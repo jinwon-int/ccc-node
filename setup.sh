@@ -12,7 +12,8 @@ set -euo pipefail
 DRY=0; [ "${1:-}" = "--dry-run" ] && DRY=1
 SRC="$(cd "$(dirname "$0")" && pwd)"
 CLAUDE_DIR="$HOME/.claude"
-HERMES_DIR="$HOME/.hermes/memories"
+MEM_DIR="$CLAUDE_DIR/memories"          # node-owned memory (Hermes-independent)
+HERMES_DIR="$HOME/.hermes/memories"     # legacy memory location (fallback only)
 
 run() { if [ "$DRY" = 1 ]; then echo "[dry-run] $*"; else eval "$*"; fi; }
 note() { printf '  - %s\n' "$*"; }
@@ -43,19 +44,23 @@ seed() { # seed <template> <dest>
   if [ -e "$2" ]; then note "kept existing $2 (not overwritten)";
   else run "cp '$1' '$2'"; note "seeded template -> $2 (EDIT ME)"; fi
 }
-run "mkdir -p '$HERMES_DIR'"
+run "mkdir -p '$MEM_DIR'"
+run "mkdir -p '$HOME/.hermes'"
 seed "$SRC/claude/CLAUDE.md.template"             "$CLAUDE_DIR/CLAUDE.md"
 seed "$SRC/claude/hooks/tools-cheatsheet.md"      "$CLAUDE_DIR/hooks/tools-cheatsheet.md"
-seed "$SRC/hermes/memories/MEMORY.template.md"    "$HERMES_DIR/MEMORY.md"
-seed "$SRC/hermes/memories/USER.template.md"      "$HERMES_DIR/USER.md"
+# Node-owned memory (Hermes-independent): seed into ~/.claude/memories.
+# load-memory.sh reads here first, falling back to ~/.hermes/memories only if absent.
+seed "$SRC/hermes/memories/MEMORY.template.md"    "$MEM_DIR/MEMORY.md"
+seed "$SRC/hermes/memories/USER.template.md"      "$MEM_DIR/USER.md"
+# honcho.json stays node-local under ~/.hermes (documentation/Hermes-side; not a hard CC dep).
 seed "$SRC/hermes/honcho.template.json"           "$HOME/.hermes/honcho.json"
 
 cat <<'EOF'
 
 ==> Done. Follow-up checklist (do these manually):
   1. Edit ~/.claude/CLAUDE.md          — replace every <PLACEHOLDER> with this node's identity/user.
-  2. Edit ~/.hermes/memories/MEMORY.md — node-specific durable facts (NO raw secrets).
-  3. Edit ~/.hermes/memories/USER.md   — who you work for + preferences.
+  2. Edit ~/.claude/memories/MEMORY.md — node-specific durable facts (NO raw secrets).
+  3. Edit ~/.claude/memories/USER.md   — who you work for + preferences.
   4. Edit ~/.hermes/honcho.json        — set baseUrl / peerName / target (this is node-local; gitignored).
   5. Install wiki-agent at /root/.wiki-agent/bin/wiki-agent (canonical: jinwon-int/wiki-agent).
   6. Auth GitHub:  gh auth login   (or place token per node policy; never commit it).
