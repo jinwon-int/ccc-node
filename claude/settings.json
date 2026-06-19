@@ -14,7 +14,10 @@
       "MultiEdit(*)",
       "WebSearch",
       "WebFetch",
-      "mcp__openclaw__*"
+      "mcp__openclaw__*",
+      "mcp__searxng__*",
+      "mcp__firecrawl__*",
+      "mcp__context7__*"
     ]
   },
   "hooks": {

@@ -4,6 +4,12 @@
 
 운영 사실은 mutable — 단정/변경 전 노드 live-check + Wiki 원문 검증.
 
+## MCP 도구 (등록 시 — `claude/mcp-setup.sh`)
+- **웹검색**: `mcp__searxng__*` (Seoyoon 공용 SearXNG, 1차 검색). 외부 API는 폴백.
+- **웹 fetch/scrape**: `mcp__firecrawl__*` (URL→markdown/추출). 동적 페이지/추출에.
+- **라이브러리 문서**: `mcp__context7__*` (SDK/라이브러리 최신 문서 주입).
+- 등록/점검: `claude mcp list` · 재등록(멱등) `./claude/mcp-setup.sh`.
+
 ## Family Wiki (가장 먼저 참조)
 - 검색: `wiki-agent find "<query>"`
 - 검증(운영 단정 전): `wiki-agent load --lines A:B <path>`
