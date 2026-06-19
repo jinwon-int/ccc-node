@@ -51,3 +51,5 @@ secrets · releases · DB/replay/migration/prune · manual ACKs · emergency hot
 
 ## Interaction
 - Ask questions with **numbered options / approval phrases** (not clarify-button UX).
+- **Progress cadence**: during multi-step work, report progress **frequently in short, separate messages** (narrate as you go, push each update to the next bubble) — not one long section. Keep final reports structured (confirmed/changes/risks/next).
+- **Working-state checkpoint**: for multi-step/long/multi-session tasks, keep `/root/.claude/state/working-state.md` updated (objective / progress / next step). It is snapshotted at PreCompact and re-injected at PostCompact, so it survives compaction. Tool/command cheatsheet auto-loads each session from `~/.claude/hooks/tools-cheatsheet.md`.

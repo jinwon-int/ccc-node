@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Bootstrap a new "Claude Code node" (클코 노드) from this template.
-# Installs the SessionStart memory hook + sanitized settings into ~/.claude,
+# Installs the SessionStart memory + tool-cheatsheet hooks, the PreCompact/PostCompact
+# working-state checkpoint hook, and sanitized settings into ~/.claude,
 # and lays down per-node templates you then fill in. NEVER writes secrets.
 #
 # Usage:
@@ -24,7 +25,11 @@ run "cp '$SRC/claude/settings.json'           '$CLAUDE_DIR/settings.json'"
 run "cp '$SRC/claude/settings.local.json'     '$CLAUDE_DIR/settings.local.json'"
 run "cp '$SRC/claude/hooks/load-memory.sh'    '$CLAUDE_DIR/hooks/load-memory.sh'"
 run "cp '$SRC/claude/hooks/refresh-memory.sh' '$CLAUDE_DIR/hooks/refresh-memory.sh'"
+run "cp '$SRC/claude/hooks/load-tools.sh'     '$CLAUDE_DIR/hooks/load-tools.sh'"
+run "cp '$SRC/claude/hooks/checkpoint.sh'     '$CLAUDE_DIR/hooks/checkpoint.sh'"
 run "chmod +x '$CLAUDE_DIR/hooks/'*.sh"
+# Working-state checkpoint dir (PreCompact snapshot / PostCompact re-inject)
+run "mkdir -p '$CLAUDE_DIR/state/checkpoints'"
 
 # 2) Per-node files — only seed templates if a real one is NOT already present.
 seed() { # seed <template> <dest>
@@ -33,6 +38,7 @@ seed() { # seed <template> <dest>
 }
 run "mkdir -p '$HERMES_DIR'"
 seed "$SRC/claude/CLAUDE.md.template"             "$CLAUDE_DIR/CLAUDE.md"
+seed "$SRC/claude/hooks/tools-cheatsheet.md"      "$CLAUDE_DIR/hooks/tools-cheatsheet.md"
 seed "$SRC/hermes/memories/MEMORY.template.md"    "$HERMES_DIR/MEMORY.md"
 seed "$SRC/hermes/memories/USER.template.md"      "$HERMES_DIR/USER.md"
 seed "$SRC/hermes/honcho.template.json"           "$HOME/.hermes/honcho.json"
