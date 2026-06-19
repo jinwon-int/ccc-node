@@ -316,6 +316,12 @@ class ProjectChatHandler:
             ),
             "can_use_tool": can_use_tool,
             "permission_mode": "default",
+            # Raise stream-json decode buffer from default 1MB to 10MB.
+            # A single CLI->SDK JSON message (usually a large tool_result)
+            # exceeding 1MB was raising:
+            #   "Failed to decode JSON: JSON message exceeded maximum
+            #    buffer size of 1048576 bytes"
+            "max_buffer_size": 10 * 1024 * 1024,
         }
         if model:
             # Normalize model name: ensure at most one [1M] suffix
