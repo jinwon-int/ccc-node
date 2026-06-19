@@ -18,6 +18,11 @@ A2A 태스크를 claim하면 업무량에 맞춰 소환(예산 0–3, 하드캡 
 - `a2a-verifier` — 테스트/CI/리스크/증거 검토(소스 미편집).
 - 정책: a2a-nexus `worker-subagent-orchestration-policy.md` (Finalizer/Write-Set Rule, redaction, evidence-only).
 
+## 커스텀 스킬 (`~/.claude/skills/`)
+반복 절차 = 스킬. 설명 매칭 시 자동, 또는 `/<name>`으로 직접 호출.
+- `wiki-record` — Wiki PR-first 기록(write-path→편집→pr) + ID 규칙(TM/ND/LOG).
+- `mcp-add` — MCP 서버 등록(키는 `~/.hermes/.env`에서, secret 비노출) + allowlist.
+
 ## Family Wiki (가장 먼저 참조)
 - 검색: `wiki-agent find "<query>"`
 - 검증(운영 단정 전): `wiki-agent load --lines A:B <path>`

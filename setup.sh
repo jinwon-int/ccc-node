@@ -33,6 +33,9 @@ run "mkdir -p '$CLAUDE_DIR/state/checkpoints'"
 # A2A worker sub-agent roster (explorer/implementer/verifier) — node-agnostic role defs
 run "mkdir -p '$CLAUDE_DIR/agents'"
 run "cp '$SRC/claude/agents/'*.md '$CLAUDE_DIR/agents/'"
+# Custom skills (reusable procedures: wiki-record, mcp-add, ...) — node-agnostic
+run "mkdir -p '$CLAUDE_DIR/skills'"
+run "cp -r '$SRC/claude/skills/.' '$CLAUDE_DIR/skills/'"
 
 # 2) Per-node files — only seed templates if a real one is NOT already present.
 seed() { # seed <template> <dest>
