@@ -22,6 +22,7 @@ A2A 태스크를 claim하면 업무량에 맞춰 소환(예산 0–3, 하드캡 
 반복 절차 = 스킬. 설명 매칭 시 자동, 또는 `/<name>`으로 직접 호출.
 - `wiki-record` — Wiki PR-first 기록(write-path→편집→pr) + ID 규칙(TM/ND/LOG).
 - `mcp-add` — MCP 서버 등록(키는 `~/.hermes/.env`에서, secret 비노출) + allowlist.
+- `skill-suggest` — 트랜스크립트 스캔→반복 절차 후보 제안(휴먼 승인 후 저작). 후보: `~/.claude/state/skill-candidates.md`.
 
 ## Family Wiki (가장 먼저 참조)
 - 검색: `wiki-agent find "<query>"`
