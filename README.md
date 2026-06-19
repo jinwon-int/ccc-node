@@ -1,11 +1,17 @@
-# claude-code-node-setup
+# ccc-node
 
-Reusable template for turning a Seoyoon/Hermes node into a **Claude Code node (클코 노드)** —
-the same harness configuration `nosuk` (VPS2) runs, with all secrets and node-local
-state stripped out and replaced by placeholders.
+**CCC = Claude Code Cli** — the unified node-setting monorepo for turning a Seoyoon/Hermes
+node into a **Claude Code node (클코 노드)**: the same harness configuration `nosuk` (VPS2)
+runs, plus the Telegram bridge that connects Claude Code to Telegram, with all secrets and
+node-local state stripped out and replaced by placeholders.
 
 > Captured from the `nosuk` node setup on **2026-06-19** so other nodes can be bootstrapped
 > the same way. This repo holds the **mechanism**, not any node's live secrets/memory.
+>
+> **Bridge provenance:** `bridge/` was vendored from a fork of
+> [`terranc/claude-telegram-bot-bridge`](https://github.com/terranc/claude-telegram-bot-bridge)
+> (commit history preserved). The upstream relationship is **intentionally dropped** — the
+> bridge is now developed here, independently, as part of `ccc-node`.
 
 ## What this gives a node
 
@@ -17,14 +23,19 @@ state stripped out and replaced by placeholders.
 - **Harness settings** — `settings.json` (permissions + hook wiring) and `settings.local.json`.
 - **CLAUDE.md template** — the operating-policy skeleton (Wiki-first, A2A/Nexus, GitHub
   hygiene, fresh-approval rules) with node/user identity as `<PLACEHOLDERS>`.
+- **Telegram bridge** (`bridge/`) — a lightweight bot that bridges Claude Code to Telegram
+  for any local folder, with autostart/supervisor support. Run via `bridge/start.sh`.
 
 ## Quick start
 
 ```bash
-git clone https://github.com/jinwon-int/claude-code-node-setup.git
-cd claude-code-node-setup
+git clone https://github.com/jinwon-int/ccc-node.git
+cd ccc-node
 ./setup.sh --dry-run   # preview
 ./setup.sh             # install into ~/.claude and seed ~/.hermes templates
+
+# Telegram bridge (optional, run from the bridge/ subdir):
+cd bridge && ./start.sh --path /root -d   # daemon-supervised start
 ```
 
 Then complete the checklist `setup.sh` prints (fill placeholders, set `honcho.json`,
@@ -44,6 +55,9 @@ hermes/
   memories/MEMORY.template.md   # -> ~/.hermes/memories/MEMORY.md
   memories/USER.template.md     # -> ~/.hermes/memories/USER.md
   honcho.template.json          # -> ~/.hermes/honcho.json (set baseUrl/peer/target)
+bridge/                    # Telegram <-> Claude Code bridge (vendored, history preserved)
+  start.sh                 # daemon/supervisor entry (--path / --stop / --status / -d)
+  core/ interaction/ ...   # bridge source (upstream-independent fork)
 setup.sh                   # idempotent bootstrap (won't overwrite existing real files)
 .gitignore                 # blocks credentials, live memory, caches, sessions
 ```
