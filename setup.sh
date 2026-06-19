@@ -47,6 +47,8 @@ cat <<'EOF'
   5. Install wiki-agent at /root/.wiki-agent/bin/wiki-agent (canonical: jinwon-int/wiki-agent).
   6. Auth GitHub:  gh auth login   (or place token per node policy; never commit it).
   7. Start a fresh Claude Code session and confirm the SessionStart snapshot injects.
+  8. (Optional) Telegram bridge: cd bridge && cp .env.example .env && edit, then
+     ./start.sh --path /root -d   (daemon-supervised). See bridge/README.md.
 
 Secrets that are intentionally NOT installed by this script:
   - ~/.claude/.credentials.json   (Claude OAuth — created on `claude` login)

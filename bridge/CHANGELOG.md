@@ -1,0 +1,275 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [0.10.1] - 2026-05-31
+
+### Fixed
+- Skip empty proxy env vars to avoid httpx parse error
+
+## [0.10.0] - 2026-05-25
+
+### Changed
+- Migrate from `claude-code-sdk` to `claude-agent-sdk` (v0.1.72+) for improved Claude API integration
+- Add OpenTelemetry dependencies for enhanced observability support
+
+### Added
+- System prompt instructions for automatic image/file path detection and delivery
+- Application screenshots to README showcasing streaming response, voice message, and code editing features
+
+### Fixed
+- Auto-split `/skills` command responses exceeding Telegram's 4096 character limit using `_reply_smart`
+- Normalize model name `[1M]` suffix to prevent duplicate suffixes (e.g., `[1M][1m]`)
+- Add debug logging for file artifact sending to improve troubleshooting
+
+### Removed
+- Redundant proxy environment variable passthrough in daemon supervisor (environment inherits from parent)
+
+## [0.9.5] - 2026-04-10
+
+### Added
+- Pass proxy environment variables (`http_proxy`, `https_proxy`, `all_proxy`, `no_proxy`) to launchd plist so bot can connect through proxy in startup service mode
+- Wait for bot process to start (up to 5 seconds) after `--install` to ensure `--status` returns valid state immediately
+
+### Fixed
+- In launchd mode, mark service state as `starting` instead of `unavailable` during restart windows so status reflects that launchd will respawn the process
+- Stop bot process before uninstalling launchd plist to ensure clean removal
+
+### Changed
+- Document macOS Full Disk Access requirement for `~/Documents`, `~/Desktop`, and `~/Downloads` project directories in README
+
+### Added
+- Add optional Telegram streaming tool call display, controlled by `ENABLE_STREAMING_TOOL_CALLS` and disabled by default
+
+### Fixed
+- Preserve streamed tool call prefixes across draft updates, overflow splits, and finalization so displayed tool activity is not lost mid-response
+- Align connection resilience test expectations with the current polling connection pool configuration
+
+## [0.9.2] - 2026-03-27
+
+### Changed
+- Map existing codebase documentation structure
+- General updates and maintenance
+
+## [0.9.1] - 2026-03-22
+
+### Fixed
+- Persist structured runtime health to `.telegram_bot/health.json` so `start.sh --status` reports live `starting`, `available`, `degraded`, and `unavailable` states instead of relying on stale logs
+- Probe Claude CLI authentication during startup and request handling so status output can distinguish Telegram transport issues from Claude availability issues
+- Stop the daemon supervisor before the bot process during `start.sh --stop`, and keep shared token lock files intact when the current bot is not the owner
+
+### Changed
+- Expanded health and status regression coverage for runtime cleanup, stale health detection, supervisor shutdown, and component-specific degraded reporting
+
+## [0.9.0] - 2026-03-20
+
+### Added
+- Automatically start a new Claude chat when the gap since the previous user message exceeds `AUTO_NEW_SESSION_AFTER_HOURS`, with configuration support and regression tests for session/voice flows
+
+### Fixed
+- Make `start.sh --status` report layered bot health so a live process stays `running` even when Telegram networking or Claude SDK calls are degraded
+- Treat Claude SDK 403/upstream errors as retryable degraded state in status output instead of incorrectly reporting the bot as unavailable
+- Stop the launchd service during `start.sh --stop` so launchd `KeepAlive` no longer immediately respawns the bot and blocks a following `--install`
+
+## [0.8.6] - 2026-03-20
+
+### Fixed
+- Use dedicated HTTPX request settings for Telegram polling with HTTP/1.1 and proxy propagation, improving reliability after network changes and proxyed deployments
+- Drop stale pending updates on polling restart so the bot resumes with fresh messages after recovery
+- Preserve `PATH` and `HOME` in the generated macOS launchd plist so startup service launches reliably outside interactive shells
+
+### Changed
+- Updated README documentation for launchd startup behavior and proxy-aware connection recovery
+
+## [0.8.5] - 2026-03-13
+
+### Fixed
+- Replace blocking `run_polling()` with low-level async API (`Application.initialize/start/updater.start_polling`) to resolve polling hang where `run_polling()` blocks indefinitely and cannot be interrupted
+- Add `getMe()`-based watchdog that probes Telegram API reachability every 60 seconds; after 5 minutes of consecutive failures, stops the updater and restarts polling in-process
+- Detect unexpected polling termination and automatically restart without process restart
+- Graceful shutdown between restart cycles ensures clean Application teardown
+
+## [0.8.4] - 2026-03-12
+
+### Fixed
+- Auto-restart Telegram polling after unexpected exit (e.g. SDK crash triggering graceful shutdown) instead of silently stopping message reception
+- Retry transient SDK errors (SIGTERM, SIGKILL, ConnectionRefused) once with automatic reconnection in `process_message`
+- NetworkError now retries indefinitely with application rebuild instead of giving up after fixed attempts
+- Rapid crash protection: exits only after 5 consecutive polling failures within 30 seconds each
+
+## [0.8.3] - 2026-03-12
+
+### Fixed
+- Add network retry logic for connection resilience
+
+## [0.8.2] - 2026-03-10
+
+### Fixed
+- Add event loop watchdog that detects zombie state (asyncio loop closed but process alive) and force-exits, allowing start.sh auto-restart to recover
+- Enable launchd `KeepAlive` so the service auto-restarts even if start.sh itself exits (e.g. rapid crash limit)
+
+### Changed
+- Enhanced `--status` command to detect inactive bots via log mtime checking, reporting detailed diagnostics instead of a misleading "running" status
+
+## [0.8.1] - 2026-03-08
+
+### Fixed
+- Volcengine voice transcription now deletes the temporary TOS object after ASR completes, preventing staged voice files from accumulating over time
+- TOS cleanup failures are isolated to logs and no longer affect user-facing transcription replies
+
+### Changed
+- Extended TOS uploader API to return uploaded object metadata (`object_key` + signed URL) for explicit post-transcription cleanup
+- Added tests covering TOS object deletion on both success and failure paths
+
+## [0.8.0] - 2026-03-08
+
+### Added
+- macOS voice reply mode with TTS support: bot automatically replies with voice when user sends voice messages, using macOS `say` command + ffmpeg conversion
+- Smart voice delivery strategy based on response length (voice-only, text+voice, or text-only fallback)
+- `VOICE_REPLY_PERSONA` config for selecting macOS TTS voice persona
+
+### Fixed
+- Voice reply mode gracefully falls back to text on non-macOS platforms
+
+### Changed
+- Updated README documentation (EN/ZH) with voice reply mode usage guide
+
+## [0.7.0] - 2026-03-08
+
+### Added
+- Volcengine ASR support for voice transcription as an alternative to OpenAI Whisper
+- TOS (Tencent Object Storage) upload flow for Volcengine ASR integration
+
+### Changed
+- Added Star History chart to README files
+
+## [0.6.3] - 2026-03-06
+
+### Changed
+- Renamed project from "Telegram Skill Bot" to "Claude Telegram Bot Bridge"
+- Updated project name in README.md, README-zh.md, and start.sh
+- Changed version display from "Bot version" to "Bridge version"
+- Simplified update notification to non-interactive text prompt
+
+## [0.6.2] - 2026-03-06
+
+### Added
+- Auto-update check on startup with 1-hour cache to detect new releases
+- Interactive upgrade prompt when update is available (upgrade now / skip)
+- `--upgrade` command for one-click bot updates via git pull and dependency reinstall
+- Version comparison logic to determine if update is needed
+- Graceful handling of network failures during update check
+
+### Changed
+- Updated README.md and README-zh.md with upgrade command documentation
+- Added auto-update feature to Operations section in documentation
+
+## [0.6.1] - 2026-03-05
+
+### Changed
+- Simplified bot command descriptions for better user experience in Telegram command menu
+
+## [0.6.0] - 2026-03-05
+
+### Added
+- `/revert` command to restore conversation to any previous message state
+- 5 revert modes: full restore (code + conversation), conversation only, code only, summarize from point, or cancel
+- Paginated history browser showing last 50 messages with inline keyboard navigation
+- Priority handling for `/revert`: bypasses message queue limit and cancels active operations
+- Interactive mode selection via Telegram inline buttons
+- Conversation state restoration by truncating SDK JSONL files to selected message
+
+### Changed
+- Updated documentation (README.md, README-zh.md) with `/revert` usage examples
+- Improved button text consistency: changed "Never mind" to "Cancel"
+
+## [0.5.0] - 2026-03-05
+
+### Added
+- Native Telegram voice message support with automatic transcription via OpenAI Whisper API
+- Audio format detection and conversion (OGG/AMR → MP3) using ffmpeg
+- Voice message preview in chat: `🎤 Voice: [transcribed text]` before forwarding to Claude
+- Priority `/stop` command: immediately cancels running tasks and voice transcription, even when message queue is full
+- Comprehensive test coverage for audio processing, transcription, and voice message flow
+- Voice configuration options: `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `WHISPER_MODEL`, `MAX_VOICE_DURATION`, `FFMPEG_PATH`
+- Automatic cleanup of temporary audio files and stale audio detection
+- Retry logic with exponential backoff for Whisper API calls
+- Voice message duration validation and cost/duration logging
+
+### Changed
+- `/setup` skill now includes optional voice message configuration step
+- `.env.example` updated with voice-related configuration options
+- Enhanced error handling for voice message processing with user-friendly error messages
+- Updated documentation (README, CLAUDE.md) with voice message feature details
+
+## [0.4.0] - 2026-03-04
+
+### Added
+- `/setup` skill for conversational, multi-language installation via Claude Code
+- Support for installation in any language (English, Chinese, Japanese, Spanish, French, German, etc.)
+- Interactive installation wizard with 4-step process (system check, configuration, Python environment, completion)
+
+### Changed
+- Renamed `install.sh` to `setup.sh` for consistency with skill naming
+- Moved Python virtual environment creation and dependency installation from `start.sh` to `setup.sh`
+- `start.sh` now checks for completed installation and provides friendly error message if not installed
+- Installation flow now requires running `setup.sh` or `/setup` skill before `start.sh`
+- Improved installation prompts with better formatting and clearer instructions
+- Fixed color code rendering issues in installation scripts (added `-e` flag to all `echo` commands with color variables)
+
+### Fixed
+- Script references in README updated from `install.sh` to `setup.sh`
+- Command examples in documentation now reflect new installation flow
+
+## [0.3.0] - 2026-03-03
+
+### Added
+- Progressive streaming for AI responses using Telegram draft messages with real-time updates
+- Telegram draft API compatibility layer with graceful fallback to regular messages
+- Automatic detection of numbered options in responses (not just `AskUserQuestion` tool)
+- Streaming configuration via `DRAFT_UPDATE_MIN_CHARS` and `DRAFT_UPDATE_INTERVAL` environment variables
+
+### Fixed
+- Duplicate message issue when responses contain option buttons: streamed messages are no longer re-sent
+- Improved `AskUserQuestion` denial message with clearer formatting instructions for the AI
+
+### Changed
+- Streaming message handler now uses regular `send_message` for initial draft creation to ensure message_id availability
+- Large text chunks are split into progressive updates for smoother streaming experience
+
+## [0.2.1] - 2026-03-02
+
+### Added
+- Session progress summary: show last assistant message when switching sessions via `/resume`
+
+### Changed
+- Remove hardcoded zh-CN language policy; bot preset strings stay minimal English, LLM handles language adaptation naturally
+
+## [0.2.0] - 2026-03-02
+
+### Added
+- Long message auto-splitting: responses are split at paragraph/line boundaries (4000-char limit) and sent as multiple messages instead of being truncated
+- Typing keepalive loop: background task sends typing indicator at regular intervals during long tool calls to prevent Telegram from dropping the typing status
+
+### Fixed
+- Removed 4000-character hard truncation from `_clean_response`; full response content is now preserved
+- Inline option keyboard now only appears for `AskUserQuestion` degraded responses (via `force_options` flag), preventing false positives on numbered lists in regular replies
+
+## [0.1.0] - 2026-03-02
+
+### Added
+- Telegram bot integration with Claude Code SDK for running Claude sessions from Telegram
+- Per-user persistent Claude SDK streams with session history browsing
+- Permission gating for file access: auto-allow inside `PROJECT_ROOT`, inline button confirmation for outside
+- Message queue per user (max 3 concurrent tasks with overflow rejection)
+- `AskUserQuestion` tool degraded to Telegram inline keyboard buttons
+- Auto-send media files (photos/documents) when response contains matching file paths
+- Session persistence via JSON store (`PROJECT_ROOT/.telegram_bot/sessions.json`)
+- Bilingual documentation (English and Chinese)
+- `start.sh` lifecycle manager with venv creation, dependency caching, log rotation (14 days), and crash detection
+- macOS launchd auto-start support via `--install` / `--uninstall`
+- Debug mode with verbose logging and per-session chat file logging
+- Proxy support via `PROXY_URL` environment variable
