@@ -13,6 +13,7 @@
 ## A2A 워커 서브에이전트 roster (`~/.claude/agents/`)
 A2A 태스크를 claim하면 업무량에 맞춰 소환(예산 0–3, 하드캡 4; 호스트 부하 시 축소). 워커=단일 finalizer.
 - `a2a-explorer` — 읽기전용 조사(코드/이슈/로그). 편집·finalize 불가.
+- `a2a-researcher` — explorer 변종: 외부 웹리서치(SearXNG/Firecrawl/Context7 MCP), 읽기전용·출처 인용.
 - `a2a-implementer` — **분리된 write-set 내** 구현(최대 2개 병렬, 파일 비충돌).
 - `a2a-verifier` — 테스트/CI/리스크/증거 검토(소스 미편집).
 - 정책: a2a-nexus `worker-subagent-orchestration-policy.md` (Finalizer/Write-Set Rule, redaction, evidence-only).
