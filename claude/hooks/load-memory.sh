@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SessionStart memory bootstrap for nosuk (Hermes-style).
+# SessionStart memory bootstrap for nosuk (Claude Code, node-owned memory).
 # Serves built-in MEMORY/USER + cached Family Wiki + cached Honcho instantly,
 # then fires a detached background refresh so the next session is fresh.
 set -uo pipefail
@@ -11,12 +11,16 @@ EVENT="${1:-SessionStart}"
 CACHE=/root/.claude/hooks/cache
 HOOKDIR=/root/.claude/hooks
 
-mem="$(cat /root/.hermes/memories/MEMORY.md /root/.hermes/memories/USER.md 2>/dev/null)"
+# Node-owned memory lives under ~/.claude/memories (Hermes-independent).
+# Fall back to the legacy ~/.hermes/memories only if the local copy is absent.
+MEMDIR=/root/.claude/memories
+mem="$(cat "$MEMDIR/MEMORY.md" "$MEMDIR/USER.md" 2>/dev/null)"
+[ -z "$mem" ] && mem="$(cat /root/.hermes/memories/MEMORY.md /root/.hermes/memories/USER.md 2>/dev/null)"
 wiki="$(cat "$CACHE/wiki.txt" 2>/dev/null)"
 honcho="$(cat "$CACHE/honcho.txt" 2>/dev/null)"
 stamp="$(cat "$CACHE/.last-refresh" 2>/dev/null)"
 
-ctx="# Hermes / nosuk session memory (auto-injected: $EVENT)
+ctx="# nosuk session memory (auto-injected: $EVENT)
 
 Operational facts are mutable — live-check the node and verify Wiki source text before asserting or changing anything.
 Family Wiki + Honcho blocks below are cached (last refreshed: ${stamp:-never}); a background refresh runs each session for the next one.
