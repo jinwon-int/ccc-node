@@ -24,3 +24,6 @@ backups/
 *.key
 *token*
 *secret*
+
+# Local convenience symlink to bridge/ (created per-node, not part of the template)
+/telegram_bot
