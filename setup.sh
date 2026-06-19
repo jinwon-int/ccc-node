@@ -30,6 +30,9 @@ run "cp '$SRC/claude/hooks/checkpoint.sh'     '$CLAUDE_DIR/hooks/checkpoint.sh'"
 run "chmod +x '$CLAUDE_DIR/hooks/'*.sh"
 # Working-state checkpoint dir (PreCompact snapshot / PostCompact re-inject)
 run "mkdir -p '$CLAUDE_DIR/state/checkpoints'"
+# A2A worker sub-agent roster (explorer/implementer/verifier) — node-agnostic role defs
+run "mkdir -p '$CLAUDE_DIR/agents'"
+run "cp '$SRC/claude/agents/'*.md '$CLAUDE_DIR/agents/'"
 
 # 2) Per-node files — only seed templates if a real one is NOT already present.
 seed() { # seed <template> <dest>
