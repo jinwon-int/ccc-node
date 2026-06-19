@@ -2,7 +2,8 @@
   "env": {
     "BASH_MAX_OUTPUT_LENGTH": "200000",
     "MAX_MCP_OUTPUT_TOKENS": "25000",
-    "CLAUDE_CODE_MAX_OUTPUT_TOKENS": "32000"
+    "CLAUDE_CODE_MAX_OUTPUT_TOKENS": "32000",
+    "BASH_MAX_TIMEOUT_MS": "1200000"
   },
   "permissions": {
     "allow": [
@@ -25,6 +26,24 @@
             "command": "bash /root/.claude/hooks/load-memory.sh SessionStart",
             "timeout": 15,
             "statusMessage": "Loading nosuk memory (MEMORY/USER + Wiki + Honcho)..."
+          },
+          {
+            "type": "command",
+            "command": "bash /root/.claude/hooks/load-tools.sh SessionStart",
+            "timeout": 10,
+            "statusMessage": "Loading tool/command cheatsheet..."
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash /root/.claude/hooks/checkpoint.sh PreCompact",
+            "timeout": 10,
+            "statusMessage": "Checkpointing working-state before compaction..."
           }
         ]
       }
@@ -37,6 +56,12 @@
             "command": "bash /root/.claude/hooks/load-memory.sh PostCompact",
             "timeout": 15,
             "statusMessage": "Re-injecting nosuk memory after compaction..."
+          },
+          {
+            "type": "command",
+            "command": "bash /root/.claude/hooks/checkpoint.sh PostCompact",
+            "timeout": 10,
+            "statusMessage": "Re-injecting working-state after compaction..."
           }
         ]
       }
