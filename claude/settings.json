@@ -1,0 +1,40 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(*)",
+      "Write(*)",
+      "Read(*)",
+      "Edit(*)",
+      "MultiEdit(*)",
+      "WebSearch",
+      "WebFetch",
+      "mcp__openclaw__*"
+    ]
+  },
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash /root/.claude/hooks/load-memory.sh SessionStart",
+            "timeout": 15,
+            "statusMessage": "Loading nosuk memory (MEMORY/USER + Wiki + Honcho)..."
+          }
+        ]
+      }
+    ],
+    "PostCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash /root/.claude/hooks/load-memory.sh PostCompact",
+            "timeout": 15,
+            "statusMessage": "Re-injecting nosuk memory after compaction..."
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,18 @@
+{
+  "enabled": true,
+  "baseUrl": "<HONCHO_BASE_URL>",
+  "workspace": "seoyoon-family",
+  "peerName": "<NODE_NAME>",
+  "pinPeerName": true,
+  "pinUserPeer": true,
+  "target": "<USER_PEER_ID>",
+  "hosts": [],
+  "recallMode": "dialectic",
+  "dialecticDepth": "low",
+  "dialecticReasoningLevel": "low",
+  "observationMode": false,
+  "saveMessages": true,
+  "sessionStrategy": "per-session",
+  "writeFrequency": "session",
+  "timeout": 60000
+}

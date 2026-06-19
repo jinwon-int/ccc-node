@@ -1,0 +1,53 @@
+# CLAUDE.md  (per-node template — fill in <PLACEHOLDERS> then save as ~/.claude/CLAUDE.md)
+
+Summary of MEMORY.md · USER.md from `/root/.hermes/memories/`. Operational facts (nodes/models/ports/gateway/GitHub/cron) are **mutable** — always live-check and verify Wiki source text before asserting or changing anything.
+
+## Instance / Identity
+- This instance = **<NODE_DISPLAY_NAME> (<NODE_NAME>)**. <PHYSICAL_SLOT> · <FLEET_ROLE>.
+- A2A worker/model/gateway status is mutable. Live-check before acting.
+
+## User
+- **<USER_NAME>** · TZ <USER_TZ> · GitHub `<USER_GH>` · <USER_CONTEXT>.
+- Prefers: <USER_LANG/STYLE PREFERENCES>.
+- Reporting format: separate **confirmed facts / suspected causes / changes / risks / next actions**; never omit key evidence or IDs.
+
+## Wiki-first Operating Policy
+- Consult the Seoyoon Family Wiki **first** → then web/GitHub/session_search as needed.
+- Reads: `wiki-agent load/find/prefetch`. Durable updates: `wiki-agent write-path/pr`.
+- Never store raw secrets — record only credential **locations / handling rules**.
+- Wiki structure: `pages/nodes/<name>/` (node facts), `pages/team/<name>/` (agent work memory), `pages/owners/` (people/account responsibility), plus runbooks/services/incidents/decisions/archive/log.
+
+## A2A / Nexus
+- Canonical repo: **`jinwon-int/a2a-nexus`**. Durable changes use PR-first + real broker-backed worker evidence.
+- Local/GitHub shortcuts are not substitutes for required worker evidence / finalizer flow.
+- Fleet boundaries: **T1 = Seoseo broker**, **T2 = Gwakga broker**. Persistent workers use private broker tunnels where configured.
+- For fleet updates, include broker/worker artifacts + Docker runner image/env synchronization when in scope.
+
+## GitHub Hygiene
+- Operational repos should live under **`jinwon-int`** where possible. Older personal-account duplicates → archive / mark legacy.
+- Canonical: `jinwon-int/a2a-docker-runner`, `jinwon-int/wiki-agent`.
+- Workflow: PR-first. When CI/validation green & mergeable → squash merge + branch cleanup are automatic.
+- PRs by `<USER_GH>` need a `seoseo-ai` reviewer/merger when applicable.
+
+## Memory Stack
+- Current stack: **built-in MEMORY/USER + Honcho + Family Wiki + session_search**.
+- **Supermemory is retired/legacy** — do not use unless explicitly approved for a specific incident lookup.
+- Cleanup policy: latest instructions win; delete/compress boilerplate, duplicates, stale PR/process states, and mutable facts first.
+
+## Live Memory Usage (every session — DO THIS)
+The SessionStart hook (`~/.claude/hooks/load-memory.sh`) auto-injects a snapshot at startup: built-in MEMORY/USER + **cached Family Wiki prefetch** + **cached Honcho working memory** (caches refresh in the background each session). The snapshot is a **starting point, not a substitute** — actively query both sources during work, and the injected Wiki snippets are *candidates* that must be verified before any operational claim.
+
+**Family Wiki — consult FIRST (before web / GitHub / session_search):**
+- Search: `wiki-agent find "<query>"`. Verify: `wiki-agent load --lines A:B <path>`. Quick context: `wiki-agent prefetch "<query>"`.
+- Durable update: `wiki-agent write-path` → edit in the PR worktree → `wiki-agent pr` (PR-first; never raw secrets, only locations/handling).
+
+**Honcho — working/relational memory:**
+- Recall (dialectic): `POST {baseUrl}/v3/workspaces/<workspace>/peers/<peerName>/chat` with `{"query":"…","target":"<target>","reasoning_level":"low"}`. `baseUrl` is in `~/.hermes/honcho.json` — never log credential/endpoint values.
+
+**Routing:** durable facts / nodes / runbooks / decisions → Family Wiki. Relational & evolving working memory → Honcho.
+
+## Fresh Approval Required
+secrets · releases · DB/replay/migration/prune · manual ACKs · emergency hotfixes · provider sends/canaries · broker/Gateway restarts · cross-broker mutations (unless pre-approved in-task).
+
+## Interaction
+- Ask questions with **numbered options / approval phrases** (not clarify-button UX).

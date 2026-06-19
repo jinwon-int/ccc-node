@@ -1,0 +1,26 @@
+# NEVER commit secrets or live node state
+.credentials.json
+**/.credentials.json
+*.credentials.json
+honcho.json
+!honcho.template.json
+MEMORY.md
+USER.md
+!*.template.md
+hooks/cache/
+**/cache/
+*.lock
+.last-refresh
+.last-cleanup
+sessions/
+shell-snapshots/
+projects/
+session-env/
+backups/
+*.bak
+*.bak-*
+.env
+*.pem
+*.key
+*token*
+*secret*
