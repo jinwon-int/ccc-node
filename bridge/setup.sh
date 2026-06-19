@@ -527,6 +527,31 @@ echo "$REQ_HASH" > "$REQ_HASH_FILE"
 echo -e "${GREEN}✅ All Python dependencies installed${NC}"
 echo ""
 
+# Make the package importable as `telegram_bot`.
+# start.sh launches the bot via `python -m telegram_bot`, but the package code
+# lives in this repo dir (named `bridge`, not `telegram_bot`). We expose it with a
+# single self-contained symlink INSIDE the venv's site-packages — which is already
+# on sys.path — so:
+#   - no `.pth` file and no symlink in the parent dir are needed (parent stays clean,
+#     and the parent git repo no longer shows an untracked `telegram_bot` link);
+#   - it is recreated automatically whenever the venv is rebuilt;
+#   - `venv/` is gitignored, so this never pollutes git status.
+# This is the durable fix for the cutover failure where `python -m telegram_bot`
+# could not be imported (the link had to be created by hand at runtime).
+echo "📦 Linking package for 'python -m telegram_bot'..."
+SITE_PACKAGES="$("$VENV_DIR/bin/python" -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])' 2>/dev/null)"
+if [ -n "$SITE_PACKAGES" ] && [ -d "$SITE_PACKAGES" ]; then
+    ln -sfn "$SCRIPT_DIR" "$SITE_PACKAGES/telegram_bot"
+    if "$VENV_DIR/bin/python" -c "import telegram_bot" 2>/dev/null; then
+        echo -e "${GREEN}✅ Package importable as 'telegram_bot'${NC}"
+    else
+        echo -e "${YELLOW}⚠️  Created link but 'import telegram_bot' failed — check $SITE_PACKAGES/telegram_bot${NC}"
+    fi
+else
+    echo -e "${YELLOW}⚠️  Could not resolve site-packages; skipped package link${NC}"
+fi
+echo ""
+
 if [ $SILENT_MODE -eq 0 ]; then
     read -p "Press Enter to continue..."
     echo ""
