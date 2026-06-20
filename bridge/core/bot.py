@@ -46,6 +46,8 @@ from telegram_bot.core.project_chat import (
 )
 from claude_agent_sdk.types import PermissionResultAllow, PermissionResultDeny
 from telegram_bot.utils.chat_logger import log_debug
+from telegram_bot.utils.tg_format import wrap_markdown_tables
+from telegram_bot.utils.tg_robust import send_with_retry
 from telegram_bot.utils.audio_processor import AudioProcessor
 from telegram_bot.utils.transcription import (
     EmptyTranscriptionError,
@@ -2723,11 +2725,14 @@ class TelegramBot:
         """Reply with text (splitting if needed), send referenced files, and add option buttons."""
         # Skip text sending if already streamed
         if not streamed:
-            for part in self._split_text(content):
+            for part in self._split_text(wrap_markdown_tables(content)):
                 try:
-                    await message.reply_text(part, parse_mode=parse_mode)
-                except Exception:
-                    await message.reply_text(part)
+                    await send_with_retry(
+                        lambda p=part: message.reply_text(p, parse_mode=parse_mode)
+                    )
+                except telegram.error.BadRequest:
+                    # Markdown parse error — fall back to plain text.
+                    await send_with_retry(lambda p=part: message.reply_text(p))
 
         await self._send_content_artifacts(message, content, force_options)
 
@@ -2745,11 +2750,14 @@ class TelegramBot:
 
         # Skip text sending if already streamed
         if not streamed:
-            for part in self._split_text(content):
+            for part in self._split_text(wrap_markdown_tables(content)):
                 try:
-                    await bot.send_message(chat_id, part, parse_mode="Markdown")
-                except Exception:
-                    await bot.send_message(chat_id, part)
+                    await send_with_retry(
+                        lambda p=part: bot.send_message(chat_id, p, parse_mode="Markdown")
+                    )
+                except telegram.error.BadRequest:
+                    # Markdown parse error — fall back to plain text.
+                    await send_with_retry(lambda p=part: bot.send_message(chat_id, p))
 
         resolved_paths = self._resolve_paths(content)
         in_root_paths, _ = self._split_paths_by_scope(resolved_paths)
