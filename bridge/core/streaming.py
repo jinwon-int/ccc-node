@@ -9,9 +9,10 @@ from dataclasses import dataclass
 from typing import Any, Optional, List
 
 from telegram import Bot
-from telegram.error import TelegramError, RetryAfter
+from telegram.error import TelegramError, RetryAfter, BadRequest
 
 from telegram_bot.utils.config import config
+from telegram_bot.utils import tg_md
 
 logger = logging.getLogger(__name__)
 
@@ -195,13 +196,33 @@ class StreamingMessageHandler:
         return new_char_count >= self.min_chars or time_elapsed >= self.min_interval
 
     async def finalize_draft(self, draft: DraftState) -> bool:
-        """Convert draft to regular message"""
-        try:
-            await self._retry_with_backoff(
-                lambda: self.bot.edit_message_text(
-                    chat_id=self.chat_id, message_id=draft.message_id, text=draft.text
-                )
+        """Convert draft to a regular message, rendering Markdown -> MarkdownV2.
+
+        Live draft updates stay plain text (cheap, no parse risk); on finalize we
+        upgrade to MarkdownV2 so tables render as aligned code blocks and special
+        characters/formatting show correctly. Any parse/length edge case falls
+        back to the original plain text — delivery is never lost.
+        """
+        md2 = tg_md.to_markdownv2(draft.text)
+        use_md2 = md2 is not None and tg_md.utf16_len(md2) <= tg_md.TELEGRAM_LIMIT
+
+        async def _edit():
+            if use_md2:
+                try:
+                    return await self.bot.edit_message_text(
+                        chat_id=self.chat_id,
+                        message_id=draft.message_id,
+                        text=md2,
+                        parse_mode="MarkdownV2",
+                    )
+                except BadRequest:
+                    pass  # parse/length edge case -> plain text below
+            return await self.bot.edit_message_text(
+                chat_id=self.chat_id, message_id=draft.message_id, text=draft.text
             )
+
+        try:
+            await self._retry_with_backoff(_edit)
             logger.debug(f"Finalized draft {draft.message_id}")
             return True
         except TelegramError as e:
