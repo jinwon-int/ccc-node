@@ -16,6 +16,7 @@ esac
 
 cmd="$(printf '%s' "$input"   | jq -r '.tool_input.command // empty'   2>/dev/null)"
 fpath="$(printf '%s' "$input" | jq -r '.tool_input.file_path // empty' 2>/dev/null)"
+sid="$(printf '%s' "$input"   | jq -r '.session_id // empty'           2>/dev/null)"
 
 redact() {
   sed -E \
@@ -29,8 +30,9 @@ redact() {
 rcmd="$(printf '%s' "$cmd" | redact)"
 ts="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)"
 
-jq -nc --arg ts "$ts" --arg tool "$tool" --arg cmd "$rcmd" --arg fp "$fpath" \
+jq -nc --arg ts "$ts" --arg tool "$tool" --arg cmd "$rcmd" --arg fp "$fpath" --arg sid "$sid" \
   '{ts:$ts, tool:$tool}
+   + (if $sid != "" then {session_id:$sid} else {} end)
    + (if $cmd != "" then {command:$cmd} else {} end)
    + (if $fp  != "" then {file_path:$fp} else {} end)' >> "$LOG" 2>/dev/null
 

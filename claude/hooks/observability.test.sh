@@ -61,6 +61,26 @@ echo '{"tool_name":"Bash","tool_input":{"command":"git push --force origin main"
 ok "guard logs denial label"       'grep -q "DENY\[force-push\]" "$CCC_APPROVAL_LOG"'
 ok "guard denial omits raw cmd"    '! grep -q "force origin main" "$CCC_APPROVAL_LOG"'
 
+# --- audit.sh records session_id; evidence-gate.sh (Stop) uses it ---
+echo '{"session_id":"sX","tool_name":"Write","tool_input":{"file_path":"/x/a.py"}}' | bash "$HERE/audit.sh"
+ok "audit records session_id"      'grep -q "\"session_id\":\"sX\"" "$CCC_AUDIT_LOG"'
+
+out="$(echo '{"session_id":"sX"}' | bash "$HERE/evidence-gate.sh")"
+ok "evidence gate off by default"  '[ -z "$out" ]'
+
+out="$(echo '{"session_id":"sX"}' | CCC_EVIDENCE_GATE=1 bash "$HERE/evidence-gate.sh")"
+ok "evidence gate blocks unverified change" 'grep -q "\"decision\":\"block\"" <<<"$out"'
+
+out="$(echo '{"session_id":"sX","stop_hook_active":true}' | CCC_EVIDENCE_GATE=1 bash "$HERE/evidence-gate.sh")"
+ok "evidence gate passes when already active" '[ -z "$out" ]'
+
+out="$(echo '{"session_id":"sOther"}' | CCC_EVIDENCE_GATE=1 bash "$HERE/evidence-gate.sh")"
+ok "evidence gate ignores other sessions" '[ -z "$out" ]'
+
+echo '{"session_id":"sX","tool_name":"Bash","tool_input":{"command":"git diff --stat"}}' | bash "$HERE/audit.sh"
+out="$(echo '{"session_id":"sX"}' | CCC_EVIDENCE_GATE=1 bash "$HERE/evidence-gate.sh")"
+ok "evidence gate passes with verification" '[ -z "$out" ]'
+
 rm -rf "$TMP"
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = "0" ]
