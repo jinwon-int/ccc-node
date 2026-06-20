@@ -25,6 +25,14 @@ node-local state stripped out and replaced by placeholders.
   hygiene, fresh-approval rules) with node/user identity as `<PLACEHOLDERS>`.
 - **Telegram bridge** (`bridge/`) — a lightweight bot that bridges Claude Code to Telegram
   for any local folder, with autostart/supervisor support. Run via `bridge/start.sh`.
+- **Status line** (`hooks/statusline.sh`) — node · model · git · context % · `⚠200k` · cost ·
+  A2A marker · output style, wired via `settings.json` `statusLine`. Set `CCC_NODE` (or
+  `~/.claude/state/node.txt`) for the node label; falls back to the short hostname.
+- **Output style** (`output-styles/ccc-report.md`) — Korean structured-reporting default
+  (확정/변경/리스크/다음, 진행 내레이션, 번호형 질문), activated via `settings.json`
+  `outputStyle`. Switch anytime with `/config` → Output style.
+- **Headless runner** (`headless.sh`) — `claude -p` wrapper for cron/A2A/CI with JSON output
+  and a read-only tool baseline; guard enforcement still applies.
 
 ## Quick start
 

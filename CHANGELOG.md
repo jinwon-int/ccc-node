@@ -2,6 +2,19 @@
 
 All notable changes to the Claude Code node harness. Dates are KST.
 
+## [0.2.0] — 2026-06-20
+
+Tier 3 — presentation & headless surface.
+
+### Added
+- **Status line** (`claude/hooks/statusline.sh`): one-line at-a-glance bar — node · model · git branch+dirty · context % (color-coded: green/amber/red) · `⚠200k` token warning · session cost · A2A task marker · active output style. Reads Claude Code's stdin session JSON; degrades gracefully on empty/garbage input. Wired via the node-local `settings.json` `statusLine` field (the main status line is not applied from a plugin's `settings.json`).
+- **Output style** (`claude/output-styles/ccc-report.md`): Korean structured-reporting default — 확정/변경/리스크/다음 절 구분, 진행 내레이션(짧은 분리 메시지), 번호형 질문, Fresh-Approval 경계, secret 비노출. `keep-coding-instructions: true` (coding behaviour unchanged). Ships via the plugin's `output-styles/` and is activated through `settings.json` `outputStyle: "ccc-report"`.
+- **Headless runner** (`claude/headless.sh`): `claude -p` wrapper for cron / A2A / CI — JSON output, read-only tool baseline (override via `CCC_ALLOWED_TOOLS`/`CCC_PERMISSION_MODE`), stdin piping, session+cost logging. Guard enforcement still applies (non-`--bare`).
+- Validator coverage: statusline smoke (sample + empty input), `settings.json` statusLine/outputStyle wiring resolves to shipped files, output-style frontmatter, headless/statusline `bash -n` + shellcheck.
+
+### Notes
+- Plugin `details` inventory does not list output styles as a category, but `output-styles/ccc-report.md` ships at the plugin root and loads when the plugin is enabled (verified by isolated install).
+
 ## [0.1.1] — 2026-06-20
 
 ### Fixed

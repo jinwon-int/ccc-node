@@ -5,6 +5,12 @@
     "CLAUDE_CODE_MAX_OUTPUT_TOKENS": "32000",
     "BASH_MAX_TIMEOUT_MS": "1200000"
   },
+  "outputStyle": "ccc-report",
+  "statusLine": {
+    "type": "command",
+    "command": "bash /root/.claude/hooks/statusline.sh",
+    "padding": 1
+  },
   "permissions": {
     "allow": [
       "Bash(*)",
