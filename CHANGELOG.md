@@ -2,6 +2,16 @@
 
 All notable changes to the Claude Code node harness. Dates are KST.
 
+## [0.1.1] — 2026-06-20
+
+### Fixed
+- **Plugin now actually loads.** The 0.1.0 manifest passed `claude plugin validate` but failed at install time (`Status: ✘ failed to load`). Two distinct defects, both confirmed by a real isolated install on Claude Code 2.1.183:
+  1. `plugin.json` referenced `./hooks/hooks.json` in its `hooks` field, but `hooks/hooks.json` is auto-loaded — the duplicate reference aborted the whole plugin load.
+  2. `agents`/`commands` custom-path **arrays** (`./claude/...`) are schema-valid but silently load **0** components in this CLI; only default-location discovery is honoured.
+- **Fix**: the marketplace entry now points the plugin root at the existing component tree via `source: "./claude"`. The manifest moves to `claude/.claude-plugin/plugin.json` with **no path fields** (agents/commands/skills/hooks auto-discovered), and the hook config moves to `claude/hooks/hooks.json` with `${CLAUDE_PLUGIN_ROOT}/hooks/*.sh` paths. No `claude/` restructure; `setup.sh` is unaffected.
+- Verified real install: `Status: ✔ enabled` — Skills 7 (incl. 3 commands), Agents 4, Hooks 6, all hook scripts resolve.
+- **Validator hardened** (`scripts/validate-harness.sh`): now resolves every `${CLAUDE_PLUGIN_ROOT}` hook path to an on-disk script, rejects silent-load path fields, asserts `source: "./claude"`, and runs `claude plugin validate` when the CLI is present — the checks that would have caught 0.1.0.
+
 ## [0.1.0] — 2026-06-20
 
 First versioned/packaged release. Installable as a Claude Code **plugin** (`/plugin marketplace add jinwon-int/ccc-node` → `/plugin install ccc-node@ccc-node`) in addition to the existing `setup.sh` bootstrap.
