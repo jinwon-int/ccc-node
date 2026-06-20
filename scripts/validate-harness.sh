@@ -57,6 +57,13 @@ fm_check() { # <file>
 }
 for f in claude/skills/*/SKILL.md; do [ -f "$f" ] && fm_check "$f" && say "  ok $f"; done
 for f in claude/agents/*.md;      do [ -f "$f" ] && fm_check "$f" && say "  ok $f"; done
+# slash commands: frontmatter must carry description: (command name = filename, so no name:)
+for f in claude/commands/*.md; do
+  [ -f "$f" ] || continue
+  head -1 "$f" | grep -q '^---' || { err "no frontmatter: $f"; continue; }
+  awk 'NR>1 && /^---/{exit} {print}' "$f" | grep -q '^description:' || err "no description: in $f"
+  say "  ok $f"
+done
 
 # 6) hooks referenced by settings.json must exist on disk
 say "== referenced hooks exist =="
