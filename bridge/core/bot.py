@@ -48,6 +48,7 @@ from claude_agent_sdk.types import PermissionResultAllow, PermissionResultDeny
 from telegram_bot.utils.chat_logger import log_debug
 from telegram_bot.utils.tg_format import wrap_markdown_tables
 from telegram_bot.utils.tg_robust import send_with_retry
+from telegram_bot.utils import tg_md
 from telegram_bot.utils.audio_processor import AudioProcessor
 from telegram_bot.utils.transcription import (
     EmptyTranscriptionError,
@@ -2714,6 +2715,48 @@ class TelegramBot:
             chunks.append(remaining)
         return chunks
 
+    async def _deliver_markdown(self, content: str, op, base_parse_mode: str = "Markdown"):
+        """Split *content* and send each chunk via ``op(text, parse_mode)``.
+
+        ``op`` is a callable ``(text, parse_mode|None) -> awaitable`` returning a
+        fresh awaitable each call. Markdown is rendered to Telegram **MarkdownV2**
+        (GFM tables -> aligned code blocks, special chars escaped) when the
+        telegramify renderer is available; on the rare per-chunk parse error we
+        fall back to clean plain text for that chunk only. ``HTML`` callers keep
+        HTML; if the renderer is unavailable we use the legacy
+        ``wrap_markdown_tables`` + base-parse-mode path.
+        """
+        # HTML callers (e.g. /skills listing) keep their existing behavior.
+        if base_parse_mode == "HTML":
+            for part in self._split_text(wrap_markdown_tables(content)):
+                try:
+                    await send_with_retry(lambda p=part: op(p, "HTML"))
+                except telegram.error.BadRequest:
+                    await send_with_retry(lambda p=part: op(p, None))
+            return
+
+        if tg_md.available():
+            # Split the RAW markdown at paragraph boundaries (with headroom for
+            # MarkdownV2 escape expansion), convert each chunk independently, and
+            # fall back to clean plain text per-chunk on the rare parse error.
+            for raw in self._split_text(content, limit=3500):
+                md2 = tg_md.to_markdownv2(raw)
+                if md2 is not None and tg_md.utf16_len(md2) <= tg_md.TELEGRAM_LIMIT:
+                    try:
+                        await send_with_retry(lambda p=md2: op(p, "MarkdownV2"))
+                        continue
+                    except telegram.error.BadRequest:
+                        pass
+                await send_with_retry(lambda p=raw: op(p, None))
+            return
+
+        # Legacy fallback: telegramify unavailable -> wrap tables + base parse mode.
+        for part in self._split_text(wrap_markdown_tables(content)):
+            try:
+                await send_with_retry(lambda p=part: op(p, base_parse_mode))
+            except telegram.error.BadRequest:
+                await send_with_retry(lambda p=part: op(p, None))
+
     async def _reply_smart(
         self,
         message,
@@ -2725,14 +2768,11 @@ class TelegramBot:
         """Reply with text (splitting if needed), send referenced files, and add option buttons."""
         # Skip text sending if already streamed
         if not streamed:
-            for part in self._split_text(wrap_markdown_tables(content)):
-                try:
-                    await send_with_retry(
-                        lambda p=part: message.reply_text(p, parse_mode=parse_mode)
-                    )
-                except telegram.error.BadRequest:
-                    # Markdown parse error — fall back to plain text.
-                    await send_with_retry(lambda p=part: message.reply_text(p))
+            await self._deliver_markdown(
+                content,
+                lambda t, pm: message.reply_text(t, parse_mode=pm),
+                base_parse_mode=parse_mode,
+            )
 
         await self._send_content_artifacts(message, content, force_options)
 
@@ -2750,14 +2790,10 @@ class TelegramBot:
 
         # Skip text sending if already streamed
         if not streamed:
-            for part in self._split_text(wrap_markdown_tables(content)):
-                try:
-                    await send_with_retry(
-                        lambda p=part: bot.send_message(chat_id, p, parse_mode="Markdown")
-                    )
-                except telegram.error.BadRequest:
-                    # Markdown parse error — fall back to plain text.
-                    await send_with_retry(lambda p=part: bot.send_message(chat_id, p))
+            await self._deliver_markdown(
+                content,
+                lambda t, pm: bot.send_message(chat_id, t, parse_mode=pm),
+            )
 
         resolved_paths = self._resolve_paths(content)
         in_root_paths, _ = self._split_paths_by_scope(resolved_paths)

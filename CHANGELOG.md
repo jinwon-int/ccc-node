@@ -2,6 +2,29 @@
 
 All notable changes to the Claude Code node harness. Dates are KST.
 
+## [0.3.4] — 2026-06-20
+
+Telegram rendering — make tables and special characters display correctly instead of
+falling back to plain text.
+
+### Added
+- `bridge/utils/tg_md.py`: renders standard Markdown to Telegram **MarkdownV2** via
+  `telegramify-markdown` — GFM pipe tables become aligned fixed-width **code blocks** (a real
+  table on mobile), and reserved special characters (`_ * [ ] ( ) ~ \` > # + - = | { } . !`) are
+  escaped correctly so messages no longer hit `BadRequest` and drop to plain text. Decorative
+  heading emojis are stripped (structure kept via bold). Degrades gracefully (returns `None`) when
+  the library is absent so callers keep the legacy path. New dep: `telegramify-markdown>=0.5.0`.
+- `bridge/tests/test_tg_md.py`.
+
+### Changed
+- `bridge/core/bot.py`: `_reply_smart` / `_send_smart` now route text through a shared
+  `_deliver_markdown` helper that renders MarkdownV2 (per-chunk plain-text fallback on parse
+  error). HTML callers (`/skills` listing) keep HTML; if telegramify is unavailable the legacy
+  `wrap_markdown_tables` + Markdown path is used.
+- `bridge/core/streaming.py`: `finalize_draft` upgrades the streamed message to MarkdownV2 on
+  finalize (live drafts stay plain), so streamed responses also render tables/formatting. Any
+  parse/length edge case falls back to the original plain text — delivery is never lost.
+
 ## [0.3.3] — 2026-06-20
 
 Node onboarding hardening — closes the P2–P4 gaps found bringing up `soonwook`/vps6 standalone
