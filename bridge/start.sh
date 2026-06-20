@@ -155,6 +155,14 @@ while [ $# -gt 0 ]; do
             ACTION="uninstall"
             shift
             ;;
+        --install-systemd)
+            ACTION="install-systemd"
+            shift
+            ;;
+        --uninstall-systemd)
+            ACTION="uninstall-systemd"
+            shift
+            ;;
         --status)
             ACTION="status"
             shift
@@ -194,6 +202,8 @@ Options:
   --upgrade           Update bot to latest version and reinstall dependencies
   --install           Install as macOS launchd startup service
   --uninstall         Remove macOS launchd startup service
+  --install-systemd   Install as a Linux systemd startup service (reboot-persistent)
+  --uninstall-systemd Remove the Linux systemd startup service
 EOF
             exit 0
             ;;
@@ -737,6 +747,114 @@ do_uninstall() {
     exit 0
 }
 
+# ── Linux systemd startup service (reboot-persistent) ──
+# Mirrors do_install for Linux nodes, where `start.sh --install` (launchd) does not apply.
+# Runs the bridge in the FOREGROUND under systemd supervision (Type=simple): start.sh's own
+# prepare_runtime + exec_bot_once handle venv/deps/token-lock, and systemd handles restart-on-crash
+# and reboot persistence — so we deliberately do NOT pass -d/--daemon here.
+# Service unit name is overridable via BRIDGE_SERVICE_NAME (default ccc-telegram-bridge), letting
+# one host run multiple bridges (e.g. ccc-telegram-bridge-<slug>). Installs a system unit when run
+# as root, otherwise a `systemctl --user` unit under ~/.config/systemd/user.
+
+systemd_paths() {
+    # Sets SYSTEMD_UNIT_FILE, SYSTEMCTL (array), SYSTEMD_SCOPE based on euid.
+    SYSTEMD_SERVICE="${BRIDGE_SERVICE_NAME:-ccc-telegram-bridge}.service"
+    if [ "$(id -u)" = "0" ]; then
+        SYSTEMD_SCOPE="system"
+        SYSTEMD_UNIT_DIR="/etc/systemd/system"
+        SYSTEMCTL=(systemctl)
+    else
+        SYSTEMD_SCOPE="user"
+        SYSTEMD_UNIT_DIR="$HOME/.config/systemd/user"
+        SYSTEMCTL=(systemctl --user)
+    fi
+    SYSTEMD_UNIT_FILE="$SYSTEMD_UNIT_DIR/$SYSTEMD_SERVICE"
+}
+
+do_install_systemd() {
+    if ! command -v systemctl >/dev/null 2>&1; then
+        echo "❌ systemctl not found — this host does not use systemd. On macOS use --install instead."
+        exit 1
+    fi
+    check_env
+    systemd_paths
+
+    # Build PATH so the claude CLI (often in ~/.local/bin) is reachable from the unit.
+    local svc_path="$PATH"
+    if [ -d "$HOME/.local/bin" ] && ! echo "$svc_path" | grep -q "$HOME/.local/bin"; then
+        svc_path="$HOME/.local/bin:$svc_path"
+    fi
+    # Optional proxy, mirrored from the launchd installer.
+    local proxy_url proxy_env=""
+    proxy_url="$(read_env_with_fallback "PROXY_URL")"
+    if [ -n "$proxy_url" ]; then
+        proxy_env="Environment=http_proxy=${proxy_url}
+Environment=https_proxy=${proxy_url}
+Environment=all_proxy=${proxy_url}
+Environment=no_proxy=localhost,127.0.0.1,192.168.0.0/16,10.0.0.0/8,172.16.0.0/12"
+    fi
+
+    local wanted_by="default.target"
+    [ "$SYSTEMD_SCOPE" = "system" ] && wanted_by="multi-user.target"
+
+    echo "📝 Generating systemd unit: $SYSTEMD_UNIT_FILE"
+    mkdir -p "$SYSTEMD_UNIT_DIR"
+    cat > "$SYSTEMD_UNIT_FILE" <<UNIT
+[Unit]
+Description=ccc-node Telegram bridge (${PROJECT_SLUG})
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=${REPO_ROOT}
+Environment=HOME=${HOME}
+Environment=PATH=${svc_path}
+${proxy_env}
+ExecStart=/bin/bash ${SCRIPT_DIR}/start.sh --path ${PROJECT_ROOT}
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=20
+
+[Install]
+WantedBy=${wanted_by}
+UNIT
+    # Collapse the blank line left when there is no proxy block.
+    sed -i '/^$/d' "$SYSTEMD_UNIT_FILE" 2>/dev/null || true
+
+    "${SYSTEMCTL[@]}" daemon-reload
+    if "${SYSTEMCTL[@]}" enable --now "$SYSTEMD_SERVICE"; then
+        echo "✅ Installed and started as $SYSTEMD_SCOPE service: $SYSTEMD_SERVICE"
+    else
+        echo "⚠️  enable --now failed; unit written to $SYSTEMD_UNIT_FILE — inspect with: ${SYSTEMCTL[*]} status $SYSTEMD_SERVICE"
+        exit 1
+    fi
+    local journal_scope=""
+    [ "$SYSTEMD_SCOPE" = "user" ] && journal_scope="--user "
+    echo "💡 Status: ${SYSTEMCTL[*]} status $SYSTEMD_SERVICE"
+    echo "💡 Logs:   journalctl ${journal_scope}-u $SYSTEMD_SERVICE -f"
+    echo "💡 Remove: $0 --path \"$PROJECT_ROOT\" --uninstall-systemd"
+    exit 0
+}
+
+do_uninstall_systemd() {
+    if ! command -v systemctl >/dev/null 2>&1; then
+        echo "❌ systemctl not found — nothing to uninstall."
+        exit 1
+    fi
+    systemd_paths
+    if [ -f "$SYSTEMD_UNIT_FILE" ]; then
+        echo "🗑️  Removing systemd unit: $SYSTEMD_UNIT_FILE"
+        "${SYSTEMCTL[@]}" disable --now "$SYSTEMD_SERVICE" 2>/dev/null || true
+        rm -f "$SYSTEMD_UNIT_FILE"
+        "${SYSTEMCTL[@]}" daemon-reload
+        echo "✅ systemd service uninstalled"
+    else
+        echo "⚪ systemd service not installed ($SYSTEMD_UNIT_FILE not found)"
+    fi
+    exit 0
+}
+
 do_upgrade() {
     echo "🔄 Checking for updates..."
     local current latest
@@ -847,9 +965,11 @@ cleanup_token_lock_if_safe() {
 case "$ACTION" in
     status)    do_status ;;
     stop)      do_stop ;;
-    install)   do_install ;;
-    uninstall) do_uninstall ;;
-    upgrade)   do_upgrade ;;
+    install)           do_install ;;
+    uninstall)         do_uninstall ;;
+    install-systemd)   do_install_systemd ;;
+    uninstall-systemd) do_uninstall_systemd ;;
+    upgrade)           do_upgrade ;;
     run)       ;; # Continue to startup flow below
 esac
 

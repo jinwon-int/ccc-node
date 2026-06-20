@@ -62,7 +62,8 @@ This bot takes a different approach — **lightweight, zero-infrastructure, secu
 
 ## Platform Support
 
-- **macOS** — fully supported, including `--install` / `--uninstall`
+- **macOS** — fully supported, including launchd auto-start via `--install` / `--uninstall`
+- **Linux (systemd)** — supported, including reboot-persistent auto-start via `--install-systemd` / `--uninstall-systemd`
 - **WSL (Ubuntu/Debian-style Linux userland)** — supported for foreground run, `--daemon`, `--status`, and `--stop`
 - **Native Windows (PowerShell / CMD)** — not supported
 
@@ -114,7 +115,16 @@ Then start the bot:
 ./start.sh --path /path/to/project --upgrade    # Update to latest version
 ./start.sh --path /path/to/project --install    # macOS only: install startup service
 ./start.sh --path /path/to/project --uninstall  # macOS only: remove startup service
+./start.sh --path /path/to/project --install-systemd    # Linux: install systemd startup service (reboot-persistent)
+./start.sh --path /path/to/project --uninstall-systemd  # Linux: remove systemd startup service
 ```
+
+> **Linux reboot-persistence.** `--install` is macOS/launchd only. On Linux use `--install-systemd`:
+> run as root it writes a system unit to `/etc/systemd/system/ccc-telegram-bridge.service` and
+> runs `systemctl enable --now`; run as a normal user it installs a `systemctl --user` unit under
+> `~/.config/systemd/user`. systemd supervises the bridge in the foreground (restart-on-failure),
+> so do not combine it with `-d`. Override the unit name with `BRIDGE_SERVICE_NAME=...` to run
+> multiple bridges on one host.
 
 ## Usage Examples
 
