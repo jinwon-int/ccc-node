@@ -1,0 +1,27 @@
+{
+  "name": "ccc-node",
+  "displayName": "ccc-node — Claude Code node harness",
+  "version": "0.1.0",
+  "description": "Seoyoon/Hermes Claude Code node harness: fail-closed enforcement guard (Fresh-Approval boundary), observability (audit log + secret-awareness + lifecycle notify), A2A worker sub-agent roster, custom skills, and slash commands. Node-local memory bootstrap is installed separately via setup.sh.",
+  "author": {
+    "name": "Seoyoon / Hermes (jinwon-int)",
+    "url": "https://github.com/jinwon-int/ccc-node"
+  },
+  "homepage": "https://github.com/jinwon-int/ccc-node",
+  "repository": "https://github.com/jinwon-int/ccc-node",
+  "license": "UNLICENSED",
+  "keywords": ["harness", "enforcement", "guard", "observability", "a2a", "wiki"],
+  "skills": "./claude/skills/",
+  "commands": [
+    "./claude/commands/node-status.md",
+    "./claude/commands/a2a-claim.md",
+    "./claude/commands/wiki-log.md"
+  ],
+  "agents": [
+    "./claude/agents/a2a-explorer.md",
+    "./claude/agents/a2a-implementer.md",
+    "./claude/agents/a2a-researcher.md",
+    "./claude/agents/a2a-verifier.md"
+  ],
+  "hooks": "./hooks/hooks.json"
+}
