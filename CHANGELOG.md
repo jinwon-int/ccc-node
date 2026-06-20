@@ -2,6 +2,17 @@
 
 All notable changes to the Claude Code node harness. Dates are KST.
 
+## [0.3.7] — 2026-06-21
+
+Harness settings — pin two operational `settings.json` keys (issue #13 Tier 3).
+
+### Added
+- `claude/settings.base.json`: `includeCoAuthoredBy: true` (keep the `Co-authored-by`
+  trailer on Claude-made commits, matching the gh-pr-flow convention) and
+  `cleanupPeriodDays: 30` (explicit chat/transcript retention period). First slice of
+  the #13 harness-maturity roadmap's Tier 3 settings keys; the `model` pin is
+  intentionally deferred (operational impact, decided separately).
+
 ## [0.3.6] — 2026-06-20
 
 Telegram rendering — fix the MarkdownV2 path silently dropping long/symbol-dense messages
