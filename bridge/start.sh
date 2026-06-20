@@ -25,14 +25,27 @@ get_requirements_hash() {
 }
 
 ensure_venv() {
-    if [ -d "$VENV_DIR" ]; then
-        return 0
+    if [ ! -d "$VENV_DIR" ]; then
+        echo "📦 Virtual environment not found, creating..."
+        if ! python3 -m venv "$VENV_DIR"; then
+            echo "❌ Failed to create virtual environment: $VENV_DIR"
+            exit 1
+        fi
     fi
+    ensure_package_link
+}
 
-    echo "📦 Virtual environment not found, creating..."
-    if ! python3 -m venv "$VENV_DIR"; then
-        echo "❌ Failed to create virtual environment: $VENV_DIR"
-        exit 1
+ensure_package_link() {
+    # Make the package importable as `telegram_bot`. start.sh launches the bot via
+    # `python -m telegram_bot`, but the code lives in this dir (named `bridge`). Expose it
+    # with a self-contained symlink INSIDE the venv's site-packages (already on sys.path).
+    # Idempotent and recreated whenever the venv is, so `start.sh` works on its own without
+    # requiring `setup.sh` to have run first (otherwise the bot crash-loops with
+    # "No module named telegram_bot"). Mirrors setup.sh's package-link step.
+    local sp
+    sp="$("$VENV_DIR/bin/python" -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])' 2>/dev/null)"
+    if [ -n "$sp" ] && [ -d "$sp" ]; then
+        ln -sfn "$SCRIPT_DIR" "$sp/telegram_bot"
     fi
 }
 
