@@ -44,7 +44,9 @@ install `wiki-agent`, `gh auth login`, start a fresh session to verify injection
 ### Install the portable surface as a plugin (optional)
 
 The node-agnostic surface — enforcement guard + observability hooks, A2A agents, skills,
-and slash commands — is also packaged as a Claude Code plugin (`.claude-plugin/`):
+and slash commands — is also packaged as a Claude Code plugin. The marketplace catalog
+lives at `.claude-plugin/marketplace.json` and points the plugin root at the existing
+`claude/` tree (`source: "./claude"`), so components are auto-discovered with no duplication:
 
 ```bash
 /plugin marketplace add jinwon-int/ccc-node

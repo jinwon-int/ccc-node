@@ -11,24 +11,63 @@ say() { printf '%s\n' "$*"; }
 err() { printf 'FAIL: %s\n' "$*"; fail=1; }
 
 # 1) JSON validity
+# Plugin layout: marketplace at .claude-plugin/marketplace.json (source ./claude);
+# the plugin root is claude/, so its manifest is claude/.claude-plugin/plugin.json and
+# its hook config is the auto-discovered claude/hooks/hooks.json. Components are
+# auto-discovered from claude/{agents,commands,skills} — the manifest carries NO path
+# fields, because this CLI silently loads 0 components from custom agents/commands path
+# arrays (verified on 2.1.183); only default-location discovery is honoured.
 say "== settings JSON =="
 for f in claude/settings.json claude/settings.local.json \
-         .claude-plugin/plugin.json .claude-plugin/marketplace.json hooks/hooks.json; do
+         .claude-plugin/marketplace.json \
+         claude/.claude-plugin/plugin.json claude/hooks/hooks.json; do
   [ -f "$f" ] || { say "  (skip $f — absent)"; continue; }
   if jq -e . "$f" >/dev/null 2>&1; then say "  ok $f"; else err "invalid JSON: $f"; fi
 done
 
-# 1b) plugin manifest: name present + referenced component paths exist
-if [ -f .claude-plugin/plugin.json ]; then
+# 1b) plugin manifest + marketplace catalog + runtime hook-path resolution
+if [ -f claude/.claude-plugin/plugin.json ]; then
   say "== plugin manifest =="
-  jq -e '.name' .claude-plugin/plugin.json >/dev/null 2>&1 && say "  ok plugin.json has name" || err "plugin.json missing name"
-  mapfile -t PPATHS < <(jq -r '[.skills, .hooks, (.commands[]?), (.agents[]?)] | .[] | select(type=="string")' .claude-plugin/plugin.json 2>/dev/null)
-  for p in "${PPATHS[@]}"; do
-    rel="${p#./}"
-    if [ -e "$rel" ]; then say "  ok path $rel"; else err "plugin.json path missing: $p"; fi
-  done
-  jq -e '.plugins[0].name and .plugins[0].source' .claude-plugin/marketplace.json >/dev/null 2>&1 \
+  jq -e '.name' claude/.claude-plugin/plugin.json >/dev/null 2>&1 && say "  ok plugin.json has name" || err "plugin.json missing name"
+  # Guard against the silent-load trap: agents/commands custom-path fields don't load.
+  if jq -e 'has("agents") or has("commands") or has("hooks")' claude/.claude-plugin/plugin.json >/dev/null 2>&1; then
+    err "plugin.json must NOT set agents/commands/hooks path fields — they silently load 0 components; rely on default-location discovery under claude/"
+  else
+    say "  ok plugin.json has no silent-load path fields"
+  fi
+  # marketplace source must point the plugin root at ./claude (where the components live)
+  src="$(jq -r '.plugins[0].source // empty' .claude-plugin/marketplace.json 2>/dev/null)"
+  jq -e '.plugins[0].name' .claude-plugin/marketplace.json >/dev/null 2>&1 \
     && say "  ok marketplace.json catalog" || err "marketplace.json malformed"
+  [ "$src" = "./claude" ] && say "  ok marketplace source -> ./claude" \
+    || err "marketplace plugin source must be \"./claude\" (got: ${src:-<unset>})"
+  # default-discovery dirs must exist under the plugin root
+  for d in claude/agents claude/commands claude/skills; do
+    [ -d "$d" ] && say "  ok component dir $d" || err "missing component dir: $d"
+  done
+fi
+
+# 1c) hooks.json runtime-path resolution — the check that catches broken ${CLAUDE_PLUGIN_ROOT}
+# references (plugin root = claude/, so ${CLAUDE_PLUGIN_ROOT}/X resolves to claude/X).
+if [ -f claude/hooks/hooks.json ]; then
+  say "== hook-path resolution =="
+  mapfile -t HK < <(jq -r '.. | .command? // empty' claude/hooks/hooks.json 2>/dev/null \
+    | grep -oE '\$\{CLAUDE_PLUGIN_ROOT\}"?/[A-Za-z0-9_./-]+\.sh' | sed -E 's#.*\}"?/##' | sort -u)
+  [ "${#HK[@]}" -gt 0 ] || err "hooks.json references no \${CLAUDE_PLUGIN_ROOT} scripts"
+  for rel in "${HK[@]}"; do
+    if [ -f "claude/$rel" ]; then say "  ok \${CLAUDE_PLUGIN_ROOT}/$rel -> claude/$rel"
+    else err "hooks.json references missing script: \${CLAUDE_PLUGIN_ROOT}/$rel (expected claude/$rel)"; fi
+  done
+fi
+
+# 1d) best-effort real load check via the Claude CLI (non-blocking if absent)
+if command -v claude >/dev/null 2>&1; then
+  say "== claude plugin validate =="
+  if claude plugin validate . >/tmp/pluginval.out 2>&1; then
+    say "  ok claude plugin validate (see /tmp/pluginval.out)"
+  else
+    say "  (claude plugin validate reported issues — review /tmp/pluginval.out; non-blocking)"
+  fi
 fi
 
 # 2) shell syntax (bash -n) on all hook + top-level scripts

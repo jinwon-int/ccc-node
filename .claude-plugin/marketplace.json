@@ -7,7 +7,7 @@
   "plugins": [
     {
       "name": "ccc-node",
-      "source": "./",
+      "source": "./claude",
       "description": "Claude Code node harness — fail-closed enforcement guard, observability (audit/secret-awareness/notify), A2A worker sub-agent roster, custom skills, and slash commands."
     }
   ]
