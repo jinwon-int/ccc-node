@@ -129,6 +129,16 @@ for r in "${REFS[@]}"; do
   if [ -f "$base" ]; then say "  ok $base"; else err "settings references missing hook: $r ($base)"; fi
 done
 
+# 6a) every referenced hook must ALSO be installed by setup.sh — a hook that exists in the
+# repo but is not copied to ~/.claude would be referenced-but-missing on a real install
+# (e.g. evidence-gate.sh was added to the Stop hook but initially omitted from setup.sh).
+say "== referenced hooks installed by setup.sh =="
+for r in "${REFS[@]}"; do
+  hook="$(basename "$r")"
+  if grep -q "hooks/$hook'" setup.sh 2>/dev/null; then say "  ok setup.sh installs $hook"
+  else err "setup.sh does not install referenced hook: $hook"; fi
+done
+
 # 6b) Single-owner invariant: base (node-local) and overlay (portable) must NOT share any
 # hook event, or a standalone install would double-register; and the overlay must match the
 # plugin's hooks/hooks.json modulo the path prefix (same events, matchers, script basenames),

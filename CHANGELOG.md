@@ -2,6 +2,17 @@
 
 All notable changes to the Claude Code node harness. Dates are KST.
 
+## [0.3.12] — 2026-06-21
+
+Fix — setup.sh did not install evidence-gate.sh (added in 0.3.8 but omitted from the
+install list), so a real install referenced a Stop hook that wasn't on disk.
+
+### Fixed
+- `setup.sh`: copy `claude/hooks/evidence-gate.sh` into `~/.claude/hooks/` alongside the
+  other portable hooks.
+- `scripts/validate-harness.sh`: new check — every hook referenced by settings/overlay must
+  also be installed by `setup.sh` (catches referenced-but-not-installed hooks at CI time).
+
 ## [0.3.11] — 2026-06-21
 
 Permissions model — document the allow-all + fail-closed-hook decision (#13 item #3).
