@@ -12,7 +12,7 @@ from telegram import Bot
 from telegram.error import TelegramError, RetryAfter, BadRequest
 
 from telegram_bot.utils.config import config
-from telegram_bot.utils import tg_md
+from telegram_bot.utils import tg_md, tg_readable
 
 logger = logging.getLogger(__name__)
 
@@ -209,7 +209,15 @@ class StreamingMessageHandler:
         # to drop the whole draft to plain text in that case (all formatting lost);
         # instead we now upgrade the draft to the first chunk and send the overflow
         # as follow-up MarkdownV2 messages.
-        md2 = tg_md.to_markdownv2(draft.text)
+        # Optionally normalize layout for mobile readability before MarkdownV2
+        # (opt-in via CCC_TELEGRAM_READABLE_RENDERER). Content-preserving and
+        # fail-open; the plain fallback below still uses the original draft.text
+        # so delivery is never affected.
+        render_text = draft.text
+        if getattr(config, "enable_readable_renderer", False):
+            render_text = tg_readable.to_readable(draft.text)
+
+        md2 = tg_md.to_markdownv2(render_text)
         parts = tg_md.split_markdownv2(md2) if md2 is not None else None
         use_md2 = bool(parts)
         md2_applied = False
