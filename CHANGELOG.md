@@ -2,6 +2,22 @@
 
 All notable changes to the Claude Code node harness. Dates are KST.
 
+## [0.3.1] — 2026-06-20
+
+Plugin-mode install — resolve portable-hook double-firing between `setup.sh` and the plugin.
+
+### Changed
+- **Single owner per portable hook.** `settings.json` and an enabled plugin both register hooks and Claude Code does not de-duplicate them, so a node running both would fire guard/audit/redact/notify **twice**. `setup.sh` now composes `settings.json` from two sources and you pick one owner per node:
+  - `claude/settings.base.json` — node-local hooks (SessionStart/Pre+PostCompact) + statusLine + outputStyle, always installed.
+  - `claude/hooks/enforcement-overlay.json` — the portable hooks (guard/audit/redact/notify), absolute paths.
+  - `./setup.sh` (standalone, default): merges base + overlay → `settings.json` owns everything.
+  - `./setup.sh --with-plugin`: installs lean settings (base only); the **plugin** owns the portable hooks.
+- The static `claude/settings.json` is removed; it is now generated at install (single source of truth, no drift).
+- Validator: base/overlay hook events must be disjoint; the overlay must stay equivalent to the plugin's `hooks/hooks.json` (same events/matchers/script basenames, modulo the `${CLAUDE_PLUGIN_ROOT}` vs `/root/.claude` path prefix) so both modes enforce identically; the rendered standalone settings is validated.
+
+### Notes
+- Reference/bootstrap nodes (e.g. nosuk) stay **standalone**; plugin mode is for nodes that consume ccc-node via the marketplace. Mixing modes on one node is what double-fires — don't enable the plugin on a standalone install.
+
 ## [0.3.0] — 2026-06-20
 
 Tier 1.5 follow-up — Telegram push delivery (token-isolated, owner-only, opt-in).

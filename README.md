@@ -69,11 +69,27 @@ The plugin and `setup.sh` are complementary: the **plugin** carries the portable
 while **`setup.sh`** installs the node-local memory bootstrap (SessionStart/PostCompact
 injection, working-state checkpoint) that is inherently node-specific. See `CHANGELOG.md`.
 
+**Avoiding double-firing.** The portable enforcement/observability hooks (guard/audit/redact/
+notify) must have exactly one owner — `settings.json` and the plugin both register hooks and
+Claude Code does not de-duplicate them. So `setup.sh` composes `settings.json` from two sources:
+`claude/settings.base.json` (node-local hooks + statusLine + outputStyle, always installed) and
+`claude/hooks/enforcement-overlay.json` (the portable hooks). Pick one mode per node:
+
+- **Standalone** (default): `./setup.sh` merges base + overlay — `settings.json` owns everything,
+  no plugin required.
+- **Plugin mode**: `./setup.sh --with-plugin` installs lean settings (base only); the installed
+  **plugin** owns the portable hooks. Use this on nodes that consume ccc-node via the marketplace.
+
+Don't enable the plugin on a node installed standalone (or vice-versa) — that double-fires the
+portable hooks. The validator asserts the overlay and the plugin's `hooks/hooks.json` stay
+equivalent so the two modes enforce identically.
+
 ## Layout
 
 ```
 claude/
-  settings.json            # permissions + SessionStart/PostCompact hooks (secret-free)
+  settings.base.json       # node-local hooks + statusLine + outputStyle (always installed)
+  hooks/enforcement-overlay.json  # portable hooks; merged in for standalone, omitted in plugin mode
   settings.local.json      # local permission allowlist
   CLAUDE.md.template        # operating policy w/ <PLACEHOLDERS> -> ~/.claude/CLAUDE.md
   hooks/

@@ -5,11 +5,22 @@
 # and lays down per-node templates you then fill in. NEVER writes secrets.
 #
 # Usage:
-#   ./setup.sh            # install + print follow-up checklist
-#   ./setup.sh --dry-run  # show what would happen, change nothing
+#   ./setup.sh                 # standalone: install full settings (portable hooks included)
+#   ./setup.sh --with-plugin   # plugin mode: lean settings; the ccc-node PLUGIN owns the
+#                              #   portable hooks (guard/audit/redact/notify) — avoids the
+#                              #   double-firing you'd get if both settings.json and the
+#                              #   plugin registered them. Node-local hooks stay in settings.
+#   ./setup.sh --dry-run       # show what would happen, change nothing (combine with above)
 set -euo pipefail
 
-DRY=0; [ "${1:-}" = "--dry-run" ] && DRY=1
+DRY=0; WITH_PLUGIN=0
+for arg in "$@"; do
+  case "$arg" in
+    --dry-run) DRY=1 ;;
+    --with-plugin) WITH_PLUGIN=1 ;;
+    *) echo "Unknown flag: $arg" >&2; exit 2 ;;
+  esac
+done
 SRC="$(cd "$(dirname "$0")" && pwd)"
 CLAUDE_DIR="$HOME/.claude"
 MEM_DIR="$CLAUDE_DIR/memories"          # node-owned memory (Hermes-independent)
@@ -22,7 +33,18 @@ echo "==> Installing Claude Code node setup from: $SRC"
 
 # 1) Claude harness config + hooks (safe, secret-free)
 run "mkdir -p '$CLAUDE_DIR/hooks'"
-run "cp '$SRC/claude/settings.json'           '$CLAUDE_DIR/settings.json'"
+# settings.json is composed from two sources so the portable enforcement/observability
+# hooks have a SINGLE owner (no double-firing):
+#   - claude/settings.base.json          : node-local hooks + statusLine + outputStyle (always)
+#   - claude/hooks/enforcement-overlay.json : portable hooks guard/audit/redact/notify
+# Standalone (default): base + overlay merged → settings.json owns everything.
+# --with-plugin: base only → the ccc-node plugin's hooks/hooks.json owns the portable hooks.
+if [ "$WITH_PLUGIN" = 1 ]; then
+  note "plugin mode: lean settings (portable hooks come from the ccc-node plugin)"
+  run "cp '$SRC/claude/settings.base.json'    '$CLAUDE_DIR/settings.json'"
+else
+  run "jq -s '.[0] as \$b | .[1] as \$o | \$b | .hooks = (\$b.hooks + \$o.hooks)' '$SRC/claude/settings.base.json' '$SRC/claude/hooks/enforcement-overlay.json' > '$CLAUDE_DIR/settings.json'"
+fi
 run "cp '$SRC/claude/settings.local.json'     '$CLAUDE_DIR/settings.local.json'"
 run "cp '$SRC/claude/hooks/load-memory.sh'    '$CLAUDE_DIR/hooks/load-memory.sh'"
 run "cp '$SRC/claude/hooks/refresh-memory.sh' '$CLAUDE_DIR/hooks/refresh-memory.sh'"
