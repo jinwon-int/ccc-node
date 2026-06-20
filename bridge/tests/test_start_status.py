@@ -1,5 +1,6 @@
 import json
 import os
+import platform
 import pty
 import re
 import select
@@ -27,6 +28,19 @@ class StartStatusTests(unittest.TestCase):
         cls.repo_root = Path(__file__).resolve().parents[1]
         cls.start_script = cls.repo_root / "start.sh"
 
+    @staticmethod
+    def _hermetic_env(env: dict[str, str] | None) -> dict[str, str]:
+        """Build the subprocess env for start.sh invocations.
+
+        These tests pass the project path explicitly as a CLI argument, so an
+        ambient ``PROJECT_ROOT`` must not leak in and override it. Other tests in
+        the suite (e.g. test_push_notifier) set ``PROJECT_ROOT`` in ``os.environ``
+        at import time, which would otherwise make these tests order-dependent.
+        """
+        resolved = dict(os.environ if env is None else env)
+        resolved.pop("PROJECT_ROOT", None)
+        return resolved
+
     def _run_status(
         self, project_root: Path, env: dict[str, str] | None = None
     ) -> subprocess.CompletedProcess[str]:
@@ -36,7 +50,7 @@ class StartStatusTests(unittest.TestCase):
             text=True,
             capture_output=True,
             check=False,
-            env=env,
+            env=self._hermetic_env(env),
         )
 
     def _run_stop(
@@ -48,7 +62,7 @@ class StartStatusTests(unittest.TestCase):
             text=True,
             capture_output=True,
             check=False,
-            env=env,
+            env=self._hermetic_env(env),
         )
 
     def _prepare_project(self, tmpdir: str) -> Path:
@@ -158,7 +172,7 @@ class StartStatusTests(unittest.TestCase):
             stdin=slave_fd,
             stdout=slave_fd,
             stderr=slave_fd,
-            env=env,
+            env=self._hermetic_env(env),
             text=False,
             close_fds=True,
         )
@@ -466,6 +480,9 @@ class StartStatusTests(unittest.TestCase):
                 env_contents,
             )
 
+    @unittest.skipUnless(
+        platform.system() == "Darwin", "launchd plist install is macOS-only"
+    )
     def test_install_generates_launchd_plist_with_environment_variables(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             project_root = self._prepare_project(tmpdir)
@@ -481,7 +498,7 @@ class StartStatusTests(unittest.TestCase):
             self._make_fake_launchctl(fake_bin, launchctl_log)
 
             fake_home = Path(tmpdir) / "home"
-            env = os.environ.copy()
+            env = self._hermetic_env(os.environ.copy())
             env["HOME"] = str(fake_home)
             env["PATH"] = f"{fake_bin}:{env['PATH']}"
 
