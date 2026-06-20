@@ -38,6 +38,9 @@ run "mkdir -p '$CLAUDE_DIR/state/checkpoints'"
 # A2A worker sub-agent roster (explorer/implementer/verifier) — node-agnostic role defs
 run "mkdir -p '$CLAUDE_DIR/agents'"
 run "cp '$SRC/claude/agents/'*.md '$CLAUDE_DIR/agents/'"
+# Slash commands (quick prompt templates: /node-status, /a2a-claim, /wiki-log) — node-agnostic
+run "mkdir -p '$CLAUDE_DIR/commands'"
+run "cp '$SRC/claude/commands/'*.md '$CLAUDE_DIR/commands/'"
 # Custom skills (reusable procedures: wiki-record, mcp-add, skill-suggest, ...) — node-agnostic
 run "mkdir -p '$CLAUDE_DIR/skills'"
 run "cp -r '$SRC/claude/skills/.' '$CLAUDE_DIR/skills/'"
