@@ -1,7 +1,7 @@
 {
   "name": "ccc-node",
   "displayName": "ccc-node — Claude Code node harness",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Seoyoon/Hermes Claude Code node harness: fail-closed enforcement guard (Fresh-Approval boundary), observability (audit log + secret-awareness + lifecycle notify), A2A worker sub-agent roster, custom skills, and slash commands. Node-local memory bootstrap is installed separately via setup.sh.",
   "author": {
     "name": "Seoyoon / Hermes (jinwon-int)",

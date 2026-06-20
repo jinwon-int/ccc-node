@@ -18,7 +18,8 @@ err() { printf 'FAIL: %s\n' "$*"; fail=1; }
 # fields, because this CLI silently loads 0 components from custom agents/commands path
 # arrays (verified on 2.1.183); only default-location discovery is honoured.
 say "== settings JSON =="
-for f in claude/settings.json claude/settings.local.json \
+for f in claude/settings.base.json claude/settings.local.json \
+         claude/hooks/enforcement-overlay.json \
          .claude-plugin/marketplace.json \
          claude/.claude-plugin/plugin.json claude/hooks/hooks.json; do
   [ -f "$f" ] || { say "  (skip $f — absent)"; continue; }
@@ -120,13 +121,39 @@ for f in claude/commands/*.md; do
   say "  ok $f"
 done
 
-# 6) hooks referenced by settings.json must exist on disk
+# 6) hooks referenced by settings (base + overlay) must exist on disk
 say "== referenced hooks exist =="
-mapfile -t REFS < <(jq -r '.. | .command? // empty' claude/settings.json 2>/dev/null | grep -oE '/root/.claude/hooks/[A-Za-z0-9_.-]+\.sh' | sort -u)
+mapfile -t REFS < <(jq -r '.. | .command? // empty' claude/settings.base.json claude/hooks/enforcement-overlay.json 2>/dev/null | grep -oE '/root/.claude/hooks/[A-Za-z0-9_.-]+\.sh' | sort -u)
 for r in "${REFS[@]}"; do
   base="claude/hooks/$(basename "$r")"
-  if [ -f "$base" ]; then say "  ok $base"; else err "settings.json references missing hook: $r ($base)"; fi
+  if [ -f "$base" ]; then say "  ok $base"; else err "settings references missing hook: $r ($base)"; fi
 done
+
+# 6b) Single-owner invariant: base (node-local) and overlay (portable) must NOT share any
+# hook event, or a standalone install would double-register; and the overlay must match the
+# plugin's hooks/hooks.json modulo the path prefix (same events, matchers, script basenames),
+# so the two registration paths (setup.sh vs plugin) stay in sync.
+say "== settings base/overlay/plugin parity =="
+shared="$(jq -rn --slurpfile b claude/settings.base.json --slurpfile o claude/hooks/enforcement-overlay.json \
+  '($b[0].hooks|keys) as $bk | ($o[0].hooks|keys) as $ok | ($bk - ($bk - $ok)) | .[]' 2>/dev/null)"
+[ -z "$shared" ] && say "  ok base/overlay hook events disjoint" \
+  || err "base and overlay share hook event(s) — would double-fire standalone: $shared"
+# normalize: event -> sorted "matcher|basename(cmd)" set, comparing overlay vs plugin hooks.json
+norm() { jq -S '.hooks | to_entries | map({event:.key, items:(.value|map({m:(.matcher//""),
+          c:(.hooks|map(.command|capture("/(?<b>[A-Za-z0-9_.-]+\\.sh)").b // .)|sort)})|sort)})' "$1" 2>/dev/null; }
+if diff <(norm claude/hooks/enforcement-overlay.json) <(norm claude/hooks/hooks.json) >/dev/null 2>&1; then
+  say "  ok overlay ≡ plugin hooks.json (events/matchers/scripts match modulo path)"
+else
+  err "overlay and plugin hooks/hooks.json diverged — setup.sh and plugin would enforce differently"
+fi
+# 6c) Rendered standalone settings (base + overlay) must be valid and carry all hook events.
+if jq -s '.[0] as $b | .[1] as $o | $b | .hooks = ($b.hooks + $o.hooks)' \
+     claude/settings.base.json claude/hooks/enforcement-overlay.json >/tmp/rendered.json 2>/dev/null \
+   && jq -e '.hooks.PreToolUse and .hooks.SessionStart and .statusLine and .outputStyle' /tmp/rendered.json >/dev/null 2>&1; then
+  say "  ok rendered standalone settings valid (node-local + portable + statusLine + outputStyle)"
+else
+  err "rendered standalone settings (base+overlay) invalid or missing expected keys"
+fi
 
 # 7) Tier 3: statusline smoke + settings wiring
 say "== statusline + settings wiring =="
@@ -139,14 +166,14 @@ if [ -f claude/hooks/statusline.sh ]; then
   printf '%s' '' | CCC_NODE=ci bash claude/hooks/statusline.sh >/dev/null 2>&1 \
     && say "  ok statusline.sh survives empty input" || err "statusline.sh crashed on empty input"
 fi
-# settings.json statusLine command must point at an installed script that exists in-repo
-SL_CMD="$(jq -r '.statusLine.command // empty' claude/settings.json 2>/dev/null)"
+# settings statusLine command must point at an installed script that exists in-repo
+SL_CMD="$(jq -r '.statusLine.command // empty' claude/settings.base.json 2>/dev/null)"
 if [ -n "$SL_CMD" ]; then
   base="claude/hooks/$(basename "${SL_CMD##* }")"
   [ -f "$base" ] && say "  ok statusLine -> $base" || err "settings statusLine references missing script: $SL_CMD ($base)"
 fi
-# settings.json outputStyle must name a shipped output-style file
-OS="$(jq -r '.outputStyle // empty' claude/settings.json 2>/dev/null)"
+# settings outputStyle must name a shipped output-style file
+OS="$(jq -r '.outputStyle // empty' claude/settings.base.json 2>/dev/null)"
 if [ -n "$OS" ]; then
   if grep -rqi "^name:[[:space:]]*$OS\b" claude/output-styles/*.md 2>/dev/null \
      || [ -f "claude/output-styles/$OS.md" ]; then say "  ok outputStyle -> $OS";
