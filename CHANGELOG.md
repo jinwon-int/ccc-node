@@ -2,6 +2,23 @@
 
 All notable changes to the Claude Code node harness. Dates are KST.
 
+## [0.3.2] — 2026-06-20
+
+A2A Claude Code worker lane docs — capture the `soonwook` follow-up conversion and remove a
+few `nosuk`-only labels from portable harness messages.
+
+### Added
+- `docs/a2a-claude-worker.md`: documents the poller-service vs analysis-backend split for A2A
+  lanes where `a2a-hermes-worker` remains the systemd poller name but `OPENCLAW_BIN` /
+  `A2A_OPENCLAW_ANALYSIS_BIN` point at `claude-a2a-analysis-bridge.mjs` and broker metadata
+  reports `runtime=claude-code`.
+- `/a2a-claim` and `CLAUDE.md.template` now explicitly warn workers to classify A2A runtime from
+  live env + broker metadata instead of service name.
+
+### Changed
+- Session memory status messages and injected heading are now node-generic (`CCC_NODE`,
+  `/root/.claude/state/node.txt`, or hostname) instead of hard-coded `nosuk`.
+
 ## [0.3.1] — 2026-06-20
 
 Plugin-mode install — resolve portable-hook double-firing between `setup.sh` and the plugin.

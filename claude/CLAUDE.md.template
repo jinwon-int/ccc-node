@@ -22,6 +22,7 @@ Summary of MEMORY.md · USER.md from `/root/.hermes/memories/`. Operational fact
 - Local/GitHub shortcuts are not substitutes for required worker evidence / finalizer flow.
 - Fleet boundaries: **T1 = Seoseo broker**, **T2 = Gwakga broker**. Persistent workers use private broker tunnels where configured.
 - For fleet updates, include broker/worker artifacts + Docker runner image/env synchronization when in scope.
+- ccc-node can coexist with an A2A poller whose systemd service is still named `a2a-hermes-worker`; classify the lane by live env and broker metadata. Claude Code A2A lanes use `claude-a2a-analysis-bridge.mjs` with `metadata.runtime=claude-code` / `harness=claude` / `adapter=claude-a2a-analysis-bridge`.
 
 ## GitHub Hygiene
 - Operational repos should live under **`jinwon-int`** where possible. Older personal-account duplicates → archive / mark legacy.

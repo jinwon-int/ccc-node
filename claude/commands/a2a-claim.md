@@ -8,6 +8,12 @@ You are acting as an A2A Nexus worker (this node) claiming a task.
 
 Follow the worker sub-agent roster + policy (Family Wiki DOC-951 TM-1040; a2a-nexus `worker-subagent-orchestration-policy.md`):
 
+If this node is a Claude Code A2A lane, remember that the systemd service may still be named
+`a2a-hermes-worker`; classify the worker by live env + broker metadata, not by service name.
+The expected Claude lane has `A2A_OPENCLAW_ANALYSIS_BIN`/`OPENCLAW_BIN` pointing at
+`claude-a2a-analysis-bridge.mjs` and broker metadata `runtime=claude-code`, `harness=claude`,
+`adapter=claude-a2a-analysis-bridge`. See repo doc `docs/a2a-claude-worker.md`.
+
 1. **Scope the task** read-only first. Decide its size (small / medium / large) and whether it touches sensitive/Fresh-Approval surfaces.
 2. **Pick the adaptive budget** (0 / 1 / 2 / 3, hard cap 4 incl. the worker; Escape Hatch: 0 is always valid):
    - small / trivial / sensitive → **0** sub-agents; you investigate and finalize directly.

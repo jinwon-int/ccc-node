@@ -1,12 +1,13 @@
 # ccc-node
 
 **CCC = Claude Code Cli** — the unified node-setting monorepo for turning a Seoyoon/Hermes
-node into a **Claude Code node (클코 노드)**: the same harness configuration `nosuk` (VPS2)
-runs, plus the Telegram bridge that connects Claude Code to Telegram, with all secrets and
-node-local state stripped out and replaced by placeholders.
+node into a **Claude Code node (클코 노드)**: the same harness configuration proven on
+`nosuk` (VPS2) and `soonwook` (VPS6), plus the Telegram bridge that connects Claude Code
+to Telegram, with all secrets and node-local state stripped out and replaced by placeholders.
 
-> Captured from the `nosuk` node setup on **2026-06-19** so other nodes can be bootstrapped
-> the same way. This repo holds the **mechanism**, not any node's live secrets/memory.
+> Captured from the `nosuk` node setup on **2026-06-19** and updated after the `soonwook`
+> VPS6 rollout on **2026-06-20** so other nodes can be bootstrapped the same way. This repo
+> holds the **mechanism**, not any node's live secrets/memory.
 >
 > **Bridge provenance:** `bridge/` was vendored from a fork of
 > [`terranc/claude-telegram-bot-bridge`](https://github.com/terranc/claude-telegram-bot-bridge)
@@ -37,6 +38,10 @@ node-local state stripped out and replaced by placeholders.
   `outputStyle`. Switch anytime with `/config` → Output style.
 - **Headless runner** (`headless.sh`) — `claude -p` wrapper for cron/A2A/CI with JSON output
   and a read-only tool baseline; guard enforcement still applies.
+- **A2A Claude Code worker lane** — documentation for nodes whose broker poller keeps the
+  historical `a2a-hermes-worker` service name while the task analysis adapter is switched to
+  `claude-a2a-analysis-bridge` and broker metadata reports `runtime=claude-code`. See
+  [`docs/a2a-claude-worker.md`](docs/a2a-claude-worker.md).
 
 ## Quick start
 
@@ -102,6 +107,8 @@ hermes/
 bridge/                    # Telegram <-> Claude Code bridge (vendored, history preserved)
   start.sh                 # daemon/supervisor entry (--path / --stop / --status / -d)
   core/ interaction/ ...   # bridge source (upstream-independent fork)
+docs/
+  a2a-claude-worker.md     # A2A poller-vs-analysis-backend wiring + verification
 setup.sh                   # idempotent bootstrap (won't overwrite existing real files)
 .gitignore                 # blocks credentials, live memory, caches, sessions
 ```
