@@ -21,4 +21,15 @@ jq -nc --arg ts "$ts" --arg ev "$EVENT" --arg msg "$msg" \
 if [ "$EVENT" = "Notification" ]; then
   printf '%s\t%s\n' "$ts" "${msg:-attention-needed}" >> "$APPROVAL" 2>/dev/null
 fi
+
+# SessionEnd: archive the working-state checkpoint so it survives session exit.
+if [ "$EVENT" = "SessionEnd" ]; then
+  WS="${CCC_WORKING_STATE:-/root/.claude/state/working-state.md}"
+  ARCH_DIR="${CCC_SESSION_ARCHIVE:-/root/.claude/state/session-archive}"
+  if [ -f "$WS" ]; then
+    mkdir -p "$ARCH_DIR" 2>/dev/null
+    stamp="$(printf '%s' "$ts" | tr ':' '-')"
+    cp "$WS" "$ARCH_DIR/working-state-${stamp}.md" 2>/dev/null
+  fi
+fi
 exit 0

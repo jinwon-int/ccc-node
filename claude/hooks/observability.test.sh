@@ -40,6 +40,12 @@ ok "notify writes approval marker" 'grep -q "permission" "$CCC_APPROVAL_LOG"'
 echo '{}' | bash "$HERE/notify.sh" Stop
 ok "notify logs Stop"              'grep -q "\"event\":\"Stop\"" "$CCC_AUDIT_LOG"'
 
+# SessionEnd archives the working-state file
+export CCC_WORKING_STATE="$TMP/ws.md"; export CCC_SESSION_ARCHIVE="$TMP/arch"
+printf 'objective: test\n' > "$CCC_WORKING_STATE"
+echo '{}' | bash "$HERE/notify.sh" SessionEnd
+ok "SessionEnd archives ws"        'ls "$TMP/arch"/working-state-*.md >/dev/null 2>&1'
+
 # --- guard.sh: denial writes approval-needed marker (label only, no raw cmd) ---
 echo '{"tool_name":"Bash","tool_input":{"command":"git push --force origin main"}}' | bash "$HERE/guard.sh" >/dev/null 2>&1
 ok "guard logs denial label"       'grep -q "DENY\[force-push\]" "$CCC_APPROVAL_LOG"'
