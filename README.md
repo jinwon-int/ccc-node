@@ -25,6 +25,10 @@ node-local state stripped out and replaced by placeholders.
   hygiene, fresh-approval rules) with node/user identity as `<PLACEHOLDERS>`.
 - **Telegram bridge** (`bridge/`) — a lightweight bot that bridges Claude Code to Telegram
   for any local folder, with autostart/supervisor support. Run via `bridge/start.sh`.
+- **Push notifier** (`bridge/core/push_notifier.py`) — opt-in, owner-only delivery of
+  Claude Code lifecycle notifications. The notify hook (`CCC_NOTIFY_TELEGRAM=1`) writes
+  redacted summaries to a spool; the bridge sends them so the **bot token never leaves the
+  bridge**. Disabled by default; enable via `CCC_PUSH_ENABLED` + an owner chat id.
 - **Status line** (`hooks/statusline.sh`) — node · model · git · context % · `⚠200k` · cost ·
   A2A marker · output style, wired via `settings.json` `statusLine`. Set `CCC_NODE` (or
   `~/.claude/state/node.txt`) for the node label; falls back to the short hostname.

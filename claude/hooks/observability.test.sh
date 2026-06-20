@@ -40,6 +40,16 @@ ok "notify writes approval marker" 'grep -q "permission" "$CCC_APPROVAL_LOG"'
 echo '{}' | bash "$HERE/notify.sh" Stop
 ok "notify logs Stop"              'grep -q "\"event\":\"Stop\"" "$CCC_AUDIT_LOG"'
 
+# --- Telegram push spool: OFF by default, opt-in writes a redacted owner-only summary ---
+echo '{"message":"needs permission"}' | CCC_PUSH_SPOOL="$TMP/spool" bash "$HERE/notify.sh" Notification
+ok "push spool off by default"     '[ ! -d "$TMP/spool" ]'
+
+echo '{"message":"approve ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ012345 now"}' \
+  | CCC_NOTIFY_TELEGRAM=1 CCC_NODE=testnode CCC_PUSH_SPOOL="$TMP/spool" bash "$HERE/notify.sh" Notification
+ok "push spool writes when opt-in"  'ls "$TMP/spool"/*.json >/dev/null 2>&1'
+ok "push spool redacts token"       'cat "$TMP/spool"/*.json | grep -q "\\[REDACTED\\]" && ! cat "$TMP/spool"/*.json | grep -q "ABCDEFGHIJKLMNOPQRSTUVWXYZ012345"'
+ok "push spool carries node label"  'cat "$TMP/spool"/*.json | grep -q "testnode"'
+
 # SessionEnd archives the working-state file
 export CCC_WORKING_STATE="$TMP/ws.md"; export CCC_SESSION_ARCHIVE="$TMP/arch"
 printf 'objective: test\n' > "$CCC_WORKING_STATE"

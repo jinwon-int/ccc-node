@@ -2,6 +2,19 @@
 
 All notable changes to the Claude Code node harness. Dates are KST.
 
+## [0.3.0] — 2026-06-20
+
+Tier 1.5 follow-up — Telegram push delivery (token-isolated, owner-only, opt-in).
+
+### Added
+- **Bridge push notifier** (`bridge/core/push_notifier.py`): a background task in the Telegram bridge that delivers Claude Code lifecycle notifications to the **owner only**, decoupled from the hook via a filesystem spool. The bot **token never leaves the bridge** — the hook writes summaries, the bridge sends them. Owner target = `CCC_PUSH_CHAT_ID` or the sole `ALLOWED_USER_IDS`. Rate-limited, deduplicated, best-effort (delivery failure never crashes the bot). **Disabled by default** (`CCC_PUSH_ENABLED`); merging/restarting is a no-op until an operator opts in.
+- **notify hook spool** (`claude/hooks/notify.sh`): with `CCC_NOTIFY_TELEGRAM=1`, Notification/Stop events also write a short, **redacted** summary (token-shaped runs masked, length-capped) into `~/.claude/state/telegram-spool`. Off by default; never touches the bot token.
+- Config (`bridge/utils/config.py`): `CCC_PUSH_ENABLED` / `CCC_PUSH_CHAT_ID` / `CCC_PUSH_SPOOL` / `CCC_PUSH_POLL_INTERVAL` / `CCC_PUSH_MAX_PER_MINUTE`, documented in `bridge/.env.example`.
+- Tests: `bridge/tests/test_push_notifier.py` (11 cases — disabled-by-default, owner target resolution, dedup, rate-limit, retry-on-failure, malformed-archive, format); observability suite +4 (spool off-by-default, opt-in, redaction, node label) → 17/17.
+
+### Approval boundary
+- Telegram delivery is an outbound provider send. It stays **opt-in + owner-only + token-isolated** by construction; first live activation (set `CCC_PUSH_*`, restart the bridge) remains a separate, explicitly-approved step.
+
 ## [0.2.0] — 2026-06-20
 
 Tier 3 — presentation & headless surface.

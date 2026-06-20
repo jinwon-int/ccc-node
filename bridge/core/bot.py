@@ -38,6 +38,7 @@ from telegram.ext import (
 from telegram.request import BaseRequest, HTTPXRequest
 from telegram_bot.utils.config import config
 from telegram_bot.session.manager import session_manager
+from telegram_bot.core.push_notifier import PushNotifier
 from telegram_bot.core.project_chat import (
     project_chat_handler,
     ChatResponse,
@@ -76,6 +77,8 @@ class TelegramBot:
 
     def __init__(self):
         self.application: Optional[Application] = None
+        # ccc-node owner-only push notifier (disabled unless config.push_enabled).
+        self._push_notifier = PushNotifier()
         # Only sessions created/resumed in current runtime are auto-resumed.
         self._runtime_active_sessions: set[int] = set()
         self._runtime_active_voice_sessions: set[int] = set()
@@ -288,6 +291,7 @@ class TelegramBot:
             await self._on_ready(self.application)
 
             watchdog_task = None
+            push_task = None
             try:
                 await self.application.start()
                 await self.application.updater.start_polling(
@@ -304,6 +308,9 @@ class TelegramBot:
                     health_reporter.record_claude_error(claude_reason)
 
                 watchdog_task = asyncio.create_task(self._polling_watchdog(stop_event))
+                push_task = asyncio.create_task(
+                    self._push_notifier.run(self.application, stop_event)
+                )
 
                 await self._wait_for_polling_exit(stop_event)
 
@@ -359,12 +366,13 @@ class TelegramBot:
                 health_reporter.record_telegram_error(message, consecutive_failures=1)
                 raise SystemExit(message)
             finally:
-                if watchdog_task and not watchdog_task.done():
-                    watchdog_task.cancel()
-                    try:
-                        await watchdog_task
-                    except (asyncio.CancelledError, _PollingRestart):
-                        pass
+                for _task in (watchdog_task, push_task):
+                    if _task and not _task.done():
+                        _task.cancel()
+                        try:
+                            await _task
+                        except (asyncio.CancelledError, _PollingRestart):
+                            pass
                 await self._graceful_shutdown()
 
         logger.info("Bot stopped")
