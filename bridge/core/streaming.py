@@ -12,7 +12,7 @@ from telegram import Bot
 from telegram.error import TelegramError, RetryAfter, BadRequest
 
 from telegram_bot.utils.config import config
-from telegram_bot.utils import tg_md, tg_readable
+from telegram_bot.utils import tg_md, tg_readable, tg_entities
 
 logger = logging.getLogger(__name__)
 
@@ -195,6 +195,48 @@ class StreamingMessageHandler:
         time_elapsed = time.time() - draft.last_update_time
         return new_char_count >= self.min_chars or time_elapsed >= self.min_interval
 
+    async def _finalize_with_entities(self, draft: DraftState, chunks) -> bool:
+        """Finalize using (text + entities) instead of a MarkdownV2 string.
+
+        Returns True on success. Returns False if the primary edit fails, so the
+        caller falls back to the MarkdownV2 path (the draft still holds the
+        original plain text, so re-editing there does not duplicate content).
+        No parse_mode is set when entities are used (they are mutually exclusive).
+        """
+        first_text, first_entities = chunks[0]
+
+        async def _edit():
+            return await self.bot.edit_message_text(
+                chat_id=self.chat_id,
+                message_id=draft.message_id,
+                text=first_text,
+                entities=first_entities or None,
+            )
+
+        try:
+            await self._retry_with_backoff(_edit)
+        except TelegramError as e:
+            if self._is_not_modified_error(e):
+                return True
+            logger.warning(
+                f"Entity finalize failed for draft {draft.message_id} ({e}); "
+                "falling back to MarkdownV2"
+            )
+            return False
+
+        # Overflow chunks as follow-up messages (entities, no parse_mode).
+        for chunk_text, chunk_entities in chunks[1:]:
+            try:
+                await self._retry_with_backoff(
+                    lambda t=chunk_text, ents=chunk_entities: self.bot.send_message(
+                        chat_id=self.chat_id, text=t, entities=ents or None
+                    )
+                )
+            except TelegramError as e:
+                logger.warning(f"Entity overflow chunk send failed: {e}")
+        logger.debug(f"Finalized draft {draft.message_id} via entities")
+        return True
+
     async def finalize_draft(self, draft: DraftState) -> bool:
         """Convert draft to a regular message, rendering Markdown -> MarkdownV2.
 
@@ -216,6 +258,18 @@ class StreamingMessageHandler:
         render_text = draft.text
         if getattr(config, "enable_readable_renderer", False):
             render_text = tg_readable.to_readable(draft.text)
+
+        # Entity path (opt-in via CCC_TELEGRAM_ENTITY_RENDERER): send
+        # (text + MessageEntity[]) without parse_mode, avoiding MarkdownV2 escape
+        # failures. Any failure / unavailable API falls through to MarkdownV2.
+        if getattr(config, "enable_entity_renderer", False):
+            entity_chunks = tg_entities.to_entity_chunks(
+                render_text, tg_md.TELEGRAM_LIMIT
+            )
+            if entity_chunks and await self._finalize_with_entities(
+                draft, entity_chunks
+            ):
+                return True
 
         md2 = tg_md.to_markdownv2(render_text)
         # Optional 'k/N' part markers on multi-chunk responses (opt-in via

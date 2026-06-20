@@ -205,6 +205,16 @@ class Config(BaseSettings):
             "split into more than one message."
         ),
     )
+    enable_entity_renderer: bool = Field(
+        default=False,
+        alias="CCC_TELEGRAM_ENTITY_RENDERER",
+        description=(
+            "Send final Telegram output as (text + MessageEntity[]) instead of a "
+            "MarkdownV2 string, avoiding escape failures (GitHub issue #34). "
+            "Opt-in; falls back to MarkdownV2 if the entity API is unavailable or "
+            "a send fails."
+        ),
+    )
 
     # Voice message configuration
     transcription_provider: str = Field(

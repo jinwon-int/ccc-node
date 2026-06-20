@@ -19,6 +19,9 @@ config_module.config = SimpleNamespace(
 sys.modules["telegram_bot.utils.config"] = config_module
 
 from telegram_bot.core.streaming import StreamingMessageHandler
+from telegram_bot.utils import tg_entities
+
+_ENTITY_OK = tg_entities.available()
 
 
 class _BotWithDraftId:
@@ -275,6 +278,44 @@ class SplitBoundaryGuardTests(unittest.TestCase):
         naive_cut = 30  # inside the table
         cut = self.handler._avoid_block_split(text, naive_cut, max_length=100)
         self.assertEqual(cut, naive_cut)
+
+
+class EntityFinalizeTests(unittest.IsolatedAsyncioTestCase):
+    @unittest.skipUnless(_ENTITY_OK, "entity API unavailable")
+    async def test_entity_path_sends_entities_without_parse_mode(self):
+        class _EntityBot:
+            def __init__(self):
+                self.edits = []
+                self.sends = []
+
+            async def edit_message_text(
+                self, *, chat_id, message_id, text, parse_mode=None, entities=None
+            ):
+                self.edits.append((text, parse_mode, entities))
+                return SimpleNamespace(message_id=message_id)
+
+            async def send_message(
+                self, *, chat_id, text, parse_mode=None, entities=None
+            ):
+                self.sends.append((text, parse_mode, entities))
+                return SimpleNamespace(message_id=900)
+
+        bot = _EntityBot()
+        handler = StreamingMessageHandler(bot=bot, chat_id=42, user_id=7)
+        draft = SimpleNamespace(message_id=10, text="**bold** text")
+
+        config_module.config.enable_entity_renderer = True
+        try:
+            ok = await handler.finalize_draft(draft)
+        finally:
+            config_module.config.enable_entity_renderer = False
+
+        self.assertTrue(ok)
+        self.assertEqual(len(bot.edits), 1)
+        text, parse_mode, entities = bot.edits[0]
+        self.assertIsNone(parse_mode)  # entities and parse_mode are mutually exclusive
+        self.assertTrue(entities)
+        self.assertNotIn("**", text)  # markdown markup moved into entities
 
 
 if __name__ == "__main__":
