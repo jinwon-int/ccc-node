@@ -1,0 +1,16 @@
+name: harness-ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  validate-harness:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install jq + shellcheck
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq jq shellcheck
+      - name: Validate harness (JSON, shell syntax, shellcheck, hook tests, frontmatter)
+        run: bash scripts/validate-harness.sh
