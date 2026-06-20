@@ -10,7 +10,7 @@ approval from execution**: gated actions do not run without an explicit operator
 | `autonomous` | Proceeds silently | — (not matched by guard) | read/search, normal `git`/`gh`/`npm`, file edits in repo |
 | `operator_notify` | Proceeds; recorded | `audit.sh` (PostToolUse) | any mutating tool call (commit, push to a branch, merge) — auditable after the fact |
 | `operator_approval_gated` | **DENIED** until `CCC_ALLOW_GATED=1` | `guard.sh` | service control (broker/Gateway/worker/bridge), DB destructive/migrate/replay, repo visibility, secret read/exfil, secret-file Read/Edit/Write, catastrophic `rm` |
-| `operator_review_gated` | **DENIED**; also needs review evidence | `guard.sh` | force-push, history rewrite, release/publish/tag-push (changes published/shared state) |
+| `operator_review_gated` | **DENIED**; also needs review evidence | `guard.sh` | force-push *to a protected/ambiguous/multi target*, history rewrite, release/publish/tag-push (changes published/shared state) |
 
 ## Bypass (operator approval)
 
@@ -29,7 +29,16 @@ recorded to `~/.claude/state/approval-needed.log`; the bypass is logged to stder
 - `operator_review_gated` differs from `operator_approval_gated` only in that the change
   alters shared/published state (remote history, releases), so it warrants review evidence
   in addition to approval. Both are blocked by default.
-- Fail-closed: if a pattern is uncertain, prefer gating. Patterns are tuned (see
-  `guard.test.sh`, 59 cases) to avoid blocking normal autonomous work.
+- **Force-push relaxation** (operator-approved): a *single explicit* force-push to a
+  **non-protected feature branch** (e.g. `git push -f origin feat/x`) proceeds
+  autonomously — it only rewrites that branch's own history, not shared/published state.
+  It stays **DENIED** (review-gated) when the target is a protected branch
+  (`main`/`master`/`develop`/`release*`/`hotfix/*`/`prod`/`production`/`stable`), is
+  ambiguous/bare (no explicit dst, `HEAD`, current branch), uses multiple refspecs, or is
+  part of a compound/chained command. Fail-closed: when the destination can't be parsed
+  unambiguously, it is denied.
+- Fail-closed: if a pattern is uncertain, prefer gating. Patterns are covered by
+  `guard.test.sh` (allow + deny cases, including the force-push relaxation) to avoid
+  blocking normal autonomous work.
 - This model mirrors the fleet's formal risk profiles and the `CLAUDE.md`
   "Fresh Approval Required" set.

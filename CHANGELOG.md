@@ -2,6 +2,26 @@
 
 All notable changes to the Claude Code node harness. Dates are KST.
 
+## [0.3.10] — 2026-06-21
+
+Guard — relax the force-push gate for a developer's own feature branches (operator-approved).
+
+### Changed
+- `claude/hooks/guard.sh`: a *single explicit* `git push --force`/`-f`/`--force-with-lease`
+  (or `+refspec`) to a **non-protected feature branch** now proceeds autonomously instead of
+  being review-gated — it only rewrites that branch's own history, not shared/published state.
+  The gate still **DENIES** (fail-closed) when the destination is a protected branch
+  (`main`/`master`/`develop`/`release*`/`hotfix/*`/`prod`/`production`/`stable`), is
+  ambiguous/bare (no explicit dst, `HEAD`, current branch), uses multiple refspecs, or is part
+  of a compound/chained command. Destination is parsed from the command's positional args;
+  when it can't be parsed unambiguously, the push is denied.
+- `claude/hooks/RISK-PROFILES.md`: document the relaxation under `operator_review_gated`.
+
+### Added
+- `claude/hooks/guard.test.sh`: allow/deny cases for the relaxation (feature-branch allow;
+  protected/ambiguous/multi/compound deny), and made the suite **hermetic** by stripping any
+  ambient `CCC_ALLOW_GATED` (which would otherwise turn every gated case into a false "allow").
+
 ## [0.3.9] — 2026-06-21
 
 Self-update skill — safe harness drift control (issue #13 Tier 2, item #16).

@@ -66,8 +66,65 @@ g() { grep -Eq "$1" <<<"$c"; }   # case-sensitive
 gi() { grep -Eiq "$1" <<<"$c"; } # case-insensitive
 
 # force push / history rewrite
-g 'git[[:space:]]+push\b.*([[:space:]]-[a-zA-Z]*f\b|--force-with-lease|--force([[:space:]=]|$))' && deny "force-push" "operator_review_gated" "$c"
-g 'git[[:space:]]+push\b.*[[:space:]]\+[A-Za-z0-9_./-]+:'                                         && deny "force-push-refspec" "operator_review_gated" "$c"
+#
+# Force-push is review-gated by default, BUT auto-allowed (operator-approved
+# relaxation) for an *explicit single* force-push to a NON-protected feature
+# branch. Protected branches (main/master/develop/release*/…), ambiguous or
+# bare targets (no explicit dst, HEAD, current branch), multiple refspecs, and
+# compound/chained commands ALL stay DENIED — fail-closed when uncertain.
+is_forcepush() {
+  g 'git[[:space:]]+push\b.*([[:space:]]-[a-zA-Z]*f\b|--force-with-lease|--force([[:space:]=]|$))' && return 0
+  g 'git[[:space:]]+push\b.*[[:space:]]\+[A-Za-z0-9_./-]+:'                                         && return 0  # +src:dst
+  g 'git[[:space:]]+push\b.*[[:space:]]\+[A-Za-z0-9_./-]+([[:space:]]|$)'                           && return 0  # +branch
+  return 1
+}
+
+# 0 = safe (single explicit force-push to a clear non-protected feature branch).
+forcepush_to_feature_branch() {
+  # Never safe if the command chains/embeds anything else.
+  case "$c" in *';'*|*'&'*|*'|'*|*'`'*|*'$('*|*$'\n'*) return 1;; esac
+  # Exactly one `git push` invocation.
+  [ "$(grep -oE 'git[[:space:]]+push\b' <<<"$c" | wc -l)" -eq 1 ] || return 1
+
+  local toks; read -ra toks <<<"$c"
+  local n=${#toks[@]} i=0 pi=-1
+  while [ "$i" -lt "$n" ]; do [ "${toks[$i]}" = "push" ] && { pi=$i; break; }; i=$((i+1)); done
+  [ "$pi" -ge 0 ] || return 1
+
+  # Collect positional args after `push`, skipping flags (and value-taking flags).
+  local positionals=() j=$((pi+1)) t
+  while [ "$j" -lt "$n" ]; do
+    t="${toks[$j]}"
+    case "$t" in
+      -o|--push-option|--repo|--exec|--receive-pack) j=$((j+2)); continue ;;  # flag + its value
+      -*) j=$((j+1)); continue ;;                                             # other flags
+      *) positionals+=("$t") ;;
+    esac
+    j=$((j+1))
+  done
+
+  # Require exactly: <remote> <single-refspec>. Anything else is ambiguous/multi.
+  [ "${#positionals[@]}" -eq 2 ] || return 1
+  local refspec="${positionals[1]}"
+  refspec="${refspec#+}"          # drop leading + (force refspec)
+  local dst="${refspec##*:}"      # dst = after last ':' (whole token if no ':')
+  [ -n "$dst" ] || return 1
+
+  # Protected / ambiguous destinations stay gated.
+  case "$dst" in
+    main|master|develop|HEAD|@|prod|production|stable) return 1 ;;
+    release|release/*|release-*|releases/*|hotfix/*)    return 1 ;;
+  esac
+  # dst must be a plain branch ref (no globs / refspec tricks).
+  printf '%s' "$dst" | grep -Eq '^[A-Za-z0-9._/-]+$' || return 1
+  return 0
+}
+
+if is_forcepush; then
+  forcepush_to_feature_branch \
+    || deny "force-push" "operator_review_gated" "$c"
+  # else: operator-approved relaxation — single force-push to a non-protected feature branch.
+fi
 g 'git[[:space:]]+(filter-branch|filter-repo)([[:space:]]|$)|git-filter-repo'                               && deny "history-rewrite" "operator_review_gated" "$c"
 
 # broker / Gateway / worker / bridge service control

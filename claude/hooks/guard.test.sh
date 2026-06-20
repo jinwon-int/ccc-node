@@ -2,6 +2,10 @@
 # Tests for guard.sh — the PreToolUse fail-closed guard.
 # Usage: bash guard.test.sh   (exit 0 = all pass)
 set -uo pipefail
+# Hermetic: an ambient operator escape hatch in the caller's environment would make every
+# gated case "allow" and silently pass the suite. Strip it; the one escape-hatch case below
+# re-injects it explicitly via `env`.
+unset CCC_ALLOW_GATED
 HERE="$(cd "$(dirname "$0")" && pwd)"
 GUARD="$HERE/guard.sh"
 pass=0; fail=0
@@ -50,11 +54,28 @@ run allow Read file_path '/opt/ccc-node/README.md'
 run allow Read file_path '/opt/ccc-node/hermes/honcho.template.json'
 run allow Edit file_path '/root/.claude/settings.json'
 
+# ---- force-push relaxation: single push to a NON-protected feature branch is allowed ----
+run allow Bash command 'git push -f origin feat/x'
+run allow Bash command 'git push --force origin feature/my-thing'
+run allow Bash command 'git push --force-with-lease origin feat/guard-forcepush-feature-branch-relax'
+run allow Bash command 'git push -f origin HEAD:feat/x'
+run allow Bash command 'git push origin +feat/x'
+run allow Bash command 'git push --force -o ci.skip origin feat/x'
+
 # ---- MUST DENY (fresh-approval / catastrophic) ----
 run deny Bash command 'git push --force origin main'
 run deny Bash command 'git push -f origin main'
 run deny Bash command 'git push --force-with-lease'
 run deny Bash command 'git push origin +main:main'
+# force-push still DENIED for protected / ambiguous / multi / compound targets
+run deny Bash command 'git push -f origin develop'
+run deny Bash command 'git push -f origin master'
+run deny Bash command 'git push --force origin release/1.2'
+run deny Bash command 'git push -f origin HEAD'
+run deny Bash command 'git push -f origin'
+run deny Bash command 'git push -f origin feat/x feat/y'
+run deny Bash command 'git push -f origin +main:main'
+run deny Bash command 'git push -f origin feat/x && rm -rf /tmp/x'
 run deny Bash command 'git filter-branch --tree-filter x HEAD'
 run deny Bash command 'git filter-repo --path secret'
 run deny Bash command 'systemctl restart a2a-broker'
