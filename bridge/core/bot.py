@@ -39,6 +39,7 @@ from telegram.request import BaseRequest, HTTPXRequest
 from telegram_bot.utils.config import config
 from telegram_bot.session.manager import session_manager
 from telegram_bot.core.push_notifier import PushNotifier
+from telegram_bot.core.session_isolation import apply_subprocess_session_isolation
 from telegram_bot.core.project_chat import (
     project_chat_handler,
     ChatResponse,
@@ -232,6 +233,10 @@ class TelegramBot:
 
     async def _run_async(self):
         """Async entry: manage Application lifecycle and polling restart loop."""
+        # Isolate child claude/bash/pytest process trees into their own session so a
+        # SIGTERM/SIGINT from work the bot itself launched cannot propagate back and
+        # stop the bot (see core/session_isolation.py).
+        apply_subprocess_session_isolation()
         loop = asyncio.get_running_loop()
         stop_event = asyncio.Event()
 
