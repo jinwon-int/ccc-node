@@ -4,7 +4,11 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from telegram_bot.utils.tg_readable import to_readable
+from telegram_bot.utils.tg_readable import (
+    to_readable,
+    apply_part_headers,
+    part_marker,
+)
 
 
 class ToReadableTests(unittest.TestCase):
@@ -82,6 +86,30 @@ class ToReadableTests(unittest.TestCase):
             "재시작 확인"
         )
         self.assertEqual(to_readable(before), after)
+
+
+class PartHeaderTests(unittest.TestCase):
+    def test_part_marker_is_markdownv2_safe(self):
+        # '*' is the only markup; digits and '/' need no MarkdownV2 escaping.
+        self.assertEqual(part_marker(2, 3), "*2/3*")
+
+    def test_single_chunk_unchanged(self):
+        self.assertEqual(apply_part_headers(["only"]), ["only"])
+
+    def test_empty_unchanged(self):
+        self.assertEqual(apply_part_headers([]), [])
+
+    def test_multi_chunk_gets_markers(self):
+        self.assertEqual(
+            apply_part_headers(["a", "b", "c"]),
+            ["*1/3*\na", "*2/3*\nb", "*3/3*\nc"],
+        )
+
+    def test_returns_new_list_without_mutating_input(self):
+        src = ["x", "y"]
+        out = apply_part_headers(src)
+        self.assertIsNot(out, src)
+        self.assertEqual(src, ["x", "y"])
 
 
 if __name__ == "__main__":
