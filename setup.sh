@@ -103,6 +103,7 @@ run "cp '$SRC/claude/hooks/guard.sh'          '$CLAUDE_DIR/hooks/guard.sh'"
 run "cp '$SRC/claude/hooks/audit.sh'          '$CLAUDE_DIR/hooks/audit.sh'"
 run "cp '$SRC/claude/hooks/redact.sh'         '$CLAUDE_DIR/hooks/redact.sh'"
 run "cp '$SRC/claude/hooks/notify.sh'         '$CLAUDE_DIR/hooks/notify.sh'"
+run "cp '$SRC/claude/hooks/evidence-gate.sh'  '$CLAUDE_DIR/hooks/evidence-gate.sh'"
 run "cp '$SRC/claude/hooks/statusline.sh'     '$CLAUDE_DIR/hooks/statusline.sh'"
 run "chmod +x '$CLAUDE_DIR/hooks/'*.sh"
 # Tier 3: status line (node·model·git·context·cost·A2A) wired via settings.json statusLine.
