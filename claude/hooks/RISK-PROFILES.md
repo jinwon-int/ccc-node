@@ -42,3 +42,32 @@ recorded to `~/.claude/state/approval-needed.log`; the bypass is logged to stder
   blocking normal autonomous work.
 - This model mirrors the fleet's formal risk profiles and the `CLAUDE.md`
   "Fresh Approval Required" set.
+
+## Permissions (`settings.json`) vs hook enforcement — decision (#13 item #3)
+
+`settings.json` keeps a broad `Bash(*)` allow **on purpose**: enforcement is the hook
+layer, not a permission allowlist. Audit-log analysis (2026-06-21, ~1k tool calls) shows
+this node's Bash usage is overwhelmingly **compound / multi-line** — `cd X && …`,
+heredocs, `for`/`if` loops, pipes. Claude Code permission entries (`Bash(cmd:*)`)
+prefix-match the *whole* command string, so they cannot describe compound commands: a
+per-command allowlist would miss most of them and degrade into constant `ask` prompts,
+breaking autonomous A2A / cron / headless runs (**over-block**).
+
+Therefore:
+
+- **`allow`** stays broad (`Bash(*)`, `Read/Write/Edit/MultiEdit`), so autonomous work is
+  never prompt-blocked.
+- **`guard.sh`** (PreToolUse, regex over the *full* command) is the real Fresh-Approval
+  enforcement — it sees compound commands that `settings` prefix patterns cannot, and is
+  fail-closed.
+- `settings` `deny`/`ask` carry only patterns that are *expressible* as a simple prefix
+  (secret-file `Read`, `npm publish`, `gh release create`, `sudo`) as a declarative second
+  line — never the primary guard. Patterns whose safe form is contextual (e.g. force-push,
+  allowed to non-protected feature branches but denied elsewhere) are left to `guard.sh`
+  to avoid contradicting its policy.
+
+**Decision:** the roadmap's "replace `Bash(*)` allow-all with an allowlist" (#13 item #3)
+is **superseded for this node** by the allow-all + fail-closed-hook model above. The
+acceptance goal — *every Fresh-Approval category is code-blocked or prompts* — is met by
+`guard.sh` and verified by `guard.test.sh`; an allowlist would add over-block risk without
+adding enforcement.

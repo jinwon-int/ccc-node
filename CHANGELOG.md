@@ -2,6 +2,20 @@
 
 All notable changes to the Claude Code node harness. Dates are KST.
 
+## [0.3.11] — 2026-06-21
+
+Permissions model — document the allow-all + fail-closed-hook decision (#13 item #3).
+
+### Changed
+- `claude/hooks/RISK-PROFILES.md`: add a "Permissions vs hook enforcement" decision
+  section. Audit analysis (~1k tool calls) shows Bash usage is overwhelmingly
+  compound/multi-line, which prefix-matched permission entries (`Bash(cmd:*)`) cannot
+  describe — a per-command allowlist would over-block autonomous A2A/cron/headless runs.
+  **Decision:** keep the broad `Bash(*)` allow and rely on `guard.sh` (regex, full-command,
+  fail-closed) as the real Fresh-Approval enforcement; #13 item #3's "replace `Bash(*)`
+  allow-all" is **superseded** for this node. No code/permission change — documents the
+  existing, intentional model.
+
 ## [0.3.10] — 2026-06-21
 
 Guard — relax the force-push gate for a developer's own feature branches (operator-approved).
