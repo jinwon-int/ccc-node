@@ -2,6 +2,22 @@
 
 All notable changes to the Claude Code node harness. Dates are KST.
 
+## [0.3.8] — 2026-06-21
+
+Evidence gate — "evidence before declaring" Stop hook (issue #13 Tier 1.5, item #8).
+
+### Added
+- `claude/hooks/evidence-gate.sh`: opt-in (`CCC_EVIDENCE_GATE=1`) Stop hook. If the
+  current session changed files (Write/Edit/MultiEdit/NotebookEdit) but the audit log
+  shows no verification activity (tests / `--dry-run` / `--check` / `git diff`·`status` /
+  CI checks), it blocks the stop **once** and asks for evidence. Loop-safe
+  (`stop_hook_active` passes through), session-scoped, fail-open. Off by default.
+- `claude/hooks/audit.sh`: record `session_id` so the gate can scope to the current
+  session.
+- Wired the gate into `Stop` in both `claude/hooks/hooks.json` and
+  `claude/hooks/enforcement-overlay.json` (parity preserved); 6 new tests in
+  `observability.test.sh` (23/23 pass).
+
 ## [0.3.7] — 2026-06-21
 
 Harness settings — pin two operational `settings.json` keys (issue #13 Tier 3).

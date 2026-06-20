@@ -51,6 +51,11 @@
         "hooks": [
           {
             "type": "command",
+            "command": "bash /root/.claude/hooks/evidence-gate.sh",
+            "timeout": 10
+          },
+          {
+            "type": "command",
             "command": "bash /root/.claude/hooks/notify.sh Stop",
             "timeout": 10
           }
