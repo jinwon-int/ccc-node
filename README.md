@@ -41,6 +41,20 @@ cd bridge && ./start.sh --path /root -d   # daemon-supervised start
 Then complete the checklist `setup.sh` prints (fill placeholders, set `honcho.json`,
 install `wiki-agent`, `gh auth login`, start a fresh session to verify injection).
 
+### Install the portable surface as a plugin (optional)
+
+The node-agnostic surface — enforcement guard + observability hooks, A2A agents, skills,
+and slash commands — is also packaged as a Claude Code plugin (`.claude-plugin/`):
+
+```bash
+/plugin marketplace add jinwon-int/ccc-node
+/plugin install ccc-node@ccc-node
+```
+
+The plugin and `setup.sh` are complementary: the **plugin** carries the portable surface,
+while **`setup.sh`** installs the node-local memory bootstrap (SessionStart/PostCompact
+injection, working-state checkpoint) that is inherently node-specific. See `CHANGELOG.md`.
+
 ## Layout
 
 ```

@@ -1,0 +1,14 @@
+{
+  "name": "ccc-node",
+  "owner": {
+    "name": "jinwon-int (Seoyoon / Hermes)",
+    "url": "https://github.com/jinwon-int/ccc-node"
+  },
+  "plugins": [
+    {
+      "name": "ccc-node",
+      "source": "./",
+      "description": "Claude Code node harness — fail-closed enforcement guard, observability (audit/secret-awareness/notify), A2A worker sub-agent roster, custom skills, and slash commands."
+    }
+  ]
+}

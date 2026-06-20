@@ -12,10 +12,24 @@ err() { printf 'FAIL: %s\n' "$*"; fail=1; }
 
 # 1) JSON validity
 say "== settings JSON =="
-for f in claude/settings.json claude/settings.local.json; do
+for f in claude/settings.json claude/settings.local.json \
+         .claude-plugin/plugin.json .claude-plugin/marketplace.json hooks/hooks.json; do
   [ -f "$f" ] || { say "  (skip $f — absent)"; continue; }
   if jq -e . "$f" >/dev/null 2>&1; then say "  ok $f"; else err "invalid JSON: $f"; fi
 done
+
+# 1b) plugin manifest: name present + referenced component paths exist
+if [ -f .claude-plugin/plugin.json ]; then
+  say "== plugin manifest =="
+  jq -e '.name' .claude-plugin/plugin.json >/dev/null 2>&1 && say "  ok plugin.json has name" || err "plugin.json missing name"
+  mapfile -t PPATHS < <(jq -r '[.skills, .hooks, (.commands[]?), (.agents[]?)] | .[] | select(type=="string")' .claude-plugin/plugin.json 2>/dev/null)
+  for p in "${PPATHS[@]}"; do
+    rel="${p#./}"
+    if [ -e "$rel" ]; then say "  ok path $rel"; else err "plugin.json path missing: $p"; fi
+  done
+  jq -e '.plugins[0].name and .plugins[0].source' .claude-plugin/marketplace.json >/dev/null 2>&1 \
+    && say "  ok marketplace.json catalog" || err "marketplace.json malformed"
+fi
 
 # 2) shell syntax (bash -n) on all hook + top-level scripts
 say "== bash -n =="
