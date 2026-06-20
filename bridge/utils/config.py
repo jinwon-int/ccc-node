@@ -187,6 +187,15 @@ class Config(BaseSettings):
         default=False,
         description="Whether to show tool calls in Telegram streaming messages",
     )
+    enable_readable_renderer: bool = Field(
+        default=False,
+        alias="CCC_TELEGRAM_READABLE_RENDERER",
+        description=(
+            "Normalize final Telegram text for mobile readability before the "
+            "MarkdownV2 conversion (GitHub issue #34). Opt-in; when off, output "
+            "is unchanged."
+        ),
+    )
 
     # Voice message configuration
     transcription_provider: str = Field(
