@@ -2,6 +2,31 @@
 
 All notable changes to the Claude Code node harness. Dates are KST.
 
+## [0.3.6] — 2026-06-20
+
+Telegram rendering — fix the MarkdownV2 path silently dropping long/symbol-dense messages
+(and tables) to plain text. Follow-up to 0.3.4.
+
+### Fixed
+- MarkdownV2 escaping expands text ~1.2x (more for tables/symbol-dense content), so a
+  sub-limit raw chunk could exceed Telegram's 4096-char limit once escaped and was dropped to
+  **plain text — losing all formatting**. Both delivery paths now convert to MarkdownV2 **first**
+  and split on entity-safe boundaries with `tg_md.split_markdownv2`, instead of splitting raw and
+  hoping the escaped form fits.
+  - `bridge/core/bot.py`: `_deliver_markdown` converts the whole message then splits the
+    MarkdownV2 (removes the fragile raw-3500 headroom heuristic; per-part plain fallback only on
+    the rare `BadRequest`).
+  - `bridge/core/streaming.py`: `finalize_draft` upgrades the draft to the first MarkdownV2 chunk
+    and emits the overflow as follow-up MarkdownV2 messages, instead of dropping the whole draft to
+    plain when the escaped form exceeds the limit.
+- `bridge/core/streaming.py`: `_find_split_boundary` no longer cuts through a fenced code block or
+  a contiguous pipe table when overflowing between draft messages (new `_avoid_block_split` guard,
+  floored at `max_length // 2`), so a table renders as one block instead of two broken halves.
+
+### Changed
+- `bridge/tests/test_streaming.py`: fixtures accept `parse_mode` (mirrors the real telegram Bot
+  signature); added regression tests for overflow splitting and the block-boundary guard.
+
 ## [0.3.5] — 2026-06-20
 
 ### Fixed
