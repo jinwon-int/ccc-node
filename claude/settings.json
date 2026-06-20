@@ -18,9 +18,32 @@
       "mcp__searxng__*",
       "mcp__firecrawl__*",
       "mcp__context7__*"
+    ],
+    "deny": [
+      "Read(**/.env)",
+      "Read(**/.credentials.json)",
+      "Read(**/*.pem)",
+      "Read(**/id_rsa)",
+      "Bash(npm publish:*)",
+      "Bash(gh release create:*)"
+    ],
+    "ask": [
+      "Bash(sudo:*)"
     ]
   },
   "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash|Read|Edit|Write|MultiEdit|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash /root/.claude/hooks/guard.sh",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
     "SessionStart": [
       {
         "hooks": [
