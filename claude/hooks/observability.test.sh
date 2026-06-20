@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Tests for Tier 1.5 observability hooks: audit.sh, redact.sh, notify.sh.
+# shellcheck disable=SC2034  # `out` is consumed via eval inside ok()
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 pass=0; fail=0
