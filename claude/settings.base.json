@@ -45,7 +45,7 @@
             "type": "command",
             "command": "bash /root/.claude/hooks/load-memory.sh SessionStart",
             "timeout": 15,
-            "statusMessage": "Loading nosuk memory (MEMORY/USER + Wiki + Honcho)..."
+            "statusMessage": "Loading node memory (MEMORY/USER + Wiki + Honcho)..."
           },
           {
             "type": "command",
@@ -75,7 +75,7 @@
             "type": "command",
             "command": "bash /root/.claude/hooks/load-memory.sh PostCompact",
             "timeout": 15,
-            "statusMessage": "Re-injecting nosuk memory after compaction..."
+            "statusMessage": "Re-injecting node memory after compaction..."
           },
           {
             "type": "command",

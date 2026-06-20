@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SessionStart memory bootstrap for nosuk (Claude Code, node-owned memory).
+# SessionStart memory bootstrap for a Claude Code node (node-owned memory).
 # Serves built-in MEMORY/USER + cached Family Wiki + cached Honcho instantly,
 # then fires a detached background refresh so the next session is fresh.
 set -uo pipefail
@@ -20,7 +20,9 @@ wiki="$(cat "$CACHE/wiki.txt" 2>/dev/null)"
 honcho="$(cat "$CACHE/honcho.txt" 2>/dev/null)"
 stamp="$(cat "$CACHE/.last-refresh" 2>/dev/null)"
 
-ctx="# nosuk session memory (auto-injected: $EVENT)
+node_label="${CCC_NODE:-$(cat /root/.claude/state/node.txt 2>/dev/null || hostname -s 2>/dev/null || printf 'ccc-node')}"
+
+ctx="# ${node_label} session memory (auto-injected: $EVENT)
 
 Operational facts are mutable — live-check the node and verify Wiki source text before asserting or changing anything.
 Family Wiki + Honcho blocks below are cached (last refreshed: ${stamp:-never}); a background refresh runs each session for the next one.
