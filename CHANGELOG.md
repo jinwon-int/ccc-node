@@ -2,6 +2,30 @@
 
 All notable changes to the Claude Code node harness. Dates are KST.
 
+## [0.3.3] — 2026-06-20
+
+Node onboarding hardening — closes the P2–P4 gaps found bringing up `soonwook`/vps6 standalone
+(issue #25). P1 shipped in #24, P5 in #27.
+
+### Added
+- **P2 — Linux reboot-persistence for the Telegram bridge.** `bridge/start.sh` gains
+  `--install-systemd` / `--uninstall-systemd`. Run as root it writes a system unit to
+  `/etc/systemd/system/ccc-telegram-bridge.service` and `systemctl enable --now`s it; run as a
+  normal user it installs a `systemctl --user` unit. The unit runs the bridge in the foreground
+  under systemd supervision (`Restart=on-failure`); name overridable via `BRIDGE_SERVICE_NAME`.
+  No more hand-written units (cf. the manual `ccc-telegram-bridge.service` on soonwook).
+- **P4 — node-identity seeding.** `setup.sh` accepts `--node`, `--display`, `--slot`,
+  `--fleet-role`, `--lang`, `--user-name`, `--user-gh`, `--user-tz`, `--user-context` and
+  substitutes the matching `<PLACEHOLDER>` tokens in freshly-seeded `CLAUDE.md` / `MEMORY.md` /
+  `USER.md`. Omitted tokens are left intact for manual editing; existing files are never rewritten.
+
+### Changed
+- **P3 — `setup.sh` no longer overwrites `~/.claude` without a restore point.** Before clobbering
+  `settings.json`, `settings.local.json`, and the hook/output-style/agent/command/skill dirs it
+  tars them to `~/.claude/backups/ccc-node-setup-<ts>.tar.gz` (credentials excluded). Skip with
+  `--no-backup`.
+- `bridge/README.md`: documents Linux systemd install and lists Linux under Platform Support.
+
 ## [0.3.2] — 2026-06-20
 
 A2A Claude Code worker lane docs — capture the `soonwook` follow-up conversion and remove a

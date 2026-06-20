@@ -11,15 +11,43 @@
 #                              #   double-firing you'd get if both settings.json and the
 #                              #   plugin registered them. Node-local hooks stay in settings.
 #   ./setup.sh --dry-run       # show what would happen, change nothing (combine with above)
+#   ./setup.sh --no-backup     # do NOT snapshot the existing ~/.claude before overwriting
+#
+# Node-identity seeding (optional): when these are given, freshly-seeded CLAUDE.md / MEMORY.md /
+# USER.md have their <PLACEHOLDER> tokens substituted automatically (existing files are never
+# touched). Anything you omit is left as <PLACEHOLDER> for you to fill in by hand.
+#   --node <name>            e.g. soonwook      -> <NODE_NAME>
+#   --display <name>         e.g. 순욱           -> <NODE_DISPLAY_NAME>
+#   --slot <slot>            e.g. VPS6          -> <PHYSICAL_SLOT>
+#   --fleet-role <role>      e.g. "Team2 worker" -> <FLEET_ROLE>
+#   --lang <language>        e.g. Korean        -> <LANGUAGE>
+#   --user-name <name>                          -> <USER_NAME>
+#   --user-gh <handle>                          -> <USER_GH>
+#   --user-tz <tz>           e.g. Asia/Seoul    -> <USER_TZ>
+#   --user-context <text>                       -> <USER_CONTEXT>
 set -euo pipefail
 
-DRY=0; WITH_PLUGIN=0
-for arg in "$@"; do
-  case "$arg" in
+DRY=0; WITH_PLUGIN=0; BACKUP=1
+OPT_NODE=""; OPT_DISPLAY=""; OPT_SLOT=""; OPT_FLEET_ROLE=""; OPT_LANG=""
+OPT_USER_NAME=""; OPT_USER_GH=""; OPT_USER_TZ=""; OPT_USER_CONTEXT=""
+need_val() { [ -n "${2:-}" ] || { echo "Flag $1 requires a value" >&2; exit 2; }; }
+while [ $# -gt 0 ]; do
+  case "$1" in
     --dry-run) DRY=1 ;;
     --with-plugin) WITH_PLUGIN=1 ;;
-    *) echo "Unknown flag: $arg" >&2; exit 2 ;;
+    --no-backup) BACKUP=0 ;;
+    --node)         need_val "$1" "${2:-}"; OPT_NODE="$2"; shift ;;
+    --display)      need_val "$1" "${2:-}"; OPT_DISPLAY="$2"; shift ;;
+    --slot)         need_val "$1" "${2:-}"; OPT_SLOT="$2"; shift ;;
+    --fleet-role)   need_val "$1" "${2:-}"; OPT_FLEET_ROLE="$2"; shift ;;
+    --lang)         need_val "$1" "${2:-}"; OPT_LANG="$2"; shift ;;
+    --user-name)    need_val "$1" "${2:-}"; OPT_USER_NAME="$2"; shift ;;
+    --user-gh)      need_val "$1" "${2:-}"; OPT_USER_GH="$2"; shift ;;
+    --user-tz)      need_val "$1" "${2:-}"; OPT_USER_TZ="$2"; shift ;;
+    --user-context) need_val "$1" "${2:-}"; OPT_USER_CONTEXT="$2"; shift ;;
+    *) echo "Unknown flag: $1" >&2; exit 2 ;;
   esac
+  shift
 done
 SRC="$(cd "$(dirname "$0")" && pwd)"
 CLAUDE_DIR="$HOME/.claude"
@@ -29,7 +57,28 @@ HERMES_DIR="$HOME/.hermes/memories"     # legacy memory location (fallback only)
 run() { if [ "$DRY" = 1 ]; then echo "[dry-run] $*"; else eval "$*"; fi; }
 note() { printf '  - %s\n' "$*"; }
 
+# Snapshot the existing ~/.claude config BEFORE we overwrite anything. setup.sh unconditionally
+# overwrites settings.json, settings.local.json and the hook/output-style/agent/command/skill
+# dirs — on a node that already has a configured identity that is destructive, so we tar a
+# restore point first. Credentials (~/.claude/.credentials.json) are intentionally NOT included.
+backup_claude_dir() {
+  if [ "$BACKUP" != 1 ]; then note "backup skipped (--no-backup)"; return 0; fi
+  [ -d "$CLAUDE_DIR" ] || { note "no existing $CLAUDE_DIR — nothing to back up"; return 0; }
+  local items=() p
+  for p in settings.json settings.local.json hooks output-styles agents commands skills; do
+    [ -e "$CLAUDE_DIR/$p" ] && items+=("$p")
+  done
+  if [ "${#items[@]}" -eq 0 ]; then note "fresh install — no overwritable config to back up"; return 0; fi
+  local ts archive
+  ts="$(date +%Y%m%d-%H%M%S)"
+  archive="$CLAUDE_DIR/backups/ccc-node-setup-$ts.tar.gz"
+  run "mkdir -p '$CLAUDE_DIR/backups'"
+  run "tar -czf '$archive' -C '$CLAUDE_DIR' ${items[*]}"
+  note "backed up existing config -> $archive (restore: tar -xzf <archive> -C '$CLAUDE_DIR')"
+}
+
 echo "==> Installing Claude Code node setup from: $SRC"
+backup_claude_dir
 
 # 1) Claude harness config + hooks (safe, secret-free)
 run "mkdir -p '$CLAUDE_DIR/hooks'"
@@ -77,9 +126,10 @@ run "cp -r '$SRC/claude/skills/.' '$CLAUDE_DIR/skills/'"
 run "chmod +x '$CLAUDE_DIR/skills/'*/*.sh 2>/dev/null || true"
 
 # 2) Per-node files — only seed templates if a real one is NOT already present.
+SEEDED=()  # files freshly created from a template this run (safe to placeholder-substitute)
 seed() { # seed <template> <dest>
   if [ -e "$2" ]; then note "kept existing $2 (not overwritten)";
-  else run "cp '$1' '$2'"; note "seeded template -> $2 (EDIT ME)"; fi
+  else run "cp '$1' '$2'"; SEEDED+=("$2"); note "seeded template -> $2 (EDIT ME)"; fi
 }
 run "mkdir -p '$MEM_DIR'"
 run "mkdir -p '$HOME/.hermes'"
@@ -92,10 +142,52 @@ seed "$SRC/hermes/memories/USER.template.md"      "$MEM_DIR/USER.md"
 # honcho.json stays node-local under ~/.hermes (documentation/Hermes-side; not a hard CC dep).
 seed "$SRC/hermes/honcho.template.json"           "$HOME/.hermes/honcho.json"
 
+# 3) Node-identity substitution — fill <PLACEHOLDER> tokens in the files we just seeded.
+# Only freshly-seeded files are touched (existing identity is never rewritten). Tokens for which
+# no flag was given are left intact so the manual checklist below still applies to them.
+apply_node_identity() {
+  local any=0 v
+  for v in "$OPT_NODE" "$OPT_DISPLAY" "$OPT_SLOT" "$OPT_FLEET_ROLE" "$OPT_LANG" \
+           "$OPT_USER_NAME" "$OPT_USER_GH" "$OPT_USER_TZ" "$OPT_USER_CONTEXT"; do
+    [ -n "$v" ] && any=1
+  done
+  [ "$any" = 1 ] || return 0
+  if [ "${#SEEDED[@]}" -eq 0 ]; then
+    note "identity flags given but all target files already existed — left untouched"; return 0
+  fi
+  if ! command -v python3 >/dev/null 2>&1; then
+    note "python3 not found — cannot auto-substitute placeholders; edit seeded files by hand"; return 0
+  fi
+  local f
+  for f in "${SEEDED[@]}"; do
+    if [ "$DRY" = 1 ]; then echo "[dry-run] substitute provided placeholders in $f"; continue; fi
+    NODE_NAME="$OPT_NODE" NODE_DISPLAY_NAME="$OPT_DISPLAY" PHYSICAL_SLOT="$OPT_SLOT" \
+    FLEET_ROLE="$OPT_FLEET_ROLE" LANGUAGE="$OPT_LANG" USER_NAME="$OPT_USER_NAME" \
+    USER_GH="$OPT_USER_GH" USER_TZ="$OPT_USER_TZ" USER_CONTEXT="$OPT_USER_CONTEXT" \
+    python3 - "$f" <<'PY'
+import os, sys
+path = sys.argv[1]
+keys = ["NODE_NAME","NODE_DISPLAY_NAME","PHYSICAL_SLOT","FLEET_ROLE","LANGUAGE",
+        "USER_NAME","USER_GH","USER_TZ","USER_CONTEXT"]
+with open(path, encoding="utf-8") as fh:
+    s = fh.read()
+for k in keys:
+    val = os.environ.get(k, "")
+    if val:
+        s = s.replace("<%s>" % k, val)
+with open(path, "w", encoding="utf-8") as fh:
+    fh.write(s)
+PY
+    note "applied node identity to $f"
+  done
+}
+apply_node_identity
+
 cat <<'EOF'
 
 ==> Done. Follow-up checklist (do these manually):
-  1. Edit ~/.claude/CLAUDE.md          — replace every <PLACEHOLDER> with this node's identity/user.
+  1. Edit ~/.claude/CLAUDE.md          — replace any remaining <PLACEHOLDER> with this node's identity/user.
+                                         (Pass --node/--display/--slot/--user-* to setup.sh to pre-fill these.)
   2. Edit ~/.claude/memories/MEMORY.md — node-specific durable facts (NO raw secrets).
   3. Edit ~/.claude/memories/USER.md   — who you work for + preferences.
   4. Edit ~/.hermes/honcho.json        — set baseUrl / peerName / target (this is node-local; gitignored).
@@ -107,6 +199,7 @@ cat <<'EOF'
      key read from ~/.hermes/.env). Idempotent; tool perms pre-allowed in settings.json.
   9. (Optional) Telegram bridge: cd bridge && cp .env.example .env && edit, then
      ./start.sh --path /root -d   (daemon-supervised). See bridge/README.md.
+     Linux reboot-persistence: ./start.sh --path /root --install-systemd   (systemd unit).
 
 Secrets that are intentionally NOT installed by this script:
   - ~/.claude/.credentials.json   (Claude OAuth — created on `claude` login)
