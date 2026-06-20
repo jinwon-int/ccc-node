@@ -49,6 +49,7 @@ from telegram_bot.utils.chat_logger import log_debug
 from telegram_bot.utils.tg_format import wrap_markdown_tables
 from telegram_bot.utils.tg_robust import send_with_retry
 from telegram_bot.utils import tg_md
+from telegram_bot.utils import tg_errors
 from telegram_bot.utils.audio_processor import AudioProcessor
 from telegram_bot.utils.transcription import (
     EmptyTranscriptionError,
@@ -1380,6 +1381,17 @@ class TelegramBot:
 
     async def _error_handler(self, update: object, context: ContextTypes.DEFAULT_TYPE):
         """Global error handler for uncaught exceptions in handlers."""
+        # Telegram rejects no-op edits (identical text + reply markup) with a 400
+        # "message is not modified". Inline-button / callback edit paths can hit
+        # this (e.g. tapping the same option twice). It's harmless — the message
+        # already shows the intended content — so log quietly instead of alarming
+        # the user with "❌ Internal error".
+        if tg_errors.is_not_modified(context.error):
+            logger.debug(
+                "Ignored Telegram 'message is not modified' (no-op edit): %s",
+                context.error,
+            )
+            return
         logger.error("Unhandled exception:", exc_info=context.error)
         if isinstance(update, Update) and update.effective_chat:
             try:
