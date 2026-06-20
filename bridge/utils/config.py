@@ -93,6 +93,39 @@ class Config(BaseSettings):
         description="List of allowed Telegram user IDs (empty = allow all)",
     )
 
+    # ccc-node push notifier (owner-only outbound Claude Code lifecycle notifications).
+    # DISABLED by default — opt-in only. See core/push_notifier.py for the approval boundary.
+    push_enabled: bool = Field(
+        default=False,
+        alias="CCC_PUSH_ENABLED",
+        description="Enable owner-only push delivery of Claude Code notifications (opt-in).",
+    )
+    push_chat_id: Optional[int] = Field(
+        default=None,
+        alias="CCC_PUSH_CHAT_ID",
+        description="Explicit owner chat id for push. Falls back to the sole ALLOWED_USER_IDS.",
+    )
+    push_spool_dir: Path = Field(
+        default=Path.home() / ".claude" / "state" / "telegram-spool",
+        alias="CCC_PUSH_SPOOL",
+        description="Spool directory the Claude Code notify hook writes summaries into.",
+    )
+    push_poll_interval: float = Field(
+        default=3.0, alias="CCC_PUSH_POLL_INTERVAL",
+        description="Seconds between spool drains.",
+    )
+    push_max_per_minute: int = Field(
+        default=10, alias="CCC_PUSH_MAX_PER_MINUTE",
+        description="Rate limit: max push messages delivered per minute.",
+    )
+
+    @field_validator("push_enabled", mode="before")
+    @classmethod
+    def parse_push_enabled(cls, v):
+        if isinstance(v, str):
+            return v.strip().lower() in ("1", "true", "yes", "on")
+        return bool(v)
+
     @field_validator("allowed_user_ids", mode="before")
     @classmethod
     def parse_allowed_user_ids(cls, v):
