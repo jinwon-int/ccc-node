@@ -115,3 +115,33 @@ def _transform(text: str) -> str:
 
     # Trim leading/trailing blank lines without disturbing interior content.
     return "\n".join(pass3).strip("\n")
+
+
+# Headroom (UTF-16 units) reserved so a part marker like "*12/12*\n" can never
+# push an already limit-sized chunk past the Telegram message limit. The caller
+# shrinks the split limit by this amount before splitting.
+PART_HEADER_RESERVE = 16
+
+
+def part_marker(index: int, total: int) -> str:
+    """Return a compact, MarkdownV2-safe part marker, e.g. ``*2/3*``.
+
+    Uses a bold span (`*...*`); digits and ``/`` are not MarkdownV2 special
+    characters, so no escaping is required.
+    """
+    return f"*{index}/{total}*"
+
+
+def apply_part_headers(parts):
+    """Prefix each chunk with a compact ``k/N`` continuation marker.
+
+    Returns a new list. A single chunk (or empty input) is returned unchanged —
+    a part marker is only meaningful when a response spans multiple messages.
+    Each chunk is assumed to already be MarkdownV2; the marker is MarkdownV2-safe
+    and is separated from the body by a single newline.
+    """
+    parts = list(parts)
+    total = len(parts)
+    if total <= 1:
+        return parts
+    return [f"{part_marker(i, total)}\n{chunk}" for i, chunk in enumerate(parts, 1)]

@@ -218,7 +218,16 @@ class StreamingMessageHandler:
             render_text = tg_readable.to_readable(draft.text)
 
         md2 = tg_md.to_markdownv2(render_text)
-        parts = tg_md.split_markdownv2(md2) if md2 is not None else None
+        # Optional 'k/N' part markers on multi-chunk responses (opt-in via
+        # CCC_TELEGRAM_PART_HEADERS). Reserve headroom in the split limit first so
+        # a marker can never push a chunk past the Telegram limit.
+        part_headers = getattr(config, "enable_part_headers", False)
+        split_limit = tg_md.TELEGRAM_LIMIT - (
+            tg_readable.PART_HEADER_RESERVE if part_headers else 0
+        )
+        parts = tg_md.split_markdownv2(md2, split_limit) if md2 is not None else None
+        if parts and part_headers and len(parts) > 1:
+            parts = tg_readable.apply_part_headers(parts)
         use_md2 = bool(parts)
         md2_applied = False
 

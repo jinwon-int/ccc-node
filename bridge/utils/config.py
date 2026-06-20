@@ -196,6 +196,15 @@ class Config(BaseSettings):
             "is unchanged."
         ),
     )
+    enable_part_headers: bool = Field(
+        default=False,
+        alias="CCC_TELEGRAM_PART_HEADERS",
+        description=(
+            "Prefix multi-chunk Telegram responses with a compact 'k/N' part "
+            "marker (GitHub issue #34). Opt-in; only applies when a response is "
+            "split into more than one message."
+        ),
+    )
 
     # Voice message configuration
     transcription_provider: str = Field(
