@@ -2,6 +2,16 @@
 
 All notable changes to the Claude Code node harness. Dates are KST.
 
+## [0.3.5] — 2026-06-20
+
+### Fixed
+- Telegram bridge no longer surfaces "❌ Internal error: Message is not modified..." to the
+  chat. Telegram rejects no-op edits (identical text + reply markup) with a harmless 400; the
+  streaming draft path already swallowed it, but inline-button / callback edit paths
+  (`query.edit_message_text(...)`) did not, so the exception reached the global error handler and
+  was posted to the user. `_error_handler` now detects this case and logs it quietly. New
+  `bridge/utils/tg_errors.py` (`is_not_modified`) + `bridge/tests/test_tg_errors.py`.
+
 ## [0.3.4] — 2026-06-20
 
 Telegram rendering — make tables and special characters display correctly instead of
