@@ -203,28 +203,37 @@ class StreamingMessageHandler:
         characters/formatting show correctly. Any parse/length edge case falls
         back to the original plain text — delivery is never lost.
         """
+        # Convert to MarkdownV2, then split on entity-safe boundaries. MarkdownV2
+        # escaping expands the text (~1.2x, more for tables/symbol-dense content),
+        # so a sub-limit raw draft can exceed TELEGRAM_LIMIT once escaped. We used
+        # to drop the whole draft to plain text in that case (all formatting lost);
+        # instead we now upgrade the draft to the first chunk and send the overflow
+        # as follow-up MarkdownV2 messages.
         md2 = tg_md.to_markdownv2(draft.text)
-        use_md2 = md2 is not None and tg_md.utf16_len(md2) <= tg_md.TELEGRAM_LIMIT
+        parts = tg_md.split_markdownv2(md2) if md2 is not None else None
+        use_md2 = bool(parts)
+        md2_applied = False
 
         async def _edit():
+            nonlocal md2_applied
             if use_md2:
                 try:
-                    return await self.bot.edit_message_text(
+                    res = await self.bot.edit_message_text(
                         chat_id=self.chat_id,
                         message_id=draft.message_id,
-                        text=md2,
+                        text=parts[0],
                         parse_mode="MarkdownV2",
                     )
+                    md2_applied = True
+                    return res
                 except BadRequest:
-                    pass  # parse/length edge case -> plain text below
+                    md2_applied = False  # parse edge case -> plain text below
             return await self.bot.edit_message_text(
                 chat_id=self.chat_id, message_id=draft.message_id, text=draft.text
             )
 
         try:
             await self._retry_with_backoff(_edit)
-            logger.debug(f"Finalized draft {draft.message_id}")
-            return True
         except TelegramError as e:
             if self._is_not_modified_error(e):
                 logger.debug(f"Draft {draft.message_id} already up-to-date on finalize")
@@ -232,8 +241,42 @@ class StreamingMessageHandler:
             logger.error(f"Failed to finalize draft {draft.message_id}: {e}")
             return False
 
+        # Send overflow chunks as follow-up messages — only when the primary
+        # MarkdownV2 edit actually applied (the plain fallback already carries the
+        # full draft text, so emitting extras then would duplicate content).
+        if md2_applied and len(parts) > 1:
+            for extra in parts[1:]:
+                try:
+                    await self._retry_with_backoff(
+                        lambda t=extra: self.bot.send_message(
+                            chat_id=self.chat_id, text=t, parse_mode="MarkdownV2"
+                        )
+                    )
+                except TelegramError as e:
+                    logger.warning(
+                        f"Overflow chunk MarkdownV2 send failed ({e}); retrying plain"
+                    )
+                    try:
+                        await self._retry_with_backoff(
+                            lambda t=extra: self.bot.send_message(
+                                chat_id=self.chat_id, text=t
+                            )
+                        )
+                    except TelegramError as e2:
+                        logger.error(f"Overflow chunk plain send failed: {e2}")
+
+        logger.debug(f"Finalized draft {draft.message_id}")
+        return True
+
     def _find_split_boundary(self, text: str, max_length: int = 4000) -> int:
-        """Find smart boundary for text splitting (paragraph > line > hard cut)"""
+        """Find smart boundary for text splitting (paragraph > line > hard cut).
+
+        Avoids cutting through a fenced code block or a contiguous pipe table:
+        if the chosen boundary lands inside such a block, back up to the block's
+        start so each draft renders a whole table/code block instead of two
+        broken halves. Backing up is floored at ``max_length // 2`` to avoid
+        pathologically small chunks (a single huge block degrades gracefully).
+        """
         if len(text) <= max_length:
             return len(text)
 
@@ -246,10 +289,42 @@ class StreamingMessageHandler:
         # Try line boundary (single newline)
         line_idx = text.rfind("\n", search_start, max_length)
         if line_idx > search_start:
-            return line_idx + 1
+            return self._avoid_block_split(text, line_idx + 1, max_length)
 
         # Hard cut at max_length
-        return max_length
+        return self._avoid_block_split(text, max_length, max_length)
+
+    @staticmethod
+    def _avoid_block_split(text: str, cut: int, max_length: int) -> int:
+        """Pull *cut* back to a block boundary if it falls inside a code/table block."""
+        floor = max(1, max_length // 2)
+        prefix = text[:cut]
+
+        # Inside a fenced code block? (odd number of ``` fences before the cut)
+        if prefix.count("```") % 2 == 1:
+            fence = prefix.rfind("```")
+            line_start = prefix.rfind("\n", 0, fence) + 1  # 0 if no newline
+            if line_start >= floor:
+                return line_start
+
+        # Inside a contiguous pipe table? The last emitted line is a table row
+        # (contains '|') and the next line continues the table. Walk back over
+        # consecutive table rows to the line before the block.
+        lines = prefix.split("\n")
+        # prefix ends with '\n' (cut is at a line boundary) -> last element ''.
+        idx = len(lines) - 2 if lines and lines[-1] == "" else len(lines) - 1
+        next_line = text[cut:].split("\n", 1)[0]
+        if 0 <= idx < len(lines) and "|" in lines[idx] and "|" in next_line:
+            back = cut
+            j = idx
+            while j >= 0 and "|" in lines[j]:
+                back -= len(lines[j]) + 1  # +1 for the newline
+                j -= 1
+            back = max(back, 0)
+            if back >= floor:
+                return back
+
+        return cut
 
     def _first_draft_prefix(self) -> str:
         """Return tool calls prefix if we're still on the first draft, else empty string."""

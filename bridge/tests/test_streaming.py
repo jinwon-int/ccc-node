@@ -58,7 +58,9 @@ class _BotDraftReturnsBool:
 
 
 class _BotEditNotModified:
-    async def edit_message_text(self, *, chat_id, message_id, text):
+    # parse_mode mirrors the real telegram Bot signature (finalize_draft now
+    # passes parse_mode="MarkdownV2" on the upgrade attempt).
+    async def edit_message_text(self, *, chat_id, message_id, text, parse_mode=None):
         raise TelegramError(
             "Message is not modified: specified new message content and reply markup are exactly the same as a current content and reply markup of the message"
         )
@@ -68,13 +70,31 @@ class _BotRecorder:
     def __init__(self):
         self.calls = []
 
-    async def send_message(self, *, chat_id, text):
+    async def send_message(self, *, chat_id, text, parse_mode=None):
         self.calls.append(("send_message", chat_id, text))
         return SimpleNamespace(message_id=404)
 
-    async def edit_message_text(self, *, chat_id, message_id, text):
+    async def edit_message_text(self, *, chat_id, message_id, text, parse_mode=None):
         self.calls.append(("edit_message_text", chat_id, message_id, text))
         return True
+
+
+class _BotCapture:
+    """Records edit/send calls with their parse_mode for finalize-split tests."""
+
+    def __init__(self):
+        self.edits = []  # (message_id, text, parse_mode)
+        self.sends = []  # (text, parse_mode)
+        self._next_id = 500
+
+    async def edit_message_text(self, *, chat_id, message_id, text, parse_mode=None):
+        self.edits.append((message_id, text, parse_mode))
+        return SimpleNamespace(message_id=message_id)
+
+    async def send_message(self, *, chat_id, text, parse_mode=None):
+        self._next_id += 1
+        self.sends.append((text, parse_mode))
+        return SimpleNamespace(message_id=self._next_id)
 
 
 class StreamingMessageHandlerTests(unittest.IsolatedAsyncioTestCase):
@@ -161,6 +181,100 @@ class StreamingMessageHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(bot.calls), 1)
         self.assertEqual(bot.calls[0][0], "send_message")
         self.assertIn("/tmp/a.txt", bot.calls[0][2])
+
+
+from telegram_bot.utils import tg_md  # noqa: E402
+
+_HAS_TG_MD = tg_md.available()
+
+
+class FinalizeMarkdownV2SplitTests(unittest.IsolatedAsyncioTestCase):
+    @unittest.skipUnless(_HAS_TG_MD, "telegramify-markdown not installed")
+    async def test_small_draft_single_markdownv2_edit(self):
+        bot = _BotCapture()
+        handler = StreamingMessageHandler(bot=bot, chat_id=42, user_id=7)
+        draft = SimpleNamespace(message_id=992, text="간단 보고: a_b*c (괄호)")
+
+        ok = await handler.finalize_draft(draft)
+
+        self.assertTrue(ok)
+        self.assertEqual(len(bot.edits), 1)
+        self.assertEqual(bot.edits[0][0], 992)
+        self.assertEqual(bot.edits[0][2], "MarkdownV2")
+        self.assertEqual(bot.sends, [])  # no overflow follow-ups
+
+    @unittest.skipUnless(_HAS_TG_MD, "telegramify-markdown not installed")
+    async def test_overflow_draft_splits_into_followups(self):
+        # Symbol-dense body whose MarkdownV2-escaped form exceeds TELEGRAM_LIMIT.
+        # Previously this dropped the WHOLE draft to plain text (formatting lost);
+        # now the draft is upgraded to chunk 1 and the rest go as follow-ups.
+        draft_text = (
+            "- 항목 a_b*c (괄호) {중괄호} [링크](http://x) 1+1=2 경로/a.b-c #태그\n" * 90
+        )
+        md2 = tg_md.to_markdownv2(draft_text)
+        self.assertGreater(tg_md.utf16_len(md2), tg_md.TELEGRAM_LIMIT)  # precondition
+
+        bot = _BotCapture()
+        handler = StreamingMessageHandler(bot=bot, chat_id=42, user_id=7)
+        draft = SimpleNamespace(message_id=992, text=draft_text)
+
+        ok = await handler.finalize_draft(draft)
+
+        self.assertTrue(ok)
+        # The original draft message is upgraded in place to MarkdownV2 chunk 1...
+        self.assertEqual(len(bot.edits), 1)
+        self.assertEqual(bot.edits[0][0], 992)
+        self.assertEqual(bot.edits[0][2], "MarkdownV2")
+        self.assertLessEqual(tg_md.utf16_len(bot.edits[0][1]), tg_md.TELEGRAM_LIMIT)
+        # ...and the overflow goes out as MarkdownV2 follow-up messages, each
+        # within the per-message limit (no plain-text fallback, formatting kept).
+        self.assertGreaterEqual(len(bot.sends), 1)
+        for text, parse_mode in bot.sends:
+            self.assertEqual(parse_mode, "MarkdownV2")
+            self.assertLessEqual(tg_md.utf16_len(text), tg_md.TELEGRAM_LIMIT)
+
+
+class SplitBoundaryGuardTests(unittest.TestCase):
+    def setUp(self):
+        self.handler = StreamingMessageHandler(
+            bot=_BotRecorder(), chat_id=42, user_id=7
+        )
+
+    def test_avoid_split_inside_pipe_table(self):
+        head = "h" * 60 + "\n"  # 61 chars, no blank line in window
+        table = "| a | b |\n" * 6  # contiguous pipe table
+        text = head + table + "end\n"
+        # A naive line-boundary cut inside the table (after 3 rows)...
+        naive_cut = len(head) + 30
+        cut = self.handler._avoid_block_split(text, naive_cut, max_length=100)
+        # ...is pulled back to the table block start, so no row is straddled.
+        self.assertEqual(cut, len(head))
+        self.assertTrue(text[cut:].startswith("| a | b |"))
+
+    def test_avoid_split_inside_code_fence(self):
+        head = "h" * 60 + "\n"
+        body = "```\n" + "code\n" * 8
+        text = head + body
+        naive_cut = len(head) + 4 + 25  # inside the unclosed code block
+        cut = self.handler._avoid_block_split(text, naive_cut, max_length=100)
+        self.assertEqual(cut, len(head))
+        self.assertTrue(text[cut:].startswith("```"))
+
+    def test_no_block_returns_cut_unchanged(self):
+        text = "para one line\n" * 20
+        cut = 100
+        self.assertEqual(
+            self.handler._avoid_block_split(text, cut, max_length=100), cut
+        )
+
+    def test_tiny_backup_floored(self):
+        # Table starts below the floor (max_length//2); guard declines to back up
+        # that far rather than emit a pathologically small chunk.
+        table = "| a | b |\n" * 10
+        text = table + "end\n"
+        naive_cut = 30  # inside the table
+        cut = self.handler._avoid_block_split(text, naive_cut, max_length=100)
+        self.assertEqual(cut, naive_cut)
 
 
 if __name__ == "__main__":

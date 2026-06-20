@@ -2736,19 +2736,22 @@ class TelegramBot:
             return
 
         if tg_md.available():
-            # Split the RAW markdown at paragraph boundaries (with headroom for
-            # MarkdownV2 escape expansion), convert each chunk independently, and
-            # fall back to clean plain text per-chunk on the rare parse error.
-            for raw in self._split_text(content, limit=3500):
-                md2 = tg_md.to_markdownv2(raw)
-                if md2 is not None and tg_md.utf16_len(md2) <= tg_md.TELEGRAM_LIMIT:
+            # Convert the whole message to MarkdownV2 first, THEN split on
+            # entity-safe boundaries with split_markdownv2. Splitting the raw
+            # markdown before conversion is unsafe: MarkdownV2 escaping expands
+            # the text (~1.2x, more for tables/symbol-dense content), so a
+            # sub-limit raw chunk can exceed TELEGRAM_LIMIT once escaped and was
+            # silently dropped to plain text (all formatting lost). Per-part
+            # plain fallback only on the rare BadRequest.
+            md2 = tg_md.to_markdownv2(content)
+            if md2 is not None:
+                for part in tg_md.split_markdownv2(md2):
                     try:
-                        await send_with_retry(lambda p=md2: op(p, "MarkdownV2"))
-                        continue
+                        await send_with_retry(lambda p=part: op(p, "MarkdownV2"))
                     except telegram.error.BadRequest:
-                        pass
-                await send_with_retry(lambda p=raw: op(p, None))
-            return
+                        await send_with_retry(lambda p=part: op(p, None))
+                return
+            # conversion unavailable/failed -> legacy path below
 
         # Legacy fallback: telegramify unavailable -> wrap tables + base parse mode.
         for part in self._split_text(wrap_markdown_tables(content)):
