@@ -2,6 +2,19 @@
 
 All notable changes to the Claude Code node harness. Dates are KST.
 
+## [0.3.9] — 2026-06-21
+
+Self-update skill — safe harness drift control (issue #13 Tier 2, item #16).
+
+### Added
+- `claude/skills/self-update/`: a skill that updates a node's installed harness
+  (`~/.claude`) to ccc-node latest. `check.sh` is **read-only** drift detection
+  (fetch + commits/files/CHANGELOG delta vs origin/main). Applying is **approval-gated**
+  and routed through `setup.sh` (auto-snapshot to `~/.claude/backups/`), validated with
+  `scripts/validate-harness.sh`, with an explicit rollback path. SKILL.md documents that
+  node identity (CLAUDE.md, memories, honcho.json) is preserved by setup.sh's `seed()`
+  and that the Telegram bridge is out of scope.
+
 ## [0.3.8] — 2026-06-21
 
 Evidence gate — "evidence before declaring" Stop hook (issue #13 Tier 1.5, item #8).
