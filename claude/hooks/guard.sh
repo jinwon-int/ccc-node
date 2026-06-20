@@ -22,6 +22,10 @@ cmd="$(printf '%s' "$input"   | jq -r '.tool_input.command // empty' 2>/dev/null
 fpath="$(printf '%s' "$input" | jq -r '.tool_input.file_path // empty' 2>/dev/null)"
 
 deny() {
+  # Observability: record the denial (risk label + tool only — never the raw command,
+  # which may carry secrets) so blocked gated actions surface as approval-needed.
+  local ts; ts="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)"
+  printf '%s\tDENY[%s]\ttool=%s\n' "$ts" "$1" "${tool:-?}" >> "${CCC_APPROVAL_LOG:-/root/.claude/state/approval-needed.log}" 2>/dev/null
   echo "BLOCKED by ccc-node guard [$1]: ${2}" >&2
   echo "→ Fresh Approval Required (CLAUDE.md). After the operator approves THIS action, re-run with CCC_ALLOW_GATED=1." >&2
   exit 2

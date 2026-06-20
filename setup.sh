@@ -29,6 +29,9 @@ run "cp '$SRC/claude/hooks/refresh-memory.sh' '$CLAUDE_DIR/hooks/refresh-memory.
 run "cp '$SRC/claude/hooks/load-tools.sh'     '$CLAUDE_DIR/hooks/load-tools.sh'"
 run "cp '$SRC/claude/hooks/checkpoint.sh'     '$CLAUDE_DIR/hooks/checkpoint.sh'"
 run "cp '$SRC/claude/hooks/guard.sh'          '$CLAUDE_DIR/hooks/guard.sh'"
+run "cp '$SRC/claude/hooks/audit.sh'          '$CLAUDE_DIR/hooks/audit.sh'"
+run "cp '$SRC/claude/hooks/redact.sh'         '$CLAUDE_DIR/hooks/redact.sh'"
+run "cp '$SRC/claude/hooks/notify.sh'         '$CLAUDE_DIR/hooks/notify.sh'"
 run "chmod +x '$CLAUDE_DIR/hooks/'*.sh"
 # Working-state checkpoint dir (PreCompact snapshot / PostCompact re-inject)
 run "mkdir -p '$CLAUDE_DIR/state/checkpoints'"
