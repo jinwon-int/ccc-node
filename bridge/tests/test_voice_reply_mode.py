@@ -7,7 +7,7 @@ import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
@@ -154,6 +154,15 @@ class VoiceReplyModeTests(unittest.IsolatedAsyncioTestCase):
         bot_module.session_manager = session_module.session_manager
         bot_module.project_chat_handler = project_chat_module.project_chat_handler
         session_module.session_manager._sessions.clear()
+        # Voice delivery is gated behind macOS (`say`). These tests mock the actual
+        # synthesis (`_send_voice_message`) and only exercise the platform-independent
+        # orchestration logic, so force the macOS gate on regardless of host platform
+        # to keep coverage on Linux CI runners.
+        macos_patcher = patch.object(
+            bot_module.TelegramBot, "_is_macos", staticmethod(lambda: True)
+        )
+        macos_patcher.start()
+        self.addCleanup(macos_patcher.stop)
 
     def test_voice_message_switches_to_voice_mode(self):
         bot = TelegramBot()

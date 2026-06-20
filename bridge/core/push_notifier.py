@@ -36,7 +36,12 @@ class PushNotifier:
 
     def __init__(self) -> None:
         self.enabled: bool = bool(getattr(config, "push_enabled", False))
-        self.spool_dir: Path = Path(getattr(config, "push_spool_dir"))
+        # Default mirrors utils.config.push_spool_dir so the notifier is robust to a
+        # config object that omits the key (e.g. SimpleNamespace stubs in tests).
+        self.spool_dir: Path = Path(
+            getattr(config, "push_spool_dir", None)
+            or (Path.home() / ".claude" / "state" / "telegram-spool")
+        )
         self.interval: float = float(getattr(config, "push_poll_interval", 3.0))
         self.max_per_minute: int = int(getattr(config, "push_max_per_minute", 10))
         self._recent: Dict[str, float] = {}

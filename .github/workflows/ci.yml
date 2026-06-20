@@ -14,3 +14,25 @@ jobs:
         run: sudo apt-get update -qq && sudo apt-get install -y -qq jq shellcheck
       - name: Validate harness (JSON, shell syntax, shellcheck, hook tests, frontmatter)
         run: bash scripts/validate-harness.sh
+
+  bridge-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install bridge dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r bridge/requirements.txt
+          pip install pytest
+      - name: Expose bridge as the telegram_bot package
+        # Mirrors start.sh's ensure_package_link: the code lives in bridge/ but is
+        # imported as `telegram_bot`, so symlink it onto the interpreter's site-packages.
+        run: |
+          sp="$(python -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
+          ln -sfn "$GITHUB_WORKSPACE/bridge" "$sp/telegram_bot"
+      - name: Run bridge tests
+        working-directory: bridge
+        run: python -m pytest -q
