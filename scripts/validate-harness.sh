@@ -72,7 +72,7 @@ fi
 
 # 2) shell syntax (bash -n) on all hook + top-level scripts
 say "== bash -n =="
-mapfile -t SH < <(find claude/hooks scripts -name '*.sh' 2>/dev/null; echo setup.sh; echo claude/mcp-setup.sh)
+mapfile -t SH < <(find claude/hooks scripts -name '*.sh' 2>/dev/null; echo setup.sh; echo claude/mcp-setup.sh; echo claude/headless.sh)
 for f in "${SH[@]}"; do
   [ -f "$f" ] || continue
   if bash -n "$f" 2>/dev/null; then say "  ok $f"; else err "bash -n: $f"; fi
@@ -81,7 +81,8 @@ done
 # 3) shellcheck — scoped to reviewed scripts (blocking); others get bash -n only above.
 say "== shellcheck =="
 SC_SCOPE=(claude/hooks/guard.sh claude/hooks/audit.sh claude/hooks/redact.sh \
-          claude/hooks/notify.sh claude/hooks/guard.test.sh \
+          claude/hooks/notify.sh claude/hooks/statusline.sh claude/headless.sh \
+          claude/hooks/guard.test.sh \
           claude/hooks/observability.test.sh scripts/validate-harness.sh)
 if command -v shellcheck >/dev/null 2>&1; then
   for f in "${SC_SCOPE[@]}"; do
@@ -110,6 +111,7 @@ fm_check() { # <file>
 }
 for f in claude/skills/*/SKILL.md; do [ -f "$f" ] && fm_check "$f" && say "  ok $f"; done
 for f in claude/agents/*.md;      do [ -f "$f" ] && fm_check "$f" && say "  ok $f"; done
+for f in claude/output-styles/*.md; do [ -f "$f" ] && fm_check "$f" && say "  ok $f"; done
 # slash commands: frontmatter must carry description: (command name = filename, so no name:)
 for f in claude/commands/*.md; do
   [ -f "$f" ] || continue
@@ -125,6 +127,31 @@ for r in "${REFS[@]}"; do
   base="claude/hooks/$(basename "$r")"
   if [ -f "$base" ]; then say "  ok $base"; else err "settings.json references missing hook: $r ($base)"; fi
 done
+
+# 7) Tier 3: statusline smoke + settings wiring
+say "== statusline + settings wiring =="
+if [ -f claude/hooks/statusline.sh ]; then
+  SAMPLE='{"model":{"display_name":"T"},"context_window":{"used_percentage":42.5},"cost":{"total_cost_usd":1.2},"exceeds_200k_tokens":true,"output_style":{"name":"ccc-report"},"workspace":{"current_dir":"'"$ROOT"'"}}'
+  if out="$(printf '%s' "$SAMPLE" | CCC_NODE=ci bash claude/hooks/statusline.sh 2>/dev/null)" && [ -n "$out" ]; then
+    say "  ok statusline.sh emits output"
+  else err "statusline.sh produced no output / non-zero"; fi
+  # empty input must not crash (fail-open to a usable bar)
+  printf '%s' '' | CCC_NODE=ci bash claude/hooks/statusline.sh >/dev/null 2>&1 \
+    && say "  ok statusline.sh survives empty input" || err "statusline.sh crashed on empty input"
+fi
+# settings.json statusLine command must point at an installed script that exists in-repo
+SL_CMD="$(jq -r '.statusLine.command // empty' claude/settings.json 2>/dev/null)"
+if [ -n "$SL_CMD" ]; then
+  base="claude/hooks/$(basename "${SL_CMD##* }")"
+  [ -f "$base" ] && say "  ok statusLine -> $base" || err "settings statusLine references missing script: $SL_CMD ($base)"
+fi
+# settings.json outputStyle must name a shipped output-style file
+OS="$(jq -r '.outputStyle // empty' claude/settings.json 2>/dev/null)"
+if [ -n "$OS" ]; then
+  if grep -rqi "^name:[[:space:]]*$OS\b" claude/output-styles/*.md 2>/dev/null \
+     || [ -f "claude/output-styles/$OS.md" ]; then say "  ok outputStyle -> $OS";
+  else err "settings outputStyle '$OS' has no matching claude/output-styles/*.md"; fi
+fi
 
 say "===================="
 if [ "$fail" = "0" ]; then say "HARNESS VALIDATION: PASS"; else say "HARNESS VALIDATION: FAIL"; fi

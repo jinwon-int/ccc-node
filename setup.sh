@@ -32,7 +32,15 @@ run "cp '$SRC/claude/hooks/guard.sh'          '$CLAUDE_DIR/hooks/guard.sh'"
 run "cp '$SRC/claude/hooks/audit.sh'          '$CLAUDE_DIR/hooks/audit.sh'"
 run "cp '$SRC/claude/hooks/redact.sh'         '$CLAUDE_DIR/hooks/redact.sh'"
 run "cp '$SRC/claude/hooks/notify.sh'         '$CLAUDE_DIR/hooks/notify.sh'"
+run "cp '$SRC/claude/hooks/statusline.sh'     '$CLAUDE_DIR/hooks/statusline.sh'"
 run "chmod +x '$CLAUDE_DIR/hooks/'*.sh"
+# Tier 3: status line (node·model·git·context·cost·A2A) wired via settings.json statusLine.
+# Output style (한국어 구조화 보고) — node-agnostic; settings.json activates it as outputStyle.
+run "mkdir -p '$CLAUDE_DIR/output-styles'"
+run "cp '$SRC/claude/output-styles/'*.md '$CLAUDE_DIR/output-styles/'"
+# Headless runner for cron/A2A/CI (`claude -p` wrapper, guard still applies).
+run "cp '$SRC/claude/headless.sh'             '$CLAUDE_DIR/headless.sh'"
+run "chmod +x '$CLAUDE_DIR/headless.sh'"
 # Working-state checkpoint dir (PreCompact snapshot / PostCompact re-inject)
 run "mkdir -p '$CLAUDE_DIR/state/checkpoints'"
 # A2A worker sub-agent roster (explorer/implementer/verifier) — node-agnostic role defs
