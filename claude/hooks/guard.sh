@@ -65,6 +65,30 @@ c="$cmd"
 g() { grep -Eq "$1" <<<"$c"; }   # case-sensitive
 gi() { grep -Eiq "$1" <<<"$c"; } # case-insensitive
 
+# 0 = safe low-risk local Telegram bridge restart.
+ccc_telegram_bridge_restart() {
+  # Never allow the carve-out to hide chained/compound service controls.
+  case "$c" in *';'*|*'&'*|*'|'*|*'`'*|*'$('*|*$'\n'*) return 1;; esac
+  local toks; read -ra toks <<<"$c"
+  local n=${#toks[@]} i=0 si=-1 service_cmds=0
+  while [ "$i" -lt "$n" ]; do
+    case "${toks[$i]}" in
+      systemctl|service) service_cmds=$((service_cmds+1)); [ "$si" -lt 0 ] && si=$i ;;
+    esac
+    i=$((i+1))
+  done
+  [ "$service_cmds" -eq 1 ] || return 1
+
+  [ "$((si + 2))" -lt "$n" ] || return 1
+  [ "${toks[$((si + 1))]}" = "restart" ] || return 1
+  case "${toks[$((si + 2))]}" in
+    ccc-telegram-bridge|ccc-telegram-bridge.service) : ;;
+    *) return 1 ;;
+  esac
+  [ "$((si + 3))" -eq "$n" ] || return 1
+  return 0
+}
+
 # force push / history rewrite
 #
 # Force-push is review-gated by default, BUT auto-allowed (operator-approved
@@ -128,6 +152,7 @@ fi
 g 'git[[:space:]]+(filter-branch|filter-repo)([[:space:]]|$)|git-filter-repo'                               && deny "history-rewrite" "operator_review_gated" "$c"
 
 # broker / Gateway / worker / bridge service control
+ccc_telegram_bridge_restart && exit 0
 g '(systemctl|service|supervisorctl|pm2)[[:space:]]+(restart|stop|start|reload|kill)([[:space:]]).*(broker|gateway|worker|a2a|hermes|openclaw|bridge)' && deny "service-control" "operator_approval_gated" "$c"
 gi '\b(restart|reload)[-_](broker|gateway|bridge|worker)\b' && deny "service-control" "operator_approval_gated" "$c"
 
