@@ -97,6 +97,7 @@ fi
 run "cp '$SRC/claude/settings.local.json'     '$CLAUDE_DIR/settings.local.json'"
 run "cp '$SRC/claude/hooks/load-memory.sh'    '$CLAUDE_DIR/hooks/load-memory.sh'"
 run "cp '$SRC/claude/hooks/refresh-memory.sh' '$CLAUDE_DIR/hooks/refresh-memory.sh'"
+run "cp '$SRC/claude/hooks/scan-injection.sh' '$CLAUDE_DIR/hooks/scan-injection.sh'"
 run "cp '$SRC/claude/hooks/load-tools.sh'     '$CLAUDE_DIR/hooks/load-tools.sh'"
 run "cp '$SRC/claude/hooks/checkpoint.sh'     '$CLAUDE_DIR/hooks/checkpoint.sh'"
 run "cp '$SRC/claude/hooks/guard.sh'          '$CLAUDE_DIR/hooks/guard.sh'"
