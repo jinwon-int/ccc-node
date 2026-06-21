@@ -199,22 +199,24 @@ class Config(BaseSettings):
         ),
     )
     enable_part_headers: bool = Field(
-        default=False,
+        default=True,
         alias="CCC_TELEGRAM_PART_HEADERS",
         description=(
             "Prefix multi-chunk Telegram responses with a compact 'k/N' part "
-            "marker (GitHub issue #34). Opt-in; only applies when a response is "
-            "split into more than one message."
+            "marker (GitHub issue #34). Default on; only applies when a response "
+            "is split into more than one message. Set "
+            "CCC_TELEGRAM_PART_HEADERS=false to disable."
         ),
     )
     enable_entity_renderer: bool = Field(
-        default=False,
+        default=True,
         alias="CCC_TELEGRAM_ENTITY_RENDERER",
         description=(
             "Send final Telegram output as (text + MessageEntity[]) instead of a "
             "MarkdownV2 string, avoiding escape failures (GitHub issue #34). "
-            "Opt-in; falls back to MarkdownV2 if the entity API is unavailable or "
-            "a send fails."
+            "Default on; fail-open — falls back to MarkdownV2 if the entity API "
+            "is unavailable or a send fails. Set "
+            "CCC_TELEGRAM_ENTITY_RENDERER=false to disable."
         ),
     )
 
