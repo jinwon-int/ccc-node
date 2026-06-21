@@ -111,7 +111,7 @@ fi
 
 # 4) hook tests
 say "== hook tests =="
-for t in claude/hooks/guard.test.sh claude/hooks/observability.test.sh claude/hooks/security-scan.test.sh; do
+for t in claude/hooks/guard.test.sh claude/hooks/observability.test.sh claude/hooks/security-scan.test.sh scripts/ccc-doctor.test.sh; do
   [ -f "$t" ] || { err "missing test: $t"; continue; }
   if bash "$t" >/tmp/htest.out 2>&1; then say "  ok $(grep -E 'PASS=' /tmp/htest.out | tail -1) $t";
   else err "test failed: $t"; tail -5 /tmp/htest.out; fi

@@ -36,6 +36,10 @@ to Telegram, with all secrets and node-local state stripped out and replaced by 
 - **Output style** (`output-styles/ccc-report.md`) — Korean structured-reporting default
   (확정/변경/리스크/다음, 진행 내레이션, 번호형 질문), activated via `settings.json`
   `outputStyle`. Switch anytime with `/config` → Output style.
+- **Doctor diagnostics** (`scripts/ccc-doctor.sh`, `/doctor`) — read-only harness drift
+  classification for settings, hook wiring, output style, status line, and bridge status.
+  The first slice reports `정상`/`경고`/`교정가능`/`수동필요`; `--fix` is reserved for a
+  later backup + dry-run + idempotent repair slice.
 - **Headless runner** (`headless.sh`) — `claude -p` wrapper for cron/A2A/CI with JSON output
   and a read-only tool baseline; guard enforcement still applies.
 - **A2A Claude Code worker lane** — documentation for nodes whose broker poller keeps the
