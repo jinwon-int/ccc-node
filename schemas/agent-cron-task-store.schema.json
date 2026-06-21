@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/jinwon-int/ccc-node/schemas/agent-cron-task-store.schema.json",
+  "title": "ccc-node agent-cron task store",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "tasks"],
+  "properties": {
+    "version": { "const": 1 },
+    "tasks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "schedule", "prompt", "enabled"],
+        "properties": {
+          "id": { "type": "string", "pattern": "^[A-Za-z0-9_.-]{1,96}$" },
+          "name": { "type": "string" },
+          "schedule": { "type": "string", "minLength": 1 },
+          "prompt": { "type": "string", "minLength": 1 },
+          "enabled": { "type": "boolean" },
+          "allowedTools": { "type": "array", "items": { "type": "string" }, "default": [] },
+          "permissionMode": { "enum": ["default", "dontAsk", "acceptEdits"] },
+          "notify": { "enum": ["none", "telegram-owner"], "default": "none" },
+          "attachMemory": { "type": "array", "items": { "type": "string" }, "default": [] },
+          "attachSkills": { "type": "array", "items": { "type": "string" }, "default": [] },
+          "redactProfile": { "type": "string", "default": "default" },
+          "lastRunAt": { "type": ["string", "null"] },
+          "lastStatus": { "type": ["string", "null"] },
+          "lastRunId": { "type": ["string", "null"] }
+        }
+      }
+    }
+  }
+}

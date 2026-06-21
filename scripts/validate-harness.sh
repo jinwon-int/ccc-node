@@ -21,7 +21,8 @@ say "== settings JSON =="
 for f in claude/settings.base.json claude/settings.local.json \
          claude/hooks/enforcement-overlay.json \
          .claude-plugin/marketplace.json \
-         claude/.claude-plugin/plugin.json claude/hooks/hooks.json; do
+         claude/.claude-plugin/plugin.json claude/hooks/hooks.json \
+         schemas/agent-cron-task-store.schema.json; do
   [ -f "$f" ] || { say "  (skip $f — absent)"; continue; }
   if jq -e . "$f" >/dev/null 2>&1; then say "  ok $f"; else err "invalid JSON: $f"; fi
 done
@@ -111,7 +112,7 @@ fi
 
 # 4) hook tests
 say "== hook tests =="
-for t in claude/hooks/guard.test.sh claude/hooks/observability.test.sh claude/hooks/security-scan.test.sh scripts/ccc-doctor.test.sh scripts/ccc-security-audit.test.sh; do
+for t in claude/hooks/guard.test.sh claude/hooks/observability.test.sh claude/hooks/security-scan.test.sh scripts/ccc-doctor.test.sh scripts/ccc-security-audit.test.sh scripts/agent-cron.test.sh; do
   [ -f "$t" ] || { err "missing test: $t"; continue; }
   if bash "$t" >/tmp/htest.out 2>&1; then say "  ok $(grep -E 'PASS=' /tmp/htest.out | tail -1) $t";
   else err "test failed: $t"; tail -5 /tmp/htest.out; fi
