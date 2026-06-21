@@ -36,10 +36,10 @@ to Telegram, with all secrets and node-local state stripped out and replaced by 
 - **Output style** (`output-styles/ccc-report.md`) — Korean structured-reporting default
   (확정/변경/리스크/다음, 진행 내레이션, 번호형 질문), activated via `settings.json`
   `outputStyle`. Switch anytime with `/config` → Output style.
-- **Doctor diagnostics** (`scripts/ccc-doctor.sh`, `/doctor`) — read-only harness drift
-  classification for settings, hook wiring, output style, status line, and bridge status.
-  The first slice reports `정상`/`경고`/`교정가능`/`수동필요`; `--fix` is reserved for a
-  later backup + dry-run + idempotent repair slice.
+- **Doctor diagnostics** (`scripts/ccc-doctor.sh`, `/doctor`) — harness drift classification for
+  settings, hook wiring, output style, status line, and bridge status. `--fix` is dry-run by
+  default; `--fix --apply` currently repairs only deterministic `settings.json` drift after a
+  backup tar, while manual/risky/system-level items stay fail-closed.
 - **Security audit** (`scripts/ccc-security-audit.sh`, `/security-audit`) — read-only,
   metadata-only checks for sensitive file permissions, settings allowlist posture, scanner
   integrity, and push-spool/cache redaction risk. It never prints matched secret text or file

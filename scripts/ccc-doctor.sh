@@ -1,38 +1,37 @@
 #!/usr/bin/env bash
-# ccc doctor — read-only harness consistency diagnostics.
+# ccc doctor — harness consistency diagnostics and conservative repair.
 #
-# First slice for issue #52: classify drift only. `--fix` is intentionally
-# non-mutating/not implemented here; future slices must add backup + dry-run +
-# idempotent repair before writing anything.
+# First repair slice for issue #52: `--fix` is dry-run by default; `--fix
+# --apply` repairs only settings.json drift that is classified as 교정가능.
+# Manual/risky/system-level items remain fail-closed.
 set -uo pipefail
 
 REPO="${CCC_DOCTOR_REPO_DIR:-$(cd "$(dirname "$0")/.." && pwd)}"
 CLAUDE_DIR="${CCC_DOCTOR_CLAUDE_DIR:-/root/.claude}"
 SETTINGS="$CLAUDE_DIR/settings.json"
 FIX=0
+APPLY=0
 for arg in "$@"; do
   case "$arg" in
     --fix) FIX=1 ;;
+    --apply|--write) APPLY=1 ;;
     -h|--help)
       cat <<'EOF'
-Usage: ccc-doctor.sh [--fix]
+Usage: ccc-doctor.sh [--fix [--apply]]
 
-Read-only ccc-node harness diagnostics. Classifies checks as:
-정상 / 경고 / 교정가능 / 수동필요.
+Diagnostics classify checks as: 정상 / 경고 / 교정가능 / 수동필요.
 
-This implementation slice is diagnostic-only: --fix is not implemented and
-makes no filesystem changes.
+Repair boundary:
+- `--fix` is a dry-run plan and makes no filesystem changes.
+- `--fix --apply` writes only deterministic settings.json repairs for 교정가능
+  outputStyle/statusLine/hook wiring drift, after a backup tar is created.
+- 수동필요/risky/system-level items fail closed and are never auto-repaired.
 EOF
       exit 0
       ;;
     *) echo "Unknown flag: $arg" >&2; exit 2 ;;
   esac
 done
-
-if [ "$FIX" = 1 ]; then
-  echo "ccc doctor --fix is not implemented in this diagnostic-only slice; no filesystem changes were made." >&2
-  exit 2
-fi
 
 normal=0; warn=0; fixable=0; manual=0
 rows=()
@@ -147,22 +146,96 @@ else
   add 경고 "bridge status" "bridge/start.sh missing or not executable" "not all nodes run the Telegram bridge; install/check only if needed"
 fi
 
-printf '# ccc doctor\n\n'
-printf -- '- repo: `%s`\n' "$REPO"
-printf -- '- claude dir: `%s`\n' "$CLAUDE_DIR"
-printf -- '- mode: `%s`\n\n' "$mode"
-printf '## 진단 요약\n\n'
-printf -- '- 정상: %s\n- 경고: %s\n- 교정가능: %s\n- 수동필요: %s\n\n' "$normal" "$warn" "$fixable" "$manual"
-printf '| 분류 | 항목 | 상태 | 조치 |\n|---|---|---|---|\n'
-for row in "${rows[@]}"; do
-  IFS='|' read -r class item status action <<<"$row"
-  printf '| %s | `%s` | %s | %s |\n' "$class" "$item" "$status" "$action"
-done
-printf '\n## 경계\n\n'
-printf -- '- This command is read-only in the current slice.\n'
-printf -- '- No remote nodes, secrets, broker/Gateway restarts, bridge restarts, migrations, or provider sends are touched.\n'
-printf -- '- `--fix` is reserved for a later backup + dry-run + idempotent repair slice.\n'
+print_report() {
+  printf '# ccc doctor\n\n'
+  printf -- '- repo: `%s`\n' "$REPO"
+  printf -- '- claude dir: `%s`\n' "$CLAUDE_DIR"
+  printf -- '- mode: `%s`\n\n' "$mode"
+  printf '## 진단 요약\n\n'
+  printf -- '- 정상: %s\n- 경고: %s\n- 교정가능: %s\n- 수동필요: %s\n\n' "$normal" "$warn" "$fixable" "$manual"
+  printf '| 분류 | 항목 | 상태 | 조치 |\n|---|---|---|---|\n'
+  for row in "${rows[@]}"; do
+    IFS='|' read -r class item status action <<<"$row"
+    printf '| %s | `%s` | %s | %s |\n' "$class" "$item" "$status" "$action"
+  done
+  printf '\n## 경계\n\n'
+  printf -- '- Diagnostics are read-only unless `--fix --apply` is explicitly used.\n'
+  printf -- '- `--fix` alone is dry-run only.\n'
+  printf -- '- No remote nodes, secrets, broker/Gateway restarts, bridge restarts, migrations, or provider sends are touched.\n'
+}
 
+settings_desired_tmp=""
+make_settings_desired() {
+  [ "$settings_valid" = 1 ] || return 1
+  [ "$mode" = standalone ] || [ "$mode" = plugin ] || return 1
+  [ -f "$REPO/claude/settings.base.json" ] || return 1
+  settings_desired_tmp="$(mktemp)"
+  if [ "$mode" = standalone ]; then
+    [ -f "$REPO/claude/hooks/enforcement-overlay.json" ] || return 1
+    jq -s '
+      .[0] as $cur | .[1] as $base | .[2] as $overlay |
+      $cur
+      | .outputStyle = $base.outputStyle
+      | .statusLine = $base.statusLine
+      | .hooks.SessionStart = $base.hooks.SessionStart
+      | .hooks.PostCompact = $base.hooks.PostCompact
+      | .hooks.PreToolUse = $overlay.hooks.PreToolUse
+      | .hooks.PostToolUse = $overlay.hooks.PostToolUse
+      | .hooks.UserPromptSubmit = $overlay.hooks.UserPromptSubmit
+      | .hooks.Notification = $overlay.hooks.Notification
+      | .hooks.Stop = $overlay.hooks.Stop
+      | .hooks.SessionEnd = $overlay.hooks.SessionEnd
+    ' "$SETTINGS" "$REPO/claude/settings.base.json" "$REPO/claude/hooks/enforcement-overlay.json" > "$settings_desired_tmp" 2>/dev/null
+  else
+    jq -s '
+      .[0] as $cur | .[1] as $base |
+      $cur
+      | .outputStyle = $base.outputStyle
+      | .statusLine = $base.statusLine
+      | .hooks.SessionStart = $base.hooks.SessionStart
+      | .hooks.PostCompact = $base.hooks.PostCompact
+    ' "$SETTINGS" "$REPO/claude/settings.base.json" > "$settings_desired_tmp" 2>/dev/null
+  fi
+}
+
+settings_needs_repair() {
+  make_settings_desired || return 1
+  ! diff <(jq -S . "$SETTINGS") <(jq -S . "$settings_desired_tmp") >/dev/null 2>&1
+}
+
+apply_settings_repair() {
+  settings_needs_repair || { rm -f "${settings_desired_tmp:-}"; return 1; }
+  local ts archive
+  ts="$(date +%Y%m%d-%H%M%S)"
+  archive="$CLAUDE_DIR/backups/ccc-doctor-$ts.tar.gz"
+  mkdir -p "$CLAUDE_DIR/backups"
+  tar -czf "$archive" -C "$CLAUDE_DIR" settings.json
+  mv "$settings_desired_tmp" "$SETTINGS"
+  printf 'applied settings.json repair; backup=%s\n' "$archive"
+}
+
+if [ "$FIX" = 1 ]; then
+  printf '# ccc doctor --fix\n\n'
+  if [ "$manual" -gt 0 ]; then
+    printf 'manual items present; refusing automatic repair.\n' >&2
+    print_report
+    exit 1
+  fi
+  if settings_needs_repair; then
+    if [ "$APPLY" = 1 ]; then
+      apply_settings_repair
+      exit 0
+    fi
+    rm -f "${settings_desired_tmp:-}"
+    printf 'dry-run: would repair settings.json from canonical repo templates. Re-run with `--fix --apply` to write after backup.\n'
+    exit 1
+  fi
+  rm -f "${settings_desired_tmp:-}"
+  printf 'no repairs needed.\n'
+  exit 0
+fi
+
+print_report
 if [ "$manual" -gt 0 ] || [ "$fixable" -gt 0 ]; then
   exit 1
 fi
