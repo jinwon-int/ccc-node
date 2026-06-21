@@ -20,6 +20,13 @@ HONCHO="$(jq -r '.baseUrl // empty' "$HONCHO_CFG" 2>/dev/null)"
 WS="$(jq -r '.workspace // "seoyoon-family"' "$HONCHO_CFG" 2>/dev/null)"
 PEER="$(jq -r '.peerName // empty' "$HONCHO_CFG" 2>/dev/null)"
 TARGET="$(jq -r '.target // "seo-jin-on"' "$HONCHO_CFG" 2>/dev/null)"
+# Optional bearer token for when the Honcho server runs with AUTH_USE_AUTH=true.
+# Read from honcho.json (authToken/apiKey). When absent, no header is sent and
+# behaviour is identical to before — so this is safe to ship ahead of any
+# server-side auth change.
+HONCHO_TOKEN="$(jq -r '.authToken // .apiKey // empty' "$HONCHO_CFG" 2>/dev/null)"
+HONCHO_AUTH_ARGS=()
+[ -n "$HONCHO_TOKEN" ] && HONCHO_AUTH_ARGS=(-H "Authorization: Bearer $HONCHO_TOKEN")
 
 # Family Wiki cache prefetch (local, budget-capped). Set PREFETCH_QUERY per node.
 PREFETCH_QUERY="${PREFETCH_QUERY:-this node operating memory, current status, and Seoyoon ops priorities}"
@@ -33,6 +40,7 @@ if [ -n "$HONCHO" ] && [ -n "$PEER" ]; then
   h="$(timeout 60 curl -s -X POST \
     "$HONCHO/v3/workspaces/$WS/peers/$PEER/chat" \
     -H 'Content-Type: application/json' \
+    "${HONCHO_AUTH_ARGS[@]}" \
     -d "{\"query\":\"Summarize what you know about working with the user: preferences, current priorities, and operating context.\",\"target\":\"$TARGET\",\"reasoning_level\":\"low\"}" \
     2>/dev/null | jq -r '.content // empty' 2>/dev/null)"
   if [ -n "$h" ]; then
