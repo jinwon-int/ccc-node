@@ -40,6 +40,10 @@ to Telegram, with all secrets and node-local state stripped out and replaced by 
   classification for settings, hook wiring, output style, status line, and bridge status.
   The first slice reports `정상`/`경고`/`교정가능`/`수동필요`; `--fix` is reserved for a
   later backup + dry-run + idempotent repair slice.
+- **Security audit** (`scripts/ccc-security-audit.sh`, `/security-audit`) — read-only,
+  metadata-only checks for sensitive file permissions, settings allowlist posture, scanner
+  integrity, and push-spool/cache redaction risk. It never prints matched secret text or file
+  contents; `--fix` is reserved for a later repair slice.
 - **Headless runner** (`headless.sh`) — `claude -p` wrapper for cron/A2A/CI with JSON output
   and a read-only tool baseline; guard enforcement still applies.
 - **A2A Claude Code worker lane** — documentation for nodes whose broker poller keeps the
