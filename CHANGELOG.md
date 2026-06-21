@@ -2,6 +2,19 @@
 
 All notable changes to the Claude Code node harness. Dates are KST.
 
+## [0.3.13] — 2026-06-21
+
+Guard — narrow Telegram bridge restart carve-out for issue #34 slice 4 canary operations.
+
+### Changed
+- `claude/hooks/guard.sh`: allow the low-risk local `ccc-telegram-bridge` restart path
+  (`.service` suffix optional) while preserving approval gates for broker/Gateway/A2A worker
+  and other bridge service controls discovered during issue #34 canary operations.
+
+### Added
+- `claude/hooks/guard.test.sh`: acceptance coverage for allowed `ccc-telegram-bridge`
+  restarts and denied A2A/worker/broker service controls.
+
 ## [0.3.12] — 2026-06-21
 
 Fix — setup.sh did not install evidence-gate.sh (added in 0.3.8 but omitted from the
