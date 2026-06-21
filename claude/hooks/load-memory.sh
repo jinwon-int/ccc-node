@@ -8,17 +8,32 @@ set -uo pipefail
 # both SessionStart (fresh session) and PostCompact (re-inject after compaction).
 EVENT="${1:-SessionStart}"
 
-CACHE=/root/.claude/hooks/cache
-HOOKDIR=/root/.claude/hooks
+CACHE="${CCC_MEMORY_CACHE_DIR:-/root/.claude/hooks/cache}"
+HOOKDIR="${CCC_HOOK_DIR:-/root/.claude/hooks}"
+
+scan_injection_block() { # <label> <text>
+  local label="$1" text="$2" scanned
+  if [ -x "$HOOKDIR/scan-injection.sh" ] \
+    && scanned="$(printf '%s' "$text" | "$HOOKDIR/scan-injection.sh" "$label" 2>/dev/null)"; then
+    printf '%s' "$scanned"
+  else
+    # Fail-open by design: scanner availability must not prevent session startup.
+    printf '%s' "$text"
+  fi
+}
 
 # Node-owned memory lives under ~/.claude/memories (Hermes-independent).
 # Fall back to the legacy ~/.hermes/memories only if the local copy is absent.
-MEMDIR=/root/.claude/memories
+MEMDIR="${CCC_MEMORY_DIR:-/root/.claude/memories}"
 mem="$(cat "$MEMDIR/MEMORY.md" "$MEMDIR/USER.md" 2>/dev/null)"
 [ -z "$mem" ] && mem="$(cat /root/.hermes/memories/MEMORY.md /root/.hermes/memories/USER.md 2>/dev/null)"
 wiki="$(cat "$CACHE/wiki.txt" 2>/dev/null)"
 honcho="$(cat "$CACHE/honcho.txt" 2>/dev/null)"
 stamp="$(cat "$CACHE/.last-refresh" 2>/dev/null)"
+
+mem="$(scan_injection_block built-in-memory "$mem")"
+wiki="$(scan_injection_block family-wiki-cache "$wiki")"
+honcho="$(scan_injection_block honcho-cache "$honcho")"
 
 node_label="${CCC_NODE:-$(cat /root/.claude/state/node.txt 2>/dev/null || hostname -s 2>/dev/null || printf 'ccc-node')}"
 

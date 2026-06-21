@@ -43,6 +43,21 @@ recorded to `~/.claude/state/approval-needed.log`; the bypass is logged to stder
 - This model mirrors the fleet's formal risk profiles and the `CLAUDE.md`
   "Fresh Approval Required" set.
 
+## Memory injection scanner
+
+`scan-injection.sh` protects SessionStart/PostCompact memory injection by redacting
+high-risk content before `load-memory.sh` emits `additionalContext`:
+
+- credential-like strings → `[REDACTED:credential]` / `[REDACTED:jwt]`;
+- obvious prompt-injection directives → `[REDACTED:prompt-injection]`;
+- invisible/bidi Unicode controls → `[REDACTED:unicode]`.
+
+The scanner is **fail-open for availability**: if it is missing or exits non-zero,
+`load-memory.sh` injects the original text so a node can still start. Successful findings
+are recorded as metadata-only `MemoryInjectionScan` audit events; raw/redacted body text is
+never written to the audit log. This is intentionally separate from `guard.sh`, which remains
+fail-closed for operator actions.
+
 ## Permissions (`settings.json`) vs hook enforcement — decision (#13 item #3)
 
 `settings.json` keeps a broad `Bash(*)` allow **on purpose**: enforcement is the hook
