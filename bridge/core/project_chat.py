@@ -72,7 +72,7 @@ ALLOWED_TOOLS = [
     # AskUserQuestion is handled via disallowed_tools + can_use_tool callback
 ]
 
-PROCESS_TIMEOUT = int(os.getenv("CLAUDE_PROCESS_TIMEOUT", "600"))
+PROCESS_TIMEOUT = int(os.getenv("CLAUDE_PROCESS_TIMEOUT", "3600"))
 
 
 def _is_retryable_sdk_error(error: Exception) -> bool:
