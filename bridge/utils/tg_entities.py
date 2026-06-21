@@ -86,6 +86,39 @@ def to_entity_chunks(
         return None
 
 
+def apply_single_part_header(chunk: EntityChunk, index: int, total: int) -> EntityChunk:
+    """Prefix one entity chunk with a bold ``index/total`` marker.
+
+    This is used when streaming overflow already split the response into several
+    draft messages before final rendering. In that case each finalized draft is
+    often a single entity chunk, so ``apply_part_headers`` cannot infer the
+    cross-draft total from the chunk list length.
+    """
+    text, entities = chunk
+    entity_cls = PTBMessageEntity
+    if entity_cls is None or total <= 1:
+        return chunk
+    marker_text = f"{index}/{total}"
+    prefix = f"{marker_text}\n"
+    try:
+        shift = _tm.utf16_len(prefix) if _tm is not None else len(prefix)
+    except Exception:  # pragma: no cover - utf16_len only fails on bad input
+        shift = len(prefix)
+    marker_entity = entity_cls(type="bold", offset=0, length=len(marker_text))
+    shifted = [
+        entity_cls(
+            type=e.type,
+            offset=e.offset + shift,
+            length=e.length,
+            url=getattr(e, "url", None),
+            language=getattr(e, "language", None),
+            custom_emoji_id=getattr(e, "custom_emoji_id", None),
+        )
+        for e in entities
+    ]
+    return prefix + text, [marker_entity, *shifted]
+
+
 def apply_part_headers(chunks: List[EntityChunk]) -> List[EntityChunk]:
     """Prefix each entity chunk with a compact bold ``k/N`` continuation marker.
 
