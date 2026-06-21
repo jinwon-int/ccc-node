@@ -2,6 +2,31 @@
 
 All notable changes to the Claude Code node harness. Dates are KST.
 
+## [0.3.14] — 2026-06-21
+
+Bridge — extend `CCC_TELEGRAM_PART_HEADERS` to the entity-renderer path so multi-chunk
+responses actually get a `k/N` marker under the default config (GitHub issue #34 follow-up).
+
+### Fixed
+- `bridge/core/streaming.py`: previously, `apply_part_headers` only ran on the MarkdownV2
+  fallback path. With both `CCC_TELEGRAM_ENTITY_RENDERER` and `CCC_TELEGRAM_PART_HEADERS`
+  default-on (slices 4 & 5), the entity path returned first and emitted multi-chunk
+  responses with no part marker. The `PART_HEADER_RESERVE` headroom is now applied to the
+  split limit for both renderers, and entity chunks pass through `apply_part_headers`
+  before send.
+
+### Added
+- `bridge/utils/tg_entities.py`: `apply_part_headers(chunks)` — entity-path counterpart to
+  `tg_readable.apply_part_headers`. Prepends `"k/N\n"` to each chunk text and emits a bold
+  `MessageEntity` over the `k/N` digits (no `parse_mode` is set in the entity path, so
+  asterisks would otherwise render as literal text). Existing entity offsets are shifted
+  by the UTF-16 length of the prefix.
+- `bridge/tests/test_tg_entities.py`: unit coverage for single/empty/multi-chunk behavior,
+  offset shifting, and UTF-16-safe ASCII marker length.
+- `bridge/tests/test_streaming.py`: integration test — a >TELEGRAM_LIMIT draft on the
+  entity path lands as multiple bubbles, each starting with `k/N\n` and carrying a bold
+  marker `MessageEntity`.
+
 ## [0.3.13] — 2026-06-21
 
 Guard — narrow Telegram bridge restart carve-out for issue #34 slice 4 canary operations.

@@ -58,5 +58,76 @@ class EntityRenderTests(unittest.TestCase):
         self.assertLessEqual(e.offset + e.length, tm.utf16_len(text))
 
 
+class EntityPartHeaderTests(unittest.TestCase):
+    """Entity-path counterpart to tg_readable.apply_part_headers tests."""
+
+    def test_single_chunk_unchanged(self):
+        src = [("only", [])]
+        out = tg_entities.apply_part_headers(src)
+        self.assertEqual(out, [("only", [])])
+
+    def test_empty_unchanged(self):
+        self.assertEqual(tg_entities.apply_part_headers([]), [])
+
+    def test_returns_new_list_without_mutating_input(self):
+        src = [("a", []), ("b", [])]
+        out = tg_entities.apply_part_headers(src)
+        self.assertIsNot(out, src)
+        # input chunks themselves untouched
+        self.assertEqual(src[0], ("a", []))
+        self.assertEqual(src[1], ("b", []))
+
+    @needs_lib
+    def test_multi_chunk_prepends_bold_marker(self):
+        from telegram import MessageEntity
+
+        src = [("alpha", []), ("beta", []), ("gamma", [])]
+        out = tg_entities.apply_part_headers(src)
+        self.assertEqual(len(out), 3)
+        for index, (text, entities) in enumerate(out, 1):
+            self.assertTrue(text.startswith(f"{index}/3\n"))
+            # first entity is the bold marker over the 'k/N' digits only
+            self.assertEqual(entities[0].type, MessageEntity.BOLD)
+            self.assertEqual(entities[0].offset, 0)
+            self.assertEqual(entities[0].length, len(f"{index}/3"))
+
+    @needs_lib
+    def test_multi_chunk_shifts_existing_entity_offsets(self):
+        from telegram import MessageEntity
+
+        # Pre-existing bold over "alpha" at offset 0, length 5
+        existing = MessageEntity(type="bold", offset=0, length=5)
+        src = [("alpha body", [existing]), ("beta body", [])]
+        out = tg_entities.apply_part_headers(src)
+
+        first_text, first_entities = out[0]
+        prefix = "1/2\n"  # marker + newline
+        self.assertEqual(first_text, prefix + "alpha body")
+        # Two entities: marker bold (offset 0) + shifted original (offset = len(prefix))
+        self.assertEqual(len(first_entities), 2)
+        marker, shifted = first_entities
+        self.assertEqual(marker.offset, 0)
+        self.assertEqual(marker.length, 3)  # "1/2"
+        self.assertEqual(shifted.type, MessageEntity.BOLD)
+        self.assertEqual(shifted.offset, len(prefix))
+        self.assertEqual(shifted.length, 5)
+
+    @needs_lib
+    def test_offset_shift_is_utf16_aware_for_ascii_marker(self):
+        import telegramify_markdown as tm
+        from telegram import MessageEntity
+
+        # ASCII-only marker — UTF-16 length must equal the string length so the
+        # shifted offset is byte-for-byte addressable on Telegram's side.
+        src = [("x", []), ("y", [])]
+        out = tg_entities.apply_part_headers(src)
+        prefix_text = "1/2\n"
+        self.assertEqual(tm.utf16_len(prefix_text), len(prefix_text))
+        # marker entity covers exactly the digit/slash portion (no newline)
+        self.assertEqual(out[0][1][0].length, len("1/2"))
+        # full chunk text starts with the prefix
+        self.assertTrue(out[0][0].startswith(prefix_text))
+
+
 if __name__ == "__main__":
     unittest.main()

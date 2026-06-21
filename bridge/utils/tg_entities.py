@@ -84,3 +84,58 @@ def to_entity_chunks(
             exc_info=True,
         )
         return None
+
+
+def apply_part_headers(chunks: List[EntityChunk]) -> List[EntityChunk]:
+    """Prefix each entity chunk with a compact bold ``k/N`` continuation marker.
+
+    Entity counterpart to ``tg_readable.apply_part_headers`` — that helper only
+    runs on the MarkdownV2 fallback path, so without this the entity path emits
+    multi-chunk responses with no part marker at all (GitHub issue #34, slice 5
+    follow-up).
+
+    Returns a new list. A single chunk (or empty input) is returned unchanged —
+    a marker is only meaningful when a response spans multiple messages. Each
+    chunk's existing MessageEntity offsets are shifted by the UTF-16 length of
+    the prepended ``"k/N\\n"`` text, and a bold entity is added over the
+    ``k/N`` digits so it renders identically to the MarkdownV2 ``*k/N*`` marker
+    (the entity path sends without ``parse_mode``, so asterisks would otherwise
+    appear as literal text).
+
+    If ``telegram.MessageEntity`` is unavailable (pragma: no cover branch in
+    ``available()``), the input is returned as a list copy so the caller can
+    continue without raising.
+    """
+    chunks = list(chunks)
+    if PTBMessageEntity is None:
+        return chunks
+    total = len(chunks)
+    if total <= 1:
+        return chunks
+    out: List[EntityChunk] = []
+    for index, (text, entities) in enumerate(chunks, 1):
+        marker_text = f"{index}/{total}"
+        prefix = f"{marker_text}\n"
+        # ASCII prefix → UTF-16 code-unit length equals str length. Use the
+        # telegramify_markdown helper when available to stay consistent with
+        # how split_entities measures offsets.
+        try:
+            shift = _tm.utf16_len(prefix)
+        except Exception:  # pragma: no cover - utf16_len only fails on bad input
+            shift = len(prefix)
+        marker_entity = PTBMessageEntity(
+            type="bold", offset=0, length=len(marker_text)
+        )
+        shifted = [
+            PTBMessageEntity(
+                type=e.type,
+                offset=e.offset + shift,
+                length=e.length,
+                url=getattr(e, "url", None),
+                language=getattr(e, "language", None),
+                custom_emoji_id=getattr(e, "custom_emoji_id", None),
+            )
+            for e in entities
+        ]
+        out.append((prefix + text, [marker_entity, *shifted]))
+    return out
