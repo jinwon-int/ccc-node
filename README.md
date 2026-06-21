@@ -48,8 +48,10 @@ to Telegram, with all secrets and node-local state stripped out and replaced by 
   and a read-only tool baseline; guard enforcement still applies.
 - **A2A Claude Code worker lane** — documentation for nodes whose broker poller keeps the
   historical `a2a-hermes-worker` service name while the task analysis adapter is switched to
-  `claude-a2a-analysis-bridge` and broker metadata reports `runtime=claude-code`. See
-  [`docs/a2a-claude-worker.md`](docs/a2a-claude-worker.md).
+  `claude-a2a-analysis-bridge` and broker metadata reports `runtime=claude-code`. The
+  `claude/agents/a2a-*.md` roster carries advisory `model_tier` metadata (read-only
+  explorer/researcher = `low-cost`, implementer/verifier = `upper`) and requires cost/token
+  notes when runner accounting is available. See [`docs/a2a-claude-worker.md`](docs/a2a-claude-worker.md).
 
 ## Quick start
 
