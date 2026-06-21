@@ -1,5 +1,5 @@
 ---
-description: Read-only ccc-node harness doctor — classify settings/hook/output-style/statusline/bridge drift without mutating files.
+description: ccc-node harness doctor — classify settings/hook/output-style/statusline/bridge drift; `--fix` is dry-run, `--fix --apply` repairs only safe settings drift after backup.
 allowed-tools: Bash(/opt/ccc-node/scripts/ccc-doctor.sh:*)
 ---
 
@@ -16,4 +16,4 @@ Summarize the doctor result for the operator in Korean using the structured repo
 - risks;
 - next action.
 
-Do not run `--fix` unless the operator explicitly approves a future repair slice. The current doctor implementation is read-only and `--fix` is intentionally not implemented.
+Do not run `--fix --apply` unless the operator explicitly approves a repair action. `--fix` alone is dry-run only; `--fix --apply` currently repairs only deterministic `settings.json` drift after a backup tar and still fails closed on manual/risky items.

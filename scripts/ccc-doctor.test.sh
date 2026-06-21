@@ -64,11 +64,33 @@ out="$(run_doctor "$drift")"; rc=$?
 ok "missing installed hook exits 1" '[ "$rc" = 1 ]'
 ok "missing installed hook classified fixable" 'grep -q "교정가능.*statusline.sh" <<<"$out"'
 
-before="$(find "$drift" -type f -printf '%P %s %T@\n' | sort)"
-out="$(run_doctor "$drift" --fix 2>&1)"; rc=$?
-after="$(find "$drift" -type f -printf '%P %s %T@\n' | sort)"
-ok "--fix is explicitly not implemented in diagnostic slice" '[ "$rc" = 2 ] && grep -q "not implemented" <<<"$out"'
-ok "--fix made no filesystem changes" '[ "$before" = "$after" ]'
+repair="$(make_fixture repair standalone)"
+jq '.outputStyle="plain" | .statusLine.command="bad-statusline" | del(.hooks.PostCompact)' \
+  "$repair/home/.claude/settings.json" > "$repair/home/.claude/settings.json.tmp"
+mv "$repair/home/.claude/settings.json.tmp" "$repair/home/.claude/settings.json"
+before="$(find "$repair" -type f -printf '%P %s %T@\n' | sort)"
+out="$(run_doctor "$repair" --fix 2>&1)"; rc=$?
+after="$(find "$repair" -type f -printf '%P %s %T@\n' | sort)"
+ok "--fix defaults to dry-run plan" '[ "$rc" = 1 ] && grep -q "dry-run" <<<"$out" && grep -q "would repair settings.json" <<<"$out"'
+ok "--fix dry-run made no filesystem changes" '[ "$before" = "$after" ]'
+
+out="$(run_doctor "$repair" --fix --apply 2>&1)"; rc=$?
+ok "--fix --apply repairs drift" '[ "$rc" = 0 ]'
+ok "--fix --apply restores outputStyle" 'jq -e ".outputStyle == \"ccc-report\"" "$repair/home/.claude/settings.json" >/dev/null'
+ok "--fix --apply restores statusLine" 'jq -e ".statusLine.command | contains(\"statusline.sh\")" "$repair/home/.claude/settings.json" >/dev/null'
+ok "--fix --apply restores PostCompact hook" 'jq -e ".hooks.PostCompact" "$repair/home/.claude/settings.json" >/dev/null'
+ok "--fix --apply creates backup tar" 'find "$repair/home/.claude/backups" -name "ccc-doctor-*.tar.gz" | grep -q .'
+backup_count_before="$(find "$repair/home/.claude/backups" -name "ccc-doctor-*.tar.gz" | wc -l)"
+out="$(run_doctor "$repair" --fix --apply 2>&1)"; rc=$?
+backup_count_after="$(find "$repair/home/.claude/backups" -name "ccc-doctor-*.tar.gz" | wc -l)"
+ok "--fix --apply is idempotent" '[ "$rc" = 0 ] && [ "$backup_count_before" = "$backup_count_after" ] && grep -q "no repairs needed" <<<"$out"'
+
+manual="$(make_fixture manual standalone)"
+printf '{not-json}\n' > "$manual/home/.claude/settings.json"
+before="$(find "$manual" -type f -printf '%P %s %T@\n' | sort)"
+out="$(run_doctor "$manual" --fix --apply 2>&1)"; rc=$?
+after="$(find "$manual" -type f -printf '%P %s %T@\n' | sort)"
+ok "--fix --apply fails closed on manual settings" '[ "$rc" = 1 ] && grep -q "manual items present" <<<"$out" && [ "$before" = "$after" ]'
 
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
