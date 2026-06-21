@@ -236,6 +236,42 @@ class FinalizeMarkdownV2SplitTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(parse_mode, "MarkdownV2")
             self.assertLessEqual(tg_md.utf16_len(text), tg_md.TELEGRAM_LIMIT)
 
+    @unittest.skipUnless(_HAS_TG_MD, "telegramify-markdown not installed")
+    async def test_streaming_overflow_drafts_get_part_headers(self):
+        """Part headers must fire for streaming overflow drafts, not only final chunks.
+
+        Regression coverage for #57: streaming overflow used to finalize each
+        ~4K draft as a single chunk, so CCC_TELEGRAM_PART_HEADERS=true never
+        produced k/N markers for the default streaming path.
+        """
+        bot = _BotCapture()
+        handler = StreamingMessageHandler(bot=bot, chat_id=42, user_id=7)
+        handler.min_chars = 150
+        long_body = ("word " * 1800).rstrip()
+
+        config_module.config.enable_part_headers = True
+        try:
+            await handler.update_if_needed(long_body)
+            ok = await handler.finalize_all()
+        finally:
+            config_module.config.enable_part_headers = False
+
+        self.assertTrue(ok)
+        self.assertGreater(len(handler.drafts), 1, "precondition: streaming overflow happened")
+        marked_edits = [
+            text for _message_id, text, parse_mode in bot.edits
+            if parse_mode == "MarkdownV2" and text.startswith("*1/")
+        ]
+        self.assertTrue(marked_edits, "streaming multi-draft response missing k/N header")
+        total = len(handler.drafts)
+        final_marked_texts = [
+            text for _message_id, text, parse_mode in bot.edits
+            if parse_mode == "MarkdownV2" and any(
+                text.startswith(f"*{index}/{total}*") for index in range(1, total + 1)
+            )
+        ]
+        self.assertGreaterEqual(len(final_marked_texts), total)
+
 
 class SplitBoundaryGuardTests(unittest.TestCase):
     def setUp(self):

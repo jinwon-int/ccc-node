@@ -26,6 +26,8 @@ class DraftState:
     last_update_time: float
     char_count_since_update: int = 0
     draft_id: Optional[str] = None
+    part_header_index: Optional[int] = None
+    part_header_total: Optional[int] = None
 
 
 class StreamingMessageHandler:
@@ -274,8 +276,15 @@ class StreamingMessageHandler:
         # failures. Any failure / unavailable API falls through to MarkdownV2.
         if getattr(config, "enable_entity_renderer", False):
             entity_chunks = tg_entities.to_entity_chunks(render_text, split_limit)
+            streaming_header = self._streaming_part_header(draft)
             if entity_chunks and part_headers and len(entity_chunks) > 1:
                 entity_chunks = tg_entities.apply_part_headers(entity_chunks)
+            elif entity_chunks and streaming_header:
+                entity_chunks = [
+                    tg_entities.apply_single_part_header(
+                        entity_chunks[0], streaming_header[0], streaming_header[1]
+                    )
+                ]
             if entity_chunks and await self._finalize_with_entities(
                 draft, entity_chunks
             ):
@@ -283,8 +292,14 @@ class StreamingMessageHandler:
 
         md2 = tg_md.to_markdownv2(render_text)
         parts = tg_md.split_markdownv2(md2, split_limit) if md2 is not None else None
+        streaming_header = self._streaming_part_header(draft)
         if parts and part_headers and len(parts) > 1:
             parts = tg_readable.apply_part_headers(parts)
+        elif parts and streaming_header:
+            parts = [
+                f"{tg_readable.part_marker(streaming_header[0], streaming_header[1])}\n{parts[0]}",
+                *parts[1:],
+            ]
         use_md2 = bool(parts)
         md2_applied = False
 
@@ -318,7 +333,7 @@ class StreamingMessageHandler:
         # Send overflow chunks as follow-up messages — only when the primary
         # MarkdownV2 edit actually applied (the plain fallback already carries the
         # full draft text, so emitting extras then would duplicate content).
-        if md2_applied and len(parts) > 1:
+        if md2_applied and parts and len(parts) > 1:
             for extra in parts[1:]:
                 try:
                     await self._retry_with_backoff(
@@ -403,6 +418,32 @@ class StreamingMessageHandler:
     def _first_draft_prefix(self) -> str:
         """Return tool calls prefix if we're still on the first draft, else empty string."""
         return self.tool_calls_text if len(self.drafts) <= 1 else ""
+
+    @staticmethod
+    def _streaming_part_header(draft: DraftState) -> Optional[tuple[int, int]]:
+        index = getattr(draft, "part_header_index", None)
+        total = getattr(draft, "part_header_total", None)
+        if isinstance(index, int) and isinstance(total, int) and total > 1:
+            return index, total
+        return None
+
+    def _apply_streaming_part_headers(self) -> None:
+        """Record k/N markers for multi-draft streaming responses.
+
+        Per-chunk part headers inside ``finalize_draft`` only fire when a single
+        finalized draft splits into multiple Telegram messages. Streaming mode
+        can create several ~4K drafts first; each draft then finalizes as a
+        single chunk, so no marker ever appears. Once ``finalize_all`` runs we
+        know the total draft count and can mark each finalized draft in place.
+        """
+        if not getattr(config, "enable_part_headers", False):
+            return
+        total = len(self.drafts)
+        if total <= 1:
+            return
+        for index, draft in enumerate(self.drafts, 1):
+            draft.part_header_index = index
+            draft.part_header_total = total
 
     async def handle_overflow(self) -> bool:
         """Handle 4000 character boundary by finalizing current draft and creating new one"""
@@ -517,6 +558,11 @@ class StreamingMessageHandler:
             final_text = self._first_draft_prefix() + self.accumulated_text
             if current_draft.text != final_text:
                 current_draft.text = final_text
+
+        # Streaming overflow can produce multiple finalized drafts before the
+        # final chunk arrives. Per-draft finalization cannot know the eventual
+        # total, so apply k/N markers here when the whole response is known.
+        self._apply_streaming_part_headers()
 
         # Finalize all drafts
         for draft in self.drafts:
