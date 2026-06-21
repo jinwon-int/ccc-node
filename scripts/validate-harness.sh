@@ -127,6 +127,17 @@ fm_check() { # <file>
 }
 for f in claude/skills/*/SKILL.md; do [ -f "$f" ] && fm_check "$f" && say "  ok $f"; done
 for f in claude/agents/*.md;      do [ -f "$f" ] && fm_check "$f" && say "  ok $f"; done
+# A2A subagent cost-tier metadata (#54): advisory only; no hard-coded model routing.
+for f in claude/agents/a2a-*.md; do
+  [ -f "$f" ] || continue
+  fm="$(awk 'NR>1 && /^---/{exit} {print}' "$f")"
+  if grep -q '^model_tier:[[:space:]]*\(low-cost\|upper\)$' <<<"$fm"; then say "  ok model_tier $f";
+  else err "missing/invalid model_tier in $f (expected low-cost or upper)"; fi
+  grep -q '^model_tier_default:[[:space:]]*inherit-parent-unless-overridden$' <<<"$fm" \
+    && say "  ok model_tier_default $f" || err "missing safe model_tier_default in $f"
+  grep -qi 'cost/token' "$f" \
+    && say "  ok cost/token reporting note $f" || err "missing cost/token reporting note in $f"
+done
 for f in claude/output-styles/*.md; do [ -f "$f" ] && fm_check "$f" && say "  ok $f"; done
 # slash commands: frontmatter must carry description: (command name = filename, so no name:)
 for f in claude/commands/*.md; do
