@@ -26,6 +26,21 @@ for f in claude/settings.base.json claude/settings.local.json \
   if jq -e . "$f" >/dev/null 2>&1; then say "  ok $f"; else err "invalid JSON: $f"; fi
 done
 
+# 1a) CLAUDE.md template policy blocks
+say "== CLAUDE.md template policy =="
+if [ -f claude/CLAUDE.md.template ]; then
+  grep -q '^## Standing Orders$' claude/CLAUDE.md.template \
+    && say "  ok Standing Orders section" || err "CLAUDE.md.template missing Standing Orders section"
+  grep -q '| Workstream | Autonomy scope | Trigger | Approval gate | Escalation |' claude/CLAUDE.md.template \
+    && say "  ok Standing Orders table columns" || err "Standing Orders table missing required columns"
+  grep -q 'Fresh Approval Required always wins' claude/CLAUDE.md.template \
+    && say "  ok Fresh Approval precedence stated" || err "Standing Orders must state Fresh Approval precedence"
+  grep -q '| Fresh-approval operations |' claude/CLAUDE.md.template \
+    && say "  ok Fresh-approval operations row" || err "Standing Orders missing Fresh-approval operations row"
+else
+  err "missing claude/CLAUDE.md.template"
+fi
+
 # 1b) plugin manifest + marketplace catalog + runtime hook-path resolution
 if [ -f claude/.claude-plugin/plugin.json ]; then
   say "== plugin manifest =="
