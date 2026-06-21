@@ -317,6 +317,70 @@ class EntityFinalizeTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(entities)
         self.assertNotIn("**", text)  # markdown markup moved into entities
 
+    @unittest.skipUnless(_ENTITY_OK, "entity API unavailable")
+    async def test_entity_path_applies_part_headers_on_multi_chunk(self):
+        """Multi-chunk responses on the entity path get bold k/N markers.
+
+        Regression coverage for the entity-vs-MarkdownV2 part-headers gap: until
+        this lane was added, ``apply_part_headers`` only ran on the MarkdownV2
+        fallback, so the default-on entity renderer emitted multi-bubble
+        responses with no part marker at all.
+        """
+        from telegram import MessageEntity
+
+        class _EntityBot:
+            def __init__(self):
+                self.edits = []
+                self.sends = []
+
+            async def edit_message_text(
+                self, *, chat_id, message_id, text, parse_mode=None, entities=None
+            ):
+                self.edits.append((text, parse_mode, entities))
+                return SimpleNamespace(message_id=message_id)
+
+            async def send_message(
+                self, *, chat_id, text, parse_mode=None, entities=None
+            ):
+                self.sends.append((text, parse_mode, entities))
+                return SimpleNamespace(message_id=900)
+
+        bot = _EntityBot()
+        handler = StreamingMessageHandler(bot=bot, chat_id=42, user_id=7)
+        # ~12K chars of ASCII → guaranteed >1 chunk under TELEGRAM_LIMIT=4096
+        long_body = ("word " * 2400).rstrip()
+        draft = SimpleNamespace(message_id=10, text=long_body)
+
+        config_module.config.enable_entity_renderer = True
+        config_module.config.enable_part_headers = True
+        try:
+            ok = await handler.finalize_draft(draft)
+        finally:
+            config_module.config.enable_entity_renderer = False
+            config_module.config.enable_part_headers = False
+
+        self.assertTrue(ok)
+        # First chunk lands via edit; remaining chunks via send_message.
+        total_chunks = 1 + len(bot.sends)
+        self.assertGreater(total_chunks, 1, "draft should split into >1 chunks")
+
+        # Every chunk must start with 'k/N\n' and carry a bold marker entity.
+        all_chunks = [
+            (bot.edits[0][0], bot.edits[0][2]),
+            *[(text, entities) for text, _pm, entities in bot.sends],
+        ]
+        for index, (text, entities) in enumerate(all_chunks, 1):
+            expected_prefix = f"{index}/{total_chunks}\n"
+            self.assertTrue(
+                text.startswith(expected_prefix),
+                f"chunk {index} text missing 'k/N' prefix: {text[:20]!r}",
+            )
+            self.assertTrue(entities, f"chunk {index} has no entities")
+            marker = entities[0]
+            self.assertEqual(marker.type, MessageEntity.BOLD)
+            self.assertEqual(marker.offset, 0)
+            self.assertEqual(marker.length, len(f"{index}/{total_chunks}"))
+
 
 if __name__ == "__main__":
     unittest.main()
