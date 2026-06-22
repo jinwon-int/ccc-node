@@ -50,9 +50,9 @@ if [ -f "$LOG" ] && [ -s "$LOG" ]; then
   manual_c="$(awk -v c="$cutoff" '$1>=c && /start trigger=manual/ {n++} END{print n+0}' "$LOG" 2>/dev/null)"
   sessionend_c="$(awk -v c="$cutoff" '$1>=c && /start trigger=sessionend/ {n++} END{print n+0}' "$LOG" 2>/dev/null)"
   precompact_c="$(awk -v c="$cutoff" '$1>=c && /start trigger=precompact/ {n++} END{print n+0}' "$LOG" 2>/dev/null)"
-  drain_ok="$(awk -v c="$cutoff" '$1>=c && /\[drain\] drained / {n+=0; if(match($0,/ok=([0-9]+)/,m)) n+=m[1]} END{print n+0}' "$LOG" 2>/dev/null)"
-  drain_failed="$(awk -v c="$cutoff" '$1>=c && /\[drain\] drained / {n+=0; if(match($0,/failed=([0-9]+)/,m)) n+=m[1]} END{print n+0}' "$LOG" 2>/dev/null)"
-  drain_drop="$(awk -v c="$cutoff" '$1>=c && /\[drain\] drained / {n+=0; if(match($0,/dropped=([0-9]+)/,m)) n+=m[1]} END{print n+0}' "$LOG" 2>/dev/null)"
+  drain_ok="$(awk -v c="$cutoff" '$1>=c && /\[drain\] drained / {for(i=1;i<=NF;i++) if($i ~ /^ok=[0-9]+$/) {split($i,a,"="); n+=a[2]}} END{print n+0}' "$LOG" 2>/dev/null)"
+  drain_failed="$(awk -v c="$cutoff" '$1>=c && /\[drain\] drained / {for(i=1;i<=NF;i++) if($i ~ /^failed=[0-9]+$/) {split($i,a,"="); n+=a[2]}} END{print n+0}' "$LOG" 2>/dev/null)"
+  drain_drop="$(awk -v c="$cutoff" '$1>=c && /\[drain\] drained / {for(i=1;i<=NF;i++) if($i ~ /^dropped=[0-9]+$/) {split($i,a,"="); n+=a[2]}} END{print n+0}' "$LOG" 2>/dev/null)"
 fi
 
 # ---- Honcho config reachability note ----------------------------------------
