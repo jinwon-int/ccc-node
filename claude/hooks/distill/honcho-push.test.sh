@@ -42,6 +42,8 @@ export CCC_STATE_DIR="$TMP/state"
 
 PAYLOAD_WITH_FACTS='{"session_id":"sess-1","trigger":"manual","distilled_at":"2026-01-01T00:00:00Z","source_cwd":"/root/project-a","source_project":"-root-project-a","honcho":[{"kind":"context","text":"fact one","subject":"session"}],"wiki_candidates":[]}'
 PAYLOAD_NO_FACTS='{"session_id":"sess-empty","trigger":"manual","honcho":[],"wiki_candidates":[]}'
+unset CCC_NODE
+printf 'seoseo\n' > "$TMP/state/node.txt"
 
 out="$(printf '%s' "$PAYLOAD_WITH_FACTS" | CURL_STUB_HTTP=201 bash "$PUSH" 2>&1)"; rc=$?
 ok "success exits 0" '[ "$rc" = 0 ]'
@@ -49,7 +51,12 @@ ok "success reports pushed fact count" 'grep -q "honcho push ok http=201 session
 ok "success does not create retry queue" '[ ! -s "$TMP/state/honcho-queue.jsonl" ]'
 ok "success called health, ensure-session and messages endpoints" 'grep -q "/health" "$CURL_STUB_LOG" && grep -q "/v3/workspaces/test-ws/sessions" "$CURL_STUB_LOG" && grep -q "/v3/workspaces/test-ws/sessions/sess-1/messages" "$CURL_STUB_LOG"'
 ok "success message metadata includes source cwd" 'jq -e ".messages[0].metadata.source_cwd == \"/root/project-a\" and .messages[0].metadata.source_project == \"-root-project-a\"" "$CURL_STUB_BODY_DIR/message.json" >/dev/null'
+ok "success message metadata node defaults to state node.txt" 'jq -e ".messages[0].metadata.node == \"seoseo\"" "$CURL_STUB_BODY_DIR/message.json" >/dev/null'
 ok "auth token is passed only as header argument to curl stub, not stdout" '! grep -q "secret-token" <<<"$out"'
+
+: > "$CURL_STUB_LOG"; rm -f "$CURL_STUB_BODY_DIR/message.json"
+out="$(printf '%s' "$PAYLOAD_WITH_FACTS" | CCC_NODE=gwakga CURL_STUB_HTTP=201 bash "$PUSH" 2>&1)"; rc=$?
+ok "CCC_NODE overrides state node.txt" '[ "$rc" = 0 ] && jq -e ".messages[0].metadata.node == \"gwakga\"" "$CURL_STUB_BODY_DIR/message.json" >/dev/null'
 
 : > "$CURL_STUB_LOG"
 out="$(printf '%s' "$PAYLOAD_WITH_FACTS" | CURL_STUB_HEALTH_HTTP=503 CURL_STUB_HTTP=201 bash "$PUSH" 2>&1)"; rc=$?

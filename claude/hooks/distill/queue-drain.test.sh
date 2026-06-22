@@ -35,6 +35,8 @@ cat > "$CFG" <<'JSON'
 JSON
 export CCC_HONCHO_CFG="$CFG"
 export CCC_STATE_DIR="$TMP/state"
+unset CCC_NODE
+printf 'nosuk\n' > "$TMP/state/node.txt"
 
 PAYLOAD='{"session_id":"sess-queued","trigger":"manual","distilled_at":"2026-01-01T00:00:00Z","honcho":[{"kind":"context","text":"queued fact","subject":"session"}],"wiki_candidates":[]}'
 QUEUE="$TMP/state/honcho-queue.jsonl"
@@ -57,6 +59,7 @@ ok "successful drain exits 0" '[ "$rc" = 0 ]'
 ok "successful drain truncates queue" '[ ! -s "$QUEUE" ]'
 ok "successful drain logs ok=1" 'grep -q "\[drain\] drained ok=1 failed=0 dropped=0 processed=1" "$LOG"'
 ok "successful drain posts replay metadata" 'jq -e ".messages[0].metadata.replay == true and .messages[0].metadata.trigger == \"manual\" and (.messages[0].content | contains(\"(replayed)\"))" "$TMP/bodies/message.json" >/dev/null'
+ok "successful drain uses state node.txt metadata node" 'jq -e ".messages[0].metadata.node == \"nosuk\"" "$TMP/bodies/message.json" >/dev/null'
 
 printf '%s\n' "$PAYLOAD" > "$QUEUE"
 : > "$CURL_STUB_LOG"

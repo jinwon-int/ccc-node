@@ -53,6 +53,12 @@ TOKEN="$(jq -r '.authToken // .apiKey // empty' "$CFG" 2>/dev/null)"
 AUTH=()
 [ -n "$TOKEN" ] && AUTH=(-H "Authorization: Bearer $TOKEN")
 
+# Origin node label for replay traceability. AI_PEER is the target Honcho peer;
+# NODE is the source node that produced/replayed the distill facts.
+NODE="${CCC_NODE:-}"
+[ -z "$NODE" ] && [ -r "$STATE_DIR/node.txt" ] && NODE="$(head -1 "$STATE_DIR/node.txt" 2>/dev/null)"
+[ -z "$NODE" ] && NODE="$(hostname -s 2>/dev/null || echo ccc-node)"
+
 # Quick /health probe — if Honcho is down, leave the queue intact and try
 # next SessionStart. No point burning retry attempts against a known-down host.
 HEALTH_HTTP="$(curl -sS -m 3 -o /dev/null -w '%{http_code}' "$BASE/health" 2>/dev/null)"
@@ -108,18 +114,18 @@ while IFS= read -r line; do
     -X POST "$BASE/v3/workspaces/$WS/sessions" \
     -H "Content-Type: application/json" \
     "${AUTH[@]}" \
-    --data "$(jq -nc --arg id "$sid" \
-      '{id:$id, metadata:{source:"claude-code-distill", node:"dungae", replay:true}}')" \
+    --data "$(jq -nc --arg id "$sid" --arg node "$NODE" \
+      '{id:$id, metadata:{source:"claude-code-distill", node:$node, replay:true}}')" \
     >/dev/null 2>&1 || true
 
   # POST the message.
   http="$(jq -nc \
-    --arg peer "$AI_PEER" --arg content "$content" \
+    --arg peer "$AI_PEER" --arg content "$content" --arg node "$NODE" \
     --argjson facts "$facts" \
     --arg sid "$sid" --arg trg "$trg" --arg ts "$ts" \
     '{messages:[{peer_id:$peer, content:$content,
                  metadata:{source:"claude-code-distill",
-                           node:"dungae",
+                           node:$node,
                            claude_session:$sid,
                            trigger:$trg,
                            distilled_at:$ts,
