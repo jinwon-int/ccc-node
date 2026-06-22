@@ -5,10 +5,12 @@
 # - store/list/validate is implemented.
 # - due is a read-only dry-run resolver for schedule/catch-up planning.
 # - lock implements local task-lock acquire/release/probe primitives.
-# - run is a read-only execution-plan preview when called with --dry-run.
+# - run is an explicit manual execution path with lock acquire/release and
+#   task-store lastRunAt/lastStatus/lastRunId updates.
+# - run --dry-run remains a read-only execution-plan preview.
 #
-# This script intentionally does not execute prompts, write push spool entries,
-# install timers, mutate lastRunAt, or touch live cron/systemd state.
+# This script intentionally does not write push spool entries, install timers,
+# or touch live cron/systemd state.
 set -uo pipefail
 
 STORE="${CCC_AGENT_CRON_STORE:-$HOME/.claude/state/agent-cron/tasks.json}"
@@ -38,9 +40,13 @@ Implemented slices:
 - run --dry-run: read-only execution-plan preview. It combines due, lock probe,
   task policy, and headless command metadata, but never acquires locks, executes
   prompts, sends notifications, installs schedulers, or updates task history.
+- run: explicit manual execution for due enabled tasks. It acquires the task lock,
+  invokes ccc-headless, records lastRunAt/lastStatus/lastRunId, and releases the
+  lock in all normal failure/success paths. It still does not send Telegram
+  notifications, install schedulers, mutate crontab/systemd, or touch remotes.
 
-No task execution, Telegram push, scheduler bootstrap, systemd/crontab writes,
-provider sends, lastRunAt updates, or remote-node actions are performed.
+No Telegram push, scheduler bootstrap, systemd/crontab writes, provider sends,
+or remote-node actions are performed.
 EOF
       exit 0
       ;;
@@ -67,6 +73,7 @@ import os
 import re
 import shlex
 import socket
+import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -325,7 +332,12 @@ def lock_status(task_id, task, at):
         return base
     timeout = task.get('lockTimeoutSec', 0) if isinstance(task, dict) else 0
     age = lock_age(lock, at)
-    stale = bool(timeout and age is not None and age > timeout)
+    current_boot = boot_id()
+    stale = bool(lock.get('error'))
+    if not stale and lock.get('bootId') and current_boot and lock.get('bootId') != current_boot:
+        stale = True
+    if not stale and timeout and age is not None and age > timeout:
+        stale = True
     state = 'stale' if stale else 'held'
     base.update({'lockState': state, 'holder': lock, 'lockAgeSec': age, 'lockTimeoutSec': timeout})
     return base
@@ -568,25 +580,27 @@ def parse_run_args():
     return task_id, dry_run, at_value, local_json
 
 
+def run_plan_for(data, task_id, at_value):
+    global at_raw
+    old_at = at_raw
+    at_raw = at_value or at_raw
+    try:
+        plan = due_plan(data)
+    finally:
+        at_raw = old_at
+    row = next((t for t in plan.get('tasks', []) if t.get('id') == task_id), None)
+    return plan, row
+
+
 def run_dry_plan(data):
     try:
         task_id, dry_run, at_value, as_json = parse_run_args()
         if not dry_run:
-            return None, as_json, 2
+            return run_execute(data, task_id, at_value, as_json)
         task = task_by_id(data, task_id)
         if not task:
             return {'ok': False, 'mode': 'run-dry-run-read-only', 'taskId': task_id, 'error': 'task id not found'}, as_json, 1
-        original_at = os.environ.get('AT')
-        os.environ['AT'] = at_value or original_at or ''
-        # Keep due_plan input deterministic without mutating external process state.
-        global at_raw
-        old_at = at_raw
-        at_raw = at_value or at_raw
-        try:
-            plan = due_plan(data)
-        finally:
-            at_raw = old_at
-        row = next((t for t in plan.get('tasks', []) if t.get('id') == task_id), None)
+        plan, row = run_plan_for(data, task_id, at_value)
         if row is None:
             return {'ok': False, 'mode': 'run-dry-run-read-only', 'taskId': task_id, 'error': 'task id not found in due plan'}, as_json, 1
         headless_cmd = os.environ.get('CCC_HEADLESS_CMD') or str(Path(os.environ.get('SCRIPT_ROOT', '.')) / 'claude' / 'headless.sh')
@@ -608,29 +622,14 @@ def run_dry_plan(data):
                 'holder': row.get('holder'),
                 'probeOnly': True,
             },
-            'headless': {
-                'command': headless_cmd,
-                'promptBytes': len((task.get('prompt') or '').encode('utf-8')),
-                'permissionMode': task.get('permissionMode') or 'default',
-                'allowedTools': task.get('allowedTools', []),
-                'attachMemory': task.get('attachMemory', []),
-                'attachSkills': task.get('attachSkills', []),
-                'execute': False,
-            },
+            'headless': headless_metadata(task, execute=False),
             'notification': {
                 'policy': notify,
                 'delivery': 'preview-only' if notify == 'telegram-owner' else 'none',
                 'redactProfile': task.get('redactProfile', 'default'),
                 'send': False,
             },
-            'mutations': {
-                'lockAcquire': False,
-                'taskStoreWrite': False,
-                'historyAppend': False,
-                'pushSpoolWrite': False,
-                'schedulerInstall': False,
-                'headlessExecute': False,
-            },
+            'mutations': mutation_flags(False, False, False),
             'errors': plan.get('errors', []),
         }
         return result, as_json, 0 if result['ok'] else 1
@@ -638,20 +637,197 @@ def run_dry_plan(data):
         return {'ok': False, 'mode': 'run-dry-run-read-only', 'taskId': None, 'error': str(e)}, json_out, 1
 
 
+def headless_metadata(task, execute):
+    headless_cmd = os.environ.get('CCC_HEADLESS_CMD') or str(Path(os.environ.get('SCRIPT_ROOT', '.')) / 'claude' / 'headless.sh')
+    return {
+        'command': headless_cmd,
+        'promptBytes': len((task.get('prompt') or '').encode('utf-8')),
+        'permissionMode': task.get('permissionMode') or 'default',
+        'allowedTools': task.get('allowedTools', []),
+        'attachMemory': task.get('attachMemory', []),
+        'attachSkills': task.get('attachSkills', []),
+        'execute': bool(execute),
+    }
+
+
+def mutation_flags(lock_acquire, task_write, headless_execute):
+    return {
+        'lockAcquire': bool(lock_acquire),
+        'taskStoreWrite': bool(task_write),
+        'historyAppend': False,
+        'pushSpoolWrite': False,
+        'schedulerInstall': False,
+        'headlessExecute': bool(headless_execute),
+    }
+
+
+def write_doc(data):
+    store.parent.mkdir(parents=True, exist_ok=True)
+    tmp = store.with_name(f'.{store.name}.tmp.{os.getpid()}')
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2, sort_keys=False) + '\n', encoding='utf-8')
+    try:
+        os.chmod(tmp, 0o600)
+    except OSError:
+        pass
+    tmp.replace(store)
+
+
+def acquire_for_run(task_id, task, run_id, scheduled_at, at):
+    path = lock_path(task_id)
+    status = lock_status(task_id, task, at)
+    if status['lockState'] == 'held':
+        return False, {'state': 'held', 'path': str(path), 'holder': status.get('holder')}
+    if status['lockState'] == 'stale':
+        stale_path = path.with_name(f'{path.name}.stale.{int(at.timestamp())}.{os.getpid()}')
+        try:
+            path.rename(stale_path)
+        except FileNotFoundError:
+            after = lock_status(task_id, task, at)
+            return False, {'state': after.get('lockState', 'held'), 'path': str(path), 'holder': after.get('holder')}
+        except OSError as e:
+            return False, {'state': 'error', 'path': str(path), 'error': str(e)}
+    payload = {
+        'taskId': task_id,
+        'runId': run_id,
+        'pid': os.getpid(),
+        'host': socket.gethostname(),
+        'bootId': boot_id(),
+        'acquiredAt': fmt_dt(at),
+        'scheduledAt': scheduled_at or fmt_dt(at),
+    }
+    try:
+        write_lock(path, payload)
+    except FileExistsError:
+        after = lock_status(task_id, task, at)
+        return False, {'state': after.get('lockState', 'held'), 'path': str(path), 'holder': after.get('holder')}
+    return True, {'state': 'acquired', 'path': str(path), 'holder': payload}
+
+
+def release_for_run(task_id, run_id):
+    path, lock = read_lock(task_id)
+    if lock is None:
+        return {'ok': True, 'state': 'free'}
+    if lock.get('runId') != run_id:
+        return {'ok': False, 'state': 'release-mismatch', 'holder': lock}
+    path.unlink()
+    return {'ok': True, 'state': 'released'}
+
+
+def short_text(text, limit=4000):
+    if text is None:
+        return ''
+    text = str(text)
+    return text if len(text) <= limit else text[:limit] + f'\n[truncated {len(text)-limit} chars]'
+
+
+def run_headless(task):
+    meta = headless_metadata(task, execute=True)
+    cmd = shlex.split(meta['command'])
+    if not cmd:
+        raise ValueError('CCC_HEADLESS_CMD resolved to an empty command')
+    env = os.environ.copy()
+    allowed = task.get('allowedTools', [])
+    if allowed:
+        env['CCC_ALLOWED_TOOLS'] = ','.join(allowed)
+    perm = task.get('permissionMode') or 'default'
+    if perm != 'default':
+        env['CCC_PERMISSION_MODE'] = perm
+    prompt = task.get('prompt') or ''
+    proc = subprocess.run(cmd + [prompt], text=True, input='', capture_output=True, env=env)
+    return {
+        **meta,
+        'exitCode': proc.returncode,
+        'stdout': short_text(proc.stdout),
+        'stderr': short_text(proc.stderr),
+    }
+
+
+def run_execute(data, task_id, at_value, as_json):
+    task = task_by_id(data, task_id)
+    if not task:
+        return {'ok': False, 'mode': 'run-execute', 'taskId': task_id, 'error': 'task id not found'}, as_json, 1
+    plan, row = run_plan_for(data, task_id, at_value)
+    if row is None:
+        return {'ok': False, 'mode': 'run-execute', 'taskId': task_id, 'error': 'task id not found in due plan'}, as_json, 1
+    base = {
+        'mode': 'run-execute',
+        'store': str(store),
+        'at': plan.get('at'),
+        'taskId': task_id,
+        'scheduledAt': row.get('scheduledAt'),
+        'due': bool(row.get('due')),
+        'notification': {'policy': task.get('notify', 'none'), 'send': False, 'delivery': 'not-implemented'},
+    }
+    if not task.get('enabled'):
+        return {**base, 'ok': True, 'status': 'disabled', 'mutations': mutation_flags(False, False, False)}, as_json, 0
+    if not row.get('due'):
+        return {**base, 'ok': True, 'status': 'not-due', 'mutations': mutation_flags(False, False, False)}, as_json, 0
+    at = parse_dt(plan.get('at'), '--at')
+    scheduled_at = row.get('scheduledAt') or fmt_dt(at)
+    run_id = f'{task_id}-{int(at.timestamp())}-{os.getpid()}'
+    acquired, lock = acquire_for_run(task_id, task, run_id, scheduled_at, at)
+    if not acquired:
+        return {**base, 'ok': False, 'status': 'locked' if lock.get('state') in {'held','stale'} else lock.get('state','lock-error'), 'runId': run_id, 'lock': lock, 'mutations': mutation_flags(False, False, False)}, as_json, 1
+    headless = None
+    release = {'ok': False, 'state': 'not-attempted'}
+    status = 'failed'
+    ok = False
+    rc = 1
+    try:
+        try:
+            headless = run_headless(task)
+            ok = headless.get('exitCode') == 0
+            status = 'success' if ok else 'failed'
+            rc = 0 if ok else 1
+        except Exception as e:
+            headless = {
+                **headless_metadata(task, execute=True),
+                'exitCode': 127,
+                'stdout': '',
+                'stderr': short_text(str(e)),
+            }
+            ok = False
+            status = 'failed'
+            rc = 1
+        task['lastRunAt'] = scheduled_at
+        task['lastStatus'] = status
+        task['lastRunId'] = run_id
+        write_doc(data)
+    finally:
+        release = release_for_run(task_id, run_id)
+    result = {
+        **base,
+        'ok': ok,
+        'status': status,
+        'runId': run_id,
+        'lock': {'state': lock.get('state'), 'path': lock.get('path'), 'release': release},
+        'headless': headless or headless_metadata(task, execute=True),
+        'mutations': mutation_flags(True, headless is not None, headless is not None),
+    }
+    if not release.get('ok'):
+        result['ok'] = False
+        result['releaseError'] = release
+        rc = 1
+    return result, as_json, rc
+
+
 def emit_run(result, as_json):
     if result is None:
-        print('agent-cron run is not implemented in this read-only slice; pass --dry-run for a no-execution plan preview.', file=sys.stderr)
+        print('agent-cron run returned no result', file=sys.stderr)
         return
     if as_json:
         print(json.dumps(result, ensure_ascii=False, indent=2))
     else:
-        print('# agent-cron run dry-run plan\n')
+        title = '# agent-cron run dry-run plan' if result.get('mode') == 'run-dry-run-read-only' else '# agent-cron run result'
+        print(title + '\n')
         print(f"- task: `{result['taskId']}`")
         print(f"- at: `{result['at']}`")
-        print(f"- due: `{str(result['due']).lower()}` status=`{result['status']}` scheduledAt=`{result.get('scheduledAt') or ''}`")
-        print(f"- lock: `{result['lock']['state']}` `{result['lock']['path']}` (probe only)")
-        print(f"- headless: `{result['headless']['command']}` (not executed)")
-        print('- mutations: none; no lock acquire, task store write, history append, push spool write, scheduler install, or headless execution')
+        print(f"- due: `{str(result.get('due')).lower()}` status=`{result.get('status')}` scheduledAt=`{result.get('scheduledAt') or ''}`")
+        if result.get('lock'):
+            print(f"- lock: `{result['lock'].get('state')}` `{result['lock'].get('path')}`")
+        if result.get('headless'):
+            print(f"- headless: `{result['headless'].get('command')}` execute=`{str(result['headless'].get('execute')).lower()}` exit=`{result['headless'].get('exitCode', '')}`")
+        print(f"- mutations: `{json.dumps(result.get('mutations', {}), ensure_ascii=False, sort_keys=True)}`")
 
 
 data, errors = load_doc()
