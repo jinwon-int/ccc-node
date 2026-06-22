@@ -5,6 +5,9 @@
 # The agent is expected to keep /root/.claude/state/working-state.md current during long/multi-session tasks.
 set -uo pipefail
 
+# Distill subprocess guard (see ~/.claude/hooks/distill.sh).
+[ -n "${CLAUDE_DISTILL_INFLIGHT:-}" ] && exit 0
+
 EVENT="${1:-PreCompact}"
 STATE_DIR=/root/.claude/state
 STATE_FILE="$STATE_DIR/working-state.md"

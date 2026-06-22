@@ -3,6 +3,9 @@
 # Mirrors load-memory.sh output shape so the cheatsheet lands in context each session.
 set -uo pipefail
 
+# Distill subprocess guard (see ~/.claude/hooks/distill.sh).
+[ -n "${CLAUDE_DISTILL_INFLIGHT:-}" ] && exit 0
+
 EVENT="${1:-SessionStart}"
 CHEAT=/root/.claude/hooks/tools-cheatsheet.md
 

@@ -4,6 +4,11 @@
 # then fires a detached background refresh so the next session is fresh.
 set -uo pipefail
 
+# Distill subprocess guard: when a distill pipeline spawns `claude -p ...`,
+# we don't want the child to re-load memory / refresh caches / fire more
+# distillations. See ~/.claude/hooks/distill.sh for the parent setter.
+[ -n "${CLAUDE_DISTILL_INFLIGHT:-}" ] && exit 0
+
 # Event name drives hookEventName in the output so the same script serves
 # both SessionStart (fresh session) and PostCompact (re-inject after compaction).
 EVENT="${1:-SessionStart}"

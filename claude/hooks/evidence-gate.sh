@@ -17,6 +17,9 @@
 # to stdout and exit 0.
 set -uo pipefail
 
+# Distill subprocess guard (see ~/.claude/hooks/distill.sh).
+[ -n "${CLAUDE_DISTILL_INFLIGHT:-}" ] && exit 0
+
 [ "${CCC_EVIDENCE_GATE:-0}" = "1" ] || exit 0
 
 input="$(cat 2>/dev/null)"

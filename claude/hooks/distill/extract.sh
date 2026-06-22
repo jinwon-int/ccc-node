@@ -1,0 +1,141 @@
+#!/usr/bin/env bash
+# distill/extract.sh
+#   1. Reads transcript jsonl path from CLAUDE_DISTILL_TRANSCRIPT.
+#   2. Pulls last N user/assistant turns, strips tool_use/tool_result bulk.
+#   3. Applies a secret-regex redact pass (FW-03).
+#   4. Calls `claude -p` (OAuth, inherits parent auth) with a focused
+#      extract prompt; expects strict JSON: {honcho:[...], wiki_candidates:[...]}.
+#   5. Emits the JSON to stdout for distill.sh to dispatch.
+#
+# CLAUDE_DISTILL_INFLIGHT=1 is set by the parent so the child claude session
+# does NOT re-run the SessionStart/PreCompact/etc. hooks.
+set -uo pipefail
+
+TRANSCRIPT="${CLAUDE_DISTILL_TRANSCRIPT:-}"
+SESSION_ID="${CLAUDE_DISTILL_SESSION:-unknown}"
+TRIGGER="${CLAUDE_DISTILL_TRIGGER:-manual}"
+MAX_TURNS="${CLAUDE_DISTILL_MAX_TURNS:-80}"
+MAX_BYTES="${CLAUDE_DISTILL_MAX_BYTES:-60000}"
+MODEL="${CLAUDE_DISTILL_MODEL:-haiku}"
+TIMEOUT="${CLAUDE_DISTILL_TIMEOUT:-90}"
+
+[ -f "$TRANSCRIPT" ] || { echo "no transcript: $TRANSCRIPT" >&2; exit 1; }
+
+# ---- step 1+2: extract last N meaningful turns ----------------------------
+# Each line is a JSON event; we want user prompts + assistant text messages.
+# Tool calls are summarized as "[tool:<name>]" to keep token budget low.
+RAW="$(tail -n 400 "$TRANSCRIPT" 2>/dev/null | jq -r --argjson maxt "$MAX_TURNS" '
+  select(.type == "user" or .type == "assistant")
+  | . as $e
+  | (.message.content // .content // "") as $c
+  | if ($c | type) == "string" then
+      "[\($e.type)] \($c)"
+    elif ($c | type) == "array" then
+      "[\($e.type)] " + (
+        $c | map(
+          if .type == "text" then .text
+          elif .type == "tool_use" then "[tool:\(.name // "?")]"
+          elif .type == "tool_result" then "[tool_result:\(.tool_use_id // "?" | .[0:8])]"
+          else "[\(.type // "?")]"
+          end
+        ) | join("\n")
+      )
+    else "" end
+' 2>/dev/null | tail -n "$MAX_TURNS")"
+
+[ -z "$RAW" ] && { echo "empty transcript content" >&2; exit 1; }
+
+# ---- step 3: redact pass (FW-03) ------------------------------------------
+# Mirrors patterns from ~/.claude/hooks/redact.sh + ghp/gho/ghs/sk-/AKIA/PEM.
+REDACTED="$(printf '%s' "$RAW" | sed -E \
+  -e 's/(ghp|gho|ghs|ghr|github_pat)_[A-Za-z0-9_]{20,}/[REDACTED:gh-token]/g' \
+  -e 's/sk-[A-Za-z0-9_-]{20,}/[REDACTED:api-key]/g' \
+  -e 's/AKIA[A-Z0-9]{16}/[REDACTED:aws-key]/g' \
+  -e 's/-----BEGIN [A-Z ]*PRIVATE KEY-----/[REDACTED:pem-begin]/g' \
+  -e 's/Bearer [A-Za-z0-9._-]{20,}/Bearer [REDACTED]/g' \
+)"
+
+# byte cap (head from the end so most-recent context wins)
+if [ "${#REDACTED}" -gt "$MAX_BYTES" ]; then
+  REDACTED="...[truncated $((${#REDACTED} - MAX_BYTES)) bytes]...
+$(printf '%s' "$REDACTED" | tail -c "$MAX_BYTES")"
+fi
+
+# ---- step 4: build extract prompt -----------------------------------------
+PROMPT="$(cat <<'EOF'
+You are a memory-distillation pass for a Claude Code node.
+You will receive a redacted slice of a session transcript between USER (Seo Jin On / 서진원) and ASSISTANT (dungae, a Hermes Team2 worker).
+
+Extract two kinds of items and return STRICT JSON only — no prose, no markdown fences.
+
+Schema:
+{
+  "honcho": [
+    {
+      "kind": "preference" | "decision" | "observation" | "context",
+      "text": "<one-sentence Korean fact about the user, relationship, or in-flight work>",
+      "subject": "user" | "session" | "node"
+    }
+  ],
+  "wiki_candidates": [
+    {
+      "title": "<short Korean title>",
+      "suggested_path": "<e.g. pages/team/dungae/DECISIONS.md or pages/nodes/dungae/RUNBOOK.md or pages/log.md>",
+      "summary": "<2-4 sentence Korean summary of the durable operational fact / decision / runbook step>",
+      "evidence_excerpt": "<<= 200 chars verbatim Korean quote from the transcript>"
+    }
+  ]
+}
+
+honcho criteria (working/relational memory; volatile OK):
+  - new user preference, communication style, in-flight context that next session needs
+  - relationship-level observations about the user
+  - DO NOT include node operational facts here — those go to wiki_candidates.
+
+wiki_candidates criteria (durable, public-safe wiki page material):
+  - design / architecture / policy decisions for this node
+  - new runbook step, incident conclusion, service config change rationale
+  - MUST NOT include raw secrets — only locations/handling rules (FW-03).
+  - if nothing durable came up this session, return [].
+
+Return [] for either array if nothing qualifies. NEVER invent items.
+If the transcript is mostly small talk or trivial Q&A, return {"honcho": [], "wiki_candidates": []}.
+EOF
+)"
+
+INPUT="$(printf '%s\n\n--- transcript (session=%s trigger=%s) ---\n%s\n' \
+  "$PROMPT" "$SESSION_ID" "$TRIGGER" "$REDACTED")"
+
+# ---- step 5: call `claude -p` (OAuth via parent process) -------------------
+# CLAUDE_DISTILL_INFLIGHT=1 is already exported by distill.sh so the child's
+# SessionStart/PreCompact/etc. hooks short-circuit.
+RESULT="$(printf '%s' "$INPUT" | timeout "$TIMEOUT" claude -p \
+  --model "$MODEL" \
+  --no-session-persistence \
+  --output-format text \
+  2>/dev/null)"
+ec=$?
+
+if [ $ec -ne 0 ] || [ -z "$RESULT" ]; then
+  echo "claude -p failed (ec=$ec) or empty result" >&2
+  exit 1
+fi
+
+# Strip possible markdown fences (```json … ```). The rest should be valid JSON.
+# (The earlier awk-range trick failed for nested objects — first inner `}` cut it short.)
+CLEAN="$(printf '%s' "$RESULT" | sed -E '/^[[:space:]]*```/d')"
+
+# Validate JSON.
+if ! printf '%s' "$CLEAN" | jq -e '.honcho and .wiki_candidates' >/dev/null 2>&1; then
+  echo "invalid json from claude -p" >&2
+  echo "--- raw ---" >&2
+  printf '%s\n' "$RESULT" | head -c 2000 >&2
+  exit 1
+fi
+
+# Tag with metadata for downstream consumers.
+printf '%s' "$CLEAN" | jq -c \
+  --arg sid "$SESSION_ID" \
+  --arg trg "$TRIGGER" \
+  --arg ts  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  '. + {session_id:$sid, trigger:$trg, distilled_at:$ts}'

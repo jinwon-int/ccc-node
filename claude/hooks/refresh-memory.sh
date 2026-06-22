@@ -4,6 +4,9 @@
 # Single-flight via flock; each source fail-open; caches updated atomically only on success.
 set -uo pipefail
 
+# Distill subprocess guard (see ~/.claude/hooks/distill.sh).
+[ -n "${CLAUDE_DISTILL_INFLIGHT:-}" ] && exit 0
+
 CACHE=/root/.claude/hooks/cache
 mkdir -p "$CACHE"
 

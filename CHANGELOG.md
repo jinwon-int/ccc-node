@@ -2,6 +2,65 @@
 
 All notable changes to the Claude Code node harness. Dates are KST.
 
+## [0.3.15] — 2026-06-22
+
+Session Distiller — `PreCompact`/`SessionEnd` hook pipeline that distills the live transcript
+via `claude -p --model haiku` (inherits parent OAuth, no `ANTHROPIC_API_KEY` needed) and
+routes the result to **Honcho** (auto push of working/relational facts) + a **human-gated
+wiki-candidates queue** (`~/.claude/state/wiki-candidates.md`) for durable wiki promotion via
+the existing `wiki-record` skill. Closes the gap left by the Hermes consolidator after the
+ccc-node harness moved to Claude Code, without re-bloating `MEMORY.md`/`USER.md`.
+
+Design rationale and live-check evidence: seoyoon-family-wiki `pages/team/dungae/DECISIONS.md`
+**[TM-1058]**, log **[LOG-1212]** / **[LOG-1220]**. Runbook sections: `pages/nodes/dungae/RUNBOOK.md`
+**[ND-1059]** (overview), **[ND-1060]** (troubleshooting), **[ND-1061]** (`rm-catastrophic`
+guard-bypass pattern for LIVE flip).
+
+### Added
+- `claude/hooks/distill.sh`: entry hook. Recursion-guarded
+  (`CLAUDE_DISTILL_INFLIGHT=1`), off-switch (`~/.claude/state/distill.disabled`), dry-run
+  (`~/.claude/state/distill.dryrun`), min-content gate, backgrounded so the foreground
+  hook returns instantly; resolves its sub-script directory dynamically so the same file
+  works in both standalone (`~/.claude/hooks/distill.sh`) and plugin
+  (`${CLAUDE_PLUGIN_ROOT}/hooks/distill.sh`) install modes.
+- `claude/hooks/distill/extract.sh`: pulls the last N user/assistant turns from
+  `~/.claude/projects/<cwd-encoded>/<session-uuid>.jsonl`, applies a secret-regex redact
+  pass on top of `redact.sh` patterns, invokes `claude -p --model haiku
+  --no-session-persistence --output-format text`, validates the strict-JSON response, and
+  tags it with `session_id`/`trigger`/`distilled_at` metadata.
+- `claude/hooks/distill/honcho-push.sh`: upserts the Honcho session and POSTs distilled
+  working/relational facts to `{baseUrl}/v3/workspaces/<ws>/sessions/<sid>/messages` as
+  `peer_id: <aiPeer>`. Fail-open with retry-queue stub (`honcho-queue.jsonl`).
+- `claude/hooks/distill/wiki-queue.sh`: appends durable wiki candidates to
+  `~/.claude/state/wiki-candidates.md` with title-hash 7-day de-dup; auto-bootstraps the
+  queue header on first run. No auto-PR (human-gated per [FW-03]).
+- `claude/settings.base.json` + `claude/hooks/enforcement-overlay.json` +
+  `claude/hooks/hooks.json`: register `distill.sh` on `PreCompact` (after `checkpoint.sh`)
+  and `SessionEnd` (after `notify.sh`) for both standalone and plugin install modes.
+- `claude/settings.base.json` env: `CLAUDE_DISTILL_TIMEOUT="180"` — bigger budget than the
+  90 s default for transcripts that exceed Haiku's first-token latency on large sessions.
+- `setup.sh`: copies `claude/hooks/distill.sh` and the `claude/hooks/distill/` directory
+  into `~/.claude/hooks/`, and `chmod +x` covers both directories.
+
+### Changed
+- `claude/hooks/load-memory.sh`, `claude/hooks/load-tools.sh`, `claude/hooks/checkpoint.sh`,
+  `claude/hooks/refresh-memory.sh`, `claude/hooks/evidence-gate.sh`: each gains a single
+  guard line right after `set -uo pipefail`:
+  ```
+  [ -n "${CLAUDE_DISTILL_INFLIGHT:-}" ] && exit 0
+  ```
+  This prevents the child `claude -p` session spawned by the distiller from re-firing
+  memory loads / cache refreshes / checkpoints / Stop-time evidence checks.
+
+### Verified
+- Guards: all six hooks (`load-memory`, `load-tools`, `checkpoint`, `refresh-memory`,
+  `evidence-gate`, `distill`) exit 0 silently under `CLAUDE_DISTILL_INFLIGHT=1`.
+- Live Honcho POST: `ensure-session` returned HTTP 201, message POST returned HTTP 201,
+  read-back confirmed peer/content/metadata round-trip, DELETE 202 cleanup.
+- LIVE end-to-end manual run: `claude -p` Haiku call ~28 s, valid JSON parsed,
+  2 wiki candidates auto-queued (later promoted to RUNBOOK [ND-1059..1061] in Wiki PR
+  jinwon-int/seoyoon-family-wiki#1916).
+
 ## [0.3.14] — 2026-06-21
 
 Bridge — extend `CCC_TELEGRAM_PART_HEADERS` to the entity-renderer path so multi-chunk
