@@ -12,13 +12,13 @@ ok() { if eval "$2"; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $
 export CCC_STATE_DIR="$TMP/state"
 mkdir -p "$CCC_STATE_DIR"
 
-PAYLOAD='{"session_id":"sess-wiki","trigger":"manual","wiki_candidates":[{"title":"Decision A","suggested_path":"pages/team/dungae/DECISIONS.md","summary":"Keep the safe path.","evidence_excerpt":"operator said safe"},{"title":"Runbook B","suggested_path":"pages/nodes/dungae/RUNBOOK.md","summary":"Do the thing.","evidence_excerpt":"command output"}],"honcho":[]}'
+PAYLOAD='{"session_id":"sess-wiki","trigger":"manual","source_cwd":"/root/project-a","source_project":"-root-project-a","wiki_candidates":[{"title":"Decision A","suggested_path":"pages/team/dungae/DECISIONS.md","summary":"Keep the safe path.","evidence_excerpt":"operator said safe"},{"title":"Runbook B","suggested_path":"pages/nodes/dungae/RUNBOOK.md","summary":"Do the thing.","evidence_excerpt":"command output"}],"honcho":[]}'
 
 out="$(printf '%s' "$PAYLOAD" | bash "$WIKI_QUEUE" 2>&1)"; rc=$?
 ok "first append exits 0" '[ "$rc" = 0 ]'
 ok "first append reports two additions" 'grep -q "wiki-queue session=sess-wiki added=2 skipped(dup)=0 total_in=2" <<<"$out"'
 ok "queue file has bootstrap header and candidates" 'grep -q "Wiki Candidates Queue" "$CCC_STATE_DIR/wiki-candidates.md" && grep -q "\[CAND-1\].*Decision A" "$CCC_STATE_DIR/wiki-candidates.md" && grep -q "\[CAND-2\].*Runbook B" "$CCC_STATE_DIR/wiki-candidates.md"'
-ok "candidate metadata is recorded" 'grep -q "source-session:.*sess-wiki" "$CCC_STATE_DIR/wiki-candidates.md" && grep -q "status: pending" "$CCC_STATE_DIR/wiki-candidates.md"'
+ok "candidate metadata is recorded" 'grep -q "source-session:.*sess-wiki" "$CCC_STATE_DIR/wiki-candidates.md" && grep -q "source-cwd:.*project-a" "$CCC_STATE_DIR/wiki-candidates.md" && grep -q "status: pending" "$CCC_STATE_DIR/wiki-candidates.md"'
 ok "seen file stores two hashes" '[ "$(wc -l < "$CCC_STATE_DIR/wiki-candidates.seen")" = 2 ]'
 
 out="$(printf '%s' "$PAYLOAD" | bash "$WIKI_QUEUE" 2>&1)"; rc=$?

@@ -66,6 +66,8 @@ run_extract() {
   export CLAUDE_DISTILL_TRANSCRIPT="$transcript"
   export CLAUDE_DISTILL_SESSION="sess-test"
   export CLAUDE_DISTILL_TRIGGER="manual"
+  export CLAUDE_DISTILL_SOURCE_CWD="/root/project-a"
+  export CLAUDE_DISTILL_SOURCE_PROJECT="-root-project-a"
   export CLAUDE_DISTILL_TIMEOUT="$timeout_s"
   export CLAUDE_DISTILL_MAX_TURNS=20
   export CLAUDE_DISTILL_MAX_BYTES=20000
@@ -79,7 +81,8 @@ out=""; rc=99
 run_extract "$TRANSCRIPT" valid
 ok "valid JSON exits 0" '[ "$rc" = 0 ]'
 ok "valid JSON is tagged with session metadata" 'jq -e ".session_id == \"sess-test\" and .trigger == \"manual\" and (.honcho|length)==1" <<<"$out" >/dev/null'
-ok "transcript input is redacted before claude" '! grep -q "ghp_abcdefghijklmnopqrstuvwxyz123456\|Bearer abcdefghijklmnopqrstuvwxyz123456" "$TMP/input-valid.txt" && grep -q "REDACTED" "$TMP/input-valid.txt"'
+ok "valid JSON carries source cwd metadata" 'jq -e ".source_cwd == \"/root/project-a\" and .source_project == \"-root-project-a\"" <<<"$out" >/dev/null'
+ok "transcript input is redacted before claude" '! grep -q "ghp_ab...3456\|Bearer abcdefghijklmnopqrstuvwxyz123456" "$TMP/input-valid.txt" && grep -q "REDACTED" "$TMP/input-valid.txt"'
 
 run_extract "$TRANSCRIPT" fenced
 ok "fenced JSON is stripped" '[ "$rc" = 0 ] && jq -e ".honcho == [] and .wiki_candidates == []" <<<"$out" >/dev/null'
