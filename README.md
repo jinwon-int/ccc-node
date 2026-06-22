@@ -50,10 +50,11 @@ to Telegram, with all secrets and node-local state stripped out and replaced by 
   contents; `--fix` is reserved for a later repair slice.
 - **Headless runner** (`headless.sh`) — `claude -p` wrapper for cron/A2A/CI with JSON output
   and a read-only tool baseline; guard enforcement still applies.
-- **Agent-cron store/list/due** (`scripts/agent-cron.sh`, `/agent-cron`) — first-class durable
-  task-definition surface for future headless cron work. The current slices validate/list
-  `~/.claude/state/agent-cron/tasks.json` against `schemas/agent-cron-task-store.schema.json`
-  and provide a read-only `due` resolver for schedule/catch-up planning. They do not execute
+- **Agent-cron store/list/due/lock** (`scripts/agent-cron.sh`, `/agent-cron`) — first-class
+  durable task-definition surface for future headless cron work. The current slices validate/list
+  `~/.claude/state/agent-cron/tasks.json` against `schemas/agent-cron-task-store.schema.json`,
+  provide a read-only `due` resolver for schedule/catch-up planning, and expose local atomic
+  task-lock `acquire`/`release`/`probe` primitives with stale-lock reporting. They do not execute
   tasks, update `lastRunAt`, send Telegram/provider messages, or install schedulers.
 - **A2A Claude Code worker lane** — documentation for nodes whose broker poller keeps the
   historical `a2a-hermes-worker` service name while the task analysis adapter is switched to

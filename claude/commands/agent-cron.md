@@ -1,5 +1,5 @@
 ---
-description: List, validate, and dry-run-resolve local agent-cron task definitions without executing them.
+description: List, validate, dry-run-resolve, and inspect local locks for agent-cron task definitions without executing tasks.
 allowed-tools: Bash(/opt/ccc-node/scripts/agent-cron.sh:*)
 ---
 
@@ -10,6 +10,10 @@ allowed-tools: Bash(/opt/ccc-node/scripts/agent-cron.sh:*)
 ## Dry-run due plan
 
 !`/opt/ccc-node/scripts/agent-cron.sh due 2>&1 || true`
+
+## Lock boundary
+
+Task locks are local primitives for future run-with-lock slices. Do not acquire or release locks from this summary command; only explain that `agent-cron.sh lock <task-id> --action probe --json` is the read-only inspection path when a specific task id is provided by the operator.
 
 ## Task
 
