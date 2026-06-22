@@ -43,7 +43,7 @@ ctx="# Working-state checkpoint (auto-injected: PostCompact)
 This is the pre-compaction task context. Continue from here. (Durable facts: prefer Wiki/memory.)
 
 ## working-state.md
-${state:-(working-state.md empty — if a task is in progress, keep /root/.claude/state/working-state.md updated as objective / progress / next step)}
+${state:-(working-state.md empty — if a task is in progress, keep $STATE_DIR/working-state.md updated as objective / progress / next step)}
 
 Latest checkpoint: ${latest:-(none)}"
 
