@@ -42,6 +42,14 @@ if [ "$N" = "0" ]; then
   exit 0
 fi
 
+# Pre-flight Honcho liveness before any push. If Honcho is down, skip cleanly
+# instead of growing the retry queue; distill.sh still runs the local wiki queue.
+HEALTH_HTTP="$(curl -sS -m "${CCC_HONCHO_HEALTH_TIMEOUT:-3}" -o /dev/null -w "%{http_code}" "$BASE/health" 2>/dev/null || true)"
+if ! printf '%s' "$HEALTH_HTTP" | grep -Eq '^(200|204)$'; then
+  echo "honcho /health probe failed http=${HEALTH_HTTP:-000} session=$SID facts=$N; skipping push"
+  exit 0
+fi
+
 # Build a single human-readable message body summarizing the facts.
 # Honcho's dialectic engine will reason over it on recall.
 CONTENT="$(printf '%s' "$HONCHO_FACTS" | jq -r --arg sid "$SID" --arg trg "$TRG" '

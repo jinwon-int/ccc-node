@@ -15,13 +15,14 @@ cat > "$TMP/bin/curl" <<'SH'
 set -uo pipefail
 printf '%s\n' "$*" >> "${CURL_STUB_LOG:?}"
 http="${CURL_STUB_HTTP:-201}"
+health_http="${CURL_STUB_HEALTH_HTTP:-204}"
 if [ -n "${CURL_STUB_BODY_DIR:-}" ] && [[ "$*" == *"--data-binary @-"* ]]; then
   mkdir -p "$CURL_STUB_BODY_DIR"
   cat > "$CURL_STUB_BODY_DIR/message.json"
 fi
-# honcho-push has two curl calls: ensure-session uses -w "ensure-session...";
-# message POST uses -w "\n__HTTP__%{http_code}__" and captures the body.
+# honcho-push has three curl calls: /health probe, ensure-session, and message POST.
 case "$*" in
+  */health*) printf '%s' "$health_http" ;;
   *__HTTP__*) printf '{"ok":true}\n__HTTP__%s__' "$http" ;;
   *ensure-session*) printf 'ensure-session http=%s\n' "$http" ;;
   *) printf '%s' "$http" ;;
@@ -46,12 +47,19 @@ out="$(printf '%s' "$PAYLOAD_WITH_FACTS" | CURL_STUB_HTTP=201 bash "$PUSH" 2>&1)
 ok "success exits 0" '[ "$rc" = 0 ]'
 ok "success reports pushed fact count" 'grep -q "honcho push ok http=201 session=sess-1 facts=1" <<<"$out"'
 ok "success does not create retry queue" '[ ! -s "$TMP/state/honcho-queue.jsonl" ]'
-ok "success called ensure-session and messages endpoints" 'grep -q "/v3/workspaces/test-ws/sessions" "$CURL_STUB_LOG" && grep -q "/v3/workspaces/test-ws/sessions/sess-1/messages" "$CURL_STUB_LOG"'
+ok "success called health, ensure-session and messages endpoints" 'grep -q "/health" "$CURL_STUB_LOG" && grep -q "/v3/workspaces/test-ws/sessions" "$CURL_STUB_LOG" && grep -q "/v3/workspaces/test-ws/sessions/sess-1/messages" "$CURL_STUB_LOG"'
 ok "success message metadata includes source cwd" 'jq -e ".messages[0].metadata.source_cwd == \"/root/project-a\" and .messages[0].metadata.source_project == \"-root-project-a\"" "$CURL_STUB_BODY_DIR/message.json" >/dev/null'
 ok "auth token is passed only as header argument to curl stub, not stdout" '! grep -q "secret-token" <<<"$out"'
 
 : > "$CURL_STUB_LOG"
-out="$(printf '%s' "$PAYLOAD_WITH_FACTS" | CURL_STUB_HTTP=503 bash "$PUSH" 2>&1)"; rc=$?
+out="$(printf '%s' "$PAYLOAD_WITH_FACTS" | CURL_STUB_HEALTH_HTTP=503 CURL_STUB_HTTP=201 bash "$PUSH" 2>&1)"; rc=$?
+ok "health failure exits 0" '[ "$rc" = 0 ]'
+ok "health failure reports skip" 'grep -q "honcho /health probe failed http=503 session=sess-1 facts=1; skipping push" <<<"$out"'
+ok "health failure does not create retry queue" '[ ! -s "$TMP/state/honcho-queue.jsonl" ]'
+ok "health failure does not call ensure-session or messages" 'grep -q "/health" "$CURL_STUB_LOG" && ! grep -q "/v3/workspaces/test-ws/sessions" "$CURL_STUB_LOG"'
+
+: > "$CURL_STUB_LOG"
+out="$(printf '%s' "$PAYLOAD_WITH_FACTS" | CURL_STUB_HEALTH_HTTP=204 CURL_STUB_HTTP=503 bash "$PUSH" 2>&1)"; rc=$?
 ok "failed push exits non-zero" '[ "$rc" = 1 ]'
 ok "failed push reports http code" 'grep -q "honcho push failed http=503 session=sess-1 facts=1" <<<"$out"'
 ok "failed push appends retry queue" '[ "$(wc -l < "$TMP/state/honcho-queue.jsonl")" = 1 ] && jq -e ".session_id == \"sess-1\"" "$TMP/state/honcho-queue.jsonl" >/dev/null'
