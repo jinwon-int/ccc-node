@@ -29,6 +29,26 @@
           "catchUpPolicy": { "enum": ["skip", "once", "all"], "default": "skip" },
           "maxCatchup": { "type": "integer", "minimum": 1, "maximum": 100, "default": 1 },
           "lockTimeoutSec": { "type": "integer", "minimum": 0, "maximum": 86400, "default": 0 },
+          "maxRunHistory": { "type": "integer", "minimum": 1, "maximum": 500, "default": 20 },
+          "runHistory": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["runId", "scheduledAt", "startedAt", "status", "attempt", "notifyState"],
+              "properties": {
+                "runId": { "type": "string", "minLength": 1 },
+                "scheduledAt": { "type": "string", "minLength": 1 },
+                "startedAt": { "type": "string", "minLength": 1 },
+                "finishedAt": { "type": ["string", "null"] },
+                "status": { "type": "string", "minLength": 1 },
+                "exitCode": { "type": ["integer", "null"] },
+                "attempt": { "type": "integer", "minimum": 1 },
+                "notifyState": { "type": "string", "minLength": 1 }
+              }
+            },
+            "default": []
+          },
           "lastRunAt": { "type": ["string", "null"] },
           "lastStatus": { "type": ["string", "null"] },
           "lastRunId": { "type": ["string", "null"] }

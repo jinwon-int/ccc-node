@@ -57,7 +57,8 @@ to Telegram, with all secrets and node-local state stripped out and replaced by 
   task-lock `acquire`/`release`/`probe` primitives with stale-lock reporting, and support
   `run <task-id> --dry-run` execution-plan previews plus explicit manual `run <task-id>`
   execution for due enabled tasks. Manual run acquires/releases the local lock, invokes
-  `headless.sh`, and updates `lastRunAt`/`lastStatus`/`lastRunId`. When
+  `headless.sh`, appends bounded `runHistory`, and updates
+  `lastRunAt`/`lastStatus`/`lastRunId`. When
   `notify=telegram-owner`, manual run writes a short redacted owner-only bridge spool entry
   (`CCC_AGENT_CRON_PUSH_SPOOL`/`CCC_PUSH_SPOOL`), but still does not directly call
   Telegram/provider APIs or install schedulers.
