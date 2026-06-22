@@ -2,6 +2,23 @@
 
 All notable changes to the Claude Code node harness. Dates are KST.
 
+## [0.3.16] — 2026-06-22
+
+Follow-up to 0.3.15 — add operator-facing `/distill` skill for manual control of the
+Session Distiller pipeline introduced in the previous release.
+
+### Added
+- `claude/skills/distill/SKILL.md`: dispatches on the slash-command argument:
+  - (empty) / `manual` — fire `distill.sh manual` and wait (polling `distill.log` up to
+    180 s) before reporting what was distilled.
+  - `status` — non-mutating: print toggle state, last `distill-last.json` summary,
+    last 5 `distill.log` lines, and the wiki-candidates queue size.
+  - `dryrun` / `live` — toggle DRY-RUN mode; uses `mv` (not `rm`) so the
+    `guard.sh` `rm-catastrophic` rule never trips.
+  - `disable` / `enable` — toggle the OFF switch the same way.
+- The skill is picked up by the existing `setup.sh` skills `cp -r` line; no
+  `setup.sh` change required.
+
 ## [0.3.15] — 2026-06-22
 
 Session Distiller — `PreCompact`/`SessionEnd` hook pipeline that distills the live transcript
