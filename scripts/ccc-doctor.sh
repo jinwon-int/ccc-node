@@ -10,14 +10,16 @@ REPO="${CCC_DOCTOR_REPO_DIR:-$(cd "$(dirname "$0")/.." && pwd)}"
 CLAUDE_DIR="${CCC_DOCTOR_CLAUDE_DIR:-/root/.claude}"
 SETTINGS="$CLAUDE_DIR/settings.json"
 FIX=0
+ROLLBACK=0
 APPLY=0
 for arg in "$@"; do
   case "$arg" in
     --fix) FIX=1 ;;
+    --rollback) ROLLBACK=1 ;;
     --apply|--write) APPLY=1 ;;
     -h|--help)
       cat <<'EOF'
-Usage: ccc-doctor.sh [--fix [--apply]]
+Usage: ccc-doctor.sh [--fix [--apply]] [--rollback [--apply]]
 
 Diagnostics classify checks as: 정상 / 경고 / 교정가능 / 수동필요.
 
@@ -25,6 +27,9 @@ Repair boundary:
 - `--fix` is a dry-run plan and makes no filesystem changes.
 - `--fix --apply` writes only deterministic settings.json repairs for 교정가능
   outputStyle/statusLine/hook wiring drift, after a backup tar is created.
+- `--rollback` is a dry-run plan that selects the latest ccc-doctor settings backup.
+- `--rollback --apply` restores only settings.json from that backup, after backing up
+  the current settings.json as `ccc-doctor-pre-rollback-*.tar.gz`.
 - 수동필요/risky/system-level items fail closed and are never auto-repaired.
 EOF
       exit 0
@@ -159,8 +164,8 @@ print_report() {
     printf '| %s | `%s` | %s | %s |\n' "$class" "$item" "$status" "$action"
   done
   printf '\n## 경계\n\n'
-  printf -- '- Diagnostics are read-only unless `--fix --apply` is explicitly used.\n'
-  printf -- '- `--fix` alone is dry-run only.\n'
+  printf -- '- Diagnostics are read-only unless `--fix --apply` or `--rollback --apply` is explicitly used.\n'
+  printf -- '- `--fix` and `--rollback` alone are dry-run only.\n'
   printf -- '- No remote nodes, secrets, broker/Gateway restarts, bridge restarts, migrations, or provider sends are touched.\n'
 }
 
@@ -213,6 +218,47 @@ apply_settings_repair() {
   mv "$settings_desired_tmp" "$SETTINGS"
   printf 'applied settings.json repair; backup=%s\n' "$archive"
 }
+
+latest_rollback_backup() {
+  local backup_dir="$CLAUDE_DIR/backups"
+  [ -d "$backup_dir" ] || return 1
+  find "$backup_dir" -maxdepth 1 -type f -name 'ccc-doctor-[0-9]*.tar.gz' -printf '%T@ %p\n' 2>/dev/null \
+    | sort -nr | head -1 | cut -d' ' -f2-
+}
+
+validate_settings_backup() {
+  local archive="$1"
+  [ -n "$archive" ] && [ -f "$archive" ] || return 1
+  tar -tzf "$archive" settings.json >/dev/null 2>&1 || return 1
+}
+
+apply_settings_rollback() {
+  local archive="$1" ts pre_archive
+  validate_settings_backup "$archive" || return 1
+  ts="$(date +%Y%m%d-%H%M%S)"
+  pre_archive="$CLAUDE_DIR/backups/ccc-doctor-pre-rollback-$ts.tar.gz"
+  mkdir -p "$CLAUDE_DIR/backups"
+  if [ -f "$SETTINGS" ]; then
+    tar -czf "$pre_archive" -C "$CLAUDE_DIR" settings.json
+  fi
+  tar -xzf "$archive" -C "$CLAUDE_DIR" settings.json
+  printf 'applied settings.json rollback; restored=%s; preRollbackBackup=%s\n' "$archive" "$pre_archive"
+}
+
+if [ "$ROLLBACK" = 1 ]; then
+  printf '# ccc doctor --rollback\n\n'
+  archive="$(latest_rollback_backup || true)"
+  if ! validate_settings_backup "$archive"; then
+    printf 'no rollback backup found; refusing automatic rollback.\n' >&2
+    exit 1
+  fi
+  if [ "$APPLY" = 1 ]; then
+    apply_settings_rollback "$archive" || { printf 'rollback backup is invalid; refusing automatic rollback.\n' >&2; exit 1; }
+    exit 0
+  fi
+  printf 'dry-run: would restore settings.json from %s. Re-run with `--rollback --apply` to write after pre-rollback backup.\n' "$archive"
+  exit 1
+fi
 
 if [ "$FIX" = 1 ]; then
   printf '# ccc doctor --fix\n\n'
