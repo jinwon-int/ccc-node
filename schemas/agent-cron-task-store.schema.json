@@ -49,6 +49,27 @@
             },
             "default": []
           },
+          "retryPolicy": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "maxAttempts": { "type": "integer", "minimum": 1, "maximum": 10, "default": 1 },
+              "backoffSec": { "type": "integer", "minimum": 0, "maximum": 86400, "default": 60 },
+              "backoffMultiplier": { "type": "integer", "minimum": 1, "maximum": 10, "default": 2 },
+              "maxBackoffSec": { "type": "integer", "minimum": 0, "maximum": 86400, "default": 3600 }
+            }
+          },
+          "retryState": {
+            "type": ["object", "null"],
+            "additionalProperties": false,
+            "properties": {
+              "scheduledAt": { "type": "string", "minLength": 1 },
+              "attempt": { "type": "integer", "minimum": 1 },
+              "retryEligibleAt": { "type": ["string", "null"] },
+              "lastStatus": { "type": "string", "minLength": 1 },
+              "lastRunId": { "type": ["string", "null"] }
+            }
+          },
           "lastRunAt": { "type": ["string", "null"] },
           "lastStatus": { "type": ["string", "null"] },
           "lastRunId": { "type": ["string", "null"] }

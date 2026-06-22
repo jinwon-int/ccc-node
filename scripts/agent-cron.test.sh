@@ -73,6 +73,13 @@ JSON
 out="$(CCC_AGENT_CRON_STORE="$BAD_REDACT" bash "$CMD" validate 2>&1)"; rc=$?
 ok "non-string redactProfile fails validation" '[ "$rc" = 1 ] && grep -q "redactProfile" <<<"$out"'
 
+BAD_RETRY="$TMP/bad-retry.json"
+cat > "$BAD_RETRY" <<'JSON'
+{"version":1,"tasks":[{"id":"bad-retry","schedule":"* * * * *","prompt":"a","enabled":true,"notify":"none","retryPolicy":{"maxAttempts":0}}]}
+JSON
+out="$(CCC_AGENT_CRON_STORE="$BAD_RETRY" bash "$CMD" validate 2>&1)"; rc=$?
+ok "invalid retryPolicy fails validation" '[ "$rc" = 1 ] && grep -q "retryPolicy.maxAttempts" <<<"$out"'
+
 BAD_TZ="$TMP/bad-tz.json"
 cat > "$BAD_TZ" <<'JSON'
 {"version":1,"tasks":[{"id":"bad-tz","schedule":"* * * * *","prompt":"a","enabled":true,"notify":"none","timezone":"Asia/Seoul"}]}
@@ -122,6 +129,14 @@ ok "invalid --at fails closed without traceback" '[ "$rc" = 1 ] && grep -q -- "-
 
 out="$(CCC_AGENT_CRON_STORE="$DUE" bash "$CMD" due --at 2026-01-01T02:05:00Z)"; rc=$?
 ok "due table exits 0" '[ "$rc" = 0 ] && grep -q "dry-run/read-only" <<<"$out" && grep -q "hourly-skip" <<<"$out"'
+
+RETRY_DUE="$TMP/retry-due.json"
+cat > "$RETRY_DUE" <<'JSON'
+{"version":1,"tasks":[{"id":"retry-wait","schedule":"0 0 * * *","prompt":"a","enabled":true,"notify":"none","lastRunAt":"2026-01-01T00:00:00Z","retryPolicy":{"maxAttempts":3,"backoffSec":60,"backoffMultiplier":2,"maxBackoffSec":300},"retryState":{"scheduledAt":"2026-01-01T00:00:00Z","attempt":1,"retryEligibleAt":"2026-01-01T00:10:00Z","lastStatus":"failed","lastRunId":"r1"}},{"id":"retry-ready","schedule":"0 0 * * *","prompt":"b","enabled":true,"notify":"none","lastRunAt":"2026-01-01T00:00:00Z","retryPolicy":{"maxAttempts":3,"backoffSec":60},"retryState":{"scheduledAt":"2026-01-01T00:00:00Z","attempt":1,"retryEligibleAt":"2026-01-01T00:02:00Z","lastStatus":"failed","lastRunId":"r1"}}]}
+JSON
+out="$(CCC_AGENT_CRON_STORE="$RETRY_DUE" bash "$CMD" due --json --at 2026-01-01T00:05:00Z)"; rc=$?
+ok "due shows retry wait without execution" '[ "$rc" = 0 ] && jq -e ".tasks[] | select(.id == \"retry-wait\" and .due == false and .status == \"retry-wait\" and .retryEligibleAt == \"2026-01-01T00:10:00Z\")" <<<"$out" >/dev/null'
+ok "due exposes eligible retry as retry-due" '[ "$rc" = 0 ] && jq -e ".tasks[] | select(.id == \"retry-ready\" and .due == true and .status == \"retry-due\" and .scheduledAt == \"2026-01-01T00:00:00Z\" and .retryAttempt == 2)" <<<"$out" >/dev/null'
 
 LOCK_STORE="$TMP/lock-store/tasks.json"
 mkdir -p "$(dirname "$LOCK_STORE")"
@@ -178,7 +193,7 @@ ok "run --dry-run made no filesystem changes" '[ "$before" = "$after" ]'
 EXEC_STORE="$TMP/exec-store/tasks.json"
 mkdir -p "$(dirname "$EXEC_STORE")"
 cat > "$EXEC_STORE" <<'JSON'
-{"version":1,"tasks":[{"id":"exec-success","schedule":"* * * * *","prompt":"Run safely","enabled":true,"notify":"none","allowedTools":["Read","Grep"],"permissionMode":"dontAsk","lastRunAt":"2026-01-01T00:00:00Z","lockTimeoutSec":60},{"id":"exec-fail","schedule":"* * * * *","prompt":"Fail safely","enabled":true,"notify":"none","lastRunAt":"2026-01-01T00:00:00Z","lockTimeoutSec":60},{"id":"exec-disabled","schedule":"* * * * *","prompt":"Disabled","enabled":false,"notify":"none","lastRunAt":"2026-01-01T00:00:00Z","lockTimeoutSec":60},{"id":"exec-not-due","schedule":"0 0 * * *","prompt":"Not due","enabled":true,"notify":"none","lastRunAt":"2026-01-01T00:00:00Z","lockTimeoutSec":60},{"id":"exec-notify","schedule":"* * * * *","prompt":"Notify safely","enabled":true,"notify":"telegram-owner","redactProfile":"owner","lastRunAt":"2026-01-01T00:00:00Z","lockTimeoutSec":60},{"id":"exec-notify-fail","schedule":"* * * * *","prompt":"Notify Fail secret","enabled":true,"notify":"telegram-owner","redactProfile":"owner","lastRunAt":"2026-01-01T00:00:00Z","lockTimeoutSec":60},{"id":"exec-history","schedule":"* * * * *","prompt":"History safely","enabled":true,"notify":"none","lastRunAt":"2026-01-01T00:00:00Z","lockTimeoutSec":60,"maxRunHistory":3},{"id":"exec-history-prune","schedule":"* * * * *","prompt":"History prune","enabled":true,"notify":"none","lastRunAt":"2026-01-01T00:00:00Z","lockTimeoutSec":60,"maxRunHistory":2,"runHistory":[{"runId":"old-1","scheduledAt":"2026-01-01T00:00:00Z","startedAt":"2026-01-01T00:00:00Z","finishedAt":"2026-01-01T00:00:00Z","status":"success","exitCode":0,"attempt":1,"notifyState":"none"},{"runId":"old-2","scheduledAt":"2026-01-01T00:01:00Z","startedAt":"2026-01-01T00:01:00Z","finishedAt":"2026-01-01T00:01:00Z","status":"success","exitCode":0,"attempt":1,"notifyState":"none"}]}]}
+{"version":1,"tasks":[{"id":"exec-success","schedule":"* * * * *","prompt":"Run safely","enabled":true,"notify":"none","allowedTools":["Read","Grep"],"permissionMode":"dontAsk","lastRunAt":"2026-01-01T00:00:00Z","lockTimeoutSec":60},{"id":"exec-fail","schedule":"* * * * *","prompt":"Fail safely","enabled":true,"notify":"none","lastRunAt":"2026-01-01T00:00:00Z","lockTimeoutSec":60},{"id":"exec-disabled","schedule":"* * * * *","prompt":"Disabled","enabled":false,"notify":"none","lastRunAt":"2026-01-01T00:00:00Z","lockTimeoutSec":60},{"id":"exec-not-due","schedule":"0 0 * * *","prompt":"Not due","enabled":true,"notify":"none","lastRunAt":"2026-01-01T00:00:00Z","lockTimeoutSec":60},{"id":"exec-notify","schedule":"* * * * *","prompt":"Notify safely","enabled":true,"notify":"telegram-owner","redactProfile":"owner","lastRunAt":"2026-01-01T00:00:00Z","lockTimeoutSec":60},{"id":"exec-notify-fail","schedule":"* * * * *","prompt":"Notify Fail secret","enabled":true,"notify":"telegram-owner","redactProfile":"owner","lastRunAt":"2026-01-01T00:00:00Z","lockTimeoutSec":60},{"id":"exec-history","schedule":"* * * * *","prompt":"History safely","enabled":true,"notify":"none","lastRunAt":"2026-01-01T00:00:00Z","lockTimeoutSec":60,"maxRunHistory":3},{"id":"exec-history-prune","schedule":"* * * * *","prompt":"History prune","enabled":true,"notify":"none","lastRunAt":"2026-01-01T00:00:00Z","lockTimeoutSec":60,"maxRunHistory":2,"runHistory":[{"runId":"old-1","scheduledAt":"2026-01-01T00:00:00Z","startedAt":"2026-01-01T00:00:00Z","finishedAt":"2026-01-01T00:00:00Z","status":"success","exitCode":0,"attempt":1,"notifyState":"none"},{"runId":"old-2","scheduledAt":"2026-01-01T00:01:00Z","startedAt":"2026-01-01T00:01:00Z","finishedAt":"2026-01-01T00:01:00Z","status":"success","exitCode":0,"attempt":1,"notifyState":"none"}]},{"id":"exec-retry","schedule":"* * * * *","prompt":"Fail retry","enabled":true,"notify":"none","lastRunAt":"2026-01-01T00:00:00Z","lockTimeoutSec":60,"retryPolicy":{"maxAttempts":3,"backoffSec":60,"backoffMultiplier":2,"maxBackoffSec":300}},{"id":"exec-retry-success","schedule":"0 0 * * *","prompt":"Run retry success","enabled":true,"notify":"none","lastRunAt":"2026-01-01T00:00:00Z","lockTimeoutSec":60,"retryPolicy":{"maxAttempts":3,"backoffSec":60},"retryState":{"scheduledAt":"2026-01-01T00:00:00Z","attempt":1,"retryEligibleAt":"2026-01-01T00:02:00Z","lastStatus":"failed","lastRunId":"r1"}}]}
 JSON
 FAKE_HEADLESS="$TMP/fake-headless-exec.sh"
 cat > "$FAKE_HEADLESS" <<'SH'
@@ -246,5 +261,11 @@ ok "run appends durable runHistory entry on failure" '[ "$rc" = 1 ] && jq -e ".m
 
 out="$(CCC_AGENT_CRON_STORE="$EXEC_STORE" CCC_HEADLESS_CMD="$FAKE_HEADLESS" bash "$CMD" run exec-history-prune --json --at 2026-01-01T00:05:00Z)"; rc=$?
 ok "runHistory prunes oldest entries using maxRunHistory" '[ "$rc" = 0 ] && jq -e ".tasks[] | select(.id == \"exec-history-prune\" and (.runHistory|length)==2 and .runHistory[0].runId == \"old-2\" and .runHistory[1].status == \"success\")" "$EXEC_STORE" >/dev/null'
+
+out="$(CCC_AGENT_CRON_STORE="$EXEC_STORE" CCC_HEADLESS_CMD="$FAKE_HEADLESS" bash "$CMD" run exec-retry --json --at 2026-01-01T00:01:00Z 2>&1)"; rc=$?
+ok "run failure schedules retryEligibleAt with bounded policy" '[ "$rc" = 1 ] && jq -e ".status == \"failed\" and .retry.retryEligibleAt == \"2026-01-01T00:02:00Z\" and .retry.attempt == 1" <<<"$out" >/dev/null && jq -e ".tasks[] | select(.id == \"exec-retry\" and .retryState.retryEligibleAt == \"2026-01-01T00:02:00Z\" and .retryState.attempt == 1)" "$EXEC_STORE" >/dev/null'
+
+out="$(CCC_AGENT_CRON_STORE="$EXEC_STORE" CCC_HEADLESS_CMD="$FAKE_HEADLESS" bash "$CMD" run exec-retry-success --json --at 2026-01-01T00:02:00Z)"; rc=$?
+ok "successful retry clears retryState" '[ "$rc" = 0 ] && jq -e ".status == \"success\" and .retry.cleared == true" <<<"$out" >/dev/null && jq -e ".tasks[] | select(.id == \"exec-retry-success\" and ((has(\"retryState\") | not) or .retryState == null))" "$EXEC_STORE" >/dev/null'
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
