@@ -3,7 +3,8 @@
     "BASH_MAX_OUTPUT_LENGTH": "200000",
     "MAX_MCP_OUTPUT_TOKENS": "25000",
     "CLAUDE_CODE_MAX_OUTPUT_TOKENS": "32000",
-    "BASH_MAX_TIMEOUT_MS": "1200000"
+    "BASH_MAX_TIMEOUT_MS": "1200000",
+    "CLAUDE_DISTILL_TIMEOUT": "180"
   },
   "includeCoAuthoredBy": true,
   "cleanupPeriodDays": 30,
@@ -66,6 +67,12 @@
             "command": "bash /root/.claude/hooks/checkpoint.sh PreCompact",
             "timeout": 10,
             "statusMessage": "Checkpointing working-state before compaction..."
+          },
+          {
+            "type": "command",
+            "command": "bash /root/.claude/hooks/distill.sh precompact",
+            "timeout": 10,
+            "statusMessage": "Queuing session distill (background)..."
           }
         ]
       }
