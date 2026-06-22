@@ -25,6 +25,10 @@
           "attachMemory": { "type": "array", "items": { "type": "string" }, "default": [] },
           "attachSkills": { "type": "array", "items": { "type": "string" }, "default": [] },
           "redactProfile": { "type": "string", "default": "default" },
+          "timezone": { "const": "UTC", "default": "UTC" },
+          "catchUpPolicy": { "enum": ["skip", "once", "all"], "default": "skip" },
+          "maxCatchup": { "type": "integer", "minimum": 1, "maximum": 100, "default": 1 },
+          "lockTimeoutSec": { "type": "integer", "minimum": 0, "maximum": 86400, "default": 0 },
           "lastRunAt": { "type": ["string", "null"] },
           "lastStatus": { "type": ["string", "null"] },
           "lastRunId": { "type": ["string", "null"] }
