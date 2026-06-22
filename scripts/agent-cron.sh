@@ -1,27 +1,37 @@
 #!/usr/bin/env bash
-# agent-cron — first-class durable task store/list surface.
+# agent-cron — first-class durable task store/list/due surface.
 #
-# First slice for issue #55: define and inspect the task store only. This script
-# intentionally does not execute prompts, write push spool entries, install
-# timers, or mutate live cron/systemd state.
+# Issue #55 incremental slices:
+# - store/list/validate is implemented.
+# - due is a read-only dry-run resolver for schedule/catch-up planning.
+#
+# This script intentionally does not execute prompts, write push spool entries,
+# install timers, mutate lastRunAt, or touch live cron/systemd state.
 set -uo pipefail
 
 STORE="${CCC_AGENT_CRON_STORE:-$HOME/.claude/state/agent-cron/tasks.json}"
 CMD="${1:-list}"
 [ $# -gt 0 ] && shift
 JSON=0
+AT=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --json) JSON=1 ;;
     --store) [ -n "${2:-}" ] || { echo "--store requires a path" >&2; exit 2; }; STORE="$2"; shift ;;
+    --at) [ -n "${2:-}" ] || { echo "--at requires an ISO8601 timestamp" >&2; exit 2; }; AT="$2"; shift ;;
     -h|--help)
       cat <<'EOF'
 Usage: agent-cron.sh [list|validate] [--store PATH] [--json]
+       agent-cron.sh due [--store PATH] [--at ISO8601] [--json]
        agent-cron.sh run <task-id>
 
-First implementation slice: store/list/validate only.
+Implemented slices:
+- list/validate: inspect and validate the task definition store.
+- due: read-only dry-run schedule resolver. It reports due tasks, missed windows,
+  catch-up policy, and lock paths, but never executes prompts or writes state.
+
 No task execution, Telegram push, scheduler bootstrap, systemd/crontab writes,
-provider sends, or remote-node actions are performed.
+provider sends, lastRunAt updates, or remote-node actions are performed.
 EOF
       exit 0
       ;;
@@ -31,29 +41,41 @@ EOF
 done
 
 case "$CMD" in
-  list|validate) ;;
+  list|validate|due) ;;
   run|execute|scheduler|install|enable|disable|add|remove)
-    echo "agent-cron $CMD is not implemented in this store/list-only slice; no filesystem changes were made." >&2
+    echo "agent-cron $CMD is not implemented in this read-only slice; no filesystem changes were made." >&2
     exit 2
     ;;
   *) echo "Unknown command: $CMD" >&2; exit 2 ;;
 esac
 
-export STORE JSON CMD
+export STORE JSON CMD AT
 python3 - <<'PY'
 import json
 import os
 import re
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 store = Path(os.environ['STORE']).expanduser()
 json_out = os.environ.get('JSON') == '1'
 cmd = os.environ['CMD']
+at_raw = os.environ.get('AT') or ''
 
 ALLOWED_NOTIFY = {'none', 'telegram-owner'}
 ALLOWED_PERMISSION = {'dontAsk', 'acceptEdits', 'default', None}
+ALLOWED_CATCH_UP = {'skip', 'once', 'all', None}
 ID_RX = re.compile(r'^[A-Za-z0-9_.-]{1,96}$')
+CRON_FIELD_RX = re.compile(r'^(\*|\*/[1-9][0-9]*|[0-9]+)(,(\*|\*/[1-9][0-9]*|[0-9]+))*$')
+SHORTHAND = {
+    '@hourly': '0 * * * *',
+    '@daily': '0 0 * * *',
+    '@weekly': '0 0 * * 0',
+    '@monthly': '0 0 1 * *',
+    '@yearly': '0 0 1 1 *',
+    '@annually': '0 0 1 1 *',
+}
 
 
 def empty_doc():
@@ -114,7 +136,119 @@ def validate_doc(data):
             val = task.get(field, [])
             if not isinstance(val, list) or any(not isinstance(x, str) for x in val):
                 errors.append(f'{prefix}.{field} must be an array of strings')
+        catch_up = task.get('catchUpPolicy')
+        if catch_up not in ALLOWED_CATCH_UP:
+            errors.append(f'{prefix}.catchUpPolicy must be one of skip, once, all')
+        max_catch_up = task.get('maxCatchup', 1)
+        if not isinstance(max_catch_up, int) or max_catch_up < 1 or max_catch_up > 100:
+            errors.append(f'{prefix}.maxCatchup must be an integer from 1 to 100')
+        lock_timeout = task.get('lockTimeoutSec', 0)
+        if not isinstance(lock_timeout, int) or lock_timeout < 0 or lock_timeout > 86400:
+            errors.append(f'{prefix}.lockTimeoutSec must be an integer from 0 to 86400')
+        timezone_name = task.get('timezone', 'UTC')
+        if timezone_name != 'UTC':
+            errors.append(f'{prefix}.timezone currently supports UTC only')
+        for field in ('lastRunAt', 'lastStatus', 'lastRunId'):
+            if field in task and task[field] is not None and not isinstance(task[field], str):
+                errors.append(f'{prefix}.{field} must be string or null')
     return errors
+
+
+def parse_dt(value, field='timestamp'):
+    if value is None or value == '':
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f'{field} must be an ISO8601 string')
+    text = value.strip()
+    if text.endswith('Z'):
+        text = text[:-1] + '+00:00'
+    try:
+        dt = datetime.fromisoformat(text)
+    except ValueError as e:
+        raise ValueError(f'{field} is not valid ISO8601: {value}') from e
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).replace(second=0, microsecond=0)
+
+
+def expand_field(raw, min_v, max_v):
+    vals = set()
+    for part in raw.split(','):
+        if part == '*':
+            vals.update(range(min_v, max_v + 1))
+        elif part.startswith('*/'):
+            step = int(part[2:])
+            if step <= 0:
+                raise ValueError('step must be positive')
+            vals.update(range(min_v, max_v + 1, step))
+        else:
+            v = int(part)
+            if v < min_v or v > max_v:
+                raise ValueError(f'value {v} outside {min_v}-{max_v}')
+            vals.add(v)
+    return vals
+
+
+def parse_schedule(expr):
+    expr = expr.strip()
+    if expr == '@reboot':
+        raise ValueError('@reboot is not supported by dry-run due resolver')
+    expr = SHORTHAND.get(expr, expr)
+    parts = expr.split()
+    if len(parts) != 5:
+        raise ValueError('schedule must be a supported @shorthand or 5-field cron')
+    for p in parts:
+        if not CRON_FIELD_RX.match(p):
+            raise ValueError(f'unsupported cron field: {p}')
+    return {
+        'minute': expand_field(parts[0], 0, 59),
+        'hour': expand_field(parts[1], 0, 23),
+        'dom': expand_field(parts[2], 1, 31),
+        'month': expand_field(parts[3], 1, 12),
+        'dow': expand_field(parts[4], 0, 7),
+        'expr': expr,
+    }
+
+
+def cron_matches(dt, spec):
+    dow = (dt.weekday() + 1) % 7  # Python Mon=0; cron Sun=0
+    dows = spec['dow']
+    return (
+        dt.minute in spec['minute'] and
+        dt.hour in spec['hour'] and
+        dt.day in spec['dom'] and
+        dt.month in spec['month'] and
+        (dow in dows or (dow == 0 and 7 in dows))
+    )
+
+
+def iter_occurrences(spec, start_exclusive, end_inclusive, cap=1000):
+    cur = (start_exclusive + timedelta(minutes=1)).replace(second=0, microsecond=0)
+    end = end_inclusive.replace(second=0, microsecond=0)
+    out = []
+    while cur <= end and len(out) < cap:
+        if cron_matches(cur, spec):
+            out.append(cur)
+        cur += timedelta(minutes=1)
+    return out
+
+
+def next_occurrence(spec, after, max_minutes=366 * 24 * 60):
+    cur = (after + timedelta(minutes=1)).replace(second=0, microsecond=0)
+    for _ in range(max_minutes):
+        if cron_matches(cur, spec):
+            return cur
+        cur += timedelta(minutes=1)
+    return None
+
+
+def fmt_dt(dt):
+    return None if dt is None else dt.isoformat().replace('+00:00', 'Z')
+
+
+def lock_path(task_id):
+    base = store.parent if str(store.parent) != '.' else Path.cwd()
+    return base / 'locks' / f'{task_id}.lock'
 
 
 def normalize(data):
@@ -130,12 +264,65 @@ def normalize(data):
             'permissionMode': t.get('permissionMode') or 'default',
             'attachMemory': t.get('attachMemory', []),
             'attachSkills': t.get('attachSkills', []),
+            'timezone': t.get('timezone', 'UTC'),
+            'catchUpPolicy': t.get('catchUpPolicy', 'skip'),
+            'maxCatchup': t.get('maxCatchup', 1),
+            'lockTimeoutSec': t.get('lockTimeoutSec', 0),
             'lastRunAt': t.get('lastRunAt'),
             'lastStatus': t.get('lastStatus'),
             'lastRunId': t.get('lastRunId'),
         })
     out['tasks'].sort(key=lambda x: x['id'] or '')
     return out
+
+
+def due_plan(data):
+    at = parse_dt(at_raw, '--at') if at_raw else datetime.now(timezone.utc).replace(second=0, microsecond=0)
+    rows = []
+    errors = []
+    for idx, task in enumerate(data.get('tasks', [])):
+        tid = task.get('id')
+        row = {
+            'id': tid,
+            'enabled': bool(task.get('enabled')),
+            'schedule': task.get('schedule'),
+            'timezone': task.get('timezone', 'UTC'),
+            'catchUpPolicy': task.get('catchUpPolicy', 'skip'),
+            'maxCatchup': task.get('maxCatchup', 1),
+            'lastRunAt': task.get('lastRunAt'),
+            'due': False,
+            'dueCount': 0,
+            'missedRuns': 0,
+            'scheduledAt': None,
+            'nextDueAt': None,
+            'lockPath': str(lock_path(tid or f'task-{idx}')),
+            'lockState': 'held' if lock_path(tid or f'task-{idx}').exists() else 'free',
+            'status': 'disabled' if not task.get('enabled') else 'idle',
+        }
+        try:
+            spec = parse_schedule(task.get('schedule') or '')
+            last = parse_dt(task.get('lastRunAt'), f'tasks[{idx}].lastRunAt')
+            horizon_start = last or (at - timedelta(days=366))
+            occurrences = iter_occurrences(spec, horizon_start, at)
+            raw_missed = len(occurrences)
+            policy = task.get('catchUpPolicy', 'skip')
+            max_catch = task.get('maxCatchup', 1)
+            if task.get('enabled') and raw_missed > 0:
+                row['due'] = True
+                row['scheduledAt'] = fmt_dt(occurrences[-1])
+                if policy == 'all':
+                    row['dueCount'] = min(raw_missed, max_catch)
+                else:
+                    row['dueCount'] = 1
+                row['missedRuns'] = max(0, raw_missed - row['dueCount'])
+                row['status'] = 'locked' if row['lockState'] == 'held' else 'due'
+            row['nextDueAt'] = fmt_dt(next_occurrence(spec, at))
+        except Exception as e:
+            row['status'] = 'invalid-schedule'
+            row['error'] = str(e)
+            errors.append(f'{tid}: {e}')
+        rows.append(row)
+    return {'ok': not errors, 'store': str(store), 'at': fmt_dt(at), 'mode': 'dry-run-read-only', 'tasks': rows, 'errors': errors}
 
 
 data, errors = load_doc()
@@ -151,6 +338,28 @@ if cmd == 'validate':
         print(f'agent-cron store OK: {store} ({len(data.get("tasks", []))} task(s))')
     sys.exit(0)
 
+if cmd == 'due':
+    plan = due_plan(data)
+    if json_out:
+        print(json.dumps(plan, ensure_ascii=False, indent=2))
+    else:
+        print('# agent-cron due plan\n')
+        print(f"- store: `{plan['store']}`")
+        print(f"- at: `{plan['at']}`")
+        print('- mode: dry-run/read-only; no execution, push, scheduler, systemd, crontab, or state writes\n')
+        if not plan['tasks']:
+            print('No agent-cron tasks are defined.')
+        else:
+            print('| id | status | schedule | due | due count | missed | scheduled at | next due | lock |')
+            print('|---|---|---|---:|---:|---:|---|---|---|')
+            for t in plan['tasks']:
+                print(f"| `{t['id']}` | `{t['status']}` | `{t['schedule']}` | {str(t['due']).lower()} | {t['dueCount']} | {t['missedRuns']} | `{t['scheduledAt'] or ''}` | `{t['nextDueAt'] or ''}` | `{t['lockState']}` |")
+        if plan['errors']:
+            print('\n## Errors')
+            for e in plan['errors']:
+                print(f'- {e}')
+    sys.exit(0 if plan['ok'] else 1)
+
 norm = normalize(data)
 if json_out:
     print(json.dumps(norm, ensure_ascii=False, indent=2))
@@ -158,13 +367,13 @@ if json_out:
 
 print('# agent-cron tasks\n')
 print(f'- store: `{store}`')
-print('- mode: store/list only; no execution, push, scheduler, systemd, or crontab changes\n')
+print('- mode: store/list/due only; no execution, push, scheduler, systemd, crontab, or state writes\n')
 if not norm['tasks']:
     print('No agent-cron tasks are defined.')
     sys.exit(0)
-print('| id | schedule | enabled | notify | tools | last status |')
-print('|---|---|---:|---|---|---|')
+print('| id | schedule | enabled | notify | catch-up | tools | last status |')
+print('|---|---|---:|---|---|---|---|')
 for t in norm['tasks']:
     tools = ','.join(t['allowedTools']) if t['allowedTools'] else '(default)'
-    print(f"| `{t['id']}` | `{t['schedule']}` | {str(t['enabled']).lower()} | `{t['notify']}` | `{tools}` | `{t.get('lastStatus') or 'unknown'}` |")
+    print(f"| `{t['id']}` | `{t['schedule']}` | {str(t['enabled']).lower()} | `{t['notify']}` | `{t['catchUpPolicy']}` | `{tools}` | `{t.get('lastStatus') or 'unknown'}` |")
 PY
