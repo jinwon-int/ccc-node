@@ -12,21 +12,29 @@ SETTINGS="$CLAUDE_DIR/settings.json"
 FIX=0
 ROLLBACK=0
 APPLY=0
-for arg in "$@"; do
+SCOPE="settings"
+while [ $# -gt 0 ]; do
+  arg="$1"
   case "$arg" in
     --fix) FIX=1 ;;
     --rollback) ROLLBACK=1 ;;
     --apply|--write) APPLY=1 ;;
+    --scope) [ -n "${2:-}" ] || { echo "--scope requires a value" >&2; exit 2; }; SCOPE="$2"; shift ;;
+    --scope=*) SCOPE="${arg#--scope=}" ;;
     -h|--help)
       cat <<'EOF'
-Usage: ccc-doctor.sh [--fix [--apply]] [--rollback [--apply]]
+Usage: ccc-doctor.sh [--fix [--apply] [--scope=settings|files|hooks,output-styles]] [--rollback [--apply]]
 
 Diagnostics classify checks as: 정상 / 경고 / 교정가능 / 수동필요.
 
 Repair boundary:
 - `--fix` is a dry-run plan and makes no filesystem changes.
-- `--fix --apply` writes only deterministic settings.json repairs for 교정가능
-  outputStyle/statusLine/hook wiring drift, after a backup tar is created.
+- `--fix --apply` defaults to `--scope=settings` and writes only deterministic
+  settings.json repairs for 교정가능 outputStyle/statusLine/hook wiring drift,
+  after a backup tar is created.
+- `--fix --apply --scope=files` reinstalls only allowlisted hook scripts and
+  output-style files from the repo after a scoped backup. It refuses symlinks,
+  path traversal, missing repo sources, and ambiguous/manual install modes.
 - `--rollback` is a dry-run plan that selects the latest ccc-doctor settings backup.
 - `--rollback --apply` restores only settings.json from that backup, after backing up
   the current settings.json as `ccc-doctor-pre-rollback-*.tar.gz`.
@@ -36,6 +44,7 @@ EOF
       ;;
     *) echo "Unknown flag: $arg" >&2; exit 2 ;;
   esac
+  shift
 done
 
 normal=0; warn=0; fixable=0; manual=0
@@ -50,6 +59,35 @@ add() { # <class> <item> <status> <action>
     수동필요) manual=$((manual+1)) ;;
   esac
 }
+
+HOOK_FILES=(
+  hooks/load-memory.sh hooks/load-tools.sh hooks/checkpoint.sh hooks/statusline.sh
+  hooks/guard.sh hooks/audit.sh hooks/redact.sh hooks/notify.sh hooks/evidence-gate.sh
+)
+OUTPUT_STYLE_FILES=(output-styles/ccc-report.md)
+
+scope_has() {
+  local want="$1" raw part
+  raw=",$SCOPE,"
+  case "$want" in
+    settings) [[ "$raw" == *,settings,* ]] || [[ "$raw" == *,all,* ]] ;;
+    hooks) [[ "$raw" == *,hooks,* ]] || [[ "$raw" == *,files,* ]] || [[ "$raw" == *,all,* ]] ;;
+    output-styles) [[ "$raw" == *,output-styles,* ]] || [[ "$raw" == *,files,* ]] || [[ "$raw" == *,all,* ]] ;;
+    *) return 1 ;;
+  esac
+}
+
+valid_scope() {
+  local rest="$SCOPE" part
+  while [ -n "$rest" ]; do
+    part="${rest%%,*}"
+    [ "$part" = "$rest" ] && rest="" || rest="${rest#*,}"
+    case "$part" in settings|files|hooks|output-styles|all) ;;
+      *) return 1 ;;
+    esac
+  done
+}
+valid_scope || { echo "unsupported --scope: $SCOPE" >&2; exit 2; }
 
 json_ok() { jq -e . "$1" >/dev/null 2>&1; }
 json_has() { jq -e "$2" "$1" >/dev/null 2>&1; }
@@ -114,21 +152,29 @@ if [ "$settings_valid" = 1 ]; then
   fi
 fi
 
-for rel in \
-  hooks/load-memory.sh hooks/load-tools.sh hooks/checkpoint.sh hooks/statusline.sh \
-  hooks/guard.sh hooks/audit.sh hooks/redact.sh hooks/notify.sh hooks/evidence-gate.sh; do
-  if [ -f "$CLAUDE_DIR/$rel" ]; then
-    add 정상 "$rel" "installed" "none"
+for rel in "${HOOK_FILES[@]}"; do
+  src="$REPO/claude/$rel"
+  dst="$CLAUDE_DIR/$rel"
+  if [ ! -f "$dst" ]; then
+    add 교정가능 "$rel" "missing" "run ccc-doctor --fix --apply --scope=files after backup to reinstall allowlisted harness files"
+  elif [ -f "$src" ] && ! cmp -s "$src" "$dst"; then
+    add 교정가능 "$rel" "drifted" "run ccc-doctor --fix --apply --scope=files after backup to reinstall allowlisted harness files"
   else
-    add 교정가능 "$rel" "missing" "run setup.sh after backup to reinstall harness files"
+    add 정상 "$rel" "installed" "none"
   fi
 done
 
-if [ -f "$CLAUDE_DIR/output-styles/ccc-report.md" ]; then
-  add 정상 "output-styles/ccc-report.md" "installed" "none"
-else
-  add 교정가능 "output-styles/ccc-report.md" "missing" "run setup.sh after backup to reinstall output styles"
-fi
+for rel in "${OUTPUT_STYLE_FILES[@]}"; do
+  src="$REPO/claude/$rel"
+  dst="$CLAUDE_DIR/$rel"
+  if [ ! -f "$dst" ]; then
+    add 교정가능 "$rel" "missing" "run ccc-doctor --fix --apply --scope=files after backup to reinstall output styles"
+  elif [ -f "$src" ] && ! cmp -s "$src" "$dst"; then
+    add 교정가능 "$rel" "drifted" "run ccc-doctor --fix --apply --scope=files after backup to reinstall output styles"
+  else
+    add 정상 "$rel" "installed" "none"
+  fi
+done
 
 if [ -f "$REPO/claude/hooks/enforcement-overlay.json" ] && [ -f "$REPO/claude/hooks/hooks.json" ]; then
   norm() { jq -S '.hooks | to_entries | map({event:.key, items:(.value|map({m:(.matcher//""), c:(.hooks|map(.command|capture("/(?<b>[A-Za-z0-9_.-]+\\.sh)").b // .)|sort)})|sort)})' "$1" 2>/dev/null; }
@@ -245,6 +291,100 @@ apply_settings_rollback() {
   printf 'applied settings.json rollback; restored=%s; preRollbackBackup=%s\n' "$archive" "$pre_archive"
 }
 
+file_repair_list() {
+  local rel src dst
+  if scope_has hooks; then
+    for rel in "${HOOK_FILES[@]}"; do
+      src="$REPO/claude/$rel"; dst="$CLAUDE_DIR/$rel"
+      if [ ! -f "$dst" ] || { [ -f "$src" ] && ! cmp -s "$src" "$dst"; }; then
+        printf '%s\n' "$rel"
+      fi
+    done
+  fi
+  if scope_has output-styles; then
+    for rel in "${OUTPUT_STYLE_FILES[@]}"; do
+      src="$REPO/claude/$rel"; dst="$CLAUDE_DIR/$rel"
+      if [ ! -f "$dst" ] || { [ -f "$src" ] && ! cmp -s "$src" "$dst"; }; then
+        printf '%s\n' "$rel"
+      fi
+    done
+  fi
+}
+
+is_path_under() { # <path> <root>
+  local path root
+  path="$(realpath -m "$1")"
+  root="$(realpath -m "$2")"
+  [[ "$path" == "$root" || "$path" == "$root"/* ]]
+}
+
+validate_file_repair_target() { # <rel>
+  local rel="$1" src="$REPO/claude/$1" dst="$CLAUDE_DIR/$1" parent
+  case "$rel" in hooks/*|output-styles/*) ;;
+    *) printf 'unsupported repair target: %s\n' "$rel" >&2; return 1 ;;
+  esac
+  [ -f "$src" ] || { printf 'source file missing: %s\n' "$src" >&2; return 1; }
+  [ ! -L "$src" ] || { printf 'source symlink refused: %s\n' "$src" >&2; return 1; }
+  parent="$(dirname "$dst")"
+  if [ -L "$parent" ]; then
+    printf 'destination parent symlink refused: %s\n' "$parent" >&2; return 1
+  fi
+  if [ -L "$dst" ]; then
+    printf 'destination symlink refused: %s\n' "$dst" >&2; return 1
+  fi
+  case "$rel" in
+    hooks/*) is_path_under "$dst" "$CLAUDE_DIR/hooks" || { printf 'destination escapes hooks dir: %s\n' "$dst" >&2; return 1; } ;;
+    output-styles/*) is_path_under "$dst" "$CLAUDE_DIR/output-styles" || { printf 'destination escapes output-styles dir: %s\n' "$dst" >&2; return 1; } ;;
+  esac
+}
+
+backup_file_repairs() { # <list-file>
+  local list_file="$1" ts archive existing
+  ts="$(date +%Y%m%d-%H%M%S)"
+  archive="$CLAUDE_DIR/backups/ccc-doctor-files-$ts.tar.gz"
+  mkdir -p "$CLAUDE_DIR/backups"
+  existing="$(mktemp)"
+  while IFS= read -r rel; do
+    [ -e "$CLAUDE_DIR/$rel" ] && printf '%s\n' "$rel" >> "$existing"
+  done < "$list_file"
+  if [ -s "$existing" ]; then
+    tar -czf "$archive" -C "$CLAUDE_DIR" -T "$existing"
+  else
+    tar -czf "$archive" -C "$CLAUDE_DIR" --files-from /dev/null --warning=no-file-changed 2>/dev/null || :
+    # GNU tar refuses empty archives on some systems; a manifest still records the guarded apply.
+    printf 'no pre-existing files for scoped repair\n' > "$CLAUDE_DIR/backups/ccc-doctor-files-$ts.manifest.txt"
+  fi
+  rm -f "$existing"
+  printf '%s\n' "$archive"
+}
+
+apply_file_repairs() {
+  local list_file rel archive dst src
+  list_file="$(mktemp)"
+  file_repair_list > "$list_file"
+  if [ ! -s "$list_file" ]; then
+    rm -f "$list_file"
+    return 1
+  fi
+  if [ "$mode" != standalone ]; then
+    rm -f "$list_file"
+    printf 'install mode is %s; refusing scoped file repair to avoid plugin/standalone double-firing.\n' "$mode" >&2
+    return 2
+  fi
+  while IFS= read -r rel; do
+    validate_file_repair_target "$rel" || { rm -f "$list_file"; return 2; }
+  done < "$list_file"
+  archive="$(backup_file_repairs "$list_file")"
+  while IFS= read -r rel; do
+    src="$REPO/claude/$rel"; dst="$CLAUDE_DIR/$rel"
+    mkdir -p "$(dirname "$dst")"
+    cp "$src" "$dst"
+    chmod --reference="$src" "$dst" 2>/dev/null || true
+  done < "$list_file"
+  printf 'applied scoped file repair; backup=%s; repaired=%s\n' "$archive" "$(paste -sd, "$list_file")"
+  rm -f "$list_file"
+}
+
 if [ "$ROLLBACK" = 1 ]; then
   printf '# ccc doctor --rollback\n\n'
   archive="$(latest_rollback_backup || true)"
@@ -267,17 +407,42 @@ if [ "$FIX" = 1 ]; then
     print_report
     exit 1
   fi
-  if settings_needs_repair; then
+
+  settings_needed=0
+  files_needed=0
+  file_repairs_tmp="$(mktemp)"
+  if scope_has settings && settings_needs_repair; then
+    settings_needed=1
+  fi
+  if { scope_has hooks || scope_has output-styles; } && file_repair_list > "$file_repairs_tmp" && [ -s "$file_repairs_tmp" ]; then
+    files_needed=1
+  fi
+
+  if [ "$settings_needed" = 1 ] || [ "$files_needed" = 1 ]; then
     if [ "$APPLY" = 1 ]; then
-      apply_settings_repair
+      if [ "$settings_needed" = 1 ]; then
+        apply_settings_repair || exit 1
+      fi
+      if [ "$files_needed" = 1 ]; then
+        apply_file_repairs || exit 1
+      fi
+      rm -f "$file_repairs_tmp" "${settings_desired_tmp:-}"
       exit 0
     fi
-    rm -f "${settings_desired_tmp:-}"
-    printf 'dry-run: would repair settings.json from canonical repo templates. Re-run with `--fix --apply` to write after backup.\n'
+    [ "$settings_needed" = 1 ] && printf 'dry-run: would repair settings.json from canonical repo templates. Re-run with `--fix --apply` to write after backup.\n'
+    if [ "$files_needed" = 1 ]; then
+      printf 'dry-run: would reinstall scoped files from canonical repo templates: %s. Re-run with `--fix --apply --scope=%s` to write after backup.\n' "$(paste -sd, "$file_repairs_tmp")" "$SCOPE"
+    fi
+    rm -f "$file_repairs_tmp" "${settings_desired_tmp:-}"
     exit 1
   fi
-  rm -f "${settings_desired_tmp:-}"
-  printf 'no repairs needed.\n'
+
+  if { scope_has hooks || scope_has output-styles; } && [ "$APPLY" != 1 ]; then
+    printf 'no scoped file repairs needed.\n'
+  else
+    printf 'no repairs needed.\n'
+  fi
+  rm -f "$file_repairs_tmp" "${settings_desired_tmp:-}"
   exit 0
 fi
 

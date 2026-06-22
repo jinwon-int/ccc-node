@@ -38,10 +38,12 @@ to Telegram, with all secrets and node-local state stripped out and replaced by 
   `outputStyle`. Switch anytime with `/config` → Output style.
 - **Doctor diagnostics** (`scripts/ccc-doctor.sh`, `/doctor`) — harness drift classification for
   settings, hook wiring, output style, status line, and bridge status. `--fix` is dry-run by
-  default; `--fix --apply` currently repairs only deterministic `settings.json` drift after a
-  backup tar. `--rollback` is also dry-run by default, and `--rollback --apply` restores only
-  `settings.json` from the latest doctor backup after creating a pre-rollback backup. Manual/
-  risky/system-level items stay fail-closed.
+  default; `--fix --apply` defaults to scoped `settings.json` repair after a backup tar, while
+  `--fix --apply --scope=files` reinstalls only allowlisted hook/output-style files after a
+  scoped backup and refuses symlinks/path escapes/plugin double-firing risk. `--rollback` is
+  dry-run by default, and `--rollback --apply` restores only `settings.json` from the latest
+  doctor backup after creating a pre-rollback backup. Manual/risky/system-level items stay
+  fail-closed.
 - **Security audit** (`scripts/ccc-security-audit.sh`, `/security-audit`) — read-only,
   metadata-only checks for sensitive file permissions, settings allowlist posture, scanner
   integrity, and push-spool/cache redaction risk. It never prints matched secret text or file
