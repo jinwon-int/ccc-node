@@ -4,6 +4,8 @@
 # Issue #55 incremental slices:
 # - store/list/validate is implemented.
 # - due is a read-only dry-run resolver for schedule/catch-up planning.
+# - lock implements local task-lock acquire/release/probe primitives.
+# - run is a read-only execution-plan preview when called with --dry-run.
 #
 # This script intentionally does not execute prompts, write push spool entries,
 # install timers, mutate lastRunAt, or touch live cron/systemd state.
@@ -24,7 +26,7 @@ while [ $# -gt 0 ]; do
 Usage: agent-cron.sh [list|validate] [--store PATH] [--json]
        agent-cron.sh due [--store PATH] [--at ISO8601] [--json]
        agent-cron.sh lock <task-id> --action acquire|release|probe --run-id ID [--scheduled-at ISO8601] [--at ISO8601] [--json]
-       agent-cron.sh run <task-id>
+       agent-cron.sh run <task-id> --dry-run [--at ISO8601] [--json]
 
 Implemented slices:
 - list/validate: inspect and validate the task definition store.
@@ -32,6 +34,9 @@ Implemented slices:
   catch-up policy, and lock paths, but never executes prompts or writes state.
 - lock: local atomic task-lock acquire/release/probe primitives only. It writes
   lock files under the task store's sibling locks/ directory, but never executes
+  prompts, sends notifications, installs schedulers, or updates task history.
+- run --dry-run: read-only execution-plan preview. It combines due, lock probe,
+  task policy, and headless command metadata, but never acquires locks, executes
   prompts, sends notifications, installs schedulers, or updates task history.
 
 No task execution, Telegram push, scheduler bootstrap, systemd/crontab writes,
@@ -45,15 +50,16 @@ EOF
 done
 
 case "$CMD" in
-  list|validate|due|lock) ;;
-  run|execute|scheduler|install|enable|disable|add|remove)
+  list|validate|due|lock|run) ;;
+  execute|scheduler|install|enable|disable|add|remove)
     echo "agent-cron $CMD is not implemented in this read-only slice; no filesystem changes were made." >&2
     exit 2
     ;;
   *) echo "Unknown command: $CMD" >&2; exit 2 ;;
 esac
 
-export STORE JSON CMD AT
+SCRIPT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+export STORE JSON CMD AT SCRIPT_ROOT
 export EXTRA_ARGS="$*"
 python3 - <<'PY'
 import json
@@ -536,6 +542,118 @@ def due_plan(data):
     return {'ok': not errors, 'store': str(store), 'at': fmt_dt(at), 'mode': 'dry-run-read-only', 'tasks': rows, 'errors': errors}
 
 
+def parse_run_args():
+    args = shlex.split(os.environ.get('EXTRA_ARGS', ''))
+    if not args:
+        raise ValueError('run requires a task id')
+    task_id = args[0]
+    dry_run = False
+    at_value = at_raw
+    local_json = json_out
+    i = 1
+    while i < len(args):
+        a = args[i]
+        if a == '--dry-run':
+            dry_run = True
+        elif a == '--json':
+            local_json = True
+        elif a == '--at':
+            i += 1
+            if i >= len(args):
+                raise ValueError('--at requires a value')
+            at_value = args[i]
+        else:
+            raise ValueError(f'unsupported run argument: {a}')
+        i += 1
+    return task_id, dry_run, at_value, local_json
+
+
+def run_dry_plan(data):
+    try:
+        task_id, dry_run, at_value, as_json = parse_run_args()
+        if not dry_run:
+            return None, as_json, 2
+        task = task_by_id(data, task_id)
+        if not task:
+            return {'ok': False, 'mode': 'run-dry-run-read-only', 'taskId': task_id, 'error': 'task id not found'}, as_json, 1
+        original_at = os.environ.get('AT')
+        os.environ['AT'] = at_value or original_at or ''
+        # Keep due_plan input deterministic without mutating external process state.
+        global at_raw
+        old_at = at_raw
+        at_raw = at_value or at_raw
+        try:
+            plan = due_plan(data)
+        finally:
+            at_raw = old_at
+        row = next((t for t in plan.get('tasks', []) if t.get('id') == task_id), None)
+        if row is None:
+            return {'ok': False, 'mode': 'run-dry-run-read-only', 'taskId': task_id, 'error': 'task id not found in due plan'}, as_json, 1
+        headless_cmd = os.environ.get('CCC_HEADLESS_CMD') or str(Path(os.environ.get('SCRIPT_ROOT', '.')) / 'claude' / 'headless.sh')
+        notify = task.get('notify', 'none')
+        result = {
+            'ok': plan.get('ok', False),
+            'mode': 'run-dry-run-read-only',
+            'store': str(store),
+            'at': plan.get('at'),
+            'taskId': task_id,
+            'due': bool(row.get('due')),
+            'status': row.get('status'),
+            'scheduledAt': row.get('scheduledAt'),
+            'dueCount': row.get('dueCount', 0),
+            'missedRuns': row.get('missedRuns', 0),
+            'lock': {
+                'state': row.get('lockState'),
+                'path': row.get('lockPath'),
+                'holder': row.get('holder'),
+                'probeOnly': True,
+            },
+            'headless': {
+                'command': headless_cmd,
+                'promptBytes': len((task.get('prompt') or '').encode('utf-8')),
+                'permissionMode': task.get('permissionMode') or 'default',
+                'allowedTools': task.get('allowedTools', []),
+                'attachMemory': task.get('attachMemory', []),
+                'attachSkills': task.get('attachSkills', []),
+                'execute': False,
+            },
+            'notification': {
+                'policy': notify,
+                'delivery': 'preview-only' if notify == 'telegram-owner' else 'none',
+                'redactProfile': task.get('redactProfile', 'default'),
+                'send': False,
+            },
+            'mutations': {
+                'lockAcquire': False,
+                'taskStoreWrite': False,
+                'historyAppend': False,
+                'pushSpoolWrite': False,
+                'schedulerInstall': False,
+                'headlessExecute': False,
+            },
+            'errors': plan.get('errors', []),
+        }
+        return result, as_json, 0 if result['ok'] else 1
+    except Exception as e:
+        return {'ok': False, 'mode': 'run-dry-run-read-only', 'taskId': None, 'error': str(e)}, json_out, 1
+
+
+def emit_run(result, as_json):
+    if result is None:
+        print('agent-cron run is not implemented in this read-only slice; pass --dry-run for a no-execution plan preview.', file=sys.stderr)
+        return
+    if as_json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    else:
+        print('# agent-cron run dry-run plan\n')
+        print(f"- task: `{result['taskId']}`")
+        print(f"- at: `{result['at']}`")
+        print(f"- due: `{str(result['due']).lower()}` status=`{result['status']}` scheduledAt=`{result.get('scheduledAt') or ''}`")
+        print(f"- lock: `{result['lock']['state']}` `{result['lock']['path']}` (probe only)")
+        print(f"- headless: `{result['headless']['command']}` (not executed)")
+        print('- mutations: none; no lock acquire, task store write, history append, push spool write, scheduler install, or headless execution')
+
+
 data, errors = load_doc()
 if errors:
     for e in errors:
@@ -545,6 +663,11 @@ if errors:
 if cmd == 'lock':
     result, as_json, rc = lock_command(data)
     emit_lock(result, as_json)
+    sys.exit(rc)
+
+if cmd == 'run':
+    result, as_json, rc = run_dry_plan(data)
+    emit_run(result, as_json)
     sys.exit(rc)
 
 if cmd == 'validate':

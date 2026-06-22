@@ -160,11 +160,25 @@ JSON
 out="$(CCC_AGENT_CRON_STORE="$BAD_SCHED" bash "$CMD" due --json --at 2026-01-01T00:00:00Z 2>&1)"; rc=$?
 ok "due fails closed on unsupported schedule" '[ "$rc" = 1 ] && grep -q "unsupported\|5-field" <<<"$out"'
 
+RUN_STORE="$TMP/run-store/tasks.json"
+mkdir -p "$(dirname "$RUN_STORE")"
+cat > "$RUN_STORE" <<'JSON'
+{"version":1,"tasks":[{"id":"runny","schedule":"* * * * *","prompt":"Summarize safely","enabled":true,"notify":"telegram-owner","allowedTools":["Read","Grep"],"permissionMode":"dontAsk","attachMemory":["MEMORY.md"],"attachSkills":["wiki-record"],"redactProfile":"owner","lastRunAt":"2026-01-01T00:00:00Z","lockTimeoutSec":60}]}
+JSON
 before="$(find "$TMP" -type f -printf '%P %s %T@\n' | sort)"
-out="$(CCC_AGENT_CRON_STORE="$STORE" bash "$CMD" run daily-wiki-prefetch 2>&1)"; rc=$?
+out="$(CCC_AGENT_CRON_STORE="$RUN_STORE" CCC_HEADLESS_CMD="$TMP/fake-headless.sh" bash "$CMD" run runny --dry-run --json --at 2026-01-01T00:01:00Z)"; rc=$?
 after="$(find "$TMP" -type f -printf '%P %s %T@\n' | sort)"
-ok "run is not implemented in current slice" '[ "$rc" = 2 ] && grep -q "not implemented" <<<"$out"'
-ok "run made no filesystem changes" '[ "$before" = "$after" ]'
+ok "run --dry-run emits deterministic execution plan JSON" '[ "$rc" = 0 ] && jq -e ".ok == true and .mode == \"run-dry-run-read-only\" and .taskId == \"runny\" and .due == true and .scheduledAt == \"2026-01-01T00:01:00Z\"" <<<"$out" >/dev/null'
+ok "run --dry-run includes headless and task policy" '[ "$rc" = 0 ] && jq -e ".headless.command == \"$TMP/fake-headless.sh\" and .headless.permissionMode == \"dontAsk\" and (.headless.allowedTools == [\"Read\",\"Grep\"]) and (.headless.attachMemory == [\"MEMORY.md\"]) and (.headless.attachSkills == [\"wiki-record\"])" <<<"$out" >/dev/null'
+ok "run --dry-run previews owner notification without sending" '[ "$rc" = 0 ] && jq -e ".notification.policy == \"telegram-owner\" and .notification.delivery == \"preview-only\" and .notification.redactProfile == \"owner\"" <<<"$out" >/dev/null'
+ok "run --dry-run declares no mutations" '[ "$rc" = 0 ] && jq -e ".mutations.lockAcquire == false and .mutations.taskStoreWrite == false and .mutations.historyAppend == false and .mutations.pushSpoolWrite == false and .mutations.schedulerInstall == false" <<<"$out" >/dev/null'
+ok "run --dry-run made no filesystem changes" '[ "$before" = "$after" ]'
+
+before="$(find "$TMP" -type f -printf '%P %s %T@\n' | sort)"
+out="$(CCC_AGENT_CRON_STORE="$RUN_STORE" bash "$CMD" run runny --json --at 2026-01-01T00:01:00Z 2>&1)"; rc=$?
+after="$(find "$TMP" -type f -printf '%P %s %T@\n' | sort)"
+ok "run without --dry-run is not implemented in current slice" '[ "$rc" = 2 ] && grep -q "not implemented" <<<"$out"'
+ok "run without --dry-run made no filesystem changes" '[ "$before" = "$after" ]'
 
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
