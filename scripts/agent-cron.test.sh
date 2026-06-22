@@ -174,11 +174,54 @@ ok "run --dry-run previews owner notification without sending" '[ "$rc" = 0 ] &&
 ok "run --dry-run declares no mutations" '[ "$rc" = 0 ] && jq -e ".mutations.lockAcquire == false and .mutations.taskStoreWrite == false and .mutations.historyAppend == false and .mutations.pushSpoolWrite == false and .mutations.schedulerInstall == false" <<<"$out" >/dev/null'
 ok "run --dry-run made no filesystem changes" '[ "$before" = "$after" ]'
 
-before="$(find "$TMP" -type f -printf '%P %s %T@\n' | sort)"
-out="$(CCC_AGENT_CRON_STORE="$RUN_STORE" bash "$CMD" run runny --json --at 2026-01-01T00:01:00Z 2>&1)"; rc=$?
-after="$(find "$TMP" -type f -printf '%P %s %T@\n' | sort)"
-ok "run without --dry-run is not implemented in current slice" '[ "$rc" = 2 ] && grep -q "not implemented" <<<"$out"'
-ok "run without --dry-run made no filesystem changes" '[ "$before" = "$after" ]'
+
+EXEC_STORE="$TMP/exec-store/tasks.json"
+mkdir -p "$(dirname "$EXEC_STORE")"
+cat > "$EXEC_STORE" <<'JSON'
+{"version":1,"tasks":[{"id":"exec-success","schedule":"* * * * *","prompt":"Run safely","enabled":true,"notify":"none","allowedTools":["Read","Grep"],"permissionMode":"dontAsk","lastRunAt":"2026-01-01T00:00:00Z","lockTimeoutSec":60},{"id":"exec-fail","schedule":"* * * * *","prompt":"Fail safely","enabled":true,"notify":"none","lastRunAt":"2026-01-01T00:00:00Z","lockTimeoutSec":60},{"id":"exec-disabled","schedule":"* * * * *","prompt":"Disabled","enabled":false,"notify":"none","lastRunAt":"2026-01-01T00:00:00Z","lockTimeoutSec":60},{"id":"exec-not-due","schedule":"0 0 * * *","prompt":"Not due","enabled":true,"notify":"none","lastRunAt":"2026-01-01T00:00:00Z","lockTimeoutSec":60}]}
+JSON
+FAKE_HEADLESS="$TMP/fake-headless-exec.sh"
+cat > "$FAKE_HEADLESS" <<'SH'
+#!/usr/bin/env bash
+set -u
+printf 'prompt=%s
+allowed=%s
+perm=%s
+' "$1" "${CCC_ALLOWED_TOOLS:-}" "${CCC_PERMISSION_MODE:-}" >> "$FAKE_HEADLESS_LOG"
+case "$1" in
+  *Fail*) echo "fake failure" >&2; exit 7 ;;
+  *) echo "fake result for $1" ;;
+esac
+SH
+chmod +x "$FAKE_HEADLESS"
+export FAKE_HEADLESS_LOG="$TMP/fake-headless.log"
+
+out="$(CCC_AGENT_CRON_STORE="$EXEC_STORE" CCC_HEADLESS_CMD="$FAKE_HEADLESS" bash "$CMD" run exec-success --json --at 2026-01-01T00:01:00Z)"; rc=$?
+ok "run executes due task with fake headless" '[ "$rc" = 0 ] && jq -e ".ok == true and .status == \"success\" and .mutations.lockAcquire == true and .mutations.taskStoreWrite == true and .mutations.headlessExecute == true" <<<"$out" >/dev/null'
+ok "run passes prompt and policy to headless" 'grep -q "prompt=Run safely" "$FAKE_HEADLESS_LOG" && grep -q "allowed=Read,Grep" "$FAKE_HEADLESS_LOG" && grep -q "perm=dontAsk" "$FAKE_HEADLESS_LOG"'
+ok "run records last successful state and releases lock" 'jq -e ".tasks[] | select(.id == \"exec-success\" and .lastRunAt == \"2026-01-01T00:01:00Z\" and .lastStatus == \"success\" and (.lastRunId|type == \"string\"))" "$EXEC_STORE" >/dev/null && [ ! -e "$TMP/exec-store/locks/exec-success.lock" ]'
+
+out="$(CCC_AGENT_CRON_STORE="$EXEC_STORE" CCC_HEADLESS_CMD="$FAKE_HEADLESS" bash "$CMD" run exec-fail --json --at 2026-01-01T00:01:00Z 2>&1)"; rc=$?
+ok "run propagates headless failure" '[ "$rc" = 1 ] && jq -e ".ok == false and .status == \"failed\" and .headless.exitCode == 7" <<<"$out" >/dev/null'
+ok "run failure records state and releases lock" 'jq -e ".tasks[] | select(.id == \"exec-fail\" and .lastRunAt == \"2026-01-01T00:01:00Z\" and .lastStatus == \"failed\")" "$EXEC_STORE" >/dev/null && [ ! -e "$TMP/exec-store/locks/exec-fail.lock" ]'
+
+mkdir -p "$TMP/exec-store/locks"
+boot_id="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || true)"
+python3 - "$TMP/exec-store/locks/exec-success.lock" "$boot_id" <<'PY'
+import json, sys
+p=sys.argv[1]
+boot=sys.argv[2]
+open(p,'w',encoding='utf-8').write(json.dumps({"taskId":"exec-success","runId":"other-run","pid":999999,"host":"test","bootId":boot,"acquiredAt":"2026-01-01T00:02:00Z","scheduledAt":"2026-01-01T00:02:00Z"})+chr(10))
+PY
+out="$(CCC_AGENT_CRON_STORE="$EXEC_STORE" CCC_HEADLESS_CMD="$FAKE_HEADLESS" bash "$CMD" run exec-success --json --at 2026-01-01T00:02:00Z 2>&1)"; rc=$?
+ok "run refuses held lock with nonzero exit" '[ "$rc" = 1 ] && jq -e ".ok == false and .status == \"locked\"" <<<"$out" >/dev/null'
+rm -f "$TMP/exec-store/locks/exec-success.lock"
+
+out="$(CCC_AGENT_CRON_STORE="$EXEC_STORE" CCC_HEADLESS_CMD="$FAKE_HEADLESS" bash "$CMD" run exec-disabled --json --at 2026-01-01T00:02:00Z)"; rc=$?
+ok "run skips disabled task without lock" '[ "$rc" = 0 ] && jq -e ".ok == true and .status == \"disabled\" and .mutations.lockAcquire == false" <<<"$out" >/dev/null && [ ! -e "$TMP/exec-store/locks/exec-disabled.lock" ]'
+
+out="$(CCC_AGENT_CRON_STORE="$EXEC_STORE" CCC_HEADLESS_CMD="$FAKE_HEADLESS" bash "$CMD" run exec-not-due --json --at 2026-01-01T00:02:00Z)"; rc=$?
+ok "run skips not-due task without lock" '[ "$rc" = 0 ] && jq -e ".ok == true and .status == \"not-due\" and .mutations.lockAcquire == false" <<<"$out" >/dev/null && [ ! -e "$TMP/exec-store/locks/exec-not-due.lock" ]'
 
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
