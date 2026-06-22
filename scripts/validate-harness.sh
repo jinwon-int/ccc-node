@@ -113,7 +113,7 @@ fi
 # 4) hook tests
 say "== hook tests =="
 for t in claude/hooks/guard.test.sh claude/hooks/observability.test.sh claude/hooks/security-scan.test.sh \
-         claude/hooks/distill-scope.test.sh \
+         claude/hooks/checkpoint.test.sh claude/hooks/distill-scope.test.sh \
          claude/hooks/distill/extract.test.sh claude/hooks/distill/honcho-push.test.sh \
          claude/hooks/distill/queue-drain.test.sh claude/hooks/distill/wiki-queue.test.sh \
          scripts/ccc-doctor.test.sh scripts/ccc-distill-check.test.sh scripts/ccc-security-audit.test.sh scripts/agent-cron.test.sh; do

@@ -12,6 +12,7 @@ LOG="$STATE_DIR/distill.log"
 QUEUE="$STATE_DIR/honcho-queue.jsonl"
 DEAD="$STATE_DIR/honcho-queue.jsonl.dead"
 LAST="$STATE_DIR/distill-last.json"
+CKPT_DIR="$STATE_DIR/checkpoints"
 DISABLED="$STATE_DIR/distill.disabled"
 DRYRUN="$STATE_DIR/distill.dryrun"
 OUTPUT="${1:-text}"
@@ -43,6 +44,18 @@ if [ -f "$LOG" ] && [ -s "$LOG" ]; then
   log_tail="$(tail -5 "$LOG" 2>/dev/null | sed 's/^/  /')"
 fi
 
+# ---- checkpoint freshness ---------------------------------------------------
+checkpoint_snapshots=0
+checkpoint_last="none"
+if [ -d "$CKPT_DIR" ]; then
+  checkpoint_snapshots="$(find "$CKPT_DIR" -maxdepth 1 -type f -name 'working-state-*.md' 2>/dev/null | wc -l | tr -d '[:space:]')"
+  case "$checkpoint_snapshots" in ''|*[!0-9]*) checkpoint_snapshots=0 ;; esac
+  checkpoint_last_path="$(find "$CKPT_DIR" -maxdepth 1 -type f -name 'working-state-*.md' -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-)"
+  if [ -n "$checkpoint_last_path" ] && [ -f "$checkpoint_last_path" ]; then
+    checkpoint_last="$(basename "$checkpoint_last_path") mtime=$(date -u -r "$checkpoint_last_path" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || printf 'unknown')"
+  fi
+fi
+
 # ---- trigger counts (last 14 days) -----------------------------------------
 cutoff="$(date -u -d '14 days ago' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || printf '0000-00-00T00:00:00Z')"
 manual_c=0; sessionend_c=0; precompact_c=0; drain_ok=0; drain_failed=0; drain_drop=0
@@ -50,9 +63,9 @@ if [ -f "$LOG" ] && [ -s "$LOG" ]; then
   manual_c="$(awk -v c="$cutoff" '$1>=c && /start trigger=manual/ {n++} END{print n+0}' "$LOG" 2>/dev/null)"
   sessionend_c="$(awk -v c="$cutoff" '$1>=c && /start trigger=sessionend/ {n++} END{print n+0}' "$LOG" 2>/dev/null)"
   precompact_c="$(awk -v c="$cutoff" '$1>=c && /start trigger=precompact/ {n++} END{print n+0}' "$LOG" 2>/dev/null)"
-  drain_ok="$(awk -v c="$cutoff" '$1>=c && /\[drain\] drained / {n+=0; if(match($0,/ok=([0-9]+)/,m)) n+=m[1]} END{print n+0}' "$LOG" 2>/dev/null)"
-  drain_failed="$(awk -v c="$cutoff" '$1>=c && /\[drain\] drained / {n+=0; if(match($0,/failed=([0-9]+)/,m)) n+=m[1]} END{print n+0}' "$LOG" 2>/dev/null)"
-  drain_drop="$(awk -v c="$cutoff" '$1>=c && /\[drain\] drained / {n+=0; if(match($0,/dropped=([0-9]+)/,m)) n+=m[1]} END{print n+0}' "$LOG" 2>/dev/null)"
+  drain_ok="$(awk -v c="$cutoff" '$1>=c && /\[drain\] drained / {if(match($0,/ok=[0-9]+/)) {n+=substr($0,RSTART+3,RLENGTH-3)}} END{print n+0}' "$LOG" 2>/dev/null)"
+  drain_failed="$(awk -v c="$cutoff" '$1>=c && /\[drain\] drained / {if(match($0,/failed=[0-9]+/)) {n+=substr($0,RSTART+7,RLENGTH-7)}} END{print n+0}' "$LOG" 2>/dev/null)"
+  drain_drop="$(awk -v c="$cutoff" '$1>=c && /\[drain\] drained / {if(match($0,/dropped=[0-9]+/)) {n+=substr($0,RSTART+8,RLENGTH-8)}} END{print n+0}' "$LOG" 2>/dev/null)"
 fi
 
 # ---- Honcho config reachability note ----------------------------------------
@@ -73,6 +86,9 @@ if [ "$OUTPUT" = "--json" ]; then
     --arg state_dir "$STATE_DIR" \
     --arg state_dir_ok "$state_dir_ok" \
     --arg honcho_base "$honcho_base" \
+    --arg ckpt_dir "$CKPT_DIR" \
+    --arg ckpt_last "$checkpoint_last" \
+    --argjson ckpt_snapshots "$checkpoint_snapshots" \
     --argjson queue_lines "$queue_lines" \
     --argjson dead_lines "$dead_lines" \
     --argjson manual "$manual_c" \
@@ -84,6 +100,7 @@ if [ "$OUTPUT" = "--json" ]; then
     '{mode:$mode, last:$last, state_dir:$state_dir, state_dir_ok:$state_dir_ok,
       honcho_base:$honcho_base,
       queue:{lines:$queue_lines, dead:$dead_lines},
+      checkpoint:{dir:$ckpt_dir, snapshots:$ckpt_snapshots, last:$ckpt_last},
       triggers:{manual:$manual, sessionend:$sessionend, precompact:$precompact},
       drain:{ok:$drain_ok, failed:$drain_failed, dropped:$drain_drop}}'
 else
@@ -92,6 +109,7 @@ else
   printf -- '- mode:       `%s`\n' "$MODE"
   printf -- '- last:       %s\n' "$last_summary"
   printf -- '- queue:      %s lines (dead: %s)\n' "$queue_lines" "$dead_lines"
+  printf -- '- checkpoint: %s snapshots (last: %s)\n' "$checkpoint_snapshots" "$checkpoint_last"
   printf -- '- honcho:     %s\n' "$honcho_base"
   printf '\n## triggers (14d)\n\n'
   printf -- '- manual:     %s\n' "$manual_c"
