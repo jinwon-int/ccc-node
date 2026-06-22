@@ -48,5 +48,18 @@ touch "$TMP/state/distill.dryrun"
 out="$(bash "$CHECK" 2>&1)"; rc=$?
 ok "text output exits 0" '[ "$rc" = 0 ]'
 ok "text output shows dry-run" 'grep -q "mode:" <<<"$out" && grep -q "DRY-RUN" <<<"$out"'
+rm -f "$TMP/state/distill.dryrun"
+
+# Regression for #82 fleet rollout: drain counters must work on mawk (Ubuntu
+# default), not just gawk. Earlier gawk-only match($0,/re/,m) zeroed the
+# counters on every mawk node, masking #83/#84 acceptance evidence.
+awk_default="$(awk 'BEGIN{print "ok"}' 2>/dev/null)"
+# Populate two drain lines so the sum path is exercised.
+cat > "$TMP/state/distill.log" <<'LOG'
+2026-06-22T00:00:01Z [drain] drained ok=2 failed=1 dropped=1 processed=4
+2026-06-22T00:00:02Z [drain] drained ok=3 failed=0 dropped=2 processed=5
+LOG
+out="$(bash "$CHECK" --json 2>&1)"; rc=$?
+ok "multi-drain cumulative sum" '[ "$rc" = 0 ] && jq -e ".drain.ok == 5 and .drain.failed == 1 and .drain.dropped == 3" <<<"$out" >/dev/null'
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
