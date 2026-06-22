@@ -131,9 +131,11 @@ guard-bypass pattern for LIVE flip).
 - `claude/hooks/distill/wiki-queue.sh`: appends durable wiki candidates to
   `~/.claude/state/wiki-candidates.md` with title-hash 7-day de-dup; auto-bootstraps the
   queue header on first run. No auto-PR (human-gated per [FW-03]).
-- `claude/settings.base.json` + `claude/hooks/enforcement-overlay.json` +
-  `claude/hooks/hooks.json`: register `distill.sh` on `PreCompact` (after `checkpoint.sh`)
+- `claude/settings.base.json`: registers `distill.sh` on `PreCompact` (after `checkpoint.sh`)
   and `SessionEnd` (after `notify.sh`) for both standalone and plugin install modes.
+- `claude/hooks/enforcement-overlay.json` + `claude/hooks/hooks.json`: register
+  `distill.sh` on `SessionEnd` only. PreCompact is handled exclusively by `settings.base.json`
+  (merged into `~/.claude/settings.json` by `setup.sh`).
 - `claude/settings.base.json` env: `CLAUDE_DISTILL_TIMEOUT="180"` — bigger budget than the
   90 s default for transcripts that exceed Haiku's first-token latency on large sessions.
 - `setup.sh`: copies `claude/hooks/distill.sh` and the `claude/hooks/distill/` directory
