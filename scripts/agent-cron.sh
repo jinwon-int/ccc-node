@@ -66,6 +66,7 @@ at_raw = os.environ.get('AT') or ''
 ALLOWED_NOTIFY = {'none', 'telegram-owner'}
 ALLOWED_PERMISSION = {'dontAsk', 'acceptEdits', 'default', None}
 ALLOWED_CATCH_UP = {'skip', 'once', 'all', None}
+OCCURRENCE_SCAN_LIMIT = 1000
 ID_RX = re.compile(r'^[A-Za-z0-9_.-]{1,96}$')
 CRON_FIELD_RX = re.compile(r'^(\*|\*/[1-9][0-9]*|[0-9]+)(,(\*|\*/[1-9][0-9]*|[0-9]+))*$')
 SHORTHAND = {
@@ -151,6 +152,8 @@ def validate_doc(data):
         for field in ('lastRunAt', 'lastStatus', 'lastRunId'):
             if field in task and task[field] is not None and not isinstance(task[field], str):
                 errors.append(f'{prefix}.{field} must be string or null')
+        if 'redactProfile' in task and task['redactProfile'] is not None and not isinstance(task['redactProfile'], str):
+            errors.append(f'{prefix}.redactProfile must be string or null')
     return errors
 
 
@@ -206,6 +209,8 @@ def parse_schedule(expr):
         'dom': expand_field(parts[2], 1, 31),
         'month': expand_field(parts[3], 1, 12),
         'dow': expand_field(parts[4], 0, 7),
+        'dom_any': parts[2] == '*',
+        'dow_any': parts[4] == '*',
         'expr': expr,
     }
 
@@ -213,24 +218,36 @@ def parse_schedule(expr):
 def cron_matches(dt, spec):
     dow = (dt.weekday() + 1) % 7  # Python Mon=0; cron Sun=0
     dows = spec['dow']
+    dom_match = dt.day in spec['dom']
+    dow_match = dow in dows or (dow == 0 and 7 in dows)
+    # Standard cron semantics: when both day-of-month and day-of-week are
+    # restricted, either field may match. If one is '*', the restricted field
+    # controls the day match.
+    if not spec.get('dom_any') and not spec.get('dow_any'):
+        day_match = dom_match or dow_match
+    else:
+        day_match = dom_match and dow_match
     return (
         dt.minute in spec['minute'] and
         dt.hour in spec['hour'] and
-        dt.day in spec['dom'] and
-        dt.month in spec['month'] and
-        (dow in dows or (dow == 0 and 7 in dows))
+        day_match and
+        dt.month in spec['month']
     )
 
 
-def iter_occurrences(spec, start_exclusive, end_inclusive, cap=1000):
+def iter_occurrences(spec, start_exclusive, end_inclusive, cap=OCCURRENCE_SCAN_LIMIT):
     cur = (start_exclusive + timedelta(minutes=1)).replace(second=0, microsecond=0)
     end = end_inclusive.replace(second=0, microsecond=0)
     out = []
-    while cur <= end and len(out) < cap:
+    truncated = False
+    while cur <= end:
         if cron_matches(cur, spec):
+            if len(out) >= cap:
+                truncated = True
+                break
             out.append(cur)
         cur += timedelta(minutes=1)
-    return out
+    return out, truncated
 
 
 def next_occurrence(spec, after, max_minutes=366 * 24 * 60):
@@ -268,6 +285,7 @@ def normalize(data):
             'catchUpPolicy': t.get('catchUpPolicy', 'skip'),
             'maxCatchup': t.get('maxCatchup', 1),
             'lockTimeoutSec': t.get('lockTimeoutSec', 0),
+            'redactProfile': t.get('redactProfile', 'default'),
             'lastRunAt': t.get('lastRunAt'),
             'lastStatus': t.get('lastStatus'),
             'lastRunId': t.get('lastRunId'),
@@ -277,7 +295,17 @@ def normalize(data):
 
 
 def due_plan(data):
-    at = parse_dt(at_raw, '--at') if at_raw else datetime.now(timezone.utc).replace(second=0, microsecond=0)
+    try:
+        at = parse_dt(at_raw, '--at') if at_raw else datetime.now(timezone.utc).replace(second=0, microsecond=0)
+    except Exception as e:
+        return {
+            'ok': False,
+            'store': str(store),
+            'at': at_raw,
+            'mode': 'dry-run-read-only',
+            'tasks': [],
+            'errors': [str(e)],
+        }
     rows = []
     errors = []
     for idx, task in enumerate(data.get('tasks', [])):
@@ -293,6 +321,8 @@ def due_plan(data):
             'due': False,
             'dueCount': 0,
             'missedRuns': 0,
+            'missedRunsTruncated': False,
+            'occurrenceScanLimit': OCCURRENCE_SCAN_LIMIT,
             'scheduledAt': None,
             'nextDueAt': None,
             'lockPath': str(lock_path(tid or f'task-{idx}')),
@@ -303,8 +333,9 @@ def due_plan(data):
             spec = parse_schedule(task.get('schedule') or '')
             last = parse_dt(task.get('lastRunAt'), f'tasks[{idx}].lastRunAt')
             horizon_start = last or (at - timedelta(days=366))
-            occurrences = iter_occurrences(spec, horizon_start, at)
+            occurrences, truncated = iter_occurrences(spec, horizon_start, at)
             raw_missed = len(occurrences)
+            row['missedRunsTruncated'] = truncated
             policy = task.get('catchUpPolicy', 'skip')
             max_catch = task.get('maxCatchup', 1)
             if task.get('enabled') and raw_missed > 0:
