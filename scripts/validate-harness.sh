@@ -116,7 +116,7 @@ for t in claude/hooks/guard.test.sh claude/hooks/observability.test.sh claude/ho
          claude/hooks/distill-scope.test.sh \
          claude/hooks/distill/extract.test.sh claude/hooks/distill/honcho-push.test.sh \
          claude/hooks/distill/queue-drain.test.sh claude/hooks/distill/wiki-queue.test.sh \
-         scripts/ccc-doctor.test.sh scripts/ccc-security-audit.test.sh scripts/agent-cron.test.sh; do
+         scripts/ccc-doctor.test.sh scripts/ccc-distill-check.test.sh scripts/ccc-security-audit.test.sh scripts/agent-cron.test.sh; do
   [ -f "$t" ] || { err "missing test: $t"; continue; }
   if bash "$t" >/tmp/htest.out 2>&1; then say "  ok $(grep -E 'PASS=' /tmp/htest.out | tail -1) $t";
   else err "test failed: $t"; tail -5 /tmp/htest.out; fi
