@@ -2,6 +2,30 @@
 
 All notable changes to the Claude Code node harness. Dates are KST.
 
+## [0.3.17] — 2026-06-22
+
+Follow-up to 0.3.15 — harden `distill/extract.sh` against Haiku occasionally
+returning prose instead of strict JSON (observed once on a natural `SessionEnd`
+trigger fired from a code-debugging session — fail-open, but worth recovering).
+
+### Fixed
+- `claude/hooks/distill/extract.sh`:
+  - Stronger user-prompt output contract: explicit "first non-whitespace is `{`,
+    last non-whitespace is `}`, no prose, no preamble, no fences" plus an empty
+    schema fallback for trivial sessions.
+  - New `--append-system-prompt` constraint (belt + suspenders) attached to the
+    `claude -p` invocation, restating the strict-JSON contract at system level.
+  - **Two-attempt strategy**: if attempt 1's response fails `jq` validation, the
+    script retries once with an even more emphatic system prompt (`CRITICAL
+    OUTPUT CONTRACT...`) instead of failing immediately. Most Haiku "prose drift"
+    cases recover on this single strict retry.
+  - On final failure, the first 1 KB of each attempt's raw response is logged to
+    `distill.log` for debugging.
+
+Live verified on the dungae node: trigger=manual, attempt 1 produced valid JSON
+(no retry needed), honcho POST returned HTTP 201 with 2 facts, 1 wiki candidate
+queued, pipeline completed in ~80 s.
+
 ## [0.3.16] — 2026-06-22
 
 Follow-up to 0.3.15 — add operator-facing `/distill` skill for manual control of the
