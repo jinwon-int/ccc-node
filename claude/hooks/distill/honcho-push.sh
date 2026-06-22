@@ -7,8 +7,8 @@
 #   body: {messages: [{peer_id, content, metadata}]}
 # Session is ensure-created first (POST .../sessions) — 409 on conflict is fine.
 #
-# Fail-open: on any error, append the payload to ~/.claude/state/honcho-queue.jsonl
-# for next-SessionStart retry (not implemented yet — placeholder for future).
+# Fail-open: on any push/reachability error, append the payload to
+# ~/.claude/state/honcho-queue.jsonl for next-SessionStart retry.
 set -uo pipefail
 
 CFG="${CCC_HONCHO_CFG:-/root/.hermes/honcho.json}"
@@ -42,12 +42,13 @@ if [ "$N" = "0" ]; then
   exit 0
 fi
 
-# Pre-flight Honcho liveness before any push. If Honcho is down, skip cleanly
-# instead of growing the retry queue; distill.sh still runs the local wiki queue.
+# Pre-flight Honcho liveness before any push. If Honcho is down, persist the
+# payload for later SessionStart drain without burning queue-drain retry attempts.
 HEALTH_HTTP="$(curl -sS -m "${CCC_HONCHO_HEALTH_TIMEOUT:-3}" -o /dev/null -w "%{http_code}" "$BASE/health" 2>/dev/null || true)"
 if ! printf '%s' "$HEALTH_HTTP" | grep -Eq '^(200|204)$'; then
-  echo "honcho /health probe failed http=${HEALTH_HTTP:-000} session=$SID facts=$N; skipping push"
-  exit 0
+  printf '%s\n' "$PAYLOAD" >> "$QUEUE" 2>/dev/null || true
+  echo "honcho /health probe failed http=${HEALTH_HTTP:-000} session=$SID facts=$N; queued for retry"
+  exit 1
 fi
 
 # Build a single human-readable message body summarizing the facts.
