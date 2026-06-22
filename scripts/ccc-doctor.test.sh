@@ -85,6 +85,23 @@ out="$(run_doctor "$repair" --fix --apply 2>&1)"; rc=$?
 backup_count_after="$(find "$repair/home/.claude/backups" -name "ccc-doctor-*.tar.gz" | wc -l)"
 ok "--fix --apply is idempotent" '[ "$rc" = 0 ] && [ "$backup_count_before" = "$backup_count_after" ] && grep -q "no repairs needed" <<<"$out"'
 
+before="$(find "$repair" -type f -printf '%P %s %T@\n' | sort)"
+out="$(run_doctor "$repair" --rollback 2>&1)"; rc=$?
+after="$(find "$repair" -type f -printf '%P %s %T@\n' | sort)"
+ok "--rollback defaults to dry-run" '[ "$rc" = 1 ] && grep -q "dry-run" <<<"$out" && grep -q "would restore settings.json" <<<"$out"'
+ok "--rollback dry-run made no filesystem changes" '[ "$before" = "$after" ]'
+
+out="$(run_doctor "$repair" --rollback --apply 2>&1)"; rc=$?
+ok "--rollback --apply restores previous settings" '[ "$rc" = 0 ]'
+ok "--rollback --apply restores previous outputStyle drift" 'jq -e ".outputStyle == \"plain\"" "$repair/home/.claude/settings.json" >/dev/null'
+ok "--rollback --apply restores previous statusLine drift" 'jq -e ".statusLine.command == \"bad-statusline\"" "$repair/home/.claude/settings.json" >/dev/null'
+ok "--rollback --apply restores missing PostCompact" 'jq -e "has(\"hooks\") and (.hooks | has(\"PostCompact\") | not)" "$repair/home/.claude/settings.json" >/dev/null'
+ok "--rollback --apply creates pre-rollback backup" 'find "$repair/home/.claude/backups" -name "ccc-doctor-pre-rollback-*.tar.gz" | grep -q .'
+
+nobackup="$(make_fixture nobackup standalone)"
+out="$(run_doctor "$nobackup" --rollback --apply 2>&1)"; rc=$?
+ok "--rollback --apply fails closed without backup" '[ "$rc" = 1 ] && grep -q "no rollback backup found" <<<"$out"'
+
 manual="$(make_fixture manual standalone)"
 printf '{not-json}\n' > "$manual/home/.claude/settings.json"
 before="$(find "$manual" -type f -printf '%P %s %T@\n' | sort)"

@@ -39,7 +39,9 @@ to Telegram, with all secrets and node-local state stripped out and replaced by 
 - **Doctor diagnostics** (`scripts/ccc-doctor.sh`, `/doctor`) — harness drift classification for
   settings, hook wiring, output style, status line, and bridge status. `--fix` is dry-run by
   default; `--fix --apply` currently repairs only deterministic `settings.json` drift after a
-  backup tar, while manual/risky/system-level items stay fail-closed.
+  backup tar. `--rollback` is also dry-run by default, and `--rollback --apply` restores only
+  `settings.json` from the latest doctor backup after creating a pre-rollback backup. Manual/
+  risky/system-level items stay fail-closed.
 - **Security audit** (`scripts/ccc-security-audit.sh`, `/security-audit`) — read-only,
   metadata-only checks for sensitive file permissions, settings allowlist posture, scanner
   integrity, and push-spool/cache redaction risk. It never prints matched secret text or file
