@@ -17,7 +17,7 @@ Task locks are local primitives for manual run-with-lock execution. Do not acqui
 
 `agent-cron.sh run <task-id> --dry-run --json` is also read-only: it previews due/lock/headless/notification metadata but does not acquire locks, execute prompts, write history, write push spool files, install schedulers, or send messages.
 
-`agent-cron.sh run <task-id> --json` is an explicit manual execution path for due enabled tasks. It acquires/releases the local task lock, invokes `headless.sh`, appends bounded `runHistory`, records `lastRunAt`/`lastStatus`/`lastRunId`, and when `notify=telegram-owner` writes a short redacted owner-only bridge spool file. It still does not directly send Telegram/provider messages, install schedulers, edit crontab/systemd, or touch remotes.
+`agent-cron.sh run <task-id> --json` is an explicit manual execution path for due enabled tasks. It acquires/releases the local task lock, invokes `headless.sh`, appends bounded `runHistory`, records `lastRunAt`/`lastStatus`/`lastRunId`, persists bounded `retryState`/`retryEligibleAt` on failure when `retryPolicy` allows another attempt, clears retry state on success, and when `notify=telegram-owner` writes a short redacted owner-only bridge spool file. It still does not directly send Telegram/provider messages, install schedulers, edit crontab/systemd, or touch remotes.
 
 ## Task
 

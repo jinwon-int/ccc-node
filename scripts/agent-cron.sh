@@ -10,6 +10,8 @@
 #   telegram-owner it writes a redacted owner-only bridge spool entry, but never
 #   calls Telegram/provider APIs directly.
 # - run also appends a bounded runHistory entry for executed tasks.
+# - retryPolicy/retryState expose bounded retry/backoff planning and
+#   retryEligibleAt, but do not install or run a scheduler.
 # - run --dry-run remains a read-only execution-plan preview.
 #
 # This script intentionally does not install timers or touch live cron/systemd
@@ -36,7 +38,8 @@ Usage: agent-cron.sh [list|validate] [--store PATH] [--json]
 Implemented slices:
 - list/validate: inspect and validate the task definition store.
 - due: read-only dry-run schedule resolver. It reports due tasks, missed windows,
-  catch-up policy, and lock paths, but never executes prompts or writes state.
+  catch-up policy, retryEligibleAt state, and lock paths, but never executes
+  prompts or writes state.
 - lock: local atomic task-lock acquire/release/probe primitives only. It writes
   lock files under the task store's sibling locks/ directory, but never executes
   prompts, sends notifications, installs schedulers, or updates task history.
@@ -46,7 +49,8 @@ Implemented slices:
 - run: explicit manual execution for due enabled tasks. It acquires the task lock,
   invokes ccc-headless, records lastRunAt/lastStatus/lastRunId, writes a
   redacted owner-only bridge spool entry when notify=telegram-owner, appends a
-  bounded runHistory entry, and releases the lock in all normal failure/success
+  bounded runHistory entry, records retryState/retryEligibleAt on failure, clears
+  retryState on success, and releases the lock in all normal failure/success
   paths. It still does not call Telegram
   or provider APIs, install schedulers, mutate crontab/systemd, or touch remotes.
 
@@ -200,6 +204,34 @@ def validate_doc(data):
         for field in ('lastRunAt', 'lastStatus', 'lastRunId'):
             if field in task and task[field] is not None and not isinstance(task[field], str):
                 errors.append(f'{prefix}.{field} must be string or null')
+        retry_policy = task.get('retryPolicy')
+        if retry_policy is not None:
+            if not isinstance(retry_policy, dict):
+                errors.append(f'{prefix}.retryPolicy must be an object')
+            else:
+                for field, default, low, high in (
+                    ('maxAttempts', 1, 1, 10),
+                    ('backoffSec', 60, 0, 86400),
+                    ('backoffMultiplier', 2, 1, 10),
+                    ('maxBackoffSec', 3600, 0, 86400),
+                ):
+                    value = retry_policy.get(field, default)
+                    if not isinstance(value, int) or value < low or value > high:
+                        errors.append(f'{prefix}.retryPolicy.{field} must be an integer from {low} to {high}')
+        retry_state = task.get('retryState')
+        if retry_state is not None:
+            if not isinstance(retry_state, dict):
+                errors.append(f'{prefix}.retryState must be an object')
+            else:
+                for field in ('scheduledAt', 'lastStatus'):
+                    if not isinstance(retry_state.get(field), str) or not retry_state.get(field):
+                        errors.append(f'{prefix}.retryState.{field} must be a non-empty string')
+                if not isinstance(retry_state.get('attempt'), int) or retry_state.get('attempt') < 1:
+                    errors.append(f'{prefix}.retryState.attempt must be a positive integer')
+                if 'retryEligibleAt' in retry_state and retry_state['retryEligibleAt'] is not None and not isinstance(retry_state['retryEligibleAt'], str):
+                    errors.append(f'{prefix}.retryState.retryEligibleAt must be string or null')
+                if 'lastRunId' in retry_state and retry_state['lastRunId'] is not None and not isinstance(retry_state['lastRunId'], str):
+                    errors.append(f'{prefix}.retryState.lastRunId must be string or null')
         if 'redactProfile' in task and task['redactProfile'] is not None and not isinstance(task['redactProfile'], str):
             errors.append(f'{prefix}.redactProfile must be string or null')
     return errors
@@ -261,6 +293,89 @@ def parse_schedule(expr):
         'dow_any': parts[4] == '*',
         'expr': expr,
     }
+
+
+
+def retry_policy(task):
+    raw = task.get('retryPolicy') if isinstance(task, dict) else None
+    if not isinstance(raw, dict):
+        raw = {}
+    max_attempts = raw.get('maxAttempts', 1)
+    backoff_sec = raw.get('backoffSec', 60)
+    multiplier = raw.get('backoffMultiplier', 2)
+    max_backoff = raw.get('maxBackoffSec', 3600)
+    def clamp_int(value, default, low, high):
+        return value if isinstance(value, int) and low <= value <= high else default
+    return {
+        'maxAttempts': clamp_int(max_attempts, 1, 1, 10),
+        'backoffSec': clamp_int(backoff_sec, 60, 0, 86400),
+        'backoffMultiplier': clamp_int(multiplier, 2, 1, 10),
+        'maxBackoffSec': clamp_int(max_backoff, 3600, 0, 86400),
+    }
+
+
+def retry_delay(policy, attempt):
+    attempt_index = max(0, int(attempt or 1) - 1)
+    delay = policy['backoffSec'] * (policy['backoffMultiplier'] ** attempt_index)
+    return min(delay, policy['maxBackoffSec'])
+
+
+def retry_view(task, at):
+    state = task.get('retryState') if isinstance(task, dict) else None
+    if not isinstance(state, dict):
+        return None
+    policy = retry_policy(task)
+    attempt = state.get('attempt')
+    if not isinstance(attempt, int) or attempt < 1:
+        return None
+    eligible_raw = state.get('retryEligibleAt')
+    eligible = None
+    if eligible_raw:
+        try:
+            eligible = parse_dt(eligible_raw, 'retryEligibleAt')
+        except Exception:
+            return {'state': state, 'policy': policy, 'valid': False, 'error': 'invalid retryEligibleAt'}
+    ready = bool(eligible is not None and eligible <= at and attempt < policy['maxAttempts'])
+    waiting = bool(eligible is not None and eligible > at and attempt < policy['maxAttempts'])
+    exhausted = bool(attempt >= policy['maxAttempts'] or eligible is None)
+    return {
+        'state': state,
+        'policy': policy,
+        'valid': True,
+        'retryEligibleAt': fmt_dt(eligible),
+        'retryAttempt': attempt + 1 if ready else attempt,
+        'ready': ready,
+        'waiting': waiting,
+        'exhausted': exhausted,
+    }
+
+
+def apply_retry_transition(task, scheduled_at, attempt, run_id, status, at):
+    if status == 'success':
+        existed = 'retryState' in task
+        task.pop('retryState', None)
+        return {'cleared': existed, 'attempt': attempt, 'retryEligibleAt': None, 'exhausted': False}
+    policy = retry_policy(task)
+    if attempt >= policy['maxAttempts']:
+        task['retryState'] = {
+            'scheduledAt': scheduled_at,
+            'attempt': attempt,
+            'retryEligibleAt': None,
+            'lastStatus': 'exhausted',
+            'lastRunId': run_id,
+        }
+        return {'cleared': False, 'attempt': attempt, 'retryEligibleAt': None, 'exhausted': True, 'policy': policy}
+    delay = retry_delay(policy, attempt)
+    eligible = at + timedelta(seconds=delay)
+    eligible = eligible.replace(second=0, microsecond=0)
+    task['retryState'] = {
+        'scheduledAt': scheduled_at,
+        'attempt': attempt,
+        'retryEligibleAt': fmt_dt(eligible),
+        'lastStatus': status,
+        'lastRunId': run_id,
+    }
+    return {'cleared': False, 'attempt': attempt, 'retryEligibleAt': fmt_dt(eligible), 'exhausted': False, 'policy': policy}
 
 
 def cron_matches(dt, spec):
@@ -508,6 +623,8 @@ def normalize(data):
             'lastStatus': t.get('lastStatus'),
             'lastRunId': t.get('lastRunId'),
             'runHistoryCount': len(t.get('runHistory', [])) if isinstance(t.get('runHistory', []), list) else 0,
+            'retryPolicy': t.get('retryPolicy'),
+            'retryState': t.get('retryState'),
         })
     out['tasks'].sort(key=lambda x: x['id'] or '')
     return out
@@ -538,6 +655,8 @@ def due_plan(data):
             'catchUpPolicy': task.get('catchUpPolicy', 'skip'),
             'maxCatchup': task.get('maxCatchup', 1),
             'lastRunAt': task.get('lastRunAt'),
+            'retryEligibleAt': None,
+            'retryAttempt': None,
             'due': False,
             'dueCount': 0,
             'missedRuns': 0,
@@ -575,6 +694,26 @@ def due_plan(data):
                     row['status'] = 'stale-lock'
                 else:
                     row['status'] = 'due'
+            retry = retry_view(task, at)
+            if retry:
+                row['retryEligibleAt'] = retry.get('retryEligibleAt')
+                row['retryAttempt'] = retry.get('retryAttempt')
+                if not retry.get('valid', True):
+                    row['retryError'] = retry.get('error')
+                elif task.get('enabled') and not row['due']:
+                    if retry.get('ready'):
+                        row['due'] = True
+                        row['dueCount'] = 1
+                        row['scheduledAt'] = retry['state'].get('scheduledAt')
+                        row['status'] = 'retry-due'
+                        if row['lockState'] == 'held':
+                            row['status'] = 'locked'
+                        elif row['lockState'] == 'stale':
+                            row['status'] = 'stale-lock'
+                    elif retry.get('waiting'):
+                        row['status'] = 'retry-wait'
+                    elif retry.get('exhausted'):
+                        row['status'] = 'retry-exhausted'
             row['nextDueAt'] = fmt_dt(next_occurrence(spec, at))
         except Exception as e:
             row['status'] = 'invalid-schedule'
@@ -704,6 +843,9 @@ def write_doc(data):
 
 def history_attempt(task, scheduled_at):
     attempts = 0
+    retry_state = task.get('retryState') if isinstance(task, dict) else None
+    if isinstance(retry_state, dict) and retry_state.get('scheduledAt') == scheduled_at:
+        attempts = max(attempts, int(retry_state.get('attempt') or 0))
     history = task.get('runHistory', [])
     if isinstance(history, list):
         for item in history:
@@ -941,6 +1083,7 @@ def run_execute(data, task_id, at_value, as_json):
         notify_state = notification.get('delivery') or 'none'
         if task.get('notify', 'none') == 'none':
             notify_state = 'none'
+        attempt = history_attempt(task, scheduled_at)
         entry = {
             'runId': run_id,
             'scheduledAt': scheduled_at,
@@ -948,10 +1091,11 @@ def run_execute(data, task_id, at_value, as_json):
             'finishedAt': fmt_dt(at),
             'status': status,
             'exitCode': headless.get('exitCode') if isinstance(headless, dict) else None,
-            'attempt': history_attempt(task, scheduled_at),
+            'attempt': attempt,
             'notifyState': notify_state,
         }
         append_run_history(task, entry)
+        retry = apply_retry_transition(task, scheduled_at, attempt, run_id, status, at)
         task['lastRunAt'] = scheduled_at
         task['lastStatus'] = status
         task['lastRunId'] = run_id
@@ -966,6 +1110,7 @@ def run_execute(data, task_id, at_value, as_json):
         'lock': {'state': lock.get('state'), 'path': lock.get('path'), 'release': release},
         'headless': headless or headless_metadata(task, execute=True),
         'notification': notification,
+        'retry': retry,
         'mutations': mutation_flags(True, headless is not None, headless is not None, notification.get('delivery') == 'spooled', True),
     }
     if not release.get('ok'):
