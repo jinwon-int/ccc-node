@@ -66,7 +66,7 @@ PROMPT="$(cat <<'EOF'
 You are a memory-distillation pass for a Claude Code node.
 You will receive a redacted slice of a session transcript between USER (Seo Jin On / 서진원) and ASSISTANT (dungae, a Hermes Team2 worker).
 
-Extract two kinds of items and return STRICT JSON only — no prose, no markdown fences.
+Extract two kinds of items and return STRICT JSON only.
 
 Schema:
 {
@@ -99,9 +99,19 @@ wiki_candidates criteria (durable, public-safe wiki page material):
   - if nothing durable came up this session, return [].
 
 Return [] for either array if nothing qualifies. NEVER invent items.
-If the transcript is mostly small talk or trivial Q&A, return {"honcho": [], "wiki_candidates": []}.
+If the transcript is mostly small talk, code debugging, or trivial Q&A, return {"honcho": [], "wiki_candidates": []}.
+
+OUTPUT CONTRACT — READ TWICE:
+- Your ENTIRE response MUST be a single JSON object.
+- First non-whitespace character MUST be `{`. Last non-whitespace character MUST be `}`.
+- NO prose before. NO prose after. NO numbered list. NO bullet analysis. NO "Here is the result:" preamble.
+- NO markdown code fences (no triple backticks, no `json` tag). The harness will still strip fences as a safety net, but do not emit them.
+- If you have nothing to extract, emit exactly: {"honcho":[],"wiki_candidates":[]}
 EOF
 )"
+
+# System-prompt-level constraint (belt + suspenders with the user-prompt instruction).
+SYSTEM_CONSTRAINT='Output strict JSON only. The entire response is a single JSON object starting with { and ending with }. No prose, no preamble, no analysis, no markdown fences. If nothing qualifies, return {"honcho":[],"wiki_candidates":[]}.'
 
 INPUT="$(printf '%s\n\n--- transcript (session=%s trigger=%s) ---\n%s\n' \
   "$PROMPT" "$SESSION_ID" "$TRIGGER" "$REDACTED")"
@@ -109,28 +119,58 @@ INPUT="$(printf '%s\n\n--- transcript (session=%s trigger=%s) ---\n%s\n' \
 # ---- step 5: call `claude -p` (OAuth via parent process) -------------------
 # CLAUDE_DISTILL_INFLIGHT=1 is already exported by distill.sh so the child's
 # SessionStart/PreCompact/etc. hooks short-circuit.
-RESULT="$(printf '%s' "$INPUT" | timeout "$TIMEOUT" claude -p \
-  --model "$MODEL" \
-  --no-session-persistence \
-  --output-format text \
-  2>/dev/null)"
+#
+# Two-attempt strategy:
+#   attempt 1 — full input + system constraint.
+#   attempt 2 (only if attempt 1's response is not parseable JSON) — same input,
+#              but with an even more emphatic system prompt prepended. Most
+#              Haiku "prose drift" failures recover on a single strict retry.
+
+call_claude() {
+  local sys="$1"
+  printf '%s' "$INPUT" | timeout "$TIMEOUT" claude -p \
+    --model "$MODEL" \
+    --no-session-persistence \
+    --output-format text \
+    --append-system-prompt "$sys" \
+    2>/dev/null
+}
+
+try_parse() {
+  # Strip possible markdown fences (```json … ```). The rest should be valid JSON.
+  printf '%s' "$1" | sed -E '/^[[:space:]]*```/d'
+}
+
+RESULT="$(call_claude "$SYSTEM_CONSTRAINT")"
 ec=$?
 
 if [ $ec -ne 0 ] || [ -z "$RESULT" ]; then
-  echo "claude -p failed (ec=$ec) or empty result" >&2
+  echo "claude -p attempt 1 failed (ec=$ec) or empty result" >&2
   exit 1
 fi
 
-# Strip possible markdown fences (```json … ```). The rest should be valid JSON.
-# (The earlier awk-range trick failed for nested objects — first inner `}` cut it short.)
-CLEAN="$(printf '%s' "$RESULT" | sed -E '/^[[:space:]]*```/d')"
+CLEAN="$(try_parse "$RESULT")"
 
-# Validate JSON.
+# Validate JSON. If it fails, do ONE retry with a stricter system prompt.
 if ! printf '%s' "$CLEAN" | jq -e '.honcho and .wiki_candidates' >/dev/null 2>&1; then
-  echo "invalid json from claude -p" >&2
-  echo "--- raw ---" >&2
-  printf '%s\n' "$RESULT" | head -c 2000 >&2
-  exit 1
+  echo "attempt 1 produced non-JSON; retrying with stricter system prompt" >&2
+  STRICT='CRITICAL OUTPUT CONTRACT. Your entire response MUST be exactly one JSON object and nothing else. The very first character is { and the very last character is }. No prose. No code fences. No "Here is the JSON". If you have nothing to extract, output exactly: {"honcho":[],"wiki_candidates":[]}'
+  RESULT2="$(call_claude "$STRICT")"
+  ec2=$?
+  if [ $ec2 -ne 0 ] || [ -z "$RESULT2" ]; then
+    echo "claude -p attempt 2 failed (ec=$ec2) or empty result" >&2
+    echo "--- attempt 1 raw (head 1KB) ---" >&2
+    printf '%s\n' "$RESULT" | head -c 1024 >&2
+    exit 1
+  fi
+  CLEAN="$(try_parse "$RESULT2")"
+  if ! printf '%s' "$CLEAN" | jq -e '.honcho and .wiki_candidates' >/dev/null 2>&1; then
+    echo "attempt 2 also produced non-JSON; giving up" >&2
+    echo "--- attempt 2 raw (head 1KB) ---" >&2
+    printf '%s\n' "$RESULT2" | head -c 1024 >&2
+    exit 1
+  fi
+  echo "recovered on retry" >&2
 fi
 
 # Tag with metadata for downstream consumers.
