@@ -141,7 +141,20 @@ HOOKDIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)" || HOOKD
 
   # Stash extracted JSON for debugging + sub-script consumption.
   STASH="$STATE_DIR/distill-last.json"
+  STASH_DIR="$STATE_DIR/distill-history"
+  HISTORY_KEEP="${CCC_DISTILL_HISTORY_KEEP:-20}"
+  case "$HISTORY_KEEP" in ''|*[!0-9]*) HISTORY_KEEP=20 ;; esac
+  if [ -f "$STASH" ]; then
+    mkdir -p "$STASH_DIR" 2>/dev/null
+    cp -p "$STASH" "$STASH_DIR/$(date -u +%Y%m%d-%H%M%S)-${BASHPID:-$$}.json" 2>/dev/null || true
+  fi
   printf '%s' "$EXTRACT_OUT" > "$STASH" 2>/dev/null
+  if [ "$HISTORY_KEEP" -gt 0 ]; then
+    find "$STASH_DIR" -maxdepth 1 -type f -name '*.json' -printf '%T@ %p\n' 2>/dev/null \
+      | sort -rn \
+      | awk -v keep="$HISTORY_KEEP" 'NR > keep { sub(/^[^ ]+ /, ""); print }' \
+      | xargs -r rm -- 2>/dev/null || true
+  fi
 
   if [ "$DRYRUN" = "1" ]; then
     log "dry-run skipping honcho/wiki push (see $STASH)"

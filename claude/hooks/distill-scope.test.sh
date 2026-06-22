@@ -61,7 +61,15 @@ mkdir -p "$TMP/bin"
 cat > "$TMP/bin/claude" <<'SH'
 #!/usr/bin/env bash
 cat >/dev/null
-printf '{"honcho":[],"wiki_candidates":[]}'
+if [ -n "${CLAUDE_STUB_COUNTER:-}" ]; then
+  n=0
+  [ -f "$CLAUDE_STUB_COUNTER" ] && n="$(cat "$CLAUDE_STUB_COUNTER" 2>/dev/null || printf 0)"
+  n=$((n + 1))
+  printf '%s' "$n" > "$CLAUDE_STUB_COUNTER"
+  printf '{"session_id":"sess-%s","honcho":[],"wiki_candidates":[]}' "$n"
+else
+  printf '{"honcho":[],"wiki_candidates":[]}'
+fi
 SH
 chmod +x "$TMP/bin/claude"
 PATH="$TMP/bin:$PATH"
@@ -77,6 +85,28 @@ for _ in $(seq 1 25); do
 done
 ok "three real turns exit 0" '[ "$rc" = 0 ]'
 ok "three real turns pass turn gate and spawn" 'grep -q "spawned bg" "$STATE/distill.log" && grep -q "dry-run skipping honcho/wiki push" "$STATE/distill.log"'
+
+: > "$STATE/distill.log"
+rm -rf "$STATE/distill-history"
+rm -f "$STATE/distill-last.json"
+export CLAUDE_STUB_COUNTER="$TMP/claude-counter"
+: > "$CLAUDE_STUB_COUNTER"
+for r in 1 2 3 4; do
+  TRANS_RING="$TMP/projects/-root--openclaw-workspace/sess-ring-$r.jsonl"
+  make_transcript "$TRANS_RING" 3 "user"
+  out="$(payload_other "sess-ring-$r" "$TRANS_RING" "/root/.openclaw/workspace" \
+    | CCC_STATE_DIR="$STATE" CCC_DISTILL_HISTORY_KEEP=2 CCC_DISTILL_SCOPE_CWDS="/root/.openclaw/workspace" bash "$DISTILL" sessionend 2>&1)"; rc=$?
+  ok "ring run $r exits 0" '[ "$rc" = 0 ]'
+  for _ in $(seq 1 25); do
+    jq -e --arg sid "sess-ring-$r" '.session_id == $sid' "$STATE/distill-last.json" >/dev/null 2>&1 && break
+    sleep 0.1
+  done
+  : > "$STATE/distill.log"
+done
+hist_count="$(find "$STATE/distill-history" -maxdepth 1 -type f -name '*.json' 2>/dev/null | wc -l | tr -d '[:space:]')"
+ok "distill history keep cap is enforced" '[ "$hist_count" = 2 ]'
+ok "latest distill-last survives" 'jq -e ".session_id == \"sess-ring-4\"" "$STATE/distill-last.json" >/dev/null'
+ok "old snapshots survive future runs" 'find "$STATE/distill-history" -maxdepth 1 -type f -name "*.json" -print0 | xargs -0 -r grep -h "sess-ring-" | grep -Eq "sess-ring-[23]"'
 
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
