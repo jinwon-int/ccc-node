@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Tests for agent-cron store/list/due slices — no execution, no push, no scheduler.
+# Tests for agent-cron store/list/due/scheduler-dry-run slices.
+# No timer install, direct provider send, live task execution, or remote mutation.
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 CMD="$ROOT/scripts/agent-cron.sh"
@@ -167,6 +168,25 @@ ok "due reports stale lock using lockTimeoutSec" '[ "$rc" = 0 ] && jq -e ".tasks
 
 out="$(CCC_AGENT_CRON_STORE="$LOCK_STORE" bash "$CMD" lock locky --action acquire --run-id run-3 --at 2026-01-01T00:02:00Z --json)"; rc=$?
 ok "lock acquire reclaims stale lock" '[ "$rc" = 0 ] && jq -e ".ok == true and .lockState == \"acquired\" and .reclaimedStale == true and .runId == \"run-3\"" <<<"$out" >/dev/null && jq -e ".runId == \"run-3\"" "$TMP/lock-store/locks/locky.lock" >/dev/null'
+
+SCHED_STORE="$TMP/scheduler-store/tasks.json"
+mkdir -p "$(dirname "$SCHED_STORE")"
+cat > "$SCHED_STORE" <<'JSON'
+{"version":1,"tasks":[{"id":"sched-due","schedule":"* * * * *","prompt":"Run me","enabled":true,"notify":"none","lastRunAt":"2026-01-01T00:00:00Z","lockTimeoutSec":60},{"id":"sched-retry","schedule":"0 0 * * *","prompt":"Retry me","enabled":true,"notify":"none","lastRunAt":"2026-01-01T00:00:00Z","retryPolicy":{"maxAttempts":3,"backoffSec":60},"retryState":{"scheduledAt":"2026-01-01T00:00:00Z","attempt":1,"retryEligibleAt":"2026-01-01T00:02:00Z","lastStatus":"failed","lastRunId":"r1"}},{"id":"sched-disabled","schedule":"* * * * *","prompt":"No","enabled":false,"notify":"none","lastRunAt":"2026-01-01T00:00:00Z"},{"id":"sched-locked","schedule":"* * * * *","prompt":"Locked","enabled":true,"notify":"none","lastRunAt":"2026-01-01T00:00:00Z","lockTimeoutSec":600}]}
+JSON
+mkdir -p "$TMP/scheduler-store/locks"
+cat > "$TMP/scheduler-store/locks/sched-locked.lock" <<'JSON'
+{"taskId":"sched-locked","runId":"held","pid":999999,"host":"test","bootId":"","acquiredAt":"2026-01-01T00:04:00Z","scheduledAt":"2026-01-01T00:04:00Z"}
+JSON
+before="$(find "$TMP/scheduler-store" -type f -printf '%P %s %T@\n' | sort)"
+out="$(CCC_AGENT_CRON_STORE="$SCHED_STORE" bash "$CMD" scheduler --dry-run --json --at 2026-01-01T00:05:00Z)"; rc=$?
+after="$(find "$TMP/scheduler-store" -type f -printf '%P %s %T@\n' | sort)"
+ok "scheduler --dry-run emits read-only plan" '[ "$rc" = 0 ] && jq -e ".ok == true and .mode == \"scheduler-dry-run-read-only\" and .mutations.lockAcquire == false and .mutations.taskStoreWrite == false and .mutations.headlessExecute == false" <<<"$out" >/dev/null'
+ok "scheduler --dry-run plans due and retry-due actions" 'jq -e ".actions[] | select(.taskId == \"sched-due\" and .action == \"would-run\" and .status == \"due\")" <<<"$out" >/dev/null && jq -e ".actions[] | select(.taskId == \"sched-retry\" and .action == \"would-run\" and .status == \"retry-due\" and .retryAttempt == 2)" <<<"$out" >/dev/null'
+ok "scheduler --dry-run skips disabled and locked tasks" 'jq -e ".actions[] | select(.taskId == \"sched-disabled\" and .action == \"skip\" and .reason == \"disabled\")" <<<"$out" >/dev/null && jq -e ".actions[] | select(.taskId == \"sched-locked\" and .action == \"skip\" and .reason == \"locked\")" <<<"$out" >/dev/null'
+ok "scheduler --dry-run made no filesystem changes" '[ "$before" = "$after" ]'
+out="$(CCC_AGENT_CRON_STORE="$SCHED_STORE" bash "$CMD" scheduler --json --at 2026-01-01T00:05:00Z 2>&1)"; rc=$?
+ok "scheduler without --dry-run is blocked" '[ "$rc" = 2 ] && grep -q "requires --dry-run" <<<"$out"'
 
 BAD_SCHED="$TMP/bad-schedule.json"
 cat > "$BAD_SCHED" <<'JSON'
