@@ -15,7 +15,7 @@ export CCC_STATE_DIR="$TMP/state"
 export CCC_HONCHO_CFG="$TMP/honcho.json"
 out="$(bash "$CHECK" --json 2>&1)"; rc=$?
 ok "empty state exits 0" '[ "$rc" = 0 ]'
-ok "empty state reports live mode" 'jq -e ".mode == \"LIVE\" and .queue.lines == 0 and .triggers.precompact == 0" <<<"$out" >/dev/null'
+ok "empty state reports live mode" 'jq -e ".mode == \"LIVE\" and .queue.lines == 0 and .checkpoint.snapshots == 0 and .triggers.precompact == 0" <<<"$out" >/dev/null'
 ok "empty state reports honcho base without network" 'jq -e ".honcho_base == \"http://honcho.example\"" <<<"$out" >/dev/null'
 cat > "$TMP/state/distill.log" <<'LOG'
 2026-06-20T00:00:00Z start trigger=manual dryrun=0 pid=1
@@ -34,10 +34,16 @@ JSONL
 cat > "$TMP/state/distill-last.json" <<'JSON'
 {"session_id":"s1","trigger":"precompact","distilled_at":"2026-06-22T00:00:01Z","honcho":[{"text":"x"}],"wiki_candidates":[{"title":"w"}]}
 JSON
+mkdir -p "$TMP/state/checkpoints"
+printf 'older\n' > "$TMP/state/checkpoints/working-state-20260621_000000.md"
+printf 'newer\n' > "$TMP/state/checkpoints/working-state-20260622_000000.md"
+touch -t 202606210000 "$TMP/state/checkpoints/working-state-20260621_000000.md"
+touch -t 202606220000 "$TMP/state/checkpoints/working-state-20260622_000000.md"
 out="$(bash "$CHECK" --json 2>&1)"; rc=$?
 ok "populated state exits 0" '[ "$rc" = 0 ]'
 ok "populated counts queue/dead" 'jq -e ".queue.lines == 2 and .queue.dead == 1" <<<"$out" >/dev/null'
 ok "populated counts triggers" 'jq -e ".triggers.manual == 1 and .triggers.sessionend == 1 and .triggers.precompact == 1" <<<"$out" >/dev/null'
+ok "populated reports checkpoints" 'jq -e ".checkpoint.snapshots == 2 and (.checkpoint.last | contains(\"working-state-20260622_000000.md\"))" <<<"$out" >/dev/null'
 ok "populated counts drain" 'jq -e ".drain.ok == 2 and .drain.failed == 1 and .drain.dropped == 1" <<<"$out" >/dev/null'
 ok "populated reports last summary" 'jq -e ".last | contains(\"session=s1\") and contains(\"trigger=precompact\")" <<<"$out" >/dev/null'
 touch "$TMP/state/distill.disabled"
