@@ -6,11 +6,13 @@
 # - due is a read-only dry-run resolver for schedule/catch-up planning.
 # - lock implements local task-lock acquire/release/probe primitives.
 # - run is an explicit manual execution path with lock acquire/release and
-#   task-store lastRunAt/lastStatus/lastRunId updates.
+#   task-store lastRunAt/lastStatus/lastRunId updates. When notify is
+#   telegram-owner it writes a redacted owner-only bridge spool entry, but never
+#   calls Telegram/provider APIs directly.
 # - run --dry-run remains a read-only execution-plan preview.
 #
-# This script intentionally does not write push spool entries, install timers,
-# or touch live cron/systemd state.
+# This script intentionally does not install timers or touch live cron/systemd
+# state.
 set -uo pipefail
 
 STORE="${CCC_AGENT_CRON_STORE:-$HOME/.claude/state/agent-cron/tasks.json}"
@@ -41,12 +43,13 @@ Implemented slices:
   task policy, and headless command metadata, but never acquires locks, executes
   prompts, sends notifications, installs schedulers, or updates task history.
 - run: explicit manual execution for due enabled tasks. It acquires the task lock,
-  invokes ccc-headless, records lastRunAt/lastStatus/lastRunId, and releases the
-  lock in all normal failure/success paths. It still does not send Telegram
-  notifications, install schedulers, mutate crontab/systemd, or touch remotes.
+  invokes ccc-headless, records lastRunAt/lastStatus/lastRunId, writes a
+  redacted owner-only bridge spool entry when notify=telegram-owner, and releases
+  the lock in all normal failure/success paths. It still does not call Telegram
+  or provider APIs, install schedulers, mutate crontab/systemd, or touch remotes.
 
-No Telegram push, scheduler bootstrap, systemd/crontab writes, provider sends,
-or remote-node actions are performed.
+No direct Telegram/API send, scheduler bootstrap, systemd/crontab writes,
+provider sends, or remote-node actions are performed.
 EOF
       exit 0
       ;;
@@ -650,12 +653,12 @@ def headless_metadata(task, execute):
     }
 
 
-def mutation_flags(lock_acquire, task_write, headless_execute):
+def mutation_flags(lock_acquire, task_write, headless_execute, push_spool_write=False):
     return {
         'lockAcquire': bool(lock_acquire),
         'taskStoreWrite': bool(task_write),
         'historyAppend': False,
-        'pushSpoolWrite': False,
+        'pushSpoolWrite': bool(push_spool_write),
         'schedulerInstall': False,
         'headlessExecute': bool(headless_execute),
     }
@@ -742,6 +745,100 @@ def run_headless(task):
     }
 
 
+def push_spool_dir():
+    raw = (
+        os.environ.get('CCC_AGENT_CRON_PUSH_SPOOL') or
+        os.environ.get('CCC_PUSH_SPOOL') or
+        str(Path.home() / '.claude' / 'state' / 'telegram-spool')
+    )
+    return Path(raw).expanduser()
+
+
+def safe_name(value):
+    return re.sub(r'[^A-Za-z0-9_.-]+', '-', str(value or 'unknown'))[:120] or 'unknown'
+
+
+def redact_for_owner(text, limit=1200):
+    text = short_text(text or '', limit)
+    # Mask common secret-bearing assignments and bearer headers first, then long
+    # token-shaped runs. Keep this conservative: the spool is operator-visible.
+    patterns = [
+        (r'(?i)(bearer\s+)[A-Za-z0-9._~+/=-]{8,}', r'\1[REDACTED]'),
+        (r'(?i)\b(token|secret|password|passwd|api[_-]?key|authorization)\s*[:=]\s*[^\s,;]+', r'\1=[REDACTED]'),
+        (r'\b(ghp|gho|ghu|ghs|github_pat|sk|xox[baprs])-?[A-Za-z0-9_./+=-]{8,}', r'[REDACTED]'),
+        (r'[A-Za-z0-9_./+=-]{24,}', r'[REDACTED]'),
+    ]
+    for rx, repl in patterns:
+        text = re.sub(rx, repl, text)
+    return text
+
+
+def notification_base(task):
+    notify = task.get('notify', 'none')
+    return {
+        'policy': notify,
+        'send': False,
+        'delivery': 'none' if notify == 'none' else 'not-attempted',
+        'redactProfile': task.get('redactProfile', 'default'),
+    }
+
+
+def build_owner_text(task_id, run_id, scheduled_at, status, headless):
+    stdout = redact_for_owner((headless or {}).get('stdout', ''), 900).strip()
+    stderr = redact_for_owner((headless or {}).get('stderr', ''), 900).strip()
+    lines = [
+        f"agent-cron task {task_id} finished with status={status}",
+        f"scheduledAt={scheduled_at or ''}",
+        f"runId={run_id}",
+        f"exitCode={(headless or {}).get('exitCode', '')}",
+    ]
+    if stdout:
+        lines.append('stdout: ' + stdout.replace('\n', ' ')[:900])
+    if stderr:
+        lines.append('stderr: ' + stderr.replace('\n', ' ')[:900])
+    return '\n'.join(lines)
+
+
+def write_owner_spool(task, task_id, run_id, scheduled_at, status, headless, at):
+    base = notification_base(task)
+    if task.get('notify', 'none') != 'telegram-owner':
+        return base
+    spool = push_spool_dir()
+    text = build_owner_text(task_id, run_id, scheduled_at, status, headless)
+    ts = fmt_dt(at) or datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace('+00:00', 'Z')
+    payload = {
+        'version': 1,
+        'ts': ts,
+        'event': 'AgentCronRun',
+        'node': socket.gethostname(),
+        'text': text,
+        'dedup': f'agent-cron:{task_id}:{run_id}:{status}',
+        'recipient': 'owner',
+        'taskId': task_id,
+        'runId': run_id,
+        'scheduledAt': scheduled_at,
+        'status': status,
+        'redactProfile': task.get('redactProfile', 'default'),
+        'redacted': True,
+        'send': False,
+        'delivery': 'spooled',
+    }
+    try:
+        spool.mkdir(parents=True, exist_ok=True)
+        name = f"{safe_name(ts)}-{safe_name(task_id)}-{safe_name(run_id)}.json"
+        path = spool / name
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        fd = os.open(str(path), flags, 0o600)
+        try:
+            os.write(fd, (json.dumps(payload, ensure_ascii=False, sort_keys=True) + '\n').encode('utf-8'))
+        finally:
+            os.close(fd)
+        payload['path'] = str(path)
+        return {**base, 'delivery': 'spooled', 'redacted': True, 'spoolPath': str(path)}
+    except Exception as e:
+        return {**base, 'delivery': 'spool-error', 'redacted': True, 'error': short_text(str(e), 600)}
+
+
 def run_execute(data, task_id, at_value, as_json):
     task = task_by_id(data, task_id)
     if not task:
@@ -756,7 +853,7 @@ def run_execute(data, task_id, at_value, as_json):
         'taskId': task_id,
         'scheduledAt': row.get('scheduledAt'),
         'due': bool(row.get('due')),
-        'notification': {'policy': task.get('notify', 'none'), 'send': False, 'delivery': 'not-implemented'},
+        'notification': notification_base(task),
     }
     if not task.get('enabled'):
         return {**base, 'ok': True, 'status': 'disabled', 'mutations': mutation_flags(False, False, False)}, as_json, 0
@@ -770,6 +867,7 @@ def run_execute(data, task_id, at_value, as_json):
         return {**base, 'ok': False, 'status': 'locked' if lock.get('state') in {'held','stale'} else lock.get('state','lock-error'), 'runId': run_id, 'lock': lock, 'mutations': mutation_flags(False, False, False)}, as_json, 1
     headless = None
     release = {'ok': False, 'state': 'not-attempted'}
+    notification = notification_base(task)
     status = 'failed'
     ok = False
     rc = 1
@@ -793,6 +891,7 @@ def run_execute(data, task_id, at_value, as_json):
         task['lastStatus'] = status
         task['lastRunId'] = run_id
         write_doc(data)
+        notification = write_owner_spool(task, task_id, run_id, scheduled_at, status, headless, at)
     finally:
         release = release_for_run(task_id, run_id)
     result = {
@@ -802,7 +901,8 @@ def run_execute(data, task_id, at_value, as_json):
         'runId': run_id,
         'lock': {'state': lock.get('state'), 'path': lock.get('path'), 'release': release},
         'headless': headless or headless_metadata(task, execute=True),
-        'mutations': mutation_flags(True, headless is not None, headless is not None),
+        'notification': notification,
+        'mutations': mutation_flags(True, headless is not None, headless is not None, notification.get('delivery') == 'spooled'),
     }
     if not release.get('ok'):
         result['ok'] = False
