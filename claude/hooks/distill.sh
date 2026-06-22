@@ -106,9 +106,16 @@ if ! scope_allows_project "$PROJECT_ENC" "$SOURCE_CWD"; then
 fi
 
 # ---- min-content gate (skip trivial sessions) ------------------------------
-LINES="$(wc -l < "$TRANSCRIPT_PATH" 2>/dev/null || echo 0)"
-if [ "$LINES" -lt 6 ]; then
-  log "skip reason=too-few-lines lines=$LINES"
+MIN_TURNS="${CCC_DISTILL_MIN_TURNS:-3}"
+TURN_WINDOW="${CCC_DISTILL_TURN_WINDOW:-400}"
+TURNS="$(tail -n "$TURN_WINDOW" "$TRANSCRIPT_PATH" 2>/dev/null \
+  | jq -r 'select(.type == "user" or .type == "assistant") | .type' 2>/dev/null \
+  | wc -l | tr -d '[:space:]')"
+case "$MIN_TURNS" in ''|*[!0-9]*) MIN_TURNS=3 ;; esac
+case "$TURN_WINDOW" in ''|*[!0-9]*) TURN_WINDOW=400 ;; esac
+case "$TURNS" in ''|*[!0-9]*) TURNS=0 ;; esac
+if [ "$TURNS" -lt "$MIN_TURNS" ]; then
+  log "skip reason=too-few-turns turns=$TURNS min_turns=$MIN_TURNS"
   exit 0
 fi
 

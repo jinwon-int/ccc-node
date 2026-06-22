@@ -10,11 +10,11 @@ trap 'rm -rf "$TMP"' EXIT
 ok() { if eval "$2"; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $1"; fi; }
 
 make_transcript() {
-  local path="$1" lines="${2:-6}"
+  local path="$1" lines="${2:-6}" type="${3:-user}"
   mkdir -p "$(dirname "$path")"
   : > "$path"
   for i in $(seq 1 "$lines"); do
-    printf '{"type":"user","message":{"content":"turn %s"}}\n' "$i" >> "$path"
+    printf '{"type":"%s","message":{"content":"turn %s"}}\n' "$type" "$i" >> "$path"
   done
 }
 
@@ -40,14 +40,43 @@ make_transcript "$TRANS_ALLOWED" 2
 out="$(payload_other sess-allowed "$TRANS_ALLOWED" "/root/.openclaw/workspace" \
   | CCC_STATE_DIR="$STATE" CCC_DISTILL_SCOPE_CWDS="/root/.openclaw/workspace" bash "$DISTILL" sessionend 2>&1)"; rc=$?
 ok "scope exact cwd match exits 0" '[ "$rc" = 0 ]'
-ok "scope exact cwd match reaches min-content gate" 'grep -q "skip reason=too-few-lines" "$STATE/distill.log" && ! grep -q "cwd-out-of-scope" "$STATE/distill.log"'
+ok "scope exact cwd match reaches turn-count gate" 'grep -q "skip reason=too-few-turns turns=2" "$STATE/distill.log" && ! grep -q "cwd-out-of-scope" "$STATE/distill.log"'
 
 : > "$STATE/distill.log"
 printf '%s\n' '-root--openclaw-workspace' > "$STATE/distill.scope"
 out="$(jq -nc --arg sid sess-encoded --arg tp "$TRANS_ALLOWED" '{session_id:$sid, transcript_path:$tp}' \
   | CCC_STATE_DIR="$STATE" bash "$DISTILL" sessionend 2>&1)"; rc=$?
 ok "encoded project scope file match exits 0" '[ "$rc" = 0 ]'
-ok "encoded project scope file match reaches min-content gate" 'grep -q "source_cwd=encoded:-root--openclaw-workspace" "$STATE/distill.log" && grep -q "skip reason=too-few-lines" "$STATE/distill.log" && ! grep -q "cwd-out-of-scope" "$STATE/distill.log"'
+ok "encoded project scope file match reaches turn-count gate" 'grep -q "source_cwd=encoded:-root--openclaw-workspace" "$STATE/distill.log" && grep -q "skip reason=too-few-turns turns=2" "$STATE/distill.log" && ! grep -q "cwd-out-of-scope" "$STATE/distill.log"'
+
+: > "$STATE/distill.log"
+TRANS_STRUCTURAL="$TMP/projects/-root--openclaw-workspace/sess-structural.jsonl"
+make_transcript "$TRANS_STRUCTURAL" 8 "queue-operation"
+out="$(payload_other sess-structural "$TRANS_STRUCTURAL" "/root/.openclaw/workspace" \
+  | CCC_STATE_DIR="$STATE" CCC_DISTILL_SCOPE_CWDS="/root/.openclaw/workspace" bash "$DISTILL" sessionend 2>&1)"; rc=$?
+ok "structural-only transcript exits 0" '[ "$rc" = 0 ]'
+ok "structural-only transcript is skipped by turn gate" 'grep -q "skip reason=too-few-turns turns=0" "$STATE/distill.log" && ! grep -q "spawned bg" "$STATE/distill.log"'
+
+mkdir -p "$TMP/bin"
+cat > "$TMP/bin/claude" <<'SH'
+#!/usr/bin/env bash
+cat >/dev/null
+printf '{"honcho":[],"wiki_candidates":[]}'
+SH
+chmod +x "$TMP/bin/claude"
+PATH="$TMP/bin:$PATH"
+touch "$STATE/distill.dryrun"
+: > "$STATE/distill.log"
+TRANS_REAL="$TMP/projects/-root--openclaw-workspace/sess-real.jsonl"
+make_transcript "$TRANS_REAL" 3 "user"
+out="$(payload_other sess-real "$TRANS_REAL" "/root/.openclaw/workspace" \
+  | CCC_STATE_DIR="$STATE" CCC_DISTILL_SCOPE_CWDS="/root/.openclaw/workspace" bash "$DISTILL" sessionend 2>&1)"; rc=$?
+for _ in $(seq 1 25); do
+  grep -q "dry-run skipping honcho/wiki push" "$STATE/distill.log" && break
+  sleep 0.1
+done
+ok "three real turns exit 0" '[ "$rc" = 0 ]'
+ok "three real turns pass turn gate and spawn" 'grep -q "spawned bg" "$STATE/distill.log" && grep -q "dry-run skipping honcho/wiki push" "$STATE/distill.log"'
 
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
