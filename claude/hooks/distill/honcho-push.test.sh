@@ -15,6 +15,10 @@ cat > "$TMP/bin/curl" <<'SH'
 set -uo pipefail
 printf '%s\n' "$*" >> "${CURL_STUB_LOG:?}"
 http="${CURL_STUB_HTTP:-201}"
+if [ -n "${CURL_STUB_BODY_DIR:-}" ] && [[ "$*" == *"--data-binary @-"* ]]; then
+  mkdir -p "$CURL_STUB_BODY_DIR"
+  cat > "$CURL_STUB_BODY_DIR/message.json"
+fi
 # honcho-push has two curl calls: ensure-session uses -w "ensure-session...";
 # message POST uses -w "\n__HTTP__%{http_code}__" and captures the body.
 case "$*" in
@@ -26,6 +30,7 @@ SH
 chmod +x "$TMP/bin/curl"
 export PATH="$TMP/bin:$PATH"
 export CURL_STUB_LOG="$TMP/curl.log"
+export CURL_STUB_BODY_DIR="$TMP/bodies"
 
 CFG="$TMP/honcho.json"
 cat > "$CFG" <<'JSON'
@@ -34,7 +39,7 @@ JSON
 export CCC_HONCHO_CFG="$CFG"
 export CCC_STATE_DIR="$TMP/state"
 
-PAYLOAD_WITH_FACTS='{"session_id":"sess-1","trigger":"manual","distilled_at":"2026-01-01T00:00:00Z","honcho":[{"kind":"context","text":"fact one","subject":"session"}],"wiki_candidates":[]}'
+PAYLOAD_WITH_FACTS='{"session_id":"sess-1","trigger":"manual","distilled_at":"2026-01-01T00:00:00Z","source_cwd":"/root/project-a","source_project":"-root-project-a","honcho":[{"kind":"context","text":"fact one","subject":"session"}],"wiki_candidates":[]}'
 PAYLOAD_NO_FACTS='{"session_id":"sess-empty","trigger":"manual","honcho":[],"wiki_candidates":[]}'
 
 out="$(printf '%s' "$PAYLOAD_WITH_FACTS" | CURL_STUB_HTTP=201 bash "$PUSH" 2>&1)"; rc=$?
@@ -42,6 +47,7 @@ ok "success exits 0" '[ "$rc" = 0 ]'
 ok "success reports pushed fact count" 'grep -q "honcho push ok http=201 session=sess-1 facts=1" <<<"$out"'
 ok "success does not create retry queue" '[ ! -s "$TMP/state/honcho-queue.jsonl" ]'
 ok "success called ensure-session and messages endpoints" 'grep -q "/v3/workspaces/test-ws/sessions" "$CURL_STUB_LOG" && grep -q "/v3/workspaces/test-ws/sessions/sess-1/messages" "$CURL_STUB_LOG"'
+ok "success message metadata includes source cwd" 'jq -e ".messages[0].metadata.source_cwd == \"/root/project-a\" and .messages[0].metadata.source_project == \"-root-project-a\"" "$CURL_STUB_BODY_DIR/message.json" >/dev/null'
 ok "auth token is passed only as header argument to curl stub, not stdout" '! grep -q "secret-token" <<<"$out"'
 
 : > "$CURL_STUB_LOG"

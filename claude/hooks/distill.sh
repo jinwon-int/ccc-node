@@ -41,17 +41,46 @@ DRYRUN=0
 ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 log() { printf '%s %s\n' "$(ts)" "$*" >> "$LOG" 2>/dev/null; }
 
+encode_project_dir() { printf '%s' "$1" | sed -E 's|[^A-Za-z0-9_]|-|g'; }
+legacy_project_dir() { printf '%s' "$1" | sed 's|/|-|g'; }
+
+scope_values() {
+  [ -n "${CCC_DISTILL_SCOPE_CWDS:-}" ] && printf '%s\n' "$CCC_DISTILL_SCOPE_CWDS" | tr ',:' '\n'
+  [ -f "$STATE_DIR/distill.scope" ] && cat "$STATE_DIR/distill.scope"
+}
+
+scope_allows_project() {
+  local project="$1" cwd="$2" raw val enc legacy any=0
+  while IFS= read -r raw; do
+    val="$(printf '%s' "$raw" | sed -E 's/#.*$//; s/^[[:space:]]+//; s/[[:space:]]+$//')"
+    [ -z "$val" ] && continue
+    any=1
+    [ "$val" = "$cwd" ] && return 0
+    [ "$val" = "$project" ] && return 0
+    enc="$(encode_project_dir "$val")"
+    legacy="$(legacy_project_dir "$val")"
+    [ "$project" = "$enc" ] && return 0
+    [ "$project" = "$legacy" ] && return 0
+  done < <(scope_values)
+  [ "$any" = "0" ] && return 0
+  return 1
+}
+
 log "start trigger=$TRIGGER dryrun=$DRYRUN pid=$$"
 
 # ---- read hook stdin payload (PreCompact/SessionEnd give JSON, manual = empty)
 HOOK_INPUT="$(cat 2>/dev/null || true)"
 SESSION_ID="$(printf '%s' "$HOOK_INPUT" | jq -r '.session_id // empty' 2>/dev/null)"
 TRANSCRIPT_PATH="$(printf '%s' "$HOOK_INPUT" | jq -r '.transcript_path // empty' 2>/dev/null)"
+SOURCE_CWD="$(printf '%s' "$HOOK_INPUT" | jq -r '.cwd // .workspace.current_dir // .workspace.cwd // empty' 2>/dev/null)"
+PROJECT_ENC=""
 
 # Fallback: find the most-recent transcript jsonl for cwd-encoded project dir.
 if [ -z "$TRANSCRIPT_PATH" ] || [ ! -f "$TRANSCRIPT_PATH" ]; then
-  PROJ_ENC="$(printf '%s' "${PWD:-/root}" | sed 's|/|-|g')"
-  TRANSCRIPT_PATH="$(ls -t "/root/.claude/projects/$PROJ_ENC"/*.jsonl 2>/dev/null | head -1)"
+  for PROJ_ENC in "$(encode_project_dir "${PWD:-/root}")" "$(legacy_project_dir "${PWD:-/root}")"; do
+    TRANSCRIPT_PATH="$(ls -t "/root/.claude/projects/$PROJ_ENC"/*.jsonl 2>/dev/null | head -1)"
+    [ -n "$TRANSCRIPT_PATH" ] && [ -f "$TRANSCRIPT_PATH" ] && break
+  done
 fi
 
 if [ -z "$TRANSCRIPT_PATH" ] || [ ! -f "$TRANSCRIPT_PATH" ]; then
@@ -59,8 +88,22 @@ if [ -z "$TRANSCRIPT_PATH" ] || [ ! -f "$TRANSCRIPT_PATH" ]; then
   exit 0
 fi
 
+PROJECT_ENC="$(basename "$(dirname "$TRANSCRIPT_PATH")")"
+if [ -z "$SOURCE_CWD" ]; then
+  if [ "$PROJECT_ENC" = "$(encode_project_dir "${PWD:-/root}")" ] || [ "$PROJECT_ENC" = "$(legacy_project_dir "${PWD:-/root}")" ]; then
+    SOURCE_CWD="${PWD:-/root}"
+  else
+    SOURCE_CWD="encoded:$PROJECT_ENC"
+  fi
+fi
+
 [ -z "$SESSION_ID" ] && SESSION_ID="$(basename "$TRANSCRIPT_PATH" .jsonl)"
-log "transcript=$TRANSCRIPT_PATH session=$SESSION_ID"
+log "transcript=$TRANSCRIPT_PATH session=$SESSION_ID source_cwd=$SOURCE_CWD source_project=$PROJECT_ENC"
+
+if ! scope_allows_project "$PROJECT_ENC" "$SOURCE_CWD"; then
+  log "skip reason=cwd-out-of-scope cwd=$SOURCE_CWD project=$PROJECT_ENC"
+  exit 0
+fi
 
 # ---- min-content gate (skip trivial sessions) ------------------------------
 LINES="$(wc -l < "$TRANSCRIPT_PATH" 2>/dev/null || echo 0)"
@@ -78,6 +121,8 @@ HOOKDIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)" || HOOKD
   export CLAUDE_DISTILL_TRIGGER="$TRIGGER"
   export CLAUDE_DISTILL_SESSION="$SESSION_ID"
   export CLAUDE_DISTILL_TRANSCRIPT="$TRANSCRIPT_PATH"
+  export CLAUDE_DISTILL_SOURCE_CWD="$SOURCE_CWD"
+  export CLAUDE_DISTILL_SOURCE_PROJECT="$PROJECT_ENC"
   export CLAUDE_DISTILL_DRYRUN="$DRYRUN"
 
   EXTRACT_OUT="$(bash "$HOOKDIR/distill/extract.sh" 2>>"$LOG")"

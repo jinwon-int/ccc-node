@@ -18,6 +18,8 @@ MAX_TURNS="${CLAUDE_DISTILL_MAX_TURNS:-80}"
 MAX_BYTES="${CLAUDE_DISTILL_MAX_BYTES:-60000}"
 MODEL="${CLAUDE_DISTILL_MODEL:-haiku}"
 TIMEOUT="${CLAUDE_DISTILL_TIMEOUT:-90}"
+SOURCE_CWD="${CLAUDE_DISTILL_SOURCE_CWD:-}"
+SOURCE_PROJECT="${CLAUDE_DISTILL_SOURCE_PROJECT:-}"
 
 [ -f "$TRANSCRIPT" ] || { echo "no transcript: $TRANSCRIPT" >&2; exit 1; }
 
@@ -207,4 +209,6 @@ printf '%s' "$CLEAN" | jq -c \
   --arg sid "$SESSION_ID" \
   --arg trg "$TRIGGER" \
   --arg ts  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-  '. + {session_id:$sid, trigger:$trg, distilled_at:$ts}'
+  --arg source_cwd "$SOURCE_CWD" \
+  --arg source_project "$SOURCE_PROJECT" \
+  '. + {session_id:$sid, trigger:$trg, distilled_at:$ts, source_cwd:$source_cwd, source_project:$source_project}'

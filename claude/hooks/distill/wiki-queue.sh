@@ -41,6 +41,8 @@ fi
 
 SID="$(printf '%s' "$PAYLOAD" | jq -r '.session_id // "unknown"')"
 TRG="$(printf '%s' "$PAYLOAD" | jq -r '.trigger // "manual"')"
+SOURCE_CWD="$(printf '%s' "$PAYLOAD" | jq -r '.source_cwd // empty')"
+SOURCE_PROJECT="$(printf '%s' "$PAYLOAD" | jq -r '.source_project // empty')"
 TS_LOG="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 DATE="$(date -u +%Y-%m-%d)"
 
@@ -87,6 +89,8 @@ for i in $(seq 0 $((LEN - 1))); do
     printf -- '- suggested-path: `%s`\n' "$PATH_S"
     printf -- '- proposed-id: TM-?? (assign at PR time)\n'
     printf -- '- source-session: `%s` (trigger=%s)\n' "$SID" "$TRG"
+    [ -n "$SOURCE_CWD" ] && printf -- '- source-cwd: `%s`\n' "$SOURCE_CWD"
+    [ -n "$SOURCE_PROJECT" ] && printf -- '- source-project: `%s`\n' "$SOURCE_PROJECT"
     printf -- '- distilled-at: %s\n' "$TS_LOG"
     printf -- '- status: pending\n'
     printf -- '- summary: %s\n' "$SUMMARY"

@@ -32,6 +32,8 @@ PAYLOAD="$(cat 2>/dev/null)"
 SID="$(printf '%s' "$PAYLOAD" | jq -r '.session_id // "unknown"')"
 TRG="$(printf '%s' "$PAYLOAD" | jq -r '.trigger // "manual"')"
 TS="$(printf '%s' "$PAYLOAD" | jq -r '.distilled_at // empty')"
+SOURCE_CWD="$(printf '%s' "$PAYLOAD" | jq -r '.source_cwd // empty')"
+SOURCE_PROJECT="$(printf '%s' "$PAYLOAD" | jq -r '.source_project // empty')"
 HONCHO_FACTS="$(printf '%s' "$PAYLOAD" | jq -c '.honcho // []')"
 N="$(printf '%s' "$HONCHO_FACTS" | jq 'length')"
 
@@ -62,7 +64,8 @@ curl -sS -m 8 -o /dev/null -w "ensure-session http=%{http_code}\n" \
   -H "Content-Type: application/json" \
   "${AUTH[@]}" \
   --data "$(jq -nc --arg id "$SID" --arg ai "$AI_PEER" \
-    '{id:$id, metadata:{source:"claude-code-distill", node:"dungae"}}')" \
+    --arg source_cwd "$SOURCE_CWD" --arg source_project "$SOURCE_PROJECT" \
+    '{id:$id, metadata:{source:"claude-code-distill", node:"dungae", source_cwd:$source_cwd, source_project:$source_project}}')" \
   2>&1 || true
 
 # --- Step B: POST the distilled message.
@@ -71,12 +74,15 @@ RESP="$(jq -nc \
   --arg content "$CONTENT" \
   --argjson facts "$HONCHO_FACTS" \
   --arg sid "$SID" --arg trg "$TRG" --arg ts "$TS" \
+  --arg source_cwd "$SOURCE_CWD" --arg source_project "$SOURCE_PROJECT" \
   '{messages:[{peer_id:$peer, content:$content,
                metadata:{source:"claude-code-distill",
                          node:"dungae",
                          claude_session:$sid,
                          trigger:$trg,
                          distilled_at:$ts,
+                         source_cwd:$source_cwd,
+                         source_project:$source_project,
                          facts:$facts}}]}' \
   | curl -sS -m 10 -w "\n__HTTP__%{http_code}__" \
     -X POST "$BASE/v3/workspaces/$WS/sessions/$SID/messages" \
