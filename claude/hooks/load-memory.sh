@@ -40,7 +40,7 @@ mem="$(scan_injection_block built-in-memory "$mem")"
 wiki="$(scan_injection_block family-wiki-cache "$wiki")"
 honcho="$(scan_injection_block honcho-cache "$honcho")"
 
-node_label="${CCC_NODE:-$(cat /root/.claude/state/node.txt 2>/dev/null || hostname -s 2>/dev/null || printf 'ccc-node')}"
+node_label="${CCC_NODE:-$(cat ${CCC_STATE_DIR:-/root/.claude/state}/node.txt 2>/dev/null || hostname -s 2>/dev/null || printf 'ccc-node')}"
 
 ctx="# ${node_label} session memory (auto-injected: $EVENT)
 
