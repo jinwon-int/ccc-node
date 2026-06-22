@@ -23,6 +23,13 @@ WS="$(jq -r '.workspace // "seoyoon-family"' "$CFG" 2>/dev/null)"
 AI_PEER="$(jq -r '.hosts.hermes.aiPeer // .aiPeer // "dungae"' "$CFG" 2>/dev/null)"
 TOKEN="$(jq -r '.authToken // .apiKey // empty' "$CFG" 2>/dev/null)"
 
+# Originating node label for metadata traceability — matches the pattern used
+# by load-memory.sh / notify.sh / statusline.sh so fleet rollout doesn't tag
+# every distilled message with the origin node's name.
+NODE="${CCC_NODE:-}"
+[ -z "$NODE" ] && [ -r "$STATE_DIR/node.txt" ] && NODE="$(head -1 "$STATE_DIR/node.txt" 2>/dev/null)"
+[ -z "$NODE" ] && NODE="$(hostname -s 2>/dev/null || echo ccc-node)"
+
 [ -n "$BASE" ] || { echo "no baseUrl"; exit 0; }
 
 PAYLOAD="$(cat 2>/dev/null)"
@@ -71,21 +78,22 @@ curl -sS -m 8 -o /dev/null -w "ensure-session http=%{http_code}\n" \
   -X POST "$BASE/v3/workspaces/$WS/sessions" \
   -H "Content-Type: application/json" \
   "${AUTH[@]}" \
-  --data "$(jq -nc --arg id "$SID" --arg ai "$AI_PEER" \
+  --data "$(jq -nc --arg id "$SID" --arg ai "$AI_PEER" --arg node "$NODE" \
     --arg source_cwd "$SOURCE_CWD" --arg source_project "$SOURCE_PROJECT" \
-    '{id:$id, metadata:{source:"claude-code-distill", node:"dungae", source_cwd:$source_cwd, source_project:$source_project}}')" \
+    '{id:$id, metadata:{source:"claude-code-distill", node:$node, source_cwd:$source_cwd, source_project:$source_project}}')" \
   2>&1 || true
 
 # --- Step B: POST the distilled message.
 RESP="$(jq -nc \
   --arg peer "$AI_PEER" \
+  --arg node "$NODE" \
   --arg content "$CONTENT" \
   --argjson facts "$HONCHO_FACTS" \
   --arg sid "$SID" --arg trg "$TRG" --arg ts "$TS" \
   --arg source_cwd "$SOURCE_CWD" --arg source_project "$SOURCE_PROJECT" \
   '{messages:[{peer_id:$peer, content:$content,
                metadata:{source:"claude-code-distill",
-                         node:"dungae",
+                         node:$node,
                          claude_session:$sid,
                          trigger:$trg,
                          distilled_at:$ts,

@@ -2,6 +2,67 @@
 
 All notable changes to the Claude Code node harness. Dates are KST.
 
+## [0.3.19] — 2026-06-22
+
+Fleet-readiness follow-up to 0.3.18 — addresses #82 (meta-tracker for fleet rollout)
+and adds hermetic coverage for #83 (queue-drain outage logic).
+
+### Fixed
+- `claude/hooks/distill/honcho-push.sh`, `claude/hooks/distill/queue-drain.sh`:
+  `metadata.node` no longer hardcoded to `"dungae"`. Resolves to
+  `${CCC_NODE:-$(head -1 $STATE_DIR/node.txt 2>/dev/null) || $(hostname -s 2>/dev/null || echo ccc-node)}`,
+  matching the pattern already used by `load-memory.sh` / `notify.sh` /
+  `statusline.sh` so fleet rollout doesn't tag every distilled message with
+  the origin node's name. `AI_PEER` (Honcho peer id) still defaults to
+  `"dungae"` because it's a separate concept driven by `~/.hermes/honcho.json`
+  `hosts.hermes.aiPeer`.
+
+### Added
+- `claude/hooks/distill/queue-drain.test.sh`: 49-case hermetic test
+  (curl-stubbed, no Honcho/network calls) covering every documented branch:
+  empty queue, missing queue file, no honcho.cfg, `distill.disabled` off-switch,
+  `/health` probe skip (no retry burn on outage), full-success drain, full-failure
+  retry with `_attempts` increment, partial drain (1 success + 1 fail with
+  attempts→3 cap), dead-letter move to `honcho-queue.jsonl.dead`,
+  empty-facts drop, `MAX_BATCH` cap preserving overflow, auth-token isolation
+  from stdout/queue, and node-label resolution via `CCC_NODE` / `node.txt` /
+  hostname. Substitutes for the "real Honcho outage" exercise in #83, which
+  requires mutating `~/.hermes/honcho.json` (forbidden by current A2A approval
+  scope) — when live verification is approved separately this hermetic suite
+  still applies as a regression guard.
+
+### Changed
+- `claude/hooks/distill/honcho-push.test.sh`: 4 new assertions covering node
+  resolution: `metadata.node` defaults to `node.txt` value when no `CCC_NODE`,
+  `CCC_NODE` overrides `node.txt`, and the explicit per-node value (e.g.
+  `seoseo`, `gwakga`) is reflected in the message body.
+
+### Notes
+- Issue #82 still tracks per-node rollout (`seoseo` / `gwakga` / `bangtong` /
+  `sogyo` / `gongyung` / `nosuk` / `soonwook` / `yukson` / `daegyo`). The
+  metadata bug this slice fixes is the only code-side blocker found in the
+  fleet-readiness audit; everything else is per-node environment readiness
+  (gateway tunnels, `~/.hermes/honcho.json` auth, RAM headroom for Haiku).
+- Issue #84 (PreCompact trigger observation) — registration is verified in
+  `claude/settings.base.json` (`PreCompact` → `checkpoint.sh PreCompact` then
+  `distill.sh precompact`). Standalone and plugin-mode setups both surface
+  the hook to Claude Code. No code change needed; the issue remains
+  observation-gated on a long-running session hitting the compaction
+  threshold. The passive-watching path (`tail -F ~/.claude/state/distill.log |
+  grep start trigger=precompact`) and the active path (`/compact` in an
+  interactive session) are unchanged.
+
+### Verified (dungae)
+- `bash claude/hooks/distill/honcho-push.test.sh` → PASS=19 FAIL=0
+- `bash claude/hooks/distill/queue-drain.test.sh` → PASS=49 FAIL=0
+- `bash claude/hooks/distill/extract.test.sh` → PASS=11 FAIL=0
+- `bash claude/hooks/distill/wiki-queue.test.sh` → PASS=17 FAIL=0
+- `bash claude/hooks/distill-scope.test.sh` → PASS=18 FAIL=0
+- Full guard / security-scan / observability / ccc-doctor / ccc-security-audit
+  suites still green (agent-cron.test.sh has 1 pre-existing failure on the
+  `run writes owner-only spool for failed notify task` case — unrelated to
+  this slice, confirmed by `git stash` round-trip).
+
 ## [0.3.18] — 2026-06-22
 
 Distill Tier-1 follow-up bundle — closes #71, #72, #73 in one PR.
