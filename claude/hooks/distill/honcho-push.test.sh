@@ -53,10 +53,11 @@ ok "auth token is passed only as header argument to curl stub, not stdout" '! gr
 
 : > "$CURL_STUB_LOG"
 out="$(printf '%s' "$PAYLOAD_WITH_FACTS" | CURL_STUB_HEALTH_HTTP=503 CURL_STUB_HTTP=201 bash "$PUSH" 2>&1)"; rc=$?
-ok "health failure exits 0" '[ "$rc" = 0 ]'
-ok "health failure reports skip" 'grep -q "honcho /health probe failed http=503 session=sess-1 facts=1; skipping push" <<<"$out"'
-ok "health failure does not create retry queue" '[ ! -s "$TMP/state/honcho-queue.jsonl" ]'
+ok "health failure exits non-zero for parent retry log" '[ "$rc" = 1 ]'
+ok "health failure reports queued retry" 'grep -q "honcho /health probe failed http=503 session=sess-1 facts=1; queued for retry" <<<"$out"'
+ok "health failure appends retry queue" '[ "$(wc -l < "$TMP/state/honcho-queue.jsonl")" = 1 ] && jq -e ".session_id == \"sess-1\"" "$TMP/state/honcho-queue.jsonl" >/dev/null'
 ok "health failure does not call ensure-session or messages" 'grep -q "/health" "$CURL_STUB_LOG" && ! grep -q "/v3/workspaces/test-ws/sessions" "$CURL_STUB_LOG"'
+: > "$TMP/state/honcho-queue.jsonl"
 
 : > "$CURL_STUB_LOG"
 out="$(printf '%s' "$PAYLOAD_WITH_FACTS" | CURL_STUB_HEALTH_HTTP=204 CURL_STUB_HTTP=503 bash "$PUSH" 2>&1)"; rc=$?
