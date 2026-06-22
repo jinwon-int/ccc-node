@@ -9,6 +9,7 @@
 #   task-store lastRunAt/lastStatus/lastRunId updates. When notify is
 #   telegram-owner it writes a redacted owner-only bridge spool entry, but never
 #   calls Telegram/provider APIs directly.
+# - run also appends a bounded runHistory entry for executed tasks.
 # - run --dry-run remains a read-only execution-plan preview.
 #
 # This script intentionally does not install timers or touch live cron/systemd
@@ -44,8 +45,9 @@ Implemented slices:
   prompts, sends notifications, installs schedulers, or updates task history.
 - run: explicit manual execution for due enabled tasks. It acquires the task lock,
   invokes ccc-headless, records lastRunAt/lastStatus/lastRunId, writes a
-  redacted owner-only bridge spool entry when notify=telegram-owner, and releases
-  the lock in all normal failure/success paths. It still does not call Telegram
+  redacted owner-only bridge spool entry when notify=telegram-owner, appends a
+  bounded runHistory entry, and releases the lock in all normal failure/success
+  paths. It still does not call Telegram
   or provider APIs, install schedulers, mutate crontab/systemd, or touch remotes.
 
 No direct Telegram/API send, scheduler bootstrap, systemd/crontab writes,
@@ -169,6 +171,29 @@ def validate_doc(data):
         lock_timeout = task.get('lockTimeoutSec', 0)
         if not isinstance(lock_timeout, int) or lock_timeout < 0 or lock_timeout > 86400:
             errors.append(f'{prefix}.lockTimeoutSec must be an integer from 0 to 86400')
+        max_run_history = task.get('maxRunHistory', 20)
+        if not isinstance(max_run_history, int) or max_run_history < 1 or max_run_history > 500:
+            errors.append(f'{prefix}.maxRunHistory must be an integer from 1 to 500')
+        run_history = task.get('runHistory', [])
+        if not isinstance(run_history, list):
+            errors.append(f'{prefix}.runHistory must be an array')
+        else:
+            for hidx, item in enumerate(run_history):
+                hp = f'{prefix}.runHistory[{hidx}]'
+                if not isinstance(item, dict):
+                    errors.append(f'{hp} must be an object')
+                    continue
+                for field in ('runId', 'scheduledAt', 'startedAt', 'status'):
+                    if not isinstance(item.get(field), str) or not item.get(field):
+                        errors.append(f'{hp}.{field} must be a non-empty string')
+                if 'finishedAt' in item and item['finishedAt'] is not None and not isinstance(item['finishedAt'], str):
+                    errors.append(f'{hp}.finishedAt must be string or null')
+                if 'exitCode' in item and item['exitCode'] is not None and not isinstance(item['exitCode'], int):
+                    errors.append(f'{hp}.exitCode must be integer or null')
+                if not isinstance(item.get('attempt', 1), int) or item.get('attempt', 1) < 1:
+                    errors.append(f'{hp}.attempt must be a positive integer')
+                if not isinstance(item.get('notifyState', 'none'), str):
+                    errors.append(f'{hp}.notifyState must be a string')
         timezone_name = task.get('timezone', 'UTC')
         if timezone_name != 'UTC':
             errors.append(f'{prefix}.timezone currently supports UTC only')
@@ -477,10 +502,12 @@ def normalize(data):
             'catchUpPolicy': t.get('catchUpPolicy', 'skip'),
             'maxCatchup': t.get('maxCatchup', 1),
             'lockTimeoutSec': t.get('lockTimeoutSec', 0),
+            'maxRunHistory': t.get('maxRunHistory', 20),
             'redactProfile': t.get('redactProfile', 'default'),
             'lastRunAt': t.get('lastRunAt'),
             'lastStatus': t.get('lastStatus'),
             'lastRunId': t.get('lastRunId'),
+            'runHistoryCount': len(t.get('runHistory', [])) if isinstance(t.get('runHistory', []), list) else 0,
         })
     out['tasks'].sort(key=lambda x: x['id'] or '')
     return out
@@ -653,11 +680,11 @@ def headless_metadata(task, execute):
     }
 
 
-def mutation_flags(lock_acquire, task_write, headless_execute, push_spool_write=False):
+def mutation_flags(lock_acquire, task_write, headless_execute, push_spool_write=False, history_append=False):
     return {
         'lockAcquire': bool(lock_acquire),
         'taskStoreWrite': bool(task_write),
-        'historyAppend': False,
+        'historyAppend': bool(history_append),
         'pushSpoolWrite': bool(push_spool_write),
         'schedulerInstall': False,
         'headlessExecute': bool(headless_execute),
@@ -673,6 +700,29 @@ def write_doc(data):
     except OSError:
         pass
     tmp.replace(store)
+
+
+def history_attempt(task, scheduled_at):
+    attempts = 0
+    history = task.get('runHistory', [])
+    if isinstance(history, list):
+        for item in history:
+            if isinstance(item, dict) and item.get('scheduledAt') == scheduled_at:
+                attempts = max(attempts, int(item.get('attempt') or 0))
+    return attempts + 1
+
+
+def append_run_history(task, entry):
+    history = task.get('runHistory')
+    if not isinstance(history, list):
+        history = []
+    history.append(entry)
+    max_history = task.get('maxRunHistory', 20)
+    if not isinstance(max_history, int) or max_history < 1:
+        max_history = 20
+    if max_history > 500:
+        max_history = 500
+    task['runHistory'] = history[-max_history:]
 
 
 def acquire_for_run(task_id, task, run_id, scheduled_at, at):
@@ -887,11 +937,25 @@ def run_execute(data, task_id, at_value, as_json):
             ok = False
             status = 'failed'
             rc = 1
+        notification = write_owner_spool(task, task_id, run_id, scheduled_at, status, headless, at)
+        notify_state = notification.get('delivery') or 'none'
+        if task.get('notify', 'none') == 'none':
+            notify_state = 'none'
+        entry = {
+            'runId': run_id,
+            'scheduledAt': scheduled_at,
+            'startedAt': fmt_dt(at),
+            'finishedAt': fmt_dt(at),
+            'status': status,
+            'exitCode': headless.get('exitCode') if isinstance(headless, dict) else None,
+            'attempt': history_attempt(task, scheduled_at),
+            'notifyState': notify_state,
+        }
+        append_run_history(task, entry)
         task['lastRunAt'] = scheduled_at
         task['lastStatus'] = status
         task['lastRunId'] = run_id
         write_doc(data)
-        notification = write_owner_spool(task, task_id, run_id, scheduled_at, status, headless, at)
     finally:
         release = release_for_run(task_id, run_id)
     result = {
@@ -902,7 +966,7 @@ def run_execute(data, task_id, at_value, as_json):
         'lock': {'state': lock.get('state'), 'path': lock.get('path'), 'release': release},
         'headless': headless or headless_metadata(task, execute=True),
         'notification': notification,
-        'mutations': mutation_flags(True, headless is not None, headless is not None, notification.get('delivery') == 'spooled'),
+        'mutations': mutation_flags(True, headless is not None, headless is not None, notification.get('delivery') == 'spooled', True),
     }
     if not release.get('ok'):
         result['ok'] = False
