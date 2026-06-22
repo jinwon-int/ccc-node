@@ -2,6 +2,62 @@
 
 All notable changes to the Claude Code node harness. Dates are KST.
 
+## [0.3.18] — 2026-06-22
+
+Distill Tier-1 follow-up bundle — closes #71, #72, #73 in one PR.
+
+### Added
+- `claude/hooks/distill/queue-drain.sh` (#71): SessionStart-backgrounded retry
+  worker for `honcho-queue.jsonl`. Reads up to `CCC_DISTILL_DRAIN_BATCH`
+  (default 20) entries per run, retries each with the same upsert-session +
+  POST-messages sequence as `honcho-push.sh`. In-band `_attempts` counter
+  on each line; entries that exceed `CCC_DISTILL_DRAIN_MAX_ATTEMPTS`
+  (default 3) move to `honcho-queue.jsonl.dead` for manual review.
+  Pre-flight `/health` probe (skips drain if Honcho is unreachable).
+  Single-flight via `flock` so concurrent SessionStarts don't double-drain.
+  Replayed messages carry `metadata.replay: true` and a `(replayed)` marker
+  in content so they're identifiable in Honcho.
+
+### Changed
+- `claude/hooks/distill/extract.sh` (#72): timeout (ec=124) now triggers a
+  one-shot retry path — rebuilds the transcript window with halved
+  `MAX_TURNS` and `MAX_BYTES`, calls `claude -p` again with the existing
+  `STRICT` system prompt. Transcript construction was factored into a
+  `build_redacted()` function so both attempts share the same redact +
+  byte-cap logic. JSON-drift retry path (#70) is preserved and now lives
+  after the timeout-retry branch.
+- `claude/hooks/distill.sh`, `distill/honcho-push.sh`, `distill/wiki-queue.sh`
+  (#73): state-dir paths read from `CCC_STATE_DIR`
+  (default `/root/.claude/state`) instead of being literal-hardcoded.
+  `distill/honcho-push.sh` also reads `CCC_HONCHO_CFG`
+  (default `/root/.hermes/honcho.json`) for non-root / alternate-install
+  scenarios. Matches the pattern already used by `load-memory.sh`'s
+  `CCC_MEMORY_CACHE_DIR` / `CCC_HOOK_DIR`.
+- `claude/settings.base.json`: new SessionStart hook entry that fires
+  `queue-drain.sh` in the background (`& 2>/dev/null`) so it never adds
+  latency to startup.
+- `setup.sh`: copies the new `claude/hooks/distill/queue-drain.sh` alongside
+  the other distill sub-scripts; chmod glob already covers it.
+
+### Verified (dungae)
+- Empty queue path: `queue-drain.sh` returns immediately, no log noise.
+- Loaded queue path: seeded a synthetic failed payload, ran drain,
+  Honcho POST returned HTTP 201, queue file truncated to 0 lines, message
+  visible in Honcho with `metadata.replay: true` and the `(replayed)` content
+  prefix. DELETE 202 cleanup of the smoke session.
+- LIVE manual distill on the working session: attempt 1 succeeded in ~75 s,
+  no retry needed, 2 honcho facts + 1 wiki candidate.
+- Concurrent natural SessionEnd from another cwd's session distilled
+  successfully alongside (4 candidates added) — single-flight lock didn't
+  interfere.
+
+### Notes
+- The `_attempts` field is added in-band to the JSON line on each retry
+  failure. Old queue lines (pre-0.3.18) without this field default to 0,
+  so they retry up to `MAX_ATTEMPTS` total — graceful migration.
+- No plugin.json bump (drain runs in node-local SessionStart, not in the
+  portable plugin surface).
+
 ## [0.3.17] — 2026-06-22
 
 Follow-up to 0.3.15 — harden `distill/extract.sh` against Haiku occasionally

@@ -11,9 +11,10 @@
 # for next-SessionStart retry (not implemented yet — placeholder for future).
 set -uo pipefail
 
-CFG=/root/.hermes/honcho.json
-QUEUE=/root/.claude/state/honcho-queue.jsonl
-mkdir -p "$(dirname "$QUEUE")" 2>/dev/null
+CFG="${CCC_HONCHO_CFG:-/root/.hermes/honcho.json}"
+STATE_DIR="${CCC_STATE_DIR:-/root/.claude/state}"
+QUEUE="$STATE_DIR/honcho-queue.jsonl"
+mkdir -p "$STATE_DIR" 2>/dev/null
 
 [ -f "$CFG" ] || { echo "no honcho.json"; exit 0; }
 
