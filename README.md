@@ -77,6 +77,15 @@ to Telegram, with all secrets and node-local state stripped out and replaced by 
   `claude/agents/a2a-*.md` roster carries advisory `model_tier` metadata (read-only
   explorer/researcher = `low-cost`, implementer/verifier = `upper`) and requires cost/token
   notes when runner accounting is available. See [`docs/a2a-claude-worker.md`](docs/a2a-claude-worker.md).
+- **Session Distiller** (`claude/hooks/distill.sh`, `/distill`) — PreCompact/SessionEnd hook
+  pipeline (0.3.15+) that distills live transcripts via `claude -p --model haiku` (inherits
+  parent OAuth, no API key) and routes results to **Honcho** (auto-push of working/relational
+  facts) + a **human-gated wiki-candidates queue** (`~/.claude/state/wiki-candidates.md`).
+  Includes a retry drain worker (`queue-drain.sh`, 0.3.18) for failed Honcho pushes and an
+  off-switch (`distill.disabled`) / dry-run toggle. Fleet verification: see issue #82 and
+  `scripts/ccc-distill-check.sh --json` for per-node health snapshot. Non-root installs: set
+  `CCC_STATE_DIR` (state/log/queue), `CLAUDE_PROJECTS_DIR` (transcript discovery), and
+  `CCC_NODE` (node label); the checker respects `CCC_STATE_DIR`.
 
 ## Quick start
 
