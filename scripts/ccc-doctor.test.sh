@@ -150,5 +150,12 @@ out="$(run_doctor "$manual" --fix --apply 2>&1)"; rc=$?
 after="$(find "$manual" -type f -printf '%P %s %T@\n' | sort)"
 ok "--fix --apply fails closed on manual settings" '[ "$rc" = 1 ] && grep -q "manual items present" <<<"$out" && [ "$before" = "$after" ]'
 
+missing_settings="$(make_fixture missing-settings standalone)"
+rm -f "$missing_settings/home/.claude/settings.json"
+before="$(find "$missing_settings" -type f -printf '%P %s %T@\n' | sort)"
+out="$(run_doctor "$missing_settings" --fix --apply 2>&1)"; rc=$?
+after="$(find "$missing_settings" -type f -printf '%P %s %T@\n' | sort)"
+ok "missing settings fails closed instead of claiming repairable" '[ "$rc" = 1 ] && grep -q "수동필요.*settings.json.*missing" <<<"$out" && grep -q "install mode cannot be inferred safely" <<<"$out" && [ "$before" = "$after" ]'
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

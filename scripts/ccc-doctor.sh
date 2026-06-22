@@ -95,7 +95,7 @@ json_has() { jq -e "$2" "$1" >/dev/null 2>&1; }
 mode="unknown"
 settings_valid=0
 if [ ! -f "$SETTINGS" ]; then
-  add 교정가능 "settings.json" "missing" "run setup.sh from the repo after backing up ~/.claude"
+  add 수동필요 "settings.json" "missing" "run setup.sh from the repo after backing up ~/.claude; install mode cannot be inferred safely"
 elif ! json_ok "$SETTINGS"; then
   add 수동필요 "settings.json" "invalid JSON" "repair JSON manually or restore from backup"
 else
