@@ -25,6 +25,8 @@ Task locks are local primitives for manual run-with-lock execution. Do not acqui
 
 `agent-cron.sh scheduler --dry-run --json` is read-only: it reports one deterministic scheduler tick (`would-run` / `skip`) using the due plan, retry state, and lock probe results. It does not acquire locks, execute prompts, write task history, write push spool files, install timers, edit crontab/systemd, or send messages.
 
+`agent-cron.sh scheduler --execute --json` is the approved one-shot executor path for live/systemd use: it consumes due/retry-due tasks through the same locked `run` path, so it may acquire locks, execute headless, write task history, and write owner-only redacted spool files. It still does not install timers, edit crontab/systemd, or directly call Telegram/provider APIs. Timer installation is handled separately by `scripts/install-agent-cron-systemd.sh --apply` and requires explicit approval.
+
 ## Task
 
 Summarize the configured agent-cron definitions for the operator in Korean using:
@@ -34,4 +36,4 @@ Summarize the configured agent-cron definitions for the operator in Korean using
 - execution boundary;
 - next action.
 
-Do not run tasks, acquire/release locks, write scheduler state, edit crontab/systemd, update `lastRunAt`, send Telegram/provider messages, or call non-dry-run `run` from this summary command. If the operator explicitly requests execution, use `run <task-id> --dry-run --json` first to show the boundary, then call non-dry-run `run` only for a due enabled task. If the operator asks about scheduling, use `scheduler --dry-run --json`; actual timer installation remains outside this command and requires explicit approval.
+Do not run tasks, acquire/release locks, write scheduler state, edit crontab/systemd, update `lastRunAt`, send Telegram/provider messages, or call non-dry-run `run` from this summary command. If the operator explicitly requests execution, use `run <task-id> --dry-run --json` first to show the boundary, then call non-dry-run `run` only for a due enabled task. If the operator asks about scheduling, use `scheduler --dry-run --json`; `scheduler --execute` and actual timer installation remain explicit-approval operations.

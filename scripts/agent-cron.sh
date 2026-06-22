@@ -15,6 +15,9 @@
 # - run --dry-run remains a read-only execution-plan preview.
 # - scheduler --dry-run is a read-only single-tick scheduler plan; it never
 #   installs timers, acquires locks, executes tasks, or writes state.
+# - scheduler --execute is an explicit one-shot scheduler executor for approved
+#   live/systemd use. It consumes due/retry-due tasks via the same run path, but
+#   never installs timers itself.
 #
 # This script intentionally does not install timers or touch live cron/systemd
 # state.
@@ -36,7 +39,7 @@ Usage: agent-cron.sh [list|validate] [--store PATH] [--json]
        agent-cron.sh due [--store PATH] [--at ISO8601] [--json]
        agent-cron.sh lock <task-id> --action acquire|release|probe --run-id ID [--scheduled-at ISO8601] [--at ISO8601] [--json]
        agent-cron.sh run <task-id> --dry-run [--at ISO8601] [--json]
-       agent-cron.sh scheduler --dry-run [--at ISO8601] [--json]
+       agent-cron.sh scheduler --dry-run|--execute [--at ISO8601] [--max-runs N] [--json]
 
 Implemented slices:
 - list/validate: inspect and validate the task definition store.
@@ -52,6 +55,9 @@ Implemented slices:
 - scheduler --dry-run: read-only single-tick scheduler plan. It reports which
   tasks would run or skip, including retry-due tasks, but never installs timers,
   acquires locks, executes prompts, writes task state, or sends notifications.
+- scheduler --execute: explicit one-shot scheduler executor for approved live/systemd
+  use. It runs at most --max-runs due/retry-due tasks through the existing run path;
+  it never installs timers or edits crontab/systemd.
 - run: explicit manual execution for due enabled tasks. It acquires the task lock,
   invokes ccc-headless, records lastRunAt/lastStatus/lastRunId, writes a
   redacted owner-only bridge spool entry when notify=telegram-owner, appends a
@@ -61,7 +67,7 @@ Implemented slices:
   or provider APIs, install schedulers, mutate crontab/systemd, or touch remotes.
 
 No direct Telegram/API send, scheduler bootstrap, systemd/crontab writes,
-provider sends, or remote-node actions are performed.
+provider sends, or remote-node actions are performed by agent-cron itself.
 EOF
       exit 0
       ;;
@@ -734,15 +740,24 @@ def due_plan(data):
 def parse_scheduler_args():
     args = shlex.split(os.environ.get('EXTRA_ARGS', ''))
     dry_run = False
+    execute = False
     at_value = at_raw
     local_json = json_out
+    max_runs = 10
     i = 0
     while i < len(args):
         a = args[i]
         if a == '--dry-run':
             dry_run = True
+        elif a == '--execute':
+            execute = True
         elif a == '--json':
             local_json = True
+        elif a == '--max-runs':
+            i += 1
+            if i >= len(args):
+                raise ValueError('--max-runs requires a value')
+            max_runs = int(args[i])
         elif a == '--at':
             i += 1
             if i >= len(args):
@@ -751,20 +766,60 @@ def parse_scheduler_args():
         else:
             raise ValueError(f'unsupported scheduler argument: {a}')
         i += 1
-    return dry_run, at_value, local_json
+    if dry_run and execute:
+        raise ValueError('scheduler accepts only one of --dry-run or --execute')
+    if max_runs < 1 or max_runs > 100:
+        raise ValueError('--max-runs must be an integer from 1 to 100')
+    return dry_run, execute, at_value, local_json, max_runs
+
+
+def scheduler_actions(plan):
+    actions = []
+    for row in plan.get('tasks', []):
+        status = row.get('status')
+        lock_state = row.get('lockState')
+        action = 'skip'
+        reason = status or 'unknown'
+        if not row.get('enabled'):
+            reason = 'disabled'
+        elif row.get('due') and lock_state == 'held':
+            reason = 'locked'
+        elif row.get('due'):
+            action = 'would-run'
+            reason = status or 'due'
+        elif status == 'retry-wait':
+            reason = 'retry-wait'
+        elif status == 'retry-exhausted':
+            reason = 'retry-exhausted'
+        else:
+            reason = 'not-due'
+        actions.append({
+            'taskId': row.get('id'),
+            'action': action,
+            'reason': reason,
+            'status': status,
+            'scheduledAt': row.get('scheduledAt'),
+            'dueCount': row.get('dueCount', 0),
+            'missedRuns': row.get('missedRuns', 0),
+            'retryEligibleAt': row.get('retryEligibleAt'),
+            'retryAttempt': row.get('retryAttempt'),
+            'lockState': lock_state,
+            'lockPath': row.get('lockPath'),
+        })
+    return actions
 
 
 def scheduler_plan(data):
     global at_raw
     try:
-        dry_run, at_value, as_json = parse_scheduler_args()
-        if not dry_run:
+        dry_run, execute, at_value, as_json, max_runs = parse_scheduler_args()
+        if not dry_run and not execute:
             return {
                 'ok': False,
                 'mode': 'scheduler-blocked',
                 'store': str(store),
                 'at': at_value or at_raw,
-                'error': 'scheduler requires --dry-run in this source-only slice; no filesystem changes were made',
+                'error': 'scheduler requires --dry-run or --execute; no filesystem changes were made',
                 'mutations': mutation_flags(False, False, False),
             }, as_json, 2
         old_at = at_raw
@@ -773,55 +828,58 @@ def scheduler_plan(data):
             plan = due_plan(data)
         finally:
             at_raw = old_at
-        actions = []
-        for row in plan.get('tasks', []):
-            status = row.get('status')
-            lock_state = row.get('lockState')
-            action = 'skip'
-            reason = status or 'unknown'
-            if not row.get('enabled'):
-                reason = 'disabled'
-            elif row.get('due') and lock_state == 'held':
-                reason = 'locked'
-            elif row.get('due'):
-                action = 'would-run'
-                reason = status or 'due'
-            elif status == 'retry-wait':
-                reason = 'retry-wait'
-            elif status == 'retry-exhausted':
-                reason = 'retry-exhausted'
-            else:
-                reason = 'not-due'
-            actions.append({
-                'taskId': row.get('id'),
-                'action': action,
-                'reason': reason,
-                'status': status,
-                'scheduledAt': row.get('scheduledAt'),
-                'dueCount': row.get('dueCount', 0),
-                'missedRuns': row.get('missedRuns', 0),
-                'retryEligibleAt': row.get('retryEligibleAt'),
-                'retryAttempt': row.get('retryAttempt'),
-                'lockState': lock_state,
-                'lockPath': row.get('lockPath'),
-            })
-        return {
-            'ok': plan.get('ok', False),
-            'mode': 'scheduler-dry-run-read-only',
-            'store': str(store),
-            'at': plan.get('at'),
-            'actions': actions,
-            'errors': plan.get('errors', []),
-            'mutations': mutation_flags(False, False, False),
-        }, as_json, 0 if plan.get('ok', False) else 1
+        actions = scheduler_actions(plan)
+        if dry_run:
+            return {
+                'ok': plan.get('ok', False),
+                'mode': 'scheduler-dry-run-read-only',
+                'store': str(store),
+                'at': plan.get('at'),
+                'actions': actions,
+                'errors': plan.get('errors', []),
+                'mutations': mutation_flags(False, False, False),
+            }, as_json, 0 if plan.get('ok', False) else 1
+        return scheduler_execute(data, plan, actions, at_value, as_json, max_runs)
     except Exception as e:
         return {
             'ok': False,
-            'mode': 'scheduler-dry-run-read-only',
+            'mode': 'scheduler-error',
             'store': str(store),
             'error': str(e),
             'mutations': mutation_flags(False, False, False),
         }, json_out, 1
+
+
+def scheduler_execute(data, plan, actions, at_value, as_json, max_runs):
+    runnable = [a for a in actions if a.get('action') == 'would-run' and a.get('taskId')]
+    selected = runnable[:max_runs]
+    results = []
+    any_headless = False
+    any_spool = False
+    any_history = False
+    any_lock = False
+    for action in selected:
+        result, _json, _rc = run_execute(data, action['taskId'], at_value or plan.get('at'), True)
+        results.append(result)
+        m = result.get('mutations') or {}
+        any_headless = any_headless or bool(m.get('headlessExecute'))
+        any_spool = any_spool or bool(m.get('pushSpoolWrite'))
+        any_history = any_history or bool(m.get('historyAppend'))
+        any_lock = any_lock or bool(m.get('lockAcquire'))
+    return {
+        'ok': True,
+        'mode': 'scheduler-execute-one-shot',
+        'store': str(store),
+        'at': plan.get('at'),
+        'plannedActions': len(actions),
+        'runnableActions': len(runnable),
+        'executedActions': len(results),
+        'maxRuns': max_runs,
+        'truncated': len(runnable) > len(selected),
+        'results': results,
+        'errors': plan.get('errors', []),
+        'mutations': mutation_flags(any_lock, bool(results), any_headless, any_spool, any_history),
+    }, as_json, 0
 
 
 def emit_scheduler(result, as_json):
