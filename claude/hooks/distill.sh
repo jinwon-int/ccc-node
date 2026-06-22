@@ -132,10 +132,14 @@ HOOKDIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)" || HOOKD
   export CLAUDE_DISTILL_SOURCE_PROJECT="$PROJECT_ENC"
   export CLAUDE_DISTILL_DRYRUN="$DRYRUN"
 
+  PIPE_START_EPOCH="$(date -u +%s)"
+  PIPE_PID="${BASHPID:-$$}"
+  elapsed_s() { now="$(date -u +%s)"; printf '%s' "$((now - PIPE_START_EPOCH))"; }
+
   EXTRACT_OUT="$(bash "$HOOKDIR/distill/extract.sh" 2>>"$LOG")"
   ec=$?
   if [ $ec -ne 0 ] || [ -z "$EXTRACT_OUT" ]; then
-    log "extract failed ec=$ec"
+    log "extract failed ec=$ec trigger=$TRIGGER pid=$PIPE_PID elapsed_s=$(elapsed_s)"
     exit 0
   fi
 
@@ -157,7 +161,7 @@ HOOKDIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)" || HOOKD
   fi
 
   if [ "$DRYRUN" = "1" ]; then
-    log "dry-run skipping honcho/wiki push (see $STASH)"
+    log "dry-run skipping honcho/wiki push (see $STASH) trigger=$TRIGGER pid=$PIPE_PID elapsed_s=$(elapsed_s)"
     exit 0
   fi
 
@@ -166,7 +170,7 @@ HOOKDIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)" || HOOKD
   bash "$HOOKDIR/distill/wiki-queue.sh" < "$STASH" >> "$LOG" 2>&1 || \
     log "wiki-queue non-zero"
 
-  log "done"
+  log "done trigger=$TRIGGER pid=$PIPE_PID elapsed_s=$(elapsed_s)"
 ) </dev/null >/dev/null 2>&1 &
 BG_PID=$!
 disown 2>/dev/null || true

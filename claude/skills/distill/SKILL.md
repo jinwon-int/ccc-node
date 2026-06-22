@@ -1,6 +1,6 @@
 ---
 name: distill
-description: Manually trigger / inspect / toggle the Session Distiller (TM-1058) — the PreCompact+SessionEnd memory pipeline that distills transcripts via Haiku and routes to Honcho + wiki-candidates. Use when the operator says `/distill`, asks to "run distill now", wants to see what the last distill captured, wants to flip between LIVE and DRY-RUN, or wants to turn distill off. Arg is one of: (empty)/`manual` (fire now), `status` (show last result + queue), `dryrun` (enable dry-run mode), `live` (disable dry-run), `disable` (off-switch), `enable` (clear off-switch).
+description: Manually trigger / inspect / toggle the Session Distiller (TM-1058) — the PreCompact+SessionEnd memory pipeline that distills transcripts via Haiku and routes to Honcho + wiki-candidates. Use when the operator says `/distill`, asks to "run distill now", wants to see what the last distill captured, wants aggregate distill health stats, wants to flip between LIVE and DRY-RUN, or wants to turn distill off. Arg is one of: (empty)/`manual` (fire now), `status` (show last result + queue), `stats [days]` (read-only log summary), `dryrun` (enable dry-run mode), `live` (disable dry-run), `disable` (off-switch), `enable` (clear off-switch).
 ---
 
 # distill — Session Distiller manual control
@@ -13,6 +13,7 @@ Wraps `~/.claude/hooks/distill.sh` with a single operator-facing UX. Design: see
 |---|---|
 | (empty) / `manual` | Fire distill.sh on the current session, wait for the bg pipeline, summarize what was distilled. |
 | `status` | Show toggle state, last `distill-last.json`, last 5 log lines, wiki-candidates queue size. No fire. |
+| `stats [days]` | Read-only aggregate summary from `distill.log` for the last N days (default 7). |
 | `dryrun` | Enable DRY-RUN (extract only; no Honcho/Wiki writes). Idempotent. |
 | `live` | Disable DRY-RUN. Idempotent. |
 | `disable` | Off-switch on (skip everything). |
@@ -36,6 +37,64 @@ Operator arg: `$ARGUMENTS`
        ~/.claude/state/distill-last.json 2>/dev/null
      tail -5 ~/.claude/state/distill.log 2>/dev/null
      grep -c "^## \[CAND-" ~/.claude/state/wiki-candidates.md 2>/dev/null
+     ```
+
+   - **`stats [days]`** — read-only aggregate over `distill.log` (default 7 days):
+     ```bash
+     set -uo pipefail
+     ARG="${ARGUMENTS:-stats}"
+     DAYS="$(printf '%s' "$ARG" | sed -E 's/^stats[[:space:]]*//; s/^days=//')"
+     case "$DAYS" in ''|*[!0-9]*) DAYS=7 ;; esac
+     LOG="${CCC_STATE_DIR:-$HOME/.claude/state}/distill.log"
+     CUTOFF="$(date -u -d "$DAYS days ago" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || printf '0000-00-00T00:00:00Z')"
+     printf '[distill stats — last %s days]\n' "$DAYS"
+     awk -v cutoff="$CUTOFF" '
+       $1 < cutoff { next }
+       /start trigger=/ {
+         trigger="unknown"
+         if (match($0, /trigger=[^ ]+/)) { trigger=substr($0, RSTART+8, RLENGTH-8) }
+         total[trigger]++
+       }
+       / done trigger=/ {
+         trigger="unknown"; elapsed=""
+         if (match($0, /trigger=[^ ]+/)) { trigger=substr($0, RSTART+8, RLENGTH-8) }
+         if (match($0, /elapsed_s=[0-9]+/)) { elapsed=substr($0, RSTART+10, RLENGTH-10); elapsed_sum[trigger]+=elapsed; elapsed_n[trigger]++ }
+         done[trigger]++
+       }
+       /extract failed/ {
+         trigger="unknown"; elapsed=""
+         if (match($0, /trigger=[^ ]+/)) { trigger=substr($0, RSTART+8, RLENGTH-8) }
+         if (match($0, /elapsed_s=[0-9]+/)) { elapsed=substr($0, RSTART+10, RLENGTH-10); elapsed_sum[trigger]+=elapsed; elapsed_n[trigger]++ }
+         failed[trigger]++
+       }
+       /dry-run skipping/ {
+         trigger="unknown"; elapsed=""
+         if (match($0, /trigger=[^ ]+/)) { trigger=substr($0, RSTART+8, RLENGTH-8) }
+         if (match($0, /elapsed_s=[0-9]+/)) { elapsed=substr($0, RSTART+10, RLENGTH-10); elapsed_sum[trigger]+=elapsed; elapsed_n[trigger]++ }
+         dryrun[trigger]++
+       }
+       /skip reason=|skipped reason=/ {
+         trigger="unknown"
+         if (match($0, /trigger=[^ ]+/)) { trigger=substr($0, RSTART+8, RLENGTH-8) }
+         skip[trigger]++
+       }
+       END {
+         split("manual precompact sessionend unknown", order, " ")
+         for (i=1; i<=length(order); i++) {
+           t=order[i]
+           if ((total[t]+done[t]+failed[t]+dryrun[t]+skip[t]) == 0) continue
+           avg="-"
+           if (elapsed_n[t] > 0) avg=sprintf("%ds", elapsed_sum[t]/elapsed_n[t])
+           printf "%-10s %4d runs (%3d done / %3d failed / %3d dryrun / %3d skipped) avg=%s\n", t ":", total[t], done[t], failed[t], dryrun[t], skip[t], avg
+         }
+       }
+     ' "$LOG" 2>/dev/null
+     printf '\nHoncho push: %s ok / %s queued\n' \
+       "$(awk -v cutoff="$CUTOFF" '$1>=cutoff && /honcho push ok/ {n++} END{print n+0}' "$LOG" 2>/dev/null)" \
+       "$(awk -v cutoff="$CUTOFF" '$1>=cutoff && (/honcho-push non-zero|honcho push failed/) {n++} END{print n+0}' "$LOG" 2>/dev/null)"
+     printf 'Wiki queue:   %s candidates added / %s dedup-skipped\n' \
+       "$(awk -v cutoff="$CUTOFF" '$1>=cutoff && /wiki-queue session=/ {if (match($0,/added=[0-9]+/)) {n+=substr($0,RSTART+6,RLENGTH-6)}} END{print n+0}' "$LOG" 2>/dev/null)" \
+       "$(awk -v cutoff="$CUTOFF" '$1>=cutoff && /wiki-queue session=/ {if (match($0,/skipped\(dup\)=[0-9]+/)) {n+=substr($0,RSTART+13,RLENGTH-13)}} END{print n+0}' "$LOG" 2>/dev/null)"
      ```
 
    - **`dryrun`** — `touch ~/.claude/state/distill.dryrun`. Confirm.
