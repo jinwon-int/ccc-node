@@ -50,9 +50,11 @@ if [ -f "$LOG" ] && [ -s "$LOG" ]; then
   manual_c="$(awk -v c="$cutoff" '$1>=c && /start trigger=manual/ {n++} END{print n+0}' "$LOG" 2>/dev/null)"
   sessionend_c="$(awk -v c="$cutoff" '$1>=c && /start trigger=sessionend/ {n++} END{print n+0}' "$LOG" 2>/dev/null)"
   precompact_c="$(awk -v c="$cutoff" '$1>=c && /start trigger=precompact/ {n++} END{print n+0}' "$LOG" 2>/dev/null)"
-  drain_ok="$(awk -v c="$cutoff" '$1>=c && /\[drain\] drained / {n+=0; if(match($0,/ok=([0-9]+)/,m)) n+=m[1]} END{print n+0}' "$LOG" 2>/dev/null)"
-  drain_failed="$(awk -v c="$cutoff" '$1>=c && /\[drain\] drained / {n+=0; if(match($0,/failed=([0-9]+)/,m)) n+=m[1]} END{print n+0}' "$LOG" 2>/dev/null)"
-  drain_drop="$(awk -v c="$cutoff" '$1>=c && /\[drain\] drained / {n+=0; if(match($0,/dropped=([0-9]+)/,m)) n+=m[1]} END{print n+0}' "$LOG" 2>/dev/null)"
+  # Portable awk: mawk / busybox awk lack match() 3-arg capture-group form.
+  # Use sub()+sub() to extract numeric values instead (POSIX, works everywhere).
+  drain_ok="$(awk -v c="$cutoff" '$1>=c && /\[drain\] drained / {s=$0; sub(/.*ok=/,"",s); sub(/ .*/,"",s); n+=s+0} END{print n+0}' "$LOG" 2>/dev/null)"
+  drain_failed="$(awk -v c="$cutoff" '$1>=c && /\[drain\] drained / {s=$0; sub(/.*failed=/,"",s); sub(/ .*/,"",s); n+=s+0} END{print n+0}' "$LOG" 2>/dev/null)"
+  drain_drop="$(awk -v c="$cutoff" '$1>=c && /\[drain\] drained / {s=$0; sub(/.*dropped=/,"",s); sub(/ .*/,"",s); n+=s+0} END{print n+0}' "$LOG" 2>/dev/null)"
 fi
 
 # ---- Honcho config reachability note ----------------------------------------
