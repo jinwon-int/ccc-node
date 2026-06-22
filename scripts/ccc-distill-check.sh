@@ -50,9 +50,10 @@ if [ -f "$LOG" ] && [ -s "$LOG" ]; then
   manual_c="$(awk -v c="$cutoff" '$1>=c && /start trigger=manual/ {n++} END{print n+0}' "$LOG" 2>/dev/null)"
   sessionend_c="$(awk -v c="$cutoff" '$1>=c && /start trigger=sessionend/ {n++} END{print n+0}' "$LOG" 2>/dev/null)"
   precompact_c="$(awk -v c="$cutoff" '$1>=c && /start trigger=precompact/ {n++} END{print n+0}' "$LOG" 2>/dev/null)"
-  drain_ok="$(awk -v c="$cutoff" '$1>=c && /\[drain\] drained / {n+=0; if(match($0,/ok=([0-9]+)/,m)) n+=m[1]} END{print n+0}' "$LOG" 2>/dev/null)"
-  drain_failed="$(awk -v c="$cutoff" '$1>=c && /\[drain\] drained / {n+=0; if(match($0,/failed=([0-9]+)/,m)) n+=m[1]} END{print n+0}' "$LOG" 2>/dev/null)"
-  drain_drop="$(awk -v c="$cutoff" '$1>=c && /\[drain\] drained / {n+=0; if(match($0,/dropped=([0-9]+)/,m)) n+=m[1]} END{print n+0}' "$LOG" 2>/dev/null)"
+  # Portable awk (no GNU match-3rd-arg) — split on key= then space-delim the number.
+  drain_ok="$(awk -v c="$cutoff" '$1>=c && /\[drain\] drained / {split($0,a,"ok="); split(a[2],b," "); n+=b[1]} END{print n+0}' "$LOG" 2>/dev/null)"
+  drain_failed="$(awk -v c="$cutoff" '$1>=c && /\[drain\] drained / {split($0,a,"failed="); split(a[2],b," "); n+=b[1]} END{print n+0}' "$LOG" 2>/dev/null)"
+  drain_drop="$(awk -v c="$cutoff" '$1>=c && /\[drain\] drained / {split($0,a,"dropped="); split(a[2],b," "); n+=b[1]} END{print n+0}' "$LOG" 2>/dev/null)"
 fi
 
 # ---- Honcho config reachability note ----------------------------------------
