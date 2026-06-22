@@ -23,7 +23,8 @@ if [ -n "${CLAUDE_DISTILL_INFLIGHT:-}" ]; then
 fi
 
 # ---- off-switch ------------------------------------------------------------
-STATE_DIR=/root/.claude/state
+# State dir is overridable for testing / non-root installs (#73).
+STATE_DIR="${CCC_STATE_DIR:-/root/.claude/state}"
 LOG="$STATE_DIR/distill.log"
 mkdir -p "$STATE_DIR" 2>/dev/null
 

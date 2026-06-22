@@ -113,6 +113,7 @@ run "mkdir -p '$CLAUDE_DIR/hooks/distill'"
 run "cp '$SRC/claude/hooks/distill/extract.sh'     '$CLAUDE_DIR/hooks/distill/extract.sh'"
 run "cp '$SRC/claude/hooks/distill/honcho-push.sh' '$CLAUDE_DIR/hooks/distill/honcho-push.sh'"
 run "cp '$SRC/claude/hooks/distill/wiki-queue.sh'  '$CLAUDE_DIR/hooks/distill/wiki-queue.sh'"
+run "cp '$SRC/claude/hooks/distill/queue-drain.sh' '$CLAUDE_DIR/hooks/distill/queue-drain.sh'"
 run "chmod +x '$CLAUDE_DIR/hooks/'*.sh '$CLAUDE_DIR/hooks/distill/'*.sh"
 # Tier 3: status line (node·model·git·context·cost·A2A) wired via settings.json statusLine.
 # Output style (한국어 구조화 보고) — node-agnostic; settings.json activates it as outputStyle.

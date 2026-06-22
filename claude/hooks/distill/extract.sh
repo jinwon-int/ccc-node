@@ -21,45 +21,52 @@ TIMEOUT="${CLAUDE_DISTILL_TIMEOUT:-90}"
 
 [ -f "$TRANSCRIPT" ] || { echo "no transcript: $TRANSCRIPT" >&2; exit 1; }
 
-# ---- step 1+2: extract last N meaningful turns ----------------------------
-# Each line is a JSON event; we want user prompts + assistant text messages.
-# Tool calls are summarized as "[tool:<name>]" to keep token budget low.
-RAW="$(tail -n 400 "$TRANSCRIPT" 2>/dev/null | jq -r --argjson maxt "$MAX_TURNS" '
-  select(.type == "user" or .type == "assistant")
-  | . as $e
-  | (.message.content // .content // "") as $c
-  | if ($c | type) == "string" then
-      "[\($e.type)] \($c)"
-    elif ($c | type) == "array" then
-      "[\($e.type)] " + (
-        $c | map(
-          if .type == "text" then .text
-          elif .type == "tool_use" then "[tool:\(.name // "?")]"
-          elif .type == "tool_result" then "[tool_result:\(.tool_use_id // "?" | .[0:8])]"
-          else "[\(.type // "?")]"
-          end
-        ) | join("\n")
-      )
-    else "" end
-' 2>/dev/null | tail -n "$MAX_TURNS")"
+# ---- step 1+2+3: build the redacted, byte-capped transcript window --------
+# Wrapped in a function so the timeout-retry path can rebuild with smaller
+# (turns, bytes) on ec=124 (#72).
+build_redacted() {
+  local max_turns="$1" max_bytes="$2"
+  local raw redacted
+  raw="$(tail -n 400 "$TRANSCRIPT" 2>/dev/null | jq -r '
+    select(.type == "user" or .type == "assistant")
+    | . as $e
+    | (.message.content // .content // "") as $c
+    | if ($c | type) == "string" then
+        "[\($e.type)] \($c)"
+      elif ($c | type) == "array" then
+        "[\($e.type)] " + (
+          $c | map(
+            if .type == "text" then .text
+            elif .type == "tool_use" then "[tool:\(.name // "?")]"
+            elif .type == "tool_result" then "[tool_result:\(.tool_use_id // "?" | .[0:8])]"
+            else "[\(.type // "?")]"
+            end
+          ) | join("\n")
+        )
+      else "" end
+  ' 2>/dev/null | tail -n "$max_turns")"
+  [ -z "$raw" ] && return 1
 
-[ -z "$RAW" ] && { echo "empty transcript content" >&2; exit 1; }
+  # FW-03 redact pass — mirrors ~/.claude/hooks/redact.sh + ghp/gho/ghs/sk-/AKIA/PEM.
+  redacted="$(printf '%s' "$raw" | sed -E \
+    -e 's/(ghp|gho|ghs|ghr|github_pat)_[A-Za-z0-9_]{20,}/[REDACTED:gh-token]/g' \
+    -e 's/sk-[A-Za-z0-9_-]{20,}/[REDACTED:api-key]/g' \
+    -e 's/AKIA[A-Z0-9]{16}/[REDACTED:aws-key]/g' \
+    -e 's/-----BEGIN [A-Z ]*PRIVATE KEY-----/[REDACTED:pem-begin]/g' \
+    -e 's/Bearer [A-Za-z0-9._-]{20,}/Bearer [REDACTED]/g' \
+  )"
 
-# ---- step 3: redact pass (FW-03) ------------------------------------------
-# Mirrors patterns from ~/.claude/hooks/redact.sh + ghp/gho/ghs/sk-/AKIA/PEM.
-REDACTED="$(printf '%s' "$RAW" | sed -E \
-  -e 's/(ghp|gho|ghs|ghr|github_pat)_[A-Za-z0-9_]{20,}/[REDACTED:gh-token]/g' \
-  -e 's/sk-[A-Za-z0-9_-]{20,}/[REDACTED:api-key]/g' \
-  -e 's/AKIA[A-Z0-9]{16}/[REDACTED:aws-key]/g' \
-  -e 's/-----BEGIN [A-Z ]*PRIVATE KEY-----/[REDACTED:pem-begin]/g' \
-  -e 's/Bearer [A-Za-z0-9._-]{20,}/Bearer [REDACTED]/g' \
-)"
+  # byte cap — keep the tail so most-recent context wins
+  if [ "${#redacted}" -gt "$max_bytes" ]; then
+    redacted="...[truncated $((${#redacted} - max_bytes)) bytes]...
+$(printf '%s' "$redacted" | tail -c "$max_bytes")"
+  fi
 
-# byte cap (head from the end so most-recent context wins)
-if [ "${#REDACTED}" -gt "$MAX_BYTES" ]; then
-  REDACTED="...[truncated $((${#REDACTED} - MAX_BYTES)) bytes]...
-$(printf '%s' "$REDACTED" | tail -c "$MAX_BYTES")"
-fi
+  printf '%s' "$redacted"
+}
+
+REDACTED="$(build_redacted "$MAX_TURNS" "$MAX_BYTES")"
+[ -z "$REDACTED" ] && { echo "empty transcript content" >&2; exit 1; }
 
 # ---- step 4: build extract prompt -----------------------------------------
 PROMPT="$(cat <<'EOF'
@@ -113,22 +120,22 @@ EOF
 # System-prompt-level constraint (belt + suspenders with the user-prompt instruction).
 SYSTEM_CONSTRAINT='Output strict JSON only. The entire response is a single JSON object starting with { and ending with }. No prose, no preamble, no analysis, no markdown fences. If nothing qualifies, return {"honcho":[],"wiki_candidates":[]}.'
 
-INPUT="$(printf '%s\n\n--- transcript (session=%s trigger=%s) ---\n%s\n' \
-  "$PROMPT" "$SESSION_ID" "$TRIGGER" "$REDACTED")"
+# Even more emphatic prompt used on retries (timeout or JSON-drift).
+STRICT='CRITICAL OUTPUT CONTRACT. Your entire response MUST be exactly one JSON object and nothing else. The very first character is { and the very last character is }. No prose. No code fences. No "Here is the JSON". If you have nothing to extract, output exactly: {"honcho":[],"wiki_candidates":[]}'
 
 # ---- step 5: call `claude -p` (OAuth via parent process) -------------------
 # CLAUDE_DISTILL_INFLIGHT=1 is already exported by distill.sh so the child's
 # SessionStart/PreCompact/etc. hooks short-circuit.
 #
-# Two-attempt strategy:
+# Three-attempt strategy:
 #   attempt 1 — full input + system constraint.
-#   attempt 2 (only if attempt 1's response is not parseable JSON) — same input,
-#              but with an even more emphatic system prompt prepended. Most
-#              Haiku "prose drift" failures recover on a single strict retry.
+#   attempt 2a (only on ec=124 / timeout, #72) — rebuild input with halved
+#               turns/bytes, retry with STRICT prompt.
+#   attempt 2b (only on JSON-drift, #70) — same input, STRICT prompt.
 
 call_claude() {
-  local sys="$1"
-  printf '%s' "$INPUT" | timeout "$TIMEOUT" claude -p \
+  local sys="$1" input="$2"
+  printf '%s' "$input" | timeout "$TIMEOUT" claude -p \
     --model "$MODEL" \
     --no-session-persistence \
     --output-format text \
@@ -141,36 +148,58 @@ try_parse() {
   printf '%s' "$1" | sed -E '/^[[:space:]]*```/d'
 }
 
-RESULT="$(call_claude "$SYSTEM_CONSTRAINT")"
+build_input() {
+  # $1 = REDACTED slice (already byte-capped)
+  printf '%s\n\n--- transcript (session=%s trigger=%s) ---\n%s\n' \
+    "$PROMPT" "$SESSION_ID" "$TRIGGER" "$1"
+}
+
+INPUT="$(build_input "$REDACTED")"
+RESULT="$(call_claude "$SYSTEM_CONSTRAINT" "$INPUT")"
 ec=$?
 
-if [ $ec -ne 0 ] || [ -z "$RESULT" ]; then
+# Timeout (#72): halve the window and retry once with STRICT.
+if [ $ec -eq 124 ]; then
+  half_turns=$(( MAX_TURNS / 2 ))
+  half_bytes=$(( MAX_BYTES / 2 ))
+  echo "attempt 1 timed out (ec=124); retrying with max_turns=$half_turns max_bytes=$half_bytes + STRICT" >&2
+  REDACTED2="$(build_redacted "$half_turns" "$half_bytes")"
+  if [ -n "$REDACTED2" ]; then
+    INPUT="$(build_input "$REDACTED2")"
+    RESULT="$(call_claude "$STRICT" "$INPUT")"
+    ec=$?
+  fi
+  if [ $ec -ne 0 ] || [ -z "$RESULT" ]; then
+    echo "claude -p timeout-retry also failed (ec=$ec) or empty" >&2
+    exit 1
+  fi
+  echo "recovered on timeout retry" >&2
+elif [ $ec -ne 0 ] || [ -z "$RESULT" ]; then
   echo "claude -p attempt 1 failed (ec=$ec) or empty result" >&2
   exit 1
 fi
 
 CLEAN="$(try_parse "$RESULT")"
 
-# Validate JSON. If it fails, do ONE retry with a stricter system prompt.
+# JSON-drift retry (#70): same input window, STRICT prompt.
 if ! printf '%s' "$CLEAN" | jq -e '.honcho and .wiki_candidates' >/dev/null 2>&1; then
-  echo "attempt 1 produced non-JSON; retrying with stricter system prompt" >&2
-  STRICT='CRITICAL OUTPUT CONTRACT. Your entire response MUST be exactly one JSON object and nothing else. The very first character is { and the very last character is }. No prose. No code fences. No "Here is the JSON". If you have nothing to extract, output exactly: {"honcho":[],"wiki_candidates":[]}'
-  RESULT2="$(call_claude "$STRICT")"
+  echo "attempt produced non-JSON; retrying with STRICT system prompt" >&2
+  RESULT2="$(call_claude "$STRICT" "$INPUT")"
   ec2=$?
   if [ $ec2 -ne 0 ] || [ -z "$RESULT2" ]; then
-    echo "claude -p attempt 2 failed (ec=$ec2) or empty result" >&2
-    echo "--- attempt 1 raw (head 1KB) ---" >&2
+    echo "JSON-drift retry failed (ec=$ec2) or empty" >&2
+    echo "--- previous attempt raw (head 1KB) ---" >&2
     printf '%s\n' "$RESULT" | head -c 1024 >&2
     exit 1
   fi
   CLEAN="$(try_parse "$RESULT2")"
   if ! printf '%s' "$CLEAN" | jq -e '.honcho and .wiki_candidates' >/dev/null 2>&1; then
-    echo "attempt 2 also produced non-JSON; giving up" >&2
-    echo "--- attempt 2 raw (head 1KB) ---" >&2
+    echo "JSON-drift retry also produced non-JSON; giving up" >&2
+    echo "--- retry raw (head 1KB) ---" >&2
     printf '%s\n' "$RESULT2" | head -c 1024 >&2
     exit 1
   fi
-  echo "recovered on retry" >&2
+  echo "recovered on JSON-drift retry" >&2
 fi
 
 # Tag with metadata for downstream consumers.

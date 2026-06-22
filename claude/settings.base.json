@@ -55,6 +55,12 @@
             "command": "bash /root/.claude/hooks/load-tools.sh SessionStart",
             "timeout": 10,
             "statusMessage": "Loading tool/command cheatsheet..."
+          },
+          {
+            "type": "command",
+            "command": "CLAUDE_DISTILL_INFLIGHT=1 bash /root/.claude/hooks/distill/queue-drain.sh >/dev/null 2>&1 &",
+            "timeout": 5,
+            "statusMessage": "Draining honcho retry queue (background)..."
           }
         ]
       }

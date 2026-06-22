@@ -8,7 +8,7 @@
 # .seen file with a 7-day TTL window so identical re-surfaces don't pile up.
 set -uo pipefail
 
-STATE_DIR=/root/.claude/state
+STATE_DIR="${CCC_STATE_DIR:-/root/.claude/state}"
 QUEUE="$STATE_DIR/wiki-candidates.md"
 SEEN="$STATE_DIR/wiki-candidates.seen"
 mkdir -p "$STATE_DIR" 2>/dev/null
