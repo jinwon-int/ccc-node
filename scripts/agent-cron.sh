@@ -23,12 +23,16 @@ while [ $# -gt 0 ]; do
       cat <<'EOF'
 Usage: agent-cron.sh [list|validate] [--store PATH] [--json]
        agent-cron.sh due [--store PATH] [--at ISO8601] [--json]
+       agent-cron.sh lock <task-id> --action acquire|release|probe --run-id ID [--scheduled-at ISO8601] [--at ISO8601] [--json]
        agent-cron.sh run <task-id>
 
 Implemented slices:
 - list/validate: inspect and validate the task definition store.
 - due: read-only dry-run schedule resolver. It reports due tasks, missed windows,
   catch-up policy, and lock paths, but never executes prompts or writes state.
+- lock: local atomic task-lock acquire/release/probe primitives only. It writes
+  lock files under the task store's sibling locks/ directory, but never executes
+  prompts, sends notifications, installs schedulers, or updates task history.
 
 No task execution, Telegram push, scheduler bootstrap, systemd/crontab writes,
 provider sends, lastRunAt updates, or remote-node actions are performed.
@@ -41,7 +45,7 @@ EOF
 done
 
 case "$CMD" in
-  list|validate|due) ;;
+  list|validate|due|lock) ;;
   run|execute|scheduler|install|enable|disable|add|remove)
     echo "agent-cron $CMD is not implemented in this read-only slice; no filesystem changes were made." >&2
     exit 2
@@ -50,10 +54,13 @@ case "$CMD" in
 esac
 
 export STORE JSON CMD AT
+export EXTRA_ARGS="$*"
 python3 - <<'PY'
 import json
 import os
 import re
+import shlex
+import socket
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -268,6 +275,170 @@ def lock_path(task_id):
     return base / 'locks' / f'{task_id}.lock'
 
 
+def boot_id():
+    try:
+        return Path('/proc/sys/kernel/random/boot_id').read_text(encoding='utf-8').strip()
+    except OSError:
+        return ''
+
+
+def task_by_id(data, task_id):
+    for task in data.get('tasks', []):
+        if task.get('id') == task_id:
+            return task
+    return None
+
+
+def read_lock(task_id):
+    path = lock_path(task_id)
+    if not path.exists():
+        return None, None
+    try:
+        data = json.loads(path.read_text(encoding='utf-8'))
+        if not isinstance(data, dict):
+            data = {'raw': data}
+    except Exception as e:
+        data = {'error': f'invalid lock JSON: {e}'}
+    return path, data
+
+
+def lock_age(lock, at):
+    try:
+        acquired = parse_dt(lock.get('acquiredAt'), 'acquiredAt')
+    except Exception:
+        return None
+    if acquired is None:
+        return None
+    return max(0, int((at - acquired).total_seconds()))
+
+
+def lock_status(task_id, task, at):
+    path, lock = read_lock(task_id)
+    base = {'lockPath': str(lock_path(task_id)), 'lockState': 'free'}
+    if lock is None:
+        return base
+    timeout = task.get('lockTimeoutSec', 0) if isinstance(task, dict) else 0
+    age = lock_age(lock, at)
+    stale = bool(timeout and age is not None and age > timeout)
+    state = 'stale' if stale else 'held'
+    base.update({'lockState': state, 'holder': lock, 'lockAgeSec': age, 'lockTimeoutSec': timeout})
+    return base
+
+
+def write_lock(path, payload):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    fd = os.open(str(path), flags, 0o600)
+    try:
+        os.write(fd, (json.dumps(payload, ensure_ascii=False, sort_keys=True) + '\n').encode('utf-8'))
+    finally:
+        os.close(fd)
+
+
+def parse_lock_args():
+    args = shlex.split(os.environ.get('EXTRA_ARGS', ''))
+    if not args:
+        raise ValueError('lock requires a task id')
+    task_id = args[0]
+    action = 'probe'
+    run_id = ''
+    scheduled_at = ''
+    at_value = at_raw
+    local_json = json_out
+    i = 1
+    while i < len(args):
+        a = args[i]
+        if a == '--json':
+            local_json = True
+        elif a == '--action':
+            i += 1
+            if i >= len(args):
+                raise ValueError('--action requires a value')
+            action = args[i]
+        elif a == '--run-id':
+            i += 1
+            if i >= len(args):
+                raise ValueError('--run-id requires a value')
+            run_id = args[i]
+        elif a == '--scheduled-at':
+            i += 1
+            if i >= len(args):
+                raise ValueError('--scheduled-at requires a value')
+            scheduled_at = args[i]
+        elif a == '--at':
+            i += 1
+            if i >= len(args):
+                raise ValueError('--at requires a value')
+            at_value = args[i]
+        else:
+            raise ValueError(f'unsupported lock argument: {a}')
+        i += 1
+    if action not in {'probe', 'acquire', 'release'}:
+        raise ValueError('--action must be one of acquire, release, probe')
+    if action in {'acquire', 'release'} and not run_id:
+        raise ValueError('--run-id is required for acquire/release')
+    return task_id, action, run_id, scheduled_at, at_value, local_json
+
+
+def emit_lock(result, as_json):
+    if as_json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    else:
+        print(f"agent-cron lock {result.get('taskId')}: {result.get('lockState')} ok={str(result.get('ok')).lower()}")
+
+
+def lock_command(data):
+    try:
+        task_id, action, run_id, scheduled_at, at_value, as_json = parse_lock_args()
+        at = parse_dt(at_value, '--at') if at_value else datetime.now(timezone.utc).replace(second=0, microsecond=0)
+        task = task_by_id(data, task_id)
+        if not task:
+            return {'ok': False, 'taskId': task_id, 'lockState': 'unknown-task', 'error': 'task id not found'}, as_json, 1
+        path = lock_path(task_id)
+        status = lock_status(task_id, task, at)
+        result = {'ok': True, 'taskId': task_id, 'action': action, **status}
+        if action == 'probe':
+            return result, as_json, 0
+        if action == 'release':
+            holder = status.get('holder') or {}
+            if status['lockState'] == 'free':
+                result.update({'lockState': 'free', 'ok': True})
+                return result, as_json, 0
+            if holder.get('runId') != run_id:
+                result.update({'ok': False, 'lockState': 'release-mismatch', 'runId': run_id})
+                return result, as_json, 1
+            path.unlink()
+            result.update({'ok': True, 'lockState': 'released', 'runId': run_id})
+            return result, as_json, 0
+        # acquire
+        reclaimed = False
+        if status['lockState'] == 'held':
+            result.update({'ok': False, 'lockState': 'held', 'runId': run_id})
+            return result, as_json, 1
+        if status['lockState'] == 'stale':
+            stale_path = path.with_name(f'{path.name}.stale.{int(at.timestamp())}.{os.getpid()}')
+            path.rename(stale_path)
+            reclaimed = True
+        payload = {
+            'taskId': task_id,
+            'runId': run_id,
+            'pid': os.getpid(),
+            'host': socket.gethostname(),
+            'bootId': boot_id(),
+            'acquiredAt': fmt_dt(at),
+            'scheduledAt': scheduled_at or fmt_dt(at),
+        }
+        try:
+            write_lock(path, payload)
+        except FileExistsError:
+            after = lock_status(task_id, task, at)
+            return {'ok': False, 'taskId': task_id, 'action': action, **after, 'runId': run_id}, as_json, 1
+        result = {'ok': True, 'taskId': task_id, 'action': action, 'lockPath': str(path), 'lockState': 'acquired', 'runId': run_id, 'reclaimedStale': reclaimed, 'holder': payload}
+        return result, as_json, 0
+    except Exception as e:
+        return {'ok': False, 'taskId': None, 'lockState': 'error', 'error': str(e)}, json_out, 1
+
+
 def normalize(data):
     out = {'version': 1, 'tasks': []}
     for t in data.get('tasks', []):
@@ -310,6 +481,7 @@ def due_plan(data):
     errors = []
     for idx, task in enumerate(data.get('tasks', [])):
         tid = task.get('id')
+        lock = lock_status(tid or f'task-{idx}', task, at)
         row = {
             'id': tid,
             'enabled': bool(task.get('enabled')),
@@ -325,10 +497,13 @@ def due_plan(data):
             'occurrenceScanLimit': OCCURRENCE_SCAN_LIMIT,
             'scheduledAt': None,
             'nextDueAt': None,
-            'lockPath': str(lock_path(tid or f'task-{idx}')),
-            'lockState': 'held' if lock_path(tid or f'task-{idx}').exists() else 'free',
+            'lockPath': lock['lockPath'],
+            'lockState': lock['lockState'],
             'status': 'disabled' if not task.get('enabled') else 'idle',
         }
+        for k in ('holder', 'lockAgeSec', 'lockTimeoutSec'):
+            if k in lock:
+                row[k] = lock[k]
         try:
             spec = parse_schedule(task.get('schedule') or '')
             last = parse_dt(task.get('lastRunAt'), f'tasks[{idx}].lastRunAt')
@@ -346,7 +521,12 @@ def due_plan(data):
                 else:
                     row['dueCount'] = 1
                 row['missedRuns'] = max(0, raw_missed - row['dueCount'])
-                row['status'] = 'locked' if row['lockState'] == 'held' else 'due'
+                if row['lockState'] == 'held':
+                    row['status'] = 'locked'
+                elif row['lockState'] == 'stale':
+                    row['status'] = 'stale-lock'
+                else:
+                    row['status'] = 'due'
             row['nextDueAt'] = fmt_dt(next_occurrence(spec, at))
         except Exception as e:
             row['status'] = 'invalid-schedule'
@@ -361,6 +541,11 @@ if errors:
     for e in errors:
         print(f'agent-cron: {e}', file=sys.stderr)
     sys.exit(1)
+
+if cmd == 'lock':
+    result, as_json, rc = lock_command(data)
+    emit_lock(result, as_json)
+    sys.exit(rc)
 
 if cmd == 'validate':
     if json_out:
