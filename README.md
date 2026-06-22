@@ -62,7 +62,12 @@ to Telegram, with all secrets and node-local state stripped out and replaced by 
   `retryState`/`retryEligibleAt` according to optional `retryPolicy`; this is
   planning state only. `scheduler --dry-run` adds a read-only single-tick
   scheduler plan that reports `would-run`/`skip` actions without acquiring
-  locks, executing prompts, writing spool files, or installing timers. When
+  locks, executing prompts, writing spool files, or installing timers.
+  `scheduler --execute` is an explicit one-shot executor for approved live/systemd
+  use; it consumes due/retry-due tasks through the same locked manual run path
+  but still never installs timers itself. `scripts/install-agent-cron-systemd.sh`
+  installs the systemd service/timer only when called with `--apply`; default is
+  dry-run. When
   `notify=telegram-owner`, manual run writes a short redacted owner-only bridge spool entry
   (`CCC_AGENT_CRON_PUSH_SPOOL`/`CCC_PUSH_SPOOL`), but still does not directly call
   Telegram/provider APIs or install schedulers.

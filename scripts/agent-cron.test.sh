@@ -186,7 +186,27 @@ ok "scheduler --dry-run plans due and retry-due actions" 'jq -e ".actions[] | se
 ok "scheduler --dry-run skips disabled and locked tasks" 'jq -e ".actions[] | select(.taskId == \"sched-disabled\" and .action == \"skip\" and .reason == \"disabled\")" <<<"$out" >/dev/null && jq -e ".actions[] | select(.taskId == \"sched-locked\" and .action == \"skip\" and .reason == \"locked\")" <<<"$out" >/dev/null'
 ok "scheduler --dry-run made no filesystem changes" '[ "$before" = "$after" ]'
 out="$(CCC_AGENT_CRON_STORE="$SCHED_STORE" bash "$CMD" scheduler --json --at 2026-01-01T00:05:00Z 2>&1)"; rc=$?
-ok "scheduler without --dry-run is blocked" '[ "$rc" = 2 ] && grep -q "requires --dry-run" <<<"$out"'
+ok "scheduler without mode is blocked" '[ "$rc" = 2 ] && grep -q "requires --dry-run or --execute" <<<"$out"'
+
+INSTALLER="$ROOT/scripts/install-agent-cron-systemd.sh"
+FAKE_SYSTEMCTL="$TMP/fake-systemctl.sh"
+cat > "$FAKE_SYSTEMCTL" <<'SH'
+#!/usr/bin/env bash
+printf '%s
+' "$*" >> "$FAKE_SYSTEMCTL_LOG"
+SH
+chmod +x "$FAKE_SYSTEMCTL"
+export FAKE_SYSTEMCTL_LOG="$TMP/systemctl.log"
+SYSTEMD_DIR="$TMP/systemd"
+before="$(find "$TMP" -type f -printf '%P %s %T@
+' | sort)"
+out="$(CCC_SYSTEMD_DIR="$SYSTEMD_DIR" CCC_SYSTEMCTL="$FAKE_SYSTEMCTL" bash "$INSTALLER" --dry-run --service-name ccc-agent-cron-test 2>&1)"; rc=$?
+after="$(find "$TMP" -type f -printf '%P %s %T@
+' | sort)"
+ok "systemd installer dry-run writes nothing" '[ "$rc" = 0 ] && grep -q "dry-run: would write" <<<"$out" && [ "$before" = "$after" ]'
+out="$(CCC_SYSTEMD_DIR="$SYSTEMD_DIR" CCC_SYSTEMCTL="$FAKE_SYSTEMCTL" bash "$INSTALLER" --apply --service-name ccc-agent-cron-test --store "$SCHED_STORE" --headless "$TMP/headless.sh" --spool "$TMP/spool" 2>&1)"; rc=$?
+ok "systemd installer apply writes service and timer" '[ "$rc" = 0 ] && [ -f "$SYSTEMD_DIR/ccc-agent-cron-test.service" ] && [ -f "$SYSTEMD_DIR/ccc-agent-cron-test.timer" ] && grep -q "scheduler --execute --json" "$SYSTEMD_DIR/ccc-agent-cron-test.service" && grep -q "Persistent=true" "$SYSTEMD_DIR/ccc-agent-cron-test.timer"'
+ok "systemd installer apply reloads/enables/restarts timer" 'grep -q "daemon-reload" "$FAKE_SYSTEMCTL_LOG" && grep -q "enable --now ccc-agent-cron-test.timer" "$FAKE_SYSTEMCTL_LOG" && grep -q "restart ccc-agent-cron-test.timer" "$FAKE_SYSTEMCTL_LOG"'
 
 BAD_SCHED="$TMP/bad-schedule.json"
 cat > "$BAD_SCHED" <<'JSON'
@@ -230,6 +250,15 @@ esac
 SH
 chmod +x "$FAKE_HEADLESS"
 export FAKE_HEADLESS_LOG="$TMP/fake-headless.log"
+
+SCHED_EXEC_STORE="$TMP/scheduler-exec-store/tasks.json"
+mkdir -p "$(dirname "$SCHED_EXEC_STORE")"
+cat > "$SCHED_EXEC_STORE" <<'JSON'
+{"version":1,"tasks":[{"id":"sched-exec-success","schedule":"* * * * *","prompt":"Scheduler success","enabled":true,"notify":"none","lastRunAt":"2026-01-01T00:00:00Z","lockTimeoutSec":60},{"id":"sched-exec-fail","schedule":"* * * * *","prompt":"Scheduler Fail","enabled":true,"notify":"none","lastRunAt":"2026-01-01T00:00:00Z","lockTimeoutSec":60}]}
+JSON
+out="$(CCC_AGENT_CRON_STORE="$SCHED_EXEC_STORE" CCC_HEADLESS_CMD="$FAKE_HEADLESS" bash "$CMD" scheduler --execute --json --at 2026-01-01T00:01:00Z --max-runs 2)"; rc=$?
+ok "scheduler --execute runs due tasks through run path" '[ "$rc" = 0 ] && jq -e ".mode == \"scheduler-execute-one-shot\" and .executedActions == 2 and .mutations.lockAcquire == true and .mutations.taskStoreWrite == true and .mutations.headlessExecute == true and .mutations.historyAppend == true" <<<"$out" >/dev/null'
+ok "scheduler --execute records success and failure without keeping locks" 'jq -e ".tasks[] | select(.id == \"sched-exec-success\" and .lastStatus == \"success\" and (.runHistory|length)==1)" "$SCHED_EXEC_STORE" >/dev/null && jq -e ".tasks[] | select(.id == \"sched-exec-fail\" and .lastStatus == \"failed\" and (.runHistory|length)==1)" "$SCHED_EXEC_STORE" >/dev/null && [ ! -e "$TMP/scheduler-exec-store/locks/sched-exec-success.lock" ] && [ ! -e "$TMP/scheduler-exec-store/locks/sched-exec-fail.lock" ]'
 
 out="$(CCC_AGENT_CRON_STORE="$EXEC_STORE" CCC_HEADLESS_CMD="$FAKE_HEADLESS" bash "$CMD" run exec-success --json --at 2026-01-01T00:01:00Z)"; rc=$?
 ok "run executes due task with fake headless" '[ "$rc" = 0 ] && jq -e ".ok == true and .status == \"success\" and .mutations.lockAcquire == true and .mutations.taskStoreWrite == true and .mutations.headlessExecute == true" <<<"$out" >/dev/null'
