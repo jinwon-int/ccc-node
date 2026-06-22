@@ -2,6 +2,22 @@
 
 All notable changes to the Claude Code node harness. Dates are KST.
 
+## [0.3.19] — 2026-06-22
+
+Fleet-readiness fix for `scripts/ccc-distill-check.sh` (#82).
+
+### Fixed
+- `scripts/ccc-distill-check.sh` drain counter awk was using the
+  gawk-specific 3-arg `match($0, /re/, m)` capture form, which is a
+  silent syntax error on `mawk` (the default `awk` on Debian/Ubuntu
+  fleet nodes). On those systems the drain counters came out empty,
+  which then failed the `jq --argjson` call in `--json` mode and broke
+  the per-node status snapshot mid-line. Replaced with portable 2-arg
+  `match()` + `substr()` so the counter output is identical on
+  `mawk`, `gawk`, and BWK `awk`. Covered by
+  `scripts/ccc-distill-check.test.sh` (the existing populated-state
+  case reproduces the mawk parse error against the old code).
+
 ## [0.3.18] — 2026-06-22
 
 Distill Tier-1 follow-up bundle — closes #71, #72, #73 in one PR.
