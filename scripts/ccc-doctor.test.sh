@@ -18,6 +18,16 @@ make_fixture() { # <name> <mode:standalone|plugin>
   cp "$ROOT/claude/settings.local.json" "$dir/repo/claude/settings.local.json"
   cp "$ROOT/claude/hooks/enforcement-overlay.json" "$dir/repo/claude/hooks/enforcement-overlay.json"
   cp "$ROOT/claude/hooks/hooks.json" "$dir/repo/claude/hooks/hooks.json"
+  cp "$ROOT/claude/hooks/load-memory.sh" "$dir/repo/claude/hooks/load-memory.sh"
+  cp "$ROOT/claude/hooks/load-tools.sh" "$dir/repo/claude/hooks/load-tools.sh"
+  cp "$ROOT/claude/hooks/checkpoint.sh" "$dir/repo/claude/hooks/checkpoint.sh"
+  cp "$ROOT/claude/hooks/statusline.sh" "$dir/repo/claude/hooks/statusline.sh"
+  cp "$ROOT/claude/hooks/guard.sh" "$dir/repo/claude/hooks/guard.sh"
+  cp "$ROOT/claude/hooks/audit.sh" "$dir/repo/claude/hooks/audit.sh"
+  cp "$ROOT/claude/hooks/redact.sh" "$dir/repo/claude/hooks/redact.sh"
+  cp "$ROOT/claude/hooks/notify.sh" "$dir/repo/claude/hooks/notify.sh"
+  cp "$ROOT/claude/hooks/evidence-gate.sh" "$dir/repo/claude/hooks/evidence-gate.sh"
+  cp "$ROOT/claude/output-styles/ccc-report.md" "$dir/repo/claude/output-styles/ccc-report.md"
   cp "$ROOT/claude/hooks/load-memory.sh" "$dir/home/.claude/hooks/load-memory.sh"
   cp "$ROOT/claude/hooks/load-tools.sh" "$dir/home/.claude/hooks/load-tools.sh"
   cp "$ROOT/claude/hooks/checkpoint.sh" "$dir/home/.claude/hooks/checkpoint.sh"
@@ -101,6 +111,37 @@ ok "--rollback --apply creates pre-rollback backup" 'find "$repair/home/.claude/
 nobackup="$(make_fixture nobackup standalone)"
 out="$(run_doctor "$nobackup" --rollback --apply 2>&1)"; rc=$?
 ok "--rollback --apply fails closed without backup" '[ "$rc" = 1 ] && grep -q "no rollback backup found" <<<"$out"'
+
+files="$(make_fixture files standalone)"
+rm -f "$files/home/.claude/hooks/statusline.sh"
+printf 'drifted output style\n' > "$files/home/.claude/output-styles/ccc-report.md"
+before="$(find "$files" -type f -printf '%P %s %T@\n' | sort)"
+out="$(run_doctor "$files" --fix --scope=files 2>&1)"; rc=$?
+after="$(find "$files" -type f -printf '%P %s %T@\n' | sort)"
+ok "--fix --scope=files is dry-run" '[ "$rc" = 1 ] && grep -q "dry-run: would reinstall scoped files" <<<"$out" && [ "$before" = "$after" ]'
+
+out="$(run_doctor "$files" --fix --apply --scope=files 2>&1)"; rc=$?
+ok "--fix --apply --scope=files repairs allowlisted files" '[ "$rc" = 0 ] && grep -q "applied scoped file repair" <<<"$out"'
+ok "file repair restores missing hook" 'cmp -s "$ROOT/claude/hooks/statusline.sh" "$files/home/.claude/hooks/statusline.sh"'
+ok "file repair restores output style drift" 'cmp -s "$ROOT/claude/output-styles/ccc-report.md" "$files/home/.claude/output-styles/ccc-report.md"'
+ok "file repair creates scoped backup tar" 'find "$files/home/.claude/backups" -name "ccc-doctor-files-*.tar.gz" | grep -q .'
+backup_count_before="$(find "$files/home/.claude/backups" -name "ccc-doctor-files-*.tar.gz" | wc -l)"
+out="$(run_doctor "$files" --fix --apply --scope=files 2>&1)"; rc=$?
+backup_count_after="$(find "$files/home/.claude/backups" -name "ccc-doctor-files-*.tar.gz" | wc -l)"
+ok "file repair is idempotent" '[ "$rc" = 0 ] && [ "$backup_count_before" = "$backup_count_after" ] && grep -q "no repairs needed" <<<"$out"'
+
+symlink="$(make_fixture symlink standalone)"
+rm -f "$symlink/home/.claude/hooks/statusline.sh"
+ln -s /tmp/ccc-doctor-symlink-target "$symlink/home/.claude/hooks/statusline.sh"
+before="$(find "$symlink" -type f,l -printf '%P %s %T@ %l\n' | sort)"
+out="$(run_doctor "$symlink" --fix --apply --scope=files 2>&1)"; rc=$?
+after="$(find "$symlink" -type f,l -printf '%P %s %T@ %l\n' | sort)"
+ok "file repair refuses destination symlink" '[ "$rc" = 1 ] && grep -q "destination symlink refused" <<<"$out" && [ "$before" = "$after" ]'
+
+plugin_repair="$(make_fixture plugin-repair plugin)"
+rm -f "$plugin_repair/home/.claude/hooks/statusline.sh"
+out="$(run_doctor "$plugin_repair" --fix --apply --scope=files 2>&1)"; rc=$?
+ok "file repair refuses plugin mode" '[ "$rc" = 1 ] && grep -q "double-firing" <<<"$out"'
 
 manual="$(make_fixture manual standalone)"
 printf '{not-json}\n' > "$manual/home/.claude/settings.json"
