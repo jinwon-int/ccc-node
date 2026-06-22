@@ -5,7 +5,9 @@
 # Auto-PR is intentionally NOT done here (human gate per TM-1058).
 #
 # De-dup: each candidate's title (lowercased, trimmed) is hashed; we maintain a
-# .seen file with a 7-day TTL window so identical re-surfaces don't pile up.
+# .seen file with a 7-day TTL window. The canonical format is:
+#   <first_epoch> <last_epoch> <count> <hash>
+# Legacy lines are accepted as either `<epoch> <hash>` or `<hash>`.
 set -uo pipefail
 
 STATE_DIR="${CCC_STATE_DIR:-/root/.claude/state}"
@@ -27,6 +29,89 @@ if [ ! -f "$QUEUE" ]; then
 
 EOF
 fi
+
+NOW_EPOCH="$(date -u +%s)"
+CUTOFF_EPOCH="$(date -u -d '7 days ago' +%s 2>/dev/null || echo 0)"
+STALE_CUTOFF_ISO="$(date -u -d '7 days ago' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || printf '0000-00-00T00:00:00Z')"
+HOTNESS_THRESHOLD="${CCC_DISTILL_HOTNESS_THRESHOLD:-3}"
+case "$HOTNESS_THRESHOLD" in ''|*[!0-9]*) HOTNESS_THRESHOLD=3 ;; esac
+[ "$HOTNESS_THRESHOLD" -lt 1 ] && HOTNESS_THRESHOLD=3
+
+normalize_seen() {
+  [ -f "$SEEN" ] || { : > "$SEEN"; return 0; }
+  awk -v cutoff="$CUTOFF_EPOCH" -v now="$NOW_EPOCH" '
+    function isnum(v) { return v ~ /^[0-9]+$/ }
+    NF == 0 { next }
+    NF == 1 {
+      first=now; last=now; count=1; hash=$1
+    }
+    NF == 2 {
+      first=$1; last=$1; count=1; hash=$2
+      if (!isnum(first)) { first=now; last=now; count=1; hash=$1 }
+    }
+    NF >= 4 {
+      first=$1; last=$2; count=$3; hash=$4
+      if (!isnum(first)) first=now
+      if (!isnum(last)) last=first
+      if (!isnum(count) || count < 1) count=1
+    }
+    hash != "" && last >= cutoff {
+      # Last duplicate wins if stale/manual edits created repeated hashes.
+      row[hash]=first " " last " " count " " hash
+    }
+    END {
+      for (h in row) print row[h]
+    }
+  ' "$SEEN" > "$SEEN.tmp" 2>/dev/null && mv "$SEEN.tmp" "$SEEN"
+}
+
+seen_row() { # <hash>
+  awk -v h="$1" '$4 == h { print; exit }' "$SEEN" 2>/dev/null
+}
+
+update_seen() { # <hash> <first> <last> <count>
+  local hash="$1" first="$2" last="$3" count="$4" tmp found=0
+  tmp="$SEEN.tmp.$$"
+  awk -v h="$hash" -v first="$first" -v last="$last" -v count="$count" '
+    $4 == h { print first, last, count, h; found=1; next }
+    { print }
+    END { if (!found) print first, last, count, h }
+  ' "$SEEN" > "$tmp" 2>/dev/null && mv "$tmp" "$SEEN"
+}
+
+mark_stale_pending() {
+  [ -f "$QUEUE" ] || return 0
+  awk -v cutoff="$STALE_CUTOFF_ISO" '
+    function reset() { block=""; pending=0; distilled="" }
+    function flush() {
+      if (block == "") return
+      if (pending && distilled != "" && distilled < cutoff && block !~ /\(stale: pending review\)/) {
+        sub(/\n/, " (stale: pending review)\n", block)
+      }
+      printf "%s", block
+      reset()
+    }
+    BEGIN { reset() }
+    /^## \[CAND-[0-9]+\]/ {
+      flush()
+      block=$0 "\n"
+      next
+    }
+    {
+      if (block != "") {
+        block = block $0 "\n"
+        if ($0 ~ /^- status: pending/) pending=1
+        if ($0 ~ /^- distilled-at: /) distilled=$3
+      } else {
+        print
+      }
+    }
+    END { flush() }
+  ' "$QUEUE" > "$QUEUE.tmp" 2>/dev/null && mv "$QUEUE.tmp" "$QUEUE"
+}
+
+normalize_seen
+mark_stale_pending
 
 PAYLOAD="$(cat 2>/dev/null)"
 [ -n "$PAYLOAD" ] || exit 0
@@ -51,15 +136,6 @@ LAST_ID="$(grep -oE '\[CAND-[0-9]+\]' "$QUEUE" 2>/dev/null | grep -oE '[0-9]+' |
 [ -z "$LAST_ID" ] && LAST_ID=0
 NEXT_ID=$((LAST_ID + 1))
 
-# Prune seen file (>7 days old entries dropped).
-if [ -f "$SEEN" ]; then
-  CUTOFF=$(date -u -d '7 days ago' +%s 2>/dev/null || echo 0)
-  awk -v cutoff="$CUTOFF" '$1 >= cutoff' "$SEEN" > "$SEEN.tmp" 2>/dev/null \
-    && mv "$SEEN.tmp" "$SEEN"
-fi
-touch "$SEEN"
-
-NOW_EPOCH="$(date -u +%s)"
 ADDED=0
 SKIPPED=0
 
@@ -78,14 +154,35 @@ for i in $(seq 0 $((LEN - 1))); do
   HASH="$(printf '%s' "$TITLE" | tr '[:upper:]' '[:lower:]' | tr -s ' ' \
     | sha256sum | cut -c1-12)"
 
-  if grep -q " $HASH$" "$SEEN" 2>/dev/null; then
+  ROW="$(seen_row "$HASH")"
+  FIRST="$NOW_EPOCH"
+  OLD_COUNT=0
+  if [ -n "$ROW" ]; then
+    FIRST="$(printf '%s' "$ROW" | awk '{print $1}')"
+    OLD_COUNT="$(printf '%s' "$ROW" | awk '{print $3}')"
+    case "$OLD_COUNT" in ''|*[!0-9]*) OLD_COUNT=1 ;; esac
+  fi
+  NEW_COUNT=$((OLD_COUNT + 1))
+  update_seen "$HASH" "$FIRST" "$NOW_EPOCH" "$NEW_COUNT"
+
+  HOT_EMIT=0
+  if [ "$OLD_COUNT" -gt 0 ] && [ "$OLD_COUNT" -lt "$HOTNESS_THRESHOLD" ] && [ "$NEW_COUNT" -ge "$HOTNESS_THRESHOLD" ]; then
+    HOT_EMIT=1
+  fi
+
+  if [ "$OLD_COUNT" -gt 0 ] && [ "$HOT_EMIT" != "1" ]; then
     SKIPPED=$((SKIPPED + 1))
     continue
   fi
 
+  DISPLAY_TITLE="$TITLE"
+  if [ "$HOT_EMIT" = "1" ]; then
+    DISPLAY_TITLE="🔥 HOT (seen ×$NEW_COUNT) — $TITLE"
+  fi
+
   # Append entry.
   {
-    printf '\n## [CAND-%d] %s — %s\n' "$NEXT_ID" "$DATE" "$TITLE"
+    printf '\n## [CAND-%d] %s — %s\n' "$NEXT_ID" "$DATE" "$DISPLAY_TITLE"
     printf -- '- suggested-path: `%s`\n' "$PATH_S"
     printf -- '- proposed-id: TM-?? (assign at PR time)\n'
     printf -- '- source-session: `%s` (trigger=%s)\n' "$SID" "$TRG"
@@ -100,7 +197,6 @@ for i in $(seq 0 $((LEN - 1))); do
     fi
   } >> "$QUEUE"
 
-  echo "$NOW_EPOCH $HASH" >> "$SEEN"
   NEXT_ID=$((NEXT_ID + 1))
   ADDED=$((ADDED + 1))
 done
