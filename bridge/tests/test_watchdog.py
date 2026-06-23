@@ -42,6 +42,17 @@ sys.modules["telegram_bot.utils.config"] = config_module
 sys.modules.pop("telegram_bot.core.bot", None)
 import telegram_bot.core.bot as bot_module
 
+bot_module.health_reporter = types.SimpleNamespace(
+    initialize_process=lambda: None,
+    mark_starting=lambda reason=None: None,
+    mark_unavailable=lambda reason=None: None,
+    cleanup_runtime_files=lambda: None,
+    record_telegram_ok=lambda: None,
+    record_telegram_error=lambda error, consecutive_failures=None: None,
+    record_claude_ok=lambda: None,
+    record_claude_error=lambda error: None,
+)
+
 TelegramBot = bot_module.TelegramBot
 _PollingRestart = bot_module._PollingRestart
 

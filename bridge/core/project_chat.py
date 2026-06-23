@@ -758,6 +758,7 @@ class ProjectChatHandler:
                     future=retry_future,
                     streaming_handler=retry_handler,
                 )
+                retry_state: Optional[_UserStreamState] = None
                 try:
                     retry_state = await self._get_or_create_stream(
                         user_id, model, new_session=False
@@ -776,6 +777,13 @@ class ProjectChatHandler:
                         )
                     return await asyncio.wait_for(retry_future, timeout=PROCESS_TIMEOUT)
                 except Exception as retry_err:
+                    if retry_state and retry_request in retry_state.pending:
+                        try:
+                            retry_state.pending.remove(retry_request)
+                        except ValueError:
+                            pass
+                    if not retry_future.done():
+                        retry_future.cancel()
                     logger.error(
                         "Retry also failed for user %s: %s",
                         user_id,
