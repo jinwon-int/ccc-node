@@ -1,8 +1,52 @@
+# pyright: reportMissingImports=false
 """
 Tests for revert command functionality.
 """
 
+import tempfile
 import unittest
+from pathlib import Path
+
+from telegram_bot.core.conversation_paths import resolve_conversation_file
+
+
+class TestConversationPathResolution(unittest.TestCase):
+    """Test conversation JSONL path containment checks."""
+
+    def test_resolves_session_file_under_conversations_dir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "conversations"
+            root.mkdir()
+
+            self.assertEqual(
+                resolve_conversation_file(root, "session-123"),
+                root.resolve() / "session-123.jsonl",
+            )
+
+    def test_rejects_path_traversal_session_id(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "conversations"
+            root.mkdir()
+
+            self.assertIsNone(resolve_conversation_file(root, "../outside/session"))
+
+    def test_rejects_absolute_session_id(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "conversations"
+            root.mkdir()
+
+            self.assertIsNone(resolve_conversation_file(root, "/tmp/not-a-session"))
+
+    def test_rejects_symlink_escape(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            root = base / "conversations"
+            root.mkdir()
+            outside = base / "outside.jsonl"
+            outside.write_text("outside\n", encoding="utf-8")
+            (root / "link.jsonl").symlink_to(outside)
+
+            self.assertIsNone(resolve_conversation_file(root, "link"))
 
 
 class TestRevertCallbackParsing(unittest.TestCase):
