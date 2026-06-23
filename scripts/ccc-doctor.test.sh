@@ -84,6 +84,24 @@ after="$(find "$repair" -type f -printf '%P %s %T@\n' | sort)"
 ok "--fix defaults to dry-run plan" '[ "$rc" = 1 ] && grep -q "dry-run" <<<"$out" && grep -q "would repair settings.json" <<<"$out"'
 ok "--fix dry-run made no filesystem changes" '[ "$before" = "$after" ]'
 
+backup_fail="$(make_fixture backup-fail standalone)"
+jq '.outputStyle="plain"' "$backup_fail/home/.claude/settings.json" > "$backup_fail/home/.claude/settings.json.tmp"
+mv "$backup_fail/home/.claude/settings.json.tmp" "$backup_fail/home/.claude/settings.json"
+mkdir -p "$backup_fail/bin"
+cat > "$backup_fail/bin/tar" <<'EOF'
+#!/usr/bin/env bash
+case "$1" in
+  -czf) printf 'not a tar archive\n' > "$2"; exit 0 ;;
+  -tzf) exit 1 ;;
+esac
+exec /usr/bin/tar "$@"
+EOF
+chmod +x "$backup_fail/bin/tar"
+settings_before="$(cat "$backup_fail/home/.claude/settings.json")"
+out="$(PATH="$backup_fail/bin:$PATH" CCC_DOCTOR_REPO_DIR="$backup_fail/repo" CCC_DOCTOR_CLAUDE_DIR="$backup_fail/home/.claude" bash "$DOCTOR" --fix --apply 2>&1)"; rc=$?
+settings_after="$(cat "$backup_fail/home/.claude/settings.json")"
+ok "--fix --apply fails closed when backup tar validation fails" '[ "$rc" = 1 ] && grep -q "failed to create valid settings backup" <<<"$out" && [ "$settings_before" = "$settings_after" ]'
+
 out="$(run_doctor "$repair" --fix --apply 2>&1)"; rc=$?
 ok "--fix --apply repairs drift" '[ "$rc" = 0 ]'
 ok "--fix --apply restores outputStyle" 'jq -e ".outputStyle == \"ccc-report\"" "$repair/home/.claude/settings.json" >/dev/null'

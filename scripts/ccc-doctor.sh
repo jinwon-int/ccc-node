@@ -260,7 +260,12 @@ apply_settings_repair() {
   ts="$(date +%Y%m%d-%H%M%S)"
   archive="$CLAUDE_DIR/backups/ccc-doctor-$ts.tar.gz"
   mkdir -p "$CLAUDE_DIR/backups"
-  tar -czf "$archive" -C "$CLAUDE_DIR" settings.json
+  if ! tar -czf "$archive" -C "$CLAUDE_DIR" settings.json \
+    || ! validate_settings_backup "$archive"; then
+    rm -f "${settings_desired_tmp:-}"
+    printf 'failed to create valid settings backup: %s\n' "$archive" >&2
+    return 1
+  fi
   mv "$settings_desired_tmp" "$SETTINGS"
   printf 'applied settings.json repair; backup=%s\n' "$archive"
 }

@@ -73,7 +73,14 @@ backup_claude_dir() {
   ts="$(date +%Y%m%d-%H%M%S)"
   archive="$CLAUDE_DIR/backups/ccc-node-setup-$ts.tar.gz"
   run "mkdir -p '$CLAUDE_DIR/backups'"
-  run "tar -czf '$archive' -C '$CLAUDE_DIR' ${items[*]}"
+  if ! run "tar -czf '$archive' -C '$CLAUDE_DIR' ${items[*]}"; then
+    echo "Backup creation failed: $archive" >&2
+    return 1
+  fi
+  if [ "$DRY" != 1 ] && ! tar -tzf "$archive" "${items[@]}" >/dev/null 2>&1; then
+    echo "Backup validation failed: $archive" >&2
+    return 1
+  fi
   note "backed up existing config -> $archive (restore: tar -xzf <archive> -C '$CLAUDE_DIR')"
 }
 
