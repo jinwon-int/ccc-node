@@ -68,34 +68,62 @@ Operator arg: `$ARGUMENTS`
      CUTOFF="$(date -u -d "$DAYS days ago" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || printf '0000-00-00T00:00:00Z')"
      printf '[distill stats — last %s days]\n' "$DAYS"
      awk -v cutoff="$CUTOFF" '
+       # Resolve trigger for a log line:
+       #   1) inline `trigger=…` (preferred — current distill.sh emits it on every line)
+       #   2) PID lookup against the most recent `start trigger=X pid=Y` line for the same PID
+       #      (handles format drift between start/start-bg/done where PIDs differ but still
+       #       lets us correlate when one stage has it and another does not)
+       #   3) "unknown" (truly historical lines from older distill.sh versions)
+       function get_trigger(line,    p) {
+         if (match(line, /trigger=[^ ]+/)) return substr(line, RSTART+8, RLENGTH-8)
+         if (match(line, /pid=[0-9]+/)) {
+           p=substr(line, RSTART+4, RLENGTH-4)
+           if (p in pid_trigger) return pid_trigger[p]
+         }
+         return "unknown"
+       }
        $1 < cutoff { next }
        /start trigger=/ {
-         trigger="unknown"
+         trigger="unknown"; pid=""
          if (match($0, /trigger=[^ ]+/)) { trigger=substr($0, RSTART+8, RLENGTH-8) }
+         if (match($0, /pid=[0-9]+/))    { pid=substr($0, RSTART+4, RLENGTH-4) }
+         if (pid != "") pid_trigger[pid]=trigger
          total[trigger]++
+         next
+       }
+       /spawned bg pid=/ {
+         # Bridge parent (start) PID -> bg (worker) PID so downstream lines that
+         # log only the bg pid still resolve their trigger via the cache.
+         if (match($0, /pid=[0-9]+/)) {
+           bg=substr($0, RSTART+4, RLENGTH-4)
+           # Find the most recent start-trigger by scanning known parents.
+           for (p in pid_trigger) parent_trigger=pid_trigger[p]
+           pid_trigger[bg]=parent_trigger
+         }
+         next
        }
        / done trigger=/ {
-         trigger="unknown"; elapsed=""
-         if (match($0, /trigger=[^ ]+/)) { trigger=substr($0, RSTART+8, RLENGTH-8) }
+         trigger=get_trigger($0); elapsed=""
          if (match($0, /elapsed_s=[0-9]+/)) { elapsed=substr($0, RSTART+10, RLENGTH-10); elapsed_sum[trigger]+=elapsed; elapsed_n[trigger]++ }
          done[trigger]++
+         next
        }
        /extract failed/ {
-         trigger="unknown"; elapsed=""
-         if (match($0, /trigger=[^ ]+/)) { trigger=substr($0, RSTART+8, RLENGTH-8) }
+         trigger=get_trigger($0); elapsed=""
          if (match($0, /elapsed_s=[0-9]+/)) { elapsed=substr($0, RSTART+10, RLENGTH-10); elapsed_sum[trigger]+=elapsed; elapsed_n[trigger]++ }
          failed[trigger]++
+         next
        }
        /dry-run skipping/ {
-         trigger="unknown"; elapsed=""
-         if (match($0, /trigger=[^ ]+/)) { trigger=substr($0, RSTART+8, RLENGTH-8) }
+         trigger=get_trigger($0); elapsed=""
          if (match($0, /elapsed_s=[0-9]+/)) { elapsed=substr($0, RSTART+10, RLENGTH-10); elapsed_sum[trigger]+=elapsed; elapsed_n[trigger]++ }
          dryrun[trigger]++
+         next
        }
        /skip reason=|skipped reason=/ {
-         trigger="unknown"
-         if (match($0, /trigger=[^ ]+/)) { trigger=substr($0, RSTART+8, RLENGTH-8) }
+         trigger=get_trigger($0)
          skip[trigger]++
+         next
        }
        END {
          split("manual precompact sessionend unknown", order, " ")

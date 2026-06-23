@@ -73,5 +73,61 @@ ok "stale pending entry is marked once" '[ "$rc" = 0 ] && grep -q "\[CAND-99\].*
 ok "merged entries are not marked stale" '! grep -q "\[CAND-100\].*(stale: pending review)" "$CCC_STATE_DIR/wiki-candidates.md"'
 ok "distill status documents pending stale hot counts" 'grep -q "pending=.*stale=.*hot=" "$SKILL" || grep -q "pending/stale/hot" "$SKILL"'
 
+# ---- Issue #133: title normalization collapses cosmetic variants -----------
+# Reset state so the dedup tests don't fight prior fixtures.
+rm -rf "$CCC_STATE_DIR"
+mkdir -p "$CCC_STATE_DIR"
+
+# Cluster A: two #82 variants — bilingual prefix + punctuation differ, dedup must collapse.
+# (Two variants stay below the HOT threshold so we can measure pure dedup behavior.)
+ISSUE82_PAYLOAD='{"session_id":"sess-i82","trigger":"manual","wiki_candidates":[
+  {"title":"#82 distill fleet rollout: per-node smoke 절차","suggested_path":"pages/log.md","summary":"a"},
+  {"title":"이슈 #82: distill fleet verification per-node 체크리스트 현황","suggested_path":"pages/log.md","summary":"b"}
+],"honcho":[]}'
+out="$(printf '%s' "$ISSUE82_PAYLOAD" | bash "$WIKI_QUEUE" 2>&1)"; rc=$?
+ok "issue-anchored variants: first wins, rest dedup" '[ "$rc" = 0 ] && grep -q "added=1 skipped(dup)=1 total_in=2" <<<"$out"'
+ok "issue-anchored seen-file has exactly one row for cluster" '[ "$(wc -l < "$CCC_STATE_DIR/wiki-candidates.seen")" = 1 ]'
+
+# Cluster A continued: a third sighting (different cosmetic variant) crosses the
+# HOT threshold and produces a 🔥 HOT entry — proving the dedup-hit chain works.
+ISSUE82_HOT_PAYLOAD='{"session_id":"sess-i82b","trigger":"manual","wiki_candidates":[
+  {"title":"Distill Fleet Rollout (#82) 노드별 검증 체크리스트","suggested_path":"pages/log.md","summary":"c"}
+],"honcho":[]}'
+out="$(printf '%s' "$ISSUE82_HOT_PAYLOAD" | bash "$WIKI_QUEUE" 2>&1)"; rc=$?
+ok "issue-anchored third sighting triggers HOT marking" '[ "$rc" = 0 ] && grep -q "added=1 skipped(dup)=0 total_in=1" <<<"$out" && grep -q "🔥 HOT (seen ×3)" "$CCC_STATE_DIR/wiki-candidates.md"'
+
+# Cluster B: multi-issue title (#82/#83/#84) must NOT collapse into #82-only bucket.
+MULTI_PAYLOAD='{"session_id":"sess-multi","trigger":"manual","wiki_candidates":[
+  {"title":"ccc-node #82/#83/#84: distill fleet 검증 (rollout/outage/PreCompact)","suggested_path":"pages/log.md","summary":"multi"}
+],"honcho":[]}'
+out="$(printf '%s' "$MULTI_PAYLOAD" | bash "$WIKI_QUEUE" 2>&1)"; rc=$?
+ok "multi-issue title is distinct from single-issue bucket" '[ "$rc" = 0 ] && grep -q "added=1 skipped(dup)=0 total_in=1" <<<"$out" && [ "$(wc -l < "$CCC_STATE_DIR/wiki-candidates.seen")" = 2 ]'
+
+# Cluster C: sigilless variants — round-tag and punctuation should still dedup.
+# Two variants stay below HOT threshold; (r18) parens-stripped + round-stripped
+# must collapse with the bare form.
+SIGILLESS_PAYLOAD='{"session_id":"sess-noissue","trigger":"manual","wiki_candidates":[
+  {"title":"agent-cron 계층적 슬라이스 구현 전략 (r18)","suggested_path":"pages/log.md","summary":"a"},
+  {"title":"agent-cron 계층적 슬라이스 구현 전략","suggested_path":"pages/log.md","summary":"b"}
+],"honcho":[]}'
+out="$(printf '%s' "$SIGILLESS_PAYLOAD" | bash "$WIKI_QUEUE" 2>&1)"; rc=$?
+ok "sigilless variants dedup via round-tag + punctuation strip" '[ "$rc" = 0 ] && grep -q "added=1 skipped(dup)=1 total_in=2" <<<"$out"'
+
+# Cluster D: section-prefix variants dedup.
+PREFIX_PAYLOAD='{"session_id":"sess-prefix","trigger":"manual","wiki_candidates":[
+  {"title":"Decision: Honcho 인증 강제 절차","suggested_path":"pages/log.md","summary":"a"},
+  {"title":"결정: Honcho 인증 강제 절차","suggested_path":"pages/log.md","summary":"b"}
+],"honcho":[]}'
+out="$(printf '%s' "$PREFIX_PAYLOAD" | bash "$WIKI_QUEUE" 2>&1)"; rc=$?
+ok "section-prefix variants (Decision/결정) dedup" '[ "$rc" = 0 ] && grep -q "added=1 skipped(dup)=1 total_in=2" <<<"$out"'
+
+# Cluster E: distinct topics must NOT collapse.
+DISTINCT_PAYLOAD='{"session_id":"sess-distinct","trigger":"manual","wiki_candidates":[
+  {"title":"xurl media upload requires oauth1","suggested_path":"pages/log.md","summary":"a"},
+  {"title":"Streamlit scroll UX patterns","suggested_path":"pages/log.md","summary":"b"}
+],"honcho":[]}'
+out="$(printf '%s' "$DISTINCT_PAYLOAD" | bash "$WIKI_QUEUE" 2>&1)"; rc=$?
+ok "distinct topics are not collapsed" '[ "$rc" = 0 ] && grep -q "added=2 skipped(dup)=0 total_in=2" <<<"$out"'
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

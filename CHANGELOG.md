@@ -2,6 +2,37 @@
 
 All notable changes to the Claude Code node harness. Dates are KST.
 
+## [Unreleased]
+
+Distill observability follow-up — closes #130, #133.
+
+### Changed
+- `claude/hooks/distill.sh` (#130): the three `skip reason=…` log lines
+  (`no-transcript`, `cwd-out-of-scope`, `too-few-turns`) now emit
+  `trigger=$TRIGGER pid=$$` so `/distill stats` can attribute them to the
+  correct trigger column instead of falling through to `unknown:`.
+- `claude/skills/distill/SKILL.md` (#130): the stats awk now caches
+  `pid → trigger` from `start trigger=… pid=…` lines (plus a parent→bg PID
+  bridge from `spawned bg pid=…`) and falls back to that cache when a
+  downstream line lacks an inline `trigger=` field. Truly historical
+  orphan lines (no trigger, no pid) still bucket into `unknown:`.
+- `claude/hooks/distill/wiki-queue.sh` (#133): replaced the title-only
+  hash with `title_hash()`. Strategy A — if the title contains one or
+  more `#NNN` tokens, the hash is determined by the sorted set of issue
+  numbers (so `#82 ...`, `Issue #82: ...`, `이슈 #82: ...`, `... (#82) ...`
+  all collapse). Strategy B — sigilless titles get aggressive
+  normalization (lowercase, strip bilingual section prefixes with colon,
+  strip space-bounded `r\d+` round tags, replace common punctuation with
+  space, collapse whitespace). The `.seen` file format is unchanged — old
+  rows live their 7-day TTL and roll off naturally.
+
+### Tests
+- `claude/hooks/distill/wiki-queue.test.sh` — new cases covering
+  issue-anchored cluster collapse, multi-issue distinctness, sigilless
+  variant dedup (round-tag + punctuation), section-prefix bilingual
+  dedup, and a HOT-crossing chain proving the dedup signal now feeds
+  the existing `#76` hot mechanism end-to-end.
+
 ## [0.3.18] — 2026-06-22
 
 Distill Tier-1 follow-up bundle — closes #71, #72, #73 in one PR.
