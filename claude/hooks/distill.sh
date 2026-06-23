@@ -87,7 +87,10 @@ if [ -z "$TRANSCRIPT_PATH" ] || [ ! -f "$TRANSCRIPT_PATH" ]; then
 fi
 
 if [ -z "$TRANSCRIPT_PATH" ] || [ ! -f "$TRANSCRIPT_PATH" ]; then
-  log "skip reason=no-transcript"
+  log "skip reason=no-transcript trigger=$TRIGGER pid=$$"
+  # ^ trigger=/pid= kept after the semantic fields (reason=, cwd=, turns=)
+  # so existing log-parsers and tests that grep "skip reason=…<semantic>"
+  # substrings keep working — see distill-scope.test.sh.
   exit 0
 fi
 
@@ -104,7 +107,7 @@ fi
 log "transcript=$TRANSCRIPT_PATH session=$SESSION_ID source_cwd=$SOURCE_CWD source_project=$PROJECT_ENC"
 
 if ! scope_allows_project "$PROJECT_ENC" "$SOURCE_CWD"; then
-  log "skip reason=cwd-out-of-scope cwd=$SOURCE_CWD project=$PROJECT_ENC"
+  log "skip reason=cwd-out-of-scope cwd=$SOURCE_CWD project=$PROJECT_ENC trigger=$TRIGGER pid=$$"
   exit 0
 fi
 
@@ -118,7 +121,7 @@ case "$MIN_TURNS" in ''|*[!0-9]*) MIN_TURNS=3 ;; esac
 case "$TURN_WINDOW" in ''|*[!0-9]*) TURN_WINDOW=400 ;; esac
 case "$TURNS" in ''|*[!0-9]*) TURNS=0 ;; esac
 if [ "$TURNS" -lt "$MIN_TURNS" ]; then
-  log "skip reason=too-few-turns turns=$TURNS min_turns=$MIN_TURNS"
+  log "skip reason=too-few-turns turns=$TURNS min_turns=$MIN_TURNS trigger=$TRIGGER pid=$$"
   exit 0
 fi
 

@@ -37,6 +37,49 @@ HOTNESS_THRESHOLD="${CCC_DISTILL_HOTNESS_THRESHOLD:-3}"
 case "$HOTNESS_THRESHOLD" in ''|*[!0-9]*) HOTNESS_THRESHOLD=3 ;; esac
 [ "$HOTNESS_THRESHOLD" -lt 1 ] && HOTNESS_THRESHOLD=3
 
+# title_hash: collapse cosmetic title variants so the dedup/hot mechanism
+# actually catches recurring topics. Strategy:
+#   A) issue-anchored — if the title mentions one or more #NNN tokens, the
+#      hash is determined ONLY by the sorted set of issue numbers. That
+#      handles real-world variants like:
+#        "#82 distill fleet rollout: per-node smoke 절차"
+#        "Issue #82: distill fleet verification checklist — 9개 노드 ..."
+#        "이슈 #82: distill fleet verification per-node 체크리스트 현황"
+#        "Distill Fleet Rollout (#82) 노드별 검증 체크리스트"
+#      → all collapse to `i82`. Multi-issue titles like `#82/#83/#84: ...`
+#      get a distinct bucket `i82-i83-i84` (operator intent differs).
+#   B) sigilless — lowercase, strip section-prefix words ("Issue:", "이슈:",
+#      "Decision:", etc., with required colon), strip space-bounded round
+#      tokens (r10, r25), normalize common punctuation to space, collapse
+#      whitespace. Backward compatible with the old hash for titles that
+#      consist of plain words only (e.g. "Decision A").
+title_hash() {
+  local title="$1"
+  local issue_sig
+  issue_sig="$(printf '%s' "$title" | grep -oE '#[0-9]+' | tr -d '#' | sort -un | paste -sd- -)"
+  if [ -n "$issue_sig" ]; then
+    printf 'i%s' "$issue_sig" | sha256sum | cut -c1-12
+    return
+  fi
+  # Order matters: replace punctuation (so "(r18)" -> " r18 ") BEFORE the
+  # round-tag strip so space-bounded \br[0-9]+\b actually matches.
+  printf '%s' "$title" \
+    | tr '[:upper:]' '[:lower:]' \
+    | sed -E '
+        s/^[[:space:]]*(issue|이슈|결정|정책|런북|runbook|decision|spec|policy):[[:space:]]+//
+        s/—/ /g
+        s/–/ /g
+        s/：/ /g
+        s/[(),./?!]/ /g
+        s/:/ /g
+        s/(^| )r[0-9]+( |$)/ /g
+        s/[[:space:]]+/ /g
+        s/^[[:space:]]+//
+        s/[[:space:]]+$//
+      ' \
+    | sha256sum | cut -c1-12
+}
+
 normalize_seen() {
   [ -f "$SEEN" ] || { : > "$SEEN"; return 0; }
   awk -v cutoff="$CUTOFF_EPOCH" -v now="$NOW_EPOCH" '
@@ -150,9 +193,8 @@ for i in $(seq 0 $((LEN - 1))); do
 
   [ -z "$TITLE" ] && continue
 
-  # De-dup hash: title (normalized).
-  HASH="$(printf '%s' "$TITLE" | tr '[:upper:]' '[:lower:]' | tr -s ' ' \
-    | sha256sum | cut -c1-12)"
+  # De-dup hash: title (normalized — see title_hash() above).
+  HASH="$(title_hash "$TITLE")"
 
   ROW="$(seen_row "$HASH")"
   FIRST="$NOW_EPOCH"
