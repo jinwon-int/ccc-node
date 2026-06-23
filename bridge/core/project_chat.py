@@ -243,7 +243,6 @@ class ProjectChatHandler:
         state_holder: Dict[str, _UserStreamState] = {}
 
         async def can_use_tool(tool_name, tool_input, _context=None):
-            print(f"[DEBUG] can_use_tool called: {tool_name}")
             logger.debug(
                 f"can_use_tool called: tool_name={tool_name}, tool_input type={type(tool_input)}"
             )
