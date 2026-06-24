@@ -175,6 +175,33 @@ hook caches, sessions, and anything matching `*token*` / `*secret*`.
 ## Dependencies a node needs
 
 - [`jinwon-int/wiki-agent`](https://github.com/jinwon-int/wiki-agent) installed at
-  `/root/.wiki-agent/bin/wiki-agent` (Family Wiki reads/prefetch).
+  `${CCC_WIKI_AGENT_BIN:-$HOME/.wiki-agent/bin/wiki-agent}` (Family Wiki reads/prefetch).
+  Existing root VPS installs still resolve to `/root/.wiki-agent/bin/wiki-agent`.
 - `jq`, `curl`, `flock` (standard).
-- A Honcho endpoint reachable from the node (set in `honcho.json`).
+- A Honcho endpoint reachable from the node (set in `${CCC_HERMES_DIR:-$HOME/.hermes}/honcho.json`).
+
+## Non-root path overrides
+
+`setup.sh` defaults to the historical root-compatible layout through `$HOME`, but
+non-root nodes can make the target paths explicit without changing existing root
+behavior:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `CCC_CLAUDE_DIR` | `$HOME/.claude` | Claude Code harness, hooks, memories, output styles, commands, skills |
+| `CCC_HERMES_DIR` | `$HOME/.hermes` | `honcho.json` and Hermes-side local config templates |
+| `CCC_WIKI_AGENT_BIN` | `$HOME/.wiki-agent/bin/wiki-agent` | Checklist path for the Family Wiki reader/writer binary |
+| `CCC_BRIDGE_DEFAULT_PATH` | `$HOME` | Suggested Telegram bridge `--path` workspace in the printed checklist |
+
+Example non-root preview:
+
+```bash
+HOME=/home/ccc \
+CCC_CLAUDE_DIR=/home/ccc/.claude \
+CCC_HERMES_DIR=/home/ccc/.hermes \
+CCC_WIKI_AGENT_BIN=/home/ccc/.wiki-agent/bin/wiki-agent \
+CCC_BRIDGE_DEFAULT_PATH=/home/ccc \
+./setup.sh --dry-run
+```
+
+The setup script prints the resolved paths and never prints or moves raw secrets.

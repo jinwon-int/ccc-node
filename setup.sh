@@ -50,9 +50,15 @@ while [ $# -gt 0 ]; do
   shift
 done
 SRC="$(cd "$(dirname "$0")" && pwd)"
-CLAUDE_DIR="$HOME/.claude"
+# Path overrides are explicit so non-root nodes can dry-run/install without
+# inheriting root-only assumptions. Defaults preserve the existing root VPS
+# layout when HOME=/root.
+CLAUDE_DIR="${CCC_CLAUDE_DIR:-$HOME/.claude}"
 MEM_DIR="$CLAUDE_DIR/memories"          # node-owned memory (Hermes-independent)
-HERMES_DIR="$HOME/.hermes/memories"     # legacy memory location (fallback only)
+HERMES_ROOT="${CCC_HERMES_DIR:-$HOME/.hermes}"
+HERMES_DIR="$HERMES_ROOT/memories"      # legacy memory location (fallback only)
+WIKI_AGENT_BIN="${CCC_WIKI_AGENT_BIN:-$HOME/.wiki-agent/bin/wiki-agent}"
+BRIDGE_DEFAULT_PATH="${CCC_BRIDGE_DEFAULT_PATH:-$HOME}"
 
 run() { if [ "$DRY" = 1 ]; then echo "[dry-run] $*"; else eval "$*"; fi; }
 note() { printf '  - %s\n' "$*"; }
@@ -149,7 +155,7 @@ seed() { # seed <template> <dest>
   else run "cp '$1' '$2'"; SEEDED+=("$2"); note "seeded template -> $2 (EDIT ME)"; fi
 }
 run "mkdir -p '$MEM_DIR'"
-run "mkdir -p '$HOME/.hermes'"
+run "mkdir -p '$HERMES_ROOT'"
 seed "$SRC/claude/CLAUDE.md.template"             "$CLAUDE_DIR/CLAUDE.md"
 seed "$SRC/claude/hooks/tools-cheatsheet.md"      "$CLAUDE_DIR/hooks/tools-cheatsheet.md"
 # Node-owned memory (Hermes-independent): seed into ~/.claude/memories.
@@ -157,7 +163,7 @@ seed "$SRC/claude/hooks/tools-cheatsheet.md"      "$CLAUDE_DIR/hooks/tools-cheat
 seed "$SRC/hermes/memories/MEMORY.template.md"    "$MEM_DIR/MEMORY.md"
 seed "$SRC/hermes/memories/USER.template.md"      "$MEM_DIR/USER.md"
 # honcho.json stays node-local under ~/.hermes (documentation/Hermes-side; not a hard CC dep).
-seed "$SRC/hermes/honcho.template.json"           "$HOME/.hermes/honcho.json"
+seed "$SRC/hermes/honcho.template.json"           "$HERMES_ROOT/honcho.json"
 
 # 3) Node-identity substitution — fill <PLACEHOLDER> tokens in the files we just seeded.
 # Only freshly-seeded files are touched (existing identity is never rewritten). Tokens for which
@@ -207,19 +213,28 @@ cat <<'EOF'
                                          (Pass --node/--display/--slot/--user-* to setup.sh to pre-fill these.)
   2. Edit ~/.claude/memories/MEMORY.md — node-specific durable facts (NO raw secrets).
   3. Edit ~/.claude/memories/USER.md   — who you work for + preferences.
-  4. Edit ~/.hermes/honcho.json        — set baseUrl / peerName / target (this is node-local; gitignored).
-  5. Install wiki-agent at /root/.wiki-agent/bin/wiki-agent (canonical: jinwon-int/wiki-agent).
+  4. Edit $HERMES_ROOT/honcho.json        — set baseUrl / peerName / target (this is node-local; gitignored).
+  5. Install wiki-agent at $WIKI_AGENT_BIN (canonical: jinwon-int/wiki-agent).
   6. Auth GitHub:  gh auth login   (or place token per node policy; never commit it).
   7. Start a fresh Claude Code session and confirm the SessionStart snapshot injects.
   8. (Optional) MCP tool servers: ./claude/mcp-setup.sh
      Registers searxng (Tailnet SearXNG) + context7 (docs) + firecrawl (web scrape;
      key read from ~/.hermes/.env). Idempotent; tool perms pre-allowed in settings.json.
   9. (Optional) Telegram bridge: cd bridge && cp .env.example .env && edit, then
-     ./start.sh --path /root -d   (daemon-supervised). See bridge/README.md.
-     Linux reboot-persistence: ./start.sh --path /root --install-systemd   (systemd unit).
+     ./start.sh --path $BRIDGE_DEFAULT_PATH -d   (daemon-supervised). See bridge/README.md.
+     Linux reboot-persistence: ./start.sh --path $BRIDGE_DEFAULT_PATH --install-systemd   (systemd unit).
 
 Secrets that are intentionally NOT installed by this script:
   - ~/.claude/.credentials.json   (Claude OAuth — created on `claude` login)
   - GitHub token                  (gh auth login)
   - Honcho endpoint value         (you set it in ~/.hermes/honcho.json)
 EOF
+
+printf '\nResolved path configuration (override with CCC_* env vars; no secrets printed):\n'
+printf '  - CCC_CLAUDE_DIR=%s\n' "$CLAUDE_DIR"
+printf '  - CLAUDE.md=%s/CLAUDE.md\n' "$CLAUDE_DIR"
+printf '  - CCC_HERMES_DIR=%s\n' "$HERMES_ROOT"
+printf '  - honcho.json=%s/honcho.json\n' "$HERMES_ROOT"
+printf '  - CCC_WIKI_AGENT_BIN=%s\n' "$WIKI_AGENT_BIN"
+printf '  - CCC_BRIDGE_DEFAULT_PATH=%s\n' "$BRIDGE_DEFAULT_PATH"
+printf '  - bridge command=./start.sh --path %s -d\n' "$BRIDGE_DEFAULT_PATH"
