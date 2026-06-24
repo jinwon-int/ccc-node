@@ -103,6 +103,7 @@ utils/chat_logger.py Per-session debug chat logging
 | `PROJECT_ROOT` | Set by start.sh | Base path for all file access validation |
 | `DRAFT_UPDATE_MIN_CHARS` | No | Min characters before draft update (default: 150) |
 | `DRAFT_UPDATE_INTERVAL` | No | Min seconds between draft updates (default: 1.0) |
+| `CCC_PARTIAL_STREAMING` | No | Real token-level streaming via SDK partial messages (default: true). Set false to fall back to whole-block draft updates |
 | `OPENAI_API_KEY` | Voice only | API key for Whisper transcription |
 | `OPENAI_BASE_URL` | No | Optional OpenAI-compatible Whisper API base URL |
 | `WHISPER_MODEL` | No | Whisper model name (default: `whisper-1`) |

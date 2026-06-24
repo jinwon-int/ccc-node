@@ -41,6 +41,7 @@ sdk_module.ClaudeSDKClient = _DummySDKClient
 sdk_module.ClaudeAgentOptions = _DummyAgentOptions
 sdk_module.AssistantMessage = type("AssistantMessage", (), {})
 sdk_module.ResultMessage = type("ResultMessage", (), {})
+sdk_module.StreamEvent = type("StreamEvent", (), {})
 sdk_module.TextBlock = type("TextBlock", (), {})
 sdk_module.ToolUseBlock = type("ToolUseBlock", (), {})
 sdk_module.PermissionResultAllow = _PermissionResultAllow
@@ -119,6 +120,149 @@ class RetryCleanupTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(retry_state.pending), 0)
         self.assertIsNotNone(retry_client.request)
         self.assertTrue(retry_client.request.future.cancelled())
+
+
+class _FakeStreamingHandler:
+    """Records draft updates without touching Telegram."""
+
+    def __init__(self):
+        self.updates = []
+        self.drafts = [object()]  # non-empty -> response marked as streamed
+        self.finalized = False
+
+    async def update_if_needed(self, text):
+        self.updates.append(text)
+
+    async def finalize_all(self):
+        self.finalized = True
+
+
+class _ScriptedClient:
+    """Async client whose receive_messages() replays a fixed message script."""
+
+    def __init__(self, messages):
+        self._messages = messages
+
+    async def receive_messages(self):
+        for msg in self._messages:
+            yield msg
+
+
+def _new(cls, **attrs):
+    """Build an SDK message instance without invoking its constructor.
+
+    The reader-loop tests must work whether ``project_chat`` imported the bare
+    stub types (this module run in isolation) or the real claude_agent_sdk
+    dataclasses (full pytest run, where another test imported the real SDK
+    first). Bypassing __init__ and setting only the attributes the reader loop
+    reads keeps the helpers valid for both. (None of these dataclasses use
+    __slots__, so setattr works.)
+    """
+    obj = object.__new__(cls)
+    for key, value in attrs.items():
+        setattr(obj, key, value)
+    return obj
+
+
+def _stream_event(text, parent=None):
+    return _new(
+        project_chat.StreamEvent,
+        event={"type": "content_block_delta", "delta": {"type": "text_delta", "text": text}},
+        parent_tool_use_id=parent,
+    )
+
+
+def _assistant(text):
+    return _new(
+        project_chat.AssistantMessage,
+        content=[_new(project_chat.TextBlock, text=text)],
+    )
+
+
+def _result(text, session_id="sess-1"):
+    return _new(
+        project_chat.ResultMessage,
+        result=text,
+        session_id=session_id,
+        is_error=False,
+        duration_ms=5,
+    )
+
+
+def _make_request(streaming_handler):
+    loop = asyncio.get_event_loop()
+    return project_chat._PendingRequest(
+        user_id=7,
+        chat_id=42,
+        model=None,
+        requested_session_id=None,
+        permission_callback=None,
+        typing_callback=None,
+        future=loop.create_future(),
+        streaming_handler=streaming_handler,
+    )
+
+
+class _DeltaHelperTests(unittest.TestCase):
+    def test_extracts_text_delta(self):
+        ev = {"type": "content_block_delta", "delta": {"type": "text_delta", "text": "hi"}}
+        self.assertEqual(project_chat._extract_stream_text_delta(ev), "hi")
+
+    def test_ignores_non_text_events(self):
+        for ev in (
+            {"type": "content_block_delta", "delta": {"type": "input_json_delta", "partial_json": "{"}},
+            {"type": "content_block_start"},
+            {"type": "message_stop"},
+            {"type": "content_block_delta", "delta": {"type": "text_delta", "text": ""}},
+            "not-a-dict",
+            None,
+        ):
+            self.assertIsNone(project_chat._extract_stream_text_delta(ev))
+
+
+class PartialStreamingReaderTests(unittest.IsolatedAsyncioTestCase):
+    async def test_deltas_drive_draft_and_block_not_redelivered(self):
+        handler = project_chat.ProjectChatHandler()
+        sh = _FakeStreamingHandler()
+        req = _make_request(sh)
+        state = project_chat._UserStreamState(client=None, model=None)
+        state.pending.append(req)
+        state.client = _ScriptedClient(
+            [
+                _stream_event("Hello "),
+                _stream_event("world"),
+                _stream_event(" [sub]", parent="tool_123"),  # subagent — must be ignored
+                _assistant("Hello world"),  # complete block — must NOT be re-fed
+                _result("Hello world"),
+            ]
+        )
+
+        await handler._reader_loop(7, state)
+
+        # Only the two top-level deltas drove the draft; the subagent delta and
+        # the complete AssistantMessage block were not fed (no double-count).
+        self.assertEqual(sh.updates, ["Hello ", "world"])
+        self.assertTrue(sh.finalized)
+        self.assertTrue(req.streamed_via_partials)
+        resp = req.future.result()
+        self.assertTrue(resp.success)
+        self.assertEqual(resp.content, "Hello world")
+        self.assertTrue(resp.streamed)
+
+    async def test_falls_back_to_block_when_no_deltas(self):
+        handler = project_chat.ProjectChatHandler()
+        sh = _FakeStreamingHandler()
+        req = _make_request(sh)
+        state = project_chat._UserStreamState(client=None, model=None)
+        state.pending.append(req)
+        state.client = _ScriptedClient([_assistant("Hi there"), _result("Hi there")])
+
+        await handler._reader_loop(7, state)
+
+        # No StreamEvents arrived, so the complete block drives the draft.
+        self.assertEqual(sh.updates, ["Hi there"])
+        self.assertFalse(req.streamed_via_partials)
+        self.assertEqual(req.future.result().content, "Hi there")
 
 
 if __name__ == "__main__":
