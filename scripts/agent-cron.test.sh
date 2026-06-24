@@ -50,6 +50,11 @@ ok "list --json exits 0" '[ "$rc" = 0 ]'
 ok "list --json is valid JSON" 'jq -e ".version == 1 and (.tasks|length)==1 and .tasks[0].catchUpPolicy == \"skip\"" <<<"$out" >/dev/null'
 ok "list --json preserves redact profile" 'jq -e ".tasks[0].redactProfile == \"default\"" <<<"$out" >/dev/null'
 
+PY_CMD="$ROOT/scripts/agent_cron.py"
+out="$(CCC_AGENT_CRON_STORE="$STORE" python3 "$PY_CMD" list --json 2>&1)"; rc=$?
+ok "python agent-cron entrypoint exists and lists JSON" '[ "$rc" = 0 ] && jq -e ".version == 1 and (.tasks|length)==1 and .tasks[0].id == \"daily-wiki-prefetch\"" <<<"$out" >/dev/null'
+ok "shell wrapper delegates to python entrypoint" 'grep -q "agent_cron.py" "$CMD"'
+
 out="$(CCC_AGENT_CRON_STORE="$TMP/missing.json" bash "$CMD" list)"; rc=$?
 ok "missing store lists empty safely" '[ "$rc" = 0 ] && grep -q "No agent-cron tasks" <<<"$out"'
 
