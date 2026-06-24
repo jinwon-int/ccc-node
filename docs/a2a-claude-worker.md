@@ -100,13 +100,18 @@ Required shape:
 - `A2A_NATIVE_NODE_BIN` points at the Termux native glibc-runner Node wrapper.
 - `A2A_WORKER_ROOT/dist/worker.js` exists and is launched by that native Node.
 - `A2A_CLAUDE_CODE_BIN` points at the native Claude wrapper.
-- `OPENCLAW_BIN` and `A2A_OPENCLAW_ANALYSIS_BIN` both point at the same
-  `claude-a2a-analysis-bridge.mjs` file.
+- `OPENCLAW_BIN` and `A2A_OPENCLAW_ANALYSIS_BIN` both point at the same bridge
+  file, one of:
+  - `claude-a2a-analysis-bridge.mjs` — read-only analysis only, or
+  - `claude-a2a-patch-bridge.mjs` — intent-aware superset (a2a-nexus #1021):
+    identical analysis behavior plus a deterministic single-shot GitHub PATCH
+    path. To enable single-shot, also set `A2A_CLAUDE_CODE_PATCH_MODE=single-shot`
+    (the checker fails closed if this is set without the patch bridge).
 - `BROKER_URL=http://127.0.0.1:18790` so the worker uses the local tunnel to the
   broker instead of embedding remote broker details in the launcher.
 - `WORKER_MODE=persistent` and `WORKER_METADATA_JSON` includes
-  `runtime=claude-code`, `harness=claude`, and
-  `adapter=claude-a2a-analysis-bridge`.
+  `runtime=claude-code`, `harness=claude`, and an `adapter` that matches the
+  wired bridge (`claude-a2a-analysis-bridge` or `claude-a2a-patch-bridge`).
 - Env hygiene is enabled:
   `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`, `DISABLE_GROWTHBOOK=1`, and
   `USE_BUILTIN_RIPGREP=0`.
