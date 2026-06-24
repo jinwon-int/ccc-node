@@ -41,8 +41,24 @@ PATH_KEYS = (
 REQUIRED_METADATA = {
     "runtime": "claude-code",
     "harness": "claude",
-    "adapter": "claude-a2a-analysis-bridge",
 }
+# Intent-aware drop-in bridges accepted for OPENCLAW_BIN. The patch bridge
+# (a2a-nexus #1021, claude-a2a-patch-bridge.mjs) behaves IDENTICALLY to the
+# analysis bridge for analysis-intent tasks and adds a deterministic
+# single-shot PATCH path; it shares the same CLI contract, stdout envelope,
+# and OPENCLAW_BIN/A2A_OPENCLAW_ANALYSIS_BIN env var, so it is a safe superset.
+ANALYSIS_BRIDGE = "claude-a2a-analysis-bridge.mjs"
+PATCH_BRIDGE = "claude-a2a-patch-bridge.mjs"
+ALLOWED_BRIDGES = (ANALYSIS_BRIDGE, PATCH_BRIDGE)
+# The adapter id the worker must register, keyed by the wired bridge file, so
+# WORKER_METADATA_JSON stays honest about which bridge is actually spawned.
+BRIDGE_ADAPTER = {
+    ANALYSIS_BRIDGE: "claude-a2a-analysis-bridge",
+    PATCH_BRIDGE: "claude-a2a-patch-bridge",
+}
+# Recognized values for the patch bridge's single-shot opt-in (mirrors
+# isSingleShotPatchMode in claude-a2a-patch-bridge.mjs).
+PATCH_MODE_VALUES = ("single-shot", "single_shot", "singleshot")
 FORBIDDEN_CONTEXT_NAMES = {
     "AGENTS.md",
     "SOUL.md",
@@ -124,7 +140,7 @@ def validate_broker_url(value: str) -> None:
         raise ConfigError("BROKER_URL must use local tunnel port 18790")
 
 
-def validate_metadata(value: str) -> dict[str, object]:
+def validate_metadata(value: str, expected_adapter: str) -> dict[str, object]:
     try:
         metadata = json.loads(value)
     except json.JSONDecodeError as exc:
@@ -134,6 +150,11 @@ def validate_metadata(value: str) -> dict[str, object]:
     for key, expected in REQUIRED_METADATA.items():
         if metadata.get(key) != expected:
             raise ConfigError(f"WORKER_METADATA_JSON must set {key}={expected!r}")
+    if metadata.get("adapter") != expected_adapter:
+        raise ConfigError(
+            f"WORKER_METADATA_JSON must set adapter={expected_adapter!r} "
+            "to match the wired OPENCLAW_BIN bridge"
+        )
     return metadata
 
 
@@ -167,11 +188,24 @@ def validate_env(env: dict[str, str]) -> tuple[Path, list[str], dict[str, object
     a2a_openclaw = checked_paths["A2A_OPENCLAW_ANALYSIS_BIN"].resolve()
     if openclaw != a2a_openclaw:
         raise ConfigError("OPENCLAW_BIN and A2A_OPENCLAW_ANALYSIS_BIN must point at the same bridge file")
-    if openclaw.name != "claude-a2a-analysis-bridge.mjs":
-        raise ConfigError("OpenClaw analysis bridge must be claude-a2a-analysis-bridge.mjs")
+    if openclaw.name not in ALLOWED_BRIDGES:
+        raise ConfigError(
+            "OpenClaw bridge must be one of: " + ", ".join(ALLOWED_BRIDGES)
+        )
+
+    patch_mode = env.get("A2A_CLAUDE_CODE_PATCH_MODE", "").strip().lower()
+    if patch_mode:
+        if patch_mode not in PATCH_MODE_VALUES:
+            raise ConfigError(
+                "A2A_CLAUDE_CODE_PATCH_MODE must be one of: " + ", ".join(PATCH_MODE_VALUES)
+            )
+        if openclaw.name != PATCH_BRIDGE:
+            raise ConfigError(
+                f"A2A_CLAUDE_CODE_PATCH_MODE requires OPENCLAW_BIN to be {PATCH_BRIDGE}"
+            )
 
     validate_broker_url(env["BROKER_URL"])
-    metadata = validate_metadata(env["WORKER_METADATA_JSON"])
+    metadata = validate_metadata(env["WORKER_METADATA_JSON"], BRIDGE_ADAPTER[openclaw.name])
 
     args = [str(checked_paths["A2A_NATIVE_NODE_BIN"]), str(worker_script)]
     extra = env.get("A2A_WORKER_ARGS", "")

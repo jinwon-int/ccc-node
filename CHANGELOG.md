@@ -8,7 +8,16 @@ Distill observability follow-up — closes #130, #133.
 
 A2A mobile native worker first slice — refs #150.
 
+Native worker accepts the single-shot patch bridge — refs #150, a2a-nexus #1020/#1021.
+
 ### Added
+- `scripts/a2a_termux_native_worker.py` now accepts `claude-a2a-patch-bridge.mjs`
+  (a2a-nexus #1021) for `OPENCLAW_BIN`/`A2A_OPENCLAW_ANALYSIS_BIN` as an
+  intent-aware drop-in superset of the analysis bridge, and validates an opt-in
+  `A2A_CLAUDE_CODE_PATCH_MODE=single-shot` (fail-closed if set without the patch
+  bridge). `WORKER_METADATA_JSON` `adapter` must now match the wired bridge.
+  Env example + `docs/a2a-claude-worker.md` document the single-shot path; new
+  test cases cover the patch-bridge env, mode/bridge mismatch, and bad mode value.
 - `scripts/a2a-termux-native-worker.sh` + Python checker: validates a
   systemd-style env file for running `a2a-broker-worker/dist/worker.js` under
   Termux native/glibc-runner Node, with fail-closed bridge metadata, local
