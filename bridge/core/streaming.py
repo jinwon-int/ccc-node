@@ -460,12 +460,17 @@ class StreamingMessageHandler:
         current_draft.text = finalize_text
         await self.finalize_draft(current_draft)
 
-        # Create new draft with remaining text
+        # Create new draft with remaining text. Seed it only up to its own split
+        # boundary so the initial send never exceeds the Telegram per-message
+        # limit — the caller's overflow loop finalizes/splits the rest on the
+        # next iteration. (When the remainder already fits, _find_split_boundary
+        # returns its full length, so this is a no-op for the common case.)
         remaining_text = self.accumulated_text[split_point:]
         self.accumulated_text = remaining_text
 
         if remaining_text:
-            await self.create_draft(remaining_text)
+            seed_boundary = self._find_split_boundary(remaining_text)
+            await self.create_draft(remaining_text[:seed_boundary])
             logger.debug(
                 f"Created overflow draft, remaining {len(remaining_text)} chars"
             )
@@ -476,62 +481,49 @@ class StreamingMessageHandler:
         """
         Main entry point: accumulate text and update draft if thresholds met.
         Handles overflow to new drafts when exceeding 4000 chars.
+
+        The Claude SDK delivers complete text blocks (token-level partial
+        streaming is off), so a single chunk can already be hundreds–thousands
+        of characters. We accumulate the whole chunk, split it across Telegram's
+        4000-char limit into separate drafts, then push AT MOST ONE edit for the
+        trailing draft (threshold-gated).
+
+        The previous implementation sliced a large chunk into ``min_chars``
+        pieces and issued one ``edit_message_text`` per slice — N sequential
+        network round-trips against the *same* message (N = len/min_chars). Every
+        intermediate edit was overwritten ~instantly (never seen by the user) and
+        the rapid same-message edits routinely tripped Telegram's per-message
+        edit flood limit, forcing RetryAfter backoff. That was pure added
+        latency, and because the reader loop awaits this inline it also delayed
+        the final ResultMessage. Collapsing to a single edit removes both costs.
         """
         if self._finalized:
             return False
 
         chunk_size = len(new_text_chunk)
-        logger.debug(
-            f"Received chunk: {chunk_size} chars, accumulated before: {len(self.accumulated_text)} chars"
-        )
-
-        # If chunk is large, simulate progressive updates
-        if chunk_size > self.min_chars:
-            # Split large chunk into smaller pieces for progressive updates
-            chunk_start = 0
-            while chunk_start < chunk_size:
-                chunk_end = min(chunk_start + self.min_chars, chunk_size)
-                partial_chunk = new_text_chunk[chunk_start:chunk_end]
-                self.accumulated_text += partial_chunk
-
-                # Check for overflow
-                if len(self.accumulated_text) >= 4000:
-                    await self.handle_overflow()
-                    chunk_start = chunk_end
-                    continue
-
-                display_text = self._first_draft_prefix() + self.accumulated_text
-                # Create first draft if needed
-                if not self.drafts:
-                    await self.create_draft(display_text)
-                else:
-                    # Update existing draft
-                    current_draft = self.drafts[-1]
-                    await self.update_draft(current_draft, display_text)
-
-                chunk_start = chunk_end
-            return True
-
-        # Small chunk - normal accumulation
         self.accumulated_text += new_text_chunk
         logger.debug(
-            f"Accumulated {len(self.accumulated_text)} chars (chunk: {chunk_size} chars)"
+            f"Received chunk: {chunk_size} chars, accumulated: {len(self.accumulated_text)} chars"
         )
 
-        # Check for overflow
-        if len(self.accumulated_text) >= 4000:
-            await self.handle_overflow()
-            return True
-
-        display_text = self._first_draft_prefix() + self.accumulated_text
-
-        # Create first draft if needed
+        # The first draft must exist before handle_overflow (which finalizes the
+        # *current* draft in place). Seed it with content only up to the first
+        # split boundary so the initial send is never oversized.
         if not self.drafts:
-            await self.create_draft(display_text)
+            boundary = self._find_split_boundary(self.accumulated_text)
+            seed = self._first_draft_prefix() + self.accumulated_text[:boundary]
+            await self.create_draft(seed)
+
+        # Split off complete drafts while the buffer exceeds the Telegram limit.
+        while len(self.accumulated_text) >= 4000:
+            await self.handle_overflow()
+
+        if not self.drafts:
             return True
 
-        # Update existing draft if thresholds met
+        # One consolidated update for whatever remains (threshold-gated).
         current_draft = self.drafts[-1]
+        display_text = self._first_draft_prefix() + self.accumulated_text
         chars_since_update = len(display_text) - len(current_draft.text)
         current_draft.char_count_since_update = chars_since_update
 
@@ -539,7 +531,7 @@ class StreamingMessageHandler:
             f"Checking update: {chars_since_update} chars since last update, min_chars={self.min_chars}"
         )
 
-        if self.should_update(current_draft, chars_since_update):
+        if chars_since_update and self.should_update(current_draft, chars_since_update):
             await self.update_draft(current_draft, display_text)
             return True
 

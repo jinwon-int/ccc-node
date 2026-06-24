@@ -17,6 +17,7 @@ from claude_agent_sdk import (
     ClaudeAgentOptions,
     AssistantMessage,
     ResultMessage,
+    StreamEvent,
     TextBlock,
     ToolUseBlock,
     PermissionResultAllow,
@@ -153,6 +154,25 @@ def _format_ask_user_question(tool_input: dict):
     return "\n".join(lines), []
 
 
+def _extract_stream_text_delta(event: Any) -> Optional[str]:
+    """Pull the incremental text from a raw Anthropic streaming event.
+
+    Returns the delta text for ``content_block_delta`` events carrying a
+    ``text_delta`` (the per-token text increments), else None. Tool-argument
+    deltas (``input_json_delta``), block start/stop, and message-level events
+    are ignored — only assistant-visible text drives the live draft.
+    """
+    if not isinstance(event, dict):
+        return None
+    if event.get("type") != "content_block_delta":
+        return None
+    delta = event.get("delta")
+    if not isinstance(delta, dict) or delta.get("type") != "text_delta":
+        return None
+    text = delta.get("text")
+    return text if isinstance(text, str) and text else None
+
+
 def _detect_numbered_options(text: str) -> bool:
     """
     Detect if text contains numbered options format (e.g., "1. Option A").
@@ -202,6 +222,11 @@ class _PendingRequest:
     last_assistant_texts: List[str] = field(default_factory=list)
     synthetic_response: Optional[str] = None
     streaming_handler: Optional[Any] = None  # StreamingMessageHandler instance
+    # Set once any partial StreamEvent text delta has driven the live draft, so
+    # the complete AssistantMessage that follows is NOT re-fed to the streaming
+    # handler (which would double the text). Stays False when partial streaming
+    # is off / no deltas arrive, preserving the whole-block fallback path.
+    streamed_via_partials: bool = False
 
 
 @dataclass
@@ -321,6 +346,11 @@ class ProjectChatHandler:
             #   "Failed to decode JSON: JSON message exceeded maximum
             #    buffer size of 1048576 bytes"
             "max_buffer_size": 10 * 1024 * 1024,
+            # Real token-level streaming: ask the SDK for partial message events
+            # so the reader loop can update the Telegram draft from incremental
+            # text deltas (true typewriter effect). The draft edit cadence stays
+            # throttled by draft_update_min_chars / draft_update_interval.
+            "include_partial_messages": config.enable_partial_streaming,
         }
         if model:
             # Normalize model name: ensure at most one [1M] suffix
@@ -471,6 +501,25 @@ class ProjectChatHandler:
                     except Exception:
                         pass
 
+                if isinstance(msg, StreamEvent):
+                    # Real token-level streaming: drive the live draft from
+                    # incremental text deltas as they arrive (true typewriter).
+                    # Only top-level assistant text streams to the user; nested
+                    # subagent (Task) deltas carry parent_tool_use_id and must
+                    # not pollute the main response draft.
+                    if (
+                        req.streaming_handler
+                        and getattr(msg, "parent_tool_use_id", None) is None
+                    ):
+                        delta = _extract_stream_text_delta(msg.event)
+                        if delta:
+                            req.streamed_via_partials = True
+                            try:
+                                await req.streaming_handler.update_if_needed(delta)
+                            except Exception as e:
+                                logger.error(f"Partial streaming update failed: {e}")
+                    continue
+
                 if isinstance(msg, AssistantMessage):
                     logger.debug(
                         f"Received AssistantMessage with {len(msg.content)} blocks"
@@ -480,8 +529,12 @@ class ProjectChatHandler:
                         if isinstance(block, TextBlock):
                             logger.debug(f"TextBlock: {len(block.text)} chars")
                             req.last_assistant_texts.append(block.text)
-                            # Update streaming draft if handler is available
-                            if req.streaming_handler:
+                            # Update the streaming draft from the complete block
+                            # ONLY when partial deltas didn't already build it —
+                            # otherwise the text would be doubled. When partial
+                            # streaming is off (no deltas), this is the fallback
+                            # whole-block update path.
+                            if req.streaming_handler and not req.streamed_via_partials:
                                 try:
                                     await req.streaming_handler.update_if_needed(
                                         block.text

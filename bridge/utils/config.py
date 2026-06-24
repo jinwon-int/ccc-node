@@ -219,6 +219,19 @@ class Config(BaseSettings):
             "CCC_TELEGRAM_ENTITY_RENDERER=false to disable."
         ),
     )
+    enable_partial_streaming: bool = Field(
+        default=True,
+        alias="CCC_PARTIAL_STREAMING",
+        description=(
+            "Enable real token-level streaming. When on, the SDK is asked for "
+            "partial message events (include_partial_messages) and the reader "
+            "loop drives the live Telegram draft from incremental text deltas, "
+            "giving a true typewriter effect instead of a single block update. "
+            "Draft edit cadence is still throttled by draft_update_min_chars / "
+            "draft_update_interval. Set CCC_PARTIAL_STREAMING=false to disable "
+            "(falls back to whole-block draft updates)."
+        ),
+    )
 
     # Voice message configuration
     transcription_provider: str = Field(
