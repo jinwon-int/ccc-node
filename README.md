@@ -76,7 +76,10 @@ to Telegram, with all secrets and node-local state stripped out and replaced by 
   `claude-a2a-analysis-bridge` and broker metadata reports `runtime=claude-code`. The
   `claude/agents/a2a-*.md` roster carries advisory `model_tier` metadata (read-only
   explorer/researcher = `low-cost`, implementer/verifier = `upper`) and requires cost/token
-  notes when runner accounting is available. See [`docs/a2a-claude-worker.md`](docs/a2a-claude-worker.md).
+  notes when runner accounting is available. Mobile nodes can preflight the native
+  Termux/glibc-runner worker path with `scripts/a2a-termux-native-worker.sh`, using
+  `docs/examples/a2a-termux-native-worker.env.example` as the non-secret env template. See
+  [`docs/a2a-claude-worker.md`](docs/a2a-claude-worker.md).
 - **Session Distiller** (`claude/hooks/distill.sh`, `/distill`) — PreCompact/SessionEnd hook
   pipeline (0.3.15+) that distills live transcripts via `claude -p --model haiku` (inherits
   parent OAuth, no API key) and routes results to **Honcho** (auto-push of working/relational
@@ -153,6 +156,10 @@ bridge/                    # Telegram <-> Claude Code bridge (vendored, history 
   core/ interaction/ ...   # bridge source (upstream-independent fork)
 docs/
   a2a-claude-worker.md     # A2A poller-vs-analysis-backend wiring + verification
+  examples/a2a-termux-native-worker.env.example  # non-secret native mobile worker env shape
+scripts/
+  a2a-termux-native-worker.sh  # validates/execs native Termux Node worker.js env (PR-first)
+  validate-harness.sh          # CI harness validation, including forbidden context-file guard
 setup.sh                   # idempotent bootstrap (won't overwrite existing real files)
 .gitignore                 # blocks credentials, live memory, caches, sessions
 ```

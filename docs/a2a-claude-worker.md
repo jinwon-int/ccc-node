@@ -74,6 +74,53 @@ The row should be online/fresh and expose metadata like:
 }
 ```
 
+## Termux native worker harness (PR-first slice)
+
+For mobile nodes such as `gongyung` and `daegyo`, the first safe native slice is
+additive: validate and launch `a2a-broker-worker/dist/worker.js` with the
+Termux/glibc-runner Node wrapper, while keeping the historical proot worker as a
+fallback until a later operator-approved cutover. Do not install Termux:Boot,
+restart workers, stop proot, or create broker tasks from this repository-only
+check.
+
+The repository helper reads a systemd-style env file and fails closed unless the
+worker and bridge wiring are explicitly native:
+
+```bash
+cp docs/examples/a2a-termux-native-worker.env.example /tmp/a2a-native-worker.env
+# Edit /tmp/a2a-native-worker.env on the phone with real node-local paths.
+
+scripts/a2a-termux-native-worker.sh check --env-file /tmp/a2a-native-worker.env
+scripts/a2a-termux-native-worker.sh print-command --env-file /tmp/a2a-native-worker.env
+```
+
+Required shape:
+
+- `A2A_TERMUX_NATIVE=1` so old proot/systemd env files are rejected.
+- `A2A_NATIVE_NODE_BIN` points at the Termux native glibc-runner Node wrapper.
+- `A2A_WORKER_ROOT/dist/worker.js` exists and is launched by that native Node.
+- `A2A_CLAUDE_CODE_BIN` points at the native Claude wrapper.
+- `OPENCLAW_BIN` and `A2A_OPENCLAW_ANALYSIS_BIN` both point at the same
+  `claude-a2a-analysis-bridge.mjs` file.
+- `BROKER_URL=http://127.0.0.1:18790` so the worker uses the local tunnel to the
+  broker instead of embedding remote broker details in the launcher.
+- `WORKER_MODE=persistent` and `WORKER_METADATA_JSON` includes
+  `runtime=claude-code`, `harness=claude`, and
+  `adapter=claude-a2a-analysis-bridge`.
+- Env hygiene is enabled:
+  `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`, `DISABLE_GROWTHBOOK=1`, and
+  `USE_BUILTIN_RIPGREP=0`.
+
+Only after review and fresh operator approval should the phone run:
+
+```bash
+scripts/a2a-termux-native-worker.sh run --env-file /path/outside/repo/a2a-native-worker.env
+```
+
+That command `exec`s native Node in the current process; supervision, the
+`18790 -> broker:8787` tunnel, Termux:Boot wiring, and proot cutover remain a
+separate live-ops step.
+
 ## No-provider adapter smoke
 
 Before any real provider canary, run the bridge with a fake Claude binary so the JSON contract, executable path, and Node runtime are proven without spending provider quota:
