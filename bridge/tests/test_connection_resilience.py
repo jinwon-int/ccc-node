@@ -31,6 +31,7 @@ setattr(
         logs_dir=_Path("/tmp/test_bot/logs"),
         session_store_path=_Path("/tmp/test_bot/sessions.json"),
         allowed_user_ids=[],
+        require_allowlist=False,  # access-control guard not under test here
         draft_update_min_chars=150,
         draft_update_interval=1.0,
         ffmpeg_path=None,

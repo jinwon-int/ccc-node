@@ -90,7 +90,18 @@ class Config(BaseSettings):
     # Access Control - comma-separated list of allowed user IDs (if empty, allow all)
     allowed_user_ids: List[int] = Field(
         default_factory=list,
-        description="List of allowed Telegram user IDs (empty = allow all)",
+        description=(
+            "List of allowed Telegram user IDs. Empty means allow all, but the "
+            "bot refuses to start while empty unless CCC_REQUIRE_ALLOWLIST=false."
+        ),
+    )
+    # Fail-closed guard: when true (default), the bot REFUSES to start with an
+    # empty allowed_user_ids, preventing an accidental open-to-everyone bridge.
+    # Set CCC_REQUIRE_ALLOWLIST=false only to intentionally run an open bridge.
+    require_allowlist: bool = Field(
+        default=True,
+        alias="CCC_REQUIRE_ALLOWLIST",
+        description="Refuse to start when ALLOWED_USER_IDS is empty (fail-closed access control).",
     )
 
     # ccc-node push notifier (owner-only outbound Claude Code lifecycle notifications).
@@ -119,7 +130,7 @@ class Config(BaseSettings):
         description="Rate limit: max push messages delivered per minute.",
     )
 
-    @field_validator("push_enabled", mode="before")
+    @field_validator("push_enabled", "require_allowlist", mode="before")
     @classmethod
     def parse_push_enabled(cls, v):
         if isinstance(v, str):
