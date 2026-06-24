@@ -27,7 +27,31 @@ for f in claude/settings.base.json claude/settings.local.json \
   if jq -e . "$f" >/dev/null 2>&1; then say "  ok $f"; else err "invalid JSON: $f"; fi
 done
 
-# 1a) CLAUDE.md template policy blocks
+# 1a) Fail closed if OpenClaw runtime/bootstrap context files are tracked.
+say "== OpenClaw context guard =="
+if command -v git >/dev/null 2>&1 && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  offenders=()
+  while IFS= read -r f; do
+    base="${f##*/}"
+    case "$f" in
+      .openclaw/*|*/.openclaw/*) offenders+=("$f") ;;
+      *)
+        case "$base" in
+          AGENTS.md|SOUL.md|USER.md|TOOLS.md|HEARTBEAT.md|IDENTITY.md) offenders+=("$f") ;;
+        esac
+        ;;
+    esac
+  done < <(git ls-files)
+  if [ "${#offenders[@]}" -eq 0 ]; then
+    say "  ok no OpenClaw runtime/bootstrap context files tracked"
+  else
+    err "OpenClaw runtime/bootstrap context files tracked: ${offenders[*]}"
+  fi
+else
+  say "  (git unavailable or not a worktree — skipped)"
+fi
+
+# 1b) CLAUDE.md template policy blocks
 say "== CLAUDE.md template policy =="
 if [ -f claude/CLAUDE.md.template ]; then
   grep -q '^## Standing Orders$' claude/CLAUDE.md.template \
@@ -42,7 +66,7 @@ else
   err "missing claude/CLAUDE.md.template"
 fi
 
-# 1b) plugin manifest + marketplace catalog + runtime hook-path resolution
+# 1c) plugin manifest + marketplace catalog + runtime hook-path resolution
 if [ -f claude/.claude-plugin/plugin.json ]; then
   say "== plugin manifest =="
   jq -e '.name' claude/.claude-plugin/plugin.json >/dev/null 2>&1 && say "  ok plugin.json has name" || err "plugin.json missing name"
@@ -64,7 +88,7 @@ if [ -f claude/.claude-plugin/plugin.json ]; then
   done
 fi
 
-# 1c) hooks.json runtime-path resolution — the check that catches broken ${CLAUDE_PLUGIN_ROOT}
+# 1d) hooks.json runtime-path resolution — the check that catches broken ${CLAUDE_PLUGIN_ROOT}
 # references (plugin root = claude/, so ${CLAUDE_PLUGIN_ROOT}/X resolves to claude/X).
 if [ -f claude/hooks/hooks.json ]; then
   say "== hook-path resolution =="
@@ -77,7 +101,7 @@ if [ -f claude/hooks/hooks.json ]; then
   done
 fi
 
-# 1d) best-effort real load check via the Claude CLI (non-blocking if absent)
+# 1e) best-effort real load check via the Claude CLI (non-blocking if absent)
 if command -v claude >/dev/null 2>&1; then
   say "== claude plugin validate =="
   if claude plugin validate . >/tmp/pluginval.out 2>&1; then
@@ -116,7 +140,8 @@ for t in claude/hooks/guard.test.sh claude/hooks/observability.test.sh claude/ho
          claude/hooks/checkpoint.test.sh claude/hooks/distill-scope.test.sh \
          claude/hooks/distill/extract.test.sh claude/hooks/distill/honcho-push.test.sh \
          claude/hooks/distill/queue-drain.test.sh claude/hooks/distill/wiki-queue.test.sh \
-         scripts/ccc-doctor.test.sh scripts/ccc-distill-check.test.sh scripts/ccc-security-audit.test.sh scripts/agent-cron.test.sh; do
+         scripts/ccc-doctor.test.sh scripts/ccc-distill-check.test.sh scripts/ccc-security-audit.test.sh \
+         scripts/agent-cron.test.sh scripts/a2a-termux-native-worker.test.sh; do
   [ -f "$t" ] || { err "missing test: $t"; continue; }
   if bash "$t" >/tmp/htest.out 2>&1; then say "  ok $(grep -E 'PASS=' /tmp/htest.out | tail -1) $t";
   else err "test failed: $t"; tail -5 /tmp/htest.out; fi

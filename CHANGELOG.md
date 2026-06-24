@@ -6,6 +6,21 @@ All notable changes to the Claude Code node harness. Dates are KST.
 
 Distill observability follow-up — closes #130, #133.
 
+A2A mobile native worker first slice — refs #150.
+
+### Added
+- `scripts/a2a-termux-native-worker.sh` + Python checker: validates a
+  systemd-style env file for running `a2a-broker-worker/dist/worker.js` under
+  Termux native/glibc-runner Node, with fail-closed bridge metadata, local
+  tunnel, and env-hygiene checks. `run` is explicit and no live cutover or
+  restart is performed by default.
+- `docs/examples/a2a-termux-native-worker.env.example` and
+  `docs/a2a-claude-worker.md` native-Termux section documenting the PR-first
+  mobile worker path.
+- `scripts/validate-harness.sh`: OpenClaw runtime/bootstrap context-file guard
+  for tracked `AGENTS.md`, `SOUL.md`, `USER.md`, `TOOLS.md`, `HEARTBEAT.md`,
+  `IDENTITY.md`, and `.openclaw/**` paths.
+
 ### Changed
 - `claude/hooks/distill.sh` (#130): the three `skip reason=…` log lines
   (`no-transcript`, `cwd-out-of-scope`, `too-few-turns`) now emit
