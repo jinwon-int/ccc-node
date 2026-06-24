@@ -165,6 +165,18 @@ seed "$SRC/hermes/memories/USER.template.md"      "$MEM_DIR/USER.md"
 # honcho.json stays node-local under ~/.hermes (documentation/Hermes-side; not a hard CC dep).
 seed "$SRC/hermes/honcho.template.json"           "$HERMES_ROOT/honcho.json"
 
+# 2b) HOME-path rewrite — the settings/hook/skill templates use /root/.claude as the
+# canonical harness path. On nodes whose harness dir is not /root/.claude (e.g. Termux,
+# HOME=/data/data/com.termux/files/home), rewrite the installed files so settings.json
+# hook *command* paths resolve AND hook internal defaults (${CCC_*:-/root/.claude/...})
+# point at this node's real dir. Without this, claude fails its SessionEnd/Start hooks
+# (hook script not found) and memory/cache/state default to a nonexistent /root path.
+# No-op on standard root-HOME nodes where CLAUDE_DIR == /root/.claude.
+if [ "$CLAUDE_DIR" != "/root/.claude" ]; then
+  note "rewrite /root/.claude -> $CLAUDE_DIR in installed harness files"
+  run "grep -rlZ '/root/.claude' '$CLAUDE_DIR' 2>/dev/null | xargs -0 -r sed -i 's#/root/.claude#$CLAUDE_DIR#g' || true"
+fi
+
 # 3) Node-identity substitution — fill <PLACEHOLDER> tokens in the files we just seeded.
 # Only freshly-seeded files are touched (existing identity is never rewritten). Tokens for which
 # no flag was given are left intact so the manual checklist below still applies to them.
