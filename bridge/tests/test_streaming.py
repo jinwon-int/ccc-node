@@ -185,6 +185,41 @@ class StreamingMessageHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(bot.calls[0][0], "send_message")
         self.assertIn("/tmp/a.txt", bot.calls[0][2])
 
+    async def test_large_subchunk_block_is_one_send_no_edit_storm(self):
+        """A single complete SDK block under the 4000-char limit must produce
+        exactly one send and NO per-slice edit storm.
+
+        Regression for the streaming latency bug: the SDK delivers complete text
+        blocks (partial streaming off), and the old code sliced each block into
+        min_chars pieces, firing one edit_message_text per slice (~len/min_chars
+        sequential round-trips that also tripped Telegram's edit flood limit).
+        """
+        bot = _BotRecorder()
+        handler = StreamingMessageHandler(bot=bot, chat_id=42, user_id=7)
+
+        await handler.update_if_needed("x" * 1500)  # ~10 slices under old code
+
+        sends = [c for c in bot.calls if c[0] == "send_message"]
+        edits = [c for c in bot.calls if c[0] == "edit_message_text"]
+        self.assertEqual(len(sends), 1)
+        self.assertEqual(len(edits), 0)
+        self.assertEqual(len(handler.drafts), 1)
+
+    async def test_large_block_api_calls_scale_with_drafts_not_length(self):
+        """A multi-draft block splits by the 4000-char limit, and the number of
+        Telegram API calls tracks the draft count — not the text length."""
+        bot = _BotRecorder()
+        handler = StreamingMessageHandler(bot=bot, chat_id=42, user_id=7)
+
+        await handler.update_if_needed("x" * 9000)  # ~60 slices under old code
+
+        self.assertEqual(len(handler.drafts), 3)  # 9000 / 4000 -> 3 drafts
+        # Bounded by ~2 calls per draft (a send to open each draft + a finalize
+        # edit when it overflows), far below the ~60 edit_message_text calls the
+        # per-slice implementation would have made for 9000 chars.
+        self.assertLessEqual(len(bot.calls), 2 * len(handler.drafts))
+        self.assertLess(len(bot.calls), 9000 // handler.min_chars)
+
 
 from telegram_bot.utils import tg_md  # noqa: E402
 
