@@ -5,6 +5,15 @@ otherwise open it to every Telegram user), unless CCC_REQUIRE_ALLOWLIST=false
 is set to intentionally run an open bridge.
 """
 
+# ruff: noqa: E402
+import os
+from pathlib import Path
+
+# config.py reads PROJECT_ROOT (and a bot token) at import time; set them before
+# importing the bot module so collection works without a configured environment.
+os.environ.setdefault("PROJECT_ROOT", str(Path(__file__).resolve().parents[1]))
+os.environ.setdefault("TELEGRAM_BOT_TOKEN", "123456:test")
+
 import unittest
 from types import SimpleNamespace
 
