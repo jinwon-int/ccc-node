@@ -116,6 +116,7 @@ class TelegramBot:
         # Track currently executing task per user for priority stop command
         self._active_tasks: Dict[int, asyncio.Task] = {}
         self._audio_dir = config.bot_data_dir / "audio"
+        self._image_dir = config.bot_data_dir / "images"
         self._audio_processor = AudioProcessor(ffmpeg_path=config.ffmpeg_path)
         self._whisper_transcriber: Optional[WhisperTranscriber] = None
         self._volcengine_transcriber: Optional[VolcengineFileFastTranscriber] = None
@@ -140,11 +141,17 @@ class TelegramBot:
     async def _on_ready(self, application: Application):
         """Called after application.initialize() — sets up commands and cleanup."""
         self._audio_dir.mkdir(parents=True, exist_ok=True)
+        self._image_dir.mkdir(parents=True, exist_ok=True)
         removed = await self._cleanup_stale_audio_files(
             self._audio_dir, max_age_seconds=self._STALE_AUDIO_SECONDS
         )
+        removed_images = await self._cleanup_stale_audio_files(
+            self._image_dir, max_age_seconds=self._STALE_AUDIO_SECONDS
+        )
         if removed:
             logger.info("Startup audio cleanup removed %s stale file(s)", removed)
+        if removed_images:
+            logger.info("Startup image cleanup removed %s stale file(s)", removed_images)
         await self._set_bot_commands()
         logger.info("Bot initialization complete")
 
@@ -788,9 +795,16 @@ class TelegramBot:
             MessageHandler(filters.COMMAND, self._handle_skill_command), group=1
         )
 
-        # Text message handler - for answers to questions
+        # Text/message handlers - for answers to questions
         self.application.add_handler(
             MessageHandler(filters.VOICE, self._handle_voice_message), group=2
+        )
+        self.application.add_handler(
+            MessageHandler(
+                filters.PHOTO | filters.Document.IMAGE,
+                self._handle_photo_message,
+            ),
+            group=2,
         )
         self.application.add_handler(
             MessageHandler(filters.TEXT & ~filters.COMMAND, self._handle_text_message),
@@ -2023,10 +2037,66 @@ class TelegramBot:
 
         return f"https://api.telegram.org/file/bot{config.telegram_bot_token}/{normalized_path}"
 
-    async def _download_voice_file(self, voice, destination: FilePath) -> None:
+    @staticmethod
+    def _resolve_image_extension(mime_type: Optional[str], file_name: Optional[str] = None) -> str:
+        if file_name:
+            suffix = FilePath(file_name).suffix.lower().lstrip(".")
+            if suffix in {"jpg", "jpeg", "png", "webp", "gif", "bmp", "tif", "tiff"}:
+                return "jpg" if suffix == "jpeg" else suffix
+        mime = (mime_type or "").lower().split(";", 1)[0].strip()
+        return {
+            "image/jpeg": "jpg",
+            "image/jpg": "jpg",
+            "image/png": "png",
+            "image/webp": "webp",
+            "image/gif": "gif",
+            "image/bmp": "bmp",
+            "image/tiff": "tiff",
+        }.get(mime, "jpg")
+
+    @staticmethod
+    def _build_image_file_name(user_id: int, extension: str) -> str:
+        safe_ext = re.sub(r"[^a-z0-9]", "", extension.lower()) or "jpg"
+        return f"image_{user_id}_{int(time.time() * 1000)}.{safe_ext}"
+
+    @staticmethod
+    def _select_inbound_image(message: Message) -> Tuple[Optional[Any], str]:
+        photos = list(getattr(message, "photo", None) or [])
+        if photos:
+            def score(photo: Any) -> int:
+                file_size = int(getattr(photo, "file_size", 0) or 0)
+                pixels = int(getattr(photo, "width", 0) or 0) * int(getattr(photo, "height", 0) or 0)
+                return max(file_size, pixels)
+
+            return max(photos, key=score), "photo"
+
+        document = getattr(message, "document", None)
+        mime_type = str(getattr(document, "mime_type", "") or "").lower()
+        if document is not None and mime_type.startswith("image/"):
+            return document, "document"
+        return None, "none"
+
+    @staticmethod
+    def _build_image_prompt(image_path: FilePath, caption: str) -> str:
+        caption = (caption or "").strip()
+        prompt = (
+            "The user sent an inbound Telegram image. Analyze the image and answer the user's request.\n\n"
+            f"Local image path: {image_path}\n"
+        )
+        if caption:
+            prompt += f"Caption / user instruction: {caption}\n"
+        else:
+            prompt += "Caption / user instruction: Please describe what is in the image and mention any visible text.\n"
+        prompt += (
+            "If the current Claude Code runtime cannot directly inspect image files, say so clearly "
+            "and explain what file was received instead of silently ignoring the image."
+        )
+        return prompt
+
+    async def _download_telegram_file(self, file_id: str, destination: FilePath) -> None:
         app = self._require_application()
-        telegram_file = await app.bot.get_file(voice.file_id)
-        logger.debug("Downloading voice file to %s", destination)
+        telegram_file = await app.bot.get_file(file_id)
+        logger.debug("Downloading Telegram file to %s", destination)
         if hasattr(telegram_file, "download_to_drive"):
             await telegram_file.download_to_drive(custom_path=str(destination))
             return
@@ -2036,6 +2106,12 @@ class TelegramBot:
             )
             return
         raise RuntimeError("Telegram file download API is unavailable.")
+
+    async def _download_voice_file(self, voice, destination: FilePath) -> None:
+        await self._download_telegram_file(voice.file_id, destination)
+
+    async def _download_image_file(self, image, destination: FilePath) -> None:
+        await self._download_telegram_file(image.file_id, destination)
 
     async def _prepare_audio_for_whisper(
         self, source_path: FilePath, cleanup_paths: List[FilePath]
@@ -2145,6 +2221,83 @@ class TelegramBot:
                 f"Error: {str(e)}\n\n"
                 "Please try again later."
             )
+
+    async def _handle_photo_message(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ):
+        del context
+        if not await self._check_access(update):
+            return
+        message = self._require_message(update)
+        image, image_kind = self._select_inbound_image(message)
+        if image is None:
+            return
+
+        user_id = self._require_user(update).id
+        file_id = getattr(image, "file_id", "")
+        caption = getattr(message, "caption", None) or ""
+        log_debug(user_id, "image", f"{image_kind}:{file_id} caption_len={len(caption)}")
+
+        async def run_task():
+            self._image_dir.mkdir(parents=True, exist_ok=True)
+            start = time.perf_counter()
+            cleanup_paths: List[FilePath] = []
+            outcome = "failed"
+            try:
+                extension = self._resolve_image_extension(
+                    getattr(image, "mime_type", None), getattr(image, "file_name", None)
+                )
+                image_path = self._image_dir / self._build_image_file_name(
+                    user_id=user_id, extension=extension
+                )
+                cleanup_paths.append(image_path)
+                try:
+                    await self._download_image_file(image, image_path)
+                except Exception as exc:
+                    logger.error(
+                        "Image file download failed for user %s: %s",
+                        user_id,
+                        exc,
+                        exc_info=True,
+                    )
+                    await message.reply_text(
+                        "❌ Failed to download your image. Please retry."
+                    )
+                    outcome = "download_failed"
+                    return
+
+                prompt = self._build_image_prompt(image_path, caption)
+                await self._process_user_message_text(
+                    update,
+                    user_id,
+                    prompt,
+                    message_source="image",
+                )
+                outcome = "success"
+            except asyncio.CancelledError:
+                outcome = "cancelled"
+                logger.info("Image processing cancelled for user %s", user_id)
+                raise
+            finally:
+                await self._audio_processor.cleanup_audio_files(cleanup_paths)
+                elapsed_ms = int((time.perf_counter() - start) * 1000)
+                logger.info(
+                    "Image processing result user_id=%s kind=%s outcome=%s elapsed_ms=%s",
+                    user_id,
+                    image_kind,
+                    outcome,
+                    elapsed_ms,
+                )
+
+        async def on_overflow():
+            reply = (
+                f"⏳ Image queue is full ({self._MAX_INFLIGHT_MESSAGES} active tasks). "
+                "Please wait or send /stop to terminate running tasks."
+            )
+            await message.reply_text(reply)
+            log_debug(user_id, "bot", reply)
+
+        await self._enqueue_user_task(user_id, run_task, on_overflow)
 
     async def _handle_voice_message(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
