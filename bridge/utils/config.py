@@ -231,6 +231,26 @@ class Config(BaseSettings):
             "Default on; set CCC_TELEGRAM_LOOSE_SPACING=false for compact output."
         ),
     )
+    telegram_max_bubble_chars: int = Field(
+        default=1200,
+        alias="CCC_TELEGRAM_MAX_BUBBLE_CHARS",
+        description=(
+            "Maximum characters per Telegram message ('bubble'). Long replies "
+            "are split into multiple messages at this size during streaming so no "
+            "single bubble is overwhelming. Telegram's hard limit is 4096; values "
+            "are clamped to [200, 4000]. Default 1200."
+        ),
+    )
+
+    @field_validator("telegram_max_bubble_chars", mode="before")
+    @classmethod
+    def clamp_max_bubble_chars(cls, v):
+        try:
+            n = int(v)
+        except (TypeError, ValueError):
+            return 1200
+        return max(200, min(n, 4000))
+
     enable_entity_renderer: bool = Field(
         default=True,
         alias="CCC_TELEGRAM_ENTITY_RENDERER",
