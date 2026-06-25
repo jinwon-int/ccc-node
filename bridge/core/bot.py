@@ -51,6 +51,7 @@ from telegram_bot.utils.chat_logger import log_debug
 from telegram_bot.utils.tg_format import wrap_markdown_tables
 from telegram_bot.utils.tg_robust import send_with_retry
 from telegram_bot.utils import tg_md
+from telegram_bot.utils import tg_readable
 from telegram_bot.utils import tg_errors
 from telegram_bot.utils.audio_processor import AudioProcessor
 from telegram_bot.utils.transcription import (
@@ -2956,6 +2957,18 @@ class TelegramBot:
                     await send_with_retry(lambda p=part: op(p, None))
             return
 
+        # Normalize layout for mobile readability (loose-spacing etc.) before the
+        # MarkdownV2 conversion — mirrors the streaming finalize path so the
+        # non-streaming delivery path (the default since live streaming is
+        # opt-in, see CCC_TELEGRAM_STREAMING) renders identically. Shared helper
+        # keeps both paths from drifting. Content-preserving, idempotent,
+        # fail-open.
+        render_text = tg_readable.render_for_delivery(
+            content,
+            enabled=getattr(config, "enable_readable_renderer", False),
+            loose=getattr(config, "enable_loose_spacing", False),
+        )
+
         if tg_md.available():
             # Convert the whole message to MarkdownV2 first, THEN split on
             # entity-safe boundaries with split_markdownv2. Splitting the raw
@@ -2964,7 +2977,7 @@ class TelegramBot:
             # sub-limit raw chunk can exceed TELEGRAM_LIMIT once escaped and was
             # silently dropped to plain text (all formatting lost). Per-part
             # plain fallback only on the rare BadRequest.
-            md2 = tg_md.to_markdownv2(content)
+            md2 = tg_md.to_markdownv2(render_text)
             if md2 is not None:
                 for part in tg_md.split_markdownv2(md2, limit):
                     try:
@@ -2975,7 +2988,7 @@ class TelegramBot:
             # conversion unavailable/failed -> legacy path below
 
         # Legacy fallback: telegramify unavailable -> wrap tables + base parse mode.
-        for part in self._split_text(wrap_markdown_tables(content), limit):
+        for part in self._split_text(wrap_markdown_tables(render_text), limit):
             try:
                 await send_with_retry(lambda p=part: op(p, base_parse_mode))
             except telegram.error.BadRequest:
