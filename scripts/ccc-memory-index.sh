@@ -120,12 +120,28 @@ def docs():
             yield kind, str(p), text
 
 
+def db_sidecars(path: Path):
+    return [path, Path(str(path) + "-wal"), Path(str(path) + "-shm"), Path(str(path) + "-journal")]
+
+
 def secure_db_files(path: Path):
-    for p in [path, Path(str(path) + "-wal"), Path(str(path) + "-shm"), Path(str(path) + "-journal")]:
+    for p in db_sidecars(path):
         try:
             if p.exists():
                 os.chmod(p, 0o600)
         except OSError:
+            pass
+
+
+def remove_existing_db(path: Path):
+    # Rebuild is a privacy boundary: old DB free pages may contain pre-redaction
+    # plaintext. Delete the DB + sidecars before opening so the new file only
+    # contains freshly redacted content.
+    for p in db_sidecars(path):
+        try:
+            if p.exists():
+                p.unlink()
+        except FileNotFoundError:
             pass
 
 
@@ -135,9 +151,13 @@ try:
 except OSError:
     pass
 
+if cmd == "rebuild":
+    remove_existing_db(db)
+
 con = sqlite3.connect(db)
 try:
     con.execute("PRAGMA journal_mode=DELETE")
+    con.execute("PRAGMA secure_delete=ON")
     con.execute("CREATE TABLE IF NOT EXISTS memory_docs (source TEXT NOT NULL, path TEXT PRIMARY KEY, content TEXT NOT NULL, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)")
     con.execute("CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(path UNINDEXED, source UNINDEXED, content)")
     if cmd == "rebuild":
@@ -163,6 +183,9 @@ try:
         con.execute("DELETE FROM memory_fts")
         con.execute("INSERT INTO memory_fts(path,source,content) SELECT path,source,content FROM memory_docs")
         con.commit()
+        # Compact after update/rebuild so replaced/deleted plaintext from older
+        # index versions is not left in SQLite free pages.
+        con.execute("VACUUM")
     count = con.execute("SELECT COUNT(*) FROM memory_docs").fetchone()[0]
 finally:
     con.close()
