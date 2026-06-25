@@ -50,8 +50,9 @@ fi
 case "$tool" in
   Read|Edit|Write|NotebookEdit|MultiEdit)
     case "$fpath" in
-      *.template.*|*.env.example) : ;;                       # templates/examples are safe
-      */.env|*.credentials.json|*.pem|*/id_rsa|*/id_rsa.*|*.key)
+      *.template.*|*.env.example|*.env.template|*.env.sample) : ;;  # templates/examples are safe
+      */.env|*/.env.*|*.env|*.credentials.json|*.pem|*/id_rsa|*/id_rsa.*|*.key)
+        # Covers .env, .env.local, .env.production, foo.env, etc. (templates carved above).
         deny "secret-file" "operator_approval_gated" "$tool on $fpath" ;;
     esac
     ;;
@@ -64,6 +65,12 @@ c="$cmd"
 
 g() { grep -Eq "$1" <<<"$c"; }   # case-sensitive
 gi() { grep -Eiq "$1" <<<"$c"; } # case-insensitive
+
+# Quote-stripped view: dangerous tokens must not be hidden behind quotes, e.g.
+# `rm -rf "/root"` or `cat ".env"`. Matching the de-quoted form only ever ADDS
+# denials (never removes them), so it cannot loosen the guard.
+cn="${c//\"/}"; cn="${cn//\'/}"
+gn() { grep -Eq "$1" <<<"$cn"; }    # case-sensitive, quote-stripped
 
 # 0 = safe low-risk local Telegram bridge restart.
 ccc_telegram_bridge_restart() {
@@ -96,10 +103,32 @@ ccc_telegram_bridge_restart() {
 # branch. Protected branches (main/master/develop/release*/…), ambiguous or
 # bare targets (no explicit dst, HEAD, current branch), multiple refspecs, and
 # compound/chained commands ALL stay DENIED — fail-closed when uncertain.
+# 0 = the command's git subcommand is `push`, tolerating global options that sit
+# between `git` and the subcommand (e.g. `git -C <dir> push`, `git -c k=v push`).
+# The old regex required `git` and `push` to be adjacent, so `git -C x push
+# --force origin main` slipped past the review gate entirely.
+cmd_is_git_push() {
+  local toks; read -ra toks <<<"$c"
+  local n=${#toks[@]} i=0
+  while [ "$i" -lt "$n" ] && [ "${toks[$i]}" != "git" ]; do i=$((i+1)); done
+  [ "$i" -lt "$n" ] || return 1
+  i=$((i+1))
+  while [ "$i" -lt "$n" ]; do
+    case "${toks[$i]}" in
+      -C|-c|--git-dir|--work-tree|--namespace|--exec-path|--super-prefix) i=$((i+2)) ;;  # opt + value
+      push) return 0 ;;
+      -*) i=$((i+1)) ;;        # value-less global flag
+      *) return 1 ;;           # first non-option subcommand isn't push
+    esac
+  done
+  return 1
+}
+
 is_forcepush() {
-  g 'git[[:space:]]+push\b.*([[:space:]]-[a-zA-Z]*f\b|--force-with-lease|--force([[:space:]=]|$))' && return 0
-  g 'git[[:space:]]+push\b.*[[:space:]]\+[A-Za-z0-9_./-]+:'                                         && return 0  # +src:dst
-  g 'git[[:space:]]+push\b.*[[:space:]]\+[A-Za-z0-9_./-]+([[:space:]]|$)'                           && return 0  # +branch
+  cmd_is_git_push || return 1
+  g '([[:space:]]-[a-zA-Z]*f\b|--force-with-lease|--force([[:space:]=]|$))' && return 0
+  g '[[:space:]]\+[A-Za-z0-9_./-]+:'                                        && return 0  # +src:dst
+  g '[[:space:]]\+[A-Za-z0-9_./-]+([[:space:]]|$)'                          && return 0  # +branch
   return 1
 }
 
@@ -165,11 +194,15 @@ g '[[:space:]]replay([[:space:]]|$)'                                            
 g 'npm[[:space:]]+publish([[:space:]]|$)|gh[[:space:]]+release[[:space:]]+create([[:space:]]|$)|git[[:space:]]+push([[:space:]]|$)[^|;&]*--tags' && deny "release/publish" "operator_review_gated" "$c"
 g 'gh[[:space:]]+repo[[:space:]]+edit([[:space:]]|$)[^|;&]*--visibility'                          && deny "repo-visibility" "operator_approval_gated" "$c"
 
-# secret read / exfil
-g '\b(cat|less|more|head|tail|xxd|od|strings|bat)\b[^|;&]*(\.env([[:space:]]|$)|\.credentials\.json|\bid_rsa\b|\.pem([[:space:]]|$))' && deny "secret-read" "operator_approval_gated" "$c"
-g '\b(curl|wget|nc|ncat|scp|rsync|ssh)\b[^|;&]*(\.env([[:space:]]|$)|\.credentials|\bid_rsa\b|secret|token)' && deny "secret-exfil" "operator_approval_gated" "$c"
+# secret read / exfil (quote-stripped; `.env` matched only when NOT followed by
+# more name chars, so `.env` is caught but `.env.example` templates are not).
+# Verb list extended beyond pagers to copy/encode tools (cp/mv/dd/tee/base64/…).
+gn '\b(cat|less|more|head|tail|xxd|od|strings|bat|nl|tac|cp|mv|dd|tee|install|rsync|base64|gpg|openssl)\b[^|;&]*(\.env([^A-Za-z0-9_.-]|$)|\.credentials\.json|\bid_rsa\b|\.pem([[:space:]]|$))' && deny "secret-read" "operator_approval_gated" "$c"
+# Indirect read via an interpreter, e.g. python3 -c "open('.env').read()".
+gn '\b(python3?|ruby|perl|node|php)\b[^|;&]*(\.env([^A-Za-z0-9_.-]|$)|\.credentials|\bid_rsa\b|\.pem\b)' && deny "secret-indirect-read" "operator_approval_gated" "$c"
+gn '\b(curl|wget|nc|ncat|scp|sftp|ftp|rsync|ssh)\b[^|;&]*(\.env([^A-Za-z0-9_.-]|$)|\.credentials|\bid_rsa\b|secret|token)' && deny "secret-exfil" "operator_approval_gated" "$c"
 
-# catastrophic rm against absolute / home roots
-g '\brm\b[[:space:]]+(-[A-Za-z]+[[:space:]]+)*(/|~|\$HOME|/root|/etc|/var|/usr|/bin|/lib)([[:space:]/]|$)' && deny "rm-catastrophic" "operator_approval_gated" "$c"
+# catastrophic rm against absolute / home roots (quote-stripped; long flags too)
+gn '\brm\b([[:space:]]+--?[A-Za-z-]+)*[[:space:]]+(/|~|\$HOME|/root|/etc|/var|/usr|/bin|/lib)([[:space:]/]|$)' && deny "rm-catastrophic" "operator_approval_gated" "$c"
 
 exit 0

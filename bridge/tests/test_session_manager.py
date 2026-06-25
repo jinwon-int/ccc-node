@@ -52,6 +52,36 @@ class SessionManagerReplyModeTests(unittest.IsolatedAsyncioTestCase):
             mode = await manager.get_reply_mode(1001)
             self.assertEqual(mode, "voice")
 
+    async def test_get_session_returns_isolated_copy(self):
+        # Mutating a returned session must NOT leak into the store before an
+        # explicit update_session() — get() hands out a deep copy.
+        with TemporaryDirectory() as td:
+            module = self._load_session_manager_module(td)
+            manager = module.SessionManager()
+
+            await manager.update_session(1001, {"model": "opus"})
+            session = await manager.get_session(1001)
+            session["model"] = "haiku"  # local mutation, no commit
+            session["pending"] = [1, 2, 3]
+
+            fresh = await manager.get_session(1001)
+            self.assertEqual(fresh["model"], "opus")
+            self.assertNotIn("pending", fresh)
+
+    async def test_update_session_does_not_alias_caller_dict(self):
+        # After update_session, mutating the dict the caller passed must not
+        # change the stored state (store keeps a private copy).
+        with TemporaryDirectory() as td:
+            module = self._load_session_manager_module(td)
+            manager = module.SessionManager()
+
+            payload = {"items": [1, 2]}
+            await manager.update_session(1001, payload)
+            payload["items"].append(999)  # mutate the nested list after commit
+
+            fresh = await manager.get_session(1001)
+            self.assertEqual(fresh["items"], [1, 2])
+
     async def test_should_start_new_session_is_false_without_previous_message(self):
         with TemporaryDirectory() as td:
             module = self._load_session_manager_module(td)

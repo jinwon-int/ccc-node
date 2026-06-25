@@ -265,5 +265,33 @@ class PartialStreamingReaderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(req.future.result().content, "Hi there")
 
 
+class _DisconnectClient:
+    def __init__(self):
+        self.disconnected = False
+
+    async def disconnect(self):
+        self.disconnected = True
+
+
+class ClearUserStreamTests(unittest.IsolatedAsyncioTestCase):
+    async def test_clear_cancels_futures_and_disconnects(self):
+        handler = project_chat.ProjectChatHandler()
+        client = _DisconnectClient()
+        state = project_chat._UserStreamState(client=client, model=None)
+        req = _make_request(None)
+        state.pending.append(req)
+        handler._streams[7] = state
+
+        await handler.clear_user_stream(7)
+
+        self.assertTrue(req.future.cancelled())   # revert cancellation semantics kept
+        self.assertTrue(client.disconnected)       # SDK subprocess actually torn down
+        self.assertNotIn(7, handler._streams)      # stream removed
+
+    async def test_clear_missing_user_is_noop(self):
+        handler = project_chat.ProjectChatHandler()
+        await handler.clear_user_stream(999)  # must not raise
+
+
 if __name__ == "__main__":
     unittest.main()

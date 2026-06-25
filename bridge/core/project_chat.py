@@ -889,26 +889,25 @@ class ProjectChatHandler:
     def is_user_busy(self, user_id: int) -> bool:
         return self.inflight_count(user_id) > 0
 
-    def clear_user_stream(self, user_id: int) -> None:
-        """Clear active stream for a user to force new SDK connection."""
-        if user_id in self._streams:
-            state = self._streams[user_id]
-            # Cancel reader and typing tasks
-            if state.reader_task and not state.reader_task.done():
-                state.reader_task.cancel()
-            if state.typing_task and not state.typing_task.done():
-                state.typing_task.cancel()
-            # Close SDK client
-            try:
-                if state.client:
-                    close_fn = getattr(state.client, "close", None)
-                    if callable(close_fn):
-                        asyncio.create_task(close_fn())
-            except Exception as e:
-                logger.error(f"Error closing SDK client for user {user_id}: {e}")
-            # Remove from streams dict
-            del self._streams[user_id]
-            logger.info(f"Cleared stream for user {user_id}")
+    async def clear_user_stream(self, user_id: int) -> None:
+        """Clear active stream for a user to force a new SDK connection (used by /revert).
+
+        Cancels pending request futures first (revert relies on cancellation
+        semantics, not a 'terminated' result), then delegates to the full
+        teardown which cancels AND awaits the reader/typing tasks with timeouts
+        and awaits ``client.disconnect()``. The old implementation fire-and-forgot
+        ``asyncio.create_task(close_fn())`` — an unreferenced task that could be
+        garbage-collected mid-flight, and ``close`` often did not exist on the
+        client (the real method is ``disconnect``), leaking the SDK subprocess.
+        """
+        state = self._streams.get(user_id)
+        if not state:
+            return
+        for req in list(state.pending):
+            if req.future and not req.future.done():
+                req.future.cancel()
+        await self._disconnect_user_stream(user_id)
+        logger.info(f"Cleared stream for user {user_id}")
 
     def clear_pending_permissions(self, user_id: int) -> None:
         """Clear pending permission futures for a user."""

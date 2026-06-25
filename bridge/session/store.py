@@ -1,4 +1,5 @@
 import asyncio
+import copy
 import json
 import logging
 from typing import Optional, Dict, Any
@@ -36,9 +37,15 @@ class SessionStore:
         return f"telegram_session:{user_id}"
 
     async def get(self, user_id: int) -> Optional[Dict[str, Any]]:
+        # Return a deep copy, never the live stored dict. Callers throughout the
+        # bot mutate the returned session in place and only persist via
+        # update_session(); handing out the live reference let those mutations
+        # (and, under concurrent same-user handlers, each other's edits) leak
+        # into the store before — or without — an explicit commit.
         key = self._key(user_id)
         async with self._lock:
-            return self._local_data.get(key)
+            value = self._local_data.get(key)
+            return copy.deepcopy(value) if value is not None else None
 
     async def set(
         self, user_id: int, data: Dict[str, Any], ttl: Optional[int] = None
@@ -46,7 +53,7 @@ class SessionStore:
         del ttl  # kept for API compatibility; local JSON storage has no TTL
         key = self._key(user_id)
         async with self._lock:
-            self._local_data[key] = data
+            self._local_data[key] = copy.deepcopy(data)
             self._save_local_data()
 
     async def delete(self, user_id: int) -> None:
@@ -57,10 +64,12 @@ class SessionStore:
                 self._save_local_data()
 
     async def update(self, user_id: int, updates: Dict[str, Any]) -> None:
+        # Build the new state from a private copy of the stored dict so an
+        # earlier get()'s returned object can't alias the base being updated.
         key = self._key(user_id)
         async with self._lock:
-            data = self._local_data.get(key, {})
-            data.update(updates)
+            data = copy.deepcopy(self._local_data.get(key, {}))
+            data.update(copy.deepcopy(updates))
             self._local_data[key] = data
             self._save_local_data()
 

@@ -1346,10 +1346,10 @@ class TelegramBot:
 
     async def _clear_user_state(self, user_id: int) -> None:
         """Clear runtime state after revert operation."""
-        # Clear active stream
-        project_chat_handler.clear_user_stream(user_id)
+        # Clear active stream (cancels pending futures + disconnects the SDK client)
+        await project_chat_handler.clear_user_stream(user_id)
 
-        # Clear pending permission futures
+        # Clear pending permission futures (no-op if the stream was just cleared)
         project_chat_handler.clear_pending_permissions(user_id)
 
         # Update session manager
