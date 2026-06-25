@@ -205,6 +205,25 @@ class StreamingMessageHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(edits), 0)
         self.assertEqual(len(handler.drafts), 1)
 
+    async def test_max_bubble_chars_controls_split(self):
+        """A smaller per-bubble size splits a long reply into more, smaller drafts."""
+        bot = _BotRecorder()
+        handler = StreamingMessageHandler(bot=bot, chat_id=42, user_id=7)
+        handler.max_bubble_chars = 1000
+
+        await handler.update_if_needed("x" * 3500)
+
+        # 3500 / 1000 -> 4 drafts (three full bubbles + a remainder).
+        self.assertEqual(len(handler.drafts), 4)
+        for draft in handler.drafts[:-1]:
+            self.assertLessEqual(len(draft.text), 1000)
+
+    async def test_default_bubble_size_falls_back_to_4000(self):
+        bot = _BotRecorder()
+        handler = StreamingMessageHandler(bot=bot, chat_id=42, user_id=7)
+        # Test config stub has no telegram_max_bubble_chars -> safe default.
+        self.assertEqual(handler.max_bubble_chars, 4000)
+
     async def test_large_block_api_calls_scale_with_drafts_not_length(self):
         """A multi-draft block splits by the 4000-char limit, and the number of
         Telegram API calls tracks the draft count — not the text length."""

@@ -165,5 +165,40 @@ class VoiceProviderConfigTests(unittest.TestCase):
             self.assertEqual(cfg.auto_new_session_after_hours, 12.0)
 
 
+class MaxBubbleCharsConfigTests(unittest.TestCase):
+    def _load_with_env(self, project_root: str, **extra_env):
+        with patch.dict(
+            os.environ,
+            {
+                "PROJECT_ROOT": project_root,
+                "TELEGRAM_BOT_TOKEN": "123456:abc",
+                **extra_env,
+            },
+            clear=True,
+        ):
+            sys.modules.pop("telegram_bot.utils.config", None)
+            return importlib.import_module("telegram_bot.utils.config")
+
+    def test_default_is_1200(self):
+        with TemporaryDirectory() as td:
+            module = self._load_with_env(td)
+            self.assertEqual(module.config.telegram_max_bubble_chars, 1200)
+
+    def test_clamped_to_hard_limit(self):
+        with TemporaryDirectory() as td:
+            module = self._load_with_env(td, CCC_TELEGRAM_MAX_BUBBLE_CHARS="99999")
+            self.assertEqual(module.config.telegram_max_bubble_chars, 4000)
+
+    def test_clamped_to_floor(self):
+        with TemporaryDirectory() as td:
+            module = self._load_with_env(td, CCC_TELEGRAM_MAX_BUBBLE_CHARS="50")
+            self.assertEqual(module.config.telegram_max_bubble_chars, 200)
+
+    def test_honors_valid_value(self):
+        with TemporaryDirectory() as td:
+            module = self._load_with_env(td, CCC_TELEGRAM_MAX_BUBBLE_CHARS="1500")
+            self.assertEqual(module.config.telegram_max_bubble_chars, 1500)
+
+
 if __name__ == "__main__":
     unittest.main()

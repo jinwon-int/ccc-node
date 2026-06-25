@@ -35,7 +35,8 @@ class StreamingMessageHandler:
     Handles progressive streaming of AI responses using Telegram draft messages.
 
     Manages draft message lifecycle: creation, updates, finalization, and cancellation.
-    Supports multi-message handling for content exceeding 4000 characters.
+    Supports multi-message handling, splitting long replies into per-bubble-sized
+    messages (``max_bubble_chars``, configurable via CCC_TELEGRAM_MAX_BUBBLE_CHARS).
     """
 
     def __init__(self, bot: Bot, chat_id: int, user_id: int):
@@ -47,6 +48,16 @@ class StreamingMessageHandler:
         self.tool_calls_text: str = ""  # Accumulated tool call display text
         self.min_chars = config.draft_update_min_chars
         self.min_interval = config.draft_update_interval
+        # Max characters per Telegram message ("bubble"). Long replies overflow
+        # into a new draft at this size during streaming so no single bubble is
+        # overwhelming. Clamped to the Telegram hard limit as a safety bound.
+        self.max_bubble_chars = max(
+            200,
+            min(
+                int(getattr(config, "telegram_max_bubble_chars", 4000)),
+                tg_md.TELEGRAM_LIMIT,
+            ),
+        )
         self.enable_tool_calls = getattr(config, "enable_streaming_tool_calls", False)
         self._finalized = False
         self._draft_seq = 0
@@ -359,15 +370,18 @@ class StreamingMessageHandler:
         logger.debug(f"Finalized draft {draft.message_id}")
         return True
 
-    def _find_split_boundary(self, text: str, max_length: int = 4000) -> int:
+    def _find_split_boundary(self, text: str, max_length: Optional[int] = None) -> int:
         """Find smart boundary for text splitting (paragraph > line > hard cut).
 
-        Avoids cutting through a fenced code block or a contiguous pipe table:
-        if the chosen boundary lands inside such a block, back up to the block's
-        start so each draft renders a whole table/code block instead of two
-        broken halves. Backing up is floored at ``max_length // 2`` to avoid
-        pathologically small chunks (a single huge block degrades gracefully).
+        ``max_length`` defaults to the configured per-bubble size. Avoids cutting
+        through a fenced code block or a contiguous pipe table: if the chosen
+        boundary lands inside such a block, back up to the block's start so each
+        draft renders a whole table/code block instead of two broken halves.
+        Backing up is floored at ``max_length // 2`` to avoid pathologically
+        small chunks (a single huge block degrades gracefully).
         """
+        if max_length is None:
+            max_length = self.max_bubble_chars
         if len(text) <= max_length:
             return len(text)
 
@@ -448,7 +462,7 @@ class StreamingMessageHandler:
             draft.part_header_total = total
 
     async def handle_overflow(self) -> bool:
-        """Handle 4000 character boundary by finalizing current draft and creating new one"""
+        """Handle the per-bubble boundary by finalizing the current draft and creating a new one."""
         if not self.drafts:
             return False
 
@@ -482,13 +496,13 @@ class StreamingMessageHandler:
     async def update_if_needed(self, new_text_chunk: str) -> bool:
         """
         Main entry point: accumulate text and update draft if thresholds met.
-        Handles overflow to new drafts when exceeding 4000 chars.
+        Handles overflow to new drafts when exceeding the per-bubble size
+        (``max_bubble_chars``, configurable via CCC_TELEGRAM_MAX_BUBBLE_CHARS).
 
-        The Claude SDK delivers complete text blocks (token-level partial
-        streaming is off), so a single chunk can already be hundreds–thousands
-        of characters. We accumulate the whole chunk, split it across Telegram's
-        4000-char limit into separate drafts, then push AT MOST ONE edit for the
-        trailing draft (threshold-gated).
+        A single chunk can already be hundreds–thousands of characters. We
+        accumulate the whole chunk, split it across the per-bubble size into
+        separate drafts, then push AT MOST ONE edit for the trailing draft
+        (threshold-gated).
 
         The previous implementation sliced a large chunk into ``min_chars``
         pieces and issued one ``edit_message_text`` per slice — N sequential
@@ -516,8 +530,8 @@ class StreamingMessageHandler:
             seed = self._first_draft_prefix() + self.accumulated_text[:boundary]
             await self.create_draft(seed)
 
-        # Split off complete drafts while the buffer exceeds the Telegram limit.
-        while len(self.accumulated_text) >= 4000:
+        # Split off complete drafts while the buffer exceeds the per-bubble size.
+        while len(self.accumulated_text) >= self.max_bubble_chars:
             await self.handle_overflow()
 
         if not self.drafts:
