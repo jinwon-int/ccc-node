@@ -165,6 +165,36 @@ class VoiceProviderConfigTests(unittest.TestCase):
             self.assertEqual(cfg.auto_new_session_after_hours, 12.0)
 
 
+class AllowedUserIdsConfigTests(unittest.TestCase):
+    def _load_with_env(self, project_root: str, **extra_env):
+        with patch.dict(
+            os.environ,
+            {
+                "PROJECT_ROOT": project_root,
+                "TELEGRAM_BOT_TOKEN": "123456:abc",
+                **extra_env,
+            },
+            clear=True,
+        ):
+            sys.modules.pop("telegram_bot.utils.config", None)
+            return importlib.import_module("telegram_bot.utils.config")
+
+    def test_allowed_user_ids_accepts_comma_separated_env(self):
+        with TemporaryDirectory() as td:
+            module = self._load_with_env(td, ALLOWED_USER_IDS="123,456,789")
+            self.assertEqual(module.config.allowed_user_ids, [123, 456, 789])
+
+    def test_allowed_user_ids_accepts_json_array_env_for_compatibility(self):
+        with TemporaryDirectory() as td:
+            module = self._load_with_env(td, ALLOWED_USER_IDS="[123, 456, 789]")
+            self.assertEqual(module.config.allowed_user_ids, [123, 456, 789])
+
+    def test_allowed_user_ids_ignores_blank_segments(self):
+        with TemporaryDirectory() as td:
+            module = self._load_with_env(td, ALLOWED_USER_IDS="123, ,456,")
+            self.assertEqual(module.config.allowed_user_ids, [123, 456])
+
+
 class MaxBubbleCharsConfigTests(unittest.TestCase):
     def _load_with_env(self, project_root: str, **extra_env):
         with patch.dict(

@@ -385,15 +385,23 @@ class StreamingMessageHandler:
         if len(text) <= max_length:
             return len(text)
 
-        # Try paragraph boundary (double newline)
-        search_start = max(0, max_length - 200)
-        para_idx = text.rfind("\n\n", search_start, max_length)
-        if para_idx > search_start:
-            return para_idx + 2
+        floor = max(1, max_length // 2)
+
+        # Prefer paragraph boundaries across the useful back half of the chunk,
+        # not only the final 200 characters. This makes the configured per-bubble
+        # size a target ceiling while still producing readable semantic bubbles.
+        para_idx = text.rfind("\n\n", floor, max_length)
+        if para_idx >= floor:
+            return self._avoid_block_split(text, para_idx + 2, max_length)
+
+        # Then try a heading boundary so a new section starts a new bubble.
+        heading_idx = text.rfind("\n#", floor, max_length)
+        if heading_idx >= floor:
+            return self._avoid_block_split(text, heading_idx + 1, max_length)
 
         # Try line boundary (single newline)
-        line_idx = text.rfind("\n", search_start, max_length)
-        if line_idx > search_start:
+        line_idx = text.rfind("\n", floor, max_length)
+        if line_idx >= floor:
             return self._avoid_block_split(text, line_idx + 1, max_length)
 
         # Hard cut at max_length

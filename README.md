@@ -16,11 +16,17 @@ to Telegram, with all secrets and node-local state stripped out and replaced by 
 
 ## What this gives a node
 
-- **SessionStart / PostCompact memory injection** — `hooks/load-memory.sh` injects a snapshot
-  at session start: built-in `MEMORY.md`/`USER.md` + cached Family Wiki prefetch + cached
-  Honcho working memory, then fires a detached background refresh for the next session.
+- **SessionStart / PostCompact memory injection** — `hooks/load-memory.sh` injects a bounded
+  snapshot at session start: built-in `MEMORY.md`/`USER.md` + local hot-memory search
+  (when enabled) + cached Family Wiki prefetch + cached Honcho working memory, then fires
+  a detached background refresh for the next session. Startup remains no-network/fail-open.
 - **Background cache refresh** — `hooks/refresh-memory.sh` updates the Wiki + Honcho caches
-  out-of-band (single-flight via `flock`, fail-open) so startup never blocks on slow calls.
+  out-of-band (single-flight via `flock`, fail-open), records per-source cache metadata,
+  and opportunistically updates the local SQLite FTS5 hot-memory index.
+- **Local memory diagnostics/eval** — `scripts/ccc-memory-check.sh`,
+  `scripts/ccc-memory-index.sh`, `scripts/ccc-memory-search.sh`, and
+  `scripts/ccc-memory-eval.sh` provide cache health, SQLite FTS5 indexing/search, and
+  no-network latency/recall smoke tests for `CCC_MEMORY_PROFILE=hybrid|max-perf`.
 - **Harness settings** — `settings.json` (permissions + hook wiring) and `settings.local.json`.
 - **CLAUDE.md template** — the operating-policy skeleton (Wiki-first, A2A/Nexus, GitHub
   hygiene, fresh-approval rules) with node/user identity as `<PLACEHOLDERS>`.
@@ -145,8 +151,8 @@ claude/
   settings.local.json      # local permission allowlist
   CLAUDE.md.template        # operating policy w/ <PLACEHOLDERS> -> ~/.claude/CLAUDE.md
   hooks/
-    load-memory.sh         # snapshot injector (verbatim; paths only)
-    refresh-memory.sh      # Wiki+Honcho cache refresh (endpoint read from honcho.json)
+    load-memory.sh         # bounded snapshot injector (no-network startup; local hot cache optional)
+    refresh-memory.sh      # parallel Wiki+Honcho cache refresh + per-source metadata
 hermes/
   memories/MEMORY.template.md   # -> ~/.hermes/memories/MEMORY.md
   memories/USER.template.md     # -> ~/.hermes/memories/USER.md
@@ -159,6 +165,10 @@ docs/
   examples/a2a-termux-native-worker.env.example  # non-secret native mobile worker env shape
 scripts/
   a2a-termux-native-worker.sh  # validates/execs native Termux Node worker.js env (PR-first)
+  ccc-memory-check.sh          # read-only Wiki/Honcho/local-index cache health snapshot
+  ccc-memory-index.sh          # build/update SQLite FTS5 local hot-memory index
+  ccc-memory-search.sh         # query local hot-memory index as JSON
+  ccc-memory-eval.sh           # no-network latency/recall smoke harness
   validate-harness.sh          # CI harness validation, including forbidden context-file guard
 setup.sh                   # idempotent bootstrap (won't overwrite existing real files)
 .gitignore                 # blocks credentials, live memory, caches, sessions
@@ -199,6 +209,11 @@ behavior:
 | `CCC_HERMES_DIR` | `$HOME/.hermes` | `honcho.json` and Hermes-side local config templates |
 | `CCC_WIKI_AGENT_BIN` | `$HOME/.wiki-agent/bin/wiki-agent` | Checklist path for the Family Wiki reader/writer binary |
 | `CCC_BRIDGE_DEFAULT_PATH` | `$HOME` | Suggested Telegram bridge `--path` workspace in the printed checklist |
+| `CCC_MEMORY_PROFILE` | `honcho` | Memory profile: `honcho`, `hybrid`, or `max-perf` |
+| `CCC_MEMORY_CACHE_DIR` | `$CCC_CLAUDE_DIR/hooks/cache` | Wiki/Honcho cache and refresh metadata location |
+| `CCC_STATE_DIR` | `$CCC_CLAUDE_DIR/state` | Node state plus local `memory-index.sqlite` |
+| `CCC_HONCHO_MEMORY_ENABLED` | `1` | Set `0`/`false`/`off` to remove Honcho from the read path while keeping local/Wiki memory |
+| `CCC_MEMORY_MAX_BYTES` | `12000` | Total SessionStart memory injection byte budget |
 
 Example non-root preview:
 

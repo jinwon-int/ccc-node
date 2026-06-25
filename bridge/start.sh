@@ -49,6 +49,24 @@ ensure_package_link() {
     fi
 }
 
+ensure_android_api_level() {
+    # Some Rust-backed Python dependencies (for example pyromark via maturin/pyo3)
+    # need ANDROID_API_LEVEL when building on Termux. Auto-detect it so mobile
+    # installs do not fail before the bridge can start.
+    if [ -n "${ANDROID_API_LEVEL:-}" ]; then
+        return 0
+    fi
+    if { [ -n "${TERMUX_VERSION:-}" ] || printf '%s' "${PREFIX:-}" | grep -q '/com.termux/'; } \
+        && command -v getprop >/dev/null 2>&1; then
+        local sdk
+        sdk="$(getprop ro.build.version.sdk 2>/dev/null | tr -dc '0-9')"
+        if [ -n "$sdk" ]; then
+            export ANDROID_API_LEVEL="$sdk"
+            echo -e "\033[90m✓ Android API level auto-detected: $ANDROID_API_LEVEL\033[0m"
+        fi
+    fi
+}
+
 sync_dependencies() {
     local force_install="$1"
     local current_hash saved_hash
@@ -58,6 +76,7 @@ sync_dependencies() {
 
     if [ "$force_install" = "1" ] || [ -z "$saved_hash" ] || [ "$saved_hash" != "$current_hash" ]; then
         echo "📦 Installing Python dependencies..."
+        ensure_android_api_level
         if ! "$VENV_DIR/bin/pip" install -q --upgrade pip; then
             echo "❌ Failed to upgrade pip"
             exit 1
