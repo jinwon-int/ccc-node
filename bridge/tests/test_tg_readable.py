@@ -6,6 +6,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from telegram_bot.utils.tg_readable import (
     to_readable,
+    render_for_delivery,
     apply_part_headers,
     part_marker,
 )
@@ -164,6 +165,34 @@ class PartHeaderTests(unittest.TestCase):
         out = apply_part_headers(src)
         self.assertIsNot(out, src)
         self.assertEqual(src, ["x", "y"])
+
+
+class RenderForDeliveryTests(unittest.TestCase):
+    """Shared helper used by both the streaming and non-streaming send paths."""
+
+    SRC = "Items:\n- a\n- b\n- c\n"
+
+    def test_disabled_returns_input_unchanged(self):
+        # When the readable renderer is off, the text must pass through verbatim
+        # (no whitespace normalization, no loose spacing) regardless of loose.
+        self.assertEqual(
+            render_for_delivery(self.SRC, enabled=False, loose=True), self.SRC
+        )
+        self.assertEqual(
+            render_for_delivery(self.SRC, enabled=False, loose=False), self.SRC
+        )
+
+    def test_enabled_loose_inserts_blank_lines_between_list_items(self):
+        out = render_for_delivery(self.SRC, enabled=True, loose=True)
+        self.assertEqual(out, "Items:\n- a\n\n- b\n\n- c")
+        # Equivalent to calling to_readable directly with loose=True.
+        self.assertEqual(out, to_readable(self.SRC, loose=True))
+
+    def test_enabled_compact_normalizes_without_loose_spacing(self):
+        out = render_for_delivery(self.SRC, enabled=True, loose=False)
+        # No blank lines inserted between adjacent list items in compact mode.
+        self.assertNotIn("\n\n", out)
+        self.assertEqual(out, to_readable(self.SRC, loose=False))
 
 
 if __name__ == "__main__":

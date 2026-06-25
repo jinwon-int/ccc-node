@@ -71,6 +71,22 @@ def to_readable(text: str, loose: bool = False) -> str:
         return text
 
 
+def render_for_delivery(text: str, *, enabled: bool, loose: bool) -> str:
+    """Apply the readable renderer for outbound delivery, honoring config flags.
+
+    Single source of truth shared by BOTH the streaming finalize path
+    (``core/streaming.py``) and the non-streaming delivery path
+    (``core/bot.py``) so the two never drift: whenever the readable renderer is
+    enabled, every reply is normalized the same way regardless of which path
+    sends it. When *enabled* is False the text is returned unchanged.
+
+    Fail-open via :func:`to_readable`.
+    """
+    if not enabled:
+        return text
+    return to_readable(text, loose=loose)
+
+
 def _transform(text: str, loose: bool = False) -> str:
     if not text:
         return text
