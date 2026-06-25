@@ -200,5 +200,30 @@ class MaxBubbleCharsConfigTests(unittest.TestCase):
             self.assertEqual(module.config.telegram_max_bubble_chars, 1500)
 
 
+class StreamingDefaultConfigTests(unittest.TestCase):
+    def _load_with_env(self, project_root: str, **extra_env):
+        with patch.dict(
+            os.environ,
+            {
+                "PROJECT_ROOT": project_root,
+                "TELEGRAM_BOT_TOKEN": "123456:abc",
+                **extra_env,
+            },
+            clear=True,
+        ):
+            sys.modules.pop("telegram_bot.utils.config", None)
+            return importlib.import_module("telegram_bot.utils.config")
+
+    def test_streaming_off_by_default(self):
+        with TemporaryDirectory() as td:
+            module = self._load_with_env(td)
+            self.assertFalse(module.config.enable_streaming)
+
+    def test_streaming_can_be_enabled(self):
+        with TemporaryDirectory() as td:
+            module = self._load_with_env(td, CCC_TELEGRAM_STREAMING="true")
+            self.assertTrue(module.config.enable_streaming)
+
+
 if __name__ == "__main__":
     unittest.main()

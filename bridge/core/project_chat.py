@@ -350,7 +350,9 @@ class ProjectChatHandler:
             # so the reader loop can update the Telegram draft from incremental
             # text deltas (true typewriter effect). The draft edit cadence stays
             # throttled by draft_update_min_chars / draft_update_interval.
-            "include_partial_messages": config.enable_partial_streaming,
+            "include_partial_messages": bool(
+                config.enable_streaming and config.enable_partial_streaming
+            ),
         }
         if model:
             # Normalize model name: ensure at most one [1M] suffix
@@ -701,9 +703,11 @@ class ProjectChatHandler:
         loop = asyncio.get_running_loop()
         future: asyncio.Future = loop.create_future()
 
-        # Create streaming handler if bot is provided
+        # Create streaming handler only when live streaming is enabled. With it
+        # off (default), the reply is delivered as complete message(s) by the
+        # caller when generation finishes — no live draft.
         streaming_handler = None
-        if bot:
+        if bot and config.enable_streaming:
             from telegram_bot.core.streaming import StreamingMessageHandler
 
             streaming_handler = StreamingMessageHandler(bot, chat_id, user_id)
@@ -796,7 +800,7 @@ class ProjectChatHandler:
 
                 retry_future: asyncio.Future = loop.create_future()
                 retry_handler = None
-                if bot:
+                if bot and config.enable_streaming:
                     from telegram_bot.core.streaming import StreamingMessageHandler
 
                     retry_handler = StreamingMessageHandler(bot, chat_id, user_id)

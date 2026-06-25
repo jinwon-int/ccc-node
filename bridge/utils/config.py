@@ -262,17 +262,28 @@ class Config(BaseSettings):
             "CCC_TELEGRAM_ENTITY_RENDERER=false to disable."
         ),
     )
+    enable_streaming: bool = Field(
+        default=False,
+        alias="CCC_TELEGRAM_STREAMING",
+        description=(
+            "Master switch for live response streaming (the progressively-edited "
+            "Telegram draft). Default OFF: replies are delivered as complete "
+            "message(s) when generation finishes, which is more reliable than "
+            "the live draft. Set CCC_TELEGRAM_STREAMING=true to re-enable the "
+            "live draft (then CCC_PARTIAL_STREAMING controls token-level vs "
+            "whole-block updates)."
+        ),
+    )
     enable_partial_streaming: bool = Field(
         default=True,
         alias="CCC_PARTIAL_STREAMING",
         description=(
-            "Enable real token-level streaming. When on, the SDK is asked for "
-            "partial message events (include_partial_messages) and the reader "
-            "loop drives the live Telegram draft from incremental text deltas, "
-            "giving a true typewriter effect instead of a single block update. "
-            "Draft edit cadence is still throttled by draft_update_min_chars / "
-            "draft_update_interval. Set CCC_PARTIAL_STREAMING=false to disable "
-            "(falls back to whole-block draft updates)."
+            "Token-level streaming, used only when CCC_TELEGRAM_STREAMING is on. "
+            "When enabled, the SDK is asked for partial message events "
+            "(include_partial_messages) and the reader loop drives the live "
+            "Telegram draft from incremental text deltas (true typewriter), vs a "
+            "single whole-block update. Draft edit cadence is still throttled by "
+            "draft_update_min_chars / draft_update_interval."
         ),
     )
 
