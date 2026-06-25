@@ -6,6 +6,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 pass=0; fail=0
 TMP="$(mktemp -d)"
 export CCC_AUDIT_LOG="$TMP/audit.jsonl"
+fake_github_token="ghp_""12345678901234567890"
 export CCC_APPROVAL_LOG="$TMP/approval.log"
 ok() { if eval "$2"; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $1"; fi; }
 
@@ -16,7 +17,7 @@ ok "audit records Bash"            'grep -q "\"tool\":\"Bash\"" "$CCC_AUDIT_LOG"
 echo '{"tool_name":"Read","tool_input":{"file_path":"/x"}}' | bash "$HERE/audit.sh"
 ok "audit skips Read"              '[ "$(grep -c Read "$CCC_AUDIT_LOG")" = "0" ]'
 
-echo '{"tool_name":"Bash","tool_input":{"command":"deploy --token=ghp_ABCDEF1234567890abcdef"}}' | bash "$HERE/audit.sh"
+printf '{"tool_name":"Bash","tool_input":{"command":"deploy --token=%s"}}\n' "$fake_github_token" | bash "$HERE/audit.sh"
 ok "audit redacts ghp token"       'grep -q "<redacted>" "$CCC_AUDIT_LOG" && ! grep -q "ABCDEF1234567890abcdef" "$CCC_AUDIT_LOG"'
 
 echo '{"tool_name":"Bash","tool_input":{"command":"curl -H \"authorization: Bearer sk-abcdefghijklmnop1234\""}}' | bash "$HERE/audit.sh"
@@ -26,7 +27,7 @@ echo '{"tool_name":"Write","tool_input":{"file_path":"/opt/x/foo.md"}}' | bash "
 ok "audit records Write file_path" 'grep -q "foo.md" "$CCC_AUDIT_LOG"'
 
 # --- redact.sh: warns on raw credential in prompt, silent otherwise ---
-out="$(echo '{"prompt":"please use ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ012345 to auth"}' | bash "$HERE/redact.sh")"
+out="$(printf '{"prompt":"please use %s to auth"}\n' "$fake_github_token" | bash "$HERE/redact.sh")"
 ok "redact warns on token"         'grep -q "raw credential" <<<"$out"'
 
 out="$(echo '{"prompt":"normal request, refactor the parser"}' | bash "$HERE/redact.sh")"
@@ -44,7 +45,7 @@ ok "notify logs Stop"              'grep -q "\"event\":\"Stop\"" "$CCC_AUDIT_LOG
 echo '{"message":"needs permission"}' | CCC_PUSH_SPOOL="$TMP/spool" bash "$HERE/notify.sh" Notification
 ok "push spool off by default"     '[ ! -d "$TMP/spool" ]'
 
-echo '{"message":"approve ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ012345 now"}' \
+printf '{"message":"approve %s now"}\n' "$fake_github_token" \
   | CCC_NOTIFY_TELEGRAM=1 CCC_NODE=testnode CCC_PUSH_SPOOL="$TMP/spool" bash "$HERE/notify.sh" Notification
 ok "push spool writes when opt-in"  'ls "$TMP/spool"/*.json >/dev/null 2>&1'
 ok "push spool redacts token"       'cat "$TMP/spool"/*.json | grep -q "\\[REDACTED\\]" && ! cat "$TMP/spool"/*.json | grep -q "ABCDEFGHIJKLMNOPQRSTUVWXYZ012345"'

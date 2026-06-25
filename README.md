@@ -212,3 +212,14 @@ CCC_BRIDGE_DEFAULT_PATH=/home/ccc \
 ```
 
 The setup script prints the resolved paths and never prints or moves raw secrets.
+
+## Public source visibility boundary
+
+This repository is being prepared for possible public source visibility. A
+public repository setting would be source-only: it would not approve release or
+tag creation, package/image publication, production deploy/restart/reload,
+database mutation, provider or Telegram sends, credential movement, history
+rewrite, or any other live operation.
+
+Runtime credentials and private operational data must stay outside the
+repository. Example configuration must use placeholders only.

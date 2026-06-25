@@ -1,0 +1,10 @@
+title = "ccc-node public-readiness gitleaks allowlist"
+
+[allowlist]
+description = "Allow redaction-unit-test fixture strings; tests synthesize fake credentials to verify sanitization paths."
+paths = [
+  'claude/hooks/observability.test.sh',
+  'claude/hooks/distill/extract.test.sh',
+  'claude/hooks/security-scan.test.sh',
+  'scripts/ccc-security-audit.test.sh',
+]
