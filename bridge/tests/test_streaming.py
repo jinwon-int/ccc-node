@@ -218,6 +218,38 @@ class StreamingMessageHandlerTests(unittest.IsolatedAsyncioTestCase):
         for draft in handler.drafts[:-1]:
             self.assertLessEqual(len(draft.text), 1000)
 
+    async def test_first_chunk_creates_draft_immediately(self):
+        """First paint must not wait for min_chars/min_interval thresholds."""
+        bot = _BotRecorder()
+        handler = StreamingMessageHandler(bot=bot, chat_id=42, user_id=7)
+        handler.min_chars = 10_000
+        handler.min_interval = 60.0
+
+        await handler.update_if_needed("hi")
+
+        self.assertEqual(len(handler.drafts), 1)
+        self.assertEqual(handler.drafts[0].text, "hi")
+        self.assertEqual([c[0] for c in bot.calls], ["send_message"])
+
+    async def test_semantic_split_prefers_paragraph_boundary_in_back_half(self):
+        bot = _BotRecorder()
+        handler = StreamingMessageHandler(bot=bot, chat_id=42, user_id=7)
+        text = "a" * 650 + "\n\n" + "b" * 700
+
+        split = handler._find_split_boundary(text, max_length=1000)
+
+        self.assertEqual(split, 652)
+
+    async def test_semantic_split_does_not_cut_inside_code_fence_when_possible(self):
+        bot = _BotRecorder()
+        handler = StreamingMessageHandler(bot=bot, chat_id=42, user_id=7)
+        prefix = "intro " * 60
+        text = prefix + "\n\n```\n" + ("code line\n" * 90) + "```\n\nafter"
+
+        split = handler._find_split_boundary(text, max_length=700)
+
+        self.assertLessEqual(split, len(prefix) + len("\n\n"))
+
     async def test_default_bubble_size_falls_back_to_4000(self):
         bot = _BotRecorder()
         handler = StreamingMessageHandler(bot=bot, chat_id=42, user_id=7)

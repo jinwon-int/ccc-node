@@ -4,51 +4,129 @@
 # Single-flight via flock; each source fail-open; caches updated atomically only on success.
 set -uo pipefail
 
-# Distill subprocess guard (see ~/.claude/hooks/distill.sh).
 [ -n "${CLAUDE_DISTILL_INFLIGHT:-}" ] && exit 0
 
-CACHE=/root/.claude/hooks/cache
-mkdir -p "$CACHE"
+STATE_DIR="${CCC_STATE_DIR:-/root/.claude/state}"
+CACHE="${CCC_MEMORY_CACHE_DIR:-/root/.claude/hooks/cache}"
+HOOKDIR="${CCC_HOOK_DIR:-/root/.claude/hooks}"
+WIKI="${CCC_WIKI_AGENT_BIN:-/root/.wiki-agent/bin/wiki-agent}"
+HONCHO_CFG="${CCC_HONCHO_CFG:-${CCC_HERMES_DIR:-/root/.hermes}/honcho.json}"
+WIKI_TIMEOUT="${CCC_WIKI_TIMEOUT_SEC:-60}"
+HONCHO_TIMEOUT="${CCC_HONCHO_TIMEOUT_SEC:-60}"
+HONCHO_ENABLED="${CCC_HONCHO_MEMORY_ENABLED:-1}"
+PROFILE="${CCC_MEMORY_PROFILE:-honcho}"
+mkdir -p "$CACHE" "$STATE_DIR"
+
+is_disabled() { case "${1:-}" in 0|false|FALSE|off|OFF|no|NO) return 0;; *) return 1;; esac; }
+now_iso() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+now_ms() { python3 -c 'import time; print(int(time.time()*1000))'; }
+bytes_for() { [ -f "$1" ] && wc -c < "$1" | tr -d '[:space:]' || printf '0'; }
 
 # Non-blocking single-flight lock: if a refresh is already running, exit.
 exec 9>"$CACHE/.refresh.lock"
 flock -n 9 || exit 0
 
-WIKI=/root/.wiki-agent/bin/wiki-agent
+query_from_state() {
+  local node cwd task
+  node="${CCC_NODE:-$(cat "$STATE_DIR/node.txt" 2>/dev/null || hostname -s 2>/dev/null || printf 'ccc-node')}"
+  cwd="$(cat "$STATE_DIR/cwd.txt" 2>/dev/null || pwd 2>/dev/null || printf '')"
+  task="$(cat "$STATE_DIR/current-task.txt" 2>/dev/null || printf '')"
+  printf '%s' "${PREFETCH_QUERY:-node ${node}; cwd ${cwd}; task ${task}; Seoyoon ops priorities and current node operating memory}"
+}
 
-# Honcho config is read from ~/.hermes/honcho.json — NEVER hard-code the endpoint here.
-# baseUrl / workspace / peerName / target are node-local, not committed to this repo.
-HONCHO_CFG=/root/.hermes/honcho.json
-HONCHO="$(jq -r '.baseUrl // empty' "$HONCHO_CFG" 2>/dev/null)"
-WS="$(jq -r '.workspace // "seoyoon-family"' "$HONCHO_CFG" 2>/dev/null)"
-PEER="$(jq -r '.peerName // empty' "$HONCHO_CFG" 2>/dev/null)"
-TARGET="$(jq -r '.target // "seo-jin-on"' "$HONCHO_CFG" 2>/dev/null)"
-# Optional bearer token for when the Honcho server runs with AUTH_USE_AUTH=true.
-# Read from honcho.json (authToken/apiKey). When absent, no header is sent and
-# behaviour is identical to before — so this is safe to ship ahead of any
-# server-side auth change.
-HONCHO_TOKEN="$(jq -r '.authToken // .apiKey // empty' "$HONCHO_CFG" 2>/dev/null)"
-HONCHO_AUTH_ARGS=()
-[ -n "$HONCHO_TOKEN" ] && HONCHO_AUTH_ARGS=(-H "Authorization: Bearer $HONCHO_TOKEN")
+record_status() { # <name> <status> <duration_ms> <bytes> <error>
+  local name="$1" status="$2" duration="$3" bytes="$4" error="$5"
+  jq -n --arg source "$name" --arg status "$status" --arg refreshed_at "$(now_iso)" \
+    --arg error "$error" --argjson duration_ms "${duration:-0}" --argjson bytes "${bytes:-0}" \
+    '{source:$source,status:$status,refreshed_at:$refreshed_at,duration_ms:$duration_ms,bytes:$bytes,error:$error}' \
+    > "$CACHE/.${name}.status.json"
+}
 
-# Family Wiki cache prefetch (local, budget-capped). Set PREFETCH_QUERY per node.
-PREFETCH_QUERY="${PREFETCH_QUERY:-this node operating memory, current status, and Seoyoon ops priorities}"
-w="$(timeout 60 "$WIKI" --no-notify prefetch "$PREFETCH_QUERY" 2>/dev/null)"
-if [ -n "$w" ]; then
-  printf '%s\n' "$w" > "$CACHE/wiki.txt.tmp" && mv "$CACHE/wiki.txt.tmp" "$CACHE/wiki.txt"
-fi
+refresh_wiki() {
+  local start end duration q tmp status err
+  start="$(now_ms)"
+  q="$(query_from_state)"
+  tmp="$CACHE/wiki.txt.tmp.$$"
+  status="ok"; err=""
+  if [ ! -x "$WIKI" ]; then
+    status="missing"; err="wiki-agent not executable"
+  elif ! timeout "$WIKI_TIMEOUT" "$WIKI" --no-notify prefetch "$q" > "$tmp" 2>"$tmp.err"; then
+    status="error"; err="$(tr '\n' ' ' < "$tmp.err" | cut -c1-240)"
+  elif [ ! -s "$tmp" ]; then
+    status="empty"; err="empty wiki prefetch"
+  else
+    mv "$tmp" "$CACHE/wiki.txt"
+  fi
+  rm -f "$tmp" "$tmp.err"
+  end="$(now_ms)"; duration="$((end - start))"
+  record_status wiki "$status" "$duration" "$(bytes_for "$CACHE/wiki.txt")" "$err"
+}
 
-# Honcho dialectic — working memory about the user (network, LLM-backed)
-if [ -n "$HONCHO" ] && [ -n "$PEER" ]; then
-  h="$(timeout 60 curl -s -X POST \
-    "$HONCHO/v3/workspaces/$WS/peers/$PEER/chat" \
-    -H 'Content-Type: application/json' \
-    "${HONCHO_AUTH_ARGS[@]}" \
-    -d "{\"query\":\"Summarize what you know about working with the user: preferences, current priorities, and operating context.\",\"target\":\"$TARGET\",\"reasoning_level\":\"low\"}" \
-    2>/dev/null | jq -r '.content // empty' 2>/dev/null)"
-  if [ -n "$h" ]; then
-    printf '%s\n' "$h" > "$CACHE/honcho.txt.tmp" && mv "$CACHE/honcho.txt.tmp" "$CACHE/honcho.txt"
+refresh_honcho() {
+  local start end duration honcho ws peer target token tmp status err query
+  start="$(now_ms)"
+  tmp="$CACHE/honcho.txt.tmp.$$"
+  status="ok"; err=""
+  if is_disabled "$HONCHO_ENABLED" || [ "$PROFILE" = "max-perf" ]; then
+    status="disabled"; err="Honcho read path disabled"
+  elif [ ! -f "$HONCHO_CFG" ]; then
+    status="missing"; err="honcho config missing"
+  else
+    honcho="$(jq -r '.baseUrl // empty' "$HONCHO_CFG" 2>/dev/null)"
+    ws="$(jq -r '.workspace // "seoyoon-family"' "$HONCHO_CFG" 2>/dev/null)"
+    peer="$(jq -r '.peerName // empty' "$HONCHO_CFG" 2>/dev/null)"
+    target="$(jq -r '.target // "seo-jin-on"' "$HONCHO_CFG" 2>/dev/null)"
+    token="$(jq -r '.authToken // .apiKey // empty' "$HONCHO_CFG" 2>/dev/null)"
+    query="For the current ccc-node task, summarize only directly relevant user preferences, operating constraints, and current priorities. Avoid repeating generic facts."
+    if [ -z "$honcho" ] || [ -z "$peer" ]; then
+      status="missing"; err="honcho baseUrl or peerName missing"
+    else
+      auth_args=()
+      if [ -n "$token" ]; then
+        auth_header="$(printf '%s: %s %s' 'Authorization' 'Bearer' "$token")"
+        auth_args=(-H "$auth_header")
+      fi
+      if ! timeout "$HONCHO_TIMEOUT" curl -sS -X POST \
+        "$honcho/v3/workspaces/$ws/peers/$peer/chat" \
+        -H 'Content-Type: application/json' \
+        "${auth_args[@]}" \
+        -d "$(jq -n --arg query "$query" --arg target "$target" '{query:$query,target:$target,reasoning_level:"low"}')" \
+        2>"$tmp.err" | jq -r '.content // empty' > "$tmp" 2>>"$tmp.err"; then
+        status="error"; err="$(tr '\n' ' ' < "$tmp.err" | cut -c1-240)"
+      elif [ ! -s "$tmp" ]; then
+        status="empty"; err="empty Honcho response"
+      else
+        mv "$tmp" "$CACHE/honcho.txt"
+      fi
+    fi
+  fi
+  rm -f "$tmp" "$tmp.err"
+  end="$(now_ms)"; duration="$((end - start))"
+  record_status honcho "$status" "$duration" "$(bytes_for "$CACHE/honcho.txt")" "$err"
+}
+
+refresh_wiki & wiki_pid=$!
+refresh_honcho & honcho_pid=$!
+wait "$wiki_pid" || true
+wait "$honcho_pid" || true
+
+# Update local hot-memory index opportunistically. It is best-effort and never blocks hook startup.
+index_status="skipped"; index_error=""
+index_script=""
+[ -x "$HOOKDIR/../../scripts/ccc-memory-index.sh" ] && index_script="$HOOKDIR/../../scripts/ccc-memory-index.sh"
+[ -z "$index_script" ] && [ -x "$HOOKDIR/ccc-memory-index.sh" ] && index_script="$HOOKDIR/ccc-memory-index.sh"
+if [ -n "$index_script" ]; then
+  if out="$(timeout 30 "$index_script" update 2>&1)"; then
+    index_status="ok"
+  else
+    index_status="error"; index_error="$(printf '%s' "$out" | tr '\n' ' ' | cut -c1-240)"
   fi
 fi
+record_status local_index "$index_status" 0 0 "$index_error"
 
-date -u +%Y-%m-%dT%H:%M:%SZ > "$CACHE/.last-refresh"
+# Merge per-source statuses into one meta document.
+jq -s '{generated_at:(now|todate), sources: map({(.source): del(.source)}) | add}' \
+  "$CACHE/.wiki.status.json" "$CACHE/.honcho.status.json" "$CACHE/.local_index.status.json" \
+  > "$CACHE/meta.json.tmp" 2>/dev/null && mv "$CACHE/meta.json.tmp" "$CACHE/meta.json"
+
+now_iso > "$CACHE/.last-refresh"

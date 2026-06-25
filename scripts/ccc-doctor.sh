@@ -197,6 +197,24 @@ else
   add 경고 "bridge status" "bridge/start.sh missing or not executable" "not all nodes run the Telegram bridge; install/check only if needed"
 fi
 
+if [ -x "$REPO/scripts/ccc-memory-check.sh" ]; then
+  mem_json="$(CCC_STATE_DIR="${CCC_STATE_DIR:-$CLAUDE_DIR/state}" CCC_MEMORY_CACHE_DIR="${CCC_MEMORY_CACHE_DIR:-$CLAUDE_DIR/hooks/cache}" "$REPO/scripts/ccc-memory-check.sh" --json 2>/dev/null || true)"
+  if [ -n "$mem_json" ] && printf '%s' "$mem_json" | jq -e . >/dev/null 2>&1; then
+    wiki_status="$(printf '%s' "$mem_json" | jq -r '.wiki.status // "unknown"')"
+    honcho_status="$(printf '%s' "$mem_json" | jq -r '.honcho.status // "unknown"')"
+    index_exists="$(printf '%s' "$mem_json" | jq -r '.local_index.exists // false')"
+    if [ "$wiki_status" = ok ] && { [ "$honcho_status" = ok ] || [ "$honcho_status" = disabled ]; }; then
+      add 정상 "memory cache" "wiki=$wiki_status; honcho=$honcho_status; local_index=$index_exists" "none"
+    else
+      add 경고 "memory cache" "wiki=$wiki_status; honcho=$honcho_status; local_index=$index_exists" "run scripts/ccc-memory-check.sh --json and inspect stale/missing cache metadata"
+    fi
+  else
+    add 경고 "memory cache" "diagnostic unavailable" "run scripts/ccc-memory-check.sh manually"
+  fi
+else
+  add 경고 "memory cache" "ccc-memory-check.sh missing" "complete checkout or reinstall scripts"
+fi
+
 print_report() {
   printf '# ccc doctor\n\n'
   printf -- '- repo: `%s`\n' "$REPO"

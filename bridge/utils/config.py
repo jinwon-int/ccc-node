@@ -1,10 +1,11 @@
+import json
 import os
 import logging
 from pathlib import Path
-from typing import Optional, List
+from typing import Annotated, Optional, List
 from dotenv import load_dotenv
 from pydantic import Field, field_validator, model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 BOT_PACKAGE_DIR = Path(__file__).resolve().parent.parent
 
@@ -88,7 +89,7 @@ class Config(BaseSettings):
     )
 
     # Access Control - comma-separated list of allowed user IDs (if empty, allow all)
-    allowed_user_ids: List[int] = Field(
+    allowed_user_ids: Annotated[List[int], NoDecode] = Field(
         default_factory=list,
         description=(
             "List of allowed Telegram user IDs. Empty means allow all, but the "
@@ -142,9 +143,15 @@ class Config(BaseSettings):
     def parse_allowed_user_ids(cls, v):
         """Parse allowed_user_ids from string or list"""
         if isinstance(v, str):
-            if not v or v.strip() == "":
+            value = v.strip()
+            if not value:
                 return []
-            return [int(x.strip()) for x in v.split(",") if x.strip()]
+            if value.startswith("["):
+                parsed = json.loads(value)
+                if not isinstance(parsed, list):
+                    raise ValueError("ALLOWED_USER_IDS JSON value must be a list")
+                return [int(x) for x in parsed]
+            return [int(x.strip()) for x in value.split(",") if x.strip()]
         if isinstance(v, int):
             return [v]
         return v
