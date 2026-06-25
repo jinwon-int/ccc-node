@@ -104,6 +104,7 @@ utils/chat_logger.py Per-session debug chat logging
 | `DRAFT_UPDATE_MIN_CHARS` | No | Min characters before draft update (default: 150) |
 | `DRAFT_UPDATE_INTERVAL` | No | Min seconds between draft updates (default: 1.0) |
 | `CCC_PARTIAL_STREAMING` | No | Real token-level streaming via SDK partial messages (default: true). Set false to fall back to whole-block draft updates |
+| `CCC_TELEGRAM_LOOSE_SPACING` | No | Insert a blank line between list items for easier reading (default: true). Prose/tables/code untouched. Set false for compact output |
 | `OPENAI_API_KEY` | Voice only | API key for Whisper transcription |
 | `OPENAI_BASE_URL` | No | Optional OpenAI-compatible Whisper API base URL |
 | `WHISPER_MODEL` | No | Whisper model name (default: `whisper-1`) |

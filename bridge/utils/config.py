@@ -219,6 +219,18 @@ class Config(BaseSettings):
             "CCC_TELEGRAM_PART_HEADERS=false to disable."
         ),
     )
+    enable_loose_spacing: bool = Field(
+        default=True,
+        alias="CCC_TELEGRAM_LOOSE_SPACING",
+        description=(
+            "Add vertical breathing room by inserting a blank line between "
+            "adjacent list items so dense bullet/numbered lists are easier to "
+            "read on mobile. Telegram has no line-height control, so blank lines "
+            "are the only lever. Prose lines stay attached and fenced code is "
+            "untouched. Applies only when the readable renderer is enabled. "
+            "Default on; set CCC_TELEGRAM_LOOSE_SPACING=false for compact output."
+        ),
+    )
     enable_entity_renderer: bool = Field(
         default=True,
         alias="CCC_TELEGRAM_ENTITY_RENDERER",

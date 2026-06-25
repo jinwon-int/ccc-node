@@ -39,19 +39,30 @@ _HEADING_RE = re.compile(r"^\s{0,3}#{1,6}\s+\S")
 _BOLD_ONLY_RE = re.compile(r"^\s*\*\*[^*\n]+\*\*:?\s*$")
 # A fenced code block delimiter.
 _FENCE_RE = re.compile(r"^\s*```")
+# A list item line: optional indent, a bullet (-, *, +, •) or number (1. / 1)),
+# a space, then content. Used by loose spacing to give each item its own line.
+_LIST_ITEM_RE = re.compile(r"^\s*(?:[-*+•]|\d+[.)])\s+\S")
+
+
+def _is_list_item(line: str) -> bool:
+    return bool(_LIST_ITEM_RE.match(line))
 
 
 def _is_section_heading(line: str) -> bool:
     return bool(_HEADING_RE.match(line) or _BOLD_ONLY_RE.match(line))
 
 
-def to_readable(text: str) -> str:
+def to_readable(text: str, loose: bool = False) -> str:
     """Return a readability-normalized copy of *text*.
+
+    When *loose* is True, also insert a blank line between adjacent list-item
+    lines so each item gets its own visual line — prose lines stay attached and
+    fenced code is left intact.
 
     Fail-open: on any unexpected error the original *text* is returned unchanged.
     """
     try:
-        return _transform(text)
+        return _transform(text, loose=loose)
     except Exception:  # pragma: no cover - never let formatting break delivery
         logger.warning(
             "tg_readable.to_readable failed; returning input unchanged",
@@ -60,7 +71,7 @@ def to_readable(text: str) -> str:
         return text
 
 
-def _transform(text: str) -> str:
+def _transform(text: str, loose: bool = False) -> str:
     if not text:
         return text
 
@@ -93,6 +104,30 @@ def _transform(text: str) -> str:
         ):
             pass2.append("")
         pass2.append(line)
+
+    # Pass 2.5 (opt-in): loose spacing — insert a single blank line between two
+    # adjacent list-item lines so each item gets its own visual line. Telegram has
+    # no line-height control, so blank lines are the only way to "space out" a
+    # dense bullet/numbered list. Prose lines are left attached (only list items
+    # are spaced), and fenced code is untouched. A list item followed by an
+    # indented continuation line is NOT split (the continuation isn't a list item).
+    if loose:
+        in_fence = False
+        loose_lines: list[str] = []
+        for line in pass2:
+            if _FENCE_RE.match(line):
+                in_fence = not in_fence
+                loose_lines.append(line)
+                continue
+            if (
+                not in_fence
+                and _is_list_item(line)
+                and loose_lines
+                and _is_list_item(loose_lines[-1])
+            ):
+                loose_lines.append("")
+            loose_lines.append(line)
+        pass2 = loose_lines
 
     # Pass 3: collapse runs of blank lines to a single blank line (outside fences).
     in_fence = False

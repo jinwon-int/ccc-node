@@ -259,7 +259,9 @@ class StreamingMessageHandler:
         # so delivery is never affected.
         render_text = draft.text
         if getattr(config, "enable_readable_renderer", False):
-            render_text = tg_readable.to_readable(draft.text)
+            render_text = tg_readable.to_readable(
+                draft.text, loose=getattr(config, "enable_loose_spacing", False)
+            )
 
         # Optional 'k/N' part markers on multi-chunk responses (opt-in via
         # CCC_TELEGRAM_PART_HEADERS). Reserve headroom in the split limit first so
