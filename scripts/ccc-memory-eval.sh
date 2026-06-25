@@ -27,8 +27,16 @@ else
   STATE_DIR="$(mktemp -d)"
   CREATED_STATE_DIR=1
 fi
-CACHE="${CCC_MEMORY_CACHE_DIR:-$STATE_DIR/cache}"
-MEMORY_DIR="${CCC_MEMORY_DIR:-$STATE_DIR/memories}"
+EVAL_USE_EXTERNAL_DIRS="${CCC_MEMORY_EVAL_USE_EXTERNAL_DIRS:-0}"
+if [ "$EVAL_USE_EXTERNAL_DIRS" = "1" ]; then
+  CACHE="${CCC_MEMORY_CACHE_DIR:-$STATE_DIR/cache}"
+  MEMORY_DIR="${CCC_MEMORY_DIR:-$STATE_DIR/memories}"
+else
+  # Eval is a smoke harness: keep sample files isolated even when the caller's
+  # shell exports real CCC_MEMORY_DIR / CCC_MEMORY_CACHE_DIR.
+  CACHE="$STATE_DIR/cache"
+  MEMORY_DIR="$STATE_DIR/memories"
+fi
 INDEX_OUT="$STATE_DIR/eval-index.json"
 INDEX_ERR="$STATE_DIR/eval-index.err"
 SEARCH_ERR="$STATE_DIR/eval-search.err"
