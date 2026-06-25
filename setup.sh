@@ -63,6 +63,28 @@ BRIDGE_DEFAULT_PATH="${CCC_BRIDGE_DEFAULT_PATH:-$HOME}"
 run() { if [ "$DRY" = 1 ]; then echo "[dry-run] $*"; else eval "$*"; fi; }
 note() { printf '  - %s\n' "$*"; }
 
+# Merge base + enforcement-overlay into settings.json ATOMICALLY: render to a temp
+# file, validate it parses, then mv into place. The old `jq ... > settings.json`
+# form pre-truncates the destination via the `>` redirect, so a jq failure (bad
+# input, jq missing) left a 0-byte settings.json with no detection — bricking the
+# node's hooks/permissions. Here a failure leaves any existing file untouched.
+merge_settings_json() {
+  local base="$1" overlay="$2" dest="$3"
+  if [ "$DRY" = 1 ]; then
+    echo "[dry-run] merge (atomic+validated) '$base' + '$overlay' -> '$dest'"
+    return 0
+  fi
+  local tmp; tmp="$(mktemp "${dest}.XXXXXX")" || { echo "ERROR: mktemp failed for $dest" >&2; return 1; }
+  if jq -s '.[0] as $b | .[1] as $o | $b | .hooks = ($b.hooks + $o.hooks)' "$base" "$overlay" > "$tmp" 2>/dev/null \
+     && jq -e . "$tmp" >/dev/null 2>&1; then
+    mv "$tmp" "$dest"
+  else
+    rm -f "$tmp"
+    echo "ERROR: failed to merge settings.json from '$base' + '$overlay' (existing file left untouched)" >&2
+    return 1
+  fi
+}
+
 # Snapshot the existing ~/.claude config BEFORE we overwrite anything. setup.sh unconditionally
 # overwrites settings.json, settings.local.json and the hook/output-style/agent/command/skill
 # dirs — on a node that already has a configured identity that is destructive, so we tar a
@@ -105,7 +127,7 @@ if [ "$WITH_PLUGIN" = 1 ]; then
   note "plugin mode: lean settings (portable hooks come from the ccc-node plugin)"
   run "cp '$SRC/claude/settings.base.json'    '$CLAUDE_DIR/settings.json'"
 else
-  run "jq -s '.[0] as \$b | .[1] as \$o | \$b | .hooks = (\$b.hooks + \$o.hooks)' '$SRC/claude/settings.base.json' '$SRC/claude/hooks/enforcement-overlay.json' > '$CLAUDE_DIR/settings.json'"
+  merge_settings_json "$SRC/claude/settings.base.json" "$SRC/claude/hooks/enforcement-overlay.json" "$CLAUDE_DIR/settings.json"
 fi
 run "cp '$SRC/claude/settings.local.json'     '$CLAUDE_DIR/settings.local.json'"
 run "cp '$SRC/claude/hooks/load-memory.sh'    '$CLAUDE_DIR/hooks/load-memory.sh'"
