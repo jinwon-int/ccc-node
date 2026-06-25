@@ -180,10 +180,16 @@ if is_forcepush; then
 fi
 g 'git[[:space:]]+(filter-branch|filter-repo)([[:space:]]|$)|git-filter-repo'                               && deny "history-rewrite" "operator_review_gated" "$c"
 
-# broker / Gateway / worker / bridge service control
+# broker / Gateway / worker service control (operator-gated, fleet-risky).
+# NOTE: ccc-telegram-bridge restart is intentionally NOT gated — it is a local,
+# single-node Telegram channel restart (low blast radius), unlike broker/Gateway/
+# worker restarts which can disrupt the A2A fleet mid-task. The carve-out below
+# still fast-allows the bare local form; dropping `bridge` from the deny patterns
+# additionally permits remote (ssh-wrapped) ccc-telegram-bridge restarts used by
+# fleet rollouts, without loosening any broker/Gateway/worker/DB/secret gate.
 ccc_telegram_bridge_restart && exit 0
-g '(systemctl|service|supervisorctl|pm2)[[:space:]]+(restart|stop|start|reload|kill)([[:space:]]).*(broker|gateway|worker|a2a|hermes|openclaw|bridge)' && deny "service-control" "operator_approval_gated" "$c"
-gi '\b(restart|reload)[-_](broker|gateway|bridge|worker)\b' && deny "service-control" "operator_approval_gated" "$c"
+g '(systemctl|service|supervisorctl|pm2)[[:space:]]+(restart|stop|start|reload|kill)([[:space:]]).*(broker|gateway|worker|a2a|hermes|openclaw)' && deny "service-control" "operator_approval_gated" "$c"
+gi '\b(restart|reload)[-_](broker|gateway|worker)\b' && deny "service-control" "operator_approval_gated" "$c"
 
 # DB destructive / migration / replay
 gi '\b(DROP[[:space:]]+(TABLE|DATABASE)|TRUNCATE[[:space:]]|FLUSHALL|FLUSHDB)\b'                  && deny "db-destructive" "operator_approval_gated" "$c"
