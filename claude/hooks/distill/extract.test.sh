@@ -5,6 +5,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 EXTRACT="$HERE/extract.sh"
 pass=0; fail=0
 TMP="$(mktemp -d)"
+fake_github_token="ghp_""12345678901234567890"
 trap 'rm -rf "$TMP"' EXIT
 
 ok() { if eval "$2"; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $1"; fi; }
@@ -13,7 +14,7 @@ make_transcript() {
   local path="$1"
   cat > "$path" <<'JSONL'
 {"type":"system","content":"ignore"}
-{"type":"user","message":{"content":"hello ghp_abcdefghijklmnopqrstuvwxyz123456"}}
+{"type":"user","message":{"content":"hello $fake_github_token"}}
 {"type":"assistant","message":{"content":[{"type":"text","text":"noted"},{"type":"tool_use","name":"Bash"}]}}
 {"type":"user","message":{"content":"Bearer abcdefghijklmnopqrstuvwxyz123456"}}
 {"type":"assistant","message":{"content":"final"}}
@@ -82,7 +83,7 @@ run_extract "$TRANSCRIPT" valid
 ok "valid JSON exits 0" '[ "$rc" = 0 ]'
 ok "valid JSON is tagged with session metadata" 'jq -e ".session_id == \"sess-test\" and .trigger == \"manual\" and (.honcho|length)==1" <<<"$out" >/dev/null'
 ok "valid JSON carries source cwd metadata" 'jq -e ".source_cwd == \"/root/project-a\" and .source_project == \"-root-project-a\"" <<<"$out" >/dev/null'
-ok "transcript input is redacted before claude" '! grep -q "ghp_ab...3456\|Bearer abcdefghijklmnopqrstuvwxyz123456" "$TMP/input-valid.txt" && grep -q "REDACTED" "$TMP/input-valid.txt"'
+ok "transcript input is redacted before claude" '! grep -q "$fake_github_token\|Bearer abcdefghijklmnopqrstuvwxyz123456" "$TMP/input-valid.txt" && grep -q "REDACTED" "$TMP/input-valid.txt"'
 
 run_extract "$TRANSCRIPT" fenced
 ok "fenced JSON is stripped" '[ "$rc" = 0 ] && jq -e ".honcho == [] and .wiki_candidates == []" <<<"$out" >/dev/null'
