@@ -88,6 +88,60 @@ class ToReadableTests(unittest.TestCase):
         self.assertEqual(to_readable(before), after)
 
 
+class LooseSpacingTests(unittest.TestCase):
+    def test_loose_off_by_default(self):
+        # Default call leaves tight list items unchanged.
+        self.assertEqual(to_readable("- a\n- b\n- c"), "- a\n- b\n- c")
+
+    def test_loose_separates_list_items(self):
+        self.assertEqual(
+            to_readable("- a\n- b\n- c", loose=True),
+            "- a\n\n- b\n\n- c",
+        )
+
+    def test_loose_separates_numbered_list_items(self):
+        self.assertEqual(
+            to_readable("1. a\n2. b", loose=True),
+            "1. a\n\n2. b",
+        )
+
+    def test_loose_leaves_prose_lines_attached(self):
+        # Only list items get spaced; adjacent prose lines stay together.
+        self.assertEqual(
+            to_readable("first line\nsecond line", loose=True),
+            "first line\nsecond line",
+        )
+
+    def test_loose_does_not_split_list_item_continuation(self):
+        # An indented continuation line is not a list item, so it stays attached.
+        self.assertEqual(
+            to_readable("- item one\n  more detail\n- item two", loose=True),
+            "- item one\n  more detail\n- item two",
+        )
+
+    def test_loose_keeps_table_rows_together(self):
+        src = "| h1 | h2 |\n| -- | -- |\n| a | b |"
+        # Table rows are not list items, so they are never split.
+        self.assertEqual(to_readable(src, loose=True), src)
+
+    def test_loose_does_not_double_existing_blanks(self):
+        self.assertEqual(
+            to_readable("a\n\nb", loose=True),
+            "a\n\nb",
+        )
+
+    def test_loose_leaves_fenced_code_untouched(self):
+        src = "intro\n```\nline1\nline2\n```\ntail"
+        out = to_readable(src, loose=True)
+        # Code lines stay adjacent; only content outside the fence gets air.
+        self.assertIn("```\nline1\nline2\n```", out)
+
+    def test_loose_is_idempotent(self):
+        src = "intro\n- a\n- b\n## Section\nbody line one\nbody line two"
+        once = to_readable(src, loose=True)
+        self.assertEqual(once, to_readable(once, loose=True))
+
+
 class PartHeaderTests(unittest.TestCase):
     def test_part_marker_is_markdownv2_safe(self):
         # '*' is the only markup; digits and '/' need no MarkdownV2 escaping.
