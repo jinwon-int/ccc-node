@@ -603,5 +603,135 @@ class VoiceFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(task.cancelled())
 
 
+class _FakePhotoMessage:
+    def __init__(self, *, photo=None, document=None, caption=None):
+        self.voice = None
+        self.photo = photo or []
+        self.document = document
+        self.caption = caption
+        self.message_id = 2
+        self.chat = SimpleNamespace(send_action=AsyncMock())
+        self.replies = []
+
+    async def reply_text(self, text, **kwargs):
+        del kwargs
+        self.replies.append(text)
+
+
+def _build_photo_update(user_id: int, *, photo=None, document=None, caption=None):
+    message = _FakePhotoMessage(photo=photo, document=document, caption=caption)
+    return SimpleNamespace(
+        message=message,
+        callback_query=None,
+        effective_user=SimpleNamespace(id=user_id),
+        effective_chat=SimpleNamespace(id=1001),
+    )
+
+
+class PhotoFlowTests(unittest.IsolatedAsyncioTestCase):
+    async def test_ignores_unauthorized_photo_message(self):
+        bot = TelegramBot()
+        bot._check_access = AsyncMock(return_value=False)
+        bot._enqueue_user_task = AsyncMock()
+        photo = SimpleNamespace(file_id="p1", width=100, height=100, file_size=1000)
+        update = _build_photo_update(11, photo=[photo])
+
+        await bot._handle_photo_message(update, None)
+        bot._enqueue_user_task.assert_not_called()
+
+    async def test_photo_queue_overflow_reports_user_visible_message(self):
+        bot = TelegramBot()
+        bot._check_access = AsyncMock(return_value=True)
+
+        async def overflow(user_id, run_task, on_overflow):
+            del user_id, run_task
+            await on_overflow()
+            return False
+
+        bot._enqueue_user_task = overflow
+        photo = SimpleNamespace(file_id="p1", width=100, height=100, file_size=1000)
+        update = _build_photo_update(11, photo=[photo])
+
+        await bot._handle_photo_message(update, None)
+        self.assertTrue(any("Image queue is full" in msg for msg in update.message.replies))
+
+    async def test_photo_download_failure_reports_retry_message(self):
+        bot = TelegramBot()
+        bot._check_access = AsyncMock(return_value=True)
+
+        async def run_now(user_id, run_task, on_overflow):
+            del user_id, on_overflow
+            await run_task()
+            return True
+
+        bot._enqueue_user_task = run_now
+        bot._download_image_file = AsyncMock(side_effect=RuntimeError("download error"))
+        photo = SimpleNamespace(file_id="p1", width=100, height=100, file_size=1000)
+        update = _build_photo_update(11, photo=[photo])
+
+        with TemporaryDirectory() as td:
+            bot._image_dir = Path(td)
+            await bot._handle_photo_message(update, None)
+
+        self.assertTrue(any("Failed to download your image" in msg for msg in update.message.replies))
+
+    async def test_photo_caption_and_local_path_are_forwarded_to_project_chat(self):
+        bot = TelegramBot()
+        bot._check_access = AsyncMock(return_value=True)
+
+        async def run_now(user_id, run_task, on_overflow):
+            del user_id, on_overflow
+            await run_task()
+            return True
+
+        bot._enqueue_user_task = run_now
+        bot._download_image_file = AsyncMock(return_value=None)
+        bot._process_user_message_text = AsyncMock()
+        small = SimpleNamespace(file_id="small", width=100, height=100, file_size=1000)
+        large = SimpleNamespace(file_id="large", width=1200, height=900, file_size=200000)
+        update = _build_photo_update(11, photo=[small, large], caption="이거 분석해줘")
+
+        with TemporaryDirectory() as td:
+            bot._image_dir = Path(td)
+            await bot._handle_photo_message(update, None)
+
+        bot._download_image_file.assert_awaited_once()
+        self.assertEqual(bot._download_image_file.await_args.args[0].file_id, "large")
+        bot._process_user_message_text.assert_awaited_once()
+        called = bot._process_user_message_text.await_args
+        prompt = called.args[2]
+        self.assertIn("Local image path:", prompt)
+        self.assertIn("이거 분석해줘", prompt)
+        self.assertIn(".jpg", prompt)
+        self.assertEqual(called.kwargs.get("message_source"), "image")
+
+    async def test_image_document_uses_document_mime_extension(self):
+        bot = TelegramBot()
+        bot._check_access = AsyncMock(return_value=True)
+
+        async def run_now(user_id, run_task, on_overflow):
+            del user_id, on_overflow
+            await run_task()
+            return True
+
+        bot._enqueue_user_task = run_now
+        bot._download_image_file = AsyncMock(return_value=None)
+        bot._process_user_message_text = AsyncMock()
+        document = SimpleNamespace(
+            file_id="doc1",
+            mime_type="image/png",
+            file_name="screenshot.png",
+        )
+        update = _build_photo_update(11, document=document, caption=None)
+
+        with TemporaryDirectory() as td:
+            bot._image_dir = Path(td)
+            await bot._handle_photo_message(update, None)
+
+        prompt = bot._process_user_message_text.await_args.args[2]
+        self.assertIn(".png", prompt)
+        self.assertIn("Please describe what is in the image", prompt)
+
+
 if __name__ == "__main__":
     unittest.main()
