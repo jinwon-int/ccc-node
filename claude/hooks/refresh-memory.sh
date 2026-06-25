@@ -7,18 +7,18 @@ set -uo pipefail
 # Distill subprocess guard (see ~/.claude/hooks/distill.sh).
 [ -n "${CLAUDE_DISTILL_INFLIGHT:-}" ] && exit 0
 
-CACHE=/root/.claude/hooks/cache
+CACHE="${CCC_MEMORY_CACHE_DIR:-/root/.claude/hooks/cache}"
 mkdir -p "$CACHE"
 
 # Non-blocking single-flight lock: if a refresh is already running, exit.
 exec 9>"$CACHE/.refresh.lock"
 flock -n 9 || exit 0
 
-WIKI=/root/.wiki-agent/bin/wiki-agent
+WIKI="${CCC_WIKI_AGENT_BIN:-/root/.wiki-agent/bin/wiki-agent}"
 
 # Honcho config is read from ~/.hermes/honcho.json — NEVER hard-code the endpoint here.
 # baseUrl / workspace / peerName / target are node-local, not committed to this repo.
-HONCHO_CFG=/root/.hermes/honcho.json
+HONCHO_CFG="${CCC_HERMES_DIR:-/root/.hermes}/honcho.json"
 HONCHO="$(jq -r '.baseUrl // empty' "$HONCHO_CFG" 2>/dev/null)"
 WS="$(jq -r '.workspace // "seoyoon-family"' "$HONCHO_CFG" 2>/dev/null)"
 PEER="$(jq -r '.peerName // empty' "$HONCHO_CFG" 2>/dev/null)"
@@ -52,3 +52,11 @@ if [ -n "$HONCHO" ] && [ -n "$PEER" ]; then
 fi
 
 date -u +%Y-%m-%dT%H:%M:%SZ > "$CACHE/.last-refresh"
+
+# Update FTS5 hot index when CCC_MEMORY_PROFILE=hybrid or max-perf.
+# The FTS5 scripts are shipped in the ccc-node repo scripts/ dir; resolve
+# via CCC_FTS5_SCRIPT_DIR or auto-discover from the hook location.
+FTS5_UPDATE="${CCC_FTS5_SCRIPT_DIR:-$HOME/ccc-node/scripts}/ccc-fts5-update.sh"
+if [ -x "$FTS5_UPDATE" ]; then
+  bash "$FTS5_UPDATE" >/dev/null 2>&1 || true
+fi

@@ -19,6 +19,18 @@ to Telegram, with all secrets and node-local state stripped out and replaced by 
 - **SessionStart / PostCompact memory injection** — `hooks/load-memory.sh` injects a snapshot
   at session start: built-in `MEMORY.md`/`USER.md` + cached Family Wiki prefetch + cached
   Honcho working memory, then fires a detached background refresh for the next session.
+- **Local FTS5 hot index** (`scripts/ccc-fts5-index.py`) — optional SQLite-backed full-text
+  search over node memory sources. Activated by `CCC_MEMORY_PROFILE=hybrid` or
+  `CCC_MEMORY_PROFILE=max-perf` (default: `honcho`, no local index). Provides `update`,
+  `search`, and `check` subcommands. The index lives under `CCC_STATE_DIR/ccc-fts5.db`
+  and never indexes secret-bearing content (detected via safety-belt blocklist).
+  - `scripts/ccc-fts5-update.sh` — rebuild index from cache/memory files
+  - `scripts/ccc-fts5-search.sh "<query>"` — FTS5 query with JSON output
+  - `scripts/ccc-fts5-check.sh` — health/staleness statistics
+- **Offline memory eval harness** (`scripts/ccc-memory-eval.py`) — measures latency,
+  token budget, refresh health, and recall quality using controlled fixtures. No live
+  Honcho or provider calls. JSON output suitable for CI dashboards.
+  - `scripts/ccc-memory-eval.test.sh` — validates the harness (fixtures-only, CI-safe)
 - **Background cache refresh** — `hooks/refresh-memory.sh` updates the Wiki + Honcho caches
   out-of-band (single-flight via `flock`, fail-open) so startup never blocks on slow calls.
 - **Harness settings** — `settings.json` (permissions + hook wiring) and `settings.local.json`.
@@ -199,6 +211,10 @@ behavior:
 | `CCC_HERMES_DIR` | `$HOME/.hermes` | `honcho.json` and Hermes-side local config templates |
 | `CCC_WIKI_AGENT_BIN` | `$HOME/.wiki-agent/bin/wiki-agent` | Checklist path for the Family Wiki reader/writer binary |
 | `CCC_BRIDGE_DEFAULT_PATH` | `$HOME` | Suggested Telegram bridge `--path` workspace in the printed checklist |
+| `CCC_MEMORY_PROFILE` | `honcho` | Memory backend: `honcho` (default, Honcho-only), `hybrid` (Honcho + local FTS5), `max-perf` (Honcho + FTS5 + future vector/graph) |
+| `CCC_MEMORY_CACHE_DIR` | `$CCC_CLAUDE_DIR/hooks/cache` | Wiki + Honcho cache file location |
+| `CCC_FTS5_SCRIPT_DIR` | `$HOME/ccc-node/scripts` | Location of ccc-fts5-*.sh scripts |
+| `CCC_MEMORY_EVAL_FIXTURES` | `<repo>/scripts/eval-fixtures` | Custom fixture directory for eval harness |
 
 Example non-root preview:
 

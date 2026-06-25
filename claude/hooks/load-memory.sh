@@ -36,6 +36,21 @@ wiki="$(cat "$CACHE/wiki.txt" 2>/dev/null)"
 honcho="$(cat "$CACHE/honcho.txt" 2>/dev/null)"
 stamp="$(cat "$CACHE/.last-refresh" 2>/dev/null)"
 
+# FTS5 hot index snippet (available when CCC_MEMORY_PROFILE=hybrid|max-perf).
+fts5=""
+if command -v python3 >/dev/null 2>&1; then
+  FTS5_SEARCH="${CCC_FTS5_SCRIPT_DIR:-$HOME/ccc-node/scripts}/ccc-fts5-search.sh"
+  if [ -x "$FTS5_SEARCH" ]; then
+    PROFILE="${CCC_MEMORY_PROFILE:-honcho}"
+    case "$PROFILE" in
+      hybrid|max-perf)
+        fts5="$(CCC_MEMORY_PROFILE="$PROFILE" bash "$FTS5_SEARCH" \
+          "node memory preferences priorities operating context" -n 5 2>/dev/null)"
+        ;;
+    esac
+  fi
+fi
+
 mem="$(scan_injection_block built-in-memory "$mem")"
 wiki="$(scan_injection_block family-wiki-cache "$wiki")"
 honcho="$(scan_injection_block honcho-cache "$honcho")"
@@ -54,7 +69,10 @@ ${mem:-(memory files unavailable)}
 ${wiki:-(no wiki cache yet — will populate after first background refresh)}
 
 ## Honcho working memory — Seo Jin On
-${honcho:-(no honcho cache yet — will populate after first background refresh)}"
+${honcho:-(no honcho cache yet — will populate after first background refresh)}
+
+## FTS5 hot index (local, CCC_MEMORY_PROFILE: ${CCC_MEMORY_PROFILE:-honcho})${fts5:+
+${fts5}}"
 
 jq -n --arg ctx "$ctx" --arg event "$EVENT" \
   '{hookSpecificOutput:{hookEventName:$event,additionalContext:$ctx}}'
