@@ -272,6 +272,7 @@ class StreamingMessageHandler:
             draft.text,
             enabled=getattr(config, "enable_readable_renderer", False),
             loose=getattr(config, "enable_loose_spacing", False),
+            spacing=getattr(config, "spacing_lines", 1),
         )
 
         # Optional 'k/N' part markers on multi-chunk responses (opt-in via

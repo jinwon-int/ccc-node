@@ -2968,6 +2968,7 @@ class TelegramBot:
             content,
             enabled=getattr(config, "enable_readable_renderer", False),
             loose=getattr(config, "enable_loose_spacing", False),
+            spacing=getattr(config, "spacing_lines", 1),
         )
 
         # Entity path (opt-in via CCC_TELEGRAM_ENTITY_RENDERER, default on):

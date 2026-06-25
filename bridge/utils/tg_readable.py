@@ -52,17 +52,22 @@ def _is_section_heading(line: str) -> bool:
     return bool(_HEADING_RE.match(line) or _BOLD_ONLY_RE.match(line))
 
 
-def to_readable(text: str, loose: bool = False) -> str:
+def to_readable(text: str, loose: bool = False, spacing: int = 1) -> str:
     """Return a readability-normalized copy of *text*.
 
     When *loose* is True, also insert a blank line between adjacent list-item
     lines so each item gets its own visual line — prose lines stay attached and
     fenced code is left intact.
 
+    *spacing* sets how many blank lines each vertical gap is normalized to
+    (clamped to [1, 3]). ``spacing=1`` reproduces the historical behavior
+    (every blank run collapses to a single blank line); ``spacing=2`` widens
+    every paragraph/section/list-item gap to two blank lines for roomier output.
+
     Fail-open: on any unexpected error the original *text* is returned unchanged.
     """
     try:
-        return _transform(text, loose=loose)
+        return _transform(text, loose=loose, spacing=spacing)
     except Exception:  # pragma: no cover - never let formatting break delivery
         logger.warning(
             "tg_readable.to_readable failed; returning input unchanged",
@@ -71,7 +76,9 @@ def to_readable(text: str, loose: bool = False) -> str:
         return text
 
 
-def render_for_delivery(text: str, *, enabled: bool, loose: bool) -> str:
+def render_for_delivery(
+    text: str, *, enabled: bool, loose: bool, spacing: int = 1
+) -> str:
     """Apply the readable renderer for outbound delivery, honoring config flags.
 
     Single source of truth shared by BOTH the streaming finalize path
@@ -84,12 +91,19 @@ def render_for_delivery(text: str, *, enabled: bool, loose: bool) -> str:
     """
     if not enabled:
         return text
-    return to_readable(text, loose=loose)
+    return to_readable(text, loose=loose, spacing=spacing)
 
 
-def _transform(text: str, loose: bool = False) -> str:
+def _transform(text: str, loose: bool = False, spacing: int = 1) -> str:
     if not text:
         return text
+
+    # Defensive clamp so a stray config value can never explode message length
+    # or break the single-blank invariant relied on by downstream conversion.
+    try:
+        spacing = max(1, min(int(spacing), 3))
+    except (TypeError, ValueError):
+        spacing = 1
 
     lines = text.split("\n")
 
@@ -145,24 +159,37 @@ def _transform(text: str, loose: bool = False) -> str:
             loose_lines.append(line)
         pass2 = loose_lines
 
-    # Pass 3: collapse runs of blank lines to a single blank line (outside fences).
+    # Pass 3: normalize every run of blank lines (outside fences) to exactly
+    # `spacing` blank lines. With spacing=1 this is the historical "collapse to a
+    # single blank line"; with spacing>1 each paragraph/section/list-item gap is
+    # widened uniformly. Leading/trailing runs are trimmed by the final strip, so
+    # interior gaps are the only ones widened — soft-wrapped lines with no blank
+    # between them stay attached.
     in_fence = False
-    blank_run = 0
     pass3: list[str] = []
-    for line in pass2:
+    i = 0
+    n = len(pass2)
+    while i < n:
+        line = pass2[i]
         if _FENCE_RE.match(line):
             in_fence = not in_fence
-            blank_run = 0
             pass3.append(line)
+            i += 1
             continue
         if not in_fence and line.strip() == "":
-            blank_run += 1
-            if blank_run >= 2:
-                continue  # keep at most one consecutive blank line
-            pass3.append("")
+            # Consume the whole blank run, then emit exactly `spacing` blanks.
+            j = i
+            while (
+                j < n
+                and not _FENCE_RE.match(pass2[j])
+                and pass2[j].strip() == ""
+            ):
+                j += 1
+            pass3.extend([""] * spacing)
+            i = j
         else:
-            blank_run = 0
             pass3.append(line)
+            i += 1
 
     # Trim leading/trailing blank lines without disturbing interior content.
     return "\n".join(pass3).strip("\n")

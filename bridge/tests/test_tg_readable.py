@@ -143,6 +143,52 @@ class LooseSpacingTests(unittest.TestCase):
         self.assertEqual(once, to_readable(once, loose=True))
 
 
+class SpacingLinesTests(unittest.TestCase):
+    def test_spacing_default_one_matches_legacy(self):
+        # spacing=1 (default) reproduces the historical collapse-to-one behavior.
+        self.assertEqual(to_readable("a\n\n\n\nb"), "a\n\nb")
+        self.assertEqual(to_readable("a\n\n\n\nb", spacing=1), "a\n\nb")
+
+    def test_spacing_two_widens_paragraph_gaps(self):
+        # An author paragraph break (single blank) widens to two blank lines.
+        self.assertEqual(to_readable("a\n\nb", spacing=2), "a\n\n\nb")
+
+    def test_spacing_two_widens_list_item_gaps_in_loose(self):
+        self.assertEqual(
+            to_readable("- a\n- b", loose=True, spacing=2),
+            "- a\n\n\n- b",
+        )
+
+    def test_spacing_two_widens_blank_before_heading(self):
+        self.assertEqual(
+            to_readable("intro\n## Section\nbody", spacing=2),
+            "intro\n\n\n## Section\nbody",
+        )
+
+    def test_spacing_does_not_space_soft_wrapped_prose(self):
+        # No blank between the lines, so no gap is created (only gaps widen).
+        self.assertEqual(
+            to_readable("first line\nsecond line", spacing=2),
+            "first line\nsecond line",
+        )
+
+    def test_spacing_two_leaves_fenced_code_untouched(self):
+        src = "intro\n\n```\nl1\n\n\nl2\n```\n\ntail"
+        out = to_readable(src, spacing=2)
+        self.assertIn("```\nl1\n\n\nl2\n```", out)
+
+    def test_spacing_two_is_idempotent(self):
+        src = "intro\n\nbody\n- a\n- b\n## Section\ntail"
+        once = to_readable(src, loose=True, spacing=2)
+        self.assertEqual(once, to_readable(once, loose=True, spacing=2))
+
+    def test_spacing_clamped_to_max_three(self):
+        self.assertEqual(to_readable("a\n\nb", spacing=99), "a\n\n\n\nb")
+
+    def test_spacing_invalid_falls_back_to_one(self):
+        self.assertEqual(to_readable("a\n\n\nb", spacing="oops"), "a\n\nb")
+
+
 class PartHeaderTests(unittest.TestCase):
     def test_part_marker_is_markdownv2_safe(self):
         # '*' is the only markup; digits and '/' need no MarkdownV2 escaping.
