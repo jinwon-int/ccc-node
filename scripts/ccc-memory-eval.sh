@@ -1,15 +1,48 @@
 #!/usr/bin/env bash
 # ccc-memory-eval.sh — local, no-network smoke/eval harness for memory changes.
 set -uo pipefail
-ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-STATE_DIR="${CCC_STATE_DIR:-$(mktemp -d)}"
-CACHE="${CCC_MEMORY_CACHE_DIR:-$STATE_DIR/cache}"
-MEMORY_DIR="${CCC_MEMORY_DIR:-$STATE_DIR/memories}"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+find_tool() { # <tool-name> <repo-relative-fallback>
+  local name="$1" fallback="$2" d
+  for d in "${CCC_MEMORY_TOOLS_DIR:-}" "$SCRIPT_DIR" "$ROOT/scripts"; do
+    [ -n "$d" ] || continue
+    if [ -x "$d/$name" ]; then printf '%s\n' "$d/$name"; return 0; fi
+  done
+  if [ -x "$ROOT/$fallback" ]; then printf '%s\n' "$ROOT/$fallback"; return 0; fi
+  return 1
+}
+INDEX_TOOL="$(find_tool ccc-memory-index.sh scripts/ccc-memory-index.sh)"
+SEARCH_TOOL="$(find_tool ccc-memory-search.sh scripts/ccc-memory-search.sh)"
+LOAD_HOOK="$(find_tool load-memory.sh claude/hooks/load-memory.sh)"
 QUERY="${1:-user preferences}"
 KEEP_TMP="${CCC_MEMORY_EVAL_KEEP_TMP:-0}"
+
+if [ -n "${CCC_STATE_DIR:-}" ]; then
+  CALLER_STATE_DIR="$CCC_STATE_DIR"
+  mkdir -p "$CALLER_STATE_DIR"
+  STATE_DIR="$(mktemp -d "$CALLER_STATE_DIR/ccc-memory-eval.XXXXXX")"
+  CREATED_STATE_DIR=1
+else
+  STATE_DIR="$(mktemp -d)"
+  CREATED_STATE_DIR=1
+fi
+CACHE="${CCC_MEMORY_CACHE_DIR:-$STATE_DIR/cache}"
+MEMORY_DIR="${CCC_MEMORY_DIR:-$STATE_DIR/memories}"
+INDEX_OUT="$STATE_DIR/eval-index.json"
+INDEX_ERR="$STATE_DIR/eval-index.err"
+SEARCH_ERR="$STATE_DIR/eval-search.err"
+LOAD_ERR="$STATE_DIR/eval-load.err"
 START_MS="$(python3 -c 'import time; print(int(time.time()*1000))')"
 
-cleanup() { [ "$KEEP_TMP" = "1" ] || rm -rf "$STATE_DIR"; }
+cleanup() {
+  if [ "$KEEP_TMP" = "1" ]; then
+    return 0
+  fi
+  if [ "${CREATED_STATE_DIR:-0}" = "1" ] && [ -n "${STATE_DIR:-}" ] && [ -d "$STATE_DIR" ]; then
+    rm -rf "$STATE_DIR"
+  fi
+}
 trap cleanup EXIT
 mkdir -p "$CACHE" "$MEMORY_DIR" "$STATE_DIR"
 printf 'User prefers concise evidence-based reports.\n' > "$MEMORY_DIR/USER.md"
@@ -20,11 +53,11 @@ printf 'eval-node\n' > "$STATE_DIR/node.txt"
 printf '%s\n' "$QUERY" > "$STATE_DIR/current-task.txt"
 
 CCC_STATE_DIR="$STATE_DIR" CCC_MEMORY_CACHE_DIR="$CACHE" CCC_MEMORY_DIR="$MEMORY_DIR" \
-  "$ROOT/scripts/ccc-memory-index.sh" rebuild >/tmp/ccc-memory-eval-index.json 2>/tmp/ccc-memory-eval-index.err
+  "$INDEX_TOOL" rebuild >"$INDEX_OUT" 2>"$INDEX_ERR"
 index_rc=$?
-search_json="$(CCC_STATE_DIR="$STATE_DIR" CCC_MEMORY_INDEX_DB="$STATE_DIR/memory-index.sqlite" "$ROOT/scripts/ccc-memory-search.sh" "$QUERY" 2>/tmp/ccc-memory-eval-search.err)"
+search_json="$(CCC_STATE_DIR="$STATE_DIR" CCC_MEMORY_INDEX_DB="$STATE_DIR/memory-index.sqlite" "$SEARCH_TOOL" "$QUERY" 2>"$SEARCH_ERR")"
 search_rc=$?
-load_json="$(CCC_STATE_DIR="$STATE_DIR" CCC_MEMORY_CACHE_DIR="$CACHE" CCC_MEMORY_DIR="$MEMORY_DIR" CCC_HOOK_DIR="$ROOT/claude/hooks" CCC_MEMORY_PROFILE=hybrid CCC_LOCAL_MEMORY_ENABLED=1 CCC_MEMORY_QUERY="$QUERY" "$ROOT/claude/hooks/load-memory.sh" SessionStart 2>/tmp/ccc-memory-eval-load.err)"
+load_json="$(CCC_STATE_DIR="$STATE_DIR" CCC_MEMORY_CACHE_DIR="$CACHE" CCC_MEMORY_DIR="$MEMORY_DIR" CCC_HOOK_DIR="$(dirname "$LOAD_HOOK")" CCC_MEMORY_TOOLS_DIR="$(dirname "$INDEX_TOOL")" CCC_MEMORY_PROFILE=hybrid CCC_LOCAL_MEMORY_ENABLED=1 CCC_MEMORY_QUERY="$QUERY" "$LOAD_HOOK" SessionStart 2>"$LOAD_ERR")"
 load_rc=$?
 END_MS="$(python3 -c 'import time; print(int(time.time()*1000))')"
 bytes="$(printf '%s' "$load_json" | wc -c | tr -d '[:space:]')"

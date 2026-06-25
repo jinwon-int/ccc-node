@@ -44,11 +44,21 @@ limit_bytes() { # <max> <text>
 limit = int(sys.argv[1])
 data = sys.stdin.buffer.read()
 if limit > 0 and len(data) > limit:
-    sys.stdout.buffer.write(data[:limit])
+    text = data[:limit].decode("utf-8", errors="ignore")
+    sys.stdout.buffer.write(text.encode("utf-8"))
     sys.stdout.write("\n… [truncated by CCC memory budget]\n")
 else:
     sys.stdout.buffer.write(data)
 ' "$max"
+}
+
+find_memory_tool() { # <tool-name>
+  local name="$1" d
+  for d in "${CCC_MEMORY_TOOLS_DIR:-}" "$HOOKDIR" "$HOOKDIR/../../scripts"; do
+    [ -n "$d" ] || continue
+    if [ -x "$d/$name" ]; then printf '%s\n' "$d/$name"; return 0; fi
+  done
+  return 1
 }
 
 age_seconds() { # <file>
@@ -82,10 +92,9 @@ fi
 
 local_hot=""
 if [ "$PROFILE" = "hybrid" ] || [ "$PROFILE" = "max-perf" ] || is_truthy "$LOCAL_ENABLED"; then
-  if [ -x "$HOOKDIR/../../scripts/ccc-memory-search.sh" ]; then
-    local_hot="$({ "$HOOKDIR/../../scripts/ccc-memory-search.sh" "$QUERY" 2>/dev/null || true; } | sed -n '1,120p')"
-  elif [ -x "$HOOKDIR/ccc-memory-search.sh" ]; then
-    local_hot="$({ "$HOOKDIR/ccc-memory-search.sh" "$QUERY" 2>/dev/null || true; } | sed -n '1,120p')"
+  search_tool="$(find_memory_tool ccc-memory-search.sh 2>/dev/null || true)"
+  if [ -n "$search_tool" ]; then
+    local_hot="$({ "$search_tool" "$QUERY" 2>/dev/null || true; } | sed -n '1,120p')"
   fi
 fi
 

@@ -18,6 +18,14 @@ PROFILE="${CCC_MEMORY_PROFILE:-honcho}"
 mkdir -p "$CACHE" "$STATE_DIR"
 
 is_disabled() { case "${1:-}" in 0|false|FALSE|off|OFF|no|NO) return 0;; *) return 1;; esac; }
+find_memory_tool() { # <tool-name>
+  local name="$1" d
+  for d in "${CCC_MEMORY_TOOLS_DIR:-}" "$HOOKDIR" "$HOOKDIR/../../scripts"; do
+    [ -n "$d" ] || continue
+    if [ -x "$d/$name" ]; then printf '%s\n' "$d/$name"; return 0; fi
+  done
+  return 1
+}
 now_iso() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 now_ms() { python3 -c 'import time; print(int(time.time()*1000))'; }
 bytes_for() { [ -f "$1" ] && wc -c < "$1" | tr -d '[:space:]' || printf '0'; }
@@ -112,9 +120,7 @@ wait "$honcho_pid" || true
 
 # Update local hot-memory index opportunistically. It is best-effort and never blocks hook startup.
 index_status="skipped"; index_error=""
-index_script=""
-[ -x "$HOOKDIR/../../scripts/ccc-memory-index.sh" ] && index_script="$HOOKDIR/../../scripts/ccc-memory-index.sh"
-[ -z "$index_script" ] && [ -x "$HOOKDIR/ccc-memory-index.sh" ] && index_script="$HOOKDIR/ccc-memory-index.sh"
+index_script="$(find_memory_tool ccc-memory-index.sh 2>/dev/null || true)"
 if [ -n "$index_script" ]; then
   if out="$(timeout 30 "$index_script" update 2>&1)"; then
     index_status="ok"

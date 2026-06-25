@@ -141,6 +141,11 @@ run "cp '$SRC/claude/hooks/redact.sh'         '$CLAUDE_DIR/hooks/redact.sh'"
 run "cp '$SRC/claude/hooks/notify.sh'         '$CLAUDE_DIR/hooks/notify.sh'"
 run "cp '$SRC/claude/hooks/evidence-gate.sh'  '$CLAUDE_DIR/hooks/evidence-gate.sh'"
 run "cp '$SRC/claude/hooks/statusline.sh'     '$CLAUDE_DIR/hooks/statusline.sh'"
+# Memory helper tools used by load-memory.sh / refresh-memory.sh in standalone installs.
+run "cp '$SRC/scripts/ccc-memory-index.sh'    '$CLAUDE_DIR/hooks/ccc-memory-index.sh'"
+run "cp '$SRC/scripts/ccc-memory-search.sh'   '$CLAUDE_DIR/hooks/ccc-memory-search.sh'"
+run "cp '$SRC/scripts/ccc-memory-check.sh'    '$CLAUDE_DIR/hooks/ccc-memory-check.sh'"
+run "cp '$SRC/scripts/ccc-memory-eval.sh'     '$CLAUDE_DIR/hooks/ccc-memory-eval.sh'"
 # Session Distiller — PreCompact/SessionEnd trans → Haiku (OAuth) → Honcho push + wiki-candidates queue.
 # See pages/team/dungae/DECISIONS.md [TM-1058] for design rationale.
 run "cp '$SRC/claude/hooks/distill.sh'        '$CLAUDE_DIR/hooks/distill.sh'"
