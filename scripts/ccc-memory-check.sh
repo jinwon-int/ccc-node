@@ -10,6 +10,7 @@ TTL="${CCC_MEMORY_CACHE_TTL_SEC:-21600}"
 OUTPUT="${1:-text}"
 
 now_epoch() { date -u +%s; }
+is_disabled() { case "${1:-}" in 0|false|FALSE|off|OFF|no|NO) return 0;; *) return 1;; esac; }
 file_epoch() { [ -f "$1" ] && date -u -r "$1" +%s 2>/dev/null || printf '0'; }
 age_for() {
   local f="$1" ts now
@@ -39,7 +40,7 @@ fi
 
 wiki_status="$(status_for "$wiki_file")"
 honcho_status="disabled"
-if [ "$honcho_enabled" != "0" ] && [ "$honcho_enabled" != "false" ] && [ "$honcho_enabled" != "off" ]; then
+if ! is_disabled "$honcho_enabled"; then
   honcho_status="$(status_for "$honcho_file")"
 fi
 
