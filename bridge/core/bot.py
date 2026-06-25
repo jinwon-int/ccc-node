@@ -52,6 +52,7 @@ from telegram_bot.utils.tg_format import wrap_markdown_tables
 from telegram_bot.utils.tg_robust import send_with_retry
 from telegram_bot.utils import tg_md
 from telegram_bot.utils import tg_readable
+from telegram_bot.utils import tg_entities
 from telegram_bot.utils import tg_errors
 from telegram_bot.utils.audio_processor import AudioProcessor
 from telegram_bot.utils.transcription import (
@@ -2969,6 +2970,25 @@ class TelegramBot:
             loose=getattr(config, "enable_loose_spacing", False),
         )
 
+        # Entity path (opt-in via CCC_TELEGRAM_ENTITY_RENDERER, default on):
+        # send (text + MessageEntity[]) without parse_mode, avoiding MarkdownV2
+        # escape failures. Mirrors the streaming finalize path so both delivery
+        # paths render identically. Fail-open: to_entity_chunks returns None when
+        # the renderer is unavailable (-> MarkdownV2 below), and each chunk
+        # degrades to plain text on the rare BadRequest (per-message, so no
+        # duplication on partial failure).
+        if getattr(config, "enable_entity_renderer", False):
+            entity_chunks = tg_entities.to_entity_chunks(render_text, limit)
+            if entity_chunks:
+                for text, entities in entity_chunks:
+                    try:
+                        await send_with_retry(
+                            lambda t=text, e=entities: op(t, None, e or None)
+                        )
+                    except telegram.error.BadRequest:
+                        await send_with_retry(lambda t=text: op(t, None))
+                return
+
         if tg_md.available():
             # Convert the whole message to MarkdownV2 first, THEN split on
             # entity-safe boundaries with split_markdownv2. Splitting the raw
@@ -3007,7 +3027,9 @@ class TelegramBot:
         if not streamed:
             await self._deliver_markdown(
                 content,
-                lambda t, pm: message.reply_text(t, parse_mode=pm),
+                lambda t, pm=None, ents=None: message.reply_text(
+                    t, parse_mode=pm, entities=ents
+                ),
                 base_parse_mode=parse_mode,
             )
 
@@ -3029,7 +3051,9 @@ class TelegramBot:
         if not streamed:
             await self._deliver_markdown(
                 content,
-                lambda t, pm: bot.send_message(chat_id, t, parse_mode=pm),
+                lambda t, pm=None, ents=None: bot.send_message(
+                    chat_id, t, parse_mode=pm, entities=ents
+                ),
             )
 
         resolved_paths = self._resolve_paths(content)
