@@ -29,6 +29,25 @@ class DeliverMarkdownRendererWiringTests(unittest.TestCase):
     def test_bot_imports_tg_readable(self):
         self.assertIn("from telegram_bot.utils import tg_readable", _bot_text())
 
+    def test_bot_imports_tg_entities(self):
+        self.assertIn("from telegram_bot.utils import tg_entities", _bot_text())
+
+    def test_deliver_markdown_tries_entity_renderer_before_markdownv2(self):
+        text = _bot_text()
+        start = text.index("async def _deliver_markdown")
+        end = text.index("async def ", start + 1)
+        body = text[start:end]
+
+        # Entity path is attempted, gated on the entity-renderer flag, and runs
+        # on render_text before the MarkdownV2 conversion (parity with the
+        # streaming finalize path).
+        self.assertIn("enable_entity_renderer", body)
+        self.assertIn("tg_entities.to_entity_chunks(render_text", body)
+
+        entity = body.index("tg_entities.to_entity_chunks(render_text")
+        convert = body.index("tg_md.to_markdownv2(render_text)")
+        self.assertLess(entity, convert)
+
     def test_deliver_markdown_applies_readable_renderer_before_markdownv2(self):
         text = _bot_text()
         start = text.index("async def _deliver_markdown")
