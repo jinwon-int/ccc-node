@@ -2783,9 +2783,20 @@ class TelegramBot:
         HTML; if the renderer is unavailable we use the legacy
         ``wrap_markdown_tables`` + base-parse-mode path.
         """
+        # Per-bubble size: non-streaming replies split into the same digestible
+        # messages as the streaming path (CCC_TELEGRAM_MAX_BUBBLE_CHARS), bounded
+        # by the Telegram hard limit.
+        limit = max(
+            200,
+            min(
+                int(getattr(config, "telegram_max_bubble_chars", 4000)),
+                tg_md.TELEGRAM_LIMIT,
+            ),
+        )
+
         # HTML callers (e.g. /skills listing) keep their existing behavior.
         if base_parse_mode == "HTML":
-            for part in self._split_text(wrap_markdown_tables(content)):
+            for part in self._split_text(wrap_markdown_tables(content), limit):
                 try:
                     await send_with_retry(lambda p=part: op(p, "HTML"))
                 except telegram.error.BadRequest:
@@ -2802,7 +2813,7 @@ class TelegramBot:
             # plain fallback only on the rare BadRequest.
             md2 = tg_md.to_markdownv2(content)
             if md2 is not None:
-                for part in tg_md.split_markdownv2(md2):
+                for part in tg_md.split_markdownv2(md2, limit):
                     try:
                         await send_with_retry(lambda p=part: op(p, "MarkdownV2"))
                     except telegram.error.BadRequest:
@@ -2811,7 +2822,7 @@ class TelegramBot:
             # conversion unavailable/failed -> legacy path below
 
         # Legacy fallback: telegramify unavailable -> wrap tables + base parse mode.
-        for part in self._split_text(wrap_markdown_tables(content)):
+        for part in self._split_text(wrap_markdown_tables(content), limit):
             try:
                 await send_with_retry(lambda p=part: op(p, base_parse_mode))
             except telegram.error.BadRequest:

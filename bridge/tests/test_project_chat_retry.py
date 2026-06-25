@@ -293,5 +293,45 @@ class ClearUserStreamTests(unittest.IsolatedAsyncioTestCase):
         await handler.clear_user_stream(999)  # must not raise
 
 
+class _CapturingClient:
+    """Client that records the in-flight request's streaming_handler at query time
+    and immediately resolves the future so process_message returns."""
+
+    def __init__(self, state):
+        self.state = state
+        self.captured_handler = "unset"
+
+    async def query(self, *_args, **_kwargs):
+        req = self.state.pending[0]
+        self.captured_handler = req.streaming_handler
+        req.future.set_result(
+            project_chat.ChatResponse(content="ok", session_id="s")
+        )
+
+
+class StreamingGateTests(unittest.IsolatedAsyncioTestCase):
+    async def test_no_streaming_handler_when_disabled(self):
+        # Even with a bot passed, streaming OFF means no live draft handler is
+        # created — the reply is delivered as a complete message by the caller.
+        handler = project_chat.ProjectChatHandler()
+        state = project_chat._UserStreamState(client=None, model=None)
+        client = _CapturingClient(state)
+        state.client = client
+
+        async def fake_goc(*_a, **_k):
+            return state
+
+        handler._get_or_create_stream = fake_goc
+        config_module.config.enable_streaming = False
+        try:
+            resp = await handler.process_message(
+                "hi", user_id=7, chat_id=42, bot=object()
+            )
+        finally:
+            config_module.config.enable_streaming = None
+        self.assertIsNone(client.captured_handler)
+        self.assertEqual(resp.content, "ok")
+
+
 if __name__ == "__main__":
     unittest.main()
