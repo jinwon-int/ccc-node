@@ -235,7 +235,7 @@ class TelegramBot:
                 [cli_path, "auth", "status", "--json"],
                 text=True,
                 capture_output=True,
-                timeout=5,
+                timeout=float(os.getenv("CLAUDE_AUTH_STATUS_TIMEOUT", "15")),
                 check=False,
             )
         except subprocess.TimeoutExpired:
