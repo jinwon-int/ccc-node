@@ -154,7 +154,11 @@ run "cp '$SRC/claude/hooks/distill/extract.sh'     '$CLAUDE_DIR/hooks/distill/ex
 run "cp '$SRC/claude/hooks/distill/honcho-push.sh' '$CLAUDE_DIR/hooks/distill/honcho-push.sh'"
 run "cp '$SRC/claude/hooks/distill/wiki-queue.sh'  '$CLAUDE_DIR/hooks/distill/wiki-queue.sh'"
 run "cp '$SRC/claude/hooks/distill/queue-drain.sh' '$CLAUDE_DIR/hooks/distill/queue-drain.sh'"
-run "chmod +x '$CLAUDE_DIR/hooks/'*.sh '$CLAUDE_DIR/hooks/distill/'*.sh"
+# Skill Review — Hermes-style background skill draft staging (human-approved).
+run "cp '$SRC/claude/hooks/skill-review.sh' '$CLAUDE_DIR/hooks/skill-review.sh'"
+run "mkdir -p '$CLAUDE_DIR/hooks/skill-review'"
+run "cp '$SRC/claude/hooks/skill-review/extract.sh' '$CLAUDE_DIR/hooks/skill-review/extract.sh'"
+run "chmod +x '$CLAUDE_DIR/hooks/'*.sh '$CLAUDE_DIR/hooks/distill/'*.sh '$CLAUDE_DIR/hooks/skill-review/'*.sh"
 # Tier 3: status line (node·model·git·context·cost·A2A) wired via settings.json statusLine.
 # Output style (한국어 구조화 보고) — node-agnostic; settings.json activates it as outputStyle.
 run "mkdir -p '$CLAUDE_DIR/output-styles'"

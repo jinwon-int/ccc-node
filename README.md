@@ -95,6 +95,12 @@ to Telegram, with all secrets and node-local state stripped out and replaced by 
   `scripts/ccc-distill-check.sh --json` for per-node health snapshot. Non-root installs: set
   `CCC_STATE_DIR` (state/log/queue), `CLAUDE_PROJECTS_DIR` (transcript discovery), and
   `CCC_NODE` (node label); the checker respects `CCC_STATE_DIR`.
+- **Skill Review** (`claude/hooks/skill-review.sh`, `/skill-suggest`) — Hermes-style
+  SessionEnd self-improvement pass that reviews recent transcripts via `claude -p --model haiku`
+  and stages reusable `SKILL.md` drafts under `~/.claude/state/pending-skills/`. It never writes
+  directly to `~/.claude/skills`; install/overwrite requires explicit human approval through the
+  `skill-suggest` workflow. Use `skill-review.disabled` as the off-switch and
+  `CCC_SKILL_REVIEW_COOLDOWN_SECONDS` to tune cost cadence.
 
 ## Quick start
 
