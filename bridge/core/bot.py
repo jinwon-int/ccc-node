@@ -1892,7 +1892,10 @@ class TelegramBot:
         )
         await self._send_file_paths(message.chat.id, in_root_paths)
 
-        if force_options:
+        # Inline option buttons are opt-in (CCC_TELEGRAM_OPTION_BUTTONS). When
+        # off (default), the numbered options remain in the message text and the
+        # user types their choice — no tap-to-select keyboard.
+        if force_options and getattr(config, "enable_option_buttons", False):
             options = self._extract_options(content)
             kb = self._build_option_keyboard(options)
             if kb:
@@ -3060,8 +3063,9 @@ class TelegramBot:
         resolved_paths = self._resolve_paths(content)
         in_root_paths, _ = self._split_paths_by_scope(resolved_paths)
         await self._send_file_paths(chat_id, in_root_paths)
-        # Only show inline keyboard for AskUserQuestion degraded content
-        if force_options:
+        # Inline option buttons are opt-in (CCC_TELEGRAM_OPTION_BUTTONS); default
+        # off, so numbered options stay as text and the user types their choice.
+        if force_options and getattr(config, "enable_option_buttons", False):
             options = self._extract_options(content)
             kb = self._build_option_keyboard(options)
             if kb:
