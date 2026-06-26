@@ -234,6 +234,11 @@ CCC_BRIDGE_DEFAULT_PATH=/home/ccc \
 
 The setup script prints the resolved paths and never prints or moves raw secrets.
 
+On **recent Android (Android 16 / Samsung S23 Ultra class)** the Claude Code CLI
+itself has a device-level blocker (glibc-native binary won't link under Termux) —
+use the JS-pinned, non-proot path. See
+[docs/android-termux-claude.md](docs/android-termux-claude.md).
+
 ## Public source visibility boundary
 
 This repository is being prepared for possible public source visibility. A
