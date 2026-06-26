@@ -76,6 +76,50 @@ ALLOWED_TOOLS = [
 PROCESS_TIMEOUT = int(os.getenv("CLAUDE_PROCESS_TIMEOUT", "3600"))
 
 
+# Error signatures for a claude subprocess that was killed by a service
+# restart/shutdown signal rather than failing on its own. When systemd restarts
+# ``ccc-telegram-bridge.service`` it delivers SIGTERM to the whole control group,
+# so an in-flight claude child dies with exit 143 (=128+SIGTERM) or 137
+# (=128+SIGKILL). That is not a real answer failure — the user message should be
+# resent after the restart instead of surfacing a scary "❌ Error: ... exit 143".
+_SHUTDOWN_SIGNAL_PATTERNS = (
+    "exit code -15",
+    "exit code -9",
+    "exit code 143",
+    "exit code 137",
+    "exit status 143",
+    "exit status 137",
+    "exited with code 143",
+    "exited with code 137",
+    "exited with status 143",
+    "exited with status 137",
+    "sigterm",
+    "sigkill",
+    "stopped by signal",
+    "terminated by signal",
+)
+
+
+def _is_shutdown_signal_error(error_msg: str) -> bool:
+    """True when ``error_msg`` reflects a claude subprocess killed by a
+    service restart/shutdown signal (SIGTERM=143, SIGKILL=137).
+
+    Used to (1) treat the error as retryable and (2) replace the raw error text
+    with a friendly "restarted, please resend" notice rather than leaking the
+    exit code to the user.
+    """
+    low = error_msg.lower()
+    return any(pattern in low for pattern in _SHUTDOWN_SIGNAL_PATTERNS)
+
+
+# User-facing notice shown when an in-flight answer is interrupted by a bridge
+# restart, in place of the raw subprocess error string.
+RESTART_INTERRUPT_NOTICE = (
+    "⏳ The bridge restarted while answering, so the last reply was interrupted. "
+    "Please resend your message."
+)
+
+
 def _is_retryable_sdk_error(error: Exception) -> bool:
     """Check if the SDK error is transient and worth retrying.
 
@@ -84,6 +128,10 @@ def _is_retryable_sdk_error(error: Exception) -> bool:
     """
     error_type = type(error).__name__
     error_msg = str(error)
+
+    # A subprocess killed by a restart/shutdown signal is always worth retrying.
+    if _is_shutdown_signal_error(error_msg):
+        return True
 
     # Permanent errors that should NOT be retried
     NON_RETRYABLE_PATTERNS = [
@@ -666,11 +714,18 @@ class ProjectChatHandler:
                 log_chat(
                     req.user_id, req.requested_session_id, "error", err, success=False
                 )
+                # A bridge restart (systemd SIGTERM) kills the in-flight claude
+                # child with exit 143; don't surface that raw code — tell the user
+                # to resend instead of replying with "❌ Error: ... exit 143".
+                if _is_shutdown_signal_error(err):
+                    user_content = RESTART_INTERRUPT_NOTICE
+                else:
+                    user_content = f"❌ Error: {err}"
                 if not req.future.done():
                     try:
                         req.future.set_result(
                             ChatResponse(
-                                content=f"❌ Error: {err}",
+                                content=user_content,
                                 success=False,
                                 error=err,
                                 session_id=state.last_session_id,
@@ -849,14 +904,26 @@ class ProjectChatHandler:
                     retry_msg = str(retry_err)
                     health_reporter.record_claude_error(retry_msg)
                     return ChatResponse(
-                        content=f"❌ Error: {retry_msg}",
+                        content=(
+                            RESTART_INTERRUPT_NOTICE
+                            if _is_shutdown_signal_error(retry_msg)
+                            else f"❌ Error: {retry_msg}"
+                        ),
                         success=False,
                         error=retry_msg,
                     )
 
             logger.error(f"Error processing message: {e}", exc_info=True)
             health_reporter.record_claude_error(err)
-            return ChatResponse(content=f"❌ Error: {err}", success=False, error=err)
+            return ChatResponse(
+                content=(
+                    RESTART_INTERRUPT_NOTICE
+                    if _is_shutdown_signal_error(err)
+                    else f"❌ Error: {err}"
+                ),
+                success=False,
+                error=err,
+            )
 
         finally:
             self._active_tasks.pop(user_id, None)
