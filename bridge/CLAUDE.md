@@ -86,7 +86,7 @@ utils/chat_logger.py Per-session debug chat logging
 - **Revert flow**: `/revert` displays paginated message history (last 50 messages) via inline keyboard. User selects a message, then chooses from 5 modes: (1) Restore code and conversation, (2) Restore conversation only, (3) Restore code only, (4) Summarize from here, (5) Cancel. Revert truncates SDK JSONL file to selected message, clears active stream, cancels pending tasks, and resets session state. Callback data format: `revert:select:{index}`, `revert:page:{page}`, `revert:mode:{index}:{mode}`.
 - **Permission request UI**: When tools need to access paths outside PROJECT_ROOT, a standalone message with inline keyboard buttons is sent. Users can Allow (once), Deny, or Allow All (session-wide). Requests timeout after 60 seconds. The `/new` command clears the approve-all flag.
 - **Permission callback pattern**: Uses asyncio.Future to wait for user response. Callback data format: `perm:allow:{request_id}`, `perm:deny:{request_id}`, `perm:allow_all:{request_id}`. Futures are stored in `_pending_permission_futures` dict and resolved by callback handlers.
-- `AskUserQuestion` tool is degraded: converted to plain text with numbered options rendered as Telegram inline keyboard buttons.
+- `AskUserQuestion` tool is degraded: converted to plain text with numbered options. By default the user types their choice; set `CCC_TELEGRAM_OPTION_BUTTONS=true` to render the options as tappable Telegram inline keyboard buttons instead.
 - Responses with file paths matching media extensions are auto-sent as Telegram photos/documents.
 - Message queue per user: max 3 concurrent tasks with overflow rejection. Priority commands like `/stop` and `/revert` bypass this limit.
 - `start.sh` handles venv creation, dependency caching (MD5-based), log rotation (14 days), auto-restart with crash detection (>5 in 60s).
@@ -107,6 +107,7 @@ utils/chat_logger.py Per-session debug chat logging
 | `CCC_PARTIAL_STREAMING` | No | Token-level streaming, only when `CCC_TELEGRAM_STREAMING=true` (default: true). Set false for whole-block draft updates |
 | `CCC_TELEGRAM_LOOSE_SPACING` | No | Insert a blank line between list items for easier reading (default: true). Prose/tables/code untouched. Set false for compact output |
 | `CCC_TELEGRAM_MAX_BUBBLE_CHARS` | No | Max characters per Telegram message; long replies split into multiple bubbles at this size (default: 1200, clamped to [200, 4000]) |
+| `CCC_TELEGRAM_OPTION_BUTTONS` | No | Render multiple-choice questions as tappable inline buttons (default: **false**). Off = options shown as text, user types their choice |
 | `OPENAI_API_KEY` | Voice only | API key for Whisper transcription |
 | `OPENAI_BASE_URL` | No | Optional OpenAI-compatible Whisper API base URL |
 | `WHISPER_MODEL` | No | Whisper model name (default: `whisper-1`) |

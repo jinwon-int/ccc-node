@@ -281,6 +281,18 @@ class Config(BaseSettings):
             return 1200
         return max(200, min(n, 4000))
 
+    enable_option_buttons: bool = Field(
+        default=False,
+        alias="CCC_TELEGRAM_OPTION_BUTTONS",
+        description=(
+            "Render multiple-choice questions as tappable Telegram inline "
+            "keyboard buttons. Default OFF: the question and its numbered options "
+            "are shown as plain text and the user just types their choice. Set "
+            "CCC_TELEGRAM_OPTION_BUTTONS=true to bring back the tap-to-select "
+            "buttons."
+        ),
+    )
+
     enable_entity_renderer: bool = Field(
         default=True,
         alias="CCC_TELEGRAM_ENTITY_RENDERER",

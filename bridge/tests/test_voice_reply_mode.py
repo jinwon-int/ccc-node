@@ -425,5 +425,35 @@ class VoiceReplyModeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(kwargs["session_id"])
 
 
+class OptionButtonsTests(unittest.IsolatedAsyncioTestCase):
+    _CONTENT = "어떤 걸 원하세요?\n\n1. 첫째\n2. 둘째"
+
+    async def test_option_buttons_suppressed_by_default(self):
+        bot = TelegramBot()
+        bot._send_file_paths = AsyncMock()
+        message = SimpleNamespace(chat=SimpleNamespace(id=1), reply_text=AsyncMock())
+
+        # Stub config has no enable_option_buttons -> default off.
+        await bot._send_content_artifacts(message, self._CONTENT, force_options=True)
+
+        message.reply_text.assert_not_called()  # numbered options stay as text
+
+    async def test_option_buttons_shown_when_enabled(self):
+        bot = TelegramBot()
+        bot._send_file_paths = AsyncMock()
+        message = SimpleNamespace(chat=SimpleNamespace(id=1), reply_text=AsyncMock())
+
+        config_module.config.enable_option_buttons = True
+        try:
+            await bot._send_content_artifacts(
+                message, self._CONTENT, force_options=True
+            )
+        finally:
+            config_module.config.enable_option_buttons = False
+
+        message.reply_text.assert_called_once()
+        self.assertIn("reply_markup", message.reply_text.call_args.kwargs)
+
+
 if __name__ == "__main__":
     unittest.main()

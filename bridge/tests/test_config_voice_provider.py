@@ -254,6 +254,16 @@ class StreamingDefaultConfigTests(unittest.TestCase):
             module = self._load_with_env(td, CCC_TELEGRAM_STREAMING="true")
             self.assertTrue(module.config.enable_streaming)
 
+    def test_option_buttons_off_by_default(self):
+        with TemporaryDirectory() as td:
+            module = self._load_with_env(td)
+            self.assertFalse(module.config.enable_option_buttons)
+
+    def test_option_buttons_can_be_enabled(self):
+        with TemporaryDirectory() as td:
+            module = self._load_with_env(td, CCC_TELEGRAM_OPTION_BUTTONS="true")
+            self.assertTrue(module.config.enable_option_buttons)
+
 
 if __name__ == "__main__":
     unittest.main()
