@@ -74,6 +74,11 @@
             "type": "command",
             "command": "bash /root/.claude/hooks/distill.sh sessionend",
             "timeout": 10
+          },
+          {
+            "type": "command",
+            "command": "bash /root/.claude/hooks/skill-review.sh sessionend",
+            "timeout": 10
           }
         ]
       }
