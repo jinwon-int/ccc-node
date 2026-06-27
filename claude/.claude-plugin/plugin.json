@@ -9,6 +9,6 @@
   },
   "homepage": "https://github.com/jinwon-int/ccc-node",
   "repository": "https://github.com/jinwon-int/ccc-node",
-  "license": "UNLICENSED",
+  "license": "MIT",
   "keywords": ["harness", "enforcement", "guard", "observability", "a2a", "wiki"]
 }
