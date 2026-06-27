@@ -1,0 +1,7 @@
+# Optional voice-provider extras for the Telegram bridge.
+#
+# Only needed when VOICE_TRANSCRIPTION_PROVIDER=volcengine and you upload audio
+# through Volcengine TOS object storage. `tos` pulls in a native `crcmod` wheel,
+# so it is kept out of the core requirements.txt to avoid aborting the whole
+# install on toolchain-less hosts. The default Whisper voice path does not need it.
+tos

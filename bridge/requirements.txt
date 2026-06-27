@@ -7,4 +7,8 @@ claude-agent-sdk>=0.1.72
 opentelemetry-api>=1.41.0
 opentelemetry-sdk>=1.41.0
 openai>=1.0.0
-tos
+# Optional: the Volcengine TOS voice-upload provider needs the `tos` package,
+# which builds a native `crcmod` wheel and can fail on minimal toolchains. It is
+# intentionally NOT a core dependency so a missing/unbuildable `tos` cannot abort
+# the whole install (the TOS uploader imports it lazily). Install when you use the
+# volcengine voice provider: pip install -r requirements-voice.txt
