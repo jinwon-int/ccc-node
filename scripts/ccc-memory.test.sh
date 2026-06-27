@@ -105,8 +105,15 @@ printf 'Implement issue 186 memory roadmap with Honcho cache TTL\n' > "$query_st
 out="$(CCC_STATE_DIR="$query_state" CCC_MEMORY_QUERY_EXTRA='Authorization: Bearer QUERY_SECRET_SHOULD_NOT_LEAK' bash "$ROOT/scripts/ccc-memory-query.sh" --mode remote 2>&1)"; rc=$?
 ok "memory query helper builds redacted task-aware query" '[ "$rc" = 0 ] && grep -q "issue 186" <<<"$out" && grep -q "changed-memory-file.txt" <<<"$out" && ! grep -q "QUERY_SECRET_SHOULD_NOT_LEAK" <<<"$out"'
 
+printf 'Implement issue 186 memory roadmap with Honcho cache TTL and changed-memory-file context\n' > "$mem/MEMORY.md"
+out="$(CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" bash "$ROOT/scripts/ccc-memory-index.sh" rebuild 2>&1)"; rc=$?
+helper_query="$(CCC_STATE_DIR="$query_state" CCC_WORKTREE="$query_cwd" bash "$ROOT/scripts/ccc-memory-query.sh" --mode local)"
+out="$(CCC_STATE_DIR="$state" CCC_MEMORY_INDEX_DB="$state/memory-index.sqlite" bash "$ROOT/scripts/ccc-memory-search.sh" "$helper_query" 2>&1)"; rc=$?
+ok "memory search tolerates task-aware helper query punctuation" '[ "$rc" = 0 ] && jq -e "(.results | length) > 0 and (.tokens | index(\"honcho\") != null)" >/dev/null <<<"$out"'
+
 out="$(CCC_STATE_DIR="$TMP/golden-state" bash "$ROOT/scripts/ccc-memory-eval.sh" --golden 2>&1)"; rc=$?
 ok "memory eval golden-set reports precision recall mrr" '[ "$rc" = 0 ] && jq -e ".ok == true and .mode == \"golden\" and .metrics.precision_at_1 >= 0.5 and .metrics.recall_at_5 >= 0.5 and .metrics.mrr > 0 and .metrics.latency_p95_ms >= .metrics.latency_p50_ms" >/dev/null <<<"$out"'
+
 
 printf '%s\n' '{"source":"wiki","status":"ok","refreshed_at":"2000-01-01T00:00:00Z","duration_ms":1,"bytes":10,"error":"","query_hash":"abc","stale":false,"max_age_sec":1}' > "$cache/wiki.meta.json"
 out="$(CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CCC_WIKI_CACHE_MAX_AGE_SEC=1 bash "$ROOT/scripts/ccc-memory-check.sh" --json 2>&1)"; rc=$?
