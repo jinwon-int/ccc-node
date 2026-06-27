@@ -24,9 +24,11 @@ to Telegram, with all secrets and node-local state stripped out and replaced by 
   out-of-band (single-flight via `flock`, fail-open), records per-source cache metadata,
   and opportunistically updates the local SQLite FTS5 hot-memory index.
 - **Local memory diagnostics/eval** — `scripts/ccc-memory-check.sh`,
-  `scripts/ccc-memory-index.sh`, `scripts/ccc-memory-search.sh`, and
-  `scripts/ccc-memory-eval.sh` provide cache health, SQLite FTS5 indexing/search, and
-  no-network latency/recall smoke tests for `CCC_MEMORY_PROFILE=hybrid|max-perf`.
+  `scripts/ccc-memory-index.sh`, `scripts/ccc-memory-search.sh`,
+  `scripts/ccc-memory-query.sh`, `scripts/ccc-wiki-triage.sh`, and
+  `scripts/ccc-memory-eval.sh` provide cache health, task-aware query construction,
+  SQLite FTS5 indexing/search with docs-only fallback, human-gated Wiki candidate triage,
+  and no-network smoke/golden-set quality tests for `CCC_MEMORY_PROFILE=hybrid|max-perf`.
 - **Harness settings** — `settings.json` (permissions + hook wiring) and `settings.local.json`.
 - **CLAUDE.md template** — the operating-policy skeleton (Wiki-first, A2A/Nexus, GitHub
   hygiene, fresh-approval rules) with node/user identity as `<PLACEHOLDERS>`.
@@ -174,7 +176,9 @@ scripts/
   ccc-memory-check.sh          # read-only Wiki/Honcho/local-index cache health snapshot
   ccc-memory-index.sh          # build/update SQLite FTS5 local hot-memory index
   ccc-memory-search.sh         # query local hot-memory index as JSON
-  ccc-memory-eval.sh           # no-network latency/recall smoke harness
+  ccc-memory-query.sh          # build redacted task-aware local/remote memory queries
+  ccc-memory-eval.sh           # no-network smoke + golden-set memory quality harness
+  ccc-wiki-triage.sh           # local human-gated Wiki candidate review/marking
   validate-harness.sh          # CI harness validation, including forbidden context-file guard
 setup.sh                   # idempotent bootstrap (won't overwrite existing real files)
 .gitignore                 # blocks credentials, live memory, caches, sessions
@@ -220,6 +224,9 @@ behavior:
 | `CCC_STATE_DIR` | `$CCC_CLAUDE_DIR/state` | Node state plus local `memory-index.sqlite` |
 | `CCC_HONCHO_MEMORY_ENABLED` | `1` | Set `0`/`false`/`off` to remove Honcho from the read path while keeping local/Wiki memory |
 | `CCC_MEMORY_MAX_BYTES` | `12000` | Total SessionStart memory injection byte budget |
+| `CCC_MEMORY_QUERY_MAX_BYTES` | mode-specific | Max task-aware query bytes; remote defaults lower than local |
+| `CCC_WIKI_CACHE_MAX_AGE_SEC` / `CCC_HONCHO_CACHE_MAX_AGE_SEC` | `CCC_MEMORY_CACHE_TTL_SEC` | Per-source stale-warning thresholds |
+| `CCC_MEMORY_EVAL_MODE=golden` or `ccc-memory-eval.sh --golden` | off | Run deterministic no-network precision/recall/MRR/p50/p95 memory quality benchmark |
 
 Example non-root preview:
 

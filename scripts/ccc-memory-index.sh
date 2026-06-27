@@ -30,6 +30,8 @@ state = Path(state_dir)
 mem = Path(memory_dir)
 cache = Path(cache_dir)
 index_distill_enabled = index_distill.lower() in {"1", "true", "yes", "on"}
+disable_fts5 = os.environ.get("CCC_MEMORY_DISABLE_FTS5", "").lower() in {"1", "true", "yes", "on"}
+fts5_enabled = False
 
 SECRET_NAMES = (
     "TOKEN", "SECRET", "PASSWORD", "PASSWD", "API_KEY", "APIKEY",
@@ -159,10 +161,18 @@ try:
     con.execute("PRAGMA journal_mode=DELETE")
     con.execute("PRAGMA secure_delete=ON")
     con.execute("CREATE TABLE IF NOT EXISTS memory_docs (source TEXT NOT NULL, path TEXT PRIMARY KEY, content TEXT NOT NULL, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)")
-    con.execute("CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(path UNINDEXED, source UNINDEXED, content)")
+    if disable_fts5:
+        con.execute("DROP TABLE IF EXISTS memory_fts")
+    else:
+        try:
+            con.execute("CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(path UNINDEXED, source UNINDEXED, content)")
+            fts5_enabled = True
+        except sqlite3.OperationalError:
+            fts5_enabled = False
     if cmd == "rebuild":
         con.execute("DELETE FROM memory_docs")
-        con.execute("DELETE FROM memory_fts")
+        if fts5_enabled:
+            con.execute("DELETE FROM memory_fts")
     if cmd in ("update", "rebuild"):
         seen = set()
         for source, path, content in docs():
@@ -180,8 +190,9 @@ try:
             )
         else:
             con.execute("DELETE FROM memory_docs")
-        con.execute("DELETE FROM memory_fts")
-        con.execute("INSERT INTO memory_fts(path,source,content) SELECT path,source,content FROM memory_docs")
+        if fts5_enabled:
+            con.execute("DELETE FROM memory_fts")
+            con.execute("INSERT INTO memory_fts(path,source,content) SELECT path,source,content FROM memory_docs")
         con.commit()
         # Compact after update/rebuild so replaced/deleted plaintext from older
         # index versions is not left in SQLite free pages.
@@ -191,5 +202,5 @@ finally:
     con.close()
     secure_db_files(db)
 
-print(json.dumps({"ok": True, "db": str(db), "documents": count, "distill_indexed": index_distill_enabled}, ensure_ascii=False))
+print(json.dumps({"ok": True, "db": str(db), "documents": count, "distill_indexed": index_distill_enabled, "fts5_enabled": fts5_enabled}, ensure_ascii=False))
 PY

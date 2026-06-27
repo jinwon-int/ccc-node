@@ -23,7 +23,7 @@ MAX_HONCHO="${CCC_HONCHO_MAX_BYTES:-4000}"
 MAX_LOCAL="${CCC_LOCAL_MEMORY_MAX_BYTES:-3000}"
 HONCHO_ENABLED="${CCC_HONCHO_MEMORY_ENABLED:-1}"
 LOCAL_ENABLED="${CCC_LOCAL_MEMORY_ENABLED:-}"
-QUERY="${CCC_MEMORY_QUERY:-$(cat "$STATE_DIR/current-task.txt" 2>/dev/null || printf 'current task')}"
+QUERY="${CCC_MEMORY_QUERY:-}"
 
 is_truthy() { case "${1:-}" in 1|true|TRUE|yes|YES|on|ON) return 0;; *) return 1;; esac; }
 is_disabled() { case "${1:-}" in 0|false|FALSE|off|OFF|no|NO) return 0;; *) return 1;; esac; }
@@ -60,6 +60,17 @@ find_memory_tool() { # <tool-name>
   done
   return 1
 }
+
+build_memory_query() {
+  if [ -n "${QUERY:-}" ]; then printf '%s' "$QUERY"; return 0; fi
+  local query_tool
+  query_tool="$(find_memory_tool ccc-memory-query.sh 2>/dev/null || true)"
+  if [ -n "$query_tool" ]; then
+    CCC_WORKTREE="${CCC_WORKTREE:-$(pwd 2>/dev/null || true)}" "$query_tool" --mode local 2>/dev/null && return 0
+  fi
+  cat "$STATE_DIR/current-task.txt" 2>/dev/null || printf 'current task'
+}
+QUERY="$(build_memory_query)"
 
 age_seconds() { # <file>
   local f="$1" now ts
