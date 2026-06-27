@@ -394,7 +394,7 @@ class VoiceReplyModeTests(unittest.IsolatedAsyncioTestCase):
         kwargs = process_mock.await_args.kwargs
         self.assertTrue(kwargs["new_session"])
         self.assertIsNone(kwargs["session_id"])
-        session = await session_module.session_manager.get_session(44)
+        session = await session_module.session_manager.get_session(bot._conversation_key(44, 1001))
         self.assertIn("last_user_message_at", session)
 
     async def test_expired_voice_message_starts_new_session_automatically(self):

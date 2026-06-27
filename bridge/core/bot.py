@@ -110,13 +110,13 @@ class TelegramBot:
         # ccc-node owner-only push notifier (disabled unless config.push_enabled).
         self._push_notifier = PushNotifier()
         # Only sessions created/resumed in current runtime are auto-resumed.
-        self._runtime_active_sessions: set[int] = set()
-        self._runtime_active_voice_sessions: set[int] = set()
-        self._user_run_tasks: Dict[int, set[asyncio.Task]] = {}
-        self._user_voice_tasks: Dict[int, set[asyncio.Task]] = {}
-        self._user_queue_locks: Dict[int, asyncio.Lock] = {}
+        self._runtime_active_sessions: set[Any] = set()
+        self._runtime_active_voice_sessions: set[Any] = set()
+        self._user_run_tasks: Dict[Any, set[asyncio.Task]] = {}
+        self._user_voice_tasks: Dict[Any, set[asyncio.Task]] = {}
+        self._user_queue_locks: Dict[Any, asyncio.Lock] = {}
         # Track currently executing task per user for priority stop command
-        self._active_tasks: Dict[int, asyncio.Task] = {}
+        self._active_tasks: Dict[Any, asyncio.Task] = {}
         self._audio_dir = config.bot_data_dir / "audio"
         self._image_dir = config.bot_data_dir / "images"
         self._audio_processor = AudioProcessor(ffmpeg_path=config.ffmpeg_path)
@@ -663,17 +663,19 @@ class TelegramBot:
                     outside.append(path_str)
         return outside
 
-    async def _consume_outside_approval_once(self, user_id: int) -> bool:
-        session = await session_manager.get_session(user_id)
+    async def _consume_outside_approval_once(self, user_id: int, chat_id: Optional[int] = None) -> bool:
+        session_key = self._conversation_key(user_id, chat_id)
+        session = await session_manager.get_session(session_key)
         if not session.get("outside_path_approved_once"):
             return False
         session["outside_path_approved_once"] = False
         session.pop("pending_outside_paths", None)
-        await session_manager.update_session(user_id, session)
+        await session_manager.update_session(session_key, session)
         return True
 
-    async def _maybe_capture_outside_approval(self, user_id: int, text: str) -> None:
-        session = await session_manager.get_session(user_id)
+    async def _maybe_capture_outside_approval(self, user_id: int, text: str, chat_id: Optional[int] = None) -> None:
+        session_key = self._conversation_key(user_id, chat_id)
+        session = await session_manager.get_session(session_key)
         pending = session.get("pending_outside_paths")
         if not pending:
             return
@@ -695,11 +697,11 @@ class TelegramBot:
         if allow:
             session["outside_path_approved_once"] = True
             session.pop("pending_outside_paths", None)
-            await session_manager.update_session(user_id, session)
+            await session_manager.update_session(session_key, session)
         elif deny:
             session["outside_path_approved_once"] = False
             session.pop("pending_outside_paths", None)
-            await session_manager.update_session(user_id, session)
+            await session_manager.update_session(session_key, session)
 
     async def _permission_callback(
         self, chat_id: int, user_id: int, tool_name: str, tool_input: Any
@@ -731,12 +733,13 @@ class TelegramBot:
 
         outside_paths = self._extract_outside_paths(tool_name, tool_input)
         if outside_paths:
-            if await self._consume_outside_approval_once(user_id):
+            session_key = self._conversation_key(user_id, chat_id)
+            if await self._consume_outside_approval_once(user_id, chat_id):
                 return PermissionResultAllow()
 
-            session = await session_manager.get_session(user_id)
+            session = await session_manager.get_session(session_key)
             session["pending_outside_paths"] = outside_paths[:5]
-            await session_manager.update_session(user_id, session)
+            await session_manager.update_session(session_key, session)
 
             preview = "\n".join(f"- {path}" for path in outside_paths[:5])
             return PermissionResultDeny(
@@ -751,21 +754,33 @@ class TelegramBot:
 
         return PermissionResultAllow()
 
-    async def _save_session_id(self, user_id: int, response: ChatResponse):
-        if response.session_id:
-            session = await session_manager.get_session(user_id)
-            session["session_id"] = response.session_id
-            await session_manager.update_session(user_id, session)
-            self._runtime_active_sessions.add(user_id)
+    @staticmethod
+    def _conversation_key(user_id: int, chat_id: Optional[int] = None) -> Any:
+        """Storage/queue key for one Telegram conversation.
 
-    def _effective_session_id(self, user_id: int, session: dict) -> Optional[str]:
+        Private chats and groups can contain the same Telegram user. Session and
+        queue state must therefore include chat_id; otherwise answers/session IDs
+        can bleed between DM and group conversations.
+        """
+        if chat_id is None or chat_id == user_id:
+            return user_id
+        return f"{user_id}:{chat_id}"
+
+    async def _save_session_id(self, session_key: Any, response: ChatResponse):
+        if response.session_id:
+            session = await session_manager.get_session(session_key)
+            session["session_id"] = response.session_id
+            await session_manager.update_session(session_key, session)
+            self._runtime_active_sessions.add(session_key)
+
+    def _effective_session_id(self, session_key: Any, session: dict) -> Optional[str]:
         """Prevent cross-process auto-resume from persisted session data."""
         session_id = session.get("session_id")
         if not session_id:
             return None
-        if user_id not in self._runtime_active_sessions:
+        if session_key not in self._runtime_active_sessions:
             logger.info(
-                f"Ignoring persisted session_id for user {user_id} (not active in current runtime)"
+                f"Ignoring persisted session_id for conversation {session_key} (not active in current runtime)"
             )
             return None
         return session_id
@@ -888,7 +903,7 @@ class TelegramBot:
             permission_callback=self._permission_callback,
             typing_callback=lambda: message.chat.send_action(action="typing"),
         )
-        await self._save_session_id(user_id, response)
+        await self._save_session_id(self._conversation_key(user_id, chat.id), response)
         # PATCH 2026-05-04: use _reply_smart to auto-split >4096 char responses
         # (Telegram message size limit). Capo's 23TM project has 31+ skills,
         # full /skills listing exceeds limit → "Message is too long" error.
@@ -900,6 +915,8 @@ class TelegramBot:
             return
         user_id = self._require_user(update).id
         message = self._require_message(update)
+        chat = self._require_chat(update)
+        conversation_key = self._conversation_key(user_id, chat.id)
         log_debug(user_id, "command", "/new")
 
         cancelled_voice = await self._cancel_user_voice_tasks(user_id)
@@ -910,10 +927,10 @@ class TelegramBot:
                 user_id,
             )
 
-        # Cancel any ongoing streaming
-        await self._cancel_user_streaming(user_id)
+        # Cancel any ongoing streaming in this Telegram conversation
+        await self._cancel_user_streaming(user_id, chat.id)
 
-        session = await session_manager.get_session(user_id)
+        session = await session_manager.get_session(conversation_key)
         session["session_id"] = None
         session["new_session"] = True
 
@@ -937,8 +954,8 @@ class TelegramBot:
                 f"Auto-synced model: {old_model} -> {settings_model} (effective: {effective})",
             )
 
-        await session_manager.update_session(user_id, session)
-        self._runtime_active_sessions.discard(user_id)
+        await session_manager.update_session(conversation_key, session)
+        self._runtime_active_sessions.discard(conversation_key)
         reply = "🆕 Switched to new session mode. Your next message will start a new Claude Code session."
         await message.reply_text(reply)
         log_debug(user_id, "bot", reply)
@@ -1047,6 +1064,8 @@ class TelegramBot:
             return
         user_id = self._require_user(update).id
         message = self._require_message(update)
+        chat = self._require_chat(update)
+        conversation_key = self._conversation_key(user_id, chat.id)
         log_debug(user_id, "command", "/stop")
 
         cancelled_voice = await self._cancel_user_voice_tasks(user_id)
@@ -1057,11 +1076,11 @@ class TelegramBot:
                 user_id,
             )
 
-        # Cancel any ongoing streaming
-        await self._cancel_user_streaming(user_id)
+        # Cancel any ongoing streaming in this Telegram conversation
+        await self._cancel_user_streaming(user_id, chat.id)
 
         # Cancel the currently executing task (priority stop)
-        active_task = self._active_tasks.get(user_id)
+        active_task = self._active_tasks.get(conversation_key) or self._active_tasks.get(user_id)
         task_cancelled = False
         if active_task and not active_task.done():
             active_task.cancel()
@@ -1071,8 +1090,12 @@ class TelegramBot:
                 user_id,
             )
 
-        killed = await project_chat_handler.stop(user_id)
-        cleared = self._clear_user_queue(user_id)
+        try:
+            killed = await project_chat_handler.stop(user_id, chat_id=chat.id)
+        except TypeError:
+            # Some tests/older adapters expose stop(user_id) only.
+            killed = await project_chat_handler.stop(user_id)
+        cleared = self._clear_user_queue(conversation_key)
 
         # Build response message - simple and friendly
         if task_cancelled or killed or cleared:
@@ -1462,10 +1485,10 @@ class TelegramBot:
             except Exception:
                 pass
 
-    async def _cancel_user_streaming(self, user_id: int) -> bool:
-        """Cancel streaming for a user"""
+    async def _cancel_user_streaming(self, user_id: int, chat_id: Optional[int] = None) -> bool:
+        """Cancel streaming for a user/conversation"""
         try:
-            return await project_chat_handler.cancel_user_streaming(user_id)
+            return await project_chat_handler.cancel_user_streaming(user_id, chat_id)
         except Exception as e:
             logger.error(f"Failed to cancel streaming for user {user_id}: {e}")
             return False
@@ -1620,10 +1643,11 @@ class TelegramBot:
             log_debug(user_id, "bot", reply)
             return
 
+        conversation_key = self._conversation_key(user_id, chat.id)
         slash_cmd = "/" + parts[1]
 
         async def run_task():
-            session = await session_manager.get_session(user_id)
+            session = await session_manager.get_session(conversation_key)
             try:
                 await message.chat.send_action(action="typing")
             except Exception:
@@ -1632,13 +1656,13 @@ class TelegramBot:
                 user_message=slash_cmd,
                 user_id=user_id,
                 chat_id=chat.id,
-                session_id=self._effective_session_id(user_id, session),
+                session_id=self._effective_session_id(conversation_key, session),
                 model=session.get("model"),
                 permission_callback=self._permission_callback,
                 typing_callback=lambda: message.chat.send_action(action="typing"),
                 bot=app.bot,
             )
-            await self._save_session_id(user_id, response)
+            await self._save_session_id(conversation_key, response)
             await self._reply_smart(
                 message,
                 response.content,
@@ -1652,7 +1676,7 @@ class TelegramBot:
             await message.reply_text(reply)
             log_debug(user_id, "bot", reply)
 
-        await self._enqueue_user_task(user_id, run_task, on_overflow)
+        await self._enqueue_user_task(conversation_key, run_task, on_overflow)
 
     async def _exec_slash_command(self, update: Update, slash_cmd: str):
         """Execute a slash command via Claude Code CLI and reply."""
@@ -1660,22 +1684,23 @@ class TelegramBot:
         user_id = self._require_user(update).id
         chat = self._require_chat(update)
         app = self._require_application()
+        conversation_key = self._conversation_key(user_id, chat.id)
 
         async def run_task():
-            session = await session_manager.get_session(user_id)
+            session = await session_manager.get_session(conversation_key)
             await message.chat.send_action(action="typing")
             try:
                 response = await project_chat_handler.process_message(
                     user_message=slash_cmd,
                     user_id=user_id,
                     chat_id=chat.id,
-                    session_id=self._effective_session_id(user_id, session),
+                    session_id=self._effective_session_id(conversation_key, session),
                     model=session.get("model"),
                     permission_callback=self._permission_callback,
                     typing_callback=lambda: message.chat.send_action(action="typing"),
                     bot=app.bot,
                 )
-                await self._save_session_id(user_id, response)
+                await self._save_session_id(conversation_key, response)
                 await self._reply_smart(
                     message,
                     response.content,
@@ -1692,7 +1717,7 @@ class TelegramBot:
             await message.reply_text(reply)
             log_debug(user_id, "bot", reply)
 
-        await self._enqueue_user_task(user_id, run_task, on_overflow)
+        await self._enqueue_user_task(conversation_key, run_task, on_overflow)
 
     async def _cmd_skill(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /skill xxx [args] - forward as Claude Code slash command (/xxx [args])"""
@@ -2154,7 +2179,20 @@ class TelegramBot:
         message = self._require_message(update)
         chat = self._require_chat(update)
         app = self._require_application()
-        current_session = await session_manager.get_session(user_id)
+        conversation_key = self._conversation_key(user_id, chat.id)
+        current_session = await session_manager.get_session(conversation_key)
+        if conversation_key != user_id:
+            # One-time compatibility migration: older bridge versions stored all
+            # Telegram chat state under bare user_id. If the scoped session only
+            # has defaults, seed it from legacy state, then keep future updates
+            # chat-scoped.
+            legacy_session = await session_manager.get_session(user_id)
+            scoped_is_default = set(current_session.keys()).issubset({"reply_mode"})
+            if legacy_session and scoped_is_default and legacy_session != current_session:
+                current_session = dict(legacy_session)
+                await session_manager.update_session(conversation_key, current_session)
+                if user_id in self._runtime_active_sessions:
+                    self._runtime_active_sessions.add(conversation_key)
         current_reply_mode = self._normalize_reply_mode(
             current_session.get("reply_mode")
         )
@@ -2167,7 +2205,7 @@ class TelegramBot:
         if current_reply_mode != next_reply_mode:
             current_session["reply_mode"] = next_reply_mode
             await session_manager.update_session(
-                user_id, {"reply_mode": next_reply_mode}
+                conversation_key, {"reply_mode": next_reply_mode}
             )
         else:
             current_session["reply_mode"] = current_reply_mode
@@ -2179,16 +2217,16 @@ class TelegramBot:
         try:
             new_session = current_session.pop("new_session", False)
             auto_new_session = await session_manager.should_start_new_session(
-                user_id, now=message_timestamp
+                conversation_key, now=message_timestamp
             )
             if auto_new_session:
                 current_session["session_id"] = None
-                self._runtime_active_sessions.discard(user_id)
+                self._runtime_active_sessions.discard(conversation_key)
                 new_session = True
             if new_session:
-                await session_manager.update_session(user_id, current_session)
+                await session_manager.update_session(conversation_key, current_session)
 
-            await session_manager.set_last_user_message_at(user_id, message_timestamp)
+            await session_manager.set_last_user_message_at(conversation_key, message_timestamp)
 
             enable_streaming_text = next_reply_mode != "voice"
             response = await project_chat_handler.process_message(
@@ -2196,14 +2234,14 @@ class TelegramBot:
                 user_id=user_id,
                 chat_id=chat.id,
                 message_id=message.message_id,
-                session_id=self._effective_session_id(user_id, current_session),
+                session_id=self._effective_session_id(conversation_key, current_session),
                 model=current_session.get("model"),
                 new_session=new_session,
                 permission_callback=self._permission_callback,
                 typing_callback=lambda: message.chat.send_action(action="typing"),
                 bot=app.bot if enable_streaming_text else None,
             )
-            await self._save_session_id(user_id, response)
+            await self._save_session_id(conversation_key, response)
             await self._send_reply_by_mode(
                 message=message,
                 user_id=user_id,
@@ -2591,8 +2629,10 @@ class TelegramBot:
             return
 
         user_id = self._require_user(update).id
+        chat = self._require_chat(update)
+        conversation_key = self._conversation_key(user_id, chat.id)
         text = message.text
-        session = await session_manager.get_session(user_id)
+        session = await session_manager.get_session(conversation_key)
 
         # Check resume selection (user replies with a number)
         resume_list = session.get("resume_list")
@@ -2604,8 +2644,8 @@ class TelegramBot:
                 session["session_id"] = sid
                 session["new_session"] = False
                 session.pop("resume_list", None)
-                await session_manager.update_session(user_id, session)
-                self._runtime_active_sessions.add(user_id)
+                await session_manager.update_session(conversation_key, session)
+                self._runtime_active_sessions.add(conversation_key)
                 reply = f"✅ Switched to session: {msg}"
                 await message.reply_text(reply)
                 log_debug(user_id, "bot", reply)
@@ -2625,16 +2665,16 @@ class TelegramBot:
         # Clear resume list if user sends non-number
         if resume_list:
             session.pop("resume_list", None)
-            await session_manager.update_session(user_id, session)
+            await session_manager.update_session(conversation_key, session)
 
         # Capture explicit outside-path approval/denial from user replies.
-        await self._maybe_capture_outside_approval(user_id, text)
+        await self._maybe_capture_outside_approval(user_id, text, chat.id)
 
         # Check if there's a pending question
-        pending = await session_manager.get_pending_question(user_id)
+        pending = await session_manager.get_pending_question(conversation_key)
         if pending:
             log_debug(user_id, "user", f"[answer] {text}")
-            await session_manager.clear_pending_question(user_id)
+            await session_manager.clear_pending_question(conversation_key)
             reply = f"✅ Answer received: {text}\n\nContinuing..."
             await message.reply_text(reply)
             log_debug(user_id, "bot", reply)
@@ -2648,8 +2688,7 @@ class TelegramBot:
             await message.reply_text(reply)
             log_debug(user_id, "bot", reply)
 
-        await self._enqueue_user_task(user_id, run_task, on_overflow)
-
+        await self._enqueue_user_task(conversation_key, run_task, on_overflow)
     # Match both absolute (/foo/bar.png) and relative (foo/bar.png) file paths
     _FILE_PATH_RE = re.compile(
         r"(/?(?:[\w.@-]+/)+[\w.@-]+\.(?:png|jpg|jpeg|gif|webp|mp4|mp3|pdf|zip))",

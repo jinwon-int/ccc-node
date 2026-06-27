@@ -299,15 +299,24 @@ class ProjectChatHandler:
     def __init__(self):
         self.project_root = PROJECT_ROOT
         self._active_tasks: Dict[int, asyncio.Task] = {}
-        self._streams: Dict[int, _UserStreamState] = {}
-        self._stream_init_locks: Dict[int, asyncio.Lock] = {}
+        # Streams are scoped by Telegram conversation, not only user. A single
+        # Telegram user may talk to the bridge in a private DM and a group at the
+        # same time; sharing one Claude stream made pending ResultMessages race
+        # and could swap answers between chats.
+        self._streams: Dict[Tuple[int, int], _UserStreamState] = {}
+        self._stream_init_locks: Dict[Tuple[int, int], asyncio.Lock] = {}
         logger.info(f"ProjectChatHandler initialized for {self.project_root}")
 
-    def _get_stream_init_lock(self, user_id: int) -> asyncio.Lock:
-        lock = self._stream_init_locks.get(user_id)
+    @staticmethod
+    def _stream_key(user_id: int, chat_id: int) -> Tuple[int, int]:
+        return (user_id, chat_id)
+
+    def _get_stream_init_lock(self, user_id: int, chat_id: int) -> asyncio.Lock:
+        key = self._stream_key(user_id, chat_id)
+        lock = self._stream_init_locks.get(key)
         if lock is None:
             lock = asyncio.Lock()
-            self._stream_init_locks[user_id] = lock
+            self._stream_init_locks[key] = lock
         return lock
 
     async def _create_user_stream(
@@ -423,12 +432,13 @@ class ProjectChatHandler:
         )
         return state
 
-    async def _disconnect_user_stream(
-        self, user_id: int, cancel_message: Optional[str] = None
+    async def _disconnect_stream_state(
+        self, key: Any, state: _UserStreamState, cancel_message: Optional[str] = None
     ) -> bool:
-        state = self._streams.pop(user_id, None)
-        if not state:
-            return False
+        if isinstance(key, tuple):
+            user_id, chat_id = key
+        else:
+            user_id, chat_id = key, "*"
 
         # Cancel typing keepalive task
         if state.typing_task and not state.typing_task.done():
@@ -438,7 +448,7 @@ class ProjectChatHandler:
             except (asyncio.TimeoutError, asyncio.CancelledError):
                 pass
             except Exception as e:
-                logger.error(f"Error cancelling typing task for user {user_id}: {e}")
+                logger.error(f"Error cancelling typing task for user {user_id} chat {chat_id}: {e}")
 
         # Cancel reader task first
         if state.reader_task and not state.reader_task.done():
@@ -447,12 +457,12 @@ class ProjectChatHandler:
                 await asyncio.wait_for(state.reader_task, timeout=2.0)
             except asyncio.TimeoutError:
                 logger.warning(
-                    f"Reader task for user {user_id} did not complete within timeout"
+                    f"Reader task for user {user_id} chat {chat_id} did not complete within timeout"
                 )
             except asyncio.CancelledError:
                 pass
             except Exception as e:
-                logger.error(f"Error cancelling reader task for user {user_id}: {e}")
+                logger.error(f"Error cancelling reader task for user {user_id} chat {chat_id}: {e}")
 
         # Fail all pending requests
         msg = cancel_message or "🛑 Task has been terminated."
@@ -475,34 +485,57 @@ class ProjectChatHandler:
         try:
             await asyncio.wait_for(state.client.disconnect(), timeout=3.0)
         except asyncio.TimeoutError:
-            logger.warning(f"Client disconnect for user {user_id} timed out")
+            logger.warning(f"Client disconnect for user {user_id} chat {chat_id} timed out")
         except Exception as e:
-            logger.error(f"Error disconnecting client for user {user_id}: {e}")
+            logger.error(f"Error disconnecting client for user {user_id} chat {chat_id}: {e}")
 
         return True
 
+    async def _disconnect_user_stream(
+        self, user_id: int, chat_id: Optional[int] = None, cancel_message: Optional[str] = None
+    ) -> bool:
+        if chat_id is not None:
+            key = self._stream_key(user_id, chat_id)
+            state = self._streams.pop(key, None)
+            if not state:
+                return False
+            return await self._disconnect_stream_state(key, state, cancel_message)
+
+        matched = [
+            (key, state)
+            for key, state in list(self._streams.items())
+            if (key[0] if isinstance(key, tuple) else key) == user_id
+        ]
+        if not matched:
+            return False
+        for key, state in matched:
+            self._streams.pop(key, None)
+            await self._disconnect_stream_state(key, state, cancel_message)
+        return True
+
     async def _get_or_create_stream(
-        self, user_id: int, model: Optional[str], new_session: bool
+        self, user_id: int, chat_id: int, model: Optional[str], new_session: bool
     ) -> _UserStreamState:
-        lock = self._get_stream_init_lock(user_id)
+        key = self._stream_key(user_id, chat_id)
+        lock = self._get_stream_init_lock(user_id, chat_id)
         async with lock:
-            state = self._streams.get(user_id)
+            state = self._streams.get(key)
 
             # Detect stale stream: reader task ended (e.g. after system sleep/wake)
             if state and state.reader_task is not None and state.reader_task.done():
                 logger.warning(
-                    f"Stale stream detected for user {user_id} (reader task exited), recreating"
+                    f"Stale stream detected for user {user_id} chat {chat_id} (reader task exited), recreating"
                 )
-                await self._disconnect_user_stream(user_id)
+                await self._disconnect_user_stream(user_id, chat_id)
                 state = None
 
             if state and (new_session or state.model != model):
-                await self._disconnect_user_stream(user_id)
+                await self._disconnect_user_stream(user_id, chat_id)
                 state = None
 
             if not state:
                 state = await self._create_user_stream(user_id, model)
-                self._streams[user_id] = state
+                self._streams[key] = state
             return state
 
     async def _typing_keepalive_loop(
@@ -695,8 +728,11 @@ class ProjectChatHandler:
             # Cancel typing keepalive to prevent orphan task
             if state.typing_task and not state.typing_task.done():
                 state.typing_task.cancel()
-            # Remove broken stream so the next request creates a fresh connection
-            self._streams.pop(user_id, None)
+            # Remove broken stream(s) by state identity so only the affected
+            # conversation is recreated on the next request.
+            for key, stream_state in list(self._streams.items()):
+                if stream_state is state:
+                    self._streams.pop(key, None)
             # Safely handle pending requests
             pending_copy = list(state.pending)
             state.pending.clear()
@@ -780,7 +816,7 @@ class ProjectChatHandler:
         state: Optional[_UserStreamState] = None
 
         try:
-            state = await self._get_or_create_stream(user_id, model, new_session)
+            state = await self._get_or_create_stream(user_id, chat_id, model, new_session)
             async with state.send_lock:
                 request.sent_session_id = (
                     session_id or state.last_session_id or "default"
@@ -848,7 +884,7 @@ class ProjectChatHandler:
                     err,
                 )
                 logger.info(f"Disconnecting stream for user {user_id} before retry...")
-                await self._disconnect_user_stream(user_id)
+                await self._disconnect_user_stream(user_id, chat_id)
                 logger.info(
                     f"Stream disconnected for user {user_id}, creating retry request..."
                 )
@@ -872,7 +908,7 @@ class ProjectChatHandler:
                 retry_state: Optional[_UserStreamState] = None
                 try:
                     retry_state = await self._get_or_create_stream(
-                        user_id, model, new_session=False
+                        user_id, chat_id, model, new_session=False
                     )
                     async with retry_state.send_lock:
                         retry_request.sent_session_id = (
@@ -928,40 +964,50 @@ class ProjectChatHandler:
         finally:
             self._active_tasks.pop(user_id, None)
 
-    async def stop(self, user_id: int) -> bool:
-        """Stop active stream for a user and fail all pending requests."""
+    async def stop(self, user_id: int, chat_id: Optional[int] = None) -> bool:
+        """Stop active stream(s) for a user and fail pending requests."""
         return await self._disconnect_user_stream(
-            user_id, cancel_message="🛑 Task has been terminated."
+            user_id, chat_id=chat_id, cancel_message="🛑 Task has been terminated."
         )
 
-    async def cancel_user_streaming(self, user_id: int) -> bool:
-        """Cancel streaming for a user by calling cancel() on all pending streaming handlers."""
-        state = self._streams.get(user_id)
-        if not state or not state.pending:
+    def _states_for_user(self, user_id: int, chat_id: Optional[int] = None) -> List[_UserStreamState]:
+        if chat_id is not None:
+            state = self._streams.get(self._stream_key(user_id, chat_id))
+            return [state] if state else []
+        return [
+            state
+            for key, state in self._streams.items()
+            if (key[0] if isinstance(key, tuple) else key) == user_id
+        ]
+
+    async def cancel_user_streaming(self, user_id: int, chat_id: Optional[int] = None) -> bool:
+        """Cancel streaming drafts for one Telegram conversation, or all user conversations."""
+        states = self._states_for_user(user_id, chat_id)
+        if not states:
             return False
 
         cancelled = False
-        for req in state.pending:
-            if req.streaming_handler:
-                try:
-                    await req.streaming_handler.cancel()
-                    cancelled = True
-                except Exception as e:
-                    logger.error(f"Failed to cancel streaming for user {user_id}: {e}")
+        for state in states:
+            if not state.pending:
+                continue
+            for req in state.pending:
+                if req.streaming_handler:
+                    try:
+                        await req.streaming_handler.cancel()
+                        cancelled = True
+                    except Exception as e:
+                        logger.error(f"Failed to cancel streaming for user {user_id}: {e}")
 
         return cancelled
 
-    def inflight_count(self, user_id: int) -> int:
-        state = self._streams.get(user_id)
-        if not state:
-            return 0
-        return len(state.pending)
+    def inflight_count(self, user_id: int, chat_id: Optional[int] = None) -> int:
+        return sum(len(state.pending) for state in self._states_for_user(user_id, chat_id))
 
-    def is_user_busy(self, user_id: int) -> bool:
-        return self.inflight_count(user_id) > 0
+    def is_user_busy(self, user_id: int, chat_id: Optional[int] = None) -> bool:
+        return self.inflight_count(user_id, chat_id) > 0
 
-    async def clear_user_stream(self, user_id: int) -> None:
-        """Clear active stream for a user to force a new SDK connection (used by /revert).
+    async def clear_user_stream(self, user_id: int, chat_id: Optional[int] = None) -> None:
+        """Clear active stream(s) for a user to force a new SDK connection (used by /revert).
 
         Cancels pending request futures first (revert relies on cancellation
         semantics, not a 'terminated' result), then delegates to the full
@@ -971,24 +1017,20 @@ class ProjectChatHandler:
         garbage-collected mid-flight, and ``close`` often did not exist on the
         client (the real method is ``disconnect``), leaking the SDK subprocess.
         """
-        state = self._streams.get(user_id)
-        if not state:
-            return
-        for req in list(state.pending):
-            if req.future and not req.future.done():
-                req.future.cancel()
-        await self._disconnect_user_stream(user_id)
-        logger.info(f"Cleared stream for user {user_id}")
-
-    def clear_pending_permissions(self, user_id: int) -> None:
-        """Clear pending permission futures for a user."""
-        state = self._streams.get(user_id)
-        if state:
-            # Clear any pending permission requests
+        for state in self._states_for_user(user_id, chat_id):
             for req in list(state.pending):
                 if req.future and not req.future.done():
                     req.future.cancel()
-            logger.info(f"Cleared pending permissions for user {user_id}")
+        await self._disconnect_user_stream(user_id, chat_id)
+        logger.info(f"Cleared stream for user {user_id} chat {chat_id or '*'}")
+
+    def clear_pending_permissions(self, user_id: int, chat_id: Optional[int] = None) -> None:
+        """Clear pending permission futures for a user."""
+        for state in self._states_for_user(user_id, chat_id):
+            for req in list(state.pending):
+                if req.future and not req.future.done():
+                    req.future.cancel()
+            logger.info(f"Cleared pending permissions for user {user_id} chat {chat_id or '*'}")
 
     def list_sessions(self, limit: int = 10) -> List[Tuple[str, str, float]]:
         """List recent conversations: [(session_id, first_user_msg, mtime)]"""
