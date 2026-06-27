@@ -25,10 +25,12 @@ to Telegram, with all secrets and node-local state stripped out and replaced by 
   and opportunistically updates the local SQLite FTS5 hot-memory index.
 - **Local memory diagnostics/eval** — `scripts/ccc-memory-check.sh`,
   `scripts/ccc-memory-index.sh`, `scripts/ccc-memory-search.sh`,
-  `scripts/ccc-memory-query.sh`, `scripts/ccc-wiki-triage.sh`, and
-  `scripts/ccc-memory-eval.sh` provide cache health, task-aware query construction,
-  SQLite FTS5 indexing/search with docs-only fallback, human-gated Wiki candidate triage,
-  and no-network smoke/golden-set quality tests for `CCC_MEMORY_PROFILE=hybrid|max-perf`.
+  `scripts/ccc-memory-query.sh`, `scripts/ccc-memory-explain.sh`,
+  `scripts/ccc-wiki-triage.sh`, `scripts/ccc-memory-eval.sh`, and
+  `scripts/ccc-memory-benchmark-export.sh` provide cache health, task-aware query construction,
+  SQLite FTS5 indexing/search with docs-only fallback, hybrid-local scoring diagnostics,
+  read-only recall explanations, human-gated Wiki candidate triage, no-network smoke/golden/scenario
+  quality tests, and disabled-by-default synthetic benchmark export for `CCC_MEMORY_PROFILE=hybrid|max-perf`.
 - **Harness settings** — `settings.json` (permissions + hook wiring) and `settings.local.json`.
 - **CLAUDE.md template** — the operating-policy skeleton (Wiki-first, A2A/Nexus, GitHub
   hygiene, fresh-approval rules) with node/user identity as `<PLACEHOLDERS>`.
@@ -177,7 +179,9 @@ scripts/
   ccc-memory-index.sh          # build/update SQLite FTS5 local hot-memory index
   ccc-memory-search.sh         # query local hot-memory index as JSON
   ccc-memory-query.sh          # build redacted task-aware local/remote memory queries
-  ccc-memory-eval.sh           # no-network smoke + golden-set memory quality harness
+  ccc-memory-explain.sh        # explain effective query, cache staleness, budgets, and ranked recall
+  ccc-memory-eval.sh           # no-network smoke + golden/scenario memory quality harness
+  ccc-memory-benchmark-export.sh # synthetic benchmark fixture export (no real memory by default)
   ccc-wiki-triage.sh           # local human-gated Wiki candidate review/marking
   validate-harness.sh          # CI harness validation, including forbidden context-file guard
 setup.sh                   # idempotent bootstrap (won't overwrite existing real files)

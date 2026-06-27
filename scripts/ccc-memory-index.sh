@@ -10,6 +10,7 @@ CACHE="${CCC_MEMORY_CACHE_DIR:-/root/.claude/hooks/cache}"
 DB="${CCC_MEMORY_INDEX_DB:-$STATE_DIR/memory-index.sqlite}"
 CMD="${1:-update}"
 INDEX_DISTILL="${CCC_MEMORY_INDEX_DISTILL:-0}"
+FACTS_FILE="${CCC_MEMORY_FACTS_FILE:-$STATE_DIR/memory-facts.jsonl}"
 
 case "$CMD" in
   update|rebuild|check) ;;
@@ -19,16 +20,17 @@ esac
 mkdir -p "$STATE_DIR"
 chmod 700 "$STATE_DIR" 2>/dev/null || true
 
-python3 - "$CMD" "$DB" "$STATE_DIR" "$MEMORY_DIR" "$CACHE" "$INDEX_DISTILL" <<'PY'
+python3 - "$CMD" "$DB" "$STATE_DIR" "$MEMORY_DIR" "$CACHE" "$INDEX_DISTILL" "$FACTS_FILE" <<'PY'
 import json, os, re, sqlite3, sys
 from pathlib import Path
 
-cmd, db_path, state_dir, memory_dir, cache_dir, index_distill = sys.argv[1:]
+cmd, db_path, state_dir, memory_dir, cache_dir, index_distill, facts_file_arg = sys.argv[1:]
 os.umask(0o077)
 db = Path(db_path)
 state = Path(state_dir)
 mem = Path(memory_dir)
 cache = Path(cache_dir)
+facts_file = Path(facts_file_arg)
 index_distill_enabled = index_distill.lower() in {"1", "true", "yes", "on"}
 disable_fts5 = os.environ.get("CCC_MEMORY_DISABLE_FTS5", "").lower() in {"1", "true", "yes", "on"}
 fts5_enabled = False
@@ -105,6 +107,9 @@ def docs():
     for name in ("wiki.txt", "honcho.txt"):
         candidates.append(("cache", cache / name))
 
+    for row in structured_fact_docs(facts_file):
+        candidates.append(row)
+
     # Distill artifacts can include raw transcript fragments. Keep them opt-in.
     if index_distill_enabled:
         for name in ("distill-last.json", "wiki-candidates.md"):
@@ -114,12 +119,88 @@ def docs():
             for p in sorted(hist.glob("*.json"))[-200:]:
                 candidates.append(("distill-history", p))
 
-    for kind, p in candidates:
+    for item in candidates:
+        if len(item) == 3:
+            kind, path, text = item
+            if text:
+                yield kind, str(path), text
+            continue
+        kind, p = item
         if not p.is_file():
             continue
         text = read_json_text(p) if p.suffix == ".json" else redact_text(read_text(p))
         if text:
             yield kind, str(p), text
+
+
+
+
+def normalize_for_hash(text: str) -> str:
+    return re.sub(r"\s+", " ", text.strip().lower())
+
+
+def structured_fact_docs(path: Path):
+    """Yield reviewed/local structured memory facts as indexable local docs.
+
+    JSONL is optional and local-only. It is intended for distilled facts, not raw
+    transcript blobs. Rejected facts are skipped, duplicate normalized text is
+    skipped, and all text passes through the same redaction boundary as other
+    memory sources.
+    """
+    if not path.is_file():
+        return
+    seen_text = set()
+    for line_no, raw in enumerate(read_text(path).splitlines(), start=1):
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            obj = json.loads(raw)
+        except Exception:
+            text = redact_text(raw)
+            obj = {"id": f"line-{line_no}", "kind": "unstructured", "text": text, "review": "needs-human"}
+        if not isinstance(obj, dict):
+            continue
+        review = str(obj.get("review") or "auto-local").lower()
+        if review == "rejected":
+            continue
+        text = redact_text(str(obj.get("text") or obj.get("summary") or ""))
+        if not text:
+            continue
+        norm = normalize_for_hash(text)
+        if norm in seen_text:
+            continue
+        seen_text.add(norm)
+        kind = str(obj.get("kind") or "fact")
+        durability = str(obj.get("durability") or ("volatile" if kind == "task-progress" else "durable"))
+        privacy = str(obj.get("privacy") or "private")
+        confidence = obj.get("confidence", "")
+        observed_at = str(obj.get("observed_at") or "")
+        valid_from = str(obj.get("valid_from") or "")
+        valid_until = str(obj.get("valid_until") or "")
+        def listish(name):
+            v = obj.get(name) or []
+            if isinstance(v, list):
+                return ", ".join(redact_text(str(x)) for x in v[:20])
+            return redact_text(str(v))
+        source = obj.get("source") if isinstance(obj.get("source"), dict) else {}
+        source_text = " ".join(str(source.get(k) or "") for k in ("type", "path", "span"))
+        content = redact_text("\n".join([
+            f"kind: {kind}",
+            f"durability: {durability}",
+            f"privacy: {privacy}",
+            f"review: {review}",
+            f"confidence: {confidence}",
+            f"observed_at: {observed_at}",
+            f"valid_from: {valid_from}",
+            f"valid_until: {valid_until}",
+            f"entities: {listish('entities')}",
+            f"tags: {listish('tags')}",
+            f"source: {source_text}",
+            f"text: {text}",
+        ]))
+        fid = str(obj.get("id") or f"line-{line_no}")
+        yield "structured", f"{path}#L{line_no}:{fid}", content
 
 
 def db_sidecars(path: Path):
