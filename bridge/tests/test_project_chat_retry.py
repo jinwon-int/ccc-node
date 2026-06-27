@@ -333,5 +333,28 @@ class StreamingGateTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(resp.content, "ok")
 
 
+class ChatScopedStreamTests(unittest.IsolatedAsyncioTestCase):
+    async def test_same_user_different_chats_get_separate_streams(self):
+        handler = project_chat.ProjectChatHandler()
+        created = []
+
+        async def fake_create(user_id, model):
+            state = project_chat._UserStreamState(client=object(), model=model)
+            created.append((user_id, state))
+            return state
+
+        handler._create_user_stream = fake_create
+
+        private_state = await handler._get_or_create_stream(7, 7, None, False)
+        group_state = await handler._get_or_create_stream(7, -10042, None, False)
+        private_again = await handler._get_or_create_stream(7, 7, None, False)
+
+        self.assertIs(private_again, private_state)
+        self.assertIsNot(private_state, group_state)
+        self.assertIn((7, 7), handler._streams)
+        self.assertIn((7, -10042), handler._streams)
+        self.assertEqual(len(created), 2)
+
+
 if __name__ == "__main__":
     unittest.main()
