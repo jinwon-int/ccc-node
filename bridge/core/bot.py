@@ -40,6 +40,7 @@ from telegram_bot.utils.config import config
 from telegram_bot.session.manager import session_manager
 from telegram_bot.core.push_notifier import PushNotifier
 from telegram_bot.core.session_isolation import apply_subprocess_session_isolation
+from telegram_bot.core import ui
 from .conversation_paths import resolve_conversation_file
 from telegram_bot.core.project_chat import (
     project_chat_handler,
@@ -2695,7 +2696,6 @@ class TelegramBot:
         re.IGNORECASE,
     )
     _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
-    _OPTION_RE = re.compile(r"^\s*(\d+)[.、)）]\s*(.+)", re.MULTILINE)
 
     def _resolve_paths(self, content: str) -> List[FilePath]:
         """Extract file paths from text and resolve relative ones against PROJECT_ROOT."""
@@ -2727,182 +2727,28 @@ class TelegramBot:
 
     def _extract_options(self, text: str) -> List[str]:
         """Extract numbered options from text like '1. xxx\n2. xxx'."""
-        matches = self._OPTION_RE.findall(text)
-        if len(matches) < 2:
-            return []
-        # Verify consecutive numbering starting from 1
-        nums = [int(m[0]) for m in matches]
-        if nums != list(range(1, len(nums) + 1)):
-            return []
-        return [m[1].strip() for m in matches]
+        return ui.extract_options(text)
 
     def _build_option_keyboard(
         self, options: List[str]
     ) -> Optional[InlineKeyboardMarkup]:
         """Build inline keyboard from extracted options."""
-        if not options:
-            return None
-        buttons = []
-        for i, opt in enumerate(options, 1):
-            # callback_data max 64 bytes; truncate label if needed
-            label = f"{i}. {opt}"
-            cb_data = f"opt:{label}"
-            if len(cb_data.encode("utf-8")) > 64:
-                cb_data = f"opt:{i}"
-            buttons.append([InlineKeyboardButton(label, callback_data=cb_data)])
-        return InlineKeyboardMarkup(buttons)
+        return ui.build_option_keyboard(options)
 
     def _build_history_keyboard(
         self, messages: List[Dict[str, Any]], page: int = 0, page_size: int = 10
     ) -> InlineKeyboardMarkup:
-        """Build inline keyboard for message history selection.
-
-        Args:
-            messages: List of user message dicts with index, timestamp, role, content (newest first)
-            page: Current page number (0-indexed)
-            page_size: Number of messages per page
-
-        Returns:
-            InlineKeyboardMarkup with message buttons and pagination controls
-        """
-        start_idx = page * page_size
-        end_idx = start_idx + page_size
-        page_messages = messages[start_idx:end_idx]
-
-        buttons = []
-        for msg in page_messages:
-            # Format relative time
-            timestamp = msg.get("timestamp", "")
-            time_str = self._format_relative_time(timestamp)
-
-            # Truncate content preview
-            content = msg.get("content", "")
-            preview = content[:40] + "..." if len(content) > 40 else content
-            preview = preview.replace("\n", " ")
-
-            # Format button label with relative time
-            label = f"💬 {time_str} {preview}"
-
-            # Callback data: revert:select:{index}
-            cb_data = f"revert:select:{msg['index']}"
-            buttons.append([InlineKeyboardButton(label, callback_data=cb_data)])
-
-        # Add pagination buttons if needed
-        pagination_row = []
-        total_pages = (len(messages) + page_size - 1) // page_size
-
-        if page > 0:
-            pagination_row.append(
-                InlineKeyboardButton(
-                    "◀️ Previous", callback_data=f"revert:page:{page - 1}"
-                )
-            )
-        if page < total_pages - 1:
-            pagination_row.append(
-                InlineKeyboardButton("Next ▶️", callback_data=f"revert:page:{page + 1}")
-            )
-
-        if pagination_row:
-            buttons.append(pagination_row)
-
-        return InlineKeyboardMarkup(buttons)
+        """Build inline keyboard for message history selection."""
+        return ui.build_history_keyboard(messages, page, page_size)
 
     @staticmethod
     def _format_relative_time(timestamp: str) -> str:
-        """Format timestamp as relative time.
-
-        Returns:
-            - "Just now" for < 1 minute
-            - "X minutes ago" for < 1 hour
-            - "X hours ago" for < 24 hours (today)
-            - "Yesterday" for yesterday
-            - "X days ago" for 2-3 days ago
-            - "MM-DD" for > 3 days ago
-        """
-        if not timestamp:
-            return ""
-
-        try:
-            from datetime import datetime, timezone
-
-            dt = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
-            now = datetime.now(timezone.utc)
-            diff = now - dt
-
-            total_seconds = diff.total_seconds()
-
-            # Less than 1 minute
-            if total_seconds < 60:
-                return "Just now"
-
-            # Less than 1 hour
-            if total_seconds < 3600:
-                minutes = int(total_seconds / 60)
-                return f"{minutes}m ago"
-
-            # Less than 24 hours (today)
-            if total_seconds < 86400:
-                hours = int(total_seconds / 3600)
-                return f"{hours}h ago"
-
-            # Calculate days
-            days = int(total_seconds / 86400)
-
-            # Yesterday
-            if days == 1:
-                return "Yesterday"
-
-            # 2-3 days ago
-            if days <= 3:
-                return f"{days}d ago"
-
-            # More than 3 days - show date
-            return dt.strftime("%m-%d")
-
-        except Exception:
-            return timestamp[:10] if len(timestamp) >= 10 else ""
+        """Format timestamp as relative time (see ui.format_relative_time)."""
+        return ui.format_relative_time(timestamp)
 
     def _build_revert_mode_keyboard(self, msg_index: int) -> InlineKeyboardMarkup:
-        """Build inline keyboard for revert mode selection.
-
-        Args:
-            msg_index: Index of the selected message in JSONL file
-
-        Returns:
-            InlineKeyboardMarkup with 5 revert mode options
-        """
-        buttons = [
-            [
-                InlineKeyboardButton(
-                    "🔄 Restore code and conversation",
-                    callback_data=f"revert:mode:{msg_index}:full",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    "💬 Restore conversation only",
-                    callback_data=f"revert:mode:{msg_index}:conv",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    "📝 Restore code only",
-                    callback_data=f"revert:mode:{msg_index}:code",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    "📋 Summarize from here",
-                    callback_data=f"revert:mode:{msg_index}:summary",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    "❌ Cancel", callback_data=f"revert:mode:{msg_index}:cancel"
-                )
-            ],
-        ]
-        return InlineKeyboardMarkup(buttons)
+        """Build inline keyboard for revert mode selection."""
+        return ui.build_revert_mode_keyboard(msg_index)
 
     async def _send_file_paths(self, chat_id: int, paths: List[FilePath]) -> None:
         app = self._require_application()
@@ -2947,27 +2793,8 @@ class TelegramBot:
 
     @staticmethod
     def _split_text(text: str, limit: int = 4000) -> List[str]:
-        """Split text into chunks no longer than limit, breaking at paragraph or line boundaries."""
-        if len(text) <= limit:
-            return [text]
-        chunks: List[str] = []
-        remaining = text
-        while len(remaining) > limit:
-            # Try to split at a paragraph boundary (double newline)
-            cut = remaining.rfind("\n\n", 0, limit)
-            if cut == -1:
-                # Fall back to single newline
-                cut = remaining.rfind("\n", 0, limit)
-            if cut == -1:
-                # Hard cut at limit
-                cut = limit
-            else:
-                cut += 1  # include the newline in the current chunk
-            chunks.append(remaining[:cut].rstrip())
-            remaining = remaining[cut:].lstrip("\n")
-        if remaining:
-            chunks.append(remaining)
-        return chunks
+        """Split text into chunks no longer than limit (see ui.split_text)."""
+        return ui.split_text(text, limit)
 
     async def _deliver_markdown(self, content: str, op, base_parse_mode: str = "Markdown"):
         """Split *content* and send each chunk via ``op(text, parse_mode)``.
