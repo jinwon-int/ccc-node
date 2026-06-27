@@ -35,19 +35,32 @@ exec 9>"$CACHE/.refresh.lock"
 flock -n 9 || exit 0
 
 query_from_state() {
-  local node cwd task
+  if [ -n "${PREFETCH_QUERY:-}" ]; then printf '%s' "$PREFETCH_QUERY"; return 0; fi
+  local query_tool node cwd task
+  query_tool="$(find_memory_tool ccc-memory-query.sh 2>/dev/null || true)"
+  if [ -n "$query_tool" ]; then
+    CCC_WORKTREE="${CCC_WORKTREE:-$(cat "$STATE_DIR/cwd.txt" 2>/dev/null || pwd 2>/dev/null || true)}" "$query_tool" --mode remote 2>/dev/null && return 0
+  fi
   node="${CCC_NODE:-$(cat "$STATE_DIR/node.txt" 2>/dev/null || hostname -s 2>/dev/null || printf 'ccc-node')}"
   cwd="$(cat "$STATE_DIR/cwd.txt" 2>/dev/null || pwd 2>/dev/null || printf '')"
   task="$(cat "$STATE_DIR/current-task.txt" 2>/dev/null || printf '')"
-  printf '%s' "${PREFETCH_QUERY:-node ${node}; cwd ${cwd}; task ${task}; Seoyoon ops priorities and current node operating memory}"
+  printf '%s' "node ${node}; cwd ${cwd}; task ${task}; Seoyoon ops priorities and current node operating memory"
 }
 
-record_status() { # <name> <status> <duration_ms> <bytes> <error>
-  local name="$1" status="$2" duration="$3" bytes="$4" error="$5"
+record_status() { # <name> <status> <duration_ms> <bytes> <error> [query]
+  local name="$1" status="$2" duration="$3" bytes="$4" error="$5" query="${6:-}" qhash max_age
+  qhash="$(printf '%s' "$query" | sha256sum 2>/dev/null | cut -d' ' -f1)"
+  case "$name" in
+    wiki) max_age="${CCC_WIKI_CACHE_MAX_AGE_SEC:-${CCC_MEMORY_CACHE_TTL_SEC:-21600}}" ;;
+    honcho) max_age="${CCC_HONCHO_CACHE_MAX_AGE_SEC:-${CCC_MEMORY_CACHE_TTL_SEC:-21600}}" ;;
+    *) max_age="${CCC_LOCAL_MEMORY_CACHE_MAX_AGE_SEC:-${CCC_MEMORY_CACHE_TTL_SEC:-21600}}" ;;
+  esac
   jq -n --arg source "$name" --arg status "$status" --arg refreshed_at "$(now_iso)" \
-    --arg error "$error" --argjson duration_ms "${duration:-0}" --argjson bytes "${bytes:-0}" \
-    '{source:$source,status:$status,refreshed_at:$refreshed_at,duration_ms:$duration_ms,bytes:$bytes,error:$error}' \
+    --arg error "$error" --arg query_hash "$qhash" --argjson duration_ms "${duration:-0}" \
+    --argjson bytes "${bytes:-0}" --argjson max_age_sec "${max_age:-0}" \
+    '{source:$source,status:$status,refreshed_at:$refreshed_at,duration_ms:$duration_ms,bytes:$bytes,error:$error,error_class:(if $error=="" then "" else ($status) end),query_hash:$query_hash,max_age_sec:$max_age_sec,stale:false}' \
     > "$CACHE/.${name}.status.json"
+  cp "$CACHE/.${name}.status.json" "$CACHE/${name}.meta.json" 2>/dev/null || true
 }
 
 refresh_wiki() {
@@ -67,7 +80,7 @@ refresh_wiki() {
   fi
   rm -f "$tmp" "$tmp.err"
   end="$(now_ms)"; duration="$((end - start))"
-  record_status wiki "$status" "$duration" "$(bytes_for "$CACHE/wiki.txt")" "$err"
+  record_status wiki "$status" "$duration" "$(bytes_for "$CACHE/wiki.txt")" "$err" "$q"
 }
 
 refresh_honcho() {
@@ -110,7 +123,7 @@ refresh_honcho() {
   fi
   rm -f "$tmp" "$tmp.err"
   end="$(now_ms)"; duration="$((end - start))"
-  record_status honcho "$status" "$duration" "$(bytes_for "$CACHE/honcho.txt")" "$err"
+  record_status honcho "$status" "$duration" "$(bytes_for "$CACHE/honcho.txt")" "$err" "$query"
 }
 
 refresh_wiki & wiki_pid=$!

@@ -16,6 +16,85 @@ INDEX_TOOL="$(find_tool ccc-memory-index.sh scripts/ccc-memory-index.sh)"
 SEARCH_TOOL="$(find_tool ccc-memory-search.sh scripts/ccc-memory-search.sh)"
 LOAD_HOOK="$(find_tool load-memory.sh claude/hooks/load-memory.sh)"
 QUERY="${1:-user preferences}"
+
+if [ "${1:-}" = "--golden" ] || [ "${CCC_MEMORY_EVAL_MODE:-}" = "golden" ]; then
+  KEEP_TMP="${CCC_MEMORY_EVAL_KEEP_TMP:-0}"
+  if [ -n "${CCC_STATE_DIR:-}" ]; then
+    mkdir -p "$CCC_STATE_DIR"
+    STATE_DIR="$(mktemp -d "$CCC_STATE_DIR/ccc-memory-golden.XXXXXX")"
+  else
+    STATE_DIR="$(mktemp -d)"
+  fi
+  cleanup_golden() { [ "$KEEP_TMP" = "1" ] || rm -rf "$STATE_DIR"; }
+  trap cleanup_golden EXIT
+  CACHE="$STATE_DIR/cache"
+  MEMORY_DIR="$STATE_DIR/memories"
+  mkdir -p "$CACHE" "$MEMORY_DIR" "$STATE_DIR"
+  printf 'Seoyoon A2A uses Seoseo broker for Team1 and Gwakga broker for Team2. Durable work is PR-first and broker-backed.
+ccc-node SessionStart must stay no-network and fail-open.
+' > "$MEMORY_DIR/MEMORY.md"
+  printf 'Seo Jin On prefers Korean practical evidence-based reports with facts, risks, and next steps.
+' > "$MEMORY_DIR/USER.md"
+  printf 'Family Wiki candidate: ccc-node memory cache TTL, stale warning, and human-gated Wiki candidate triage.
+' > "$CACHE/wiki.txt"
+  printf 'Honcho summary: retain Honcho as relational memory; use conservative cadence and task supplement.
+' > "$CACHE/honcho.txt"
+  printf 'golden-node
+' > "$STATE_DIR/node.txt"
+  CCC_STATE_DIR="$STATE_DIR" CCC_MEMORY_CACHE_DIR="$CACHE" CCC_MEMORY_DIR="$MEMORY_DIR" "$INDEX_TOOL" rebuild >/dev/null
+  python3 - "$SEARCH_TOOL" "$STATE_DIR" <<'PY'
+import json, subprocess, sys, time
+search_tool, state_dir = sys.argv[1], sys.argv[2]
+cases = [
+  {"id":"a2a-brokers", "query":"Team1 Seoseo broker Team2 Gwakga", "expected":["MEMORY.md"]},
+  {"id":"startup-boundary", "query":"SessionStart no-network fail-open", "expected":["MEMORY.md"]},
+  {"id":"korean-report", "query":"Korean practical evidence reports", "expected":["USER.md"]},
+  {"id":"cache-stale", "query":"memory cache TTL stale warning", "expected":["wiki.txt"]},
+  {"id":"honcho-relational", "query":"Honcho relational task supplement", "expected":["honcho.txt"]},
+]
+ks=[1,3,5]
+start=time.time()
+per=[]
+latencies=[]
+for c in cases:
+    one_start=time.time()
+    cp=subprocess.run([search_tool, c["query"]], env={"CCC_STATE_DIR":state_dir,"CCC_MEMORY_INDEX_DB":f"{state_dir}/memory-index.sqlite"}, text=True, capture_output=True, timeout=10)
+    latencies.append(int((time.time()-one_start)*1000))
+    results=json.loads(cp.stdout).get("results", []) if cp.returncode == 0 else []
+    paths=[r.get("path","") for r in results]
+    ranks=[]
+    for exp in c["expected"]:
+        rank=next((i+1 for i,p in enumerate(paths) if exp in p), None)
+        ranks.append(rank)
+    per.append({"id":c["id"],"query":c["query"],"expected":c["expected"],"paths":paths,"ranks":ranks})
+metrics={}
+for k in ks:
+    precisions=[]; recalls=[]
+    for row in per:
+        top=row["paths"][:k]
+        hits=sum(1 for exp in row["expected"] if any(exp in p for p in top))
+        precisions.append(hits / max(1, min(k, len(top) or k)))
+        recalls.append(hits / len(row["expected"]))
+    metrics[f"precision_at_{k}"]=sum(precisions)/len(precisions)
+    metrics[f"recall_at_{k}"]=sum(recalls)/len(recalls)
+rr=[]
+for row in per:
+    best=min([r for r in row["ranks"] if r], default=None)
+    rr.append(0 if best is None else 1/best)
+metrics["mrr"]=sum(rr)/len(rr)
+latencies_sorted=sorted(latencies)
+def pct(values, q):
+    if not values: return 0
+    idx=min(len(values)-1, max(0, int(round((len(values)-1)*q))))
+    return values[idx]
+metrics["latency_p50_ms"]=pct(latencies_sorted, 0.50)
+metrics["latency_p95_ms"]=pct(latencies_sorted, 0.95)
+metrics["latency_ms"]=int((time.time()-start)*1000)
+print(json.dumps({"ok": metrics["recall_at_5"] >= 0.8 and metrics["precision_at_1"] >= 0.6, "mode":"golden", "cases":per, "metrics":metrics, "state_dir":state_dir}, ensure_ascii=False, indent=2))
+PY
+  exit $?
+fi
+
 KEEP_TMP="${CCC_MEMORY_EVAL_KEEP_TMP:-0}"
 
 if [ -n "${CCC_STATE_DIR:-}" ]; then

@@ -7,6 +7,8 @@ CACHE="${CCC_MEMORY_CACHE_DIR:-/root/.claude/hooks/cache}"
 HONCHO_CFG="${CCC_HONCHO_CFG:-${CCC_HERMES_DIR:-/root/.hermes}/honcho.json}"
 PROFILE="${CCC_MEMORY_PROFILE:-honcho}"
 TTL="${CCC_MEMORY_CACHE_TTL_SEC:-21600}"
+WIKI_TTL="${CCC_WIKI_CACHE_MAX_AGE_SEC:-$TTL}"
+HONCHO_TTL="${CCC_HONCHO_CACHE_MAX_AGE_SEC:-$TTL}"
 OUTPUT="${1:-text}"
 
 now_epoch() { date -u +%s; }
@@ -18,6 +20,14 @@ age_for() {
   if [ "$ts" = "0" ]; then printf '-1'; else printf '%s' "$((now - ts))"; fi
 }
 bytes_for() { [ -f "$1" ] && wc -c < "$1" | tr -d '[:space:]' || printf '0'; }
+meta_json_for() {
+  local f="$1" ttl="$2"
+  if [ ! -f "$f" ]; then printf '{}'; return 0; fi
+  jq --argjson ttl "${ttl:-0}" '
+    (.max_age_sec //= $ttl)
+    | (.stale = (((.refreshed_at? // "") | fromdateiso8601? // 0) as $t | ($t > 0 and ((now | floor) - $t > (.max_age_sec // $ttl)))))
+  ' "$f" 2>/dev/null || printf '{}'
+}
 status_for() {
   local f="$1" age
   age="$(age_for "$f")"
@@ -30,6 +40,8 @@ status_for() {
 wiki_file="$CACHE/wiki.txt"
 honcho_file="$CACHE/honcho.txt"
 meta_file="$CACHE/meta.json"
+wiki_meta_file="$CACHE/wiki.meta.json"
+honcho_meta_file="$CACHE/honcho.meta.json"
 index_db="$STATE_DIR/memory-index.sqlite"
 
 honcho_enabled="${CCC_HONCHO_MEMORY_ENABLED:-1}"
@@ -54,6 +66,8 @@ if [ "$OUTPUT" = "--json" ] || [ "$OUTPUT" = "json" ]; then
     --arg wiki_status "$wiki_status" \
     --arg honcho_status "$honcho_status" \
     --arg meta_file "$meta_file" \
+    --argjson wiki_meta "$(meta_json_for "$wiki_meta_file" "$WIKI_TTL")" \
+    --argjson honcho_meta "$(meta_json_for "$honcho_meta_file" "$HONCHO_TTL")" \
     --arg index_db "$index_db" \
     --argjson ttl "$TTL" \
     --argjson wiki_age "$(age_for "$wiki_file")" \
@@ -62,8 +76,8 @@ if [ "$OUTPUT" = "--json" ] || [ "$OUTPUT" = "json" ]; then
     --argjson honcho_bytes "$(bytes_for "$honcho_file")" \
     --argjson index_exists "$([ -f "$index_db" ] && printf true || printf false)" \
     '{profile:$profile, ttl_seconds:$ttl, cache:{dir:$cache_dir, meta:$meta_file}, state_dir:$state_dir,
-      wiki:{status:$wiki_status, age_seconds:$wiki_age, bytes:$wiki_bytes},
-      honcho:{status:$honcho_status, age_seconds:$honcho_age, bytes:$honcho_bytes, cfg:$honcho_cfg, base:$honcho_base},
+      wiki:{status:$wiki_status, age_seconds:$wiki_age, bytes:$wiki_bytes, meta:$wiki_meta},
+      honcho:{status:$honcho_status, age_seconds:$honcho_age, bytes:$honcho_bytes, cfg:$honcho_cfg, base:$honcho_base, meta:$honcho_meta},
       local_index:{db:$index_db, exists:$index_exists}}'
   exit 0
 fi
