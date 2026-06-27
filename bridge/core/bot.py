@@ -41,6 +41,7 @@ from telegram_bot.session.manager import session_manager
 from telegram_bot.core.push_notifier import PushNotifier
 from telegram_bot.core.session_isolation import apply_subprocess_session_isolation
 from telegram_bot.core import ui
+from telegram_bot.core import media
 from .conversation_paths import resolve_conversation_file
 from telegram_bot.core.project_chat import (
     project_chat_handler,
@@ -102,9 +103,6 @@ def _esc_md2(text: str) -> str:
 
 
 class TelegramBot:
-    _VOICE_TEXT_CHAR_THRESHOLD = 300
-    _VOICE_LONG_HANZI_THRESHOLD = 1000
-    _VOICE_LONG_ENGLISH_WORD_THRESHOLD = 1000
 
     def __init__(self):
         self.application: Optional[Application] = None
@@ -1770,23 +1768,11 @@ class TelegramBot:
 
     @staticmethod
     def _resolve_voice_extension(mime_type: Optional[str]) -> str:
-        if not mime_type:
-            return "ogg"
-        normalized = mime_type.lower()
-        if "amr" in normalized:
-            return "amr"
-        if "mp3" in normalized or "mpeg" in normalized:
-            return "mp3"
-        if "wav" in normalized:
-            return "wav"
-        if "m4a" in normalized or "mp4" in normalized:
-            return "m4a"
-        return "ogg"
+        return media.resolve_voice_extension(mime_type)
 
     @staticmethod
     def _build_voice_file_name(user_id: int, extension: str) -> str:
-        timestamp_ms = int(time.time() * 1000)
-        return f"{user_id}_{timestamp_ms}.{extension}"
+        return media.build_voice_file_name(user_id, extension)
 
     def _get_whisper_transcriber(self) -> WhisperTranscriber:
         if self._whisper_transcriber is None:
@@ -1840,44 +1826,28 @@ class TelegramBot:
 
     @staticmethod
     def _is_macos() -> bool:
-        return platform.system() == "Darwin"
+        return media.is_macos()
 
     @staticmethod
     def _count_hanzi(text: str) -> int:
-        return len(re.findall(r"[\u4e00-\u9fff]", text))
+        return media.count_hanzi(text)
 
     @staticmethod
     def _count_english_words(text: str) -> int:
-        return len(re.findall(r"[A-Za-z]+(?:'[A-Za-z]+)?", text))
+        return media.count_english_words(text)
 
     def _resolve_next_reply_mode(
         self, *, current_mode: str, message_source: str, user_text: str
     ) -> str:
         del current_mode, user_text
-        if not self._is_macos():
-            return "text"
-        if message_source == "voice":
-            return "voice"
-        return "text"
+        return media.resolve_next_reply_mode(message_source, is_macos=self._is_macos())
 
     @staticmethod
     def _normalize_reply_mode(mode: Optional[str]) -> str:
-        normalized = str(mode or "text").strip().lower()
-        if normalized not in {"text", "voice"}:
-            return "text"
-        return normalized
+        return media.normalize_reply_mode(mode)
 
     def _get_voice_delivery_strategy(self, content: str) -> str:
-        hanzi_count = self._count_hanzi(content)
-        english_word_count = self._count_english_words(content)
-        if (
-            hanzi_count > self._VOICE_LONG_HANZI_THRESHOLD
-            or english_word_count > self._VOICE_LONG_ENGLISH_WORD_THRESHOLD
-        ):
-            return "text_only"
-        if len(content) > self._VOICE_TEXT_CHAR_THRESHOLD:
-            return "voice_and_text"
-        return "voice_only"
+        return media.voice_delivery_strategy(content)
 
     async def _send_voice_message(self, message: Message, content: str) -> None:
         tts = self._get_tts_synthesizer()
@@ -2053,7 +2023,7 @@ class TelegramBot:
 
     @staticmethod
     def _redact_telegram_file_url(url: str) -> str:
-        return re.sub(r"/bot[^/]+/", "/bot***REDACTED***/", url)
+        return media.redact_telegram_file_url(url)
 
     async def _build_telegram_file_url(self, file_id: str) -> str:
         app = self._require_application()
@@ -2070,59 +2040,19 @@ class TelegramBot:
 
     @staticmethod
     def _resolve_image_extension(mime_type: Optional[str], file_name: Optional[str] = None) -> str:
-        if file_name:
-            suffix = FilePath(file_name).suffix.lower().lstrip(".")
-            if suffix in {"jpg", "jpeg", "png", "webp", "gif", "bmp", "tif", "tiff"}:
-                return "jpg" if suffix == "jpeg" else suffix
-        mime = (mime_type or "").lower().split(";", 1)[0].strip()
-        return {
-            "image/jpeg": "jpg",
-            "image/jpg": "jpg",
-            "image/png": "png",
-            "image/webp": "webp",
-            "image/gif": "gif",
-            "image/bmp": "bmp",
-            "image/tiff": "tiff",
-        }.get(mime, "jpg")
+        return media.resolve_image_extension(mime_type, file_name)
 
     @staticmethod
     def _build_image_file_name(user_id: int, extension: str) -> str:
-        safe_ext = re.sub(r"[^a-z0-9]", "", extension.lower()) or "jpg"
-        return f"image_{user_id}_{int(time.time() * 1000)}.{safe_ext}"
+        return media.build_image_file_name(user_id, extension)
 
     @staticmethod
     def _select_inbound_image(message: Message) -> Tuple[Optional[Any], str]:
-        photos = list(getattr(message, "photo", None) or [])
-        if photos:
-            def score(photo: Any) -> int:
-                file_size = int(getattr(photo, "file_size", 0) or 0)
-                pixels = int(getattr(photo, "width", 0) or 0) * int(getattr(photo, "height", 0) or 0)
-                return max(file_size, pixels)
-
-            return max(photos, key=score), "photo"
-
-        document = getattr(message, "document", None)
-        mime_type = str(getattr(document, "mime_type", "") or "").lower()
-        if document is not None and mime_type.startswith("image/"):
-            return document, "document"
-        return None, "none"
+        return media.select_inbound_image(message)
 
     @staticmethod
     def _build_image_prompt(image_path: FilePath, caption: str) -> str:
-        caption = (caption or "").strip()
-        prompt = (
-            "The user sent an inbound Telegram image. Analyze the image and answer the user's request.\n\n"
-            f"Local image path: {image_path}\n"
-        )
-        if caption:
-            prompt += f"Caption / user instruction: {caption}\n"
-        else:
-            prompt += "Caption / user instruction: Please describe what is in the image and mention any visible text.\n"
-        prompt += (
-            "If the current Claude Code runtime cannot directly inspect image files, say so clearly "
-            "and explain what file was received instead of silently ignoring the image."
-        )
-        return prompt
+        return media.build_image_prompt(image_path, caption)
 
     async def _download_telegram_file(self, file_id: str, destination: FilePath) -> None:
         app = self._require_application()
