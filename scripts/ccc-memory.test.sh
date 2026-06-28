@@ -121,6 +121,21 @@ out="$(CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem
 ok "memory index includes structured facts" '[ "$rc" = 0 ] && jq -e ".documents >= 3" >/dev/null <<<"$out"'
 out="$(CCC_STATE_DIR="$state" CCC_MEMORY_INDEX_DB="$state/memory-index.sqlite" CCC_MEMORY_RETRIEVAL=hybrid-local bash "$ROOT/scripts/ccc-memory-search.sh" "current editor Helix" 2>&1)"; rc=$?
 ok "hybrid-local search explains scoring signals" '[ "$rc" = 0 ] && jq -e ".retrievalMode == \"hybrid-local\" and (.results[0].signals.token_hits >= 1)" >/dev/null <<<"$out"'
+
+# Default retrieval must apply the durability/source boosts too (not raw bm25),
+# so a keyword-dense volatile fact with EQUAL coverage can't outrank a durable
+# one. Distinct fixture so the only differentiator is the boost.
+rank_facts="$state/rank-facts.jsonl"
+printf '%s\n' \
+  '{"id":"durable-policy","kind":"decision","text":"durable operating policy memory ranking default mode evidence.","durability":"durable","privacy":"private","review":"auto-local"}' \
+  '{"id":"volatile-dense","kind":"task-progress","text":"durable operating policy memory ranking default mode durable operating policy memory ranking default mode volatile draft pending.","durability":"volatile","privacy":"private","review":"auto-local"}' \
+  > "$rank_facts"
+CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CCC_MEMORY_FACTS_FILE="$rank_facts" bash "$ROOT/scripts/ccc-memory-index.sh" rebuild >/dev/null 2>&1
+out="$(CCC_STATE_DIR="$state" CCC_MEMORY_INDEX_DB="$state/memory-index.sqlite" bash "$ROOT/scripts/ccc-memory-search.sh" "durable operating policy memory ranking" 2>&1)"; rc=$?
+ok "default retrieval reranks with boosts (fts-rerank mode)" '[ "$rc" = 0 ] && jq -e ".retrievalMode == \"fts-rerank\"" >/dev/null <<<"$out"'
+ok "default retrieval demotes keyword-dense volatile below durable" '[ "$rc" = 0 ] && jq -e "(.results[0].path | contains(\"durable-policy\")) and (.results[0].signals.durability_penalty == 0) and ((.results | map(select(.path | contains(\"volatile-dense\")))[0].signals.durability_penalty) == -3.0)" >/dev/null <<<"$out"'
+# restore the structured-fact index for the secret-redaction test below
+CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CCC_MEMORY_FACTS_FILE="$facts" bash "$ROOT/scripts/ccc-memory-index.sh" rebuild >/dev/null 2>&1
 ok "structured fact indexing redacts secrets" '! python3 - <<PY | grep -q VALUE_SHOULD_NOT_INDEX_FACT
 import sqlite3
 con=sqlite3.connect("$state/memory-index.sqlite")

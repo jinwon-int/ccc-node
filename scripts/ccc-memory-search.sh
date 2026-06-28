@@ -31,9 +31,32 @@ def tokens_for(q: str):
 def fts_expr(toks):
     return " OR ".join('"%s"' % t.replace('"', '""') for t in toks)
 
+def fts_query(toks):
+    # Build a sanitized FTS5 MATCH from extracted tokens so it never trips over
+    # the ':' / '-' / '/' punctuation in the task-aware query (which made the old
+    # raw-query attempt throw and silently fall back to a flat token OR). Each
+    # token is quoted (neutralizes FTS syntax); adjacent bigrams are added as
+    # quoted phrases so documents where the terms appear *together* score higher
+    # under bm25 — cheap proximity weighting without leaving FTS5.
+    if not toks:
+        return None
+    parts = ['"%s"' % t.replace('"', '""') for t in toks]
+    for a, b in zip(toks, toks[1:]):
+        parts.append('"%s %s"' % (a.replace('"', '""'), b.replace('"', '""')))
+    return " OR ".join(parts)
+
 def run_fts(expr, n=None):
-    cur=con.execute("SELECT path, source, snippet(memory_fts, 2, '[', ']', ' … ', 16) AS snippet, bm25(memory_fts) AS score FROM memory_fts WHERE memory_fts MATCH ? ORDER BY score LIMIT ?", (expr, n or limit))
-    return [{"path":r["path"],"source":r["source"],"snippet":r["snippet"],"score":r["score"],"signals":{"fts_bm25":r["score"]}} for r in cur]
+    # FTS5 candidate generation joined to memory_docs so the rerank can read
+    # content/updated_at for the durability/recency/source signals.
+    cur=con.execute(
+        "SELECT f.path AS path, f.source AS source, "
+        "snippet(memory_fts, 2, '[', ']', ' … ', 16) AS snippet, "
+        "bm25(memory_fts) AS bm25, d.content AS content, d.updated_at AS updated_at "
+        "FROM memory_fts f LEFT JOIN memory_docs d ON d.path = f.path "
+        "WHERE memory_fts MATCH ? ORDER BY bm25 LIMIT ?",
+        (expr, n or limit))
+    return [{"path":r["path"],"source":r["source"],"snippet":r["snippet"],
+             "bm25":r["bm25"],"content":r["content"] or "","updated_at":r["updated_at"] or ""} for r in cur]
 
 def run_like(toks, n=None):
     if not toks:
@@ -43,9 +66,48 @@ def run_like(toks, n=None):
     for t in toks:
         params.extend([f"%{t.lower()}%", f"%{t.lower()}%"])
     score_terms = " + ".join(["CASE WHEN lower(content) LIKE ? OR lower(path) LIKE ? THEN 1 ELSE 0 END" for _ in toks])
-    sql = f"SELECT path, source, substr(content,1,240) AS snippet, updated_at, ({score_terms}) AS hits FROM memory_docs WHERE {clauses} ORDER BY hits DESC, updated_at DESC LIMIT ?"
+    sql = f"SELECT path, source, content, updated_at, ({score_terms}) AS hits FROM memory_docs WHERE {clauses} ORDER BY hits DESC, updated_at DESC LIMIT ?"
     cur=con.execute(sql, params + params + [n or limit])
-    return [{"path":r["path"],"source":r["source"],"snippet":r["snippet"],"score":None,"token_hits":r["hits"],"signals":{"like_token_hits":r["hits"]}} for r in cur]
+    return [{"path":r["path"],"source":r["source"],"snippet":(r["content"] or "")[:240],
+             "bm25":None,"token_hits":r["hits"],"content":r["content"] or "","updated_at":r["updated_at"] or ""} for r in cur]
+
+def rerank(cands):
+    # Re-rank FTS/LIKE candidates with the SAME explainable formula the hybrid
+    # lane uses, so the DEFAULT retrieval path gets the source / recency /
+    # durability signals too. Lexical relevance is distinct-token *coverage*
+    # (term frequency is deliberately ignored) so a keyword-stuffed volatile or
+    # review:rejected doc can no longer outrank a durable memory fact. A small
+    # normalized bm25 term only breaks ties between equal-coverage candidates.
+    if not cands:
+        return []
+    bms=[-(c["bm25"]) for c in cands if c.get("bm25") is not None]
+    lo, hi = (min(bms), max(bms)) if bms else (0.0, 0.0)
+    q=query.lower()
+    out=[]
+    for c in cands:
+        content=c.get("content") or ""
+        hay=(c["path"]+"\n"+c["source"]+"\n"+content).lower()
+        token_hits=sum(1 for t in toks if t in hay)
+        phrase_hit=1 if q and q in hay else 0
+        if c.get("bm25") is not None and hi > lo:
+            tie=((-c["bm25"]) - lo) / (hi - lo)
+        else:
+            tie=0.0
+        signals={
+            "token_hits": token_hits,
+            "phrase_hit": phrase_hit,
+            "source_boost": source_boost(c["source"], content),
+            "recency_boost": round(recency_boost(c.get("updated_at")), 4),
+            "durability_penalty": durability_penalty(content),
+            "bm25_tiebreak": round(tie, 4),
+        }
+        if c.get("bm25") is not None:
+            signals["fts_bm25"]=c["bm25"]
+        score=(token_hits*4.0)+(phrase_hit*3.0)+signals["source_boost"]+signals["recency_boost"]+signals["durability_penalty"]+(tie*0.5)
+        out.append({"path":c["path"],"source":c["source"],"snippet":c["snippet"],
+                    "score":round(score,4),"signals":signals})
+    out.sort(key=lambda x: x["score"], reverse=True)
+    return out[:limit]
 
 def source_boost(source: str, content: str):
     s=source or ""
@@ -100,20 +162,27 @@ def hybrid(toks):
 
 toks = tokens_for(query)
 rows=[]
-mode = retrieval.strip().lower() or "fts"
-if mode in {"hybrid", "hybrid-local"}:
+requested = retrieval.strip().lower() or "fts"
+if requested in {"hybrid", "hybrid-local"}:
+    mode = requested
     rows = hybrid(toks)
 else:
-    try:
+    # Default: FTS5 candidate generation (over-fetched) + explainable boost
+    # rerank. Falls back to LIKE (also reranked) when FTS5 is unavailable.
+    mode = "fts-rerank"
+    over = max(limit * 6, 30)
+    expr = fts_query(toks)
+    cands=[]
+    if expr is not None:
         try:
-            rows = run_fts(query)
+            cands = run_fts(expr, over)
         except sqlite3.OperationalError:
-            rows = []
-        if not rows and toks:
-            rows = run_fts(fts_expr(toks))
-    except sqlite3.OperationalError:
-        rows = run_like(toks)
-    if not rows:
-        rows = run_like(toks)
+            cands = []
+    if not cands:
+        try:
+            cands = run_like(toks, over)
+        except sqlite3.OperationalError:
+            cands = []
+    rows = rerank(cands)
 print(json.dumps({"query":query,"tokens":toks,"retrievalMode":mode,"results":rows}, ensure_ascii=False, indent=2))
 PY
