@@ -54,6 +54,19 @@ core/project_chat.py ProjectChatHandler — per-user long-lived Claude SDK
 core/streaming.py    StreamingMessageHandler — progressive draft message updates
     │                for real-time AI response streaming
     │
+core/ (helpers)      Pure, directly unit-tested helpers extracted from bot.py /
+    │                project_chat.py (the orchestrators stay thin delegators):
+    │                  ui.py         — text split, relative time, inline keyboards
+    │                  media.py      — voice/image extension+filename, reply-mode
+    │                                  + delivery-strategy heuristics
+    │                  paths.py      — PROJECT_ROOT scope classification for the
+    │                                  permission gate (which paths need approval)
+    │                  task_queue.py — UserTaskQueue: per-user bounded run queue +
+    │                                  active-task tracking for /stop and /revert
+    │                  revert.py     — atomic conversation-JSONL truncation
+    │                  sdk_text.py   — SDK error classification, stream-delta
+    │                                  extraction, AskUserQuestion formatting
+    │
 utils/audio_processor.py AudioProcessor — format detection, ffmpeg conversion,
     │                   temp/stale audio cleanup
     │
