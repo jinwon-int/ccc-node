@@ -18,8 +18,9 @@ to Telegram, with all secrets and node-local state stripped out and replaced by 
 
 - **SessionStart / PostCompact memory injection** — `hooks/load-memory.sh` injects a bounded
   snapshot at session start: built-in `MEMORY.md`/`USER.md` + local hot-memory search
-  (when enabled) + cached Family Wiki prefetch + cached Honcho working memory, then fires
-  a detached background refresh for the next session. Startup remains no-network/fail-open.
+  (on by default for every profile; `CCC_LOCAL_MEMORY_ENABLED=0` opts out) + cached Family
+  Wiki prefetch + cached Honcho working memory, then fires a detached background refresh for
+  the next session. Startup remains no-network/fail-open.
 - **Background cache refresh** — `hooks/refresh-memory.sh` updates the Wiki + Honcho caches
   out-of-band (single-flight via `flock`, fail-open), records per-source cache metadata,
   and opportunistically updates the local SQLite FTS5 hot-memory index.
@@ -229,6 +230,7 @@ behavior:
 | `CCC_MEMORY_CACHE_DIR` | `$CCC_CLAUDE_DIR/hooks/cache` | Wiki/Honcho cache and refresh metadata location |
 | `CCC_STATE_DIR` | `$CCC_CLAUDE_DIR/state` | Node state plus local `memory-index.sqlite` |
 | `CCC_HONCHO_MEMORY_ENABLED` | `1` | Set `0`/`false`/`off` to remove Honcho from the read path while keeping local/Wiki memory |
+| `CCC_LOCAL_MEMORY_ENABLED` | `1` (on) | Local hot-memory index search is queried for every profile by default; set `0`/`false`/`off` to opt out |
 | `CCC_MEMORY_MAX_BYTES` | `12000` | Total SessionStart memory injection byte budget |
 | `CCC_MEMORY_QUERY_MAX_BYTES` | mode-specific | Max task-aware query bytes; remote defaults lower than local |
 | `CCC_WIKI_CACHE_MAX_AGE_SEC` / `CCC_HONCHO_CACHE_MAX_AGE_SEC` | `CCC_MEMORY_CACHE_TTL_SEC` | Per-source stale-warning thresholds |
