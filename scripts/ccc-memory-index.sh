@@ -233,7 +233,7 @@ def structured_fact_docs(path: Path):
         if review == "rejected":
             continue
         kind = str(obj.get("kind") or "fact")
-        durability = str(obj.get("durability") or ("volatile" if kind == "task-progress" else "durable"))
+        durability = str(obj.get("durability") or ("volatile" if kind == "task-progress" else "durable")).lower()
         observed_at = str(obj.get("observed_at") or "")
         # Decay: drop volatile facts past the TTL before they consume a dedup
         # slot or get indexed. Durable facts and undated facts are kept.

@@ -151,7 +151,13 @@ ok "fusion fuzzy lane recalls all-typo query" '[ "$rc" = 0 ] && jq -e ".retrieva
 # Decay/forgetting: volatile facts past CCC_MEMORY_VOLATILE_TTL_DAYS are dropped
 # at index time so stale working state stops surfacing; durable + undated facts
 # never decay (fail-safe); TTL=0 disables decay entirely.
-decay_facts="$state/decay-facts.jsonl"
+decay_state="$TMP/decay-state"
+decay_cache="$decay_state/cache"
+decay_mem="$decay_state/memories"
+mkdir -p "$decay_cache" "$decay_mem"
+printf 'decay fixture memory\n' > "$decay_mem/MEMORY.md"
+printf 'decay fixture user\n' > "$decay_mem/USER.md"
+decay_facts="$decay_state/decay-facts.jsonl"
 OLD_TS="$(python3 -c 'from datetime import datetime,timezone,timedelta; print((datetime.now(timezone.utc)-timedelta(days=40)).strftime("%Y-%m-%dT%H:%M:%SZ"))')"
 NEW_TS="$(python3 -c 'from datetime import datetime,timezone,timedelta; print((datetime.now(timezone.utc)-timedelta(days=2)).strftime("%Y-%m-%dT%H:%M:%SZ"))')"
 printf '%s\n' \
@@ -160,14 +166,19 @@ printf '%s\n' \
   "{\"id\":\"decay-durable\",\"kind\":\"decision\",\"text\":\"durable decision zgamma marker\",\"durability\":\"durable\",\"observed_at\":\"$OLD_TS\",\"review\":\"auto-local\"}" \
   "{\"id\":\"decay-undated\",\"kind\":\"task-progress\",\"text\":\"undated ephemeral progress zdelta marker\",\"durability\":\"volatile\",\"review\":\"auto-local\"}" \
   > "$decay_facts"
-CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CCC_MEMORY_FACTS_FILE="$decay_facts" bash "$ROOT/scripts/ccc-memory-index.sh" rebuild >/dev/null 2>&1
-dq() { CCC_STATE_DIR="$state" CCC_MEMORY_INDEX_DB="$state/memory-index.sqlite" bash "$ROOT/scripts/ccc-memory-search.sh" "$1" 2>/dev/null | jq '.results | length'; }
-ok "decay drops stale volatile fact from index" '[ "$(dq "zalpha")" = 0 ]'
-ok "decay keeps recent volatile fact" '[ "$(dq "zbeta")" = 1 ]'
-ok "decay never forgets durable fact" '[ "$(dq "zgamma")" = 1 ]'
-ok "decay keeps undated volatile fact (fail-safe)" '[ "$(dq "zdelta")" = 1 ]'
-CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CCC_MEMORY_FACTS_FILE="$decay_facts" CCC_MEMORY_VOLATILE_TTL_DAYS=0 bash "$ROOT/scripts/ccc-memory-index.sh" rebuild >/dev/null 2>&1
-ok "TTL=0 disables decay (stale volatile returns)" '[ "$(dq "zalpha")" = 1 ]'
+CCC_STATE_DIR="$decay_state" CCC_MEMORY_CACHE_DIR="$decay_cache" CCC_MEMORY_DIR="$decay_mem" CCC_MEMORY_FACTS_FILE="$decay_facts" bash "$ROOT/scripts/ccc-memory-index.sh" rebuild >/dev/null 2>&1
+dq_has() {
+  local out
+  out="$(CCC_STATE_DIR="$decay_state" CCC_MEMORY_INDEX_DB="$decay_state/memory-index.sqlite" \
+    bash "$ROOT/scripts/ccc-memory-search.sh" "$1" 2>/dev/null)" || return 1
+  jq -e --arg marker "$1" '.results | any(.[]; (((.path // "") + " " + (.snippet // "")) | contains($marker)))' >/dev/null <<<"$out"
+}
+ok "decay drops stale volatile fact from index" '! dq_has "zalpha"'
+ok "decay keeps recent volatile fact" 'dq_has "zbeta"'
+ok "decay never forgets durable fact" 'dq_has "zgamma"'
+ok "decay keeps undated volatile fact (fail-safe)" 'dq_has "zdelta"'
+CCC_STATE_DIR="$decay_state" CCC_MEMORY_CACHE_DIR="$decay_cache" CCC_MEMORY_DIR="$decay_mem" CCC_MEMORY_FACTS_FILE="$decay_facts" CCC_MEMORY_VOLATILE_TTL_DAYS=0 bash "$ROOT/scripts/ccc-memory-index.sh" rebuild >/dev/null 2>&1
+ok "TTL=0 disables decay (stale volatile returns)" 'dq_has "zalpha"'
 
 # restore the structured-fact index for the secret-redaction test below
 CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CCC_MEMORY_FACTS_FILE="$facts" bash "$ROOT/scripts/ccc-memory-index.sh" rebuild >/dev/null 2>&1
