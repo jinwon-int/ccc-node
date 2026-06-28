@@ -15,11 +15,11 @@ set -uo pipefail
 # Distill subprocess guard (defensive — SessionStart should already have it set).
 [ -n "${CLAUDE_DISTILL_INFLIGHT:-}" ] || export CLAUDE_DISTILL_INFLIGHT=1
 
-STATE_DIR="${CCC_STATE_DIR:-/root/.claude/state}"
+STATE_DIR="${CCC_STATE_DIR:-${HOME:-/root}/.claude/state}"
 LOG="$STATE_DIR/distill.log"
 QUEUE="$STATE_DIR/honcho-queue.jsonl"
 DEAD="$STATE_DIR/honcho-queue.jsonl.dead"
-CFG="${CCC_HONCHO_CFG:-/root/.hermes/honcho.json}"
+CFG="${CCC_HONCHO_CFG:-${HOME:-/root}/.hermes/honcho.json}"
 
 MAX_BATCH="${CCC_DISTILL_DRAIN_BATCH:-20}"
 MAX_ATTEMPTS="${CCC_DISTILL_DRAIN_MAX_ATTEMPTS:-3}"

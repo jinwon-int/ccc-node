@@ -24,7 +24,7 @@ fi
 
 # ---- off-switch ------------------------------------------------------------
 # State dir is overridable for testing / non-root installs (#73).
-STATE_DIR="${CCC_STATE_DIR:-/root/.claude/state}"
+STATE_DIR="${CCC_STATE_DIR:-${HOME:-/root}/.claude/state}"
 LOG="$STATE_DIR/distill.log"
 mkdir -p "$STATE_DIR" 2>/dev/null
 
@@ -78,7 +78,7 @@ PROJECT_ENC=""
 # Fallback: find the most-recent transcript jsonl for cwd-encoded project dir.
 # Uses CLAUDE_PROJECTS_DIR (default /root/.claude/projects) so non-root
 # installs (e.g. /opt/ccc-node on nosuk/soonwook/dungae) work out of the box.
-PROJECTS_DIR="${CLAUDE_PROJECTS_DIR:-/root/.claude/projects}"
+PROJECTS_DIR="${CLAUDE_PROJECTS_DIR:-${HOME:-/root}/.claude/projects}"
 if [ -z "$TRANSCRIPT_PATH" ] || [ ! -f "$TRANSCRIPT_PATH" ]; then
   for PROJ_ENC in "$(encode_project_dir "${PWD:-/root}")" "$(legacy_project_dir "${PWD:-/root}")"; do
     TRANSCRIPT_PATH="$(ls -t "$PROJECTS_DIR/$PROJ_ENC"/*.jsonl 2>/dev/null | head -1)"
@@ -128,7 +128,7 @@ fi
 # ---- fire pipeline (detach so hook returns fast; SessionEnd has tight timeout)
 # Dynamic hookdir — works in both standalone (~/.claude/hooks/) and plugin
 # (${CLAUDE_PLUGIN_ROOT}/hooks/) modes. distill/ sub-scripts must sit next to this file.
-HOOKDIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)" || HOOKDIR=/root/.claude/hooks
+HOOKDIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)" || HOOKDIR=${HOME:-/root}/.claude/hooks
 (
   export CLAUDE_DISTILL_INFLIGHT=1
   export CLAUDE_DISTILL_TRIGGER="$TRIGGER"

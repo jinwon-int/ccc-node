@@ -10,7 +10,7 @@
 # Legacy lines are accepted as either `<epoch> <hash>` or `<hash>`.
 set -uo pipefail
 
-STATE_DIR="${CCC_STATE_DIR:-/root/.claude/state}"
+STATE_DIR="${CCC_STATE_DIR:-${HOME:-/root}/.claude/state}"
 QUEUE="$STATE_DIR/wiki-candidates.md"
 SEEN="$STATE_DIR/wiki-candidates.seen"
 mkdir -p "$STATE_DIR" 2>/dev/null

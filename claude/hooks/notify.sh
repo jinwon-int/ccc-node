@@ -8,8 +8,8 @@ set -uo pipefail
 
 EVENT="${1:-Notification}"
 input="$(cat 2>/dev/null)"
-LOG="${CCC_AUDIT_LOG:-/root/.claude/state/audit.jsonl}"
-APPROVAL="${CCC_APPROVAL_LOG:-/root/.claude/state/approval-needed.log}"
+LOG="${CCC_AUDIT_LOG:-${HOME:-/root}/.claude/state/audit.jsonl}"
+APPROVAL="${CCC_APPROVAL_LOG:-${HOME:-/root}/.claude/state/approval-needed.log}"
 mkdir -p "$(dirname "$LOG")" 2>/dev/null
 
 ts="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)"
@@ -44,8 +44,8 @@ fi
 
 # SessionEnd: archive the working-state checkpoint so it survives session exit.
 if [ "$EVENT" = "SessionEnd" ]; then
-  WS="${CCC_WORKING_STATE:-/root/.claude/state/working-state.md}"
-  ARCH_DIR="${CCC_SESSION_ARCHIVE:-/root/.claude/state/session-archive}"
+  WS="${CCC_WORKING_STATE:-${HOME:-/root}/.claude/state/working-state.md}"
+  ARCH_DIR="${CCC_SESSION_ARCHIVE:-${HOME:-/root}/.claude/state/session-archive}"
   if [ -f "$WS" ]; then
     mkdir -p "$ARCH_DIR" 2>/dev/null
     stamp="$(printf '%s' "$ts" | tr ':' '-')"

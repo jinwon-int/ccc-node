@@ -17,7 +17,7 @@ if [ -n "${CLAUDE_DISTILL_INFLIGHT:-}" ] || [ -n "${CLAUDE_SKILL_REVIEW_INFLIGHT
   exit 0
 fi
 
-STATE_DIR="${CCC_STATE_DIR:-/root/.claude/state}"
+STATE_DIR="${CCC_STATE_DIR:-${HOME:-/root}/.claude/state}"
 LOG="$STATE_DIR/skill-review.log"
 PENDING_DIR="$STATE_DIR/pending-skills"
 mkdir -p "$STATE_DIR" "$PENDING_DIR" 2>/dev/null
@@ -39,7 +39,7 @@ SESSION_ID="$(printf '%s' "$HOOK_INPUT" | jq -r '.session_id // empty' 2>/dev/nu
 TRANSCRIPT_PATH="$(printf '%s' "$HOOK_INPUT" | jq -r '.transcript_path // empty' 2>/dev/null)"
 SOURCE_CWD="$(printf '%s' "$HOOK_INPUT" | jq -r '.cwd // .workspace.current_dir // .workspace.cwd // empty' 2>/dev/null)"
 
-PROJECTS_DIR="${CLAUDE_PROJECTS_DIR:-/root/.claude/projects}"
+PROJECTS_DIR="${CLAUDE_PROJECTS_DIR:-${HOME:-/root}/.claude/projects}"
 if [ -z "$TRANSCRIPT_PATH" ] || [ ! -f "$TRANSCRIPT_PATH" ]; then
   for PROJ_ENC in "$(encode_project_dir "${PWD:-/root}")" "$(legacy_project_dir "${PWD:-/root}")"; do
     TRANSCRIPT_PATH="$(ls -t "$PROJECTS_DIR/$PROJ_ENC"/*.jsonl 2>/dev/null | head -1)"
@@ -94,7 +94,7 @@ fi
 date -u +%s > "$LAST_FILE" 2>/dev/null || true
 log "start trigger=$TRIGGER session=$SESSION_ID transcript=$TRANSCRIPT_PATH source_cwd=$SOURCE_CWD project=$PROJECT_ENC turns=$TURNS pid=$$"
 
-HOOKDIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)" || HOOKDIR=/root/.claude/hooks
+HOOKDIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)" || HOOKDIR=${HOME:-/root}/.claude/hooks
 (
   export CLAUDE_SKILL_REVIEW_INFLIGHT=1
   # Reuse the existing distill recursion guard understood by load-memory,
@@ -105,7 +105,7 @@ HOOKDIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)" || HOOKD
   export CLAUDE_SKILL_REVIEW_TRANSCRIPT="$TRANSCRIPT_PATH"
   export CLAUDE_SKILL_REVIEW_SOURCE_CWD="$SOURCE_CWD"
   export CLAUDE_SKILL_REVIEW_SOURCE_PROJECT="$PROJECT_ENC"
-  export CLAUDE_SKILLS_DIR="${CLAUDE_SKILLS_DIR:-/root/.claude/skills}"
+  export CLAUDE_SKILLS_DIR="${CLAUDE_SKILLS_DIR:-${HOME:-/root}/.claude/skills}"
   export CCC_SKILL_REVIEW_PENDING_DIR="$PENDING_DIR"
 
   PIPE_PID="${BASHPID:-$$}"
