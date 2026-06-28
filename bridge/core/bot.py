@@ -254,7 +254,10 @@ class TelegramBot:
             data = json.loads(raw) if raw else {}
         except json.JSONDecodeError:
             preview = raw.replace("\n", " ")[:200]
-            return False, f"invalid claude auth response: {preview}"
+            return (
+                False,
+                f"invalid claude auth response (cli={cli_path}, exit={proc.returncode}): {preview}",
+            )
 
         if data.get("loggedIn") is True:
             return True, ""
