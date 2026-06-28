@@ -87,7 +87,7 @@ refresh_honcho() {
   local start end duration honcho ws peer target token tmp status err query
   start="$(now_ms)"
   tmp="$CACHE/honcho.txt.tmp.$$"
-  status="ok"; err=""
+  status="ok"; err=""; query=""
   if is_disabled "$HONCHO_ENABLED" || [ "$PROFILE" = "max-perf" ]; then
     status="disabled"; err="Honcho read path disabled"
   elif [ ! -f "$HONCHO_CFG" ]; then
