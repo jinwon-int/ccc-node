@@ -4,7 +4,6 @@ import logging
 import os
 import platform
 import re
-import shlex
 import signal
 import shutil
 import subprocess
@@ -42,6 +41,8 @@ from telegram_bot.core.push_notifier import PushNotifier
 from telegram_bot.core.session_isolation import apply_subprocess_session_isolation
 from telegram_bot.core import ui
 from telegram_bot.core import media
+from telegram_bot.core import paths as path_scope
+from telegram_bot.core import revert as revert_ops
 from telegram_bot.core.task_queue import UserTaskQueue
 from .conversation_paths import resolve_conversation_file
 from telegram_bot.core.project_chat import (
@@ -129,10 +130,8 @@ class TelegramBot:
         ("opus", "Claude Opus"),
         ("haiku", "Claude Haiku"),
     ]
-    _PATH_GUARDED_TOOLS = {"Read", "Edit", "Write", "MultiEdit", "Glob", "Grep", "Bash"}
     _ALLOW_OUTSIDE_ONCE_TOKEN = "ALLOW_OUTSIDE_ONCE"
     _DENY_OUTSIDE_TOKEN = "DENY_OUTSIDE"
-    _PATH_KEYWORDS = ("path", "file", "cwd", "dir", "directory", "root")
     _MAX_INFLIGHT_MESSAGES = 3
     _STALE_AUDIO_SECONDS = 24 * 60 * 60
     _WATCHDOG_INTERVAL = 60
@@ -561,105 +560,34 @@ class TelegramBot:
         return text.strip() in ("/stop", "/revert")
 
     @staticmethod
-    def _is_within_project_root(path: FilePath) -> bool:
+    def _project_root() -> FilePath:
         from telegram_bot.core.project_chat import PROJECT_ROOT
 
-        try:
-            return path.resolve(strict=False).is_relative_to(PROJECT_ROOT)
-        except Exception:
-            return False
+        return PROJECT_ROOT
+
+    @staticmethod
+    def _is_within_project_root(path: FilePath) -> bool:
+        return path_scope.is_within_project_root(path, TelegramBot._project_root())
 
     @staticmethod
     def _resolve_candidate_path(raw_path: str) -> FilePath:
-        from telegram_bot.core.project_chat import PROJECT_ROOT
-
-        candidate = FilePath(raw_path.strip().strip("\"'")).expanduser()
-        if not candidate.is_absolute():
-            candidate = PROJECT_ROOT / candidate
-        return candidate.resolve(strict=False)
+        return path_scope.resolve_candidate_path(raw_path, TelegramBot._project_root())
 
     @staticmethod
     def _iter_strings(value: Any) -> Iterable[str]:
-        if isinstance(value, str):
-            yield value
-            return
-        if isinstance(value, dict):
-            for item in value.values():
-                yield from TelegramBot._iter_strings(item)
-            return
-        if isinstance(value, (list, tuple)):
-            for item in value:
-                yield from TelegramBot._iter_strings(item)
+        return path_scope.iter_strings(value)
 
     @staticmethod
     def _extract_paths_from_command(command: str) -> List[str]:
-        try:
-            tokens = shlex.split(command)
-        except Exception:
-            tokens = command.split()
-
-        candidates: List[str] = []
-        for token in tokens:
-            token = token.strip()
-            if not token or token.startswith("-") or "://" in token:
-                continue
-            if token.startswith(("~", "/", "./", "../")) or "/" in token:
-                candidates.append(token)
-        return candidates
+        return path_scope.extract_paths_from_command(command)
 
     def _extract_path_candidates(self, tool_name: str, tool_input: Any) -> List[str]:
-        candidates: List[str] = []
-        seen = set()
-
-        def add_candidate(raw: str):
-            raw = raw.strip()
-            if not raw or raw in seen:
-                return
-            seen.add(raw)
-            candidates.append(raw)
-
-        def walk(value: Any, parent_key: str = ""):
-            if isinstance(value, dict):
-                for key, item in value.items():
-                    key_lower = key.lower()
-                    if isinstance(item, str) and any(
-                        word in key_lower for word in self._PATH_KEYWORDS
-                    ):
-                        add_candidate(item)
-                    else:
-                        walk(item, key_lower)
-                return
-            if isinstance(value, (list, tuple)):
-                for item in value:
-                    walk(item, parent_key)
-                return
-            if isinstance(value, str) and parent_key == "command":
-                for token in self._extract_paths_from_command(value):
-                    add_candidate(token)
-
-        walk(tool_input)
-        if tool_name == "Bash":
-            for text in self._iter_strings(tool_input):
-                for token in self._extract_paths_from_command(text):
-                    add_candidate(token)
-        return candidates
+        return path_scope.extract_path_candidates(tool_name, tool_input)
 
     def _extract_outside_paths(self, tool_name: str, tool_input: Any) -> List[str]:
-        if tool_name not in self._PATH_GUARDED_TOOLS:
-            return []
-        outside: List[str] = []
-        seen = set()
-        for raw_path in self._extract_path_candidates(tool_name, tool_input):
-            try:
-                resolved = self._resolve_candidate_path(raw_path)
-            except Exception:
-                continue
-            if not self._is_within_project_root(resolved):
-                path_str = str(resolved)
-                if path_str not in seen:
-                    seen.add(path_str)
-                    outside.append(path_str)
-        return outside
+        return path_scope.extract_outside_paths(
+            tool_name, tool_input, project_root=self._project_root()
+        )
 
     async def _consume_outside_approval_once(self, user_id: int, chat_id: Optional[int] = None) -> bool:
         session_key = self._conversation_key(user_id, chat_id)
@@ -1410,41 +1338,13 @@ class TelegramBot:
                 session_id,
             )
             return False
-        if not filepath.exists():
-            return False
 
-        tmp_path: Optional[FilePath] = None
-        try:
-            # Read all lines up to (but NOT including) the target message
-            # This reverts TO the state BEFORE the selected message
-            lines_to_keep = []
-            with open(filepath, "r", encoding="utf-8") as f:
-                for idx, line in enumerate(f):
-                    if idx >= msg_index:
-                        break
-                    lines_to_keep.append(line)
-
-            # Write the truncated conversation atomically to avoid partial files.
-            tmp_path = filepath.with_name(
-                f".{filepath.name}.tmp-{os.getpid()}-{time.time_ns()}"
-            )
-            with open(tmp_path, "w", encoding="utf-8") as f:
-                f.writelines(lines_to_keep)
-            os.replace(tmp_path, filepath)
-
+        if revert_ops.truncate_jsonl_to(filepath, msg_index):
             logger.info(
                 f"User {user_id}: conversation reverted to before message {msg_index} (mode: {mode})"
             )
             return True
-
-        except Exception as e:
-            if tmp_path is not None:
-                try:
-                    tmp_path.unlink(missing_ok=True)
-                except Exception:
-                    pass
-            logger.error(f"Conversation revert failed: {e}", exc_info=True)
-            return False
+        return False
 
     async def _execute_summarize_mode(
         self, user_id: int, session_id: str, msg_index: int
@@ -2576,14 +2476,7 @@ class TelegramBot:
     def _split_paths_by_scope(
         self, paths: List[FilePath]
     ) -> Tuple[List[FilePath], List[FilePath]]:
-        in_root: List[FilePath] = []
-        outside: List[FilePath] = []
-        for path in paths:
-            if self._is_within_project_root(path):
-                in_root.append(path)
-            else:
-                outside.append(path)
-        return in_root, outside
+        return path_scope.split_paths_by_scope(paths, self._project_root())
 
     def _extract_options(self, text: str) -> List[str]:
         """Extract numbered options from text like '1. xxx\n2. xxx'."""
