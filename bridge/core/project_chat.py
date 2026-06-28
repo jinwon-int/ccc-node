@@ -73,7 +73,7 @@ ALLOWED_TOOLS = [
     # AskUserQuestion is handled via disallowed_tools + can_use_tool callback
 ]
 
-PROCESS_TIMEOUT = int(os.getenv("CLAUDE_PROCESS_TIMEOUT", "3600"))
+PROCESS_TIMEOUT = int(os.getenv("CLAUDE_PROCESS_TIMEOUT", "21600"))
 
 
 # Pure SDK-stream / text helpers live in core/sdk_text.py (error classification,
