@@ -96,12 +96,12 @@ refresh_honcho() {
     # Config may use the nested `.hosts.hermes.*` schema (aiPeer/peerName/workspace/
     # apiKey) instead of the legacy top-level keys; read top-level first, fall back to
     # the nested block so both layouts work.
-    honcho="$(jq -r '.baseUrl // .hosts.hermes.baseUrl // empty' "$HONCHO_CFG" 2>/dev/null)"
-    ws="$(jq -r '.workspace // .hosts.hermes.workspace // "seoyoon-family"' "$HONCHO_CFG" 2>/dev/null)"
-    peer="$(jq -r '.peerName // .hosts.hermes.peerName // empty' "$HONCHO_CFG" 2>/dev/null)"
-    target="$(jq -r '.target // .hosts.hermes.peerName // "seo-jin-on"' "$HONCHO_CFG" 2>/dev/null)"
-    token="$(jq -r '.authToken // .apiKey // .hosts.hermes.apiKey // empty' "$HONCHO_CFG" 2>/dev/null)"
-    rl="$(jq -r '.reasoningLevel // .hosts.hermes.dialecticReasoningLevel // "low"' "$HONCHO_CFG" 2>/dev/null)"
+    honcho="$(jq -r 'def nz(x): x | select(. != null and . != ""); nz(.baseUrl) // nz(.hosts.hermes.baseUrl) // empty' "$HONCHO_CFG" 2>/dev/null)"
+    ws="$(jq -r 'def nz(x): x | select(. != null and . != ""); nz(.workspace) // nz(.hosts.hermes.workspace) // "seoyoon-family"' "$HONCHO_CFG" 2>/dev/null)"
+    peer="$(jq -r 'def nz(x): x | select(. != null and . != ""); nz(.peerName) // nz(.hosts.hermes.peerName) // empty' "$HONCHO_CFG" 2>/dev/null)"
+    target="$(jq -r 'def nz(x): x | select(. != null and . != ""); nz(.target) // nz(.hosts.hermes.peerName) // "seo-jin-on"' "$HONCHO_CFG" 2>/dev/null)"
+    token="$(jq -r 'def nz(x): x | select(. != null and . != ""); nz(.authToken) // nz(.apiKey) // nz(.hosts.hermes.apiKey) // empty' "$HONCHO_CFG" 2>/dev/null)"
+    rl="$(jq -r 'def nz(x): x | select(. != null and . != ""); nz(.reasoningLevel) // nz(.hosts.hermes.dialecticReasoningLevel) // "low"' "$HONCHO_CFG" 2>/dev/null)"
     query="For the current ccc-node task, summarize only directly relevant user preferences, operating constraints, and current priorities. Avoid repeating generic facts."
     if [ -z "$honcho" ] || [ -z "$peer" ]; then
       status="missing"; err="honcho baseUrl or peerName missing"
