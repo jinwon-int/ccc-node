@@ -38,7 +38,7 @@ if [ -n "$CHECK_TOOL" ]; then
 fi
 jq -n \
   --arg query "$QUERY" \
-  --arg retrieval "${CCC_MEMORY_RETRIEVAL:-fts}" \
+  --arg retrieval "${CCC_MEMORY_RETRIEVAL:-fts-rerank}" \
   --arg state_dir "$STATE_DIR" \
   --arg cache_dir "$CACHE" \
   --arg memory_dir "$MEMORY_DIR" \
