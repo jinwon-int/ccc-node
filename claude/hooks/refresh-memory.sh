@@ -9,7 +9,7 @@ set -uo pipefail
 STATE_DIR="${CCC_STATE_DIR:-${HOME:-/root}/.claude/state}"
 CACHE="${CCC_MEMORY_CACHE_DIR:-${HOME:-/root}/.claude/hooks/cache}"
 HOOKDIR="${CCC_HOOK_DIR:-${HOME:-/root}/.claude/hooks}"
-WIKI="${CCC_WIKI_AGENT_BIN:-/root/.wiki-agent/bin/wiki-agent}"
+WIKI="${CCC_WIKI_AGENT_BIN:-${HOME:-/root}/.wiki-agent/bin/wiki-agent}"
 HONCHO_CFG="${CCC_HONCHO_CFG:-${CCC_HERMES_DIR:-${HOME:-/root}/.hermes}/honcho.json}"
 WIKI_TIMEOUT="${CCC_WIKI_TIMEOUT_SEC:-60}"
 HONCHO_TIMEOUT="${CCC_HONCHO_TIMEOUT_SEC:-60}"
@@ -87,7 +87,7 @@ refresh_honcho() {
   local start end duration honcho ws peer target token tmp status err query
   start="$(now_ms)"
   tmp="$CACHE/honcho.txt.tmp.$$"
-  status="ok"; err=""
+  status="ok"; err=""; query=""
   if is_disabled "$HONCHO_ENABLED" || [ "$PROFILE" = "max-perf" ]; then
     status="disabled"; err="Honcho read path disabled"
   elif [ ! -f "$HONCHO_CFG" ]; then
