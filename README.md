@@ -169,7 +169,9 @@ hermes/
   honcho.template.json          # -> ~/.hermes/honcho.json (set baseUrl/peer/target)
 bridge/                    # Telegram <-> Claude Code bridge (vendored, history preserved)
   start.sh                 # daemon/supervisor entry (--path / --stop / --status / -d)
-  core/ interaction/ ...   # bridge source (upstream-independent fork)
+  core/                    # bridge source (upstream-independent fork): bot.py orchestrator +
+                           #   focused helpers ui/media/paths/task_queue/revert/sdk_text (unit-tested)
+  interaction/ utils/ ...  # bridge source (upstream-independent fork)
 docs/
   a2a-claude-worker.md     # A2A poller-vs-analysis-backend wiring + verification
   examples/a2a-termux-native-worker.env.example  # non-secret native mobile worker env shape
