@@ -6,6 +6,7 @@
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT" || exit 1
+TMP="${TMPDIR:-/tmp}"; mkdir -p "$TMP" 2>/dev/null || TMP="$ROOT/.harness-tmp"; mkdir -p "$TMP" 2>/dev/null
 fail=0
 say() { printf '%s\n' "$*"; }
 err() { printf 'FAIL: %s\n' "$*"; fail=1; }
@@ -104,10 +105,10 @@ fi
 # 1e) best-effort real load check via the Claude CLI (non-blocking if absent)
 if command -v claude >/dev/null 2>&1; then
   say "== claude plugin validate =="
-  if claude plugin validate . >/tmp/pluginval.out 2>&1; then
-    say "  ok claude plugin validate (see /tmp/pluginval.out)"
+  if claude plugin validate . >"$TMP/pluginval.out" 2>&1; then
+    say "  ok claude plugin validate (see $TMP/pluginval.out)"
   else
-    say "  (claude plugin validate reported issues — review /tmp/pluginval.out; non-blocking)"
+    say "  (claude plugin validate reported issues — review $TMP/pluginval.out; non-blocking)"
   fi
 fi
 
@@ -143,8 +144,8 @@ for t in claude/hooks/guard.test.sh claude/hooks/observability.test.sh claude/ho
          scripts/ccc-doctor.test.sh scripts/ccc-memory.test.sh scripts/ccc-distill-check.test.sh scripts/ccc-security-audit.test.sh \
          scripts/agent-cron.test.sh scripts/agent-cron-lib.test.sh scripts/a2a-termux-native-worker.test.sh; do
   [ -f "$t" ] || { err "missing test: $t"; continue; }
-  if bash "$t" >/tmp/htest.out 2>&1; then say "  ok $(grep -E 'PASS=' /tmp/htest.out | tail -1) $t";
-  else err "test failed: $t"; tail -5 /tmp/htest.out; fi
+  if bash "$t" >"$TMP/htest.out" 2>&1; then say "  ok $(grep -E 'PASS=' "$TMP/htest.out" | tail -1) $t";
+  else err "test failed: $t"; tail -5 "$TMP/htest.out"; fi
 done
 
 # 5) skill + agent frontmatter (must start with --- and carry name: + description:)
@@ -214,8 +215,8 @@ else
 fi
 # 6c) Rendered standalone settings (base + overlay) must be valid and carry all hook events.
 if jq -s '.[0] as $b | .[1] as $o | $b | .hooks = ($b.hooks + $o.hooks)' \
-     claude/settings.base.json claude/hooks/enforcement-overlay.json >/tmp/rendered.json 2>/dev/null \
-   && jq -e '.hooks.PreToolUse and .hooks.SessionStart and .statusLine and .outputStyle' /tmp/rendered.json >/dev/null 2>&1; then
+     claude/settings.base.json claude/hooks/enforcement-overlay.json >"$TMP/rendered.json" 2>/dev/null \
+   && jq -e '.hooks.PreToolUse and .hooks.SessionStart and .statusLine and .outputStyle' "$TMP/rendered.json" >/dev/null 2>&1; then
   say "  ok rendered standalone settings valid (node-local + portable + statusLine + outputStyle)"
 else
   err "rendered standalone settings (base+overlay) invalid or missing expected keys"
