@@ -231,6 +231,7 @@ behavior:
 | `CCC_STATE_DIR` | `$CCC_CLAUDE_DIR/state` | Node state plus local `memory-index.sqlite` |
 | `CCC_HONCHO_MEMORY_ENABLED` | `1` | Set `0`/`false`/`off` to remove Honcho from the read path while keeping local/Wiki memory |
 | `CCC_LOCAL_MEMORY_ENABLED` | `1` (on) | Local hot-memory index search is queried for every profile by default; set `0`/`false`/`off` to opt out |
+| `CCC_MEMORY_FUSION` | `1` (on) | Fuse the lexical lane with a stdlib char-ngram fuzzy lane (RRF) so typo/transposed/morphological queries still recall; set `0`/`false`/`off` for the lexical lane only |
 | `CCC_MEMORY_MAX_BYTES` | `12000` | Total SessionStart memory injection byte budget |
 | `CCC_MEMORY_QUERY_MAX_BYTES` | mode-specific | Max task-aware query bytes; remote defaults lower than local |
 | `CCC_WIKI_CACHE_MAX_AGE_SEC` / `CCC_HONCHO_CACHE_MAX_AGE_SEC` | `CCC_MEMORY_CACHE_TTL_SEC` | Per-source stale-warning thresholds |

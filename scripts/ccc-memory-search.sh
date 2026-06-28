@@ -107,7 +107,79 @@ def rerank(cands):
         out.append({"path":c["path"],"source":c["source"],"snippet":c["snippet"],
                     "score":round(score,4),"signals":signals})
     out.sort(key=lambda x: x["score"], reverse=True)
-    return out[:limit]
+    return out
+
+def char_ngrams(s, n=3):
+    # Character n-grams over a normalized stream (alnum + Hangul + CJK). This is
+    # a stdlib, no-network fuzzy-recall signal: it matches morphological variants,
+    # typos, and partial tokens that exact FTS tokenization misses — especially
+    # for agglutinative Korean ("메모리" vs "메모리를"), where surface forms differ
+    # but share character n-grams. It is NOT neural semantics (no synonymy across
+    # scripts); a true embedding lane would slot into the same RRF fusion below.
+    chars=re.findall(r"[0-9a-z가-힣぀-ヿ一-鿿]", s.lower())
+    norm="".join(chars)
+    if len(norm) < n:
+        return {norm} if norm else set()
+    return {norm[i:i+n] for i in range(len(norm)-n+1)}
+
+def fuzzy_scan(qgrams, n_over):
+    # Full scan of the (small, bounded) hot index, scored by how much of the
+    # query's char-ngram profile the doc covers (containment coefficient).
+    if not qgrams:
+        return []
+    out=[]
+    for r in con.execute("SELECT path, source, content, updated_at FROM memory_docs"):
+        content=r["content"] or ""
+        dg=char_ngrams(r["path"]+" "+content)
+        if not dg:
+            continue
+        sim=len(qgrams & dg)/len(qgrams)
+        if sim < 0.34:
+            continue
+        out.append({"path":r["path"],"source":r["source"],"snippet":content[:240],
+                    "content":content,"updated_at":r["updated_at"] or "","fuzzy_sim":round(sim,4)})
+    out.sort(key=lambda x: x["fuzzy_sim"], reverse=True)
+    return out[:n_over]
+
+def fuzzy_rerank(cands):
+    out=[]
+    for c in cands:
+        content=c.get("content") or ""
+        signals={
+            "fuzzy_sim": c["fuzzy_sim"],
+            "source_boost": source_boost(c["source"], content),
+            "recency_boost": round(recency_boost(c.get("updated_at")), 4),
+            "durability_penalty": durability_penalty(content),
+        }
+        score=(c["fuzzy_sim"]*8.0)+signals["source_boost"]+signals["recency_boost"]+signals["durability_penalty"]
+        out.append({"path":c["path"],"source":c["source"],"snippet":c["snippet"],
+                    "score":round(score,4),"signals":signals})
+    out.sort(key=lambda x: x["score"], reverse=True)
+    return out
+
+def rrf_fuse(lanes, k=60):
+    # Reciprocal Rank Fusion: each lane contributes 1/(k+rank). Docs found by
+    # multiple lanes accumulate; the richer per-doc record (more signals) is kept.
+    agg={}
+    for lane in lanes:
+        for rank, item in enumerate(lane):
+            p=item["path"]
+            cur=agg.get(p)
+            contrib=1.0/(k+rank+1)
+            if cur is None:
+                agg[p]={"item":item,"rrf":contrib,"nsig":len(item.get("signals",{}))}
+            else:
+                cur["rrf"]+=contrib
+                if len(item.get("signals",{})) > cur["nsig"]:
+                    cur["item"]=item; cur["nsig"]=len(item.get("signals",{}))
+    fused=[]
+    for v in agg.values():
+        it=dict(v["item"])
+        it["score"]=round(v["rrf"], 6)
+        it.setdefault("signals", {})["rrf"]=round(v["rrf"], 6)
+        fused.append(it)
+    fused.sort(key=lambda x: x["score"], reverse=True)
+    return fused[:limit]
 
 def source_boost(source: str, content: str):
     s=source or ""
@@ -167,9 +239,12 @@ if requested in {"hybrid", "hybrid-local"}:
     mode = requested
     rows = hybrid(toks)
 else:
-    # Default: FTS5 candidate generation (over-fetched) + explainable boost
-    # rerank. Falls back to LIKE (also reranked) when FTS5 is unavailable.
-    mode = "fts-rerank"
+    # Default: a lexical lane (FTS5 candidate generation + boost rerank; LIKE
+    # fallback) fused with a stdlib fuzzy char-ngram lane via Reciprocal Rank
+    # Fusion. The fuzzy lane recalls morphological / typo / partial-token matches
+    # the exact FTS tokenizer misses (notably Korean surface-form variation),
+    # without any model or network. Set CCC_MEMORY_FUSION=0 for the lexical lane
+    # only. The fusion is the seam a future embedding lane would plug into.
     over = max(limit * 6, 30)
     expr = fts_query(toks)
     cands=[]
@@ -183,6 +258,19 @@ else:
             cands = run_like(toks, over)
         except sqlite3.OperationalError:
             cands = []
-    rows = rerank(cands)
+    lexical = rerank(cands)
+    import os as _os
+    fusion_on = _os.environ.get("CCC_MEMORY_FUSION", "1").strip().lower() not in {"0","false","off","no"}
+    if fusion_on:
+        fuzzy = fuzzy_rerank(fuzzy_scan(char_ngrams(query), over))
+        if fuzzy:
+            mode = "fusion-rrf"
+            rows = rrf_fuse([lexical, fuzzy])
+        else:
+            mode = "fts-rerank"
+            rows = lexical[:limit]
+    else:
+        mode = "fts-rerank"
+        rows = lexical[:limit]
 print(json.dumps({"query":query,"tokens":toks,"retrievalMode":mode,"results":rows}, ensure_ascii=False, indent=2))
 PY
