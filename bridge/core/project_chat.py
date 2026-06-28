@@ -152,7 +152,6 @@ class ProjectChatHandler:
 
     def __init__(self):
         self.project_root = PROJECT_ROOT
-        self._active_tasks: Dict[int, asyncio.Task] = {}
         # Streams are scoped by Telegram conversation, not only user. A single
         # Telegram user may talk to the bridge in a private DM and a group at the
         # same time; sharing one Claude stream made pending ResultMessages race
@@ -653,10 +652,6 @@ class ProjectChatHandler:
         logger.info(f"Processing message from user {user_id}: {user_message[:80]}...")
         log_chat(user_id, session_id, "user", user_message, model=model)
 
-        task = asyncio.current_task()
-        if task:
-            self._active_tasks[user_id] = task
-
         loop = asyncio.get_running_loop()
         future: asyncio.Future = loop.create_future()
 
@@ -826,9 +821,6 @@ class ProjectChatHandler:
                 success=False,
                 error=err,
             )
-
-        finally:
-            self._active_tasks.pop(user_id, None)
 
     async def stop(self, user_id: int, chat_id: Optional[int] = None) -> bool:
         """Stop active stream(s) for a user and fail pending requests."""
