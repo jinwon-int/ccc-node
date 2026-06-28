@@ -737,7 +737,6 @@ def run_dry_plan(data):
         plan, row = run_plan_for(data, task_id, at_value)
         if row is None:
             return {'ok': False, 'mode': 'run-dry-run-read-only', 'taskId': task_id, 'error': 'task id not found in due plan'}, as_json, 1
-        headless_cmd = os.environ.get('CCC_HEADLESS_CMD') or str(Path(os.environ.get('SCRIPT_ROOT', '.')) / 'claude' / 'headless.sh')
         notify = task.get('notify', 'none')
         result = {
             'ok': plan.get('ok', False),
