@@ -1133,6 +1133,7 @@ class TelegramBot:
         """Handle revert-related callback queries."""
         query = self._require_callback_query(update)
         user_id = self._require_user(update).id
+        chat_id = update.effective_chat.id if update.effective_chat else None
 
         # Parse callback data
         parts = data.split(":")
@@ -1221,7 +1222,7 @@ class TelegramBot:
 
             try:
                 success = await self._execute_revert(
-                    user_id, session_id, msg_index, mode
+                    user_id, session_id, msg_index, mode, chat_id=chat_id
                 )
 
                 if success:
@@ -1248,7 +1249,8 @@ class TelegramBot:
                 await query.edit_message_text(f"❌ Revert failed: {e}")
 
     async def _execute_revert(
-        self, user_id: int, session_id: str, msg_index: int, mode: str
+        self, user_id: int, session_id: str, msg_index: int, mode: str,
+        chat_id: Optional[int] = None,
     ) -> bool:
         """Execute revert operation based on selected mode.
 
@@ -1257,13 +1259,15 @@ class TelegramBot:
             session_id: Current session ID
             msg_index: Index of message to revert to in JSONL file
             mode: Revert mode (full, conv, code, summary)
+            chat_id: Telegram chat ID, so the right per-conversation task/stream
+                is cancelled in group chats (queue keys are conversation-scoped)
 
         Returns:
             True if revert succeeded, False otherwise
         """
         try:
             # Cancel any active operations first
-            await self._cancel_active_operations(user_id)
+            await self._cancel_active_operations(user_id, chat_id)
 
             if mode == "summary":
                 # Summarize mode: inject summary request message
@@ -1288,13 +1292,21 @@ class TelegramBot:
             logger.error(f"Execute revert failed: {e}", exc_info=True)
             return False
 
-    async def _cancel_active_operations(self, user_id: int) -> None:
-        """Cancel active streaming and voice tasks before revert."""
-        # Cancel streaming
-        await self._cancel_user_streaming(user_id)
+    async def _cancel_active_operations(self, user_id: int, chat_id: Optional[int] = None) -> None:
+        """Cancel active streaming and voice tasks before revert.
+
+        The run queue is keyed per conversation (``user_id:chat_id`` in groups),
+        so cancellation must use the conversation key — falling back to the bare
+        ``user_id`` key for DMs / legacy entries — or a group chat's in-flight
+        task is missed and keeps running while the conversation is truncated.
+        """
+        conversation_key = self._conversation_key(user_id, chat_id)
+
+        # Cancel streaming (scoped to this conversation)
+        await self._cancel_user_streaming(user_id, chat_id)
 
         # Cancel active task
-        active_task = self._tasks.active(user_id)
+        active_task = self._tasks.active(conversation_key) or self._tasks.active(user_id)
         if active_task and not active_task.done():
             active_task.cancel()
             try:
