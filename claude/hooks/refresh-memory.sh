@@ -93,11 +93,15 @@ refresh_honcho() {
   elif [ ! -f "$HONCHO_CFG" ]; then
     status="missing"; err="honcho config missing"
   else
-    honcho="$(jq -r '.baseUrl // empty' "$HONCHO_CFG" 2>/dev/null)"
-    ws="$(jq -r '.workspace // "seoyoon-family"' "$HONCHO_CFG" 2>/dev/null)"
-    peer="$(jq -r '.peerName // empty' "$HONCHO_CFG" 2>/dev/null)"
-    target="$(jq -r '.target // "seo-jin-on"' "$HONCHO_CFG" 2>/dev/null)"
-    token="$(jq -r '.authToken // .apiKey // empty' "$HONCHO_CFG" 2>/dev/null)"
+    # Config may use the nested `.hosts.hermes.*` schema (aiPeer/peerName/workspace/
+    # apiKey) instead of the legacy top-level keys; read top-level first, fall back to
+    # the nested block so both layouts work.
+    honcho="$(jq -r '.baseUrl // .hosts.hermes.baseUrl // empty' "$HONCHO_CFG" 2>/dev/null)"
+    ws="$(jq -r '.workspace // .hosts.hermes.workspace // "seoyoon-family"' "$HONCHO_CFG" 2>/dev/null)"
+    peer="$(jq -r '.peerName // .hosts.hermes.peerName // empty' "$HONCHO_CFG" 2>/dev/null)"
+    target="$(jq -r '.target // .hosts.hermes.peerName // "seo-jin-on"' "$HONCHO_CFG" 2>/dev/null)"
+    token="$(jq -r '.authToken // .apiKey // .hosts.hermes.apiKey // empty' "$HONCHO_CFG" 2>/dev/null)"
+    rl="$(jq -r '.reasoningLevel // .hosts.hermes.dialecticReasoningLevel // "low"' "$HONCHO_CFG" 2>/dev/null)"
     query="For the current ccc-node task, summarize only directly relevant user preferences, operating constraints, and current priorities. Avoid repeating generic facts."
     if [ -z "$honcho" ] || [ -z "$peer" ]; then
       status="missing"; err="honcho baseUrl or peerName missing"
@@ -111,7 +115,7 @@ refresh_honcho() {
         "$honcho/v3/workspaces/$ws/peers/$peer/chat" \
         -H 'Content-Type: application/json' \
         "${auth_args[@]}" \
-        -d "$(jq -n --arg query "$query" --arg target "$target" '{query:$query,target:$target,reasoning_level:"low"}')" \
+        -d "$(jq -n --arg query "$query" --arg target "$target" --arg rl "$rl" '{query:$query,target:$target,reasoning_level:$rl}')" \
         2>"$tmp.err" | jq -r '.content // empty' > "$tmp" 2>>"$tmp.err"; then
         status="error"; err="$(tr '\n' ' ' < "$tmp.err" | cut -c1-240)"
       elif [ ! -s "$tmp" ]; then
