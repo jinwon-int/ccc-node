@@ -43,6 +43,7 @@ from telegram_bot.core import ui
 from telegram_bot.core import media
 from telegram_bot.core import paths as path_scope
 from telegram_bot.core import revert as revert_ops
+from telegram_bot.core.task_queue import UserTaskQueue
 from .conversation_paths import resolve_conversation_file
 from telegram_bot.core.project_chat import (
     project_chat_handler,
@@ -112,11 +113,9 @@ class TelegramBot:
         # Only sessions created/resumed in current runtime are auto-resumed.
         self._runtime_active_sessions: set[Any] = set()
         self._runtime_active_voice_sessions: set[Any] = set()
-        self._user_run_tasks: Dict[Any, set[asyncio.Task]] = {}
         self._user_voice_tasks: Dict[Any, set[asyncio.Task]] = {}
-        self._user_queue_locks: Dict[Any, asyncio.Lock] = {}
-        # Track currently executing task per user for priority stop command
-        self._active_tasks: Dict[Any, asyncio.Task] = {}
+        # Per-user bounded run queue + active-task tracking (priority stop/revert).
+        self._tasks = UserTaskQueue(self._MAX_INFLIGHT_MESSAGES)
         self._audio_dir = config.bot_data_dir / "audio"
         self._image_dir = config.bot_data_dir / "images"
         self._audio_processor = AudioProcessor(ffmpeg_path=config.ffmpeg_path)
@@ -1007,7 +1006,7 @@ class TelegramBot:
         await self._cancel_user_streaming(user_id, chat.id)
 
         # Cancel the currently executing task (priority stop)
-        active_task = self._active_tasks.get(conversation_key) or self._active_tasks.get(user_id)
+        active_task = self._tasks.active(conversation_key) or self._tasks.active(user_id)
         task_cancelled = False
         if active_task and not active_task.done():
             active_task.cancel()
@@ -1292,7 +1291,7 @@ class TelegramBot:
         await self._cancel_user_streaming(user_id)
 
         # Cancel active task
-        active_task = self._active_tasks.get(user_id)
+        active_task = self._tasks.active(user_id)
         if active_task and not active_task.done():
             active_task.cancel()
             try:
@@ -1445,49 +1444,8 @@ class TelegramBot:
             max_age_seconds=max_age_seconds,
         )
 
-    def _get_user_queue_lock(self, user_id: int) -> asyncio.Lock:
-        lock = self._user_queue_locks.get(user_id)
-        if lock is None:
-            lock = asyncio.Lock()
-            self._user_queue_locks[user_id] = lock
-        return lock
-
-    def _prune_user_tasks(self, user_id: int) -> set[asyncio.Task]:
-        tasks = self._user_run_tasks.get(user_id)
-        if not tasks:
-            tasks = set()
-            self._user_run_tasks[user_id] = tasks
-            return tasks
-        done = {t for t in tasks if t.done()}
-        tasks.difference_update(done)
-        return tasks
-
-    def _track_user_task(self, user_id: int, task: asyncio.Task) -> None:
-        tasks = self._prune_user_tasks(user_id)
-        tasks.add(task)
-
-        def _on_done(t: asyncio.Task):
-            current = self._user_run_tasks.get(user_id)
-            if current is not None:
-                current.discard(t)
-            try:
-                t.result()
-            except asyncio.CancelledError:
-                pass
-            except Exception as e:
-                logger.error(
-                    f"Background task failed for user {user_id}: {e}", exc_info=True
-                )
-
-        task.add_done_callback(_on_done)
-
     def _clear_user_queue(self, user_id: int) -> int:
-        tasks = self._prune_user_tasks(user_id)
-        cleared = len(tasks)
-        for t in list(tasks):
-            t.cancel()
-        tasks.clear()
-        return cleared
+        return self._tasks.clear(user_id)
 
     async def _enqueue_user_task(
         self,
@@ -1495,35 +1453,7 @@ class TelegramBot:
         run_task: Callable[[], Awaitable[None]],
         on_overflow: Callable[[], Awaitable[None]],
     ) -> bool:
-        lock = self._get_user_queue_lock(user_id)
-        accepted_task: Optional[asyncio.Task] = None
-
-        async with lock:
-            tasks = self._prune_user_tasks(user_id)
-            if len(tasks) >= self._MAX_INFLIGHT_MESSAGES:
-                accepted_task = None
-            else:
-                # Wrap run_task to track active task execution
-                async def wrapped_task():
-                    # Store as active task when execution starts
-                    current_task = asyncio.current_task()
-                    self._active_tasks[user_id] = current_task
-                    try:
-                        await run_task()
-                    except asyncio.CancelledError:
-                        # Re-raise to ensure cancellation propagates
-                        raise
-                    finally:
-                        # Remove from active tasks when done
-                        self._active_tasks.pop(user_id, None)
-
-                accepted_task = asyncio.create_task(wrapped_task())
-                self._track_user_task(user_id, accepted_task)
-
-        if not accepted_task:
-            await on_overflow()
-            return False
-        return True
+        return await self._tasks.enqueue(user_id, run_task, on_overflow)
 
     async def _cmd_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /command xxx - forward as Claude Code slash command"""
