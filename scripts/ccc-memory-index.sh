@@ -312,13 +312,13 @@ try:
         # vector, so the semantic lane just has fewer candidates).
         if EMBED_CMD:
             con.execute("CREATE TABLE IF NOT EXISTS memory_vectors (path TEXT PRIMARY KEY, content_hash TEXT, model TEXT, dim INTEGER, vec TEXT)")
-            existing = {r[0]: r[1] for r in con.execute("SELECT path, content_hash FROM memory_vectors")}
+            existing = {r[0]: (r[1], r[2]) for r in con.execute("SELECT path, content_hash, model FROM memory_vectors")}
             keep = set()
             for path, content in con.execute("SELECT path, content FROM memory_docs").fetchall():
                 keep.add(path)
                 h = hashlib.sha256((content or "").encode("utf-8")).hexdigest()
-                if existing.get(path) == h:
-                    continue  # unchanged since last embed -> no re-embed (cost control)
+                if existing.get(path) == (h, EMBED_MODEL):
+                    continue  # unchanged under the same model -> no re-embed (cost control)
                 vec = embed_text(content or "")
                 if vec is None:
                     continue

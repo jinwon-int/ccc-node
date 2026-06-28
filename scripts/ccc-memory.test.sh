@@ -194,6 +194,13 @@ c=sqlite3.connect(sys.argv[1])
 n=c.execute("select count(*) from memory_vectors").fetchone()[0]
 sys.exit(0 if n>=1 else 1)
 PY'
+CCC_STATE_DIR="$estate" CCC_MEMORY_CACHE_DIR="$estate/cache" CCC_MEMORY_DIR="$estate/memories" CCC_MEMORY_FACTS_FILE="$estate/facts.jsonl" CCC_MEMORY_EMBED_CMD="$embcmd" CCC_MEMORY_EMBED_MODEL="model-b" bash "$ROOT/scripts/ccc-memory-index.sh" update >/dev/null 2>&1
+ok "embedding vectors refresh when the model label changes" 'python3 - "$estate/memory-index.sqlite" <<PY >/dev/null 2>&1
+import sqlite3,sys
+c=sqlite3.connect(sys.argv[1])
+models={r[0] for r in c.execute("select model from memory_vectors")}
+sys.exit(0 if models == {"model-b"} else 1)
+PY'
 out="$(CCC_STATE_DIR="$estate" CCC_MEMORY_INDEX_DB="$estate/memory-index.sqlite" bash "$ROOT/scripts/ccc-memory-search.sh" "car rules" 2>&1)"; rc=$?
 ok "surface-form lanes miss the synonym query" '[ "$rc" = 0 ] && jq -e "(.results | length) == 0" >/dev/null <<<"$out"'
 out="$(CCC_STATE_DIR="$estate" CCC_MEMORY_INDEX_DB="$estate/memory-index.sqlite" CCC_MEMORY_EMBED_CMD="$embcmd" bash "$ROOT/scripts/ccc-memory-search.sh" "car rules" 2>&1)"; rc=$?
