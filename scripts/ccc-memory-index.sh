@@ -21,11 +21,42 @@ mkdir -p "$STATE_DIR"
 chmod 700 "$STATE_DIR" 2>/dev/null || true
 
 python3 - "$CMD" "$DB" "$STATE_DIR" "$MEMORY_DIR" "$CACHE" "$INDEX_DISTILL" "$FACTS_FILE" <<'PY'
-import json, os, re, sqlite3, sys
+import hashlib, json, os, re, sqlite3, subprocess, sys
 from pathlib import Path
 
 cmd, db_path, state_dir, memory_dir, cache_dir, index_distill, facts_file_arg = sys.argv[1:]
 os.umask(0o077)
+
+# Optional, operator-configured embedding provider for the semantic retrieval
+# lane. CCC_MEMORY_EMBED_CMD is a shell command that reads text on stdin and
+# prints a JSON float array (or {"embedding":[...]}) on stdout — the repo ships
+# NO provider/key, only the wiring. Doc embeddings are precomputed here (during
+# the background refresh/index, where network is allowed) over the ALREADY
+# REDACTED memory_docs content, so no secrets leave the node and SessionStart
+# stays no-network. Unset by default → no embedding, no behavior change.
+EMBED_CMD = os.environ.get("CCC_MEMORY_EMBED_CMD", "").strip()
+EMBED_MODEL = os.environ.get("CCC_MEMORY_EMBED_MODEL", "").strip()
+try:
+    EMBED_TIMEOUT = float(os.environ.get("CCC_MEMORY_EMBED_TIMEOUT", "15") or 15)
+except ValueError:
+    EMBED_TIMEOUT = 15.0
+
+def embed_text(text):
+    if not EMBED_CMD:
+        return None
+    try:
+        p = subprocess.run(["/bin/sh", "-c", EMBED_CMD], input=text, text=True,
+                           capture_output=True, timeout=EMBED_TIMEOUT)
+        if p.returncode != 0:
+            return None
+        vec = json.loads(p.stdout)
+        if isinstance(vec, dict):
+            vec = vec.get("embedding") or vec.get("data") or vec.get("vector")
+        if not isinstance(vec, list) or not vec or not all(isinstance(x, (int, float)) for x in vec):
+            return None
+        return [float(x) for x in vec]
+    except Exception:
+        return None
 db = Path(db_path)
 state = Path(state_dir)
 mem = Path(memory_dir)
@@ -275,6 +306,29 @@ try:
             con.execute("DELETE FROM memory_fts")
             con.execute("INSERT INTO memory_fts(path,source,content) SELECT path,source,content FROM memory_docs")
         con.commit()
+        # Optional semantic-lane embeddings, computed incrementally over the
+        # redacted memory_docs content. Skipped entirely when CCC_MEMORY_EMBED_CMD
+        # is unset; fail-open per doc (a failed embed leaves the doc without a
+        # vector, so the semantic lane just has fewer candidates).
+        if EMBED_CMD:
+            con.execute("CREATE TABLE IF NOT EXISTS memory_vectors (path TEXT PRIMARY KEY, content_hash TEXT, model TEXT, dim INTEGER, vec TEXT)")
+            existing = {r[0]: r[1] for r in con.execute("SELECT path, content_hash FROM memory_vectors")}
+            keep = set()
+            for path, content in con.execute("SELECT path, content FROM memory_docs").fetchall():
+                keep.add(path)
+                h = hashlib.sha256((content or "").encode("utf-8")).hexdigest()
+                if existing.get(path) == h:
+                    continue  # unchanged since last embed -> no re-embed (cost control)
+                vec = embed_text(content or "")
+                if vec is None:
+                    continue
+                con.execute(
+                    "INSERT INTO memory_vectors(path,content_hash,model,dim,vec) VALUES(?,?,?,?,?) "
+                    "ON CONFLICT(path) DO UPDATE SET content_hash=excluded.content_hash, model=excluded.model, dim=excluded.dim, vec=excluded.vec",
+                    (path, h, EMBED_MODEL, len(vec), json.dumps(vec)),
+                )
+            con.executemany("DELETE FROM memory_vectors WHERE path = ?", [(p,) for p in existing if p not in keep])
+            con.commit()
         # Compact after update/rebuild so replaced/deleted plaintext from older
         # index versions is not left in SQLite free pages.
         con.execute("VACUUM")
