@@ -406,6 +406,14 @@ class ProjectChatHandler:
                 if not state.pending:
                     continue
                 req = state.pending[0]
+                # Once a request's response is finalized (future resolved) it is
+                # about to be popped and delivered — stop refreshing the typing
+                # indicator so it doesn't reassert "typing…" after the agent's
+                # final message. Streamed replies edit drafts rather than sending
+                # a new message, so they never clear typing on their own; a stray
+                # keepalive here is exactly what leaves it stuck.
+                if req.future.done():
+                    continue
                 if not req.typing_callback:
                     continue
                 now = asyncio.get_event_loop().time()
@@ -431,7 +439,11 @@ class ProjectChatHandler:
 
                 req = state.pending[0]
                 now = asyncio.get_event_loop().time()
-                if req.typing_callback and now - req.last_typing_at >= TYPING_INTERVAL:
+                if (
+                    req.typing_callback
+                    and not req.future.done()
+                    and now - req.last_typing_at >= TYPING_INTERVAL
+                ):
                     req.last_typing_at = now
                     try:
                         await req.typing_callback()
