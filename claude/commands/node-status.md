@@ -8,8 +8,8 @@ allowed-tools: Bash(git status:*), Bash(git -C:*), Bash(crontab:*), Bash(tail:*)
 - cron: !`crontab -l 2>&1 | grep -vE '^#|^$' | head`
 - bridge status: !`/opt/ccc-node/bridge/start.sh --path /root --status 2>&1 | tail -5 || echo "(bridge status unavailable)"`
 - claude CLI integrity: !`T=$(readlink -f "$(command -v claude 2>/dev/null)" 2>/dev/null); if [ -z "$T" ]; then echo "⚠️ claude not found on PATH"; elif grep -q CLAUDE_STUB "$T" 2>/dev/null; then echo "⚠️ STUB at $T — real CLI clobbered by a test stub (see Wiki LOG-1391); restore: npm install -g @anthropic-ai/claude-code --force"; else echo "ok ($T, $(stat -c%s "$T" 2>/dev/null)B)"; fi`
-- recent audit (last 5): !`tail -5 /root/.claude/state/audit.jsonl 2>/dev/null || echo "(no audit log yet)"`
-- approval-needed markers (last 5): !`tail -5 /root/.claude/state/approval-needed.log 2>/dev/null || echo "(none)"`
+- recent audit (last 5): !`tail -5 ${CCC_STATE_DIR:-${HOME:-/root}/.claude/state}/audit.jsonl 2>/dev/null || echo "(no audit log yet)"`
+- approval-needed markers (last 5): !`tail -5 ${CCC_STATE_DIR:-${HOME:-/root}/.claude/state}/approval-needed.log 2>/dev/null || echo "(none)"`
 
 ## Task
 

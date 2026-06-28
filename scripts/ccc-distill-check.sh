@@ -6,8 +6,8 @@
 # Usage: bash scripts/ccc-distill-check.sh [--json]
 set -uo pipefail
 
-STATE_DIR="${CCC_STATE_DIR:-/root/.claude/state}"
-HONCHO_CFG="${CCC_HONCHO_CFG:-/root/.hermes/honcho.json}"
+STATE_DIR="${CCC_STATE_DIR:-${HOME:-/root}/.claude/state}"
+HONCHO_CFG="${CCC_HONCHO_CFG:-${HOME:-/root}/.hermes/honcho.json}"
 LOG="$STATE_DIR/distill.log"
 QUEUE="$STATE_DIR/honcho-queue.jsonl"
 DEAD="$STATE_DIR/honcho-queue.jsonl.dead"

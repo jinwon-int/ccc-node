@@ -33,7 +33,7 @@ command -v "$BIN" >/dev/null 2>&1 || { echo "ccc-headless: '$BIN' not found in P
 args=(-p "$PROMPT" --output-format json --allowedTools "$ALLOWED")
 [ -n "${CCC_PERMISSION_MODE:-}" ] && args+=(--permission-mode "$CCC_PERMISSION_MODE")
 
-ERRF="$(mktemp /tmp/ccc-headless.XXXXXX.err)"
+ERRF="$(mktemp "${TMPDIR:-/tmp}"/ccc-headless.XXXXXX.err)"
 trap 'rm -f "$ERRF"' EXIT
 
 if [ ! -t 0 ]; then

@@ -76,7 +76,7 @@ SOURCE_CWD="$(printf '%s' "$HOOK_INPUT" | jq -r '.cwd // .workspace.current_dir 
 PROJECT_ENC=""
 
 # Fallback: find the most-recent transcript jsonl for cwd-encoded project dir.
-# Uses CLAUDE_PROJECTS_DIR (default /root/.claude/projects) so non-root
+# Uses CLAUDE_PROJECTS_DIR (default $HOME/.claude/projects) so non-root
 # installs (e.g. /opt/ccc-node on nosuk/soonwook/dungae) work out of the box.
 PROJECTS_DIR="${CLAUDE_PROJECTS_DIR:-${HOME:-/root}/.claude/projects}"
 if [ -z "$TRANSCRIPT_PATH" ] || [ ! -f "$TRANSCRIPT_PATH" ]; then

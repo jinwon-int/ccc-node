@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ccc-memory-search.sh — query the local hot-memory SQLite index.
 set -uo pipefail
-STATE_DIR="${CCC_STATE_DIR:-/root/.claude/state}"
+STATE_DIR="${CCC_STATE_DIR:-${HOME:-/root}/.claude/state}"
 DB="${CCC_MEMORY_INDEX_DB:-$STATE_DIR/memory-index.sqlite}"
 QUERY="${1:-}"
 LIMIT="${CCC_MEMORY_SEARCH_LIMIT:-5}"

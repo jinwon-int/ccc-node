@@ -2,9 +2,9 @@
 # ccc-memory-check.sh — read-only memory cache/profile diagnostics.
 set -uo pipefail
 
-STATE_DIR="${CCC_STATE_DIR:-/root/.claude/state}"
-CACHE="${CCC_MEMORY_CACHE_DIR:-/root/.claude/hooks/cache}"
-HONCHO_CFG="${CCC_HONCHO_CFG:-${CCC_HERMES_DIR:-/root/.hermes}/honcho.json}"
+STATE_DIR="${CCC_STATE_DIR:-${HOME:-/root}/.claude/state}"
+CACHE="${CCC_MEMORY_CACHE_DIR:-${HOME:-/root}/.claude/hooks/cache}"
+HONCHO_CFG="${CCC_HONCHO_CFG:-${CCC_HERMES_DIR:-${HOME:-/root}/.hermes}/honcho.json}"
 PROFILE="${CCC_MEMORY_PROFILE:-honcho}"
 TTL="${CCC_MEMORY_CACHE_TTL_SEC:-21600}"
 WIKI_TTL="${CCC_WIKI_CACHE_MAX_AGE_SEC:-$TTL}"

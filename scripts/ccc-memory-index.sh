@@ -4,9 +4,9 @@
 set -uo pipefail
 umask 077
 
-STATE_DIR="${CCC_STATE_DIR:-/root/.claude/state}"
-MEMORY_DIR="${CCC_MEMORY_DIR:-/root/.claude/memories}"
-CACHE="${CCC_MEMORY_CACHE_DIR:-/root/.claude/hooks/cache}"
+STATE_DIR="${CCC_STATE_DIR:-${HOME:-/root}/.claude/state}"
+MEMORY_DIR="${CCC_MEMORY_DIR:-${HOME:-/root}/.claude/memories}"
+CACHE="${CCC_MEMORY_CACHE_DIR:-${HOME:-/root}/.claude/hooks/cache}"
 DB="${CCC_MEMORY_INDEX_DB:-$STATE_DIR/memory-index.sqlite}"
 CMD="${1:-update}"
 INDEX_DISTILL="${CCC_MEMORY_INDEX_DISTILL:-0}"
