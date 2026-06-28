@@ -22,10 +22,13 @@ MAX_WIKI="${CCC_WIKI_MAX_BYTES:-5000}"
 MAX_HONCHO="${CCC_HONCHO_MAX_BYTES:-4000}"
 MAX_LOCAL="${CCC_LOCAL_MEMORY_MAX_BYTES:-3000}"
 HONCHO_ENABLED="${CCC_HONCHO_MEMORY_ENABLED:-1}"
+# Local hot-memory search is ON by default for every profile now that the
+# default retrieval reranks with durability/source/recency boosts; set
+# CCC_LOCAL_MEMORY_ENABLED=0/false/off to opt out. hybrid/max-perf always query
+# it regardless (that is part of their definition).
 LOCAL_ENABLED="${CCC_LOCAL_MEMORY_ENABLED:-}"
 QUERY="${CCC_MEMORY_QUERY:-}"
 
-is_truthy() { case "${1:-}" in 1|true|TRUE|yes|YES|on|ON) return 0;; *) return 1;; esac; }
 is_disabled() { case "${1:-}" in 0|false|FALSE|off|OFF|no|NO) return 0;; *) return 1;; esac; }
 
 scan_injection_block() { # <label> <text>
@@ -102,7 +105,7 @@ if ! is_disabled "$HONCHO_ENABLED" && [ "$PROFILE" != "max-perf" ]; then
 fi
 
 local_hot=""
-if [ "$PROFILE" = "hybrid" ] || [ "$PROFILE" = "max-perf" ] || is_truthy "$LOCAL_ENABLED"; then
+if [ "$PROFILE" = "hybrid" ] || [ "$PROFILE" = "max-perf" ] || ! is_disabled "$LOCAL_ENABLED"; then
   search_tool="$(find_memory_tool ccc-memory-search.sh 2>/dev/null || true)"
   if [ -n "$search_tool" ]; then
     local_hot="$({ "$search_tool" "$QUERY" 2>/dev/null || true; } | sed -n '1,120p')"
