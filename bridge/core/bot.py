@@ -42,6 +42,7 @@ from telegram_bot.core.session_isolation import apply_subprocess_session_isolati
 from telegram_bot.core import ui
 from telegram_bot.core import media
 from telegram_bot.core import paths as path_scope
+from telegram_bot.core import revert as revert_ops
 from .conversation_paths import resolve_conversation_file
 from telegram_bot.core.project_chat import (
     project_chat_handler,
@@ -1338,41 +1339,13 @@ class TelegramBot:
                 session_id,
             )
             return False
-        if not filepath.exists():
-            return False
 
-        tmp_path: Optional[FilePath] = None
-        try:
-            # Read all lines up to (but NOT including) the target message
-            # This reverts TO the state BEFORE the selected message
-            lines_to_keep = []
-            with open(filepath, "r", encoding="utf-8") as f:
-                for idx, line in enumerate(f):
-                    if idx >= msg_index:
-                        break
-                    lines_to_keep.append(line)
-
-            # Write the truncated conversation atomically to avoid partial files.
-            tmp_path = filepath.with_name(
-                f".{filepath.name}.tmp-{os.getpid()}-{time.time_ns()}"
-            )
-            with open(tmp_path, "w", encoding="utf-8") as f:
-                f.writelines(lines_to_keep)
-            os.replace(tmp_path, filepath)
-
+        if revert_ops.truncate_jsonl_to(filepath, msg_index):
             logger.info(
                 f"User {user_id}: conversation reverted to before message {msg_index} (mode: {mode})"
             )
             return True
-
-        except Exception as e:
-            if tmp_path is not None:
-                try:
-                    tmp_path.unlink(missing_ok=True)
-                except Exception:
-                    pass
-            logger.error(f"Conversation revert failed: {e}", exc_info=True)
-            return False
+        return False
 
     async def _execute_summarize_mode(
         self, user_id: int, session_id: str, msg_index: int
