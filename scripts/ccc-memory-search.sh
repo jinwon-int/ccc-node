@@ -9,11 +9,25 @@ RETRIEVAL="${CCC_MEMORY_RETRIEVAL:-fts}"
 [ -n "$QUERY" ] || { echo "usage: $0 <query>" >&2; exit 2; }
 [ -f "$DB" ] || { echo "memory index missing: $DB" >&2; exit 1; }
 python3 - "$DB" "$QUERY" "$LIMIT" "$RETRIEVAL" <<'PY'
-import json, math, re, sqlite3, sys, time
+import json, math, os, re, sqlite3, subprocess, sys, time
 from datetime import datetime, timezone
 path, query, limit, retrieval = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
 con=sqlite3.connect(path)
 con.row_factory=sqlite3.Row
+
+# Optional semantic lane (operator-configured embedding provider; see the index
+# tool). Doc vectors are precomputed in memory_vectors during refresh; here we
+# embed the QUERY at search time with a tight timeout and fail-open — so this is
+# the one lane that may touch the network, only when CCC_MEMORY_EMBED_CMD is set.
+EMBED_CMD = os.environ.get("CCC_MEMORY_EMBED_CMD", "").strip()
+try:
+    EMBED_TIMEOUT = float(os.environ.get("CCC_MEMORY_EMBED_TIMEOUT", "15") or 15)
+except ValueError:
+    EMBED_TIMEOUT = 15.0
+try:
+    EMBED_MIN_SIM = float(os.environ.get("CCC_MEMORY_EMBED_MIN_SIM", "0.55") or 0.55)
+except ValueError:
+    EMBED_MIN_SIM = 0.55
 
 def tokens_for(q: str):
     # ccc-memory-query emits labels and paths. FTS5 MATCH treats ':'/'-'/'/' as
@@ -181,6 +195,73 @@ def rrf_fuse(lanes, k=60):
     fused.sort(key=lambda x: x["score"], reverse=True)
     return fused[:limit]
 
+def embed_query(text):
+    if not EMBED_CMD:
+        return None
+    try:
+        p = subprocess.run(["/bin/sh", "-c", EMBED_CMD], input=text, text=True,
+                           capture_output=True, timeout=EMBED_TIMEOUT)
+        if p.returncode != 0:
+            return None
+        vec = json.loads(p.stdout)
+        if isinstance(vec, dict):
+            vec = vec.get("embedding") or vec.get("data") or vec.get("vector")
+        if not isinstance(vec, list) or not vec or not all(isinstance(x, (int, float)) for x in vec):
+            return None
+        return [float(x) for x in vec]
+    except Exception:
+        return None
+
+def cosine(a, b):
+    if len(a) != len(b):
+        return None
+    dot=sum(x*y for x, y in zip(a, b))
+    na=math.sqrt(sum(x*x for x in a)); nb=math.sqrt(sum(y*y for y in b))
+    if na == 0 or nb == 0:
+        return None
+    return dot/(na*nb)
+
+def embedding_scan(qvec, n_over):
+    # Semantic lane: cosine of the query vector against the precomputed doc
+    # vectors. Recalls synonyms / paraphrase / cross-language matches that the
+    # lexical and fuzzy lanes (both surface-form) cannot.
+    try:
+        rows=con.execute("SELECT v.path AS path, v.vec AS vec, d.source AS source, "
+                         "d.content AS content, d.updated_at AS updated_at "
+                         "FROM memory_vectors v JOIN memory_docs d ON d.path = v.path").fetchall()
+    except sqlite3.OperationalError:
+        return []
+    out=[]
+    for r in rows:
+        try:
+            dv=json.loads(r["vec"])
+        except Exception:
+            continue
+        sim=cosine(qvec, dv)
+        if sim is None or sim < EMBED_MIN_SIM:
+            continue
+        content=r["content"] or ""
+        out.append({"path":r["path"],"source":r["source"],"snippet":content[:240],
+                    "content":content,"updated_at":r["updated_at"] or "","cos":round(sim,4)})
+    out.sort(key=lambda x: x["cos"], reverse=True)
+    return out[:n_over]
+
+def embedding_rerank(cands):
+    out=[]
+    for c in cands:
+        content=c.get("content") or ""
+        signals={
+            "cosine": c["cos"],
+            "source_boost": source_boost(c["source"], content),
+            "recency_boost": round(recency_boost(c.get("updated_at")), 4),
+            "durability_penalty": durability_penalty(content),
+        }
+        score=(c["cos"]*8.0)+signals["source_boost"]+signals["recency_boost"]+signals["durability_penalty"]
+        out.append({"path":c["path"],"source":c["source"],"snippet":c["snippet"],
+                    "score":round(score,4),"signals":signals})
+    out.sort(key=lambda x: x["score"], reverse=True)
+    return out
+
 def source_boost(source: str, content: str):
     s=source or ""
     if s == "memory": return 3.0
@@ -235,6 +316,7 @@ def hybrid(toks):
 toks = tokens_for(query)
 rows=[]
 requested = retrieval.strip().lower() or "fts"
+used=[requested]
 if requested in {"hybrid", "hybrid-local"}:
     mode = requested
     rows = hybrid(toks)
@@ -259,18 +341,22 @@ else:
         except sqlite3.OperationalError:
             cands = []
     lexical = rerank(cands)
-    import os as _os
-    fusion_on = _os.environ.get("CCC_MEMORY_FUSION", "1").strip().lower() not in {"0","false","off","no"}
+    fusion_on = os.environ.get("CCC_MEMORY_FUSION", "1").strip().lower() not in {"0","false","off","no"}
+    lanes=[lexical]; used=["lexical"]
     if fusion_on:
         fuzzy = fuzzy_rerank(fuzzy_scan(char_ngrams(query), over))
         if fuzzy:
-            mode = "fusion-rrf"
-            rows = rrf_fuse([lexical, fuzzy])
-        else:
-            mode = "fts-rerank"
-            rows = lexical[:limit]
+            lanes.append(fuzzy); used.append("fuzzy")
+        if EMBED_CMD:
+            qvec = embed_query(query)
+            emb = embedding_rerank(embedding_scan(qvec, over)) if qvec is not None else []
+            if emb:
+                lanes.append(emb); used.append("embedding")
+    if len(lanes) > 1:
+        mode = "fusion-rrf"
+        rows = rrf_fuse(lanes)
     else:
         mode = "fts-rerank"
         rows = lexical[:limit]
-print(json.dumps({"query":query,"tokens":toks,"retrievalMode":mode,"results":rows}, ensure_ascii=False, indent=2))
+print(json.dumps({"query":query,"tokens":toks,"retrievalMode":mode,"lanes":used,"results":rows}, ensure_ascii=False, indent=2))
 PY

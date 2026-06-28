@@ -232,6 +232,8 @@ behavior:
 | `CCC_HONCHO_MEMORY_ENABLED` | `1` | Set `0`/`false`/`off` to remove Honcho from the read path while keeping local/Wiki memory |
 | `CCC_LOCAL_MEMORY_ENABLED` | `1` (on) | Local hot-memory index search is queried for every profile by default; set `0`/`false`/`off` to opt out |
 | `CCC_MEMORY_FUSION` | `1` (on) | Fuse the lexical lane with a stdlib char-ngram fuzzy lane (RRF) so typo/transposed/morphological queries still recall; set `0`/`false`/`off` for the lexical lane only |
+| `CCC_MEMORY_EMBED_CMD` | unset (off) | Opt-in semantic lane: a command that reads text on stdin and prints a JSON float array (the repo ships no provider/key). Doc vectors are precomputed during background refresh; only the query is embedded at search time (tight timeout, fail-open). See `docs/examples/memory-embed-openai.example.sh`. Unset → no embedding, no startup network |
+| `CCC_MEMORY_EMBED_MODEL` / `CCC_MEMORY_EMBED_TIMEOUT` / `CCC_MEMORY_EMBED_MIN_SIM` | `` / `15` / `0.55` | Embedding model label, per-call timeout (s), and minimum cosine for the semantic lane |
 | `CCC_MEMORY_MAX_BYTES` | `12000` | Total SessionStart memory injection byte budget |
 | `CCC_MEMORY_QUERY_MAX_BYTES` | mode-specific | Max task-aware query bytes; remote defaults lower than local |
 | `CCC_WIKI_CACHE_MAX_AGE_SEC` / `CCC_HONCHO_CACHE_MAX_AGE_SEC` | `CCC_MEMORY_CACHE_TTL_SEC` | Per-source stale-warning thresholds |

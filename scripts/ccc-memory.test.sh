@@ -167,6 +167,47 @@ ok "default profile queries the local hot-memory index" '[ "$rc" = 0 ] && jq -e 
 out="$(CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CCC_MEMORY_INDEX_DB="$state/memory-index.sqlite" CCC_HOOK_DIR="$ROOT/claude/hooks" CCC_MEMORY_TOOLS_DIR="$ROOT/scripts" CCC_LOCAL_MEMORY_ENABLED=0 CCC_MEMORY_QUERY="current editor Helix" bash "$ROOT/claude/hooks/load-memory.sh" SessionStart 2>&1)"; rc=$?
 ok "CCC_LOCAL_MEMORY_ENABLED=0 opts out of local hot memory" '[ "$rc" = 0 ] && jq -e ".hookSpecificOutput.additionalContext | (contains(\"local hot memory disabled\") and (contains(\"\\\"results\\\"\") | not))" >/dev/null <<<"$out"'
 
+# Embedding (semantic) lane — opt-in via CCC_MEMORY_EMBED_CMD. Uses a local,
+# no-network fake embedder with a tiny concept map so a synonym query recalls a
+# doc that the surface-form lexical + fuzzy lanes both miss.
+estate="$TMP/embed-state"; rm -rf "$estate"; mkdir -p "$estate/cache" "$estate/memories"
+printf 'x\n' > "$estate/memories/MEMORY.md"; printf 'x\n' > "$estate/memories/USER.md"
+printf '%s\n' '{"id":"autodoc","kind":"decision","text":"The automobile parking guideline for the node.","durability":"durable","privacy":"private","review":"auto-local"}' > "$estate/facts.jsonl"
+cat > "$estate/fake-embed.py" <<'PYEMB'
+import sys, json, re
+text = sys.stdin.read().lower()
+concepts = [["car","automobile","vehicle"],["policy","rule","guideline","rules","parking"]]
+toks = set(re.findall(r"[a-z]+", text))
+vec = [0.0]*(len(concepts)+1)
+for i, ws in enumerate(concepts):
+    for w in ws:
+        if w in toks:
+            vec[i] += 1.0
+vec[-1] = 0.01  # baseline on a dedicated axis so unrelated docs don't false-match
+print(json.dumps(vec))
+PYEMB
+embcmd="python3 $estate/fake-embed.py"
+CCC_STATE_DIR="$estate" CCC_MEMORY_CACHE_DIR="$estate/cache" CCC_MEMORY_DIR="$estate/memories" CCC_MEMORY_FACTS_FILE="$estate/facts.jsonl" CCC_MEMORY_EMBED_CMD="$embcmd" bash "$ROOT/scripts/ccc-memory-index.sh" rebuild >/dev/null 2>&1
+ok "index precomputes embedding vectors when CCC_MEMORY_EMBED_CMD is set" 'python3 - "$estate/memory-index.sqlite" <<PY >/dev/null 2>&1
+import sqlite3,sys
+c=sqlite3.connect(sys.argv[1])
+n=c.execute("select count(*) from memory_vectors").fetchone()[0]
+sys.exit(0 if n>=1 else 1)
+PY'
+CCC_STATE_DIR="$estate" CCC_MEMORY_CACHE_DIR="$estate/cache" CCC_MEMORY_DIR="$estate/memories" CCC_MEMORY_FACTS_FILE="$estate/facts.jsonl" CCC_MEMORY_EMBED_CMD="$embcmd" CCC_MEMORY_EMBED_MODEL="model-b" bash "$ROOT/scripts/ccc-memory-index.sh" update >/dev/null 2>&1
+ok "embedding vectors refresh when the model label changes" 'python3 - "$estate/memory-index.sqlite" <<PY >/dev/null 2>&1
+import sqlite3,sys
+c=sqlite3.connect(sys.argv[1])
+models={r[0] for r in c.execute("select model from memory_vectors")}
+sys.exit(0 if models == {"model-b"} else 1)
+PY'
+out="$(CCC_STATE_DIR="$estate" CCC_MEMORY_INDEX_DB="$estate/memory-index.sqlite" bash "$ROOT/scripts/ccc-memory-search.sh" "car rules" 2>&1)"; rc=$?
+ok "surface-form lanes miss the synonym query" '[ "$rc" = 0 ] && jq -e "(.results | length) == 0" >/dev/null <<<"$out"'
+out="$(CCC_STATE_DIR="$estate" CCC_MEMORY_INDEX_DB="$estate/memory-index.sqlite" CCC_MEMORY_EMBED_CMD="$embcmd" bash "$ROOT/scripts/ccc-memory-search.sh" "car rules" 2>&1)"; rc=$?
+ok "embedding lane recalls the synonym query" '[ "$rc" = 0 ] && jq -e "(.lanes | index(\"embedding\") != null) and (.results[0].path | contains(\"autodoc\"))" >/dev/null <<<"$out"'
+out="$(CCC_STATE_DIR="$estate" CCC_MEMORY_INDEX_DB="$estate/memory-index.sqlite" CCC_MEMORY_EMBED_CMD=/bin/false bash "$ROOT/scripts/ccc-memory-search.sh" "automobile guideline" 2>&1)"; rc=$?
+ok "embedding lane fails open when the provider errors" '[ "$rc" = 0 ] && jq -e "(.lanes | index(\"embedding\")) == null and (.results | length) >= 1" >/dev/null <<<"$out"'
+
 out="$(CCC_STATE_DIR="$TMP/golden-state" bash "$ROOT/scripts/ccc-memory-eval.sh" --golden 2>&1)"; rc=$?
 ok "memory eval golden-set reports precision recall mrr" '[ "$rc" = 0 ] && jq -e ".ok == true and .mode == \"golden\" and .metrics.precision_at_1 >= 0.5 and .metrics.recall_at_5 >= 0.5 and .metrics.mrr > 0 and .metrics.latency_p95_ms >= .metrics.latency_p50_ms" >/dev/null <<<"$out"'
 out="$(CCC_STATE_DIR="$TMP/scenario-state" bash "$ROOT/scripts/ccc-memory-eval.sh" --scenario 2>&1)"; rc=$?
