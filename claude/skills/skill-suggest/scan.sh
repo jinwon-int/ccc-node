@@ -4,7 +4,7 @@
 # ranked candidate report. It NEVER authors skills itself — it only proposes; a human
 # (via the `/skill-suggest` skill) decides what becomes a SKILL.md.
 #
-# Output: /root/.claude/state/skill-candidates.md
+# Output: $HOME/.claude/state/skill-candidates.md
 # Tune:   SKILL_SUGGEST_MIN (min frequency to surface, default 4)
 set -uo pipefail
 

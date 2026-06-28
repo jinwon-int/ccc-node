@@ -2,7 +2,7 @@
 # Working-state checkpoint across compaction boundaries.
 #   PreCompact  : snapshot working-state.md so nothing is lost when context is compacted.
 #   PostCompact : re-inject working-state.md into context so the next turn knows what it was doing.
-# The agent is expected to keep /root/.claude/state/working-state.md current during long/multi-session tasks.
+# The agent is expected to keep $HOME/.claude/state/working-state.md current during long/multi-session tasks.
 set -uo pipefail
 
 # Distill subprocess guard (see ~/.claude/hooks/distill.sh).
