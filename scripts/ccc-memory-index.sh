@@ -22,6 +22,7 @@ chmod 700 "$STATE_DIR" 2>/dev/null || true
 
 python3 - "$CMD" "$DB" "$STATE_DIR" "$MEMORY_DIR" "$CACHE" "$INDEX_DISTILL" "$FACTS_FILE" <<'PY'
 import hashlib, json, os, re, sqlite3, subprocess, sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 cmd, db_path, state_dir, memory_dir, cache_dir, index_distill, facts_file_arg = sys.argv[1:]
@@ -57,6 +58,42 @@ def embed_text(text):
         return [float(x) for x in vec]
     except Exception:
         return None
+# Decay/forgetting for volatile structured facts. Volatile facts (e.g.
+# distilled task-progress) describe ephemeral working state; once older than
+# this TTL they are dropped from the index so they stop polluting recall weeks
+# later. Durable facts (preferences/decisions) never decay. Only memory-facts
+# entries are affected — MEMORY.md/USER.md/wiki/honcho docs are always indexed.
+# Set CCC_MEMORY_VOLATILE_TTL_DAYS=0 to disable decay entirely.
+try:
+    VOLATILE_TTL_DAYS = float(os.environ.get("CCC_MEMORY_VOLATILE_TTL_DAYS", "14") or 14)
+except ValueError:
+    VOLATILE_TTL_DAYS = 14.0
+
+
+def fact_age_days(observed_at):
+    """Age of a fact in days from its observed_at, or None if unparseable.
+
+    Fail-safe: missing/garbage timestamps return None so the caller keeps the
+    fact (we never forget a fact just because we couldn't read its date).
+    """
+    s = (observed_at or "").strip()
+    if not s:
+        return None
+    s = s.replace("Z", "+00:00")
+    dt = None
+    for candidate in (s, s[:19]):
+        try:
+            dt = datetime.fromisoformat(candidate)
+            break
+        except ValueError:
+            continue
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - dt).total_seconds() / 86400.0
+
+
 db = Path(db_path)
 state = Path(state_dir)
 mem = Path(memory_dir)
@@ -195,6 +232,15 @@ def structured_fact_docs(path: Path):
         review = str(obj.get("review") or "auto-local").lower()
         if review == "rejected":
             continue
+        kind = str(obj.get("kind") or "fact")
+        durability = str(obj.get("durability") or ("volatile" if kind == "task-progress" else "durable")).lower()
+        observed_at = str(obj.get("observed_at") or "")
+        # Decay: drop volatile facts past the TTL before they consume a dedup
+        # slot or get indexed. Durable facts and undated facts are kept.
+        if durability == "volatile" and VOLATILE_TTL_DAYS > 0:
+            age = fact_age_days(observed_at)
+            if age is not None and age > VOLATILE_TTL_DAYS:
+                continue
         text = redact_text(str(obj.get("text") or obj.get("summary") or ""))
         if not text:
             continue
@@ -202,11 +248,8 @@ def structured_fact_docs(path: Path):
         if norm in seen_text:
             continue
         seen_text.add(norm)
-        kind = str(obj.get("kind") or "fact")
-        durability = str(obj.get("durability") or ("volatile" if kind == "task-progress" else "durable"))
         privacy = str(obj.get("privacy") or "private")
         confidence = obj.get("confidence", "")
-        observed_at = str(obj.get("observed_at") or "")
         valid_from = str(obj.get("valid_from") or "")
         valid_until = str(obj.get("valid_until") or "")
         def listish(name):
