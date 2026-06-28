@@ -141,6 +141,7 @@ for t in claude/hooks/guard.test.sh claude/hooks/observability.test.sh claude/ho
          claude/hooks/checkpoint.test.sh claude/hooks/distill-scope.test.sh claude/hooks/skill-review.test.sh \
          claude/hooks/distill/extract.test.sh claude/hooks/distill/honcho-push.test.sh \
          claude/hooks/distill/queue-drain.test.sh claude/hooks/distill/wiki-queue.test.sh \
+         claude/hooks/distill/local-facts.test.sh \
          scripts/ccc-doctor.test.sh scripts/ccc-memory.test.sh scripts/ccc-distill-check.test.sh scripts/ccc-security-audit.test.sh \
          scripts/agent-cron.test.sh scripts/agent-cron-lib.test.sh scripts/a2a-termux-native-worker.test.sh; do
   [ -f "$t" ] || { err "missing test: $t"; continue; }

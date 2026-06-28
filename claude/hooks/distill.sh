@@ -175,6 +175,8 @@ HOOKDIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)" || HOOKD
     log "honcho-push non-zero (queued for retry)"
   bash "$HOOKDIR/distill/wiki-queue.sh" < "$STASH" >> "$LOG" 2>&1 || \
     log "wiki-queue non-zero"
+  bash "$HOOKDIR/distill/local-facts.sh" < "$STASH" >> "$LOG" 2>&1 || \
+    log "local-facts non-zero"
 
   log "done trigger=$TRIGGER pid=$PIPE_PID elapsed_s=$(elapsed_s)"
 ) </dev/null >/dev/null 2>&1 &

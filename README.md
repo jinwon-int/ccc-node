@@ -95,7 +95,10 @@ to Telegram, with all secrets and node-local state stripped out and replaced by 
   pipeline (0.3.15+) that distills live transcripts via `claude -p --model haiku` (inherits
   parent OAuth, no API key) and routes results to **Honcho** (auto-push of working/relational
   facts) + a **human-gated wiki-candidates queue** (`~/.claude/state/wiki-candidates.md`).
-  Includes a retry drain worker (`queue-drain.sh`, 0.3.18) for failed Honcho pushes and an
+  Includes a retry drain worker (`queue-drain.sh`, 0.3.18) for failed Honcho pushes, a
+  **local-facts writer** (`local-facts.sh`) that appends distilled facts to
+  `~/.claude/state/memory-facts.jsonl` so the hot SQLite index can recall them next session
+  (no network, independent of Honcho), and an
   off-switch (`distill.disabled`) / dry-run toggle. Fleet verification: see issue #82 and
   `scripts/ccc-distill-check.sh --json` for per-node health snapshot. Non-root installs: set
   `CCC_STATE_DIR` (state/log/queue), `CLAUDE_PROJECTS_DIR` (transcript discovery), and
