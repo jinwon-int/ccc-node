@@ -11,8 +11,8 @@
 # ~/.claude/state/honcho-queue.jsonl for next-SessionStart retry.
 set -uo pipefail
 
-CFG="${CCC_HONCHO_CFG:-/root/.hermes/honcho.json}"
-STATE_DIR="${CCC_STATE_DIR:-/root/.claude/state}"
+CFG="${CCC_HONCHO_CFG:-${HOME:-/root}/.hermes/honcho.json}"
+STATE_DIR="${CCC_STATE_DIR:-${HOME:-/root}/.claude/state}"
 QUEUE="$STATE_DIR/honcho-queue.jsonl"
 mkdir -p "$STATE_DIR" 2>/dev/null
 

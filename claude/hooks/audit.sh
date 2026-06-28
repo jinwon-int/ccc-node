@@ -4,7 +4,7 @@
 # Secrets are redacted before they ever touch the log (FW-03).
 set -uo pipefail
 
-LOG="${CCC_AUDIT_LOG:-/root/.claude/state/audit.jsonl}"
+LOG="${CCC_AUDIT_LOG:-${HOME:-/root}/.claude/state/audit.jsonl}"
 mkdir -p "$(dirname "$LOG")" 2>/dev/null
 
 input="$(cat 2>/dev/null)"; [ -n "$input" ] || exit 0

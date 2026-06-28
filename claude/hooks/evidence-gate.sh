@@ -31,7 +31,7 @@ active="$(printf '%s' "$input" | jq -r '.stop_hook_active // false' 2>/dev/null)
 sid="$(printf '%s' "$input" | jq -r '.session_id // empty' 2>/dev/null)"
 [ -n "$sid" ] || exit 0            # cannot scope to a session -> don't gate
 
-LOG="${CCC_AUDIT_LOG:-/root/.claude/state/audit.jsonl}"
+LOG="${CCC_AUDIT_LOG:-${HOME:-/root}/.claude/state/audit.jsonl}"
 [ -f "$LOG" ] || exit 0
 
 # Audit entries for this session only.

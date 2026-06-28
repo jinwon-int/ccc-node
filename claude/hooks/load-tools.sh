@@ -7,7 +7,7 @@ set -uo pipefail
 [ -n "${CLAUDE_DISTILL_INFLIGHT:-}" ] && exit 0
 
 EVENT="${1:-SessionStart}"
-CHEAT=/root/.claude/hooks/tools-cheatsheet.md
+CHEAT=${HOME:-/root}/.claude/hooks/tools-cheatsheet.md
 
 ctx="$(cat "$CHEAT" 2>/dev/null)"
 [ -z "$ctx" ] && ctx="(tools cheatsheet missing: $CHEAT)"

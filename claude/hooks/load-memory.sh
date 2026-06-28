@@ -10,10 +10,10 @@ set -uo pipefail
 [ -n "${CLAUDE_DISTILL_INFLIGHT:-}" ] && exit 0
 
 EVENT="${1:-SessionStart}"
-STATE_DIR="${CCC_STATE_DIR:-/root/.claude/state}"
-CACHE="${CCC_MEMORY_CACHE_DIR:-/root/.claude/hooks/cache}"
-HOOKDIR="${CCC_HOOK_DIR:-/root/.claude/hooks}"
-MEMDIR="${CCC_MEMORY_DIR:-/root/.claude/memories}"
+STATE_DIR="${CCC_STATE_DIR:-${HOME:-/root}/.claude/state}"
+CACHE="${CCC_MEMORY_CACHE_DIR:-${HOME:-/root}/.claude/hooks/cache}"
+HOOKDIR="${CCC_HOOK_DIR:-${HOME:-/root}/.claude/hooks}"
+MEMDIR="${CCC_MEMORY_DIR:-${HOME:-/root}/.claude/memories}"
 PROFILE="${CCC_MEMORY_PROFILE:-honcho}"
 TTL="${CCC_MEMORY_CACHE_TTL_SEC:-21600}"
 MAX_TOTAL="${CCC_MEMORY_MAX_BYTES:-12000}"
@@ -94,7 +94,7 @@ stale_note() { # <label> <file>
 
 # Built-in node memory lives under ~/.claude/memories; legacy Hermes memory is fallback only.
 mem="$(cat "$MEMDIR/MEMORY.md" "$MEMDIR/USER.md" 2>/dev/null)"
-[ -z "$mem" ] && mem="$(cat /root/.hermes/memories/MEMORY.md /root/.hermes/memories/USER.md 2>/dev/null)"
+[ -z "$mem" ] && mem="$(cat ${HOME:-/root}/.hermes/memories/MEMORY.md ${HOME:-/root}/.hermes/memories/USER.md 2>/dev/null)"
 wiki="$(cat "$CACHE/wiki.txt" 2>/dev/null)"
 honcho=""
 if ! is_disabled "$HONCHO_ENABLED" && [ "$PROFILE" != "max-perf" ]; then

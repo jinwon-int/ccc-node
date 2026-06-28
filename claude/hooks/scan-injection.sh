@@ -84,7 +84,7 @@ for rx in injection_patterns:
 sys.stdout.write(text)
 
 if categories:
-    log = os.environ.get('CCC_AUDIT_LOG', '/root/.claude/state/audit.jsonl')
+    log = os.environ.get('CCC_AUDIT_LOG', os.path.expanduser('~/.claude/state/audit.jsonl'))
     try:
         os.makedirs(os.path.dirname(log), exist_ok=True)
         with open(log, 'a', encoding='utf-8') as fh:

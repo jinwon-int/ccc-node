@@ -10,7 +10,7 @@ set -uo pipefail
 
 EVENT="${1:-PreCompact}"
 # State dir is overridable for testing / non-root installs (#82).
-STATE_DIR="${CCC_STATE_DIR:-/root/.claude/state}"
+STATE_DIR="${CCC_STATE_DIR:-${HOME:-/root}/.claude/state}"
 STATE_FILE="$STATE_DIR/working-state.md"
 CKPT_DIR="$STATE_DIR/checkpoints"
 LOG="$STATE_DIR/checkpoint.log"
