@@ -99,5 +99,42 @@ class RevertCancelScopeTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(task.cancelled() or task.done())
 
 
+class VoiceCancelScopeTests(unittest.IsolatedAsyncioTestCase):
+    """/stop and /new cancel voice transcription per conversation, not globally.
+
+    Voice tasks used to be tracked by bare user_id, so /stop in one chat cancelled
+    the same user's voice work in every other chat. They are now keyed by the
+    conversation key.
+    """
+
+    def _bare_bot(self):
+        bot = TelegramBot.__new__(TelegramBot)
+        bot._user_voice_tasks = {}
+        return bot
+
+    async def _pending_task(self):
+        task = asyncio.create_task(asyncio.sleep(30))
+        await asyncio.sleep(0)
+        self.addCleanup(task.cancel)
+        return task
+
+    async def test_voice_cancel_does_not_cross_chats(self):
+        bot = self._bare_bot()
+        key_a = bot._conversation_key(7, 100)  # "7:100"
+        key_b = bot._conversation_key(7, 200)  # "7:200"
+        task_a = await self._pending_task()
+        bot._track_voice_task(key_a, task_a)
+
+        # /stop in chat B must not touch chat A's voice task.
+        cancelled = await bot._cancel_user_voice_tasks(key_b)
+        self.assertEqual(cancelled, 0)
+        self.assertFalse(task_a.cancelled())
+
+        # /stop in chat A cancels it.
+        cancelled = await bot._cancel_user_voice_tasks(key_a)
+        self.assertEqual(cancelled, 1)
+        self.assertTrue(task_a.cancelled() or task_a.done())
+
+
 if __name__ == "__main__":
     unittest.main()
