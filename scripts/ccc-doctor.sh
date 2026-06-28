@@ -7,7 +7,7 @@
 set -uo pipefail
 
 REPO="${CCC_DOCTOR_REPO_DIR:-$(cd "$(dirname "$0")/.." && pwd)}"
-CLAUDE_DIR="${CCC_DOCTOR_CLAUDE_DIR:-/root/.claude}"
+CLAUDE_DIR="${CCC_DOCTOR_CLAUDE_DIR:-${HOME:-/root}/.claude}"
 SETTINGS="$CLAUDE_DIR/settings.json"
 FIX=0
 ROLLBACK=0

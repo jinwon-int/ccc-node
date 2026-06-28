@@ -18,7 +18,7 @@ while [ $# -gt 0 ]; do
 done
 case "$MODE" in local|remote) ;; *) echo "invalid mode: $MODE" >&2; exit 2 ;; esac
 
-STATE_DIR="${CCC_STATE_DIR:-/root/.claude/state}"
+STATE_DIR="${CCC_STATE_DIR:-${HOME:-/root}/.claude/state}"
 MAX_BYTES="${CCC_MEMORY_QUERY_MAX_BYTES:-}"
 if [ -z "$MAX_BYTES" ]; then
   if [ "$MODE" = "remote" ]; then MAX_BYTES="${CCC_MEMORY_REMOTE_QUERY_MAX_BYTES:-900}"; else MAX_BYTES="${CCC_MEMORY_LOCAL_QUERY_MAX_BYTES:-1400}"; fi

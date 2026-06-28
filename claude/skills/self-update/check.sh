@@ -3,7 +3,7 @@
 # READ-ONLY — fetches and reports; never pulls, installs, or restarts.
 set -uo pipefail
 
-REPO="${CCC_REPO_DIR:-/opt/ccc-node}"
+REPO="${CCC_REPO_DIR:-$([ -d /opt/ccc-node/.git ] && echo /opt/ccc-node || echo "$HOME/ccc-node")}"
 if [ ! -d "$REPO/.git" ]; then
   echo "ccc-node repo not found at $REPO (set CCC_REPO_DIR)"; exit 1
 fi

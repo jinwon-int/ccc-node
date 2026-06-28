@@ -17,7 +17,7 @@ Adds an MCP server so its tools (`mcp__<name>__*`) are available every session. 
    ```
    For a server needing a key — read it into a shell var so it is never printed:
    ```bash
-   KEY=$(grep -E '^<ENV_NAME>=' /root/.hermes/.env | head -1 | cut -d= -f2- | tr -d '"'\'' ')
+   KEY=$(grep -E '^<ENV_NAME>=' $HOME/.hermes/.env | head -1 | cut -d= -f2- | tr -d '"'\'' ')
    claude mcp add <name> -s user -e <ENV_NAME>="$KEY" -- npx -y <pkg>
    unset KEY
    ```
@@ -26,7 +26,7 @@ Adds an MCP server so its tools (`mcp__<name>__*`) are available every session. 
 
 4. **Protect the secret store**
    ```bash
-   chmod 600 /root/.claude.json
+   chmod 600 $HOME/.claude.json
    ```
 
 5. **Verify**

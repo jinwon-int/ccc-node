@@ -8,10 +8,10 @@
 # Tune:   SKILL_SUGGEST_MIN (min frequency to surface, default 4)
 set -uo pipefail
 
-PROJ="${CLAUDE_PROJECTS_DIR:-/root/.claude/projects}"
-OUT="${SKILL_SUGGEST_OUT:-/root/.claude/state/skill-candidates.md}"
+PROJ="${CLAUDE_PROJECTS_DIR:-${HOME:-/root}/.claude/projects}"
+OUT="${SKILL_SUGGEST_OUT:-${HOME:-/root}/.claude/state/skill-candidates.md}"
 MIN="${SKILL_SUGGEST_MIN:-4}"
-SKILLS_DIR="${CLAUDE_SKILLS_DIR:-/root/.claude/skills}"
+SKILLS_DIR="${CLAUDE_SKILLS_DIR:-${HOME:-/root}/.claude/skills}"
 mkdir -p "$(dirname "$OUT")"
 
 # Existing skills (so we can flag candidates already covered).

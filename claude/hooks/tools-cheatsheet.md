@@ -29,7 +29,7 @@ A2A 태스크를 claim하면 업무량에 맞춰 소환(예산 0–3, 하드캡 
 - 검증(운영 단정 전): `wiki-agent load --lines A:B <path>`
 - 빠른 맥락: `wiki-agent prefetch "<query>"`
 - 영속 업데이트(PR-first): `wiki-agent write-path` → 반환된 워크트리에서 편집 → `wiki-agent pr`
-  - 워크트리: `/root/.wiki-agent/wiki-pr-work/seoyoon-family-wiki`
+  - 워크트리: `$HOME/.wiki-agent/wiki-pr-work/seoyoon-family-wiki`
   - ID 규칙: 새 섹션 ID = `max(TM-/ND-)+1`; `log.md`는 최상단에 `LOG-<max+1>` prepend; **raw secret 금지**(위치/취급만)
 
 ## Honcho (관계/working memory)
@@ -41,7 +41,7 @@ A2A 태스크를 claim하면 업무량에 맞춰 소환(예산 0–3, 하드캡 
 - 배포: `/opt/ccc-node/bridge` (repo `jinwon-int/ccc-node`)
 - 상태: `/opt/ccc-node/bridge/start.sh --path /root --status`
 - import 링크 복구/운영 절차: 노드 Wiki RUNBOOK 참조
-- 재시작 헬퍼(있으면): `/root/.telegram_bot/restart_bridge.sh`
+- 재시작 헬퍼(있으면): `$HOME/.telegram_bot/restart_bridge.sh`
 
 ## GitHub (PR-first)
 - 생성: `gh pr create --repo <owner/repo> --base main --head <branch> --title .. --body ..`
@@ -50,5 +50,5 @@ A2A 태스크를 claim하면 업무량에 맞춰 소환(예산 0–3, 하드캡 
 - main 직접 푸시 금지(브랜치 먼저); 커밋에 `Co-Authored-By` trailer
 
 ## 진행상태 체크포인트 (멀티세션/장기 작업)
-- `/root/.claude/state/working-state.md`를 **목표 / 진행 / 다음 단계**로 갱신 유지
+- `$HOME/.claude/state/working-state.md`를 **목표 / 진행 / 다음 단계**로 갱신 유지
 - 이 파일은 PreCompact에서 스냅샷되고 PostCompact에서 자동 재주입됨

@@ -12,7 +12,7 @@ Use this when work produces reusable operating knowledge (a decision, runbook, n
 1. **Open a PR worktree**
    ```bash
    wiki-agent write-path        # resets/creates the PR branch
-   # worktree: /root/.wiki-agent/wiki-pr-work/seoyoon-family-wiki
+   # worktree: $HOME/.wiki-agent/wiki-pr-work/seoyoon-family-wiki
    ```
 
 2. **Find the target page** (consult first; don't guess paths)
@@ -23,7 +23,7 @@ Use this when work produces reusable operating knowledge (a decision, runbook, n
 
 3. **Compute new IDs** (worktree = `$W`)
    ```bash
-   W=/root/.wiki-agent/wiki-pr-work/seoyoon-family-wiki
+   W=$HOME/.wiki-agent/wiki-pr-work/seoyoon-family-wiki
    # next section id (DOC-/TM-/ND- share one space): max+1
    grep -rhoE "\[(TM|ND)-[0-9]+\]" "$W/pages" | grep -oE "[0-9]+" | sort -n | tail -1
    # next log id:

@@ -2,9 +2,9 @@
 # ccc-memory-explain.sh — read-only explanation of task-conditioned memory recall.
 set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-STATE_DIR="${CCC_STATE_DIR:-/root/.claude/state}"
-CACHE="${CCC_MEMORY_CACHE_DIR:-/root/.claude/hooks/cache}"
-MEMORY_DIR="${CCC_MEMORY_DIR:-/root/.claude/memories}"
+STATE_DIR="${CCC_STATE_DIR:-${HOME:-/root}/.claude/state}"
+CACHE="${CCC_MEMORY_CACHE_DIR:-${HOME:-/root}/.claude/hooks/cache}"
+MEMORY_DIR="${CCC_MEMORY_DIR:-${HOME:-/root}/.claude/memories}"
 OUTPUT="text"
 QUERY=""
 while [ $# -gt 0 ]; do

@@ -33,8 +33,8 @@ if [ "$FIX" = 1 ]; then
 fi
 
 export CCC_SECURITY_AUDIT_REPO_DIR="${CCC_SECURITY_AUDIT_REPO_DIR:-$(cd "$(dirname "$0")/.." && pwd)}"
-export CCC_SECURITY_AUDIT_CLAUDE_DIR="${CCC_SECURITY_AUDIT_CLAUDE_DIR:-/root/.claude}"
-export CCC_SECURITY_AUDIT_HERMES_DIR="${CCC_SECURITY_AUDIT_HERMES_DIR:-/root/.hermes}"
+export CCC_SECURITY_AUDIT_CLAUDE_DIR="${CCC_SECURITY_AUDIT_CLAUDE_DIR:-${HOME:-/root}/.claude}"
+export CCC_SECURITY_AUDIT_HERMES_DIR="${CCC_SECURITY_AUDIT_HERMES_DIR:-${HOME:-/root}/.hermes}"
 export CCC_SECURITY_AUDIT_SPOOL_DIR="${CCC_SECURITY_AUDIT_SPOOL_DIR:-$CCC_SECURITY_AUDIT_CLAUDE_DIR/state/telegram-spool}"
 export CCC_SECURITY_AUDIT_CACHE_DIR="${CCC_SECURITY_AUDIT_CACHE_DIR:-$CCC_SECURITY_AUDIT_CLAUDE_DIR/hooks/cache}"
 
@@ -47,8 +47,8 @@ import subprocess
 from pathlib import Path
 
 repo = Path(os.environ.get('CCC_SECURITY_AUDIT_REPO_DIR') or Path(__file__).resolve().parents[1])
-claude_dir = Path(os.environ.get('CCC_SECURITY_AUDIT_CLAUDE_DIR') or '/root/.claude')
-hermes_dir = Path(os.environ.get('CCC_SECURITY_AUDIT_HERMES_DIR') or '/root/.hermes')
+claude_dir = Path(os.environ.get('CCC_SECURITY_AUDIT_CLAUDE_DIR') or os.path.expanduser('~/.claude'))
+hermes_dir = Path(os.environ.get('CCC_SECURITY_AUDIT_HERMES_DIR') or os.path.expanduser('~/.hermes'))
 spool_dir = Path(os.environ.get('CCC_SECURITY_AUDIT_SPOOL_DIR') or claude_dir / 'state' / 'telegram-spool')
 cache_dir = Path(os.environ.get('CCC_SECURITY_AUDIT_CACHE_DIR') or claude_dir / 'hooks' / 'cache')
 

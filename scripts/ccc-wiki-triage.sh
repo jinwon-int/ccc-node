@@ -3,7 +3,7 @@
 # Never writes to Family Wiki; local decision marks are stored under CCC_STATE_DIR only.
 set -uo pipefail
 
-STATE_DIR="${CCC_STATE_DIR:-/root/.claude/state}"
+STATE_DIR="${CCC_STATE_DIR:-${HOME:-/root}/.claude/state}"
 CANDIDATES="${CCC_WIKI_CANDIDATES_FILE:-$STATE_DIR/wiki-candidates.md}"
 DECISIONS="${CCC_WIKI_TRIAGE_DECISIONS:-$STATE_DIR/wiki-candidate-decisions.json}"
 CMD="${1:-list}"
