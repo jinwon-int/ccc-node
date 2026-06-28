@@ -34,7 +34,9 @@ deny() {
   # Observability: record the denial (risk label + profile + tool only — never the raw
   # command, which may carry secrets) so blocked gated actions surface as approval-needed.
   local ts; ts="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)"
-  printf '%s\tDENY[%s]\tprofile=%s\ttool=%s\n' "$ts" "$label" "$profile" "${tool:-?}" >> "${CCC_APPROVAL_LOG:-${HOME:-/root}/.claude/state/approval-needed.log}" 2>/dev/null
+  local approval_log="${CCC_APPROVAL_LOG:-${HOME:-/root}/.claude/state/approval-needed.log}"
+  mkdir -p "$(dirname "$approval_log")" 2>/dev/null
+  printf '%s\tDENY[%s]\tprofile=%s\ttool=%s\n' "$ts" "$label" "$profile" "${tool:-?}" >> "$approval_log" 2>/dev/null
   echo "BLOCKED by ccc-node guard [$label] (profile=$profile): ${detail}" >&2
   echo "→ Fresh Approval Required (CLAUDE.md). After the operator approves THIS action, re-run with CCC_ALLOW_GATED=1." >&2
   exit 2
