@@ -572,7 +572,7 @@ class VoiceFlowTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(60)
 
         task = asyncio.create_task(long_task())
-        bot._track_voice_task(11, task)
+        bot._track_voice_task("11:1001", task)  # conversation key (user 11, chat 1001)
 
         update = SimpleNamespace(
             message=SimpleNamespace(reply_text=AsyncMock(), text="/stop"),
@@ -591,7 +591,7 @@ class VoiceFlowTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(60)
 
         task = asyncio.create_task(long_task())
-        bot._track_voice_task(11, task)
+        bot._track_voice_task("11:1001", task)  # conversation key (user 11, chat 1001)
 
         update = SimpleNamespace(
             message=SimpleNamespace(reply_text=AsyncMock(), text="/new"),

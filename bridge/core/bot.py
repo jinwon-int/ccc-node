@@ -112,7 +112,6 @@ class TelegramBot:
         self._push_notifier = PushNotifier()
         # Only sessions created/resumed in current runtime are auto-resumed.
         self._runtime_active_sessions: set[Any] = set()
-        self._runtime_active_voice_sessions: set[Any] = set()
         self._user_voice_tasks: Dict[Any, set[asyncio.Task]] = {}
         # Per-user bounded run queue + active-task tracking (priority stop/revert).
         self._tasks = UserTaskQueue(self._MAX_INFLIGHT_MESSAGES)
@@ -848,7 +847,7 @@ class TelegramBot:
         conversation_key = self._conversation_key(user_id, chat.id)
         log_debug(user_id, "command", "/new")
 
-        cancelled_voice = await self._cancel_user_voice_tasks(user_id)
+        cancelled_voice = await self._cancel_user_voice_tasks(conversation_key)
         if cancelled_voice:
             logger.info(
                 "Cancelled %s active voice task(s) for user %s on /new",
@@ -997,7 +996,7 @@ class TelegramBot:
         conversation_key = self._conversation_key(user_id, chat.id)
         log_debug(user_id, "command", "/stop")
 
-        cancelled_voice = await self._cancel_user_voice_tasks(user_id)
+        cancelled_voice = await self._cancel_user_voice_tasks(conversation_key)
         if cancelled_voice:
             logger.info(
                 "Cancelled %s active voice task(s) for user %s on /stop",
@@ -1315,7 +1314,7 @@ class TelegramBot:
                 pass
 
         # Cancel voice transcription
-        voice_tasks = self._user_voice_tasks.get(user_id, set())
+        voice_tasks = self._user_voice_tasks.get(conversation_key, set())
         for task in list(voice_tasks):
             if not task.done():
                 task.cancel()
@@ -1406,40 +1405,39 @@ class TelegramBot:
             logger.error(f"Failed to cancel streaming for user {user_id}: {e}")
             return False
 
-    def _prune_voice_tasks(self, user_id: int) -> set[asyncio.Task]:
-        tasks = self._user_voice_tasks.get(user_id)
+    def _prune_voice_tasks(self, key: Any) -> set[asyncio.Task]:
+        tasks = self._user_voice_tasks.get(key)
         if not tasks:
             tasks = set()
-            self._user_voice_tasks[user_id] = tasks
+            self._user_voice_tasks[key] = tasks
             return tasks
         done = {t for t in tasks if t.done()}
         tasks.difference_update(done)
         return tasks
 
-    def _track_voice_task(self, user_id: int, task: asyncio.Task) -> None:
-        tasks = self._prune_voice_tasks(user_id)
+    def _track_voice_task(self, key: Any, task: asyncio.Task) -> None:
+        # key is the conversation key (user_id:chat_id in groups, bare user_id in
+        # DMs) so /stop and /new only cancel voice work in the current chat.
+        tasks = self._prune_voice_tasks(key)
         tasks.add(task)
-        self._runtime_active_voice_sessions.add(user_id)
 
         def _on_done(t: asyncio.Task) -> None:
-            current = self._user_voice_tasks.get(user_id)
+            current = self._user_voice_tasks.get(key)
             if current is not None:
                 current.discard(t)
-                if not current:
-                    self._runtime_active_voice_sessions.discard(user_id)
             try:
                 t.result()
             except asyncio.CancelledError:
-                logger.debug("Voice task cancelled for user %s", user_id)
+                logger.debug("Voice task cancelled for conversation %s", key)
             except Exception as exc:
                 logger.error(
-                    "Voice task failed for user %s: %s", user_id, exc, exc_info=True
+                    "Voice task failed for conversation %s: %s", key, exc, exc_info=True
                 )
 
         task.add_done_callback(_on_done)
 
-    async def _cancel_user_voice_tasks(self, user_id: int) -> int:
-        tasks = self._prune_voice_tasks(user_id)
+    async def _cancel_user_voice_tasks(self, key: Any) -> int:
+        tasks = self._prune_voice_tasks(key)
         cancelled = 0
         for task in list(tasks):
             if not task.done():
@@ -1448,7 +1446,6 @@ class TelegramBot:
         if tasks:
             await asyncio.gather(*list(tasks), return_exceptions=True)
         tasks.clear()
-        self._runtime_active_voice_sessions.discard(user_id)
         return cancelled
 
     async def _cleanup_stale_audio_files(
@@ -2053,6 +2050,8 @@ class TelegramBot:
             return
 
         user_id = self._require_user(update).id
+        chat = self._require_chat(update)
+        conversation_key = self._conversation_key(user_id, chat.id)
         file_id = getattr(image, "file_id", "")
         caption = getattr(message, "caption", None) or ""
         log_debug(user_id, "image", f"{image_kind}:{file_id} caption_len={len(caption)}")
@@ -2116,7 +2115,7 @@ class TelegramBot:
             await message.reply_text(reply)
             log_debug(user_id, "bot", reply)
 
-        await self._enqueue_user_task(user_id, run_task, on_overflow)
+        await self._enqueue_user_task(conversation_key, run_task, on_overflow)
 
     async def _handle_voice_message(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -2129,13 +2128,15 @@ class TelegramBot:
             return
 
         user_id = self._require_user(update).id
+        chat = self._require_chat(update)
+        conversation_key = self._conversation_key(user_id, chat.id)
         voice = message.voice
         log_debug(user_id, "voice", f"voice:{voice.file_id} duration={voice.duration}")
 
         async def run_task():
             task = asyncio.current_task()
             if task is not None:
-                self._track_voice_task(user_id, task)
+                self._track_voice_task(conversation_key, task)
 
             self._audio_dir.mkdir(parents=True, exist_ok=True)
             start = time.perf_counter()
@@ -2392,7 +2393,7 @@ class TelegramBot:
             await message.reply_text(reply)
             log_debug(user_id, "bot", reply)
 
-        await self._enqueue_user_task(user_id, run_task, on_overflow)
+        await self._enqueue_user_task(conversation_key, run_task, on_overflow)
 
     async def _handle_text_message(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -2795,7 +2796,8 @@ class TelegramBot:
                     "⏳ Processing previous messages, please wait or send /stop to terminate.",
                 )
 
-            await self._enqueue_user_task(user_id, run_task, on_overflow)
+            conversation_key = self._conversation_key(user_id, chat_id)
+            await self._enqueue_user_task(conversation_key, run_task, on_overflow)
             return
 
         # Handle revert callbacks
