@@ -23,9 +23,10 @@ out="$(bash "$CHECKPOINT" PostCompact 2>&1)"; rc=$?
 ok "PostCompact exits 0" '[ "$rc" = 0 ]'
 ok "PostCompact reinjects working state" 'jq -e ".hookSpecificOutput.hookEventName == \"PostCompact\" and (.hookSpecificOutput.additionalContext | contains(\"active work\"))" <<<"$out" >/dev/null'
 
-CLAUDE_DISTILL_INFLIGHT=1 bash "$CHECKPOINT" PreCompact >/tmp/checkpoint-guard.out 2>&1; rc=$?
+guard_out="${TMPDIR:-/tmp}/checkpoint-guard.out"
+CLAUDE_DISTILL_INFLIGHT=1 bash "$CHECKPOINT" PreCompact >"$guard_out" 2>&1; rc=$?
 ok "distill recursion guard exits 0" '[ "$rc" = 0 ]'
-ok "distill recursion guard emits no output" '[ ! -s /tmp/checkpoint-guard.out ]'
+ok "distill recursion guard emits no output" '[ ! -s "$guard_out" ]'
 
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
