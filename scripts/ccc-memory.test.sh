@@ -216,6 +216,33 @@ ok "rendered local hot block drops debug signals/score/results noise" '[ "$rc" =
 out="$(hot_run CCC_MEMORY_INJECT_RENDER=0)"; rc=$?
 ok "CCC_MEMORY_INJECT_RENDER=0 injects raw search JSON" '[ "$rc" = 0 ] && jq -e ".hookSpecificOutput.additionalContext | (contains(\"\\\"results\\\"\") and contains(\"signals\"))" >/dev/null <<<"$out"'
 
+# Relevance-aware budget: when small/empty canonical blocks (no wiki/honcho cache)
+# leave budget unused, the local hot block reclaims it — fetching MORE than the
+# default 5 results to fill the freed budget — while the whole injection stays
+# within CCC_MEMORY_MAX_BYTES. Disable with CCC_MEMORY_DYNAMIC_BUDGET=0; an
+# explicit CCC_MEMORY_SEARCH_LIMIT always wins.
+bud_state="$TMP/budget-state"; bud_cache="$TMP/budget-cache"; bud_mem="$TMP/budget-mem"
+rm -rf "$bud_state" "$bud_cache" "$bud_mem"; mkdir -p "$bud_state" "$bud_cache" "$bud_mem"
+printf 'Tiny node identity memory.\n' > "$bud_mem/MEMORY.md"; printf 'concise\n' > "$bud_mem/USER.md"
+bud_facts="$bud_state/memory-facts.jsonl"; : > "$bud_facts"
+for i in $(seq 1 40); do
+  printf '{"id":"bf%s","kind":"preference","text":"Operator preference %s about editor Helix workflow tooling configuration detail %s","review":"auto-local"}\n' "$i" "$i" "$i" >> "$bud_facts"
+done
+CCC_STATE_DIR="$bud_state" CCC_MEMORY_CACHE_DIR="$bud_cache" CCC_MEMORY_DIR="$bud_mem" CCC_MEMORY_FACTS_FILE="$bud_facts" bash "$ROOT/scripts/ccc-memory-index.sh" rebuild >/dev/null 2>&1
+bud_bullets() { # extra env assignments; prints count of rendered local bullets
+  env CCC_STATE_DIR="$bud_state" CCC_MEMORY_CACHE_DIR="$bud_cache" CCC_MEMORY_DIR="$bud_mem" \
+    CCC_MEMORY_INDEX_DB="$bud_state/memory-index.sqlite" CCC_HOOK_DIR="$ROOT/claude/hooks" \
+    CCC_MEMORY_TOOLS_DIR="$ROOT/scripts" CCC_MEMORY_QUERY="editor Helix" "$@" \
+    bash "$ROOT/claude/hooks/load-memory.sh" SessionStart 2>/dev/null \
+    | jq -r '.hookSpecificOutput.additionalContext' \
+    | sed -n '/## Local hot memory/,/## Family Wiki/p' | grep -c '^- ('
+}
+ok "dynamic budget reclaims slack -> local surfaces more than the default 5" '[ "$(bud_bullets)" -gt 5 ]'
+ok "dynamic budget OFF -> local stays at the default 5" '[ "$(bud_bullets CCC_MEMORY_DYNAMIC_BUDGET=0)" = 5 ]'
+ok "explicit CCC_MEMORY_SEARCH_LIMIT wins over dynamic" '[ "$(bud_bullets CCC_MEMORY_SEARCH_LIMIT=3)" = 3 ]'
+bud_total="$(env CCC_STATE_DIR="$bud_state" CCC_MEMORY_CACHE_DIR="$bud_cache" CCC_MEMORY_DIR="$bud_mem" CCC_MEMORY_INDEX_DB="$bud_state/memory-index.sqlite" CCC_HOOK_DIR="$ROOT/claude/hooks" CCC_MEMORY_TOOLS_DIR="$ROOT/scripts" CCC_MEMORY_QUERY="editor Helix" bash "$ROOT/claude/hooks/load-memory.sh" SessionStart 2>/dev/null | jq -r '.hookSpecificOutput.additionalContext' | wc -c)"
+ok "dynamic budget keeps the whole injection within CCC_MEMORY_MAX_BYTES" '[ "$bud_total" -le 12000 ]'
+
 # Cross-source injection dedup: the local hot block must not echo hits that are
 # ALSO injected verbatim as the MEMORY/wiki/honcho blocks (double-spending the
 # budget). A memory-source hit fully present in the injected MEMORY block is
