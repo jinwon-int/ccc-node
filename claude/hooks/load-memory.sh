@@ -98,6 +98,43 @@ sys.stdout.write(json.dumps(doc, ensure_ascii=False))
 PY
 }
 
+# Render the (deduped) local hot-memory search JSON as compact, readable lines
+# for injection. The raw search JSON carries full filesystem paths, a per-result
+# score and an 8-field `signals` object that are debug-only noise to the model
+# and waste the bounded injection budget — the agent only needs the snippet and
+# which source it came from. The search tool and ccc-memory-explain still emit
+# full JSON for diagnostics; this only changes what gets injected.
+# Set CCC_MEMORY_INJECT_RENDER=0/false/off to inject the raw JSON instead.
+render_local_hot() { # <search-json>
+  if is_disabled "${CCC_MEMORY_INJECT_RENDER:-1}"; then printf '%s' "$1"; return 0; fi
+  SEARCH_JSON="$1" python3 - 2>/dev/null <<'PY' || printf '%s' "$1"
+import json, os, re, sys
+raw = os.environ.get("SEARCH_JSON", "")
+try:
+    doc = json.loads(raw)
+except Exception:
+    sys.stdout.write(raw); sys.exit(0)
+results = doc.get("results") if isinstance(doc, dict) else None
+if not isinstance(results, list):
+    sys.stdout.write(raw); sys.exit(0)
+LABEL = {"memory": "memory", "cache": "cache", "structured": "fact",
+         "state": "distill", "distill-history": "distill"}
+lines = []
+for r in results:
+    if not isinstance(r, dict):
+        continue
+    snip = str(r.get("snippet") or r.get("content") or r.get("text") or "")
+    snip = re.sub(r"\s+", " ", snip.replace("[", "").replace("]", "")).strip()
+    # FTS snippets bracket matches and wrap gaps in "…"; drop the leading/trailing
+    # ellipsis so the rendered line reads cleanly (internal gaps are kept).
+    snip = re.sub(r"^\s*(?:…|\.\.\.)\s*|\s*(?:…|\.\.\.)\s*$", "", snip)
+    if not snip:
+        continue
+    lines.append(f"- ({LABEL.get(str(r.get('source') or ''), 'memory')}) {snip}")
+sys.stdout.write("\n".join(lines))
+PY
+}
+
 find_memory_tool() { # <tool-name>
   local name="$1" d
   for d in "${CCC_MEMORY_TOOLS_DIR:-}" "$HOOKDIR" "$HOOKDIR/../../scripts"; do
@@ -164,6 +201,9 @@ honcho="$(scan_injection_block honcho-cache "$honcho" | limit_bytes "$MAX_HONCHO
 local_hot="$(dedup_local_hot "$mem
 $wiki
 $honcho" "$local_hot")"
+# Render the search JSON to compact readable lines before scanning/limiting, so
+# the model gets snippets+source instead of debug scores/signals/paths.
+local_hot="$(render_local_hot "$local_hot")"
 local_hot="$(scan_injection_block local-hot-memory "$local_hot" | limit_bytes "$MAX_LOCAL")"
 
 node_label="${CCC_NODE:-$(cat "$STATE_DIR/node.txt" 2>/dev/null || hostname -s 2>/dev/null || printf 'ccc-node')}"
