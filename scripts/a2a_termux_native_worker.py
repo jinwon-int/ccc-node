@@ -38,6 +38,13 @@ PATH_KEYS = (
     "OPENCLAW_BIN",
     "A2A_OPENCLAW_ANALYSIS_BIN",
 )
+# These are exec()'d directly (the native Node wrapper and the Claude CLI
+# wrapper), so they must be executable — caught at check time, not at exec time.
+# The bridges are .mjs files passed to Node, so they only need to exist.
+EXEC_KEYS = (
+    "A2A_NATIVE_NODE_BIN",
+    "A2A_CLAUDE_CODE_BIN",
+)
 REQUIRED_METADATA = {
     "runtime": "claude-code",
     "harness": "claude",
@@ -117,6 +124,13 @@ def existing_file(label: str, value: str) -> Path:
     return path
 
 
+def executable_file(label: str, value: str) -> Path:
+    path = existing_file(label, value)
+    if not os.access(path, os.X_OK):
+        raise ConfigError(f"{label} must be executable: {value}")
+    return path
+
+
 def existing_dir(label: str, value: str) -> Path:
     path = Path(value).expanduser()
     if not path.is_dir():
@@ -177,11 +191,21 @@ def validate_env(env: dict[str, str]) -> tuple[Path, list[str], dict[str, object
         raise ConfigError(f"worker script must exist: {worker_script}")
     if not worker_script.name == "worker.js":
         raise ConfigError("worker script must be the a2a-broker-worker worker.js entrypoint")
+    # The script we exec must live under the declared worker root, so an override
+    # can't point the launcher at a worker.js anywhere else on the device.
+    try:
+        worker_script.resolve().relative_to(worker_root.resolve())
+    except ValueError:
+        raise ConfigError(
+            f"worker script must live under A2A_WORKER_ROOT ({worker_root}): {worker_script}"
+        )
 
     checked_paths: dict[str, Path] = {}
     for key in PATH_KEYS:
-        checked_paths[key] = existing_file(key, env[key])
-        check_forbidden_context(checked_paths[key], key)
+        # Reject forbidden OpenClaw context targets first (regardless of mode/bits),
+        # then assert existence and — for the exec'd wrappers — executability.
+        check_forbidden_context(Path(env[key]).expanduser(), key)
+        checked_paths[key] = (executable_file if key in EXEC_KEYS else existing_file)(key, env[key])
     check_forbidden_context(worker_script, "A2A_WORKER_SCRIPT")
 
     openclaw = checked_paths["OPENCLAW_BIN"].resolve()
@@ -253,7 +277,10 @@ def cmd_run(args: argparse.Namespace) -> int:
     env, _worker_script, command, _metadata = load_and_validate(args.env_file)
     child_env = os.environ.copy()
     child_env.update(env)
-    os.execve(command[0], command, child_env)
+    try:
+        os.execve(command[0], command, child_env)
+    except OSError as exc:  # exec failed — stay fail-closed instead of a raw traceback
+        raise ConfigError(f"failed to exec native worker {command[0]}: {exc}") from exc
     return 127
 
 
