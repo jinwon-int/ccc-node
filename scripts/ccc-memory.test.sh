@@ -7,6 +7,12 @@ TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 ok() { if eval "$2"; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $1"; fi; }
 
+# Hermetic by default: load-memory fires a DETACHED refresh-memory that rebuilds
+# the index and consolidates facts out-of-band. During tests that races against
+# fixtures we just built, mutating shared state mid-assertion. Suppress it suite-
+# wide; the one guard test below unsets it to prove the default still fires.
+export CCC_MEMORY_NO_REFRESH=1
+
 state="$TMP/state"
 cache="$TMP/cache"
 mem="$TMP/memories"
@@ -238,12 +244,11 @@ for i in $(seq 1 40); do
 done
 CCC_STATE_DIR="$bud_state" CCC_MEMORY_CACHE_DIR="$bud_cache" CCC_MEMORY_DIR="$bud_mem" CCC_MEMORY_FACTS_FILE="$bud_facts" bash "$ROOT/scripts/ccc-memory-index.sh" rebuild >/dev/null 2>&1
 bud_bullets() { # extra env assignments; prints count of rendered local bullets
-  # CCC_MEMORY_CONSOLIDATE=0: the fixture is intentionally many near-identical
-  # facts (to test result-count scaling); the detached refresh load-memory fires
-  # would otherwise consolidate them away mid-test. The two features are orthogonal.
+  # The fixture is intentionally many near-identical facts (to test result-count
+  # scaling). The suite-wide CCC_MEMORY_NO_REFRESH=1 keeps the detached refresh
+  # from consolidating them away mid-test, so no per-test pin is needed.
   env CCC_STATE_DIR="$bud_state" CCC_MEMORY_CACHE_DIR="$bud_cache" CCC_MEMORY_DIR="$bud_mem" \
     CCC_MEMORY_INDEX_DB="$bud_state/memory-index.sqlite" CCC_HOOK_DIR="$ROOT/claude/hooks" \
-    CCC_MEMORY_CONSOLIDATE=0 \
     CCC_MEMORY_TOOLS_DIR="$ROOT/scripts" CCC_MEMORY_QUERY="editor Helix" "$@" \
     bash "$ROOT/claude/hooks/load-memory.sh" SessionStart 2>/dev/null \
     | jq -r '.hookSpecificOutput.additionalContext' \
@@ -252,7 +257,7 @@ bud_bullets() { # extra env assignments; prints count of rendered local bullets
 ok "dynamic budget reclaims slack -> local surfaces more than the default 5" '[ "$(bud_bullets)" -gt 5 ]'
 ok "dynamic budget OFF -> local stays at the default 5" '[ "$(bud_bullets CCC_MEMORY_DYNAMIC_BUDGET=0)" = 5 ]'
 ok "explicit CCC_MEMORY_SEARCH_LIMIT wins over dynamic" '[ "$(bud_bullets CCC_MEMORY_SEARCH_LIMIT=3)" = 3 ]'
-bud_total="$(env CCC_STATE_DIR="$bud_state" CCC_MEMORY_CACHE_DIR="$bud_cache" CCC_MEMORY_DIR="$bud_mem" CCC_MEMORY_INDEX_DB="$bud_state/memory-index.sqlite" CCC_HOOK_DIR="$ROOT/claude/hooks" CCC_MEMORY_CONSOLIDATE=0 CCC_MEMORY_TOOLS_DIR="$ROOT/scripts" CCC_MEMORY_QUERY="editor Helix" bash "$ROOT/claude/hooks/load-memory.sh" SessionStart 2>/dev/null | jq -r '.hookSpecificOutput.additionalContext' | wc -c)"
+bud_total="$(env CCC_STATE_DIR="$bud_state" CCC_MEMORY_CACHE_DIR="$bud_cache" CCC_MEMORY_DIR="$bud_mem" CCC_MEMORY_INDEX_DB="$bud_state/memory-index.sqlite" CCC_HOOK_DIR="$ROOT/claude/hooks" CCC_MEMORY_TOOLS_DIR="$ROOT/scripts" CCC_MEMORY_QUERY="editor Helix" bash "$ROOT/claude/hooks/load-memory.sh" SessionStart 2>/dev/null | jq -r '.hookSpecificOutput.additionalContext' | wc -c)"
 ok "dynamic budget keeps the whole injection within CCC_MEMORY_MAX_BYTES" '[ "$bud_total" -le 12000 ]'
 
 # Usage feedback loop: docs repeatedly RETRIEVED for real injections earn a small
@@ -430,6 +435,34 @@ out="$(HOME="$install_home" CCC_CLAUDE_DIR="$install_claude" CCC_HERMES_DIR="$in
 ok "setup installs memory helper tools beside hooks" 'grep -q "rc=0" <<<"$out" && [ -x "$install_claude/hooks/ccc-memory-index.sh" ] && [ -x "$install_claude/hooks/ccc-memory-search.sh" ] && [ -x "$install_claude/hooks/ccc-memory-query.sh" ] && [ -x "$install_claude/hooks/ccc-memory-explain.sh" ] && [ -x "$install_claude/hooks/ccc-wiki-triage.sh" ] && [ -x "$install_claude/hooks/ccc-memory-benchmark-export.sh" ]'
 out="$(CCC_STATE_DIR="$TMP/install-eval-state" bash "$install_claude/hooks/ccc-memory-eval.sh" Honcho 2>&1)"; rc=$?
 ok "installed memory eval finds helper tools beside hooks" '[ "$rc" = 0 ] && jq -e ".ok == true" >/dev/null <<<"$out"'
+
+# Refresh guard: load-memory fires the detached refresh by default, and
+# CCC_MEMORY_NO_REFRESH=1 suppresses it (the knob that makes this suite hermetic).
+# A fake refresh-memory.sh signals a FIFO, so we observe firing deterministically
+# without sleeping; the guarded case just times out the read.
+gr_state="$TMP/guard-state"; gr_hook="$TMP/guard-hookdir"
+mkdir -p "$gr_state/cache" "$gr_state/mem" "$gr_hook"
+gr_fifo="$TMP/guard.fifo"
+cat > "$gr_hook/refresh-memory.sh" <<'SH'
+#!/usr/bin/env bash
+printf 'fired\n' > "$CCC_GUARD_FIFO" 2>/dev/null || true
+SH
+chmod +x "$gr_hook/refresh-memory.sh"
+gr_run() { # env-prefix args become extra assignments; -u clears the suite-wide guard
+  env -u CCC_MEMORY_NO_REFRESH \
+    CCC_STATE_DIR="$gr_state" CCC_MEMORY_CACHE_DIR="$gr_state/cache" CCC_MEMORY_DIR="$gr_state/mem" \
+    CCC_HOOK_DIR="$gr_hook" CCC_MEMORY_TOOLS_DIR="$ROOT/scripts" CCC_MEMORY_QUERY="x" \
+    CCC_GUARD_FIFO="$gr_fifo" "$@" \
+    bash "$ROOT/claude/hooks/load-memory.sh" SessionStart >/dev/null 2>&1
+}
+rm -f "$gr_fifo"; mkfifo "$gr_fifo"
+gr_run
+if read -t 5 _l <>"$gr_fifo"; then gr_default=fired; else gr_default=silent; fi
+ok "load-memory fires the background refresh by default" '[ "$gr_default" = fired ]'
+rm -f "$gr_fifo"; mkfifo "$gr_fifo"
+gr_run CCC_MEMORY_NO_REFRESH=1
+if read -t 2 _l <>"$gr_fifo"; then gr_guarded=fired; else gr_guarded=silent; fi
+ok "CCC_MEMORY_NO_REFRESH=1 suppresses the background refresh" '[ "$gr_guarded" = silent ]'
 
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

@@ -276,4 +276,10 @@ jq -n --arg ctx "$ctx" --arg event "$EVENT" \
   '{hookSpecificOutput:{hookEventName:$event,additionalContext:$ctx}}'
 
 # Fire-and-forget: refresh caches for the NEXT session, fully detached so startup never waits.
-setsid bash "$HOOKDIR/refresh-memory.sh" >/dev/null 2>&1 </dev/null &
+# CCC_MEMORY_NO_REFRESH=1 suppresses it — for hermetic tests (the detached refresh
+# rebuilds the index / consolidates facts out-of-band, which otherwise mutates
+# shared state mid-test) and for any caller that wants a strictly read-only inject.
+case "${CCC_MEMORY_NO_REFRESH:-0}" in
+  1|true|TRUE|on|ON|yes|YES) : ;;
+  *) setsid bash "$HOOKDIR/refresh-memory.sh" >/dev/null 2>&1 </dev/null & ;;
+esac
