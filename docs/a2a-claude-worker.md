@@ -116,6 +116,12 @@ Required shape:
   `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`, `DISABLE_GROWTHBOOK=1`, and
   `USE_BUILTIN_RIPGREP=0`.
 
+The checker also fails closed when the exec'd wrappers (`A2A_NATIVE_NODE_BIN`,
+`A2A_CLAUDE_CODE_BIN`) are not executable, when a `A2A_WORKER_SCRIPT` override
+points at a `worker.js` outside `A2A_WORKER_ROOT` (path-escape), and — for
+`run` — when the final `exec` itself fails (a bounded error, never a raw
+traceback).
+
 Only after review and fresh operator approval should the phone run:
 
 ```bash

@@ -147,5 +147,58 @@ PY
 out="$(bash "$TOOL" check --env-file "$patch_mismatch" 2>&1)"; rc=$?
 ok "adapter/bridge mismatch fails closed" '[ "$rc" = 2 ] && grep -q "adapter" <<<"$out"'
 
+# --- hardening: executable bins, worker-script containment, clean exec failure ---
+
+# The exec'd native Node wrapper must be executable; a non-+x bin fails at check
+# time (not later at exec).
+non_exec_node="$TMP/non-exec-node.env"
+write_env "$non_exec_node"
+cp "$TMP/bin/node-native" "$TMP/bin/node-native-noexec"
+chmod -x "$TMP/bin/node-native-noexec"
+python3 - "$non_exec_node" "$TMP/bin/node-native" "$TMP/bin/node-native-noexec" <<'PY'
+import sys
+p, old, new = sys.argv[1:]
+s = open(p, encoding='utf-8').read().replace('A2A_NATIVE_NODE_BIN=' + old, 'A2A_NATIVE_NODE_BIN=' + new)
+open(p, 'w', encoding='utf-8').write(s)
+PY
+out="$(bash "$TOOL" check --env-file "$non_exec_node" 2>&1)"; rc=$?
+ok "non-executable native node bin fails closed" '[ "$rc" = 2 ] && grep -q "must be executable" <<<"$out"'
+
+# A worker.js override outside A2A_WORKER_ROOT is rejected (path-escape).
+escape_worker="$TMP/escape-worker.env"
+write_env "$escape_worker"
+mkdir -p "$TMP/elsewhere"
+printf 'console.log("rogue");\n' > "$TMP/elsewhere/worker.js"
+printf 'A2A_WORKER_SCRIPT=%s\n' "$TMP/elsewhere/worker.js" >> "$escape_worker"
+out="$(bash "$TOOL" check --env-file "$escape_worker" 2>&1)"; rc=$?
+ok "worker script outside A2A_WORKER_ROOT fails closed" '[ "$rc" = 2 ] && grep -q "must live under A2A_WORKER_ROOT" <<<"$out"'
+
+# A worker.js override INSIDE the root is still accepted.
+inside_worker="$TMP/inside-worker.env"
+write_env "$inside_worker"
+mkdir -p "$TMP/worker/alt"
+printf 'console.log("alt");\n' > "$TMP/worker/alt/worker.js"
+printf 'A2A_WORKER_SCRIPT=%s\n' "$TMP/worker/alt/worker.js" >> "$inside_worker"
+out="$(bash "$TOOL" check --env-file "$inside_worker" 2>&1)"; rc=$?
+ok "worker script override inside the root is accepted" '[ "$rc" = 0 ] && grep -q "safe to launch" <<<"$out"'
+
+# A failed exec stays fail-closed (clean error, exit 2) rather than a raw traceback.
+# A directory as the node bin makes execve raise OSError; a forbidden-context name
+# would trip earlier, so use a plain dir the validator accepts as a file? Instead,
+# point the node bin at a non-ELF executable that execve refuses (ENOEXEC) — a
+# script without a shebang, marked +x.
+exec_fail="$TMP/exec-fail.env"
+write_env "$exec_fail"
+printf '\xff\xfenot a valid executable\n' > "$TMP/bin/bad-node"
+chmod +x "$TMP/bin/bad-node"
+python3 - "$exec_fail" "$TMP/bin/node-native" "$TMP/bin/bad-node" <<'PY'
+import sys
+p, old, new = sys.argv[1:]
+s = open(p, encoding='utf-8').read().replace('A2A_NATIVE_NODE_BIN=' + old, 'A2A_NATIVE_NODE_BIN=' + new)
+open(p, 'w', encoding='utf-8').write(s)
+PY
+out="$(bash "$TOOL" run --env-file "$exec_fail" 2>&1)"; rc=$?
+ok "failed exec stays fail-closed (no traceback)" '[ "$rc" = 2 ] && grep -q "failed to exec native worker" <<<"$out" && ! grep -q "Traceback" <<<"$out"'
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
