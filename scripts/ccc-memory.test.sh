@@ -196,9 +196,25 @@ ok "benchmark export defaults to synthetic fixtures only" '[ "$rc" = 0 ] && jq -
 # Default profile (honcho) now queries the local hot-memory index too (was
 # hybrid/max-perf-only). The structured-fact index built above is still present.
 out="$(CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CCC_MEMORY_INDEX_DB="$state/memory-index.sqlite" CCC_HOOK_DIR="$ROOT/claude/hooks" CCC_MEMORY_TOOLS_DIR="$ROOT/scripts" CCC_MEMORY_QUERY="current editor Helix" bash "$ROOT/claude/hooks/load-memory.sh" SessionStart 2>&1)"; rc=$?
-ok "default profile queries the local hot-memory index" '[ "$rc" = 0 ] && jq -e ".hookSpecificOutput.additionalContext | contains(\"\\\"results\\\"\")" >/dev/null <<<"$out"'
+ok "default profile queries the local hot-memory index" '[ "$rc" = 0 ] && jq -e ".hookSpecificOutput.additionalContext | (contains(\"- (\") and (contains(\"local hot memory disabled\") | not))" >/dev/null <<<"$out"'
 out="$(CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CCC_MEMORY_INDEX_DB="$state/memory-index.sqlite" CCC_HOOK_DIR="$ROOT/claude/hooks" CCC_MEMORY_TOOLS_DIR="$ROOT/scripts" CCC_LOCAL_MEMORY_ENABLED=0 CCC_MEMORY_QUERY="current editor Helix" bash "$ROOT/claude/hooks/load-memory.sh" SessionStart 2>&1)"; rc=$?
 ok "CCC_LOCAL_MEMORY_ENABLED=0 opts out of local hot memory" '[ "$rc" = 0 ] && jq -e ".hookSpecificOutput.additionalContext | (contains(\"local hot memory disabled\") and (contains(\"\\\"results\\\"\") | not))" >/dev/null <<<"$out"'
+
+# Injection rendering: the local hot block is injected as compact readable lines
+# ("- (source) snippet"), not the raw search JSON — the debug score/signals/full
+# paths are noise to the model and waste the budget. CCC_MEMORY_INJECT_RENDER=0
+# falls back to raw JSON (for diagnostics / back-compat).
+hot_run() { # extra env assignments as args
+  env CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" \
+    CCC_MEMORY_INDEX_DB="$state/memory-index.sqlite" CCC_HOOK_DIR="$ROOT/claude/hooks" \
+    CCC_MEMORY_TOOLS_DIR="$ROOT/scripts" CCC_MEMORY_QUERY="current editor Helix" "$@" \
+    bash "$ROOT/claude/hooks/load-memory.sh" SessionStart 2>&1
+}
+out="$(hot_run)"; rc=$?
+ok "rendered local hot block uses readable bullet lines" '[ "$rc" = 0 ] && jq -e ".hookSpecificOutput.additionalContext | contains(\"- (fact)\")" >/dev/null <<<"$out"'
+ok "rendered local hot block drops debug signals/score/results noise" '[ "$rc" = 0 ] && jq -e ".hookSpecificOutput.additionalContext | ((contains(\"signals\") or contains(\"\\\"score\\\"\") or contains(\"\\\"results\\\"\")) | not)" >/dev/null <<<"$out"'
+out="$(hot_run CCC_MEMORY_INJECT_RENDER=0)"; rc=$?
+ok "CCC_MEMORY_INJECT_RENDER=0 injects raw search JSON" '[ "$rc" = 0 ] && jq -e ".hookSpecificOutput.additionalContext | (contains(\"\\\"results\\\"\") and contains(\"signals\"))" >/dev/null <<<"$out"'
 
 # Cross-source injection dedup: the local hot block must not echo hits that are
 # ALSO injected verbatim as the MEMORY/wiki/honcho blocks (double-spending the
@@ -219,9 +235,11 @@ CCC_STATE_DIR="$dd_state" CCC_MEMORY_CACHE_DIR="$dd_cache" CCC_MEMORY_DIR="$dd_m
 dd_sources() { # remaining args become extra env assignments for the hook
   # `env` (not a bare prefix) so post-expansion NAME=VALUE words from "$@" are
   # honoured as assignments rather than treated as the command name.
+  # Disable rendering so the local block stays raw JSON we can parse for sources.
   env CCC_STATE_DIR="$dd_state" CCC_MEMORY_CACHE_DIR="$dd_cache" CCC_MEMORY_DIR="$dd_mem" \
     CCC_MEMORY_INDEX_DB="$dd_state/memory-index.sqlite" CCC_HOOK_DIR="$ROOT/claude/hooks" \
-    CCC_MEMORY_TOOLS_DIR="$ROOT/scripts" CCC_MEMORY_QUERY="Helix editor" "$@" \
+    CCC_MEMORY_TOOLS_DIR="$ROOT/scripts" CCC_MEMORY_QUERY="Helix editor" \
+    CCC_MEMORY_INJECT_RENDER=0 "$@" \
     bash "$ROOT/claude/hooks/load-memory.sh" SessionStart 2>/dev/null \
     | jq -r '.hookSpecificOutput.additionalContext' \
     | sed -n '/## Local hot memory/,/## Family Wiki/p' \
