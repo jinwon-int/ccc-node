@@ -55,6 +55,49 @@ else:
 ' "$max"
 }
 
+# Cross-source injection dedup. The local hot-memory search re-surfaces hits from
+# MEMORY.md/USER.md (source=memory) and the wiki/honcho caches (source=cache) that
+# are ALSO injected verbatim as their own blocks above — double-spending the
+# bounded injection budget. Drop such a hit only when its snippet is already fully
+# present in the injected text, so anything truncated away from the canonical
+# block is still kept (lossless). Structured (distilled-fact) and distill-state
+# hits have no other injection path and are always kept.
+# Set CCC_MEMORY_INJECT_DEDUP=0/false/off to disable.
+dedup_local_hot() { # <injected-text> <search-json>
+  if is_disabled "${CCC_MEMORY_INJECT_DEDUP:-1}"; then printf '%s' "$2"; return 0; fi
+  # JSON is passed via env, not stdin: the heredoc below occupies stdin.
+  INJECTED="$1" SEARCH_JSON="$2" python3 - 2>/dev/null <<'PY' || printf '%s' "$2"
+import json, os, re, sys
+raw = os.environ.get("SEARCH_JSON", "")
+try:
+    doc = json.loads(raw)
+except Exception:
+    sys.stdout.write(raw); sys.exit(0)
+results = doc.get("results") if isinstance(doc, dict) else None
+if not isinstance(results, list) or not results:
+    sys.stdout.write(raw); sys.exit(0)
+
+def norm(t):
+    return " ".join(re.findall(r"[0-9a-z가-힣]+", (t or "").lower()))
+
+injected = norm(os.environ.get("INJECTED", ""))
+kept, dropped = [], 0
+for r in results:
+    if str(r.get("source") or "") not in ("memory", "cache"):
+        kept.append(r); continue
+    snip = str(r.get("snippet") or r.get("content") or r.get("text") or "")
+    snip = snip.replace("[", " ").replace("]", " ")
+    frags = [f for f in (norm(p) for p in re.split(r"\s*(?:…|\.\.\.)\s*", snip)) if len(f) >= 12]
+    if injected and frags and all(f in injected for f in frags):
+        dropped += 1; continue
+    kept.append(r)
+doc["results"] = kept
+if dropped:
+    doc["injectionDedup"] = {"dropped": dropped, "kept": len(kept)}
+sys.stdout.write(json.dumps(doc, ensure_ascii=False))
+PY
+}
+
 find_memory_tool() { # <tool-name>
   local name="$1" d
   for d in "${CCC_MEMORY_TOOLS_DIR:-}" "$HOOKDIR" "$HOOKDIR/../../scripts"; do
@@ -115,6 +158,12 @@ fi
 mem="$(scan_injection_block built-in-memory "$mem" | limit_bytes "$MAX_MEM")"
 wiki="$(scan_injection_block family-wiki-cache "$wiki" | limit_bytes "$MAX_WIKI")"
 honcho="$(scan_injection_block honcho-cache "$honcho" | limit_bytes "$MAX_HONCHO")"
+# Dedup the local hot block against what we ACTUALLY inject above (post-redaction,
+# post-truncation), before scanning/limiting it — so it surfaces index-only
+# content (distilled facts) instead of echoing the canonical blocks.
+local_hot="$(dedup_local_hot "$mem
+$wiki
+$honcho" "$local_hot")"
 local_hot="$(scan_injection_block local-hot-memory "$local_hot" | limit_bytes "$MAX_LOCAL")"
 
 node_label="${CCC_NODE:-$(cat "$STATE_DIR/node.txt" 2>/dev/null || hostname -s 2>/dev/null || printf 'ccc-node')}"

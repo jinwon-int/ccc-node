@@ -200,6 +200,39 @@ ok "default profile queries the local hot-memory index" '[ "$rc" = 0 ] && jq -e 
 out="$(CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CCC_MEMORY_INDEX_DB="$state/memory-index.sqlite" CCC_HOOK_DIR="$ROOT/claude/hooks" CCC_MEMORY_TOOLS_DIR="$ROOT/scripts" CCC_LOCAL_MEMORY_ENABLED=0 CCC_MEMORY_QUERY="current editor Helix" bash "$ROOT/claude/hooks/load-memory.sh" SessionStart 2>&1)"; rc=$?
 ok "CCC_LOCAL_MEMORY_ENABLED=0 opts out of local hot memory" '[ "$rc" = 0 ] && jq -e ".hookSpecificOutput.additionalContext | (contains(\"local hot memory disabled\") and (contains(\"\\\"results\\\"\") | not))" >/dev/null <<<"$out"'
 
+# Cross-source injection dedup: the local hot block must not echo hits that are
+# ALSO injected verbatim as the MEMORY/wiki/honcho blocks (double-spending the
+# budget). A memory-source hit fully present in the injected MEMORY block is
+# dropped; a distilled fact (no other injection path) is kept; content truncated
+# out of the canonical block is kept (lossless); CCC_MEMORY_INJECT_DEDUP=0 off.
+dd_state="$TMP/dedup-state"; dd_cache="$TMP/dedup-cache"; dd_mem="$TMP/dedup-mem"
+rm -rf "$dd_state" "$dd_cache" "$dd_mem"; mkdir -p "$dd_state" "$dd_cache" "$dd_mem"
+printf 'Operator prefers Helix editor and the honcho memory profile by default.\n' > "$dd_mem/MEMORY.md"
+printf 'user likes concise Korean reports\n' > "$dd_mem/USER.md"
+printf 'wiki mentions unrelated deployment runbook details\n' > "$dd_cache/wiki.txt"
+# Facts live at the DEFAULT path so the detached background refresh that
+# load-memory.sh fires rebuilds the index WITH them (otherwise a concurrent
+# rebuild from the empty default path would drop the fact mid-suite).
+dd_facts="$dd_state/memory-facts.jsonl"
+printf '%s\n' '{"id":"dedup-fact","kind":"preference","text":"Operator switched current editor to Helix from Neovim last sprint.","durability":"durable","review":"auto-local"}' > "$dd_facts"
+CCC_STATE_DIR="$dd_state" CCC_MEMORY_CACHE_DIR="$dd_cache" CCC_MEMORY_DIR="$dd_mem" CCC_MEMORY_FACTS_FILE="$dd_facts" bash "$ROOT/scripts/ccc-memory-index.sh" rebuild >/dev/null 2>&1
+dd_sources() { # remaining args become extra env assignments for the hook
+  # `env` (not a bare prefix) so post-expansion NAME=VALUE words from "$@" are
+  # honoured as assignments rather than treated as the command name.
+  env CCC_STATE_DIR="$dd_state" CCC_MEMORY_CACHE_DIR="$dd_cache" CCC_MEMORY_DIR="$dd_mem" \
+    CCC_MEMORY_INDEX_DB="$dd_state/memory-index.sqlite" CCC_HOOK_DIR="$ROOT/claude/hooks" \
+    CCC_MEMORY_TOOLS_DIR="$ROOT/scripts" CCC_MEMORY_QUERY="Helix editor" "$@" \
+    bash "$ROOT/claude/hooks/load-memory.sh" SessionStart 2>/dev/null \
+    | jq -r '.hookSpecificOutput.additionalContext' \
+    | sed -n '/## Local hot memory/,/## Family Wiki/p' \
+    | python3 -c 'import sys,re,json
+t=sys.stdin.read(); m=re.search(r"\{.*\}",t,re.S)
+print(" ".join(sorted({r.get("source","") for r in (json.loads(m.group(0)).get("results",[]) if m else [])})))'
+}
+ok "injection dedup drops memory hit already in MEMORY block, keeps distilled fact" '[ "$(dd_sources)" = "structured" ]'
+ok "injection dedup OFF keeps the redundant memory hit" '[ "$(dd_sources CCC_MEMORY_INJECT_DEDUP=0)" = "memory structured" ]'
+ok "injection dedup is lossless when canonical block is truncated away" '[ "$(dd_sources CCC_BUILTIN_MEMORY_MAX_BYTES=20)" = "memory structured" ]'
+
 # Embedding (semantic) lane — opt-in via CCC_MEMORY_EMBED_CMD. Uses a local,
 # no-network fake embedder with a tiny concept map so a synonym query recalls a
 # doc that the surface-form lexical + fuzzy lanes both miss.
