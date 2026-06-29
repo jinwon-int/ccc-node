@@ -4,6 +4,7 @@
 import asyncio
 import os
 import sys
+import tempfile
 import types
 import unittest
 from pathlib import Path
@@ -17,6 +18,8 @@ os.environ["PROJECT_ROOT"] = str(Path(__file__).resolve().parents[1])
 
 from pathlib import Path as _Path
 
+_TEST_BOT_DIR = _Path(os.environ.get("TMPDIR") or tempfile.gettempdir()) / "test_bot"
+
 config_module = types.ModuleType("telegram_bot.utils.config")
 setattr(
     config_module,
@@ -26,9 +29,9 @@ setattr(
         network_retry_attempts=3,
         network_retry_delay=5,
         polling_timeout=30,
-        bot_data_dir=_Path("/tmp/test_bot"),
-        logs_dir=_Path("/tmp/test_bot/logs"),
-        session_store_path=_Path("/tmp/test_bot/sessions.json"),
+        bot_data_dir=_TEST_BOT_DIR,
+        logs_dir=_TEST_BOT_DIR / "logs",
+        session_store_path=_TEST_BOT_DIR / "sessions.json",
         allowed_user_ids=[],
         draft_update_min_chars=150,
         draft_update_interval=1.0,
