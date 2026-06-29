@@ -135,6 +135,19 @@ refresh_honcho & honcho_pid=$!
 wait "$wiki_pid" || true
 wait "$honcho_pid" || true
 
+# Consolidate near-duplicate distilled facts BEFORE indexing, so superseded
+# copies drop out of this same refresh. Best-effort; never blocks startup.
+consolidate_status="skipped"; consolidate_error=""
+consolidate_script="$(find_memory_tool ccc-memory-consolidate.sh 2>/dev/null || true)"
+if [ -n "$consolidate_script" ]; then
+  if out="$(timeout 30 "$consolidate_script" 2>&1)"; then
+    consolidate_status="ok"
+  else
+    consolidate_status="error"; consolidate_error="$(printf '%s' "$out" | tr '\n' ' ' | cut -c1-240)"
+  fi
+fi
+record_status fact_consolidate "$consolidate_status" 0 0 "$consolidate_error"
+
 # Update local hot-memory index opportunistically. It is best-effort and never blocks hook startup.
 index_status="skipped"; index_error=""
 index_script="$(find_memory_tool ccc-memory-index.sh 2>/dev/null || true)"
@@ -149,7 +162,8 @@ record_status local_index "$index_status" 0 0 "$index_error"
 
 # Merge per-source statuses into one meta document.
 jq -s '{generated_at:(now|todate), sources: map({(.source): del(.source)}) | add}' \
-  "$CACHE/.wiki.status.json" "$CACHE/.honcho.status.json" "$CACHE/.local_index.status.json" \
+  "$CACHE/.wiki.status.json" "$CACHE/.honcho.status.json" \
+  "$CACHE/.fact_consolidate.status.json" "$CACHE/.local_index.status.json" \
   > "$CACHE/meta.json.tmp" 2>/dev/null && mv "$CACHE/meta.json.tmp" "$CACHE/meta.json"
 
 now_iso > "$CACHE/.last-refresh"

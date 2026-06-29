@@ -238,8 +238,12 @@ for i in $(seq 1 40); do
 done
 CCC_STATE_DIR="$bud_state" CCC_MEMORY_CACHE_DIR="$bud_cache" CCC_MEMORY_DIR="$bud_mem" CCC_MEMORY_FACTS_FILE="$bud_facts" bash "$ROOT/scripts/ccc-memory-index.sh" rebuild >/dev/null 2>&1
 bud_bullets() { # extra env assignments; prints count of rendered local bullets
+  # CCC_MEMORY_CONSOLIDATE=0: the fixture is intentionally many near-identical
+  # facts (to test result-count scaling); the detached refresh load-memory fires
+  # would otherwise consolidate them away mid-test. The two features are orthogonal.
   env CCC_STATE_DIR="$bud_state" CCC_MEMORY_CACHE_DIR="$bud_cache" CCC_MEMORY_DIR="$bud_mem" \
     CCC_MEMORY_INDEX_DB="$bud_state/memory-index.sqlite" CCC_HOOK_DIR="$ROOT/claude/hooks" \
+    CCC_MEMORY_CONSOLIDATE=0 \
     CCC_MEMORY_TOOLS_DIR="$ROOT/scripts" CCC_MEMORY_QUERY="editor Helix" "$@" \
     bash "$ROOT/claude/hooks/load-memory.sh" SessionStart 2>/dev/null \
     | jq -r '.hookSpecificOutput.additionalContext' \
@@ -248,7 +252,7 @@ bud_bullets() { # extra env assignments; prints count of rendered local bullets
 ok "dynamic budget reclaims slack -> local surfaces more than the default 5" '[ "$(bud_bullets)" -gt 5 ]'
 ok "dynamic budget OFF -> local stays at the default 5" '[ "$(bud_bullets CCC_MEMORY_DYNAMIC_BUDGET=0)" = 5 ]'
 ok "explicit CCC_MEMORY_SEARCH_LIMIT wins over dynamic" '[ "$(bud_bullets CCC_MEMORY_SEARCH_LIMIT=3)" = 3 ]'
-bud_total="$(env CCC_STATE_DIR="$bud_state" CCC_MEMORY_CACHE_DIR="$bud_cache" CCC_MEMORY_DIR="$bud_mem" CCC_MEMORY_INDEX_DB="$bud_state/memory-index.sqlite" CCC_HOOK_DIR="$ROOT/claude/hooks" CCC_MEMORY_TOOLS_DIR="$ROOT/scripts" CCC_MEMORY_QUERY="editor Helix" bash "$ROOT/claude/hooks/load-memory.sh" SessionStart 2>/dev/null | jq -r '.hookSpecificOutput.additionalContext' | wc -c)"
+bud_total="$(env CCC_STATE_DIR="$bud_state" CCC_MEMORY_CACHE_DIR="$bud_cache" CCC_MEMORY_DIR="$bud_mem" CCC_MEMORY_INDEX_DB="$bud_state/memory-index.sqlite" CCC_HOOK_DIR="$ROOT/claude/hooks" CCC_MEMORY_CONSOLIDATE=0 CCC_MEMORY_TOOLS_DIR="$ROOT/scripts" CCC_MEMORY_QUERY="editor Helix" bash "$ROOT/claude/hooks/load-memory.sh" SessionStart 2>/dev/null | jq -r '.hookSpecificOutput.additionalContext' | wc -c)"
 ok "dynamic budget keeps the whole injection within CCC_MEMORY_MAX_BYTES" '[ "$bud_total" -le 12000 ]'
 
 # Usage feedback loop: docs repeatedly RETRIEVED for real injections earn a small
@@ -285,6 +289,33 @@ ok "CCC_MEMORY_USAGE_FEEDBACK=0 zeroes the boost" '[ "$rc" = 0 ] && jq -e "all(.
 cp "$us_file" "$us_file.bak"
 CCC_STATE_DIR="$us_state" CCC_MEMORY_INDEX_DB="$us_state/memory-index.sqlite" CCC_MEMORY_USAGE_FEEDBACK=0 CCC_MEMORY_RECORD_USAGE=1 bash "$ROOT/scripts/ccc-memory-search.sh" "beta deployment" >/dev/null 2>&1
 ok "CCC_MEMORY_USAGE_FEEDBACK=0 also suppresses recording" 'diff -q "$us_file" "$us_file.bak" >/dev/null'
+
+# Fact consolidation: near-duplicate distilled facts (char-4-gram Jaccard >= thr,
+# same kind) collapse to the most recent; older MACHINE-generated copies are
+# marked review:superseded (audit trail) and the index skips them. Human-reviewed
+# facts are never auto-superseded. Distinct facts are untouched; idempotent.
+co_state="$TMP/consolidate-state"; co_cache="$TMP/consolidate-cache"; co_mem="$TMP/consolidate-mem"
+rm -rf "$co_state" "$co_cache" "$co_mem"; mkdir -p "$co_state" "$co_cache" "$co_mem"
+printf 'x\n' > "$co_mem/MEMORY.md"; printf 'x\n' > "$co_mem/USER.md"
+co_facts="$co_state/memory-facts.jsonl"
+printf '%s\n' \
+  '{"id":"c-old","kind":"preference","text":"Operator switched current editor to Helix from Neovim","observed_at":"2026-06-01T00:00:00Z","review":"auto-local"}' \
+  '{"id":"c-new","kind":"preference","text":"Operator switched current editor to Helix from Neovim now","observed_at":"2026-06-20T00:00:00Z","review":"auto-local"}' \
+  '{"id":"c-distinct","kind":"decision","text":"Honcho auth is enforced via OAuth subprocess for distill","observed_at":"2026-06-10T00:00:00Z","review":"auto-local"}' \
+  '{"id":"c-human","kind":"preference","text":"Operator switched current editor to Helix from Neovim","observed_at":"2026-05-01T00:00:00Z","review":"approved"}' \
+  > "$co_facts"
+out="$(CCC_STATE_DIR="$co_state" CCC_MEMORY_FACTS_FILE="$co_facts" bash "$ROOT/scripts/ccc-memory-consolidate.sh" 2>&1)"; rc=$?
+ok "consolidate supersedes the older near-duplicate" '[ "$rc" = 0 ] && jq -e ".ok == true and .superseded == 1 and .changed == true" >/dev/null <<<"$out"'
+ok "older auto-fact is marked superseded, newer kept" 'jq -e "select(.id==\"c-old\").review == \"superseded\"" >/dev/null <<<"$(grep c-old "$co_facts")" && jq -e "select(.id==\"c-new\").review == \"auto-local\"" >/dev/null <<<"$(grep c-new "$co_facts")"'
+ok "distinct fact (different kind/topic) is untouched" 'jq -e "select(.id==\"c-distinct\").review == \"auto-local\"" >/dev/null <<<"$(grep c-distinct "$co_facts")"'
+ok "human-approved near-duplicate is never auto-superseded" 'jq -e "select(.id==\"c-human\").review == \"approved\"" >/dev/null <<<"$(grep c-human "$co_facts")"'
+out="$(CCC_STATE_DIR="$co_state" CCC_MEMORY_FACTS_FILE="$co_facts" bash "$ROOT/scripts/ccc-memory-consolidate.sh" 2>&1)"; rc=$?
+ok "consolidate is idempotent (second run changes nothing)" '[ "$rc" = 0 ] && jq -e ".superseded == 0 and .changed == false" >/dev/null <<<"$out"'
+out="$(CCC_STATE_DIR="$co_state" CCC_MEMORY_FACTS_FILE="$co_facts" CCC_MEMORY_CONSOLIDATE=0 bash "$ROOT/scripts/ccc-memory-consolidate.sh" 2>&1)"; rc=$?
+ok "CCC_MEMORY_CONSOLIDATE=0 skips" '[ "$rc" = 0 ] && jq -e ".skipped == \"disabled\"" >/dev/null <<<"$out"'
+CCC_STATE_DIR="$co_state" CCC_MEMORY_CACHE_DIR="$co_cache" CCC_MEMORY_DIR="$co_mem" CCC_MEMORY_FACTS_FILE="$co_facts" bash "$ROOT/scripts/ccc-memory-index.sh" rebuild >/dev/null 2>&1
+out="$(CCC_STATE_DIR="$co_state" CCC_MEMORY_INDEX_DB="$co_state/memory-index.sqlite" bash "$ROOT/scripts/ccc-memory-search.sh" "editor Helix Neovim" 2>/dev/null)"
+ok "index skips superseded facts (c-old not surfaced)" 'jq -e "all(.results[].path; (contains(\"c-old\")|not))" >/dev/null <<<"$out"'
 
 # Cross-source injection dedup: the local hot block must not echo hits that are
 # ALSO injected verbatim as the MEMORY/wiki/honcho blocks (double-spending the

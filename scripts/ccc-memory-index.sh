@@ -230,7 +230,9 @@ def structured_fact_docs(path: Path):
         if not isinstance(obj, dict):
             continue
         review = str(obj.get("review") or "auto-local").lower()
-        if review == "rejected":
+        # 'superseded' = a near-duplicate consolidated away by ccc-memory-consolidate;
+        # kept in the file as an audit trail but not injected.
+        if review in ("rejected", "superseded"):
             continue
         kind = str(obj.get("kind") or "fact")
         durability = str(obj.get("durability") or ("volatile" if kind == "task-progress" else "durable")).lower()
