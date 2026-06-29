@@ -228,7 +228,9 @@ if [ "$PROFILE" = "hybrid" ] || [ "$PROFILE" = "max-perf" ] || ! is_disabled "$L
     # No line-cap here: dedup/render parse the whole JSON (a partial cut would
     # break json.loads and fall back to raw). Result count is bounded by
     # search_limit and the byte budget is enforced by limit_bytes below.
-    local_hot="$({ CCC_MEMORY_SEARCH_LIMIT="$search_limit" "$search_tool" "$QUERY" 2>/dev/null || true; })"
+    # CCC_MEMORY_RECORD_USAGE=1: this is the real injection retrieval, so let the
+    # search record retrieval-frequency feedback (diagnostics stay read-only).
+    local_hot="$({ CCC_MEMORY_RECORD_USAGE=1 CCC_MEMORY_SEARCH_LIMIT="$search_limit" "$search_tool" "$QUERY" 2>/dev/null || true; })"
   fi
 fi
 

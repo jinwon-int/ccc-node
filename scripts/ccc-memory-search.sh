@@ -9,7 +9,7 @@ RETRIEVAL="${CCC_MEMORY_RETRIEVAL:-fts}"
 [ -n "$QUERY" ] || { echo "usage: $0 <query>" >&2; exit 2; }
 [ -f "$DB" ] || { echo "memory index missing: $DB" >&2; exit 1; }
 python3 - "$DB" "$QUERY" "$LIMIT" "$RETRIEVAL" <<'PY'
-import json, math, os, re, sqlite3, subprocess, sys, time
+import hashlib, json, math, os, re, sqlite3, subprocess, sys, tempfile, time
 from datetime import datetime, timezone
 path, query, limit, retrieval = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
 con=sqlite3.connect(path)
@@ -28,6 +28,91 @@ try:
     EMBED_MIN_SIM = float(os.environ.get("CCC_MEMORY_EMBED_MIN_SIM", "0.55") or 0.55)
 except ValueError:
     EMBED_MIN_SIM = 0.55
+
+# ---- usage feedback (retrieval-frequency weighting) ------------------------
+# A closed, local feedback loop: docs that are repeatedly RETRIEVED for real
+# injections earn a small, recency-decayed boost, so memory that keeps proving
+# useful surfaces faster over time. Keyed by a content hash (stable across the
+# path/line churn that local-facts append causes). Reading the boost is always
+# on but a no-op until stats exist (no behavior change on a fresh node); WRITING
+# happens only when the caller sets CCC_MEMORY_RECORD_USAGE=1 (load-memory's
+# injection search), so ccc-memory-explain and tests stay read-only. The weight
+# is small relative to token coverage (×4), so usage nudges ties — it does not
+# let a popular-but-irrelevant doc outrank a strong lexical match.
+# Disable the whole loop (read + write) with CCC_MEMORY_USAGE_FEEDBACK=0.
+USAGE_ON = os.environ.get("CCC_MEMORY_USAGE_FEEDBACK", "1").strip().lower() not in {"0","false","off","no"}
+USAGE_RECORD = USAGE_ON and os.environ.get("CCC_MEMORY_RECORD_USAGE", "").strip().lower() in {"1","true","on","yes"}
+try:
+    USAGE_WEIGHT = float(os.environ.get("CCC_MEMORY_USAGE_WEIGHT", "1.5") or 1.5)
+except ValueError:
+    USAGE_WEIGHT = 1.5
+try:
+    USAGE_TTL_DAYS = float(os.environ.get("CCC_MEMORY_USAGE_TTL_DAYS", "30") or 30)
+except ValueError:
+    USAGE_TTL_DAYS = 30.0
+USAGE_MAX_ENTRIES = 2000
+USAGE_PATH = os.environ.get("CCC_MEMORY_USAGE_FILE") or os.path.join(os.path.dirname(path) or ".", "memory-usage.json")
+
+def _chash(content):
+    norm = " ".join(re.findall(r"[0-9a-z가-힣]+", (content or "").lower()))
+    return hashlib.sha1(norm.encode("utf-8")).hexdigest()[:16] if norm else ""
+
+def _load_usage():
+    if not USAGE_ON:
+        return {}
+    try:
+        with open(USAGE_PATH, encoding="utf-8") as fh:
+            d = json.load(fh)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+USAGE = _load_usage()
+
+def usage_signal(content):
+    if not USAGE_ON or not USAGE:
+        return 0.0
+    rec = USAGE.get(_chash(content))
+    if not isinstance(rec, dict):
+        return 0.0
+    n = rec.get("n") or 0
+    if n <= 0:
+        return 0.0
+    age_days = max(0.0, (time.time() - (rec.get("t") or 0)) / 86400.0)
+    decay = max(0.0, 1.0 - age_days / USAGE_TTL_DAYS) if USAGE_TTL_DAYS > 0 else 1.0
+    # Cap below one token of coverage (token_hits×4) so usage only ever breaks
+    # ties / nudges — a popular doc can never outrank a stronger lexical match.
+    return round(min(USAGE_WEIGHT * math.log1p(n) * decay, 3.0), 4)
+
+def record_usage(rows):
+    # Best-effort, atomic, bounded, fail-open. Counts each surfaced doc once per
+    # retrieval and stamps the time so the recency decay can fade stale popularity.
+    if not USAGE_RECORD or not rows:
+        return
+    now = int(time.time())
+    data = dict(USAGE)
+    for r in rows:
+        ch = r.get("_chash") or ""
+        if not ch:
+            continue
+        rec = data.get(ch)
+        if isinstance(rec, dict):
+            rec["n"] = (rec.get("n") or 0) + 1
+            rec["t"] = now
+        else:
+            data[ch] = {"n": 1, "t": now}
+    if len(data) > USAGE_MAX_ENTRIES:  # evict least-recently-used
+        data = dict(sorted(data.items(), key=lambda kv: (kv[1].get("t") or 0), reverse=True)[:USAGE_MAX_ENTRIES])
+    try:
+        d = os.path.dirname(USAGE_PATH) or "."
+        os.makedirs(d, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=d, prefix=".memory-usage.", suffix=".tmp")
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, ensure_ascii=False)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, USAGE_PATH)
+    except Exception:
+        pass
 
 def tokens_for(q: str):
     # ccc-memory-query emits labels and paths. FTS5 MATCH treats ':'/'-'/'/' as
@@ -114,12 +199,13 @@ def rerank(cands):
             "recency_boost": round(recency_boost(c.get("updated_at")), 4),
             "durability_penalty": durability_penalty(content),
             "bm25_tiebreak": round(tie, 4),
+            "usage_boost": usage_signal(content),
         }
         if c.get("bm25") is not None:
             signals["fts_bm25"]=c["bm25"]
-        score=(token_hits*4.0)+(phrase_hit*3.0)+signals["source_boost"]+signals["recency_boost"]+signals["durability_penalty"]+(tie*0.5)
+        score=(token_hits*4.0)+(phrase_hit*3.0)+signals["source_boost"]+signals["recency_boost"]+signals["durability_penalty"]+(tie*0.5)+signals["usage_boost"]
         out.append({"path":c["path"],"source":c["source"],"snippet":c["snippet"],
-                    "score":round(score,4),"signals":signals})
+                    "score":round(score,4),"signals":signals,"_chash":_chash(content)})
     out.sort(key=lambda x: x["score"], reverse=True)
     return out
 
@@ -164,10 +250,11 @@ def fuzzy_rerank(cands):
             "source_boost": source_boost(c["source"], content),
             "recency_boost": round(recency_boost(c.get("updated_at")), 4),
             "durability_penalty": durability_penalty(content),
+            "usage_boost": usage_signal(content),
         }
-        score=(c["fuzzy_sim"]*8.0)+signals["source_boost"]+signals["recency_boost"]+signals["durability_penalty"]
+        score=(c["fuzzy_sim"]*8.0)+signals["source_boost"]+signals["recency_boost"]+signals["durability_penalty"]+signals["usage_boost"]
         out.append({"path":c["path"],"source":c["source"],"snippet":c["snippet"],
-                    "score":round(score,4),"signals":signals})
+                    "score":round(score,4),"signals":signals,"_chash":_chash(content)})
     out.sort(key=lambda x: x["score"], reverse=True)
     return out
 
@@ -255,10 +342,11 @@ def embedding_rerank(cands):
             "source_boost": source_boost(c["source"], content),
             "recency_boost": round(recency_boost(c.get("updated_at")), 4),
             "durability_penalty": durability_penalty(content),
+            "usage_boost": usage_signal(content),
         }
-        score=(c["cos"]*8.0)+signals["source_boost"]+signals["recency_boost"]+signals["durability_penalty"]
+        score=(c["cos"]*8.0)+signals["source_boost"]+signals["recency_boost"]+signals["durability_penalty"]+signals["usage_boost"]
         out.append({"path":c["path"],"source":c["source"],"snippet":c["snippet"],
-                    "score":round(score,4),"signals":signals})
+                    "score":round(score,4),"signals":signals,"_chash":_chash(content)})
     out.sort(key=lambda x: x["score"], reverse=True)
     return out
 
@@ -304,12 +392,13 @@ def hybrid(toks):
             "source_boost": source_boost(r["source"], content),
             "recency_boost": recency_boost(r["updated_at"]),
             "durability_penalty": durability_penalty(content),
+            "usage_boost": usage_signal(content),
         }
         # Simple local fusion. It is intentionally explainable and stdlib-only;
         # optional vector lanes can be added later without changing startup safety.
-        score=(token_hits*4.0)+(phrase_hit*3.0)+signals["source_boost"]+signals["recency_boost"]+signals["durability_penalty"]
+        score=(token_hits*4.0)+(phrase_hit*3.0)+signals["source_boost"]+signals["recency_boost"]+signals["durability_penalty"]+signals["usage_boost"]
         sn=content[:240]
-        out.append({"path":r["path"],"source":r["source"],"snippet":sn,"score":round(score,4),"signals":signals})
+        out.append({"path":r["path"],"source":r["source"],"snippet":sn,"score":round(score,4),"signals":signals,"_chash":_chash(content)})
     out.sort(key=lambda x: x["score"], reverse=True)
     return out[:limit]
 
@@ -358,5 +447,11 @@ else:
     else:
         mode = "fts-rerank"
         rows = lexical[:limit]
+
+# Feedback: record the surfaced docs (only when the caller opted in), then drop
+# the internal content-hash before emitting results.
+record_usage(rows)
+for r in rows:
+    r.pop("_chash", None)
 print(json.dumps({"query":query,"tokens":toks,"retrievalMode":mode,"lanes":used,"results":rows}, ensure_ascii=False, indent=2))
 PY

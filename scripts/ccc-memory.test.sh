@@ -243,6 +243,41 @@ ok "explicit CCC_MEMORY_SEARCH_LIMIT wins over dynamic" '[ "$(bud_bullets CCC_ME
 bud_total="$(env CCC_STATE_DIR="$bud_state" CCC_MEMORY_CACHE_DIR="$bud_cache" CCC_MEMORY_DIR="$bud_mem" CCC_MEMORY_INDEX_DB="$bud_state/memory-index.sqlite" CCC_HOOK_DIR="$ROOT/claude/hooks" CCC_MEMORY_TOOLS_DIR="$ROOT/scripts" CCC_MEMORY_QUERY="editor Helix" bash "$ROOT/claude/hooks/load-memory.sh" SessionStart 2>/dev/null | jq -r '.hookSpecificOutput.additionalContext' | wc -c)"
 ok "dynamic budget keeps the whole injection within CCC_MEMORY_MAX_BYTES" '[ "$bud_total" -le 12000 ]'
 
+# Usage feedback loop: docs repeatedly RETRIEVED for real injections earn a small
+# recency-decayed boost (tie-break only, capped below one token of coverage).
+# Recording happens only when the caller sets CCC_MEMORY_RECORD_USAGE=1, so
+# diagnostics stay read-only; CCC_MEMORY_USAGE_FEEDBACK=0 disables the whole loop.
+us_state="$TMP/usage-state"; us_cache="$TMP/usage-cache"; us_mem="$TMP/usage-mem"
+rm -rf "$us_state" "$us_cache" "$us_mem"; mkdir -p "$us_state" "$us_cache" "$us_mem"
+printf 'x\n' > "$us_mem/MEMORY.md"; printf 'x\n' > "$us_mem/USER.md"
+us_facts="$us_state/memory-facts.jsonl"
+printf '%s\n' \
+  '{"id":"ua","kind":"preference","text":"alpha topic about deployment runbook procedure","review":"auto-local"}' \
+  '{"id":"ub","kind":"preference","text":"beta topic about deployment runbook procedure","review":"auto-local"}' \
+  > "$us_facts"
+CCC_STATE_DIR="$us_state" CCC_MEMORY_CACHE_DIR="$us_cache" CCC_MEMORY_DIR="$us_mem" CCC_MEMORY_FACTS_FILE="$us_facts" bash "$ROOT/scripts/ccc-memory-index.sh" rebuild >/dev/null 2>&1
+us_search() { env CCC_STATE_DIR="$us_state" CCC_MEMORY_INDEX_DB="$us_state/memory-index.sqlite" "$@" bash "$ROOT/scripts/ccc-memory-search.sh" "deployment runbook" 2>/dev/null; }
+us_file="$us_state/memory-usage.json"
+
+out="$(us_search)"; rc=$?
+ok "usage_boost is 0 with no stats (no behavior change on fresh node)" '[ "$rc" = 0 ] && jq -e "all(.results[].signals.usage_boost; . == 0)" >/dev/null <<<"$out"'
+ok "search does not record usage without CCC_MEMORY_RECORD_USAGE" '[ ! -f "$us_file" ]'
+
+# Record retrievals of the "beta" doc; it should then carry a boost and outrank
+# its equal-coverage "alpha" peer (pure tie-break).
+for i in 1 2 3 4; do CCC_STATE_DIR="$us_state" CCC_MEMORY_INDEX_DB="$us_state/memory-index.sqlite" CCC_MEMORY_RECORD_USAGE=1 CCC_MEMORY_SEARCH_LIMIT=1 bash "$ROOT/scripts/ccc-memory-search.sh" "beta deployment runbook" >/dev/null 2>&1; done
+ok "RECORD_USAGE writes a bounded chmod-600 usage file" '[ -f "$us_file" ] && [ "$(stat -c %a "$us_file")" = 600 ] && jq -e "to_entries | length == 1 and .[0].value.n == 4" >/dev/null <<<"$(cat "$us_file")"'
+out="$(us_search)"; rc=$?
+ok "recorded doc earns a positive usage_boost and ranks first" '[ "$rc" = 0 ] && jq -e "(.results[0].path | contains(\"ub\")) and (.results[0].signals.usage_boost > 0)" >/dev/null <<<"$out"'
+ok "usage_boost is capped below one token of coverage (<= 3.0)" 'jq -e "all(.results[].signals.usage_boost; . <= 3.0)" >/dev/null <<<"$out"'
+
+# Off-switch disables both read (boost) and write (record).
+out="$(us_search CCC_MEMORY_USAGE_FEEDBACK=0)"; rc=$?
+ok "CCC_MEMORY_USAGE_FEEDBACK=0 zeroes the boost" '[ "$rc" = 0 ] && jq -e "all(.results[].signals.usage_boost; . == 0)" >/dev/null <<<"$out"'
+cp "$us_file" "$us_file.bak"
+CCC_STATE_DIR="$us_state" CCC_MEMORY_INDEX_DB="$us_state/memory-index.sqlite" CCC_MEMORY_USAGE_FEEDBACK=0 CCC_MEMORY_RECORD_USAGE=1 bash "$ROOT/scripts/ccc-memory-search.sh" "beta deployment" >/dev/null 2>&1
+ok "CCC_MEMORY_USAGE_FEEDBACK=0 also suppresses recording" 'diff -q "$us_file" "$us_file.bak" >/dev/null'
+
 # Cross-source injection dedup: the local hot block must not echo hits that are
 # ALSO injected verbatim as the MEMORY/wiki/honcho blocks (double-spending the
 # budget). A memory-source hit fully present in the injected MEMORY block is
