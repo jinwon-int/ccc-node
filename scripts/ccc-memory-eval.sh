@@ -56,7 +56,7 @@ cases = [
 per=[]; latencies=[]
 for c in cases:
     start=time.time()
-    env={"CCC_STATE_DIR":state_dir,"CCC_MEMORY_INDEX_DB":f"{state_dir}/memory-index.sqlite","CCC_MEMORY_RETRIEVAL":"hybrid-local","CCC_MEMORY_SEARCH_LIMIT":"5"}
+    env={**os.environ,"CCC_STATE_DIR":state_dir,"CCC_MEMORY_INDEX_DB":f"{state_dir}/memory-index.sqlite","CCC_MEMORY_RETRIEVAL":"hybrid-local","CCC_MEMORY_SEARCH_LIMIT":"5"}
     cp=subprocess.run([search_tool, c["query"]], env=env, text=True, capture_output=True, timeout=10)
     latencies.append(int((time.time()-start)*1000))
     results=json.loads(cp.stdout).get("results", []) if cp.returncode == 0 else []
@@ -126,7 +126,7 @@ ccc-node SessionStart must stay no-network and fail-open.
 ' > "$STATE_DIR/node.txt"
   CCC_STATE_DIR="$STATE_DIR" CCC_MEMORY_CACHE_DIR="$CACHE" CCC_MEMORY_DIR="$MEMORY_DIR" "$INDEX_TOOL" rebuild >/dev/null
   python3 - "$SEARCH_TOOL" "$STATE_DIR" <<'PY'
-import json, subprocess, sys, time
+import json, os, subprocess, sys, time
 search_tool, state_dir = sys.argv[1], sys.argv[2]
 cases = [
   {"id":"a2a-brokers", "query":"Team1 Seoseo broker Team2 Gwakga", "expected":["MEMORY.md"]},
@@ -141,7 +141,7 @@ per=[]
 latencies=[]
 for c in cases:
     one_start=time.time()
-    cp=subprocess.run([search_tool, c["query"]], env={"CCC_STATE_DIR":state_dir,"CCC_MEMORY_INDEX_DB":f"{state_dir}/memory-index.sqlite"}, text=True, capture_output=True, timeout=10)
+    cp=subprocess.run([search_tool, c["query"]], env={**os.environ,"CCC_STATE_DIR":state_dir,"CCC_MEMORY_INDEX_DB":f"{state_dir}/memory-index.sqlite"}, text=True, capture_output=True, timeout=10)
     latencies.append(int((time.time()-one_start)*1000))
     results=json.loads(cp.stdout).get("results", []) if cp.returncode == 0 else []
     paths=[r.get("path","") for r in results]
