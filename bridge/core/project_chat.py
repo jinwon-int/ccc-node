@@ -659,7 +659,7 @@ class ProjectChatHandler:
         # off (default), the reply is delivered as complete message(s) by the
         # caller when generation finishes — no live draft.
         streaming_handler = None
-        if bot and config.enable_streaming:
+        if bot and getattr(config, "enable_streaming", False):
             from telegram_bot.core.streaming import StreamingMessageHandler
 
             streaming_handler = StreamingMessageHandler(bot, chat_id, user_id)
@@ -752,7 +752,7 @@ class ProjectChatHandler:
 
                 retry_future: asyncio.Future = loop.create_future()
                 retry_handler = None
-                if bot and config.enable_streaming:
+                if bot and getattr(config, "enable_streaming", False):
                     from telegram_bot.core.streaming import StreamingMessageHandler
 
                     retry_handler = StreamingMessageHandler(bot, chat_id, user_id)
