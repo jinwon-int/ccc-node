@@ -184,27 +184,64 @@ if ! is_disabled "$HONCHO_ENABLED" && [ "$PROFILE" != "max-perf" ]; then
   honcho="$(cat "$CACHE/honcho.txt" 2>/dev/null)"
 fi
 
+# Limit the canonical blocks first (static caps) so we can measure their slack
+# before sizing the local hot block.
+mem="$(scan_injection_block built-in-memory "$mem" | limit_bytes "$MAX_MEM")"
+wiki="$(scan_injection_block family-wiki-cache "$wiki" | limit_bytes "$MAX_WIKI")"
+honcho="$(scan_injection_block honcho-cache "$honcho" | limit_bytes "$MAX_HONCHO")"
+
+# Relevance-aware budget. The per-block caps sum to more than CCC_MEMORY_MAX_BYTES,
+# so today the tail (Honcho) is simply truncated and any budget a small/empty block
+# leaves unused (no wiki/honcho cache, or max-perf which drops Honcho) is wasted —
+# while the local hot block is also under-filled because the search returns only
+# CCC_MEMORY_SEARCH_LIMIT (5) results regardless. Reclaim that slack for the local
+# hot block — the task-conditioned, most query-relevant source — by growing BOTH
+# its byte budget AND how many results we fetch to fill it. Purely additive: never
+# below MAX_LOCAL / the default limit (worst case == today); the final MAX_TOTAL
+# cap still bounds the whole injection. Disable with CCC_MEMORY_DYNAMIC_BUDGET=0.
+alloc_local="$MAX_LOCAL"
+search_limit="${CCC_MEMORY_SEARCH_LIMIT:-}"
+if ! is_disabled "${CCC_MEMORY_DYNAMIC_BUDGET:-1}"; then
+  msize="$(printf '%s' "$mem" | wc -c)"
+  wsize="$(printf '%s' "$wiki" | wc -c)"
+  hsize="$(printf '%s' "$honcho" | wc -c)"
+  # alloc = byte budget for local (>= MAX_LOCAL, reclaiming slack up to the total
+  # minus a ~1000B scaffold reserve); dyn_limit = results to fetch to fill it
+  # (~180B/result, clamped to [5,25]). The final limit_bytes is the hard bound.
+  budget_out="$(python3 -c 'import sys
+total, reserve, maxlocal, bpr, base, maxlim, m, w, h = (int(x) for x in sys.argv[1:])
+alloc = max(maxlocal, total - reserve - m - w - h)
+print(alloc, max(base, min(maxlim, alloc // bpr)))' \
+    "$MAX_TOTAL" 1000 "$MAX_LOCAL" 180 5 25 "$msize" "$wsize" "$hsize" 2>/dev/null || true)"
+  alloc_candidate="${budget_out%% *}"
+  limit_candidate="${budget_out##* }"
+  case "$alloc_candidate" in ''|*[!0-9]*) ;; *) alloc_local="$alloc_candidate" ;; esac
+  if [ -z "$search_limit" ]; then
+    case "$limit_candidate" in ''|*[!0-9]*) ;; *) search_limit="$limit_candidate" ;; esac
+  fi
+fi
+
 local_hot=""
 if [ "$PROFILE" = "hybrid" ] || [ "$PROFILE" = "max-perf" ] || ! is_disabled "$LOCAL_ENABLED"; then
   search_tool="$(find_memory_tool ccc-memory-search.sh 2>/dev/null || true)"
   if [ -n "$search_tool" ]; then
-    local_hot="$({ "$search_tool" "$QUERY" 2>/dev/null || true; } | sed -n '1,120p')"
+    # No line-cap here: dedup/render parse the whole JSON (a partial cut would
+    # break json.loads and fall back to raw). Result count is bounded by
+    # search_limit and the byte budget is enforced by limit_bytes below.
+    local_hot="$({ CCC_MEMORY_SEARCH_LIMIT="$search_limit" "$search_tool" "$QUERY" 2>/dev/null || true; })"
   fi
 fi
 
-mem="$(scan_injection_block built-in-memory "$mem" | limit_bytes "$MAX_MEM")"
-wiki="$(scan_injection_block family-wiki-cache "$wiki" | limit_bytes "$MAX_WIKI")"
-honcho="$(scan_injection_block honcho-cache "$honcho" | limit_bytes "$MAX_HONCHO")"
 # Dedup the local hot block against what we ACTUALLY inject above (post-redaction,
-# post-truncation), before scanning/limiting it — so it surfaces index-only
-# content (distilled facts) instead of echoing the canonical blocks.
+# post-truncation) before rendering it — so it surfaces index-only content
+# (distilled facts) instead of echoing the canonical blocks.
 local_hot="$(dedup_local_hot "$mem
 $wiki
 $honcho" "$local_hot")"
-# Render the search JSON to compact readable lines before scanning/limiting, so
-# the model gets snippets+source instead of debug scores/signals/paths.
+# Render the search JSON to compact readable lines, then apply the (possibly
+# enlarged) local byte budget.
 local_hot="$(render_local_hot "$local_hot")"
-local_hot="$(scan_injection_block local-hot-memory "$local_hot" | limit_bytes "$MAX_LOCAL")"
+local_hot="$(scan_injection_block local-hot-memory "$local_hot" | limit_bytes "$alloc_local")"
 
 node_label="${CCC_NODE:-$(cat "$STATE_DIR/node.txt" 2>/dev/null || hostname -s 2>/dev/null || printf 'ccc-node')}"
 stamp="$(cat "$CACHE/.last-refresh" 2>/dev/null)"
