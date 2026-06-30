@@ -1,6 +1,7 @@
 import asyncio
 import os
 import sys
+import tempfile
 import types
 import unittest
 from collections import deque
@@ -61,6 +62,9 @@ _config_module.config = SimpleNamespace(
     heartbeat_update_interval_seconds=0.02,
     heartbeat_suppress_when_streaming_progress=True,
     heartbeat_delete_on_done=True,
+    heartbeat_duration_log_path=None,
+    heartbeat_forecast_enabled=False,
+    heartbeat_forecast_min_samples=10,
 )
 sys.modules["telegram_bot.utils.config"] = _config_module
 
@@ -171,6 +175,29 @@ class HeartbeatLoopTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(asyncio.TimeoutError):
             await asyncio.wait_for(self.status_event.wait(), timeout=0.1)
         self.assertEqual(self.status_calls, [])
+
+    async def test_includes_forecast_when_enough_duration_samples_exist(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "duration.jsonl"
+            path.write_text(
+                "".join(
+                    '{"user_id":1,"chat_id":2,"model":null,"duration_ms":120000,"success":true}\n'
+                    for _ in range(3)
+                ),
+                encoding="utf-8",
+            )
+            project_chat.config.heartbeat_forecast_enabled = True
+            project_chat.config.heartbeat_forecast_min_samples = 3
+            project_chat.config.heartbeat_duration_log_path = path
+            self.addCleanup(setattr, project_chat.config, "heartbeat_forecast_enabled", False)
+            self.addCleanup(setattr, project_chat.config, "heartbeat_forecast_min_samples", 10)
+            self.addCleanup(setattr, project_chat.config, "heartbeat_duration_log_path", None)
+
+            req = self._make_request()
+            state = _UserStreamState(client=None, model=None, pending=deque([req]))
+            await self._start_loop(state)
+            await asyncio.wait_for(self.status_event.wait(), timeout=1.0)
+            self.assertIn("ETA ~2m 00s", self.status_calls[0][0])
 
 
 if __name__ == "__main__":

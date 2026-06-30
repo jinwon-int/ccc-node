@@ -38,6 +38,7 @@ from telegram_bot.core.heartbeat import (
 from telegram_bot.utils.duration_log import (
     append_duration_sample,
     default_duration_log_path,
+    forecast_ms,
 )
 
 logger = logging.getLogger(__name__)
@@ -140,6 +141,8 @@ class _PendingRequest:
     heartbeat_message_id: Optional[int] = None
     current_tool_label: Optional[str] = None
     last_visible_progress_at: float = 0.0
+    heartbeat_forecast_loaded: bool = False
+    heartbeat_forecast_ms: Optional[int] = None
     last_assistant_texts: List[str] = field(default_factory=list)
     synthetic_response: Optional[str] = None
     streaming_handler: Optional[Any] = None  # StreamingMessageHandler instance
@@ -457,9 +460,13 @@ class ProjectChatHandler:
         ):
             return
 
+        self._load_heartbeat_forecast(req)
         text = compose_heartbeat_text(
             elapsed_seconds=now - req.started_at,
             current_tool=req.current_tool_label,
+            forecast_seconds=(req.heartbeat_forecast_ms / 1000.0)
+            if req.heartbeat_forecast_ms is not None
+            else None,
         )
         try:
             message_id = await req.status_callback(text, req.heartbeat_message_id)
@@ -473,17 +480,33 @@ class ProjectChatHandler:
                 type(e).__name__,
             )
 
+    def _duration_log_path(self) -> Path:
+        path = getattr(config, "heartbeat_duration_log_path", None)
+        if path is None:
+            return default_duration_log_path(
+                Path(getattr(config, "bot_data_dir", PROJECT_ROOT / ".telegram_bot"))
+            )
+        return Path(path)
+
+    def _load_heartbeat_forecast(self, req: _PendingRequest) -> None:
+        if req.heartbeat_forecast_loaded:
+            return
+        req.heartbeat_forecast_loaded = True
+        if not getattr(config, "heartbeat_forecast_enabled", False):
+            return
+        req.heartbeat_forecast_ms = forecast_ms(
+            self._duration_log_path(),
+            user_id=req.user_id,
+            model=req.model,
+            min_samples=int(getattr(config, "heartbeat_forecast_min_samples", 10)),
+        )
+
     def _append_duration_log(self, req: _PendingRequest, msg: ResultMessage) -> None:
         """Record request duration metadata without prompt/response text."""
         if not getattr(config, "heartbeat_duration_log_enabled", False):
             return
-        path = getattr(config, "heartbeat_duration_log_path", None)
-        if path is None:
-            path = default_duration_log_path(
-                Path(getattr(config, "bot_data_dir", PROJECT_ROOT / ".telegram_bot"))
-            )
         append_duration_sample(
-            path=Path(path),
+            path=self._duration_log_path(),
             user_id=req.user_id,
             chat_id=req.chat_id,
             session_id=msg.session_id or req.requested_session_id,
