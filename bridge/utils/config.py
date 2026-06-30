@@ -353,6 +353,21 @@ class Config(BaseSettings):
         alias="CCC_HEARTBEAT_DELETE_ON_DONE",
         description="Delete transient heartbeat messages when a task completes or is cancelled.",
     )
+    heartbeat_duration_log_enabled: bool = Field(
+        default=True,
+        alias="CCC_HEARTBEAT_DURATION_LOG_ENABLED",
+        description="Append local request duration samples for later heartbeat forecasts.",
+    )
+    heartbeat_duration_log_path: Optional[Path] = Field(
+        default=None,
+        alias="CCC_HEARTBEAT_DURATION_LOG_PATH",
+        description="Optional JSONL duration log path. Defaults to BOT_DATA_DIR/duration.jsonl.",
+    )
+    heartbeat_duration_log_max_lines: int = Field(
+        default=10000,
+        alias="CCC_HEARTBEAT_DURATION_LOG_MAX_LINES",
+        description="Maximum JSONL duration samples to retain locally.",
+    )
 
     # Voice message configuration
     transcription_provider: str = Field(
