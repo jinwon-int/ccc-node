@@ -23,7 +23,12 @@ to Telegram, with all secrets and node-local state stripped out and replaced by 
   the next session. Startup remains no-network/fail-open.
 - **Background cache refresh** — `hooks/refresh-memory.sh` updates the Wiki + Honcho caches
   out-of-band (single-flight via `flock`, fail-open), records per-source cache metadata,
-  and opportunistically updates the local SQLite FTS5 hot-memory index.
+  and opportunistically updates the local SQLite FTS5 hot-memory index. This refresh is
+  SessionStart-driven, so nodes that idle between Claude sessions can carry a stale snapshot
+  into their first session after a long idle. `scripts/install-memory-refresh-cron.sh`
+  (dry-run by default; `--apply` to write, `--remove` to undo) installs an optional crontab
+  entry that keeps the snapshot warm; like the agent-cron timer, `setup.sh` never installs it
+  itself.
 - **Local memory diagnostics/eval** — `scripts/ccc-memory-check.sh`,
   `scripts/ccc-memory-index.sh`, `scripts/ccc-memory-search.sh`,
   `scripts/ccc-memory-query.sh`, `scripts/ccc-memory-explain.sh`,

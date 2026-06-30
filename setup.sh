@@ -272,6 +272,8 @@ cat <<'EOF'
   9. (Optional) Telegram bridge: cd bridge && cp .env.example .env && edit, then
      ./start.sh --path $BRIDGE_DEFAULT_PATH -d   (daemon-supervised). See bridge/README.md.
      Linux reboot-persistence: ./start.sh --path $BRIDGE_DEFAULT_PATH --install-systemd   (systemd unit).
+  10. (Optional) Keep the memory snapshot warm on idle nodes:
+     ./scripts/install-memory-refresh-cron.sh --apply   (cron runs refresh-memory.sh; dry-run by default).
 
 Secrets that are intentionally NOT installed by this script:
   - ~/.claude/.credentials.json   (Claude OAuth — created on `claude` login)
