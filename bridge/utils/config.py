@@ -368,6 +368,16 @@ class Config(BaseSettings):
         alias="CCC_HEARTBEAT_DURATION_LOG_MAX_LINES",
         description="Maximum JSONL duration samples to retain locally.",
     )
+    heartbeat_forecast_enabled: bool = Field(
+        default=True,
+        alias="CCC_HEARTBEAT_FORECAST_ENABLED",
+        description="Show median duration forecasts in heartbeat messages when enough samples exist.",
+    )
+    heartbeat_forecast_min_samples: int = Field(
+        default=10,
+        alias="CCC_HEARTBEAT_FORECAST_MIN_SAMPLES",
+        description="Minimum local duration samples required before showing a forecast.",
+    )
 
     # Voice message configuration
     transcription_provider: str = Field(
