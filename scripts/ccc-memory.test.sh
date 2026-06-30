@@ -97,6 +97,21 @@ printf '가나다라마바사아자차카타파하\n' > "$mem/USER.md"
 out="$(CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CCC_HOOK_DIR="$ROOT/claude/hooks" CCC_MEMORY_TOOLS_DIR="$ROOT/scripts" CCC_MEMORY_MAX_BYTES=90 bash "$ROOT/claude/hooks/load-memory.sh" SessionStart 2>&1)"; rc=$?
 ok "load-memory byte budget remains valid JSON for UTF-8 text" '[ "$rc" = 0 ] && jq -e ".hookSpecificOutput.additionalContext" >/dev/null <<<"$out"'
 
+resume_json="$TMP/resume.json"
+cat > "$resume_json" <<'JSON'
+{"resume":{"last_activity":"하트비트/ETA 배포 승인 대기","pending_action":"5대 노드 업그레이드 진행","awaiting_user":true,"open_question":"배포 진행할까요?","next_step":"승인 후 PR merge SHA 배포","evidence":["#233","be4a60c"]}}
+JSON
+out="$(CCC_STATE_DIR="$state" bash "$ROOT/claude/hooks/distill/resume-write.sh" < "$resume_json" 2>&1)"; rc=$?
+ok "resume-write creates fixed-schema resume pointer" '[ "$rc" = 0 ] && [ -f "$state/resume.md" ] && grep -q "다음 액션: 5대 노드 업그레이드 진행" "$state/resume.md"'
+resume_before="$(cat "$state/resume.md")"
+cat > "$TMP/empty-resume.json" <<'JSON'
+{"resume":{"last_activity":"","pending_action":"","awaiting_user":false,"open_question":"","next_step":"","evidence":[]}}
+JSON
+CCC_STATE_DIR="$state" bash "$ROOT/claude/hooks/distill/resume-write.sh" < "$TMP/empty-resume.json" >/dev/null 2>&1
+ok "resume-write preserves previous resume on empty resume object" '[ "$(cat "$state/resume.md")" = "$resume_before" ]'
+out="$(CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CCC_HOOK_DIR="$ROOT/claude/hooks" CCC_MEMORY_TOOLS_DIR="$ROOT/scripts" CCC_MEMORY_NO_REFRESH=1 bash "$ROOT/claude/hooks/load-memory.sh" SessionStart 2>&1)"; rc=$?
+ok "load-memory injects resume pointer at the top of session context" '[ "$rc" = 0 ] && jq -e ".hookSpecificOutput.additionalContext | startswith(\"# test-node session memory\") and contains(\"▶ 직전 세션에서 이어서:\") and contains(\"배포 진행할까요?\")" >/dev/null <<<"$out"'
+
 caller_state="$TMP/caller-state"
 mkdir -p "$caller_state"
 printf 'keep\n' > "$caller_state/marker.txt"

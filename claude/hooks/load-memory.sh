@@ -21,6 +21,7 @@ MAX_MEM="${CCC_BUILTIN_MEMORY_MAX_BYTES:-4000}"
 MAX_WIKI="${CCC_WIKI_MAX_BYTES:-5000}"
 MAX_HONCHO="${CCC_HONCHO_MAX_BYTES:-4000}"
 MAX_LOCAL="${CCC_LOCAL_MEMORY_MAX_BYTES:-3000}"
+MAX_RESUME="${CCC_RESUME_MAX_BYTES:-2000}"
 HONCHO_ENABLED="${CCC_HONCHO_MEMORY_ENABLED:-1}"
 # Local hot-memory search is ON by default for every profile now that the
 # default retrieval reranks with durability/source/recency boosts; set
@@ -183,10 +184,12 @@ honcho=""
 if ! is_disabled "$HONCHO_ENABLED" && [ "$PROFILE" != "max-perf" ]; then
   honcho="$(cat "$CACHE/honcho.txt" 2>/dev/null)"
 fi
+resume="$(cat "${CCC_RESUME_FILE:-$STATE_DIR/resume.md}" 2>/dev/null)"
 
 # Limit the canonical blocks first (static caps) so we can measure their slack
 # before sizing the local hot block.
 mem="$(scan_injection_block built-in-memory "$mem" | limit_bytes "$MAX_MEM")"
+resume="$(scan_injection_block resume-pointer "$resume" | limit_bytes "$MAX_RESUME")"
 wiki="$(scan_injection_block family-wiki-cache "$wiki" | limit_bytes "$MAX_WIKI")"
 honcho="$(scan_injection_block honcho-cache "$honcho" | limit_bytes "$MAX_HONCHO")"
 
@@ -205,14 +208,15 @@ if ! is_disabled "${CCC_MEMORY_DYNAMIC_BUDGET:-1}"; then
   msize="$(printf '%s' "$mem" | wc -c)"
   wsize="$(printf '%s' "$wiki" | wc -c)"
   hsize="$(printf '%s' "$honcho" | wc -c)"
+  rsize="$(printf '%s' "$resume" | wc -c)"
   # alloc = byte budget for local (>= MAX_LOCAL, reclaiming slack up to the total
   # minus a ~1000B scaffold reserve); dyn_limit = results to fetch to fill it
   # (~180B/result, clamped to [5,25]). The final limit_bytes is the hard bound.
   budget_out="$(python3 -c 'import sys
-total, reserve, maxlocal, bpr, base, maxlim, m, w, h = (int(x) for x in sys.argv[1:])
-alloc = max(maxlocal, total - reserve - m - w - h)
+total, reserve, maxlocal, bpr, base, maxlim, m, r, w, h = (int(x) for x in sys.argv[1:])
+alloc = max(maxlocal, total - reserve - m - r - w - h)
 print(alloc, max(base, min(maxlim, alloc // bpr)))' \
-    "$MAX_TOTAL" 1000 "$MAX_LOCAL" 180 5 25 "$msize" "$wsize" "$hsize" 2>/dev/null || true)"
+    "$MAX_TOTAL" 1000 "$MAX_LOCAL" 180 5 25 "$msize" "$rsize" "$wsize" "$hsize" 2>/dev/null || true)"
   alloc_candidate="${budget_out%% *}"
   limit_candidate="${budget_out##* }"
   case "$alloc_candidate" in ''|*[!0-9]*) ;; *) alloc_local="$alloc_candidate" ;; esac
@@ -253,9 +257,16 @@ if ! is_disabled "$HONCHO_ENABLED" && [ "$PROFILE" != "max-perf" ]; then
   honcho_note="$(stale_note 'Honcho' "$CACHE/honcho.txt")"
 fi
 
+resume_block=""
+if [ -n "${resume:-}" ]; then
+  resume_block="▶ 직전 세션에서 이어서:
+${resume}
+"
+fi
+
 ctx="# ${node_label} session memory (auto-injected: $EVENT)
 
-Operational facts are mutable — live-check the node and verify Wiki source text before asserting or changing anything.
+${resume_block}Operational facts are mutable — live-check the node and verify Wiki source text before asserting or changing anything.
 Memory profile: ${PROFILE}; last refresh: ${stamp:-never}; ${wiki_note}; ${honcho_note}. A background refresh runs each session for the next one.
 
 ## Built-in MEMORY + USER

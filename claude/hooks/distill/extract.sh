@@ -4,7 +4,7 @@
 #   2. Pulls last N user/assistant turns, strips tool_use/tool_result bulk.
 #   3. Applies a secret-regex redact pass (FW-03).
 #   4. Calls `claude -p` (OAuth, inherits parent auth) with a focused
-#      extract prompt; expects strict JSON: {honcho:[...], wiki_candidates:[...]}.
+#      extract prompt; expects strict JSON: {honcho:[...], wiki_candidates:[...], resume:{...}}.
 #   5. Emits the JSON to stdout for distill.sh to dispatch.
 #
 # CLAUDE_DISTILL_INFLIGHT=1 is set by the parent so the child claude session
@@ -93,7 +93,15 @@ Schema:
       "summary": "<2-4 sentence Korean summary of the durable operational fact / decision / runbook step>",
       "evidence_excerpt": "<<= 200 chars verbatim Korean quote from the transcript>"
     }
-  ]
+  ],
+  "resume": {
+    "last_activity": "<what the user/assistant was doing at the end of the session, Korean, <= 160 chars>",
+    "pending_action": "<the next concrete action, or empty string>",
+    "awaiting_user": false,
+    "open_question": "<unanswered user-facing question / approval request, or empty string>",
+    "next_step": "<one safest next step, or empty string>",
+    "evidence": ["<PR/issue/commit/run id if present>"]
+  }
 }
 
 honcho criteria (working/relational memory; volatile OK):
@@ -108,22 +116,24 @@ wiki_candidates criteria (durable, public-safe wiki page material):
   - if nothing durable came up this session, return [].
 
 Return [] for either array if nothing qualifies. NEVER invent items.
-If the transcript is mostly small talk, code debugging, or trivial Q&A, return {"honcho": [], "wiki_candidates": []}.
+Always include a `resume` object. Use empty strings/false/[] when there is no meaningful in-flight handoff.
+For `resume`, summarize only the last actionable thread: pending approval, unfinished work, open question, and PR/issue/run evidence. Do not include raw secrets or long transcript text.
+If the transcript is mostly small talk, code debugging, or trivial Q&A, return {"honcho": [], "wiki_candidates": [], "resume": {"last_activity":"","pending_action":"","awaiting_user":false,"open_question":"","next_step":"","evidence":[]}}.
 
 OUTPUT CONTRACT — READ TWICE:
 - Your ENTIRE response MUST be a single JSON object.
 - First non-whitespace character MUST be `{`. Last non-whitespace character MUST be `}`.
 - NO prose before. NO prose after. NO numbered list. NO bullet analysis. NO "Here is the result:" preamble.
 - NO markdown code fences (no triple backticks, no `json` tag). The harness will still strip fences as a safety net, but do not emit them.
-- If you have nothing to extract, emit exactly: {"honcho":[],"wiki_candidates":[]}
+- If you have nothing to extract, emit exactly: {"honcho":[],"wiki_candidates":[],"resume":{"last_activity":"","pending_action":"","awaiting_user":false,"open_question":"","next_step":"","evidence":[]}}
 EOF
 )"
 
 # System-prompt-level constraint (belt + suspenders with the user-prompt instruction).
-SYSTEM_CONSTRAINT='Output strict JSON only. The entire response is a single JSON object starting with { and ending with }. No prose, no preamble, no analysis, no markdown fences. If nothing qualifies, return {"honcho":[],"wiki_candidates":[]}.'
+SYSTEM_CONSTRAINT='Output strict JSON only. The entire response is a single JSON object starting with { and ending with }. Include honcho, wiki_candidates, and resume keys. No prose, no preamble, no analysis, no markdown fences. If nothing qualifies, return {"honcho":[],"wiki_candidates":[],"resume":{"last_activity":"","pending_action":"","awaiting_user":false,"open_question":"","next_step":"","evidence":[]}}.'
 
 # Even more emphatic prompt used on retries (timeout or JSON-drift).
-STRICT='CRITICAL OUTPUT CONTRACT. Your entire response MUST be exactly one JSON object and nothing else. The very first character is { and the very last character is }. No prose. No code fences. No "Here is the JSON". If you have nothing to extract, output exactly: {"honcho":[],"wiki_candidates":[]}'
+STRICT='CRITICAL OUTPUT CONTRACT. Your entire response MUST be exactly one JSON object and nothing else. The very first character is { and the very last character is }. Include honcho, wiki_candidates, and resume keys. No prose. No code fences. No "Here is the JSON". If you have nothing to extract, output exactly: {"honcho":[],"wiki_candidates":[],"resume":{"last_activity":"","pending_action":"","awaiting_user":false,"open_question":"","next_step":"","evidence":[]}}'
 
 # ---- step 5: call `claude -p` (OAuth via parent process) -------------------
 # CLAUDE_DISTILL_INFLIGHT=1 is already exported by distill.sh so the child's
@@ -184,7 +194,7 @@ fi
 CLEAN="$(try_parse "$RESULT")"
 
 # JSON-drift retry (#70): same input window, STRICT prompt.
-if ! printf '%s' "$CLEAN" | jq -e '.honcho and .wiki_candidates' >/dev/null 2>&1; then
+if ! printf '%s' "$CLEAN" | jq -e '.honcho and .wiki_candidates and (.resume | type == "object")' >/dev/null 2>&1; then
   echo "attempt produced non-JSON; retrying with STRICT system prompt" >&2
   RESULT2="$(call_claude "$STRICT" "$INPUT")"
   ec2=$?
@@ -195,7 +205,7 @@ if ! printf '%s' "$CLEAN" | jq -e '.honcho and .wiki_candidates' >/dev/null 2>&1
     exit 1
   fi
   CLEAN="$(try_parse "$RESULT2")"
-  if ! printf '%s' "$CLEAN" | jq -e '.honcho and .wiki_candidates' >/dev/null 2>&1; then
+  if ! printf '%s' "$CLEAN" | jq -e '.honcho and .wiki_candidates and (.resume | type == "object")' >/dev/null 2>&1; then
     echo "JSON-drift retry also produced non-JSON; giving up" >&2
     echo "--- retry raw (head 1KB) ---" >&2
     printf '%s\n' "$RESULT2" | head -c 1024 >&2

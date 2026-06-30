@@ -66,9 +66,9 @@ if [ -n "${CLAUDE_STUB_COUNTER:-}" ]; then
   [ -f "$CLAUDE_STUB_COUNTER" ] && n="$(cat "$CLAUDE_STUB_COUNTER" 2>/dev/null || printf 0)"
   n=$((n + 1))
   printf '%s' "$n" > "$CLAUDE_STUB_COUNTER"
-  printf '{"session_id":"sess-%s","honcho":[],"wiki_candidates":[]}' "$n"
+  printf '{"session_id":"sess-%s","honcho":[],"wiki_candidates":[],"resume":{"last_activity":"ok","pending_action":"","awaiting_user":false,"open_question":"","next_step":"","evidence":[]}}' "$n"
 else
-  printf '{"honcho":[],"wiki_candidates":[]}'
+  printf '{"honcho":[],"wiki_candidates":[],"resume":{"last_activity":"ok","pending_action":"","awaiting_user":false,"open_question":"","next_step":"","evidence":[]}}'
 fi
 SH
 chmod +x "$TMP/bin/claude"
@@ -103,7 +103,11 @@ for r in 1 2 3 4; do
   done
   : > "$STATE/distill.log"
 done
-hist_count="$(find "$STATE/distill-history" -maxdepth 1 -type f -name '*.json' 2>/dev/null | wc -l | tr -d '[:space:]')"
+for _ in $(seq 1 25); do
+  hist_count="$(find "$STATE/distill-history" -maxdepth 1 -type f -name '*.json' 2>/dev/null | wc -l | tr -d '[:space:]')"
+  [ "$hist_count" = 2 ] && break
+  sleep 0.1
+done
 ok "distill history keep cap is enforced" '[ "$hist_count" = 2 ]'
 ok "latest distill-last survives" 'jq -e ".session_id == \"sess-ring-4\"" "$STATE/distill-last.json" >/dev/null'
 ok "old snapshots survive future runs" 'find "$STATE/distill-history" -maxdepth 1 -type f -name "*.json" -print0 | xargs -0 -r grep -h "sess-ring-" | grep -Eq "sess-ring-[23]"'
