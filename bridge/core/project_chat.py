@@ -35,6 +35,10 @@ from telegram_bot.core.heartbeat import (
     should_update_heartbeat,
     tool_label,
 )
+from telegram_bot.utils.duration_log import (
+    append_duration_sample,
+    default_duration_log_path,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -469,6 +473,26 @@ class ProjectChatHandler:
                 type(e).__name__,
             )
 
+    def _append_duration_log(self, req: _PendingRequest, msg: ResultMessage) -> None:
+        """Record request duration metadata without prompt/response text."""
+        if not getattr(config, "heartbeat_duration_log_enabled", False):
+            return
+        path = getattr(config, "heartbeat_duration_log_path", None)
+        if path is None:
+            path = default_duration_log_path(
+                Path(getattr(config, "bot_data_dir", PROJECT_ROOT / ".telegram_bot"))
+            )
+        append_duration_sample(
+            path=Path(path),
+            user_id=req.user_id,
+            chat_id=req.chat_id,
+            session_id=msg.session_id or req.requested_session_id,
+            model=req.model,
+            duration_ms=msg.duration_ms,
+            success=not msg.is_error,
+            max_lines=int(getattr(config, "heartbeat_duration_log_max_lines", 10000)),
+        )
+
     async def _typing_keepalive_loop(
         self, user_id: int, state: _UserStreamState
     ) -> None:
@@ -609,6 +633,7 @@ class ProjectChatHandler:
                     logger.info(
                         f"ResultMessage: session={msg.session_id}, is_error={msg.is_error}, duration={msg.duration_ms}ms"
                     )
+                    self._append_duration_log(req, msg)
 
                     if msg.is_error:
                         logger.error(f"SDK returned error: {content[:500]}")
