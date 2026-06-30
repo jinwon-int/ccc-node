@@ -123,6 +123,35 @@ class TelegramBot:
         self._volcengine_tos_uploader: Optional[VolcengineTOSUploader] = None
         self._tts_synthesizer: Optional[MacOSTtsSynthesizer] = None
 
+    def _make_status_callback(self, bot: Any, chat_id: int):
+        """Build a fail-open send/edit/delete callback for task heartbeat messages."""
+
+        async def status_callback(text: Optional[str], message_id: Optional[int] = None) -> Optional[int]:
+            try:
+                if text is None:
+                    if message_id is not None and getattr(config, "heartbeat_delete_on_done", True):
+                        await bot.delete_message(chat_id=chat_id, message_id=message_id)
+                    return None
+                if message_id is not None:
+                    try:
+                        await bot.edit_message_text(
+                            chat_id=chat_id,
+                            message_id=message_id,
+                            text=text,
+                        )
+                    except telegram.error.BadRequest as exc:
+                        if "message is not modified" not in str(exc).lower():
+                            raise
+                    return message_id
+                sent = await bot.send_message(chat_id=chat_id, text=text)
+                value = getattr(sent, "message_id", None)
+                return value if isinstance(value, int) else None
+            except Exception as exc:
+                logger.warning("Heartbeat status callback failed: %s", type(exc).__name__)
+                return message_id
+
+        return status_callback
+
     # Available models for /model command (aliases, CLI resolves via env vars)
     MODELS = [
         ("sonnet", "Claude Sonnet"),
@@ -830,6 +859,7 @@ class TelegramBot:
             new_session=True,
             permission_callback=self._permission_callback,
             typing_callback=lambda: message.chat.send_action(action="typing"),
+            status_callback=self._make_status_callback(context.bot, chat.id),
         )
         await self._save_session_id(self._conversation_key(user_id, chat.id), response)
         # PATCH 2026-05-04: use _reply_smart to auto-split >4096 char responses
@@ -1501,6 +1531,7 @@ class TelegramBot:
                 model=session.get("model"),
                 permission_callback=self._permission_callback,
                 typing_callback=lambda: message.chat.send_action(action="typing"),
+                status_callback=self._make_status_callback(app.bot, chat.id),
                 bot=app.bot,
             )
             await self._save_session_id(conversation_key, response)
@@ -1539,6 +1570,7 @@ class TelegramBot:
                     model=session.get("model"),
                     permission_callback=self._permission_callback,
                     typing_callback=lambda: message.chat.send_action(action="typing"),
+                    status_callback=self._make_status_callback(app.bot, chat.id),
                     bot=app.bot,
                 )
                 await self._save_session_id(conversation_key, response)
@@ -2012,6 +2044,7 @@ class TelegramBot:
                 new_session=new_session,
                 permission_callback=self._permission_callback,
                 typing_callback=lambda: message.chat.send_action(action="typing"),
+                status_callback=self._make_status_callback(app.bot, chat.id),
                 bot=app.bot if enable_streaming_text else None,
             )
             await self._save_session_id(conversation_key, response)
@@ -2776,6 +2809,7 @@ class TelegramBot:
                         typing_callback=lambda: app.bot.send_chat_action(
                             chat_id, action="typing"
                         ),
+                        status_callback=self._make_status_callback(app.bot, chat_id),
                         bot=app.bot,
                     )
                     await self._save_session_id(user_id, response)

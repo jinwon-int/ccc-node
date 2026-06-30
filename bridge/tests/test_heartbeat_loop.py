@@ -1,0 +1,177 @@
+import asyncio
+import os
+import sys
+import types
+import unittest
+from collections import deque
+from pathlib import Path
+from types import SimpleNamespace
+
+os.environ.setdefault("PROJECT_ROOT", str(Path(__file__).resolve().parents[1]))
+BRIDGE_DIR = Path(__file__).resolve().parents[1]
+
+telegram_bot_pkg = types.ModuleType("telegram_bot")
+telegram_bot_pkg.__path__ = [str(BRIDGE_DIR)]
+sys.modules.setdefault("telegram_bot", telegram_bot_pkg)
+
+sdk_module = types.ModuleType("claude_agent_sdk")
+
+
+class _DummySDKClient:
+    pass
+
+
+class _DummyAgentOptions:
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+
+
+class _PermissionResultAllow:
+    pass
+
+
+class _PermissionResultDeny:
+    pass
+
+
+sdk_module.ClaudeSDKClient = _DummySDKClient
+sdk_module.ClaudeAgentOptions = _DummyAgentOptions
+sdk_module.AssistantMessage = type("AssistantMessage", (), {})
+sdk_module.ResultMessage = type("ResultMessage", (), {})
+sdk_module.StreamEvent = type("StreamEvent", (), {})
+sdk_module.TextBlock = type("TextBlock", (), {})
+sdk_module.ToolUseBlock = type("ToolUseBlock", (), {})
+sdk_module.PermissionResultAllow = _PermissionResultAllow
+sdk_module.PermissionResultDeny = _PermissionResultDeny
+sys.modules.setdefault("claude_agent_sdk", sdk_module)
+
+internal_module = types.ModuleType("claude_agent_sdk._internal")
+transport_pkg = types.ModuleType("claude_agent_sdk._internal.transport")
+subprocess_cli_module = types.ModuleType("claude_agent_sdk._internal.transport.subprocess_cli")
+subprocess_cli_module.SubprocessCLITransport = type("SubprocessCLITransport", (), {})
+sys.modules.setdefault("claude_agent_sdk._internal", internal_module)
+sys.modules.setdefault("claude_agent_sdk._internal.transport", transport_pkg)
+sys.modules.setdefault("claude_agent_sdk._internal.transport.subprocess_cli", subprocess_cli_module)
+
+_config_module = types.ModuleType("telegram_bot.utils.config")
+_config_module.config = SimpleNamespace(
+    claude_cli_path=None,
+    heartbeat_enabled=True,
+    heartbeat_threshold_seconds=0.02,
+    heartbeat_update_interval_seconds=0.02,
+    heartbeat_suppress_when_streaming_progress=True,
+    heartbeat_delete_on_done=True,
+)
+sys.modules["telegram_bot.utils.config"] = _config_module
+
+_chat_logger_module = types.ModuleType("telegram_bot.utils.chat_logger")
+_chat_logger_module.log_chat = lambda *args, **kwargs: None
+sys.modules["telegram_bot.utils.chat_logger"] = _chat_logger_module
+
+_health_module = types.ModuleType("telegram_bot.utils.health")
+_health_module.health_reporter = SimpleNamespace(
+    record_claude_error=lambda *args, **kwargs: None,
+    record_claude_ok=lambda *args, **kwargs: None,
+)
+sys.modules["telegram_bot.utils.health"] = _health_module
+
+import importlib  # noqa: E402
+
+sys.modules.pop("telegram_bot.core.project_chat", None)
+project_chat = importlib.import_module("telegram_bot.core.project_chat")
+ProjectChatHandler = project_chat.ProjectChatHandler
+_PendingRequest = project_chat._PendingRequest
+_UserStreamState = project_chat._UserStreamState
+
+
+class HeartbeatLoopTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self._orig_interval = project_chat.TYPING_INTERVAL
+        project_chat.TYPING_INTERVAL = 0.01
+        self.addCleanup(setattr, project_chat, "TYPING_INTERVAL", self._orig_interval)
+        self.handler = ProjectChatHandler()
+        self.status_calls = []
+        self.status_event = asyncio.Event()
+
+    async def _status_callback(self, text, message_id=None):
+        self.status_calls.append((text, message_id))
+        self.status_event.set()
+        if text is None:
+            return None
+        return message_id or 1234
+
+    def _make_request(self, *, done=False, streaming_handler=None):
+        future = asyncio.get_running_loop().create_future()
+        req = _PendingRequest(
+            user_id=1,
+            chat_id=2,
+            model=None,
+            requested_session_id=None,
+            permission_callback=None,
+            typing_callback=None,
+            future=future,
+            status_callback=self._status_callback,
+            streaming_handler=streaming_handler,
+        )
+        req.started_at = asyncio.get_running_loop().time()
+        req.current_tool_label = "Read: bridge/core/project_chat.py"
+        if done:
+            future.set_result("done")
+        return req
+
+    async def _start_loop(self, state):
+        task = asyncio.create_task(self.handler._typing_keepalive_loop(1, state))
+        self.addCleanup(self._cancel, task)
+        return task
+
+    @staticmethod
+    async def _cancel(task):
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    async def test_sends_heartbeat_after_threshold_without_typing_callback(self):
+        req = self._make_request()
+        state = _UserStreamState(client=None, model=None, pending=deque([req]))
+        await self._start_loop(state)
+        await asyncio.wait_for(self.status_event.wait(), timeout=1.0)
+        self.assertEqual(req.heartbeat_message_id, 1234)
+        self.assertIn("⏳ Working", self.status_calls[0][0])
+        self.assertIn("Read: bridge/core/project_chat.py", self.status_calls[0][0])
+
+    async def test_does_not_send_when_disabled(self):
+        project_chat.config.heartbeat_enabled = False
+        self.addCleanup(setattr, project_chat.config, "heartbeat_enabled", True)
+        req = self._make_request()
+        state = _UserStreamState(client=None, model=None, pending=deque([req]))
+        await self._start_loop(state)
+        with self.assertRaises(asyncio.TimeoutError):
+            await asyncio.wait_for(self.status_event.wait(), timeout=0.1)
+        self.assertEqual(self.status_calls, [])
+
+    async def test_cleanup_deletes_existing_heartbeat(self):
+        req = self._make_request()
+        req.heartbeat_message_id = 1234
+        await self.handler._cleanup_heartbeat(req)
+        self.assertEqual(self.status_calls, [(None, 1234)])
+        self.assertIsNone(req.heartbeat_message_id)
+
+    async def test_suppresses_when_streaming_recently_showed_progress(self):
+        project_chat.config.heartbeat_threshold_seconds = 1.0
+        self.addCleanup(setattr, project_chat.config, "heartbeat_threshold_seconds", 0.02)
+        streaming_handler = SimpleNamespace(drafts=[SimpleNamespace(message_id=99)])
+        req = self._make_request(streaming_handler=streaming_handler)
+        now = asyncio.get_running_loop().time()
+        req.started_at = now - 2.0
+        req.last_visible_progress_at = now
+        state = _UserStreamState(client=None, model=None, pending=deque([req]))
+        await self._start_loop(state)
+        with self.assertRaises(asyncio.TimeoutError):
+            await asyncio.wait_for(self.status_event.wait(), timeout=0.1)
+        self.assertEqual(self.status_calls, [])
+
+
+if __name__ == "__main__":
+    unittest.main()
