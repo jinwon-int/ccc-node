@@ -143,7 +143,8 @@ for t in claude/hooks/guard.test.sh claude/hooks/observability.test.sh claude/ho
          claude/hooks/distill/queue-drain.test.sh claude/hooks/distill/wiki-queue.test.sh \
          claude/hooks/distill/local-facts.test.sh \
          scripts/ccc-doctor.test.sh scripts/ccc-memory.test.sh scripts/ccc-distill-check.test.sh scripts/ccc-security-audit.test.sh \
-         scripts/agent-cron.test.sh scripts/agent-cron-lib.test.sh scripts/a2a-termux-native-worker.test.sh; do
+         scripts/agent-cron.test.sh scripts/agent-cron-lib.test.sh scripts/a2a-termux-native-worker.test.sh \
+         scripts/install-memory-refresh-cron.test.sh; do
   [ -f "$t" ] || { err "missing test: $t"; continue; }
   if bash "$t" >"$TMP/htest.out" 2>&1; then say "  ok $(grep -E 'PASS=' "$TMP/htest.out" | tail -1) $t";
   else err "test failed: $t"; tail -5 "$TMP/htest.out"; fi
