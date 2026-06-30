@@ -159,6 +159,8 @@ HOOKDIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)" || HOOKD
     cp -p "$STASH" "$STASH_DIR/$(date -u +%Y%m%d-%H%M%S)-${BASHPID:-$$}.json" 2>/dev/null || true
   fi
   printf '%s' "$EXTRACT_OUT" > "$STASH" 2>/dev/null
+  bash "$HOOKDIR/distill/resume-write.sh" < "$STASH" >> "$LOG" 2>&1 || \
+    log "resume-write non-zero"
   if [ "$HISTORY_KEEP" -gt 0 ]; then
     find "$STASH_DIR" -maxdepth 1 -type f -name '*.json' -printf '%T@ %p\n' 2>/dev/null \
       | sort -rn \

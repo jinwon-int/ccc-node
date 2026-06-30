@@ -37,19 +37,19 @@ printf '%s' "$count" > "$count_file"
 if [ -n "$input_file" ]; then cat > "$input_file"; else cat >/dev/null; fi
 case "$mode" in
   valid)
-    printf '{"honcho":[{"kind":"context","text":"ok","subject":"session"}],"wiki_candidates":[]}'
+    printf '{"honcho":[{"kind":"context","text":"ok","subject":"session"}],"wiki_candidates":[],"resume":{"last_activity":"ok","pending_action":"","awaiting_user":false,"open_question":"","next_step":"","evidence":[]}}'
     ;;
   fenced)
-    printf '```json\n{"honcho":[],"wiki_candidates":[]}\n```\n'
+    printf '```json\n{"honcho":[],"wiki_candidates":[],"resume":{"last_activity":"","pending_action":"","awaiting_user":false,"open_question":"","next_step":"","evidence":[]}}\n```\n'
     ;;
   drift)
-    if [ "$count" = 1 ]; then printf 'Here is the JSON: nope\n'; else printf '{"honcho":[],"wiki_candidates":[]}'; fi
+    if [ "$count" = 1 ]; then printf 'Here is the JSON: nope\n'; else printf '{"honcho":[],"wiki_candidates":[],"resume":{"last_activity":"","pending_action":"","awaiting_user":false,"open_question":"","next_step":"","evidence":[]}}'; fi
     ;;
   timeout)
-    if [ "$count" = 1 ]; then sleep 5; else printf '{"honcho":[],"wiki_candidates":[]}'; fi
+    if [ "$count" = 1 ]; then sleep 5; else printf '{"honcho":[],"wiki_candidates":[],"resume":{"last_activity":"","pending_action":"","awaiting_user":false,"open_question":"","next_step":"","evidence":[]}}'; fi
     ;;
   *)
-    printf '{"honcho":[],"wiki_candidates":[]}'
+    printf '{"honcho":[],"wiki_candidates":[],"resume":{"last_activity":"","pending_action":"","awaiting_user":false,"open_question":"","next_step":"","evidence":[]}}'
     ;;
 esac
 SH
