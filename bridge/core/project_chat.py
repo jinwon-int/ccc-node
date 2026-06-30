@@ -29,6 +29,12 @@ from claude_agent_sdk._internal.transport.subprocess_cli import SubprocessCLITra
 from telegram_bot.utils.chat_logger import log_chat
 from telegram_bot.utils.config import config
 from telegram_bot.utils.health import health_reporter
+from telegram_bot.core.heartbeat import (
+    compose_heartbeat_text,
+    has_recent_visible_progress,
+    should_update_heartbeat,
+    tool_label,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -94,6 +100,9 @@ from telegram_bot.core.sdk_text import (  # noqa: E402
 PermissionCallback = Callable[[int, int, str, Dict[str, Any]], Awaitable]
 # Callback type: async () -> Any, sends typing action
 TypingCallback = Callable[[], Awaitable[Any]]
+# Callback type: async (text, message_id) -> message_id | None. When text is
+# None the existing heartbeat message should be deleted/cleared.
+StatusCallback = Callable[[Optional[str], Optional[int]], Awaitable[Optional[int]]]
 
 TYPING_INTERVAL = 4  # Telegram typing status expires after ~5s
 
@@ -119,8 +128,14 @@ class _PendingRequest:
     permission_callback: Optional[PermissionCallback]
     typing_callback: Optional[TypingCallback]
     future: asyncio.Future
+    status_callback: Optional[StatusCallback] = None
     sent_session_id: str = "default"
     last_typing_at: float = 0.0
+    started_at: float = 0.0
+    heartbeat_last_update_at: float = 0.0
+    heartbeat_message_id: Optional[int] = None
+    current_tool_label: Optional[str] = None
+    last_visible_progress_at: float = 0.0
     last_assistant_texts: List[str] = field(default_factory=list)
     synthetic_response: Optional[str] = None
     streaming_handler: Optional[Any] = None  # StreamingMessageHandler instance
@@ -321,6 +336,7 @@ class ProjectChatHandler:
         msg = cancel_message or "🛑 Task has been terminated."
         while state.pending:
             req = state.pending.popleft()
+            await self._cleanup_heartbeat(req)
             if not req.future.done():
                 try:
                     req.future.set_result(
@@ -391,6 +407,68 @@ class ProjectChatHandler:
                 self._streams[key] = state
             return state
 
+    async def _cleanup_heartbeat(self, req: _PendingRequest) -> None:
+        """Delete/clear the transient heartbeat message for a request."""
+        if not req.status_callback or req.heartbeat_message_id is None:
+            return
+        try:
+            await req.status_callback(None, req.heartbeat_message_id)
+        except Exception as e:
+            logger.warning(
+                "Heartbeat cleanup failed for user %s chat %s: %s",
+                req.user_id,
+                req.chat_id,
+                type(e).__name__,
+            )
+        finally:
+            req.heartbeat_message_id = None
+
+    async def _maybe_update_heartbeat(self, req: _PendingRequest, now: float) -> None:
+        """Send or edit a fail-open long-running task heartbeat."""
+        if not getattr(config, "heartbeat_enabled", True):
+            return
+        if not req.status_callback or req.future.done():
+            return
+
+        threshold = float(getattr(config, "heartbeat_threshold_seconds", 15.0))
+        interval = float(getattr(config, "heartbeat_update_interval_seconds", 15.0))
+        if not should_update_heartbeat(
+            now=now,
+            started_at=req.started_at,
+            last_update_at=req.heartbeat_last_update_at,
+            threshold_seconds=threshold,
+            update_interval_seconds=interval,
+        ):
+            return
+
+        if (
+            getattr(config, "heartbeat_suppress_when_streaming_progress", True)
+            and req.streaming_handler
+            and getattr(req.streaming_handler, "drafts", None)
+            and has_recent_visible_progress(
+                now=now,
+                last_visible_progress_at=req.last_visible_progress_at,
+                window_seconds=threshold,
+            )
+        ):
+            return
+
+        text = compose_heartbeat_text(
+            elapsed_seconds=now - req.started_at,
+            current_tool=req.current_tool_label,
+        )
+        try:
+            message_id = await req.status_callback(text, req.heartbeat_message_id)
+            req.heartbeat_message_id = message_id
+            req.heartbeat_last_update_at = now
+        except Exception as e:
+            logger.warning(
+                "Heartbeat update failed for user %s chat %s: %s",
+                req.user_id,
+                req.chat_id,
+                type(e).__name__,
+            )
+
     async def _typing_keepalive_loop(
         self, user_id: int, state: _UserStreamState
     ) -> None:
@@ -413,16 +491,14 @@ class ProjectChatHandler:
                 # keepalive here is exactly what leaves it stuck.
                 if req.future.done():
                     continue
-                if not req.typing_callback:
-                    continue
                 now = asyncio.get_event_loop().time()
-                if now - req.last_typing_at < TYPING_INTERVAL:
-                    continue
-                req.last_typing_at = now
-                try:
-                    await req.typing_callback()
-                except Exception:
-                    pass
+                if req.typing_callback and now - req.last_typing_at >= TYPING_INTERVAL:
+                    req.last_typing_at = now
+                    try:
+                        await req.typing_callback()
+                    except Exception:
+                        pass
+                await self._maybe_update_heartbeat(req, now)
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -464,6 +540,7 @@ class ProjectChatHandler:
                             req.streamed_via_partials = True
                             try:
                                 await req.streaming_handler.update_if_needed(delta)
+                                req.last_visible_progress_at = now
                             except Exception as e:
                                 logger.error(f"Partial streaming update failed: {e}")
                     continue
@@ -487,17 +564,20 @@ class ProjectChatHandler:
                                     await req.streaming_handler.update_if_needed(
                                         block.text
                                     )
+                                    req.last_visible_progress_at = now
                                 except Exception as e:
                                     logger.error(f"Streaming update failed: {e}")
                             if os.environ.get("BOT_DEBUG"):
                                 print(f"\033[36m[Claude]\033[0m {block.text[:200]}")
                         elif isinstance(block, ToolUseBlock):
                             logger.debug(f"ToolUseBlock: {block.name}")
+                            req.current_tool_label = tool_label(block.name, block.input)
                             if req.streaming_handler:
                                 try:
                                     await req.streaming_handler.add_tool_call(
                                         block.name, block.input
                                     )
+                                    req.last_visible_progress_at = now
                                 except Exception as e:
                                     logger.error(f"Tool call display failed: {e}")
                             if os.environ.get("BOT_DEBUG"):
@@ -516,6 +596,7 @@ class ProjectChatHandler:
                             await req.streaming_handler.finalize_all()
                         except Exception as e:
                             logger.error(f"Streaming finalization failed: {e}")
+                    await self._cleanup_heartbeat(req)
 
                     if req.synthetic_response:
                         content = (
@@ -602,6 +683,7 @@ class ProjectChatHandler:
             pending_copy = list(state.pending)
             state.pending.clear()
             for req in pending_copy:
+                await self._cleanup_heartbeat(req)
                 # Finalize streaming drafts on error
                 if req.streaming_handler:
                     try:
@@ -646,6 +728,7 @@ class ProjectChatHandler:
         new_session: bool = False,
         permission_callback: Optional[PermissionCallback] = None,
         typing_callback: Optional[TypingCallback] = None,
+        status_callback: Optional[StatusCallback] = None,
         bot: Optional[Any] = None,
     ) -> ChatResponse:
         del message_id
@@ -672,8 +755,10 @@ class ProjectChatHandler:
             permission_callback=permission_callback,
             typing_callback=typing_callback,
             future=future,
+            status_callback=status_callback,
             streaming_handler=streaming_handler,
         )
+        request.started_at = loop.time()
         state: Optional[_UserStreamState] = None
 
         try:
@@ -705,6 +790,7 @@ class ProjectChatHandler:
                     await streaming_handler.cancel()
                 except Exception as e:
                     logger.error(f"Failed to cancel streaming handler: {e}")
+            await self._cleanup_heartbeat(request)
             await self.stop(user_id)
             # Don't return a message - bot.py will handle the user response
             raise
@@ -713,6 +799,7 @@ class ProjectChatHandler:
             logger.warning(
                 f"Query timed out for user {user_id} after {PROCESS_TIMEOUT}s"
             )
+            await self._cleanup_heartbeat(request)
             await self.stop(user_id)
             msg = f"⏰ Timed out after {PROCESS_TIMEOUT}s. Please retry or simplify your request."
             health_reporter.record_claude_error(msg)
@@ -724,6 +811,7 @@ class ProjectChatHandler:
                     state.pending.remove(request)
                 except ValueError:
                     pass
+            await self._cleanup_heartbeat(request)
 
             err = str(e)
             logger.error(
@@ -764,8 +852,10 @@ class ProjectChatHandler:
                     permission_callback=permission_callback,
                     typing_callback=typing_callback,
                     future=retry_future,
+                    status_callback=status_callback,
                     streaming_handler=retry_handler,
                 )
+                retry_request.started_at = loop.time()
                 retry_state: Optional[_UserStreamState] = None
                 try:
                     retry_state = await self._get_or_create_stream(
@@ -790,6 +880,7 @@ class ProjectChatHandler:
                             retry_state.pending.remove(retry_request)
                         except ValueError:
                             pass
+                    await self._cleanup_heartbeat(retry_request)
                     if not retry_future.done():
                         retry_future.cancel()
                     logger.error(

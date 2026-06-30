@@ -328,6 +328,31 @@ class Config(BaseSettings):
             "draft_update_min_chars / draft_update_interval."
         ),
     )
+    heartbeat_enabled: bool = Field(
+        default=True,
+        alias="CCC_HEARTBEAT_ENABLED",
+        description="Enable fail-open long-running task heartbeat messages.",
+    )
+    heartbeat_threshold_seconds: float = Field(
+        default=15.0,
+        alias="CCC_HEARTBEAT_THRESHOLD_SECONDS",
+        description="Seconds before sending the first long-running task heartbeat.",
+    )
+    heartbeat_update_interval_seconds: float = Field(
+        default=15.0,
+        alias="CCC_HEARTBEAT_UPDATE_INTERVAL_SECONDS",
+        description="Minimum seconds between heartbeat message edits.",
+    )
+    heartbeat_suppress_when_streaming_progress: bool = Field(
+        default=True,
+        alias="CCC_HEARTBEAT_SUPPRESS_WHEN_STREAMING_PROGRESS",
+        description="Suppress heartbeat while live streaming drafts recently showed progress.",
+    )
+    heartbeat_delete_on_done: bool = Field(
+        default=True,
+        alias="CCC_HEARTBEAT_DELETE_ON_DONE",
+        description="Delete transient heartbeat messages when a task completes or is cancelled.",
+    )
 
     # Voice message configuration
     transcription_provider: str = Field(
