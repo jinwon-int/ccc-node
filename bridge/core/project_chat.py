@@ -539,6 +539,18 @@ class ProjectChatHandler:
                 if req.future.done():
                     continue
                 now = asyncio.get_event_loop().time()
+                # Stop refreshing typing once the initial text has been streamed
+                # but no new streaming activity has arrived for 2×TYPING_INTERVAL.
+                # This happens when Claude uses a long-running tool (Bash, Task, …)
+                # after showing its initial reply text — the user can already see
+                # the text, and the heartbeat will take over to advertise progress.
+                if req.last_visible_progress_at > 0 and not has_recent_visible_progress(
+                    now=now,
+                    last_visible_progress_at=req.last_visible_progress_at,
+                    window_seconds=TYPING_INTERVAL * 2,
+                ):
+                    await self._maybe_update_heartbeat(req, now)
+                    continue
                 if req.typing_callback and now - req.last_typing_at >= TYPING_INTERVAL:
                     req.last_typing_at = now
                     try:
