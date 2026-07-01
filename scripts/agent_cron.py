@@ -9,7 +9,7 @@ import shlex as _shlex
 import sys as _sys
 from pathlib import Path as _Path
 
-_USAGE = "Usage: agent-cron.sh [list|validate] [--store PATH] [--json]\n       agent-cron.sh due [--store PATH] [--at ISO8601] [--json]\n       agent-cron.sh lock <task-id> --action acquire|release|probe --run-id ID [--scheduled-at ISO8601] [--at ISO8601] [--json]\n       agent-cron.sh run <task-id> --dry-run [--at ISO8601] [--json]\n       agent-cron.sh scheduler --dry-run|--execute [--at ISO8601] [--max-runs N] [--json]\n\nImplemented slices:\n- list/validate: inspect and validate the task definition store.\n- due: read-only dry-run schedule resolver. It reports due tasks, missed windows,\n  catch-up policy, retryEligibleAt state, and lock paths, but never executes\n  prompts or writes state.\n- lock: local atomic task-lock acquire/release/probe primitives only. It writes\n  lock files under the task store's sibling locks/ directory, but never executes\n  prompts, sends notifications, installs schedulers, or updates task history.\n- run --dry-run: read-only execution-plan preview. It combines due, lock probe,\n  task policy, and headless command metadata, but never acquires locks, executes\n  prompts, sends notifications, installs schedulers, or updates task history.\n- scheduler --dry-run: read-only single-tick scheduler plan. It reports which\n  tasks would run or skip, including retry-due tasks, but never installs timers,\n  acquires locks, executes prompts, writes task state, or sends notifications.\n- scheduler --execute: explicit one-shot scheduler executor for approved live/systemd\n  use. It runs at most --max-runs due/retry-due tasks through the existing run path;\n  it never installs timers or edits crontab/systemd.\n- run: explicit manual execution for due enabled tasks. It acquires the task lock,\n  invokes ccc-headless, records lastRunAt/lastStatus/lastRunId, writes a\n  redacted owner-only bridge spool entry when notify=telegram-owner, appends a\n  bounded runHistory entry, records retryState/retryEligibleAt on failure, clears\n  retryState on success, and releases the lock in all normal failure/success\n  paths. It still does not call Telegram\n  or provider APIs, install schedulers, mutate crontab/systemd, or touch remotes.\n\nNo direct Telegram/API send, scheduler bootstrap, systemd/crontab writes,\nprovider sends, or remote-node actions are performed by agent-cron itself.\n"
+_USAGE = "Usage: agent-cron.sh [list|validate|status] [--store PATH] [--json]\n       agent-cron.sh due [--store PATH] [--at ISO8601] [--json]\n       agent-cron.sh lock <task-id> --action acquire|release|probe --run-id ID [--scheduled-at ISO8601] [--at ISO8601] [--json]\n       agent-cron.sh run <task-id> --dry-run [--at ISO8601] [--json]\n       agent-cron.sh scheduler --dry-run|--execute [--at ISO8601] [--max-runs N] [--json]\n\nImplemented slices:\n- list/validate: inspect and validate the task definition store.\n- due: read-only dry-run schedule resolver. It reports due tasks, missed windows,\n  catch-up policy, retryEligibleAt state, and lock paths, but never executes\n  prompts or writes state.\n- lock: local atomic task-lock acquire/release/probe primitives only. It writes\n  lock files under the task store's sibling locks/ directory, but never executes\n  prompts, sends notifications, installs schedulers, or updates task history.\n- run --dry-run: read-only execution-plan preview. It combines due, lock probe,\n  task policy, and headless command metadata, but never acquires locks, executes\n  prompts, sends notifications, installs schedulers, or updates task history.\n- scheduler --dry-run: read-only single-tick scheduler plan. It reports which\n  tasks would run or skip, including retry-due tasks, but never installs timers,\n  acquires locks, executes prompts, writes task state, or sends notifications.\n- scheduler --execute: explicit one-shot scheduler executor for approved live/systemd\n  use. It runs at most --max-runs due/retry-due tasks through the existing run path;\n  it never installs timers or edits crontab/systemd.\n- run: explicit manual execution for due enabled tasks. It acquires the task lock,\n  invokes ccc-headless, records lastRunAt/lastStatus/lastRunId, writes a\n  redacted owner-only bridge spool entry when notify=telegram-owner, appends a\n  bounded runHistory entry, records retryState/retryEligibleAt on failure, clears\n  retryState on success, and releases the lock in all normal failure/success\n  paths. It still does not call Telegram\n  or provider APIs, install schedulers, mutate crontab/systemd, or touch remotes.\n\nNo direct Telegram/API send, scheduler bootstrap, systemd/crontab writes,\nprovider sends, or remote-node actions are performed by agent-cron itself.\n"
 
 
 def _die(message, code=2):
@@ -48,7 +48,7 @@ def _bootstrap_cli():
             break
         i += 1
 
-    if cmd_value not in ('list', 'validate', 'due', 'lock', 'run', 'scheduler'):
+    if cmd_value not in ('list', 'validate', 'status', 'due', 'lock', 'run', 'scheduler'):
         if cmd_value in ('execute', 'install', 'enable', 'disable', 'add', 'remove'):
             _die(f'agent-cron {cmd_value} is not implemented in this read-only slice; no filesystem changes were made.', 2)
         _die(f'Unknown command: {cmd_value}', 2)
@@ -561,6 +561,92 @@ def parse_scheduler_args():
     if max_runs < 1 or max_runs > 100:
         raise ValueError('--max-runs must be an integer from 1 to 100')
     return dry_run, execute, at_value, local_json, max_runs
+
+
+def agent_cron_status(data):
+    plan = due_plan(data)
+    tasks = []
+    counts = {
+        'total': 0,
+        'healthy': 0,
+        'due': 0,
+        'retry_wait': 0,
+        'retry_exhausted': 0,
+        'failed': 0,
+        'locked': 0,
+        'disabled': 0,
+        'invalid': 0,
+    }
+    for row in plan.get('tasks', []):
+        status = row.get('status') or 'unknown'
+        task_id = row.get('id')
+        task = task_by_id(data, task_id) if task_id else None
+        last_status = task.get('lastStatus') if isinstance(task, dict) else None
+        health = 'healthy'
+        if status == 'disabled':
+            health = 'disabled'
+        elif status in {'locked', 'stale-lock'}:
+            health = 'locked'
+        elif status == 'retry-exhausted':
+            health = 'retry-exhausted'
+        elif status == 'retry-wait':
+            health = 'retry-wait'
+        elif status in {'due', 'retry-due'}:
+            health = 'due'
+        elif status == 'invalid-schedule' or row.get('error'):
+            health = 'invalid'
+        elif last_status in {'failed', 'error'}:
+            health = 'failed'
+        counts['total'] += 1
+        if health == 'retry-wait':
+            counts['retry_wait'] += 1
+        elif health == 'retry-exhausted':
+            counts['retry_exhausted'] += 1
+        else:
+            counts[health] = counts.get(health, 0) + 1
+        tasks.append({
+            'id': task_id,
+            'node': os.environ.get('CCC_NODE') or socket.gethostname(),
+            'health': health,
+            'status': status,
+            'enabled': row.get('enabled'),
+            'lastStatus': last_status,
+            'lastRunAt': task.get('lastRunAt') if isinstance(task, dict) else None,
+            'lastRunId': task.get('lastRunId') if isinstance(task, dict) else None,
+            'scheduledAt': row.get('scheduledAt'),
+            'nextDueAt': row.get('nextDueAt'),
+            'retryEligibleAt': row.get('retryEligibleAt'),
+            'retryAttempt': row.get('retryAttempt'),
+            'retryExhausted': health == 'retry-exhausted',
+            'lockState': row.get('lockState'),
+            'lockPath': row.get('lockPath'),
+            'error': row.get('error'),
+        })
+    return {
+        'ok': plan.get('ok', False) and counts['invalid'] == 0,
+        'mode': 'status-read-only',
+        'store': str(store),
+        'at': plan.get('at'),
+        'summary': counts,
+        'tasks': tasks,
+        'errors': plan.get('errors', []),
+        'mutations': mutation_flags(False, False, False),
+    }
+
+
+def emit_status(result, as_json):
+    if as_json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
+    print('# agent-cron status\n')
+    print(f"- store: `{result.get('store')}`")
+    print(f"- at: `{result.get('at') or ''}`")
+    print('- mode: read-only; no task execution, lock acquire, spool write, scheduler install, or state writes\n')
+    print('| id | health | last status | retry | next due | lock |')
+    print('|---|---|---|---|---|---|')
+    for t in result.get('tasks', []):
+        retry = t.get('retryEligibleAt') or ('exhausted' if t.get('retryExhausted') else '')
+        print(f"| `{t.get('id')}` | `{t.get('health')}` | `{t.get('lastStatus') or ''}` | `{retry}` | `{t.get('nextDueAt') or ''}` | `{t.get('lockState')}` |")
 
 
 def scheduler_actions(plan):
@@ -1123,6 +1209,11 @@ if cmd == 'run':
     result, as_json, rc = run_dry_plan(data)
     emit_run(result, as_json)
     sys.exit(rc)
+
+if cmd == 'status':
+    result = agent_cron_status(data)
+    emit_status(result, json_out)
+    sys.exit(0 if result.get('ok') else 1)
 
 if cmd == 'validate':
     if json_out:

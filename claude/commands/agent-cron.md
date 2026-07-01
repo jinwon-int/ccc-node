@@ -11,6 +11,10 @@ allowed-tools: Bash(/opt/ccc-node/scripts/agent-cron.sh:*)
 
 !`/opt/ccc-node/scripts/agent-cron.sh due 2>&1 || true`
 
+## Read-only status rollup
+
+!`/opt/ccc-node/scripts/agent-cron.sh status 2>&1 || true`
+
 ## Dry-run scheduler tick plan
 
 !`/opt/ccc-node/scripts/agent-cron.sh scheduler --dry-run 2>&1 || true`
