@@ -132,6 +132,42 @@ class TypingKeepaliveTest(unittest.IsolatedAsyncioTestCase):
             await asyncio.wait_for(self.called.wait(), timeout=0.2)
         self.assertEqual(self.calls, 0)
 
+    async def test_typing_stops_when_streaming_idle_after_text_shown(self):
+        """Typing must stop when text was already streamed but a tool is still running.
+
+        Scenario: Claude streams reply text (last_visible_progress_at is set), then
+        executes a long Bash/Task tool.  The SDK emits no new events while the tool
+        runs, so last_visible_progress_at stays frozen.  After 2×TYPING_INTERVAL of
+        idle streaming the keepalive must stop refreshing the typing indicator — the
+        heartbeat will take over to signal progress.
+        """
+        req = self._make_request(done=False)
+        # Simulate: streaming text was shown 3×interval ago (tool is now running).
+        now = asyncio.get_event_loop().time()
+        req.last_visible_progress_at = now - project_chat.TYPING_INTERVAL * 3
+        state = _UserStreamState(client=None, model=None, pending=deque([req]))
+        await self._start_loop(state)
+        with self.assertRaises(asyncio.TimeoutError):
+            await asyncio.wait_for(self.called.wait(), timeout=0.2)
+        self.assertEqual(
+            self.calls, 0,
+            "typing must NOT be sent once streaming is idle and text is already shown",
+        )
+
+    async def test_typing_continues_during_active_streaming(self):
+        """Typing must continue while the assistant is actively streaming text."""
+        req = self._make_request(done=False)
+        # Simulate: text was just streamed (recent streaming activity).
+        now = asyncio.get_event_loop().time()
+        req.last_visible_progress_at = now
+        state = _UserStreamState(client=None, model=None, pending=deque([req]))
+        await self._start_loop(state)
+        await asyncio.wait_for(self.called.wait(), timeout=2.0)
+        self.assertGreater(
+            self.calls, 0,
+            "typing must continue while streaming is still active",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
