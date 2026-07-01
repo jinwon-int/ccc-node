@@ -116,6 +116,19 @@ to Telegram, with all secrets and node-local state stripped out and replaced by 
   `skill-suggest` workflow. Use `skill-review.disabled` as the off-switch and
   `CCC_SKILL_REVIEW_COOLDOWN_SECONDS` to tune cost cadence.
 
+## Operator docs map
+
+The README is the install/safety overview. Subsystem details live under `docs/`:
+
+| Topic | Doc |
+|---|---|
+| Memory injection, refresh, hot index | [`docs/memory.md`](docs/memory.md) |
+| Agent-cron commands, status, retry rollup | [`docs/agent-cron.md`](docs/agent-cron.md) |
+| Telegram bridge operations and boundaries | [`docs/bridge-ops.md`](docs/bridge-ops.md) |
+| Security audit and fleet matrix reporting | [`docs/security-audit.md`](docs/security-audit.md) |
+| Termux/VPS parity rules | [`docs/termux-vps-parity.md`](docs/termux-vps-parity.md) |
+| Bridge upstream and i18n policy | [`docs/bridge-upstream-i18n-policy.md`](docs/bridge-upstream-i18n-policy.md) |
+
 ## Quick start
 
 ```bash

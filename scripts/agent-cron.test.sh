@@ -321,5 +321,15 @@ ok "run failure schedules retryEligibleAt with bounded policy" '[ "$rc" = 1 ] &&
 
 out="$(CCC_AGENT_CRON_STORE="$EXEC_STORE" CCC_HEADLESS_CMD="$FAKE_HEADLESS" bash "$CMD" run exec-retry-success --json --at 2026-01-01T00:02:00Z)"; rc=$?
 ok "successful retry clears retryState" '[ "$rc" = 0 ] && jq -e ".status == \"success\" and .retry.cleared == true" <<<"$out" >/dev/null && jq -e ".tasks[] | select(.id == \"exec-retry-success\" and ((has(\"retryState\") | not) or .retryState == null))" "$EXEC_STORE" >/dev/null'
+
+STATUS_STORE="$TMP/status-store/tasks.json"
+mkdir -p "$(dirname "$STATUS_STORE")"
+cat > "$STATUS_STORE" <<'JSON'
+{"version":1,"tasks":[{"id":"status-healthy","schedule":"0 0 * * *","prompt":"ok","enabled":true,"notify":"none","lastRunAt":"2026-01-01T00:00:00Z","lastStatus":"success"},{"id":"status-failed","schedule":"0 0 * * *","prompt":"bad","enabled":true,"notify":"none","lastRunAt":"2026-01-01T00:00:00Z","lastStatus":"failed"},{"id":"status-retry-exhausted","schedule":"0 0 * * *","prompt":"retry","enabled":true,"notify":"none","lastRunAt":"2026-01-01T00:00:00Z","retryPolicy":{"maxAttempts":1},"retryState":{"scheduledAt":"2026-01-01T00:00:00Z","attempt":1,"retryEligibleAt":"2026-01-01T00:01:00Z","lastStatus":"failed","lastRunId":"r1"}}]}
+JSON
+out="$(CCC_AGENT_CRON_STORE="$STATUS_STORE" CCC_NODE="test-node" bash "$CMD" status --json --at 2026-01-01T00:05:00Z)"; rc=$?
+ok "status --json emits read-only operator rollup" '[ "$rc" = 0 ] && jq -e ".mode == \"status-read-only\" and .mutations.lockAcquire == false and .mutations.taskStoreWrite == false and .mutations.pushSpoolWrite == false" <<<"$out" >/dev/null'
+ok "status reports failed and retry-exhausted tasks" 'jq -e ".tasks[] | select(.id == \"status-failed\" and .health == \"failed\" and .node == \"test-node\")" <<<"$out" >/dev/null && jq -e ".tasks[] | select(.id == \"status-retry-exhausted\" and .health == \"retry-exhausted\" and .retryExhausted == true)" <<<"$out" >/dev/null'
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
