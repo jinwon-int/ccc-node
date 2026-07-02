@@ -6,6 +6,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 VENV_DIR="$SCRIPT_DIR/venv"
 REQ_FILE="$SCRIPT_DIR/requirements.txt"
+PYPROJECT_FILE="$SCRIPT_DIR/pyproject.toml"
 ENV_FILE="$SCRIPT_DIR/.env"
 REQ_HASH_FILE="$VENV_DIR/.req_hash"
 
@@ -21,7 +22,14 @@ CACHE_DIR="$HOME/.telegram-bot-cache"
 CACHE_FILE="$CACHE_DIR/update_check"
 
 get_requirements_hash() {
-    md5 -q "$REQ_FILE" 2>/dev/null || md5sum "$REQ_FILE" | cut -d' ' -f1
+    "$VENV_DIR/bin/python" - "$REQ_FILE" "$PYPROJECT_FILE" <<'PY'
+import hashlib, pathlib, sys
+h = hashlib.sha256()
+for name in sys.argv[1:]:
+    h.update(pathlib.Path(name).read_bytes())
+    h.update(b"\0")
+print(h.hexdigest())
+PY
 }
 
 ensure_venv() {
@@ -32,20 +40,17 @@ ensure_venv() {
             exit 1
         fi
     fi
-    ensure_package_link
+    cleanup_package_link
 }
 
-ensure_package_link() {
-    # Make the package importable as `telegram_bot`. start.sh launches the bot via
-    # `python -m telegram_bot`, but the code lives in this dir (named `bridge`). Expose it
-    # with a self-contained symlink INSIDE the venv's site-packages (already on sys.path).
-    # Idempotent and recreated whenever the venv is, so `start.sh` works on its own without
-    # requiring `setup.sh` to have run first (otherwise the bot crash-loops with
-    # "No module named telegram_bot"). Mirrors setup.sh's package-link step.
+cleanup_package_link() {
+    # Older installs exposed bridge/ as telegram_bot through a site-packages
+    # symlink. Remove that stale link before editable installation so import
+    # resolution is owned by packaging metadata instead of filesystem state.
     local sp
     sp="$("$VENV_DIR/bin/python" -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])' 2>/dev/null)"
-    if [ -n "$sp" ] && [ -d "$sp" ]; then
-        ln -sfn "$SCRIPT_DIR" "$sp/telegram_bot"
+    if [ -n "$sp" ] && [ -L "$sp/telegram_bot" ]; then
+        rm -f "$sp/telegram_bot"
     fi
 }
 
@@ -83,6 +88,10 @@ sync_dependencies() {
         fi
         if ! "$VENV_DIR/bin/pip" install -q -r "$REQ_FILE"; then
             echo "❌ Dependency installation failed"
+            exit 1
+        fi
+        if ! "$VENV_DIR/bin/pip" install -q -e "$SCRIPT_DIR"; then
+            echo "❌ Editable bridge package installation failed"
             exit 1
         fi
         echo "$current_hash" > "$REQ_HASH_FILE"
