@@ -19,6 +19,40 @@ jobs:
           mkdir -p "$TMPDIR"
           bash scripts/validate-harness.sh
 
+  python-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install lint tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install ruff mypy
+          pip install -r bridge/requirements.txt
+      - name: Ruff
+        run: ruff check .
+      - name: Mypy (focused subset)
+        run: mypy
+
+  secret-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install gitleaks
+        env:
+          GITLEAKS_VERSION: 8.30.1
+        run: |
+          curl -sSL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" -o /tmp/gitleaks.tar.gz
+          tar -xzf /tmp/gitleaks.tar.gz -C /tmp gitleaks
+          sudo install -m 0755 /tmp/gitleaks /usr/local/bin/gitleaks
+          gitleaks version
+      - name: Gitleaks
+        run: gitleaks detect --source . -c .gitleaks.toml --no-banner
+
   bridge-tests:
     runs-on: ubuntu-latest
     strategy:
@@ -34,17 +68,23 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r bridge/requirements.txt
-          pip install pytest
+          pip install pytest pytest-cov
       - name: Expose bridge as the telegram_bot package
         # Mirrors start.sh's ensure_package_link: the code lives in bridge/ but is
         # imported as `telegram_bot`, so symlink it onto the interpreter's site-packages.
         run: |
           sp="$(python -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
           ln -sfn "$GITHUB_WORKSPACE/bridge" "$sp/telegram_bot"
-      - name: Run bridge tests
+      - name: Run bridge tests with coverage
         working-directory: bridge
         env:
           TMPDIR: ${{ runner.temp }}/ccc-tmp
         run: |
           mkdir -p "$TMPDIR"
-          python -m pytest -q
+          python -m pytest -q --cov=telegram_bot --cov-report=term --cov-report=xml
+      - name: Upload bridge coverage artifact
+        if: matrix.python-version == '3.12'
+        uses: actions/upload-artifact@v4
+        with:
+          name: bridge-coverage
+          path: bridge/coverage.xml

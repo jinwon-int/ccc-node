@@ -115,7 +115,6 @@ class EntityPartHeaderTests(unittest.TestCase):
     @needs_lib
     def test_offset_shift_is_utf16_aware_for_ascii_marker(self):
         import telegramify_markdown as tm
-        from telegram import MessageEntity
 
         # ASCII-only marker — UTF-16 length must equal the string length so the
         # shifted offset is byte-for-byte addressable on Telegram's side.

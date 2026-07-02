@@ -1,7 +1,5 @@
 """Tests for utils.tg_md — Markdown -> Telegram MarkdownV2 rendering."""
 
-import importlib
-
 import pytest
 
 from telegram_bot.utils import tg_md

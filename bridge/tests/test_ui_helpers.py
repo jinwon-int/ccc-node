@@ -111,15 +111,15 @@ class KeyboardTest(unittest.TestCase):
         kb = ui.build_history_keyboard(messages, page=0, page_size=10)
         labels = [b.text for row in kb.inline_keyboard for b in row]
         # First page: no "Previous", has "Next".
-        self.assertFalse(any("Previous" in l for l in labels))
-        self.assertTrue(any("Next" in l for l in labels))
+        self.assertFalse(any("Previous" in label for label in labels))
+        self.assertTrue(any("Next" in label for label in labels))
 
     def test_history_keyboard_pagination_middle_page(self):
         messages = [{"index": i, "timestamp": "", "content": f"m{i}"} for i in range(25)]
         kb = ui.build_history_keyboard(messages, page=1, page_size=10)
         labels = [b.text for row in kb.inline_keyboard for b in row]
-        self.assertTrue(any("Previous" in l for l in labels))
-        self.assertTrue(any("Next" in l for l in labels))
+        self.assertTrue(any("Previous" in label for label in labels))
+        self.assertTrue(any("Next" in label for label in labels))
 
     def test_history_keyboard_select_callback(self):
         messages = [{"index": 7, "timestamp": "", "content": "hello"}]
