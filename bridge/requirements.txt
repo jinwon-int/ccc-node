@@ -4,7 +4,7 @@ python-dotenv>=1.0.0
 pydantic>=2.0.0
 pydantic-settings>=2.2.0
 claude-agent-sdk>=0.1.72
-opentelemetry-api>=1.41.0
+opentelemetry-api>=1.43.0
 opentelemetry-sdk>=1.41.0
 openai>=1.0.0
 # Optional: the Volcengine TOS voice-upload provider needs the `tos` package,
