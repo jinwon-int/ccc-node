@@ -30,7 +30,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install ruff mypy
-          pip install -r bridge/requirements.txt
+          pip install -e "bridge[dev]"
       - name: Ruff
         run: ruff check .
       - name: Mypy (focused subset)
@@ -64,17 +64,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-      - name: Install bridge dependencies
+      - name: Install bridge
         run: |
           python -m pip install --upgrade pip
-          pip install -r bridge/requirements.txt
-          pip install pytest pytest-cov
-      - name: Expose bridge as the telegram_bot package
-        # Mirrors start.sh's ensure_package_link: the code lives in bridge/ but is
-        # imported as `telegram_bot`, so symlink it onto the interpreter's site-packages.
-        run: |
-          sp="$(python -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
-          ln -sfn "$GITHUB_WORKSPACE/bridge" "$sp/telegram_bot"
+          pip install -e "bridge[dev]"
       - name: Run bridge tests with coverage
         working-directory: bridge
         env:

@@ -1,3 +1,6 @@
+# Compatibility install list for legacy scripts/operators. New installs should
+# prefer `pip install -e .` (or `pip install -e .[dev]` for tests); keep this in
+# sync with bridge/pyproject.toml until all nodes have migrated.
 python-telegram-bot>=20.7
 telegramify-markdown>=0.5.0
 python-dotenv>=1.0.0
