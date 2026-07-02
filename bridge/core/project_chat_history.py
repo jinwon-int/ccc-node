@@ -10,9 +10,10 @@ logger = logging.getLogger(__name__)
 
 
 def _conversations_dir() -> Path:
-    """Read the compatibility constant from project_chat at call time."""
-    from telegram_bot.core import project_chat
+    """Read the active project_chat module compatibility constant at call time."""
+    import sys
 
+    project_chat = sys.modules["telegram_bot.core.project_chat"]
     return project_chat.CONVERSATIONS_DIR
 
 
