@@ -61,6 +61,7 @@ out="$(run_doctor "$clean")"; rc=$?
 ok "clean standalone exits 0" '[ "$rc" = 0 ]'
 ok "clean output reports 정상" 'grep -q "정상" <<<"$out"'
 ok "clean output reports standalone mode" 'grep -q "mode.*standalone" <<<"$out"'
+ok "clean output reports harness version" 'grep -q "harness version" <<<"$out"'
 
 plugin="$(make_fixture plugin plugin)"
 out="$(run_doctor "$plugin")"; rc=$?

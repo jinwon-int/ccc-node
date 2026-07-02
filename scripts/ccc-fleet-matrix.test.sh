@@ -12,9 +12,12 @@ ok() { if eval "$2"; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $
 
 cat > "$TMP/doctor.txt" <<'EOF'
 ===== dungae =====
-{"ok":true,"checks":[{"status":"정상"}]}
+{"ok":true,"harnessVersion":"v0.1.0-2-gabc1234","checks":[{"status":"정상"}]}
 ===== nosuk =====
-{"ok":true,"checks":[{"status":"경고","reason":"stale cache"}]}
+# ccc doctor
+- harness version: `v0.1.0-dirty`
+
+경고: stale cache
 ===== soonwook =====
 permission denied
 EOF
@@ -22,6 +25,7 @@ EOF
 out="$(bash "$ROOT/scripts/ccc-doctor-fleet-matrix.sh" --evidence "$TMP/doctor.txt" --node-list dungae,nosuk,soonwook --json)"; rc=$?
 ok "doctor matrix emits JSON" '[ "$rc" = 0 ] && jq -e ".kind == \"ccc-doctor-fleet-matrix\" and .mutations.serviceRestart == false and .mutations.secretRead == false" <<<"$out" >/dev/null'
 ok "doctor matrix classifies Korean statuses" 'jq -e ".nodes[] | select(.node == \"dungae\" and .status == \"정상\")" <<<"$out" >/dev/null && jq -e ".nodes[] | select(.node == \"nosuk\" and .status == \"경고\")" <<<"$out" >/dev/null && jq -e ".nodes[] | select(.node == \"soonwook\" and .status == \"수동필요\")" <<<"$out" >/dev/null'
+ok "doctor matrix includes harness versions" 'jq -e ".nodes[] | select(.node == \"dungae\" and .version == \"v0.1.0-2-gabc1234\")" <<<"$out" >/dev/null && jq -e ".nodes[] | select(.node == \"nosuk\" and .version == \"v0.1.0-dirty\")" <<<"$out" >/dev/null'
 
 cat > "$TMP/security.txt" <<'EOF'
 ===== daegyo =====
