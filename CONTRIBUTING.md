@@ -24,3 +24,16 @@ into ordinary contribution PRs: visibility changes, release/tag/package publish,
 production deploy/restart/reload, database mutation, provider/Telegram live
 sends, credential movement, force-push/history rewrite, or other destructive
 operations.
+
+## Release policy
+
+- Version tags use `v0.MINOR.PATCH` until the harness reaches a stable 1.0
+  contract. Use MINOR for user-visible features/behavior changes and PATCH for
+  fixes, docs, and tooling-only bundles.
+- Cut releases in trains, not on every merge. Prefer tagging after a meaningful
+  issue bundle lands, with a practical upper bound of one release train per week.
+- Before tagging, move completed notes from `CHANGELOG.md` `Unreleased` into a
+  dated version section, run the local checks above, and verify
+  `scripts/ccc-version.sh` resolves the intended tag after `git fetch --tags`.
+- Creating/pushing tags and GitHub Releases is a separate release approval gate;
+  do not do it as part of a normal PR without explicit operator approval.
