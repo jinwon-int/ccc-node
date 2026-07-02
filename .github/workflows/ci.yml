@@ -38,6 +38,8 @@ jobs:
         env:
           PYTHONPATH: ${{ github.workspace }}/.github/pythonpath
         run: mypy
+      - name: CI pip hash pinning regression
+        run: python -m pytest -q tests/test_ci_pip_hash_pinning.py
 
   secret-scan:
     runs-on: ubuntu-latest
