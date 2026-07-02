@@ -1,0 +1,31 @@
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W"]
+# Keep the first CI gate focused on pycodestyle/pyflakes correctness. Import
+# sorting, pyupgrade rewrites, bugbear, simplify, and broad line wrapping are
+# intentionally deferred so this PR does not create repo-wide churn before the
+# bridge refactor/packaging work.
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+# These files deliberately patch sys.modules/sys.path or bootstrap the script
+# before importing runtime modules; keep the exception scoped and auditable.
+"bridge/tests/test_duration_log.py" = ["E402"]
+"bridge/tests/test_heartbeat_format.py" = ["E402"]
+"scripts/agent_cron.py" = ["E402"]
+
+[tool.mypy]
+python_version = "3.11"
+warn_unused_ignores = true
+no_implicit_optional = true
+ignore_missing_imports = true
+mypy_path = "bridge"
+files = [
+  "bridge/core/paths.py",
+  "bridge/core/push_notifier.py",
+  "bridge/core/task_queue.py",
+  "scripts/agent_cron_lib.py",
+]
