@@ -10,10 +10,12 @@ on:
 
 permissions:
   contents: read
-  security-events: write
 
 jobs:
   analyze:
+    permissions:
+      contents: read
+      security-events: write
     name: Analyze Python
     runs-on: ubuntu-latest
     strategy:
