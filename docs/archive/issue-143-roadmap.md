@@ -1,5 +1,7 @@
 # Issue #143 A2A roadmap matrix
 
+> Historical record. Current install/ops docs live in [`../README.md`](../README.md), [`../harness.md`](../harness.md), [`../doctor.md`](../doctor.md), and [`../memory.md`](../memory.md).
+
 This document turns the broad repo-evaluation issue into explicit follow-up
 tracks without claiming every recommendation is already implemented.
 

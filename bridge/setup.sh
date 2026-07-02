@@ -514,41 +514,32 @@ else
     echo -e "${GREEN}✅ Virtual environment created${NC}"
 fi
 
-# Install dependencies
+# Install dependencies and editable package
 echo "📦 Installing Python dependencies (this may take a minute)..."
 "$VENV_DIR/bin/pip" install -q --upgrade pip
 "$VENV_DIR/bin/pip" install -q -r "$REQ_FILE"
+"$VENV_DIR/bin/pip" install -q -e "$SCRIPT_DIR"
 
 # Save hash for future checks
 REQ_HASH_FILE="$VENV_DIR/.req_hash"
-REQ_HASH="$(md5 -q "$REQ_FILE" 2>/dev/null || md5sum "$REQ_FILE" | cut -d' ' -f1)"
+REQ_HASH="$("$VENV_DIR/bin/python" - "$REQ_FILE" "$SCRIPT_DIR/pyproject.toml" <<'PY'
+import hashlib, pathlib, sys
+h = hashlib.sha256()
+for name in sys.argv[1:]:
+    h.update(pathlib.Path(name).read_bytes())
+    h.update(b"\0")
+print(h.hexdigest())
+PY
+)"
 echo "$REQ_HASH" > "$REQ_HASH_FILE"
 
 echo -e "${GREEN}✅ All Python dependencies installed${NC}"
 echo ""
 
-# Make the package importable as `telegram_bot`.
-# start.sh launches the bot via `python -m telegram_bot`, but the package code
-# lives in this repo dir (named `bridge`, not `telegram_bot`). We expose it with a
-# single self-contained symlink INSIDE the venv's site-packages — which is already
-# on sys.path — so:
-#   - no `.pth` file and no symlink in the parent dir are needed (parent stays clean,
-#     and the parent git repo no longer shows an untracked `telegram_bot` link);
-#   - it is recreated automatically whenever the venv is rebuilt;
-#   - `venv/` is gitignored, so this never pollutes git status.
-# This is the durable fix for the cutover failure where `python -m telegram_bot`
-# could not be imported (the link had to be created by hand at runtime).
-echo "📦 Linking package for 'python -m telegram_bot'..."
-SITE_PACKAGES="$("$VENV_DIR/bin/python" -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])' 2>/dev/null)"
-if [ -n "$SITE_PACKAGES" ] && [ -d "$SITE_PACKAGES" ]; then
-    ln -sfn "$SCRIPT_DIR" "$SITE_PACKAGES/telegram_bot"
-    if "$VENV_DIR/bin/python" -c "import telegram_bot" 2>/dev/null; then
-        echo -e "${GREEN}✅ Package importable as 'telegram_bot'${NC}"
-    else
-        echo -e "${YELLOW}⚠️  Created link but 'import telegram_bot' failed — check $SITE_PACKAGES/telegram_bot${NC}"
-    fi
+if "$VENV_DIR/bin/python" -c "import telegram_bot" 2>/dev/null; then
+    echo -e "${GREEN}✅ Package importable as 'telegram_bot'${NC}"
 else
-    echo -e "${YELLOW}⚠️  Could not resolve site-packages; skipped package link${NC}"
+    echo -e "${YELLOW}⚠️  Editable install completed but 'import telegram_bot' failed${NC}"
 fi
 echo ""
 

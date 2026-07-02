@@ -1,0 +1,43 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  github-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Extract release notes
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          tag = os.environ['TAG']
+          text = Path('CHANGELOG.md').read_text(encoding='utf-8')
+          headings = [i for i, line in enumerate(text.splitlines()) if line.startswith('## ')]
+          lines = text.splitlines()
+          start = None
+          for idx in headings:
+              if tag in lines[idx] or tag.lstrip('v') in lines[idx]:
+                  start = idx
+                  break
+          if start is None:
+              start = headings[0] if headings else 0
+          later = [idx for idx in headings if idx > start]
+          end = later[0] if later else len(lines)
+          notes = '\n'.join(lines[start:end]).strip() or f'Release {tag}'
+          Path('release-notes.md').write_text(notes + '\n', encoding='utf-8')
+          PY
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: gh release create "$TAG" --title "$TAG" --notes-file release-notes.md --verify-tag

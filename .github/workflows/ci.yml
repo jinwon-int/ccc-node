@@ -23,14 +23,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
       - name: Install lint tools
         run: |
           python -m pip install --upgrade pip
           pip install ruff mypy
-          pip install -r bridge/requirements.txt
+          pip install -e "bridge[dev]"
       - name: Ruff
         run: ruff check .
       - name: Mypy (focused subset)
@@ -61,20 +61,13 @@ jobs:
         python-version: ["3.11", "3.12"]
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}
-      - name: Install bridge dependencies
+      - name: Install bridge
         run: |
           python -m pip install --upgrade pip
-          pip install -r bridge/requirements.txt
-          pip install pytest pytest-cov
-      - name: Expose bridge as the telegram_bot package
-        # Mirrors start.sh's ensure_package_link: the code lives in bridge/ but is
-        # imported as `telegram_bot`, so symlink it onto the interpreter's site-packages.
-        run: |
-          sp="$(python -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
-          ln -sfn "$GITHUB_WORKSPACE/bridge" "$sp/telegram_bot"
+          pip install -e "bridge[dev]"
       - name: Run bridge tests with coverage
         working-directory: bridge
         env:
@@ -84,7 +77,7 @@ jobs:
           python -m pytest -q --cov=telegram_bot --cov-report=term --cov-report=xml
       - name: Upload bridge coverage artifact
         if: matrix.python-version == '3.12'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: bridge-coverage
           path: bridge/coverage.xml

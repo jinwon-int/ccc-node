@@ -92,6 +92,16 @@ valid_scope || { echo "unsupported --scope: $SCOPE" >&2; exit 2; }
 json_ok() { jq -e . "$1" >/dev/null 2>&1; }
 json_has() { jq -e "$2" "$1" >/dev/null 2>&1; }
 
+harness_version() {
+  if [ -x "$REPO/scripts/ccc-version.sh" ]; then
+    CCC_VERSION_REPO_DIR="$REPO" "$REPO/scripts/ccc-version.sh" 2>/dev/null || printf 'unknown\n'
+  elif git -C "$REPO" describe --tags --dirty --always >/dev/null 2>&1; then
+    git -C "$REPO" describe --tags --dirty --always
+  else
+    printf 'unknown\n'
+  fi
+}
+
 mode="unknown"
 settings_valid=0
 if [ ! -f "$SETTINGS" ]; then
@@ -218,6 +228,7 @@ fi
 print_report() {
   printf '# ccc doctor\n\n'
   printf -- '- repo: `%s`\n' "$REPO"
+  printf -- '- harness version: `%s`\n' "$(harness_version)"
   printf -- '- claude dir: `%s`\n' "$CLAUDE_DIR"
   printf -- '- mode: `%s`\n\n' "$mode"
   printf '## 진단 요약\n\n'

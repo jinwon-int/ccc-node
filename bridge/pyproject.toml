@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ccc-telegram-bridge"
+version = "0.1.0"
+description = "Telegram bridge for ccc-node Claude Code harnesses"
+requires-python = ">=3.11"
+dependencies = [
+  "python-telegram-bot>=20.7",
+  "telegramify-markdown>=0.5.0",
+  "python-dotenv>=1.0.0",
+  "pydantic>=2.0.0",
+  "pydantic-settings>=2.2.0",
+  "claude-agent-sdk>=0.1.72",
+  "opentelemetry-api>=1.41.0",
+  "opentelemetry-sdk>=1.41.0",
+  "openai>=1.0.0",
+]
+
+[project.optional-dependencies]
+# Mirrors requirements-voice.txt. Keep the extra small because the TOS uploader
+# imports this optional native dependency lazily and many nodes do not need it.
+voice = ["tos"]
+dev = ["pytest", "pytest-cov"]
+
+[tool.setuptools]
+package-dir = {"telegram_bot" = "."}
+packages = [
+  "telegram_bot",
+  "telegram_bot.core",
+  "telegram_bot.interaction",
+  "telegram_bot.session",
+  "telegram_bot.skills",
+  "telegram_bot.utils",
+]
+# There is no telegram_bot.hooks Python package in bridge/ today; repository
+# hook scripts live under the top-level claude/hooks/ and are validated by
+# scripts/validate-harness.sh rather than packaged into the Telegram bridge.

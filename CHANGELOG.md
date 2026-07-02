@@ -4,6 +4,17 @@ All notable changes to the Claude Code node harness. Dates are KST.
 
 ## [Unreleased]
 
+### Added
+- Tag-based versioning preparation for #251: `scripts/ccc-version.sh`, ccc-doctor
+  harness-version reporting, fleet-matrix version extraction, release workflow,
+  and CONTRIBUTING release policy. Actual tag/Release publishing remains a
+  separate operator approval gate.
+
+### Notes
+- Future release tags should be `v0.MINOR.PATCH`. Historical changelog headings
+  without a leading `v` are preserved as-is; the release workflow accepts either
+  tagged (`v0.4.0`) or historical (`0.3.18`) headings when extracting notes.
+
 Distill observability follow-up — closes #130, #133.
 
 A2A mobile native worker first slice — refs #150.

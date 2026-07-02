@@ -79,6 +79,22 @@ def classify(body):
         return ('경고', 'warnings_present')
     return ('수동필요', 'unclassified_output')
 
+def extract_version(body):
+    if not body:
+        return None
+    try:
+        obj = json.loads(body)
+        for key in ('harnessVersion', 'harness_version', 'version'):
+            if isinstance(obj, dict) and obj.get(key):
+                return str(obj[key])
+    except Exception:
+        pass
+    m = re.search(r'harness version:\s*`?([^`\n]+)`?', body, re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+    m = re.search(r'\bversion[:=]\s*`?([^`\s]+)`?', body, re.IGNORECASE)
+    return m.group(1).strip() if m else None
+
 nodes = []
 seen = set()
 for name in known + [n for n in blocks if n not in known]:
@@ -89,6 +105,7 @@ for name in known + [n for n in blocks if n not in known]:
     status, reason = classify(body)
     nodes.append({
         'node': name,
+        'version': extract_version(body),
         'status': status,
         'reason': reason,
         'evidencePresent': bool(body),
