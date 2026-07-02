@@ -143,7 +143,9 @@ run "cp '$SRC/claude/hooks/evidence-gate.sh'  '$CLAUDE_DIR/hooks/evidence-gate.s
 run "cp '$SRC/claude/hooks/statusline.sh'     '$CLAUDE_DIR/hooks/statusline.sh'"
 # Memory helper tools used by load-memory.sh / refresh-memory.sh in standalone installs.
 run "cp '$SRC/scripts/ccc-memory-index.sh'    '$CLAUDE_DIR/hooks/ccc-memory-index.sh'"
+run "cp '$SRC/scripts/ccc_memory_index.py'    '$CLAUDE_DIR/hooks/ccc_memory_index.py'"
 run "cp '$SRC/scripts/ccc-memory-search.sh'   '$CLAUDE_DIR/hooks/ccc-memory-search.sh'"
+run "cp '$SRC/scripts/ccc_memory_search.py'   '$CLAUDE_DIR/hooks/ccc_memory_search.py'"
 run "cp '$SRC/scripts/ccc-memory-consolidate.sh' '$CLAUDE_DIR/hooks/ccc-memory-consolidate.sh'"
 run "cp '$SRC/scripts/ccc-memory-query.sh'    '$CLAUDE_DIR/hooks/ccc-memory-query.sh'"
 run "cp '$SRC/scripts/ccc-memory-check.sh'    '$CLAUDE_DIR/hooks/ccc-memory-check.sh'"
