@@ -27,9 +27,10 @@ logger = logging.getLogger(__name__)
 
 
 def _process_timeout() -> int:
-    """Read the compatibility constant from project_chat at call time."""
-    from telegram_bot.core import project_chat
+    """Read the active project_chat module compatibility constant at call time."""
+    import sys
 
+    project_chat = sys.modules["telegram_bot.core.project_chat"]
     return getattr(project_chat, "PROCESS_TIMEOUT", 21600)
 
 
