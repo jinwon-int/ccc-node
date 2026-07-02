@@ -7,7 +7,6 @@ import types
 from typing import Any, Dict, Optional
 from datetime import datetime, timezone
 
-import telegram.error
 from telegram import (
     Update,
     Message,
@@ -45,6 +44,8 @@ STALE_MESSAGE_SECONDS = 20 * 60  # 20 minutes
 
 from telegram_bot.core.bot_shared import _PollingRestart, enforce_access_control  # noqa: F401
 from telegram_bot.core import bot_lifecycle as _bot_lifecycle_module
+from telegram_bot.core import bot_status as _bot_status_module
+from telegram_bot.core.bot_status import BotStatusMixin
 from telegram_bot.core import bot_access as _bot_access_module
 from telegram_bot.core.bot_access import BotAccessMixin
 from telegram_bot.core.bot_lifecycle import BotLifecycleMixin
@@ -58,6 +59,7 @@ from telegram_bot.core.bot_voice import BotVoiceMixin
 
 _EXTRACTED_MODULES = (
     _bot_lifecycle_module,
+    _bot_status_module,
     _bot_access_module,
     _bot_commands_module,
     _bot_delivery_module,
@@ -94,7 +96,7 @@ _sync_extracted_modules()
 sys.modules[__name__].__class__ = _BotModule
 
 
-class TelegramBot(BotLifecycleMixin, BotAccessMixin, BotCommandMixin, BotDeliveryMixin, BotVoiceMixin):
+class TelegramBot(BotLifecycleMixin, BotStatusMixin, BotAccessMixin, BotCommandMixin, BotDeliveryMixin, BotVoiceMixin):
 
     def __init__(self):
         self._config = config
@@ -114,34 +116,6 @@ class TelegramBot(BotLifecycleMixin, BotAccessMixin, BotCommandMixin, BotDeliver
         self._volcengine_tos_uploader: Optional[VolcengineTOSUploader] = None
         self._tts_synthesizer: Optional[MacOSTtsSynthesizer] = None
 
-    def _make_status_callback(self, bot: Any, chat_id: int):
-        """Build a fail-open send/edit/delete callback for task heartbeat messages."""
-
-        async def status_callback(text: Optional[str], message_id: Optional[int] = None) -> Optional[int]:
-            try:
-                if text is None:
-                    if message_id is not None and getattr(config, "heartbeat_delete_on_done", True):
-                        await bot.delete_message(chat_id=chat_id, message_id=message_id)
-                    return None
-                if message_id is not None:
-                    try:
-                        await bot.edit_message_text(
-                            chat_id=chat_id,
-                            message_id=message_id,
-                            text=text,
-                        )
-                    except telegram.error.BadRequest as exc:
-                        if "message is not modified" not in str(exc).lower():
-                            raise
-                    return message_id
-                sent = await bot.send_message(chat_id=chat_id, text=text)
-                value = getattr(sent, "message_id", None)
-                return value if isinstance(value, int) else None
-            except Exception as exc:
-                logger.warning("Heartbeat status callback failed: %s", type(exc).__name__)
-                return message_id
-
-        return status_callback
 
     # Available models for /model command (aliases, CLI resolves via env vars)
     MODELS = [
