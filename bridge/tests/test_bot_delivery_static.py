@@ -1,4 +1,4 @@
-"""Static guards on the non-streaming delivery path in ``core/bot.py``.
+"""Static guards on the non-streaming delivery path in ``core/bot_delivery.py``.
 
 Regression context: live streaming is opt-in (default off via
 ``CCC_TELEGRAM_STREAMING``), so normal replies go through
@@ -8,7 +8,7 @@ so once streaming defaulted off every reply skipped it and lost its mobile
 readability formatting. These static checks assert the renderer stays wired
 into the non-streaming path so the regression cannot silently return.
 
-``core/bot.py`` cannot be imported in the CI test environment (it eagerly
+``core/bot_delivery.py`` cannot be imported in the CI test environment (it eagerly
 constructs config-backed singletons that need a live PROJECT_ROOT), so we assert
 on the source text — the same approach used by ``test_start_script_static.py``.
 """
@@ -18,7 +18,7 @@ import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
-BOT_PY = ROOT / "core" / "bot.py"
+BOT_PY = ROOT / "core" / "bot_delivery.py"
 
 
 def _bot_text() -> str:
@@ -26,10 +26,10 @@ def _bot_text() -> str:
 
 
 class DeliverMarkdownRendererWiringTests(unittest.TestCase):
-    def test_bot_imports_tg_readable(self):
+    def test_delivery_imports_tg_readable(self):
         self.assertIn("from telegram_bot.utils import tg_readable", _bot_text())
 
-    def test_bot_imports_tg_entities(self):
+    def test_delivery_imports_tg_entities(self):
         self.assertIn("from telegram_bot.utils import tg_entities", _bot_text())
 
     def test_deliver_markdown_tries_entity_renderer_before_markdownv2(self):
