@@ -109,7 +109,19 @@ TypingCallback = Callable[[], Awaitable[Any]]
 # None the existing heartbeat message should be deleted/cleared.
 StatusCallback = Callable[[Optional[str], Optional[int]], Awaitable[Optional[int]]]
 
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning("Ignoring invalid integer env %s=%r; using %s", name, raw, default)
+        return default
+
+
 TYPING_INTERVAL = 4  # Telegram typing status expires after ~5s
+TYPING_MAX_NO_PROGRESS_SECONDS = _env_int("CCC_TYPING_MAX_NO_PROGRESS_SECONDS", 600)
 
 
 @dataclass
@@ -141,6 +153,7 @@ class _PendingRequest:
     heartbeat_message_id: Optional[int] = None
     current_tool_label: Optional[str] = None
     last_visible_progress_at: float = 0.0
+    awaiting_permission: bool = False
     heartbeat_forecast_loaded: bool = False
     heartbeat_forecast_ms: Optional[int] = None
     last_assistant_texts: List[str] = field(default_factory=list)
@@ -234,7 +247,11 @@ class ProjectChatHandler:
             if not callback:
                 return PermissionResultAllow()
 
-            result = await callback(req.chat_id, user_id, tool_name, tool_input)
+            req.awaiting_permission = True
+            try:
+                result = await callback(req.chat_id, user_id, tool_name, tool_input)
+            finally:
+                req.awaiting_permission = False
             if isinstance(result, (PermissionResultAllow, PermissionResultDeny)):
                 return result
             return PermissionResultAllow() if result else PermissionResultDeny()
@@ -516,6 +533,23 @@ class ProjectChatHandler:
             max_lines=int(getattr(config, "heartbeat_duration_log_max_lines", 10000)),
         )
 
+    def _should_refresh_typing(self, req: _PendingRequest, now: float) -> bool:
+        """Return whether Telegram typing should still be asserted for a request."""
+        if req.future.done() or req.awaiting_permission:
+            return False
+        # After any visible draft/tool progress, stop typing entirely. Telegram
+        # draft edits do not clear typing; progress/heartbeat should represent
+        # the work from here instead of reasserting a stale chat action.
+        if req.last_visible_progress_at > 0:
+            return False
+        if (
+            TYPING_MAX_NO_PROGRESS_SECONDS > 0
+            and req.started_at > 0
+            and now - req.started_at >= TYPING_MAX_NO_PROGRESS_SECONDS
+        ):
+            return False
+        return True
+
     async def _typing_keepalive_loop(
         self, user_id: int, state: _UserStreamState
     ) -> None:
@@ -539,19 +573,15 @@ class ProjectChatHandler:
                 if req.future.done():
                     continue
                 now = asyncio.get_event_loop().time()
-                # Stop refreshing typing once the initial text has been streamed
-                # but no new streaming activity has arrived for 2×TYPING_INTERVAL.
-                # This happens when Claude uses a long-running tool (Bash, Task, …)
-                # after showing its initial reply text — the user can already see
-                # the text, and the heartbeat will take over to advertise progress.
-                if req.last_visible_progress_at > 0 and not has_recent_visible_progress(
-                    now=now,
-                    last_visible_progress_at=req.last_visible_progress_at,
-                    window_seconds=TYPING_INTERVAL * 2,
-                ):
+                if not self._should_refresh_typing(req, now):
                     await self._maybe_update_heartbeat(req, now)
                     continue
                 if req.typing_callback and now - req.last_typing_at >= TYPING_INTERVAL:
+                    # Re-check immediately before the network call to avoid a
+                    # finalize/permission race reasserting typing after completion.
+                    if not self._should_refresh_typing(req, now):
+                        await self._maybe_update_heartbeat(req, now)
+                        continue
                     req.last_typing_at = now
                     try:
                         await req.typing_callback()
@@ -575,7 +605,8 @@ class ProjectChatHandler:
                 now = asyncio.get_event_loop().time()
                 if (
                     req.typing_callback
-                    and not req.future.done()
+                    and not isinstance(msg, ResultMessage)
+                    and self._should_refresh_typing(req, now)
                     and now - req.last_typing_at >= TYPING_INTERVAL
                 ):
                     req.last_typing_at = now
