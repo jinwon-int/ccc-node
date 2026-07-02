@@ -1,5 +1,7 @@
 # Distill fleet closeout guide
 
+> Historical closeout guide. Current distill/memory docs live in [`../memory.md`](../memory.md); current docs index is [`../README.md`](../README.md).
+
 Issue #82 tracks fleet verification of the Session Distiller. Closeout is intentionally conservative because a green result on one node does not prove the rest of the fleet has the same state directory, Honcho reachability, queue/drain behavior, or Claude subprocess behavior.
 
 ## Closeout rule
