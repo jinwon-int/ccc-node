@@ -154,19 +154,67 @@ class TypingKeepaliveTest(unittest.IsolatedAsyncioTestCase):
             "typing must NOT be sent once streaming is idle and text is already shown",
         )
 
-    async def test_typing_continues_during_active_streaming(self):
-        """Typing must continue while the assistant is actively streaming text."""
+    async def test_typing_stops_after_any_visible_progress(self):
+        """Typing stops once the user can see streamed text/tool progress."""
         req = self._make_request(done=False)
-        # Simulate: text was just streamed (recent streaming activity).
         now = asyncio.get_event_loop().time()
         req.last_visible_progress_at = now
         state = _UserStreamState(client=None, model=None, pending=deque([req]))
         await self._start_loop(state)
-        await asyncio.wait_for(self.called.wait(), timeout=2.0)
-        self.assertGreater(
-            self.calls, 0,
-            "typing must continue while streaming is still active",
+        with self.assertRaises(asyncio.TimeoutError):
+            await asyncio.wait_for(self.called.wait(), timeout=0.2)
+        self.assertEqual(
+            self.calls,
+            0,
+            "typing must NOT be sent after visible progress has appeared",
         )
+
+    async def test_typing_skips_permission_wait(self):
+        """Permission prompts wait for the user; typing must not imply the bot is working."""
+        req = self._make_request(done=False)
+        req.awaiting_permission = True
+        state = _UserStreamState(client=None, model=None, pending=deque([req]))
+        await self._start_loop(state)
+        with self.assertRaises(asyncio.TimeoutError):
+            await asyncio.wait_for(self.called.wait(), timeout=0.2)
+        self.assertEqual(self.calls, 0)
+
+    async def test_typing_stops_after_no_progress_cap(self):
+        req = self._make_request(done=False)
+        orig_cap = project_chat.TYPING_MAX_NO_PROGRESS_SECONDS
+        setattr(project_chat, "TYPING_MAX_NO_PROGRESS_SECONDS", 0.02)
+        self.addCleanup(setattr, project_chat, "TYPING_MAX_NO_PROGRESS_SECONDS", orig_cap)
+        req.started_at = asyncio.get_event_loop().time() - 1.0
+        state = _UserStreamState(client=None, model=None, pending=deque([req]))
+        await self._start_loop(state)
+        with self.assertRaises(asyncio.TimeoutError):
+            await asyncio.wait_for(self.called.wait(), timeout=0.2)
+        self.assertEqual(self.calls, 0)
+
+    def test_invalid_typing_cap_env_falls_back(self):
+        self.assertEqual(project_chat._env_int("MISSING_CCC_TEST_INT", 600), 600)
+        with self.assertLogs(project_chat.logger, level="WARNING"):
+            self.assertEqual(project_chat._env_int("PATH", 600), 600)
+
+    async def test_reader_loop_does_not_refresh_typing_for_result_message(self):
+        class _OneResultClient:
+            async def receive_messages(self):
+                yield project_chat.ResultMessage(
+                    subtype="success",
+                    duration_ms=1,
+                    duration_api_ms=1,
+                    is_error=False,
+                    num_turns=1,
+                    session_id="s1",
+                    result="done",
+                )
+
+        req = self._make_request(done=False)
+        req.last_typing_at = asyncio.get_event_loop().time() - 100
+        state = _UserStreamState(client=_OneResultClient(), model=None, pending=deque([req]))
+        await self.handler._reader_loop(1, state)
+        self.assertEqual(self.calls, 0, "ResultMessage must not reassert typing")
+        self.assertTrue(req.future.done())
 
 
 if __name__ == "__main__":
