@@ -1,0 +1,4 @@
+# CI verification tools installed with hash checking.
+# Runtime/dev bridge dependencies come from bridge/pyproject.toml via pip-compile.
+ruff
+mypy

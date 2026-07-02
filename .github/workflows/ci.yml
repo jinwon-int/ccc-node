@@ -31,12 +31,12 @@ jobs:
           python-version: "3.12"
       - name: Install lint tools
         run: |
-          python -m pip install --upgrade pip
-          pip install ruff mypy
-          pip install -e "bridge[dev]"
+          python -m pip install --require-hashes -r .github/requirements/bridge-ci.txt
       - name: Ruff
         run: ruff check .
       - name: Mypy (focused subset)
+        env:
+          PYTHONPATH: ${{ github.workspace }}/.github/pythonpath
         run: mypy
 
   secret-scan:
@@ -69,12 +69,12 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - name: Install bridge
         run: |
-          python -m pip install --upgrade pip
-          pip install -e "bridge[dev]"
+          python -m pip install --require-hashes -r .github/requirements/bridge-ci.txt
       - name: Run bridge tests with coverage
         working-directory: bridge
         env:
           TMPDIR: ${{ runner.temp }}/ccc-tmp
+          PYTHONPATH: ${{ github.workspace }}/.github/pythonpath
         run: |
           mkdir -p "$TMPDIR"
           python -m pytest -q --cov=telegram_bot --cov-report=term --cov-report=xml
