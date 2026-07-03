@@ -37,6 +37,14 @@ recorded to `~/.claude/state/approval-needed.log`; the bypass is logged to stder
   ambiguous/bare (no explicit dst, `HEAD`, current branch), uses multiple refspecs, or is
   part of a compound/chained command. Fail-closed: when the destination can't be parsed
   unambiguously, it is denied.
+- **Self-update relaxation** (operator-approved procedure, not a loosened gate): the
+  fixed maintenance script `~/.claude/hooks/ccc-self-update.sh` (pull → setup.sh →
+  restart of operator-allowlisted units, fail-closed preconditions, audit + rollback)
+  runs autonomously — approval happened at PR review time. Its blast-radius boundary,
+  `~/.claude/self-update.services` / `self-update.repo`, is write-gated for agents
+  (`self-update-config`, Edit/Write tools and shell redirect/copy verbs); reads stay
+  allowed. Direct broker/Gateway/worker service control remains gated. See
+  `docs/self-update.md`.
 - Fail-closed: if a pattern is uncertain, prefer gating. Patterns are covered by
   `guard.test.sh` (allow + deny cases, including the force-push relaxation) to avoid
   blocking normal autonomous work.

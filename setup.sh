@@ -169,6 +169,9 @@ run "cp '$SRC/claude/hooks/skill-review/extract.sh' '$CLAUDE_DIR/hooks/skill-rev
 # Skill autosave sweep — covers bridge/SDK sessions that never fire SessionEnd
 # hooks; scheduled separately via scripts/install-skill-autosave-cron.sh.
 run "cp '$SRC/scripts/ccc-skill-autosave.sh' '$CLAUDE_DIR/hooks/ccc-skill-autosave.sh'"
+# Self-update — the pre-approved node maintenance procedure (pull + setup +
+# restart of operator-allowlisted services only; see docs/self-update.md).
+run "cp '$SRC/scripts/ccc-self-update.sh' '$CLAUDE_DIR/hooks/ccc-self-update.sh'"
 run "chmod +x '$CLAUDE_DIR/hooks/'*.sh '$CLAUDE_DIR/hooks/distill/'*.sh '$CLAUDE_DIR/hooks/skill-review/'*.sh"
 # Tier 3: status line (node·model·git·context·cost·A2A) wired via settings.json statusLine.
 # Output style (한국어 구조화 보고) — node-agnostic; settings.json activates it as outputStyle.
