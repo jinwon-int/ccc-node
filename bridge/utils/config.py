@@ -239,16 +239,16 @@ class Config(BaseSettings):
         ),
     )
     spacing_lines: int = Field(
-        default=1,
+        default=2,
         alias="CCC_TELEGRAM_SPACING_LINES",
         description=(
             "Number of blank lines to use for each vertical gap when the readable "
             "renderer normalizes layout: paragraph, section, and (in loose mode) "
             "list-item gaps are all widened to this many blank lines so output is "
             "less dense on mobile. Telegram has no line-height control, so blank "
-            "lines are the only lever. Clamped to [1, 3]. Default 1 (single blank "
-            "line, identical to prior behavior); set CCC_TELEGRAM_SPACING_LINES=2 "
-            "for roomier output. Applies only when the readable renderer is on."
+            "lines are the only lever. Clamped to [1, 3]. Default 2 (roomy); set "
+            "CCC_TELEGRAM_SPACING_LINES=1 for the historical compact single-blank "
+            "layout. Applies only when the readable renderer is on."
         ),
     )
 

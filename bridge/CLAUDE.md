@@ -119,6 +119,7 @@ utils/chat_logger.py Per-session debug chat logging
 | `CCC_TELEGRAM_STREAMING` | No | Master switch for live response streaming / draft editing (default: **false**). Off = replies delivered as complete message(s) when done. Set true to re-enable the live draft |
 | `CCC_PARTIAL_STREAMING` | No | Token-level streaming, only when `CCC_TELEGRAM_STREAMING=true` (default: true). Set false for whole-block draft updates |
 | `CCC_TELEGRAM_LOOSE_SPACING` | No | Insert a blank line between list items for easier reading (default: true). Prose/tables/code untouched. Set false for compact output |
+| `CCC_TELEGRAM_SPACING_LINES` | No | Blank lines per vertical gap (paragraph/section/list-item) in the readable renderer, clamped to [1, 3] (default: 2). Set 1 for the compact single-blank layout |
 | `CCC_TELEGRAM_MAX_BUBBLE_CHARS` | No | Max characters per Telegram message; long replies split into multiple bubbles at this size (default: 1200, clamped to [200, 4000]) |
 | `CCC_TELEGRAM_OPTION_BUTTONS` | No | Render multiple-choice questions as tappable inline buttons (default: **false**). Off = options shown as text, user types their choice |
 | `OPENAI_API_KEY` | Voice only | API key for Whisper transcription |
