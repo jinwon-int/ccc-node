@@ -130,6 +130,11 @@ fi
 # (${CLAUDE_PLUGIN_ROOT}/hooks/) modes. distill/ sub-scripts must sit next to this file.
 HOOKDIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)" || HOOKDIR=${HOME:-/root}/.claude/hooks
 (
+  # Ensure a valid CWD — A2A worker sessions run in /tmp dirs that may be
+  # deleted before this bg process reaches `claude -p`, causing immediate
+  # ENOENT exit (ec=1). Fall back to HOME so the CWD is always stable.
+  cd "${HOME:-/root}" 2>/dev/null || cd / 2>/dev/null || true
+
   export CLAUDE_DISTILL_INFLIGHT=1
   export CLAUDE_DISTILL_TRIGGER="$TRIGGER"
   export CLAUDE_DISTILL_SESSION="$SESSION_ID"
