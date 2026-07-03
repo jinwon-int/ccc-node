@@ -43,6 +43,16 @@ _FENCE_RE = re.compile(r"^\s*```")
 # a space, then content. Used by loose spacing to give each item its own line.
 _LIST_ITEM_RE = re.compile(r"^\s*(?:[-*+•]|\d+[.)])\s+\S")
 
+# Filler for extra gap lines when spacing > 1. The downstream Markdown ->
+# MarkdownV2 / entity converters (telegramify) parse the text into an AST and
+# re-render it, which collapses every run of truly blank lines back to a single
+# blank line (and removes blank lines between list items entirely) — silently
+# undoing any widening done here. A line holding a single NO-BREAK SPACE is a
+# real (invisible) paragraph to the converter, so it survives conversion intact
+# and renders as an empty line in Telegram. The first line of every gap stays a
+# genuine blank line so Markdown block structure is unchanged.
+GAP_FILLER_LINE = "\u00a0"  # NO-BREAK SPACE
+
 
 def _is_list_item(line: str) -> bool:
     return bool(_LIST_ITEM_RE.match(line))
@@ -59,10 +69,14 @@ def to_readable(text: str, loose: bool = False, spacing: int = 1) -> str:
     lines so each item gets its own visual line — prose lines stay attached and
     fenced code is left intact.
 
-    *spacing* sets how many blank lines each vertical gap is normalized to
-    (clamped to [1, 3]). ``spacing=1`` reproduces the historical behavior
-    (every blank run collapses to a single blank line); ``spacing=2`` widens
-    every paragraph/section/list-item gap to two blank lines for roomier output.
+    *spacing* sets how many visually blank lines each vertical gap is
+    normalized to (clamped to [1, 3]). ``spacing=1`` reproduces the historical
+    behavior (every blank run collapses to a single blank line); ``spacing=2``
+    widens every paragraph/section/list-item gap for roomier output. Gaps wider
+    than one line are emitted as one real blank line plus ``spacing - 1``
+    invisible :data:`GAP_FILLER_LINE` lines so the extra space survives the
+    downstream Markdown -> MarkdownV2 / entity conversion, which collapses runs
+    of truly blank lines.
 
     Fail-open: on any unexpected error the original *text* is returned unchanged.
     """
@@ -159,12 +173,14 @@ def _transform(text: str, loose: bool = False, spacing: int = 1) -> str:
             loose_lines.append(line)
         pass2 = loose_lines
 
-    # Pass 3: normalize every run of blank lines (outside fences) to exactly
-    # `spacing` blank lines. With spacing=1 this is the historical "collapse to a
-    # single blank line"; with spacing>1 each paragraph/section/list-item gap is
-    # widened uniformly. Leading/trailing runs are trimmed by the final strip, so
-    # interior gaps are the only ones widened — soft-wrapped lines with no blank
-    # between them stay attached.
+    # Pass 3: normalize every run of blank lines (outside fences) to exactly one
+    # real blank line plus `spacing - 1` GAP_FILLER_LINE lines. With spacing=1
+    # this is the historical "collapse to a single blank line"; with spacing>1
+    # each paragraph/section/list-item gap gains invisible filler lines that
+    # survive the downstream Markdown -> MarkdownV2 / entity conversion (which
+    # collapses runs of truly blank lines — see GAP_FILLER_LINE). Leading and
+    # trailing runs are trimmed at the end, so interior gaps are the only ones
+    # widened — soft-wrapped lines with no blank between them stay attached.
     in_fence = False
     pass3: list[str] = []
     i = 0
@@ -177,7 +193,8 @@ def _transform(text: str, loose: bool = False, spacing: int = 1) -> str:
             i += 1
             continue
         if not in_fence and line.strip() == "":
-            # Consume the whole blank run, then emit exactly `spacing` blanks.
+            # Consume the whole blank run (NBSP filler counts as blank, which
+            # keeps the transform idempotent), then emit the canonical gap.
             j = i
             while (
                 j < n
@@ -185,14 +202,21 @@ def _transform(text: str, loose: bool = False, spacing: int = 1) -> str:
                 and pass2[j].strip() == ""
             ):
                 j += 1
-            pass3.extend([""] * spacing)
+            pass3.append("")
+            pass3.extend([GAP_FILLER_LINE] * (spacing - 1))
             i = j
         else:
             pass3.append(line)
             i += 1
 
-    # Trim leading/trailing blank lines without disturbing interior content.
-    return "\n".join(pass3).strip("\n")
+    # Trim leading/trailing blank lines (including NBSP filler, which is
+    # whitespace to str.strip) without disturbing interior content.
+    start, end = 0, len(pass3)
+    while start < end and pass3[start].strip() == "":
+        start += 1
+    while end > start and pass3[end - 1].strip() == "":
+        end -= 1
+    return "\n".join(pass3[start:end])
 
 
 # Headroom (UTF-16 units) reserved so a part marker like "*12/12*\n" can never

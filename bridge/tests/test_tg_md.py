@@ -65,6 +65,24 @@ def test_heading_emoji_stripped():
 
 
 @needs_lib
+def test_readable_spacing_gap_survives_conversion():
+    # The readable renderer widens gaps with an invisible NBSP filler line
+    # precisely because this converter collapses runs of truly blank lines.
+    # Guard the contract end-to-end: a spacing=2 gap must still be visible
+    # (one blank line + one NBSP line) after MarkdownV2 conversion.
+    from telegram_bot.utils.tg_readable import GAP_FILLER_LINE, to_readable
+
+    out = tg_md.to_markdownv2(to_readable("para one\n\npara two", spacing=2))
+    assert f"\n\n{GAP_FILLER_LINE}\n" in out
+    # Loose list items keep their filler line too (the converter would render
+    # a plain loose list with no blank between items at all).
+    out = tg_md.to_markdownv2(
+        to_readable("- item one\n- item two", loose=True, spacing=2)
+    )
+    assert GAP_FILLER_LINE in out
+
+
+@needs_lib
 def test_long_content_splits_within_limit():
     md = "\n\n".join(f"paragraph {i} with text" for i in range(800))
     out = tg_md.to_markdownv2(md)
