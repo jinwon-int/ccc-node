@@ -5,9 +5,19 @@
 # Auto-PR is intentionally NOT done here (human gate per TM-1058).
 #
 # De-dup: each candidate's title (lowercased, trimmed) is hashed; we maintain a
-# .seen file with a 7-day TTL window. The canonical format is:
+# .seen file with a TTL window (CCC_DISTILL_SEEN_TTL_DAYS, default 7 days).
+# The canonical format is:
 #   <first_epoch> <last_epoch> <count> <hash>
 # Legacy lines are accepted as either `<epoch> <hash>` or `<hash>`.
+#
+# Noise controls (GitHub issue #298):
+#   - at most CCC_DISTILL_MAX_WIKI_CANDS (default 3) candidates are queued per
+#     session; the extractor prompt asks for the same cap, this is the
+#     deterministic backstop.
+#   - `wiki-queue.sh --compact` retroactively de-duplicates PENDING queue
+#     entries with the same title_hash() bucket (entries queued before the
+#     issue-anchored hashing existed), keeping only the newest per bucket, and
+#     refreshes .seen so the surviving topics stay suppressed.
 set -uo pipefail
 
 STATE_DIR="${CCC_STATE_DIR:-${HOME:-/root}/.claude/state}"
@@ -31,11 +41,20 @@ EOF
 fi
 
 NOW_EPOCH="$(date -u +%s)"
-CUTOFF_EPOCH="$(date -u -d '7 days ago' +%s 2>/dev/null || echo 0)"
+# Dedup memory TTL: how long a queued topic suppresses re-extraction. Longer
+# values reduce weekly re-queueing of long-running topics (issue #298).
+SEEN_TTL_DAYS="${CCC_DISTILL_SEEN_TTL_DAYS:-7}"
+case "$SEEN_TTL_DAYS" in ''|*[!0-9]*) SEEN_TTL_DAYS=7 ;; esac
+[ "$SEEN_TTL_DAYS" -lt 1 ] && SEEN_TTL_DAYS=7
+CUTOFF_EPOCH="$(date -u -d "$SEEN_TTL_DAYS days ago" +%s 2>/dev/null || echo 0)"
+# Review-staleness marker stays at a fixed 7 days (independent of dedup TTL).
 STALE_CUTOFF_ISO="$(date -u -d '7 days ago' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || printf '0000-00-00T00:00:00Z')"
 HOTNESS_THRESHOLD="${CCC_DISTILL_HOTNESS_THRESHOLD:-3}"
 case "$HOTNESS_THRESHOLD" in ''|*[!0-9]*) HOTNESS_THRESHOLD=3 ;; esac
 [ "$HOTNESS_THRESHOLD" -lt 1 ] && HOTNESS_THRESHOLD=3
+MAX_WIKI_CANDS="${CCC_DISTILL_MAX_WIKI_CANDS:-3}"
+case "$MAX_WIKI_CANDS" in ''|*[!0-9]*) MAX_WIKI_CANDS=3 ;; esac
+[ "$MAX_WIKI_CANDS" -lt 1 ] && MAX_WIKI_CANDS=3
 
 # title_hash: collapse cosmetic title variants so the dedup/hot mechanism
 # actually catches recurring topics. Strategy:
@@ -153,8 +172,85 @@ mark_stale_pending() {
   ' "$QUEUE" > "$QUEUE.tmp" 2>/dev/null && mv "$QUEUE.tmp" "$QUEUE"
 }
 
+# --compact: one-shot retroactive de-dup of PENDING queue entries (issue #298).
+# Entries queued before issue-anchored hashing existed can share a topic bucket;
+# this keeps only the NEWEST pending entry per title_hash bucket, drops the rest
+# (the queue header documents deletion as the rejection mechanism), and bumps
+# .seen so surviving topics stay suppressed. merged/rejected entries are kept.
+compact_queue() {
+  [ -f "$QUEUE" ] || { echo "wiki-queue compact: no queue file"; return 0; }
+  local tmpdir
+  tmpdir="$(mktemp -d)" || return 0
+  awk -v dir="$tmpdir" '
+    BEGIN { out=dir "/block-00000" }
+    /^## \[CAND-[0-9]+\]/ { n++; out=sprintf("%s/block-%05d", dir, n) }
+    { print > out }
+  ' "$QUEUE"
+
+  # Heading shape: `## [CAND-N] YYYY-MM-DD — TITLE`; a HOT re-surface carries a
+  # second separator: `## [CAND-N] YYYY-MM-DD — 🔥 HOT (seen ×K) — TITLE`.
+  block_hash() { # <block-file> -> title_hash of the real title ("" if no title)
+    local heading title
+    heading="$(head -1 "$1")"
+    [ "${heading%%— *}" != "$heading" ] || { printf ''; return; }
+    title="${heading#*— }"
+    case "$title" in "🔥 HOT ("*"— "*) title="${title#*— }" ;; esac
+    title_hash "$title"
+  }
+
+  local f hash
+  declare -A winner bucket_total
+  # Pass 1: newest pending block per bucket wins (ascending file order = queue order).
+  for f in "$tmpdir"/block-*; do
+    [ "$f" = "$tmpdir/block-00000" ] && continue
+    grep -q '^- status: pending' "$f" || continue
+    hash="$(block_hash "$f")"
+    [ -n "$hash" ] || continue
+    winner["$hash"]="$f"
+    bucket_total["$hash"]=$(( ${bucket_total["$hash"]:-0} + 1 ))
+  done
+
+  local kept=0 dropped=0 row first count old
+  {
+    [ -f "$tmpdir/block-00000" ] && cat "$tmpdir/block-00000"
+    for f in "$tmpdir"/block-*; do
+      [ "$f" = "$tmpdir/block-00000" ] && continue
+      if grep -q '^- status: pending' "$f"; then
+        hash="$(block_hash "$f")"
+        if [ -n "$hash" ] && [ "${winner["$hash"]:-}" != "$f" ]; then
+          dropped=$((dropped + 1))
+          continue
+        fi
+      fi
+      cat "$f"
+      kept=$((kept + 1))
+    done
+  } > "$QUEUE.tmp" && mv "$QUEUE.tmp" "$QUEUE"
+
+  # Refresh .seen for surviving buckets so near-term re-extraction stays deduped.
+  for hash in "${!winner[@]}"; do
+    row="$(seen_row "$hash")"
+    first="$NOW_EPOCH"; count="${bucket_total["$hash"]}"
+    if [ -n "$row" ]; then
+      first="$(printf '%s' "$row" | awk '{print $1}')"
+      old="$(printf '%s' "$row" | awk '{print $3}')"
+      case "$old" in ''|*[!0-9]*) old=1 ;; esac
+      [ "$old" -gt "$count" ] && count="$old"
+    fi
+    update_seen "$hash" "$first" "$NOW_EPOCH" "$count"
+  done
+
+  rm -rf "$tmpdir"
+  echo "wiki-queue compact: kept=$kept dropped(dup)=$dropped buckets=${#winner[@]}"
+}
+
 normalize_seen
 mark_stale_pending
+
+if [ "${1:-}" = "--compact" ]; then
+  compact_queue
+  exit 0
+fi
 
 PAYLOAD="$(cat 2>/dev/null)"
 [ -n "$PAYLOAD" ] || exit 0
@@ -165,6 +261,15 @@ N="$(printf '%s' "$CANDS" | jq 'length')"
 if [ "$N" = "0" ]; then
   echo "no wiki candidates (session=$(printf '%s' "$PAYLOAD" | jq -r .session_id))"
   exit 0
+fi
+
+# Per-session cap (issue #298): the extractor prompt asks for at most this many,
+# but the prompt has no enforcement power — this truncation is the deterministic
+# backstop. Extract order is the model's durability ranking, so keep the head.
+TRUNCATED=0
+if [ "$N" -gt "$MAX_WIKI_CANDS" ]; then
+  TRUNCATED=$((N - MAX_WIKI_CANDS))
+  CANDS="$(printf '%s' "$CANDS" | jq -c ".[0:$MAX_WIKI_CANDS]")"
 fi
 
 SID="$(printf '%s' "$PAYLOAD" | jq -r '.session_id // "unknown"')"
@@ -243,4 +348,4 @@ for i in $(seq 0 $((LEN - 1))); do
   ADDED=$((ADDED + 1))
 done
 
-echo "wiki-queue session=$SID added=$ADDED skipped(dup)=$SKIPPED total_in=$N"
+echo "wiki-queue session=$SID added=$ADDED skipped(dup)=$SKIPPED total_in=$N truncated(cap)=$TRUNCATED"
