@@ -147,9 +147,9 @@ class RenderedSpacingTests(unittest.TestCase):
 
         def gap(a, b):
             lines = text.split("\n")
-            ai = next(i for i, l in enumerate(lines) if a in l)
-            bi = next(i for i, l in enumerate(lines) if b in l and i > ai)
-            return sum(1 for l in lines[ai + 1 : bi] if l.strip() == "")
+            ai = next(i for i, ln in enumerate(lines) if a in ln)
+            bi = next(i for i, ln in enumerate(lines) if b in ln and i > ai)
+            return sum(1 for ln in lines[ai + 1 : bi] if ln.strip() == "")
 
         self.assertEqual(gap("Title", "intro"), 1)
         self.assertEqual(gap("intro", "item one"), 2)

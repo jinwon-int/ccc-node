@@ -90,7 +90,7 @@ def _visual_gap(out: str, a_frag: str, b_frag: str) -> int:
         if ai is None and a_frag in line:
             ai = i
         elif ai is not None and b_frag in line:
-            return sum(1 for l in lines[ai + 1 : i] if l.strip() == "")
+            return sum(1 for gap_line in lines[ai + 1 : i] if gap_line.strip() == "")
     raise AssertionError(f"fragments not found in order: {a_frag!r}, {b_frag!r}")
 
 
