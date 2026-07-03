@@ -1,6 +1,6 @@
 ---
 name: distill
-description: Manually trigger / inspect / toggle the Session Distiller (TM-1058) — the PreCompact+SessionEnd memory pipeline that distills transcripts via Haiku and routes to Honcho + wiki-candidates. Use when the operator says `/distill`, asks to "run distill now", wants to see what the last distill captured, wants aggregate distill health stats, wants to flip between LIVE and DRY-RUN, or wants to turn distill off. Arg is one of: (empty)/`manual` (fire now), `status` (show last result + queue), `stats [days]` (read-only log summary), `dryrun` (enable dry-run mode), `live` (disable dry-run), `disable` (off-switch), `enable` (clear off-switch).
+description: Manually trigger / inspect / toggle the Session Distiller (TM-1058) — the PreCompact+SessionEnd memory pipeline that distills transcripts via Haiku and routes to Honcho + wiki-candidates. Use when the operator says `/distill`, asks to "run distill now", wants to see what the last distill captured, wants aggregate distill health stats, wants to flip between LIVE and DRY-RUN, or wants to turn distill off. Arg is one of: (empty)/`manual` (fire now), `status` (show last result + queue), `stats [days]` (read-only log summary), `dryrun` (enable dry-run mode), `live` (disable dry-run), `disable` (off-switch), `enable` (clear off-switch), `compact` (retroactive de-dup of pending wiki-candidates backlog).
 ---
 
 # distill — Session Distiller manual control
@@ -18,8 +18,19 @@ Wraps `~/.claude/hooks/distill.sh` with a single operator-facing UX. Design: see
 | `live` | Disable DRY-RUN. Idempotent. |
 | `disable` | Off-switch on (skip everything). |
 | `enable` | Off-switch off. |
+| `compact` | One-shot retroactive de-dup of PENDING wiki-candidates (same `title_hash` bucket → keep newest, refresh `.seen`). Backlog cleanup for entries queued before issue-anchored hashing (issue #298). |
 
 Operator arg: `$ARGUMENTS`
+
+For **`compact`**, run the queue's built-in compactor and report its summary line
+(kept / dropped(dup) / buckets), plus the queue size before/after:
+
+```bash
+wc -l ~/.claude/state/wiki-candidates.md
+bash ~/.claude/hooks/distill/wiki-queue.sh --compact
+wc -l ~/.claude/state/wiki-candidates.md
+```
+
 
 ## Procedure
 
@@ -185,6 +196,7 @@ Operator arg: `$ARGUMENTS`
 
 ## Safety
 - Scope control: by default distill accepts every transcript visible to the node. To restrict a multi-tenant node, set `CCC_DISTILL_SCOPE_CWDS` to a comma/colon-separated allowlist of cwd paths, or write one cwd/project-encoded entry per line to `~/.claude/state/distill.scope`. Out-of-scope transcripts log `skip reason=cwd-out-of-scope` and do not extract, push, or queue.
+- Noise controls (issue #298): wiki-candidates are extracted only when reusable + new + settled (exclusion list in the extract prompt), capped at `CCC_DISTILL_MAX_WIKI_CANDS` (default 3) per session by wiki-queue, and deduped by topic for `CCC_DISTILL_SEEN_TTL_DAYS` (default 7). `/distill compact` cleans pre-existing duplicate backlog.
 - All outputs carry provenance: `source_cwd`/`source_project` in `distill-last.json`, Honcho metadata, and wiki-candidates entries.
 - DO NOT use `rm` on `distill.disabled` / `distill.dryrun` (guard blocks `rm` + system paths). Always `mv` to a timestamped archive name — same disable effect, no guard friction.
 - Manual fire from inside an active Claude Code session uses **this** session's transcript. If you want to distill some **other** session, set `CLAUDE_DISTILL_TRANSCRIPT=/path/to/other.jsonl` in env before firing.

@@ -113,6 +113,16 @@ wiki_candidates criteria (durable, public-safe wiki page material):
   - design / architecture / policy decisions for this node
   - new runbook step, incident conclusion, service config change rationale
   - MUST NOT include raw secrets — only locations/handling rules (FW-03).
+  - Extract an item ONLY if ALL three hold (GitHub issue #298):
+      1. reusable — a future session would act differently because of it
+      2. new — not already recorded in the wiki or an earlier session's extract
+      3. settled — a confirmed decision/fact, not work still in progress
+  - NEVER extract (exclusion list):
+      - progress snapshots of ongoing or completed work ("~진행 중", "~완료함")
+      - watch/observe items ("~를 관찰해야 함", pending verification)
+      - an issue/topic already extracted in a previous session (same #NNN issue)
+      - implementation details that are not design decisions
+  - At most 3 wiki_candidates per session — keep only the most durable ones.
   - if nothing durable came up this session, return [].
 
 Return [] for either array if nothing qualifies. NEVER invent items.
