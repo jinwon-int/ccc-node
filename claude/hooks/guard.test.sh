@@ -140,6 +140,25 @@ run allow Read file_path '/app/.env.template'
 run allow Read file_path '/app/.env.sample'
 run allow Bash command 'cat bridge/.env.example'
 
+# ---- self-update: pre-approved procedure allowed, its config gated ----
+# The fixed maintenance procedure may run (approval happened at PR review time)...
+run allow Bash command 'bash /root/.claude/hooks/ccc-self-update.sh run'
+run allow Bash command 'bash /root/.claude/hooks/ccc-self-update.sh run --force'
+run allow Bash command '/root/.claude/hooks/ccc-self-update.sh status'
+run allow Bash command 'bash ~/ccc-node/scripts/ccc-self-update.sh run'
+# ...but the operator-owned allowlist that bounds its blast radius is write-gated
+run deny Write file_path '/root/.claude/self-update.services'
+run deny Edit file_path '/root/.claude/self-update.repo'
+run allow Read file_path '/root/.claude/self-update.services'
+run deny Bash command 'echo hermes-broker >> /root/.claude/self-update.services'
+run deny Bash command 'printf "%s\n" broker > /root/.claude/self-update.services'
+run deny Bash command 'echo x | tee /root/.claude/self-update.services'
+run deny Bash command 'sed -i "s/a/b/" /root/.claude/self-update.repo'
+run allow Bash command 'cat /root/.claude/self-update.services'
+# ...and direct fleet service control stays gated regardless
+run deny Bash command 'systemctl restart hermes-broker'
+run deny Bash command 'systemctl stop a2a-gateway'
+
 # ---- escape hatch: gated allowed only with operator signal ----
 run allow Bash command 'git push --force origin main' 'CCC_ALLOW_GATED=1'
 

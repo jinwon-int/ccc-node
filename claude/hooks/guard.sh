@@ -60,6 +60,19 @@ case "$tool" in
     ;;
 esac
 
+# --- Self-update operator config: agents may READ but never write -------------
+# ~/.claude/self-update.services / .repo define which services the pre-approved
+# ccc-self-update.sh procedure may restart (and where the repo lives). They are
+# the blast-radius boundary of that carve-out, so only the operator edits them.
+case "$tool" in
+  Edit|Write|NotebookEdit|MultiEdit)
+    case "$fpath" in
+      */self-update.services|*/self-update.repo)
+        deny "self-update-config" "operator_approval_gated" "$tool on $fpath" ;;
+    esac
+    ;;
+esac
+
 # --- Bash command-content patterns ---
 [ "$tool" = "Bash" ] || exit 0
 [ -n "$cmd" ] || exit 0
@@ -189,9 +202,18 @@ g 'git[[:space:]]+(filter-branch|filter-repo)([[:space:]]|$)|git-filter-repo'   
 # still fast-allows the bare local form; dropping `bridge` from the deny patterns
 # additionally permits remote (ssh-wrapped) ccc-telegram-bridge restarts used by
 # fleet rollouts, without loosening any broker/Gateway/worker/DB/secret gate.
+# For "update this node and restart its services" the PRE-APPROVED path is
+# `~/.claude/hooks/ccc-self-update.sh run` (reviewed fixed procedure; restarts
+# only operator-allowlisted units — see self-update-config gate above). Direct
+# service control below stays gated.
 ccc_telegram_bridge_restart && exit 0
 g '(systemctl|service|supervisorctl|pm2)[[:space:]]+(restart|stop|start|reload|kill)([[:space:]]).*(broker|gateway|worker|a2a|hermes|openclaw)' && deny "service-control" "operator_approval_gated" "$c"
 gi '\b(restart|reload)[-_](broker|gateway|worker)\b' && deny "service-control" "operator_approval_gated" "$c"
+
+# Writes to the self-update operator config via shell (redirects/copy tools).
+# Read (cat/grep) stays allowed; only mutation is gated.
+gn '(>>?[[:space:]]*[^|;&]*self-update\.(services|repo))' && deny "self-update-config" "operator_approval_gated" "$c"
+gn '\b(tee|cp|mv|dd|install|rsync|sed|truncate|ln)\b[^|;&]*self-update\.(services|repo)' && deny "self-update-config" "operator_approval_gated" "$c"
 
 # DB destructive / migration / replay
 gi '\b(DROP[[:space:]]+(TABLE|DATABASE)|TRUNCATE[[:space:]]|FLUSHALL|FLUSHDB)\b'                  && deny "db-destructive" "operator_approval_gated" "$c"
