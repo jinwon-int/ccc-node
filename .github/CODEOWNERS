@@ -1,0 +1,7 @@
+# ccc-node code ownership
+#
+# Keep both current repository administrators listed so a code-owner review can
+# be satisfied by the account that did not author the PR. Do not require two
+# approving reviews until a third write-capable reviewer/team exists.
+
+* @jinon86 @seoseo-ai
