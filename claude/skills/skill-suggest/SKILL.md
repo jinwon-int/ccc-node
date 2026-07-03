@@ -42,7 +42,9 @@ Approximates "auto-skillification": find procedures you keep repeating and turn 
    bash ~/.claude/skills/skill-suggest/scan.sh
    cat ~/.claude/state/skill-candidates.md
    ```
-   (A daily cron may also refresh this file, so candidates stay current between sessions.)
+   (The daily skill-autosave sweep also refreshes this file and drafts skills
+   from bridge/SDK transcripts — enable it with
+   `scripts/install-skill-autosave-cron.sh --apply`; see `docs/skill-autosave.md`.)
 
 3. **Interpret, don't dump.** Read the ranked command shapes and cluster them into *procedures*:
    - Group related high-count shapes by tool/intent (e.g. `wiki-agent write-path` + `wiki-agent pr` = the wiki flow).
