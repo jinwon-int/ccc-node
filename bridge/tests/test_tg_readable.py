@@ -5,11 +5,14 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from telegram_bot.utils.tg_readable import (
+    GAP_FILLER_LINE,
     to_readable,
     render_for_delivery,
     apply_part_headers,
     part_marker,
 )
+
+NB = GAP_FILLER_LINE  # U+00A0 — invisible filler for gaps wider than one line
 
 
 class ToReadableTests(unittest.TestCase):
@@ -150,19 +153,22 @@ class SpacingLinesTests(unittest.TestCase):
         self.assertEqual(to_readable("a\n\n\n\nb", spacing=1), "a\n\nb")
 
     def test_spacing_two_widens_paragraph_gaps(self):
-        # An author paragraph break (single blank) widens to two blank lines.
-        self.assertEqual(to_readable("a\n\nb", spacing=2), "a\n\n\nb")
+        # An author paragraph break (single blank) widens to a blank line plus
+        # an invisible NBSP filler line. The filler (not a second real blank) is
+        # what survives the MarkdownV2/entity conversion, which collapses runs
+        # of truly blank lines back to one.
+        self.assertEqual(to_readable("a\n\nb", spacing=2), f"a\n\n{NB}\nb")
 
     def test_spacing_two_widens_list_item_gaps_in_loose(self):
         self.assertEqual(
             to_readable("- a\n- b", loose=True, spacing=2),
-            "- a\n\n\n- b",
+            f"- a\n\n{NB}\n- b",
         )
 
     def test_spacing_two_widens_blank_before_heading(self):
         self.assertEqual(
             to_readable("intro\n## Section\nbody", spacing=2),
-            "intro\n\n\n## Section\nbody",
+            f"intro\n\n{NB}\n## Section\nbody",
         )
 
     def test_spacing_does_not_space_soft_wrapped_prose(self):
@@ -183,10 +189,22 @@ class SpacingLinesTests(unittest.TestCase):
         self.assertEqual(once, to_readable(once, loose=True, spacing=2))
 
     def test_spacing_clamped_to_max_three(self):
-        self.assertEqual(to_readable("a\n\nb", spacing=99), "a\n\n\n\nb")
+        self.assertEqual(
+            to_readable("a\n\nb", spacing=99), f"a\n\n{NB}\n{NB}\nb"
+        )
 
     def test_spacing_invalid_falls_back_to_one(self):
         self.assertEqual(to_readable("a\n\n\nb", spacing="oops"), "a\n\nb")
+
+    def test_spacing_filler_trimmed_at_edges(self):
+        # Leading/trailing blank runs never leave filler behind.
+        self.assertEqual(to_readable("\n\na\n\n\n", spacing=2), "a")
+
+    def test_spacing_filler_lines_count_as_blank_on_rerender(self):
+        # A gap already containing filler re-normalizes instead of growing.
+        src = f"a\n\n{NB}\nb"
+        self.assertEqual(to_readable(src, spacing=1), "a\n\nb")
+        self.assertEqual(to_readable(src, spacing=3), f"a\n\n{NB}\n{NB}\nb")
 
 
 class PartHeaderTests(unittest.TestCase):
