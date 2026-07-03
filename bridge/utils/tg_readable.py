@@ -62,6 +62,26 @@ def _is_section_heading(line: str) -> bool:
     return bool(_HEADING_RE.match(line) or _BOLD_ONLY_RE.match(line))
 
 
+def _gap_filler_count(prev_line: str, next_line: str, spacing: int) -> int:
+    """Filler lines a gap needs so the *rendered* gap is uniform.
+
+    The telegramify Markdown converter eats the gap's real blank line whenever
+    the gap follows a list item (lazy-continuation parsing) but keeps it
+    everywhere else, so a fixed filler count renders unevenly (the exact
+    inconsistency reported on GitHub issue #34 follow-ups). Compensate per
+    boundary so every rendered gap between blocks is `spacing` blank lines,
+    list items sit one step tighter at `spacing - 1`, and a heading/section
+    label always has exactly one blank line under it.
+    """
+    if _is_section_heading(prev_line):
+        return 0  # heading gap stays a single real blank -> renders as 1
+    if _is_list_item(prev_line):
+        if _is_list_item(next_line):
+            return spacing - 1  # blank eaten -> renders as spacing - 1
+        return spacing  # blank eaten -> renders as spacing
+    return spacing - 1  # blank kept -> renders as spacing
+
+
 def to_readable(text: str, loose: bool = False, spacing: int = 1) -> str:
     """Return a readability-normalized copy of *text*.
 
@@ -69,14 +89,16 @@ def to_readable(text: str, loose: bool = False, spacing: int = 1) -> str:
     lines so each item gets its own visual line — prose lines stay attached and
     fenced code is left intact.
 
-    *spacing* sets how many visually blank lines each vertical gap is
-    normalized to (clamped to [1, 3]). ``spacing=1`` reproduces the historical
-    behavior (every blank run collapses to a single blank line); ``spacing=2``
-    widens every paragraph/section/list-item gap for roomier output. Gaps wider
-    than one line are emitted as one real blank line plus ``spacing - 1``
-    invisible :data:`GAP_FILLER_LINE` lines so the extra space survives the
-    downstream Markdown -> MarkdownV2 / entity conversion, which collapses runs
-    of truly blank lines.
+    *spacing* sets how many visually blank lines separate blocks in the
+    RENDERED message (clamped to [1, 3]): every paragraph/section gap shows
+    ``spacing`` blank lines, list items sit one step tighter at
+    ``spacing - 1``, and a heading/section label always has exactly one blank
+    line under it. Gaps are emitted as one real blank line plus a
+    boundary-dependent number of invisible :data:`GAP_FILLER_LINE` lines
+    (see :func:`_gap_filler_count`) to compensate for the downstream
+    Markdown -> MarkdownV2 / entity conversion, which collapses runs of truly
+    blank lines and eats the blank after list items — the correction that
+    keeps the rendered spacing uniform across boundary types.
 
     Fail-open: on any unexpected error the original *text* is returned unchanged.
     """
@@ -149,6 +171,26 @@ def _transform(text: str, loose: bool = False, spacing: int = 1) -> str:
             pass2.append("")
         pass2.append(line)
 
+    # Pass 2b: ensure a blank line after a heading/section label so body text
+    # never sits attached directly under its title. Pass 3 keeps this gap at
+    # exactly one real blank line (uniform "one blank line under every
+    # heading"), which both converter paths preserve.
+    in_fence = False
+    pass2b: list[str] = []
+    for line in pass2:
+        is_fence_delim = bool(_FENCE_RE.match(line))
+        if (
+            not in_fence
+            and pass2b
+            and _is_section_heading(pass2b[-1])
+            and line.strip() != ""
+        ):
+            pass2b.append("")
+        pass2b.append(line)
+        if is_fence_delim:
+            in_fence = not in_fence
+    pass2 = pass2b
+
     # Pass 2.5 (opt-in): loose spacing — insert a single blank line between two
     # adjacent list-item lines so each item gets its own visual line. Telegram has
     # no line-height control, so blank lines are the only way to "space out" a
@@ -174,13 +216,14 @@ def _transform(text: str, loose: bool = False, spacing: int = 1) -> str:
         pass2 = loose_lines
 
     # Pass 3: normalize every run of blank lines (outside fences) to exactly one
-    # real blank line plus `spacing - 1` GAP_FILLER_LINE lines. With spacing=1
-    # this is the historical "collapse to a single blank line"; with spacing>1
-    # each paragraph/section/list-item gap gains invisible filler lines that
-    # survive the downstream Markdown -> MarkdownV2 / entity conversion (which
-    # collapses runs of truly blank lines — see GAP_FILLER_LINE). Leading and
-    # trailing runs are trimmed at the end, so interior gaps are the only ones
-    # widened — soft-wrapped lines with no blank between them stay attached.
+    # real blank line plus a boundary-dependent number of GAP_FILLER_LINE lines
+    # (see _gap_filler_count) so the gap the USER SEES after the downstream
+    # Markdown -> MarkdownV2 / entity conversion is uniform: `spacing` blank
+    # lines between blocks, `spacing - 1` between list items, exactly one under
+    # a heading. The filler is needed because the converter collapses runs of
+    # truly blank lines — see GAP_FILLER_LINE. Leading and trailing runs are
+    # trimmed at the end, so interior gaps are the only ones widened —
+    # soft-wrapped lines with no blank between them stay attached.
     in_fence = False
     pass3: list[str] = []
     i = 0
@@ -194,7 +237,9 @@ def _transform(text: str, loose: bool = False, spacing: int = 1) -> str:
             continue
         if not in_fence and line.strip() == "":
             # Consume the whole blank run (NBSP filler counts as blank, which
-            # keeps the transform idempotent), then emit the canonical gap.
+            # keeps the transform idempotent), then emit the canonical gap for
+            # this boundary. Leading/trailing runs get no filler — they are
+            # trimmed below anyway.
             j = i
             while (
                 j < n
@@ -203,7 +248,11 @@ def _transform(text: str, loose: bool = False, spacing: int = 1) -> str:
             ):
                 j += 1
             pass3.append("")
-            pass3.extend([GAP_FILLER_LINE] * (spacing - 1))
+            if pass3[:-1] and j < n:
+                pass3.extend(
+                    [GAP_FILLER_LINE]
+                    * _gap_filler_count(pass3[-2], pass2[j], spacing)
+                )
             i = j
         else:
             pass3.append(line)

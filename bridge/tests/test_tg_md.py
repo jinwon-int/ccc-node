@@ -82,6 +82,38 @@ def test_readable_spacing_gap_survives_conversion():
     assert GAP_FILLER_LINE in out
 
 
+def _visual_gap(out: str, a_frag: str, b_frag: str) -> int:
+    """Count visually blank lines between the lines containing the fragments."""
+    lines = out.split("\n")
+    ai = None
+    for i, line in enumerate(lines):
+        if ai is None and a_frag in line:
+            ai = i
+        elif ai is not None and b_frag in line:
+            return sum(1 for gap_line in lines[ai + 1 : i] if gap_line.strip() == "")
+    raise AssertionError(f"fragments not found in order: {a_frag!r}, {b_frag!r}")
+
+
+@needs_lib
+def test_rendered_gaps_are_uniform_across_boundary_types():
+    # The converter eats the blank line after list items but keeps it after
+    # paragraphs; the readable renderer compensates per boundary so the gap
+    # the user SEES is uniform: spacing between blocks, spacing-1 between list
+    # items, exactly one blank line under a heading.
+    from telegram_bot.utils.tg_readable import to_readable
+
+    doc = (
+        "## Title\n\nintro para\n\n- item one\n- item two\n\n"
+        "closing para\n\nsecond para"
+    )
+    out = tg_md.to_markdownv2(to_readable(doc, loose=True, spacing=2))
+    assert _visual_gap(out, "Title", "intro") == 1  # under heading
+    assert _visual_gap(out, "intro", "item one") == 2  # block gap
+    assert _visual_gap(out, "item one", "item two") == 1  # list items
+    assert _visual_gap(out, "item two", "closing") == 2  # list end -> block
+    assert _visual_gap(out, "closing", "second") == 2  # block gap
+
+
 @needs_lib
 def test_long_content_splits_within_limit():
     md = "\n\n".join(f"paragraph {i} with text" for i in range(800))

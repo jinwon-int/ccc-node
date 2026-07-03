@@ -28,22 +28,24 @@ class ToReadableTests(unittest.TestCase):
     def test_trims_leading_and_trailing_blanks(self):
         self.assertEqual(to_readable("\n\nhello\n\n"), "hello")
 
-    def test_blank_line_before_heading(self):
+    def test_blank_line_before_and_after_heading(self):
+        # A heading gets air on both sides: before (section separation) and
+        # after (body never sits attached directly under its title).
         self.assertEqual(
             to_readable("intro text\n## Section\nbody"),
-            "intro text\n\n## Section\nbody",
+            "intro text\n\n## Section\n\nbody",
         )
 
-    def test_blank_line_before_bold_label(self):
+    def test_blank_line_before_and_after_bold_label(self):
         self.assertEqual(
             to_readable("intro\n**확인됨**\n- item"),
-            "intro\n\n**확인됨**\n- item",
+            "intro\n\n**확인됨**\n\n- item",
         )
 
     def test_no_extra_blank_when_already_separated(self):
         self.assertEqual(
-            to_readable("intro\n\n## Section\nbody"),
-            "intro\n\n## Section\nbody",
+            to_readable("intro\n\n## Section\n\nbody"),
+            "intro\n\n## Section\n\nbody",
         )
 
     def test_fenced_code_block_is_untouched(self):
@@ -80,13 +82,19 @@ class ToReadableTests(unittest.TestCase):
             "요약입니다.\n"
             "\n"
             "## 확정\n"
+            "\n"
             "- nosuk healthy\n"
             "- soonwook healthy\n"
             "\n"
+            # Filler compensates the converter eating the blank after a list
+            # item, so the rendered gap stays one blank line like the others.
+            f"{NB}\n"
             "## 변경\n"
+            "\n"
             "PR #33 merged\n"
             "\n"
             "## 다음\n"
+            "\n"
             "재시작 확인"
         )
         self.assertEqual(to_readable(before), after)
@@ -166,9 +174,26 @@ class SpacingLinesTests(unittest.TestCase):
         )
 
     def test_spacing_two_widens_blank_before_heading(self):
+        # Before the heading: spacing-wide gap. Under the heading: always
+        # exactly one blank line, independent of spacing.
         self.assertEqual(
             to_readable("intro\n## Section\nbody", spacing=2),
-            f"intro\n\n{NB}\n## Section\nbody",
+            f"intro\n\n{NB}\n## Section\n\nbody",
+        )
+
+    def test_heading_gap_is_single_blank_even_when_author_left_more(self):
+        self.assertEqual(
+            to_readable("## Section\n\n\n\nbody", spacing=2),
+            "## Section\n\nbody",
+        )
+
+    def test_list_end_gap_gets_extra_filler(self):
+        # The converter eats the blank after a list item, so the gap from a
+        # list item to a non-item block carries `spacing` filler lines (one
+        # more than a paragraph gap) to render at the same width.
+        self.assertEqual(
+            to_readable("- a\n\nBBB", spacing=2),
+            f"- a\n\n{NB}\n{NB}\nBBB",
         )
 
     def test_spacing_does_not_space_soft_wrapped_prose(self):
