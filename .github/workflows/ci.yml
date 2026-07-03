@@ -39,7 +39,7 @@ jobs:
           PYTHONPATH: ${{ github.workspace }}/.github/pythonpath
         run: mypy
       - name: CI hardening regressions
-        run: python -m pytest -q tests/test_ci_pip_hash_pinning.py tests/test_workflow_permissions.py
+        run: python -m pytest -q tests/test_ci_pip_hash_pinning.py tests/test_workflow_permissions.py tests/test_codeowners_branch_protection.py
 
   secret-scan:
     runs-on: ubuntu-latest
