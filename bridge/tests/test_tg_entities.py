@@ -128,5 +128,35 @@ class EntityPartHeaderTests(unittest.TestCase):
         self.assertTrue(out[0][0].startswith(prefix_text))
 
 
+class RenderedSpacingTests(unittest.TestCase):
+    @needs_lib
+    def test_rendered_gaps_are_uniform_across_boundary_types(self):
+        # Entity-path twin of the tg_md uniformity test: the readable
+        # renderer's per-boundary filler must survive entity conversion so the
+        # visible spacing is consistent (spacing between blocks, spacing-1
+        # between list items, one blank line under a heading).
+        from telegram_bot.utils.tg_readable import to_readable
+
+        doc = (
+            "## Title\n\nintro para\n\n- item one\n- item two\n\n"
+            "closing para\n\nsecond para"
+        )
+        text, _ = tg_entities.to_entity_chunks(
+            to_readable(doc, loose=True, spacing=2), 4000
+        )[0]
+
+        def gap(a, b):
+            lines = text.split("\n")
+            ai = next(i for i, l in enumerate(lines) if a in l)
+            bi = next(i for i, l in enumerate(lines) if b in l and i > ai)
+            return sum(1 for l in lines[ai + 1 : bi] if l.strip() == "")
+
+        self.assertEqual(gap("Title", "intro"), 1)
+        self.assertEqual(gap("intro", "item one"), 2)
+        self.assertEqual(gap("item one", "item two"), 1)
+        self.assertEqual(gap("item two", "closing"), 2)
+        self.assertEqual(gap("closing", "second"), 2)
+
+
 if __name__ == "__main__":
     unittest.main()
