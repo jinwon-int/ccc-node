@@ -200,5 +200,203 @@ PY
 out="$(bash "$TOOL" run --env-file "$exec_fail" 2>&1)"; rc=$?
 ok "failed exec stays fail-closed (no traceback)" '[ "$rc" = 2 ] && grep -q "failed to exec native worker" <<<"$out" && ! grep -q "Traceback" <<<"$out"'
 
+# -----------------------------------------------------------------------------
+# Supervisor subcommands (supervise / stop / status)
+# -----------------------------------------------------------------------------
+# These absorb what used to live in a2a-termux-native-worker-supervisor.test.sh
+# (deleted in the same PR).  The supervisor half is now dispatched by this
+# script's own main(), and we mock the underlying Python worker via
+# A2A_PYTHON_HARNESS + a bash executable stub so the tests need no real
+# python3, ssh, or curl on the network side.
+
+SUP_TMP="$(mktemp -d)"
+# NB: don't cleanup SUP_TMP inside a nested EXIT trap — the outer trap on line 8
+# already covers $TMP, and we bind SUP_TMP to $TMP so cleanup piggy-backs.
+mv "$SUP_TMP" "$TMP/sup" && SUP_TMP="$TMP/sup"
+
+# Mock Python harness: `check` always OK, `run` sleeps so the supervisor's
+# worker loop has something to wait on.  Same shape as the real Python file:
+# executable with a shebang, so the shell dispatcher (which calls it directly)
+# doesn't care whether it's actually Python.
+cat > "$SUP_TMP/mock-python-harness.sh" <<'MOCK_PY_EOF'
+#!/usr/bin/env bash
+case "${1:-}" in
+    check) exit 0 ;;
+    run)
+        echo "MOCK_RUN args=$*"
+        exec sleep 3600
+        ;;
+    *) echo "mock python harness: unknown $1" >&2; exit 2 ;;
+esac
+MOCK_PY_EOF
+chmod +x "$SUP_TMP/mock-python-harness.sh"
+
+# A second mock that fails `check` — used to verify supervise aborts cleanly.
+cat > "$SUP_TMP/mock-python-harness-fail.sh" <<'MOCK_PYF_EOF'
+#!/usr/bin/env bash
+echo "MOCK_PY: forcing check failure" >&2
+exit 2
+MOCK_PYF_EOF
+chmod +x "$SUP_TMP/mock-python-harness-fail.sh"
+
+# Mock ssh that blocks so we can inspect the tunnel loop without real network
+# I/O.  Touches a marker file so tests can wait for it to launch.
+mkdir -p "$SUP_TMP/bin"
+cat > "$SUP_TMP/bin/ssh" <<'SSH_EOF'
+#!/usr/bin/env bash
+touch "${A2A_TEST_SSH_MARKER:-/tmp/a2a-test-ssh}"
+exec sleep 3600
+SSH_EOF
+chmod +x "$SUP_TMP/bin/ssh"
+
+# Mock curl so `status`'s tunnel probe is deterministic.
+cat > "$SUP_TMP/bin/curl" <<'CURL_EOF'
+#!/usr/bin/env bash
+if [[ "${A2A_TEST_CURL_OK:-0}" == "1" ]]; then
+    exit 0
+fi
+exit 7
+CURL_EOF
+chmod +x "$SUP_TMP/bin/curl"
+
+# Minimal env file the mock Python accepts.  We only need the tunnel target
+# key for supervise; other keys are irrelevant because `check` is mocked.
+ENVF="$SUP_TMP/canonical.env"
+cat > "$ENVF" <<EOF
+A2A_TUNNEL_SSH_TARGET=fake-target
+A2A_WORKER_ROOT=$SUP_TMP/worker-root
+EOF
+mkdir -p "$SUP_TMP/worker-root/dist"
+
+# Isolate lock / log paths so we never touch \$HOME/.a2a or \$HOME/.hermes/logs.
+export A2A_SUPERVISOR_LOCK_DIR="$SUP_TMP"
+export A2A_SUPERVISOR_LOG_DIR="$SUP_TMP"
+export A2A_SUPERVISOR_LOCK="$SUP_TMP/sup.lock"
+export A2A_SUPERVISOR_LOG="$SUP_TMP/sup.log"
+export A2A_TEST_SSH_MARKER="$SUP_TMP/ssh-started"
+export A2A_TEST_CURL_OK=0
+export A2A_PYTHON_HARNESS="$SUP_TMP/mock-python-harness.sh"
+export PATH="$SUP_TMP/bin:$PATH"
+SUP_PIDFILE="$A2A_SUPERVISOR_LOCK.pid"
+
+# ---- read-only paths first (fast, no side effects) ----
+
+out="$(bash "$TOOL" 2>&1)"; rc=$?
+ok "no command prints usage rc=2" '[ "$rc" = 2 ] && grep -q "Usage:" <<<"$out"'
+
+out="$(bash "$TOOL" --help 2>&1)"; rc=$?
+ok "--help prints usage rc=2" '[ "$rc" = 2 ] && grep -q "supervise" <<<"$out"'
+
+out="$(bash "$TOOL" supervise 2>&1)"; rc=$?
+ok "supervise without --env-file fails" '[ "$rc" = 2 ] && grep -q -- "--env-file required" <<<"$out"'
+
+out="$(bash "$TOOL" bogus --env-file "$ENVF" 2>&1)"; rc=$?
+ok "unknown command exits nonzero" '[ "$rc" = 2 ] && grep -q "unknown command" <<<"$out"'
+
+# stop / status with no supervisor running.
+out="$(bash "$TOOL" stop 2>&1)"; rc=$?
+ok "stop with no supervisor is a no-op" '[ "$rc" = 0 ] && grep -q "no supervisor" <<<"$out"'
+
+out="$(bash "$TOOL" status 2>&1)"; rc=$?
+ok "status with no supervisor reports none" '[ "$rc" = 0 ] && grep -q "supervisor: none" <<<"$out"'
+ok "status reports tunnel DOWN when curl fails" 'grep -q "tunnel: DOWN" <<<"$out"'
+
+# Missing tunnel SSH target: supervise refuses even if validation would pass.
+ENV_NOSSH="$SUP_TMP/nossh.env"
+grep -v '^A2A_TUNNEL_SSH_TARGET=' "$ENVF" > "$ENV_NOSSH"
+out="$(bash "$TOOL" supervise --env-file "$ENV_NOSSH" 2>&1)"; rc=$?
+ok "supervise requires A2A_TUNNEL_SSH_TARGET" '[ "$rc" = 2 ] && grep -q "A2A_TUNNEL_SSH_TARGET" <<<"$out"'
+
+# Validation failure in the Python harness surfaces from supervise.
+A2A_PYTHON_HARNESS="$SUP_TMP/mock-python-harness-fail.sh" \
+    bash "$TOOL" supervise --env-file "$ENVF" >/dev/null 2>&1
+rc=$?
+ok "harness check failure aborts supervise" '[ "$rc" = 2 ]'
+
+# ---- singleton via flock: start supervisor #1, then verify #2 refuses ----
+
+# Start supervisor #1 in a subshell backgrounded.  It will run our mock ssh
+# forever and our mock harness `run` forever; both are killable.
+bash "$TOOL" supervise --env-file "$ENVF" >/dev/null 2>&1 &
+SUP1_PID=$!
+
+# Wait for the PID file to be written and the mock ssh to actually launch,
+# so #2's flock -n meaningfully contends with a live holder.
+for _ in $(seq 1 40); do
+    if [[ -f "$A2A_TEST_SSH_MARKER" && -s "$SUP_PIDFILE" ]]; then
+        break
+    fi
+    sleep 0.1
+done
+
+ok "supervisor #1 started (mock ssh launched)" '[ -f "$A2A_TEST_SSH_MARKER" ]'
+ok "supervisor #1 wrote PID file" '[ -s "$SUP_PIDFILE" ]'
+
+# Second supervise call must fail fast with rc=3 (flock -n contention).
+out="$(bash "$TOOL" supervise --env-file "$ENVF" 2>&1)"; rc=$?
+ok "second supervise fails rc=3 while lock held" '[ "$rc" = 3 ]'
+
+# status now reports the running supervisor's PID.
+out="$(bash "$TOOL" status 2>&1)"
+ok "status shows running supervisor pid" 'grep -qE "supervisor: [0-9]+" <<<"$out"'
+
+# stop cleanly tears the supervisor down.
+out="$(bash "$TOOL" stop 2>&1)"; rc=$?
+ok "stop terminates the running supervisor" '[ "$rc" = 0 ] && grep -qE "(stopped|killed) sup=" <<<"$out"'
+
+# Give the wait / kill_tree cleanup a beat, then confirm supervisor #1 exit.
+for _ in $(seq 1 40); do
+    kill -0 "$SUP1_PID" 2>/dev/null || break
+    sleep 0.1
+done
+ok "supervisor #1 exited after stop" '! kill -0 "$SUP1_PID" 2>/dev/null'
+
+# After stop, another supervise can proceed (lock released).
+bash "$TOOL" supervise --env-file "$ENVF" >/dev/null 2>&1 &
+SUP2_PID=$!
+for _ in $(seq 1 40); do
+    [[ -s "$SUP_PIDFILE" ]] && break
+    sleep 0.1
+done
+ok "supervisor #2 acquires released lock" '[ -s "$SUP_PIDFILE" ]'
+bash "$TOOL" stop >/dev/null 2>&1 || true
+wait "$SUP2_PID" 2>/dev/null || true
+
+# ---- unit-level: source the script to exercise kill_tree without run-loop ----
+# We source it, then invoke helpers directly.  main() is guarded by a
+# BASH_SOURCE / $0 check so sourcing doesn't trigger the dispatcher.
+(
+    export A2A_SUPERVISOR_LOCK_DIR="$SUP_TMP"
+    export A2A_SUPERVISOR_LOG_DIR="$SUP_TMP"
+    # shellcheck disable=SC1090
+    source "$TOOL"
+
+    # kill_tree on a parent whose child is `sleep 3600`.
+    (
+        sleep 3600 &
+        wait
+    ) &
+    parent=$!
+    for _ in $(seq 1 20); do
+        [[ -n "$(pgrep -P "$parent" 2>/dev/null)" ]] && break
+        sleep 0.1
+    done
+    kill_tree "$parent"
+    for _ in $(seq 1 20); do
+        kill -0 "$parent" 2>/dev/null || break
+        sleep 0.1
+    done
+    if kill -0 "$parent" 2>/dev/null; then
+        echo "KILL_TREE_LEFT_PARENT" > "$SUP_TMP/kill_tree.marker"
+    else
+        echo "OK" > "$SUP_TMP/kill_tree.marker"
+    fi
+) || true
+ok "kill_tree removes parent + child" 'grep -q "^OK$" "$SUP_TMP/kill_tree.marker" 2>/dev/null'
+
+# ---- curl UP path in status ----
+out=$(A2A_TEST_CURL_OK=1 bash "$TOOL" status 2>&1)
+ok "status reports tunnel UP when curl returns 0" 'grep -q "tunnel: UP" <<<"$out"'
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
