@@ -371,7 +371,13 @@ class Config(BaseSettings):
     heartbeat_forecast_enabled: bool = Field(
         default=True,
         alias="CCC_HEARTBEAT_FORECAST_ENABLED",
-        description="Show median duration forecasts in heartbeat messages when enough samples exist.",
+        description=(
+            "Show a remaining-time ETA in heartbeat messages. Recomputed every "
+            "heartbeat tick as the conditional median of past request durations "
+            "that exceed the current elapsed time (so it tracks long-running "
+            "tasks instead of going stale); hidden when too few comparable "
+            "samples remain."
+        ),
     )
     heartbeat_forecast_min_samples: int = Field(
         default=10,

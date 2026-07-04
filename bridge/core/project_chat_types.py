@@ -48,7 +48,9 @@ class _PendingRequest:
     last_visible_progress_at: float = 0.0
     awaiting_permission: bool = False
     heartbeat_forecast_loaded: bool = False
-    heartbeat_forecast_ms: Optional[int] = None
+    # Duration samples the per-tick remaining-time ETA conditions on (loaded
+    # once per request; the estimate itself is recomputed every heartbeat).
+    heartbeat_forecast_samples: List[int] = field(default_factory=list)
     last_assistant_texts: List[str] = field(default_factory=list)
     synthetic_response: Optional[str] = None
     streaming_handler: Optional[Any] = None  # StreamingMessageHandler instance
