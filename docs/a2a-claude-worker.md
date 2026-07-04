@@ -132,6 +132,63 @@ That command `exec`s native Node in the current process; supervision, the
 `18790 -> broker:8787` tunnel, Termux:Boot wiring, and proot cutover remain a
 separate live-ops step.
 
+## Canonical supervisor + health check
+
+The same script now owns the SSH tunnel + worker respawn loop that gongyung
+and daegyo used to hand-roll under `~/.hermes/scripts/native-worker-supervisor.sh`.
+Those local versions let a single Seoseo-broker restart snowball into a
+7-supervisor pile-up on gongyung (Wiki ND-1236) because nothing enforced
+singleton semantics and orphaned SSH tunnels kept the local port bound.
+
+The canonical version fixes both:
+
+- **Singleton via `flock`.** A second `supervise` invocation exits with
+  rc=3 while another supervisor holds `$HOME/.a2a/a2a-native-worker-supervisor.lock`.
+- **Orphan-safe cleanup.** `cleanup_orphans` sweeps parent=1 SSH tunnels on
+  port 18790 at start; `kill_tree` walks child PIDs recursively at stop so
+  the tunnel subshell and its ssh grandchild are torn down together.
+
+```bash
+# Foreground supervisor (SSH tunnel + worker respawn loop).
+scripts/a2a-termux-native-worker.sh supervise --env-file /path/canonical.env
+
+# Read-only snapshot: supervisor PID, tunnel UP/DOWN, worker count, orphans.
+scripts/a2a-termux-native-worker.sh status
+
+# SIGTERM the supervisor holding the lock (KILL fallback + tunnel sweep).
+scripts/a2a-termux-native-worker.sh stop
+```
+
+Additional env keys the supervisor needs (on top of `check`/`run`):
+
+- `A2A_TUNNEL_SSH_TARGET` — SSH host alias for the remote broker (required).
+- `A2A_TUNNEL_REMOTE` — optional; defaults to `127.0.0.1:8787`.
+
+Cron-safe health check (separate script so it doesn't need supervisor state):
+
+```bash
+# Default: self-heals by spawning a supervisor via `setsid -f` when none is
+# holding the lock.  --no-self-heal makes it strictly read-only.
+scripts/a2a-termux-native-worker-health.sh --env-file /path/canonical.env
+scripts/a2a-termux-native-worker-health.sh --env-file /path/canonical.env --no-self-heal --json
+```
+
+Exit codes are distinct so cron logs are self-explanatory:
+
+| rc | meaning                                                  |
+|----|----------------------------------------------------------|
+| 0  | healthy, or spawned a fresh supervisor                   |
+| 2  | env validation failure / missing `--env-file`            |
+| 3  | supervisor up but tunnel DOWN (self-heal can't help)     |
+| 4  | supervisor-count-cap exceeded — MANUAL SWEEP (ND-1236)   |
+| 5  | self-heal requested but `setsid` returned nonzero        |
+
+The rc=4 path is a direct guard against the ND-1236 pile-up: the checker
+counts distinct supervisor-looking processes (both the canonical script AND
+the legacy `~/.hermes/scripts/native-worker-supervisor.sh` pattern) and
+refuses to self-heal on top of an existing pile-up. `--max-supervisors N`
+overrides the default cap of 1.
+
 ## No-provider adapter smoke
 
 Before any real provider canary, run the bridge with a fake Claude binary so the JSON contract, executable path, and Node runtime are proven without spending provider quota:

@@ -34,6 +34,24 @@ Native worker accepts the single-shot patch bridge — refs #150, a2a-nexus #102
   Termux native/glibc-runner Node, with fail-closed bridge metadata, local
   tunnel, and env-hygiene checks. `run` is explicit and no live cutover or
   restart is performed by default.
+- `scripts/a2a-termux-native-worker.sh` now also owns the singleton
+  SSH-tunnel + worker-respawn supervisor (`supervise`/`stop`/`status`
+  subcommands) — canonical replacement for the hand-rolled
+  `~/.hermes/scripts/native-worker-supervisor.sh` that gongyung and daegyo
+  used to run. Wiki ND-1236: singleton via `flock -n` (second supervise
+  exits rc=3), orphan-safe cleanup (`cleanup_orphans` sweeps parent=1 ssh
+  on port 18790; `kill_tree` walks pgrep -P recursively; `sweep_lingering_ssh`
+  is the belt-and-suspenders finalizer). Supervise inherits
+  `A2A_TUNNEL_SSH_TARGET` and `A2A_TUNNEL_REMOTE` env keys.
+- `scripts/a2a-termux-native-worker-health.sh` (new, cron-safe): read-only
+  supervisor / tunnel / worker snapshot with optional `--self-heal` (spawns
+  a supervisor via `setsid -f` when none is running) and a
+  `--max-supervisors N` cap detector that flags the exact >1-supervisor
+  pile-up that motivated ND-1236, matching BOTH the canonical script AND
+  the legacy `native-worker-supervisor.sh` process name so a pre-migration
+  node running both trips the check. Exit codes 0/2/3/4/5 are distinct so
+  cron logs are self-explanatory; `--json` emits a single-line schema.v1
+  summary for fleet log ingestion.
 - `docs/examples/a2a-termux-native-worker.env.example` and
   `docs/a2a-claude-worker.md` native-Termux section documenting the PR-first
   mobile worker path.
