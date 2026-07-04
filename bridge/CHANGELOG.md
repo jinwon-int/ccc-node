@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- **Orphaned `node claude` processes** accumulate on Android/Termux when the bridge
+  restarts or crashes (jinwon-int/ccc-node#303). Root causes addressed:
+  - Added `utils/orphan_reaper.py`: scans `/proc` for PPID=1 `node claude` processes
+    older than 30 min and SIGTERMs them. No psutil dependency; works on Linux/Termux.
+  - Bridge now sweeps orphans at **startup** (`_on_ready`) to clean up survivors from
+    a previous crashed run.
+  - A **periodic reaper asyncio task** sweeps every 15 minutes during normal operation.
+  - Increased `client.disconnect()` timeout from 3 s → 15 s so the SDK transport has
+    enough headroom (5 s EOF wait + 5 s SIGTERM + buffer) to actually kill the subprocess
+    before the bridge gives up and potentially orphans it.
+- 26 new unit tests cover the reaper utility end-to-end.
+
 ## [0.10.1] - 2026-05-31
 
 ### Fixed

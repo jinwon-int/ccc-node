@@ -326,11 +326,16 @@ class ProjectChatHandler(
                 except Exception as e:
                     logger.error(f"Error setting future result: {e}")
 
-        # Disconnect client
+        # Disconnect client.  The SDK transport's close() waits up to 5s for a
+        # graceful stdin-EOF shutdown then sends SIGTERM (another 5s) before
+        # SIGKILL — 10s total.  Allow 15s so the subprocess is actually killed
+        # rather than abandoned as an orphan when the outer timeout fires.
         try:
-            await asyncio.wait_for(state.client.disconnect(), timeout=3.0)
+            await asyncio.wait_for(state.client.disconnect(), timeout=15.0)
         except asyncio.TimeoutError:
-            logger.warning(f"Client disconnect for user {user_id} chat {chat_id} timed out")
+            logger.warning(
+                f"Client disconnect for user {user_id} chat {chat_id} timed out after 15s"
+            )
         except Exception as e:
             logger.error(f"Error disconnecting client for user {user_id} chat {chat_id}: {e}")
 
