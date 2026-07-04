@@ -39,6 +39,10 @@ _HEADING_RE = re.compile(r"^\s{0,3}#{1,6}\s+\S")
 _BOLD_ONLY_RE = re.compile(r"^\s*\*\*[^*\n]+\*\*:?\s*$")
 # A fenced code block delimiter.
 _FENCE_RE = re.compile(r"^\s*```")
+# An ATX heading marker with NO content (e.g. a bare "##" the model emits as a
+# visual divider). telegramify renders it as a dangling level emoji ("✏ " on a
+# line of its own), so it must be normalized to a blank line before conversion.
+_EMPTY_HEADING_RE = re.compile(r"^\s{0,3}#{1,6}\s*$")
 # A list item line: optional indent, a bullet (-, *, +, •) or number (1. / 1)),
 # a space, then content. Used by loose spacing to give each item its own line.
 _LIST_ITEM_RE = re.compile(r"^\s*(?:[-*+•]|\d+[.)])\s+\S")
@@ -144,12 +148,19 @@ def _transform(text: str, loose: bool = False, spacing: int = 1) -> str:
     lines = text.split("\n")
 
     # Pass 1: strip trailing whitespace, but leave fenced code content untouched.
+    # A content-less heading marker ("##" used as a visual divider) becomes a
+    # blank line here — downstream conversion would otherwise render it as a
+    # dangling heading emoji on its own line; as a blank it normalizes into the
+    # standard gap, preserving the divider intent as vertical space.
     in_fence = False
     pass1: list[str] = []
     for line in lines:
         if _FENCE_RE.match(line):
             in_fence = not in_fence
             pass1.append(line.rstrip())
+            continue
+        if not in_fence and _EMPTY_HEADING_RE.match(line):
+            pass1.append("")
             continue
         pass1.append(line if in_fence else line.rstrip())
 
