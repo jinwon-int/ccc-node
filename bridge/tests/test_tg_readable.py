@@ -225,6 +225,20 @@ class SpacingLinesTests(unittest.TestCase):
         # Leading/trailing blank runs never leave filler behind.
         self.assertEqual(to_readable("\n\na\n\n\n", spacing=2), "a")
 
+    def test_bare_heading_marker_becomes_standard_gap(self):
+        # A content-less "##" divider line would render as a dangling heading
+        # emoji ("✏ ") after conversion; normalize it to the standard gap.
+        self.assertEqual(to_readable("a\n##\nb", spacing=2), f"a\n\n{NB}\nb")
+        self.assertEqual(to_readable("a\n\n### \n\nb", spacing=2), f"a\n\n{NB}\nb")
+        # Real headings (with content) are untouched by this rule.
+        self.assertEqual(
+            to_readable("a\n## T\nb", spacing=2), f"a\n\n{NB}\n## T\n\nb"
+        )
+
+    def test_bare_heading_marker_inside_fence_untouched(self):
+        src = "intro\n\n```\n##\n```"
+        self.assertIn("```\n##\n```", to_readable(src, spacing=2))
+
     def test_spacing_filler_lines_count_as_blank_on_rerender(self):
         # A gap already containing filler re-normalizes instead of growing.
         src = f"a\n\n{NB}\nb"
