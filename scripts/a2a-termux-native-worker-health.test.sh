@@ -17,6 +17,10 @@ HARNESS="$ROOT/scripts/a2a-termux-native-worker.sh"
 
 pass=0; fail=0
 TMP="$(mktemp -d)"
+# Resolve real setsid BEFORE we prepend $TMP/bin (with mock setsid) to PATH,
+# so the fake-supervisor helpers can detach properly (ppid=1) while the
+# health check under test still sees the mock.
+REAL_SETSID="$(command -v setsid || echo /data/data/com.termux/files/usr/bin/setsid)"
 trap 'trap - EXIT; jobs -p | xargs -r kill -KILL 2>/dev/null; rm -rf "$TMP"' EXIT
 
 # Pre-flight: kill any leftover fake-supervisor processes from previous test
@@ -175,13 +179,24 @@ ok "--quiet suppresses OK output" '[ "$rc" = 0 ] && [ -z "$out" ]'
 rm -f "$PIDFILE"
 
 start_fake_supervisor() {
-    # `exec -a <argv0>` renames the process so pgrep -f matches.  We use two
-    # matches so the cap detector sees count > max.  stdin/out/err are
-    # redirected away so `$(start_fake_supervisor)` doesn't block waiting for
-    # the backgrounded sleep to close its inherited pipe fd.
-    bash -c 'exec -a "bash /path/a2a-termux-native-worker.sh supervise --env-file /x" sleep 3600' \
-        </dev/null >/dev/null 2>&1 &
-    echo "$!"
+    # `exec -a <argv0>` renames the process so pgrep -f matches.  `setsid -f`
+    # detaches the process so its ppid=1 — required because the health
+    # checker filters supervisors by ppid=1 (a real canonical supervisor is
+    # setsid-detached).  Without setsid the fake would be a child of the
+    # test shell (ppid=test-shell-pid) and wouldn't count.
+    # Marker file lets us map argv0 -> spawned PID for later cleanup, since
+    # setsid detaches the process out of $! tracking.
+    local marker="$TMP/fake-sup-$$-$RANDOM.pid"
+    # Use REAL_SETSID (resolved before mock injection) so the fake actually
+    # detaches — the mock setsid on PATH just records invocations.
+    "$REAL_SETSID" -f bash -c "echo \$\$ > $marker; exec -a 'bash /path/a2a-termux-native-worker.sh supervise --env-file /x' sleep 3600" \
+        </dev/null >/dev/null 2>&1
+    # Wait briefly for the marker to appear.
+    for _ in $(seq 1 20); do
+        [[ -s "$marker" ]] && break
+        sleep 0.1
+    done
+    cat "$marker" 2>/dev/null
 }
 FAKE1=$(start_fake_supervisor)
 FAKE2=$(start_fake_supervisor)
@@ -215,12 +230,19 @@ kill -KILL "$FAKE1" "$FAKE2" 2>/dev/null || true
 # Same shape as #9 but argv0 mimics ~/.hermes/scripts/native-worker-supervisor.sh
 # so we prove a pre-migration node running BOTH scripts trips the detector.
 rm -f "$PIDFILE"
-bash -c 'exec -a "bash /root/.hermes/scripts/native-worker-supervisor.sh" sleep 3600' \
-    </dev/null >/dev/null 2>&1 &
-LEG1=$!
-bash -c 'exec -a "bash /root/.hermes/scripts/native-worker-supervisor.sh" sleep 3600' \
-    </dev/null >/dev/null 2>&1 &
-LEG2=$!
+start_fake_legacy() {
+    # Same ppid=1 detachment requirement as start_fake_supervisor.
+    local marker="$TMP/fake-leg-$$-$RANDOM.pid"
+    "$REAL_SETSID" -f bash -c "echo \$\$ > $marker; exec -a 'bash /root/.hermes/scripts/native-worker-supervisor.sh' sleep 3600" \
+        </dev/null >/dev/null 2>&1
+    for _ in $(seq 1 20); do
+        [[ -s "$marker" ]] && break
+        sleep 0.1
+    done
+    cat "$marker" 2>/dev/null
+}
+LEG1=$(start_fake_legacy)
+LEG2=$(start_fake_legacy)
 for _ in $(seq 1 20); do
     n=$(pgrep -f 'native-worker-supervisor\.sh' 2>/dev/null | wc -l)
     [[ "$n" -ge 2 ]] && break
