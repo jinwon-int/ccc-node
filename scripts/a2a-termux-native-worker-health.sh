@@ -90,13 +90,24 @@ current_supervisor_pid() {
 }
 
 # Count distinct supervisor-looking processes.  Emits space-separated PIDs on
-# stdout and the count on stderr as "count=N".  We look at *both* the canonical
-# supervise loop AND the legacy hand-rolled script, so a pre-migration node
-# with both running is caught even if flock is intact for each individually.
+# stdout.  We look at *both* the canonical supervise loop AND the legacy
+# hand-rolled script, so a pre-migration node with both running is caught
+# even if flock is intact for each individually.
+#
+# We keep only ppid=1 matches.  The canonical supervisor is `setsid -f`
+# detached (ppid=1), and its tunnel-loop / worker-loop subshells inherit the
+# same argv but have ppid=<parent-supervisor>.  Without the ppid filter, the
+# cap detector would double-count the parent + its subshell as "2 supervisors"
+# and mis-flag a healthy singleton as an ND-1236 pile-up.
 list_supervisor_pids() {
     { pgrep -f "$CANONICAL_SIG" 2>/dev/null || true
       pgrep -f "$LEGACY_SIG"    2>/dev/null || true
-    } | awk 'NF && !seen[$0]++'
+    } | awk 'NF && !seen[$0]++' | while IFS= read -r pid; do
+        [[ -z "$pid" ]] && continue
+        local ppid
+        ppid=$(awk '/^PPid:/ {print $2}' "/proc/$pid/status" 2>/dev/null || echo "")
+        [[ "$ppid" == "1" ]] && printf '%s\n' "$pid"
+    done
 }
 
 count_workers_under() {
