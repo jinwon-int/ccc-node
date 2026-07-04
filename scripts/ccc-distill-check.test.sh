@@ -17,12 +17,17 @@ out="$(bash "$CHECK" --json 2>&1)"; rc=$?
 ok "empty state exits 0" '[ "$rc" = 0 ]'
 ok "empty state reports live mode" 'jq -e ".mode == \"LIVE\" and .queue.lines == 0 and .checkpoint.snapshots == 0 and .triggers.precompact == 0" <<<"$out" >/dev/null'
 ok "empty state reports honcho base without network" 'jq -e ".honcho_base == \"http://honcho.example\"" <<<"$out" >/dev/null'
-cat > "$TMP/state/distill.log" <<'LOG'
-2026-06-20T00:00:00Z start trigger=manual dryrun=0 pid=1
-2026-06-20T00:00:01Z done trigger=manual pid=2 elapsed_s=1
-2026-06-21T00:00:00Z start trigger=sessionend dryrun=0 pid=3
-2026-06-21T00:00:01Z [drain] drained ok=2 failed=1 dropped=1 processed=4
-2026-06-22T00:00:00Z start trigger=precompact dryrun=0 pid=5
+# Timestamps must stay inside the checker's 14-day window on ANY run date —
+# hardcoded dates rot and start failing two weeks after they were written.
+D3="$(date -u -d '3 days ago' +%Y-%m-%dT%H:%M:%SZ)"
+D2="$(date -u -d '2 days ago' +%Y-%m-%dT%H:%M:%SZ)"
+D1="$(date -u -d '1 day ago'  +%Y-%m-%dT%H:%M:%SZ)"
+cat > "$TMP/state/distill.log" <<LOG
+$D3 start trigger=manual dryrun=0 pid=1
+$D3 done trigger=manual pid=2 elapsed_s=1
+$D2 start trigger=sessionend dryrun=0 pid=3
+$D2 [drain] drained ok=2 failed=1 dropped=1 processed=4
+$D1 start trigger=precompact dryrun=0 pid=5
 LOG
 cat > "$TMP/state/honcho-queue.jsonl" <<'JSONL'
 {"session_id":"a"}

@@ -199,6 +199,61 @@ class HeartbeatLoopTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.wait_for(self.status_event.wait(), timeout=1.0)
             self.assertIn("ETA ~2m 00s", self.status_calls[0][0])
 
+    async def test_hides_forecast_once_elapsed_exceeds_all_samples(self):
+        # Remaining-time ETA conditions on samples longer than elapsed; when a
+        # task outlives its whole history the ETA disappears instead of showing
+        # a stale "ETA ~2m" under an elapsed of 5m.
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "duration.jsonl"
+            path.write_text(
+                "".join(
+                    '{"user_id":1,"chat_id":2,"model":null,"duration_ms":120000,"success":true}\n'
+                    for _ in range(3)
+                ),
+                encoding="utf-8",
+            )
+            project_chat.config.heartbeat_forecast_enabled = True
+            project_chat.config.heartbeat_forecast_min_samples = 3
+            project_chat.config.heartbeat_duration_log_path = path
+            self.addCleanup(setattr, project_chat.config, "heartbeat_forecast_enabled", False)
+            self.addCleanup(setattr, project_chat.config, "heartbeat_forecast_min_samples", 10)
+            self.addCleanup(setattr, project_chat.config, "heartbeat_duration_log_path", None)
+
+            req = self._make_request()
+            req.started_at = asyncio.get_running_loop().time() - 300.0  # elapsed 5m
+            state = _UserStreamState(client=None, model=None, pending=deque([req]))
+            await self._start_loop(state)
+            await asyncio.wait_for(self.status_event.wait(), timeout=1.0)
+            text = self.status_calls[0][0]
+            self.assertIn("Working", text)
+            self.assertNotIn("ETA", text)
+
+    async def test_forecast_shrinks_as_task_progresses(self):
+        # Same history, elapsed 30s -> remaining should be ~1m 30s, not the
+        # full 2m total-median the old fixed forecast displayed.
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "duration.jsonl"
+            path.write_text(
+                "".join(
+                    '{"user_id":1,"chat_id":2,"model":null,"duration_ms":120000,"success":true}\n'
+                    for _ in range(3)
+                ),
+                encoding="utf-8",
+            )
+            project_chat.config.heartbeat_forecast_enabled = True
+            project_chat.config.heartbeat_forecast_min_samples = 3
+            project_chat.config.heartbeat_duration_log_path = path
+            self.addCleanup(setattr, project_chat.config, "heartbeat_forecast_enabled", False)
+            self.addCleanup(setattr, project_chat.config, "heartbeat_forecast_min_samples", 10)
+            self.addCleanup(setattr, project_chat.config, "heartbeat_duration_log_path", None)
+
+            req = self._make_request()
+            req.started_at = asyncio.get_running_loop().time() - 30.0
+            state = _UserStreamState(client=None, model=None, pending=deque([req]))
+            await self._start_loop(state)
+            await asyncio.wait_for(self.status_event.wait(), timeout=1.0)
+            self.assertIn("ETA ~1m 30s", self.status_calls[0][0])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -32,7 +32,8 @@ from telegram_bot.core.heartbeat import (
 from telegram_bot.utils.duration_log import (
     append_duration_sample,
     default_duration_log_path,
-    forecast_ms,
+    forecast_samples,
+    remaining_ms,
 )
 
 logger = logging.getLogger(__name__)
@@ -429,11 +430,24 @@ class ProjectChatHandler(
             return
 
         self._load_heartbeat_forecast(req)
+        # Recompute the ETA on every tick as a REMAINING-time estimate
+        # conditioned on the samples still longer than the current elapsed time
+        # (see duration_log.remaining_ms) — a fixed total-median forecast goes
+        # stale and reads absurd once elapsed exceeds it.
+        elapsed = now - req.started_at
+        forecast_remaining_ms = (
+            remaining_ms(
+                req.heartbeat_forecast_samples,
+                elapsed_ms=int(elapsed * 1000),
+            )
+            if req.heartbeat_forecast_samples
+            else None
+        )
         text = compose_heartbeat_text(
-            elapsed_seconds=now - req.started_at,
+            elapsed_seconds=elapsed,
             current_tool=req.current_tool_label,
-            forecast_seconds=(req.heartbeat_forecast_ms / 1000.0)
-            if req.heartbeat_forecast_ms is not None
+            forecast_seconds=(forecast_remaining_ms / 1000.0)
+            if forecast_remaining_ms is not None
             else None,
         )
         try:
@@ -457,12 +471,17 @@ class ProjectChatHandler(
         return Path(path)
 
     def _load_heartbeat_forecast(self, req: _PendingRequest) -> None:
+        """Load the duration samples the ETA conditions on (once per request).
+
+        Only the sample list is cached — the remaining-time estimate itself is
+        recomputed from it on every heartbeat tick so it tracks elapsed time.
+        """
         if req.heartbeat_forecast_loaded:
             return
         req.heartbeat_forecast_loaded = True
         if not getattr(config, "heartbeat_forecast_enabled", False):
             return
-        req.heartbeat_forecast_ms = forecast_ms(
+        req.heartbeat_forecast_samples = forecast_samples(
             self._duration_log_path(),
             user_id=req.user_id,
             model=req.model,

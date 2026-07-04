@@ -131,15 +131,20 @@ def recent_samples(
     return rows[-max(0, limit):]
 
 
-def forecast_ms(
+def forecast_samples(
     path: Path,
     *,
     user_id: Optional[int] = None,
     model: Optional[str] = None,
     min_samples: int = 10,
     limit: int = 200,
-) -> Optional[int]:
-    """Return a median duration forecast using exact, user, then global fallback."""
+) -> list[int]:
+    """Return the duration samples a forecast should condition on.
+
+    Uses the exact (user+model) → user → global fallback chain and returns the
+    first level that has at least *min_samples* values, or ``[]`` when no level
+    qualifies. Callers cache this list and derive per-tick estimates from it.
+    """
     filters = []
     if user_id is not None and model is not None:
         filters.append({"user_id": user_id, "model": model})
@@ -157,5 +162,51 @@ def forecast_ms(
         )
         values = [row["duration_ms"] for row in rows]
         if len(values) >= min_samples:
-            return int(median(values))
+            return values
+    return []
+
+
+def forecast_ms(
+    path: Path,
+    *,
+    user_id: Optional[int] = None,
+    model: Optional[str] = None,
+    min_samples: int = 10,
+    limit: int = 200,
+) -> Optional[int]:
+    """Return a median duration forecast using exact, user, then global fallback."""
+    values = forecast_samples(
+        path, user_id=user_id, model=model, min_samples=min_samples, limit=limit
+    )
+    if values:
+        return int(median(values))
     return None
+
+
+def remaining_ms(
+    values: Iterable[int],
+    *,
+    elapsed_ms: int,
+    min_conditional: int = 3,
+) -> Optional[int]:
+    """Estimate REMAINING time for a task that has already run *elapsed_ms*.
+
+    Request durations are heavily long-tailed (quick Q&A next to multi-minute
+    coding runs), so the unconditional median is a poor predictor for any one
+    task — and a fixed forecast turns absurd the moment elapsed exceeds it.
+    Condition on survival instead: only samples LONGER than the current elapsed
+    time say anything about a task that is still running, so the estimate is
+    ``median(samples > elapsed) - elapsed``, recomputed every tick. As elapsed
+    grows the estimate updates itself; when fewer than *min_conditional*
+    samples remain the honest answer is "unknown" (return None, hide the ETA)
+    rather than an invented number.
+
+    Rounded to whole seconds so heartbeat edits do not flicker millisecond
+    noise.
+    """
+    elapsed_ms = max(0, int(elapsed_ms))
+    cond = [int(v) for v in values if isinstance(v, int) and v > elapsed_ms]
+    if len(cond) < max(1, int(min_conditional)):
+        return None
+    remaining = int(median(cond)) - elapsed_ms
+    return max(0, int(round(remaining / 1000.0)) * 1000)
