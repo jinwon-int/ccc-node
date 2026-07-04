@@ -16,6 +16,10 @@ from telegram_bot.core.bot_shared import _PollingRestart, enforce_access_control
 from telegram_bot.core.session_isolation import apply_subprocess_session_isolation
 from telegram_bot.utils.config import config
 from telegram_bot.utils.health import health_reporter
+from telegram_bot.utils.orphan_reaper import (
+    run_periodic_reaper,
+    sweep_orphaned_claude_processes,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +39,21 @@ class BotLifecycleMixin:
             logger.info("Startup audio cleanup removed %s stale file(s)", removed)
         if removed_images:
             logger.info("Startup image cleanup removed %s stale file(s)", removed_images)
+
+        # Reap any node-claude orphans left over from a previous bridge run.
+        # On Android/Termux there is no systemd cgroup to clean up child
+        # processes automatically when the bridge exits, so PPID=1 orphans can
+        # accumulate across restarts (see jinwon-int/ccc-node#303).
+        killed = sweep_orphaned_claude_processes()
+        if killed:
+            logger.info(
+                "Startup orphan sweep: signalled %d orphan node-claude process(es) — PIDs %s",
+                len(killed),
+                killed,
+            )
+        else:
+            logger.debug("Startup orphan sweep: no orphans found")
+
         await self._set_bot_commands()
         logger.info("Bot initialization complete")
 
@@ -218,6 +237,7 @@ class BotLifecycleMixin:
 
             watchdog_task = None
             push_task = None
+            reaper_task = None
             try:
                 await self.application.start()
                 await self.application.updater.start_polling(
@@ -236,6 +256,9 @@ class BotLifecycleMixin:
                 watchdog_task = asyncio.create_task(self._polling_watchdog(stop_event))
                 push_task = asyncio.create_task(
                     self._push_notifier.run(self.application, stop_event)
+                )
+                reaper_task = asyncio.create_task(
+                    run_periodic_reaper(), name="orphan-reaper"
                 )
 
                 await self._wait_for_polling_exit(stop_event)
@@ -292,7 +315,7 @@ class BotLifecycleMixin:
                 health_reporter.record_telegram_error(message, consecutive_failures=1)
                 raise SystemExit(message)
             finally:
-                for _task in (watchdog_task, push_task):
+                for _task in (watchdog_task, push_task, reaper_task):
                     if _task and not _task.done():
                         _task.cancel()
                         try:
