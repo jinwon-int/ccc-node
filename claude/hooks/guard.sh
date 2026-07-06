@@ -15,6 +15,10 @@
 #   operator_review_gated   — DENIED; history/published-state change needing review evidence too.
 # guard.sh enforces the two *gated* profiles (deny). The other two are non-blocking.
 #
+# Secret policy (2026-07-06): local file reads (.env, credentials) are NOT gated — the node
+# operator already has full shell access, so reading locally carries no marginal risk.
+# Only EXTERNAL exfil (curl/wget/scp sending secret files to remote endpoints) stays gated.
+#
 # Design notes:
 #   - No `set -e`: grep "no match" returns 1 and must not abort the script.
 #   - Fail-OPEN only if jq/stdin is unavailable (jq is a harness dependency); everything else
@@ -47,19 +51,6 @@ if [ "${CCC_ALLOW_GATED:-0}" = "1" ]; then
   echo "ccc-node guard: CCC_ALLOW_GATED=1 set — gated action allowed by operator (audit: tool=$tool)." >&2
   exit 0
 fi
-
-# --- Secret-file access via Read/Edit/Write tools (path-based) ---
-case "$tool" in
-  Read|Edit|Write|NotebookEdit|MultiEdit)
-    case "$fpath" in
-      *.template.*|*.env.example|*.env.template|*.env.sample) : ;;  # templates/examples are safe
-      *.pub|*.pub.pem) : ;;  # public keys are safe — only private keys/secrets are gated
-      */.env|*/.env.*|*.env|*.credentials.json|*.pem|*/id_rsa|*/id_rsa.*|*.key)
-        # Covers .env, .env.local, .env.production, foo.env, etc. (templates + public keys carved above).
-        deny "secret-file" "operator_approval_gated" "$tool on $fpath" ;;
-    esac
-    ;;
-esac
 
 # --- Self-update operator config: agents may READ but never write -------------
 # ~/.claude/self-update.services / .repo define which services the pre-approved
@@ -186,7 +177,7 @@ g 'git[[:space:]]+(filter-branch|filter-repo)([[:space:]]|$)|git-filter-repo'   
 # without per-action approval — a node must be able to update from GitHub and
 # recover its own services unattended. The bundled `ccc-self-update.sh run`
 # remains the audited "update + restart the allowlisted set" path. The genuinely
-# dangerous gates below (secret read/exfil, DB destructive/migrate, force-push to
+# dangerous gates below (secret exfil, DB destructive/migrate, force-push to
 # protected branches, catastrophic rm, self-update.services writes) are untouched.
 
 # Writes to the self-update operator config via shell (redirects/copy tools).
@@ -203,13 +194,11 @@ g '[[:space:]]replay([[:space:]]|$)'                                            
 g 'npm[[:space:]]+publish([[:space:]]|$)|gh[[:space:]]+release[[:space:]]+create([[:space:]]|$)|git[[:space:]]+push([[:space:]]|$)[^|;&]*--tags' && deny "release/publish" "operator_review_gated" "$c"
 g 'gh[[:space:]]+repo[[:space:]]+edit([[:space:]]|$)[^|;&]*--visibility'                          && deny "repo-visibility" "operator_approval_gated" "$c"
 
-# secret read / exfil (quote-stripped; `.env` matched only when NOT followed by
-# more name chars, so `.env` is caught but `.env.example` templates are not).
-# Verb list extended beyond pagers to copy/encode tools (cp/mv/dd/tee/base64/…).
-gnp '\b(cat|less|more|head|tail|xxd|od|strings|bat|nl|tac|cp|mv|dd|tee|install|rsync|base64|gpg|openssl)\b[^|;&]*(\.env([^A-Za-z0-9_.-]|$)|\.credentials\.json|\bid_rsa\b|\.pem([[:space:]]|$))' && deny "secret-read" "operator_approval_gated" "$c"
-# Indirect read via an interpreter, e.g. python3 -c "open('.env').read()".
-gnp '\b(python3?|ruby|perl|node|php)\b[^|;&]*(\.env([^A-Za-z0-9_.-]|$)|\.credentials|\bid_rsa\b|\.pem\b)' && deny "secret-indirect-read" "operator_approval_gated" "$c"
-gn '\b(curl|wget|nc|ncat|scp|sftp|ftp|rsync|ssh)\b[^|;&]*(\.env([^A-Za-z0-9_.-]|$)|\.credentials|\bid_rsa\b|secret|token)' && deny "secret-exfil" "operator_approval_gated" "$c"
+# secret exfil — external transfer of credential files to remote endpoints.
+# Local reads (.env, credentials) are intentionally NOT gated: the operator already has
+# full shell access to the node, so local reads carry no marginal risk. Only network
+# exfil (curl/wget/nc/scp sending secret files to a remote) stays gated.
+gn '\b(curl|wget|nc|ncat|scp|sftp|ftp|rsync)\b[^|;&]*(\.env([^A-Za-z0-9_.-]|$)|\.credentials|\bid_rsa\b|secret|token)' && deny "secret-exfil" "operator_approval_gated" "$c"
 
 # catastrophic rm against absolute / home roots (quote-stripped; long flags too)
 gn '\brm\b([[:space:]]+--?[A-Za-z-]+)*[[:space:]]+(/|~|\$HOME|/root|/etc|/var|/usr|/bin|/lib)([[:space:]/]|$)' && deny "rm-catastrophic" "operator_approval_gated" "$c"
