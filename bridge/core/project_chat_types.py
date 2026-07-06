@@ -39,6 +39,10 @@ class _PendingRequest:
     typing_callback: Optional[TypingCallback]
     future: asyncio.Future
     status_callback: Optional[StatusCallback] = None
+    # Persistent task-ledger record id (None when the ledger is unavailable).
+    # Terminal transitions (completed/failed/canceled/timeout/interrupted) go
+    # through the ledger so no status indicator can outlive its task record.
+    task_id: Optional[str] = None
     sent_session_id: str = "default"
     last_typing_at: float = 0.0
     started_at: float = 0.0

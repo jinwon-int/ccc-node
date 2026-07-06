@@ -14,6 +14,11 @@ from telegram_bot.core.project_chat_types import (
     _PendingRequest,
     _UserStreamState,
 )
+from telegram_bot.core.task_ledger import (
+    CANCELED as TASK_CANCELED,
+    FAILED as TASK_FAILED,
+    TIMEOUT as TASK_TIMEOUT,
+)
 from telegram_bot.core.sdk_text import (
     RESTART_INTERRUPT_NOTICE,
     _is_retryable_sdk_error,
@@ -77,6 +82,7 @@ class ProjectChatProcessMixin:
             streaming_handler=streaming_handler,
         )
         request.started_at = loop.time()
+        request.task_id = self._ledger_create(user_id, chat_id)
         state: Optional[_UserStreamState] = None
 
         try:
@@ -108,7 +114,8 @@ class ProjectChatProcessMixin:
                     await streaming_handler.cancel()
                 except Exception as e:
                     logger.error(f"Failed to cancel streaming handler: {e}")
-            await self._cleanup_heartbeat(request)
+            cleaned = await self._cleanup_heartbeat(request)
+            self._ledger_finish(request, TASK_CANCELED, cleanup_done=cleaned)
             await self.stop(user_id)
             # Don't return a message - bot.py will handle the user response
             raise
@@ -117,7 +124,8 @@ class ProjectChatProcessMixin:
             logger.warning(
                 f"Query timed out for user {user_id} after {_process_timeout()}s"
             )
-            await self._cleanup_heartbeat(request)
+            cleaned = await self._cleanup_heartbeat(request)
+            self._ledger_finish(request, TASK_TIMEOUT, cleanup_done=cleaned)
             await self.stop(user_id)
             msg = f"⏰ Timed out after {_process_timeout()}s. Please retry or simplify your request."
             health_reporter.record_claude_error(msg)
@@ -129,7 +137,8 @@ class ProjectChatProcessMixin:
                     state.pending.remove(request)
                 except ValueError:
                     pass
-            await self._cleanup_heartbeat(request)
+            cleaned = await self._cleanup_heartbeat(request)
+            self._ledger_finish(request, TASK_FAILED, cleanup_done=cleaned)
 
             err = str(e)
             logger.error(
@@ -174,6 +183,7 @@ class ProjectChatProcessMixin:
                     streaming_handler=retry_handler,
                 )
                 retry_request.started_at = loop.time()
+                retry_request.task_id = self._ledger_create(user_id, chat_id)
                 retry_state: Optional[_UserStreamState] = None
                 try:
                     retry_state = await self._get_or_create_stream(
@@ -198,7 +208,8 @@ class ProjectChatProcessMixin:
                             retry_state.pending.remove(retry_request)
                         except ValueError:
                             pass
-                    await self._cleanup_heartbeat(retry_request)
+                    cleaned = await self._cleanup_heartbeat(retry_request)
+                    self._ledger_finish(retry_request, TASK_FAILED, cleanup_done=cleaned)
                     if not retry_future.done():
                         retry_future.cancel()
                     logger.error(
