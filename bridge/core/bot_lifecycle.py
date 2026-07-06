@@ -146,6 +146,7 @@ class BotLifecycleMixin:
 
     _MIN_UPTIME = 30  # seconds — polling exits faster → count as crash
     _MAX_RAPID_CRASHES = 5
+    _WORKLOAD_INTERVAL = 10  # seconds between in-flight workload snapshots
 
     def run(self):
         """Run the bot with in-process polling restart capability."""
@@ -278,6 +279,7 @@ class BotLifecycleMixin:
             watchdog_task = None
             push_task = None
             reaper_task = None
+            workload_task = None
             try:
                 await self.application.start()
                 await self.application.updater.start_polling(
@@ -299,6 +301,9 @@ class BotLifecycleMixin:
                 )
                 reaper_task = asyncio.create_task(
                     run_periodic_reaper(), name="orphan-reaper"
+                )
+                workload_task = asyncio.create_task(
+                    self._workload_reporter(stop_event), name="workload-reporter"
                 )
 
                 await self._wait_for_polling_exit(stop_event)
@@ -355,7 +360,7 @@ class BotLifecycleMixin:
                 health_reporter.record_telegram_error(message, consecutive_failures=1)
                 raise SystemExit(message)
             finally:
-                for _task in (watchdog_task, push_task, reaper_task):
+                for _task in (watchdog_task, push_task, reaper_task, workload_task):
                     if _task and not _task.done():
                         _task.cancel()
                         try:
@@ -405,6 +410,24 @@ class BotLifecycleMixin:
                         logger.error("updater.stop() timed out, forcing process exit")
                         os._exit(1)
                     raise _PollingRestart()
+
+    async def _workload_reporter(self, stop_event: asyncio.Event):
+        """Publish in-flight request count to health.json on a fixed interval.
+
+        The self-update procedure reads this to defer restarting the bridge
+        while it is serving a request, so an in-flight ``claude`` child is not
+        SIGTERM-killed mid-task (exit 143).
+        """
+        from telegram_bot.core.project_chat import project_chat_handler
+
+        while not stop_event.is_set():
+            try:
+                now = asyncio.get_event_loop().time()
+                count, oldest_age = project_chat_handler.workload_snapshot(now)
+                health_reporter.record_workload(count, oldest_age)
+            except Exception as exc:
+                logger.debug("Workload reporter tick failed: %s", type(exc).__name__)
+            await asyncio.sleep(self._WORKLOAD_INTERVAL)
 
     async def _wait_for_polling_exit(self, stop_event: asyncio.Event):
         """Block until stop signal or polling exits unexpectedly."""

@@ -27,7 +27,16 @@
 # Env: CCC_SELF_UPDATE_REPO, CCC_SELF_UPDATE_BRANCH (default main),
 #      CCC_SELF_UPDATE_SYSTEMCTL (default systemctl; tests inject a fake),
 #      CCC_STATE_DIR, CCC_PUSH_SPOOL, CCC_NODE.
-# Exit: 0 = up-to-date or updated cleanly; non-zero = aborted (reason logged).
+# Idle gate: before touching anything the run defers (exit 8) while the telegram
+#      bridge is serving a request, so a restart cannot SIGTERM-kill an in-flight
+#      `claude` child (exit 143) mid-task. Reads the bridge's health.json.
+#      CCC_SELF_UPDATE_HEALTH_FILE (default ~/.telegram_bot/health.json),
+#      CCC_SELF_UPDATE_HEALTH_FRESH_SECONDS (90), CCC_SELF_UPDATE_BUSY_MAX_SECONDS
+#      (1800 — never defer a task older than this), CCC_SELF_UPDATE_MAX_DEFER_SECONDS
+#      (3600 — cap total deferral so continuous load can't starve updates).
+#      Fail-open (missing/unreadable/stale health → proceed); --force bypasses.
+# Exit: 0 = up-to-date or updated cleanly; 8 = deferred (bridge busy); other
+#      non-zero = aborted (reason logged).
 set -uo pipefail
 
 CLAUDE_DIR="${CCC_CLAUDE_DIR:-${HOME:-/root}/.claude}"
@@ -105,6 +114,68 @@ if ! mkdir "$LOCK" 2>/dev/null; then
   fi
 fi
 trap 'rmdir "$LOCK" 2>/dev/null' EXIT
+
+# --- idle gate: never restart the bridge while it is serving a request --------
+# The bridge writes an in-flight workload snapshot to its health.json. Restarting
+# it mid-request SIGTERM-kills the in-flight `claude` child (exit 143) and destroys
+# the user's work. When the bridge is busy we defer the WHOLE run (nothing fetched
+# or restarted) and let the next scheduled tick retry — bounded so a hung/very-long
+# request, or continuous load, cannot starve updates forever.
+HEALTH_FILE="${CCC_SELF_UPDATE_HEALTH_FILE:-${HOME:-/root}/.telegram_bot/health.json}"
+FRESH_SECONDS="${CCC_SELF_UPDATE_HEALTH_FRESH_SECONDS:-90}"
+BUSY_MAX_SECONDS="${CCC_SELF_UPDATE_BUSY_MAX_SECONDS:-1800}"
+MAX_DEFER_SECONDS="${CCC_SELF_UPDATE_MAX_DEFER_SECONDS:-3600}"
+DEFER_MARK="$STATE_DIR/self-update.deferred-since"
+
+# Echo a reason and return 0 when the bridge is busy; return 1 (fail-open) when
+# idle, unknown, stale, or over the per-task cap.
+bridge_is_busy() {
+  [ -f "$HEALTH_FILE" ] || return 1
+  python3 - "$HEALTH_FILE" "$FRESH_SECONDS" "$BUSY_MAX_SECONDS" <<'PY'
+import json, sys
+from datetime import datetime, timezone
+path, fresh_window, busy_max = sys.argv[1], float(sys.argv[2]), float(sys.argv[3])
+try:
+    d = json.load(open(path, encoding="utf-8"))
+except Exception:
+    sys.exit(1)  # unreadable -> fail-open (treat as idle)
+wl = d.get("workload") or {}
+try:
+    active = int(wl.get("active_requests") or 0)
+    oldest = float(wl.get("oldest_request_age_seconds") or 0)
+except Exception:
+    sys.exit(1)
+ua = d.get("updated_at")
+fresh = False
+if ua:
+    try:
+        t = datetime.fromisoformat(str(ua).replace("Z", "+00:00"))
+        fresh = (datetime.now(timezone.utc) - t).total_seconds() <= fresh_window
+    except Exception:
+        fresh = False
+if fresh and active > 0 and oldest < busy_max:
+    print("active=%d oldest=%ds" % (active, int(oldest)))
+    sys.exit(0)  # busy
+sys.exit(1)  # idle / stale / over-cap -> proceed
+PY
+}
+
+if [ "$FORCE" != "1" ] && busy_reason="$(bridge_is_busy)"; then
+  now_epoch="$(date +%s)"
+  since="$(cat "$DEFER_MARK" 2>/dev/null)"
+  case "$since" in ''|*[!0-9]*) since="" ;; esac
+  [ -n "$since" ] || { since="$now_epoch"; printf '%s' "$now_epoch" > "$DEFER_MARK" 2>/dev/null; }
+  waited=$(( now_epoch - since ))
+  if [ "$waited" -lt "$MAX_DEFER_SECONDS" ]; then
+    log "deferred reason=bridge-busy $busy_reason waited=${waited}s"
+    say "self-update: bridge busy ($busy_reason) — deferring, will retry next tick"
+    exit 8
+  fi
+  log "proceed reason=defer-cap-exceeded waited=${waited}s $busy_reason"
+  say "self-update: bridge busy but deferred ${waited}s ≥ ${MAX_DEFER_SECONDS}s cap — proceeding"
+fi
+# Not busy (or forced, or cap exceeded) → clear any deferral marker and continue.
+rm -f "$DEFER_MARK" 2>/dev/null
 
 REPO="$(resolve_repo)"
 

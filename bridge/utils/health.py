@@ -56,6 +56,10 @@ class RuntimeHealthReporter:
                 "last_error_at": None,
                 "last_error": "",
             },
+            "workload": {
+                "active_requests": 0,
+                "oldest_request_age_seconds": 0,
+            },
         }
 
     @property
@@ -171,6 +175,24 @@ class RuntimeHealthReporter:
             self._state["claude"]["last_error_at"] = _utc_now_iso()
             self._state["claude"]["last_error"] = _normalize_reason(error)
             self._recompute_service_locked()
+            self._write_health_locked()
+
+    def record_workload(
+        self, active_requests: int, oldest_request_age_seconds: float
+    ) -> None:
+        """Publish the current in-flight request count for idle-gated restarts.
+
+        External supervisors (e.g. the self-update procedure) read this from
+        ``health.json`` and defer a restart while the bridge is busy, so an
+        in-flight ``claude`` child is not SIGTERM-killed mid-task.
+        """
+        with self._lock:
+            self._state["workload"] = {
+                "active_requests": max(0, int(active_requests)),
+                "oldest_request_age_seconds": max(
+                    0, int(oldest_request_age_seconds)
+                ),
+            }
             self._write_health_locked()
 
     def snapshot(self) -> dict[str, Any]:
