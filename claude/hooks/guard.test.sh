@@ -81,12 +81,21 @@ run deny Bash command 'git push -f origin +main:main'
 run deny Bash command 'git push -f origin feat/x && rm -rf /tmp/x'
 run deny Bash command 'git filter-branch --tree-filter x HEAD'
 run deny Bash command 'git filter-repo --path secret'
-run deny Bash command 'systemctl restart a2a-broker'
-run deny Bash command 'systemctl restart claude-a2a-analysis-bridge'
-run deny Bash command 'systemctl restart a2a-hermes-worker'
-run deny Bash command 'systemctl restart gwakga-broker'
-run deny Bash command 'pm2 restart gateway'
-run deny Bash command 'sudo systemctl stop hermes-gateway'
+# Operator-approved relaxation: fleet service control (restart/start/reload/stop/
+# kill) is NOT gated — a node manages its own service lifecycle directly.
+run allow Bash command 'systemctl restart a2a-broker'
+run allow Bash command 'systemctl restart claude-a2a-analysis-bridge'
+run allow Bash command 'systemctl restart a2a-hermes-worker'
+run allow Bash command 'systemctl restart gwakga-broker'
+run allow Bash command 'pm2 restart gateway'
+run allow Bash command 'systemctl start a2a-worker'
+run allow Bash command 'systemctl reload hermes-broker'
+run allow Bash command 'ssh nosuk systemctl restart a2a-hermes-worker'
+run allow Bash command 'restart-worker'
+run allow Bash command 'sudo systemctl stop hermes-gateway'
+run allow Bash command 'systemctl kill a2a-worker'
+run allow Bash command 'pm2 stop gateway'
+run allow Bash command 'stop-broker'
 # ccc-telegram-bridge restart is intentionally NOT gated (local, low blast radius).
 run allow Bash command 'bash restart_bridge.sh'
 run deny Bash command 'redis-cli FLUSHALL'
@@ -155,9 +164,9 @@ run deny Bash command 'printf "%s\n" broker > /root/.claude/self-update.services
 run deny Bash command 'echo x | tee /root/.claude/self-update.services'
 run deny Bash command 'sed -i "s/a/b/" /root/.claude/self-update.repo'
 run allow Bash command 'cat /root/.claude/self-update.services'
-# ...and direct fleet service control stays gated regardless
-run deny Bash command 'systemctl restart hermes-broker'
-run deny Bash command 'systemctl stop a2a-gateway'
+# ...and direct fleet service control (restart or stop) is allowed.
+run allow Bash command 'systemctl restart hermes-broker'
+run allow Bash command 'systemctl stop a2a-gateway'
 
 # ---- escape hatch: gated allowed only with operator signal ----
 run allow Bash command 'git push --force origin main' 'CCC_ALLOW_GATED=1'
