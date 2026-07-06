@@ -87,30 +87,6 @@ gi() { grep -Eiq "$1" <<<"$c"; } # case-insensitive
 cn="${c//\"/}"; cn="${cn//\'/}"
 gn() { grep -Eq "$1" <<<"$cn"; }    # case-sensitive, quote-stripped
 
-# 0 = safe low-risk local Telegram bridge restart.
-ccc_telegram_bridge_restart() {
-  # Never allow the carve-out to hide chained/compound service controls.
-  case "$c" in *';'*|*'&'*|*'|'*|*'`'*|*'$('*|*$'\n'*) return 1;; esac
-  local toks; read -ra toks <<<"$c"
-  local n=${#toks[@]} i=0 si=-1 service_cmds=0
-  while [ "$i" -lt "$n" ]; do
-    case "${toks[$i]}" in
-      systemctl|service) service_cmds=$((service_cmds+1)); [ "$si" -lt 0 ] && si=$i ;;
-    esac
-    i=$((i+1))
-  done
-  [ "$service_cmds" -eq 1 ] || return 1
-
-  [ "$((si + 2))" -lt "$n" ] || return 1
-  [ "${toks[$((si + 1))]}" = "restart" ] || return 1
-  case "${toks[$((si + 2))]}" in
-    ccc-telegram-bridge|ccc-telegram-bridge.service) : ;;
-    *) return 1 ;;
-  esac
-  [ "$((si + 3))" -eq "$n" ] || return 1
-  return 0
-}
-
 # force push / history rewrite
 #
 # Force-push is review-gated by default, BUT auto-allowed (operator-approved
@@ -195,20 +171,15 @@ if is_forcepush; then
 fi
 g 'git[[:space:]]+(filter-branch|filter-repo)([[:space:]]|$)|git-filter-repo'                               && deny "history-rewrite" "operator_review_gated" "$c"
 
-# broker / Gateway / worker service control (operator-gated, fleet-risky).
-# NOTE: ccc-telegram-bridge restart is intentionally NOT gated — it is a local,
-# single-node Telegram channel restart (low blast radius), unlike broker/Gateway/
-# worker restarts which can disrupt the A2A fleet mid-task. The carve-out below
-# still fast-allows the bare local form; dropping `bridge` from the deny patterns
-# additionally permits remote (ssh-wrapped) ccc-telegram-bridge restarts used by
-# fleet rollouts, without loosening any broker/Gateway/worker/DB/secret gate.
-# For "update this node and restart its services" the PRE-APPROVED path is
-# `~/.claude/hooks/ccc-self-update.sh run` (reviewed fixed procedure; restarts
-# only operator-allowlisted units — see self-update-config gate above). Direct
-# service control below stays gated.
-ccc_telegram_bridge_restart && exit 0
-g '(systemctl|service|supervisorctl|pm2)[[:space:]]+(restart|stop|start|reload|kill)([[:space:]]).*(broker|gateway|worker|a2a|hermes|openclaw)' && deny "service-control" "operator_approval_gated" "$c"
-gi '\b(restart|reload)[-_](broker|gateway|worker)\b' && deny "service-control" "operator_approval_gated" "$c"
+# broker / Gateway / worker service control — NOT gated.
+# Operator-approved relaxation (reviewed in PR): a fleet node manages its own
+# service lifecycle directly, so restart / start / reload / stop / kill of
+# broker/Gateway/worker/a2a/hermes/openclaw (and ccc-telegram-bridge) proceed
+# without per-action approval — a node must be able to update from GitHub and
+# recover its own services unattended. The bundled `ccc-self-update.sh run`
+# remains the audited "update + restart the allowlisted set" path. The genuinely
+# dangerous gates below (secret read/exfil, DB destructive/migrate, force-push to
+# protected branches, catastrophic rm, self-update.services writes) are untouched.
 
 # Writes to the self-update operator config via shell (redirects/copy tools).
 # Read (cat/grep) stays allowed; only mutation is gated.

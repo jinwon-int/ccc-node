@@ -9,7 +9,7 @@ approval from execution**: gated actions do not run without an explicit operator
 |---|---|---|---|
 | `autonomous` | Proceeds silently | — (not matched by guard) | read/search, normal `git`/`gh`/`npm`, file edits in repo |
 | `operator_notify` | Proceeds; recorded | `audit.sh` (PostToolUse) | any mutating tool call (commit, push to a branch, merge) — auditable after the fact |
-| `operator_approval_gated` | **DENIED** until `CCC_ALLOW_GATED=1` | `guard.sh` | service control (broker/Gateway/worker/bridge), DB destructive/migrate/replay, repo visibility, secret read/exfil, secret-file Read/Edit/Write, catastrophic `rm` |
+| `operator_approval_gated` | **DENIED** until `CCC_ALLOW_GATED=1` | `guard.sh` | DB destructive/migrate/replay, repo visibility, secret read/exfil, secret-file Read/Edit/Write, catastrophic `rm` (service control is no longer gated — see note) |
 | `operator_review_gated` | **DENIED**; also needs review evidence | `guard.sh` | force-push *to a protected/ambiguous/multi target*, history rewrite, release/publish/tag-push (changes published/shared state) |
 
 ## Bypass (operator approval)
@@ -43,8 +43,14 @@ recorded to `~/.claude/state/approval-needed.log`; the bypass is logged to stder
   runs autonomously — approval happened at PR review time. Its blast-radius boundary,
   `~/.claude/self-update.services` / `self-update.repo`, is write-gated for agents
   (`self-update-config`, Edit/Write tools and shell redirect/copy verbs); reads stay
-  allowed. Direct broker/Gateway/worker service control remains gated. See
-  `docs/self-update.md`.
+  allowed. See `docs/self-update.md`.
+- **Service-control relaxation** (operator-approved): direct service lifecycle
+  control — `restart` / `start` / `reload` / `stop` / `kill` — of fleet services
+  (`broker`/`Gateway`/`worker`/`a2a`/`hermes`/`openclaw` and `ccc-telegram-bridge`)
+  is **not gated**. A fleet node manages its own services directly so it can update
+  from GitHub and recover unattended. The genuinely dangerous gates (secret, DB,
+  force-push to protected branches, catastrophic `rm`, `self-update.services`
+  writes) are unaffected.
 - Fail-closed: if a pattern is uncertain, prefer gating. Patterns are covered by
   `guard.test.sh` (allow + deny cases, including the force-push relaxation) to avoid
   blocking normal autonomous work.

@@ -1,11 +1,12 @@
 # Self-update (pre-approved node maintenance)
 
-Broker/Gateway/worker service control is `operator_approval_gated` in guard.sh
-— and stays that way. But a fleet node is only useful if it can pick up
-ccc-node updates and restart its own services. The resolution follows the same
-pattern as the `ccc-telegram-bridge` restart carve-out: instead of loosening
-the gate, the operator **pre-approves a fixed procedure in code review**, and
-agents may invoke that procedure as a whole.
+A fleet node must be able to pick up ccc-node updates and restart its own
+services. Direct service control (`restart`/`start`/`reload`/`stop`/`kill`) of
+broker/Gateway/worker units is allowed by guard.sh (operator-approved
+relaxation). This script is still the **pre-approved, audited way to do it as one
+atomic step** — pull → `setup.sh` → restart the operator-allowlisted set with
+fail-closed preconditions and rollback — which an agent may invoke as a whole
+rather than composing the steps ad hoc.
 
 ## The procedure
 
@@ -37,8 +38,10 @@ agents may invoke that procedure as a whole.
   file (`self-update-config` gate) — Edit/Write tools *and* shell redirection /
   copy tools — while reads stay allowed. Only the operator decides which units
   the procedure may ever restart.
-- Direct `systemctl restart <broker|gateway|worker|…>` remains
-  `operator_approval_gated` exactly as before. Nothing was loosened.
+- Direct `systemctl restart|start|reload|stop|kill <broker|gateway|worker|…>` is
+  allowed (operator-approved relaxation — a node manages its own service lifecycle
+  so it can update and recover unattended). This bundled procedure remains the
+  audited way to do "update **and** restart the allowlisted set" atomically.
 
 ## Operator setup (once per node)
 
