@@ -148,6 +148,16 @@ run allow Read file_path '/app/.env.example'
 run allow Read file_path '/app/.env.template'
 run allow Read file_path '/app/.env.sample'
 run allow Bash command 'cat bridge/.env.example'
+# ...and PUBLIC keys (.pub / .pub.pem) are readable; PRIVATE keys/secrets stay gated.
+run allow Read file_path '/etc/broker/gwakga-agent-card-ed25519.pub.pem'
+run allow Read file_path '/home/x/.ssh/id_ed25519.pub'
+run allow Bash command 'cat /etc/broker/gwakga-agent-card-ed25519.pub.pem'
+run allow Bash command 'head -20 keys/agent.pub.pem'
+run deny Read file_path '/etc/broker/server.pem'
+run deny Read file_path '/etc/ssl/private/tls.key'
+run deny Bash command 'cat /etc/broker/server.pem'
+run deny Bash command "python3 -c \"print(open('server.pem').read())\""
+run deny Bash command 'cat agent.pub.pem server.pem'
 
 # ---- self-update: pre-approved procedure allowed, its config gated ----
 # The fixed maintenance procedure may run (approval happened at PR review time)...
