@@ -388,6 +388,29 @@ class ProjectChatHandler(
                 self._streams[key] = state
             return state
 
+    def workload_snapshot(self, now: float) -> tuple[int, float]:
+        """Return ``(in_flight_count, oldest_request_age_seconds)``.
+
+        Exposes bridge busyness so an external supervisor (the self-update
+        procedure) can avoid restarting the bridge mid-request — a restart
+        SIGTERM-kills the in-flight ``claude`` child (exit 143) and destroys
+        the user's work. ``now`` must come from the event loop clock so it is
+        comparable to ``_PendingRequest.started_at``.
+        """
+        count = 0
+        oldest_started: Optional[float] = None
+        for state in list(self._streams.values()):
+            for req in list(state.pending):
+                if req.future.done():
+                    continue
+                count += 1
+                if req.started_at > 0 and (
+                    oldest_started is None or req.started_at < oldest_started
+                ):
+                    oldest_started = req.started_at
+        oldest_age = (now - oldest_started) if oldest_started is not None else 0.0
+        return count, max(0.0, oldest_age)
+
     async def _cleanup_heartbeat(self, req: _PendingRequest) -> None:
         """Delete/clear the transient heartbeat message for a request."""
         if not req.status_callback or req.heartbeat_message_id is None:

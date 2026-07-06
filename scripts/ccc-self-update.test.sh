@@ -98,5 +98,46 @@ git -C "$REPO" checkout -q main
 out="$(run_selfup status)"; rc=$?
 ok "status reports repo and services" '[ "$rc" = 0 ] && grep -q "repo: $REPO" <<<"$out" && grep -q "services file:" <<<"$out"'
 
+# --- 7) idle gate: defer restarts while the bridge is serving a request --------
+HFILE="$TMP/health.json"
+export CCC_SELF_UPDATE_HEALTH_FILE="$HFILE"
+# Bring the node fully up-to-date so a *proceed* is a clean exit-0 (no side effects).
+git -C "$REPO" fetch -q origin main; git -C "$REPO" reset --hard -q origin/main
+now_iso() { python3 -c "from datetime import datetime,timezone as z;print(datetime.now(z.utc).isoformat().replace('+00:00','Z'))"; }
+old_iso() { python3 -c "from datetime import datetime,timezone as z,timedelta as d;print((datetime.now(z.utc)-d(seconds=600)).isoformat().replace('+00:00','Z'))"; }
+mk_health() { printf '{"updated_at":"%s","workload":{"active_requests":%s,"oldest_request_age_seconds":%s}}' "$1" "$2" "$3" > "$HFILE"; }
+clr_defer() { rm -f "$STATE/self-update.deferred-since"; }
+
+clr_defer; mk_health "$(now_iso)" 2 45
+out="$(run_selfup run 2>&1)"; rc=$?
+ok "busy bridge defers (exit 8)" '[ "$rc" = 8 ] && grep -q "bridge busy" <<<"$out"'
+ok "defer marker recorded" '[ -f "$STATE/self-update.deferred-since" ]'
+ok "defer writes audit log" 'grep -q "deferred reason=bridge-busy" "$STATE/self-update.log"'
+
+clr_defer; mk_health "$(now_iso)" 0 0
+out="$(run_selfup run 2>&1)"; rc=$?
+ok "idle bridge proceeds" '[ "$rc" = 0 ]'
+
+clr_defer; mk_health "$(old_iso)" 3 45
+out="$(run_selfup run 2>&1)"; rc=$?
+ok "stale health proceeds (fail-open)" '[ "$rc" = 0 ]'
+
+clr_defer; mk_health "$(now_iso)" 2 45
+out="$(run_selfup run --force 2>&1)"; rc=$?
+ok "--force bypasses idle gate" '[ "$rc" != 8 ]'
+
+clr_defer; mk_health "$(now_iso)" 1 99999
+out="$(run_selfup run 2>&1)"; rc=$?
+ok "task older than busy-max proceeds" '[ "$rc" = 0 ]'
+
+# total-deferral cap: continuous busy must not starve updates forever
+mk_health "$(now_iso)" 1 60
+echo "$(( $(date +%s) - 7200 ))" > "$STATE/self-update.deferred-since"
+out="$(run_selfup run 2>&1)"; rc=$?
+ok "deferral cap exceeded proceeds despite busy" '[ "$rc" = 0 ]'
+ok "deferral marker cleared after proceeding" '[ ! -f "$STATE/self-update.deferred-since" ]'
+
+rm -f "$HFILE"; unset CCC_SELF_UPDATE_HEALTH_FILE
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

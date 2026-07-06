@@ -56,6 +56,24 @@ A2A fleet rollout) resolves to the guarded, audited
 `~/.claude/hooks/ccc-self-update.sh run` — no `CCC_ALLOW_GATED` needed and no
 per-restart approval friction.
 
+## Idle gate (don't restart mid-task)
+
+`systemctl restart` SIGTERMs the whole service cgroup. For the telegram bridge
+that kills the in-flight `claude` child (exit 143) and destroys the user's work —
+so a self-update that lands while the bridge is busy silently interrupts a
+running task. To avoid that, the run **defers before touching anything** while
+the bridge is serving a request:
+
+- the bridge publishes an in-flight `workload` snapshot to its `health.json`;
+- if that snapshot is fresh and shows `active_requests > 0`, the run logs a
+  `deferred reason=bridge-busy` audit line and exits `8` — nothing is fetched or
+  restarted, and the next scheduled tick retries;
+- bounded so it can't starve updates: a single task older than
+  `CCC_SELF_UPDATE_BUSY_MAX_SECONDS` no longer blocks, and total deferral is
+  capped at `CCC_SELF_UPDATE_MAX_DEFER_SECONDS`;
+- fail-open (missing / unreadable / stale `health.json` → proceed) and
+  `--force` bypasses the gate entirely.
+
 ## Knobs
 
 | Env | Default | Meaning |
@@ -64,6 +82,11 @@ per-restart approval friction.
 | `CCC_SELF_UPDATE_BRANCH` | `main` | branch the node must be on |
 | `CCC_SELF_UPDATE_SERVICES` | `~/.claude/self-update.services` | allowlist path |
 | `CCC_SELF_UPDATE_SYSTEMCTL` | `systemctl` | service manager command (tests inject a fake) |
+| `CCC_SELF_UPDATE_HEALTH_FILE` | `~/.telegram_bot/health.json` | bridge health file the idle gate reads |
+| `CCC_SELF_UPDATE_HEALTH_FRESH_SECONDS` | `90` | max age of `health.json` for its workload to count |
+| `CCC_SELF_UPDATE_BUSY_MAX_SECONDS` | `1800` | never defer for a task older than this |
+| `CCC_SELF_UPDATE_MAX_DEFER_SECONDS` | `3600` | cap total deferral so continuous load can't starve updates |
 
 Exit codes: 0 ok/up-to-date · 3 lock held · 4 precondition failed · 5 fetch/ff
-failed · 6 setup failed (rolled back) · 7 service restart failure.
+failed · 6 setup failed (rolled back) · 7 service restart failure · 8 deferred
+(bridge busy — retry next tick).

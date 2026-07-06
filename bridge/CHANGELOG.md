@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **Self-update restarted the bridge mid-task**, killing in-flight `claude` children
+  (SIGTERM → exit 143) and destroying the user's work — the root cause behind the
+  frozen heartbeats below and the frequent "resend please" interruptions. The bridge
+  now publishes an in-flight `workload` snapshot (active request count + oldest age)
+  to `health.json` every 10s, and `ccc-self-update.sh` **defers the whole run (exit 8)
+  while the bridge is busy**, retrying on the next scheduled tick. Bounded so it can't
+  starve updates (`CCC_SELF_UPDATE_BUSY_MAX_SECONDS` per task, `..._MAX_DEFER_SECONDS`
+  total); fail-open and `--force`-bypassable. See `docs/self-update.md`.
 - **Dangling `⏳ Working — Nm` heartbeat** left frozen as the last chat message after a
   task was effectively done. Two independent causes, both fixed:
   - **Restart orphans (primary).** When the bridge is SIGTERM-killed mid-request

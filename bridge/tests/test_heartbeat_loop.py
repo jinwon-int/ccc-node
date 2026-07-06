@@ -265,6 +265,27 @@ class HeartbeatLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(self.status_calls[0][0])
         self.assertIn("⏳ Working", self.status_calls[0][0])
 
+    async def test_workload_snapshot_counts_inflight_and_oldest(self):
+        now = asyncio.get_running_loop().time()
+        r1 = self._make_request()
+        r1.started_at = now - 30
+        r2 = self._make_request()
+        r2.started_at = now - 10
+        finished = self._make_request(done=True)  # resolved → not in-flight
+        finished.started_at = now - 100
+        state = _UserStreamState(
+            client=None, model=None, pending=deque([r1, r2, finished])
+        )
+        self.handler._streams[(1, 2)] = state
+        count, oldest = self.handler.workload_snapshot(now)
+        self.assertEqual(count, 2)
+        self.assertGreaterEqual(oldest, 29.0)
+        self.assertLess(oldest, 31.0)
+
+    async def test_workload_snapshot_empty_when_idle(self):
+        now = asyncio.get_running_loop().time()
+        self.assertEqual(self.handler.workload_snapshot(now), (0, 0.0))
+
     async def test_forecast_shrinks_as_task_progresses(self):
         # Same history, elapsed 30s -> remaining should be ~1m 30s, not the
         # full 2m total-median the old fixed forecast displayed.
