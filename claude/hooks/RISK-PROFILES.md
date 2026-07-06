@@ -44,6 +44,11 @@ recorded to `~/.claude/state/approval-needed.log`; the bypass is logged to stder
   `~/.claude/self-update.services` / `self-update.repo`, is write-gated for agents
   (`self-update-config`, Edit/Write tools and shell redirect/copy verbs); reads stay
   allowed. See `docs/self-update.md`.
+- **Public-key carve-out** (operator-approved): `*.pub` and `*.pub.pem` files are
+  public keys — safe to read — so they are exempt from the secret-file / secret-read
+  gates even though they carry a `.pem` extension. Private keys (`*.pem` without
+  `.pub`, `*.key`, `id_rsa`) and other secrets stay gated; a public key referenced
+  alongside a real secret in the same command still trips the deny.
 - **Service-control relaxation** (operator-approved): direct service lifecycle
   control — `restart` / `start` / `reload` / `stop` / `kill` — of fleet services
   (`broker`/`Gateway`/`worker`/`a2a`/`hermes`/`openclaw` and `ccc-telegram-bridge`)

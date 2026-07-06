@@ -53,8 +53,9 @@ case "$tool" in
   Read|Edit|Write|NotebookEdit|MultiEdit)
     case "$fpath" in
       *.template.*|*.env.example|*.env.template|*.env.sample) : ;;  # templates/examples are safe
+      *.pub|*.pub.pem) : ;;  # public keys are safe — only private keys/secrets are gated
       */.env|*/.env.*|*.env|*.credentials.json|*.pem|*/id_rsa|*/id_rsa.*|*.key)
-        # Covers .env, .env.local, .env.production, foo.env, etc. (templates carved above).
+        # Covers .env, .env.local, .env.production, foo.env, etc. (templates + public keys carved above).
         deny "secret-file" "operator_approval_gated" "$tool on $fpath" ;;
     esac
     ;;
@@ -86,6 +87,13 @@ gi() { grep -Eiq "$1" <<<"$c"; } # case-insensitive
 # denials (never removes them), so it cannot loosen the guard.
 cn="${c//\"/}"; cn="${cn//\'/}"
 gn() { grep -Eq "$1" <<<"$cn"; }    # case-sensitive, quote-stripped
+
+# Public-key carve-out: `.pub.pem` is a PUBLIC key (safe to read), but the secret
+# patterns below match any `.pem`. Neutralize `.pub.pem` tokens in a separate view
+# so a public key alone is allowed, while any real secret in the SAME command still
+# trips the deny (e.g. `cat a.pub.pem b.pem` → b.pem still matches).
+cnp="${cn//.pub.pem/ }"
+gnp() { grep -Eq "$1" <<<"$cnp"; }  # like gn, but with public keys neutralized
 
 # force push / history rewrite
 #
@@ -198,9 +206,9 @@ g 'gh[[:space:]]+repo[[:space:]]+edit([[:space:]]|$)[^|;&]*--visibility'        
 # secret read / exfil (quote-stripped; `.env` matched only when NOT followed by
 # more name chars, so `.env` is caught but `.env.example` templates are not).
 # Verb list extended beyond pagers to copy/encode tools (cp/mv/dd/tee/base64/…).
-gn '\b(cat|less|more|head|tail|xxd|od|strings|bat|nl|tac|cp|mv|dd|tee|install|rsync|base64|gpg|openssl)\b[^|;&]*(\.env([^A-Za-z0-9_.-]|$)|\.credentials\.json|\bid_rsa\b|\.pem([[:space:]]|$))' && deny "secret-read" "operator_approval_gated" "$c"
+gnp '\b(cat|less|more|head|tail|xxd|od|strings|bat|nl|tac|cp|mv|dd|tee|install|rsync|base64|gpg|openssl)\b[^|;&]*(\.env([^A-Za-z0-9_.-]|$)|\.credentials\.json|\bid_rsa\b|\.pem([[:space:]]|$))' && deny "secret-read" "operator_approval_gated" "$c"
 # Indirect read via an interpreter, e.g. python3 -c "open('.env').read()".
-gn '\b(python3?|ruby|perl|node|php)\b[^|;&]*(\.env([^A-Za-z0-9_.-]|$)|\.credentials|\bid_rsa\b|\.pem\b)' && deny "secret-indirect-read" "operator_approval_gated" "$c"
+gnp '\b(python3?|ruby|perl|node|php)\b[^|;&]*(\.env([^A-Za-z0-9_.-]|$)|\.credentials|\bid_rsa\b|\.pem\b)' && deny "secret-indirect-read" "operator_approval_gated" "$c"
 gn '\b(curl|wget|nc|ncat|scp|sftp|ftp|rsync|ssh)\b[^|;&]*(\.env([^A-Za-z0-9_.-]|$)|\.credentials|\bid_rsa\b|secret|token)' && deny "secret-exfil" "operator_approval_gated" "$c"
 
 # catastrophic rm against absolute / home roots (quote-stripped; long flags too)
