@@ -364,6 +364,27 @@ class Config(BaseSettings):
             "BOT_DATA_DIR/heartbeats.json."
         ),
     )
+    task_ledger_path: Optional[Path] = Field(
+        default=None,
+        alias="CCC_TASK_LEDGER_PATH",
+        description=(
+            "Optional path to the persistent task ledger (Hermes-style explicit "
+            "task lifecycle for bridge requests). Every request gets a record "
+            "with an explicit state; the '⏳ Working' status message is a "
+            "projection of it, terminal cleanup is retried until it lands, and "
+            "startup reconciles records orphaned by a dead process. Defaults to "
+            "BOT_DATA_DIR/tasks.json."
+        ),
+    )
+    task_interrupted_notice: bool = Field(
+        default=True,
+        alias="CCC_TASK_INTERRUPTED_NOTICE",
+        description=(
+            "When a restart interrupts an in-flight request, edit its status "
+            "message into a short 'interrupted — please resend' notice instead "
+            "of deleting it silently. Set false to delete."
+        ),
+    )
     heartbeat_stall_seconds: float = Field(
         default=300.0,
         alias="CCC_HEARTBEAT_STALL_SECONDS",

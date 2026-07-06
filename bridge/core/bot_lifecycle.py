@@ -16,6 +16,11 @@ from telegram_bot.core.bot_shared import _PollingRestart, enforce_access_control
 from telegram_bot.core.session_isolation import apply_subprocess_session_isolation
 from telegram_bot.utils.config import config
 from telegram_bot.utils.health import health_reporter
+from telegram_bot.core.task_ledger import (
+    INTERRUPTED_NOTICE_TEXT,
+    TaskLedger,
+    ledger_path_for,
+)
 from telegram_bot.utils.heartbeat_store import drain_heartbeats, store_path_for
 from telegram_bot.utils.orphan_reaper import (
     run_periodic_reaper,
@@ -61,8 +66,72 @@ class BotLifecycleMixin:
         # restart is the only thing that can remove the now-frozen messages.
         await self._sweep_orphaned_heartbeats(application)
 
+        # Task-ledger reconciliation (Hermes model): every non-terminal task
+        # record was written by a previous process, so it died mid-flight —
+        # transition it to `interrupted` and clean (or annotate) its status
+        # message. Then drain any terminal ops left pending by failed cleanups.
+        await self._reconcile_task_ledger(application)
+
         await self._set_bot_commands()
         logger.info("Bot initialization complete")
+
+    def _lifecycle_task_ledger(self):
+        path = ledger_path_for(
+            getattr(config, "bot_data_dir", None),
+            getattr(config, "task_ledger_path", None),
+        )
+        return TaskLedger(path) if path else None
+
+    async def _reconcile_task_ledger(self, application: Application) -> None:
+        ledger = self._lifecycle_task_ledger()
+        if ledger is None:
+            return
+        op_kind = (
+            "notice"
+            if getattr(config, "task_interrupted_notice", True)
+            else "delete"
+        )
+        interrupted = ledger.reconcile_interrupted(op_kind=op_kind)
+        if interrupted:
+            logger.info(
+                "Task ledger reconciliation: %d task(s) from a previous run marked interrupted",
+                interrupted,
+            )
+        await self._drain_terminal_ops(application.bot, ledger)
+
+    async def _drain_terminal_ops(self, bot, ledger=None) -> None:
+        """Retry pending terminal cleanups (the ledger's mini terminal-outbox)."""
+        ledger = ledger or self._lifecycle_task_ledger()
+        if ledger is None:
+            return
+        for task_id, op in ledger.pending_terminal_ops():
+            chat_id = op.get("chat_id")
+            message_id = op.get("message_id")
+            if not chat_id or not message_id:
+                ledger.resolve_terminal_op(task_id, success=True)
+                continue
+            try:
+                if op.get("kind") == "notice":
+                    await bot.edit_message_text(
+                        chat_id=chat_id,
+                        message_id=message_id,
+                        text=INTERRUPTED_NOTICE_TEXT,
+                    )
+                else:
+                    await bot.delete_message(chat_id=chat_id, message_id=message_id)
+                ledger.resolve_terminal_op(task_id, success=True)
+            except telegram.error.BadRequest:
+                # Message already gone / not editable — nothing left to clean.
+                ledger.resolve_terminal_op(task_id, success=True)
+            except Exception as exc:
+                logger.debug(
+                    "Terminal op retry failed for task %s (%s/%s): %s",
+                    task_id,
+                    chat_id,
+                    message_id,
+                    type(exc).__name__,
+                )
+                ledger.resolve_terminal_op(task_id, success=False)
 
     async def _sweep_orphaned_heartbeats(self, application: Application) -> None:
         """Delete heartbeat messages left frozen by a previous killed run."""
@@ -427,6 +496,13 @@ class BotLifecycleMixin:
                 health_reporter.record_workload(count, oldest_age)
             except Exception as exc:
                 logger.debug("Workload reporter tick failed: %s", type(exc).__name__)
+            # Retry any terminal cleanups that failed at transition time (the
+            # ledger's terminal-outbox) — normally an empty, cheap read.
+            try:
+                if self.application:
+                    await self._drain_terminal_ops(self.application.bot)
+            except Exception as exc:
+                logger.debug("Terminal op drain failed: %s", type(exc).__name__)
             await asyncio.sleep(self._WORKLOAD_INTERVAL)
 
     async def _wait_for_polling_exit(self, stop_event: asyncio.Event):

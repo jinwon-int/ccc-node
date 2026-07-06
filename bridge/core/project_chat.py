@@ -24,6 +24,13 @@ from claude_agent_sdk import (
 from claude_agent_sdk._internal.transport.subprocess_cli import SubprocessCLITransport
 
 from telegram_bot.utils.config import config
+from telegram_bot.core.task_ledger import (
+    CANCELED as TASK_CANCELED,
+    INPUT_REQUIRED as TASK_INPUT_REQUIRED,
+    WORKING as TASK_WORKING,
+    TaskLedger,
+    ledger_path_for,
+)
 from telegram_bot.core.heartbeat import (
     compose_heartbeat_text,
     has_recent_visible_progress,
@@ -200,10 +207,15 @@ class ProjectChatHandler(
                 return PermissionResultAllow()
 
             req.awaiting_permission = True
+            led = self._task_ledger
+            if led and req.task_id:
+                led.set_state(req.task_id, TASK_INPUT_REQUIRED)
             try:
                 result = await callback(req.chat_id, user_id, tool_name, tool_input)
             finally:
                 req.awaiting_permission = False
+                if led and req.task_id:
+                    led.set_state(req.task_id, TASK_WORKING)
             if isinstance(result, (PermissionResultAllow, PermissionResultDeny)):
                 return result
             return PermissionResultAllow() if result else PermissionResultDeny()
@@ -312,7 +324,8 @@ class ProjectChatHandler(
         msg = cancel_message or "🛑 Task has been terminated."
         while state.pending:
             req = state.pending.popleft()
-            await self._cleanup_heartbeat(req)
+            cleaned = await self._cleanup_heartbeat(req)
+            self._ledger_finish(req, TASK_CANCELED, cleanup_done=cleaned)
             if not req.future.done():
                 try:
                     req.future.set_result(
@@ -411,12 +424,42 @@ class ProjectChatHandler(
         oldest_age = (now - oldest_started) if oldest_started is not None else 0.0
         return count, max(0.0, oldest_age)
 
-    async def _cleanup_heartbeat(self, req: _PendingRequest) -> None:
-        """Delete/clear the transient heartbeat message for a request."""
+    @property
+    def _task_ledger(self):
+        """Lazy persistent task ledger; None when no data dir is configured."""
+        cached = getattr(self, "_task_ledger_cache", None)
+        if cached is not None:
+            return cached or None  # False sentinel = resolved to unavailable
+        path = ledger_path_for(
+            getattr(config, "bot_data_dir", None),
+            getattr(config, "task_ledger_path", None),
+        )
+        self._task_ledger_cache = TaskLedger(path) if path else False
+        return self._task_ledger_cache or None
+
+    def _ledger_create(self, user_id: int, chat_id: int):
+        led = self._task_ledger
+        return led.create(user_id, chat_id) if led else None
+
+    def _ledger_finish(
+        self, req: _PendingRequest, state: str, *, cleanup_done: bool
+    ) -> None:
+        led = self._task_ledger
+        if led and req.task_id:
+            led.finish(req.task_id, state, cleanup_done=cleanup_done)
+
+    async def _cleanup_heartbeat(self, req: _PendingRequest) -> bool:
+        """Delete/clear the transient heartbeat message for a request.
+
+        Returns True when there is nothing left to clean (no message, or the
+        delete went through) — False when the delete failed, so the caller's
+        terminal transition keeps a retryable op in the task ledger.
+        """
         if not req.status_callback or req.heartbeat_message_id is None:
-            return
+            return True
+        cleaned = False
         try:
-            await req.status_callback(None, req.heartbeat_message_id)
+            cleaned = (await req.status_callback(None, req.heartbeat_message_id)) is None
         except Exception as e:
             logger.warning(
                 "Heartbeat cleanup failed for user %s chat %s: %s",
@@ -426,6 +469,10 @@ class ProjectChatHandler(
             )
         finally:
             req.heartbeat_message_id = None
+        led = self._task_ledger
+        if cleaned and led and req.task_id:
+            led.set_status_message(req.task_id, None)
+        return cleaned
 
     async def _maybe_update_heartbeat(self, req: _PendingRequest, now: float) -> None:
         """Send or edit a fail-open long-running task heartbeat."""
@@ -493,9 +540,16 @@ class ProjectChatHandler(
             else None,
         )
         try:
+            previous_id = req.heartbeat_message_id
             message_id = await req.status_callback(text, req.heartbeat_message_id)
             req.heartbeat_message_id = message_id
             req.heartbeat_last_update_at = now
+            # Register the projection in the task ledger so a terminal
+            # transition (or a restart's reconciliation) can always clean it.
+            if message_id != previous_id:
+                led = self._task_ledger
+                if led and req.task_id:
+                    led.set_status_message(req.task_id, message_id)
         except Exception as e:
             logger.warning(
                 "Heartbeat update failed for user %s chat %s: %s",

@@ -9,6 +9,10 @@ import os
 from claude_agent_sdk import AssistantMessage, ResultMessage, StreamEvent, TextBlock, ToolUseBlock
 
 from telegram_bot.core.heartbeat import tool_label
+from telegram_bot.core.task_ledger import (
+    COMPLETED as TASK_COMPLETED,
+    FAILED as TASK_FAILED,
+)
 from telegram_bot.core.project_chat_types import ChatResponse, _UserStreamState
 from telegram_bot.core.sdk_text import (
     RESTART_INTERRUPT_NOTICE,
@@ -125,7 +129,14 @@ class ProjectChatReaderMixin:
                             await req.streaming_handler.finalize_all()
                         except Exception as e:
                             logger.error(f"Streaming finalization failed: {e}")
-                    await self._cleanup_heartbeat(req)
+                    cleaned = await self._cleanup_heartbeat(req)
+                    # Terminal transition: a failed cleanup keeps a retryable op
+                    # in the ledger, so the status message can never be orphaned.
+                    self._ledger_finish(
+                        req,
+                        TASK_FAILED if msg.is_error else TASK_COMPLETED,
+                        cleanup_done=cleaned,
+                    )
 
                     if req.synthetic_response:
                         content = (
@@ -213,7 +224,8 @@ class ProjectChatReaderMixin:
             pending_copy = list(state.pending)
             state.pending.clear()
             for req in pending_copy:
-                await self._cleanup_heartbeat(req)
+                cleaned = await self._cleanup_heartbeat(req)
+                self._ledger_finish(req, TASK_FAILED, cleanup_done=cleaned)
                 # Finalize streaming drafts on error
                 if req.streaming_handler:
                     try:

@@ -286,6 +286,58 @@ class HeartbeatLoopTests(unittest.IsolatedAsyncioTestCase):
         now = asyncio.get_running_loop().time()
         self.assertEqual(self.handler.workload_snapshot(now), (0, 0.0))
 
+    async def test_heartbeat_send_registers_message_in_task_ledger(self):
+        with tempfile.TemporaryDirectory() as td:
+            project_chat.config.bot_data_dir = Path(td)
+            self.addCleanup(delattr, project_chat.config, "bot_data_dir")
+            self.handler._task_ledger_cache = None
+            req = self._make_request()
+            req.task_id = self.handler._ledger_create(1, 2)
+            state = _UserStreamState(client=None, model=None, pending=deque([req]))
+            await self._start_loop(state)
+            await asyncio.wait_for(self.status_event.wait(), timeout=1.0)
+            await asyncio.sleep(0)  # let the registration write land
+            records = self.handler._task_ledger.records()
+            self.assertEqual(len(records), 1)
+            self.assertEqual(records[0]["status_message_id"], 1234)
+            self.assertEqual(records[0]["state"], "working")
+
+    async def test_failed_cleanup_leaves_retryable_terminal_op(self):
+        with tempfile.TemporaryDirectory() as td:
+            project_chat.config.bot_data_dir = Path(td)
+            self.addCleanup(delattr, project_chat.config, "bot_data_dir")
+            self.handler._task_ledger_cache = None
+
+            async def failing_status_callback(text, message_id=None):
+                # Delete swallowed a network error: contract returns message_id.
+                return message_id
+
+            req = self._make_request()
+            req.status_callback = failing_status_callback
+            req.task_id = self.handler._ledger_create(1, 2)
+            self.handler._task_ledger.set_status_message(req.task_id, 999)
+            req.heartbeat_message_id = 999
+            cleaned = await self.handler._cleanup_heartbeat(req)
+            self.assertFalse(cleaned)
+            self.handler._ledger_finish(req, "completed", cleanup_done=cleaned)
+            ops = self.handler._task_ledger.pending_terminal_ops()
+            self.assertEqual(len(ops), 1)
+            self.assertEqual(ops[0][1]["message_id"], 999)
+
+    async def test_successful_cleanup_purges_ledger_record_on_finish(self):
+        with tempfile.TemporaryDirectory() as td:
+            project_chat.config.bot_data_dir = Path(td)
+            self.addCleanup(delattr, project_chat.config, "bot_data_dir")
+            self.handler._task_ledger_cache = None
+            req = self._make_request()
+            req.task_id = self.handler._ledger_create(1, 2)
+            self.handler._task_ledger.set_status_message(req.task_id, 555)
+            req.heartbeat_message_id = 555
+            cleaned = await self.handler._cleanup_heartbeat(req)
+            self.assertTrue(cleaned)
+            self.handler._ledger_finish(req, "completed", cleanup_done=cleaned)
+            self.assertEqual(self.handler._task_ledger.records(), [])
+
     async def test_forecast_shrinks_as_task_progresses(self):
         # Same history, elapsed 30s -> remaining should be ~1m 30s, not the
         # full 2m total-median the old fixed forecast displayed.

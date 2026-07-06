@@ -132,6 +132,8 @@ utils/chat_logger.py Per-session debug chat logging
 
 All bot data writes to `PROJECT_ROOT/.telegram_bot/`:
 - `sessions.json` — user session persistence
+- `tasks.json` — persistent task ledger (explicit request lifecycle; the
+  "⏳ Working" status message is a projection of it, reconciled across restarts)
 - `logs/bot.log` — main log (daily rotation)
 - `logs/error_YYYYMMDD.log` — error log
 - `logs/{user_id}_{session_id}_{date}.log` — debug chat logs

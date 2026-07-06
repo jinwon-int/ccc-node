@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Persistent task ledger** (`core/task_ledger.py`) — the structural fix for the
+  recurring "typing / ⏳ Working stuck after the work is done" class of bugs, ported
+  from the Hermes/A2A task-lifecycle model (jinwon-int/a2a-nexus `task-projection.ts`,
+  terminal-outbox pattern). Previously the bridge *inferred* request status from
+  in-memory stream liveness, so every crash/hang/race left indicators stranded.
+  Now every request gets a persisted record with an explicit state
+  (`working` / `input-required` → `completed` / `failed` / `canceled` / `timeout` /
+  `interrupted`) and the status message is a projection of it:
+  - every completion/cancel/timeout/error path is a terminal transition through the
+    ledger — an indicator can no longer outlive its task record;
+  - a terminal cleanup whose Telegram delete fails leaves a retryable `terminal_op`
+    (mini terminal-outbox), drained every 10s and at startup;
+  - startup reconciliation marks records from a dead process `interrupted` and edits
+    their frozen "⏳ Working" message into a short resend notice
+    (`CCC_TASK_INTERRUPTED_NOTICE=false` to delete instead); ledger path override:
+    `CCC_TASK_LEDGER_PATH` (default `BOT_DATA_DIR/tasks.json`).
+  - 14 new unit/integration tests (`test_task_ledger.py` + heartbeat-loop ledger cases).
+
 ### Fixed
 - **Self-update restarted the bridge mid-task**, killing in-flight `claude` children
   (SIGTERM → exit 143) and destroying the user's work — the root cause behind the
