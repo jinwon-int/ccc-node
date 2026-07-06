@@ -353,6 +353,32 @@ class Config(BaseSettings):
         alias="CCC_HEARTBEAT_DELETE_ON_DONE",
         description="Delete transient heartbeat messages when a task completes or is cancelled.",
     )
+    heartbeat_store_path: Optional[Path] = Field(
+        default=None,
+        alias="CCC_HEARTBEAT_STORE_PATH",
+        description=(
+            "Optional path to the JSON registry of live heartbeat message ids. "
+            "On startup the bridge deletes any survivors listed here — heartbeats "
+            "from a run that was SIGTERM-killed mid-request, whose '⏳ Working' "
+            "message would otherwise linger forever. Defaults to "
+            "BOT_DATA_DIR/heartbeats.json."
+        ),
+    )
+    heartbeat_stall_seconds: float = Field(
+        default=300.0,
+        alias="CCC_HEARTBEAT_STALL_SECONDS",
+        description=(
+            "Delete the transient heartbeat message when no SDK event has arrived "
+            "for this many seconds. A request that stalls (e.g. a bridge restart "
+            "left it in flight, or the SDK stream hangs) never reaches the "
+            "terminal ResultMessage that normally removes the heartbeat, so the "
+            "growing '⏳ Working — Nm' line would otherwise linger as the last "
+            "chat message. It reappears automatically if SDK activity resumes. "
+            "Set 0 to disable. NOTE: a legitimately long single tool call emits "
+            "no intermediate SDK events while it runs, so if it exceeds this its "
+            "heartbeat is removed too — raise this when you run such tools."
+        ),
+    )
     heartbeat_duration_log_enabled: bool = Field(
         default=True,
         alias="CCC_HEARTBEAT_DURATION_LOG_ENABLED",

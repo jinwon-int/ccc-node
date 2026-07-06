@@ -44,6 +44,12 @@ class _PendingRequest:
     started_at: float = 0.0
     heartbeat_last_update_at: float = 0.0
     heartbeat_message_id: Optional[int] = None
+    # Wall-clock of the last SDK event the reader loop saw for this request.
+    # Drives heartbeat stall detection: when it goes silent for too long the
+    # request is stuck (bridge restart / hung stream) and its heartbeat is
+    # removed instead of ticking up forever. 0 until the first event; the
+    # stall check falls back to started_at.
+    last_event_at: float = 0.0
     current_tool_label: Optional[str] = None
     last_visible_progress_at: float = 0.0
     awaiting_permission: bool = False
