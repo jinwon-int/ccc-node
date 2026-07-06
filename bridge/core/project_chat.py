@@ -411,6 +411,20 @@ class ProjectChatHandler(
         if not req.status_callback or req.future.done():
             return
 
+        # Stall guard: if the SDK stream has gone silent for too long the request
+        # is stuck (e.g. a bridge restart left it in flight, or the stream hung)
+        # and will never reach the terminal ResultMessage that deletes the
+        # heartbeat. Remove the dangling "⏳ Working — Nm" line rather than let it
+        # tick up forever as the last chat message. It reappears if activity
+        # resumes (last_event_at advances on the next SDK event).
+        stall_seconds = float(getattr(config, "heartbeat_stall_seconds", 0.0) or 0.0)
+        if stall_seconds > 0:
+            last_event = req.last_event_at or req.started_at
+            if last_event > 0 and now - last_event >= stall_seconds:
+                if req.heartbeat_message_id is not None:
+                    await self._cleanup_heartbeat(req)
+                return
+
         threshold = float(getattr(config, "heartbeat_threshold_seconds", 15.0))
         interval = float(getattr(config, "heartbeat_update_interval_seconds", 15.0))
         if not should_update_heartbeat(

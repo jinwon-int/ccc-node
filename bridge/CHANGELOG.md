@@ -8,6 +8,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **Dangling `⏳ Working — Nm` heartbeat** left frozen as the last chat message after a
+  task was effectively done. Two independent causes, both fixed:
+  - **Restart orphans (primary).** When the bridge is SIGTERM-killed mid-request
+    (exit 143 — frequent on Android/Termux), the in-flight request dies with the
+    process and its heartbeat message is never deleted; the restarted bridge has no
+    in-memory record of it. Heartbeat message ids are now persisted to
+    `BOT_DATA_DIR/heartbeats.json` (`utils/heartbeat_store.py`) on creation and
+    discarded on clean deletion, and the bridge sweeps any survivors on startup
+    (`_on_ready`, alongside the orphan-process reaper) — mirroring the process reaper
+    but for Telegram messages. Override the path with `CCC_HEARTBEAT_STORE_PATH`.
+  - **Live stalls (secondary).** If a still-in-flight request goes silent without
+    reaching its terminal `ResultMessage` (hung stream), the heartbeat used to tick up
+    until the 6-hour `CLAUDE_PROCESS_TIMEOUT`. The reader loop now stamps
+    `_PendingRequest.last_event_at` on every SDK event, and `_maybe_update_heartbeat`
+    deletes the heartbeat once the stream has been silent for
+    `CCC_HEARTBEAT_STALL_SECONDS` (default 300 s; 0 disables). It reappears if activity
+    resumes. A legitimately long single tool call emits no intermediate events, so
+    raise this value if you run such tools.
+  - 12 new unit tests: 9 for the heartbeat-id store, 3 for stall deletion.
 - **Orphaned `node claude` processes** accumulate on Android/Termux when the bridge
   restarts or crashes (jinwon-int/ccc-node#303). Root causes addressed:
   - Added `utils/orphan_reaper.py`: scans `/proc` for PPID=1 `node claude` processes

@@ -16,6 +16,7 @@ from telegram_bot.core.bot_shared import _PollingRestart, enforce_access_control
 from telegram_bot.core.session_isolation import apply_subprocess_session_isolation
 from telegram_bot.utils.config import config
 from telegram_bot.utils.health import health_reporter
+from telegram_bot.utils.heartbeat_store import drain_heartbeats, store_path_for
 from telegram_bot.utils.orphan_reaper import (
     run_periodic_reaper,
     sweep_orphaned_claude_processes,
@@ -54,8 +55,47 @@ class BotLifecycleMixin:
         else:
             logger.debug("Startup orphan sweep: no orphans found")
 
+        # Delete '⏳ Working' heartbeat messages orphaned by a previous run that
+        # was SIGTERM-killed mid-request (exit 143). Their ids were persisted on
+        # creation; the owning _PendingRequest died with that process, so this
+        # restart is the only thing that can remove the now-frozen messages.
+        await self._sweep_orphaned_heartbeats(application)
+
         await self._set_bot_commands()
         logger.info("Bot initialization complete")
+
+    async def _sweep_orphaned_heartbeats(self, application: Application) -> None:
+        """Delete heartbeat messages left frozen by a previous killed run."""
+        store_path = store_path_for(
+            getattr(config, "bot_data_dir", None),
+            getattr(config, "heartbeat_store_path", None),
+        )
+        if store_path is None:
+            return
+        leftovers = drain_heartbeats(store_path)
+        if not leftovers:
+            return
+        deleted = 0
+        for chat_id, message_id in leftovers:
+            try:
+                await application.bot.delete_message(
+                    chat_id=chat_id, message_id=message_id
+                )
+                deleted += 1
+            except Exception as exc:
+                # Best-effort: message may be >48h old, already gone, or the chat
+                # unreachable. Nothing more we can do — it stays as-is.
+                logger.debug(
+                    "Heartbeat sweep: could not delete %s/%s: %s",
+                    chat_id,
+                    message_id,
+                    type(exc).__name__,
+                )
+        logger.info(
+            "Startup heartbeat sweep: removed %d/%d stale heartbeat message(s)",
+            deleted,
+            len(leftovers),
+        )
 
     def build(self):
         """Build the application (no post_init — lifecycle managed manually)."""

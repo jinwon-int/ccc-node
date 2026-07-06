@@ -228,6 +228,43 @@ class HeartbeatLoopTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("Working", text)
             self.assertNotIn("ETA", text)
 
+    async def test_deletes_heartbeat_when_stream_stalls(self):
+        project_chat.config.heartbeat_stall_seconds = 0.05
+        self.addCleanup(setattr, project_chat.config, "heartbeat_stall_seconds", 0.0)
+        req = self._make_request()
+        req.heartbeat_message_id = 1234
+        now = asyncio.get_running_loop().time()
+        req.started_at = now - 10.0
+        req.last_event_at = now - 10.0  # silent far longer than the stall window
+        await self.handler._maybe_update_heartbeat(req, now)
+        self.assertEqual(self.status_calls, [(None, 1234)])
+        self.assertIsNone(req.heartbeat_message_id)
+
+    async def test_stall_falls_back_to_started_at_when_no_event_yet(self):
+        project_chat.config.heartbeat_stall_seconds = 0.05
+        self.addCleanup(setattr, project_chat.config, "heartbeat_stall_seconds", 0.0)
+        req = self._make_request()
+        req.heartbeat_message_id = 1234
+        now = asyncio.get_running_loop().time()
+        req.started_at = now - 10.0
+        req.last_event_at = 0.0  # the SDK never emitted a single event
+        await self.handler._maybe_update_heartbeat(req, now)
+        self.assertEqual(self.status_calls, [(None, 1234)])
+        self.assertIsNone(req.heartbeat_message_id)
+
+    async def test_recent_activity_keeps_heartbeat(self):
+        project_chat.config.heartbeat_stall_seconds = 100.0
+        self.addCleanup(setattr, project_chat.config, "heartbeat_stall_seconds", 0.0)
+        req = self._make_request()
+        now = asyncio.get_running_loop().time()
+        req.started_at = now - 10.0
+        req.last_event_at = now  # a fresh SDK event just arrived
+        await self.handler._maybe_update_heartbeat(req, now)
+        self.assertTrue(self.status_calls)
+        # A live heartbeat is an edit/send (text present), not a deletion.
+        self.assertIsNotNone(self.status_calls[0][0])
+        self.assertIn("⏳ Working", self.status_calls[0][0])
+
     async def test_forecast_shrinks_as_task_progresses(self):
         # Same history, elapsed 30s -> remaining should be ~1m 30s, not the
         # full 2m total-median the old fixed forecast displayed.

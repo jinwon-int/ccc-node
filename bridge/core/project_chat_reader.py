@@ -39,6 +39,9 @@ class ProjectChatReaderMixin:
 
                 req = state.pending[0]
                 now = asyncio.get_event_loop().time()
+                # Any SDK event means the stream is alive; reset the stall clock
+                # so the heartbeat keeps ticking. Silence resumes the countdown.
+                req.last_event_at = now
                 if (
                     req.typing_callback
                     and not isinstance(msg, ResultMessage)
