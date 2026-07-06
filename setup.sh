@@ -162,6 +162,7 @@ run "cp '$SRC/claude/hooks/distill/honcho-push.sh' '$CLAUDE_DIR/hooks/distill/ho
 run "cp '$SRC/claude/hooks/distill/wiki-queue.sh'  '$CLAUDE_DIR/hooks/distill/wiki-queue.sh'"
 run "cp '$SRC/claude/hooks/distill/queue-drain.sh' '$CLAUDE_DIR/hooks/distill/queue-drain.sh'"
 run "cp '$SRC/claude/hooks/distill/local-facts.sh' '$CLAUDE_DIR/hooks/distill/local-facts.sh'"
+run "cp '$SRC/claude/hooks/distill/resume-write.sh' '$CLAUDE_DIR/hooks/distill/resume-write.sh'"
 # Skill Review — Hermes-style background skill draft staging (human-approved).
 run "cp '$SRC/claude/hooks/skill-review.sh' '$CLAUDE_DIR/hooks/skill-review.sh'"
 run "mkdir -p '$CLAUDE_DIR/hooks/skill-review'"
