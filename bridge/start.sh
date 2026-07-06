@@ -1068,6 +1068,11 @@ exec_bot_once() {
     export BOT_TOKEN_LOCK_FILE="$TOKEN_LOCK_FILE"
     export BOT_OWNS_TOKEN_LOCK="1"
     write_token_lock "$$"
+    # Write PID file so `--status` works in foreground/systemd mode.
+    # `exec` replaces the current shell with the Python process, keeping the
+    # same PID ($$), so this file stays valid after exec.  do_status() already
+    # handles stale PIDs via kill-0 + cleanup_pid, so no extra cleanup is needed.
+    echo $$ > "$PID_FILE"
 
     echo ""
     echo "🚀 Starting Telegram Bot..."
