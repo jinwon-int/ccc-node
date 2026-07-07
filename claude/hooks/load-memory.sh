@@ -48,9 +48,14 @@ limit_bytes() { # <max> <text>
 limit = int(sys.argv[1])
 data = sys.stdin.buffer.read()
 if limit > 0 and len(data) > limit:
-    text = data[:limit].decode("utf-8", errors="ignore")
+    # Reserve room for the truncation marker so the total output stays within
+    # <limit> bytes. Slicing to <limit> and THEN appending the suffix used to
+    # overshoot the declared cap by the suffix length (~38 bytes).
+    suffix = "\n… [truncated by CCC memory budget]\n".encode("utf-8")
+    keep = max(0, limit - len(suffix))
+    text = data[:keep].decode("utf-8", errors="ignore")
     sys.stdout.buffer.write(text.encode("utf-8"))
-    sys.stdout.write("\n… [truncated by CCC memory budget]\n")
+    sys.stdout.buffer.write(suffix)
 else:
     sys.stdout.buffer.write(data)
 ' "$max"

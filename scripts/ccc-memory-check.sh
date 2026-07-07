@@ -17,7 +17,10 @@ file_epoch() { [ -f "$1" ] && date -u -r "$1" +%s 2>/dev/null || printf '0'; }
 age_for() {
   local f="$1" ts now
   ts="$(file_epoch "$f")"; now="$(now_epoch)"
-  if [ "$ts" = "0" ]; then printf '-1'; else printf '%s' "$((now - ts))"; fi
+  # `printf '-1'` treats -1 as a flag ("invalid option") and emits nothing,
+  # which makes --json fail (--argjson gets "") and text mode misreport a
+  # missing cache as healthy. Use `printf '%s'` so the literal -1 is emitted.
+  if [ "$ts" = "0" ]; then printf '%s' '-1'; else printf '%s' "$((now - ts))"; fi
 }
 bytes_for() { [ -f "$1" ] && wc -c < "$1" | tr -d '[:space:]' || printf '0'; }
 meta_json_for() {
@@ -29,10 +32,12 @@ meta_json_for() {
   ' "$f" 2>/dev/null || printf '{}'
 }
 status_for() {
-  local f="$1" age
+  # Use the per-source TTL (falling back to the global one) so the status line
+  # agrees with the per-source staleness the meta computation reports.
+  local f="$1" ttl="${2:-$TTL}" age
   age="$(age_for "$f")"
   if [ "$age" -lt 0 ]; then printf 'missing'
-  elif [ "$age" -gt "$TTL" ]; then printf 'stale'
+  elif [ "$age" -gt "$ttl" ]; then printf 'stale'
   else printf 'ok'
   fi
 }
@@ -47,13 +52,16 @@ index_db="$STATE_DIR/memory-index.sqlite"
 honcho_enabled="${CCC_HONCHO_MEMORY_ENABLED:-1}"
 honcho_base="(missing)"
 if [ -f "$HONCHO_CFG" ]; then
-  honcho_base="$(jq -r '.baseUrl // "unset"' "$HONCHO_CFG" 2>/dev/null || printf 'parse-error')"
+  # Mirror refresh-memory.sh: the config may use the nested `.hosts.hermes.*`
+  # schema instead of top-level keys. Read top-level first, then fall back so the
+  # diagnostic reports the same base URL the refresh path actually resolves.
+  honcho_base="$(jq -r 'def nz(x): x | select(. != null and . != ""); nz(.baseUrl) // nz(.hosts.hermes.baseUrl) // "unset"' "$HONCHO_CFG" 2>/dev/null || printf 'parse-error')"
 fi
 
-wiki_status="$(status_for "$wiki_file")"
+wiki_status="$(status_for "$wiki_file" "$WIKI_TTL")"
 honcho_status="disabled"
 if ! is_disabled "$honcho_enabled"; then
-  honcho_status="$(status_for "$honcho_file")"
+  honcho_status="$(status_for "$honcho_file" "$HONCHO_TTL")"
 fi
 
 if [ "$OUTPUT" = "--json" ] || [ "$OUTPUT" = "json" ]; then
