@@ -23,7 +23,16 @@ sys.argv = [sys.argv[0], DB, QUERY, LIMIT, RETRIEVAL]
 
 import hashlib, json, math, os, re, sqlite3, subprocess, sys, tempfile, time
 from datetime import datetime, timezone
-path, query, limit, retrieval = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
+path, query, retrieval = sys.argv[1], sys.argv[2], sys.argv[4]
+# Guard the limit parse like every other numeric env var here: a malformed
+# CCC_MEMORY_SEARCH_LIMIT (e.g. "abc") must fall back, not crash with a
+# traceback, and a non-positive value (0/-1 → empty results) falls back too.
+try:
+    limit = int(sys.argv[3])
+except (TypeError, ValueError):
+    limit = 5
+if limit <= 0:
+    limit = 5
 con=sqlite3.connect(path)
 con.row_factory=sqlite3.Row
 
@@ -66,7 +75,11 @@ USAGE_MAX_ENTRIES = 2000
 USAGE_PATH = os.environ.get("CCC_MEMORY_USAGE_FILE") or os.path.join(os.path.dirname(path) or ".", "memory-usage.json")
 
 def _chash(content):
-    norm = " ".join(re.findall(r"[0-9a-z가-힣]+", (content or "").lower()))
+    # Charset matches char_ngrams() (Hiragana/Katakana/CJK included). The old
+    # ASCII+Hangul-only set normalized predominantly Japanese/Chinese content to
+    # "", so _chash returned "" and the usage-feedback loop (record/boost) could
+    # never key such docs. Korean was already covered; this closes the JP/CN gap.
+    norm = " ".join(re.findall(r"[0-9a-z가-힣぀-ヿ一-鿿]+", (content or "").lower()))
     return hashlib.sha1(norm.encode("utf-8")).hexdigest()[:16] if norm else ""
 
 def _load_usage():

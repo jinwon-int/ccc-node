@@ -341,7 +341,15 @@ try:
             seen.add(path)
             con.execute(
                 "INSERT INTO memory_docs(source,path,content,updated_at) VALUES(?,?,?,CURRENT_TIMESTAMP) "
-                "ON CONFLICT(path) DO UPDATE SET source=excluded.source, content=excluded.content, updated_at=CURRENT_TIMESTAMP",
+                "ON CONFLICT(path) DO UPDATE SET source=excluded.source, content=excluded.content, "
+                # Only advance updated_at when the content actually changed. The
+                # search-side recency_boost decays over updated_at; bumping it on
+                # every (frequently background-triggered) index run re-timestamped
+                # every doc to ~now, collapsing recency into a uniform constant
+                # that never affected ranking. Preserving it on no-op re-index
+                # keeps recency meaningful (last content change, not last run).
+                "updated_at=CASE WHEN memory_docs.content <> excluded.content "
+                "THEN CURRENT_TIMESTAMP ELSE memory_docs.updated_at END",
                 (source, path, content),
             )
         # Remove documents that disappeared or are no longer indexed under current policy.
