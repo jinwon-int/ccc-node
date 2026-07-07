@@ -5,8 +5,11 @@
 # Exit 0 = allow; exit 2 = deny (the harness aborts the tool call and shows stderr to Claude).
 #
 # Policy: separation of approval from execution. Gated actions are DENIED by default and
-# require an explicit operator approval signal — set CCC_ALLOW_GATED=1 in the environment
-# only after the operator has approved the specific action (this is the bypass-by-operator).
+# require an explicit operator approval signal — CCC_ALLOW_GATED=1 set in the HARNESS
+# process environment (the env this hook inherits), only after the operator has approved
+# the specific action (bypass-by-operator). An agent cannot self-approve: env assignments
+# inside the Bash tool command (e.g. `CCC_ALLOW_GATED=1 cmd`) never reach this hook,
+# which runs before the command in its own environment.
 #
 # Risk-profile model (see RISK-PROFILES.md):
 #   autonomous              — not matched here; proceeds silently.
@@ -42,7 +45,7 @@ deny() {
   mkdir -p "$(dirname "$approval_log")" 2>/dev/null
   printf '%s\tDENY[%s]\tprofile=%s\ttool=%s\n' "$ts" "$label" "$profile" "${tool:-?}" >> "$approval_log" 2>/dev/null
   echo "BLOCKED by ccc-node guard [$label] (profile=$profile): ${detail}" >&2
-  echo "→ Fresh Approval Required (CLAUDE.md). After the operator approves THIS action, re-run with CCC_ALLOW_GATED=1." >&2
+  echo "→ Fresh Approval Required (CLAUDE.md). NOTE: CCC_ALLOW_GATED=1 only works when set in the HARNESS process environment by the operator (e.g. relaunch the session with it, or the operator runs the approved command in their own shell). A CCC_ALLOW_GATED=1 prefix inside an agent Bash command has NO effect — this hook runs first, in its own environment. Agents: prefer a non-gated alternative path, or ask the operator to execute." >&2
   exit 2
 }
 
