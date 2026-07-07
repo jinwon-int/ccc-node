@@ -315,6 +315,10 @@ class TelegramBot(BotLifecycleMixin, BotStatusMixin, BotAccessMixin, BotCommandM
             pass
 
         try:
+            # Capture stale session_id before it may be cleared by auto_new_session.
+            # Used below to inject recent conversation history when a new session starts.
+            stale_session_id = current_session.get("session_id")
+
             new_session = current_session.pop("new_session", False)
             auto_new_session = await session_manager.should_start_new_session(
                 conversation_key, now=message_timestamp
@@ -328,13 +332,41 @@ class TelegramBot(BotLifecycleMixin, BotStatusMixin, BotAccessMixin, BotCommandM
 
             await session_manager.set_last_user_message_at(conversation_key, message_timestamp)
 
+            effective_sid = self._effective_session_id(conversation_key, current_session)
+
+            # History injection: when the effective session_id is None (new session due to
+            # bridge restart, session expiry, or auto-rotation) but we have a previous
+            # session, prepend the recent exchanges so context is not lost.
+            send_text = text
+            if effective_sid is None and stale_session_id:
+                try:
+                    recent = project_chat_handler.get_recent_messages(stale_session_id, limit=6)
+                    if recent:
+                        lines = []
+                        for m in recent:
+                            label = "사용자" if m["role"] == "user" else "어시스턴트"
+                            snippet = m["content"][:400].replace("\n", " ")
+                            lines.append(f"{label}: {snippet}")
+                        history_block = "\n".join(lines)
+                        send_text = (
+                            f"[이전 대화 맥락 — 세션 전환으로 자동 주입됨]\n"
+                            f"{history_block}\n\n"
+                            f"[현재 메시지]\n{text}"
+                        )
+                        logger.info(
+                            f"History injection: {len(recent)} msgs from session "
+                            f"{stale_session_id[:8]}... prepended for user {user_id}"
+                        )
+                except Exception as _hist_err:
+                    logger.warning(f"History injection failed, sending without context: {_hist_err}")
+
             enable_streaming_text = next_reply_mode != "voice"
             response = await project_chat_handler.process_message(
-                user_message=text,
+                user_message=send_text,
                 user_id=user_id,
                 chat_id=chat.id,
                 message_id=message.message_id,
-                session_id=self._effective_session_id(conversation_key, current_session),
+                session_id=effective_sid,
                 model=current_session.get("model"),
                 new_session=new_session,
                 permission_callback=self._permission_callback,
