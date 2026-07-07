@@ -41,6 +41,80 @@ DRYRUN=0
 ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 log() { printf '%s %s\n' "$(ts)" "$*" >> "$LOG" 2>/dev/null; }
 
+# ---- detached pipeline body --------------------------------------------------
+# Shared by both spawn modes (setsid re-entry + legacy subshell fallback).
+# All inputs come from CLAUDE_DISTILL_* env vars exported at the spawn site,
+# so the function behaves identically however it is entered.
+run_bg_pipeline() {
+  # Ensure a valid CWD — A2A worker sessions run in /tmp dirs that may be
+  # deleted before this bg process reaches `claude -p`, causing immediate
+  # ENOENT exit (ec=1). Fall back to HOME so the CWD is always stable.
+  cd "${HOME:-/root}" 2>/dev/null || cd / 2>/dev/null || true
+
+  export CLAUDE_DISTILL_INFLIGHT=1
+  local TRIGGER="${CLAUDE_DISTILL_TRIGGER:-manual}"
+  local DRYRUN="${CLAUDE_DISTILL_DRYRUN:-0}"
+  local HOOKDIR
+  HOOKDIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)" || HOOKDIR=${HOME:-/root}/.claude/hooks
+
+  local PIPE_START_EPOCH PIPE_PID
+  PIPE_START_EPOCH="$(date -u +%s)"
+  PIPE_PID="${BASHPID:-$$}"
+  elapsed_s() { now="$(date -u +%s)"; printf '%s' "$((now - PIPE_START_EPOCH))"; }
+
+  local EXTRACT_OUT ec
+  EXTRACT_OUT="$(bash "$HOOKDIR/distill/extract.sh" 2>>"$LOG")"
+  ec=$?
+  if [ $ec -ne 0 ] || [ -z "$EXTRACT_OUT" ]; then
+    log "extract failed ec=$ec trigger=$TRIGGER pid=$PIPE_PID elapsed_s=$(elapsed_s)"
+    return 0
+  fi
+
+  # Stash extracted JSON for debugging + sub-script consumption.
+  local STASH="$STATE_DIR/distill-last.json"
+  local STASH_DIR="$STATE_DIR/distill-history"
+  local HISTORY_KEEP="${CCC_DISTILL_HISTORY_KEEP:-20}"
+  case "$HISTORY_KEEP" in ''|*[!0-9]*) HISTORY_KEEP=20 ;; esac
+  if [ -f "$STASH" ]; then
+    mkdir -p "$STASH_DIR" 2>/dev/null
+    cp -p "$STASH" "$STASH_DIR/$(date -u +%Y%m%d-%H%M%S)-${BASHPID:-$$}.json" 2>/dev/null || true
+  fi
+  printf '%s' "$EXTRACT_OUT" > "$STASH" 2>/dev/null
+  bash "$HOOKDIR/distill/resume-write.sh" < "$STASH" >> "$LOG" 2>&1 || \
+    log "resume-write non-zero"
+  if [ "$HISTORY_KEEP" -gt 0 ]; then
+    find "$STASH_DIR" -maxdepth 1 -type f -name '*.json' -printf '%T@ %p\n' 2>/dev/null \
+      | sort -rn \
+      | awk -v keep="$HISTORY_KEEP" 'NR > keep { sub(/^[^ ]+ /, ""); print }' \
+      | xargs -r rm -- 2>/dev/null || true
+  fi
+
+  if [ "$DRYRUN" = "1" ]; then
+    log "dry-run skipping honcho/wiki push (see $STASH) trigger=$TRIGGER pid=$PIPE_PID elapsed_s=$(elapsed_s)"
+    return 0
+  fi
+
+  bash "$HOOKDIR/distill/honcho-push.sh" < "$STASH" >> "$LOG" 2>&1 || \
+    log "honcho-push non-zero (queued for retry)"
+  bash "$HOOKDIR/distill/wiki-queue.sh" < "$STASH" >> "$LOG" 2>&1 || \
+    log "wiki-queue non-zero"
+  bash "$HOOKDIR/distill/local-facts.sh" < "$STASH" >> "$LOG" 2>&1 || \
+    log "local-facts non-zero"
+
+  log "done trigger=$TRIGGER pid=$PIPE_PID elapsed_s=$(elapsed_s)"
+  return 0
+}
+
+# ---- bg re-entry (setsid-detached pipeline; spawned at the bottom) -----------
+# Reached only when the spawn site re-invokes this script with
+# CLAUDE_DISTILL_BG=1 and WITHOUT CLAUDE_DISTILL_INFLIGHT (run_bg_pipeline
+# sets INFLIGHT itself for the nested `claude -p` session), so the recursion
+# guard at the top does not short-circuit this path.
+if [ "${CLAUDE_DISTILL_BG:-}" = "1" ]; then
+  run_bg_pipeline
+  exit 0
+fi
+
 encode_project_dir() { printf '%s' "$1" | sed -E 's|[^A-Za-z0-9_]|-|g'; }
 legacy_project_dir() { printf '%s' "$1" | sed 's|/|-|g'; }
 
@@ -126,68 +200,32 @@ if [ "$TURNS" -lt "$MIN_TURNS" ]; then
 fi
 
 # ---- fire pipeline (detach so hook returns fast; SessionEnd has tight timeout)
-# Dynamic hookdir — works in both standalone (~/.claude/hooks/) and plugin
-# (${CLAUDE_PLUGIN_ROOT}/hooks/) modes. distill/ sub-scripts must sit next to this file.
-HOOKDIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)" || HOOKDIR=${HOME:-/root}/.claude/hooks
-(
-  # Ensure a valid CWD — A2A worker sessions run in /tmp dirs that may be
-  # deleted before this bg process reaches `claude -p`, causing immediate
-  # ENOENT exit (ec=1). Fall back to HOME so the CWD is always stable.
-  cd "${HOME:-/root}" 2>/dev/null || cd / 2>/dev/null || true
+# Inputs for run_bg_pipeline — exported so both spawn modes (setsid re-entry
+# and subshell fallback) read the same contract.
+export CLAUDE_DISTILL_TRIGGER="$TRIGGER"
+export CLAUDE_DISTILL_SESSION="$SESSION_ID"
+export CLAUDE_DISTILL_TRANSCRIPT="$TRANSCRIPT_PATH"
+export CLAUDE_DISTILL_SOURCE_CWD="$SOURCE_CWD"
+export CLAUDE_DISTILL_SOURCE_PROJECT="$PROJECT_ENC"
+export CLAUDE_DISTILL_DRYRUN="$DRYRUN"
 
-  export CLAUDE_DISTILL_INFLIGHT=1
-  export CLAUDE_DISTILL_TRIGGER="$TRIGGER"
-  export CLAUDE_DISTILL_SESSION="$SESSION_ID"
-  export CLAUDE_DISTILL_TRANSCRIPT="$TRANSCRIPT_PATH"
-  export CLAUDE_DISTILL_SOURCE_CWD="$SOURCE_CWD"
-  export CLAUDE_DISTILL_SOURCE_PROJECT="$PROJECT_ENC"
-  export CLAUDE_DISTILL_DRYRUN="$DRYRUN"
-
-  PIPE_START_EPOCH="$(date -u +%s)"
-  PIPE_PID="${BASHPID:-$$}"
-  elapsed_s() { now="$(date -u +%s)"; printf '%s' "$((now - PIPE_START_EPOCH))"; }
-
-  EXTRACT_OUT="$(bash "$HOOKDIR/distill/extract.sh" 2>>"$LOG")"
-  ec=$?
-  if [ $ec -ne 0 ] || [ -z "$EXTRACT_OUT" ]; then
-    log "extract failed ec=$ec trigger=$TRIGGER pid=$PIPE_PID elapsed_s=$(elapsed_s)"
-    exit 0
-  fi
-
-  # Stash extracted JSON for debugging + sub-script consumption.
-  STASH="$STATE_DIR/distill-last.json"
-  STASH_DIR="$STATE_DIR/distill-history"
-  HISTORY_KEEP="${CCC_DISTILL_HISTORY_KEEP:-20}"
-  case "$HISTORY_KEEP" in ''|*[!0-9]*) HISTORY_KEEP=20 ;; esac
-  if [ -f "$STASH" ]; then
-    mkdir -p "$STASH_DIR" 2>/dev/null
-    cp -p "$STASH" "$STASH_DIR/$(date -u +%Y%m%d-%H%M%S)-${BASHPID:-$$}.json" 2>/dev/null || true
-  fi
-  printf '%s' "$EXTRACT_OUT" > "$STASH" 2>/dev/null
-  bash "$HOOKDIR/distill/resume-write.sh" < "$STASH" >> "$LOG" 2>&1 || \
-    log "resume-write non-zero"
-  if [ "$HISTORY_KEEP" -gt 0 ]; then
-    find "$STASH_DIR" -maxdepth 1 -type f -name '*.json' -printf '%T@ %p\n' 2>/dev/null \
-      | sort -rn \
-      | awk -v keep="$HISTORY_KEEP" 'NR > keep { sub(/^[^ ]+ /, ""); print }' \
-      | xargs -r rm -- 2>/dev/null || true
-  fi
-
-  if [ "$DRYRUN" = "1" ]; then
-    log "dry-run skipping honcho/wiki push (see $STASH) trigger=$TRIGGER pid=$PIPE_PID elapsed_s=$(elapsed_s)"
-    exit 0
-  fi
-
-  bash "$HOOKDIR/distill/honcho-push.sh" < "$STASH" >> "$LOG" 2>&1 || \
-    log "honcho-push non-zero (queued for retry)"
-  bash "$HOOKDIR/distill/wiki-queue.sh" < "$STASH" >> "$LOG" 2>&1 || \
-    log "wiki-queue non-zero"
-  bash "$HOOKDIR/distill/local-facts.sh" < "$STASH" >> "$LOG" 2>&1 || \
-    log "local-facts non-zero"
-
-  log "done trigger=$TRIGGER pid=$PIPE_PID elapsed_s=$(elapsed_s)"
-) </dev/null >/dev/null 2>&1 &
-BG_PID=$!
-disown 2>/dev/null || true
-log "spawned bg pid=$BG_PID"
+# Prefer `setsid`: a plain disowned subshell stays in the hook's process
+# group/session, so when the parent session is torn down as a group (ssh-driven
+# maintenance sessions, CLI teardown) the pipeline dies silently before logging
+# anything — observed fleet-wide on 2026-07-07 (gwakga/nosuk sessionend runs
+# ended at "spawned bg" with no done/skip/error). A new session survives that
+# teardown; SIGHUP-only protection (nohup/disown) does not. Fallback keeps the
+# legacy disowned-subshell behaviour where setsid is unavailable.
+DISTILL_SELF="${BASH_SOURCE[0]:-$0}"
+if command -v setsid >/dev/null 2>&1 && [ -f "$DISTILL_SELF" ]; then
+  CLAUDE_DISTILL_BG=1 setsid bash "$DISTILL_SELF" "$TRIGGER" </dev/null >/dev/null 2>&1 &
+  BG_PID=$!
+  disown 2>/dev/null || true
+  log "spawned bg pid=$BG_PID mode=setsid"
+else
+  ( run_bg_pipeline ) </dev/null >/dev/null 2>&1 &
+  BG_PID=$!
+  disown 2>/dev/null || true
+  log "spawned bg pid=$BG_PID mode=subshell"
+fi
 exit 0
