@@ -127,6 +127,49 @@ class UserTaskQueueTest(unittest.IsolatedAsyncioTestCase):
         q = UserTaskQueue()
         self.assertEqual(q.clear("nobody"), 0)
 
+    async def test_earlier_task_finishing_keeps_later_active_slot(self):
+        # Regression: with two concurrent tasks under the same key, the first to
+        # finish used to pop the shared _active slot unconditionally, erasing the
+        # still-running later task so /stop could no longer cancel it.
+        q = UserTaskQueue(max_inflight=3)
+        a_started = asyncio.Event()
+        a_release = asyncio.Event()
+        b_started = asyncio.Event()
+        b_release = asyncio.Event()
+
+        async def run_a():
+            a_started.set()
+            await a_release.wait()
+
+        async def run_b():
+            b_started.set()
+            await b_release.wait()
+
+        async def overflow():
+            raise AssertionError("unexpected overflow")
+
+        await q.enqueue("u", run_a, overflow)
+        await asyncio.wait_for(a_started.wait(), 1)
+        await q.enqueue("u", run_b, overflow)
+        await asyncio.wait_for(b_started.wait(), 1)
+
+        # B started last, so it owns the active slot.
+        b_task = q.active("u")
+        self.assertIsNotNone(b_task)
+
+        # A finishes first. Its finally must NOT clear B's slot.
+        a_release.set()
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        self.assertIs(q.active("u"), b_task)
+
+        # B is still cancellable via the active slot.
+        q.active("u").cancel()
+        b_release.set()
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        self.assertIsNone(q.active("u"))
+
 
 if __name__ == "__main__":
     unittest.main()

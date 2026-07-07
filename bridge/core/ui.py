@@ -60,6 +60,12 @@ def format_relative_time(timestamp: str) -> str:
 
     try:
         dt = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+        # A timestamp with no "Z" and no explicit offset parses as tz-naive;
+        # subtracting it from a tz-aware `now` raises TypeError, so every such
+        # button would silently fall back to a raw date. Assume UTC for naive
+        # inputs so relative formatting keeps working.
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
         now = datetime.now(timezone.utc)
         diff = now - dt
 
@@ -142,7 +148,7 @@ def build_history_keyboard(
     page_messages = messages[start_idx:end_idx]
 
     buttons = []
-    for msg in page_messages:
+    for offset, msg in enumerate(page_messages):
         # Format relative time
         timestamp = msg.get("timestamp", "")
         time_str = format_relative_time(timestamp)
@@ -155,8 +161,11 @@ def build_history_keyboard(
         # Format button label with relative time
         label = f"💬 {time_str} {preview}"
 
-        # Callback data: revert:select:{index}
-        cb_data = f"revert:select:{msg['index']}"
+        # Callback data: revert:select:{index}. Fall back to the computed
+        # absolute position when a record lacks an explicit "index" so a single
+        # malformed entry can't crash the whole keyboard (leaving /revert blank).
+        index = msg.get("index", start_idx + offset)
+        cb_data = f"revert:select:{index}"
         buttons.append([InlineKeyboardButton(label, callback_data=cb_data)])
 
     # Add pagination buttons if needed
