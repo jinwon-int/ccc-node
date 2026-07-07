@@ -202,6 +202,13 @@ class StreamingMessageHandler:
                 return True
             logger.error(f"Failed to update draft {draft.message_id}: {e}")
             return False
+        except Exception as e:
+            # Match create_draft's resilience: a non-Telegram transport error
+            # (OSError, etc.) during an edit must not propagate out through the
+            # reader loop and abort message processing mid-stream. Treat it as a
+            # failed update and carry on.
+            logger.error(f"Failed to update draft {draft.message_id}: {e}")
+            return False
 
     def should_update(self, draft: DraftState, new_char_count: int) -> bool:
         """Check if draft should be updated based on thresholds"""
@@ -538,6 +545,13 @@ class StreamingMessageHandler:
             boundary = self._find_split_boundary(self.accumulated_text)
             seed = self._first_draft_prefix() + self.accumulated_text[:boundary]
             await self.create_draft(seed)
+            # create_draft returns None and leaves drafts empty on a failed send.
+            # Without a first draft, handle_overflow() below returns immediately
+            # without consuming accumulated_text, so the overflow `while` would
+            # spin forever with no await point and hang the whole event loop.
+            # Bail this round instead; the next chunk retries the first send.
+            if not self.drafts:
+                return False
 
         # Split off complete drafts while the buffer exceeds the per-bubble size.
         while len(self.accumulated_text) >= self.max_bubble_chars:

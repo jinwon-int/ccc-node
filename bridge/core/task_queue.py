@@ -109,7 +109,15 @@ class UserTaskQueue:
                         # Re-raise to ensure cancellation propagates.
                         raise
                     finally:
-                        self._active.pop(key, None)
+                        # Identity-guarded clear: with up to max_inflight tasks
+                        # per key running concurrently (the lock is released
+                        # before the task body runs), a bare pop would let an
+                        # earlier task delete a *later* task's active slot —
+                        # leaving a still-running task invisible to the priority
+                        # /stop and /revert paths. Only clear the slot when it
+                        # still points at THIS task.
+                        if self._active.get(key) is current_task:
+                            self._active.pop(key, None)
 
                 accepted_task = asyncio.create_task(wrapped_task())
                 self._track(key, accepted_task)

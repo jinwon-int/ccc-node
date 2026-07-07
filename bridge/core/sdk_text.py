@@ -122,12 +122,14 @@ def _format_ask_user_question(tool_input: dict):
     """
     lines: list = []
 
-    for q in tool_input.get("questions", []):
+    for q in tool_input.get("questions") or []:
+        if not isinstance(q, dict):
+            continue
         question = q.get("question", "")
         if question:
             lines.append(question)
 
-        options = q.get("options", [])
+        options = q.get("options") or []
 
         if options:
             lines.append("")

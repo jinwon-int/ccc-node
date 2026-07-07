@@ -82,6 +82,13 @@ else
 fi
 
 if [ "$APPLY" = 1 ]; then
+  # Ensure the log directory exists before cron fires. The cron line redirects
+  # to "$LOG" (under STATE_DIR); if that dir is absent, /bin/sh fails to open the
+  # redirect and the warming refresh never runs. refresh-memory.sh creates it
+  # internally, but that is too late — the redirect is set up first.
+  if [ "$REMOVE" != 1 ]; then
+    mkdir -p "$(dirname "$LOG")" 2>/dev/null || true
+  fi
   printf '%s\n' "$desired" | "$CRONTAB" -
   echo "memory-refresh cron: ${action} done (schedule: ${SCHEDULE})"
 else

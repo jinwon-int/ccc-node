@@ -101,7 +101,8 @@ gnp() { grep -Eq "$1" <<<"$cnp"; }  # like gn, but with public keys neutralized
 # The old regex required `git` and `push` to be adjacent, so `git -C x push
 # --force origin main` slipped past the review gate entirely.
 cmd_is_git_push() {
-  local toks; read -ra toks <<<"$c"
+  # Parse the quote-stripped view so a quoted subcommand/flag can't hide the push.
+  local toks; read -ra toks <<<"$cn"
   local n=${#toks[@]} i=0
   while [ "$i" -lt "$n" ] && [ "${toks[$i]}" != "git" ]; do i=$((i+1)); done
   [ "$i" -lt "$n" ] || return 1
@@ -119,9 +120,13 @@ cmd_is_git_push() {
 
 is_forcepush() {
   cmd_is_git_push || return 1
-  g '([[:space:]]-[a-zA-Z]*f\b|--force-with-lease|--force([[:space:]=]|$))' && return 0
-  g '[[:space:]]\+[A-Za-z0-9_./-]+:'                                        && return 0  # +src:dst
-  g '[[:space:]]\+[A-Za-z0-9_./-]+([[:space:]]|$)'                          && return 0  # +branch
+  # Match against the quote-stripped view (gn/cn) so `git push "--force" …` and
+  # `git push origin "+main"` can't slip the gate behind quotes. The short-flag
+  # pattern allows `f` anywhere in a bundled cluster (`-fv`, `-vf`, `-fu`), not
+  # only as the last letter.
+  gn '([[:space:]]-[a-zA-Z]*f[a-zA-Z]*\b|--force-with-lease|--force([[:space:]=]|$))' && return 0
+  gn '[[:space:]]\+[A-Za-z0-9_./-]+:'                                        && return 0  # +src:dst
+  gn '[[:space:]]\+[A-Za-z0-9_./-]+([[:space:]]|$)'                          && return 0  # +branch
   return 1
 }
 
@@ -129,12 +134,26 @@ is_forcepush() {
 forcepush_to_feature_branch() {
   # Never safe if the command chains/embeds anything else.
   case "$c" in *';'*|*'&'*|*'|'*|*'`'*|*'$('*|*$'\n'*) return 1;; esac
-  # Exactly one `git push` invocation.
-  [ "$(grep -oE 'git[[:space:]]+push\b' <<<"$c" | wc -l)" -eq 1 ] || return 1
 
-  local toks; read -ra toks <<<"$c"
-  local n=${#toks[@]} i=0 pi=-1
-  while [ "$i" -lt "$n" ]; do [ "${toks[$i]}" = "push" ] && { pi=$i; break; }; i=$((i+1)); done
+  # Parse the quote-stripped view and locate the push subcommand, tolerating the
+  # same global options as cmd_is_git_push (`git -C <dir> push`, `git -c k=v push`).
+  # The old code counted adjacent `git push` with `wc -l`, which returned 0 for
+  # `-C`/`-c` forms and wrongly denied every legitimate feature-branch force-push
+  # made through them.
+  local toks; read -ra toks <<<"$cn"
+  local n=${#toks[@]} i=0
+  while [ "$i" -lt "$n" ] && [ "${toks[$i]}" != "git" ]; do i=$((i+1)); done
+  [ "$i" -lt "$n" ] || return 1
+  i=$((i+1))
+  local pi=-1
+  while [ "$i" -lt "$n" ]; do
+    case "${toks[$i]}" in
+      -C|-c|--git-dir|--work-tree|--namespace|--exec-path|--super-prefix) i=$((i+2)) ;;
+      push) pi=$i; break ;;
+      -*) i=$((i+1)) ;;
+      *) return 1 ;;   # first non-option subcommand isn't push
+    esac
+  done
   [ "$pi" -ge 0 ] || return 1
 
   # Collect positional args after `push`, skipping flags (and value-taking flags).
@@ -154,6 +173,9 @@ forcepush_to_feature_branch() {
   local refspec="${positionals[1]}"
   refspec="${refspec#+}"          # drop leading + (force refspec)
   local dst="${refspec##*:}"      # dst = after last ':' (whole token if no ':')
+  # Normalize a fully-qualified ref down to its branch name so protected targets
+  # written as `refs/heads/main` / `heads/main` are still recognized as `main`.
+  dst="${dst#refs/heads/}"; dst="${dst#heads/}"
   [ -n "$dst" ] || return 1
 
   # Protected / ambiguous destinations stay gated.
@@ -190,20 +212,50 @@ gn '\b(tee|cp|mv|dd|install|rsync|sed|truncate|ln)\b[^|;&]*self-update\.(service
 
 # DB destructive / migration / replay
 gi '\b(DROP[[:space:]]+(TABLE|DATABASE)|TRUNCATE[[:space:]]|FLUSHALL|FLUSHDB)\b'                  && deny "db-destructive" "operator_approval_gated" "$c"
-gi '\b(db:migrate|prisma[[:space:]]+migrate[[:space:]]+(deploy|dev)|alembic[[:space:]]+(upgrade|downgrade)|knex[[:space:]]+migrate)\b' && deny "db-migrate" "operator_approval_gated" "$c"
-g '[[:space:]]replay([[:space:]]|$)'                                                              && deny "replay" "operator_approval_gated" "$c"
+# `db:migrate` only as an actual run invocation (npm/yarn/pnpm/npx run, or make),
+# not the bare token — `grep db:migrate Makefile` used to trip this.
+gi '\b((npm|pnpm|yarn|npx)([[:space:]]+run)?[[:space:]]+db:migrate|make[[:space:]]+db:migrate|prisma[[:space:]]+migrate[[:space:]]+(deploy|dev)|alembic[[:space:]]+(upgrade|downgrade)|knex[[:space:]]+migrate)\b' && deny "db-migrate" "operator_approval_gated" "$c"
+# `replay` only as a broker/worker/gateway subcommand — the bare word matched
+# innocuous greps/filenames like `grep replay app.log` before.
+g '\b(broker|worker|gateway|hermes|a2a|nexus|openclaw)[A-Za-z0-9_-]*[[:space:]]+replay([[:space:]]|$)' && deny "replay" "operator_approval_gated" "$c"
 
 # release / publish / tag-push / repo visibility
-g 'npm[[:space:]]+publish([[:space:]]|$)|gh[[:space:]]+release[[:space:]]+create([[:space:]]|$)|git[[:space:]]+push([[:space:]]|$)[^|;&]*--tags' && deny "release/publish" "operator_review_gated" "$c"
+g '\b(npm|yarn|pnpm)[[:space:]]+publish([[:space:]]|$)|gh[[:space:]]+release[[:space:]]+create([[:space:]]|$)' && deny "release/publish" "operator_review_gated" "$c"
+# tag-push: detect the push subcommand through git global options (-C/-c) just
+# like the force-push gate, then look for --tags/--follow-tags anywhere in it.
+# The old adjacency regex let `git -C /repo push origin --tags` slip the gate.
+if cmd_is_git_push && gn '[[:space:]]--(tags|follow-tags)([[:space:]=]|$)'; then
+  deny "release/publish" "operator_review_gated" "$c"
+fi
 g 'gh[[:space:]]+repo[[:space:]]+edit([[:space:]]|$)[^|;&]*--visibility'                          && deny "repo-visibility" "operator_approval_gated" "$c"
 
-# secret exfil — external transfer of credential files to remote endpoints.
+# secret exfil — external transfer of credential/key FILES to a remote endpoint.
 # Local reads (.env, credentials) are intentionally NOT gated: the operator already has
 # full shell access to the node, so local reads carry no marginal risk. Only network
 # exfil (curl/wget/nc/scp sending secret files to a remote) stays gated.
-gn '\b(curl|wget|nc|ncat|scp|sftp|ftp|rsync)\b[^|;&]*(\.env([^A-Za-z0-9_.-]|$)|\.credentials|\bid_rsa\b|secret|token)' && deny "secret-exfil" "operator_approval_gated" "$c"
+#
+# Order-INDEPENDENT: a network tool anywhere in the command PLUS a credential-file
+# reference anywhere trips the gate. The old single-regex form required the secret
+# token to appear *after* the tool on the same segment, so `cat .env | curl @-`
+# (read the secret, pipe it out) and `base64 key | nc host` slipped straight
+# through. `secret`/`token` are no longer matched as bare words — that blocked
+# ordinary API calls like `curl https://…/token` — only concrete credential files
+# (.env, .credentials, SSH private keys) count. Public keys (…​.pub / …​.pub.pem)
+# are neutralized first so deploying an authorized_keys public key is not gated.
+cexf="$(printf '%s' "$cnp" | sed -E 's#[A-Za-z0-9_./~-]*\.pub(\.pem)?#PUBKEY#g' 2>/dev/null)"
+[ -n "$cexf" ] || cexf="$cnp"
+gexf() { grep -Eq "$1" <<<"$cexf"; }
+_exfil_net='\b(curl|wget|nc|ncat|scp|sftp|ftp|rsync)\b'
+_exfil_secret='(\.env([^A-Za-z0-9_.-]|$)|\.credentials|\bid_(rsa|dsa|ecdsa|ed25519)\b)'
+if gexf "$_exfil_net" && gexf "$_exfil_secret"; then
+  deny "secret-exfil" "operator_approval_gated" "$c"
+fi
 
 # catastrophic rm against absolute / home roots (quote-stripped; long flags too)
-gn '\brm\b([[:space:]]+--?[A-Za-z-]+)*[[:space:]]+(/|~|\$HOME|/root|/etc|/var|/usr|/bin|/lib)([[:space:]/]|$)' && deny "rm-catastrophic" "operator_approval_gated" "$c"
+# The trailing anchor now also accepts `*` so `rm -rf /*` (glob-expands to every
+# top-level dir — as catastrophic as `rm -rf /`) is caught, and `${HOME}` is
+# matched alongside `$HOME`. Relative globs like `rm -rf foo/*` are unaffected:
+# the token right after the flags must still BE a filesystem root.
+gn '\brm\b([[:space:]]+--?[A-Za-z-]+)*[[:space:]]+(/|~|\$HOME|\$\{HOME\}|/root|/etc|/var|/usr|/bin|/lib)([[:space:]/*]|$)' && deny "rm-catastrophic" "operator_approval_gated" "$c"
 
 exit 0
