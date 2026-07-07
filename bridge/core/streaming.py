@@ -202,6 +202,13 @@ class StreamingMessageHandler:
                 return True
             logger.error(f"Failed to update draft {draft.message_id}: {e}")
             return False
+        except Exception as e:
+            # Match create_draft's resilience: a non-Telegram transport error
+            # (OSError, etc.) during an edit must not propagate out through the
+            # reader loop and abort message processing mid-stream. Treat it as a
+            # failed update and carry on.
+            logger.error(f"Failed to update draft {draft.message_id}: {e}")
+            return False
 
     def should_update(self, draft: DraftState, new_char_count: int) -> bool:
         """Check if draft should be updated based on thresholds"""

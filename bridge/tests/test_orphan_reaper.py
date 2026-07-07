@@ -113,6 +113,16 @@ class TestIsNodeClaude(unittest.TestCase):
     def test_case_insensitive(self):
         self.assertTrue(self._check(["Node", "Claude"]))
 
+    def test_argv_list_with_spaced_node_path(self):
+        # Regression: a node binary under a path with a space must still be
+        # detected. The old code joined argv with spaces then re-split, turning
+        # "/opt/my node/bin/node" into two tokens and missing the orphan. The
+        # argv-list form preserves the boundary.
+        argv = ["/opt/my node/bin/node", "/home/x/.npm/claude", "--print"]
+        self.assertTrue(self.mod._is_node_claude(argv))
+        # The lossy space-joined form is exactly what used to fail.
+        self.assertFalse(self.mod._is_node_claude(" ".join(argv)))
+
 
 # ---------------------------------------------------------------------------
 # Unit tests for _is_orphaned_claude_process

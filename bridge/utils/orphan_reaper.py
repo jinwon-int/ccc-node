@@ -106,9 +106,25 @@ def _cmdline_of(pid: int) -> str:
     return raw.replace(b"\x00", b" ").decode("utf-8", errors="replace").strip()
 
 
-def _is_node_claude(cmdline: str) -> bool:
+def _argv_of(pid: int) -> list[str]:
+    """Return the process argv as a list, preserving argument boundaries.
+
+    /proc/<pid>/cmdline is NUL-separated, so splitting on ``\\x00`` keeps each
+    argument intact even when a path contains spaces (e.g. a node binary under
+    ``/opt/my node/bin/node``). Detection must use this rather than a
+    space-joined string, which would mis-split such a path and miss the orphan.
     """
-    Return True when ``cmdline`` looks like a ``node claude …`` invocation.
+    raw = _read_bytes(f"/proc/{pid}/cmdline")
+    if raw is None:
+        return []
+    return [
+        a for a in raw.decode("utf-8", errors="replace").split("\x00") if a
+    ]
+
+
+def _is_node_claude(cmdline) -> bool:
+    """
+    Return True when the invocation looks like a ``node claude …`` process.
 
     The bridge spawns claude via the Agent SDK as:
         /path/to/node /path/to/claude --output-format stream-json …
@@ -116,8 +132,11 @@ def _is_node_claude(cmdline: str) -> bool:
     On JS-pinned nodes (e.g. daegyo) ``claude`` is the JS entry-point path,
     so we check that the first argument is ``node`` (basename) and that at
     least one subsequent argument contains the string ``claude``.
+
+    Accepts either an argv list (preferred — preserves boundaries for paths
+    with spaces) or a whitespace-joined string (best-effort, legacy).
     """
-    parts = cmdline.split()
+    parts = cmdline if isinstance(cmdline, list) else cmdline.split()
     if len(parts) < 2:
         return False
     first = parts[0].split("/")[-1].lower()
@@ -178,7 +197,7 @@ def _is_orphaned_claude_process(
     if age < min_age_seconds:
         return False
 
-    return _is_node_claude(_cmdline_of(pid))
+    return _is_node_claude(_argv_of(pid))
 
 
 def find_orphaned_claude_pids(
