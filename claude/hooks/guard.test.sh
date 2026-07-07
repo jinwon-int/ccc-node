@@ -193,6 +193,10 @@ run allow Bash command 'scp ~/.ssh/id_ed25519.pub host:/home/x/.ssh/authorized_k
 # `replay` only gates the broker subcommand, not the bare word
 run allow Bash command 'grep replay app.log'
 run deny  Bash command 'broker replay --from 0'
+# `db:migrate` only gates an actual run invocation, not a grep of the token
+run allow Bash command 'grep db:migrate Makefile'
+run deny  Bash command 'npm run db:migrate'
+run deny  Bash command 'yarn db:migrate'
 
 # ---- self-update: pre-approved procedure allowed, its config gated ----
 # The fixed maintenance procedure may run (approval happened at PR review time)...

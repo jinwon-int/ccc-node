@@ -209,7 +209,9 @@ gn '\b(tee|cp|mv|dd|install|rsync|sed|truncate|ln)\b[^|;&]*self-update\.(service
 
 # DB destructive / migration / replay
 gi '\b(DROP[[:space:]]+(TABLE|DATABASE)|TRUNCATE[[:space:]]|FLUSHALL|FLUSHDB)\b'                  && deny "db-destructive" "operator_approval_gated" "$c"
-gi '\b(db:migrate|prisma[[:space:]]+migrate[[:space:]]+(deploy|dev)|alembic[[:space:]]+(upgrade|downgrade)|knex[[:space:]]+migrate)\b' && deny "db-migrate" "operator_approval_gated" "$c"
+# `db:migrate` only as an actual run invocation (npm/yarn/pnpm/npx run, or make),
+# not the bare token — `grep db:migrate Makefile` used to trip this.
+gi '\b((npm|pnpm|yarn|npx)([[:space:]]+run)?[[:space:]]+db:migrate|make[[:space:]]+db:migrate|prisma[[:space:]]+migrate[[:space:]]+(deploy|dev)|alembic[[:space:]]+(upgrade|downgrade)|knex[[:space:]]+migrate)\b' && deny "db-migrate" "operator_approval_gated" "$c"
 # `replay` only as a broker/worker/gateway subcommand — the bare word matched
 # innocuous greps/filenames like `grep replay app.log` before.
 g '\b(broker|worker|gateway|hermes|a2a|nexus|openclaw)[A-Za-z0-9_-]*[[:space:]]+replay([[:space:]]|$)' && deny "replay" "operator_approval_gated" "$c"
