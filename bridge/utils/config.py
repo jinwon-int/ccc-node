@@ -699,7 +699,11 @@ def setup_logging() -> None:
     # being set to INFO. Set the root to the most-verbose handler's level (log_level)
     # and gate the CONSOLE per-handler instead so the file still receives INFO.
     logging.basicConfig(level=log_level, format=config.log_format)
-    for _h in logging.getLogger().handlers:
+    root_logger = logging.getLogger()
+    # basicConfig is a no-op when a harness (for example pytest) already installed
+    # handlers, so set the root level explicitly as the durable invariant.
+    root_logger.setLevel(log_level)
+    for _h in root_logger.handlers:
         # basicConfig's console StreamHandler inherits the root level; raise it to
         # console_level so stdout stays quiet while the file handlers below get INFO.
         _h.setLevel(console_level)
