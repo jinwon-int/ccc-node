@@ -6,15 +6,21 @@ import logging
 from typing import List, Optional
 
 from telegram_bot.core.project_chat_types import _UserStreamState
+from telegram_bot.core.sdk_text import TASK_TERMINATED_NOTICE
 
 logger = logging.getLogger(__name__)
 
 
 class ProjectChatStateMixin:
     async def stop(self, user_id: int, chat_id: Optional[int] = None) -> bool:
-        """Stop active stream(s) for a user and fail pending requests."""
+        """Stop active stream(s) for a user and fail pending requests.
+
+        The default notice is upgraded to a specific reason by
+        ``_disconnect_stream_state`` when a recent SDK/stream error (usage limit,
+        auth, network) is what actually caused the stop.
+        """
         return await self._disconnect_user_stream(
-            user_id, chat_id=chat_id, cancel_message="🛑 Task has been terminated."
+            user_id, chat_id=chat_id, cancel_message=TASK_TERMINATED_NOTICE
         )
     def _states_for_user(self, user_id: int, chat_id: Optional[int] = None) -> List[_UserStreamState]:
         if chat_id is not None:

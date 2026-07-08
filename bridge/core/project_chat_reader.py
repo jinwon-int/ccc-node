@@ -5,6 +5,7 @@
 import asyncio
 import logging
 import os
+import time
 
 from claude_agent_sdk import AssistantMessage, ResultMessage, StreamEvent, TextBlock, ToolUseBlock
 
@@ -154,6 +155,10 @@ class ProjectChatReaderMixin:
                     if msg.is_error:
                         logger.error(f"SDK returned error: {content[:500]}")
                         health_reporter.record_claude_error(content)
+                        # Record the cause so a racing disconnect can surface it
+                        # instead of the opaque "Task has been terminated." notice.
+                        state.last_error = content
+                        state.last_error_ts = time.monotonic()
                         log_chat(
                             req.user_id,
                             msg.session_id or req.requested_session_id,
@@ -212,6 +217,10 @@ class ProjectChatReaderMixin:
             raise
         except Exception as e:
             logger.error(f"Reader loop crashed for user {user_id}: {e}", exc_info=True)
+            # Record the cause so a racing disconnect can surface it instead of
+            # the opaque "Task has been terminated." notice.
+            state.last_error = str(e)
+            state.last_error_ts = time.monotonic()
             # Cancel typing keepalive to prevent orphan task
             if state.typing_task and not state.typing_task.done():
                 state.typing_task.cancel()
