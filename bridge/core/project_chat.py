@@ -4,6 +4,7 @@ Project Chat Handler - Integrates Telegram with Claude Code SDK.
 
 import os
 import re
+import time
 import asyncio
 import logging
 from pathlib import Path
@@ -95,6 +96,9 @@ PROCESS_TIMEOUT = int(os.getenv("CLAUDE_PROCESS_TIMEOUT", "21600"))
 # `from telegram_bot.core.project_chat import _is_...` imports (tests) keep working.
 from telegram_bot.core.sdk_text import (  # noqa: E402,F401
     RESTART_INTERRUPT_NOTICE,
+    TASK_TERMINATED_NOTICE,
+    CANCEL_REASON_WINDOW_S,
+    describe_cancel_reason,
     _is_shutdown_signal_error,
     _is_retryable_sdk_error,
     _format_ask_user_question,
@@ -320,8 +324,17 @@ class ProjectChatHandler(
             except Exception as e:
                 logger.error(f"Error cancelling reader task for user {user_id} chat {chat_id}: {e}")
 
-        # Fail all pending requests
-        msg = cancel_message or "🛑 Task has been terminated."
+        # Fail all pending requests.
+        msg = cancel_message or TASK_TERMINATED_NOTICE
+        # If this disconnect was triggered by a recent stream error (usage limit,
+        # auth, network drop) rather than an explicit user /stop, surface the real
+        # reason instead of the opaque "Task has been terminated." notice.
+        if msg == TASK_TERMINATED_NOTICE and state.last_error:
+            if (time.monotonic() - state.last_error_ts) < CANCEL_REASON_WINDOW_S:
+                reason = describe_cancel_reason(state.last_error)
+                if reason:
+                    msg = reason
+            state.last_error = None
         while state.pending:
             req = state.pending.popleft()
             cleaned = await self._cleanup_heartbeat(req)

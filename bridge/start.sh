@@ -1129,6 +1129,8 @@ exec_bot_once() {
     # handles stale PIDs via kill-0 + cleanup_pid, so no extra cleanup is needed.
     echo $$ > "$PID_FILE"
 
+    _acquire_platform_wakelock
+
     echo ""
     echo "🚀 Starting Telegram Bot..."
     echo "================================"
@@ -1137,6 +1139,19 @@ exec_bot_once() {
         exec "$VENV_DIR/bin/python" -m telegram_bot --path "$PROJECT_ROOT" --debug
     fi
     exec "$VENV_DIR/bin/python" -m telegram_bot --path "$PROJECT_ROOT"
+}
+
+# On Termux (Android), hold a wake lock so Doze / battery optimisation does not
+# suspend the process (and its network) when the screen is off. Without it the
+# long-lived Claude SDK stream and Telegram polling drop during idle periods and
+# sessions end early. Idempotent; a no-op on non-Termux hosts. We only acquire
+# (never auto-release) so a lock shared with other Termux services (e.g. sshd via
+# ~/.termux/boot) is never dropped when the bridge stops.
+_acquire_platform_wakelock() {
+    if command -v termux-wake-lock >/dev/null 2>&1; then
+        termux-wake-lock >/dev/null 2>&1 || true
+        echo "🔒 Termux wake lock held (prevents Doze from suspending the bot)"
+    fi
 }
 
 run_daemon_supervisor() {
@@ -1166,6 +1181,8 @@ run_daemon_supervisor() {
     echo "DEBUG: https_proxy=$https_proxy" >> "$LOGS_DIR/supervisor.log"
     echo "DEBUG: VENV_DIR=$VENV_DIR" >> "$LOGS_DIR/supervisor.log"
     echo "DEBUG: PROJECT_ROOT=$PROJECT_ROOT" >> "$LOGS_DIR/supervisor.log"
+
+    _acquire_platform_wakelock
 
     while true; do
         echo ""
