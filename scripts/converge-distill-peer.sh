@@ -46,7 +46,7 @@ fi
 
 # Resolve current author peer the SAME way the distill hooks do:
 #   .hosts.hermes.aiPeer  (nested, higher precedence)  //  .aiPeer  (flat)
-NESTED="$(jq -r '(.hosts.hermes.aiPeer) // empty' "$CFG" 2>/dev/null)"
+NESTED="$(jq -r '(.hosts|objects|.hermes.aiPeer) // empty' "$CFG" 2>/dev/null)"  # objects: tolerate legacy hosts:[] array
 FLAT="$(jq -r '(.aiPeer) // empty' "$CFG" 2>/dev/null)"
 if [ -n "$NESTED" ]; then CUR="$NESTED"; FIELD=".hosts.hermes.aiPeer";
 elif [ -n "$FLAT" ]; then CUR="$FLAT"; FIELD=".aiPeer";
@@ -91,9 +91,9 @@ fi
 
 # --- verify (live canary) ---------------------------------------------------
 if [ "$MODE" = "verify" ]; then
-  BASE="$(jq -r 'def nz(x): x|select(.!=null and .!=""); nz(.baseUrl)//nz(.hosts.hermes.baseUrl)//empty' "$CFG")"
-  WS="$(jq -r 'def nz(x): x|select(.!=null and .!=""); nz(.workspace)//nz(.hosts.hermes.workspace)//"seoyoon-family"' "$CFG")"
-  TOKEN="$(jq -r 'def nz(x): x|select(.!=null and .!=""); nz(.authToken)//nz(.apiKey)//nz(.hosts.hermes.apiKey)//empty' "$CFG")"
+  BASE="$(jq -r 'def nz(x): x|select(.!=null and .!=""); nz(.baseUrl)//nz(.hosts|objects|.hermes.baseUrl)//empty' "$CFG")"
+  WS="$(jq -r 'def nz(x): x|select(.!=null and .!=""); nz(.workspace)//nz(.hosts|objects|.hermes.workspace)//"seoyoon-family"' "$CFG")"
+  TOKEN="$(jq -r 'def nz(x): x|select(.!=null and .!=""); nz(.authToken)//nz(.apiKey)//nz(.hosts|objects|.hermes.apiKey)//empty' "$CFG")"
   [ -n "$BASE" ] || { echo "verify: no baseUrl in cfg; skip live check"; exit 0; }
   SID="converge-verify-${NODE}-$(date +%Y%m%d 2>/dev/null || echo d)"
   AUTH=(); [ -n "$TOKEN" ] && AUTH=(-H "Authorization: Bearer $TOKEN")

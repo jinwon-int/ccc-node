@@ -7,7 +7,7 @@
   "pinPeerName": true,
   "pinUserPeer": true,
   "target": "<USER_PEER_ID>",
-  "hosts": [],
+  "hosts": {},
   "recallMode": "dialectic",
   "dialecticDepth": "low",
   "dialecticReasoningLevel": "low",
