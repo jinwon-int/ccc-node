@@ -18,10 +18,14 @@ mkdir -p "$STATE_DIR" 2>/dev/null
 
 [ -f "$CFG" ] || { echo "no honcho.json"; exit 0; }
 
-BASE="$(jq -r 'def nz(x): x | select(. != null and . != ""); nz(.baseUrl) // nz(.hosts.hermes.baseUrl) // empty' "$CFG" 2>/dev/null)"
-WS="$(jq -r 'def nz(x): x | select(. != null and . != ""); nz(.workspace) // nz(.hosts.hermes.workspace) // "seoyoon-family"' "$CFG" 2>/dev/null)"
-AI_PEER="$(jq -r 'def nz(x): x | select(. != null and . != ""); nz(.hosts.hermes.aiPeer) // nz(.aiPeer) // "family-assistant"' "$CFG" 2>/dev/null)"
-TOKEN="$(jq -r 'def nz(x): x | select(. != null and . != ""); nz(.authToken) // nz(.apiKey) // nz(.hosts.hermes.apiKey) // empty' "$CFG" 2>/dev/null)"
+# `.hosts|objects|.hermes.X` tolerates a legacy `hosts: []` (array) seed: `objects`
+# passes hosts through only when it is an object, else yields empty — so the nested
+# lookup can never raise "Cannot index array" and abort the whole jq (which would
+# blank out AI_PEER and push an empty peer_id). Falls through to the flat fields.
+BASE="$(jq -r 'def nz(x): x | select(. != null and . != ""); nz(.baseUrl) // nz(.hosts|objects|.hermes.baseUrl) // empty' "$CFG" 2>/dev/null)"
+WS="$(jq -r 'def nz(x): x | select(. != null and . != ""); nz(.workspace) // nz(.hosts|objects|.hermes.workspace) // "seoyoon-family"' "$CFG" 2>/dev/null)"
+AI_PEER="$(jq -r 'def nz(x): x | select(. != null and . != ""); nz(.hosts|objects|.hermes.aiPeer) // nz(.aiPeer) // "family-assistant"' "$CFG" 2>/dev/null)"
+TOKEN="$(jq -r 'def nz(x): x | select(. != null and . != ""); nz(.authToken) // nz(.apiKey) // nz(.hosts|objects|.hermes.apiKey) // empty' "$CFG" 2>/dev/null)"
 
 # Origin node label for traceability across fleet rollout. This is separate
 # from AI_PEER (the Honcho peer id) and must not be hard-coded to the original
