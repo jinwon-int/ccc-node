@@ -202,10 +202,21 @@ class RuntimeHealthReporter:
     def cleanup_runtime_files(self) -> None:
         with self._lock:
             self._refresh_runtime_context_locked()
+            # Only remove the pid file if it still records THIS process.
+            # Concurrent instances share one pid file: the newer instance
+            # overwrites it in initialize_process(), and when either of them
+            # exits (e.g. Telegram getUpdates conflict kills the loser), an
+            # unconditional unlink here would delete the survivor's pid file —
+            # leaving a live bot that `start.sh --status` reports as dead.
             try:
-                self._pid_file.unlink()
-            except FileNotFoundError:
-                pass
+                recorded = self._pid_file.read_text(encoding="utf-8").strip()
+            except (FileNotFoundError, OSError):
+                recorded = ""
+            if recorded == str(os.getpid()):
+                try:
+                    self._pid_file.unlink()
+                except FileNotFoundError:
+                    pass
             if self._owns_token_lock and self._token_lock_file:
                 try:
                     Path(self._token_lock_file).unlink()
