@@ -207,6 +207,55 @@ class StartStatusTests(unittest.TestCase):
             "",
         )
 
+    def _spawn_unmanaged_decoy(self, project_root: Path) -> subprocess.Popen:
+        """Spawn a harmless process whose cmdline matches the project-scoped
+        bot pattern (`-m telegram_bot --path <root>`) without running the bot.
+
+        `bash -c 'sleep 30' <extra args>` exposes the extra args as $0/$@ in
+        /proc/<pid>/cmdline, which is what `pgrep -f` matches against.
+        """
+        canonical_root = project_root.resolve()
+        decoy = subprocess.Popen(
+            [
+                "bash",
+                "-c",
+                # Compound command so bash does NOT exec-replace itself with
+                # sleep (which would rewrite the visible cmdline).
+                "sleep 30; true",
+                "python",
+                "-m",
+                "telegram_bot",
+                "--path",
+                str(canonical_root),
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        self.addCleanup(decoy.kill)
+        time.sleep(0.2)
+        return decoy
+
+    def test_unknown_flag_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_root = self._prepare_project(tmpdir)
+            result = subprocess.run(
+                [
+                    "bash",
+                    str(self.start_script),
+                    "--path",
+                    str(project_root),
+                    "--start",
+                ],
+                cwd=self.repo_root,
+                text=True,
+                capture_output=True,
+                check=False,
+                env=self._hermetic_env(None),
+            )
+
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("Unknown option: --start", result.stdout)
+
     def test_status_no_pid_file(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             project_root = self._prepare_project(tmpdir)
@@ -218,6 +267,35 @@ class StartStatusTests(unittest.TestCase):
             self.assertIn("Service: unavailable (process not running)", result.stdout)
             self.assertIn("Telegram: unavailable (process not running)", result.stdout)
             self.assertIn("Claude: unavailable (process not running)", result.stdout)
+
+    def test_status_reports_unmanaged_running_process(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_root = self._prepare_project(tmpdir)
+            decoy = self._spawn_unmanaged_decoy(project_root)
+
+            result = self._run_status(project_root)
+
+            self.assertEqual(result.returncode, 0)
+            self.assertIn("Bot status: degraded", result.stdout)
+            self.assertIn(f"unmanaged PID(s): {decoy.pid}", result.stdout)
+            self.assertIn("no PID file", result.stdout)
+            # The decoy must survive a status probe.
+            self.assertIsNone(decoy.poll())
+
+    def test_stop_stops_unmanaged_process(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_root = self._prepare_project(tmpdir)
+            decoy = self._spawn_unmanaged_decoy(project_root)
+
+            result = self._run_stop(project_root)
+
+            self.assertEqual(result.returncode, 0)
+            self.assertIn(
+                f"Stopping unmanaged bot process (PID: {decoy.pid})", result.stdout
+            )
+            self.assertIn("Bot stopped", result.stdout)
+            decoy.wait(timeout=15)
+            self.assertIsNotNone(decoy.poll())
 
     def test_status_stale_pid_cleans_pid_file(self):
         with tempfile.TemporaryDirectory() as tmpdir:

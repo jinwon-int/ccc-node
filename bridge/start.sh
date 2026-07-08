@@ -237,6 +237,18 @@ EOF
             ;;
         *)
             # First non-option argument as project path
+            # Reject unknown flags loudly. Silently swallowing them turns a
+            # typo (or a plausible-but-nonexistent flag like `--start`) into a
+            # foreground run whose lifecycle is tied to the invoking shell —
+            # observed on daegyo where `--start` was assumed to mean a managed
+            # start.
+            case "$1" in
+                -*)
+                    echo "❌ Error: Unknown option: $1"
+                    echo "Use --help to list supported options."
+                    exit 1
+                    ;;
+            esac
             if [ -z "$PROJECT_ROOT" ]; then
                 export PROJECT_ROOT="$1"
             fi
@@ -302,6 +314,15 @@ is_supervisor_running() {
 
 cleanup_pid() {
     rm -f "$PID_FILE" 2>/dev/null || true
+}
+
+# PIDs of `python -m telegram_bot --path $PROJECT_ROOT` processes for THIS
+# project root, regardless of pid-file state. Covers unmanaged instances whose
+# pid file was lost (pid-file race between concurrent instances) or never
+# written — the same fallback the fleet watchdogs already use, so --status /
+# --stop and the watchdogs agree on what "running" means.
+find_project_bot_pids() {
+    pgrep -f -- "-m telegram_bot --path ${PROJECT_ROOT}( |\$)" 2>/dev/null || true
 }
 
 cleanup_supervisor_pid() {
@@ -415,33 +436,47 @@ PY
 
 # ── Action handlers ──
 
+# Shared fallback for do_status when the pid file is missing or stale: a bot
+# process for this project may still be alive (unmanaged — e.g. its pid file
+# was deleted by a dying concurrent instance, or it was started foreground in
+# an ssh session). Report it instead of declaring the bot dead.
+report_unmanaged_or_dead() {
+    local reason="$1" live_pids
+    live_pids="$(find_project_bot_pids | tr '\n' ' ' | sed 's/ $//')"
+    if [ -n "$live_pids" ]; then
+        echo "🟡 Bot status: degraded"
+        print_component_status "Process" "alive" "unmanaged PID(s): $live_pids ($reason)"
+        print_component_status "Service" "degraded" "running without pid file; not recoverable by --status/--stop bookkeeping"
+        echo "💡 Recover: $0 --path \"$PROJECT_ROOT\" --stop && $0 --path \"$PROJECT_ROOT\" --daemon"
+        return 0
+    fi
+    echo "🔴 Bot status: unavailable"
+    print_component_status "Process" "dead" "$reason"
+    print_component_status "Service" "unavailable" "process not running"
+    print_component_status "Telegram" "unavailable" "process not running"
+    print_component_status "Claude" "unavailable" "process not running"
+}
+
 do_status() {
     local pid
     pid="$(read_pid)"
     if [ -z "$pid" ]; then
-        echo "🔴 Bot status: unavailable"
-        print_component_status "Process" "dead" "no PID file"
-        print_component_status "Service" "unavailable" "process not running"
-        print_component_status "Telegram" "unavailable" "process not running"
-        print_component_status "Claude" "unavailable" "process not running"
+        report_unmanaged_or_dead "no PID file"
         exit 0
     fi
     if kill -0 "$pid" 2>/dev/null; then
         render_status_from_health "$HEALTH_FILE" "$pid" "$HEALTH_STALE_SECONDS"
     else
-        echo "🔴 Bot status: unavailable"
-        print_component_status "Process" "dead" "stale PID: $pid"
-        print_component_status "Service" "unavailable" "process not running"
-        print_component_status "Telegram" "unavailable" "process not running"
-        print_component_status "Claude" "unavailable" "process not running"
         cleanup_pid
+        report_unmanaged_or_dead "stale PID: $pid"
     fi
     exit 0
 }
 
 do_stop() {
-    local pid supervisor_pid
+    local pid supervisor_pid upid
     local stopped_service=0
+    local unmanaged_stopped=0
     supervisor_pid="$(read_supervisor_pid)"
     pid="$(read_pid)"
 
@@ -480,10 +515,30 @@ do_stop() {
         fi
     fi
 
+    # Also stop unmanaged instances for this project root (pid file lost or
+    # never written) — otherwise --stop reports "not running" while a live
+    # bot keeps holding the Telegram token.
+    for upid in $(find_project_bot_pids); do
+        [ -n "$pid" ] && [ "$upid" = "$pid" ] && continue
+        [ -n "$supervisor_pid" ] && [ "$upid" = "$supervisor_pid" ] && continue
+        echo "🛑 Stopping unmanaged bot process (PID: $upid)..."
+        kill "$upid" 2>/dev/null || true
+        for i in $(seq 1 10); do
+            kill -0 "$upid" 2>/dev/null || break
+            sleep 1
+        done
+        if kill -0 "$upid" 2>/dev/null; then
+            echo "⚠️  Unmanaged bot process not responding to SIGTERM, sending SIGKILL..."
+            kill -9 "$upid" 2>/dev/null
+            sleep 0.5
+        fi
+        unmanaged_stopped=1
+    done
+
     cleanup_pid
     cleanup_supervisor_pid
     cleanup_token_lock_if_safe "$supervisor_pid" "$pid"
-    if [ "$stopped_service" -eq 1 ] || [ -n "$supervisor_pid" ] || [ -n "$pid" ]; then
+    if [ "$stopped_service" -eq 1 ] || [ -n "$supervisor_pid" ] || [ -n "$pid" ] || [ "$unmanaged_stopped" -eq 1 ]; then
         echo "✅ Bot stopped"
     else
         echo "⚪ Bot is not running"
@@ -1205,6 +1260,18 @@ if [ "$RUN_AS_DAEMON_SUPERVISOR" -eq 1 ]; then
     prepare_runtime
     run_daemon_supervisor
     exit $?
+fi
+
+# Double-start guard for the plain foreground path (the daemon path above has
+# its own). Managed instances are caught via pid files; unmanaged ones (pid
+# file lost/never written) via the project-scoped process match — starting a
+# second instance anyway ends in a Telegram getUpdates conflict where the
+# loser's cleanup can delete the survivor's pid file.
+if [ "$INTERNAL_RUN" -eq 0 ]; then
+    if is_supervisor_running || is_running || [ -n "$(find_project_bot_pids)" ]; then
+        echo "⚠️  Bot is already running. Use --stop first."
+        exit 1
+    fi
 fi
 
 if is_token_locked; then

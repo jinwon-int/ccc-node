@@ -95,6 +95,31 @@ class RuntimeHealthReporterTests(unittest.TestCase):
             self.assertFalse(reporter.pid_file.exists())
             self.assertFalse(lock_file.exists())
 
+    def test_cleanup_preserves_pid_file_owned_by_another_process(self):
+        """A dying instance must not delete the pid file of a concurrent
+        surviving instance (pid-file race — observed on daegyo 2026-07-08)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_root = Path(tmpdir)
+            module = self._load_health_module(project_root)
+            reporter = module.RuntimeHealthReporter(project_root / ".telegram_bot")
+
+            with patch.dict(
+                os.environ,
+                {"BOT_PROCESS_MODE": "foreground", "BOT_OWNS_TOKEN_LOCK": "0"},
+                clear=False,
+            ):
+                reporter.initialize_process()
+                # Another (surviving) instance overwrites the shared pid file.
+                other_pid = os.getpid() + 1
+                reporter.pid_file.write_text(f"{other_pid}\n", encoding="utf-8")
+                reporter.cleanup_runtime_files()
+
+            self.assertTrue(reporter.pid_file.exists())
+            self.assertEqual(
+                reporter.pid_file.read_text(encoding="utf-8").strip(),
+                str(other_pid),
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
