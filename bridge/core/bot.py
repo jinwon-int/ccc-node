@@ -24,6 +24,7 @@ from telegram.ext import (
 from telegram.request import HTTPXRequest  # noqa: F401 - compatibility for tests/patches
 from telegram_bot.utils.config import config
 from telegram_bot.session.manager import session_manager
+from telegram_bot.core import session_resume
 from telegram_bot.core.push_notifier import PushNotifier
 from telegram_bot.core.task_queue import UserTaskQueue
 from telegram_bot.core.project_chat import (
@@ -152,16 +153,37 @@ class TelegramBot(BotLifecycleMixin, BotStatusMixin, BotAccessMixin, BotCommandM
             self._runtime_active_sessions.add(session_key)
 
     def _effective_session_id(self, session_key: Any, session: dict) -> Optional[str]:
-        """Prevent cross-process auto-resume from persisted session data."""
+        """Return a session_id that is safe to auto-resume.
+
+        Sessions touched in the current runtime always resume. After a bridge
+        restart the runtime set is empty; to avoid conversation memory loss,
+        a persisted session_id is still resumed when its SDK transcript exists
+        on disk (opt-out: CCC_RESUME_PERSISTED_SESSIONS=false). A persisted id
+        without a transcript is still ignored (stale/foreign session data).
+        """
         session_id = session.get("session_id")
         if not session_id:
             return None
-        if session_key not in self._runtime_active_sessions:
+        if session_key in self._runtime_active_sessions:
+            return session_id
+        if session_resume.resume_persisted_enabled() and session_resume.persisted_transcript_exists(
+            self._sdk_conversations_dir(), session_id
+        ):
             logger.info(
-                f"Ignoring persisted session_id for conversation {session_key} (not active in current runtime)"
+                f"Resuming persisted session_id for conversation {session_key} after restart"
             )
-            return None
-        return session_id
+            self._runtime_active_sessions.add(session_key)
+            return session_id
+        logger.info(
+            f"Ignoring persisted session_id for conversation {session_key} (not active in current runtime)"
+        )
+        return None
+
+    @staticmethod
+    def _sdk_conversations_dir():
+        """Resolve CONVERSATIONS_DIR from the live project_chat module (test-stub safe)."""
+        module = sys.modules.get("telegram_bot.core.project_chat")
+        return getattr(module, "CONVERSATIONS_DIR", None)
 
     @staticmethod
     def _message_timestamp_utc(message: Message) -> datetime:

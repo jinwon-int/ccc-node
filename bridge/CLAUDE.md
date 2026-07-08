@@ -122,6 +122,7 @@ utils/chat_logger.py Per-session debug chat logging
 | `CCC_TELEGRAM_SPACING_LINES` | No | Blank lines per vertical gap (paragraph/section/list-item) in the readable renderer, clamped to [1, 3] (default: 2). Set 1 for the compact single-blank layout |
 | `CCC_TELEGRAM_MAX_BUBBLE_CHARS` | No | Max characters per Telegram message; long replies split into multiple bubbles at this size (default: 1200, clamped to [200, 4000]) |
 | `CCC_TELEGRAM_OPTION_BUTTONS` | No | Render multiple-choice questions as tappable inline buttons (default: **false**). Off = options shown as text, user types their choice |
+| `CCC_RESUME_PERSISTED_SESSIONS` | No | Auto-resume a persisted session_id after a bridge restart when its SDK transcript still exists on disk (default: **true**). Set false to restore the old never-resume-across-restart behavior |
 | `OPENAI_API_KEY` | Voice only | API key for Whisper transcription |
 | `OPENAI_BASE_URL` | No | Optional OpenAI-compatible Whisper API base URL |
 | `WHISPER_MODEL` | No | Whisper model name (default: `whisper-1`) |
