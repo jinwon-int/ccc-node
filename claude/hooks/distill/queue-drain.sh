@@ -48,6 +48,7 @@ BASE="$(jq -r '.baseUrl // empty' "$CFG" 2>/dev/null)"
 WS="$(jq -r '.workspace // "seoyoon-family"' "$CFG" 2>/dev/null)"
 AI_PEER="$(jq -r '.hosts.hermes.aiPeer // .aiPeer // "family-assistant"' "$CFG" 2>/dev/null)"
 TOKEN="$(jq -r '.authToken // .apiKey // empty' "$CFG" 2>/dev/null)"
+case "$BASE" in "<"*">") BASE="" ;; esac  # unfilled seed placeholder => unconfigured
 [ -n "$BASE" ] || { log "skip reason=no-baseUrl"; exit 0; }
 
 AUTH=()
