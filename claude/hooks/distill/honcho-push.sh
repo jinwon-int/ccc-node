@@ -30,6 +30,9 @@ NODE="${CCC_NODE:-}"
 [ -z "$NODE" ] && [ -r "$STATE_DIR/node.txt" ] && NODE="$(head -1 "$STATE_DIR/node.txt" 2>/dev/null)"
 [ -z "$NODE" ] && NODE="$(hostname -s 2>/dev/null || echo ccc-node)"
 
+# Treat an unfilled seed placeholder (e.g. "<HONCHO_BASE_URL>") as unconfigured:
+# a freshly seeded honcho.json should cleanly no-op, not queue junk on a bogus URL.
+case "$BASE" in "<"*">") BASE="" ;; esac
 [ -n "$BASE" ] || { echo "no baseUrl"; exit 0; }
 
 PAYLOAD="$(cat 2>/dev/null)"
