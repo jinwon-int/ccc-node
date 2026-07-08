@@ -46,7 +46,7 @@ flock -n 9 || { log "skip reason=lock-held"; exit 0; }
 # ---- Honcho config --------------------------------------------------------
 BASE="$(jq -r '.baseUrl // empty' "$CFG" 2>/dev/null)"
 WS="$(jq -r '.workspace // "seoyoon-family"' "$CFG" 2>/dev/null)"
-AI_PEER="$(jq -r '.hosts.hermes.aiPeer // .aiPeer // "dungae"' "$CFG" 2>/dev/null)"
+AI_PEER="$(jq -r '.hosts.hermes.aiPeer // .aiPeer // "family-assistant"' "$CFG" 2>/dev/null)"
 TOKEN="$(jq -r '.authToken // .apiKey // empty' "$CFG" 2>/dev/null)"
 [ -n "$BASE" ] || { log "skip reason=no-baseUrl"; exit 0; }
 

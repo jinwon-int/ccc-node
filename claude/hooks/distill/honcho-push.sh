@@ -20,7 +20,7 @@ mkdir -p "$STATE_DIR" 2>/dev/null
 
 BASE="$(jq -r 'def nz(x): x | select(. != null and . != ""); nz(.baseUrl) // nz(.hosts.hermes.baseUrl) // empty' "$CFG" 2>/dev/null)"
 WS="$(jq -r 'def nz(x): x | select(. != null and . != ""); nz(.workspace) // nz(.hosts.hermes.workspace) // "seoyoon-family"' "$CFG" 2>/dev/null)"
-AI_PEER="$(jq -r 'def nz(x): x | select(. != null and . != ""); nz(.hosts.hermes.aiPeer) // nz(.aiPeer) // "dungae"' "$CFG" 2>/dev/null)"
+AI_PEER="$(jq -r 'def nz(x): x | select(. != null and . != ""); nz(.hosts.hermes.aiPeer) // nz(.aiPeer) // "family-assistant"' "$CFG" 2>/dev/null)"
 TOKEN="$(jq -r 'def nz(x): x | select(. != null and . != ""); nz(.authToken) // nz(.apiKey) // nz(.hosts.hermes.apiKey) // empty' "$CFG" 2>/dev/null)"
 
 # Origin node label for traceability across fleet rollout. This is separate
