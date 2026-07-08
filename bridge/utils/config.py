@@ -689,9 +689,24 @@ def setup_logging() -> None:
 
     is_debug = os.environ.get("BOT_DEBUG")
 
-    # Console handler - WARNING+ in non-debug, full level in debug
+    # Console handler - WARNING+ in non-debug, full level in debug.
     console_level = log_level if is_debug else logging.WARNING
-    logging.basicConfig(level=console_level, format=config.log_format)
+    # The ROOT logger level is a hard gate applied BEFORE any handler's own level:
+    # a record below it is dropped and never reaches the handlers. Setting the root
+    # to console_level (WARNING in non-debug) therefore silently discarded every
+    # INFO record — boot banners AND operational markers like "Ignoring persisted
+    # session_id" — so bot.log only ever captured WARNING+ despite the file handler
+    # being set to INFO. Set the root to the most-verbose handler's level (log_level)
+    # and gate the CONSOLE per-handler instead so the file still receives INFO.
+    logging.basicConfig(level=log_level, format=config.log_format)
+    root_logger = logging.getLogger()
+    # basicConfig is a no-op when a harness (for example pytest) already installed
+    # handlers, so set the root level explicitly as the durable invariant.
+    root_logger.setLevel(log_level)
+    for _h in root_logger.handlers:
+        # basicConfig's console StreamHandler inherits the root level; raise it to
+        # console_level so stdout stays quiet while the file handlers below get INFO.
+        _h.setLevel(console_level)
 
     # File handler - write to project-root scoped runtime logs.
     logs_dir = config.logs_dir
