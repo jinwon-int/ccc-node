@@ -104,3 +104,42 @@ class ReExportTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DescribeCancelReasonTest(unittest.TestCase):
+    def test_usage_limit_with_reset_hint(self):
+        msg = sdk_text.describe_cancel_reason(
+            "You've hit your limit · resets Jul 13, 10am (Asia/Seoul)"
+        )
+        self.assertIsNotNone(msg)
+        self.assertIn("usage limit", msg.lower())
+        self.assertIn("Jul 13, 10am", msg)
+
+    def test_usage_limit_without_reset_hint(self):
+        msg = sdk_text.describe_cancel_reason("usage limit exceeded")
+        self.assertIsNotNone(msg)
+        self.assertIn("usage limit", msg.lower())
+
+    def test_auth_error(self):
+        msg = sdk_text.describe_cancel_reason("Failed to authenticate. API Error: 401")
+        self.assertIsNotNone(msg)
+        self.assertIn("authentication", msg.lower())
+
+    def test_overloaded(self):
+        self.assertIn("overloaded", (sdk_text.describe_cancel_reason("Error 529 overloaded") or "").lower())
+
+    def test_network(self):
+        self.assertIn("connection", (sdk_text.describe_cancel_reason("connection timed out") or "").lower())
+
+    def test_unrecognised_returns_none(self):
+        # A genuine /stop has no error text -> caller keeps the generic notice.
+        self.assertIsNone(sdk_text.describe_cancel_reason(None))
+        self.assertIsNone(sdk_text.describe_cancel_reason(""))
+        self.assertIsNone(sdk_text.describe_cancel_reason("some unrelated failure"))
+
+    def test_reset_hint_extraction(self):
+        self.assertEqual(
+            sdk_text._extract_reset_hint("resets Jul 13, 10am (Asia/Seoul)"),
+            "Jul 13, 10am",
+        )
+        self.assertIsNone(sdk_text._extract_reset_hint("no hint here"))

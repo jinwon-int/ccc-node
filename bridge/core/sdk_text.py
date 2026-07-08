@@ -44,6 +44,53 @@ RESTART_INTERRUPT_NOTICE = (
     "Please resend your message."
 )
 
+# Opaque notice used when a task is cancelled with no recorded cause (e.g. an
+# explicit /stop). Kept as a shared constant so the disconnect path can detect
+# "this is the default" and upgrade it to a specific reason when one is known.
+TASK_TERMINATED_NOTICE = "🛑 Task has been terminated."
+
+# How recent (seconds) a recorded stream error must be to be treated as the
+# cause of a subsequent cancellation/disconnect.
+CANCEL_REASON_WINDOW_S = 30.0
+
+_RESET_HINT_RE = re.compile(r"resets?\s+([^\n().]+)", re.IGNORECASE)
+
+
+def _extract_reset_hint(text: Optional[str]) -> Optional[str]:
+    """Pull a human reset hint (e.g. ``Jul 13, 10am``) out of a limit message."""
+    if not text:
+        return None
+    m = _RESET_HINT_RE.search(text)
+    if not m:
+        return None
+    return m.group(1).strip().rstrip(",.") or None
+
+
+def describe_cancel_reason(error_text: Optional[str]) -> Optional[str]:
+    """Map a raw SDK/stream error into a concise, user-facing cancellation reason.
+
+    Returns ``None`` when the text is empty or unrecognised, so the caller can
+    fall back to the generic terminated notice (e.g. a genuine ``/stop``).
+    """
+    if not error_text:
+        return None
+    low = error_text.lower()
+    if "hit your limit" in low or "usage limit" in low or "rate limit" in low or "rate_limit" in low:
+        reset = _extract_reset_hint(error_text)
+        if reset:
+            return (
+                f"🚦 Claude usage limit reached — resets {reset}. "
+                "Please retry after it resets."
+            )
+        return "🚦 Claude usage limit reached. Please retry after it resets."
+    if "authenticate" in low or "authentication" in low or "invalid api key" in low or " 401" in low:
+        return "🔑 Claude authentication failed — the node's credentials need attention."
+    if "overloaded" in low or "529" in low or "503" in low:
+        return "⏳ Claude is temporarily overloaded — please resend in a moment."
+    if any(k in low for k in ("timed out", "timeout", "connection", "network", "econnreset", "getaddrinfo")):
+        return "🌐 Connection interrupted — please resend your message."
+    return None
+
 
 def _is_shutdown_signal_error(error_msg: str) -> bool:
     """True when ``error_msg`` reflects a claude subprocess killed by a

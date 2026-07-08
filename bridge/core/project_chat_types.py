@@ -80,3 +80,8 @@ class _UserStreamState:
     reader_task: Optional[asyncio.Task] = None
     typing_task: Optional[asyncio.Task] = None
     last_session_id: Optional[str] = None
+    # Last SDK/stream error text + monotonic timestamp. Recorded by the reader so
+    # a subsequent disconnect can surface the real cause (usage limit, auth,
+    # network) instead of the opaque "Task has been terminated." notice.
+    last_error: Optional[str] = None
+    last_error_ts: float = 0.0
