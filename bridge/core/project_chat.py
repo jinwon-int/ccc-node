@@ -142,10 +142,11 @@ class ProjectChatHandler(
     ProjectChatHistoryMixin,
 ):
     """
-    Handles Telegram messages using a per-user long-lived Claude SDK stream.
+    Handles Telegram messages using per-conversation long-lived Claude SDK streams.
 
-    This allows multiple messages to be submitted quickly to the same live session
-    before earlier responses are fully returned.
+    Requests for the same Telegram conversation are serialized until the SDK
+    returns a terminal ResultMessage. This preserves the bridge's pending FIFO
+    even when Claude Code internally records queued prompts on a live stream.
     """
 
     def __init__(self):
@@ -156,6 +157,7 @@ class ProjectChatHandler(
         # and could swap answers between chats.
         self._streams: Dict[Tuple[int, int], _UserStreamState] = {}
         self._stream_init_locks: Dict[Tuple[int, int], asyncio.Lock] = {}
+        self._conversation_locks: Dict[Tuple[int, int], asyncio.Lock] = {}
         logger.info(f"ProjectChatHandler initialized for {self.project_root}")
 
     @staticmethod
@@ -168,6 +170,14 @@ class ProjectChatHandler(
         if lock is None:
             lock = asyncio.Lock()
             self._stream_init_locks[key] = lock
+        return lock
+
+    def _get_conversation_lock(self, user_id: int, chat_id: int) -> asyncio.Lock:
+        key = self._stream_key(user_id, chat_id)
+        lock = self._conversation_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._conversation_locks[key] = lock
         return lock
 
     async def _create_user_stream(
