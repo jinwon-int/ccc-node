@@ -490,11 +490,11 @@ class ProjectChatHandler(
                 req.chat_id,
                 type(e).__name__,
             )
-        finally:
+        if cleaned:
             req.heartbeat_message_id = None
-        led = self._task_ledger
-        if cleaned and led and req.task_id:
-            led.set_status_message(req.task_id, None)
+            led = self._task_ledger
+            if led and req.task_id:
+                led.set_status_message(req.task_id, None)
         return cleaned
 
     async def _maybe_update_heartbeat(self, req: _PendingRequest, now: float) -> None:
