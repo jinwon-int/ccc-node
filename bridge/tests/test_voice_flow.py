@@ -612,93 +612,146 @@ class VoiceFlowTests(unittest.IsolatedAsyncioTestCase):
 
 
 class NewSessionFlagTests(unittest.IsolatedAsyncioTestCase):
-    async def test_new_session_flag_is_consumed_once(self):
-        class MemorySessionManager:
-            def __init__(self):
-                self.session = {
+    class MemorySessionManager:
+        def __init__(self, session=None):
+            self.session = dict(
+                session
+                or {
                     "reply_mode": "text",
                     "session_id": None,
                     "new_session": True,
                     "model": "sonnet",
                 }
-
-            async def get_session(self, user_id):
-                del user_id
-                return dict(self.session)
-
-            async def update_session(self, user_id, data):
-                del user_id
-                self.session.update(dict(data))
-
-            async def should_start_new_session(self, user_id, now=None):
-                del user_id, now
-                return False
-
-            async def set_last_user_message_at(self, user_id, at=None):
-                del user_id, at
-                self.session["last_user_message_at"] = "2026-07-09T02:23:57+00:00"
-
-        class RecordingProjectChatHandler:
-            def __init__(self):
-                self.calls = []
-
-            def get_recent_messages(self, session_id, limit=6):
-                del session_id, limit
-                return []
-
-            async def process_message(self, **kwargs):
-                self.calls.append(dict(kwargs))
-                return _ChatResponse(
-                    content="ok",
-                    session_id=f"session-{len(self.calls)}",
-                )
-
-        class TextMessage:
-            def __init__(self, message_id):
-                self.message_id = message_id
-                self.date = None
-                self.chat = SimpleNamespace(send_action=AsyncMock())
-                self.replies = []
-
-            async def reply_text(self, text, **kwargs):
-                del kwargs
-                self.replies.append(text)
-
-        def build_update(message_id):
-            return SimpleNamespace(
-                message=TextMessage(message_id),
-                callback_query=None,
-                effective_user=SimpleNamespace(id=11),
-                effective_chat=SimpleNamespace(id=1001),
             )
 
-        session_manager = MemorySessionManager()
-        handler = RecordingProjectChatHandler()
+        async def get_session(self, user_id):
+            del user_id
+            return dict(self.session)
+
+        async def update_session(self, user_id, data):
+            del user_id
+            self.session.update(dict(data))
+
+        async def should_start_new_session(self, user_id, now=None):
+            del user_id, now
+            return False
+
+        async def set_last_user_message_at(self, user_id, at=None):
+            del user_id, at
+            self.session["last_user_message_at"] = "2026-07-09T02:23:57+00:00"
+
+    class RecordingProjectChatHandler:
+        def __init__(self):
+            self.calls = []
+
+        def get_recent_messages(self, session_id, limit=6):
+            del session_id, limit
+            return []
+
+        async def process_message(self, **kwargs):
+            self.calls.append(dict(kwargs))
+            return _ChatResponse(
+                content="ok",
+                session_id=f"session-{len(self.calls)}",
+            )
+
+    class TextMessage:
+        def __init__(self, message_id):
+            self.message_id = message_id
+            self.date = None
+            self.chat = SimpleNamespace(send_action=AsyncMock())
+            self.replies = []
+
+        async def reply_text(self, text, **kwargs):
+            del kwargs
+            self.replies.append(text)
+
+    @staticmethod
+    def build_update(message_id):
+        return SimpleNamespace(
+            message=NewSessionFlagTests.TextMessage(message_id),
+            callback_query=None,
+            effective_user=SimpleNamespace(id=11),
+            effective_chat=SimpleNamespace(id=1001),
+        )
+
+    async def _run_with_stubs(self, session_manager, handler, coro):
         old_session_manager = bot_module.session_manager
         old_handler = bot_module.project_chat_handler
         try:
             bot_module.session_manager = session_manager
             bot_module.project_chat_handler = handler
-            bot = TelegramBot()
-            bot.application = SimpleNamespace(
-                bot=SimpleNamespace(
-                    send_message=AsyncMock(return_value=SimpleNamespace(message_id=55)),
-                    edit_message_text=AsyncMock(),
-                    delete_message=AsyncMock(),
-                )
-            )
-            bot._send_reply_by_mode = AsyncMock()
-
-            await bot._process_user_message_text(build_update(1), 11, "first")
-            self.assertIs(handler.calls[0]["new_session"], True)
-            self.assertIs(session_manager.session["new_session"], False)
-
-            await bot._process_user_message_text(build_update(2), 11, "second")
-            self.assertIs(handler.calls[1]["new_session"], False)
-            self.assertEqual(handler.calls[1]["session_id"], "session-1")
+            return await coro()
         finally:
             bot_module.session_manager = old_session_manager
             bot_module.project_chat_handler = old_handler
+
+    def _bot(self):
+        bot = TelegramBot()
+        bot.application = SimpleNamespace(
+            bot=SimpleNamespace(
+                send_message=AsyncMock(return_value=SimpleNamespace(message_id=55)),
+                edit_message_text=AsyncMock(),
+                delete_message=AsyncMock(),
+            )
+        )
+        bot._send_reply_by_mode = AsyncMock()
+        return bot
+
+    async def test_new_session_flag_is_consumed_once_and_announced_once(self):
+        session_manager = self.MemorySessionManager()
+        handler = self.RecordingProjectChatHandler()
+        bot = self._bot()
+
+        async def exercise():
+            first_update = self.build_update(1)
+            second_update = self.build_update(2)
+            await bot._process_user_message_text(first_update, 11, "first")
+            await bot._process_user_message_text(second_update, 11, "second")
+            return first_update, second_update
+
+        first_update, second_update = await self._run_with_stubs(
+            session_manager, handler, exercise
+        )
+
+        self.assertIs(handler.calls[0]["new_session"], True)
+        self.assertIs(session_manager.session["new_session"], False)
+        self.assertTrue(
+            any("CCC session started (/new requested)" in msg for msg in first_update.message.replies)
+        )
+        self.assertIs(handler.calls[1]["new_session"], False)
+        self.assertEqual(handler.calls[1]["session_id"], "session-1")
+        self.assertFalse(
+            any("CCC session started" in msg for msg in second_update.message.replies)
+        )
+
+    async def test_unresumable_persisted_session_is_announced(self):
+        session_manager = self.MemorySessionManager(
+            {
+                "reply_mode": "text",
+                "session_id": "previous-session-id",
+                "new_session": False,
+                "model": "sonnet",
+            }
+        )
+        handler = self.RecordingProjectChatHandler()
+        bot = self._bot()
+
+        async def exercise():
+            update = self.build_update(1)
+            await bot._process_user_message_text(update, 11, "first")
+            return update
+
+        update = await self._run_with_stubs(session_manager, handler, exercise)
+
+        self.assertIsNone(handler.calls[0]["session_id"])
+        self.assertTrue(
+            any(
+                "CCC session started (previous session was not resumable)" in msg
+                and "Previous session: previous… (not resumed)" in msg
+                for msg in update.message.replies
+            )
+        )
 
 
 class _FakePhotoMessage:

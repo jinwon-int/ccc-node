@@ -23,6 +23,7 @@ from telegram.ext import (
 )
 from telegram.request import HTTPXRequest  # noqa: F401 - compatibility for tests/patches
 from telegram_bot.utils.config import config
+from telegram_bot.utils.chat_logger import log_debug
 from telegram_bot.session.manager import session_manager
 from telegram_bot.core import session_resume
 from telegram_bot.core.push_notifier import PushNotifier
@@ -184,6 +185,40 @@ class TelegramBot(BotLifecycleMixin, BotStatusMixin, BotAccessMixin, BotCommandM
         """Resolve CONVERSATIONS_DIR from the live project_chat module (test-stub safe)."""
         module = sys.modules.get("telegram_bot.core.project_chat")
         return getattr(module, "CONVERSATIONS_DIR", None)
+
+    @staticmethod
+    def _session_start_notice_text(
+        *,
+        reason: str,
+        model: Optional[str],
+        previous_session_id: Optional[str] = None,
+    ) -> str:
+        lines = [
+            f"◐ CCC session started ({reason}). Conversation history is on a fresh Claude Code stream.",
+            "Use /resume to browse and restore a previous session.",
+            "",
+            f"◆ Model: {model or 'default'}",
+            "◆ Provider: Claude Code",
+            "◆ Context: new stream",
+        ]
+        if previous_session_id:
+            lines.append(f"◆ Previous session: {previous_session_id[:8]}… (not resumed)")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _session_start_reason(
+        *,
+        new_session: bool,
+        auto_new_session: bool,
+        stale_session_id: Optional[str],
+    ) -> str:
+        if auto_new_session:
+            return "automatic reset"
+        if new_session:
+            return "/new requested"
+        if stale_session_id:
+            return "previous session was not resumable"
+        return "no active session"
 
     @staticmethod
     def _message_timestamp_utc(message: Message) -> datetime:
@@ -359,6 +394,18 @@ class TelegramBot(BotLifecycleMixin, BotStatusMixin, BotAccessMixin, BotCommandM
             await session_manager.set_last_user_message_at(conversation_key, message_timestamp)
 
             effective_sid = self._effective_session_id(conversation_key, current_session)
+            if effective_sid is None:
+                notice = self._session_start_notice_text(
+                    reason=self._session_start_reason(
+                        new_session=new_session,
+                        auto_new_session=auto_new_session,
+                        stale_session_id=stale_session_id,
+                    ),
+                    model=current_session.get("model"),
+                    previous_session_id=stale_session_id,
+                )
+                await message.reply_text(notice)
+                log_debug(user_id, "bot", notice)
 
             # History injection: when the effective session_id is None (new session due to
             # bridge restart, session expiry, or auto-rotation) but we have a previous
