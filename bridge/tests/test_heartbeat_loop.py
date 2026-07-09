@@ -240,6 +240,27 @@ class HeartbeatLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.status_calls, [(None, 1234)])
         self.assertIsNone(req.heartbeat_message_id)
 
+    async def test_failed_stall_cleanup_keeps_heartbeat_id_for_retry(self):
+        project_chat.config.heartbeat_stall_seconds = 0.05
+        self.addCleanup(setattr, project_chat.config, "heartbeat_stall_seconds", 0.0)
+
+        async def failing_status_callback(text, message_id=None):
+            self.status_calls.append((text, message_id))
+            return message_id
+
+        req = self._make_request()
+        req.status_callback = failing_status_callback
+        req.heartbeat_message_id = 1234
+        now = asyncio.get_running_loop().time()
+        req.started_at = now - 10.0
+        req.last_event_at = now - 10.0
+
+        await self.handler._maybe_update_heartbeat(req, now)
+        await self.handler._maybe_update_heartbeat(req, now + 1.0)
+
+        self.assertEqual(self.status_calls, [(None, 1234), (None, 1234)])
+        self.assertEqual(req.heartbeat_message_id, 1234)
+
     async def test_stall_falls_back_to_started_at_when_no_event_yet(self):
         project_chat.config.heartbeat_stall_seconds = 0.05
         self.addCleanup(setattr, project_chat.config, "heartbeat_stall_seconds", 0.0)

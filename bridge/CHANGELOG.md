@@ -27,6 +27,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - 14 new unit/integration tests (`test_task_ledger.py` + heartbeat-loop ledger cases).
 
 ### Fixed
+- **Heartbeat cleanup retry path (#307).** If deleting a stalled `⏳ Working` status
+  message fails, the bridge now keeps the message id on the live request so the
+  next heartbeat tick retries the cleanup instead of losing the id and leaving a
+  dangling status line behind.
 - **Self-update restarted the bridge mid-task**, killing in-flight `claude` children
   (SIGTERM → exit 143) and destroying the user's work — the root cause behind the
   frozen heartbeats below and the frequent "resend please" interruptions. The bridge
