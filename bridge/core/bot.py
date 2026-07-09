@@ -350,6 +350,10 @@ class TelegramBot(BotLifecycleMixin, BotStatusMixin, BotAccessMixin, BotCommandM
                 self._runtime_active_sessions.discard(conversation_key)
                 new_session = True
             if new_session:
+                # SessionStore.update() is merge-only: popping the one-shot flag from
+                # the local copy does not remove it from persisted JSON storage. Persist
+                # an explicit false value so /new is consumed by exactly one message.
+                current_session["new_session"] = False
                 await session_manager.update_session(conversation_key, current_session)
 
             await session_manager.set_last_user_message_at(conversation_key, message_timestamp)

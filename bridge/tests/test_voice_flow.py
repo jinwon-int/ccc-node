@@ -62,6 +62,14 @@ class _SessionManager:
         del user_id, data
         return None
 
+    async def should_start_new_session(self, user_id, now=None):
+        del user_id, now
+        return False
+
+    async def set_last_user_message_at(self, user_id, at=None):
+        del user_id, at
+        return None
+
     async def get_pending_question(self, user_id):
         del user_id
         return None
@@ -601,6 +609,96 @@ class VoiceFlowTests(unittest.IsolatedAsyncioTestCase):
         )
         await bot._cmd_new(update, None)
         self.assertTrue(task.cancelled())
+
+
+class NewSessionFlagTests(unittest.IsolatedAsyncioTestCase):
+    async def test_new_session_flag_is_consumed_once(self):
+        class MemorySessionManager:
+            def __init__(self):
+                self.session = {
+                    "reply_mode": "text",
+                    "session_id": None,
+                    "new_session": True,
+                    "model": "sonnet",
+                }
+
+            async def get_session(self, user_id):
+                del user_id
+                return dict(self.session)
+
+            async def update_session(self, user_id, data):
+                del user_id
+                self.session.update(dict(data))
+
+            async def should_start_new_session(self, user_id, now=None):
+                del user_id, now
+                return False
+
+            async def set_last_user_message_at(self, user_id, at=None):
+                del user_id, at
+                self.session["last_user_message_at"] = "2026-07-09T02:23:57+00:00"
+
+        class RecordingProjectChatHandler:
+            def __init__(self):
+                self.calls = []
+
+            def get_recent_messages(self, session_id, limit=6):
+                del session_id, limit
+                return []
+
+            async def process_message(self, **kwargs):
+                self.calls.append(dict(kwargs))
+                return _ChatResponse(
+                    content="ok",
+                    session_id=f"session-{len(self.calls)}",
+                )
+
+        class TextMessage:
+            def __init__(self, message_id):
+                self.message_id = message_id
+                self.date = None
+                self.chat = SimpleNamespace(send_action=AsyncMock())
+                self.replies = []
+
+            async def reply_text(self, text, **kwargs):
+                del kwargs
+                self.replies.append(text)
+
+        def build_update(message_id):
+            return SimpleNamespace(
+                message=TextMessage(message_id),
+                callback_query=None,
+                effective_user=SimpleNamespace(id=11),
+                effective_chat=SimpleNamespace(id=1001),
+            )
+
+        session_manager = MemorySessionManager()
+        handler = RecordingProjectChatHandler()
+        old_session_manager = bot_module.session_manager
+        old_handler = bot_module.project_chat_handler
+        try:
+            bot_module.session_manager = session_manager
+            bot_module.project_chat_handler = handler
+            bot = TelegramBot()
+            bot.application = SimpleNamespace(
+                bot=SimpleNamespace(
+                    send_message=AsyncMock(return_value=SimpleNamespace(message_id=55)),
+                    edit_message_text=AsyncMock(),
+                    delete_message=AsyncMock(),
+                )
+            )
+            bot._send_reply_by_mode = AsyncMock()
+
+            await bot._process_user_message_text(build_update(1), 11, "first")
+            self.assertIs(handler.calls[0]["new_session"], True)
+            self.assertIs(session_manager.session["new_session"], False)
+
+            await bot._process_user_message_text(build_update(2), 11, "second")
+            self.assertIs(handler.calls[1]["new_session"], False)
+            self.assertEqual(handler.calls[1]["session_id"], "session-1")
+        finally:
+            bot_module.session_manager = old_session_manager
+            bot_module.project_chat_handler = old_handler
 
 
 class _FakePhotoMessage:
