@@ -94,26 +94,37 @@ current_supervisor_pid() {
 # hand-rolled script, so a pre-migration node with both running is caught
 # even if flock is intact for each individually.
 #
-# We keep only ppid=1 matches.  The canonical supervisor is `setsid -f`
-# detached (ppid=1), and its tunnel-loop / worker-loop subshells inherit the
-# same argv but have ppid=<parent-supervisor>.  Without the ppid filter, the
-# cap detector would double-count the parent + its subshell as "2 supervisors"
-# and mis-flag a healthy singleton as an ND-1236 pile-up.
+# We keep only detached supervisor roots.  On classic init systems a
+# `setsid -f` detached process is often reparented to ppid=1, but under
+# user/systemd managers or other subreapers it may instead be reparented to the
+# manager while still being the process-group/session leader.  Accept either
+# shape.  Tunnel-loop / worker-loop subshells inherit the supervisor's session
+# and process group but are not leaders, so they are still filtered out.
+is_detached_supervisor_root() {
+    local pid="$1" stat rest state ppid pgrp session
+    [[ -n "$pid" && -r "/proc/$pid/stat" ]] || return 1
+    stat=$(cat "/proc/$pid/stat" 2>/dev/null) || return 1
+    rest=${stat##*) }
+    read -r state ppid pgrp session _ <<<"$rest"
+    [[ -n "$ppid" && -n "$pgrp" && -n "$session" ]] || return 1
+    [[ "$ppid" == "1" || "$pid" == "$pgrp" || "$pid" == "$session" ]]
+}
+
 list_supervisor_pids() {
     { pgrep -f "$CANONICAL_SIG" 2>/dev/null || true
       pgrep -f "$LEGACY_SIG"    2>/dev/null || true
     } | awk 'NF && !seen[$0]++' | while IFS= read -r pid; do
         [[ -z "$pid" ]] && continue
-        local ppid
-        ppid=$(awk '/^PPid:/ {print $2}' "/proc/$pid/status" 2>/dev/null || echo "")
-        [[ "$ppid" == "1" ]] && printf '%s\n' "$pid"
+        is_detached_supervisor_root "$pid" && printf '%s\n' "$pid"
     done
 }
 
 count_workers_under() {
     local root="$1"
+    local n
     if [[ -z "$root" ]]; then
-        pgrep -c -f 'dist/worker\.js' 2>/dev/null || echo 0
+        n=$(pgrep -c -f 'dist/worker\.js' 2>/dev/null || true)
+        printf '%s\n' "${n:-0}"
         return
     fi
     # Skip regex-escape entirely: pgrep's `.` in worker.js is technically
@@ -122,7 +133,8 @@ count_workers_under() {
     # line will match "$root/dist/worker[not-a-dot]js".  This avoids brittle
     # portability of `sed` character-class parsing (Termux's sed rejects some
     # bracket patterns that GNU sed accepts).
-    pgrep -c -f "$root/dist/worker.js" 2>/dev/null || echo 0
+    n=$(pgrep -c -f "$root/dist/worker.js" 2>/dev/null || true)
+    printf '%s\n' "${n:-0}"
 }
 
 tunnel_status() {
