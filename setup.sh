@@ -264,6 +264,43 @@ PY
 }
 apply_node_identity
 
+# 3c) Placeholder-residue warning — a config left with unresolved <TOKEN> placeholders
+# silently breaks fail-open consumers. Worst case is honcho.json: refresh-memory.sh /
+# distill read baseUrl, treat the placeholder as a value, fail with curl errors, and the
+# memory pipeline goes dark with NO alert. This happened fleet-wide on 2026-07-08 when a
+# retirement sweep removed ~/.hermes and this seed step quietly reinstated the template
+# on 3 nodes (seoyoon-family-wiki LOG-1579). Warn loudly so the operator fills values now.
+warn_placeholder_residue() {
+  local f residue found=0 honcho_checked=0
+  # honcho.json is checked even when it was NOT freshly seeded this run — an old
+  # placeholder left from a previous run is just as fatal to the memory pipeline.
+  for f in "$HERMES_ROOT/honcho.json" ${SEEDED[@]+"${SEEDED[@]}"}; do
+    [ -f "$f" ] || continue
+    if [ "$f" = "$HERMES_ROOT/honcho.json" ]; then          # dedupe when freshly seeded
+      [ "$honcho_checked" = 1 ] && continue
+      honcho_checked=1
+    fi
+    residue="$(grep -hoE '<[A-Z][A-Z0-9_]+>' "$f" 2>/dev/null | sort -u | tr '\n' ' ' || true)"
+    [ -n "${residue// /}" ] || continue
+    if [ "$found" = 0 ]; then
+      printf '\n==> WARNING: unresolved template placeholders detected:\n'
+      found=1
+    fi
+    printf '      %s : %s\n' "$f" "$residue"
+  done
+  if [ "$found" = 1 ]; then
+    cat <<'WEOF'
+    A placeholder baseUrl in honcho.json DISABLES the Honcho memory pipeline
+    silently (refresh/distill are fail-open — they log an error and move on).
+    Fill in real values before relying on memory recall on this node.
+    If this node had a working config that a cleanup/retirement sweep moved away,
+    look for it under backup/quarantine dirs (e.g. /root/hermes-retired-*/root.hermes/)
+    and restore it instead of re-filling by hand.
+WEOF
+  fi
+}
+warn_placeholder_residue
+
 cat <<'EOF'
 
 ==> Done. Follow-up checklist (do these manually):
