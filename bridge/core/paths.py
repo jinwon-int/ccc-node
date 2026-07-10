@@ -15,10 +15,9 @@ import shlex
 from pathlib import Path as FilePath
 from typing import Any, Iterable, Iterator, List, Sequence, Tuple
 
-# Tools whose inputs can reference filesystem paths we must scope-check.
-PATH_GUARDED_TOOLS = frozenset(
-    {"Read", "Edit", "Write", "MultiEdit", "Glob", "Grep", "Bash"}
-)
+# Structured tools whose path fields are useful for inside/outside approval UX.
+# Bash is deliberately excluded: shell text parsing is not a security boundary.
+PATH_GUARDED_TOOLS = frozenset({"Read", "Edit", "Write", "MultiEdit", "Glob", "Grep"})
 
 # Dict-key substrings that mark a string value as a path to scope-check.
 PATH_KEYWORDS: Tuple[str, ...] = ("path", "file", "cwd", "dir", "directory", "root")
@@ -102,10 +101,6 @@ def extract_path_candidates(
                 add_candidate(token)
 
     walk(tool_input)
-    if tool_name == "Bash":
-        for text in iter_strings(tool_input):
-            for token in extract_paths_from_command(text):
-                add_candidate(token)
     return candidates
 
 

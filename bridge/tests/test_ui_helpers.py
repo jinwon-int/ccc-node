@@ -99,6 +99,21 @@ class KeyboardTest(unittest.TestCase):
         self.assertEqual(rows[0][0].callback_data, "opt:1. yes")
         self.assertEqual(rows[1][0].callback_data, "opt:2. no")
 
+    def test_permission_option_callbacks_keep_explicit_tokens(self):
+        options = [
+            "ALLOW_OUTSIDE_ONCE (Allow this Bash call once)",
+            "DENY_OUTSIDE (Deny)",
+        ]
+        kb = ui.build_option_keyboard(options)
+        rows = kb.inline_keyboard
+        self.assertEqual(
+            rows[0][0].callback_data,
+            "opt:1. ALLOW_OUTSIDE_ONCE (Allow this Bash call once)",
+        )
+        self.assertEqual(rows[1][0].callback_data, "opt:2. DENY_OUTSIDE (Deny)")
+        for row in rows:
+            self.assertLessEqual(len(row[0].callback_data.encode("utf-8")), 64)
+
     def test_option_keyboard_truncates_long_callback(self):
         long_opt = "z" * 200
         kb = ui.build_option_keyboard([long_opt])

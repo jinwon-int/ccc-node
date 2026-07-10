@@ -396,7 +396,7 @@ class BotDeliveryMixin:
             await query.edit_message_text(f"✅ Selected: {choice}")
             # Send choice back to Claude as a new message
             chat_id = chat.id
-            await self._maybe_capture_outside_approval(user_id, choice)
+            await self._maybe_capture_outside_approval(user_id, choice, chat_id)
 
             async def run_task():
                 session = await session_manager.get_session(user_id)

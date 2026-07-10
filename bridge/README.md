@@ -336,8 +336,9 @@ Current reference pricing is about **$0.006/minute** of audio. Check OpenAI pric
 
 ## Security
 
-- `--path` sets the `PROJECT_ROOT` — the sandbox boundary for all file operations.
-- File access within `PROJECT_ROOT` is auto-allowed. Outside access requires user confirmation via inline buttons.
+- `--path` sets the `PROJECT_ROOT` working directory and structured-tool approval boundary. It is **not** an OS sandbox.
+- Structured file tools (`Read`, `Edit`, `Write`, `MultiEdit`, `Glob`, `Grep`) are auto-allowed inside `PROJECT_ROOT`; outside paths require user confirmation.
+- `Bash` is disabled by default. `CCC_BRIDGE_BASH_POLICY=approve-each` opts in, but every Bash call still requires explicit one-time approval and may access outside `PROJECT_ROOT`; use an OS sandbox for stronger isolation.
 - Bot output referencing external files requires confirmation before sending.
 - All runtime data stays under `PROJECT_ROOT/.telegram_bot/`.
 

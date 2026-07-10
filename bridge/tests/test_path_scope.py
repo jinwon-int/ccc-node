@@ -32,6 +32,12 @@ class IsWithinProjectRootTest(unittest.TestCase):
         escaped = self.root / ".." / "sibling" / "x"
         self.assertFalse(paths.is_within_project_root(escaped, self.root))
 
+    def test_symlink_escape_is_outside(self):
+        with TemporaryDirectory() as outside:
+            link = self.root / "external-link"
+            link.symlink_to(Path(outside), target_is_directory=True)
+            self.assertFalse(paths.is_within_project_root(link / "file.txt", self.root))
+
 
 class ResolveCandidatePathTest(unittest.TestCase):
     def setUp(self):
@@ -141,11 +147,22 @@ class ExtractOutsidePathsTest(unittest.TestCase):
         )
         self.assertEqual(got, [])
 
-    def test_bash_escape_flagged(self):
-        got = paths.extract_outside_paths(
-            "Bash", {"command": "cat /etc/passwd"}, project_root=self.root
-        )
-        self.assertEqual(got, ["/etc/passwd"])
+    def test_bash_is_not_treated_as_a_path_parser_security_boundary(self):
+        commands = [
+            "cat /etc/passwd",
+            'P=/etc/passwd; cat "$P"',
+            'python -c \'open("/etc/passwd").read()\'',
+            "cd .. && pwd",
+            "cat $(printf /etc/passwd)",
+        ]
+        for command in commands:
+            with self.subTest(command=command):
+                self.assertEqual(
+                    paths.extract_outside_paths(
+                        "Bash", {"command": command}, project_root=self.root
+                    ),
+                    [],
+                )
 
 
 class SplitPathsByScopeTest(unittest.TestCase):
