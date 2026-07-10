@@ -9,14 +9,59 @@ from claude_agent_sdk.types import PermissionResultAllow, PermissionResultDeny
 
 from telegram_bot.core import bot_access
 from telegram_bot.core.bot_access import BotAccessMixin
-from telegram_bot.core import tool_policy
+from telegram_bot.core import project_chat, tool_policy
+
+
+class _FakeSDKClient:
+    last_options = None
+
+    def __init__(self, options):
+        type(self).last_options = options
+
+    async def connect(self):
+        return None
+
+
+class SDKOptionWiringTest(unittest.TestCase):
+    def test_project_chat_passes_bash_ask_hook_without_bare_allow(self):
+        def close_task(coro):
+            coro.close()
+            return object()
+
+        with patch.object(project_chat, "ClaudeSDKClient", _FakeSDKClient), patch.object(
+            project_chat.asyncio, "create_task", side_effect=close_task
+        ):
+            handler = project_chat.ProjectChatHandler()
+            asyncio.run(handler._create_user_stream(10, None))
+
+        options = _FakeSDKClient.last_options
+        self.assertIsNotNone(options)
+        self.assertNotIn("Bash", options.allowed_tools)
+        self.assertNotIn("Bash", options.disallowed_tools)
+        self.assertIn("PreToolUse", options.hooks)
+        matcher = options.hooks["PreToolUse"][0]
+        self.assertEqual(matcher.matcher, "Bash")
+        decision = asyncio.run(
+            matcher.hooks[0](
+                {
+                    "hook_event_name": "PreToolUse",
+                    "tool_name": "Bash",
+                    "tool_input": {"command": "pwd"},
+                },
+                "tool-use-id",
+                None,
+            )
+        )
+        self.assertEqual(
+            decision["hookSpecificOutput"]["permissionDecision"], "ask"
+        )
 
 
 class ToolPolicyTest(unittest.TestCase):
     def test_default_requires_per_call_approval_for_bash(self):
         with patch.dict(os.environ, {}, clear=True):
             self.assertEqual(tool_policy.resolve_bash_policy(), "approve-each")
-            self.assertIn("Bash", tool_policy.allowed_tools())
+            self.assertNotIn("Bash", tool_policy.allowed_tools())
             self.assertNotIn("Bash", tool_policy.disallowed_tools())
             self.assertIn("AskUserQuestion", tool_policy.disallowed_tools())
 
@@ -33,13 +78,39 @@ class ToolPolicyTest(unittest.TestCase):
             self.assertEqual(tool_policy.resolve_bash_policy(), "disabled")
             self.assertNotIn("Bash", tool_policy.allowed_tools())
 
-    def test_approve_each_opt_in_exposes_bash(self):
+    def test_approve_each_exposes_bash_without_auto_approving_it(self):
         tools = tool_policy.allowed_tools("approve-each")
-        self.assertIn("Bash", tools)
+        self.assertNotIn("Bash", tools)
         self.assertIn("Read", tools)
         self.assertIn("Write", tools)
         self.assertNotIn("Bash", tool_policy.disallowed_tools("approve-each"))
         self.assertIn("AskUserQuestion", tool_policy.disallowed_tools("approve-each"))
+
+    def test_approve_each_registers_pretool_ask_hook_for_bash(self):
+        hooks = tool_policy.bash_permission_hooks("approve-each")
+        self.assertEqual(set(hooks), {"PreToolUse"})
+        self.assertEqual(len(hooks["PreToolUse"]), 1)
+        matcher = hooks["PreToolUse"][0]
+        self.assertEqual(matcher.matcher, "Bash")
+        self.assertEqual(len(matcher.hooks), 1)
+
+        result = asyncio.run(
+            matcher.hooks[0](
+                {
+                    "hook_event_name": "PreToolUse",
+                    "tool_name": "Bash",
+                    "tool_input": {"command": "pwd"},
+                },
+                "tool-use-id",
+                None,
+            )
+        )
+        specific = result["hookSpecificOutput"]
+        self.assertEqual(specific["hookEventName"], "PreToolUse")
+        self.assertEqual(specific["permissionDecision"], "ask")
+
+    def test_disabled_policy_does_not_register_bash_hook(self):
+        self.assertEqual(tool_policy.bash_permission_hooks("disabled"), {})
 
     def test_bash_without_active_callback_fails_closed(self):
         self.assertTrue(

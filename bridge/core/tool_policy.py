@@ -9,7 +9,9 @@ hard-disable Bash explicitly; unknown policy values fail closed.
 from __future__ import annotations
 
 import os
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
+
+from claude_agent_sdk import HookMatcher
 
 BASH_POLICY_ENV = "CCC_BRIDGE_BASH_POLICY"
 BASH_DISABLED = "disabled"
@@ -41,13 +43,13 @@ def resolve_bash_policy(raw: Optional[str] = None) -> str:
 
 
 def allowed_tools(bash_policy: Optional[str] = None) -> List[str]:
-    """Build the SDK allowlist for the validated Bash policy."""
+    """Build the SDK allowlist without auto-approving Bash."""
 
-    policy = resolve_bash_policy(bash_policy)
-    tools: List[str] = list(STRUCTURED_ALLOWED_TOOLS)
-    if policy == BASH_APPROVE_EACH:
-        tools.append("Bash")
-    return tools
+    del bash_policy
+    # An unlisted tool remains visible and falls through to permission
+    # evaluation. A bare Bash entry would auto-approve every invocation before
+    # can_use_tool is consulted, so Bash must never be added here.
+    return list(STRUCTURED_ALLOWED_TOOLS)
 
 
 def disallowed_tools(bash_policy: Optional[str] = None) -> List[str]:
@@ -58,6 +60,49 @@ def disallowed_tools(bash_policy: Optional[str] = None) -> List[str]:
     if policy == BASH_DISABLED:
         tools.append("Bash")
     return tools
+
+
+def bash_permission_hooks(
+    bash_policy: Optional[str] = None,
+) -> Dict[str, List[HookMatcher]]:
+    """Force every exposed Bash call through can_use_tool.
+
+    A PreToolUse ``ask`` decision takes precedence over allow rules, including
+    broad ``Bash(*)`` rules inherited from settings.json.
+    """
+
+    if resolve_bash_policy(bash_policy) != BASH_APPROVE_EACH:
+        return {}
+
+    async def require_per_call_approval(
+        _input_data: Dict[str, Any], _tool_use_id: Optional[str], _context: Any
+    ) -> Dict[str, Any]:
+        return {
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "ask",
+                "permissionDecisionReason": (
+                    "Bash requires explicit per-call Telegram approval."
+                ),
+            }
+        }
+
+    return {
+        "PreToolUse": [
+            HookMatcher(matcher="Bash", hooks=[require_per_call_approval])
+        ]
+    }
+
+
+def sdk_permission_options(bash_policy: Optional[str] = None) -> Dict[str, Any]:
+    """Build one internally consistent SDK permission bundle."""
+
+    policy = resolve_bash_policy(bash_policy)
+    return {
+        "allowed_tools": allowed_tools(policy),
+        "disallowed_tools": disallowed_tools(policy),
+        "hooks": bash_permission_hooks(policy),
+    }
 
 
 def missing_callback_requires_denial(
