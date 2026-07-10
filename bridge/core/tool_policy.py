@@ -1,9 +1,9 @@
-"""Fail-closed tool exposure policy for the Telegram bridge.
+"""Approval-gated Bash exposure policy for the Telegram bridge.
 
 ``PROJECT_ROOT`` is an approval/working-directory boundary, not a shell
-sandbox. Bash is therefore absent by default. The only source-level opt-in is
-``approve-each``, which still requires the permission callback to approve every
-individual Bash call.
+sandbox. Bash is exposed by default under ``approve-each``, which requires the
+permission callback to approve every individual Bash call. Operators can still
+hard-disable Bash explicitly; unknown policy values fail closed.
 """
 
 from __future__ import annotations
@@ -31,9 +31,9 @@ STRUCTURED_ALLOWED_TOOLS = (
 
 
 def resolve_bash_policy(raw: Optional[str] = None) -> str:
-    """Return a validated policy, failing closed on missing/unknown values."""
+    """Default missing values to approve-each and fail closed on unknown values."""
 
-    value = os.getenv(BASH_POLICY_ENV, BASH_DISABLED) if raw is None else raw
+    value = os.getenv(BASH_POLICY_ENV, BASH_APPROVE_EACH) if raw is None else raw
     normalized = str(value).strip().lower().replace("_", "-")
     if normalized == BASH_APPROVE_EACH:
         return BASH_APPROVE_EACH

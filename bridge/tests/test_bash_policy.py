@@ -13,8 +13,17 @@ from telegram_bot.core import tool_policy
 
 
 class ToolPolicyTest(unittest.TestCase):
-    def test_default_disables_bash(self):
+    def test_default_requires_per_call_approval_for_bash(self):
         with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(tool_policy.resolve_bash_policy(), "approve-each")
+            self.assertIn("Bash", tool_policy.allowed_tools())
+            self.assertNotIn("Bash", tool_policy.disallowed_tools())
+            self.assertIn("AskUserQuestion", tool_policy.disallowed_tools())
+
+    def test_explicit_disabled_policy_hard_denies_bash(self):
+        with patch.dict(
+            os.environ, {"CCC_BRIDGE_BASH_POLICY": "disabled"}, clear=True
+        ):
             self.assertEqual(tool_policy.resolve_bash_policy(), "disabled")
             self.assertNotIn("Bash", tool_policy.allowed_tools())
             self.assertIn("Bash", tool_policy.disallowed_tools())
