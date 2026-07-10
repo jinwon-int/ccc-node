@@ -27,11 +27,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - 14 new unit/integration tests (`test_task_ledger.py` + heartbeat-loop ledger cases).
 
 ### Changed
-- `CCC_BRIDGE_BASH_POLICY` now has three explicit states and defaults to
-  `auto-approve`, which deliberately adds bare `Bash` to the SDK allowlist so
-  calls run without per-call Telegram confirmation. Operators can select
-  `approve-each` to omit bare Bash and install a bridge-owned `PreToolUse` ask
-  hook, or `disabled` to remove Bash entirely. Unknown values fail closed.
+- `CCC_BRIDGE_BASH_POLICY` has three explicit states and defaults to
+  `auto-approve`. Bash now runs inside a strict Claude Code OS sandbox with
+  unsandboxed fallback/excluded commands disabled, host reads denied by default,
+  and SDK startup failing closed when the sandbox is unavailable. The bridge
+  ignores user/project/local settings for SDK streams so merged filesystem
+  arrays cannot widen the boundary. `approve-each` adds Telegram confirmation
+  on top of the same sandbox; `disabled` removes Bash entirely. Unknown values
+  fail closed. Linux/WSL2 requires `bubblewrap` and `socat`.
 
 ### Fixed
 - **Heartbeat cleanup retry path (#307).** If deleting a stalled `⏳ Working` status

@@ -324,8 +324,11 @@ ffmpeg -version
 
 ## 安全
 
-- `--path` 设定 `PROJECT_ROOT` — 所有文件操作的沙箱边界。
-- `PROJECT_ROOT` 内的文件访问自动放行。外部访问需通过内联按钮确认。
+- `--path` 设定 `PROJECT_ROOT` 工作目录以及结构化文件工具的确认边界。
+- 结构化文件工具（`Read`、`Edit`、`Write`、`MultiEdit`、`Glob`、`Grep`）保持现有行为：根目录内自动放行，外部路径需要用户确认。
+- `Bash` 默认使用 `CCC_BRIDGE_BASH_POLICY=auto-approve`，但命令只会在 Claude Code 的严格 OS 沙箱中自动运行。Bridge 禁止非沙箱回退和 excluded commands；沙箱不可用时 fail-closed；默认拒绝读取 host 文件，仅重新允许 `PROJECT_ROOT` 与最小的只读可执行文件/运行库路径。Bridge SDK stream 不加载 user/project/local settings，避免合并的 filesystem 配置扩大边界。
+- Linux/WSL2 必须先安装 `bubblewrap` 和 `socat`（`sudo apt-get install bubblewrap socat`）；macOS 使用 Seatbelt。原生 Windows、WSL1、Termux 或无法初始化沙箱的 Linux 主机会 fail-closed，绝不会在 host 上直接执行 Bash。
+- `approve-each` 在相同 OS 沙箱之外再要求每次 Telegram 确认；`disabled` 完全移除 Bash；未知值 fail-closed。用户确认不能获得非沙箱逃逸。
 - Bot 输出引用外部文件时，发送前需用户确认。
 - 所有运行时数据都在 `PROJECT_ROOT/.telegram_bot/` 内。
 
