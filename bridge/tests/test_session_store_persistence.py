@@ -1,6 +1,7 @@
 """Regression tests for atomic, corruption-recoverable SessionStore persistence."""
 
 import asyncio
+import errno
 import json
 import os
 import stat
@@ -66,7 +67,41 @@ def test_first_save_is_atomic_and_private(tmp_path):
     assert read_json(path) == {"telegram_session:1": {"session_id": "one"}}
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
     assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
-    assert list(path.parent.glob(f".{path.name}.tmp-*")) == []
+    assert list(path.parent.glob(f".{path.name}*.tmp-*")) == []
+
+
+def test_existing_state_files_are_tightened_to_0600(tmp_path):
+    path = tmp_path / "sessions.json"
+    backup_path = path.with_name(f"{path.name}.bak")
+    payload = '{"telegram_session:1": {"version": 1}}\n'
+    path.write_text(payload, encoding="utf-8")
+    backup_path.write_text(payload, encoding="utf-8")
+    path.chmod(0o644)
+    backup_path.chmod(0o664)
+
+    SessionStore(path)
+
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert stat.S_IMODE(backup_path.stat().st_mode) == 0o600
+
+
+def test_existing_safe_parent_permissions_are_not_overwritten(tmp_path):
+    parent = tmp_path / "shared-state"
+    parent.mkdir(mode=0o755)
+    parent.chmod(0o755)
+
+    SessionStore(parent / "sessions.json")
+
+    assert stat.S_IMODE(parent.stat().st_mode) == 0o755
+
+
+def test_existing_group_writable_parent_fails_closed(tmp_path):
+    parent = tmp_path / "unsafe-state"
+    parent.mkdir(mode=0o777)
+    parent.chmod(0o777)
+
+    with pytest.raises(PermissionError, match="writable by group or others"):
+        SessionStore(parent / "sessions.json")
 
 
 def test_serialization_failure_preserves_disk_and_memory(tmp_path):
@@ -100,7 +135,99 @@ def test_temp_write_failure_preserves_disk_and_memory(tmp_path, operation):
 
     assert path.read_bytes() == before
     assert run(store.get(1)) == {"version": 1}
-    assert list(path.parent.glob(f".{path.name}.tmp-*")) == []
+    assert list(path.parent.glob(f".{path.name}*.tmp-*")) == []
+
+
+@pytest.mark.parametrize("operation", ["write", "flush"])
+def test_primary_temp_io_failure_after_backup_preserves_state(tmp_path, operation):
+    path = tmp_path / "sessions.json"
+    store = SessionStore(path)
+    run(store.set(1, {"version": 1}))
+    before = path.read_bytes()
+    real_fdopen = os.fdopen
+    open_calls = 0
+
+    def fail_primary_fdopen(*args, **kwargs):
+        nonlocal open_calls
+        open_calls += 1
+        stream = real_fdopen(*args, **kwargs)
+        if open_calls == 2:
+            return FailingStream(stream, operation)
+        return stream
+
+    with patch("telegram_bot.session.store.os.fdopen", side_effect=fail_primary_fdopen):
+        with pytest.raises(OSError, match=f"{operation} failed"):
+            run(store.update(1, {"version": 2}))
+
+    assert path.read_bytes() == before
+    assert run(store.get(1)) == {"version": 1}
+    assert list(path.parent.glob(f".{path.name}*.tmp-*")) == []
+
+
+def test_primary_file_fsync_failure_after_backup_preserves_state(tmp_path):
+    path = tmp_path / "sessions.json"
+    store = SessionStore(path)
+    run(store.set(1, {"version": 1}))
+    before = path.read_bytes()
+    real_fsync = os.fsync
+    regular_calls = 0
+
+    def fail_second_regular_file(fd):
+        nonlocal regular_calls
+        if stat.S_ISREG(os.fstat(fd).st_mode):
+            regular_calls += 1
+            if regular_calls == 2:
+                raise OSError(errno.EIO, "primary file fsync failed")
+        return real_fsync(fd)
+
+    with patch("telegram_bot.session.store.os.fsync", side_effect=fail_second_regular_file):
+        with pytest.raises(OSError, match="primary file fsync failed"):
+            run(store.update(1, {"version": 2}))
+
+    assert path.read_bytes() == before
+    assert run(store.get(1)) == {"version": 1}
+    assert list(path.parent.glob(f".{path.name}*.tmp-*")) == []
+
+
+def test_backup_replace_failure_preserves_primary_and_memory(tmp_path):
+    path = tmp_path / "sessions.json"
+    backup_path = path.with_name(f"{path.name}.bak")
+    store = SessionStore(path)
+    run(store.set(1, {"version": 1}))
+    before = path.read_bytes()
+    real_replace = os.replace
+
+    def fail_backup_replace(source, destination):
+        if Path(destination) == backup_path:
+            raise OSError("backup replace failed")
+        return real_replace(source, destination)
+
+    with patch("telegram_bot.session.store.os.replace", side_effect=fail_backup_replace):
+        with pytest.raises(OSError, match="backup replace failed"):
+            run(store.update(1, {"version": 2}))
+
+    assert path.read_bytes() == before
+    assert run(store.get(1)) == {"version": 1}
+    assert list(path.parent.glob(f".{path.name}*.tmp-*")) == []
+
+
+def test_delete_replace_failure_rolls_memory_back(tmp_path):
+    path = tmp_path / "sessions.json"
+    store = SessionStore(path)
+    run(store.set(1, {"version": 1}))
+    real_replace = os.replace
+
+    def fail_primary_replace(source, destination):
+        if Path(destination) == path:
+            raise OSError("replace failed")
+        return real_replace(source, destination)
+
+    with patch("telegram_bot.session.store.os.replace", side_effect=fail_primary_replace):
+        with pytest.raises(OSError, match="replace failed"):
+            run(store.delete(1))
+
+    assert run(store.get(1)) == {"version": 1}
+    assert read_json(path) == {"telegram_session:1": {"version": 1}}
 
 
 def test_file_fsync_failure_preserves_disk_and_memory(tmp_path):
@@ -115,7 +242,7 @@ def test_file_fsync_failure_preserves_disk_and_memory(tmp_path):
 
     assert path.read_bytes() == before
     assert run(store.get(1)) == {"version": 1}
-    assert list(path.parent.glob(f".{path.name}.tmp-*")) == []
+    assert list(path.parent.glob(f".{path.name}*.tmp-*")) == []
 
 
 def test_unsupported_directory_fsync_keeps_committed_state(tmp_path, caplog):
@@ -126,7 +253,7 @@ def test_unsupported_directory_fsync_keeps_committed_state(tmp_path, caplog):
 
     def fail_for_directory(fd):
         if stat.S_ISDIR(os.fstat(fd).st_mode):
-            raise OSError("directory fsync unsupported")
+            raise OSError(errno.EINVAL, "directory fsync unsupported")
         return real_fsync(fd)
 
     with patch("telegram_bot.session.store.os.fsync", side_effect=fail_for_directory):
@@ -135,6 +262,75 @@ def test_unsupported_directory_fsync_keeps_committed_state(tmp_path, caplog):
     assert read_json(path) == {"telegram_session:1": {"version": 2}}
     assert run(store.get(1)) == {"version": 2}
     assert "Directory fsync unavailable" in caplog.text
+
+
+def test_backup_directory_fsync_io_error_rolls_back_before_primary_replace(tmp_path):
+    path = tmp_path / "sessions.json"
+    store = SessionStore(path)
+    run(store.set(1, {"version": 1}))
+    before = path.read_bytes()
+    real_fsync = os.fsync
+
+    def fail_first_directory(fd):
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            raise OSError(errno.EIO, "directory fsync failed")
+        return real_fsync(fd)
+
+    with patch("telegram_bot.session.store.os.fsync", side_effect=fail_first_directory):
+        with pytest.raises(OSError, match="directory fsync failed"):
+            run(store.update(1, {"version": 2}))
+
+    assert path.read_bytes() == before
+    assert run(store.get(1)) == {"version": 1}
+
+
+def test_primary_directory_fsync_io_error_keeps_committed_disk_and_memory(tmp_path):
+    path = tmp_path / "sessions.json"
+    store = SessionStore(path)
+    run(store.set(1, {"version": 1}))
+    real_fsync = os.fsync
+    directory_calls = 0
+
+    def fail_second_directory(fd):
+        nonlocal directory_calls
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            directory_calls += 1
+            if directory_calls == 2:
+                raise OSError(errno.EIO, "directory fsync failed")
+        return real_fsync(fd)
+
+    with patch("telegram_bot.session.store.os.fsync", side_effect=fail_second_directory):
+        with pytest.raises(OSError, match="directory fsync failed"):
+            run(store.update(1, {"version": 2}))
+
+    assert read_json(path) == {"telegram_session:1": {"version": 2}}
+    assert run(store.get(1)) == {"version": 2}
+
+
+def test_directory_close_error_after_primary_replace_is_nonfatal(tmp_path, caplog):
+    path = tmp_path / "sessions.json"
+    store = SessionStore(path)
+    run(store.set(1, {"version": 1}))
+    real_close = os.close
+    directory_calls = 0
+
+    def fail_second_directory_close(fd):
+        nonlocal directory_calls
+        is_directory = stat.S_ISDIR(os.fstat(fd).st_mode)
+        real_close(fd)
+        if is_directory:
+            directory_calls += 1
+            if directory_calls == 2:
+                raise OSError(errno.EIO, "directory close failed")
+
+    with patch(
+        "telegram_bot.session.store.os.close", side_effect=fail_second_directory_close
+    ):
+        run(store.update(1, {"version": 2}))
+
+    assert read_json(path) == {"telegram_session:1": {"version": 2}}
+    assert run(store.get(1)) == {"version": 2}
+    assert "Directory close failed" in caplog.text
 
 
 def test_primary_replace_failure_preserves_disk_and_memory(tmp_path):
@@ -155,7 +351,7 @@ def test_primary_replace_failure_preserves_disk_and_memory(tmp_path):
 
     assert path.read_bytes() == before
     assert run(store.get(1)) == {"version": 1}
-    assert list(path.parent.glob(f".{path.name}.tmp-*")) == []
+    assert list(path.parent.glob(f".{path.name}*.tmp-*")) == []
 
 
 def test_corrupt_primary_recovers_previous_good_backup(tmp_path, caplog):
@@ -183,6 +379,72 @@ def test_corrupt_primary_without_backup_fails_closed(tmp_path):
         SessionStore(path)
 
 
+def test_missing_primary_with_malformed_backup_fails_closed(tmp_path):
+    path = tmp_path / "sessions.json"
+    backup_path = path.with_name(f"{path.name}.bak")
+    backup_path.write_text("{ truncated", encoding="utf-8")
+
+    with pytest.raises(SessionStoreCorruptionError, match="no valid backup"):
+        SessionStore(path)
+
+
+def test_recovery_rewrite_failure_leaves_corrupt_primary_and_backup_intact(tmp_path):
+    path = tmp_path / "sessions.json"
+    backup_path = path.with_name(f"{path.name}.bak")
+    corrupt_primary = b"{ truncated"
+    valid_backup = b'{"telegram_session:1": {"version": 1}}\n'
+    path.write_bytes(corrupt_primary)
+    backup_path.write_bytes(valid_backup)
+    real_replace = os.replace
+
+    def fail_primary_replace(source, destination):
+        if Path(destination) == path:
+            raise OSError("recovery replace failed")
+        return real_replace(source, destination)
+
+    with patch("telegram_bot.session.store.os.replace", side_effect=fail_primary_replace):
+        with pytest.raises(OSError, match="recovery replace failed"):
+            SessionStore(path)
+
+    assert path.read_bytes() == corrupt_primary
+    assert backup_path.read_bytes() == valid_backup
+    assert list(path.parent.glob(f".{path.name}*.tmp-*")) == []
+
+
+def test_existing_symlink_state_file_fails_closed(tmp_path):
+    target = tmp_path / "target.json"
+    target.write_text("{}\n", encoding="utf-8")
+    path = tmp_path / "sessions.json"
+    path.symlink_to(target)
+
+    with pytest.raises(PermissionError, match="regular file"):
+        SessionStore(path)
+
+
+def test_existing_hardlinked_state_file_fails_closed(tmp_path):
+    target = tmp_path / "target.json"
+    target.write_text("{}\n", encoding="utf-8")
+    path = tmp_path / "sessions.json"
+    os.link(target, path)
+
+    with pytest.raises(PermissionError, match="multiple hard links"):
+        SessionStore(path)
+
+
+def test_runtime_wrong_shaped_session_is_rejected_without_mutation(tmp_path):
+    path = tmp_path / "sessions.json"
+    store = SessionStore(path)
+    run(store.set(1, {"version": 1}))
+    before = path.read_bytes()
+
+    with pytest.raises(ValueError, match="must be an object"):
+        run(store.set(2, []))  # type: ignore[arg-type]
+
+    assert path.read_bytes() == before
+    assert run(store.get(2)) is None
+    assert run(store.get(1)) == {"version": 1}
+
+
 def test_missing_primary_recovers_previous_good_backup(tmp_path, caplog):
     path = tmp_path / "sessions.json"
     store = SessionStore(path)
@@ -195,6 +457,84 @@ def test_missing_primary_recovers_previous_good_backup(tmp_path, caplog):
     assert run(recovered.get(1)) == {"version": 1}
     assert read_json(path) == {"telegram_session:1": {"version": 1}}
     assert "Recovered local session data" in caplog.text
+
+
+def test_primary_permission_error_does_not_promote_stale_backup(tmp_path):
+    path = tmp_path / "sessions.json"
+    store = SessionStore(path)
+    run(store.set(1, {"version": 1}))
+    run(store.update(1, {"version": 2}))
+    before = path.read_bytes()
+    calls = []
+    real_read = SessionStore._read_json_object
+
+    def fail_primary(candidate):
+        calls.append(Path(candidate))
+        if Path(candidate) == path:
+            raise PermissionError("primary unreadable")
+        return real_read(candidate)
+
+    with patch.object(SessionStore, "_read_json_object", side_effect=fail_primary):
+        with pytest.raises(PermissionError, match="primary unreadable"):
+            SessionStore(path)
+
+    assert calls == [path]
+    assert path.read_bytes() == before
+    assert read_json(path) == {"telegram_session:1": {"version": 2}}
+
+
+def test_backup_permission_error_does_not_replace_corrupt_primary(tmp_path):
+    path = tmp_path / "sessions.json"
+    backup_path = path.with_name(f"{path.name}.bak")
+    path.write_text("{ truncated", encoding="utf-8")
+    backup_path.write_text(
+        '{"telegram_session:1": {"version": 1}}\n', encoding="utf-8"
+    )
+    primary_before = path.read_bytes()
+    real_read = SessionStore._read_json_object
+
+    def fail_backup(candidate):
+        if Path(candidate) == backup_path:
+            raise PermissionError("backup unreadable")
+        return real_read(candidate)
+
+    with patch.object(SessionStore, "_read_json_object", side_effect=fail_backup):
+        with pytest.raises(PermissionError, match="backup unreadable"):
+            SessionStore(path)
+
+    assert path.read_bytes() == primary_before
+
+
+@pytest.mark.parametrize(
+    "invalid_primary",
+    [
+        "[]\n",
+        '{"unexpected:1": {"version": 2}}\n',
+        '{"telegram_session:1": []}\n',
+    ],
+)
+def test_wrong_shaped_primary_recovers_valid_backup(tmp_path, invalid_primary):
+    path = tmp_path / "sessions.json"
+    backup_path = path.with_name(f"{path.name}.bak")
+    path.write_text(invalid_primary, encoding="utf-8")
+    backup_path.write_text(
+        '{"telegram_session:1": {"version": 1}}\n', encoding="utf-8"
+    )
+
+    recovered = SessionStore(path)
+
+    assert run(recovered.get(1)) == {"version": 1}
+    assert read_json(path) == {"telegram_session:1": {"version": 1}}
+
+
+def test_wrong_shaped_primary_and_backup_fail_closed(tmp_path):
+    path = tmp_path / "sessions.json"
+    backup_path = path.with_name(f"{path.name}.bak")
+    path.write_text('{"telegram_session:1": []}\n', encoding="utf-8")
+    backup_path.write_text('{"unexpected:1": {}}\n', encoding="utf-8")
+
+    with pytest.raises(SessionStoreCorruptionError, match="no valid backup"):
+        SessionStore(path)
 
 
 def test_restart_and_concurrent_updates_persist_valid_json(tmp_path):
@@ -213,7 +553,7 @@ def test_restart_and_concurrent_updates_persist_valid_json(tmp_path):
 
     assert run(reloaded.get(1)) == expected
     assert read_json(path) == {"telegram_session:1": expected}
-    assert list(path.parent.glob(f".{path.name}.tmp-*")) == []
+    assert list(path.parent.glob(f".{path.name}*.tmp-*")) == []
 
 
 def test_concurrent_set_update_delete_remains_consistent(tmp_path):
