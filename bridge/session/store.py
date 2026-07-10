@@ -1,8 +1,10 @@
 import asyncio
 import copy
+import errno
 import json
 import logging
 import os
+import stat
 import tempfile
 from pathlib import Path
 from typing import Optional, Dict, Any
@@ -15,26 +17,128 @@ class SessionStoreCorruptionError(RuntimeError):
     """Raised when session state exists but no valid copy can be loaded."""
 
 
+class SessionStoreDurabilityError(OSError):
+    """Raised after an atomic replace whose directory sync could not be confirmed."""
+
+    def __init__(self, destination: Path, cause: OSError):
+        super().__init__(cause.errno, f"directory fsync failed for {destination}: {cause}")
+        self.destination = destination
+
+
+class SessionStoreValidationError(ValueError):
+    """Raised when decoded session state does not match the persisted schema."""
+
+
+def _validate_session_data(data: Any) -> Dict[str, Any]:
+    if not isinstance(data, dict):
+        raise SessionStoreValidationError(
+            f"session store root must be an object, got {type(data).__name__}"
+        )
+    for key, value in data.items():
+        if not isinstance(key, str):
+            raise SessionStoreValidationError(
+                f"session store key must be a string, got {type(key).__name__}"
+            )
+        prefix, separator, user_id = key.partition(":")
+        if prefix != "telegram_session" or separator != ":" or not user_id:
+            raise SessionStoreValidationError(f"invalid session store key: {key!r}")
+        try:
+            for component in user_id.split(":"):
+                if not component:
+                    raise ValueError("empty conversation key component")
+                int(component)
+        except ValueError as error:
+            raise SessionStoreValidationError(
+                f"invalid session conversation key: {key!r}"
+            ) from error
+        if not isinstance(value, dict):
+            raise SessionStoreValidationError(
+                f"session entry {key!r} must be an object, got {type(value).__name__}"
+            )
+    return data
+
+
+def _decode_json_object(payload: bytes, source: Path) -> Dict[str, Any]:
+    try:
+        data = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise
+    try:
+        return _validate_session_data(data)
+    except SessionStoreValidationError as error:
+        raise SessionStoreValidationError(f"invalid session data in {source}: {error}") from error
+
+
+_CORRUPTION_ERRORS = (
+    UnicodeDecodeError,
+    json.JSONDecodeError,
+    SessionStoreValidationError,
+)
+
+
+def _ensure_storage_directory(path: Path) -> None:
+    """Create a private state directory or validate an existing safe directory."""
+    existed = path.exists()
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    metadata = path.stat()
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise NotADirectoryError(f"session store parent is not a directory: {path}")
+    if hasattr(os, "getuid") and metadata.st_uid != os.getuid():
+        raise PermissionError(f"session store parent is not owned by this process: {path}")
+    mode = stat.S_IMODE(metadata.st_mode)
+    if mode & 0o022:
+        raise PermissionError(
+            f"session store parent is writable by group or others: {path} ({mode:04o})"
+        )
+    if not existed and mode != 0o700:
+        path.chmod(0o700)
+
+
+def _secure_existing_state_file(path: Path) -> None:
+    """Tighten a legacy state file without following symlinks or hard links."""
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return
+    if not stat.S_ISREG(metadata.st_mode) or path.is_symlink():
+        raise PermissionError(f"session state must be a regular file: {path}")
+    if metadata.st_nlink != 1:
+        raise PermissionError(f"session state must not have multiple hard links: {path}")
+    if hasattr(os, "getuid") and metadata.st_uid != os.getuid():
+        raise PermissionError(f"session state is not owned by this process: {path}")
+    if stat.S_IMODE(metadata.st_mode) != 0o600:
+        path.chmod(0o600)
+
+
 def _fsync_directory(path: Path) -> None:
-    """Durably record a rename when the filesystem supports directory fsync."""
+    """Durably record a rename, tolerating only known unsupported operations."""
     fd = None
+    unsupported_errors = {
+        errno.EINVAL,
+        getattr(errno, "ENOTSUP", errno.EINVAL),
+        getattr(errno, "EOPNOTSUPP", errno.EINVAL),
+    }
     try:
         flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
         fd = os.open(path, flags)
         os.fsync(fd)
     except OSError as error:
-        # The file itself was already fsynced and atomically replaced. Some
-        # overlay/network filesystems reject directory fsync; treating that as
-        # a failed commit would roll memory back after disk already changed.
+        if error.errno not in unsupported_errors:
+            raise
         logger.warning("Directory fsync unavailable for %s: %s", path, error)
     finally:
         if fd is not None:
-            os.close(fd)
+            try:
+                os.close(fd)
+            except OSError as error:
+                # Closing an already-fsynced directory descriptor cannot undo
+                # the rename and must not trigger an in-memory rollback.
+                logger.warning("Directory close failed for %s: %s", path, error)
 
 
 def _atomic_write_bytes(destination: Path, payload: bytes) -> None:
     """Write *payload* via a private same-directory temp file and replace."""
-    destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    _ensure_storage_directory(destination.parent)
     fd, raw_temp_path = tempfile.mkstemp(
         prefix=f".{destination.name}.tmp-", dir=destination.parent
     )
@@ -47,21 +151,33 @@ def _atomic_write_bytes(destination: Path, payload: bytes) -> None:
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temp_path, destination)
-        _fsync_directory(destination.parent)
+        try:
+            _fsync_directory(destination.parent)
+        except OSError as error:
+            raise SessionStoreDurabilityError(destination, error) from error
     except Exception:
         if fd >= 0:
-            os.close(fd)
-        temp_path.unlink(missing_ok=True)
+            try:
+                os.close(fd)
+            except OSError as close_error:
+                logger.warning("Temporary file close failed for %s: %s", temp_path, close_error)
+        try:
+            temp_path.unlink(missing_ok=True)
+        except OSError as unlink_error:
+            logger.warning("Temporary file cleanup failed for %s: %s", temp_path, unlink_error)
         raise
 
 
 class SessionStore:
+    """Process-local JSON store; one live instance must own each storage path."""
+
     def __init__(self, storage_path: Optional[Path] = None):
         self._local_data: Dict[str, Any] = {}
         self._lock = asyncio.Lock()
         self._storage_path = Path(storage_path or config.session_store_path)
-        self._storage_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        os.chmod(self._storage_path.parent, 0o700)
+        _ensure_storage_directory(self._storage_path.parent)
+        _secure_existing_state_file(self._storage_path)
+        _secure_existing_state_file(self._backup_path)
         self._load_local_data()
         logger.info(f"Using local JSON storage at {self._storage_path}")
 
@@ -71,13 +187,10 @@ class SessionStore:
 
     @staticmethod
     def _read_json_object(path: Path) -> Dict[str, Any]:
-        with open(path, "r", encoding="utf-8") as stream:
-            data = json.load(stream)
-        if not isinstance(data, dict):
-            raise ValueError(f"session store root must be an object, got {type(data).__name__}")
-        return data
+        return _decode_json_object(path.read_bytes(), path)
 
     def _load_local_data(self):
+        primary_error = None
         if not self._storage_path.exists():
             if not self._backup_path.exists():
                 return
@@ -89,12 +202,18 @@ class SessionStore:
             try:
                 self._local_data = self._read_json_object(self._storage_path)
                 return
-            except Exception as primary_error:
-                logger.error(f"Failed to load local session data: {primary_error}")
+            except _CORRUPTION_ERRORS as error:
+                primary_error = error
+                logger.error("Confirmed corrupt local session data: %s", error)
+
+        if not self._backup_path.exists():
+            raise SessionStoreCorruptionError(
+                f"Session store {self._storage_path} is corrupt and has no valid backup"
+            ) from primary_error
 
         try:
             recovered = self._read_json_object(self._backup_path)
-        except Exception as backup_error:
+        except _CORRUPTION_ERRORS as backup_error:
             raise SessionStoreCorruptionError(
                 f"Session store {self._storage_path} is corrupt and has no valid backup"
             ) from backup_error
@@ -111,13 +230,15 @@ class SessionStore:
 
     def _save_local_data(self):
         try:
+            _validate_session_data(self._local_data)
             payload = (
                 json.dumps(self._local_data, ensure_ascii=False, indent=2) + "\n"
             ).encode("utf-8")
             if self._storage_path.exists():
                 previous_payload = self._storage_path.read_bytes()
-                # Never promote a malformed primary to the recovery slot.
-                self._read_json_object(self._storage_path)
+                # Parse the exact bytes destined for backup to avoid a TOCTOU
+                # gap between validation and previous-good preservation.
+                _decode_json_object(previous_payload, self._storage_path)
                 _atomic_write_bytes(self._backup_path, previous_payload)
             _atomic_write_bytes(self._storage_path, payload)
         except Exception as e:
@@ -130,6 +251,14 @@ class SessionStore:
         try:
             mutation()
             self._save_local_data()
+        except SessionStoreDurabilityError as error:
+            # If the primary rename committed, disk already contains the new
+            # state. Preserve the matching memory state while surfacing that
+            # crash-durability could not be confirmed. Backup-only failures
+            # happen before the primary replace and still require rollback.
+            if error.destination != self._storage_path:
+                self._local_data = previous
+            raise
         except Exception:
             self._local_data = previous
             raise
