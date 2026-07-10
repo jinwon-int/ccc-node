@@ -48,7 +48,14 @@ The SessionStart hook (`~/.claude/hooks/load-memory.sh`) auto-injects a snapshot
 **Routing:** durable facts / nodes / runbooks / decisions → Family Wiki. Relational & evolving working memory → Honcho.
 
 ## Fresh Approval Required
-secrets · releases · DB/replay/migration/prune · manual ACKs · emergency hotfixes · provider sends/canaries · broker/Gateway restarts · cross-broker mutations (unless pre-approved in-task).
+secrets · releases · DB/replay/migration/prune · manual ACKs · emergency hotfixes · provider sends/canaries · direct service/host lifecycle (including broker/Gateway restarts and reboot/shutdown) · cross-broker mutations (unless pre-approved in-task).
+
+Service-control exceptions are deliberately narrow: an exact local
+`ccc-telegram-bridge[.service]` restart, the reviewed `ccc-self-update.sh`
+procedure, or a root-installed `ccc-service-control` wrapper invocation for an
+exact root-owned allowlist entry. `guard.sh` is defense-in-depth; the actual
+boundary is the unprivileged agent account and root-owned wrapper/config. See
+`docs/service-control.md` in the ccc-node repository.
 
 ## Standing Orders
 These orders define what this node may do autonomously, what requires fresh approval, and when to escalate. **Fresh Approval Required always wins** over any autonomous lane below.

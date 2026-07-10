@@ -195,20 +195,52 @@ if is_forcepush; then
 fi
 g 'git[[:space:]]+(filter-branch|filter-repo)([[:space:]]|$)|git-filter-repo'                               && deny "history-rewrite" "operator_review_gated" "$c"
 
-# broker / Gateway / worker service control — NOT gated.
-# Operator-approved relaxation (reviewed in PR): a fleet node manages its own
-# service lifecycle directly, so restart / start / reload / stop / kill of
-# broker/Gateway/worker/a2a/hermes/openclaw (and ccc-telegram-bridge) proceed
-# without per-action approval — a node must be able to update from GitHub and
-# recover its own services unattended. The bundled `ccc-self-update.sh run`
-# remains the audited "update + restart the allowlisted set" path. The genuinely
-# dangerous gates below (secret exfil, DB destructive/migrate, force-push to
-# protected branches, catastrophic rm, self-update.services writes) are untouched.
+# Service/host lifecycle is fail-closed.  guard.sh is only defense-in-depth: the
+# actual privilege boundary is the root-owned ccc-service-control wrapper and its
+# root-owned allowlist (docs/service-control.md).  Direct lifecycle commands need
+# fresh approval, except for the exact local ccc-telegram-bridge restart carve-out.
+is_direct_ccc_bridge_restart() {
+  case "$cn" in
+    'systemctl restart ccc-telegram-bridge'|'systemctl restart ccc-telegram-bridge.service'|\
+    'sudo systemctl restart ccc-telegram-bridge'|'sudo systemctl restart ccc-telegram-bridge.service')
+      return 0 ;;
+  esac
+  return 1
+}
 
-# Writes to the self-update operator config via shell (redirects/copy tools).
-# Read (cat/grep) stays allowed; only mutation is gated.
-gn '(>>?[[:space:]]*[^|;&]*self-update\.(services|repo))' && deny "self-update-config" "operator_approval_gated" "$c"
-gn '\b(tee|cp|mv|dd|install|rsync|sed|truncate|ln)\b[^|;&]*self-update\.(services|repo)' && deny "self-update-config" "operator_approval_gated" "$c"
+if ! is_direct_ccc_bridge_restart; then
+  gn '\b(systemctl|service)\b[^;&|]*\b(start|restart|reload|stop|kill|disable|enable|mask|unmask|daemon-reload|daemon-reexec)\b' \
+    && deny "service-lifecycle" "operator_approval_gated" "$c"
+  gn '\bpm2\b[^;&|]*\b(start|restart|reload|stop|delete|kill)\b' \
+    && deny "service-lifecycle" "operator_approval_gated" "$c"
+  gn '\b(docker|podman)\b[^;&|]*\b(run|up|start|restart|stop|kill|rm|pause|unpause|down)\b' \
+    && deny "service-lifecycle" "operator_approval_gated" "$c"
+  gn '\bkubectl\b[^;&|]*\b(rollout[[:space:]]+restart|scale|delete|drain|cordon|uncordon)\b' \
+    && deny "service-lifecycle" "operator_approval_gated" "$c"
+  gn '(^|[[:space:];|&])(restart-worker|stop-broker)([[:space:];|&]|$)' \
+    && deny "service-lifecycle" "operator_approval_gated" "$c"
+fi
+
+is_readonly_lifecycle_text_search() {
+  printf '%s' "$cn" | grep -Eq \
+    '^[[:space:]]*(grep|rg)([[:space:]]+[^;&|<>$`()]+)+[[:space:]]*$'
+}
+if ! is_readonly_lifecycle_text_search \
+  && gn '\b(shutdown|reboot|poweroff|halt)\b'; then
+  deny "host-lifecycle" "operator_approval_gated" "$c"
+fi
+
+# References to self-update operator config fail closed unless the whole command
+# is a simple local read.  This deliberately catches interpreter-mediated writes
+# (`python open(..., "w")`, Ruby File.write, etc.) without pretending to parse
+# every language.  The root-owned deployment is the real protection layer.
+is_readonly_self_update_config_command() {
+  printf '%s' "$cn" | grep -Eq \
+    '^[[:space:]]*(cat|grep|stat|test|wc|sha256sum)([[:space:]]+--?[A-Za-z0-9_-]+)*[[:space:]]+[^;&|<>$`()]*self-update\.(services|repo)([[:space:]]+[^;&|<>$`()]+)*[[:space:]]*$'
+}
+if gn 'self-update\.(services|repo)' && ! is_readonly_self_update_config_command; then
+  deny "self-update-config" "operator_approval_gated" "$c"
+fi
 
 # DB destructive / migration / replay
 gi '\b(DROP[[:space:]]+(TABLE|DATABASE)|TRUNCATE[[:space:]]|FLUSHALL|FLUSHDB)\b'                  && deny "db-destructive" "operator_approval_gated" "$c"
