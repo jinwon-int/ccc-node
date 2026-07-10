@@ -71,21 +71,16 @@ PROJECT_ROOT = Path(os.environ["PROJECT_ROOT"]).resolve()
 PROJECT_DIR_NAME = str(PROJECT_ROOT).replace("/", "-").replace("_", "-")
 CONVERSATIONS_DIR = Path.home() / ".claude" / "projects" / PROJECT_DIR_NAME
 
-ALLOWED_TOOLS = [
-    "Read",
-    "Edit",
-    "Write",
-    "MultiEdit",
-    "Glob",
-    "Grep",
-    "WebFetch",
-    "WebSearch",
-    "Task",
-    "NotebookEdit",
-    "TodoWrite",
-    "Bash",
-    # AskUserQuestion is handled via disallowed_tools + can_use_tool callback
-]
+from telegram_bot.core.tool_policy import (  # noqa: E402
+    allowed_tools,
+    disallowed_tools,
+    missing_callback_requires_denial,
+    resolve_bash_policy,
+)
+
+BASH_POLICY = resolve_bash_policy()
+ALLOWED_TOOLS = allowed_tools(BASH_POLICY)
+DISALLOWED_TOOLS = disallowed_tools(BASH_POLICY)
 
 PROCESS_TIMEOUT = int(os.getenv("CLAUDE_PROCESS_TIMEOUT", "21600"))
 
@@ -214,10 +209,20 @@ class ProjectChatHandler(
                 )
             state = state_holder.get("state")
             if not state or not state.pending:
+                if missing_callback_requires_denial(tool_name, BASH_POLICY):
+                    logger.warning("bash_callback_state_missing user_id=%s", user_id)
+                    return PermissionResultDeny(
+                        message="Bash requires an active per-call permission callback."
+                    )
                 return PermissionResultAllow()
             req = state.pending[0]
             callback = req.permission_callback
             if not callback:
+                if missing_callback_requires_denial(tool_name, BASH_POLICY):
+                    logger.warning("bash_permission_callback_missing user_id=%s", user_id)
+                    return PermissionResultDeny(
+                        message="Bash requires an active per-call permission callback."
+                    )
                 return PermissionResultAllow()
 
             req.awaiting_permission = True
@@ -237,7 +242,7 @@ class ProjectChatHandler(
         opts: Dict[str, Any] = {
             "cwd": str(self.project_root),
             "allowed_tools": ALLOWED_TOOLS,
-            "disallowed_tools": ["AskUserQuestion"],  # Disable to force degradation
+            "disallowed_tools": DISALLOWED_TOOLS,
             "system_prompt": (
                 "\n\n## Important: User Questions and Choices\n\n"
                 "The AskUserQuestion tool is NOT available in this environment. "
