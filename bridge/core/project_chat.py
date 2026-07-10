@@ -72,16 +72,14 @@ PROJECT_DIR_NAME = str(PROJECT_ROOT).replace("/", "-").replace("_", "-")
 CONVERSATIONS_DIR = Path.home() / ".claude" / "projects" / PROJECT_DIR_NAME
 
 from telegram_bot.core.tool_policy import (  # noqa: E402
+    BASH_DISABLED,
     missing_callback_requires_denial,
     resolve_bash_policy,
     sdk_permission_options,
+    strict_bash_sandbox_settings,
 )
 
 BASH_POLICY = resolve_bash_policy()
-SDK_PERMISSION_OPTIONS = sdk_permission_options(BASH_POLICY)
-ALLOWED_TOOLS = SDK_PERMISSION_OPTIONS["allowed_tools"]
-DISALLOWED_TOOLS = SDK_PERMISSION_OPTIONS["disallowed_tools"]
-BASH_PERMISSION_HOOKS = SDK_PERMISSION_OPTIONS["hooks"]
 
 PROCESS_TIMEOUT = int(os.getenv("CLAUDE_PROCESS_TIMEOUT", "21600"))
 
@@ -240,11 +238,12 @@ class ProjectChatHandler(
                 return result
             return PermissionResultAllow() if result else PermissionResultDeny()
 
+        permission_options = sdk_permission_options(BASH_POLICY)
         opts: Dict[str, Any] = {
             "cwd": str(self.project_root),
-            "allowed_tools": ALLOWED_TOOLS,
-            "disallowed_tools": DISALLOWED_TOOLS,
-            "hooks": BASH_PERMISSION_HOOKS,
+            "allowed_tools": permission_options["allowed_tools"],
+            "disallowed_tools": permission_options["disallowed_tools"],
+            "hooks": permission_options["hooks"],
             "system_prompt": (
                 "\n\n## Important: User Questions and Choices\n\n"
                 "The AskUserQuestion tool is NOT available in this environment. "
@@ -288,6 +287,16 @@ class ProjectChatHandler(
                 config.enable_streaming and config.enable_partial_streaming
             ),
         }
+        if BASH_POLICY != BASH_DISABLED:
+            # The SDK's OS sandbox, not shell-token inspection, is the Bash
+            # security boundary. Filesystem settings are disabled so user,
+            # project or local arrays cannot merge an allowRead/allowWrite or
+            # excluded-command escape into this process-owned policy.
+            opts["sandbox"] = strict_bash_sandbox_settings(
+                self.project_root,
+                str(config.claude_cli_path) if config.claude_cli_path else None,
+            )
+            opts["setting_sources"] = []
         if model:
             # Normalize model name: ensure at most one [1M] suffix
             # e.g., "claude-opus-4-7[1M][1m]" -> "claude-opus-4-7[1M]"

@@ -3,6 +3,7 @@
 import asyncio
 import os
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from claude_agent_sdk.types import PermissionResultAllow, PermissionResultDeny
@@ -39,6 +40,122 @@ class SDKOptionWiringTest(unittest.TestCase):
         self.assertIn("Bash", options.allowed_tools)
         self.assertNotIn("Bash", options.disallowed_tools)
         self.assertEqual(options.hooks, {})
+
+    def test_project_chat_wires_fail_closed_project_sandbox(self):
+        def close_task(coro):
+            coro.close()
+            return object()
+
+        with patch.object(project_chat, "ClaudeSDKClient", _FakeSDKClient), patch.object(
+            project_chat.asyncio, "create_task", side_effect=close_task
+        ):
+            handler = project_chat.ProjectChatHandler()
+            asyncio.run(handler._create_user_stream(10, None))
+
+        options = _FakeSDKClient.last_options
+        self.assertIsNotNone(options)
+        assert options is not None
+        self.assertEqual(options.setting_sources, [])
+        self.assertEqual(
+            options.sandbox,
+            tool_policy.strict_bash_sandbox_settings(handler.project_root),
+        )
+
+    def test_approve_each_keeps_strict_sandbox_and_telegram_hook(self):
+        def close_task(coro):
+            coro.close()
+            return object()
+
+        with patch.object(project_chat, "BASH_POLICY", "approve-each"), patch.object(
+            project_chat, "ClaudeSDKClient", _FakeSDKClient
+        ), patch.object(project_chat.asyncio, "create_task", side_effect=close_task):
+            handler = project_chat.ProjectChatHandler()
+            asyncio.run(handler._create_user_stream(10, None))
+
+        options = _FakeSDKClient.last_options
+        assert options is not None
+        self.assertNotIn("Bash", options.allowed_tools)
+        self.assertNotIn("Bash", options.disallowed_tools)
+        self.assertIn("PreToolUse", options.hooks)
+        self.assertEqual(
+            options.sandbox,
+            tool_policy.strict_bash_sandbox_settings(handler.project_root),
+        )
+        self.assertEqual(options.setting_sources, [])
+
+    def test_disabled_removes_bash_without_requiring_sandbox_backend(self):
+        def close_task(coro):
+            coro.close()
+            return object()
+
+        with patch.object(project_chat, "BASH_POLICY", "disabled"), patch.object(
+            project_chat, "ClaudeSDKClient", _FakeSDKClient
+        ), patch.object(project_chat.asyncio, "create_task", side_effect=close_task):
+            asyncio.run(project_chat.ProjectChatHandler()._create_user_stream(10, None))
+
+        options = _FakeSDKClient.last_options
+        assert options is not None
+        self.assertNotIn("Bash", options.allowed_tools)
+        self.assertIn("Bash", options.disallowed_tools)
+        self.assertIsNone(options.sandbox)
+        self.assertIsNone(options.setting_sources)
+
+
+class StrictBashSandboxTest(unittest.TestCase):
+    def test_strict_sandbox_fails_closed_without_escape_hatches(self):
+        root = Path("/srv/example-project")
+        sandbox = tool_policy.strict_bash_sandbox_settings(root)
+
+        self.assertTrue(sandbox["enabled"])
+        self.assertTrue(sandbox["autoAllowBashIfSandboxed"])
+        self.assertTrue(sandbox["failIfUnavailable"])
+        self.assertFalse(sandbox["allowUnsandboxedCommands"])
+        self.assertEqual(sandbox["excludedCommands"], [])
+        self.assertFalse(sandbox["enableWeakerNestedSandbox"])
+        self.assertEqual(sandbox["ignoreViolations"], {"file": [], "network": []})
+
+    def test_strict_sandbox_denies_host_reads_and_reallows_only_project_and_runtime(self):
+        root = Path("/srv/example-project")
+        sandbox = tool_policy.strict_bash_sandbox_settings(root)
+        filesystem = sandbox["filesystem"]
+
+        self.assertEqual(filesystem["denyRead"], ["/"])
+        self.assertIn(str(root), filesystem["allowRead"])
+        self.assertNotIn("/etc", filesystem["allowRead"])
+        self.assertNotIn("/proc", filesystem["allowRead"])
+        self.assertNotIn("/dev", filesystem["allowRead"])
+        self.assertNotIn(str(Path.home()), filesystem["allowRead"])
+        self.assertEqual(filesystem["allowWrite"], [str(root)])
+        self.assertEqual(filesystem["denyWrite"], [])
+
+    def test_sandbox_reallows_only_sdk_and_resolved_cli_bootstrap_roots(self):
+        with patch.object(
+            tool_policy.claude_agent_sdk,
+            "__file__",
+            "/opt/ccc-bridge/venv/claude_agent_sdk/__init__.py",
+        ), patch.object(tool_policy.shutil, "which", return_value="/opt/claude/bin/claude"):
+            sandbox = tool_policy.strict_bash_sandbox_settings(Path("/srv/project"))
+
+        allow_read = sandbox["filesystem"]["allowRead"]
+        self.assertIn("/opt/ccc-bridge/venv/claude_agent_sdk", allow_read)
+        self.assertIn("/opt/claude/bin", allow_read)
+        self.assertNotIn("/opt/ccc-bridge/venv", allow_read)
+        self.assertNotIn("/opt/claude", allow_read)
+
+    def test_shell_syntax_does_not_change_the_os_boundary(self):
+        sandbox = tool_policy.strict_bash_sandbox_settings(Path("/srv/project"))
+        attack_forms = [
+            'P=/etc/passwd; cat "$P"',
+            'python -c \'open("/etc/passwd").read()\'',
+            "cd .. && pwd",
+            "cat $(printf /etc/passwd)",
+            "ln -s /etc/passwd ./outside && cat ./outside",
+        ]
+
+        for command in attack_forms:
+            with self.subTest(command=command):
+                self.assertEqual(sandbox["filesystem"]["denyRead"], ["/"])
+                self.assertFalse(sandbox["allowUnsandboxedCommands"])
 
 
 class ToolPolicyTest(unittest.TestCase):
