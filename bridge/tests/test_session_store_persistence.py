@@ -21,6 +21,7 @@ if "telegram_bot" not in sys.modules:
 from telegram_bot.session.store import (  # noqa: E402
     SessionStore,
     SessionStoreCorruptionError,
+    SessionStoreValidationError,
 )
 
 
@@ -70,6 +71,19 @@ def test_first_save_is_atomic_and_private(tmp_path):
     assert list(path.parent.glob(f".{path.name}*.tmp-*")) == []
 
 
+def test_backup_preserves_exact_previous_primary_bytes(tmp_path):
+    path = tmp_path / "sessions.json"
+    backup_path = path.with_name(f"{path.name}.bak")
+    store = SessionStore(path)
+    run(store.set("11:1001", {"version": 1, "label": "가나다"}))
+    previous_primary = path.read_bytes()
+
+    run(store.update("11:1001", {"version": 2}))
+
+    assert backup_path.read_bytes() == previous_primary
+    assert read_json(path)["telegram_session:11:1001"]["version"] == 2
+
+
 def test_existing_state_files_are_tightened_to_0600(tmp_path):
     path = tmp_path / "sessions.json"
     backup_path = path.with_name(f"{path.name}.bak")
@@ -104,18 +118,145 @@ def test_existing_group_writable_parent_fails_closed(tmp_path):
         SessionStore(parent / "sessions.json")
 
 
+def test_symlinked_storage_parent_fails_closed(tmp_path):
+    real_parent = tmp_path / "real-state"
+    real_parent.mkdir(mode=0o700)
+    symlinked_parent = tmp_path / "linked-state"
+    symlinked_parent.symlink_to(real_parent, target_is_directory=True)
+
+    with pytest.raises(PermissionError, match="symlink"):
+        SessionStore(symlinked_parent / "sessions.json")
+
+    assert not (real_parent / "sessions.json").exists()
+
+
+def test_symlinked_storage_ancestor_fails_closed(tmp_path):
+    real_root = tmp_path / "real-root"
+    state_parent = real_root / "state"
+    state_parent.mkdir(parents=True, mode=0o700)
+    symlinked_root = tmp_path / "linked-root"
+    symlinked_root.symlink_to(real_root, target_is_directory=True)
+
+    with pytest.raises(PermissionError, match="symlink"):
+        SessionStore(symlinked_root / "state" / "sessions.json")
+
+
+def test_group_writable_nonsticky_ancestor_fails_closed(tmp_path):
+    unsafe_ancestor = tmp_path / "unsafe-ancestor"
+    safe_parent = unsafe_ancestor / "private-state"
+    safe_parent.mkdir(parents=True, mode=0o700)
+    unsafe_ancestor.chmod(0o777)
+    safe_parent.chmod(0o700)
+
+    with pytest.raises(PermissionError, match="unsafe writable ancestor"):
+        SessionStore(safe_parent / "sessions.json")
+
+
+def test_missing_directory_components_are_created_private(tmp_path):
+    level_one = tmp_path / "level-one"
+    level_two = level_one / "level-two"
+
+    SessionStore(level_two / "sessions.json")
+
+    assert stat.S_IMODE(level_one.stat().st_mode) == 0o700
+    assert stat.S_IMODE(level_two.stat().st_mode) == 0o700
+    assert not level_one.is_symlink()
+    assert not level_two.is_symlink()
+
+
 def test_serialization_failure_preserves_disk_and_memory(tmp_path):
     path = tmp_path / "sessions.json"
     store = SessionStore(path)
     run(store.set(1, {"session_id": "stable"}))
     before = path.read_bytes()
 
-    with pytest.raises(TypeError):
+    with pytest.raises(SessionStoreValidationError):
         run(store.set(2, {"not_json": object()}))
 
     assert path.read_bytes() == before
     assert run(store.get(2)) is None
     assert run(store.get(1)) == {"session_id": "stable"}
+
+
+@pytest.mark.parametrize(
+    "invalid_value",
+    [
+        {"nested": {1: "integer-key"}},
+        {"tuple_value": (1, 2)},
+        {"collision": {1: "integer", "1": "string"}},
+        {"number": float("nan")},
+        {"number": float("inf")},
+        {"number": float("-inf")},
+    ],
+)
+def test_noncanonical_nested_values_are_rejected_without_state_change(
+    tmp_path, invalid_value
+):
+    path = tmp_path / "sessions.json"
+    store = SessionStore(path)
+    run(store.set(1, {"version": 1}))
+    before = path.read_bytes()
+
+    with pytest.raises(SessionStoreValidationError):
+        run(store.set(2, invalid_value))
+
+    assert path.read_bytes() == before
+    assert run(store.get(1)) == {"version": 1}
+    assert run(store.get(2)) is None
+
+
+def test_cyclic_nested_value_is_rejected_without_state_change(tmp_path):
+    path = tmp_path / "sessions.json"
+    store = SessionStore(path)
+    run(store.set(1, {"version": 1}))
+    before = path.read_bytes()
+    cyclic = {}
+    cyclic["self"] = cyclic
+
+    with pytest.raises(SessionStoreValidationError, match="cyclic"):
+        run(store.set(2, cyclic))
+
+    assert path.read_bytes() == before
+    assert run(store.get(2)) is None
+
+
+def test_canonical_nested_value_round_trips_without_type_drift(tmp_path):
+    path = tmp_path / "sessions.json"
+    value = {
+        "nested": {
+            "items": [1, 2.5, True, None, {"name": "stable"}],
+            "empty": {},
+        }
+    }
+    store = SessionStore(path)
+
+    run(store.set("11:1001", value))
+
+    assert run(store.get("11:1001")) == value
+    assert SessionStore(path)._local_data == {
+        "telegram_session:11:1001": value
+    }
+
+
+def test_nonfinite_number_on_disk_is_confirmed_corruption(tmp_path):
+    path = tmp_path / "sessions.json"
+    path.write_text(
+        '{"telegram_session:1": {"number": NaN}}\n', encoding="utf-8"
+    )
+
+    with pytest.raises(SessionStoreCorruptionError):
+        SessionStore(path)
+
+
+def test_duplicate_nested_json_key_on_disk_is_confirmed_corruption(tmp_path):
+    path = tmp_path / "sessions.json"
+    path.write_text(
+        '{"telegram_session:1": {"value": 1, "value": 2}}\n',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(SessionStoreCorruptionError):
+        SessionStore(path)
 
 
 @pytest.mark.parametrize("operation", ["write", "flush"])

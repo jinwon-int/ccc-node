@@ -3,6 +3,7 @@ import copy
 import errno
 import json
 import logging
+import math
 import os
 import stat
 import tempfile
@@ -27,6 +28,57 @@ class SessionStoreDurabilityError(OSError):
 
 class SessionStoreValidationError(ValueError):
     """Raised when decoded session state does not match the persisted schema."""
+
+
+def _validate_json_value(
+    value: Any, location: str, active_containers: set[int], depth: int = 0
+) -> None:
+    """Require values whose Python types survive a JSON encode/decode unchanged."""
+    if depth > 256:
+        raise SessionStoreValidationError(
+            f"JSON value exceeds maximum nesting depth at {location}"
+        )
+    if value is None or type(value) in {str, bool, int}:
+        return
+    if type(value) is float:
+        if not math.isfinite(value):
+            raise SessionStoreValidationError(
+                f"non-finite number is not valid session JSON at {location}"
+            )
+        return
+    if type(value) not in {dict, list}:
+        raise SessionStoreValidationError(
+            f"non-canonical JSON type at {location}: {type(value).__name__}"
+        )
+
+    marker = id(value)
+    if marker in active_containers:
+        raise SessionStoreValidationError(f"cyclic JSON value at {location}")
+    active_containers.add(marker)
+    try:
+        if type(value) is dict:
+            for key, nested_value in value.items():
+                if type(key) is not str:
+                    raise SessionStoreValidationError(
+                        f"JSON object key at {location} must be a string, "
+                        f"got {type(key).__name__}"
+                    )
+                _validate_json_value(
+                    nested_value,
+                    f"{location}.{key}",
+                    active_containers,
+                    depth + 1,
+                )
+        else:
+            for index, nested_value in enumerate(value):
+                _validate_json_value(
+                    nested_value,
+                    f"{location}[{index}]",
+                    active_containers,
+                    depth + 1,
+                )
+    finally:
+        active_containers.remove(marker)
 
 
 def _validate_session_data(data: Any) -> Dict[str, Any]:
@@ -55,18 +107,36 @@ def _validate_session_data(data: Any) -> Dict[str, Any]:
             raise SessionStoreValidationError(
                 f"session entry {key!r} must be an object, got {type(value).__name__}"
             )
+        _validate_json_value(value, key, set())
     return data
+
+
+def _reject_duplicate_json_keys(pairs: list[tuple[str, Any]]) -> Dict[str, Any]:
+    result: Dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise SessionStoreValidationError(f"duplicate JSON object key: {key!r}")
+        result[key] = value
+    return result
 
 
 def _decode_json_object(payload: bytes, source: Path) -> Dict[str, Any]:
     try:
-        data = json.loads(payload.decode("utf-8"))
+        data = json.loads(
+            payload.decode("utf-8"), object_pairs_hook=_reject_duplicate_json_keys
+        )
     except (UnicodeDecodeError, json.JSONDecodeError):
         raise
+    except (SessionStoreValidationError, RecursionError) as error:
+        raise SessionStoreValidationError(
+            f"invalid session data in {source}: {error}"
+        ) from error
     try:
         return _validate_session_data(data)
     except SessionStoreValidationError as error:
-        raise SessionStoreValidationError(f"invalid session data in {source}: {error}") from error
+        raise SessionStoreValidationError(
+            f"invalid session data in {source}: {error}"
+        ) from error
 
 
 _CORRUPTION_ERRORS = (
@@ -76,22 +146,91 @@ _CORRUPTION_ERRORS = (
 )
 
 
+def _absolute_path(path: Path) -> Path:
+    """Normalize `.`/`..` lexically without resolving symlinks."""
+    return Path(os.path.abspath(os.fspath(path)))
+
+
+def _validate_existing_directory_components(path: Path) -> None:
+    """Reject symlink components and externally replaceable ancestors."""
+    path = _absolute_path(path)
+    current = Path(path.anchor)
+    sticky_bit = getattr(stat, "S_ISVTX", 0o1000)
+    for component in path.parts[1:]:
+        current /= component
+        try:
+            metadata = current.lstat()
+        except FileNotFoundError:
+            return
+        if stat.S_ISLNK(metadata.st_mode):
+            raise PermissionError(
+                f"session store directory path contains a symlink: {current}"
+            )
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise NotADirectoryError(
+                f"session store directory component is not a directory: {current}"
+            )
+        if current == path:
+            continue
+        mode = stat.S_IMODE(metadata.st_mode)
+        if mode & 0o022 and not mode & sticky_bit:
+            raise PermissionError(
+                f"session store path has an unsafe writable ancestor: "
+                f"{current} ({mode:04o})"
+            )
+
+
+def _create_missing_directory_components(path: Path) -> None:
+    """Create components one at a time without following an existing symlink."""
+    path = _absolute_path(path)
+    current = Path(path.anchor)
+    for component in path.parts[1:]:
+        current /= component
+        try:
+            metadata = current.lstat()
+        except FileNotFoundError:
+            try:
+                os.mkdir(current, mode=0o700)
+            except FileExistsError:
+                # A concurrent creator must still pass the no-symlink check.
+                pass
+            metadata = current.lstat()
+        if stat.S_ISLNK(metadata.st_mode):
+            raise PermissionError(
+                f"session store directory path contains a symlink: {current}"
+            )
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise NotADirectoryError(
+                f"session store directory component is not a directory: {current}"
+            )
+
+
 def _ensure_storage_directory(path: Path) -> None:
     """Create a private state directory or validate an existing safe directory."""
-    existed = path.exists()
-    path.mkdir(parents=True, exist_ok=True, mode=0o700)
-    metadata = path.stat()
+    path = _absolute_path(path)
+    _validate_existing_directory_components(path)
+    try:
+        path.lstat()
+        existed = True
+    except FileNotFoundError:
+        existed = False
+
+    _create_missing_directory_components(path)
+    _validate_existing_directory_components(path)
+    metadata = path.lstat()
     if not stat.S_ISDIR(metadata.st_mode):
         raise NotADirectoryError(f"session store parent is not a directory: {path}")
     if hasattr(os, "getuid") and metadata.st_uid != os.getuid():
         raise PermissionError(f"session store parent is not owned by this process: {path}")
     mode = stat.S_IMODE(metadata.st_mode)
+    if not existed and mode != 0o700:
+        path.chmod(0o700)
+        metadata = path.lstat()
+        mode = stat.S_IMODE(metadata.st_mode)
     if mode & 0o022:
         raise PermissionError(
             f"session store parent is writable by group or others: {path} ({mode:04o})"
         )
-    if not existed and mode != 0o700:
-        path.chmod(0o700)
 
 
 def _secure_existing_state_file(path: Path) -> None:
@@ -174,7 +313,9 @@ class SessionStore:
     def __init__(self, storage_path: Optional[Path] = None):
         self._local_data: Dict[str, Any] = {}
         self._lock = asyncio.Lock()
-        self._storage_path = Path(storage_path or config.session_store_path)
+        self._storage_path = _absolute_path(
+            Path(storage_path or config.session_store_path)
+        )
         _ensure_storage_directory(self._storage_path.parent)
         _secure_existing_state_file(self._storage_path)
         _secure_existing_state_file(self._backup_path)
@@ -219,7 +360,10 @@ class SessionStore:
             ) from backup_error
 
         payload = (
-            json.dumps(recovered, ensure_ascii=False, indent=2) + "\n"
+            json.dumps(
+                recovered, ensure_ascii=False, indent=2, allow_nan=False
+            )
+            + "\n"
         ).encode("utf-8")
         _atomic_write_bytes(self._storage_path, payload)
         self._local_data = recovered
@@ -232,7 +376,12 @@ class SessionStore:
         try:
             _validate_session_data(self._local_data)
             payload = (
-                json.dumps(self._local_data, ensure_ascii=False, indent=2) + "\n"
+                json.dumps(
+                    self._local_data,
+                    ensure_ascii=False,
+                    indent=2,
+                    allow_nan=False,
+                ) + "\n"
             ).encode("utf-8")
             if self._storage_path.exists():
                 previous_payload = self._storage_path.read_bytes()
