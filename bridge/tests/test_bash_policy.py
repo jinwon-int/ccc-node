@@ -1,4 +1,4 @@
-"""Fail-closed Bash policy and permission-flow regression tests."""
+"""Bash auto-approval, per-call approval, and fail-closed regression tests."""
 
 import asyncio
 import os
@@ -23,7 +23,7 @@ class _FakeSDKClient:
 
 
 class SDKOptionWiringTest(unittest.TestCase):
-    def test_project_chat_passes_bash_ask_hook_without_bare_allow(self):
+    def test_project_chat_defaults_to_bare_bash_auto_approval(self):
         def close_task(coro):
             coro.close()
             return object()
@@ -36,34 +36,25 @@ class SDKOptionWiringTest(unittest.TestCase):
 
         options = _FakeSDKClient.last_options
         self.assertIsNotNone(options)
-        self.assertNotIn("Bash", options.allowed_tools)
+        self.assertIn("Bash", options.allowed_tools)
         self.assertNotIn("Bash", options.disallowed_tools)
-        self.assertIn("PreToolUse", options.hooks)
-        matcher = options.hooks["PreToolUse"][0]
-        self.assertEqual(matcher.matcher, "Bash")
-        decision = asyncio.run(
-            matcher.hooks[0](
-                {
-                    "hook_event_name": "PreToolUse",
-                    "tool_name": "Bash",
-                    "tool_input": {"command": "pwd"},
-                },
-                "tool-use-id",
-                None,
-            )
-        )
-        self.assertEqual(
-            decision["hookSpecificOutput"]["permissionDecision"], "ask"
-        )
+        self.assertEqual(options.hooks, {})
 
 
 class ToolPolicyTest(unittest.TestCase):
-    def test_default_requires_per_call_approval_for_bash(self):
+    def test_default_auto_approves_bash(self):
         with patch.dict(os.environ, {}, clear=True):
-            self.assertEqual(tool_policy.resolve_bash_policy(), "approve-each")
-            self.assertNotIn("Bash", tool_policy.allowed_tools())
+            self.assertEqual(tool_policy.resolve_bash_policy(), "auto-approve")
+            self.assertIn("Bash", tool_policy.allowed_tools())
             self.assertNotIn("Bash", tool_policy.disallowed_tools())
             self.assertIn("AskUserQuestion", tool_policy.disallowed_tools())
+            self.assertEqual(tool_policy.bash_permission_hooks(), {})
+
+    def test_auto_approve_normalizes_underscore_form(self):
+        self.assertEqual(
+            tool_policy.resolve_bash_policy("auto_approve"), "auto-approve"
+        )
+        self.assertIn("Bash", tool_policy.allowed_tools("auto_approve"))
 
     def test_explicit_disabled_policy_hard_denies_bash(self):
         with patch.dict(
@@ -112,9 +103,12 @@ class ToolPolicyTest(unittest.TestCase):
     def test_disabled_policy_does_not_register_bash_hook(self):
         self.assertEqual(tool_policy.bash_permission_hooks("disabled"), {})
 
-    def test_bash_without_active_callback_fails_closed(self):
+    def test_bash_without_active_callback_is_policy_specific(self):
         self.assertTrue(
             tool_policy.missing_callback_requires_denial("Bash", "approve-each")
+        )
+        self.assertFalse(
+            tool_policy.missing_callback_requires_denial("Bash", "auto-approve")
         )
         self.assertTrue(tool_policy.missing_callback_requires_denial("Bash", "disabled"))
         self.assertFalse(tool_policy.missing_callback_requires_denial("Read", "disabled"))
@@ -163,7 +157,11 @@ class BashPermissionFlowTest(unittest.TestCase):
         self.assertIsInstance(result, PermissionResultDeny)
         self.assertIn("disabled", result.message.lower())
 
-    def test_every_opt_in_bash_form_requires_approval(self):
+    def test_auto_approve_policy_allows_without_one_time_token(self):
+        result = self.call(_AccessSubject("auto-approve"), "pwd")
+        self.assertIsInstance(result, PermissionResultAllow)
+
+    def test_every_per_call_bash_form_requires_approval(self):
         subject = _AccessSubject("approve-each")
         commands = [
             "pwd",

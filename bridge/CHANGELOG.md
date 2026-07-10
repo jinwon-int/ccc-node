@@ -27,11 +27,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - 14 new unit/integration tests (`test_task_ledger.py` + heartbeat-loop ledger cases).
 
 ### Changed
-- `CCC_BRIDGE_BASH_POLICY` now defaults to `approve-each`. Bash is deliberately
-  omitted from bare SDK allow rules, and a bridge-owned `PreToolUse` ask hook
-  routes every call through the existing per-call Telegram approval flow even
-  when settings contain `Bash(*)`. Operators can set `disabled` to remove Bash
-  entirely; unknown values still fail closed.
+- `CCC_BRIDGE_BASH_POLICY` now has three explicit states and defaults to
+  `auto-approve`, which deliberately adds bare `Bash` to the SDK allowlist so
+  calls run without per-call Telegram confirmation. Operators can select
+  `approve-each` to omit bare Bash and install a bridge-owned `PreToolUse` ask
+  hook, or `disabled` to remove Bash entirely. Unknown values fail closed.
 
 ### Fixed
 - **Heartbeat cleanup retry path (#307).** If deleting a stalled `⏳ Working` status

@@ -260,6 +260,12 @@ class BotAccessMixin:
 
         if tool_name == "Bash":
             policy = self._bash_policy()
+            if policy == "auto-approve":
+                logger.info(
+                    "bash_auto_approved user_id=%s chat_id=%s", user_id, chat_id
+                )
+                return PermissionResultAllow()
+
             if policy != "approve-each":
                 logger.warning(
                     "bash_disabled_denied user_id=%s chat_id=%s", user_id, chat_id
@@ -267,8 +273,8 @@ class BotAccessMixin:
                 return PermissionResultDeny(
                     message=(
                         "Bash is disabled by the fail-closed bridge policy. "
-                        "An operator may opt in with CCC_BRIDGE_BASH_POLICY=approve-each, "
-                        "but PROJECT_ROOT is not an OS sandbox."
+                        "An operator may select CCC_BRIDGE_BASH_POLICY=auto-approve "
+                        "or approve-each, but PROJECT_ROOT is not an OS sandbox."
                     )
                 )
 

@@ -1,9 +1,10 @@
-"""Approval-gated Bash exposure policy for the Telegram bridge.
+"""Three-state Bash permission policy for the Telegram bridge.
 
-``PROJECT_ROOT`` is an approval/working-directory boundary, not a shell
-sandbox. Bash is exposed by default under ``approve-each``, which requires the
-permission callback to approve every individual Bash call. Operators can still
-hard-disable Bash explicitly; unknown policy values fail closed.
+``PROJECT_ROOT`` is a working-directory/structured-tool boundary, not a shell
+sandbox. The operator-selected default is ``auto-approve``: Bash is placed in
+the SDK bare allowlist and runs without per-call Telegram confirmation.
+``approve-each`` remains available for explicit one-time confirmation, while
+``disabled`` removes Bash entirely. Unknown policy values fail closed.
 """
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ from claude_agent_sdk import HookMatcher
 BASH_POLICY_ENV = "CCC_BRIDGE_BASH_POLICY"
 BASH_DISABLED = "disabled"
 BASH_APPROVE_EACH = "approve-each"
+BASH_AUTO_APPROVE = "auto-approve"
 
 STRUCTURED_ALLOWED_TOOLS = (
     "Read",
@@ -33,23 +35,28 @@ STRUCTURED_ALLOWED_TOOLS = (
 
 
 def resolve_bash_policy(raw: Optional[str] = None) -> str:
-    """Default missing values to approve-each and fail closed on unknown values."""
+    """Default missing values to auto-approve and fail closed on unknown values."""
 
-    value = os.getenv(BASH_POLICY_ENV, BASH_APPROVE_EACH) if raw is None else raw
+    value = os.getenv(BASH_POLICY_ENV, BASH_AUTO_APPROVE) if raw is None else raw
     normalized = str(value).strip().lower().replace("_", "-")
-    if normalized == BASH_APPROVE_EACH:
-        return BASH_APPROVE_EACH
+    if normalized in (BASH_AUTO_APPROVE, BASH_APPROVE_EACH):
+        return normalized
     return BASH_DISABLED
 
 
 def allowed_tools(bash_policy: Optional[str] = None) -> List[str]:
-    """Build the SDK allowlist without auto-approving Bash."""
+    """Build the SDK allowlist for the selected Bash policy.
 
-    del bash_policy
-    # An unlisted tool remains visible and falls through to permission
-    # evaluation. A bare Bash entry would auto-approve every invocation before
-    # can_use_tool is consulted, so Bash must never be added here.
-    return list(STRUCTURED_ALLOWED_TOOLS)
+    A bare ``Bash`` entry is intentionally used only for ``auto-approve``;
+    Claude Agent SDK evaluates it as an automatic allow rule before
+    ``can_use_tool``.
+    """
+
+    policy = resolve_bash_policy(bash_policy)
+    tools: List[str] = list(STRUCTURED_ALLOWED_TOOLS)
+    if policy == BASH_AUTO_APPROVE:
+        tools.append("Bash")
+    return tools
 
 
 def disallowed_tools(bash_policy: Optional[str] = None) -> List[str]:
@@ -65,10 +72,11 @@ def disallowed_tools(bash_policy: Optional[str] = None) -> List[str]:
 def bash_permission_hooks(
     bash_policy: Optional[str] = None,
 ) -> Dict[str, List[HookMatcher]]:
-    """Force every exposed Bash call through can_use_tool.
+    """Force Bash through ``can_use_tool`` only under ``approve-each``.
 
     A PreToolUse ``ask`` decision takes precedence over allow rules, including
-    broad ``Bash(*)`` rules inherited from settings.json.
+    broad ``Bash(*)`` rules inherited from settings.json. ``auto-approve``
+    deliberately installs no ask hook.
     """
 
     if resolve_bash_policy(bash_policy) != BASH_APPROVE_EACH:
@@ -108,7 +116,8 @@ def sdk_permission_options(bash_policy: Optional[str] = None) -> Dict[str, Any]:
 def missing_callback_requires_denial(
     tool_name: str, bash_policy: Optional[str] = None
 ) -> bool:
-    """Keep Bash fail-closed if stream/request callback state is unavailable."""
+    """Require callback state unless the operator selected auto-approval."""
 
-    del bash_policy  # Reserved for future sandboxed policies; Bash always fails closed.
-    return tool_name == "Bash"
+    if tool_name != "Bash":
+        return False
+    return resolve_bash_policy(bash_policy) != BASH_AUTO_APPROVE
