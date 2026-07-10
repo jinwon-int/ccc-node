@@ -338,7 +338,7 @@ Current reference pricing is about **$0.006/minute** of audio. Check OpenAI pric
 
 - `--path` sets the `PROJECT_ROOT` working directory and structured-tool approval boundary. It is **not** an OS sandbox.
 - Structured file tools (`Read`, `Edit`, `Write`, `MultiEdit`, `Glob`, `Grep`) are auto-allowed inside `PROJECT_ROOT`; outside paths require user confirmation.
-- `Bash` is disabled by default. `CCC_BRIDGE_BASH_POLICY=approve-each` opts in, but every Bash call still requires explicit one-time approval and may access outside `PROJECT_ROOT`; use an OS sandbox for stronger isolation.
+- `Bash` defaults to `CCC_BRIDGE_BASH_POLICY=auto-approve`: the SDK receives a bare `Bash` allow rule, so calls run immediately without per-call Telegram confirmation. Set `approve-each` to omit bare Bash and install a bridge-owned `PreToolUse` ask hook that routes each call through explicit one-time Telegram approval—even if settings contain `Bash(*)`. Set `disabled` to remove Bash entirely; unknown values fail closed. Bash may access outside `PROJECT_ROOT`; use an OS sandbox for stronger isolation.
 - Bot output referencing external files requires confirmation before sending.
 - All runtime data stays under `PROJECT_ROOT/.telegram_bot/`.
 

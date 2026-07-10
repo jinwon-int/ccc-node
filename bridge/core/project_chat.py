@@ -72,15 +72,16 @@ PROJECT_DIR_NAME = str(PROJECT_ROOT).replace("/", "-").replace("_", "-")
 CONVERSATIONS_DIR = Path.home() / ".claude" / "projects" / PROJECT_DIR_NAME
 
 from telegram_bot.core.tool_policy import (  # noqa: E402
-    allowed_tools,
-    disallowed_tools,
     missing_callback_requires_denial,
     resolve_bash_policy,
+    sdk_permission_options,
 )
 
 BASH_POLICY = resolve_bash_policy()
-ALLOWED_TOOLS = allowed_tools(BASH_POLICY)
-DISALLOWED_TOOLS = disallowed_tools(BASH_POLICY)
+SDK_PERMISSION_OPTIONS = sdk_permission_options(BASH_POLICY)
+ALLOWED_TOOLS = SDK_PERMISSION_OPTIONS["allowed_tools"]
+DISALLOWED_TOOLS = SDK_PERMISSION_OPTIONS["disallowed_tools"]
+BASH_PERMISSION_HOOKS = SDK_PERMISSION_OPTIONS["hooks"]
 
 PROCESS_TIMEOUT = int(os.getenv("CLAUDE_PROCESS_TIMEOUT", "21600"))
 
@@ -243,6 +244,7 @@ class ProjectChatHandler(
             "cwd": str(self.project_root),
             "allowed_tools": ALLOWED_TOOLS,
             "disallowed_tools": DISALLOWED_TOOLS,
+            "hooks": BASH_PERMISSION_HOOKS,
             "system_prompt": (
                 "\n\n## Important: User Questions and Choices\n\n"
                 "The AskUserQuestion tool is NOT available in this environment. "

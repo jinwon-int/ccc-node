@@ -26,6 +26,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `CCC_TASK_LEDGER_PATH` (default `BOT_DATA_DIR/tasks.json`).
   - 14 new unit/integration tests (`test_task_ledger.py` + heartbeat-loop ledger cases).
 
+### Changed
+- `CCC_BRIDGE_BASH_POLICY` now has three explicit states and defaults to
+  `auto-approve`, which deliberately adds bare `Bash` to the SDK allowlist so
+  calls run without per-call Telegram confirmation. Operators can select
+  `approve-each` to omit bare Bash and install a bridge-owned `PreToolUse` ask
+  hook, or `disabled` to remove Bash entirely. Unknown values fail closed.
+
 ### Fixed
 - **Heartbeat cleanup retry path (#307).** If deleting a stalled `⏳ Working` status
   message fails, the bridge now keeps the message id on the live request so the
