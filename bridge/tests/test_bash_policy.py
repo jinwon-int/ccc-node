@@ -159,6 +159,22 @@ class BashPermissionFlowTest(unittest.TestCase):
         self.assertTrue(self.sessions.sessions[key]["bash_approved_digest"])
         self.assertFalse(self.sessions.sessions[key].get("outside_path_approved_once", False))
 
+    def test_button_reply_creates_token_only_in_the_matching_chat(self):
+        subject = _AccessSubject("approve-each")
+        key = subject._conversation_key(20, 10)
+        self.sessions.sessions[key] = {
+            "pending_outside_paths": ["Bash command requires per-call approval"],
+            "pending_approval_kind": "bash",
+            "pending_approval_digest": subject._approval_digest(
+                "Bash", {"command": "pwd"}
+            ),
+        }
+        choice = "1. ALLOW_OUTSIDE_ONCE (Allow this Bash call once)"
+        asyncio.run(subject._maybe_capture_outside_approval(20, choice, 11))
+        self.assertFalse(self.sessions.sessions[key].get("bash_approved_once", False))
+        asyncio.run(subject._maybe_capture_outside_approval(20, choice, 10))
+        self.assertTrue(self.sessions.sessions[key]["bash_approved_once"])
+
     def test_approval_token_must_be_an_explicit_reply(self):
         subject = _AccessSubject("approve-each")
         key = subject._conversation_key(20, 10)
@@ -169,13 +185,18 @@ class BashPermissionFlowTest(unittest.TestCase):
                 "Bash", {"command": "pwd"}
             ),
         }
-        asyncio.run(
-            subject._maybe_capture_outside_approval(
-                20, "do not use ALLOW_OUTSIDE_ONCE here", 10
-            )
-        )
-        self.assertFalse(self.sessions.sessions[key].get("bash_approved_once", False))
-        self.assertIn("pending_outside_paths", self.sessions.sessions[key])
+        for text in (
+            "do not use ALLOW_OUTSIDE_ONCE here",
+            "1",
+            "yes",
+            "allow",
+        ):
+            with self.subTest(text=text):
+                asyncio.run(subject._maybe_capture_outside_approval(20, text, 10))
+                self.assertFalse(
+                    self.sessions.sessions[key].get("bash_approved_once", False)
+                )
+                self.assertIn("pending_outside_paths", self.sessions.sessions[key])
 
     def test_denial_reply_is_logged_and_clears_pending_digest(self):
         subject = _AccessSubject("approve-each")
@@ -188,7 +209,11 @@ class BashPermissionFlowTest(unittest.TestCase):
             ),
         }
         with self.assertLogs("telegram_bot.core.bot_access", level="INFO") as logs:
-            asyncio.run(subject._maybe_capture_outside_approval(20, "DENY_OUTSIDE", 10))
+            asyncio.run(
+                subject._maybe_capture_outside_approval(
+                    20, "2. DENY_OUTSIDE (Deny)", 10
+                )
+            )
         self.assertFalse(self.sessions.sessions[key].get("bash_approved_once", False))
         self.assertNotIn("pending_approval_digest", self.sessions.sessions[key])
         self.assertTrue(

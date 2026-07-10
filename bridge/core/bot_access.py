@@ -176,20 +176,16 @@ class BotAccessMixin:
         normalized = " ".join(text.strip().lower().split())
         allow_token = self._ALLOW_OUTSIDE_ONCE_TOKEN.lower()
         deny_token = self._DENY_OUTSIDE_TOKEN.lower()
-        allow = normalized in {
-            allow_token,
-            "1",
-            "allow",
-            "yes",
-            "y",
-        } or normalized.startswith(f"{allow_token} (")
-        deny = normalized in {
-            deny_token,
-            "2",
-            "deny",
-            "no",
-            "n",
-        } or normalized.startswith(f"{deny_token} (")
+        allow = (
+            normalized == allow_token
+            or normalized.startswith(f"{allow_token} (")
+            or normalized.startswith(f"1. {allow_token} (")
+        )
+        deny = (
+            normalized == deny_token
+            or normalized.startswith(f"{deny_token} (")
+            or normalized.startswith(f"2. {deny_token} (")
+        )
         approval_kind = session.get("pending_approval_kind", "outside-path")
         flag = self._approval_flag(approval_kind)
         other_flag = self._approval_flag(
