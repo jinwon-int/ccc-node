@@ -11,6 +11,13 @@ ok() { if eval "$2"; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $
 
 export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t
 
+# Keep fixtures hermetic when the operator shell exports live self-update
+# settings. In particular, a real busy health file must not defer every fixture
+# update before the tests install their own health file in section 7.
+unset CCC_SELF_UPDATE_BRANCH CCC_SELF_UPDATE_SERVICES
+unset CCC_SELF_UPDATE_HEALTH_FILE CCC_SELF_UPDATE_HEALTH_FRESH_SECONDS
+unset CCC_SELF_UPDATE_BUSY_MAX_SECONDS CCC_SELF_UPDATE_MAX_DEFER_SECONDS
+
 # Fixture: origin repo with a stub setup.sh, plus a node-side clone.
 ORIGIN="$TMP/origin.git"
 REPO="$TMP/node/ccc-node"
