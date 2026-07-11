@@ -27,6 +27,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - 14 new unit/integration tests (`test_task_ledger.py` + heartbeat-loop ledger cases).
 
 ### Changed
+- **Termux session-store path compatibility.** Ancestor validation now permits the
+  current Termux app's exact non-world-writable `.../com.termux/files` root and
+  OS-owned Android platform ancestors on validated, current-UID-owned canonical
+  Termux data paths. Symlinks, untrusted group/world-writable ancestors,
+  missing or spoofed prefixes, and writable final storage directories remain
+  fail-closed.
 - **Execution profiles (#376).** `CCC_BRIDGE_EXECUTION_PROFILE` now separates the
   SDK execution boundary from `CCC_BRIDGE_BASH_POLICY` approval UX. The package
   default `strict-project` preserves PR #363's fail-closed project-root OS
