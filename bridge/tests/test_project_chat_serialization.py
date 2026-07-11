@@ -15,6 +15,7 @@ telegram_bot_pkg.__path__ = [str(BRIDGE_DIR)]
 sys.modules.setdefault("telegram_bot", telegram_bot_pkg)
 
 sdk_module = types.ModuleType("claude_agent_sdk")
+sdk_module.__path__ = []
 setattr(sdk_module, "ClaudeSDKClient", type("ClaudeSDKClient", (), {}))
 setattr(
     sdk_module,
@@ -28,7 +29,20 @@ setattr(sdk_module, "TextBlock", type("TextBlock", (), {}))
 setattr(sdk_module, "ToolUseBlock", type("ToolUseBlock", (), {}))
 setattr(sdk_module, "PermissionResultAllow", type("PermissionResultAllow", (), {}))
 setattr(sdk_module, "PermissionResultDeny", type("PermissionResultDeny", (), {}))
+setattr(
+    sdk_module,
+    "HookMatcher",
+    type("HookMatcher", (), {"__init__": lambda self, **kwargs: None}),
+)
 sys.modules["claude_agent_sdk"] = sdk_module
+
+sdk_types_module = types.ModuleType("claude_agent_sdk.types")
+setattr(sdk_types_module, "HookContext", type("HookContext", (), {}))
+setattr(sdk_types_module, "HookInput", type("HookInput", (), {}))
+setattr(sdk_types_module, "HookJSONOutput", type("HookJSONOutput", (), {}))
+setattr(sdk_types_module, "PermissionResultAllow", sdk_module.PermissionResultAllow)
+setattr(sdk_types_module, "PermissionResultDeny", sdk_module.PermissionResultDeny)
+sys.modules["claude_agent_sdk.types"] = sdk_types_module
 
 internal_module = types.ModuleType("claude_agent_sdk._internal")
 transport_pkg = types.ModuleType("claude_agent_sdk._internal.transport")
@@ -107,8 +121,11 @@ class ProjectChatSerializationTests(unittest.IsolatedAsyncioTestCase):
         self.client = _SerialClient(self.state)
         self.state.client = self.client
 
-        async def get_state(user_id, chat_id, model, new_session):
+        async def get_state(
+            user_id, chat_id, model, new_session, unsolicited_callback=None
+        ):
             del user_id, chat_id, model, new_session
+            self.state.unsolicited_callback = unsolicited_callback
             return self.state
 
         self.handler._get_or_create_stream = get_state

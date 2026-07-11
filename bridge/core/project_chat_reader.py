@@ -36,10 +36,80 @@ def _typing_interval() -> float:
 
 
 class ProjectChatReaderMixin:
+    async def _handle_unsolicited_message(
+        self, user_id: int, state: _UserStreamState, msg
+    ) -> None:
+        """Route a background SDK result after the request FIFO has drained.
+
+        Assistant text is buffered until its terminal ResultMessage so the
+        Telegram route receives one complete message, not both SDK frames.
+        StreamEvent partials are intentionally ignored because there is no live
+        Telegram draft associated with an unsolicited notification.
+        """
+        if isinstance(msg, StreamEvent):
+            # The first token delta establishes turn ownership even though
+            # unsolicited drafts are intentionally not streamed to Telegram.
+            state.unsolicited_inflight = True
+            return
+        if isinstance(msg, AssistantMessage):
+            state.unsolicited_inflight = True
+            state.unsolicited_assistant_texts.extend(
+                block.text for block in msg.content if isinstance(block, TextBlock)
+            )
+            return
+        if not isinstance(msg, ResultMessage):
+            return
+
+        state.last_session_id = msg.session_id or state.last_session_id
+        raw = msg.result or "\n".join(state.unsolicited_assistant_texts)
+        state.unsolicited_assistant_texts.clear()
+        state.unsolicited_inflight = False
+        content = getattr(self, "_clean_response")(raw) or "(No response)"
+        if msg.is_error:
+            content = f"❌ Background task failed: {content}"
+
+        callback = state.unsolicited_callback
+        if callback is None:
+            logger.warning(
+                "Dropping unsolicited SDK result without Telegram route: user=%s session=%s",
+                user_id,
+                msg.session_id,
+            )
+            return
+        try:
+            await callback(content, msg.session_id)
+        except Exception as exc:
+            logger.error(
+                "Unsolicited Telegram delivery failed: user=%s session=%s error=%s",
+                user_id,
+                msg.session_id,
+                type(exc).__name__,
+            )
+            health_reporter.record_claude_error(
+                f"Unsolicited Telegram delivery failed: {type(exc).__name__}"
+            )
+            return
+
+        if msg.is_error:
+            health_reporter.record_claude_error(content)
+            state.last_error = content
+            state.last_error_ts = time.monotonic()
+        else:
+            health_reporter.record_claude_ok()
+        log_chat(
+            user_id,
+            msg.session_id,
+            "assistant",
+            content,
+            model=state.model,
+            success=not msg.is_error,
+        )
+
     async def _reader_loop(self, user_id: int, state: _UserStreamState) -> None:
         try:
             async for msg in state.client.receive_messages():
-                if not state.pending:
+                if state.unsolicited_inflight or not state.pending:
+                    await self._handle_unsolicited_message(user_id, state, msg)
                     continue
 
                 req = state.pending[0]
