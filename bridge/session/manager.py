@@ -30,6 +30,9 @@ class SessionManager:
             await self.store.set(user_id, session)
         return session
 
+    async def list_sessions(self) -> Dict[str, Dict[str, Any]]:
+        return await self.store.list_sessions()
+
     async def get_session(self, user_id: int) -> Dict[str, Any]:
         session = await self.store.get(user_id) or {}
         return await self._ensure_reply_mode(user_id, session)

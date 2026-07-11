@@ -71,6 +71,21 @@ def test_first_save_is_atomic_and_private(tmp_path):
     assert list(path.parent.glob(f".{path.name}*.tmp-*")) == []
 
 
+def test_list_sessions_returns_conversation_suffixes_and_deep_copies(tmp_path):
+    path = tmp_path / "sessions.json"
+    store = SessionStore(path)
+    run(store.set(1, {"session_id": "one", "nested": {"value": 1}}))
+    run(store.set("11:1001", {"session_id": "group"}))
+
+    listed = run(store.list_sessions())
+    assert listed == {
+        "1": {"session_id": "one", "nested": {"value": 1}},
+        "11:1001": {"session_id": "group"},
+    }
+    listed["1"]["nested"]["value"] = 9
+    assert run(store.get(1))["nested"]["value"] == 1
+
+
 def test_backup_preserves_exact_previous_primary_bytes(tmp_path):
     path = tmp_path / "sessions.json"
     backup_path = path.with_name(f"{path.name}.bak")

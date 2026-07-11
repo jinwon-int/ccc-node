@@ -21,6 +21,10 @@ from telegram_bot.core.task_ledger import (
     TaskLedger,
     ledger_path_for,
 )
+from telegram_bot.core.dead_session_recovery import (
+    recover_dead_session_notifications,
+    run_periodic_dead_session_recovery,
+)
 from telegram_bot.utils.heartbeat_store import drain_heartbeats, store_path_for
 from telegram_bot.utils.orphan_reaper import (
     run_periodic_reaper,
@@ -71,9 +75,37 @@ class BotLifecycleMixin:
         # transition it to `interrupted` and clean (or annotate) its status
         # message. Then drain any terminal ops left pending by failed cleanups.
         await self._reconcile_task_ledger(application)
+        await self._recover_dead_session_notifications(application)
 
         await self._set_bot_commands()
         logger.info("Bot initialization complete")
+
+    async def _recover_dead_session_notifications(self, application: Application) -> None:
+        from telegram_bot.core.project_chat import (
+            CONVERSATIONS_DIR,
+            project_chat_handler,
+        )
+        from telegram_bot.session.manager import session_manager
+
+        stats = await recover_dead_session_notifications(
+            application.bot,
+            session_manager,
+            project_chat_handler,
+            CONVERSATIONS_DIR,
+            max_delivery_attempts_per_scan=3,
+            send_timeout=5.0,
+        )
+        if stats.delivered or stats.failed or stats.rejected:
+            logger.info(
+                "Dead-session recovery: scanned=%d delivered=%d duplicate=%d failed=%d rejected=%d active=%d locked=%d",
+                stats.scanned,
+                stats.delivered,
+                stats.duplicate,
+                stats.failed,
+                stats.rejected,
+                stats.skipped_active,
+                stats.skipped_locked,
+            )
 
     def _lifecycle_task_ledger(self):
         path = ledger_path_for(
@@ -349,6 +381,7 @@ class BotLifecycleMixin:
             push_task = None
             reaper_task = None
             workload_task = None
+            dead_session_recovery_task = None
             try:
                 await self.application.start()
                 await self.application.updater.start_polling(
@@ -373,6 +406,10 @@ class BotLifecycleMixin:
                 )
                 workload_task = asyncio.create_task(
                     self._workload_reporter(stop_event), name="workload-reporter"
+                )
+                dead_session_recovery_task = asyncio.create_task(
+                    self._periodic_dead_session_recovery(stop_event),
+                    name="dead-session-recovery",
                 )
 
                 await self._wait_for_polling_exit(stop_event)
@@ -429,7 +466,13 @@ class BotLifecycleMixin:
                 health_reporter.record_telegram_error(message, consecutive_failures=1)
                 raise SystemExit(message)
             finally:
-                for _task in (watchdog_task, push_task, reaper_task, workload_task):
+                for _task in (
+                    watchdog_task,
+                    push_task,
+                    reaper_task,
+                    workload_task,
+                    dead_session_recovery_task,
+                ):
                     if _task and not _task.done():
                         _task.cancel()
                         try:
@@ -479,6 +522,25 @@ class BotLifecycleMixin:
                         logger.error("updater.stop() timed out, forcing process exit")
                         os._exit(1)
                     raise _PollingRestart()
+
+    async def _periodic_dead_session_recovery(
+        self, stop_event: asyncio.Event
+    ) -> None:
+        from telegram_bot.core.project_chat import (
+            CONVERSATIONS_DIR,
+            project_chat_handler,
+        )
+        from telegram_bot.session.manager import session_manager
+
+        if not self.application:
+            return
+        await run_periodic_dead_session_recovery(
+            self.application.bot,
+            session_manager,
+            project_chat_handler,
+            CONVERSATIONS_DIR,
+            stop_event,
+        )
 
     async def _workload_reporter(self, stop_event: asyncio.Event):
         """Publish in-flight request count to health.json on a fixed interval.
