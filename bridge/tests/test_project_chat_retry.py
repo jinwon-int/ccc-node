@@ -18,6 +18,7 @@ telegram_bot_pkg.__path__ = [str(BRIDGE_DIR)]
 sys.modules.setdefault("telegram_bot", telegram_bot_pkg)
 
 sdk_module = types.ModuleType("claude_agent_sdk")
+sdk_module.__path__ = []
 
 
 class _DummySDKClient:
@@ -39,6 +40,9 @@ class _PermissionResultDeny:
 
 sdk_module.ClaudeSDKClient = _DummySDKClient
 sdk_module.ClaudeAgentOptions = _DummyAgentOptions
+sdk_module.HookMatcher = type(
+    "HookMatcher", (), {"__init__": lambda self, **kwargs: None}
+)
 sdk_module.AssistantMessage = type("AssistantMessage", (), {})
 sdk_module.ResultMessage = type("ResultMessage", (), {})
 sdk_module.StreamEvent = type("StreamEvent", (), {})
@@ -47,6 +51,14 @@ sdk_module.ToolUseBlock = type("ToolUseBlock", (), {})
 sdk_module.PermissionResultAllow = _PermissionResultAllow
 sdk_module.PermissionResultDeny = _PermissionResultDeny
 sys.modules.setdefault("claude_agent_sdk", sdk_module)
+
+sdk_types_module = types.ModuleType("claude_agent_sdk.types")
+sdk_types_module.HookContext = type("HookContext", (), {})
+sdk_types_module.HookInput = type("HookInput", (), {})
+sdk_types_module.HookJSONOutput = type("HookJSONOutput", (), {})
+sdk_types_module.PermissionResultAllow = _PermissionResultAllow
+sdk_types_module.PermissionResultDeny = _PermissionResultDeny
+sys.modules.setdefault("claude_agent_sdk.types", sdk_types_module)
 
 internal_module = types.ModuleType("claude_agent_sdk._internal")
 transport_pkg = types.ModuleType("claude_agent_sdk._internal.transport")
@@ -179,12 +191,12 @@ def _assistant(text):
     )
 
 
-def _result(text, session_id="sess-1"):
+def _result(text, session_id="sess-1", is_error=False):
     return _new(
         project_chat.ResultMessage,
         result=text,
         session_id=session_id,
-        is_error=False,
+        is_error=is_error,
         duration_ms=5,
     )
 
@@ -265,6 +277,157 @@ class PartialStreamingReaderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(req.future.result().content, "Hi there")
 
 
+class UnsolicitedReaderTests(unittest.IsolatedAsyncioTestCase):
+    async def test_assistant_result_pair_is_delivered_once_without_pending_request(self):
+        delivered = []
+
+        async def deliver(content, session_id):
+            delivered.append((content, session_id))
+
+        handler = project_chat.ProjectChatHandler()
+        state = project_chat._UserStreamState(
+            client=_ScriptedClient(
+                [
+                    _stream_event("ignored partial"),
+                    _assistant("background task finished"),
+                    _result("", session_id="task-session"),
+                ]
+            ),
+            model=None,
+            unsolicited_callback=deliver,
+        )
+
+        await handler._reader_loop(7, state)
+
+        self.assertEqual(delivered, [("background task finished", "task-session")])
+        self.assertEqual(state.last_session_id, "task-session")
+        self.assertEqual(state.unsolicited_assistant_texts, [])
+        self.assertFalse(state.unsolicited_inflight)
+
+    async def test_unsolicited_turn_keeps_result_when_request_arrives_mid_turn(self):
+        delivered = []
+
+        async def deliver(content, session_id):
+            delivered.append((content, session_id))
+
+        handler = project_chat.ProjectChatHandler()
+        request = _make_request(None)
+        state = project_chat._UserStreamState(
+            client=None,
+            model=None,
+            unsolicited_callback=deliver,
+        )
+
+        class _RacingClient:
+            async def receive_messages(self):
+                yield _assistant("background result")
+                state.pending.append(request)
+                yield _result("", session_id="background-session")
+
+        state.client = _RacingClient()
+        await handler._reader_loop(7, state)
+
+        self.assertEqual(delivered, [("background result", "background-session")])
+        self.assertEqual(list(state.pending), [request])
+        self.assertFalse(request.future.done())
+        self.assertFalse(state.unsolicited_inflight)
+
+    async def test_multiple_assistant_messages_are_preserved_for_empty_result(self):
+        delivered = []
+
+        async def deliver(content, session_id):
+            delivered.append((content, session_id))
+
+        handler = project_chat.ProjectChatHandler()
+        state = project_chat._UserStreamState(
+            client=_ScriptedClient(
+                [
+                    _assistant("first phase"),
+                    _assistant("second phase"),
+                    _result("", session_id="task-session"),
+                ]
+            ),
+            model=None,
+            unsolicited_callback=deliver,
+        )
+
+        await handler._reader_loop(7, state)
+
+        self.assertEqual(delivered, [("first phase\nsecond phase", "task-session")])
+
+    async def test_unsolicited_error_records_error_health_not_ok(self):
+        delivered = []
+
+        async def deliver(content, session_id):
+            delivered.append((content, session_id))
+
+        handler = project_chat.ProjectChatHandler()
+        state = project_chat._UserStreamState(
+            client=_ScriptedClient(
+                [_result("task failed", session_id="task-session", is_error=True)]
+            ),
+            model=None,
+            unsolicited_callback=deliver,
+        )
+        reader_health = handler._handle_unsolicited_message.__func__.__globals__[
+            "health_reporter"
+        ]
+        error_record = unittest.mock.Mock()
+        ok_record = unittest.mock.Mock()
+        old_error = reader_health.record_claude_error
+        old_ok = reader_health.record_claude_ok
+        reader_health.record_claude_error = error_record
+        reader_health.record_claude_ok = ok_record
+        try:
+            await handler._reader_loop(7, state)
+        finally:
+            reader_health.record_claude_error = old_error
+            reader_health.record_claude_ok = old_ok
+
+        self.assertEqual(
+            delivered,
+            [("❌ Background task failed: task failed", "task-session")],
+        )
+        error_record.assert_called_once_with("❌ Background task failed: task failed")
+        ok_record.assert_not_called()
+        self.assertEqual(state.last_error, "❌ Background task failed: task failed")
+
+    async def test_process_message_registers_bot_route_before_query(self):
+        handler = project_chat.ProjectChatHandler()
+        bot = SimpleNamespace(send_message=AsyncMock())
+        state = project_chat._UserStreamState(client=None, model=None)
+
+        class _ImmediateClient:
+            async def query(self, *_args, **_kwargs):
+                self_outer.assertIsNotNone(state.unsolicited_callback)
+                await state.unsolicited_callback("late task done", "task-session")
+                req = state.pending[0]
+                req.future.set_result(project_chat.ChatResponse(content="ok"))
+
+        async def get_stream(
+            _user_id, _chat_id, _model, _new_session, unsolicited_callback
+        ):
+            state.unsolicited_callback = unsolicited_callback
+            return state
+
+        self_outer = self
+        state.client = _ImmediateClient()
+        handler._get_or_create_stream = AsyncMock(side_effect=get_stream)
+
+        response = await handler.process_message(
+            "hello", user_id=7, chat_id=42, notification_bot=bot
+        )
+
+        self.assertTrue(response.success)
+        handler._get_or_create_stream.assert_awaited_once()
+        callback = handler._get_or_create_stream.await_args.args[4]
+        self.assertIs(callback, state.unsolicited_callback)
+        bot.send_message.assert_awaited_once_with(
+            chat_id=42,
+            text="late task done",
+        )
+
+
 class _DisconnectClient:
     def __init__(self):
         self.disconnected = False
@@ -338,8 +501,12 @@ class ChatScopedStreamTests(unittest.IsolatedAsyncioTestCase):
         handler = project_chat.ProjectChatHandler()
         created = []
 
-        async def fake_create(user_id, model):
-            state = project_chat._UserStreamState(client=object(), model=model)
+        async def fake_create(user_id, model, unsolicited_callback=None):
+            state = project_chat._UserStreamState(
+                client=object(),
+                model=model,
+                unsolicited_callback=unsolicited_callback,
+            )
             created.append((user_id, state))
             return state
 

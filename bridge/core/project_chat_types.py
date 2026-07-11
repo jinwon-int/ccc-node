@@ -17,6 +17,11 @@ TypingCallback = Callable[[], Awaitable[Any]]
 StatusCallback = Callable[[Optional[str], Optional[int]], Awaitable[Optional[int]]]
 
 
+# Callback type: async (text, session_id) -> None. Delivers SDK messages that
+# arrive on a live stream after its Telegram request queue has drained.
+UnsolicitedCallback = Callable[[str, Optional[str]], Awaitable[None]]
+
+
 @dataclass
 class ChatResponse:
     """Response from processing a message"""
@@ -85,3 +90,12 @@ class _UserStreamState:
     # network) instead of the opaque "Task has been terminated." notice.
     last_error: Optional[str] = None
     last_error_ts: float = 0.0
+    # Route for SDK AssistantMessage/ResultMessage pairs that arrive after the
+    # request FIFO has drained (for example background task notifications).
+    unsolicited_callback: Optional[UnsolicitedCallback] = None
+    unsolicited_assistant_texts: List[str] = field(default_factory=list)
+    # Once a turn-bearing frame arrives without a pending Telegram request,
+    # keep ownership through its terminal ResultMessage. A new Telegram request
+    # may be enqueued between those frames and must not steal the autonomous
+    # turn's result.
+    unsolicited_inflight: bool = False

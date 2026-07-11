@@ -11,6 +11,7 @@ from telegram_bot.core.project_chat_types import (
     PermissionCallback,
     StatusCallback,
     TypingCallback,
+    UnsolicitedCallback,
     _PendingRequest,
     _UserStreamState,
 )
@@ -53,6 +54,7 @@ class ProjectChatProcessMixin:
         typing_callback: Optional[TypingCallback] = None,
         status_callback: Optional[StatusCallback] = None,
         bot: Optional[Any] = None,
+        notification_bot: Optional[Any] = None,
     ) -> ChatResponse:
         del message_id
         logger.info(f"Processing message from user {user_id}: {user_message[:80]}...")
@@ -85,6 +87,22 @@ class ProjectChatProcessMixin:
         request.task_id = self._ledger_create(user_id, chat_id)
         state: Optional[_UserStreamState] = None
 
+        unsolicited_callback: Optional[UnsolicitedCallback] = None
+        route_bot = notification_bot or bot
+        if route_bot:
+
+            async def deliver_unsolicited(
+                content: str, _session_id: Optional[str]
+            ) -> None:
+                # Background task notifications have no caller waiting to send
+                # the ChatResponse. Keep one SDK result to one Telegram message.
+                text = content
+                if len(text) > 4000:
+                    text = f"{text[:3960]}\n\n… (background result truncated)"
+                await route_bot.send_message(chat_id=chat_id, text=text)
+
+            unsolicited_callback = deliver_unsolicited
+
         # The Claude Code SDK can internally queue follow-up prompts on a
         # live stream, so submitting a second query before the first
         # ResultMessage arrives breaks the bridge's pending FIFO. Serialize
@@ -92,7 +110,9 @@ class ProjectChatProcessMixin:
         conversation_lock = self._get_conversation_lock(user_id, chat_id)
         async with conversation_lock:
             try:
-                state = await self._get_or_create_stream(user_id, chat_id, model, new_session)
+                state = await getattr(self, "_get_or_create_stream")(
+                    user_id, chat_id, model, new_session, unsolicited_callback
+                )
                 async with state.send_lock:
                     request.sent_session_id = session_id or state.last_session_id or "default"
                     state.pending.append(request)
@@ -184,8 +204,12 @@ class ProjectChatProcessMixin:
                     retry_request.task_id = self._ledger_create(user_id, chat_id)
                     retry_state: Optional[_UserStreamState] = None
                     try:
-                        retry_state = await self._get_or_create_stream(
-                            user_id, chat_id, model, new_session=False
+                        retry_state = await getattr(self, "_get_or_create_stream")(
+                            user_id,
+                            chat_id,
+                            model,
+                            False,
+                            unsolicited_callback,
                         )
                         async with retry_state.send_lock:
                             retry_request.sent_session_id = (

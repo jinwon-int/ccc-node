@@ -106,6 +106,7 @@ from telegram_bot.core.project_chat_types import (  # noqa: E402,F401
     PermissionCallback,
     StatusCallback,
     TypingCallback,
+    UnsolicitedCallback,
     _PendingRequest,
     _UserStreamState,
 )
@@ -175,7 +176,10 @@ class ProjectChatHandler(
         return lock
 
     async def _create_user_stream(
-        self, user_id: int, model: Optional[str]
+        self,
+        user_id: int,
+        model: Optional[str],
+        unsolicited_callback: Optional[UnsolicitedCallback] = None,
     ) -> _UserStreamState:
         state_holder: Dict[str, _UserStreamState] = {}
 
@@ -310,7 +314,11 @@ class ProjectChatHandler(
 
         client = ClaudeSDKClient(options=ClaudeAgentOptions(**opts))
         await client.connect()
-        state = _UserStreamState(client=client, model=model)
+        state = _UserStreamState(
+            client=client,
+            model=model,
+            unsolicited_callback=unsolicited_callback,
+        )
         state_holder["state"] = state
         state.reader_task = asyncio.create_task(self._reader_loop(user_id, state))
         state.typing_task = asyncio.create_task(
@@ -416,7 +424,12 @@ class ProjectChatHandler(
         return True
 
     async def _get_or_create_stream(
-        self, user_id: int, chat_id: int, model: Optional[str], new_session: bool
+        self,
+        user_id: int,
+        chat_id: int,
+        model: Optional[str],
+        new_session: bool,
+        unsolicited_callback: Optional[UnsolicitedCallback] = None,
     ) -> _UserStreamState:
         key = self._stream_key(user_id, chat_id)
         lock = self._get_stream_init_lock(user_id, chat_id)
@@ -436,8 +449,14 @@ class ProjectChatHandler(
                 state = None
 
             if not state:
-                state = await self._create_user_stream(user_id, model)
+                state = await self._create_user_stream(
+                    user_id, model, unsolicited_callback
+                )
                 self._streams[key] = state
+            elif unsolicited_callback is not None:
+                # Refresh the route when Telegram supplies a new Bot instance,
+                # while preserving the same long-lived SDK stream.
+                state.unsolicited_callback = unsolicited_callback
             return state
 
     def workload_snapshot(self, now: float) -> tuple[int, float]:

@@ -446,6 +446,7 @@ class TelegramBot(BotLifecycleMixin, BotStatusMixin, BotAccessMixin, BotCommandM
                 typing_callback=lambda: message.chat.send_action(action="typing"),
                 status_callback=self._make_status_callback(app.bot, chat.id),
                 bot=app.bot if enable_streaming_text else None,
+                notification_bot=app.bot,
             )
             await self._save_session_id(conversation_key, response)
             await self._send_reply_by_mode(
