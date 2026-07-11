@@ -193,7 +193,7 @@ class BotCommandMixin:
 
         # Store session list for later selection
         session = await session_manager.get_session(user_id)
-        session["resume_list"] = [(sid, msg) for sid, msg, _ in sessions]
+        session["resume_list"] = [[sid, msg] for sid, msg, _ in sessions]
         await session_manager.update_session(user_id, session)
 
         def _esc_resume_text(text: str) -> str:
