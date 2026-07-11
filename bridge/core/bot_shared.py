@@ -3,6 +3,11 @@
 import logging
 import re
 
+from telegram_bot.core.tool_policy import (
+    EXECUTION_OWNER_OPERATOR,
+    owner_operator_access_is_safe,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -23,6 +28,21 @@ def enforce_access_control(cfg) -> None:
             "accept messages from ANY Telegram user. Set ALLOWED_USER_IDS to the "
             "permitted user IDs, or set CCC_REQUIRE_ALLOWLIST=false to "
             "intentionally run an open bridge."
+        )
+        logger.error(msg)
+        raise SystemExit(msg)
+
+    requested_profile = (
+        str(getattr(cfg, "execution_profile", "strict-project")).strip().lower().replace("_", "-")
+    )
+    if requested_profile == EXECUTION_OWNER_OPERATOR and not owner_operator_access_is_safe(
+        cfg.allowed_user_ids,
+        getattr(cfg, "require_allowlist", True),
+    ):
+        msg = (
+            "Refusing to start owner-operator execution: it requires exactly one "
+            "ALLOWED_USER_IDS owner and CCC_REQUIRE_ALLOWLIST=true. Use "
+            "strict-project or disabled for shared/open bridges."
         )
         logger.error(msg)
         raise SystemExit(msg)

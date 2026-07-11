@@ -73,13 +73,22 @@ CONVERSATIONS_DIR = Path.home() / ".claude" / "projects" / PROJECT_DIR_NAME
 
 from telegram_bot.core.tool_policy import (  # noqa: E402
     BASH_DISABLED,
+    EXECUTION_OWNER_OPERATOR,
+    EXECUTION_STRICT_PROJECT,
+    effective_bash_policy,
     missing_callback_requires_denial,
     resolve_bash_policy,
+    resolve_execution_profile,
     sdk_permission_options,
     strict_bash_sandbox_settings,
 )
 
-BASH_POLICY = resolve_bash_policy()
+EXECUTION_PROFILE = resolve_execution_profile(
+    getattr(config, "execution_profile", EXECUTION_STRICT_PROJECT),
+    allowed_user_ids=getattr(config, "allowed_user_ids", []),
+    require_allowlist=getattr(config, "require_allowlist", True),
+)
+BASH_POLICY = effective_bash_policy(resolve_bash_policy(), EXECUTION_PROFILE)
 
 PROCESS_TIMEOUT = int(os.getenv("CLAUDE_PROCESS_TIMEOUT", "21600"))
 
@@ -111,6 +120,7 @@ from telegram_bot.core.project_chat_types import (  # noqa: E402,F401
     _UserStreamState,
 )
 
+
 def _env_int(name: str, default: int) -> int:
     raw = os.getenv(name)
     if raw is None or raw.strip() == "":
@@ -129,6 +139,7 @@ from telegram_bot.core.project_chat_history import ProjectChatHistoryMixin  # no
 from telegram_bot.core.project_chat_process import ProjectChatProcessMixin  # noqa: E402
 from telegram_bot.core.project_chat_reader import ProjectChatReaderMixin  # noqa: E402
 from telegram_bot.core.project_chat_state import ProjectChatStateMixin  # noqa: E402
+
 
 class ProjectChatHandler(
     ProjectChatReaderMixin,
@@ -182,6 +193,7 @@ class ProjectChatHandler(
         unsolicited_callback: Optional[UnsolicitedCallback] = None,
     ) -> _UserStreamState:
         state_holder: Dict[str, _UserStreamState] = {}
+        bash_policy = effective_bash_policy(BASH_POLICY, EXECUTION_PROFILE)
 
         async def can_use_tool(tool_name, tool_input, _context=None):
             logger.debug(
@@ -190,9 +202,7 @@ class ProjectChatHandler(
             # AskUserQuestion: degrade to plain text instead of interactive dialog
             if tool_name == "AskUserQuestion" and isinstance(tool_input, dict):
                 formatted, _ = _format_ask_user_question(tool_input)
-                logger.debug(
-                    f"AskUserQuestion intercepted, formatted: {formatted[:200]}..."
-                )
+                logger.debug(f"AskUserQuestion intercepted, formatted: {formatted[:200]}...")
                 s = state_holder.get("state")
                 if s and s.pending:
                     s.pending[0].synthetic_response = formatted
@@ -212,7 +222,7 @@ class ProjectChatHandler(
                 )
             state = state_holder.get("state")
             if not state or not state.pending:
-                if missing_callback_requires_denial(tool_name, BASH_POLICY):
+                if missing_callback_requires_denial(tool_name, bash_policy):
                     logger.warning("bash_callback_state_missing user_id=%s", user_id)
                     return PermissionResultDeny(
                         message="Bash requires an active per-call permission callback."
@@ -221,7 +231,7 @@ class ProjectChatHandler(
             req = state.pending[0]
             callback = req.permission_callback
             if not callback:
-                if missing_callback_requires_denial(tool_name, BASH_POLICY):
+                if missing_callback_requires_denial(tool_name, bash_policy):
                     logger.warning("bash_permission_callback_missing user_id=%s", user_id)
                     return PermissionResultDeny(
                         message="Bash requires an active per-call permission callback."
@@ -242,7 +252,7 @@ class ProjectChatHandler(
                 return result
             return PermissionResultAllow() if result else PermissionResultDeny()
 
-        permission_options = sdk_permission_options(BASH_POLICY)
+        permission_options = sdk_permission_options(bash_policy)
         opts: Dict[str, Any] = {
             "cwd": str(self.project_root),
             "allowed_tools": permission_options["allowed_tools"],
@@ -291,21 +301,27 @@ class ProjectChatHandler(
                 config.enable_streaming and config.enable_partial_streaming
             ),
         }
-        if BASH_POLICY != BASH_DISABLED:
-            # The SDK's OS sandbox, not shell-token inspection, is the Bash
-            # security boundary. Filesystem settings are disabled so user,
-            # project or local arrays cannot merge an allowRead/allowWrite or
-            # excluded-command escape into this process-owned policy.
-            opts["sandbox"] = strict_bash_sandbox_settings(
-                self.project_root,
-                str(config.claude_cli_path) if config.claude_cli_path else None,
-            )
+        if EXECUTION_PROFILE == EXECUTION_OWNER_OPERATOR:
+            # Owner-operated bridges intentionally retain host utility and the
+            # normal Claude Code settings/context chain. Access control, not a
+            # project-root sandbox, is the boundary for this explicit profile.
+            opts["setting_sources"] = ["user", "project", "local"]
+        else:
+            # Every non-owner profile suppresses filesystem settings. Even when
+            # Bash is disallowed, user/project/local settings can register host
+            # shell hooks independently of the model-facing Bash tool.
             opts["setting_sources"] = []
+            if EXECUTION_PROFILE == EXECUTION_STRICT_PROJECT and bash_policy != BASH_DISABLED:
+                # Strict-project uses the SDK OS sandbox as the Bash boundary.
+                opts["sandbox"] = strict_bash_sandbox_settings(
+                    self.project_root,
+                    str(config.claude_cli_path) if config.claude_cli_path else None,
+                )
         if model:
             # Normalize model name: ensure at most one [1M] suffix
             # e.g., "claude-opus-4-7[1M][1m]" -> "claude-opus-4-7[1M]"
             # e.g., "opus" -> "opus" (alias, unchanged)
-            normalized = re.sub(r'\[(?:1[mM])\]+', '', model)  # Remove all [1M]/[1m] suffixes
+            normalized = re.sub(r"\[(?:1[mM])\]+", "", model)  # Remove all [1M]/[1m] suffixes
             if normalized != model:
                 # Had suffix, add back single [1M]
                 normalized = f"{normalized}[1m]"
@@ -321,9 +337,7 @@ class ProjectChatHandler(
         )
         state_holder["state"] = state
         state.reader_task = asyncio.create_task(self._reader_loop(user_id, state))
-        state.typing_task = asyncio.create_task(
-            self._typing_keepalive_loop(user_id, state)
-        )
+        state.typing_task = asyncio.create_task(self._typing_keepalive_loop(user_id, state))
         return state
 
     async def _disconnect_stream_state(
@@ -449,9 +463,7 @@ class ProjectChatHandler(
                 state = None
 
             if not state:
-                state = await self._create_user_stream(
-                    user_id, model, unsolicited_callback
-                )
+                state = await self._create_user_stream(user_id, model, unsolicited_callback)
                 self._streams[key] = state
             elif unsolicited_callback is not None:
                 # Refresh the route when Telegram supplies a new Bot instance,
@@ -499,9 +511,7 @@ class ProjectChatHandler(
         led = self._task_ledger
         return led.create(user_id, chat_id) if led else None
 
-    def _ledger_finish(
-        self, req: _PendingRequest, state: str, *, cleanup_done: bool
-    ) -> None:
+    def _ledger_finish(self, req: _PendingRequest, state: str, *, cleanup_done: bool) -> None:
         led = self._task_ledger
         if led and req.task_id:
             led.finish(req.task_id, state, cleanup_done=cleanup_done)
@@ -674,9 +684,7 @@ class ProjectChatHandler(
             return False
         return True
 
-    async def _typing_keepalive_loop(
-        self, user_id: int, state: _UserStreamState
-    ) -> None:
+    async def _typing_keepalive_loop(self, user_id: int, state: _UserStreamState) -> None:
         """Background task that sends typing actions at regular intervals.
 
         Keeps Telegram typing indicator alive during long tool calls when
@@ -715,12 +723,7 @@ class ProjectChatHandler(
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            logger.error(
-                f"Typing keepalive loop crashed for user {user_id}: {e}", exc_info=True
-            )
-
-
-
+            logger.error(f"Typing keepalive loop crashed for user {user_id}: {e}", exc_info=True)
 
 
 project_chat_handler = ProjectChatHandler()

@@ -13,6 +13,12 @@ from telegram.ext import Application
 from telegram.request import BaseRequest, HTTPXRequest
 
 from telegram_bot.core.bot_shared import _PollingRestart, enforce_access_control
+from telegram_bot.core.tool_policy import (
+    EXECUTION_OWNER_OPERATOR,
+    effective_bash_policy,
+    resolve_bash_policy,
+    resolve_execution_profile,
+)
 from telegram_bot.core.session_isolation import apply_subprocess_session_isolation
 from telegram_bot.utils.config import config
 from telegram_bot.utils.health import health_reporter
@@ -118,11 +124,7 @@ class BotLifecycleMixin:
         ledger = self._lifecycle_task_ledger()
         if ledger is None:
             return
-        op_kind = (
-            "notice"
-            if getattr(config, "task_interrupted_notice", True)
-            else "delete"
-        )
+        op_kind = "notice" if getattr(config, "task_interrupted_notice", True) else "delete"
         interrupted = ledger.reconcile_interrupted(op_kind=op_kind)
         if interrupted:
             logger.info(
@@ -179,9 +181,7 @@ class BotLifecycleMixin:
         deleted = 0
         for chat_id, message_id in leftovers:
             try:
-                await application.bot.delete_message(
-                    chat_id=chat_id, message_id=message_id
-                )
+                await application.bot.delete_message(chat_id=chat_id, message_id=message_id)
                 deleted += 1
             except Exception as exc:
                 # Best-effort: message may be >48h old, already gone, or the chat
@@ -251,6 +251,18 @@ class BotLifecycleMixin:
 
     def run(self):
         """Run the bot with in-process polling restart capability."""
+        execution_profile = resolve_execution_profile(
+            getattr(config, "execution_profile", "strict-project"),
+            allowed_user_ids=getattr(config, "allowed_user_ids", []),
+            require_allowlist=getattr(config, "require_allowlist", True),
+        )
+        bash_policy = effective_bash_policy(resolve_bash_policy(), execution_profile)
+        logger.info(
+            "bridge_execution_policy execution_profile=%s bash_policy=%s host_scope=%s",
+            execution_profile,
+            bash_policy,
+            str(execution_profile == EXECUTION_OWNER_OPERATOR).lower(),
+        )
         enforce_access_control(config)
         exit_reason = "Bot stopped"
         try:
@@ -274,9 +286,7 @@ class BotLifecycleMixin:
 
     def _probe_claude_readiness(self) -> tuple[bool, str]:
         cli_path = (
-            str(config.claude_cli_path)
-            if config.claude_cli_path
-            else shutil.which("claude") or ""
+            str(config.claude_cli_path) if config.claude_cli_path else shutil.which("claude") or ""
         )
         if not cli_path:
             return False, "claude command not found"
@@ -367,9 +377,7 @@ class BotLifecycleMixin:
                     f"telegram startup error: {e}",
                     consecutive_failures=1,
                 )
-                logger.warning(
-                    "Network error during initialization: %s, retrying...", e
-                )
+                logger.warning("Network error during initialization: %s, retrying...", e)
                 # Force cleanup to release leaked connections from pool
                 await self._graceful_shutdown(force=True)
                 await asyncio.sleep(5)
@@ -401,9 +409,7 @@ class BotLifecycleMixin:
                 push_task = asyncio.create_task(
                     self._push_notifier.run(self.application, stop_event)
                 )
-                reaper_task = asyncio.create_task(
-                    run_periodic_reaper(), name="orphan-reaper"
-                )
+                reaper_task = asyncio.create_task(run_periodic_reaper(), name="orphan-reaper")
                 workload_task = asyncio.create_task(
                     self._workload_reporter(stop_event), name="workload-reporter"
                 )
@@ -415,9 +421,7 @@ class BotLifecycleMixin:
                 await self._wait_for_polling_exit(stop_event)
 
             except _PollingRestart:
-                health_reporter.mark_starting(
-                    "restarting polling after connection loss"
-                )
+                health_reporter.mark_starting("restarting polling after connection loss")
                 uptime = time.time() - start_time
                 if uptime < self._MIN_UPTIME:
                     rapid_crash_count += 1
@@ -443,9 +447,7 @@ class BotLifecycleMixin:
                     f"telegram timeout error: {e}",
                     consecutive_failures=1,
                 )
-                logger.warning(
-                    "TimedOut error during runtime (likely PoolTimeout): %s", e
-                )
+                logger.warning("TimedOut error during runtime (likely PoolTimeout): %s", e)
                 # Force cleanup to release leaked connections from pool
                 await self._graceful_shutdown(force=True)
                 continue
@@ -523,9 +525,7 @@ class BotLifecycleMixin:
                         os._exit(1)
                     raise _PollingRestart()
 
-    async def _periodic_dead_session_recovery(
-        self, stop_event: asyncio.Event
-    ) -> None:
+    async def _periodic_dead_session_recovery(self, stop_event: asyncio.Event) -> None:
         from telegram_bot.core.project_chat import (
             CONVERSATIONS_DIR,
             project_chat_handler,

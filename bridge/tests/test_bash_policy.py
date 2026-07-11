@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from claude_agent_sdk.types import PermissionResultAllow, PermissionResultDeny
+from claude_agent_sdk._internal.transport.subprocess_cli import SubprocessCLITransport
 
 from telegram_bot.core import bot_access
 from telegram_bot.core.bot_access import BotAccessMixin
@@ -23,14 +24,63 @@ class _FakeSDKClient:
         return None
 
 
+def _serialized_cli_args(options):
+    transport = SubprocessCLITransport(prompt="", options=options)
+    transport._cli_path = "/bin/true"
+    return transport._build_command()
+
+
 class SDKOptionWiringTest(unittest.TestCase):
+    def test_owner_operator_uses_host_scope_and_normal_settings(self):
+        def close_task(coro):
+            coro.close()
+            return object()
+
+        with (
+            patch.object(project_chat, "EXECUTION_PROFILE", "owner-operator", create=True),
+            patch.object(project_chat, "BASH_POLICY", "auto-approve"),
+            patch.object(project_chat, "ClaudeSDKClient", _FakeSDKClient),
+            patch.object(project_chat.asyncio, "create_task", side_effect=close_task),
+        ):
+            handler = project_chat.ProjectChatHandler()
+            asyncio.run(handler._create_user_stream(10, None))
+
+        options = _FakeSDKClient.last_options
+        assert options is not None
+        self.assertIn("Bash", options.allowed_tools)
+        self.assertIsNone(options.sandbox)
+        self.assertEqual(options.setting_sources, ["user", "project", "local"])
+        self.assertIn("--setting-sources=user,project,local", _serialized_cli_args(options))
+
+    def test_owner_operator_keeps_approve_each_independent_of_sandbox(self):
+        def close_task(coro):
+            coro.close()
+            return object()
+
+        with (
+            patch.object(project_chat, "EXECUTION_PROFILE", "owner-operator", create=True),
+            patch.object(project_chat, "BASH_POLICY", "approve-each"),
+            patch.object(project_chat, "ClaudeSDKClient", _FakeSDKClient),
+            patch.object(project_chat.asyncio, "create_task", side_effect=close_task),
+        ):
+            asyncio.run(project_chat.ProjectChatHandler()._create_user_stream(10, None))
+
+        options = _FakeSDKClient.last_options
+        assert options is not None
+        self.assertNotIn("Bash", options.allowed_tools)
+        self.assertNotIn("Bash", options.disallowed_tools)
+        self.assertIn("PreToolUse", options.hooks)
+        self.assertIsNone(options.sandbox)
+        self.assertEqual(options.setting_sources, ["user", "project", "local"])
+
     def test_project_chat_defaults_to_bare_bash_auto_approval(self):
         def close_task(coro):
             coro.close()
             return object()
 
-        with patch.object(project_chat, "ClaudeSDKClient", _FakeSDKClient), patch.object(
-            project_chat.asyncio, "create_task", side_effect=close_task
+        with (
+            patch.object(project_chat, "ClaudeSDKClient", _FakeSDKClient),
+            patch.object(project_chat.asyncio, "create_task", side_effect=close_task),
         ):
             handler = project_chat.ProjectChatHandler()
             asyncio.run(handler._create_user_stream(10, None))
@@ -46,8 +96,9 @@ class SDKOptionWiringTest(unittest.TestCase):
             coro.close()
             return object()
 
-        with patch.object(project_chat, "ClaudeSDKClient", _FakeSDKClient), patch.object(
-            project_chat.asyncio, "create_task", side_effect=close_task
+        with (
+            patch.object(project_chat, "ClaudeSDKClient", _FakeSDKClient),
+            patch.object(project_chat.asyncio, "create_task", side_effect=close_task),
         ):
             handler = project_chat.ProjectChatHandler()
             asyncio.run(handler._create_user_stream(10, None))
@@ -60,15 +111,18 @@ class SDKOptionWiringTest(unittest.TestCase):
             options.sandbox,
             tool_policy.strict_bash_sandbox_settings(handler.project_root),
         )
+        self.assertIn("--setting-sources=", _serialized_cli_args(options))
 
     def test_approve_each_keeps_strict_sandbox_and_telegram_hook(self):
         def close_task(coro):
             coro.close()
             return object()
 
-        with patch.object(project_chat, "BASH_POLICY", "approve-each"), patch.object(
-            project_chat, "ClaudeSDKClient", _FakeSDKClient
-        ), patch.object(project_chat.asyncio, "create_task", side_effect=close_task):
+        with (
+            patch.object(project_chat, "BASH_POLICY", "approve-each"),
+            patch.object(project_chat, "ClaudeSDKClient", _FakeSDKClient),
+            patch.object(project_chat.asyncio, "create_task", side_effect=close_task),
+        ):
             handler = project_chat.ProjectChatHandler()
             asyncio.run(handler._create_user_stream(10, None))
 
@@ -88,9 +142,11 @@ class SDKOptionWiringTest(unittest.TestCase):
             coro.close()
             return object()
 
-        with patch.object(project_chat, "BASH_POLICY", "disabled"), patch.object(
-            project_chat, "ClaudeSDKClient", _FakeSDKClient
-        ), patch.object(project_chat.asyncio, "create_task", side_effect=close_task):
+        with (
+            patch.object(project_chat, "BASH_POLICY", "disabled"),
+            patch.object(project_chat, "ClaudeSDKClient", _FakeSDKClient),
+            patch.object(project_chat.asyncio, "create_task", side_effect=close_task),
+        ):
             asyncio.run(project_chat.ProjectChatHandler()._create_user_stream(10, None))
 
         options = _FakeSDKClient.last_options
@@ -98,7 +154,92 @@ class SDKOptionWiringTest(unittest.TestCase):
         self.assertNotIn("Bash", options.allowed_tools)
         self.assertIn("Bash", options.disallowed_tools)
         self.assertIsNone(options.sandbox)
-        self.assertIsNone(options.setting_sources)
+        self.assertEqual(options.setting_sources, [])
+        self.assertIn("--setting-sources=", _serialized_cli_args(options))
+
+    def test_disabled_execution_profile_suppresses_host_settings(self):
+        def close_task(coro):
+            coro.close()
+            return object()
+
+        with (
+            patch.object(project_chat, "EXECUTION_PROFILE", "disabled"),
+            patch.object(project_chat, "BASH_POLICY", tool_policy.BASH_AUTO_APPROVE),
+            patch.object(project_chat, "ClaudeSDKClient", _FakeSDKClient),
+            patch.object(project_chat.asyncio, "create_task", side_effect=close_task),
+        ):
+            handler = project_chat.ProjectChatHandler()
+            asyncio.run(handler._create_user_stream(10, None))
+
+        options = _FakeSDKClient.last_options
+        assert options is not None
+        self.assertNotIn("Bash", options.allowed_tools)
+        self.assertIn("Bash", options.disallowed_tools)
+        self.assertIsNone(options.sandbox)
+        self.assertEqual(options.setting_sources, [])
+        self.assertIn("--setting-sources=", _serialized_cli_args(options))
+
+
+class ExecutionProfileTest(unittest.TestCase):
+    def test_default_profile_preserves_strict_project_sandbox(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(
+                tool_policy.resolve_execution_profile(
+                    allowed_user_ids=[42], require_allowlist=True
+                ),
+                "strict-project",
+            )
+
+    def test_owner_operator_requires_exactly_one_allowlisted_owner(self):
+        accepted = tool_policy.resolve_execution_profile(
+            "owner_operator", allowed_user_ids=[42], require_allowlist=True
+        )
+        self.assertEqual(accepted, "owner-operator")
+        self.assertEqual(
+            tool_policy.resolve_execution_profile(
+                " owner_operator ", allowed_user_ids=[42, 42], require_allowlist=True
+            ),
+            "owner-operator",
+        )
+
+        unsafe_inputs = (
+            ([], True),
+            ([42, 43], True),
+            ([42], False),
+        )
+        for allowed_user_ids, require_allowlist in unsafe_inputs:
+            with self.subTest(
+                allowed_user_ids=allowed_user_ids,
+                require_allowlist=require_allowlist,
+            ):
+                self.assertEqual(
+                    tool_policy.resolve_execution_profile(
+                        "owner-operator",
+                        allowed_user_ids=allowed_user_ids,
+                        require_allowlist=require_allowlist,
+                    ),
+                    "disabled",
+                )
+
+    def test_unknown_profile_fails_closed_to_disabled(self):
+        self.assertEqual(
+            tool_policy.resolve_execution_profile(
+                "host-unrestricted",
+                allowed_user_ids=[42],
+                require_allowlist=True,
+            ),
+            "disabled",
+        )
+
+    def test_disabled_profile_overrides_bash_auto_approval(self):
+        self.assertEqual(
+            tool_policy.effective_bash_policy("auto-approve", "disabled"),
+            "disabled",
+        )
+        self.assertEqual(
+            tool_policy.effective_bash_policy("approve-each", "strict-project"),
+            "approve-each",
+        )
 
 
 class StrictBashSandboxTest(unittest.TestCase):
@@ -129,11 +270,14 @@ class StrictBashSandboxTest(unittest.TestCase):
         self.assertEqual(filesystem["denyWrite"], [])
 
     def test_sandbox_reallows_only_sdk_and_resolved_cli_bootstrap_roots(self):
-        with patch.object(
-            tool_policy.claude_agent_sdk,
-            "__file__",
-            "/opt/ccc-bridge/venv/claude_agent_sdk/__init__.py",
-        ), patch.object(tool_policy.shutil, "which", return_value="/opt/claude/bin/claude"):
+        with (
+            patch.object(
+                tool_policy.claude_agent_sdk,
+                "__file__",
+                "/opt/ccc-bridge/venv/claude_agent_sdk/__init__.py",
+            ),
+            patch.object(tool_policy.shutil, "which", return_value="/opt/claude/bin/claude"),
+        ):
             sandbox = tool_policy.strict_bash_sandbox_settings(Path("/srv/project"))
 
         allow_read = sandbox["filesystem"]["allowRead"]
@@ -146,7 +290,7 @@ class StrictBashSandboxTest(unittest.TestCase):
         sandbox = tool_policy.strict_bash_sandbox_settings(Path("/srv/project"))
         attack_forms = [
             'P=/etc/passwd; cat "$P"',
-            'python -c \'open("/etc/passwd").read()\'',
+            "python -c 'open(\"/etc/passwd\").read()'",
             "cd .. && pwd",
             "cat $(printf /etc/passwd)",
             "ln -s /etc/passwd ./outside && cat ./outside",
@@ -168,15 +312,11 @@ class ToolPolicyTest(unittest.TestCase):
             self.assertEqual(tool_policy.bash_permission_hooks(), {})
 
     def test_auto_approve_normalizes_underscore_form(self):
-        self.assertEqual(
-            tool_policy.resolve_bash_policy("auto_approve"), "auto-approve"
-        )
+        self.assertEqual(tool_policy.resolve_bash_policy("auto_approve"), "auto-approve")
         self.assertIn("Bash", tool_policy.allowed_tools("auto_approve"))
 
     def test_explicit_disabled_policy_hard_denies_bash(self):
-        with patch.dict(
-            os.environ, {"CCC_BRIDGE_BASH_POLICY": "disabled"}, clear=True
-        ):
+        with patch.dict(os.environ, {"CCC_BRIDGE_BASH_POLICY": "disabled"}, clear=True):
             self.assertEqual(tool_policy.resolve_bash_policy(), "disabled")
             self.assertNotIn("Bash", tool_policy.allowed_tools())
             self.assertIn("Bash", tool_policy.disallowed_tools())
@@ -221,12 +361,8 @@ class ToolPolicyTest(unittest.TestCase):
         self.assertEqual(tool_policy.bash_permission_hooks("disabled"), {})
 
     def test_bash_without_active_callback_is_policy_specific(self):
-        self.assertTrue(
-            tool_policy.missing_callback_requires_denial("Bash", "approve-each")
-        )
-        self.assertFalse(
-            tool_policy.missing_callback_requires_denial("Bash", "auto-approve")
-        )
+        self.assertTrue(tool_policy.missing_callback_requires_denial("Bash", "approve-each"))
+        self.assertFalse(tool_policy.missing_callback_requires_denial("Bash", "auto-approve"))
         self.assertTrue(tool_policy.missing_callback_requires_denial("Bash", "disabled"))
         self.assertFalse(tool_policy.missing_callback_requires_denial("Read", "disabled"))
 
@@ -265,9 +401,7 @@ class BashPermissionFlowTest(unittest.TestCase):
         self.addCleanup(self.session_patch.stop)
 
     def call(self, subject, command):
-        return asyncio.run(
-            subject._permission_callback(10, 20, "Bash", {"command": command})
-        )
+        return asyncio.run(subject._permission_callback(10, 20, "Bash", {"command": command}))
 
     def test_disabled_policy_denies_even_if_callback_is_called(self):
         result = self.call(_AccessSubject("disabled"), "pwd")
@@ -283,7 +417,7 @@ class BashPermissionFlowTest(unittest.TestCase):
         commands = [
             "pwd",
             'P=/etc/passwd; cat "$P"',
-            'python -c \'open("/etc/passwd").read()\'',
+            "python -c 'open(\"/etc/passwd\").read()'",
             "cd .. && pwd",
             "cat $(printf /etc/passwd)",
         ]
@@ -314,9 +448,7 @@ class BashPermissionFlowTest(unittest.TestCase):
         key = subject._conversation_key(20, 10)
         self.sessions.sessions[key] = {
             "bash_approved_once": True,
-            "bash_approved_digest": subject._approval_digest(
-                "Bash", {"command": "pwd"}
-            ),
+            "bash_approved_digest": subject._approval_digest("Bash", {"command": "pwd"}),
             "pending_approval_kind": "bash",
         }
         with self.assertLogs("telegram_bot.core.bot_access", level="WARNING") as logs:
@@ -324,9 +456,7 @@ class BashPermissionFlowTest(unittest.TestCase):
         self.assertIsInstance(result, PermissionResultDeny)
         self.assertFalse(self.sessions.sessions[key]["bash_approved_once"])
         self.assertNotIn("bash_approved_digest", self.sessions.sessions[key])
-        self.assertTrue(
-            any("bash_approval_digest_mismatch" in line for line in logs.output)
-        )
+        self.assertTrue(any("bash_approval_digest_mismatch" in line for line in logs.output))
 
     def test_outside_path_approval_cannot_authorize_bash(self):
         subject = _AccessSubject("approve-each")
@@ -345,9 +475,7 @@ class BashPermissionFlowTest(unittest.TestCase):
         self.sessions.sessions[key] = {
             "pending_outside_paths": ["Bash command requires per-call approval"],
             "pending_approval_kind": "bash",
-            "pending_approval_digest": subject._approval_digest(
-                "Bash", {"command": "pwd"}
-            ),
+            "pending_approval_digest": subject._approval_digest("Bash", {"command": "pwd"}),
         }
         asyncio.run(subject._maybe_capture_outside_approval(20, "ALLOW_OUTSIDE_ONCE", 10))
         self.assertTrue(self.sessions.sessions[key]["bash_approved_once"])
@@ -360,9 +488,7 @@ class BashPermissionFlowTest(unittest.TestCase):
         self.sessions.sessions[key] = {
             "pending_outside_paths": ["Bash command requires per-call approval"],
             "pending_approval_kind": "bash",
-            "pending_approval_digest": subject._approval_digest(
-                "Bash", {"command": "pwd"}
-            ),
+            "pending_approval_digest": subject._approval_digest("Bash", {"command": "pwd"}),
         }
         choice = "1. ALLOW_OUTSIDE_ONCE (Allow this Bash call once)"
         asyncio.run(subject._maybe_capture_outside_approval(20, choice, 11))
@@ -376,9 +502,7 @@ class BashPermissionFlowTest(unittest.TestCase):
         self.sessions.sessions[key] = {
             "pending_outside_paths": ["Bash command requires per-call approval"],
             "pending_approval_kind": "bash",
-            "pending_approval_digest": subject._approval_digest(
-                "Bash", {"command": "pwd"}
-            ),
+            "pending_approval_digest": subject._approval_digest("Bash", {"command": "pwd"}),
         }
         for text in (
             "do not use ALLOW_OUTSIDE_ONCE here",
@@ -388,9 +512,7 @@ class BashPermissionFlowTest(unittest.TestCase):
         ):
             with self.subTest(text=text):
                 asyncio.run(subject._maybe_capture_outside_approval(20, text, 10))
-                self.assertFalse(
-                    self.sessions.sessions[key].get("bash_approved_once", False)
-                )
+                self.assertFalse(self.sessions.sessions[key].get("bash_approved_once", False))
                 self.assertIn("pending_outside_paths", self.sessions.sessions[key])
 
     def test_denial_reply_is_logged_and_clears_pending_digest(self):
@@ -399,21 +521,13 @@ class BashPermissionFlowTest(unittest.TestCase):
         self.sessions.sessions[key] = {
             "pending_outside_paths": ["Bash command requires per-call approval"],
             "pending_approval_kind": "bash",
-            "pending_approval_digest": subject._approval_digest(
-                "Bash", {"command": "pwd"}
-            ),
+            "pending_approval_digest": subject._approval_digest("Bash", {"command": "pwd"}),
         }
         with self.assertLogs("telegram_bot.core.bot_access", level="INFO") as logs:
-            asyncio.run(
-                subject._maybe_capture_outside_approval(
-                    20, "2. DENY_OUTSIDE (Deny)", 10
-                )
-            )
+            asyncio.run(subject._maybe_capture_outside_approval(20, "2. DENY_OUTSIDE (Deny)", 10))
         self.assertFalse(self.sessions.sessions[key].get("bash_approved_once", False))
         self.assertNotIn("pending_approval_digest", self.sessions.sessions[key])
-        self.assertTrue(
-            any("bash_approval_reply_denied" in line for line in logs.output)
-        )
+        self.assertTrue(any("bash_approval_reply_denied" in line for line in logs.output))
 
     def test_denial_records_pending_state_and_telemetry(self):
         subject = _AccessSubject("approve-each")

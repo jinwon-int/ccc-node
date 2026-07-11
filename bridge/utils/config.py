@@ -21,9 +21,7 @@ load_dotenv(dotenv_path=ENV_FILE_PATH)  # project .env first (higher priority)
 # If project .env has a placeholder token, clear it so bot source .env fallback works
 if os.environ.get("TELEGRAM_BOT_TOKEN", "") in _PLACEHOLDER_TOKENS:
     os.environ.pop("TELEGRAM_BOT_TOKEN", None)
-load_dotenv(
-    dotenv_path=BOT_ENV_FILE_PATH
-)  # global fallback (won't override already-set vars)
+load_dotenv(dotenv_path=BOT_ENV_FILE_PATH)  # global fallback (won't override already-set vars)
 
 LOGS_DIR = BOT_DATA_DIR / "logs"
 SESSION_STORE_PATH = BOT_DATA_DIR / "sessions.json"
@@ -56,9 +54,7 @@ class Config(BaseSettings):
     network_retry_delay: int = Field(
         default=5, description="Delay in seconds between retry attempts"
     )
-    polling_timeout: int = Field(
-        default=30, description="Telegram polling timeout in seconds"
-    )
+    polling_timeout: int = Field(default=30, description="Telegram polling timeout in seconds")
 
     @field_validator("telegram_bot_token", mode="before")
     @classmethod
@@ -71,9 +67,7 @@ class Config(BaseSettings):
         return v.strip()
 
     # Runtime data
-    bot_data_dir: Path = Field(
-        default=BOT_DATA_DIR, description="Runtime data directory"
-    )
+    bot_data_dir: Path = Field(default=BOT_DATA_DIR, description="Runtime data directory")
     logs_dir: Path = Field(default=LOGS_DIR, description="Runtime logs directory")
     session_store_path: Path = Field(
         default=SESSION_STORE_PATH,
@@ -104,6 +98,14 @@ class Config(BaseSettings):
         alias="CCC_REQUIRE_ALLOWLIST",
         description="Refuse to start when ALLOWED_USER_IDS is empty (fail-closed access control).",
     )
+    execution_profile: str = Field(
+        default="strict-project",
+        alias="CCC_BRIDGE_EXECUTION_PROFILE",
+        description=(
+            "SDK execution boundary: strict-project (default), owner-operator "
+            "(single allowlisted owner only), or disabled."
+        ),
+    )
 
     # ccc-node push notifier (owner-only outbound Claude Code lifecycle notifications).
     # DISABLED by default — opt-in only. See core/push_notifier.py for the approval boundary.
@@ -123,11 +125,13 @@ class Config(BaseSettings):
         description="Spool directory the Claude Code notify hook writes summaries into.",
     )
     push_poll_interval: float = Field(
-        default=3.0, alias="CCC_PUSH_POLL_INTERVAL",
+        default=3.0,
+        alias="CCC_PUSH_POLL_INTERVAL",
         description="Seconds between spool drains.",
     )
     push_max_per_minute: int = Field(
-        default=10, alias="CCC_PUSH_MAX_PER_MINUTE",
+        default=10,
+        alias="CCC_PUSH_MAX_PER_MINUTE",
         description="Rate limit: max push messages delivered per minute.",
     )
 
@@ -165,8 +169,7 @@ class Config(BaseSettings):
             if not v:
                 return None
             raise ValueError(
-                "AUTO_NEW_SESSION_AFTER_HOURS must be a positive number, "
-                "or 0/off/false to disable."
+                "AUTO_NEW_SESSION_AFTER_HOURS must be a positive number, or 0/off/false to disable."
             )
         if isinstance(v, str):
             value = v.strip().lower()
@@ -188,8 +191,7 @@ class Config(BaseSettings):
             return None
         if parsed < 0:
             raise ValueError(
-                "AUTO_NEW_SESSION_AFTER_HOURS must be greater than 0, "
-                "or 0/off/false to disable."
+                "AUTO_NEW_SESSION_AFTER_HOURS must be greater than 0, or 0/off/false to disable."
             )
         return parsed
 
@@ -435,9 +437,7 @@ class Config(BaseSettings):
     # Voice message configuration
     transcription_provider: str = Field(
         default="whisper",
-        description=(
-            "Voice transcription provider. Supported values: whisper, volcengine"
-        ),
+        description=("Voice transcription provider. Supported values: whisper, volcengine"),
     )
     openai_api_key: Optional[str] = Field(
         default=None, description="OpenAI API key used for Whisper transcription"
@@ -476,12 +476,8 @@ class Config(BaseSettings):
     volcengine_tos_bucket_name: Optional[str] = Field(
         default=None, description="Volcengine TOS bucket name for staging voice files"
     )
-    volcengine_tos_endpoint: str = Field(
-        default="", description="Volcengine TOS endpoint URL"
-    )
-    volcengine_tos_region: str = Field(
-        default="cn-beijing", description="Volcengine TOS region"
-    )
+    volcengine_tos_endpoint: str = Field(default="", description="Volcengine TOS endpoint URL")
+    volcengine_tos_region: str = Field(default="cn-beijing", description="Volcengine TOS region")
     volcengine_tos_signed_url_ttl_seconds: int = Field(
         default=900,
         description="Signed URL TTL in seconds for Volcengine ASR to fetch staged voice file",
@@ -533,9 +529,7 @@ class Config(BaseSettings):
         provider = str(v or "whisper").strip().lower()
         allowed = {"whisper", "volcengine"}
         if provider not in allowed:
-            raise ValueError(
-                "TRANSCRIPTION_PROVIDER must be one of: whisper, volcengine."
-            )
+            raise ValueError("TRANSCRIPTION_PROVIDER must be one of: whisper, volcengine.")
         return provider
 
     @field_validator("openai_api_key", mode="before")
@@ -665,9 +659,7 @@ class Config(BaseSettings):
             missing.append("VOLCENGINE_TOS_ENDPOINT")
         if missing:
             raise ValueError(
-                "Volcengine transcription provider requires: "
-                + ", ".join(missing)
-                + "."
+                "Volcengine transcription provider requires: " + ", ".join(missing) + "."
             )
         return self
 
@@ -732,8 +724,6 @@ def setup_logging() -> None:
     efh.setLevel(logging.ERROR)
     sep = "=" * 60
     efh.setFormatter(
-        logging.Formatter(
-            f"\n{sep}\n[%(asctime)s] %(name)s - %(levelname)s\n%(message)s\n{sep}"
-        )
+        logging.Formatter(f"\n{sep}\n[%(asctime)s] %(name)s - %(levelname)s\n%(message)s\n{sep}")
     )
     logging.getLogger().addHandler(efh)

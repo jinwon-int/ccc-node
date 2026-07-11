@@ -242,7 +242,10 @@ Any unrecognized `/command` is also forwarded as a skill invocation.
 | Variable | Required | Default | Description |
 |---|---|---|---|
 | `TELEGRAM_BOT_TOKEN` | Yes | — | Telegram Bot API token |
-| `ALLOWED_USER_IDS` | No | *(allow all)* | Comma-separated user ID whitelist |
+| `ALLOWED_USER_IDS` | No | *(allow all)* | Comma-separated user ID whitelist; `owner-operator` requires exactly one owner |
+| `CCC_REQUIRE_ALLOWLIST` | No | `true` | Refuse startup when the allowlist is empty; must stay true for `owner-operator` |
+| `CCC_BRIDGE_EXECUTION_PROFILE` | No | `strict-project` | Execution boundary: `strict-project`, `owner-operator`, or `disabled` |
+| `CCC_BRIDGE_BASH_POLICY` | No | `auto-approve` | Bash approval UX: `auto-approve`, `approve-each`, or `disabled` |
 | `CLAUDE_CLI_PATH` | No | *(auto-detect)* | Absolute path to Claude CLI binary |
 | `CLAUDE_SETTINGS_PATH` | No | `~/.claude/settings.json` | Path to Claude Code settings file |
 | `CLAUDE_PROCESS_TIMEOUT` | No | `600` | SDK timeout in seconds |
@@ -321,9 +324,11 @@ Current reference pricing is about **$0.006/minute** of audio. Check OpenAI pric
 
 - `--path` sets the `PROJECT_ROOT` working directory and structured-tool approval boundary.
 - Structured file tools (`Read`, `Edit`, `Write`, `MultiEdit`, `Glob`, `Grep`) keep their existing UX policy: paths inside `PROJECT_ROOT` are auto-allowed and outside paths require user confirmation.
-- `Bash` defaults to `CCC_BRIDGE_BASH_POLICY=auto-approve`, but auto-approval now runs only inside Claude Code's **strict OS sandbox**. The bridge disables unsandboxed fallback and excluded commands, fails closed if the sandbox is unavailable, denies host reads by default, and re-allows only `PROJECT_ROOT` plus the minimal read-only executable/library runtime. User/project/local settings are not loaded into bridge SDK streams, so merged filesystem arrays cannot widen this boundary.
-- On Linux/WSL2, install `bubblewrap` and `socat` before enabling Bash (`sudo apt-get install bubblewrap socat`). macOS uses Seatbelt. Native Windows, WSL1, Termux, or a Linux host where the sandbox cannot initialize will fail closed rather than run Bash on the host.
-- `approve-each` retains explicit one-time Telegram approval **in addition to** the same OS sandbox. `disabled` removes Bash entirely; unknown values fail closed. Approval never grants an unsandboxed escape.
+- `CCC_BRIDGE_EXECUTION_PROFILE` selects the execution boundary independently from Bash approval:
+  - `strict-project` (package default) preserves the fail-closed Claude Code OS sandbox: host reads are denied by default, only `PROJECT_ROOT` plus the minimal runtime is re-allowed, unsandboxed fallback/excluded commands are disabled, and user/project/local settings are suppressed. Linux/WSL2 requires `bubblewrap` and `socat`; unsupported/unavailable sandbox backends fail closed.
+  - `owner-operator` deliberately runs without the OS sandbox and restores normal user/project/local settings plus host-capable Claude Code utility. It starts only with `CCC_REQUIRE_ALLOWLIST=true` and exactly one `ALLOWED_USER_IDS` owner. This profile trusts that owner boundary and is **not** a prompt-injection defense.
+  - `disabled` hard-denies Bash and suppresses user/project/local filesystem settings so settings hooks cannot retain host execution. Unknown or unsafe profile values also resolve to disabled.
+- `CCC_BRIDGE_BASH_POLICY` controls approval UX inside the selected boundary: `auto-approve` (default), `approve-each` (one-time Telegram confirmation per command), or `disabled`. Approval never widens `strict-project`, and it is not a second sandbox in `owner-operator`.
 - Bot output referencing external files requires confirmation before sending.
 - All runtime data stays under `PROJECT_ROOT/.telegram_bot/`.
 

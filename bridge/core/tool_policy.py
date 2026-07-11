@@ -1,11 +1,10 @@
-"""Three-state Bash permission policy for the Telegram bridge.
+"""Execution-boundary and Bash approval policy for the Telegram bridge.
 
-``PROJECT_ROOT`` remains the structured-tool UX boundary. Bash itself is
-confined independently by Claude Code's OS sandbox: command text is never
-parsed as the security boundary, unsandboxed fallback is disabled, and an
-unavailable sandbox fails closed. The operator-selected default remains
-``auto-approve`` inside that boundary; ``approve-each`` adds a Telegram prompt,
-while ``disabled`` removes Bash entirely. Unknown policy values fail closed.
+``CCC_BRIDGE_EXECUTION_PROFILE`` selects the SDK boundary independently from
+``CCC_BRIDGE_BASH_POLICY`` approval UX. ``strict-project`` keeps the fail-closed
+OS sandbox, ``owner-operator`` intentionally restores normal host-capable Claude
+Code execution for exactly one allowlisted owner, and ``disabled`` removes Bash.
+Unknown or unsafe profile values fail closed to ``disabled``.
 """
 
 from __future__ import annotations
@@ -13,7 +12,7 @@ from __future__ import annotations
 import os
 import shutil
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 import claude_agent_sdk
 from claude_agent_sdk import HookMatcher
@@ -23,6 +22,47 @@ BASH_POLICY_ENV = "CCC_BRIDGE_BASH_POLICY"
 BASH_DISABLED = "disabled"
 BASH_APPROVE_EACH = "approve-each"
 BASH_AUTO_APPROVE = "auto-approve"
+
+EXECUTION_PROFILE_ENV = "CCC_BRIDGE_EXECUTION_PROFILE"
+EXECUTION_OWNER_OPERATOR = "owner-operator"
+EXECUTION_STRICT_PROJECT = "strict-project"
+EXECUTION_DISABLED = "disabled"
+
+
+def owner_operator_access_is_safe(
+    allowed_user_ids: Optional[Sequence[int]], require_allowlist: bool
+) -> bool:
+    """Return whether host-capable execution is bound to one explicit owner."""
+
+    owners = {int(user_id) for user_id in (allowed_user_ids or [])}
+    return bool(require_allowlist) and len(owners) == 1
+
+
+def resolve_execution_profile(
+    raw: Optional[str] = None,
+    *,
+    allowed_user_ids: Optional[Sequence[int]] = None,
+    require_allowlist: bool = True,
+) -> str:
+    """Resolve the SDK execution boundary, failing closed on unsafe inputs.
+
+    ``strict-project`` remains the package default. ``owner-operator`` is valid
+    only when Telegram access is constrained to one explicit owner; otherwise
+    it degrades to ``disabled`` so Bash cannot accidentally gain host scope.
+    """
+
+    value = os.getenv(EXECUTION_PROFILE_ENV, EXECUTION_STRICT_PROJECT) if raw is None else raw
+    normalized = str(value).strip().lower().replace("_", "-")
+    if normalized == EXECUTION_OWNER_OPERATOR:
+        if owner_operator_access_is_safe(allowed_user_ids, require_allowlist):
+            return EXECUTION_OWNER_OPERATOR
+        return EXECUTION_DISABLED
+    if normalized == EXECUTION_STRICT_PROJECT:
+        return EXECUTION_STRICT_PROJECT
+    if normalized == EXECUTION_DISABLED:
+        return EXECUTION_DISABLED
+    return EXECUTION_DISABLED
+
 
 # Bash needs a small read-only host runtime to start interpreters and resolve
 # libraries. Everything else is hidden by denyRead=["/"]. The project root is
@@ -134,6 +174,14 @@ def resolve_bash_policy(raw: Optional[str] = None) -> str:
     return BASH_DISABLED
 
 
+def effective_bash_policy(bash_policy: Optional[str], execution_profile: str) -> str:
+    """Apply the execution boundary without coupling it to approval UX."""
+
+    if execution_profile not in (EXECUTION_OWNER_OPERATOR, EXECUTION_STRICT_PROJECT):
+        return BASH_DISABLED
+    return resolve_bash_policy(bash_policy)
+
+
 def allowed_tools(bash_policy: Optional[str] = None) -> List[str]:
     """Build the SDK allowlist for the selected Bash policy.
 
@@ -181,17 +229,11 @@ def bash_permission_hooks(
             "hookSpecificOutput": {
                 "hookEventName": "PreToolUse",
                 "permissionDecision": "ask",
-                "permissionDecisionReason": (
-                    "Bash requires explicit per-call Telegram approval."
-                ),
+                "permissionDecisionReason": ("Bash requires explicit per-call Telegram approval."),
             }
         }
 
-    return {
-        "PreToolUse": [
-            HookMatcher(matcher="Bash", hooks=[require_per_call_approval])
-        ]
-    }
+    return {"PreToolUse": [HookMatcher(matcher="Bash", hooks=[require_per_call_approval])]}
 
 
 def sdk_permission_options(bash_policy: Optional[str] = None) -> Dict[str, Any]:
@@ -205,9 +247,7 @@ def sdk_permission_options(bash_policy: Optional[str] = None) -> Dict[str, Any]:
     }
 
 
-def missing_callback_requires_denial(
-    tool_name: str, bash_policy: Optional[str] = None
-) -> bool:
+def missing_callback_requires_denial(tool_name: str, bash_policy: Optional[str] = None) -> bool:
     """Require callback state unless the operator selected auto-approval."""
 
     if tool_name != "Bash":

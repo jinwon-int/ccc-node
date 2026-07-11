@@ -27,6 +27,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - 14 new unit/integration tests (`test_task_ledger.py` + heartbeat-loop ledger cases).
 
 ### Changed
+- **Execution profiles (#376).** `CCC_BRIDGE_EXECUTION_PROFILE` now separates the
+  SDK execution boundary from `CCC_BRIDGE_BASH_POLICY` approval UX. The package
+  default `strict-project` preserves PR #363's fail-closed project-root OS
+  sandbox. Explicit `owner-operator` restores normal host-capable Claude Code
+  execution and user/project/local settings only when
+  `CCC_REQUIRE_ALLOWLIST=true` and `ALLOWED_USER_IDS` resolves to one owner;
+  shared/open owner mode refuses startup. `disabled` and unknown/unsafe values
+  hard-deny Bash and suppress filesystem settings sources so settings hooks
+  cannot retain host execution. Startup logs expose the effective profile, Bash
+  policy, and host-scope boolean without logging owner IDs or secrets.
 - `CCC_BRIDGE_BASH_POLICY` has three explicit states and defaults to
   `auto-approve`. Bash now runs inside a strict Claude Code OS sandbox with
   unsandboxed fallback/excluded commands disabled, host reads denied by default,

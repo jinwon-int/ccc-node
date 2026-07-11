@@ -228,7 +228,10 @@ Claude:  ...
 | 变量 | 必需 | 默认值 | 说明 |
 |---|---|---|---|
 | `TELEGRAM_BOT_TOKEN` | 是 | — | Telegram Bot API Token |
-| `ALLOWED_USER_IDS` | 否 | *（允许所有人）* | 逗号分隔的用户 ID 白名单 |
+| `ALLOWED_USER_IDS` | 否 | *（允许所有人）* | 逗号分隔的用户 ID 白名单；`owner-operator` 必须且只能配置一个 owner |
+| `CCC_REQUIRE_ALLOWLIST` | 否 | `true` | 白名单为空时拒绝启动；`owner-operator` 必须保持为 true |
+| `CCC_BRIDGE_EXECUTION_PROFILE` | 否 | `strict-project` | 执行边界：`strict-project`、`owner-operator` 或 `disabled` |
+| `CCC_BRIDGE_BASH_POLICY` | 否 | `auto-approve` | Bash 审批方式：`auto-approve`、`approve-each` 或 `disabled` |
 | `CLAUDE_CLI_PATH` | 否 | *（自动检测）* | Claude CLI 绝对路径 |
 | `CLAUDE_SETTINGS_PATH` | 否 | `~/.claude/settings.json` | Claude Code settings 文件路径 |
 | `CLAUDE_PROCESS_TIMEOUT` | 否 | `600` | SDK 超时时间（秒） |
@@ -308,9 +311,11 @@ ffmpeg -version
 
 - `--path` 设定 `PROJECT_ROOT` 工作目录以及结构化文件工具的确认边界。
 - 结构化文件工具（`Read`、`Edit`、`Write`、`MultiEdit`、`Glob`、`Grep`）保持现有行为：根目录内自动放行，外部路径需要用户确认。
-- `Bash` 默认使用 `CCC_BRIDGE_BASH_POLICY=auto-approve`，但命令只会在 Claude Code 的严格 OS 沙箱中自动运行。Bridge 禁止非沙箱回退和 excluded commands；沙箱不可用时 fail-closed；默认拒绝读取 host 文件，仅重新允许 `PROJECT_ROOT` 与最小的只读可执行文件/运行库路径。Bridge SDK stream 不加载 user/project/local settings，避免合并的 filesystem 配置扩大边界。
-- Linux/WSL2 必须先安装 `bubblewrap` 和 `socat`（`sudo apt-get install bubblewrap socat`）；macOS 使用 Seatbelt。原生 Windows、WSL1、Termux 或无法初始化沙箱的 Linux 主机会 fail-closed，绝不会在 host 上直接执行 Bash。
-- `approve-each` 在相同 OS 沙箱之外再要求每次 Telegram 确认；`disabled` 完全移除 Bash；未知值 fail-closed。用户确认不能获得非沙箱逃逸。
+- `CCC_BRIDGE_EXECUTION_PROFILE` 独立选择执行边界：
+  - `strict-project`（包默认值）保留 fail-closed Claude Code OS 沙箱：默认拒绝 host 读取，仅重新允许 `PROJECT_ROOT` 与最小运行库，禁止非沙箱回退与 excluded commands，并禁用 user/project/local settings。Linux/WSL2 需要 `bubblewrap` 和 `socat`；后端不可用时 fail-closed。
+  - `owner-operator` 明确关闭 OS 沙箱，恢复正常 user/project/local settings 与 host 级 Claude Code 运维能力。只有 `CCC_REQUIRE_ALLOWLIST=true` 且 `ALLOWED_USER_IDS` 恰好一个 owner 时才能启动。此模式信任 owner 边界，**不能**防御 prompt injection。
+  - `disabled` 强制禁用 Bash，并禁止 user/project/local 文件系统 settings，避免 settings hook 保留 host 执行能力；未知或不安全的配置也会降级为 disabled。
+- `CCC_BRIDGE_BASH_POLICY` 只控制所选边界内的审批体验：`auto-approve`（默认）、`approve-each`（每条命令一次 Telegram 确认）或 `disabled`。审批不会扩大 `strict-project`，在 `owner-operator` 中也不是第二层沙箱。
 - Bot 输出引用外部文件时，发送前需用户确认。
 - 所有运行时数据都在 `PROJECT_ROOT/.telegram_bot/` 内。
 
