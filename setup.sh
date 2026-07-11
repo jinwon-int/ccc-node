@@ -60,9 +60,46 @@ HERMES_DIR="$HERMES_ROOT/memories"      # legacy memory location (fallback only)
 WIKI_AGENT_BIN="${CCC_WIKI_AGENT_BIN:-$HOME/.wiki-agent/bin/wiki-agent}"
 BRIDGE_DEFAULT_PATH="${CCC_BRIDGE_DEFAULT_PATH:-$HOME}"
 
-case "$CLAUDE_DIR:$HERMES_ROOT" in
-  :*|*:|/:*|*:/) echo "ERROR: refusing an empty or filesystem-root install path" >&2; exit 2 ;;
-esac
+validate_install_roots() {
+  command -v python3 >/dev/null 2>&1 || {
+    echo "ERROR: python3 is required to validate install paths" >&2
+    return 1
+  }
+  python3 - "$CLAUDE_DIR" "$HERMES_ROOT" <<'PY'
+import os
+import pathlib
+import stat
+import sys
+
+labels = ("CCC_CLAUDE_DIR", "CCC_HERMES_DIR")
+normalized = []
+for label, raw in zip(labels, sys.argv[1:]):
+    if not raw or not os.path.isabs(raw):
+        print(f"ERROR: {label} must be a non-empty absolute path", file=sys.stderr)
+        raise SystemExit(1)
+    path = os.path.normpath(os.path.join(os.path.sep, os.path.relpath(raw, os.path.sep)))
+    if path == os.path.sep:
+        print(f"ERROR: refusing filesystem-root install path for {label}", file=sys.stderr)
+        raise SystemExit(1)
+    current = pathlib.Path(os.path.sep)
+    for part in pathlib.PurePath(path).parts[1:]:
+        current /= part
+        try:
+            mode = current.lstat().st_mode
+        except FileNotFoundError:
+            continue
+        if stat.S_ISLNK(mode):
+            print(f"ERROR: install path contains symlink component: {current}", file=sys.stderr)
+            raise SystemExit(1)
+    normalized.append(path)
+
+claude, hermes = normalized
+if claude == hermes or claude.startswith(hermes + os.sep) or hermes.startswith(claude + os.sep):
+    print("ERROR: Claude and Hermes install roots must not overlap", file=sys.stderr)
+    raise SystemExit(1)
+PY
+}
+validate_install_roots || exit 2
 
 render_command() {
   printf '[dry-run]'
@@ -86,6 +123,41 @@ CLAUDE_MANAGED=(
   settings.json settings.local.json hooks output-styles headless.sh
   agents commands skills CLAUDE.md memories
 )
+
+validate_managed_artifacts() {
+  python3 - "$CLAUDE_DIR" "$HERMES_ROOT" "${CLAUDE_MANAGED[@]}" <<'PY'
+import pathlib
+import stat
+import sys
+
+claude = pathlib.Path(sys.argv[1])
+hermes = pathlib.Path(sys.argv[2])
+for item in sys.argv[3:]:
+    root = claude / item
+    candidates = [root]
+    if root.is_dir() and not root.is_symlink():
+        candidates.extend(root.rglob("*"))
+    for candidate in candidates:
+        if candidate.is_symlink():
+            print(f"ERROR: refusing managed artifact symlink: {candidate}", file=sys.stderr)
+            raise SystemExit(1)
+        try:
+            mode = candidate.lstat().st_mode
+        except FileNotFoundError:
+            continue
+        if stat.S_ISREG(mode) and candidate.stat().st_nlink != 1:
+            print(f"ERROR: refusing managed artifact hardlink: {candidate}", file=sys.stderr)
+            raise SystemExit(1)
+honcho = hermes / "honcho.json"
+if honcho.is_symlink():
+    print(f"ERROR: refusing managed artifact symlink: {honcho}", file=sys.stderr)
+    raise SystemExit(1)
+if honcho.exists() and honcho.is_file() and honcho.stat().st_nlink != 1:
+    print(f"ERROR: refusing managed artifact hardlink: {honcho}", file=sys.stderr)
+    raise SystemExit(1)
+PY
+}
+validate_managed_artifacts || exit 2
 SETUP_TXN_DIR=""
 SETUP_TXN_ACTIVE=0
 
@@ -304,8 +376,8 @@ run cp "$SRC/claude/output-styles/"*.md "$CLAUDE_DIR/output-styles/"
 # Headless runner for cron/A2A/CI (`claude -p` wrapper, guard still applies).
 run cp "$SRC/claude/headless.sh" "$CLAUDE_DIR/headless.sh"
 run chmod +x "$CLAUDE_DIR/headless.sh"
-# Working-state checkpoint dir (PreCompact snapshot / PostCompact re-inject)
-run mkdir -p "$CLAUDE_DIR/state/checkpoints"
+# checkpoint.sh creates its runtime state directory on demand. setup.sh must not
+# mutate state/checkpoints because runtime state is outside the install transaction.
 # A2A worker sub-agent roster (explorer/implementer/verifier) — node-agnostic role defs
 run mkdir -p "$CLAUDE_DIR/agents"
 run cp "$SRC/claude/agents/"*.md "$CLAUDE_DIR/agents/"
@@ -352,7 +424,20 @@ if [ "$CLAUDE_DIR" != "/root/.claude" ]; then
   if [ "$DRY" = 1 ]; then
     render_command rewrite-root-paths "/root/.claude" "$CLAUDE_DIR"
   else
-    while IFS= read -r -d '' rewrite_file; do
+    rewrite_targets=(
+      "$CLAUDE_DIR/settings.json" "$CLAUDE_DIR/settings.local.json"
+      "$CLAUDE_DIR/headless.sh"
+      "$CLAUDE_DIR/hooks/ccc_memory_index.py"
+      "$CLAUDE_DIR/hooks/ccc_memory_search.py"
+      "${installed_hook_scripts[@]}" "${SEEDED[@]}"
+    )
+    for source_tree in output-styles agents commands skills; do
+      while IFS= read -r -d '' source_file; do
+        rewrite_targets+=("$CLAUDE_DIR/$source_tree/${source_file#"$SRC/claude/$source_tree/"}")
+      done < <(find "$SRC/claude/$source_tree" -type f -print0)
+    done
+    for rewrite_file in "${rewrite_targets[@]}"; do
+      [ -f "$rewrite_file" ] || continue
       python3 - "$rewrite_file" "$CLAUDE_DIR" <<'PY'
 import sys
 
@@ -362,7 +447,7 @@ with open(path, encoding="utf-8") as fh:
 with open(path, "w", encoding="utf-8") as fh:
     fh.write(content.replace("/root/.claude", replacement))
 PY
-    done < <(grep -rlZ '/root/.claude' "$CLAUDE_DIR" 2>/dev/null || true)
+    done
   fi
 fi
 

@@ -17,8 +17,8 @@
 #   1. take a lock; resolve the repo (env > repo file > script location > ~/ccc-node)
 #   2. preconditions: .git present, clean working tree, on the expected branch
 #   3. git fetch + merge --ff-only (never rewrites local history)
-#   4. if HEAD changed (or --force): run ./setup.sh to redeploy the harness;
-#      on setup failure roll back to the old SHA and abort
+#   4. if HEAD changed (or --force): snapshot Claude + Hermes managed artifacts,
+#      run ./setup.sh, then verify both repo SHA and artifact rollback on failure
 #   5. restart each allowlisted service and verify it is active again
 #   6. append a JSONL audit record and queue an owner Telegram notification
 #      (spool only — this script never touches the bot token)
@@ -40,6 +40,7 @@
 set -uo pipefail
 
 CLAUDE_DIR="${CCC_CLAUDE_DIR:-${HOME:-/root}/.claude}"
+HERMES_ROOT="${CCC_HERMES_DIR:-${HOME:-/root}/.hermes}"
 STATE_DIR="${CCC_STATE_DIR:-$CLAUDE_DIR/state}"
 LOG="$STATE_DIR/self-update.log"
 LOCK="$STATE_DIR/self-update.lock"
@@ -48,8 +49,48 @@ SERVICES_FILE="${CCC_SELF_UPDATE_SERVICES:-$CLAUDE_DIR/self-update.services}"
 REPO_FILE="$CLAUDE_DIR/self-update.repo"
 BRANCH="${CCC_SELF_UPDATE_BRANCH:-main}"
 SYSTEMCTL="${CCC_SELF_UPDATE_SYSTEMCTL:-systemctl}"
+
+validate_runtime_paths() {
+  python3 - "$CLAUDE_DIR" "$HERMES_ROOT" "$STATE_DIR" <<'PY'
+import os
+import pathlib
+import stat
+import sys
+
+normalized = []
+for raw in sys.argv[1:]:
+    if not raw or not os.path.isabs(raw):
+        print(f"self-update: path must be absolute: {raw!r}", file=sys.stderr)
+        raise SystemExit(1)
+    path = os.path.normpath(os.path.join(os.path.sep, os.path.relpath(raw, os.path.sep)))
+    if path == os.path.sep:
+        print("self-update: refusing filesystem-root path", file=sys.stderr)
+        raise SystemExit(1)
+    current = pathlib.Path(os.path.sep)
+    for part in pathlib.PurePath(path).parts[1:]:
+        current /= part
+        try:
+            mode = current.lstat().st_mode
+        except FileNotFoundError:
+            continue
+        if stat.S_ISLNK(mode):
+            print(f"self-update: path contains symlink component: {current}", file=sys.stderr)
+            raise SystemExit(1)
+    normalized.append(path)
+claude, hermes, state = normalized
+if claude == hermes or claude.startswith(hermes + os.sep) or hermes.startswith(claude + os.sep):
+    print("self-update: Claude and Hermes roots must not overlap", file=sys.stderr)
+    raise SystemExit(1)
+if not (state == claude or state.startswith(claude + os.sep)):
+    print("self-update: state directory must be inside the Claude root", file=sys.stderr)
+    raise SystemExit(1)
+PY
+}
+validate_runtime_paths || exit 4
 mkdir -p "$STATE_DIR" 2>/dev/null
-INSTALL_SNAPSHOT=""
+INSTALL_SNAPSHOT_DIR=""
+CLAUDE_SNAPSHOT=""
+HERMES_SNAPSHOT=""
 KEEP_INSTALL_SNAPSHOT=0
 INSTALLED_PATHS=(
   settings.json settings.local.json hooks output-styles headless.sh
@@ -91,17 +132,75 @@ audit() { # <result> <old> <new> <changed> <setup_ok> <services-json>
 
 snapshot_installed_artifacts() {
   local existing=() item
-  INSTALL_SNAPSHOT="$STATE_DIR/self-update-install-rollback.$$.tar.gz"
+  python3 - "$CLAUDE_DIR" "$HERMES_ROOT" "${INSTALLED_PATHS[@]}" <<'PY' || return 1
+import pathlib
+import stat
+import sys
+
+claude = pathlib.Path(sys.argv[1])
+hermes = pathlib.Path(sys.argv[2])
+for item in sys.argv[3:]:
+    root = claude / item
+    candidates = [root]
+    if root.is_dir() and not root.is_symlink():
+        candidates.extend(root.rglob("*"))
+    for candidate in candidates:
+        if candidate.is_symlink():
+            print(f"self-update: refusing managed artifact symlink: {candidate}", file=sys.stderr)
+            raise SystemExit(1)
+        try:
+            mode = candidate.lstat().st_mode
+        except FileNotFoundError:
+            continue
+        if stat.S_ISREG(mode) and candidate.stat().st_nlink != 1:
+            print(f"self-update: refusing managed artifact hardlink: {candidate}", file=sys.stderr)
+            raise SystemExit(1)
+honcho = hermes / "honcho.json"
+if honcho.is_symlink():
+    print(f"self-update: refusing managed artifact symlink: {honcho}", file=sys.stderr)
+    raise SystemExit(1)
+if honcho.exists() and honcho.is_file() and honcho.stat().st_nlink != 1:
+    print(f"self-update: refusing managed artifact hardlink: {honcho}", file=sys.stderr)
+    raise SystemExit(1)
+PY
+  INSTALL_SNAPSHOT_DIR="$(mktemp -d "$STATE_DIR/self-update-install-rollback.XXXXXX")" || return 1
+  chmod 700 "$INSTALL_SNAPSHOT_DIR" || return 1
+  CLAUDE_SNAPSHOT="$INSTALL_SNAPSHOT_DIR/claude.tar.gz"
+  HERMES_SNAPSHOT="$INSTALL_SNAPSHOT_DIR/hermes.tar.gz"
   for item in "${INSTALLED_PATHS[@]}"; do
     { [ -e "$CLAUDE_DIR/$item" ] || [ -L "$CLAUDE_DIR/$item" ]; } && existing+=("$item")
   done
   if [ "${#existing[@]}" -gt 0 ]; then
-    (umask 077; tar -czf "$INSTALL_SNAPSHOT" -C "$CLAUDE_DIR" "${existing[@]}") || return 1
+    (umask 077; tar -czf "$CLAUDE_SNAPSHOT" -C "$CLAUDE_DIR" "${existing[@]}") || return 1
   else
-    (umask 077; tar -czf "$INSTALL_SNAPSHOT" --files-from /dev/null) || return 1
+    (umask 077; tar -czf "$CLAUDE_SNAPSHOT" --files-from /dev/null) || return 1
   fi
-  chmod 600 "$INSTALL_SNAPSHOT" || return 1
-  tar -tzf "$INSTALL_SNAPSHOT" >/dev/null || return 1
+  if [ -e "$HERMES_ROOT/honcho.json" ] || [ -L "$HERMES_ROOT/honcho.json" ]; then
+    (umask 077; tar -czf "$HERMES_SNAPSHOT" -C "$HERMES_ROOT" honcho.json) || return 1
+  else
+    (umask 077; tar -czf "$HERMES_SNAPSHOT" --files-from /dev/null) || return 1
+  fi
+  chmod 600 "$CLAUDE_SNAPSHOT" "$HERMES_SNAPSHOT" || return 1
+  tar -tzf "$CLAUDE_SNAPSHOT" >/dev/null || return 1
+  tar -tzf "$HERMES_SNAPSHOT" >/dev/null || return 1
+  python3 - "$CLAUDE_SNAPSHOT" "$HERMES_SNAPSHOT" "${INSTALLED_PATHS[*]}" <<'PY' || return 1
+import pathlib
+import sys
+import tarfile
+
+claude_archive, hermes_archive, allowed_text = sys.argv[1:]
+for archive, allowed in (
+    (claude_archive, set(allowed_text.split())),
+    (hermes_archive, {"honcho.json"}),
+):
+    with tarfile.open(archive, "r:gz") as tf:
+        for member in tf.getmembers():
+            path = pathlib.PurePosixPath(member.name)
+            if path.is_absolute() or ".." in path.parts or not path.parts or path.parts[0] not in allowed:
+                raise SystemExit(f"unsafe snapshot member: {member.name}")
+            if member.issym() or member.islnk():
+                raise SystemExit(f"unsafe snapshot link member: {member.name}")
+PY
 }
 
 restore_installed_artifacts() {
@@ -109,16 +208,24 @@ restore_installed_artifacts() {
   for item in "${INSTALLED_PATHS[@]}"; do
     rm -rf -- "$CLAUDE_DIR/$item" || failed=1
   done
-  mkdir -p "$CLAUDE_DIR" || failed=1
-  tar -xzf "$INSTALL_SNAPSHOT" -C "$CLAUDE_DIR" || failed=1
+  mkdir -p "$CLAUDE_DIR" "$HERMES_ROOT" || failed=1
+  tar -xzf "$CLAUDE_SNAPSHOT" -C "$CLAUDE_DIR" || failed=1
+  rm -f -- "$HERMES_ROOT/honcho.json" || failed=1
+  tar -xzf "$HERMES_SNAPSHOT" -C "$HERMES_ROOT" || failed=1
   [ "$failed" = 0 ]
 }
 
 cleanup() {
-  if [ "$KEEP_INSTALL_SNAPSHOT" != 1 ] && [ -n "$INSTALL_SNAPSHOT" ]; then
-    rm -f -- "$INSTALL_SNAPSHOT"
+  if [ "$KEEP_INSTALL_SNAPSHOT" != 1 ] && [ -n "$INSTALL_SNAPSHOT_DIR" ]; then
+    rm -rf -- "$INSTALL_SNAPSHOT_DIR"
   fi
   rmdir "$LOCK" 2>/dev/null
+}
+
+reset_repo_to_old_sha() {
+  git -C "$REPO" reset --hard "$OLD_SHA" >/dev/null 2>&1 || return 1
+  [ "$(git -C "$REPO" rev-parse HEAD 2>/dev/null)" = "$OLD_SHA" ] || return 1
+  [ -z "$(git -C "$REPO" status --porcelain 2>/dev/null)" ]
 }
 
 MODE="${1:-run}"
@@ -217,6 +324,40 @@ rm -f "$DEFER_MARK" 2>/dev/null
 
 REPO="$(resolve_repo)"
 
+validate_repo_path() {
+  python3 - "$REPO" "$CLAUDE_DIR" "$HERMES_ROOT" <<'PY'
+import os
+import pathlib
+import stat
+import sys
+
+raw, claude, hermes = sys.argv[1:]
+if not raw or not os.path.isabs(raw):
+    print("self-update: repository path must be absolute", file=sys.stderr)
+    raise SystemExit(1)
+repo = os.path.normpath(os.path.join(os.path.sep, os.path.relpath(raw, os.path.sep)))
+if repo == os.path.sep:
+    print("self-update: refusing filesystem-root repository", file=sys.stderr)
+    raise SystemExit(1)
+for other in (claude, hermes):
+    other = os.path.normpath(os.path.join(os.path.sep, os.path.relpath(other, os.path.sep)))
+    if repo == other or repo.startswith(other + os.sep) or other.startswith(repo + os.sep):
+        print("self-update: repository and install roots must not overlap", file=sys.stderr)
+        raise SystemExit(1)
+current = pathlib.Path(os.path.sep)
+for part in pathlib.PurePath(repo).parts[1:]:
+    current /= part
+    try:
+        mode = current.lstat().st_mode
+    except FileNotFoundError:
+        continue
+    if stat.S_ISLNK(mode):
+        print(f"self-update: repository path contains symlink component: {current}", file=sys.stderr)
+        raise SystemExit(1)
+PY
+}
+validate_repo_path || exit 4
+
 # --- preconditions ------------------------------------------------------------
 if [ ! -d "$REPO/.git" ]; then
   log "abort reason=no-repo repo=$REPO"
@@ -262,16 +403,24 @@ fi
 # --- redeploy harness ---------------------------------------------------------
 SETUP_OK=true
 if ! snapshot_installed_artifacts; then
-  audit "artifact-snapshot-failed" "$OLD_SHA" "$NEW_SHA" "$CHANGED" false '[]'
-  notify "self-update 실패: 설치본 rollback snapshot 생성 실패. 로그: ~/.claude/state/self-update.log" "snapshot-fail-$NEW_SHA"
-  say "self-update: installed-artifact snapshot failed; aborting before setup" >&2
-  git -C "$REPO" reset --hard "$OLD_SHA" >/dev/null 2>&1
-  exit 6
+  if reset_repo_to_old_sha; then
+    audit "artifact-snapshot-failed" "$OLD_SHA" "$NEW_SHA" "$CHANGED" false '[]'
+    notify "self-update 실패: 설치본 rollback snapshot 생성 실패. repo는 이전 SHA로 복구했습니다. 로그: ~/.claude/state/self-update.log" "snapshot-fail-$NEW_SHA"
+    say "self-update: installed-artifact snapshot failed; repository rolled back before setup" >&2
+    exit 6
+  fi
+  audit "artifact-snapshot-failed-repo-rollback-degraded" "$OLD_SHA" "$NEW_SHA" "$CHANGED" false '[]'
+  notify "self-update 중대 실패: snapshot 생성과 repo rollback이 모두 실패했습니다. 로그를 즉시 확인하세요." "snapshot-repo-degraded-$NEW_SHA"
+  say "self-update: snapshot failed and repository rollback was degraded" >&2
+  exit 9
 fi
 if ! (cd "$REPO" && bash setup.sh >>"$LOG" 2>&1); then
   SETUP_OK=false
-  git -C "$REPO" reset --hard "$OLD_SHA" >/dev/null 2>&1
-  if restore_installed_artifacts; then
+  REPO_ROLLBACK_OK=true
+  ARTIFACT_ROLLBACK_OK=true
+  reset_repo_to_old_sha || REPO_ROLLBACK_OK=false
+  restore_installed_artifacts || ARTIFACT_ROLLBACK_OK=false
+  if [ "$REPO_ROLLBACK_OK" = true ] && [ "$ARTIFACT_ROLLBACK_OK" = true ]; then
     audit "setup-failed-rolled-back" "$OLD_SHA" "$NEW_SHA" "$CHANGED" false '[]'
     notify "self-update 실패: setup.sh 오류 — repo와 설치본을 ${OLD_SHA:0:7} 상태로 롤백했습니다. 로그: ~/.claude/state/self-update.log" "fail-$NEW_SHA"
     say "self-update: setup.sh failed; rolled back repo and installed artifacts to ${OLD_SHA:0:7}" >&2
@@ -279,12 +428,13 @@ if ! (cd "$REPO" && bash setup.sh >>"$LOG" 2>&1); then
   fi
   audit "setup-failed-rollback-degraded" "$OLD_SHA" "$NEW_SHA" "$CHANGED" false '[]'
   KEEP_INSTALL_SNAPSHOT=1
-  notify "self-update 중대 실패: setup.sh 오류 뒤 설치본 rollback이 불완전합니다. 로그를 즉시 확인하세요." "rollback-degraded-$NEW_SHA"
-  say "self-update: setup failed and installed-artifact rollback was degraded; recovery snapshot retained at $INSTALL_SNAPSHOT" >&2
+  log "recovery snapshot=$INSTALL_SNAPSHOT_DIR repoRollback=$REPO_ROLLBACK_OK artifactRollback=$ARTIFACT_ROLLBACK_OK"
+  notify "self-update 중대 실패: setup.sh 오류 뒤 rollback이 불완전합니다. 로그를 즉시 확인하세요." "rollback-degraded-$NEW_SHA"
+  say "self-update: setup failed and rollback was degraded; recovery snapshot retained at $INSTALL_SNAPSHOT_DIR" >&2
   exit 9
 fi
-rm -f -- "$INSTALL_SNAPSHOT"
-INSTALL_SNAPSHOT=""
+rm -rf -- "$INSTALL_SNAPSHOT_DIR"
+INSTALL_SNAPSHOT_DIR=""
 
 # --- restart allowlisted services ----------------------------------------------
 SERVICES_JSON='[]'

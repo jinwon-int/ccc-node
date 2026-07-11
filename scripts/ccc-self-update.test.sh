@@ -36,13 +36,15 @@ exit 0
 SH
 chmod +x "$FAKEBIN/fakesystemctl"
 
-STATE="$TMP/state"
 CLAUDE="$TMP/claude"
-mkdir -p "$STATE" "$CLAUDE"
+STATE="$CLAUDE/state"
+HERMES="$TMP/hermes"
+mkdir -p "$STATE" "$CLAUDE" "$HERMES"
 export SETUP_MARKER="$TMP/setup.marker"
 
 run_selfup() {
   CCC_CLAUDE_DIR="$CLAUDE" CCC_STATE_DIR="$STATE" CCC_PUSH_SPOOL="$TMP/spool" \
+  CCC_HERMES_DIR="$HERMES" \
   CCC_SELF_UPDATE_REPO="$REPO" CCC_SELF_UPDATE_SYSTEMCTL="$FAKEBIN/fakesystemctl" \
   CCC_NODE=testnode bash "$SELFUP" "$@"
 }
@@ -64,7 +66,7 @@ ok "only allowlisted services restarted" 'grep -q "restart hermes-broker" "$TMP/
 ok "audit record written" 'grep -q "\"result\":\"ok\"" "$STATE/self-update.log"'
 ok "owner notification queued" 'ls "$TMP/spool"/*SelfUpdate*.json >/dev/null 2>&1 && jq -r .text "$TMP/spool"/*SelfUpdate*.json | grep -q "self-update 완료"'
 ok "successful update removes private recovery snapshot" \
-  '! compgen -G "$STATE/self-update-install-rollback.*.tar.gz" >/dev/null'
+  '! compgen -G "$STATE/self-update-install-rollback.*" >/dev/null'
 
 # Snapshot permission failures must be fail-closed even though the snapshot
 # helper is called in an `if ! ...` conditional (where Bash suppresses errexit
@@ -81,6 +83,13 @@ ok "snapshot chmod failure is fail-closed before setup" \
   '[ "$rc" = 6 ] && [ "$(wc -l < "$SETUP_MARKER")" = "$setup_count_before" ] && grep -q "artifact-snapshot-failed" "$STATE/self-update.log"'
 rm -f "$FAKEBIN/chmod"
 
+ln -s "$TMP/missing-managed-target" "$CLAUDE/settings.local.json"
+setup_count_before="$(wc -l < "$SETUP_MARKER")"
+out="$(run_selfup run --force 2>&1)"; rc=$?
+ok "managed artifact symlink is rejected before setup" \
+  '[ "$rc" = 6 ] && [ "$(wc -l < "$SETUP_MARKER")" = "$setup_count_before" ] && grep -q "artifact-snapshot-failed" "$STATE/self-update.log"'
+rm -f "$CLAUDE/settings.local.json"
+
 # --- 3) service restart failure is reported ------------------------------------
 echo change3 > "$TMP/seed/file.txt"
 git -C "$TMP/seed" add -A && git -C "$TMP/seed" commit -qm three && git -C "$TMP/seed" push -q origin main
@@ -96,7 +105,8 @@ ok "failure notification queued" 'jq -r .text "$TMP/spool"/*SelfUpdate*.json 2>/
 OLD_HEAD="$(git -C "$REPO" rev-parse HEAD)"
 mkdir -p "$CLAUDE/hooks"
 printf '%s\n' 'old-installed-hook' > "$CLAUDE/hooks/installed-hook.sh"
-ln -s "$TMP/missing-node-local-settings" "$CLAUDE/settings.local.json"
+printf '%s\n' '{"oldHoncho":true}' > "$HERMES/honcho.json"
+printf '%s\n' '{"oldLocal":true}' > "$CLAUDE/settings.local.json"
 rm -f "$CLAUDE/headless.sh"
 INSTALLED_BEFORE="$(sha256sum "$CLAUDE/hooks/installed-hook.sh")"
 cat > "$TMP/seed/setup.sh" <<'SH'
@@ -104,17 +114,35 @@ cat > "$TMP/seed/setup.sh" <<'SH'
 printf '%s\n' 'partially-updated-hook' > "${CCC_CLAUDE_DIR:?}/hooks/installed-hook.sh"
 rm -f "${CCC_CLAUDE_DIR:?}/settings.local.json"
 printf '%s\n' 'partially-created-headless' > "${CCC_CLAUDE_DIR:?}/headless.sh"
+printf '%s\n' '{"newHoncho":true}' > "${CCC_HERMES_DIR:?}/honcho.json"
 exit 1
 SH
 git -C "$TMP/seed" add -A && git -C "$TMP/seed" commit -qm broken-setup && git -C "$TMP/seed" push -q origin main
 out="$(run_selfup run 2>&1)"; rc=$?
 ok "setup failure exits non-zero and rolls back" '[ "$rc" = 6 ] && [ "$(git -C "$REPO" rev-parse HEAD)" = "$OLD_HEAD" ]'
 ok "setup failure restores installed artifacts" '[ "$(sha256sum "$CLAUDE/hooks/installed-hook.sh")" = "$INSTALLED_BEFORE" ]'
-ok "setup failure restores dangling symlinks and absent artifacts" \
-  '[ -L "$CLAUDE/settings.local.json" ] && [ "$(readlink "$CLAUDE/settings.local.json")" = "$TMP/missing-node-local-settings" ] && [ ! -e "$CLAUDE/headless.sh" ]'
+ok "setup failure restores Hermes honcho artifact" 'grep -q "oldHoncho" "$HERMES/honcho.json"'
+ok "setup failure restores regular and absent artifacts" \
+  'grep -q "oldLocal" "$CLAUDE/settings.local.json" && [ ! -e "$CLAUDE/headless.sh" ]'
 ok "rollback audit recorded" 'grep -q "setup-failed-rolled-back" "$STATE/self-update.log"'
 ok "successful artifact rollback removes private recovery snapshot" \
-  '! compgen -G "$STATE/self-update-install-rollback.*.tar.gz" >/dev/null'
+  '! compgen -G "$STATE/self-update-install-rollback.*" >/dev/null'
+
+# A failed repository reset must never be reported as a complete rollback.
+cat > "$FAKEBIN/git" <<'SH'
+#!/usr/bin/env bash
+case " $* " in *" reset --hard "*) exit 96 ;; esac
+exec /usr/bin/git "$@"
+SH
+chmod +x "$FAKEBIN/git"
+out="$(PATH="$FAKEBIN:$PATH" run_selfup run 2>&1)"; rc=$?
+ok "repo reset failure exits 9 and records degraded rollback" \
+  '[ "$rc" = 9 ] && [ "$(git -C "$REPO" rev-parse HEAD)" != "$OLD_HEAD" ] && grep -q "repoRollback=false" "$STATE/self-update.log"'
+ok "repo reset failure retains recovery snapshot directory" \
+  'compgen -G "$STATE/self-update-install-rollback.*" >/dev/null'
+rm -f "$FAKEBIN/git"
+/usr/bin/git -C "$REPO" reset --hard -q "$OLD_HEAD"
+rm -rf "$STATE"/self-update-install-rollback.*
 
 # If extraction itself fails, expose a distinct degraded state and retain the
 # validated private snapshot for operator recovery instead of deleting it in
@@ -129,10 +157,12 @@ out="$(PATH="$FAKEBIN:$PATH" run_selfup run 2>&1)"; rc=$?
 ok "artifact restore failure exits 9 and records degraded rollback" \
   '[ "$rc" = 9 ] && grep -q "setup-failed-rollback-degraded" "$STATE/self-update.log"'
 ok "degraded rollback retains validated private snapshot" \
-  'compgen -G "$STATE/self-update-install-rollback.*.tar.gz" >/dev/null'
-retained_snapshot="$(compgen -G "$STATE/self-update-install-rollback.*.tar.gz" | head -1)"
-ok "retained recovery snapshot is owner-only" '[ "$(stat -c %a "$retained_snapshot")" = 600 ]'
-rm -f "$FAKEBIN/tar" "$STATE"/self-update-install-rollback.*.tar.gz
+  'compgen -G "$STATE/self-update-install-rollback.*" >/dev/null'
+retained_snapshot="$(compgen -G "$STATE/self-update-install-rollback.*" | head -1)"
+ok "retained recovery snapshot is owner-only" \
+  '[ "$(stat -c %a "$retained_snapshot")" = 700 ] && [ "$(stat -c %a "$retained_snapshot/claude.tar.gz")" = 600 ] && [ "$(stat -c %a "$retained_snapshot/hermes.tar.gz")" = 600 ]'
+rm -f "$FAKEBIN/tar"
+rm -rf "$STATE"/self-update-install-rollback.*
 
 # --- 5) fail-closed preconditions -----------------------------------------------
 echo dirty > "$REPO/file.txt"
