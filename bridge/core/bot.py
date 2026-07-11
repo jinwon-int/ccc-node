@@ -305,8 +305,8 @@ class TelegramBot(BotLifecycleMixin, BotStatusMixin, BotAccessMixin, BotCommandM
 
         Used to detect replies to the bot's own messages. Accessing
         ``bot.id`` before the bot is initialized raises, so guard broadly and
-        fall back to None (callers then use the replied-to author's ``is_bot``
-        flag).
+        fall back to None. Reply-context trust classification then remains
+        fail-closed instead of treating an arbitrary bot as this bot.
         """
         try:
             app = self.application

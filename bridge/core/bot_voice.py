@@ -466,7 +466,9 @@ class BotVoiceMixin:
 
                 prompt = self._build_image_prompt(image_path, caption)
                 reply_prefix = build_reply_context_prefix(
-                    message, bot_user_id=self._own_bot_id()
+                    message,
+                    bot_user_id=self._own_bot_id(),
+                    owner_user_id=user_id,
                 )
                 if reply_prefix:
                     prompt = f"{reply_prefix}\n\n{prompt}"
@@ -748,7 +750,9 @@ class BotVoiceMixin:
 
                 preview = f"🎤 Voice: {text}"
                 reply_prefix = build_reply_context_prefix(
-                    message, bot_user_id=self._own_bot_id()
+                    message,
+                    bot_user_id=self._own_bot_id(),
+                    owner_user_id=user_id,
                 )
                 task_text = f"{reply_prefix}\n\n{text}" if reply_prefix else text
                 await self._process_user_message_text(

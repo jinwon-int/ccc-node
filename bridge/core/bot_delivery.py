@@ -105,7 +105,9 @@ class BotDeliveryMixin:
         # above (resume selection, pending-question answer) return early and
         # deliberately keep the raw text.
         reply_prefix = build_reply_context_prefix(
-            message, bot_user_id=self._own_bot_id()
+            message,
+            bot_user_id=self._own_bot_id(),
+            owner_user_id=user_id,
         )
         task_text = f"{reply_prefix}\n\n{text}" if reply_prefix else text
 
