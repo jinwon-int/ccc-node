@@ -55,6 +55,28 @@ ok "setup refuses filesystem-root Claude install target" '[ "$rc" = 2 ] && grep 
 out="$(HOME="$TMP/root-guard-home" CCC_CLAUDE_DIR="$TMP/root-guard-claude" CCC_HERMES_DIR=/ bash "$SETUP" --dry-run 2>&1)"; rc=$?
 ok "setup refuses filesystem-root Hermes install target" '[ "$rc" = 2 ] && grep -q "filesystem-root" <<<"$out"'
 
+out="$(HOME="$TMP/root-guard-home" CCC_CLAUDE_DIR=/tmp/.. CCC_HERMES_DIR="$TMP/root-guard-hermes" bash "$SETUP" --dry-run 2>&1)"; rc=$?
+ok "setup refuses normalized filesystem-root aliases" '[ "$rc" = 2 ] && grep -q "filesystem-root" <<<"$out"'
+
+mkdir -p "$TMP/live-claude-target"
+ln -s "$TMP/live-claude-target" "$TMP/live-claude-link"
+out="$(HOME="$TMP/root-guard-home" CCC_CLAUDE_DIR="$TMP/live-claude-link" CCC_HERMES_DIR="$TMP/root-guard-hermes" bash "$SETUP" --dry-run 2>&1)"; rc=$?
+ok "setup refuses install roots with symlink components" '[ "$rc" = 2 ] && grep -q "symlink" <<<"$out"'
+
+managed_link_claude="$TMP/managed-link-claude"
+mkdir -p "$managed_link_claude" "$TMP/external-hooks"
+ln -s "$TMP/external-hooks" "$managed_link_claude/hooks"
+out="$(HOME="$TMP/root-guard-home" CCC_CLAUDE_DIR="$managed_link_claude" CCC_HERMES_DIR="$TMP/root-guard-hermes" bash "$SETUP" --dry-run 2>&1)"; rc=$?
+ok "setup refuses managed artifact symlinks before mutation" '[ "$rc" = 2 ] && grep -q "managed artifact symlink" <<<"$out" && [ -z "$(find "$TMP/external-hooks" -mindepth 1 -print -quit)" ]'
+
+hardlink_claude="$TMP/hardlink-claude"
+mkdir -p "$hardlink_claude"
+printf '%s\n' '{"shared":true}' > "$TMP/shared-settings.json"
+ln "$TMP/shared-settings.json" "$hardlink_claude/settings.json"
+out="$(HOME="$TMP/root-guard-home" CCC_CLAUDE_DIR="$hardlink_claude" CCC_HERMES_DIR="$TMP/root-guard-hermes" bash "$SETUP" --dry-run 2>&1)"; rc=$?
+ok "setup refuses managed artifact hardlinks before mutation" \
+  '[ "$rc" = 2 ] && grep -q "managed artifact hardlink" <<<"$out" && grep -q "shared" "$TMP/shared-settings.json"'
+
 # Paths are data, never shell source. The historical run() helper passed these
 # values through eval, so a quote plus command separator could execute a second
 # command during an otherwise harmless install.
@@ -72,9 +94,10 @@ txn_hermes="$TMP/txn-hermes"
 mkdir -p "$txn_claude/hooks" "$txn_hermes" "$TMP/fail-bin"
 printf '%s\n' '{"old":true}' > "$txn_claude/settings.json"
 printf '%s\n' 'old-hook' > "$txn_claude/hooks/old-local.sh"
-ln -s "$TMP/missing-node-local-settings" "$txn_claude/settings.local.json"
+printf '%s\n' '{"oldLocal":true}' > "$txn_claude/settings.local.json"
 settings_txn_before="$(sha256sum "$txn_claude/settings.json")"
 hook_txn_before="$(sha256sum "$txn_claude/hooks/old-local.sh")"
+local_txn_before="$(sha256sum "$txn_claude/settings.local.json")"
 cat > "$TMP/fail-bin/cp" <<'EOF'
 #!/usr/bin/env bash
 count_file="${CCC_TEST_CP_COUNT:?}"
@@ -89,7 +112,18 @@ out="$(HOME="$TMP/txn-home" PATH="$TMP/fail-bin:$PATH" CCC_TEST_CP_COUNT="$TMP/c
   bash "$SETUP" --no-backup 2>&1)"; rc=$?
 ok "setup injected staging failure exits non-zero" '[ "$rc" != 0 ]'
 ok "setup staging failure preserves installed artifacts byte-for-byte" \
-  '[ "$(sha256sum "$txn_claude/settings.json")" = "$settings_txn_before" ] && [ "$(sha256sum "$txn_claude/hooks/old-local.sh")" = "$hook_txn_before" ] && [ -L "$txn_claude/settings.local.json" ] && [ "$(readlink "$txn_claude/settings.local.json")" = "$TMP/missing-node-local-settings" ]'
+  '[ "$(sha256sum "$txn_claude/settings.json")" = "$settings_txn_before" ] && [ "$(sha256sum "$txn_claude/hooks/old-local.sh")" = "$hook_txn_before" ] && [ "$(sha256sum "$txn_claude/settings.local.json")" = "$local_txn_before" ]'
+
+# HOME-path rewriting is source-driven. Existing node-local files outside the
+# installed harness must not be scanned or rewritten.
+rewrite_claude="$TMP/rewrite-claude"
+rewrite_hermes="$TMP/rewrite-hermes"
+mkdir -p "$rewrite_claude"
+printf '%s\n' 'credential-note=/root/.claude/private' > "$rewrite_claude/.credentials.json"
+credential_before="$(sha256sum "$rewrite_claude/.credentials.json")"
+out="$(HOME="$TMP/rewrite-home" CCC_CLAUDE_DIR="$rewrite_claude" CCC_HERMES_DIR="$rewrite_hermes" bash "$SETUP" --no-backup 2>&1)"; rc=$?
+ok "custom-path rewrite leaves node-local credentials untouched" \
+  '[ "$rc" = 0 ] && [ "$(sha256sum "$rewrite_claude/.credentials.json")" = "$credential_before" ]'
 
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

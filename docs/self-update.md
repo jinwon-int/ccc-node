@@ -15,12 +15,15 @@ rather than composing the steps ad hoc.
 1. lock; resolve the repo (`CCC_SELF_UPDATE_REPO` > `~/.claude/self-update.repo`
    > script location > `~/ccc-node`)
 2. fail-closed preconditions: clean working tree, on the expected branch
-   (`CCC_SELF_UPDATE_BRANCH`, default `main`)
+   (`CCC_SELF_UPDATE_BRANCH`, default `main`); Claude/Hermes/state/repository
+   paths must be absolute, normalized, non-root, non-overlapping, and free of
+   symlink components; managed artifacts must not be symlinks or hardlinks
 3. `git fetch` + `merge --ff-only` (never rewrites local history; diverged →
    abort)
-4. if HEAD changed (or `run --force`): snapshot the managed installed
-   artifacts, then let `./setup.sh` redeploy the harness; a setup failure
-   **rolls back both the repository SHA and installed artifacts** and aborts
+4. if HEAD changed (or `run --force`): snapshot the managed Claude artifacts
+   plus Hermes `honcho.json`, then let `./setup.sh` redeploy the harness; a
+   setup failure verifies rollback of both the repository SHA and installed
+   artifacts before reporting success
 5. restarts each service listed in the operator allowlist and verifies it is
    active again
 6. appends a JSONL audit record (`~/.claude/state/self-update.log`) and queues
@@ -92,12 +95,17 @@ the bridge is serving a request:
 | `CCC_SELF_UPDATE_MAX_DEFER_SECONDS` | `3600` | cap total deferral so continuous load can't starve updates |
 
 Exit codes: 0 ok/up-to-date · 3 lock held · 4 precondition failed · 5 fetch/ff
-failed · 6 setup/snapshot failed (repo and managed artifacts rolled back, or
-setup never started) · 7 service restart failure · 8 deferred (bridge busy —
-retry next tick) · 9 setup failed and installed-artifact rollback was degraded.
-On exit 9, the validated private recovery snapshot is retained with owner-only
-permissions (`0600`) under
-`~/.claude/state/self-update-install-rollback.*.tar.gz` for local operator
-recovery only; do not share or attach it because managed configuration and
-memory files may be present. Normal success and successful rollback remove it
-automatically.
+failed · 6 setup/snapshot failed (repo and managed artifacts were verified
+rolled back, or setup never started) · 7 service restart failure · 8 deferred
+(bridge busy — retry next tick) · 9 repository or installed-artifact rollback
+was degraded.
+On exit 9, the validated private recovery snapshot is retained under
+`~/.claude/state/self-update-install-rollback.*/` (`0700` directory containing
+`0600` Claude and Hermes archives) for local operator
+recovery only; do not share it because it may contain settings and memory
+files. Normal success and successful rollback remove it automatically.
+
+`setup.sh` independently exits `70` when its own local artifact rollback is
+degraded and prints the retained private transaction directory. The outer
+self-update layer must still verify its own repository + Claude + Hermes
+rollback rather than treating that exit as a complete restore.
