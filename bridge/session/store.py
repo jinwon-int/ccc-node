@@ -415,6 +415,16 @@ class SessionStore:
     def _key(self, user_id: int) -> str:
         return f"telegram_session:{user_id}"
 
+    async def list_sessions(self) -> Dict[str, Dict[str, Any]]:
+        """Return a deep-copied map of conversation-key suffixes to sessions."""
+        prefix = "telegram_session:"
+        async with self._lock:
+            return {
+                key[len(prefix) :]: copy.deepcopy(value)
+                for key, value in self._local_data.items()
+                if key.startswith(prefix) and isinstance(value, dict)
+            }
+
     async def get(self, user_id: int) -> Optional[Dict[str, Any]]:
         # Return a deep copy, never the live stored dict. Callers throughout the
         # bot mutate the returned session in place and only persist via
