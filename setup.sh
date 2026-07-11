@@ -11,7 +11,7 @@
 #                              #   double-firing you'd get if both settings.json and the
 #                              #   plugin registered them. Node-local hooks stay in settings.
 #   ./setup.sh --dry-run       # show what would happen, change nothing (combine with above)
-#   ./setup.sh --no-backup     # do NOT snapshot the existing ~/.claude before overwriting
+#   ./setup.sh --no-backup     # skip the durable operator backup (failure rollback remains enabled)
 #
 # Node-identity seeding (optional): when these are given, freshly-seeded CLAUDE.md / MEMORY.md /
 # USER.md have their <PLACEHOLDER> tokens substituted automatically (existing files are never
@@ -60,8 +60,97 @@ HERMES_DIR="$HERMES_ROOT/memories"      # legacy memory location (fallback only)
 WIKI_AGENT_BIN="${CCC_WIKI_AGENT_BIN:-$HOME/.wiki-agent/bin/wiki-agent}"
 BRIDGE_DEFAULT_PATH="${CCC_BRIDGE_DEFAULT_PATH:-$HOME}"
 
-run() { if [ "$DRY" = 1 ]; then echo "[dry-run] $*"; else eval "$*"; fi; }
+case "$CLAUDE_DIR:$HERMES_ROOT" in
+  :*|*:|/:*|*:/) echo "ERROR: refusing an empty or filesystem-root install path" >&2; exit 2 ;;
+esac
+
+render_command() {
+  printf '[dry-run]'
+  printf ' %q' "$@"
+  printf '\n'
+}
+run() {
+  if [ "$DRY" = 1 ]; then
+    render_command "$@"
+  else
+    "$@"
+  fi
+}
 note() { printf '  - %s\n' "$*"; }
+
+# setup is transactional even with --no-backup. The operator backup is a
+# durable restore point; this private snapshot exists only long enough to undo
+# a failed install. Exact managed paths are archived so credentials, projects,
+# transcripts, state, and other node-local data never enter the snapshot.
+CLAUDE_MANAGED=(
+  settings.json settings.local.json hooks output-styles headless.sh
+  agents commands skills CLAUDE.md memories
+)
+SETUP_TXN_DIR=""
+SETUP_TXN_ACTIVE=0
+
+snapshot_paths() { # <root> <archive> <path>...
+  local root="$1" archive="$2"; shift 2
+  local existing=() item
+  for item in "$@"; do
+    { [ -e "$root/$item" ] || [ -L "$root/$item" ]; } && existing+=("$item")
+  done
+  if [ "${#existing[@]}" -gt 0 ]; then
+    tar -czf "$archive" -C "$root" "${existing[@]}"
+  else
+    tar -czf "$archive" --files-from /dev/null
+  fi
+}
+
+begin_install_transaction() {
+  [ "$DRY" = 1 ] && return 0
+  local parent
+  parent="$(dirname "$CLAUDE_DIR")"
+  mkdir -p "$parent"
+  SETUP_TXN_DIR="$(mktemp -d "$parent/.ccc-node-setup-rollback.XXXXXX")"
+  snapshot_paths "$CLAUDE_DIR" "$SETUP_TXN_DIR/claude.tar.gz" "${CLAUDE_MANAGED[@]}"
+  if [ -e "$HERMES_ROOT/honcho.json" ] || [ -L "$HERMES_ROOT/honcho.json" ]; then
+    tar -czf "$SETUP_TXN_DIR/hermes.tar.gz" -C "$HERMES_ROOT" honcho.json
+  else
+    tar -czf "$SETUP_TXN_DIR/hermes.tar.gz" --files-from /dev/null
+  fi
+  tar -tzf "$SETUP_TXN_DIR/claude.tar.gz" >/dev/null
+  tar -tzf "$SETUP_TXN_DIR/hermes.tar.gz" >/dev/null
+  SETUP_TXN_ACTIVE=1
+}
+
+rollback_install_transaction() {
+  local item failed=0
+  trap - EXIT
+  for item in "${CLAUDE_MANAGED[@]}"; do rm -rf -- "$CLAUDE_DIR/$item" || failed=1; done
+  mkdir -p "$CLAUDE_DIR" "$HERMES_ROOT" || failed=1
+  tar -xzf "$SETUP_TXN_DIR/claude.tar.gz" -C "$CLAUDE_DIR" || failed=1
+  rm -f -- "$HERMES_ROOT/honcho.json" || failed=1
+  tar -xzf "$SETUP_TXN_DIR/hermes.tar.gz" -C "$HERMES_ROOT" || failed=1
+  if [ "$failed" = 0 ]; then
+    echo "ERROR: setup failed; restored previous installed artifacts" >&2
+  else
+    echo "ERROR: setup failed and artifact rollback was degraded; inspect $SETUP_TXN_DIR" >&2
+    return 1
+  fi
+}
+
+finish_install_transaction() {
+  local rc=$? keep_snapshot=0
+  trap - EXIT
+  if [ "$SETUP_TXN_ACTIVE" = 1 ] && [ "$rc" -ne 0 ]; then
+    if ! rollback_install_transaction; then
+      rc=70
+      keep_snapshot=1
+    fi
+  fi
+  if [ "$keep_snapshot" = 0 ] && [ -n "$SETUP_TXN_DIR" ]; then
+    rm -rf -- "$SETUP_TXN_DIR"
+  fi
+  exit "$rc"
+}
+
+trap finish_install_transaction EXIT
 
 # Merge base + enforcement-overlay into settings.json ATOMICALLY: render to a temp
 # file, validate it parses, then mv into place. The old `jq ... > settings.json`
@@ -100,8 +189,8 @@ backup_claude_dir() {
   local ts archive
   ts="$(date +%Y%m%d-%H%M%S)"
   archive="$CLAUDE_DIR/backups/ccc-node-setup-$ts.tar.gz"
-  run "mkdir -p '$CLAUDE_DIR/backups'"
-  if ! run "tar -czf '$archive' -C '$CLAUDE_DIR' ${items[*]}"; then
+  run mkdir -p "$CLAUDE_DIR/backups"
+  if ! run tar -czf "$archive" -C "$CLAUDE_DIR" "${items[@]}"; then
     echo "Backup creation failed: $archive" >&2
     return 1
   fi
@@ -114,9 +203,10 @@ backup_claude_dir() {
 
 echo "==> Installing Claude Code node setup from: $SRC"
 backup_claude_dir
+begin_install_transaction
 
 # 1) Claude harness config + hooks (safe, secret-free)
-run "mkdir -p '$CLAUDE_DIR/hooks'"
+run mkdir -p "$CLAUDE_DIR/hooks"
 # settings.json is composed from two sources so the portable enforcement/observability
 # hooks have a SINGLE owner (no double-firing):
 #   - claude/settings.base.json          : node-local hooks + statusLine + outputStyle (always)
@@ -125,83 +215,122 @@ run "mkdir -p '$CLAUDE_DIR/hooks'"
 # --with-plugin: base only → the ccc-node plugin's hooks/hooks.json owns the portable hooks.
 if [ "$WITH_PLUGIN" = 1 ]; then
   note "plugin mode: lean settings (portable hooks come from the ccc-node plugin)"
-  run "cp '$SRC/claude/settings.base.json'    '$CLAUDE_DIR/settings.json'"
+  run cp "$SRC/claude/settings.base.json" "$CLAUDE_DIR/settings.json"
 else
   merge_settings_json "$SRC/claude/settings.base.json" "$SRC/claude/hooks/enforcement-overlay.json" "$CLAUDE_DIR/settings.json"
 fi
-run "cp '$SRC/claude/settings.local.json'     '$CLAUDE_DIR/settings.local.json'"
-run "cp '$SRC/claude/hooks/load-memory.sh'    '$CLAUDE_DIR/hooks/load-memory.sh'"
-run "cp '$SRC/claude/hooks/refresh-memory.sh' '$CLAUDE_DIR/hooks/refresh-memory.sh'"
-run "cp '$SRC/claude/hooks/scan-injection.sh' '$CLAUDE_DIR/hooks/scan-injection.sh'"
-run "cp '$SRC/claude/hooks/load-tools.sh'     '$CLAUDE_DIR/hooks/load-tools.sh'"
-run "cp '$SRC/claude/hooks/checkpoint.sh'     '$CLAUDE_DIR/hooks/checkpoint.sh'"
-run "cp '$SRC/claude/hooks/guard.sh'          '$CLAUDE_DIR/hooks/guard.sh'"
-run "cp '$SRC/claude/hooks/audit.sh'          '$CLAUDE_DIR/hooks/audit.sh'"
-run "cp '$SRC/claude/hooks/redact.sh'         '$CLAUDE_DIR/hooks/redact.sh'"
-run "cp '$SRC/claude/hooks/notify.sh'         '$CLAUDE_DIR/hooks/notify.sh'"
-run "cp '$SRC/claude/hooks/evidence-gate.sh'  '$CLAUDE_DIR/hooks/evidence-gate.sh'"
-run "cp '$SRC/claude/hooks/statusline.sh'     '$CLAUDE_DIR/hooks/statusline.sh'"
+run cp "$SRC/claude/settings.local.json" "$CLAUDE_DIR/settings.local.json"
+run cp "$SRC/claude/hooks/load-memory.sh" "$CLAUDE_DIR/hooks/load-memory.sh"
+run cp "$SRC/claude/hooks/refresh-memory.sh" "$CLAUDE_DIR/hooks/refresh-memory.sh"
+run cp "$SRC/claude/hooks/scan-injection.sh" "$CLAUDE_DIR/hooks/scan-injection.sh"
+run cp "$SRC/claude/hooks/load-tools.sh" "$CLAUDE_DIR/hooks/load-tools.sh"
+run cp "$SRC/claude/hooks/checkpoint.sh" "$CLAUDE_DIR/hooks/checkpoint.sh"
+run cp "$SRC/claude/hooks/guard.sh" "$CLAUDE_DIR/hooks/guard.sh"
+run cp "$SRC/claude/hooks/audit.sh" "$CLAUDE_DIR/hooks/audit.sh"
+run cp "$SRC/claude/hooks/redact.sh" "$CLAUDE_DIR/hooks/redact.sh"
+run cp "$SRC/claude/hooks/notify.sh" "$CLAUDE_DIR/hooks/notify.sh"
+run cp "$SRC/claude/hooks/evidence-gate.sh" "$CLAUDE_DIR/hooks/evidence-gate.sh"
+run cp "$SRC/claude/hooks/statusline.sh" "$CLAUDE_DIR/hooks/statusline.sh"
 # Memory helper tools used by load-memory.sh / refresh-memory.sh in standalone installs.
-run "cp '$SRC/scripts/ccc-memory-index.sh'    '$CLAUDE_DIR/hooks/ccc-memory-index.sh'"
-run "cp '$SRC/scripts/ccc_memory_index.py'    '$CLAUDE_DIR/hooks/ccc_memory_index.py'"
-run "cp '$SRC/scripts/ccc-memory-search.sh'   '$CLAUDE_DIR/hooks/ccc-memory-search.sh'"
-run "cp '$SRC/scripts/ccc_memory_search.py'   '$CLAUDE_DIR/hooks/ccc_memory_search.py'"
-run "cp '$SRC/scripts/ccc-memory-consolidate.sh' '$CLAUDE_DIR/hooks/ccc-memory-consolidate.sh'"
-run "cp '$SRC/scripts/ccc-memory-query.sh'    '$CLAUDE_DIR/hooks/ccc-memory-query.sh'"
-run "cp '$SRC/scripts/ccc-memory-check.sh'    '$CLAUDE_DIR/hooks/ccc-memory-check.sh'"
-run "cp '$SRC/scripts/ccc-memory-explain.sh'  '$CLAUDE_DIR/hooks/ccc-memory-explain.sh'"
-run "cp '$SRC/scripts/ccc-wiki-triage.sh'     '$CLAUDE_DIR/hooks/ccc-wiki-triage.sh'"
-run "cp '$SRC/scripts/ccc-memory-eval.sh'     '$CLAUDE_DIR/hooks/ccc-memory-eval.sh'"
-run "cp '$SRC/scripts/ccc-memory-benchmark-export.sh' '$CLAUDE_DIR/hooks/ccc-memory-benchmark-export.sh'"
+run cp "$SRC/scripts/ccc-memory-index.sh" "$CLAUDE_DIR/hooks/ccc-memory-index.sh"
+run cp "$SRC/scripts/ccc_memory_index.py" "$CLAUDE_DIR/hooks/ccc_memory_index.py"
+run cp "$SRC/scripts/ccc-memory-search.sh" "$CLAUDE_DIR/hooks/ccc-memory-search.sh"
+run cp "$SRC/scripts/ccc_memory_search.py" "$CLAUDE_DIR/hooks/ccc_memory_search.py"
+run cp "$SRC/scripts/ccc-memory-consolidate.sh" "$CLAUDE_DIR/hooks/ccc-memory-consolidate.sh"
+run cp "$SRC/scripts/ccc-memory-query.sh" "$CLAUDE_DIR/hooks/ccc-memory-query.sh"
+run cp "$SRC/scripts/ccc-memory-check.sh" "$CLAUDE_DIR/hooks/ccc-memory-check.sh"
+run cp "$SRC/scripts/ccc-memory-explain.sh" "$CLAUDE_DIR/hooks/ccc-memory-explain.sh"
+run cp "$SRC/scripts/ccc-wiki-triage.sh" "$CLAUDE_DIR/hooks/ccc-wiki-triage.sh"
+run cp "$SRC/scripts/ccc-memory-eval.sh" "$CLAUDE_DIR/hooks/ccc-memory-eval.sh"
+run cp "$SRC/scripts/ccc-memory-benchmark-export.sh" "$CLAUDE_DIR/hooks/ccc-memory-benchmark-export.sh"
 # Session Distiller — PreCompact/SessionEnd trans → Haiku (OAuth) → Honcho push + wiki-candidates queue.
 # See pages/team/dungae/DECISIONS.md [TM-1058] for design rationale.
-run "cp '$SRC/claude/hooks/distill.sh'        '$CLAUDE_DIR/hooks/distill.sh'"
-run "mkdir -p '$CLAUDE_DIR/hooks/distill'"
-run "cp '$SRC/claude/hooks/distill/extract.sh'     '$CLAUDE_DIR/hooks/distill/extract.sh'"
-run "cp '$SRC/claude/hooks/distill/honcho-push.sh' '$CLAUDE_DIR/hooks/distill/honcho-push.sh'"
-run "cp '$SRC/claude/hooks/distill/wiki-queue.sh'  '$CLAUDE_DIR/hooks/distill/wiki-queue.sh'"
-run "cp '$SRC/claude/hooks/distill/queue-drain.sh' '$CLAUDE_DIR/hooks/distill/queue-drain.sh'"
-run "cp '$SRC/claude/hooks/distill/local-facts.sh' '$CLAUDE_DIR/hooks/distill/local-facts.sh'"
-run "cp '$SRC/claude/hooks/distill/resume-write.sh' '$CLAUDE_DIR/hooks/distill/resume-write.sh'"
+run cp "$SRC/claude/hooks/distill.sh" "$CLAUDE_DIR/hooks/distill.sh"
+run mkdir -p "$CLAUDE_DIR/hooks/distill"
+run cp "$SRC/claude/hooks/distill/extract.sh" "$CLAUDE_DIR/hooks/distill/extract.sh"
+run cp "$SRC/claude/hooks/distill/honcho-push.sh" "$CLAUDE_DIR/hooks/distill/honcho-push.sh"
+run cp "$SRC/claude/hooks/distill/wiki-queue.sh" "$CLAUDE_DIR/hooks/distill/wiki-queue.sh"
+run cp "$SRC/claude/hooks/distill/queue-drain.sh" "$CLAUDE_DIR/hooks/distill/queue-drain.sh"
+run cp "$SRC/claude/hooks/distill/local-facts.sh" "$CLAUDE_DIR/hooks/distill/local-facts.sh"
+run cp "$SRC/claude/hooks/distill/resume-write.sh" "$CLAUDE_DIR/hooks/distill/resume-write.sh"
 # Skill Review — Hermes-style background skill draft staging (human-approved).
-run "cp '$SRC/claude/hooks/skill-review.sh' '$CLAUDE_DIR/hooks/skill-review.sh'"
-run "mkdir -p '$CLAUDE_DIR/hooks/skill-review'"
-run "cp '$SRC/claude/hooks/skill-review/extract.sh' '$CLAUDE_DIR/hooks/skill-review/extract.sh'"
+run cp "$SRC/claude/hooks/skill-review.sh" "$CLAUDE_DIR/hooks/skill-review.sh"
+run mkdir -p "$CLAUDE_DIR/hooks/skill-review"
+run cp "$SRC/claude/hooks/skill-review/extract.sh" "$CLAUDE_DIR/hooks/skill-review/extract.sh"
 # Skill autosave sweep — covers bridge/SDK sessions that never fire SessionEnd
 # hooks; scheduled separately via scripts/install-skill-autosave-cron.sh.
-run "cp '$SRC/scripts/ccc-skill-autosave.sh' '$CLAUDE_DIR/hooks/ccc-skill-autosave.sh'"
+run cp "$SRC/scripts/ccc-skill-autosave.sh" "$CLAUDE_DIR/hooks/ccc-skill-autosave.sh"
 # Self-update — the pre-approved node maintenance procedure (pull + setup +
 # restart of operator-allowlisted services only; see docs/self-update.md).
-run "cp '$SRC/scripts/ccc-self-update.sh' '$CLAUDE_DIR/hooks/ccc-self-update.sh'"
-run "chmod +x '$CLAUDE_DIR/hooks/'*.sh '$CLAUDE_DIR/hooks/distill/'*.sh '$CLAUDE_DIR/hooks/skill-review/'*.sh"
+run cp "$SRC/scripts/ccc-self-update.sh" "$CLAUDE_DIR/hooks/ccc-self-update.sh"
+installed_hook_scripts=(
+  "$CLAUDE_DIR/hooks/load-memory.sh"
+  "$CLAUDE_DIR/hooks/refresh-memory.sh"
+  "$CLAUDE_DIR/hooks/scan-injection.sh"
+  "$CLAUDE_DIR/hooks/load-tools.sh"
+  "$CLAUDE_DIR/hooks/checkpoint.sh"
+  "$CLAUDE_DIR/hooks/guard.sh"
+  "$CLAUDE_DIR/hooks/audit.sh"
+  "$CLAUDE_DIR/hooks/redact.sh"
+  "$CLAUDE_DIR/hooks/notify.sh"
+  "$CLAUDE_DIR/hooks/evidence-gate.sh"
+  "$CLAUDE_DIR/hooks/statusline.sh"
+  "$CLAUDE_DIR/hooks/ccc-memory-index.sh"
+  "$CLAUDE_DIR/hooks/ccc-memory-search.sh"
+  "$CLAUDE_DIR/hooks/ccc-memory-consolidate.sh"
+  "$CLAUDE_DIR/hooks/ccc-memory-query.sh"
+  "$CLAUDE_DIR/hooks/ccc-memory-check.sh"
+  "$CLAUDE_DIR/hooks/ccc-memory-explain.sh"
+  "$CLAUDE_DIR/hooks/ccc-wiki-triage.sh"
+  "$CLAUDE_DIR/hooks/ccc-memory-eval.sh"
+  "$CLAUDE_DIR/hooks/ccc-memory-benchmark-export.sh"
+  "$CLAUDE_DIR/hooks/distill.sh"
+  "$CLAUDE_DIR/hooks/distill/extract.sh"
+  "$CLAUDE_DIR/hooks/distill/honcho-push.sh"
+  "$CLAUDE_DIR/hooks/distill/wiki-queue.sh"
+  "$CLAUDE_DIR/hooks/distill/queue-drain.sh"
+  "$CLAUDE_DIR/hooks/distill/local-facts.sh"
+  "$CLAUDE_DIR/hooks/distill/resume-write.sh"
+  "$CLAUDE_DIR/hooks/skill-review.sh"
+  "$CLAUDE_DIR/hooks/skill-review/extract.sh"
+  "$CLAUDE_DIR/hooks/ccc-skill-autosave.sh"
+  "$CLAUDE_DIR/hooks/ccc-self-update.sh"
+)
+run chmod +x "${installed_hook_scripts[@]}"
 # Tier 3: status line (node·model·git·context·cost·A2A) wired via settings.json statusLine.
 # Output style (한국어 구조화 보고) — node-agnostic; settings.json activates it as outputStyle.
-run "mkdir -p '$CLAUDE_DIR/output-styles'"
-run "cp '$SRC/claude/output-styles/'*.md '$CLAUDE_DIR/output-styles/'"
+run mkdir -p "$CLAUDE_DIR/output-styles"
+run cp "$SRC/claude/output-styles/"*.md "$CLAUDE_DIR/output-styles/"
 # Headless runner for cron/A2A/CI (`claude -p` wrapper, guard still applies).
-run "cp '$SRC/claude/headless.sh'             '$CLAUDE_DIR/headless.sh'"
-run "chmod +x '$CLAUDE_DIR/headless.sh'"
+run cp "$SRC/claude/headless.sh" "$CLAUDE_DIR/headless.sh"
+run chmod +x "$CLAUDE_DIR/headless.sh"
 # Working-state checkpoint dir (PreCompact snapshot / PostCompact re-inject)
-run "mkdir -p '$CLAUDE_DIR/state/checkpoints'"
+run mkdir -p "$CLAUDE_DIR/state/checkpoints"
 # A2A worker sub-agent roster (explorer/implementer/verifier) — node-agnostic role defs
-run "mkdir -p '$CLAUDE_DIR/agents'"
-run "cp '$SRC/claude/agents/'*.md '$CLAUDE_DIR/agents/'"
+run mkdir -p "$CLAUDE_DIR/agents"
+run cp "$SRC/claude/agents/"*.md "$CLAUDE_DIR/agents/"
 # Slash commands (quick prompt templates: /node-status, /a2a-claim, /wiki-log) — node-agnostic
-run "mkdir -p '$CLAUDE_DIR/commands'"
-run "cp '$SRC/claude/commands/'*.md '$CLAUDE_DIR/commands/'"
+run mkdir -p "$CLAUDE_DIR/commands"
+run cp "$SRC/claude/commands/"*.md "$CLAUDE_DIR/commands/"
 # Custom skills (reusable procedures: wiki-record, mcp-add, skill-suggest, ...) — node-agnostic
-run "mkdir -p '$CLAUDE_DIR/skills'"
-run "cp -r '$SRC/claude/skills/.' '$CLAUDE_DIR/skills/'"
-run "chmod +x '$CLAUDE_DIR/skills/'*/*.sh 2>/dev/null || true"
+run mkdir -p "$CLAUDE_DIR/skills"
+run cp -r "$SRC/claude/skills/." "$CLAUDE_DIR/skills/"
+skill_sources=("$SRC"/claude/skills/*/*.sh)
+skill_targets=()
+for skill_source in "${skill_sources[@]}"; do
+  [ -e "$skill_source" ] || continue
+  skill_targets+=("$CLAUDE_DIR/skills/${skill_source#"$SRC/claude/skills/"}")
+done
+if [ "${#skill_targets[@]}" -gt 0 ]; then run chmod +x "${skill_targets[@]}"; fi
 
 # 2) Per-node files — only seed templates if a real one is NOT already present.
 SEEDED=()  # files freshly created from a template this run (safe to placeholder-substitute)
 seed() { # seed <template> <dest>
   if [ -e "$2" ]; then note "kept existing $2 (not overwritten)";
-  else run "cp '$1' '$2'"; SEEDED+=("$2"); note "seeded template -> $2 (EDIT ME)"; fi
+  else run cp "$1" "$2"; SEEDED+=("$2"); note "seeded template -> $2 (EDIT ME)"; fi
 }
-run "mkdir -p '$MEM_DIR'"
-run "mkdir -p '$HERMES_ROOT'"
+run mkdir -p "$MEM_DIR"
+run mkdir -p "$HERMES_ROOT"
 seed "$SRC/claude/CLAUDE.md.template"             "$CLAUDE_DIR/CLAUDE.md"
 seed "$SRC/claude/hooks/tools-cheatsheet.md"      "$CLAUDE_DIR/hooks/tools-cheatsheet.md"
 # Node-owned memory (Hermes-independent): seed into ~/.claude/memories.
@@ -220,7 +349,21 @@ seed "$SRC/hermes/honcho.template.json"           "$HERMES_ROOT/honcho.json"
 # No-op on standard root-HOME nodes where CLAUDE_DIR == /root/.claude.
 if [ "$CLAUDE_DIR" != "/root/.claude" ]; then
   note "rewrite /root/.claude -> $CLAUDE_DIR in installed harness files"
-  run "grep -rlZ '/root/.claude' '$CLAUDE_DIR' 2>/dev/null | xargs -0 -r sed -i 's#/root/.claude#$CLAUDE_DIR#g' || true"
+  if [ "$DRY" = 1 ]; then
+    render_command rewrite-root-paths "/root/.claude" "$CLAUDE_DIR"
+  else
+    while IFS= read -r -d '' rewrite_file; do
+      python3 - "$rewrite_file" "$CLAUDE_DIR" <<'PY'
+import sys
+
+path, replacement = sys.argv[1:]
+with open(path, encoding="utf-8") as fh:
+    content = fh.read()
+with open(path, "w", encoding="utf-8") as fh:
+    fh.write(content.replace("/root/.claude", replacement))
+PY
+    done < <(grep -rlZ '/root/.claude' "$CLAUDE_DIR" 2>/dev/null || true)
+  fi
 fi
 
 # 3) Node-identity substitution — fill <PLACEHOLDER> tokens in the files we just seeded.
@@ -335,3 +478,5 @@ printf '  - honcho.json=%s/honcho.json\n' "$HERMES_ROOT"
 printf '  - CCC_WIKI_AGENT_BIN=%s\n' "$WIKI_AGENT_BIN"
 printf '  - CCC_BRIDGE_DEFAULT_PATH=%s\n' "$BRIDGE_DEFAULT_PATH"
 printf '  - bridge command=./start.sh --path %s -d\n' "$BRIDGE_DEFAULT_PATH"
+
+SETUP_TXN_ACTIVE=0

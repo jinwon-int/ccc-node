@@ -49,6 +49,12 @@ REPO_FILE="$CLAUDE_DIR/self-update.repo"
 BRANCH="${CCC_SELF_UPDATE_BRANCH:-main}"
 SYSTEMCTL="${CCC_SELF_UPDATE_SYSTEMCTL:-systemctl}"
 mkdir -p "$STATE_DIR" 2>/dev/null
+INSTALL_SNAPSHOT=""
+KEEP_INSTALL_SNAPSHOT=0
+INSTALLED_PATHS=(
+  settings.json settings.local.json hooks output-styles headless.sh
+  agents commands skills CLAUDE.md memories
+)
 
 ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 log() { printf '%s %s\n' "$(ts)" "$*" >> "$LOG" 2>/dev/null; }
@@ -83,6 +89,38 @@ audit() { # <result> <old> <new> <changed> <setup_ok> <services-json>
     >> "$LOG" 2>/dev/null
 }
 
+snapshot_installed_artifacts() {
+  local existing=() item
+  INSTALL_SNAPSHOT="$STATE_DIR/self-update-install-rollback.$$.tar.gz"
+  for item in "${INSTALLED_PATHS[@]}"; do
+    { [ -e "$CLAUDE_DIR/$item" ] || [ -L "$CLAUDE_DIR/$item" ]; } && existing+=("$item")
+  done
+  if [ "${#existing[@]}" -gt 0 ]; then
+    (umask 077; tar -czf "$INSTALL_SNAPSHOT" -C "$CLAUDE_DIR" "${existing[@]}") || return 1
+  else
+    (umask 077; tar -czf "$INSTALL_SNAPSHOT" --files-from /dev/null) || return 1
+  fi
+  chmod 600 "$INSTALL_SNAPSHOT" || return 1
+  tar -tzf "$INSTALL_SNAPSHOT" >/dev/null || return 1
+}
+
+restore_installed_artifacts() {
+  local item failed=0
+  for item in "${INSTALLED_PATHS[@]}"; do
+    rm -rf -- "$CLAUDE_DIR/$item" || failed=1
+  done
+  mkdir -p "$CLAUDE_DIR" || failed=1
+  tar -xzf "$INSTALL_SNAPSHOT" -C "$CLAUDE_DIR" || failed=1
+  [ "$failed" = 0 ]
+}
+
+cleanup() {
+  if [ "$KEEP_INSTALL_SNAPSHOT" != 1 ] && [ -n "$INSTALL_SNAPSHOT" ]; then
+    rm -f -- "$INSTALL_SNAPSHOT"
+  fi
+  rmdir "$LOCK" 2>/dev/null
+}
+
 MODE="${1:-run}"
 FORCE=0
 [ "${2:-}" = "--force" ] && FORCE=1
@@ -113,7 +151,7 @@ if ! mkdir "$LOCK" 2>/dev/null; then
     exit 3
   fi
 fi
-trap 'rmdir "$LOCK" 2>/dev/null' EXIT
+trap cleanup EXIT
 
 # --- idle gate: never restart the bridge while it is serving a request --------
 # The bridge writes an in-flight workload snapshot to its health.json. Restarting
@@ -223,14 +261,30 @@ fi
 
 # --- redeploy harness ---------------------------------------------------------
 SETUP_OK=true
+if ! snapshot_installed_artifacts; then
+  audit "artifact-snapshot-failed" "$OLD_SHA" "$NEW_SHA" "$CHANGED" false '[]'
+  notify "self-update 실패: 설치본 rollback snapshot 생성 실패. 로그: ~/.claude/state/self-update.log" "snapshot-fail-$NEW_SHA"
+  say "self-update: installed-artifact snapshot failed; aborting before setup" >&2
+  git -C "$REPO" reset --hard "$OLD_SHA" >/dev/null 2>&1
+  exit 6
+fi
 if ! (cd "$REPO" && bash setup.sh >>"$LOG" 2>&1); then
   SETUP_OK=false
   git -C "$REPO" reset --hard "$OLD_SHA" >/dev/null 2>&1
-  audit "setup-failed-rolled-back" "$OLD_SHA" "$NEW_SHA" "$CHANGED" false '[]'
-  notify "self-update 실패: setup.sh 오류 — ${OLD_SHA:0:7}로 롤백했습니다. 로그: ~/.claude/state/self-update.log" "fail-$NEW_SHA"
-  say "self-update: setup.sh failed; rolled back to ${OLD_SHA:0:7}" >&2
-  exit 6
+  if restore_installed_artifacts; then
+    audit "setup-failed-rolled-back" "$OLD_SHA" "$NEW_SHA" "$CHANGED" false '[]'
+    notify "self-update 실패: setup.sh 오류 — repo와 설치본을 ${OLD_SHA:0:7} 상태로 롤백했습니다. 로그: ~/.claude/state/self-update.log" "fail-$NEW_SHA"
+    say "self-update: setup.sh failed; rolled back repo and installed artifacts to ${OLD_SHA:0:7}" >&2
+    exit 6
+  fi
+  audit "setup-failed-rollback-degraded" "$OLD_SHA" "$NEW_SHA" "$CHANGED" false '[]'
+  KEEP_INSTALL_SNAPSHOT=1
+  notify "self-update 중대 실패: setup.sh 오류 뒤 설치본 rollback이 불완전합니다. 로그를 즉시 확인하세요." "rollback-degraded-$NEW_SHA"
+  say "self-update: setup failed and installed-artifact rollback was degraded; recovery snapshot retained at $INSTALL_SNAPSHOT" >&2
+  exit 9
 fi
+rm -f -- "$INSTALL_SNAPSHOT"
+INSTALL_SNAPSHOT=""
 
 # --- restart allowlisted services ----------------------------------------------
 SERVICES_JSON='[]'

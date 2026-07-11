@@ -18,8 +18,9 @@ rather than composing the steps ad hoc.
    (`CCC_SELF_UPDATE_BRANCH`, default `main`)
 3. `git fetch` + `merge --ff-only` (never rewrites local history; diverged →
    abort)
-4. if HEAD changed (or `run --force`): `./setup.sh` redeploys the harness; a
-   setup failure **rolls back to the old SHA** and aborts
+4. if HEAD changed (or `run --force`): snapshot the managed installed
+   artifacts, then let `./setup.sh` redeploy the harness; a setup failure
+   **rolls back both the repository SHA and installed artifacts** and aborts
 5. restarts each service listed in the operator allowlist and verifies it is
    active again
 6. appends a JSONL audit record (`~/.claude/state/self-update.log`) and queues
@@ -91,5 +92,12 @@ the bridge is serving a request:
 | `CCC_SELF_UPDATE_MAX_DEFER_SECONDS` | `3600` | cap total deferral so continuous load can't starve updates |
 
 Exit codes: 0 ok/up-to-date · 3 lock held · 4 precondition failed · 5 fetch/ff
-failed · 6 setup failed (rolled back) · 7 service restart failure · 8 deferred
-(bridge busy — retry next tick).
+failed · 6 setup/snapshot failed (repo and managed artifacts rolled back, or
+setup never started) · 7 service restart failure · 8 deferred (bridge busy —
+retry next tick) · 9 setup failed and installed-artifact rollback was degraded.
+On exit 9, the validated private recovery snapshot is retained with owner-only
+permissions (`0600`) under
+`~/.claude/state/self-update-install-rollback.*.tar.gz` for local operator
+recovery only; do not share or attach it because managed configuration and
+memory files may be present. Normal success and successful rollback remove it
+automatically.
