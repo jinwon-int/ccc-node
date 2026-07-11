@@ -70,39 +70,22 @@ This bot takes a different approach — **lightweight, zero-infrastructure, secu
 ## Quick Start
 
 ```bash
-git clone https://github.com/terranc/claude-telegram-bot-bridge
-cd claude-telegram-bot-bridge
-claude
-```
-
-Then run `/setup`. Claude Code will handle everything: system checks, bot token collection, dependency installation, and configuration.
-
-> **Note:** Commands starting with `/` (like `/setup`) are [Claude Code skills](https://code.claude.com/docs/en/skills). Type them in the `claude` CLI prompt, not in your regular terminal.
-
-Once setup is complete, start the bot:
-
-```bash
-./start.sh --path /path/to/your/project
-```
-
-<details>
-<summary>Alternative: Direct installation script</summary>
-
-If you prefer not to use Claude Code, run the installation script directly:
-
-```bash
-git clone https://github.com/terranc/claude-telegram-bot-bridge
-cd claude-telegram-bot-bridge
+git clone https://github.com/jinwon-int/ccc-node
+cd ccc-node/bridge
 ./setup.sh
 ```
 
-Then start the bot:
+Start the bot after setup:
 
 ```bash
 ./start.sh --path /path/to/your/project
 ```
 
-</details>
+The installed runtime identity comes from the canonical ccc-node checkout, not
+from the historical bridge changelog or upstream releases. Use
+`./start.sh --version` to read it and `./start.sh --upgrade` to invoke the
+reviewed `scripts/ccc-self-update.sh` path. See
+[Version and provenance](../docs/version-and-provenance.md).
 
 ### Common Commands
 
@@ -385,4 +368,4 @@ MIT
 
 ## Star History
 
-[![Star History Chart](https://api.star-history.com/svg?repos=terranc/claude-telegram-bot-bridge&type=Date)](https://star-history.com/#terranc/claude-telegram-bot-bridge&Date)
+[![Star History Chart](https://api.star-history.com/svg?repos=jinwon-int/ccc-node&type=Date)](https://star-history.com/#jinwon-int/ccc-node&Date)

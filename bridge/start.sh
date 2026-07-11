@@ -17,10 +17,6 @@ BLUE='\033[0;34m'
 BOLD='\033[1m'
 NC='\033[0m'
 
-# Version check cache
-CACHE_DIR="$HOME/.telegram-bot-cache"
-CACHE_FILE="$CACHE_DIR/update_check"
-
 get_requirements_hash() {
     "$VENV_DIR/bin/python" - "$REQ_FILE" "$PYPROJECT_FILE" <<'PY'
 import hashlib, pathlib, sys
@@ -101,41 +97,37 @@ sync_dependencies() {
     fi
 }
 
-get_current_version() {
-    grep -E "^## \[[0-9]" "$SCRIPT_DIR/CHANGELOG.md" | head -1 | sed -E 's/^## \[([0-9.]+)\].*/\1/'
+get_checkout_version() {
+    local version_cmd="$REPO_ROOT/scripts/ccc-version.sh"
+    if [ ! -x "$version_cmd" ]; then
+        return 1
+    fi
+    CCC_VERSION_REPO_DIR="$REPO_ROOT" "$version_cmd"
 }
 
-compare_versions() {
-    [ "$1" = "$2" ] && return 1
-    local IFS=.
-    local i ver1=($1) ver2=($2)
-    for ((i=0; i<${#ver1[@]} || i<${#ver2[@]}; i++)); do
-        [ "${ver1[i]:-0}" -gt "${ver2[i]:-0}" ] && return 2
-        [ "${ver1[i]:-0}" -lt "${ver2[i]:-0}" ] && return 0
-    done
-    return 1
+validate_canonical_origin() {
+    local origin
+    origin="$(git -C "$REPO_ROOT" remote get-url origin 2>/dev/null)" || return 1
+    case "$origin" in
+        https://github.com/jinwon-int/ccc-node|\
+        https://github.com/jinwon-int/ccc-node.git|\
+        git@github.com:jinwon-int/ccc-node|\
+        git@github.com:jinwon-int/ccc-node.git|\
+        ssh://git@github.com/jinwon-int/ccc-node|\
+        ssh://git@github.com/jinwon-int/ccc-node.git)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
 }
 
 check_update() {
     local current
-    current="$(get_current_version)"
-
-    mkdir -p "$CACHE_DIR"
-    if [ -f "$CACHE_FILE" ] && [ -n "$(find "$CACHE_FILE" -mmin -60 2>/dev/null)" ]; then
-        echo -e "\033[90m✓ Bridge version: v${current} (up to date)\033[0m"
-        return
-    fi
-
-    local latest
-    latest="$(curl -sL --max-time 3 "https://api.github.com/repos/terranc/claude-telegram-bot-bridge/releases/latest" 2>/dev/null | grep -o '"tag_name": *"v[^"]*"' | sed 's/.*"v\([^"]*\)".*/\1/')"
-    [ -z "$latest" ] && return
-    touch "$CACHE_FILE"
-    if compare_versions "$current" "$latest"; then
-        echo -e "${BLUE}📦 Update available: v${current} → v${latest}${NC}"
-        echo -e "${BLUE}   Run: ./start.sh --upgrade${NC}"
-    else
-        echo -e "\033[90m✓ Bridge version: v${current} (up to date)\033[0m"
-    fi
+    current="$(get_checkout_version 2>/dev/null || echo unknown)"
+    echo -e "\033[90m✓ ccc-node checkout: ${current}\033[0m"
+    echo -e "\033[90m  Updates are managed by: scripts/ccc-self-update.sh\033[0m"
 }
 
 # Basic repository sanity check
@@ -203,6 +195,10 @@ while [ $# -gt 0 ]; do
             ACTION="upgrade"
             shift
             ;;
+        --version)
+            ACTION="version"
+            shift
+            ;;
         --_daemon_supervisor)
             PROCESS_MODE="daemon"
             RUN_AS_DAEMON_SUPERVISOR=1
@@ -227,7 +223,8 @@ Options:
   --debug             Enable debug/verbose logging
   --status            Show whether the bot is running
   --stop              Stop the running bot
-  --upgrade           Update bot to latest version and reinstall dependencies
+  --upgrade           Update through canonical ccc-self-update and reinstall if changed
+  --version           Print the installed ccc-node checkout identity
   --install           Install as macOS launchd startup service
   --uninstall         Remove macOS launchd startup service
   --install-systemd   Install as a Linux systemd startup service (reboot-persistent)
@@ -938,44 +935,44 @@ do_uninstall_systemd() {
     exit 0
 }
 
-do_upgrade() {
-    echo "🔄 Checking for updates..."
-    local current latest
-    current="$(get_current_version)"
-    latest="$(curl -sL --max-time 3 "https://api.github.com/repos/terranc/claude-telegram-bot-bridge/releases/latest" 2>/dev/null | grep -o '"tag_name": *"v[^"]*"' | sed 's/.*"v\([^"]*\)".*/\1/')"
-
-    if [ -z "$latest" ]; then
-        echo "❌ Failed to fetch latest version from GitHub"
+do_version() {
+    local current
+    if ! current="$(get_checkout_version)"; then
+        echo "❌ Unable to derive ccc-node checkout identity" >&2
         exit 1
     fi
-
-    if ! compare_versions "$current" "$latest"; then
-        echo "✅ Already up to date (v${current}), syncing dependencies..."
-        ensure_venv
-        sync_dependencies 1
-        echo "✅ Dependency sync complete"
-        exit 0
-    fi
-
-    echo "📦 Update available: v${current} → v${latest}"
-
-    if [ -n "$(git status --porcelain 2>/dev/null)" ]; then
-        echo "⚠️  Uncommitted changes detected. Commit or stash them first."
-        exit 1
-    fi
-
-    echo "⬇️  Pulling latest code..."
-    if ! git pull; then
-        echo "❌ git pull failed"
-        exit 1
-    fi
-
-    ensure_venv
-    sync_dependencies 1
-
-    current="$(get_current_version)"
-    echo "✅ Upgrade complete! Now running v${current}"
+    echo "ccc-node checkout: $current"
     exit 0
+}
+
+do_upgrade() {
+    local updater="$REPO_ROOT/scripts/ccc-self-update.sh"
+    local current rc
+
+    if [ ! -x "$updater" ]; then
+        echo "❌ Canonical updater is missing or not executable: $updater" >&2
+        exit 1
+    fi
+    if ! validate_canonical_origin; then
+        echo "❌ Refusing update: checkout origin is not canonical jinwon-int/ccc-node" >&2
+        exit 4
+    fi
+
+    echo "🔄 Running canonical ccc-node updater..."
+    if CCC_SELF_UPDATE_REPO="$REPO_ROOT" \
+        CCC_SELF_UPDATE_BRANCH="main" \
+        "$updater" run; then
+        if ! current="$(get_checkout_version)"; then
+            echo "❌ Update completed but installed checkout identity is unavailable" >&2
+            exit 1
+        fi
+        echo "✅ Upgrade complete — installed checkout: $current"
+        exit 0
+    else
+        rc=$?
+        echo "❌ Canonical updater did not complete (exit $rc)" >&2
+        exit "$rc"
+    fi
 }
 
 # ── Token-based global lock (prevents duplicate instances across different project dirs) ──
@@ -1053,6 +1050,7 @@ case "$ACTION" in
     install-systemd)   do_install_systemd ;;
     uninstall-systemd) do_uninstall_systemd ;;
     upgrade)           do_upgrade ;;
+    version)           do_version ;;
     run)       ;; # Continue to startup flow below
 esac
 
