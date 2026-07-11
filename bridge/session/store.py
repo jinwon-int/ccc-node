@@ -151,11 +151,87 @@ def _absolute_path(path: Path) -> Path:
     return Path(os.path.abspath(os.fspath(path)))
 
 
+def _termux_app_roots() -> tuple[Path, ...]:
+    """Return canonical private-data aliases for a validated Termux PREFIX."""
+    prefix = os.environ.get("PREFIX")
+    if not prefix:
+        return ()
+    prefix_path = _absolute_path(Path(prefix))
+    parts = prefix_path.parts
+    if parts == ("/", "data", "data", "com.termux", "files", "usr"):
+        user_id = "0"
+    elif (
+        len(parts) == 7
+        and parts[:2] == ("/", "data")
+        and parts[2] in {"user", "user_de"}
+        and parts[3].isascii()
+        and parts[3].isdecimal()
+        and (parts[3] == "0" or not parts[3].startswith("0"))
+        and parts[4:] == ("com.termux", "files", "usr")
+    ):
+        user_id = parts[3]
+    else:
+        return ()
+
+    try:
+        prefix_metadata = prefix_path.lstat()
+    except OSError:
+        return ()
+    prefix_mode = stat.S_IMODE(prefix_metadata.st_mode)
+    if (
+        stat.S_ISLNK(prefix_metadata.st_mode)
+        or not stat.S_ISDIR(prefix_metadata.st_mode)
+        or prefix_metadata.st_uid != os.getuid()
+        or prefix_mode & 0o022
+    ):
+        return ()
+
+    roots = (
+        Path(f"/data/user/{user_id}/com.termux/files"),
+        Path(f"/data/user_de/{user_id}/com.termux/files"),
+    )
+    if user_id == "0":
+        return (Path("/data/data/com.termux/files"), *roots)
+    return roots
+
+
+def _is_owned_termux_private_ancestor(path: Path, metadata: os.stat_result) -> bool:
+    """Recognize only the current Termux app's exact private files root."""
+    path = _absolute_path(path)
+    mode = stat.S_IMODE(metadata.st_mode)
+    process_uid = os.getuid()
+    process_gid = os.getgid()
+    return (
+        path in _termux_app_roots()
+        and metadata.st_uid == process_uid
+        and metadata.st_gid == process_gid
+        and process_uid == process_gid
+        and not mode & 0o002
+    )
+
+
+def _is_trusted_android_platform_ancestor(
+    path: Path, metadata: os.stat_result
+) -> bool:
+    """Recognize OS-owned ancestors on a validated Termux app-data path."""
+    path = _absolute_path(path)
+    if path == Path("/") or not any(
+        path in root.parents for root in _termux_app_roots()
+    ):
+        return False
+    mode = stat.S_IMODE(metadata.st_mode)
+    process_groups = {os.getgid(), *os.getgroups()}
+    return (
+        metadata.st_uid in {0, 1000}
+        and metadata.st_gid not in process_groups
+        and not mode & 0o002
+    )
+
+
 def _validate_existing_directory_components(path: Path) -> None:
-    """Reject symlink components and externally replaceable ancestors."""
+    """Reject symlink components and ancestors writable by process peers."""
     path = _absolute_path(path)
     current = Path(path.anchor)
-    sticky_bit = getattr(stat, "S_ISVTX", 0o1000)
     for component in path.parts[1:]:
         current /= component
         try:
@@ -173,7 +249,16 @@ def _validate_existing_directory_components(path: Path) -> None:
         if current == path:
             continue
         mode = stat.S_IMODE(metadata.st_mode)
-        if mode & 0o022 and not mode & sticky_bit:
+        sticky_bit = getattr(stat, "S_ISVTX", 0o1000)
+        trusted_sticky = bool(
+            mode & sticky_bit and metadata.st_uid in {0, os.getuid()}
+        )
+        if (
+            mode & 0o022
+            and not trusted_sticky
+            and not _is_owned_termux_private_ancestor(current, metadata)
+            and not _is_trusted_android_platform_ancestor(current, metadata)
+        ):
             raise PermissionError(
                 f"session store path has an unsafe writable ancestor: "
                 f"{current} ({mode:04o})"

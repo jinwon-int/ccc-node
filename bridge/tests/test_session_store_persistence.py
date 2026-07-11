@@ -22,6 +22,7 @@ from telegram_bot.session.store import (  # noqa: E402
     SessionStore,
     SessionStoreCorruptionError,
     SessionStoreValidationError,
+    _validate_existing_directory_components,
 )
 
 
@@ -165,6 +166,349 @@ def test_group_writable_nonsticky_ancestor_fails_closed(tmp_path):
 
     with pytest.raises(PermissionError, match="unsafe writable ancestor"):
         SessionStore(safe_parent / "sessions.json")
+
+
+def _fake_foreign_owned_sticky_metadata(path: Path):
+    sticky_ancestor = Path("/foreign-sticky")
+    if path == sticky_ancestor:
+        mode, user_id, group_id = 0o1777, 4000, 4000
+    else:
+        mode, user_id, group_id = 0o700, 2000, 2000
+    return types.SimpleNamespace(
+        st_mode=stat.S_IFDIR | mode,
+        st_gid=group_id,
+        st_uid=user_id,
+    )
+
+
+def test_foreign_owned_sticky_writable_ancestor_fails_closed():
+    target = Path("/foreign-sticky/private-state")
+
+    with (
+        patch.object(
+            Path,
+            "lstat",
+            autospec=True,
+            side_effect=_fake_foreign_owned_sticky_metadata,
+        ),
+        patch.object(os, "getuid", return_value=2000),
+        patch.object(os, "getgid", return_value=2000),
+        patch.object(os, "getgroups", return_value=[2000]),
+        patch.dict(os.environ, {}, clear=True),
+        pytest.raises(PermissionError, match="unsafe writable ancestor"),
+    ):
+        _validate_existing_directory_components(target)
+
+
+def _fake_directory_metadata(path: Path, *, group_id: int, user_id: int = 0):
+    mode = 0o771 if path in {Path("/data"), Path("/data/data")} else 0o700
+    return types.SimpleNamespace(
+        st_mode=stat.S_IFDIR | mode,
+        st_gid=group_id,
+        st_uid=user_id,
+    )
+
+
+def test_android_platform_ancestor_is_allowed_when_process_is_not_in_its_group():
+    target = Path("/data/data/com.termux/files/home/.telegram_bot")
+
+    with (
+        patch.object(
+            Path,
+            "lstat",
+            autospec=True,
+            side_effect=lambda path: _fake_directory_metadata(
+                path,
+                group_id=1000,
+                user_id=(
+                    2000
+                    if path == Path("/data/data/com.termux/files/usr")
+                    else 0
+                ),
+            ),
+        ),
+        patch.object(os, "getuid", return_value=2000),
+        patch.object(os, "getgid", return_value=2000),
+        patch.object(os, "getgroups", return_value=[2000, 3003]),
+        patch.dict(
+            os.environ,
+            {"PREFIX": "/data/data/com.termux/files/usr"},
+            clear=False,
+        ),
+    ):
+        _validate_existing_directory_components(target)
+
+
+def _fake_foreign_group_metadata(path: Path):
+    mode = 0o771 if path == Path("/srv/shared") else 0o700
+    return types.SimpleNamespace(
+        st_mode=stat.S_IFDIR | mode,
+        st_gid=4000 if path == Path("/srv/shared") else 2000,
+        st_uid=0 if path == Path("/srv/shared") else 2000,
+    )
+
+
+def test_generic_foreign_group_writable_ancestor_fails_closed():
+    target = Path("/srv/shared/private-state")
+
+    with (
+        patch.object(
+            Path,
+            "lstat",
+            autospec=True,
+            side_effect=_fake_foreign_group_metadata,
+        ),
+        patch.object(os, "getuid", return_value=2000),
+        patch.object(os, "getgid", return_value=2000),
+        patch.object(os, "getgroups", return_value=[2000, 3003]),
+        patch.dict(os.environ, {}, clear=True),
+        pytest.raises(PermissionError, match="unsafe writable ancestor"),
+    ):
+        _validate_existing_directory_components(target)
+
+
+def _fake_termux_directory_metadata(path: Path):
+    app_root = Path("/data/data/com.termux/files")
+    if path == app_root:
+        mode, user_id, group_id = 0o771, 2000, 2000
+    elif app_root in path.parents:
+        mode, user_id, group_id = 0o700, 2000, 2000
+    else:
+        mode, user_id, group_id = 0o771, 0, 1000
+    return types.SimpleNamespace(
+        st_mode=stat.S_IFDIR | mode,
+        st_gid=group_id,
+        st_uid=user_id,
+    )
+
+
+def test_termux_app_private_root_is_allowed_when_owned_by_the_process():
+    target = Path("/data/data/com.termux/files/home/.telegram_bot")
+
+    with (
+        patch.object(
+            Path,
+            "lstat",
+            autospec=True,
+            side_effect=_fake_termux_directory_metadata,
+        ),
+        patch.object(os, "getuid", return_value=2000),
+        patch.object(os, "getgid", return_value=2000),
+        patch.object(os, "getgroups", return_value=[2000, 3003]),
+        patch.dict(
+            os.environ,
+            {"PREFIX": "/data/data/com.termux/files/usr"},
+            clear=False,
+        ),
+    ):
+        _validate_existing_directory_components(target)
+
+
+def _fake_termux_foreign_group_descendant(path: Path):
+    prefix = Path("/data/data/com.termux/files/usr")
+    app_root = Path("/data/data/com.termux/files")
+    foreign_descendant = app_root / "home"
+    if path == prefix:
+        mode, user_id, group_id = 0o700, 2000, 2000
+    elif path == app_root:
+        mode, user_id, group_id = 0o771, 2000, 2000
+    elif path == foreign_descendant:
+        mode, user_id, group_id = 0o770, 2000, 4000
+    elif app_root in path.parents:
+        mode, user_id, group_id = 0o700, 2000, 2000
+    else:
+        mode, user_id, group_id = 0o771, 0, 1000
+    return types.SimpleNamespace(
+        st_mode=stat.S_IFDIR | mode,
+        st_gid=group_id,
+        st_uid=user_id,
+    )
+
+
+def test_termux_foreign_group_writable_descendant_fails_closed():
+    target = Path("/data/data/com.termux/files/home/.telegram_bot")
+
+    with (
+        patch.object(
+            Path,
+            "lstat",
+            autospec=True,
+            side_effect=_fake_termux_foreign_group_descendant,
+        ),
+        patch.object(os, "getuid", return_value=2000),
+        patch.object(os, "getgid", return_value=2000),
+        patch.object(os, "getgroups", return_value=[2000, 3003]),
+        patch.dict(
+            os.environ,
+            {"PREFIX": "/data/data/com.termux/files/usr"},
+            clear=False,
+        ),
+        pytest.raises(PermissionError, match="unsafe writable ancestor"),
+    ):
+        _validate_existing_directory_components(target)
+
+
+def _fake_missing_termux_prefix(path: Path):
+    if path == Path("/data/data/com.termux/files/usr"):
+        raise FileNotFoundError(path)
+    return _fake_termux_directory_metadata(path)
+
+
+def test_canonical_termux_prefix_must_exist_and_be_owned():
+    target = Path("/data/data/com.termux/files/home/.telegram_bot")
+
+    with (
+        patch.object(
+            Path,
+            "lstat",
+            autospec=True,
+            side_effect=_fake_missing_termux_prefix,
+        ),
+        patch.object(os, "getuid", return_value=2000),
+        patch.object(os, "getgid", return_value=2000),
+        patch.object(os, "getgroups", return_value=[2000, 3003]),
+        patch.dict(
+            os.environ,
+            {"PREFIX": "/data/data/com.termux/files/usr"},
+            clear=False,
+        ),
+        pytest.raises(PermissionError, match="unsafe writable ancestor"),
+    ):
+        _validate_existing_directory_components(target)
+
+
+def _fake_termux_alias_metadata(path: Path):
+    app_root = Path("/data/user/0/com.termux/files")
+    if path == Path("/data/data/com.termux/files/usr"):
+        mode, user_id, group_id = 0o700, 2000, 2000
+    elif path == app_root:
+        mode, user_id, group_id = 0o771, 2000, 2000
+    elif app_root in path.parents or path == app_root.parent:
+        mode, user_id, group_id = 0o700, 2000, 2000
+    else:
+        mode, user_id, group_id = 0o771, 0, 1000
+    return types.SimpleNamespace(
+        st_mode=stat.S_IFDIR | mode,
+        st_gid=group_id,
+        st_uid=user_id,
+    )
+
+
+def test_legacy_prefix_allows_android_user_zero_alias():
+    target = Path("/data/user/0/com.termux/files/home/.telegram_bot")
+
+    with (
+        patch.object(
+            Path,
+            "lstat",
+            autospec=True,
+            side_effect=_fake_termux_alias_metadata,
+        ),
+        patch.object(os, "getuid", return_value=2000),
+        patch.object(os, "getgid", return_value=2000),
+        patch.object(os, "getgroups", return_value=[2000, 3003]),
+        patch.dict(
+            os.environ,
+            {"PREFIX": "/data/data/com.termux/files/usr"},
+            clear=False,
+        ),
+    ):
+        _validate_existing_directory_components(target)
+
+
+def _fake_unicode_termux_metadata(path: Path):
+    app_root = Path("/data/user/١٠/com.termux/files")
+    prefix = app_root / "usr"
+    if path == prefix:
+        mode, user_id, group_id = 0o700, 2000, 2000
+    elif path == app_root:
+        mode, user_id, group_id = 0o771, 2000, 2000
+    elif app_root in path.parents or path == app_root.parent:
+        mode, user_id, group_id = 0o700, 2000, 2000
+    else:
+        mode, user_id, group_id = 0o771, 0, 1000
+    return types.SimpleNamespace(
+        st_mode=stat.S_IFDIR | mode,
+        st_gid=group_id,
+        st_uid=user_id,
+    )
+
+
+def test_non_ascii_android_user_id_fails_closed():
+    prefix = "/data/user/١٠/com.termux/files/usr"
+    target = Path("/data/user/١٠/com.termux/files/home/.telegram_bot")
+
+    with (
+        patch.object(
+            Path,
+            "lstat",
+            autospec=True,
+            side_effect=_fake_unicode_termux_metadata,
+        ),
+        patch.object(os, "getuid", return_value=2000),
+        patch.object(os, "getgid", return_value=2000),
+        patch.object(os, "getgroups", return_value=[2000, 3003]),
+        patch.dict(os.environ, {"PREFIX": prefix}, clear=False),
+        pytest.raises(PermissionError, match="unsafe writable ancestor"),
+    ):
+        _validate_existing_directory_components(target)
+
+
+def _fake_spoofed_termux_metadata(path: Path):
+    app_root = Path("/tmp/com.termux/files")
+    if path == Path("/tmp"):
+        mode, user_id, group_id = 0o1777, 0, 0
+    elif path == app_root:
+        mode, user_id, group_id = 0o771, 2000, 2000
+    elif app_root in path.parents:
+        mode, user_id, group_id = 0o700, 2000, 2000
+    else:
+        mode, user_id, group_id = 0o755, 0, 0
+    return types.SimpleNamespace(
+        st_mode=stat.S_IFDIR | mode,
+        st_gid=group_id,
+        st_uid=user_id,
+    )
+
+
+def test_spoofed_termux_prefix_outside_android_data_root_fails_closed():
+    target = Path("/tmp/com.termux/files/home/.telegram_bot")
+
+    with (
+        patch.object(
+            Path,
+            "lstat",
+            autospec=True,
+            side_effect=_fake_spoofed_termux_metadata,
+        ),
+        patch.object(os, "getuid", return_value=2000),
+        patch.object(os, "getgid", return_value=2000),
+        patch.object(os, "getgroups", return_value=[2000, 3003]),
+        patch.dict(
+            os.environ,
+            {"PREFIX": "/tmp/com.termux/files/usr"},
+            clear=False,
+        ),
+        pytest.raises(PermissionError, match="unsafe writable ancestor"),
+    ):
+        _validate_existing_directory_components(target)
+
+
+def test_group_writable_ancestor_still_fails_when_process_is_in_its_group():
+    target = Path("/data/data/com.termux/files/home/.telegram_bot")
+
+    with (
+        patch.object(
+            Path,
+            "lstat",
+            autospec=True,
+            side_effect=lambda path: _fake_directory_metadata(path, group_id=1000),
+        ),
+        patch.object(os, "getgid", return_value=1000),
+        patch.object(os, "getgroups", return_value=[1000, 3003]),
+        pytest.raises(PermissionError, match="unsafe writable ancestor"),
+    ):
+        _validate_existing_directory_components(target)
 
 
 def test_missing_directory_components_are_created_private(tmp_path):
