@@ -16,6 +16,12 @@ All notable changes to the Claude Code node harness. Dates are KST.
   tagged (`v0.4.0`) or historical (`0.3.18`) headings when extracting notes.
 
 ### Fixed
+- CodeQL/required-check drift (#350): Dependabot now groups the complete
+  `github/codeql-action/*` family, CodeQL publishes the stable
+  `codeql-python` context, and `.github/required-checks.json` plus regression
+  tests bind all six desired `main` checks to explicit workflow job names.
+  The CI governance runbook distinguishes runner infrastructure failures from
+  source failures and documents the narrow post-merge protection update.
 - Canonical provenance/update drift (#351): bridge install docs now clone
   `jinwon-int/ccc-node`; `bridge/start.sh --version` uses
   `scripts/ccc-version.sh`, and `--upgrade` validates the canonical origin,

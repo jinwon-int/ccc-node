@@ -4,6 +4,11 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    # Keep init/analyze on one commit so CodeQL never runs mixed action SHAs.
+    groups:
+      codeql-action-family:
+        patterns:
+          - github/codeql-action/*
   - package-ecosystem: pip
     directory: /bridge
     schedule:
