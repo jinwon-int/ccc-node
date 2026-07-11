@@ -1,7 +1,10 @@
 import importlib
 import os
+import shutil
+import subprocess
 import sys
 import unittest
+from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
@@ -27,6 +30,96 @@ class VoiceProviderConfigTests(unittest.TestCase):
             module = self._load_config_module(td)
             cfg = module.Config(telegram_bot_token="123456:abc", _env_file=None)
             self.assertEqual(cfg.transcription_provider, "whisper")
+
+    def test_execution_profile_defaults_to_strict_project(self):
+        with TemporaryDirectory() as td:
+            module = self._load_config_module(td)
+            cfg = module.Config(telegram_bot_token="123456:abc", _env_file=None)
+            self.assertEqual(cfg.execution_profile, "strict-project")
+
+    def test_execution_profile_reads_explicit_env(self):
+        with TemporaryDirectory() as td:
+            module = self._load_config_module(td)
+            with patch.dict(
+                os.environ,
+                {"CCC_BRIDGE_EXECUTION_PROFILE": "owner-operator"},
+                clear=False,
+            ):
+                cfg = module.Config(telegram_bot_token="123456:abc", _env_file=None)
+            self.assertEqual(cfg.execution_profile, "owner-operator")
+
+    def test_execution_profile_precedence_in_fresh_processes(self):
+        source_config = Path(__file__).resolve().parents[1] / "utils" / "config.py"
+        with TemporaryDirectory() as td:
+            root = Path(td)
+            package_root = root / "package"
+            package = package_root / "telegram_bot"
+            utils = package / "utils"
+            utils.mkdir(parents=True)
+            (package / "__init__.py").write_text("", encoding="utf-8")
+            (utils / "__init__.py").write_text("", encoding="utf-8")
+            shutil.copy2(source_config, utils / "config.py")
+
+            project_root = root / "project"
+            project_env = project_root / ".telegram_bot" / ".env"
+            project_env.parent.mkdir(parents=True)
+            package_env = package / ".env"
+
+            def fresh_profile(
+                *,
+                process_value=None,
+                project_value=None,
+                package_value=None,
+            ):
+                project_lines = ["TELEGRAM_BOT_TOKEN=123456:test"]
+                if project_value is not None:
+                    project_lines.append(f"CCC_BRIDGE_EXECUTION_PROFILE={project_value}")
+                project_env.write_text("\n".join(project_lines) + "\n", encoding="utf-8")
+                package_lines = []
+                if package_value is not None:
+                    package_lines.append(f"CCC_BRIDGE_EXECUTION_PROFILE={package_value}")
+                package_env.write_text("\n".join(package_lines) + "\n", encoding="utf-8")
+
+                env = {
+                    "HOME": str(root / "home"),
+                    "PATH": os.environ.get("PATH", ""),
+                    "PROJECT_ROOT": str(project_root),
+                    "PYTHONPATH": str(package_root),
+                }
+                if process_value is not None:
+                    env["CCC_BRIDGE_EXECUTION_PROFILE"] = process_value
+                result = subprocess.run(
+                    [
+                        sys.executable,
+                        "-c",
+                        "from telegram_bot.utils.config import config; "
+                        "print(config.execution_profile)",
+                    ],
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                    check=True,
+                )
+                return result.stdout.strip()
+
+            self.assertEqual(
+                fresh_profile(
+                    process_value="disabled",
+                    project_value="strict-project",
+                    package_value="owner-operator",
+                ),
+                "disabled",
+            )
+            self.assertEqual(
+                fresh_profile(project_value="strict-project", package_value="owner-operator"),
+                "strict-project",
+            )
+            self.assertEqual(
+                fresh_profile(package_value="owner-operator"),
+                "owner-operator",
+            )
+            self.assertEqual(fresh_profile(), "strict-project")
 
     def test_invalid_provider_is_rejected(self):
         with TemporaryDirectory() as td:
