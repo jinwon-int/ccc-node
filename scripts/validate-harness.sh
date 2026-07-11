@@ -198,8 +198,11 @@ done
 say "== referenced hooks installed by setup.sh =="
 for r in "${REFS[@]}"; do
   hook="$(basename "$r")"
-  if grep -q "hooks/$hook'" setup.sh 2>/dev/null; then say "  ok setup.sh installs $hook"
-  else err "setup.sh does not install referenced hook: $hook"; fi
+  if grep -Fq "run cp \"\$SRC/claude/hooks/$hook\"" setup.sh 2>/dev/null; then
+    say "  ok setup.sh installs $hook"
+  else
+    err "setup.sh does not install referenced hook: $hook"
+  fi
 done
 
 # 6b) Single-owner invariant: base (node-local) and overlay (portable) must NOT share any
