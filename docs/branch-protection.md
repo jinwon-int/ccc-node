@@ -1,8 +1,10 @@
 # Branch protection and CODEOWNERS policy
 
-`main` is protected by GitHub branch protection. This repository intentionally
-keeps the source-controlled ownership file separate from live branch-protection
-settings so protection changes stay auditable and reversible.
+`main` is protected by both legacy GitHub branch protection and a repository
+ruleset. This repository intentionally keeps source-controlled ownership and CI
+desired-state files separate from live protection settings so changes stay
+auditable and reversible. Required-check identity, dual-layer protection, and
+infra-failure handling are defined in [`ci-governance.md`](ci-governance.md).
 
 ## Current code-owner model
 

@@ -1,0 +1,44 @@
+{
+  "branch": "main",
+  "strict": true,
+  "protection_api": "legacy-branch-protection",
+  "app_id": 15368,
+  "checks": [
+    {
+      "context": "validate-harness",
+      "workflow": "ci.yml",
+      "job_id": "validate-harness",
+      "job_name": "validate-harness"
+    },
+    {
+      "context": "python-lint",
+      "workflow": "ci.yml",
+      "job_id": "python-lint",
+      "job_name": "python-lint"
+    },
+    {
+      "context": "secret-scan",
+      "workflow": "ci.yml",
+      "job_id": "secret-scan",
+      "job_name": "secret-scan"
+    },
+    {
+      "context": "bridge-tests (3.11)",
+      "workflow": "ci.yml",
+      "job_id": "bridge-tests",
+      "job_name": "bridge-tests (${{ matrix.python-version }})"
+    },
+    {
+      "context": "bridge-tests (3.12)",
+      "workflow": "ci.yml",
+      "job_id": "bridge-tests",
+      "job_name": "bridge-tests (${{ matrix.python-version }})"
+    },
+    {
+      "context": "codeql-python",
+      "workflow": "codeql.yml",
+      "job_id": "analyze",
+      "job_name": "codeql-python"
+    }
+  ]
+}

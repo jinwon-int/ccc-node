@@ -16,12 +16,9 @@ jobs:
     permissions:
       contents: read
       security-events: write
-    name: Analyze Python
+    # Keep this exact name aligned with .github/required-checks.json.
+    name: codeql-python
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        language: ['python']
     steps:
       - name: Checkout repository
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
@@ -29,7 +26,7 @@ jobs:
       - name: Initialize CodeQL
         uses: github/codeql-action/init@99df26d4f13ea111d4ec1a7dddef6063f76b97e9 # v4
         with:
-          languages: ${{ matrix.language }}
+          languages: python
 
       - name: Perform CodeQL Analysis
         uses: github/codeql-action/analyze@99df26d4f13ea111d4ec1a7dddef6063f76b97e9 # v4
