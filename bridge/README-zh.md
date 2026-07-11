@@ -69,39 +69,21 @@ Claude Code 很强大，但它绑定在你的终端里。当你离开电脑 — 
 ## 快速开始
 
 ```bash
-git clone https://github.com/terranc/claude-telegram-bot-bridge
-cd claude-telegram-bot-bridge
-claude
-```
-
-然后运行 `/setup`。Claude Code 会处理一切：系统检查、Bot Token 收集、依赖安装和配置。
-
-> **注意：** 以 `/` 开头的命令（如 `/setup`）是 [Claude Code 技能](https://code.claude.com/docs/en/skills)。请在 `claude` CLI 提示符中输入，而非在普通终端中。
-
-设置完成后，启动 Bot：
-
-```bash
-./start.sh --path /path/to/your/project
-```
-
-<details>
-<summary>备选方案：直接运行安装脚本</summary>
-
-如果你不想使用 Claude Code，可以直接运行安装脚本：
-
-```bash
-git clone https://github.com/terranc/claude-telegram-bot-bridge
-cd claude-telegram-bot-bridge
+git clone https://github.com/jinwon-int/ccc-node
+cd ccc-node/bridge
 ./setup.sh
 ```
 
-然后启动 Bot：
+设置完成后启动 Bot：
 
 ```bash
 ./start.sh --path /path/to/your/project
 ```
 
-</details>
+已安装运行时的身份来自 canonical ccc-node checkout，而不是历史 bridge
+changelog 或 upstream release。使用 `./start.sh --version` 查看，使用
+`./start.sh --upgrade` 调用经过审查的 `scripts/ccc-self-update.sh` 路径。详见
+[版本与来源](../docs/version-and-provenance.md)。
 
 ### 常用命令
 
@@ -373,4 +355,4 @@ MIT
 
 ## Star History
 
-[![Star History Chart](https://api.star-history.com/svg?repos=terranc/claude-telegram-bot-bridge&type=Date)](https://star-history.com/#terranc/claude-telegram-bot-bridge&Date)
+[![Star History Chart](https://api.star-history.com/svg?repos=jinwon-int/ccc-node&type=Date)](https://star-history.com/#jinwon-int/ccc-node&Date)

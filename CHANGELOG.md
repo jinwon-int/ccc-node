@@ -15,6 +15,14 @@ All notable changes to the Claude Code node harness. Dates are KST.
   without a leading `v` are preserved as-is; the release workflow accepts either
   tagged (`v0.4.0`) or historical (`0.3.18`) headings when extracting notes.
 
+### Fixed
+- Canonical provenance/update drift (#351): bridge install docs now clone
+  `jinwon-int/ccc-node`; `bridge/start.sh --version` uses
+  `scripts/ccc-version.sh`, and `--upgrade` validates the canonical origin,
+  pins `main`, and delegates to `scripts/ccc-self-update.sh` while preserving
+  its terminal exit code. Historical bridge/package versions no longer drive
+  runtime update decisions.
+
 Distill observability follow-up — closes #130, #133.
 
 A2A mobile native worker first slice — refs #150.

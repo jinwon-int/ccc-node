@@ -38,7 +38,7 @@ After setup:
 | Agent-cron | Durable local task definitions, due/lock/run primitives, explicit scheduler execution. | [`docs/agent-cron.md`](docs/agent-cron.md) |
 | A2A worker lane | Claude Code A2A poller/analysis-backend wiring, native Termux worker preflight. | [`docs/a2a-claude-worker.md`](docs/a2a-claude-worker.md) |
 | Termux parity | Android/Termux constraints and VPS parity notes. | [`docs/android-termux-claude.md`](docs/android-termux-claude.md), [`docs/termux-vps-parity.md`](docs/termux-vps-parity.md) |
-| Release/version anchor | `scripts/ccc-version.sh` exposes the harness tag/SHA anchor for doctor/fleet reports. | [`CONTRIBUTING.md`](CONTRIBUTING.md) |
+| Release/version anchor | `scripts/ccc-version.sh` exposes the checkout tag/SHA/dirty identity used by doctor and fleet reports; updates use `scripts/ccc-self-update.sh`. | [`docs/version-and-provenance.md`](docs/version-and-provenance.md) |
 
 ## Repository layout
 

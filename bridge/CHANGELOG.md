@@ -37,6 +37,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fail closed. Linux/WSL2 requires `bubblewrap` and `socat`.
 
 ### Fixed
+- **Canonical update provenance (#351).** `bridge/start.sh` no longer compares
+  the vendored bridge changelog with `terranc/claude-telegram-bot-bridge`
+  releases and then pulls whichever checkout happens to be current. `--upgrade`
+  now delegates to the hardened `scripts/ccc-self-update.sh` against the
+  canonical repository and pinned `main` branch, preserving its exit code;
+  `--version`, startup output, doctor, and fleet reports share the
+  `scripts/ccc-version.sh` checkout identity. Canonical clone/update docs and a
+  fixture-based no-network regression test cover the compatibility entry point.
 - **Heartbeat cleanup retry path (#307).** If deleting a stalled `⏳ Working` status
   message fails, the bridge now keeps the message id on the live request so the
   next heartbeat tick retries the cleanup instead of losing the id and leaving a

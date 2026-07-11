@@ -5,6 +5,7 @@
 ## Upstream security tracking
 
 - Treat upstream releases/advisories as signals to review, not as automatic update instructions.
+- Running nodes derive identity from `scripts/ccc-version.sh` and update only through `scripts/ccc-self-update.sh`; upstream tags and `bridge/CHANGELOG.md` never drive that path.
 - For a security-relevant upstream change, open a ccc-node issue or PR that explains whether the patch is ported, already covered, not applicable, or deliberately rejected.
 - Keep ccc-node safety boundaries authoritative: owner allowlists, token redaction, project path scoping, no raw Telegram/provider payloads in logs, and explicit approval for live sends/canaries.
 
