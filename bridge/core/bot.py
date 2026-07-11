@@ -300,6 +300,22 @@ class TelegramBot(BotLifecycleMixin, BotStatusMixin, BotAccessMixin, BotCommandM
             raise RuntimeError("Telegram application is not initialized.")
         return app
 
+    def _own_bot_id(self) -> Optional[int]:
+        """This bot's numeric user id, or None if unavailable.
+
+        Used to detect replies to the bot's own messages. Accessing
+        ``bot.id`` before the bot is initialized raises, so guard broadly and
+        fall back to None. Reply-context trust classification then remains
+        fail-closed instead of treating an arbitrary bot as this bot.
+        """
+        try:
+            app = self.application
+            if app is None:
+                return None
+            return getattr(app.bot, "id", None)
+        except Exception:
+            return None
+
 
 
 
