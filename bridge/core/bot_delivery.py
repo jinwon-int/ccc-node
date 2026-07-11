@@ -23,6 +23,7 @@ from telegram_bot.core import paths as path_scope
 from telegram_bot.core.project_chat import (
     project_chat_handler,
 )
+from telegram_bot.core.bot_shared import build_reply_context_prefix
 from telegram_bot.utils.chat_logger import log_debug
 from telegram_bot.utils.tg_format import wrap_markdown_tables
 from telegram_bot.utils.tg_robust import send_with_retry
@@ -99,8 +100,17 @@ class BotDeliveryMixin:
             log_debug(user_id, "bot", reply)
             return
 
+        # Inject replied-to (quoted) original as context so the agent knows
+        # which prior message the user is referencing. The special branches
+        # above (resume selection, pending-question answer) return early and
+        # deliberately keep the raw text.
+        reply_prefix = build_reply_context_prefix(
+            message, bot_user_id=self._own_bot_id()
+        )
+        task_text = f"{reply_prefix}\n\n{text}" if reply_prefix else text
+
         async def run_task():
-            await self._process_user_message_text(update, user_id, text)
+            await self._process_user_message_text(update, user_id, task_text)
 
         async def on_overflow():
             reply = "⏳ Processing previous messages, please wait or send /stop to terminate."

@@ -15,6 +15,7 @@ from telegram.ext import (
 )
 from telegram_bot.utils.config import config
 from telegram_bot.core import media
+from telegram_bot.core.bot_shared import build_reply_context_prefix
 from telegram_bot.utils.chat_logger import log_debug
 from telegram_bot.utils.transcription import (
     EmptyTranscriptionError,
@@ -464,6 +465,11 @@ class BotVoiceMixin:
                     return
 
                 prompt = self._build_image_prompt(image_path, caption)
+                reply_prefix = build_reply_context_prefix(
+                    message, bot_user_id=self._own_bot_id()
+                )
+                if reply_prefix:
+                    prompt = f"{reply_prefix}\n\n{prompt}"
                 await self._process_user_message_text(
                     update,
                     user_id,
@@ -741,10 +747,14 @@ class BotVoiceMixin:
                     return
 
                 preview = f"🎤 Voice: {text}"
+                reply_prefix = build_reply_context_prefix(
+                    message, bot_user_id=self._own_bot_id()
+                )
+                task_text = f"{reply_prefix}\n\n{text}" if reply_prefix else text
                 await self._process_user_message_text(
                     update,
                     user_id,
-                    text,
+                    task_text,
                     message_source="voice",
                     voice_input_preview=preview,
                 )

@@ -8,6 +8,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Telegram reply-context injection** (`core/bot_shared.build_reply_context_prefix`, #380).
+  When a user *replies* to an earlier message, the bridge previously forwarded
+  only the new text and dropped the quoted original, so the agent couldn't tell
+  which prior message was referenced. Now the replied-to original is prepended as
+  a `[Replying to: "..."]` context line before the user's text, across the text,
+  photo, and voice handlers. Ported from the Hermes Agent pattern (Telegram
+  adapter extraction + gateway injection): prefer Telegram's native partial quote
+  (`message.quote`) so replying to one selected substring of a multi-section
+  message doesn't inject the whole original; fall back to the replied-to
+  text/caption; cap the snippet at 500 chars; and disambiguate replies to the
+  bot's own prior messages (`[Replying to your previous message: "..."]`).
+  Non-reply messages and text-less media replies are unchanged. 14 new unit tests
+  (`test_reply_context.py`).
 - **Persistent task ledger** (`core/task_ledger.py`) — the structural fix for the
   recurring "typing / ⏳ Working stuck after the work is done" class of bugs, ported
   from the Hermes/A2A task-lifecycle model (jinwon-int/a2a-nexus `task-projection.ts`,
