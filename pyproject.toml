@@ -27,10 +27,12 @@ explicit_package_bases = true
 files = [
   "bridge/core/agent_runtime.py",
   "bridge/core/codex_app_server.py",
+  "bridge/core/codex_runtime.py",
   "bridge/core/paths.py",
   "bridge/core/push_notifier.py",
   "bridge/core/task_queue.py",
   "bridge/tests/test_agent_runtime_contract.py",
   "bridge/tests/test_codex_app_server.py",
+  "bridge/tests/test_codex_runtime.py",
   "scripts/agent_cron_lib.py",
 ]

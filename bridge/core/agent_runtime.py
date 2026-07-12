@@ -69,6 +69,45 @@ class ReasoningDeltaEvent:
 
 
 @dataclass(frozen=True, slots=True)
+class ToolStartedEvent:
+    """A provider tool item began execution."""
+
+    tool_call_id: str
+    tool_name: str
+    arguments: Mapping[str, JsonValue]
+    kind: Literal["tool_started"] = "tool_started"
+
+    def __post_init__(self) -> None:
+        if not self.tool_call_id:
+            raise ValueError("tool call id must not be empty")
+        if not self.tool_name:
+            raise ValueError("tool name must not be empty")
+        object.__setattr__(
+            self,
+            "arguments",
+            MappingProxyType({key: freeze_json(value) for key, value in self.arguments.items()}),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ToolCompletedEvent:
+    """A provider tool item finished execution."""
+
+    tool_call_id: str
+    tool_name: str
+    result: JsonValue
+    success: bool
+    kind: Literal["tool_completed"] = "tool_completed"
+
+    def __post_init__(self) -> None:
+        if not self.tool_call_id:
+            raise ValueError("tool call id must not be empty")
+        if not self.tool_name:
+            raise ValueError("tool name must not be empty")
+        object.__setattr__(self, "result", freeze_json(self.result))
+
+
+@dataclass(frozen=True, slots=True)
 class ApprovalRequestEvent:
     """A request that cannot proceed without an explicit approval decision."""
 
@@ -134,6 +173,8 @@ class ErrorEvent:
 AgentEvent: TypeAlias = (
     TextDeltaEvent
     | ReasoningDeltaEvent
+    | ToolStartedEvent
+    | ToolCompletedEvent
     | ApprovalRequestEvent
     | CompletionEvent
     | ResultEvent

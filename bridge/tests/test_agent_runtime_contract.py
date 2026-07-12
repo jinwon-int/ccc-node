@@ -22,6 +22,8 @@ if TYPE_CHECKING:
         ResultEvent,
         SessionRequest,
         TextDeltaEvent,
+        ToolCompletedEvent,
+        ToolStartedEvent,
         deny_approval,
     )
 else:
@@ -40,6 +42,8 @@ else:
         ResultEvent,
         SessionRequest,
         TextDeltaEvent,
+        ToolCompletedEvent,
+        ToolStartedEvent,
         deny_approval,
     )
 
@@ -172,6 +176,22 @@ class AgentRuntimeContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(cast(tuple[Mapping[str, int], ...], frozen_result["items"])[0]["value"], 1)
         with self.assertRaises(TypeError):
             cast(dict[str, object], request.arguments)["path"] = "forbidden"
+
+    async def test_tool_lifecycle_events_are_typed_immutable_snapshots(self) -> None:
+        arguments: dict[str, JsonValue] = {"command": "pwd", "paths": ["."]}
+        output: dict[str, JsonValue] = {"exitCode": 0, "lines": ["/workspace"]}
+
+        started = ToolStartedEvent(tool_call_id="item-1", tool_name="command", arguments=arguments)
+        completed = ToolCompletedEvent(
+            tool_call_id="item-1", tool_name="command", result=output, success=True
+        )
+        cast(list[str], arguments["paths"]).append("changed")
+        cast(list[str], output["lines"]).append("changed")
+
+        self.assertEqual(started.kind, "tool_started")
+        self.assertEqual(started.arguments["paths"], (".",))
+        self.assertEqual(completed.kind, "tool_completed")
+        self.assertEqual(cast(Mapping[str, object], completed.result)["lines"], ("/workspace",))
 
 
 if __name__ == "__main__":
