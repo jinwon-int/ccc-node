@@ -4,7 +4,9 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 DOCTOR="$ROOT/scripts/ccc-doctor.sh"
 pass=0; fail=0
-TMP="$(mktemp -d)"
+# Some hardened runners mount /tmp noexec; the doctor must execute fixture CLIs.
+TMP_BASE="${TMPDIR:-$(dirname "$ROOT")}"; mkdir -p "$TMP_BASE"
+TMP="$(mktemp -d "$TMP_BASE/ccc-doctor-test.XXXXXX")"
 trap 'rm -rf "$TMP"' EXIT
 
 ok() { if eval "$2"; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $1"; fi; }
@@ -54,6 +56,30 @@ run_doctor() { # <fixture-dir> [args...]
   local dir="$1"; shift
   CCC_DOCTOR_REPO_DIR="$dir/repo" CCC_DOCTOR_CLAUDE_DIR="$dir/home/.claude" \
     bash "$DOCTOR" "$@"
+}
+
+make_fake_codex() { # <fixture-dir>
+  local dir="$1"
+  mkdir -p "$dir/bin"
+  cat > "$dir/bin/codex" <<'EOF'
+#!/usr/bin/env bash
+case "${FAKE_CODEX_MODE:-authenticated}:$*" in
+  timeout:*) sleep 2; exit 0 ;;
+  authenticated:--version) printf 'codex-cli 1.2.3\n' ;;
+  authenticated:app-server\ --help) printf 'Usage: codex app-server [OPTIONS]\n' ;;
+  authenticated:login\ status) printf 'Logged in using ChatGPT\n' ;;
+  unauthenticated:--version) printf 'codex-cli 1.2.3\n' ;;
+  unauthenticated:app-server\ --help) printf 'Usage: codex app-server [OPTIONS]\n' ;;
+  unauthenticated:login\ status)
+    printf 'Not logged in: SENSITIVE_AUTH_MARKER account@example.invalid {"access_token":"SENSITIVE_TOKEN_MARKER"}\n' >&2
+    exit 1
+    ;;
+  malformed:--version) printf 'codex-cli 1.2.3\n' ;;
+  malformed:app-server\ --help) printf 'unexpected output\n' ;;
+  *) exit 2 ;;
+esac
+EOF
+  chmod +x "$dir/bin/codex"
 }
 
 clean="$(make_fixture clean standalone)"
@@ -175,6 +201,43 @@ before="$(find "$missing_settings" -type f -printf '%P %s %T@\n' | sort)"
 out="$(run_doctor "$missing_settings" --fix --apply 2>&1)"; rc=$?
 after="$(find "$missing_settings" -type f -printf '%P %s %T@\n' | sort)"
 ok "missing settings fails closed instead of claiming repairable" '[ "$rc" = 1 ] && grep -q "수동필요.*settings.json.*missing" <<<"$out" && grep -q "install mode cannot be inferred safely" <<<"$out" && [ "$before" = "$after" ]'
+
+claude_default="$(make_fixture claude-default standalone)"
+out_default="$(run_doctor "$claude_default")"; rc_default=$?
+out_claude="$(CCC_AGENT_PROVIDER=claude run_doctor "$claude_default")"; rc_claude=$?
+ok "explicit Claude provider preserves default behavior" '[ "$rc_default" = 0 ] && [ "$rc_claude" = 0 ] && [ "$out_default" = "$out_claude" ]'
+ok "Claude human output reports provider without a Codex probe" 'grep -q "provider.*claude" <<<"$out_claude" && grep -q "readiness.*not-applicable" <<<"$out_claude"'
+
+codex_absent="$(make_fixture codex-absent standalone)"
+out="$(CCC_AGENT_PROVIDER=codex CCC_CODEX_CLI_PATH=definitely-not-a-real-codex-command run_doctor "$codex_absent" 2>&1)"; rc=$?
+ok "missing Codex binary fails closed" '[ "$rc" = 1 ] && grep -q "Codex executable.*not found" <<<"$out" && ! grep -q "definitely-not-a-real-codex-command" <<<"$out"'
+
+codex_nonexec="$(make_fixture codex-nonexec standalone)"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$codex_nonexec/codex-cli"
+chmod 600 "$codex_nonexec/codex-cli"
+out="$(CCC_AGENT_PROVIDER=codex CCC_CODEX_CLI_PATH="$codex_nonexec/codex-cli" run_doctor "$codex_nonexec" 2>&1)"; rc=$?
+ok "non-executable Codex binary fails closed without path disclosure" '[ "$rc" = 1 ] && grep -q "Codex executable.*not executable" <<<"$out" && ! grep -Fq "$codex_nonexec/codex-cli" <<<"$out"'
+
+codex_timeout="$(make_fixture codex-timeout standalone)"
+make_fake_codex "$codex_timeout"
+out="$(FAKE_CODEX_MODE=timeout CCC_CODEX_READINESS_TIMEOUT=0.1 CCC_AGENT_PROVIDER=codex CCC_CODEX_CLI_PATH="$codex_timeout/bin/codex" run_doctor "$codex_timeout" 2>&1)"; rc=$?
+ok "Codex probe timeout is bounded and fail-closed" '[ "$rc" = 1 ] && grep -q "Codex version probe.*timed out" <<<"$out"'
+
+codex_auth="$(make_fixture codex-auth standalone)"
+make_fake_codex "$codex_auth"
+out="$(FAKE_CODEX_MODE=authenticated CCC_AGENT_PROVIDER=codex CCC_CODEX_CLI_PATH="$codex_auth/bin/codex" run_doctor "$codex_auth")"; rc=$?
+ok "authenticated Codex readiness succeeds" '[ "$rc" = 0 ] && grep -q "provider.*codex" <<<"$out" && grep -q "readiness.*ready" <<<"$out" && grep -q "Codex login.*authenticated" <<<"$out"'
+
+out="$(FAKE_CODEX_MODE=unauthenticated CCC_AGENT_PROVIDER=codex CCC_CODEX_CLI_PATH="$codex_auth/bin/codex" run_doctor "$codex_auth" 2>&1)"; rc=$?
+ok "unauthenticated Codex readiness fails closed" '[ "$rc" = 1 ] && grep -q "Codex login.*not authenticated" <<<"$out"'
+ok "Codex diagnostics redact command output" '! grep -Eq "SENSITIVE_AUTH_MARKER|SENSITIVE_TOKEN_MARKER|account@example.invalid|access_token" <<<"$out"'
+
+out="$(FAKE_CODEX_MODE=malformed CCC_AGENT_PROVIDER=codex CCC_CODEX_CLI_PATH="$codex_auth/bin/codex" run_doctor "$codex_auth" 2>&1)"; rc=$?
+ok "malformed app-server probe fails closed" '[ "$rc" = 1 ] && grep -q "Codex app-server probe.*malformed output" <<<"$out" && ! grep -q "unexpected output" <<<"$out"'
+
+json_out="$(FAKE_CODEX_MODE=authenticated CCC_AGENT_PROVIDER=codex CCC_CODEX_CLI_PATH="$codex_auth/bin/codex" run_doctor "$codex_auth" --json)"; rc=$?
+ok "Codex JSON output is valid and carries additive readiness fields" '[ "$rc" = 0 ] && jq -e '\''(.provider == "codex") and (.readiness == "ready") and (.mode == "standalone") and (.counts["수동필요"] == 0) and ([.rows[].item] | index("Codex login") != null)'\'' <<<"$json_out" >/dev/null'
+ok "Codex JSON output does not disclose executable path" '! grep -Fq "$codex_auth/bin/codex" <<<"$json_out"'
 
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
