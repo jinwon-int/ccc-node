@@ -81,12 +81,14 @@ class BotDeliveryMixin:
                 reply = f"✅ Switched to session: {msg}"
                 await message.reply_text(reply)
                 log_debug(user_id, "bot", reply)
-                # Send last assistant message as progress summary
-                last_msg = self._project_chat.get_session_last_assistant_message(sid)
-                if last_msg:
-                    progress = f"📋 {last_msg}"
-                    await message.reply_text(progress)
-                    log_debug(user_id, "bot", progress)
+                # Claude's legacy transcript path provides a progress summary.
+                # Codex selections must not access Claude transcript files.
+                if provider == "claude":
+                    last_msg = self._project_chat.get_session_last_assistant_message(sid)
+                    if last_msg:
+                        progress = f"📋 {last_msg}"
+                        await message.reply_text(progress)
+                        log_debug(user_id, "bot", progress)
                 return
             else:
                 reply = "❌ Invalid number, please try again."
@@ -507,14 +509,16 @@ class BotDeliveryMixin:
 
         # Handle model selection
         if data.startswith("model:"):
-            model_name = data.split(":", 1)[1]
+            parts = data.split(":", 2)
+            callback_provider = parts[1] if len(parts) == 3 else "claude"
+            model_name = parts[2] if len(parts) == 3 else parts[1]
             log_debug(user_id, "callback", f"model:{model_name}")
             session_key = self._conversation_key(user_id, chat.id)
             active_provider = self._active_provider()
-            if active_provider != "claude":
+            if callback_provider != active_provider:
                 await query.edit_message_text(
-                    "❌ Claude model shortcuts are unavailable with Codex. "
-                    "Use /model <codex-model>."
+                    f"❌ Provider mismatch: selected model is {callback_provider}, "
+                    f"but the active provider is {active_provider}."
                 )
                 return
             stored_provider = await self._session_provider(
@@ -527,7 +531,11 @@ class BotDeliveryMixin:
                 session_key,
                 updates=updates,
             )
-            label = dict(self.MODELS).get(model_name, model_name)
+            label = (
+                dict(self.MODELS).get(model_name, model_name)
+                if active_provider == "claude"
+                else model_name
+            )
             logger.info(
                 "User %s: model set to %r via callback in chat %s",
                 user_id,

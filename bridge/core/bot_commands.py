@@ -179,16 +179,29 @@ class BotCommandMixin:
             return
 
         if active_provider == "codex":
-            current_model = (
-                session.get("model")
-                if session["provider"] == active_provider
-                else None
-            )
-            reply = (
-                f"🤖 Provider: codex\nModel: {current_model or 'default'}\n"
-                "Usage: /model <codex-model>"
-            )
-            await message.reply_text(reply)
+            try:
+                models = await self._project_chat.list_runtime_models()
+            except Exception:
+                logger.warning("Codex model browsing failed")
+                reply = "⚠️ Codex model list is unavailable. Use /model <codex-model>."
+                await message.reply_text(reply)
+                log_debug(user_id, "bot", reply)
+                return
+            buttons = [
+                [InlineKeyboardButton(
+                    model.display_name[:64],
+                    callback_data=f"model:codex:{model.id}",
+                )]
+                for model in models
+                if len(f"model:codex:{model.id}".encode("utf-8")) <= 64
+            ]
+            if not buttons:
+                reply = "📭 No Codex models are available. Use /model <codex-model>."
+                await message.reply_text(reply)
+                log_debug(user_id, "bot", reply)
+                return
+            reply = "🤖 Select Codex model:"
+            await message.reply_text(reply, reply_markup=InlineKeyboardMarkup(buttons))
             log_debug(user_id, "bot", reply)
             return
 
@@ -230,7 +243,39 @@ class BotCommandMixin:
             log_debug(user_id, "bot", reply)
             return
         if active_provider == "codex":
-            reply = "📭 Codex session browsing is not available in this version."
+            try:
+                codex_sessions = await self._project_chat.list_runtime_sessions(limit=10)
+            except Exception:
+                logger.warning("Codex session browsing failed")
+                reply = "⚠️ Codex session history is unavailable."
+                await message.reply_text(reply)
+                log_debug(user_id, "bot", reply)
+                return
+            if not codex_sessions:
+                reply = "📭 No Codex session history found."
+                await message.reply_text(reply)
+                log_debug(user_id, "bot", reply)
+                return
+            resume_list = []
+            lines = ["📋 Session History\n"]
+            for index, item in enumerate(codex_sessions, 1):
+                label = item.title or item.preview or item.id
+                label = re.sub(r"https?://\S+", "", label)
+                label = " ".join(label.split())[:120] or item.id
+                resume_list.append([item.id, label, "codex"])
+                details = " · ".join(
+                    " ".join(value.split())[:80]
+                    for value in (item.model, item.cwd)
+                    if value
+                )
+                provider_tag = f"codex · {details}" if details else "codex"
+                lines.append(f"{index}. {label} [{provider_tag}]")
+            lines.append("\nReply with a number to switch to that session:")
+            await self._session_manager.patch_session(
+                conversation_key,
+                updates={"resume_list": resume_list},
+            )
+            reply = "\n".join(lines)
             await message.reply_text(reply)
             log_debug(user_id, "bot", reply)
             return
@@ -350,15 +395,24 @@ class BotCommandMixin:
             return
 
         if session["provider"] == "codex":
-            reply = (
-                "📜 Recent History\nProvider: codex\n\n"
-                "Codex history browsing is not available in this version."
-            )
-            await message.reply_text(reply)
-            log_debug(user_id, "bot", reply)
-            return
-
-        messages = self._project_chat.get_recent_messages(session_id, limit=5)
+            try:
+                history = await self._project_chat.read_runtime_session(session_id, limit=5)
+            except Exception:
+                logger.warning("Codex history browsing failed")
+                reply = "⚠️ Codex history is unavailable for this session."
+                await message.reply_text(reply)
+                log_debug(user_id, "bot", reply)
+                return
+            messages = [
+                {
+                    "role": item.role,
+                    "content": item.content,
+                    "timestamp": item.timestamp or "",
+                }
+                for item in history.messages
+            ]
+        else:
+            messages = self._project_chat.get_recent_messages(session_id, limit=5)
 
         if not messages:
             reply = "📭 No history available for this session."

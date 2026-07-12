@@ -418,6 +418,76 @@ class CodexAppServerTests(unittest.IsolatedAsyncioTestCase):
         await client.close()
 
 
+    async def test_thread_browsing_helpers_use_v2_shapes_and_parse_defensively(self) -> None:
+        reader = asyncio.StreamReader()
+        writer = FakeWriter(reader)
+        client = CodexAppServerClient(reader=reader, writer=writer)
+        await client.start()
+
+        list_task = asyncio.create_task(client.thread_list(limit=7, cursor="next-1"))
+        while writer.messages[-1].get("method") != "thread/list":
+            await asyncio.sleep(0)
+        request = writer.messages[-1]
+        assert request["params"] == {
+            "limit": 7,
+            "cursor": "next-1",
+            "sortKey": "updated_at",
+        }
+        writer.feed({"id": request["id"], "result": {
+            "data": [
+                {"id": "thread-1", "title": "Title", "preview": "Preview", "updatedAt": 42,
+                 "cwd": "/workspace", "model": "o3"},
+                {"id": "", "preview": "invalid"},
+                "invalid",
+            ],
+            "nextCursor": "next-2",
+        }})
+        page = await list_task
+        assert len(page.data) == 1
+        assert page.data[0].id == "thread-1"
+        assert page.next_cursor == "next-2"
+
+        read_task = asyncio.create_task(client.thread_read("thread-1", include_turns=True))
+        while writer.messages[-1].get("method") != "thread/read":
+            await asyncio.sleep(0)
+        request = writer.messages[-1]
+        assert request["params"] == {"threadId": "thread-1", "includeTurns": True}
+        writer.feed({"id": request["id"], "result": {"thread": {
+            "id": "thread-1",
+            "turns": [{"id": "turn-1", "items": [{"type": "userMessage", "content": [
+                {"type": "text", "text": "hello"}
+            ]}]}],
+        }}})
+        thread = await read_task
+        assert thread is not None
+        assert thread.id == "thread-1"
+        assert len(thread.turns) == 1
+
+        malformed_task = asyncio.create_task(client.thread_list())
+        while writer.messages[-1].get("method") != "thread/list":
+            await asyncio.sleep(0)
+        request = writer.messages[-1]
+        writer.feed({"id": request["id"], "result": {
+            "data": "private raw payload", "nextCursor": 7
+        }})
+        malformed = await malformed_task
+        assert malformed.data == ()
+        assert malformed.next_cursor is None
+
+        error_task = asyncio.create_task(client.thread_read("thread-1"))
+        while writer.messages[-1].get("method") != "thread/read":
+            await asyncio.sleep(0)
+        request = writer.messages[-1]
+        writer.feed({
+            "id": request["id"],
+            "error": {"code": -1, "message": "private raw payload"},
+        })
+        with pytest.raises(CodexProtocolError) as caught:
+            await error_task
+        assert str(caught.value) == "thread/read request failed"
+        assert "private raw payload" not in str(caught.value)
+        await client.close()
+
     async def test_malformed_messages_do_not_deadlock_pending_requests(self) -> None:
         reader = asyncio.StreamReader()
         writer = FakeWriter(reader)

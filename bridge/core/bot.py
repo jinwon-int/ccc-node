@@ -508,7 +508,11 @@ class TelegramBot(BotLifecycleMixin, BotStatusMixin, BotAccessMixin, BotCommandM
             # bridge restart, session expiry, or auto-rotation) but we have a previous
             # session, prepend the recent exchanges so context is not lost.
             send_text = text
-            if effective_sid is None and stale_session_id:
+            if (
+                effective_sid is None
+                and stale_session_id
+                and current_session["provider"] == "claude"
+            ):
                 try:
                     recent = self._project_chat.get_recent_messages(stale_session_id, limit=6)
                     if recent:

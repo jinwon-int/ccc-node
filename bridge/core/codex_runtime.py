@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Protocol, cast
+from typing import Literal, Protocol, cast
 
 from .agent_runtime import (
     AgentEvent,
@@ -18,7 +18,10 @@ from .agent_runtime import (
     ModelInfo,
     ReasoningDeltaEvent,
     ResultEvent,
+    SessionHistory,
+    SessionHistoryMessage,
     SessionRequest,
+    SessionSummary,
     TextDeltaEvent,
     ToolCompletedEvent,
     ToolStartedEvent,
@@ -28,6 +31,8 @@ from .codex_app_server import (
     CodexAppServerClient,
     CodexNotification,
     CodexServerRequest,
+    CodexThread,
+    CodexThreadListPage,
     JsonValue,
     ServerRequestHandler,
 )
@@ -57,6 +62,14 @@ class AppServerClient(Protocol):
     async def turn_interrupt(self, thread_id: str, turn_id: str) -> JsonValue: ...
 
     async def list_models(self, *, include_hidden: bool = False) -> JsonValue: ...
+
+    async def thread_list(
+        self, *, limit: int = 20, cursor: str | None = None
+    ) -> CodexThreadListPage: ...
+
+    async def thread_read(
+        self, thread_id: str, *, include_turns: bool = True
+    ) -> CodexThread | None: ...
 
     async def next_notification(self) -> CodexNotification: ...
 
@@ -210,6 +223,117 @@ class CodexRuntime:
                 continue
             models.append(ModelInfo(id=model_id, display_name=display_name))
         return tuple(models)
+
+    @property
+    def supports_session_browsing(self) -> bool:
+        return True
+
+    async def list_sessions(
+        self,
+        *,
+        limit: int = 10,
+        max_pages: int = 5,
+    ) -> Sequence[SessionSummary]:
+        """Return a bounded list of app-server threads."""
+
+        if limit <= 0 or max_pages <= 0:
+            return ()
+        await self._ensure_started()
+        bounded_limit = min(limit, 100)
+        bounded_pages = min(max_pages, 5)
+        cursor: str | None = None
+        seen_cursors: set[str] = set()
+        summaries: list[SessionSummary] = []
+        for _ in range(bounded_pages):
+            page = await self._client.thread_list(
+                limit=min(20, bounded_limit - len(summaries)),
+                cursor=cursor,
+            )
+            for value in page.data:
+                if len(summaries) >= bounded_limit:
+                    break
+                summaries.append(
+                    SessionSummary(
+                        id=value.id,
+                        title=value.title,
+                        preview=value.preview,
+                        updated_at=value.updated_at,
+                        cwd=value.cwd,
+                        model=value.model,
+                    )
+                )
+            if len(summaries) >= bounded_limit or page.next_cursor is None:
+                break
+            if page.next_cursor in seen_cursors:
+                break
+            seen_cursors.add(page.next_cursor)
+            cursor = page.next_cursor
+        return tuple(summaries)
+
+    async def read_session(self, session_id: str, *, limit: int = 5) -> SessionHistory:
+        """Return only bounded user and assistant text from ``thread/read``."""
+
+        if not session_id:
+            raise ValueError("session id must not be empty")
+        if limit <= 0:
+            return SessionHistory(session_id, ())
+        await self._ensure_started()
+        thread = await self._client.thread_read(session_id, include_turns=True)
+        if thread is None:
+            return SessionHistory(session_id, ())
+        messages: list[SessionHistoryMessage] = []
+        for turn in thread.turns[-100:]:
+            timestamp = self._history_timestamp(turn.get("createdAt"))
+            items = turn.get("items")
+            if not isinstance(items, (list, tuple)):
+                continue
+            for item in items[:200]:
+                if not isinstance(item, Mapping):
+                    continue
+                item_type = item.get("type")
+                role: Literal["user", "assistant"]
+                text: object
+                if item_type == "userMessage":
+                    text = self._user_message_text(item.get("content"))
+                    role = "user"
+                elif item_type == "agentMessage":
+                    text = item.get("text")
+                    role = "assistant"
+                else:
+                    continue
+                if not isinstance(text, str):
+                    continue
+                bounded_text = text[:2000].strip()
+                if not bounded_text:
+                    continue
+                item_timestamp = self._history_timestamp(item.get("timestamp")) or timestamp
+                messages.append(
+                    SessionHistoryMessage(role, bounded_text, item_timestamp)
+                )
+        return SessionHistory(session_id, tuple(messages[-min(limit, 50):]))
+
+    @staticmethod
+    def _user_message_text(content: JsonValue) -> str | None:
+        if isinstance(content, str):
+            return content[:2000]
+        if not isinstance(content, (list, tuple)):
+            return None
+        parts: list[str] = []
+        for block in content[:50]:
+            if not isinstance(block, Mapping):
+                continue
+            if block.get("type") not in {"text", "input_text"}:
+                continue
+            text = block.get("text")
+            if isinstance(text, str):
+                bounded_text = text[:2000].strip()
+                if bounded_text:
+                    parts.append(bounded_text)
+        return "\n".join(parts) or None
+
+    @staticmethod
+    def _history_timestamp(value: object) -> str | None:
+        return value if isinstance(value, str) and value else None
 
     async def close(self) -> None:
         if self._closed:

@@ -62,6 +62,9 @@ class FakeClient:
         self.thread_start_result: Any = {"thread": {"id": "thread-new"}}
         self.notifications: asyncio.Queue[CodexNotification | BaseException] = asyncio.Queue()
         self.model_result: Any = {"data": []}
+        self.thread_pages: list[Any] = []
+        self.thread_reads: dict[str, Any] = {}
+        self.thread_list_calls: list[dict[str, Any]] = []
         self.turn_start_calls: list[dict[str, Any]] = []
         self.interrupt_calls: list[tuple[str, str]] = []
         self.before_turn_response: list[CodexNotification] = []
@@ -88,6 +91,13 @@ class FakeClient:
 
     async def list_models(self, *, include_hidden: bool = False) -> Any:
         return self.model_result
+
+    async def thread_list(self, *, limit: int = 20, cursor: str | None = None) -> Any:
+        self.thread_list_calls.append({"limit": limit, "cursor": cursor})
+        return self.thread_pages.pop(0)
+
+    async def thread_read(self, thread_id: str, *, include_turns: bool = True) -> Any:
+        return self.thread_reads.get(thread_id)
 
     async def turn_start(
         self,
@@ -186,6 +196,55 @@ class CodexRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaisesRegex(RuntimeError, "invalid thread id"):
             await self.runtime.start_or_resume(SessionRequest(working_directory="/workspace"))
+
+    async def test_session_list_is_bounded_and_read_exposes_only_visible_messages(self) -> None:
+        from telegram_bot.core.agent_runtime import SessionHistoryMessage
+        from telegram_bot.core.codex_app_server import (
+            CodexThread,
+            CodexThreadListPage,
+            CodexThreadSummary,
+        )
+
+        client = self.clients[0]
+        client.thread_pages = [
+            CodexThreadListPage(
+                data=(CodexThreadSummary("thread-1", "Title", "Preview", 42.0, "/work", "o3"),),
+                next_cursor="cursor-2",
+            ),
+            CodexThreadListPage(
+                data=(CodexThreadSummary("thread-2", None, None, None, None, None),),
+                next_cursor="cursor-3",
+            ),
+        ]
+
+        sessions = await self.runtime.list_sessions(limit=50, max_pages=2)
+
+        self.assertEqual([session.id for session in sessions], ["thread-1", "thread-2"])
+        self.assertEqual(client.thread_list_calls, [
+            {"limit": 20, "cursor": None},
+            {"limit": 20, "cursor": "cursor-2"},
+        ])
+        client.thread_reads["thread-1"] = CodexThread(
+            id="thread-1",
+            turns=(
+                {"id": "turn-1", "createdAt": "2026-01-01T00:00:00Z", "items": (
+                    {"type": "userMessage", "content": ({"type": "text", "text": "hello"},)},
+                    {"type": "reasoning", "summary": ("secret",)},
+                    {"type": "commandExecution", "command": "cat secret"},
+                    {"type": "agentMessage", "text": "world"},
+                )},
+            ),
+        )
+
+        history = await self.runtime.read_session("thread-1", limit=5)
+
+        self.assertEqual(history.session_id, "thread-1")
+        self.assertEqual(history.messages, (
+            SessionHistoryMessage("user", "hello", "2026-01-01T00:00:00Z"),
+            SessionHistoryMessage("assistant", "world", "2026-01-01T00:00:00Z"),
+        ))
+        self.assertNotIn("secret", repr(history))
+        self.assertNotIn("cat secret", repr(history))
 
     async def test_turn_maps_streamed_events_including_notifications_before_response(self) -> None:
         session = await self.runtime.start_or_resume(SessionRequest(working_directory="/workspace"))

@@ -12,6 +12,12 @@ from unittest.mock import AsyncMock, Mock, patch
 import pytest
 
 from telegram_bot.core.project_chat_types import ChatResponse
+from telegram_bot.core.agent_runtime import (
+    ModelInfo,
+    SessionHistory,
+    SessionHistoryMessage,
+    SessionSummary,
+)
 from telegram_bot.session.manager import SessionManager
 from telegram_bot.session.store import SessionStore
 
@@ -166,13 +172,45 @@ async def test_history_uses_conversation_scope_and_labels_legacy_claude(tmp_path
 
 
 @pytest.mark.anyio
+async def test_codex_resume_uses_runtime_and_persists_canonical_provider_entries(
+    tmp_path: Path,
+) -> None:
+    manager = make_manager(tmp_path, "codex")
+    project_chat = SimpleNamespace(
+        list_runtime_sessions=AsyncMock(return_value=(
+            SessionSummary(
+                "codex-1", title="Thread title", preview="hello", updated_at=900.0,
+                cwd="/workspace", model="o3",
+            ),
+        )),
+        list_sessions=Mock(side_effect=AssertionError("must not read Claude transcripts")),
+    )
+    bot = bare_bot(manager, provider="codex", project_chat=project_chat)
+    update = make_update()
+
+    await bot._cmd_resume(update, SimpleNamespace(args=[]))
+
+    project_chat.list_runtime_sessions.assert_awaited_once_with(limit=10)
+    session = await manager.get_session("7:9")
+    assert session["resume_list"] == [["codex-1", "Thread title", "codex"]]
+    assert "[codex" in update.message.replies[0][0].lower()
+
+
+@pytest.mark.anyio
 async def test_codex_history_never_reads_claude_transcript_store(tmp_path: Path) -> None:
     manager = make_manager(tmp_path, "codex")
     await manager.store.set(
         "7:9", {"provider": "codex", "session_id": "codex-thread"}
     )
     project_chat = SimpleNamespace(
-        get_recent_messages=Mock(side_effect=AssertionError("must not read Claude history"))
+        get_recent_messages=Mock(side_effect=AssertionError("must not read Claude history")),
+        read_runtime_session=AsyncMock(return_value=SessionHistory(
+            "codex-thread",
+            (
+                SessionHistoryMessage("user", "hello", "2026-01-01T00:00:00Z"),
+                SessionHistoryMessage("assistant", "world", "2026-01-01T00:01:00Z"),
+            ),
+        )),
     )
     bot = bare_bot(manager, provider="codex", project_chat=project_chat)
     update = make_update(chat_id=9)
@@ -180,9 +218,40 @@ async def test_codex_history_never_reads_claude_transcript_store(tmp_path: Path)
     await bot._cmd_history(update, SimpleNamespace(args=[]))
 
     project_chat.get_recent_messages.assert_not_called()
+    project_chat.read_runtime_session.assert_awaited_once_with("codex-thread", limit=5)
     reply = update.message.replies[0][0]
     assert "Provider: codex" in reply
-    assert "not available" in reply
+    assert "hello" in reply
+    assert "world" in reply
+
+
+@pytest.mark.anyio
+async def test_codex_browsing_empty_and_error_states_are_safe(tmp_path: Path) -> None:
+    manager = make_manager(tmp_path, "codex")
+    await manager.patch_session(
+        "7:9", updates={"provider": "codex", "session_id": "codex-thread"}
+    )
+    project_chat = SimpleNamespace(
+        list_runtime_sessions=AsyncMock(side_effect=RuntimeError("raw payload secret")),
+        read_runtime_session=AsyncMock(return_value=SessionHistory("codex-thread", ())),
+        list_runtime_models=AsyncMock(return_value=()),
+    )
+    bot = bare_bot(manager, provider="codex", project_chat=project_chat)
+
+    resume = make_update()
+    await bot._cmd_resume(resume, SimpleNamespace(args=[]))
+    assert resume.message.replies[0][0] == "⚠️ Codex session history is unavailable."
+    assert "raw payload secret" not in resume.message.replies[0][0]
+
+    history = make_update()
+    await bot._cmd_history(history, SimpleNamespace(args=[]))
+    assert history.message.replies[0][0] == "📭 No history available for this session."
+
+    model = make_update()
+    await bot._cmd_model(model, SimpleNamespace(args=[]))
+    assert model.message.replies[0][0] == (
+        "📭 No Codex models are available. Use /model <codex-model>."
+    )
 
 
 @pytest.mark.anyio
@@ -234,14 +303,23 @@ async def test_codex_model_command_does_not_read_claude_settings_and_persists_ra
     await manager.store.set(
         "7:9", {"session_id": "legacy-claude", "model": "opus"}
     )
-    bot = bare_bot(manager, provider="codex")
+    project_chat = SimpleNamespace(
+        list_runtime_models=AsyncMock(return_value=(
+            ModelInfo("o3", "O3"),
+            ModelInfo("codex/custom", "Codex Custom"),
+        ))
+    )
+    bot = bare_bot(manager, provider="codex", project_chat=project_chat)
     update = make_update()
 
     await bot._cmd_model(update, SimpleNamespace(args=[]))
-    assert update.message.replies[0][0] == (
-        "🤖 Provider: codex\nModel: default\nUsage: /model <codex-model>"
-    )
-    assert update.message.replies[0][1] == {}
+    assert update.message.replies[0][0] == "🤖 Select Codex model:"
+    keyboard = update.message.replies[0][1]["reply_markup"].inline_keyboard
+    assert [row[0].text for row in keyboard] == ["O3", "Codex Custom"]
+    assert [row[0].callback_data for row in keyboard] == [
+        "model:codex:o3",
+        "model:codex:codex/custom",
+    ]
 
     explicit = make_update()
     await bot._cmd_model(explicit, SimpleNamespace(args=["o3/custom:raw"]))
@@ -271,6 +349,47 @@ async def test_successful_codex_response_persists_provider_and_errors_do_not_ove
 
 
 @pytest.mark.anyio
+async def test_codex_model_callback_is_provider_scoped_and_conversation_safe(
+    tmp_path: Path,
+) -> None:
+    manager = make_manager(tmp_path, "codex")
+    await manager.store.set(
+        "7:9", {"provider": "codex", "session_id": "thread-9", "model": "old"}
+    )
+    await manager.store.set(
+        "7:10", {"provider": "codex", "session_id": "thread-10", "model": "other"}
+    )
+    bot = bare_bot(manager, provider="codex")
+    bot.application = SimpleNamespace(bot=object())
+    query = SimpleNamespace(
+        data="model:codex:o3/raw",
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(),
+    )
+    update = SimpleNamespace(
+        effective_user=SimpleNamespace(id=7),
+        effective_chat=SimpleNamespace(id=9),
+        message=None,
+        callback_query=query,
+    )
+
+    await bot._handle_callback(update, SimpleNamespace())
+
+    selected = await manager.get_session("7:9")
+    other = await manager.get_session("7:10")
+    assert selected["model"] == "o3/raw"
+    assert selected["session_id"] == "thread-9"
+    assert other["model"] == "other"
+    query.edit_message_text.assert_awaited_once_with("✅ Model switched to: o3/raw")
+
+    query.edit_message_text.reset_mock()
+    query.data = "model:claude:opus"
+    await bot._handle_callback(update, SimpleNamespace())
+    assert "Provider mismatch" in query.edit_message_text.await_args.args[0]
+    assert (await manager.get_session("7:9"))["model"] == "o3/raw"
+
+
+@pytest.mark.anyio
 async def test_successful_resume_selection_persists_compatible_provider(tmp_path: Path) -> None:
     manager = make_manager(tmp_path, "claude")
     await manager.patch_session(
@@ -286,3 +405,29 @@ async def test_successful_resume_selection_persists_compatible_provider(tmp_path
     assert session["provider"] == "claude"
     assert session["session_id"] == "claude-1"
     assert "resume_list" not in session
+
+
+@pytest.mark.anyio
+async def test_codex_resume_selection_never_reads_claude_progress_and_is_chat_scoped(
+    tmp_path: Path,
+) -> None:
+    manager = make_manager(tmp_path, "codex")
+    await manager.patch_session(
+        "7:9", updates={"resume_list": [["codex-1", "summary", "codex"]]}
+    )
+    await manager.patch_session(
+        "7:10", updates={"session_id": "codex-other", "provider": "codex"}
+    )
+    project_chat = SimpleNamespace(
+        get_session_last_assistant_message=Mock(
+            side_effect=AssertionError("must not read Claude transcript")
+        )
+    )
+    bot = bare_bot(manager, provider="codex", project_chat=project_chat)
+    update = make_update(text="1")
+
+    await bot._handle_text_message(update, SimpleNamespace(args=[]))
+
+    project_chat.get_session_last_assistant_message.assert_not_called()
+    assert (await manager.get_session("7:9"))["session_id"] == "codex-1"
+    assert (await manager.get_session("7:10"))["session_id"] == "codex-other"
