@@ -26,7 +26,6 @@ from telegram_bot.core.sdk_text import (
     _is_shutdown_signal_error,
 )
 from telegram_bot.utils.chat_logger import log_chat
-from telegram_bot.utils.config import config
 from telegram_bot.utils.health import health_reporter
 
 logger = logging.getLogger(__name__)
@@ -67,10 +66,12 @@ class ProjectChatProcessMixin:
         # off (default), the reply is delivered as complete message(s) by the
         # caller when generation finishes — no live draft.
         streaming_handler = None
-        if bot and getattr(config, "enable_streaming", False):
+        if bot and getattr(self._config, "enable_streaming", False):
             from telegram_bot.core.streaming import StreamingMessageHandler
 
-            streaming_handler = StreamingMessageHandler(bot, chat_id, user_id)
+            streaming_handler = StreamingMessageHandler(
+                bot, chat_id, user_id, settings=self._config
+            )
 
         request = _PendingRequest(
             user_id=user_id,
@@ -121,10 +122,13 @@ class ProjectChatProcessMixin:
                         f"Submitted message to live stream: user={user_id}, pending={len(state.pending)}, "
                         f"session_key={request.sent_session_id}"
                     )
-                    if config.claude_cli_path:
-                        logger.info(f"Using configured Claude CLI path: {config.claude_cli_path}")
+                    if self._config.claude_cli_path:
+                        logger.info(
+                            "Using configured Claude CLI path: %s",
+                            self._config.claude_cli_path,
+                        )
 
-                return await asyncio.wait_for(future, timeout=_process_timeout())
+                return await asyncio.wait_for(future, timeout=self._process_timeout_seconds)
 
             except asyncio.CancelledError:
                 logger.info(f"Task cancelled for user {user_id} - cleaning up")
@@ -141,11 +145,11 @@ class ProjectChatProcessMixin:
                 raise
 
             except asyncio.TimeoutError:
-                logger.warning(f"Query timed out for user {user_id} after {_process_timeout()}s")
+                logger.warning(f"Query timed out for user {user_id} after {self._process_timeout_seconds}s")
                 cleaned = await self._cleanup_heartbeat(request)
                 self._ledger_finish(request, TASK_TIMEOUT, cleanup_done=cleaned)
                 await self.stop(user_id)
-                msg = f"⏰ Timed out after {_process_timeout()}s. Please retry or simplify your request."
+                msg = f"⏰ Timed out after {self._process_timeout_seconds}s. Please retry or simplify your request."
                 health_reporter.record_claude_error(msg)
                 return ChatResponse(content=msg, success=False, error=msg)
 
@@ -185,10 +189,12 @@ class ProjectChatProcessMixin:
 
                     retry_future: asyncio.Future = loop.create_future()
                     retry_handler = None
-                    if bot and getattr(config, "enable_streaming", False):
+                    if bot and getattr(self._config, "enable_streaming", False):
                         from telegram_bot.core.streaming import StreamingMessageHandler
 
-                        retry_handler = StreamingMessageHandler(bot, chat_id, user_id)
+                        retry_handler = StreamingMessageHandler(
+                bot, chat_id, user_id, settings=self._config
+            )
                     retry_request = _PendingRequest(
                         user_id=user_id,
                         chat_id=chat_id,
@@ -223,7 +229,7 @@ class ProjectChatProcessMixin:
                                 "✅ Retry submitted successfully for user %s after reconnection",
                                 user_id,
                             )
-                        return await asyncio.wait_for(retry_future, timeout=_process_timeout())
+                        return await asyncio.wait_for(retry_future, timeout=self._process_timeout_seconds)
                     except Exception as retry_err:
                         if retry_state and retry_request in retry_state.pending:
                             try:

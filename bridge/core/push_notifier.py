@@ -34,25 +34,26 @@ _SENT_RETENTION_SECONDS = 7 * 24 * 60 * 60
 class PushNotifier:
     """Polls a spool directory and delivers queued notifications to the owner chat."""
 
-    def __init__(self) -> None:
-        self.enabled: bool = bool(getattr(config, "push_enabled", False))
+    def __init__(self, settings=None) -> None:
+        self._config = config if settings is None else settings
+        self.enabled: bool = bool(getattr(self._config, "push_enabled", False))
         # Default mirrors utils.config.push_spool_dir so the notifier is robust to a
         # config object that omits the key (e.g. SimpleNamespace stubs in tests).
         self.spool_dir: Path = Path(
-            getattr(config, "push_spool_dir", None)
+            getattr(self._config, "push_spool_dir", None)
             or (Path.home() / ".claude" / "state" / "telegram-spool")
         )
-        self.interval: float = float(getattr(config, "push_poll_interval", 3.0))
-        self.max_per_minute: int = int(getattr(config, "push_max_per_minute", 10))
+        self.interval: float = float(getattr(self._config, "push_poll_interval", 3.0))
+        self.max_per_minute: int = int(getattr(self._config, "push_max_per_minute", 10))
         self._recent: Dict[str, float] = {}
         self._sent_times: List[float] = []
 
     def _resolve_target(self) -> Optional[int]:
         """Owner-only target: explicit chat id, else the single allowed user id."""
-        cid = getattr(config, "push_chat_id", None)
+        cid = getattr(self._config, "push_chat_id", None)
         if cid:
             return int(cid)
-        allowed = getattr(config, "allowed_user_ids", None) or []
+        allowed = getattr(self._config, "allowed_user_ids", None) or []
         if len(allowed) == 1:
             return int(allowed[0])
         return None

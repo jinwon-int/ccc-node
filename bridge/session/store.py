@@ -8,8 +8,7 @@ import os
 import stat
 import tempfile
 from pathlib import Path
-from typing import Optional, Dict, Any
-from telegram_bot.utils.config import config
+from typing import Any, Dict, Iterable, Mapping, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -249,6 +248,16 @@ def _validate_existing_directory_components(path: Path) -> None:
         if current == path:
             continue
         mode = stat.S_IMODE(metadata.st_mode)
+        trusted_platform_owner = (
+            metadata.st_uid in {0, os.getuid()}
+            or _is_owned_termux_private_ancestor(current, metadata)
+            or _is_trusted_android_platform_ancestor(current, metadata)
+        )
+        if not trusted_platform_owner:
+            raise PermissionError(
+                f"session store path has an unsafe owner ancestor: "
+                f"{current} (uid={metadata.st_uid}, mode={mode:04o})"
+            )
         sticky_bit = getattr(stat, "S_ISVTX", 0o1000)
         trusted_sticky = bool(
             mode & sticky_bit and metadata.st_uid in {0, os.getuid()}
@@ -290,6 +299,25 @@ def _create_missing_directory_components(path: Path) -> None:
             )
 
 
+def _validate_storage_directory(path: Path) -> None:
+    """Validate an existing storage parent without creating or chmodding anything."""
+    path = _absolute_path(path)
+    _validate_existing_directory_components(path)
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise NotADirectoryError(f"session store parent is not a directory: {path}")
+    if hasattr(os, "getuid") and metadata.st_uid != os.getuid():
+        raise PermissionError(f"session store parent is not owned by this process: {path}")
+    mode = stat.S_IMODE(metadata.st_mode)
+    if mode & 0o022:
+        raise PermissionError(
+            f"session store parent is writable by group or others: {path} ({mode:04o})"
+        )
+
+
 def _ensure_storage_directory(path: Path) -> None:
     """Create a private state directory or validate an existing safe directory."""
     path = _absolute_path(path)
@@ -316,6 +344,11 @@ def _ensure_storage_directory(path: Path) -> None:
         raise PermissionError(
             f"session store parent is writable by group or others: {path} ({mode:04o})"
         )
+
+
+def ensure_private_directory(path: Path) -> None:
+    """Create or validate a process-owned directory without following symlinks."""
+    _ensure_storage_directory(path)
 
 
 def _secure_existing_state_file(path: Path) -> None:
@@ -395,17 +428,30 @@ def _atomic_write_bytes(destination: Path, payload: bytes) -> None:
 class SessionStore:
     """Process-local JSON store; one live instance must own each storage path."""
 
-    def __init__(self, storage_path: Optional[Path] = None):
+    def __init__(self, storage_path: Path):
         self._local_data: Dict[str, Any] = {}
         self._lock = asyncio.Lock()
-        self._storage_path = _absolute_path(
-            Path(storage_path or config.session_store_path)
-        )
+        self._storage_path = _absolute_path(Path(storage_path))
+        self._initialized = False
+
+    def validate_path(self) -> None:
+        """Validate the configured storage path without creating runtime state."""
+        _validate_storage_directory(self._storage_path.parent)
+
+    def initialize(self) -> None:
+        """Create and load the session store at the explicit runtime boundary."""
+        if self._initialized:
+            return
         _ensure_storage_directory(self._storage_path.parent)
         _secure_existing_state_file(self._storage_path)
         _secure_existing_state_file(self._backup_path)
         self._load_local_data()
+        self._initialized = True
         logger.info(f"Using local JSON storage at {self._storage_path}")
+
+    def _require_initialized(self) -> None:
+        if not self._initialized:
+            raise RuntimeError("SessionStore is not initialized")
 
     @property
     def _backup_path(self) -> Path:
@@ -502,6 +548,7 @@ class SessionStore:
 
     async def list_sessions(self) -> Dict[str, Dict[str, Any]]:
         """Return a deep-copied map of conversation-key suffixes to sessions."""
+        self._require_initialized()
         prefix = "telegram_session:"
         async with self._lock:
             return {
@@ -516,6 +563,7 @@ class SessionStore:
         # update_session(); handing out the live reference let those mutations
         # (and, under concurrent same-user handlers, each other's edits) leak
         # into the store before — or without — an explicit commit.
+        self._require_initialized()
         key = self._key(user_id)
         async with self._lock:
             value = self._local_data.get(key)
@@ -524,6 +572,7 @@ class SessionStore:
     async def set(
         self, user_id: int, data: Dict[str, Any], ttl: Optional[int] = None
     ) -> None:
+        self._require_initialized()
         del ttl  # kept for API compatibility; local JSON storage has no TTL
         key = self._key(user_id)
         value = copy.deepcopy(data)
@@ -531,6 +580,7 @@ class SessionStore:
             self._commit(lambda: self._local_data.__setitem__(key, value))
 
     async def delete(self, user_id: int) -> None:
+        self._require_initialized()
         key = self._key(user_id)
         async with self._lock:
             if key in self._local_data:
@@ -539,11 +589,62 @@ class SessionStore:
     async def update(self, user_id: int, updates: Dict[str, Any]) -> None:
         # Build the new state from a private copy of the stored dict so an
         # earlier get()'s returned object can't alias the base being updated.
+        self._require_initialized()
         key = self._key(user_id)
         async with self._lock:
             data = copy.deepcopy(self._local_data.get(key, {}))
             data.update(copy.deepcopy(updates))
             self._commit(lambda: self._local_data.__setitem__(key, data))
 
+    async def patch(
+        self,
+        user_id: int,
+        *,
+        updates: Optional[Mapping[str, Any]] = None,
+        remove_fields: Iterable[str] = (),
+    ) -> None:
+        """Atomically merge fields and remove fields without stale replacement."""
+        self._require_initialized()
+        key = self._key(user_id)
+        update_copy = copy.deepcopy(dict(updates or {}))
+        removals = tuple(remove_fields)
+        async with self._lock:
+            data = copy.deepcopy(self._local_data.get(key, {}))
+            changed = False
+            for field in removals:
+                if field in data:
+                    data.pop(field)
+                    changed = True
+            for field, value in update_copy.items():
+                if field not in data or data[field] != value:
+                    data[field] = value
+                    changed = True
+            if changed:
+                self._commit(lambda: self._local_data.__setitem__(key, data))
 
-session_store = SessionStore()
+    async def patch_if(
+        self,
+        user_id: int,
+        *,
+        expected: Mapping[str, Any],
+        updates: Optional[Mapping[str, Any]] = None,
+        remove_fields: Iterable[str] = (),
+    ) -> bool:
+        """Compare and patch one session atomically under the per-store lock."""
+        self._require_initialized()
+        key = self._key(user_id)
+        expected_copy = copy.deepcopy(dict(expected))
+        update_copy = copy.deepcopy(dict(updates or {}))
+        removals = tuple(remove_fields)
+        async with self._lock:
+            data = copy.deepcopy(self._local_data.get(key, {}))
+            if any(
+                field not in data or data[field] != value
+                for field, value in expected_copy.items()
+            ):
+                return False
+            for field in removals:
+                data.pop(field, None)
+            data.update(update_copy)
+            self._commit(lambda: self._local_data.__setitem__(key, data))
+            return True

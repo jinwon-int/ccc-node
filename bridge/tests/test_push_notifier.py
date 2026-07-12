@@ -31,6 +31,27 @@ def _cfg(**over):
 
 
 class ResolveTargetTests(unittest.TestCase):
+    def test_injected_settings_override_divergent_ambient_config(self):
+        injected = _cfg(
+            push_enabled=False,
+            push_chat_id=None,
+            allowed_user_ids=[222],
+            push_spool_dir="/tmp/injected-spool",
+        )
+        ambient = _cfg(
+            push_enabled=True,
+            push_chat_id=111,
+            allowed_user_ids=[111],
+            push_spool_dir="/tmp/ambient-spool",
+        )
+
+        with patch.object(pn, "config", ambient):
+            notifier = PushNotifier(injected)
+
+        self.assertFalse(notifier.enabled)
+        self.assertEqual(notifier._resolve_target(), 222)
+        self.assertEqual(notifier.spool_dir, Path("/tmp/injected-spool"))
+
     def test_explicit_chat_id_wins(self):
         with patch.object(pn, "config", _cfg(push_chat_id=999, allowed_user_ids=[1, 2])):
             self.assertEqual(PushNotifier()._resolve_target(), 999)

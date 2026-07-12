@@ -9,18 +9,10 @@ from typing import Any, Dict, List, Optional, Tuple
 logger = logging.getLogger(__name__)
 
 
-def _conversations_dir() -> Path:
-    """Read the active project_chat module compatibility constant at call time."""
-    import sys
-
-    project_chat = sys.modules["telegram_bot.core.project_chat"]
-    return project_chat.CONVERSATIONS_DIR
-
-
 class ProjectChatHistoryMixin:
     def list_sessions(self, limit: int = 10) -> List[Tuple[str, str, float]]:
         """List recent conversations: [(session_id, first_user_msg, mtime)]"""
-        conv_dir = _conversations_dir()
+        conv_dir = self.conversations_dir
         if not conv_dir.exists():
             return []
         files = sorted(
@@ -41,7 +33,7 @@ class ProjectChatHistoryMixin:
         self, session_id: str, max_chars: int = 300
     ) -> Optional[str]:
         """Extract the last assistant text message from a session JSONL file."""
-        filepath = _conversations_dir() / f"{session_id}.jsonl"
+        filepath = self.conversations_dir / f"{session_id}.jsonl"
         if not filepath.exists():
             return None
         try:
@@ -77,7 +69,7 @@ class ProjectChatHistoryMixin:
         self, session_id: str, limit: int = 5
     ) -> List[Dict[str, Any]]:
         """Get the last N messages from a session in chronological order."""
-        filepath = _conversations_dir() / f"{session_id}.jsonl"
+        filepath = self.conversations_dir / f"{session_id}.jsonl"
         if not filepath.exists():
             return []
 
@@ -131,7 +123,7 @@ class ProjectChatHistoryMixin:
         Returns list of USER messages only with index, timestamp, role, and content preview.
         Messages are returned in reverse chronological order (newest first).
         """
-        filepath = _conversations_dir() / f"{session_id}.jsonl"
+        filepath = self.conversations_dir / f"{session_id}.jsonl"
         if not filepath.exists():
             return []
 

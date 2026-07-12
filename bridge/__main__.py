@@ -1,8 +1,11 @@
 import argparse
 import logging
 import os
+import time
 from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from telegram_bot.utils.config import Settings, bind_config, setup_logging
 
@@ -21,6 +24,77 @@ def load_runtime_settings(
     )
     bind_config(settings)
     return settings
+
+
+@dataclass(frozen=True)
+class AppContext:
+    """Validated runtime dependencies shared by one bridge application."""
+
+    settings: Settings
+    session_store: Any
+    session_manager: Any
+    project_chat: Any
+    sdk_factory: Any
+    telegram_port: Any
+    clock: Any
+
+
+def build_context(
+    settings: Settings,
+    *,
+    sdk_factory: Any = None,
+    telegram_port: Any = None,
+    clock: Any = None,
+) -> AppContext:
+    """Compose dependencies without performing filesystem initialization."""
+    bind_config(settings)
+    from telegram.ext import Application
+    from claude_agent_sdk import ClaudeSDKClient
+    from telegram_bot.core.project_chat import ProjectChatHandler
+    from telegram_bot.session.manager import SessionManager
+    from telegram_bot.session.store import SessionStore
+    from telegram_bot.utils.chat_logger import bind_logs_dir
+    from telegram_bot.utils.health import health_reporter
+
+    sdk_factory = sdk_factory or ClaudeSDKClient
+    telegram_port = telegram_port or Application.builder
+    clock = clock or time
+    bind_logs_dir(settings.logs_dir)
+    health_reporter.bind(settings.bot_data_dir)
+    store = SessionStore(settings.session_store_path)
+    session_manager = SessionManager(store=store, settings=settings)
+    project_chat = ProjectChatHandler(
+        settings=settings,
+        sdk_client_factory=sdk_factory,
+        clock=clock,
+    )
+    return AppContext(
+        settings=settings,
+        session_store=store,
+        session_manager=session_manager,
+        project_chat=project_chat,
+        sdk_factory=sdk_factory,
+        telegram_port=telegram_port,
+        clock=clock,
+    )
+
+
+def create_app(context: AppContext):
+    """Create the Telegram adapter from an already-built application context."""
+    from telegram_bot.core.bot import TelegramBot
+
+    return TelegramBot(
+        settings=context.settings,
+        session_manager=context.session_manager,
+        project_chat=context.project_chat,
+        application_builder_factory=context.telegram_port,
+        clock=context.clock,
+    )
+
+
+def create_bot(settings: Settings):
+    """Compatibility entrypoint for validated Settings callers."""
+    return create_app(build_context(settings))
 
 
 def main() -> None:
@@ -44,8 +118,9 @@ def main() -> None:
         raise SystemExit(1)
 
     settings = load_runtime_settings()
-    from telegram_bot.core.bot import bot
+    bot = create_bot(settings)
 
+    bot.validate_runtime_paths()
     setup_logging(settings)
     logger = logging.getLogger(__name__)
     try:

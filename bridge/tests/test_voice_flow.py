@@ -47,7 +47,6 @@ config_module.config = SimpleNamespace(
     draft_update_min_chars=20,
     draft_update_interval=0.1,
 )
-sys.modules["telegram_bot.utils.config"] = config_module
 
 
 session_module = types.ModuleType("telegram_bot.session.manager")
@@ -61,6 +60,16 @@ class _SessionManager:
     async def update_session(self, user_id, data):
         del user_id, data
         return None
+
+    async def patch_session(self, user_id, *, updates=None, remove_fields=()):
+        del user_id, updates, remove_fields
+        return None
+
+    async def patch_session_if(
+        self, user_id, *, expected, updates=None, remove_fields=()
+    ):
+        del user_id, expected, updates, remove_fields
+        return True
 
     async def should_start_new_session(self, user_id, now=None):
         del user_id, now
@@ -84,7 +93,6 @@ class _SessionManager:
 
 
 session_module.session_manager = _SessionManager()
-sys.modules["telegram_bot.session.manager"] = session_module
 
 
 project_chat_module = types.ModuleType("telegram_bot.core.project_chat")
@@ -120,30 +128,64 @@ class _ProjectChatHandler:
         return None
 
 
+_MISSING_MODULE = object()
+_original_project_chat = sys.modules.get("telegram_bot.core.project_chat", _MISSING_MODULE)
+_original_chat_logger = sys.modules.get("telegram_bot.utils.chat_logger", _MISSING_MODULE)
+
 project_chat_module.project_chat_handler = _ProjectChatHandler()
 project_chat_module.ChatResponse = _ChatResponse
 project_chat_module.PROJECT_ROOT = Path("/tmp")
 project_chat_module.CONVERSATIONS_DIR = Path("/tmp/conversations")
 sys.modules["telegram_bot.core.project_chat"] = project_chat_module
 
-
 chat_logger_module = types.ModuleType("telegram_bot.utils.chat_logger")
 chat_logger_module.log_debug = lambda *args, **kwargs: None
 sys.modules["telegram_bot.utils.chat_logger"] = chat_logger_module
 
-
-permission_module = types.ModuleType("claude_agent_sdk.types")
-permission_module.PermissionResultAllow = type("PermissionResultAllow", (), {})
-permission_module.PermissionResultDeny = type(
-    "PermissionResultDeny", (), {"__init__": lambda self, message="": None}
+_RUNTIME_MODULE_NAMES = (
+    "telegram_bot.core.bot",
+    "telegram_bot.core.bot_lifecycle",
+    "telegram_bot.core.bot_status",
+    "telegram_bot.core.bot_access",
+    "telegram_bot.core.bot_commands",
+    "telegram_bot.core.bot_delivery",
+    "telegram_bot.core.bot_voice",
 )
-sys.modules["claude_agent_sdk.types"] = permission_module
+_original_runtime_modules = {
+    name: sys.modules.get(name, _MISSING_MODULE) for name in _RUNTIME_MODULE_NAMES
+}
+
+try:
+    from telegram_bot.utils.tos_uploader import TOSUploadError
+    from telegram_bot.utils.transcription import EmptyTranscriptionError, TranscriptionError
+finally:
+    if _original_project_chat is _MISSING_MODULE:
+        sys.modules.pop("telegram_bot.core.project_chat", None)
+    else:
+        sys.modules["telegram_bot.core.project_chat"] = _original_project_chat
+    if _original_chat_logger is _MISSING_MODULE:
+        sys.modules.pop("telegram_bot.utils.chat_logger", None)
+    else:
+        sys.modules["telegram_bot.utils.chat_logger"] = _original_chat_logger
+    for _module_name, _original_module in _original_runtime_modules.items():
+        if _original_module is _MISSING_MODULE:
+            sys.modules.pop(_module_name, None)
+        else:
+            assert isinstance(_original_module, types.ModuleType)
+            sys.modules[_module_name] = _original_module
+
+def _telegram_bot_class():
+    chat_logger = sys.modules.get("telegram_bot.utils.chat_logger")
+    if chat_logger is not None and not callable(getattr(chat_logger, "log_debug", None)):
+        sys.modules.pop("telegram_bot.utils.chat_logger", None)
+    from telegram_bot.core.bot import TelegramBot
+
+    return TelegramBot
 
 
-import telegram_bot.core.bot as bot_module
-from telegram_bot.core.bot import TelegramBot
-from telegram_bot.utils.tos_uploader import TOSUploadError
-from telegram_bot.utils.transcription import EmptyTranscriptionError, TranscriptionError
+def _make_bot(**kwargs):
+    return _telegram_bot_class()(**kwargs)
+
 
 _NOISY_LOGGERS = ["telegram_bot.core.bot"]
 _ORIGINAL_LEVELS = {}
@@ -185,7 +227,11 @@ def _build_update(user_id: int, voice):
 
 class VoiceFlowTests(unittest.IsolatedAsyncioTestCase):
     async def test_text_reply_passes_owner_id_to_reply_context_builder(self):
-        bot = TelegramBot()
+        bot = _make_bot(
+            settings=config_module.config,
+            session_manager=session_module.session_manager,
+            project_chat=project_chat_module.project_chat_handler,
+        )
         bot._check_access = AsyncMock(return_value=True)
         bot._maybe_capture_outside_approval = AsyncMock()
         bot._enqueue_user_task = AsyncMock(return_value=True)
@@ -211,7 +257,11 @@ class VoiceFlowTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_ignores_unauthorized_voice_message(self):
-        bot = TelegramBot()
+        bot = _make_bot(
+            settings=config_module.config,
+            session_manager=session_module.session_manager,
+            project_chat=project_chat_module.project_chat_handler,
+        )
         bot._check_access = AsyncMock(return_value=False)
         bot._enqueue_user_task = AsyncMock()
         voice = SimpleNamespace(file_id="v1", duration=30, mime_type="audio/ogg")
@@ -221,7 +271,11 @@ class VoiceFlowTests(unittest.IsolatedAsyncioTestCase):
         bot._enqueue_user_task.assert_not_called()
 
     async def test_rejects_when_duration_exceeds_limit(self):
-        bot = TelegramBot()
+        bot = _make_bot(
+            settings=config_module.config,
+            session_manager=session_module.session_manager,
+            project_chat=project_chat_module.project_chat_handler,
+        )
         bot._check_access = AsyncMock(return_value=True)
 
         async def run_now(user_id, run_task, on_overflow):
@@ -237,7 +291,11 @@ class VoiceFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any("too long" in msg for msg in update.message.replies))
 
     async def test_reports_queue_overflow(self):
-        bot = TelegramBot()
+        bot = _make_bot(
+            settings=config_module.config,
+            session_manager=session_module.session_manager,
+            project_chat=project_chat_module.project_chat_handler,
+        )
         bot._check_access = AsyncMock(return_value=True)
 
         async def overflow(user_id, run_task, on_overflow):
@@ -255,7 +313,11 @@ class VoiceFlowTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_reports_download_failure(self):
-        bot = TelegramBot()
+        bot = _make_bot(
+            settings=config_module.config,
+            session_manager=session_module.session_manager,
+            project_chat=project_chat_module.project_chat_handler,
+        )
         bot._check_access = AsyncMock(return_value=True)
 
         async def run_now(user_id, run_task, on_overflow):
@@ -274,7 +336,11 @@ class VoiceFlowTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_reports_conversion_failure(self):
-        bot = TelegramBot()
+        bot = _make_bot(
+            settings=config_module.config,
+            session_manager=session_module.session_manager,
+            project_chat=project_chat_module.project_chat_handler,
+        )
         bot._check_access = AsyncMock(return_value=True)
 
         async def run_now(user_id, run_task, on_overflow):
@@ -296,7 +362,11 @@ class VoiceFlowTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_reports_empty_transcription(self):
-        bot = TelegramBot()
+        bot = _make_bot(
+            settings=config_module.config,
+            session_manager=session_module.session_manager,
+            project_chat=project_chat_module.project_chat_handler,
+        )
         bot._check_access = AsyncMock(return_value=True)
 
         async def run_now(user_id, run_task, on_overflow):
@@ -324,7 +394,11 @@ class VoiceFlowTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_successful_transcription_forwards_text(self):
-        bot = TelegramBot()
+        bot = _make_bot(
+            settings=config_module.config,
+            session_manager=session_module.session_manager,
+            project_chat=project_chat_module.project_chat_handler,
+        )
         bot._check_access = AsyncMock(return_value=True)
 
         async def run_now(user_id, run_task, on_overflow):
@@ -359,7 +433,11 @@ class VoiceFlowTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_third_party_reply_is_marked_untrusted_for_owner_voice_turn(self):
-        bot = TelegramBot()
+        bot = _make_bot(
+            settings=config_module.config,
+            session_manager=session_module.session_manager,
+            project_chat=project_chat_module.project_chat_handler,
+        )
         bot._check_access = AsyncMock(return_value=True)
 
         async def run_now(user_id, run_task, on_overflow):
@@ -398,12 +476,15 @@ class VoiceFlowTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_successful_volcengine_transcription_uses_tos_url(self):
-        bot = TelegramBot()
+        bot = _make_bot(
+            settings=config_module.config,
+            session_manager=session_module.session_manager,
+            project_chat=project_chat_module.project_chat_handler,
+        )
         bot._check_access = AsyncMock(return_value=True)
 
-        old_provider = bot_module.config.transcription_provider
+        old_provider = config_module.config.transcription_provider
         config_module.config.transcription_provider = "volcengine"
-        bot_module.config.transcription_provider = "volcengine"
 
         async def run_now(user_id, run_task, on_overflow):
             del user_id, on_overflow
@@ -441,7 +522,6 @@ class VoiceFlowTests(unittest.IsolatedAsyncioTestCase):
                 await bot._handle_voice_message(update, None)
         finally:
             config_module.config.transcription_provider = old_provider
-            bot_module.config.transcription_provider = old_provider
 
         bot._download_voice_file.assert_awaited_once()
         self.assertEqual(uploader.upload_file_with_object_key.call_count, 1)
@@ -460,12 +540,15 @@ class VoiceFlowTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_volcengine_delete_failure_does_not_break_successful_reply(self):
-        bot = TelegramBot()
+        bot = _make_bot(
+            settings=config_module.config,
+            session_manager=session_module.session_manager,
+            project_chat=project_chat_module.project_chat_handler,
+        )
         bot._check_access = AsyncMock(return_value=True)
 
-        old_provider = bot_module.config.transcription_provider
+        old_provider = config_module.config.transcription_provider
         config_module.config.transcription_provider = "volcengine"
-        bot_module.config.transcription_provider = "volcengine"
 
         async def run_now(user_id, run_task, on_overflow):
             del user_id, on_overflow
@@ -504,19 +587,21 @@ class VoiceFlowTests(unittest.IsolatedAsyncioTestCase):
                 await bot._handle_voice_message(update, None)
         finally:
             config_module.config.transcription_provider = old_provider
-            bot_module.config.transcription_provider = old_provider
 
         transcriber.transcribe_audio.assert_awaited_once()
         uploader.delete_object.assert_called_once_with("telegram-voice/11/object.ogg")
         bot._process_user_message_text.assert_awaited_once()
 
     async def test_volcengine_transcription_failure_still_deletes_tos_object(self):
-        bot = TelegramBot()
+        bot = _make_bot(
+            settings=config_module.config,
+            session_manager=session_module.session_manager,
+            project_chat=project_chat_module.project_chat_handler,
+        )
         bot._check_access = AsyncMock(return_value=True)
 
-        old_provider = bot_module.config.transcription_provider
+        old_provider = config_module.config.transcription_provider
         config_module.config.transcription_provider = "volcengine"
-        bot_module.config.transcription_provider = "volcengine"
 
         async def run_now(user_id, run_task, on_overflow):
             del user_id, on_overflow
@@ -552,7 +637,6 @@ class VoiceFlowTests(unittest.IsolatedAsyncioTestCase):
                 await bot._handle_voice_message(update, None)
         finally:
             config_module.config.transcription_provider = old_provider
-            bot_module.config.transcription_provider = old_provider
 
         uploader.delete_object.assert_called_once_with("telegram-voice/11/object.ogg")
         bot._process_user_message_text.assert_not_awaited()
@@ -564,12 +648,15 @@ class VoiceFlowTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_reports_missing_volcengine_configuration(self):
-        bot = TelegramBot()
+        bot = _make_bot(
+            settings=config_module.config,
+            session_manager=session_module.session_manager,
+            project_chat=project_chat_module.project_chat_handler,
+        )
         bot._check_access = AsyncMock(return_value=True)
 
-        old_provider = bot_module.config.transcription_provider
+        old_provider = config_module.config.transcription_provider
         config_module.config.transcription_provider = "volcengine"
-        bot_module.config.transcription_provider = "volcengine"
 
         async def run_now(user_id, run_task, on_overflow):
             del user_id, on_overflow
@@ -591,7 +678,6 @@ class VoiceFlowTests(unittest.IsolatedAsyncioTestCase):
                 await bot._handle_voice_message(update, None)
         finally:
             config_module.config.transcription_provider = old_provider
-            bot_module.config.transcription_provider = old_provider
 
         self.assertTrue(
             any(
@@ -601,12 +687,15 @@ class VoiceFlowTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_reports_missing_volcengine_dependency(self):
-        bot = TelegramBot()
+        bot = _make_bot(
+            settings=config_module.config,
+            session_manager=session_module.session_manager,
+            project_chat=project_chat_module.project_chat_handler,
+        )
         bot._check_access = AsyncMock(return_value=True)
 
-        old_provider = bot_module.config.transcription_provider
+        old_provider = config_module.config.transcription_provider
         config_module.config.transcription_provider = "volcengine"
-        bot_module.config.transcription_provider = "volcengine"
 
         async def run_now(user_id, run_task, on_overflow):
             del user_id, on_overflow
@@ -631,14 +720,17 @@ class VoiceFlowTests(unittest.IsolatedAsyncioTestCase):
                 await bot._handle_voice_message(update, None)
         finally:
             config_module.config.transcription_provider = old_provider
-            bot_module.config.transcription_provider = old_provider
 
         self.assertTrue(
             any("dependency is missing" in msg for msg in update.message.replies)
         )
 
     async def test_stop_cancels_active_voice_tasks(self):
-        bot = TelegramBot()
+        bot = _make_bot(
+            settings=config_module.config,
+            session_manager=session_module.session_manager,
+            project_chat=project_chat_module.project_chat_handler,
+        )
         bot._check_access = AsyncMock(return_value=True)
 
         async def long_task():
@@ -657,7 +749,11 @@ class VoiceFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(task.cancelled())
 
     async def test_new_cancels_active_voice_tasks(self):
-        bot = TelegramBot()
+        bot = _make_bot(
+            settings=config_module.config,
+            session_manager=session_module.session_manager,
+            project_chat=project_chat_module.project_chat_handler,
+        )
         bot._check_access = AsyncMock(return_value=True)
 
         async def long_task():
@@ -697,6 +793,23 @@ class NewSessionFlagTests(unittest.IsolatedAsyncioTestCase):
             del user_id
             self.session.update(dict(data))
 
+        async def patch_session(self, user_id, *, updates=None, remove_fields=()):
+            del user_id
+            self.session.update(dict(updates or {}))
+            for field in remove_fields:
+                self.session.pop(field, None)
+
+        async def patch_session_if(
+            self, user_id, *, expected, updates=None, remove_fields=()
+        ):
+            del user_id
+            if any(self.session.get(key) != value for key, value in expected.items()):
+                return False
+            await self.patch_session(
+                0, updates=updates, remove_fields=remove_fields
+            )
+            return True
+
         async def should_start_new_session(self, user_id, now=None):
             del user_id, now
             return False
@@ -708,6 +821,7 @@ class NewSessionFlagTests(unittest.IsolatedAsyncioTestCase):
     class RecordingProjectChatHandler:
         def __init__(self):
             self.calls = []
+            self.conversations_dir = Path("/nonexistent/ccc-test-conversations")
 
         def get_recent_messages(self, session_id, limit=6):
             del session_id, limit
@@ -740,19 +854,16 @@ class NewSessionFlagTests(unittest.IsolatedAsyncioTestCase):
             effective_chat=SimpleNamespace(id=1001),
         )
 
-    async def _run_with_stubs(self, session_manager, handler, coro):
-        old_session_manager = bot_module.session_manager
-        old_handler = bot_module.project_chat_handler
-        try:
-            bot_module.session_manager = session_manager
-            bot_module.project_chat_handler = handler
-            return await coro()
-        finally:
-            bot_module.session_manager = old_session_manager
-            bot_module.project_chat_handler = old_handler
+    async def _run_with_stubs(self, handler, coro):
+        del handler
+        return await coro()
 
     def _bot(self):
-        bot = TelegramBot()
+        bot = _make_bot(
+            settings=config_module.config,
+            session_manager=session_module.session_manager,
+            project_chat=project_chat_module.project_chat_handler,
+        )
         bot.application = SimpleNamespace(
             bot=SimpleNamespace(
                 send_message=AsyncMock(return_value=SimpleNamespace(message_id=55)),
@@ -767,6 +878,8 @@ class NewSessionFlagTests(unittest.IsolatedAsyncioTestCase):
         session_manager = self.MemorySessionManager()
         handler = self.RecordingProjectChatHandler()
         bot = self._bot()
+        bot._session_manager = session_manager
+        bot._project_chat = handler
 
         async def exercise():
             first_update = self.build_update(1)
@@ -775,9 +888,7 @@ class NewSessionFlagTests(unittest.IsolatedAsyncioTestCase):
             await bot._process_user_message_text(second_update, 11, "second")
             return first_update, second_update
 
-        first_update, second_update = await self._run_with_stubs(
-            session_manager, handler, exercise
-        )
+        first_update, second_update = await self._run_with_stubs(handler, exercise)
 
         self.assertIs(handler.calls[0]["new_session"], True)
         self.assertIs(session_manager.session["new_session"], False)
@@ -801,14 +912,17 @@ class NewSessionFlagTests(unittest.IsolatedAsyncioTestCase):
         )
         handler = self.RecordingProjectChatHandler()
         bot = self._bot()
+        bot._session_manager = session_manager
+        bot._project_chat = handler
 
         async def exercise():
             update = self.build_update(1)
             await bot._process_user_message_text(update, 11, "first")
             return update
 
-        update = await self._run_with_stubs(session_manager, handler, exercise)
+        update = await self._run_with_stubs(handler, exercise)
 
+        self.assertTrue(handler.calls, update.message.replies)
         self.assertIsNone(handler.calls[0]["session_id"])
         self.assertTrue(
             any(
@@ -846,7 +960,11 @@ def _build_photo_update(user_id: int, *, photo=None, document=None, caption=None
 
 class PhotoFlowTests(unittest.IsolatedAsyncioTestCase):
     async def test_ignores_unauthorized_photo_message(self):
-        bot = TelegramBot()
+        bot = _make_bot(
+            settings=config_module.config,
+            session_manager=session_module.session_manager,
+            project_chat=project_chat_module.project_chat_handler,
+        )
         bot._check_access = AsyncMock(return_value=False)
         bot._enqueue_user_task = AsyncMock()
         photo = SimpleNamespace(file_id="p1", width=100, height=100, file_size=1000)
@@ -856,7 +974,11 @@ class PhotoFlowTests(unittest.IsolatedAsyncioTestCase):
         bot._enqueue_user_task.assert_not_called()
 
     async def test_photo_queue_overflow_reports_user_visible_message(self):
-        bot = TelegramBot()
+        bot = _make_bot(
+            settings=config_module.config,
+            session_manager=session_module.session_manager,
+            project_chat=project_chat_module.project_chat_handler,
+        )
         bot._check_access = AsyncMock(return_value=True)
 
         async def overflow(user_id, run_task, on_overflow):
@@ -872,7 +994,11 @@ class PhotoFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any("Image queue is full" in msg for msg in update.message.replies))
 
     async def test_photo_download_failure_reports_retry_message(self):
-        bot = TelegramBot()
+        bot = _make_bot(
+            settings=config_module.config,
+            session_manager=session_module.session_manager,
+            project_chat=project_chat_module.project_chat_handler,
+        )
         bot._check_access = AsyncMock(return_value=True)
 
         async def run_now(user_id, run_task, on_overflow):
@@ -892,7 +1018,11 @@ class PhotoFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any("Failed to download your image" in msg for msg in update.message.replies))
 
     async def test_photo_caption_and_local_path_are_forwarded_to_project_chat(self):
-        bot = TelegramBot()
+        bot = _make_bot(
+            settings=config_module.config,
+            session_manager=session_module.session_manager,
+            project_chat=project_chat_module.project_chat_handler,
+        )
         bot._check_access = AsyncMock(return_value=True)
 
         async def run_now(user_id, run_task, on_overflow):
@@ -922,7 +1052,11 @@ class PhotoFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(called.kwargs.get("message_source"), "image")
 
     async def test_photo_reply_passes_owner_id_to_reply_context_builder(self):
-        bot = TelegramBot()
+        bot = _make_bot(
+            settings=config_module.config,
+            session_manager=session_module.session_manager,
+            project_chat=project_chat_module.project_chat_handler,
+        )
         bot._check_access = AsyncMock(return_value=True)
 
         async def run_now(user_id, run_task, on_overflow):
@@ -961,7 +1095,11 @@ class PhotoFlowTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_image_document_uses_document_mime_extension(self):
-        bot = TelegramBot()
+        bot = _make_bot(
+            settings=config_module.config,
+            session_manager=session_module.session_manager,
+            project_chat=project_chat_module.project_chat_handler,
+        )
         bot._check_access = AsyncMock(return_value=True)
 
         async def run_now(user_id, run_task, on_overflow):

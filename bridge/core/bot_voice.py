@@ -13,7 +13,6 @@ from telegram import (
 from telegram.ext import (
     ContextTypes,
 )
-from telegram_bot.utils.config import config
 from telegram_bot.core import media
 from telegram_bot.core.bot_shared import build_reply_context_prefix
 from telegram_bot.utils.chat_logger import log_debug
@@ -33,7 +32,7 @@ STALE_MESSAGE_SECONDS = 20 * 60  # 20 minutes
 
 class BotVoiceMixin:
     def _voice_config(self):
-        return getattr(self, "_config", config)
+        return self._config
 
     def _prune_voice_tasks(self, key: Any) -> set[asyncio.Task]:
         tasks = self._user_voice_tasks.get(key)

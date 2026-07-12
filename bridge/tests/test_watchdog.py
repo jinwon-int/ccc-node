@@ -14,6 +14,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 _ORIGINAL_PROJECT_ROOT = os.environ.get("PROJECT_ROOT")
 _ORIGINAL_CONFIG_MODULE = sys.modules.get("telegram_bot.utils.config")
+_ORIGINAL_PROJECT_CHAT_MODULE = sys.modules.get("telegram_bot.core.project_chat")
+_ORIGINAL_CHAT_LOGGER_MODULE = sys.modules.get("telegram_bot.utils.chat_logger")
 os.environ["PROJECT_ROOT"] = str(Path(__file__).resolve().parents[1])
 
 from pathlib import Path as _Path
@@ -42,6 +44,37 @@ setattr(
 )
 sys.modules["telegram_bot.utils.config"] = config_module
 
+chat_logger_module = types.ModuleType("telegram_bot.utils.chat_logger")
+chat_logger_module.log_debug = lambda *args, **kwargs: None
+chat_logger_module.log_chat = lambda *args, **kwargs: None
+sys.modules["telegram_bot.utils.chat_logger"] = chat_logger_module
+
+project_chat_module = types.ModuleType("telegram_bot.core.project_chat")
+project_chat_module.project_chat_handler = types.SimpleNamespace()
+project_chat_module.ChatResponse = type("ChatResponse", (), {})
+project_chat_module.PROJECT_ROOT = _Path(os.environ["PROJECT_ROOT"])
+project_chat_module.CONVERSATIONS_DIR = _TEST_BOT_DIR / "conversations"
+sys.modules["telegram_bot.core.project_chat"] = project_chat_module
+
+_EXTRACTED_MODULE_NAMES = (
+    "telegram_bot.core.bot_lifecycle",
+    "telegram_bot.core.bot_status",
+    "telegram_bot.core.bot_access",
+    "telegram_bot.core.bot_commands",
+    "telegram_bot.core.bot_delivery",
+    "telegram_bot.core.bot_voice",
+)
+_ORIGINAL_EXTRACTED_MODULES = {
+    name: sys.modules.get(name) for name in _EXTRACTED_MODULE_NAMES
+}
+_ORIGINAL_BOT_MODULE = sys.modules.get("telegram_bot.core.bot")
+_ORIGINAL_EXTRACTED_PROJECT_CHAT_HANDLERS = {
+    name: getattr(module, "project_chat_handler")
+    for name in _EXTRACTED_MODULE_NAMES
+    if (module := sys.modules.get(name)) is not None
+    and hasattr(module, "project_chat_handler")
+}
+
 sys.modules.pop("telegram_bot.core.bot", None)
 import telegram_bot.core.bot as bot_module
 
@@ -55,9 +88,9 @@ bot_module.health_reporter = types.SimpleNamespace(
     record_claude_ok=lambda: None,
     record_claude_error=lambda error: None,
 )
+_FAKE_HEALTH_REPORTER = bot_module.health_reporter
 
-TelegramBot = bot_module.TelegramBot
-_PollingRestart = bot_module._PollingRestart
+from telegram_bot.core.bot_shared import _PollingRestart
 
 if _ORIGINAL_PROJECT_ROOT is None:
     os.environ.pop("PROJECT_ROOT", None)
@@ -69,14 +102,51 @@ if _ORIGINAL_CONFIG_MODULE is None:
 else:
     sys.modules["telegram_bot.utils.config"] = _ORIGINAL_CONFIG_MODULE
 
-sys.modules.pop("telegram_bot.core.bot", None)
+if _ORIGINAL_PROJECT_CHAT_MODULE is None:
+    sys.modules.pop("telegram_bot.core.project_chat", None)
+else:
+    sys.modules["telegram_bot.core.project_chat"] = _ORIGINAL_PROJECT_CHAT_MODULE
+
+if _ORIGINAL_CHAT_LOGGER_MODULE is None:
+    sys.modules.pop("telegram_bot.utils.chat_logger", None)
+else:
+    sys.modules["telegram_bot.utils.chat_logger"] = _ORIGINAL_CHAT_LOGGER_MODULE
+
+for _module_name, _original_module in _ORIGINAL_EXTRACTED_MODULES.items():
+    if _original_module is None:
+        sys.modules.pop(_module_name, None)
+    else:
+        sys.modules[_module_name] = _original_module
+
+if _ORIGINAL_BOT_MODULE is None:
+    sys.modules.pop("telegram_bot.core.bot", None)
+else:
+    sys.modules["telegram_bot.core.bot"] = _ORIGINAL_BOT_MODULE
+
+
+def _telegram_bot_module():
+    chat_logger = sys.modules.get("telegram_bot.utils.chat_logger")
+    if chat_logger is not None and not callable(getattr(chat_logger, "log_debug", None)):
+        sys.modules.pop("telegram_bot.utils.chat_logger", None)
+    import telegram_bot.core.bot as runtime_bot_module
+
+    runtime_bot_module.health_reporter = _FAKE_HEALTH_REPORTER
+    return runtime_bot_module
+
+
+def _make_bot(**kwargs):
+    return _telegram_bot_module().TelegramBot(**kwargs)
 
 
 class TestPollingWatchdog(unittest.TestCase):
     """Test watchdog detection and polling restart."""
 
     def setUp(self):
-        self.bot = TelegramBot()
+        self.bot = _make_bot(
+            settings=config_module.config,
+            session_manager=Mock(),
+            project_chat=project_chat_module.project_chat_handler,
+        )
 
     def test_watchdog_healthy_api_no_restart(self):
         """Watchdog should keep running when Telegram API stays reachable."""
@@ -141,7 +211,11 @@ class TestWaitForPollingExit(unittest.TestCase):
     """Test _wait_for_polling_exit detects terminal states."""
 
     def setUp(self):
-        self.bot = TelegramBot()
+        self.bot = _make_bot(
+            settings=config_module.config,
+            session_manager=Mock(),
+            project_chat=project_chat_module.project_chat_handler,
+        )
 
     def test_unexpected_exit_triggers_restart(self):
         """Polling exiting unexpectedly should raise _PollingRestart."""
@@ -177,7 +251,11 @@ class TestGracefulShutdown(unittest.TestCase):
     """Test _graceful_shutdown cleans up properly."""
 
     def setUp(self):
-        self.bot = TelegramBot()
+        self.bot = _make_bot(
+            settings=config_module.config,
+            session_manager=Mock(),
+            project_chat=project_chat_module.project_chat_handler,
+        )
 
     def test_shutdown_stops_all_components(self):
         """Graceful shutdown stops updater, app, and calls shutdown."""

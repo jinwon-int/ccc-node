@@ -224,4 +224,25 @@ class RuntimeHealthReporter:
                     pass
 
 
-health_reporter = RuntimeHealthReporter(config.bot_data_dir)
+class DeferredHealthReporter:
+    """Import-safe proxy bound to the validated runtime directory at composition."""
+
+    def __init__(self) -> None:
+        self._reporter: RuntimeHealthReporter | None = None
+        self._lock = threading.RLock()
+
+    def bind(self, bot_data_dir: Path) -> None:
+        with self._lock:
+            self._reporter = RuntimeHealthReporter(Path(bot_data_dir))
+
+    def _get(self) -> RuntimeHealthReporter:
+        with self._lock:
+            if self._reporter is None:
+                self._reporter = RuntimeHealthReporter(Path(config.bot_data_dir))
+            return self._reporter
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._get(), name)
+
+
+health_reporter = DeferredHealthReporter()

@@ -7,20 +7,32 @@ from datetime import datetime
 from pathlib import Path
 from telegram_bot.utils.config import config
 
-LOGS_DIR = config.logs_dir
+_bound_logs_dir: Path | None = None
 
 logger = logging.getLogger(__name__)
 
 
-def _ensure_logs_dir():
-    LOGS_DIR.mkdir(parents=True, exist_ok=True)
+def bind_logs_dir(path: Path) -> None:
+    """Bind the validated runtime log directory without creating it."""
+    global _bound_logs_dir
+    _bound_logs_dir = Path(path)
+
+
+def _logs_dir() -> Path:
+    return _bound_logs_dir or Path(config.logs_dir)
+
+
+def _ensure_logs_dir() -> Path:
+    path = _logs_dir()
+    path.mkdir(parents=True, exist_ok=True)
+    return path
 
 
 def _log_file(user_id: int, session_id: str | None) -> Path:
-    _ensure_logs_dir()
+    logs_dir = _ensure_logs_dir()
     date_str = datetime.now().strftime("%Y%m%d")
     sid = session_id or "default"
-    return LOGS_DIR / f"{user_id}_{sid}_{date_str}.log"
+    return logs_dir / f"{user_id}_{sid}_{date_str}.log"
 
 
 def log_chat(

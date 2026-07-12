@@ -5,7 +5,6 @@ import os
 import signal
 import shutil
 import subprocess
-import time
 
 import telegram.error
 from telegram import Update
@@ -20,7 +19,6 @@ from telegram_bot.core.tool_policy import (
     resolve_execution_profile,
 )
 from telegram_bot.core.session_isolation import apply_subprocess_session_isolation
-from telegram_bot.utils.config import config
 from telegram_bot.utils.health import health_reporter
 from telegram_bot.core.task_ledger import (
     INTERRUPTED_NOTICE_TEXT,
@@ -87,17 +85,11 @@ class BotLifecycleMixin:
         logger.info("Bot initialization complete")
 
     async def _recover_dead_session_notifications(self, application: Application) -> None:
-        from telegram_bot.core.project_chat import (
-            CONVERSATIONS_DIR,
-            project_chat_handler,
-        )
-        from telegram_bot.session.manager import session_manager
-
         stats = await recover_dead_session_notifications(
             application.bot,
-            session_manager,
-            project_chat_handler,
-            CONVERSATIONS_DIR,
+            self._session_manager,
+            self._project_chat,
+            self._project_chat.conversations_dir,
             max_delivery_attempts_per_scan=3,
             send_timeout=5.0,
         )
@@ -115,8 +107,8 @@ class BotLifecycleMixin:
 
     def _lifecycle_task_ledger(self):
         path = ledger_path_for(
-            getattr(config, "bot_data_dir", None),
-            getattr(config, "task_ledger_path", None),
+            getattr(self._config, "bot_data_dir", None),
+            getattr(self._config, "task_ledger_path", None),
         )
         return TaskLedger(path) if path else None
 
@@ -124,7 +116,7 @@ class BotLifecycleMixin:
         ledger = self._lifecycle_task_ledger()
         if ledger is None:
             return
-        op_kind = "notice" if getattr(config, "task_interrupted_notice", True) else "delete"
+        op_kind = "notice" if getattr(self._config, "task_interrupted_notice", True) else "delete"
         interrupted = ledger.reconcile_interrupted(op_kind=op_kind)
         if interrupted:
             logger.info(
@@ -170,8 +162,8 @@ class BotLifecycleMixin:
     async def _sweep_orphaned_heartbeats(self, application: Application) -> None:
         """Delete heartbeat messages left frozen by a previous killed run."""
         store_path = store_path_for(
-            getattr(config, "bot_data_dir", None),
-            getattr(config, "heartbeat_store_path", None),
+            getattr(self._config, "bot_data_dir", None),
+            getattr(self._config, "heartbeat_store_path", None),
         )
         if store_path is None:
             return
@@ -201,8 +193,8 @@ class BotLifecycleMixin:
     def build(self):
         """Build the application (no post_init — lifecycle managed manually)."""
         self.application = (
-            Application.builder()
-            .token(config.telegram_bot_token)
+            self._application_builder_factory()
+            .token(self._config.telegram_bot_token)
             .concurrent_updates(True)
             .get_updates_request(self._build_get_updates_request())
             .request(self._build_default_request())
@@ -249,15 +241,20 @@ class BotLifecycleMixin:
     _MAX_RAPID_CRASHES = 5
     _WORKLOAD_INTERVAL = 10  # seconds between in-flight workload snapshots
 
+    def validate_runtime_paths(self) -> None:
+        """Validate runtime paths before logging creates artifacts."""
+        self._session_manager.validate_storage_path()
+
     def run(self):
         """Run the bot with in-process polling restart capability."""
+        settings = self._config
         execution_profile = resolve_execution_profile(
-            getattr(config, "execution_profile", "strict-project"),
-            allowed_user_ids=getattr(config, "allowed_user_ids", []),
-            require_allowlist=getattr(config, "require_allowlist", True),
+            getattr(settings, "execution_profile", "strict-project"),
+            allowed_user_ids=getattr(settings, "allowed_user_ids", []),
+            require_allowlist=getattr(settings, "require_allowlist", True),
         )
         bash_policy = effective_bash_policy(
-            resolve_bash_policy(getattr(config, "bash_policy", None)), execution_profile
+            resolve_bash_policy(getattr(settings, "bash_policy", None)), execution_profile
         )
         logger.info(
             "bridge_execution_policy execution_profile=%s bash_policy=%s host_scope=%s",
@@ -265,7 +262,8 @@ class BotLifecycleMixin:
             bash_policy,
             str(execution_profile == EXECUTION_OWNER_OPERATOR).lower(),
         )
-        enforce_access_control(config)
+        enforce_access_control(settings)
+        self._session_manager.initialize()
         exit_reason = "Bot stopped"
         try:
             health_reporter.initialize_process()
@@ -288,7 +286,7 @@ class BotLifecycleMixin:
 
     def _probe_claude_readiness(self) -> tuple[bool, str]:
         cli_path = (
-            str(config.claude_cli_path) if config.claude_cli_path else shutil.which("claude") or ""
+            str(self._config.claude_cli_path) if self._config.claude_cli_path else shutil.which("claude") or ""
         )
         if not cli_path:
             return False, "claude command not found"
@@ -340,7 +338,7 @@ class BotLifecycleMixin:
                 self.build()
 
             logger.info("Starting...")
-            start_time = time.time()
+            start_time = self._clock.time()
             health_reporter.mark_starting("initializing telegram polling")
 
             try:
@@ -424,7 +422,7 @@ class BotLifecycleMixin:
 
             except _PollingRestart:
                 health_reporter.mark_starting("restarting polling after connection loss")
-                uptime = time.time() - start_time
+                uptime = self._clock.time() - start_time
                 if uptime < self._MIN_UPTIME:
                     rapid_crash_count += 1
                     if rapid_crash_count >= self._MAX_RAPID_CRASHES:
@@ -528,19 +526,13 @@ class BotLifecycleMixin:
                     raise _PollingRestart()
 
     async def _periodic_dead_session_recovery(self, stop_event: asyncio.Event) -> None:
-        from telegram_bot.core.project_chat import (
-            CONVERSATIONS_DIR,
-            project_chat_handler,
-        )
-        from telegram_bot.session.manager import session_manager
-
         if not self.application:
             return
         await run_periodic_dead_session_recovery(
             self.application.bot,
-            session_manager,
-            project_chat_handler,
-            CONVERSATIONS_DIR,
+            self._session_manager,
+            self._project_chat,
+            self._project_chat.conversations_dir,
             stop_event,
         )
 
@@ -551,12 +543,10 @@ class BotLifecycleMixin:
         while it is serving a request, so an in-flight ``claude`` child is not
         SIGTERM-killed mid-task (exit 143).
         """
-        from telegram_bot.core.project_chat import project_chat_handler
-
         while not stop_event.is_set():
             try:
                 now = asyncio.get_event_loop().time()
-                count, oldest_age = project_chat_handler.workload_snapshot(now)
+                count, oldest_age = self._project_chat.workload_snapshot(now)
                 health_reporter.record_workload(count, oldest_age)
             except Exception as exc:
                 logger.debug("Workload reporter tick failed: %s", type(exc).__name__)

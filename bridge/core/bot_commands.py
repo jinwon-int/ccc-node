@@ -3,7 +3,6 @@ import asyncio
 import json
 import logging
 import re
-import time
 from typing import Awaitable, Callable, Optional
 from datetime import datetime
 
@@ -16,13 +15,8 @@ from telegram.ext import (
     CommandHandler,
     ContextTypes,
 )
-from telegram_bot.session.manager import session_manager
 from telegram_bot.core import revert as revert_ops
 from .conversation_paths import resolve_conversation_file
-from telegram_bot.core.project_chat import (
-    project_chat_handler,
-    CONVERSATIONS_DIR,
-)
 from telegram_bot.utils.chat_logger import log_debug
 from telegram_bot.utils import tg_errors
 
@@ -65,7 +59,7 @@ class BotCommandMixin:
             "- Do NOT use Markdown syntax (no ## or **)\n"
             "- Do NOT output any extra introductory text or status lines"
         )
-        response = await project_chat_handler.process_message(
+        response = await self._project_chat.process_message(
             user_message=prompt,
             user_id=user_id,
             chat_id=chat.id,
@@ -102,7 +96,8 @@ class BotCommandMixin:
         # Cancel any ongoing streaming in this Telegram conversation
         await self._cancel_user_streaming(user_id, chat.id)
 
-        session = await session_manager.get_session(conversation_key)
+        session = await self._session_manager.get_session(conversation_key)
+        updates = {"session_id": None, "new_session": True}
         session["session_id"] = None
         session["new_session"] = True
 
@@ -116,6 +111,7 @@ class BotCommandMixin:
         if session.get("model") != settings_model:
             old_model = session.get("model")
             session["model"] = settings_model
+            updates["model"] = settings_model
             effective = self._get_real_model(session)
             logger.info(
                 f"User {user_id}: model synced {old_model!r} -> {settings_model!r} (effective: {effective!r}) on /new"
@@ -126,7 +122,9 @@ class BotCommandMixin:
                 f"Auto-synced model: {old_model} -> {settings_model} (effective: {effective})",
             )
 
-        await session_manager.update_session(conversation_key, session)
+        await self._session_manager.patch_session(
+            conversation_key, updates=updates
+        )
         self._runtime_active_sessions.discard(conversation_key)
         reply = "🆕 Switched to new session mode. Your next message will start a new Claude Code session."
         await message.reply_text(reply)
@@ -147,13 +145,16 @@ class BotCommandMixin:
             return
         user_id = self._require_user(update).id
         message = self._require_message(update)
+        chat = self._require_chat(update)
+        conversation_key = self._conversation_key(user_id, chat.id)
         log_debug(user_id, "command", "/model")
-        session = await session_manager.get_session(user_id)
+        session = await self._session_manager.get_session(conversation_key)
 
         if context.args:
             name = context.args[0]
-            session["model"] = name
-            await session_manager.update_session(user_id, session)
+            await self._session_manager.patch_session(
+                conversation_key, updates={"model": name}
+            )
             label = dict(self.MODELS).get(name, name)
             logger.info(f"User {user_id}: model set to {name!r} via /model command")
             reply = f"✅ Switched to {label}"
@@ -183,25 +184,28 @@ class BotCommandMixin:
             return
         user_id = self._require_user(update).id
         message = self._require_message(update)
+        chat = self._require_chat(update)
+        conversation_key = self._conversation_key(user_id, chat.id)
         log_debug(user_id, "command", "/resume")
-        sessions = project_chat_handler.list_sessions(limit=10)
+        sessions = self._project_chat.list_sessions(limit=10)
         if not sessions:
             reply = "📭 No session history found."
             await message.reply_text(reply)
             log_debug(user_id, "bot", reply)
             return
 
-        # Store session list for later selection
-        session = await session_manager.get_session(user_id)
-        session["resume_list"] = [[sid, msg] for sid, msg, _ in sessions]
-        await session_manager.update_session(user_id, session)
+        # Store session list for later selection in this Telegram conversation.
+        await self._session_manager.patch_session(
+            conversation_key,
+            updates={"resume_list": [[sid, msg] for sid, msg, _ in sessions]},
+        )
 
         def _esc_resume_text(text: str) -> str:
             text = re.sub(r"https?://\S+", "", text).strip()
             return _esc_md2(text)
 
         def relative_time(mtime: float) -> str:
-            delta = int(time.time() - mtime)
+            delta = int(self._clock.time() - mtime)
             if delta < 60:
                 return f"{delta} seconds ago"
             if delta < 3600:
@@ -263,10 +267,10 @@ class BotCommandMixin:
             )
 
         try:
-            killed = await project_chat_handler.stop(user_id, chat_id=chat.id)
+            killed = await self._project_chat.stop(user_id, chat_id=chat.id)
         except TypeError:
             # Some tests/older adapters expose stop(user_id) only.
-            killed = await project_chat_handler.stop(user_id)
+            killed = await self._project_chat.stop(user_id)
         cleared = self._clear_user_queue(conversation_key)
 
         # Build response message - simple and friendly
@@ -285,7 +289,7 @@ class BotCommandMixin:
         message = self._require_message(update)
         log_debug(user_id, "command", "/history")
 
-        session = await session_manager.get_session(user_id)
+        session = await self._session_manager.get_session(user_id)
         session_id = session.get("session_id")
 
         if not session_id:
@@ -294,7 +298,7 @@ class BotCommandMixin:
             log_debug(user_id, "bot", reply)
             return
 
-        messages = project_chat_handler.get_recent_messages(session_id, limit=5)
+        messages = self._project_chat.get_recent_messages(session_id, limit=5)
 
         if not messages:
             reply = "📭 No history available for this session."
@@ -346,7 +350,7 @@ class BotCommandMixin:
         message = self._require_message(update)
         log_debug(user_id, "command", "/revert")
 
-        session = await session_manager.get_session(user_id)
+        session = await self._session_manager.get_session(user_id)
         session_id = session.get("session_id")
 
         if not session_id:
@@ -356,7 +360,7 @@ class BotCommandMixin:
             return
 
         # Get conversation history
-        messages = project_chat_handler.get_conversation_history(session_id, limit=50)
+        messages = self._project_chat.get_conversation_history(session_id, limit=50)
 
         if not messages:
             reply = "📭 No conversation history available to revert."
@@ -386,7 +390,7 @@ class BotCommandMixin:
 
         action = parts[1]  # "select", "page", or "mode"
 
-        session = await session_manager.get_session(user_id)
+        session = await self._session_manager.get_session(user_id)
         session_id = session.get("session_id")
 
         if not session_id:
@@ -396,7 +400,7 @@ class BotCommandMixin:
         if action == "page":
             # Handle pagination
             page = int(parts[2])
-            messages = project_chat_handler.get_conversation_history(
+            messages = self._project_chat.get_conversation_history(
                 session_id, limit=50
             )
             keyboard = self._build_history_keyboard(messages, page=page)
@@ -408,7 +412,7 @@ class BotCommandMixin:
             keyboard = self._build_revert_mode_keyboard(msg_index)
 
             # Get selected message details for context
-            messages = project_chat_handler.get_conversation_history(
+            messages = self._project_chat.get_conversation_history(
                 session_id, limit=50
             )
             selected_msg = next((m for m in messages if m["index"] == msg_index), None)
@@ -439,7 +443,7 @@ class BotCommandMixin:
             await query.edit_message_text("⏳ Reverting to selected message...")
 
             # Get selected message info BEFORE revert (since it will be deleted)
-            messages = project_chat_handler.get_conversation_history(
+            messages = self._project_chat.get_conversation_history(
                 session_id, limit=50
             )
             selected_msg = next((m for m in messages if m["index"] == msg_index), None)
@@ -570,16 +574,17 @@ class BotCommandMixin:
     async def _clear_user_state(self, user_id: int) -> None:
         """Clear runtime state after revert operation."""
         # Clear active stream (cancels pending futures + disconnects the SDK client)
-        await project_chat_handler.clear_user_stream(user_id)
+        await self._project_chat.clear_user_stream(user_id)
 
         # Clear pending permission futures (no-op if the stream was just cleared)
-        project_chat_handler.clear_pending_permissions(user_id)
+        self._project_chat.clear_pending_permissions(user_id)
 
         # Update session manager
-        session = await session_manager.get_session(user_id)
-        # Clear approve-all flag similar to /new command
-        session.pop("approve_all_outside_access", None)
-        await session_manager.update_session(user_id, session)
+        # Clear approve-all flag similar to /new command without replacing
+        # unrelated fields written by another concurrent update.
+        await self._session_manager.patch_session(
+            user_id, remove_fields={"approve_all_outside_access"}
+        )
 
     async def _execute_conversation_revert(
         self, user_id: int, session_id: str, msg_index: int, mode: str
@@ -589,7 +594,7 @@ class BotCommandMixin:
         Args:
             mode: "full", "conv", or "code"
         """
-        filepath = resolve_conversation_file(CONVERSATIONS_DIR, session_id)
+        filepath = resolve_conversation_file(self._project_chat.conversations_dir, session_id)
         if filepath is None:
             logger.warning(
                 "Rejected conversation path outside conversations dir: session_id=%r",
@@ -644,7 +649,7 @@ class BotCommandMixin:
     async def _cancel_user_streaming(self, user_id: int, chat_id: Optional[int] = None) -> bool:
         """Cancel streaming for a user/conversation"""
         try:
-            return await project_chat_handler.cancel_user_streaming(user_id, chat_id)
+            return await self._project_chat.cancel_user_streaming(user_id, chat_id)
         except Exception as e:
             logger.error(f"Failed to cancel streaming for user {user_id}: {e}")
             return False
@@ -681,12 +686,12 @@ class BotCommandMixin:
         slash_cmd = "/" + parts[1]
 
         async def run_task():
-            session = await session_manager.get_session(conversation_key)
+            session = await self._session_manager.get_session(conversation_key)
             try:
                 await message.chat.send_action(action="typing")
             except Exception:
                 pass
-            response = await project_chat_handler.process_message(
+            response = await self._project_chat.process_message(
                 user_message=slash_cmd,
                 user_id=user_id,
                 chat_id=chat.id,
@@ -722,10 +727,10 @@ class BotCommandMixin:
         conversation_key = self._conversation_key(user_id, chat.id)
 
         async def run_task():
-            session = await session_manager.get_session(conversation_key)
+            session = await self._session_manager.get_session(conversation_key)
             await message.chat.send_action(action="typing")
             try:
-                response = await project_chat_handler.process_message(
+                response = await self._project_chat.process_message(
                     user_message=slash_cmd,
                     user_id=user_id,
                     chat_id=chat.id,

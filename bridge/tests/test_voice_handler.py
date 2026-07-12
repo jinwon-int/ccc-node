@@ -46,7 +46,6 @@ config_module.config = SimpleNamespace(
     draft_update_min_chars=20,
     draft_update_interval=0.1,
 )
-sys.modules["telegram_bot.utils.config"] = config_module
 
 
 session_module = types.ModuleType("telegram_bot.session.manager")
@@ -75,7 +74,6 @@ class _SessionManager:
 
 
 session_module.session_manager = _SessionManager()
-sys.modules["telegram_bot.session.manager"] = session_module
 
 
 project_chat_module = types.ModuleType("telegram_bot.core.project_chat")
@@ -111,53 +109,89 @@ class _ProjectChatHandler:
         return None
 
 
+_MISSING_MODULE = object()
+_original_project_chat = sys.modules.get("telegram_bot.core.project_chat", _MISSING_MODULE)
+_original_chat_logger = sys.modules.get("telegram_bot.utils.chat_logger", _MISSING_MODULE)
+
 project_chat_module.project_chat_handler = _ProjectChatHandler()
 project_chat_module.ChatResponse = _ChatResponse
 project_chat_module.PROJECT_ROOT = Path("/tmp")
 project_chat_module.CONVERSATIONS_DIR = Path("/tmp/conversations")
 sys.modules["telegram_bot.core.project_chat"] = project_chat_module
 
-
 chat_logger_module = types.ModuleType("telegram_bot.utils.chat_logger")
 chat_logger_module.log_debug = lambda *args, **kwargs: None
 sys.modules["telegram_bot.utils.chat_logger"] = chat_logger_module
 
+_RUNTIME_MODULE_NAMES = (
+    "telegram_bot.core.bot",
+    "telegram_bot.core.bot_lifecycle",
+    "telegram_bot.core.bot_status",
+    "telegram_bot.core.bot_access",
+    "telegram_bot.core.bot_commands",
+    "telegram_bot.core.bot_delivery",
+    "telegram_bot.core.bot_voice",
+)
+_original_runtime_modules = {
+    name: sys.modules.get(name, _MISSING_MODULE) for name in _RUNTIME_MODULE_NAMES
+}
 
-permission_module = types.ModuleType("claude_agent_sdk.types")
+if _original_project_chat is _MISSING_MODULE:
+    sys.modules.pop("telegram_bot.core.project_chat", None)
+else:
+    sys.modules["telegram_bot.core.project_chat"] = _original_project_chat
+if _original_chat_logger is _MISSING_MODULE:
+    sys.modules.pop("telegram_bot.utils.chat_logger", None)
+else:
+    sys.modules["telegram_bot.utils.chat_logger"] = _original_chat_logger
+for _module_name, _original_module in _original_runtime_modules.items():
+    if _original_module is _MISSING_MODULE:
+        sys.modules.pop(_module_name, None)
+    else:
+        assert isinstance(_original_module, types.ModuleType)
+        sys.modules[_module_name] = _original_module
 
 
-class _PermissionResultAllow:
-    pass
+def _telegram_bot_class():
+    chat_logger = sys.modules.get("telegram_bot.utils.chat_logger")
+    if chat_logger is not None and not callable(getattr(chat_logger, "log_debug", None)):
+        sys.modules.pop("telegram_bot.utils.chat_logger", None)
+    from telegram_bot.core.bot import TelegramBot
+
+    return TelegramBot
 
 
-class _PermissionResultDeny:
-    def __init__(self, message=""):
-        self.message = message
-
-
-permission_module.PermissionResultAllow = _PermissionResultAllow
-permission_module.PermissionResultDeny = _PermissionResultDeny
-sys.modules["claude_agent_sdk.types"] = permission_module
-
-
-from telegram_bot.core.bot import TelegramBot
+def _make_bot(**kwargs):
+    return _telegram_bot_class()(**kwargs)
 
 
 class VoiceHandlerHelperTests(unittest.IsolatedAsyncioTestCase):
     def test_resolve_voice_extension(self):
-        bot = TelegramBot()
+        bot = _make_bot(
+            settings=config_module.config,
+            session_manager=session_module.session_manager,
+            project_chat=project_chat_module.project_chat_handler,
+        )
         self.assertEqual(bot._resolve_voice_extension("audio/ogg"), "ogg")
         self.assertEqual(bot._resolve_voice_extension("audio/amr"), "amr")
         self.assertEqual(bot._resolve_voice_extension(None), "ogg")
 
     def test_build_voice_file_name(self):
-        bot = TelegramBot()
+        bot = _make_bot(
+            settings=config_module.config,
+            session_manager=session_module.session_manager,
+            project_chat=project_chat_module.project_chat_handler,
+        )
         name = bot._build_voice_file_name(user_id=42, extension="ogg")
         self.assertTrue(name.startswith("42_"))
         self.assertTrue(name.endswith(".ogg"))
 
     async def test_cancel_user_voice_tasks(self):
-        bot = TelegramBot()
+        bot = _make_bot(
+            settings=config_module.config,
+            session_manager=session_module.session_manager,
+            project_chat=project_chat_module.project_chat_handler,
+        )
 
         async def sleeper():
             await asyncio.sleep(60)
@@ -179,12 +213,20 @@ class VoiceHandlerHelperTests(unittest.IsolatedAsyncioTestCase):
             stale.touch()
             fresh.touch()
 
-            bot = TelegramBot()
+            bot = _make_bot(
+            settings=config_module.config,
+            session_manager=session_module.session_manager,
+            project_chat=project_chat_module.project_chat_handler,
+        )
             removed = await bot._cleanup_stale_audio_files(audio_dir, max_age_seconds=0)
             self.assertGreaterEqual(removed, 1)
 
     async def test_build_telegram_file_url_supports_relative_path(self):
-        bot = TelegramBot()
+        bot = _make_bot(
+            settings=config_module.config,
+            session_manager=session_module.session_manager,
+            project_chat=project_chat_module.project_chat_handler,
+        )
         bot.application = SimpleNamespace(
             bot=SimpleNamespace(
                 get_file=AsyncMock(
@@ -200,7 +242,11 @@ class VoiceHandlerHelperTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_build_telegram_file_url_supports_absolute_url(self):
-        bot = TelegramBot()
+        bot = _make_bot(
+            settings=config_module.config,
+            session_manager=session_module.session_manager,
+            project_chat=project_chat_module.project_chat_handler,
+        )
         absolute = "https://api.telegram.org/file/bot123456:ABC/voice/file_10.oga"
         bot.application = SimpleNamespace(
             bot=SimpleNamespace(
@@ -212,7 +258,11 @@ class VoiceHandlerHelperTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(url, absolute)
 
     def test_redact_telegram_file_url_masks_all_bot_tokens(self):
-        bot = TelegramBot()
+        bot = _make_bot(
+            settings=config_module.config,
+            session_manager=session_module.session_manager,
+            project_chat=project_chat_module.project_chat_handler,
+        )
         source = "https://api.telegram.org/file/botA/https://api.telegram.org/file/botB/voice/file_10.oga"
         redacted = bot._redact_telegram_file_url(source)
         self.assertEqual(

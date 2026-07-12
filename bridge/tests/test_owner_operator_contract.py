@@ -50,9 +50,12 @@ def close_task(coro):
     return object()
 
 
-project_chat.ClaudeSDKClient = FakeSDKClient
 project_chat.asyncio.create_task = close_task
-asyncio.run(project_chat.ProjectChatHandler()._create_user_stream(42, None))
+handler = project_chat.ProjectChatHandler(
+    settings=config,
+    sdk_client_factory=FakeSDKClient,
+)
+asyncio.run(handler._create_user_stream(42, None))
 options = FakeSDKClient.last_options
 assert options is not None
 transport = SubprocessCLITransport(prompt="", options=options)
@@ -62,8 +65,8 @@ print(
     json.dumps(
         {
             "allowed_owner_ids": config.allowed_user_ids,
-            "execution_profile": project_chat.EXECUTION_PROFILE,
-            "bash_policy": project_chat.BASH_POLICY,
+            "execution_profile": handler._execution_profile,
+            "bash_policy": handler._bash_policy,
             "candidate_imports": candidate_imports,
             "require_allowlist": config.require_allowlist,
             "sandbox": options.sandbox,

@@ -9,8 +9,7 @@ from claude_agent_sdk.types import PermissionResultAllow, PermissionResultDeny
 from telegram import Update
 
 from telegram_bot.core import paths as path_scope
-from telegram_bot.session.manager import session_manager
-from telegram_bot.utils.config import config
+from telegram_bot.core import tool_policy
 
 logger = logging.getLogger(__name__)
 STALE_MESSAGE_SECONDS = 20 * 60  # 20 minutes
@@ -19,9 +18,9 @@ STALE_MESSAGE_SECONDS = 20 * 60  # 20 minutes
 class BotAccessMixin:
     def _check_user_access(self, user_id: int) -> bool:
         """Check if user has permission to use the bot"""
-        if not config.allowed_user_ids:
+        if not self._config.allowed_user_ids:
             return True  # Allow all users if not configured
-        return user_id in config.allowed_user_ids
+        return user_id in self._config.allowed_user_ids
 
     async def _check_access(self, update: Update) -> bool:
         """Check if user has permission to use this bot
@@ -73,25 +72,25 @@ class BotAccessMixin:
         """
         return text.strip() in ("/stop", "/revert")
 
-    @staticmethod
-    def _project_root() -> FilePath:
-        from telegram_bot.core.project_chat import PROJECT_ROOT
+    def _project_root(self) -> FilePath:
+        return FilePath(self._config.project_root).resolve()
 
-        return PROJECT_ROOT
+    def _bash_policy(self) -> str:
+        execution_profile = tool_policy.resolve_execution_profile(
+            getattr(self._config, "execution_profile", tool_policy.EXECUTION_STRICT_PROJECT),
+            allowed_user_ids=getattr(self._config, "allowed_user_ids", []),
+            require_allowlist=getattr(self._config, "require_allowlist", True),
+        )
+        return tool_policy.effective_bash_policy(
+            tool_policy.resolve_bash_policy(getattr(self._config, "bash_policy", None)),
+            execution_profile,
+        )
 
-    @staticmethod
-    def _bash_policy() -> str:
-        from telegram_bot.core.project_chat import BASH_POLICY
+    def _is_within_project_root(self, path: FilePath) -> bool:
+        return path_scope.is_within_project_root(path, self._project_root())
 
-        return BASH_POLICY
-
-    @staticmethod
-    def _is_within_project_root(path: FilePath) -> bool:
-        return path_scope.is_within_project_root(path, BotAccessMixin._project_root())
-
-    @staticmethod
-    def _resolve_candidate_path(raw_path: str) -> FilePath:
-        return path_scope.resolve_candidate_path(raw_path, BotAccessMixin._project_root())
+    def _resolve_candidate_path(self, raw_path: str) -> FilePath:
+        return path_scope.resolve_candidate_path(raw_path, self._project_root())
 
     @staticmethod
     def _iter_strings(value: Any) -> Iterable[str]:
@@ -139,36 +138,54 @@ class BotAccessMixin:
         approval_digest: Optional[str] = None,
     ) -> bool:
         session_key = self._conversation_key(user_id, chat_id)
-        session = await session_manager.get_session(session_key)
         flag = self._approval_flag(approval_kind)
-        if not session.get(flag):
-            return False
+        expected: dict[str, Any] = {flag: True}
+        remove_fields = {
+            "pending_outside_paths",
+            "pending_approval_kind",
+            "pending_approval_digest",
+        }
         if approval_kind == "bash":
+            if not approval_digest:
+                return False
+            session = await self._session_manager.get_session(session_key)
             approved_digest = session.get("bash_approved_digest")
-            if not approval_digest or approved_digest != approval_digest:
-                session[flag] = False
-                session.pop("bash_approved_digest", None)
-                await session_manager.update_session(session_key, session)
+            if not session.get(flag) or not approved_digest:
+                return False
+            if approved_digest != approval_digest:
+                await self._session_manager.patch_session_if(
+                    session_key,
+                    expected={flag: True, "bash_approved_digest": approved_digest},
+                    updates={flag: False},
+                    remove_fields=remove_fields | {"bash_approved_digest"},
+                )
                 logger.warning(
                     "bash_approval_digest_mismatch user_id=%s chat_id=%s",
                     user_id,
                     chat_id,
                 )
                 return False
-        session[flag] = False
-        if approval_kind == "bash":
-            session.pop("bash_approved_digest", None)
-        session.pop("pending_outside_paths", None)
-        session.pop("pending_approval_kind", None)
-        session.pop("pending_approval_digest", None)
-        await session_manager.update_session(session_key, session)
-        return True
+            expected["bash_approved_digest"] = approval_digest
+            remove_fields.add("bash_approved_digest")
+        consumed = await self._session_manager.patch_session_if(
+            session_key,
+            expected=expected,
+            updates={flag: False},
+            remove_fields=remove_fields,
+        )
+        if not consumed and approval_kind == "bash":
+            logger.warning(
+                "bash_approval_unavailable_or_digest_mismatch user_id=%s chat_id=%s",
+                user_id,
+                chat_id,
+            )
+        return consumed
 
     async def _maybe_capture_outside_approval(
         self, user_id: int, text: str, chat_id: Optional[int] = None
     ) -> None:
         session_key = self._conversation_key(user_id, chat_id)
-        session = await session_manager.get_session(session_key)
+        session = await self._session_manager.get_session(session_key)
         pending = session.get("pending_outside_paths")
         if not pending:
             return
@@ -186,49 +203,58 @@ class BotAccessMixin:
             or normalized.startswith(f"{deny_token} (")
             or normalized.startswith(f"2. {deny_token} (")
         )
+        if not allow and not deny:
+            return
+
         approval_kind = session.get("pending_approval_kind", "outside-path")
+        pending_digest = session.get("pending_approval_digest")
         flag = self._approval_flag(approval_kind)
         other_flag = self._approval_flag(
             "outside-path" if approval_kind == "bash" else "bash"
         )
+        expected: dict[str, Any] = {"pending_outside_paths": pending}
+        if "pending_approval_kind" in session:
+            expected["pending_approval_kind"] = session["pending_approval_kind"]
+        if "pending_approval_digest" in session:
+            expected["pending_approval_digest"] = pending_digest
 
-        if allow:
-            session[flag] = True
-            session[other_flag] = False
-            if approval_kind == "bash":
-                pending_digest = session.get("pending_approval_digest")
-                if not pending_digest:
-                    logger.warning(
-                        "bash_approval_missing_digest user_id=%s chat_id=%s",
-                        user_id,
-                        chat_id,
-                    )
-                    session[flag] = False
-                    await session_manager.update_session(session_key, session)
-                    return
-                session["bash_approved_digest"] = pending_digest
-                logger.info(
-                    "bash_approval_reply_allowed user_id=%s chat_id=%s",
+        updates: dict[str, Any] = {flag: bool(allow), other_flag: False}
+        remove_fields = {
+            "pending_outside_paths",
+            "pending_approval_kind",
+            "pending_approval_digest",
+        }
+        if approval_kind == "bash":
+            remove_fields.add("bash_approved_digest")
+            if allow and pending_digest:
+                updates["bash_approved_digest"] = pending_digest
+                remove_fields.discard("bash_approved_digest")
+            elif allow:
+                updates[flag] = False
+                logger.warning(
+                    "bash_approval_missing_digest user_id=%s chat_id=%s",
                     user_id,
                     chat_id,
                 )
-            session.pop("pending_outside_paths", None)
-            session.pop("pending_approval_kind", None)
-            session.pop("pending_approval_digest", None)
-            await session_manager.update_session(session_key, session)
-        elif deny:
-            session[flag] = False
-            if approval_kind == "bash":
-                session.pop("bash_approved_digest", None)
+            elif deny:
                 logger.info(
                     "bash_approval_reply_denied user_id=%s chat_id=%s",
                     user_id,
                     chat_id,
                 )
-            session.pop("pending_outside_paths", None)
-            session.pop("pending_approval_kind", None)
-            session.pop("pending_approval_digest", None)
-            await session_manager.update_session(session_key, session)
+
+        applied = await self._session_manager.patch_session_if(
+            session_key,
+            expected=expected,
+            updates=updates,
+            remove_fields=remove_fields,
+        )
+        if applied and allow and approval_kind == "bash" and pending_digest:
+            logger.info(
+                "bash_approval_reply_allowed user_id=%s chat_id=%s",
+                user_id,
+                chat_id,
+            )
 
     async def _permission_callback(
         self, chat_id: int, user_id: int, tool_name: str, tool_input: Any
@@ -293,11 +319,14 @@ class BotAccessMixin:
             candidates = self._extract_path_candidates(tool_name, tool_input)[:4]
             pending = ["Bash command requires per-call approval", *candidates]
             session_key = self._conversation_key(user_id, chat_id)
-            session = await session_manager.get_session(session_key)
-            session["pending_outside_paths"] = pending
-            session["pending_approval_kind"] = "bash"
-            session["pending_approval_digest"] = request_digest
-            await session_manager.update_session(session_key, session)
+            await self._session_manager.patch_session(
+                session_key,
+                updates={
+                    "pending_outside_paths": pending,
+                    "pending_approval_kind": "bash",
+                    "pending_approval_digest": request_digest,
+                },
+            )
             logger.warning(
                 "bash_approval_required user_id=%s chat_id=%s preview_paths=%s",
                 user_id,
@@ -324,11 +353,14 @@ class BotAccessMixin:
             if await self._consume_outside_approval_once(user_id, chat_id):
                 return PermissionResultAllow()
 
-            session = await session_manager.get_session(session_key)
-            session["pending_outside_paths"] = outside_paths[:5]
-            session["pending_approval_kind"] = "outside-path"
-            await session_manager.update_session(session_key, session)
-
+            await self._session_manager.patch_session(
+                session_key,
+                updates={
+                    "pending_outside_paths": outside_paths[:5],
+                    "pending_approval_kind": "outside-path",
+                    "pending_approval_digest": None,
+                },
+            )
             preview = "\n".join(f"- {path}" for path in outside_paths[:5])
             return PermissionResultDeny(
                 message=(

@@ -1,8 +1,10 @@
 from datetime import datetime, timedelta, timezone
-from typing import Dict, Any, Optional
+from typing import TYPE_CHECKING, Any, Dict, Iterable, Mapping, Optional
 
-from telegram_bot.utils.config import config
-from telegram_bot.session.store import session_store
+from telegram_bot.session.store import SessionStore
+
+if TYPE_CHECKING:
+    from telegram_bot.utils.config import Settings
 
 
 class SessionManager:
@@ -10,8 +12,16 @@ class SessionManager:
     DEFAULT_REPLY_MODE = "text"
     LAST_USER_MESSAGE_AT_KEY = "last_user_message_at"
 
-    def __init__(self):
-        self.store = session_store
+    def __init__(self, store: SessionStore, settings: "Settings"):
+        self.store = store
+        self.settings = settings
+
+    def validate_storage_path(self) -> None:
+        """Validate session storage without creating files or directories."""
+        self.store.validate_path()
+
+    def initialize(self) -> None:
+        self.store.initialize()
 
     @classmethod
     def normalize_reply_mode(cls, mode: Optional[str]) -> str:
@@ -26,8 +36,8 @@ class SessionManager:
         current_mode = session.get("reply_mode")
         normalized_mode = self.normalize_reply_mode(current_mode)
         if current_mode != normalized_mode:
+            await self.store.patch(user_id, updates={"reply_mode": normalized_mode})
             session["reply_mode"] = normalized_mode
-            await self.store.set(user_id, session)
         return session
 
     async def list_sessions(self) -> Dict[str, Dict[str, Any]]:
@@ -42,6 +52,43 @@ class SessionManager:
         if "reply_mode" in payload:
             payload["reply_mode"] = self.normalize_reply_mode(payload.get("reply_mode"))
         await self.store.update(user_id, payload)
+
+    async def replace_session(self, user_id: int, data: Dict[str, Any]) -> None:
+        """Persist a complete session snapshot, including field removals."""
+        payload = dict(data)
+        if "reply_mode" in payload:
+            payload["reply_mode"] = self.normalize_reply_mode(payload.get("reply_mode"))
+        await self.store.set(user_id, payload)
+
+    async def patch_session(
+        self,
+        user_id: int,
+        *,
+        updates: Optional[Mapping[str, Any]] = None,
+        remove_fields: Iterable[str] = (),
+    ) -> None:
+        payload = dict(updates or {})
+        if "reply_mode" in payload:
+            payload["reply_mode"] = self.normalize_reply_mode(payload.get("reply_mode"))
+        await self.store.patch(user_id, updates=payload, remove_fields=remove_fields)
+
+    async def patch_session_if(
+        self,
+        user_id: int,
+        *,
+        expected: Mapping[str, Any],
+        updates: Optional[Mapping[str, Any]] = None,
+        remove_fields: Iterable[str] = (),
+    ) -> bool:
+        payload = dict(updates or {})
+        if "reply_mode" in payload:
+            payload["reply_mode"] = self.normalize_reply_mode(payload.get("reply_mode"))
+        return await self.store.patch_if(
+            user_id,
+            expected=expected,
+            updates=payload,
+            remove_fields=remove_fields,
+        )
 
     async def get_reply_mode(self, user_id: int) -> str:
         session = await self.get_session(user_id)
@@ -67,10 +114,7 @@ class SessionManager:
         return session.get("pending_question")
 
     async def clear_pending_question(self, user_id: int) -> None:
-        session = await self.get_session(user_id)
-        if "pending_question" in session:
-            del session["pending_question"]
-            await self.update_session(user_id, session)
+        await self.patch_session(user_id, remove_fields={"pending_question"})
 
     @staticmethod
     def _normalize_timestamp(value: datetime) -> datetime:
@@ -88,9 +132,8 @@ class SessionManager:
             return None
         return cls._normalize_timestamp(parsed)
 
-    @staticmethod
-    def _auto_new_session_interval() -> Optional[timedelta]:
-        hours = getattr(config, "auto_new_session_after_hours", 24.0)
+    def _auto_new_session_interval(self) -> Optional[timedelta]:
+        hours = self.settings.auto_new_session_after_hours
         if hours is None:
             return None
         return timedelta(hours=float(hours))
@@ -121,6 +164,3 @@ class SessionManager:
 
         current_time = self._normalize_timestamp(now or datetime.now(timezone.utc))
         return current_time - last_user_message_at > interval
-
-
-session_manager = SessionManager()

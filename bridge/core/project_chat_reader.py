@@ -5,7 +5,6 @@
 import asyncio
 import logging
 import os
-import time
 
 from claude_agent_sdk import AssistantMessage, ResultMessage, StreamEvent, TextBlock, ToolUseBlock
 
@@ -93,7 +92,7 @@ class ProjectChatReaderMixin:
         if msg.is_error:
             health_reporter.record_claude_error(content)
             state.last_error = content
-            state.last_error_ts = time.monotonic()
+            state.last_error_ts = self._clock.monotonic()
         else:
             health_reporter.record_claude_ok()
         log_chat(
@@ -121,7 +120,7 @@ class ProjectChatReaderMixin:
                     req.typing_callback
                     and not isinstance(msg, ResultMessage)
                     and self._should_refresh_typing(req, now)
-                    and now - req.last_typing_at >= _typing_interval()
+                    and now - req.last_typing_at >= self._typing_interval_seconds
                 ):
                     req.last_typing_at = now
                     try:
@@ -228,7 +227,7 @@ class ProjectChatReaderMixin:
                         # Record the cause so a racing disconnect can surface it
                         # instead of the opaque "Task has been terminated." notice.
                         state.last_error = content
-                        state.last_error_ts = time.monotonic()
+                        state.last_error_ts = self._clock.monotonic()
                         log_chat(
                             req.user_id,
                             msg.session_id or req.requested_session_id,
@@ -290,7 +289,7 @@ class ProjectChatReaderMixin:
             # Record the cause so a racing disconnect can surface it instead of
             # the opaque "Task has been terminated." notice.
             state.last_error = str(e)
-            state.last_error_ts = time.monotonic()
+            state.last_error_ts = self._clock.monotonic()
             # Cancel typing keepalive to prevent orphan task
             if state.typing_task and not state.typing_task.done():
                 state.typing_task.cancel()

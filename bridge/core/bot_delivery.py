@@ -1,5 +1,6 @@
 # ruff: noqa: E402
 import logging
+import secrets
 from pathlib import Path as FilePath
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -16,13 +17,8 @@ from telegram import (
 from telegram.ext import (
     ContextTypes,
 )
-from telegram_bot.utils.config import config
-from telegram_bot.session.manager import session_manager
 from telegram_bot.core import ui
 from telegram_bot.core import paths as path_scope
-from telegram_bot.core.project_chat import (
-    project_chat_handler,
-)
 from telegram_bot.core.bot_shared import build_reply_context_prefix
 from telegram_bot.utils.chat_logger import log_debug
 from telegram_bot.utils.tg_format import wrap_markdown_tables
@@ -52,7 +48,7 @@ class BotDeliveryMixin:
         chat = self._require_chat(update)
         conversation_key = self._conversation_key(user_id, chat.id)
         text = message.text
-        session = await session_manager.get_session(conversation_key)
+        session = await self._session_manager.get_session(conversation_key)
 
         # Check resume selection (user replies with a number)
         resume_list = session.get("resume_list")
@@ -61,16 +57,17 @@ class BotDeliveryMixin:
             idx = int(text.strip()) - 1
             if 0 <= idx < len(resume_list):
                 sid, msg = resume_list[idx]
-                session["session_id"] = sid
-                session["new_session"] = False
-                session.pop("resume_list", None)
-                await session_manager.update_session(conversation_key, session)
+                await self._session_manager.patch_session(
+                    conversation_key,
+                    updates={"session_id": sid, "new_session": False},
+                    remove_fields={"resume_list"},
+                )
                 self._runtime_active_sessions.add(conversation_key)
                 reply = f"✅ Switched to session: {msg}"
                 await message.reply_text(reply)
                 log_debug(user_id, "bot", reply)
                 # Send last assistant message as progress summary
-                last_msg = project_chat_handler.get_session_last_assistant_message(sid)
+                last_msg = self._project_chat.get_session_last_assistant_message(sid)
                 if last_msg:
                     progress = f"📋 {last_msg}"
                     await message.reply_text(progress)
@@ -84,17 +81,18 @@ class BotDeliveryMixin:
 
         # Clear resume list if user sends non-number
         if resume_list:
-            session.pop("resume_list", None)
-            await session_manager.update_session(conversation_key, session)
+            await self._session_manager.patch_session(
+                conversation_key, remove_fields={"resume_list"}
+            )
 
         # Capture explicit outside-path approval/denial from user replies.
         await self._maybe_capture_outside_approval(user_id, text, chat.id)
 
         # Check if there's a pending question
-        pending = await session_manager.get_pending_question(conversation_key)
+        pending = await self._session_manager.get_pending_question(conversation_key)
         if pending:
             log_debug(user_id, "user", f"[answer] {text}")
-            await session_manager.clear_pending_question(conversation_key)
+            await self._session_manager.clear_pending_question(conversation_key)
             reply = f"✅ Answer received: {text}\n\nContinuing..."
             await message.reply_text(reply)
             log_debug(user_id, "bot", reply)
@@ -122,15 +120,13 @@ class BotDeliveryMixin:
         await self._enqueue_user_task(conversation_key, run_task, on_overflow)
 
     def _resolve_paths(self, content: str) -> List[FilePath]:
-        """Extract file paths from text and resolve relative ones against PROJECT_ROOT."""
-        from telegram_bot.core.project_chat import PROJECT_ROOT
-
+        """Extract file paths and resolve relative ones against injected PROJECT_ROOT."""
         paths = []
         seen = set()
         for m in self._FILE_PATH_RE.findall(content):
             p = FilePath(m.strip())
             if not p.is_absolute():
-                p = PROJECT_ROOT / p
+                p = self._project_root() / p
             p = p.resolve()
             if p not in seen and p.is_file() and p.stat().st_size < 10 * 1024 * 1024:
                 seen.add(p)
@@ -188,17 +184,28 @@ class BotDeliveryMixin:
     async def _prompt_outside_file_confirmation(
         self, chat_id: int, user_id: int, paths: List[FilePath]
     ) -> None:
-        session = await session_manager.get_session(user_id)
-        session["pending_external_files"] = [str(p) for p in paths]
-        await session_manager.update_session(user_id, session)
+        session_key = self._conversation_key(user_id, chat_id)
+        request_token = secrets.token_urlsafe(12)
+        await self._session_manager.patch_session(
+            session_key,
+            updates={
+                "pending_external_files": [str(p) for p in paths],
+                "pending_external_files_token": request_token,
+            },
+        )
         kb = InlineKeyboardMarkup(
             [
                 [
                     InlineKeyboardButton(
-                        "✅ Send external files", callback_data="extsend:allow"
+                        "✅ Send external files",
+                        callback_data=f"extsend:{request_token}:allow",
                     )
                 ],
-                [InlineKeyboardButton("❌ Cancel", callback_data="extsend:deny")],
+                [
+                    InlineKeyboardButton(
+                        "❌ Cancel", callback_data=f"extsend:{request_token}:deny"
+                    )
+                ],
             ]
         )
         app = self._require_application()
@@ -230,7 +237,7 @@ class BotDeliveryMixin:
         limit = max(
             200,
             min(
-                int(getattr(config, "telegram_max_bubble_chars", 4000)),
+                int(getattr(self._config, "telegram_max_bubble_chars", 4000)),
                 tg_md.TELEGRAM_LIMIT,
             ),
         )
@@ -252,9 +259,9 @@ class BotDeliveryMixin:
         # fail-open.
         render_text = tg_readable.render_for_delivery(
             content,
-            enabled=getattr(config, "enable_readable_renderer", False),
-            loose=getattr(config, "enable_loose_spacing", False),
-            spacing=getattr(config, "spacing_lines", 1),
+            enabled=getattr(self._config, "enable_readable_renderer", False),
+            loose=getattr(self._config, "enable_loose_spacing", False),
+            spacing=getattr(self._config, "spacing_lines", 1),
         )
 
         # Entity path (opt-in via CCC_TELEGRAM_ENTITY_RENDERER, default on):
@@ -264,7 +271,7 @@ class BotDeliveryMixin:
         # the renderer is unavailable (-> MarkdownV2 below), and each chunk
         # degrades to plain text on the rare BadRequest (per-message, so no
         # duplication on partial failure).
-        if getattr(config, "enable_entity_renderer", False):
+        if getattr(self._config, "enable_entity_renderer", False):
             entity_chunks = tg_entities.to_entity_chunks(render_text, limit)
             if entity_chunks:
                 for text, entities in entity_chunks:
@@ -348,7 +355,7 @@ class BotDeliveryMixin:
         await self._send_file_paths(chat_id, in_root_paths)
         # Inline option buttons are opt-in (CCC_TELEGRAM_OPTION_BUTTONS); default
         # off, so numbered options stay as text and the user types their choice.
-        if force_options and getattr(config, "enable_option_buttons", False):
+        if force_options and getattr(self._config, "enable_option_buttons", False):
             options = self._extract_options(content)
             kb = self._build_option_keyboard(options)
             if kb:
@@ -372,12 +379,38 @@ class BotDeliveryMixin:
             return
 
         if data.startswith("extsend:"):
-            session = await session_manager.get_session(user_id)
-            pending = session.get("pending_external_files", [])
-            session.pop("pending_external_files", None)
-            await session_manager.update_session(user_id, session)
+            parts = data.split(":", 2)
+            if len(parts) != 3 or parts[2] not in {"allow", "deny"}:
+                await query.edit_message_text("ℹ️ This file request has expired.")
+                return
 
-            if data == "extsend:deny":
+            _, request_token, decision = parts
+            session_key = self._conversation_key(user_id, chat.id)
+            session = await self._session_manager.get_session(session_key)
+            pending = session.get("pending_external_files", [])
+            pending_token = session.get("pending_external_files_token")
+            if not pending_token or not secrets.compare_digest(
+                str(request_token), str(pending_token)
+            ):
+                await query.edit_message_text("ℹ️ This file request has expired.")
+                return
+
+            consumed = await self._session_manager.patch_session_if(
+                session_key,
+                expected={
+                    "pending_external_files": pending,
+                    "pending_external_files_token": pending_token,
+                },
+                remove_fields={
+                    "pending_external_files",
+                    "pending_external_files_token",
+                },
+            )
+            if not consumed:
+                await query.edit_message_text("ℹ️ This file request has expired.")
+                return
+
+            if decision == "deny":
                 await query.edit_message_text("❌ External file sending cancelled.")
                 return
 
@@ -411,10 +444,10 @@ class BotDeliveryMixin:
             await self._maybe_capture_outside_approval(user_id, choice, chat_id)
 
             async def run_task():
-                session = await session_manager.get_session(user_id)
+                session = await self._session_manager.get_session(user_id)
                 await app.bot.send_chat_action(chat_id, action="typing")
                 try:
-                    response = await project_chat_handler.process_message(
+                    response = await self._project_chat.process_message(
                         user_message=choice,
                         user_id=user_id,
                         chat_id=chat_id,
@@ -458,12 +491,16 @@ class BotDeliveryMixin:
         if data.startswith("model:"):
             model_name = data.split(":", 1)[1]
             log_debug(user_id, "callback", f"model:{model_name}")
-            session = await session_manager.get_session(user_id)
-            session["model"] = model_name
-            await session_manager.update_session(user_id, session)
+            session_key = self._conversation_key(user_id, chat.id)
+            await self._session_manager.patch_session(
+                session_key, updates={"model": model_name}
+            )
             label = dict(self.MODELS).get(model_name, model_name)
             logger.info(
-                f"User {user_id}: model set to {model_name!r} via inline keyboard"
+                "User %s: model set to %r via callback in chat %s",
+                user_id,
+                model_name,
+                chat.id,
             )
             reply = f"✅ Model switched to: {label}"
             await query.edit_message_text(reply)
@@ -471,9 +508,9 @@ class BotDeliveryMixin:
             return
 
         # Check if there's a pending question
-        pending = await session_manager.get_pending_question(user_id)
+        pending = await self._session_manager.get_pending_question(user_id)
         if pending:
-            await session_manager.clear_pending_question(user_id)
+            await self._session_manager.clear_pending_question(user_id)
             await query.edit_message_text(f"✅ Selected: {data}\n\nContinuing...")
 
     async def _set_bot_commands(self):

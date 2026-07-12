@@ -3,7 +3,6 @@ from typing import Any, Optional
 
 import telegram.error
 
-from telegram_bot.utils.config import config
 from telegram_bot.utils.heartbeat_store import (
     discard_heartbeat,
     record_heartbeat,
@@ -17,8 +16,8 @@ class BotStatusMixin:
     def _heartbeat_store_path(self):
         """Resolve the heartbeat id registry path, or None when unavailable."""
         return store_path_for(
-            getattr(config, "bot_data_dir", None),
-            getattr(config, "heartbeat_store_path", None),
+            getattr(self._config, "bot_data_dir", None),
+            getattr(self._config, "heartbeat_store_path", None),
         )
 
     def _make_status_callback(self, bot: Any, chat_id: int):
@@ -28,7 +27,7 @@ class BotStatusMixin:
         async def status_callback(text: Optional[str], message_id: Optional[int] = None) -> Optional[int]:
             try:
                 if text is None:
-                    if message_id is not None and getattr(config, "heartbeat_delete_on_done", True):
+                    if message_id is not None and getattr(self._config, "heartbeat_delete_on_done", True):
                         await bot.delete_message(chat_id=chat_id, message_id=message_id)
                     # Only reached when the delete above didn't raise: the message
                     # is gone, so drop it from the startup-sweep registry. A failed

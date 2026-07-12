@@ -39,26 +39,29 @@ class StreamingMessageHandler:
     messages (``max_bubble_chars``, configurable via CCC_TELEGRAM_MAX_BUBBLE_CHARS).
     """
 
-    def __init__(self, bot: Bot, chat_id: int, user_id: int):
+    def __init__(self, bot: Bot, chat_id: int, user_id: int, *, settings: Any = None):
+        runtime_config = config if settings is None else settings
         self.bot = bot
         self.chat_id = chat_id
         self.user_id = user_id
         self.drafts: List[DraftState] = []
         self.accumulated_text: str = ""
         self.tool_calls_text: str = ""  # Accumulated tool call display text
-        self.min_chars = config.draft_update_min_chars
-        self.min_interval = config.draft_update_interval
+        self.min_chars = runtime_config.draft_update_min_chars
+        self.min_interval = runtime_config.draft_update_interval
         # Max characters per Telegram message ("bubble"). Long replies overflow
         # into a new draft at this size during streaming so no single bubble is
         # overwhelming. Clamped to the Telegram hard limit as a safety bound.
         self.max_bubble_chars = max(
             200,
             min(
-                int(getattr(config, "telegram_max_bubble_chars", 4000)),
+                int(getattr(runtime_config, "telegram_max_bubble_chars", 4000)),
                 tg_md.TELEGRAM_LIMIT,
             ),
         )
-        self.enable_tool_calls = getattr(config, "enable_streaming_tool_calls", False)
+        self.enable_tool_calls = getattr(
+            runtime_config, "enable_streaming_tool_calls", False
+        )
         self._finalized = False
         self._draft_seq = 0
 

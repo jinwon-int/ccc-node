@@ -4,12 +4,12 @@ import asyncio
 import os
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from claude_agent_sdk.types import PermissionResultAllow, PermissionResultDeny
 from claude_agent_sdk._internal.transport.subprocess_cli import SubprocessCLITransport
 
-from telegram_bot.core import bot_access
 from telegram_bot.core.bot_access import BotAccessMixin
 from telegram_bot.core import project_chat, tool_policy
 
@@ -372,18 +372,44 @@ class _MemorySessionManager:
         self.sessions = {}
 
     async def get_session(self, key):
-        return self.sessions.setdefault(key, {})
+        return dict(self.sessions.setdefault(key, {}))
 
-    async def update_session(self, key, session):
-        self.sessions[key] = dict(session)
+    async def update_session(self, key, value):
+        self.sessions.setdefault(key, {}).update(value)
+
+    async def replace_session(self, key, value):
+        self.sessions[key] = dict(value)
+
+    async def patch_session(self, key, *, updates=None, remove_fields=()):
+        current = dict(self.sessions.setdefault(key, {}))
+        current.update(updates or {})
+        for field in remove_fields:
+            current.pop(field, None)
+        self.sessions[key] = current
+
+    async def patch_session_if(
+        self, key, *, expected, updates=None, remove_fields=()
+    ):
+        current = dict(self.sessions.setdefault(key, {}))
+        if any(field not in current or current[field] != value for field, value in expected.items()):
+            return False
+        current.update(updates or {})
+        for field in remove_fields:
+            current.pop(field, None)
+        self.sessions[key] = current
+        return True
+
+    async def set_pending_question(self, key, prompt):
+        self.sessions.setdefault(key, {})["pending_question"] = prompt
 
 
 class _AccessSubject(BotAccessMixin):
     _ALLOW_OUTSIDE_ONCE_TOKEN = "ALLOW_OUTSIDE_ONCE"
     _DENY_OUTSIDE_TOKEN = "DENY_OUTSIDE"
 
-    def __init__(self, bash_policy):
+    def __init__(self, bash_policy, session_manager):
         self._test_bash_policy = bash_policy
+        self._session_manager = session_manager
 
     @staticmethod
     def _conversation_key(user_id, chat_id=None):
@@ -393,27 +419,53 @@ class _AccessSubject(BotAccessMixin):
         return self._test_bash_policy
 
 
+class _InjectedAccessSubject(BotAccessMixin):
+    _ALLOW_OUTSIDE_ONCE_TOKEN = "ALLOW_OUTSIDE_ONCE"
+    _DENY_OUTSIDE_TOKEN = "DENY_OUTSIDE"
+
+    def __init__(self, settings, session_manager):
+        self._config = settings
+        self._session_manager = session_manager
+
+    @staticmethod
+    def _conversation_key(user_id, chat_id=None):
+        return f"{user_id}:{chat_id}" if chat_id is not None else str(user_id)
+
+
 class BashPermissionFlowTest(unittest.TestCase):
     def setUp(self):
         self.sessions = _MemorySessionManager()
-        self.session_patch = patch.object(bot_access, "session_manager", self.sessions)
-        self.session_patch.start()
-        self.addCleanup(self.session_patch.stop)
+
+    def subject(self, bash_policy):
+        return _AccessSubject(bash_policy, self.sessions)
 
     def call(self, subject, command):
         return asyncio.run(subject._permission_callback(10, 20, "Bash", {"command": command}))
 
+    def test_injected_disabled_policy_wins_over_ambient_auto_approve(self):
+        settings = SimpleNamespace(
+            bash_policy="disabled",
+            execution_profile="strict-project",
+            allowed_user_ids=[20],
+            require_allowlist=True,
+            project_root=Path("/tmp/injected-project"),
+        )
+        subject = _InjectedAccessSubject(settings, self.sessions)
+        with patch.object(project_chat, "BASH_POLICY", "auto-approve"):
+            result = self.call(subject, "pwd")
+        self.assertIsInstance(result, PermissionResultDeny)
+
     def test_disabled_policy_denies_even_if_callback_is_called(self):
-        result = self.call(_AccessSubject("disabled"), "pwd")
+        result = self.call(self.subject("disabled"), "pwd")
         self.assertIsInstance(result, PermissionResultDeny)
         self.assertIn("disabled", result.message.lower())
 
     def test_auto_approve_policy_allows_without_one_time_token(self):
-        result = self.call(_AccessSubject("auto-approve"), "pwd")
+        result = self.call(self.subject("auto-approve"), "pwd")
         self.assertIsInstance(result, PermissionResultAllow)
 
     def test_every_per_call_bash_form_requires_approval(self):
-        subject = _AccessSubject("approve-each")
+        subject = self.subject("approve-each")
         commands = [
             "pwd",
             'P=/etc/passwd; cat "$P"',
@@ -428,7 +480,7 @@ class BashPermissionFlowTest(unittest.TestCase):
                 self.assertIn("Bash", result.message)
 
     def test_one_time_approval_is_consumed_and_logged(self):
-        subject = _AccessSubject("approve-each")
+        subject = self.subject("approve-each")
         key = subject._conversation_key(20, 10)
         digest = subject._approval_digest("Bash", {"command": "pwd"})
         self.sessions.sessions[key] = {
@@ -444,7 +496,7 @@ class BashPermissionFlowTest(unittest.TestCase):
         self.assertTrue(any("bash_approval_consumed" in line for line in logs.output))
 
     def test_one_time_approval_cannot_authorize_a_different_command(self):
-        subject = _AccessSubject("approve-each")
+        subject = self.subject("approve-each")
         key = subject._conversation_key(20, 10)
         self.sessions.sessions[key] = {
             "bash_approved_once": True,
@@ -459,7 +511,7 @@ class BashPermissionFlowTest(unittest.TestCase):
         self.assertTrue(any("bash_approval_digest_mismatch" in line for line in logs.output))
 
     def test_outside_path_approval_cannot_authorize_bash(self):
-        subject = _AccessSubject("approve-each")
+        subject = self.subject("approve-each")
         key = subject._conversation_key(20, 10)
         self.sessions.sessions[key] = {
             "outside_path_approved_once": True,
@@ -470,7 +522,7 @@ class BashPermissionFlowTest(unittest.TestCase):
         self.assertTrue(self.sessions.sessions[key]["outside_path_approved_once"])
 
     def test_allow_reply_creates_bash_specific_token(self):
-        subject = _AccessSubject("approve-each")
+        subject = self.subject("approve-each")
         key = subject._conversation_key(20, 10)
         self.sessions.sessions[key] = {
             "pending_outside_paths": ["Bash command requires per-call approval"],
@@ -483,7 +535,7 @@ class BashPermissionFlowTest(unittest.TestCase):
         self.assertFalse(self.sessions.sessions[key].get("outside_path_approved_once", False))
 
     def test_button_reply_creates_token_only_in_the_matching_chat(self):
-        subject = _AccessSubject("approve-each")
+        subject = self.subject("approve-each")
         key = subject._conversation_key(20, 10)
         self.sessions.sessions[key] = {
             "pending_outside_paths": ["Bash command requires per-call approval"],
@@ -497,7 +549,7 @@ class BashPermissionFlowTest(unittest.TestCase):
         self.assertTrue(self.sessions.sessions[key]["bash_approved_once"])
 
     def test_approval_token_must_be_an_explicit_reply(self):
-        subject = _AccessSubject("approve-each")
+        subject = self.subject("approve-each")
         key = subject._conversation_key(20, 10)
         self.sessions.sessions[key] = {
             "pending_outside_paths": ["Bash command requires per-call approval"],
@@ -516,7 +568,7 @@ class BashPermissionFlowTest(unittest.TestCase):
                 self.assertIn("pending_outside_paths", self.sessions.sessions[key])
 
     def test_denial_reply_is_logged_and_clears_pending_digest(self):
-        subject = _AccessSubject("approve-each")
+        subject = self.subject("approve-each")
         key = subject._conversation_key(20, 10)
         self.sessions.sessions[key] = {
             "pending_outside_paths": ["Bash command requires per-call approval"],
@@ -530,7 +582,7 @@ class BashPermissionFlowTest(unittest.TestCase):
         self.assertTrue(any("bash_approval_reply_denied" in line for line in logs.output))
 
     def test_denial_records_pending_state_and_telemetry(self):
-        subject = _AccessSubject("approve-each")
+        subject = self.subject("approve-each")
         key = subject._conversation_key(20, 10)
         with self.assertLogs("telegram_bot.core.bot_access", level="WARNING") as logs:
             result = self.call(subject, "pwd")
