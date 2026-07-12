@@ -264,6 +264,35 @@ async def test_codex_start_resume_and_event_mapping_hides_reasoning(tmp_path: Pa
 
 
 @pytest.mark.anyio
+async def test_codex_uses_only_explicit_provider_neutral_approval_callback(
+    tmp_path: Path,
+) -> None:
+    approval = ApprovalRequestEvent("approval-1", "write_file", {"path": "secret"}, "write")
+    denied = FakeSession("denied", [approval, CompletionEvent("end_turn")])
+    allowed = FakeSession("allowed", [approval, CompletionEvent("end_turn")])
+    handler = _handler(tmp_path, FakeRuntime([denied, allowed]))
+    seen: list[tuple[int, int, str, int]] = []
+
+    async def approve(chat_id, user_id, event, generation):
+        seen.append((chat_id, user_id, event.request_id, generation))
+        return ApprovalDecision.ALLOW
+
+    await handler.process_message("default", 7, 70)
+    await handler.process_message(
+        "explicit",
+        7,
+        71,
+        approval_callback=approve,
+    )
+
+    assert denied.approvals == [ApprovalDecision.DENY]
+    assert allowed.approvals == [ApprovalDecision.ALLOW]
+    assert len(seen) == 1
+    assert seen[0][:3] == (71, 7, "approval-1")
+    assert handler.is_agent_approval_active(7, 71, seen[0][3]) is False
+
+
+@pytest.mark.anyio
 async def test_codex_browsing_methods_delegate_without_claude_transcript_access(
     tmp_path: Path,
 ) -> None:

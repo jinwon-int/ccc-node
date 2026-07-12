@@ -1,6 +1,6 @@
 """Stream state/control mixin for ProjectChatHandler."""
 
-# mypy: disable-error-code="attr-defined"
+# mypy: disable-error-code="attr-defined,has-type"
 
 import asyncio
 import logging
@@ -13,6 +13,28 @@ logger = logging.getLogger(__name__)
 
 
 class ProjectChatStateMixin:
+    def _next_agent_generation(self, key) -> int:
+        generation = self._agent_generation_counters.get(key, 0) + 1
+        self._agent_generation_counters[key] = generation
+        return generation
+
+    def is_agent_approval_active(
+        self, user_id: int, chat_id: int, generation: int
+    ) -> bool:
+        key = self._stream_key(user_id, chat_id)
+        return (
+            not self._agent_runtime_closed
+            and self._agent_active_generations.get(key) == generation
+            and key in self._agent_active_sessions
+        )
+
+    def invalidate_agent_approvals(
+        self, user_id: int, chat_id: Optional[int] = None
+    ) -> None:
+        for key in self._agent_keys_for_user(user_id, chat_id):
+            self._next_agent_generation(key)
+            self._agent_active_generations.pop(key, None)
+
     def _require_runtime(self):
         if self._agent_runtime is None or self._agent_runtime_closed:
             raise RuntimeError("Agent runtime is unavailable")
@@ -48,6 +70,7 @@ class ProjectChatStateMixin:
         """
         if self._agent_runtime is not None:
             sessions = self._active_agent_sessions_for_user(user_id, chat_id)
+            self.invalidate_agent_approvals(user_id, chat_id)
             await asyncio.gather(
                 *(self._interrupt_agent_session(session) for session in sessions)
             )
@@ -151,6 +174,7 @@ class ProjectChatStateMixin:
         if self._agent_runtime is None or self._agent_runtime_closed:
             return
         self._agent_runtime_closed = True
+        self._agent_active_generations.clear()
         await asyncio.gather(
             *(
                 self._interrupt_agent_session(session)

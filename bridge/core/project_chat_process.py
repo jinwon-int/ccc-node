@@ -7,6 +7,7 @@ import logging
 from typing import Any, Optional
 
 from telegram_bot.core.agent_runtime import (
+    ApprovalDecision,
     ApprovalRequestEvent,
     CompletionEvent,
     ErrorEvent,
@@ -16,9 +17,9 @@ from telegram_bot.core.agent_runtime import (
     TextDeltaEvent,
     ToolCompletedEvent,
     ToolStartedEvent,
-    deny_approval,
 )
 from telegram_bot.core.project_chat_types import (
+    AgentApprovalCallback,
     ChatResponse,
     PermissionCallback,
     StatusCallback,
@@ -62,6 +63,7 @@ class ProjectChatProcessMixin:
         model: Optional[str] = None,
         new_session: bool = False,
         permission_callback: Optional[PermissionCallback] = None,
+        approval_callback: Optional[AgentApprovalCallback] = None,
         typing_callback: Optional[TypingCallback] = None,
         status_callback: Optional[StatusCallback] = None,
         bot: Optional[Any] = None,
@@ -76,6 +78,7 @@ class ProjectChatProcessMixin:
                 session_id=session_id,
                 model=model,
                 new_session=new_session,
+                approval_callback=approval_callback,
                 typing_callback=typing_callback,
                 bot=bot,
             )
@@ -312,6 +315,7 @@ class ProjectChatProcessMixin:
         session_id: Optional[str],
         model: Optional[str],
         new_session: bool,
+        approval_callback: Optional[AgentApprovalCallback],
         typing_callback: Optional[TypingCallback],
         bot: Optional[Any],
     ) -> ChatResponse:
@@ -324,6 +328,8 @@ class ProjectChatProcessMixin:
             streaming_handler = StreamingMessageHandler(bot, chat_id, user_id, settings=self._config)
 
         async with self._get_conversation_lock(user_id, chat_id):
+            generation = self._next_agent_generation(key)
+            self._agent_active_generations[key] = generation
             session = self._agent_sessions.get(key)
             if new_session or (
                 session is not None
@@ -352,11 +358,30 @@ class ProjectChatProcessMixin:
                 text_parts: list[str] = []
                 terminal_error: ErrorEvent | None = None
 
+                async def handle_approval(event: ApprovalRequestEvent) -> ApprovalDecision:
+                    if approval_callback is None:
+                        return ApprovalDecision.DENY
+                    if not self.is_agent_approval_active(user_id, chat_id, generation):
+                        return ApprovalDecision.DENY
+                    try:
+                        decision = await approval_callback(chat_id, user_id, event, generation)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        logger.exception("Provider-neutral approval callback failed")
+                        return ApprovalDecision.DENY
+                    if (
+                        decision is ApprovalDecision.ALLOW
+                        and self.is_agent_approval_active(user_id, chat_id, generation)
+                    ):
+                        return ApprovalDecision.ALLOW
+                    return ApprovalDecision.DENY
+
                 async def consume_agent_events() -> None:
                     nonlocal terminal_error
                     async for event in session.send_turn(
                         user_message,
-                        approval_handler=deny_approval,
+                        approval_handler=handle_approval,
                     ):
                         if typing_callback is not None:
                             try:
@@ -452,6 +477,8 @@ class ProjectChatProcessMixin:
                     session_id=session.session_id if session is not None else session_id,
                 )
             finally:
+                if self._agent_active_generations.get(key) == generation:
+                    self._agent_active_generations.pop(key, None)
                 if self._agent_active_sessions.get(key) is session:
                     self._agent_active_sessions.pop(key, None)
                     self._agent_started_at.pop(key, None)

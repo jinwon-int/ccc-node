@@ -53,6 +53,7 @@ from telegram_bot.core import bot_delivery as _bot_delivery_module
 from telegram_bot.core.bot_delivery import BotDeliveryMixin
 from telegram_bot.core import bot_voice as _bot_voice_module
 from telegram_bot.core.bot_voice import BotVoiceMixin
+from telegram_bot.core.bot_approvals import BotApprovalMixin
 
 
 _EXTRACTED_MODULES = (
@@ -88,7 +89,15 @@ _sync_extracted_modules()
 sys.modules[__name__].__class__ = _BotModule
 
 
-class TelegramBot(BotLifecycleMixin, BotStatusMixin, BotAccessMixin, BotCommandMixin, BotDeliveryMixin, BotVoiceMixin):
+class TelegramBot(
+    BotLifecycleMixin,
+    BotStatusMixin,
+    BotAccessMixin,
+    BotCommandMixin,
+    BotDeliveryMixin,
+    BotVoiceMixin,
+    BotApprovalMixin,
+):
 
     def __init__(
         self,
@@ -121,6 +130,7 @@ class TelegramBot(BotLifecycleMixin, BotStatusMixin, BotAccessMixin, BotCommandM
         self._volcengine_transcriber: Optional[VolcengineFileFastTranscriber] = None
         self._volcengine_tos_uploader: Optional[VolcengineTOSUploader] = None
         self._tts_synthesizer: Optional[MacOSTtsSynthesizer] = None
+        self._initialize_codex_approvals()
 
 
     # Available models for /model command (aliases, CLI resolves via env vars)
@@ -439,6 +449,8 @@ class TelegramBot(BotLifecycleMixin, BotStatusMixin, BotAccessMixin, BotCommandM
             conversation_key, current_session
         )
         if provider_switched:
+            self._deny_codex_approvals(user_id, chat.id)
+            self._invalidate_codex_approvals(user_id, chat.id)
             self._runtime_active_sessions.discard(conversation_key)
         current_reply_mode = self._normalize_reply_mode(
             current_session.get("reply_mode")
@@ -544,6 +556,7 @@ class TelegramBot(BotLifecycleMixin, BotStatusMixin, BotAccessMixin, BotCommandM
                 model=current_session.get("model"),
                 new_session=new_session,
                 permission_callback=self._permission_callback,
+                approval_callback=self._codex_approval_callback,
                 typing_callback=lambda: message.chat.send_action(action="typing"),
                 status_callback=self._make_status_callback(app.bot, chat.id),
                 bot=app.bot if enable_streaming_text else None,

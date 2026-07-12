@@ -84,6 +84,7 @@ from telegram_bot.core.sdk_text import (  # noqa: E402,F401
 
 from telegram_bot.core.project_chat_types import (  # noqa: E402,F401
     ChatResponse,
+    AgentApprovalCallback,
     PermissionCallback,
     StatusCallback,
     TypingCallback,
@@ -177,6 +178,8 @@ class ProjectChatHandler(
         self._agent_sessions: Dict[Tuple[int, int], Any] = {}
         self._agent_session_models: Dict[Tuple[int, int], Optional[str]] = {}
         self._agent_active_sessions: Dict[Tuple[int, int], Any] = {}
+        self._agent_active_generations: Dict[Tuple[int, int], int] = {}
+        self._agent_generation_counters: Dict[Tuple[int, int], int] = {}
         self._agent_started_at: Dict[Tuple[int, int], float] = {}
         self._agent_runtime_closed = False
         self._agent_interrupt_timeout_seconds = 10.0

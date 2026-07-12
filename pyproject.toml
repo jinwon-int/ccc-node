@@ -26,6 +26,7 @@ mypy_path = "bridge"
 explicit_package_bases = true
 files = [
   "bridge/core/agent_runtime.py",
+  "bridge/core/bot_approvals.py",
   "bridge/core/codex_app_server.py",
   "bridge/core/codex_runtime.py",
   "bridge/core/paths.py",

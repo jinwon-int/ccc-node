@@ -395,6 +395,10 @@ class BotDeliveryMixin:
         if data is None:
             return
 
+        if data.startswith("ca:"):
+            await self._resolve_codex_approval(user_id, chat.id, data)
+            return
+
         if data.startswith("extsend:"):
             parts = data.split(":", 2)
             if len(parts) != 3 or parts[2] not in {"allow", "deny"}:
@@ -474,6 +478,7 @@ class BotDeliveryMixin:
                         session_id=self._effective_session_id(conversation_key, session),
                         model=session.get("model"),
                         permission_callback=self._permission_callback,
+                        approval_callback=self._codex_approval_callback,
                         typing_callback=lambda: app.bot.send_chat_action(
                             chat_id, action="typing"
                         ),

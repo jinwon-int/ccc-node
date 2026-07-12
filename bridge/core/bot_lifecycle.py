@@ -582,6 +582,7 @@ class BotLifecycleMixin:
             force: If True, skip graceful stop and immediately cleanup.
                    Use when connection pool is exhausted or timed out.
         """
+        self._deny_codex_approvals()
         if not self.application:
             return
 
