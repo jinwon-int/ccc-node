@@ -256,7 +256,9 @@ class BotLifecycleMixin:
             allowed_user_ids=getattr(config, "allowed_user_ids", []),
             require_allowlist=getattr(config, "require_allowlist", True),
         )
-        bash_policy = effective_bash_policy(resolve_bash_policy(), execution_profile)
+        bash_policy = effective_bash_policy(
+            resolve_bash_policy(getattr(config, "bash_policy", None)), execution_profile
+        )
         logger.info(
             "bridge_execution_policy execution_profile=%s bash_policy=%s host_scope=%s",
             execution_profile,

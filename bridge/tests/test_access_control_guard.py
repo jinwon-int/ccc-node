@@ -121,6 +121,57 @@ class AccessControlGuardTests(unittest.TestCase):
             self.assertNotIn("ALLOWED_USER_IDS=42", log_text)
             self.assertFalse((data_dir / "health.json").exists())
 
+    def test_real_entrypoint_logs_bound_project_bash_policy_before_allowlist_exit(self):
+        repo_root = Path(__file__).resolve().parents[2]
+        bridge_dir = repo_root / "bridge"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            project_root = Path(temp_dir)
+            project_root.chmod(0o700)
+            data_dir = project_root / ".telegram_bot"
+            data_dir.mkdir(mode=0o700)
+            env_file = data_dir / ".env"
+            env_file.write_text(
+                "TELEGRAM_BOT_TOKEN=123456:test\n"
+                "CCC_REQUIRE_ALLOWLIST=true\n"
+                "CCC_BRIDGE_EXECUTION_PROFILE=strict-project\n"
+                "CCC_BRIDGE_BASH_POLICY=approve-each\n",
+                encoding="utf-8",
+            )
+            env_file.chmod(0o600)
+
+            env = os.environ.copy()
+            for key in (
+                "PROJECT_ROOT",
+                "TELEGRAM_BOT_TOKEN",
+                "ALLOWED_USER_IDS",
+                "CCC_REQUIRE_ALLOWLIST",
+                "CCC_BRIDGE_EXECUTION_PROFILE",
+                "CCC_BRIDGE_BASH_POLICY",
+            ):
+                env.pop(key, None)
+            env["BOT_DEBUG"] = "1"
+            env["PYTHONPATH"] = str(repo_root / ".github" / "pythonpath")
+
+            result = subprocess.run(
+                [sys.executable, "-m", "telegram_bot", "--path", str(project_root), "--debug"],
+                cwd=bridge_dir,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            log_text = (data_dir / "logs" / "bot.log").read_text(encoding="utf-8")
+            self.assertIn(
+                "bridge_execution_policy execution_profile=strict-project "
+                "bash_policy=approve-each host_scope=false",
+                log_text,
+            )
+            self.assertIn("Refusing to start: ALLOWED_USER_IDS is empty", log_text)
+            self.assertFalse((data_dir / "health.json").exists())
+
 
 if __name__ == "__main__":
     unittest.main()

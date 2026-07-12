@@ -1,27 +1,25 @@
 import json
 import os
 import logging
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Annotated, Optional, List
-from dotenv import load_dotenv
+from typing import Annotated, Any, Optional, List
+from dotenv import dotenv_values
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 BOT_PACKAGE_DIR = Path(__file__).resolve().parent.parent
 
-# Project root directory (where the bot operates)
-PROJECT_ROOT = Path(os.environ["PROJECT_ROOT"]).resolve()
+# Compatibility defaults for direct ``Config(...)`` construction. Runtime
+# settings are loaded lazily below; importing this module must not require a
+# project root or touch the process environment.
+PROJECT_ROOT = Path(os.environ.get("PROJECT_ROOT", os.curdir)).resolve()
 BOT_DATA_DIR = PROJECT_ROOT / ".telegram_bot"
 ENV_FILE_PATH = BOT_DATA_DIR / ".env"  # project config (priority)
 BOT_ENV_FILE_PATH = BOT_PACKAGE_DIR / ".env"  # global fallback (e.g. CLAUDE_CLI_PATH)
 
 _PLACEHOLDER_TOKENS = {"your_bot_token_here", ""}
-
-load_dotenv(dotenv_path=ENV_FILE_PATH)  # project .env first (higher priority)
-# If project .env has a placeholder token, clear it so bot source .env fallback works
-if os.environ.get("TELEGRAM_BOT_TOKEN", "") in _PLACEHOLDER_TOKENS:
-    os.environ.pop("TELEGRAM_BOT_TOKEN", None)
-load_dotenv(dotenv_path=BOT_ENV_FILE_PATH)  # global fallback (won't override already-set vars)
+_IMPORT_ENV = dict(os.environ)
 
 LOGS_DIR = BOT_DATA_DIR / "logs"
 SESSION_STORE_PATH = BOT_DATA_DIR / "sessions.json"
@@ -37,6 +35,67 @@ class Config(BaseSettings):
         env_file_encoding="utf-8",
         extra="ignore",
     )
+
+    @classmethod
+    def load(
+        cls,
+        *,
+        project_root: Path | str | None = None,
+        environ: Mapping[str, str] | None = None,
+        bot_env_file: Path | str | None = None,
+    ) -> "Config":
+        """Load settings without mutating the process environment.
+
+        Precedence is explicit: process environment, project ``.env``, then the
+        package fallback ``.env``.
+        """
+        process_values = dict(os.environ if environ is None else environ)
+        root_value = project_root if project_root is not None else process_values.get("PROJECT_ROOT")
+        if root_value is None or not str(root_value).strip():
+            raise ValueError("PROJECT_ROOT must be non-empty to load runtime settings")
+        root = Path(root_value).expanduser().resolve()
+        fallback_path = Path(bot_env_file or BOT_ENV_FILE_PATH).expanduser()
+        project_path = root / ".telegram_bot" / ".env"
+
+        fallback_values = {
+            key: value
+            for key, value in dotenv_values(fallback_path).items()
+            if value is not None
+        }
+        project_values = {
+            key: value
+            for key, value in dotenv_values(project_path).items()
+            if value is not None
+        }
+        process_token = process_values.get("TELEGRAM_BOT_TOKEN")
+        fallback_has_token = "TELEGRAM_BOT_TOKEN" in fallback_values
+        if process_token in _PLACEHOLDER_TOKENS:
+            process_values.pop("TELEGRAM_BOT_TOKEN", None)
+            if fallback_has_token:
+                project_values.pop("TELEGRAM_BOT_TOKEN", None)
+        elif (
+            project_values.get("TELEGRAM_BOT_TOKEN") in _PLACEHOLDER_TOKENS
+            and fallback_has_token
+        ):
+            project_values.pop("TELEGRAM_BOT_TOKEN", None)
+        merged = {**fallback_values, **project_values, **process_values}
+
+        values: dict[str, Any] = {}
+        for name, field in cls.model_fields.items():
+            environment_name = field.alias or name.upper()
+            if environment_name in merged:
+                values[field.alias or name] = merged[environment_name]
+
+        data_dir = root / ".telegram_bot"
+        home = Path(process_values.get("HOME", str(Path.home()))).expanduser()
+        values.setdefault("bot_data_dir", data_dir)
+        values.setdefault("logs_dir", data_dir / "logs")
+        values.setdefault("session_store_path", data_dir / "sessions.json")
+        values.setdefault("claude_settings_path", home / ".claude" / "settings.json")
+        values.setdefault(
+            "CCC_PUSH_SPOOL", home / ".claude" / "state" / "telegram-spool"
+        )
+        return cls.model_validate(values)
 
     claude_cli_path: Optional[Path] = Field(
         default=None,
@@ -106,6 +165,11 @@ class Config(BaseSettings):
             "(single allowlisted owner only), or disabled."
         ),
     )
+    bash_policy: str = Field(
+        default="auto-approve",
+        alias="CCC_BRIDGE_BASH_POLICY",
+        description="Bash approval UX: auto-approve, approve-each, or disabled.",
+    )
 
     # ccc-node push notifier (owner-only outbound Claude Code lifecycle notifications).
     # DISABLED by default — opt-in only. See core/push_notifier.py for the approval boundary.
@@ -135,12 +199,29 @@ class Config(BaseSettings):
         description="Rate limit: max push messages delivered per minute.",
     )
 
-    @field_validator("push_enabled", "require_allowlist", mode="before")
+    @field_validator("push_enabled", mode="before")
     @classmethod
     def parse_push_enabled(cls, v):
         if isinstance(v, str):
             return v.strip().lower() in ("1", "true", "yes", "on")
         return bool(v)
+
+    @field_validator("require_allowlist", mode="before")
+    @classmethod
+    def parse_require_allowlist(cls, v):
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, str):
+            normalized = v.strip().lower()
+            if normalized in {"1", "true", "yes", "on"}:
+                return True
+            if normalized in {"0", "false", "no", "off"}:
+                return False
+        elif isinstance(v, int) and v in {0, 1}:
+            return bool(v)
+        raise ValueError(
+            "CCC_REQUIRE_ALLOWLIST must be a boolean: true/false, yes/no, on/off, or 1/0"
+        )
 
     @field_validator("allowed_user_ids", mode="before")
     @classmethod
@@ -670,14 +751,57 @@ class Config(BaseSettings):
     )
 
 
-# Global config instance
-config = Config()  # type: ignore[call-arg]
+Settings = Config
 
 
-def setup_logging() -> None:
-    """Setup logging configuration with console and file output"""
-    log_level = getattr(logging, config.log_level.upper())
-    formatter = logging.Formatter(config.log_format)
+def _load_legacy_config() -> Config:
+    """Load the compatibility singleton only when a runtime consumer needs it."""
+    return Config.load(
+        project_root=PROJECT_ROOT,
+        environ=_IMPORT_ENV,
+        bot_env_file=BOT_ENV_FILE_PATH,
+    )
+
+
+class _LazyConfig:
+    """Compatibility proxy that keeps module import side-effect free."""
+
+    def __init__(self) -> None:
+        object.__setattr__(self, "_loaded", None)
+
+    def bind(self, settings: Config) -> None:
+        object.__setattr__(self, "_loaded", settings)
+
+    def _get(self) -> Config:
+        loaded = object.__getattribute__(self, "_loaded")
+        if loaded is None:
+            loaded = _load_legacy_config()
+            object.__setattr__(self, "_loaded", loaded)
+        return loaded
+
+    def __getattr__(self, name):
+        return getattr(self._get(), name)
+
+    def __setattr__(self, name, value) -> None:
+        setattr(self._get(), name, value)
+
+    def __delattr__(self, name) -> None:
+        delattr(self._get(), name)
+
+
+config = _LazyConfig()
+
+
+def bind_config(settings: Config) -> None:
+    """Bind validated settings before importing runtime components."""
+    config.bind(settings)
+
+
+def setup_logging(settings: Config | None = None) -> None:
+    """Setup logging configuration with console and file output."""
+    runtime_config: Any = config if settings is None else settings
+    log_level = getattr(logging, runtime_config.log_level.upper())
+    formatter = logging.Formatter(runtime_config.log_format)
 
     is_debug = os.environ.get("BOT_DEBUG")
 
@@ -690,7 +814,7 @@ def setup_logging() -> None:
     # session_id" — so bot.log only ever captured WARNING+ despite the file handler
     # being set to INFO. Set the root to the most-verbose handler's level (log_level)
     # and gate the CONSOLE per-handler instead so the file still receives INFO.
-    logging.basicConfig(level=log_level, format=config.log_format)
+    logging.basicConfig(level=log_level, format=runtime_config.log_format)
     root_logger = logging.getLogger()
     # basicConfig is a no-op when a harness (for example pytest) already installed
     # handlers, so set the root level explicitly as the durable invariant.
@@ -701,7 +825,7 @@ def setup_logging() -> None:
         _h.setLevel(console_level)
 
     # File handler - write to project-root scoped runtime logs.
-    logs_dir = config.logs_dir
+    logs_dir = runtime_config.logs_dir
     logs_dir.mkdir(parents=True, exist_ok=True)
     # Always write to file, not just in debug mode
     fh = logging.FileHandler(logs_dir / "bot.log", encoding="utf-8")
