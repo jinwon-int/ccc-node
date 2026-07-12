@@ -23,9 +23,12 @@ warn_unused_ignores = true
 no_implicit_optional = true
 ignore_missing_imports = true
 mypy_path = "bridge"
+explicit_package_bases = true
 files = [
+  "bridge/core/agent_runtime.py",
   "bridge/core/paths.py",
   "bridge/core/push_notifier.py",
   "bridge/core/task_queue.py",
+  "bridge/tests/test_agent_runtime_contract.py",
   "scripts/agent_cron_lib.py",
 ]

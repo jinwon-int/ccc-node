@@ -10,11 +10,31 @@ from __future__ import annotations
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
-from typing import Literal, Protocol, TypeAlias, runtime_checkable
+from types import MappingProxyType
+from typing import Literal, Protocol, TypeAlias
 
 JsonValue: TypeAlias = (
-    None | bool | int | float | str | list["JsonValue"] | dict[str, "JsonValue"]
+    None
+    | bool
+    | int
+    | float
+    | str
+    | list["JsonValue"]
+    | tuple["JsonValue", ...]
+    | Mapping[str, "JsonValue"]
 )
+
+
+def freeze_json(value: JsonValue) -> JsonValue:
+    """Return a recursively immutable snapshot of a JSON-compatible value."""
+
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, Mapping):
+        return MappingProxyType({key: freeze_json(item) for key, item in value.items()})
+    if isinstance(value, (list, tuple)):
+        return tuple(freeze_json(item) for item in value)
+    raise TypeError(f"unsupported JSON value: {type(value).__name__}")
 
 
 class ApprovalDecision(str, Enum):
@@ -65,6 +85,11 @@ class ApprovalRequestEvent:
             raise ValueError("approval action must not be empty")
         if not self.description:
             raise ValueError("approval description must not be empty")
+        object.__setattr__(
+            self,
+            "arguments",
+            MappingProxyType({key: freeze_json(value) for key, value in self.arguments.items()}),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,6 +110,9 @@ class ResultEvent:
 
     result: JsonValue
     kind: Literal["result"] = "result"
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "result", freeze_json(self.result))
 
 
 @dataclass(frozen=True, slots=True)
@@ -151,7 +179,6 @@ class ModelInfo:
             raise ValueError("model display name must not be empty")
 
 
-@runtime_checkable
 class AgentSession(Protocol):
     """A live provider-neutral agent session."""
 
@@ -160,7 +187,7 @@ class AgentSession(Protocol):
         """Stable identifier for this session."""
         ...
 
-    async def send_turn(
+    def send_turn(
         self,
         message: str,
         *,
@@ -178,7 +205,6 @@ class AgentSession(Protocol):
         ...
 
 
-@runtime_checkable
 class AgentRuntime(Protocol):
     """Factory and model-discovery contract implemented by agent providers."""
 

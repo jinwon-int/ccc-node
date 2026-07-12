@@ -2,26 +2,46 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Callable, Sequence
-from typing import cast
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
+from typing import TYPE_CHECKING, cast
 import unittest
 
-from telegram_bot.core.agent_runtime import (
-    AgentEvent,
-    AgentRuntime,
-    AgentSession,
-    ApprovalDecision,
-    ApprovalHandler,
-    ApprovalRequestEvent,
-    CompletionEvent,
-    ErrorEvent,
-    ModelInfo,
-    ReasoningDeltaEvent,
-    ResultEvent,
-    SessionRequest,
-    TextDeltaEvent,
-    deny_approval,
-)
+if TYPE_CHECKING:
+    from core.agent_runtime import (
+        AgentEvent,
+        AgentRuntime,
+        AgentSession,
+        ApprovalDecision,
+        ApprovalHandler,
+        ApprovalRequestEvent,
+        CompletionEvent,
+        ErrorEvent,
+        JsonValue,
+        ModelInfo,
+        ReasoningDeltaEvent,
+        ResultEvent,
+        SessionRequest,
+        TextDeltaEvent,
+        deny_approval,
+    )
+else:
+    from telegram_bot.core.agent_runtime import (
+        AgentEvent,
+        AgentRuntime,
+        AgentSession,
+        ApprovalDecision,
+        ApprovalHandler,
+        ApprovalRequestEvent,
+        CompletionEvent,
+        ErrorEvent,
+        JsonValue,
+        ModelInfo,
+        ReasoningDeltaEvent,
+        ResultEvent,
+        SessionRequest,
+        TextDeltaEvent,
+        deny_approval,
+    )
 
 
 class FakeSession:
@@ -29,7 +49,7 @@ class FakeSession:
         self.session_id = session_id
         self.interrupted = False
 
-    async def send_turn(
+    def send_turn(
         self,
         message: str,
         *,
@@ -41,9 +61,8 @@ class FakeSession:
             arguments={"path": "notes.txt"},
             description="Write notes.txt",
         )
-        decision = await approval_handler(request)
-
         async def events() -> AsyncIterator[AgentEvent]:
+            decision = await approval_handler(request)
             yield TextDeltaEvent(text=message)
             yield ReasoningDeltaEvent(text="checking approval")
             yield request
@@ -75,19 +94,16 @@ _fake_runtime_conforms: AgentRuntime = FakeRuntime()
 class AgentRuntimeContractTests(unittest.IsolatedAsyncioTestCase):
     async def test_fake_runtime_structurally_conforms_and_streams_all_event_kinds(self) -> None:
         runtime = FakeRuntime()
-        self.assertIsInstance(runtime, AgentRuntime)
-
         session = await runtime.start_or_resume(
             SessionRequest(working_directory="/workspace", session_id="resume-me")
         )
-        self.assertIsInstance(session, AgentSession)
         self.assertEqual(session.session_id, "resume-me")
         self.assertEqual((await runtime.list_models())[0].id, "fake-model")
 
         async def allow(_request: ApprovalRequestEvent) -> ApprovalDecision:
             return ApprovalDecision.ALLOW
 
-        stream = await session.send_turn("hello", approval_handler=allow)
+        stream = session.send_turn("hello", approval_handler=allow)
         events = [event async for event in stream]
 
         self.assertEqual(
@@ -100,7 +116,7 @@ class AgentRuntimeContractTests(unittest.IsolatedAsyncioTestCase):
     async def test_approval_is_explicit_and_defaults_to_deny(self) -> None:
         session = FakeSession("session")
 
-        stream = await session.send_turn("hello")
+        stream = session.send_turn("hello")
         events = [event async for event in stream]
 
         self.assertIsInstance(events[-1], ErrorEvent)
@@ -115,12 +131,47 @@ class AgentRuntimeContractTests(unittest.IsolatedAsyncioTestCase):
             lambda: ApprovalRequestEvent(
                 request_id="", action="write_file", arguments={}, description="Write a file"
             ),
+            lambda: ApprovalRequestEvent(
+                request_id="approval", action="", arguments={}, description="Write a file"
+            ),
+            lambda: ApprovalRequestEvent(
+                request_id="approval", action="write_file", arguments={}, description=""
+            ),
+            lambda: CompletionEvent(stop_reason=""),
             lambda: ErrorEvent(code="", message="failed"),
+            lambda: ErrorEvent(code="failed", message=""),
+            lambda: SessionRequest(working_directory=""),
+            lambda: SessionRequest(working_directory="/workspace", session_id=""),
+            lambda: SessionRequest(working_directory="/workspace", model=""),
+            lambda: ModelInfo(id="", display_name="Fake model"),
+            lambda: ModelInfo(id="fake", display_name=""),
         )
 
         for factory in invalid_factories:
             with self.subTest(factory=factory), self.assertRaises(ValueError):
                 factory()
+
+    async def test_event_payloads_are_recursively_immutable_snapshots(self) -> None:
+        arguments: dict[str, JsonValue] = {"path": "notes.txt", "tags": ["a"]}
+        request = ApprovalRequestEvent(
+            request_id="approval-1",
+            action="write_file",
+            arguments=arguments,
+            description="Write notes.txt",
+        )
+        result_source: dict[str, JsonValue] = {"items": [{"value": 1}]}
+        result = ResultEvent(result=result_source)
+
+        arguments["path"] = "changed.txt"
+        cast(list[str], arguments["tags"]).append("b")
+        cast(list[dict[str, int]], result_source["items"])[0]["value"] = 2
+
+        self.assertEqual(request.arguments["path"], "notes.txt")
+        self.assertEqual(request.arguments["tags"], ("a",))
+        frozen_result = cast(Mapping[str, object], result.result)
+        self.assertEqual(cast(tuple[Mapping[str, int], ...], frozen_result["items"])[0]["value"], 1)
+        with self.assertRaises(TypeError):
+            cast(dict[str, object], request.arguments)["path"] = "forbidden"
 
 
 if __name__ == "__main__":
