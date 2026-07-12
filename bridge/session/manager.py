@@ -9,6 +9,7 @@ if TYPE_CHECKING:
 
 class SessionManager:
     VALID_REPLY_MODES = {"text", "voice"}
+    VALID_PROVIDERS = {"claude", "codex"}
     DEFAULT_REPLY_MODE = "text"
     LAST_USER_MESSAGE_AT_KEY = "last_user_message_at"
 
@@ -30,6 +31,17 @@ class SessionManager:
             return cls.DEFAULT_REPLY_MODE
         return normalized
 
+    @classmethod
+    def normalize_provider(cls, provider: Optional[str]) -> str:
+        """Interpret provider-less legacy rows as Claude."""
+        normalized = str(provider or "claude").strip().lower()
+        if normalized not in cls.VALID_PROVIDERS:
+            raise ValueError(f"Unsupported session provider: {provider!r}")
+        return normalized
+
+    def active_provider(self) -> str:
+        return self.normalize_provider(getattr(self.settings, "agent_provider", "claude"))
+
     async def _ensure_reply_mode(
         self, user_id: int, session: Dict[str, Any]
     ) -> Dict[str, Any]:
@@ -43,12 +55,49 @@ class SessionManager:
     async def list_sessions(self) -> Dict[str, Dict[str, Any]]:
         return await self.store.list_sessions()
 
+    async def get_session_provider(self, user_id: int) -> str:
+        """Read the effective provider without lazily persisting other defaults."""
+        stored = await self.store.get(user_id)
+        if stored is None:
+            return self.active_provider()
+        return self.normalize_provider(stored.get("provider"))
+
     async def get_session(self, user_id: int) -> Dict[str, Any]:
-        session = await self.store.get(user_id) or {}
+        stored = await self.store.get(user_id)
+        if stored is None:
+            session = {
+                "provider": self.active_provider(),
+                "reply_mode": self.DEFAULT_REPLY_MODE,
+            }
+            await self.store.patch(user_id, updates=session)
+            return session
+        session = stored
+        session["provider"] = self.normalize_provider(session.get("provider"))
         return await self._ensure_reply_mode(user_id, session)
+
+    async def align_active_provider(self, user_id: int) -> tuple[Dict[str, Any], bool]:
+        """Reset provider-specific state in one atomic patch after a provider change."""
+        session = await self.get_session(user_id)
+        active_provider = self.active_provider()
+        if session["provider"] == active_provider:
+            return session, False
+        await self.patch_session(
+            user_id,
+            updates={
+                "provider": active_provider,
+                "session_id": None,
+                "new_session": True,
+            },
+            remove_fields={"model"},
+        )
+        session.update(provider=active_provider, session_id=None, new_session=True)
+        session.pop("model", None)
+        return session, True
 
     async def update_session(self, user_id: int, data: Dict[str, Any]) -> None:
         payload = dict(data)
+        if "provider" in payload:
+            payload["provider"] = self.normalize_provider(payload.get("provider"))
         if "reply_mode" in payload:
             payload["reply_mode"] = self.normalize_reply_mode(payload.get("reply_mode"))
         await self.store.update(user_id, payload)
@@ -56,6 +105,8 @@ class SessionManager:
     async def replace_session(self, user_id: int, data: Dict[str, Any]) -> None:
         """Persist a complete session snapshot, including field removals."""
         payload = dict(data)
+        if "provider" in payload:
+            payload["provider"] = self.normalize_provider(payload.get("provider"))
         if "reply_mode" in payload:
             payload["reply_mode"] = self.normalize_reply_mode(payload.get("reply_mode"))
         await self.store.set(user_id, payload)
@@ -68,6 +119,8 @@ class SessionManager:
         remove_fields: Iterable[str] = (),
     ) -> None:
         payload = dict(updates or {})
+        if "provider" in payload:
+            payload["provider"] = self.normalize_provider(payload.get("provider"))
         if "reply_mode" in payload:
             payload["reply_mode"] = self.normalize_reply_mode(payload.get("reply_mode"))
         await self.store.patch(user_id, updates=payload, remove_fields=remove_fields)
@@ -81,6 +134,8 @@ class SessionManager:
         remove_fields: Iterable[str] = (),
     ) -> bool:
         payload = dict(updates or {})
+        if "provider" in payload:
+            payload["provider"] = self.normalize_provider(payload.get("provider"))
         if "reply_mode" in payload:
             payload["reply_mode"] = self.normalize_reply_mode(payload.get("reply_mode"))
         return await self.store.patch_if(

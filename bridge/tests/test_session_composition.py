@@ -360,6 +360,7 @@ class InterleavingManager:
 subject = object.__new__(TelegramBot)
 subject._session_manager = InterleavingManager()
 subject._runtime_active_sessions = set()
+subject._config = SimpleNamespace(agent_provider="claude")
 
 asyncio.run(
     subject._save_session_id(
@@ -368,7 +369,10 @@ asyncio.run(
     )
 )
 
-assert subject._session_manager.persisted == {"session_id": "session-new"}
+assert subject._session_manager.persisted == {
+    "provider": "claude",
+    "session_id": "session-new",
+}
 print("SESSION_ID_PATCH_OK")
 """,
         probe_root=tmp_path,

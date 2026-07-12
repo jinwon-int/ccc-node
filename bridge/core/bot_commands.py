@@ -97,18 +97,28 @@ class BotCommandMixin:
         await self._cancel_user_streaming(user_id, chat.id)
 
         session = await self._session_manager.get_session(conversation_key)
-        updates = {"session_id": None, "new_session": True}
+        active_provider = self._active_provider()
+        updates = {
+            "provider": active_provider,
+            "session_id": None,
+            "new_session": True,
+        }
         session["session_id"] = None
         session["new_session"] = True
 
-        # Sync session model with settings.json; clear if settings changed
-        try:
-            with open(self._config.claude_settings_path, "r") as f:
-                settings_model = json.load(f).get("model")
-        except Exception:
+        # Claude keeps settings.json synchronization. Codex must not read it.
+        settings_model = session.get("model")
+        if active_provider == "claude":
+            try:
+                with open(self._config.claude_settings_path, "r") as f:
+                    settings_model = json.load(f).get("model")
+            except Exception:
+                settings_model = None
+        elif session.get("provider") != active_provider:
             settings_model = None
+            updates["model"] = None
 
-        if session.get("model") != settings_model:
+        if active_provider == "claude" and session.get("model") != settings_model:
             old_model = session.get("model")
             session["model"] = settings_model
             updates["model"] = settings_model
@@ -126,7 +136,8 @@ class BotCommandMixin:
             conversation_key, updates=updates
         )
         self._runtime_active_sessions.discard(conversation_key)
-        reply = "🆕 Switched to new session mode. Your next message will start a new Claude Code session."
+        provider_label = "Claude Code" if active_provider == "claude" else "Codex"
+        reply = f"🆕 Switched to new session mode. Your next message will start a new {provider_label} session."
         await message.reply_text(reply)
         log_debug(user_id, "bot", reply)
 
@@ -149,15 +160,34 @@ class BotCommandMixin:
         conversation_key = self._conversation_key(user_id, chat.id)
         log_debug(user_id, "command", "/model")
         session = await self._session_manager.get_session(conversation_key)
+        active_provider = self._active_provider()
 
         if context.args:
             name = context.args[0]
+            updates = {"provider": active_provider, "model": name}
+            if session["provider"] != active_provider:
+                updates.update(session_id=None, new_session=True)
             await self._session_manager.patch_session(
-                conversation_key, updates={"model": name}
+                conversation_key,
+                updates=updates,
             )
-            label = dict(self.MODELS).get(name, name)
+            label = dict(self.MODELS).get(name, name) if active_provider == "claude" else name
             logger.info(f"User {user_id}: model set to {name!r} via /model command")
             reply = f"✅ Switched to {label}"
+            await message.reply_text(reply)
+            log_debug(user_id, "bot", reply)
+            return
+
+        if active_provider == "codex":
+            current_model = (
+                session.get("model")
+                if session["provider"] == active_provider
+                else None
+            )
+            reply = (
+                f"🤖 Provider: codex\nModel: {current_model or 'default'}\n"
+                "Usage: /model <codex-model>"
+            )
             await message.reply_text(reply)
             log_debug(user_id, "bot", reply)
             return
@@ -187,6 +217,23 @@ class BotCommandMixin:
         chat = self._require_chat(update)
         conversation_key = self._conversation_key(user_id, chat.id)
         log_debug(user_id, "command", "/resume")
+        active_provider = self._active_provider()
+        stored_provider = await self._session_provider(
+            conversation_key
+        )
+        if stored_provider != active_provider:
+            reply = (
+                f"❌ Provider mismatch: this session is {stored_provider}, "
+                f"but the active provider is {active_provider}. Use /new first."
+            )
+            await message.reply_text(reply)
+            log_debug(user_id, "bot", reply)
+            return
+        if active_provider == "codex":
+            reply = "📭 Codex session browsing is not available in this version."
+            await message.reply_text(reply)
+            log_debug(user_id, "bot", reply)
+            return
         sessions = self._project_chat.list_sessions(limit=10)
         if not sessions:
             reply = "📭 No session history found."
@@ -197,7 +244,9 @@ class BotCommandMixin:
         # Store session list for later selection in this Telegram conversation.
         await self._session_manager.patch_session(
             conversation_key,
-            updates={"resume_list": [[sid, msg] for sid, msg, _ in sessions]},
+            updates={
+                "resume_list": [[sid, msg, "claude"] for sid, msg, _ in sessions]
+            },
         )
 
         def _esc_resume_text(text: str) -> str:
@@ -223,7 +272,7 @@ class BotCommandMixin:
             if i > 1:
                 lines.append("")
             num = NUM_EMOJI[i - 1] if i <= len(NUM_EMOJI) else f"*{i}\\.*"
-            lines.append(f"{num} {esc}")
+            lines.append(f"{num} {esc} \\[claude\\]")
             lines.append(_esc_resume_text(ts))
         lines.append(f"\n{_esc_md2('Reply with a number to switch to that session:')}")
         reply = "\n".join(lines)
@@ -287,9 +336,11 @@ class BotCommandMixin:
             return
         user_id = self._require_user(update).id
         message = self._require_message(update)
+        chat = self._require_chat(update)
         log_debug(user_id, "command", "/history")
 
-        session = await self._session_manager.get_session(user_id)
+        conversation_key = self._conversation_key(user_id, chat.id)
+        session = await self._session_manager.get_session(conversation_key)
         session_id = session.get("session_id")
 
         if not session_id:
@@ -306,7 +357,10 @@ class BotCommandMixin:
             log_debug(user_id, "bot", reply)
             return
 
-        lines = ["📜 Recent History (last 5 messages)\n"]
+        lines = [
+            "📜 Recent History (last 5 messages)",
+            f"Provider: {session['provider']}\n",
+        ]
         for msg in messages:
             role = msg["role"]
             content = msg["content"]
@@ -686,7 +740,9 @@ class BotCommandMixin:
         slash_cmd = "/" + parts[1]
 
         async def run_task():
-            session = await self._session_manager.get_session(conversation_key)
+            session, _ = await self._align_active_provider(
+                conversation_key
+            )
             try:
                 await message.chat.send_action(action="typing")
             except Exception:
@@ -727,7 +783,9 @@ class BotCommandMixin:
         conversation_key = self._conversation_key(user_id, chat.id)
 
         async def run_task():
-            session = await self._session_manager.get_session(conversation_key)
+            session, _ = await self._align_active_provider(
+                conversation_key
+            )
             await message.chat.send_action(action="typing")
             try:
                 response = await self._project_chat.process_message(
