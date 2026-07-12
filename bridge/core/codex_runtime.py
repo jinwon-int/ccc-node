@@ -484,7 +484,9 @@ class CodexRuntime:
         active.queue.put_nowait(approval)
         try:
             decision = await active.approval_handler(approval)
-        except (asyncio.CancelledError, Exception):
+        except asyncio.CancelledError:
+            raise
+        except Exception:
             decision = ApprovalDecision.DENY
         if active.finished or self._active_turns.get(cast(str, thread_id)) is not active:
             decision = ApprovalDecision.DENY

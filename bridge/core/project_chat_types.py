@@ -6,10 +6,16 @@ from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Deque, Dict, List, Optional
 
 from claude_agent_sdk import ClaudeSDKClient
+from telegram_bot.core.agent_runtime import ApprovalDecision, ApprovalRequestEvent
 
 
 # Callback type: async (chat_id, user_id, tool_name, tool_input) -> bool | PermissionResult
 PermissionCallback = Callable[[int, int, str, Dict[str, Any]], Awaitable]
+# Explicit provider-neutral approval bridge. The generation is owned by
+# ProjectChat and lets the Telegram side reject stale buttons fail-closed.
+AgentApprovalCallback = Callable[
+    [int, int, ApprovalRequestEvent, int], Awaitable[ApprovalDecision]
+]
 # Callback type: async () -> Any, sends typing action
 TypingCallback = Callable[[], Awaitable[Any]]
 # Callback type: async (text, message_id) -> message_id | None. When text is

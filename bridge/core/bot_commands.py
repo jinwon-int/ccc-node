@@ -65,6 +65,7 @@ class BotCommandMixin:
             chat_id=chat.id,
             new_session=True,
             permission_callback=self._permission_callback,
+            approval_callback=self._codex_approval_callback,
             typing_callback=lambda: message.chat.send_action(action="typing"),
             status_callback=self._make_status_callback(context.bot, chat.id),
             notification_bot=context.bot,
@@ -85,6 +86,9 @@ class BotCommandMixin:
         conversation_key = self._conversation_key(user_id, chat.id)
         log_debug(user_id, "command", "/new")
 
+        self._deny_codex_approvals(user_id, chat.id)
+        self._invalidate_codex_approvals(user_id, chat.id)
+
         cancelled_voice = await self._cancel_user_voice_tasks(conversation_key)
         if cancelled_voice:
             logger.info(
@@ -95,6 +99,14 @@ class BotCommandMixin:
 
         # Cancel any ongoing streaming in this Telegram conversation
         await self._cancel_user_streaming(user_id, chat.id)
+        tasks = getattr(self, "_tasks", None)
+        active_task = (
+            tasks.active(conversation_key) or tasks.active(user_id)
+            if tasks is not None
+            else None
+        )
+        if active_task and not active_task.done():
+            active_task.cancel()
 
         session = await self._session_manager.get_session(conversation_key)
         active_provider = self._active_provider()
@@ -337,6 +349,9 @@ class BotCommandMixin:
         chat = self._require_chat(update)
         conversation_key = self._conversation_key(user_id, chat.id)
         log_debug(user_id, "command", "/stop")
+
+        self._deny_codex_approvals(user_id, chat.id)
+        self._invalidate_codex_approvals(user_id, chat.id)
 
         cancelled_voice = await self._cancel_user_voice_tasks(conversation_key)
         if cancelled_voice:
@@ -817,6 +832,7 @@ class BotCommandMixin:
                 session_id=self._effective_session_id(conversation_key, session),
                 model=session.get("model"),
                 permission_callback=self._permission_callback,
+                approval_callback=self._codex_approval_callback,
                 typing_callback=lambda: message.chat.send_action(action="typing"),
                 status_callback=self._make_status_callback(app.bot, chat.id),
                 bot=app.bot,
@@ -858,6 +874,7 @@ class BotCommandMixin:
                     session_id=self._effective_session_id(conversation_key, session),
                     model=session.get("model"),
                     permission_callback=self._permission_callback,
+                    approval_callback=self._codex_approval_callback,
                     typing_callback=lambda: message.chat.send_action(action="typing"),
                     status_callback=self._make_status_callback(app.bot, chat.id),
                     bot=app.bot,
