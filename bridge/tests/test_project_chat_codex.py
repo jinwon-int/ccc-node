@@ -249,18 +249,52 @@ async def test_codex_start_resume_and_event_mapping_hides_reasoning(tmp_path: Pa
     handler = _handler(tmp_path, runtime)
 
     response = await handler.process_message(
-        "hello", user_id=7, chat_id=70, session_id="resumed", model="codex-test"
+        "hello",
+        user_id=7,
+        chat_id=70,
+        session_id="resumed",
+        model="codex-test",
+        effort="high",
     )
 
     assert runtime.requests == [
-        SessionRequest(working_directory=str(tmp_path.resolve()), session_id="resumed", model="codex-test")
+        SessionRequest(
+            working_directory=str(tmp_path.resolve()),
+            session_id="resumed",
+            model="codex-test",
+            effort="high",
+        )
     ]
     assert session.messages == ["hello"]
+
     assert session.approvals == [ApprovalDecision.DENY]
     assert response.content == "hello world"
     assert "private chain" not in response.content
     assert response.success is True
     assert response.session_id == "resumed"
+
+
+@pytest.mark.anyio
+async def test_codex_effort_change_recreates_wrapper_and_resumes_same_thread(
+    tmp_path: Path,
+) -> None:
+    low_session = FakeSession("thread-1")
+    high_session = FakeSession("thread-1")
+    runtime = FakeRuntime([low_session, high_session])
+    handler = _handler(tmp_path, runtime)
+
+    first = await handler.process_message(
+        "first", user_id=7, chat_id=70, session_id="thread-1", effort="low"
+    )
+    second = await handler.process_message(
+        "second", user_id=7, chat_id=70, session_id=first.session_id, effort="high"
+    )
+
+    assert [request.effort for request in runtime.requests] == ["low", "high"]
+    assert [request.session_id for request in runtime.requests] == ["thread-1", "thread-1"]
+    assert low_session.messages == ["first"]
+    assert high_session.messages == ["second"]
+    assert second.session_id == "thread-1"
 
 
 @pytest.mark.anyio

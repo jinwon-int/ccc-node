@@ -477,6 +477,7 @@ class BotDeliveryMixin:
                         chat_id=chat_id,
                         session_id=self._effective_session_id(conversation_key, session),
                         model=session.get("model"),
+                        effort=session.get("effort"),
                         permission_callback=self._permission_callback,
                         approval_callback=self._codex_approval_callback,
                         typing_callback=lambda: app.bot.send_chat_action(
@@ -512,6 +513,45 @@ class BotDeliveryMixin:
             await self._handle_revert_callback(update, context, data)
             return
 
+        # Handle effort selection
+        if data.startswith("effort:"):
+            parts = data.split(":", 2)
+            callback_provider = parts[1] if len(parts) == 3 else ""
+            requested = parts[2] if len(parts) == 3 else ""
+            active_provider = self._active_provider()
+            if callback_provider != active_provider or active_provider != "codex":
+                await query.edit_message_text(
+                    f"❌ Provider mismatch: selected effort is {callback_provider or 'unknown'}, "
+                    f"but the active provider is {active_provider}."
+                )
+                return
+            session_key = self._conversation_key(user_id, chat.id)
+            session, provider_switched = await self._session_manager.align_active_provider(
+                session_key
+            )
+            if provider_switched:
+                self._deny_codex_approvals(user_id, chat.id)
+                self._invalidate_codex_approvals(user_id, chat.id)
+                self._runtime_active_sessions.discard(session_key)
+            try:
+                models = tuple(await self._project_chat.list_runtime_models())
+            except Exception:
+                logger.warning("Codex effort callback browsing failed", exc_info=True)
+                await query.edit_message_text("⚠️ Codex effort options are unavailable.")
+                return
+            model = self._selected_codex_model(models, session)
+            if model is None or not model.supported_reasoning_efforts:
+                await query.edit_message_text(
+                    "📭 The selected Codex model does not advertise reasoning effort options."
+                )
+                return
+            reply = await self._apply_codex_effort_selection(
+                session_key, model, requested
+            )
+            await query.edit_message_text(reply)
+            log_debug(user_id, "bot", reply)
+            return
+
         # Handle model selection
         if data.startswith("model:"):
             parts = data.split(":", 2)
@@ -529,12 +569,21 @@ class BotDeliveryMixin:
             stored_provider = await self._session_provider(
                 session_key
             )
+            session = await self._session_manager.get_session(session_key)
             updates = {"provider": active_provider, "model": model_name}
+            remove_fields = set()
+            reset_note = None
             if stored_provider != active_provider:
                 updates.update(session_id=None, new_session=True)
+                remove_fields.add("effort")
+            elif active_provider == "codex":
+                reset_note = await self._codex_model_effort_reset_note(session, model_name)
+                if reset_note:
+                    remove_fields.add("effort")
             await self._session_manager.patch_session(
                 session_key,
                 updates=updates,
+                remove_fields=remove_fields,
             )
             label = (
                 dict(self.MODELS).get(model_name, model_name)
@@ -548,6 +597,8 @@ class BotDeliveryMixin:
                 chat.id,
             )
             reply = f"✅ Model switched to: {label}"
+            if reset_note:
+                reply = f"{reply}\n{reset_note}"
             await query.edit_message_text(reply)
             log_debug(user_id, "bot", reply)
             return
@@ -564,6 +615,7 @@ class BotDeliveryMixin:
             BotCommand("new", "New session"),
             BotCommand("stop", "Stop execution"),
             BotCommand("model", "Switch model"),
+            BotCommand("effort", "Set Codex reasoning effort"),
             BotCommand("resume", "Resume session"),
             BotCommand("history", "View message history"),
             BotCommand("revert", "Revert conversation"),

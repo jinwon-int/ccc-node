@@ -196,10 +196,13 @@ class SessionRequest:
     working_directory: str
     session_id: str | None = None
     model: str | None = None
+    effort: str | None = None
 
     def __post_init__(self) -> None:
         if not self.working_directory:
             raise ValueError("working directory must not be empty")
+        if self.effort is not None and not self.effort:
+            raise ValueError("effort must not be empty")
         if self.session_id == "":
             raise ValueError("session id must not be empty")
         if self.model == "":
@@ -212,12 +215,18 @@ class ModelInfo:
 
     id: str
     display_name: str
+    default_reasoning_effort: str | None = None
+    supported_reasoning_efforts: Sequence[str] = ()
+    is_default: bool = False
 
     def __post_init__(self) -> None:
         if not self.id:
             raise ValueError("model id must not be empty")
         if not self.display_name:
             raise ValueError("model display name must not be empty")
+        object.__setattr__(
+            self, "supported_reasoning_efforts", tuple(self.supported_reasoning_efforts)
+        )
 
 
 @dataclass(frozen=True, slots=True)
