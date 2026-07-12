@@ -211,12 +211,16 @@ ok "Claude human output reports provider without a Codex probe" 'grep -q "provid
 codex_absent="$(make_fixture codex-absent standalone)"
 out="$(CCC_AGENT_PROVIDER=codex CCC_CODEX_CLI_PATH=definitely-not-a-real-codex-command run_doctor "$codex_absent" 2>&1)"; rc=$?
 ok "missing Codex binary fails closed" '[ "$rc" = 1 ] && grep -q "Codex executable.*not found" <<<"$out" && ! grep -q "definitely-not-a-real-codex-command" <<<"$out"'
+json_fail="$(CCC_AGENT_PROVIDER=codex CCC_CODEX_CLI_PATH=definitely-not-a-real-codex-command run_doctor "$codex_absent" --json 2>&1)"; json_rc=$?
+ok "missing Codex binary JSON does not disclose configured command" '[ "$json_rc" = 1 ] && ! grep -q "definitely-not-a-real-codex-command" <<<"$json_fail"'
 
 codex_nonexec="$(make_fixture codex-nonexec standalone)"
 printf '#!/usr/bin/env bash\nexit 0\n' > "$codex_nonexec/codex-cli"
 chmod 600 "$codex_nonexec/codex-cli"
 out="$(CCC_AGENT_PROVIDER=codex CCC_CODEX_CLI_PATH="$codex_nonexec/codex-cli" run_doctor "$codex_nonexec" 2>&1)"; rc=$?
 ok "non-executable Codex binary fails closed without path disclosure" '[ "$rc" = 1 ] && grep -q "Codex executable.*not executable" <<<"$out" && ! grep -Fq "$codex_nonexec/codex-cli" <<<"$out"'
+json_fail="$(CCC_AGENT_PROVIDER=codex CCC_CODEX_CLI_PATH="$codex_nonexec/codex-cli" run_doctor "$codex_nonexec" --json 2>&1)"; json_rc=$?
+ok "non-executable Codex binary JSON does not disclose path" '[ "$json_rc" = 1 ] && ! grep -Fq "$codex_nonexec/codex-cli" <<<"$json_fail"'
 
 codex_timeout="$(make_fixture codex-timeout standalone)"
 make_fake_codex "$codex_timeout"
@@ -231,9 +235,13 @@ ok "authenticated Codex readiness succeeds" '[ "$rc" = 0 ] && grep -q "provider.
 out="$(FAKE_CODEX_MODE=unauthenticated CCC_AGENT_PROVIDER=codex CCC_CODEX_CLI_PATH="$codex_auth/bin/codex" run_doctor "$codex_auth" 2>&1)"; rc=$?
 ok "unauthenticated Codex readiness fails closed" '[ "$rc" = 1 ] && grep -q "Codex login.*not authenticated" <<<"$out"'
 ok "Codex diagnostics redact command output" '! grep -Eq "SENSITIVE_AUTH_MARKER|SENSITIVE_TOKEN_MARKER|account@example.invalid|access_token" <<<"$out"'
+json_fail="$(FAKE_CODEX_MODE=unauthenticated CCC_AGENT_PROVIDER=codex CCC_CODEX_CLI_PATH="$codex_auth/bin/codex" run_doctor "$codex_auth" --json 2>&1)"; json_rc=$?
+ok "unauthenticated Codex JSON redacts command output" '[ "$json_rc" = 1 ] && ! grep -Eq "SENSITIVE_AUTH_MARKER|SENSITIVE_TOKEN_MARKER|account@example.invalid|access_token" <<<"$json_fail"'
 
 out="$(FAKE_CODEX_MODE=malformed CCC_AGENT_PROVIDER=codex CCC_CODEX_CLI_PATH="$codex_auth/bin/codex" run_doctor "$codex_auth" 2>&1)"; rc=$?
 ok "malformed app-server probe fails closed" '[ "$rc" = 1 ] && grep -q "Codex app-server probe.*malformed output" <<<"$out" && ! grep -q "unexpected output" <<<"$out"'
+json_fail="$(FAKE_CODEX_MODE=malformed CCC_AGENT_PROVIDER=codex CCC_CODEX_CLI_PATH="$codex_auth/bin/codex" run_doctor "$codex_auth" --json 2>&1)"; json_rc=$?
+ok "malformed app-server JSON does not disclose raw output" '[ "$json_rc" = 1 ] && ! grep -q "unexpected output" <<<"$json_fail"'
 
 json_out="$(FAKE_CODEX_MODE=authenticated CCC_AGENT_PROVIDER=codex CCC_CODEX_CLI_PATH="$codex_auth/bin/codex" run_doctor "$codex_auth" --json)"; rc=$?
 ok "Codex JSON output is valid and carries additive readiness fields" '[ "$rc" = 0 ] && jq -e '\''(.provider == "codex") and (.readiness == "ready") and (.mode == "standalone") and (.counts["수동필요"] == 0) and ([.rows[].item] | index("Codex login") != null)'\'' <<<"$json_out" >/dev/null'
