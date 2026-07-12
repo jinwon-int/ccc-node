@@ -88,10 +88,11 @@ class SessionManager:
                 "session_id": None,
                 "new_session": True,
             },
-            remove_fields={"model"},
+            remove_fields={"model", "effort"},
         )
         session.update(provider=active_provider, session_id=None, new_session=True)
         session.pop("model", None)
+        session.pop("effort", None)
         return session, True
 
     async def update_session(self, user_id: int, data: Dict[str, Any]) -> None:

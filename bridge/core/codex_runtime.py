@@ -57,6 +57,7 @@ class AppServerClient(Protocol):
         input_items: Sequence[Mapping[str, JsonValue]],
         *,
         model: str | None = None,
+        effort: str | None = None,
     ) -> JsonValue: ...
 
     async def turn_interrupt(self, thread_id: str, turn_id: str) -> JsonValue: ...
@@ -96,11 +97,13 @@ class CodexSession:
         runtime: CodexRuntime,
         thread_id: str,
         model: str | None,
+        effort: str | None,
         turn_lock: asyncio.Lock,
     ) -> None:
         self._runtime = runtime
         self._thread_id = thread_id
         self._model = model
+        self._effort = effort
         self._turn_lock = turn_lock
 
     @property
@@ -122,6 +125,7 @@ class CodexSession:
                         self._thread_id,
                         [{"type": "text", "text": message}],
                         model=self._model,
+                        effort=self._effort,
                     )
                     active.turn_id = self._runtime._turn_id(result)
                     self._runtime._flush_pending_notifications(active)
@@ -201,7 +205,7 @@ class CodexRuntime:
             )
         thread_id = self._thread_id(result)
         turn_lock = self._thread_locks.setdefault(thread_id, asyncio.Lock())
-        return CodexSession(self, thread_id, request.model, turn_lock)
+        return CodexSession(self, thread_id, request.model, request.effort, turn_lock)
 
     async def list_models(self) -> Sequence[ModelInfo]:
         await self._ensure_started()
@@ -221,7 +225,27 @@ class CodexRuntime:
                 continue
             if not isinstance(display_name, str) or not display_name:
                 continue
-            models.append(ModelInfo(id=model_id, display_name=display_name))
+            raw_efforts = value.get("supportedReasoningEfforts")
+            efforts: list[str] = []
+            if isinstance(raw_efforts, (list, tuple)):
+                for option in raw_efforts:
+                    if not isinstance(option, Mapping):
+                        continue
+                    effort = option.get("reasoningEffort")
+                    if isinstance(effort, str) and effort and effort not in efforts:
+                        efforts.append(effort)
+            default_effort = value.get("defaultReasoningEffort")
+            if not isinstance(default_effort, str) or not default_effort:
+                default_effort = None
+            models.append(
+                ModelInfo(
+                    id=model_id,
+                    display_name=display_name,
+                    default_reasoning_effort=default_effort,
+                    supported_reasoning_efforts=tuple(efforts),
+                    is_default=value.get("isDefault") is True,
+                )
+            )
         return tuple(models)
 
     @property

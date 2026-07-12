@@ -110,6 +110,7 @@ class BotCommandMixin:
 
         session = await self._session_manager.get_session(conversation_key)
         active_provider = self._active_provider()
+        provider_changed = session.get("provider") != active_provider
         updates = {
             "provider": active_provider,
             "session_id": None,
@@ -145,7 +146,9 @@ class BotCommandMixin:
             )
 
         await self._session_manager.patch_session(
-            conversation_key, updates=updates
+            conversation_key,
+            updates=updates,
+            remove_fields={"effort"} if provider_changed else (),
         )
         self._runtime_active_sessions.discard(conversation_key)
         provider_label = "Claude Code" if active_provider == "claude" else "Codex"
@@ -177,15 +180,25 @@ class BotCommandMixin:
         if context.args:
             name = context.args[0]
             updates = {"provider": active_provider, "model": name}
+            remove_fields = set()
+            reset_note = None
             if session["provider"] != active_provider:
                 updates.update(session_id=None, new_session=True)
+                remove_fields.add("effort")
+            elif active_provider == "codex":
+                reset_note = await self._codex_model_effort_reset_note(session, name)
+                if reset_note:
+                    remove_fields.add("effort")
             await self._session_manager.patch_session(
                 conversation_key,
                 updates=updates,
+                remove_fields=remove_fields,
             )
             label = dict(self.MODELS).get(name, name) if active_provider == "claude" else name
             logger.info(f"User {user_id}: model set to {name!r} via /model command")
             reply = f"✅ Switched to {label}"
+            if reset_note:
+                reply = f"{reply}\n{reset_note}"
             await message.reply_text(reply)
             log_debug(user_id, "bot", reply)
             return
@@ -231,6 +244,152 @@ class BotCommandMixin:
             for name, label in models
         ]
         reply = "🤖 Select Claude Code model:"
+        await message.reply_text(reply, reply_markup=InlineKeyboardMarkup(buttons))
+        log_debug(user_id, "bot", reply)
+
+    @staticmethod
+    def _selected_codex_model(models, session: dict):
+        selected_id = session.get("model")
+        if selected_id:
+            return next((model for model in models if model.id == selected_id), None)
+        return next((model for model in models if model.is_default), models[0] if models else None)
+
+    async def _codex_model_effort_reset_note(self, session: dict, model_id: str):
+        current_effort = session.get("effort")
+        if not current_effort:
+            return None
+        try:
+            models = tuple(await self._project_chat.list_runtime_models())
+        except Exception:
+            logger.warning("Codex model effort compatibility lookup failed", exc_info=True)
+            return (
+                f"ℹ️ Reasoning effort {current_effort} could not be validated; "
+                "reset to model default."
+            )
+        model = next((item for item in models if item.id == model_id), None)
+        if model is not None and current_effort in model.supported_reasoning_efforts:
+            return None
+        default_label = (
+            model.default_reasoning_effort
+            if model is not None and model.default_reasoning_effort
+            else "provider default"
+        )
+        return (
+            f"ℹ️ Reasoning effort {current_effort} is unsupported; "
+            f"reset to model default ({default_label})."
+        )
+
+    async def _apply_codex_effort_selection(
+        self, conversation_key, model, requested: str
+    ) -> str:
+        if requested == "default":
+            await self._session_manager.patch_session(
+                conversation_key,
+                updates={"provider": "codex"},
+                remove_fields={"effort"},
+            )
+            default_label = model.default_reasoning_effort or "provider default"
+            return (
+                f"✅ Reasoning effort reset to model default ({default_label}) "
+                f"for {model.display_name}"
+            )
+        if requested not in model.supported_reasoning_efforts:
+            supported = ", ".join(model.supported_reasoning_efforts)
+            return (
+                f"❌ Unsupported effort for {model.display_name}: {requested}. "
+                f"Supported: {supported}, default"
+            )
+        await self._session_manager.patch_session(
+            conversation_key,
+            updates={"provider": "codex", "effort": requested},
+        )
+        return f"✅ Reasoning effort set to {requested} for {model.display_name}"
+
+    async def _cmd_effort(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not await self._check_access(update):
+            return
+        user_id = self._require_user(update).id
+        message = self._require_message(update)
+        chat = self._require_chat(update)
+        log_debug(user_id, "command", "/effort")
+        if self._active_provider() != "codex":
+            reply = "⚠️ /effort is available only when the Codex provider is active."
+            await message.reply_text(reply)
+            log_debug(user_id, "bot", reply)
+            return
+
+        conversation_key = self._conversation_key(user_id, chat.id)
+        session, provider_switched = await self._session_manager.align_active_provider(
+            conversation_key
+        )
+        if provider_switched:
+            self._deny_codex_approvals(user_id, chat.id)
+            self._invalidate_codex_approvals(user_id, chat.id)
+            self._runtime_active_sessions.discard(conversation_key)
+        try:
+            models = tuple(await self._project_chat.list_runtime_models())
+        except Exception:
+            logger.warning("Codex effort browsing failed", exc_info=True)
+            reply = "⚠️ Codex effort options are unavailable."
+            await message.reply_text(reply)
+            log_debug(user_id, "bot", reply)
+            return
+        model = self._selected_codex_model(models, session)
+        requested = context.args[0] if context.args else None
+        if model is None:
+            if requested == "default":
+                await self._session_manager.patch_session(
+                    conversation_key,
+                    updates={"provider": "codex"},
+                    remove_fields={"effort"},
+                )
+                reply = "✅ Reasoning effort reset to provider default"
+            else:
+                reply = (
+                    "📭 The selected Codex model does not advertise reasoning "
+                    "effort options."
+                )
+            await message.reply_text(reply)
+            log_debug(user_id, "bot", reply)
+            return
+        if not model.supported_reasoning_efforts and requested != "default":
+            reply = "📭 The selected Codex model does not advertise reasoning effort options."
+            await message.reply_text(reply)
+            log_debug(user_id, "bot", reply)
+            return
+
+        if requested is not None:
+            reply = await self._apply_codex_effort_selection(
+                conversation_key, model, requested
+            )
+            await message.reply_text(reply)
+            log_debug(user_id, "bot", reply)
+            return
+
+        current = session.get("effort")
+        buttons = []
+        for effort in model.supported_reasoning_efforts:
+            callback_data = f"effort:codex:{effort}"
+            if len(callback_data.encode("utf-8")) > 64:
+                continue
+            suffixes = []
+            if effort == model.default_reasoning_effort:
+                suffixes.append("model default")
+            if effort == current:
+                suffixes.append("current")
+            label = f"{effort} ({', '.join(suffixes)})" if suffixes else effort
+            buttons.append([
+                InlineKeyboardButton(label, callback_data=callback_data)
+            ])
+        buttons.append([
+            InlineKeyboardButton("Use model default", callback_data="effort:codex:default")
+        ])
+        current_label = current or "model default"
+        default_label = model.default_reasoning_effort or "provider default"
+        reply = (
+            f"🧠 Select reasoning effort for {model.display_name}:\n"
+            f"Current: {current_label} · Model default: {default_label}"
+        )
         await message.reply_text(reply, reply_markup=InlineKeyboardMarkup(buttons))
         log_debug(user_id, "bot", reply)
 
@@ -831,6 +990,7 @@ class BotCommandMixin:
                 chat_id=chat.id,
                 session_id=self._effective_session_id(conversation_key, session),
                 model=session.get("model"),
+                effort=session.get("effort"),
                 permission_callback=self._permission_callback,
                 approval_callback=self._codex_approval_callback,
                 typing_callback=lambda: message.chat.send_action(action="typing"),
@@ -873,6 +1033,7 @@ class BotCommandMixin:
                     chat_id=chat.id,
                     session_id=self._effective_session_id(conversation_key, session),
                     model=session.get("model"),
+                    effort=session.get("effort"),
                     permission_callback=self._permission_callback,
                     approval_callback=self._codex_approval_callback,
                     typing_callback=lambda: message.chat.send_action(action="typing"),

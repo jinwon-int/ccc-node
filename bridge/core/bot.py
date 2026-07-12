@@ -296,6 +296,7 @@ class TelegramBot(
         self.application.add_handler(CommandHandler("skills", self._cmd_skills))
         self.application.add_handler(CommandHandler("new", self._cmd_new))
         self.application.add_handler(CommandHandler("model", self._cmd_model))
+        self.application.add_handler(CommandHandler("effort", self._cmd_effort))
         self.application.add_handler(CommandHandler("resume", self._cmd_resume))
         self.application.add_handler(CommandHandler("stop", self._cmd_stop))
         self.application.add_handler(CommandHandler("history", self._cmd_history))
@@ -428,6 +429,7 @@ class TelegramBot(
                 migration_fields = {
                     "session_id",
                     "model",
+                    "effort",
                     "provider",
                     "reply_mode",
                     "last_user_message_at",
@@ -554,6 +556,7 @@ class TelegramBot(
                 message_id=message.message_id,
                 session_id=effective_sid,
                 model=current_session.get("model"),
+                effort=current_session.get("effort"),
                 new_session=new_session,
                 permission_callback=self._permission_callback,
                 approval_callback=self._codex_approval_callback,

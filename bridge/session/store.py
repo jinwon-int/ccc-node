@@ -113,6 +113,11 @@ def _validate_session_data(data: Any) -> Dict[str, Any]:
             raise SessionStoreValidationError(
                 f"session entry {key!r} has invalid provider: {provider!r}"
             )
+        effort = value.get("effort")
+        if effort is not None and (not isinstance(effort, str) or not effort):
+            raise SessionStoreValidationError(
+                f"session entry {key!r} has invalid effort: {effort!r}"
+            )
         _validate_json_value(value, key, set())
     return data
 

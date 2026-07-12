@@ -61,6 +61,7 @@ class ProjectChatProcessMixin:
         message_id: Optional[int] = None,
         session_id: Optional[str] = None,
         model: Optional[str] = None,
+        effort: Optional[str] = None,
         new_session: bool = False,
         permission_callback: Optional[PermissionCallback] = None,
         approval_callback: Optional[AgentApprovalCallback] = None,
@@ -77,6 +78,7 @@ class ProjectChatProcessMixin:
                 chat_id=chat_id,
                 session_id=session_id,
                 model=model,
+                effort=effort,
                 new_session=new_session,
                 approval_callback=approval_callback,
                 typing_callback=typing_callback,
@@ -314,6 +316,7 @@ class ProjectChatProcessMixin:
         chat_id: int,
         session_id: Optional[str],
         model: Optional[str],
+        effort: Optional[str],
         new_session: bool,
         approval_callback: Optional[AgentApprovalCallback],
         typing_callback: Optional[TypingCallback],
@@ -336,10 +339,12 @@ class ProjectChatProcessMixin:
                 and (
                     (session_id is not None and session.session_id != session_id)
                     or self._agent_session_models.get(key) != model
+                    or self._agent_session_efforts.get(key) != effort
                 )
             ):
                 self._agent_sessions.pop(key, None)
                 self._agent_session_models.pop(key, None)
+                self._agent_session_efforts.pop(key, None)
                 session = None
             try:
                 if session is None:
@@ -348,10 +353,12 @@ class ProjectChatProcessMixin:
                             working_directory=str(self.project_root),
                             session_id=None if new_session else session_id,
                             model=model,
+                            effort=effort,
                         )
                     )
                     self._agent_sessions[key] = session
                     self._agent_session_models[key] = model
+                    self._agent_session_efforts[key] = effort
 
                 self._agent_active_sessions[key] = session
                 self._agent_started_at[key] = asyncio.get_running_loop().time()
@@ -426,6 +433,7 @@ class ProjectChatProcessMixin:
                     if self._agent_sessions.get(key) is session:
                         self._agent_sessions.pop(key, None)
                         self._agent_session_models.pop(key, None)
+                        self._agent_session_efforts.pop(key, None)
                     return ChatResponse(
                         content=f"❌ Processing failed: {terminal_error.message}",
                         success=False,
@@ -443,6 +451,7 @@ class ProjectChatProcessMixin:
                 if session is not None and self._agent_sessions.get(key) is session:
                     self._agent_sessions.pop(key, None)
                     self._agent_session_models.pop(key, None)
+                    self._agent_session_efforts.pop(key, None)
                 if session is not None:
                     await self._interrupt_agent_session(session)
                 await self._cancel_agent_streaming(
@@ -466,6 +475,7 @@ class ProjectChatProcessMixin:
                 if session is not None and self._agent_sessions.get(key) is session:
                     self._agent_sessions.pop(key, None)
                     self._agent_session_models.pop(key, None)
+                    self._agent_session_efforts.pop(key, None)
                 await self._cancel_agent_streaming(
                     streaming_handler, context="returning an agent error"
                 )

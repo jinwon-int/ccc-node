@@ -96,3 +96,9 @@ def test_tuple_resume_list_is_rejected_by_validator():
 def test_provider_validation_rejects_non_string_json_values(provider) -> None:
     with pytest.raises(SessionStoreValidationError, match="invalid provider"):
         _validate_session_data({"telegram_session:1": {"provider": provider}})
+
+
+@pytest.mark.parametrize("effort", ["", [], {}, 1, True])
+def test_effort_validation_rejects_non_string_or_empty_values(effort) -> None:
+    with pytest.raises(SessionStoreValidationError, match="invalid effort"):
+        _validate_session_data({"telegram_session:1": {"effort": effort}})

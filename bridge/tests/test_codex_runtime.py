@@ -105,10 +105,17 @@ class FakeClient:
         input_items: Sequence[Mapping[str, Any]],
         *,
         model: str | None = None,
+        effort: str | None = None,
     ) -> Any:
         turn_id = f"turn-{len(self.turn_start_calls) + 1}"
         self.turn_start_calls.append(
-            {"thread_id": thread_id, "input": list(input_items), "model": model, "turn_id": turn_id}
+            {
+                "thread_id": thread_id,
+                "input": list(input_items),
+                "model": model,
+                "effort": effort,
+                "turn_id": turn_id,
+            }
         )
         self.turn_started.set()
         for notification in self.before_turn_response:
@@ -165,7 +172,19 @@ class CodexRuntimeTests(unittest.IsolatedAsyncioTestCase):
         client = self.clients[0]
         client.model_result = {
             "data": [
-                {"id": "codex-a", "displayName": "Codex A"},
+                {
+                    "id": "codex-a",
+                    "displayName": "Codex A",
+                    "defaultReasoningEffort": "medium",
+                    "supportedReasoningEfforts": [
+                        {"reasoningEffort": "low", "description": "Fast"},
+                        {"reasoningEffort": "medium", "description": "Balanced"},
+                        {"reasoningEffort": "high", "description": "Deep"},
+                        {"reasoningEffort": "high", "description": "Duplicate"},
+                        {"description": "Malformed"},
+                    ],
+                    "isDefault": True,
+                },
                 {"id": "", "displayName": "invalid"},
                 {"id": "codex-b", "name": "Codex B"},
                 {"id": 7, "displayName": "invalid"},
@@ -187,8 +206,17 @@ class CodexRuntimeTests(unittest.IsolatedAsyncioTestCase):
             [{"thread_id": "thread-old", "cwd": "/workspace/resume", "model": "codex-b"}],
         )
         self.assertEqual(
-            [(model.id, model.display_name) for model in models],
-            [("codex-a", "Codex A"), ("codex-b", "Codex B")],
+            models,
+            (
+                ModelInfo(
+                    "codex-a",
+                    "Codex A",
+                    default_reasoning_effort="medium",
+                    supported_reasoning_efforts=("low", "medium", "high"),
+                    is_default=True,
+                ),
+                ModelInfo("codex-b", "Codex B"),
+            ),
         )
 
     async def test_start_rejects_a_malformed_thread_identifier(self) -> None:
@@ -247,7 +275,9 @@ class CodexRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("cat secret", repr(history))
 
     async def test_turn_maps_streamed_events_including_notifications_before_response(self) -> None:
-        session = await self.runtime.start_or_resume(SessionRequest(working_directory="/workspace"))
+        session = await self.runtime.start_or_resume(
+            SessionRequest(working_directory="/workspace", effort="high")
+        )
         client = self.clients[0]
         client.before_turn_response = [
             CodexNotification(
@@ -332,6 +362,7 @@ class CodexRuntimeTests(unittest.IsolatedAsyncioTestCase):
             client.turn_start_calls[0]["input"],
             [{"type": "text", "text": "hello"}],
         )
+        self.assertEqual(client.turn_start_calls[0]["effort"], "high")
 
     async def test_approval_routes_exact_turn_and_fails_closed(self) -> None:
         session = await self.runtime.start_or_resume(SessionRequest(working_directory="/workspace"))

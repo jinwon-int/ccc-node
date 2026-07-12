@@ -432,9 +432,29 @@ class CodexAppServerTests(unittest.IsolatedAsyncioTestCase):
         })
         await assert_call(client.thread_resume("thread-1"), "thread/resume", {"threadId": "thread-1"})
         await assert_call(
-            client.turn_start("thread-1", [{"type": "text", "text": "hello"}]),
+            client.turn_start(
+                "thread-1",
+                [{"type": "text", "text": "hello"}],
+                model="o3",
+                effort="high",
+            ),
             "turn/start",
-            {"threadId": "thread-1", "input": [{"type": "text", "text": "hello"}]},
+            {
+                "threadId": "thread-1",
+                "input": [{"type": "text", "text": "hello"}],
+                "model": "o3",
+                "effort": "high",
+            },
+        )
+        await assert_call(
+            client.turn_start(
+                "thread-1", [{"type": "text", "text": "use defaults"}]
+            ),
+            "turn/start",
+            {
+                "threadId": "thread-1",
+                "input": [{"type": "text", "text": "use defaults"}],
+            },
         )
         await assert_call(
             client.turn_interrupt("thread-1", "turn-1"),

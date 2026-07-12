@@ -132,6 +132,7 @@ class ProjectChatStateMixin:
             for key in self._agent_keys_for_user(user_id, chat_id):
                 self._agent_sessions.pop(key, None)
                 self._agent_session_models.pop(key, None)
+                self._agent_session_efforts.pop(key, None)
             return
         for state in self._states_for_user(user_id, chat_id):
             for req in list(state.pending):
