@@ -67,7 +67,11 @@ class TestConnectionResilience(unittest.TestCase):
 
     def setUp(self):
         """Set up test fixtures."""
-        self.bot = TelegramBot()
+        self.bot = TelegramBot(
+            settings=config_module.config,
+            session_manager=Mock(),
+            project_chat=Mock(),
+        )
 
     @patch.object(bot_module, "Application")
     @patch.object(bot_module, "HTTPXRequest", side_effect=lambda **kwargs: kwargs)
@@ -81,6 +85,7 @@ class TestConnectionResilience(unittest.TestCase):
         mock_builder.get_updates_request.return_value = mock_builder
         mock_builder.request.return_value = mock_builder
         mock_builder.build.return_value = Mock()
+        self.bot._application_builder_factory = mock_app_class.builder
 
         self.bot.build()
 

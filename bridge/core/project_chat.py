@@ -8,7 +8,7 @@ import time
 import asyncio
 import logging
 from pathlib import Path
-from typing import Optional, Dict, Any, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple
 
 from claude_agent_sdk import (
     ClaudeSDKClient,
@@ -21,8 +21,6 @@ from claude_agent_sdk import (
     PermissionResultAllow,
     PermissionResultDeny,
 )
-
-from claude_agent_sdk._internal.transport.subprocess_cli import SubprocessCLITransport
 
 from telegram_bot.utils.config import config
 from telegram_bot.core.task_ledger import (
@@ -47,30 +45,6 @@ from telegram_bot.utils.duration_log import (
 logger = logging.getLogger(__name__)
 
 
-def _patch_sdk_cli_resolution() -> None:
-    """Make SDK default transport honor configured CLAUDE_CLI_PATH."""
-    marker = "_telegram_bot_cli_path_patch_applied"
-    if getattr(SubprocessCLITransport, marker, False):
-        return
-    if not config.claude_cli_path:
-        return
-
-    cli_path = str(config.claude_cli_path)
-
-    def patched_find_cli(self):
-        return cli_path
-
-    setattr(SubprocessCLITransport, "_find_cli", patched_find_cli)
-    setattr(SubprocessCLITransport, marker, True)
-    logger.info(f"Patched SDK CLI resolution to use configured path: {cli_path}")
-
-
-_patch_sdk_cli_resolution()
-
-PROJECT_ROOT = Path(os.environ["PROJECT_ROOT"]).resolve()
-PROJECT_DIR_NAME = str(PROJECT_ROOT).replace("/", "-").replace("_", "-")
-CONVERSATIONS_DIR = Path.home() / ".claude" / "projects" / PROJECT_DIR_NAME
-
 from telegram_bot.core.tool_policy import (  # noqa: E402
     BASH_DISABLED,
     EXECUTION_OWNER_OPERATOR,
@@ -83,16 +57,12 @@ from telegram_bot.core.tool_policy import (  # noqa: E402
     strict_bash_sandbox_settings,
 )
 
-EXECUTION_PROFILE = resolve_execution_profile(
-    getattr(config, "execution_profile", EXECUTION_STRICT_PROJECT),
-    allowed_user_ids=getattr(config, "allowed_user_ids", []),
-    require_allowlist=getattr(config, "require_allowlist", True),
-)
-BASH_POLICY = effective_bash_policy(
-    resolve_bash_policy(getattr(config, "bash_policy", None)), EXECUTION_PROFILE
-)
-
 PROCESS_TIMEOUT = int(os.getenv("CLAUDE_PROCESS_TIMEOUT", "21600"))
+
+# Compatibility knobs for legacy direct-construction tests. Production always
+# injects Settings and therefore never reads these module values.
+EXECUTION_PROFILE = EXECUTION_STRICT_PROJECT
+BASH_POLICY = "auto-approve"
 
 
 # Pure SDK-stream / text helpers live in core/sdk_text.py (error classification,
@@ -157,8 +127,51 @@ class ProjectChatHandler(
     even when Claude Code internally records queued prompts on a live stream.
     """
 
-    def __init__(self):
-        self.project_root = PROJECT_ROOT
+    def __init__(
+        self,
+        settings: Any = None,
+        *,
+        sdk_client_factory: Optional[Callable[..., Any]] = None,
+        clock: Any = None,
+    ):
+        # ``settings=None`` is retained only for legacy unit-test adapters. The
+        # production composition root always injects the validated Settings.
+        compatibility_mode = settings is None
+        self._config = config if compatibility_mode else settings
+        root_value = getattr(
+            self._config,
+            "project_root",
+            os.environ.get("PROJECT_ROOT", Path.cwd()),
+        )
+        self.project_root = Path(root_value).resolve()
+        project_dir_name = str(self.project_root).replace("/", "-").replace("_", "-")
+        self.conversations_dir = Path.home() / ".claude" / "projects" / project_dir_name
+        profile = (
+            EXECUTION_PROFILE
+            if compatibility_mode
+            else getattr(self._config, "execution_profile", EXECUTION_STRICT_PROJECT)
+        )
+        policy = (
+            BASH_POLICY
+            if compatibility_mode
+            else getattr(self._config, "bash_policy", None)
+        )
+        if compatibility_mode:
+            self._execution_profile = profile
+        else:
+            self._execution_profile = resolve_execution_profile(
+                profile,
+                allowed_user_ids=getattr(self._config, "allowed_user_ids", []),
+                require_allowlist=getattr(self._config, "require_allowlist", True),
+            )
+        self._bash_policy = effective_bash_policy(
+            resolve_bash_policy(policy),
+            self._execution_profile,
+        )
+        self._sdk_client_factory = sdk_client_factory or ClaudeSDKClient
+        self._clock = clock or time
+        self._process_timeout_seconds = PROCESS_TIMEOUT
+        self._typing_interval_seconds = TYPING_INTERVAL
         # Streams are scoped by Telegram conversation, not only user. A single
         # Telegram user may talk to the bridge in a private DM and a group at the
         # same time; sharing one Claude stream made pending ResultMessages race
@@ -195,7 +208,7 @@ class ProjectChatHandler(
         unsolicited_callback: Optional[UnsolicitedCallback] = None,
     ) -> _UserStreamState:
         state_holder: Dict[str, _UserStreamState] = {}
-        bash_policy = effective_bash_policy(BASH_POLICY, EXECUTION_PROFILE)
+        bash_policy = self._bash_policy
 
         async def can_use_tool(tool_name, tool_input, _context=None):
             logger.debug(
@@ -300,10 +313,10 @@ class ProjectChatHandler(
             # text deltas (true typewriter effect). The draft edit cadence stays
             # throttled by draft_update_min_chars / draft_update_interval.
             "include_partial_messages": bool(
-                config.enable_streaming and config.enable_partial_streaming
+                self._config.enable_streaming and self._config.enable_partial_streaming
             ),
         }
-        if EXECUTION_PROFILE == EXECUTION_OWNER_OPERATOR:
+        if self._execution_profile == EXECUTION_OWNER_OPERATOR:
             # Owner-operated bridges intentionally retain host utility and the
             # normal Claude Code settings/context chain. Access control, not a
             # project-root sandbox, is the boundary for this explicit profile.
@@ -313,12 +326,14 @@ class ProjectChatHandler(
             # Bash is disallowed, user/project/local settings can register host
             # shell hooks independently of the model-facing Bash tool.
             opts["setting_sources"] = []
-            if EXECUTION_PROFILE == EXECUTION_STRICT_PROJECT and bash_policy != BASH_DISABLED:
+            if self._execution_profile == EXECUTION_STRICT_PROJECT and bash_policy != BASH_DISABLED:
                 # Strict-project uses the SDK OS sandbox as the Bash boundary.
                 opts["sandbox"] = strict_bash_sandbox_settings(
                     self.project_root,
-                    str(config.claude_cli_path) if config.claude_cli_path else None,
+                    str(self._config.claude_cli_path) if self._config.claude_cli_path else None,
                 )
+        if self._config.claude_cli_path:
+            opts["cli_path"] = str(self._config.claude_cli_path)
         if model:
             # Normalize model name: ensure at most one [1M] suffix
             # e.g., "claude-opus-4-7[1M][1m]" -> "claude-opus-4-7[1M]"
@@ -330,7 +345,7 @@ class ProjectChatHandler(
                 logger.info(f"Model normalized: {model!r} -> {normalized!r}")
             opts["model"] = normalized
 
-        client = ClaudeSDKClient(options=ClaudeAgentOptions(**opts))
+        client = self._sdk_client_factory(options=ClaudeAgentOptions(**opts))
         await client.connect()
         state = _UserStreamState(
             client=client,
@@ -380,7 +395,7 @@ class ProjectChatHandler(
         # auth, network drop) rather than an explicit user /stop, surface the real
         # reason instead of the opaque "Task has been terminated." notice.
         if msg == TASK_TERMINATED_NOTICE and state.last_error:
-            if (time.monotonic() - state.last_error_ts) < CANCEL_REASON_WINDOW_S:
+            if (self._clock.monotonic() - state.last_error_ts) < CANCEL_REASON_WINDOW_S:
                 reason = describe_cancel_reason(state.last_error)
                 if reason:
                     msg = reason
@@ -629,10 +644,10 @@ class ProjectChatHandler(
             )
 
     def _duration_log_path(self) -> Path:
-        path = getattr(config, "heartbeat_duration_log_path", None)
+        path = getattr(self._config, "heartbeat_duration_log_path", None)
         if path is None:
             return default_duration_log_path(
-                Path(getattr(config, "bot_data_dir", PROJECT_ROOT / ".telegram_bot"))
+                Path(getattr(self._config, "bot_data_dir", self.project_root / ".telegram_bot"))
             )
         return Path(path)
 
@@ -726,6 +741,3 @@ class ProjectChatHandler(
             raise
         except Exception as e:
             logger.error(f"Typing keepalive loop crashed for user {user_id}: {e}", exc_info=True)
-
-
-project_chat_handler = ProjectChatHandler()

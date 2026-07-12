@@ -30,6 +30,12 @@ def run(awaitable):
     return asyncio.run(awaitable)
 
 
+def initialized_store(path: Path) -> SessionStore:
+    store = SessionStore(path)
+    store.initialize()
+    return store
+
+
 def read_json(path: Path):
     return json.loads(path.read_text(encoding="utf-8"))
 
@@ -62,7 +68,7 @@ class FailingStream:
 
 def test_first_save_is_atomic_and_private(tmp_path):
     path = tmp_path / "state" / "sessions.json"
-    store = SessionStore(path)
+    store = initialized_store(path)
 
     run(store.set(1, {"session_id": "one"}))
 
@@ -74,7 +80,7 @@ def test_first_save_is_atomic_and_private(tmp_path):
 
 def test_list_sessions_returns_conversation_suffixes_and_deep_copies(tmp_path):
     path = tmp_path / "sessions.json"
-    store = SessionStore(path)
+    store = initialized_store(path)
     run(store.set(1, {"session_id": "one", "nested": {"value": 1}}))
     run(store.set("11:1001", {"session_id": "group"}))
 
@@ -90,7 +96,7 @@ def test_list_sessions_returns_conversation_suffixes_and_deep_copies(tmp_path):
 def test_backup_preserves_exact_previous_primary_bytes(tmp_path):
     path = tmp_path / "sessions.json"
     backup_path = path.with_name(f"{path.name}.bak")
-    store = SessionStore(path)
+    store = initialized_store(path)
     run(store.set("11:1001", {"version": 1, "label": "가나다"}))
     previous_primary = path.read_bytes()
 
@@ -109,7 +115,7 @@ def test_existing_state_files_are_tightened_to_0600(tmp_path):
     path.chmod(0o644)
     backup_path.chmod(0o664)
 
-    SessionStore(path)
+    initialized_store(path)
 
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
     assert stat.S_IMODE(backup_path.stat().st_mode) == 0o600
@@ -120,7 +126,7 @@ def test_existing_safe_parent_permissions_are_not_overwritten(tmp_path):
     parent.mkdir(mode=0o755)
     parent.chmod(0o755)
 
-    SessionStore(parent / "sessions.json")
+    initialized_store(parent / "sessions.json")
 
     assert stat.S_IMODE(parent.stat().st_mode) == 0o755
 
@@ -131,7 +137,7 @@ def test_existing_group_writable_parent_fails_closed(tmp_path):
     parent.chmod(0o777)
 
     with pytest.raises(PermissionError, match="writable by group or others"):
-        SessionStore(parent / "sessions.json")
+        initialized_store(parent / "sessions.json")
 
 
 def test_symlinked_storage_parent_fails_closed(tmp_path):
@@ -141,7 +147,7 @@ def test_symlinked_storage_parent_fails_closed(tmp_path):
     symlinked_parent.symlink_to(real_parent, target_is_directory=True)
 
     with pytest.raises(PermissionError, match="symlink"):
-        SessionStore(symlinked_parent / "sessions.json")
+        initialized_store(symlinked_parent / "sessions.json")
 
     assert not (real_parent / "sessions.json").exists()
 
@@ -154,7 +160,7 @@ def test_symlinked_storage_ancestor_fails_closed(tmp_path):
     symlinked_root.symlink_to(real_root, target_is_directory=True)
 
     with pytest.raises(PermissionError, match="symlink"):
-        SessionStore(symlinked_root / "state" / "sessions.json")
+        initialized_store(symlinked_root / "state" / "sessions.json")
 
 
 def test_group_writable_nonsticky_ancestor_fails_closed(tmp_path):
@@ -165,7 +171,7 @@ def test_group_writable_nonsticky_ancestor_fails_closed(tmp_path):
     safe_parent.chmod(0o700)
 
     with pytest.raises(PermissionError, match="unsafe writable ancestor"):
-        SessionStore(safe_parent / "sessions.json")
+        initialized_store(safe_parent / "sessions.json")
 
 
 def _fake_foreign_owned_sticky_metadata(path: Path):
@@ -195,7 +201,34 @@ def test_foreign_owned_sticky_writable_ancestor_fails_closed():
         patch.object(os, "getgid", return_value=2000),
         patch.object(os, "getgroups", return_value=[2000]),
         patch.dict(os.environ, {}, clear=True),
-        pytest.raises(PermissionError, match="unsafe writable ancestor"),
+        pytest.raises(PermissionError, match="unsafe owner ancestor"),
+    ):
+        _validate_existing_directory_components(target)
+
+
+def test_foreign_owned_owner_writable_ancestor_fails_closed():
+    target = Path("/foreign-owned/private-state")
+
+    def metadata(path: Path):
+        if path == Path("/foreign-owned"):
+            mode, user_id, group_id = 0o755, 4000, 4000
+        elif path == Path("/"):
+            mode, user_id, group_id = 0o755, 0, 0
+        else:
+            mode, user_id, group_id = 0o700, 2000, 2000
+        return types.SimpleNamespace(
+            st_mode=stat.S_IFDIR | mode,
+            st_gid=group_id,
+            st_uid=user_id,
+        )
+
+    with (
+        patch.object(Path, "lstat", autospec=True, side_effect=metadata),
+        patch.object(os, "getuid", return_value=2000),
+        patch.object(os, "getgid", return_value=2000),
+        patch.object(os, "getgroups", return_value=[2000]),
+        patch.dict(os.environ, {}, clear=True),
+        pytest.raises(PermissionError, match="unsafe owner ancestor"),
     ):
         _validate_existing_directory_components(target)
 
@@ -515,7 +548,7 @@ def test_missing_directory_components_are_created_private(tmp_path):
     level_one = tmp_path / "level-one"
     level_two = level_one / "level-two"
 
-    SessionStore(level_two / "sessions.json")
+    initialized_store(level_two / "sessions.json")
 
     assert stat.S_IMODE(level_one.stat().st_mode) == 0o700
     assert stat.S_IMODE(level_two.stat().st_mode) == 0o700
@@ -525,7 +558,7 @@ def test_missing_directory_components_are_created_private(tmp_path):
 
 def test_serialization_failure_preserves_disk_and_memory(tmp_path):
     path = tmp_path / "sessions.json"
-    store = SessionStore(path)
+    store = initialized_store(path)
     run(store.set(1, {"session_id": "stable"}))
     before = path.read_bytes()
 
@@ -552,7 +585,7 @@ def test_noncanonical_nested_values_are_rejected_without_state_change(
     tmp_path, invalid_value
 ):
     path = tmp_path / "sessions.json"
-    store = SessionStore(path)
+    store = initialized_store(path)
     run(store.set(1, {"version": 1}))
     before = path.read_bytes()
 
@@ -566,7 +599,7 @@ def test_noncanonical_nested_values_are_rejected_without_state_change(
 
 def test_cyclic_nested_value_is_rejected_without_state_change(tmp_path):
     path = tmp_path / "sessions.json"
-    store = SessionStore(path)
+    store = initialized_store(path)
     run(store.set(1, {"version": 1}))
     before = path.read_bytes()
     cyclic = {}
@@ -587,12 +620,12 @@ def test_canonical_nested_value_round_trips_without_type_drift(tmp_path):
             "empty": {},
         }
     }
-    store = SessionStore(path)
+    store = initialized_store(path)
 
     run(store.set("11:1001", value))
 
     assert run(store.get("11:1001")) == value
-    assert SessionStore(path)._local_data == {
+    assert initialized_store(path)._local_data == {
         "telegram_session:11:1001": value
     }
 
@@ -604,7 +637,7 @@ def test_nonfinite_number_on_disk_is_confirmed_corruption(tmp_path):
     )
 
     with pytest.raises(SessionStoreCorruptionError):
-        SessionStore(path)
+        initialized_store(path)
 
 
 def test_duplicate_nested_json_key_on_disk_is_confirmed_corruption(tmp_path):
@@ -615,13 +648,13 @@ def test_duplicate_nested_json_key_on_disk_is_confirmed_corruption(tmp_path):
     )
 
     with pytest.raises(SessionStoreCorruptionError):
-        SessionStore(path)
+        initialized_store(path)
 
 
 @pytest.mark.parametrize("operation", ["write", "flush"])
 def test_temp_write_failure_preserves_disk_and_memory(tmp_path, operation):
     path = tmp_path / "sessions.json"
-    store = SessionStore(path)
+    store = initialized_store(path)
     run(store.set(1, {"version": 1}))
     before = path.read_bytes()
     real_fdopen = os.fdopen
@@ -641,7 +674,7 @@ def test_temp_write_failure_preserves_disk_and_memory(tmp_path, operation):
 @pytest.mark.parametrize("operation", ["write", "flush"])
 def test_primary_temp_io_failure_after_backup_preserves_state(tmp_path, operation):
     path = tmp_path / "sessions.json"
-    store = SessionStore(path)
+    store = initialized_store(path)
     run(store.set(1, {"version": 1}))
     before = path.read_bytes()
     real_fdopen = os.fdopen
@@ -666,7 +699,7 @@ def test_primary_temp_io_failure_after_backup_preserves_state(tmp_path, operatio
 
 def test_primary_file_fsync_failure_after_backup_preserves_state(tmp_path):
     path = tmp_path / "sessions.json"
-    store = SessionStore(path)
+    store = initialized_store(path)
     run(store.set(1, {"version": 1}))
     before = path.read_bytes()
     real_fsync = os.fsync
@@ -692,7 +725,7 @@ def test_primary_file_fsync_failure_after_backup_preserves_state(tmp_path):
 def test_backup_replace_failure_preserves_primary_and_memory(tmp_path):
     path = tmp_path / "sessions.json"
     backup_path = path.with_name(f"{path.name}.bak")
-    store = SessionStore(path)
+    store = initialized_store(path)
     run(store.set(1, {"version": 1}))
     before = path.read_bytes()
     real_replace = os.replace
@@ -713,7 +746,7 @@ def test_backup_replace_failure_preserves_primary_and_memory(tmp_path):
 
 def test_delete_replace_failure_rolls_memory_back(tmp_path):
     path = tmp_path / "sessions.json"
-    store = SessionStore(path)
+    store = initialized_store(path)
     run(store.set(1, {"version": 1}))
     real_replace = os.replace
 
@@ -732,7 +765,7 @@ def test_delete_replace_failure_rolls_memory_back(tmp_path):
 
 def test_file_fsync_failure_preserves_disk_and_memory(tmp_path):
     path = tmp_path / "sessions.json"
-    store = SessionStore(path)
+    store = initialized_store(path)
     run(store.set(1, {"version": 1}))
     before = path.read_bytes()
 
@@ -747,7 +780,7 @@ def test_file_fsync_failure_preserves_disk_and_memory(tmp_path):
 
 def test_unsupported_directory_fsync_keeps_committed_state(tmp_path, caplog):
     path = tmp_path / "sessions.json"
-    store = SessionStore(path)
+    store = initialized_store(path)
     run(store.set(1, {"version": 1}))
     real_fsync = os.fsync
 
@@ -766,7 +799,7 @@ def test_unsupported_directory_fsync_keeps_committed_state(tmp_path, caplog):
 
 def test_backup_directory_fsync_io_error_rolls_back_before_primary_replace(tmp_path):
     path = tmp_path / "sessions.json"
-    store = SessionStore(path)
+    store = initialized_store(path)
     run(store.set(1, {"version": 1}))
     before = path.read_bytes()
     real_fsync = os.fsync
@@ -786,7 +819,7 @@ def test_backup_directory_fsync_io_error_rolls_back_before_primary_replace(tmp_p
 
 def test_primary_directory_fsync_io_error_keeps_committed_disk_and_memory(tmp_path):
     path = tmp_path / "sessions.json"
-    store = SessionStore(path)
+    store = initialized_store(path)
     run(store.set(1, {"version": 1}))
     real_fsync = os.fsync
     directory_calls = 0
@@ -809,7 +842,7 @@ def test_primary_directory_fsync_io_error_keeps_committed_disk_and_memory(tmp_pa
 
 def test_directory_close_error_after_primary_replace_is_nonfatal(tmp_path, caplog):
     path = tmp_path / "sessions.json"
-    store = SessionStore(path)
+    store = initialized_store(path)
     run(store.set(1, {"version": 1}))
     real_close = os.close
     directory_calls = 0
@@ -835,7 +868,7 @@ def test_directory_close_error_after_primary_replace_is_nonfatal(tmp_path, caplo
 
 def test_primary_replace_failure_preserves_disk_and_memory(tmp_path):
     path = tmp_path / "sessions.json"
-    store = SessionStore(path)
+    store = initialized_store(path)
     run(store.set(1, {"version": 1}))
     before = path.read_bytes()
     real_replace = os.replace
@@ -856,7 +889,7 @@ def test_primary_replace_failure_preserves_disk_and_memory(tmp_path):
 
 def test_corrupt_primary_recovers_previous_good_backup(tmp_path, caplog):
     path = tmp_path / "sessions.json"
-    store = SessionStore(path)
+    store = initialized_store(path)
     run(store.set(1, {"version": 1}))
     run(store.update(1, {"version": 2}))
     backup_path = path.with_name(f"{path.name}.bak")
@@ -864,7 +897,7 @@ def test_corrupt_primary_recovers_previous_good_backup(tmp_path, caplog):
     assert stat.S_IMODE(backup_path.stat().st_mode) == 0o600
 
     path.write_text("{ truncated", encoding="utf-8")
-    recovered = SessionStore(path)
+    recovered = initialized_store(path)
 
     assert run(recovered.get(1)) == {"version": 1}
     assert read_json(path) == {"telegram_session:1": {"version": 1}}
@@ -876,7 +909,7 @@ def test_corrupt_primary_without_backup_fails_closed(tmp_path):
     path.write_text("{ truncated", encoding="utf-8")
 
     with pytest.raises(SessionStoreCorruptionError, match="no valid backup"):
-        SessionStore(path)
+        initialized_store(path)
 
 
 def test_missing_primary_with_malformed_backup_fails_closed(tmp_path):
@@ -885,7 +918,7 @@ def test_missing_primary_with_malformed_backup_fails_closed(tmp_path):
     backup_path.write_text("{ truncated", encoding="utf-8")
 
     with pytest.raises(SessionStoreCorruptionError, match="no valid backup"):
-        SessionStore(path)
+        initialized_store(path)
 
 
 def test_recovery_rewrite_failure_leaves_corrupt_primary_and_backup_intact(tmp_path):
@@ -904,7 +937,7 @@ def test_recovery_rewrite_failure_leaves_corrupt_primary_and_backup_intact(tmp_p
 
     with patch("telegram_bot.session.store.os.replace", side_effect=fail_primary_replace):
         with pytest.raises(OSError, match="recovery replace failed"):
-            SessionStore(path)
+            initialized_store(path)
 
     assert path.read_bytes() == corrupt_primary
     assert backup_path.read_bytes() == valid_backup
@@ -918,7 +951,7 @@ def test_existing_symlink_state_file_fails_closed(tmp_path):
     path.symlink_to(target)
 
     with pytest.raises(PermissionError, match="regular file"):
-        SessionStore(path)
+        initialized_store(path)
 
 
 def test_existing_hardlinked_state_file_fails_closed(tmp_path):
@@ -928,12 +961,12 @@ def test_existing_hardlinked_state_file_fails_closed(tmp_path):
     os.link(target, path)
 
     with pytest.raises(PermissionError, match="multiple hard links"):
-        SessionStore(path)
+        initialized_store(path)
 
 
 def test_runtime_wrong_shaped_session_is_rejected_without_mutation(tmp_path):
     path = tmp_path / "sessions.json"
-    store = SessionStore(path)
+    store = initialized_store(path)
     run(store.set(1, {"version": 1}))
     before = path.read_bytes()
 
@@ -947,12 +980,12 @@ def test_runtime_wrong_shaped_session_is_rejected_without_mutation(tmp_path):
 
 def test_missing_primary_recovers_previous_good_backup(tmp_path, caplog):
     path = tmp_path / "sessions.json"
-    store = SessionStore(path)
+    store = initialized_store(path)
     run(store.set(1, {"version": 1}))
     run(store.update(1, {"version": 2}))
     path.unlink()
 
-    recovered = SessionStore(path)
+    recovered = initialized_store(path)
 
     assert run(recovered.get(1)) == {"version": 1}
     assert read_json(path) == {"telegram_session:1": {"version": 1}}
@@ -961,7 +994,7 @@ def test_missing_primary_recovers_previous_good_backup(tmp_path, caplog):
 
 def test_primary_permission_error_does_not_promote_stale_backup(tmp_path):
     path = tmp_path / "sessions.json"
-    store = SessionStore(path)
+    store = initialized_store(path)
     run(store.set(1, {"version": 1}))
     run(store.update(1, {"version": 2}))
     before = path.read_bytes()
@@ -976,7 +1009,7 @@ def test_primary_permission_error_does_not_promote_stale_backup(tmp_path):
 
     with patch.object(SessionStore, "_read_json_object", side_effect=fail_primary):
         with pytest.raises(PermissionError, match="primary unreadable"):
-            SessionStore(path)
+            initialized_store(path)
 
     assert calls == [path]
     assert path.read_bytes() == before
@@ -1000,7 +1033,7 @@ def test_backup_permission_error_does_not_replace_corrupt_primary(tmp_path):
 
     with patch.object(SessionStore, "_read_json_object", side_effect=fail_backup):
         with pytest.raises(PermissionError, match="backup unreadable"):
-            SessionStore(path)
+            initialized_store(path)
 
     assert path.read_bytes() == primary_before
 
@@ -1021,7 +1054,7 @@ def test_wrong_shaped_primary_recovers_valid_backup(tmp_path, invalid_primary):
         '{"telegram_session:1": {"version": 1}}\n', encoding="utf-8"
     )
 
-    recovered = SessionStore(path)
+    recovered = initialized_store(path)
 
     assert run(recovered.get(1)) == {"version": 1}
     assert read_json(path) == {"telegram_session:1": {"version": 1}}
@@ -1034,12 +1067,12 @@ def test_wrong_shaped_primary_and_backup_fail_closed(tmp_path):
     backup_path.write_text('{"unexpected:1": {}}\n', encoding="utf-8")
 
     with pytest.raises(SessionStoreCorruptionError, match="no valid backup"):
-        SessionStore(path)
+        initialized_store(path)
 
 
 def test_restart_and_concurrent_updates_persist_valid_json(tmp_path):
     path = tmp_path / "sessions.json"
-    store = SessionStore(path)
+    store = initialized_store(path)
 
     async def mutate():
         await store.set(1, {})
@@ -1048,7 +1081,7 @@ def test_restart_and_concurrent_updates_persist_valid_json(tmp_path):
         )
 
     run(mutate())
-    reloaded = SessionStore(path)
+    reloaded = initialized_store(path)
     expected = {f"key_{index}": index for index in range(20)}
 
     assert run(reloaded.get(1)) == expected
@@ -1058,7 +1091,7 @@ def test_restart_and_concurrent_updates_persist_valid_json(tmp_path):
 
 def test_concurrent_set_update_delete_remains_consistent(tmp_path):
     path = tmp_path / "sessions.json"
-    store = SessionStore(path)
+    store = initialized_store(path)
 
     async def mutate():
         await asyncio.gather(
@@ -1074,7 +1107,7 @@ def test_concurrent_set_update_delete_remains_consistent(tmp_path):
         )
 
     run(mutate())
-    reloaded = SessionStore(path)
+    reloaded = initialized_store(path)
     expected = {
         f"telegram_session:{user_id}": {"value": user_id, "updated": True}
         for user_id in range(1, 20, 2)

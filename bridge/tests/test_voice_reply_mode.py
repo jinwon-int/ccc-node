@@ -19,6 +19,7 @@ config_module.config = SimpleNamespace(
     claude_settings_path=Path("/tmp/settings.json"),
     max_voice_duration=300,
     bot_data_dir=Path("/tmp/telegram-bot-data"),
+    project_root=Path("/tmp"),
     transcription_provider="whisper",
     openai_api_key="test-key",
     openai_base_url=None,
@@ -29,7 +30,6 @@ config_module.config = SimpleNamespace(
     draft_update_interval=0.1,
     auto_new_session_after_hours=24.0,
 )
-sys.modules["telegram_bot.utils.config"] = config_module
 
 
 session_module = types.ModuleType("telegram_bot.session.manager")
@@ -47,6 +47,24 @@ class _SessionManager:
         session.update(data)
         self._sessions[user_id] = session
         return None
+
+    async def patch_session(self, user_id, *, updates=None, remove_fields=()):
+        session = dict(self._sessions.get(user_id, {"reply_mode": "text"}))
+        session.update(dict(updates or {}))
+        for field in remove_fields:
+            session.pop(field, None)
+        self._sessions[user_id] = session
+
+    async def patch_session_if(
+        self, user_id, *, expected, updates=None, remove_fields=()
+    ):
+        session = dict(self._sessions.get(user_id, {"reply_mode": "text"}))
+        if any(session.get(key) != value for key, value in expected.items()):
+            return False
+        await self.patch_session(
+            user_id, updates=updates, remove_fields=remove_fields
+        )
+        return True
 
     async def get_pending_question(self, user_id):
         del user_id
@@ -66,7 +84,6 @@ class _SessionManager:
 
 
 session_module.session_manager = _SessionManager()
-sys.modules["telegram_bot.session.manager"] = session_module
 
 
 project_chat_module = types.ModuleType("telegram_bot.core.project_chat")
@@ -107,29 +124,62 @@ class _ProjectChatHandler:
         return None
 
 
+_MISSING_MODULE = object()
+_original_project_chat = sys.modules.get("telegram_bot.core.project_chat", _MISSING_MODULE)
+_original_chat_logger = sys.modules.get("telegram_bot.utils.chat_logger", _MISSING_MODULE)
+
 project_chat_module.project_chat_handler = _ProjectChatHandler()
 project_chat_module.ChatResponse = _ChatResponse
 project_chat_module.PROJECT_ROOT = Path("/tmp")
 project_chat_module.CONVERSATIONS_DIR = Path("/tmp/conversations")
 sys.modules["telegram_bot.core.project_chat"] = project_chat_module
 
-
 chat_logger_module = types.ModuleType("telegram_bot.utils.chat_logger")
 chat_logger_module.log_debug = lambda *args, **kwargs: None
 sys.modules["telegram_bot.utils.chat_logger"] = chat_logger_module
 
-
-permission_module = types.ModuleType("claude_agent_sdk.types")
-permission_module.PermissionResultAllow = type("PermissionResultAllow", (), {})
-permission_module.PermissionResultDeny = type(
-    "PermissionResultDeny", (), {"__init__": lambda self, message="": None}
+_RUNTIME_MODULE_NAMES = (
+    "telegram_bot.core.bot",
+    "telegram_bot.core.bot_lifecycle",
+    "telegram_bot.core.bot_status",
+    "telegram_bot.core.bot_access",
+    "telegram_bot.core.bot_commands",
+    "telegram_bot.core.bot_delivery",
+    "telegram_bot.core.bot_voice",
 )
-sys.modules["claude_agent_sdk.types"] = permission_module
+_original_runtime_modules = {
+    name: sys.modules.get(name, _MISSING_MODULE) for name in _RUNTIME_MODULE_NAMES
+}
+
+try:
+    from telegram_bot.utils.tts import VoicePersonaNotAvailableError
+finally:
+    if _original_project_chat is _MISSING_MODULE:
+        sys.modules.pop("telegram_bot.core.project_chat", None)
+    else:
+        sys.modules["telegram_bot.core.project_chat"] = _original_project_chat
+    if _original_chat_logger is _MISSING_MODULE:
+        sys.modules.pop("telegram_bot.utils.chat_logger", None)
+    else:
+        sys.modules["telegram_bot.utils.chat_logger"] = _original_chat_logger
+    for _module_name, _original_module in _original_runtime_modules.items():
+        if _original_module is _MISSING_MODULE:
+            sys.modules.pop(_module_name, None)
+        else:
+            assert isinstance(_original_module, types.ModuleType)
+            sys.modules[_module_name] = _original_module
+
+def _telegram_bot_class():
+    chat_logger = sys.modules.get("telegram_bot.utils.chat_logger")
+    if chat_logger is not None and not callable(getattr(chat_logger, "log_debug", None)):
+        sys.modules.pop("telegram_bot.utils.chat_logger", None)
+    from telegram_bot.core.bot import TelegramBot
+
+    return TelegramBot
 
 
-from telegram_bot.core.bot import TelegramBot
-import telegram_bot.core.bot as bot_module
-from telegram_bot.utils.tts import VoicePersonaNotAvailableError
+def _make_bot(**kwargs):
+    return _telegram_bot_class()(**kwargs)
 
 
 def _build_text_update(user_id: int, text: str):
@@ -150,22 +200,25 @@ def _build_text_update(user_id: int, text: str):
 
 class VoiceReplyModeTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
-        bot_module.config = config_module.config
-        bot_module.session_manager = session_module.session_manager
-        bot_module.project_chat_handler = project_chat_module.project_chat_handler
+        TelegramBot = _telegram_bot_class()
+
         session_module.session_manager._sessions.clear()
         # Voice delivery is gated behind macOS (`say`). These tests mock the actual
         # synthesis (`_send_voice_message`) and only exercise the platform-independent
         # orchestration logic, so force the macOS gate on regardless of host platform
         # to keep coverage on Linux CI runners.
         macos_patcher = patch.object(
-            bot_module.TelegramBot, "_is_macos", staticmethod(lambda: True)
+            TelegramBot, "_is_macos", staticmethod(lambda: True)
         )
         macos_patcher.start()
         self.addCleanup(macos_patcher.stop)
 
     def test_voice_message_switches_to_voice_mode(self):
-        bot = TelegramBot()
+        bot = _make_bot(
+            settings=config_module.config,
+            session_manager=session_module.session_manager,
+            project_chat=project_chat_module.project_chat_handler,
+        )
         mode = bot._resolve_next_reply_mode(
             current_mode="text",
             message_source="voice",
@@ -174,7 +227,11 @@ class VoiceReplyModeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(mode, "voice")
 
     def test_text_message_switches_to_text_mode(self):
-        bot = TelegramBot()
+        bot = _make_bot(
+            settings=config_module.config,
+            session_manager=session_module.session_manager,
+            project_chat=project_chat_module.project_chat_handler,
+        )
         mode = bot._resolve_next_reply_mode(
             current_mode="voice",
             message_source="text",
@@ -183,7 +240,11 @@ class VoiceReplyModeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(mode, "text")
 
     def test_voice_message_keeps_voice_mode(self):
-        bot = TelegramBot()
+        bot = _make_bot(
+            settings=config_module.config,
+            session_manager=session_module.session_manager,
+            project_chat=project_chat_module.project_chat_handler,
+        )
         mode = bot._resolve_next_reply_mode(
             current_mode="voice",
             message_source="voice",
@@ -192,7 +253,11 @@ class VoiceReplyModeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(mode, "voice")
 
     def test_delivery_strategy_thresholds(self):
-        bot = TelegramBot()
+        bot = _make_bot(
+            settings=config_module.config,
+            session_manager=session_module.session_manager,
+            project_chat=project_chat_module.project_chat_handler,
+        )
         self.assertEqual(bot._get_voice_delivery_strategy("短文本"), "voice_only")
         self.assertEqual(bot._get_voice_delivery_strategy("a" * 301), "voice_and_text")
         self.assertEqual(bot._get_voice_delivery_strategy("中" * 1001), "text_only")
@@ -200,7 +265,11 @@ class VoiceReplyModeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(bot._get_voice_delivery_strategy(english_long), "text_only")
 
     async def test_voice_mode_falls_back_to_text_when_synthesis_fails(self):
-        bot = TelegramBot()
+        bot = _make_bot(
+            settings=config_module.config,
+            session_manager=session_module.session_manager,
+            project_chat=project_chat_module.project_chat_handler,
+        )
         message = _build_text_update(11, "hello").message
         bot._send_voice_message = AsyncMock(side_effect=RuntimeError("tts failed"))
         bot._reply_smart = AsyncMock()
@@ -217,7 +286,11 @@ class VoiceReplyModeTests(unittest.IsolatedAsyncioTestCase):
         bot._reply_smart.assert_awaited_once()
 
     async def test_voice_mode_returns_friendly_message_when_persona_missing(self):
-        bot = TelegramBot()
+        bot = _make_bot(
+            settings=config_module.config,
+            session_manager=session_module.session_manager,
+            project_chat=project_chat_module.project_chat_handler,
+        )
         message = _build_text_update(11, "hello").message
         bot._send_voice_message = AsyncMock(
             side_effect=VoicePersonaNotAvailableError(
@@ -245,7 +318,11 @@ class VoiceReplyModeTests(unittest.IsolatedAsyncioTestCase):
         bot._reply_smart.assert_awaited_once()
 
     async def test_text_reply_merges_voice_preview_into_single_message(self):
-        bot = TelegramBot()
+        bot = _make_bot(
+            settings=config_module.config,
+            session_manager=session_module.session_manager,
+            project_chat=project_chat_module.project_chat_handler,
+        )
         message = _build_text_update(11, "hello").message
         bot._reply_smart = AsyncMock()
 
@@ -265,7 +342,11 @@ class VoiceReplyModeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(merged_content, "🎤 Voice: raw transcript\n\nfinal reply")
 
     async def test_voice_only_reply_sends_preview_before_voice(self):
-        bot = TelegramBot()
+        bot = _make_bot(
+            settings=config_module.config,
+            session_manager=session_module.session_manager,
+            project_chat=project_chat_module.project_chat_handler,
+        )
         message = _build_text_update(11, "hello").message
         send_order = []
 
@@ -302,7 +383,11 @@ class VoiceReplyModeTests(unittest.IsolatedAsyncioTestCase):
         message.reply_text.assert_awaited_once_with("🎤 Voice: raw transcript")
 
     async def test_voice_only_preview_not_duplicated_when_synthesis_fails(self):
-        bot = TelegramBot()
+        bot = _make_bot(
+            settings=config_module.config,
+            session_manager=session_module.session_manager,
+            project_chat=project_chat_module.project_chat_handler,
+        )
         message = _build_text_update(11, "hello").message
         bot._send_voice_message = AsyncMock(side_effect=RuntimeError("tts failed"))
         bot._reply_smart = AsyncMock()
@@ -323,7 +408,11 @@ class VoiceReplyModeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(fallback_content, "short reply")
 
     async def test_voice_mode_persists_after_long_text_fallback(self):
-        bot = TelegramBot()
+        bot = _make_bot(
+            settings=config_module.config,
+            session_manager=session_module.session_manager,
+            project_chat=project_chat_module.project_chat_handler,
+        )
         bot.application = SimpleNamespace(bot=SimpleNamespace())
         bot._save_session_id = AsyncMock()
         bot._send_reply_by_mode = AsyncMock()
@@ -352,14 +441,17 @@ class VoiceReplyModeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(session.get("reply_mode"), "voice")
 
     async def test_voice_mode_disables_streaming_text_forwarding(self):
-        bot = TelegramBot()
+        bot = _make_bot(
+            settings=config_module.config,
+            session_manager=session_module.session_manager,
+            project_chat=project_chat_module.project_chat_handler,
+        )
         app_bot = SimpleNamespace()
         bot.application = SimpleNamespace(bot=app_bot)
         bot._save_session_id = AsyncMock()
         bot._send_reply_by_mode = AsyncMock()
         process_mock = AsyncMock(return_value=_ChatResponse(content="short reply"))
         project_chat_module.project_chat_handler.process_message = process_mock
-        bot_module.project_chat_handler.process_message = process_mock
         await session_module.session_manager.update_session(33, {"reply_mode": "voice"})
 
         update = _build_text_update(33, "来自语音转写")
@@ -371,13 +463,16 @@ class VoiceReplyModeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(kwargs["bot"])
 
     async def test_expired_text_message_starts_new_session_automatically(self):
-        bot = TelegramBot()
+        bot = _make_bot(
+            settings=config_module.config,
+            session_manager=session_module.session_manager,
+            project_chat=project_chat_module.project_chat_handler,
+        )
         bot.application = SimpleNamespace(bot=SimpleNamespace())
         bot._save_session_id = AsyncMock()
         bot._send_reply_by_mode = AsyncMock()
         process_mock = AsyncMock(return_value=_ChatResponse(content="ok"))
         project_chat_module.project_chat_handler.process_message = process_mock
-        bot_module.project_chat_handler.process_message = process_mock
         await session_module.session_manager.update_session(
             44,
             {
@@ -398,13 +493,16 @@ class VoiceReplyModeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("last_user_message_at", session)
 
     async def test_expired_voice_message_starts_new_session_automatically(self):
-        bot = TelegramBot()
+        bot = _make_bot(
+            settings=config_module.config,
+            session_manager=session_module.session_manager,
+            project_chat=project_chat_module.project_chat_handler,
+        )
         bot.application = SimpleNamespace(bot=SimpleNamespace())
         bot._save_session_id = AsyncMock()
         bot._send_reply_by_mode = AsyncMock()
         process_mock = AsyncMock(return_value=_ChatResponse(content="ok"))
         project_chat_module.project_chat_handler.process_message = process_mock
-        bot_module.project_chat_handler.process_message = process_mock
         await session_module.session_manager.update_session(
             55,
             {
@@ -429,7 +527,11 @@ class OptionButtonsTests(unittest.IsolatedAsyncioTestCase):
     _CONTENT = "어떤 걸 원하세요?\n\n1. 첫째\n2. 둘째"
 
     async def test_option_buttons_suppressed_by_default(self):
-        bot = TelegramBot()
+        bot = _make_bot(
+            settings=config_module.config,
+            session_manager=session_module.session_manager,
+            project_chat=project_chat_module.project_chat_handler,
+        )
         bot._send_file_paths = AsyncMock()
         message = SimpleNamespace(chat=SimpleNamespace(id=1), reply_text=AsyncMock())
 
@@ -439,7 +541,11 @@ class OptionButtonsTests(unittest.IsolatedAsyncioTestCase):
         message.reply_text.assert_not_called()  # numbered options stay as text
 
     async def test_option_buttons_shown_when_enabled(self):
-        bot = TelegramBot()
+        bot = _make_bot(
+            settings=config_module.config,
+            session_manager=session_module.session_manager,
+            project_chat=project_chat_module.project_chat_handler,
+        )
         bot._send_file_paths = AsyncMock()
         message = SimpleNamespace(chat=SimpleNamespace(id=1), reply_text=AsyncMock())
 

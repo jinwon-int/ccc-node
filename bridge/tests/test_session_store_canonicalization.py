@@ -35,6 +35,12 @@ def run(awaitable):
     return asyncio.run(awaitable)
 
 
+def initialized_store(path: Path) -> SessionStore:
+    store = SessionStore(path)
+    store.initialize()
+    return store
+
+
 def _build_resume_list(sessions):
     """Mirror the fixed ``_cmd_resume`` comprehension (bot_commands.py)."""
     return [[sid, msg] for sid, msg, _ in sessions]
@@ -56,14 +62,14 @@ def test_resume_list_persists_and_reloads_through_store():
         path = Path(tmp) / "sessions.json"
         resume_list = _build_resume_list(SESSIONS)
 
-        store = SessionStore(path)
+        store = initialized_store(path)
         run(store.update(4242, {"resume_list": resume_list}))
 
         stored = run(store.get(4242))
         assert stored["resume_list"] == resume_list
 
         # Survives a cold reload from disk unchanged...
-        reloaded = run(SessionStore(path).get(4242))
+        reloaded = run(initialized_store(path).get(4242))
         assert reloaded["resume_list"] == resume_list
 
         # ...and the delivery-side unpacking (``sid, msg = resume_list[idx]``)

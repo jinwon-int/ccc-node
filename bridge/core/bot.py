@@ -3,6 +3,7 @@ import asyncio
 import logging
 import re
 import sys
+import time
 import types
 from typing import Any, Dict, Optional
 from datetime import datetime, timezone
@@ -22,16 +23,11 @@ from telegram.ext import (
     filters,
 )
 from telegram.request import HTTPXRequest  # noqa: F401 - compatibility for tests/patches
-from telegram_bot.utils.config import config
 from telegram_bot.utils.chat_logger import log_debug
-from telegram_bot.session.manager import session_manager
 from telegram_bot.core import session_resume
 from telegram_bot.core.push_notifier import PushNotifier
 from telegram_bot.core.task_queue import UserTaskQueue
-from telegram_bot.core.project_chat import (
-    project_chat_handler,
-    ChatResponse,
-)
+from telegram_bot.core.project_chat import ChatResponse
 from telegram_bot.utils.audio_processor import AudioProcessor
 from telegram_bot.utils.transcription import (
     VolcengineFileFastTranscriber,
@@ -72,9 +68,6 @@ _EXTRACTED_MODULES = (
 def _sync_extracted_modules() -> None:
     """Keep extracted mixin modules aligned with monkeypatched bot globals."""
     for module in _EXTRACTED_MODULES:
-        module.config = config
-        module.project_chat_handler = project_chat_handler
-        module.session_manager = session_manager
         module.Application = Application
         module.HTTPXRequest = HTTPXRequest
         module.enforce_access_control = enforce_access_control
@@ -84,9 +77,6 @@ class _BotModule(types.ModuleType):
     def __setattr__(self, name: str, value: Any) -> None:
         super().__setattr__(name, value)
         if name in {
-            "config",
-            "project_chat_handler",
-            "session_manager",
             "Application",
             "HTTPXRequest",
             "enforce_access_control",
@@ -100,19 +90,33 @@ sys.modules[__name__].__class__ = _BotModule
 
 class TelegramBot(BotLifecycleMixin, BotStatusMixin, BotAccessMixin, BotCommandMixin, BotDeliveryMixin, BotVoiceMixin):
 
-    def __init__(self):
-        self._config = config
+    def __init__(
+        self,
+        *,
+        settings: Any,
+        session_manager: Any,
+        project_chat: Any,
+        application_builder_factory: Any = None,
+        clock: Any = None,
+    ):
+        self._config = settings
+        self._session_manager = session_manager
+        self._project_chat = project_chat
+        self._application_builder_factory = (
+            application_builder_factory or Application.builder
+        )
+        self._clock = clock or time
         self.application: Optional[Application] = None
         # ccc-node owner-only push notifier (disabled unless config.push_enabled).
-        self._push_notifier = PushNotifier()
+        self._push_notifier = PushNotifier(settings)
         # Only sessions created/resumed in current runtime are auto-resumed.
         self._runtime_active_sessions: set[Any] = set()
         self._user_voice_tasks: Dict[Any, set[asyncio.Task]] = {}
         # Per-user bounded run queue + active-task tracking (priority stop/revert).
         self._tasks = UserTaskQueue(self._MAX_INFLIGHT_MESSAGES)
-        self._audio_dir = config.bot_data_dir / "audio"
-        self._image_dir = config.bot_data_dir / "images"
-        self._audio_processor = AudioProcessor(ffmpeg_path=config.ffmpeg_path)
+        self._audio_dir = settings.bot_data_dir / "audio"
+        self._image_dir = settings.bot_data_dir / "images"
+        self._audio_processor = AudioProcessor(ffmpeg_path=settings.ffmpeg_path)
         self._whisper_transcriber: Optional[WhisperTranscriber] = None
         self._volcengine_transcriber: Optional[VolcengineFileFastTranscriber] = None
         self._volcengine_tos_uploader: Optional[VolcengineTOSUploader] = None
@@ -148,9 +152,9 @@ class TelegramBot(BotLifecycleMixin, BotStatusMixin, BotAccessMixin, BotCommandM
 
     async def _save_session_id(self, session_key: Any, response: ChatResponse):
         if response.session_id:
-            session = await session_manager.get_session(session_key)
-            session["session_id"] = response.session_id
-            await session_manager.update_session(session_key, session)
+            await self._session_manager.patch_session(
+                session_key, updates={"session_id": response.session_id}
+            )
             self._runtime_active_sessions.add(session_key)
 
     def _effective_session_id(self, session_key: Any, session: dict) -> Optional[str]:
@@ -180,11 +184,9 @@ class TelegramBot(BotLifecycleMixin, BotStatusMixin, BotAccessMixin, BotCommandM
         )
         return None
 
-    @staticmethod
-    def _sdk_conversations_dir():
-        """Resolve CONVERSATIONS_DIR from the live project_chat module (test-stub safe)."""
-        module = sys.modules.get("telegram_bot.core.project_chat")
-        return getattr(module, "CONVERSATIONS_DIR", None)
+    def _sdk_conversations_dir(self):
+        """Return the SDK history directory owned by the injected handler."""
+        return self._project_chat.conversations_dir
 
     @staticmethod
     def _session_start_notice_text(
@@ -353,17 +355,32 @@ class TelegramBot(BotLifecycleMixin, BotStatusMixin, BotAccessMixin, BotCommandM
         chat = self._require_chat(update)
         app = self._require_application()
         conversation_key = self._conversation_key(user_id, chat.id)
-        current_session = await session_manager.get_session(conversation_key)
+        current_session = await self._session_manager.get_session(conversation_key)
         if conversation_key != user_id:
             # One-time compatibility migration: older bridge versions stored all
             # Telegram chat state under bare user_id. If the scoped session only
             # has defaults, seed it from legacy state, then keep future updates
             # chat-scoped.
-            legacy_session = await session_manager.get_session(user_id)
+            legacy_session = await self._session_manager.get_session(user_id)
             scoped_is_default = set(current_session.keys()).issubset({"reply_mode"})
             if legacy_session and scoped_is_default and legacy_session != current_session:
-                current_session = dict(legacy_session)
-                await session_manager.update_session(conversation_key, current_session)
+                migration_fields = {
+                    "session_id",
+                    "model",
+                    "reply_mode",
+                    "last_user_message_at",
+                    "force_auto_new_session",
+                }
+                migrated = {
+                    key: value
+                    for key, value in legacy_session.items()
+                    if key in migration_fields
+                }
+                if migrated:
+                    await self._session_manager.patch_session(
+                        conversation_key, updates=migrated
+                    )
+                    current_session.update(migrated)
                 if user_id in self._runtime_active_sessions:
                     self._runtime_active_sessions.add(conversation_key)
         current_reply_mode = self._normalize_reply_mode(
@@ -377,7 +394,7 @@ class TelegramBot(BotLifecycleMixin, BotStatusMixin, BotAccessMixin, BotCommandM
         )
         if current_reply_mode != next_reply_mode:
             current_session["reply_mode"] = next_reply_mode
-            await session_manager.update_session(
+            await self._session_manager.update_session(
                 conversation_key, {"reply_mode": next_reply_mode}
             )
         else:
@@ -392,22 +409,28 @@ class TelegramBot(BotLifecycleMixin, BotStatusMixin, BotAccessMixin, BotCommandM
             # Used below to inject recent conversation history when a new session starts.
             stale_session_id = current_session.get("session_id")
 
-            new_session = current_session.pop("new_session", False)
-            auto_new_session = await session_manager.should_start_new_session(
+            requested_new_session = bool(current_session.get("new_session"))
+            new_session = False
+            if requested_new_session:
+                new_session = await self._session_manager.patch_session_if(
+                    conversation_key,
+                    expected={"new_session": True},
+                    updates={"new_session": False},
+                )
+                current_session["new_session"] = False
+            auto_new_session = await self._session_manager.should_start_new_session(
                 conversation_key, now=message_timestamp
             )
             if auto_new_session:
+                await self._session_manager.patch_session(
+                    conversation_key,
+                    updates={"session_id": None, "new_session": False},
+                )
                 current_session["session_id"] = None
                 self._runtime_active_sessions.discard(conversation_key)
                 new_session = True
-            if new_session:
-                # SessionStore.update() is merge-only: popping the one-shot flag from
-                # the local copy does not remove it from persisted JSON storage. Persist
-                # an explicit false value so /new is consumed by exactly one message.
-                current_session["new_session"] = False
-                await session_manager.update_session(conversation_key, current_session)
 
-            await session_manager.set_last_user_message_at(conversation_key, message_timestamp)
+            await self._session_manager.set_last_user_message_at(conversation_key, message_timestamp)
 
             effective_sid = self._effective_session_id(conversation_key, current_session)
             if effective_sid is None:
@@ -429,7 +452,7 @@ class TelegramBot(BotLifecycleMixin, BotStatusMixin, BotAccessMixin, BotCommandM
             send_text = text
             if effective_sid is None and stale_session_id:
                 try:
-                    recent = project_chat_handler.get_recent_messages(stale_session_id, limit=6)
+                    recent = self._project_chat.get_recent_messages(stale_session_id, limit=6)
                     if recent:
                         lines = []
                         for m in recent:
@@ -450,7 +473,7 @@ class TelegramBot(BotLifecycleMixin, BotStatusMixin, BotAccessMixin, BotCommandM
                     logger.warning(f"History injection failed, sending without context: {_hist_err}")
 
             enable_streaming_text = next_reply_mode != "voice"
-            response = await project_chat_handler.process_message(
+            response = await self._project_chat.process_message(
                 user_message=send_text,
                 user_id=user_id,
                 chat_id=chat.id,
@@ -495,21 +518,3 @@ class TelegramBot(BotLifecycleMixin, BotStatusMixin, BotAccessMixin, BotCommandM
         re.IGNORECASE,
     )
     _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-bot = TelegramBot()

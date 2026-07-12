@@ -62,7 +62,6 @@ for name in [
     sys.modules.pop(name, None)
 
 project_chat = importlib.import_module("telegram_bot.core.project_chat")
-project_chat_history = importlib.import_module("telegram_bot.core.project_chat_history")
 project_chat_process = importlib.import_module("telegram_bot.core.project_chat_process")
 project_chat_reader = importlib.import_module("telegram_bot.core.project_chat_reader")
 
@@ -109,33 +108,28 @@ class ProjectChatMixinContractTests(unittest.TestCase):
             project_chat.TYPING_INTERVAL = original_typing
             project_chat.PROCESS_TIMEOUT = original_timeout
 
-    def test_history_helpers_read_conversations_dir_at_call_time(self):
-        original_dir = project_chat.CONVERSATIONS_DIR
-        try:
-            with tempfile.TemporaryDirectory() as tmp:
-                conv_dir = Path(tmp)
-                project_chat.CONVERSATIONS_DIR = conv_dir
-                session_path = conv_dir / "session-1.jsonl"
-                session_path.write_text(
-                    json.dumps(
-                        {
-                            "type": "user",
-                            "message": {"role": "user", "content": "hello from patched dir"},
-                            "timestamp": "2026-07-03T00:00:00Z",
-                        }
-                    )
-                    + "\n",
-                    encoding="utf-8",
+    def test_history_helpers_use_handler_conversations_dir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            conv_dir = Path(tmp)
+            session_path = conv_dir / "session-1.jsonl"
+            session_path.write_text(
+                json.dumps(
+                    {
+                        "type": "user",
+                        "message": {"role": "user", "content": "hello from injected dir"},
+                        "timestamp": "2026-07-03T00:00:00Z",
+                    }
                 )
-                handler = project_chat.ProjectChatHandler()
-                self.assertEqual(project_chat_history._conversations_dir(), conv_dir)
-                self.assertEqual(handler.list_sessions(limit=1)[0][0], "session-1")
-                self.assertEqual(
-                    handler.get_conversation_history("session-1", limit=1)[0]["content"],
-                    "hello from patched dir",
-                )
-        finally:
-            project_chat.CONVERSATIONS_DIR = original_dir
+                + "\n",
+                encoding="utf-8",
+            )
+            handler = project_chat.ProjectChatHandler()
+            handler.conversations_dir = conv_dir
+            self.assertEqual(handler.list_sessions(limit=1)[0][0], "session-1")
+            self.assertEqual(
+                handler.get_conversation_history("session-1", limit=1)[0]["content"],
+                "hello from injected dir",
+            )
 
 
 if __name__ == "__main__":
