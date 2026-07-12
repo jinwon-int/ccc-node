@@ -56,10 +56,25 @@ class BotDeliveryMixin:
             log_debug(user_id, "user", text)
             idx = int(text.strip()) - 1
             if 0 <= idx < len(resume_list):
-                sid, msg = resume_list[idx]
+                entry = resume_list[idx]
+                sid, msg = entry[:2]
+                provider = entry[2] if len(entry) > 2 else "claude"
+                active_provider = self._active_provider()
+                if provider != active_provider:
+                    reply = (
+                        f"❌ Provider mismatch: selected session is {provider}, "
+                        f"but the active provider is {active_provider}."
+                    )
+                    await message.reply_text(reply)
+                    log_debug(user_id, "bot", reply)
+                    return
                 await self._session_manager.patch_session(
                     conversation_key,
-                    updates={"session_id": sid, "new_session": False},
+                    updates={
+                        "provider": provider,
+                        "session_id": sid,
+                        "new_session": False,
+                    },
                     remove_fields={"resume_list"},
                 )
                 self._runtime_active_sessions.add(conversation_key)
@@ -442,16 +457,19 @@ class BotDeliveryMixin:
             # Send choice back to Claude as a new message
             chat_id = chat.id
             await self._maybe_capture_outside_approval(user_id, choice, chat_id)
+            conversation_key = self._conversation_key(user_id, chat_id)
 
             async def run_task():
-                session = await self._session_manager.get_session(user_id)
+                session, _ = await self._align_active_provider(
+                    conversation_key
+                )
                 await app.bot.send_chat_action(chat_id, action="typing")
                 try:
                     response = await self._project_chat.process_message(
                         user_message=choice,
                         user_id=user_id,
                         chat_id=chat_id,
-                        session_id=self._effective_session_id(user_id, session),
+                        session_id=self._effective_session_id(conversation_key, session),
                         model=session.get("model"),
                         permission_callback=self._permission_callback,
                         typing_callback=lambda: app.bot.send_chat_action(
@@ -460,7 +478,7 @@ class BotDeliveryMixin:
                         status_callback=self._make_status_callback(app.bot, chat_id),
                         bot=app.bot,
                     )
-                    await self._save_session_id(user_id, response)
+                    await self._save_session_id(conversation_key, response)
                     await self._send_smart(
                         chat_id,
                         response.content,
@@ -492,8 +510,22 @@ class BotDeliveryMixin:
             model_name = data.split(":", 1)[1]
             log_debug(user_id, "callback", f"model:{model_name}")
             session_key = self._conversation_key(user_id, chat.id)
+            active_provider = self._active_provider()
+            if active_provider != "claude":
+                await query.edit_message_text(
+                    "❌ Claude model shortcuts are unavailable with Codex. "
+                    "Use /model <codex-model>."
+                )
+                return
+            stored_provider = await self._session_provider(
+                session_key
+            )
+            updates = {"provider": active_provider, "model": model_name}
+            if stored_provider != active_provider:
+                updates.update(session_id=None, new_session=True)
             await self._session_manager.patch_session(
-                session_key, updates={"model": model_name}
+                session_key,
+                updates=updates,
             )
             label = dict(self.MODELS).get(model_name, model_name)
             logger.info(

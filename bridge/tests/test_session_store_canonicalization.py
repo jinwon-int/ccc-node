@@ -18,6 +18,8 @@ import tempfile
 import types
 from pathlib import Path
 
+import pytest
+
 BRIDGE_DIR = Path(__file__).resolve().parents[1]
 if "telegram_bot" not in sys.modules:
     package = types.ModuleType("telegram_bot")
@@ -87,4 +89,10 @@ def test_tuple_resume_list_is_rejected_by_validator():
         assert "resume_list[0]" in str(error)
         assert "tuple" in str(error)
     else:  # pragma: no cover - protects against a silent regression
-        raise AssertionError("tuple resume_list must not validate")
+        raise AssertionError("tuple payload was unexpectedly accepted")
+
+
+@pytest.mark.parametrize("provider", [[], {}, 1, True])
+def test_provider_validation_rejects_non_string_json_values(provider) -> None:
+    with pytest.raises(SessionStoreValidationError, match="invalid provider"):
+        _validate_session_data({"telegram_session:1": {"provider": provider}})

@@ -150,10 +150,52 @@ class TelegramBot(BotLifecycleMixin, BotStatusMixin, BotAccessMixin, BotCommandM
             return user_id
         return f"{user_id}:{chat_id}"
 
+    def _active_provider(self) -> str:
+        provider = str(getattr(self._config, "agent_provider", "claude")).strip().lower()
+        if provider not in {"claude", "codex"}:
+            raise ValueError(f"Unsupported agent provider: {provider!r}")
+        return provider
+
+    async def _align_active_provider(self, session_key: Any, session=None):
+        """Align provider state, retaining compatibility with lightweight test managers."""
+        align = getattr(self._session_manager, "align_active_provider", None)
+        if callable(align):
+            return await align(session_key)
+        if session is None:
+            session = await self._session_manager.get_session(session_key)
+        provider = str(session.get("provider", "claude")).strip().lower()
+        active_provider = self._active_provider()
+        session["provider"] = provider
+        if provider == active_provider:
+            return session, False
+        await self._session_manager.patch_session(
+            session_key,
+            updates={
+                "provider": active_provider,
+                "session_id": None,
+                "new_session": True,
+            },
+            remove_fields={"model"},
+        )
+        session.update(provider=active_provider, session_id=None, new_session=True)
+        session.pop("model", None)
+        return session, True
+
+    async def _session_provider(self, session_key: Any) -> str:
+        get_provider = getattr(self._session_manager, "get_session_provider", None)
+        if callable(get_provider):
+            return await get_provider(session_key)
+        session = await self._session_manager.get_session(session_key)
+        return str(session.get("provider", "claude")).strip().lower()
+
     async def _save_session_id(self, session_key: Any, response: ChatResponse):
-        if response.session_id:
+        if getattr(response, "success", True) and response.session_id:
             await self._session_manager.patch_session(
-                session_key, updates={"session_id": response.session_id}
+                session_key,
+                updates={
+                    "provider": self._active_provider(),
+                    "session_id": response.session_id,
+                },
             )
             self._runtime_active_sessions.add(session_key)
 
@@ -169,7 +211,12 @@ class TelegramBot(BotLifecycleMixin, BotStatusMixin, BotAccessMixin, BotCommandM
         session_id = session.get("session_id")
         if not session_id:
             return None
+        if session.get("provider", "claude") != self._active_provider():
+            return None
         if session_key in self._runtime_active_sessions:
+            return session_id
+        if self._active_provider() == "codex":
+            self._runtime_active_sessions.add(session_key)
             return session_id
         if session_resume.resume_persisted_enabled() and session_resume.persisted_transcript_exists(
             self._sdk_conversations_dir(), session_id
@@ -193,14 +240,16 @@ class TelegramBot(BotLifecycleMixin, BotStatusMixin, BotAccessMixin, BotCommandM
         *,
         reason: str,
         model: Optional[str],
+        provider: str = "claude",
         previous_session_id: Optional[str] = None,
     ) -> str:
+        provider_label = "Claude Code" if provider == "claude" else "Codex"
         lines = [
-            f"◐ CCC session started ({reason}). Conversation history is on a fresh Claude Code stream.",
+            f"◐ CCC session started ({reason}). Conversation history is on a fresh {provider_label} stream.",
             "Use /resume to browse and restore a previous session.",
             "",
             f"◆ Model: {model or 'default'}",
-            "◆ Provider: Claude Code",
+            f"◆ Provider: {provider_label}",
             "◆ Context: new stream",
         ]
         if previous_session_id:
@@ -362,11 +411,14 @@ class TelegramBot(BotLifecycleMixin, BotStatusMixin, BotAccessMixin, BotCommandM
             # has defaults, seed it from legacy state, then keep future updates
             # chat-scoped.
             legacy_session = await self._session_manager.get_session(user_id)
-            scoped_is_default = set(current_session.keys()).issubset({"reply_mode"})
+            scoped_is_default = set(current_session.keys()).issubset(
+                {"reply_mode", "provider"}
+            )
             if legacy_session and scoped_is_default and legacy_session != current_session:
                 migration_fields = {
                     "session_id",
                     "model",
+                    "provider",
                     "reply_mode",
                     "last_user_message_at",
                     "force_auto_new_session",
@@ -383,6 +435,11 @@ class TelegramBot(BotLifecycleMixin, BotStatusMixin, BotAccessMixin, BotCommandM
                     current_session.update(migrated)
                 if user_id in self._runtime_active_sessions:
                     self._runtime_active_sessions.add(conversation_key)
+        current_session, provider_switched = await self._align_active_provider(
+            conversation_key, current_session
+        )
+        if provider_switched:
+            self._runtime_active_sessions.discard(conversation_key)
         current_reply_mode = self._normalize_reply_mode(
             current_session.get("reply_mode")
         )
@@ -441,6 +498,7 @@ class TelegramBot(BotLifecycleMixin, BotStatusMixin, BotAccessMixin, BotCommandM
                         stale_session_id=stale_session_id,
                     ),
                     model=current_session.get("model"),
+                    provider=current_session["provider"],
                     previous_session_id=stale_session_id,
                 )
                 await message.reply_text(notice)
