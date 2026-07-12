@@ -1075,7 +1075,35 @@ load_optional_env() {
     fi
 }
 
-maybe_setup_claude_cli() {
+maybe_setup_agent_cli() {
+    local provider codex_cli
+    provider="$(read_env_with_fallback "CCC_AGENT_PROVIDER")"
+    provider="${provider:-claude}"
+
+    case "${provider,,}" in
+        codex)
+            codex_cli="$(read_env_with_fallback "CCC_CODEX_CLI_PATH")"
+            codex_cli="${codex_cli:-codex}"
+            if [[ "$codex_cli" == */* ]]; then
+                if [ ! -f "$codex_cli" ] || [ ! -x "$codex_cli" ]; then
+                    echo "❌ Error: configured Codex CLI is not executable"
+                    exit 1
+                fi
+            elif ! command -v "$codex_cli" >/dev/null 2>&1; then
+                echo "❌ Error: Codex CLI not found. Install Codex CLI or set CCC_CODEX_CLI_PATH in .env"
+                exit 1
+            fi
+            echo "✅ Codex provider CLI is available"
+            return
+            ;;
+        claude)
+            ;;
+        *)
+            echo "❌ Error: unsupported CCC_AGENT_PROVIDER (expected claude or codex)"
+            exit 1
+            ;;
+    esac
+
     if [ -n "$CLAUDE_CLI_PATH" ]; then
         echo "🛠️ Using user-specified CLAUDE_CLI_PATH: $CLAUDE_CLI_PATH"
         return
@@ -1091,7 +1119,7 @@ maybe_setup_claude_cli() {
 
 prepare_runtime() {
     load_optional_env
-    maybe_setup_claude_cli
+    maybe_setup_agent_cli
 
     if ! command -v python3 >/dev/null 2>&1; then
         echo "❌ Error: Python 3.11+ is required"
