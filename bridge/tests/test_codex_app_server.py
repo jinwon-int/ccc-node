@@ -420,6 +420,16 @@ class CodexAppServerTests(unittest.IsolatedAsyncioTestCase):
             },
         )
         await assert_call(
+            client.turn_start(
+                "thread-1", [{"type": "text", "text": "use defaults"}]
+            ),
+            "turn/start",
+            {
+                "threadId": "thread-1",
+                "input": [{"type": "text", "text": "use defaults"}],
+            },
+        )
+        await assert_call(
             client.turn_interrupt("thread-1", "turn-1"),
             "turn/interrupt",
             {"threadId": "thread-1", "turnId": "turn-1"},
