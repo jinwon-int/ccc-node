@@ -261,27 +261,94 @@ if cmd_is_git_push && gn '[[:space:]]--(tags|follow-tags)([[:space:]=]|$)'; then
 fi
 g 'gh[[:space:]]+repo[[:space:]]+edit([[:space:]]|$)[^|;&]*--visibility'                          && deny "repo-visibility" "operator_approval_gated" "$c"
 
-# secret exfil — external transfer of credential/key FILES to a remote endpoint.
+# secret exfil — EGRESS of a credential/key FILE to a remote endpoint.
 # Local reads (.env, credentials) are intentionally NOT gated: the operator already has
-# full shell access to the node, so local reads carry no marginal risk. Only network
-# exfil (curl/wget/nc/scp sending secret files to a remote) stays gated.
+# full shell access to the node, so local reads carry no marginal risk. Only genuine
+# network egress of a secret file stays gated.
 #
-# Order-INDEPENDENT: a network tool anywhere in the command PLUS a credential-file
-# reference anywhere trips the gate. The old single-regex form required the secret
-# token to appear *after* the tool on the same segment, so `cat .env | curl @-`
-# (read the secret, pipe it out) and `base64 key | nc host` slipped straight
-# through. `secret`/`token` are no longer matched as bare words — that blocked
-# ordinary API calls like `curl https://…/token` — only concrete credential files
-# (.env, .credentials, SSH private keys) count. Public keys (…​.pub / …​.pub.pem)
-# are neutralized first so deploying an authorized_keys public key is not gated.
-cexf="$(printf '%s' "$cnp" | sed -E 's#[A-Za-z0-9_./~-]*\.pub(\.pem)?#PUBKEY#g' 2>/dev/null)"
-[ -n "$cexf" ] || cexf="$cnp"
-gexf() { grep -Eq "$1" <<<"$cexf"; }
-_exfil_net='\b(curl|wget|nc|ncat|scp|sftp|ftp|rsync)\b'
-_exfil_secret='(\.env([^A-Za-z0-9_.-]|$)|\.credentials|\bid_(rsa|dsa|ecdsa|ed25519)\b)'
-if gexf "$_exfil_net" && gexf "$_exfil_secret"; then
-  deny "secret-exfil" "operator_approval_gated" "$c"
-fi
+# Precision (issue #399) over the old "net tool ANYWHERE + secret ANYWHERE" match,
+# which over-blocked three non-exfil shapes. The refined rule keeps every real-exfil
+# catch while allowing:
+#   1) segment scope   — a net tool and a secret in DIFFERENT statements (`;`, `&&`,
+#                        `||`, `&`) no longer cross-contaminate (they can't share data).
+#   2) remote required — a purely LOCAL scp/sftp/rsync copy (no remote spec) is not
+#                        exfil; rsync is the standard local-backup tool.
+#   3) direction       — an INGRESS download whose only secret reference is an output
+#                        sink (`-o FILE`, `> FILE`), a URL/remote resource, or a
+#                        remote-source pull (`scp host:/x .`) is not egress.
+# Preserved real-exfil catches: read-then-pipe (`cat .env | curl @-`,
+# `base64 key | nc host`), direct uploads (`curl -T/-d @.env`, `scp .env host:`,
+# `rsync .env host:`, `wget --post-file=.env`, `nc host < .env`). Public keys
+# (…​.pub / …​.pub.pem) are neutralized first so deploying an authorized_keys key is fine.
+_secret_in()   { grep -Eq '(\.env([^A-Za-z0-9_.-]|$)|\.credentials|\bid_(rsa|dsa|ecdsa|ed25519)\b)' <<<"$1"; }
+_remote_in()   { grep -Eq '(^[A-Za-z][A-Za-z0-9+.-]*://|^([A-Za-z0-9_.-]+@)?[A-Za-z0-9_.-]+:)' <<<"$1"; }
+_net_http_in() { grep -Eqw '(curl|wget|nc|ncat|ftp)' <<<"$1"; }   # inherently-remote senders
+_net_copy_in() { grep -Eqw '(scp|sftp|rsync)' <<<"$1"; }          # SRC->DEST copy tools (can be local)
+_net_any_in()  { grep -Eqw '(curl|wget|nc|ncat|ftp|scp|sftp|rsync)' <<<"$1"; }
+
+# 0 = the statement egresses a credential file to a remote endpoint.
+exfil_stmt() {
+  local stmt="$1"
+  _secret_in "$stmt" || return 1
+  _net_any_in "$stmt" || return 1
+
+  local -a stages; IFS='|' read -ra stages <<<"$stmt"   # read (not glob) split on pipe
+  local n=${#stages[@]} i j
+
+  # (1) piped read-then-send: a secret in an UPSTREAM stage feeding a net tool downstream.
+  for ((i=0; i<n; i++)); do
+    _secret_in "${stages[$i]}" || continue
+    for ((j=i+1; j<n; j++)); do
+      _net_any_in "${stages[$j]}" && return 0
+    done
+  done
+
+  # (2)/(3) direct: a net tool and a secret in the SAME stage.
+  local stage k prev
+  for stage in "${stages[@]}"; do
+    _net_any_in "$stage" || continue
+    local -a t; read -ra t <<<"$stage"
+    local m=${#t[@]} http=0 copy=0 rlast=-1
+    for ((k=0; k<m; k++)); do
+      _net_http_in "${t[$k]}" && http=1
+      _net_copy_in "${t[$k]}" && copy=1
+      _remote_in  "${t[$k]}" && rlast=$k                 # last remote endpoint = the destination
+    done
+
+    # HTTP-ish sender: egress unless every secret token is an output sink or a remote resource.
+    if [ "$http" -eq 1 ]; then
+      for ((k=0; k<m; k++)); do
+        _secret_in "${t[$k]}" || continue
+        _remote_in "${t[$k]}" && continue                # a URL/remote resource, not a local secret
+        prev="${t[$((k-1))]:-}"
+        grep -Eq '^(-o|--output|-O|--output-document)$' <<<"$prev"      && continue   # -o FILE
+        grep -Eq '^[0-9]*>>?$' <<<"$prev"                              && continue   # > FILE
+        grep -Eq '^(--output|--output-document|-o)=' <<<"${t[$k]}"     && continue   # --output=FILE
+        grep -Eq '^[0-9]*>>?' <<<"${t[$k]}"                            && continue   # >FILE (fused)
+        return 0                                          # non-sink secret with an HTTP sender → egress
+      done
+    fi
+
+    # COPY tool: needs a real remote spec; egress = a LOCAL secret source before the remote dest.
+    if [ "$copy" -eq 1 ] && [ "$rlast" -ge 0 ]; then
+      for ((k=0; k<m; k++)); do
+        _secret_in "${t[$k]}" || continue
+        _remote_in "${t[$k]}" && continue                # secret on the remote side (ingress pull)
+        [ "$k" -lt "$rlast" ] && return 0                # local secret source precedes a remote dest
+      done
+    fi
+  done
+  return 1
+}
+
+# Quote-stripped + public-key-neutralized view, split into statements on `;`/`&&`/`||`/`&`.
+base_exfil="$(printf '%s' "$cn" | sed -E 's#[A-Za-z0-9_./~-]*\.pub(\.pem)?#PUBKEY#g' 2>/dev/null)"
+[ -n "$base_exfil" ] || base_exfil="$cn"
+# `|| [ -n "$_stmt" ]` so a final statement with no trailing newline is still tested.
+while IFS= read -r _stmt || [ -n "$_stmt" ]; do
+  [ -n "$_stmt" ] || continue
+  exfil_stmt "$_stmt" && deny "secret-exfil" "operator_approval_gated" "$c"
+done < <(printf '%s\n' "$base_exfil" | sed -E 's/(&&|\|\||;|&)/\n/g')
 
 # catastrophic rm against absolute / home roots (quote-stripped; long flags too)
 # The trailing anchor now also accepts `*` so `rm -rf /*` (glob-expands to every
