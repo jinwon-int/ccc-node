@@ -409,3 +409,21 @@ async def test_codex_close_bounds_hung_interrupt_and_still_closes_runtime(tmp_pa
     assert runtime.close_calls == 1
     session.release["first"].set()
     await task
+
+
+@pytest.mark.anyio
+async def test_codex_streaming_cancel_failure_never_masks_primary_outcome(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    class BrokenStreamingHandler:
+        async def cancel(self) -> None:
+            raise RuntimeError("telegram cancel failed")
+
+    handler = _handler(tmp_path, FakeRuntime())
+
+    await handler._cancel_agent_streaming(
+        BrokenStreamingHandler(), context="test primary outcome"
+    )
+
+    assert "test primary outcome" in caplog.text
+    assert "telegram cancel failed" in caplog.text

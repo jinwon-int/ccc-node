@@ -293,6 +293,16 @@ class ProjectChatProcessMixin:
                     error=err,
                 )
 
+    async def _cancel_agent_streaming(
+        self, streaming_handler: Optional[Any], *, context: str
+    ) -> None:
+        if streaming_handler is None:
+            return
+        try:
+            await streaming_handler.cancel()
+        except Exception:
+            logger.exception("Failed to cancel agent stream while %s", context)
+
     async def _process_agent_message(
         self,
         *,
@@ -410,11 +420,9 @@ class ProjectChatProcessMixin:
                     self._agent_session_models.pop(key, None)
                 if session is not None:
                     await self._interrupt_agent_session(session)
-                if streaming_handler:
-                    try:
-                        await streaming_handler.cancel()
-                    except Exception:
-                        logger.exception("Failed to cancel timed-out agent stream")
+                await self._cancel_agent_streaming(
+                    streaming_handler, context="handling an agent timeout"
+                )
                 message = f"Timed out after {self._process_timeout_seconds}s"
                 return ChatResponse(
                     content=f"⏰ {message}. Please retry or simplify your request.",
@@ -425,15 +433,17 @@ class ProjectChatProcessMixin:
             except asyncio.CancelledError:
                 if session is not None:
                     await self._interrupt_agent_session(session)
-                if streaming_handler:
-                    await streaming_handler.cancel()
+                await self._cancel_agent_streaming(
+                    streaming_handler, context="propagating task cancellation"
+                )
                 raise
             except Exception as exc:
                 if session is not None and self._agent_sessions.get(key) is session:
                     self._agent_sessions.pop(key, None)
                     self._agent_session_models.pop(key, None)
-                if streaming_handler:
-                    await streaming_handler.cancel()
+                await self._cancel_agent_streaming(
+                    streaming_handler, context="returning an agent error"
+                )
                 message = str(exc) or "Agent runtime failed"
                 return ChatResponse(
                     content=f"❌ Error: {message}",
