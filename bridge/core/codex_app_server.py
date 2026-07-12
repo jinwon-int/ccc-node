@@ -30,6 +30,11 @@ class CodexServerRequest:
     params: Mapping[str, JsonValue]
 
 
+ServerRequestHandler: TypeAlias = Callable[
+    [CodexServerRequest], Awaitable[Mapping[str, JsonValue]]
+]
+
+
 class AsyncLineReader(Protocol):
     async def readline(self) -> bytes: ...
 
@@ -45,13 +50,18 @@ class AsyncWriter(Protocol):
 
 
 class AppServerProcess(Protocol):
-    stdout: AsyncLineReader | None
-    stdin: AsyncWriter | None
+    @property
+    def stdout(self) -> AsyncLineReader | None: ...
+
+    @property
+    def stdin(self) -> AsyncWriter | None: ...
 
     @property
     def returncode(self) -> int | None: ...
 
     def terminate(self) -> None: ...
+
+    def kill(self) -> None: ...
 
     async def wait(self) -> int: ...
 
@@ -63,6 +73,10 @@ class CodexConnectionClosedError(RuntimeError):
     """The app-server connection closed before a request completed."""
 
 
+class CodexProtocolError(RuntimeError):
+    """The app-server emitted a malformed JSON-RPC response."""
+
+
 class CodexAppServerClient:
     """A single-connection Codex app-server JSONL client."""
 
@@ -72,12 +86,22 @@ class CodexAppServerClient:
         reader: AsyncLineReader | None = None,
         writer: AsyncWriter | None = None,
         process_factory: ProcessFactory | None = None,
+        server_request_handler: ServerRequestHandler | None = None,
+        server_request_timeout: float = 30.0,
+        process_shutdown_timeout: float = 5.0,
     ) -> None:
         if (reader is None) != (writer is None):
             raise ValueError("reader and writer must be provided together")
+        if server_request_timeout <= 0:
+            raise ValueError("server request timeout must be positive")
+        if process_shutdown_timeout <= 0:
+            raise ValueError("process shutdown timeout must be positive")
         self._reader = reader
         self._writer = writer
         self._process_factory = process_factory or self._spawn_default_process
+        self._server_request_handler = server_request_handler
+        self._server_request_timeout = server_request_timeout
+        self._process_shutdown_timeout = process_shutdown_timeout
         self._process: AppServerProcess | None = None
         self._next_id = 1
         self._pending: dict[int, asyncio.Future[JsonValue]] = {}
@@ -87,6 +111,7 @@ class CodexAppServerClient:
         self._write_lock = asyncio.Lock()
         self._reader_task: asyncio.Task[None] | None = None
         self._process_task: asyncio.Task[None] | None = None
+        self._server_request_tasks: set[asyncio.Task[None]] = set()
         self._closed = False
         self._connection_error: CodexConnectionClosedError | None = None
         self._initialize_result: JsonValue = None
@@ -143,6 +168,12 @@ class CodexAppServerClient:
         try:
             await self._write(message)
             return await future
+        except BaseException:
+            if future.done() and not future.cancelled():
+                future.exception()
+            else:
+                future.cancel()
+            raise
         finally:
             self._pending.pop(request_id, None)
 
@@ -226,23 +257,45 @@ class CodexAppServerClient:
         return await self._server_requests.get()
 
     async def close(self) -> None:
-        """Close the transport. Repeated calls are harmless."""
+        """Close the transport. Repeated calls are harmless and bounded."""
 
         if self._closed:
             return
         self._closed = True
         error = CodexConnectionClosedError("client closed")
         self._fail_pending(error)
-        if self._writer is not None:
-            self._writer.close()
-            await self._writer.wait_closed()
-        if self._process is not None and self._process.returncode is None:
-            self._process.terminate()
-        if self._process_task is not None:
-            await asyncio.gather(self._process_task, return_exceptions=True)
+
+        for task in tuple(self._server_request_tasks):
+            task.cancel()
+        if self._server_request_tasks:
+            await asyncio.gather(*self._server_request_tasks, return_exceptions=True)
+
         if self._reader_task is not None:
             self._reader_task.cancel()
             await asyncio.gather(self._reader_task, return_exceptions=True)
+
+        if self._writer is not None:
+            self._writer.close()
+            try:
+                await asyncio.wait_for(
+                    self._writer.wait_closed(),
+                    timeout=self._process_shutdown_timeout,
+                )
+            except TimeoutError:
+                pass
+
+        if self._process is not None and self._process.returncode is None:
+            self._process.terminate()
+        if self._process_task is not None:
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(self._process_task),
+                    timeout=self._process_shutdown_timeout,
+                )
+            except TimeoutError:
+                if self._process is not None and self._process.returncode is None:
+                    self._process.kill()
+                await asyncio.gather(self._process_task, return_exceptions=True)
 
     @staticmethod
     async def _spawn_default_process() -> AppServerProcess:
@@ -257,19 +310,36 @@ class CodexAppServerClient:
 
     async def _watch_process(self) -> None:
         process = cast(AppServerProcess, self._process)
-        returncode = await process.wait()
+        try:
+            returncode = await process.wait()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            if not self._closed:
+                self._record_connection_error(
+                    CodexConnectionClosedError(f"app-server process wait failed: {exc}")
+                )
+            return
         if not self._closed:
-            self._connection_error = CodexConnectionClosedError(
-                f"app-server process exited with status {returncode}"
+            self._record_connection_error(
+                CodexConnectionClosedError(
+                    f"app-server process exited with status {returncode}"
+                )
             )
-            self._fail_pending(self._connection_error)
 
     async def _write(self, message: JsonObject) -> None:
         writer = cast(AsyncWriter, self._writer)
         payload = json.dumps(message, separators=(",", ":")).encode() + b"\n"
-        async with self._write_lock:
-            writer.write(payload)
-            await writer.drain()
+        try:
+            async with self._write_lock:
+                writer.write(payload)
+                await writer.drain()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            error = CodexConnectionClosedError(f"app-server write failed: {exc}")
+            self._record_connection_error(error)
+            raise error from exc
 
     async def _read_stdout(self) -> None:
         reader = cast(AsyncLineReader, self._reader)
@@ -281,38 +351,99 @@ class CodexAppServerClient:
                     continue
                 if not isinstance(message, dict):
                     continue
-                method = message.get("method")
-                params = message.get("params", {})
-                if method is not None:
+
+                request_id = message.get("id")
+                if "method" in message:
+                    method = message.get("method")
+                    params = message.get("params", {})
                     if not isinstance(method, str) or not isinstance(params, dict):
+                        self._fail_malformed_response(request_id, "invalid method or params")
                         continue
-                    request_id = message.get("id")
                     if request_id is None:
                         await self._notifications.put(CodexNotification(method, params))
                     elif self._is_rpc_id(request_id):
-                        await self._server_requests.put(
-                            CodexServerRequest(request_id, method, params)
-                        )
-                        await self._write(self._default_server_response(request_id, method))
+                        request = CodexServerRequest(request_id, method, params)
+                        await self._server_requests.put(request)
+                        task = asyncio.create_task(self._dispatch_server_request(request))
+                        self._server_request_tasks.add(task)
+                        task.add_done_callback(self._server_request_tasks.discard)
                     continue
-                request_id = message.get("id")
+
                 if not isinstance(request_id, int) or isinstance(request_id, bool):
                     continue
                 future = self._pending.get(request_id)
                 if future is None or future.done():
                     continue
-                if "result" in message and "error" not in message:
+                has_result = "result" in message
+                has_error = "error" in message
+                if has_result == has_error:
+                    future.set_exception(
+                        CodexProtocolError("response must contain exactly one of result or error")
+                    )
+                elif has_result:
                     future.set_result(cast(JsonValue, message["result"]))
-                elif "error" in message and "result" not in message:
+                else:
                     future.set_exception(RuntimeError(str(message["error"])))
-            self._connection_error = CodexConnectionClosedError("app-server stdout reached EOF")
-            self._fail_pending(self._connection_error)
+
+            if not self._closed:
+                self._record_connection_error(
+                    CodexConnectionClosedError("app-server stdout reached EOF")
+                )
         except asyncio.CancelledError:
             raise
+        except Exception as exc:
+            if not self._closed:
+                self._record_connection_error(
+                    CodexConnectionClosedError(f"app-server reader failed: {exc}")
+                )
+
+    async def _dispatch_server_request(self, request: CodexServerRequest) -> None:
+        response = self._default_server_response_payload(request.method)
+        if self._server_request_handler is not None:
+            try:
+                candidate = await asyncio.wait_for(
+                    self._server_request_handler(request),
+                    timeout=self._server_request_timeout,
+                )
+                response = self._validate_server_response_payload(candidate)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                response = self._default_server_response_payload(request.method)
+
+        message: JsonObject = {"id": request.id}
+        message.update(response)
+        try:
+            await self._write(message)
+        except CodexConnectionClosedError:
+            return
+
+    def _fail_malformed_response(self, request_id: object, reason: str) -> None:
+        if not isinstance(request_id, int) or isinstance(request_id, bool):
+            return
+        future = self._pending.get(request_id)
+        if future is not None and not future.done():
+            future.set_exception(CodexProtocolError(reason))
+
+    @staticmethod
+    def _validate_server_response_payload(
+        response: Mapping[str, JsonValue],
+    ) -> JsonObject:
+        payload = dict(response)
+        if set(payload) not in ({"result"}, {"error"}):
+            raise CodexProtocolError(
+                "server request handler must return exactly one of result or error"
+            )
+        return payload
 
     @staticmethod
     def _is_rpc_id(value: object) -> bool:
         return isinstance(value, (int, str)) and not isinstance(value, bool)
+
+    def _record_connection_error(self, error: CodexConnectionClosedError) -> None:
+        if self._connection_error is None:
+            self._connection_error = error
+        self._fail_pending(self._connection_error)
 
     def _fail_pending(self, error: BaseException) -> None:
         for future in tuple(self._pending.values()):
@@ -320,21 +451,19 @@ class CodexAppServerClient:
                 future.set_exception(error)
 
     @staticmethod
-    def _default_server_response(request_id: JsonRpcId, method: str) -> JsonObject:
+    def _default_server_response_payload(method: str) -> JsonObject:
         if method in {
             "item/commandExecution/requestApproval",
             "item/fileChange/requestApproval",
         }:
-            return {"id": request_id, "result": {"decision": "decline"}}
+            return {"result": {"decision": "decline"}}
         if method == "item/permissions/requestApproval":
-            return {"id": request_id, "result": {"permissions": {}}}
+            return {"result": {"permissions": {}, "scope": "turn"}}
         if method == "mcpServer/elicitation/request":
             return {
-                "id": request_id,
-                "result": {"action": "decline", "content": None},
+                "result": {"action": "decline", "content": None, "_meta": None},
             }
         return {
-            "id": request_id,
             "error": {
                 "code": -32601,
                 "message": "Client does not support server request",
