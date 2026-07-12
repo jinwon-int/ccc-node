@@ -179,6 +179,7 @@ class ProjectChatHandler(
         self._agent_active_sessions: Dict[Tuple[int, int], Any] = {}
         self._agent_started_at: Dict[Tuple[int, int], float] = {}
         self._agent_runtime_closed = False
+        self._agent_interrupt_timeout_seconds = 10.0
         self._clock = clock or time
         self._process_timeout_seconds = PROCESS_TIMEOUT
         self._typing_interval_seconds = TYPING_INTERVAL

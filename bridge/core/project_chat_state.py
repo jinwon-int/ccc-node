@@ -22,8 +22,9 @@ class ProjectChatStateMixin:
         """
         if self._agent_runtime is not None:
             sessions = self._active_agent_sessions_for_user(user_id, chat_id)
-            for session in sessions:
-                await session.interrupt()
+            await asyncio.gather(
+                *(self._interrupt_agent_session(session) for session in sessions)
+            )
             for key in self._agent_keys_for_user(user_id, chat_id):
                 if self._agent_active_sessions.get(key) in sessions:
                     self._agent_active_sessions.pop(key, None)
@@ -106,16 +107,30 @@ class ProjectChatStateMixin:
         keys = self._agent_keys_for_user(user_id, chat_id)
         return [self._agent_active_sessions[key] for key in keys if key in self._agent_active_sessions]
 
+    async def _interrupt_agent_session(self, session) -> None:
+        try:
+            await asyncio.wait_for(
+                session.interrupt(), timeout=self._agent_interrupt_timeout_seconds
+            )
+        except TimeoutError:
+            logger.warning(
+                "Agent session interrupt timed out after %.1fs",
+                self._agent_interrupt_timeout_seconds,
+            )
+        except Exception:
+            logger.exception("Failed to interrupt agent session")
+
     async def close(self) -> None:
         """Interrupt active Codex turns and close its shared runtime once."""
         if self._agent_runtime is None or self._agent_runtime_closed:
             return
         self._agent_runtime_closed = True
-        for session in tuple(self._agent_active_sessions.values()):
-            try:
-                await session.interrupt()
-            except Exception:
-                logger.exception("Failed to interrupt agent session during shutdown")
+        await asyncio.gather(
+            *(
+                self._interrupt_agent_session(session)
+                for session in tuple(self._agent_active_sessions.values())
+            )
+        )
         close = getattr(self._agent_runtime, "close", None)
         if close is not None:
             try:

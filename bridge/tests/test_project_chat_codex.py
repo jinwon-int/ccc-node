@@ -114,6 +114,12 @@ def _handler(tmp_path: Path, runtime: FakeRuntime) -> ProjectChatHandler:
     return handler
 
 
+async def _wait_until(predicate, *, timeout: float = 1.0) -> None:
+    async with asyncio.timeout(timeout):
+        while not predicate():
+            await asyncio.sleep(0)
+
+
 def test_agent_provider_settings_default_and_reject_unknown(tmp_path: Path) -> None:
     settings_class = _real_settings_class()
     environ = {"HOME": str(tmp_path), "TELEGRAM_BOT_TOKEN": "123456:test"}
@@ -273,21 +279,18 @@ async def test_codex_serializes_same_conversation_but_isolates_other_chats(tmp_p
     handler = _handler(tmp_path, runtime)
 
     first_task = asyncio.create_task(handler.process_message("first", 7, 70))
-    while "first" not in first.started:
-        await asyncio.sleep(0)
+    await _wait_until(lambda: "first" in first.started)
     await first.started["first"].wait()
     queued_task = asyncio.create_task(handler.process_message("queued", 7, 70))
     other_task = asyncio.create_task(handler.process_message("other", 7, 71))
-    while "other" not in other.started:
-        await asyncio.sleep(0)
+    await _wait_until(lambda: "other" in other.started)
     await other.started["other"].wait()
     await asyncio.sleep(0)
 
     assert first.messages == ["first"]
     assert other.messages == ["other"]
     first.release["first"].set()
-    while "queued" not in first.started:
-        await asyncio.sleep(0)
+    await _wait_until(lambda: "queued" in first.started)
     first.release["queued"].set()
     other.release["other"].set()
     responses = await asyncio.gather(first_task, queued_task, other_task)
@@ -301,8 +304,7 @@ async def test_codex_stop_interrupts_only_exact_active_conversation(tmp_path: Pa
     handler = _handler(tmp_path, FakeRuntime([first, other]))
     first_task = asyncio.create_task(handler.process_message("first", 7, 70))
     other_task = asyncio.create_task(handler.process_message("other", 7, 71))
-    while "first" not in first.started or "other" not in other.started:
-        await asyncio.sleep(0)
+    await _wait_until(lambda: "first" in first.started and "other" in other.started)
 
     assert await handler.stop(7, chat_id=70) is True
     assert first.interrupt_calls == 1
@@ -335,12 +337,73 @@ async def test_codex_clear_and_close_are_bounded_and_idempotent(tmp_path: Path) 
     runtime = FakeRuntime([session])
     handler = _handler(tmp_path, runtime)
     task = asyncio.create_task(handler.process_message("first", 7, 70))
-    while "first" not in session.started:
-        await asyncio.sleep(0)
+    await _wait_until(lambda: "first" in session.started)
 
     await handler.clear_user_stream(7, chat_id=70)
     await handler.close()
     await handler.close()
+
+    assert session.interrupt_calls == 1
+    assert runtime.close_calls == 1
+    session.release["first"].set()
+    await task
+
+
+class HangingSession(FakeSession):
+    def __init__(self, session_id: str) -> None:
+        super().__init__(session_id)
+        self.release = asyncio.Event()
+
+    def send_turn(
+        self,
+        message: str,
+        *,
+        approval_handler: ApprovalHandler = deny_approval,
+    ) -> AsyncIterator[AgentEvent]:
+        del approval_handler
+
+        async def stream() -> AsyncIterator[AgentEvent]:
+            self.messages.append(message)
+            await self.release.wait()
+            yield TextDeltaEvent("late")
+
+        return stream()
+
+
+@pytest.mark.anyio
+async def test_codex_turn_timeout_interrupts_and_cleans_session(tmp_path: Path) -> None:
+    hung = HangingSession("hung")
+    recovered = FakeSession("recovered")
+    runtime = FakeRuntime([hung, recovered])
+    handler = _handler(tmp_path, runtime)
+    handler._process_timeout_seconds = 0.01
+
+    response = await asyncio.wait_for(handler.process_message("hang", 7, 70), timeout=1.0)
+    retry = await handler.process_message("retry", 7, 70)
+
+    assert response.success is False
+    assert response.error is not None and "Timed out" in response.error
+    assert hung.interrupt_calls == 1
+    assert retry.success is True
+    assert len(runtime.requests) == 2
+
+
+class HangingInterruptSession(BlockingSession):
+    async def interrupt(self) -> None:
+        self.interrupt_calls += 1
+        await asyncio.Event().wait()
+
+
+@pytest.mark.anyio
+async def test_codex_close_bounds_hung_interrupt_and_still_closes_runtime(tmp_path: Path) -> None:
+    session = HangingInterruptSession("thread-a")
+    runtime = FakeRuntime([session])
+    handler = _handler(tmp_path, runtime)
+    handler._agent_interrupt_timeout_seconds = 0.01
+    task = asyncio.create_task(handler.process_message("first", 7, 70))
+    await _wait_until(lambda: "first" in session.started)
+
+    await asyncio.wait_for(handler.close(), timeout=1.0)
 
     assert session.interrupt_calls == 1
     assert runtime.close_calls == 1

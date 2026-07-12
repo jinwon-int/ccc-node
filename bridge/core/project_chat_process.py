@@ -341,40 +341,47 @@ class ProjectChatProcessMixin:
                 self._agent_started_at[key] = asyncio.get_running_loop().time()
                 text_parts: list[str] = []
                 terminal_error: ErrorEvent | None = None
-                async for event in session.send_turn(
-                    user_message,
-                    approval_handler=deny_approval,
-                ):
-                    if typing_callback is not None:
-                        try:
-                            await typing_callback()
-                        except Exception:
-                            pass
-                    if isinstance(event, TextDeltaEvent):
-                        text_parts.append(event.text)
-                        if streaming_handler:
-                            await streaming_handler.update_if_needed(event.text)
-                    elif isinstance(event, ToolStartedEvent):
-                        if streaming_handler:
-                            await streaming_handler.add_tool_call(
-                                event.tool_name,
-                                dict(event.arguments),
-                            )
-                    elif isinstance(event, ErrorEvent):
-                        terminal_error = event
-                    elif isinstance(
-                        event,
-                        (
-                            ReasoningDeltaEvent,
-                            ToolCompletedEvent,
-                            ApprovalRequestEvent,
-                            ResultEvent,
-                            CompletionEvent,
-                        ),
+
+                async def consume_agent_events() -> None:
+                    nonlocal terminal_error
+                    async for event in session.send_turn(
+                        user_message,
+                        approval_handler=deny_approval,
                     ):
-                        # Reasoning remains private. Other normalized lifecycle
-                        # events are consumed so provider objects never escape.
-                        continue
+                        if typing_callback is not None:
+                            try:
+                                await typing_callback()
+                            except Exception:
+                                pass
+                        if isinstance(event, TextDeltaEvent):
+                            text_parts.append(event.text)
+                            if streaming_handler:
+                                await streaming_handler.update_if_needed(event.text)
+                        elif isinstance(event, ToolStartedEvent):
+                            if streaming_handler:
+                                await streaming_handler.add_tool_call(
+                                    event.tool_name,
+                                    dict(event.arguments),
+                                )
+                        elif isinstance(event, ErrorEvent):
+                            terminal_error = event
+                        elif isinstance(
+                            event,
+                            (
+                                ReasoningDeltaEvent,
+                                ToolCompletedEvent,
+                                ApprovalRequestEvent,
+                                ResultEvent,
+                                CompletionEvent,
+                            ),
+                        ):
+                            # Reasoning remains private. Other normalized lifecycle
+                            # events are consumed so provider objects never escape.
+                            continue
+
+                await asyncio.wait_for(
+                    consume_agent_events(), timeout=self._process_timeout_seconds
+                )
 
                 if streaming_handler:
                     await streaming_handler.finalize_all()
@@ -397,9 +404,27 @@ class ProjectChatProcessMixin:
                     session_id=session.session_id,
                     streamed=streamed,
                 )
+            except TimeoutError:
+                if session is not None and self._agent_sessions.get(key) is session:
+                    self._agent_sessions.pop(key, None)
+                    self._agent_session_models.pop(key, None)
+                if session is not None:
+                    await self._interrupt_agent_session(session)
+                if streaming_handler:
+                    try:
+                        await streaming_handler.cancel()
+                    except Exception:
+                        logger.exception("Failed to cancel timed-out agent stream")
+                message = f"Timed out after {self._process_timeout_seconds}s"
+                return ChatResponse(
+                    content=f"⏰ {message}. Please retry or simplify your request.",
+                    success=False,
+                    error=message,
+                    session_id=session.session_id if session is not None else session_id,
+                )
             except asyncio.CancelledError:
                 if session is not None:
-                    await session.interrupt()
+                    await self._interrupt_agent_session(session)
                 if streaming_handler:
                     await streaming_handler.cancel()
                 raise
