@@ -215,6 +215,14 @@ class CodexRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 {
                     "threadId": "thread-new",
                     "turnId": "turn-1",
+                    "item": {"id": "message-1", "type": "agentMessage", "text": "hello"},
+                },
+            ),
+            CodexNotification(
+                "item/started",
+                {
+                    "threadId": "thread-new",
+                    "turnId": "turn-1",
                     "item": {"id": "item-1", "type": "commandExecution", "command": "pwd"},
                 },
             ),

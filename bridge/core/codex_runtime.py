@@ -277,6 +277,15 @@ class CodexRuntime:
             return None
         if not isinstance(tool_name, str) or not tool_name:
             return None
+        if tool_name in {
+            "agentMessage",
+            "userMessage",
+            "reasoning",
+            "plan",
+            "enteredReviewMode",
+            "exitedReviewMode",
+        }:
+            return None
         snapshot = cast(Mapping[str, AgentJsonValue], item)
         if method == "item/started":
             return ToolStartedEvent(item_id, tool_name, snapshot)
