@@ -197,12 +197,15 @@ class SessionRequest:
     session_id: str | None = None
     model: str | None = None
     effort: str | None = None
+    approval_policy: str | None = None
 
     def __post_init__(self) -> None:
         if not self.working_directory:
             raise ValueError("working directory must not be empty")
         if self.effort is not None and not self.effort:
             raise ValueError("effort must not be empty")
+        if self.approval_policy is not None and not self.approval_policy:
+            raise ValueError("approval policy must not be empty")
         if self.session_id == "":
             raise ValueError("session id must not be empty")
         if self.model == "":

@@ -86,6 +86,11 @@ class BotAccessMixin:
             execution_profile,
         )
 
+    def _codex_approval_policy(self) -> str:
+        """Map bridge approval UX to Codex app-server's supported policy."""
+
+        return "never" if self._bash_policy() == "auto-approve" else "untrusted"
+
     def _is_within_project_root(self, path: FilePath) -> bool:
         return path_scope.is_within_project_root(path, self._project_root())
 

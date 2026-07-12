@@ -255,6 +255,7 @@ async def test_codex_start_resume_and_event_mapping_hides_reasoning(tmp_path: Pa
         session_id="resumed",
         model="codex-test",
         effort="high",
+        approval_policy="untrusted",
     )
 
     assert runtime.requests == [
@@ -263,6 +264,7 @@ async def test_codex_start_resume_and_event_mapping_hides_reasoning(tmp_path: Pa
             session_id="resumed",
             model="codex-test",
             effort="high",
+            approval_policy="untrusted",
         )
     ]
     assert session.messages == ["hello"]

@@ -348,6 +348,7 @@ class CodexAppServerClient:
         *,
         model: str | None = None,
         effort: str | None = None,
+        approval_policy: str | None = None,
     ) -> JsonValue:
         """Start a turn with protocol input items."""
 
@@ -359,6 +360,8 @@ class CodexAppServerClient:
             params["model"] = model
         if effort is not None:
             params["effort"] = effort
+        if approval_policy is not None:
+            params["approvalPolicy"] = approval_policy
         return await self.request("turn/start", params)
 
     async def turn_interrupt(self, thread_id: str, turn_id: str) -> JsonValue:

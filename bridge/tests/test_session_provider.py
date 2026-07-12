@@ -79,6 +79,26 @@ def bare_bot(manager: SessionManager, *, provider: str, project_chat=None) -> An
     return bot
 
 
+@pytest.mark.parametrize(
+    ("bash_policy", "expected"),
+    [
+        ("approve-each", "untrusted"),
+        ("auto-approve", "never"),
+        ("disabled", "untrusted"),
+    ],
+)
+def test_codex_approval_policy_follows_bridge_bash_policy(
+    tmp_path: Path, bash_policy: str, expected: str
+) -> None:
+    bot = bare_bot(make_manager(tmp_path, "codex"), provider="codex")
+    bot._config.bash_policy = bash_policy
+    bot._config.execution_profile = "owner-operator"
+    bot._config.allowed_user_ids = [7]
+    bot._config.require_allowlist = True
+
+    assert bot._codex_approval_policy() == expected
+
+
 @pytest.mark.anyio
 async def test_legacy_provider_defaults_to_claude_without_bulk_migration(tmp_path: Path) -> None:
     manager = make_manager(tmp_path, "codex")

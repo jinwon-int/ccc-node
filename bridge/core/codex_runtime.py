@@ -58,6 +58,7 @@ class AppServerClient(Protocol):
         *,
         model: str | None = None,
         effort: str | None = None,
+        approval_policy: str | None = None,
     ) -> JsonValue: ...
 
     async def turn_interrupt(self, thread_id: str, turn_id: str) -> JsonValue: ...
@@ -98,12 +99,14 @@ class CodexSession:
         thread_id: str,
         model: str | None,
         effort: str | None,
+        approval_policy: str | None,
         turn_lock: asyncio.Lock,
     ) -> None:
         self._runtime = runtime
         self._thread_id = thread_id
         self._model = model
         self._effort = effort
+        self._approval_policy = approval_policy
         self._turn_lock = turn_lock
 
     @property
@@ -126,8 +129,12 @@ class CodexSession:
                         [{"type": "text", "text": message}],
                         model=self._model,
                         effort=self._effort,
+                        approval_policy=self._approval_policy,
                     )
-                    active.turn_id = self._runtime._turn_id(result)
+                    returned_turn_id = self._runtime._turn_id(result)
+                    if active.turn_id is not None and active.turn_id != returned_turn_id:
+                        raise RuntimeError("Codex approval turn does not match turn/start response")
+                    active.turn_id = returned_turn_id
                     self._runtime._flush_pending_notifications(active)
                     while True:
                         event = await active.queue.get()
@@ -205,7 +212,14 @@ class CodexRuntime:
             )
         thread_id = self._thread_id(result)
         turn_lock = self._thread_locks.setdefault(thread_id, asyncio.Lock())
-        return CodexSession(self, thread_id, request.model, request.effort, turn_lock)
+        return CodexSession(
+            self,
+            thread_id,
+            request.model,
+            request.effort,
+            request.approval_policy,
+            turn_lock,
+        )
 
     async def list_models(self) -> Sequence[ModelInfo]:
         await self._ensure_started()
@@ -491,12 +505,14 @@ class CodexRuntime:
         active: _ActiveTurn | None = None
         if isinstance(thread_id, str):
             active = self._active_turns.get(thread_id)
-        if (
-            active is None
-            or active.finished
-            or not isinstance(turn_id, str)
-            or active.turn_id != turn_id
-        ):
+        if active is None or active.finished or not isinstance(turn_id, str):
+            return self._approval_response(request.method, ApprovalDecision.DENY, request.params)
+        if active.turn_id is None:
+            # The app-server may emit a server request before the turn/start
+            # response is observed. Bind the local active turn provisionally;
+            # send_turn verifies the returned ID before accepting more events.
+            active.turn_id = turn_id
+        elif active.turn_id != turn_id:
             return self._approval_response(request.method, ApprovalDecision.DENY, request.params)
 
         approval = ApprovalRequestEvent(

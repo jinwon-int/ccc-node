@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
+from contextlib import suppress
 from typing import TYPE_CHECKING, Any, cast
 import unittest
 
@@ -68,6 +69,8 @@ class FakeClient:
         self.turn_start_calls: list[dict[str, Any]] = []
         self.interrupt_calls: list[tuple[str, str]] = []
         self.before_turn_response: list[CodexNotification] = []
+        self.before_turn_server_requests: list[CodexServerRequest] = []
+        self.server_request_tasks: list[asyncio.Task[Mapping[str, Any]]] = []
         self.turn_started = asyncio.Event()
         self.release_turn_start = asyncio.Event()
         self.release_turn_start.set()
@@ -106,6 +109,7 @@ class FakeClient:
         *,
         model: str | None = None,
         effort: str | None = None,
+        approval_policy: str | None = None,
     ) -> Any:
         turn_id = f"turn-{len(self.turn_start_calls) + 1}"
         self.turn_start_calls.append(
@@ -114,10 +118,19 @@ class FakeClient:
                 "input": list(input_items),
                 "model": model,
                 "effort": effort,
+                "approval_policy": approval_policy,
                 "turn_id": turn_id,
             }
         )
         self.turn_started.set()
+
+        async def handle(request: CodexServerRequest) -> Mapping[str, Any]:
+            return await self.server_request_handler(request)
+
+        for request in self.before_turn_server_requests:
+            self.server_request_tasks.append(asyncio.create_task(handle(request)))
+            await asyncio.sleep(0)
+        self.before_turn_server_requests.clear()
         for notification in self.before_turn_response:
             await self.notifications.put(notification)
             await asyncio.sleep(0)
@@ -276,7 +289,11 @@ class CodexRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_turn_maps_streamed_events_including_notifications_before_response(self) -> None:
         session = await self.runtime.start_or_resume(
-            SessionRequest(working_directory="/workspace", effort="high")
+            SessionRequest(
+                working_directory="/workspace",
+                effort="high",
+                approval_policy="untrusted",
+            )
         )
         client = self.clients[0]
         client.before_turn_response = [
@@ -363,6 +380,48 @@ class CodexRuntimeTests(unittest.IsolatedAsyncioTestCase):
             [{"type": "text", "text": "hello"}],
         )
         self.assertEqual(client.turn_start_calls[0]["effort"], "high")
+        self.assertEqual(client.turn_start_calls[0]["approval_policy"], "untrusted")
+
+    async def test_approval_before_turn_start_response_routes_to_handler(self) -> None:
+        session = await self.runtime.start_or_resume(
+            SessionRequest(
+                working_directory="/workspace",
+                approval_policy="untrusted",
+            )
+        )
+        client = self.clients[0]
+        client.before_turn_server_requests = [
+            CodexServerRequest(
+                "approval-early",
+                "item/commandExecution/requestApproval",
+                {
+                    "threadId": "thread-new",
+                    "turnId": "turn-1",
+                    "itemId": "item-1",
+                },
+            )
+        ]
+        seen: list[str] = []
+
+        async def allow(request: ApprovalRequestEvent) -> ApprovalDecision:
+            seen.append(request.request_id)
+            return ApprovalDecision.ALLOW
+
+        stream = session.send_turn("edit", approval_handler=allow)
+        consumer = asyncio.create_task(next_event(stream))
+        try:
+            while not client.server_request_tasks:
+                await asyncio.sleep(0)
+            response = await asyncio.wait_for(client.server_request_tasks[0], timeout=0.2)
+            self.assertEqual(response, {"result": {"decision": "accept"}})
+            self.assertEqual(seen, ["approval-early"])
+            event = await asyncio.wait_for(consumer, timeout=0.2)
+            self.assertIsInstance(event, ApprovalRequestEvent)
+            self.assertEqual(cast(ApprovalRequestEvent, event).request_id, "approval-early")
+        finally:
+            consumer.cancel()
+            with suppress(asyncio.CancelledError):
+                await consumer
 
     async def test_approval_routes_exact_turn_and_fails_closed(self) -> None:
         session = await self.runtime.start_or_resume(SessionRequest(working_directory="/workspace"))

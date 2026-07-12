@@ -72,6 +72,12 @@ class BotApprovalMixin:
         event: ApprovalRequestEvent,
         generation: int,
     ) -> ApprovalDecision:
+        bash_policy = self._bash_policy()
+        if bash_policy == "auto-approve":
+            return ApprovalDecision.ALLOW
+        if bash_policy != "approve-each":
+            return ApprovalDecision.DENY
+
         label = _ACTION_LABELS.get(event.action)
         if (
             label is None
