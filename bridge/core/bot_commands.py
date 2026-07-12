@@ -349,6 +349,15 @@ class BotCommandMixin:
             log_debug(user_id, "bot", reply)
             return
 
+        if session["provider"] == "codex":
+            reply = (
+                "📜 Recent History\nProvider: codex\n\n"
+                "Codex history browsing is not available in this version."
+            )
+            await message.reply_text(reply)
+            log_debug(user_id, "bot", reply)
+            return
+
         messages = self._project_chat.get_recent_messages(session_id, limit=5)
 
         if not messages:

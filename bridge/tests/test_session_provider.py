@@ -166,6 +166,26 @@ async def test_history_uses_conversation_scope_and_labels_legacy_claude(tmp_path
 
 
 @pytest.mark.anyio
+async def test_codex_history_never_reads_claude_transcript_store(tmp_path: Path) -> None:
+    manager = make_manager(tmp_path, "codex")
+    await manager.store.set(
+        "7:9", {"provider": "codex", "session_id": "codex-thread"}
+    )
+    project_chat = SimpleNamespace(
+        get_recent_messages=Mock(side_effect=AssertionError("must not read Claude history"))
+    )
+    bot = bare_bot(manager, provider="codex", project_chat=project_chat)
+    update = make_update(chat_id=9)
+
+    await bot._cmd_history(update, SimpleNamespace(args=[]))
+
+    project_chat.get_recent_messages.assert_not_called()
+    reply = update.message.replies[0][0]
+    assert "Provider: codex" in reply
+    assert "not available" in reply
+
+
+@pytest.mark.anyio
 async def test_claude_model_command_keeps_alias_keyboard_and_settings_default(tmp_path: Path) -> None:
     settings_path = tmp_path / "settings.json"
     settings_path.write_text(json.dumps({"model": "opus"}), encoding="utf-8")

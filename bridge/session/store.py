@@ -107,7 +107,9 @@ def _validate_session_data(data: Any) -> Dict[str, Any]:
                 f"session entry {key!r} must be an object, got {type(value).__name__}"
             )
         provider = value.get("provider")
-        if provider is not None and provider not in {"claude", "codex"}:
+        if provider is not None and (
+            not isinstance(provider, str) or provider not in {"claude", "codex"}
+        ):
             raise SessionStoreValidationError(
                 f"session entry {key!r} has invalid provider: {provider!r}"
             )
