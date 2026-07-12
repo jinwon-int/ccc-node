@@ -88,7 +88,9 @@ EXECUTION_PROFILE = resolve_execution_profile(
     allowed_user_ids=getattr(config, "allowed_user_ids", []),
     require_allowlist=getattr(config, "require_allowlist", True),
 )
-BASH_POLICY = effective_bash_policy(resolve_bash_policy(), EXECUTION_PROFILE)
+BASH_POLICY = effective_bash_policy(
+    resolve_bash_policy(getattr(config, "bash_policy", None)), EXECUTION_PROFILE
+)
 
 PROCESS_TIMEOUT = int(os.getenv("CLAUDE_PROCESS_TIMEOUT", "21600"))
 
