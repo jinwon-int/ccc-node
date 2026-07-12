@@ -12,6 +12,7 @@ import unittest
 
 if TYPE_CHECKING:
     from core.codex_app_server import (
+        STDOUT_BUFFER_LIMIT,
         CodexAppServerClient,
         CodexConnectionClosedError,
         CodexNotification,
@@ -20,6 +21,7 @@ if TYPE_CHECKING:
     )
 else:
     from telegram_bot.core.codex_app_server import (
+        STDOUT_BUFFER_LIMIT,
         CodexAppServerClient,
         CodexConnectionClosedError,
         CodexNotification,
@@ -378,8 +380,33 @@ class CodexAppServerTests(unittest.IsolatedAsyncioTestCase):
             assert spawn_kwargs == {
                 "stdin": asyncio.subprocess.PIPE,
                 "stdout": asyncio.subprocess.PIPE,
+                "limit": STDOUT_BUFFER_LIMIT,
             }
+            # Regression: the stdout buffer must exceed asyncio's 64 KiB default
+            # so oversized JSONL frames are read whole rather than crashing the
+            # reader loop.
+            assert spawn_kwargs["limit"] > 64 * 1024
             await client.close()
+
+    async def test_reader_accepts_lines_larger_than_default_stream_limit(self) -> None:
+        # A default StreamReader (64 KiB limit) raises ValueError on this line and
+        # tears the connection down; the raised STDOUT_BUFFER_LIMIT reads it whole.
+        reader = asyncio.StreamReader(limit=STDOUT_BUFFER_LIMIT)
+        writer = FakeWriter(reader)
+        client = CodexAppServerClient(reader=reader, writer=writer)
+        await client.start()
+
+        request_task = asyncio.create_task(client.request("model/list", {}))
+        while writer.messages[-1].get("method") != "model/list":
+            await asyncio.sleep(0)
+        request = writer.messages[-1]
+
+        big_value = "x" * (200 * 1024)  # 200 KiB — well past the 64 KiB default
+        writer.feed({"id": request["id"], "result": {"blob": big_value}})
+
+        result = await asyncio.wait_for(request_task, timeout=1)
+        assert result == {"blob": big_value}
+        await client.close()
 
 
     async def test_protocol_helpers_use_known_method_names_and_parameters(self) -> None:

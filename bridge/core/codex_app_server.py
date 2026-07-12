@@ -12,6 +12,14 @@ JsonValue: TypeAlias = None | bool | int | float | str | list["JsonValue"] | dic
 JsonObject: TypeAlias = dict[str, JsonValue]
 JsonRpcId: TypeAlias = int | str
 
+# asyncio's StreamReader defaults to a 64 KiB line buffer. ``codex app-server``
+# routinely emits single JSONL frames larger than that (e.g. big tool outputs or
+# thread listings), and ``StreamReader.readline`` raises ``ValueError`` once a
+# line exceeds the limit — which the reader loop turns into a fatal
+# ``CodexConnectionClosedError``. Raise the stdout buffer so oversized frames are
+# read whole instead of tearing down the connection.
+STDOUT_BUFFER_LIMIT = 16 * 1024 * 1024  # 16 MiB
+
 
 @dataclass(frozen=True, slots=True)
 class CodexNotification:
@@ -431,6 +439,7 @@ class CodexAppServerClient:
             "--stdio",
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
+            limit=STDOUT_BUFFER_LIMIT,
         )
         return cast(AppServerProcess, process)
 
