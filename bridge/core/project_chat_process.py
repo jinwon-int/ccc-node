@@ -6,6 +6,18 @@ import asyncio
 import logging
 from typing import Any, Optional
 
+from telegram_bot.core.agent_runtime import (
+    ApprovalRequestEvent,
+    CompletionEvent,
+    ErrorEvent,
+    ReasoningDeltaEvent,
+    ResultEvent,
+    SessionRequest,
+    TextDeltaEvent,
+    ToolCompletedEvent,
+    ToolStartedEvent,
+    deny_approval,
+)
 from telegram_bot.core.project_chat_types import (
     ChatResponse,
     PermissionCallback,
@@ -56,6 +68,17 @@ class ProjectChatProcessMixin:
         notification_bot: Optional[Any] = None,
     ) -> ChatResponse:
         del message_id
+        if self._agent_runtime is not None:
+            return await self._process_agent_message(
+                user_message=user_message,
+                user_id=user_id,
+                chat_id=chat_id,
+                session_id=session_id,
+                model=model,
+                new_session=new_session,
+                typing_callback=typing_callback,
+                bot=bot,
+            )
         logger.info(f"Processing message from user {user_id}: {user_message[:80]}...")
         log_chat(user_id, session_id, "user", user_message, model=model)
 
@@ -269,3 +292,131 @@ class ProjectChatProcessMixin:
                     success=False,
                     error=err,
                 )
+
+    async def _process_agent_message(
+        self,
+        *,
+        user_message: str,
+        user_id: int,
+        chat_id: int,
+        session_id: Optional[str],
+        model: Optional[str],
+        new_session: bool,
+        typing_callback: Optional[TypingCallback],
+        bot: Optional[Any],
+    ) -> ChatResponse:
+        """Run one provider-neutral turn without changing the Claude SDK path."""
+        key = self._stream_key(user_id, chat_id)
+        streaming_handler = None
+        if bot and getattr(self._config, "enable_streaming", False):
+            from telegram_bot.core.streaming import StreamingMessageHandler
+
+            streaming_handler = StreamingMessageHandler(bot, chat_id, user_id, settings=self._config)
+
+        async with self._get_conversation_lock(user_id, chat_id):
+            session = self._agent_sessions.get(key)
+            if new_session or (
+                session is not None
+                and (
+                    (session_id is not None and session.session_id != session_id)
+                    or self._agent_session_models.get(key) != model
+                )
+            ):
+                self._agent_sessions.pop(key, None)
+                self._agent_session_models.pop(key, None)
+                session = None
+            try:
+                if session is None:
+                    session = await self._agent_runtime.start_or_resume(
+                        SessionRequest(
+                            working_directory=str(self.project_root),
+                            session_id=None if new_session else session_id,
+                            model=model,
+                        )
+                    )
+                    self._agent_sessions[key] = session
+                    self._agent_session_models[key] = model
+
+                self._agent_active_sessions[key] = session
+                self._agent_started_at[key] = asyncio.get_running_loop().time()
+                text_parts: list[str] = []
+                terminal_error: ErrorEvent | None = None
+                async for event in session.send_turn(
+                    user_message,
+                    approval_handler=deny_approval,
+                ):
+                    if typing_callback is not None:
+                        try:
+                            await typing_callback()
+                        except Exception:
+                            pass
+                    if isinstance(event, TextDeltaEvent):
+                        text_parts.append(event.text)
+                        if streaming_handler:
+                            await streaming_handler.update_if_needed(event.text)
+                    elif isinstance(event, ToolStartedEvent):
+                        if streaming_handler:
+                            await streaming_handler.add_tool_call(
+                                event.tool_name,
+                                dict(event.arguments),
+                            )
+                    elif isinstance(event, ErrorEvent):
+                        terminal_error = event
+                    elif isinstance(
+                        event,
+                        (
+                            ReasoningDeltaEvent,
+                            ToolCompletedEvent,
+                            ApprovalRequestEvent,
+                            ResultEvent,
+                            CompletionEvent,
+                        ),
+                    ):
+                        # Reasoning remains private. Other normalized lifecycle
+                        # events are consumed so provider objects never escape.
+                        continue
+
+                if streaming_handler:
+                    await streaming_handler.finalize_all()
+                content = self._clean_response("".join(text_parts)) or "(No response)"
+                streamed = bool(streaming_handler and streaming_handler.drafts)
+                if terminal_error is not None:
+                    if self._agent_sessions.get(key) is session:
+                        self._agent_sessions.pop(key, None)
+                        self._agent_session_models.pop(key, None)
+                    return ChatResponse(
+                        content=f"❌ Processing failed: {terminal_error.message}",
+                        success=False,
+                        error=terminal_error.message,
+                        session_id=session.session_id,
+                        streamed=streamed,
+                    )
+                return ChatResponse(
+                    content=content,
+                    success=True,
+                    session_id=session.session_id,
+                    streamed=streamed,
+                )
+            except asyncio.CancelledError:
+                if session is not None:
+                    await session.interrupt()
+                if streaming_handler:
+                    await streaming_handler.cancel()
+                raise
+            except Exception as exc:
+                if session is not None and self._agent_sessions.get(key) is session:
+                    self._agent_sessions.pop(key, None)
+                    self._agent_session_models.pop(key, None)
+                if streaming_handler:
+                    await streaming_handler.cancel()
+                message = str(exc) or "Agent runtime failed"
+                return ChatResponse(
+                    content=f"❌ Error: {message}",
+                    success=False,
+                    error=message,
+                    session_id=session.session_id if session is not None else session_id,
+                )
+            finally:
+                if self._agent_active_sessions.get(key) is session:
+                    self._agent_active_sessions.pop(key, None)
+                    self._agent_started_at.pop(key, None)
