@@ -55,7 +55,8 @@ This bot takes a different approach — **lightweight, zero-infrastructure, secu
 ## Prerequisites
 
 - **Python 3.11+**
-- **Claude CLI** — installed and in `$PATH`, or specify via `CLAUDE_CLI_PATH`
+- **Provider CLI** — Claude CLI (default), or Codex CLI when `CCC_AGENT_PROVIDER=codex`
+- **Codex authentication** — for Codex, complete the CLI login flow and pass `../scripts/ccc-doctor.sh` before starting the bridge
 - **Telegram Bot Token** — from [@BotFather](https://t.me/BotFather)
 - **ffmpeg** — required for audio format conversion
 - **OpenAI API Key** — required for Whisper transcription (`OPENAI_API_KEY`)
@@ -246,6 +247,8 @@ Any unrecognized `/command` is also forwarded as a skill invocation.
 | `CCC_REQUIRE_ALLOWLIST` | No | `true` | Refuse startup when the allowlist is empty; must stay true for `owner-operator` |
 | `CCC_BRIDGE_EXECUTION_PROFILE` | No | `strict-project` | Execution boundary: `strict-project`, `owner-operator`, or `disabled` |
 | `CCC_BRIDGE_BASH_POLICY` | No | `auto-approve` | Bash approval UX: `auto-approve`, `approve-each`, or `disabled` |
+| `CCC_AGENT_PROVIDER` | No | `claude` | Agent provider: `claude` or `codex` |
+| `CCC_CODEX_CLI_PATH` | Codex only | `codex` | Codex CLI executable path or command name |
 | `CLAUDE_CLI_PATH` | No | *(auto-detect)* | Absolute path to Claude CLI binary |
 | `CLAUDE_SETTINGS_PATH` | No | `~/.claude/settings.json` | Path to Claude Code settings file |
 | `CLAUDE_PROCESS_TIMEOUT` | No | `600` | SDK timeout in seconds |
@@ -329,8 +332,20 @@ Current reference pricing is about **$0.006/minute** of audio. Check OpenAI pric
   - `owner-operator` deliberately runs without the OS sandbox and restores normal user/project/local settings plus host-capable Claude Code utility. It starts only with `CCC_REQUIRE_ALLOWLIST=true` and exactly one `ALLOWED_USER_IDS` owner. This profile trusts that owner boundary and is **not** a prompt-injection defense.
   - `disabled` hard-denies Bash and suppresses user/project/local filesystem settings so settings hooks cannot retain host execution. Unknown or unsafe profile values also resolve to disabled.
 - `CCC_BRIDGE_BASH_POLICY` controls approval UX inside the selected boundary: `auto-approve` (default), `approve-each` (one-time Telegram confirmation per command), or `disabled`. Approval never widens `strict-project`, and it is not a second sandbox in `owner-operator`.
+- Codex provider approvals are delivered only to the single allowlisted owner. They are turn-scoped and offer Allow or Deny only; Codex has no session-wide **Allow All** path.
 - Bot output referencing external files requires confirmation before sending.
 - All runtime data stays under `PROJECT_ROOT/.telegram_bot/`.
+
+### Codex readiness and rollout
+
+Codex rollout is source/config driven and must be serial:
+
+1. Install Codex CLI and authenticate it using the CLI's normal login flow.
+2. Set `CCC_AGENT_PROVIDER=codex` and, when needed, `CCC_CODEX_CLI_PATH`.
+3. Run `../scripts/ccc-doctor.sh` and require `readiness: ready`. The doctor performs only bounded, non-secret version, app-server help, and login-status probes; it never starts a model turn or polls Telegram.
+4. Stop the existing bridge owner, then start exactly one replacement and verify status. **Two services must never poll the same Telegram bot token concurrently.**
+
+Roll back by stopping the Codex bridge, restoring `CCC_AGENT_PROVIDER=claude`, and starting the prior Claude bridge as the sole poller. Do not overlap old and new services during rollout or rollback.
 
 ## Lifecycle Management
 

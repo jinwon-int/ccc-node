@@ -6,6 +6,7 @@ from __future__ import annotations
 import filecmp
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -27,6 +28,8 @@ HOOK_FILES = [
 ]
 OUTPUT_STYLE_FILES = ["output-styles/ccc-report.md"]
 VALID_SCOPES = {"settings", "files", "hooks", "output-styles", "all"}
+CODEX_PROBE_TIMEOUT_SECONDS = 5.0
+CODEX_PROBE_TIMEOUT_MAX_SECONDS = 10.0
 
 
 @dataclass
@@ -46,6 +49,8 @@ class Doctor:
         self.rows: list[Row] = []
         self.counts = {"정상": 0, "경고": 0, "교정가능": 0, "수동필요": 0}
         self.mode = "unknown"
+        self.provider = os.environ.get("CCC_AGENT_PROVIDER", "claude").strip().lower()
+        self.readiness = "not-applicable"
         self.settings_valid = False
         self.current_settings: dict[str, Any] | None = None
 
@@ -170,6 +175,148 @@ class Doctor:
         self.check_overlay_parity()
         self.check_bridge_status()
         self.check_memory_cache()
+        self.check_provider_readiness()
+
+    def codex_probe_timeout(self) -> float:
+        value = os.environ.get("CCC_CODEX_READINESS_TIMEOUT", "")
+        try:
+            timeout = float(value) if value else CODEX_PROBE_TIMEOUT_SECONDS
+        except ValueError:
+            return CODEX_PROBE_TIMEOUT_SECONDS
+        return min(max(timeout, 0.1), CODEX_PROBE_TIMEOUT_MAX_SECONDS)
+
+    def resolve_codex_executable(self) -> tuple[Path | None, str | None]:
+        configured = os.environ.get("CCC_CODEX_CLI_PATH", "codex").strip()
+        if not configured:
+            return None, "not found"
+        if os.sep in configured or (os.altsep is not None and os.altsep in configured):
+            candidate = Path(configured).expanduser()
+            if not candidate.is_file():
+                return None, "not found"
+            if not os.access(candidate, os.X_OK):
+                return None, "not executable"
+            return candidate.resolve(), None
+        resolved = shutil.which(configured)
+        if resolved is None:
+            return None, "not found"
+        candidate = Path(resolved)
+        if not candidate.is_file() or not os.access(candidate, os.X_OK):
+            return None, "not executable"
+        return candidate.resolve(), None
+
+    def run_codex_probe(
+        self, executable: Path, args: list[str]
+    ) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [str(executable), *args],
+            text=True,
+            capture_output=True,
+            timeout=self.codex_probe_timeout(),
+            check=False,
+        )
+
+    @staticmethod
+    def probe_output(result: subprocess.CompletedProcess[str]) -> str:
+        return (result.stdout + result.stderr)[:4096].strip()
+
+    def fail_codex_readiness(self, item: str, status: str, action: str) -> None:
+        self.readiness = "failed"
+        self.add("수동필요", item, status, action)
+
+    def check_provider_readiness(self) -> None:
+        if self.provider == "claude":
+            return
+        if self.provider != "codex":
+            self.readiness = "failed"
+            self.add(
+                "수동필요",
+                "agent provider",
+                "unsupported provider",
+                "set CCC_AGENT_PROVIDER to claude or codex",
+            )
+            return
+
+        executable, error = self.resolve_codex_executable()
+        if executable is None:
+            self.fail_codex_readiness(
+                "Codex executable",
+                error or "unavailable",
+                "install Codex CLI or configure an executable CCC_CODEX_CLI_PATH",
+            )
+            return
+        self.add("정상", "Codex executable", "executable", "none")
+
+        probes = (
+            (
+                "Codex version probe",
+                ["--version"],
+                lambda output: bool(
+                    re.search(r"\bcodex(?:-cli)?\b.*\d", output, re.IGNORECASE)
+                ),
+                "install a Codex CLI version with a working --version command",
+            ),
+            (
+                "Codex app-server probe",
+                ["app-server", "--help"],
+                lambda output: bool(re.search(r"app[- ]server", output, re.IGNORECASE)),
+                "install a Codex CLI version that exposes the app-server surface",
+            ),
+        )
+        for item, args, valid, action in probes:
+            try:
+                result = self.run_codex_probe(executable, args)
+            except subprocess.TimeoutExpired:
+                self.fail_codex_readiness(item, "timed out", action)
+                return
+            except Exception:
+                self.fail_codex_readiness(item, "probe failed", action)
+                return
+            output = self.probe_output(result)
+            if result.returncode != 0:
+                self.fail_codex_readiness(item, "probe failed", action)
+                return
+            if not output or not valid(output):
+                self.fail_codex_readiness(item, "malformed output", action)
+                return
+            self.add("정상", item, "available", "none")
+
+        try:
+            login = self.run_codex_probe(executable, ["login", "status"])
+        except subprocess.TimeoutExpired:
+            self.fail_codex_readiness(
+                "Codex login", "timed out", "authenticate Codex CLI, then rerun ccc-doctor"
+            )
+            return
+        except Exception:
+            self.fail_codex_readiness(
+                "Codex login", "probe failed", "authenticate Codex CLI, then rerun ccc-doctor"
+            )
+            return
+        login_output = self.probe_output(login)
+        negative = re.search(
+            r"\b(not logged in|not authenticated|unauthenticated|logged out)\b",
+            login_output,
+            re.IGNORECASE,
+        )
+        authenticated = re.search(
+            r"\b(logged in|authenticated)\b", login_output, re.IGNORECASE
+        )
+        if login.returncode != 0 or negative:
+            self.fail_codex_readiness(
+                "Codex login",
+                "not authenticated",
+                "authenticate Codex CLI, then rerun ccc-doctor",
+            )
+            return
+        if not login_output or not authenticated:
+            self.fail_codex_readiness(
+                "Codex login",
+                "malformed output",
+                "verify Codex CLI login status manually, then rerun ccc-doctor",
+            )
+            return
+        self.add("정상", "Codex login", "authenticated", "none")
+        self.readiness = "ready"
 
     def normalize_hook_manifest(self, path: Path) -> list[dict[str, Any]]:
         data = self.load_json(path)
@@ -245,7 +392,9 @@ class Doctor:
         print(f"- repo: `{self.repo}`")
         print(f"- harness version: `{self.harness_version()}`")
         print(f"- claude dir: `{self.claude_dir}`")
-        print(f"- mode: `{self.mode}`\n")
+        print(f"- mode: `{self.mode}`")
+        print(f"- provider: `{self.provider}`")
+        print(f"- readiness: `{self.readiness}`\n")
         print("## 진단 요약\n")
         print(f"- 정상: {self.counts['정상']}")
         print(f"- 경고: {self.counts['경고']}")
@@ -259,6 +408,27 @@ class Doctor:
         print("- Diagnostics are read-only unless `--fix --apply` or `--rollback --apply` is explicitly used.")
         print("- `--fix` and `--rollback` alone are dry-run only.")
         print("- No remote nodes, secrets, broker/Gateway restarts, bridge restarts, migrations, or provider sends are touched.")
+
+    def print_json_report(self) -> None:
+        report = {
+            "repo": str(self.repo),
+            "harnessVersion": self.harness_version(),
+            "claudeDir": str(self.claude_dir),
+            "mode": self.mode,
+            "provider": self.provider,
+            "readiness": self.readiness,
+            "counts": self.counts,
+            "rows": [
+                {
+                    "class": row.klass,
+                    "item": row.item,
+                    "status": row.status,
+                    "action": row.action,
+                }
+                for row in self.rows
+            ],
+        }
+        print(json.dumps(report, ensure_ascii=False, sort_keys=True))
 
     def desired_settings(self) -> dict[str, Any] | None:
         if not self.settings_valid or self.mode not in {"standalone", "plugin"} or self.current_settings is None:
@@ -421,8 +591,8 @@ class Doctor:
         return True
 
 
-def parse_args(argv: list[str]) -> tuple[int, bool, bool, bool, str]:
-    fix = rollback = apply = False
+def parse_args(argv: list[str]) -> tuple[int, bool, bool, bool, bool, str]:
+    fix = rollback = apply = json_output = False
     scope = "settings"
     i = 0
     while i < len(argv):
@@ -433,10 +603,12 @@ def parse_args(argv: list[str]) -> tuple[int, bool, bool, bool, str]:
             rollback = True
         elif arg in {"--apply", "--write"}:
             apply = True
+        elif arg == "--json":
+            json_output = True
         elif arg == "--scope":
             if i + 1 >= len(argv):
                 print("--scope requires a value", file=sys.stderr)
-                return 2, fix, rollback, apply, scope
+                return 2, fix, rollback, apply, json_output, scope
             i += 1
             scope = argv[i]
         elif arg.startswith("--scope="):
@@ -458,20 +630,21 @@ def parse_args(argv: list[str]) -> tuple[int, bool, bool, bool, str]:
             print("- `--rollback --apply` restores only settings.json from that backup, after backing up")
             print("  the current settings.json as `ccc-doctor-pre-rollback-*.tar.gz`.")
             print("- 수동필요/risky/system-level items fail closed and are never auto-repaired.")
-            return 0, fix, rollback, apply, scope
+            print("- `--json` emits the read-only diagnostic report as one JSON object.")
+            return 0, fix, rollback, apply, json_output, scope
         else:
             print(f"Unknown flag: {arg}", file=sys.stderr)
-            return 2, fix, rollback, apply, scope
+            return 2, fix, rollback, apply, json_output, scope
         i += 1
     parts = scope.split(",") if scope else [""]
     if any(part not in VALID_SCOPES for part in parts):
         print(f"unsupported --scope: {scope}", file=sys.stderr)
-        return 2, fix, rollback, apply, scope
-    return -1, fix, rollback, apply, scope
+        return 2, fix, rollback, apply, json_output, scope
+    return -1, fix, rollback, apply, json_output, scope
 
 
 def main(argv: list[str]) -> int:
-    parsed_rc, fix, rollback, apply, scope = parse_args(argv)
+    parsed_rc, fix, rollback, apply, json_output, scope = parse_args(argv)
     if parsed_rc >= 0:
         return parsed_rc
     repo = Path(os.environ.get("CCC_DOCTOR_REPO_DIR", Path(__file__).resolve().parents[1])).resolve()
@@ -521,7 +694,10 @@ def main(argv: list[str]) -> int:
             print("no repairs needed.")
         return 0
 
-    doctor.print_report()
+    if json_output:
+        doctor.print_json_report()
+    else:
+        doctor.print_report()
     return 1 if doctor.counts["수동필요"] > 0 or doctor.counts["교정가능"] > 0 else 0
 
 

@@ -10,6 +10,7 @@
 - Installed hook scripts and output-style files under the target Claude directory.
 - Telegram bridge status output when `bridge/start.sh` is present.
 - Harness version anchor via `scripts/ccc-version.sh`.
+- Selected agent provider. For `CCC_AGENT_PROVIDER=codex`, deterministic CLI, app-server surface, and login readiness without a model turn or Telegram access.
 
 The report is Markdown and classifies rows as:
 
@@ -24,6 +25,7 @@ The report is Markdown and classifies rows as:
 
 ```bash
 scripts/ccc-doctor.sh
+scripts/ccc-doctor.sh --json                 # one JSON object
 scripts/ccc-doctor.sh --fix                  # dry-run only
 scripts/ccc-doctor.sh --fix --apply          # settings-only repair after backup
 scripts/ccc-doctor.sh --fix --apply --scope=files
@@ -39,6 +41,34 @@ scripts/ccc-doctor.sh --rollback --apply
 - File repair refuses symlinks, path traversal, missing repo sources, plugin/standalone double-firing risk, and unsupported targets.
 - `--rollback --apply` restores only `settings.json` from the latest doctor backup after creating a pre-rollback backup.
 - It never touches remote nodes, secrets, broker/Gateway restarts, bridge restarts, migrations, provider sends, or DB/ACK/replay state.
+
+## Provider readiness
+
+`CCC_AGENT_PROVIDER` accepts `claude` (the unchanged default) or `codex`. Set
+`CCC_CODEX_CLI_PATH` to the Codex executable path or command name when the
+default `codex` lookup is not suitable.
+
+For Codex, doctor resolves an executable and runs bounded, non-mutating probes:
+
+- `--version` must return recognizable Codex version output.
+- `app-server --help` must expose the app-server surface used by the bridge.
+- `login status` must report an authenticated CLI session.
+
+The probes never invoke a model turn or Telegram. Their raw stdout/stderr,
+command payloads, executable/credential paths, auth JSON, tokens, and account
+identity are never included in diagnostics. Missing/non-executable binaries,
+timeouts, unauthenticated or malformed output, and probe exceptions produce
+stable redacted `수동필요` rows, `readiness: failed`, and a nonzero exit.
+Human output adds `provider` and `readiness` headers. `--json` carries the same
+diagnostic information with additive `provider`, `readiness`, `counts`, and
+`rows` fields.
+
+Before a Codex rollout, install/authenticate the CLI, set the provider variables,
+and require a ready doctor result. Codex approval requests are owner-only and
+turn-scoped: Allow or Deny each request; there is no **Allow All**. Stop the old
+bridge before starting the new one because two services must never poll the same
+Telegram bot token concurrently. Roll back by stopping Codex, restoring
+`CCC_AGENT_PROVIDER=claude`, and starting Claude as the sole poller.
 
 ## Fleet matrix
 
