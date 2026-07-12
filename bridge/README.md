@@ -204,6 +204,27 @@ You:   summarize the changes in src/api/ from the last 3 commits
 Claude: ...
 ```
 
+### Set Codex reasoning effort
+
+When `CCC_AGENT_PROVIDER=codex`, `/effort` shows only the effort values
+advertised for the selected model by Codex `model/list`. The override is stored
+per Telegram conversation and is sent on each `turn/start`.
+
+```
+You:   /effort
+Bot:   Select reasoning effort for GPT-5.3-Codex...
+
+You:   /effort high
+Bot:   Reasoning effort set to high
+
+You:   /effort default
+Bot:   Reasoning effort reset to model default
+```
+
+Changing `/model` preserves the current effort only when the new model advertises
+it as supported; otherwise the override is removed and the bot reports the reset.
+`/effort` is unavailable while the Claude provider is active.
+
 ### Let the bot run 24/7
 
 ```bash
@@ -227,7 +248,8 @@ Claude: ...
 |---|---|
 | `/start` | Start a conversation |
 | `/new` | Start a new session (clears current stream and cancels ongoing streaming) |
-| `/model` | Switch model (Sonnet / Opus / Haiku) |
+| `/model` | Switch model (provider-specific list or `/model <id>`) |
+| `/effort [value\|default]` | Select or reset per-conversation Codex reasoning effort |
 | `/resume` | Browse and resume a previous session (shows progress summary with last assistant message) |
 | `/stop` | Interrupt execution immediately (bypasses queue, cancels active task) |
 | `/history` | View recent conversation history |

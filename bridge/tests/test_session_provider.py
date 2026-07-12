@@ -109,6 +109,7 @@ async def test_provider_switch_reset_is_atomic_and_exactly_conversation_scoped(t
             "provider": "claude",
             "session_id": "claude-9",
             "model": "opus",
+            "effort": "high",
             "reply_mode": "voice",
             "metadata": {"keep": True},
         },
@@ -431,3 +432,221 @@ async def test_codex_resume_selection_never_reads_claude_progress_and_is_chat_sc
     project_chat.get_session_last_assistant_message.assert_not_called()
     assert (await manager.get_session("7:9"))["session_id"] == "codex-1"
     assert (await manager.get_session("7:10"))["session_id"] == "codex-other"
+
+
+def _effort_models():
+    return (
+        ModelInfo(
+            "o3",
+            "O3",
+            default_reasoning_effort="medium",
+            supported_reasoning_efforts=("low", "medium", "high"),
+            is_default=True,
+        ),
+    )
+
+
+def test_effort_command_handler_is_registered(tmp_path: Path) -> None:
+    bot = bare_bot(make_manager(tmp_path, "codex"), provider="codex")
+    bot.application = SimpleNamespace(add_handler=Mock())
+
+    bot._setup_handlers()
+
+    handlers = [call.args[0] for call in bot.application.add_handler.call_args_list]
+    commands = {
+        command
+        for handler in handlers
+        for command in getattr(handler, "commands", frozenset())
+    }
+    assert "effort" in commands
+
+
+@pytest.mark.anyio
+async def test_effort_command_is_published_in_bot_menu(tmp_path: Path) -> None:
+    bot = bare_bot(make_manager(tmp_path, "codex"), provider="codex")
+    set_my_commands = AsyncMock()
+    bot.application = SimpleNamespace(bot=SimpleNamespace(set_my_commands=set_my_commands))
+
+    await bot._set_bot_commands()
+
+    assert set_my_commands.await_count == 3
+    for call in set_my_commands.await_args_list:
+        assert "effort" in {command.command for command in call.args[0]}
+
+
+@pytest.mark.anyio
+async def test_codex_effort_picker_uses_catalog_order_and_metadata(tmp_path: Path) -> None:
+    manager = make_manager(tmp_path, "codex")
+    await manager.store.set(
+        "7:9",
+        {
+            "provider": "codex",
+            "session_id": "thread-9",
+            "model": "o3",
+            "effort": "high",
+        },
+    )
+    project_chat = SimpleNamespace(list_runtime_models=AsyncMock(return_value=_effort_models()))
+    bot = bare_bot(manager, provider="codex", project_chat=project_chat)
+    update = make_update()
+
+    await bot._cmd_effort(update, SimpleNamespace(args=[]))
+
+    text, kwargs = update.message.replies[0]
+    assert text == "🧠 Select reasoning effort for O3:\nCurrent: high · Model default: medium"
+    keyboard = kwargs["reply_markup"].inline_keyboard
+    assert [row[0].text for row in keyboard] == [
+        "low",
+        "medium (model default)",
+        "high (current)",
+        "Use model default",
+    ]
+    assert [row[0].callback_data for row in keyboard] == [
+        "effort:codex:low",
+        "effort:codex:medium",
+        "effort:codex:high",
+        "effort:codex:default",
+    ]
+
+
+@pytest.mark.anyio
+async def test_codex_effort_argument_and_default_are_conversation_scoped(tmp_path: Path) -> None:
+    manager = make_manager(tmp_path, "codex")
+    await manager.store.set(
+        "7:9", {"provider": "codex", "session_id": "thread-9", "model": "o3"}
+    )
+    await manager.store.set(
+        "7:10", {"provider": "codex", "session_id": "thread-10", "model": "o3"}
+    )
+    project_chat = SimpleNamespace(list_runtime_models=AsyncMock(return_value=_effort_models()))
+    bot = bare_bot(manager, provider="codex", project_chat=project_chat)
+
+    selected = make_update()
+    await bot._cmd_effort(selected, SimpleNamespace(args=["high"]))
+    assert (await manager.get_session("7:9"))["effort"] == "high"
+    assert "effort" not in await manager.get_session("7:10")
+
+    reset = make_update()
+    await bot._cmd_effort(reset, SimpleNamespace(args=["default"]))
+    session = await manager.get_session("7:9")
+    assert "effort" not in session
+    assert session["session_id"] == "thread-9"
+    assert reset.message.replies[0][0] == (
+        "✅ Reasoning effort reset to model default (medium) for O3"
+    )
+
+
+@pytest.mark.anyio
+async def test_codex_effort_rejects_unknown_selected_model(tmp_path: Path) -> None:
+    manager = make_manager(tmp_path, "codex")
+    await manager.store.set(
+        "7:9",
+        {"provider": "codex", "session_id": "thread-9", "model": "custom/raw"},
+    )
+    project_chat = SimpleNamespace(list_runtime_models=AsyncMock(return_value=_effort_models()))
+    bot = bare_bot(manager, provider="codex", project_chat=project_chat)
+    update = make_update()
+
+    await bot._cmd_effort(update, SimpleNamespace(args=["high"]))
+
+    assert "effort" not in await manager.get_session("7:9")
+    assert update.message.replies[0][0] == (
+        "📭 The selected Codex model does not advertise reasoning effort options."
+    )
+
+    await manager.patch_session("7:9", updates={"effort": "high"})
+    reset = make_update()
+    await bot._cmd_effort(reset, SimpleNamespace(args=["default"]))
+    assert "effort" not in await manager.get_session("7:9")
+    assert reset.message.replies[0][0] == "✅ Reasoning effort reset to provider default"
+
+
+@pytest.mark.anyio
+async def test_codex_model_change_resets_incompatible_effort(tmp_path: Path) -> None:
+    manager = make_manager(tmp_path, "codex")
+    await manager.store.set(
+        "7:9",
+        {
+            "provider": "codex",
+            "session_id": "thread-9",
+            "model": "o3",
+            "effort": "high",
+        },
+    )
+    models = (
+        ModelInfo(
+            "o3-mini",
+            "O3 Mini",
+            default_reasoning_effort="medium",
+            supported_reasoning_efforts=("low", "medium"),
+        ),
+    )
+    project_chat = SimpleNamespace(list_runtime_models=AsyncMock(return_value=models))
+    bot = bare_bot(manager, provider="codex", project_chat=project_chat)
+    update = make_update()
+
+    await bot._cmd_model(update, SimpleNamespace(args=["o3-mini"]))
+
+    session = await manager.get_session("7:9")
+    assert session["model"] == "o3-mini"
+    assert "effort" not in session
+    assert update.message.replies[0][0] == (
+        "✅ Switched to o3-mini\n"
+        "ℹ️ Reasoning effort high is unsupported; reset to model default (medium)."
+    )
+
+
+@pytest.mark.anyio
+async def test_codex_effort_callback_is_conversation_safe(tmp_path: Path) -> None:
+    manager = make_manager(tmp_path, "codex")
+    await manager.store.set(
+        "7:9", {"provider": "claude", "session_id": "claude-9", "model": "opus"}
+    )
+    await manager.store.set(
+        "7:10", {"provider": "codex", "session_id": "thread-10", "model": "o3"}
+    )
+    project_chat = SimpleNamespace(list_runtime_models=AsyncMock(return_value=_effort_models()))
+    bot = bare_bot(manager, provider="codex", project_chat=project_chat)
+    bot.application = SimpleNamespace(bot=object())
+    query = SimpleNamespace(
+        data="effort:codex:high",
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(),
+    )
+    update = SimpleNamespace(
+        effective_user=SimpleNamespace(id=7),
+        effective_chat=SimpleNamespace(id=9),
+        message=None,
+        callback_query=query,
+    )
+
+    await bot._handle_callback(update, SimpleNamespace())
+
+    session = await manager.get_session("7:9")
+    assert session["provider"] == "codex"
+    assert session["session_id"] is None
+    assert "model" not in session
+    assert session["effort"] == "high"
+    assert "effort" not in await manager.get_session("7:10")
+    query.edit_message_text.assert_awaited_once_with(
+        "✅ Reasoning effort set to high for O3"
+    )
+
+
+@pytest.mark.anyio
+async def test_codex_effort_aligns_stale_provider_before_selection(tmp_path: Path) -> None:
+    manager = make_manager(tmp_path, "codex")
+    await manager.store.set(
+        "7:9", {"provider": "claude", "session_id": "claude-9", "model": "opus"}
+    )
+    project_chat = SimpleNamespace(list_runtime_models=AsyncMock(return_value=_effort_models()))
+    bot = bare_bot(manager, provider="codex", project_chat=project_chat)
+    update = make_update()
+
+    await bot._cmd_effort(update, SimpleNamespace(args=["high"]))
+
+    session = await manager.get_session("7:9")
+    assert session["provider"] == "codex"
+    assert session["session_id"] is None
+    assert "model" not in session
+    assert session["effort"] == "high"
