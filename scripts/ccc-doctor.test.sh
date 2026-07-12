@@ -202,6 +202,7 @@ out="$(run_doctor "$missing_settings" --fix --apply 2>&1)"; rc=$?
 after="$(find "$missing_settings" -type f -printf '%P %s %T@\n' | sort)"
 ok "missing settings fails closed instead of claiming repairable" '[ "$rc" = 1 ] && grep -q "수동필요.*settings.json.*missing" <<<"$out" && grep -q "install mode cannot be inferred safely" <<<"$out" && [ "$before" = "$after" ]'
 
+# Keep every human-mode Codex failure probe paired with a JSON non-disclosure assertion.
 claude_default="$(make_fixture claude-default standalone)"
 out_default="$(run_doctor "$claude_default")"; rc_default=$?
 out_claude="$(CCC_AGENT_PROVIDER=claude run_doctor "$claude_default")"; rc_claude=$?
