@@ -357,7 +357,6 @@ class CodexAppServerClient:
                     method = message.get("method")
                     params = message.get("params", {})
                     if not isinstance(method, str) or not isinstance(params, dict):
-                        self._fail_malformed_response(request_id, "invalid method or params")
                         continue
                     if request_id is None:
                         await self._notifications.put(CodexNotification(method, params))

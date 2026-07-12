@@ -429,6 +429,7 @@ class CodexAppServerTests(unittest.IsolatedAsyncioTestCase):
         request_id = writer.messages[-1]["id"]
 
         writer.feed_raw(b"not-json")
+        writer.feed({"id": request_id, "method": 42, "params": {}})
         writer.feed({"id": request_id, "result": {"data": []}})
 
         assert await asyncio.wait_for(pending, timeout=0.2) == {"data": []}
