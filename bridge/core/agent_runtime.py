@@ -196,7 +196,8 @@ class AgentSession(Protocol):
         """Send one turn and return its normalized event stream.
 
         Omitting ``approval_handler`` is always fail-closed: every approval
-        request receives ``ApprovalDecision.DENY``.
+        request receives ``ApprovalDecision.DENY``. Provider adapters must
+        preserve this default instead of delegating omission to an SDK default.
         """
         ...
 
