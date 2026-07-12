@@ -34,6 +34,7 @@ class AppContext:
     session_store: Any
     session_manager: Any
     project_chat: Any
+    agent_runtime: Any
     sdk_factory: Any
     telegram_port: Any
     clock: Any
@@ -43,6 +44,7 @@ def build_context(
     settings: Settings,
     *,
     sdk_factory: Any = None,
+    agent_runtime: Any = None,
     telegram_port: Any = None,
     clock: Any = None,
 ) -> AppContext:
@@ -57,6 +59,10 @@ def build_context(
     from telegram_bot.utils.health import health_reporter
 
     sdk_factory = sdk_factory or ClaudeSDKClient
+    if settings.agent_provider == "codex" and agent_runtime is None:
+        from telegram_bot.core.codex_runtime import CodexRuntime
+
+        agent_runtime = CodexRuntime(cli_path=settings.codex_cli_path)
     telegram_port = telegram_port or Application.builder
     clock = clock or time
     bind_logs_dir(settings.logs_dir)
@@ -66,6 +72,7 @@ def build_context(
     project_chat = ProjectChatHandler(
         settings=settings,
         sdk_client_factory=sdk_factory,
+        agent_runtime=agent_runtime,
         clock=clock,
     )
     return AppContext(
@@ -73,6 +80,7 @@ def build_context(
         session_store=store,
         session_manager=session_manager,
         project_chat=project_chat,
+        agent_runtime=agent_runtime,
         sdk_factory=sdk_factory,
         telegram_port=telegram_port,
         clock=clock,

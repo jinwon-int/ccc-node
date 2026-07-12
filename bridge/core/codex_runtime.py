@@ -66,10 +66,6 @@ class AppServerClient(Protocol):
 ClientFactory = Callable[[ServerRequestHandler], AppServerClient]
 
 
-def _default_client_factory(handler: ServerRequestHandler) -> AppServerClient:
-    return CodexAppServerClient(server_request_handler=handler)
-
-
 @dataclass(slots=True)
 class _ActiveTurn:
     queue: asyncio.Queue[AgentEvent]
@@ -145,8 +141,21 @@ class CodexSession:
 class CodexRuntime:
     """Own a shared Codex app-server client and its notification dispatcher."""
 
-    def __init__(self, *, client_factory: ClientFactory = _default_client_factory) -> None:
-        self._client = client_factory(self._handle_server_request)
+    def __init__(
+        self,
+        *,
+        cli_path: str = "codex",
+        client_factory: ClientFactory | None = None,
+    ) -> None:
+        if not cli_path.strip():
+            raise ValueError("Codex CLI path must not be empty")
+        factory = client_factory or (
+            lambda handler: CodexAppServerClient(
+                executable=cli_path,
+                server_request_handler=handler,
+            )
+        )
+        self._client = factory(self._handle_server_request)
         self._start_lock = asyncio.Lock()
         self._started = False
         self._dispatcher_task: asyncio.Task[None] | None = None

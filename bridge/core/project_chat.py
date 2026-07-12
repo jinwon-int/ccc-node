@@ -132,6 +132,7 @@ class ProjectChatHandler(
         settings: Any = None,
         *,
         sdk_client_factory: Optional[Callable[..., Any]] = None,
+        agent_runtime: Any = None,
         clock: Any = None,
     ):
         # ``settings=None`` is retained only for legacy unit-test adapters. The
@@ -169,6 +170,16 @@ class ProjectChatHandler(
             self._execution_profile,
         )
         self._sdk_client_factory = sdk_client_factory or ClaudeSDKClient
+        provider = getattr(self._config, "agent_provider", "claude")
+        if provider == "codex" and agent_runtime is None:
+            raise ValueError("Codex ProjectChat requires an injected AgentRuntime")
+        self._agent_runtime = agent_runtime if provider == "codex" else None
+        self._agent_sessions: Dict[Tuple[int, int], Any] = {}
+        self._agent_session_models: Dict[Tuple[int, int], Optional[str]] = {}
+        self._agent_active_sessions: Dict[Tuple[int, int], Any] = {}
+        self._agent_started_at: Dict[Tuple[int, int], float] = {}
+        self._agent_runtime_closed = False
+        self._agent_interrupt_timeout_seconds = 10.0
         self._clock = clock or time
         self._process_timeout_seconds = PROCESS_TIMEOUT
         self._typing_interval_seconds = TYPING_INTERVAL
@@ -497,8 +508,11 @@ class ProjectChatHandler(
         the user's work. ``now`` must come from the event loop clock so it is
         comparable to ``_PendingRequest.started_at``.
         """
-        count = 0
+        count = len(self._agent_active_sessions)
         oldest_started: Optional[float] = None
+        for started_at in self._agent_started_at.values():
+            if oldest_started is None or started_at < oldest_started:
+                oldest_started = started_at
         for state in list(self._streams.values()):
             for req in list(state.pending):
                 if req.future.done():

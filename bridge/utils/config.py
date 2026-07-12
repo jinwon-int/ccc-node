@@ -5,7 +5,7 @@ import stat
 import logging
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Annotated, Any, Optional, List
+from typing import Annotated, Any, Literal, Optional, List
 from dotenv import dotenv_values
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
@@ -100,6 +100,16 @@ class Config(BaseSettings):
         )
         return cls.model_validate(values)
 
+    agent_provider: Literal["claude", "codex"] = Field(
+        default="claude",
+        alias="CCC_AGENT_PROVIDER",
+        description="Agent provider used by ProjectChat.",
+    )
+    codex_cli_path: str = Field(
+        default="codex",
+        alias="CCC_CODEX_CLI_PATH",
+        description="Codex CLI executable path or command name.",
+    )
     claude_cli_path: Optional[Path] = Field(
         default=None,
         description="Optional absolute path to Claude CLI binary (defaults to system PATH)",
@@ -127,6 +137,14 @@ class Config(BaseSettings):
                 "Set it in the project .env or bot source .env file."
             )
         return v.strip()
+
+    @field_validator("codex_cli_path", mode="before")
+    @classmethod
+    def validate_codex_cli_path(cls, v):
+        value = str(v).strip()
+        if not value:
+            raise ValueError("CCC_CODEX_CLI_PATH must be non-empty")
+        return value
 
     # Runtime data
     project_root: Path = Field(default=PROJECT_ROOT, description="Bound project root")

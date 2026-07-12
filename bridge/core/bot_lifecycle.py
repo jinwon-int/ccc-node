@@ -482,6 +482,10 @@ class BotLifecycleMixin:
                         except (asyncio.CancelledError, _PollingRestart):
                             pass
                 await self._graceful_shutdown()
+                if stop_event.is_set():
+                    close_project_chat = getattr(self._project_chat, "close", None)
+                    if close_project_chat is not None:
+                        await close_project_chat()
 
         logger.info("Bot stopped")
 

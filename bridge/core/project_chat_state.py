@@ -2,6 +2,7 @@
 
 # mypy: disable-error-code="attr-defined"
 
+import asyncio
 import logging
 from typing import List, Optional
 
@@ -19,6 +20,16 @@ class ProjectChatStateMixin:
         ``_disconnect_stream_state`` when a recent SDK/stream error (usage limit,
         auth, network) is what actually caused the stop.
         """
+        if self._agent_runtime is not None:
+            sessions = self._active_agent_sessions_for_user(user_id, chat_id)
+            await asyncio.gather(
+                *(self._interrupt_agent_session(session) for session in sessions)
+            )
+            for key in self._agent_keys_for_user(user_id, chat_id):
+                if self._agent_active_sessions.get(key) in sessions:
+                    self._agent_active_sessions.pop(key, None)
+                    self._agent_started_at.pop(key, None)
+            return bool(sessions)
         return await self._disconnect_user_stream(
             user_id, chat_id=chat_id, cancel_message=TASK_TERMINATED_NOTICE
         )
@@ -51,6 +62,8 @@ class ProjectChatStateMixin:
 
         return cancelled
     def inflight_count(self, user_id: int, chat_id: Optional[int] = None) -> int:
+        if self._agent_runtime is not None:
+            return len(self._active_agent_sessions_for_user(user_id, chat_id))
         return sum(len(state.pending) for state in self._states_for_user(user_id, chat_id))
     def is_user_busy(self, user_id: int, chat_id: Optional[int] = None) -> bool:
         return self.inflight_count(user_id, chat_id) > 0
@@ -65,6 +78,12 @@ class ProjectChatStateMixin:
         garbage-collected mid-flight, and ``close`` often did not exist on the
         client (the real method is ``disconnect``), leaking the SDK subprocess.
         """
+        if self._agent_runtime is not None:
+            await self.stop(user_id, chat_id)
+            for key in self._agent_keys_for_user(user_id, chat_id):
+                self._agent_sessions.pop(key, None)
+                self._agent_session_models.pop(key, None)
+            return
         for state in self._states_for_user(user_id, chat_id):
             for req in list(state.pending):
                 if req.future and not req.future.done():
@@ -78,3 +97,45 @@ class ProjectChatStateMixin:
                 if req.future and not req.future.done():
                     req.future.cancel()
             logger.info(f"Cleared pending permissions for user {user_id} chat {chat_id or '*'}")
+
+    def _agent_keys_for_user(self, user_id: int, chat_id: Optional[int] = None):
+        if chat_id is not None:
+            return [self._stream_key(user_id, chat_id)]
+        return [key for key in self._agent_sessions if key[0] == user_id]
+
+    def _active_agent_sessions_for_user(self, user_id: int, chat_id: Optional[int] = None):
+        keys = self._agent_keys_for_user(user_id, chat_id)
+        return [self._agent_active_sessions[key] for key in keys if key in self._agent_active_sessions]
+
+    async def _interrupt_agent_session(self, session) -> None:
+        try:
+            await asyncio.wait_for(
+                session.interrupt(), timeout=self._agent_interrupt_timeout_seconds
+            )
+        except TimeoutError:
+            logger.warning(
+                "Agent session interrupt timed out after %.1fs",
+                self._agent_interrupt_timeout_seconds,
+            )
+        except Exception:
+            logger.exception("Failed to interrupt agent session")
+
+    async def close(self) -> None:
+        """Interrupt active Codex turns and close its shared runtime once."""
+        if self._agent_runtime is None or self._agent_runtime_closed:
+            return
+        self._agent_runtime_closed = True
+        await asyncio.gather(
+            *(
+                self._interrupt_agent_session(session)
+                for session in tuple(self._agent_active_sessions.values())
+            )
+        )
+        close = getattr(self._agent_runtime, "close", None)
+        if close is not None:
+            try:
+                await asyncio.wait_for(close(), timeout=10.0)
+            except TimeoutError:
+                logger.warning("Agent runtime close timed out after 10s")
+            except Exception:
+                logger.exception("Agent runtime close failed")

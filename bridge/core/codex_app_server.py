@@ -86,6 +86,7 @@ class CodexAppServerClient:
         reader: AsyncLineReader | None = None,
         writer: AsyncWriter | None = None,
         process_factory: ProcessFactory | None = None,
+        executable: str = "codex",
         server_request_handler: ServerRequestHandler | None = None,
         server_request_timeout: float = 30.0,
         process_shutdown_timeout: float = 5.0,
@@ -96,8 +97,11 @@ class CodexAppServerClient:
             raise ValueError("server request timeout must be positive")
         if process_shutdown_timeout <= 0:
             raise ValueError("process shutdown timeout must be positive")
+        if not executable.strip():
+            raise ValueError("Codex executable must not be empty")
         self._reader = reader
         self._writer = writer
+        self._executable = executable
         self._process_factory = process_factory or self._spawn_default_process
         self._server_request_handler = server_request_handler
         self._server_request_timeout = server_request_timeout
@@ -297,10 +301,9 @@ class CodexAppServerClient:
                     self._process.kill()
                 await asyncio.gather(self._process_task, return_exceptions=True)
 
-    @staticmethod
-    async def _spawn_default_process() -> AppServerProcess:
+    async def _spawn_default_process(self) -> AppServerProcess:
         process = await asyncio.create_subprocess_exec(
-            "codex",
+            self._executable,
             "app-server",
             "--stdio",
             stdin=asyncio.subprocess.PIPE,
