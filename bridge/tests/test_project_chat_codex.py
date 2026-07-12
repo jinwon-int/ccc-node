@@ -20,9 +20,13 @@ from telegram_bot.core.agent_runtime import (
     ApprovalRequestEvent,
     CompletionEvent,
     ErrorEvent,
+    ModelInfo,
     ReasoningDeltaEvent,
     ResultEvent,
+    SessionHistory,
+    SessionHistoryMessage,
     SessionRequest,
+    SessionSummary,
     TextDeltaEvent,
     ToolCompletedEvent,
     ToolStartedEvent,
@@ -94,6 +98,11 @@ class FakeRuntime:
         self.sessions = sessions or []
         self.requests: list[SessionRequest] = []
         self.close_calls = 0
+        self.supports_session_browsing = True
+        self.session_summaries = (SessionSummary("thread-1", preview="hello"),)
+        self.session_history = SessionHistory(
+            "thread-1", (SessionHistoryMessage("assistant", "world"),)
+        )
 
     async def start_or_resume(self, request: SessionRequest) -> FakeSession:
         self.requests.append(request)
@@ -102,7 +111,14 @@ class FakeRuntime:
         return FakeSession(request.session_id or f"new-{len(self.requests)}")
 
     async def list_models(self):
-        return ()
+        return (ModelInfo("codex-test", "Codex Test"),)
+
+    async def list_sessions(self, *, limit: int = 10):
+        return self.session_summaries[:limit]
+
+    async def read_session(self, session_id: str, *, limit: int = 5):
+        assert session_id == self.session_history.session_id
+        return SessionHistory(session_id, self.session_history.messages[-limit:])
 
     async def close(self) -> None:
         self.close_calls += 1
@@ -245,6 +261,38 @@ async def test_codex_start_resume_and_event_mapping_hides_reasoning(tmp_path: Pa
     assert "private chain" not in response.content
     assert response.success is True
     assert response.session_id == "resumed"
+
+
+@pytest.mark.anyio
+async def test_codex_browsing_methods_delegate_without_claude_transcript_access(
+    tmp_path: Path,
+) -> None:
+    runtime = FakeRuntime()
+    handler = _handler(tmp_path, runtime)
+
+    sessions = await handler.list_runtime_sessions(limit=1)
+    history = await handler.read_runtime_session("thread-1", limit=1)
+    models = await handler.list_runtime_models()
+
+    assert sessions == runtime.session_summaries
+    assert history == runtime.session_history
+    assert [(model.id, model.display_name) for model in models] == [
+        ("codex-test", "Codex Test")
+    ]
+
+
+@pytest.mark.anyio
+async def test_runtime_browsing_fails_safely_when_capability_is_unavailable(
+    tmp_path: Path,
+) -> None:
+    runtime = FakeRuntime()
+    runtime.supports_session_browsing = False
+    handler = _handler(tmp_path, runtime)
+
+    with pytest.raises(RuntimeError, match="unavailable"):
+        await handler.list_runtime_sessions()
+    with pytest.raises(RuntimeError, match="unavailable"):
+        await handler.read_runtime_session("thread-1")
 
 
 class BlockingSession(FakeSession):

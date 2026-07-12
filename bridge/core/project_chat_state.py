@@ -13,6 +13,32 @@ logger = logging.getLogger(__name__)
 
 
 class ProjectChatStateMixin:
+    def _require_runtime(self):
+        if self._agent_runtime is None or self._agent_runtime_closed:
+            raise RuntimeError("Agent runtime is unavailable")
+        return self._agent_runtime
+
+    def _require_session_browser(self):
+        runtime = self._require_runtime()
+        if not getattr(runtime, "supports_session_browsing", False):
+            raise RuntimeError("Session browsing is unavailable for this provider")
+        return runtime
+
+    async def list_runtime_sessions(self, *, limit: int = 10):
+        """List sessions through the active provider runtime."""
+
+        return await self._require_session_browser().list_sessions(limit=limit)
+
+    async def read_runtime_session(self, session_id: str, *, limit: int = 5):
+        """Read user-visible history through the active provider runtime."""
+
+        return await self._require_session_browser().read_session(session_id, limit=limit)
+
+    async def list_runtime_models(self):
+        """List models through the active provider runtime."""
+
+        return await self._require_runtime().list_models()
+
     async def stop(self, user_id: int, chat_id: Optional[int] = None) -> bool:
         """Stop active stream(s) for a user and fail pending requests.
 

@@ -6,7 +6,7 @@ import asyncio
 import json
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Protocol, TypeAlias, cast
+from typing import Literal, Protocol, TypeAlias, cast
 
 JsonValue: TypeAlias = None | bool | int | float | str | list["JsonValue"] | dict[str, "JsonValue"]
 JsonObject: TypeAlias = dict[str, JsonValue]
@@ -75,6 +75,34 @@ class CodexConnectionClosedError(RuntimeError):
 
 class CodexProtocolError(RuntimeError):
     """The app-server emitted a malformed JSON-RPC response."""
+
+
+@dataclass(frozen=True, slots=True)
+class CodexThreadSummary:
+    """Defensively parsed metadata from a ``thread/list`` entry."""
+
+    id: str
+    title: str | None
+    preview: str | None
+    updated_at: float | None
+    cwd: str | None
+    model: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class CodexThreadListPage:
+    """One parsed page returned by ``thread/list``."""
+
+    data: tuple[CodexThreadSummary, ...]
+    next_cursor: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class CodexThread:
+    """The bounded thread structure needed by the runtime history adapter."""
+
+    id: str
+    turns: tuple[Mapping[str, JsonValue], ...]
 
 
 class CodexAppServerClient:
@@ -217,6 +245,94 @@ class CodexAppServerClient:
             params["model"] = model
         return await self.request("thread/resume", params)
 
+    async def thread_list(
+        self,
+        *,
+        limit: int = 20,
+        cursor: str | None = None,
+        sort_key: Literal["created_at", "updated_at", "recency_at"] = "updated_at",
+    ) -> CodexThreadListPage:
+        """List threads using the app-server v2 request shape."""
+
+        if not 1 <= limit <= 100:
+            raise ValueError("thread list limit must be between 1 and 100")
+        params: JsonObject = {"limit": limit, "sortKey": sort_key}
+        if cursor is not None:
+            if not cursor:
+                raise ValueError("thread list cursor must not be empty")
+            params["cursor"] = cursor
+        try:
+            result = await self.request("thread/list", params)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            raise CodexProtocolError("thread/list request failed") from None
+        if not isinstance(result, Mapping):
+            return CodexThreadListPage((), None)
+        raw_data = result.get("data")
+        if not isinstance(raw_data, (list, tuple)):
+            return CodexThreadListPage((), None)
+        summaries: list[CodexThreadSummary] = []
+        for raw in raw_data[:100]:
+            if not isinstance(raw, Mapping):
+                continue
+            thread_id = raw.get("id")
+            if not isinstance(thread_id, str) or not thread_id:
+                continue
+            updated = raw.get("updatedAt")
+            if not isinstance(updated, (int, float)) or isinstance(updated, bool):
+                updated = None
+            summaries.append(
+                CodexThreadSummary(
+                    id=thread_id,
+                    title=self._optional_string(raw.get("title", raw.get("name"))),
+                    preview=self._optional_string(raw.get("preview")),
+                    updated_at=float(updated) if updated is not None else None,
+                    cwd=self._optional_string(raw.get("cwd")),
+                    model=self._optional_string(raw.get("model")),
+                )
+            )
+        return CodexThreadListPage(
+            tuple(summaries), self._optional_string(result.get("nextCursor"))
+        )
+
+    async def thread_read(
+        self,
+        thread_id: str,
+        *,
+        include_turns: bool = True,
+    ) -> CodexThread | None:
+        """Read one thread using the app-server v2 request shape."""
+
+        if not thread_id:
+            raise ValueError("thread id must not be empty")
+        try:
+            result = await self.request(
+                "thread/read",
+                {"threadId": thread_id, "includeTurns": include_turns},
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            raise CodexProtocolError("thread/read request failed") from None
+        if not isinstance(result, Mapping):
+            return None
+        thread = result.get("thread")
+        if not isinstance(thread, Mapping):
+            return None
+        returned_id = thread.get("id")
+        if not isinstance(returned_id, str) or returned_id != thread_id:
+            return None
+        raw_turns = thread.get("turns", ())
+        if not isinstance(raw_turns, (list, tuple)):
+            return None
+        turns = tuple(
+            cast(Mapping[str, JsonValue], dict(turn))
+            for turn in raw_turns[:200]
+            if isinstance(turn, Mapping)
+        )
+        return CodexThread(returned_id, turns)
+
     async def turn_start(
         self,
         thread_id: str,
@@ -249,6 +365,10 @@ class CodexAppServerClient:
         if include_hidden:
             params["includeHidden"] = True
         return await self.request("model/list", params)
+
+    @staticmethod
+    def _optional_string(value: object) -> str | None:
+        return value if isinstance(value, str) and value else None
 
     async def next_notification(self) -> CodexNotification:
         """Wait for the next server notification."""

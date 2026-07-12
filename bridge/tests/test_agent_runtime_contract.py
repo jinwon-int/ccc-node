@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 import unittest
 
 if TYPE_CHECKING:
@@ -46,6 +46,13 @@ else:
         ToolStartedEvent,
         deny_approval,
     )
+
+
+from telegram_bot.core.agent_runtime import (
+    SessionHistory,
+    SessionHistoryMessage,
+    SessionSummary,
+)
 
 
 class FakeSession:
@@ -192,6 +199,32 @@ class AgentRuntimeContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(started.arguments["paths"], (".",))
         self.assertEqual(completed.kind, "tool_completed")
         self.assertEqual(cast(Mapping[str, object], completed.result)["lines"], ("/workspace",))
+
+
+    async def test_session_browsing_values_are_immutable_and_validate_required_fields(self) -> None:
+        summary = SessionSummary(
+            id="thread-1",
+            title="A title",
+            preview="hello",
+            updated_at=123.0,
+            cwd="/workspace",
+            model="codex-test",
+        )
+        message = SessionHistoryMessage(
+            role="user", content="hello", timestamp="2026-01-01T00:00:00Z"
+        )
+        history = SessionHistory(session_id="thread-1", messages=[message])
+
+        self.assertEqual(summary.id, "thread-1")
+        self.assertEqual(history.messages, (message,))
+        with self.assertRaises((AttributeError, TypeError)):
+            cast(Any, history.messages).append(message)
+        with self.assertRaises(ValueError):
+            SessionSummary(id="")
+        with self.assertRaises(ValueError):
+            SessionHistoryMessage(role="tool", content="hidden")
+        with self.assertRaises(ValueError):
+            SessionHistory(session_id="", messages=())
 
 
 if __name__ == "__main__":

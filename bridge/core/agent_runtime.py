@@ -220,6 +220,61 @@ class ModelInfo:
             raise ValueError("model display name must not be empty")
 
 
+@dataclass(frozen=True, slots=True)
+class SessionSummary:
+    """Provider-neutral metadata for one resumable session."""
+
+    id: str
+    title: str | None = None
+    preview: str | None = None
+    updated_at: float | None = None
+    cwd: str | None = None
+    model: str | None = None
+
+    def __post_init__(self) -> None:
+        if not self.id:
+            raise ValueError("session summary id must not be empty")
+
+
+@dataclass(frozen=True, slots=True)
+class SessionHistoryMessage:
+    """One user-visible message from a stored session."""
+
+    role: Literal["user", "assistant"]
+    content: str
+    timestamp: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.role not in {"user", "assistant"}:
+            raise ValueError("session history role must be user or assistant")
+        if not self.content:
+            raise ValueError("session history content must not be empty")
+
+
+@dataclass(frozen=True, slots=True)
+class SessionHistory:
+    """Bounded user-visible history for one provider session."""
+
+    session_id: str
+    messages: Sequence[SessionHistoryMessage]
+
+    def __post_init__(self) -> None:
+        if not self.session_id:
+            raise ValueError("session history id must not be empty")
+        object.__setattr__(self, "messages", tuple(self.messages))
+
+
+class SessionBrowser(Protocol):
+    """Optional provider-neutral capability for stored-session browsing."""
+
+    @property
+    def supports_session_browsing(self) -> bool: ...
+
+    async def list_sessions(self, *, limit: int = 10) -> Sequence[SessionSummary]: ...
+
+    async def read_session(self, session_id: str, *, limit: int = 5) -> SessionHistory: ...
+
+
 class AgentSession(Protocol):
     """A live provider-neutral agent session."""
 
