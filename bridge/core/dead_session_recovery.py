@@ -444,7 +444,18 @@ async def _quarantine_transcript(
     )
     record = transcript_quarantine_record(session_id, reason, path)
     if existing is not None and existing.get("fingerprint") == record["fingerprint"]:
-        return False
+        # Identical rejection already quarantined. Records without a file
+        # identity never take the pre-scan skip, so the pending-notice retry
+        # must stay reachable here as well — send only, never re-quarantine.
+        if existing.get("notified") or not can_notify:
+            return False
+        if await _send_quarantine_notice(bot, chat_id, reason, send_timeout):
+            await _persist_quarantine(
+                session_manager, storage_key, dict(existing, notified=True)
+            )
+        else:
+            stats.failed += 1
+        return True
     consumed = False
     if can_notify:
         consumed = True

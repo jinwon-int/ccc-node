@@ -382,6 +382,34 @@ class TranscriptQuarantineTests(unittest.IsolatedAsyncioTestCase):
         # First send failed, second succeeded, third deduplicated.
         self.assertEqual(self.bot.send_message.await_count, 2)
 
+    async def test_identityless_rejection_still_retries_pending_notice(self):
+        """#424 review: records with identity=null never take the pre-scan
+        skip, so the failed-notice retry must stay reachable on the
+        same-fingerprint dedupe path too."""
+        missing_root = self.root / "missing"  # -> "conversation root unavailable"
+        self.bot.send_message.side_effect = RuntimeError("network down")
+
+        first = await recover_dead_session_notifications(
+            self.bot, self.sessions, self.handler, missing_root
+        )
+        self.bot.send_message.side_effect = None
+        second = await recover_dead_session_notifications(
+            self.bot, self.sessions, self.handler, missing_root
+        )
+        third = await recover_dead_session_notifications(
+            self.bot, self.sessions, self.handler, missing_root
+        )
+
+        record = self.sessions.sessions["7:70"][QUARANTINE_KEY]
+        self.assertIsNone(record["identity"])
+        self.assertTrue(record["notified"])
+        self.assertEqual((first.quarantined, first.failed), (1, 1))
+        # One failed attempt, one successful retry, then deduplicated.
+        self.assertEqual(self.bot.send_message.await_count, 2)
+        self.assertEqual((second.quarantined, third.quarantined), (0, 0))
+        text = self.bot.send_message.await_args.kwargs["text"]
+        self.assertIn("conversation root unavailable", text)
+
     def test_quarantine_blocks_scan_requires_matching_identity(self):
         record = transcript_quarantine_record(self.session_id, "reason", self.path)
         self.assertTrue(quarantine_blocks_scan(record, self.session_id, self.path))
