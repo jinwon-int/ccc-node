@@ -49,6 +49,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - 14 new unit/integration tests (`test_task_ledger.py` + heartbeat-loop ledger cases).
 
 ### Changed
+- **Codex `auto-approve` default sends an explicit `never` + `workspaceWrite`
+  turn (#412).** `CCC_BRIDGE_BASH_POLICY=auto-approve` already mapped to Codex
+  `approvalPolicy=never` with no reviewer, but the bridge sent **no** per-turn
+  sandbox, so the effective boundary silently fell back to each node's
+  `$CODEX_HOME/config.toml` or the Codex defaults. Every `auto-approve` turn now
+  also sends `sandboxPolicy={type: workspaceWrite, networkAccess: false}`, making
+  the safe low-friction product default (`never` + network-off `workspaceWrite`)
+  explicit and node-config-independent. `auto-review` is unchanged
+  (`on-request` + `auto_review` + the same network-off `workspaceWrite`
+  sandbox); `approve-each` and `disabled` still send no per-turn sandbox and
+  defer to Codex's own default boundary. A fresh sandbox dict is built per turn
+  and frozen into the provider-neutral request snapshot, so it stays immutable.
 - **Termux session-store path compatibility.** Ancestor validation now permits the
   current Termux app's exact non-world-writable `.../com.termux/files` root and
   OS-owned Android platform ancestors on validated, current-UID-owned canonical

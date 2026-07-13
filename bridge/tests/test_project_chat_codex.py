@@ -7,7 +7,7 @@ import importlib
 import sys
 from collections.abc import AsyncIterator
 from pathlib import Path
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 from typing import cast
 
 import pytest
@@ -278,6 +278,49 @@ async def test_codex_start_resume_and_event_mapping_hides_reasoning(tmp_path: Pa
     assert "private chain" not in response.content
     assert response.success is True
     assert response.session_id == "resumed"
+
+
+@pytest.mark.anyio
+async def test_codex_auto_approve_turn_sends_explicit_workspace_write_sandbox(
+    tmp_path: Path,
+) -> None:
+    """The auto-approve default is a never/no-reviewer/workspaceWrite turn payload.
+
+    ``approvalPolicy=never`` with no explicit sandbox would let each node's
+    ``config.toml`` decide the effective boundary; the bridge must send the exact
+    network-off ``workspaceWrite`` policy so the safe default holds on every turn.
+    """
+
+    session = FakeSession("thread-1")
+    runtime = FakeRuntime([session])
+    handler = _handler(tmp_path, runtime)
+
+    await handler.process_message(
+        "hello",
+        user_id=7,
+        chat_id=70,
+        session_id="thread-1",
+        model="codex-test",
+        approval_policy="never",
+        approvals_reviewer=None,
+        sandbox_policy={"type": "workspaceWrite", "networkAccess": False},
+    )
+
+    assert runtime.requests == [
+        SessionRequest(
+            working_directory=str(tmp_path.resolve()),
+            session_id="thread-1",
+            model="codex-test",
+            approval_policy="never",
+            approvals_reviewer=None,
+            sandbox_policy={"type": "workspaceWrite", "networkAccess": False},
+        )
+    ]
+    recorded_sandbox = runtime.requests[0].sandbox_policy
+    assert recorded_sandbox == {"type": "workspaceWrite", "networkAccess": False}
+    # The provider-neutral request snapshot must be immutable: SessionRequest
+    # freezes the sandbox mapping into a read-only view.
+    assert isinstance(recorded_sandbox, MappingProxyType)
 
 
 @pytest.mark.anyio

@@ -106,9 +106,25 @@ class BotAccessMixin:
         )
 
     def _codex_sandbox_policy(self) -> dict[str, object] | None:
-        """Keep auto-review inside a workspace-only, network-off boundary."""
+        """Bind auto-approve and auto-review to a workspace-only, network-off boundary.
 
-        if self._bash_policy() != tool_policy.BASH_AUTO_REVIEW:
+        ``auto-approve`` maps to Codex ``approvalPolicy=never``. Without an
+        explicit per-turn sandbox the effective boundary would silently fall back
+        to each node's ``$CODEX_HOME/config.toml`` or the Codex defaults, so the
+        intended low-friction product default (``never`` + ``workspaceWrite`` with
+        network off) would depend on node-local configuration. Sending the policy
+        makes that default explicit on every turn. ``auto-review`` keeps the same
+        network-off ``workspaceWrite`` boundary; ``approve-each`` and ``disabled``
+        send no per-turn sandbox and defer to Codex's own default.
+
+        A fresh dict is returned per turn so the frozen request snapshot cannot be
+        mutated through a shared reference.
+        """
+
+        if self._bash_policy() not in (
+            tool_policy.BASH_AUTO_APPROVE,
+            tool_policy.BASH_AUTO_REVIEW,
+        ):
             return None
         return {"type": "workspaceWrite", "networkAccess": False}
 

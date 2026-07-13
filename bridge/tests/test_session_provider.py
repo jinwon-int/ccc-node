@@ -83,7 +83,12 @@ def bare_bot(manager: SessionManager, *, provider: str, project_chat=None) -> An
     ("bash_policy", "approval", "reviewer", "sandbox"),
     [
         ("approve-each", "untrusted", None, None),
-        ("auto-approve", "never", None, None),
+        (
+            "auto-approve",
+            "never",
+            None,
+            {"type": "workspaceWrite", "networkAccess": False},
+        ),
         (
             "auto-review",
             "on-request",

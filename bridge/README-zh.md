@@ -316,6 +316,7 @@ ffmpeg -version
   - `owner-operator` 明确关闭 OS 沙箱，恢复正常 user/project/local settings 与 host 级 Claude Code 运维能力。只有 `CCC_REQUIRE_ALLOWLIST=true` 且 `ALLOWED_USER_IDS` 恰好一个 owner 时才能启动。此模式信任 owner 边界，**不能**防御 prompt injection。
   - `disabled` 强制禁用 Bash，并禁止 user/project/local 文件系统 settings，避免 settings hook 保留 host 执行能力；未知或不安全的配置也会降级为 disabled。
 - `CCC_BRIDGE_BASH_POLICY` 只控制所选边界内的审批体验：`auto-approve`（默认）、`auto-review`、`approve-each` 或 `disabled`。审批不会扩大 `strict-project`，在 `owner-operator` 中也不是第二层沙箱。Claude 会把 `auto-review` 保守地按 `approve-each` 处理。
+- Codex 的 `auto-approve`（默认）每个 turn 都发送 `approvalPolicy=never`、不带 reviewer，以及 `sandboxPolicy={type: workspaceWrite, networkAccess: false}`。显式发送沙箱是刻意的：在 `never` 且不带 per-turn 沙箱时，有效边界会悄悄回退到各节点的 `$CODEX_HOME/config.toml` 或 Codex 默认值，使安全的低摩擦产品默认（`never` + 关闭网络的 `workspaceWrite`）依赖于节点本地配置。显式策略让写入保持在工作区内、网络关闭，且无需任何 per-node 配置。`approve-each` 和 `disabled` 不发送 per-turn 沙箱，沿用 Codex 自身的默认边界。
 - Codex 的 `auto-review` 每个 turn 都发送 `approvalPolicy=on-request`、`approvalsReviewer=auto_review` 和网络关闭的 `workspaceWrite` 沙箱。工作区内的日常操作自动继续；符合条件的越界请求由 Codex reviewer agent 评估。该模式不会扩大沙箱、不会自动开放网络，也不是安全保证。
 - Bot 输出引用外部文件时，发送前需用户确认。
 - 所有运行时数据都在 `PROJECT_ROOT/.telegram_bot/` 内。
