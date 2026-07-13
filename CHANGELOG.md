@@ -16,6 +16,18 @@ All notable changes to the Claude Code node harness. Dates are KST.
   tagged (`v0.4.0`) or historical (`0.3.18`) headings when extracting notes.
 
 ### Fixed
+- `ccc_doctor.py --json` stdout is now strictly machine-parseable (#404):
+  `scripts/ccc_doctor.py --json` runs the whole diagnosis with the real stdout
+  file descriptor redirected to stderr and writes the single JSON document to a
+  preserved private copy of stdout. This structurally prevents a probe (or a
+  descriptor-inheriting subprocess such as a Codex helper) from trailing
+  non-JSON bytes after the report, so a strict `json.load` consumer no longer
+  fails with `Extra data`. Probe diagnostics surface on stderr; exit-code
+  semantics (0 for 정상/경고 only; 1 for 교정가능/수동필요) are documented in
+  `--help` and the module docstring. Regression coverage in
+  `scripts/ccc-doctor.test.sh` parses the Codex `--json` path repeatedly with
+  `json.load` and proves the stdout guard diverts stray fd-1/print leaks to
+  stderr.
 - CodeQL/required-check drift (#350): Dependabot now groups the complete
   `github/codeql-action/*` family, CodeQL publishes the stable
   `codeql-python` context, and `.github/required-checks.json` plus regression
