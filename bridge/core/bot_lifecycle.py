@@ -794,13 +794,16 @@ class BotLifecycleMixin:
             AlertThresholds,
             HealthProbe,
             evaluate_alerts,
+            probe_interval,
             write_alert_spool,
         )
 
         settings = self._config
         if not getattr(settings, "health_alerts_enabled", True):
             return
-        interval = float(getattr(settings, "health_alerts_interval_seconds", 60.0) or 60.0)
+        # Defensive clamp: a non-positive configured interval would make
+        # wait_for time out immediately and spin this loop hot (#430 review).
+        interval = probe_interval(getattr(settings, "health_alerts_interval_seconds", None))
         probe = HealthProbe(
             project_chat=self._project_chat,
             spool_dir=self._push_notifier.spool_dir,

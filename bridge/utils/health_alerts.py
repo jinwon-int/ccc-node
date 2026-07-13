@@ -53,6 +53,26 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_PROBE_INTERVAL_SECONDS = 60.0
 DEFAULT_ALERT_COOLDOWN_SECONDS = 1800.0
+MIN_PROBE_INTERVAL_SECONDS = 5.0
+MAX_PROBE_INTERVAL_SECONDS = 3600.0
+
+
+def probe_interval(value: Any, default: float = DEFAULT_PROBE_INTERVAL_SECONDS) -> float:
+    """Resolve the probe interval defensively.
+
+    A non-positive or unparsable configured interval must never reach the
+    probe loop: ``asyncio.wait_for(..., timeout<=0)`` times out immediately and
+    the loop would spin hot, hammering health.json and /proc every iteration.
+    Invalid values fall back to the default; valid ones are clamped to
+    [MIN_PROBE_INTERVAL_SECONDS, MAX_PROBE_INTERVAL_SECONDS].
+    """
+    try:
+        interval = float(value)
+    except (TypeError, ValueError):
+        return default
+    if interval <= 0:
+        return default
+    return min(max(interval, MIN_PROBE_INTERVAL_SECONDS), MAX_PROBE_INTERVAL_SECONDS)
 
 
 @dataclass(frozen=True)

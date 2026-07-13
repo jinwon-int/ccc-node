@@ -15,6 +15,9 @@ from types import SimpleNamespace
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from telegram_bot.utils.health_alerts import (
+    DEFAULT_PROBE_INTERVAL_SECONDS,
+    MAX_PROBE_INTERVAL_SECONDS,
+    MIN_PROBE_INTERVAL_SECONDS,
     Alert,
     AlertGate,
     AlertThresholds,
@@ -22,6 +25,7 @@ from telegram_bot.utils.health_alerts import (
     HealthSignals,
     count_spool_backlog,
     evaluate_alerts,
+    probe_interval,
     write_alert_spool,
 )
 
@@ -93,6 +97,63 @@ class EvaluateAlertsTests(unittest.TestCase):
             self.assertNotRegex(alert.message, r"[/\\]")
             self.assertNotIn("token", alert.message.lower())
             self.assertNotIn("secret", alert.message.lower())
+
+
+class ProbeIntervalTests(unittest.TestCase):
+    def test_non_positive_and_invalid_intervals_never_reach_the_loop(self):
+        """#430 review: a negative interval passed straight to asyncio.wait_for
+        times out instantly and spins the probe loop hot."""
+        for bad in (-1, 0, 0.0, -0.5, None, "abc"):
+            with self.subTest(value=bad):
+                self.assertEqual(probe_interval(bad), DEFAULT_PROBE_INTERVAL_SECONDS)
+
+    def test_valid_intervals_are_clamped_to_sane_bounds(self):
+        self.assertEqual(probe_interval(60), 60.0)
+        self.assertEqual(probe_interval(1), MIN_PROBE_INTERVAL_SECONDS)
+        self.assertEqual(probe_interval(999999), MAX_PROBE_INTERVAL_SECONDS)
+
+
+class ProbeLoopHotSpinRegressionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_negative_configured_interval_does_not_hot_loop(self):
+        """Drive the real lifecycle probe task with interval=-1: with the clamp
+        the first tick is minutes away, so a short observation window must see
+        zero probe executions (the unclamped loop ran ~100k ticks/second)."""
+        from telegram_bot.core.bot_lifecycle import BotLifecycleMixin
+
+        ticks = []
+
+        class Bot(BotLifecycleMixin):
+            def __init__(self, tmp):
+                self._config = SimpleNamespace(
+                    health_alerts_enabled=True,
+                    health_alerts_interval_seconds=-1,
+                    health_alerts_cooldown_seconds=1800.0,
+                    alert_heartbeat_age_factor=1.0,
+                    alert_max_dead_streams=1,
+                    alert_max_pending_notifications=10,
+                    alert_max_orphan_children=1,
+                    push_enabled=False,
+                )
+                self._project_chat = SimpleNamespace(
+                    _streams={},
+                    workload_snapshot=lambda now: ticks.append(now) or (0, 0.0),
+                    _process_timeout_seconds=600.0,
+                )
+                self._push_notifier = SimpleNamespace(spool_dir=Path(tmp) / "spool")
+
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            bot = Bot(tmp)
+            stop = asyncio.Event()
+            task = asyncio.create_task(bot._health_alerts_probe(stop))
+            await asyncio.sleep(0.25)
+            stop.set()
+            await asyncio.wait_for(task, timeout=2.0)
+
+        self.assertEqual(
+            ticks, [], "clamped interval must not allow immediate hot ticks"
+        )
 
 
 class AlertGateTests(unittest.TestCase):
