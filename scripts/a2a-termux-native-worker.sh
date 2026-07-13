@@ -300,6 +300,11 @@ cmd_status() {
         ppid=$(awk '/^PPid:/ {print $2}' "/proc/$pid/status" 2>/dev/null || echo "")
         [[ "$ppid" == "1" ]] && printf '  pid=%s\n' "$pid"
     done < <(pgrep -f "ssh -N.*-L 127\.0\.0\.1:${LOCAL_PORT}:" 2>/dev/null || true)
+    # `read` returns 1 on EOF, so the loop above (and thus this function)
+    # would otherwise report failure whenever there are zero orphan ssh
+    # processes — the normal, healthy case. `status` is read-only reporting;
+    # its exit code must reflect "ran successfully", not "found something".
+    return 0
 }
 
 usage() {
