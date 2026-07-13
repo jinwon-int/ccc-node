@@ -116,6 +116,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   still True, so a `Conflict`/`Forbidden` raised *after* polling started would
   otherwise never surface anywhere — the callback flags permanent errors and
   the polling supervisor re-raises them into the fail-closed handlers.
+  `InvalidToken` takes a third path: PTB re-raises it inside the retry loop
+  *without* invoking the error callback, killing the polling task while
+  `updater.running` stays True. The supervisor now also watches the polling
+  task itself (defensively, with the get_me watchdog as fallback) and routes
+  a task killed by a permanent error into the same fail-closed handlers.
 - **Canonical update provenance (#351).** `bridge/start.sh` no longer compares
   the vendored bridge changelog with `terranc/claude-telegram-bot-bridge`
   releases and then pulls whichever checkout happens to be current. `--upgrade`

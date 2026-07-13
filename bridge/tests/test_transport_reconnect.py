@@ -312,6 +312,60 @@ async def test_reconnect_registers_polling_error_callback(
     assert updater.start_calls[-1]["error_callback"] == bot._on_polling_error
 
 
+@pytest.mark.anyio
+async def test_invalid_token_killing_real_ptb_polling_task_fails_closed(
+    fake_health: FakeHealth,
+) -> None:
+    """Drive a REAL PTB Updater through InvalidToken (#418 review).
+
+    PTB's polling retry loop re-raises InvalidToken WITHOUT invoking the
+    error callback; the polling task dies while ``updater.running`` stays
+    True and no callback fires. The supervisor must detect the dead task
+    and fail closed with the original error instead of waiting forever.
+    """
+    import contextlib
+
+    from telegram.ext import Updater
+
+    class TokenRevokedBot:
+        """Minimal Bot surface; get_updates 401s like a revoked token."""
+
+        async def initialize(self) -> None:
+            return None
+
+        async def shutdown(self) -> None:
+            return None
+
+        async def delete_webhook(self, drop_pending_updates=None) -> bool:
+            return True
+
+        async def get_updates(self, *args, **kwargs):
+            raise telegram.error.InvalidToken("401 unauthorized")
+
+    updater = Updater(bot=TokenRevokedBot(), update_queue=asyncio.Queue())
+    await updater.initialize()
+    bot = bare_lifecycle_bot(None)
+    bot.application = SimpleNamespace(updater=updater, bot=object(), running=True)
+    try:
+        await updater.start_polling(error_callback=bot._on_polling_error)
+        for _ in range(100):  # let the polling task die on its first poll
+            if bot._polling_task_failure() is not None:
+                break
+            await asyncio.sleep(0.01)
+
+        # The zombie premise: task dead, no callback fired, updater "running".
+        assert updater.running is True
+        assert getattr(bot, "_fatal_polling_error", None) is None
+
+        with pytest.raises(telegram.error.InvalidToken):
+            await asyncio.wait_for(bot._supervise_polling(asyncio.Event()), timeout=10)
+    finally:
+        with contextlib.suppress(telegram.error.InvalidToken, RuntimeError):
+            await updater.stop()
+        with contextlib.suppress(RuntimeError):
+            await updater.shutdown()
+
+
 def test_only_first_polling_start_drops_backlog() -> None:
     bot = bare_lifecycle_bot(FakeUpdater())
 

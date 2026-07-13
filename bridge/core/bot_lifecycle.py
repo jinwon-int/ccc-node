@@ -5,6 +5,7 @@ import os
 import signal
 import shutil
 import subprocess
+from typing import Optional
 
 import telegram.error
 from telegram import Update
@@ -784,6 +785,25 @@ class BotLifecycleMixin:
                 logger.debug("Terminal op drain failed: %s", type(exc).__name__)
             await asyncio.sleep(self._WORKLOAD_INTERVAL)
 
+    def _polling_task_failure(self) -> Optional[BaseException]:
+        """Return the exception that killed PTB's polling task, if it died.
+
+        PTB's polling retry loop re-raises ``InvalidToken`` *without* invoking
+        the error callback, and a crashed polling task does not clear
+        ``updater.running`` — a zombie state no public Updater API reflects.
+        Reach the name-mangled task defensively: if PTB internals drift, this
+        returns None and the get_me watchdog remains the fallback detector.
+        """
+        app = self.application
+        updater = getattr(app, "updater", None) if app else None
+        task = getattr(updater, "_Updater__polling_task", None)
+        if task is None or not task.done() or task.cancelled():
+            return None
+        try:
+            return task.exception()
+        except (asyncio.CancelledError, asyncio.InvalidStateError):
+            return None
+
     async def _wait_for_polling_exit(self, stop_event: asyncio.Event):
         """Block until stop signal, polling exit, or a fatal polling error."""
         while not stop_event.is_set():
@@ -792,6 +812,19 @@ class BotLifecycleMixin:
             # checked explicitly — it never shows up as a stopped updater.
             if getattr(self, "_fatal_polling_error", None) is not None:
                 logger.warning("Permanent polling failure flagged, leaving polling wait")
+                raise _PollingRestart()
+            failure = self._polling_task_failure()
+            if failure is not None:
+                # InvalidToken kills the polling task without reaching the
+                # error callback while updater.running stays True. Route
+                # permanent failures to the fail-closed handlers; anything
+                # else gets the transport-only reconnect.
+                if isinstance(failure, self._PERMANENT_POLLING_ERRORS):
+                    self._fatal_polling_error = failure
+                logger.warning(
+                    "Polling task died (%s), triggering restart",
+                    type(failure).__name__,
+                )
                 raise _PollingRestart()
             if (
                 self.application
