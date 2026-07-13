@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Explicit safe Codex default (#412).** The default `auto-approve` policy now
+  sends `approvalPolicy=never`, no reviewer, and a network-off `workspaceWrite`
+  sandbox on every Codex turn. New clean Codex deployments therefore no longer
+  depend on a node-local `config.toml` sandbox default to preserve the intended
+  low-friction workspace boundary; explicit node policy overrides remain intact.
 - **Codex low-friction auto-review policy (#409).** `CCC_BRIDGE_BASH_POLICY=auto-review`
   now sends the deployed app-server's exact `on-request` approval policy,
   `auto_review` reviewer, and a network-off `workspaceWrite` sandbox on every

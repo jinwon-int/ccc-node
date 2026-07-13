@@ -106,9 +106,12 @@ class BotAccessMixin:
         )
 
     def _codex_sandbox_policy(self) -> dict[str, object] | None:
-        """Keep auto-review inside a workspace-only, network-off boundary."""
+        """Keep automatic Codex modes inside a network-off workspace boundary."""
 
-        if self._bash_policy() != tool_policy.BASH_AUTO_REVIEW:
+        if self._bash_policy() not in {
+            tool_policy.BASH_AUTO_APPROVE,
+            tool_policy.BASH_AUTO_REVIEW,
+        }:
             return None
         return {"type": "workspaceWrite", "networkAccess": False}
 
