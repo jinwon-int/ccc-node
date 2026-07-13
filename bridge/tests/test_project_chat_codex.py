@@ -280,6 +280,98 @@ async def test_codex_start_resume_and_event_mapping_hides_reasoning(tmp_path: Pa
     assert response.session_id == "resumed"
 
 
+class ProgressSession(FakeSession):
+    def __init__(self, session_id: str) -> None:
+        super().__init__(session_id)
+        self.tool_started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    def send_turn(
+        self,
+        message: str,
+        *,
+        approval_handler: ApprovalHandler = deny_approval,
+    ) -> AsyncIterator[AgentEvent]:
+        del approval_handler
+
+        async def stream() -> AsyncIterator[AgentEvent]:
+            self.messages.append(message)
+            yield ToolStartedEvent(
+                "tool-1",
+                "commandExecution",
+                {"command": "pwd"},
+            )
+            self.tool_started.set()
+            await self.release.wait()
+            yield ToolCompletedEvent(
+                "tool-1",
+                "commandExecution",
+                {"exitCode": 0},
+                True,
+            )
+            yield TextDeltaEvent("done")
+            yield CompletionEvent("end_turn")
+
+        return stream()
+
+
+@pytest.mark.anyio
+async def test_codex_keeps_typing_alive_and_shows_tool_heartbeat(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    session = ProgressSession("thread-1")
+    handler = _handler(tmp_path, FakeRuntime([session]))
+    handler._typing_interval_seconds = 0.01
+    heartbeat_config = ProjectChatHandler._maybe_update_heartbeat.__globals__["config"]
+    monkeypatch.setattr(heartbeat_config, "heartbeat_enabled", True)
+    monkeypatch.setattr(heartbeat_config, "heartbeat_threshold_seconds", 0.01)
+    monkeypatch.setattr(heartbeat_config, "heartbeat_update_interval_seconds", 0.01)
+    monkeypatch.setattr(heartbeat_config, "heartbeat_stall_seconds", 0.0)
+    monkeypatch.setattr(heartbeat_config, "heartbeat_forecast_enabled", False)
+
+    typing_calls: list[str] = []
+    status_calls: list[tuple[str | None, int | None]] = []
+    status_visible = asyncio.Event()
+
+    async def typing_callback() -> None:
+        typing_calls.append("typing")
+
+    async def status_callback(
+        text: str | None, message_id: int | None = None
+    ) -> int | None:
+        status_calls.append((text, message_id))
+        if text is None:
+            return None
+        status_visible.set()
+        return message_id or 1234
+
+    task = asyncio.create_task(
+        handler.process_message(
+            "run a command",
+            user_id=7,
+            chat_id=70,
+            typing_callback=typing_callback,
+            status_callback=status_callback,
+        )
+    )
+    await asyncio.wait_for(session.tool_started.wait(), timeout=1)
+    await asyncio.wait_for(status_visible.wait(), timeout=1)
+
+    assert typing_calls
+    assert any(
+        text is not None
+        and "⏳ Working" in text
+        and "Command: pwd" in text
+        for text, _ in status_calls
+    )
+
+    session.release.set()
+    response = await asyncio.wait_for(task, timeout=1)
+
+    assert response.content == "done"
+    assert status_calls[-1] == (None, 1234)
+
+
 @pytest.mark.anyio
 async def test_codex_effort_change_recreates_wrapper_and_resumes_same_thread(
     tmp_path: Path,

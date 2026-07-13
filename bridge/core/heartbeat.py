@@ -56,6 +56,22 @@ def tool_label(name: Optional[str], tool_input: Any = None) -> Optional[str]:
     elif name == "Task":
         summary = tool_input.get("description") or tool_input.get("subagent_type")
         limit = 60
+    elif name == "commandExecution":
+        name = "Command"
+        summary = tool_input.get("command")
+        limit = 60
+    elif name == "fileChange":
+        name = "File change"
+        summary = tool_input.get("path") or tool_input.get("file_path")
+        limit = 40
+    elif name == "mcpToolCall":
+        name = "MCP"
+        summary = tool_input.get("tool") or tool_input.get("name")
+        limit = 50
+    elif name == "webSearch":
+        name = "Web search"
+        summary = tool_input.get("query")
+        limit = 60
 
     if summary:
         return f"{name}: {_truncate(str(summary), limit)}"
