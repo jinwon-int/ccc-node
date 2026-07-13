@@ -86,6 +86,35 @@ class BotAccessMixin:
             execution_profile,
         )
 
+    def _codex_approval_policy(self) -> str:
+        """Map bridge approval UX to Codex app-server's supported policy."""
+
+        policy = self._bash_policy()
+        if policy == tool_policy.BASH_AUTO_APPROVE:
+            return "never"
+        if policy == tool_policy.BASH_AUTO_REVIEW:
+            return "on-request"
+        return "untrusted"
+
+    def _codex_approvals_reviewer(self) -> str | None:
+        """Route eligible boundary reviews to Codex only in auto-review mode."""
+
+        return (
+            "auto_review"
+            if self._bash_policy() == tool_policy.BASH_AUTO_REVIEW
+            else None
+        )
+
+    def _codex_sandbox_policy(self) -> dict[str, object] | None:
+        """Map automatic Codex modes to their explicit sandbox contract."""
+
+        policy = self._bash_policy()
+        if policy == tool_policy.BASH_AUTO_APPROVE:
+            return {"type": "dangerFullAccess"}
+        if policy == tool_policy.BASH_AUTO_REVIEW:
+            return {"type": "workspaceWrite", "networkAccess": False}
+        return None
+
     def _is_within_project_root(self, path: FilePath) -> bool:
         return path_scope.is_within_project_root(path, self._project_root())
 
@@ -292,15 +321,18 @@ class BotAccessMixin:
                 )
                 return PermissionResultAllow()
 
-            if policy != "approve-each":
+            if policy not in (
+                tool_policy.BASH_APPROVE_EACH,
+                tool_policy.BASH_AUTO_REVIEW,
+            ):
                 logger.warning(
                     "bash_disabled_denied user_id=%s chat_id=%s", user_id, chat_id
                 )
                 return PermissionResultDeny(
                     message=(
                         "Bash is disabled by the fail-closed bridge policy. "
-                        "An operator may select CCC_BRIDGE_BASH_POLICY=auto-approve "
-                        "or approve-each, but PROJECT_ROOT is not an OS sandbox."
+                        "An operator may select CCC_BRIDGE_BASH_POLICY=auto-approve, "
+                        "auto-review, or approve-each, but PROJECT_ROOT is not an OS sandbox."
                     )
                 )
 

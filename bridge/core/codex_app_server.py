@@ -348,6 +348,9 @@ class CodexAppServerClient:
         *,
         model: str | None = None,
         effort: str | None = None,
+        approval_policy: str | None = None,
+        approvals_reviewer: str | None = None,
+        sandbox_policy: Mapping[str, JsonValue] | None = None,
     ) -> JsonValue:
         """Start a turn with protocol input items."""
 
@@ -359,6 +362,12 @@ class CodexAppServerClient:
             params["model"] = model
         if effort is not None:
             params["effort"] = effort
+        if approval_policy is not None:
+            params["approvalPolicy"] = approval_policy
+        if approvals_reviewer is not None:
+            params["approvalsReviewer"] = approvals_reviewer
+        if sandbox_policy is not None:
+            params["sandboxPolicy"] = dict(sandbox_policy)
         return await self.request("turn/start", params)
 
     async def turn_interrupt(self, thread_id: str, turn_id: str) -> JsonValue:

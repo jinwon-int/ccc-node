@@ -315,6 +315,15 @@ class ToolPolicyTest(unittest.TestCase):
         self.assertEqual(tool_policy.resolve_bash_policy("auto_approve"), "auto-approve")
         self.assertIn("Bash", tool_policy.allowed_tools("auto_approve"))
 
+    def test_auto_review_is_recognized_but_keeps_claude_per_call_approval(self):
+        self.assertEqual(tool_policy.resolve_bash_policy("auto_review"), "auto-review")
+        self.assertNotIn("Bash", tool_policy.allowed_tools("auto-review"))
+        hooks = tool_policy.bash_permission_hooks("auto-review")
+        self.assertEqual(set(hooks), {"PreToolUse"})
+        self.assertTrue(
+            tool_policy.missing_callback_requires_denial("Bash", "auto-review")
+        )
+
     def test_explicit_disabled_policy_hard_denies_bash(self):
         with patch.dict(os.environ, {"CCC_BRIDGE_BASH_POLICY": "disabled"}, clear=True):
             self.assertEqual(tool_policy.resolve_bash_policy(), "disabled")

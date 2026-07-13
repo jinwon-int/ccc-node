@@ -7,7 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Unrestricted Codex package default (#415).** The default `auto-approve`
+  policy now sends `approvalPolicy=never`, no reviewer, and
+  `sandboxPolicy={type: dangerFullAccess}` on every Codex turn regardless of
+  execution profile. This supersedes the network-off workspace default added
+  in #412: root bridges can now access external/Tailscale networks, host files,
+  systemd, SSH, devices, and paths outside the workspace without prompting.
+  Every allowlisted Telegram user is part of the effective trust boundary;
+  single-owner operation is strongly recommended. Explicit `auto-review`,
+  `approve-each`, and `disabled` policies retain their prior behavior.
+
 ### Added
+- **Explicit safe Codex default (#412).** The default `auto-approve` policy now
+  sends `approvalPolicy=never`, no reviewer, and a network-off `workspaceWrite`
+  sandbox on every Codex turn. New clean Codex deployments therefore no longer
+  depend on a node-local `config.toml` sandbox default to preserve the intended
+  low-friction workspace boundary; explicit node policy overrides remain intact.
+- **Codex low-friction auto-review policy (#409).** `CCC_BRIDGE_BASH_POLICY=auto-review`
+  now sends the deployed app-server's exact `on-request` approval policy,
+  `auto_review` reviewer, and a network-off `workspaceWrite` sandbox on every
+  turn. Routine workspace work continues automatically while eligible boundary
+  crossings are evaluated by Codex's reviewer agent. The policy is transported
+  through the provider-neutral session contract, participates in session-cache
+  invalidation, never enables `dangerFullAccess`, and degrades conservatively to
+  per-call human approval when the active provider is Claude.
 - **Telegram reply-context injection** (`core/bot_shared.build_reply_context_prefix`, #380).
   When a user *replies* to an earlier message, the bridge previously forwarded
   only the new text and dropped the quoted original, so the agent couldn't tell
@@ -67,6 +91,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fail closed. Linux/WSL2 requires `bubblewrap` and `socat`.
 
 ### Fixed
+- **Transient Telegram outages no longer cancel in-flight AI turns (#411, part A).**
+  A runtime `NetworkError`/`TimedOut` or a watchdog-detected hang previously tore
+  down the whole Application lifecycle, taking the in-progress agent turn with it
+  (observed live: a ~10s transport blip cancelled a running Claude turn and its
+  answer was never delivered). Polling exits are now supervised: the bridge first
+  runs a bounded transport-only reconnect (`_RECONNECT_ATTEMPTS`, exponential
+  backoff) that restarts only the updater — the Application object, bot request
+  pools, conversation FIFO, and every in-flight agent turn survive untouched, so
+  a turn finishing mid-outage still delivers exactly once through the surviving
+  bot. Escalation to the full teardown/rebuild path happens only when the
+  reconnect fails outright or reconnected polling keeps dying within
+  `_MIN_UPTIME` (preserving the rapid-crash SystemExit accounting). The polling
+  watchdog now stays alive after triggering a restart, since no rebuild recreates
+  it after a transport-only reconnect. Reconnects never drop pending updates —
+  only the process's very first polling start drops the backlog — so messages
+  sent during an outage are no longer lost. Permanent failures (invalid token,
+  getUpdates conflict, revoked token) keep their fail-closed SystemExit, and the
+  in-flight requests they terminate are now attributed in
+  `health.json → transport.cancelled_by_transport`; successful transport-only
+  reconnects increment `transport.reconnects`. Both `start_polling` calls now
+  register a synchronous `error_callback`: python-telegram-bot retries
+  getUpdates errors indefinitely in a background loop with `updater.running`
+  still True, so a `Conflict`/`Forbidden` raised *after* polling started would
+  otherwise never surface anywhere — the callback flags permanent errors and
+  the polling supervisor re-raises them into the fail-closed handlers.
+  `InvalidToken` takes a third path: PTB re-raises it inside the retry loop
+  *without* invoking the error callback, killing the polling task while
+  `updater.running` stays True. The supervisor now also watches the polling
+  task itself (defensively, with the get_me watchdog as fallback) and routes
+  a task killed by a permanent error into the same fail-closed handlers.
 - **Canonical update provenance (#351).** `bridge/start.sh` no longer compares
   the vendored bridge changelog with `terranc/claude-telegram-bot-bridge`
   releases and then pulls whichever checkout happens to be current. `--upgrade`

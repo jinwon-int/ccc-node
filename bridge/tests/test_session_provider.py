@@ -79,6 +79,58 @@ def bare_bot(manager: SessionManager, *, provider: str, project_chat=None) -> An
     return bot
 
 
+@pytest.mark.parametrize(
+    ("bash_policy", "approval", "reviewer", "sandbox"),
+    [
+        ("approve-each", "untrusted", None, None),
+        (
+            "auto-approve",
+            "never",
+            None,
+            {"type": "dangerFullAccess"},
+        ),
+        (
+            "auto-review",
+            "on-request",
+            "auto_review",
+            {"type": "workspaceWrite", "networkAccess": False},
+        ),
+        ("disabled", "untrusted", None, None),
+    ],
+)
+def test_codex_execution_policy_follows_bridge_bash_policy(
+    tmp_path: Path,
+    bash_policy: str,
+    approval: str,
+    reviewer: str | None,
+    sandbox: dict[str, object] | None,
+) -> None:
+    bot = bare_bot(make_manager(tmp_path, "codex"), provider="codex")
+    bot._config.bash_policy = bash_policy
+    bot._config.execution_profile = "owner-operator"
+    bot._config.allowed_user_ids = [7]
+    bot._config.require_allowlist = True
+
+    assert bot._codex_approval_policy() == approval
+    assert bot._codex_approvals_reviewer() == reviewer
+    assert bot._codex_sandbox_policy() == sandbox
+
+
+@pytest.mark.parametrize("execution_profile", ["strict-project", "owner-operator"])
+def test_codex_auto_approve_full_access_is_execution_profile_independent(
+    tmp_path: Path, execution_profile: str
+) -> None:
+    bot = bare_bot(make_manager(tmp_path, "codex"), provider="codex")
+    bot._config.bash_policy = "auto-approve"
+    bot._config.execution_profile = execution_profile
+    bot._config.allowed_user_ids = [7]
+    bot._config.require_allowlist = True
+
+    assert bot._codex_approval_policy() == "never"
+    assert bot._codex_approvals_reviewer() is None
+    assert bot._codex_sandbox_policy() == {"type": "dangerFullAccess"}
+
+
 @pytest.mark.anyio
 async def test_legacy_provider_defaults_to_claude_without_bulk_migration(tmp_path: Path) -> None:
     manager = make_manager(tmp_path, "codex")

@@ -8,7 +8,7 @@ import time
 import asyncio
 import logging
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Mapping, Optional, Tuple
 
 from claude_agent_sdk import (
     ClaudeSDKClient,
@@ -178,6 +178,11 @@ class ProjectChatHandler(
         self._agent_sessions: Dict[Tuple[int, int], Any] = {}
         self._agent_session_models: Dict[Tuple[int, int], Optional[str]] = {}
         self._agent_session_efforts: Dict[Tuple[int, int], Optional[str]] = {}
+        self._agent_session_approval_policies: Dict[Tuple[int, int], Optional[str]] = {}
+        self._agent_session_approvals_reviewers: Dict[Tuple[int, int], Optional[str]] = {}
+        self._agent_session_sandbox_policies: Dict[
+            Tuple[int, int], Optional[Mapping[str, Any]]
+        ] = {}
         self._agent_active_sessions: Dict[Tuple[int, int], Any] = {}
         self._agent_active_generations: Dict[Tuple[int, int], int] = {}
         self._agent_generation_counters: Dict[Tuple[int, int], int] = {}

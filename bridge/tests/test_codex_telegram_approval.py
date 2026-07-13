@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -52,9 +53,16 @@ def approval_event() -> ApprovalRequestEvent:
     )
 
 
-def _subject(*, timeout: float = 0.2, send_error=None, edit_error=None):
+def _subject(
+    *, timeout: float = 0.2, send_error=None, edit_error=None, bash_policy: str = "approve-each"
+):
     subject = TelegramBot.__new__(TelegramBot)
-    subject._config = SimpleNamespace(allowed_user_ids=[7])
+    subject._config = SimpleNamespace(
+        allowed_user_ids=[7],
+        bash_policy=bash_policy,
+        execution_profile="owner-operator",
+        require_allowlist=True,
+    )
     subject._project_chat = FakeProjectChat()
     subject._codex_approval_timeout_seconds = timeout
     subject._codex_approval_max_pending = 4
@@ -98,7 +106,10 @@ async def test_owner_can_resolve_once_with_opaque_bounded_token(
         approval_event.action,
     ):
         assert sensitive not in data
-    assert telegram.sent[0]["text"] == "Codex requests approval to run a command."
+    assert telegram.sent[0]["text"] == (
+        "Codex requests approval to run a command.\n"
+        "Reply with 승인 or 거절, or use the buttons."
+    )
 
     assert await subject._resolve_codex_approval(7, 70, data) is True
     assert await task is expected
@@ -123,6 +134,111 @@ async def test_wrong_owner_chat_unknown_and_stale_do_not_resume(
     subject._project_chat.active.clear()
     assert await subject._resolve_codex_approval(7, 70, data) is True
     assert await task is ApprovalDecision.DENY
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("reply", "expected_result", "expected_decision"),
+    [
+        ("승인.", "allowed", ApprovalDecision.ALLOW),
+        ("거절", "denied", ApprovalDecision.DENY),
+        ("approve", "allowed", ApprovalDecision.ALLOW),
+        ("cancel", "denied", ApprovalDecision.DENY),
+    ],
+)
+async def test_owner_can_resolve_single_pending_with_standalone_text(
+    approval_event: ApprovalRequestEvent,
+    reply: str,
+    expected_result: str,
+    expected_decision: ApprovalDecision,
+) -> None:
+    subject, _ = _subject()
+    subject._project_chat.active.add((7, 70, 3))
+    task = asyncio.create_task(subject._codex_approval_callback(70, 7, approval_event, 3))
+    await _wait_pending(subject)
+
+    assert await subject._resolve_codex_approval_text(7, 70, reply) == expected_result
+    assert await task is expected_decision
+    assert await subject._resolve_codex_approval_text(7, 70, reply) is None
+
+
+@pytest.mark.anyio
+async def test_spoken_approval_rejects_sentences_wrong_scope_and_ambiguity(
+    approval_event: ApprovalRequestEvent,
+) -> None:
+    subject, _ = _subject()
+    subject._project_chat.active.update({(7, 70, 3), (7, 70, 4)})
+    first = asyncio.create_task(subject._codex_approval_callback(70, 7, approval_event, 3))
+    await _wait_pending(subject)
+
+    assert await subject._resolve_codex_approval_text(7, 70, "이건 승인해도 될까") is None
+    assert await subject._resolve_codex_approval_text(7, 70, "응") is None
+    assert await subject._resolve_codex_approval_text(7, 70, "좋아") is None
+    assert await subject._resolve_codex_approval_text(7, 70, "승인?") is None
+    assert await subject._resolve_codex_approval_text(8, 70, "승인") is None
+    assert await subject._resolve_codex_approval_text(7, 71, "승인") is None
+    assert not first.done()
+
+    second_event = ApprovalRequestEvent(
+        "provider-request-second",
+        approval_event.action,
+        approval_event.arguments,
+        approval_event.description,
+    )
+    second = asyncio.create_task(subject._codex_approval_callback(70, 7, second_event, 4))
+    await _wait_pending(subject, 2)
+
+    assert await subject._resolve_codex_approval_text(7, 70, "승인") == "ambiguous"
+    assert not first.done()
+    assert not second.done()
+    assert subject._deny_codex_approvals(7, 70) == 2
+    assert await first is ApprovalDecision.DENY
+    assert await second is ApprovalDecision.DENY
+
+
+@pytest.mark.anyio
+async def test_text_handler_resolves_approval_before_user_task_queue(
+    approval_event: ApprovalRequestEvent,
+) -> None:
+    subject, _ = _subject()
+    subject._project_chat.active.add((7, 70, 3))
+    task = asyncio.create_task(subject._codex_approval_callback(70, 7, approval_event, 3))
+    await _wait_pending(subject)
+
+    message = SimpleNamespace(text="승인", reply_text=AsyncMock())
+    update = SimpleNamespace(
+        message=message,
+        callback_query=None,
+        effective_user=SimpleNamespace(id=7),
+        effective_chat=SimpleNamespace(id=70),
+    )
+    subject._check_access = AsyncMock(return_value=True)
+    subject._session_manager = SimpleNamespace(
+        get_session=AsyncMock(side_effect=AssertionError("approval reply entered session path"))
+    )
+    subject._enqueue_user_task = AsyncMock(
+        side_effect=AssertionError("approval reply entered task queue")
+    )
+
+    await subject._handle_text_message(update, SimpleNamespace())
+
+    assert await task is ApprovalDecision.ALLOW
+    message.reply_text.assert_awaited_once_with("✅ Approved.")
+    subject._enqueue_user_task.assert_not_awaited()
+
+
+@pytest.mark.anyio
+async def test_disabled_policy_denies_without_rendering_ui(
+    approval_event: ApprovalRequestEvent,
+) -> None:
+    subject, telegram = _subject(bash_policy="disabled")
+    subject._project_chat.active.add((7, 70, 1))
+
+    decision = await subject._codex_approval_callback(70, 7, approval_event, 1)
+
+    assert decision is ApprovalDecision.DENY
+    assert telegram.sent == []
+    assert subject._pending_codex_approvals == {}
 
 
 @pytest.mark.anyio

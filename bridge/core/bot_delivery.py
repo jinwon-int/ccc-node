@@ -48,6 +48,16 @@ class BotDeliveryMixin:
         chat = self._require_chat(update)
         conversation_key = self._conversation_key(user_id, chat.id)
         text = message.text
+        approval_result = await self._resolve_codex_approval_text(user_id, chat.id, text)
+        if approval_result is not None:
+            replies = {
+                "allowed": "✅ Approved.",
+                "denied": "❌ Denied.",
+                "expired": "ℹ️ Approval expired; denied.",
+                "ambiguous": "⚠️ Multiple approvals are pending; use the buttons.",
+            }
+            await message.reply_text(replies[approval_result])
+            return
         session = await self._session_manager.get_session(conversation_key)
 
         # Check resume selection (user replies with a number)
@@ -478,6 +488,9 @@ class BotDeliveryMixin:
                         session_id=self._effective_session_id(conversation_key, session),
                         model=session.get("model"),
                         effort=session.get("effort"),
+                        approval_policy=self._codex_approval_policy(),
+                        approvals_reviewer=self._codex_approvals_reviewer(),
+                        sandbox_policy=self._codex_sandbox_policy(),
                         permission_callback=self._permission_callback,
                         approval_callback=self._codex_approval_callback,
                         typing_callback=lambda: app.bot.send_chat_action(

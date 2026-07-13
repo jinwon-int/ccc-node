@@ -175,7 +175,13 @@ class TestPollingWatchdog(unittest.TestCase):
         mock_updater.stop.assert_not_awaited()
 
     def test_watchdog_requests_restart_after_threshold(self):
-        """Watchdog should stop the updater and raise _PollingRestart after prolonged failure."""
+        """Watchdog should stop the updater after prolonged failure and stay alive.
+
+        Stopping the updater is what triggers the supervised transport-only
+        reconnect (issue #411). The watchdog must NOT die in the process: after
+        a transport-only reconnect no full rebuild recreates it, so raising
+        here would leave the reconnected polling transport unmonitored.
+        """
         stop_event = asyncio.Event()
         mock_app = Mock()
         mock_app.bot = Mock()
@@ -198,8 +204,16 @@ class TestPollingWatchdog(unittest.TestCase):
         self.bot._NETWORK_FAILURE_THRESHOLD = 0.02
 
         async def run():
-            with self.assertRaises(_PollingRestart):
-                await self.bot._polling_watchdog(stop_event)
+            task = asyncio.create_task(self.bot._polling_watchdog(stop_event))
+            for _ in range(200):
+                if mock_updater.stop.await_count:
+                    break
+                await asyncio.sleep(0.01)
+            # The watchdog survived its own restart trigger and keeps looping
+            # (the stopped updater makes it skip checks, not exit).
+            self.assertFalse(task.done())
+            stop_event.set()
+            await task
 
         asyncio.run(run())
 

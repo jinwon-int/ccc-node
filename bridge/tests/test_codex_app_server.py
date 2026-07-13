@@ -437,6 +437,9 @@ class CodexAppServerTests(unittest.IsolatedAsyncioTestCase):
                 [{"type": "text", "text": "hello"}],
                 model="o3",
                 effort="high",
+                approval_policy="on-request",
+                approvals_reviewer="auto_review",
+                sandbox_policy={"type": "workspaceWrite", "networkAccess": False},
             ),
             "turn/start",
             {
@@ -444,6 +447,24 @@ class CodexAppServerTests(unittest.IsolatedAsyncioTestCase):
                 "input": [{"type": "text", "text": "hello"}],
                 "model": "o3",
                 "effort": "high",
+                "approvalPolicy": "on-request",
+                "approvalsReviewer": "auto_review",
+                "sandboxPolicy": {"type": "workspaceWrite", "networkAccess": False},
+            },
+        )
+        await assert_call(
+            client.turn_start(
+                "thread-1",
+                [{"type": "text", "text": "full access"}],
+                approval_policy="never",
+                sandbox_policy={"type": "dangerFullAccess"},
+            ),
+            "turn/start",
+            {
+                "threadId": "thread-1",
+                "input": [{"type": "text", "text": "full access"}],
+                "approvalPolicy": "never",
+                "sandboxPolicy": {"type": "dangerFullAccess"},
             },
         )
         await assert_call(
