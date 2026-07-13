@@ -15,6 +15,7 @@ printf '#!/usr/bin/env bash\necho claude "$@"\n' > "$TMP/bin/claude-native"
 printf 'console.log("worker fixture");\n' > "$TMP/worker/dist/worker.js"
 printf 'console.log("bridge fixture");\n' > "$TMP/worker/scripts/claude-a2a-analysis-bridge.mjs"
 printf 'console.log("patch bridge fixture");\n' > "$TMP/worker/scripts/claude-a2a-patch-bridge.mjs"
+printf 'console.log("task handler fixture");\n' > "$TMP/worker/scripts/a2a-task-handler.mjs"
 chmod +x "$TMP/bin/node-native" "$TMP/bin/claude-native"
 
 write_env() {
@@ -61,6 +62,19 @@ ok "valid native worker env passes" '[ "$rc" = 0 ] && grep -q "safe to launch" <
 
 out="$(bash "$TOOL" print-command --env-file "$good" 2>&1)"; rc=$?
 ok "print-command renders native node worker.js" '[ "$rc" = 0 ] && grep -q "$TMP/bin/node-native" <<<"$out" && grep -q "$TMP/worker/dist/worker.js" <<<"$out"'
+
+# The launcher derives the worker.js external-handler wiring (WORKER_HANDLER_*)
+# from OPENCLAW_BIN so newer worker.js builds run the real bridge, not the silent
+# echo builtin. check surfaces it and analysisBridge=enabled.
+out="$(bash "$TOOL" check --env-file "$good" 2>&1)"; rc=$?
+ok "check derives task-handler wiring" '[ "$rc" = 0 ] && grep -q "taskHandler=$TMP/bin/node-native $TMP/worker/scripts/a2a-task-handler.mjs" <<<"$out" && grep -q "analysisBridge=enabled" <<<"$out"'
+
+# An explicit WORKER_HANDLER_COMMAND in the env file wins over the derived value.
+override="$TMP/override.env"
+write_env "$override"
+printf 'WORKER_HANDLER_COMMAND=/custom/node\n' >> "$override"
+out="$(bash "$TOOL" check --env-file "$override" 2>&1)"; rc=$?
+ok "explicit WORKER_HANDLER_COMMAND override respected" '[ "$rc" = 0 ] && grep -q "taskHandler=/custom/node" <<<"$out"'
 
 bad_broker="$TMP/bad-broker.env"
 write_env "$bad_broker"
@@ -181,6 +195,30 @@ printf 'console.log("alt");\n' > "$TMP/worker/alt/worker.js"
 printf 'A2A_WORKER_SCRIPT=%s\n' "$TMP/worker/alt/worker.js" >> "$inside_worker"
 out="$(bash "$TOOL" check --env-file "$inside_worker" 2>&1)"; rc=$?
 ok "worker script override inside the root is accepted" '[ "$rc" = 0 ] && grep -q "safe to launch" <<<"$out"'
+
+# The versioned task handler is mandatory: without it worker.js silently runs its
+# echo builtin, so a missing handler must fail closed at check time. Use a
+# separate worker root that lacks a2a-task-handler.mjs.
+nohandler="$TMP/nohandler.env"
+mkdir -p "$TMP/worker-nh/dist" "$TMP/worker-nh/scripts"
+printf 'console.log("worker fixture");\n' > "$TMP/worker-nh/dist/worker.js"
+printf 'console.log("bridge fixture");\n' > "$TMP/worker-nh/scripts/claude-a2a-analysis-bridge.mjs"
+cat > "$nohandler" <<EOF
+A2A_TERMUX_NATIVE=1
+A2A_NATIVE_NODE_BIN=$TMP/bin/node-native
+A2A_WORKER_ROOT=$TMP/worker-nh
+A2A_CLAUDE_CODE_BIN=$TMP/bin/claude-native
+OPENCLAW_BIN=$TMP/worker-nh/scripts/claude-a2a-analysis-bridge.mjs
+A2A_OPENCLAW_ANALYSIS_BIN=$TMP/worker-nh/scripts/claude-a2a-analysis-bridge.mjs
+BROKER_URL=http://127.0.0.1:18790
+WORKER_MODE=persistent
+WORKER_METADATA_JSON={"runtime":"claude-code","harness":"claude","adapter":"claude-a2a-analysis-bridge","nodeId":"mobile-native"}
+CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+DISABLE_GROWTHBOOK=1
+USE_BUILTIN_RIPGREP=0
+EOF
+out="$(bash "$TOOL" check --env-file "$nohandler" 2>&1)"; rc=$?
+ok "missing task handler fails closed" '[ "$rc" = 2 ] && grep -q "task handler must exist" <<<"$out"'
 
 # A failed exec stays fail-closed (clean error, exit 2) rather than a raw traceback.
 # A directory as the node bin makes execve raise OSError; a forbidden-context name
