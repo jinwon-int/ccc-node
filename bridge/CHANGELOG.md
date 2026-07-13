@@ -19,6 +19,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `approve-each`, and `disabled` policies retain their prior behavior.
 
 ### Added
+- **End-to-end delivery reliability harness (#385).** `tests/test_e2e_delivery.py`
+  boots the real bridge composition — `TelegramBot` → `ProjectChatHandler` with
+  the real reader loop, typing keepalive, session store, task ledger, and
+  dead-session recovery — over a fake Telegram surface and a scripted Claude
+  SDK client (no network, no live provider, no real token). Three round-trips
+  execute for real: a solicited user message delivering its reply to the
+  Telegram outbound exactly once; an unsolicited background wakeup turn with no
+  pending request still delivering exactly once (#364 P1 — the reader used to
+  drop these entirely); and a dead session's persisted terminal task
+  notification delivered by the recovery pass and deduplicated on the next pass
+  (#364 P2 / #372). A negative control re-introduces the pre-#371 reader drop
+  behavior and shows the unsolicited round-trip then fails, proving the
+  positive test is the tripwire for that regression class. Runs
+  deterministically inside the required `bridge-tests` CI gate.
 - **Explicit safe Codex default (#412).** The default `auto-approve` policy now
   sends `approvalPolicy=never`, no reviewer, and a network-off `workspaceWrite`
   sandbox on every Codex turn. New clean Codex deployments therefore no longer
