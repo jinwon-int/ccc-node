@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import platform
 import time
 from dataclasses import asdict, dataclass, field
@@ -70,7 +71,10 @@ def probe_interval(value: Any, default: float = DEFAULT_PROBE_INTERVAL_SECONDS) 
         interval = float(value)
     except (TypeError, ValueError):
         return default
-    if interval <= 0:
+    # NaN passes every comparison guard (all NaN comparisons are False) and
+    # min/max propagate it, so wait_for(timeout=NaN) would still time out
+    # immediately — reject every non-finite value outright (#430 review).
+    if not math.isfinite(interval) or interval <= 0:
         return default
     return min(max(interval, MIN_PROBE_INTERVAL_SECONDS), MAX_PROBE_INTERVAL_SECONDS)
 

@@ -107,6 +107,15 @@ class ProbeIntervalTests(unittest.TestCase):
             with self.subTest(value=bad):
                 self.assertEqual(probe_interval(bad), DEFAULT_PROBE_INTERVAL_SECONDS)
 
+    def test_non_finite_intervals_never_reach_the_loop(self):
+        """#430 review round 2: NaN passes every comparison guard (all NaN
+        comparisons are False) and min/max propagate it, so
+        wait_for(timeout=NaN) times out immediately — Pydantic accepts
+        CCC_HEALTH_ALERTS_INTERVAL_SECONDS=nan for float fields."""
+        for bad in ("nan", float("nan"), "inf", float("inf"), "-inf", float("-inf")):
+            with self.subTest(value=bad):
+                self.assertEqual(probe_interval(bad), DEFAULT_PROBE_INTERVAL_SECONDS)
+
     def test_valid_intervals_are_clamped_to_sane_bounds(self):
         self.assertEqual(probe_interval(60), 60.0)
         self.assertEqual(probe_interval(1), MIN_PROBE_INTERVAL_SECONDS)
