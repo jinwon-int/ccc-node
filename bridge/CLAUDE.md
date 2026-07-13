@@ -112,7 +112,7 @@ utils/chat_logger.py Per-session debug chat logging
 | `ALLOWED_USER_IDS` | No | Comma-separated user IDs; `owner-operator` requires exactly one |
 | `CCC_REQUIRE_ALLOWLIST` | No | Fail-closed allowlist guard (default: true; required for `owner-operator`) |
 | `CCC_BRIDGE_EXECUTION_PROFILE` | No | `strict-project` (default), `owner-operator`, or `disabled` execution boundary |
-| `CCC_BRIDGE_BASH_POLICY` | No | `auto-approve` (default), `auto-review`, `approve-each`, or `disabled`; Codex auto-approve is explicit `never + workspaceWrite(network off)` |
+| `CCC_BRIDGE_BASH_POLICY` | No | `auto-approve` (default), `auto-review`, `approve-each`, or `disabled`; Codex auto-approve is unrestricted `never + dangerFullAccess` |
 | `CLAUDE_CLI_PATH` | No | Absolute path to Claude CLI binary |
 | `CLAUDE_PROCESS_TIMEOUT` | No | SDK timeout in seconds (default: 600) |
 | `PROXY_URL` | No | HTTP proxy; start.sh auto-configures env vars |
