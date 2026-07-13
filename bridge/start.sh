@@ -25,7 +25,19 @@ deps_install_mode() {
     # dependency. CCC_DEPS_UNLOCKED=1 is the documented escape hatch for hosts
     # where a locked artifact cannot build; it restores the legacy
     # lower-bound requirements.txt flow and therefore loses reproducibility.
-    if [ "${CCC_DEPS_UNLOCKED:-0}" = "1" ]; then
+    #
+    # Resolution order matches the rest of the bridge config: an explicitly
+    # set process environment value wins, then the project .env
+    # ($PROJECT_ROOT/.telegram_bot/.env), then the bot source dir .env —
+    # merge_env_files() never exports project .env keys into the shell, so
+    # this must go through read_env_with_fallback. Only the literal "1"
+    # selects the unlocked flow; anything else stays locked (fail closed to
+    # the reproducible default).
+    local configured="${CCC_DEPS_UNLOCKED:-}"
+    if [ -z "$configured" ]; then
+        configured="$(read_env_with_fallback "CCC_DEPS_UNLOCKED")"
+    fi
+    if [ "$configured" = "1" ]; then
         echo "unlocked"
     else
         echo "locked"

@@ -94,8 +94,11 @@ def test_start_sh_installs_hash_locked_by_default():
     assert '--require-hashes -r "$LOCK_FILE"' in script
     # The editable first-party install must not pull unhashed transitives.
     assert '--no-deps -e "$SCRIPT_DIR"' in script
-    # The escape hatch exists, is explicit, and defaults to locked.
-    assert 'CCC_DEPS_UNLOCKED:-0' in script
+    # The escape hatch exists, is explicit, and defaults to locked. It must
+    # honor the project/global .env path, not just the process environment
+    # (PR #431 review finding).
+    assert "CCC_DEPS_UNLOCKED:-" in script
+    assert 'read_env_with_fallback "CCC_DEPS_UNLOCKED"' in script
 
 
 def test_start_sh_locked_path_has_no_unpinned_pip_upgrade():

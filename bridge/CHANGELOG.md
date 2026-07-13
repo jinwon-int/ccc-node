@@ -28,7 +28,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with `--no-deps`, so clean installs at the same checkout resolve identical
   versions/hashes and unhashed transitive dependencies are rejected; the
   legacy lower-bound `requirements.txt` flow remains available behind the
-  documented `CCC_DEPS_UNLOCKED=1` escape hatch (the locked path also drops
+  documented `CCC_DEPS_UNLOCKED=1` escape hatch — honored from the process
+  environment or, like other bridge settings, from the project/global `.env`
+  (the locked path also drops
   the previous unpinned `pip install --upgrade pip`, removing an
   install-time nondeterminism source). Both locks are regenerated together by
   the new `scripts/ccc-deps-lock.sh`, which records the Termux/Linux/macOS
