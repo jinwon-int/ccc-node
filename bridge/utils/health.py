@@ -213,6 +213,23 @@ class RuntimeHealthReporter:
             ) + max(0, int(count))
             self._write_health_locked()
 
+    def record_health_signals(
+        self, signals: dict[str, Any], alerts_fired: int = 0
+    ) -> None:
+        """Publish one health-probe tick's structured signals (#389).
+
+        ``signals`` carries only counts and ages — the probe never includes
+        tokens, prompts, or filesystem paths.
+        """
+        with self._lock:
+            section = self._state.setdefault("signals", {})
+            section.update(signals)
+            section["alerts_fired"] = int(section.get("alerts_fired", 0)) + max(
+                0, int(alerts_fired)
+            )
+            section["updated_at"] = _utc_now_iso()
+            self._write_health_locked()
+
     def record_stalled_request(self, count: int = 1) -> None:
         """Count requests released by the terminal-event stall guard (#411 C)."""
         with self._lock:

@@ -1,0 +1,264 @@
+"""Detection-only runtime health probe and threshold alerts (issue #389).
+
+All alert paths are exercised with synthetic states; nothing here contacts
+Telegram or any provider — real delivery stays behind the push notifier's
+``CCC_PUSH_ENABLED`` opt-in.
+"""
+
+import asyncio
+import json
+import sys
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from telegram_bot.utils.health_alerts import (
+    Alert,
+    AlertGate,
+    AlertThresholds,
+    HealthProbe,
+    HealthSignals,
+    count_spool_backlog,
+    evaluate_alerts,
+    write_alert_spool,
+)
+
+
+class EvaluateAlertsTests(unittest.TestCase):
+    def test_healthy_signals_fire_nothing(self):
+        signals = HealthSignals(
+            active_streams=2,
+            active_requests=1,
+            oldest_request_age_seconds=100.0,
+            request_lifetime_seconds=600.0,
+            pending_notifications=2,
+        )
+        self.assertEqual(evaluate_alerts(signals, AlertThresholds()), [])
+
+    def test_each_signal_crossing_fires_its_alert(self):
+        cases = {
+            "dead_session_stream": HealthSignals(dead_streams=1),
+            "request_outlived_lifetime": HealthSignals(
+                oldest_request_age_seconds=601.0, request_lifetime_seconds=600.0
+            ),
+            "notification_backlog": HealthSignals(pending_notifications=10),
+            "notifications_dropped": HealthSignals(dropped_notifications=1),
+            "orphan_claude_children": HealthSignals(orphan_children=1),
+        }
+        for code, signals in cases.items():
+            with self.subTest(code=code):
+                fired = evaluate_alerts(signals, AlertThresholds())
+                self.assertEqual([a.code for a in fired], [code])
+
+    def test_heartbeat_age_threshold_tracks_request_lifetime(self):
+        """#307 alignment: the alert boundary is a multiple of the lifetime."""
+        thresholds = AlertThresholds(heartbeat_age_factor=2.0)
+        below = HealthSignals(
+            oldest_request_age_seconds=1199.0, request_lifetime_seconds=600.0
+        )
+        at = HealthSignals(
+            oldest_request_age_seconds=1200.0, request_lifetime_seconds=600.0
+        )
+        self.assertEqual(evaluate_alerts(below, thresholds), [])
+        self.assertEqual(
+            [a.code for a in evaluate_alerts(at, thresholds)],
+            ["request_outlived_lifetime"],
+        )
+        # Factor 0 disables the check; unknown lifetime never alerts.
+        self.assertEqual(
+            evaluate_alerts(at, AlertThresholds(heartbeat_age_factor=0.0)), []
+        )
+        self.assertEqual(
+            evaluate_alerts(
+                HealthSignals(oldest_request_age_seconds=9999.0), AlertThresholds()
+            ),
+            [],
+        )
+
+    def test_alert_messages_are_redaction_safe(self):
+        signals = HealthSignals(
+            dead_streams=3,
+            oldest_request_age_seconds=1000.0,
+            request_lifetime_seconds=600.0,
+            pending_notifications=25,
+            dropped_notifications=4,
+            orphan_children=2,
+        )
+        fired = evaluate_alerts(signals, AlertThresholds())
+        self.assertEqual(len(fired), 5)
+        for alert in fired:
+            # Constant templates + counts only: no filesystem paths, no secrets.
+            self.assertNotRegex(alert.message, r"[/\\]")
+            self.assertNotIn("token", alert.message.lower())
+            self.assertNotIn("secret", alert.message.lower())
+
+
+class AlertGateTests(unittest.TestCase):
+    def test_persistent_condition_alerts_once_per_cooldown(self):
+        gate = AlertGate(cooldown_seconds=100.0)
+        alert = Alert(code="dead_session_stream", message="m")
+
+        self.assertEqual(gate.admit([alert], now=0.0), [alert])
+        self.assertEqual(gate.admit([alert], now=50.0), [])
+        self.assertEqual(gate.admit([alert], now=100.0), [alert])
+
+    def test_cleared_condition_rearms_immediately(self):
+        gate = AlertGate(cooldown_seconds=1000.0)
+        alert = Alert(code="orphan_claude_children", message="m")
+
+        self.assertEqual(gate.admit([alert], now=0.0), [alert])
+        self.assertEqual(gate.admit([], now=1.0), [])  # condition cleared
+        self.assertEqual(gate.admit([alert], now=2.0), [alert])
+
+
+class SpoolTests(unittest.TestCase):
+    def test_alert_spools_as_push_notifier_record(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            spool = Path(tmp) / "spool"
+            alert = Alert(code="notification_backlog", message="12 queued")
+
+            self.assertTrue(write_alert_spool(spool, alert, node="test-node"))
+
+            files = list(spool.glob("*.json"))
+            self.assertEqual(len(files), 1)
+            record = json.loads(files[0].read_text(encoding="utf-8"))
+            self.assertEqual(record["event"], "health-alert")
+            self.assertEqual(record["node"], "test-node")
+            self.assertEqual(record["text"], "12 queued")
+            self.assertEqual(record["dedup"], "health-alert:notification_backlog")
+            self.assertEqual(count_spool_backlog(spool), 1)
+
+
+class HealthProbeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_collects_all_four_signal_groups_from_synthetic_state(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            spool = Path(tmp) / "spool"
+            spool.mkdir()
+            (spool / "pending-1.json").write_text("{}", encoding="utf-8")
+            (spool / "pending-2.json").write_text("{}", encoding="utf-8")
+
+            done_task = asyncio.create_task(asyncio.sleep(0))
+            await done_task
+            live_task = asyncio.create_task(asyncio.sleep(60))
+            self.addCleanup(live_task.cancel)
+
+            handler = SimpleNamespace(
+                _streams={
+                    ("u1", 1): SimpleNamespace(reader_task=done_task),  # dead
+                    ("u2", 2): SimpleNamespace(reader_task=live_task),  # alive
+                    ("u3", 3): SimpleNamespace(reader_task=None),  # starting up
+                },
+                workload_snapshot=lambda now: (2, 750.0),
+                _process_timeout_seconds=600.0,
+            )
+            probe = HealthProbe(
+                project_chat=handler,
+                spool_dir=spool,
+                orphan_probe=lambda: [111, 222],
+                health_snapshot=lambda: {"recovery": {"quarantined_transcripts": 3}},
+            )
+
+            signals = probe.collect(now=1000.0)
+
+            self.assertEqual(signals.dead_streams, 1)
+            self.assertEqual(signals.active_streams, 2)
+            self.assertEqual(signals.active_requests, 2)
+            self.assertEqual(signals.oldest_request_age_seconds, 750.0)
+            self.assertEqual(signals.request_lifetime_seconds, 600.0)
+            self.assertEqual(signals.pending_notifications, 2)
+            self.assertEqual(signals.dropped_notifications, 3)
+            self.assertEqual(signals.orphan_children, 2)
+
+            fired = evaluate_alerts(signals, AlertThresholds())
+            self.assertEqual(
+                sorted(a.code for a in fired),
+                [
+                    "dead_session_stream",
+                    "notifications_dropped",
+                    "orphan_claude_children",
+                    "request_outlived_lifetime",
+                ],
+            )
+
+    async def test_probe_is_fail_open_on_broken_collaborators(self):
+        def broken_snapshot():
+            raise RuntimeError("no health file")
+
+        def broken_orphans():
+            raise RuntimeError("no /proc")
+
+        handler = SimpleNamespace(_streams=None)
+        probe = HealthProbe(
+            project_chat=handler,
+            spool_dir=Path("/nonexistent/spool"),
+            orphan_probe=broken_orphans,
+            health_snapshot=broken_snapshot,
+        )
+
+        signals = probe.collect(now=0.0)
+
+        self.assertEqual(signals, HealthSignals())
+        self.assertEqual(evaluate_alerts(signals, AlertThresholds()), [])
+
+    async def test_signals_export_shape_for_health_json(self):
+        signals = HealthSignals(
+            active_streams=1,
+            dead_streams=0,
+            active_requests=1,
+            oldest_request_age_seconds=12.7,
+            request_lifetime_seconds=600.0,
+            pending_notifications=0,
+            dropped_notifications=0,
+            orphan_children=0,
+        )
+        data = signals.as_dict()
+        self.assertEqual(data["oldest_request_age_seconds"], 12)
+        self.assertEqual(data["request_lifetime_seconds"], 600)
+        self.assertEqual(
+            sorted(data),
+            [
+                "active_requests",
+                "active_streams",
+                "dead_streams",
+                "dropped_notifications",
+                "oldest_request_age_seconds",
+                "orphan_children",
+                "pending_notifications",
+                "request_lifetime_seconds",
+            ],
+        )
+
+
+class HealthReporterSignalsTests(unittest.TestCase):
+    def test_reporter_publishes_signals_section(self):
+        import importlib
+        import tempfile
+
+        sys.modules.pop("telegram_bot.utils.health", None)
+        health_module = importlib.import_module("telegram_bot.utils.health")
+        with tempfile.TemporaryDirectory() as tmp:
+            reporter = health_module.RuntimeHealthReporter(Path(tmp) / ".telegram_bot")
+            signals = HealthSignals(dead_streams=1, orphan_children=2).as_dict()
+
+            reporter.record_health_signals(signals, alerts_fired=2)
+            reporter.record_health_signals(
+                HealthSignals(dead_streams=0, orphan_children=0).as_dict(),
+                alerts_fired=0,
+            )
+
+            snapshot = reporter.snapshot()["signals"]
+            self.assertEqual(snapshot["dead_streams"], 0)
+            self.assertEqual(snapshot["orphan_children"], 0)
+            self.assertEqual(snapshot["alerts_fired"], 2)  # cumulative
+            on_disk = json.loads(reporter.health_file.read_text(encoding="utf-8"))
+            self.assertIn("signals", on_disk)
+
+
+if __name__ == "__main__":
+    unittest.main()

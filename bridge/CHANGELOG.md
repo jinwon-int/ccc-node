@@ -19,6 +19,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `approve-each`, and `disabled` policies retain their prior behavior.
 
 ### Added
+- **Runtime health probe + threshold alerts, detection-only (#389).** A new
+  periodic lifecycle task exports four structured signals to
+  `health.json → signals` every `CCC_HEALTH_ALERTS_INTERVAL_SECONDS` (60):
+  session liveness (registered streams whose reader task died), heartbeat age
+  vs request lifetime (oldest in-flight request compared to
+  `CLAUDE_PROCESS_TIMEOUT` — the #307 "outlived its own lifetime" class),
+  pending/dropped notifications (push-spool backlog + cumulative quarantined
+  transcripts from #411 B), and orphan node-claude children (read-only #303
+  probe). Configurable thresholds fire redaction-safe alerts (constant
+  templates + counts only — never tokens, prompts, or paths) that are logged,
+  counted in `health.json`, and queued through the owner-only push-notifier
+  spool with per-code cooldown — so a real Telegram send additionally requires
+  the existing `CCC_PUSH_ENABLED` opt-in and inherits its dedup and rate
+  limits. Detection-only by design: no restart, reap, or any remediation.
+  Thresholds and their rationale are documented in `.env.example`.
 - **End-to-end delivery reliability harness (#385).** `tests/test_e2e_delivery.py`
   boots the real bridge composition — `TelegramBot` → `ProjectChatHandler` with
   the real reader loop, typing keepalive, session store, task ledger, and
