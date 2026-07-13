@@ -243,17 +243,20 @@ class DeadSessionScannerTests(unittest.IsolatedAsyncioTestCase):
 class TranscriptQuarantineTests(unittest.IsolatedAsyncioTestCase):
     """Rejected transcripts are quarantined instead of rescanned forever (#411 B)."""
 
-    SECRET = "SECRET_TOKEN_MARKER_XYZ"
+    # Redaction canary: stands in for arbitrary transcript content (which may
+    # contain prompts or credentials in production) and must never leak into
+    # quarantine notices or records.
+    CANARY = "REDACTION_CANARY_MARKER_XYZ"
 
     async def asyncSetUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
         self.session_id = "session-1"
         self.path = self.root / f"{self.session_id}.jsonl"
-        # Rejects with "queue row session id does not match owner"; the secret
-        # marker inside the row must never leak into notices or records.
+        # Rejects with "queue row session id does not match owner"; the canary
+        # inside the row must never leak into notices or records.
         self.path.write_text(
-            _queue("enqueue", session_id="foreign", content=self.SECRET),
+            _queue("enqueue", session_id="foreign", content=self.CANARY),
             encoding="utf-8",
         )
         self.sessions = _SessionManager(
@@ -316,8 +319,8 @@ class TranscriptQuarantineTests(unittest.IsolatedAsyncioTestCase):
 
         text = self.bot.send_message.await_args.kwargs["text"]
         record = json.dumps(self.sessions.sessions["7:70"][QUARANTINE_KEY])
-        self.assertNotIn(self.SECRET, text)
-        self.assertNotIn(self.SECRET, record)
+        self.assertNotIn(self.CANARY, text)
+        self.assertNotIn(self.CANARY, record)
         self.assertNotIn(str(self.root), text)
 
     async def test_quarantine_survives_restart(self):
