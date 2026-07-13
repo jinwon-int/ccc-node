@@ -56,7 +56,7 @@ def _process_timeout() -> int:
 
 
 class ProjectChatProcessMixin:
-    async def process_message(
+    async def process_message(  # noqa: C901 -- #348 baseline hotspot
         self,
         user_message: str,
         user_id: int,
@@ -317,7 +317,7 @@ class ProjectChatProcessMixin:
         except Exception:
             logger.exception("Failed to cancel agent stream while %s", context)
 
-    async def _process_agent_message(
+    async def _process_agent_message(  # noqa: C901 -- #348 baseline hotspot
         self,
         *,
         user_message: str,

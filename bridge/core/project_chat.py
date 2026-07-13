@@ -225,7 +225,7 @@ class ProjectChatHandler(
             self._conversation_locks[key] = lock
         return lock
 
-    async def _create_user_stream(
+    async def _create_user_stream(  # noqa: C901 -- #348 baseline hotspot
         self,
         user_id: int,
         model: Optional[str],
@@ -381,7 +381,7 @@ class ProjectChatHandler(
         state.typing_task = asyncio.create_task(self._typing_keepalive_loop(user_id, state))
         return state
 
-    async def _disconnect_stream_state(
+    async def _disconnect_stream_state(  # noqa: C901 -- #348 baseline hotspot
         self, key: Any, state: _UserStreamState, cancel_message: Optional[str] = None
     ) -> bool:
         if isinstance(key, tuple):

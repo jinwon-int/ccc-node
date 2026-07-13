@@ -260,7 +260,7 @@ class StreamingMessageHandler:
         logger.debug(f"Finalized draft {draft.message_id} via entities")
         return True
 
-    async def finalize_draft(self, draft: DraftState) -> bool:
+    async def finalize_draft(self, draft: DraftState) -> bool:  # noqa: C901 -- #348 baseline hotspot
         """Convert draft to a regular message, rendering Markdown -> MarkdownV2.
 
         Live draft updates stay plain text (cheap, no parse risk); on finalize we

@@ -31,6 +31,14 @@ STALE_MESSAGE_SECONDS = 20 * 60  # 20 minutes
 
 
 class BotVoiceMixin:
+    # Lazily constructed voice collaborators (initialized to None by the
+    # composing TelegramBot); annotated here so mypy can type the lazy-init
+    # getters below.
+    _whisper_transcriber: Optional[WhisperTranscriber]
+    _volcengine_transcriber: Optional[VolcengineFileFastTranscriber]
+    _volcengine_tos_uploader: Optional[VolcengineTOSUploader]
+    _tts_synthesizer: Optional[MacOSTtsSynthesizer]
+
     def _voice_config(self):
         return self._config
 
@@ -503,7 +511,7 @@ class BotVoiceMixin:
 
         await self._enqueue_user_task(conversation_key, run_task, on_overflow)
 
-    async def _handle_voice_message(
+    async def _handle_voice_message(  # noqa: C901 -- #348 baseline hotspot
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ):
         del context
@@ -519,7 +527,7 @@ class BotVoiceMixin:
         voice = message.voice
         log_debug(user_id, "voice", f"voice:{voice.file_id} duration={voice.duration}")
 
-        async def run_task():
+        async def run_task():  # noqa: C901 -- #348 baseline hotspot
             task = asyncio.current_task()
             if task is not None:
                 self._track_voice_task(conversation_key, task)

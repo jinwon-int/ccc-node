@@ -203,7 +203,7 @@ def derive_worker_handler_env(
     return {key: value for key, value in derived.items() if key not in env}
 
 
-def validate_env(env: dict[str, str]) -> tuple[Path, list[str], dict[str, object], dict[str, str]]:
+def validate_env(env: dict[str, str]) -> tuple[Path, list[str], dict[str, object], dict[str, str]]:  # noqa: C901 -- #348 baseline hotspot
     require_keys(env)
     if env["A2A_TERMUX_NATIVE"] != "1":
         raise ConfigError("A2A_TERMUX_NATIVE must be 1 so proot/systemd configs fail closed")

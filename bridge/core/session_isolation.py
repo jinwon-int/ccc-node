@@ -60,7 +60,7 @@ def apply_subprocess_session_isolation() -> bool:
 
     open_process._ccc_session_isolated = True  # type: ignore[attr-defined]
     open_process._ccc_original = original  # type: ignore[attr-defined]
-    anyio.open_process = open_process  # type: ignore[assignment]
+    anyio.open_process = open_process
     logger.info(
         "Applied subprocess session isolation "
         "(child processes spawned with start_new_session=True)"

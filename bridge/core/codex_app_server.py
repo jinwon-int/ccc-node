@@ -485,7 +485,7 @@ class CodexAppServerClient:
             self._record_connection_error(error)
             raise error from exc
 
-    async def _read_stdout(self) -> None:
+    async def _read_stdout(self) -> None:  # noqa: C901 -- #348 baseline hotspot
         reader = cast(AsyncLineReader, self._reader)
         try:
             while line := await reader.readline():

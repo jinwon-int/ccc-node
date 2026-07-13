@@ -403,7 +403,7 @@ class TelegramBot(
 
 
 
-    async def _process_user_message_text(
+    async def _process_user_message_text(  # noqa: C901 -- #348 baseline hotspot
         self,
         update: Update,
         user_id: int,

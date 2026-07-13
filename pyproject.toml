@@ -3,12 +3,19 @@ line-length = 100
 target-version = "py311"
 
 [tool.ruff.lint]
-select = ["E", "F", "W"]
+select = ["E", "F", "W", "C90"]
 # Keep the first CI gate focused on pycodestyle/pyflakes correctness. Import
 # sorting, pyupgrade rewrites, bugbear, simplify, and broad line wrapping are
 # intentionally deferred so this PR does not create repo-wide churn before the
 # bridge refactor/packaging work.
 ignore = ["E501"]
+
+[tool.ruff.lint.mccabe]
+# Complexity regression gate (issue #348): new functions above CC 15 fail CI.
+# Pre-existing hotspots carry an explicit, per-function `# noqa: C901`
+# baseline marker so the exception list stays review-visible in the diff that
+# touches it; do not add new markers without refactoring being infeasible.
+max-complexity = 15
 
 [tool.ruff.lint.per-file-ignores]
 # These files deliberately patch sys.modules/sys.path or bootstrap the script
@@ -25,15 +32,26 @@ ignore_missing_imports = true
 mypy_path = "bridge"
 explicit_package_bases = true
 files = [
-  "bridge/core/agent_runtime.py",
-  "bridge/core/bot_approvals.py",
-  "bridge/core/codex_app_server.py",
-  "bridge/core/codex_runtime.py",
-  "bridge/core/paths.py",
-  "bridge/core/push_notifier.py",
-  "bridge/core/task_queue.py",
+  "bridge/core",
   "bridge/tests/test_agent_runtime_contract.py",
   "bridge/tests/test_codex_app_server.py",
   "bridge/tests/test_codex_runtime.py",
   "scripts/agent_cron_lib.py",
 ]
+
+# Baseline exception (issue #348): the TelegramBot mixin modules reference
+# attributes provided by the composing class, which mypy cannot see until the
+# typed-composition/AppContext refactor lands. Only attr-defined is disabled,
+# only for these modules, so every other error class still gates them and new
+# modules get full checking. Any change to this list is review-visible here.
+[[tool.mypy.overrides]]
+module = [
+  "core.bot_access",
+  "core.bot_commands",
+  "core.bot_delivery",
+  "core.bot_lifecycle",
+  "core.bot_status",
+  "core.bot_voice",
+  "core.project_chat_history",
+]
+disable_error_code = ["attr-defined"]
