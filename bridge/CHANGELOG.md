@@ -91,6 +91,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fail closed. Linux/WSL2 requires `bubblewrap` and `socat`.
 
 ### Fixed
+- **Requests whose terminal event never arrives are released within a bounded
+  grace instead of blocking the conversation for hours (#411, part C).** When
+  the agent produced answer text but the terminal event (Claude
+  `ResultMessage` / provider completion) vanished, the request previously
+  stayed `working` until the full process timeout (default 21600s), and
+  same-conversation serialization blocked every follow-up message with it
+  (observed live: a 1,866-char answer written to the transcript, never
+  delivered, FIFO stuck for 26+ minutes while all health probes read
+  healthy). Both provider paths now share one lifecycle invariant, tuned by
+  `CCC_TERMINAL_STALL_SECONDS` (default 300, 0 disables): once answer text is
+  the latest meaningful activity — no tool running, no approval pending — and
+  the stream stays silent for the grace period, the buffered answer is
+  delivered exactly once with an explicit stall notice, the turn is
+  interrupted, the task-ledger record terminalizes, and the conversation FIFO
+  releases so queued messages proceed. Exactly-once is structural: the Claude
+  path tears down the dead stream and swallows at most one late
+  `ResultMessage` racing the teardown; the provider-neutral path closes the
+  abandoned event iterator so a late completion has no consumer. Long tool
+  runs and input-required approval waits are exempt (their silence is
+  legitimate), and a fresh stream event restarts the countdown. Released
+  requests are counted in `health.json → requests.stalled`.
 - **Rejected dead-session transcripts are quarantined instead of rescanned
   forever (#411, part B).** When dead-session recovery rejects a transcript as
   unsafe to replay (`TranscriptRejected`), the bridge previously re-parsed and

@@ -67,6 +67,9 @@ class RuntimeHealthReporter:
             "recovery": {
                 "quarantined_transcripts": 0,
             },
+            "requests": {
+                "stalled": 0,
+            },
         }
 
     @property
@@ -208,6 +211,13 @@ class RuntimeHealthReporter:
             transport["cancelled_by_transport"] = int(
                 transport.get("cancelled_by_transport", 0)
             ) + max(0, int(count))
+            self._write_health_locked()
+
+    def record_stalled_request(self, count: int = 1) -> None:
+        """Count requests released by the terminal-event stall guard (#411 C)."""
+        with self._lock:
+            requests = self._state.setdefault("requests", {"stalled": 0})
+            requests["stalled"] = int(requests.get("stalled", 0)) + max(0, int(count))
             self._write_health_locked()
 
     def record_transcript_quarantined(self, count: int = 1) -> None:

@@ -45,6 +45,18 @@ class ProjectChatReaderMixin:
         StreamEvent partials are intentionally ignored because there is no live
         Telegram draft associated with an unsolicited notification.
         """
+        if isinstance(msg, ResultMessage) and state.stall_swallow_result:
+            # A terminal-event stall already delivered this turn's buffered
+            # text and the stream is being torn down — swallow the late
+            # terminal frame so the answer is not delivered twice (#411 C).
+            state.stall_swallow_result = False
+            logger.warning(
+                "Swallowed late ResultMessage after terminal-event stall release: "
+                "user=%s session=%s",
+                user_id,
+                msg.session_id,
+            )
+            return
         if isinstance(msg, StreamEvent):
             # The first token delta establishes turn ownership even though
             # unsolicited drafts are intentionally not streamed to Telegram.
@@ -156,6 +168,7 @@ class ProjectChatReaderMixin:
                     for block in msg.content:
                         if isinstance(block, TextBlock):
                             logger.debug(f"TextBlock: {len(block.text)} chars")
+                            req.last_text_at = now
                             req.last_assistant_texts.append(block.text)
                             # Update the streaming draft from the complete block
                             # ONLY when partial deltas didn't already build it —
@@ -174,6 +187,7 @@ class ProjectChatReaderMixin:
                                 print(f"\033[36m[Claude]\033[0m {block.text[:200]}")
                         elif isinstance(block, ToolUseBlock):
                             logger.debug(f"ToolUseBlock: {block.name}")
+                            req.last_tool_at = now
                             req.current_tool_label = tool_label(block.name, block.input)
                             if req.streaming_handler:
                                 try:

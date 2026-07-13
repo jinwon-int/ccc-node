@@ -23,8 +23,11 @@ from claude_agent_sdk import (
 )
 
 from telegram_bot.utils.config import config
+from telegram_bot.utils.chat_logger import log_chat
+from telegram_bot.utils.health import health_reporter
 from telegram_bot.core.task_ledger import (
     CANCELED as TASK_CANCELED,
+    COMPLETED as TASK_COMPLETED,
     INPUT_REQUIRED as TASK_INPUT_REQUIRED,
     WORKING as TASK_WORKING,
     TaskLedger,
@@ -72,6 +75,7 @@ BASH_POLICY = "auto-approve"
 from telegram_bot.core.sdk_text import (  # noqa: E402,F401
     RESTART_INTERRUPT_NOTICE,
     TASK_TERMINATED_NOTICE,
+    TERMINAL_STALL_NOTICE,
     CANCEL_REASON_WINDOW_S,
     describe_cancel_reason,
     _is_shutdown_signal_error,
@@ -724,6 +728,81 @@ class ProjectChatHandler(
             return False
         return True
 
+    def _terminal_stall_eligible(self, req: _PendingRequest, now: float) -> bool:
+        """True when answer text is the latest activity and the stream went silent.
+
+        Text after every tool start means the turn most likely finished and only
+        its terminal event vanished (#411 C). A running tool or a pending
+        permission keeps the request out of scope — long tool silences are
+        normal and input-required states belong to the user.
+        """
+        grace = float(getattr(config, "terminal_stall_seconds", 0.0) or 0.0)
+        if grace <= 0 or req.future.done():
+            return False
+        if not req.last_assistant_texts or req.last_text_at <= 0:
+            return False
+        if req.last_tool_at >= req.last_text_at or req.awaiting_permission:
+            return False
+        last_event = req.last_event_at or req.started_at
+        return last_event > 0 and now - last_event >= grace
+
+    async def _release_stalled_request(
+        self, user_id: int, state: _UserStreamState, req: _PendingRequest
+    ) -> None:
+        """Terminalize a request whose terminal event never arrived (#411 C).
+
+        Delivers the buffered assistant text exactly once with an explicit
+        stall notice, finishes the ledger record, resolves the future (which
+        releases the conversation FIFO for queued messages), and tears down the
+        silent stream. ``stall_swallow_result`` makes the reader swallow a late
+        ResultMessage that races the teardown, so the answer cannot be
+        delivered twice through the unsolicited route.
+        """
+        if state.pending and state.pending[0] is req:
+            state.pending.popleft()
+        else:
+            return
+        state.stall_swallow_result = True
+        if req.streaming_handler:
+            try:
+                await req.streaming_handler.finalize_all()
+            except Exception as exc:
+                logger.error(f"Streaming finalization on stall release failed: {exc}")
+        cleaned = await self._cleanup_heartbeat(req)
+        self._ledger_finish(req, TASK_COMPLETED, cleanup_done=cleaned)
+        content = self._clean_response("\n".join(req.last_assistant_texts)) or "(No response)"
+        logger.warning(
+            "Terminal-event stall released request for user %s chat %s after "
+            "silence following final text — delivering buffered answer",
+            req.user_id,
+            req.chat_id,
+        )
+        try:
+            health_reporter.record_stalled_request()
+        except Exception:
+            pass
+        log_chat(
+            req.user_id,
+            state.last_session_id or req.requested_session_id,
+            "assistant",
+            content,
+            model=req.model,
+        )
+        if not req.future.done():
+            req.future.set_result(
+                ChatResponse(
+                    content=f"{content}\n\n{TERMINAL_STALL_NOTICE}",
+                    success=True,
+                    session_id=state.last_session_id,
+                    streamed=bool(req.streaming_handler and req.streaming_handler.drafts),
+                )
+            )
+        # Tear down the dead stream from outside this loop task: the disconnect
+        # cancels state.typing_task, which is the very task running this code.
+        asyncio.get_event_loop().create_task(
+            self._disconnect_user_stream(user_id, req.chat_id)
+        )
+
     async def _typing_keepalive_loop(self, user_id: int, state: _UserStreamState) -> None:
         """Background task that sends typing actions at regular intervals.
 
@@ -745,6 +824,9 @@ class ProjectChatHandler(
                 if req.future.done():
                     continue
                 now = asyncio.get_event_loop().time()
+                if self._terminal_stall_eligible(req, now):
+                    await self._release_stalled_request(user_id, state, req)
+                    continue
                 if not self._should_refresh_typing(req, now):
                     await self._maybe_update_heartbeat(req, now)
                     continue

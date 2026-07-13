@@ -44,6 +44,15 @@ RESTART_INTERRUPT_NOTICE = (
     "Please resend your message."
 )
 
+# Appended when a turn produced answer text but its terminal event never
+# arrived and the bounded stall grace released it (#411 C). The buffered text
+# above this notice is delivered exactly once; the turn itself is interrupted.
+TERMINAL_STALL_NOTICE = (
+    "⚠️ The agent stopped responding after producing this answer (no completion "
+    "signal arrived). The turn was closed automatically — reply to continue, and "
+    "re-send your request if anything seems missing."
+)
+
 # Opaque notice used when a task is cancelled with no recorded cause (e.g. an
 # explicit /stop). Kept as a shared constant so the disconnect path can detect
 # "this is the default" and upgrade it to a specific reason when one is known.
