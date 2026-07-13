@@ -9,7 +9,7 @@ approval from execution**: gated actions do not run without an explicit operator
 |---|---|---|---|
 | `autonomous` | Proceeds silently | — (not matched by guard) | read/search, normal `git`/`gh`/`npm`, file edits in repo |
 | `operator_notify` | Proceeds; recorded | `audit.sh` (PostToolUse) | any mutating tool call (commit, push to a branch, merge) — auditable after the fact |
-| `operator_approval_gated` | **DENIED** until `CCC_ALLOW_GATED=1` | `guard.sh` | DB destructive/migrate/replay, repo visibility, secret read/exfil, secret-file Read/Edit/Write, catastrophic `rm` (service control is no longer gated — see note) |
+| `operator_approval_gated` | **DENIED** until `CCC_ALLOW_GATED=1` | `guard.sh` | DB destructive/migrate/replay, repo visibility, secret exfil, catastrophic `rm`, non-fleet service lifecycle, host lifecycle (fleet-service lifecycle is relaxed — see note) |
 | `operator_review_gated` | **DENIED**; also needs review evidence | `guard.sh` | force-push *to a protected/ambiguous/multi target*, history rewrite, release/publish/tag-push (changes published/shared state) |
 
 ## Bypass (operator approval)
@@ -49,13 +49,25 @@ recorded to `~/.claude/state/approval-needed.log`; the bypass is logged to stder
   gates even though they carry a `.pem` extension. Private keys (`*.pem` without
   `.pub`, `*.key`, `id_rsa`) and other secrets stay gated; a public key referenced
   alongside a real secret in the same command still trips the deny.
-- **Service-control relaxation** (operator-approved): direct service lifecycle
-  control — `restart` / `start` / `reload` / `stop` / `kill` — of fleet services
-  (`broker`/`Gateway`/`worker`/`a2a`/`hermes`/`openclaw` and `ccc-telegram-bridge`)
-  is **not gated**. A fleet node manages its own services directly so it can update
-  from GitHub and recover unattended. The genuinely dangerous gates (secret, DB,
-  force-push to protected branches, catastrophic `rm`, `self-update.services`
-  writes) are unaffected.
+- **Service-control relaxation** (operator-approved): pure lifecycle verbs —
+  `start` / `restart` / `reload` / `stop` / `kill` (and their `try-`/`-or-`
+  variants) — on **fleet services** are **not gated**. A unit/process counts as
+  a fleet service when its name carries a fleet token (`a2a`, `hermes`,
+  `openclaw`, `broker`, `gateway`, `worker`) or is `ccc-telegram-bridge`. The
+  transport does not change the risk class: local `systemctl`/`service`/`pm2`,
+  a peer-node restart over `ssh <node> systemctl …` (타노드 재시작), and
+  `systemctl -H/-M <target> …` are judged by the same unit check — a fleet node
+  manages its own and its peers' services so the fleet can update from GitHub
+  and recover unattended. Still gated: non-fleet units (`nginx`, `ufw`, …),
+  config-changing verbs (`enable`/`disable`/`mask`/`unmask`/`isolate`/
+  `daemon-reload`/`daemon-reexec`) even on fleet units, `pm2 delete`,
+  docker/podman/kubectl lifecycle, host lifecycle (`shutdown`/`reboot`/
+  `poweroff`/`halt` — local **or over ssh**), and any invocation whose verb and
+  targets cannot be parsed unambiguously (interpreter-mediated calls fail
+  closed). `guard.sh` judges *every* lifecycle segment of a compound command;
+  one non-fleet target denies the whole command. The genuinely dangerous gates
+  (secret exfil, DB, force-push to protected branches, catastrophic `rm`,
+  `self-update.services` writes) are unaffected.
 - Fail-closed: if a pattern is uncertain, prefer gating. Patterns are covered by
   `guard.test.sh` (allow + deny cases, including the force-push relaxation) to avoid
   blocking normal autonomous work.

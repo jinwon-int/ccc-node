@@ -195,31 +195,124 @@ if is_forcepush; then
 fi
 g 'git[[:space:]]+(filter-branch|filter-repo)([[:space:]]|$)|git-filter-repo'                               && deny "history-rewrite" "operator_review_gated" "$c"
 
-# Service/host lifecycle is fail-closed.  guard.sh is only defense-in-depth: the
-# actual privilege boundary is the root-owned ccc-service-control wrapper and its
-# root-owned allowlist (docs/service-control.md).  Direct lifecycle commands need
-# fresh approval, except for the exact local ccc-telegram-bridge restart carve-out.
-is_direct_ccc_bridge_restart() {
-  case "$cn" in
-    'systemctl restart ccc-telegram-bridge'|'systemctl restart ccc-telegram-bridge.service'|\
-    'sudo systemctl restart ccc-telegram-bridge'|'sudo systemctl restart ccc-telegram-bridge.service')
-      return 0 ;;
+# Service lifecycle.  guard.sh is only defense-in-depth: the actual privilege
+# boundary is the unprivileged agent account plus the root-owned
+# ccc-service-control wrapper and its root-owned allowlist (docs/service-control.md).
+#
+# Fleet-service relaxation (operator-approved; RISK-PROFILES.md): pure lifecycle
+# verbs — start/restart/reload/stop/kill (and try-/or- variants) — on FLEET units
+# (names carrying a2a / hermes / openclaw / broker / gateway / worker, or
+# ccc-telegram-bridge) proceed autonomously.  The transport does not change the
+# risk class: local systemctl, a peer-node restart via `ssh <node> systemctl …`,
+# and `systemctl -H <node> …` are judged by the same unit check, so a node can
+# update from GitHub and recover itself or a peer unattended.
+#
+# Everything else stays fail-closed (fresh approval): non-fleet units,
+# config-changing verbs (enable/disable/mask/unmask/daemon-reload/daemon-reexec)
+# even on fleet units, pm2 delete, docker/podman/kubectl lifecycle, host
+# lifecycle (shutdown/reboot/poweroff/halt — local or remote), and any
+# invocation whose verb/targets cannot be parsed unambiguously
+# (interpreter-mediated forms fail closed).
+
+fleet_unit() {  # 0 = token names a fleet service (systemd unit or pm2 name)
+  printf '%s' "$1" | grep -Eiq \
+    '(^|[^A-Za-z0-9])(a2a|hermes|openclaw|broker|gateway|worker)([^A-Za-z0-9]|$)|ccc-telegram-bridge'
+}
+
+_relax_verb() {  # lifecycle verbs covered by the fleet relaxation
+  case "$1" in
+    start|restart|reload|stop|kill|try-restart|reload-or-restart|try-reload-or-restart|force-reload) return 0 ;;
   esac
   return 1
 }
 
-if ! is_direct_ccc_bridge_restart; then
-  gn '\b(systemctl|service)\b[^;&|]*\b(start|restart|reload|stop|kill|disable|enable|mask|unmask|daemon-reload|daemon-reexec)\b' \
-    && deny "service-lifecycle" "operator_approval_gated" "$c"
-  gn '\bpm2\b[^;&|]*\b(start|restart|reload|stop|delete|kill)\b' \
-    && deny "service-lifecycle" "operator_approval_gated" "$c"
-  gn '\b(docker|podman)\b[^;&|]*\b(run|up|start|restart|stop|kill|rm|pause|unpause|down)\b' \
-    && deny "service-lifecycle" "operator_approval_gated" "$c"
-  gn '\bkubectl\b[^;&|]*\b(rollout[[:space:]]+restart|scale|delete|drain|cordon|uncordon)\b' \
-    && deny "service-lifecycle" "operator_approval_gated" "$c"
-  gn '(^|[[:space:];|&])(restart-worker|stop-broker)([[:space:];|&]|$)' \
-    && deny "service-lifecycle" "operator_approval_gated" "$c"
+# stdin = one candidate target token per line (everything after the verb).
+# 0 = at least one positional target and EVERY positional target is a fleet
+# unit.  Flags are skipped; redirections (`>f`, `2>&1`, `> f`) are skipped; a
+# `#` token stops parsing (trailing comment).  Anything else must BE a fleet
+# unit or the whole segment fails (fail-closed).
+_targets_fleet() {
+  local t found=0 skip=0
+  while IFS= read -r t; do
+    [ -n "$t" ] || continue
+    if [ "$skip" = 1 ]; then skip=0; continue; fi
+    case "$t" in '#'*) break ;; esac
+    if printf '%s' "$t" | grep -Eq '^[0-9]*(>>?|<)'; then
+      printf '%s' "$t" | grep -Eq '^[0-9]*(>>?|<)$' && skip=1   # bare op: value follows
+      continue
+    fi
+    case "$t" in
+      -s|--signal|--kill-who|--kill-whom) skip=1; continue ;;   # value-taking kill flags
+      -*) continue ;;
+    esac
+    found=1
+    fleet_unit "$t" || return 1
+  done
+  [ "$found" = 1 ]
+}
+
+_systemctl_seg_fleet() {  # `systemctl [flags] <verb> <unit…>`
+  local -a t; read -ra t <<<"$1"
+  local n=${#t[@]} i=1 verb=''
+  while [ "$i" -lt "$n" ]; do
+    case "${t[$i]}" in
+      -H|--host|-M|--machine) i=$((i+2)) ;;   # value-taking transport flags
+      -*) i=$((i+1)) ;;
+      *) verb="${t[$i]}"; i=$((i+1)); break ;;
+    esac
+  done
+  _relax_verb "$verb" || return 1
+  printf '%s\n' "${t[@]:$i}" | _targets_fleet
+}
+
+_service_seg_fleet() {  # SysV order: `service <unit> <verb>`
+  local -a t; read -ra t <<<"$1"
+  [ "${#t[@]}" -ge 3 ] || return 1
+  _relax_verb "${t[2]}" || return 1
+  fleet_unit "${t[1]}"
+}
+
+_pm2_seg_fleet() {  # `pm2 <verb> <name…>`; delete is config-changing → not relaxed
+  local -a t; read -ra t <<<"$1"
+  local n=${#t[@]} i=1 verb=''
+  while [ "$i" -lt "$n" ]; do
+    case "${t[$i]}" in -*) i=$((i+1)) ;; *) verb="${t[$i]}"; i=$((i+1)); break ;; esac
+  done
+  case "$verb" in start|restart|reload|stop|kill) ;; *) return 1 ;; esac
+  printf '%s\n' "${t[@]:$i}" | _targets_fleet
+}
+
+# 0 = every systemctl/service/pm2 lifecycle invocation in the command targets
+# only fleet units with a relaxed verb.  One non-fleet target, config verb,
+# missing target, or unparseable segment fails the whole command (fail-closed).
+all_lifecycle_segments_fleet() {
+  local seg decided=1
+  while IFS= read -r seg; do
+    [ -n "$seg" ] || continue
+    # Segments without a gated verb (e.g. `systemctl status x` inside a
+    # compound) did not trigger this gate and are not judged here.
+    grep -Eq '\b(start|restart|reload|stop|kill|delete|disable|enable|mask|unmask|isolate|daemon-reload|daemon-reexec)\b' <<<"$seg" \
+      || continue
+    case "$seg" in
+      systemctl*) _systemctl_seg_fleet "$seg" || return 1 ;;
+      service*)   _service_seg_fleet "$seg"   || return 1 ;;
+      pm2*)       _pm2_seg_fleet "$seg"       || return 1 ;;
+      *) return 1 ;;
+    esac
+    decided=0
+  done < <(grep -Eo '\b(systemctl|service|pm2)\b[^;&|]*' <<<"$cn")
+  return "$decided"
+}
+
+if gn '\b(systemctl|service)\b[^;&|]*\b(start|restart|reload|stop|kill|disable|enable|mask|unmask|isolate|daemon-reload|daemon-reexec)\b' \
+   || gn '\bpm2\b[^;&|]*\b(start|restart|reload|stop|delete|kill)\b'; then
+  all_lifecycle_segments_fleet \
+    || deny "service-lifecycle" "operator_approval_gated" "$c"
 fi
+gn '\b(docker|podman)\b[^;&|]*\b(run|up|start|restart|stop|kill|rm|pause|unpause|down)\b' \
+  && deny "service-lifecycle" "operator_approval_gated" "$c"
+gn '\bkubectl\b[^;&|]*\b(rollout[[:space:]]+restart|scale|delete|drain|cordon|uncordon)\b' \
+  && deny "service-lifecycle" "operator_approval_gated" "$c"
 
 is_readonly_lifecycle_text_search() {
   printf '%s' "$cn" | grep -Eq \

@@ -6,16 +6,25 @@ wrapper and root-owned exact-unit allowlist.
 
 ## Policy
 
-- Direct `systemctl`, `service`, or `pm2` lifecycle commands require fresh
-  operator approval.
+- **Fleet-service lifecycle is autonomous** (operator-approved relaxation; see
+  `claude/hooks/RISK-PROFILES.md`): `start`/`restart`/`reload`/`stop`/`kill`
+  of units whose name carries `a2a`/`hermes`/`openclaw`/`broker`/`gateway`/
+  `worker` or is `ccc-telegram-bridge` — locally or toward a peer node
+  (`ssh <node> systemctl restart <unit>`, `systemctl -H <node> …`). A fleet
+  node manages its own and its peers' services so it can update from GitHub
+  and recover unattended.
+- Everything else is fail-closed: `systemctl`/`service`/`pm2` lifecycle of
+  non-fleet units, config-changing verbs (`enable`/`disable`/`mask`/`unmask`/
+  `isolate`/`daemon-*`), `pm2 delete`, and docker/podman/kubectl lifecycle
+  require fresh operator approval. Compound commands are judged per lifecycle
+  segment; one non-fleet target denies the whole command.
 - Host lifecycle commands (`shutdown`, `reboot`, `poweroff`, `halt`) require
-  fresh operator approval.
-- The only direct service carve-out is an exact local restart of
-  `ccc-telegram-bridge[.service]`.
+  fresh operator approval — including against peer nodes over ssh.
 - Pre-reviewed self-update remains available through `ccc-self-update.sh`; its
   operator config must be root-owned and unavailable for agent writes.
-- Other pre-approved restarts use only the installed `ccc-service-control`
-  wrapper and exact `.service` names in `/etc/ccc-node/service-control.allow`.
+- Where a real privilege boundary is required (unprivileged agent account),
+  pre-approved restarts use the installed `ccc-service-control` wrapper and
+  exact `.service` names in `/etc/ccc-node/service-control.allow`.
 
 ## Operator installation (not performed by setup.sh)
 

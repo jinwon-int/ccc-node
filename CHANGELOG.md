@@ -4,6 +4,25 @@ All notable changes to the Claude Code node harness. Dates are KST.
 
 ## [Unreleased]
 
+### Changed
+- guard.sh service-lifecycle gate re-baselined for owner-operator fleet
+  operations (#341 direction): pure lifecycle verbs (start/restart/reload/
+  stop/kill and try-/or- variants) on fleet units (`a2a`/`hermes`/`openclaw`/
+  `broker`/`gateway`/`worker`/`ccc-telegram-bridge`) now proceed autonomously,
+  and the transport no longer changes the verdict — peer-node restarts
+  (`ssh <node> systemctl restart <unit>`, `systemctl -H <node> …`) pass the
+  same unit check. This restores the "Service-control relaxation" that
+  RISK-PROFILES.md and docs/self-update.md already documented but #342's
+  fail-closed rewrite had revoked in enforcement, which blocked routine fleet
+  recovery (타노드 재시작) and contradicted the docs. Still fail-closed:
+  non-fleet units, config-changing verbs (enable/disable/mask/unmask/isolate/
+  daemon-*), `pm2 delete`, docker/podman/kubectl, host lifecycle (local or
+  over ssh), and unparseable/interpreter-mediated forms; compound commands are
+  judged per lifecycle segment and one non-fleet target denies the whole
+  command. `systemctl isolate` is newly gated. RISK-PROFILES.md,
+  docs/service-control.md, CLAUDE.md.template, and a2a-claim.md now state the
+  same boundary as the code (single source of truth per #342 acceptance).
+
 ### Added
 - Tag-based versioning preparation for #251: `scripts/ccc-version.sh`, ccc-doctor
   harness-version reporting, fleet-matrix version extraction, release workflow,
