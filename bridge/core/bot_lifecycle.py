@@ -252,6 +252,15 @@ class BotLifecycleMixin:
     # a row means the transport problem is not transient — escalate to the full
     # rebuild path (which owns the rapid-crash SystemExit accounting).
     _MAX_RAPID_RECONNECT_CYCLES = 3
+    # getUpdates errors that must fail closed instead of being retried forever.
+    # PTB's polling loop (network_retry_loop, max_retries=-1) only invokes the
+    # error callback and keeps updater.running True, so without an explicit
+    # callback a post-start Conflict/Forbidden would never surface anywhere.
+    _PERMANENT_POLLING_ERRORS = (
+        telegram.error.InvalidToken,
+        telegram.error.Conflict,
+        telegram.error.Forbidden,
+    )
 
     def validate_runtime_paths(self) -> None:
         """Validate runtime paths before logging creates artifacts."""
@@ -414,6 +423,7 @@ class BotLifecycleMixin:
                     # transport outage would be silently lost. The 20-minute
                     # stale-message guard in _check_access still bounds backlogs.
                     drop_pending_updates=self._consume_initial_polling_start(),
+                    error_callback=self._on_polling_error,
                 )
 
                 logger.info("Bot is running")
@@ -479,6 +489,25 @@ class BotLifecycleMixin:
                 # Force cleanup to release leaked connections from pool
                 await self._graceful_shutdown(force=True)
                 continue
+            except telegram.error.Conflict:
+                # Surfaced by _on_polling_error via the supervisor: another
+                # instance started polling the same token after we did.
+                message = (
+                    "Another bot instance is already running with the same token.\n"
+                    "   Use --stop to stop it first, or check for duplicate processes."
+                )
+                health_reporter.record_telegram_error(message, consecutive_failures=1)
+                self._record_transport_teardown("telegram getUpdates conflict")
+                raise SystemExit(message)
+            except telegram.error.InvalidToken:
+                message = (
+                    "Invalid Telegram Bot Token. "
+                    "Please check TELEGRAM_BOT_TOKEN in your .env file.\n"
+                    "   Get a valid token from @BotFather on Telegram."
+                )
+                health_reporter.record_telegram_error(message, consecutive_failures=1)
+                self._record_transport_teardown("invalid telegram token")
+                raise SystemExit(message)
             except telegram.error.Forbidden as e:
                 message = (
                     f"Bot token was revoked or bot is blocked: {e}\n"
@@ -515,6 +544,35 @@ class BotLifecycleMixin:
         self._polling_started_once = True
         return first
 
+    def _on_polling_error(self, exc: telegram.error.TelegramError) -> None:
+        """Synchronous getUpdates error callback for PTB's polling retry loop.
+
+        PTB (22.x) retries polling errors indefinitely in a background task and
+        keeps ``updater.running`` True; its default callback only logs. A
+        permanent ``Conflict``/``Forbidden`` raised *after* polling started would
+        therefore never reach the fail-closed handlers in ``_run_async``. Flag
+        permanent errors for the polling supervisor to fail closed; transient
+        errors only mark telegram health degraded (PTB already logs and retries
+        them, and the watchdog escalates prolonged outages).
+
+        Must never raise: PTB aborts the retry loop when the callback raises.
+        """
+        try:
+            if isinstance(exc, self._PERMANENT_POLLING_ERRORS):
+                self._fatal_polling_error = exc
+                health_reporter.record_telegram_error(
+                    f"permanent polling failure: {exc}", consecutive_failures=1
+                )
+                logger.error(
+                    "Permanent polling failure (%s): %s — failing closed",
+                    type(exc).__name__,
+                    exc,
+                )
+            else:
+                health_reporter.record_telegram_error(str(exc))
+        except Exception:
+            logger.exception("Polling error callback failed")
+
     async def _supervise_polling(self, stop_event: asyncio.Event) -> None:
         """Wait for polling exit; recover transient exits transport-only.
 
@@ -535,6 +593,14 @@ class BotLifecycleMixin:
             except _PollingRestart:
                 if stop_event.is_set():
                     return
+                fatal = getattr(self, "_fatal_polling_error", None)
+                if fatal is not None:
+                    # A permanent getUpdates failure (Conflict/Forbidden/token)
+                    # must not be "reconnected around": surface the original
+                    # error so _run_async's fail-closed handlers terminate with
+                    # explicit attribution.
+                    self._fatal_polling_error = None
+                    raise fatal
                 if self._clock.time() - entered_at < self._MIN_UPTIME:
                     rapid_cycles += 1
                     if rapid_cycles >= self._MAX_RAPID_RECONNECT_CYCLES:
@@ -575,6 +641,7 @@ class BotLifecycleMixin:
                 await updater.start_polling(
                     allowed_updates=Update.ALL_TYPES,
                     drop_pending_updates=False,
+                    error_callback=self._on_polling_error,
                 )
             except asyncio.CancelledError:
                 raise
@@ -718,8 +785,14 @@ class BotLifecycleMixin:
             await asyncio.sleep(self._WORKLOAD_INTERVAL)
 
     async def _wait_for_polling_exit(self, stop_event: asyncio.Event):
-        """Block until stop signal or polling exits unexpectedly."""
+        """Block until stop signal, polling exit, or a fatal polling error."""
         while not stop_event.is_set():
+            # PTB keeps updater.running True while retrying getUpdates forever,
+            # so a permanent failure flagged by _on_polling_error must be
+            # checked explicitly — it never shows up as a stopped updater.
+            if getattr(self, "_fatal_polling_error", None) is not None:
+                logger.warning("Permanent polling failure flagged, leaving polling wait")
+                raise _PollingRestart()
             if (
                 self.application
                 and self.application.updater

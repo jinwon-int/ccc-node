@@ -110,7 +110,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   getUpdates conflict, revoked token) keep their fail-closed SystemExit, and the
   in-flight requests they terminate are now attributed in
   `health.json → transport.cancelled_by_transport`; successful transport-only
-  reconnects increment `transport.reconnects`.
+  reconnects increment `transport.reconnects`. Both `start_polling` calls now
+  register a synchronous `error_callback`: python-telegram-bot retries
+  getUpdates errors indefinitely in a background loop with `updater.running`
+  still True, so a `Conflict`/`Forbidden` raised *after* polling started would
+  otherwise never surface anywhere — the callback flags permanent errors and
+  the polling supervisor re-raises them into the fail-closed handlers.
 - **Canonical update provenance (#351).** `bridge/start.sh` no longer compares
   the vendored bridge changelog with `terranc/claude-telegram-bot-bridge`
   releases and then pulls whichever checkout happens to be current. `--upgrade`

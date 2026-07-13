@@ -251,6 +251,67 @@ async def test_supervise_polling_escalates_on_rapid_reconnect_death_loop(
     assert len(updater.start_calls) == bot._MAX_RAPID_RECONNECT_CYCLES - 1
 
 
+def test_polling_error_callback_flags_only_permanent_errors(
+    fake_health: FakeHealth,
+) -> None:
+    """PTB retries getUpdates forever with updater.running True; permanent
+    errors surface only through this callback (#418 review)."""
+
+    bot = bare_lifecycle_bot(FakeUpdater())
+
+    bot._on_polling_error(telegram.error.NetworkError("blip"))
+    assert getattr(bot, "_fatal_polling_error", None) is None
+
+    conflict = telegram.error.Conflict("another instance is polling")
+    bot._on_polling_error(conflict)
+    assert bot._fatal_polling_error is conflict
+    assert any("permanent polling failure" in e for e in fake_health.telegram_errors)
+
+
+@pytest.mark.anyio
+async def test_wait_for_polling_exit_surfaces_fatal_error_while_running(
+    fake_health: FakeHealth,
+) -> None:
+    """The core #418 regression: a post-start Conflict leaves updater.running
+    True, so the wait loop must check the fatal flag explicitly."""
+
+    updater = FakeUpdater()
+    updater.running = True
+    bot = bare_lifecycle_bot(updater)
+    bot._on_polling_error(telegram.error.Conflict("duplicate poller"))
+
+    with pytest.raises(_PollingRestart):
+        await asyncio.wait_for(bot._wait_for_polling_exit(asyncio.Event()), timeout=5)
+
+
+@pytest.mark.anyio
+async def test_supervise_polling_fails_closed_on_permanent_polling_error(
+    fake_health: FakeHealth,
+) -> None:
+    updater = FakeUpdater()
+    updater.running = True
+    bot = bare_lifecycle_bot(updater)
+    conflict = telegram.error.Conflict("duplicate poller")
+    bot._on_polling_error(conflict)
+
+    with pytest.raises(telegram.error.Conflict):
+        await asyncio.wait_for(bot._supervise_polling(asyncio.Event()), timeout=5)
+
+    # The permanent error is never "reconnected around".
+    assert updater.start_calls == []
+
+
+@pytest.mark.anyio
+async def test_reconnect_registers_polling_error_callback(
+    fake_health: FakeHealth,
+) -> None:
+    updater = FakeUpdater()
+    bot = bare_lifecycle_bot(updater)
+
+    assert await bot._reconnect_polling(asyncio.Event()) is True
+    assert updater.start_calls[-1]["error_callback"] == bot._on_polling_error
+
+
 def test_only_first_polling_start_drops_backlog() -> None:
     bot = bare_lifecycle_bot(FakeUpdater())
 
