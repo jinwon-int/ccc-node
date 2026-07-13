@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Unrestricted Codex package default (#415).** The default `auto-approve`
+  policy now sends `approvalPolicy=never`, no reviewer, and
+  `sandboxPolicy={type: dangerFullAccess}` on every Codex turn regardless of
+  execution profile. This supersedes the network-off workspace default added
+  in #412: root bridges can now access external/Tailscale networks, host files,
+  systemd, SSH, devices, and paths outside the workspace without prompting.
+  Every allowlisted Telegram user is part of the effective trust boundary;
+  single-owner operation is strongly recommended. Explicit `auto-review`,
+  `approve-each`, and `disabled` policies retain their prior behavior.
+
 ### Added
 - **Explicit safe Codex default (#412).** The default `auto-approve` policy now
   sends `approvalPolicy=never`, no reviewer, and a network-off `workspaceWrite`

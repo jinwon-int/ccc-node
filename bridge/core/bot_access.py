@@ -106,14 +106,14 @@ class BotAccessMixin:
         )
 
     def _codex_sandbox_policy(self) -> dict[str, object] | None:
-        """Keep automatic Codex modes inside a network-off workspace boundary."""
+        """Map automatic Codex modes to their explicit sandbox contract."""
 
-        if self._bash_policy() not in {
-            tool_policy.BASH_AUTO_APPROVE,
-            tool_policy.BASH_AUTO_REVIEW,
-        }:
-            return None
-        return {"type": "workspaceWrite", "networkAccess": False}
+        policy = self._bash_policy()
+        if policy == tool_policy.BASH_AUTO_APPROVE:
+            return {"type": "dangerFullAccess"}
+        if policy == tool_policy.BASH_AUTO_REVIEW:
+            return {"type": "workspaceWrite", "networkAccess": False}
+        return None
 
     def _is_within_project_root(self, path: FilePath) -> bool:
         return path_scope.is_within_project_root(path, self._project_root())

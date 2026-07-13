@@ -454,6 +454,21 @@ class CodexAppServerTests(unittest.IsolatedAsyncioTestCase):
         )
         await assert_call(
             client.turn_start(
+                "thread-1",
+                [{"type": "text", "text": "full access"}],
+                approval_policy="never",
+                sandbox_policy={"type": "dangerFullAccess"},
+            ),
+            "turn/start",
+            {
+                "threadId": "thread-1",
+                "input": [{"type": "text", "text": "full access"}],
+                "approvalPolicy": "never",
+                "sandboxPolicy": {"type": "dangerFullAccess"},
+            },
+        )
+        await assert_call(
+            client.turn_start(
                 "thread-1", [{"type": "text", "text": "use defaults"}]
             ),
             "turn/start",

@@ -87,7 +87,7 @@ def bare_bot(manager: SessionManager, *, provider: str, project_chat=None) -> An
             "auto-approve",
             "never",
             None,
-            {"type": "workspaceWrite", "networkAccess": False},
+            {"type": "dangerFullAccess"},
         ),
         (
             "auto-review",
@@ -114,6 +114,21 @@ def test_codex_execution_policy_follows_bridge_bash_policy(
     assert bot._codex_approval_policy() == approval
     assert bot._codex_approvals_reviewer() == reviewer
     assert bot._codex_sandbox_policy() == sandbox
+
+
+@pytest.mark.parametrize("execution_profile", ["strict-project", "owner-operator"])
+def test_codex_auto_approve_full_access_is_execution_profile_independent(
+    tmp_path: Path, execution_profile: str
+) -> None:
+    bot = bare_bot(make_manager(tmp_path, "codex"), provider="codex")
+    bot._config.bash_policy = "auto-approve"
+    bot._config.execution_profile = execution_profile
+    bot._config.allowed_user_ids = [7]
+    bot._config.require_allowlist = True
+
+    assert bot._codex_approval_policy() == "never"
+    assert bot._codex_approvals_reviewer() is None
+    assert bot._codex_sandbox_policy() == {"type": "dangerFullAccess"}
 
 
 @pytest.mark.anyio

@@ -231,7 +231,7 @@ Claude:  ...
 | `ALLOWED_USER_IDS` | 否 | *（允许所有人）* | 逗号分隔的用户 ID 白名单；`owner-operator` 必须且只能配置一个 owner |
 | `CCC_REQUIRE_ALLOWLIST` | 否 | `true` | 白名单为空时拒绝启动；`owner-operator` 必须保持为 true |
 | `CCC_BRIDGE_EXECUTION_PROFILE` | 否 | `strict-project` | 执行边界：`strict-project`、`owner-operator` 或 `disabled` |
-| `CCC_BRIDGE_BASH_POLICY` | 否 | `auto-approve` | Bash 审批方式：`auto-approve`、`auto-review`、`approve-each` 或 `disabled` |
+| `CCC_BRIDGE_BASH_POLICY` | 否 | `auto-approve` | Bash 审批方式；Codex 默认值为不受限的 `never + dangerFullAccess` |
 | `CLAUDE_CLI_PATH` | 否 | *（自动检测）* | Claude CLI 绝对路径 |
 | `CLAUDE_SETTINGS_PATH` | 否 | `~/.claude/settings.json` | Claude Code settings 文件路径 |
 | `CLAUDE_PROCESS_TIMEOUT` | 否 | `600` | SDK 超时时间（秒） |
@@ -315,8 +315,8 @@ ffmpeg -version
   - `strict-project`（包默认值）保留 fail-closed Claude Code OS 沙箱：默认拒绝 host 读取，仅重新允许 `PROJECT_ROOT` 与最小运行库，禁止非沙箱回退与 excluded commands，并禁用 user/project/local settings。Linux/WSL2 需要 `bubblewrap` 和 `socat`；后端不可用时 fail-closed。
   - `owner-operator` 明确关闭 OS 沙箱，恢复正常 user/project/local settings 与 host 级 Claude Code 运维能力。只有 `CCC_REQUIRE_ALLOWLIST=true` 且 `ALLOWED_USER_IDS` 恰好一个 owner 时才能启动。此模式信任 owner 边界，**不能**防御 prompt injection。
   - `disabled` 强制禁用 Bash，并禁止 user/project/local 文件系统 settings，避免 settings hook 保留 host 执行能力；未知或不安全的配置也会降级为 disabled。
-- `CCC_BRIDGE_BASH_POLICY` 只控制所选边界内的审批体验：`auto-approve`（默认）、`auto-review`、`approve-each` 或 `disabled`。审批不会扩大 `strict-project`，在 `owner-operator` 中也不是第二层沙箱。Claude 会把 `auto-review` 保守地按 `approve-each` 处理。
-- Codex 的 `auto-approve`（包默认值）每个 turn 都发送 `approvalPolicy=never`、不设置 reviewer，并显式发送网络关闭的 `sandboxPolicy={type: workspaceWrite, networkAccess: false}`。该模式不显示审批提示，但仍保留工作区沙箱；越界操作可能直接失败，且绝不会请求 `dangerFullAccess`。
+- `CCC_BRIDGE_BASH_POLICY` 控制审批体验：`auto-approve`（默认）、`auto-review`、`approve-each` 或 `disabled`。Claude 的审批不会扩大所选执行边界。**Codex 不同：**默认 `auto-approve` 无论 `strict-project` 还是 `owner-operator` 都会明确请求完全访问。Claude 会把 `auto-review` 保守地按 `approve-each` 处理。
+- Codex 的 `auto-approve`（包默认值）每个 turn 都发送 `approvalPolicy=never`、不设置 reviewer，并发送 `sandboxPolicy={type: dangerFullAccess}`。外部网络、Tailscale、host 文件系统、systemd、SSH、设备及工作区外路径均可在无审批提示的情况下访问。bridge 以 root 运行时，所有白名单 Telegram 用户都属于 root 信任边界；强烈建议只配置一个可信 owner。该模式没有沙箱，也不能防御 prompt injection。
 - Codex 的 `auto-review` 每个 turn 都发送 `approvalPolicy=on-request`、`approvalsReviewer=auto_review` 和网络关闭的 `workspaceWrite` 沙箱。工作区内的日常操作自动继续；符合条件的越界请求由 Codex reviewer agent 评估。该模式不会扩大沙箱、不会自动开放网络，也不是安全保证。
 - Bot 输出引用外部文件时，发送前需用户确认。
 - 所有运行时数据都在 `PROJECT_ROOT/.telegram_bot/` 内。
