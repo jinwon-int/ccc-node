@@ -467,7 +467,7 @@ async def _quarantine_transcript(
     return consumed
 
 
-async def recover_dead_session_notifications(
+async def recover_dead_session_notifications(  # noqa: C901 -- #348 baseline hotspot
     bot: Any,
     session_manager: Any,
     project_handler: Any,

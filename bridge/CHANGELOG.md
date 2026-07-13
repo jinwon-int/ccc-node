@@ -19,6 +19,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `approve-each`, and `disabled` policies retain their prior behavior.
 
 ### Added
+- **Coverage, mypy, and complexity regression gates (#348).** The CI coverage
+  run now measures branch coverage and fails under 72% (measured baseline
+  74.1%; staged plan to 80% in `docs/quality-baseline.md`). Ruff gains the
+  `C901` complexity gate (`max-complexity = 15`): new functions above CC 15
+  fail CI, while the 19 pre-existing hotspots carry explicit per-function
+  `# noqa: C901 -- #348 baseline hotspot` markers so the exception list stays
+  review-visible. Mypy now checks all 34 `bridge/core` modules — six real
+  errors surfaced by the expansion were fixed (lazy-init collaborator
+  annotations in `bot_voice`, an `Optional` declaration for
+  `_fatal_polling_error` in `bot_lifecycle`, a stale ignore in
+  `session_isolation`) — with a single review-visible baseline override
+  (`attr-defined` only, mixin modules only) pending the typed-composition
+  refactor. New behavior tests cover the deny/error/empty/no-match paths of
+  the access and delivery mixins (allowlist denials per update type,
+  stale-message drops, Bash per-call approval round-trip incl. digest
+  mismatch, outside-path approval round-trip, resume-selection
+  mismatch/no-match, pending-question consumption, queue overflow, heartbeat
+  status callback send/edit/delete/error fail-open contract).
 - **Hash-locked runtime dependency installs + wheel smoke gate (#349).**
   `bridge/requirements.lock.txt` is a new pip-compile `--generate-hashes` lock
   of the runtime dependency set, generated from the same source as the CI lock

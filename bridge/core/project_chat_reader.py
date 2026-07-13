@@ -116,7 +116,7 @@ class ProjectChatReaderMixin:
             success=not msg.is_error,
         )
 
-    async def _reader_loop(self, user_id: int, state: _UserStreamState) -> None:
+    async def _reader_loop(self, user_id: int, state: _UserStreamState) -> None:  # noqa: C901 -- #348 baseline hotspot
         try:
             async for msg in state.client.receive_messages():
                 if state.unsolicited_inflight or not state.pending:

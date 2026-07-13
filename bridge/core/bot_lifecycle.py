@@ -274,6 +274,10 @@ class BotLifecycleMixin:
         telegram.error.Conflict,
         telegram.error.Forbidden,
     )
+    # Set by _on_polling_error / _polling_task_failure when a permanent
+    # getUpdates error surfaces; consumed (and reset to None) by the
+    # supervise/reconnect paths.
+    _fatal_polling_error: Optional[telegram.error.TelegramError] = None
 
     def validate_runtime_paths(self) -> None:
         """Validate runtime paths before logging creates artifacts."""
@@ -353,7 +357,7 @@ class BotLifecycleMixin:
 
         return False, "claude authentication unavailable"
 
-    async def _run_async(self):
+    async def _run_async(self):  # noqa: C901 -- #348 baseline hotspot
         """Async entry: manage Application lifecycle and polling restart loop."""
         # Isolate child claude/bash/pytest process trees into their own session so a
         # SIGTERM/SIGINT from work the bot itself launched cannot propagate back and

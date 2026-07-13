@@ -113,7 +113,7 @@ def load_doc():
     return data, validate_doc(data)
 
 
-def validate_doc(data):
+def validate_doc(data):  # noqa: C901 -- #348 baseline hotspot
     errors = []
     if not isinstance(data, dict):
         return ['store must be a JSON object']
@@ -432,7 +432,7 @@ def normalize(data):
     return out
 
 
-def due_plan(data):
+def due_plan(data):  # noqa: C901 -- #348 baseline hotspot
     try:
         at = parse_dt(at_raw, '--at') if at_raw else datetime.now(timezone.utc).replace(second=0, microsecond=0)
     except Exception as e:

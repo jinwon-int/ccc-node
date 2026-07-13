@@ -134,7 +134,7 @@ def render_for_delivery(
     return to_readable(text, loose=loose, spacing=spacing)
 
 
-def _transform(text: str, loose: bool = False, spacing: int = 1) -> str:
+def _transform(text: str, loose: bool = False, spacing: int = 1) -> str:  # noqa: C901 -- #348 baseline hotspot
     if not text:
         return text
 

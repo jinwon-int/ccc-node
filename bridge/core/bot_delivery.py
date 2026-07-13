@@ -388,7 +388,7 @@ class BotDeliveryMixin:
             if kb:
                 await bot.send_message(chat_id, "Please select:", reply_markup=kb)
 
-    async def _handle_callback(
+    async def _handle_callback(  # noqa: C901 -- #348 baseline hotspot
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ):
         """Handle callback queries from inline keyboards"""

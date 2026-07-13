@@ -45,3 +45,5 @@ openspec
 /.codex
 /.commitlintrc.js
 /AGENTS.md
+.coverage
+coverage.xml

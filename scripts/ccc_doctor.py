@@ -112,7 +112,7 @@ class Doctor:
         except Exception:
             return "unknown"
 
-    def diagnose(self) -> None:
+    def diagnose(self) -> None:  # noqa: C901 -- #348 baseline hotspot
         if not self.settings.exists():
             self.add("수동필요", "settings.json", "missing", "run setup.sh from the repo after backing up ~/.claude; install mode cannot be inferred safely")
         elif not self.json_ok(self.settings):
@@ -716,7 +716,7 @@ def emit_json_report(doctor: Doctor) -> int:
     return doctor.report_exit_code()
 
 
-def main(argv: list[str]) -> int:
+def main(argv: list[str]) -> int:  # noqa: C901 -- #348 baseline hotspot
     parsed_rc, fix, rollback, apply, json_output, scope = parse_args(argv)
     if parsed_rc >= 0:
         return parsed_rc

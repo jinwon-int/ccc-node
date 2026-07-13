@@ -38,3 +38,16 @@ packages = [
 # There is no telegram_bot.hooks Python package in bridge/ today; repository
 # hook scripts live under the top-level claude/hooks/ and are validated by
 # scripts/validate-harness.sh rather than packaged into the Telegram bridge.
+
+# Coverage regression gate (issue #348). Branch coverage is the gated metric —
+# it catches untested deny/error/empty/no-match paths that line coverage
+# hides. fail_under holds the measured baseline with a small buffer; the
+# staged plan (raise as the low modules gain tests, target 80) is documented
+# in docs/quality-baseline.md. CI runs pytest with --cov from bridge/, so this
+# config applies to every gated coverage run.
+[tool.coverage.run]
+branch = true
+
+[tool.coverage.report]
+fail_under = 72
+precision = 1
