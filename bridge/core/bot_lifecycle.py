@@ -5,6 +5,7 @@ import os
 import signal
 import shutil
 import subprocess
+from typing import Optional
 
 import telegram.error
 from telegram import Update
@@ -240,6 +241,27 @@ class BotLifecycleMixin:
     _MIN_UPTIME = 30  # seconds — polling exits faster → count as crash
     _MAX_RAPID_CRASHES = 5
     _WORKLOAD_INTERVAL = 10  # seconds between in-flight workload snapshots
+    # Transport-only reconnect policy (issue #411): a transient Telegram
+    # NetworkError/TimedOut must not tear down the Application — that would
+    # couple the polling transport to in-flight agent turns. Retry the
+    # updater alone with bounded exponential backoff before escalating to
+    # the full rebuild path.
+    _RECONNECT_ATTEMPTS = 5
+    _RECONNECT_BASE_DELAY = 1.0  # seconds, doubled per attempt
+    _RECONNECT_MAX_DELAY = 30.0
+    # Reconnected polling that dies again within _MIN_UPTIME this many times in
+    # a row means the transport problem is not transient — escalate to the full
+    # rebuild path (which owns the rapid-crash SystemExit accounting).
+    _MAX_RAPID_RECONNECT_CYCLES = 3
+    # getUpdates errors that must fail closed instead of being retried forever.
+    # PTB's polling loop (network_retry_loop, max_retries=-1) only invokes the
+    # error callback and keeps updater.running True, so without an explicit
+    # callback a post-start Conflict/Forbidden would never surface anywhere.
+    _PERMANENT_POLLING_ERRORS = (
+        telegram.error.InvalidToken,
+        telegram.error.Conflict,
+        telegram.error.Forbidden,
+    )
 
     def validate_runtime_paths(self) -> None:
         """Validate runtime paths before logging creates artifacts."""
@@ -350,6 +372,7 @@ class BotLifecycleMixin:
                     "   Get a valid token from @BotFather on Telegram."
                 )
                 health_reporter.record_telegram_error(message, consecutive_failures=1)
+                self._record_transport_teardown("invalid telegram token")
                 raise SystemExit(message)
             except telegram.error.Conflict:
                 message = (
@@ -357,6 +380,7 @@ class BotLifecycleMixin:
                     "   Use --stop to stop it first, or check for duplicate processes."
                 )
                 health_reporter.record_telegram_error(message, consecutive_failures=1)
+                self._record_transport_teardown("telegram getUpdates conflict")
                 raise SystemExit(message)
             except telegram.error.TimedOut as e:
                 # PoolTimeout is converted to TimedOut, need force cleanup
@@ -394,7 +418,13 @@ class BotLifecycleMixin:
                 await self.application.start()
                 await self.application.updater.start_polling(
                     allowed_updates=Update.ALL_TYPES,
-                    drop_pending_updates=True,
+                    # Drop the backlog only on the process's very first polling
+                    # start (deliberate stale-flood protection at boot). In-process
+                    # restarts must NOT drop updates: messages sent during a
+                    # transport outage would be silently lost. The 20-minute
+                    # stale-message guard in _check_access still bounds backlogs.
+                    drop_pending_updates=self._consume_initial_polling_start(),
+                    error_callback=self._on_polling_error,
                 )
 
                 logger.info("Bot is running")
@@ -418,7 +448,7 @@ class BotLifecycleMixin:
                     name="dead-session-recovery",
                 )
 
-                await self._wait_for_polling_exit(stop_event)
+                await self._supervise_polling(stop_event)
 
             except _PollingRestart:
                 health_reporter.mark_starting("restarting polling after connection loss")
@@ -460,12 +490,32 @@ class BotLifecycleMixin:
                 # Force cleanup to release leaked connections from pool
                 await self._graceful_shutdown(force=True)
                 continue
+            except telegram.error.Conflict:
+                # Surfaced by _on_polling_error via the supervisor: another
+                # instance started polling the same token after we did.
+                message = (
+                    "Another bot instance is already running with the same token.\n"
+                    "   Use --stop to stop it first, or check for duplicate processes."
+                )
+                health_reporter.record_telegram_error(message, consecutive_failures=1)
+                self._record_transport_teardown("telegram getUpdates conflict")
+                raise SystemExit(message)
+            except telegram.error.InvalidToken:
+                message = (
+                    "Invalid Telegram Bot Token. "
+                    "Please check TELEGRAM_BOT_TOKEN in your .env file.\n"
+                    "   Get a valid token from @BotFather on Telegram."
+                )
+                health_reporter.record_telegram_error(message, consecutive_failures=1)
+                self._record_transport_teardown("invalid telegram token")
+                raise SystemExit(message)
             except telegram.error.Forbidden as e:
                 message = (
                     f"Bot token was revoked or bot is blocked: {e}\n"
                     "   Create a new token via @BotFather on Telegram."
                 )
                 health_reporter.record_telegram_error(message, consecutive_failures=1)
+                self._record_transport_teardown("telegram token revoked or bot blocked")
                 raise SystemExit(message)
             finally:
                 for _task in (
@@ -488,6 +538,173 @@ class BotLifecycleMixin:
                         await close_project_chat()
 
         logger.info("Bot stopped")
+
+    def _consume_initial_polling_start(self) -> bool:
+        """True exactly once per process: only the first start drops the backlog."""
+        first = not getattr(self, "_polling_started_once", False)
+        self._polling_started_once = True
+        return first
+
+    def _on_polling_error(self, exc: telegram.error.TelegramError) -> None:
+        """Synchronous getUpdates error callback for PTB's polling retry loop.
+
+        PTB (22.x) retries polling errors indefinitely in a background task and
+        keeps ``updater.running`` True; its default callback only logs. A
+        permanent ``Conflict``/``Forbidden`` raised *after* polling started would
+        therefore never reach the fail-closed handlers in ``_run_async``. Flag
+        permanent errors for the polling supervisor to fail closed; transient
+        errors only mark telegram health degraded (PTB already logs and retries
+        them, and the watchdog escalates prolonged outages).
+
+        Must never raise: PTB aborts the retry loop when the callback raises.
+        """
+        try:
+            if isinstance(exc, self._PERMANENT_POLLING_ERRORS):
+                self._fatal_polling_error = exc
+                health_reporter.record_telegram_error(
+                    f"permanent polling failure: {exc}", consecutive_failures=1
+                )
+                logger.error(
+                    "Permanent polling failure (%s): %s — failing closed",
+                    type(exc).__name__,
+                    exc,
+                )
+            else:
+                health_reporter.record_telegram_error(str(exc))
+        except Exception:
+            logger.exception("Polling error callback failed")
+
+    async def _supervise_polling(self, stop_event: asyncio.Event) -> None:
+        """Wait for polling exit; recover transient exits transport-only.
+
+        A stopped updater (watchdog-triggered or an unexpected polling exit)
+        first gets a bounded transport-only reconnect that preserves the
+        Application, its bot request pools, and every in-flight agent turn.
+        ``_PollingRestart`` escalates to the caller's full teardown/rebuild
+        path when the reconnect fails outright, or when reconnected polling
+        keeps dying within ``_MIN_UPTIME`` — a hot reconnect loop would
+        otherwise bypass the rapid-crash accounting entirely.
+        """
+        rapid_cycles = 0
+        while True:
+            entered_at = self._clock.time()
+            try:
+                await self._wait_for_polling_exit(stop_event)
+                return
+            except _PollingRestart:
+                if stop_event.is_set():
+                    return
+                fatal = getattr(self, "_fatal_polling_error", None)
+                if fatal is not None:
+                    # A permanent getUpdates failure (Conflict/Forbidden/token)
+                    # must not be "reconnected around": surface the original
+                    # error so _run_async's fail-closed handlers terminate with
+                    # explicit attribution.
+                    self._fatal_polling_error = None
+                    raise fatal
+                if self._clock.time() - entered_at < self._MIN_UPTIME:
+                    rapid_cycles += 1
+                    if rapid_cycles >= self._MAX_RAPID_RECONNECT_CYCLES:
+                        logger.warning(
+                            "Polling died %d times within %ds of reconnecting; "
+                            "escalating to full application rebuild",
+                            rapid_cycles,
+                            self._MIN_UPTIME,
+                        )
+                        raise
+                else:
+                    rapid_cycles = 0
+                if not await self._reconnect_polling(stop_event):
+                    raise
+
+    async def _reconnect_polling(self, stop_event: asyncio.Event) -> bool:
+        """Bounded transport-only polling reconnect (issue #411).
+
+        Restarts only the Telegram updater with exponential backoff. The
+        Application object — and with it the bot request pools, handler state,
+        conversation FIFO, and in-flight agent turns — is left untouched, so a
+        turn that finishes mid-outage still delivers through the surviving bot
+        once polling is back. Never drops pending updates. Returns True when
+        polling is running again; False after ``_RECONNECT_ATTEMPTS`` failures
+        or when a stop was requested.
+        """
+        app = self.application
+        updater = getattr(app, "updater", None) if app else None
+        if updater is None:
+            return False
+        health_reporter.mark_starting("reconnecting telegram polling")
+        for attempt in range(1, self._RECONNECT_ATTEMPTS + 1):
+            if stop_event.is_set():
+                return False
+            try:
+                if updater.running:
+                    await asyncio.wait_for(updater.stop(), timeout=15)
+                await updater.start_polling(
+                    allowed_updates=Update.ALL_TYPES,
+                    drop_pending_updates=False,
+                    error_callback=self._on_polling_error,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                health_reporter.record_telegram_error(f"polling reconnect failed: {exc}")
+                if attempt >= self._RECONNECT_ATTEMPTS:
+                    break
+                delay = min(
+                    self._RECONNECT_BASE_DELAY * (2 ** (attempt - 1)),
+                    self._RECONNECT_MAX_DELAY,
+                )
+                logger.warning(
+                    "Polling reconnect attempt %d/%d failed (%s), retrying in %.1fs",
+                    attempt,
+                    self._RECONNECT_ATTEMPTS,
+                    type(exc).__name__,
+                    delay,
+                )
+                try:
+                    await asyncio.wait_for(stop_event.wait(), timeout=delay)
+                    return False  # stop requested during backoff
+                except asyncio.TimeoutError:
+                    continue
+            else:
+                health_reporter.record_transport_reconnect()
+                health_reporter.record_telegram_ok()
+                logger.info(
+                    "Polling transport reconnected (attempt %d/%d) — "
+                    "in-flight agent turns preserved",
+                    attempt,
+                    self._RECONNECT_ATTEMPTS,
+                )
+                return True
+        logger.warning(
+            "Transport-only reconnect failed after %d attempt(s); "
+            "escalating to full application rebuild",
+            self._RECONNECT_ATTEMPTS,
+        )
+        return False
+
+    def _record_transport_teardown(self, reason: str) -> None:
+        """Attribute in-flight requests terminated by a transport-caused exit.
+
+        Permanent Telegram failures (revoked token, getUpdates conflict) keep
+        their fail-closed SystemExit, but the requests they take down must be
+        visible: count them in ``health.transport.cancelled_by_transport`` so a
+        silent-cancellation regression shows up in monitoring. The task ledger's
+        startup reconciliation still marks each record ``interrupted`` and posts
+        the owner-facing retry notice.
+        """
+        try:
+            now = asyncio.get_running_loop().time()
+            count, _ = self._project_chat.workload_snapshot(now)
+        except Exception:
+            return
+        if count > 0:
+            health_reporter.record_cancelled_by_transport(count)
+            logger.warning(
+                "Permanent transport failure terminates %d in-flight request(s): %s",
+                count,
+                reason,
+            )
 
     async def _polling_watchdog(self, stop_event: asyncio.Event):
         """Monitor Telegram API reachability; restart polling if hung."""
@@ -527,7 +744,12 @@ class BotLifecycleMixin:
                     except asyncio.TimeoutError:
                         logger.error("updater.stop() timed out, forcing process exit")
                         os._exit(1)
-                    raise _PollingRestart()
+                    # The stopped updater makes _supervise_polling run the
+                    # transport-only reconnect. Stay alive instead of raising:
+                    # after a transport-only reconnect no full rebuild recreates
+                    # this task, so dying here would leave polling unmonitored
+                    # (issue #411).
+                    consecutive_failures = 0
 
     async def _periodic_dead_session_recovery(self, stop_event: asyncio.Event) -> None:
         if not self.application:
@@ -563,9 +785,47 @@ class BotLifecycleMixin:
                 logger.debug("Terminal op drain failed: %s", type(exc).__name__)
             await asyncio.sleep(self._WORKLOAD_INTERVAL)
 
+    def _polling_task_failure(self) -> Optional[BaseException]:
+        """Return the exception that killed PTB's polling task, if it died.
+
+        PTB's polling retry loop re-raises ``InvalidToken`` *without* invoking
+        the error callback, and a crashed polling task does not clear
+        ``updater.running`` — a zombie state no public Updater API reflects.
+        Reach the name-mangled task defensively: if PTB internals drift, this
+        returns None and the get_me watchdog remains the fallback detector.
+        """
+        app = self.application
+        updater = getattr(app, "updater", None) if app else None
+        task = getattr(updater, "_Updater__polling_task", None)
+        if task is None or not task.done() or task.cancelled():
+            return None
+        try:
+            return task.exception()
+        except (asyncio.CancelledError, asyncio.InvalidStateError):
+            return None
+
     async def _wait_for_polling_exit(self, stop_event: asyncio.Event):
-        """Block until stop signal or polling exits unexpectedly."""
+        """Block until stop signal, polling exit, or a fatal polling error."""
         while not stop_event.is_set():
+            # PTB keeps updater.running True while retrying getUpdates forever,
+            # so a permanent failure flagged by _on_polling_error must be
+            # checked explicitly — it never shows up as a stopped updater.
+            if getattr(self, "_fatal_polling_error", None) is not None:
+                logger.warning("Permanent polling failure flagged, leaving polling wait")
+                raise _PollingRestart()
+            failure = self._polling_task_failure()
+            if failure is not None:
+                # InvalidToken kills the polling task without reaching the
+                # error callback while updater.running stays True. Route
+                # permanent failures to the fail-closed handlers; anything
+                # else gets the transport-only reconnect.
+                if isinstance(failure, self._PERMANENT_POLLING_ERRORS):
+                    self._fatal_polling_error = failure
+                logger.warning(
+                    "Polling task died (%s), triggering restart",
+                    type(failure).__name__,
+                )
+                raise _PollingRestart()
             if (
                 self.application
                 and self.application.updater

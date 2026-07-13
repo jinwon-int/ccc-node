@@ -1,6 +1,7 @@
 """Tests for Telegram bot connection resilience after system sleep."""
 
 # ruff: noqa: E402
+import asyncio
 import unittest
 from unittest.mock import AsyncMock, Mock, patch, PropertyMock
 from pathlib import Path
@@ -192,6 +193,47 @@ class TestConnectionResilience(unittest.TestCase):
         _, kwargs = mock_updater.start_polling.call_args
         self.assertEqual(kwargs["allowed_updates"], Update.ALL_TYPES)
         self.assertTrue(kwargs["drop_pending_updates"])
+        self.assertEqual(kwargs["error_callback"], self.bot._on_polling_error)
+
+    def test_runtime_conflict_after_polling_start_fails_closed(self):
+        """A Conflict emitted by PTB's polling retry loop AFTER polling started
+        must still reach the fail-closed SystemExit path (#418 review).
+
+        PTB 22.x retries getUpdates indefinitely with updater.running True and
+        its default error callback only logs, so the registered error_callback
+        is the only place a post-start Conflict can surface.
+        """
+        mock_app = Mock()
+        mock_app.initialize = AsyncMock()
+        mock_app.start = AsyncMock()
+
+        mock_updater = Mock()
+        type(mock_updater).running = PropertyMock(return_value=True)
+        mock_updater.stop = AsyncMock()
+
+        async def fake_start_polling(**kwargs):
+            # Simulate the polling retry loop reporting an asynchronous
+            # Conflict shortly after polling started.
+            asyncio.get_running_loop().call_later(
+                0.05, kwargs["error_callback"], telegram.error.Conflict("duplicate")
+            )
+
+        mock_updater.start_polling = AsyncMock(side_effect=fake_start_polling)
+        mock_app.updater = mock_updater
+        type(mock_app).running = PropertyMock(return_value=True)
+        mock_app.stop = AsyncMock()
+        mock_app.shutdown = AsyncMock()
+        mock_app.bot = Mock()
+
+        self.bot.application = mock_app
+        self.bot.build = Mock()
+        self.bot._on_ready = AsyncMock()
+        self.bot._probe_claude_readiness = Mock(return_value=(True, ""))
+
+        with self.assertRaises(SystemExit) as ctx:
+            self.bot.run()
+
+        self.assertIn("Another bot instance", str(ctx.exception))
 
     @patch("time.time")
     def test_rapid_restart_triggers_system_exit(self, mock_time):

@@ -60,6 +60,10 @@ class RuntimeHealthReporter:
                 "active_requests": 0,
                 "oldest_request_age_seconds": 0,
             },
+            "transport": {
+                "reconnects": 0,
+                "cancelled_by_transport": 0,
+            },
         }
 
     @property
@@ -175,6 +179,32 @@ class RuntimeHealthReporter:
             self._state["claude"]["last_error_at"] = _utc_now_iso()
             self._state["claude"]["last_error"] = _normalize_reason(error)
             self._recompute_service_locked()
+            self._write_health_locked()
+
+    def _transport_locked(self) -> dict[str, Any]:
+        return self._state.setdefault(
+            "transport", {"reconnects": 0, "cancelled_by_transport": 0}
+        )
+
+    def record_transport_reconnect(self) -> None:
+        """Count a successful transport-only polling reconnect (issue #411).
+
+        A rising counter with ``cancelled_by_transport`` staying flat is the
+        expected signature: the polling transport recovered without terminating
+        any in-flight agent turn.
+        """
+        with self._lock:
+            transport = self._transport_locked()
+            transport["reconnects"] = int(transport.get("reconnects", 0)) + 1
+            self._write_health_locked()
+
+    def record_cancelled_by_transport(self, count: int = 1) -> None:
+        """Count in-flight requests terminated by a transport-caused teardown."""
+        with self._lock:
+            transport = self._transport_locked()
+            transport["cancelled_by_transport"] = int(
+                transport.get("cancelled_by_transport", 0)
+            ) + max(0, int(count))
             self._write_health_locked()
 
     def record_workload(
