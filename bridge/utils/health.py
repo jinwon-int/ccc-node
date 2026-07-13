@@ -64,6 +64,9 @@ class RuntimeHealthReporter:
                 "reconnects": 0,
                 "cancelled_by_transport": 0,
             },
+            "recovery": {
+                "quarantined_transcripts": 0,
+            },
         }
 
     @property
@@ -204,6 +207,15 @@ class RuntimeHealthReporter:
             transport = self._transport_locked()
             transport["cancelled_by_transport"] = int(
                 transport.get("cancelled_by_transport", 0)
+            ) + max(0, int(count))
+            self._write_health_locked()
+
+    def record_transcript_quarantined(self, count: int = 1) -> None:
+        """Count dead-session transcripts newly quarantined as unrecoverable (#411)."""
+        with self._lock:
+            recovery = self._state.setdefault("recovery", {"quarantined_transcripts": 0})
+            recovery["quarantined_transcripts"] = int(
+                recovery.get("quarantined_transcripts", 0)
             ) + max(0, int(count))
             self._write_health_locked()
 
