@@ -423,6 +423,46 @@ class CodexRuntimeTests(unittest.IsolatedAsyncioTestCase):
             with suppress(asyncio.CancelledError):
                 await consumer
 
+    async def test_mismatched_approval_before_turn_start_response_is_declined(
+        self,
+    ) -> None:
+        session = await self.runtime.start_or_resume(
+            SessionRequest(
+                working_directory="/workspace",
+                approval_policy="untrusted",
+            )
+        )
+        client = self.clients[0]
+        client.before_turn_server_requests = [
+            CodexServerRequest(
+                "approval-mismatch",
+                "item/commandExecution/requestApproval",
+                {
+                    "threadId": "thread-new",
+                    "turnId": "turn-other",
+                    "itemId": "item-1",
+                },
+            )
+        ]
+        seen: list[str] = []
+
+        async def allow(request: ApprovalRequestEvent) -> ApprovalDecision:
+            seen.append(request.request_id)
+            return ApprovalDecision.ALLOW
+
+        stream = session.send_turn("edit", approval_handler=allow)
+        consumer = asyncio.create_task(next_event(stream))
+        try:
+            while not client.server_request_tasks:
+                await asyncio.sleep(0)
+            response = await asyncio.wait_for(client.server_request_tasks[0], timeout=0.2)
+            self.assertEqual(response, {"result": {"decision": "decline"}})
+            self.assertEqual(seen, [])
+        finally:
+            consumer.cancel()
+            with suppress(asyncio.CancelledError):
+                await consumer
+
     async def test_approval_routes_exact_turn_and_fails_closed(self) -> None:
         session = await self.runtime.start_or_resume(SessionRequest(working_directory="/workspace"))
         client = self.clients[0]

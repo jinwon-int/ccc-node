@@ -86,6 +86,7 @@ class _ActiveTurn:
     queue: asyncio.Queue[AgentEvent]
     approval_handler: ApprovalHandler
     turn_id: str | None = None
+    turn_ready: asyncio.Event = field(default_factory=asyncio.Event)
     finished: bool = False
     pending_notifications: list[CodexNotification] = field(default_factory=list)
 
@@ -135,6 +136,7 @@ class CodexSession:
                     if active.turn_id is not None and active.turn_id != returned_turn_id:
                         raise RuntimeError("Codex approval turn does not match turn/start response")
                     active.turn_id = returned_turn_id
+                    active.turn_ready.set()
                     self._runtime._flush_pending_notifications(active)
                     while True:
                         event = await active.queue.get()
@@ -150,6 +152,7 @@ class CodexSession:
                     )
                 finally:
                     active.finished = True
+                    active.turn_ready.set()
                     if self._runtime._active_turns.get(self._thread_id) is active:
                         self._runtime._active_turns.pop(self._thread_id, None)
 
@@ -508,11 +511,16 @@ class CodexRuntime:
         if active is None or active.finished or not isinstance(turn_id, str):
             return self._approval_response(request.method, ApprovalDecision.DENY, request.params)
         if active.turn_id is None:
-            # The app-server may emit a server request before the turn/start
-            # response is observed. Bind the local active turn provisionally;
-            # send_turn verifies the returned ID before accepting more events.
-            active.turn_id = turn_id
-        elif active.turn_id != turn_id:
+            # A server request task can be scheduled before turn/start returns.
+            # Wait for the exact returned turn ID before exposing approval UI or
+            # sending an allow decision. A missing response remains fail-closed.
+            try:
+                await asyncio.wait_for(active.turn_ready.wait(), timeout=5.0)
+            except TimeoutError:
+                return self._approval_response(
+                    request.method, ApprovalDecision.DENY, request.params
+                )
+        if active.finished or active.turn_id != turn_id:
             return self._approval_response(request.method, ApprovalDecision.DENY, request.params)
 
         approval = ApprovalRequestEvent(
