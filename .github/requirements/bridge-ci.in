@@ -1,4 +1,12 @@
 # CI verification tools installed with hash checking.
 # Runtime/dev bridge dependencies come from bridge/pyproject.toml via pip-compile.
+# Regenerate both this lock and bridge/requirements.lock.txt together with
+# scripts/ccc-deps-lock.sh so one PR carries one verified resolution.
 ruff
 mypy
+build
+pip-audit
+# Pinned build backend so the wheel-smoke job builds with --no-isolation and
+# never fetches an unhashed setuptools at build time (bridge/pyproject.toml
+# requires setuptools>=68).
+setuptools>=68

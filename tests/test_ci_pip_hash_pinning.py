@@ -13,11 +13,21 @@ PYTHONPATH_SHIM = REPO_ROOT / ".github" / "pythonpath" / "telegram_bot"
 
 
 def test_ci_pip_installs_use_hash_locked_requirements():
+    """Every registry-facing pip install must be hash-locked.
+
+    The only line allowed without --require-hashes is the local wheel install,
+    which must carry --no-deps so it cannot pull unhashed transitives from the
+    index.
+    """
     workflow = CI_WORKFLOW.read_text(encoding="utf-8")
     pip_lines = [line.strip() for line in workflow.splitlines() if "pip install" in line]
     assert pip_lines, "expected CI workflow to install Python dependencies"
-    assert all("--require-hashes" in line for line in pip_lines), pip_lines
-    assert all(".github/requirements/bridge-ci.txt" in line for line in pip_lines), pip_lines
+    hash_locks = (".github/requirements/bridge-ci.txt", "bridge/requirements.lock.txt")
+    for line in pip_lines:
+        if "--require-hashes" in line:
+            assert any(lock in line for lock in hash_locks), line
+        else:
+            assert "--no-deps" in line and ".whl" in line, line
 
 
 def test_ci_hash_lock_contains_hashes_for_tooling_and_bridge_dependencies():

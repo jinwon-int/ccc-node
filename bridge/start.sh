@@ -6,6 +6,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 VENV_DIR="$SCRIPT_DIR/venv"
 REQ_FILE="$SCRIPT_DIR/requirements.txt"
+LOCK_FILE="$SCRIPT_DIR/requirements.lock.txt"
 PYPROJECT_FILE="$SCRIPT_DIR/pyproject.toml"
 ENV_FILE="$SCRIPT_DIR/.env"
 REQ_HASH_FILE="$VENV_DIR/.req_hash"
@@ -17,13 +18,29 @@ BLUE='\033[0;34m'
 BOLD='\033[1m'
 NC='\033[0m'
 
+deps_install_mode() {
+    # Locked (default): install third-party dependencies exclusively from the
+    # hash-locked requirements.lock.txt so every node at the same checkout
+    # resolves identical versions and pip rejects any unhashed transitive
+    # dependency. CCC_DEPS_UNLOCKED=1 is the documented escape hatch for hosts
+    # where a locked artifact cannot build; it restores the legacy
+    # lower-bound requirements.txt flow and therefore loses reproducibility.
+    if [ "${CCC_DEPS_UNLOCKED:-0}" = "1" ]; then
+        echo "unlocked"
+    else
+        echo "locked"
+    fi
+}
+
 get_requirements_hash() {
-    "$VENV_DIR/bin/python" - "$REQ_FILE" "$PYPROJECT_FILE" <<'PY'
+    "$VENV_DIR/bin/python" - "$REQ_FILE" "$LOCK_FILE" "$PYPROJECT_FILE" "$(deps_install_mode)" <<'PY'
 import hashlib, pathlib, sys
 h = hashlib.sha256()
-for name in sys.argv[1:]:
-    h.update(pathlib.Path(name).read_bytes())
+for name in sys.argv[1:-1]:
+    path = pathlib.Path(name)
+    h.update(path.read_bytes() if path.exists() else b"<absent>")
     h.update(b"\0")
+h.update(sys.argv[-1].encode())
 print(h.hexdigest())
 PY
 }
@@ -78,17 +95,43 @@ sync_dependencies() {
     if [ "$force_install" = "1" ] || [ -z "$saved_hash" ] || [ "$saved_hash" != "$current_hash" ]; then
         echo "📦 Installing Python dependencies..."
         ensure_android_api_level
-        if ! "$VENV_DIR/bin/pip" install -q --upgrade pip; then
-            echo "❌ Failed to upgrade pip"
-            exit 1
-        fi
-        if ! "$VENV_DIR/bin/pip" install -q -r "$REQ_FILE"; then
-            echo "❌ Dependency installation failed"
-            exit 1
-        fi
-        if ! "$VENV_DIR/bin/pip" install -q -e "$SCRIPT_DIR"; then
-            echo "❌ Editable bridge package installation failed"
-            exit 1
+        if [ "$(deps_install_mode)" = "locked" ]; then
+            if [ ! -f "$LOCK_FILE" ]; then
+                echo "❌ Hash lock not found: $LOCK_FILE"
+                echo "   Regenerate it with scripts/ccc-deps-lock.sh, or set"
+                echo "   CCC_DEPS_UNLOCKED=1 to use the legacy unlocked install."
+                exit 1
+            fi
+            # Every third-party package (including transitives) must match a
+            # recorded hash; the venv's bundled pip (>=22.3 on Python 3.11+)
+            # already supports --require-hashes, so no unpinned pip
+            # self-upgrade is performed on this path.
+            if ! "$VENV_DIR/bin/pip" install -q --require-hashes -r "$LOCK_FILE"; then
+                echo "❌ Hash-locked dependency installation failed"
+                echo "   If this host cannot install a locked artifact, retry with"
+                echo "   CCC_DEPS_UNLOCKED=1 and report the platform gap."
+                exit 1
+            fi
+            # --no-deps keeps the editable first-party install from pulling
+            # any unhashed transitive dependency outside the lock.
+            if ! "$VENV_DIR/bin/pip" install -q --no-deps -e "$SCRIPT_DIR"; then
+                echo "❌ Editable bridge package installation failed"
+                exit 1
+            fi
+        else
+            echo "⚠️  CCC_DEPS_UNLOCKED=1 — legacy unlocked install (no hash verification)"
+            if ! "$VENV_DIR/bin/pip" install -q --upgrade pip; then
+                echo "❌ Failed to upgrade pip"
+                exit 1
+            fi
+            if ! "$VENV_DIR/bin/pip" install -q -r "$REQ_FILE"; then
+                echo "❌ Dependency installation failed"
+                exit 1
+            fi
+            if ! "$VENV_DIR/bin/pip" install -q -e "$SCRIPT_DIR"; then
+                echo "❌ Editable bridge package installation failed"
+                exit 1
+            fi
         fi
         echo "$current_hash" > "$REQ_HASH_FILE"
         echo "✅ Dependencies are up to date"

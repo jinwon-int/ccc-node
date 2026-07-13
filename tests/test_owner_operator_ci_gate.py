@@ -12,7 +12,8 @@ OWNER_CONTRACT_COMMAND = "python -m pytest -q tests/test_owner_operator_contract
 CI_HARDENING_COMMAND = (
     "python -m pytest -q tests/test_ci_pip_hash_pinning.py "
     "tests/test_workflow_permissions.py tests/test_codeowners_branch_protection.py "
-    "tests/test_ci_required_contexts.py tests/test_owner_operator_ci_gate.py"
+    "tests/test_ci_required_contexts.py tests/test_owner_operator_ci_gate.py "
+    "tests/test_runtime_deps_lock.py"
 )
 
 
