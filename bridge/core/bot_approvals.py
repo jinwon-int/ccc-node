@@ -17,6 +17,38 @@ from telegram_bot.core.agent_runtime import ApprovalDecision, ApprovalRequestEve
 logger = logging.getLogger(__name__)
 
 _APPROVAL_PREFIX = "ca"
+_APPROVAL_ALLOW_TEXT = frozenset(
+    {
+        "승인",
+        "승인해",
+        "허용",
+        "허용해",
+        "진행",
+        "진행해",
+        "approve",
+        "allow",
+        "yes",
+        "go ahead",
+    }
+)
+_APPROVAL_DENY_TEXT = frozenset(
+    {
+        "거절",
+        "거절해",
+        "취소",
+        "취소해",
+        "중단",
+        "중단해",
+        "하지마",
+        "하지 마",
+        "안돼",
+        "deny",
+        "cancel",
+        "reject",
+        "no",
+        "stop",
+    }
+)
 _ACTION_LABELS = {
     "item/commandExecution/requestApproval": "run a command",
     "item/fileChange/requestApproval": "change files",
@@ -64,6 +96,67 @@ class BotApprovalMixin:
         if len(data.encode("utf-8")) > 64:
             raise ValueError("Telegram approval callback data exceeds 64 bytes")
         return data
+
+    @staticmethod
+    def _approval_text_decision(text: str) -> ApprovalDecision | None:
+        normalized = " ".join(text.strip().casefold().split()).rstrip(".!。！")
+        if normalized in _APPROVAL_ALLOW_TEXT:
+            return ApprovalDecision.ALLOW
+        if normalized in _APPROVAL_DENY_TEXT:
+            return ApprovalDecision.DENY
+        return None
+
+    def _consume_codex_approval(
+        self,
+        pending: _PendingCodexApproval,
+        requested: ApprovalDecision,
+    ) -> tuple[ApprovalDecision, bool] | None:
+        pending_approvals = getattr(self, "_pending_codex_approvals", None)
+        if pending_approvals is None:
+            return None
+        loop = asyncio.get_running_loop()
+        active = self._project_chat.is_agent_approval_active(
+            pending.user_id, pending.chat_id, pending.generation
+        )
+        expired = not active or loop.time() >= pending.expires_at
+        decision = ApprovalDecision.DENY if expired else requested
+        # Consume before resolution so button/text races and replay cannot win twice.
+        if pending_approvals.pop(pending.token, None) is not pending:
+            return None
+        if not pending.future.done():
+            pending.future.set_result(decision)
+        return decision, expired
+
+    async def _resolve_codex_approval_text(
+        self, user_id: int, chat_id: int, text: str
+    ) -> str | None:
+        requested = self._approval_text_decision(text)
+        if requested is None or user_id != self._sole_owner_id():
+            return None
+        pending_approvals = getattr(self, "_pending_codex_approvals", None)
+        if not pending_approvals:
+            return None
+        conversation_key = self._conversation_key(user_id, chat_id)
+        matches = [
+            pending
+            for pending in pending_approvals.values()
+            if pending.user_id == user_id
+            and pending.chat_id == chat_id
+            and pending.conversation_key == conversation_key
+        ]
+        if not matches:
+            return None
+        if len(matches) != 1:
+            return "ambiguous"
+
+        pending = matches[0]
+        consumed = self._consume_codex_approval(pending, requested)
+        if consumed is None:
+            return None
+        decision, expired = consumed
+        if expired:
+            return "expired"
+        return "allowed" if decision is ApprovalDecision.ALLOW else "denied"
 
     async def _codex_approval_callback(
         self,
@@ -133,7 +226,10 @@ class BotApprovalMixin:
             app = self._require_application()
             message = await app.bot.send_message(
                 chat_id=chat_id,
-                text=f"Codex requests approval to {label}.",
+                text=(
+                    f"Codex requests approval to {label}.\n"
+                    "Reply with 승인 or 거절, or use the buttons."
+                ),
                 reply_markup=keyboard,
             )
             pending.message_id = getattr(message, "message_id", None)
@@ -187,21 +283,10 @@ class BotApprovalMixin:
         ):
             return False
 
-        loop = asyncio.get_running_loop()
-        active = self._project_chat.is_agent_approval_active(
-            pending.user_id, pending.chat_id, pending.generation
+        requested = (
+            ApprovalDecision.ALLOW if parts[2] == "a" else ApprovalDecision.DENY
         )
-        decision = (
-            ApprovalDecision.ALLOW
-            if active and loop.time() < pending.expires_at and parts[2] == "a"
-            else ApprovalDecision.DENY
-        )
-        # Consume before resolution so replay and duplicate clicks cannot race.
-        if self._pending_codex_approvals.pop(token, None) is not pending:
-            return False
-        if not pending.future.done():
-            pending.future.set_result(decision)
-        return True
+        return self._consume_codex_approval(pending, requested) is not None
 
     def _deny_codex_approvals(
         self, user_id: int | None = None, chat_id: int | None = None
