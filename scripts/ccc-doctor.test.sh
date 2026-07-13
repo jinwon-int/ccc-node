@@ -248,5 +248,44 @@ json_out="$(FAKE_CODEX_MODE=authenticated CCC_AGENT_PROVIDER=codex CCC_CODEX_CLI
 ok "Codex JSON output is valid and carries additive readiness fields" '[ "$rc" = 0 ] && jq -e '\''(.provider == "codex") and (.readiness == "ready") and (.mode == "standalone") and (.counts["수동필요"] == 0) and ([.rows[].item] | index("Codex login") != null)'\'' <<<"$json_out" >/dev/null'
 ok "Codex JSON output does not disclose executable path" '! grep -Fq "$codex_auth/bin/codex" <<<"$json_out"'
 
+# #404: --json stdout must stay strictly machine-parseable. Capture stdout to a
+# file (command substitution would strip trailing whitespace and hide the bug)
+# and require json.load — not raw_decode recovery — to accept it every time.
+strict_json_ok=1
+for _ in 1 2 3 4 5; do
+  FAKE_CODEX_MODE=authenticated CCC_AGENT_PROVIDER=codex CCC_CODEX_CLI_PATH="$codex_auth/bin/codex" \
+    run_doctor "$codex_auth" --json >"$TMP/strict.json" 2>/dev/null
+  python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$TMP/strict.json" || { strict_json_ok=0; break; }
+done
+ok "Codex --json stdout is strictly json.load-parseable across repeated runs (#404)" '[ "$strict_json_ok" = 1 ]'
+
+# #404: prove the stdout guard captures the intermittent trailing writer. A
+# subclassed diagnose leaks to both sys.stdout (stray print) and fd 1 (a
+# descriptor-inheriting subprocess/codex grandchild); emit_json_report must keep
+# stdout a single JSON document and divert the leaks to stderr.
+cat > "$TMP/guard_leak.py" <<'PY'
+import os, sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(os.environ["DOCTOR_PY"]).resolve().parent))
+import ccc_doctor as mod
+
+
+class LeakyDoctor(mod.Doctor):
+    def diagnose(self):
+        print("STRAY_PRINT_LEAK")          # python-level stray stdout write
+        sys.stdout.flush()
+        os.write(1, b"RAW_FD1_LEAK")        # descriptor-level leak to the real fd 1
+        self.add("정상", "synthetic", "ok", "none")
+
+
+sys.exit(mod.emit_json_report(LeakyDoctor(Path("."), Path("."), "settings")))
+PY
+DOCTOR_PY="$ROOT/scripts/ccc_doctor.py" python3 "$TMP/guard_leak.py" >"$TMP/guard.out" 2>"$TMP/guard.err"
+ok "stdout guard keeps --json stdout pure JSON despite stray fd1/print leaks (#404)" \
+  'python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$TMP/guard.out" && ! grep -Eq "STRAY_PRINT_LEAK|RAW_FD1_LEAK" "$TMP/guard.out"'
+ok "stdout guard diverts stray diagnostics to stderr (#404)" \
+  'grep -q "STRAY_PRINT_LEAK" "$TMP/guard.err" && grep -q "RAW_FD1_LEAK" "$TMP/guard.err"'
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

@@ -1,8 +1,17 @@
 #!/usr/bin/env python3
-"""ccc doctor — harness consistency diagnostics and conservative repair."""
+"""ccc doctor — harness consistency diagnostics and conservative repair.
+
+``--json`` stdout contract: stdout carries exactly one JSON document (optional
+surrounding whitespace only), so a strict ``json.load`` consumer never sees
+trailing data. Probe/subprocess diagnostics are routed to stderr while the report
+is assembled. Exit code is independent of ``--json``: it is ``1`` when any
+``교정가능`` (correctable) or ``수동필요`` (manual) finding is present and ``0``
+otherwise; ``경고`` (warning) findings do not change the exit code.
+"""
 
 from __future__ import annotations
 
+import contextlib
 import filecmp
 import json
 import os
@@ -409,7 +418,7 @@ class Doctor:
         print("- `--fix` and `--rollback` alone are dry-run only.")
         print("- No remote nodes, secrets, broker/Gateway restarts, bridge restarts, migrations, or provider sends are touched.")
 
-    def print_json_report(self) -> None:
+    def json_report_text(self) -> str:
         report = {
             "repo": str(self.repo),
             "harnessVersion": self.harness_version(),
@@ -428,7 +437,15 @@ class Doctor:
                 for row in self.rows
             ],
         }
-        print(json.dumps(report, ensure_ascii=False, sort_keys=True))
+        return json.dumps(report, ensure_ascii=False, sort_keys=True)
+
+    def print_json_report(self) -> None:
+        print(self.json_report_text())
+
+    def report_exit_code(self) -> int:
+        """Exit non-zero for correctable/manual findings; warnings do not count."""
+
+        return 1 if self.counts["수동필요"] > 0 or self.counts["교정가능"] > 0 else 0
 
     def desired_settings(self) -> dict[str, Any] | None:
         if not self.settings_valid or self.mode not in {"standalone", "plugin"} or self.current_settings is None:
@@ -630,7 +647,13 @@ def parse_args(argv: list[str]) -> tuple[int, bool, bool, bool, bool, str]:
             print("- `--rollback --apply` restores only settings.json from that backup, after backing up")
             print("  the current settings.json as `ccc-doctor-pre-rollback-*.tar.gz`.")
             print("- 수동필요/risky/system-level items fail closed and are never auto-repaired.")
-            print("- `--json` emits the read-only diagnostic report as one JSON object.")
+            print("- `--json` writes exactly one JSON object to stdout (surrounding whitespace")
+            print("  only); probe/subprocess diagnostics go to stderr so stdout stays strictly")
+            print("  machine-parseable. `--fix`/`--rollback` take precedence and emit human text.")
+            print()
+            print("Exit codes (human and --json alike): 0 when only 정상/경고 findings exist; 1")
+            print("when any 교정가능 (correctable) or 수동필요 (manual) finding is present. 경고")
+            print("(warning) findings do not change the exit code.")
             return 0, fix, rollback, apply, json_output, scope
         else:
             print(f"Unknown flag: {arg}", file=sys.stderr)
@@ -643,6 +666,38 @@ def parse_args(argv: list[str]) -> tuple[int, bool, bool, bool, bool, str]:
     return -1, fix, rollback, apply, json_output, scope
 
 
+def emit_json_report(doctor: Doctor) -> int:
+    """Diagnose and write exactly one JSON document to stdout.
+
+    stdout must stay strictly machine-parseable — a single JSON object with only
+    optional surrounding whitespace — so a strict ``json.load`` consumer never
+    fails on trailing bytes. A probe (or a helper it spawns, e.g. a Codex
+    subprocess that reopens the inherited stdout descriptor) could otherwise
+    trail non-JSON bytes after the report. To make the contract structural rather
+    than best-effort, the real stdout file descriptor is redirected to stderr for
+    the entire diagnosis and the JSON document is written to a preserved private
+    copy of the original stdout, which is then closed. Any stray write — a stray
+    ``print`` or a descriptor-inheriting subprocess — therefore lands on stderr,
+    and nothing in this process can reach real stdout after the JSON document.
+    """
+
+    sys.stdout.flush()
+    sys.stderr.flush()
+    real_stdout_fd = os.dup(1)
+    try:
+        # Point fd 1 at stderr for the whole diagnosis so descriptor-inheriting
+        # writers cannot reach the JSON stream; redirect_stdout catches Python
+        # level prints too.
+        os.dup2(2, 1)
+        with contextlib.redirect_stdout(sys.stderr):
+            doctor.diagnose()
+            payload = doctor.json_report_text()
+        os.write(real_stdout_fd, (payload + "\n").encode("utf-8"))
+    finally:
+        os.close(real_stdout_fd)
+    return doctor.report_exit_code()
+
+
 def main(argv: list[str]) -> int:
     parsed_rc, fix, rollback, apply, json_output, scope = parse_args(argv)
     if parsed_rc >= 0:
@@ -650,6 +705,13 @@ def main(argv: list[str]) -> int:
     repo = Path(os.environ.get("CCC_DOCTOR_REPO_DIR", Path(__file__).resolve().parents[1])).resolve()
     claude_dir = Path(os.environ.get("CCC_DOCTOR_CLAUDE_DIR", str(Path.home() / ".claude"))).resolve()
     doctor = Doctor(repo, claude_dir, scope)
+
+    # Pure --json report: diagnose under a stdout guard so stdout stays a single
+    # JSON document. --fix/--rollback intentionally emit human-readable stdout and
+    # take precedence over --json, matching the prior behavior.
+    if json_output and not fix and not rollback:
+        return emit_json_report(doctor)
+
     doctor.diagnose()
 
     if rollback:
@@ -694,11 +756,8 @@ def main(argv: list[str]) -> int:
             print("no repairs needed.")
         return 0
 
-    if json_output:
-        doctor.print_json_report()
-    else:
-        doctor.print_report()
-    return 1 if doctor.counts["수동필요"] > 0 or doctor.counts["교정가능"] > 0 else 0
+    doctor.print_report()
+    return doctor.report_exit_code()
 
 
 if __name__ == "__main__":
