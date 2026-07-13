@@ -49,7 +49,7 @@ jobs:
           mkdir -p "$TMPDIR"
           python -m pytest -q tests/test_owner_operator_contract.py
       - name: CI hardening regressions
-        run: python -m pytest -q tests/test_ci_pip_hash_pinning.py tests/test_workflow_permissions.py tests/test_codeowners_branch_protection.py tests/test_ci_required_contexts.py tests/test_owner_operator_ci_gate.py
+        run: python -m pytest -q tests/test_ci_pip_hash_pinning.py tests/test_workflow_permissions.py tests/test_codeowners_branch_protection.py tests/test_ci_required_contexts.py tests/test_owner_operator_ci_gate.py tests/test_runtime_deps_lock.py
 
   secret-scan:
     name: secret-scan
@@ -98,3 +98,44 @@ jobs:
         with:
           name: bridge-coverage
           path: bridge/coverage.xml
+
+  wheel-smoke:
+    name: wheel-smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+      - name: Install verification tools (hash-locked)
+        run: |
+          python -m pip install --require-hashes -r .github/requirements/bridge-ci.txt
+      - name: Build bridge wheel (no isolation — backend pinned in the CI lock)
+        run: python -m build --wheel --no-isolation --outdir "$RUNNER_TEMP/dist" bridge
+      - name: Install wheel into a clean venv (hash-locked runtime deps)
+        run: |
+          python -m venv "$RUNNER_TEMP/wheel-venv"
+          "$RUNNER_TEMP/wheel-venv/bin/pip" install --require-hashes -r bridge/requirements.lock.txt
+          "$RUNNER_TEMP/wheel-venv/bin/pip" install --no-deps "$RUNNER_TEMP"/dist/*.whl
+      - name: Import and config smoke (outside the source tree)
+        working-directory: ${{ runner.temp }}
+        env:
+          TELEGRAM_BOT_TOKEN: "123456:wheel-smoke-placeholder"
+          ALLOWED_USER_IDS: "1"
+          PROJECT_ROOT: ${{ runner.temp }}
+        run: |
+          "$RUNNER_TEMP/wheel-venv/bin/python" - <<'PY'
+          import telegram_bot
+          import telegram_bot.core.bot
+          import telegram_bot.core.project_chat
+          from telegram_bot.utils.config import Settings
+
+          assert "site-packages" in telegram_bot.__file__, telegram_bot.__file__
+          settings = Settings()
+          assert settings.allowed_user_ids == [1]
+          print("wheel import/config smoke OK:", telegram_bot.__file__)
+          PY
+      - name: pip check (clean venv)
+        run: '"$RUNNER_TEMP/wheel-venv/bin/pip" check'
+      - name: pip-audit (hash-locked runtime set)
+        run: pip-audit --require-hashes --disable-pip -r bridge/requirements.lock.txt

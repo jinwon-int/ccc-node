@@ -35,6 +35,12 @@
       "job_name": "bridge-tests (${{ matrix.python-version }})"
     },
     {
+      "context": "wheel-smoke",
+      "workflow": "ci.yml",
+      "job_id": "wheel-smoke",
+      "job_name": "wheel-smoke"
+    },
+    {
       "context": "codeql-python",
       "workflow": "codeql.yml",
       "job_id": "analyze",

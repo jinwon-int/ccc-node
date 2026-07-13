@@ -19,6 +19,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `approve-each`, and `disabled` policies retain their prior behavior.
 
 ### Added
+- **Hash-locked runtime dependency installs + wheel smoke gate (#349).**
+  `bridge/requirements.lock.txt` is a new pip-compile `--generate-hashes` lock
+  of the runtime dependency set, generated from the same source as the CI lock
+  (`bridge/pyproject.toml`) and constrained to it so runtime nodes install
+  exactly the versions CI tested. `start.sh` now installs it with
+  `pip --require-hashes` by default and adds the first-party bridge package
+  with `--no-deps`, so clean installs at the same checkout resolve identical
+  versions/hashes and unhashed transitive dependencies are rejected; the
+  legacy lower-bound `requirements.txt` flow remains available behind the
+  documented `CCC_DEPS_UNLOCKED=1` escape hatch — honored from the process
+  environment or, like other bridge settings, from the project/global `.env`
+  (the locked path also drops
+  the previous unpinned `pip install --upgrade pip`, removing an
+  install-time nondeterminism source). Both locks are regenerated together by
+  the new `scripts/ccc-deps-lock.sh`, which records the Termux/Linux/macOS
+  single-lock marker policy and enforces runtime⊆CI version consistency —
+  also guarded in CI by the new `tests/test_runtime_deps_lock.py`. A new
+  `wheel-smoke` CI job (declared as a required context in
+  `.github/required-checks.json`; the live branch-protection addition follows
+  the approved #350 post-merge pattern) builds the bridge wheel with
+  `--no-isolation` (the setuptools backend is hash-pinned in the CI lock, so
+  the build fetches nothing unhashed), installs the hash-locked runtime set
+  plus the wheel with `--no-deps` into a clean venv,
+  import/config-smokes the installed package outside the source tree, and
+  makes `pip check` and `pip-audit` (over the hash-locked runtime set)
+  blocking gates.
 - **Runtime health probe + threshold alerts, detection-only (#389).** A new
   periodic lifecycle task exports four structured signals to
   `health.json → signals` every `CCC_HEALTH_ALERTS_INTERVAL_SECONDS` (60):

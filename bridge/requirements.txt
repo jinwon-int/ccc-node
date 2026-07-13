@@ -1,6 +1,9 @@
-# Compatibility install list for legacy scripts/operators. New installs should
-# prefer `pip install -e .` (or `pip install -e .[dev]` for tests); keep this in
-# sync with bridge/pyproject.toml until all nodes have migrated.
+# Compatibility install list for legacy scripts/operators. Normal node installs
+# go through start.sh, which installs the hash-locked requirements.lock.txt
+# (regenerated via scripts/ccc-deps-lock.sh) with --require-hashes; this file is
+# only used when CCC_DEPS_UNLOCKED=1 opts out of the locked flow. For manual
+# dev setups prefer `pip install -e .` (or `pip install -e .[dev]` for tests);
+# keep this in sync with bridge/pyproject.toml until all nodes have migrated.
 python-telegram-bot>=20.7
 telegramify-markdown>=0.5.0
 python-dotenv>=1.2.2

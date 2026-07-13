@@ -20,6 +20,7 @@ EXPECTED_CONTEXTS = [
     "secret-scan",
     "bridge-tests (3.11)",
     "bridge-tests (3.12)",
+    "wheel-smoke",
     "codeql-python",
 ]
 

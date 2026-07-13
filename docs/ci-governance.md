@@ -18,13 +18,46 @@ protection API field; rulesets call the analogous field `integration_id`.
 | `secret-scan` | `harness-ci` |
 | `bridge-tests (3.11)` | `harness-ci` |
 | `bridge-tests (3.12)` | `harness-ci` |
+| `wheel-smoke` | `harness-ci` |
 | `codeql-python` | `codeql` |
 
 The first five contexts were already enforced by legacy branch protection.
 After the approved #350 post-merge mutation, CodeQL is required under the
-stable `codeql-python` name as the sixth context. Workflow job names and this
-manifest are guarded by `tests/test_ci_required_contexts.py` so a rename cannot
-silently strand the live required context.
+stable `codeql-python` name as the sixth context. `wheel-smoke` (issue #349)
+is the seventh declared context: it builds the bridge wheel, installs the
+hash-locked runtime set plus the wheel into a clean venv, import/config-smokes
+the installed package outside the source tree, and runs `pip check` and
+`pip-audit` against the runtime lock. Its live required-check addition follows
+the same approved post-merge operation pattern as #350: mutate only
+`required_status_checks`, verify the readback, and roll back only the check
+list on failure. Workflow job names and this manifest are guarded by
+`tests/test_ci_required_contexts.py` so a rename cannot silently strand the
+live required context.
+
+## Dependency lock governance (issue #349)
+
+Two hash locks share one generation source, `bridge/pyproject.toml`, and are
+regenerated together by `scripts/ccc-deps-lock.sh`:
+
+1. `.github/requirements/bridge-ci.txt` — CI toolchain (ruff, mypy, build,
+   pip-audit, pinned pip) plus the bridge dev extra; every CI `pip install`
+   uses `--require-hashes` against it.
+2. `bridge/requirements.lock.txt` — the runtime set, compiled with the CI lock
+   as a pip constraint so runtime nodes install exactly the versions CI
+   tested. `bridge/start.sh` installs it with `--require-hashes` by default
+   and adds the first-party package with `--no-deps`, so no unhashed
+   transitive dependency can enter a node. `CCC_DEPS_UNLOCKED=1` is the
+   documented escape hatch for hosts that cannot build a locked artifact.
+
+`tests/test_runtime_deps_lock.py` enforces that the runtime lock stays a
+version-consistent subset of the CI lock, that every pin carries hashes, and
+that the wheel-smoke/audit gates stay wired. Lock refreshes — including
+Dependabot-driven bumps — are regenerated via the script and land as one
+verified PR unit validated by the full required-check matrix; lock files are
+never hand-edited. The platform marker/lock policy (single Linux-compiled
+lock for glibc Linux, macOS, and Termux; sdist hashes cover source builds;
+platform-specific deps require explicit environment markers in
+`bridge/pyproject.toml`) is documented in `scripts/ccc-deps-lock.sh`.
 
 ## CodeQL update atomicity
 
