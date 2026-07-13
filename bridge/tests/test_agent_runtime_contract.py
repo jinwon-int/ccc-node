@@ -155,6 +155,8 @@ class AgentRuntimeContractTests(unittest.IsolatedAsyncioTestCase):
             lambda: SessionRequest(working_directory="/workspace", session_id=""),
             lambda: SessionRequest(working_directory="/workspace", model=""),
             lambda: SessionRequest(working_directory="/workspace", effort=""),
+            lambda: SessionRequest(working_directory="/workspace", approvals_reviewer=""),
+            lambda: SessionRequest(working_directory="/workspace", sandbox_policy={}),
             lambda: ModelInfo(id="", display_name="Fake model"),
             lambda: ModelInfo(id="fake", display_name=""),
         )

@@ -22,6 +22,7 @@ BASH_POLICY_ENV = "CCC_BRIDGE_BASH_POLICY"
 BASH_DISABLED = "disabled"
 BASH_APPROVE_EACH = "approve-each"
 BASH_AUTO_APPROVE = "auto-approve"
+BASH_AUTO_REVIEW = "auto-review"
 
 EXECUTION_PROFILE_ENV = "CCC_BRIDGE_EXECUTION_PROFILE"
 EXECUTION_OWNER_OPERATOR = "owner-operator"
@@ -169,7 +170,7 @@ def resolve_bash_policy(raw: Optional[str] = None) -> str:
 
     value = os.getenv(BASH_POLICY_ENV, BASH_AUTO_APPROVE) if raw is None else raw
     normalized = str(value).strip().lower().replace("_", "-")
-    if normalized in (BASH_AUTO_APPROVE, BASH_APPROVE_EACH):
+    if normalized in (BASH_AUTO_APPROVE, BASH_APPROVE_EACH, BASH_AUTO_REVIEW):
         return normalized
     return BASH_DISABLED
 
@@ -210,14 +211,18 @@ def disallowed_tools(bash_policy: Optional[str] = None) -> List[str]:
 def bash_permission_hooks(
     bash_policy: Optional[str] = None,
 ) -> Dict[str, List[HookMatcher]]:
-    """Force Bash through ``can_use_tool`` only under ``approve-each``.
+    """Force Bash through ``can_use_tool`` under interactive policies.
 
     A PreToolUse ``ask`` decision takes precedence over allow rules, including
     broad ``Bash(*)`` rules inherited from settings.json. ``auto-approve``
-    deliberately installs no ask hook.
+    deliberately installs no ask hook. ``auto-review`` uses this conservative
+    path for Claude, which has no Codex reviewer agent.
     """
 
-    if resolve_bash_policy(bash_policy) != BASH_APPROVE_EACH:
+    if resolve_bash_policy(bash_policy) not in (
+        BASH_APPROVE_EACH,
+        BASH_AUTO_REVIEW,
+    ):
         return {}
 
     async def require_per_call_approval(

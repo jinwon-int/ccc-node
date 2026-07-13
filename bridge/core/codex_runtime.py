@@ -59,6 +59,8 @@ class AppServerClient(Protocol):
         model: str | None = None,
         effort: str | None = None,
         approval_policy: str | None = None,
+        approvals_reviewer: str | None = None,
+        sandbox_policy: Mapping[str, JsonValue] | None = None,
     ) -> JsonValue: ...
 
     async def turn_interrupt(self, thread_id: str, turn_id: str) -> JsonValue: ...
@@ -101,6 +103,8 @@ class CodexSession:
         model: str | None,
         effort: str | None,
         approval_policy: str | None,
+        approvals_reviewer: str | None,
+        sandbox_policy: Mapping[str, AgentJsonValue] | None,
         turn_lock: asyncio.Lock,
     ) -> None:
         self._runtime = runtime
@@ -108,6 +112,8 @@ class CodexSession:
         self._model = model
         self._effort = effort
         self._approval_policy = approval_policy
+        self._approvals_reviewer = approvals_reviewer
+        self._sandbox_policy = cast(Mapping[str, JsonValue] | None, sandbox_policy)
         self._turn_lock = turn_lock
 
     @property
@@ -131,6 +137,8 @@ class CodexSession:
                         model=self._model,
                         effort=self._effort,
                         approval_policy=self._approval_policy,
+                        approvals_reviewer=self._approvals_reviewer,
+                        sandbox_policy=self._sandbox_policy,
                     )
                     returned_turn_id = self._runtime._turn_id(result)
                     if active.turn_id is not None and active.turn_id != returned_turn_id:
@@ -221,6 +229,8 @@ class CodexRuntime:
             request.model,
             request.effort,
             request.approval_policy,
+            request.approvals_reviewer,
+            request.sandbox_policy,
             turn_lock,
         )
 
