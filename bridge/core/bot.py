@@ -557,6 +557,7 @@ class TelegramBot(
                 session_id=effective_sid,
                 model=current_session.get("model"),
                 effort=current_session.get("effort"),
+                approval_policy=self._codex_approval_policy(),
                 new_session=new_session,
                 permission_callback=self._permission_callback,
                 approval_callback=self._codex_approval_callback,

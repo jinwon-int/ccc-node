@@ -58,6 +58,7 @@ class AppServerClient(Protocol):
         *,
         model: str | None = None,
         effort: str | None = None,
+        approval_policy: str | None = None,
     ) -> JsonValue: ...
 
     async def turn_interrupt(self, thread_id: str, turn_id: str) -> JsonValue: ...
@@ -85,6 +86,7 @@ class _ActiveTurn:
     queue: asyncio.Queue[AgentEvent]
     approval_handler: ApprovalHandler
     turn_id: str | None = None
+    turn_ready: asyncio.Event = field(default_factory=asyncio.Event)
     finished: bool = False
     pending_notifications: list[CodexNotification] = field(default_factory=list)
 
@@ -98,12 +100,14 @@ class CodexSession:
         thread_id: str,
         model: str | None,
         effort: str | None,
+        approval_policy: str | None,
         turn_lock: asyncio.Lock,
     ) -> None:
         self._runtime = runtime
         self._thread_id = thread_id
         self._model = model
         self._effort = effort
+        self._approval_policy = approval_policy
         self._turn_lock = turn_lock
 
     @property
@@ -126,8 +130,13 @@ class CodexSession:
                         [{"type": "text", "text": message}],
                         model=self._model,
                         effort=self._effort,
+                        approval_policy=self._approval_policy,
                     )
-                    active.turn_id = self._runtime._turn_id(result)
+                    returned_turn_id = self._runtime._turn_id(result)
+                    if active.turn_id is not None and active.turn_id != returned_turn_id:
+                        raise RuntimeError("Codex approval turn does not match turn/start response")
+                    active.turn_id = returned_turn_id
+                    active.turn_ready.set()
                     self._runtime._flush_pending_notifications(active)
                     while True:
                         event = await active.queue.get()
@@ -143,6 +152,7 @@ class CodexSession:
                     )
                 finally:
                     active.finished = True
+                    active.turn_ready.set()
                     if self._runtime._active_turns.get(self._thread_id) is active:
                         self._runtime._active_turns.pop(self._thread_id, None)
 
@@ -205,7 +215,14 @@ class CodexRuntime:
             )
         thread_id = self._thread_id(result)
         turn_lock = self._thread_locks.setdefault(thread_id, asyncio.Lock())
-        return CodexSession(self, thread_id, request.model, request.effort, turn_lock)
+        return CodexSession(
+            self,
+            thread_id,
+            request.model,
+            request.effort,
+            request.approval_policy,
+            turn_lock,
+        )
 
     async def list_models(self) -> Sequence[ModelInfo]:
         await self._ensure_started()
@@ -491,12 +508,19 @@ class CodexRuntime:
         active: _ActiveTurn | None = None
         if isinstance(thread_id, str):
             active = self._active_turns.get(thread_id)
-        if (
-            active is None
-            or active.finished
-            or not isinstance(turn_id, str)
-            or active.turn_id != turn_id
-        ):
+        if active is None or active.finished or not isinstance(turn_id, str):
+            return self._approval_response(request.method, ApprovalDecision.DENY, request.params)
+        if active.turn_id is None:
+            # A server request task can be scheduled before turn/start returns.
+            # Wait for the exact returned turn ID before exposing approval UI or
+            # sending an allow decision. A missing response remains fail-closed.
+            try:
+                await asyncio.wait_for(active.turn_ready.wait(), timeout=5.0)
+            except TimeoutError:
+                return self._approval_response(
+                    request.method, ApprovalDecision.DENY, request.params
+                )
+        if active.finished or active.turn_id != turn_id:
             return self._approval_response(request.method, ApprovalDecision.DENY, request.params)
 
         approval = ApprovalRequestEvent(

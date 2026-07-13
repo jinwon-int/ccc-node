@@ -478,6 +478,7 @@ class BotDeliveryMixin:
                         session_id=self._effective_session_id(conversation_key, session),
                         model=session.get("model"),
                         effort=session.get("effort"),
+                        approval_policy=self._codex_approval_policy(),
                         permission_callback=self._permission_callback,
                         approval_callback=self._codex_approval_callback,
                         typing_callback=lambda: app.bot.send_chat_action(

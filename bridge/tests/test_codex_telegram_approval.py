@@ -52,9 +52,16 @@ def approval_event() -> ApprovalRequestEvent:
     )
 
 
-def _subject(*, timeout: float = 0.2, send_error=None, edit_error=None):
+def _subject(
+    *, timeout: float = 0.2, send_error=None, edit_error=None, bash_policy: str = "approve-each"
+):
     subject = TelegramBot.__new__(TelegramBot)
-    subject._config = SimpleNamespace(allowed_user_ids=[7])
+    subject._config = SimpleNamespace(
+        allowed_user_ids=[7],
+        bash_policy=bash_policy,
+        execution_profile="owner-operator",
+        require_allowlist=True,
+    )
     subject._project_chat = FakeProjectChat()
     subject._codex_approval_timeout_seconds = timeout
     subject._codex_approval_max_pending = 4
@@ -123,6 +130,20 @@ async def test_wrong_owner_chat_unknown_and_stale_do_not_resume(
     subject._project_chat.active.clear()
     assert await subject._resolve_codex_approval(7, 70, data) is True
     assert await task is ApprovalDecision.DENY
+
+
+@pytest.mark.anyio
+async def test_disabled_policy_denies_without_rendering_ui(
+    approval_event: ApprovalRequestEvent,
+) -> None:
+    subject, telegram = _subject(bash_policy="disabled")
+    subject._project_chat.active.add((7, 70, 1))
+
+    decision = await subject._codex_approval_callback(70, 7, approval_event, 1)
+
+    assert decision is ApprovalDecision.DENY
+    assert telegram.sent == []
+    assert subject._pending_codex_approvals == {}
 
 
 @pytest.mark.anyio

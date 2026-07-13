@@ -178,6 +178,7 @@ class ProjectChatHandler(
         self._agent_sessions: Dict[Tuple[int, int], Any] = {}
         self._agent_session_models: Dict[Tuple[int, int], Optional[str]] = {}
         self._agent_session_efforts: Dict[Tuple[int, int], Optional[str]] = {}
+        self._agent_session_approval_policies: Dict[Tuple[int, int], Optional[str]] = {}
         self._agent_active_sessions: Dict[Tuple[int, int], Any] = {}
         self._agent_active_generations: Dict[Tuple[int, int], int] = {}
         self._agent_generation_counters: Dict[Tuple[int, int], int] = {}

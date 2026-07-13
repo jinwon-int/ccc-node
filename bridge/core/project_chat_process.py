@@ -62,6 +62,7 @@ class ProjectChatProcessMixin:
         session_id: Optional[str] = None,
         model: Optional[str] = None,
         effort: Optional[str] = None,
+        approval_policy: Optional[str] = None,
         new_session: bool = False,
         permission_callback: Optional[PermissionCallback] = None,
         approval_callback: Optional[AgentApprovalCallback] = None,
@@ -79,6 +80,7 @@ class ProjectChatProcessMixin:
                 session_id=session_id,
                 model=model,
                 effort=effort,
+                approval_policy=approval_policy,
                 new_session=new_session,
                 approval_callback=approval_callback,
                 typing_callback=typing_callback,
@@ -317,6 +319,7 @@ class ProjectChatProcessMixin:
         session_id: Optional[str],
         model: Optional[str],
         effort: Optional[str],
+        approval_policy: Optional[str],
         new_session: bool,
         approval_callback: Optional[AgentApprovalCallback],
         typing_callback: Optional[TypingCallback],
@@ -340,11 +343,13 @@ class ProjectChatProcessMixin:
                     (session_id is not None and session.session_id != session_id)
                     or self._agent_session_models.get(key) != model
                     or self._agent_session_efforts.get(key) != effort
+                    or self._agent_session_approval_policies.get(key) != approval_policy
                 )
             ):
                 self._agent_sessions.pop(key, None)
                 self._agent_session_models.pop(key, None)
                 self._agent_session_efforts.pop(key, None)
+                self._agent_session_approval_policies.pop(key, None)
                 session = None
             try:
                 if session is None:
@@ -354,11 +359,13 @@ class ProjectChatProcessMixin:
                             session_id=None if new_session else session_id,
                             model=model,
                             effort=effort,
+                            approval_policy=approval_policy,
                         )
                     )
                     self._agent_sessions[key] = session
                     self._agent_session_models[key] = model
                     self._agent_session_efforts[key] = effort
+                    self._agent_session_approval_policies[key] = approval_policy
 
                 self._agent_active_sessions[key] = session
                 self._agent_started_at[key] = asyncio.get_running_loop().time()
@@ -434,6 +441,7 @@ class ProjectChatProcessMixin:
                         self._agent_sessions.pop(key, None)
                         self._agent_session_models.pop(key, None)
                         self._agent_session_efforts.pop(key, None)
+                        self._agent_session_approval_policies.pop(key, None)
                     return ChatResponse(
                         content=f"❌ Processing failed: {terminal_error.message}",
                         success=False,
@@ -452,6 +460,7 @@ class ProjectChatProcessMixin:
                     self._agent_sessions.pop(key, None)
                     self._agent_session_models.pop(key, None)
                     self._agent_session_efforts.pop(key, None)
+                    self._agent_session_approval_policies.pop(key, None)
                 if session is not None:
                     await self._interrupt_agent_session(session)
                 await self._cancel_agent_streaming(
@@ -476,6 +485,7 @@ class ProjectChatProcessMixin:
                     self._agent_sessions.pop(key, None)
                     self._agent_session_models.pop(key, None)
                     self._agent_session_efforts.pop(key, None)
+                    self._agent_session_approval_policies.pop(key, None)
                 await self._cancel_agent_streaming(
                     streaming_handler, context="returning an agent error"
                 )
