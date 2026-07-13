@@ -187,6 +187,28 @@ class AgentRuntimeContractTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(TypeError):
             cast(dict[str, object], request.arguments)["path"] = "forbidden"
 
+    async def test_session_request_sandbox_policy_is_recursively_immutable_snapshot(
+        self,
+    ) -> None:
+        sandbox: dict[str, JsonValue] = {
+            "type": "workspaceWrite",
+            "networkAccess": False,
+            "writableRoots": ["/workspace"],
+        }
+        request = SessionRequest(
+            working_directory="/workspace",
+            sandbox_policy=sandbox,
+        )
+
+        sandbox["networkAccess"] = True
+        cast(list[str], sandbox["writableRoots"]).append("/tmp")
+
+        assert request.sandbox_policy is not None
+        self.assertFalse(request.sandbox_policy["networkAccess"])
+        self.assertEqual(request.sandbox_policy["writableRoots"], ("/workspace",))
+        with self.assertRaises(TypeError):
+            cast(dict[str, JsonValue], request.sandbox_policy)["networkAccess"] = True
+
     async def test_tool_lifecycle_events_are_typed_immutable_snapshots(self) -> None:
         arguments: dict[str, JsonValue] = {"command": "pwd", "paths": ["."]}
         output: dict[str, JsonValue] = {"exitCode": 0, "lines": ["/workspace"]}
