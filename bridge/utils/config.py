@@ -505,6 +505,56 @@ class Config(BaseSettings):
             "heartbeat is removed too — raise this when you run such tools."
         ),
     )
+    health_alerts_enabled: bool = Field(
+        default=True,
+        alias="CCC_HEALTH_ALERTS_ENABLED",
+        description=(
+            "Run the detection-only runtime health probe (#389): every interval "
+            "it exports session-liveness, heartbeat-age, notification-backlog, "
+            "and orphan-child signals to health.json and evaluates alert "
+            "thresholds. Alerts are queued through the owner-only push-notifier "
+            "spool, so a real Telegram send additionally requires "
+            "CCC_PUSH_ENABLED; with push disabled alerts surface in logs and "
+            "health.json only."
+        ),
+    )
+    health_alerts_interval_seconds: float = Field(
+        default=60.0,
+        alias="CCC_HEALTH_ALERTS_INTERVAL_SECONDS",
+        description="Seconds between runtime health probe ticks.",
+    )
+    health_alerts_cooldown_seconds: float = Field(
+        default=1800.0,
+        alias="CCC_HEALTH_ALERTS_COOLDOWN_SECONDS",
+        description=(
+            "Per-alert-code cooldown: a persistent condition re-alerts only "
+            "after this long (a cleared condition re-arms immediately)."
+        ),
+    )
+    alert_heartbeat_age_factor: float = Field(
+        default=1.0,
+        alias="CCC_ALERT_HEARTBEAT_AGE_FACTOR",
+        description=(
+            "Alert when the oldest in-flight request exceeds this multiple of "
+            "CLAUDE_PROCESS_TIMEOUT — nothing should outlive its own request "
+            "lifetime (#307 regression guard). 0 disables this check."
+        ),
+    )
+    alert_max_dead_streams: int = Field(
+        default=1,
+        alias="CCC_ALERT_MAX_DEAD_STREAMS",
+        description="Alert when at least this many registered streams have a dead reader.",
+    )
+    alert_max_pending_notifications: int = Field(
+        default=10,
+        alias="CCC_ALERT_MAX_PENDING_NOTIFICATIONS",
+        description="Alert when the push-notifier spool backlog reaches this size.",
+    )
+    alert_max_orphan_children: int = Field(
+        default=1,
+        alias="CCC_ALERT_MAX_ORPHAN_CHILDREN",
+        description="Alert when at least this many orphan node-claude processes survive.",
+    )
     terminal_stall_seconds: float = Field(
         default=300.0,
         alias="CCC_TERMINAL_STALL_SECONDS",

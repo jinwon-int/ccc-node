@@ -426,6 +426,7 @@ class BotLifecycleMixin:
             reaper_task = None
             workload_task = None
             dead_session_recovery_task = None
+            health_alerts_task = None
             try:
                 await self.application.start()
                 await self.application.updater.start_polling(
@@ -458,6 +459,9 @@ class BotLifecycleMixin:
                 dead_session_recovery_task = asyncio.create_task(
                     self._periodic_dead_session_recovery(stop_event),
                     name="dead-session-recovery",
+                )
+                health_alerts_task = asyncio.create_task(
+                    self._health_alerts_probe(stop_event), name="health-alerts"
                 )
 
                 await self._supervise_polling(stop_event)
@@ -536,6 +540,7 @@ class BotLifecycleMixin:
                     reaper_task,
                     workload_task,
                     dead_session_recovery_task,
+                    health_alerts_task,
                 ):
                     if _task and not _task.done():
                         _task.cancel()
@@ -774,6 +779,74 @@ class BotLifecycleMixin:
             stop_event,
             on_stats=self._record_recovery_stats,
         )
+
+    async def _health_alerts_probe(self, stop_event: asyncio.Event) -> None:
+        """Detection-only runtime health probe + threshold alerts (#389).
+
+        Every tick exports the four structured signals to ``health.json`` and
+        evaluates alert thresholds. Fired alerts are logged and queued through
+        the owner-only push-notifier spool — the actual Telegram send stays
+        behind the notifier's ``CCC_PUSH_ENABLED`` opt-in, so this task never
+        contacts a provider on its own. No remediation is performed here.
+        """
+        from telegram_bot.utils.health_alerts import (
+            AlertGate,
+            AlertThresholds,
+            HealthProbe,
+            evaluate_alerts,
+            probe_interval,
+            write_alert_spool,
+        )
+
+        settings = self._config
+        if not getattr(settings, "health_alerts_enabled", True):
+            return
+        # Defensive clamp: a non-positive configured interval would make
+        # wait_for time out immediately and spin this loop hot (#430 review).
+        interval = probe_interval(getattr(settings, "health_alerts_interval_seconds", None))
+        probe = HealthProbe(
+            project_chat=self._project_chat,
+            spool_dir=self._push_notifier.spool_dir,
+            thresholds=AlertThresholds(
+                heartbeat_age_factor=float(
+                    getattr(settings, "alert_heartbeat_age_factor", 1.0)
+                ),
+                max_dead_streams=int(getattr(settings, "alert_max_dead_streams", 1)),
+                max_pending_notifications=int(
+                    getattr(settings, "alert_max_pending_notifications", 10)
+                ),
+                max_orphan_children=int(
+                    getattr(settings, "alert_max_orphan_children", 1)
+                ),
+            ),
+        )
+        gate = AlertGate(
+            cooldown_seconds=float(
+                getattr(settings, "health_alerts_cooldown_seconds", 1800.0)
+            )
+        )
+        push_enabled = bool(getattr(settings, "push_enabled", False))
+        while not stop_event.is_set():
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=interval)
+                return
+            except asyncio.TimeoutError:
+                pass
+            try:
+                now = asyncio.get_running_loop().time()
+                signals = probe.collect(now)
+                fired = gate.admit(evaluate_alerts(signals, probe.thresholds))
+                health_reporter.record_health_signals(
+                    signals.as_dict(), alerts_fired=len(fired)
+                )
+                for alert in fired:
+                    logger.warning("Health alert [%s]: %s", alert.code, alert.message)
+                    if push_enabled:
+                        write_alert_spool(self._push_notifier.spool_dir, alert)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # detection must never hurt the bridge
+                logger.debug("Health probe tick failed: %s", type(exc).__name__)
 
     async def _workload_reporter(self, stop_event: asyncio.Event):
         """Publish in-flight request count to health.json on a fixed interval.
