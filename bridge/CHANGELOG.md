@@ -91,6 +91,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fail closed. Linux/WSL2 requires `bubblewrap` and `socat`.
 
 ### Fixed
+- **Transient Telegram outages no longer cancel in-flight AI turns (#411, part A).**
+  A runtime `NetworkError`/`TimedOut` or a watchdog-detected hang previously tore
+  down the whole Application lifecycle, taking the in-progress agent turn with it
+  (observed live: a ~10s transport blip cancelled a running Claude turn and its
+  answer was never delivered). Polling exits are now supervised: the bridge first
+  runs a bounded transport-only reconnect (`_RECONNECT_ATTEMPTS`, exponential
+  backoff) that restarts only the updater — the Application object, bot request
+  pools, conversation FIFO, and every in-flight agent turn survive untouched, so
+  a turn finishing mid-outage still delivers exactly once through the surviving
+  bot. Escalation to the full teardown/rebuild path happens only when the
+  reconnect fails outright or reconnected polling keeps dying within
+  `_MIN_UPTIME` (preserving the rapid-crash SystemExit accounting). The polling
+  watchdog now stays alive after triggering a restart, since no rebuild recreates
+  it after a transport-only reconnect. Reconnects never drop pending updates —
+  only the process's very first polling start drops the backlog — so messages
+  sent during an outage are no longer lost. Permanent failures (invalid token,
+  getUpdates conflict, revoked token) keep their fail-closed SystemExit, and the
+  in-flight requests they terminate are now attributed in
+  `health.json → transport.cancelled_by_transport`; successful transport-only
+  reconnects increment `transport.reconnects`.
 - **Canonical update provenance (#351).** `bridge/start.sh` no longer compares
   the vendored bridge changelog with `terranc/claude-telegram-bot-bridge`
   releases and then pulls whichever checkout happens to be current. `--upgrade`
