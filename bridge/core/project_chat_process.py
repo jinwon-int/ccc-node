@@ -20,6 +20,7 @@ from telegram_bot.core.agent_runtime import (
     ToolCompletedEvent,
     ToolStartedEvent,
 )
+from telegram_bot.core.heartbeat import tool_label
 from telegram_bot.core.project_chat_types import (
     AgentApprovalCallback,
     ChatResponse,
@@ -32,8 +33,11 @@ from telegram_bot.core.project_chat_types import (
 )
 from telegram_bot.core.task_ledger import (
     CANCELED as TASK_CANCELED,
+    COMPLETED as TASK_COMPLETED,
     FAILED as TASK_FAILED,
+    INPUT_REQUIRED as TASK_INPUT_REQUIRED,
     TIMEOUT as TASK_TIMEOUT,
+    WORKING as TASK_WORKING,
 )
 from telegram_bot.core.sdk_text import (
     RESTART_INTERRUPT_NOTICE,
@@ -91,6 +95,7 @@ class ProjectChatProcessMixin:
                 new_session=new_session,
                 approval_callback=approval_callback,
                 typing_callback=typing_callback,
+                status_callback=status_callback,
                 bot=bot,
             )
         logger.info(f"Processing message from user {user_id}: {user_message[:80]}...")
@@ -317,6 +322,40 @@ class ProjectChatProcessMixin:
         except Exception:
             logger.exception("Failed to cancel agent stream while %s", context)
 
+    async def _agent_progress_loop(self, request: _PendingRequest) -> None:
+        """Keep provider-neutral turns visibly alive between runtime events."""
+        try:
+            while not request.future.done():
+                now = asyncio.get_running_loop().time()
+                if (
+                    request.typing_callback is not None
+                    and self._should_refresh_typing(request, now)
+                    and now - request.last_typing_at >= self._typing_interval_seconds
+                ):
+                    request.last_typing_at = now
+                    try:
+                        await request.typing_callback()
+                    except Exception:
+                        pass
+                try:
+                    await self._maybe_update_heartbeat(request, now)
+                except Exception as exc:
+                    logger.warning(
+                        "Provider-neutral heartbeat update failed: %s",
+                        type(exc).__name__,
+                    )
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(request.future),
+                        timeout=self._typing_interval_seconds,
+                    )
+                except TimeoutError:
+                    pass
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Provider-neutral progress loop failed")
+
     async def _process_agent_message(  # noqa: C901 -- #348 baseline hotspot
         self,
         *,
@@ -332,6 +371,7 @@ class ProjectChatProcessMixin:
         new_session: bool,
         approval_callback: Optional[AgentApprovalCallback],
         typing_callback: Optional[TypingCallback],
+        status_callback: Optional[StatusCallback],
         bot: Optional[Any],
     ) -> ChatResponse:
         """Run one provider-neutral turn without changing the Claude SDK path."""
@@ -343,6 +383,26 @@ class ProjectChatProcessMixin:
             streaming_handler = StreamingMessageHandler(bot, chat_id, user_id, settings=self._config)
 
         async with self._get_conversation_lock(user_id, chat_id):
+            loop = asyncio.get_running_loop()
+            progress_future: asyncio.Future[None] = loop.create_future()
+            progress_request = _PendingRequest(
+                user_id=user_id,
+                chat_id=chat_id,
+                model=model,
+                requested_session_id=session_id,
+                permission_callback=None,
+                typing_callback=typing_callback,
+                future=progress_future,
+                status_callback=status_callback,
+                streaming_handler=streaming_handler,
+            )
+            progress_request.started_at = loop.time()
+            progress_request.task_id = self._ledger_create(user_id, chat_id)
+            progress_task = asyncio.create_task(
+                self._agent_progress_loop(progress_request),
+                name=f"agent-progress-{user_id}-{chat_id}",
+            )
+            progress_terminal_state = TASK_FAILED
             generation = self._next_agent_generation(key)
             self._agent_active_generations[key] = generation
             session = self._agent_sessions.get(key)
@@ -395,13 +455,24 @@ class ProjectChatProcessMixin:
                         return ApprovalDecision.DENY
                     if not self.is_agent_approval_active(user_id, chat_id, generation):
                         return ApprovalDecision.DENY
+                    progress_request.awaiting_permission = True
+                    ledger = self._task_ledger
+                    if ledger and progress_request.task_id:
+                        ledger.set_state(progress_request.task_id, TASK_INPUT_REQUIRED)
                     try:
-                        decision = await approval_callback(chat_id, user_id, event, generation)
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception:
-                        logger.exception("Provider-neutral approval callback failed")
-                        return ApprovalDecision.DENY
+                        try:
+                            decision = await approval_callback(
+                                chat_id, user_id, event, generation
+                            )
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception:
+                            logger.exception("Provider-neutral approval callback failed")
+                            return ApprovalDecision.DENY
+                    finally:
+                        progress_request.awaiting_permission = False
+                        if ledger and progress_request.task_id:
+                            ledger.set_state(progress_request.task_id, TASK_WORKING)
                     if (
                         decision is ApprovalDecision.ALLOW
                         and self.is_agent_approval_active(user_id, chat_id, generation)
@@ -426,6 +497,7 @@ class ProjectChatProcessMixin:
                     nonlocal terminal_error, stalled
                     busy_depth = 0
                     approval_pending = False
+                    active_tools: dict[str, str] = {}
                     iterator = session.send_turn(
                         user_message,
                         approval_handler=handle_approval,
@@ -450,25 +522,36 @@ class ProjectChatProcessMixin:
                             except TimeoutError:
                                 stalled = True
                                 return
+                            now = asyncio.get_running_loop().time()
+                            progress_request.last_event_at = now
                             approval_pending = isinstance(event, ApprovalRequestEvent)
-                            if typing_callback is not None:
-                                try:
-                                    await typing_callback()
-                                except Exception:
-                                    pass
                             if isinstance(event, TextDeltaEvent):
+                                progress_request.last_text_at = now
                                 text_parts.append(event.text)
                                 if streaming_handler:
                                     await streaming_handler.update_if_needed(event.text)
+                                    progress_request.last_visible_progress_at = now
                             elif isinstance(event, ToolStartedEvent):
                                 busy_depth += 1
+                                progress_request.last_tool_at = now
+                                label = tool_label(event.tool_name, dict(event.arguments))
+                                if label is not None:
+                                    active_tools[event.tool_call_id] = label
+                                    progress_request.current_tool_label = label
                                 if streaming_handler:
                                     await streaming_handler.add_tool_call(
                                         event.tool_name,
                                         dict(event.arguments),
                                     )
+                                    progress_request.last_visible_progress_at = now
                             elif isinstance(event, ToolCompletedEvent):
                                 busy_depth = max(0, busy_depth - 1)
+                                active_tools.pop(event.tool_call_id, None)
+                                progress_request.current_tool_label = (
+                                    list(active_tools.values())[-1]
+                                    if active_tools
+                                    else None
+                                )
                             elif isinstance(event, ErrorEvent):
                                 terminal_error = event
                             elif isinstance(
@@ -499,6 +582,7 @@ class ProjectChatProcessMixin:
                 )
 
                 if stalled:
+                    progress_terminal_state = TASK_COMPLETED
                     if self._agent_sessions.get(key) is session:
                         self._agent_sessions.pop(key, None)
                         self._agent_session_models.pop(key, None)
@@ -532,6 +616,7 @@ class ProjectChatProcessMixin:
                 content = self._clean_response("".join(text_parts)) or "(No response)"
                 streamed = bool(streaming_handler and streaming_handler.drafts)
                 if terminal_error is not None:
+                    progress_terminal_state = TASK_FAILED
                     if self._agent_sessions.get(key) is session:
                         self._agent_sessions.pop(key, None)
                         self._agent_session_models.pop(key, None)
@@ -546,6 +631,7 @@ class ProjectChatProcessMixin:
                         session_id=session.session_id,
                         streamed=streamed,
                     )
+                progress_terminal_state = TASK_COMPLETED
                 return ChatResponse(
                     content=content,
                     success=True,
@@ -553,6 +639,7 @@ class ProjectChatProcessMixin:
                     streamed=streamed,
                 )
             except TimeoutError:
+                progress_terminal_state = TASK_TIMEOUT
                 if session is not None and self._agent_sessions.get(key) is session:
                     self._agent_sessions.pop(key, None)
                     self._agent_session_models.pop(key, None)
@@ -573,6 +660,7 @@ class ProjectChatProcessMixin:
                     session_id=session.session_id if session is not None else session_id,
                 )
             except asyncio.CancelledError:
+                progress_terminal_state = TASK_CANCELED
                 if session is not None:
                     await self._interrupt_agent_session(session)
                 await self._cancel_agent_streaming(
@@ -580,6 +668,7 @@ class ProjectChatProcessMixin:
                 )
                 raise
             except Exception as exc:
+                progress_terminal_state = TASK_FAILED
                 if session is not None and self._agent_sessions.get(key) is session:
                     self._agent_sessions.pop(key, None)
                     self._agent_session_models.pop(key, None)
@@ -598,6 +687,19 @@ class ProjectChatProcessMixin:
                     session_id=session.session_id if session is not None else session_id,
                 )
             finally:
+                if not progress_future.done():
+                    progress_future.set_result(None)
+                try:
+                    await asyncio.wait_for(progress_task, timeout=5.0)
+                except TimeoutError:
+                    progress_task.cancel()
+                    await asyncio.gather(progress_task, return_exceptions=True)
+                cleaned = await self._cleanup_heartbeat(progress_request)
+                self._ledger_finish(
+                    progress_request,
+                    progress_terminal_state,
+                    cleanup_done=cleaned,
+                )
                 if self._agent_active_generations.get(key) == generation:
                     self._agent_active_generations.pop(key, None)
                 if self._agent_active_sessions.get(key) is session:

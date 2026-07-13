@@ -673,8 +673,12 @@ class ProjectChatHandler(
     def _duration_log_path(self) -> Path:
         path = getattr(self._config, "heartbeat_duration_log_path", None)
         if path is None:
+            bot_data_dir = (
+                getattr(self._config, "bot_data_dir", None)
+                or self.project_root / ".telegram_bot"
+            )
             return default_duration_log_path(
-                Path(getattr(self._config, "bot_data_dir", self.project_root / ".telegram_bot"))
+                Path(bot_data_dir)
             )
         return Path(path)
 
