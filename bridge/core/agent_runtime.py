@@ -198,6 +198,8 @@ class SessionRequest:
     model: str | None = None
     effort: str | None = None
     approval_policy: str | None = None
+    approvals_reviewer: str | None = None
+    sandbox_policy: Mapping[str, JsonValue] | None = None
 
     def __post_init__(self) -> None:
         if not self.working_directory:
@@ -206,6 +208,13 @@ class SessionRequest:
             raise ValueError("effort must not be empty")
         if self.approval_policy is not None and not self.approval_policy:
             raise ValueError("approval policy must not be empty")
+        if self.approvals_reviewer is not None and not self.approvals_reviewer:
+            raise ValueError("approvals reviewer must not be empty")
+        if self.sandbox_policy is not None:
+            frozen_sandbox = freeze_json(self.sandbox_policy)
+            if not isinstance(frozen_sandbox, Mapping) or not frozen_sandbox:
+                raise ValueError("sandbox policy must not be empty")
+            object.__setattr__(self, "sandbox_policy", frozen_sandbox)
         if self.session_id == "":
             raise ValueError("session id must not be empty")
         if self.model == "":

@@ -155,6 +155,8 @@ class AgentRuntimeContractTests(unittest.IsolatedAsyncioTestCase):
             lambda: SessionRequest(working_directory="/workspace", session_id=""),
             lambda: SessionRequest(working_directory="/workspace", model=""),
             lambda: SessionRequest(working_directory="/workspace", effort=""),
+            lambda: SessionRequest(working_directory="/workspace", approvals_reviewer=""),
+            lambda: SessionRequest(working_directory="/workspace", sandbox_policy={}),
             lambda: ModelInfo(id="", display_name="Fake model"),
             lambda: ModelInfo(id="fake", display_name=""),
         )
@@ -184,6 +186,28 @@ class AgentRuntimeContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(cast(tuple[Mapping[str, int], ...], frozen_result["items"])[0]["value"], 1)
         with self.assertRaises(TypeError):
             cast(dict[str, object], request.arguments)["path"] = "forbidden"
+
+    async def test_session_request_sandbox_policy_is_recursively_immutable_snapshot(
+        self,
+    ) -> None:
+        sandbox: dict[str, JsonValue] = {
+            "type": "workspaceWrite",
+            "networkAccess": False,
+            "writableRoots": ["/workspace"],
+        }
+        request = SessionRequest(
+            working_directory="/workspace",
+            sandbox_policy=sandbox,
+        )
+
+        sandbox["networkAccess"] = True
+        cast(list[str], sandbox["writableRoots"]).append("/tmp")
+
+        assert request.sandbox_policy is not None
+        self.assertFalse(request.sandbox_policy["networkAccess"])
+        self.assertEqual(request.sandbox_policy["writableRoots"], ("/workspace",))
+        with self.assertRaises(TypeError):
+            cast(dict[str, JsonValue], request.sandbox_policy)["networkAccess"] = True
 
     async def test_tool_lifecycle_events_are_typed_immutable_snapshots(self) -> None:
         arguments: dict[str, JsonValue] = {"command": "pwd", "paths": ["."]}

@@ -255,7 +255,9 @@ async def test_codex_start_resume_and_event_mapping_hides_reasoning(tmp_path: Pa
         session_id="resumed",
         model="codex-test",
         effort="high",
-        approval_policy="untrusted",
+        approval_policy="on-request",
+        approvals_reviewer="auto_review",
+        sandbox_policy={"type": "workspaceWrite", "networkAccess": False},
     )
 
     assert runtime.requests == [
@@ -264,7 +266,9 @@ async def test_codex_start_resume_and_event_mapping_hides_reasoning(tmp_path: Pa
             session_id="resumed",
             model="codex-test",
             effort="high",
-            approval_policy="untrusted",
+            approval_policy="on-request",
+            approvals_reviewer="auto_review",
+            sandbox_policy={"type": "workspaceWrite", "networkAccess": False},
         )
     ]
     assert session.messages == ["hello"]
@@ -297,6 +301,52 @@ async def test_codex_effort_change_recreates_wrapper_and_resumes_same_thread(
     assert low_session.messages == ["first"]
     assert high_session.messages == ["second"]
     assert second.session_id == "thread-1"
+
+
+@pytest.mark.anyio
+async def test_codex_reviewer_or_sandbox_change_recreates_wrapper(
+    tmp_path: Path,
+) -> None:
+    sessions = [FakeSession("thread-1") for _ in range(3)]
+    runtime = FakeRuntime(sessions)
+    handler = _handler(tmp_path, runtime)
+
+    common = {
+        "user_id": 7,
+        "chat_id": 70,
+        "session_id": "thread-1",
+        "approval_policy": "on-request",
+    }
+    await handler.process_message(
+        "first",
+        **common,
+        approvals_reviewer="user",
+        sandbox_policy={"type": "workspaceWrite", "networkAccess": False},
+    )
+    await handler.process_message(
+        "second",
+        **common,
+        approvals_reviewer="auto_review",
+        sandbox_policy={"type": "workspaceWrite", "networkAccess": False},
+    )
+    await handler.process_message(
+        "third",
+        **common,
+        approvals_reviewer="auto_review",
+        sandbox_policy={"type": "workspaceWrite", "networkAccess": True},
+    )
+
+    assert len(runtime.requests) == 3
+    assert [request.approvals_reviewer for request in runtime.requests] == [
+        "user",
+        "auto_review",
+        "auto_review",
+    ]
+    assert [request.sandbox_policy["networkAccess"] for request in runtime.requests] == [
+        False,
+        False,
+        True,
+    ]
 
 
 @pytest.mark.anyio

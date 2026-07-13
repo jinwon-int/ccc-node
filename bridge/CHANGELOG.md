@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Codex low-friction auto-review policy (#409).** `CCC_BRIDGE_BASH_POLICY=auto-review`
+  now sends the deployed app-server's exact `on-request` approval policy,
+  `auto_review` reviewer, and a network-off `workspaceWrite` sandbox on every
+  turn. Routine workspace work continues automatically while eligible boundary
+  crossings are evaluated by Codex's reviewer agent. The policy is transported
+  through the provider-neutral session contract, participates in session-cache
+  invalidation, never enables `dangerFullAccess`, and degrades conservatively to
+  per-call human approval when the active provider is Claude.
 - **Telegram reply-context injection** (`core/bot_shared.build_reply_context_prefix`, #380).
   When a user *replies* to an earlier message, the bridge previously forwarded
   only the new text and dropped the quoted original, so the agent couldn't tell

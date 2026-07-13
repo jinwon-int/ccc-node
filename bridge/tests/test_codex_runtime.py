@@ -110,6 +110,8 @@ class FakeClient:
         model: str | None = None,
         effort: str | None = None,
         approval_policy: str | None = None,
+        approvals_reviewer: str | None = None,
+        sandbox_policy: Mapping[str, Any] | None = None,
     ) -> Any:
         turn_id = f"turn-{len(self.turn_start_calls) + 1}"
         self.turn_start_calls.append(
@@ -119,6 +121,8 @@ class FakeClient:
                 "model": model,
                 "effort": effort,
                 "approval_policy": approval_policy,
+                "approvals_reviewer": approvals_reviewer,
+                "sandbox_policy": dict(sandbox_policy) if sandbox_policy is not None else None,
                 "turn_id": turn_id,
             }
         )
@@ -292,7 +296,9 @@ class CodexRuntimeTests(unittest.IsolatedAsyncioTestCase):
             SessionRequest(
                 working_directory="/workspace",
                 effort="high",
-                approval_policy="untrusted",
+                approval_policy="on-request",
+                approvals_reviewer="auto_review",
+                sandbox_policy={"type": "workspaceWrite", "networkAccess": False},
             )
         )
         client = self.clients[0]
@@ -380,7 +386,12 @@ class CodexRuntimeTests(unittest.IsolatedAsyncioTestCase):
             [{"type": "text", "text": "hello"}],
         )
         self.assertEqual(client.turn_start_calls[0]["effort"], "high")
-        self.assertEqual(client.turn_start_calls[0]["approval_policy"], "untrusted")
+        self.assertEqual(client.turn_start_calls[0]["approval_policy"], "on-request")
+        self.assertEqual(client.turn_start_calls[0]["approvals_reviewer"], "auto_review")
+        self.assertEqual(
+            client.turn_start_calls[0]["sandbox_policy"],
+            {"type": "workspaceWrite", "networkAccess": False},
+        )
 
     async def test_approval_before_turn_start_response_routes_to_handler(self) -> None:
         session = await self.runtime.start_or_resume(

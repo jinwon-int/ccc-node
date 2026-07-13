@@ -437,7 +437,9 @@ class CodexAppServerTests(unittest.IsolatedAsyncioTestCase):
                 [{"type": "text", "text": "hello"}],
                 model="o3",
                 effort="high",
-                approval_policy="untrusted",
+                approval_policy="on-request",
+                approvals_reviewer="auto_review",
+                sandbox_policy={"type": "workspaceWrite", "networkAccess": False},
             ),
             "turn/start",
             {
@@ -445,7 +447,9 @@ class CodexAppServerTests(unittest.IsolatedAsyncioTestCase):
                 "input": [{"type": "text", "text": "hello"}],
                 "model": "o3",
                 "effort": "high",
-                "approvalPolicy": "untrusted",
+                "approvalPolicy": "on-request",
+                "approvalsReviewer": "auto_review",
+                "sandboxPolicy": {"type": "workspaceWrite", "networkAccess": False},
             },
         )
         await assert_call(
