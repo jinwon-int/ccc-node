@@ -63,6 +63,16 @@ BRIDGE_ADAPTER = {
     ANALYSIS_BRIDGE: "claude-a2a-analysis-bridge",
     PATCH_BRIDGE: "claude-a2a-patch-bridge",
 }
+# The versioned external handler worker.js spawns per task; its documented
+# contract is "stdin A2A task JSON -> stdout WorkerHandlerOutcome JSON". Newer
+# a2a-broker worker.js builds select the real analysis/patch bridge ONLY through
+# WORKER_HANDLER_COMMAND and no longer read OPENCLAW_BIN directly. When the wiring
+# is absent the worker silently falls back to its builtin "echo" handler, so it
+# keeps claiming, signing, and finalizing tasks with no real work. The launcher
+# therefore derives the wiring below from the validated env instead of trusting
+# every env file to have been regenerated for the new contract. Lives under
+# A2A_WORKER_ROOT/scripts/.
+TASK_HANDLER = "a2a-task-handler.mjs"
 # Recognized values for the patch bridge's single-shot opt-in (mirrors
 # isSingleShotPatchMode in claude-a2a-patch-bridge.mjs).
 PATCH_MODE_VALUES = ("single-shot", "single_shot", "singleshot")
@@ -172,7 +182,28 @@ def validate_metadata(value: str, expected_adapter: str) -> dict[str, object]:
     return metadata
 
 
-def validate_env(env: dict[str, str]) -> tuple[Path, list[str], dict[str, object]]:
+def derive_worker_handler_env(
+    env: dict[str, str], worker_root: Path, node_bin: Path, handler_script: Path
+) -> dict[str, str]:
+    """Derive the worker.js external-handler wiring from the validated env.
+
+    Returns only the keys the operator has NOT set explicitly, so an env file may
+    still override any of them. Without these, newer worker.js builds ignore the
+    wired OPENCLAW_BIN bridge and run the silent "echo" builtin instead.
+    """
+    derived = {
+        "WORKER_HANDLER_COMMAND": str(node_bin),
+        "WORKER_HANDLER_ARGS_JSON": json.dumps([str(handler_script)]),
+        "WORKER_HANDLER_CWD": str(worker_root),
+        # a2a-task-handler.mjs only routes an analyze/verify task to the real
+        # OpenClaw analysis bridge when this enable flag is truthy; otherwise it
+        # returns a generic accept with no model execution.
+        "A2A_OPENCLAW_ANALYSIS_ENABLED": "1",
+    }
+    return {key: value for key, value in derived.items() if key not in env}
+
+
+def validate_env(env: dict[str, str]) -> tuple[Path, list[str], dict[str, object], dict[str, str]]:
     require_keys(env)
     if env["A2A_TERMUX_NATIVE"] != "1":
         raise ConfigError("A2A_TERMUX_NATIVE must be 1 so proot/systemd configs fail closed")
@@ -231,6 +262,21 @@ def validate_env(env: dict[str, str]) -> tuple[Path, list[str], dict[str, object
     validate_broker_url(env["BROKER_URL"])
     metadata = validate_metadata(env["WORKER_METADATA_JSON"], BRIDGE_ADAPTER[openclaw.name])
 
+    # The versioned external handler must exist so worker.js runs the real bridge
+    # rather than its silent "echo" builtin. Fail closed here (at check time)
+    # instead of discovering an all-echo worker from finalized-but-empty tasks.
+    handler_script = (worker_root / "scripts" / TASK_HANDLER).resolve()
+    check_forbidden_context(handler_script, "A2A_TASK_HANDLER")
+    if not handler_script.is_file():
+        raise ConfigError(
+            f"native worker task handler must exist: {handler_script} — worker.js "
+            "selects the real bridge via WORKER_HANDLER_COMMAND and otherwise falls "
+            "back to the echo builtin (silent no-op tasks)"
+        )
+    handler_env = derive_worker_handler_env(
+        env, worker_root.resolve(), checked_paths["A2A_NATIVE_NODE_BIN"], handler_script
+    )
+
     args = [str(checked_paths["A2A_NATIVE_NODE_BIN"]), str(worker_script)]
     extra = env.get("A2A_WORKER_ARGS", "")
     if extra:
@@ -238,7 +284,7 @@ def validate_env(env: dict[str, str]) -> tuple[Path, list[str], dict[str, object
             args.extend(shlex.split(extra, posix=True))
         except ValueError as exc:
             raise ConfigError(f"A2A_WORKER_ARGS is invalid shell syntax: {exc}") from exc
-    return worker_script, args, metadata
+    return worker_script, args, metadata, handler_env
 
 
 def shell_join(args: list[str]) -> str:
@@ -250,12 +296,12 @@ def load_and_validate(env_file: str) -> tuple[dict[str, str], Path, list[str], d
     if not path.is_file():
         raise ConfigError(f"env file not found: {env_file}")
     env = parse_env_file(path)
-    worker_script, args, metadata = validate_env(env)
-    return env, worker_script, args, metadata
+    worker_script, args, metadata, handler_env = validate_env(env)
+    return env, worker_script, args, metadata, handler_env
 
 
 def cmd_check(args: argparse.Namespace) -> int:
-    env, worker_script, command, metadata = load_and_validate(args.env_file)
+    env, worker_script, command, metadata, handler_env = load_and_validate(args.env_file)
     print("OK: Termux native A2A worker env is safe to launch")
     print(f"workerScript={worker_script}")
     print(f"brokerUrl={env['BROKER_URL']}")
@@ -264,19 +310,40 @@ def cmd_check(args: argparse.Namespace) -> int:
         + ",".join(f"{key}={metadata.get(key)}" for key in ("runtime", "harness", "adapter"))
     )
     print("command=" + shell_join(command))
+    # Surface the effective worker.js external-handler wiring (explicit env value
+    # wins over the derived default) so an all-echo worker is visible at a glance.
+    effective_cmd = env.get("WORKER_HANDLER_COMMAND", handler_env.get("WORKER_HANDLER_COMMAND", ""))
+    effective_args_json = env.get(
+        "WORKER_HANDLER_ARGS_JSON", handler_env.get("WORKER_HANDLER_ARGS_JSON", "[]")
+    )
+    try:
+        effective_args = [str(item) for item in json.loads(effective_args_json)]
+    except (json.JSONDecodeError, TypeError):
+        effective_args = []
+    if effective_cmd:
+        print("taskHandler=" + shell_join([effective_cmd, *effective_args]))
+    analysis_enabled = env.get(
+        "A2A_OPENCLAW_ANALYSIS_ENABLED", handler_env.get("A2A_OPENCLAW_ANALYSIS_ENABLED", "")
+    )
+    print(f"analysisBridge={'enabled' if analysis_enabled == '1' else analysis_enabled or 'unset'}")
     return 0
 
 
 def cmd_print_command(args: argparse.Namespace) -> int:
-    _env, _worker_script, command, _metadata = load_and_validate(args.env_file)
+    _env, _worker_script, command, _metadata, _handler_env = load_and_validate(args.env_file)
     print(shell_join(command))
     return 0
 
 
 def cmd_run(args: argparse.Namespace) -> int:
-    env, _worker_script, command, _metadata = load_and_validate(args.env_file)
+    env, _worker_script, command, _metadata, handler_env = load_and_validate(args.env_file)
     child_env = os.environ.copy()
     child_env.update(env)
+    # Apply the derived worker.js handler wiring. derive_worker_handler_env()
+    # already excludes any key the env file set explicitly, so this never clobbers
+    # an operator override, but it does win over a stale inherited environment.
+    for key, value in handler_env.items():
+        child_env[key] = value
     try:
         os.execve(command[0], command, child_env)
     except OSError as exc:  # exec failed — stay fail-closed instead of a raw traceback
