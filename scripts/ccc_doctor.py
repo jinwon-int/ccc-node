@@ -666,6 +666,24 @@ def parse_args(argv: list[str]) -> tuple[int, bool, bool, bool, bool, str]:
     return -1, fix, rollback, apply, json_output, scope
 
 
+def _write_all(fd: int, data: bytes) -> None:
+    """Write every byte to ``fd``, looping over partial ``os.write`` results.
+
+    ``os.write`` is permitted to consume fewer bytes than requested — notably on
+    pipes, where the field failure was observed — so a single call can truncate
+    the sole JSON document and break the strict ``json.load(stdout)`` contract.
+    Loop until the whole buffer is written and fail loudly on a zero-progress
+    write rather than emit a partial document.
+    """
+
+    view = memoryview(data)
+    while view:
+        written = os.write(fd, view)
+        if written <= 0:
+            raise OSError("short write while emitting the JSON report")
+        view = view[written:]
+
+
 def emit_json_report(doctor: Doctor) -> int:
     """Diagnose and write exactly one JSON document to stdout.
 
@@ -692,7 +710,7 @@ def emit_json_report(doctor: Doctor) -> int:
         with contextlib.redirect_stdout(sys.stderr):
             doctor.diagnose()
             payload = doctor.json_report_text()
-        os.write(real_stdout_fd, (payload + "\n").encode("utf-8"))
+        _write_all(real_stdout_fd, (payload + "\n").encode("utf-8"))
     finally:
         os.close(real_stdout_fd)
     return doctor.report_exit_code()

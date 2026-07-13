@@ -287,5 +287,37 @@ ok "stdout guard keeps --json stdout pure JSON despite stray fd1/print leaks (#4
 ok "stdout guard diverts stray diagnostics to stderr (#404)" \
   'grep -q "STRAY_PRINT_LEAK" "$TMP/guard.err" && grep -q "RAW_FD1_LEAK" "$TMP/guard.err"'
 
+# #404: os.write may consume fewer bytes than requested (partial write); the JSON
+# document must not be truncated. Cap every os.write to 7 bytes and require the
+# full multi-row report to still land on stdout.
+cat > "$TMP/shortwrite.py" <<'PY'
+import os, sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(os.environ["DOCTOR_PY"]).resolve().parent))
+import ccc_doctor as mod
+
+
+class TinyDoctor(mod.Doctor):
+    def harness_version(self):
+        return "test-version"
+
+    def diagnose(self):
+        for i in range(20):  # encoded JSON far exceeds a single 7-byte write
+            self.add("정상", "synthetic-%02d" % i, "ok", "none")
+
+
+_real_write = os.write
+os.write = lambda fd, data: _real_write(fd, bytes(data)[:7])
+try:
+    rc = mod.emit_json_report(TinyDoctor(Path("."), Path("."), "settings"))
+finally:
+    os.write = _real_write
+sys.exit(rc)
+PY
+DOCTOR_PY="$ROOT/scripts/ccc_doctor.py" python3 "$TMP/shortwrite.py" >"$TMP/short.out" 2>"$TMP/short.err"
+ok "short os.write does not truncate --json stdout (#404)" \
+  'python3 -c "import json,sys; obj=json.load(open(sys.argv[1])); sys.exit(0 if len(obj[\"rows\"]) == 20 else 1)" "$TMP/short.out"'
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
