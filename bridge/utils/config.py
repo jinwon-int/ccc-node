@@ -505,6 +505,22 @@ class Config(BaseSettings):
             "heartbeat is removed too — raise this when you run such tools."
         ),
     )
+    terminal_stall_seconds: float = Field(
+        default=300.0,
+        alias="CCC_TERMINAL_STALL_SECONDS",
+        description=(
+            "Release a request whose agent produced answer text but whose "
+            "terminal event (Claude ResultMessage / provider completion) never "
+            "arrives (#411 C). After this many seconds of total stream silence "
+            "following the last assistant text — with no tool running and no "
+            "approval pending — the buffered text is delivered once with a "
+            "stall notice, the turn is interrupted, and the conversation FIFO "
+            "is released so queued messages proceed. Without it the request "
+            "would hold the conversation until the full process timeout "
+            "(default 21600s). Set 0 to disable and fall back to the process "
+            "timeout only."
+        ),
+    )
     heartbeat_duration_log_enabled: bool = Field(
         default=True,
         alias="CCC_HEARTBEAT_DURATION_LOG_ENABLED",

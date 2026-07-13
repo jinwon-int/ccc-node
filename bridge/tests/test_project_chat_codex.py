@@ -533,6 +533,176 @@ class HangingSession(FakeSession):
         return stream()
 
 
+class StallSession(FakeSession):
+    """Yields some events, then the terminal event never arrives (#411 C)."""
+
+    def __init__(self, session_id: str, pre_events: list[AgentEvent] | None = None) -> None:
+        super().__init__(session_id)
+        self.pre_events = (
+            pre_events if pre_events is not None else [TextDeltaEvent("partial answer")]
+        )
+        self.hang = asyncio.Event()
+        self.closed = False
+
+    def send_turn(
+        self,
+        message: str,
+        *,
+        approval_handler: ApprovalHandler = deny_approval,
+    ) -> AsyncIterator[AgentEvent]:
+        del approval_handler
+
+        async def stream() -> AsyncIterator[AgentEvent]:
+            self.messages.append(message)
+            try:
+                for event in self.pre_events:
+                    yield event
+                await self.hang.wait()
+            finally:
+                self.closed = True
+
+        return stream()
+
+
+def _stall_handler(
+    tmp_path: Path, runtime: FakeRuntime, monkeypatch: pytest.MonkeyPatch
+) -> tuple[ProjectChatHandler, list[int]]:
+    stalled: list[int] = []
+    # Patch the exact globals the method executes with: sibling test modules
+    # rebuild telegram_bot.core.* sys.modules entries at import time, so a
+    # dotted-name patch can hit a different module generation.
+    process_globals = ProjectChatHandler._process_agent_message.__globals__
+    monkeypatch.setitem(
+        process_globals,
+        "health_reporter",
+        SimpleNamespace(
+            record_claude_error=lambda *a, **k: None,
+            record_claude_ok=lambda *a, **k: None,
+            record_stalled_request=lambda count=1: stalled.append(count),
+        ),
+    )
+    settings = _settings(tmp_path)
+    settings.terminal_stall_seconds = 0.05
+    handler = ProjectChatHandler(settings=settings, agent_runtime=runtime)
+    handler._task_ledger_cache = False
+    return handler, stalled
+
+
+@pytest.mark.anyio
+async def test_codex_terminal_stall_releases_turn_and_queued_request_proceeds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RED for #411 C: text arrives, the completion event vanishes; the turn
+    must terminalize within the bounded grace and free the conversation."""
+
+    stall = StallSession("thread-1")
+    follow = FakeSession("thread-1")
+    runtime = FakeRuntime([stall, follow])
+    handler, stalled = _stall_handler(tmp_path, runtime, monkeypatch)
+
+    first_task = asyncio.create_task(handler.process_message("hang", 7, 70))
+    await _wait_until(lambda: stall.messages == ["hang"])
+    queued_task = asyncio.create_task(handler.process_message("queued", 7, 70))
+
+    first, queued = await asyncio.wait_for(
+        asyncio.gather(first_task, queued_task), timeout=5
+    )
+
+    assert first.success is True
+    assert "partial answer" in first.content
+    assert "closed automatically" in first.content
+    # The turn is interrupted and its abandoned generator is closed, so a late
+    # completion event has no consumer left — the answer cannot deliver twice.
+    assert stall.interrupt_calls == 1
+    assert stall.closed is True
+    assert stalled == [1]
+    # The queued follow-up ran after the release on a fresh session.
+    assert queued.success is True and queued.content == "ok"
+    assert follow.messages == ["queued"]
+    assert len(runtime.requests) == 2
+
+
+@pytest.mark.anyio
+async def test_codex_no_stall_release_without_text(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    stall = StallSession("thread-1", pre_events=[])
+    handler, stalled = _stall_handler(tmp_path, FakeRuntime([stall]), monkeypatch)
+    handler._process_timeout_seconds = 0.2
+
+    response = await asyncio.wait_for(handler.process_message("hang", 7, 70), timeout=5)
+
+    assert response.success is False
+    assert response.error is not None and "Timed out" in response.error
+    assert stalled == []
+
+
+@pytest.mark.anyio
+async def test_codex_no_stall_release_while_tool_is_running(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    stall = StallSession(
+        "thread-1",
+        pre_events=[
+            TextDeltaEvent("working"),
+            ToolStartedEvent("tool-1", "command", {"command": "sleep"}),
+        ],
+    )
+    handler, stalled = _stall_handler(tmp_path, FakeRuntime([stall]), monkeypatch)
+    handler._process_timeout_seconds = 0.2
+
+    response = await asyncio.wait_for(handler.process_message("hang", 7, 70), timeout=5)
+
+    assert response.success is False
+    assert response.error is not None and "Timed out" in response.error
+    assert stalled == []
+
+
+@pytest.mark.anyio
+async def test_codex_no_stall_release_while_approval_pending(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    stall = StallSession(
+        "thread-1",
+        pre_events=[
+            TextDeltaEvent("needs approval"),
+            ApprovalRequestEvent("approval-1", "write_file", {"path": "x"}, "write x"),
+        ],
+    )
+    handler, stalled = _stall_handler(tmp_path, FakeRuntime([stall]), monkeypatch)
+    handler._process_timeout_seconds = 0.2
+
+    response = await asyncio.wait_for(handler.process_message("hang", 7, 70), timeout=5)
+
+    assert response.success is False
+    assert response.error is not None and "Timed out" in response.error
+    assert stalled == []
+
+
+@pytest.mark.anyio
+async def test_codex_completed_turn_after_tool_is_not_stalled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A normal tool→text→completion turn must be untouched by the guard."""
+
+    session = FakeSession(
+        "thread-1",
+        [
+            ToolStartedEvent("tool-1", "command", {"command": "pwd"}),
+            ToolCompletedEvent("tool-1", "command", {"output": "/"}, True),
+            TextDeltaEvent("done"),
+            CompletionEvent("end_turn"),
+        ],
+    )
+    handler, stalled = _stall_handler(tmp_path, FakeRuntime([session]), monkeypatch)
+
+    response = await asyncio.wait_for(handler.process_message("go", 7, 70), timeout=5)
+
+    assert response.success is True
+    assert response.content == "done"
+    assert stalled == []
+
+
 @pytest.mark.anyio
 async def test_codex_turn_timeout_interrupts_and_cleans_session(tmp_path: Path) -> None:
     hung = HangingSession("hung")

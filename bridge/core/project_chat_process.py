@@ -37,6 +37,7 @@ from telegram_bot.core.task_ledger import (
 )
 from telegram_bot.core.sdk_text import (
     RESTART_INTERRUPT_NOTICE,
+    TERMINAL_STALL_NOTICE,
     _is_retryable_sdk_error,
     _is_shutdown_signal_error,
 )
@@ -408,46 +409,123 @@ class ProjectChatProcessMixin:
                         return ApprovalDecision.ALLOW
                     return ApprovalDecision.DENY
 
+                stall_grace = float(
+                    getattr(self._config, "terminal_stall_seconds", 0.0) or 0.0
+                )
+                stalled = False
+
                 async def consume_agent_events() -> None:
-                    nonlocal terminal_error
-                    async for event in session.send_turn(
+                    """Consume one turn's events with a terminal-event stall guard.
+
+                    The same lifecycle invariant as the Claude reader (#411 C):
+                    once answer text exists and no tool or approval is pending,
+                    prolonged silence means the completion event vanished — stop
+                    consuming after the bounded grace instead of holding the
+                    conversation until the full process timeout.
+                    """
+                    nonlocal terminal_error, stalled
+                    busy_depth = 0
+                    approval_pending = False
+                    iterator = session.send_turn(
                         user_message,
                         approval_handler=handle_approval,
-                    ):
-                        if typing_callback is not None:
+                    ).__aiter__()
+                    try:
+                        while True:
+                            stall_eligible = (
+                                stall_grace > 0
+                                and bool(text_parts)
+                                and busy_depth <= 0
+                                and not approval_pending
+                            )
                             try:
-                                await typing_callback()
-                            except Exception:
-                                pass
-                        if isinstance(event, TextDeltaEvent):
-                            text_parts.append(event.text)
-                            if streaming_handler:
-                                await streaming_handler.update_if_needed(event.text)
-                        elif isinstance(event, ToolStartedEvent):
-                            if streaming_handler:
-                                await streaming_handler.add_tool_call(
-                                    event.tool_name,
-                                    dict(event.arguments),
-                                )
-                        elif isinstance(event, ErrorEvent):
-                            terminal_error = event
-                        elif isinstance(
-                            event,
-                            (
-                                ReasoningDeltaEvent,
-                                ToolCompletedEvent,
-                                ApprovalRequestEvent,
-                                ResultEvent,
-                                CompletionEvent,
-                            ),
-                        ):
-                            # Reasoning remains private. Other normalized lifecycle
-                            # events are consumed so provider objects never escape.
-                            continue
+                                if stall_eligible:
+                                    event = await asyncio.wait_for(
+                                        iterator.__anext__(), timeout=stall_grace
+                                    )
+                                else:
+                                    event = await iterator.__anext__()
+                            except StopAsyncIteration:
+                                return
+                            except TimeoutError:
+                                stalled = True
+                                return
+                            approval_pending = isinstance(event, ApprovalRequestEvent)
+                            if typing_callback is not None:
+                                try:
+                                    await typing_callback()
+                                except Exception:
+                                    pass
+                            if isinstance(event, TextDeltaEvent):
+                                text_parts.append(event.text)
+                                if streaming_handler:
+                                    await streaming_handler.update_if_needed(event.text)
+                            elif isinstance(event, ToolStartedEvent):
+                                busy_depth += 1
+                                if streaming_handler:
+                                    await streaming_handler.add_tool_call(
+                                        event.tool_name,
+                                        dict(event.arguments),
+                                    )
+                            elif isinstance(event, ToolCompletedEvent):
+                                busy_depth = max(0, busy_depth - 1)
+                            elif isinstance(event, ErrorEvent):
+                                terminal_error = event
+                            elif isinstance(
+                                event,
+                                (
+                                    ReasoningDeltaEvent,
+                                    ApprovalRequestEvent,
+                                    ResultEvent,
+                                    CompletionEvent,
+                                ),
+                            ):
+                                # Reasoning remains private. Other normalized
+                                # lifecycle events are consumed so provider
+                                # objects never escape.
+                                continue
+                    finally:
+                        # Run the generator's cleanup (turn bookkeeping, locks)
+                        # even when the stall guard abandoned it mid-turn; this
+                        # also guarantees a late completion event has no
+                        # consumer left, so the answer cannot deliver twice.
+                        try:
+                            await iterator.aclose()
+                        except Exception:
+                            pass
 
                 await asyncio.wait_for(
                     consume_agent_events(), timeout=self._process_timeout_seconds
                 )
+
+                if stalled:
+                    if self._agent_sessions.get(key) is session:
+                        self._agent_sessions.pop(key, None)
+                        self._agent_session_models.pop(key, None)
+                        self._agent_session_efforts.pop(key, None)
+                        self._agent_session_approval_policies.pop(key, None)
+                        self._agent_session_approvals_reviewers.pop(key, None)
+                        self._agent_session_sandbox_policies.pop(key, None)
+                    await self._interrupt_agent_session(session)
+                    if streaming_handler:
+                        await streaming_handler.finalize_all()
+                    logger.warning(
+                        "Terminal-event stall released agent turn for user %s chat %s "
+                        "after silence following answer text",
+                        user_id,
+                        chat_id,
+                    )
+                    try:
+                        health_reporter.record_stalled_request()
+                    except Exception:
+                        pass
+                    content = self._clean_response("".join(text_parts)) or "(No response)"
+                    return ChatResponse(
+                        content=f"{content}\n\n{TERMINAL_STALL_NOTICE}",
+                        success=True,
+                        session_id=session.session_id,
+                        streamed=bool(streaming_handler and streaming_handler.drafts),
+                    )
 
                 if streaming_handler:
                     await streaming_handler.finalize_all()

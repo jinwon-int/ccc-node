@@ -65,6 +65,13 @@ class _PendingRequest:
     # removed instead of ticking up forever. 0 until the first event; the
     # stall check falls back to started_at.
     last_event_at: float = 0.0
+    # Wall-clock of the newest assistant TextBlock / ToolUseBlock (#411 C).
+    # A terminal-event stall is only releasable when answer text is the latest
+    # meaningful activity: last_text_at > last_tool_at means no tool started
+    # after the text, so prolonged silence implies the terminal event vanished
+    # rather than a long-running tool.
+    last_text_at: float = 0.0
+    last_tool_at: float = 0.0
     current_tool_label: Optional[str] = None
     last_visible_progress_at: float = 0.0
     awaiting_permission: bool = False
@@ -105,3 +112,8 @@ class _UserStreamState:
     # may be enqueued between those frames and must not steal the autonomous
     # turn's result.
     unsolicited_inflight: bool = False
+    # Set when a terminal-event stall released the head request (#411 C). The
+    # stream is being torn down; if its late ResultMessage still races in, the
+    # reader swallows exactly one instead of double-delivering the same answer
+    # through the unsolicited route.
+    stall_swallow_result: bool = False
