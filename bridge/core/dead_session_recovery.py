@@ -9,6 +9,15 @@ Delivery is intentionally *at least once*: the durable marker is written after
 Telegram confirms ``send_message``.  A process crash between those two steps can
 produce one duplicate, but cannot silently mark an unsent notification done.
 Per-scan caps and bounded marker retention prevent replay storms.
+
+A transcript that fails safety validation (``TranscriptRejected``) is
+*quarantined* instead of being rescanned every tick (issue #411 B): a stable
+fingerprint — session id, reason code, and the file's identity/size/mtime — is
+persisted in the conversation's session record, the owner is notified once with
+a redacted reason, and the file is not parsed again until its identity changes
+or the session rotates.  Retention is bounded by construction: one quarantine
+record per conversation, replaced on re-evaluation and cleared when the
+transcript parses again.
 """
 
 from __future__ import annotations
@@ -22,6 +31,7 @@ import re
 import stat
 from collections import deque
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Optional
 from xml.etree import ElementTree
@@ -32,6 +42,7 @@ ENV_FLAG = "CCC_DEAD_SESSION_RECOVERY"
 INTERVAL_ENV = "CCC_DEAD_SESSION_RECOVERY_INTERVAL_SECONDS"
 _FALSE_VALUES = {"false", "0", "no", "off"}
 MARKER_KEY = "delivered_background_notifications"
+QUARANTINE_KEY = "rejected_transcript_quarantine"
 TERMINAL_STATUSES = frozenset(
     {"completed", "failed", "canceled", "cancelled", "timeout", "timed_out"}
 )
@@ -70,6 +81,8 @@ class RecoveryStats:
     rejected: int = 0
     skipped_active: int = 0
     skipped_locked: int = 0
+    quarantined: int = 0
+    quarantine_skipped: int = 0
 
 
 def recovery_enabled(environ: Optional[Mapping[str, str]] = None) -> bool:
@@ -291,6 +304,169 @@ def _live_stream_owned(handler: Any, user_id: int, chat_id: int) -> bool:
     return bool(reader is not None and not reader.done())
 
 
+def _transcript_file_identity(path: Optional[Path]) -> Optional[dict[str, int]]:
+    """Cheap lstat-based identity used to detect transcript change without parsing."""
+    if path is None:
+        return None
+    try:
+        meta = os.lstat(path)
+    except OSError:
+        return None
+    return {
+        "dev": meta.st_dev,
+        "ino": meta.st_ino,
+        "size": meta.st_size,
+        "mtime_ns": meta.st_mtime_ns,
+    }
+
+
+def transcript_quarantine_record(
+    session_id: str, reason: str, path: Optional[Path]
+) -> dict[str, Any]:
+    """Build a persistable quarantine record for one rejected transcript.
+
+    The fingerprint binds the exact rejection: same session, same reason code,
+    same file identity.  Reason strings are the module's own constant messages
+    (never transcript content), so the record is redaction-safe by
+    construction.
+    """
+    identity = _transcript_file_identity(path)
+    payload = json.dumps([session_id, reason, identity], sort_keys=True, separators=(",", ":"))
+    return {
+        "fingerprint": "sha256:" + hashlib.sha256(payload.encode("utf-8")).hexdigest(),
+        "identity": identity,
+        "session_id": session_id,
+        "reason": reason,
+        "quarantined_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "notified": False,
+    }
+
+
+def _valid_quarantine(record: Any, session_id: str) -> Optional[dict[str, Any]]:
+    if not isinstance(record, dict):
+        return None
+    if record.get("session_id") != session_id:
+        return None
+    if not isinstance(record.get("fingerprint"), str):
+        return None
+    if not isinstance(record.get("reason"), str):
+        return None
+    return record
+
+
+def quarantine_blocks_scan(record: Any, session_id: str, path: Path) -> bool:
+    """True when the persisted quarantine still matches the unchanged file.
+
+    Any identity drift — new inode, different size, newer mtime — re-enables a
+    bounded re-evaluation; an operator can force one by touching or replacing
+    the transcript, or by rotating the session.  An unknown identity never
+    blocks: it cannot prove the file is unchanged.
+    """
+    valid = _valid_quarantine(record, session_id)
+    if valid is None:
+        return False
+    identity = valid.get("identity")
+    if not isinstance(identity, dict):
+        return False
+    return _transcript_file_identity(path) == identity
+
+
+def format_quarantine_notice(reason: str) -> str:
+    """Owner-facing quarantine notice; carries only the constant reason code."""
+    return (
+        "⚠️ Background-task recovery for this conversation is quarantined.\n\n"
+        f"Reason: {reason}.\n\n"
+        "The stored session transcript cannot be replayed safely, so completed "
+        "background results recorded there will not be re-delivered "
+        "automatically. Send a new message to continue; re-run the task if you "
+        "still need its result."
+    )
+
+
+async def _send_quarantine_notice(
+    bot: Any, chat_id: int, reason: str, send_timeout: float
+) -> bool:
+    try:
+        await asyncio.wait_for(
+            bot.send_message(chat_id=chat_id, text=format_quarantine_notice(reason)),
+            timeout=send_timeout,
+        )
+    except Exception as error:
+        logger.warning(
+            "Quarantine notice delivery failed for chat %s: %s",
+            chat_id,
+            type(error).__name__,
+        )
+        return False
+    return True
+
+
+async def _persist_quarantine(session_manager: Any, storage_key: Any, record: Any) -> bool:
+    try:
+        await session_manager.update_session(storage_key, {QUARANTINE_KEY: record})
+    except Exception as error:
+        logger.warning(
+            "Quarantine persistence failed for conversation %s: %s",
+            storage_key,
+            type(error).__name__,
+        )
+        return False
+    return True
+
+
+async def _quarantine_transcript(
+    *,
+    bot: Any,
+    session_manager: Any,
+    storage_key: Any,
+    chat_id: int,
+    session_id: str,
+    reason: str,
+    path: Optional[Path],
+    existing: Optional[dict[str, Any]],
+    stats: RecoveryStats,
+    can_notify: bool,
+    send_timeout: float,
+) -> bool:
+    """Quarantine one rejected transcript; True when a send attempt was consumed.
+
+    The first rejection for a fingerprint notifies the owner once and persists
+    the record; an identical rejection (same session, reason, and file
+    identity) is deduplicated silently.  A failed notice leaves
+    ``notified=False`` in the persisted record so later ticks retry only the
+    cheap send, never the parse.
+    """
+    stats.rejected += 1
+    logger.warning(
+        "Dead-session transcript rejected for conversation %s: %s",
+        storage_key,
+        reason,
+    )
+    record = transcript_quarantine_record(session_id, reason, path)
+    if existing is not None and existing.get("fingerprint") == record["fingerprint"]:
+        # Identical rejection already quarantined. Records without a file
+        # identity never take the pre-scan skip, so the pending-notice retry
+        # must stay reachable here as well — send only, never re-quarantine.
+        if existing.get("notified") or not can_notify:
+            return False
+        if await _send_quarantine_notice(bot, chat_id, reason, send_timeout):
+            await _persist_quarantine(
+                session_manager, storage_key, dict(existing, notified=True)
+            )
+        else:
+            stats.failed += 1
+        return True
+    consumed = False
+    if can_notify:
+        consumed = True
+        record["notified"] = await _send_quarantine_notice(bot, chat_id, reason, send_timeout)
+        if not record["notified"]:
+            stats.failed += 1
+    if await _persist_quarantine(session_manager, storage_key, record):
+        stats.quarantined += 1
+    return consumed
+
+
 async def recover_dead_session_notifications(
     bot: Any,
     session_manager: Any,
@@ -355,17 +531,53 @@ async def recover_dead_session_notifications(
                 stats.rejected += 1
                 continue
             markers = list(markers_value[-marker_retention:])
+            quarantine = _valid_quarantine(current.get(QUARANTINE_KEY), session_id)
+            path: Optional[Path] = None
             try:
                 path = _safe_transcript_path(Path(conversations_dir), session_id)
+                if quarantine is not None and quarantine_blocks_scan(
+                    quarantine, session_id, path
+                ):
+                    # Identical rejected transcript: never parse it again. Only
+                    # a pending owner notice is retried, within the send budget.
+                    stats.quarantine_skipped += 1
+                    if (
+                        not quarantine.get("notified")
+                        and delivery_attempts < max_delivery_attempts_per_scan
+                    ):
+                        delivery_attempts += 1
+                        if await _send_quarantine_notice(
+                            bot, chat_id, str(quarantine["reason"]), send_timeout
+                        ):
+                            await _persist_quarantine(
+                                session_manager,
+                                storage_key,
+                                dict(quarantine, notified=True),
+                            )
+                        else:
+                            stats.failed += 1
+                    continue
                 notifications = await asyncio.to_thread(scan_transcript, path, session_id)
             except TranscriptRejected as error:
-                logger.warning(
-                    "Dead-session transcript rejected for conversation %s: %s",
-                    storage_key,
-                    type(error).__name__,
-                )
-                stats.rejected += 1
+                if await _quarantine_transcript(
+                    bot=bot,
+                    session_manager=session_manager,
+                    storage_key=storage_key,
+                    chat_id=chat_id,
+                    session_id=session_id,
+                    reason=str(error) or type(error).__name__,
+                    path=path,
+                    existing=quarantine,
+                    stats=stats,
+                    can_notify=delivery_attempts < max_delivery_attempts_per_scan,
+                    send_timeout=send_timeout,
+                ):
+                    delivery_attempts += 1
                 continue
+            if quarantine is not None:
+                # The transcript changed and parses again — lift the stale
+                # quarantine so this conversation resumes normal recovery.
+                await _persist_quarantine(session_manager, storage_key, None)
             stats.scanned += 1
             sent_here = 0
             for item in notifications:
@@ -418,8 +630,14 @@ async def run_periodic_dead_session_recovery(
     project_handler: Any,
     conversations_dir: Optional[Path],
     stop_event: asyncio.Event,
+    on_stats: Optional[Any] = None,
 ) -> None:
-    """Run one bounded scan per interval until the lifecycle stop event is set."""
+    """Run one bounded scan per interval until the lifecycle stop event is set.
+
+    ``on_stats`` (optional sync callable) receives each tick's ``RecoveryStats``
+    so the caller can surface counters (e.g. quarantined transcripts) in health
+    reporting without this module importing bridge internals.
+    """
     interval = recovery_interval()
     while not stop_event.is_set():
         try:
@@ -428,9 +646,11 @@ async def run_periodic_dead_session_recovery(
         except asyncio.TimeoutError:
             pass
         try:
-            await recover_dead_session_notifications(
+            stats = await recover_dead_session_notifications(
                 bot, session_manager, project_handler, conversations_dir
             )
+            if on_stats is not None:
+                on_stats(stats)
         except asyncio.CancelledError:
             raise
         except Exception as error:  # pragma: no cover - final fail-open boundary

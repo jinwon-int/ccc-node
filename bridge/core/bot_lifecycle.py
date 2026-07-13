@@ -94,17 +94,29 @@ class BotLifecycleMixin:
             max_delivery_attempts_per_scan=3,
             send_timeout=5.0,
         )
+        self._record_recovery_stats(stats)
         if stats.delivered or stats.failed or stats.rejected:
             logger.info(
-                "Dead-session recovery: scanned=%d delivered=%d duplicate=%d failed=%d rejected=%d active=%d locked=%d",
+                "Dead-session recovery: scanned=%d delivered=%d duplicate=%d failed=%d "
+                "rejected=%d quarantined=%d quarantine_skipped=%d active=%d locked=%d",
                 stats.scanned,
                 stats.delivered,
                 stats.duplicate,
                 stats.failed,
                 stats.rejected,
+                stats.quarantined,
+                stats.quarantine_skipped,
                 stats.skipped_active,
                 stats.skipped_locked,
             )
+
+    def _record_recovery_stats(self, stats) -> None:
+        """Surface recovery counters in health.json (fail-open)."""
+        try:
+            if getattr(stats, "quarantined", 0):
+                health_reporter.record_transcript_quarantined(stats.quarantined)
+        except Exception as exc:
+            logger.debug("Recovery stats health recording failed: %s", type(exc).__name__)
 
     def _lifecycle_task_ledger(self):
         path = ledger_path_for(
@@ -760,6 +772,7 @@ class BotLifecycleMixin:
             self._project_chat,
             self._project_chat.conversations_dir,
             stop_event,
+            on_stats=self._record_recovery_stats,
         )
 
     async def _workload_reporter(self, stop_event: asyncio.Event):

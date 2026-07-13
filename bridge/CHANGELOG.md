@@ -91,6 +91,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fail closed. Linux/WSL2 requires `bubblewrap` and `socat`.
 
 ### Fixed
+- **Rejected dead-session transcripts are quarantined instead of rescanned
+  forever (#411, part B).** When dead-session recovery rejects a transcript as
+  unsafe to replay (`TranscriptRejected`), the bridge previously re-parsed and
+  re-warned about the same immutable file on every 60-second tick, with no
+  owner notification (observed live: identical rejection warnings every minute
+  for over an hour). A rejection now persists a quarantine record in the
+  conversation's session state, fingerprinted by session id, constant reason
+  code, and the file's dev/inode/size/mtime identity. Subsequent ticks skip the
+  parse entirely while the identity is unchanged; the owner gets exactly one
+  redacted notice (reason code only — never transcript content or paths)
+  explaining that automatic recovery is impossible and the task should be
+  re-run if still needed. A failed notice is retried on later ticks without
+  re-parsing. Identity drift (operator touch/replace) or session rotation
+  triggers a bounded re-evaluation: a repaired transcript resumes normal
+  recovery and lifts the quarantine; a still-broken one re-quarantines under
+  its new fingerprint. Quarantine state survives restarts (it lives in
+  `sessions.json`), retention is one record per conversation by construction,
+  and new quarantine events are counted in
+  `health.json → recovery.quarantined_transcripts`.
 - **Transient Telegram outages no longer cancel in-flight AI turns (#411, part A).**
   A runtime `NetworkError`/`TimedOut` or a watchdog-detected hang previously tore
   down the whole Application lifecycle, taking the in-progress agent turn with it

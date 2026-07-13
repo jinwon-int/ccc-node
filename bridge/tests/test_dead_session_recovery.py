@@ -9,12 +9,15 @@ from unittest.mock import AsyncMock
 
 from telegram_bot.core.dead_session_recovery import (
     MARKER_KEY,
+    QUARANTINE_KEY,
     TranscriptRejected,
     format_notification,
     notification_marker,
     parse_conversation_route,
+    quarantine_blocks_scan,
     recover_dead_session_notifications,
     scan_transcript,
+    transcript_quarantine_record,
 )
 
 
@@ -235,6 +238,196 @@ class DeadSessionScannerTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(stats.delivered, 1)
         self.assertEqual(self.bot.send_message.await_count, 1)
+
+
+class TranscriptQuarantineTests(unittest.IsolatedAsyncioTestCase):
+    """Rejected transcripts are quarantined instead of rescanned forever (#411 B)."""
+
+    # Redaction canary: stands in for arbitrary transcript content (which may
+    # contain prompts or credentials in production) and must never leak into
+    # quarantine notices or records.
+    CANARY = "REDACTION_CANARY_MARKER_XYZ"
+
+    async def asyncSetUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.session_id = "session-1"
+        self.path = self.root / f"{self.session_id}.jsonl"
+        # Rejects with "queue row session id does not match owner"; the canary
+        # inside the row must never leak into notices or records.
+        self.path.write_text(
+            _queue("enqueue", session_id="foreign", content=self.CANARY),
+            encoding="utf-8",
+        )
+        self.sessions = _SessionManager(
+            {"7:70": {"session_id": self.session_id, "reply_mode": "text"}}
+        )
+        self.bot = SimpleNamespace(
+            send_message=AsyncMock(return_value=SimpleNamespace(message_id=1))
+        )
+        self.handler = SimpleNamespace(
+            _streams={},
+            _get_conversation_lock=lambda _user, _chat: asyncio.Lock(),
+        )
+
+    async def asyncTearDown(self):
+        self.tmp.cleanup()
+
+    async def _recover(self):
+        return await recover_dead_session_notifications(
+            self.bot, self.sessions, self.handler, self.root
+        )
+
+    def _counting_scan(self):
+        import telegram_bot.core.dead_session_recovery as module
+
+        calls = []
+        original = scan_transcript
+
+        def wrapper(path, expected_session_id, **kwargs):
+            calls.append(str(path))
+            return original(path, expected_session_id, **kwargs)
+
+        patcher = unittest.mock.patch.object(module, "scan_transcript", wrapper)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return calls
+
+    async def test_rejected_transcript_is_parsed_once_and_notified_once(self):
+        calls = self._counting_scan()
+
+        first = await self._recover()
+        second = await self._recover()
+        third = await self._recover()
+
+        # Exactly one parse across all ticks; only the first tick rejects.
+        self.assertEqual(len(calls), 1)
+        self.assertEqual((first.rejected, first.quarantined), (1, 1))
+        self.assertEqual((second.rejected, second.quarantine_skipped), (0, 1))
+        self.assertEqual((third.rejected, third.quarantine_skipped), (0, 1))
+        # Exactly one owner notice, deduplicated afterwards.
+        self.bot.send_message.assert_awaited_once()
+        text = self.bot.send_message.await_args.kwargs["text"]
+        self.assertIn("quarantined", text)
+        self.assertIn("queue row session id does not match owner", text)
+        record = self.sessions.sessions["7:70"][QUARANTINE_KEY]
+        self.assertTrue(record["notified"])
+        self.assertTrue(record["fingerprint"].startswith("sha256:"))
+
+    async def test_notice_and_record_never_leak_transcript_content(self):
+        await self._recover()
+
+        text = self.bot.send_message.await_args.kwargs["text"]
+        record = json.dumps(self.sessions.sessions["7:70"][QUARANTINE_KEY])
+        self.assertNotIn(self.CANARY, text)
+        self.assertNotIn(self.CANARY, record)
+        self.assertNotIn(str(self.root), text)
+
+    async def test_quarantine_survives_restart(self):
+        await self._recover()
+        calls = self._counting_scan()
+
+        # A fresh manager over the same persisted store simulates a restart.
+        restarted = _SessionManager(self.sessions.sessions)
+        stats = await recover_dead_session_notifications(
+            self.bot, restarted, self.handler, self.root
+        )
+
+        self.assertEqual(stats.quarantine_skipped, 1)
+        self.assertEqual(calls, [])
+        self.bot.send_message.assert_awaited_once()
+
+    async def test_changed_transcript_is_reevaluated_and_recovers(self):
+        await self._recover()
+        # Repair the transcript: recovery must notice the identity change,
+        # re-scan, deliver, and lift the quarantine.
+        self.path.write_text(_queue("enqueue", content=_task()), encoding="utf-8")
+
+        stats = await self._recover()
+
+        self.assertEqual((stats.scanned, stats.delivered), (1, 1))
+        self.assertIsNone(self.sessions.sessions["7:70"][QUARANTINE_KEY])
+
+    async def test_changed_but_still_rejecting_transcript_requarantines_once(self):
+        await self._recover()
+        old_fingerprint = self.sessions.sessions["7:70"][QUARANTINE_KEY]["fingerprint"]
+        self.path.write_text(
+            _queue("enqueue", session_id="foreign", content="different body"),
+            encoding="utf-8",
+        )
+
+        second = await self._recover()
+        third = await self._recover()
+
+        self.assertEqual((second.rejected, second.quarantined), (1, 1))
+        self.assertEqual((third.rejected, third.quarantine_skipped), (0, 1))
+        record = self.sessions.sessions["7:70"][QUARANTINE_KEY]
+        self.assertNotEqual(record["fingerprint"], old_fingerprint)
+        self.assertEqual(self.bot.send_message.await_count, 2)
+
+    async def test_failed_notice_retries_without_reparsing(self):
+        calls = self._counting_scan()
+        self.bot.send_message.side_effect = RuntimeError("network down")
+
+        first = await self._recover()
+        self.bot.send_message.side_effect = None
+        second = await self._recover()
+        third = await self._recover()
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual((first.quarantined, first.failed), (1, 1))
+        self.assertEqual(second.quarantine_skipped, 1)
+        self.assertTrue(self.sessions.sessions["7:70"][QUARANTINE_KEY]["notified"])
+        self.assertEqual(third.quarantine_skipped, 1)
+        # First send failed, second succeeded, third deduplicated.
+        self.assertEqual(self.bot.send_message.await_count, 2)
+
+    async def test_identityless_rejection_still_retries_pending_notice(self):
+        """#424 review: records with identity=null never take the pre-scan
+        skip, so the failed-notice retry must stay reachable on the
+        same-fingerprint dedupe path too."""
+        missing_root = self.root / "missing"  # -> "conversation root unavailable"
+        self.bot.send_message.side_effect = RuntimeError("network down")
+
+        first = await recover_dead_session_notifications(
+            self.bot, self.sessions, self.handler, missing_root
+        )
+        self.bot.send_message.side_effect = None
+        second = await recover_dead_session_notifications(
+            self.bot, self.sessions, self.handler, missing_root
+        )
+        third = await recover_dead_session_notifications(
+            self.bot, self.sessions, self.handler, missing_root
+        )
+
+        record = self.sessions.sessions["7:70"][QUARANTINE_KEY]
+        self.assertIsNone(record["identity"])
+        self.assertTrue(record["notified"])
+        self.assertEqual((first.quarantined, first.failed), (1, 1))
+        # One failed attempt, one successful retry, then deduplicated.
+        self.assertEqual(self.bot.send_message.await_count, 2)
+        self.assertEqual((second.quarantined, third.quarantined), (0, 0))
+        text = self.bot.send_message.await_args.kwargs["text"]
+        self.assertIn("conversation root unavailable", text)
+
+    def test_quarantine_blocks_scan_requires_matching_identity(self):
+        record = transcript_quarantine_record(self.session_id, "reason", self.path)
+        self.assertTrue(quarantine_blocks_scan(record, self.session_id, self.path))
+        self.assertFalse(quarantine_blocks_scan(record, "other-session", self.path))
+        self.assertFalse(quarantine_blocks_scan(None, self.session_id, self.path))
+        self.assertFalse(quarantine_blocks_scan("corrupt", self.session_id, self.path))
+        os.utime(self.path)  # identity drift re-enables evaluation
+        self.assertFalse(quarantine_blocks_scan(record, self.session_id, self.path))
+
+    def test_fingerprint_is_stable_and_identity_bound(self):
+        first = transcript_quarantine_record(self.session_id, "reason", self.path)
+        second = transcript_quarantine_record(self.session_id, "reason", self.path)
+        self.assertEqual(first["fingerprint"], second["fingerprint"])
+        other_reason = transcript_quarantine_record(self.session_id, "other", self.path)
+        self.assertNotEqual(first["fingerprint"], other_reason["fingerprint"])
+        pathless = transcript_quarantine_record(self.session_id, "reason", None)
+        self.assertNotEqual(first["fingerprint"], pathless["fingerprint"])
+        self.assertIsNone(pathless["identity"])
 
 
 if __name__ == "__main__":
