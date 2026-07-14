@@ -368,13 +368,64 @@ cleanup_pid() {
     rm -f "$PID_FILE" 2>/dev/null || true
 }
 
+# True iff /proc/<pid>/cmdline is exactly a telegram_bot bot for THIS project
+# root: a `telegram_bot` argv token plus a `--path` token whose immediately
+# following argument equals PROJECT_ROOT *literally*. NUL-delimited exact
+# comparison — no regex — so paths with ERE metacharacters (. + ( ) space …)
+# can neither false-match nor be missed.
+_cmdline_is_project_bot() {
+    local file="$1" arg has_module=0 path_match=0
+    local -a argv=()
+    while IFS= read -r -d '' arg; do argv+=("$arg"); done < "$file" 2>/dev/null
+    local i
+    for ((i = 0; i < ${#argv[@]}; i++)); do
+        [ "${argv[i]}" = "telegram_bot" ] && has_module=1
+        if [ "${argv[i]}" = "--path" ] \
+            && [ "$((i + 1))" -lt "${#argv[@]}" ] \
+            && [ "${argv[$((i + 1))]}" = "$PROJECT_ROOT" ]; then
+            path_match=1
+        fi
+    done
+    [ "$has_module" = 1 ] && [ "$path_match" = 1 ]
+}
+
+# /proc-less fallback (e.g. macOS): literal substring match on the ps argv
+# string. `case` globs treat PROJECT_ROOT as a literal, so no regex injection;
+# the trailing space/end anchor stops `/root` matching `/rootX`.
+_ps_argv_is_project_bot() {
+    local pid="$1" args
+    args="$(ps -o args= -p "$pid" 2>/dev/null)" || return 1
+    case "$args" in
+        *"-m telegram_bot "*) : ;;
+        *) return 1 ;;
+    esac
+    case "$args" in
+        *"--path $PROJECT_ROOT") return 0 ;;
+        *"--path $PROJECT_ROOT "*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 # PIDs of `python -m telegram_bot --path $PROJECT_ROOT` processes for THIS
 # project root, regardless of pid-file state. Covers unmanaged instances whose
 # pid file was lost (pid-file race between concurrent instances) or never
 # written — the same fallback the fleet watchdogs already use, so --status /
 # --stop and the watchdogs agree on what "running" means.
+#
+# pgrep -f gathers candidates by a metacharacter-free literal prefix; the exact
+# owner is then confirmed against /proc/<pid>/cmdline (NUL-delimited), because
+# inserting PROJECT_ROOT raw into the pgrep ERE mis-judged metacharacter paths
+# and could self-inflict a getUpdates Conflict by launching a second instance.
 find_project_bot_pids() {
-    pgrep -f -- "-m telegram_bot --path ${PROJECT_ROOT}( |\$)" 2>/dev/null || true
+    local pid
+    while IFS= read -r pid; do
+        [ -n "$pid" ] || continue
+        if [ -r "/proc/$pid/cmdline" ]; then
+            _cmdline_is_project_bot "/proc/$pid/cmdline" && printf '%s\n' "$pid"
+        else
+            _ps_argv_is_project_bot "$pid" && printf '%s\n' "$pid"
+        fi
+    done < <(pgrep -f -- "-m telegram_bot --path" 2>/dev/null || true)
 }
 
 cleanup_supervisor_pid() {
