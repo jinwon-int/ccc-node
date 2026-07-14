@@ -30,10 +30,8 @@ package-dir = {"telegram_bot" = "."}
 packages = [
   "telegram_bot",
   "telegram_bot.core",
-  "telegram_bot.interaction",
   "telegram_bot.memory",
   "telegram_bot.session",
-  "telegram_bot.skills",
   "telegram_bot.utils",
 ]
 # There is no telegram_bot.hooks Python package in bridge/ today; repository
