@@ -1,0 +1,208 @@
+{
+  "$defs": {
+    "DistillProvenance": {
+      "additionalProperties": false,
+      "properties": {
+        "distilled_at": {
+          "format": "date-time",
+          "title": "Distilled At",
+          "type": "string"
+        },
+        "provider": {
+          "const": "codex",
+          "title": "Provider",
+          "type": "string"
+        },
+        "source_thread_hash": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Source Thread Hash",
+          "type": "string"
+        },
+        "trigger": {
+          "$ref": "#/$defs/DistillTrigger"
+        }
+      },
+      "required": [
+        "provider",
+        "source_thread_hash",
+        "trigger",
+        "distilled_at"
+      ],
+      "title": "DistillProvenance",
+      "type": "object"
+    },
+    "DistillTrigger": {
+      "enum": [
+        "new_command",
+        "provider_switch",
+        "auto_new"
+      ],
+      "title": "DistillTrigger",
+      "type": "string"
+    },
+    "HonchoFact": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "enum": [
+            "preference",
+            "decision",
+            "observation",
+            "context"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "subject": {
+          "enum": [
+            "user",
+            "session",
+            "node"
+          ],
+          "title": "Subject",
+          "type": "string"
+        },
+        "text": {
+          "maxLength": 4096,
+          "minLength": 1,
+          "title": "Text",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "text",
+        "subject"
+      ],
+      "title": "HonchoFact",
+      "type": "object"
+    },
+    "ResumeState": {
+      "additionalProperties": false,
+      "properties": {
+        "awaiting_user": {
+          "title": "Awaiting User",
+          "type": "boolean"
+        },
+        "evidence": {
+          "items": {
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^(?:(?:issue|pr|commit|run|task|round)\\s+#?[A-Za-z0-9][A-Za-z0-9._:/@-]{0,119}|[0-9a-f]{7,64}|#[0-9]{1,20})$",
+            "type": "string"
+          },
+          "maxItems": 16,
+          "title": "Evidence",
+          "type": "array"
+        },
+        "last_activity": {
+          "maxLength": 160,
+          "title": "Last Activity",
+          "type": "string"
+        },
+        "next_step": {
+          "maxLength": 400,
+          "title": "Next Step",
+          "type": "string"
+        },
+        "open_question": {
+          "maxLength": 400,
+          "title": "Open Question",
+          "type": "string"
+        },
+        "pending_action": {
+          "maxLength": 400,
+          "title": "Pending Action",
+          "type": "string"
+        }
+      },
+      "required": [
+        "last_activity",
+        "pending_action",
+        "awaiting_user",
+        "open_question",
+        "next_step",
+        "evidence"
+      ],
+      "title": "ResumeState",
+      "type": "object"
+    },
+    "WikiCandidate": {
+      "additionalProperties": false,
+      "properties": {
+        "evidence_excerpt": {
+          "maxLength": 200,
+          "minLength": 1,
+          "title": "Evidence Excerpt",
+          "type": "string"
+        },
+        "suggested_path": {
+          "pattern": "^(?:pages/log\\.md|pages/(?:team|nodes)/[A-Za-z0-9][A-Za-z0-9._-]*/(?:[A-Za-z0-9][A-Za-z0-9._-]*/)*[A-Za-z0-9][A-Za-z0-9._-]*\\.md)$",
+          "title": "Suggested Path",
+          "type": "string"
+        },
+        "summary": {
+          "maxLength": 600,
+          "minLength": 1,
+          "title": "Summary",
+          "type": "string"
+        },
+        "title": {
+          "maxLength": 160,
+          "minLength": 1,
+          "title": "Title",
+          "type": "string"
+        }
+      },
+      "required": [
+        "title",
+        "suggested_path",
+        "summary",
+        "evidence_excerpt"
+      ],
+      "title": "WikiCandidate",
+      "type": "object"
+    }
+  },
+  "$id": "https://schemas.seoyoon-family.com/ccc-node/codex-distill-extraction-v1.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "honcho": {
+      "items": {
+        "$ref": "#/$defs/HonchoFact"
+      },
+      "maxItems": 12,
+      "title": "Honcho",
+      "type": "array"
+    },
+    "provenance": {
+      "$ref": "#/$defs/DistillProvenance"
+    },
+    "resume": {
+      "$ref": "#/$defs/ResumeState"
+    },
+    "schema_version": {
+      "const": 1,
+      "title": "Schema Version",
+      "type": "integer"
+    },
+    "wiki_candidates": {
+      "items": {
+        "$ref": "#/$defs/WikiCandidate"
+      },
+      "maxItems": 3,
+      "title": "Wiki Candidates",
+      "type": "array"
+    }
+  },
+  "required": [
+    "schema_version",
+    "provenance",
+    "honcho",
+    "wiki_candidates",
+    "resume"
+  ],
+  "title": "DistillExtractionOutput",
+  "type": "object"
+}
