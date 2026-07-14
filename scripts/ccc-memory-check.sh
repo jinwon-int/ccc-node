@@ -50,6 +50,10 @@ honcho_meta_file="$CACHE/honcho.meta.json"
 index_db="$STATE_DIR/memory-index.sqlite"
 
 honcho_enabled="${CCC_HONCHO_MEMORY_ENABLED:-1}"
+wiki_enabled="${CCC_WIKI_MEMORY_ENABLED:-1}"
+if [ "${CCC_NODE_ISOLATION_PROFILE:-fleet}" = "external" ]; then
+  wiki_enabled=0
+fi
 honcho_base="(missing)"
 if [ -f "$HONCHO_CFG" ]; then
   # Mirror refresh-memory.sh: the config may use the nested `.hosts.hermes.*`
@@ -58,7 +62,10 @@ if [ -f "$HONCHO_CFG" ]; then
   honcho_base="$(jq -r 'def nz(x): x | select(. != null and . != ""); nz(.baseUrl) // nz(.hosts.hermes.baseUrl) // "unset"' "$HONCHO_CFG" 2>/dev/null || printf 'parse-error')"
 fi
 
-wiki_status="$(status_for "$wiki_file" "$WIKI_TTL")"
+wiki_status="disabled"
+if ! is_disabled "$wiki_enabled"; then
+  wiki_status="$(status_for "$wiki_file" "$WIKI_TTL")"
+fi
 honcho_status="disabled"
 if ! is_disabled "$honcho_enabled"; then
   honcho_status="$(status_for "$honcho_file" "$HONCHO_TTL")"

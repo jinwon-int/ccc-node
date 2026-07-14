@@ -14,6 +14,9 @@ HONCHO_CFG="${CCC_HONCHO_CFG:-${CCC_HERMES_DIR:-${HOME:-/root}/.hermes}/honcho.j
 WIKI_TIMEOUT="${CCC_WIKI_TIMEOUT_SEC:-60}"
 HONCHO_TIMEOUT="${CCC_HONCHO_TIMEOUT_SEC:-60}"
 HONCHO_ENABLED="${CCC_HONCHO_MEMORY_ENABLED:-1}"
+WIKI_ENABLED="${CCC_WIKI_MEMORY_ENABLED:-1}"
+ISOLATION_PROFILE="${CCC_NODE_ISOLATION_PROFILE:-fleet}"
+[ "$ISOLATION_PROFILE" = "external" ] && WIKI_ENABLED=0
 PROFILE="${CCC_MEMORY_PROFILE:-honcho}"
 mkdir -p "$CACHE" "$STATE_DIR"
 
@@ -64,23 +67,29 @@ record_status() { # <name> <status> <duration_ms> <bytes> <error> [query]
 }
 
 refresh_wiki() {
-  local start end duration q tmp status err
+  local start end duration q tmp status err bytes
   start="$(now_ms)"
-  q="$(query_from_state)"
+  q=""
   tmp="$CACHE/wiki.txt.tmp.$$"
-  status="ok"; err=""
-  if [ ! -x "$WIKI" ]; then
-    status="missing"; err="wiki-agent not executable"
-  elif ! timeout "$WIKI_TIMEOUT" "$WIKI" --no-notify prefetch "$q" > "$tmp" 2>"$tmp.err"; then
-    status="error"; err="$(tr '\n' ' ' < "$tmp.err" | cut -c1-240)"
-  elif [ ! -s "$tmp" ]; then
-    status="empty"; err="empty wiki prefetch"
+  status="ok"; err=""; bytes=0
+  if is_disabled "$WIKI_ENABLED"; then
+    status="disabled"; err="Family Wiki read path disabled"
   else
-    mv "$tmp" "$CACHE/wiki.txt"
+    q="$(query_from_state)"
+    if [ ! -x "$WIKI" ]; then
+      status="missing"; err="wiki-agent not executable"
+    elif ! timeout "$WIKI_TIMEOUT" "$WIKI" --no-notify prefetch "$q" > "$tmp" 2>"$tmp.err"; then
+      status="error"; err="$(tr '\n' ' ' < "$tmp.err" | cut -c1-240)"
+    elif [ ! -s "$tmp" ]; then
+      status="empty"; err="empty wiki prefetch"
+    else
+      mv "$tmp" "$CACHE/wiki.txt"
+    fi
+    bytes="$(bytes_for "$CACHE/wiki.txt")"
   fi
   rm -f "$tmp" "$tmp.err"
   end="$(now_ms)"; duration="$((end - start))"
-  record_status wiki "$status" "$duration" "$(bytes_for "$CACHE/wiki.txt")" "$err" "$q"
+  record_status wiki "$status" "$duration" "$bytes" "$err" "$q"
 }
 
 refresh_honcho() {

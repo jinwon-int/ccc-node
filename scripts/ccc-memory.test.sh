@@ -29,6 +29,12 @@ ok "memory check json succeeds" '[ "$rc" = 0 ] && jq -e ".wiki.status == \"ok\" 
 out="$(CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CCC_HONCHO_MEMORY_ENABLED=FALSE bash "$ROOT/scripts/ccc-memory-check.sh" --json 2>&1)"; rc=$?
 ok "memory check treats uppercase FALSE as disabled" '[ "$rc" = 0 ] && jq -e ".honcho.status == \"disabled\"" >/dev/null <<<"$out"'
 
+out="$(CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CCC_NODE_ISOLATION_PROFILE=external CCC_WIKI_MEMORY_ENABLED=1 bash "$ROOT/scripts/ccc-memory-check.sh" --json 2>&1)"; rc=$?
+ok "external isolation overrides an explicit Wiki enable in diagnostics" '[ "$rc" = 0 ] && jq -e ".wiki.status == \"disabled\"" >/dev/null <<<"$out"'
+
+out="$(CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CCC_WIKI_MEMORY_ENABLED=FALSE bash "$ROOT/scripts/ccc-memory-check.sh" --json 2>&1)"; rc=$?
+ok "memory check reports Wiki disabled despite a stale cache file" '[ "$rc" = 0 ] && jq -e ".wiki.status == \"disabled\"" >/dev/null <<<"$out"'
+
 secret_a="VALUE_SHOULD_NOT_INDEX_A"
 secret_b="VALUE_SHOULD_NOT_INDEX_B"
 secret_c="VALUE_SHOULD_NOT_INDEX_C"
@@ -54,6 +60,70 @@ finally:
 PY
 )"
 ok "memory index redacts bearer/key/url secrets" '! grep -q "VALUE_SHOULD_NOT_INDEX_A\|VALUE_SHOULD_NOT_INDEX_B\|VALUE_SHOULD_NOT_INDEX_C" <<<"$db_dump"'
+
+# A pre-disable opt-in index can contain valid/malformed distill artifacts. The
+# external boundary must hide them immediately, before the next cleanup, and a
+# disabled update must fail closed rather than indexing malformed raw JSON.
+mkdir -p "$state/distill-history"
+printf '%s\n' '{"honcho":[{"text":"STALE_VALID_HONCHO_KEEP"}],"wiki_candidates":[{"summary":"STALE_VALID_WIKI_DROP"}]}' > "$state/distill-history/stale-valid.json"
+CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CCC_MEMORY_INDEX_DISTILL=1 bash "$ROOT/scripts/ccc-memory-index.sh" rebuild >/dev/null 2>&1
+out="$(CCC_STATE_DIR="$state" CCC_NODE_ISOLATION_PROFILE=external CCC_WIKI_MEMORY_ENABLED=1 bash "$ROOT/scripts/ccc-memory-search.sh" 'STALE_VALID_WIKI_DROP' 2>&1)"; rc=$?
+ok "external search immediately hides stale valid distill-history rows" '[ "$rc" = 0 ] && jq -e "(.results | length) == 0" >/dev/null <<<"$out"'
+out="$(CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CCC_HOOK_DIR="$ROOT/claude/hooks" CCC_MEMORY_TOOLS_DIR="$ROOT/scripts" CCC_MEMORY_QUERY='STALE_VALID_WIKI_DROP' CCC_NODE_ISOLATION_PROFILE=external CCC_WIKI_MEMORY_ENABLED=1 CCC_HONCHO_MEMORY_ENABLED=0 CCC_MEMORY_NO_REFRESH=1 bash "$ROOT/claude/hooks/load-memory.sh" SessionStart 2>&1)"; rc=$?
+ok "external SessionStart immediately hides stale valid distill-history rows" '[ "$rc" = 0 ] && ! grep -q "STALE_VALID_WIKI_DROP\|stale-valid.json" <<<"$out"'
+printf '%s\n' '{"wiki_candidates":[{"summary":"MALFORMED_HISTORY_WIKI_DROP"}]' > "$state/distill-history/malformed.json"
+CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CCC_MEMORY_INDEX_DISTILL=1 CCC_NODE_ISOLATION_PROFILE=external CCC_WIKI_MEMORY_ENABLED=1 bash "$ROOT/scripts/ccc-memory-index.sh" update >/dev/null 2>&1
+malformed_dump="$(python3 - <<PY
+import sqlite3
+con=sqlite3.connect('$state/memory-index.sqlite')
+try:
+    print('\n'.join((row[0] or '')+' '+(row[1] or '') for row in con.execute('select path,content from memory_docs')))
+finally:
+    con.close()
+PY
+)"
+ok "external update drops malformed distill-history JSON instead of indexing raw text" '! grep -q "MALFORMED_HISTORY_WIKI_DROP\|malformed.json" <<<"$malformed_dump"'
+out="$(CCC_STATE_DIR="$state" CCC_NODE_ISOLATION_PROFILE=external CCC_WIKI_MEMORY_ENABLED=1 bash "$ROOT/scripts/ccc-memory-search.sh" 'MALFORMED_HISTORY_WIKI_DROP' 2>&1)"; rc=$?
+ok "external search cannot surface malformed distill-history after update" '[ "$rc" = 0 ] && jq -e "(.results | length) == 0" >/dev/null <<<"$out"'
+out="$(CCC_STATE_DIR="$state" CCC_NODE_ISOLATION_PROFILE=external CCC_WIKI_MEMORY_ENABLED=1 bash "$ROOT/scripts/ccc-memory-search.sh" 'STALE_VALID_HONCHO_KEEP' 2>&1)"; rc=$?
+ok "external search preserves sanitized local Honcho distill after update" '[ "$rc" = 0 ] && jq -e "[.results[] | select(.source == \"distill-local\" and (.path | endswith(\"/stale-valid.json\")))] | length >= 1" >/dev/null <<<"$out"'
+rm -rf "$state/distill-history"
+CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" bash "$ROOT/scripts/ccc-memory-index.sh" rebuild >/dev/null 2>&1
+
+out="$(CCC_STATE_DIR="$state" CCC_NODE_ISOLATION_PROFILE=external CCC_WIKI_MEMORY_ENABLED=1 bash "$ROOT/scripts/ccc-memory-search.sh" 'hybrid memory profile' 2>&1)"; rc=$?
+ok "external search filters a stale Wiki row before index cleanup" '[ "$rc" = 0 ] && jq -e "[.results[] | select(.path | endswith(\"/wiki.txt\"))] | length == 0" >/dev/null <<<"$out"'
+out="$(CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CCC_MEMORY_TOOLS_DIR="$ROOT/scripts" CCC_NODE_ISOLATION_PROFILE=external CCC_WIKI_MEMORY_ENABLED=1 bash "$ROOT/scripts/ccc-memory-explain.sh" --json --query 'hybrid memory profile' 2>&1)"; rc=$?
+ok "external memory explain reports zero Wiki budget and no stale Wiki result" '[ "$rc" = 0 ] && jq -e ".budgets.wiki == 0 and ([.search.results[] | select(.path | endswith(\"/wiki.txt\"))] | length == 0)" >/dev/null <<<"$out"'
+
+out="$(CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CCC_NODE_ISOLATION_PROFILE=external CCC_WIKI_MEMORY_ENABLED=1 bash "$ROOT/scripts/ccc-memory-index.sh" update 2>&1)"; rc=$?
+indexed_paths="$(python3 - <<PY
+import sqlite3
+con=sqlite3.connect('$state/memory-index.sqlite')
+try:
+    print('\n'.join(row[0] for row in con.execute('select path from memory_docs order by path')))
+finally:
+    con.close()
+PY
+)"
+ok "wiki-disabled index update reports effective policy" '[ "$rc" = 0 ] && jq -e ".wiki_enabled == false" >/dev/null <<<"$out"'
+ok "wiki-disabled index removes stale Wiki rows but keeps Honcho" '! grep -q "/wiki.txt$" <<<"$indexed_paths" && grep -q "/honcho.txt$" <<<"$indexed_paths"'
+printf '%s\n' '{"honcho":[{"text":"HONCHO_DISTILL_KEEP"}],"wiki_candidates":[{"summary":"WIKI_DISTILL_DROP"}]}' > "$state/distill-last.json"
+printf 'WIKI_QUEUE_DROP\n' > "$state/wiki-candidates.md"
+mkdir -p "$state/distill-history"
+printf '%s\n' '{"honcho":[{"text":"HONCHO_HISTORY_KEEP"}],"wiki_candidates":[{"summary":"WIKI_HISTORY_DROP"}]}' > "$state/distill-history/one.json"
+CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CCC_MEMORY_INDEX_DISTILL=1 CCC_NODE_ISOLATION_PROFILE=external CCC_WIKI_MEMORY_ENABLED=1 bash "$ROOT/scripts/ccc-memory-index.sh" rebuild >/dev/null 2>&1
+distill_dump="$(python3 - <<PY
+import sqlite3
+con=sqlite3.connect('$state/memory-index.sqlite')
+try:
+    print('\n'.join(row[0] for row in con.execute('select content from memory_docs')))
+finally:
+    con.close()
+PY
+)"
+ok "wiki-disabled opt-in distill index strips Wiki queue/history fields" 'grep -q "HONCHO_DISTILL_KEEP\|HONCHO_HISTORY_KEEP" <<<"$distill_dump" && ! grep -q "WIKI_DISTILL_DROP\|WIKI_QUEUE_DROP\|WIKI_HISTORY_DROP" <<<"$distill_dump"'
+rm -rf "$state/distill-last.json" "$state/wiki-candidates.md" "$state/distill-history"
+CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" bash "$ROOT/scripts/ccc-memory-index.sh" update >/dev/null 2>&1
 
 old_state="$TMP/old-state"
 old_cache="$TMP/old-cache"

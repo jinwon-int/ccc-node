@@ -20,6 +20,13 @@
 #     refreshes .seen so the surviving topics stay suppressed.
 set -uo pipefail
 
+case "${CCC_NODE_ISOLATION_PROFILE:-fleet}:${CCC_WIKI_MEMORY_ENABLED:-1}" in
+  external:*|*:0|*:false|*:FALSE|*:off|*:OFF|*:no|*:NO)
+    printf 'wiki-queue skipped reason=disabled\n'
+    exit 0
+    ;;
+esac
+
 STATE_DIR="${CCC_STATE_DIR:-${HOME:-/root}/.claude/state}"
 QUEUE="$STATE_DIR/wiki-candidates.md"
 SEEN="$STATE_DIR/wiki-candidates.seen"

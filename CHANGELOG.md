@@ -5,6 +5,14 @@ All notable changes to the Claude Code node harness. Dates are KST.
 ## [Unreleased]
 
 ### Added
+- Fail-closed external-node memory isolation (#466):
+  `CCC_NODE_ISOLATION_PROFILE=external` provides a higher-priority bridge-to-hook
+  placement policy and PreToolUse Family-resource guard; `CCC_WIKI_MEMORY_ENABLED=0`
+  disables Family Wiki injection, refresh, local
+  indexing (including stale distill artifacts), extraction candidates, and queue
+  writes while preserving built-in/local/Honcho/resume memory. Node-local
+  `CCC_MEMORY_USER_LABEL` / `CCC_MEMORY_ASSISTANT_LABEL` replace hard-coded
+  relationship identities without changing existing defaults.
 - Tag-based versioning preparation for #251: `scripts/ccc-version.sh`, ccc-doctor
   harness-version reporting, fleet-matrix version extraction, release workflow,
   and CONTRIBUTING release policy. Actual tag/Release publishing remains a

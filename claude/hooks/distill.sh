@@ -17,6 +17,11 @@
 #   - Dry-run:   touch ~/.claude/state/distill.dryrun (no Honcho/queue writes)
 set -uo pipefail
 
+is_disabled() { case "${1:-}" in 0|false|FALSE|off|OFF|no|NO) return 0;; *) return 1;; esac; }
+wiki_memory_disabled() {
+  [ "${CCC_NODE_ISOLATION_PROFILE:-fleet}" = "external" ] || is_disabled "${CCC_WIKI_MEMORY_ENABLED:-1}"
+}
+
 # ---- recursion guard (FIRST line of executable logic) ----------------------
 if [ -n "${CLAUDE_DISTILL_INFLIGHT:-}" ]; then
   exit 0
@@ -96,8 +101,12 @@ run_bg_pipeline() {
 
   bash "$HOOKDIR/distill/honcho-push.sh" < "$STASH" >> "$LOG" 2>&1 || \
     log "honcho-push non-zero (queued for retry)"
-  bash "$HOOKDIR/distill/wiki-queue.sh" < "$STASH" >> "$LOG" 2>&1 || \
-    log "wiki-queue non-zero"
+  if wiki_memory_disabled; then
+    log "wiki-queue skipped reason=disabled"
+  else
+    bash "$HOOKDIR/distill/wiki-queue.sh" < "$STASH" >> "$LOG" 2>&1 || \
+      log "wiki-queue non-zero"
+  fi
   bash "$HOOKDIR/distill/local-facts.sh" < "$STASH" >> "$LOG" 2>&1 || \
     log "local-facts non-zero"
 

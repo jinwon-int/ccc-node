@@ -126,6 +126,7 @@ def main() -> None:
         raise SystemExit(1)
 
     settings = load_runtime_settings()
+    os.environ.update(settings.hook_policy_environment())
     bot = create_bot(settings)
 
     bot.validate_runtime_paths()

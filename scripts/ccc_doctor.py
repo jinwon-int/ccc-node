@@ -387,7 +387,7 @@ class Doctor:
                 honcho = (mem.get("honcho") or {}).get("status", "unknown")
                 idx = (mem.get("local_index") or {}).get("exists", False)
                 status = f"wiki={wiki}; honcho={honcho}; local_index={str(idx).lower()}"
-                if wiki == "ok" and honcho in {"ok", "disabled"}:
+                if wiki in {"ok", "disabled"} and honcho in {"ok", "disabled"}:
                     self.add("정상", "memory cache", status, "none")
                 else:
                     self.add("경고", "memory cache", status, "run scripts/ccc-memory-check.sh --json and inspect stale/missing cache metadata")
