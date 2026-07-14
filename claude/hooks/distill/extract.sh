@@ -20,6 +20,13 @@ MODEL="${CLAUDE_DISTILL_MODEL:-haiku}"
 TIMEOUT="${CLAUDE_DISTILL_TIMEOUT:-90}"
 SOURCE_CWD="${CLAUDE_DISTILL_SOURCE_CWD:-}"
 SOURCE_PROJECT="${CLAUDE_DISTILL_SOURCE_PROJECT:-}"
+WIKI_ENABLED="${CCC_WIKI_MEMORY_ENABLED:-1}"
+USER_LABEL="$(printf '%s' "${CCC_MEMORY_USER_LABEL:-Seo Jin On / 서진원}" | tr '\r\n' '  ' | cut -c1-80)"
+ASSISTANT_LABEL="$(printf '%s' "${CCC_MEMORY_ASSISTANT_LABEL:-dungae, a Hermes Team2 worker}" | tr '\r\n' '  ' | cut -c1-80)"
+
+is_disabled() { case "${1:-}" in 0|false|FALSE|off|OFF|no|NO) return 0;; *) return 1;; esac; }
+WIKI_ENABLED_JSON=true
+is_disabled "$WIKI_ENABLED" && WIKI_ENABLED_JSON=false
 
 [ -f "$TRANSCRIPT" ] || { echo "no transcript: $TRANSCRIPT" >&2; exit 1; }
 
@@ -73,7 +80,7 @@ REDACTED="$(build_redacted "$MAX_TURNS" "$MAX_BYTES")"
 # ---- step 4: build extract prompt -----------------------------------------
 PROMPT="$(cat <<'EOF'
 You are a memory-distillation pass for a Claude Code node.
-You will receive a redacted slice of a session transcript between USER (Seo Jin On / 서진원) and ASSISTANT (dungae, a Hermes Team2 worker).
+You will receive a redacted slice of a session transcript.
 
 Extract two kinds of items and return STRICT JSON only.
 
@@ -138,12 +145,25 @@ OUTPUT CONTRACT — READ TWICE:
 - If you have nothing to extract, emit exactly: {"honcho":[],"wiki_candidates":[],"resume":{"last_activity":"","pending_action":"","awaiting_user":false,"open_question":"","next_step":"","evidence":[]}}
 EOF
 )"
+PROMPT="Configured identity: USER (${USER_LABEL}) and ASSISTANT (${ASSISTANT_LABEL}).
+${PROMPT}"
+if is_disabled "$WIKI_ENABLED"; then
+  PROMPT="${PROMPT}
+
+Family Wiki memory is disabled for this node. You MUST return wiki_candidates as an empty array. Do not propose Wiki paths or Wiki records."
+fi
 
 # System-prompt-level constraint (belt + suspenders with the user-prompt instruction).
 SYSTEM_CONSTRAINT='Output strict JSON only. The entire response is a single JSON object starting with { and ending with }. Include honcho, wiki_candidates, and resume keys. No prose, no preamble, no analysis, no markdown fences. If nothing qualifies, return {"honcho":[],"wiki_candidates":[],"resume":{"last_activity":"","pending_action":"","awaiting_user":false,"open_question":"","next_step":"","evidence":[]}}.'
+if is_disabled "$WIKI_ENABLED"; then
+  SYSTEM_CONSTRAINT="${SYSTEM_CONSTRAINT} Family Wiki memory is disabled: wiki_candidates MUST be []."
+fi
 
 # Even more emphatic prompt used on retries (timeout or JSON-drift).
 STRICT='CRITICAL OUTPUT CONTRACT. Your entire response MUST be exactly one JSON object and nothing else. The very first character is { and the very last character is }. Include honcho, wiki_candidates, and resume keys. No prose. No code fences. No "Here is the JSON". If you have nothing to extract, output exactly: {"honcho":[],"wiki_candidates":[],"resume":{"last_activity":"","pending_action":"","awaiting_user":false,"open_question":"","next_step":"","evidence":[]}}'
+if is_disabled "$WIKI_ENABLED"; then
+  STRICT="${STRICT} Family Wiki memory is disabled: wiki_candidates MUST be []."
+fi
 
 # ---- step 5: call `claude -p` (OAuth via parent process) -------------------
 # CLAUDE_DISTILL_INFLIGHT=1 is already exported by distill.sh so the child's
@@ -231,4 +251,6 @@ printf '%s' "$CLEAN" | jq -c \
   --arg ts  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
   --arg source_cwd "$SOURCE_CWD" \
   --arg source_project "$SOURCE_PROJECT" \
-  '. + {session_id:$sid, trigger:$trg, distilled_at:$ts, source_cwd:$source_cwd, source_project:$source_project}'
+  --argjson wiki_enabled "$WIKI_ENABLED_JSON" \
+  '(if $wiki_enabled then . else .wiki_candidates = [] end)
+   | . + {session_id:$sid, trigger:$trg, distilled_at:$ts, source_cwd:$source_cwd, source_project:$source_project}'

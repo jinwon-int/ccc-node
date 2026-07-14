@@ -23,6 +23,8 @@ MAX_HONCHO="${CCC_HONCHO_MAX_BYTES:-4000}"
 MAX_LOCAL="${CCC_LOCAL_MEMORY_MAX_BYTES:-3000}"
 MAX_RESUME="${CCC_RESUME_MAX_BYTES:-2000}"
 HONCHO_ENABLED="${CCC_HONCHO_MEMORY_ENABLED:-1}"
+WIKI_ENABLED="${CCC_WIKI_MEMORY_ENABLED:-1}"
+USER_LABEL="${CCC_MEMORY_USER_LABEL:-Seo Jin On}"
 # Local hot-memory search is ON by default for every profile now that the
 # default retrieval reranks with durability/source/recency boosts; set
 # CCC_LOCAL_MEMORY_ENABLED=0/false/off to opt out. hybrid/max-perf always query
@@ -100,6 +102,29 @@ for r in results:
 doc["results"] = kept
 if dropped:
     doc["injectionDedup"] = {"dropped": dropped, "kept": len(kept)}
+sys.stdout.write(json.dumps(doc, ensure_ascii=False))
+PY
+}
+
+# Fail closed immediately when Wiki memory is disabled, even before the next
+# background index update removes a stale wiki.txt row from SQLite.
+filter_disabled_wiki_hits() { # <search-json>
+  if ! is_disabled "$WIKI_ENABLED"; then printf '%s' "$1"; return 0; fi
+  SEARCH_JSON="$1" python3 - 2>/dev/null <<'PY' || printf '%s' '{"results":[]}'
+import json, os, pathlib, sys
+raw = os.environ.get("SEARCH_JSON", "")
+try:
+    doc = json.loads(raw)
+except Exception:
+    sys.stdout.write('{"results":[]}'); raise SystemExit(0)
+results = doc.get("results") if isinstance(doc, dict) else None
+if not isinstance(results, list):
+    sys.stdout.write('{"results":[]}'); raise SystemExit(0)
+doc["results"] = [
+    row for row in results
+    if isinstance(row, dict)
+    and pathlib.PurePath(str(row.get("path") or "")).name != "wiki.txt"
+]
 sys.stdout.write(json.dumps(doc, ensure_ascii=False))
 PY
 }
@@ -184,7 +209,10 @@ stale_note() { # <label> <file>
 # Built-in node memory lives under ~/.claude/memories; legacy Hermes memory is fallback only.
 mem="$(cat "$MEMDIR/MEMORY.md" "$MEMDIR/USER.md" 2>/dev/null)"
 [ -z "$mem" ] && mem="$(cat ${HOME:-/root}/.hermes/memories/MEMORY.md ${HOME:-/root}/.hermes/memories/USER.md 2>/dev/null)"
-wiki="$(cat "$CACHE/wiki.txt" 2>/dev/null)"
+wiki=""
+if ! is_disabled "$WIKI_ENABLED"; then
+  wiki="$(cat "$CACHE/wiki.txt" 2>/dev/null)"
+fi
 honcho=""
 if ! is_disabled "$HONCHO_ENABLED" && [ "$PROFILE" != "max-perf" ]; then
   honcho="$(cat "$CACHE/honcho.txt" 2>/dev/null)"
@@ -195,7 +223,9 @@ resume="$(cat "${CCC_RESUME_FILE:-$STATE_DIR/resume.md}" 2>/dev/null)"
 # before sizing the local hot block.
 mem="$(scan_injection_block built-in-memory "$mem" | limit_bytes "$MAX_MEM")"
 resume="$(scan_injection_block resume-pointer "$resume" | limit_bytes "$MAX_RESUME")"
-wiki="$(scan_injection_block family-wiki-cache "$wiki" | limit_bytes "$MAX_WIKI")"
+if ! is_disabled "$WIKI_ENABLED"; then
+  wiki="$(scan_injection_block family-wiki-cache "$wiki" | limit_bytes "$MAX_WIKI")"
+fi
 honcho="$(scan_injection_block honcho-cache "$honcho" | limit_bytes "$MAX_HONCHO")"
 
 # Relevance-aware budget. The per-block caps sum to more than CCC_MEMORY_MAX_BYTES,
@@ -243,6 +273,8 @@ if [ "$PROFILE" = "hybrid" ] || [ "$PROFILE" = "max-perf" ] || ! is_disabled "$L
   fi
 fi
 
+local_hot="$(filter_disabled_wiki_hits "$local_hot")"
+
 # Dedup the local hot block against what we ACTUALLY inject above (post-redaction,
 # post-truncation) before rendering it — so it surfaces index-only content
 # (distilled facts) instead of echoing the canonical blocks.
@@ -256,7 +288,10 @@ local_hot="$(scan_injection_block local-hot-memory "$local_hot" | limit_bytes "$
 
 node_label="${CCC_NODE:-$(cat "$STATE_DIR/node.txt" 2>/dev/null || hostname -s 2>/dev/null || printf 'ccc-node')}"
 stamp="$(cat "$CACHE/.last-refresh" 2>/dev/null)"
-wiki_note="$(stale_note 'Family Wiki' "$CACHE/wiki.txt")"
+wiki_note="Family Wiki disabled"
+if ! is_disabled "$WIKI_ENABLED"; then
+  wiki_note="$(stale_note 'Family Wiki' "$CACHE/wiki.txt")"
+fi
 honcho_note="Honcho disabled"
 if ! is_disabled "$HONCHO_ENABLED" && [ "$PROFILE" != "max-perf" ]; then
   honcho_note="$(stale_note 'Honcho' "$CACHE/honcho.txt")"
@@ -269,9 +304,19 @@ ${resume}
 "
 fi
 
+operational_note="Operational facts are mutable — live-check the node before asserting or changing anything."
+wiki_block=""
+if ! is_disabled "$WIKI_ENABLED"; then
+  operational_note="Operational facts are mutable — live-check the node and verify Wiki source text before asserting or changing anything."
+  wiki_block="
+## Family Wiki (cache prefetch — candidates; verify with wiki-agent load before operational claims)
+${wiki:-(no wiki cache yet — will populate after first background refresh)}
+"
+fi
+
 ctx="# ${node_label} session memory (auto-injected: $EVENT)
 
-${resume_block}Operational facts are mutable — live-check the node and verify Wiki source text before asserting or changing anything.
+${resume_block}${operational_note}
 Memory profile: ${PROFILE}; last refresh: ${stamp:-never}; ${wiki_note}; ${honcho_note}. A background refresh runs each session for the next one.
 
 ## Built-in MEMORY + USER
@@ -279,11 +324,8 @@ ${mem:-(memory files unavailable)}
 
 ## Local hot memory (task-conditioned cache search)
 ${local_hot:-(local hot memory disabled or no hits)}
-
-## Family Wiki (cache prefetch — candidates; verify with wiki-agent load before operational claims)
-${wiki:-(no wiki cache yet — will populate after first background refresh)}
-
-## Honcho working memory — Seo Jin On
+${wiki_block}
+## Honcho working memory — ${USER_LABEL}
 ${honcho:-(Honcho disabled or no Honcho cache yet)}"
 
 ctx="$(printf '%s' "$ctx" | limit_bytes "$MAX_TOTAL")"

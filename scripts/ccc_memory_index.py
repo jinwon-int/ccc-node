@@ -105,6 +105,9 @@ mem = Path(memory_dir)
 cache = Path(cache_dir)
 facts_file = Path(facts_file_arg)
 index_distill_enabled = index_distill.lower() in {"1", "true", "yes", "on"}
+wiki_enabled = os.environ.get("CCC_WIKI_MEMORY_ENABLED", "1").lower() not in {
+    "0", "false", "off", "no"
+}
 disable_fts5 = os.environ.get("CCC_MEMORY_DISABLE_FTS5", "").lower() in {"1", "true", "yes", "on"}
 fts5_enabled = False
 
@@ -154,6 +157,8 @@ def read_json_text(path: Path) -> str:
         obj = json.loads(read_text(path))
     except Exception:
         return redact_text(read_text(path))
+    if not wiki_enabled and isinstance(obj, dict):
+        obj.pop("wiki_candidates", None)
     parts = []
 
     def walk(x):
@@ -177,16 +182,18 @@ def docs():
     candidates = []
     for name in ("MEMORY.md", "USER.md"):
         candidates.append(("memory", mem / name))
-    for name in ("wiki.txt", "honcho.txt"):
-        candidates.append(("cache", cache / name))
+    if wiki_enabled:
+        candidates.append(("cache", cache / "wiki.txt"))
+    candidates.append(("cache", cache / "honcho.txt"))
 
     for row in structured_fact_docs(facts_file):
         candidates.append(row)
 
     # Distill artifacts can include raw transcript fragments. Keep them opt-in.
     if index_distill_enabled:
-        for name in ("distill-last.json", "wiki-candidates.md"):
-            candidates.append(("state", state / name))
+        candidates.append(("state", state / "distill-last.json"))
+        if wiki_enabled:
+            candidates.append(("state", state / "wiki-candidates.md"))
         hist = state / "distill-history"
         if hist.is_dir():
             for p in sorted(hist.glob("*.json"))[-200:]:
@@ -395,4 +402,4 @@ finally:
     con.close()
     secure_db_files(db)
 
-print(json.dumps({"ok": True, "db": str(db), "documents": count, "distill_indexed": index_distill_enabled, "fts5_enabled": fts5_enabled}, ensure_ascii=False))
+print(json.dumps({"ok": True, "db": str(db), "documents": count, "distill_indexed": index_distill_enabled, "fts5_enabled": fts5_enabled, "wiki_enabled": wiki_enabled}, ensure_ascii=False))

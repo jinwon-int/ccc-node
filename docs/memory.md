@@ -10,6 +10,12 @@ ccc-node memory starts from a no-network SessionStart snapshot and refreshes cac
 - Cached Honcho working memory.
 - Distilled local facts from the Session Distiller pipeline.
 
+## Source isolation
+
+- `CCC_WIKI_MEMORY_ENABLED=0` disables the Family Wiki read and write path: no cache injection, refresh, local indexing, distill candidate generation, or Wiki queue writes. Existing cache files are ignored and removed from the local index on its next update/rebuild.
+- `CCC_MEMORY_USER_LABEL` and `CCC_MEMORY_ASSISTANT_LABEL` set the node-local relationship labels used by memory injection and distill. Defaults preserve the existing Seoyoon fleet behavior.
+- `CCC_HONCHO_MEMORY_ENABLED=0` disables the Honcho read path. A node may therefore run built-in/local memory only, Honcho without Wiki, or the default combined profile.
+
 ## Operating rules
 
 - Startup injection is fail-open and no-network.
