@@ -688,7 +688,7 @@ def _gate_secret_exfil(c, statements, managed):
 
 
 _RM_RE = re.compile(
-    r"\brm\b(\s+--?[A-Za-z-]+)*\s+(/|~|\$HOME|\$\{HOME\}|/root|/etc|/var|/usr|/bin|/lib)([\s/*]|$)")
+    r"\brm\b(\s+-[A-Za-z-]*)*\s+(/|~|\$HOME|\$\{HOME\}|/root|/etc|/var|/usr|/bin|/lib)([\s/*]|$)")
 
 
 def _gate_rm(c, statements, managed):
@@ -946,7 +946,7 @@ def _is_readonly_text_search(cn):
 
 def _is_readonly_config_command(cn):
     return re.fullmatch(
-        r"\s*(cat|grep|stat|test|wc|sha256sum)(\s+--?[A-Za-z0-9_-]+)*\s+"
+        r"\s*(cat|grep|stat|test|wc|sha256sum)(\s+-[A-Za-z0-9_-]*)*\s+"
         r"[^;&|<>$`()]*(self-update\.(services|repo)|managed-(nodes|services)\.allow)"
         r"([\s]+[^;&|<>$`()]+)*\s*",
         cn,
