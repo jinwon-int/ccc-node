@@ -21,6 +21,15 @@ SH
 chmod +x "$tools/ccc-memory-query.sh"
 cat > "$tools/ccc-memory-search.sh" <<'SH'
 #!/usr/bin/env bash
+if [ -n "${CCC_USAGE_MARKER:-}" ] && [ "${CCC_MEMORY_RECORD_USAGE:-0}" = 1 ]; then
+  printf 'recorded\n' > "$CCC_USAGE_MARKER"
+fi
+if [ "${CCC_FAKE_STALL:-0}" = 1 ]; then
+  sleep 2 &
+  stall_pid=$!
+  [ -n "${CCC_STALL_PID_FILE:-}" ] && printf '%s\n' "$stall_pid" > "$CCC_STALL_PID_FILE"
+  wait "$stall_pid"
+fi
 if [ "${CCC_FAKE_MALFORMED:-0}" = 1 ]; then
   printf 'MALFORMED_STALE_WIKI_PAYLOAD'
   exit 0
@@ -41,6 +50,27 @@ ok "wiki-disabled load-memory keeps non-Wiki sources and custom identity" '[ "$r
 ok "wiki-disabled load-memory drops direct and stale-index Wiki content" '! grep -q "Cached wiki fact\|Stale wiki index hit\|## Family Wiki\|verify Wiki source" <<<"$out"'
 out="$(HOME="$TMP/home" CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CCC_HOOK_DIR="$ROOT/claude/hooks" CCC_MEMORY_TOOLS_DIR="$tools" CCC_WIKI_MEMORY_ENABLED=0 CCC_HONCHO_MEMORY_ENABLED=0 CCC_FAKE_MALFORMED=1 CCC_MEMORY_NO_REFRESH=1 bash "$ROOT/claude/hooks/load-memory.sh" SessionStart 2>&1)"; rc=$?
 ok "wiki-disabled malformed local search fails closed without raw payload" '[ "$rc" = 0 ] && ! grep -q "MALFORMED_STALE_WIKI_PAYLOAD" <<<"$out"'
+
+start_ns="$(python3 -c 'import time; print(time.monotonic_ns())')"
+stall_pid_file="$TMP/stalled-search-child.pid"
+out="$(HOME="$TMP/home" CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CCC_HOOK_DIR="$ROOT/claude/hooks" CCC_MEMORY_TOOLS_DIR="$tools" CCC_HONCHO_MEMORY_ENABLED=0 CCC_FAKE_STALL=1 CCC_STALL_PID_FILE="$stall_pid_file" CCC_MEMORY_SEARCH_TIMEOUT_SEC=0.1 CCC_MEMORY_NO_REFRESH=1 bash "$ROOT/claude/hooks/load-memory.sh" SessionStart 2>&1)"; rc=$?
+end_ns="$(python3 -c 'import time; print(time.monotonic_ns())')"
+elapsed_ms=$(( (end_ns - start_ns) / 1000000 ))
+stall_pid="$(cat "$stall_pid_file" 2>/dev/null || true)"
+ok "stalled local search is bounded while canonical memory still injects" '[ "$rc" = 0 ] && [ "$elapsed_ms" -lt 1500 ] && grep -q "Node memory: safe fact" <<<"$out" && jq -e ".hookSpecificOutput.additionalContext" >/dev/null <<<"$out"'
+ok "stalled local search process group is terminated and reaped" '[ -n "$stall_pid" ] && ! kill -0 "$stall_pid" 2>/dev/null'
+
+usage_marker="$TMP/sessionstart-usage-recorded"
+rm -f "$usage_marker"
+out="$(HOME="$TMP/home" CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CCC_HOOK_DIR="$ROOT/claude/hooks" CCC_MEMORY_TOOLS_DIR="$tools" CCC_HONCHO_MEMORY_ENABLED=0 CCC_USAGE_MARKER="$usage_marker" CCC_MEMORY_NO_REFRESH=1 bash "$ROOT/claude/hooks/load-memory.sh" SessionStart 2>&1)"; rc=$?
+ok "SessionStart local search is read-only and does not record usage feedback" '[ "$rc" = 0 ] && [ ! -e "$usage_marker" ]'
+
+legacy_home="$TMP/legacy home"
+mkdir -p "$legacy_home/.hermes/memories"
+printf 'Legacy path-with-spaces memory fact\n' > "$legacy_home/.hermes/memories/MEMORY.md"
+printf 'Legacy path-with-spaces user fact\n' > "$legacy_home/.hermes/memories/USER.md"
+out="$(HOME="$legacy_home" CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$TMP/missing-memory-dir" CCC_HOOK_DIR="$ROOT/claude/hooks" CCC_MEMORY_TOOLS_DIR="$tools" CCC_LOCAL_MEMORY_ENABLED=0 CCC_WIKI_MEMORY_ENABLED=0 CCC_HONCHO_MEMORY_ENABLED=0 CCC_MEMORY_NO_REFRESH=1 bash "$ROOT/claude/hooks/load-memory.sh" SessionStart 2>&1)"; rc=$?
+ok "legacy Hermes fallback quotes HOME paths containing spaces" '[ "$rc" = 0 ] && grep -q "Legacy path-with-spaces memory fact" <<<"$out" && grep -q "Legacy path-with-spaces user fact" <<<"$out"'
 
 fakebin="$TMP/bin"; mkdir -p "$fakebin"
 cat > "$fakebin/timeout" <<'SH'

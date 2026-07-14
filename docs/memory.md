@@ -20,6 +20,7 @@ ccc-node memory starts from a no-network SessionStart snapshot and refreshes cac
 ## Operating rules
 
 - Startup injection is fail-open and no-network.
+- SessionStart local-hot retrieval is read-only and has an inner deadline controlled by `CCC_MEMORY_SEARCH_TIMEOUT_SEC` (default 3 seconds, capped at 10 below the outer 15-second hook limit). A timeout drops only local-hot results; bounded MEMORY/USER/cache/resume blocks still inject.
 - Background refresh uses single-flight locking and should not block the interactive session.
 - Diagnostics should report counts, statuses, paths, and cache ages only; do not print memory snippets or secrets in fleet reports.
 - On Termux, use `${TMPDIR:-$HOME/tmp}` for scratch and keep state under the user's writable home/state directory.
