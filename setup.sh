@@ -236,7 +236,7 @@ merge_settings_json() {
     return 0
   fi
   local tmp; tmp="$(mktemp "${dest}.XXXXXX")" || { echo "ERROR: mktemp failed for $dest" >&2; return 1; }
-  if jq -s '.[0] as $b | .[1] as $o | $b | .hooks = ($b.hooks + $o.hooks)' "$base" "$overlay" > "$tmp" 2>/dev/null \
+  if jq -s -f "$SRC/scripts/merge-settings.jq" "$base" "$overlay" > "$tmp" 2>/dev/null \
      && jq -e . "$tmp" >/dev/null 2>&1; then
     mv "$tmp" "$dest"
   else
