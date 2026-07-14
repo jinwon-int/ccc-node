@@ -3,6 +3,7 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 DRAIN="$HERE/queue-drain.sh"
+PUSH="$HERE/honcho-push.sh"
 pass=0; fail=0
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
@@ -17,6 +18,11 @@ printf '%s\n' "$*" >> "${CURL_STUB_LOG:?}"
 if [[ "$*" == *"--data-binary @-"* ]]; then
   mkdir -p "${CURL_STUB_BODY_DIR:?}"
   cat > "$CURL_STUB_BODY_DIR/message.json"
+fi
+if [[ "$*" == *"/messages"* ]] && [ -n "${CURL_STUB_BLOCK_DIR:-}" ]; then
+  mkdir -p "$CURL_STUB_BLOCK_DIR"
+  : > "$CURL_STUB_BLOCK_DIR/started"
+  while [ ! -f "$CURL_STUB_BLOCK_DIR/release" ]; do sleep 0.01; done
 fi
 case "$*" in
   */health*) printf '%s' "${CURL_STUB_HEALTH_HTTP:-204}" ;;
@@ -40,6 +46,7 @@ printf 'nosuk\n' > "$TMP/state/node.txt"
 
 PAYLOAD='{"session_id":"sess-queued","trigger":"manual","distilled_at":"2026-01-01T00:00:00Z","honcho":[{"kind":"context","text":"queued fact","subject":"session"}],"wiki_candidates":[]}'
 QUEUE="$TMP/state/honcho-queue.jsonl"
+WORK="$TMP/state/.honcho-queue.inflight"
 DEAD="$TMP/state/honcho-queue.jsonl.dead"
 LOG="$TMP/state/distill.log"
 
@@ -76,6 +83,48 @@ ok "max-attempt payload exits 0" '[ "$rc" = 0 ]'
 ok "max-attempt payload moves to dead letter" '[ ! -s "$QUEUE" ] && [ "$(wc -l < "$DEAD")" = 1 ] && jq -e "._attempts == 3" "$DEAD" >/dev/null'
 ok "max-attempt payload does not call messages" '! grep -q "/messages" "$CURL_STUB_LOG"'
 ok "max-attempt payload logs dropped=1" 'grep -q "\[drain\] drained ok=0 failed=0 dropped=1 processed=1" "$LOG"'
+
+PAYLOAD_CONCURRENT='{"session_id":"sess-concurrent","trigger":"sessionend","distilled_at":"2026-01-01T00:01:00Z","honcho":[{"kind":"context","text":"concurrent fact","subject":"session"}],"wiki_candidates":[]}'
+printf '%s\n' "$PAYLOAD" > "$QUEUE"
+BLOCK_DIR="$TMP/drain-block"
+rm -rf "$BLOCK_DIR"
+CURL_STUB_HEALTH_HTTP=204 CURL_STUB_MESSAGE_HTTP=201 \
+  CURL_STUB_BLOCK_DIR="$BLOCK_DIR" bash "$DRAIN" &
+drain_pid=$!
+for _ in $(seq 1 200); do
+  [ -f "$BLOCK_DIR/started" ] && break
+  sleep 0.01
+done
+ok "concurrency fixture pauses active drain" '[ -f "$BLOCK_DIR/started" ]'
+printf '%s' "$PAYLOAD_CONCURRENT" \
+  | CURL_STUB_HEALTH_HTTP=503 bash "$PUSH" > "$TMP/concurrent-push.out" 2>&1 &
+push_pid=$!
+push_completed=0
+for _ in $(seq 1 200); do
+  if ! kill -0 "$push_pid" 2>/dev/null; then
+    push_completed=1
+    break
+  fi
+  sleep 0.01
+done
+ok "producer append completes while drain network call is blocked" '[ "$push_completed" = 1 ]'
+: > "$BLOCK_DIR/release"
+wait "$push_pid"; push_rc=$?
+ok "concurrent failed push exits non-zero after queueing" '[ "$push_rc" = 1 ]'
+wait "$drain_pid"; drain_rc=$?
+ok "active drain exits 0 after release" '[ "$drain_rc" = 0 ]'
+ok "append during active drain survives" '[ "$(wc -l < "$QUEUE")" = 1 ] && jq -e ".session_id == \"sess-concurrent\"" "$QUEUE" >/dev/null'
+
+rm -f "$TMP/bodies/message.json"
+CURL_STUB_HEALTH_HTTP=204 CURL_STUB_MESSAGE_HTTP=201 bash "$DRAIN"; rc=$?
+ok "surviving concurrent append replays next round" '[ "$rc" = 0 ] && [ ! -s "$QUEUE" ] && jq -e ".messages[0].metadata.claude_session == \"sess-concurrent\" and .messages[0].metadata.replay == true" "$TMP/bodies/message.json" >/dev/null'
+
+PAYLOAD_STALE='{"session_id":"sess-stale-inflight","trigger":"sessionend","distilled_at":"2026-01-01T00:02:00Z","honcho":[{"kind":"context","text":"stale inflight fact","subject":"session"}],"wiki_candidates":[]}'
+: > "$QUEUE"
+printf '%s\n' "$PAYLOAD_STALE" > "$WORK"
+rm -f "$TMP/bodies/message.json"
+CURL_STUB_HEALTH_HTTP=204 CURL_STUB_MESSAGE_HTTP=201 bash "$DRAIN"; rc=$?
+ok "stale private worklist is recovered after a prior drain crash" '[ "$rc" = 0 ] && [ ! -e "$WORK" ] && jq -e ".messages[0].metadata.claude_session == \"sess-stale-inflight\" and .messages[0].metadata.replay == true" "$TMP/bodies/message.json" >/dev/null'
 
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
