@@ -1,4 +1,4 @@
-#!/data/data/com.termux/files/usr/bin/bash
+#!/usr/bin/env bash
 # crond-driven watchdog: restart ccc-node Telegram bridge if down.
 # Same pattern as a2a-worker-watchdog.sh (ND-172 lesson).
 #
@@ -20,14 +20,19 @@
 # "down" reading racing a fresh restart -- it never masks a real outage,
 # since the next tick (GRACE_SECONDS later) will still see it if the new
 # instance also failed to come up.
-set -u
-LOG="$HOME/.hermes/logs/bridge-watchdog.log"
+set -uo pipefail
+# Paths and tunables are overridable for testing / non-standard installs; the
+# defaults reproduce the production layout exactly (behavior-neutral).
+LOG="${BRIDGE_WATCHDOG_LOG:-$HOME/.hermes/logs/bridge-watchdog.log}"
 mkdir -p "$(dirname "$LOG")"
 ts() { date '+%Y-%m-%d %H:%M:%S%z'; }
 
-PID_FILE="$HOME/.telegram_bot/bot.pid"
-START="$HOME/ccc-node/bridge/start.sh"
-GRACE_SECONDS=90
+PID_FILE="${BRIDGE_WATCHDOG_PID_FILE:-$HOME/.telegram_bot/bot.pid}"
+START="${BRIDGE_WATCHDOG_START:-$HOME/ccc-node/bridge/start.sh}"
+GRACE_SECONDS="${BRIDGE_WATCHDOG_GRACE_SECONDS:-90}"
+# Process-match fallback pattern (overridable so tests do not match a real
+# bridge running on the same host).
+PROCESS_MATCH="${BRIDGE_WATCHDOG_PROCESS_MATCH:-python -m telegram_bot}"
 
 # Alive check: bot.pid points at a live python -m telegram_bot process
 if [ -f "$PID_FILE" ]; then
@@ -37,7 +42,7 @@ if [ -f "$PID_FILE" ]; then
   fi
 fi
 # Fallback: process match (covers stale/missing pid file)
-if pgrep -f "python -m telegram_bot" >/dev/null 2>&1; then
+if pgrep -f "$PROCESS_MATCH" >/dev/null 2>&1; then
   exit 0
 fi
 
