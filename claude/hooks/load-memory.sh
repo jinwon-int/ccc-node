@@ -122,11 +122,17 @@ except Exception:
 results = doc.get("results") if isinstance(doc, dict) else None
 if not isinstance(results, list):
     sys.stdout.write('{"results":[]}'); raise SystemExit(0)
-doc["results"] = [
-    row for row in results
-    if isinstance(row, dict)
-    and pathlib.PurePath(str(row.get("path") or "")).name != "wiki.txt"
-]
+def visible(row):
+    if not isinstance(row, dict):
+        return False
+    p = pathlib.PurePath(str(row.get("path") or ""))
+    source = str(row.get("source") or "").lower()
+    return not (
+        p.name in {"wiki.txt", "wiki-candidates.md", "distill-last.json"}
+        or "distill-history" in p.parts
+        or source.startswith("distill")
+    )
+doc["results"] = [row for row in results if visible(row)]
 sys.stdout.write(json.dumps(doc, ensure_ascii=False))
 PY
 }

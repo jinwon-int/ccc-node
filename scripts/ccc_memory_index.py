@@ -158,6 +158,8 @@ def read_json_text(path: Path) -> str:
     try:
         obj = json.loads(read_text(path))
     except Exception:
+        if not wiki_enabled:
+            return ""
         return redact_text(read_text(path))
     if not wiki_enabled and isinstance(obj, dict):
         obj.pop("wiki_candidates", None)
