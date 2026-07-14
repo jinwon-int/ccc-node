@@ -433,6 +433,30 @@ else
 fi
 rm -rf "$tmp_home" 2>/dev/null || true
 
+# ---- ReDoS regression (CodeQL): guard runs before EVERY Bash call and its input
+# length is attacker-influenceable, so the rm-root / readonly-config / readonly-text
+# checks must be bounded-time. Their flag/token groups no longer overlap an adjacent
+# `\s+` (the classic exponential-backtracking shape); feed 60-flag pathological inputs
+# and assert both bounded time and the correct verdict. ----
+redos_check() { # <label> <command-value> <expected allow|deny>
+  local label="$1" val="$2" expect="$3" rc=0 payload got
+  payload="$(jq -nc --arg v "$val" '{tool_name:"Bash", tool_input:{command:$v}}')"
+  timeout 5 bash "$GUARD" <<<"$payload" >/dev/null 2>&1 || rc=$?
+  if [ "$rc" = "124" ]; then
+    fail=$((fail+1)); printf 'FAIL [ReDoS timeout >5s] %s\n' "$label"; return
+  fi
+  got=allow; [ "$rc" = "2" ] && got=deny
+  if [ "$got" = "$expect" ]; then pass=$((pass+1));
+  else fail=$((fail+1)); printf 'FAIL [want %s got %s] %s\n' "$expect" "$got" "$label"; fi
+}
+redos_rmflags="$(printf -- '-a %.0s' $(seq 1 60))"
+redos_cfgflags="$(printf -- '--a %.0s' $(seq 1 60))"
+redos_check 'rm 60-flags then non-root (backtrack bait)' "rm ${redos_rmflags}notaroot"                                allow
+redos_check 'rm 60-flags then /etc root'                 "rm ${redos_rmflags}/etc"                                    deny
+redos_check 'wc 60-flags reading operator config'        "wc ${redos_cfgflags}/root/.claude/self-update.services"     allow
+redos_check 'echo 60-flags redirect-writing config'      "echo ${redos_cfgflags}> /root/.claude/self-update.services" deny
+redos_check 'grep 60-flags text search w/ reboot word'   "grep ${redos_cfgflags}reboot /var/log/syslog"               allow
+
 echo "----"
 echo "PASS=$pass FAIL=$fail"
 [ "$fail" = "0" ]

@@ -941,14 +941,16 @@ def _pm2_fleet(toks, i):
 
 
 def _is_readonly_text_search(cn):
-    return re.fullmatch(r"\s*(grep|rg)(\s+[^;&|<>$`()]+)+\s*", cn) is not None
+    # `\S` in the token class (not the broad `[^…]` that also matched whitespace)
+    # keeps `\s+` and the class disjoint — no overlap for CodeQL/ReDoS to exploit.
+    return re.fullmatch(r"\s*(grep|rg)(\s+[^;&|<>$`()\s]+)+\s*", cn) is not None
 
 
 def _is_readonly_config_command(cn):
     return re.fullmatch(
         r"\s*(cat|grep|stat|test|wc|sha256sum)(\s+-[A-Za-z0-9_-]*)*\s+"
         r"[^;&|<>$`()]*(self-update\.(services|repo)|managed-(nodes|services)\.allow)"
-        r"([\s]+[^;&|<>$`()]+)*\s*",
+        r"([\s]+[^;&|<>$`()\s]+)*\s*",
         cn,
     ) is not None
 
