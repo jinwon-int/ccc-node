@@ -202,6 +202,11 @@ class ProjectChatHandler(
         # and could swap answers between chats.
         self._streams: Dict[Tuple[int, int], _UserStreamState] = {}
         self._stream_init_locks: Dict[Tuple[int, int], asyncio.Lock] = {}
+        # Background stream-teardown tasks spawned from outside the loop task
+        # (e.g. terminal-stall recovery, where the teardown cancels the very
+        # task running the handler). Held here so the GC cannot reap an
+        # in-flight task, and drained/logged via a done-callback.
+        self._teardown_tasks: set["asyncio.Task[Any]"] = set()
         self._conversation_locks: Dict[Tuple[int, int], asyncio.Lock] = {}
         logger.info(f"ProjectChatHandler initialized for {self.project_root}")
 
@@ -455,6 +460,31 @@ class ProjectChatHandler(
             logger.error(f"Error disconnecting client for user {user_id} chat {chat_id}: {e}")
 
         return True
+
+    def _spawn_teardown_task(self, coro: Any, *, label: str) -> "asyncio.Task[Any]":
+        """Spawn a stream-teardown coroutine from outside the loop task.
+
+        Retains a strong reference in ``self._teardown_tasks`` so the GC cannot
+        reap the task mid-flight, and surfaces exceptions via a done-callback
+        (a raw ``create_task`` would drop them silently). Mirrors the tracking
+        pattern used in ``core/codex_app_server.py`` and ``core/bot_voice.py``.
+        """
+        task = asyncio.create_task(coro)
+        self._teardown_tasks.add(task)
+
+        def _on_done(t: "asyncio.Task[Any]") -> None:
+            self._teardown_tasks.discard(t)
+            try:
+                t.result()
+            except asyncio.CancelledError:
+                logger.debug("Teardown task cancelled (%s)", label)
+            except Exception as exc:  # noqa: BLE001 — surface, do not swallow
+                logger.error(
+                    "Teardown task failed (%s): %s", label, exc, exc_info=True
+                )
+
+        task.add_done_callback(_on_done)
+        return task
 
     async def _disconnect_user_stream(
         self, user_id: int, chat_id: Optional[int] = None, cancel_message: Optional[str] = None
@@ -803,8 +833,11 @@ class ProjectChatHandler(
             )
         # Tear down the dead stream from outside this loop task: the disconnect
         # cancels state.typing_task, which is the very task running this code.
-        asyncio.get_event_loop().create_task(
-            self._disconnect_user_stream(user_id, req.chat_id)
+        # Tracked + exception-logged so a teardown failure cannot leak the dead
+        # SDK stream silently (see _spawn_teardown_task).
+        self._spawn_teardown_task(
+            self._disconnect_user_stream(user_id, req.chat_id),
+            label=f"stall-teardown user={user_id} chat={req.chat_id}",
         )
 
     async def _typing_keepalive_loop(self, user_id: int, state: _UserStreamState) -> None:
