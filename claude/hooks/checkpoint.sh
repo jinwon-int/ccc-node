@@ -17,6 +17,15 @@ LOG="$STATE_DIR/checkpoint.log"
 ts="$(date +%Y%m%d_%H%M%S)"
 mkdir -p "$CKPT_DIR"
 
+# Portable mtime prune/select helpers (busybox-safe; see #449).
+CKPT_SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)" || CKPT_SELF_DIR="${HOME:-/root}/.claude/hooks"
+# shellcheck source=claude/hooks/lib/mtime-prune.sh
+if [ -r "$CKPT_SELF_DIR/lib/mtime-prune.sh" ]; then
+  . "$CKPT_SELF_DIR/lib/mtime-prune.sh"
+elif [ -r "${HOME:-/root}/.claude/hooks/lib/mtime-prune.sh" ]; then
+  . "${HOME:-/root}/.claude/hooks/lib/mtime-prune.sh"
+fi
+
 if [ "$EVENT" = "PreCompact" ]; then
   if [ -s "$STATE_FILE" ]; then
     cp "$STATE_FILE" "$CKPT_DIR/working-state-$ts.md"
@@ -26,15 +35,15 @@ if [ "$EVENT" = "PreCompact" ]; then
     echo "[$ts] PreCompact: no working-state.md to snapshot" >> "$LOG"
     msg="working-state.md empty; snapshot skipped (keep it updated for long tasks)."
   fi
-  # retain the 30 most recent checkpoints
-  ls -1t "$CKPT_DIR"/working-state-*.md 2>/dev/null | tail -n +31 | xargs -r rm -f
+  # retain the 30 most recent checkpoints (portable, whitespace-safe)
+  prune_keep_newest "$CKPT_DIR" 'working-state-*.md' 30
   jq -n --arg m "$msg" '{systemMessage:$m, suppressOutput:true}'
   exit 0
 fi
 
 # PostCompact (or anything else): re-inject the working state.
 state="$(cat "$STATE_FILE" 2>/dev/null)"
-latest="$(ls -1t "$CKPT_DIR"/working-state-*.md 2>/dev/null | head -1)"
+latest="$(newest_file "$CKPT_DIR" 'working-state-*.md')"
 bytes="$(printf '%s' "$state" | wc -c | tr -d ' ')"
 echo "[$ts] PostCompact: re-injected working-state (${bytes} bytes)" >> "$LOG"
 
