@@ -96,6 +96,18 @@ recorded to `~/.claude/state/approval-needed.log`; the bypass is logged to stder
   `self-update.services` — it is **write-gated for agents** (`managed-nodes-config`:
   Edit/Write tools and shell redirect/interpreter writes); reads stay allowed. See
   `docs/service-control.md` and `docs/examples/managed-nodes.allow.example`.
+- **Managed-services relaxation** (operator-owned allowlist; opt-in, fail-closed).
+  `~/.claude/managed-services.allow` (override `CCC_MANAGED_SERVICES_ALLOW`) lists the
+  **local** units/containers/processes this node self-manages. Fleet services are already
+  autonomous; this lets the node ALSO control its own **non-fleet** local apps by name —
+  `systemctl restart myapp`, `pm2 restart myapp`, `docker restart my-container` — when
+  **every** target of the `systemctl`/`service`/`pm2`/`docker`/`podman` lifecycle command
+  is listed. Fail-closed otherwise: an unlisted target (or one unlisted target mixed with a
+  listed one), targetless/global forms (`daemon-reload`), `docker compose`, a docker
+  remote-daemon flag, and command-substitution targets stay gated; `kubectl` is never
+  relaxed. This keeps `sshd`/`ufw`/`nginx` and other system services protected while
+  unblocking the node's own apps. Write-gated for agents (`managed-services-config`). See
+  `docs/examples/managed-services.allow.example`.
 - Fail-closed: if a pattern is uncertain, prefer gating. Patterns are covered by
   `guard.test.sh` (allow + deny cases, including the force-push relaxation) to avoid
   blocking normal autonomous work.

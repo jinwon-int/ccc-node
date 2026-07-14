@@ -22,6 +22,12 @@ agent account plus a root-owned wrapper and root-owned exact-unit allowlist.
 - **Reboot is autonomous on the LOCAL node and managed nodes** — `reboot` /
   `shutdown -r` is disruptive but recoverable (the node comes back). It stays
   gated for an unlisted remote host and for interpreter-mediated forms.
+- **Local non-fleet apps the node self-manages are autonomous for allowlisted
+  units** (opt-in; `~/.claude/managed-services.allow`): `systemctl`/`service`/
+  `pm2`/`docker`/`podman` lifecycle of a LOCAL unit/container is allowed when
+  every target is listed. System services you did not list (`sshd`/`ufw`/`nginx`/
+  …), mixed targets, `daemon-reload`, `docker compose`, and `kubectl` stay gated.
+  See `docs/examples/managed-services.allow.example`.
 - Everything else is fail-closed: `systemctl`/`service`/`pm2` lifecycle of
   non-fleet units on hosts that are not managed, config-changing verbs on the
   local node, `pm2 delete`, and docker/podman/kubectl lifecycle require fresh

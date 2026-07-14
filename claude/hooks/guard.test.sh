@@ -377,6 +377,48 @@ run deny Bash command 'python3 -c '\''open("/root/.claude/managed-nodes.allow","
 run allow Bash command 'cat /root/.claude/managed-nodes.allow'
 rm -rf "$ALLOW_DIR" 2>/dev/null || true
 
+# ---- managed-services allowlist: LOCAL non-fleet units the node self-manages ----
+# With no allowlist, a non-fleet local unit is gated (protects sshd/ufw/nginx).
+run deny Bash command 'systemctl restart myapp'
+run deny Bash command 'pm2 restart myapp'
+run deny Bash command 'docker restart my-container'
+
+SVC_DIR="$(mktemp -d 2>/dev/null || mktemp -d -t ccc-guard-svc)"
+printf '%s\n' '# local apps this node manages' 'myapp' 'mydashboard' 'my-container' 'web-*' > "$SVC_DIR/managed-services.allow"
+MS="CCC_MANAGED_SERVICES_ALLOW=$SVC_DIR/managed-services.allow"
+
+# listed local units via systemctl/service/pm2/docker (any lifecycle verb) → allowed
+run allow Bash command 'systemctl restart myapp' "$MS"
+run allow Bash command 'systemctl restart mydashboard.service' "$MS"
+run allow Bash command 'systemctl stop myapp' "$MS"
+run allow Bash command 'systemctl enable myapp' "$MS"
+run allow Bash command 'sudo systemctl restart myapp' "$MS"
+run allow Bash command 'service myapp restart' "$MS"
+run allow Bash command 'pm2 restart myapp' "$MS"
+run allow Bash command 'pm2 stop myapp' "$MS"
+run allow Bash command 'docker restart my-container' "$MS"
+run allow Bash command 'docker stop my-container' "$MS"
+run allow Bash command 'systemctl restart web-frontend' "$MS"
+# ...but system/unlisted units, mixed targets, targetless & compound docker stay gated
+run deny Bash command 'systemctl stop sshd' "$MS"
+run deny Bash command 'systemctl stop ufw' "$MS"
+run deny Bash command 'systemctl restart nginx' "$MS"
+run deny Bash command 'systemctl restart myapp sshd' "$MS"
+run deny Bash command 'systemctl daemon-reload' "$MS"
+run deny Bash command 'docker restart my-container otherbox' "$MS"
+run deny Bash command 'docker compose up -d' "$MS"
+run deny Bash command 'pm2 restart other' "$MS"
+run deny Bash command 'kubectl rollout restart deployment/myapp' "$MS"
+# fleet units keep working regardless of the local-services allowlist
+run allow Bash command 'systemctl restart a2a-worker' "$MS"
+# the local-services allowlist itself is operator-owned: read yes, write no
+run deny Write file_path '/root/.claude/managed-services.allow'
+run deny Edit file_path '/root/.claude/managed-services.allow'
+run allow Read file_path '/root/.claude/managed-services.allow'
+run deny Bash command 'echo evil >> /root/.claude/managed-services.allow'
+run allow Bash command 'cat /root/.claude/managed-services.allow'
+rm -rf "$SVC_DIR" 2>/dev/null || true
+
 # ---- escape hatch: gated allowed only with operator signal ----
 run allow Bash command 'git push --force origin main' 'CCC_ALLOW_GATED=1'
 

@@ -1,0 +1,31 @@
+# managed-services.allow — operator-owned allowlist of the LOCAL services THIS node
+# is allowed to control (systemctl / service / pm2 / docker / podman).
+#
+# Install as ~/.claude/managed-services.allow (or point CCC_MANAGED_SERVICES_ALLOW at
+# it). One unit/container/process name per line. `#` starts a comment; blank lines are
+# ignored. fnmatch globs are supported (`*`, `?`, `[...]`). A trailing `.service` is
+# tolerated — an entry `myapp` matches both `myapp` and `myapp.service`.
+#
+# What it does: fleet services (a2a/hermes/openclaw/broker/gateway/worker,
+# ccc-telegram-bridge) are already autonomous. This file lets the node ALSO manage its
+# OWN non-fleet local apps by name — `systemctl restart myapp`, `pm2 restart myapp`,
+# `docker restart my-container` — when every target of the command is listed here.
+#
+# What it does NOT do (stays fail-closed):
+#   - a command whose targets are not ALL listed (e.g. `systemctl restart myapp sshd`)
+#     is denied — you cannot slip an unlisted unit in alongside a listed one;
+#   - system services you did not list (sshd, ufw, nginx, postgresql, …) stay gated;
+#   - targetless/global forms (`systemctl daemon-reload`), `docker compose`, a docker
+#     remote-daemon flag (`docker -H …`), and command-substitution targets are gated;
+#   - kubectl is never relaxed here.
+#
+# TRUST: this file is the boundary that says "these local services are mine to
+# control." guard.py denies agent writes to it (Edit/Write and shell redirect/
+# interpreter writes) — only YOU edit it. Do NOT list a shared system service
+# (sshd/ufw/networking/…) whose restart could lock you out or disable security.
+
+# --- examples (delete these; add your real local apps) ---
+# myapp
+# mydashboard
+# my-container
+# web-*

@@ -63,6 +63,9 @@ Service-control boundary (enforced by `guard.py` behind the `guard.sh` shim):
 - **Reboot** (`reboot`/`shutdown -r`, recoverable) is autonomous on the LOCAL node
   and managed nodes; `poweroff`/`halt` (node stays down) and reboot of an unlisted
   host stay fresh-approval.
+- **Local self-managed apps**: list this node's own non-fleet units/containers in
+  `~/.claude/managed-services.allow` and their `systemctl`/`pm2`/`docker` lifecycle
+  is autonomous (system services like sshd/ufw/nginx stay gated). Operator-owned.
 - Still fresh-approval: non-fleet units on unmanaged hosts, local config-changing
   verbs, docker/podman/kubectl, host power-down, and — regardless of host —
   force-push to protected branches, release/publish, DB destructive/migrate.

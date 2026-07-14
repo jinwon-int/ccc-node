@@ -45,6 +45,15 @@ All notable changes to the Claude Code node harness. Dates are KST.
   a remote command chained inside quotes (`ssh node "a && b"`) intact as one managed
   statement. `guard.test.sh` grows managed-node/reboot/adversarial coverage;
   `docs/examples/managed-nodes.allow.example` documents the format. Refs #341, #452.
+- Managed-services allowlist for local self-managed apps (opt-in, fail-closed).
+  Operator-owned `~/.claude/managed-services.allow` (override `CCC_MANAGED_SERVICES_ALLOW`)
+  lists the node's own non-fleet local units/containers/processes. `systemctl`/`service`/
+  `pm2`/`docker`/`podman` lifecycle is relaxed when EVERY target of the command is listed;
+  a mixed/unlisted target, targetless `daemon-reload`, `docker compose`, a docker
+  remote-daemon flag, and command-substitution targets stay gated, and `kubectl` is never
+  relaxed — so `sshd`/`ufw`/`nginx` stay protected while the node's own apps become
+  self-manageable. Trailing `.service` is tolerated in matching. Write-gated for agents
+  (`managed-services-config`); `docs/examples/managed-services.allow.example` documents it.
 - Fail-closed external-node memory isolation (#466):
   `CCC_NODE_ISOLATION_PROFILE=external` provides a higher-priority bridge-to-hook
   placement policy and PreToolUse Family-resource guard; `CCC_WIKI_MEMORY_ENABLED=0`

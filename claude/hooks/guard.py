@@ -94,32 +94,38 @@ def _deny(label, profile, detail):
 # --------------------------------------------------------------------------- #
 # Managed-nodes allowlist (operator-owned; issue for managed-node writes).
 # --------------------------------------------------------------------------- #
-def _managed_allowlist():
-    """Return the list of allowlisted host patterns (may be empty).
+def _read_allowlist(env_var, basename):
+    """Read an operator-owned allowlist file (may be empty).
 
-    Path: $CCC_MANAGED_NODES_ALLOW or ~/.claude/managed-nodes.allow. One host or
-    glob per line; `#` comments and blank lines are ignored. The file is
-    operator-owned and agent-write-gated (see the self-update-config gate), so it
-    is the trusted boundary that says "these remote hosts are mine."
-    """
-    path = os.environ.get("CCC_MANAGED_NODES_ALLOW")
+    Path: $<env_var> or ~/.claude/<basename>. One bare token (host/unit/glob) per
+    line; `#` comments and blank lines ignored; tokens with shell/whitespace
+    metacharacters are rejected fail-closed. These files are agent-write-gated
+    (see the operator-config gate), so they are the trusted boundary."""
+    path = os.environ.get(env_var)
     if not path:
         home = os.environ.get("HOME") or "/root"
-        path = os.path.join(home, ".claude", "managed-nodes.allow")
+        path = os.path.join(home, ".claude", basename)
     entries = []
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as fh:
             for line in fh:
                 line = line.split("#", 1)[0].strip()
-                if not line:
-                    continue
-                # A managed-host entry is a single bare token (hostname/IP/glob).
-                # Reject anything with shell/whitespace metacharacters fail-closed.
-                if re.fullmatch(r"[A-Za-z0-9_.*?\[\]-]+", line):
+                if line and re.fullmatch(r"[A-Za-z0-9_.*?\[\]@:/-]+", line):
                     entries.append(line)
     except OSError:
         pass
     return entries
+
+
+def _managed_allowlist():
+    """Allowlisted REMOTE host patterns — "these remote hosts are mine.\""""
+    return _read_allowlist("CCC_MANAGED_NODES_ALLOW", "managed-nodes.allow")
+
+
+def _managed_services_allowlist():
+    """Allowlisted LOCAL service/unit/container/process names — "these local
+    services are mine to control" (systemctl/service/pm2/docker/podman)."""
+    return _read_allowlist("CCC_MANAGED_SERVICES_ALLOW", "managed-services.allow")
 
 
 def _host_allowlisted(host, entries):
@@ -127,6 +133,18 @@ def _host_allowlisted(host, entries):
     if not host:
         return False
     return any(fnmatch.fnmatch(host, e) for e in entries)
+
+
+def _service_allowlisted(unit, entries):
+    """Match a unit/container/process name, tolerating a trailing `.service` so an
+    operator entry `myapp` matches both `myapp` and `myapp.service`."""
+    unit = unit.strip()
+    if not unit:
+        return False
+    cands = [unit]
+    if unit.endswith(".service"):
+        cands.append(unit[:-len(".service")])
+    return any(fnmatch.fnmatch(c, e) for c in cands for e in entries)
 
 
 def _strip_user(token):
@@ -524,12 +542,15 @@ def evaluate(tool, cmd, fpath, tool_input_raw):
 
     # --- Operator config files: agents may READ but never WRITE. ---
     # self-update.services/.repo bound the self-update blast radius; managed-nodes.allow
-    # bounds the managed-node relaxation. Both are operator-owned.
+    # bounds the managed-node relaxation; managed-services.allow bounds the local-service
+    # relaxation. All are operator-owned.
     if tool in ("Edit", "Write", "NotebookEdit", "MultiEdit"):
         if (fpath.endswith("/self-update.services") or fpath.endswith("/self-update.repo")):
             _deny("self-update-config", "operator_approval_gated", f"{tool} on {fpath}")
         if fpath.endswith("/managed-nodes.allow"):
             _deny("managed-nodes-config", "operator_approval_gated", f"{tool} on {fpath}")
+        if fpath.endswith("/managed-services.allow"):
+            _deny("managed-services-config", "operator_approval_gated", f"{tool} on {fpath}")
 
     if tool != "Bash" or not cmd:
         return
@@ -542,6 +563,7 @@ def evaluate(tool, cmd, fpath, tool_input_raw):
         toks = cn.split()
 
     entries = _managed_allowlist()
+    svc_entries = _managed_services_allowlist()
     statements_raw = _split_statements_toplevel(c)          # quotes preserved
     statements = [_quote_strip(st) for st in statements_raw]  # pattern-match view
     # A statement is "managed-remote" when its only remote reach is to owned nodes.
@@ -549,7 +571,7 @@ def evaluate(tool, cmd, fpath, tool_input_raw):
     managed = [stmt_remote_target_managed(st, entries) for st in statements_raw]
 
     _gate_git(c, cn, toks)                    # force-push / history-rewrite
-    _service_lifecycle(cn, statements, managed)
+    _service_lifecycle(cn, statements, managed, svc_entries)
     _gate_host_lifecycle(c, cn, statements, managed)
     _gate_operator_config(c, cn)              # self-update.* / managed-nodes.allow writes
     _gate_db(c)                               # destructive / migrate / replay
@@ -628,7 +650,7 @@ def _gate_host_lifecycle(c, cn, statements, managed):
 
 
 def _gate_operator_config(c, cn):
-    if re.search(r"self-update\.(services|repo)|managed-nodes\.allow", cn) \
+    if re.search(r"self-update\.(services|repo)|managed-(nodes|services)\.allow", cn) \
             and not _is_readonly_config_command(cn):
         _deny("self-update-config", "operator_approval_gated", c)
 
@@ -677,22 +699,139 @@ def _gate_rm(c, statements, managed):
             _deny("rm-catastrophic", "operator_approval_gated", c)
 
 
-def _service_lifecycle(cn, statements, managed_stmt):
+def _service_lifecycle(cn, statements, managed_stmt, svc_entries):
+    # Precedence per statement: managed-remote (owned node) → fleet unit (#436) →
+    # managed local service (operator-listed unit/container) → else deny.
     for st, mgd in zip(statements, managed_stmt):
         if mgd:
             continue  # owned remote node — governed by its own policy
         if re.search(r"\b(systemctl|service)\b[^;&|]*\b(start|restart|reload|stop|kill|disable|enable|mask|unmask|daemon-reload|daemon-reexec)\b", st):
-            if not _is_fleet_lifecycle(st):
+            if not (_is_fleet_lifecycle(st) or _local_service_allowed(st, svc_entries)):
                 _deny("service-lifecycle", "operator_approval_gated", cn)
         if re.search(r"\bpm2\b[^;&|]*\b(start|restart|reload|stop|delete|kill)\b", st):
-            if not _is_fleet_lifecycle(st):
+            if not (_is_fleet_lifecycle(st) or _local_service_allowed(st, svc_entries)):
                 _deny("service-lifecycle", "operator_approval_gated", cn)
         if re.search(r"\b(docker|podman)\b[^;&|]*\b(run|up|start|restart|stop|kill|rm|pause|unpause|down)\b", st):
-            _deny("service-lifecycle", "operator_approval_gated", cn)
+            if not _local_service_allowed(st, svc_entries):
+                _deny("service-lifecycle", "operator_approval_gated", cn)
         if re.search(r"\bkubectl\b[^;&|]*\b(rollout\s+restart|scale|delete|drain|cordon|uncordon)\b", st):
             _deny("service-lifecycle", "operator_approval_gated", cn)
         if re.search(r"(^|[\s;|&])(restart-worker|stop-broker)([\s;|&]|$)", st):
             _deny("service-lifecycle", "operator_approval_gated", cn)
+
+
+def _local_service_allowed(st, svc_entries):
+    """True iff every unit/container/process a systemctl/service/pm2/docker/podman
+    lifecycle command in the statement targets is in the operator-owned
+    managed-services allowlist (and ≥1 target). Any un-parseable target → False
+    (fail closed), so an unlisted or ambiguous target keeps the gate."""
+    if not svc_entries:
+        return False
+    units, ok = _lifecycle_units(st)
+    if not ok or not units:
+        return False
+    return all(_service_allowlisted(u, svc_entries) for u in units)
+
+
+_DOCKER_LIFECYCLE_VERBS = {
+    "run", "up", "start", "restart", "stop", "kill", "rm", "pause", "unpause", "down",
+}
+
+
+def _lifecycle_units(st):
+    """Collect the target names of every systemctl/service/pm2/docker/podman
+    lifecycle command in the statement. Returns (units, ok); ok=False if any such
+    command's targets cannot be cleanly parsed (targetless `daemon-reload`, a
+    docker global flag / `compose` / `$()` — all uncertain → caller fails closed)."""
+    try:
+        toks = shlex.split(st)
+    except ValueError:
+        return [], False
+    units = []
+    i = 0
+    n = len(toks)
+    while i < n:
+        b = _basename(toks[i])
+        if b in ("systemctl", "service", "pm2", "docker", "podman"):
+            got, i, ok = _extract_unit_targets(b, toks, i, units)
+            if not ok:
+                return units, False
+            if not got:
+                # a lifecycle keyword with no clean target (e.g. daemon-reload) —
+                # only uncertain if it WAS a gated verb; otherwise (status/ps) skip.
+                pass
+            continue
+        i += 1
+    return units, True
+
+
+def _extract_unit_targets(tool, toks, i, units):
+    """Parse one systemctl/service/pm2/docker/podman command starting at toks[i].
+    Appends target names to `units`. Returns (found_target, next_i, ok); ok=False
+    marks an un-parseable lifecycle target so the caller fails closed."""
+    if tool == "service":
+        if i + 1 < len(toks) and not toks[i + 1].startswith("-"):
+            units.append(toks[i + 1])
+            return True, i + 2, True
+        return False, i + 1, False
+    if tool in ("docker", "podman"):
+        return _docker_targets(toks, i, units)
+    return _systemctl_pm2_targets(tool, toks, i, units)
+
+
+def _docker_targets(toks, i, units):
+    n = len(toks)
+    nxt = toks[i + 1] if i + 1 < n else None
+    if nxt is None or nxt.startswith("-") or nxt == "compose":
+        return False, i + 1, False  # global flag (incl -H remote) / compose → uncertain
+    if nxt not in _DOCKER_LIFECYCLE_VERBS:
+        return False, i + 2, True   # non-lifecycle subcommand (ps/images/…) — ignore
+    j = i + 2
+    got = False
+    while j < n:
+        t = toks[j]
+        if t in ("|", ";", "&"):
+            break
+        if t.startswith("-") or "$(" in t or "`" in t:
+            return got, j, False    # a flag/substitution on docker lifecycle → uncertain
+        units.append(t)
+        got = True
+        j += 1
+    return got, j, got
+
+
+def _systemctl_pm2_targets(tool, toks, i, units):
+    n = len(toks)
+    j = i + 1
+    while j < n:
+        t = toks[j]
+        if tool == "systemctl" and t in ("-H", "--host", "-M", "--machine"):
+            j += 2
+            continue
+        if t.startswith("-"):
+            j += 1
+            continue
+        break
+    if j >= n:
+        return False, j, False
+    j += 1  # skip the verb
+    got = False
+    while j < n:
+        t = toks[j]
+        if t in ("|", ";", "&"):
+            break
+        if t in ("-s", "--signal", "--kill-who", "--kill-whom"):
+            j += 2
+            continue
+        if t.startswith("#") or re.match(r"^[0-9]*(>>?|<)", t):
+            break
+        if t.startswith("-"):
+            j += 1
+            continue
+        units.append(t)
+        got = True
+        j += 1
+    return got, j, got
 
 
 def _is_fleet_lifecycle(stmt):
@@ -808,7 +947,7 @@ def _is_readonly_text_search(cn):
 def _is_readonly_config_command(cn):
     return re.fullmatch(
         r"\s*(cat|grep|stat|test|wc|sha256sum)(\s+--?[A-Za-z0-9_-]+)*\s+"
-        r"[^;&|<>$`()]*(self-update\.(services|repo)|managed-nodes\.allow)"
+        r"[^;&|<>$`()]*(self-update\.(services|repo)|managed-(nodes|services)\.allow)"
         r"([\s]+[^;&|<>$`()]+)*\s*",
         cn,
     ) is not None
