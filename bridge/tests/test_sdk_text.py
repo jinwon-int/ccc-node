@@ -38,6 +38,34 @@ class RetryableErrorTest(unittest.TestCase):
     def test_transient_message_retryable(self):
         self.assertTrue(sdk_text._is_retryable_sdk_error(RuntimeError("connection refused")))
 
+    def test_overload_messages_are_retryable(self):
+        for message in (
+            "Claude is overloaded",
+            "API Error 529 overloaded",
+            "HTTP 503 Service Unavailable",
+        ):
+            with self.subTest(message=message):
+                self.assertTrue(sdk_text._is_retryable_sdk_error(RuntimeError(message)))
+                self.assertIn(
+                    "overloaded",
+                    (sdk_text.describe_cancel_reason(message) or "").lower(),
+                )
+
+    def test_overload_status_codes_require_digit_boundaries(self):
+        self.assertFalse(sdk_text._is_retryable_sdk_error(RuntimeError("job 1503 failed")))
+        self.assertFalse(sdk_text._is_retryable_sdk_error(RuntimeError("request 5291 failed")))
+
+    def test_permanent_bucket_precedes_overload_status(self):
+        self.assertFalse(
+            sdk_text._is_retryable_sdk_error(
+                RuntimeError("authentication failed with HTTP 503")
+            )
+        )
+        self.assertIn(
+            "authentication",
+            (sdk_text.describe_cancel_reason("authentication failed with HTTP 503") or "").lower(),
+        )
+
 
 class FormatAskUserQuestionTest(unittest.TestCase):
     def test_question_with_options(self):

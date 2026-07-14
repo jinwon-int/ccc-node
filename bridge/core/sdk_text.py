@@ -63,6 +63,41 @@ TASK_TERMINATED_NOTICE = "🛑 Task has been terminated."
 CANCEL_REASON_WINDOW_S = 30.0
 
 _RESET_HINT_RE = re.compile(r"resets?\s+([^\n().]+)", re.IGNORECASE)
+_OVERLOAD_STATUS_RE = re.compile(r"(?<!\d)(?:503|529)(?!\d)")
+
+# Ordered once and consumed by both user-facing cancellation notices and the
+# retry classifier. Permanent buckets must win when a message also contains a
+# transient-looking status code (for example, "authentication failed: 503").
+_SDK_ERROR_TEXT_PATTERNS = {
+    "usage_limit": ("hit your limit", "usage limit", "rate limit", "rate_limit"),
+    "authentication": ("authenticate", "authentication", "invalid api key", " 401"),
+    "overloaded": ("overloaded",),
+    "network": (
+        "timed out",
+        "timeout",
+        "connection",
+        "network",
+        "econnreset",
+        "getaddrinfo",
+        "refused",
+        "unreachable",
+    ),
+}
+_SDK_ERROR_BUCKET_ORDER = ("usage_limit", "authentication", "overloaded", "network")
+_RETRYABLE_TEXT_BUCKETS = frozenset(("overloaded", "network"))
+
+
+def _classify_sdk_error_text(error_text: Optional[str]) -> Optional[str]:
+    """Return the ordered semantic bucket for a raw SDK error message."""
+    if not error_text:
+        return None
+    low = error_text.lower()
+    for bucket in _SDK_ERROR_BUCKET_ORDER:
+        if any(pattern in low for pattern in _SDK_ERROR_TEXT_PATTERNS[bucket]):
+            return bucket
+        if bucket == "overloaded" and _OVERLOAD_STATUS_RE.search(low):
+            return bucket
+    return None
 
 
 def _extract_reset_hint(text: Optional[str]) -> Optional[str]:
@@ -81,10 +116,8 @@ def describe_cancel_reason(error_text: Optional[str]) -> Optional[str]:
     Returns ``None`` when the text is empty or unrecognised, so the caller can
     fall back to the generic terminated notice (e.g. a genuine ``/stop``).
     """
-    if not error_text:
-        return None
-    low = error_text.lower()
-    if "hit your limit" in low or "usage limit" in low or "rate limit" in low or "rate_limit" in low:
+    bucket = _classify_sdk_error_text(error_text)
+    if bucket == "usage_limit":
         reset = _extract_reset_hint(error_text)
         if reset:
             return (
@@ -92,11 +125,11 @@ def describe_cancel_reason(error_text: Optional[str]) -> Optional[str]:
                 "Please retry after it resets."
             )
         return "🚦 Claude usage limit reached. Please retry after it resets."
-    if "authenticate" in low or "authentication" in low or "invalid api key" in low or " 401" in low:
+    if bucket == "authentication":
         return "🔑 Claude authentication failed — the node's credentials need attention."
-    if "overloaded" in low or "529" in low or "503" in low:
+    if bucket == "overloaded":
         return "⏳ Claude is temporarily overloaded — please resend in a moment."
-    if any(k in low for k in ("timed out", "timeout", "connection", "network", "econnreset", "getaddrinfo")):
+    if bucket == "network":
         return "🌐 Connection interrupted — please resend your message."
     return None
 
@@ -142,6 +175,10 @@ def _is_retryable_sdk_error(error: Exception) -> bool:
     if any(pattern in error_msg for pattern in NON_RETRYABLE_PATTERNS):
         return False
 
+    text_bucket = _classify_sdk_error_text(error_msg)
+    if text_bucket in {"usage_limit", "authentication"}:
+        return False
+
     # Retry all timeout and connection errors by default
     RETRYABLE_TYPES = [
         "TimeoutError",
@@ -155,17 +192,7 @@ def _is_retryable_sdk_error(error: Exception) -> bool:
     if error_type in RETRYABLE_TYPES:
         return True
 
-    # Also retry if error message contains common transient error patterns
-    RETRYABLE_MSG_PATTERNS = [
-        "timeout",
-        "connection",
-        "refused",
-        "unreachable",
-        "exit code -15",  # SIGTERM
-        "exit code -9",  # SIGKILL
-    ]
-
-    return any(pattern in error_msg.lower() for pattern in RETRYABLE_MSG_PATTERNS)
+    return text_bucket in _RETRYABLE_TEXT_BUCKETS
 
 
 def _format_ask_user_question(tool_input: dict):
