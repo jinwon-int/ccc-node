@@ -48,6 +48,15 @@ meta_file="$CACHE/meta.json"
 wiki_meta_file="$CACHE/wiki.meta.json"
 honcho_meta_file="$CACHE/honcho.meta.json"
 index_db="$STATE_DIR/memory-index.sqlite"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CODEX_MATERIALIZER="${CCC_CODEX_MEMORY_MATERIALIZER_PATH:-$SCRIPT_DIR/ccc_codex_memory.py}"
+codex_json='{"status":"unavailable","active_kind":null,"snapshot_sha256":null,"snapshot_bytes":0,"file_bytes":0,"metadata_status":"missing"}'
+if [ -x "$CODEX_MATERIALIZER" ] && [ -f "$CODEX_MATERIALIZER" ]; then
+  candidate="$("$CODEX_MATERIALIZER" status --json 2>/dev/null || true)"
+  if jq -e 'type == "object" and (.status | type == "string")' >/dev/null 2>&1 <<<"$candidate"; then
+    codex_json="$candidate"
+  fi
+fi
 
 honcho_enabled="${CCC_HONCHO_MEMORY_ENABLED:-1}"
 wiki_enabled="${CCC_WIKI_MEMORY_ENABLED:-1}"
@@ -83,6 +92,7 @@ if [ "$OUTPUT" = "--json" ] || [ "$OUTPUT" = "json" ]; then
     --arg meta_file "$meta_file" \
     --argjson wiki_meta "$(meta_json_for "$wiki_meta_file" "$WIKI_TTL")" \
     --argjson honcho_meta "$(meta_json_for "$honcho_meta_file" "$HONCHO_TTL")" \
+    --argjson codex "$codex_json" \
     --arg index_db "$index_db" \
     --argjson ttl "$TTL" \
     --argjson wiki_age "$(age_for "$wiki_file")" \
@@ -93,7 +103,8 @@ if [ "$OUTPUT" = "--json" ] || [ "$OUTPUT" = "json" ]; then
     '{profile:$profile, ttl_seconds:$ttl, cache:{dir:$cache_dir, meta:$meta_file}, state_dir:$state_dir,
       wiki:{status:$wiki_status, age_seconds:$wiki_age, bytes:$wiki_bytes, meta:$wiki_meta},
       honcho:{status:$honcho_status, age_seconds:$honcho_age, bytes:$honcho_bytes, cfg:$honcho_cfg, base:$honcho_base, meta:$honcho_meta},
-      local_index:{db:$index_db, exists:$index_exists}}'
+      local_index:{db:$index_db, exists:$index_exists},
+      codex:$codex}'
   exit 0
 fi
 
@@ -103,3 +114,8 @@ printf -- '- cache:   %s\n' "$CACHE"
 printf -- '- wiki:    %s age=%ss bytes=%s\n' "$wiki_status" "$(age_for "$wiki_file")" "$(bytes_for "$wiki_file")"
 printf -- '- honcho:  %s age=%ss bytes=%s base=%s\n' "$honcho_status" "$(age_for "$honcho_file")" "$(bytes_for "$honcho_file")" "$honcho_base"
 printf -- '- index:   %s\n' "$index_db"
+printf -- '- codex:   %s kind=%s hash=%s metadata=%s\n' \
+  "$(jq -r '.status' <<<"$codex_json")" \
+  "$(jq -r '.active_kind // "none"' <<<"$codex_json")" \
+  "$(jq -r '.snapshot_sha256 // "none"' <<<"$codex_json")" \
+  "$(jq -r '.metadata_status // "missing"' <<<"$codex_json")"
