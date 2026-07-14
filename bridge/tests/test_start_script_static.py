@@ -30,6 +30,15 @@ class StartScriptStaticTests(unittest.TestCase):
         self.assertIn('if [ -n "${ANDROID_API_LEVEL:-}" ]; then', function_body)
         self.assertIn("return 0", function_body)
 
+    def test_start_sh_never_logs_proxy_values(self):
+        text = _start_text()
+        for variable in ("http_proxy", "https_proxy"):
+            with self.subTest(variable=variable):
+                self.assertNotRegex(
+                    text,
+                    rf"(?m)^\s*echo[^\n]*\$(?:\{{)?{variable}(?:\}})?",
+                )
+
 
 if __name__ == "__main__":
     unittest.main()
