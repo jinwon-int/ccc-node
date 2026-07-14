@@ -111,6 +111,8 @@ done
 ok "distill history keep cap is enforced" '[ "$hist_count" = 2 ]'
 ok "latest distill-last survives" 'jq -e ".session_id == \"sess-ring-4\"" "$STATE/distill-last.json" >/dev/null'
 ok "old snapshots survive future runs" 'find "$STATE/distill-history" -maxdepth 1 -type f -name "*.json" -print0 | xargs -0 -r grep -h "sess-ring-" | grep -Eq "sess-ring-[23]"'
+ok "distill, skill-review, and load-memory share one detached-spawn helper" \
+  '[ -f "$HERE/lib/spawn-detached.sh" ] && grep -q '\''spawn_detached '\'' "$DISTILL" && grep -q '\''spawn_detached '\'' "$HERE/skill-review.sh" && grep -q '\''spawn_detached '\'' "$HERE/load-memory.sh"'
 
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

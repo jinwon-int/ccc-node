@@ -212,20 +212,20 @@ export CLAUDE_DISTILL_DRYRUN="$DRYRUN"
 # Prefer `setsid`: a plain disowned subshell stays in the hook's process
 # group/session, so when the parent session is torn down as a group (ssh-driven
 # maintenance sessions, CLI teardown) the pipeline dies silently before logging
-# anything — observed fleet-wide on 2026-07-07 (gwakga/nosuk sessionend runs
-# ended at "spawned bg" with no done/skip/error). A new session survives that
-# teardown; SIGHUP-only protection (nohup/disown) does not. Fallback keeps the
-# legacy disowned-subshell behaviour where setsid is unavailable.
+# anything — observed fleet-wide on 2026-07-07. The shared helper keeps the
+# legacy subshell fallback for environments without setsid.
 DISTILL_SELF="${BASH_SOURCE[0]:-$0}"
-if command -v setsid >/dev/null 2>&1 && [ -f "$DISTILL_SELF" ]; then
-  CLAUDE_DISTILL_BG=1 setsid bash "$DISTILL_SELF" "$TRIGGER" </dev/null >/dev/null 2>&1 &
-  BG_PID=$!
-  disown 2>/dev/null || true
-  log "spawned bg pid=$BG_PID mode=setsid"
+DISTILL_HOOKDIR="$(cd "$(dirname "$DISTILL_SELF")" 2>/dev/null && pwd)"
+# shellcheck source=claude/hooks/lib/spawn-detached.sh
+if [ -n "$DISTILL_HOOKDIR" ] \
+  && [ -r "$DISTILL_HOOKDIR/lib/spawn-detached.sh" ]; then
+  . "$DISTILL_HOOKDIR/lib/spawn-detached.sh"
+  if spawn_detached "$DISTILL_SELF" CLAUDE_DISTILL_BG run_bg_pipeline "$TRIGGER"; then
+    log "spawned bg pid=$SPAWN_DETACHED_PID mode=$SPAWN_DETACHED_MODE"
+  else
+    log "spawn failed reason=invalid-detached-contract"
+  fi
 else
-  ( run_bg_pipeline ) </dev/null >/dev/null 2>&1 &
-  BG_PID=$!
-  disown 2>/dev/null || true
-  log "spawned bg pid=$BG_PID mode=subshell"
+  log "spawn failed reason=missing-detached-helper"
 fi
 exit 0

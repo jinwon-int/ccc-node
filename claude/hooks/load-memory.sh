@@ -295,7 +295,19 @@ jq -n --arg ctx "$ctx" --arg event "$EVENT" \
 # CCC_MEMORY_NO_REFRESH=1 suppresses it — for hermetic tests (the detached refresh
 # rebuilds the index / consolidates facts out-of-band, which otherwise mutates
 # shared state mid-test) and for any caller that wants a strictly read-only inject.
+run_refresh_memory_bg() { bash "$HOOKDIR/refresh-memory.sh"; }
+LOAD_MEMORY_SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)"
+SPAWN_DETACHED_LIB="${CCC_SPAWN_DETACHED_LIB:-$HOOKDIR/lib/spawn-detached.sh}"
+if [ ! -r "$SPAWN_DETACHED_LIB" ] && [ -n "$LOAD_MEMORY_SELF_DIR" ]; then
+  SPAWN_DETACHED_LIB="$LOAD_MEMORY_SELF_DIR/lib/spawn-detached.sh"
+fi
 case "${CCC_MEMORY_NO_REFRESH:-0}" in
   1|true|TRUE|on|ON|yes|YES) : ;;
-  *) setsid bash "$HOOKDIR/refresh-memory.sh" >/dev/null 2>&1 </dev/null & ;;
+  *)
+    if [ -r "$SPAWN_DETACHED_LIB" ]; then
+      # shellcheck source=claude/hooks/lib/spawn-detached.sh
+      . "$SPAWN_DETACHED_LIB"
+      spawn_detached "$HOOKDIR/refresh-memory.sh" "" run_refresh_memory_bg || true
+    fi
+    ;;
 esac

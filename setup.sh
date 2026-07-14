@@ -278,7 +278,7 @@ backup_claude_dir
 begin_install_transaction
 
 # 1) Claude harness config + hooks (safe, secret-free)
-run mkdir -p "$CLAUDE_DIR/hooks"
+run mkdir -p "$CLAUDE_DIR/hooks" "$CLAUDE_DIR/hooks/lib"
 # settings.json is composed from two sources so the portable enforcement/observability
 # hooks have a SINGLE owner (no double-firing):
 #   - claude/settings.base.json          : node-local hooks + statusLine + outputStyle (always)
@@ -292,6 +292,7 @@ else
   merge_settings_json "$SRC/claude/settings.base.json" "$SRC/claude/hooks/enforcement-overlay.json" "$CLAUDE_DIR/settings.json"
 fi
 run cp "$SRC/claude/settings.local.json" "$CLAUDE_DIR/settings.local.json"
+run cp "$SRC/claude/hooks/lib/spawn-detached.sh" "$CLAUDE_DIR/hooks/lib/spawn-detached.sh"
 run cp "$SRC/claude/hooks/load-memory.sh" "$CLAUDE_DIR/hooks/load-memory.sh"
 run cp "$SRC/claude/hooks/refresh-memory.sh" "$CLAUDE_DIR/hooks/refresh-memory.sh"
 run cp "$SRC/claude/hooks/scan-injection.sh" "$CLAUDE_DIR/hooks/scan-injection.sh"
@@ -336,6 +337,7 @@ run cp "$SRC/scripts/ccc-skill-autosave.sh" "$CLAUDE_DIR/hooks/ccc-skill-autosav
 # restart of operator-allowlisted services only; see docs/self-update.md).
 run cp "$SRC/scripts/ccc-self-update.sh" "$CLAUDE_DIR/hooks/ccc-self-update.sh"
 installed_hook_scripts=(
+  "$CLAUDE_DIR/hooks/lib/spawn-detached.sh"
   "$CLAUDE_DIR/hooks/load-memory.sh"
   "$CLAUDE_DIR/hooks/refresh-memory.sh"
   "$CLAUDE_DIR/hooks/scan-injection.sh"
