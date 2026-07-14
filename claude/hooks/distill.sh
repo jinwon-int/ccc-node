@@ -61,6 +61,8 @@ run_bg_pipeline() {
   local DRYRUN="${CLAUDE_DISTILL_DRYRUN:-0}"
   local HOOKDIR
   HOOKDIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)" || HOOKDIR=${HOME:-/root}/.claude/hooks
+  # shellcheck source=claude/hooks/lib/mtime-prune.sh
+  if [ -r "$HOOKDIR/lib/mtime-prune.sh" ]; then . "$HOOKDIR/lib/mtime-prune.sh"; fi
 
   local PIPE_START_EPOCH PIPE_PID
   PIPE_START_EPOCH="$(date -u +%s)"
@@ -88,10 +90,10 @@ run_bg_pipeline() {
   bash "$HOOKDIR/distill/resume-write.sh" < "$STASH" >> "$LOG" 2>&1 || \
     log "resume-write non-zero"
   if [ "$HISTORY_KEEP" -gt 0 ]; then
-    find "$STASH_DIR" -maxdepth 1 -type f -name '*.json' -printf '%T@ %p\n' 2>/dev/null \
-      | sort -rn \
-      | awk -v keep="$HISTORY_KEEP" 'NR > keep { sub(/^[^ ]+ /, ""); print }' \
-      | xargs -r rm -- 2>/dev/null || true
+    # Portable, whitespace-safe prune (busybox find has no -printf; see #449).
+    if declare -F prune_keep_newest >/dev/null 2>&1; then
+      prune_keep_newest "$STASH_DIR" '*.json' "$HISTORY_KEEP"
+    fi
   fi
 
   if [ "$DRYRUN" = "1" ]; then

@@ -17,6 +17,16 @@ DISABLED="$STATE_DIR/distill.disabled"
 DRYRUN="$STATE_DIR/distill.dryrun"
 OUTPUT="${1:-text}"
 
+# Portable mtime select helper (busybox find has no -printf; see #449).
+CDC_SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)" || CDC_SELF_DIR=""
+# shellcheck source=claude/hooks/lib/mtime-prune.sh
+for _cdc_lib in \
+  "${CCC_MTIME_PRUNE_LIB:-}" \
+  "${CDC_SELF_DIR:+$CDC_SELF_DIR/../claude/hooks/lib/mtime-prune.sh}" \
+  "${HOME:-/root}/.claude/hooks/lib/mtime-prune.sh"; do
+  if [ -n "$_cdc_lib" ] && [ -r "$_cdc_lib" ]; then . "$_cdc_lib"; break; fi
+done
+
 # ---- toggle state -----------------------------------------------------------
 if   [ -f "$DISABLED" ]; then MODE="OFF"
 elif [ -f "$DRYRUN" ];   then MODE="DRY-RUN"
@@ -50,7 +60,7 @@ checkpoint_last="none"
 if [ -d "$CKPT_DIR" ]; then
   checkpoint_snapshots="$(find "$CKPT_DIR" -maxdepth 1 -type f -name 'working-state-*.md' 2>/dev/null | wc -l | tr -d '[:space:]')"
   case "$checkpoint_snapshots" in ''|*[!0-9]*) checkpoint_snapshots=0 ;; esac
-  checkpoint_last_path="$(find "$CKPT_DIR" -maxdepth 1 -type f -name 'working-state-*.md' -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-)"
+  checkpoint_last_path="$(newest_file "$CKPT_DIR" 'working-state-*.md')"
   if [ -n "$checkpoint_last_path" ] && [ -f "$checkpoint_last_path" ]; then
     checkpoint_last="$(basename "$checkpoint_last_path") mtime=$(date -u -r "$checkpoint_last_path" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || printf 'unknown')"
   fi
