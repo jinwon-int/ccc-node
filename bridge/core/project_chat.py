@@ -613,7 +613,9 @@ class ProjectChatHandler(
             req.heartbeat_message_id = None
             led = self._task_ledger
             if led and req.task_id:
-                led.set_status_message(req.task_id, None)
+                # Offload the (now fsync-backed) ledger write off the event loop
+                # so a heartbeat-path mutation never stalls message delivery.
+                await asyncio.to_thread(led.set_status_message, req.task_id, None)
         return cleaned
 
     async def _maybe_update_heartbeat(self, req: _PendingRequest, now: float) -> None:
@@ -691,7 +693,11 @@ class ProjectChatHandler(
             if message_id != previous_id:
                 led = self._task_ledger
                 if led and req.task_id:
-                    led.set_status_message(req.task_id, message_id)
+                    # Offload the (now fsync-backed) ledger write off the event
+                    # loop so a heartbeat-path mutation never stalls delivery.
+                    await asyncio.to_thread(
+                        led.set_status_message, req.task_id, message_id
+                    )
         except Exception as e:
             logger.warning(
                 "Heartbeat update failed for user %s chat %s: %s",

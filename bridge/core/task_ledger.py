@@ -31,12 +31,20 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
+# Reuse SessionStore's hardened atomic-write helper (#352) instead of a weaker
+# duplicate: private random temp + fsync(file) + os.replace + fsync(dir). store
+# depends only on the standard library and never imports this package, so there
+# is no import cycle and the ledger stays effectively stdlib + fail-open.
+from telegram_bot.session.store import (
+    SessionStoreDurabilityError,
+    _atomic_write_bytes,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -90,31 +98,63 @@ class TaskLedger:
         self._path = Path(path)
         self._lock = threading.Lock()
 
+    @property
+    def _backup_path(self) -> Path:
+        return self._path.with_name(self._path.name + ".bak")
+
     # --- persistence ----------------------------------------------------------
-    def _read(self) -> Dict[str, Dict[str, Any]]:
+    def _read_path(self, path: Path) -> Optional[Dict[str, Dict[str, Any]]]:
+        """Decode one ledger file, or None when it is missing/unreadable/corrupt."""
         try:
-            raw = self._path.read_text(encoding="utf-8")
+            raw = path.read_text(encoding="utf-8")
         except FileNotFoundError:
-            return {}
+            return None
         except Exception as exc:  # pragma: no cover - deliberately fail-open
             logger.warning("Task ledger read failed: %s", type(exc).__name__)
-            return {}
+            return None
         try:
             data = json.loads(raw) if raw.strip() else {}
         except json.JSONDecodeError:
-            return {}
+            return None
         if not isinstance(data, dict):
-            return {}
+            return None
         return {k: v for k, v in data.items() if isinstance(v, dict)}
 
+    def _read(self) -> Dict[str, Dict[str, Any]]:
+        primary = self._read_path(self._path)
+        if primary is not None:
+            return primary
+        # Primary missing or corrupt — recover from the previous-good backup so a
+        # torn/damaged ledger survives a restart (crash-recovery parity with the
+        # session store).
+        backup = self._read_path(self._backup_path)
+        if backup is not None:
+            logger.warning("Task ledger recovered from previous-good backup")
+            return backup
+        return {}
+
     def _write(self, records: Dict[str, Dict[str, Any]]) -> None:
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self._path.with_suffix(self._path.suffix + ".tmp")
-        tmp.write_text(
-            json.dumps(records, ensure_ascii=False, separators=(",", ":")),
-            encoding="utf-8",
-        )
-        os.replace(tmp, self._path)
+        payload = json.dumps(
+            records, ensure_ascii=False, separators=(",", ":")
+        ).encode("utf-8")
+        # Preserve the current-good file as .bak before overwriting, mirroring
+        # SessionStore's durability contract (#352). Best-effort: a backup hiccup
+        # must never block the primary write (fail-open ledger).
+        try:
+            if self._path.exists():
+                previous = self._path.read_bytes()
+                if previous.strip():
+                    json.loads(previous)  # only back up decodable bytes
+                    _atomic_write_bytes(self._backup_path, previous)
+        except Exception:
+            pass
+        # Durable primary write: private random temp + fsync(file) + os.replace +
+        # fsync(dir). Tolerate a directory fsync the filesystem cannot confirm —
+        # the rename already committed and the ledger is fail-open.
+        try:
+            _atomic_write_bytes(self._path, payload)
+        except SessionStoreDurabilityError:
+            logger.warning("Task ledger dir-fsync unconfirmed; state written")
 
     def _mutate(self, fn) -> Any:
         """Run ``fn(records) -> result`` under the lock, persisting mutations."""
