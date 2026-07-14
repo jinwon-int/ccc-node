@@ -215,5 +215,63 @@ class TerminalStallReleaseTest(unittest.IsolatedAsyncioTestCase):
             await asyncio.wait_for(asyncio.shield(req.future), timeout=0.2)
 
 
+class TeardownTaskTrackingTest(unittest.IsolatedAsyncioTestCase):
+    """#447: teardown spawned from outside the loop task must retain a strong
+    reference (GC-safe) and surface exceptions via the done-callback instead of
+    dropping them silently."""
+
+    async def asyncSetUp(self):
+        self.handler = ProjectChatHandler()
+        self.handler._task_ledger_cache = False
+
+    async def test_teardown_exception_is_logged_not_swallowed(self):
+        async def _boom():
+            raise RuntimeError("teardown blew up")
+
+        with self.assertLogs(project_chat.logger, level="ERROR") as cm:
+            task = self.handler._spawn_teardown_task(_boom(), label="unit")
+            await asyncio.gather(task, return_exceptions=True)
+            await asyncio.sleep(0)  # let the done-callback run
+
+        self.assertTrue(
+            any("teardown blew up" in line for line in cm.output),
+            cm.output,
+        )
+        # Reference is released after completion (no unbounded growth).
+        self.assertNotIn(task, self.handler._teardown_tasks)
+
+    async def test_teardown_reference_retained_until_done(self):
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def _slow():
+            started.set()
+            await release.wait()
+
+        task = self.handler._spawn_teardown_task(_slow(), label="unit")
+        await started.wait()
+        # In-flight: the handler holds the only strong reference.
+        self.assertIn(task, self.handler._teardown_tasks)
+        release.set()
+        await task
+        await asyncio.sleep(0)
+        self.assertNotIn(task, self.handler._teardown_tasks)
+
+    async def test_teardown_cancellation_is_debug_not_error(self):
+        release = asyncio.Event()
+
+        async def _slow():
+            await release.wait()
+
+        task = self.handler._spawn_teardown_task(_slow(), label="unit")
+        await asyncio.sleep(0)
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        await asyncio.sleep(0)
+        # Cancellation is expected teardown flow — reference cleaned up.
+        self.assertNotIn(task, self.handler._teardown_tasks)
+
+
 if __name__ == "__main__":
     unittest.main()
