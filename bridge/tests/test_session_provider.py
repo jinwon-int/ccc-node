@@ -420,12 +420,17 @@ async def test_model_command_provider_switch_enqueues_old_codex_thread(
         {"provider": "codex", "session_id": "thread-before-model-command"},
     )
     bot = bare_bot(manager, provider="claude")
-    journal = RecordingDistillJournal()
+    journal = RecordingDistillJournal(
+        observe=lambda: manager.store._local_data["telegram_session:7:9"][
+            "session_id"
+        ]
+    )
     bot._distill_journal = journal
 
     await bot._cmd_model(make_update(), SimpleNamespace(args=["sonnet"]))
 
     assert len(journal.calls) == 1
+    assert journal.calls[0]["observed"] == "thread-before-model-command"
     assert journal.calls[0]["thread_id"] == "thread-before-model-command"
     assert journal.calls[0]["trigger"].value == "provider_switch"
     session = await manager.get_session("7:9")
@@ -443,7 +448,11 @@ async def test_model_callback_provider_switch_enqueues_old_codex_thread(
         {"provider": "codex", "session_id": "thread-before-model-callback"},
     )
     bot = bare_bot(manager, provider="claude")
-    journal = RecordingDistillJournal()
+    journal = RecordingDistillJournal(
+        observe=lambda: manager.store._local_data["telegram_session:7:9"][
+            "session_id"
+        ]
+    )
     bot._distill_journal = journal
     bot.application = SimpleNamespace(bot=object())
     query = SimpleNamespace(
@@ -461,6 +470,7 @@ async def test_model_callback_provider_switch_enqueues_old_codex_thread(
     await bot._handle_callback(update, SimpleNamespace())
 
     assert len(journal.calls) == 1
+    assert journal.calls[0]["observed"] == "thread-before-model-callback"
     assert journal.calls[0]["thread_id"] == "thread-before-model-callback"
     assert journal.calls[0]["trigger"].value == "provider_switch"
     session = await manager.get_session("7:9")
