@@ -2,6 +2,7 @@
 
 # ruff: noqa: E402
 import asyncio
+import threading
 import unittest
 from unittest.mock import AsyncMock, Mock, patch, PropertyMock
 from pathlib import Path
@@ -194,6 +195,53 @@ class TestConnectionResilience(unittest.TestCase):
         self.assertEqual(kwargs["allowed_updates"], Update.ALL_TYPES)
         self.assertTrue(kwargs["drop_pending_updates"])
         self.assertEqual(kwargs["error_callback"], self.bot._on_polling_error)
+
+    def test_claude_readiness_probe_does_not_block_event_loop(self):
+        """A slow readiness probe must not stall unrelated async work."""
+        probe_started = threading.Event()
+        release_probe = threading.Event()
+        concurrent_progress: list[bool] = []
+
+        def slow_probe():
+            probe_started.set()
+            if not release_probe.wait(timeout=2.0):
+                raise AssertionError("event loop blocked during readiness probe")
+            return True, ""
+
+        async def release_from_event_loop():
+            while not probe_started.is_set():
+                await asyncio.sleep(0)
+            concurrent_progress.append(True)
+            release_probe.set()
+
+        mock_app = Mock()
+        mock_app.initialize = AsyncMock()
+        mock_app.start = AsyncMock()
+
+        mock_updater = Mock()
+        type(mock_updater).running = PropertyMock(return_value=True)
+
+        async def start_polling(**_kwargs):
+            asyncio.create_task(release_from_event_loop())
+
+        mock_updater.start_polling = AsyncMock(side_effect=start_polling)
+        mock_updater.stop = AsyncMock()
+        mock_app.updater = mock_updater
+        type(mock_app).running = PropertyMock(return_value=True)
+        mock_app.stop = AsyncMock()
+        mock_app.shutdown = AsyncMock()
+        mock_app.bot = Mock()
+
+        self.bot.application = mock_app
+        self.bot.build = Mock()
+        self.bot._on_ready = AsyncMock()
+        self.bot._supervise_polling = AsyncMock(side_effect=SystemExit("stop"))
+        self.bot._probe_claude_readiness = Mock(side_effect=slow_probe)
+
+        with self.assertRaises(SystemExit):
+            self.bot.run()
+
+        self.assertTrue(concurrent_progress)
 
     def test_runtime_conflict_after_polling_start_fails_closed(self):
         """A Conflict emitted by PTB's polling retry loop AFTER polling started
