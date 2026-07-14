@@ -26,6 +26,14 @@ printf 'honcho cache contains practical evidence reports\n' > "$cache/honcho.txt
 out="$(CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" bash "$ROOT/scripts/ccc-memory-check.sh" --json 2>&1)"; rc=$?
 ok "memory check json succeeds" '[ "$rc" = 0 ] && jq -e ".wiki.status == \"ok\" and .honcho.status == \"ok\"" >/dev/null <<<"$out"'
 
+codex_home="$TMP/codex-home"
+CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CCC_MEMORY_TOOLS_DIR="$ROOT/scripts" CODEX_HOME="$codex_home" python3 "$ROOT/scripts/ccc_codex_memory.py" materialize --json >/dev/null 2>&1
+out="$(CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CCC_MEMORY_TOOLS_DIR="$ROOT/scripts" CODEX_HOME="$codex_home" bash "$ROOT/scripts/ccc-memory-check.sh" --json 2>&1)"; rc=$?
+ok "memory check exposes body-free ready Codex snapshot diagnostics" '[ "$rc" = 0 ] && jq -e '\''.codex.status == "ready" and .codex.metadata_status == "ok" and (.codex.snapshot_sha256 | length) == 64 and .codex.active_kind == "base"'\'' >/dev/null <<<"$out" && ! grep -q "allowed operation policy\|user likes concise" <<<"$out"'
+rm -rf "$codex_home"
+out="$(CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CODEX_HOME="$codex_home" bash "$ROOT/scripts/ccc-memory-check.sh" --json 2>&1)"; rc=$?
+ok "memory check reports a missing Codex snapshot without creating CODEX_HOME" '[ "$rc" = 0 ] && jq -e '\''.codex.status == "missing"'\'' >/dev/null <<<"$out" && [ ! -e "$codex_home" ]'
+
 out="$(CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CCC_HONCHO_MEMORY_ENABLED=FALSE bash "$ROOT/scripts/ccc-memory-check.sh" --json 2>&1)"; rc=$?
 ok "memory check treats uppercase FALSE as disabled" '[ "$rc" = 0 ] && jq -e ".honcho.status == \"disabled\"" >/dev/null <<<"$out"'
 

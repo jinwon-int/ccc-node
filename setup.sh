@@ -226,6 +226,10 @@ run cp "$SRC/claude/hooks/lib/spawn-detached.sh" "$CLAUDE_DIR/hooks/lib/spawn-de
 run cp "$SRC/scripts/lib/harness-paths.sh" "$CLAUDE_DIR/hooks/lib/harness-paths.sh"
 run cp "$SRC/scripts/lib/harness_paths.py" "$CLAUDE_DIR/hooks/lib/harness_paths.py"
 run cp "$SRC/claude/hooks/load-memory.sh" "$CLAUDE_DIR/hooks/load-memory.sh"
+# Codex launch boundary: the launcher and materializer are installed beside
+# load-memory.sh so every direct/app-server run reuses the same snapshot policy.
+run cp "$SRC/scripts/ccc-codex" "$CLAUDE_DIR/hooks/ccc-codex"
+run cp "$SRC/scripts/ccc_codex_memory.py" "$CLAUDE_DIR/hooks/ccc_codex_memory.py"
 run cp "$SRC/claude/hooks/refresh-memory.sh" "$CLAUDE_DIR/hooks/refresh-memory.sh"
 run cp "$SRC/claude/hooks/scan-injection.sh" "$CLAUDE_DIR/hooks/scan-injection.sh"
 run cp "$SRC/claude/hooks/load-tools.sh" "$CLAUDE_DIR/hooks/load-tools.sh"
@@ -274,6 +278,8 @@ installed_hook_scripts=(
   "$CLAUDE_DIR/hooks/lib/harness-paths.sh"
   "$CLAUDE_DIR/hooks/lib/harness_paths.py"
   "$CLAUDE_DIR/hooks/load-memory.sh"
+  "$CLAUDE_DIR/hooks/ccc-codex"
+  "$CLAUDE_DIR/hooks/ccc_codex_memory.py"
   "$CLAUDE_DIR/hooks/refresh-memory.sh"
   "$CLAUDE_DIR/hooks/scan-injection.sh"
   "$CLAUDE_DIR/hooks/load-tools.sh"
@@ -486,6 +492,9 @@ cat <<'EOF'
      Linux reboot-persistence: ./start.sh --path $BRIDGE_DEFAULT_PATH --install-systemd   (systemd unit).
   10. (Optional) Keep the memory snapshot warm on idle nodes:
      ./scripts/install-memory-refresh-cron.sh --apply   (cron runs refresh-memory.sh; dry-run by default).
+  11. (Optional Codex) Keep CCC_CODEX_CLI_PATH on ~/.claude/hooks/ccc-codex,
+      set CCC_CODEX_REAL_CLI_PATH only for a non-PATH binary, and require
+      `ccc-memory-check.sh --json` to report `.codex.status == "ready"`.
 
 Secrets that are intentionally NOT installed by this script:
   - ~/.claude/.credentials.json   (Claude OAuth — created on `claude` login)
@@ -500,6 +509,8 @@ printf '  - CCC_HERMES_DIR=%s\n' "$HERMES_ROOT"
 printf '  - honcho.json=%s/honcho.json\n' "$HERMES_ROOT"
 printf '  - CCC_WIKI_AGENT_BIN=%s\n' "$WIKI_AGENT_BIN"
 printf '  - CCC_BRIDGE_DEFAULT_PATH=%s\n' "$BRIDGE_DEFAULT_PATH"
+printf '  - CCC_CODEX_CLI_PATH=%s/hooks/ccc-codex\n' "$CLAUDE_DIR"
+printf '  - CCC_CODEX_MEMORY_MATERIALIZER_PATH=%s/hooks/ccc_codex_memory.py\n' "$CLAUDE_DIR"
 printf '  - bridge command=./start.sh --path %s -d\n' "$BRIDGE_DEFAULT_PATH"
 
 SETUP_TXN_ACTIVE=0

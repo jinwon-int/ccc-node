@@ -270,7 +270,10 @@ Any unrecognized `/command` is also forwarded as a skill invocation.
 | `CCC_BRIDGE_EXECUTION_PROFILE` | No | `strict-project` | Execution boundary: `strict-project`, `owner-operator`, or `disabled` |
 | `CCC_BRIDGE_BASH_POLICY` | No | `auto-approve` | Bash approval UX; Codex default is unrestricted `never + dangerFullAccess` |
 | `CCC_AGENT_PROVIDER` | No | `claude` | Agent provider: `claude` or `codex` |
-| `CCC_CODEX_CLI_PATH` | Codex only | `codex` | Codex CLI executable path or command name |
+| `CCC_CODEX_CLI_PATH` | Codex only | `~/.claude/hooks/ccc-codex` | Installed memory-bootstrap launcher used for direct/app-server runs |
+| `CCC_CODEX_REAL_CLI_PATH` | Codex only | `codex` | Underlying Codex binary invoked by the launcher |
+| `CCC_CODEX_MEMORY_MATERIALIZER_PATH` | Codex only | `~/.claude/hooks/ccc_codex_memory.py` | Body-free materialize/status command run at thread boundaries |
+| `CCC_CODEX_MEMORY_BOOTSTRAP_TIMEOUT_SEC` | Codex only | `14` | Per-command materializer timeout |
 | `CLAUDE_CLI_PATH` | No | *(auto-detect)* | Absolute path to Claude CLI binary |
 | `CLAUDE_SETTINGS_PATH` | No | `~/.claude/settings.json` | Path to Claude Code settings file |
 | `CLAUDE_PROCESS_TIMEOUT` | No | `600` | SDK timeout in seconds |
@@ -364,9 +367,9 @@ Current reference pricing is about **$0.006/minute** of audio. Check OpenAI pric
 
 Codex rollout is source/config driven and must be serial:
 
-1. Install Codex CLI and authenticate it using the CLI's normal login flow.
-2. Set `CCC_AGENT_PROVIDER=codex` and, when needed, `CCC_CODEX_CLI_PATH`. The package-default `auto-approve` policy is `never + dangerFullAccess`; use an explicit non-default Bash policy if unrestricted host/network access is not intended.
-3. Run `../scripts/ccc-doctor.sh` and require `readiness: ready`. The doctor performs only bounded, non-secret version, app-server help, and login-status probes; it never starts a model turn or polls Telegram.
+1. Install Codex CLI, authenticate it using the CLI's normal login flow, and run repository `setup.sh` so `ccc-codex` plus `ccc_codex_memory.py` are installed under the harness hooks directory.
+2. Set `CCC_AGENT_PROVIDER=codex`. Keep `CCC_CODEX_CLI_PATH` on the installed `ccc-codex` wrapper and set `CCC_CODEX_REAL_CLI_PATH` only when the real binary is not found as `codex`. The package-default `auto-approve` policy is `never + dangerFullAccess`; use an explicit non-default Bash policy if unrestricted host/network access is not intended.
+3. Run `../scripts/ccc-memory-check.sh --json` and require `.codex.status == "ready"`, then run `../scripts/ccc-doctor.sh` and require `readiness: ready`. These diagnostics are body-free and do not start a model turn or poll Telegram.
 4. Stop the existing bridge owner, then start exactly one replacement and verify status. **Two services must never poll the same Telegram bot token concurrently.**
 
 Roll back by stopping the Codex bridge, restoring `CCC_AGENT_PROVIDER=claude`, and starting the prior Claude bridge as the sole poller. Do not overlap old and new services during rollout or rollback.

@@ -90,11 +90,17 @@ class Config(BaseSettings):
 
         data_dir = root / ".telegram_bot"
         home = Path(process_values.get("HOME", str(Path.home()))).expanduser()
+        claude_root = Path(process_values.get("CCC_CLAUDE_DIR", str(home / ".claude"))).expanduser()
         values["project_root"] = root
         values.setdefault("bot_data_dir", data_dir)
         values.setdefault("logs_dir", data_dir / "logs")
         values.setdefault("session_store_path", data_dir / "sessions.json")
-        values.setdefault("claude_settings_path", home / ".claude" / "settings.json")
+        values.setdefault("claude_settings_path", claude_root / "settings.json")
+        values.setdefault("CCC_CODEX_CLI_PATH", str(claude_root / "hooks" / "ccc-codex"))
+        values.setdefault(
+            "CCC_CODEX_MEMORY_MATERIALIZER_PATH",
+            str(claude_root / "hooks" / "ccc_codex_memory.py"),
+        )
         values.setdefault(
             "CCC_PUSH_SPOOL", home / ".claude" / "state" / "telegram-spool"
         )
@@ -139,9 +145,21 @@ class Config(BaseSettings):
         }
 
     codex_cli_path: str = Field(
-        default="codex",
+        default_factory=lambda: str(Path.home() / ".claude" / "hooks" / "ccc-codex"),
         alias="CCC_CODEX_CLI_PATH",
-        description="Codex CLI executable path or command name.",
+        description="ccc-node Codex launcher path.",
+    )
+    codex_memory_materializer_path: str = Field(
+        default_factory=lambda: str(Path.home() / ".claude" / "hooks" / "ccc_codex_memory.py"),
+        alias="CCC_CODEX_MEMORY_MATERIALIZER_PATH",
+        description="Body-free Codex memory materializer path.",
+    )
+    codex_memory_bootstrap_timeout_seconds: float = Field(
+        default=14.0,
+        ge=0.1,
+        le=30.0,
+        alias="CCC_CODEX_MEMORY_BOOTSTRAP_TIMEOUT_SEC",
+        description="Timeout for each Codex memory materialize/status command.",
     )
     claude_cli_path: Optional[Path] = Field(
         default=None,
@@ -179,12 +197,12 @@ class Config(BaseSettings):
             raise ValueError("memory identity labels must be non-empty")
         return value
 
-    @field_validator("codex_cli_path", mode="before")
+    @field_validator("codex_cli_path", "codex_memory_materializer_path", mode="before")
     @classmethod
-    def validate_codex_cli_path(cls, v):
+    def validate_codex_runtime_path(cls, v):
         value = str(v).strip()
         if not value:
-            raise ValueError("CCC_CODEX_CLI_PATH must be non-empty")
+            raise ValueError("Codex runtime paths must be non-empty")
         return value
 
     # Runtime data

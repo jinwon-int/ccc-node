@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# ccc-codex — materialize the ccc-node snapshot before every direct Codex run.
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+materializer="${CCC_CODEX_MEMORY_MATERIALIZER_PATH:-$SCRIPT_DIR/ccc_codex_memory.py}"
+real_candidate="${CCC_CODEX_REAL_CLI_PATH:-codex}"
+
+if [ ! -f "$materializer" ] || [ ! -x "$materializer" ] || [ -L "$materializer" ]; then
+  printf '%s\n' 'ccc-codex: memory bootstrap unavailable' >&2
+  exit 78
+fi
+
+if ! "$materializer" materialize --json >/dev/null 2>&1; then
+  # A refresh failure may proceed only when a previously materialized block is
+  # still structurally valid and private. status is read-only and body-free.
+  if ! "$materializer" status --json >/dev/null 2>&1; then
+    printf '%s\n' 'ccc-codex: memory bootstrap unavailable' >&2
+    exit 78
+  fi
+fi
+
+case "$real_candidate" in
+  ''|-*)
+    printf '%s\n' 'ccc-codex: real CLI unavailable' >&2
+    exit 127
+    ;;
+  */*) real_cli="$real_candidate" ;;
+  *) real_cli="$(command -v "$real_candidate" 2>/dev/null || true)" ;;
+esac
+
+if [ -z "${real_cli:-}" ] || [ ! -x "$real_cli" ] || [ ! -f "$real_cli" ]; then
+  printf '%s\n' 'ccc-codex: real CLI unavailable' >&2
+  exit 127
+fi
+if [ "$real_cli" -ef "$0" ]; then
+  printf '%s\n' 'ccc-codex: recursive real CLI configuration' >&2
+  exit 127
+fi
+
+exec "$real_cli" "$@"

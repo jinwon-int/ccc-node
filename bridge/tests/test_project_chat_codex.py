@@ -147,18 +147,43 @@ def test_agent_provider_settings_default_and_reject_unknown(tmp_path: Path) -> N
     )
 
     assert settings.agent_provider == "claude"
-    assert settings.codex_cli_path == "codex"
+    assert settings.codex_cli_path == str(tmp_path / ".claude" / "hooks" / "ccc-codex")
+    assert settings.codex_memory_materializer_path == str(
+        tmp_path / ".claude" / "hooks" / "ccc_codex_memory.py"
+    )
     codex_settings = settings_class.load(
         project_root=tmp_path / "project",
         environ={
             **environ,
             "CCC_AGENT_PROVIDER": "codex",
             "CCC_CODEX_CLI_PATH": "/opt/bin/codex-test",
+            "CCC_CODEX_MEMORY_MATERIALIZER_PATH": "/opt/lib/ccc-materialize",
+            "CCC_CODEX_MEMORY_BOOTSTRAP_TIMEOUT_SEC": "4.5",
         },
         bot_env_file=tmp_path / "missing.env",
     )
     assert codex_settings.agent_provider == "codex"
     assert codex_settings.codex_cli_path == "/opt/bin/codex-test"
+    assert codex_settings.codex_memory_materializer_path == "/opt/lib/ccc-materialize"
+    assert codex_settings.codex_memory_bootstrap_timeout_seconds == 4.5
+    custom_harness = tmp_path / "custom-claude"
+    custom_settings = settings_class.load(
+        project_root=tmp_path / "project",
+        environ={
+            **environ,
+            "CCC_CLAUDE_DIR": str(custom_harness),
+        },
+        bot_env_file=tmp_path / "missing.env",
+    )
+    assert custom_settings.codex_cli_path == str(custom_harness / "hooks" / "ccc-codex")
+    assert custom_settings.codex_memory_materializer_path == str(
+        custom_harness / "hooks" / "ccc_codex_memory.py"
+    )
+    assert custom_settings.claude_settings_path == custom_harness / "settings.json"
+    assert custom_settings.logs_dir == tmp_path / "project" / ".telegram_bot" / "logs"
+    assert custom_settings.session_store_path == (
+        tmp_path / "project" / ".telegram_bot" / "sessions.json"
+    )
     with pytest.raises(ValidationError, match="CCC_AGENT_PROVIDER|agent_provider"):
         settings_class.load(
             project_root=tmp_path / "project",
@@ -209,6 +234,55 @@ def test_codex_composition_injects_runtime_without_replacing_sdk_factory(tmp_pat
     assert context.agent_runtime is runtime
     assert context.project_chat._agent_runtime is runtime
     assert context.project_chat._sdk_client_factory is sdk_factory
+
+
+def test_codex_composition_wires_memory_bootstrap_settings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings_class = _real_settings_class()
+    _reload_real_module("telegram_bot.utils.chat_logger")
+    _reload_real_module("telegram_bot.utils.health")
+    from telegram_bot import __main__ as main_module
+    from telegram_bot.core import codex_runtime as runtime_module
+
+    settings = settings_class.load(
+        project_root=tmp_path / "project",
+        environ={
+            "HOME": str(tmp_path),
+            "TELEGRAM_BOT_TOKEN": "123456:test",
+            "CCC_AGENT_PROVIDER": "codex",
+        },
+        bot_env_file=tmp_path / "missing.env",
+    )
+    captured: dict[str, object] = {}
+
+    class Runtime:
+        def __init__(
+            self,
+            *,
+            cli_path,
+            memory_materializer_path,
+            memory_bootstrap_timeout_seconds,
+        ) -> None:
+            captured.update(
+                cli_path=cli_path,
+                memory_materializer_path=memory_materializer_path,
+                memory_bootstrap_timeout_seconds=memory_bootstrap_timeout_seconds,
+            )
+
+    monkeypatch.setattr(runtime_module, "CodexRuntime", Runtime)
+    context = main_module.build_context(
+        settings,
+        sdk_factory=object(),
+        telegram_port=lambda: None,
+    )
+
+    assert context.agent_runtime is not None
+    assert captured == {
+        "cli_path": str(tmp_path / ".claude" / "hooks" / "ccc-codex"),
+        "memory_materializer_path": str(tmp_path / ".claude" / "hooks" / "ccc_codex_memory.py"),
+        "memory_bootstrap_timeout_seconds": 14.0,
+    }
 
 
 def test_codex_runtime_wires_configured_cli_path(monkeypatch: pytest.MonkeyPatch) -> None:
