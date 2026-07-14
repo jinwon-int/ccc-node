@@ -183,6 +183,55 @@ find_memory_tool() { # <tool-name>
   return 1
 }
 
+run_memory_search_bounded() { # <tool> <query> <limit> <timeout-seconds>
+  local tool="$1" query="$2" limit="$3" timeout_sec="$4"
+  python3 -c 'import math, os, signal, subprocess, sys
+
+tool, query, limit, raw_timeout = sys.argv[1:]
+try:
+    timeout = float(raw_timeout)
+except (TypeError, ValueError):
+    timeout = 3.0
+if not math.isfinite(timeout) or timeout <= 0:
+    timeout = 3.0
+# The outer SessionStart hook has a 15-second deadline. Keep enough room for
+# canonical source assembly and JSON rendering even with an excessive override.
+timeout = min(timeout, 10.0)
+env = os.environ.copy()
+env["CCC_MEMORY_RECORD_USAGE"] = "0"
+env["CCC_MEMORY_SEARCH_LIMIT"] = limit
+try:
+    proc = subprocess.Popen(
+        [tool, query],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        env=env,
+        start_new_session=True,
+    )
+except OSError:
+    raise SystemExit(0)
+try:
+    stdout, _ = proc.communicate(timeout=timeout)
+except subprocess.TimeoutExpired:
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except OSError:
+        proc.terminate()
+    try:
+        proc.communicate(timeout=0.5)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except OSError:
+            proc.kill()
+        proc.communicate()
+    raise SystemExit(0)
+if proc.returncode == 0:
+    sys.stdout.buffer.write(stdout)
+' "$tool" "$query" "$limit" "$timeout_sec" 2>/dev/null || true
+}
+
 build_memory_query() {
   if [ -n "${QUERY:-}" ]; then printf '%s' "$QUERY"; return 0; fi
   local query_tool
@@ -216,7 +265,7 @@ stale_note() { # <label> <file>
 
 # Built-in node memory lives under ~/.claude/memories; legacy Hermes memory is fallback only.
 mem="$(cat "$MEMDIR/MEMORY.md" "$MEMDIR/USER.md" 2>/dev/null)"
-[ -z "$mem" ] && mem="$(cat ${HOME:-/root}/.hermes/memories/MEMORY.md ${HOME:-/root}/.hermes/memories/USER.md 2>/dev/null)"
+[ -z "$mem" ] && mem="$(cat "${HOME:-/root}/.hermes/memories/MEMORY.md" "${HOME:-/root}/.hermes/memories/USER.md" 2>/dev/null)"
 wiki=""
 if ! is_disabled "$WIKI_ENABLED"; then
   wiki="$(cat "$CACHE/wiki.txt" 2>/dev/null)"
@@ -275,9 +324,11 @@ if [ "$PROFILE" = "hybrid" ] || [ "$PROFILE" = "max-perf" ] || ! is_disabled "$L
     # No line-cap here: dedup/render parse the whole JSON (a partial cut would
     # break json.loads and fall back to raw). Result count is bounded by
     # search_limit and the byte budget is enforced by limit_bytes below.
-    # CCC_MEMORY_RECORD_USAGE=1: this is the real injection retrieval, so let the
-    # search record retrieval-frequency feedback (diagnostics stay read-only).
-    local_hot="$({ CCC_MEMORY_RECORD_USAGE=1 CCC_MEMORY_SEARCH_LIMIT="$search_limit" "$search_tool" "$QUERY" 2>/dev/null || true; })"
+    # SessionStart is read-only and must finish before the outer 15-second hook
+    # deadline. A short inner deadline drops only local-hot results; canonical
+    # MEMORY/USER/cache/resume blocks assembled above still inject. The helper
+    # uses Python rather than GNU timeout so the same contract works on Termux.
+    local_hot="$(run_memory_search_bounded "$search_tool" "$QUERY" "$search_limit" "${CCC_MEMORY_SEARCH_TIMEOUT_SEC:-3}")"
   fi
 fi
 

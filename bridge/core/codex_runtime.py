@@ -98,6 +98,10 @@ class _ActiveTurn:
     turn_ready: asyncio.Event = field(default_factory=asyncio.Event)
     finished: bool = False
     pending_notifications: list[CodexNotification] = field(default_factory=list)
+    # Whether assistant text has been emitted since the last message boundary.
+    # Gates the paragraph separator so consecutive agentMessages are split (but a
+    # separator never leads, and an empty message can't double it).
+    emitted_text: bool = False
 
 
 class CodexSession:
@@ -600,6 +604,7 @@ class CodexRuntime:
             delta = params.get("delta")
             if isinstance(delta, str) and delta:
                 event = TextDeltaEvent(delta)
+                active.emitted_text = True
         elif notification.method in {
             "item/reasoning/textDelta",
             "item/reasoning/summaryTextDelta",
@@ -609,6 +614,22 @@ class CodexRuntime:
                 event = ReasoningDeltaEvent(delta)
         elif notification.method in {"item/started", "item/completed"}:
             event = self._tool_event(notification.method, params)
+            if (
+                event is None
+                and notification.method == "item/completed"
+                and active.emitted_text
+                and self._is_agent_message_item(params)
+            ):
+                # A completed agentMessage marks a boundary between two assistant
+                # messages that Codex does not otherwise carry in the delta stream.
+                # Without it the deltas of consecutive messages fuse ("…다.현재…"),
+                # and the readable renderer cannot restore a paragraph break it never
+                # received. Emit an explicit separator so the "".join downstream (and
+                # the streaming accumulator) keep the boundary. emitted_text gates it
+                # so a separator only follows real text, never leads, and an empty
+                # message cannot double it.
+                event = TextDeltaEvent("\n\n")
+                active.emitted_text = False
         elif notification.method == "turn/completed":
             self._complete_turn(active, params)
             return
@@ -620,6 +641,11 @@ class CodexRuntime:
         active.pending_notifications.clear()
         for notification in pending:
             self._route_notification(notification)
+
+    @staticmethod
+    def _is_agent_message_item(params: Mapping[str, JsonValue]) -> bool:
+        item = params.get("item")
+        return isinstance(item, Mapping) and item.get("type") == "agentMessage"
 
     @staticmethod
     def _tool_event(method: str, params: Mapping[str, JsonValue]) -> AgentEvent | None:
