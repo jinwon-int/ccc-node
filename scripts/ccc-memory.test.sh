@@ -448,6 +448,7 @@ install_claude="$TMP/install-claude"
 install_hermes="$TMP/install-hermes"
 out="$(HOME="$install_home" CCC_CLAUDE_DIR="$install_claude" CCC_HERMES_DIR="$install_hermes" bash "$ROOT/setup.sh" --no-backup >/dev/null 2>&1; echo rc=$?)"
 ok "setup installs memory helper tools beside hooks" 'grep -q "rc=0" <<<"$out" && [ -x "$install_claude/hooks/ccc-memory-index.sh" ] && [ -x "$install_claude/hooks/ccc-memory-search.sh" ] && [ -x "$install_claude/hooks/ccc-memory-query.sh" ] && [ -x "$install_claude/hooks/ccc-memory-explain.sh" ] && [ -x "$install_claude/hooks/ccc-wiki-triage.sh" ] && [ -x "$install_claude/hooks/ccc-memory-benchmark-export.sh" ]'
+ok "setup installs the shared detached-spawn helper" '[ -x "$install_claude/hooks/lib/spawn-detached.sh" ]'
 out="$(CCC_STATE_DIR="$TMP/install-eval-state" bash "$install_claude/hooks/ccc-memory-eval.sh" Honcho 2>&1)"; rc=$?
 ok "installed memory eval finds helper tools beside hooks" '[ "$rc" = 0 ] && jq -e ".ok == true" >/dev/null <<<"$out"'
 
@@ -474,6 +475,20 @@ rm -f "$gr_fifo"; mkfifo "$gr_fifo"
 gr_run
 if read -t 5 _l <>"$gr_fifo"; then gr_default=fired; else gr_default=silent; fi
 ok "load-memory fires the background refresh by default" '[ "$gr_default" = fired ]'
+
+# Simulate a minimal Termux-like PATH that has the commands needed by
+# load-memory but deliberately has no setsid. The shared helper must fall back
+# to a disowned subshell instead of silently losing the refresh.
+no_setsid_bin="$TMP/no-setsid-bin"
+mkdir -p "$no_setsid_bin"
+for cmd in bash cat python3 jq date wc hostname dirname; do
+  ln -s "$(command -v "$cmd")" "$no_setsid_bin/$cmd"
+done
+rm -f "$gr_fifo"; mkfifo "$gr_fifo"
+gr_run PATH="$no_setsid_bin" CCC_LOCAL_MEMORY_ENABLED=0 CCC_HONCHO_MEMORY_ENABLED=0
+if read -t 5 _l <>"$gr_fifo"; then gr_no_setsid=fired; else gr_no_setsid=silent; fi
+ok "load-memory refresh falls back when setsid is unavailable" '[ "$gr_no_setsid" = fired ]'
+
 rm -f "$gr_fifo"; mkfifo "$gr_fifo"
 gr_run CCC_MEMORY_NO_REFRESH=1
 if read -t 2 _l <>"$gr_fifo"; then gr_guarded=fired; else gr_guarded=silent; fi

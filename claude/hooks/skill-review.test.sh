@@ -36,10 +36,16 @@ cat <<'JSON'
 JSON
 SH
 chmod +x "$TMP/bin/claude"
+cat > "$TMP/bin/setsid" <<'SH'
+#!/usr/bin/env bash
+exec "$@"
+SH
+chmod +x "$TMP/bin/setsid"
 PATH="$TMP/bin:$PATH"
 
 out="$(payload sess-1 "$TRANS" "/root/work" | CCC_STATE_DIR="$STATE" CLAUDE_SKILLS_DIR="$SKILLS" CCC_SKILL_REVIEW_COOLDOWN_SECONDS=0 bash "$REVIEW" sessionend 2>&1)"; rc=$?
 ok "skill-review hook exits 0" '[ "$rc" = 0 ]'
+ok "skill-review uses the shared setsid spawn mode" 'grep -q "spawned bg pid=.* mode=setsid" "$STATE/skill-review.log"'
 for _ in $(seq 1 30); do
   find "$STATE/pending-skills" -name SKILL.md 2>/dev/null | grep -q . && [ -f "$STATE/approval-needed.log" ] && grep -q "PENDING_SKILL_REVIEW" "$STATE/approval-needed.log" && break
   sleep 0.1
