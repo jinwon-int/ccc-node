@@ -49,6 +49,21 @@ deny() {
   exit 2
 }
 
+# --- External-node privacy boundary (higher priority than operator escape hatch) ---
+# This is a root/operator-selected placement policy, not a per-command approval gate.
+# It therefore cannot be bypassed with CCC_ALLOW_GATED or command-local env assignments.
+if [ "${CCC_NODE_ISOLATION_PROFILE:-fleet}" = "external" ]; then
+  tool_input="$(printf '%s' "$input" | jq -c '.tool_input // {}' 2>/dev/null)"
+  external_probe="${tool} ${cmd} ${fpath} ${tool_input}"
+  if printf '%s' "$external_probe" | grep -Eiq '(family[ _-]?wiki|가족위키|wiki-agent|[.]wiki-agent|seoyoon-family-wiki|wiki[.]seoyoon-family[.]com|jinwon-int|hooks/cache/wiki[.]txt|wiki-candidates|ccc-wiki-triage|wiki-record|wiki-log|CCC_WIKI_MEMORY_ENABLED|CCC_NODE_ISOLATION_PROFILE)'; then
+    deny "external-family-resource" "placement_policy" "Family Wiki/internal resource access is disabled on this external node"
+  fi
+  case "$tool" in
+    mcp__*wiki*|mcp__*Wiki*)
+      deny "external-family-resource" "placement_policy" "Wiki MCP tools are disabled on this external node" ;;
+  esac
+fi
+
 # --- Operator escape hatch: explicit, audited approval signal ---
 if [ "${CCC_ALLOW_GATED:-0}" = "1" ]; then
   echo "ccc-node guard: CCC_ALLOW_GATED=1 set — gated action allowed by operator (audit: tool=$tool)." >&2

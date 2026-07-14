@@ -29,6 +29,9 @@ ok "memory check json succeeds" '[ "$rc" = 0 ] && jq -e ".wiki.status == \"ok\" 
 out="$(CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CCC_HONCHO_MEMORY_ENABLED=FALSE bash "$ROOT/scripts/ccc-memory-check.sh" --json 2>&1)"; rc=$?
 ok "memory check treats uppercase FALSE as disabled" '[ "$rc" = 0 ] && jq -e ".honcho.status == \"disabled\"" >/dev/null <<<"$out"'
 
+out="$(CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CCC_NODE_ISOLATION_PROFILE=external CCC_WIKI_MEMORY_ENABLED=1 bash "$ROOT/scripts/ccc-memory-check.sh" --json 2>&1)"; rc=$?
+ok "external isolation overrides an explicit Wiki enable in diagnostics" '[ "$rc" = 0 ] && jq -e ".wiki.status == \"disabled\"" >/dev/null <<<"$out"'
+
 out="$(CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CCC_WIKI_MEMORY_ENABLED=FALSE bash "$ROOT/scripts/ccc-memory-check.sh" --json 2>&1)"; rc=$?
 ok "memory check reports Wiki disabled despite a stale cache file" '[ "$rc" = 0 ] && jq -e ".wiki.status == \"disabled\"" >/dev/null <<<"$out"'
 
@@ -58,7 +61,12 @@ PY
 )"
 ok "memory index redacts bearer/key/url secrets" '! grep -q "VALUE_SHOULD_NOT_INDEX_A\|VALUE_SHOULD_NOT_INDEX_B\|VALUE_SHOULD_NOT_INDEX_C" <<<"$db_dump"'
 
-out="$(CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CCC_WIKI_MEMORY_ENABLED=0 bash "$ROOT/scripts/ccc-memory-index.sh" update 2>&1)"; rc=$?
+out="$(CCC_STATE_DIR="$state" CCC_NODE_ISOLATION_PROFILE=external CCC_WIKI_MEMORY_ENABLED=1 bash "$ROOT/scripts/ccc-memory-search.sh" 'hybrid memory profile' 2>&1)"; rc=$?
+ok "external search filters a stale Wiki row before index cleanup" '[ "$rc" = 0 ] && jq -e "[.results[] | select(.path | endswith(\"/wiki.txt\"))] | length == 0" >/dev/null <<<"$out"'
+out="$(CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CCC_MEMORY_TOOLS_DIR="$ROOT/scripts" CCC_NODE_ISOLATION_PROFILE=external CCC_WIKI_MEMORY_ENABLED=1 bash "$ROOT/scripts/ccc-memory-explain.sh" --json --query 'hybrid memory profile' 2>&1)"; rc=$?
+ok "external memory explain reports zero Wiki budget and no stale Wiki result" '[ "$rc" = 0 ] && jq -e ".budgets.wiki == 0 and ([.search.results[] | select(.path | endswith(\"/wiki.txt\"))] | length == 0)" >/dev/null <<<"$out"'
+
+out="$(CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CCC_NODE_ISOLATION_PROFILE=external CCC_WIKI_MEMORY_ENABLED=1 bash "$ROOT/scripts/ccc-memory-index.sh" update 2>&1)"; rc=$?
 indexed_paths="$(python3 - <<PY
 import sqlite3
 con=sqlite3.connect('$state/memory-index.sqlite')
@@ -74,7 +82,7 @@ printf '%s\n' '{"honcho":[{"text":"HONCHO_DISTILL_KEEP"}],"wiki_candidates":[{"s
 printf 'WIKI_QUEUE_DROP\n' > "$state/wiki-candidates.md"
 mkdir -p "$state/distill-history"
 printf '%s\n' '{"honcho":[{"text":"HONCHO_HISTORY_KEEP"}],"wiki_candidates":[{"summary":"WIKI_HISTORY_DROP"}]}' > "$state/distill-history/one.json"
-CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CCC_MEMORY_INDEX_DISTILL=1 CCC_WIKI_MEMORY_ENABLED=0 bash "$ROOT/scripts/ccc-memory-index.sh" rebuild >/dev/null 2>&1
+CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CCC_MEMORY_INDEX_DISTILL=1 CCC_NODE_ISOLATION_PROFILE=external CCC_WIKI_MEMORY_ENABLED=1 bash "$ROOT/scripts/ccc-memory-index.sh" rebuild >/dev/null 2>&1
 distill_dump="$(python3 - <<PY
 import sqlite3
 con=sqlite3.connect('$state/memory-index.sqlite')

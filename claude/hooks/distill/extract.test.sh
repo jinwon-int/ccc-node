@@ -88,13 +88,14 @@ ok "valid JSON is tagged with session metadata" 'jq -e ".session_id == \"sess-te
 ok "valid JSON carries source cwd metadata" 'jq -e ".source_cwd == \"/root/project-a\" and .source_project == \"-root-project-a\"" <<<"$out" >/dev/null'
 ok "transcript input is redacted before claude" '! grep -q "$fake_github_token\|Bearer abcdefghijklmnopqrstuvwxyz123456" "$TMP/input-valid.txt" && grep -q "REDACTED" "$TMP/input-valid.txt"'
 
-export CCC_WIKI_MEMORY_ENABLED=0
+export CCC_NODE_ISOLATION_PROFILE=external
+export CCC_WIKI_MEMORY_ENABLED=1
 export CCC_MEMORY_USER_LABEL='Etter Ahn'
 export CCC_MEMORY_ASSISTANT_LABEL='Karellen'
 run_extract "$TRANSCRIPT" wiki
 ok "wiki-disabled extract deterministically strips model-proposed candidates" '[ "$rc" = 0 ] && jq -e ".wiki_candidates == [] and (.honcho|length)==1" <<<"$out" >/dev/null'
 ok "wiki-disabled extract prompt uses node-local identity and empty-Wiki contract" 'grep -q "USER (Etter Ahn) and ASSISTANT (Karellen)" "$TMP/input-wiki.txt" && grep -q "wiki_candidates as an empty array" "$TMP/input-wiki.txt" && ! grep -q "dungae, a Hermes Team2 worker" "$TMP/input-wiki.txt"'
-unset CCC_WIKI_MEMORY_ENABLED CCC_MEMORY_USER_LABEL CCC_MEMORY_ASSISTANT_LABEL
+unset CCC_NODE_ISOLATION_PROFILE CCC_WIKI_MEMORY_ENABLED CCC_MEMORY_USER_LABEL CCC_MEMORY_ASSISTANT_LABEL
 
 run_extract "$TRANSCRIPT" fenced
 ok "fenced JSON is stripped" '[ "$rc" = 0 ] && jq -e ".honcho == [] and .wiki_candidates == []" <<<"$out" >/dev/null'

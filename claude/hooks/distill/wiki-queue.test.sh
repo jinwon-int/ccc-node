@@ -17,7 +17,7 @@ mkdir -p "$CCC_STATE_DIR"
 PAYLOAD='{"session_id":"sess-wiki","trigger":"manual","source_cwd":"/root/project-a","source_project":"-root-project-a","wiki_candidates":[{"title":"Decision A","suggested_path":"pages/team/dungae/DECISIONS.md","summary":"Keep the safe path.","evidence_excerpt":"operator said safe"},{"title":"Runbook B","suggested_path":"pages/nodes/dungae/RUNBOOK.md","summary":"Do the thing.","evidence_excerpt":"command output"}],"honcho":[]}'
 
 disabled_state="$TMP/disabled-state"
-out="$(printf '%s' "$PAYLOAD" | CCC_STATE_DIR="$disabled_state" CCC_WIKI_MEMORY_ENABLED=0 bash "$WIKI_QUEUE" 2>&1)"; rc=$?
+out="$(printf '%s' "$PAYLOAD" | CCC_STATE_DIR="$disabled_state" CCC_NODE_ISOLATION_PROFILE=external CCC_WIKI_MEMORY_ENABLED=1 bash "$WIKI_QUEUE" 2>&1)"; rc=$?
 ok "wiki-disabled queue exits 0 without creating state or queue" '[ "$rc" = 0 ] && grep -q "skipped reason=disabled" <<<"$out" && [ ! -e "$disabled_state/wiki-candidates.md" ] && [ ! -e "$disabled_state/wiki-candidates.seen" ]'
 
 out="$(printf '%s' "$PAYLOAD" | bash "$WIKI_QUEUE" 2>&1)"; rc=$?

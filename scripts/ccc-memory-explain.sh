@@ -5,6 +5,10 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 STATE_DIR="${CCC_STATE_DIR:-${HOME:-/root}/.claude/state}"
 CACHE="${CCC_MEMORY_CACHE_DIR:-${HOME:-/root}/.claude/hooks/cache}"
 MEMORY_DIR="${CCC_MEMORY_DIR:-${HOME:-/root}/.claude/memories}"
+WIKI_BUDGET="${CCC_WIKI_MAX_BYTES:-5000}"
+case "${CCC_NODE_ISOLATION_PROFILE:-fleet}:${CCC_WIKI_MEMORY_ENABLED:-1}" in
+  external:*|*:0|*:false|*:FALSE|*:off|*:OFF|*:no|*:NO) WIKI_BUDGET=0 ;;
+esac
 OUTPUT="text"
 QUERY=""
 while [ $# -gt 0 ]; do
@@ -46,7 +50,7 @@ jq -n \
   --argjson check "$check_json" \
   --argjson max_total "${CCC_MEMORY_MAX_BYTES:-12000}" \
   --argjson max_mem "${CCC_BUILTIN_MEMORY_MAX_BYTES:-4000}" \
-  --argjson max_wiki "${CCC_WIKI_MAX_BYTES:-5000}" \
+  --argjson max_wiki "$WIKI_BUDGET" \
   --argjson max_honcho "${CCC_HONCHO_MAX_BYTES:-4000}" \
   --argjson max_local "${CCC_LOCAL_MEMORY_MAX_BYTES:-3000}" \
   '{ok:true, query:$query, retrievalMode:$retrieval, paths:{state_dir:$state_dir,cache_dir:$cache_dir,memory_dir:$memory_dir}, budgets:{total:$max_total,built_in:$max_mem,wiki:$max_wiki,honcho:$max_honcho,local_hot:$max_local}, cache:$check, search:$search, safety:{read_only:true, no_network:true, raw_secret_output:false, retrieved_context_is_untrusted:true}}' \

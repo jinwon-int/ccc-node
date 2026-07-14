@@ -10,13 +10,14 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 GUARD="$HERE/guard.sh"
 pass=0; fail=0
 
-# run <expected:allow|deny> <tool> <field:command|file_path> <value> [env]
+# run <expected:allow|deny> <tool> <field:command|file_path|url|query> <value> [space-separated env assignments]
 run() {
   local expect="$1" tool="$2" field="$3" val="$4" envset="${5:-}"
   local payload rc
   payload="$(jq -nc --arg t "$tool" --arg f "$field" --arg v "$val" '{tool_name:$t, tool_input:{($f):$v}}')"
   if [ -n "$envset" ]; then
-    rc=0; env "$envset" bash "$GUARD" <<<"$payload" >/dev/null 2>&1 || rc=$?
+    local envparts=(); read -ra envparts <<<"$envset"
+    rc=0; env "${envparts[@]}" bash "$GUARD" <<<"$payload" >/dev/null 2>&1 || rc=$?
   else
     rc=0; bash "$GUARD" <<<"$payload" >/dev/null 2>&1 || rc=$?
   fi
@@ -259,6 +260,20 @@ run allow Bash command 'cat /root/.claude/self-update.services'
 # ...and direct fleet service control remains gated.
 run deny Bash command 'systemctl restart hermes-broker'
 run deny Bash command 'systemctl stop a2a-gateway'
+
+# ---- external-node Family Wiki/internal-resource boundary ----
+run deny  Bash command 'wiki-agent prefetch task' 'CCC_NODE_ISOLATION_PROFILE=external'
+run deny  Bash command 'CCC_WIKI_MEMORY_ENABLED=1 bash ~/.claude/hooks/refresh-memory.sh' 'CCC_NODE_ISOLATION_PROFILE=external'
+run deny  Bash command 'gh api repos/jinwon-int/seoyoon-family-wiki' 'CCC_NODE_ISOLATION_PROFILE=external'
+run deny  Read file_path '/root/.claude/hooks/cache/wiki.txt' 'CCC_NODE_ISOLATION_PROFILE=external'
+run deny  WebFetch url 'https://wiki.seoyoon-family.com/private' 'CCC_NODE_ISOLATION_PROFILE=external'
+run deny  WebSearch query 'Seoyoon Family Wiki node facts' 'CCC_NODE_ISOLATION_PROFILE=external'
+run deny  Skill skill 'wiki-record' 'CCC_NODE_ISOLATION_PROFILE=external'
+run deny  mcp__family_wiki__wiki_find query 'anything' 'CCC_NODE_ISOLATION_PROFILE=external'
+run deny  Bash command 'wiki-agent load pages/nodes/x.md' 'CCC_NODE_ISOLATION_PROFILE=external CCC_ALLOW_GATED=1'
+run allow Bash command 'curl -fsS https://example.com' 'CCC_NODE_ISOLATION_PROFILE=external'
+run allow Read file_path '/root/karellen-workspace/README.md' 'CCC_NODE_ISOLATION_PROFILE=external'
+run allow WebFetch url 'https://example.com/docs' 'CCC_NODE_ISOLATION_PROFILE=external'
 
 # ---- escape hatch: gated allowed only with operator signal ----
 run allow Bash command 'git push --force origin main' 'CCC_ALLOW_GATED=1'

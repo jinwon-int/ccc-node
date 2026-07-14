@@ -66,6 +66,7 @@ setup.sh                   Idempotent bootstrap; refuses to overwrite real node 
 | `CCC_STATE_DIR` | `$CCC_CLAUDE_DIR/state` | Local node state and memory index |
 | `CCC_MEMORY_PROFILE` | `honcho` | Memory profile: `honcho`, `hybrid`, or `max-perf` |
 | `CCC_MEMORY_CACHE_DIR` | `$CCC_CLAUDE_DIR/hooks/cache` | Wiki/Honcho cache metadata |
+| `CCC_NODE_ISOLATION_PROFILE` | `fleet` | Set `external` for a non-bypassable external-node Family-resource guard |
 | `CCC_WIKI_MEMORY_ENABLED` | `1` | Set `0` to disable Wiki injection, refresh, indexing, and distill queue writes |
 | `CCC_MEMORY_USER_LABEL` / `CCC_MEMORY_ASSISTANT_LABEL` | fleet-compatible labels | Node-local relationship labels for injection/distill |
 

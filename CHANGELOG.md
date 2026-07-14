@@ -6,7 +6,9 @@ All notable changes to the Claude Code node harness. Dates are KST.
 
 ### Added
 - Fail-closed external-node memory isolation (#466):
-  `CCC_WIKI_MEMORY_ENABLED=0` disables Family Wiki injection, refresh, local
+  `CCC_NODE_ISOLATION_PROFILE=external` provides a higher-priority bridge-to-hook
+  placement policy and PreToolUse Family-resource guard; `CCC_WIKI_MEMORY_ENABLED=0`
+  disables Family Wiki injection, refresh, local
   indexing (including stale distill artifacts), extraction candidates, and queue
   writes while preserving built-in/local/Honcho/resume memory. Node-local
   `CCC_MEMORY_USER_LABEL` / `CCC_MEMORY_ASSISTANT_LABEL` replace hard-coded

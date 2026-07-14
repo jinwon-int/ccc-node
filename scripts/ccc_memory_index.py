@@ -108,6 +108,8 @@ index_distill_enabled = index_distill.lower() in {"1", "true", "yes", "on"}
 wiki_enabled = os.environ.get("CCC_WIKI_MEMORY_ENABLED", "1").lower() not in {
     "0", "false", "off", "no"
 }
+if os.environ.get("CCC_NODE_ISOLATION_PROFILE", "fleet").lower() == "external":
+    wiki_enabled = False
 disable_fts5 = os.environ.get("CCC_MEMORY_DISABLE_FTS5", "").lower() in {"1", "true", "yes", "on"}
 fts5_enabled = False
 

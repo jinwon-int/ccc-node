@@ -24,6 +24,8 @@ MAX_LOCAL="${CCC_LOCAL_MEMORY_MAX_BYTES:-3000}"
 MAX_RESUME="${CCC_RESUME_MAX_BYTES:-2000}"
 HONCHO_ENABLED="${CCC_HONCHO_MEMORY_ENABLED:-1}"
 WIKI_ENABLED="${CCC_WIKI_MEMORY_ENABLED:-1}"
+ISOLATION_PROFILE="${CCC_NODE_ISOLATION_PROFILE:-fleet}"
+[ "$ISOLATION_PROFILE" = "external" ] && WIKI_ENABLED=0
 USER_LABEL="${CCC_MEMORY_USER_LABEL:-Seo Jin On}"
 # Local hot-memory search is ON by default for every profile now that the
 # default retrieval reranks with durability/source/recency boosts; set

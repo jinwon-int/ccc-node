@@ -105,6 +105,39 @@ class Config(BaseSettings):
         alias="CCC_AGENT_PROVIDER",
         description="Agent provider used by ProjectChat.",
     )
+    node_isolation_profile: Literal["fleet", "external"] = Field(
+        default="fleet",
+        alias="CCC_NODE_ISOLATION_PROFILE",
+        description="Root policy inherited by Claude memory hooks.",
+    )
+    wiki_memory_enabled: bool = Field(
+        default=True,
+        alias="CCC_WIKI_MEMORY_ENABLED",
+        description="Family Wiki memory source/sink toggle; external profile always overrides off.",
+    )
+    memory_user_label: str = Field(
+        default="Seo Jin On / 서진원",
+        alias="CCC_MEMORY_USER_LABEL",
+        description="Prompt-only user identity label for memory injection/distill.",
+    )
+    memory_assistant_label: str = Field(
+        default="dungae, a Hermes Team2 worker",
+        alias="CCC_MEMORY_ASSISTANT_LABEL",
+        description="Prompt-only assistant identity label for memory distill.",
+    )
+
+    def hook_policy_environment(self) -> dict[str, str]:
+        """Return validated, non-secret policy fields inherited by Claude hooks."""
+        profile = self.node_isolation_profile
+        return {
+            "CCC_NODE_ISOLATION_PROFILE": profile,
+            "CCC_WIKI_MEMORY_ENABLED": (
+                "0" if profile == "external" else ("1" if self.wiki_memory_enabled else "0")
+            ),
+            "CCC_MEMORY_USER_LABEL": self.memory_user_label,
+            "CCC_MEMORY_ASSISTANT_LABEL": self.memory_assistant_label,
+        }
+
     codex_cli_path: str = Field(
         default="codex",
         alias="CCC_CODEX_CLI_PATH",
@@ -137,6 +170,14 @@ class Config(BaseSettings):
                 "Set it in the project .env or bot source .env file."
             )
         return v.strip()
+
+    @field_validator("memory_user_label", "memory_assistant_label", mode="before")
+    @classmethod
+    def validate_memory_label(cls, v):
+        value = " ".join(str(v).split())[:80]
+        if not value:
+            raise ValueError("memory identity labels must be non-empty")
+        return value
 
     @field_validator("codex_cli_path", mode="before")
     @classmethod

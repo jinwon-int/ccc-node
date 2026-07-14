@@ -35,6 +35,9 @@ if limit <= 0:
     limit = 5
 con=sqlite3.connect(path)
 con.row_factory=sqlite3.Row
+wiki_enabled = os.environ.get("CCC_WIKI_MEMORY_ENABLED", "1").lower() not in {"0", "false", "off", "no"}
+if os.environ.get("CCC_NODE_ISOLATION_PROFILE", "fleet").lower() == "external":
+    wiki_enabled = False
 
 # Optional semantic lane (operator-configured embedding provider; see the index
 # tool). Doc vectors are precomputed in memory_vectors during refresh; here we
@@ -202,6 +205,11 @@ def rerank(cands):
     # (term frequency is deliberately ignored) so a keyword-stuffed volatile or
     # review:rejected doc can no longer outrank a durable memory fact. A small
     # normalized bm25 term only breaks ties between equal-coverage candidates.
+    if not wiki_enabled:
+        cands = [
+            c for c in cands
+            if Path(str(c.get("path") or "")).name not in {"wiki.txt", "wiki-candidates.md"}
+        ]
     if not cands:
         return []
     bms=[-(c["bm25"]) for c in cands if c.get("bm25") is not None]
@@ -472,6 +480,14 @@ else:
     else:
         mode = "fts-rerank"
         rows = lexical[:limit]
+
+# Enforce the source boundary after every retrieval lane has fused. Individual
+# lexical/fuzzy/embedding lanes may have read a stale pre-disable DB row.
+if not wiki_enabled:
+    rows = [
+        row for row in rows
+        if Path(str(row.get("path") or "")).name not in {"wiki.txt", "wiki-candidates.md"}
+    ]
 
 # Feedback: record the surfaced docs (only when the caller opted in), then drop
 # the internal content-hash before emitting results.

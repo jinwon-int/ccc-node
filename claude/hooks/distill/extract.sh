@@ -21,6 +21,7 @@ TIMEOUT="${CLAUDE_DISTILL_TIMEOUT:-90}"
 SOURCE_CWD="${CLAUDE_DISTILL_SOURCE_CWD:-}"
 SOURCE_PROJECT="${CLAUDE_DISTILL_SOURCE_PROJECT:-}"
 WIKI_ENABLED="${CCC_WIKI_MEMORY_ENABLED:-1}"
+[ "${CCC_NODE_ISOLATION_PROFILE:-fleet}" = "external" ] && WIKI_ENABLED=0
 USER_LABEL="$(printf '%s' "${CCC_MEMORY_USER_LABEL:-Seo Jin On / 서진원}" | tr '\r\n' '  ' | cut -c1-80)"
 ASSISTANT_LABEL="$(printf '%s' "${CCC_MEMORY_ASSISTANT_LABEL:-dungae, a Hermes Team2 worker}" | tr '\r\n' '  ' | cut -c1-80)"
 

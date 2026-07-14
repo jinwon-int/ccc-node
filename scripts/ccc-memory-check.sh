@@ -51,6 +51,9 @@ index_db="$STATE_DIR/memory-index.sqlite"
 
 honcho_enabled="${CCC_HONCHO_MEMORY_ENABLED:-1}"
 wiki_enabled="${CCC_WIKI_MEMORY_ENABLED:-1}"
+if [ "${CCC_NODE_ISOLATION_PROFILE:-fleet}" = "external" ]; then
+  wiki_enabled=0
+fi
 honcho_base="(missing)"
 if [ -f "$HONCHO_CFG" ]; then
   # Mirror refresh-memory.sh: the config may use the nested `.hosts.hermes.*`

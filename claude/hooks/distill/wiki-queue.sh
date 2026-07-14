@@ -20,8 +20,8 @@
 #     refreshes .seen so the surviving topics stay suppressed.
 set -uo pipefail
 
-case "${CCC_WIKI_MEMORY_ENABLED:-1}" in
-  0|false|FALSE|off|OFF|no|NO)
+case "${CCC_NODE_ISOLATION_PROFILE:-fleet}:${CCC_WIKI_MEMORY_ENABLED:-1}" in
+  external:*|*:0|*:false|*:FALSE|*:off|*:OFF|*:no|*:NO)
     printf 'wiki-queue skipped reason=disabled\n'
     exit 0
     ;;
