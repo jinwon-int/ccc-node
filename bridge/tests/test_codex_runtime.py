@@ -6,6 +6,8 @@ import asyncio
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import suppress
 from datetime import datetime, timezone
+from pathlib import Path
+import tempfile
 from typing import TYPE_CHECKING, Any, cast
 import unittest
 
@@ -25,7 +27,7 @@ if TYPE_CHECKING:
         ToolStartedEvent,
     )
     from core.codex_app_server import CodexNotification, CodexServerRequest
-    from core.codex_runtime import CodexRuntime
+    from core.codex_runtime import CodexRuntime, _run_codex_memory_bootstrap
 else:
     from telegram_bot.core.agent_runtime import (
         AgentEvent,
@@ -42,7 +44,7 @@ else:
         ToolStartedEvent,
     )
     from telegram_bot.core.codex_app_server import CodexNotification, CodexServerRequest
-    from telegram_bot.core.codex_runtime import CodexRuntime
+    from telegram_bot.core.codex_runtime import CodexRuntime, _run_codex_memory_bootstrap
 
 
 async def next_event(stream: AsyncIterator[AgentEvent]) -> AgentEvent:
@@ -240,6 +242,78 @@ class CodexRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 ModelInfo("codex-b", "Codex B"),
             ),
         )
+
+    async def test_memory_bootstrap_runs_before_each_thread_boundary(self) -> None:
+        clients: list[FakeClient] = []
+
+        def factory(handler):
+            client = FakeClient(handler)
+            clients.append(client)
+            return client
+
+        observations: list[tuple[int, int, int]] = []
+
+        async def bootstrap() -> None:
+            client = clients[0]
+            observations.append(
+                (
+                    client.start_calls,
+                    len(client.thread_start_calls),
+                    len(client.thread_resume_calls),
+                )
+            )
+
+        runtime = CodexRuntime(client_factory=factory, memory_bootstrap=bootstrap)
+        try:
+            await runtime.start_or_resume(SessionRequest(working_directory="/new"))
+            await runtime.start_or_resume(
+                SessionRequest(working_directory="/resume", session_id="thread-old")
+            )
+        finally:
+            await runtime.close()
+        self.assertEqual(observations, [(0, 0, 0), (1, 1, 0)])
+        self.assertEqual(clients[0].start_calls, 1)
+
+    async def test_memory_bootstrap_failure_prevents_memoryless_thread_start(self) -> None:
+        clients: list[FakeClient] = []
+
+        def factory(handler):
+            client = FakeClient(handler)
+            clients.append(client)
+            return client
+
+        async def bootstrap() -> None:
+            raise RuntimeError("codex memory bootstrap unavailable")
+
+        runtime = CodexRuntime(client_factory=factory, memory_bootstrap=bootstrap)
+        try:
+            with self.assertRaisesRegex(RuntimeError, "memory bootstrap unavailable"):
+                await runtime.start_or_resume(SessionRequest(working_directory="/blocked"))
+        finally:
+            await runtime.close()
+        self.assertEqual(clients[0].start_calls, 0)
+        self.assertEqual(clients[0].thread_start_calls, [])
+
+    async def test_subprocess_bootstrap_accepts_last_ready_and_rejects_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ready = root / "ready-materializer"
+            ready.write_text(
+                "#!/usr/bin/env bash\n"
+                'case "${1:-}" in materialize) exit 9;; status) exit 0;; *) exit 64;; esac\n',
+                encoding="utf-8",
+            )
+            ready.chmod(0o700)
+            await _run_codex_memory_bootstrap(str(ready), timeout_seconds=1.0)
+
+            missing = root / "missing-materializer"
+            missing.write_text(
+                "#!/usr/bin/env bash\nexit 9\n",
+                encoding="utf-8",
+            )
+            missing.chmod(0o700)
+            with self.assertRaisesRegex(RuntimeError, "memory bootstrap unavailable"):
+                await _run_codex_memory_bootstrap(str(missing), timeout_seconds=1.0)
 
     async def test_start_rejects_a_malformed_thread_identifier(self) -> None:
         self.clients[0].thread_start_result = {"thread": {"id": ""}}

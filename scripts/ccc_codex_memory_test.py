@@ -86,6 +86,62 @@ class CodexMemoryMaterializerTest(unittest.TestCase):
         self.assertEqual(meta["snapshot_sha256"], result.snapshot_sha256)
         self.assertNotIn("active_path", meta)
 
+    def test_status_is_body_free_and_detects_missing_or_tampered_snapshot(self) -> None:
+        options = self.options()
+        missing = self.module.snapshot_status(options)
+        self.assertEqual(missing.status, "missing")
+        self.assertFalse(missing.is_ready)
+
+        self.module.materialize_snapshot("STATUS_SECRET_SENTINEL", options)
+        ready = self.module.snapshot_status(options)
+        self.assertEqual(ready.status, "ready")
+        self.assertTrue(ready.is_ready)
+        self.assertEqual(ready.metadata_status, "ok")
+        payload = json.dumps(ready.body_free_json(), sort_keys=True)
+        self.assertNotIn("STATUS_SECRET_SENTINEL", payload)
+        self.assertEqual(len(ready.snapshot_sha256 or ""), 64)
+
+        agents = self.codex_home / "AGENTS.md"
+        agents.write_text(
+            agents.read_text(encoding="utf-8").replace(
+                "STATUS_SECRET_SENTINEL", "TAMPERED_SECRET_SENTINEL"
+            ),
+            encoding="utf-8",
+        )
+        tampered = self.module.snapshot_status(options)
+        self.assertEqual(tampered.status, "unsafe")
+        self.assertFalse(tampered.is_ready)
+        self.assertNotIn("TAMPERED_SECRET_SENTINEL", json.dumps(tampered.body_free_json()))
+
+    def test_cli_status_exit_code_and_json_are_body_free(self) -> None:
+        env = {
+            **os.environ,
+            "HOME": str(self.home),
+            "CODEX_HOME": str(self.codex_home),
+        }
+        missing = subprocess.run(
+            [sys.executable, str(MODULE_PATH), "status", "--json"],
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        self.assertNotEqual(missing.returncode, 0)
+        self.assertEqual(json.loads(missing.stdout)["status"], "missing")
+        self.module.materialize_snapshot("CLI_STATUS_SECRET", self.options())
+        ready = subprocess.run(
+            [sys.executable, str(MODULE_PATH), "status", "--json"],
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        self.assertEqual(ready.returncode, 0)
+        self.assertEqual(json.loads(ready.stdout)["status"], "ready")
+        self.assertNotIn("CLI_STATUS_SECRET", ready.stdout + ready.stderr)
+
     def test_preserves_user_bytes_and_replaces_exactly_one_block(self) -> None:
         self.codex_home.mkdir(mode=0o700)
         target = self.codex_home / "AGENTS.md"

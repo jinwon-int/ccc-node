@@ -64,7 +64,11 @@ def build_context(
     if settings.agent_provider == "codex" and agent_runtime is None:
         from telegram_bot.core.codex_runtime import CodexRuntime
 
-        agent_runtime = CodexRuntime(cli_path=settings.codex_cli_path)
+        agent_runtime = CodexRuntime(
+            cli_path=settings.codex_cli_path,
+            memory_materializer_path=settings.codex_memory_materializer_path,
+            memory_bootstrap_timeout_seconds=(settings.codex_memory_bootstrap_timeout_seconds),
+        )
     telegram_port = telegram_port or Application.builder
     clock = clock or time
     bind_logs_dir(settings.logs_dir)

@@ -31,7 +31,13 @@ Configuration:
 - `CCC_CODEX_LOADER_TIMEOUT_SEC` — `load-memory.sh` deadline (default/hard max 14 seconds).
 - `CCC_CODEX_MEMORY_LOADER` — explicit trusted loader path when the installed/repository loader cannot be discovered.
 
-`--json` emits only status, hashes, byte counts, active kind, and durability state; it never emits memory bodies. Launcher, Telegram runtime, setup, and doctor wiring are tracked as the next #419 slice.
+`materialize --json` and `status --json` emit only status, hashes, byte counts, active kind, and durability/metadata state; they never emit memory bodies. `setup.sh` installs the materializer and `scripts/ccc-codex` beside `load-memory.sh` under `${CCC_CLAUDE_DIR:-$HOME/.claude}/hooks`.
+
+The launcher runs `materialize` before the real Codex CLI and finishes with `exec`, preserving argv, cwd, stdio, exit status, and signals. A refresh error may use a structurally valid private last snapshot; if `status` is not ready, launch fails closed with exit 78. Configure the underlying binary with `CCC_CODEX_REAL_CLI_PATH` (default `codex`), while `CCC_CODEX_CLI_PATH` points to the installed `ccc-codex` wrapper.
+
+The Telegram Codex runtime invokes the same materializer before every `thread/start` or `thread/resume`. A running resumed thread keeps its already-loaded instructions; a fresh root or cold resume reads the current global snapshot according to Codex behavior. The runtime does not inject `developerInstructions`. `CCC_CODEX_MEMORY_MATERIALIZER_PATH` and `CCC_CODEX_MEMORY_BOOTSTRAP_TIMEOUT_SEC` control this boundary. `ccc-memory-check.sh --json` exposes the body-free result under `.codex`.
+
+There is no Codex user-session A2A launch path in current ccc-node main. The #478 Codex distill backend is an isolated extraction boundary that intentionally ignores user config/rules and is therefore **not** routed through `ccc-codex`. Any future A2A worker that starts a user-facing Codex session must use the same wrapper/materializer contract.
 
 ## Operating rules
 

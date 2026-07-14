@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Callable, Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import hashlib
+import logging
+import math
+import os
+import signal
 from typing import Literal, Protocol, cast
 
 from .agent_runtime import (
@@ -43,6 +47,74 @@ from telegram_bot.memory.distill_types import (
     TranscriptBounds,
     TranscriptMessage,
 )
+
+
+logger = logging.getLogger(__name__)
+_MEMORY_BOOTSTRAP_MAX_OUTPUT = 16384
+MemoryBootstrap = Callable[[], Awaitable[None]]
+
+
+async def _stop_bootstrap_process(process: asyncio.subprocess.Process) -> None:
+    if process.returncode is not None:
+        return
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except OSError:
+        try:
+            process.terminate()
+        except ProcessLookupError:
+            pass
+    try:
+        await asyncio.wait_for(process.wait(), timeout=0.25)
+        return
+    except TimeoutError:
+        pass
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except OSError:
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+    try:
+        await asyncio.wait_for(process.wait(), timeout=1.0)
+    except TimeoutError:
+        pass
+
+
+async def _run_materializer_command(path: str, command: str, timeout_seconds: float) -> bool:
+    try:
+        process = await asyncio.create_subprocess_exec(
+            path,
+            command,
+            "--json",
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except OSError:
+        return False
+    try:
+        stdout, _stderr = await asyncio.wait_for(process.communicate(), timeout=timeout_seconds)
+    except asyncio.CancelledError:
+        await _stop_bootstrap_process(process)
+        raise
+    except TimeoutError:
+        await _stop_bootstrap_process(process)
+        return False
+    return process.returncode == 0 and len(stdout) <= _MEMORY_BOOTSTRAP_MAX_OUTPUT
+
+
+async def _run_codex_memory_bootstrap(path: str, *, timeout_seconds: float) -> None:
+    if not path.strip() or not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+        raise RuntimeError("codex memory bootstrap unavailable")
+    if await _run_materializer_command(path, "materialize", timeout_seconds):
+        return
+    if await _run_materializer_command(path, "status", timeout_seconds):
+        logger.warning("Codex memory refresh failed; using the last valid snapshot")
+        return
+    raise RuntimeError("codex memory bootstrap unavailable")
 
 
 class AppServerClient(Protocol):
@@ -192,9 +264,31 @@ class CodexRuntime:
         *,
         cli_path: str = "codex",
         client_factory: ClientFactory | None = None,
+        memory_materializer_path: str | None = None,
+        memory_bootstrap_timeout_seconds: float = 14.0,
+        memory_bootstrap: MemoryBootstrap | None = None,
     ) -> None:
         if not cli_path.strip():
             raise ValueError("Codex CLI path must not be empty")
+        if memory_bootstrap is not None and memory_materializer_path is not None:
+            raise ValueError("configure either memory_bootstrap or memory_materializer_path")
+        if memory_materializer_path is not None:
+            path = memory_materializer_path.strip()
+            if not path:
+                raise ValueError("Codex memory materializer path must not be empty")
+            if (
+                not math.isfinite(memory_bootstrap_timeout_seconds)
+                or memory_bootstrap_timeout_seconds <= 0
+            ):
+                raise ValueError("Codex memory bootstrap timeout must be positive")
+
+            async def configured_bootstrap() -> None:
+                await _run_codex_memory_bootstrap(
+                    path,
+                    timeout_seconds=memory_bootstrap_timeout_seconds,
+                )
+
+            memory_bootstrap = configured_bootstrap
         factory = client_factory or (
             lambda handler: CodexAppServerClient(
                 executable=cli_path,
@@ -202,12 +296,20 @@ class CodexRuntime:
             )
         )
         self._client = factory(self._handle_server_request)
+        self._memory_bootstrap = memory_bootstrap
+        self._memory_bootstrap_lock = asyncio.Lock()
         self._start_lock = asyncio.Lock()
         self._started = False
         self._dispatcher_task: asyncio.Task[None] | None = None
         self._active_turns: dict[str, _ActiveTurn] = {}
         self._thread_locks: dict[str, asyncio.Lock] = {}
         self._closed = False
+
+    async def _bootstrap_memory(self) -> None:
+        if self._memory_bootstrap is None:
+            return
+        async with self._memory_bootstrap_lock:
+            await self._memory_bootstrap()
 
     async def _ensure_started(self) -> None:
         async with self._start_lock:
@@ -220,6 +322,7 @@ class CodexRuntime:
             self._started = True
 
     async def start_or_resume(self, request: SessionRequest) -> CodexSession:
+        await self._bootstrap_memory()
         await self._ensure_started()
         if request.session_id is None:
             result = await self._client.thread_start(
