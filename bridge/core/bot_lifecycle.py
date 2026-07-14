@@ -446,7 +446,9 @@ class BotLifecycleMixin:
 
                 logger.info("Bot is running")
                 health_reporter.record_telegram_ok()
-                claude_ready, claude_reason = self._probe_claude_readiness()
+                claude_ready, claude_reason = await asyncio.to_thread(
+                    self._probe_claude_readiness
+                )
                 if claude_ready:
                     health_reporter.record_claude_ok()
                 else:
