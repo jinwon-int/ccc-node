@@ -59,47 +59,15 @@ HERMES_ROOT="${CCC_HERMES_DIR:-$HOME/.hermes}"
 HERMES_DIR="$HERMES_ROOT/memories"      # legacy memory location (fallback only)
 WIKI_AGENT_BIN="${CCC_WIKI_AGENT_BIN:-$HOME/.wiki-agent/bin/wiki-agent}"
 BRIDGE_DEFAULT_PATH="${CCC_BRIDGE_DEFAULT_PATH:-$HOME}"
+HARNESS_PATHS_LIB="$SRC/scripts/lib/harness-paths.sh"
+if [ ! -r "$HARNESS_PATHS_LIB" ]; then
+  echo "ERROR: shared harness path library is missing: $HARNESS_PATHS_LIB" >&2
+  exit 2
+fi
+# shellcheck source=/dev/null
+. "$HARNESS_PATHS_LIB"
 
-validate_install_roots() {
-  command -v python3 >/dev/null 2>&1 || {
-    echo "ERROR: python3 is required to validate install paths" >&2
-    return 1
-  }
-  python3 - "$CLAUDE_DIR" "$HERMES_ROOT" <<'PY'
-import os
-import pathlib
-import stat
-import sys
-
-labels = ("CCC_CLAUDE_DIR", "CCC_HERMES_DIR")
-normalized = []
-for label, raw in zip(labels, sys.argv[1:]):
-    if not raw or not os.path.isabs(raw):
-        print(f"ERROR: {label} must be a non-empty absolute path", file=sys.stderr)
-        raise SystemExit(1)
-    path = os.path.normpath(os.path.join(os.path.sep, os.path.relpath(raw, os.path.sep)))
-    if path == os.path.sep:
-        print(f"ERROR: refusing filesystem-root install path for {label}", file=sys.stderr)
-        raise SystemExit(1)
-    current = pathlib.Path(os.path.sep)
-    for part in pathlib.PurePath(path).parts[1:]:
-        current /= part
-        try:
-            mode = current.lstat().st_mode
-        except FileNotFoundError:
-            continue
-        if stat.S_ISLNK(mode):
-            print(f"ERROR: install path contains symlink component: {current}", file=sys.stderr)
-            raise SystemExit(1)
-    normalized.append(path)
-
-claude, hermes = normalized
-if claude == hermes or claude.startswith(hermes + os.sep) or hermes.startswith(claude + os.sep):
-    print("ERROR: Claude and Hermes install roots must not overlap", file=sys.stderr)
-    raise SystemExit(1)
-PY
-}
-validate_install_roots || exit 2
+ccc_validate_setup_roots "$CLAUDE_DIR" "$HERMES_ROOT" || exit 2
 
 render_command() {
   printf '[dry-run]'
@@ -119,45 +87,7 @@ note() { printf '  - %s\n' "$*"; }
 # durable restore point; this private snapshot exists only long enough to undo
 # a failed install. Exact managed paths are archived so credentials, projects,
 # transcripts, state, and other node-local data never enter the snapshot.
-CLAUDE_MANAGED=(
-  settings.json settings.local.json hooks output-styles headless.sh
-  agents commands skills CLAUDE.md memories
-)
-
-validate_managed_artifacts() {
-  python3 - "$CLAUDE_DIR" "$HERMES_ROOT" "${CLAUDE_MANAGED[@]}" <<'PY'
-import pathlib
-import stat
-import sys
-
-claude = pathlib.Path(sys.argv[1])
-hermes = pathlib.Path(sys.argv[2])
-for item in sys.argv[3:]:
-    root = claude / item
-    candidates = [root]
-    if root.is_dir() and not root.is_symlink():
-        candidates.extend(root.rglob("*"))
-    for candidate in candidates:
-        if candidate.is_symlink():
-            print(f"ERROR: refusing managed artifact symlink: {candidate}", file=sys.stderr)
-            raise SystemExit(1)
-        try:
-            mode = candidate.lstat().st_mode
-        except FileNotFoundError:
-            continue
-        if stat.S_ISREG(mode) and candidate.stat().st_nlink != 1:
-            print(f"ERROR: refusing managed artifact hardlink: {candidate}", file=sys.stderr)
-            raise SystemExit(1)
-honcho = hermes / "honcho.json"
-if honcho.is_symlink():
-    print(f"ERROR: refusing managed artifact symlink: {honcho}", file=sys.stderr)
-    raise SystemExit(1)
-if honcho.exists() and honcho.is_file() and honcho.stat().st_nlink != 1:
-    print(f"ERROR: refusing managed artifact hardlink: {honcho}", file=sys.stderr)
-    raise SystemExit(1)
-PY
-}
-validate_managed_artifacts || exit 2
+ccc_validate_managed_artifacts "ERROR:" "$CLAUDE_DIR" "$HERMES_ROOT" "${CCC_MANAGED_PATHS[@]}" || exit 2
 SETUP_TXN_DIR=""
 SETUP_TXN_ACTIVE=0
 
@@ -180,7 +110,7 @@ begin_install_transaction() {
   parent="$(dirname "$CLAUDE_DIR")"
   mkdir -p "$parent"
   SETUP_TXN_DIR="$(mktemp -d "$parent/.ccc-node-setup-rollback.XXXXXX")"
-  snapshot_paths "$CLAUDE_DIR" "$SETUP_TXN_DIR/claude.tar.gz" "${CLAUDE_MANAGED[@]}"
+  snapshot_paths "$CLAUDE_DIR" "$SETUP_TXN_DIR/claude.tar.gz" "${CCC_MANAGED_PATHS[@]}"
   if [ -e "$HERMES_ROOT/honcho.json" ] || [ -L "$HERMES_ROOT/honcho.json" ]; then
     tar -czf "$SETUP_TXN_DIR/hermes.tar.gz" -C "$HERMES_ROOT" honcho.json
   else
@@ -194,7 +124,7 @@ begin_install_transaction() {
 rollback_install_transaction() {
   local item failed=0
   trap - EXIT
-  for item in "${CLAUDE_MANAGED[@]}"; do rm -rf -- "$CLAUDE_DIR/$item" || failed=1; done
+  for item in "${CCC_MANAGED_PATHS[@]}"; do rm -rf -- "$CLAUDE_DIR/$item" || failed=1; done
   mkdir -p "$CLAUDE_DIR" "$HERMES_ROOT" || failed=1
   tar -xzf "$SETUP_TXN_DIR/claude.tar.gz" -C "$CLAUDE_DIR" || failed=1
   rm -f -- "$HERMES_ROOT/honcho.json" || failed=1
@@ -293,6 +223,8 @@ else
 fi
 run cp "$SRC/claude/settings.local.json" "$CLAUDE_DIR/settings.local.json"
 run cp "$SRC/claude/hooks/lib/spawn-detached.sh" "$CLAUDE_DIR/hooks/lib/spawn-detached.sh"
+run cp "$SRC/scripts/lib/harness-paths.sh" "$CLAUDE_DIR/hooks/lib/harness-paths.sh"
+run cp "$SRC/scripts/lib/harness_paths.py" "$CLAUDE_DIR/hooks/lib/harness_paths.py"
 run cp "$SRC/claude/hooks/load-memory.sh" "$CLAUDE_DIR/hooks/load-memory.sh"
 run cp "$SRC/claude/hooks/refresh-memory.sh" "$CLAUDE_DIR/hooks/refresh-memory.sh"
 run cp "$SRC/claude/hooks/scan-injection.sh" "$CLAUDE_DIR/hooks/scan-injection.sh"
@@ -338,6 +270,8 @@ run cp "$SRC/scripts/ccc-skill-autosave.sh" "$CLAUDE_DIR/hooks/ccc-skill-autosav
 run cp "$SRC/scripts/ccc-self-update.sh" "$CLAUDE_DIR/hooks/ccc-self-update.sh"
 installed_hook_scripts=(
   "$CLAUDE_DIR/hooks/lib/spawn-detached.sh"
+  "$CLAUDE_DIR/hooks/lib/harness-paths.sh"
+  "$CLAUDE_DIR/hooks/lib/harness_paths.py"
   "$CLAUDE_DIR/hooks/load-memory.sh"
   "$CLAUDE_DIR/hooks/refresh-memory.sh"
   "$CLAUDE_DIR/hooks/scan-injection.sh"
