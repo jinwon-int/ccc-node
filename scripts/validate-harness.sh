@@ -126,7 +126,8 @@ SC_SCOPE=(claude/hooks/guard.sh claude/hooks/audit.sh claude/hooks/redact.sh \
           claude/hooks/notify.sh claude/hooks/statusline.sh claude/headless.sh \
           claude/hooks/guard.test.sh scripts/ccc-service-control.sh \
           scripts/ccc-service-control.test.sh \
-          claude/hooks/observability.test.sh scripts/validate-harness.sh)
+          claude/hooks/observability.test.sh scripts/validate-harness.sh \
+          scripts/bridge-watchdog.sh scripts/bridge-watchdog.test.sh)
 if command -v shellcheck >/dev/null 2>&1; then
   for f in "${SC_SCOPE[@]}"; do
     [ -f "$f" ] || continue
@@ -166,6 +167,7 @@ for t in claude/hooks/guard.test.sh claude/hooks/observability.test.sh claude/ho
          scripts/a2a-termux-native-worker-health.test.sh \
          scripts/install-memory-refresh-cron.test.sh scripts/ccc-skill-autosave.test.sh \
          scripts/ccc-self-update.test.sh scripts/ccc-provenance.test.sh \
+         scripts/bridge-watchdog.test.sh \
          scripts/ccc-service-control.test.sh; do
   [ -f "$t" ] || { err "missing test: $t"; continue; }
   if bash "$t" >"$TMP/htest.out" 2>&1; then say "  ok $(grep -E 'PASS=' "$TMP/htest.out" | tail -1) $t";
