@@ -660,8 +660,11 @@ class BotCommandMixin:
             log_debug(user_id, "bot", reply)
             return
 
-        # Get conversation history
-        messages = self._project_chat.get_conversation_history(session_id, limit=50)
+        # Get conversation history — offloaded so reading a large transcript for
+        # /revert browsing never stalls the event loop (#456).
+        messages = await asyncio.to_thread(
+            self._project_chat.get_conversation_history, session_id, limit=50
+        )
 
         if not messages:
             reply = "📭 No conversation history available to revert."
@@ -701,8 +704,8 @@ class BotCommandMixin:
         if action == "page":
             # Handle pagination
             page = int(parts[2])
-            messages = self._project_chat.get_conversation_history(
-                session_id, limit=50
+            messages = await asyncio.to_thread(
+                self._project_chat.get_conversation_history, session_id, limit=50
             )
             keyboard = self._build_history_keyboard(messages, page=page)
             await query.edit_message_reply_markup(reply_markup=keyboard)
@@ -713,8 +716,8 @@ class BotCommandMixin:
             keyboard = self._build_revert_mode_keyboard(msg_index)
 
             # Get selected message details for context
-            messages = self._project_chat.get_conversation_history(
-                session_id, limit=50
+            messages = await asyncio.to_thread(
+                self._project_chat.get_conversation_history, session_id, limit=50
             )
             selected_msg = next((m for m in messages if m["index"] == msg_index), None)
 
@@ -744,8 +747,8 @@ class BotCommandMixin:
             await query.edit_message_text("⏳ Reverting to selected message...")
 
             # Get selected message info BEFORE revert (since it will be deleted)
-            messages = self._project_chat.get_conversation_history(
-                session_id, limit=50
+            messages = await asyncio.to_thread(
+                self._project_chat.get_conversation_history, session_id, limit=50
             )
             selected_msg = next((m for m in messages if m["index"] == msg_index), None)
 
