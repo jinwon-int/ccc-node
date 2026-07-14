@@ -4,7 +4,56 @@ All notable changes to the Claude Code node harness. Dates are KST.
 
 ## [Unreleased]
 
+### Changed
+- PreToolUse guard rewritten from bash to `guard.py` (#452), invoked through a
+  thin `guard.sh` shim so the hook/install contract is unchanged (stdin payload →
+  exit 2 to deny). shlex tokenization replaces the hand-rolled bash word-splitting
+  and its three derived string views; `guard.test.sh` (the executable-contract
+  golden suite) drives the swap — every prior non-relaxed case passes unchanged.
+  The shim fails OPEN only when python3/guard.py is unavailable (matching the
+  historical missing-jq posture); `guard.py` fails CLOSED on internal errors and
+  every matched gate. Supersedes the guard internals touched by the fleet-restart
+  branch; `validate-harness.sh` now `py_compile`s guard.py and asserts setup.sh
+  installs it.
+- Service-lifecycle gate re-baselined for fleet operations: pure lifecycle verbs
+  (start/restart/reload/stop/kill + try-/or- variants) on fleet units
+  (`a2a`/`hermes`/`openclaw`/`broker`/`gateway`/`worker`/`ccc-telegram-bridge`) are
+  autonomous, locally and toward a peer node (`ssh <node> systemctl restart <unit>`,
+  `systemctl -H <node> …`). Still gated: non-fleet units, config verbs
+  (enable/disable/mask/isolate/daemon-*) on the local node, `pm2 delete`,
+  docker/podman/kubectl, and local host lifecycle. Compound commands are judged
+  per statement; one non-fleet target denies the whole command.
+
 ### Added
+- Managed-nodes allowlist for owned-node writes (opt-in, fail-closed). Operator-owned
+  `~/.claude/managed-nodes.allow` (override `CCC_MANAGED_NODES_ALLOW`) lists the remote
+  hosts this node operates. For a Bash statement whose only remote reach (via
+  ssh/scp/rsync/sftp/`systemctl -H`) is to a listed host, `guard.py` relaxes the
+  blast-radius gates for that statement — secret/key deployment (`scp deploy.env node:`),
+  remote cleanup (`ssh node "rm -rf /var/log/old"`), remote service config verbs
+  (`ssh node "systemctl daemon-reload"`), and **reboot** of the host (`ssh node reboot`).
+  Reboot-class (`reboot`/`shutdown -r`, recoverable) is also relaxed on the LOCAL node;
+  the down-class (`poweroff`/`halt`/`shutdown` without `-r`) stays gated everywhere
+  (incl. managed nodes) since a powered-off node stays offline unattended, and reboot of
+  an unlisted host / interpreter-mediated forms stay gated. Fail-closed everywhere else:
+  no allowlist → fleet-only baseline;
+  an unlisted host → fully gated; curl/wget/nc excluded (secret-exfil keeps authority);
+  review-gated classes (force-push to protected, history-rewrite, release, DB) never
+  relaxed even via ssh; a local destructive op chained beside a managed remote op is
+  judged on its own statement and denied. The allowlist is agent-write-gated
+  (`managed-nodes-config`). Quote-aware statement splitting (a shlex-rewrite payoff) keeps
+  a remote command chained inside quotes (`ssh node "a && b"`) intact as one managed
+  statement. `guard.test.sh` grows managed-node/reboot/adversarial coverage;
+  `docs/examples/managed-nodes.allow.example` documents the format. Refs #341, #452.
+- Managed-services allowlist for local self-managed apps (opt-in, fail-closed).
+  Operator-owned `~/.claude/managed-services.allow` (override `CCC_MANAGED_SERVICES_ALLOW`)
+  lists the node's own non-fleet local units/containers/processes. `systemctl`/`service`/
+  `pm2`/`docker`/`podman` lifecycle is relaxed when EVERY target of the command is listed;
+  a mixed/unlisted target, targetless `daemon-reload`, `docker compose`, a docker
+  remote-daemon flag, and command-substitution targets stay gated, and `kubectl` is never
+  relaxed — so `sshd`/`ufw`/`nginx` stay protected while the node's own apps become
+  self-manageable. Trailing `.service` is tolerated in matching. Write-gated for agents
+  (`managed-services-config`); `docs/examples/managed-services.allow.example` documents it.
 - Fail-closed external-node memory isolation (#466):
   `CCC_NODE_ISOLATION_PROFILE=external` provides a higher-priority bridge-to-hook
   placement policy and PreToolUse Family-resource guard; `CCC_WIKI_MEMORY_ENABLED=0`

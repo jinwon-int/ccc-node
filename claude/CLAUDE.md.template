@@ -48,14 +48,31 @@ The SessionStart hook (`~/.claude/hooks/load-memory.sh`) auto-injects a snapshot
 **Routing:** durable facts / nodes / runbooks / decisions → Family Wiki. Relational & evolving working memory → Honcho.
 
 ## Fresh Approval Required
-secrets · releases · DB/replay/migration/prune · manual ACKs · emergency hotfixes · provider sends/canaries · direct service/host lifecycle (including broker/Gateway restarts and reboot/shutdown) · cross-broker mutations (unless pre-approved in-task).
+secrets · releases · DB/replay/migration/prune · manual ACKs · emergency hotfixes · provider sends/canaries · host power-down (poweroff/halt/shutdown-without-`-r`, any host) · reboot of an unlisted remote host · non-fleet service lifecycle and config-changing verbs · cross-broker mutations (unless pre-approved in-task).
 
-Service-control exceptions are deliberately narrow: an exact local
-`ccc-telegram-bridge[.service]` restart, the reviewed `ccc-self-update.sh`
-procedure, or a root-installed `ccc-service-control` wrapper invocation for an
-exact root-owned allowlist entry. `guard.sh` is defense-in-depth; the actual
-boundary is the unprivileged agent account and root-owned wrapper/config. See
-`docs/service-control.md` in the ccc-node repository.
+Service-control boundary (enforced by `guard.py` behind the `guard.sh` shim):
+- **Fleet-service lifecycle** — start/restart/reload/stop/kill of
+  `a2a`/`hermes`/`openclaw`/`broker`/`gateway`/`worker` units and
+  `ccc-telegram-bridge` — is autonomous, locally or toward a peer node
+  (`ssh <node> systemctl restart <unit>`).
+- **Managed-node operations** to hosts you list in `~/.claude/managed-nodes.allow`
+  are autonomous: secret/key deployment, remote cleanup, remote service config
+  verbs (enable/daemon-reload), and reboot of that host. The allowlist is
+  operator-owned (agents cannot edit it). With no allowlist, only the fleet-service
+  relaxation applies.
+- **Reboot** (`reboot`/`shutdown -r`, recoverable) is autonomous on the LOCAL node
+  and managed nodes; `poweroff`/`halt` (node stays down) and reboot of an unlisted
+  host stay fresh-approval.
+- **Local self-managed apps**: list this node's own non-fleet units/containers in
+  `~/.claude/managed-services.allow` and their `systemctl`/`pm2`/`docker` lifecycle
+  is autonomous (system services like sshd/ufw/nginx stay gated). Operator-owned.
+- Still fresh-approval: non-fleet units on unmanaged hosts, local config-changing
+  verbs, docker/podman/kubectl, host power-down, and — regardless of host —
+  force-push to protected branches, release/publish, DB destructive/migrate.
+
+`guard.py` is defense-in-depth; the actual boundary is the unprivileged agent
+account and root-owned wrapper/config. See `docs/service-control.md` and
+`docs/examples/managed-nodes.allow.example` in the ccc-node repository.
 
 ## Standing Orders
 These orders define what this node may do autonomously, what requires fresh approval, and when to escalate. **Fresh Approval Required always wins** over any autonomous lane below.
@@ -67,7 +84,7 @@ These orders define what this node may do autonomously, what requires fresh appr
 | A2A source-only evidence | Dispatch source-only/no-live Team1/Team2 analysis lanes with broker/worker attribution and classify outputs before acting. | User requests A2A/A2AD/team rounds, multi-worker review, or issue cleanup needing worker evidence. | Allowed when the user requested the round. No deploy/restart/DB/ACK/replay/provider canary is included unless separately approved. | Exclude wrapper-only, queued, failed, or source-blocked lanes from quorum; retry one compact supplement or fall back to finalizer direct verification. |
 | Local diagnostics / dry runs | Run read-only checks, `setup.sh --dry-run`, harness validation, syntax tests, and drift detection. | Before changing files, validating a repo, diagnosing hook/settings/statusline/bridge drift, or preparing a PR. | No approval needed for read-only diagnostics. `--fix`, writes outside the repo, service restarts, or remote node changes need scope-specific approval. | If diagnostics touch mutable live state or secrets, stop and ask with explicit numbered approval phrases. |
 | Safe file edits in repo | Edit tracked repo files on a feature branch, add tests/docs, commit, push, open PR, and report exact validation output. | A GitHub issue/PR or user request has a narrow acceptance criterion and PR-first path. | No approval needed for branch/PR edits. Never push directly to `main`; never edit deployed live artifacts first. | If implementation scope grows beyond the issue, split a child issue or ask before widening. |
-| Fresh-approval operations | Secrets, releases, DB/replay/migration/prune, manual ACKs, emergency direct hotfixes, provider sends/canaries, broker/Gateway restarts, cross-broker mutations. | Any command, tool, or worker recommendation would cross these boundaries. | **Fresh explicit approval in the current workstream is required.** | Present exact proposed action, target, rollback/verification plan, and wait. |
+| Fresh-approval operations | Secrets, releases, DB/replay/migration/prune, manual ACKs, emergency direct hotfixes, provider sends/canaries, local/non-managed host reboot·shutdown, non-fleet service lifecycle, cross-broker mutations. | Any command, tool, or worker recommendation would cross these boundaries. | **Fresh explicit approval in the current workstream is required.** | Present exact proposed action, target, rollback/verification plan, and wait. |
 
 ## Interaction
 - Ask questions with **numbered options / approval phrases** (not clarify-button UX).
