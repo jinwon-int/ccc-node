@@ -136,6 +136,21 @@ else
   say "  (shellcheck absent — skipped)"
 fi
 
+# 3b) guard.py — the PreToolUse enforcement logic behind the guard.sh shim. A
+# syntax error would make the shim fail OPEN (guard silently unenforced), so
+# compile it here and confirm setup.sh installs it alongside the shim.
+say "== guard.py (python enforcement) =="
+if command -v python3 >/dev/null 2>&1; then
+  if python3 -m py_compile claude/hooks/guard.py 2>/dev/null; then say "  ok claude/hooks/guard.py compiles"; else err "py_compile: claude/hooks/guard.py"; fi
+else
+  say "  (python3 absent — skipped)"
+fi
+if grep -Fq 'run cp "$SRC/claude/hooks/guard.py"' setup.sh 2>/dev/null; then
+  say "  ok setup.sh installs guard.py"
+else
+  err "setup.sh does not install guard.py (guard.sh shim would fail open)"
+fi
+
 # 4) hook tests
 say "== hook tests =="
 for t in claude/hooks/guard.test.sh claude/hooks/observability.test.sh claude/hooks/security-scan.test.sh \

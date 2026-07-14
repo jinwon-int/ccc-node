@@ -1,9 +1,15 @@
 # Risk profiles — ccc-node enforcement model
 
 The harness maps every tool action to one of four risk profiles. The two *gated* profiles
-are enforced by `guard.sh` (PreToolUse, fail-closed); the other two are non-blocking and
-captured by observability (`audit.sh` / `notify.sh`). This implements **separation of
-approval from execution**: gated actions do not run without an explicit operator signal.
+are enforced by `guard.py` (PreToolUse, fail-closed; invoked through the thin `guard.sh`
+shim); the other two are non-blocking and captured by observability (`audit.sh` /
+`notify.sh`). This implements **separation of approval from execution**: gated actions do
+not run without an explicit operator signal.
+
+> Enforcement moved from a hand-rolled bash tokenizer to `guard.py` (issue #452): shlex
+> gives real shell tokenization (quotes, `--`, value-taking flags), which the host/target
+> parsing below relies on. The contract is unchanged — stdin PreToolUse JSON → exit 2 to
+> deny — and is pinned by `guard.test.sh`, which drives the guard as an executable.
 
 | Profile | Behavior | Enforced by | Examples |
 |---|---|---|---|
@@ -49,13 +55,47 @@ recorded to `~/.claude/state/approval-needed.log`; the bypass is logged to stder
   gates even though they carry a `.pem` extension. Private keys (`*.pem` without
   `.pub`, `*.key`, `id_rsa`) and other secrets stay gated; a public key referenced
   alongside a real secret in the same command still trips the deny.
-- **Service-control relaxation** (operator-approved): direct service lifecycle
-  control — `restart` / `start` / `reload` / `stop` / `kill` — of fleet services
-  (`broker`/`Gateway`/`worker`/`a2a`/`hermes`/`openclaw` and `ccc-telegram-bridge`)
-  is **not gated**. A fleet node manages its own services directly so it can update
-  from GitHub and recover unattended. The genuinely dangerous gates (secret, DB,
-  force-push to protected branches, catastrophic `rm`, `self-update.services`
-  writes) are unaffected.
+- **Fleet-service relaxation** (operator-approved): pure lifecycle verbs —
+  `start`/`restart`/`reload`/`stop`/`kill` (and `try-`/`-or-` variants) — of fleet
+  services (unit/process names carrying `a2a`/`hermes`/`openclaw`/`broker`/`gateway`/
+  `worker`, or `ccc-telegram-bridge`) are **not gated**, locally or toward a peer node
+  (`ssh <node> systemctl restart <unit>`, `systemctl -H <node> …`). A fleet node manages
+  its own and its peers' services so the fleet can update from GitHub and recover
+  unattended. Still gated: non-fleet units, config-changing verbs (`enable`/`disable`/
+  `mask`/`unmask`/`isolate`/`daemon-*`) even on fleet units, `pm2 delete`, docker/podman/
+  kubectl lifecycle, and the down-class of host lifecycle (see *Host-lifecycle* below).
+  Compound commands are judged per statement; one non-fleet target denies the whole command.
+- **Host-lifecycle / reboot relaxation**: the **reboot-class** — `reboot` and `shutdown -r`
+  (the node comes back up) — is autonomous on the **local node** and on **managed nodes**
+  (`ssh <managed> reboot`); reboot is disruptive but recoverable. It stays gated for an
+  unlisted remote host (`ssh <unlisted> reboot` — list it first) and for interpreter-
+  mediated forms (only a *direct* reboot command is relaxed; `python3 -c 'os.system("reboot")'`
+  stays gated). The **down-class** — `poweroff`, `halt`, `shutdown` without `-r` — stays
+  fresh-approval **everywhere**, including on managed nodes: a powered-off fleet node stays
+  offline until manual power-on, so it always warrants a confirm.
+- **Managed-nodes relaxation** (operator-owned allowlist; opt-in, fail-closed).
+  `~/.claude/managed-nodes.allow` (override `CCC_MANAGED_NODES_ALLOW`) lists the remote
+  hosts THIS node operates — one host/glob per line, `#` comments. For a Bash statement
+  whose *only* remote reach (via `ssh`/`scp`/`rsync`/`sftp`/`systemctl -H`) is to
+  allowlisted hosts, the blast-radius gates are relaxed for that statement: **secret/key
+  deployment** (`scp deploy.env node:` — otherwise `secret-exfil`), **remote cleanup**
+  (`ssh node "rm -rf /var/log/old"` — otherwise `rm-catastrophic`), **remote service
+  control including config verbs** (`ssh node "systemctl daemon-reload"`), and **reboot**
+  of the host (`ssh node reboot`; the down-class — `poweroff`/`halt` — stays gated, see
+  *Host-lifecycle* above). This is what makes owned nodes manageable without per-command
+  `CCC_ALLOW_GATED`. It stays **fail-closed** everywhere else:
+    - no allowlist file → behavior is identical to the fleet-only baseline;
+    - a host NOT listed → fully gated (genuine exfil to an unknown endpoint still denied);
+    - `curl`/`wget`/`nc`/`ncat`/`ftp` are excluded from the relaxation — the `secret-exfil`
+      gate keeps full authority over them (deploy with `scp`/`rsync` instead);
+    - review-gated classes (force-push to protected, history rewrite, release/publish, DB
+      destructive/migrate) are **never** relaxed, even executed via `ssh` on an owned node;
+    - a LOCAL destructive op chained alongside a managed remote op is judged on its own
+      statement and denied.
+  The allowlist is the trust boundary that says "these hosts are mine," so — like
+  `self-update.services` — it is **write-gated for agents** (`managed-nodes-config`:
+  Edit/Write tools and shell redirect/interpreter writes); reads stay allowed. See
+  `docs/service-control.md` and `docs/examples/managed-nodes.allow.example`.
 - Fail-closed: if a pattern is uncertain, prefer gating. Patterns are covered by
   `guard.test.sh` (allow + deny cases, including the force-push relaxation) to avoid
   blocking normal autonomous work.
@@ -91,9 +131,9 @@ Therefore:
 
 - **`allow`** stays broad (`Bash(*)`, `Read/Write/Edit/MultiEdit`), so autonomous work is
   never prompt-blocked.
-- **`guard.sh`** (PreToolUse, regex over the *full* command) is the real Fresh-Approval
-  enforcement — it sees compound commands that `settings` prefix patterns cannot, and is
-  fail-closed.
+- **`guard.py`** (PreToolUse, shlex tokenization of the *full* command, behind the
+  `guard.sh` shim) is the real Fresh-Approval enforcement — it sees compound commands that
+  `settings` prefix patterns cannot, and is fail-closed.
 - `settings` `deny`/`ask` carry only patterns that are *expressible* as a simple prefix
   (secret-file `Read`, `npm publish`, `gh release create`, `sudo`) as a declarative second
   line — never the primary guard. Patterns whose safe form is contextual (e.g. force-push,

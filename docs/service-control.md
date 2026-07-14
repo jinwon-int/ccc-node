@@ -1,21 +1,40 @@
-# Fail-closed service control
+# Service control
 
-`claude/hooks/guard.sh` is a defense-in-depth policy hook, **not a sandbox**.
-The enforceable boundary is an unprivileged agent account plus a root-owned
-wrapper and root-owned exact-unit allowlist.
+`claude/hooks/guard.py` (behind the `guard.sh` shim) is a defense-in-depth
+policy hook, **not a sandbox**. The enforceable boundary is an unprivileged
+agent account plus a root-owned wrapper and root-owned exact-unit allowlist.
 
 ## Policy
 
-- Direct `systemctl`, `service`, or `pm2` lifecycle commands require fresh
-  operator approval.
-- Host lifecycle commands (`shutdown`, `reboot`, `poweroff`, `halt`) require
-  fresh operator approval.
-- The only direct service carve-out is an exact local restart of
-  `ccc-telegram-bridge[.service]`.
+- **Fleet-service lifecycle is autonomous** (operator-approved relaxation; see
+  `claude/hooks/RISK-PROFILES.md`): `start`/`restart`/`reload`/`stop`/`kill` of
+  units whose name carries `a2a`/`hermes`/`openclaw`/`broker`/`gateway`/`worker`
+  or is `ccc-telegram-bridge` — locally or toward a peer node
+  (`ssh <node> systemctl restart <unit>`, `systemctl -H <node> …`).
+- **Managed-node operations are autonomous for allowlisted hosts** (opt-in;
+  `~/.claude/managed-nodes.allow`): a Bash statement whose only remote reach
+  (via `ssh`/`scp`/`rsync`/`sftp`/`systemctl -H`) is to a listed host may deploy
+  secrets/keys, clean up remote paths, run remote service **config** verbs
+  (`enable`/`daemon-reload`), and reboot that host. See
+  `docs/examples/managed-nodes.allow.example`. The allowlist is operator-owned
+  and write-gated for agents; with no allowlist the behavior is the fleet-only
+  baseline.
+- **Reboot is autonomous on the LOCAL node and managed nodes** — `reboot` /
+  `shutdown -r` is disruptive but recoverable (the node comes back). It stays
+  gated for an unlisted remote host and for interpreter-mediated forms.
+- Everything else is fail-closed: `systemctl`/`service`/`pm2` lifecycle of
+  non-fleet units on hosts that are not managed, config-changing verbs on the
+  local node, `pm2 delete`, and docker/podman/kubectl lifecycle require fresh
+  operator approval. Compound commands are judged per statement; one non-fleet,
+  non-managed target denies the whole command.
+- The down-class of host lifecycle (`poweroff`/`halt`/`shutdown` without `-r`)
+  requires fresh operator approval **everywhere** — local, managed, or unlisted —
+  because a powered-off node stays offline until manual power-on.
 - Pre-reviewed self-update remains available through `ccc-self-update.sh`; its
   operator config must be root-owned and unavailable for agent writes.
-- Other pre-approved restarts use only the installed `ccc-service-control`
-  wrapper and exact `.service` names in `/etc/ccc-node/service-control.allow`.
+- Where a real privilege boundary is required (unprivileged agent account),
+  pre-approved restarts use the installed `ccc-service-control` wrapper and
+  exact `.service` names in `/etc/ccc-node/service-control.allow`.
 
 ## Operator installation (not performed by setup.sh)
 
