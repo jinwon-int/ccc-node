@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
+import hashlib
 from typing import Literal, Protocol, cast
 
 from .agent_runtime import (
@@ -35,6 +37,11 @@ from .codex_app_server import (
     CodexThreadListPage,
     JsonValue,
     ServerRequestHandler,
+)
+from telegram_bot.memory.distill_types import (
+    CodexTranscriptSnapshot,
+    TranscriptBounds,
+    TranscriptMessage,
 )
 
 
@@ -362,6 +369,170 @@ class CodexRuntime:
                     SessionHistoryMessage(role, bounded_text, item_timestamp)
                 )
         return SessionHistory(session_id, tuple(messages[-min(limit, 50):]))
+
+    async def read_session_snapshot(
+        self,
+        session_id: str,
+        *,
+        bounds: TranscriptBounds | None = None,
+        now: datetime | None = None,
+    ) -> CodexTranscriptSnapshot:
+        """Return a strict, read-only and byte-bounded Codex transcript snapshot."""
+
+        if not session_id:
+            raise ValueError("session id must not be empty")
+        limits = bounds or TranscriptBounds()
+        captured = now or datetime.now(timezone.utc)
+        if captured.tzinfo is None:
+            captured = captured.replace(tzinfo=timezone.utc)
+        captured = captured.astimezone(timezone.utc)
+        await self._ensure_started()
+        thread = await self._client.thread_read(session_id, include_turns=True)
+        thread_hash = hashlib.sha256(session_id.encode("utf-8")).hexdigest()
+        if thread is None:
+            return CodexTranscriptSnapshot(
+                thread_hash=thread_hash,
+                last_turn_id=None,
+                messages=(),
+                byte_count=0,
+                truncated=False,
+                captured_at=self._format_snapshot_time(captured),
+            )
+
+        newest_messages, last_turn_id, structural_truncation = (
+            self._snapshot_candidates(thread, limits, captured)
+        )
+        messages, byte_count, byte_truncation = self._bound_snapshot_messages(
+            newest_messages, limits
+        )
+        return CodexTranscriptSnapshot(
+            thread_hash=thread_hash,
+            last_turn_id=last_turn_id,
+            messages=messages,
+            byte_count=byte_count,
+            truncated=structural_truncation or byte_truncation,
+            captured_at=self._format_snapshot_time(captured),
+        )
+
+    @classmethod
+    def _snapshot_candidates(
+        cls,
+        thread: CodexThread,
+        limits: TranscriptBounds,
+        captured: datetime,
+    ) -> tuple[list[TranscriptMessage], str | None, bool]:
+        turns = tuple(thread.turns)
+        selected_turns = turns[-limits.max_turns :]
+        truncated = len(turns) > limits.max_turns
+        last_turn_id: str | None = None
+        if selected_turns:
+            raw_last_turn_id = selected_turns[-1].get("id")
+            if isinstance(raw_last_turn_id, str) and raw_last_turn_id:
+                last_turn_id = raw_last_turn_id
+
+        newest_messages: list[TranscriptMessage] = []
+        items_seen = 0
+        for turn in reversed(selected_turns):
+            turn_timestamp = cls._history_timestamp(turn.get("createdAt"))
+            items = turn.get("items")
+            if not isinstance(items, (list, tuple)):
+                continue
+            for item in reversed(items):
+                if items_seen >= limits.max_items:
+                    return newest_messages, last_turn_id, True
+                items_seen += 1
+                message, excluded_by_age = cls._snapshot_item(
+                    item, turn_timestamp, captured, limits.max_age_seconds
+                )
+                truncated = truncated or excluded_by_age
+                if message is None:
+                    continue
+                newest_messages.append(message)
+                if len(newest_messages) >= limits.max_messages:
+                    return newest_messages, last_turn_id, True
+        return newest_messages, last_turn_id, truncated
+
+    @classmethod
+    def _snapshot_item(
+        cls,
+        item: object,
+        turn_timestamp: str | None,
+        captured: datetime,
+        max_age_seconds: int,
+    ) -> tuple[TranscriptMessage | None, bool]:
+        if not isinstance(item, Mapping):
+            return None, False
+        item_type = item.get("type")
+        role: Literal["user", "assistant"]
+        text: object
+        if item_type == "userMessage":
+            text = cls._user_message_text(item.get("content"))
+            role = "user"
+        elif item_type == "agentMessage":
+            text = item.get("text")
+            role = "assistant"
+        else:
+            return None, False
+        if not isinstance(text, str) or not (text := text.strip()):
+            return None, False
+        timestamp = cls._history_timestamp(item.get("timestamp")) or turn_timestamp
+        parsed_timestamp = cls._parse_snapshot_time(timestamp)
+        if parsed_timestamp is None:
+            return None, True
+        if (captured - parsed_timestamp).total_seconds() > max_age_seconds:
+            return None, True
+        return TranscriptMessage(role, text, timestamp), False
+
+    @classmethod
+    def _bound_snapshot_messages(
+        cls,
+        newest_messages: list[TranscriptMessage],
+        limits: TranscriptBounds,
+    ) -> tuple[tuple[TranscriptMessage, ...], int, bool]:
+        bounded_newest: list[TranscriptMessage] = []
+        remaining_bytes = limits.max_bytes
+        truncated = False
+        for message in newest_messages:
+            if remaining_bytes <= 0:
+                truncated = True
+                break
+            allowed_bytes = min(remaining_bytes, limits.max_message_bytes)
+            bounded_text, was_truncated = cls._truncate_utf8(
+                message.text, allowed_bytes
+            )
+            truncated = truncated or was_truncated
+            if not bounded_text:
+                continue
+            bounded_newest.append(
+                TranscriptMessage(message.role, bounded_text, message.timestamp)
+            )
+            remaining_bytes -= len(bounded_text.encode("utf-8"))
+        messages = tuple(reversed(bounded_newest))
+        byte_count = sum(len(message.text.encode("utf-8")) for message in messages)
+        return messages, byte_count, truncated
+
+    @staticmethod
+    def _truncate_utf8(value: str, maximum_bytes: int) -> tuple[str, bool]:
+        payload = value.encode("utf-8")
+        if len(payload) <= maximum_bytes:
+            return value, False
+        return payload[:maximum_bytes].decode("utf-8", errors="ignore").strip(), True
+
+    @staticmethod
+    def _parse_snapshot_time(value: str | None) -> datetime | None:
+        if not value:
+            return None
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+
+    @staticmethod
+    def _format_snapshot_time(value: datetime) -> str:
+        return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
     @staticmethod
     def _user_message_text(content: JsonValue) -> str | None:

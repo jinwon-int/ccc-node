@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import suppress
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, cast
 import unittest
 
@@ -65,6 +66,7 @@ class FakeClient:
         self.model_result: Any = {"data": []}
         self.thread_pages: list[Any] = []
         self.thread_reads: dict[str, Any] = {}
+        self.thread_read_calls: list[dict[str, Any]] = []
         self.thread_list_calls: list[dict[str, Any]] = []
         self.turn_start_calls: list[dict[str, Any]] = []
         self.interrupt_calls: list[tuple[str, str]] = []
@@ -100,6 +102,9 @@ class FakeClient:
         return self.thread_pages.pop(0)
 
     async def thread_read(self, thread_id: str, *, include_turns: bool = True) -> Any:
+        self.thread_read_calls.append(
+            {"thread_id": thread_id, "include_turns": include_turns}
+        )
         return self.thread_reads.get(thread_id)
 
     async def turn_start(
@@ -290,6 +295,67 @@ class CodexRuntimeTests(unittest.IsolatedAsyncioTestCase):
         ))
         self.assertNotIn("secret", repr(history))
         self.assertNotIn("cat secret", repr(history))
+
+    async def test_distill_snapshot_is_bounded_utf8_safe_and_thread_read_only(self) -> None:
+        from telegram_bot.core.codex_app_server import CodexThread
+        from telegram_bot.memory.distill_types import TranscriptBounds
+
+        client = self.clients[0]
+        client.thread_reads["thread-old"] = CodexThread(
+            id="thread-old",
+            turns=(
+                {
+                    "id": "turn-too-old",
+                    "createdAt": "2026-07-01T00:00:00Z",
+                    "items": (
+                        {"type": "userMessage", "content": "old text"},
+                    ),
+                },
+                {
+                    "id": "turn-new",
+                    "createdAt": "2026-07-14T05:59:30Z",
+                    "items": (
+                        {
+                            "type": "userMessage",
+                            "content": ({"type": "text", "text": "hello"},),
+                        },
+                        {
+                            "type": "commandExecution",
+                            "aggregatedOutput": "raw tool secret",
+                        },
+                        {"type": "agentMessage", "text": "🙂🙂🙂"},
+                        {"type": "unknown", "text": "unknown secret"},
+                    ),
+                },
+            ),
+        )
+
+        result = await self.runtime.read_session_snapshot(
+            "thread-old",
+            bounds=TranscriptBounds(
+                max_turns=1,
+                max_items=10,
+                max_messages=2,
+                max_bytes=13,
+                max_message_bytes=8,
+                max_age_seconds=3600,
+            ),
+            now=datetime(2026, 7, 14, 6, 0, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual([message.role for message in result.messages], ["user", "assistant"])
+        self.assertEqual([message.text for message in result.messages], ["hello", "🙂🙂"])
+        self.assertEqual(result.byte_count, 13)
+        self.assertEqual(result.last_turn_id, "turn-new")
+        self.assertTrue(result.truncated)
+        self.assertNotIn("secret", repr(result))
+        self.assertEqual(
+            client.thread_read_calls,
+            [{"thread_id": "thread-old", "include_turns": True}],
+        )
+        self.assertEqual(client.thread_start_calls, [])
+        self.assertEqual(client.thread_resume_calls, [])
+        self.assertEqual(client.turn_start_calls, [])
 
     async def test_turn_maps_streamed_events_including_notifications_before_response(self) -> None:
         session = await self.runtime.start_or_resume(

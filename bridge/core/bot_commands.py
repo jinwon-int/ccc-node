@@ -16,6 +16,7 @@ from telegram.ext import (
     ContextTypes,
 )
 from telegram_bot.core import revert as revert_ops
+from telegram_bot.memory.distill_types import DistillTrigger
 from .conversation_paths import resolve_conversation_file
 from telegram_bot.utils.chat_logger import log_debug
 from telegram_bot.utils import tg_errors
@@ -112,6 +113,9 @@ class BotCommandMixin:
             active_task.cancel()
 
         session = await self._session_manager.get_session(conversation_key)
+        await self._enqueue_previous_codex_session(
+            session, DistillTrigger.NEW_COMMAND
+        )
         active_provider = self._active_provider()
         provider_changed = session.get("provider") != active_provider
         updates = {
@@ -186,6 +190,9 @@ class BotCommandMixin:
             remove_fields = set()
             reset_note = None
             if session["provider"] != active_provider:
+                await self._enqueue_previous_codex_session(
+                    session, DistillTrigger.PROVIDER_SWITCH
+                )
                 updates.update(session_id=None, new_session=True)
                 remove_fields.add("effort")
             elif active_provider == "codex":
@@ -322,7 +329,7 @@ class BotCommandMixin:
             return
 
         conversation_key = self._conversation_key(user_id, chat.id)
-        session, provider_switched = await self._session_manager.align_active_provider(
+        session, provider_switched = await self._align_active_provider(
             conversation_key
         )
         if provider_switched:

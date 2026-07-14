@@ -187,7 +187,10 @@ assert bot._clock is clock
 assert bot._project_chat.project_root == settings.project_root
 assert bot._push_notifier._config is settings
 assert bot._session_manager.store._storage_path == settings.session_store_path
+assert context.distill_journal.root == settings.bot_data_dir / "distill-journal"
+assert bot._distill_journal is context.distill_journal
 assert not settings.session_store_path.parent.exists()
+assert not context.distill_journal.root.exists()
 print("RUNTIME_COMPOSED")
 """,
         probe_root=tmp_path,

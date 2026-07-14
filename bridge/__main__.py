@@ -33,6 +33,7 @@ class AppContext:
     settings: Settings
     session_store: Any
     session_manager: Any
+    distill_journal: Any
     project_chat: Any
     agent_runtime: Any
     sdk_factory: Any
@@ -53,6 +54,7 @@ def build_context(
     from telegram.ext import Application
     from claude_agent_sdk import ClaudeSDKClient
     from telegram_bot.core.project_chat import ProjectChatHandler
+    from telegram_bot.memory.distill_journal import DistillJournal
     from telegram_bot.session.manager import SessionManager
     from telegram_bot.session.store import SessionStore
     from telegram_bot.utils.chat_logger import bind_logs_dir
@@ -69,6 +71,7 @@ def build_context(
     health_reporter.bind(settings.bot_data_dir)
     store = SessionStore(settings.session_store_path)
     session_manager = SessionManager(store=store, settings=settings)
+    distill_journal = DistillJournal(settings.bot_data_dir / "distill-journal")
     project_chat = ProjectChatHandler(
         settings=settings,
         sdk_client_factory=sdk_factory,
@@ -79,6 +82,7 @@ def build_context(
         settings=settings,
         session_store=store,
         session_manager=session_manager,
+        distill_journal=distill_journal,
         project_chat=project_chat,
         agent_runtime=agent_runtime,
         sdk_factory=sdk_factory,
@@ -95,6 +99,7 @@ def create_app(context: AppContext):
         settings=context.settings,
         session_manager=context.session_manager,
         project_chat=context.project_chat,
+        distill_journal=context.distill_journal,
         application_builder_factory=context.telegram_port,
         clock=context.clock,
     )
