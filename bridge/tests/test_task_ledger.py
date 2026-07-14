@@ -1,5 +1,6 @@
 """Unit tests for the persistent task ledger (Hermes-style task lifecycle)."""
 
+import json
 import sys
 import tempfile
 import types
@@ -132,6 +133,64 @@ class TaskLedgerTests(unittest.TestCase):
             ledger_path_for(Path("/data")), default_task_ledger_path(Path("/data"))
         )
         self.assertIsNone(ledger_path_for(None))
+
+
+class TaskLedgerDurabilityTests(unittest.TestCase):
+    """#443: tasks.json must carry the same durability guarantees as sessions.json
+    — previous-good .bak retention, crash recovery, and atomic (temp+replace)
+    writes with no fixed-name .tmp left behind."""
+
+    def setUp(self):
+        self._td = tempfile.TemporaryDirectory()
+        self.addCleanup(self._td.cleanup)
+        self.path = Path(self._td.name) / "sub" / "tasks.json"
+        self.ledger = TaskLedger(self.path)
+
+    def _bak(self) -> Path:
+        return self.path.with_name(self.path.name + ".bak")
+
+    def test_backup_written_before_overwrite(self):
+        # First write creates the primary (no prior file to back up).
+        task_id = self.ledger.create(1, 2)
+        self.assertFalse(self._bak().exists())
+        # Second write preserves the current-good file as .bak first.
+        self.ledger.set_status_message(task_id, 777)
+        self.assertTrue(self._bak().exists())
+        backed = json.loads(self._bak().read_text(encoding="utf-8"))
+        # .bak holds the pre-second-write state (status message still unset).
+        self.assertIn(task_id, backed)
+        self.assertIsNone(backed[task_id]["status_message_id"])
+        # Primary holds the new state.
+        primary = json.loads(self.path.read_text(encoding="utf-8"))
+        self.assertEqual(primary[task_id]["status_message_id"], 777)
+
+    def test_recovers_from_backup_when_primary_corrupt(self):
+        task_id = self.ledger.create(1, 2)
+        self.ledger.set_status_message(task_id, 777)  # ensures a .bak exists
+        self.assertTrue(self._bak().exists())
+        # Simulate a damaged primary (disk error / external truncation).
+        self.path.write_text("{ half-written garbage", encoding="utf-8")
+        # A fresh instance must recover the task from the previous-good backup
+        # instead of losing it (parity with SessionStore crash recovery).
+        recovered = TaskLedger(self.path)
+        ids = [r["task_id"] for r in recovered.records()]
+        self.assertIn(task_id, ids)
+
+    def test_no_fixed_tmp_or_leftover_temp_after_write(self):
+        task_id = self.ledger.create(1, 2)
+        self.ledger.set_status_message(task_id, 42)
+        self.ledger.finish(task_id, COMPLETED, cleanup_done=False)
+        names = [p.name for p in self.path.parent.iterdir()]
+        # The old fixed-name tasks.json.tmp must never appear …
+        self.assertNotIn("tasks.json.tmp", names)
+        # … and mkstemp temp files must be cleaned up (only ledger + backup).
+        leftover = [n for n in names if ".tmp-" in n]
+        self.assertEqual(leftover, [], f"stray temp files: {leftover}")
+
+    def test_state_survives_a_fresh_instance(self):
+        task_id = self.ledger.create(5, 6)
+        reopened = TaskLedger(self.path)
+        self.assertEqual([r["task_id"] for r in reopened.records()], [task_id])
 
 
 if __name__ == "__main__":
