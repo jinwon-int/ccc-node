@@ -1258,8 +1258,6 @@ run_daemon_supervisor() {
     write_token_lock "$$"
 
     # Debug: log environment variables for daemon supervisor
-    echo "DEBUG: http_proxy=$http_proxy" >> "$LOGS_DIR/supervisor.log"
-    echo "DEBUG: https_proxy=$https_proxy" >> "$LOGS_DIR/supervisor.log"
     echo "DEBUG: VENV_DIR=$VENV_DIR" >> "$LOGS_DIR/supervisor.log"
     echo "DEBUG: PROJECT_ROOT=$PROJECT_ROOT" >> "$LOGS_DIR/supervisor.log"
 
