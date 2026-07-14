@@ -459,6 +459,111 @@ class CodexRuntimeTests(unittest.IsolatedAsyncioTestCase):
             {"type": "workspaceWrite", "networkAccess": False},
         )
 
+    async def test_completed_agent_message_inserts_paragraph_boundary(self) -> None:
+        # A completed agentMessage separates two assistant messages whose deltas
+        # would otherwise fuse ("…first.second…"). The boundary rides the delta
+        # stream as a "\n\n" text_delta so the downstream join keeps it.
+        session = await self.runtime.start_or_resume(
+            SessionRequest(
+                working_directory="/workspace",
+                effort="high",
+                approval_policy="on-request",
+                approvals_reviewer="auto_review",
+                sandbox_policy={"type": "workspaceWrite", "networkAccess": False},
+            )
+        )
+        client = self.clients[0]
+        client.before_turn_response = [
+            CodexNotification(
+                "item/agentMessage/delta",
+                {"threadId": "thread-new", "turnId": "turn-1", "delta": "first part."},
+            ),
+            CodexNotification(
+                "item/completed",
+                {
+                    "threadId": "thread-new",
+                    "turnId": "turn-1",
+                    "item": {"id": "message-1", "type": "agentMessage", "text": "first part."},
+                },
+            ),
+            CodexNotification(
+                "item/agentMessage/delta",
+                {"threadId": "thread-new", "turnId": "turn-1", "delta": "second part."},
+            ),
+            CodexNotification(
+                "item/completed",
+                {
+                    "threadId": "thread-new",
+                    "turnId": "turn-1",
+                    "item": {"id": "message-2", "type": "agentMessage", "text": "second part."},
+                },
+            ),
+            CodexNotification(
+                "turn/completed",
+                {"threadId": "thread-new", "turn": {"id": "turn-1", "status": "completed"}},
+            ),
+        ]
+
+        events = [event async for event in session.send_turn("hi")]
+        text_deltas = [cast(TextDeltaEvent, e).text for e in events if e.kind == "text_delta"]
+        # boundary inserted between the two messages; trailing boundary is harmless
+        # (the consumer strips it) but present here as the second message also completes.
+        self.assertEqual(text_deltas, ["first part.", "\n\n", "second part.", "\n\n"])
+        self.assertEqual("".join(text_deltas).strip(), "first part.\n\nsecond part.")
+
+    async def test_agent_message_boundary_never_leads_or_doubles(self) -> None:
+        # A completed agentMessage with no preceding text emits nothing (no leading
+        # separator); a second consecutive completion without new text does not
+        # double the separator.
+        session = await self.runtime.start_or_resume(
+            SessionRequest(
+                working_directory="/workspace",
+                effort="high",
+                approval_policy="on-request",
+                approvals_reviewer="auto_review",
+                sandbox_policy={"type": "workspaceWrite", "networkAccess": False},
+            )
+        )
+        client = self.clients[0]
+        client.before_turn_response = [
+            CodexNotification(
+                "item/completed",  # completes before any text → must NOT lead with "\n\n"
+                {
+                    "threadId": "thread-new",
+                    "turnId": "turn-1",
+                    "item": {"id": "message-0", "type": "agentMessage", "text": ""},
+                },
+            ),
+            CodexNotification(
+                "item/agentMessage/delta",
+                {"threadId": "thread-new", "turnId": "turn-1", "delta": "only"},
+            ),
+            CodexNotification(
+                "item/completed",
+                {
+                    "threadId": "thread-new",
+                    "turnId": "turn-1",
+                    "item": {"id": "message-1", "type": "agentMessage", "text": "only"},
+                },
+            ),
+            CodexNotification(
+                "item/completed",  # consecutive completion, no new text → no double "\n\n"
+                {
+                    "threadId": "thread-new",
+                    "turnId": "turn-1",
+                    "item": {"id": "message-1", "type": "agentMessage", "text": "only"},
+                },
+            ),
+            CodexNotification(
+                "turn/completed",
+                {"threadId": "thread-new", "turn": {"id": "turn-1", "status": "completed"}},
+            ),
+        ]
+
+        events = [event async for event in session.send_turn("hi")]
+        text_deltas = [cast(TextDeltaEvent, e).text for e in events if e.kind == "text_delta"]
+        self.assertEqual(text_deltas, ["only", "\n\n"])
+
     async def test_approval_before_turn_start_response_routes_to_handler(self) -> None:
         session = await self.runtime.start_or_resume(
             SessionRequest(
