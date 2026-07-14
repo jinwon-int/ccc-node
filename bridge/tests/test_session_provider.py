@@ -76,7 +76,19 @@ def bare_bot(manager: SessionManager, *, provider: str, project_chat=None) -> An
     bot._runtime_active_sessions = set()
     bot._clock = SimpleNamespace(time=lambda: 1000.0)
     bot._check_access = AsyncMock(return_value=True)
+    bot._distill_journal = None
     return bot
+
+
+class RecordingDistillJournal:
+    def __init__(self, observe=None) -> None:
+        self.calls: list[dict[str, object]] = []
+        self.observe = observe
+
+    def enqueue_once(self, **kwargs):
+        observed = self.observe() if self.observe is not None else None
+        self.calls.append({**kwargs, "observed": observed})
+        return SimpleNamespace(job_id="job-1")
 
 
 @pytest.mark.parametrize(
@@ -346,6 +358,165 @@ async def test_codex_new_preserves_explicit_model_without_reading_claude_setting
     assert session["session_id"] is None
     assert session["model"] == "codex-explicit"
     assert session["new_session"] is True
+
+
+@pytest.mark.anyio
+async def test_codex_new_enqueues_previous_thread_before_reset(tmp_path: Path) -> None:
+    manager = make_manager(tmp_path, "codex")
+    await manager.store.set(
+        "7:9",
+        {"provider": "codex", "session_id": "thread-before-new", "model": "o3"},
+    )
+    bot = bare_bot(manager, provider="codex")
+    bot._cancel_user_voice_tasks = AsyncMock(return_value=0)
+    bot._cancel_user_streaming = AsyncMock(return_value=False)
+    journal = RecordingDistillJournal(
+        observe=lambda: manager.store._local_data["telegram_session:7:9"]["session_id"]
+    )
+    bot._distill_journal = journal
+
+    await bot._cmd_new(make_update(), SimpleNamespace(args=[]))
+
+    assert len(journal.calls) == 1
+    assert journal.calls[0]["provider"] == "codex"
+    assert journal.calls[0]["thread_id"] == "thread-before-new"
+    assert journal.calls[0]["trigger"].value == "new_command"
+    assert journal.calls[0]["observed"] == "thread-before-new"
+    assert (await manager.get_session("7:9"))["session_id"] is None
+
+
+@pytest.mark.anyio
+async def test_provider_switch_enqueues_old_codex_thread_before_alignment(
+    tmp_path: Path,
+) -> None:
+    manager = make_manager(tmp_path, "claude")
+    await manager.store.set(
+        "7:9",
+        {"provider": "codex", "session_id": "thread-before-switch", "model": "o3"},
+    )
+    bot = bare_bot(manager, provider="claude")
+    journal = RecordingDistillJournal(
+        observe=lambda: manager.store._local_data["telegram_session:7:9"]["session_id"]
+    )
+    bot._distill_journal = journal
+    old_session = await manager.get_session("7:9")
+
+    session, switched = await bot._align_active_provider("7:9", old_session)
+
+    assert switched is True
+    assert journal.calls[0]["thread_id"] == "thread-before-switch"
+    assert journal.calls[0]["trigger"].value == "provider_switch"
+    assert journal.calls[0]["observed"] == "thread-before-switch"
+    assert session["session_id"] is None
+
+
+@pytest.mark.anyio
+async def test_model_command_provider_switch_enqueues_old_codex_thread(
+    tmp_path: Path,
+) -> None:
+    manager = make_manager(tmp_path, "claude")
+    await manager.store.set(
+        "7:9",
+        {"provider": "codex", "session_id": "thread-before-model-command"},
+    )
+    bot = bare_bot(manager, provider="claude")
+    journal = RecordingDistillJournal(
+        observe=lambda: manager.store._local_data["telegram_session:7:9"][
+            "session_id"
+        ]
+    )
+    bot._distill_journal = journal
+
+    await bot._cmd_model(make_update(), SimpleNamespace(args=["sonnet"]))
+
+    assert len(journal.calls) == 1
+    assert journal.calls[0]["observed"] == "thread-before-model-command"
+    assert journal.calls[0]["thread_id"] == "thread-before-model-command"
+    assert journal.calls[0]["trigger"].value == "provider_switch"
+    session = await manager.get_session("7:9")
+    assert session["provider"] == "claude"
+    assert session["session_id"] is None
+
+
+@pytest.mark.anyio
+async def test_model_callback_provider_switch_enqueues_old_codex_thread(
+    tmp_path: Path,
+) -> None:
+    manager = make_manager(tmp_path, "claude")
+    await manager.store.set(
+        "7:9",
+        {"provider": "codex", "session_id": "thread-before-model-callback"},
+    )
+    bot = bare_bot(manager, provider="claude")
+    journal = RecordingDistillJournal(
+        observe=lambda: manager.store._local_data["telegram_session:7:9"][
+            "session_id"
+        ]
+    )
+    bot._distill_journal = journal
+    bot.application = SimpleNamespace(bot=object())
+    query = SimpleNamespace(
+        data="model:claude:sonnet",
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(),
+    )
+    update = SimpleNamespace(
+        effective_user=SimpleNamespace(id=7),
+        effective_chat=SimpleNamespace(id=9),
+        message=None,
+        callback_query=query,
+    )
+
+    await bot._handle_callback(update, SimpleNamespace())
+
+    assert len(journal.calls) == 1
+    assert journal.calls[0]["observed"] == "thread-before-model-callback"
+    assert journal.calls[0]["thread_id"] == "thread-before-model-callback"
+    assert journal.calls[0]["trigger"].value == "provider_switch"
+    session = await manager.get_session("7:9")
+    assert session["provider"] == "claude"
+    assert session["session_id"] is None
+
+
+@pytest.mark.anyio
+async def test_auto_new_enqueues_old_codex_thread_before_reset(tmp_path: Path) -> None:
+    manager = make_manager(tmp_path, "codex")
+    await manager.store.set(
+        "7:9", {"provider": "codex", "session_id": "thread-before-auto-new"}
+    )
+    bot = bare_bot(manager, provider="codex")
+    journal = RecordingDistillJournal(
+        observe=lambda: manager.store._local_data["telegram_session:7:9"]["session_id"]
+    )
+    bot._distill_journal = journal
+    session = await manager.get_session("7:9")
+
+    await bot._reset_for_auto_new_session("7:9", session)
+
+    assert journal.calls[0]["thread_id"] == "thread-before-auto-new"
+    assert journal.calls[0]["trigger"].value == "auto_new"
+    assert journal.calls[0]["observed"] == "thread-before-auto-new"
+    assert session["session_id"] is None
+    assert (await manager.get_session("7:9"))["session_id"] is None
+
+
+@pytest.mark.anyio
+async def test_distill_trigger_is_noop_for_non_codex_or_missing_thread(tmp_path: Path) -> None:
+    manager = make_manager(tmp_path, "codex")
+    bot = bare_bot(manager, provider="codex")
+    journal = RecordingDistillJournal()
+    bot._distill_journal = journal
+    from telegram_bot.memory.distill_types import DistillTrigger
+
+    assert await bot._enqueue_previous_codex_session(
+        {"provider": "claude", "session_id": "claude-1"},
+        DistillTrigger.NEW_COMMAND,
+    ) is None
+    assert await bot._enqueue_previous_codex_session(
+        {"provider": "codex", "session_id": None},
+        DistillTrigger.NEW_COMMAND,
+    ) is None
+    assert journal.calls == []
 
 
 @pytest.mark.anyio

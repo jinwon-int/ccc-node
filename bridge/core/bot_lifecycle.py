@@ -282,6 +282,9 @@ class BotLifecycleMixin:
     def validate_runtime_paths(self) -> None:
         """Validate runtime paths before logging creates artifacts."""
         self._session_manager.validate_storage_path()
+        distill_journal = getattr(self, "_distill_journal", None)
+        if distill_journal is not None:
+            distill_journal.validate_path()
 
     def run(self):
         """Run the bot with in-process polling restart capability."""
@@ -302,6 +305,9 @@ class BotLifecycleMixin:
         )
         enforce_access_control(settings)
         self._session_manager.initialize()
+        distill_journal = getattr(self, "_distill_journal", None)
+        if distill_journal is not None:
+            distill_journal.initialize()
         exit_reason = "Bot stopped"
         try:
             health_reporter.initialize_process()

@@ -5,7 +5,7 @@ import re
 import sys
 import time
 import types
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, cast
 from datetime import datetime, timezone
 
 from telegram import (
@@ -28,6 +28,7 @@ from telegram_bot.core import session_resume
 from telegram_bot.core.push_notifier import PushNotifier
 from telegram_bot.core.task_queue import UserTaskQueue
 from telegram_bot.core.project_chat import ChatResponse
+from telegram_bot.memory.distill_types import DistillJob, DistillTrigger
 from telegram_bot.utils.audio_processor import AudioProcessor
 from telegram_bot.utils.transcription import (
     VolcengineFileFastTranscriber,
@@ -105,12 +106,14 @@ class TelegramBot(
         settings: Any,
         session_manager: Any,
         project_chat: Any,
+        distill_journal: Any = None,
         application_builder_factory: Any = None,
         clock: Any = None,
     ):
         self._config = settings
         self._session_manager = session_manager
         self._project_chat = project_chat
+        self._distill_journal = distill_journal
         self._application_builder_factory = (
             application_builder_factory or Application.builder
         )
@@ -166,11 +169,27 @@ class TelegramBot(
             raise ValueError(f"Unsupported agent provider: {provider!r}")
         return provider
 
+    async def _enqueue_previous_codex_session(
+        self,
+        session: dict[str, Any],
+        trigger: DistillTrigger,
+    ) -> DistillJob | None:
+        provider = str(session.get("provider", "claude")).strip().lower()
+        thread_id = session.get("session_id")
+        if provider != "codex" or not isinstance(thread_id, str) or not thread_id:
+            return None
+        journal = getattr(self, "_distill_journal", None)
+        if journal is None:
+            return None
+        return await asyncio.to_thread(
+            journal.enqueue_once,
+            provider="codex",
+            thread_id=thread_id,
+            trigger=trigger,
+        )
+
     async def _align_active_provider(self, session_key: Any, session=None):
-        """Align provider state, retaining compatibility with lightweight test managers."""
-        align = getattr(self._session_manager, "align_active_provider", None)
-        if callable(align):
-            return await align(session_key)
+        """Durably capture a departing Codex thread before provider state resets."""
         if session is None:
             session = await self._session_manager.get_session(session_key)
         provider = str(session.get("provider", "claude")).strip().lower()
@@ -178,6 +197,12 @@ class TelegramBot(
         session["provider"] = provider
         if provider == active_provider:
             return session, False
+        await self._enqueue_previous_codex_session(
+            session, DistillTrigger.PROVIDER_SWITCH
+        )
+        align = getattr(self._session_manager, "align_active_provider", None)
+        if callable(align):
+            return await cast(Any, align)(session_key)
         await self._session_manager.patch_session(
             session_key,
             updates={
@@ -190,6 +215,18 @@ class TelegramBot(
         session.update(provider=active_provider, session_id=None, new_session=True)
         session.pop("model", None)
         return session, True
+
+    async def _reset_for_auto_new_session(
+        self, session_key: Any, session: dict[str, Any]
+    ) -> None:
+        await self._enqueue_previous_codex_session(session, DistillTrigger.AUTO_NEW)
+        await self._session_manager.patch_session(
+            session_key,
+            updates={"session_id": None, "new_session": False},
+        )
+        session["session_id"] = None
+        session["new_session"] = False
+        self._runtime_active_sessions.discard(session_key)
 
     async def _session_provider(self, session_key: Any) -> str:
         get_provider = getattr(self._session_manager, "get_session_provider", None)
@@ -493,12 +530,9 @@ class TelegramBot(
                 conversation_key, now=message_timestamp
             )
             if auto_new_session:
-                await self._session_manager.patch_session(
-                    conversation_key,
-                    updates={"session_id": None, "new_session": False},
+                await self._reset_for_auto_new_session(
+                    conversation_key, current_session
                 )
-                current_session["session_id"] = None
-                self._runtime_active_sessions.discard(conversation_key)
                 new_session = True
 
             await self._session_manager.set_last_user_message_at(conversation_key, message_timestamp)

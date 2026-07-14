@@ -20,6 +20,7 @@ from telegram.ext import (
 from telegram_bot.core import ui
 from telegram_bot.core import paths as path_scope
 from telegram_bot.core.bot_shared import build_reply_context_prefix
+from telegram_bot.memory.distill_types import DistillTrigger
 from telegram_bot.utils.chat_logger import log_debug
 from telegram_bot.utils.tg_format import wrap_markdown_tables
 from telegram_bot.utils.tg_robust import send_with_retry
@@ -539,7 +540,7 @@ class BotDeliveryMixin:
                 )
                 return
             session_key = self._conversation_key(user_id, chat.id)
-            session, provider_switched = await self._session_manager.align_active_provider(
+            session, provider_switched = await self._align_active_provider(
                 session_key
             )
             if provider_switched:
@@ -587,6 +588,9 @@ class BotDeliveryMixin:
             remove_fields = set()
             reset_note = None
             if stored_provider != active_provider:
+                await self._enqueue_previous_codex_session(
+                    session, DistillTrigger.PROVIDER_SWITCH
+                )
                 updates.update(session_id=None, new_session=True)
                 remove_fields.add("effort")
             elif active_provider == "codex":
