@@ -85,6 +85,8 @@ PY
 ok "external update drops malformed distill-history JSON instead of indexing raw text" '! grep -q "MALFORMED_HISTORY_WIKI_DROP\|malformed.json" <<<"$malformed_dump"'
 out="$(CCC_STATE_DIR="$state" CCC_NODE_ISOLATION_PROFILE=external CCC_WIKI_MEMORY_ENABLED=1 bash "$ROOT/scripts/ccc-memory-search.sh" 'MALFORMED_HISTORY_WIKI_DROP' 2>&1)"; rc=$?
 ok "external search cannot surface malformed distill-history after update" '[ "$rc" = 0 ] && jq -e "(.results | length) == 0" >/dev/null <<<"$out"'
+out="$(CCC_STATE_DIR="$state" CCC_NODE_ISOLATION_PROFILE=external CCC_WIKI_MEMORY_ENABLED=1 bash "$ROOT/scripts/ccc-memory-search.sh" 'STALE_VALID_HONCHO_KEEP' 2>&1)"; rc=$?
+ok "external search preserves sanitized local Honcho distill after update" '[ "$rc" = 0 ] && jq -e "[.results[] | select(.source == \"distill-local\" and (.path | endswith(\"/stale-valid.json\")))] | length >= 1" >/dev/null <<<"$out"'
 rm -rf "$state/distill-history"
 CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" bash "$ROOT/scripts/ccc-memory-index.sh" rebuild >/dev/null 2>&1
 

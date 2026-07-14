@@ -127,11 +127,11 @@ def visible(row):
         return False
     p = pathlib.PurePath(str(row.get("path") or ""))
     source = str(row.get("source") or "").lower()
-    return not (
-        p.name in {"wiki.txt", "wiki-candidates.md", "distill-last.json"}
-        or "distill-history" in p.parts
-        or source.startswith("distill")
-    )
+    if p.name in {"wiki.txt", "wiki-candidates.md"}:
+        return False
+    if source == "distill-local":
+        return True
+    return not (p.name == "distill-last.json" or "distill-history" in p.parts or source.startswith("distill"))
 doc["results"] = [row for row in results if visible(row)]
 sys.stdout.write(json.dumps(doc, ensure_ascii=False))
 PY
@@ -157,7 +157,7 @@ results = doc.get("results") if isinstance(doc, dict) else None
 if not isinstance(results, list):
     sys.stdout.write(raw); sys.exit(0)
 LABEL = {"memory": "memory", "cache": "cache", "structured": "fact",
-         "state": "distill", "distill-history": "distill"}
+         "state": "distill", "distill-history": "distill", "distill-local": "distill"}
 lines = []
 for r in results:
     if not isinstance(r, dict):

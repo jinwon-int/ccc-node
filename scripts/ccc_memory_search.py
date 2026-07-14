@@ -45,11 +45,11 @@ def hidden_by_wiki_boundary(row):
     raw_path = str(row.get("path") or "")
     p = Path(raw_path)
     source = str(row.get("source") or "").lower()
-    return (
-        p.name in {"wiki.txt", "wiki-candidates.md", "distill-last.json"}
-        or "distill-history" in p.parts
-        or source.startswith("distill")
-    )
+    if p.name in {"wiki.txt", "wiki-candidates.md"}:
+        return True
+    if source == "distill-local":
+        return False
+    return p.name == "distill-last.json" or "distill-history" in p.parts or source.startswith("distill")
 
 # Optional semantic lane (operator-configured embedding provider; see the index
 # tool). Doc vectors are precomputed in memory_vectors during refresh; here we

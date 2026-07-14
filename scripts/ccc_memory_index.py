@@ -195,13 +195,15 @@ def docs():
 
     # Distill artifacts can include raw transcript fragments. Keep them opt-in.
     if index_distill_enabled:
-        candidates.append(("state", state / "distill-last.json"))
+        local_distill_kind = "state" if wiki_enabled else "distill-local"
+        history_kind = "distill-history" if wiki_enabled else "distill-local"
+        candidates.append((local_distill_kind, state / "distill-last.json"))
         if wiki_enabled:
             candidates.append(("state", state / "wiki-candidates.md"))
         hist = state / "distill-history"
         if hist.is_dir():
             for p in sorted(hist.glob("*.json"))[-200:]:
-                candidates.append(("distill-history", p))
+                candidates.append((history_kind, p))
 
     for item in candidates:
         if len(item) == 3:
