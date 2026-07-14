@@ -12,6 +12,7 @@ from telegram import Update
 from telegram.ext import Application
 from telegram.request import BaseRequest, HTTPXRequest
 
+from telegram_bot.core import crash_policy
 from telegram_bot.core.bot_shared import _PollingRestart, enforce_access_control
 from telegram_bot.core.tool_policy import (
     EXECUTION_OWNER_OPERATOR,
@@ -250,8 +251,12 @@ class BotLifecycleMixin:
             http_version="1.1",
         )
 
-    _MIN_UPTIME = 30  # seconds — polling exits faster → count as crash
-    _MAX_RAPID_CRASHES = 5
+    # Crash/rapid-restart thresholds come from the single shared policy
+    # (crash-policy.env via core.crash_policy) so this in-process guard can never
+    # silently diverge from the process supervisor in start.sh (#445). Values are
+    # unchanged: in-process min-uptime 30s, 5 strikes.
+    _MIN_UPTIME = crash_policy.INPROCESS_MIN_UPTIME_SECONDS  # polling exits faster → count as crash
+    _MAX_RAPID_CRASHES = crash_policy.MAX_RAPID_CRASHES
     _WORKLOAD_INTERVAL = 10  # seconds between in-flight workload snapshots
     # Transport-only reconnect policy (issue #411): a transient Telegram
     # NetworkError/TimedOut must not tear down the Application — that would
@@ -513,6 +518,12 @@ class BotLifecycleMixin:
                 if uptime < self._MIN_UPTIME:
                     rapid_crash_count += 1
                     if rapid_crash_count >= self._MAX_RAPID_CRASHES:
+                        # Deliberate escalation to layer 2 (#445): this non-zero
+                        # SystemExit ends the process, and start.sh's supervisor
+                        # counts that as exactly ONE process crash against its own
+                        # CCC_PROCESS_CRASH_WINDOW_SECONDS/CCC_MAX_RAPID_CRASHES
+                        # budget. The in-process layer absorbs transient churn;
+                        # the supervisor bounds the process lifetime.
                         raise SystemExit(
                             f"Polling restarted {self._MAX_RAPID_CRASHES} times within "
                             f"{self._MIN_UPTIME}s each. Giving up."
