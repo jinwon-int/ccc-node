@@ -22,7 +22,7 @@ def _normalize_reason(value: Optional[str]) -> str:
 class RuntimeHealthReporter:
     SCHEMA_VERSION = 1
 
-    def __init__(self, bot_data_dir: Path):
+    def __init__(self, bot_data_dir: Path, agent_provider: str | None = None):
         self._lock = threading.Lock()
         self._bot_data_dir = bot_data_dir
         self._pid_file = bot_data_dir / "bot.pid"
@@ -31,6 +31,16 @@ class RuntimeHealthReporter:
         self._process_mode = "foreground"
         self._token_lock_file = ""
         self._owns_token_lock = False
+        configured_provider = agent_provider or getattr(config, "agent_provider", "claude")
+        self._agent_provider = (
+            "codex" if str(configured_provider).strip().lower() == "codex" else "claude"
+        )
+        initial_agent_state = {
+            "state": "degraded",
+            "last_ok_at": None,
+            "last_error_at": None,
+            "last_error": "",
+        }
         self._state: dict[str, Any] = {
             "schema_version": self.SCHEMA_VERSION,
             "updated_at": _utc_now_iso(),
@@ -50,12 +60,13 @@ class RuntimeHealthReporter:
                 "last_error": "",
                 "consecutive_failures": 0,
             },
-            "claude": {
-                "state": "degraded",
-                "last_ok_at": None,
-                "last_error_at": None,
-                "last_error": "",
+            "agent": {
+                "provider": self._agent_provider,
+                **initial_agent_state,
             },
+            # Backward-compatible alias for consumers of schema v1. It mirrors
+            # the active agent even when the provider is Codex.
+            "claude": dict(initial_agent_state),
             "workload": {
                 "active_requests": 0,
                 "oldest_request_age_seconds": 0,
@@ -109,8 +120,9 @@ class RuntimeHealthReporter:
 
     def _recompute_service_locked(self) -> None:
         telegram_state = self._state["telegram"]["state"]
-        claude_state = self._state["claude"]["state"]
-        if telegram_state == "healthy" and claude_state == "healthy":
+        agent = self._state["agent"]
+        agent_state = agent["state"]
+        if telegram_state == "healthy" and agent_state == "healthy":
             self._state["service"]["state"] = "available"
             self._state["service"]["reason"] = ""
             return
@@ -119,9 +131,11 @@ class RuntimeHealthReporter:
         if telegram_state != "healthy":
             detail = self._state["telegram"].get("last_error") or "telegram unavailable"
             reasons.append(f"Telegram: {detail}")
-        if claude_state != "healthy":
-            detail = self._state["claude"].get("last_error") or "claude unavailable"
-            reasons.append(f"Claude: {detail}")
+        if agent_state != "healthy":
+            provider = str(agent.get("provider") or self._agent_provider).lower()
+            label = "Codex" if provider == "codex" else "Claude"
+            detail = agent.get("last_error") or f"{provider} unavailable"
+            reasons.append(f"{label}: {detail}")
 
         self._state["service"]["state"] = "degraded"
         self._state["service"]["reason"] = "; ".join(reasons)
@@ -172,20 +186,37 @@ class RuntimeHealthReporter:
             self._recompute_service_locked()
             self._write_health_locked()
 
-    def record_claude_ok(self) -> None:
+    def _sync_legacy_agent_locked(self) -> None:
+        agent = self._state["agent"]
+        self._state["claude"] = {
+            key: agent.get(key)
+            for key in ("state", "last_ok_at", "last_error_at", "last_error")
+        }
+
+    def record_agent_ok(self) -> None:
         with self._lock:
-            self._state["claude"]["state"] = "healthy"
-            self._state["claude"]["last_ok_at"] = _utc_now_iso()
+            self._state["agent"]["state"] = "healthy"
+            self._state["agent"]["last_ok_at"] = _utc_now_iso()
+            self._state["agent"]["last_error"] = ""
+            self._sync_legacy_agent_locked()
             self._recompute_service_locked()
             self._write_health_locked()
 
-    def record_claude_error(self, error: str) -> None:
+    def record_agent_error(self, error: str) -> None:
         with self._lock:
-            self._state["claude"]["state"] = "degraded"
-            self._state["claude"]["last_error_at"] = _utc_now_iso()
-            self._state["claude"]["last_error"] = _normalize_reason(error)
+            self._state["agent"]["state"] = "degraded"
+            self._state["agent"]["last_error_at"] = _utc_now_iso()
+            self._state["agent"]["last_error"] = _normalize_reason(error)
+            self._sync_legacy_agent_locked()
             self._recompute_service_locked()
             self._write_health_locked()
+
+    # Compatibility names retained for shared runtime paths and external users.
+    def record_claude_ok(self) -> None:
+        self.record_agent_ok()
+
+    def record_claude_error(self, error: str) -> None:
+        self.record_agent_error(error)
 
     def _transport_locked(self) -> dict[str, Any]:
         return self._state.setdefault(
@@ -300,9 +331,9 @@ class DeferredHealthReporter:
         self._reporter: RuntimeHealthReporter | None = None
         self._lock = threading.RLock()
 
-    def bind(self, bot_data_dir: Path) -> None:
+    def bind(self, bot_data_dir: Path, agent_provider: str | None = None) -> None:
         with self._lock:
-            self._reporter = RuntimeHealthReporter(Path(bot_data_dir))
+            self._reporter = RuntimeHealthReporter(Path(bot_data_dir), agent_provider)
 
     def _get(self) -> RuntimeHealthReporter:
         with self._lock:
