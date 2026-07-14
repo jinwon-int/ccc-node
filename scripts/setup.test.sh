@@ -114,6 +114,50 @@ ok "setup injected staging failure exits non-zero" '[ "$rc" != 0 ]'
 ok "setup staging failure preserves installed artifacts byte-for-byte" \
   '[ "$(sha256sum "$txn_claude/settings.json")" = "$settings_txn_before" ] && [ "$(sha256sum "$txn_claude/hooks/old-local.sh")" = "$hook_txn_before" ] && [ "$(sha256sum "$txn_claude/settings.local.json")" = "$local_txn_before" ]'
 
+# Hook settings merge is collision-safe at the mechanism layer even though the
+# canonical base/overlay event sets remain disjoint by policy. Base hooks run
+# first, overlay hooks second, and unrelated top-level settings are preserved.
+merge_filter="$ROOT/scripts/merge-settings.jq"
+merge_base="$TMP/merge-base.json"
+merge_overlay="$TMP/merge-overlay.json"
+merge_out="$TMP/merge-out.json"
+printf '%s\n' '{"model":"base","hooks":{"SessionStart":[{"hooks":[{"command":"base-start"}]}]}}' > "$merge_base"
+printf '%s\n' '{"hooks":{"SessionStart":[{"hooks":[{"command":"overlay-start"}]}],"Stop":[{"hooks":[{"command":"overlay-stop"}]}]}}' > "$merge_overlay"
+if [ -f "$merge_filter" ]; then
+  jq -s -f "$merge_filter" "$merge_base" "$merge_overlay" > "$merge_out" 2>/dev/null
+  merge_rc=$?
+else
+  merge_rc=127
+fi
+ok "settings merge preserves both sides of a colliding hook event" \
+  '[ "$merge_rc" = 0 ] && jq -e '\''(.hooks.SessionStart | length) == 2 and .hooks.SessionStart[0].hooks[0].command == "base-start" and .hooks.SessionStart[1].hooks[0].command == "overlay-start"'\'' "$merge_out" >/dev/null'
+ok "settings merge preserves overlay-only events and base top-level settings" \
+  'jq -e '\''.model == "base" and .hooks.Stop[0].hooks[0].command == "overlay-stop"'\'' "$merge_out" >/dev/null'
+
+printf '%s\n' '{"model":"base-without-hooks"}' > "$merge_base"
+printf '%s\n' '{"hooks":{"Stop":[{"hooks":[{"command":"overlay-stop"}]}]}}' > "$merge_overlay"
+missing_base_out="$TMP/merge-missing-base.json"
+jq -s -f "$merge_filter" "$merge_base" "$merge_overlay" > "$missing_base_out" 2>/dev/null
+missing_base_rc=$?
+ok "settings merge accepts a base without hooks" \
+  '[ "$missing_base_rc" = 0 ] && jq -e '\''.model == "base-without-hooks" and (.hooks.Stop | length) == 1'\'' "$missing_base_out" >/dev/null'
+
+printf '%s\n' '{"hooks":{"SessionStart":[{"hooks":[{"command":"base-start"}]}]}}' > "$merge_base"
+printf '%s\n' '{"permissions":{"allow":[]}}' > "$merge_overlay"
+missing_overlay_out="$TMP/merge-missing-overlay.json"
+jq -s -f "$merge_filter" "$merge_base" "$merge_overlay" > "$missing_overlay_out" 2>/dev/null
+missing_overlay_rc=$?
+ok "settings merge accepts an overlay without hooks" \
+  '[ "$missing_overlay_rc" = 0 ] && jq -e '\''(.hooks.SessionStart | length) == 1'\'' "$missing_overlay_out" >/dev/null'
+
+printf '%s\n' '{"hooks":{"SessionStart":{}}}' > "$merge_base"
+printf '%s\n' '{"hooks":{"SessionStart":[]}}' > "$merge_overlay"
+jq -s -f "$merge_filter" "$merge_base" "$merge_overlay" > /dev/null 2>&1
+invalid_hook_rc=$?
+ok "settings merge rejects non-array hook event values" '[ "$invalid_hook_rc" != 0 ]'
+ok "setup uses the tracked collision-safe settings merge filter" \
+  'grep -Fq '\''jq -s -f "$SRC/scripts/merge-settings.jq"'\'' "$SETUP"'
+
 # HOME-path rewriting is source-driven. Existing node-local files outside the
 # installed harness must not be scanned or rewritten.
 rewrite_claude="$TMP/rewrite-claude"
