@@ -39,6 +39,7 @@ class StartStatusTests(unittest.TestCase):
         """
         resolved = dict(os.environ if env is None else env)
         resolved.pop("PROJECT_ROOT", None)
+        resolved.pop("CCC_AGENT_PROVIDER", None)
         return resolved
 
     def _run_status(
@@ -90,6 +91,7 @@ class StartStatusTests(unittest.TestCase):
         telegram_failures: int = 0,
         claude_state: str = "healthy",
         claude_error: str = "",
+        agent_provider: str | None = None,
     ) -> Path:
         now = updated_at or datetime.now(timezone.utc)
         health = {
@@ -126,6 +128,11 @@ class StartStatusTests(unittest.TestCase):
                 "last_error": claude_error,
             },
         }
+        if agent_provider is not None:
+            health["agent"] = {
+                "provider": agent_provider,
+                **health["claude"],
+            }
         health_file = project_root / ".telegram_bot" / "health.json"
         health_file.write_text(
             json.dumps(health, ensure_ascii=True, indent=2) + "\n",
@@ -324,6 +331,21 @@ class StartStatusTests(unittest.TestCase):
             self.assertIn("Telegram: degraded (health missing)", result.stdout)
             self.assertIn("Claude: degraded (health missing)", result.stdout)
 
+    def test_codex_status_missing_health_uses_configured_provider(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_root = self._prepare_project(tmpdir)
+            bot_dir = project_root / ".telegram_bot"
+            (bot_dir / "bot.pid").write_text(f"{os.getpid()}\n", encoding="utf-8")
+            (bot_dir / ".env").write_text(
+                "CCC_AGENT_PROVIDER=codex\n", encoding="utf-8"
+            )
+
+            result = self._run_status(project_root)
+
+            self.assertEqual(result.returncode, 0)
+            self.assertIn("Codex: degraded (health missing)", result.stdout)
+            self.assertNotIn("Claude: degraded (health missing)", result.stdout)
+
     def test_status_starting_from_fresh_health(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             project_root = self._prepare_project(tmpdir)
@@ -394,6 +416,23 @@ class StartStatusTests(unittest.TestCase):
             )
             self.assertIn("Telegram: degraded (connection lost)", result.stdout)
             self.assertIn("Claude: degraded (auth unavailable)", result.stdout)
+
+    def test_status_uses_codex_component_for_codex_health(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_root = self._prepare_project(tmpdir)
+            pid_file = project_root / ".telegram_bot" / "bot.pid"
+            pid_file.write_text(f"{os.getpid()}\n", encoding="utf-8")
+            self._write_health(
+                project_root,
+                pid=os.getpid(),
+                agent_provider="codex",
+            )
+
+            result = self._run_status(project_root)
+
+            self.assertEqual(result.returncode, 0)
+            self.assertIn("Codex: healthy", result.stdout)
+            self.assertNotIn("Claude: healthy", result.stdout)
 
     def test_status_stale_health_file_is_degraded(self):
         with tempfile.TemporaryDirectory() as tmpdir:

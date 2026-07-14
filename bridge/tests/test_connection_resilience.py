@@ -38,6 +38,8 @@ setattr(
         draft_update_interval=1.0,
         ffmpeg_path=None,
         claude_cli_path=None,
+        codex_cli_path="codex",
+        agent_provider="claude",
         claude_settings_path=_Path.home() / ".claude" / "settings.json",
     ),
 )
@@ -129,6 +131,29 @@ class TestConnectionResilience(unittest.TestCase):
         self.assertEqual(default_request["http_version"], "1.1")
         self.assertEqual(polling_request["proxy"], "http://proxy.example:8080")
         self.assertEqual(polling_request["http_version"], "1.1")
+
+    @patch("telegram_bot.core.bot_lifecycle.shutil.which", return_value="/usr/bin/codex")
+    @patch("telegram_bot.core.bot_lifecycle.subprocess.run")
+    def test_codex_readiness_uses_codex_login_status(self, mock_run, _mock_which):
+        mock_run.return_value = types.SimpleNamespace(
+            returncode=0,
+            stdout="Logged in using ChatGPT\n",
+            stderr="",
+        )
+        self.bot._config.agent_provider = "codex"
+        self.addCleanup(setattr, self.bot._config, "agent_provider", "claude")
+
+        ready, reason = self.bot._probe_agent_readiness()
+
+        self.assertTrue(ready)
+        self.assertEqual(reason, "")
+        mock_run.assert_called_once_with(
+            ["/usr/bin/codex", "login", "status"],
+            text=True,
+            capture_output=True,
+            timeout=15.0,
+            check=False,
+        )
 
     def test_invalid_token_raises_system_exit(self):
         """Test that InvalidToken during initialize raises SystemExit."""
