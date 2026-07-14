@@ -1313,9 +1313,28 @@ _acquire_platform_wakelock() {
 }
 
 run_daemon_supervisor() {
-    MAX_RAPID_CRASHES=5
-    RAPID_CRASH_WINDOW=60
-    RESTART_DELAY_BASE=3
+    # Crash/rapid-restart policy — single source shared with the in-process
+    # guard (core/bot_lifecycle.py via core/crash_policy.py). Sourcing
+    # crash-policy.env keeps this process-supervisor layer and the in-process
+    # layer from silently diverging (#445). Inline values below are a documented
+    # fallback that mirrors the file for when it is unreadable.
+    CCC_MAX_RAPID_CRASHES=5
+    CCC_PROCESS_CRASH_WINDOW_SECONDS=60
+    CCC_INPROCESS_MIN_UPTIME_SECONDS=30
+    CCC_RESTART_DELAY_BASE_SECONDS=3
+    CCC_RESTART_DELAY_MAX_SECONDS=30
+    if [ -r "$SCRIPT_DIR/crash-policy.env" ]; then
+        # shellcheck disable=SC1091
+        . "$SCRIPT_DIR/crash-policy.env"
+    fi
+    # Export so the python child inherits the exact same numbers (env has highest
+    # precedence in core.crash_policy).
+    export CCC_MAX_RAPID_CRASHES CCC_PROCESS_CRASH_WINDOW_SECONDS \
+        CCC_INPROCESS_MIN_UPTIME_SECONDS
+
+    MAX_RAPID_CRASHES="$CCC_MAX_RAPID_CRASHES"
+    RAPID_CRASH_WINDOW="$CCC_PROCESS_CRASH_WINDOW_SECONDS"
+    RESTART_DELAY_BASE="$CCC_RESTART_DELAY_BASE_SECONDS"
     rapid_crash_count=0
     child_pid=""
 
@@ -1392,8 +1411,8 @@ run_daemon_supervisor() {
         fi
 
         restart_delay=$((RESTART_DELAY_BASE * (rapid_crash_count + 1)))
-        if [ "$restart_delay" -gt 30 ]; then
-            restart_delay=30
+        if [ "$restart_delay" -gt "$CCC_RESTART_DELAY_MAX_SECONDS" ]; then
+            restart_delay="$CCC_RESTART_DELAY_MAX_SECONDS"
         fi
         echo "🔄 Auto-restarting in ${restart_delay} seconds..."
         sleep "$restart_delay"
