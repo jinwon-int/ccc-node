@@ -50,52 +50,21 @@ REPO_FILE="$CLAUDE_DIR/self-update.repo"
 BRANCH="${CCC_SELF_UPDATE_BRANCH:-main}"
 SYSTEMCTL="${CCC_SELF_UPDATE_SYSTEMCTL:-systemctl}"
 
-validate_runtime_paths() {
-  python3 - "$CLAUDE_DIR" "$HERMES_ROOT" "$STATE_DIR" <<'PY'
-import os
-import pathlib
-import stat
-import sys
+SELF_UPDATE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)"
+HARNESS_PATHS_LIB="$SELF_UPDATE_DIR/lib/harness-paths.sh"
+if [ ! -r "$HARNESS_PATHS_LIB" ]; then
+  printf '%s\n' "self-update: shared harness path library is missing: $HARNESS_PATHS_LIB" >&2
+  exit 4
+fi
+# shellcheck source=/dev/null
+. "$HARNESS_PATHS_LIB"
 
-normalized = []
-for raw in sys.argv[1:]:
-    if not raw or not os.path.isabs(raw):
-        print(f"self-update: path must be absolute: {raw!r}", file=sys.stderr)
-        raise SystemExit(1)
-    path = os.path.normpath(os.path.join(os.path.sep, os.path.relpath(raw, os.path.sep)))
-    if path == os.path.sep:
-        print("self-update: refusing filesystem-root path", file=sys.stderr)
-        raise SystemExit(1)
-    current = pathlib.Path(os.path.sep)
-    for part in pathlib.PurePath(path).parts[1:]:
-        current /= part
-        try:
-            mode = current.lstat().st_mode
-        except FileNotFoundError:
-            continue
-        if stat.S_ISLNK(mode):
-            print(f"self-update: path contains symlink component: {current}", file=sys.stderr)
-            raise SystemExit(1)
-    normalized.append(path)
-claude, hermes, state = normalized
-if claude == hermes or claude.startswith(hermes + os.sep) or hermes.startswith(claude + os.sep):
-    print("self-update: Claude and Hermes roots must not overlap", file=sys.stderr)
-    raise SystemExit(1)
-if not (state == claude or state.startswith(claude + os.sep)):
-    print("self-update: state directory must be inside the Claude root", file=sys.stderr)
-    raise SystemExit(1)
-PY
-}
-validate_runtime_paths || exit 4
+ccc_validate_self_update_roots "$CLAUDE_DIR" "$HERMES_ROOT" "$STATE_DIR" || exit 4
 mkdir -p "$STATE_DIR" 2>/dev/null
 INSTALL_SNAPSHOT_DIR=""
 CLAUDE_SNAPSHOT=""
 HERMES_SNAPSHOT=""
 KEEP_INSTALL_SNAPSHOT=0
-INSTALLED_PATHS=(
-  settings.json settings.local.json hooks output-styles headless.sh
-  agents commands skills CLAUDE.md memories
-)
 
 ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 log() { printf '%s %s\n' "$(ts)" "$*" >> "$LOG" 2>/dev/null; }
@@ -132,42 +101,12 @@ audit() { # <result> <old> <new> <changed> <setup_ok> <services-json>
 
 snapshot_installed_artifacts() {
   local existing=() item
-  python3 - "$CLAUDE_DIR" "$HERMES_ROOT" "${INSTALLED_PATHS[@]}" <<'PY' || return 1
-import pathlib
-import stat
-import sys
-
-claude = pathlib.Path(sys.argv[1])
-hermes = pathlib.Path(sys.argv[2])
-for item in sys.argv[3:]:
-    root = claude / item
-    candidates = [root]
-    if root.is_dir() and not root.is_symlink():
-        candidates.extend(root.rglob("*"))
-    for candidate in candidates:
-        if candidate.is_symlink():
-            print(f"self-update: refusing managed artifact symlink: {candidate}", file=sys.stderr)
-            raise SystemExit(1)
-        try:
-            mode = candidate.lstat().st_mode
-        except FileNotFoundError:
-            continue
-        if stat.S_ISREG(mode) and candidate.stat().st_nlink != 1:
-            print(f"self-update: refusing managed artifact hardlink: {candidate}", file=sys.stderr)
-            raise SystemExit(1)
-honcho = hermes / "honcho.json"
-if honcho.is_symlink():
-    print(f"self-update: refusing managed artifact symlink: {honcho}", file=sys.stderr)
-    raise SystemExit(1)
-if honcho.exists() and honcho.is_file() and honcho.stat().st_nlink != 1:
-    print(f"self-update: refusing managed artifact hardlink: {honcho}", file=sys.stderr)
-    raise SystemExit(1)
-PY
+  ccc_validate_managed_artifacts "self-update:" "$CLAUDE_DIR" "$HERMES_ROOT" "${CCC_MANAGED_PATHS[@]}" || return 1
   INSTALL_SNAPSHOT_DIR="$(mktemp -d "$STATE_DIR/self-update-install-rollback.XXXXXX")" || return 1
   chmod 700 "$INSTALL_SNAPSHOT_DIR" || return 1
   CLAUDE_SNAPSHOT="$INSTALL_SNAPSHOT_DIR/claude.tar.gz"
   HERMES_SNAPSHOT="$INSTALL_SNAPSHOT_DIR/hermes.tar.gz"
-  for item in "${INSTALLED_PATHS[@]}"; do
+  for item in "${CCC_MANAGED_PATHS[@]}"; do
     { [ -e "$CLAUDE_DIR/$item" ] || [ -L "$CLAUDE_DIR/$item" ]; } && existing+=("$item")
   done
   if [ "${#existing[@]}" -gt 0 ]; then
@@ -183,7 +122,7 @@ PY
   chmod 600 "$CLAUDE_SNAPSHOT" "$HERMES_SNAPSHOT" || return 1
   tar -tzf "$CLAUDE_SNAPSHOT" >/dev/null || return 1
   tar -tzf "$HERMES_SNAPSHOT" >/dev/null || return 1
-  python3 - "$CLAUDE_SNAPSHOT" "$HERMES_SNAPSHOT" "${INSTALLED_PATHS[*]}" <<'PY' || return 1
+  python3 - "$CLAUDE_SNAPSHOT" "$HERMES_SNAPSHOT" "${CCC_MANAGED_PATHS[*]}" <<'PY' || return 1
 import pathlib
 import sys
 import tarfile
@@ -205,7 +144,7 @@ PY
 
 restore_installed_artifacts() {
   local item failed=0
-  for item in "${INSTALLED_PATHS[@]}"; do
+  for item in "${CCC_MANAGED_PATHS[@]}"; do
     rm -rf -- "$CLAUDE_DIR/$item" || failed=1
   done
   mkdir -p "$CLAUDE_DIR" "$HERMES_ROOT" || failed=1
@@ -324,39 +263,7 @@ rm -f "$DEFER_MARK" 2>/dev/null
 
 REPO="$(resolve_repo)"
 
-validate_repo_path() {
-  python3 - "$REPO" "$CLAUDE_DIR" "$HERMES_ROOT" <<'PY'
-import os
-import pathlib
-import stat
-import sys
-
-raw, claude, hermes = sys.argv[1:]
-if not raw or not os.path.isabs(raw):
-    print("self-update: repository path must be absolute", file=sys.stderr)
-    raise SystemExit(1)
-repo = os.path.normpath(os.path.join(os.path.sep, os.path.relpath(raw, os.path.sep)))
-if repo == os.path.sep:
-    print("self-update: refusing filesystem-root repository", file=sys.stderr)
-    raise SystemExit(1)
-for other in (claude, hermes):
-    other = os.path.normpath(os.path.join(os.path.sep, os.path.relpath(other, os.path.sep)))
-    if repo == other or repo.startswith(other + os.sep) or other.startswith(repo + os.sep):
-        print("self-update: repository and install roots must not overlap", file=sys.stderr)
-        raise SystemExit(1)
-current = pathlib.Path(os.path.sep)
-for part in pathlib.PurePath(repo).parts[1:]:
-    current /= part
-    try:
-        mode = current.lstat().st_mode
-    except FileNotFoundError:
-        continue
-    if stat.S_ISLNK(mode):
-        print(f"self-update: repository path contains symlink component: {current}", file=sys.stderr)
-        raise SystemExit(1)
-PY
-}
-validate_repo_path || exit 4
+ccc_validate_self_update_repo "$REPO" "$CLAUDE_DIR" "$HERMES_ROOT" || exit 4
 
 # --- preconditions ------------------------------------------------------------
 if [ ! -d "$REPO/.git" ]; then
