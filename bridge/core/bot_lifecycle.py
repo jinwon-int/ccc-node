@@ -363,6 +363,35 @@ class BotLifecycleMixin:
 
         return False, "claude authentication unavailable"
 
+    def _probe_codex_readiness(self) -> tuple[bool, str]:
+        configured_path = str(getattr(self._config, "codex_cli_path", "codex")).strip()
+        cli_path = shutil.which(configured_path) or ""
+        if not cli_path:
+            return False, "codex command not found"
+
+        try:
+            proc = subprocess.run(
+                [cli_path, "login", "status"],
+                text=True,
+                capture_output=True,
+                timeout=float(os.getenv("CODEX_AUTH_STATUS_TIMEOUT", "15")),
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            return False, "codex login status timed out"
+        except Exception as exc:
+            return False, f"codex login status failed: {exc}"
+
+        if proc.returncode == 0:
+            return True, ""
+        return False, "codex authentication unavailable"
+
+    def _probe_agent_readiness(self) -> tuple[bool, str]:
+        provider = str(getattr(self._config, "agent_provider", "claude")).lower()
+        if provider == "codex":
+            return self._probe_codex_readiness()
+        return self._probe_claude_readiness()
+
     async def _run_async(self):  # noqa: C901 -- #348 baseline hotspot
         """Async entry: manage Application lifecycle and polling restart loop."""
         # Isolate child claude/bash/pytest process trees into their own session so a
@@ -452,13 +481,13 @@ class BotLifecycleMixin:
 
                 logger.info("Bot is running")
                 health_reporter.record_telegram_ok()
-                claude_ready, claude_reason = await asyncio.to_thread(
-                    self._probe_claude_readiness
+                agent_ready, agent_reason = await asyncio.to_thread(
+                    self._probe_agent_readiness
                 )
-                if claude_ready:
-                    health_reporter.record_claude_ok()
+                if agent_ready:
+                    health_reporter.record_agent_ok()
                 else:
-                    health_reporter.record_claude_error(claude_reason)
+                    health_reporter.record_agent_error(agent_reason)
 
                 watchdog_task = asyncio.create_task(self._polling_watchdog(stop_event))
                 push_task = asyncio.create_task(

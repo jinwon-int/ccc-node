@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **Provider-aware bridge health (#481).** Runtime readiness now probes the
+  configured agent provider: Claude nodes use `claude auth status --json`,
+  while Codex nodes use `codex login status`. `health.json` publishes the
+  active provider under `agent`, and `start.sh --status` labels that component
+  as Claude or Codex while retaining the legacy `claude` field for schema-v1
+  consumers.
 - **Unrestricted Codex package default (#415).** The default `auto-approve`
   policy now sends `approvalPolicy=never`, no reviewer, and
   `sandboxPolicy={type: dangerFullAccess}` on every Codex turn regardless of

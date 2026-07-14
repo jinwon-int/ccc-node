@@ -120,6 +120,33 @@ class RuntimeHealthReporterTests(unittest.TestCase):
                 str(other_pid),
             )
 
+    def test_codex_provider_reports_active_agent_and_legacy_alias(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_root = Path(tmpdir)
+            module = self._load_health_module(project_root)
+            reporter = module.RuntimeHealthReporter(
+                project_root / ".telegram_bot", agent_provider="codex"
+            )
+
+            reporter.initialize_process()
+            reporter.record_telegram_ok()
+            reporter.record_agent_error("codex authentication unavailable")
+
+            health = json.loads(reporter.health_file.read_text(encoding="utf-8"))
+            self.assertEqual(health["agent"]["provider"], "codex")
+            self.assertEqual(health["agent"]["state"], "degraded")
+            self.assertEqual(health["claude"]["state"], "degraded")
+            self.assertEqual(
+                health["service"]["reason"],
+                "Codex: codex authentication unavailable",
+            )
+
+            reporter.record_agent_ok()
+            health = json.loads(reporter.health_file.read_text(encoding="utf-8"))
+            self.assertEqual(health["agent"]["state"], "healthy")
+            self.assertEqual(health["claude"]["state"], "healthy")
+            self.assertEqual(health["service"]["state"], "available")
+
 
 if __name__ == "__main__":
     unittest.main()

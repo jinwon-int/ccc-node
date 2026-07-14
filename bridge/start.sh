@@ -392,8 +392,28 @@ print_component_status() {
     printf '\n'
 }
 
+configured_agent_provider() {
+    local provider="${CCC_AGENT_PROVIDER:-}"
+    if [ -z "$provider" ]; then
+        provider="$(read_env_with_fallback "CCC_AGENT_PROVIDER")"
+    fi
+    if [ "$(printf '%s' "$provider" | tr '[:upper:]' '[:lower:]')" = "codex" ]; then
+        echo "codex"
+    else
+        echo "claude"
+    fi
+}
+
+configured_agent_label() {
+    if [ "$(configured_agent_provider)" = "codex" ]; then
+        echo "Codex"
+    else
+        echo "Claude"
+    fi
+}
+
 render_status_from_health() {
-    python3 - "$1" "$2" "$3" <<'PY'
+    python3 - "$1" "$2" "$3" "$4" <<'PY'
 import json
 import sys
 from datetime import datetime, timezone
@@ -402,6 +422,8 @@ from pathlib import Path
 health_path = Path(sys.argv[1])
 pid = sys.argv[2]
 stale_seconds = int(sys.argv[3])
+configured_provider = sys.argv[4]
+configured_agent_label = "Codex" if configured_provider == "codex" else "Claude"
 
 
 def parse_iso(value: str | None):
@@ -432,7 +454,7 @@ if not health_path.exists():
     print(line("Process", "alive", f"PID: {pid}"))
     print(line("Service", "degraded", "health missing"))
     print(line("Telegram", "degraded", "health missing"))
-    print(line("Claude", "degraded", "health missing"))
+    print(line(configured_agent_label, "degraded", "health missing"))
     raise SystemExit(0)
 
 try:
@@ -442,7 +464,7 @@ except Exception as exc:
     print(line("Process", "alive", f"PID: {pid}"))
     print(line("Service", "degraded", f"invalid health file: {exc}"))
     print(line("Telegram", "degraded", "health unreadable"))
-    print(line("Claude", "degraded", "health unreadable"))
+    print(line(configured_agent_label, "degraded", "health unreadable"))
     raise SystemExit(0)
 
 updated_at = parse_iso(data.get("updated_at"))
@@ -452,7 +474,9 @@ if updated_at is not None:
 
 service = data.get("service") or {}
 telegram = data.get("telegram") or {}
-claude = data.get("claude") or {}
+agent = data.get("agent") or data.get("claude") or {}
+provider = str(agent.get("provider") or configured_provider).strip().lower()
+agent_label = "Codex" if provider == "codex" else "Claude"
 
 if age_seconds is None or age_seconds > stale_seconds:
     detail = "health stale"
@@ -462,15 +486,15 @@ if age_seconds is None or age_seconds > stale_seconds:
     print(line("Process", "alive", f"PID: {pid}"))
     print(line("Service", "degraded", detail))
     print(line("Telegram", "degraded", detail))
-    print(line("Claude", "degraded", detail))
+    print(line(agent_label, "degraded", detail))
     raise SystemExit(0)
 
 service_state = service.get("state") or "degraded"
 service_reason = service.get("reason") or ""
 telegram_state = telegram.get("state") or "degraded"
 telegram_reason = telegram.get("last_error") or ""
-claude_state = claude.get("state") or "degraded"
-claude_reason = claude.get("last_error") or ""
+agent_state = agent.get("state") or "degraded"
+agent_reason = agent.get("last_error") or ""
 
 icons = {
     "available": "🟢",
@@ -482,7 +506,7 @@ print(f"{icons.get(service_state, '🟡')} Bot status: {service_state}")
 print(line("Process", "alive", f"PID: {pid}"))
 print(line("Service", service_state, service_reason))
 print(line("Telegram", telegram_state, telegram_reason if telegram_state != "healthy" else ""))
-print(line("Claude", claude_state, claude_reason if claude_state != "healthy" else ""))
+print(line(agent_label, agent_state, agent_reason if agent_state != "healthy" else ""))
 PY
 }
 
@@ -493,7 +517,8 @@ PY
 # was deleted by a dying concurrent instance, or it was started foreground in
 # an ssh session). Report it instead of declaring the bot dead.
 report_unmanaged_or_dead() {
-    local reason="$1" live_pids
+    local reason="$1" live_pids agent_label
+    agent_label="$(configured_agent_label)"
     live_pids="$(find_project_bot_pids | tr '\n' ' ' | sed 's/ $//')"
     if [ -n "$live_pids" ]; then
         echo "🟡 Bot status: degraded"
@@ -506,7 +531,7 @@ report_unmanaged_or_dead() {
     print_component_status "Process" "dead" "$reason"
     print_component_status "Service" "unavailable" "process not running"
     print_component_status "Telegram" "unavailable" "process not running"
-    print_component_status "Claude" "unavailable" "process not running"
+    print_component_status "$agent_label" "unavailable" "process not running"
 }
 
 do_status() {
@@ -517,7 +542,8 @@ do_status() {
         exit 0
     fi
     if kill -0 "$pid" 2>/dev/null; then
-        render_status_from_health "$HEALTH_FILE" "$pid" "$HEALTH_STALE_SECONDS"
+        render_status_from_health \
+            "$HEALTH_FILE" "$pid" "$HEALTH_STALE_SECONDS" "$(configured_agent_provider)"
     else
         cleanup_pid
         report_unmanaged_or_dead "stale PID: $pid"
