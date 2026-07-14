@@ -14,7 +14,18 @@ set -uo pipefail
 CFG="${CCC_HONCHO_CFG:-${HOME:-/root}/.hermes/honcho.json}"
 STATE_DIR="${CCC_STATE_DIR:-${HOME:-/root}/.claude/state}"
 QUEUE="$STATE_DIR/honcho-queue.jsonl"
+QUEUE_LOCK="$STATE_DIR/.honcho-queue.lock"
 mkdir -p "$STATE_DIR" 2>/dev/null
+
+append_retry_payload() {
+  # queue-drain holds this lock only for local rename/merge operations, never
+  # while calling Honcho. A producer therefore waits only for a short critical
+  # section and cannot append to an inode that the drainer is about to replace.
+  (
+    flock 9 || exit 1
+    printf '%s\n' "$PAYLOAD" >> "$QUEUE"
+  ) 9>"$QUEUE_LOCK"
+}
 
 [ -f "$CFG" ] || { echo "no honcho.json"; exit 0; }
 
@@ -60,7 +71,7 @@ fi
 # payload for later SessionStart drain without burning queue-drain retry attempts.
 HEALTH_HTTP="$(curl -sS -m "${CCC_HONCHO_HEALTH_TIMEOUT:-3}" -o /dev/null -w "%{http_code}" "$BASE/health" 2>/dev/null || true)"
 if ! printf '%s' "$HEALTH_HTTP" | grep -Eq '^(200|204)$'; then
-  printf '%s\n' "$PAYLOAD" >> "$QUEUE" 2>/dev/null || true
+  append_retry_payload 2>/dev/null || true
   echo "honcho /health probe failed http=${HEALTH_HTTP:-000} session=$SID facts=$N; queued for retry"
   exit 1
 fi
@@ -123,6 +134,6 @@ else
   echo "honcho push failed http=$HTTP session=$SID facts=$N"
   echo "body=$(printf '%s' "$BODY" | head -c 400)"
   # Queue for retry (best-effort).
-  printf '%s\n' "$PAYLOAD" >> "$QUEUE" 2>/dev/null
+  append_retry_payload 2>/dev/null || true
   exit 1
 fi
