@@ -32,8 +32,10 @@ ok "shared implementation stays portable" \
 if [ -r "$LIB" ]; then
   # shellcheck source=/dev/null
   . "$LIB"
-  expected="settings.json settings.local.json hooks output-styles headless.sh agents commands skills CLAUDE.md memories"
+  expected="settings.json hooks output-styles headless.sh agents commands skills CLAUDE.md memories"
   ok "managed paths have one canonical ordered definition" '[ "${CCC_MANAGED_PATHS[*]}" = "$expected" ]'
+  # settings.local.json is the node-local approvals file and must NOT be managed (#454).
+  ok "settings.local.json is excluded from managed paths" '[[ " ${CCC_MANAGED_PATHS[*]} " != *" settings.local.json "* ]]'
 
   claude="$TMP/claude"; hermes="$TMP/hermes"; state="$claude/state"; repo="$TMP/repo"
   mkdir -p "$claude/hooks" "$hermes" "$state" "$repo"
@@ -43,11 +45,11 @@ if [ -r "$LIB" ]; then
   ok "repository cannot overlap install roots" '! ccc_validate_self_update_repo "$claude/repo" "$claude" "$hermes" >/dev/null 2>&1'
   ok "distinct repository path is accepted" 'ccc_validate_self_update_repo "$repo" "$claude" "$hermes" >/dev/null 2>&1'
 
-  ln -s "$TMP/missing" "$claude/settings.local.json"
+  ln -s "$TMP/missing" "$claude/settings.json"
   ok "managed artifact symlink is rejected" \
     '! ccc_validate_managed_artifacts "ERROR:" "$claude" "$hermes" "${CCC_MANAGED_PATHS[@]}" >/dev/null 2>&1'
-  rm -f "$claude/settings.local.json"
-  printf x > "$TMP/hard-target"; ln "$TMP/hard-target" "$claude/settings.local.json"
+  rm -f "$claude/settings.json"
+  printf x > "$TMP/hard-target"; ln "$TMP/hard-target" "$claude/settings.json"
   ok "managed artifact hardlink is rejected" \
     '! ccc_validate_managed_artifacts "self-update:" "$claude" "$hermes" "${CCC_MANAGED_PATHS[@]}" >/dev/null 2>&1'
 fi

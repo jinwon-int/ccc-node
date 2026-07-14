@@ -90,12 +90,12 @@ ok "snapshot chmod failure is fail-closed before setup" \
   '[ "$rc" = 6 ] && [ "$(wc -l < "$SETUP_MARKER")" = "$setup_count_before" ] && grep -q "artifact-snapshot-failed" "$STATE/self-update.log"'
 rm -f "$FAKEBIN/chmod"
 
-ln -s "$TMP/missing-managed-target" "$CLAUDE/settings.local.json"
+ln -s "$TMP/missing-managed-target" "$CLAUDE/settings.json"
 setup_count_before="$(wc -l < "$SETUP_MARKER")"
 out="$(run_selfup run --force 2>&1)"; rc=$?
 ok "managed artifact symlink is rejected before setup" \
   '[ "$rc" = 6 ] && [ "$(wc -l < "$SETUP_MARKER")" = "$setup_count_before" ] && grep -q "artifact-snapshot-failed" "$STATE/self-update.log"'
-rm -f "$CLAUDE/settings.local.json"
+rm -f "$CLAUDE/settings.json"
 
 # --- 3) service restart failure is reported ------------------------------------
 echo change3 > "$TMP/seed/file.txt"
@@ -119,7 +119,6 @@ INSTALLED_BEFORE="$(sha256sum "$CLAUDE/hooks/installed-hook.sh")"
 cat > "$TMP/seed/setup.sh" <<'SH'
 #!/usr/bin/env bash
 printf '%s\n' 'partially-updated-hook' > "${CCC_CLAUDE_DIR:?}/hooks/installed-hook.sh"
-rm -f "${CCC_CLAUDE_DIR:?}/settings.local.json"
 printf '%s\n' 'partially-created-headless' > "${CCC_CLAUDE_DIR:?}/headless.sh"
 printf '%s\n' '{"newHoncho":true}' > "${CCC_HERMES_DIR:?}/honcho.json"
 exit 1
@@ -129,8 +128,11 @@ out="$(run_selfup run 2>&1)"; rc=$?
 ok "setup failure exits non-zero and rolls back" '[ "$rc" = 6 ] && [ "$(git -C "$REPO" rev-parse HEAD)" = "$OLD_HEAD" ]'
 ok "setup failure restores installed artifacts" '[ "$(sha256sum "$CLAUDE/hooks/installed-hook.sh")" = "$INSTALLED_BEFORE" ]'
 ok "setup failure restores Hermes honcho artifact" 'grep -q "oldHoncho" "$HERMES/honcho.json"'
-ok "setup failure restores regular and absent artifacts" \
-  'grep -q "oldLocal" "$CLAUDE/settings.local.json" && [ ! -e "$CLAUDE/headless.sh" ]'
+ok "setup failure keeps managed absent artifact absent" '[ ! -e "$CLAUDE/headless.sh" ]'
+# settings.local.json is node-local (unmanaged): self-update's snapshot/deploy/
+# rollback lifecycle never touches it, so a node's approvals survive intact (#454).
+ok "self-update leaves node-local settings.local.json untouched" \
+  'grep -q "oldLocal" "$CLAUDE/settings.local.json"'
 ok "rollback audit recorded" 'grep -q "setup-failed-rolled-back" "$STATE/self-update.log"'
 ok "successful artifact rollback removes private recovery snapshot" \
   '! compgen -G "$STATE/self-update-install-rollback.*" >/dev/null'

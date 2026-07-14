@@ -177,14 +177,15 @@ merge_settings_json() {
 }
 
 # Snapshot the existing ~/.claude config BEFORE we overwrite anything. setup.sh unconditionally
-# overwrites settings.json, settings.local.json and the hook/output-style/agent/command/skill
-# dirs — on a node that already has a configured identity that is destructive, so we tar a
-# restore point first. Credentials (~/.claude/.credentials.json) are intentionally NOT included.
+# overwrites settings.json and the hook/output-style/agent/command/skill dirs — on a node that
+# already has a configured identity that is destructive, so we tar a restore point first.
+# settings.local.json is NOT backed up here: it is node-local and only seeded when absent, so
+# setup never overwrites it (#454). Credentials (~/.claude/.credentials.json) are also NOT included.
 backup_claude_dir() {
   if [ "$BACKUP" != 1 ]; then note "backup skipped (--no-backup)"; return 0; fi
   [ -d "$CLAUDE_DIR" ] || { note "no existing $CLAUDE_DIR — nothing to back up"; return 0; }
   local items=() p
-  for p in settings.json settings.local.json hooks output-styles agents commands skills; do
+  for p in settings.json hooks output-styles agents commands skills; do
     [ -e "$CLAUDE_DIR/$p" ] && items+=("$p")
   done
   if [ "${#items[@]}" -eq 0 ]; then note "fresh install — no overwritable config to back up"; return 0; fi
@@ -221,7 +222,14 @@ if [ "$WITH_PLUGIN" = 1 ]; then
 else
   merge_settings_json "$SRC/claude/settings.base.json" "$SRC/claude/hooks/enforcement-overlay.json" "$CLAUDE_DIR/settings.json"
 fi
-run cp "$SRC/claude/settings.local.json" "$CLAUDE_DIR/settings.local.json"
+# settings.local.json is the NODE-LOCAL approvals file — seed it from the
+# template ONLY when absent so a node's accumulated/hand-added approvals are
+# never clobbered by setup or self-update (#454). It is not a managed artifact.
+if [ ! -e "$CLAUDE_DIR/settings.local.json" ]; then
+  run cp "$SRC/claude/settings.local.template.json" "$CLAUDE_DIR/settings.local.json"
+else
+  note "settings.local.json already present — left untouched (node-local approvals)"
+fi
 run cp "$SRC/claude/hooks/lib/spawn-detached.sh" "$CLAUDE_DIR/hooks/lib/spawn-detached.sh"
 run cp "$SRC/scripts/lib/harness-paths.sh" "$CLAUDE_DIR/hooks/lib/harness-paths.sh"
 run cp "$SRC/scripts/lib/harness_paths.py" "$CLAUDE_DIR/hooks/lib/harness_paths.py"
@@ -369,7 +377,7 @@ if [ "$CLAUDE_DIR" != "/root/.claude" ]; then
     render_command rewrite-root-paths "/root/.claude" "$CLAUDE_DIR"
   else
     rewrite_targets=(
-      "$CLAUDE_DIR/settings.json" "$CLAUDE_DIR/settings.local.json"
+      "$CLAUDE_DIR/settings.json"
       "$CLAUDE_DIR/headless.sh"
       "$CLAUDE_DIR/hooks/ccc_memory_index.py"
       "$CLAUDE_DIR/hooks/ccc_memory_search.py"

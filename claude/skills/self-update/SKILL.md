@@ -15,16 +15,17 @@ has a rollback path.**
 `setup.sh` only overwrites **node-agnostic** harness files and **preserves node
 identity**:
 
-- **Overwritten** (common harness): `settings.json` / `settings.local.json`,
+- **Overwritten** (common harness): `settings.json`,
   `hooks/*.sh`, `agents/`, `commands/`, `skills/`, `output-styles/`, `headless.sh`.
-- **Preserved** (seeded only if absent — never overwritten): `CLAUDE.md`,
-  `memories/MEMORY.md`, `memories/USER.md`, `~/.hermes/honcho.json`,
+- **Preserved** (seeded only if absent — never overwritten): `settings.local.json`
+  (node-local approvals, seeded from `settings.local.template.json`; #454),
+  `CLAUDE.md`, `memories/MEMORY.md`, `memories/USER.md`, `~/.hermes/honcho.json`,
   `hooks/tools-cheatsheet.md`.
 - The old `~/.claude` is snapshotted to `~/.claude/backups/ccc-node-setup-<ts>.tar.gz`
   before anything is written (unless `--no-backup`, which self-update must NOT use).
 
-> Caveat: `settings.json`/`settings.local.json` ARE overwritten. If this node has
-> local settings customizations, confirm they survive (or re-apply from the backup)
+> Caveat: `settings.json` IS overwritten. If this node has local settings.json
+> customizations, confirm they survive (or re-apply from the backup)
 > after updating.
 
 ## Procedure

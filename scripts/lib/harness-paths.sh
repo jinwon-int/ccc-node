@@ -5,8 +5,12 @@
 _CCC_HARNESS_PATHS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 _CCC_HARNESS_PATHS_PY="$_CCC_HARNESS_PATHS_DIR/harness_paths.py"
 
+# settings.local.json is intentionally EXCLUDED: it is the node-local Claude Code
+# approvals file, not a managed artifact. setup.sh seeds it from
+# claude/settings.local.template.json only when absent; self-update must never
+# redeploy, snapshot, or roll it back over a node's accumulated approvals (#454).
 CCC_MANAGED_PATHS=(
-  settings.json settings.local.json hooks output-styles headless.sh
+  settings.json hooks output-styles headless.sh
   agents commands skills CLAUDE.md memories
 )
 
