@@ -28,6 +28,9 @@ backups/
 # Local convenience symlink to bridge/ (created per-node, not part of the template)
 /telegram_bot
 
+# Per-node bridge runtime state (health/sessions/tasks snapshots — mechanism repo, not node state)
+/.telegram_bot/
+
 # Python bytecode
 __pycache__/
 *.pyc
