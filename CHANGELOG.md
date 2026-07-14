@@ -79,6 +79,19 @@ All notable changes to the Claude Code node harness. Dates are KST.
   tagged (`v0.4.0`) or historical (`0.3.18`) headings when extracting notes.
 
 ### Fixed
+- Codex assistant replies lost paragraph spacing in Telegram (turning the readable
+  flags on changed nothing). Codex streams text as `item/agentMessage/delta` chunks
+  joined with no separator (`"".join` in `project_chat_process`, and the streaming
+  accumulator), and the `item/completed` boundary that ends each assistant message
+  was dropped in the runtime — so consecutive messages fused (`…다.현재…`), unlike the
+  Claude path which sources `msg.result` with its `\n\n` intact. Since the readable
+  renderer only *widens existing* blank lines, it could not restore a break Codex
+  never emitted. `core/codex_runtime.py` now emits a `\n\n` text delta on a completed
+  `agentMessage`, gated by an `emitted_text` flag so the separator only follows real
+  text, never leads, and an empty message cannot double it. It rides the existing
+  delta stream, so both the non-streaming join and the streaming accumulator recover
+  the boundary and the renderer can space paragraphs. Regression coverage in
+  `tests/test_codex_runtime.py`.
 - `ccc_doctor.py --json` stdout is now strictly machine-parseable (#404):
   `scripts/ccc_doctor.py --json` runs the whole diagnosis with the real stdout
   file descriptor redirected to stderr and writes the single JSON document to a
