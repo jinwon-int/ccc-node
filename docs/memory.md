@@ -24,6 +24,30 @@ ccc-node memory starts from a no-network SessionStart snapshot and refreshes cac
 - Diagnostics should report counts, statuses, paths, and cache ages only; do not print memory snippets or secrets in fleet reports.
 - On Termux, use `${TMPDIR:-$HOME/tmp}` for scratch and keep state under the user's writable home/state directory.
 
+## Codex distill extraction boundary
+
+The Codex write-back path is intentionally staged. The current extraction boundary is
+pure and provider-neutral: it accepts an already bounded `CodexTranscriptSnapshot`,
+redacts credential-like text, serializes deterministic input, and validates a strict
+versioned result before any future provider or sink boundary.
+
+- `bridge/memory/distill_extraction.py` contains the input/output models,
+  `DistillBackend` protocol, privacy gates, canonical input serializer, strict JSON
+  parser, and body-free diagnostics.
+- `schemas/codex-distill-extraction-v1.schema.json` is the checked-in provider output
+  schema. Every object rejects additional properties. Honcho facts are capped at 12,
+  Wiki candidates at 3, Wiki paths are limited to relative `pages/team/...`,
+  `pages/nodes/...`, or `pages/log.md` targets, and resume/evidence fields are bounded.
+- `CCC_WIKI_MEMORY_ENABLED=0` must be represented to the parser as Wiki-disabled; any
+  non-empty `wiki_candidates` result then fails closed.
+- Transcript text remains untrusted data. Credential-like content is redacted before
+  canonical input serialization, while credential-like or directive-like durable
+  Honcho/Wiki output is rejected.
+- This boundary performs no Codex/Claude/provider call, subprocess or network access,
+  journal transition, or local/Honcho/Wiki/resume sink mutation. A later child must
+  implement an isolated backend and keep the user-facing Codex thread out of the
+  extraction context.
+
 ## Useful commands
 
 - `scripts/ccc-memory-check.sh` — cache and source health.

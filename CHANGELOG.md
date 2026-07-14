@@ -25,6 +25,12 @@ All notable changes to the Claude Code node harness. Dates are KST.
   per statement; one non-fleet target denies the whole command.
 
 ### Added
+- Strict provider-neutral Codex distill extraction boundary (#476): deterministic
+  credential-redacted input with an explicit untrusted-content marker, recursive
+  unknown-field rejection, bounded Honcho/Wiki/resume output, safe relative Wiki
+  targets, directive/credential fail-closed gates, body-free diagnostics, and a
+  checked-in JSON Schema. This source-only phase exposes `DistillBackend` but makes
+  no provider call, journal transition, or sink mutation.
 - Managed-nodes allowlist for owned-node writes (opt-in, fail-closed). Operator-owned
   `~/.claude/managed-nodes.allow` (override `CCC_MANAGED_NODES_ALLOW`) lists the remote
   hosts this node operates. For a Bash statement whose only remote reach (via
