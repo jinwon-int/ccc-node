@@ -1,0 +1,6 @@
+{
+  "//": "Seed template for the NODE-LOCAL Claude Code approvals file. setup.sh copies this to ~/.claude/settings.local.json ONLY when that file is absent, and never again — node-local approvals accumulated during sessions must survive setup/self-update (#454). This file is intentionally NOT in CCC_MANAGED_PATHS, so self-update never redeploys or rolls it back. Keep it minimal: broad fleet-wide grants do not belong here.",
+  "permissions": {
+    "allow": []
+  }
+}

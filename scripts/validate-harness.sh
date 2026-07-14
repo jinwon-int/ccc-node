@@ -19,7 +19,7 @@ err() { printf 'FAIL: %s\n' "$*"; fail=1; }
 # fields, because this CLI silently loads 0 components from custom agents/commands path
 # arrays (verified on 2.1.183); only default-location discovery is honoured.
 say "== settings JSON =="
-for f in claude/settings.base.json claude/settings.local.json \
+for f in claude/settings.base.json claude/settings.local.template.json \
          claude/hooks/enforcement-overlay.json \
          .claude-plugin/marketplace.json \
          claude/.claude-plugin/plugin.json claude/hooks/hooks.json \

@@ -176,5 +176,21 @@ codex_dry_out="$(HOME="$nonroot_home" CCC_CLAUDE_DIR="$nonroot_claude" CCC_HERME
 ok "setup non-root dry-run includes both Codex managed launch artifacts" \
   '[ "$codex_dry_rc" = 0 ] && grep -Fq "$nonroot_claude/hooks/ccc-codex" <<<"$codex_dry_out" && grep -Fq "$nonroot_claude/hooks/ccc_codex_memory.py" <<<"$codex_dry_out"'
 
+# --- #454: settings.local.json is node-local — seeded if absent, never clobbered ---
+seed_home="$TMP/seed-home"; seed_claude="$TMP/seed-claude"; seed_hermes="$TMP/seed-hermes"
+HOME="$seed_home" CCC_CLAUDE_DIR="$seed_claude" CCC_HERMES_DIR="$seed_hermes" \
+  bash "$SETUP" --no-backup >/dev/null 2>&1
+ok "setup seeds settings.local.json when absent" '[ -f "$seed_claude/settings.local.json" ]'
+ok "seeded settings.local.json carries no broad fleet-wide grants" \
+  'jq -e ".permissions.allow == []" "$seed_claude/settings.local.json" >/dev/null'
+
+# A node's accumulated/hand-added approvals must survive a re-run (the self-update path).
+printf '%s\n' '{"permissions":{"allow":["Bash(node-local-only:*)"]}}' > "$seed_claude/settings.local.json"
+local_before="$(sha256sum "$seed_claude/settings.local.json")"
+HOME="$seed_home" CCC_CLAUDE_DIR="$seed_claude" CCC_HERMES_DIR="$seed_hermes" \
+  bash "$SETUP" --no-backup >/dev/null 2>&1
+ok "re-run does NOT clobber existing settings.local.json (node-local preserved)" \
+  '[ "$(sha256sum "$seed_claude/settings.local.json")" = "$local_before" ] && grep -q "node-local-only" "$seed_claude/settings.local.json"'
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

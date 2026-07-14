@@ -17,7 +17,7 @@ make_fixture() { # <name> <mode:standalone|plugin>
   mkdir -p "$dir/repo/claude/hooks" "$dir/repo/claude/output-styles" "$dir/repo/bridge" \
            "$dir/home/.claude/hooks" "$dir/home/.claude/output-styles"
   cp "$ROOT/claude/settings.base.json" "$dir/repo/claude/settings.base.json"
-  cp "$ROOT/claude/settings.local.json" "$dir/repo/claude/settings.local.json"
+  cp "$ROOT/claude/settings.local.template.json" "$dir/repo/claude/settings.local.template.json"
   cp "$ROOT/claude/hooks/enforcement-overlay.json" "$dir/repo/claude/hooks/enforcement-overlay.json"
   cp "$ROOT/claude/hooks/hooks.json" "$dir/repo/claude/hooks/hooks.json"
   cp "$ROOT/claude/hooks/load-memory.sh" "$dir/repo/claude/hooks/load-memory.sh"
@@ -48,7 +48,8 @@ make_fixture() { # <name> <mode:standalone|plugin>
   else
     cp "$ROOT/claude/settings.base.json" "$dir/home/.claude/settings.json"
   fi
-  cp "$ROOT/claude/settings.local.json" "$dir/home/.claude/settings.local.json"
+  # A configured node has a seeded node-local approvals file (from the template).
+  cp "$ROOT/claude/settings.local.template.json" "$dir/home/.claude/settings.local.json"
   printf '%s\n' "$dir"
 }
 
