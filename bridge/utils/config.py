@@ -251,6 +251,41 @@ class Config(BaseSettings):
         alias="CCC_BRIDGE_BASH_POLICY",
         description="Bash approval UX: auto-approve, approve-each, or disabled.",
     )
+    telegram_session_scope: Literal["per-user-chat", "shared-groups"] = Field(
+        default="per-user-chat",
+        alias="CCC_TELEGRAM_SESSION_SCOPE",
+        description=(
+            "Telegram session boundary. per-user-chat isolates every sender/chat; "
+            "shared-groups keeps DMs isolated but shares each group among allowlisted senders."
+        ),
+    )
+    bridge_memory_mode: Literal["off", "curated"] = Field(
+        default="off",
+        alias="CCC_BRIDGE_MEMORY_MODE",
+        description=(
+            "Opt-in bridge memory lifecycle. curated loads only ccc-node memory/distill "
+            "hooks through flag settings while filesystem setting sources stay disabled."
+        ),
+    )
+    image_context_guard: bool = Field(
+        default=False,
+        alias="CCC_BRIDGE_IMAGE_CONTEXT_GUARD",
+        description="Dedupe repeated image reads per request and enforce inbound image caps.",
+    )
+    telegram_max_image_bytes: int = Field(
+        default=5 * 1024 * 1024,
+        ge=64 * 1024,
+        le=20 * 1024 * 1024,
+        alias="CCC_TELEGRAM_MAX_IMAGE_BYTES",
+        description="Maximum inbound image payload accepted when the image context guard is on.",
+    )
+    telegram_max_image_pixels: int = Field(
+        default=4_000_000,
+        ge=65_536,
+        le=40_000_000,
+        alias="CCC_TELEGRAM_MAX_IMAGE_PIXELS",
+        description="Maximum Telegram photo variant pixel count when image guarding is on.",
+    )
 
     # ccc-node push notifier (owner-only outbound Claude Code lifecycle notifications).
     # DISABLED by default — opt-in only. See core/push_notifier.py for the approval boundary.

@@ -98,6 +98,9 @@ class _PendingRequest:
     # Per-semantic-message form of the flag. Reset at each AssistantMessage so
     # a later message without partials can still use whole-block fallback.
     current_message_streamed_via_partials: bool = False
+    # Unchanged image files may be read once per Telegram request. Claude Code
+    # otherwise embeds the same base64 payload repeatedly and burns context.
+    image_read_fingerprints: set[str] = field(default_factory=set)
 
 
 @dataclass

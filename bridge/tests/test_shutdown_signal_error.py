@@ -46,6 +46,9 @@ class _PermissionResultDeny:
 
 sdk_module.ClaudeSDKClient = _DummySDKClient
 sdk_module.ClaudeAgentOptions = _DummyAgentOptions
+sdk_module.HookMatcher = type(
+    "HookMatcher", (), {"__init__": lambda self, **kwargs: None}
+)
 sdk_module.AssistantMessage = type("AssistantMessage", (), {})
 sdk_module.RateLimitEvent = type("RateLimitEvent", (), {})
 sdk_module.ResultMessage = type("ResultMessage", (), {})

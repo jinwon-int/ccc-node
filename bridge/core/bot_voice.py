@@ -386,9 +386,14 @@ class BotVoiceMixin:
     def _build_image_file_name(user_id: int, extension: str) -> str:
         return media.build_image_file_name(user_id, extension)
 
-    @staticmethod
-    def _select_inbound_image(message: Message) -> Tuple[Optional[Any], str]:
-        return media.select_inbound_image(message)
+    def _select_inbound_image(self, message: Message) -> Tuple[Optional[Any], str]:
+        if not getattr(self._config, "image_context_guard", False):
+            return media.select_inbound_image(message)
+        return media.select_inbound_image(
+            message,
+            max_bytes=getattr(self._config, "telegram_max_image_bytes", 5 * 1024 * 1024),
+            max_pixels=getattr(self._config, "telegram_max_image_pixels", 4_000_000),
+        )
 
     @staticmethod
     def _build_image_prompt(image_path: FilePath, caption: str) -> str:
@@ -694,6 +699,11 @@ class BotVoiceMixin:
         message = self._require_message(update)
         image, image_kind = self._select_inbound_image(message)
         if image is None:
+            if image_kind == "oversize":
+                await message.reply_text(
+                    "❌ This image exceeds the configured size limit. "
+                    "Please send a smaller or lower-resolution image."
+                )
             return
 
         user_id = self._require_user(update).id
@@ -730,6 +740,22 @@ class BotVoiceMixin:
                     )
                     outcome = "download_failed"
                     return
+
+                if getattr(self._config, "image_context_guard", False):
+                    try:
+                        actual_bytes = image_path.stat().st_size
+                    except OSError:
+                        actual_bytes = 0
+                    max_bytes = getattr(
+                        self._config, "telegram_max_image_bytes", 5 * 1024 * 1024
+                    )
+                    if actual_bytes > max_bytes:
+                        await message.reply_text(
+                            "❌ This image exceeds the configured size limit. "
+                            "Please send a smaller image."
+                        )
+                        outcome = "oversize"
+                        return
 
                 prompt = self._build_image_prompt(image_path, caption)
                 reply_prefix = build_reply_context_prefix(

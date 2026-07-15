@@ -119,7 +119,12 @@ def build_image_file_name(user_id: int, extension: str) -> str:
     return f"image_{user_id}_{int(time.time() * 1000)}.{safe_ext}"
 
 
-def select_inbound_image(message: Any) -> Tuple[Optional[Any], str]:
+def select_inbound_image(
+    message: Any,
+    *,
+    max_bytes: Optional[int] = None,
+    max_pixels: Optional[int] = None,
+) -> Tuple[Optional[Any], str]:
     """Return (best image object, kind) for an inbound Telegram message.
 
     Prefers the largest photo size; falls back to an image/* document; else
@@ -127,16 +132,33 @@ def select_inbound_image(message: Any) -> Tuple[Optional[Any], str]:
     """
     photos = list(getattr(message, "photo", None) or [])
     if photos:
+        eligible = []
+        for photo in photos:
+            file_size = int(getattr(photo, "file_size", 0) or 0)
+            pixels = int(getattr(photo, "width", 0) or 0) * int(
+                getattr(photo, "height", 0) or 0
+            )
+            if max_bytes is not None and file_size > max_bytes:
+                continue
+            if max_pixels is not None and pixels > max_pixels:
+                continue
+            eligible.append(photo)
+        if not eligible:
+            return None, "oversize"
+
         def score(photo: Any) -> int:
             file_size = int(getattr(photo, "file_size", 0) or 0)
             pixels = int(getattr(photo, "width", 0) or 0) * int(getattr(photo, "height", 0) or 0)
             return max(file_size, pixels)
 
-        return max(photos, key=score), "photo"
+        return max(eligible, key=score), "photo"
 
     document = getattr(message, "document", None)
     mime_type = str(getattr(document, "mime_type", "") or "").lower()
     if document is not None and mime_type.startswith("image/"):
+        file_size = int(getattr(document, "file_size", 0) or 0)
+        if max_bytes is not None and file_size > max_bytes:
+            return None, "oversize"
         return document, "document"
     return None, "none"
 

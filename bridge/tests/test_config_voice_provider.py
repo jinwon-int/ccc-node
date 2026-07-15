@@ -48,6 +48,32 @@ class VoiceProviderConfigTests(unittest.TestCase):
                 cfg = module.Config(telegram_bot_token="123456:abc", _env_file=None)
             self.assertEqual(cfg.execution_profile, "owner-operator")
 
+    def test_shared_group_memory_and_image_guards_are_explicit_opt_ins(self):
+        with TemporaryDirectory() as td:
+            module = self._load_config_module(td)
+            cfg = module.Config(telegram_bot_token="123456:abc", _env_file=None)
+            self.assertEqual(cfg.telegram_session_scope, "per-user-chat")
+            self.assertEqual(cfg.bridge_memory_mode, "off")
+            self.assertFalse(cfg.image_context_guard)
+
+            with patch.dict(
+                os.environ,
+                {
+                    "CCC_TELEGRAM_SESSION_SCOPE": "shared-groups",
+                    "CCC_BRIDGE_MEMORY_MODE": "curated",
+                    "CCC_BRIDGE_IMAGE_CONTEXT_GUARD": "true",
+                    "CCC_TELEGRAM_MAX_IMAGE_BYTES": "1048576",
+                    "CCC_TELEGRAM_MAX_IMAGE_PIXELS": "1000000",
+                },
+                clear=False,
+            ):
+                enabled = module.Config(telegram_bot_token="123456:abc", _env_file=None)
+            self.assertEqual(enabled.telegram_session_scope, "shared-groups")
+            self.assertEqual(enabled.bridge_memory_mode, "curated")
+            self.assertTrue(enabled.image_context_guard)
+            self.assertEqual(enabled.telegram_max_image_bytes, 1048576)
+            self.assertEqual(enabled.telegram_max_image_pixels, 1000000)
+
     def test_execution_profile_precedence_in_fresh_processes(self):
         source_config = Path(__file__).resolve().parents[1] / "utils" / "config.py"
         with TemporaryDirectory() as td:
