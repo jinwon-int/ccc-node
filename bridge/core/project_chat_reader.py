@@ -35,6 +35,67 @@ def _typing_interval() -> float:
 
 
 class ProjectChatReaderMixin:
+    @staticmethod
+    def _claude_message_boundaries_enabled(req) -> bool:
+        return bool(req.streaming_handler or req.interim_message_callback)
+
+    async def _deliver_pending_claude_interim(self, req) -> None:
+        """Deliver one completed Claude message once later work proves it interim."""
+        content = req.pending_completed_message
+        if content is None:
+            return
+
+        delivered = False
+        if req.streaming_handler is not None:
+            try:
+                delivered = bool(await req.streaming_handler.finalize_segment())
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception(
+                    "Claude interim streaming finalization failed; retaining it "
+                    "for final delivery"
+                )
+        elif req.interim_message_callback is not None:
+            try:
+                await req.interim_message_callback(content)
+                delivered = True
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception(
+                    "Claude interim assistant message delivery failed; retaining "
+                    "it for final delivery"
+                )
+
+        if delivered:
+            req.interim_delivered = True
+            req.delivered_interim_parts.append(content)
+        else:
+            req.retained_response_parts.append(content)
+        req.pending_completed_message = None
+
+    def _claude_response_content(self, req, result_text: str) -> str:
+        """Build final text without duplicating successfully delivered bubbles."""
+        terminal = self._clean_response(result_text)
+        if not terminal and req.pending_completed_message is not None:
+            terminal = req.pending_completed_message
+        if not terminal:
+            terminal = self._clean_response("\n".join(req.last_assistant_texts))
+        if (
+            terminal
+            and req.pending_completed_message is None
+            and terminal in req.delivered_interim_parts
+        ):
+            # A tool-only tail can repeat the already delivered progress text
+            # in ResultMessage.result without emitting a later AssistantMessage.
+            terminal = ""
+
+        parts = list(req.retained_response_parts)
+        if terminal and (not parts or parts[-1] != terminal):
+            parts.append(terminal)
+        return "\n\n".join(part for part in parts if part)
+
     async def _handle_unsolicited_message(
         self, user_id: int, state: _UserStreamState, msg
     ) -> None:
@@ -152,7 +213,12 @@ class ProjectChatReaderMixin:
                     ):
                         delta = _extract_stream_text_delta(msg.event)
                         if delta:
+                            # A text delta after a completed AssistantMessage is
+                            # one-event look-ahead proof that the prior message
+                            # was interim rather than terminal.
+                            await self._deliver_pending_claude_interim(req)
                             req.streamed_via_partials = True
+                            req.current_message_streamed_via_partials = True
                             try:
                                 await req.streaming_handler.update_if_needed(delta)
                                 req.last_visible_progress_at = now
@@ -164,43 +230,78 @@ class ProjectChatReaderMixin:
                     logger.debug(
                         f"Received AssistantMessage with {len(msg.content)} blocks"
                     )
+                    if (
+                        self._claude_message_boundaries_enabled(req)
+                        and req.pending_completed_message is not None
+                    ):
+                        # A new completed SDK message proves the previous one
+                        # was not the terminal answer.
+                        await self._deliver_pending_claude_interim(req)
                     req.last_assistant_texts = []
-                    for block in msg.content:
-                        if isinstance(block, TextBlock):
-                            logger.debug(f"TextBlock: {len(block.text)} chars")
-                            req.last_text_at = now
-                            req.last_assistant_texts.append(block.text)
-                            # Update the streaming draft from the complete block
-                            # ONLY when partial deltas didn't already build it —
-                            # otherwise the text would be doubled. When partial
-                            # streaming is off (no deltas), this is the fallback
-                            # whole-block update path.
-                            if req.streaming_handler and not req.streamed_via_partials:
-                                try:
-                                    await req.streaming_handler.update_if_needed(
-                                        block.text
-                                    )
-                                    req.last_visible_progress_at = now
-                                except Exception as e:
-                                    logger.error(f"Streaming update failed: {e}")
-                            if os.environ.get("BOT_DEBUG"):
-                                print(f"\033[36m[Claude]\033[0m {block.text[:200]}")
-                        elif isinstance(block, ToolUseBlock):
-                            logger.debug(f"ToolUseBlock: {block.name}")
-                            req.last_tool_at = now
-                            req.current_tool_label = tool_label(block.name, block.input)
-                            if req.streaming_handler:
-                                try:
-                                    await req.streaming_handler.add_tool_call(
-                                        block.name, block.input
-                                    )
-                                    req.last_visible_progress_at = now
-                                except Exception as e:
-                                    logger.error(f"Tool call display failed: {e}")
-                            if os.environ.get("BOT_DEBUG"):
-                                print(
-                                    f"\033[33m[Tool: {block.name}]\033[0m {str(block.input)[:150]}"
+                    text_blocks = [
+                        block for block in msg.content if isinstance(block, TextBlock)
+                    ]
+                    tool_blocks = [
+                        block for block in msg.content if isinstance(block, ToolUseBlock)
+                    ]
+                    for text_block in text_blocks:
+                        logger.debug(f"TextBlock: {len(text_block.text)} chars")
+                        req.last_text_at = now
+                        req.last_assistant_texts.append(text_block.text)
+                        # Update the streaming draft from the complete block
+                        # ONLY when partial deltas didn't already build it —
+                        # otherwise the text would be doubled. When partial
+                        # streaming is off (no deltas), this is the fallback
+                        # whole-block update path.
+                        if (
+                            req.streaming_handler
+                            and not req.current_message_streamed_via_partials
+                        ):
+                            try:
+                                await req.streaming_handler.update_if_needed(
+                                    text_block.text
                                 )
+                                req.last_visible_progress_at = now
+                            except Exception as e:
+                                logger.error(f"Streaming update failed: {e}")
+                        if os.environ.get("BOT_DEBUG"):
+                            print(
+                                f"\033[36m[Claude]\033[0m {text_block.text[:200]}"
+                            )
+
+                    if self._claude_message_boundaries_enabled(req):
+                        completed = self._clean_response(
+                            "\n".join(req.last_assistant_texts)
+                        )
+                        if completed:
+                            req.pending_completed_message = completed
+
+                    # A tool in the same AssistantMessage proves any preceding
+                    # user-visible text is interim. Finalize that bubble before
+                    # adding the tool status to the next streaming segment.
+                    if tool_blocks and req.pending_completed_message is not None:
+                        await self._deliver_pending_claude_interim(req)
+
+                    for tool_block in tool_blocks:
+                        logger.debug(f"ToolUseBlock: {tool_block.name}")
+                        req.last_tool_at = now
+                        req.current_tool_label = tool_label(
+                            tool_block.name, tool_block.input
+                        )
+                        if req.streaming_handler:
+                            try:
+                                await req.streaming_handler.add_tool_call(
+                                    tool_block.name, tool_block.input
+                                )
+                                req.last_visible_progress_at = now
+                            except Exception as e:
+                                logger.error(f"Tool call display failed: {e}")
+                        if os.environ.get("BOT_DEBUG"):
+                            print(
+                                f"\033[33m[Tool: {tool_block.name}]\033[0m "
+                                f"{str(tool_block.input)[:150]}"
+                            )
+                    req.current_message_streamed_via_partials = False
                     continue
 
                 if isinstance(msg, ResultMessage):
@@ -208,9 +309,12 @@ class ProjectChatReaderMixin:
                     result_text = msg.result or "\n".join(req.last_assistant_texts)
 
                     # Finalize streaming drafts
+                    final_streamed = False
                     if req.streaming_handler:
                         try:
-                            await req.streaming_handler.finalize_all()
+                            final_streamed = bool(
+                                await req.streaming_handler.finalize_all()
+                            )
                         except Exception as e:
                             logger.error(f"Streaming finalization failed: {e}")
                     cleaned = await self._cleanup_heartbeat(req)
@@ -228,7 +332,10 @@ class ProjectChatReaderMixin:
                             or "(No response)"
                         )
                     else:
-                        content = self._clean_response(result_text) or "(No response)"
+                        content = (
+                            self._claude_response_content(req, result_text)
+                            or "(No response)"
+                        )
 
                     logger.info(
                         f"ResultMessage: session={msg.session_id}, is_error={msg.is_error}, duration={msg.duration_ms}ms"
@@ -255,9 +362,7 @@ class ProjectChatReaderMixin:
                             success=False,
                             error=content,
                             session_id=msg.session_id,
-                            streamed=bool(
-                                req.streaming_handler and req.streaming_handler.drafts
-                            ),
+                            streamed=False,
                         )
                     else:
                         health_reporter.record_claude_ok()
@@ -273,11 +378,11 @@ class ProjectChatReaderMixin:
                             req.synthetic_response is not None
                             or _detect_numbered_options(content)
                         )
-                        # Message is considered streamed if drafts were created, regardless of options
-                        # Options will be sent separately by _reply_smart()/_send_smart()
-                        is_streamed = bool(
-                            req.streaming_handler and req.streaming_handler.drafts
-                        )
+                        # ``streamed`` means the caller must not send the final
+                        # content again. Options still use their separate path.
+                        is_streamed = final_streamed
+                        if content == "(No response)" and req.interim_delivered:
+                            is_streamed = True
                         logger.debug(
                             f"Response ready: has_synthetic={bool(req.synthetic_response)}, has_numbered_options={_detect_numbered_options(content)}, has_options={has_options}, is_streamed={is_streamed}, content_len={len(content)}"
                         )
