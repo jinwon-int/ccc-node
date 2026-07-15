@@ -12,7 +12,7 @@ from telegram import Update
 from telegram.ext import Application
 from telegram.request import BaseRequest, HTTPXRequest
 
-from telegram_bot.core import crash_policy
+from telegram_bot.core import crash_policy, media
 from telegram_bot.core.bot_shared import _PollingRestart, enforce_access_control
 from telegram_bot.core.tool_policy import (
     EXECUTION_OWNER_OPERATOR,
@@ -45,17 +45,15 @@ class BotLifecycleMixin:
         """Called after application.initialize() — sets up commands and cleanup."""
         self._audio_dir.mkdir(parents=True, exist_ok=True)
         self._image_dir.mkdir(parents=True, exist_ok=True)
-        if self._document_dir.is_symlink():
-            raise RuntimeError("Document upload directory must not be a symlink")
-        self._document_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-        os.chmod(self._document_dir, 0o700)
+        document_directory_fd = media.open_private_document_directory(self._document_dir)
+        os.close(document_directory_fd)
         removed = await self._cleanup_stale_audio_files(
             self._audio_dir, max_age_seconds=self._STALE_AUDIO_SECONDS
         )
         removed_images = await self._cleanup_stale_audio_files(
             self._image_dir, max_age_seconds=self._STALE_AUDIO_SECONDS
         )
-        removed_documents = await self._cleanup_stale_audio_files(
+        removed_documents = media.cleanup_stale_document_files(
             self._document_dir, max_age_seconds=self._STALE_AUDIO_SECONDS
         )
         if removed:

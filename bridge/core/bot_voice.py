@@ -401,12 +401,36 @@ class BotVoiceMixin:
     async def _download_image_file(self, image, destination: FilePath) -> None:
         await self._download_telegram_file(image.file_id, destination)
 
-    async def _download_document_file(self, document, destination: FilePath) -> None:
-        await self._download_telegram_file(document.file_id, destination)
+    async def _get_document_file(self, document):
+        app = self._require_application()
+        return await app.bot.get_file(document.file_id)
+
+    async def _download_document_file(self, telegram_file, destination) -> None:
+        if not hasattr(telegram_file, "download_to_memory"):
+            raise RuntimeError("Telegram in-memory download API is unavailable.")
+        await telegram_file.download_to_memory(destination)
 
     def _max_document_size_bytes(self) -> int:
-        size_mb = int(getattr(self._voice_config(), "max_document_size_mb", 20))
-        return size_mb * 1024 * 1024
+        size_mb = int(getattr(self._voice_config(), "max_document_size_mb", 10))
+        return size_mb * 1_000_000
+
+    def _create_document_destination(
+        self, display_name: str, mime_type: str
+    ) -> tuple[FilePath, int]:
+        directory_fd = media.open_private_document_directory(self._document_dir)
+        try:
+            for _ in range(3):
+                file_name = media.build_document_file_name(display_name, mime_type)
+                try:
+                    file_descriptor = media.open_private_document_file(
+                        directory_fd, file_name
+                    )
+                except FileExistsError:
+                    continue
+                return self._document_dir / file_name, file_descriptor
+            raise FileExistsError("failed to allocate a unique document artifact")
+        finally:
+            os.close(directory_fd)
 
     async def _process_document_task(
         self,
@@ -417,34 +441,106 @@ class BotVoiceMixin:
         user_id: int,
         caption: str,
     ) -> None:
-        if self._document_dir.is_symlink():
-            logger.warning("Document upload directory rejected reason=symlink")
-            await message.reply_text("❌ File storage is unavailable. Please contact the operator.")
-            return
-        self._document_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-        os.chmod(self._document_dir, 0o700)
         mime_type = media.normalize_document_mime_type(
             getattr(document, "mime_type", None)
         )
         display_name = media.sanitize_document_display_name(
             getattr(document, "file_name", None)
         )
-        document_path = self._document_dir / media.build_document_file_name(
-            display_name, mime_type
-        )
-        cleanup_paths = [document_path]
+        cleanup_paths: List[FilePath] = []
         start = time.perf_counter()
         outcome = "failed"
         actual_size = 0
         try:
             try:
-                create_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-                create_flags |= getattr(os, "O_NOFOLLOW", 0)
-                file_descriptor = os.open(document_path, create_flags, 0o600)
+                telegram_file = await self._get_document_file(document)
+            except Exception as exc:
+                outcome = "metadata_failed"
+                logger.warning(
+                    "Document metadata fetch failed mime=%s error=%s",
+                    mime_type,
+                    type(exc).__name__,
+                )
+                await message.reply_text("❌ Failed to download your file. Please retry.")
+                return
+
+            try:
+                declared_size = media.parse_document_size(
+                    getattr(document, "file_size", None)
+                )
+            except ValueError:
+                outcome = "metadata_invalid"
+                await message.reply_text(
+                    "❌ File metadata is invalid. Please resend the file."
+                )
+                return
+            try:
+                remote_size = media.parse_document_size(
+                    getattr(telegram_file, "file_size", None)
+                )
+            except ValueError:
+                outcome = "metadata_invalid"
+                await message.reply_text(
+                    "❌ File metadata is invalid. Please resend the file."
+                )
+                return
+            if remote_size > self._max_document_size_bytes():
+                outcome = "size_limit_exceeded"
+                await message.reply_text(
+                    "❌ File is too large. "
+                    f"Maximum size is {self._voice_config().max_document_size_mb} MB."
+                )
+                return
+            if declared_size and remote_size and declared_size != remote_size:
+                outcome = "metadata_mismatch"
+                await message.reply_text(
+                    "❌ File metadata changed during transfer. Please resend the file."
+                )
+                return
+            expected_size = remote_size or declared_size
+
+            try:
+                document_path, file_descriptor = self._create_document_destination(
+                    display_name, mime_type
+                )
+            except Exception as exc:
+                outcome = "storage_failed"
+                logger.warning(
+                    "Document storage allocation failed mime=%s error=%s",
+                    mime_type,
+                    type(exc).__name__,
+                )
+                await message.reply_text(
+                    "❌ File storage is unavailable. Please contact the operator."
+                )
+                return
+            cleanup_paths.append(document_path)
+
+            try:
+                output = os.fdopen(file_descriptor, "w+b", buffering=0)
+            except Exception:
                 os.close(file_descriptor)
-                await self._download_document_file(document, document_path)
-                os.chmod(document_path, 0o600)
-                actual_size = document_path.stat().st_size
+                raise
+            try:
+                with output:
+                    writer = media.BoundedDocumentWriter(
+                        output,
+                        max_bytes=self._max_document_size_bytes(),
+                        path=document_path,
+                    )
+                    await self._download_document_file(telegram_file, writer)
+                    output.flush()
+                    actual_size = writer.bytes_written
+                    media.validate_private_document_fd(output.fileno())
+                    output.seek(0)
+                    prefix = output.read(8)
+            except media.DocumentSizeExceeded:
+                outcome = "size_limit_exceeded"
+                await message.reply_text(
+                    "❌ File is too large. "
+                    f"Maximum size is {self._voice_config().max_document_size_mb} MB."
+                )
+                return
             except Exception as exc:
                 outcome = "download_failed"
                 logger.warning(
@@ -455,11 +551,16 @@ class BotVoiceMixin:
                 await message.reply_text("❌ Failed to download your file. Please retry.")
                 return
 
-            if actual_size > self._max_document_size_bytes():
-                outcome = "size_limit_exceeded"
+            if expected_size and actual_size != expected_size:
+                outcome = "size_mismatch"
                 await message.reply_text(
-                    "❌ File is too large. "
-                    f"Maximum size is {self._voice_config().max_document_size_mb} MB."
+                    "❌ File size changed during transfer. Please resend the file."
+                )
+                return
+            if media.has_blocked_executable_magic(prefix):
+                outcome = "unsupported_content"
+                await message.reply_text(
+                    "❌ This file type is not supported for inbound analysis."
                 )
                 return
 
@@ -524,7 +625,13 @@ class BotVoiceMixin:
             await message.reply_text("❌ This file type is not supported for inbound analysis.")
             return
 
-        declared_size = int(getattr(document, "file_size", 0) or 0)
+        try:
+            declared_size = media.parse_document_size(
+                getattr(document, "file_size", None)
+            )
+        except ValueError:
+            await message.reply_text("❌ File metadata is invalid. Please resend the file.")
+            return
         if declared_size > self._max_document_size_bytes():
             await message.reply_text(
                 "❌ File is too large. "

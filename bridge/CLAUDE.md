@@ -102,6 +102,7 @@ utils/chat_logger.py Per-session debug chat logging
 - **Permission callback pattern**: Uses asyncio.Future to wait for user response. Callback data format: `perm:allow:{request_id}`, `perm:deny:{request_id}`, `perm:allow_all:{request_id}`. Futures are stored in `_pending_permission_futures` dict and resolved by callback handlers.
 - `AskUserQuestion` tool is degraded: converted to plain text with numbered options. By default the user types their choice; set `CCC_TELEGRAM_OPTION_BUTTONS=true` to render the options as tappable Telegram inline keyboard buttons instead.
 - Responses with file paths matching media extensions are auto-sent as Telegram photos/documents.
+- Inbound non-image Telegram documents use allowlist-first validation, returned metadata rechecks, MIME/extension policy, dirfd-relative `O_EXCL`/`O_NOFOLLOW` private storage, bounded writes, executable-magic rejection, and deterministic cleanup before their local path is passed to the active runtime.
 - Message queue per user: max 3 concurrent tasks with overflow rejection. Priority commands like `/stop` and `/revert` bypass this limit.
 - `start.sh` handles venv creation, dependency caching (MD5-based), log rotation (14 days), auto-restart with crash detection (>5 in 60s).
 

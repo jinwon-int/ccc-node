@@ -20,7 +20,7 @@ config_module.config = SimpleNamespace(
     allowed_user_ids=[],
     claude_settings_path=Path("/tmp/settings.json"),
     max_voice_duration=300,
-    max_document_size_mb=20,
+    max_document_size_mb=10,
     bot_data_dir=Path("/tmp/telegram-bot-data"),
     transcription_provider="whisper",
     openai_api_key="test-key",
@@ -1130,11 +1130,13 @@ class PhotoFlowTests(unittest.IsolatedAsyncioTestCase):
 class DocumentFlowTests(unittest.IsolatedAsyncioTestCase):
     @staticmethod
     def _bot():
-        return _make_bot(
+        bot = _make_bot(
             settings=config_module.config,
             session_manager=session_module.session_manager,
             project_chat=project_chat_module.project_chat_handler,
         )
+        bot._get_document_file = AsyncMock(return_value=SimpleNamespace(file_size=4))
+        return bot
 
     @staticmethod
     async def _run_now(user_id, run_task, on_overflow):
@@ -1163,11 +1165,12 @@ class DocumentFlowTests(unittest.IsolatedAsyncioTestCase):
         await bot._handle_document_message(update, None)
 
         bot._enqueue_user_task.assert_not_called()
+        bot._get_document_file.assert_not_awaited()
         bot._download_document_file.assert_not_awaited()
 
     async def test_oversize_and_executable_documents_fail_before_download(self):
         for document, expected in (
-            (self._document(file_size=21 * 1024 * 1024), "too large"),
+            (self._document(file_size=20_000_001), "too large"),
             (
                 self._document(
                     mime_type="application/x-msdownload",
@@ -1175,6 +1178,14 @@ class DocumentFlowTests(unittest.IsolatedAsyncioTestCase):
                 ),
                 "not supported",
             ),
+            (
+                self._document(
+                    mime_type="application/pdf",
+                    file_name="payload.txt",
+                ),
+                "not supported",
+            ),
+            (self._document(file_size="4"), "metadata is invalid"),
         ):
             with self.subTest(file_name=document.file_name):
                 bot = self._bot()
@@ -1186,6 +1197,7 @@ class DocumentFlowTests(unittest.IsolatedAsyncioTestCase):
                 await bot._handle_document_message(update, None)
 
                 bot._enqueue_user_task.assert_not_called()
+                bot._get_document_file.assert_not_awaited()
                 bot._download_document_file.assert_not_awaited()
                 self.assertTrue(any(expected in reply for reply in update.message.replies))
 
@@ -1197,9 +1209,10 @@ class DocumentFlowTests(unittest.IsolatedAsyncioTestCase):
 
         async def download(document, destination):
             del document
-            observed["initial_file_mode"] = destination.stat().st_mode & 0o777
-            destination.write_bytes(b"data")
-            observed["destination"] = destination
+            path = Path(destination.name)
+            observed["initial_file_mode"] = path.stat().st_mode & 0o777
+            destination.write(b"data")
+            observed["destination"] = path
 
         async def process(update, user_id, prompt, **kwargs):
             del update, user_id
@@ -1264,6 +1277,167 @@ class DocumentFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("secret-url", "\n".join(logs.output))
         bot._process_user_message_text.assert_not_awaited()
 
+    async def test_get_file_reported_oversize_is_rejected_before_download_or_storage(self):
+        bot = self._bot()
+        bot._check_access = AsyncMock(return_value=True)
+        bot._enqueue_user_task = self._run_now
+        limit = config_module.config.max_document_size_mb * 1_000_000
+        bot._get_document_file = AsyncMock(
+            return_value=SimpleNamespace(file_size=limit + 1)
+        )
+        bot._download_document_file = AsyncMock()
+        bot._process_user_message_text = AsyncMock()
+        update = _build_photo_update(
+            11,
+            document=self._document(file_size=None),
+        )
+
+        with TemporaryDirectory() as td:
+            bot._document_dir = Path(td) / "uploads"
+            await bot._handle_document_message(update, None)
+            self.assertFalse(bot._document_dir.exists())
+
+        bot._get_document_file.assert_awaited_once()
+        bot._download_document_file.assert_not_awaited()
+        bot._process_user_message_text.assert_not_awaited()
+        self.assertTrue(any("too large" in reply for reply in update.message.replies))
+
+    async def test_get_file_metadata_mismatch_is_rejected_before_storage(self):
+        bot = self._bot()
+        bot._check_access = AsyncMock(return_value=True)
+        bot._enqueue_user_task = self._run_now
+        bot._get_document_file = AsyncMock(return_value=SimpleNamespace(file_size=5))
+        bot._download_document_file = AsyncMock()
+        bot._process_user_message_text = AsyncMock()
+        update = _build_photo_update(11, document=self._document(file_size=4))
+
+        with TemporaryDirectory() as td:
+            bot._document_dir = Path(td) / "uploads"
+            await bot._handle_document_message(update, None)
+            self.assertFalse(bot._document_dir.exists())
+
+        bot._download_document_file.assert_not_awaited()
+        bot._process_user_message_text.assert_not_awaited()
+        self.assertTrue(any("metadata changed" in reply for reply in update.message.replies))
+
+    async def test_malformed_get_file_size_is_rejected_before_storage(self):
+        bot = self._bot()
+        bot._check_access = AsyncMock(return_value=True)
+        bot._enqueue_user_task = self._run_now
+        bot._get_document_file = AsyncMock(
+            return_value=SimpleNamespace(file_size="not-an-integer")
+        )
+        bot._download_document_file = AsyncMock()
+        bot._process_user_message_text = AsyncMock()
+        update = _build_photo_update(11, document=self._document(file_size=4))
+
+        with TemporaryDirectory() as td:
+            bot._document_dir = Path(td) / "uploads"
+            await bot._handle_document_message(update, None)
+            self.assertFalse(bot._document_dir.exists())
+
+        bot._download_document_file.assert_not_awaited()
+        bot._process_user_message_text.assert_not_awaited()
+        self.assertTrue(any("metadata is invalid" in reply for reply in update.message.replies))
+
+    async def test_actual_size_mismatch_is_rejected_and_cleaned(self):
+        bot = self._bot()
+        bot._check_access = AsyncMock(return_value=True)
+        bot._enqueue_user_task = self._run_now
+        observed = {}
+
+        async def download(document, destination):
+            del document
+            observed["destination"] = Path(destination.name)
+            destination.write(b"abc")
+
+        bot._download_document_file = AsyncMock(side_effect=download)
+        bot._process_user_message_text = AsyncMock()
+        update = _build_photo_update(11, document=self._document(file_size=4))
+
+        with TemporaryDirectory() as td:
+            bot._document_dir = Path(td) / "uploads"
+            await bot._handle_document_message(update, None)
+
+        bot._process_user_message_text.assert_not_awaited()
+        self.assertFalse(observed["destination"].exists())
+        self.assertTrue(any("size changed" in reply for reply in update.message.replies))
+
+    async def test_forced_random_collision_retries_without_overwrite(self):
+        bot = self._bot()
+        bot._check_access = AsyncMock(return_value=True)
+        bot._enqueue_user_task = self._run_now
+        observed = {}
+
+        async def download(document_file, destination):
+            del document_file
+            if hasattr(destination, "write"):
+                destination.write(b"new-data")
+            else:
+                destination.write_bytes(b"new-data")
+
+        async def process(update, user_id, prompt, **kwargs):
+            del update, user_id, kwargs
+            path_text = prompt.split("Local document path: ", 1)[1].splitlines()[0]
+            path = Path(path_text)
+            observed["path"] = path
+            observed["content"] = path.read_bytes()
+
+        bot._get_document_file = AsyncMock(return_value=SimpleNamespace(file_size=8))
+        bot._download_document_file = AsyncMock(side_effect=download)
+        bot._process_user_message_text = AsyncMock(side_effect=process)
+        update = _build_photo_update(11, document=self._document(file_size=8))
+
+        with TemporaryDirectory() as td:
+            bot._document_dir = Path(td) / "uploads"
+            bot._document_dir.mkdir(mode=0o700)
+            collision = bot._document_dir / f"document_{'a' * 32}.pdf"
+            collision.write_bytes(b"existing")
+            collision.chmod(0o600)
+            with patch(
+                "telegram_bot.core.media.secrets.token_hex",
+                side_effect=["a" * 32, "b" * 32],
+            ):
+                await bot._handle_document_message(update, None)
+
+            self.assertEqual(collision.read_bytes(), b"existing")
+            self.assertEqual(observed["content"], b"new-data")
+            self.assertEqual(observed["path"].name, f"document_{'b' * 32}.pdf")
+            self.assertFalse(observed["path"].exists())
+
+    async def test_document_download_uses_in_memory_api(self):
+        bot = self._bot()
+        telegram_file = SimpleNamespace(download_to_memory=AsyncMock())
+        destination = MagicMock()
+
+        await bot._download_document_file(telegram_file, destination)
+
+        telegram_file.download_to_memory.assert_awaited_once_with(destination)
+
+    async def test_spoofed_executable_magic_is_rejected_and_cleaned(self):
+        bot = self._bot()
+        bot._check_access = AsyncMock(return_value=True)
+        bot._enqueue_user_task = self._run_now
+        observed = {}
+
+        async def download(document, destination):
+            del document
+            observed["destination"] = Path(destination.name)
+            destination.write(b"MZpayload")
+
+        bot._get_document_file = AsyncMock(return_value=SimpleNamespace(file_size=9))
+        bot._download_document_file = AsyncMock(side_effect=download)
+        bot._process_user_message_text = AsyncMock()
+        update = _build_photo_update(11, document=self._document(file_size=9))
+
+        with TemporaryDirectory() as td:
+            bot._document_dir = Path(td) / "uploads"
+            await bot._handle_document_message(update, None)
+
+        bot._process_user_message_text.assert_not_awaited()
+        self.assertFalse(observed["destination"].exists())
+        self.assertTrue(any("not supported" in reply for reply in update.message.replies))
+
     async def test_actual_download_size_is_rechecked_when_metadata_is_missing(self):
         bot = self._bot()
         bot._check_access = AsyncMock(return_value=True)
@@ -1272,8 +1446,8 @@ class DocumentFlowTests(unittest.IsolatedAsyncioTestCase):
 
         async def download(document, destination):
             del document
-            destination.write_bytes(b"x" * (1024 * 1024 + 1))
-            observed["destination"] = destination
+            observed["destination"] = Path(destination.name)
+            destination.write(b"x" * (1_000_000 + 1))
 
         bot._download_document_file = AsyncMock(side_effect=download)
         bot._process_user_message_text = AsyncMock()
@@ -1303,8 +1477,8 @@ class DocumentFlowTests(unittest.IsolatedAsyncioTestCase):
 
         async def download(document, destination):
             del document
-            destination.write_bytes(b"data")
-            observed["destination"] = destination
+            destination.write(b"data")
+            observed["destination"] = Path(destination.name)
 
         bot._download_document_file = AsyncMock(side_effect=download)
         bot._process_user_message_text = AsyncMock(side_effect=RuntimeError("secret"))
@@ -1328,8 +1502,8 @@ class DocumentFlowTests(unittest.IsolatedAsyncioTestCase):
 
         async def download(document, destination):
             del document
-            destination.write_bytes(b"data")
-            observed["destination"] = destination
+            destination.write(b"data")
+            observed["destination"] = Path(destination.name)
 
         bot._download_document_file = AsyncMock(side_effect=download)
         bot._process_user_message_text = AsyncMock(side_effect=asyncio.CancelledError())

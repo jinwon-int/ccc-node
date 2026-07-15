@@ -235,7 +235,7 @@ class VoiceProviderConfigTests(unittest.TestCase):
         with TemporaryDirectory() as td:
             module = self._load_config_module(td)
             cfg = module.Config(telegram_bot_token="123456:abc", _env_file=None)
-            self.assertEqual(cfg.max_document_size_mb, 20)
+            self.assertEqual(cfg.max_document_size_mb, 10)
 
             with patch.dict(
                 os.environ,
@@ -252,6 +252,12 @@ class VoiceProviderConfigTests(unittest.TestCase):
                 module.Config(
                     telegram_bot_token="123456:abc",
                     CCC_MAX_DOCUMENT_SIZE_MB=0,
+                    _env_file=None,
+                )
+            with self.assertRaises(ValidationError):
+                module.Config(
+                    telegram_bot_token="123456:abc",
+                    CCC_MAX_DOCUMENT_SIZE_MB=21,
                     _env_file=None,
                 )
 
