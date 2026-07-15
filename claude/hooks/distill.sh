@@ -31,6 +31,8 @@ fi
 # State dir is overridable for testing / non-root installs (#73).
 STATE_DIR="${CCC_STATE_DIR:-${HOME:-/root}/.claude/state}"
 LOG="$STATE_DIR/distill.log"
+PENDING_DIR="$STATE_DIR/distill-pending"
+umask 077
 mkdir -p "$STATE_DIR" 2>/dev/null
 
 if [ -f "$STATE_DIR/distill.disabled" ]; then
@@ -74,7 +76,7 @@ run_bg_pipeline() {
   ec=$?
   if [ $ec -ne 0 ] || [ -z "$EXTRACT_OUT" ]; then
     log "extract failed ec=$ec trigger=$TRIGGER pid=$PIPE_PID elapsed_s=$(elapsed_s)"
-    return 0
+    return 1
   fi
 
   # Stash extracted JSON for debugging + sub-script consumption.
@@ -122,7 +124,62 @@ run_bg_pipeline() {
 # sets INFLIGHT itself for the nested `claude -p` session), so the recursion
 # guard at the top does not short-circuit this path.
 if [ "${CLAUDE_DISTILL_BG:-}" = "1" ]; then
-  run_bg_pipeline
+  PENDING_JOB="${CLAUDE_DISTILL_JOB:-}"
+  if [ -n "$PENDING_JOB" ]; then
+    case "$PENDING_JOB" in
+      "$PENDING_DIR"/*.json) ;;
+      *) log "pending rejected reason=path-outside-queue"; exit 0 ;;
+    esac
+    if [ ! -f "$PENDING_JOB" ] || [ -L "$PENDING_JOB" ]; then
+      log "pending skipped reason=missing-or-symlink"
+      exit 0
+    fi
+
+    # Per-job advisory lock. A killed worker releases the lock while leaving
+    # the durable JSON job in place for the next SessionStart recovery pass.
+    if [ -L "$PENDING_JOB.lock" ]; then
+      log "pending rejected reason=lock-symlink job=$(basename "$PENDING_JOB" .json)"
+      exit 0
+    fi
+    exec 8>"$PENDING_JOB.lock"
+    flock -n 8 || { log "pending skipped reason=job-lock-held job=$(basename "$PENDING_JOB" .json)"; exit 0; }
+
+    CLAUDE_DISTILL_TRIGGER="$(jq -r '.trigger // "manual"' "$PENDING_JOB" 2>/dev/null)"
+    CLAUDE_DISTILL_SESSION="$(jq -r '.session_id // empty' "$PENDING_JOB" 2>/dev/null)"
+    CLAUDE_DISTILL_TRANSCRIPT="$(jq -r '.transcript_path // empty' "$PENDING_JOB" 2>/dev/null)"
+    CLAUDE_DISTILL_SOURCE_CWD="$(jq -r '.source_cwd // empty' "$PENDING_JOB" 2>/dev/null)"
+    CLAUDE_DISTILL_SOURCE_PROJECT="$(jq -r '.source_project // empty' "$PENDING_JOB" 2>/dev/null)"
+    CLAUDE_DISTILL_DRYRUN="$(jq -r '.dryrun // 0' "$PENDING_JOB" 2>/dev/null)"
+    CCC_NODE_ISOLATION_PROFILE="$(jq -r '.isolation_profile // "fleet"' "$PENDING_JOB" 2>/dev/null)"
+    CCC_WIKI_MEMORY_ENABLED="$(jq -r '.wiki_memory_enabled // "1"' "$PENDING_JOB" 2>/dev/null)"
+    CCC_MEMORY_USER_LABEL="$(jq -r '.memory_user_label // "Seo Jin On / 서진원"' "$PENDING_JOB" 2>/dev/null)"
+    CCC_MEMORY_ASSISTANT_LABEL="$(jq -r '.memory_assistant_label // "dungae, a Hermes Team2 worker"' "$PENDING_JOB" 2>/dev/null)"
+    export CLAUDE_DISTILL_TRIGGER CLAUDE_DISTILL_SESSION CLAUDE_DISTILL_TRANSCRIPT
+    export CLAUDE_DISTILL_SOURCE_CWD CLAUDE_DISTILL_SOURCE_PROJECT CLAUDE_DISTILL_DRYRUN
+    export CCC_NODE_ISOLATION_PROFILE CCC_WIKI_MEMORY_ENABLED
+    export CCC_MEMORY_USER_LABEL CCC_MEMORY_ASSISTANT_LABEL
+
+    if [ -z "$CLAUDE_DISTILL_SESSION" ] || [ ! -f "$CLAUDE_DISTILL_TRANSCRIPT" ]; then
+      log "pending retained reason=invalid-job job=$(basename "$PENDING_JOB" .json)"
+      exit 0
+    fi
+
+    if run_bg_pipeline; then
+      job_id="$(basename "$PENDING_JOB" .json)"
+      rm -f "$PENDING_JOB" 2>/dev/null || {
+        log "pending retained reason=remove-failed job=$job_id"
+        exit 0
+      }
+      rm -f "$PENDING_JOB.lock" 2>/dev/null || true
+      command -v sync >/dev/null 2>&1 && sync -f "$PENDING_DIR" 2>/dev/null || true
+      log "pending completed job=$job_id"
+    else
+      log "pending retained reason=pipeline-failed job=$(basename "$PENDING_JOB" .json)"
+    fi
+    exit 0
+  fi
+
+  run_bg_pipeline || true
   exit 0
 fi
 
@@ -219,6 +276,77 @@ export CLAUDE_DISTILL_TRANSCRIPT="$TRANSCRIPT_PATH"
 export CLAUDE_DISTILL_SOURCE_CWD="$SOURCE_CWD"
 export CLAUDE_DISTILL_SOURCE_PROJECT="$PROJECT_ENC"
 export CLAUDE_DISTILL_DRYRUN="$DRYRUN"
+
+# Persist the recovery handle before starting any provider work. The job holds
+# only bounded metadata and a transcript path/hash; the raw transcript remains
+# in Claude's existing project store and is not copied or indexed here.
+if [ -L "$PENDING_DIR" ]; then
+  log "enqueue failed reason=pending-dir-symlink"
+  exit 0
+fi
+mkdir -p "$PENDING_DIR" 2>/dev/null || {
+  log "enqueue failed reason=pending-dir-create"
+  exit 0
+}
+chmod 700 "$PENDING_DIR" 2>/dev/null || true
+
+TRANSCRIPT_HASH="$(sha256sum "$TRANSCRIPT_PATH" 2>/dev/null | awk '{print $1}')"
+[ -n "$TRANSCRIPT_HASH" ] || {
+  log "enqueue failed reason=transcript-hash"
+  exit 0
+}
+JOB_ID="$(printf '%s\0%s\0%s' "$SESSION_ID" "$TRANSCRIPT_HASH" "v1" | sha256sum | awk '{print $1}')"
+PENDING_JOB="$PENDING_DIR/$JOB_ID.json"
+
+if [ -L "$PENDING_JOB" ]; then
+  log "enqueue failed reason=job-symlink job=$JOB_ID"
+  exit 0
+fi
+if [ ! -f "$PENDING_JOB" ]; then
+  JOB_TMP="$(mktemp "$PENDING_DIR/.job.XXXXXX")" || {
+    log "enqueue failed reason=mktemp"
+    exit 0
+  }
+  chmod 600 "$JOB_TMP" 2>/dev/null || true
+  if ! jq -n \
+    --arg schema "ccc.distill.pending.v1" \
+    --arg job_id "$JOB_ID" \
+    --arg transcript_sha256 "$TRANSCRIPT_HASH" \
+    --arg session_id "$SESSION_ID" \
+    --arg transcript_path "$TRANSCRIPT_PATH" \
+    --arg source_cwd "$SOURCE_CWD" \
+    --arg source_project "$PROJECT_ENC" \
+    --arg trigger "$TRIGGER" \
+    --arg created_at "$(ts)" \
+    --arg isolation_profile "${CCC_NODE_ISOLATION_PROFILE:-fleet}" \
+    --arg wiki_memory_enabled "${CCC_WIKI_MEMORY_ENABLED:-1}" \
+    --arg memory_user_label "${CCC_MEMORY_USER_LABEL:-Seo Jin On / 서진원}" \
+    --arg memory_assistant_label "${CCC_MEMORY_ASSISTANT_LABEL:-dungae, a Hermes Team2 worker}" \
+    --argjson dryrun "$DRYRUN" \
+    '{schema:$schema, job_id:$job_id, transcript_sha256:$transcript_sha256,
+      session_id:$session_id, transcript_path:$transcript_path,
+      source_cwd:$source_cwd, source_project:$source_project,
+      trigger:$trigger, dryrun:$dryrun, created_at:$created_at,
+      isolation_profile:$isolation_profile,
+      wiki_memory_enabled:$wiki_memory_enabled,
+      memory_user_label:$memory_user_label,
+      memory_assistant_label:$memory_assistant_label}' > "$JOB_TMP"; then
+    rm -f "$JOB_TMP" 2>/dev/null || true
+    log "enqueue failed reason=serialize"
+    exit 0
+  fi
+  command -v sync >/dev/null 2>&1 && sync -f "$JOB_TMP" 2>/dev/null || true
+  mv "$JOB_TMP" "$PENDING_JOB" 2>/dev/null || {
+    rm -f "$JOB_TMP" 2>/dev/null || true
+    log "enqueue failed reason=atomic-move job=$JOB_ID"
+    exit 0
+  }
+  command -v sync >/dev/null 2>&1 && sync -f "$PENDING_DIR" 2>/dev/null || true
+  log "enqueued job=$JOB_ID trigger=$TRIGGER"
+else
+  log "enqueue dedup job=$JOB_ID trigger=$TRIGGER"
+fi
+export CLAUDE_DISTILL_JOB="$PENDING_JOB"
 
 # Prefer `setsid`: a plain disowned subshell stays in the hook's process
 # group/session, so when the parent session is torn down as a group (ssh-driven
