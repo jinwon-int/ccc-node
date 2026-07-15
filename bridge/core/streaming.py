@@ -598,11 +598,44 @@ class StreamingMessageHandler:
         # total, so apply k/N markers here when the whole response is known.
         self._apply_streaming_part_headers()
 
-        # Finalize all drafts
+        # Finalize all drafts.
+        delivered = bool(self.drafts)
         for draft in self.drafts:
-            await self.finalize_draft(draft)
+            delivered = await self.finalize_draft(draft) and delivered
 
         logger.debug(f"Finalized {len(self.drafts)} draft(s) for user {self.user_id}")
+        return delivered
+
+    async def finalize_segment(self) -> bool:
+        """Finalize one semantic assistant message and reset for the next one.
+
+        Unlike ``finalize_all``, this keeps the handler open for later text in
+        the same provider turn. State is reset only after every draft finalizes,
+        so a delivery failure can still fall back to the complete final reply.
+        """
+        if self._finalized or not self.drafts:
+            return False
+
+        if self.accumulated_text:
+            current_draft = self.drafts[-1]
+            final_text = self._first_draft_prefix() + self.accumulated_text
+            if current_draft.text != final_text:
+                current_draft.text = final_text
+
+        self._apply_streaming_part_headers()
+        delivered = True
+        for draft in self.drafts:
+            delivered = await self.finalize_draft(draft) and delivered
+        if not delivered:
+            return False
+
+        count = len(self.drafts)
+        self.drafts.clear()
+        self.accumulated_text = ""
+        self.tool_calls_text = ""
+        logger.debug(
+            f"Finalized semantic segment with {count} draft(s) for user {self.user_id}"
+        )
         return True
 
     async def cancel(self) -> bool:

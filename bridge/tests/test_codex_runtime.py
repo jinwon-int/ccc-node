@@ -18,6 +18,7 @@ if TYPE_CHECKING:
         ApprovalDecision,
         ApprovalRequestEvent,
         CompletionEvent,
+        MessageCompletedEvent,
         ModelInfo,
         ReasoningDeltaEvent,
         ResultEvent,
@@ -35,6 +36,7 @@ else:
         ApprovalDecision,
         ApprovalRequestEvent,
         CompletionEvent,
+        MessageCompletedEvent,
         ModelInfo,
         ReasoningDeltaEvent,
         ResultEvent,
@@ -533,10 +535,9 @@ class CodexRuntimeTests(unittest.IsolatedAsyncioTestCase):
             {"type": "workspaceWrite", "networkAccess": False},
         )
 
-    async def test_completed_agent_message_inserts_paragraph_boundary(self) -> None:
-        # A completed agentMessage separates two assistant messages whose deltas
-        # would otherwise fuse ("…first.second…"). The boundary rides the delta
-        # stream as a "\n\n" text_delta so the downstream join keeps it.
+    async def test_completed_agent_message_emits_semantic_boundary(self) -> None:
+        # A completed agentMessage is a provider-neutral lifecycle boundary, not
+        # text. Consumers decide whether it is an interim or terminal message.
         session = await self.runtime.start_or_resume(
             SessionRequest(
                 working_directory="/workspace",
@@ -579,16 +580,23 @@ class CodexRuntimeTests(unittest.IsolatedAsyncioTestCase):
         ]
 
         events = [event async for event in session.send_turn("hi")]
-        text_deltas = [cast(TextDeltaEvent, e).text for e in events if e.kind == "text_delta"]
-        # boundary inserted between the two messages; trailing boundary is harmless
-        # (the consumer strips it) but present here as the second message also completes.
-        self.assertEqual(text_deltas, ["first part.", "\n\n", "second part.", "\n\n"])
-        self.assertEqual("".join(text_deltas).strip(), "first part.\n\nsecond part.")
+        self.assertEqual(
+            [event.kind for event in events],
+            [
+                "text_delta",
+                "message_completed",
+                "text_delta",
+                "message_completed",
+                "result",
+                "completion",
+            ],
+        )
+        boundaries = [event for event in events if isinstance(event, MessageCompletedEvent)]
+        self.assertEqual(len(boundaries), 2)
 
     async def test_agent_message_boundary_never_leads_or_doubles(self) -> None:
-        # A completed agentMessage with no preceding text emits nothing (no leading
-        # separator); a second consecutive completion without new text does not
-        # double the separator.
+        # A completed agentMessage with no preceding text emits nothing; a second
+        # consecutive completion without new text does not double the boundary.
         session = await self.runtime.start_or_resume(
             SessionRequest(
                 working_directory="/workspace",
@@ -635,8 +643,10 @@ class CodexRuntimeTests(unittest.IsolatedAsyncioTestCase):
         ]
 
         events = [event async for event in session.send_turn("hi")]
-        text_deltas = [cast(TextDeltaEvent, e).text for e in events if e.kind == "text_delta"]
-        self.assertEqual(text_deltas, ["only", "\n\n"])
+        self.assertEqual(
+            [event.kind for event in events],
+            ["text_delta", "message_completed", "result", "completion"],
+        )
 
     async def test_approval_before_turn_start_response_routes_to_handler(self) -> None:
         session = await self.runtime.start_or_resume(

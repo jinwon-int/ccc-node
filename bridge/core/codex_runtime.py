@@ -21,6 +21,7 @@ from .agent_runtime import (
     CompletionEvent,
     ErrorEvent,
     JsonValue as AgentJsonValue,
+    MessageCompletedEvent,
     ModelInfo,
     ReasoningDeltaEvent,
     ResultEvent,
@@ -723,15 +724,10 @@ class CodexRuntime:
                 and active.emitted_text
                 and self._is_agent_message_item(params)
             ):
-                # A completed agentMessage marks a boundary between two assistant
-                # messages that Codex does not otherwise carry in the delta stream.
-                # Without it the deltas of consecutive messages fuse ("…다.현재…"),
-                # and the readable renderer cannot restore a paragraph break it never
-                # received. Emit an explicit separator so the "".join downstream (and
-                # the streaming accumulator) keep the boundary. emitted_text gates it
-                # so a separator only follows real text, never leads, and an empty
-                # message cannot double it.
-                event = TextDeltaEvent("\n\n")
+                # Keep lifecycle separate from content. The consumer can now
+                # deliver an interim message before a tool while preserving the
+                # terminal message for the normal final-response path.
+                event = MessageCompletedEvent()
                 active.emitted_text = False
         elif notification.method == "turn/completed":
             self._complete_turn(active, params)

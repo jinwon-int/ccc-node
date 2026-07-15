@@ -14,6 +14,7 @@ from telegram_bot.core.agent_runtime import (
     CompletionEvent,
     ErrorEvent,
     JsonValue as AgentJsonValue,
+    MessageCompletedEvent,
     ReasoningDeltaEvent,
     ResultEvent,
     SessionRequest,
@@ -25,6 +26,7 @@ from telegram_bot.core.heartbeat import tool_label
 from telegram_bot.core.project_chat_types import (
     AgentApprovalCallback,
     ChatResponse,
+    InterimMessageCallback,
     PermissionCallback,
     StatusCallback,
     TypingCallback,
@@ -96,6 +98,7 @@ class ProjectChatProcessMixin:
         status_callback: Optional[StatusCallback] = None,
         bot: Optional[Any] = None,
         notification_bot: Optional[Any] = None,
+        interim_message_callback: Optional[InterimMessageCallback] = None,
         sensitive_log_event: Optional[str] = None,
     ) -> ChatResponse:
         del message_id
@@ -123,6 +126,7 @@ class ProjectChatProcessMixin:
                 typing_callback=typing_callback,
                 status_callback=status_callback,
                 bot=bot,
+                interim_message_callback=interim_message_callback,
             )
         _log_user_input(
             user_message=user_message,
@@ -404,6 +408,7 @@ class ProjectChatProcessMixin:
         typing_callback: Optional[TypingCallback],
         status_callback: Optional[StatusCallback],
         bot: Optional[Any],
+        interim_message_callback: Optional[InterimMessageCallback],
     ) -> ChatResponse:
         """Run one provider-neutral turn without changing the Claude SDK path."""
         key = self._stream_key(user_id, chat_id)
@@ -479,6 +484,10 @@ class ProjectChatProcessMixin:
                 self._agent_active_sessions[key] = session
                 self._agent_started_at[key] = asyncio.get_running_loop().time()
                 text_parts: list[str] = []
+                response_parts: list[str] = []
+                current_message_parts: list[str] = []
+                pending_completed_message: str | None = None
+                interim_delivered = False
                 terminal_error: ErrorEvent | None = None
 
                 async def handle_approval(event: ApprovalRequestEvent) -> ApprovalDecision:
@@ -516,7 +525,42 @@ class ProjectChatProcessMixin:
                 )
                 stalled = False
 
-                async def consume_agent_events() -> None:
+                async def deliver_pending_interim() -> None:
+                    """Deliver a completed message only after more turn work appears."""
+                    nonlocal pending_completed_message, interim_delivered
+                    content = pending_completed_message
+                    if content is None:
+                        return
+                    delivered = False
+                    if streaming_handler is not None:
+                        delivered = await streaming_handler.finalize_segment()
+                    elif interim_message_callback is not None:
+                        try:
+                            await interim_message_callback(content)
+                            delivered = True
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception:
+                            logger.exception(
+                                "Interim assistant message delivery failed; "
+                                "retaining it for final delivery"
+                            )
+                    if delivered:
+                        interim_delivered = True
+                    else:
+                        response_parts.append(content)
+                    pending_completed_message = None
+
+                def response_content() -> str:
+                    parts = list(response_parts)
+                    if pending_completed_message is not None:
+                        parts.append(pending_completed_message)
+                    current = self._clean_response("".join(current_message_parts))
+                    if current:
+                        parts.append(current)
+                    return "\n\n".join(part for part in parts if part)
+
+                async def consume_agent_events() -> None:  # noqa: C901 -- lifecycle router
                     """Consume one turn's events with a terminal-event stall guard.
 
                     The same lifecycle invariant as the Claude reader (#411 C):
@@ -525,7 +569,7 @@ class ProjectChatProcessMixin:
                     consuming after the bounded grace instead of holding the
                     conversation until the full process timeout.
                     """
-                    nonlocal terminal_error, stalled
+                    nonlocal terminal_error, stalled, pending_completed_message
                     busy_depth = 0
                     approval_pending = False
                     active_tools: dict[str, str] = {}
@@ -557,12 +601,27 @@ class ProjectChatProcessMixin:
                             progress_request.last_event_at = now
                             approval_pending = isinstance(event, ApprovalRequestEvent)
                             if isinstance(event, TextDeltaEvent):
+                                # A new text delta after a completed message proves
+                                # the prior message was interim rather than final.
+                                await deliver_pending_interim()
                                 progress_request.last_text_at = now
                                 text_parts.append(event.text)
+                                current_message_parts.append(event.text)
                                 if streaming_handler:
                                     await streaming_handler.update_if_needed(event.text)
                                     progress_request.last_visible_progress_at = now
+                            elif isinstance(event, MessageCompletedEvent):
+                                completed = self._clean_response(
+                                    "".join(current_message_parts)
+                                )
+                                current_message_parts.clear()
+                                if completed:
+                                    pending_completed_message = completed
                             elif isinstance(event, ToolStartedEvent):
+                                # Look ahead by one meaningful lifecycle event:
+                                # tool work means the completed text should be a
+                                # separate bubble now, not at turn completion.
+                                await deliver_pending_interim()
                                 busy_depth += 1
                                 progress_request.last_tool_at = now
                                 label = tool_label(event.tool_name, dict(event.arguments))
@@ -622,8 +681,9 @@ class ProjectChatProcessMixin:
                         self._agent_session_approvals_reviewers.pop(key, None)
                         self._agent_session_sandbox_policies.pop(key, None)
                     await self._interrupt_agent_session(session)
+                    final_streamed = False
                     if streaming_handler:
-                        await streaming_handler.finalize_all()
+                        final_streamed = await streaming_handler.finalize_all()
                     logger.warning(
                         "Terminal-event stall released agent turn for user %s chat %s "
                         "after silence following answer text",
@@ -634,18 +694,26 @@ class ProjectChatProcessMixin:
                         health_reporter.record_stalled_request()
                     except Exception:
                         pass
-                    content = self._clean_response("".join(text_parts)) or "(No response)"
+                    content = response_content()
+                    streamed = final_streamed
+                    if not content and interim_delivered:
+                        streamed = True
+                    content = content or "(No response)"
                     return ChatResponse(
                         content=f"{content}\n\n{TERMINAL_STALL_NOTICE}",
                         success=True,
                         session_id=session.session_id,
-                        streamed=bool(streaming_handler and streaming_handler.drafts),
+                        streamed=streamed,
                     )
 
+                final_streamed = False
                 if streaming_handler:
-                    await streaming_handler.finalize_all()
-                content = self._clean_response("".join(text_parts)) or "(No response)"
-                streamed = bool(streaming_handler and streaming_handler.drafts)
+                    final_streamed = await streaming_handler.finalize_all()
+                content = response_content()
+                streamed = final_streamed
+                if not content and interim_delivered:
+                    streamed = True
+                content = content or "(No response)"
                 if terminal_error is not None:
                     progress_terminal_state = TASK_FAILED
                     if self._agent_sessions.get(key) is session:
@@ -660,7 +728,9 @@ class ProjectChatProcessMixin:
                         success=False,
                         error=terminal_error.message,
                         session_id=session.session_id,
-                        streamed=streamed,
+                        # The error itself was not part of the assistant draft.
+                        # Always deliver it even when interim text was streamed.
+                        streamed=False,
                     )
                 progress_terminal_state = TASK_COMPLETED
                 return ChatResponse(

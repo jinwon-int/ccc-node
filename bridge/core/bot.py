@@ -625,6 +625,11 @@ class TelegramBot(
                 status_callback=self._make_status_callback(app.bot, chat.id),
                 bot=app.bot if enable_streaming_text else None,
                 notification_bot=app.bot,
+                interim_message_callback=(
+                    self._make_interim_reply_callback(message)
+                    if enable_streaming_text
+                    else None
+                ),
                 sensitive_log_event=sensitive_log_event,
             )
             await self._save_session_id(conversation_key, response)

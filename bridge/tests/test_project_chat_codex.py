@@ -20,6 +20,7 @@ from telegram_bot.core.agent_runtime import (
     ApprovalRequestEvent,
     CompletionEvent,
     ErrorEvent,
+    MessageCompletedEvent,
     ModelInfo,
     ReasoningDeltaEvent,
     ResultEvent,
@@ -352,6 +353,151 @@ async def test_codex_start_resume_and_event_mapping_hides_reasoning(tmp_path: Pa
     assert "private chain" not in response.content
     assert response.success is True
     assert response.session_id == "resumed"
+
+
+@pytest.mark.anyio
+async def test_completed_message_before_tool_is_delivered_as_interim_bubble(
+    tmp_path: Path,
+) -> None:
+    delivered: list[str] = []
+
+    async def deliver_interim(content: str) -> None:
+        delivered.append(content)
+
+    session = FakeSession(
+        "split",
+        [
+            TextDeltaEvent("Checking the repository now."),
+            MessageCompletedEvent(),
+            ToolStartedEvent("tool-1", "command", {"command": "gh issue list"}),
+            ToolCompletedEvent("tool-1", "command", {"output": "17"}, True),
+            TextDeltaEvent("There are 17 open issues."),
+            MessageCompletedEvent(),
+            ResultEvent({"status": "completed"}),
+            CompletionEvent("end_turn"),
+        ],
+    )
+    handler = _handler(tmp_path, FakeRuntime([session]))
+
+    response = await handler.process_message(
+        "How many issues are open?",
+        user_id=7,
+        chat_id=70,
+        interim_message_callback=deliver_interim,
+    )
+
+    assert delivered == ["Checking the repository now."]
+    assert response.content == "There are 17 open issues."
+    assert response.streamed is False
+
+
+@pytest.mark.anyio
+async def test_terminal_completed_message_stays_on_final_delivery_path(tmp_path: Path) -> None:
+    delivered: list[str] = []
+
+    async def deliver_interim(content: str) -> None:
+        delivered.append(content)
+
+    session = FakeSession(
+        "terminal",
+        [
+            TextDeltaEvent("The final answer."),
+            MessageCompletedEvent(),
+            ResultEvent({"status": "completed"}),
+            CompletionEvent("end_turn"),
+        ],
+    )
+    handler = _handler(tmp_path, FakeRuntime([session]))
+
+    response = await handler.process_message(
+        "answer",
+        user_id=7,
+        chat_id=70,
+        interim_message_callback=deliver_interim,
+    )
+
+    assert delivered == []
+    assert response.content == "The final answer."
+    assert response.streamed is False
+
+
+@pytest.mark.anyio
+async def test_failed_interim_delivery_falls_back_to_complete_final_text(tmp_path: Path) -> None:
+    async def fail_interim(_content: str) -> None:
+        raise OSError("telegram unavailable")
+
+    session = FakeSession(
+        "fallback",
+        [
+            TextDeltaEvent("First message."),
+            MessageCompletedEvent(),
+            ToolStartedEvent("tool-1", "command", {"command": "true"}),
+            ToolCompletedEvent("tool-1", "command", {"output": ""}, True),
+            TextDeltaEvent("Final message."),
+            MessageCompletedEvent(),
+            CompletionEvent("end_turn"),
+        ],
+    )
+    handler = _handler(tmp_path, FakeRuntime([session]))
+
+    response = await handler.process_message(
+        "go",
+        user_id=7,
+        chat_id=70,
+        interim_message_callback=fail_interim,
+    )
+
+    assert response.content == "First message.\n\nFinal message."
+    assert response.streamed is False
+
+
+@pytest.mark.anyio
+async def test_streaming_mode_finalizes_each_semantic_message_once(tmp_path: Path) -> None:
+    class Bot:
+        def __init__(self) -> None:
+            self.sent: list[str] = []
+            self.edited: list[str] = []
+
+        async def send_message(self, *, chat_id, text, **_kwargs):
+            del chat_id
+            self.sent.append(text)
+            return SimpleNamespace(message_id=len(self.sent))
+
+        async def edit_message_text(self, *, chat_id, message_id, text, **_kwargs):
+            del chat_id, message_id
+            self.edited.append(text)
+            return True
+
+    session = FakeSession(
+        "streaming-split",
+        [
+            TextDeltaEvent("Checking now."),
+            MessageCompletedEvent(),
+            ToolStartedEvent("tool-1", "command", {"command": "true"}),
+            ToolCompletedEvent("tool-1", "command", {"output": ""}, True),
+            TextDeltaEvent("Final answer."),
+            MessageCompletedEvent(),
+            CompletionEvent("end_turn"),
+        ],
+    )
+    handler = _handler(tmp_path, FakeRuntime([session]))
+    handler._config.enable_streaming = True
+    handler._config.draft_update_min_chars = 20
+    handler._config.draft_update_interval = 0.1
+    handler._config.telegram_max_bubble_chars = 4000
+    handler._config.enable_streaming_tool_calls = False
+    bot = Bot()
+
+    response = await handler.process_message(
+        "go",
+        user_id=7,
+        chat_id=70,
+        bot=bot,
+    )
+
+    assert bot.sent == ["Checking now.", "Final answer."]
+    assert response.content == "Final answer."
+    assert response.streamed is True
 
 
 class ProgressSession(FakeSession):

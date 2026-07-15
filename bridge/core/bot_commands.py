@@ -73,6 +73,7 @@ class BotCommandMixin:
             typing_callback=lambda: message.chat.send_action(action="typing"),
             status_callback=self._make_status_callback(context.bot, chat.id),
             notification_bot=context.bot,
+            interim_message_callback=self._make_interim_reply_callback(message),
         )
         await self._save_session_id(self._conversation_key(user_id, chat.id), response)
         # PATCH 2026-05-04: use _reply_smart to auto-split >4096 char responses
@@ -1012,6 +1013,7 @@ class BotCommandMixin:
                 typing_callback=lambda: message.chat.send_action(action="typing"),
                 status_callback=self._make_status_callback(app.bot, chat.id),
                 bot=app.bot,
+                interim_message_callback=self._make_interim_reply_callback(message),
             )
             await self._save_session_id(conversation_key, response)
             await self._reply_smart(
@@ -1058,6 +1060,7 @@ class BotCommandMixin:
                     typing_callback=lambda: message.chat.send_action(action="typing"),
                     status_callback=self._make_status_callback(app.bot, chat.id),
                     bot=app.bot,
+                    interim_message_callback=self._make_interim_reply_callback(message),
                 )
                 await self._save_session_id(conversation_key, response)
                 await self._reply_smart(
@@ -1125,4 +1128,3 @@ class BotCommandMixin:
         log_debug(user_id, "command", text)
 
         await self._exec_slash_command(update, f"/{cmd_name} {args}".strip())
-
