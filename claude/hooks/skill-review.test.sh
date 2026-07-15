@@ -59,6 +59,27 @@ for _ in $(seq 1 30); do
 done
 ok "last JSON stashed" 'jq -e ".skill_candidates | length == 1" "$STATE/skill-review-last.json" >/dev/null'
 
+# Auto mode (#355): the SessionEnd pipeline hands staged drafts to the machine
+# gate, which installs them unattended and archives the draft. Fresh state so
+# the approve-mode run above cannot interfere.
+STATE_AUTO="$TMP/state-auto"
+SKILLS_AUTO="$TMP/skills-auto"
+SPOOL_AUTO="$TMP/spool-auto"
+mkdir -p "$STATE_AUTO" "$SKILLS_AUTO"
+out="$(payload sess-auto "$TRANS" "/root/work" | CCC_STATE_DIR="$STATE_AUTO" CLAUDE_SKILLS_DIR="$SKILLS_AUTO" \
+  CCC_PUSH_SPOOL="$SPOOL_AUTO" CCC_SKILL_AUTOSAVE_MODE=auto CCC_SKILL_REVIEW_COOLDOWN_SECONDS=0 \
+  bash "$REVIEW" sessionend 2>&1)"; rc=$?
+ok "auto-mode hook exits 0" '[ "$rc" = 0 ]'
+for _ in $(seq 1 40); do
+  [ -f "$SKILLS_AUTO/deploy-checklist/SKILL.md" ] && break
+  sleep 0.25
+done
+ok "auto mode installs staged draft unattended" '[ -f "$SKILLS_AUTO/deploy-checklist/SKILL.md" ]'
+ok "auto mode leaves autosave ledger + marker" 'jq -e ".installed_by == \"autosave\"" "$SKILLS_AUTO/deploy-checklist/.autosave-meta.json" >/dev/null && jq -e "select(.event==\"install\") | .name == \"deploy-checklist\"" "$STATE_AUTO/skill-autosave-install.jsonl" >/dev/null'
+ok "auto mode archives the draft" 'ls -d "$STATE_AUTO/pending-skills/"*.installed-* >/dev/null 2>&1'
+ok "auto mode queues post-hoc notice" 'ls "$SPOOL_AUTO"/*SkillAutoInstall*.json >/dev/null 2>&1'
+ok "auto mode writes no approval marker when nothing stays pending" '! grep -q "PENDING_SKILL_REVIEW" "$STATE_AUTO/approval-needed.log" 2>/dev/null'
+
 # Cooldown should skip a second hook-triggered run when enabled.
 : > "$STATE/skill-review.log"
 out="$(payload sess-1 "$TRANS" "/root/work" | CCC_STATE_DIR="$STATE" CLAUDE_SKILLS_DIR="$SKILLS" CCC_SKILL_REVIEW_COOLDOWN_SECONDS=9999 bash "$REVIEW" sessionend 2>&1)"; rc=$?

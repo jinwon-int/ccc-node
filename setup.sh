@@ -272,10 +272,12 @@ run cp "$SRC/claude/hooks/distill/queue-drain.sh" "$CLAUDE_DIR/hooks/distill/que
 run cp "$SRC/claude/hooks/distill/pending-drain.sh" "$CLAUDE_DIR/hooks/distill/pending-drain.sh"
 run cp "$SRC/claude/hooks/distill/local-facts.sh" "$CLAUDE_DIR/hooks/distill/local-facts.sh"
 run cp "$SRC/claude/hooks/distill/resume-write.sh" "$CLAUDE_DIR/hooks/distill/resume-write.sh"
-# Skill Review — Hermes-style background skill draft staging (human-approved).
+# Skill Review — Hermes-style background skill draft staging (human-approved by
+# default; autoinstall.sh adds the opt-in unattended auto mode, #355).
 run cp "$SRC/claude/hooks/skill-review.sh" "$CLAUDE_DIR/hooks/skill-review.sh"
 run mkdir -p "$CLAUDE_DIR/hooks/skill-review"
 run cp "$SRC/claude/hooks/skill-review/extract.sh" "$CLAUDE_DIR/hooks/skill-review/extract.sh"
+run cp "$SRC/claude/hooks/skill-review/autoinstall.sh" "$CLAUDE_DIR/hooks/skill-review/autoinstall.sh"
 # Skill autosave sweep — covers bridge/SDK sessions that never fire SessionEnd
 # hooks; scheduled separately via scripts/install-skill-autosave-cron.sh.
 run cp "$SRC/scripts/ccc-skill-autosave.sh" "$CLAUDE_DIR/hooks/ccc-skill-autosave.sh"
@@ -319,6 +321,7 @@ installed_hook_scripts=(
   "$CLAUDE_DIR/hooks/distill/resume-write.sh"
   "$CLAUDE_DIR/hooks/skill-review.sh"
   "$CLAUDE_DIR/hooks/skill-review/extract.sh"
+  "$CLAUDE_DIR/hooks/skill-review/autoinstall.sh"
   "$CLAUDE_DIR/hooks/ccc-skill-autosave.sh"
   "$CLAUDE_DIR/hooks/ccc-self-update.sh"
 )

@@ -14,8 +14,12 @@
 #
 # Safety (same contract as the hooks it orchestrates):
 #   - Always exits 0; every step is best-effort and logged.
-#   - Never installs or overwrites ~/.claude/skills — drafts stay in the
-#     human-gated pending-skills queue (approval via /skill-suggest).
+#   - approve mode (default): never installs or overwrites ~/.claude/skills —
+#     drafts stay in the human-gated pending-skills queue (/skill-suggest).
+#   - auto mode (#355, opt-in via CCC_SKILL_AUTOSAVE_MODE=auto or `auto` in
+#     ~/.claude/state/skill-autosave.mode): after drafting, the machine-gated
+#     installer (hooks/skill-review/autoinstall.sh) installs passing drafts and
+#     queues a post-hoc Telegram notice; gate failures stay pending for humans.
 #   - Off-switch: touch ~/.claude/state/skill-autosave.disabled
 #     (skill-review's own skill-review.disabled off-switch is honored too).
 #   - Cost-bounded: at most CCC_SKILL_AUTOSAVE_MAX_SESSIONS transcripts are
@@ -34,6 +38,7 @@ SPOOL="${CCC_PUSH_SPOOL:-$STATE_DIR/telegram-spool}"
 
 REVIEW="${CCC_SKILL_REVIEW_CMD:-$CLAUDE_DIR/hooks/skill-review.sh}"
 SCAN="${CCC_SKILL_SCAN_CMD:-$CLAUDE_DIR/skills/skill-suggest/scan.sh}"
+AUTOINSTALL="${CCC_SKILL_AUTOINSTALL_CMD:-$CLAUDE_DIR/hooks/skill-review/autoinstall.sh}"
 
 MAX_SESSIONS="${CCC_SKILL_AUTOSAVE_MAX_SESSIONS:-3}"
 WINDOW_DAYS="${CCC_SKILL_AUTOSAVE_WINDOW_DAYS:-2}"
@@ -51,16 +56,28 @@ log() { printf '%s %s\n' "$(ts)" "$*" >> "$LOG" 2>/dev/null; }
 
 pending_count() {
   find "$PENDING_DIR" -mindepth 1 -maxdepth 1 -type d 2>/dev/null \
-    | grep -Ev '\.(approved|rejected)-[0-9]+$' | wc -l | tr -d '[:space:]'
+    | grep -Ev '\.(approved|rejected|installed)-[0-9]+$' | wc -l | tr -d '[:space:]'
+}
+
+# approve (default) keeps the human gate; auto (#355) hands passing drafts to
+# the machine-gated installer. Env wins over the state file.
+resolve_mode() {
+  local m="${CCC_SKILL_AUTOSAVE_MODE:-}"
+  if [ -z "$m" ] && [ -f "$STATE_DIR/skill-autosave.mode" ]; then
+    m="$(head -1 "$STATE_DIR/skill-autosave.mode" 2>/dev/null | tr -d '[:space:]')"
+  fi
+  case "$m" in auto) printf 'auto' ;; *) printf 'approve' ;; esac
 }
 
 MODE="${1:-run}"
 
 if [ "$MODE" = "status" ]; then
+  echo "mode: $(resolve_mode) (approve = human gate, auto = machine gate + post-hoc notify)"
   echo "off-switch: $([ -f "$STATE_DIR/skill-autosave.disabled" ] && echo ON || echo off)"
   echo "pending skill drafts: $(pending_count)"
   echo "candidates report: $(ls -la "$STATE_DIR/skill-candidates.md" 2>/dev/null || echo none)"
   echo "-- ledger (last 5) --";      tail -5 "$LEDGER" 2>/dev/null
+  echo "-- autosave installs (last 5) --"; tail -5 "$STATE_DIR/skill-autosave-install.jsonl" 2>/dev/null
   echo "-- log (last 10) --";        tail -10 "$LOG" 2>/dev/null
   exit 0
 fi
@@ -140,14 +157,32 @@ else
   log "sweep done drafted_sessions=$drafted pending_before=$before pending_after=$after"
 fi
 
+# --- 2b) auto mode (#355): machine-gate + install passing drafts -------------
+# autoinstall.sh no-ops unless mode=auto; it owns the gates, the daily cap, the
+# installed-by=autosave ledger and the post-hoc Telegram notice for installs
+# and blocks, so the sweep just invokes it and records the summary.
+EFFECTIVE_MODE="$(resolve_mode)"
+if [ "$EFFECTIVE_MODE" = "auto" ]; then
+  if [ -f "$AUTOINSTALL" ]; then
+    summary="$(CCC_SKILL_AUTOSAVE_TRIGGER=sweep bash "$AUTOINSTALL" run 2>>"$LOG")" \
+      && log "autoinstall $(printf '%s' "$summary" | head -c 500)" \
+      || log "autoinstall failed (non-fatal)"
+  else
+    # Fall back to the approve-mode reminder below rather than going silent.
+    EFFECTIVE_MODE="approve"
+    log "autoinstall skipped reason=missing path=$AUTOINSTALL"
+  fi
+fi
+
 # --- 3) owner-only Telegram notification via the bridge spool ----------------
 # Same token-isolation contract as notify.sh: this script never touches the bot
 # token; it writes a short summary file that the bridge PushNotifier (opt-in,
-# CCC_PUSH_ENABLED) delivers to the owner chat.
+# CCC_PUSH_ENABLED) delivers to the owner chat. In auto mode this approval
+# reminder is replaced by autoinstall's own post-hoc install/block notice.
 pending="$(pending_count)"
 last_notified="$(cat "$NOTIFIED" 2>/dev/null || printf 0)"
 case "$last_notified" in ''|*[!0-9]*) last_notified=0 ;; esac
-if [ "$NOTIFY" = "1" ] && [ "$pending" -gt 0 ] && [ "$pending" != "$last_notified" ]; then
+if [ "$EFFECTIVE_MODE" = "approve" ] && [ "$NOTIFY" = "1" ] && [ "$pending" -gt 0 ] && [ "$pending" != "$last_notified" ]; then
   if mkdir -p "$SPOOL" 2>/dev/null; then
     node="${CCC_NODE:-$(hostname -s 2>/dev/null || echo node)}"
     text="스킬 초안 ${pending}건 승인 대기 중 — '/skill-suggest'로 검토/승인하세요."

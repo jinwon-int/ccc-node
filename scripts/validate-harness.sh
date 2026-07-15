@@ -156,6 +156,7 @@ fi
 say "== hook tests =="
 for t in claude/hooks/guard.test.sh claude/hooks/observability.test.sh claude/hooks/security-scan.test.sh \
          claude/hooks/checkpoint.test.sh claude/hooks/distill-scope.test.sh claude/hooks/skill-review.test.sh \
+         claude/hooks/skill-review/autoinstall.test.sh \
          claude/hooks/lib/mtime-prune.test.sh \
          claude/hooks/lib/test-stub.test.sh \
          claude/hooks/distill/extract.test.sh claude/hooks/distill/honcho-push.test.sh \

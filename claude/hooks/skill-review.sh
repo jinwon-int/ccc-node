@@ -2,7 +2,10 @@
 # Skill Review — Hermes-style self-improvement pass for ccc-node.
 # Fired by SessionEnd / manual command. It reviews the recent Claude Code
 # transcript and stages reusable skill drafts under ~/.claude/state/pending-skills/.
-# It NEVER installs or overwrites ~/.claude/skills directly; approval is required.
+# This script never writes ~/.claude/skills itself. In approve mode (default)
+# drafts wait for human approval; in auto mode (#355, CCC_SKILL_AUTOSAVE_MODE=auto)
+# staged drafts are handed to skill-review/autoinstall.sh, whose machine gates
+# install passing drafts and leave failing ones pending for humans.
 #
 # Safety:
 #   - Always exit 0 when used as a hook.
@@ -95,8 +98,26 @@ run_skill_review_bg() {
   done
 
   if [ "$staged" -gt 0 ]; then
-    printf '%s\t%s\n' "$(ts)" "PENDING_SKILL_REVIEW staged=$staged session=$SESSION_ID" \
-      >> "$STATE_DIR/approval-needed.log" 2>/dev/null || true
+    # Auto mode (#355): hand fresh drafts to the machine-gated installer right
+    # away (Hermes-style — no human gate). The script is a strict no-op unless
+    # CCC_SKILL_AUTOSAVE_MODE=auto (or the skill-autosave.mode state file says
+    # auto), so approve-mode nodes are unchanged.
+    local AUTOINSTALL summary still_pending
+    AUTOINSTALL="${CCC_SKILL_AUTOINSTALL_CMD:-$HOOKDIR/skill-review/autoinstall.sh}"
+    if [ -f "$AUTOINSTALL" ]; then
+      summary="$(CCC_SKILL_AUTOSAVE_TRIGGER="hook-$TRIGGER" bash "$AUTOINSTALL" run 2>>"$LOG")" \
+        && log "autoinstall $(printf '%s' "$summary" | head -c 500)" \
+        || log "autoinstall failed (non-fatal)"
+    fi
+    # Approval marker only for drafts that still wait for a human — in auto
+    # mode an installed draft needs review/rollback, not approval.
+    still_pending="$(find "$PENDING_DIR" -mindepth 1 -maxdepth 1 -type d 2>/dev/null \
+      | grep -cEv '\.(approved|rejected|installed)-[0-9]+$')"
+    case "$still_pending" in ''|*[!0-9]*) still_pending="$staged" ;; esac
+    if [ "$still_pending" -gt 0 ]; then
+      printf '%s\t%s\n' "$(ts)" "PENDING_SKILL_REVIEW staged=$staged pending=$still_pending session=$SESSION_ID" \
+        >> "$STATE_DIR/approval-needed.log" 2>/dev/null || true
+    fi
   fi
   log "done staged=$staged trigger=$TRIGGER pid=$PIPE_PID"
   return 0
