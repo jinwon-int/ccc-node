@@ -81,6 +81,36 @@ class VoiceProviderConfigTests(unittest.TestCase):
             self.assertEqual(enabled.telegram_max_image_bytes, 1048576)
             self.assertEqual(enabled.telegram_max_image_pixels, 1000000)
 
+    def test_curated_web_mcp_is_explicit_complete_and_secret_safe(self):
+        with TemporaryDirectory() as td:
+            module = self._load_config_module(td)
+            base = {"telegram_bot_token": "123456:abc", "_env_file": None}
+            off = module.Config(**base)
+            self.assertEqual(off.bridge_web_mcp_mode, "off")
+
+            enabled = module.Config(
+                **base,
+                CCC_BRIDGE_WEB_MCP_MODE="searxng-firecrawl",
+                CCC_BRIDGE_SEARXNG_URL="https://search.example.com/",
+                CCC_BRIDGE_FIRECRAWL_API_KEY="fc-test-secret",
+            )
+            self.assertEqual(enabled.bridge_searxng_url, "https://search.example.com")
+            self.assertIsNotNone(enabled.bridge_firecrawl_api_key)
+            self.assertNotIn("fc-test-secret", repr(enabled.bridge_firecrawl_api_key))
+
+            for missing in (
+                "CCC_BRIDGE_SEARXNG_URL",
+                "CCC_BRIDGE_FIRECRAWL_API_KEY",
+            ):
+                values = {
+                    "CCC_BRIDGE_WEB_MCP_MODE": "searxng-firecrawl",
+                    "CCC_BRIDGE_SEARXNG_URL": "https://search.example.com",
+                    "CCC_BRIDGE_FIRECRAWL_API_KEY": "fc-test-secret",
+                }
+                values.pop(missing)
+                with self.assertRaises(ValidationError):
+                    module.Config(**base, **values)
+
     def test_execution_profile_precedence_in_fresh_processes(self):
         source_config = Path(__file__).resolve().parents[1] / "utils" / "config.py"
         with TemporaryDirectory() as td:

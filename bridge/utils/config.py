@@ -7,7 +7,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Annotated, Any, Literal, Optional, List
 from dotenv import dotenv_values
-from pydantic import Field, field_validator, model_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 BOT_PACKAGE_DIR = Path(__file__).resolve().parent.parent
@@ -269,6 +269,24 @@ class Config(BaseSettings):
             "Opt-in bridge memory lifecycle. curated loads only ccc-node memory/distill "
             "hooks through flag settings while filesystem setting sources stay disabled."
         ),
+    )
+    bridge_web_mcp_mode: Literal["off", "searxng-firecrawl"] = Field(
+        default="off",
+        alias="CCC_BRIDGE_WEB_MCP_MODE",
+        description=(
+            "Opt-in curated bridge web routing. searxng-firecrawl injects only the "
+            "SearXNG search and Firecrawl scrape MCP tools without loading user settings."
+        ),
+    )
+    bridge_searxng_url: Optional[str] = Field(
+        default=None,
+        alias="CCC_BRIDGE_SEARXNG_URL",
+        description="HTTPS SearXNG endpoint used by curated bridge web routing.",
+    )
+    bridge_firecrawl_api_key: Optional[SecretStr] = Field(
+        default=None,
+        alias="CCC_BRIDGE_FIRECRAWL_API_KEY",
+        description="Firecrawl API key used only by the curated Firecrawl MCP process.",
     )
     image_context_guard: bool = Field(
         default=False,
@@ -934,6 +952,25 @@ class Config(BaseSettings):
             raise ValueError(
                 "Volcengine transcription provider requires: " + ", ".join(missing) + "."
             )
+        return self
+
+    @model_validator(mode="after")
+    def validate_bridge_web_mcp_config(self):
+        if self.bridge_web_mcp_mode == "off":
+            return self
+        url = str(self.bridge_searxng_url or "").strip().rstrip("/")
+        key = self.bridge_firecrawl_api_key
+        if not url.startswith("https://"):
+            raise ValueError(
+                "CCC_BRIDGE_WEB_MCP_MODE=searxng-firecrawl requires an HTTPS "
+                "CCC_BRIDGE_SEARXNG_URL."
+            )
+        if key is None or not key.get_secret_value().strip():
+            raise ValueError(
+                "CCC_BRIDGE_WEB_MCP_MODE=searxng-firecrawl requires "
+                "CCC_BRIDGE_FIRECRAWL_API_KEY."
+            )
+        self.bridge_searxng_url = url
         return self
 
     # Logging

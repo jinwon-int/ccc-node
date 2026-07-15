@@ -56,6 +56,7 @@ from telegram_bot.core.usage import (
 )
 from telegram_bot.core.curated_memory import build_curated_memory_settings
 from telegram_bot.core.session_scope import stream_key
+from telegram_bot.core.web_mcp import build_curated_web_mcp
 
 logger = logging.getLogger(__name__)
 
@@ -495,6 +496,19 @@ class ProjectChatHandler(
                 self._config.enable_streaming and self._config.enable_partial_streaming
             ),
         }
+        web_mcp = build_curated_web_mcp(self._config)
+        if web_mcp is not None:
+            opts["allowed_tools"] = [
+                tool
+                for tool in opts["allowed_tools"]
+                if tool not in web_mcp["disallowed_tools"]
+            ] + web_mcp["allowed_tools"]
+            opts["disallowed_tools"] = list(
+                dict.fromkeys(opts["disallowed_tools"] + web_mcp["disallowed_tools"])
+            )
+            opts["mcp_servers"] = web_mcp["mcp_servers"]
+            opts["env"] = {**opts.get("env", {}), **web_mcp["process_env"]}
+            opts["system_prompt"] += web_mcp["system_prompt"]
         if self._execution_profile == EXECUTION_OWNER_OPERATOR:
             # Owner-operated bridges intentionally retain host utility and the
             # normal Claude Code settings/context chain. Access control, not a
