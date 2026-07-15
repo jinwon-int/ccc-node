@@ -30,6 +30,10 @@ from telegram_bot.utils import tg_entities
 
 logger = logging.getLogger(__name__)
 STALE_MESSAGE_SECONDS = 20 * 60  # 20 minutes
+# Upper bound for auto-sending an agent-produced file to Telegram. Matches the
+# Telegram Bot API's 50 MB document-send ceiling; oversize files are skipped
+# (and any residual Telegram rejection is caught in _send_file_paths).
+MAX_SEND_FILE_BYTES = 50 * 1024 * 1024
 
 
 
@@ -188,7 +192,7 @@ class BotDeliveryMixin:
             if not p.is_absolute():
                 p = self._project_root() / p
             p = p.resolve()
-            if p not in seen and p.is_file() and p.stat().st_size < 10 * 1024 * 1024:
+            if p not in seen and p.is_file() and p.stat().st_size < MAX_SEND_FILE_BYTES:
                 seen.add(p)
                 paths.append(p)
         return paths
@@ -490,7 +494,7 @@ class BotDeliveryMixin:
                     resolved = p.resolve(strict=False)
                     if (
                         resolved.is_file()
-                        and resolved.stat().st_size < 10 * 1024 * 1024
+                        and resolved.stat().st_size < MAX_SEND_FILE_BYTES
                     ):
                         paths.append(resolved)
                 except Exception:

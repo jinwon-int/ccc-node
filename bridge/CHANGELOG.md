@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Outbound file delivery covered too few file types.** Replies that referenced
+  an agent-produced file only auto-sent it to Telegram when its extension was one
+  of nine hardcoded types (`png/jpg/jpeg/gif/webp/mp4/mp3/pdf/zip`), so common
+  deliverables like `.csv`, `.md`, `.txt`, `.json`, `.xlsx`, `.docx`, `.pptx`,
+  archives, and most audio/video were silently never sent. `_FILE_PATH_RE` is now
+  built from a curated `_SENDABLE_FILE_EXTENSIONS` list spanning document, data,
+  spreadsheet, presentation, archive, and audio/video/image families (source code
+  and executables stay excluded so ordinary coding turns don't push every edited
+  file), with an order-independent trailing boundary that prevents partial-suffix
+  clipping (e.g. `.json` → `.js`). The auto-send size ceiling is raised from 10 MB
+  to the Telegram Bot API's 50 MB document limit (`MAX_SEND_FILE_BYTES`). Files
+  must still resolve to a real path under `PROJECT_ROOT`; paths outside it are not
+  auto-sent.
+
 ### Changed
 - **Accept all inbound Telegram document types (follow-up to #503/#505).** The
   inbound document path no longer filters by file type: the MIME/extension

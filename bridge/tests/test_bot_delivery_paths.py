@@ -267,5 +267,65 @@ class SendFilePathsTests(unittest.TestCase):
         self.assertTrue(any("Failed to send file" in m for m in logs.output))
 
 
+class _ResolveHarness(BotDeliveryMixin):
+    """Minimal harness exercising the real _resolve_paths over on-disk files."""
+
+    from telegram_bot.core.bot import TelegramBot as _T
+
+    _FILE_PATH_RE = _T._FILE_PATH_RE
+    _IMAGE_EXTS = _T._IMAGE_EXTS
+
+    def __init__(self, root: Path):
+        self._config = SimpleNamespace(project_root=str(root))
+
+    def _project_root(self) -> Path:
+        return Path(self._config.project_root).resolve()
+
+
+class ResolvePathsExtensionTests(unittest.TestCase):
+    def _resolve(self, tmpdir: Path, content: str):
+        return [p.name for p in _ResolveHarness(tmpdir)._resolve_paths(content)]
+
+    def test_deliverable_document_data_and_media_types_are_detected(self):
+        tmpdir = Path(tempfile.mkdtemp())
+        names = [
+            "report.pdf", "data.csv", "summary.md", "notes.txt", "sheet.xlsx",
+            "paper.docx", "config.json", "events.jsonl", "run.log", "logo.svg",
+            "clip.mov", "voice.wav", "book.epub", "slides.pptx",
+        ]
+        for n in names:
+            (tmpdir / n).write_text("x", encoding="utf-8")
+        content = "\n".join(f"Saved to {tmpdir}/{n}" for n in names)
+
+        resolved = self._resolve(tmpdir, content)
+
+        self.assertEqual(sorted(resolved), sorted(names))
+
+    def test_source_code_files_are_not_auto_sent(self):
+        # Files an ordinary coding turn edits must not be pushed every reply.
+        tmpdir = Path(tempfile.mkdtemp())
+        for n in ("app.py", "index.js", "main.ts", "run.sh", "lib.rs"):
+            (tmpdir / n).write_text("x", encoding="utf-8")
+        content = "\n".join(f"Edited {tmpdir}/{n}" for n in ("app.py", "index.js", "main.ts", "run.sh", "lib.rs"))
+
+        self.assertEqual(self._resolve(tmpdir, content), [])
+
+    def test_json_extension_is_not_clipped_to_js(self):
+        tmpdir = Path(tempfile.mkdtemp())
+        (tmpdir / "config.json").write_text("{}", encoding="utf-8")
+
+        self.assertEqual(self._resolve(tmpdir, f"see {tmpdir}/config.json"), ["config.json"])
+
+    def test_oversize_file_is_skipped(self):
+        tmpdir = Path(tempfile.mkdtemp())
+        big = tmpdir / "huge.pdf"
+        big.write_bytes(b"0" * 10)
+        import os as _os
+
+        _os.truncate(big, 60 * 1024 * 1024)  # 60 MB > 50 MB ceiling
+
+        self.assertEqual(self._resolve(tmpdir, f"here {tmpdir}/huge.pdf"), [])
+
+
 if __name__ == "__main__":
     unittest.main()
