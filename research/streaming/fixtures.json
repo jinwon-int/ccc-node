@@ -1,0 +1,134 @@
+{
+  "schema": "ccc.autoresearch.streaming.v1",
+  "cases": [
+    {
+      "id": "claude_issue_lookup_progress_then_answer",
+      "provider": "claude",
+      "events": [
+        {"type": "text_delta", "text": "I'll check the repository now."},
+        {"type": "message_completed"},
+        {"type": "tool_started", "name": "WebSearch"},
+        {"type": "tool_completed"},
+        {"type": "text_delta", "text": "There are 17 open issues."},
+        {"type": "message_completed"},
+        {"type": "result", "text": "There are 17 open issues."},
+        {"type": "turn_completed"}
+      ],
+      "expected": [
+        {"text": "I'll check the repository now.", "interim": true, "released_by_event": 2},
+        {"text": "There are 17 open issues.", "interim": false, "released_by_event": 6}
+      ]
+    },
+    {
+      "id": "codex_issue_lookup_progress_then_answer",
+      "provider": "codex",
+      "events": [
+        {"type": "text_delta", "text": "Checking the repository now."},
+        {"type": "message_completed"},
+        {"type": "tool_started", "name": "command"},
+        {"type": "tool_completed"},
+        {"type": "text_delta", "text": "There are 17 open issues."},
+        {"type": "message_completed"},
+        {"type": "result"},
+        {"type": "turn_completed"}
+      ],
+      "expected": [
+        {"text": "Checking the repository now.", "interim": true, "released_by_event": 2},
+        {"text": "There are 17 open issues.", "interim": false, "released_by_event": 6}
+      ]
+    },
+    {
+      "id": "terminal_answer_is_not_emitted_early",
+      "provider": "claude",
+      "events": [
+        {"type": "text_delta", "text": "The final answer."},
+        {"type": "message_completed"},
+        {"type": "result", "text": "The final answer."},
+        {"type": "turn_completed"}
+      ],
+      "expected": [
+        {"text": "The final answer.", "interim": false, "released_by_event": 2}
+      ]
+    },
+    {
+      "id": "next_message_proves_previous_is_interim",
+      "provider": "claude",
+      "events": [
+        {"type": "text_delta", "text": "First completed message."},
+        {"type": "message_completed"},
+        {"type": "text_delta", "text": "Final completed message."},
+        {"type": "message_completed"},
+        {"type": "result", "text": "Final completed message."},
+        {"type": "turn_completed"}
+      ],
+      "expected": [
+        {"text": "First completed message.", "interim": true, "released_by_event": 2},
+        {"text": "Final completed message.", "interim": false, "released_by_event": 4}
+      ]
+    },
+    {
+      "id": "partial_deltas_form_one_terminal_bubble",
+      "provider": "codex",
+      "events": [
+        {"type": "text_delta", "text": "Hello "},
+        {"type": "text_delta", "text": "world"},
+        {"type": "message_completed"},
+        {"type": "result"},
+        {"type": "turn_completed"}
+      ],
+      "expected": [
+        {"text": "Hello world", "interim": false, "released_by_event": 3}
+      ]
+    },
+    {
+      "id": "tool_only_tail_does_not_duplicate_progress",
+      "provider": "claude",
+      "events": [
+        {"type": "text_delta", "text": "Only progress message."},
+        {"type": "message_completed"},
+        {"type": "tool_started", "name": "Read"},
+        {"type": "tool_completed"},
+        {"type": "result", "text": "Only progress message."},
+        {"type": "turn_completed"}
+      ],
+      "expected": [
+        {"text": "Only progress message.", "interim": true, "released_by_event": 2}
+      ]
+    },
+    {
+      "id": "multiple_tool_phases_preserve_three_bubbles",
+      "provider": "codex",
+      "events": [
+        {"type": "text_delta", "text": "I will inspect the config."},
+        {"type": "message_completed"},
+        {"type": "tool_started", "name": "read"},
+        {"type": "tool_completed"},
+        {"type": "text_delta", "text": "I found the setting; now I will verify it."},
+        {"type": "message_completed"},
+        {"type": "tool_started", "name": "command"},
+        {"type": "tool_completed"},
+        {"type": "text_delta", "text": "The setting is valid."},
+        {"type": "message_completed"},
+        {"type": "result"},
+        {"type": "turn_completed"}
+      ],
+      "expected": [
+        {"text": "I will inspect the config.", "interim": true, "released_by_event": 2},
+        {"text": "I found the setting; now I will verify it.", "interim": true, "released_by_event": 6},
+        {"text": "The setting is valid.", "interim": false, "released_by_event": 10}
+      ]
+    },
+    {
+      "id": "reasoning_and_tools_without_text_emit_nothing",
+      "provider": "codex",
+      "events": [
+        {"type": "reasoning_delta", "text": "private reasoning"},
+        {"type": "tool_started", "name": "command"},
+        {"type": "tool_completed"},
+        {"type": "result"},
+        {"type": "turn_completed"}
+      ],
+      "expected": []
+    }
+  ]
+}
