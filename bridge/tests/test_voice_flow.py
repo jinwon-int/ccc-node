@@ -960,6 +960,59 @@ def _build_photo_update(user_id: int, *, photo=None, document=None, caption=None
 
 
 class PhotoFlowTests(unittest.IsolatedAsyncioTestCase):
+    async def test_guard_selects_largest_photo_within_caps(self):
+        settings = SimpleNamespace(
+            **{
+                **vars(config_module.config),
+                "image_context_guard": True,
+                "telegram_max_image_bytes": 150000,
+                "telegram_max_image_pixels": 1000000,
+            }
+        )
+        bot = _make_bot(
+            settings=settings,
+            session_manager=session_module.session_manager,
+            project_chat=project_chat_module.project_chat_handler,
+        )
+        small = SimpleNamespace(file_id="small", width=100, height=100, file_size=1000)
+        eligible = SimpleNamespace(
+            file_id="eligible", width=1000, height=900, file_size=140000
+        )
+        oversized = SimpleNamespace(
+            file_id="oversized", width=2000, height=1500, file_size=500000
+        )
+
+        selected, kind = bot._select_inbound_image(
+            _FakePhotoMessage(photo=[small, eligible, oversized])
+        )
+
+        self.assertEqual(kind, "photo")
+        self.assertEqual(selected.file_id, "eligible")
+
+    async def test_guard_rejects_when_every_photo_exceeds_caps(self):
+        settings = SimpleNamespace(
+            **{
+                **vars(config_module.config),
+                "image_context_guard": True,
+                "telegram_max_image_bytes": 100000,
+                "telegram_max_image_pixels": 1000000,
+            }
+        )
+        bot = _make_bot(
+            settings=settings,
+            session_manager=session_module.session_manager,
+            project_chat=project_chat_module.project_chat_handler,
+        )
+        bot._check_access = AsyncMock(return_value=True)
+        photo = SimpleNamespace(
+            file_id="oversized", width=2000, height=1500, file_size=500000
+        )
+        update = _build_photo_update(11, photo=[photo])
+
+        await bot._handle_photo_message(update, None)
+
+        self.assertTrue(any("size limit" in msg for msg in update.message.replies))
+
     async def test_ignores_unauthorized_photo_message(self):
         bot = _make_bot(
             settings=config_module.config,

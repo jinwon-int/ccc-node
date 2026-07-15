@@ -28,6 +28,7 @@ from telegram_bot.core import session_resume
 from telegram_bot.core.push_notifier import PushNotifier
 from telegram_bot.core.task_queue import UserTaskQueue
 from telegram_bot.core.project_chat import ChatResponse
+from telegram_bot.core.session_scope import legacy_storage_keys, storage_key
 from telegram_bot.memory.distill_types import DistillJob, DistillTrigger
 from telegram_bot.utils.audio_processor import AudioProcessor
 from telegram_bot.utils.transcription import (
@@ -152,17 +153,69 @@ class TelegramBot(
 
 
 
-    @staticmethod
-    def _conversation_key(user_id: int, chat_id: Optional[int] = None) -> Any:
+    def _conversation_key(self, user_id: int, chat_id: Optional[int] = None) -> Any:
         """Storage/queue key for one Telegram conversation.
 
-        Private chats and groups can contain the same Telegram user. Session and
-        queue state must therefore include chat_id; otherwise answers/session IDs
-        can bleed between DM and group conversations.
+        The default isolates each sender/chat pair. Operators may explicitly
+        share one session among allowlisted senders in the same group; DMs and
+        different groups always remain isolated.
         """
-        if chat_id is None or chat_id == user_id:
-            return user_id
-        return f"{user_id}:{chat_id}"
+        cfg = getattr(self, "_config", None)
+        scope = getattr(cfg, "telegram_session_scope", "per-user-chat")
+        return storage_key(scope, user_id, chat_id)
+
+    async def _seed_scoped_session_from_legacy(
+        self,
+        conversation_key: Any,
+        user_id: int,
+        chat_id: int,
+        current_session: Dict[str, Any],
+    ) -> None:
+        """Seed a new scoped row once, without merging users or groups."""
+
+        if conversation_key == user_id or not set(current_session).issubset(
+            {"reply_mode", "provider"}
+        ):
+            return
+        legacy_session = None
+        legacy_key = None
+        for candidate in legacy_storage_keys(
+            getattr(self._config, "telegram_session_scope", "per-user-chat"),
+            user_id,
+            chat_id,
+        ):
+            candidate_session = await self._session_manager.get_session(candidate)
+            if candidate_session and candidate_session != current_session:
+                legacy_session = candidate_session
+                legacy_key = candidate
+                break
+        if legacy_session is None:
+            return
+        migration_fields = {
+            "session_id",
+            "model",
+            "effort",
+            "provider",
+            "reply_mode",
+            "last_user_message_at",
+            "force_auto_new_session",
+        }
+        migrated = {
+            key: value for key, value in legacy_session.items() if key in migration_fields
+        }
+        if migrated:
+            await self._session_manager.patch_session(
+                conversation_key, updates=migrated
+            )
+            current_session.update(migrated)
+            logger.info(
+                "conversation_scope_migrated source=%s destination=%s fields=%s",
+                legacy_key,
+                conversation_key,
+                sorted(migrated),
+            )
+        if legacy_key in self._runtime_active_sessions:
+            self._runtime_active_sessions.add(conversation_key)
 
     def _active_provider(self) -> str:
         provider = str(getattr(self._config, "agent_provider", "claude")).strip().lower()
@@ -463,37 +516,9 @@ class TelegramBot(
         app = self._require_application()
         conversation_key = self._conversation_key(user_id, chat.id)
         current_session = await self._session_manager.get_session(conversation_key)
-        if conversation_key != user_id:
-            # One-time compatibility migration: older bridge versions stored all
-            # Telegram chat state under bare user_id. If the scoped session only
-            # has defaults, seed it from legacy state, then keep future updates
-            # chat-scoped.
-            legacy_session = await self._session_manager.get_session(user_id)
-            scoped_is_default = set(current_session.keys()).issubset(
-                {"reply_mode", "provider"}
-            )
-            if legacy_session and scoped_is_default and legacy_session != current_session:
-                migration_fields = {
-                    "session_id",
-                    "model",
-                    "effort",
-                    "provider",
-                    "reply_mode",
-                    "last_user_message_at",
-                    "force_auto_new_session",
-                }
-                migrated = {
-                    key: value
-                    for key, value in legacy_session.items()
-                    if key in migration_fields
-                }
-                if migrated:
-                    await self._session_manager.patch_session(
-                        conversation_key, updates=migrated
-                    )
-                    current_session.update(migrated)
-                if user_id in self._runtime_active_sessions:
-                    self._runtime_active_sessions.add(conversation_key)
+        await self._seed_scoped_session_from_legacy(
+            conversation_key, user_id, chat.id, current_session
+        )
         current_session, provider_switched = await self._align_active_provider(
             conversation_key, current_session
         )

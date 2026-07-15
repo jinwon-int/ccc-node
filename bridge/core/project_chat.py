@@ -13,6 +13,7 @@ from typing import Any, Callable, Dict, Mapping, Optional, Tuple
 from claude_agent_sdk import (
     ClaudeSDKClient,
     ClaudeAgentOptions,
+    HookMatcher,
     AssistantMessage,  # noqa: F401
     RateLimitEvent,
     ResultMessage,
@@ -53,6 +54,8 @@ from telegram_bot.core.usage import (
     parse_claude_rate_limit_event,
     parse_claude_result,
 )
+from telegram_bot.core.curated_memory import build_curated_memory_settings
+from telegram_bot.core.session_scope import stream_key
 
 logger = logging.getLogger(__name__)
 
@@ -228,9 +231,41 @@ class ProjectChatHandler(
         self._claude_rate_limit: Optional[UsageSnapshot] = None
         logger.info(f"ProjectChatHandler initialized for {self.project_root}")
 
-    @staticmethod
-    def _stream_key(user_id: int, chat_id: int) -> Tuple[int, int]:
-        return (user_id, chat_id)
+    def _stream_key(self, user_id: int, chat_id: int) -> Tuple[int, int]:
+        return stream_key(
+            getattr(self._config, "telegram_session_scope", "per-user-chat"),
+            user_id,
+            chat_id,
+        )
+
+    def _image_read_fingerprint(self, raw_path: Any) -> Optional[str]:
+        """Identify one unchanged image without reading its payload."""
+
+        if not getattr(self._config, "image_context_guard", False):
+            return None
+        value = str(raw_path or "").strip()
+        if not value:
+            return None
+        path = Path(value).expanduser()
+        if not path.is_absolute():
+            path = self.project_root / path
+        if path.suffix.lower() not in {
+            ".jpg",
+            ".jpeg",
+            ".png",
+            ".gif",
+            ".webp",
+            ".bmp",
+            ".tif",
+            ".tiff",
+        }:
+            return None
+        normalized = str(path.resolve(strict=False))
+        try:
+            metadata = path.stat()
+        except OSError:
+            return normalized
+        return f"{normalized}:{metadata.st_size}:{metadata.st_mtime_ns}"
 
     def _record_claude_usage(self, req: _PendingRequest, msg: ResultMessage) -> None:
         session_id = msg.session_id
@@ -364,7 +399,7 @@ class ProjectChatHandler(
             if led and req.task_id:
                 led.set_state(req.task_id, TASK_INPUT_REQUIRED)
             try:
-                result = await callback(req.chat_id, user_id, tool_name, tool_input)
+                result = await callback(req.chat_id, req.user_id, tool_name, tool_input)
             finally:
                 req.awaiting_permission = False
                 if led and req.task_id:
@@ -373,12 +408,50 @@ class ProjectChatHandler(
                 return result
             return PermissionResultAllow() if result else PermissionResultDeny()
 
+        async def dedupe_image_read(input_data, _tool_use_id, _context):
+            tool_input = input_data.get("tool_input", {})
+            fingerprint = self._image_read_fingerprint(
+                tool_input.get("file_path") if isinstance(tool_input, dict) else None
+            )
+            if fingerprint is None:
+                return {}
+            state = state_holder.get("state")
+            if state is None or not state.pending:
+                return {}
+            request = state.pending[0]
+            if fingerprint in request.image_read_fingerprints:
+                logger.info(
+                    "image_context_duplicate_read_denied user_id=%s chat_id=%s",
+                    request.user_id,
+                    request.chat_id,
+                )
+                return {
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "permissionDecision": "deny",
+                        "permissionDecisionReason": (
+                            "This unchanged image was already read in the current request. "
+                            "Reuse the prior image result instead of embedding it again."
+                        ),
+                    }
+                }
+            request.image_read_fingerprints.add(fingerprint)
+            return {}
+
         permission_options = sdk_permission_options(bash_policy)
+        sdk_hooks = {
+            event: list(matchers)
+            for event, matchers in permission_options["hooks"].items()
+        }
+        if getattr(self._config, "image_context_guard", False):
+            sdk_hooks.setdefault("PreToolUse", []).append(
+                HookMatcher(matcher="Read", hooks=[dedupe_image_read])
+            )
         opts: Dict[str, Any] = {
             "cwd": str(self.project_root),
             "allowed_tools": permission_options["allowed_tools"],
             "disallowed_tools": permission_options["disallowed_tools"],
-            "hooks": permission_options["hooks"],
+            "hooks": sdk_hooks,
             "system_prompt": (
                 "\n\n## Important: User Questions and Choices\n\n"
                 "The AskUserQuestion tool is NOT available in this environment. "
@@ -432,6 +505,9 @@ class ProjectChatHandler(
             # Bash is disallowed, user/project/local settings can register host
             # shell hooks independently of the model-facing Bash tool.
             opts["setting_sources"] = []
+            curated_settings = build_curated_memory_settings(self._config)
+            if curated_settings is not None:
+                opts["settings"] = curated_settings
             if self._execution_profile == EXECUTION_STRICT_PROJECT and bash_policy != BASH_DISABLED:
                 # Strict-project uses the SDK OS sandbox as the Bash boundary.
                 opts["sandbox"] = strict_bash_sandbox_settings(

@@ -332,7 +332,9 @@ def _safe_transcript_path(conversations_dir: Path, session_id: str) -> Path:
 
 
 def _live_stream_owned(handler: Any, user_id: int, chat_id: int) -> bool:
-    state = getattr(handler, "_streams", {}).get((user_id, chat_id))
+    route = getattr(handler, "_stream_key", None)
+    route_key = route(user_id, chat_id) if callable(route) else (user_id, chat_id)
+    state = getattr(handler, "_streams", {}).get(route_key)
     if state is None:
         return False
     reader = getattr(state, "reader_task", None)

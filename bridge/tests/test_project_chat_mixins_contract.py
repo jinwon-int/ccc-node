@@ -20,6 +20,9 @@ sys.modules.setdefault("telegram_bot", telegram_bot_pkg)
 sdk_module = types.ModuleType("claude_agent_sdk")
 sdk_module.ClaudeSDKClient = type("ClaudeSDKClient", (), {})
 sdk_module.ClaudeAgentOptions = type("ClaudeAgentOptions", (), {"__init__": lambda self, **kwargs: None})
+sdk_module.HookMatcher = type(
+    "HookMatcher", (), {"__init__": lambda self, **kwargs: None}
+)
 sdk_module.AssistantMessage = type("AssistantMessage", (), {})
 sdk_module.RateLimitEvent = type("RateLimitEvent", (), {})
 sdk_module.ResultMessage = type("ResultMessage", (), {})
