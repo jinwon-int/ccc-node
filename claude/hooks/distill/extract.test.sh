@@ -3,6 +3,8 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 EXTRACT="$HERE/extract.sh"
+# shellcheck source=claude/hooks/lib/test-stub.sh
+. "$HERE/../lib/test-stub.sh"
 pass=0; fail=0
 TMP="$(mktemp -d)"
 fake_github_token="ghp_""12345678901234567890"
@@ -24,8 +26,7 @@ JSONL
 install_stub() {
   local mode="$1"
   mkdir -p "$TMP/bin"
-  cat > "$TMP/bin/claude" <<'SH'
-#!/usr/bin/env bash
+  write_exec_stub "$TMP/bin/claude" <<'SH'
 set -uo pipefail
 mode="${CLAUDE_STUB_MODE:-valid}"
 count_file="${CLAUDE_STUB_COUNT_FILE:?}"

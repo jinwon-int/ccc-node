@@ -3,6 +3,8 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 DISTILL="$HERE/distill.sh"
+# shellcheck source=claude/hooks/lib/test-stub.sh
+. "$HERE/lib/test-stub.sh"
 pass=0; fail=0
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
@@ -58,8 +60,7 @@ ok "structural-only transcript exits 0" '[ "$rc" = 0 ]'
 ok "structural-only transcript is skipped by turn gate" 'grep -q "skip reason=too-few-turns turns=0" "$STATE/distill.log" && ! grep -q "spawned bg" "$STATE/distill.log"'
 
 mkdir -p "$TMP/bin"
-cat > "$TMP/bin/claude" <<'SH'
-#!/usr/bin/env bash
+write_exec_stub "$TMP/bin/claude" <<'SH'
 cat >/dev/null
 if [ -n "${CLAUDE_STUB_COUNTER:-}" ]; then
   n=0
