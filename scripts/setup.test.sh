@@ -192,5 +192,35 @@ HOME="$seed_home" CCC_CLAUDE_DIR="$seed_claude" CCC_HERMES_DIR="$seed_hermes" \
 ok "re-run does NOT clobber existing settings.local.json (node-local preserved)" \
   '[ "$(sha256sum "$seed_claude/settings.local.json")" = "$local_before" ] && grep -q "node-local-only" "$seed_claude/settings.local.json"'
 
+# --- A2A worker sub-agent roster is worker-role-gated (nexus-drift fix) ---
+# Default / broker: the a2a-* roster is NOT installed, so the only A2A entry
+# point stays the nexus/broker flow. Worker nodes opt in via CCC_A2A_ROLE=worker.
+a2a_home="$TMP/a2a-home"; a2a_claude="$TMP/a2a-claude"; a2a_hermes="$TMP/a2a-hermes"
+HOME="$a2a_home" CCC_CLAUDE_DIR="$a2a_claude" CCC_HERMES_DIR="$a2a_hermes" \
+  bash "$SETUP" --no-backup >/dev/null 2>&1
+ok "default (broker) install ships no a2a-* worker roster" \
+  '[ -z "$(ls "$a2a_claude/agents/"a2a-*.md 2>/dev/null)" ]'
+
+# Broker cleanup: a pre-existing roster is removed on a non-worker install.
+mkdir -p "$a2a_claude/agents"; printf 'x\n' > "$a2a_claude/agents/a2a-explorer.md"
+HOME="$a2a_home" CCC_CLAUDE_DIR="$a2a_claude" CCC_HERMES_DIR="$a2a_hermes" \
+  bash "$SETUP" --no-backup >/dev/null 2>&1
+ok "non-worker install removes a stale a2a-* roster" '[ ! -e "$a2a_claude/agents/a2a-explorer.md" ]'
+
+# Worker role: opt in, roster installed, and the choice is persisted to a marker.
+wk_home="$TMP/wk-home"; wk_claude="$TMP/wk-claude"; wk_hermes="$TMP/wk-hermes"
+HOME="$wk_home" CCC_CLAUDE_DIR="$wk_claude" CCC_HERMES_DIR="$wk_hermes" \
+  CCC_A2A_ROLE=worker bash "$SETUP" --no-backup >/dev/null 2>&1
+ok "CCC_A2A_ROLE=worker installs the a2a-* roster" \
+  '[ -f "$wk_claude/agents/a2a-explorer.md" ] && [ -f "$wk_claude/agents/a2a-verifier.md" ]'
+ok "worker role choice is persisted to a node-local marker" \
+  '[ "$(cat "$wk_claude/a2a-role" 2>/dev/null)" = worker ]'
+
+# Marker persistence: an unattended self-update (no env) honors the marker.
+HOME="$wk_home" CCC_CLAUDE_DIR="$wk_claude" CCC_HERMES_DIR="$wk_hermes" \
+  bash "$SETUP" --no-backup >/dev/null 2>&1
+ok "env-less re-run keeps the roster via the persisted marker" \
+  '[ -f "$wk_claude/agents/a2a-implementer.md" ]'
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

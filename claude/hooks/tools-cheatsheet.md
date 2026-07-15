@@ -10,7 +10,8 @@
 - **라이브러리 문서**: `mcp__context7__*` (SDK/라이브러리 최신 문서 주입).
 - 등록/점검: `claude mcp list` · 재등록(멱등) `./claude/mcp-setup.sh`.
 
-## A2A 워커 서브에이전트 roster (`~/.claude/agents/`)
+## A2A 워커 서브에이전트 roster (`~/.claude/agents/`) — 워커 역할 노드 전용
+**워커 역할 노드에만 설치됨** (`CCC_A2A_ROLE=worker` 옵트인; setup.sh가 마커로 영속). 브로커/미설정 노드에는 이 roster가 **없음** — A2A는 넥서스/브로커 플로우로만 진입하고, 로컬 서브에이전트를 정문으로 쓰지 않는다.
 A2A 태스크를 claim하면 업무량에 맞춰 소환(예산 0–3, 하드캡 4; 호스트 부하 시 축소). 워커=단일 finalizer.
 - `a2a-explorer` — 읽기전용 조사(코드/이슈/로그). 편집·finalize 불가.
 - `a2a-researcher` — explorer 변종: 외부 웹리서치(SearXNG/Firecrawl/Context7 MCP), 읽기전용·출처 인용.
