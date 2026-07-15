@@ -168,6 +168,26 @@ class DocumentHelperTest(unittest.TestCase):
         self.assertTrue(media.is_supported_document("application/octet-stream", "report.pdf"))
         self.assertTrue(media.is_supported_document("application/zip", "bundle.zip"))
 
+    def test_yaml_and_ndjson_alias_extensions_are_supported(self):
+        for mime_type, file_name in (
+            ("application/x-yaml", "config.yaml"),
+            ("application/x-yaml", "config.yml"),
+            ("text/yaml", "config.yaml"),
+            ("text/yaml", "config.yml"),
+            ("application/x-ndjson", "events.jsonl"),
+            ("application/x-ndjson", "events.ndjson"),
+        ):
+            with self.subTest(mime_type=mime_type, file_name=file_name):
+                self.assertTrue(media.is_supported_document(mime_type, file_name))
+
+    def test_document_size_parser_rejects_coercion_and_negative_values(self):
+        self.assertEqual(media.parse_document_size(None), 0)
+        self.assertEqual(media.parse_document_size(4), 4)
+        for value in (True, "4", 4.0, -1):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    media.parse_document_size(value)
+
     def test_prompt_includes_bounded_metadata_and_untrusted_data_warning(self):
         prompt = media.build_document_prompt(
             Path("/project/.telegram_bot/uploads/document_abc.pdf"),

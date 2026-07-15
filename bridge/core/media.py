@@ -209,6 +209,9 @@ _DOCUMENT_MIME_EXTENSIONS = {
 _DOCUMENT_EXTENSIONS_BY_MIME = {
     **{mime: {extension} for mime, extension in _DOCUMENT_MIME_EXTENSIONS.items()},
     "application/json": {".json", ".jsonl"},
+    "application/x-ndjson": {".jsonl", ".ndjson"},
+    "application/x-yaml": {".yaml", ".yml"},
+    "text/yaml": {".yaml", ".yml"},
     "text/plain": {
         ".cfg",
         ".conf",
@@ -219,6 +222,7 @@ _DOCUMENT_EXTENSIONS_BY_MIME = {
         ".jsonl",
         ".log",
         ".md",
+        ".ndjson",
         ".py",
         ".sh",
         ".toml",
@@ -286,6 +290,15 @@ def normalize_document_mime_type(mime_type: Optional[str]) -> str:
     if re.fullmatch(r"[a-z0-9][a-z0-9.+-]*/[a-z0-9][a-z0-9.+-]*", normalized):
         return normalized
     return "application/octet-stream"
+
+
+def parse_document_size(value: Any) -> int:
+    """Parse Telegram's optional integer size without coercing malformed metadata."""
+    if value is None:
+        return 0
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError("invalid Telegram document size")
+    return value
 
 
 def sanitize_document_display_name(file_name: Optional[str]) -> str:

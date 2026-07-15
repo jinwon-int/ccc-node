@@ -465,11 +465,25 @@ class BotVoiceMixin:
                 return
 
             try:
-                declared_size = max(0, int(getattr(document, "file_size", 0) or 0))
-                remote_size = max(0, int(getattr(telegram_file, "file_size", 0) or 0))
-            except (TypeError, ValueError):
-                declared_size = 0
-                remote_size = 0
+                declared_size = media.parse_document_size(
+                    getattr(document, "file_size", None)
+                )
+            except ValueError:
+                outcome = "metadata_invalid"
+                await message.reply_text(
+                    "❌ File metadata is invalid. Please resend the file."
+                )
+                return
+            try:
+                remote_size = media.parse_document_size(
+                    getattr(telegram_file, "file_size", None)
+                )
+            except ValueError:
+                outcome = "metadata_invalid"
+                await message.reply_text(
+                    "❌ File metadata is invalid. Please resend the file."
+                )
+                return
             if remote_size > self._max_document_size_bytes():
                 outcome = "size_limit_exceeded"
                 await message.reply_text(
@@ -611,7 +625,13 @@ class BotVoiceMixin:
             await message.reply_text("❌ This file type is not supported for inbound analysis.")
             return
 
-        declared_size = int(getattr(document, "file_size", 0) or 0)
+        try:
+            declared_size = media.parse_document_size(
+                getattr(document, "file_size", None)
+            )
+        except ValueError:
+            await message.reply_text("❌ File metadata is invalid. Please resend the file.")
+            return
         if declared_size > self._max_document_size_bytes():
             await message.reply_text(
                 "❌ File is too large. "

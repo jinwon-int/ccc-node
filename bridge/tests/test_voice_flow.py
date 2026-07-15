@@ -1185,6 +1185,7 @@ class DocumentFlowTests(unittest.IsolatedAsyncioTestCase):
                 ),
                 "not supported",
             ),
+            (self._document(file_size="4"), "metadata is invalid"),
         ):
             with self.subTest(file_name=document.file_name):
                 bot = self._bot()
@@ -1318,6 +1319,26 @@ class DocumentFlowTests(unittest.IsolatedAsyncioTestCase):
         bot._download_document_file.assert_not_awaited()
         bot._process_user_message_text.assert_not_awaited()
         self.assertTrue(any("metadata changed" in reply for reply in update.message.replies))
+
+    async def test_malformed_get_file_size_is_rejected_before_storage(self):
+        bot = self._bot()
+        bot._check_access = AsyncMock(return_value=True)
+        bot._enqueue_user_task = self._run_now
+        bot._get_document_file = AsyncMock(
+            return_value=SimpleNamespace(file_size="not-an-integer")
+        )
+        bot._download_document_file = AsyncMock()
+        bot._process_user_message_text = AsyncMock()
+        update = _build_photo_update(11, document=self._document(file_size=4))
+
+        with TemporaryDirectory() as td:
+            bot._document_dir = Path(td) / "uploads"
+            await bot._handle_document_message(update, None)
+            self.assertFalse(bot._document_dir.exists())
+
+        bot._download_document_file.assert_not_awaited()
+        bot._process_user_message_text.assert_not_awaited()
+        self.assertTrue(any("metadata is invalid" in reply for reply in update.message.replies))
 
     async def test_actual_size_mismatch_is_rejected_and_cleaned(self):
         bot = self._bot()
