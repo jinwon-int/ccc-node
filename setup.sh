@@ -330,9 +330,40 @@ run cp "$SRC/claude/headless.sh" "$CLAUDE_DIR/headless.sh"
 run chmod +x "$CLAUDE_DIR/headless.sh"
 # checkpoint.sh creates its runtime state directory on demand. setup.sh must not
 # mutate state/checkpoints because runtime state is outside the install transaction.
-# A2A worker sub-agent roster (explorer/implementer/verifier) — node-agnostic role defs
+# Node-agnostic sub-agents are always installed. The A2A worker sub-agent roster
+# (a2a-explorer/implementer/verifier/researcher) is a WORKER-role capability and
+# is gated below: a node opts in with CCC_A2A_ROLE=worker. On a broker or any
+# unconfigured node the roster is NOT installed, so the only A2A entry point
+# stays the nexus/broker flow — not a free-standing local sub-agent route.
 run mkdir -p "$CLAUDE_DIR/agents"
-run cp "$SRC/claude/agents/"*.md "$CLAUDE_DIR/agents/"
+for _agent_src in "$SRC/claude/agents/"*.md; do
+  [ -e "$_agent_src" ] || continue
+  case "$(basename "$_agent_src")" in
+    a2a-*) : ;;  # worker roster — installed only by the role gate below
+    *) run cp "$_agent_src" "$CLAUDE_DIR/agents/$(basename "$_agent_src")" ;;
+  esac
+done
+# Persist an explicit role choice to a node-local (unmanaged) marker so an
+# unattended self-update keeps honoring it without the operator's env.
+if [ -n "${CCC_A2A_ROLE:-}" ] && [ "$DRY" != 1 ]; then
+  printf '%s\n' "$CCC_A2A_ROLE" > "$CLAUDE_DIR/a2a-role"
+fi
+_a2a_role="${CCC_A2A_ROLE:-}"
+if [ -z "$_a2a_role" ] && [ -r "$CLAUDE_DIR/a2a-role" ]; then
+  _a2a_role="$(tr -d '[:space:]' < "$CLAUDE_DIR/a2a-role")"
+fi
+if [ "$_a2a_role" = worker ]; then
+  for _agent_src in "$SRC/claude/agents/"a2a-*.md; do
+    [ -e "$_agent_src" ] || continue
+    run cp "$_agent_src" "$CLAUDE_DIR/agents/$(basename "$_agent_src")"
+  done
+  note "A2A worker sub-agent roster installed (CCC_A2A_ROLE=worker)"
+else
+  for _stale in "$CLAUDE_DIR/agents/"a2a-*.md; do
+    [ -e "$_stale" ] && run rm -f "$_stale"
+  done
+  note "A2A worker sub-agent roster not installed (non-worker role); A2A runs through the nexus/broker flow"
+fi
 # Slash commands (quick prompt templates: /node-status, /a2a-claim, /wiki-log) — node-agnostic
 run mkdir -p "$CLAUDE_DIR/commands"
 run cp "$SRC/claude/commands/"*.md "$CLAUDE_DIR/commands/"
