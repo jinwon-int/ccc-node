@@ -93,11 +93,18 @@ ok "killed extraction retains the durable job" '[ -f "$job" ]'
 
 # The next SessionStart recovery pass launches the retained job and removes it
 # only after a successful extraction.
+recovered_job_complete() {
+  [ ! -f "$job" ] &&
+    [ ! -e "$job.lock" ] &&
+    grep -q "\[pending-drain\] spawned job=" "$STATE/distill.log" &&
+    grep -q "pending completed job=" "$STATE/distill.log"
+}
+
 printf '%s\n' success > "$CLAUDE_STUB_MODE_FILE"
 HOME="$TMP/home" CCC_STATE_DIR="$STATE" bash "$DRAIN" >/dev/null 2>&1
-wait_for '[ ! -f "$job" ]'
+wait_for 'recovered_job_complete'
 ok "SessionStart drain completes and removes a recovered job" \
-  '[ ! -f "$job" ] && [ ! -e "$job.lock" ] && grep -q "\[pending-drain\] spawned job=" "$STATE/distill.log" && grep -q "pending completed job=" "$STATE/distill.log"'
+  'recovered_job_complete'
 
 # A genuine extraction failure remains retryable rather than being consumed.
 TRANSCRIPT_FAIL="$PROJECT/sess-fail.jsonl"
