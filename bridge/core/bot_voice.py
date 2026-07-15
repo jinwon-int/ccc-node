@@ -357,7 +357,9 @@ class BotVoiceMixin:
             )
             return
 
-        await self._send_content_artifacts(message, content, force_options)
+        await self._send_content_artifacts(
+            message, content, force_options, user_id=user_id
+        )
 
     @staticmethod
     def _redact_telegram_file_url(url: str) -> str:
@@ -1052,4 +1054,3 @@ class BotVoiceMixin:
             log_debug(user_id, "bot", reply)
 
         await self._enqueue_user_task(conversation_key, run_task, on_overflow)
-
