@@ -8,7 +8,6 @@ import json
 import os
 from pathlib import Path
 import signal
-import sys
 from typing import Any, Awaitable, Callable, ParamSpec
 
 import pytest
@@ -27,7 +26,6 @@ from telegram_bot.memory.distill_extraction import (
 ROOT = Path(__file__).resolve().parents[2]
 SCHEMA_PATH = ROOT / "schemas" / "codex-distill-extraction-v1.schema.json"
 THREAD_HASH = "a" * 64
-TEST_EXECUTABLE = str(Path(sys.executable).resolve())
 P = ParamSpec("P")
 
 
@@ -39,6 +37,16 @@ def async_test(function: Callable[P, Awaitable[None]]) -> Callable[P, None]:
         asyncio.run(function(*args, **kwargs))
 
     return wrapper
+
+
+@pytest.fixture
+def codex_executable(tmp_path: Path) -> str:
+    """Create an owner-only executable accepted by the backend's safety gate."""
+
+    executable = tmp_path / "codex"
+    executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    executable.chmod(0o700)
+    return str(executable.resolve())
 
 
 def extraction_input() -> DistillExtractionInput:
@@ -121,7 +129,7 @@ def output_path_from_args(args: tuple[str, ...]) -> Path:
 
 @async_test
 async def test_backend_uses_exact_isolated_argv_private_cwd_and_canonical_stdin(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, codex_executable: str
 ) -> None:
     capture: dict[str, Any] = {}
 
@@ -139,7 +147,7 @@ async def test_backend_uses_exact_isolated_argv_private_cwd_and_canonical_stdin(
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_spawn)
     backend = CodexExecDistillBackend(
-        executable=TEST_EXECUTABLE,
+        executable=codex_executable,
         schema_path=SCHEMA_PATH,
         temp_root=tmp_path,
         environment={
@@ -158,7 +166,7 @@ async def test_backend_uses_exact_isolated_argv_private_cwd_and_canonical_stdin(
     result = await backend.extract(extraction_input())
 
     args = capture["args"]
-    assert args[0:2] == (TEST_EXECUTABLE, "exec")
+    assert args[0:2] == (codex_executable, "exec")
     assert args[-1] == DISTILL_EXTRACTION_PROMPT
     assert "--ephemeral" in args
     assert "--ignore-user-config" in args
@@ -205,7 +213,7 @@ async def test_backend_uses_exact_isolated_argv_private_cwd_and_canonical_stdin(
 
 @async_test
 async def test_backend_rejects_output_provenance_not_bound_to_input(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, codex_executable: str
 ) -> None:
     payload = valid_output()
     payload["provenance"]["source_thread_hash"] = "b" * 64
@@ -218,7 +226,7 @@ async def test_backend_rejects_output_provenance_not_bound_to_input(
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_spawn)
     backend = CodexExecDistillBackend(
-        executable=TEST_EXECUTABLE, schema_path=SCHEMA_PATH, temp_root=tmp_path
+        executable=codex_executable, schema_path=SCHEMA_PATH, temp_root=tmp_path
     )
 
     with pytest.raises(CodexDistillBackendError, match="^codex_distill_output_invalid$"):
@@ -239,6 +247,7 @@ async def test_backend_exposes_body_free_spawn_and_exit_errors(
     returncode: int,
     spawn_error: bool,
     expected: str,
+    codex_executable: str,
 ) -> None:
     async def fake_spawn(*args: str, **kwargs: Any) -> FakeProcess:
         del args, kwargs
@@ -252,7 +261,7 @@ async def test_backend_exposes_body_free_spawn_and_exit_errors(
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_spawn)
     backend = CodexExecDistillBackend(
-        executable=TEST_EXECUTABLE, schema_path=SCHEMA_PATH, temp_root=tmp_path
+        executable=codex_executable, schema_path=SCHEMA_PATH, temp_root=tmp_path
     )
 
     with pytest.raises(CodexDistillBackendError) as caught:
@@ -264,7 +273,7 @@ async def test_backend_exposes_body_free_spawn_and_exit_errors(
 
 @async_test
 async def test_timeout_terminates_the_process_group(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, codex_executable: str
 ) -> None:
     never = asyncio.Event()
     killpg_calls: list[tuple[int, signal.Signals]] = []
@@ -280,7 +289,7 @@ async def test_timeout_terminates_the_process_group(
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_spawn)
     monkeypatch.setattr(os, "killpg", lambda pid, sig: killpg_calls.append((pid, sig)))
     backend = CodexExecDistillBackend(
-        executable=TEST_EXECUTABLE,
+        executable=codex_executable,
         schema_path=SCHEMA_PATH,
         temp_root=tmp_path,
         timeout_seconds=0.01,
@@ -294,7 +303,7 @@ async def test_timeout_terminates_the_process_group(
 
 @async_test
 async def test_cancellation_terminates_process_group_and_preserves_cancellation(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, codex_executable: str
 ) -> None:
     never = asyncio.Event()
     killpg_calls: list[tuple[int, signal.Signals]] = []
@@ -310,7 +319,7 @@ async def test_cancellation_terminates_process_group_and_preserves_cancellation(
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_spawn)
     monkeypatch.setattr(os, "killpg", lambda pid, sig: killpg_calls.append((pid, sig)))
     backend = CodexExecDistillBackend(
-        executable=TEST_EXECUTABLE, schema_path=SCHEMA_PATH, temp_root=tmp_path
+        executable=codex_executable, schema_path=SCHEMA_PATH, temp_root=tmp_path
     )
 
     task = asyncio.create_task(backend.extract(extraction_input()))
@@ -324,7 +333,7 @@ async def test_cancellation_terminates_process_group_and_preserves_cancellation(
 
 @async_test
 async def test_communicate_failure_terminates_process_group_and_hides_details(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, codex_executable: str
 ) -> None:
     killpg_calls: list[tuple[int, signal.Signals]] = []
     process: FakeProcess
@@ -346,7 +355,7 @@ async def test_communicate_failure_terminates_process_group_and_hides_details(
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_spawn)
     monkeypatch.setattr(os, "killpg", fake_killpg)
     backend = CodexExecDistillBackend(
-        executable=TEST_EXECUTABLE, schema_path=SCHEMA_PATH, temp_root=tmp_path
+        executable=codex_executable, schema_path=SCHEMA_PATH, temp_root=tmp_path
     )
 
     with pytest.raises(CodexDistillBackendError) as caught:
@@ -374,6 +383,7 @@ async def test_backend_rejects_missing_unsafe_oversized_and_invalid_output(
     tmp_path: Path,
     mutation: str,
     expected: str,
+    codex_executable: str,
 ) -> None:
     async def fake_spawn(*args: str, **kwargs: Any) -> FakeProcess:
         del kwargs
@@ -401,7 +411,7 @@ async def test_backend_rejects_missing_unsafe_oversized_and_invalid_output(
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_spawn)
     backend = CodexExecDistillBackend(
-        executable=TEST_EXECUTABLE, schema_path=SCHEMA_PATH, temp_root=tmp_path
+        executable=codex_executable, schema_path=SCHEMA_PATH, temp_root=tmp_path
     )
 
     with pytest.raises(CodexDistillBackendError) as caught:
@@ -413,7 +423,7 @@ async def test_backend_rejects_missing_unsafe_oversized_and_invalid_output(
 
 @async_test
 async def test_backend_rejects_unsafe_schema_before_spawn(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, codex_executable: str
 ) -> None:
     schema_link = tmp_path / "schema.json"
     schema_link.symlink_to(SCHEMA_PATH)
@@ -427,7 +437,7 @@ async def test_backend_rejects_unsafe_schema_before_spawn(
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_spawn)
     backend = CodexExecDistillBackend(
-        executable=TEST_EXECUTABLE, schema_path=schema_link, temp_root=tmp_path
+        executable=codex_executable, schema_path=schema_link, temp_root=tmp_path
     )
 
     with pytest.raises(CodexDistillBackendError, match="^codex_distill_schema_unsafe$"):
