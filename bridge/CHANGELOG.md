@@ -18,9 +18,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and executables stay excluded so ordinary coding turns don't push every edited
   file), with an order-independent trailing boundary that prevents partial-suffix
   clipping (e.g. `.json` → `.js`). The auto-send size ceiling is raised from 10 MB
-  to the Telegram Bot API's 50 MB document limit (`MAX_SEND_FILE_BYTES`). Files
-  must still resolve to a real path under `PROJECT_ROOT`; paths outside it are not
-  auto-sent.
+  to the Telegram Bot API's 50 MB document limit (`MAX_SEND_FILE_BYTES`).
+- **Files outside `PROJECT_ROOT` were silently dropped on send.** The referenced
+  file confirmation flow (`_prompt_outside_file_confirmation` / the `extsend:`
+  callback) existed but was never wired into the reply path, so any deliverable
+  the agent produced outside the project root simply never arrived. Reply and
+  send paths now route out-of-project files through `_maybe_prompt_outside_files`,
+  which offers a one-tap confirm before sending (and is skipped when the owner
+  user id is unknown, so callers without one cannot expose out-of-project paths).
+  In-root files continue to send automatically.
 
 ### Changed
 - **Accept all inbound Telegram document types (follow-up to #503/#505).** The

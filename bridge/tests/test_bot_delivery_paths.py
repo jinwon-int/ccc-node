@@ -13,6 +13,7 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Optional
+from unittest.mock import AsyncMock
 
 from telegram_bot.core.bot_delivery import BotDeliveryMixin
 from telegram_bot.session.manager import SessionManager
@@ -325,6 +326,32 @@ class ResolvePathsExtensionTests(unittest.TestCase):
         _os.truncate(big, 60 * 1024 * 1024)  # 60 MB > 50 MB ceiling
 
         self.assertEqual(self._resolve(tmpdir, f"here {tmpdir}/huge.pdf"), [])
+
+
+class MaybePromptOutsideFilesTests(unittest.TestCase):
+    """Gating for offering to send files that resolved outside PROJECT_ROOT."""
+
+    def _bot(self):
+        bot = DeliveryHarness(str(Path(tempfile.mkdtemp())))
+        bot._prompt_outside_file_confirmation = AsyncMock()
+        return bot
+
+    def test_prompts_when_owner_known_and_outside_paths_present(self):
+        bot = self._bot()
+        paths = [Path("/etc/hosts")]
+        asyncio.run(bot._maybe_prompt_outside_files(5, 7, paths))
+        bot._prompt_outside_file_confirmation.assert_awaited_once_with(5, 7, paths)
+
+    def test_no_prompt_when_owner_unknown(self):
+        # Callers without a resolved owner id must not expose out-of-project paths.
+        bot = self._bot()
+        asyncio.run(bot._maybe_prompt_outside_files(5, None, [Path("/etc/hosts")]))
+        bot._prompt_outside_file_confirmation.assert_not_awaited()
+
+    def test_no_prompt_when_no_outside_paths(self):
+        bot = self._bot()
+        asyncio.run(bot._maybe_prompt_outside_files(5, 7, []))
+        bot._prompt_outside_file_confirmation.assert_not_awaited()
 
 
 if __name__ == "__main__":

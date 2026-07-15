@@ -31,7 +31,7 @@ This bot takes a different approach — **lightweight, zero-infrastructure, secu
 **Smart Interaction**
 - Progressive streaming: AI responses update in real-time as Claude thinks, not after completion
 - Claude's numbered options auto-convert to Telegram inline keyboard buttons — just tap to choose
-- File paths in Claude's responses are automatically sent as photos or documents — covers document, spreadsheet, presentation, data, archive, and audio/video/image types (source-code files are not auto-sent, to avoid pushing every edited file during coding). Files must be a real path under `PROJECT_ROOT` and up to 50 MB
+- File paths in Claude's responses are automatically sent as photos or documents — covers document, spreadsheet, presentation, data, archive, and audio/video/image types (source-code files are not auto-sent, to avoid pushing every edited file during coding). Files up to 50 MB; those under `PROJECT_ROOT` send automatically, and files outside it ask for a one-tap confirmation before sending instead of being dropped
 - Inbound Telegram documents are downloaded into a private project-scoped temporary path and passed to the active agent runtime for inspection
 - Native Telegram voice messages: auto-download, format detection/conversion (OGG/AMR → MP3), Whisper transcription, then forwarded to Claude
 - Per-user dedicated SDK streams — low latency, concurrent message support (up to 3 per user)
