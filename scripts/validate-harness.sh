@@ -67,6 +67,22 @@ else
   err "missing claude/CLAUDE.md.template"
 fi
 
+# 1b-1) Wiki log IDs are node/date scoped. The old global max+1 guidance caused
+# concurrent fleet writers to allocate duplicate LOG-NNNN identifiers.
+say "== Wiki LOG namespace policy =="
+WIKI_RULE_FILES=(claude/skills/wiki-record/SKILL.md claude/commands/wiki-log.md \
+                 claude/hooks/tools-cheatsheet.md hermes/memories/MEMORY.template.md)
+for f in "${WIKI_RULE_FILES[@]}"; do
+  grep -q 'LOG-YYYYMMDD-<node>-' "$f" \
+    && say "  ok node-scoped LOG guidance $f" || err "missing node-scoped LOG guidance: $f"
+done
+if grep -Fq 'LOG-<max+1>' "${WIKI_RULE_FILES[@]}" \
+   || grep -Fq 'grep -hoE "\[LOG-[0-9]+\]"' "${WIKI_RULE_FILES[@]}"; then
+  err "legacy global numeric LOG allocation guidance remains"
+else
+  say "  ok no legacy global numeric LOG allocation guidance"
+fi
+
 # 1c) plugin manifest + marketplace catalog + runtime hook-path resolution
 if [ -f claude/.claude-plugin/plugin.json ]; then
   say "== plugin manifest =="

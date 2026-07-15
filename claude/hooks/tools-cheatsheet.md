@@ -31,7 +31,7 @@ A2A 태스크를 claim하면 업무량에 맞춰 소환(예산 0–3, 하드캡 
 - 빠른 맥락: `wiki-agent prefetch "<query>"`
 - 영속 업데이트(PR-first): `wiki-agent write-path` → 반환된 워크트리에서 편집 → `wiki-agent pr`
   - 워크트리: `$HOME/.wiki-agent/wiki-pr-work/seoyoon-family-wiki`
-  - ID 규칙: 새 섹션 ID = `max(TM-/ND-)+1`; `log.md`는 최상단에 `LOG-<max+1>` prepend; **raw secret 금지**(위치/취급만)
+  - ID 규칙: 새 섹션 ID = `max(TM-/ND-)+1`; 새 로그 = `[LOG-YYYYMMDD-<node>-<same-day-seq>]`(노드별 1부터), `[LOG-00]` 규칙 블록 뒤에 prepend; 신규 `LOG-NNNN` 금지; **raw secret 금지**(위치/취급만)
 
 ## Honcho (관계/working memory)
 - baseUrl은 `~/.hermes/honcho.json` (엔드포인트/크레덴셜 값 로그 금지)
