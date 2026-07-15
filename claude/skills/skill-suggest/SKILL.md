@@ -1,11 +1,15 @@
 ---
 name: skill-suggest
-description: Detect frequently-repeated procedures from this node's Claude Code transcripts and propose new skills (human-in-the-loop). Use when asked to find automatable routines, "what should be a skill", or to review skill candidates. Scans transcripts, ranks repeated command shapes, and drafts SKILL.md proposals for approval — it never installs a skill without the user's OK.
+description: Detect frequently-repeated procedures from this node's Claude Code transcripts and propose new skills (human-in-the-loop), and review or roll back skills the autosave auto mode installed. Use when asked to find automatable routines, "what should be a skill", to review skill candidates, or to list/rollback auto-installed (autosave) skills. Scans transcripts, ranks repeated command shapes, and drafts SKILL.md proposals for approval — this skill itself never installs anything without the user's OK.
 ---
 
-# skill-suggest — propose skills from repeated work (human-approved)
+# skill-suggest — propose skills from repeated work (+ autosave post-hoc review)
 
-Approximates "auto-skillification": find procedures you keep repeating and turn the good ones into skills. Detection is automatic; **authoring/installation requires user approval** (no silent skill creation). Hermes-style Skill Review may also stage draft `SKILL.md` packages under `~/.claude/state/pending-skills/` after SessionEnd.
+Approximates "auto-skillification": find procedures you keep repeating and turn the good ones into skills. Detection is automatic; **anything this skill authors/installs requires user approval** (no silent skill creation). Hermes-style Skill Review may also stage draft `SKILL.md` packages under `~/.claude/state/pending-skills/` after SessionEnd.
+
+Two autosave modes change what "review" means here (`docs/skill-autosave.md`):
+- **approve** (default): drafts wait in the pending queue; this skill is the approval gate (step 1 below).
+- **auto** (#355, opt-in): machine gates install passing drafts unattended and the owner is notified after the fact; this skill becomes the **post-hoc review / rollback** tool (step 1b below). Drafts that failed a gate stay pending and are still approved/rejected via step 1.
 
 ## Procedure
 
@@ -36,6 +40,25 @@ Approximates "auto-skillification": find procedures you keep repeating and turn 
    STATE="${CCC_STATE_DIR:-$HOME/.claude/state}"
    mv "$STATE/pending-skills/<id>" "$STATE/pending-skills/<id>.rejected-$(date -u +%Y%m%d%H%M%S)"
    ```
+   A pending draft with an `autosave-block.json` file was machine-rejected by
+   the auto mode gate — `jq . "$STATE/pending-skills/<id>/autosave-block.json"`
+   shows the reason (secret / node-specific / lint / dedup). Give those extra
+   scrutiny before approving.
+
+1b. **Autosave post-hoc review / rollback** (auto mode installs are tracked in a
+   ledger and always reversible):
+   ```bash
+   AUTO="${CCC_CLAUDE_DIR:-$HOME/.claude}/hooks/skill-review/autoinstall.sh"
+   bash "$AUTO" list              # ledger + currently installed + blocked drafts
+   bash "$AUTO" status            # mode, daily cap usage, recent activity
+   bash "$AUTO" rollback <name>   # archive one auto-installed skill (undo)
+   bash "$AUTO" rollback --all    # bulk-undo every auto-installed skill
+   ```
+   Rollback archives into `~/.claude/state/skill-autosave-rollback/` (never
+   deletes) and refuses skills that lack the `.autosave-meta.json` marker, so
+   hand-authored skills are untouchable. Mode switch (owner decision — ask
+   before changing it): `printf auto > "$STATE/skill-autosave.mode"` or export
+   `CCC_SKILL_AUTOSAVE_MODE=auto`; remove/`approve` to restore the human gate.
 
 2. **Refresh deterministic candidates** (command-shape scan of transcripts):
    ```bash
@@ -59,6 +82,9 @@ Approximates "auto-skillification": find procedures you keep repeating and turn 
    - Offer to also land it in the `jinwon-int/ccc-node` template (`claude/skills/`) via PR, and record it in the Wiki (use the `wiki-record` skill).
 
 ## Rules
-- Never author or overwrite a skill without explicit approval.
+- Never author or overwrite a skill without explicit approval. (In auto mode the
+  *pipeline* installs machine-gated drafts on its own — but you, running this
+  skill, still never install, roll back, or change the mode without the user's OK.)
 - Keep skills node-agnostic where possible; keep secrets out (locations/handling only).
 - The scan is a heuristic over command *shapes* — always sanity-check that a candidate is a real recurring procedure before proposing.
+- Treat rollback as safe and cheap: when the user doubts an auto-installed skill, roll it back first and re-propose later.

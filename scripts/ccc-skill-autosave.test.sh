@@ -6,6 +6,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 AUTOSAVE="$HERE/ccc-skill-autosave.sh"
 INSTALLER="$HERE/install-skill-autosave-cron.sh"
 REVIEW="$HERE/../claude/hooks/skill-review.sh"
+AUTOINSTALL="$HERE/../claude/hooks/skill-review/autoinstall.sh"
 pass=0; fail=0
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
@@ -88,7 +89,29 @@ rm -f "$STATE/skill-autosave.disabled"
 out="$(CCC_STATE_DIR="$STATE" bash "$AUTOSAVE" status 2>&1)"
 ok "status reports pending count" 'printf "%s" "$out" | grep -q "pending skill drafts:"'
 
-# --- 5) cron installer: dry-run default, idempotent marker line ---------------
+# --- 5) auto mode (#355): sweep drives machine gate + unattended install -------
+STATE2="$TMP/state2"; SKILLS2="$TMP/skills2"; SPOOL2="$TMP/spool2"
+PROJECTS2="$TMP/projects2"
+make_transcript "$PROJECTS2/-root--work/bridge-sess-2.jsonl" 6
+mkdir -p "$STATE2"
+CCC_STATE_DIR="$STATE2" CLAUDE_PROJECTS_DIR="$PROJECTS2" CCC_PUSH_SPOOL="$SPOOL2" \
+  CCC_SKILL_REVIEW_CMD="$REVIEW" CCC_SKILL_SCAN_CMD="$SCAN" SCAN_TOUCH="$TMP/scan2.touched" \
+  CLAUDE_SKILLS_DIR="$TMP/skills2" CCC_SKILL_AUTOSAVE_SETTLE_SECONDS=15 \
+  CCC_SKILL_AUTOINSTALL_CMD="$AUTOINSTALL" CCC_SKILL_AUTOSAVE_MODE=auto \
+  CCC_NODE=testnode bash "$AUTOSAVE" run
+ok "auto mode installs the drafted skill unattended" '[ -f "$SKILLS2/release-checklist/SKILL.md" ]'
+# Both layers may legitimately win the install: the sweep's own autoinstall
+# pass (trigger=sweep) or the staging pipeline it spawned (trigger=hook-manual).
+ok "auto mode records installed-by=autosave ledger" 'jq -e "select(.event==\"install\") | .installed_by == \"autosave\" and (.trigger == \"sweep\" or .trigger == \"hook-manual\")" "$STATE2/skill-autosave-install.jsonl" >/dev/null'
+ok "auto mode queues post-hoc install notice" 'ls "$SPOOL2"/*SkillAutoInstall*.json >/dev/null 2>&1'
+ok "auto mode suppresses the approval reminder" '! ls "$SPOOL2"/*SkillAutosave-*.json >/dev/null 2>&1'
+ok "installed draft archived out of pending queue" 'ls -d "$STATE2/pending-skills/"*.installed-* >/dev/null 2>&1'
+out="$(CCC_STATE_DIR="$STATE2" bash "$AUTOSAVE" status 2>&1)"
+ok "status reports mode" 'printf "%s" "$out" | grep -q "^mode: approve"'
+out="$(CCC_STATE_DIR="$STATE2" CCC_SKILL_AUTOSAVE_MODE=auto bash "$AUTOSAVE" status 2>&1)"
+ok "status reflects auto mode from env" 'printf "%s" "$out" | grep -q "^mode: auto"'
+
+# --- 6) cron installer: dry-run default, idempotent marker line ---------------
 CRONFILE="$TMP/crontab.txt"
 : > "$CRONFILE"
 cat > "$TMP/bin/fakecrontab" <<SH

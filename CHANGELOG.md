@@ -31,7 +31,22 @@ All notable changes to the Claude Code node harness. Dates are KST.
   per statement; one non-fleet target denies the whole command.
 
 ### Added
-- Strict provider-neutral Codex distill extraction boundary (#476): deterministic
+- Hermes-style unattended skill-autosave **auto mode** (#355, opt-in via
+  `CCC_SKILL_AUTOSAVE_MODE=auto` or the `skill-autosave.mode` state file;
+  default `approve` keeps every existing node unchanged). New
+  `claude/hooks/skill-review/autoinstall.sh` replaces the human approval gate
+  with deterministic machine gates — secret scan (redaction pattern family,
+  hard-fail), node-specific-fact scan (home/root paths, non-loopback IPs,
+  user@host), dedup vs installed skills (never overwrites), and HARDLINE-style
+  structure lint — then installs passing drafts into `~/.claude/skills/` with
+  an `installed-by=autosave` ledger + in-dir marker, a daily install cap
+  (`CCC_SKILL_AUTOSAVE_DAILY_CAP`, default 3), and a post-hoc (not approval)
+  Telegram notice for installs and blocks. Gate failures are never dropped:
+  drafts stay pending with a recorded reason for the normal human path. Both
+  draft layers drive it (SessionEnd hook immediately, daily sweep as backstop);
+  `/skill-suggest` gains the post-hoc role — `list` / `rollback <name>` /
+  `rollback --all` (archive-only undo that refuses unmarked, hand-authored
+  skills). Off-switch honored; template-repo skills remain PR-first.
   credential-redacted input with an explicit untrusted-content marker, recursive
   unknown-field rejection, bounded Honcho/Wiki/resume output, safe relative Wiki
   targets, directive/credential fail-closed gates, body-free diagnostics, and a
