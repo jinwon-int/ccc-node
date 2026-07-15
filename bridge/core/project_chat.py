@@ -803,14 +803,20 @@ class ProjectChatHandler(
         else:
             return
         state.stall_swallow_result = True
+        final_streamed = False
         if req.streaming_handler:
             try:
-                await req.streaming_handler.finalize_all()
+                final_streamed = bool(await req.streaming_handler.finalize_all())
             except Exception as exc:
                 logger.error(f"Streaming finalization on stall release failed: {exc}")
         cleaned = await self._cleanup_heartbeat(req)
         self._ledger_finish(req, TASK_COMPLETED, cleanup_done=cleaned)
-        content = self._clean_response("\n".join(req.last_assistant_texts)) or "(No response)"
+        content = (
+            self._claude_response_content(
+                req, "\n".join(req.last_assistant_texts)
+            )
+            or "(No response)"
+        )
         logger.warning(
             "Terminal-event stall released request for user %s chat %s after "
             "silence following final text — delivering buffered answer",
@@ -834,7 +840,7 @@ class ProjectChatHandler(
                     content=f"{content}\n\n{TERMINAL_STALL_NOTICE}",
                     success=True,
                     session_id=state.last_session_id,
-                    streamed=bool(req.streaming_handler and req.streaming_handler.drafts),
+                    streamed=final_streamed,
                 )
             )
         # Tear down the dead stream from outside this loop task: the disconnect

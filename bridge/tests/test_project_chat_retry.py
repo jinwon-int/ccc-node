@@ -141,12 +141,21 @@ class _FakeStreamingHandler:
         self.updates = []
         self.drafts = [object()]  # non-empty -> response marked as streamed
         self.finalized = False
+        self.finalized_segments = 0
 
     async def update_if_needed(self, text):
+        if not self.drafts:
+            self.drafts.append(object())
         self.updates.append(text)
 
     async def finalize_all(self):
         self.finalized = True
+        return bool(self.drafts)
+
+    async def finalize_segment(self):
+        self.finalized_segments += 1
+        self.drafts.clear()
+        return True
 
 
 class _ScriptedClient:
@@ -191,6 +200,20 @@ def _assistant(text):
     )
 
 
+def _assistant_with_tool(text, *, name="Bash", tool_input=None):
+    return _new(
+        project_chat.AssistantMessage,
+        content=[
+            _new(project_chat.TextBlock, text=text),
+            _new(
+                project_chat.ToolUseBlock,
+                name=name,
+                input=tool_input or {"command": "true"},
+            ),
+        ],
+    )
+
+
 def _result(text, session_id="sess-1", is_error=False):
     return _new(
         project_chat.ResultMessage,
@@ -201,7 +224,7 @@ def _result(text, session_id="sess-1", is_error=False):
     )
 
 
-def _make_request(streaming_handler):
+def _make_request(streaming_handler, interim_message_callback=None):
     loop = asyncio.get_event_loop()
     return project_chat._PendingRequest(
         user_id=7,
@@ -212,6 +235,7 @@ def _make_request(streaming_handler):
         typing_callback=None,
         future=loop.create_future(),
         streaming_handler=streaming_handler,
+        interim_message_callback=interim_message_callback,
     )
 
 
@@ -275,6 +299,183 @@ class PartialStreamingReaderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sh.updates, ["Hi there"])
         self.assertFalse(req.streamed_via_partials)
         self.assertEqual(req.future.result().content, "Hi there")
+
+
+class ClaudeMessageBoundaryReaderTests(unittest.IsolatedAsyncioTestCase):
+    async def test_text_before_tool_is_delivered_as_interim_bubble(self):
+        delivered = []
+
+        async def deliver_interim(content):
+            delivered.append(content)
+
+        handler = project_chat.ProjectChatHandler()
+        req = _make_request(None, deliver_interim)
+        state = project_chat._UserStreamState(client=None, model=None)
+        state.pending.append(req)
+        state.client = _ScriptedClient(
+            [
+                _assistant_with_tool("I'll check the repository now."),
+                _assistant("There are 17 open issues."),
+                _result("There are 17 open issues."),
+            ]
+        )
+
+        await handler._reader_loop(7, state)
+
+        self.assertEqual(delivered, ["I'll check the repository now."])
+        response = req.future.result()
+        self.assertEqual(response.content, "There are 17 open issues.")
+        self.assertFalse(response.streamed)
+
+    async def test_next_assistant_message_proves_prior_message_is_interim(self):
+        delivered = []
+
+        async def deliver_interim(content):
+            delivered.append(content)
+
+        handler = project_chat.ProjectChatHandler()
+        req = _make_request(None, deliver_interim)
+        state = project_chat._UserStreamState(client=None, model=None)
+        state.pending.append(req)
+        state.client = _ScriptedClient(
+            [
+                _assistant("First completed message."),
+                _assistant("Final completed message."),
+                _result("Final completed message."),
+            ]
+        )
+
+        await handler._reader_loop(7, state)
+
+        self.assertEqual(delivered, ["First completed message."])
+        self.assertEqual(req.future.result().content, "Final completed message.")
+
+    async def test_terminal_assistant_message_stays_on_final_delivery_path(self):
+        delivered = []
+
+        async def deliver_interim(content):
+            delivered.append(content)
+
+        handler = project_chat.ProjectChatHandler()
+        req = _make_request(None, deliver_interim)
+        state = project_chat._UserStreamState(client=None, model=None)
+        state.pending.append(req)
+        state.client = _ScriptedClient(
+            [_assistant("The final answer."), _result("The final answer.")]
+        )
+
+        await handler._reader_loop(7, state)
+
+        self.assertEqual(delivered, [])
+        self.assertEqual(req.future.result().content, "The final answer.")
+
+    async def test_failed_interim_delivery_falls_back_to_complete_final_text(self):
+        async def fail_interim(_content):
+            raise OSError("telegram unavailable")
+
+        handler = project_chat.ProjectChatHandler()
+        req = _make_request(None, fail_interim)
+        state = project_chat._UserStreamState(client=None, model=None)
+        state.pending.append(req)
+        state.client = _ScriptedClient(
+            [
+                _assistant_with_tool("First message."),
+                _assistant("Final message."),
+                _result("Final message."),
+            ]
+        )
+
+        await handler._reader_loop(7, state)
+
+        response = req.future.result()
+        self.assertEqual(response.content, "First message.\n\nFinal message.")
+        self.assertFalse(response.streamed)
+
+    async def test_tool_only_tail_does_not_repeat_delivered_progress(self):
+        delivered = []
+
+        async def deliver_interim(content):
+            delivered.append(content)
+
+        handler = project_chat.ProjectChatHandler()
+        req = _make_request(None, deliver_interim)
+        state = project_chat._UserStreamState(client=None, model=None)
+        state.pending.append(req)
+        state.client = _ScriptedClient(
+            [
+                _assistant_with_tool("Only progress message."),
+                _result("Only progress message."),
+            ]
+        )
+
+        await handler._reader_loop(7, state)
+
+        response = req.future.result()
+        self.assertEqual(delivered, ["Only progress message."])
+        self.assertEqual(response.content, "(No response)")
+        self.assertTrue(response.streamed)
+
+    async def test_streaming_finalizes_each_assistant_message_once(self):
+        handler = project_chat.ProjectChatHandler()
+        streaming = _FakeStreamingHandler()
+        req = _make_request(streaming)
+        state = project_chat._UserStreamState(client=None, model=None)
+        state.pending.append(req)
+        state.client = _ScriptedClient(
+            [
+                _stream_event("Checking now."),
+                _assistant_with_tool("Checking now."),
+                _stream_event("Final answer."),
+                _assistant("Final answer."),
+                _result("Final answer."),
+            ]
+        )
+
+        await handler._reader_loop(7, state)
+
+        self.assertEqual(streaming.updates, ["Checking now.", "Final answer."])
+        self.assertEqual(streaming.finalized_segments, 1)
+        self.assertTrue(streaming.finalized)
+        self.assertTrue(req.future.result().streamed)
+
+    async def test_later_message_without_partials_uses_block_fallback(self):
+        handler = project_chat.ProjectChatHandler()
+        streaming = _FakeStreamingHandler()
+        req = _make_request(streaming)
+        state = project_chat._UserStreamState(client=None, model=None)
+        state.pending.append(req)
+        state.client = _ScriptedClient(
+            [
+                _stream_event("Checking now."),
+                _assistant_with_tool("Checking now."),
+                _assistant("Final block-only answer."),
+                _result("Final block-only answer."),
+            ]
+        )
+
+        await handler._reader_loop(7, state)
+
+        self.assertEqual(
+            streaming.updates,
+            ["Checking now.", "Final block-only answer."],
+        )
+
+    async def test_no_delivery_surface_preserves_legacy_final_only_behavior(self):
+        handler = project_chat.ProjectChatHandler()
+        req = _make_request(None)
+        state = project_chat._UserStreamState(client=None, model=None)
+        state.pending.append(req)
+        state.client = _ScriptedClient(
+            [
+                _assistant_with_tool("Progress that voice mode should not split."),
+                _assistant("Final answer."),
+                _result("Final answer."),
+            ]
+        )
+
+        await handler._reader_loop(7, state)
+
+        self.assertEqual(req.future.result().content, "Final answer.")
 
 
 class UnsolicitedReaderTests(unittest.IsolatedAsyncioTestCase):
@@ -463,10 +664,12 @@ class _CapturingClient:
     def __init__(self, state):
         self.state = state
         self.captured_handler = "unset"
+        self.captured_interim_callback = "unset"
 
     async def query(self, *_args, **_kwargs):
         req = self.state.pending[0]
         self.captured_handler = req.streaming_handler
+        self.captured_interim_callback = req.interim_message_callback
         req.future.set_result(
             project_chat.ChatResponse(content="ok", session_id="s")
         )
@@ -494,6 +697,31 @@ class StreamingGateTests(unittest.IsolatedAsyncioTestCase):
             config_module.config.enable_streaming = None
         self.assertIsNone(client.captured_handler)
         self.assertEqual(resp.content, "ok")
+
+    async def test_process_message_wires_interim_callback_without_streaming(self):
+        handler = project_chat.ProjectChatHandler()
+        state = project_chat._UserStreamState(client=None, model=None)
+        client = _CapturingClient(state)
+        state.client = client
+
+        async def fake_goc(*_a, **_k):
+            return state
+
+        async def deliver_interim(_content):
+            return None
+
+        handler._get_or_create_stream = fake_goc
+        config_module.config.enable_streaming = False
+        try:
+            await handler.process_message(
+                "hi",
+                user_id=7,
+                chat_id=42,
+                interim_message_callback=deliver_interim,
+            )
+        finally:
+            config_module.config.enable_streaming = None
+        self.assertIs(client.captured_interim_callback, deliver_interim)
 
 
 class ChatScopedStreamTests(unittest.IsolatedAsyncioTestCase):
