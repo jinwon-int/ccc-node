@@ -158,30 +158,6 @@ def build_image_prompt(image_path: FilePath, caption: str) -> str:
     return prompt
 
 
-_BLOCKED_DOCUMENT_EXTENSIONS = {
-    ".apk",
-    ".appimage",
-    ".bin",
-    ".com",
-    ".deb",
-    ".dll",
-    ".dmg",
-    ".dylib",
-    ".exe",
-    ".iso",
-    ".msi",
-    ".rpm",
-    ".scr",
-    ".so",
-}
-_BLOCKED_DOCUMENT_MIME_TYPES = {
-    "application/vnd.microsoft.portable-executable",
-    "application/x-dosexec",
-    "application/x-executable",
-    "application/x-msdownload",
-    "application/x-msdos-program",
-    "application/x-sharedlib",
-}
 _DOCUMENT_MIME_EXTENSIONS = {
     "application/json": ".json",
     "application/msword": ".doc",
@@ -206,48 +182,7 @@ _DOCUMENT_MIME_EXTENSIONS = {
     "text/xml": ".xml",
     "text/yaml": ".yaml",
 }
-_DOCUMENT_EXTENSIONS_BY_MIME = {
-    **{mime: {extension} for mime, extension in _DOCUMENT_MIME_EXTENSIONS.items()},
-    "application/json": {".json", ".jsonl"},
-    "application/x-ndjson": {".jsonl", ".ndjson"},
-    "application/x-yaml": {".yaml", ".yml"},
-    "text/yaml": {".yaml", ".yml"},
-    "text/plain": {
-        ".cfg",
-        ".conf",
-        ".css",
-        ".ini",
-        ".js",
-        ".json",
-        ".jsonl",
-        ".log",
-        ".md",
-        ".ndjson",
-        ".py",
-        ".sh",
-        ".toml",
-        ".ts",
-        ".txt",
-        ".xml",
-        ".yaml",
-        ".yml",
-    },
-}
-_ALLOWED_DOCUMENT_EXTENSIONS = frozenset(
-    extension
-    for extensions in _DOCUMENT_EXTENSIONS_BY_MIME.values()
-    for extension in extensions
-)
 _DOCUMENT_NAME_PATTERN = re.compile(r"document_[0-9a-f]{32}\.[a-z0-9]{1,10}")
-_BLOCKED_EXECUTABLE_MAGIC = (
-    b"MZ",
-    b"\x7fELF",
-    b"\xca\xfe\xba\xbe",
-    b"\xce\xfa\xed\xfe",
-    b"\xcf\xfa\xed\xfe",
-    b"\xfe\xed\xfa\xce",
-    b"\xfe\xed\xfa\xcf",
-)
 
 
 class DocumentSizeExceeded(RuntimeError):
@@ -322,8 +257,11 @@ def _document_suffix(file_name: Optional[str]) -> str:
 
 
 def _document_extension(file_name: Optional[str], mime_type: Optional[str]) -> str:
+    # Preserve the sender's real suffix when it is a safe token so the agent can
+    # recognize the format; otherwise fall back to a MIME-derived extension, then
+    # ``.dat``. The result always matches ``_DOCUMENT_NAME_PATTERN``.
     suffix = _document_suffix(file_name)
-    if suffix in _ALLOWED_DOCUMENT_EXTENSIONS:
+    if suffix:
         return suffix
     return _DOCUMENT_MIME_EXTENSIONS.get(normalize_document_mime_type(mime_type), ".dat")
 
@@ -331,28 +269,6 @@ def _document_extension(file_name: Optional[str], mime_type: Optional[str]) -> s
 def build_document_file_name(file_name: Optional[str], mime_type: Optional[str]) -> str:
     extension = _document_extension(file_name, mime_type)
     return f"document_{secrets.token_hex(16)}{extension}"
-
-
-def is_supported_document(mime_type: Optional[str], file_name: Optional[str]) -> bool:
-    normalized_mime = normalize_document_mime_type(mime_type)
-    suffix = _document_suffix(file_name)
-    if normalized_mime.startswith("image/"):
-        return False
-    if (
-        normalized_mime in _BLOCKED_DOCUMENT_MIME_TYPES
-        or suffix in _BLOCKED_DOCUMENT_EXTENSIONS
-    ):
-        return False
-    if normalized_mime == "application/octet-stream":
-        return suffix in _ALLOWED_DOCUMENT_EXTENSIONS
-    allowed_extensions = _DOCUMENT_EXTENSIONS_BY_MIME.get(normalized_mime)
-    if allowed_extensions is None:
-        return False
-    return not suffix or suffix in allowed_extensions
-
-
-def has_blocked_executable_magic(prefix: bytes) -> bool:
-    return any(prefix.startswith(magic) for magic in _BLOCKED_EXECUTABLE_MAGIC)
 
 
 def open_private_document_directory(path: FilePath) -> int:

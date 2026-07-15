@@ -8,6 +8,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **Accept all inbound Telegram document types (follow-up to #503/#505).** The
+  inbound document path no longer filters by file type: the MIME/extension
+  allowlist preflight and the post-download executable-magic-byte rejection are
+  removed, so every file an allowlisted user sends is downloaded and forwarded
+  to the active agent. The Telegram allowlist remains the trust boundary; all of
+  #505's storage hardening is retained (validated owner-owned `0700` dirfd,
+  `O_EXCL`/`O_NOFOLLOW`, random server-side names, validated regular-file `0600`
+  permissions, bounded writes, metadata/size rechecks), the bridge never
+  executes uploads, and agent-side execution stays gated by the Bash tool
+  policy. The stored artifact now preserves the sender's real suffix when it is a
+  safe token (falling back to a MIME-derived extension, then `.dat`). Size
+  enforcement via `CCC_MAX_DOCUMENT_SIZE_MB` is unchanged.
 - **Provider-aware bridge health (#481).** Runtime readiness now probes the
   configured agent provider: Claude nodes use `claude auth status --json`,
   while Codex nodes use `codex login status`. `health.json` publishes the

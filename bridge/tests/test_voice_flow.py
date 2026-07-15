@@ -1168,23 +1168,9 @@ class DocumentFlowTests(unittest.IsolatedAsyncioTestCase):
         bot._get_document_file.assert_not_awaited()
         bot._download_document_file.assert_not_awaited()
 
-    async def test_oversize_and_executable_documents_fail_before_download(self):
+    async def test_oversize_and_invalid_metadata_documents_fail_before_download(self):
         for document, expected in (
             (self._document(file_size=20_000_001), "too large"),
-            (
-                self._document(
-                    mime_type="application/x-msdownload",
-                    file_name="payload.exe",
-                ),
-                "not supported",
-            ),
-            (
-                self._document(
-                    mime_type="application/pdf",
-                    file_name="payload.txt",
-                ),
-                "not supported",
-            ),
             (self._document(file_size="4"), "metadata is invalid"),
         ):
             with self.subTest(file_name=document.file_name):
@@ -1200,6 +1186,44 @@ class DocumentFlowTests(unittest.IsolatedAsyncioTestCase):
                 bot._get_document_file.assert_not_awaited()
                 bot._download_document_file.assert_not_awaited()
                 self.assertTrue(any(expected in reply for reply in update.message.replies))
+
+    async def test_executable_document_is_accepted_and_forwarded(self):
+        # All file types are accepted: the sender allowlist is the trust boundary,
+        # uploads are stored non-executable, and the bridge never runs them.
+        bot = self._bot()
+        bot._check_access = AsyncMock(return_value=True)
+        bot._enqueue_user_task = self._run_now
+        observed = {}
+
+        async def download(document, destination):
+            del document
+            observed["destination"] = Path(destination.name)
+            destination.write(b"MZpayload")
+
+        bot._get_document_file = AsyncMock(return_value=SimpleNamespace(file_size=9))
+        bot._download_document_file = AsyncMock(side_effect=download)
+        bot._process_user_message_text = AsyncMock()
+        update = _build_photo_update(
+            11,
+            document=self._document(
+                mime_type="application/x-msdownload",
+                file_name="payload.exe",
+                file_size=9,
+            ),
+        )
+
+        with TemporaryDirectory() as td:
+            bot._document_dir = Path(td) / "uploads"
+            await bot._handle_document_message(update, None)
+
+        bot._process_user_message_text.assert_awaited_once()
+        prompt = bot._process_user_message_text.await_args.args[2]
+        self.assertIn("payload.exe", prompt)
+        self.assertTrue(observed["destination"].name.endswith(".exe"))
+        self.assertFalse(observed["destination"].exists())
+        self.assertFalse(
+            any("not supported" in reply for reply in update.message.replies)
+        )
 
     async def test_document_is_private_forwarded_and_cleaned_without_sensitive_logs(self):
         bot = self._bot()
@@ -1413,30 +1437,6 @@ class DocumentFlowTests(unittest.IsolatedAsyncioTestCase):
         await bot._download_document_file(telegram_file, destination)
 
         telegram_file.download_to_memory.assert_awaited_once_with(destination)
-
-    async def test_spoofed_executable_magic_is_rejected_and_cleaned(self):
-        bot = self._bot()
-        bot._check_access = AsyncMock(return_value=True)
-        bot._enqueue_user_task = self._run_now
-        observed = {}
-
-        async def download(document, destination):
-            del document
-            observed["destination"] = Path(destination.name)
-            destination.write(b"MZpayload")
-
-        bot._get_document_file = AsyncMock(return_value=SimpleNamespace(file_size=9))
-        bot._download_document_file = AsyncMock(side_effect=download)
-        bot._process_user_message_text = AsyncMock()
-        update = _build_photo_update(11, document=self._document(file_size=9))
-
-        with TemporaryDirectory() as td:
-            bot._document_dir = Path(td) / "uploads"
-            await bot._handle_document_message(update, None)
-
-        bot._process_user_message_text.assert_not_awaited()
-        self.assertFalse(observed["destination"].exists())
-        self.assertTrue(any("not supported" in reply for reply in update.message.replies))
 
     async def test_actual_download_size_is_rechecked_when_metadata_is_missing(self):
         bot = self._bot()

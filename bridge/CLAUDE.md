@@ -84,7 +84,7 @@ utils/chat_logger.py Per-session debug chat logging
 
 - **User message** → `TelegramBot` handler → access check → `ProjectChatHandler.process_message()` → Claude SDK stream → response back to Telegram
 - **Voice message** → `TelegramBot._handle_voice_message()` → download → format detect/convert → Whisper transcription → `🎤 Voice:` preview → same `process_message()` flow as text
-- **Document message** → allowlist → size/type preflight → private project-scoped download → agent prompt with local path + sanitized metadata → cleanup after the turn
+- **Document message** → allowlist → size preflight (all file types accepted) → private project-scoped download → agent prompt with local path + sanitized metadata → cleanup after the turn
 - **Permission gating**: Tool requests pass through `_permission_callback()` in bot.py. File access inside `PROJECT_ROOT` is auto-allowed; outside requires user confirmation via Telegram inline buttons with three options: Allow (once), Deny, or Allow All (session-wide). User responses are handled via asyncio.Future pattern with 60-second timeout.
 - **Per-user streams**: Each user gets a persistent `ClaudeSDKClient` connection in `ProjectChatHandler._streams`. Streams are reused across messages and cleared on `/new` or model change.
 - **Session state**: Three layers — Telegram-side (SessionStore JSON), SDK-side (~/.claude/projects/{name}/*.jsonl), runtime tracking (_runtime_active_sessions dict).
