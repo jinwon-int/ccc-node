@@ -177,6 +177,38 @@ def parse_codex_thread_usage(value: object) -> UsageSnapshot:
     )
 
 
+def parse_claude_rate_limit_event(message: object, *, observed_at: float | None = None) -> UsageSnapshot:
+    """Parse a Claude Agent SDK ``RateLimitEvent`` from the live message stream.
+
+    The CLI emits this natively (message type ``rate_limit_event``) whenever a
+    rate-limit window's status transitions (``allowed`` -> ``allowed_warning``
+    -> ``rejected``); no extra flag is required to receive it. This is the only
+    source of Claude subscription rate-limit data in headless/SDK-driven
+    sessions: the statusLine hook (``load_claude_status_snapshot``'s source)
+    only fires from the interactive terminal status bar, which never renders
+    here. Each event carries at most one window (``five_hour``/``seven_day``/
+    etc.); callers accumulate across events via ``merge_usage``.
+    """
+
+    info = getattr(message, "rate_limit_info", None)
+    label = _text(getattr(info, "rate_limit_type", None))
+    utilization = _number(getattr(info, "utilization", None), maximum=1)
+    windows: tuple[UsageWindow, ...] = ()
+    if label and utilization is not None:
+        windows = (
+            UsageWindow(
+                label=label.replace("_", " "),
+                used_percent=min(100.0, utilization * 100),
+                resets_at=_number(getattr(info, "resets_at", None), maximum=10**11),
+            ),
+        )
+    return UsageSnapshot(
+        provider="claude",
+        windows=windows,
+        observed_at=time.time() if observed_at is None else observed_at,
+    )
+
+
 def parse_claude_result(message: object, *, observed_at: float | None = None) -> UsageSnapshot:
     usage = _mapping(getattr(message, "usage", None))
     model_usage = _mapping(getattr(message, "model_usage", None))

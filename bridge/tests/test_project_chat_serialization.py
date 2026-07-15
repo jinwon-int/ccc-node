@@ -23,6 +23,7 @@ setattr(
     type("ClaudeAgentOptions", (), {"__init__": lambda self, **kwargs: None}),
 )
 setattr(sdk_module, "AssistantMessage", type("AssistantMessage", (), {}))
+setattr(sdk_module, "RateLimitEvent", type("RateLimitEvent", (), {}))
 setattr(sdk_module, "ResultMessage", type("ResultMessage", (), {}))
 setattr(sdk_module, "StreamEvent", type("StreamEvent", (), {}))
 setattr(sdk_module, "TextBlock", type("TextBlock", (), {}))

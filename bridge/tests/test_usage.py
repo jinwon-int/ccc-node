@@ -18,6 +18,7 @@ from telegram_bot.core.usage import (
     UsageWindow,
     load_claude_status_snapshot,
     merge_usage,
+    parse_claude_rate_limit_event,
     parse_claude_result,
     parse_codex_account_usage,
     parse_codex_rate_limits,
@@ -153,6 +154,47 @@ def test_claude_sdk_result_parser_uses_only_numeric_usage_fields() -> None:
     assert fallback.input_tokens == 30
     assert fallback.context_used == 35
     assert fallback.output_tokens == 5
+
+
+def test_claude_rate_limit_event_parser_converts_utilization_and_ignores_incomplete() -> None:
+    parsed = parse_claude_rate_limit_event(
+        SimpleNamespace(
+            rate_limit_info=SimpleNamespace(
+                status="allowed_warning",
+                rate_limit_type="five_hour",
+                utilization=0.812,
+                resets_at=1_900_000_000,
+            )
+        ),
+        observed_at=1000,
+    )
+    assert [w.label for w in parsed.windows] == ["five hour"]
+    assert parsed.windows[0].used_percent == pytest.approx(81.2)
+    assert parsed.windows[0].resets_at == 1_900_000_000
+
+    # Successive events (five_hour, then seven_day) accumulate via merge_usage
+    # instead of clobbering each other — each SDK event only reports one window.
+    second = parse_claude_rate_limit_event(
+        SimpleNamespace(
+            rate_limit_info=SimpleNamespace(
+                status="allowed",
+                rate_limit_type="seven_day",
+                utilization=0.1,
+                resets_at=None,
+            )
+        ),
+        observed_at=1001,
+    )
+    merged = merge_usage(parsed, second)
+    assert [w.label for w in merged.windows] == ["five hour", "seven day"]
+
+    # Missing type/utilization (e.g. an overage-only event) yields no window
+    # rather than a bogus zero-percent entry.
+    incomplete = parse_claude_rate_limit_event(
+        SimpleNamespace(rate_limit_info=SimpleNamespace(status="rejected")),
+        observed_at=1002,
+    )
+    assert incomplete.windows == ()
 
 
 def _run_collector(tmp_path: Path, payload: object, *, state_dir: Path | None = None) -> None:
@@ -322,3 +364,62 @@ async def test_claude_usage_cache_is_exact_conversation_and_session_scoped(
     assert exact.total_cost_usd == 0.01
     assert other_chat.context_used is None
     assert other_session.context_used is None
+
+
+@pytest.mark.anyio
+async def test_claude_rate_limit_is_global_unlike_session_scoped_usage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Rate limits belong to the one Claude credential this node runs as, not
+    to any single Telegram conversation — so they must surface for every
+    chat/session's /usage call, unlike the token/cost cache asserted scoped
+    above."""
+
+    monkeypatch.setenv("CCC_STATE_DIR", str(tmp_path / "state"))
+    handler = ProjectChatHandler.__new__(ProjectChatHandler)
+    handler._agent_runtime = None
+    handler._claude_usage = {}
+    handler._claude_rate_limit = None
+    handler._clock = SimpleNamespace(time=lambda: 1000.0)
+    handler._config = SimpleNamespace(claude_settings_path=tmp_path / "settings.json")
+
+    handler._record_claude_rate_limit(
+        SimpleNamespace(
+            rate_limit_info=SimpleNamespace(
+                status="allowed_warning",
+                rate_limit_type="five_hour",
+                utilization=0.5,
+                resets_at=1_900_000_000,
+            ),
+            session_id="claude-a",
+        )
+    )
+    # Empty-window events (e.g. overage-only payloads) must not wipe out the
+    # previously observed real window.
+    handler._record_claude_rate_limit(
+        SimpleNamespace(rate_limit_info=SimpleNamespace(status="rejected"), session_id="claude-a")
+    )
+
+    for user_id, chat_id, session_id in ((7, 9, "claude-a"), (7, 10, "claude-a"), (99, 1, "unrelated")):
+        result = await handler.get_usage(user_id, chat_id, session_id)
+        assert [w.label for w in result.windows] == ["five hour"]
+        assert result.windows[0].used_percent == 50.0
+
+
+@pytest.mark.anyio
+async def test_get_usage_tolerates_handler_without_rate_limit_attribute(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Guards test/legacy fixtures that build the handler via __new__ and
+    never set `_claude_rate_limit` (added after `_claude_usage`)."""
+
+    monkeypatch.setenv("CCC_STATE_DIR", str(tmp_path / "state"))
+    handler = ProjectChatHandler.__new__(ProjectChatHandler)
+    handler._agent_runtime = None
+    handler._claude_usage = {}
+    handler._clock = SimpleNamespace(time=lambda: 1000.0)
+    handler._config = SimpleNamespace(claude_settings_path=tmp_path / "settings.json")
+    assert not hasattr(handler, "_claude_rate_limit")
+
+    result = await handler.get_usage(1, 2, "claude-x")
+    assert result.windows == ()
