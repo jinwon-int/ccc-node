@@ -47,12 +47,11 @@ There is no Codex user-session A2A launch path in current ccc-node main. The #47
 - Diagnostics should report counts, statuses, paths, and cache ages only; do not print memory snippets or secrets in fleet reports.
 - On Termux, use `${TMPDIR:-$HOME/tmp}` for scratch and keep state under the user's writable home/state directory.
 
-## Codex distill extraction boundary
+## Codex distill extraction backend
 
-The Codex write-back path is intentionally staged. The current extraction boundary is
-pure and provider-neutral: it accepts an already bounded `CodexTranscriptSnapshot`,
-redacts credential-like text, serializes deterministic input, and validates a strict
-versioned result before any future provider or sink boundary.
+The Codex write-back path is intentionally staged. The provider-neutral boundary
+accepts an already bounded `CodexTranscriptSnapshot`, redacts credential-like text,
+serializes deterministic input, and validates a strict versioned result.
 
 - `bridge/memory/distill_extraction.py` contains the input/output models,
   `DistillBackend` protocol, privacy gates, canonical input serializer, strict JSON
@@ -66,10 +65,15 @@ versioned result before any future provider or sink boundary.
 - Transcript text remains untrusted data. Credential-like content is redacted before
   canonical input serialization, while credential-like or directive-like durable
   Honcho/Wiki output is rejected.
-- This boundary performs no Codex/Claude/provider call, subprocess or network access,
-  journal transition, or local/Honcho/Wiki/resume sink mutation. A later child must
-  implement an isolated backend and keep the user-facing Codex thread out of the
-  extraction context.
+- `bridge/memory/codex_exec_backend.py` implements the isolated provider adapter. It
+  launches `codex exec` with `--ephemeral`, `--ignore-user-config`, `--ignore-rules`,
+  `--sandbox read-only`, an empty private cwd, checked-in output schema, canonical
+  redacted stdin, a minimal allowlisted environment, bounded timeout/cancellation,
+  process-group termination, and an owner-only output file. Provider stdout/stderr and
+  output bodies are never exposed through errors.
+- The backend is not connected to the journal worker and performs no
+  local/Honcho/Wiki/resume sink mutation. Those orchestration and replay-safe sink
+  phases remain under #465.
 
 ## Useful commands
 

@@ -33,6 +33,7 @@ mypy_path = "bridge"
 explicit_package_bases = true
 files = [
   "bridge/core",
+  "bridge/memory/codex_exec_backend.py",
   "bridge/tests/test_agent_runtime_contract.py",
   "bridge/tests/test_codex_app_server.py",
   "bridge/tests/test_codex_runtime.py",
