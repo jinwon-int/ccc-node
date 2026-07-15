@@ -22,8 +22,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Files outside `PROJECT_ROOT` were silently dropped on send.** The referenced
   file confirmation flow (`_prompt_outside_file_confirmation` / the `extsend:`
   callback) existed but was never wired into the reply path, so any deliverable
-  the agent produced outside the project root simply never arrived. Reply and
-  send paths now route out-of-project files through `_maybe_prompt_outside_files`,
+  the agent produced outside the project root simply never arrived. Text,
+  voice-only artifact, and send paths now route out-of-project files through
+  `_maybe_prompt_outside_files`,
   which offers a one-tap confirm before sending (and is skipped when the owner
   user id is unknown, so callers without one cannot expose out-of-project paths).
   In-root files continue to send automatically.
