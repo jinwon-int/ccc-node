@@ -278,7 +278,7 @@ Any unrecognized `/command` is also forwarded as a skill invocation.
 | `CLAUDE_CLI_PATH` | No | *(auto-detect)* | Absolute path to Claude CLI binary |
 | `CLAUDE_SETTINGS_PATH` | No | `~/.claude/settings.json` | Path to Claude Code settings file |
 | `CLAUDE_PROCESS_TIMEOUT` | No | `600` | SDK timeout in seconds |
-| `CCC_MAX_DOCUMENT_SIZE_MB` | No | `20` | Maximum inbound Telegram document size in MiB (1–50) |
+| `CCC_MAX_DOCUMENT_SIZE_MB` | No | `10` | Maximum inbound Telegram document size in decimal MB (1–20) |
 | `AUTO_NEW_SESSION_AFTER_HOURS` | No | `24` | Auto-start new session after N hours of inactivity; set to `0`/`false`/`off` to disable |
 | `DRAFT_UPDATE_MIN_CHARS` | No | `150` | Minimum characters before streaming draft update |
 | `DRAFT_UPDATE_INTERVAL` | No | `1.0` | Minimum seconds between streaming draft updates |
@@ -301,11 +301,11 @@ Any unrecognized `/command` is also forwarded as a skill invocation.
 
 ## Inbound Document Handling
 
-- Non-image Telegram documents are accepted only after the normal allowlist check.
-- Each upload is stored under `PROJECT_ROOT/.telegram_bot/uploads/` with a random server-side name, a private `0700` directory, and `0600` file permissions.
-- Declared and downloaded sizes are checked against `CCC_MAX_DOCUMENT_SIZE_MB` (default: 20 MiB); known executable binary formats are rejected before download.
+- Non-image Telegram documents are accepted only after the normal allowlist, MIME/extension policy, and declared-size checks.
+- Telegram's returned file metadata is rechecked before storage. Each upload is created relative to a validated owner-owned `0700` directory fd, with a random server-side name, `O_EXCL`/`O_NOFOLLOW`, and validated regular-file `0600` permissions.
+- Actual writes are bounded by `CCC_MAX_DOCUMENT_SIZE_MB` (default: 10 decimal MB, range: 1–20). Known executable MIME types, extensions, and executable magic bytes are rejected.
 - The local path, sanitized display name, MIME type, size, and optional caption are passed to the active agent runtime. Unsupported runtime formats are reported explicitly.
-- Temporary files are removed after success, failure, or cancellation; stale files are pruned at startup.
+- Temporary files are removed after success, failure, or cancellation; startup pruning touches only regular bridge-generated artifacts and does not follow symlinks.
 
 ## Voice Transcription Channels
 

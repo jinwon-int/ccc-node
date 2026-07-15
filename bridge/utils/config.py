@@ -681,11 +681,11 @@ class Config(BaseSettings):
         default=300, description="Maximum accepted voice duration in seconds"
     )
     max_document_size_mb: int = Field(
-        default=20,
+        default=10,
         ge=1,
-        le=50,
+        le=20,
         alias="CCC_MAX_DOCUMENT_SIZE_MB",
-        description="Maximum inbound Telegram document size in MiB.",
+        description="Maximum inbound Telegram document size in decimal megabytes",
     )
     ffmpeg_path: Optional[str] = Field(
         default=None,

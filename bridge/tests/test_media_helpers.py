@@ -6,8 +6,11 @@ and the script-counting heuristics had little direct coverage. Testing the
 module functions pins the behavior independently of the bot.
 """
 
+import os
+import stat
 import unittest
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 
 from telegram_bot.core import media
@@ -159,6 +162,12 @@ class DocumentHelperTest(unittest.TestCase):
         self.assertTrue(media.is_supported_document("application/pdf", "report.pdf"))
         self.assertTrue(media.is_supported_document("application/zip", "sources.zip"))
 
+    def test_mime_extension_mismatch_and_unknown_types_are_blocked(self):
+        self.assertFalse(media.is_supported_document("application/pdf", "report.txt"))
+        self.assertFalse(media.is_supported_document("application/x-unknown", "report.dat"))
+        self.assertTrue(media.is_supported_document("application/octet-stream", "report.pdf"))
+        self.assertTrue(media.is_supported_document("application/zip", "bundle.zip"))
+
     def test_prompt_includes_bounded_metadata_and_untrusted_data_warning(self):
         prompt = media.build_document_prompt(
             Path("/project/.telegram_bot/uploads/document_abc.pdf"),
@@ -183,6 +192,95 @@ class DocumentHelperTest(unittest.TestCase):
             caption="",
         )
         self.assertIn("Inspect the file and summarize its relevant contents", prompt)
+
+
+class DocumentStorageHelperTest(unittest.TestCase):
+    def test_private_directory_fd_and_file_are_exact_modes_under_permissive_umask(self):
+        with TemporaryDirectory() as td:
+            upload_dir = Path(td) / "uploads"
+            old_umask = os.umask(0)
+            try:
+                directory_fd = media.open_private_document_directory(upload_dir)
+                file_fd = media.open_private_document_file(
+                    directory_fd, "document_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.pdf"
+                )
+            finally:
+                os.umask(old_umask)
+
+            try:
+                directory_stat = os.fstat(directory_fd)
+                file_stat = os.fstat(file_fd)
+                self.assertTrue(stat.S_ISDIR(directory_stat.st_mode))
+                self.assertTrue(stat.S_ISREG(file_stat.st_mode))
+                self.assertEqual(stat.S_IMODE(directory_stat.st_mode), 0o700)
+                self.assertEqual(stat.S_IMODE(file_stat.st_mode), 0o600)
+                self.assertEqual(file_stat.st_nlink, 1)
+                if hasattr(os, "getuid"):
+                    self.assertEqual(directory_stat.st_uid, os.getuid())
+                    self.assertEqual(file_stat.st_uid, os.getuid())
+            finally:
+                os.close(file_fd)
+                os.close(directory_fd)
+
+    def test_bounded_writer_rejects_before_writing_beyond_limit(self):
+        with TemporaryDirectory() as td:
+            path = Path(td) / "payload"
+            with path.open("w+b") as raw:
+                writer = media.BoundedDocumentWriter(raw, max_bytes=5)
+                self.assertEqual(writer.write(b"1234"), 4)
+                with self.assertRaises(media.DocumentSizeExceeded):
+                    writer.write(b"56")
+                raw.flush()
+            self.assertEqual(path.read_bytes(), b"1234")
+            self.assertEqual(writer.bytes_written, 4)
+
+    def test_post_open_hardlink_is_detected(self):
+        with TemporaryDirectory() as td:
+            upload_dir = Path(td) / "uploads"
+            directory_fd = media.open_private_document_directory(upload_dir)
+            name = "document_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.pdf"
+            file_fd = media.open_private_document_file(directory_fd, name)
+            try:
+                os.link(upload_dir / name, Path(td) / "hardlink.pdf")
+                with self.assertRaises(PermissionError):
+                    media.validate_private_document_fd(file_fd)
+            finally:
+                os.close(file_fd)
+                os.close(directory_fd)
+
+    def test_stale_cleanup_removes_only_regular_generated_files_without_following_symlinks(self):
+        with TemporaryDirectory() as td:
+            upload_dir = Path(td) / "uploads"
+            upload_dir.mkdir(mode=0o700)
+            stale = upload_dir / "document_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.pdf"
+            fresh = upload_dir / "document_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.pdf"
+            unrelated = upload_dir / "operator-note.txt"
+            outside = Path(td) / "outside.pdf"
+            linked = upload_dir / "document_cccccccccccccccccccccccccccccccc.pdf"
+            stale.write_bytes(b"stale")
+            fresh.write_bytes(b"fresh")
+            unrelated.write_bytes(b"keep")
+            outside.write_bytes(b"outside")
+            linked.symlink_to(outside)
+            os.utime(stale, (0, 0))
+            os.utime(fresh, (1_000, 1_000))
+            os.utime(unrelated, (0, 0))
+
+            removed = media.cleanup_stale_document_files(
+                upload_dir, max_age_seconds=100, now=1_000
+            )
+
+            self.assertEqual(removed, 1)
+            self.assertFalse(stale.exists())
+            self.assertTrue(fresh.exists())
+            self.assertTrue(unrelated.exists())
+            self.assertTrue(linked.is_symlink())
+            self.assertEqual(outside.read_bytes(), b"outside")
+
+    def test_executable_magic_is_blocked_even_with_document_extension(self):
+        self.assertTrue(media.has_blocked_executable_magic(b"MZpayload"))
+        self.assertTrue(media.has_blocked_executable_magic(b"\x7fELFpayload"))
+        self.assertFalse(media.has_blocked_executable_magic(b"%PDF-1.7"))
 
 
 if __name__ == "__main__":
