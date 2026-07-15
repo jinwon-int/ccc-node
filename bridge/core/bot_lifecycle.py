@@ -116,6 +116,8 @@ class BotLifecycleMixin:
         try:
             if getattr(stats, "quarantined", 0):
                 health_reporter.record_transcript_quarantined(stats.quarantined)
+            if getattr(stats, "hard_quarantined", 0):
+                health_reporter.record_transcript_hard_quarantined(stats.hard_quarantined)
         except Exception as exc:
             logger.debug("Recovery stats health recording failed: %s", type(exc).__name__)
 
