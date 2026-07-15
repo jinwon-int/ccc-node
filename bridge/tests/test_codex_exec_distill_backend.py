@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import sys
 from typing import Any, Awaitable, Callable, ParamSpec
 
 import pytest
@@ -26,6 +27,7 @@ from telegram_bot.memory.distill_extraction import (
 ROOT = Path(__file__).resolve().parents[2]
 SCHEMA_PATH = ROOT / "schemas" / "codex-distill-extraction-v1.schema.json"
 THREAD_HASH = "a" * 64
+TEST_EXECUTABLE = str(Path(sys.executable).resolve())
 P = ParamSpec("P")
 
 
@@ -137,7 +139,7 @@ async def test_backend_uses_exact_isolated_argv_private_cwd_and_canonical_stdin(
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_spawn)
     backend = CodexExecDistillBackend(
-        executable="/usr/bin/codex",
+        executable=TEST_EXECUTABLE,
         schema_path=SCHEMA_PATH,
         temp_root=tmp_path,
         environment={
@@ -156,7 +158,7 @@ async def test_backend_uses_exact_isolated_argv_private_cwd_and_canonical_stdin(
     result = await backend.extract(extraction_input())
 
     args = capture["args"]
-    assert args[0:2] == (str(Path("/usr/bin/codex").resolve()), "exec")
+    assert args[0:2] == (TEST_EXECUTABLE, "exec")
     assert args[-1] == DISTILL_EXTRACTION_PROMPT
     assert "--ephemeral" in args
     assert "--ignore-user-config" in args
@@ -216,7 +218,7 @@ async def test_backend_rejects_output_provenance_not_bound_to_input(
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_spawn)
     backend = CodexExecDistillBackend(
-        executable="/usr/bin/codex", schema_path=SCHEMA_PATH, temp_root=tmp_path
+        executable=TEST_EXECUTABLE, schema_path=SCHEMA_PATH, temp_root=tmp_path
     )
 
     with pytest.raises(CodexDistillBackendError, match="^codex_distill_output_invalid$"):
@@ -250,7 +252,7 @@ async def test_backend_exposes_body_free_spawn_and_exit_errors(
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_spawn)
     backend = CodexExecDistillBackend(
-        executable="/usr/bin/codex", schema_path=SCHEMA_PATH, temp_root=tmp_path
+        executable=TEST_EXECUTABLE, schema_path=SCHEMA_PATH, temp_root=tmp_path
     )
 
     with pytest.raises(CodexDistillBackendError) as caught:
@@ -278,7 +280,7 @@ async def test_timeout_terminates_the_process_group(
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_spawn)
     monkeypatch.setattr(os, "killpg", lambda pid, sig: killpg_calls.append((pid, sig)))
     backend = CodexExecDistillBackend(
-        executable="/usr/bin/codex",
+        executable=TEST_EXECUTABLE,
         schema_path=SCHEMA_PATH,
         temp_root=tmp_path,
         timeout_seconds=0.01,
@@ -308,7 +310,7 @@ async def test_cancellation_terminates_process_group_and_preserves_cancellation(
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_spawn)
     monkeypatch.setattr(os, "killpg", lambda pid, sig: killpg_calls.append((pid, sig)))
     backend = CodexExecDistillBackend(
-        executable="/usr/bin/codex", schema_path=SCHEMA_PATH, temp_root=tmp_path
+        executable=TEST_EXECUTABLE, schema_path=SCHEMA_PATH, temp_root=tmp_path
     )
 
     task = asyncio.create_task(backend.extract(extraction_input()))
@@ -344,7 +346,7 @@ async def test_communicate_failure_terminates_process_group_and_hides_details(
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_spawn)
     monkeypatch.setattr(os, "killpg", fake_killpg)
     backend = CodexExecDistillBackend(
-        executable="/usr/bin/codex", schema_path=SCHEMA_PATH, temp_root=tmp_path
+        executable=TEST_EXECUTABLE, schema_path=SCHEMA_PATH, temp_root=tmp_path
     )
 
     with pytest.raises(CodexDistillBackendError) as caught:
@@ -399,7 +401,7 @@ async def test_backend_rejects_missing_unsafe_oversized_and_invalid_output(
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_spawn)
     backend = CodexExecDistillBackend(
-        executable="/usr/bin/codex", schema_path=SCHEMA_PATH, temp_root=tmp_path
+        executable=TEST_EXECUTABLE, schema_path=SCHEMA_PATH, temp_root=tmp_path
     )
 
     with pytest.raises(CodexDistillBackendError) as caught:
@@ -425,7 +427,7 @@ async def test_backend_rejects_unsafe_schema_before_spawn(
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_spawn)
     backend = CodexExecDistillBackend(
-        executable="/usr/bin/codex", schema_path=schema_link, temp_root=tmp_path
+        executable=TEST_EXECUTABLE, schema_path=schema_link, temp_root=tmp_path
     )
 
     with pytest.raises(CodexDistillBackendError, match="^codex_distill_schema_unsafe$"):
