@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+from functools import wraps
 import json
 import os
 from pathlib import Path
 import signal
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, ParamSpec
 
 import pytest
 
@@ -25,6 +26,17 @@ from telegram_bot.memory.distill_extraction import (
 ROOT = Path(__file__).resolve().parents[2]
 SCHEMA_PATH = ROOT / "schemas" / "codex-distill-extraction-v1.schema.json"
 THREAD_HASH = "a" * 64
+P = ParamSpec("P")
+
+
+def async_test(function: Callable[P, Awaitable[None]]) -> Callable[P, None]:
+    """Run an async test without requiring an external pytest plugin."""
+
+    @wraps(function)
+    def wrapper(*args: P.args, **kwargs: P.kwargs) -> None:
+        asyncio.run(function(*args, **kwargs))
+
+    return wrapper
 
 
 def extraction_input() -> DistillExtractionInput:
@@ -105,7 +117,7 @@ def output_path_from_args(args: tuple[str, ...]) -> Path:
     return Path(args[args.index("--output-last-message") + 1])
 
 
-@pytest.mark.asyncio
+@async_test
 async def test_backend_uses_exact_isolated_argv_private_cwd_and_canonical_stdin(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -189,7 +201,7 @@ async def test_backend_uses_exact_isolated_argv_private_cwd_and_canonical_stdin(
     )
 
 
-@pytest.mark.asyncio
+@async_test
 async def test_backend_rejects_output_provenance_not_bound_to_input(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -211,7 +223,7 @@ async def test_backend_rejects_output_provenance_not_bound_to_input(
         await backend.extract(extraction_input())
 
 
-@pytest.mark.asyncio
+@async_test
 @pytest.mark.parametrize(
     ("returncode", "spawn_error", "expected"),
     [
@@ -248,7 +260,7 @@ async def test_backend_exposes_body_free_spawn_and_exit_errors(
     assert "private body" not in repr(caught.value)
 
 
-@pytest.mark.asyncio
+@async_test
 async def test_timeout_terminates_the_process_group(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -278,7 +290,7 @@ async def test_timeout_terminates_the_process_group(
     assert killpg_calls[0] == (47800, signal.SIGTERM)
 
 
-@pytest.mark.asyncio
+@async_test
 async def test_cancellation_terminates_process_group_and_preserves_cancellation(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -308,7 +320,7 @@ async def test_cancellation_terminates_process_group_and_preserves_cancellation(
     assert killpg_calls[0] == (47800, signal.SIGTERM)
 
 
-@pytest.mark.asyncio
+@async_test
 async def test_communicate_failure_terminates_process_group_and_hides_details(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -343,7 +355,7 @@ async def test_communicate_failure_terminates_process_group_and_hides_details(
     assert killpg_calls == [(47800, signal.SIGTERM)]
 
 
-@pytest.mark.asyncio
+@async_test
 @pytest.mark.parametrize(
     ("mutation", "expected"),
     [
@@ -397,7 +409,7 @@ async def test_backend_rejects_missing_unsafe_oversized_and_invalid_output(
     assert "PRIVATE_PROVIDER_BODY" not in repr(caught.value)
 
 
-@pytest.mark.asyncio
+@async_test
 async def test_backend_rejects_unsafe_schema_before_spawn(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
