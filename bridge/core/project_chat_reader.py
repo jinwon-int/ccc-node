@@ -6,7 +6,14 @@ import asyncio
 import logging
 import os
 
-from claude_agent_sdk import AssistantMessage, ResultMessage, StreamEvent, TextBlock, ToolUseBlock
+from claude_agent_sdk import (
+    AssistantMessage,
+    RateLimitEvent,
+    ResultMessage,
+    StreamEvent,
+    TextBlock,
+    ToolUseBlock,
+)
 
 from telegram_bot.core.heartbeat import tool_label
 from telegram_bot.core.task_ledger import (
@@ -180,6 +187,13 @@ class ProjectChatReaderMixin:
     async def _reader_loop(self, user_id: int, state: _UserStreamState) -> None:  # noqa: C901 -- #348 baseline hotspot
         try:
             async for msg in state.client.receive_messages():
+                if isinstance(msg, RateLimitEvent):
+                    # Account-level signal, unrelated to any pending Telegram
+                    # request — record it and move on regardless of pending
+                    # state (see `_record_claude_rate_limit`).
+                    self._record_claude_rate_limit(msg)
+                    continue
+
                 if state.unsolicited_inflight or not state.pending:
                     await self._handle_unsolicited_message(user_id, state, msg)
                     continue

@@ -14,6 +14,7 @@ from claude_agent_sdk import (
     ClaudeSDKClient,
     ClaudeAgentOptions,
     AssistantMessage,  # noqa: F401
+    RateLimitEvent,
     ResultMessage,
     StreamEvent,  # noqa: F401
     TextBlock,  # noqa: F401
@@ -49,6 +50,7 @@ from telegram_bot.core.usage import (
     UsageSnapshot,
     load_claude_status_snapshot,
     merge_usage,
+    parse_claude_rate_limit_event,
     parse_claude_result,
 )
 
@@ -216,6 +218,14 @@ class ProjectChatHandler(
         self._teardown_tasks: set["asyncio.Task[Any]"] = set()
         self._conversation_locks: Dict[Tuple[int, int], asyncio.Lock] = {}
         self._claude_usage: Dict[Tuple[int, int, str], UsageSnapshot] = {}
+        # Rate-limit windows are a property of the single underlying Claude
+        # subscription/OAuth credential this node authenticates with, not of
+        # any one conversation, so — unlike `_claude_usage` above — this is
+        # intentionally NOT scoped per (user_id, chat_id, session_id). It is
+        # populated from the SDK's native `RateLimitEvent` stream messages
+        # (see `_record_claude_rate_limit`), which fire regardless of which
+        # chat's stream happens to be open when the CLI emits them.
+        self._claude_rate_limit: Optional[UsageSnapshot] = None
         logger.info(f"ProjectChatHandler initialized for {self.project_root}")
 
     @staticmethod
@@ -229,6 +239,16 @@ class ProjectChatHandler(
         key = (req.user_id, req.chat_id, session_id)
         self._claude_usage[key] = parse_claude_result(msg, observed_at=self._clock.time())
         self._claude_usage = dict(tuple(self._claude_usage.items())[-128:])
+
+    def _record_claude_rate_limit(self, msg: RateLimitEvent) -> None:
+        parsed = parse_claude_rate_limit_event(msg, observed_at=self._clock.time())
+        if not parsed.windows:
+            return
+        self._claude_rate_limit = (
+            merge_usage(self._claude_rate_limit, parsed)
+            if self._claude_rate_limit is not None
+            else parsed
+        )
 
     async def get_usage(
         self, user_id: int, chat_id: int, session_id: str | None
@@ -263,6 +283,12 @@ class ProjectChatHandler(
         )
         if status is not None:
             result = merge_usage(result, status)
+        # Global, not session-scoped by design — see `_claude_rate_limit`.
+        # getattr guards test fixtures that build the handler via __new__
+        # without running __init__.
+        rate_limit = getattr(self, "_claude_rate_limit", None)
+        if rate_limit is not None:
+            result = merge_usage(result, rate_limit)
         return result
 
     def _get_stream_init_lock(self, user_id: int, chat_id: int) -> asyncio.Lock:
