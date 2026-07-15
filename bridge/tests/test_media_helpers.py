@@ -154,31 +154,23 @@ class DocumentHelperTest(unittest.TestCase):
         self.assertNotIn("payroll", first)
         self.assertNotIn("/", first)
 
-    def test_known_executable_binary_is_unsupported(self):
-        self.assertFalse(
-            media.is_supported_document("application/x-msdownload", "payload.exe")
-        )
-        self.assertFalse(media.is_supported_document("application/octet-stream", "lib.so"))
-        self.assertTrue(media.is_supported_document("application/pdf", "report.pdf"))
-        self.assertTrue(media.is_supported_document("application/zip", "sources.zip"))
-
-    def test_mime_extension_mismatch_and_unknown_types_are_blocked(self):
-        self.assertFalse(media.is_supported_document("application/pdf", "report.txt"))
-        self.assertFalse(media.is_supported_document("application/x-unknown", "report.dat"))
-        self.assertTrue(media.is_supported_document("application/octet-stream", "report.pdf"))
-        self.assertTrue(media.is_supported_document("application/zip", "bundle.zip"))
-
-    def test_yaml_and_ndjson_alias_extensions_are_supported(self):
-        for mime_type, file_name in (
-            ("application/x-yaml", "config.yaml"),
-            ("application/x-yaml", "config.yml"),
-            ("text/yaml", "config.yaml"),
-            ("text/yaml", "config.yml"),
-            ("application/x-ndjson", "events.jsonl"),
-            ("application/x-ndjson", "events.ndjson"),
+    def test_storage_name_preserves_any_safe_suffix_and_falls_back_by_mime(self):
+        # All file types are accepted; the stored name keeps the sender's real
+        # suffix when it is a safe token (so the agent can recognize the format),
+        # otherwise derives one from the MIME type, otherwise ``.dat``.
+        for file_name, mime_type, expected_suffix in (
+            ("payload.exe", "application/x-msdownload", ".exe"),
+            ("lib.so", "application/octet-stream", ".so"),
+            ("script.py", "text/x-python", ".py"),
+            ("noext", "application/pdf", ".pdf"),
+            ("noext", "application/x-unknown", ".dat"),
         ):
-            with self.subTest(mime_type=mime_type, file_name=file_name):
-                self.assertTrue(media.is_supported_document(mime_type, file_name))
+            with self.subTest(file_name=file_name):
+                name = media.build_document_file_name(file_name, mime_type)
+                self.assertTrue(name.startswith("document_"))
+                self.assertTrue(name.endswith(expected_suffix))
+                self.assertNotIn("/", name)
+                self.assertRegex(name, r"^document_[0-9a-f]{32}\.[a-z0-9]{1,10}$")
 
     def test_document_size_parser_rejects_coercion_and_negative_values(self):
         self.assertEqual(media.parse_document_size(None), 0)
@@ -296,11 +288,6 @@ class DocumentStorageHelperTest(unittest.TestCase):
             self.assertTrue(unrelated.exists())
             self.assertTrue(linked.is_symlink())
             self.assertEqual(outside.read_bytes(), b"outside")
-
-    def test_executable_magic_is_blocked_even_with_document_extension(self):
-        self.assertTrue(media.has_blocked_executable_magic(b"MZpayload"))
-        self.assertTrue(media.has_blocked_executable_magic(b"\x7fELFpayload"))
-        self.assertFalse(media.has_blocked_executable_magic(b"%PDF-1.7"))
 
 
 if __name__ == "__main__":

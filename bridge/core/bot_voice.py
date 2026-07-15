@@ -532,8 +532,6 @@ class BotVoiceMixin:
                     output.flush()
                     actual_size = writer.bytes_written
                     media.validate_private_document_fd(output.fileno())
-                    output.seek(0)
-                    prefix = output.read(8)
             except media.DocumentSizeExceeded:
                 outcome = "size_limit_exceeded"
                 await message.reply_text(
@@ -555,12 +553,6 @@ class BotVoiceMixin:
                 outcome = "size_mismatch"
                 await message.reply_text(
                     "❌ File size changed during transfer. Please resend the file."
-                )
-                return
-            if media.has_blocked_executable_magic(prefix):
-                outcome = "unsupported_content"
-                await message.reply_text(
-                    "❌ This file type is not supported for inbound analysis."
                 )
                 return
 
@@ -617,12 +609,6 @@ class BotVoiceMixin:
         message = self._require_message(update)
         document = getattr(message, "document", None)
         if document is None:
-            return
-
-        file_name = getattr(document, "file_name", None)
-        mime_type = getattr(document, "mime_type", None)
-        if not media.is_supported_document(mime_type, file_name):
-            await message.reply_text("❌ This file type is not supported for inbound analysis.")
             return
 
         try:

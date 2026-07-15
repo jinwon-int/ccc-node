@@ -301,9 +301,10 @@ Any unrecognized `/command` is also forwarded as a skill invocation.
 
 ## Inbound Document Handling
 
-- Non-image Telegram documents are accepted only after the normal allowlist, MIME/extension policy, and declared-size checks.
+- Non-image Telegram documents are accepted after the normal allowlist and declared-size checks.
+- All file types are accepted, including executable binaries: the sender allowlist is the trust boundary. Uploads are stored non-executable (`0600`) and are never run by the bridge; agent-side execution stays gated by the Bash tool policy.
 - Telegram's returned file metadata is rechecked before storage. Each upload is created relative to a validated owner-owned `0700` directory fd, with a random server-side name, `O_EXCL`/`O_NOFOLLOW`, and validated regular-file `0600` permissions.
-- Actual writes are bounded by `CCC_MAX_DOCUMENT_SIZE_MB` (default: 10 decimal MB, range: 1–20). Known executable MIME types, extensions, and executable magic bytes are rejected.
+- Actual writes are bounded by `CCC_MAX_DOCUMENT_SIZE_MB` (default: 10 decimal MB, range: 1–20).
 - The local path, sanitized display name, MIME type, size, and optional caption are passed to the active agent runtime. Unsupported runtime formats are reported explicitly.
 - Temporary files are removed after success, failure, or cancellation; startup pruning touches only regular bridge-generated artifacts and does not follow symlinks.
 
