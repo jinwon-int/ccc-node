@@ -12,11 +12,13 @@ ok() { if eval "$2"; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $
 mkdir -p "$TMP/bin" "$TMP/worker/dist" "$TMP/worker/scripts"
 printf '#!/usr/bin/env bash\necho native-node "$@"\n' > "$TMP/bin/node-native"
 printf '#!/usr/bin/env bash\necho claude "$@"\n' > "$TMP/bin/claude-native"
+printf '#!/usr/bin/env bash\necho codex "$@"\n' > "$TMP/bin/codex-native"
 printf 'console.log("worker fixture");\n' > "$TMP/worker/dist/worker.js"
 printf 'console.log("bridge fixture");\n' > "$TMP/worker/scripts/claude-a2a-analysis-bridge.mjs"
 printf 'console.log("patch bridge fixture");\n' > "$TMP/worker/scripts/claude-a2a-patch-bridge.mjs"
+printf 'console.log("codex bridge fixture");\n' > "$TMP/worker/scripts/codex-a2a-analysis-bridge.mjs"
 printf 'console.log("task handler fixture");\n' > "$TMP/worker/scripts/a2a-task-handler.mjs"
-chmod +x "$TMP/bin/node-native" "$TMP/bin/claude-native"
+chmod +x "$TMP/bin/node-native" "$TMP/bin/claude-native" "$TMP/bin/codex-native"
 
 write_env() {
   cat > "$1" <<EOF
@@ -49,6 +51,28 @@ A2A_CLAUDE_CODE_PATCH_MODE=single-shot
 BROKER_URL=http://127.0.0.1:18790
 WORKER_MODE=persistent
 WORKER_METADATA_JSON={"runtime":"claude-code","harness":"claude","adapter":"claude-a2a-patch-bridge","nodeId":"mobile-native"}
+CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+DISABLE_GROWTHBOOK=1
+USE_BUILTIN_RIPGREP=0
+EOF
+}
+
+write_codex_env() {
+  mkdir -p "$TMP/codex-dir"
+  printf '{"test":true}\n' > "$TMP/codex-dir/auth.json"
+  cat > "$1" <<EOF
+A2A_TERMUX_NATIVE=1
+A2A_NATIVE_NODE_BIN=$TMP/bin/node-native
+A2A_WORKER_ROOT=$TMP/worker
+OPENCLAW_BIN=$TMP/worker/scripts/codex-a2a-analysis-bridge.mjs
+A2A_OPENCLAW_ANALYSIS_BIN=$TMP/worker/scripts/codex-a2a-analysis-bridge.mjs
+A2A_CODEX_BIN=$TMP/bin/codex-native
+A2A_CODEX_ANALYSIS_CONFIG_DIR=$TMP/codex-dir
+A2A_CODEX_MODEL=gpt-5.6-sol
+A2A_CODEX_REASONING_EFFORT=xhigh
+BROKER_URL=http://127.0.0.1:18790
+WORKER_MODE=persistent
+WORKER_METADATA_JSON={"runtime":"codex","harness":"codex","adapter":"codex-a2a-analysis-bridge","nodeId":"mobile-native"}
 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
 DISABLE_GROWTHBOOK=1
 USE_BUILTIN_RIPGREP=0
@@ -129,6 +153,17 @@ patch_good="$TMP/patch-good.env"
 write_patch_env "$patch_good"
 out="$(bash "$TOOL" check --env-file "$patch_good" 2>&1)"; rc=$?
 ok "patch bridge + single-shot passes" '[ "$rc" = 0 ] && grep -q "safe to launch" <<<"$out" && grep -q "adapter=claude-a2a-patch-bridge" <<<"$out"'
+
+codex_good="$TMP/codex-good.env"
+write_codex_env "$codex_good"
+out="$(bash "$TOOL" check --env-file "$codex_good" 2>&1)"; rc=$?
+ok "Codex analysis bridge passes with Codex runtime metadata" '[ "$rc" = 0 ] && grep -q "safe to launch" <<<"$out" && grep -q "runtime=codex,harness=codex,adapter=codex-a2a-analysis-bridge" <<<"$out"'
+
+codex_missing_bin="$TMP/codex-missing-bin.env"
+write_codex_env "$codex_missing_bin"
+sed -i '/^A2A_CODEX_BIN=/d' "$codex_missing_bin"
+out="$(bash "$TOOL" check --env-file "$codex_missing_bin" 2>&1)"; rc=$?
+ok "Codex bridge without A2A_CODEX_BIN fails closed" '[ "$rc" = 2 ] && grep -q "A2A_CODEX_BIN" <<<"$out"'
 
 # single-shot opt-in requires the patch bridge, not the analysis bridge.
 patch_on_analysis="$TMP/patch-on-analysis.env"

@@ -18,11 +18,10 @@ import sys
 from urllib.parse import urlparse
 
 KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-REQUIRED_KEYS = (
+COMMON_REQUIRED_KEYS = (
     "A2A_TERMUX_NATIVE",
     "A2A_NATIVE_NODE_BIN",
     "A2A_WORKER_ROOT",
-    "A2A_CLAUDE_CODE_BIN",
     "OPENCLAW_BIN",
     "A2A_OPENCLAW_ANALYSIS_BIN",
     "BROKER_URL",
@@ -32,23 +31,15 @@ REQUIRED_KEYS = (
     "DISABLE_GROWTHBOOK",
     "USE_BUILTIN_RIPGREP",
 )
-PATH_KEYS = (
+COMMON_PATH_KEYS = (
     "A2A_NATIVE_NODE_BIN",
-    "A2A_CLAUDE_CODE_BIN",
     "OPENCLAW_BIN",
     "A2A_OPENCLAW_ANALYSIS_BIN",
 )
 # These are exec()'d directly (the native Node wrapper and the Claude CLI
 # wrapper), so they must be executable — caught at check time, not at exec time.
 # The bridges are .mjs files passed to Node, so they only need to exist.
-EXEC_KEYS = (
-    "A2A_NATIVE_NODE_BIN",
-    "A2A_CLAUDE_CODE_BIN",
-)
-REQUIRED_METADATA = {
-    "runtime": "claude-code",
-    "harness": "claude",
-}
+EXEC_KEYS = ("A2A_NATIVE_NODE_BIN",)
 # Intent-aware drop-in bridges accepted for OPENCLAW_BIN. The patch bridge
 # (a2a-nexus #1021, claude-a2a-patch-bridge.mjs) behaves IDENTICALLY to the
 # analysis bridge for analysis-intent tasks and adds a deterministic
@@ -56,12 +47,19 @@ REQUIRED_METADATA = {
 # and OPENCLAW_BIN/A2A_OPENCLAW_ANALYSIS_BIN env var, so it is a safe superset.
 ANALYSIS_BRIDGE = "claude-a2a-analysis-bridge.mjs"
 PATCH_BRIDGE = "claude-a2a-patch-bridge.mjs"
-ALLOWED_BRIDGES = (ANALYSIS_BRIDGE, PATCH_BRIDGE)
+CODEX_BRIDGE = "codex-a2a-analysis-bridge.mjs"
+ALLOWED_BRIDGES = (ANALYSIS_BRIDGE, PATCH_BRIDGE, CODEX_BRIDGE)
 # The adapter id the worker must register, keyed by the wired bridge file, so
 # WORKER_METADATA_JSON stays honest about which bridge is actually spawned.
 BRIDGE_ADAPTER = {
     ANALYSIS_BRIDGE: "claude-a2a-analysis-bridge",
     PATCH_BRIDGE: "claude-a2a-patch-bridge",
+    CODEX_BRIDGE: "codex-a2a-analysis-bridge",
+}
+BRIDGE_METADATA = {
+    ANALYSIS_BRIDGE: {"runtime": "claude-code", "harness": "claude"},
+    PATCH_BRIDGE: {"runtime": "claude-code", "harness": "claude"},
+    CODEX_BRIDGE: {"runtime": "codex", "harness": "codex"},
 }
 # The versioned external handler worker.js spawns per task; its documented
 # contract is "stdin A2A task JSON -> stdout WorkerHandlerOutcome JSON". Newer
@@ -121,8 +119,8 @@ def parse_env_file(path: Path) -> dict[str, str]:
     return env
 
 
-def require_keys(env: dict[str, str]) -> None:
-    missing = [key for key in REQUIRED_KEYS if not env.get(key)]
+def require_keys(env: dict[str, str], keys: tuple[str, ...] = COMMON_REQUIRED_KEYS) -> None:
+    missing = [key for key in keys if not env.get(key)]
     if missing:
         raise ConfigError("missing required env key(s): " + ", ".join(missing))
 
@@ -164,14 +162,16 @@ def validate_broker_url(value: str) -> None:
         raise ConfigError("BROKER_URL must use local tunnel port 18790")
 
 
-def validate_metadata(value: str, expected_adapter: str) -> dict[str, object]:
+def validate_metadata(
+    value: str, expected_adapter: str, required_metadata: dict[str, str]
+) -> dict[str, object]:
     try:
         metadata = json.loads(value)
     except json.JSONDecodeError as exc:
         raise ConfigError(f"WORKER_METADATA_JSON is invalid JSON: {exc}") from exc
     if not isinstance(metadata, dict):
         raise ConfigError("WORKER_METADATA_JSON must be a JSON object")
-    for key, expected in REQUIRED_METADATA.items():
+    for key, expected in required_metadata.items():
         if metadata.get(key) != expected:
             raise ConfigError(f"WORKER_METADATA_JSON must set {key}={expected!r}")
     if metadata.get("adapter") != expected_adapter:
@@ -232,7 +232,7 @@ def validate_env(env: dict[str, str]) -> tuple[Path, list[str], dict[str, object
         )
 
     checked_paths: dict[str, Path] = {}
-    for key in PATH_KEYS:
+    for key in COMMON_PATH_KEYS:
         # Reject forbidden OpenClaw context targets first (regardless of mode/bits),
         # then assert existence and — for the exec'd wrappers — executability.
         check_forbidden_context(Path(env[key]).expanduser(), key)
@@ -248,6 +248,30 @@ def validate_env(env: dict[str, str]) -> tuple[Path, list[str], dict[str, object
             "OpenClaw bridge must be one of: " + ", ".join(ALLOWED_BRIDGES)
         )
 
+    if openclaw.name == CODEX_BRIDGE:
+        require_keys(
+            env,
+            (
+                "A2A_CODEX_BIN",
+                "A2A_CODEX_ANALYSIS_CONFIG_DIR",
+                "A2A_CODEX_MODEL",
+                "A2A_CODEX_REASONING_EFFORT",
+            ),
+        )
+        check_forbidden_context(Path(env["A2A_CODEX_BIN"]).expanduser(), "A2A_CODEX_BIN")
+        executable_file("A2A_CODEX_BIN", env["A2A_CODEX_BIN"])
+        config_dir = existing_dir(
+            "A2A_CODEX_ANALYSIS_CONFIG_DIR", env["A2A_CODEX_ANALYSIS_CONFIG_DIR"]
+        )
+        check_forbidden_context(config_dir, "A2A_CODEX_ANALYSIS_CONFIG_DIR")
+        existing_file("Codex auth.json", str(config_dir / "auth.json"))
+    else:
+        require_keys(env, ("A2A_CLAUDE_CODE_BIN",))
+        check_forbidden_context(
+            Path(env["A2A_CLAUDE_CODE_BIN"]).expanduser(), "A2A_CLAUDE_CODE_BIN"
+        )
+        executable_file("A2A_CLAUDE_CODE_BIN", env["A2A_CLAUDE_CODE_BIN"])
+
     patch_mode = env.get("A2A_CLAUDE_CODE_PATCH_MODE", "").strip().lower()
     if patch_mode:
         if patch_mode not in PATCH_MODE_VALUES:
@@ -260,7 +284,11 @@ def validate_env(env: dict[str, str]) -> tuple[Path, list[str], dict[str, object
             )
 
     validate_broker_url(env["BROKER_URL"])
-    metadata = validate_metadata(env["WORKER_METADATA_JSON"], BRIDGE_ADAPTER[openclaw.name])
+    metadata = validate_metadata(
+        env["WORKER_METADATA_JSON"],
+        BRIDGE_ADAPTER[openclaw.name],
+        BRIDGE_METADATA[openclaw.name],
+    )
 
     # The versioned external handler must exist so worker.js runs the real bridge
     # rather than its silent "echo" builtin. Fail closed here (at check time)
