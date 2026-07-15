@@ -251,12 +251,15 @@ class Config(BaseSettings):
         alias="CCC_BRIDGE_BASH_POLICY",
         description="Bash approval UX: auto-approve, approve-each, or disabled.",
     )
-    telegram_session_scope: Literal["per-user-chat", "shared-groups"] = Field(
+    telegram_session_scope: Literal[
+        "per-user-chat", "shared-groups", "shared-all"
+    ] = Field(
         default="per-user-chat",
         alias="CCC_TELEGRAM_SESSION_SCOPE",
         description=(
             "Telegram session boundary. per-user-chat isolates every sender/chat; "
-            "shared-groups keeps DMs isolated but shares each group among allowlisted senders."
+            "shared-groups keeps DMs isolated but shares each group among allowlisted "
+            "senders; shared-all routes every allowed DM and group to one conversation."
         ),
     )
     bridge_memory_mode: Literal["off", "curated"] = Field(

@@ -36,9 +36,34 @@ def test_shared_groups_keep_dms_and_groups_isolated() -> None:
     assert stream_key("shared-groups", 7, -200) == (0, -200)
 
 
+def test_shared_all_routes_every_dm_and_group_to_one_conversation() -> None:
+    assert storage_key("shared-all", 7, 7) == "0:0"
+    assert storage_key("shared-all", 8, 8) == "0:0"
+    assert storage_key("shared-all", 7, -100) == "0:0"
+    assert storage_key("shared-all", 8, -200) == "0:0"
+    assert stream_key("shared-all", 7, 7) == (0, 0)
+    assert stream_key("shared-all", 8, 8) == (0, 0)
+    assert stream_key("shared-all", 7, -100) == (0, 0)
+    assert stream_key("shared-all", 8, -200) == (0, 0)
+
+    bot = TelegramBot.__new__(TelegramBot)
+    bot._config = SimpleNamespace(telegram_session_scope="shared-all")
+    assert bot._conversation_key(7, 7) == "0:0"
+    assert bot._conversation_key(8, -200) == "0:0"
+
+
 def test_shared_group_migration_prefers_same_sender_same_group() -> None:
     assert legacy_storage_keys("shared-groups", 7, -100) == ("7:-100", 7)
     assert legacy_storage_keys("per-user-chat", 7, -100) == (7,)
+
+
+def test_shared_all_migration_prefers_current_chat_then_sender_dm() -> None:
+    assert legacy_storage_keys("shared-all", 7, -100) == (
+        "0:-100",
+        "7:-100",
+        7,
+    )
+    assert legacy_storage_keys("shared-all", 7, 7) == (7,)
 
 
 def _settings(tmp_path: Path, mode: str):
@@ -95,7 +120,7 @@ class _FakeSDKClient:
         return None
 
 
-def _handler_settings(tmp_path: Path):
+def _handler_settings(tmp_path: Path, scope: str = "shared-groups"):
     return SimpleNamespace(
         project_root=tmp_path,
         execution_profile="disabled",
@@ -107,7 +132,7 @@ def _handler_settings(tmp_path: Path):
         enable_partial_streaming=False,
         bot_data_dir=None,
         task_ledger_path=None,
-        telegram_session_scope="shared-groups",
+        telegram_session_scope=scope,
         image_context_guard=True,
         bridge_memory_mode="curated",
         claude_settings_path=tmp_path / ".claude" / "settings.json",
@@ -131,6 +156,17 @@ def test_project_chat_shares_group_stream_and_lock_keys(tmp_path: Path) -> None:
     assert handler._get_conversation_lock(1, -100) is handler._get_conversation_lock(
         2, -100
     )
+
+
+def test_project_chat_shares_all_stream_and_lock_keys(tmp_path: Path) -> None:
+    handler = project_chat.ProjectChatHandler(
+        settings=_handler_settings(tmp_path, "shared-all"),
+        sdk_client_factory=_FakeSDKClient,
+    )
+    routes = [(1, 1), (2, 2), (1, -100), (2, -200)]
+    assert {handler._stream_key(user, chat) for user, chat in routes} == {(0, 0)}
+    locks = [handler._get_conversation_lock(user, chat) for user, chat in routes]
+    assert all(lock is locks[0] for lock in locks[1:])
 
 
 def test_first_sender_deterministically_seeds_shared_group_session() -> None:
@@ -173,6 +209,53 @@ def test_first_sender_deterministically_seeds_shared_group_session() -> None:
         persisted = await manager.get_session("0:-100")
         await bot._seed_scoped_session_from_legacy("0:-100", 2, -100, persisted)
         assert manager.sessions["0:-100"]["session_id"] == "sender-one"
+
+    asyncio.run(exercise())
+
+
+def test_first_request_deterministically_seeds_shared_all_session() -> None:
+    class Manager:
+        def __init__(self):
+            self.sessions = {
+                "0:0": {"provider": "claude", "reply_mode": "text"},
+                "0:-100": {
+                    "provider": "claude",
+                    "reply_mode": "text",
+                    "session_id": "first-group",
+                    "model": "opus",
+                },
+                2: {
+                    "provider": "claude",
+                    "reply_mode": "text",
+                    "session_id": "second-dm",
+                },
+            }
+
+        async def get_session(self, key):
+            return dict(self.sessions.get(key, {"provider": "claude", "reply_mode": "text"}))
+
+        async def patch_session(self, key, *, updates):
+            self.sessions.setdefault(key, {}).update(updates)
+
+    async def exercise():
+        manager = Manager()
+        bot = TelegramBot.__new__(TelegramBot)
+        bot._config = SimpleNamespace(telegram_session_scope="shared-all")
+        bot._session_manager = manager
+        bot._runtime_active_sessions = {"0:-100", 2}
+
+        shared = await manager.get_session("0:0")
+        await bot._seed_scoped_session_from_legacy("0:0", 1, -100, shared)
+        assert manager.sessions["0:0"]["session_id"] == "first-group"
+        assert manager.sessions["0:0"]["model"] == "opus"
+        assert "0:0" in bot._runtime_active_sessions
+
+        # Even a caller holding a stale default snapshot must re-read under the
+        # migration lock and cannot replace the first seed.
+        stale_default = {"provider": "claude", "reply_mode": "text"}
+        await bot._seed_scoped_session_from_legacy("0:0", 2, 2, stale_default)
+        assert manager.sessions["0:0"]["session_id"] == "first-group"
+        assert stale_default["session_id"] == "first-group"
 
     asyncio.run(exercise())
 
