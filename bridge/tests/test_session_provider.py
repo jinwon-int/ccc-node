@@ -14,6 +14,7 @@ from telegram import Bot, Update
 from telegram.ext import MessageHandler
 
 from telegram_bot.core.project_chat_types import ChatResponse
+from telegram_bot.core.usage import UsageSnapshot, UsageWindow
 from telegram_bot.core.agent_runtime import (
     ModelInfo,
     SessionHistory,
@@ -686,6 +687,73 @@ def test_effort_command_handler_is_registered(tmp_path: Path) -> None:
     assert "effort" in commands
 
 
+def test_usage_command_handler_is_registered(tmp_path: Path) -> None:
+    bot = bare_bot(make_manager(tmp_path, "claude"), provider="claude")
+    bot.application = SimpleNamespace(add_handler=Mock())
+
+    bot._setup_handlers()
+
+    handlers = [call.args[0] for call in bot.application.add_handler.call_args_list]
+    commands = {
+        command
+        for handler in handlers
+        for command in getattr(handler, "commands", frozenset())
+    }
+    assert "usage" in commands
+
+
+@pytest.mark.anyio
+async def test_usage_command_is_access_controlled_and_never_starts_turn(tmp_path: Path) -> None:
+    manager = make_manager(tmp_path, "codex")
+    await manager.store.set(
+        "7:9", {"provider": "codex", "session_id": "thread-9"}
+    )
+    project_chat = SimpleNamespace(
+        get_usage=AsyncMock(
+            return_value=UsageSnapshot(
+                provider="codex",
+                plan_type="plus",
+                windows=(UsageWindow("five hour", 25),),
+            )
+        ),
+        process_message=AsyncMock(),
+    )
+    bot = bare_bot(manager, provider="codex", project_chat=project_chat)
+    update = make_update(text="/usage")
+
+    await bot._cmd_usage(update, SimpleNamespace(args=[]))
+
+    project_chat.get_usage.assert_awaited_once_with(7, 9, "thread-9")
+    project_chat.process_message.assert_not_awaited()
+    assert "Usage · Codex" in update.message.replies[0][0]
+
+    denied = make_update(text="/usage")
+    bot._check_access = AsyncMock(return_value=False)
+    await bot._cmd_usage(denied, SimpleNamespace(args=[]))
+    assert denied.message.replies == []
+    assert project_chat.get_usage.await_count == 1
+
+
+@pytest.mark.anyio
+async def test_usage_command_hides_provider_errors_and_wrong_provider_session(
+    tmp_path: Path,
+) -> None:
+    manager = make_manager(tmp_path, "claude")
+    await manager.store.set(
+        "7:9", {"provider": "codex", "session_id": "must-not-cross-provider"}
+    )
+    project_chat = SimpleNamespace(get_usage=AsyncMock(side_effect=TimeoutError("secret")))
+    bot = bare_bot(manager, provider="claude", project_chat=project_chat)
+    update = make_update(text="/usage")
+
+    await bot._cmd_usage(update, SimpleNamespace(args=[]))
+
+    project_chat.get_usage.assert_awaited_once_with(7, 9, None)
+    reply = update.message.replies[0][0]
+    assert "unavailable" in reply
+    assert "secret" not in reply
+
+
 def _telegram_document_update(*, mime_type: str, file_name: str) -> Update:
     return Update.de_json(
         {
@@ -740,6 +808,19 @@ async def test_effort_command_is_published_in_bot_menu(tmp_path: Path) -> None:
     assert set_my_commands.await_count == 3
     for call in set_my_commands.await_args_list:
         assert "effort" in {command.command for command in call.args[0]}
+
+
+@pytest.mark.anyio
+async def test_usage_command_is_published_in_bot_menu(tmp_path: Path) -> None:
+    bot = bare_bot(make_manager(tmp_path, "claude"), provider="claude")
+    set_my_commands = AsyncMock()
+    bot.application = SimpleNamespace(bot=SimpleNamespace(set_my_commands=set_my_commands))
+
+    await bot._set_bot_commands()
+
+    assert set_my_commands.await_count == 3
+    for call in set_my_commands.await_args_list:
+        assert "usage" in {command.command for command in call.args[0]}
 
 
 @pytest.mark.anyio

@@ -159,6 +159,7 @@ fi
 say "== guard.py (python enforcement) =="
 if command -v python3 >/dev/null 2>&1; then
   if python3 -m py_compile claude/hooks/guard.py 2>/dev/null; then say "  ok claude/hooks/guard.py compiles"; else err "py_compile: claude/hooks/guard.py"; fi
+  if python3 -m py_compile claude/hooks/statusline-usage.py 2>/dev/null; then say "  ok claude/hooks/statusline-usage.py compiles"; else err "py_compile: claude/hooks/statusline-usage.py"; fi
 else
   say "  (python3 absent — skipped)"
 fi
@@ -275,10 +276,13 @@ fi
 # 7) Tier 3: statusline smoke + settings wiring
 say "== statusline + settings wiring =="
 if [ -f claude/hooks/statusline.sh ]; then
-  SAMPLE='{"model":{"display_name":"T"},"context_window":{"used_percentage":42.5},"cost":{"total_cost_usd":1.2},"exceeds_200k_tokens":true,"output_style":{"name":"ccc-report"},"workspace":{"current_dir":"'"$ROOT"'"}}'
-  if out="$(printf '%s' "$SAMPLE" | CCC_NODE=ci bash claude/hooks/statusline.sh 2>/dev/null)" && [ -n "$out" ]; then
+  SAMPLE='{"session_id":"validate-session","model":{"display_name":"T"},"context_window":{"used_percentage":42.5,"total_input_tokens":850,"context_window_size":200000},"cost":{"total_cost_usd":1.2},"rate_limits":{"five_hour":{"used_percentage":12,"resets_at":2000000000}},"exceeds_200k_tokens":true,"output_style":{"name":"ccc-report"},"workspace":{"current_dir":"'"$ROOT"'"}}'
+  if out="$(printf '%s' "$SAMPLE" | CCC_NODE=ci CCC_STATE_DIR="$TMP/status-state" CCC_STATUSLINE_USAGE_COLLECTOR="$ROOT/claude/hooks/statusline-usage.py" bash claude/hooks/statusline.sh 2>/dev/null)" && [ -n "$out" ]; then
     say "  ok statusline.sh emits output"
   else err "statusline.sh produced no output / non-zero"; fi
+  if find "$TMP/status-state/usage" -type f -name '*.json' -perm 0600 2>/dev/null | grep -q .; then
+    say "  ok statusline usage collector writes owner-only snapshot"
+  else err "statusline usage collector did not write owner-only snapshot"; fi
   # empty input must not crash (fail-open to a usable bar)
   printf '%s' '' | CCC_NODE=ci bash claude/hooks/statusline.sh >/dev/null 2>&1 \
     && say "  ok statusline.sh survives empty input" || err "statusline.sh crashed on empty input"

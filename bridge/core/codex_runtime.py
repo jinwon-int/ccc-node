@@ -11,6 +11,7 @@ import logging
 import math
 import os
 import signal
+import time
 from typing import Literal, Protocol, cast
 
 from .agent_runtime import (
@@ -42,6 +43,14 @@ from .codex_app_server import (
     CodexThreadListPage,
     JsonValue,
     ServerRequestHandler,
+)
+from .usage import (
+    SNAPSHOT_TTL_SECONDS,
+    UsageSnapshot,
+    merge_usage,
+    parse_codex_account_usage,
+    parse_codex_rate_limits,
+    parse_codex_thread_usage,
 )
 from telegram_bot.memory.distill_types import (
     CodexTranscriptSnapshot,
@@ -146,6 +155,10 @@ class AppServerClient(Protocol):
     async def turn_interrupt(self, thread_id: str, turn_id: str) -> JsonValue: ...
 
     async def list_models(self, *, include_hidden: bool = False) -> JsonValue: ...
+
+    async def account_rate_limits(self) -> JsonValue: ...
+
+    async def account_usage(self) -> JsonValue: ...
 
     async def thread_list(
         self, *, limit: int = 20, cursor: str | None = None
@@ -304,6 +317,8 @@ class CodexRuntime:
         self._dispatcher_task: asyncio.Task[None] | None = None
         self._active_turns: dict[str, _ActiveTurn] = {}
         self._thread_locks: dict[str, asyncio.Lock] = {}
+        self._thread_usage: dict[str, UsageSnapshot] = {}
+        self._account_rate_limits = UsageSnapshot(provider="codex")
         self._closed = False
 
     async def _bootstrap_memory(self) -> None:
@@ -389,6 +404,42 @@ class CodexRuntime:
                 )
             )
         return tuple(models)
+
+    async def get_usage(self, thread_id: str | None) -> UsageSnapshot:
+        """Read account usage and merge exact-thread notifications, without a turn."""
+
+        await self._ensure_started()
+
+        async def safely(call, parser) -> UsageSnapshot:
+            try:
+                value = await asyncio.wait_for(call(), timeout=5.0)
+            except Exception:
+                return UsageSnapshot(provider="codex")
+            return parser(value)
+
+        rate_limits, account = await asyncio.gather(
+            safely(self._client.account_rate_limits, parse_codex_rate_limits),
+            safely(self._client.account_usage, parse_codex_account_usage),
+        )
+        if rate_limits.observed_at is not None:
+            self._account_rate_limits = rate_limits
+        now = time.time()
+        cached_rate_limits = self._account_rate_limits
+        if (
+            cached_rate_limits.observed_at is None
+            or now - cached_rate_limits.observed_at > SNAPSHOT_TTL_SECONDS
+        ):
+            cached_rate_limits = UsageSnapshot(provider="codex")
+        result = merge_usage(cached_rate_limits, account)
+        if thread_id:
+            thread = self._thread_usage.get(thread_id)
+            if (
+                thread is not None
+                and thread.observed_at is not None
+                and now - thread.observed_at <= SNAPSHOT_TTL_SECONDS
+            ):
+                result = merge_usage(result, thread)
+        return result
 
     @property
     def supports_session_browsing(self) -> bool:
@@ -690,8 +741,16 @@ class CodexRuntime:
 
     def _route_notification(self, notification: CodexNotification) -> None:
         params = notification.params
+        if notification.method == "account/rateLimits/updated":
+            update = parse_codex_rate_limits(params)
+            self._account_rate_limits = merge_usage(self._account_rate_limits, update)
+            return
         thread_id = params.get("threadId")
         if not isinstance(thread_id, str):
+            return
+        if notification.method == "thread/tokenUsage/updated":
+            self._thread_usage[thread_id] = parse_codex_thread_usage(params)
+            self._thread_usage = dict(tuple(self._thread_usage.items())[-128:])
             return
         active = self._active_turns.get(thread_id)
         if active is None or active.finished:

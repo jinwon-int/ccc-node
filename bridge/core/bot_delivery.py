@@ -667,6 +667,7 @@ class BotDeliveryMixin:
             BotCommand("new", "New session"),
             BotCommand("stop", "Stop execution"),
             BotCommand("model", "Switch model"),
+            BotCommand("usage", "View provider usage"),
             BotCommand("effort", "Set Codex reasoning effort"),
             BotCommand("resume", "Resume session"),
             BotCommand("history", "View message history"),

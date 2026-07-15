@@ -11,6 +11,13 @@ set -uo pipefail
 input="$(cat)"
 j() { printf '%s' "$input" | jq -r "$1" 2>/dev/null; }
 
+# Best-effort, allowlisted usage snapshot for the local Telegram /usage command.
+# The collector emits nothing and status-line rendering must never depend on it.
+USAGE_COLLECTOR="${CCC_STATUSLINE_USAGE_COLLECTOR:-$HOME/.claude/hooks/statusline-usage.py}"
+if [ -x "$USAGE_COLLECTOR" ]; then
+  printf '%s' "$input" | "$USAGE_COLLECTOR" >/dev/null 2>&1 || true
+fi
+
 MODEL="$(j '.model.display_name // "?"')"
 PCT="$(j '.context_window.used_percentage // 0')"; PCT="${PCT%%.*}"; [[ "$PCT" =~ ^[0-9]+$ ]] || PCT=0
 COST="$(j '.cost.total_cost_usd // 0')"

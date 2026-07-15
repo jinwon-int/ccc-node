@@ -44,6 +44,13 @@ from telegram_bot.utils.duration_log import (
     forecast_samples,
     remaining_ms,
 )
+from telegram_bot.core.usage import (
+    SNAPSHOT_TTL_SECONDS,
+    UsageSnapshot,
+    load_claude_status_snapshot,
+    merge_usage,
+    parse_claude_result,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -208,11 +215,55 @@ class ProjectChatHandler(
         # in-flight task, and drained/logged via a done-callback.
         self._teardown_tasks: set["asyncio.Task[Any]"] = set()
         self._conversation_locks: Dict[Tuple[int, int], asyncio.Lock] = {}
+        self._claude_usage: Dict[Tuple[int, int, str], UsageSnapshot] = {}
         logger.info(f"ProjectChatHandler initialized for {self.project_root}")
 
     @staticmethod
     def _stream_key(user_id: int, chat_id: int) -> Tuple[int, int]:
         return (user_id, chat_id)
+
+    def _record_claude_usage(self, req: _PendingRequest, msg: ResultMessage) -> None:
+        session_id = msg.session_id
+        if not isinstance(session_id, str) or not session_id:
+            return
+        key = (req.user_id, req.chat_id, session_id)
+        self._claude_usage[key] = parse_claude_result(msg, observed_at=self._clock.time())
+        self._claude_usage = dict(tuple(self._claude_usage.items())[-128:])
+
+    async def get_usage(
+        self, user_id: int, chat_id: int, session_id: str | None
+    ) -> UsageSnapshot:
+        """Return provider usage already observed for this exact conversation."""
+
+        if self._agent_runtime is not None:
+            runtime = self._require_runtime()
+            get_usage = getattr(runtime, "get_usage", None)
+            if get_usage is None:
+                return UsageSnapshot(provider="codex")
+            return await asyncio.wait_for(get_usage(session_id), timeout=7.0)
+
+        result = UsageSnapshot(provider="claude")
+        if not session_id:
+            return result
+        cached = self._claude_usage.get((user_id, chat_id, session_id))
+        now = self._clock.time()
+        if (
+            cached is not None
+            and cached.observed_at is not None
+            and now - cached.observed_at <= SNAPSHOT_TTL_SECONDS
+        ):
+            result = merge_usage(result, cached)
+        state_root = Path(
+            os.environ.get(
+                "CCC_STATE_DIR", str(Path(self._config.claude_settings_path).parent / "state")
+            )
+        )
+        status = load_claude_status_snapshot(
+            state_root / "usage", session_id, now=now
+        )
+        if status is not None:
+            result = merge_usage(result, status)
+        return result
 
     def _get_stream_init_lock(self, user_id: int, chat_id: int) -> asyncio.Lock:
         key = self._stream_key(user_id, chat_id)
