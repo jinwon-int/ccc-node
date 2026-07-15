@@ -269,6 +269,7 @@ run cp "$SRC/claude/hooks/distill/extract.sh" "$CLAUDE_DIR/hooks/distill/extract
 run cp "$SRC/claude/hooks/distill/honcho-push.sh" "$CLAUDE_DIR/hooks/distill/honcho-push.sh"
 run cp "$SRC/claude/hooks/distill/wiki-queue.sh" "$CLAUDE_DIR/hooks/distill/wiki-queue.sh"
 run cp "$SRC/claude/hooks/distill/queue-drain.sh" "$CLAUDE_DIR/hooks/distill/queue-drain.sh"
+run cp "$SRC/claude/hooks/distill/pending-drain.sh" "$CLAUDE_DIR/hooks/distill/pending-drain.sh"
 run cp "$SRC/claude/hooks/distill/local-facts.sh" "$CLAUDE_DIR/hooks/distill/local-facts.sh"
 run cp "$SRC/claude/hooks/distill/resume-write.sh" "$CLAUDE_DIR/hooks/distill/resume-write.sh"
 # Skill Review — Hermes-style background skill draft staging (human-approved).
@@ -313,6 +314,7 @@ installed_hook_scripts=(
   "$CLAUDE_DIR/hooks/distill/honcho-push.sh"
   "$CLAUDE_DIR/hooks/distill/wiki-queue.sh"
   "$CLAUDE_DIR/hooks/distill/queue-drain.sh"
+  "$CLAUDE_DIR/hooks/distill/pending-drain.sh"
   "$CLAUDE_DIR/hooks/distill/local-facts.sh"
   "$CLAUDE_DIR/hooks/distill/resume-write.sh"
   "$CLAUDE_DIR/hooks/skill-review.sh"
