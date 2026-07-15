@@ -85,11 +85,19 @@ class _PendingRequest:
     last_assistant_texts: List[str] = field(default_factory=list)
     synthetic_response: Optional[str] = None
     streaming_handler: Optional[Any] = None  # StreamingMessageHandler instance
-    # Set once any partial StreamEvent text delta has driven the live draft, so
-    # the complete AssistantMessage that follows is NOT re-fed to the streaming
-    # handler (which would double the text). Stays False when partial streaming
-    # is off / no deltas arrive, preserving the whole-block fallback path.
+    interim_message_callback: Optional[InterimMessageCallback] = None
+    # Claude emits one complete AssistantMessage per semantic message. Keep the
+    # newest one pending until a later text/tool frame proves it is interim;
+    # terminal text stays on the normal final-response path.
+    pending_completed_message: Optional[str] = None
+    retained_response_parts: List[str] = field(default_factory=list)
+    delivered_interim_parts: List[str] = field(default_factory=list)
+    interim_delivered: bool = False
+    # Historical request-wide flag retained for compatibility/observability.
     streamed_via_partials: bool = False
+    # Per-semantic-message form of the flag. Reset at each AssistantMessage so
+    # a later message without partials can still use whole-block fallback.
+    current_message_streamed_via_partials: bool = False
 
 
 @dataclass

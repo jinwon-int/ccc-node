@@ -160,6 +160,7 @@ class ProjectChatProcessMixin:
             future=future,
             status_callback=status_callback,
             streaming_handler=streaming_handler,
+            interim_message_callback=interim_message_callback,
         )
         request.started_at = loop.time()
         request.task_id = self._ledger_create(user_id, chat_id)
@@ -282,6 +283,7 @@ class ProjectChatProcessMixin:
                         future=retry_future,
                         status_callback=status_callback,
                         streaming_handler=retry_handler,
+                        interim_message_callback=interim_message_callback,
                     )
                     retry_request.started_at = loop.time()
                     retry_request.task_id = self._ledger_create(user_id, chat_id)
