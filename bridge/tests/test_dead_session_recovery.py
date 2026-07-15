@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -273,9 +274,9 @@ class TranscriptQuarantineTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         self.tmp.cleanup()
 
-    async def _recover(self):
+    async def _recover(self, **kwargs):
         return await recover_dead_session_notifications(
-            self.bot, self.sessions, self.handler, self.root
+            self.bot, self.sessions, self.handler, self.root, **kwargs
         )
 
     def _counting_scan(self):
@@ -410,13 +411,147 @@ class TranscriptQuarantineTests(unittest.IsolatedAsyncioTestCase):
         text = self.bot.send_message.await_args.kwargs["text"]
         self.assertIn("conversation root unavailable", text)
 
+    def _churn_identity(self, tick):
+        # Rewrite the transcript with a different byte length so the file's
+        # lstat identity (size, mtime) changes every tick — the identity gate
+        # would NOT block, isolating the hard-quarantine bound (#423).
+        self.path.write_text(
+            _queue("enqueue", session_id="foreign", content=self.CANARY + "x" * tick),
+            encoding="utf-8",
+        )
+
+    async def test_consecutive_rejects_hard_quarantine_stops_reparsing(self):
+        """#423 (a): after N content-deterministic rejects with churning file
+        identity, hard-quarantine and stop re-parsing entirely."""
+        calls = self._counting_scan()
+        max_rejects = 3
+
+        with self.assertLogs(
+            "telegram_bot.core.dead_session_recovery", level="WARNING"
+        ) as logs:
+            for tick in range(max_rejects):
+                self._churn_identity(tick)
+                stats = await self._recover(max_rejects=max_rejects)
+                record = self.sessions.sessions["7:70"][QUARANTINE_KEY]
+                if tick < max_rejects - 1:
+                    # Soft quarantine: parsed (identity drifted, gate open),
+                    # counted as a quarantine EVENT each tick, but not yet hard.
+                    self.assertEqual(stats.rejected, 1)
+                    self.assertEqual(stats.quarantined, 1)
+                    self.assertEqual(stats.hard_quarantined, 0)
+                    self.assertFalse(record["hard"])
+                    self.assertEqual(record["reject_count"], tick + 1)
+                else:
+                    # Tick N: crosses the bound -> hard, give-up counted once.
+                    self.assertEqual(stats.rejected, 1)
+                    self.assertEqual(stats.quarantined, 1)
+                    self.assertEqual(stats.hard_quarantined, 1)
+                    self.assertTrue(record["hard"])
+                    self.assertGreaterEqual(record["reject_count"], max_rejects)
+
+            # Parsing happened up to N (one per soft/hard-transition tick).
+            self.assertEqual(len(calls), max_rejects)
+            hard_await_count = self.bot.send_message.await_count
+
+            # Subsequent ticks: hard block regardless of identity drift. No
+            # re-parse, no re-notify, counted only as quarantine_skipped.
+            for tick in range(max_rejects, max_rejects + 3):
+                self._churn_identity(tick)
+                stats = await self._recover(max_rejects=max_rejects)
+                self.assertEqual(stats.quarantine_skipped, 1)
+                self.assertEqual(stats.rejected, 0)
+                self.assertEqual(stats.quarantined, 0)
+                self.assertEqual(stats.hard_quarantined, 0)
+                self.assertEqual(len(calls), max_rejects)  # no re-parse
+
+        # No further owner notice after the conversation went hard.
+        self.assertEqual(self.bot.send_message.await_count, hard_await_count)
+        # Exactly one hard-quarantine summary WARNING line.
+        summary_lines = [
+            line for line in logs.output if "hard-quarantined after" in line
+        ]
+        self.assertEqual(len(summary_lines), 1)
+        # Reason code only — never transcript content.
+        self.assertIn("queue row session id does not match owner", summary_lines[0])
+        self.assertNotIn(self.CANARY, summary_lines[0])
+
+    async def test_transient_failure_does_not_advance_reject_counter(self):
+        """#423 (b): a non-TranscriptRejected failure (here get_session raising)
+        must never climb the counter toward a hard quarantine."""
+
+        class _FlakyManager(_SessionManager):
+            async def get_session(self, key):
+                raise RuntimeError("momentary FS error")
+
+        flaky = _FlakyManager(self.sessions.sessions)
+        for _ in range(5):
+            stats = await recover_dead_session_notifications(
+                self.bot, flaky, self.handler, self.root, max_rejects=1
+            )
+            # Folds into rejected (transient), never quarantines.
+            self.assertEqual(stats.rejected, 1)
+            self.assertEqual(stats.quarantined, 0)
+            self.assertEqual(stats.hard_quarantined, 0)
+
+        # No quarantine record was ever written; nothing hard-quarantined.
+        self.assertNotIn(QUARANTINE_KEY, self.sessions.sessions["7:70"])
+        self.bot.send_message.assert_not_awaited()
+
+    async def test_send_failure_does_not_advance_reject_counter(self):
+        """#423 (b, variant): a scan-delivery send failure (stats.failed) on a
+        valid transcript must not advance the reject counter."""
+        # Valid, parseable transcript with one terminal notification.
+        self.path.write_text(_queue("enqueue", content=_task()), encoding="utf-8")
+        self.bot.send_message.side_effect = RuntimeError("network")
+
+        for _ in range(5):
+            stats = await recover_dead_session_notifications(
+                self.bot, self.sessions, self.handler, self.root, max_rejects=1
+            )
+            self.assertEqual(stats.failed, 1)
+            self.assertEqual(stats.rejected, 0)
+            self.assertEqual(stats.quarantined, 0)
+            self.assertEqual(stats.hard_quarantined, 0)
+
+        # A send failure is transient: no quarantine record is written.
+        self.assertNotIn(QUARANTINE_KEY, self.sessions.sessions["7:70"])
+
+    async def test_hard_quarantine_persists_across_restart(self):
+        """#423 (c): a hard quarantine survives a restart and keeps blocking."""
+        max_rejects = 2
+        for tick in range(max_rejects):
+            self._churn_identity(tick)
+            await self._recover(max_rejects=max_rejects)
+        record = self.sessions.sessions["7:70"][QUARANTINE_KEY]
+        self.assertTrue(record["hard"])
+        self.assertGreaterEqual(record["reject_count"], max_rejects)
+
+        calls = self._counting_scan()
+        # Fresh manager over the same persisted store simulates a restart.
+        restarted = _SessionManager(self.sessions.sessions)
+        # Churn identity again to prove the block is identity-independent.
+        self._churn_identity(max_rejects + 1)
+        stats = await recover_dead_session_notifications(
+            self.bot, restarted, self.handler, self.root, max_rejects=max_rejects
+        )
+
+        self.assertEqual(stats.quarantine_skipped, 1)
+        self.assertEqual(calls, [])  # no re-parse
+        persisted = self.sessions.sessions["7:70"][QUARANTINE_KEY]
+        self.assertTrue(persisted["hard"])
+        self.assertGreaterEqual(persisted["reject_count"], max_rejects)
+
     def test_quarantine_blocks_scan_requires_matching_identity(self):
         record = transcript_quarantine_record(self.session_id, "reason", self.path)
         self.assertTrue(quarantine_blocks_scan(record, self.session_id, self.path))
         self.assertFalse(quarantine_blocks_scan(record, "other-session", self.path))
         self.assertFalse(quarantine_blocks_scan(None, self.session_id, self.path))
         self.assertFalse(quarantine_blocks_scan("corrupt", self.session_id, self.path))
-        os.utime(self.path)  # identity drift re-enables evaluation
+        # Advance mtime by a whole second explicitly: a bare os.utime() sets it
+        # to "now", which on coarse-resolution filesystems can equal the prior
+        # mtime and leave the identity unchanged (flaky on Termux/fast FS).
+        future = time.time() + 1
+        os.utime(self.path, (future, future))  # identity drift re-enables evaluation
         self.assertFalse(quarantine_blocks_scan(record, self.session_id, self.path))
 
     def test_fingerprint_is_stable_and_identity_bound(self):

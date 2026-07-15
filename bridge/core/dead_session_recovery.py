@@ -55,6 +55,7 @@ DEFAULT_MAX_QUEUE_DEPTH = 1_024
 DEFAULT_MAX_SESSIONS = 100
 DEFAULT_MAX_NOTIFICATIONS_PER_CONVERSATION = 3
 DEFAULT_MAX_DELIVERY_ATTEMPTS_PER_SCAN = 10
+DEFAULT_MAX_TRANSCRIPT_REJECTS = 3
 DEFAULT_MARKER_RETENTION = DEFAULT_MAX_QUEUE_DEPTH
 DEFAULT_SEND_TIMEOUT = 15.0
 DEFAULT_LOCK_TIMEOUT = 0.05
@@ -82,6 +83,10 @@ class RecoveryStats:
     skipped_active: int = 0
     skipped_locked: int = 0
     quarantined: int = 0
+    #: Give-up transitions: a conversation reaching the consecutive-reject bound
+    #: and becoming ``hard`` (counted once per transition), separate from
+    #: ``quarantined`` so the every-event health metric stays continuous (#423).
+    hard_quarantined: int = 0
     quarantine_skipped: int = 0
 
 
@@ -97,6 +102,20 @@ def recovery_interval(environ: Optional[Mapping[str, str]] = None) -> float:
     except (TypeError, ValueError):
         return DEFAULT_SCAN_INTERVAL
     return min(max(value, 5.0), 3600.0)
+
+
+def recovery_max_rejects(environ: Optional[Mapping[str, str]] = None) -> int:
+    """Consecutive content-deterministic rejects before a hard quarantine.
+
+    Bounded below at 1 so a single reject can never be configured away; an
+    unparseable value falls back to the built-in default.
+    """
+    env = os.environ if environ is None else environ
+    try:
+        value = int(env.get("CCC_DEAD_SESSION_MAX_REJECTS", DEFAULT_MAX_TRANSCRIPT_REJECTS))
+    except (TypeError, ValueError):
+        return DEFAULT_MAX_TRANSCRIPT_REJECTS
+    return max(value, 1)
 
 
 def parse_conversation_route(value: Any) -> tuple[Any, int, int]:
@@ -339,6 +358,8 @@ def transcript_quarantine_record(
         "reason": reason,
         "quarantined_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "notified": False,
+        "reject_count": 1,
+        "hard": False,
     }
 
 
@@ -427,6 +448,7 @@ async def _quarantine_transcript(
     stats: RecoveryStats,
     can_notify: bool,
     send_timeout: float,
+    max_rejects: int,
 ) -> bool:
     """Quarantine one rejected transcript; True when a send attempt was consumed.
 
@@ -435,6 +457,18 @@ async def _quarantine_transcript(
     identity) is deduplicated silently.  A failed notice leaves
     ``notified=False`` in the persisted record so later ticks retry only the
     cheap send, never the parse.
+
+    A consecutive-reject counter is layered on the record (#423): every reject
+    tick for a conversation that already has a quarantine record increments
+    ``reject_count``.  Once it reaches ``max_rejects`` the record is marked
+    ``hard`` so the pre-scan gate blocks re-parsing regardless of file identity
+    drift, closing the re-parse/re-quarantine churn loop.
+
+    ``stats.quarantined`` keeps its original meaning — every quarantine *event*
+    (a fresh quarantine or a drift re-quarantine; a silent same-fingerprint
+    dedupe is not an event) — so the health metric stays continuous. The
+    give-up transition is surfaced separately as ``stats.hard_quarantined``,
+    counted exactly once when the record first becomes ``hard``.
     """
     stats.rejected += 1
     logger.warning(
@@ -443,19 +477,69 @@ async def _quarantine_transcript(
         reason,
     )
     record = transcript_quarantine_record(session_id, reason, path)
-    if existing is not None and existing.get("fingerprint") == record["fingerprint"]:
-        # Identical rejection already quarantined. Records without a file
-        # identity never take the pre-scan skip, so the pending-notice retry
-        # must stay reachable here as well — send only, never re-quarantine.
-        if existing.get("notified") or not can_notify:
-            return False
-        if await _send_quarantine_notice(bot, chat_id, reason, send_timeout):
-            await _persist_quarantine(
-                session_manager, storage_key, dict(existing, notified=True)
+    if existing is not None:
+        # A quarantine record already exists for this conversation. Increment
+        # the consecutive-reject counter regardless of whether the fingerprint
+        # matches — identity churn keeps producing fresh fingerprints, and
+        # #423 is precisely that churn loop we must bound.
+        reject_count = existing.get("reject_count", 0) + 1
+        record["reject_count"] = reject_count
+        became_hard = reject_count >= max_rejects
+        record["hard"] = became_hard
+        already_hard = bool(existing.get("hard"))
+        if existing.get("fingerprint") == record["fingerprint"]:
+            # Identical rejection already quarantined. Preserve the pending
+            # notice/hard transition on the existing record; records without a
+            # file identity never take the pre-scan skip, so the notice retry
+            # must stay reachable here — send only, never re-parse.
+            updated = dict(
+                existing, reject_count=reject_count, hard=became_hard
             )
-        else:
-            stats.failed += 1
-        return True
+            consumed = False
+            if not existing.get("notified") and can_notify:
+                consumed = True
+                if await _send_quarantine_notice(bot, chat_id, reason, send_timeout):
+                    updated["notified"] = True
+                else:
+                    stats.failed += 1
+            if await _persist_quarantine(session_manager, storage_key, updated):
+                # Same-fingerprint dedupe is not a new quarantine event, so it
+                # does not bump ``quarantined``; only the give-up transition is
+                # surfaced.
+                if became_hard and not already_hard:
+                    stats.hard_quarantined += 1
+                    logger.warning(
+                        "conversation %s hard-quarantined after %d "
+                        "TranscriptRejected: %s",
+                        storage_key,
+                        reject_count,
+                        reason,
+                    )
+            return consumed
+        # Fingerprint drifted (new identity or reason) but the conversation is
+        # still rejecting: carry the incremented counter onto the fresh record.
+        consumed = False
+        if can_notify:
+            consumed = True
+            record["notified"] = await _send_quarantine_notice(
+                bot, chat_id, reason, send_timeout
+            )
+            if not record["notified"]:
+                stats.failed += 1
+        if await _persist_quarantine(session_manager, storage_key, record):
+            stats.quarantined += 1
+            if became_hard and not already_hard:
+                stats.hard_quarantined += 1
+                logger.warning(
+                    "conversation %s hard-quarantined after %d "
+                    "TranscriptRejected: %s",
+                    storage_key,
+                    reject_count,
+                    reason,
+                )
+        return consumed
+    became_hard = record["reject_count"] >= max_rejects
+    record["hard"] = became_hard
     consumed = False
     if can_notify:
         consumed = True
@@ -464,6 +548,14 @@ async def _quarantine_transcript(
             stats.failed += 1
     if await _persist_quarantine(session_manager, storage_key, record):
         stats.quarantined += 1
+        if became_hard:
+            stats.hard_quarantined += 1
+            logger.warning(
+                "conversation %s hard-quarantined after %d TranscriptRejected: %s",
+                storage_key,
+                record["reject_count"],
+                reason,
+            )
     return consumed
 
 
@@ -479,6 +571,7 @@ async def recover_dead_session_notifications(  # noqa: C901 -- #348 baseline hot
     marker_retention: int = DEFAULT_MARKER_RETENTION,
     send_timeout: float = DEFAULT_SEND_TIMEOUT,
     lock_timeout: float = DEFAULT_LOCK_TIMEOUT,
+    max_rejects: int = DEFAULT_MAX_TRANSCRIPT_REJECTS,
 ) -> RecoveryStats:
     """Scan persisted dead sessions once and deliver bounded terminal notices."""
     stats = RecoveryStats()
@@ -535,14 +628,20 @@ async def recover_dead_session_notifications(  # noqa: C901 -- #348 baseline hot
             path: Optional[Path] = None
             try:
                 path = _safe_transcript_path(Path(conversations_dir), session_id)
-                if quarantine is not None and quarantine_blocks_scan(
-                    quarantine, session_id, path
+                blocked_hard = quarantine is not None and quarantine.get("hard") is True
+                if quarantine is not None and (
+                    blocked_hard or quarantine_blocks_scan(quarantine, session_id, path)
                 ):
-                    # Identical rejected transcript: never parse it again. Only
-                    # a pending owner notice is retried, within the send budget.
+                    # Rejected transcript: never parse it again. A hard
+                    # quarantine (#423) blocks regardless of file-identity drift;
+                    # an identity match blocks the unchanged file. Only the
+                    # identity-match path retries a pending owner notice within
+                    # the send budget — a hard quarantine has already notified
+                    # and must never re-notify.
                     stats.quarantine_skipped += 1
                     if (
-                        not quarantine.get("notified")
+                        not blocked_hard
+                        and not quarantine.get("notified")
                         and delivery_attempts < max_delivery_attempts_per_scan
                     ):
                         delivery_attempts += 1
@@ -571,6 +670,7 @@ async def recover_dead_session_notifications(  # noqa: C901 -- #348 baseline hot
                     stats=stats,
                     can_notify=delivery_attempts < max_delivery_attempts_per_scan,
                     send_timeout=send_timeout,
+                    max_rejects=max_rejects,
                 ):
                     delivery_attempts += 1
                 continue

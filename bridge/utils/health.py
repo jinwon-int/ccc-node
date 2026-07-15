@@ -77,6 +77,7 @@ class RuntimeHealthReporter:
             },
             "recovery": {
                 "quarantined_transcripts": 0,
+                "hard_quarantined_transcripts": 0,
             },
             "requests": {
                 "stalled": 0,
@@ -274,6 +275,18 @@ class RuntimeHealthReporter:
             recovery = self._state.setdefault("recovery", {"quarantined_transcripts": 0})
             recovery["quarantined_transcripts"] = int(
                 recovery.get("quarantined_transcripts", 0)
+            ) + max(0, int(count))
+            self._write_health_locked()
+
+    def record_transcript_hard_quarantined(self, count: int = 1) -> None:
+        """Count conversations that hit the consecutive-reject bound and were
+        hard-quarantined (the give-up transition that stops the churn loop; #423).
+        Separate from ``quarantined_transcripts`` so the every-event metric stays
+        continuous."""
+        with self._lock:
+            recovery = self._state.setdefault("recovery", {"quarantined_transcripts": 0})
+            recovery["hard_quarantined_transcripts"] = int(
+                recovery.get("hard_quarantined_transcripts", 0)
             ) + max(0, int(count))
             self._write_health_locked()
 
