@@ -5,6 +5,12 @@ All notable changes to the Claude Code node harness. Dates are KST.
 ## [Unreleased]
 
 ### Changed
+- Family Wiki log-writing guidance now allocates node/date-scoped
+  `LOG-YYYYMMDD-<node>-<seq>` IDs under `[LOG-00]` instead of the collision-prone
+  global `LOG-NNNN` max+1 scheme. The wiki skill, slash command, session
+  cheatsheet, and durable-memory template share the rule, and harness validation
+  rejects regressions to the old allocator. Refs
+  `jinwon-int/seoyoon-family-wiki#2246`.
 - PreToolUse guard rewritten from bash to `guard.py` (#452), invoked through a
   thin `guard.sh` shim so the hook/install contract is unchanged (stdin payload →
   exit 2 to deny). shlex tokenization replaces the hand-rolled bash word-splitting
