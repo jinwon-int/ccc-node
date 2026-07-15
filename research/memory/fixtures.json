@@ -1,0 +1,148 @@
+{
+  "schema": "ccc.autoresearch.memory.v1",
+  "documents": [
+    {
+      "id": "global-pr-first",
+      "owner_id": "operator",
+      "conversation_scope": "global",
+      "label": "wiki workflow",
+      "text": "Durable Family Wiki changes use a PR-first workflow with human approval.",
+      "durability": "durable",
+      "sensitivity": "private"
+    },
+    {
+      "id": "current-editor",
+      "owner_id": "operator",
+      "conversation_scope": "dm",
+      "label": "editor preference",
+      "text": "The current editor preference is Helix.",
+      "durability": "durable",
+      "sensitivity": "private"
+    },
+    {
+      "id": "historical-editor",
+      "owner_id": "operator",
+      "conversation_scope": "dm",
+      "label": "historical editor preference",
+      "text": "The historical editor preference was Vim before Helix.",
+      "durability": "durable",
+      "valid_until": "2026-06-27T00:00:00Z",
+      "sensitivity": "private"
+    },
+    {
+      "id": "family-cccnode",
+      "owner_id": "operator",
+      "conversation_scope": "group",
+      "group_id": "family",
+      "label": "family ccc-node profile",
+      "text": "The Family group uses the shared-all ccc-node memory profile.",
+      "durability": "durable",
+      "sensitivity": "private"
+    },
+    {
+      "id": "team2-broker",
+      "owner_id": "operator",
+      "conversation_scope": "group",
+      "group_id": "a2a-team2",
+      "label": "Team2 broker",
+      "text": "A2A Team2 uses the Gwakga broker.",
+      "durability": "durable",
+      "sensitivity": "private"
+    },
+    {
+      "id": "volatile-rollout",
+      "owner_id": "operator",
+      "conversation_scope": "group",
+      "group_id": "family",
+      "label": "temporary ccc-node rollout",
+      "text": "A temporary ccc-node rollout is pending on one node.",
+      "durability": "volatile",
+      "sensitivity": "private"
+    },
+    {
+      "id": "vehicle-preference",
+      "owner_id": "operator",
+      "conversation_scope": "dm",
+      "label": "vehicle preference",
+      "text": "The operator only drives electric vehicles and prefers electric SUVs.",
+      "durability": "durable",
+      "sensitivity": "private"
+    },
+    {
+      "id": "secret-token",
+      "owner_id": "operator",
+      "conversation_scope": "dm",
+      "label": "API token",
+      "text": "The API token fixture value must never be retrieved.",
+      "durability": "durable",
+      "sensitivity": "secret"
+    },
+    {
+      "id": "other-owner-editor",
+      "owner_id": "someone-else",
+      "conversation_scope": "dm",
+      "label": "editor preference",
+      "text": "The current editor preference is Emacs.",
+      "durability": "durable",
+      "sensitivity": "private"
+    }
+  ],
+  "cases": [
+    {
+      "id": "dm_current_preference_beats_history",
+      "query": "current editor preference Helix",
+      "context": {"owner_id": "operator", "conversation_scope": "dm", "max_chars": 600},
+      "expected": ["current-editor"],
+      "forbidden": ["historical-editor", "other-owner-editor"]
+    },
+    {
+      "id": "explicit_history_remains_retrievable",
+      "query": "historical editor Vim before Helix",
+      "context": {"owner_id": "operator", "conversation_scope": "dm", "max_chars": 600},
+      "expected": ["historical-editor"],
+      "forbidden": ["other-owner-editor"]
+    },
+    {
+      "id": "same_group_context_is_preferred",
+      "query": "Family group ccc-node memory profile",
+      "context": {"owner_id": "operator", "conversation_scope": "group", "group_id": "family", "max_chars": 600},
+      "expected": ["family-cccnode"],
+      "forbidden": ["volatile-rollout"]
+    },
+    {
+      "id": "shared_all_can_retrieve_other_invited_group",
+      "query": "Which broker does A2A Team2 use?",
+      "context": {"owner_id": "operator", "conversation_scope": "group", "group_id": "family", "max_chars": 600},
+      "expected": ["team2-broker"],
+      "forbidden": []
+    },
+    {
+      "id": "shared_all_includes_relevant_dm_memory",
+      "query": "What is the operator vehicle preference?",
+      "context": {"owner_id": "operator", "conversation_scope": "group", "group_id": "family", "max_chars": 600},
+      "expected": ["vehicle-preference"],
+      "forbidden": []
+    },
+    {
+      "id": "global_operating_policy_is_available",
+      "query": "Family Wiki PR-first workflow human approval",
+      "context": {"owner_id": "operator", "conversation_scope": "group", "group_id": "family", "max_chars": 600},
+      "expected": ["global-pr-first"],
+      "forbidden": []
+    },
+    {
+      "id": "multi_fact_query_can_return_two_precise_memories",
+      "query": "operator editor and vehicle preferences",
+      "context": {"owner_id": "operator", "conversation_scope": "dm", "max_chars": 600},
+      "expected": ["current-editor", "vehicle-preference"],
+      "forbidden": ["historical-editor", "other-owner-editor"]
+    },
+    {
+      "id": "secret_and_other_owner_are_never_retrieved",
+      "query": "API token editor preference",
+      "context": {"owner_id": "operator", "conversation_scope": "dm", "max_chars": 600},
+      "expected": ["current-editor"],
+      "forbidden": ["secret-token", "other-owner-editor"]
+    }
+  ]
+}
