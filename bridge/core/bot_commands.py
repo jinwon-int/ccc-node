@@ -106,7 +106,7 @@ class BotCommandMixin:
         # PATCH 2026-05-04: use _reply_smart to auto-split >4096 char responses
         # (Telegram message size limit). Capo's 23TM project has 31+ skills,
         # full /skills listing exceeds limit → "Message is too long" error.
-        await self._reply_smart(message, response.content, parse_mode="HTML")
+        await self._reply_smart(message, response.content, parse_mode="HTML", user_id=user_id)
         log_debug(user_id, "bot", response.content)
 
     async def _cmd_new(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1049,6 +1049,7 @@ class BotCommandMixin:
                 parse_mode="Markdown",
                 force_options=response.has_options,
                 streamed=response.streamed,
+                user_id=user_id,
             )
 
         async def on_overflow():
@@ -1096,6 +1097,7 @@ class BotCommandMixin:
                     parse_mode="Markdown",
                     force_options=response.has_options,
                     streamed=response.streamed,
+                    user_id=user_id,
                 )
             except Exception as e:
                 logger.error(f"Skill execution failed: {e}", exc_info=True)

@@ -13,6 +13,7 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Optional
+from unittest.mock import AsyncMock
 
 from telegram_bot.core.bot_delivery import BotDeliveryMixin
 from telegram_bot.session.manager import SessionManager
@@ -265,6 +266,92 @@ class SendFilePathsTests(unittest.TestCase):
 
         self.assertEqual(sent, ["b.txt"])
         self.assertTrue(any("Failed to send file" in m for m in logs.output))
+
+
+class _ResolveHarness(BotDeliveryMixin):
+    """Minimal harness exercising the real _resolve_paths over on-disk files."""
+
+    from telegram_bot.core.bot import TelegramBot as _T
+
+    _FILE_PATH_RE = _T._FILE_PATH_RE
+    _IMAGE_EXTS = _T._IMAGE_EXTS
+
+    def __init__(self, root: Path):
+        self._config = SimpleNamespace(project_root=str(root))
+
+    def _project_root(self) -> Path:
+        return Path(self._config.project_root).resolve()
+
+
+class ResolvePathsExtensionTests(unittest.TestCase):
+    def _resolve(self, tmpdir: Path, content: str):
+        return [p.name for p in _ResolveHarness(tmpdir)._resolve_paths(content)]
+
+    def test_deliverable_document_data_and_media_types_are_detected(self):
+        tmpdir = Path(tempfile.mkdtemp())
+        names = [
+            "report.pdf", "data.csv", "summary.md", "notes.txt", "sheet.xlsx",
+            "paper.docx", "config.json", "events.jsonl", "run.log", "logo.svg",
+            "clip.mov", "voice.wav", "book.epub", "slides.pptx",
+        ]
+        for n in names:
+            (tmpdir / n).write_text("x", encoding="utf-8")
+        content = "\n".join(f"Saved to {tmpdir}/{n}" for n in names)
+
+        resolved = self._resolve(tmpdir, content)
+
+        self.assertEqual(sorted(resolved), sorted(names))
+
+    def test_source_code_files_are_not_auto_sent(self):
+        # Files an ordinary coding turn edits must not be pushed every reply.
+        tmpdir = Path(tempfile.mkdtemp())
+        for n in ("app.py", "index.js", "main.ts", "run.sh", "lib.rs"):
+            (tmpdir / n).write_text("x", encoding="utf-8")
+        content = "\n".join(f"Edited {tmpdir}/{n}" for n in ("app.py", "index.js", "main.ts", "run.sh", "lib.rs"))
+
+        self.assertEqual(self._resolve(tmpdir, content), [])
+
+    def test_json_extension_is_not_clipped_to_js(self):
+        tmpdir = Path(tempfile.mkdtemp())
+        (tmpdir / "config.json").write_text("{}", encoding="utf-8")
+
+        self.assertEqual(self._resolve(tmpdir, f"see {tmpdir}/config.json"), ["config.json"])
+
+    def test_oversize_file_is_skipped(self):
+        tmpdir = Path(tempfile.mkdtemp())
+        big = tmpdir / "huge.pdf"
+        big.write_bytes(b"0" * 10)
+        import os as _os
+
+        _os.truncate(big, 60 * 1024 * 1024)  # 60 MB > 50 MB ceiling
+
+        self.assertEqual(self._resolve(tmpdir, f"here {tmpdir}/huge.pdf"), [])
+
+
+class MaybePromptOutsideFilesTests(unittest.TestCase):
+    """Gating for offering to send files that resolved outside PROJECT_ROOT."""
+
+    def _bot(self):
+        bot = DeliveryHarness(str(Path(tempfile.mkdtemp())))
+        bot._prompt_outside_file_confirmation = AsyncMock()
+        return bot
+
+    def test_prompts_when_owner_known_and_outside_paths_present(self):
+        bot = self._bot()
+        paths = [Path("/etc/hosts")]
+        asyncio.run(bot._maybe_prompt_outside_files(5, 7, paths))
+        bot._prompt_outside_file_confirmation.assert_awaited_once_with(5, 7, paths)
+
+    def test_no_prompt_when_owner_unknown(self):
+        # Callers without a resolved owner id must not expose out-of-project paths.
+        bot = self._bot()
+        asyncio.run(bot._maybe_prompt_outside_files(5, None, [Path("/etc/hosts")]))
+        bot._prompt_outside_file_confirmation.assert_not_awaited()
+
+    def test_no_prompt_when_no_outside_paths(self):
+        bot = self._bot()
+        asyncio.run(bot._maybe_prompt_outside_files(5, 7, []))
+        bot._prompt_outside_file_confirmation.assert_not_awaited()
 
 
 if __name__ == "__main__":

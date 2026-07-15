@@ -204,7 +204,11 @@ class BotVoiceMixin:
             await self._audio_processor.cleanup_audio_files(cleanup_paths)
 
     async def _send_content_artifacts(
-        self, message: Message, content: str, force_options: bool
+        self,
+        message: Message,
+        content: str,
+        force_options: bool,
+        user_id: Optional[int] = None,
     ) -> None:
         resolved_paths = self._resolve_paths(content)
         in_root_paths, outside_paths = self._split_paths_by_scope(resolved_paths)
@@ -214,6 +218,7 @@ class BotVoiceMixin:
             f"paths={[str(p) for p in resolved_paths]}"
         )
         await self._send_file_paths(message.chat.id, in_root_paths)
+        await self._maybe_prompt_outside_files(message.chat.id, user_id, outside_paths)
 
         # Inline option buttons are opt-in (CCC_TELEGRAM_OPTION_BUTTONS). When
         # off (default), the numbered options remain in the message text and the
@@ -256,6 +261,7 @@ class BotVoiceMixin:
                 parse_mode=parse_mode,
                 force_options=force_options,
                 streamed=streamed,
+                user_id=user_id,
             )
             return
 
@@ -271,6 +277,7 @@ class BotVoiceMixin:
                 parse_mode=parse_mode,
                 force_options=force_options,
                 streamed=streamed,
+                user_id=user_id,
             )
             return
 
@@ -289,6 +296,7 @@ class BotVoiceMixin:
                 parse_mode=parse_mode,
                 force_options=force_options,
                 streamed=streamed,
+                user_id=user_id,
             )
             return
 
@@ -317,6 +325,7 @@ class BotVoiceMixin:
                 parse_mode=parse_mode,
                 force_options=force_options,
                 streamed=streamed,
+                user_id=user_id,
             )
             return
         except Exception as exc:
@@ -333,6 +342,7 @@ class BotVoiceMixin:
                 parse_mode=parse_mode,
                 force_options=force_options,
                 streamed=streamed,
+                user_id=user_id,
             )
             return
 
@@ -343,10 +353,13 @@ class BotVoiceMixin:
                 parse_mode=parse_mode,
                 force_options=force_options,
                 streamed=streamed,
+                user_id=user_id,
             )
             return
 
-        await self._send_content_artifacts(message, content, force_options)
+        await self._send_content_artifacts(
+            message, content, force_options, user_id=user_id
+        )
 
     @staticmethod
     def _redact_telegram_file_url(url: str) -> str:
@@ -1041,4 +1054,3 @@ class BotVoiceMixin:
             log_debug(user_id, "bot", reply)
 
         await self._enqueue_user_task(conversation_key, run_task, on_overflow)
-

@@ -381,6 +381,9 @@ class VoiceReplyModeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(send_order, ["preview", "voice", "artifacts"])
         bot._reply_smart.assert_not_awaited()
         message.reply_text.assert_awaited_once_with("🎤 Voice: raw transcript")
+        bot._send_content_artifacts.assert_awaited_once_with(
+            message, "short reply", False, user_id=11
+        )
 
     async def test_voice_only_preview_not_duplicated_when_synthesis_fails(self):
         bot = _make_bot(

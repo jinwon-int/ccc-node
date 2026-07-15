@@ -30,6 +30,10 @@ from telegram_bot.utils import tg_entities
 
 logger = logging.getLogger(__name__)
 STALE_MESSAGE_SECONDS = 20 * 60  # 20 minutes
+# Upper bound for auto-sending an agent-produced file to Telegram. Matches the
+# Telegram Bot API's 50 MB document-send ceiling; oversize files are skipped
+# (and any residual Telegram rejection is caught in _send_file_paths).
+MAX_SEND_FILE_BYTES = 50 * 1024 * 1024
 
 
 
@@ -188,7 +192,7 @@ class BotDeliveryMixin:
             if not p.is_absolute():
                 p = self._project_root() / p
             p = p.resolve()
-            if p not in seen and p.is_file() and p.stat().st_size < 10 * 1024 * 1024:
+            if p not in seen and p.is_file() and p.stat().st_size < MAX_SEND_FILE_BYTES:
                 seen.add(p)
                 paths.append(p)
         return paths
@@ -240,6 +244,25 @@ class BotDeliveryMixin:
                     logger.info(f"Sent document: {p}")
             except Exception as e:
                 logger.warning(f"Failed to send file {p}: {e}")
+
+    async def _maybe_prompt_outside_files(
+        self, chat_id: int, user_id: Optional[int], outside_paths: List[FilePath]
+    ) -> None:
+        """Offer to send files that resolved outside PROJECT_ROOT.
+
+        In-root files are sent automatically; anything outside the project needs
+        an explicit tap-to-confirm (the ``extsend:`` callback finishes the send).
+        Skipped when the owner user id is unknown, which keeps callers that lack
+        one from silently exposing out-of-project paths.
+        """
+        if not outside_paths or user_id is None:
+            return
+        logger.info(
+            "Outside-root file send requires confirmation chat_id=%s count=%s",
+            chat_id,
+            len(outside_paths),
+        )
+        await self._prompt_outside_file_confirmation(chat_id, user_id, outside_paths)
 
     async def _prompt_outside_file_confirmation(
         self, chat_id: int, user_id: int, paths: List[FilePath]
@@ -375,6 +398,7 @@ class BotDeliveryMixin:
         parse_mode: str = "Markdown",
         force_options: bool = False,
         streamed: bool = False,
+        user_id: Optional[int] = None,
     ):
         """Reply with text (splitting if needed), send referenced files, and add option buttons."""
         # Skip text sending if already streamed
@@ -387,7 +411,7 @@ class BotDeliveryMixin:
                 base_parse_mode=parse_mode,
             )
 
-        await self._send_content_artifacts(message, content, force_options)
+        await self._send_content_artifacts(message, content, force_options, user_id=user_id)
 
     async def _send_smart(
         self,
@@ -411,8 +435,9 @@ class BotDeliveryMixin:
             )
 
         resolved_paths = self._resolve_paths(content)
-        in_root_paths, _ = self._split_paths_by_scope(resolved_paths)
+        in_root_paths, outside_paths = self._split_paths_by_scope(resolved_paths)
         await self._send_file_paths(chat_id, in_root_paths)
+        await self._maybe_prompt_outside_files(chat_id, user_id, outside_paths)
         # Inline option buttons are opt-in (CCC_TELEGRAM_OPTION_BUTTONS); default
         # off, so numbered options stay as text and the user types their choice.
         if force_options and getattr(self._config, "enable_option_buttons", False):
@@ -490,7 +515,7 @@ class BotDeliveryMixin:
                     resolved = p.resolve(strict=False)
                     if (
                         resolved.is_file()
-                        and resolved.stat().st_size < 10 * 1024 * 1024
+                        and resolved.stat().st_size < MAX_SEND_FILE_BYTES
                     ):
                         paths.append(resolved)
                 except Exception:
