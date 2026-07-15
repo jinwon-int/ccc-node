@@ -124,6 +124,9 @@ class TelegramBot(
         self._push_notifier = PushNotifier(settings)
         # Only sessions created/resumed in current runtime are auto-resumed.
         self._runtime_active_sessions: set[Any] = set()
+        # Serialize first-use legacy seeding per destination. Telegram may
+        # dispatch updates from different chats concurrently in shared scopes.
+        self._scope_migration_locks: Dict[Any, asyncio.Lock] = {}
         self._user_voice_tasks: Dict[Any, set[asyncio.Task]] = {}
         # Per-user bounded run queue + active-task tracking (priority stop/revert).
         self._tasks = UserTaskQueue(self._MAX_INFLIGHT_MESSAGES)
@@ -157,8 +160,8 @@ class TelegramBot(
         """Storage/queue key for one Telegram conversation.
 
         The default isolates each sender/chat pair. Operators may explicitly
-        share one session among allowlisted senders in the same group; DMs and
-        different groups always remain isolated.
+        share inside each group or, with the broader shared-all opt-in, across
+        every DM and group after access control has accepted the sender.
         """
         cfg = getattr(self, "_config", None)
         scope = getattr(cfg, "telegram_session_scope", "per-user-chat")
@@ -171,51 +174,62 @@ class TelegramBot(
         chat_id: int,
         current_session: Dict[str, Any],
     ) -> None:
-        """Seed a new scoped row once, without merging users or groups."""
+        """Seed a new scoped row once from the first request's legacy row."""
 
-        if conversation_key == user_id or not set(current_session).issubset(
-            {"reply_mode", "provider"}
-        ):
+        if conversation_key == user_id:
             return
-        legacy_session = None
-        legacy_key = None
-        for candidate in legacy_storage_keys(
-            getattr(self._config, "telegram_session_scope", "per-user-chat"),
-            user_id,
-            chat_id,
-        ):
-            candidate_session = await self._session_manager.get_session(candidate)
-            if candidate_session and candidate_session != current_session:
-                legacy_session = candidate_session
-                legacy_key = candidate
-                break
-        if legacy_session is None:
-            return
-        migration_fields = {
-            "session_id",
-            "model",
-            "effort",
-            "provider",
-            "reply_mode",
-            "last_user_message_at",
-            "force_auto_new_session",
-        }
-        migrated = {
-            key: value for key, value in legacy_session.items() if key in migration_fields
-        }
-        if migrated:
-            await self._session_manager.patch_session(
-                conversation_key, updates=migrated
-            )
-            current_session.update(migrated)
-            logger.info(
-                "conversation_scope_migrated source=%s destination=%s fields=%s",
-                legacy_key,
-                conversation_key,
-                sorted(migrated),
-            )
-        if legacy_key in self._runtime_active_sessions:
-            self._runtime_active_sessions.add(conversation_key)
+        locks = getattr(self, "_scope_migration_locks", None)
+        if locks is None:
+            locks = self._scope_migration_locks = {}
+        migration_lock = locks.setdefault(conversation_key, asyncio.Lock())
+        async with migration_lock:
+            latest_session = await self._session_manager.get_session(conversation_key)
+            current_session.clear()
+            current_session.update(latest_session)
+            if not set(latest_session).issubset({"reply_mode", "provider"}):
+                return
+
+            legacy_session = None
+            legacy_key = None
+            for candidate in legacy_storage_keys(
+                getattr(self._config, "telegram_session_scope", "per-user-chat"),
+                user_id,
+                chat_id,
+            ):
+                candidate_session = await self._session_manager.get_session(candidate)
+                if candidate_session and candidate_session != latest_session:
+                    legacy_session = candidate_session
+                    legacy_key = candidate
+                    break
+            if legacy_session is None:
+                return
+            migration_fields = {
+                "session_id",
+                "model",
+                "effort",
+                "provider",
+                "reply_mode",
+                "last_user_message_at",
+                "force_auto_new_session",
+            }
+            migrated = {
+                key: value
+                for key, value in legacy_session.items()
+                if key in migration_fields
+            }
+            if migrated:
+                await self._session_manager.patch_session(
+                    conversation_key, updates=migrated
+                )
+                current_session.update(migrated)
+                logger.info(
+                    "conversation_scope_migrated source=%s destination=%s fields=%s",
+                    legacy_key,
+                    conversation_key,
+                    sorted(migrated),
+                )
+            if legacy_key in self._runtime_active_sessions:
+                self._runtime_active_sessions.add(conversation_key)
 
     def _active_provider(self) -> str:
         provider = str(getattr(self._config, "agent_provider", "claude")).strip().lower()

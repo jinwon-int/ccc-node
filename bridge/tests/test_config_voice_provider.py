@@ -69,6 +69,13 @@ class VoiceProviderConfigTests(unittest.TestCase):
             ):
                 enabled = module.Config(telegram_bot_token="123456:abc", _env_file=None)
             self.assertEqual(enabled.telegram_session_scope, "shared-groups")
+
+            shared_all = module.Config(
+                telegram_bot_token="123456:abc",
+                CCC_TELEGRAM_SESSION_SCOPE="shared-all",
+                _env_file=None,
+            )
+            self.assertEqual(shared_all.telegram_session_scope, "shared-all")
             self.assertEqual(enabled.bridge_memory_mode, "curated")
             self.assertTrue(enabled.image_context_guard)
             self.assertEqual(enabled.telegram_max_image_bytes, 1048576)
