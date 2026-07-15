@@ -21,6 +21,9 @@ TypingCallback = Callable[[], Awaitable[Any]]
 # Callback type: async (text, message_id) -> message_id | None. When text is
 # None the existing heartbeat message should be deleted/cleared.
 StatusCallback = Callable[[Optional[str], Optional[int]], Awaitable[Optional[int]]]
+# Callback for a completed assistant message that is known to be followed by
+# more work in the same turn. Raising keeps the message on the final fallback.
+InterimMessageCallback = Callable[[str], Awaitable[None]]
 
 
 # Callback type: async (text, session_id) -> None. Delivers SDK messages that

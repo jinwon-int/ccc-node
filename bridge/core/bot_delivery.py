@@ -35,6 +35,38 @@ STALE_MESSAGE_SECONDS = 20 * 60  # 20 minutes
 
 
 class BotDeliveryMixin:
+    def _make_interim_reply_callback(self, message):
+        """Build a renderer-preserving callback for an interim reply bubble."""
+
+        async def deliver(content: str) -> None:
+            await self._deliver_markdown(
+                content,
+                lambda text, parse_mode=None, entities=None: message.reply_text(
+                    text,
+                    parse_mode=parse_mode,
+                    entities=entities,
+                ),
+            )
+
+        return deliver
+
+    def _make_interim_send_callback(self, chat_id: int):
+        """Build a renderer-preserving callback for a chat-level interim bubble."""
+
+        async def deliver(content: str) -> None:
+            bot = self._require_application().bot
+            await self._deliver_markdown(
+                content,
+                lambda text, parse_mode=None, entities=None: bot.send_message(
+                    chat_id,
+                    text,
+                    parse_mode=parse_mode,
+                    entities=entities,
+                ),
+            )
+
+        return deliver
+
     async def _handle_text_message(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ):
@@ -499,6 +531,9 @@ class BotDeliveryMixin:
                         ),
                         status_callback=self._make_status_callback(app.bot, chat_id),
                         bot=app.bot,
+                        interim_message_callback=self._make_interim_send_callback(
+                            chat_id
+                        ),
                     )
                     await self._save_session_id(conversation_key, response)
                     await self._send_smart(
@@ -648,4 +683,3 @@ class BotDeliveryMixin:
             app = self._require_application()
             await app.bot.set_my_commands(commands, scope=scope)
         logger.info("Bot commands set")
-

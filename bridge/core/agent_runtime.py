@@ -57,6 +57,13 @@ class TextDeltaEvent:
 
 
 @dataclass(frozen=True, slots=True)
+class MessageCompletedEvent:
+    """One user-visible assistant message finished within the current turn."""
+
+    kind: Literal["message_completed"] = "message_completed"
+
+
+@dataclass(frozen=True, slots=True)
 class ReasoningDeltaEvent:
     """A non-empty increment of provider-normalized reasoning text."""
 
@@ -172,6 +179,7 @@ class ErrorEvent:
 
 AgentEvent: TypeAlias = (
     TextDeltaEvent
+    | MessageCompletedEvent
     | ReasoningDeltaEvent
     | ToolStartedEvent
     | ToolCompletedEvent

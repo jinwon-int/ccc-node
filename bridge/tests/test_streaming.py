@@ -101,6 +101,18 @@ class _BotCapture:
 
 
 class StreamingMessageHandlerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_finalize_segment_resets_draft_for_next_message(self):
+        bot = _BotCapture()
+        handler = StreamingMessageHandler(bot=bot, chat_id=42, user_id=7)
+
+        await handler.update_if_needed("Checking now.")
+        delivered = await handler.finalize_segment()
+        await handler.update_if_needed("Final answer.")
+        await handler.finalize_all()
+
+        self.assertTrue(delivered)
+        self.assertEqual([text for text, _ in bot.sends], ["Checking now.", "Final answer."])
+
     async def test_create_draft_uses_draft_api_with_draft_id(self):
         bot = _BotWithDraftId()
         handler = StreamingMessageHandler(bot=bot, chat_id=42, user_id=7)
