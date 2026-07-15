@@ -17,7 +17,7 @@ rollback, Hermes-style. Three layers cooperate:
 # preview (dry-run is the default)
 scripts/install-skill-autosave-cron.sh
 
-# install (daily 20:45 UTC by default; override with --schedule)
+# install (daily 20:45 UTC / 05:45 KST by default)
 scripts/install-skill-autosave-cron.sh --apply
 
 # remove
@@ -26,6 +26,14 @@ scripts/install-skill-autosave-cron.sh --remove --apply
 
 `setup.sh` installs the sweep script to `~/.claude/hooks/ccc-skill-autosave.sh`
 but — consistent with the other cron installers — never schedules it itself.
+The installer converts the default `20:45 UTC` target into the host cron
+daemon's local timezone when writing the crontab (`45 5` on KST hosts,
+`45 20` on UTC hosts), and writes a managed `CRON_TZ` block pinned to that
+detected system timezone. Cron implementations that support `CRON_TZ` honor
+the pin; implementations that do not continue evaluating the already-local
+schedule in the system timezone. An explicit `--schedule` or
+`CCC_SKILL_AUTOSAVE_CRON` value is interpreted as a raw host-local cron
+schedule.
 
 ## Telegram notification
 

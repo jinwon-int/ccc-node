@@ -19,13 +19,69 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 CLAUDE_DIR="${CCC_CLAUDE_DIR:-$HOME/.claude}"
 STATE_DIR="${CCC_STATE_DIR:-$CLAUDE_DIR/state}"
 AUTOSAVE="${CCC_SKILL_AUTOSAVE_CMD:-$CLAUDE_DIR/hooks/ccc-skill-autosave.sh}"
-# Default: daily 20:45 UTC (05:45 KST) — before the operator's morning review.
-SCHEDULE="${CCC_SKILL_AUTOSAVE_CRON:-45 20 * * *}"
 LOG="${CCC_SKILL_AUTOSAVE_CRON_LOG:-$STATE_DIR/skill-autosave.cron.log}"
 CRONTAB="${CCC_CRONTAB_CMD:-crontab}"
 MARKER="# ccc-node:skill-autosave"
+BLOCK_BEGIN="# ccc-node:autosave-schedule:begin"
+BLOCK_END="# ccc-node:autosave-schedule:end"
 APPLY=0
 REMOVE=0
+
+# User crontabs are evaluated in the cron daemon's local timezone. Resolve the
+# default 20:45 UTC target into a host-local expression at install time instead
+# of assuming every node runs cron in UTC. Asia/Seoul becomes 05:45 local;
+# UTC remains 20:45. Pin CRON_TZ to that detected system timezone as well:
+# Cronie honors it, while Debian cron safely treats it as a job environment
+# variable and continues using the same system-local schedule. This also
+# prevents an unrelated earlier CRON_TZ assignment from changing our job.
+detect_local_timezone() {
+  local timezone="${CCC_SKILL_AUTOSAVE_LOCAL_TIMEZONE:-}"
+  if [ -z "$timezone" ] && [ -r /etc/timezone ]; then
+    timezone="$(head -1 /etc/timezone 2>/dev/null | tr -d '[:space:]')"
+  fi
+  if [ -z "$timezone" ] && command -v timedatectl >/dev/null 2>&1; then
+    timezone="$(timedatectl show -p Timezone --value 2>/dev/null | tr -d '[:space:]')"
+  fi
+  if [ -z "$timezone" ] && command -v getprop >/dev/null 2>&1; then
+    timezone="$(getprop persist.sys.timezone 2>/dev/null | tr -d '[:space:]')"
+  fi
+  [ -n "$timezone" ] || timezone="$(date +%Z)"
+  case "$timezone" in
+    ''|*[!A-Za-z0-9_+:/.-]*)
+      echo "invalid local timezone '$timezone'" >&2
+      return 2
+      ;;
+  esac
+  printf '%s' "$timezone"
+}
+
+LOCAL_TIMEZONE="$(detect_local_timezone)"
+
+default_local_schedule() {
+  local offset="${CCC_SKILL_AUTOSAVE_LOCAL_UTC_OFFSET:-}"
+  local sign hours minutes offset_minutes local_minutes
+  [ -n "$offset" ] || offset="$(TZ="$LOCAL_TIMEZONE" date +%z)"
+  case "$offset" in
+    [+-][0-9][0-9][0-9][0-9]) ;;
+    *) echo "invalid local UTC offset '$offset' (expected +HHMM or -HHMM)" >&2; return 2 ;;
+  esac
+  hours="${offset:1:2}"
+  minutes="${offset:3:2}"
+  if [ "$((10#$hours))" -gt 23 ] || [ "$((10#$minutes))" -gt 59 ]; then
+    echo "invalid local UTC offset '$offset' (expected +HHMM or -HHMM)" >&2
+    return 2
+  fi
+  [ "${offset:0:1}" = "+" ] && sign=1 || sign=-1
+  offset_minutes=$((sign * (10#$hours * 60 + 10#$minutes)))
+  local_minutes=$(((20 * 60 + 45 + offset_minutes + 1440) % 1440))
+  printf '%d %d * * *' "$((local_minutes % 60))" "$((local_minutes / 60))"
+}
+
+if [ -n "${CCC_SKILL_AUTOSAVE_CRON:-}" ]; then
+  SCHEDULE="$CCC_SKILL_AUTOSAVE_CRON"
+else
+  SCHEDULE="$(default_local_schedule)"
+fi
 
 usage() {
   cat <<EOF
@@ -41,10 +97,14 @@ Options:
   --dry-run        Show the resulting crontab without changing it (default).
   --apply          Write the crontab change.
   --remove         Remove the managed entry (with --apply) instead of adding it.
-  --schedule SPEC  Cron schedule (5 fields). Default: "$SCHEDULE".
+  --schedule SPEC  Host-local cron schedule (5 fields). Default resolves the
+                   20:45 UTC target for this host: "$SCHEDULE".
 
 Env overrides: CCC_CLAUDE_DIR, CCC_STATE_DIR, CCC_SKILL_AUTOSAVE_CMD,
 CCC_SKILL_AUTOSAVE_CRON, CCC_SKILL_AUTOSAVE_CRON_LOG, CCC_CRONTAB_CMD.
+CCC_SKILL_AUTOSAVE_LOCAL_TIMEZONE and CCC_SKILL_AUTOSAVE_LOCAL_UTC_OFFSET
+(+HHMM/-HHMM) are advanced deterministic overrides for image builds and
+tests; normal installs auto-detect both.
 EOF
 }
 
@@ -73,13 +133,23 @@ fi
 CRON_LINE="$SCHEDULE bash -lc 'CCC_CLAUDE_DIR=\"$CLAUDE_DIR\" \"$AUTOSAVE\" run' >> \"$LOG\" 2>&1  $MARKER"
 
 current="$("$CRONTAB" -l 2>/dev/null || true)"
-without_marker="$(printf '%s\n' "$current" | grep -vF "$MARKER" || true)"
+if ! without_marker="$(printf '%s\n' "$current" | awk \
+  -v begin="$BLOCK_BEGIN" -v end="$BLOCK_END" -v marker="$MARKER" '
+    $0 == begin { if (skip) bad=1; skip=1; next }
+    $0 == end { if (!skip) bad=1; skip=0; next }
+    !skip && index($0, marker) == 0 { print }
+    END { if (skip || bad) exit 42 }
+  ')"; then
+  echo "skill-autosave cron: corrupt managed schedule block; refusing to edit" >&2
+  exit 4
+fi
 
 if [ "$REMOVE" = 1 ]; then
   desired="$without_marker"
   action="remove"
 else
-  desired="$(printf '%s\n%s' "$without_marker" "$CRON_LINE" | sed '/^$/d')"
+  desired="$(printf '%s\n%s\nCRON_TZ=%s\n%s\n%s' \
+    "$without_marker" "$BLOCK_BEGIN" "$LOCAL_TIMEZONE" "$CRON_LINE" "$BLOCK_END" | sed '/^$/d')"
   action="install"
 fi
 
