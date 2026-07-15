@@ -3,6 +3,8 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REVIEW="$HERE/skill-review.sh"
+# shellcheck source=claude/hooks/lib/test-stub.sh
+. "$HERE/lib/test-stub.sh"
 pass=0; fail=0
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
@@ -28,19 +30,16 @@ make_transcript "$TRANS" 5
 mkdir -p "$STATE" "$SKILLS"
 
 mkdir -p "$TMP/bin"
-cat > "$TMP/bin/claude" <<'SH'
-#!/usr/bin/env bash
+write_exec_stub "$TMP/bin/claude" <<'SH'
 cat >/dev/null
 cat <<'JSON'
 {"skill_candidates":[{"name":"deploy-checklist","category":"ops","summary":"Capture a recurring deploy checklist.","reason":"The transcript repeats a multi-step deploy verification flow.","evidence_excerpt":"automate recurring deploy checklist","skill_md":"---\nname: deploy-checklist\ndescription: Capture deploy checklist procedures.\n---\n\n# Deploy Checklist\n\n## When to Use\n- Use when deploy verification repeats.\n\n## Procedure\n1. Inspect git state.\n2. Run the verified checklist.\n\n## Safety\n- Never store raw secrets.\n\n## Verification\n- Confirm the checklist output is recorded.\n"}]}
 JSON
 SH
 chmod +x "$TMP/bin/claude"
-cat > "$TMP/bin/setsid" <<'SH'
-#!/usr/bin/env bash
+write_exec_stub "$TMP/bin/setsid" <<'SH'
 exec "$@"
 SH
-chmod +x "$TMP/bin/setsid"
 PATH="$TMP/bin:$PATH"
 
 out="$(payload sess-1 "$TRANS" "/root/work" | CCC_STATE_DIR="$STATE" CLAUDE_SKILLS_DIR="$SKILLS" CCC_SKILL_REVIEW_COOLDOWN_SECONDS=0 bash "$REVIEW" sessionend 2>&1)"; rc=$?

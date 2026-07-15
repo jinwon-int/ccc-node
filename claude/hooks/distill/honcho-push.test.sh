@@ -3,6 +3,8 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 PUSH="$HERE/honcho-push.sh"
+# shellcheck source=claude/hooks/lib/test-stub.sh
+. "$HERE/../lib/test-stub.sh"
 pass=0; fail=0
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
@@ -10,8 +12,7 @@ trap 'rm -rf "$TMP"' EXIT
 ok() { if eval "$2"; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $1"; fi; }
 
 mkdir -p "$TMP/bin" "$TMP/state"
-cat > "$TMP/bin/curl" <<'SH'
-#!/usr/bin/env bash
+write_exec_stub "$TMP/bin/curl" <<'SH'
 set -uo pipefail
 printf '%s\n' "$*" >> "${CURL_STUB_LOG:?}"
 http="${CURL_STUB_HTTP:-201}"
