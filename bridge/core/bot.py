@@ -128,6 +128,7 @@ class TelegramBot(
         self._tasks = UserTaskQueue(self._MAX_INFLIGHT_MESSAGES)
         self._audio_dir = settings.bot_data_dir / "audio"
         self._image_dir = settings.bot_data_dir / "images"
+        self._document_dir = settings.bot_data_dir / "uploads"
         self._audio_processor = AudioProcessor(ffmpeg_path=settings.ffmpeg_path)
         self._whisper_transcriber: Optional[WhisperTranscriber] = None
         self._volcengine_transcriber: Optional[VolcengineFileFastTranscriber] = None
@@ -358,6 +359,13 @@ class TelegramBot(
             group=2,
         )
         self.application.add_handler(
+            MessageHandler(
+                filters.Document.ALL & ~filters.Document.IMAGE,
+                self._handle_document_message,
+            ),
+            group=2,
+        )
+        self.application.add_handler(
             MessageHandler(filters.TEXT & ~filters.COMMAND, self._handle_text_message),
             group=2,
         )
@@ -447,6 +455,7 @@ class TelegramBot(
         text: str,
         message_source: str = "text",
         voice_input_preview: Optional[str] = None,
+        sensitive_log_event: Optional[str] = None,
     ) -> None:
         message = self._require_message(update)
         chat = self._require_chat(update)
@@ -575,12 +584,27 @@ class TelegramBot(
                             f"{history_block}\n\n"
                             f"[현재 메시지]\n{text}"
                         )
-                        logger.info(
-                            f"History injection: {len(recent)} msgs from session "
-                            f"{stale_session_id[:8]}... prepended for user {user_id}"
-                        )
+                        if sensitive_log_event:
+                            logger.info(
+                                "History injection applied for sensitive input event=%s",
+                                sensitive_log_event,
+                            )
+                        else:
+                            logger.info(
+                                f"History injection: {len(recent)} msgs from session "
+                                f"{stale_session_id[:8]}... prepended for user {user_id}"
+                            )
                 except Exception as _hist_err:
-                    logger.warning(f"History injection failed, sending without context: {_hist_err}")
+                    if sensitive_log_event:
+                        logger.warning(
+                            "History injection failed for sensitive input event=%s error=%s",
+                            sensitive_log_event,
+                            type(_hist_err).__name__,
+                        )
+                    else:
+                        logger.warning(
+                            f"History injection failed, sending without context: {_hist_err}"
+                        )
 
             enable_streaming_text = next_reply_mode != "voice"
             response = await self._project_chat.process_message(
@@ -601,6 +625,7 @@ class TelegramBot(
                 status_callback=self._make_status_callback(app.bot, chat.id),
                 bot=app.bot if enable_streaming_text else None,
                 notification_bot=app.bot,
+                sensitive_log_event=sensitive_log_event,
             )
             await self._save_session_id(conversation_key, response)
             await self._send_reply_by_mode(
@@ -616,10 +641,23 @@ class TelegramBot(
         except asyncio.CancelledError:
             # Task was cancelled by /stop command - silently exit
             # The /stop handler will send the user response
-            logger.debug(f"Message processing cancelled for user {user_id}")
+            if sensitive_log_event:
+                logger.debug(
+                    "Sensitive message processing cancelled event=%s",
+                    sensitive_log_event,
+                )
+            else:
+                logger.debug(f"Message processing cancelled for user {user_id}")
             raise
         except Exception as e:
-            logger.error(f"Error in project chat: {e}", exc_info=True)
+            if sensitive_log_event:
+                logger.error(
+                    "Sensitive project chat error event=%s error=%s",
+                    sensitive_log_event,
+                    type(e).__name__,
+                )
+            else:
+                logger.error(f"Error in project chat: {e}", exc_info=True)
             await message.reply_text(
                 "❌ Sorry, an error occurred while processing your message.\n"
                 f"Error: {str(e)}\n\n"

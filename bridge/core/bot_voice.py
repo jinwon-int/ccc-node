@@ -1,6 +1,7 @@
 # ruff: noqa: E402
 import asyncio
 import logging
+import os
 import platform
 import time
 from pathlib import Path as FilePath
@@ -399,6 +400,159 @@ class BotVoiceMixin:
 
     async def _download_image_file(self, image, destination: FilePath) -> None:
         await self._download_telegram_file(image.file_id, destination)
+
+    async def _download_document_file(self, document, destination: FilePath) -> None:
+        await self._download_telegram_file(document.file_id, destination)
+
+    def _max_document_size_bytes(self) -> int:
+        size_mb = int(getattr(self._voice_config(), "max_document_size_mb", 20))
+        return size_mb * 1024 * 1024
+
+    async def _process_document_task(
+        self,
+        *,
+        update: Update,
+        message: Message,
+        document: Any,
+        user_id: int,
+        caption: str,
+    ) -> None:
+        if self._document_dir.is_symlink():
+            logger.warning("Document upload directory rejected reason=symlink")
+            await message.reply_text("❌ File storage is unavailable. Please contact the operator.")
+            return
+        self._document_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(self._document_dir, 0o700)
+        mime_type = media.normalize_document_mime_type(
+            getattr(document, "mime_type", None)
+        )
+        display_name = media.sanitize_document_display_name(
+            getattr(document, "file_name", None)
+        )
+        document_path = self._document_dir / media.build_document_file_name(
+            display_name, mime_type
+        )
+        cleanup_paths = [document_path]
+        start = time.perf_counter()
+        outcome = "failed"
+        actual_size = 0
+        try:
+            try:
+                create_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                create_flags |= getattr(os, "O_NOFOLLOW", 0)
+                file_descriptor = os.open(document_path, create_flags, 0o600)
+                os.close(file_descriptor)
+                await self._download_document_file(document, document_path)
+                os.chmod(document_path, 0o600)
+                actual_size = document_path.stat().st_size
+            except Exception as exc:
+                outcome = "download_failed"
+                logger.warning(
+                    "Document download failed mime=%s error=%s",
+                    mime_type,
+                    type(exc).__name__,
+                )
+                await message.reply_text("❌ Failed to download your file. Please retry.")
+                return
+
+            if actual_size > self._max_document_size_bytes():
+                outcome = "size_limit_exceeded"
+                await message.reply_text(
+                    "❌ File is too large. "
+                    f"Maximum size is {self._voice_config().max_document_size_mb} MB."
+                )
+                return
+
+            prompt = media.build_document_prompt(
+                document_path,
+                display_name=display_name,
+                mime_type=mime_type,
+                size_bytes=actual_size,
+                caption=caption,
+            )
+            reply_prefix = build_reply_context_prefix(
+                message,
+                bot_user_id=self._own_bot_id(),
+                owner_user_id=user_id,
+            )
+            if reply_prefix:
+                prompt = f"{reply_prefix}\n\n{prompt}"
+            await self._process_user_message_text(
+                update,
+                user_id,
+                prompt,
+                message_source="document",
+                sensitive_log_event="inbound_document",
+            )
+            outcome = "success"
+        except asyncio.CancelledError:
+            outcome = "cancelled"
+            raise
+        except Exception as exc:
+            outcome = "processing_failed"
+            logger.warning(
+                "Document processing failed mime=%s error=%s",
+                mime_type,
+                type(exc).__name__,
+            )
+            await message.reply_text("❌ Failed to process your file. Please retry.")
+        finally:
+            await self._audio_processor.cleanup_audio_files(cleanup_paths)
+            elapsed_ms = int((time.perf_counter() - start) * 1000)
+            logger.info(
+                "Document processing result mime=%s bytes=%s outcome=%s elapsed_ms=%s",
+                mime_type,
+                actual_size,
+                outcome,
+                elapsed_ms,
+            )
+
+    async def _handle_document_message(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        del context
+        if not await self._check_access(update):
+            return
+        message = self._require_message(update)
+        document = getattr(message, "document", None)
+        if document is None:
+            return
+
+        file_name = getattr(document, "file_name", None)
+        mime_type = getattr(document, "mime_type", None)
+        if not media.is_supported_document(mime_type, file_name):
+            await message.reply_text("❌ This file type is not supported for inbound analysis.")
+            return
+
+        declared_size = int(getattr(document, "file_size", 0) or 0)
+        if declared_size > self._max_document_size_bytes():
+            await message.reply_text(
+                "❌ File is too large. "
+                f"Maximum size is {self._voice_config().max_document_size_mb} MB."
+            )
+            return
+
+        user_id = self._require_user(update).id
+        chat = self._require_chat(update)
+        conversation_key = self._conversation_key(user_id, chat.id)
+        caption = str(getattr(message, "caption", None) or "")
+
+        async def run_task() -> None:
+            await self._process_document_task(
+                update=update,
+                message=message,
+                document=document,
+                user_id=user_id,
+                caption=caption,
+            )
+
+        async def on_overflow() -> None:
+            await message.reply_text(
+                f"⏳ File queue is full ({self._MAX_INFLIGHT_MESSAGES} active tasks). "
+                "Please wait or send /stop to terminate running tasks."
+            )
+
+        await self._enqueue_user_task(conversation_key, run_task, on_overflow)
 
     async def _prepare_audio_for_whisper(
         self, source_path: FilePath, cleanup_paths: List[FilePath]
