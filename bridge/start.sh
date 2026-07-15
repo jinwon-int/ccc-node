@@ -464,101 +464,11 @@ configured_agent_label() {
 }
 
 render_status_from_health() {
-    python3 - "$1" "$2" "$3" "$4" <<'PY'
-import json
-import sys
-from datetime import datetime, timezone
-from pathlib import Path
-
-health_path = Path(sys.argv[1])
-pid = sys.argv[2]
-stale_seconds = int(sys.argv[3])
-configured_provider = sys.argv[4]
-configured_agent_label = "Codex" if configured_provider == "codex" else "Claude"
-
-
-def parse_iso(value: str | None):
-    if not value:
-        return None
-    try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
-        return None
-
-
-def format_age(seconds: int) -> str:
-    if seconds >= 3600:
-        return f"{seconds // 3600}h"
-    if seconds >= 60:
-        return f"{seconds // 60}m"
-    return f"{seconds}s"
-
-
-def line(component: str, state: str, detail: str = "") -> str:
-    if detail:
-        return f"   {component}: {state} ({detail})"
-    return f"   {component}: {state}"
-
-
-if not health_path.exists():
-    print("🟡 Bot status: degraded")
-    print(line("Process", "alive", f"PID: {pid}"))
-    print(line("Service", "degraded", "health missing"))
-    print(line("Telegram", "degraded", "health missing"))
-    print(line(configured_agent_label, "degraded", "health missing"))
-    raise SystemExit(0)
-
-try:
-    data = json.loads(health_path.read_text(encoding="utf-8"))
-except Exception as exc:
-    print("🟡 Bot status: degraded")
-    print(line("Process", "alive", f"PID: {pid}"))
-    print(line("Service", "degraded", f"invalid health file: {exc}"))
-    print(line("Telegram", "degraded", "health unreadable"))
-    print(line(configured_agent_label, "degraded", "health unreadable"))
-    raise SystemExit(0)
-
-updated_at = parse_iso(data.get("updated_at"))
-age_seconds = None
-if updated_at is not None:
-    age_seconds = max(0, int((datetime.now(timezone.utc) - updated_at).total_seconds()))
-
-service = data.get("service") or {}
-telegram = data.get("telegram") or {}
-agent = data.get("agent") or data.get("claude") or {}
-provider = str(agent.get("provider") or configured_provider).strip().lower()
-agent_label = "Codex" if provider == "codex" else "Claude"
-
-if age_seconds is None or age_seconds > stale_seconds:
-    detail = "health stale"
-    if age_seconds is not None:
-        detail = f"health stale: last update {format_age(age_seconds)} ago"
-    print("🟡 Bot status: degraded")
-    print(line("Process", "alive", f"PID: {pid}"))
-    print(line("Service", "degraded", detail))
-    print(line("Telegram", "degraded", detail))
-    print(line(agent_label, "degraded", detail))
-    raise SystemExit(0)
-
-service_state = service.get("state") or "degraded"
-service_reason = service.get("reason") or ""
-telegram_state = telegram.get("state") or "degraded"
-telegram_reason = telegram.get("last_error") or ""
-agent_state = agent.get("state") or "degraded"
-agent_reason = agent.get("last_error") or ""
-
-icons = {
-    "available": "🟢",
-    "starting": "🟡",
-    "degraded": "🟡",
-    "unavailable": "🔴",
-}
-print(f"{icons.get(service_state, '🟡')} Bot status: {service_state}")
-print(line("Process", "alive", f"PID: {pid}"))
-print(line("Service", service_state, service_reason))
-print(line("Telegram", telegram_state, telegram_reason if telegram_state != "healthy" else ""))
-print(line(agent_label, agent_state, agent_reason if agent_state != "healthy" else ""))
-PY
+    # The staleness threshold, component state → icon mapping, and elapsed-time
+    # formatting are single-sourced in bridge/utils/health_render.py (#455). It
+    # is run by path with the system python3 (no venv/import required) so the
+    # --status fallback behavior is unchanged.
+    python3 "$SCRIPT_DIR/utils/health_render.py" "$1" "$2" "$3" "$4"
 }
 
 # ── Action handlers ──
