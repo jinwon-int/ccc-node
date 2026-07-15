@@ -240,6 +240,61 @@ class DeadSessionScannerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(stats.delivered, 1)
         self.assertEqual(self.bot.send_message.await_count, 1)
 
+    async def test_codex_session_with_missing_claude_root_is_a_noop(self):
+        self.sessions.sessions["7:70"]["provider"] = "codex"
+        original = dict(self.sessions.sessions["7:70"])
+        missing_root = self.root / "missing-claude-root"
+
+        for _ in range(5):
+            stats = await recover_dead_session_notifications(
+                self.bot, self.sessions, self.handler, missing_root
+            )
+            self.assertEqual(
+                (
+                    stats.scanned,
+                    stats.delivered,
+                    stats.failed,
+                    stats.rejected,
+                    stats.quarantined,
+                    stats.hard_quarantined,
+                ),
+                (0, 0, 0, 0, 0, 0),
+            )
+
+        self.assertEqual(self.sessions.sessions["7:70"], original)
+        self.sessions.update_session.assert_not_awaited()
+        self.bot.send_message.assert_not_awaited()
+
+    async def test_mixed_sessions_recover_legacy_claude_and_skip_codex(self):
+        self.sessions.sessions["8:80"] = {
+            "provider": "codex",
+            "session_id": "codex-thread",
+            "reply_mode": "text",
+        }
+
+        stats = await recover_dead_session_notifications(
+            self.bot, self.sessions, self.handler, self.root
+        )
+
+        self.assertEqual((stats.scanned, stats.delivered, stats.rejected), (1, 1, 0))
+        self.bot.send_message.assert_awaited_once()
+        self.assertEqual(self.bot.send_message.await_args.kwargs["chat_id"], 70)
+        self.sessions.update_session.assert_awaited_once()
+        self.assertEqual(self.sessions.update_session.await_args.args[0], "7:70")
+
+    async def test_provider_switch_during_scan_does_not_cross_runtime_boundary(self):
+        stale_snapshot = await self.sessions.list_sessions()
+        self.sessions.sessions["7:70"]["provider"] = "codex"
+        self.sessions.list_sessions = AsyncMock(return_value=stale_snapshot)
+
+        stats = await recover_dead_session_notifications(
+            self.bot, self.sessions, self.handler, self.root
+        )
+
+        self.assertEqual((stats.scanned, stats.delivered, stats.rejected), (0, 0, 0))
+        self.sessions.update_session.assert_not_awaited()
+        self.bot.send_message.assert_not_awaited()
+
 
 class TranscriptQuarantineTests(unittest.IsolatedAsyncioTestCase):
     """Rejected transcripts are quarantined instead of rescanned forever (#411 B)."""
@@ -295,6 +350,7 @@ class TranscriptQuarantineTests(unittest.IsolatedAsyncioTestCase):
         return calls
 
     async def test_rejected_transcript_is_parsed_once_and_notified_once(self):
+        self.sessions.sessions["7:70"]["provider"] = "claude"
         calls = self._counting_scan()
 
         first = await self._recover()

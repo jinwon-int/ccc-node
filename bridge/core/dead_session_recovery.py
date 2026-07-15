@@ -5,6 +5,12 @@ When no live SDK stream owns a Telegram conversation, completed task wrappers
 can otherwise remain on disk forever.  This module replays the FIFO without
 mutating the transcript and sends only remaining terminal task notifications.
 
+Only Claude-owned persisted sessions are eligible. Provider-less legacy
+records retain their historical Claude meaning, while Codex sessions are a
+strict no-op even when the Claude transcript root is absent. Keeping this
+decision inside the shared scanner makes startup and periodic recovery use the
+same provider boundary.
+
 Delivery is intentionally *at least once*: the durable marker is written after
 Telegram confirms ``send_message``.  A process crash between those two steps can
 produce one duplicate, but cannot silently mark an unsent notification done.
@@ -139,6 +145,16 @@ def _validated_session_id(value: Any) -> str:
     if not _SESSION_ID_RE.fullmatch(session_id):
         raise TranscriptRejected("invalid persisted session id")
     return session_id
+
+
+def _uses_claude_transcript(session: Mapping[str, Any]) -> bool:
+    """Return whether a persisted session owns a Claude JSONL transcript."""
+    provider = session.get("provider")
+    if provider is None:
+        return True
+    if not isinstance(provider, str) or provider not in {"claude", "codex"}:
+        raise ValueError("invalid session provider")
+    return provider == "claude"
 
 
 def _task_notification(content: Any) -> Optional[TaskNotification]:
@@ -595,6 +611,8 @@ async def recover_dead_session_notifications(  # noqa: C901 -- #348 baseline hot
             storage_key, user_id, chat_id = parse_conversation_route(raw_key)
             if not isinstance(snapshot, dict):
                 raise ValueError("invalid session entry")
+            if not _uses_claude_transcript(snapshot):
+                continue
             session_id = _validated_session_id(snapshot.get("session_id"))
         except (ValueError, TranscriptRejected):
             stats.rejected += 1
@@ -613,6 +631,12 @@ async def recover_dead_session_notifications(  # noqa: C901 -- #348 baseline hot
             try:
                 current = await session_manager.get_session(storage_key)
             except Exception:
+                stats.rejected += 1
+                continue
+            try:
+                if not _uses_claude_transcript(current):
+                    continue
+            except ValueError:
                 stats.rejected += 1
                 continue
             if current.get("session_id") != session_id:
