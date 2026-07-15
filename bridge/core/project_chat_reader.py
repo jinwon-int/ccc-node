@@ -306,6 +306,7 @@ class ProjectChatReaderMixin:
 
                 if isinstance(msg, ResultMessage):
                     state.last_session_id = msg.session_id or state.last_session_id
+                    self._record_claude_usage(req, msg)
                     result_text = msg.result or "\n".join(req.last_assistant_texts)
 
                     # Finalize streaming drafts

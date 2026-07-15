@@ -331,6 +331,7 @@ class TelegramBot(
     def _setup_handlers(self):
         # Command handlers
         self.application.add_handler(CommandHandler("start", self._cmd_start))
+        self.application.add_handler(CommandHandler("usage", self._cmd_usage))
         self.application.add_handler(CommandHandler("skills", self._cmd_skills))
         self.application.add_handler(CommandHandler("new", self._cmd_new))
         self.application.add_handler(CommandHandler("model", self._cmd_model))

@@ -37,6 +37,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `approve-each`, and `disabled` policies retain their prior behavior.
 
 ### Added
+- **Provider-neutral read-only `/usage` (#502).** Authorized Telegram users can
+  inspect Codex account rate limits/token summaries and exact-thread token
+  updates through the official app-server protocol without starting a turn.
+  Claude sessions expose already-observed Agent SDK usage/cost plus optional
+  documented status-line context and Pro/Max windows via a TTL-bound,
+  owner-only, atomic allowlist snapshot. Missing fields remain explicitly
+  unavailable; transcripts, credentials, private endpoints, and reset-credit
+  consumption are never used.
 - **Private inbound Telegram documents (#503).** Non-image `Document` updates now
   pass the allowlist before download, land under the project-scoped bot data
   directory with collision-resistant names, validated dirfd-relative `O_EXCL`/

@@ -8,6 +8,7 @@ from contextlib import suppress
 from datetime import datetime, timezone
 from pathlib import Path
 import tempfile
+import time
 from typing import TYPE_CHECKING, Any, cast
 import unittest
 
@@ -29,6 +30,7 @@ if TYPE_CHECKING:
     )
     from core.codex_app_server import CodexNotification, CodexServerRequest
     from core.codex_runtime import CodexRuntime, _run_codex_memory_bootstrap
+    from core.usage import SNAPSHOT_TTL_SECONDS, UsageSnapshot
 else:
     from telegram_bot.core.agent_runtime import (
         AgentEvent,
@@ -47,6 +49,7 @@ else:
     )
     from telegram_bot.core.codex_app_server import CodexNotification, CodexServerRequest
     from telegram_bot.core.codex_runtime import CodexRuntime, _run_codex_memory_bootstrap
+    from telegram_bot.core.usage import SNAPSHOT_TTL_SECONDS, UsageSnapshot
 
 
 async def next_event(stream: AsyncIterator[AgentEvent]) -> AgentEvent:
@@ -68,6 +71,12 @@ class FakeClient:
         self.thread_start_result: Any = {"thread": {"id": "thread-new"}}
         self.notifications: asyncio.Queue[CodexNotification | BaseException] = asyncio.Queue()
         self.model_result: Any = {"data": []}
+        self.rate_limits_result: Any = {"rateLimits": {}}
+        self.account_usage_result: Any = {"summary": {}}
+        self.rate_limits_error: BaseException | None = None
+        self.account_usage_error: BaseException | None = None
+        self.rate_limits_calls = 0
+        self.account_usage_calls = 0
         self.thread_pages: list[Any] = []
         self.thread_reads: dict[str, Any] = {}
         self.thread_read_calls: list[dict[str, Any]] = []
@@ -100,6 +109,18 @@ class FakeClient:
 
     async def list_models(self, *, include_hidden: bool = False) -> Any:
         return self.model_result
+
+    async def account_rate_limits(self) -> Any:
+        self.rate_limits_calls += 1
+        if self.rate_limits_error is not None:
+            raise self.rate_limits_error
+        return self.rate_limits_result
+
+    async def account_usage(self) -> Any:
+        self.account_usage_calls += 1
+        if self.account_usage_error is not None:
+            raise self.account_usage_error
+        return self.account_usage_result
 
     async def thread_list(self, *, limit: int = 20, cursor: str | None = None) -> Any:
         self.thread_list_calls.append({"limit": limit, "cursor": cursor})
@@ -244,6 +265,96 @@ class CodexRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 ModelInfo("codex-b", "Codex B"),
             ),
         )
+
+    async def test_usage_reads_account_without_turn_and_isolates_exact_thread_cache(self) -> None:
+        await self.runtime._ensure_started()
+        client = self.clients[0]
+        client.rate_limits_result = {
+            "rateLimits": {
+                "planType": "plus",
+                "primary": {"usedPercent": 12, "windowDurationMins": 300},
+            }
+        }
+        client.account_usage_result = {
+            "summary": {"lifetimeTokens": 9000},
+            "dailyUsageBuckets": [{"startDate": "2026-07-15", "tokens": 100}],
+        }
+        self.runtime._route_notification(
+            CodexNotification(
+                "thread/tokenUsage/updated",
+                {
+                    "threadId": "thread-a",
+                    "turnId": "turn-a",
+                    "tokenUsage": {
+                        "last": {"totalTokens": 300},
+                        "total": {
+                            "inputTokens": 500,
+                            "outputTokens": 100,
+                            "reasoningOutputTokens": 0,
+                            "cachedInputTokens": 0,
+                            "totalTokens": 600,
+                        },
+                        "modelContextWindow": 200000,
+                    },
+                },
+            )
+        )
+
+        matching = await self.runtime.get_usage("thread-a")
+        other = await self.runtime.get_usage("thread-b")
+
+        self.assertEqual(client.turn_start_calls, [])
+        self.assertEqual(client.rate_limits_calls, 2)
+        self.assertEqual(client.account_usage_calls, 2)
+        self.assertEqual(matching.context_used, 300)
+        self.assertEqual(matching.lifetime_tokens, 9000)
+        self.assertIsNone(other.context_used)
+
+    async def test_usage_sparse_updates_merge_and_read_errors_fail_safe(self) -> None:
+        await self.runtime._ensure_started()
+        client = self.clients[0]
+        self.runtime._route_notification(
+            CodexNotification(
+                "account/rateLimits/updated",
+                {
+                    "rateLimits": {
+                        "planType": "plus",
+                        "limitName": "five hour",
+                        "primary": {"usedPercent": 10},
+                        "secondary": {"usedPercent": 20},
+                    }
+                },
+            )
+        )
+        self.runtime._route_notification(
+            CodexNotification(
+                "account/rateLimits/updated",
+                {
+                    "rateLimits": {
+                        "limitName": "five hour",
+                        "primary": {"usedPercent": 35},
+                    }
+                },
+            )
+        )
+        client.rate_limits_error = TimeoutError("private transport detail")
+        client.account_usage_error = ConnectionError("private transport detail")
+
+        usage = await self.runtime.get_usage(None)
+
+        self.assertEqual(usage.plan_type, "plus")
+        self.assertEqual(
+            [(item.label, item.used_percent) for item in usage.windows],
+            [("five hour primary", 35), ("five hour secondary", 20)],
+        )
+
+        self.runtime._account_rate_limits = UsageSnapshot(
+            provider="codex",
+            plan_type="stale-plan",
+            observed_at=time.time() - SNAPSHOT_TTL_SECONDS - 1,
+        )
+        stale = await self.runtime.get_usage(None)
+        self.assertIsNone(stale.plan_type)
 
     async def test_memory_bootstrap_runs_before_each_thread_boundary(self) -> None:
         clients: list[FakeClient] = []

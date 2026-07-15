@@ -250,6 +250,7 @@ it as supported; otherwise the override is removed and the bot reports the reset
 | `/start` | Start a conversation |
 | `/new` | Start a new session (clears current stream and cancels ongoing streaming) |
 | `/model` | Switch model (provider-specific list or `/model <id>`) |
+| `/usage` | View read-only provider rate limits and current-session usage without starting a turn |
 | `/effort [value\|default]` | Select or reset per-conversation Codex reasoning effort |
 | `/resume` | Browse and resume a previous session (shows progress summary with last assistant message) |
 | `/stop` | Interrupt execution immediately (bypasses queue, cancels active task) |
@@ -260,6 +261,12 @@ it as supported; otherwise the override is removed and the bot reports the reset
 | `/command <cmd> [args]` | Execute a Claude Code slash command |
 
 Any unrecognized `/command` is also forwarded as a skill invocation.
+
+`/usage` uses Codex app-server read methods and already-observed token updates.
+For Claude it uses only existing Agent SDK result metadata plus an optional,
+sanitized status-line snapshot. Missing account windows or a fresh session are
+reported as `unavailable`; the command never launches a provider turn or reads
+transcript/credential files.
 
 ## Environment Variables
 

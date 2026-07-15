@@ -16,6 +16,7 @@ from telegram.ext import (
     ContextTypes,
 )
 from telegram_bot.core import revert as revert_ops
+from telegram_bot.core.usage import UsageSnapshot, render_usage
 from telegram_bot.memory.distill_types import DistillTrigger
 from .conversation_paths import resolve_conversation_file
 from telegram_bot.utils.chat_logger import log_debug
@@ -40,6 +41,32 @@ class BotCommandMixin:
         welcome_text = f"👋 Hello, {user.first_name}! Send a message to start chatting, or use /skills to view available skills."
         await message.reply_text(welcome_text)
         log_debug(user.id, "bot", welcome_text)
+
+    async def _cmd_usage(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Render local/read-only provider usage without starting an agent turn."""
+
+        if not await self._check_access(update):
+            return
+        user_id = self._require_user(update).id
+        message = self._require_message(update)
+        chat = self._require_chat(update)
+        provider = self._active_provider()
+        conversation_key = self._conversation_key(user_id, chat.id)
+        log_debug(user_id, "command", "/usage")
+        session = await self._session_manager.get_session(conversation_key)
+        session_id = session.get("session_id") if session.get("provider") == provider else None
+        if not isinstance(session_id, str) or not session_id:
+            session_id = None
+        try:
+            snapshot = await self._project_chat.get_usage(
+                user_id, chat.id, session_id
+            )
+        except Exception:
+            logger.warning("Provider usage read failed for %s", provider)
+            snapshot = UsageSnapshot(provider=provider)
+        reply = render_usage(snapshot)
+        await message.reply_text(reply)
+        log_debug(user_id, "bot", reply)
 
     async def _cmd_skills(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_access(update):

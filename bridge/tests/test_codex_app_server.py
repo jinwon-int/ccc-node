@@ -483,6 +483,19 @@ class CodexAppServerTests(unittest.IsolatedAsyncioTestCase):
             {"threadId": "thread-1", "turnId": "turn-1"},
         )
         await assert_call(client.list_models(include_hidden=True), "model/list", {"includeHidden": True})
+        for call, method in (
+            (client.account_rate_limits(), "account/rateLimits/read"),
+            (client.account_usage(), "account/usage/read"),
+        ):
+            before = len(writer.messages)
+            task = asyncio.create_task(call)
+            while len(writer.messages) == before:
+                await asyncio.sleep(0)
+            request = writer.messages[-1]
+            assert request["method"] == method
+            assert "params" not in request
+            writer.feed({"id": request["id"], "result": {"ok": True}})
+            assert await task == {"ok": True}
         await client.close()
 
 

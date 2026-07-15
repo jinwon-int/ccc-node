@@ -386,6 +386,16 @@ class CodexAppServerClient:
             params["includeHidden"] = True
         return await self.request("model/list", params)
 
+    async def account_rate_limits(self) -> JsonValue:
+        """Read the current account rate-limit snapshot without consuming credit."""
+
+        return await self.request("account/rateLimits/read")
+
+    async def account_usage(self) -> JsonValue:
+        """Read the current account token summary without starting a turn."""
+
+        return await self.request("account/usage/read")
+
     @staticmethod
     def _optional_string(value: object) -> str | None:
         return value if isinstance(value, str) and value else None
