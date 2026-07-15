@@ -20,6 +20,7 @@ config_module.config = SimpleNamespace(
     allowed_user_ids=[],
     claude_settings_path=Path("/tmp/settings.json"),
     max_voice_duration=300,
+    max_document_size_mb=20,
     bot_data_dir=Path("/tmp/telegram-bot-data"),
     transcription_provider="whisper",
     openai_api_key="test-key",
@@ -1124,6 +1125,259 @@ class PhotoFlowTests(unittest.IsolatedAsyncioTestCase):
         prompt = bot._process_user_message_text.await_args.args[2]
         self.assertIn(".png", prompt)
         self.assertIn("Please describe what is in the image", prompt)
+
+
+class DocumentFlowTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def _bot():
+        return _make_bot(
+            settings=config_module.config,
+            session_manager=session_module.session_manager,
+            project_chat=project_chat_module.project_chat_handler,
+        )
+
+    @staticmethod
+    async def _run_now(user_id, run_task, on_overflow):
+        del user_id, on_overflow
+        await run_task()
+        return True
+
+    @staticmethod
+    def _document(**overrides):
+        values = {
+            "file_id": "private-file-id",
+            "mime_type": "application/pdf",
+            "file_name": "report.pdf",
+            "file_size": 4,
+        }
+        values.update(overrides)
+        return SimpleNamespace(**values)
+
+    async def test_unauthorized_document_is_rejected_before_enqueue_or_download(self):
+        bot = self._bot()
+        bot._check_access = AsyncMock(return_value=False)
+        bot._enqueue_user_task = AsyncMock()
+        bot._download_document_file = AsyncMock()
+        update = _build_photo_update(11, document=self._document())
+
+        await bot._handle_document_message(update, None)
+
+        bot._enqueue_user_task.assert_not_called()
+        bot._download_document_file.assert_not_awaited()
+
+    async def test_oversize_and_executable_documents_fail_before_download(self):
+        for document, expected in (
+            (self._document(file_size=21 * 1024 * 1024), "too large"),
+            (
+                self._document(
+                    mime_type="application/x-msdownload",
+                    file_name="payload.exe",
+                ),
+                "not supported",
+            ),
+        ):
+            with self.subTest(file_name=document.file_name):
+                bot = self._bot()
+                bot._check_access = AsyncMock(return_value=True)
+                bot._enqueue_user_task = AsyncMock()
+                bot._download_document_file = AsyncMock()
+                update = _build_photo_update(11, document=document)
+
+                await bot._handle_document_message(update, None)
+
+                bot._enqueue_user_task.assert_not_called()
+                bot._download_document_file.assert_not_awaited()
+                self.assertTrue(any(expected in reply for reply in update.message.replies))
+
+    async def test_document_is_private_forwarded_and_cleaned_without_sensitive_logs(self):
+        bot = self._bot()
+        bot._check_access = AsyncMock(return_value=True)
+        bot._enqueue_user_task = self._run_now
+        observed = {}
+
+        async def download(document, destination):
+            del document
+            observed["initial_file_mode"] = destination.stat().st_mode & 0o777
+            destination.write_bytes(b"data")
+            observed["destination"] = destination
+
+        async def process(update, user_id, prompt, **kwargs):
+            del update, user_id
+            path = observed["destination"]
+            observed.update(
+                prompt=prompt,
+                source=kwargs.get("message_source"),
+                sensitive_log_event=kwargs.get("sensitive_log_event"),
+                file_mode=path.stat().st_mode & 0o777,
+                dir_mode=path.parent.stat().st_mode & 0o777,
+                existed_during_turn=path.exists(),
+            )
+
+        bot._download_document_file = AsyncMock(side_effect=download)
+        bot._process_user_message_text = AsyncMock(side_effect=process)
+        update = _build_photo_update(
+            11,
+            document=self._document(file_name="../../private-payroll.pdf"),
+            caption="summarize this",
+        )
+
+        with TemporaryDirectory() as td, self.assertLogs(
+            "telegram_bot.core.bot_voice", level="INFO"
+        ) as logs:
+            bot._document_dir = Path(td) / "uploads"
+            await bot._handle_document_message(update, None)
+
+        destination = observed["destination"]
+        self.assertEqual(destination.parent.name, "uploads")
+        self.assertNotIn("private-payroll", destination.name)
+        self.assertTrue(observed["existed_during_turn"])
+        self.assertEqual(observed["initial_file_mode"], 0o600)
+        self.assertEqual(observed["file_mode"], 0o600)
+        self.assertEqual(observed["dir_mode"], 0o700)
+        self.assertEqual(observed["source"], "document")
+        self.assertEqual(observed["sensitive_log_event"], "inbound_document")
+        self.assertIn("private-payroll.pdf", observed["prompt"])
+        self.assertIn("summarize this", observed["prompt"])
+        self.assertFalse(destination.exists())
+        rendered_logs = "\n".join(logs.output)
+        self.assertNotIn("private-file-id", rendered_logs)
+        self.assertNotIn("private-payroll", rendered_logs)
+        self.assertNotIn("summarize this", rendered_logs)
+
+    async def test_download_failure_is_user_visible_and_leaves_no_file(self):
+        bot = self._bot()
+        bot._check_access = AsyncMock(return_value=True)
+        bot._enqueue_user_task = self._run_now
+        bot._download_document_file = AsyncMock(side_effect=RuntimeError("secret-url"))
+        bot._process_user_message_text = AsyncMock()
+        update = _build_photo_update(11, document=self._document())
+
+        with TemporaryDirectory() as td, self.assertLogs(
+            "telegram_bot.core.bot_voice", level="WARNING"
+        ) as logs:
+            bot._document_dir = Path(td) / "uploads"
+            await bot._handle_document_message(update, None)
+            leftovers = list(bot._document_dir.glob("*"))
+
+        self.assertEqual(leftovers, [])
+        self.assertTrue(any("Failed to download your file" in r for r in update.message.replies))
+        self.assertNotIn("secret-url", "\n".join(logs.output))
+        bot._process_user_message_text.assert_not_awaited()
+
+    async def test_actual_download_size_is_rechecked_when_metadata_is_missing(self):
+        bot = self._bot()
+        bot._check_access = AsyncMock(return_value=True)
+        bot._enqueue_user_task = self._run_now
+        observed = {}
+
+        async def download(document, destination):
+            del document
+            destination.write_bytes(b"x" * (1024 * 1024 + 1))
+            observed["destination"] = destination
+
+        bot._download_document_file = AsyncMock(side_effect=download)
+        bot._process_user_message_text = AsyncMock()
+        update = _build_photo_update(
+            11,
+            document=self._document(file_size=None),
+        )
+        original_limit = config_module.config.max_document_size_mb
+
+        try:
+            config_module.config.max_document_size_mb = 1
+            with TemporaryDirectory() as td:
+                bot._document_dir = Path(td) / "uploads"
+                await bot._handle_document_message(update, None)
+        finally:
+            config_module.config.max_document_size_mb = original_limit
+
+        self.assertTrue(any("too large" in r for r in update.message.replies))
+        bot._process_user_message_text.assert_not_awaited()
+        self.assertFalse(observed["destination"].exists())
+
+    async def test_processing_failure_is_user_visible_and_cleans_file(self):
+        bot = self._bot()
+        bot._check_access = AsyncMock(return_value=True)
+        bot._enqueue_user_task = self._run_now
+        observed = {}
+
+        async def download(document, destination):
+            del document
+            destination.write_bytes(b"data")
+            observed["destination"] = destination
+
+        bot._download_document_file = AsyncMock(side_effect=download)
+        bot._process_user_message_text = AsyncMock(side_effect=RuntimeError("secret"))
+        update = _build_photo_update(11, document=self._document())
+
+        with TemporaryDirectory() as td, self.assertLogs(
+            "telegram_bot.core.bot_voice", level="WARNING"
+        ) as logs:
+            bot._document_dir = Path(td) / "uploads"
+            await bot._handle_document_message(update, None)
+
+        self.assertTrue(any("Failed to process your file" in r for r in update.message.replies))
+        self.assertFalse(observed["destination"].exists())
+        self.assertNotIn("secret", "\n".join(logs.output))
+
+    async def test_cancelled_processing_cleans_file_and_reraises(self):
+        bot = self._bot()
+        bot._check_access = AsyncMock(return_value=True)
+        bot._enqueue_user_task = self._run_now
+        observed = {}
+
+        async def download(document, destination):
+            del document
+            destination.write_bytes(b"data")
+            observed["destination"] = destination
+
+        bot._download_document_file = AsyncMock(side_effect=download)
+        bot._process_user_message_text = AsyncMock(side_effect=asyncio.CancelledError())
+        update = _build_photo_update(11, document=self._document())
+
+        with TemporaryDirectory() as td:
+            bot._document_dir = Path(td) / "uploads"
+            with self.assertRaises(asyncio.CancelledError):
+                await bot._handle_document_message(update, None)
+
+        self.assertFalse(observed["destination"].exists())
+
+    async def test_symlink_upload_directory_is_rejected_before_download(self):
+        bot = self._bot()
+        bot._check_access = AsyncMock(return_value=True)
+        bot._enqueue_user_task = self._run_now
+        bot._download_document_file = AsyncMock()
+        update = _build_photo_update(11, document=self._document())
+
+        with TemporaryDirectory() as td:
+            root = Path(td)
+            outside = root / "outside"
+            outside.mkdir()
+            bot._document_dir = root / "uploads"
+            bot._document_dir.symlink_to(outside, target_is_directory=True)
+
+            await bot._handle_document_message(update, None)
+
+            self.assertEqual(list(outside.iterdir()), [])
+
+        bot._download_document_file.assert_not_awaited()
+        self.assertTrue(any("File storage is unavailable" in r for r in update.message.replies))
+
+    async def test_document_queue_overflow_is_user_visible(self):
+        bot = self._bot()
+        bot._check_access = AsyncMock(return_value=True)
+
+        async def overflow(user_id, run_task, on_overflow):
+            del user_id, run_task
+            await on_overflow()
+            return False
+
+        bot._enqueue_user_task = overflow
+        update = _build_photo_update(11, document=self._document())
+
+        await bot._handle_document_message(update, None)
+
+        self.assertTrue(any("File queue is full" in r for r in update.message.replies))
 
 
 if __name__ == "__main__":

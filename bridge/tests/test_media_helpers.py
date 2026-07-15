@@ -134,5 +134,56 @@ class ImagePromptTest(unittest.TestCase):
         self.assertIn("Please describe what is in the image", prompt)
 
 
+class DocumentHelperTest(unittest.TestCase):
+    def test_display_name_is_basename_only_and_control_chars_are_removed(self):
+        display = media.sanitize_document_display_name("../../private\nreport.PDF")
+        self.assertNotIn("/", display)
+        self.assertNotIn("\\", display)
+        self.assertNotIn("\n", display)
+        self.assertEqual(display, "private report.PDF")
+
+    def test_storage_name_is_random_and_keeps_only_a_safe_extension(self):
+        first = media.build_document_file_name("../../payroll.pdf", "application/pdf")
+        second = media.build_document_file_name("../../payroll.pdf", "application/pdf")
+        self.assertNotEqual(first, second)
+        self.assertTrue(first.startswith("document_"))
+        self.assertTrue(first.endswith(".pdf"))
+        self.assertNotIn("payroll", first)
+        self.assertNotIn("/", first)
+
+    def test_known_executable_binary_is_unsupported(self):
+        self.assertFalse(
+            media.is_supported_document("application/x-msdownload", "payload.exe")
+        )
+        self.assertFalse(media.is_supported_document("application/octet-stream", "lib.so"))
+        self.assertTrue(media.is_supported_document("application/pdf", "report.pdf"))
+        self.assertTrue(media.is_supported_document("application/zip", "sources.zip"))
+
+    def test_prompt_includes_bounded_metadata_and_untrusted_data_warning(self):
+        prompt = media.build_document_prompt(
+            Path("/project/.telegram_bot/uploads/document_abc.pdf"),
+            display_name="report.pdf",
+            mime_type="application/pdf",
+            size_bytes=123,
+            caption="summarize this",
+        )
+        self.assertIn("Local document path:", prompt)
+        self.assertIn("report.pdf", prompt)
+        self.assertIn("application/pdf", prompt)
+        self.assertIn("123", prompt)
+        self.assertIn("summarize this", prompt)
+        self.assertIn("untrusted data", prompt)
+
+    def test_prompt_has_default_instruction_without_caption(self):
+        prompt = media.build_document_prompt(
+            Path("/project/.telegram_bot/uploads/document_abc.csv"),
+            display_name="data.csv",
+            mime_type="text/csv",
+            size_bytes=7,
+            caption="",
+        )
+        self.assertIn("Inspect the file and summarize its relevant contents", prompt)
+
+
 if __name__ == "__main__":
     unittest.main()

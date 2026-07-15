@@ -10,6 +10,8 @@ from typing import Any
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
+from telegram import Bot, Update
+from telegram.ext import MessageHandler
 
 from telegram_bot.core.project_chat_types import ChatResponse
 from telegram_bot.core.agent_runtime import (
@@ -682,6 +684,49 @@ def test_effort_command_handler_is_registered(tmp_path: Path) -> None:
         for command in getattr(handler, "commands", frozenset())
     }
     assert "effort" in commands
+
+
+def _telegram_document_update(*, mime_type: str, file_name: str) -> Update:
+    return Update.de_json(
+        {
+            "update_id": 1,
+            "message": {
+                "message_id": 1,
+                "date": 1_700_000_000,
+                "chat": {"id": 9, "type": "private"},
+                "from": {"id": 7, "is_bot": False, "first_name": "Test"},
+                "caption": "summarize",
+                "document": {
+                    "file_id": "file-id",
+                    "file_unique_id": "unique-id",
+                    "file_name": file_name,
+                    "mime_type": mime_type,
+                    "file_size": 128,
+                },
+            },
+        },
+        Bot("123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijk"),
+    )
+
+
+def test_document_handlers_match_pdf_once_without_overlapping_images(tmp_path: Path) -> None:
+    bot = bare_bot(make_manager(tmp_path, "claude"), provider="claude")
+    bot.application = SimpleNamespace(add_handler=Mock())
+    bot._setup_handlers()
+    handlers = [
+        call.args[0]
+        for call in bot.application.add_handler.call_args_list
+        if isinstance(call.args[0], MessageHandler)
+    ]
+
+    def matching_callbacks(update: Update) -> list[str]:
+        return [handler.callback.__name__ for handler in handlers if handler.check_update(update)]
+
+    pdf = _telegram_document_update(mime_type="application/pdf", file_name="report.pdf")
+    image = _telegram_document_update(mime_type="image/png", file_name="image.png")
+
+    assert matching_callbacks(pdf) == ["_handle_document_message"]
+    assert matching_callbacks(image) == ["_handle_photo_message"]
 
 
 @pytest.mark.anyio

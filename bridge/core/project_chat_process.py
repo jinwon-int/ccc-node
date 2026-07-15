@@ -4,6 +4,7 @@
 
 import asyncio
 import logging
+import re
 from collections.abc import Mapping
 from typing import Any, Optional
 
@@ -51,6 +52,22 @@ from telegram_bot.utils.health import health_reporter
 logger = logging.getLogger(__name__)
 
 
+def _log_user_input(
+    *,
+    user_message: str,
+    user_id: int,
+    session_id: Optional[str],
+    model: Optional[str],
+    sensitive_log_event: Optional[str],
+) -> None:
+    if sensitive_log_event is not None:
+        safe_event = re.sub(r"[^a-z0-9_.-]+", "_", sensitive_log_event.lower()).strip("_")
+        logger.info("Processing sensitive input event=%s", safe_event[:64] or "unknown")
+        return
+    logger.info("Processing message from user %s: %s...", user_id, user_message[:80])
+    log_chat(user_id, session_id, "user", user_message, model=model)
+
+
 def _process_timeout() -> int:
     """Read the active project_chat module compatibility constant at call time."""
     import sys
@@ -79,9 +96,18 @@ class ProjectChatProcessMixin:
         status_callback: Optional[StatusCallback] = None,
         bot: Optional[Any] = None,
         notification_bot: Optional[Any] = None,
+        sensitive_log_event: Optional[str] = None,
     ) -> ChatResponse:
         del message_id
         if self._agent_runtime is not None:
+            if sensitive_log_event is not None:
+                _log_user_input(
+                    user_message=user_message,
+                    user_id=user_id,
+                    session_id=session_id,
+                    model=model,
+                    sensitive_log_event=sensitive_log_event,
+                )
             return await self._process_agent_message(
                 user_message=user_message,
                 user_id=user_id,
@@ -98,8 +124,13 @@ class ProjectChatProcessMixin:
                 status_callback=status_callback,
                 bot=bot,
             )
-        logger.info(f"Processing message from user {user_id}: {user_message[:80]}...")
-        log_chat(user_id, session_id, "user", user_message, model=model)
+        _log_user_input(
+            user_message=user_message,
+            user_id=user_id,
+            session_id=session_id,
+            model=model,
+            sensitive_log_event=sensitive_log_event,
+        )
 
         loop = asyncio.get_running_loop()
         future: asyncio.Future = loop.create_future()

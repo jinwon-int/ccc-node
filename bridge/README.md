@@ -32,6 +32,7 @@ This bot takes a different approach — **lightweight, zero-infrastructure, secu
 - Progressive streaming: AI responses update in real-time as Claude thinks, not after completion
 - Claude's numbered options auto-convert to Telegram inline keyboard buttons — just tap to choose
 - File paths (images, PDFs, etc.) in Claude's responses are automatically sent as photos or documents
+- Inbound Telegram documents are downloaded into a private project-scoped temporary path and passed to the active agent runtime for inspection
 - Native Telegram voice messages: auto-download, format detection/conversion (OGG/AMR → MP3), Whisper transcription, then forwarded to Claude
 - Per-user dedicated SDK streams — low latency, concurrent message support (up to 3 per user)
 - Priority `/stop` command: immediately cancels running tasks and voice transcription, even when message queue is full
@@ -277,6 +278,7 @@ Any unrecognized `/command` is also forwarded as a skill invocation.
 | `CLAUDE_CLI_PATH` | No | *(auto-detect)* | Absolute path to Claude CLI binary |
 | `CLAUDE_SETTINGS_PATH` | No | `~/.claude/settings.json` | Path to Claude Code settings file |
 | `CLAUDE_PROCESS_TIMEOUT` | No | `600` | SDK timeout in seconds |
+| `CCC_MAX_DOCUMENT_SIZE_MB` | No | `20` | Maximum inbound Telegram document size in MiB (1–50) |
 | `AUTO_NEW_SESSION_AFTER_HOURS` | No | `24` | Auto-start new session after N hours of inactivity; set to `0`/`false`/`off` to disable |
 | `DRAFT_UPDATE_MIN_CHARS` | No | `150` | Minimum characters before streaming draft update |
 | `DRAFT_UPDATE_INTERVAL` | No | `1.0` | Minimum seconds between streaming draft updates |
@@ -296,6 +298,14 @@ Any unrecognized `/command` is also forwarded as a skill invocation.
 | `VOICE_REPLY_PERSONA` | No | `Tingting` | Persona name used by voice reply mode |
 | `LOG_LEVEL` | No | `INFO` | Logging level |
 | `PROXY_URL` | No | — | HTTP proxy; auto-configures `http_proxy`/`https_proxy`/`all_proxy` |
+
+## Inbound Document Handling
+
+- Non-image Telegram documents are accepted only after the normal allowlist check.
+- Each upload is stored under `PROJECT_ROOT/.telegram_bot/uploads/` with a random server-side name, a private `0700` directory, and `0600` file permissions.
+- Declared and downloaded sizes are checked against `CCC_MAX_DOCUMENT_SIZE_MB` (default: 20 MiB); known executable binary formats are rejected before download.
+- The local path, sanitized display name, MIME type, size, and optional caption are passed to the active agent runtime. Unsupported runtime formats are reported explicitly.
+- Temporary files are removed after success, failure, or cancellation; stale files are pruned at startup.
 
 ## Voice Transcription Channels
 

@@ -25,6 +25,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `approve-each`, and `disabled` policies retain their prior behavior.
 
 ### Added
+- **Private inbound Telegram documents (#503).** Non-image `Document` updates now
+  pass the allowlist before download, land under the project-scoped bot data
+  directory with collision-resistant names and `0700`/`0600` permissions, and
+  are forwarded to the active agent with bounded, sanitized metadata. Declared
+  and downloaded sizes are both enforced via `CCC_MAX_DOCUMENT_SIZE_MB`; known
+  executable binaries, queue overflow, download errors, and unsupported agent
+  formats are user-visible instead of silently dropped. Sensitive document
+  prompts bypass normal chat-input logging in favor of a fixed audit event.
+  Temporary files are removed on success, failure, cancellation, and
+  stale-startup cleanup.
 - **Coverage, mypy, and complexity regression gates (#348).** The CI coverage
   run now measures branch coverage and fails under 72% (measured baseline
   74.1%; staged plan to 80% in `docs/quality-baseline.md`). Ruff gains the

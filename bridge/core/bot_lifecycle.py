@@ -45,16 +45,25 @@ class BotLifecycleMixin:
         """Called after application.initialize() — sets up commands and cleanup."""
         self._audio_dir.mkdir(parents=True, exist_ok=True)
         self._image_dir.mkdir(parents=True, exist_ok=True)
+        if self._document_dir.is_symlink():
+            raise RuntimeError("Document upload directory must not be a symlink")
+        self._document_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(self._document_dir, 0o700)
         removed = await self._cleanup_stale_audio_files(
             self._audio_dir, max_age_seconds=self._STALE_AUDIO_SECONDS
         )
         removed_images = await self._cleanup_stale_audio_files(
             self._image_dir, max_age_seconds=self._STALE_AUDIO_SECONDS
         )
+        removed_documents = await self._cleanup_stale_audio_files(
+            self._document_dir, max_age_seconds=self._STALE_AUDIO_SECONDS
+        )
         if removed:
             logger.info("Startup audio cleanup removed %s stale file(s)", removed)
         if removed_images:
             logger.info("Startup image cleanup removed %s stale file(s)", removed_images)
+        if removed_documents:
+            logger.info("Startup document cleanup removed %s stale file(s)", removed_documents)
 
         # Reap any node-claude orphans left over from a previous bridge run.
         # On Android/Termux there is no systemd cgroup to clean up child

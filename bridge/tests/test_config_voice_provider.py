@@ -231,6 +231,30 @@ class VoiceProviderConfigTests(unittest.TestCase):
             cfg = module.Config(telegram_bot_token="123456:abc", _env_file=None)
             self.assertEqual(cfg.voice_reply_persona, "Tingting")
 
+    def test_inbound_document_size_limit_defaults_and_validation(self):
+        with TemporaryDirectory() as td:
+            module = self._load_config_module(td)
+            cfg = module.Config(telegram_bot_token="123456:abc", _env_file=None)
+            self.assertEqual(cfg.max_document_size_mb, 20)
+
+            with patch.dict(
+                os.environ,
+                {"CCC_MAX_DOCUMENT_SIZE_MB": "8"},
+                clear=False,
+            ):
+                custom = module.Config(
+                    telegram_bot_token="123456:abc",
+                    _env_file=None,
+                )
+            self.assertEqual(custom.max_document_size_mb, 8)
+
+            with self.assertRaises(ValidationError):
+                module.Config(
+                    telegram_bot_token="123456:abc",
+                    CCC_MAX_DOCUMENT_SIZE_MB=0,
+                    _env_file=None,
+                )
+
     def test_auto_new_session_hours_defaults_to_24(self):
         with TemporaryDirectory() as td:
             module = self._load_config_module(td)
