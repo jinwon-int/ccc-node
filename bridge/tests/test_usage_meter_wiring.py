@@ -590,6 +590,31 @@ class CodexRuntimeRecorderTests(unittest.IsolatedAsyncioTestCase):
             await runtime.close()
         self.assertEqual(attempts, [1])
 
+    async def test_output_heavy_resumed_turn_keeps_its_full_total(self) -> None:
+        # Reviewer probe: cumulative 100/500 with last.totalTokens=600 must
+        # imply a (0, 0) baseline so the whole 600-token turn is metered,
+        # not just the 100 input tokens.
+        runtime = self._runtime()
+        observed: list[tuple[int, int] | None] = []
+        runtime.set_usage_recorder(
+            lambda _tid, prev, _cur: observed.append(
+                None
+                if prev is None
+                else (prev.input_tokens or 0, prev.output_tokens or 0)
+            )
+        )
+        runtime._started_turn_ids["turn-ours"] = None
+        runtime._route_notification(
+            self._notification_for(
+                "thread-resumed",
+                100,
+                500,
+                turn_id="turn-ours",
+                last={"totalTokens": 600},
+            )
+        )
+        self.assertEqual(observed, [(0, 0)])
+
     async def test_history_notifications_without_our_turn_still_baseline(self) -> None:
         runtime = self._runtime()
         observed: list[object] = []
@@ -677,6 +702,72 @@ class DistillSchedulerLoopTests(unittest.IsolatedAsyncioTestCase):
 
         journal, job, backend = await self._run_one_case(budget_tokens=200000)
         self.assertEqual(len(backend.calls), 1)
+        self.assertIs(
+            journal.get(job.job_id).status, DistillJobStatus.EXTRACTION_DONE
+        )
+
+
+class RetryableFailureLoopTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+
+    async def test_transiently_failed_extraction_is_driven_again(self) -> None:
+        import test_distill_worker as distill_fixtures
+
+        from telegram_bot.core.bot import TelegramBot
+        from telegram_bot.memory.codex_exec_backend import CodexDistillBackendError
+        from telegram_bot.memory.distill_journal import DistillJournal
+        from telegram_bot.memory.distill_types import DistillJobStatus
+
+        class FlakyBackend:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            async def extract(self, extraction_input):
+                self.calls += 1
+                if self.calls == 1:
+                    raise CodexDistillBackendError("codex_distill_timeout")
+                return distill_fixtures.output_for(extraction_input)
+
+        journal = DistillJournal(self.root / "journal")
+        journal.initialize()
+        job = distill_fixtures.snapshot_done_job(journal)
+        settings = _settings(self.root, provider="codex")
+        settings.usage_budget_tokens_codex = 200000
+        settings.distill_extraction_poll_interval = 0.02
+        settings.bot_data_dir = self.root / "bot-data"
+        settings.ffmpeg_path = None
+        handler = ProjectChatHandler(
+            settings=settings, agent_runtime=_RecorderRuntime()
+        )
+        backend = FlakyBackend()
+        worker = handler.build_distill_extraction_worker(
+            journal, backend, owner_token="retry-loop-test"
+        )
+        bot = TelegramBot(
+            settings=settings,
+            session_manager=None,
+            project_chat=handler,
+            distill_journal=journal,
+            distill_extraction_worker=worker,
+        )
+        stop = asyncio.Event()
+        loop_task = asyncio.create_task(bot._distill_extraction_loop(stop))
+        try:
+            deadline = asyncio.get_running_loop().time() + 2.0
+            while (
+                journal.get(job.job_id).status
+                is not DistillJobStatus.EXTRACTION_DONE
+                and asyncio.get_running_loop().time() < deadline
+            ):
+                await asyncio.sleep(0.02)
+        finally:
+            stop.set()
+            await asyncio.wait_for(loop_task, timeout=2.0)
+        # One failed attempt, one successful retry driven by a later sweep.
+        self.assertEqual(backend.calls, 2)
         self.assertIs(
             journal.get(job.job_id).status, DistillJobStatus.EXTRACTION_DONE
         )

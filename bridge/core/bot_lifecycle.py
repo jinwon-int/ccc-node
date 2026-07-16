@@ -876,7 +876,13 @@ class BotLifecycleMixin:
                 for job in jobs:
                     if stop_event.is_set():
                         break
-                    if job.status is not DistillJobStatus.SNAPSHOT_DONE:
+                    # Ready set: fresh snapshots AND transiently failed
+                    # extractions — claim_extraction accepts both, and the
+                    # worker's max-attempts gate bounds the retries.
+                    if job.status not in (
+                        DistillJobStatus.SNAPSHOT_DONE,
+                        DistillJobStatus.EXTRACTION_RETRYABLE_FAILED,
+                    ):
                         continue
                     await worker.extract_once(job_id=job.job_id)
             except asyncio.CancelledError:

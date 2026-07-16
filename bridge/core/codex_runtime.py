@@ -930,12 +930,16 @@ class CodexRuntime:
         last_input = _count(last.get("inputTokens"))
         last_output = _count(last.get("outputTokens"))
         if last_input is None and last_output is None:
-            # Older shape: only the turn total is exposed; attribute it to
-            # input so the turn is still metered (budget-conservative).
+            # Older shape: only the turn total is exposed. Split it against
+            # the cumulative totals — take what input can absorb, then the
+            # remainder from output — so output-heavy first resumed turns
+            # keep their full turn total instead of losing the output share
+            # to the zero clamp below.
             last_total = _count(last.get("totalTokens"))
             if last_total is None:
                 return None
-            last_input, last_output = last_total, 0
+            last_input = min(snapshot.input_tokens or 0, last_total)
+            last_output = last_total - last_input
         return UsageSnapshot(
             provider="codex",
             input_tokens=max(0, (snapshot.input_tokens or 0) - (last_input or 0)),
