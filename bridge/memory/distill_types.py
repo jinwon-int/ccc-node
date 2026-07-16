@@ -25,6 +25,10 @@ class DistillJobStatus(str, Enum):
     SNAPSHOT_DONE = "snapshot_done"
     RETRYABLE_FAILED = "retryable_failed"
     TERMINAL_FAILED = "terminal_failed"
+    RUNNING_EXTRACTION = "running_extraction"
+    EXTRACTION_RETRYABLE_FAILED = "extraction_retryable_failed"
+    EXTRACTION_DONE = "extraction_done"
+    EXTRACTION_TERMINAL_FAILED = "extraction_terminal_failed"
 
 
 @dataclass(frozen=True, slots=True)
@@ -170,6 +174,10 @@ class DistillJob:
     lease_expires_at: str | None = None
     snapshot: CodexTranscriptSnapshot | None = None
     error_code: str | None = None
+    extraction_attempts: int = 0
+    extraction_lease_epoch: int = 0
+    extraction_output: str | None = None
+    extraction_output_hash: str | None = None
 
     def __post_init__(self) -> None:
         if not _SHA256_RE.fullmatch(self.job_id):
@@ -186,12 +194,32 @@ class DistillJob:
             raise ValueError("invalid distill job thread identity")
         if not self.discriminator:
             raise ValueError("distill job discriminator must not be empty")
-        if self.schema_version <= 0 or self.attempts < 0 or self.lease_epoch < 0:
+        if (
+            self.schema_version <= 0
+            or self.attempts < 0
+            or self.lease_epoch < 0
+            or self.extraction_attempts < 0
+            or self.extraction_lease_epoch < 0
+        ):
             raise ValueError("invalid distill job counters")
         if self.error_code is not None and not _SAFE_ERROR_CODE_RE.fullmatch(
             self.error_code
         ):
             raise ValueError("invalid distill job error_code")
+        if (self.extraction_output is None) != (self.extraction_output_hash is None):
+            raise ValueError("distill extraction output and hash must be stored together")
+        if self.extraction_output is not None:
+            if not self.extraction_output:
+                raise ValueError("distill extraction output must not be empty")
+            expected_hash = hashlib.sha256(
+                self.extraction_output.encode("utf-8")
+            ).hexdigest()
+            if (
+                not isinstance(self.extraction_output_hash, str)
+                or not _SHA256_RE.fullmatch(self.extraction_output_hash)
+                or self.extraction_output_hash != expected_hash
+            ):
+                raise ValueError("invalid distill extraction output hash")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -211,6 +239,10 @@ class DistillJob:
             "lease_expires_at": self.lease_expires_at,
             "snapshot": self.snapshot.to_dict() if self.snapshot is not None else None,
             "error_code": self.error_code,
+            "extraction_attempts": self.extraction_attempts,
+            "extraction_lease_epoch": self.extraction_lease_epoch,
+            "extraction_output": self.extraction_output,
+            "extraction_output_hash": self.extraction_output_hash,
         }
 
     @classmethod
@@ -232,20 +264,30 @@ class DistillJob:
             raise ValueError("invalid distill job snapshot")
         attempts = value.get("attempts", 0)
         lease_epoch = value.get("lease_epoch", 0)
+        extraction_attempts = value.get("extraction_attempts", 0)
+        extraction_lease_epoch = value.get("extraction_lease_epoch", 0)
         schema_version = value.get("schema_version")
         if type(attempts) is not int or attempts < 0:
             raise ValueError("invalid distill job attempts")
         if type(lease_epoch) is not int or lease_epoch < 0:
             raise ValueError("invalid distill job lease_epoch")
+        if type(extraction_attempts) is not int or extraction_attempts < 0:
+            raise ValueError("invalid distill job extraction_attempts")
+        if type(extraction_lease_epoch) is not int or extraction_lease_epoch < 0:
+            raise ValueError("invalid distill job extraction_lease_epoch")
         if type(schema_version) is not int or schema_version <= 0:
             raise ValueError("invalid distill job schema_version")
         owner_token = value.get("owner_token")
         lease_expires_at = value.get("lease_expires_at")
         error_code = value.get("error_code")
+        extraction_output = value.get("extraction_output")
+        extraction_output_hash = value.get("extraction_output_hash")
         for name, optional in (
             ("owner_token", owner_token),
             ("lease_expires_at", lease_expires_at),
             ("error_code", error_code),
+            ("extraction_output", extraction_output),
+            ("extraction_output_hash", extraction_output_hash),
         ):
             if optional is not None and not isinstance(optional, str):
                 raise ValueError(f"invalid distill job field: {name}")
@@ -270,4 +312,8 @@ class DistillJob:
                 else None
             ),
             error_code=error_code,
+            extraction_attempts=extraction_attempts,
+            extraction_lease_epoch=extraction_lease_epoch,
+            extraction_output=extraction_output,
+            extraction_output_hash=extraction_output_hash,
         )

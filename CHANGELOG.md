@@ -34,6 +34,11 @@ All notable changes to the Claude Code node harness. Dates are KST.
   per statement; one non-fleet target denies the whole command.
 
 ### Added
+- A durable provider-neutral Codex distill extraction worker now advances completed
+  snapshot jobs through fenced extraction leases, atomically retains one strict result,
+  classifies body-free retryable/terminal failures, and recovers cancellation or stale
+  leases without re-reading the user thread. Runtime scheduling and memory sink writes
+  remain deferred under #465. Refs #532.
 - Hermes-style unattended skill-autosave **auto mode** (#355, opt-in via
   `CCC_SKILL_AUTOSAVE_MODE=auto` or the `skill-autosave.mode` state file;
   default `approve` keeps every existing node unchanged). New

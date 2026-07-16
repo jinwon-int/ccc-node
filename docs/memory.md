@@ -71,9 +71,14 @@ serializes deterministic input, and validates a strict versioned result.
   redacted stdin, a minimal allowlisted environment, bounded timeout/cancellation,
   process-group termination, and an owner-only output file. Provider stdout/stderr and
   output bodies are never exposed through errors.
-- The backend is not connected to the journal worker and performs no
-  local/Honcho/Wiki/resume sink mutation. Those orchestration and replay-safe sink
-  phases remain under #465.
+- `bridge/memory/distill_worker.py` claims only completed snapshots, invokes the
+  provider-neutral backend behind a fenced extraction lease, and atomically persists
+  one strictly validated result or a body-free retryable/terminal failure. Concurrent
+  duplicate workers are idempotent, cancellation remains retryable, and stale leases
+  resume at extraction without re-reading the user thread.
+- The worker is not scheduled by the bridge lifecycle and performs no
+  local/Honcho/Wiki/resume sink mutation. Runtime scheduling and replay-safe sink phases
+  remain under #465.
 
 ## Useful commands
 
