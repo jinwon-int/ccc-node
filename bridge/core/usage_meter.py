@@ -159,6 +159,10 @@ class UsageMeter:
         self._lock = threading.Lock()
         self._lock_path = self._path.with_name(self._path.name + ".lock")
         self._flock_warned = False
+        # True while in-memory counters hold deltas a failed _save() could
+        # not persist; _locked_state then skips the disk reload so those
+        # deltas survive (cross-process merge resumes after a good save).
+        self._save_failed = False
         self._budgets: dict[str, int] = {}
         for provider, budget in dict(budgets or {}).items():
             self._validate_provider(provider)
@@ -236,6 +240,7 @@ class UsageMeter:
                     handle.write(payload)
                 os.chmod(tmp_name, 0o600)
                 os.replace(tmp_name, self._path)
+                self._save_failed = False
             except BaseException:
                 try:
                     os.unlink(tmp_name)
@@ -243,6 +248,7 @@ class UsageMeter:
                     pass
                 raise
         except OSError:
+            self._save_failed = True
             logger.warning(
                 "Usage meter state could not be persisted to %s; keeping "
                 "in-memory counters",
@@ -280,9 +286,10 @@ class UsageMeter:
                         self._lock_path,
                     )
             try:
-                self._days.clear()
-                self._alerted.clear()
-                self._load()
+                if not self._save_failed:
+                    self._days.clear()
+                    self._alerted.clear()
+                    self._load()
                 yield
                 if save:
                     self._save()

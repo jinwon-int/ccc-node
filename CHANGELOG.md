@@ -76,10 +76,13 @@ All notable changes to the Claude Code node harness. Dates are KST.
   every outcome including error terminals and turns cancelled before their
   first event charges exactly once while pre-boundary failures charge
   nothing, and the distill extraction worker charges every
-  autonomous attempt with a conservative pre-spend token reservation
-  (2048 overhead + snapshot bytes ÷ 2) until the exec backend can report
-  actual usage, so repeated background work consumes — and eventually
-  hits — the cap. Autonomous admission is atomic and prospective: the
+  autonomous attempt with a worst-case pre-spend token reservation over the complete request
+  (8192 prompt/schema overhead + the backend's hard output-size cap as the
+  output allowance + six tokens per raw snapshot byte, covering canonical
+  JSON escape expansion at ≤1 BPE token per serialized byte) until the exec
+  backend can report actual usage, so repeated background work consumes —
+  and eventually hits — the cap and complete valid input+output cost cannot
+  exceed an admitted budget. Autonomous admission is atomic and prospective: the
   meter's `reserve_autonomous_spend` admits only when the whole bounded
   attempt cost (overhead + persisted snapshot size, reserved before the
   claim) fits under the cap and charges it in the same locked step, so
@@ -96,7 +99,9 @@ All notable changes to the Claude Code node harness. Dates are KST.
   re-reads the on-disk state before applying its delta, so overlapping
   meter instances or bridge processes merge spend instead of losing it to
   last-writer-wins (falling back to thread-only locking with a logged
-  warning if the lock file is unavailable). The bridge
+  warning if the lock file is unavailable, and preserving unpersisted
+  in-memory deltas across repeated save failures instead of reloading over
+  them). The bridge
   composition root (`build_context`) now constructs the distill extraction
   worker itself through the handler factory with the shared meter, the
   running `TelegramBot` retains that gated instance and drives it from the

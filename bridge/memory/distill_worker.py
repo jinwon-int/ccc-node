@@ -13,6 +13,7 @@ from .distill_extraction import (
     DistillExtractionOutput,
     build_extraction_input,
 )
+from .codex_exec_backend import MAX_EXTRACTION_JSON_BYTES
 from .distill_journal import DistillJournal
 from .distill_types import DistillJob
 
@@ -49,14 +50,16 @@ _SAFE_ERROR_CODE_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 # Worst-case autonomous pre-spend reservation (#388). The codex exec backend
 # discards provider stdout, so per-attempt token usage is not observable here
 # until #465's cost-metering criterion lands. Every extraction attempt charges
-# a bound instead: BPE tokenizers emit at most ~1 token per encoded byte, so
-# TWO tokens per raw snapshot byte absorbs canonical-payload JSON escaping for
-# bounded provider transcript text, and the flat overhead covers the
-# extraction prompt, schema, and a bounded response (a 64 KiB high-entropy
-# snapshot reserves ~139k tokens versus ~45k measured with o200k_base).
-# Budgets must fit one maximal attempt or that work stays deferred by design.
+# a post-serialization bound over the COMPLETE request instead: canonical
+# JSON escaping expands one raw snapshot byte to at most six serialized bytes
+# (backslash-u escapes), BPE tokenizers emit at most ~1 token per serialized
+# byte, the flat overhead covers the extraction prompt and schema, and the
+# output allowance equals the backend's hard output-size cap (output tokens
+# cannot exceed its JSON bytes). Budgets must fit one maximal attempt or that
+# work stays deferred by design.
 _RESERVED_OVERHEAD_TOKENS = 8192
-_RESERVED_TOKENS_PER_BYTE = 2
+_RESERVED_TOKENS_PER_BYTE = 6
+_RESERVED_OUTPUT_TOKENS = MAX_EXTRACTION_JSON_BYTES
 _RETRYABLE_BACKEND_CODES = frozenset(
     {
         "codex_distill_spawn_failed",
@@ -153,6 +156,7 @@ class CodexDistillExtractionWorker:
             )
             reserved_tokens = (
                 _RESERVED_OVERHEAD_TOKENS
+                + _RESERVED_OUTPUT_TOKENS
                 + max(0, snapshot_bytes) * _RESERVED_TOKENS_PER_BYTE
             )
             reservation = self._usage_meter.reserve_autonomous_spend(

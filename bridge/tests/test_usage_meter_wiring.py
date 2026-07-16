@@ -675,7 +675,7 @@ class DistillSchedulerLoopTests(unittest.IsolatedAsyncioTestCase):
     async def test_admitted_work_is_driven_to_extraction_by_the_loop(self) -> None:
         from telegram_bot.memory.distill_types import DistillJobStatus
 
-        journal, job, backend = await self._run_one_case(budget_tokens=10000)
+        journal, job, backend = await self._run_one_case(budget_tokens=200000)
         self.assertEqual(len(backend.calls), 1)
         self.assertIs(
             journal.get(job.job_id).status, DistillJobStatus.EXTRACTION_DONE

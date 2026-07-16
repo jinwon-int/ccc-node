@@ -420,3 +420,22 @@ class ReserveTests(UsageMeterTestCase):
         self.assertTrue(decision.allowed)
         self.assertEqual(decision.state, "ok")
         self.assertEqual(meter.check_autonomous_spend("codex").state, "blocked")
+
+
+class PersistenceFailureTests(UsageMeterTestCase):
+    def test_repeated_save_failures_preserve_inmemory_deltas(self) -> None:
+        # Reviewer probe: two 9-token records against an unavailable state
+        # path must report 18, not 9 — the failed-save deltas survive the
+        # next mutation instead of being reloaded over, and the budget keeps
+        # gating on the merged in-memory state while degraded.
+        meter = self.make_meter(budgets={"codex": 10})
+        self.path.mkdir()  # os.replace onto a directory fails on POSIX
+        with self.assertLogs("telegram_bot.core.usage_meter", level="WARNING"):
+            meter.record("codex", MODE_INTERACTIVE, input_tokens=9)
+        self.assertEqual(meter.used_tokens("codex"), 9)
+        with self.assertLogs("telegram_bot.core.usage_meter", level="WARNING"):
+            meter.record("codex", MODE_INTERACTIVE, input_tokens=9)
+        self.assertEqual(meter.used_tokens("codex"), 18)
+        self.assertFalse(
+            meter.reserve_autonomous_spend("codex", input_tokens=1).allowed
+        )
