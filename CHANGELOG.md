@@ -99,8 +99,11 @@ All notable changes to the Claude Code node harness. Dates are KST.
   warning if the lock file is unavailable). The bridge
   composition root (`build_context`) now constructs the distill extraction
   worker itself through the handler factory with the shared meter, the
-  running `TelegramBot` retains that gated instance for #465's scheduling
-  phase, and the worker's `usage_meter` is an explicit required constructor
+  running `TelegramBot` retains that gated instance and drives it from the
+  bridge lifecycle: a fail-open sweep (default every 300s,
+  `distill_extraction_poll_interval`) runs every ready snapshot job through
+  the gated worker, so capped work is deferred before any provider call
+  while job-creating trigger policy remains #465's phase, and the worker's `usage_meter` is an explicit required constructor
   decision.
   Optional per-provider daily token budgets
   (`CCC_USAGE_BUDGET_TOKENS_CLAUDE`/`_CODEX`, 0 = off) raise one warn (early

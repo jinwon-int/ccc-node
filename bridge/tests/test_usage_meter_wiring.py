@@ -610,3 +610,73 @@ class CodexRuntimeRecorderTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DistillSchedulerLoopTests(unittest.IsolatedAsyncioTestCase):
+    """The bridge lifecycle drives the retained, budget-gated worker (#388)."""
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+
+    async def _run_one_case(self, *, budget_tokens: int) -> tuple:
+        import test_distill_worker as distill_fixtures
+
+        from telegram_bot.core.bot import TelegramBot
+        from telegram_bot.memory.distill_journal import DistillJournal
+
+        journal = DistillJournal(self.root / "journal")
+        journal.initialize()
+        job = distill_fixtures.snapshot_done_job(journal)
+        settings = _settings(self.root, provider="codex")
+        settings.usage_budget_tokens_codex = budget_tokens
+        settings.distill_extraction_poll_interval = 0.02
+        settings.bot_data_dir = self.root / "bot-data"
+        settings.ffmpeg_path = None
+        handler = ProjectChatHandler(
+            settings=settings, agent_runtime=_RecorderRuntime()
+        )
+        meter = handler.usage_meter
+        assert meter is not None
+        backend = distill_fixtures.SuccessfulBackend()
+        worker = handler.build_distill_extraction_worker(
+            journal, backend, owner_token="loop-test"
+        )
+        bot = TelegramBot(
+            settings=settings,
+            session_manager=None,
+            project_chat=handler,
+            distill_journal=journal,
+            distill_extraction_worker=worker,
+        )
+        stop = asyncio.Event()
+        loop_task = asyncio.create_task(bot._distill_extraction_loop(stop))
+        try:
+            deadline = asyncio.get_running_loop().time() + 1.0
+            while not backend.calls and asyncio.get_running_loop().time() < deadline:
+                await asyncio.sleep(0.02)
+        finally:
+            stop.set()
+            await asyncio.wait_for(loop_task, timeout=2.0)
+        return journal, job, backend
+
+    async def test_capped_work_never_reaches_the_backend(self) -> None:
+        from telegram_bot.memory.distill_types import DistillJobStatus
+
+        # The job's bounded attempt cost (2058 tokens) can never fit the
+        # 1000-token cap, so the prospective gate defers it before any claim.
+        journal, job, backend = await self._run_one_case(budget_tokens=1000)
+        self.assertEqual(backend.calls, [])
+        persisted = journal.get(job.job_id)
+        self.assertIs(persisted.status, DistillJobStatus.SNAPSHOT_DONE)
+        self.assertEqual(persisted.extraction_attempts, 0)
+
+    async def test_admitted_work_is_driven_to_extraction_by_the_loop(self) -> None:
+        from telegram_bot.memory.distill_types import DistillJobStatus
+
+        journal, job, backend = await self._run_one_case(budget_tokens=10000)
+        self.assertEqual(len(backend.calls), 1)
+        self.assertIs(
+            journal.get(job.job_id).status, DistillJobStatus.EXTRACTION_DONE
+        )
