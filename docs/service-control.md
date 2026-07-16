@@ -26,8 +26,13 @@ agent account plus a root-owned wrapper and root-owned exact-unit allowlist.
   units** (opt-in; `~/.claude/managed-services.allow`): `systemctl`/`service`/
   `pm2`/`docker`/`podman` lifecycle of a LOCAL unit/container is allowed when
   every target is listed. System services you did not list (`sshd`/`ufw`/`nginx`/
-  …), mixed targets, `daemon-reload`, `docker compose`, and `kubectl` stay gated.
-  See `docs/examples/managed-services.allow.example`.
+  …), mixed targets, `daemon-reload`, other `docker compose` lifecycle, and
+  `kubectl` stay gated. Direct local detached reconciliation —
+  `docker compose up -d [services...]` or `docker-compose up --detach` — is
+  autonomous without an allowlist when it is the sole top-level command and
+  uses the bare executable name; remote-daemon flags, wrappers, substitutions,
+  compound commands, and non-detached `up` stay gated. See
+  `docs/examples/managed-services.allow.example`.
 - Everything else is fail-closed: `systemctl`/`service`/`pm2` lifecycle of
   non-fleet units on hosts that are not managed, config-changing verbs on the
   local node, `pm2 delete`, and docker/podman/kubectl lifecycle require fresh

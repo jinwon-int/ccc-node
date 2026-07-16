@@ -600,7 +600,13 @@ def evaluate(tool, cmd, fpath, tool_input_raw):
     managed = [stmt_remote_target_managed(st, entries) for st in statements_raw]
 
     _gate_git(c, cn, toks)                    # force-push / history-rewrite
-    _service_lifecycle(cn, statements, managed, svc_entries)
+    _service_lifecycle(
+        cn,
+        statements,
+        managed,
+        svc_entries,
+        single_toplevel_command=len(statements_raw) == 1,
+    )
     _gate_host_lifecycle(c, cn, statements, managed)
     _gate_operator_config(c, cn)              # self-update.* / managed-nodes.allow writes
     _gate_db(c)                               # destructive / migrate / replay
@@ -728,7 +734,64 @@ def _gate_rm(c, statements, managed):
             _deny("rm-catastrophic", "operator_approval_gated", c)
 
 
-def _service_lifecycle(cn, statements, managed_stmt, svc_entries):
+def _local_compose_up_detached(st, *, single_toplevel_command):
+    """Return True only for a direct local ``compose up --detach`` command.
+
+    This is a deliberately narrow lifecycle relaxation.  A direct detached
+    reconciliation is recoverable and matches the ccc-node/Codex auto-approve
+    path, but Compose's other lifecycle verbs and any indirection remain gated.
+    Reject shell controls, substitutions, wrappers, environment-prefixed
+    daemon selection, and Docker global flags so the carve-out cannot target a
+    remote daemon or hide an adjacent command.
+    """
+
+    # This carve-out is for one direct command, not one safe-looking fragment
+    # extracted from a compound command. A preceding `export DOCKER_HOST=...`
+    # or `docker context use ...` can otherwise redirect the later invocation.
+    if not single_toplevel_command:
+        return False
+
+    # An inherited daemon/context selector can redirect an otherwise plain
+    # command. Keep those invocations on the approval-gated path as well.
+    if os.environ.get("DOCKER_HOST") or os.environ.get("DOCKER_CONTEXT"):
+        return False
+    if re.search(r"[;&|`<>{}\n]|\$", st):
+        return False
+    try:
+        toks = shlex.split(st)
+    except ValueError:
+        return False
+    if not toks:
+        return False
+
+    # Do not trust basename alone: `/tmp/docker` may be an arbitrary wrapper.
+    # PATH resolution of these exact bare names remains the operator boundary.
+    tool = toks[0]
+    if tool == "docker":
+        # Requiring compose immediately after docker rejects global --host/-H,
+        # --context, and other daemon-selection flags.
+        if len(toks) < 3 or toks[1] != "compose":
+            return False
+        args = toks[2:]
+    elif tool == "docker-compose":
+        args = toks[1:]
+    else:
+        return False
+
+    # Keep the accepted grammar exact: no compose-global options before `up`.
+    if not args or args[0] != "up":
+        return False
+    return any(arg in ("-d", "--detach") for arg in args[1:])
+
+
+def _service_lifecycle(
+    cn,
+    statements,
+    managed_stmt,
+    svc_entries,
+    *,
+    single_toplevel_command,
+):
     # Precedence per statement: managed-remote (owned node) → fleet unit (#436) →
     # managed local service (operator-listed unit/container) → else deny.
     for st, mgd in zip(statements, managed_stmt):
@@ -741,7 +804,12 @@ def _service_lifecycle(cn, statements, managed_stmt, svc_entries):
             if not (_is_fleet_lifecycle(st) or _local_service_allowed(st, svc_entries)):
                 _deny("service-lifecycle", "operator_approval_gated", cn)
         if re.search(r"\b(docker|podman)\b[^;&|]*\b(run|up|start|restart|stop|kill|rm|pause|unpause|down)\b", st):
-            if not _local_service_allowed(st, svc_entries):
+            if not (
+                _local_compose_up_detached(
+                    st, single_toplevel_command=single_toplevel_command
+                )
+                or _local_service_allowed(st, svc_entries)
+            ):
                 _deny("service-lifecycle", "operator_approval_gated", cn)
         if re.search(r"\bkubectl\b[^;&|]*\b(rollout\s+restart|scale|delete|drain|cordon|uncordon)\b", st):
             _deny("service-lifecycle", "operator_approval_gated", cn)

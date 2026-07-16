@@ -15,8 +15,10 @@
 #   - a command whose targets are not ALL listed (e.g. `systemctl restart myapp sshd`)
 #     is denied — you cannot slip an unlisted unit in alongside a listed one;
 #   - system services you did not list (sshd, ufw, nginx, postgresql, …) stay gated;
-#   - targetless/global forms (`systemctl daemon-reload`), `docker compose`, a docker
-#     remote-daemon flag (`docker -H …`), and command-substitution targets are gated;
+#   - targetless/global forms (`systemctl daemon-reload`), Compose lifecycle other
+#     than a sole top-level direct local detached `docker compose up -d` using
+#     the bare executable name, a docker remote-daemon flag (`docker -H …`), and
+#     command-substitution targets are gated;
 #   - kubectl is never relaxed here.
 #
 # TRUST: this file is the boundary that says "these local services are mine to
