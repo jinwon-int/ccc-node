@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace
 import unittest
 
+from telegram_bot.core.agent_runtime import SessionRequest
 from telegram_bot.core.codex_app_server import CodexNotification
 from telegram_bot.core.codex_runtime import CodexRuntime
 from telegram_bot.core.project_chat import ProjectChatHandler
@@ -72,6 +74,34 @@ class ProjectChatMeterWiringTests(unittest.IsolatedAsyncioTestCase):
             day_buckets["claude"]["interactive"],
             {"input_tokens": 120, "output_tokens": 30, "requests": 1},
         )
+
+    async def test_claude_cache_tokens_count_toward_the_metered_input(self) -> None:
+        handler = ProjectChatHandler(settings=_settings(self.root))
+        self.assertIsNotNone(handler.usage_meter)
+        request = SimpleNamespace(user_id=7, chat_id=9)
+        message = SimpleNamespace(
+            session_id="session-1",
+            usage={
+                "input_tokens": 10,
+                "cache_creation_input_tokens": 2000,
+                "cache_read_input_tokens": 3000,
+                "output_tokens": 5,
+            },
+            model_usage={},
+            total_cost_usd=None,
+        )
+        handler._record_claude_usage(request, message)
+
+        day_buckets = next(iter(_meter_state(self.root)["days"].values()))
+        # The complete validated input total (raw + cache creation + cache
+        # read) is metered, not just the 10 raw input tokens.
+        self.assertEqual(
+            day_buckets["claude"]["interactive"],
+            {"input_tokens": 5010, "output_tokens": 5, "requests": 1},
+        )
+        meter = handler.usage_meter
+        assert meter is not None
+        self.assertEqual(meter.used_tokens("claude"), 5015)
 
     async def test_metering_failure_never_breaks_the_result_path(self) -> None:
         handler = ProjectChatHandler(settings=_settings(self.root))
@@ -290,6 +320,100 @@ class CodexRuntimeRecorderTests(unittest.IsolatedAsyncioTestCase):
         runtime = self._runtime()
         runtime._route_notification(self._usage_notification(500, 100))
         self.assertEqual(runtime._thread_usage["thread-1"].output_tokens, 100)
+
+    async def test_created_threads_meter_their_first_turn_and_resumed_do_not(
+        self,
+    ) -> None:
+        class _UsageClientStub:
+            async def start(self) -> dict:
+                return {}
+
+            async def thread_start(self, *, cwd: str, model: str | None = None) -> dict:
+                return {"thread": {"id": "thread-created"}}
+
+            async def thread_resume(
+                self,
+                thread_id: str,
+                *,
+                cwd: str | None = None,
+                model: str | None = None,
+            ) -> dict:
+                return {"thread": {"id": thread_id}}
+
+            async def next_notification(self) -> CodexNotification:
+                await asyncio.Event().wait()
+                raise AssertionError("unreachable")
+
+            async def close(self) -> None:
+                return None
+
+        runtime = CodexRuntime(client_factory=lambda handler: _UsageClientStub())
+        observed: list[tuple[str, tuple[int, int] | None, tuple[int, int]]] = []
+
+        def recorder(
+            thread_id: str,
+            previous: UsageSnapshot | None,
+            current: UsageSnapshot,
+        ) -> None:
+            observed.append(
+                (
+                    thread_id,
+                    None
+                    if previous is None
+                    else (previous.input_tokens or 0, previous.output_tokens or 0),
+                    (current.input_tokens or 0, current.output_tokens or 0),
+                )
+            )
+
+        runtime.set_usage_recorder(recorder)
+        try:
+            created = await runtime.start_or_resume(
+                SessionRequest(working_directory="/workspace")
+            )
+            self.assertEqual(created.session_id, "thread-created")
+            runtime._route_notification(
+                self._notification_for("thread-created", 500, 100)
+            )
+            resumed = await runtime.start_or_resume(
+                SessionRequest(
+                    working_directory="/workspace", session_id="thread-resumed"
+                )
+            )
+            self.assertEqual(resumed.session_id, "thread-resumed")
+            runtime._route_notification(
+                self._notification_for("thread-resumed", 7000, 900)
+            )
+        finally:
+            await runtime.close()
+
+        # A created thread's first observation is real new spend (zero
+        # baseline); a resumed thread's first observation is history and
+        # only establishes the baseline.
+        self.assertEqual(
+            observed,
+            [
+                ("thread-created", (0, 0), (500, 100)),
+                ("thread-resumed", None, (7000, 900)),
+            ],
+        )
+
+    @staticmethod
+    def _notification_for(
+        thread_id: str, total_input: int, total_output: int
+    ) -> CodexNotification:
+        return CodexNotification(
+            "thread/tokenUsage/updated",
+            {
+                "threadId": thread_id,
+                "tokenUsage": {
+                    "total": {
+                        "inputTokens": total_input,
+                        "outputTokens": total_output,
+                        "totalTokens": total_input + total_output,
+                    }
+                },
+            },
+        )
 
 
 if __name__ == "__main__":

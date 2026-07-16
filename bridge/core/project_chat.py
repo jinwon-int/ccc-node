@@ -381,11 +381,17 @@ class ProjectChatHandler(
         self._claude_usage[key] = snapshot
         self._claude_usage = dict(tuple(self._claude_usage.items())[-128:])
         if self._usage_meter is not None:
+            # context_used is the complete validated input total (raw input
+            # plus cache-creation and cache-read tokens); plain input_tokens
+            # alone would under-count cached turns by orders of magnitude.
+            input_total = snapshot.context_used
+            if input_total is None:
+                input_total = snapshot.input_tokens or 0
             try:
                 self._usage_meter.record(
                     "claude",
                     MODE_INTERACTIVE,
-                    input_tokens=snapshot.input_tokens or 0,
+                    input_tokens=input_total,
                     output_tokens=snapshot.output_tokens or 0,
                     requests=1,
                 )

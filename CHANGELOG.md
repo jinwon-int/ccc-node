@@ -63,9 +63,12 @@ All notable changes to the Claude Code node harness. Dates are KST.
   counters per KST day × provider × interactive/autonomous mode in
   `.telegram_bot/usage-meter.json` (atomic owner-only writes, bounded
   retention, fail-open persistence). Spend sites wired: Claude interactive
-  turns meter at the reader's `ResultMessage`, Codex interactive turns meter
-  via a runtime usage recorder fed by cumulative `thread/tokenUsage/updated`
-  deltas (baseline-first so resumed-thread history is never counted) plus a
+  turns meter at the reader's `ResultMessage` using the complete validated
+  input total (raw plus cache-creation and cache-read tokens), Codex
+  interactive turns meter via a runtime usage recorder fed by cumulative
+  `thread/tokenUsage/updated` deltas — threads the process created start
+  from a zero baseline so their first turn is metered, while resumed threads
+  baseline first so prior-session history is never counted — plus a
   per-turn request count, and the distill extraction worker charges every
   autonomous attempt with a conservative pre-spend token reservation
   (2048 overhead + snapshot bytes ÷ 2) until the exec backend can report

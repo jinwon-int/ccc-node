@@ -167,6 +167,15 @@ class CodexDeltaTests(UsageMeterTestCase):
             {"input_tokens": 600, "output_tokens": 200, "requests": 0},
         )
 
+    def test_zero_previous_meters_a_fresh_threads_first_turn(self) -> None:
+        # The runtime passes a zero-usage previous snapshot for threads it
+        # created itself, so a new thread's very first turn is real spend.
+        meter = self.make_meter()
+        meter.record_codex_thread_usage(
+            "thread-new", self.snapshot(0, 0), self.snapshot(500, 100)
+        )
+        self.assertEqual(meter.used_tokens("codex"), 600)
+
     def test_previous_snapshot_seeds_baseline_after_restart(self) -> None:
         meter = self.make_meter()
         meter.record_codex_thread_usage(

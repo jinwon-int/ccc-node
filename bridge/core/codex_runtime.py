@@ -321,6 +321,10 @@ class CodexRuntime:
         self._active_turns: dict[str, _ActiveTurn] = {}
         self._thread_locks: dict[str, asyncio.Lock] = {}
         self._thread_usage: dict[str, UsageSnapshot] = {}
+        # Threads created (not resumed) by this process: their cumulative
+        # usage totals contain no prior-session history, so the first
+        # observation is real new spend rather than a resume baseline.
+        self._created_threads: dict[str, None] = {}
         self._account_rate_limits = UsageSnapshot(provider="codex")
         self._usage_recorder: UsageRecorder | None = None
         self._closed = False
@@ -360,6 +364,8 @@ class CodexRuntime:
                 model=request.model,
             )
             thread_id = self._thread_id(result)
+            self._created_threads[thread_id] = None
+            self._created_threads = dict(tuple(self._created_threads.items())[-256:])
             turn_lock = self._thread_locks.setdefault(thread_id, asyncio.Lock())
         else:
             thread_id = request.session_id
@@ -832,6 +838,11 @@ class CodexRuntime:
 
     def _record_thread_usage(self, thread_id: str, params: Mapping[str, JsonValue]) -> None:
         previous = self._thread_usage.get(thread_id)
+        if previous is None and thread_id in self._created_threads:
+            # A thread this process created has no prior-session history in
+            # its cumulative totals: seed a zero baseline so the first turn's
+            # spend is recorded instead of being discarded as resume history.
+            previous = UsageSnapshot(provider="codex", input_tokens=0, output_tokens=0)
         snapshot = parse_codex_thread_usage(params)
         self._thread_usage[thread_id] = snapshot
         self._thread_usage = dict(tuple(self._thread_usage.items())[-128:])
