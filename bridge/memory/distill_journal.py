@@ -29,6 +29,10 @@ from .distill_types import (
     DistillJobStatus,
     DistillTrigger,
 )
+from .distill_extraction import (
+    DistillExtractionOutput,
+    parse_extraction_output,
+)
 
 _JOB_ID_RE = re.compile(r"^[0-9a-f]{64}$")
 _SAFE_ERROR_CODE_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
@@ -196,6 +200,23 @@ class DistillJournal:
         )
         if expected_job_id != job.job_id:
             raise ValueError("distill job content does not match its id")
+        extraction_statuses = {
+            DistillJobStatus.RUNNING_EXTRACTION,
+            DistillJobStatus.EXTRACTION_RETRYABLE_FAILED,
+            DistillJobStatus.EXTRACTION_DONE,
+            DistillJobStatus.EXTRACTION_TERMINAL_FAILED,
+        }
+        if job.status in extraction_statuses and job.snapshot is None:
+            raise ValueError("distill extraction job is missing its snapshot")
+        if (job.status is DistillJobStatus.EXTRACTION_DONE) != (
+            job.extraction_output is not None
+        ):
+            raise ValueError("distill extraction output does not match job status")
+        if job.extraction_output is not None:
+            try:
+                parse_extraction_output(job.extraction_output, wiki_enabled=True)
+            except (TypeError, ValueError):
+                raise ValueError("invalid distill job extraction output") from None
         return job
 
     def _write_unlocked(self, job: DistillJob) -> None:
@@ -355,6 +376,186 @@ class DistillJournal:
             self._write_unlocked(done)
             return done
 
+    def claim_extraction(
+        self,
+        job_id: str,
+        *,
+        owner_token: str,
+        now: datetime | None = None,
+        lease_seconds: int = 300,
+        max_attempts: int = 5,
+    ) -> DistillJob | None:
+        if not owner_token:
+            raise ValueError("owner_token must not be empty")
+        if lease_seconds <= 0 or max_attempts <= 0:
+            raise ValueError("lease_seconds and max_attempts must be positive")
+        current_time = _normalize_time(now or _utc_now())
+        with self._exclusive():
+            job = self._read_unlocked(job_id)
+            if job.status not in {
+                DistillJobStatus.SNAPSHOT_DONE,
+                DistillJobStatus.EXTRACTION_RETRYABLE_FAILED,
+            }:
+                return None
+            if job.snapshot is None:
+                raise ValueError("distill extraction job is missing its snapshot")
+            if job.extraction_attempts >= max_attempts:
+                terminal = replace(
+                    job,
+                    status=DistillJobStatus.EXTRACTION_TERMINAL_FAILED,
+                    updated_at=_timestamp(current_time),
+                    owner_token=None,
+                    lease_expires_at=None,
+                    error_code="extraction_max_attempts_exceeded",
+                )
+                self._write_unlocked(terminal)
+                return None
+            running = replace(
+                job,
+                status=DistillJobStatus.RUNNING_EXTRACTION,
+                updated_at=_timestamp(current_time),
+                extraction_attempts=job.extraction_attempts + 1,
+                extraction_lease_epoch=job.extraction_lease_epoch + 1,
+                owner_token=owner_token,
+                lease_expires_at=_timestamp(
+                    current_time + timedelta(seconds=lease_seconds)
+                ),
+                error_code=None,
+            )
+            self._write_unlocked(running)
+            return running
+
+    @staticmethod
+    def _require_running_extraction(
+        job: DistillJob, owner_token: str, lease_epoch: int
+    ) -> None:
+        if job.status is not DistillJobStatus.RUNNING_EXTRACTION:
+            raise RuntimeError(
+                f"invalid distill job transition from {job.status.value}"
+            )
+        if (
+            job.owner_token != owner_token
+            or job.extraction_lease_epoch != lease_epoch
+        ):
+            raise RuntimeError("distill job owner or lease epoch does not match")
+
+    @staticmethod
+    def _canonical_extraction_output(output: DistillExtractionOutput) -> str:
+        if not isinstance(output, DistillExtractionOutput):
+            raise ValueError("extraction_output must be a DistillExtractionOutput")
+        return json.dumps(
+            output.model_dump(mode="json"),
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
+    def mark_extraction_done(
+        self,
+        job_id: str,
+        *,
+        owner_token: str,
+        lease_epoch: int,
+        extraction_output: DistillExtractionOutput,
+        now: datetime | None = None,
+    ) -> DistillJob:
+        payload = self._canonical_extraction_output(extraction_output)
+        payload_hash = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+        with self._exclusive():
+            job = self._read_unlocked(job_id)
+            self._require_running_extraction(job, owner_token, lease_epoch)
+            if job.snapshot is None:
+                raise ValueError("distill extraction job is missing its snapshot")
+            provenance = extraction_output.provenance
+            if (
+                provenance.provider != job.provider
+                or provenance.source_thread_hash != job.snapshot.thread_hash
+                or provenance.trigger != job.trigger
+            ):
+                raise ValueError("distill extraction provenance does not match job")
+            done = replace(
+                job,
+                status=DistillJobStatus.EXTRACTION_DONE,
+                updated_at=_timestamp(now or _utc_now()),
+                owner_token=None,
+                lease_expires_at=None,
+                extraction_output=payload,
+                extraction_output_hash=payload_hash,
+                error_code=None,
+            )
+            self._write_unlocked(done)
+            return done
+
+    def mark_extraction_retryable_failed(
+        self,
+        job_id: str,
+        *,
+        owner_token: str,
+        lease_epoch: int,
+        error_code: str,
+        now: datetime | None = None,
+    ) -> DistillJob:
+        return self._mark_extraction_failed(
+            job_id,
+            owner_token=owner_token,
+            lease_epoch=lease_epoch,
+            error_code=error_code,
+            status=DistillJobStatus.EXTRACTION_RETRYABLE_FAILED,
+            now=now,
+        )
+
+    def mark_extraction_terminal_failed(
+        self,
+        job_id: str,
+        *,
+        owner_token: str,
+        lease_epoch: int,
+        error_code: str,
+        now: datetime | None = None,
+    ) -> DistillJob:
+        return self._mark_extraction_failed(
+            job_id,
+            owner_token=owner_token,
+            lease_epoch=lease_epoch,
+            error_code=error_code,
+            status=DistillJobStatus.EXTRACTION_TERMINAL_FAILED,
+            now=now,
+        )
+
+    def _mark_extraction_failed(
+        self,
+        job_id: str,
+        *,
+        owner_token: str,
+        lease_epoch: int,
+        error_code: str,
+        status: DistillJobStatus,
+        now: datetime | None,
+    ) -> DistillJob:
+        self._validate_error_code(error_code)
+        with self._exclusive():
+            job = self._read_unlocked(job_id)
+            self._require_running_extraction(job, owner_token, lease_epoch)
+            failed = replace(
+                job,
+                status=status,
+                updated_at=_timestamp(now or _utc_now()),
+                owner_token=None,
+                lease_expires_at=None,
+                extraction_output=None,
+                extraction_output_hash=None,
+                error_code=error_code,
+            )
+            self._write_unlocked(failed)
+            return failed
+
+    def get_extraction_output(self, job_id: str) -> DistillExtractionOutput | None:
+        job = self.get(job_id)
+        if job.extraction_output is None:
+            return None
+        return parse_extraction_output(job.extraction_output, wiki_enabled=True)
+
     def mark_retryable_failed(
         self,
         job_id: str,
@@ -410,10 +611,10 @@ class DistillJournal:
             for path in sorted(self.root.glob("*.json")):
                 self._validate_job_name(path)
                 job = self._read_unlocked(path.stem)
-                if (
-                    job.status is not DistillJobStatus.RUNNING_SNAPSHOT
-                    or job.lease_expires_at is None
-                ):
+                if job.status not in {
+                    DistillJobStatus.RUNNING_SNAPSHOT,
+                    DistillJobStatus.RUNNING_EXTRACTION,
+                } or job.lease_expires_at is None:
                     continue
                 try:
                     lease_expires = _parse_timestamp(job.lease_expires_at)
@@ -421,13 +622,23 @@ class DistillJournal:
                     raise ValueError("invalid distill job lease timestamp") from error
                 if lease_expires > current_time:
                     continue
+                recovery_status = (
+                    DistillJobStatus.QUEUED
+                    if job.status is DistillJobStatus.RUNNING_SNAPSHOT
+                    else DistillJobStatus.EXTRACTION_RETRYABLE_FAILED
+                )
+                error_code = (
+                    "lease_expired"
+                    if job.status is DistillJobStatus.RUNNING_SNAPSHOT
+                    else "extraction_lease_expired"
+                )
                 queued = replace(
                     job,
-                    status=DistillJobStatus.QUEUED,
+                    status=recovery_status,
                     updated_at=_timestamp(current_time),
                     owner_token=None,
                     lease_expires_at=None,
-                    error_code="lease_expired",
+                    error_code=error_code,
                 )
                 self._write_unlocked(queued)
                 recovered += 1
@@ -436,6 +647,11 @@ class DistillJournal:
     def diagnostics(self, job_id: str) -> dict[str, Any]:
         job = self.get(job_id)
         snapshot = job.snapshot
+        extraction = (
+            parse_extraction_output(job.extraction_output, wiki_enabled=True)
+            if job.extraction_output is not None
+            else None
+        )
         return {
             "job_id": job.job_id,
             "thread_hash": job.thread_hash,
@@ -443,8 +659,19 @@ class DistillJournal:
             "status": job.status.value,
             "attempts": job.attempts,
             "lease_epoch": job.lease_epoch,
+            "extraction_attempts": job.extraction_attempts,
+            "extraction_lease_epoch": job.extraction_lease_epoch,
             "message_count": len(snapshot.messages) if snapshot is not None else 0,
             "byte_count": snapshot.byte_count if snapshot is not None else 0,
             "truncated": snapshot.truncated if snapshot is not None else False,
+            "extraction_output_bytes": (
+                len(job.extraction_output.encode("utf-8"))
+                if job.extraction_output is not None
+                else 0
+            ),
+            "honcho_count": len(extraction.honcho) if extraction is not None else 0,
+            "wiki_candidate_count": (
+                len(extraction.wiki_candidates) if extraction is not None else 0
+            ),
             "error_code": job.error_code,
         }
