@@ -32,6 +32,13 @@ mkdir -p "$STATE" "$SKILLS"
 mkdir -p "$TMP/bin"
 write_exec_stub "$TMP/bin/claude" <<'SH'
 cat >/dev/null
+if [ -n "${CLAUDE_ENV_SNAPSHOT:-}" ]; then
+  printf '%s|%s|%s\n' \
+    "${CLAUDE_SKILL_REVIEW_BG-unset}" \
+    "${CLAUDE_SKILL_REVIEW_INFLIGHT-unset}" \
+    "${CLAUDE_DISTILL_INFLIGHT-unset}" \
+    > "$CLAUDE_ENV_SNAPSHOT"
+fi
 cat <<'JSON'
 {"skill_candidates":[{"name":"deploy-checklist","category":"ops","summary":"Capture a recurring deploy checklist.","reason":"The transcript repeats a multi-step deploy verification flow.","evidence_excerpt":"automate recurring deploy checklist","skill_md":"---\nname: deploy-checklist\ndescription: Capture deploy checklist procedures.\n---\n\n# Deploy Checklist\n\n## When to Use\n- Use when deploy verification repeats.\n\n## Procedure\n1. Inspect git state.\n2. Run the verified checklist.\n\n## Safety\n- Never store raw secrets.\n\n## Verification\n- Confirm the checklist output is recorded.\n"}]}
 JSON
@@ -71,7 +78,11 @@ out="$(payload sess-auto "$TRANS" "/root/work" | CCC_STATE_DIR="$STATE_AUTO" CLA
   bash "$REVIEW" sessionend 2>&1)"; rc=$?
 ok "auto-mode hook exits 0" '[ "$rc" = 0 ]'
 for _ in $(seq 1 40); do
-  [ -f "$SKILLS_AUTO/deploy-checklist/SKILL.md" ] && break
+  [ -f "$SKILLS_AUTO/deploy-checklist/SKILL.md" ] \
+    && [ -f "$SKILLS_AUTO/deploy-checklist/.autosave-meta.json" ] \
+    && ls -d "$STATE_AUTO/pending-skills/"*.installed-* >/dev/null 2>&1 \
+    && ls "$SPOOL_AUTO"/*SkillAutoInstall*.json >/dev/null 2>&1 \
+    && break
   sleep 0.25
 done
 ok "auto mode installs staged draft unattended" '[ -f "$SKILLS_AUTO/deploy-checklist/SKILL.md" ]'
@@ -91,6 +102,30 @@ ok "cooldown skip logged" 'grep -q "skip reason=cooldown" "$STATE/skill-review.l
 out="$(CLAUDE_SKILL_REVIEW_INFLIGHT=1 CCC_STATE_DIR="$STATE" bash "$REVIEW" sessionend <<<"$(payload sess-guard "$TRANS" "/root/work")" 2>&1)"; rc=$?
 ok "recursion guard exits 0" '[ "$rc" = 0 ]'
 ok "recursion guard logs nothing" '[ ! -s "$STATE/skill-review.log" ]'
+
+# The emergency off-switch must beat a stale/inherited detached-runner marker.
+STATE_DISABLED="$TMP/state-disabled"
+SNAPSHOT_DISABLED="$TMP/disabled-provider-env"
+mkdir -p "$STATE_DISABLED"
+: > "$STATE_DISABLED/skill-review.disabled"
+out="$(CLAUDE_SKILL_REVIEW_BG=1 CLAUDE_SKILL_REVIEW_INFLIGHT=1 \
+  CLAUDE_SKILL_REVIEW_TRANSCRIPT="$TRANS" CLAUDE_SKILL_REVIEW_SESSION=sess-disabled \
+  CLAUDE_ENV_SNAPSHOT="$SNAPSHOT_DISABLED" CCC_STATE_DIR="$STATE_DISABLED" \
+  bash "$REVIEW" sessionend 2>&1)"; rc=$?
+ok "disabled background re-entry exits 0" '[ "$rc" = 0 ]'
+ok "disabled background re-entry never calls provider" '[ ! -e "$SNAPSHOT_DISABLED" ]'
+ok "disabled background re-entry is logged" 'grep -q "skip reason=disabled" "$STATE_DISABLED/skill-review.log"'
+
+# The provider child keeps recursion guards but must not inherit the runner
+# marker, otherwise its own SessionEnd hook launches another detached review.
+SNAPSHOT_PROVIDER="$TMP/provider-env"
+out="$(CLAUDE_SKILL_REVIEW_TRANSCRIPT="$TRANS" CLAUDE_SKILL_REVIEW_SESSION=sess-provider \
+  CLAUDE_SKILL_REVIEW_BG=1 CLAUDE_SKILL_REVIEW_INFLIGHT=1 CLAUDE_DISTILL_INFLIGHT=1 \
+  CLAUDE_ENV_SNAPSHOT="$SNAPSHOT_PROVIDER" \
+  bash "$HERE/skill-review/extract.sh" 2>&1)"; rc=$?
+ok "provider environment probe exits 0" '[ "$rc" = 0 ]'
+ok "provider drops runner marker and keeps recursion guards" \
+  '[ "$(cat "$SNAPSHOT_PROVIDER" 2>/dev/null)" = "unset|1|1" ]'
 
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
