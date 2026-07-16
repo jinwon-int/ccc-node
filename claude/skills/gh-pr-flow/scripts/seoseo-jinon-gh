@@ -1,0 +1,114 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat >&2 <<'EOF'
+Usage:
+  seoseo-jinon-gh identity
+  seoseo-jinon-gh {view|checks|diff} OWNER/REPO PR_NUMBER
+  seoseo-jinon-gh {approve|merge} OWNER/REPO PR_NUMBER --confirm-user-approved
+EOF
+  exit 2
+}
+
+die() {
+  printf 'error: %s\n' "$*" >&2
+  exit 1
+}
+
+target="${CCC_SEOSEO_SSH_TARGET:-seoseo}"
+action="${1:-}"
+
+remote_gh() {
+  ssh -o BatchMode=yes -o ConnectTimeout=10 -- "$target" gh "$@"
+}
+
+identity() {
+  remote_gh api user --jq .login
+}
+
+require_jinon86() {
+  local login
+  login="$(identity)"
+  [[ "$login" == "jinon86" ]] || die "Seoseo gh identity is '$login', expected 'jinon86'"
+}
+
+validate_pr() {
+  repo="${2:-}"
+  pr="${3:-}"
+  [[ "$repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die "invalid OWNER/REPO"
+  [[ "$pr" =~ ^[1-9][0-9]*$ ]] || die "invalid PR number"
+}
+
+require_confirmation() {
+  [[ "${4:-}" == "--confirm-user-approved" ]] || \
+    die "explicit user approval is required in the active task"
+}
+
+case "$action" in
+  identity)
+    [[ $# -eq 1 ]] || usage
+    require_jinon86
+    printf 'jinon86\n'
+    ;;
+  view)
+    [[ $# -eq 3 ]] || usage
+    validate_pr "$@"
+    require_jinon86
+    remote_gh pr view "$pr" --repo "$repo" \
+      --json number,state,author,title,url,headRefOid,mergeable,mergeStateStatus,statusCheckRollup,reviews
+    ;;
+  checks)
+    [[ $# -eq 3 ]] || usage
+    validate_pr "$@"
+    require_jinon86
+    remote_gh pr checks "$pr" --repo "$repo"
+    ;;
+  diff)
+    [[ $# -eq 3 ]] || usage
+    validate_pr "$@"
+    require_jinon86
+    remote_gh pr diff "$pr" --repo "$repo"
+    ;;
+  approve)
+    [[ $# -eq 4 ]] || usage
+    validate_pr "$@"
+    require_confirmation "$@"
+    require_jinon86
+    author="$(remote_gh pr view "$pr" --repo "$repo" --json author --jq .author.login)"
+    [[ "$author" != "jinon86" ]] || die "jinon86 cannot approve a jinon86-authored PR"
+    remote_gh pr review "$pr" --repo "$repo" --approve
+    ;;
+  merge)
+    [[ $# -eq 4 ]] || usage
+    validate_pr "$@"
+    require_confirmation "$@"
+    require_jinon86
+    command -v jq >/dev/null 2>&1 || die "jq is required locally"
+    snapshot="$(remote_gh pr view "$pr" --repo "$repo" \
+      --json state,headRefOid,mergeable,mergeStateStatus,statusCheckRollup)"
+    if ! jq -e '
+      .state == "OPEN" and
+      .mergeable == "MERGEABLE" and
+      .mergeStateStatus == "CLEAN" and
+      all(.statusCheckRollup[]?;
+        if .__typename == "CheckRun" then
+          .status == "COMPLETED" and
+          (.conclusion == "SUCCESS" or .conclusion == "NEUTRAL" or .conclusion == "SKIPPED")
+        elif .__typename == "StatusContext" then
+          .state == "SUCCESS"
+        else false end)
+    ' >/dev/null <<<"$snapshot"; then
+      jq '{state,headRefOid,mergeable,mergeStateStatus,statusCheckRollup}' <<<"$snapshot" >&2
+      die "PR is not open, green, clean, and mergeable"
+    fi
+    head_sha="$(jq -r .headRefOid <<<"$snapshot")"
+    [[ "$head_sha" =~ ^[0-9a-fA-F]{40}$ ]] || die "invalid head SHA from GitHub"
+    remote_gh pr merge "$pr" --repo "$repo" --squash --delete-branch \
+      --match-head-commit "$head_sha"
+    remote_gh pr view "$pr" --repo "$repo" --json state,mergedAt,mergeCommit,url
+    ;;
+  *)
+    usage
+    ;;
+esac
