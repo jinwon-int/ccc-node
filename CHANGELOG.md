@@ -67,9 +67,12 @@ All notable changes to the Claude Code node harness. Dates are KST.
   input total (raw plus cache-creation and cache-read tokens), Codex
   interactive turns meter via a runtime usage recorder fed by cumulative
   `thread/tokenUsage/updated` deltas — threads the process created start
-  from a zero baseline so their first turn is metered, while resumed threads
-  baseline first so prior-session history is never counted — plus a
-  per-turn request count, and the distill extraction worker charges every
+  from a zero baseline so their first turn is metered, and a resumed
+  thread's first notification during a turn this process started derives an
+  implied pre-turn baseline from the turn-scoped `last` block (total minus
+  last) so the first post-resume turn is metered while prior-session
+  history is never counted — plus a per-turn request count, and the distill
+  extraction worker charges every
   autonomous attempt with a conservative pre-spend token reservation
   (2048 overhead + snapshot bytes ÷ 2) until the exec backend can report
   actual usage, so repeated background work consumes — and eventually
@@ -79,10 +82,18 @@ All notable changes to the Claude Code node harness. Dates are KST.
   claim) fits under the cap and charges it in the same locked step, so
   concurrent attempts cannot jointly overrun the cap, a single oversized
   attempt is rejected outright, and the recorded autonomous total never
-  exceeds the configured cap. No-op invocations (claim lost or job already
-  done) refund their exact reservation, a tiny valid budget no longer warns
-  at zero usage, and budgets must fit at least one maximal attempt or that
-  work stays deferred by design. The bridge
+  exceeds the configured cap. Reservations are opaque day-pinned handles:
+  the charge and any later refund target the accounting day captured at
+  admission, so a midnight rollover can neither split a reservation across
+  days nor let a refund erase another day's spend. No-op invocations (claim
+  lost or job already done) refund their exact reservation, a tiny valid
+  budget no longer warns at zero usage, and budgets must fit at least one
+  maximal attempt or that work stays deferred by design. Every meter
+  mutation additionally holds an exclusive interprocess file lock and
+  re-reads the on-disk state before applying its delta, so overlapping
+  meter instances or bridge processes merge spend instead of losing it to
+  last-writer-wins (falling back to thread-only locking with a logged
+  warning if the lock file is unavailable). The bridge
   composition root (`build_context`) now constructs the distill extraction
   worker itself through the handler factory with the shared meter, and the
   worker's `usage_meter` is an explicit required constructor decision.

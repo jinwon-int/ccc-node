@@ -19,7 +19,7 @@ from .distill_types import DistillJob
 logger = logging.getLogger(__name__)
 
 
-class _BudgetDecisionLike(Protocol):
+class _ReservationLike(Protocol):
     @property
     def allowed(self) -> bool: ...
 
@@ -40,16 +40,9 @@ class AutonomousSpendGate(Protocol):
         input_tokens: int = 0,
         output_tokens: int = 0,
         requests: int = 0,
-    ) -> _BudgetDecisionLike: ...
+    ) -> _ReservationLike: ...
 
-    def refund_autonomous_reservation(
-        self,
-        provider: str,
-        *,
-        input_tokens: int = 0,
-        output_tokens: int = 0,
-        requests: int = 0,
-    ) -> None: ...
+    def refund_reservation(self, reservation: object) -> None: ...
 
 _SAFE_ERROR_CODE_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 
@@ -141,7 +134,7 @@ class CodexDistillExtractionWorker:
         )
 
     async def extract_once(self, *, job_id: str) -> DistillJob:
-        reserved_tokens = 0
+        reservation: _ReservationLike | None = None
         if self._usage_meter is not None:
             # Prospective atomic admit-and-charge (#388): the FULL bounded
             # attempt cost — flat overhead plus the persisted snapshot's
@@ -161,15 +154,15 @@ class CodexDistillExtractionWorker:
                 _RESERVED_OVERHEAD_TOKENS
                 + max(0, snapshot_bytes) // _RESERVED_BYTES_PER_TOKEN
             )
-            decision = self._usage_meter.reserve_autonomous_spend(
+            reservation = self._usage_meter.reserve_autonomous_spend(
                 "codex",
                 input_tokens=reserved_tokens,
                 requests=1,
             )
-            if not decision.allowed:
+            if not reservation.allowed:
                 logger.warning(
                     "Distill extraction deferred by usage budget: %s",
-                    decision.reason(),
+                    reservation.reason(),
                 )
                 return preview
         claimed = await asyncio.to_thread(
@@ -180,17 +173,14 @@ class CodexDistillExtractionWorker:
             max_attempts=self._max_attempts,
         )
         if claimed is None:
-            if self._usage_meter is not None:
+            if self._usage_meter is not None and reservation is not None:
                 # The reserved attempt never started (already done, leased
-                # elsewhere, or exhausted): return the exact reservation so
+                # elsewhere, or exhausted): return the exact reservation —
+                # the handle pins its accounting day and dimensions — so
                 # no-op invocations cannot drain the budget. A crash before
                 # this refund leaves the charge in place — conservative.
                 try:
-                    self._usage_meter.refund_autonomous_reservation(
-                        "codex",
-                        input_tokens=reserved_tokens,
-                        requests=1,
-                    )
+                    self._usage_meter.refund_reservation(reservation)
                 except Exception:
                     logger.exception("Usage reservation refund failed; keeping charge")
             return await asyncio.to_thread(self._journal.get, job_id)

@@ -337,8 +337,10 @@ class ReserveTests(UsageMeterTestCase):
 
     def test_refund_unwinds_exactly_one_reservation(self) -> None:
         meter = self.make_meter(budgets={"codex": 5000})
-        meter.reserve_autonomous_spend("codex", input_tokens=2058, requests=1)
-        meter.refund_autonomous_reservation("codex", input_tokens=2058, requests=1)
+        reservation = meter.reserve_autonomous_spend(
+            "codex", input_tokens=2058, requests=1
+        )
+        meter.refund_reservation(reservation)
         self.assertEqual(meter.used_tokens("codex"), 0)
         raw = json.loads(self.path.read_text(encoding="utf-8"))
         self.assertEqual(
@@ -346,12 +348,48 @@ class ReserveTests(UsageMeterTestCase):
             {"input_tokens": 0, "output_tokens": 0, "requests": 0},
         )
 
-    def test_refund_clamps_at_zero_and_validates_provider(self) -> None:
-        meter = self.make_meter()
-        meter.refund_autonomous_reservation("codex", input_tokens=500)
+    def test_refunding_a_blocked_reservation_is_a_noop(self) -> None:
+        meter = self.make_meter(budgets={"codex": 100})
+        blocked = meter.reserve_autonomous_spend("codex", input_tokens=500)
+        self.assertFalse(blocked.allowed)
+        meter.refund_reservation(blocked)
         self.assertEqual(meter.used_tokens("codex"), 0)
-        with self.assertRaises(ValueError):
-            meter.refund_autonomous_reservation("../etc", input_tokens=1)
+
+    def test_reservation_is_pinned_to_its_accounting_day(self) -> None:
+        # Reviewer probe: a reservation admitted just before midnight must
+        # charge (and later refund) its own day, never a newer day's bucket.
+        meter = self.make_meter(budgets={"codex": 1000})
+        reservation = meter.reserve_autonomous_spend("codex", input_tokens=200)
+        self.assertTrue(reservation.allowed)
+        self.assertEqual(reservation.day, FIXED_DAY)
+
+        self.now += 86400  # cross into the next KST day
+        meter.record("codex", MODE_AUTONOMOUS, input_tokens=900)
+        meter.refund_reservation(reservation)
+
+        raw = json.loads(self.path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            raw["days"][FIXED_DAY]["codex"][MODE_AUTONOMOUS]["input_tokens"], 0
+        )
+        self.assertEqual(
+            raw["days"]["2026-07-17"]["codex"][MODE_AUTONOMOUS]["input_tokens"], 900
+        )
+
+    def test_overlapping_meter_instances_merge_instead_of_clobbering(self) -> None:
+        # Reviewer probe: two meters on one path must persist 300, not 200.
+        first = self.make_meter()
+        second = self.make_meter()
+        first.record("codex", MODE_AUTONOMOUS, input_tokens=100)
+        second.record("codex", MODE_AUTONOMOUS, input_tokens=200)
+
+        raw = json.loads(self.path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            raw["days"][FIXED_DAY]["codex"][MODE_AUTONOMOUS]["input_tokens"], 300
+        )
+        # Prospective admission also sees the other writer's spend.
+        gated = self.make_meter(budgets={"codex": 400})
+        decision = gated.reserve_autonomous_spend("codex", input_tokens=150)
+        self.assertFalse(decision.allowed)
 
     def test_reserve_without_budget_admits_and_charges(self) -> None:
         meter = self.make_meter()

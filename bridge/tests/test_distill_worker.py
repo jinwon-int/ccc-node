@@ -469,24 +469,17 @@ class _FakeUsageMeter:
     ) -> Any:
         self.reserves.append((provider, input_tokens, requests))
 
-        class _Decision:
+        class _Reservation:
             allowed = self.allowed
 
             @staticmethod
             def reason() -> str:
                 return "codex used 1000 of 1000 budget tokens (blocked)"
 
-        return _Decision()
+        return _Reservation()
 
-    def refund_autonomous_reservation(
-        self,
-        provider: str,
-        *,
-        input_tokens: int = 0,
-        output_tokens: int = 0,
-        requests: int = 0,
-    ) -> None:
-        self.refunds.append((provider, input_tokens, requests))
+    def refund_reservation(self, reservation: Any) -> None:
+        self.refunds.append(reservation)
 
 
 @pytest.mark.anyio

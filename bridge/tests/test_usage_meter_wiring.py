@@ -399,21 +399,95 @@ class CodexRuntimeRecorderTests(unittest.IsolatedAsyncioTestCase):
 
     @staticmethod
     def _notification_for(
-        thread_id: str, total_input: int, total_output: int
+        thread_id: str,
+        total_input: int,
+        total_output: int,
+        *,
+        turn_id: str | None = None,
+        last: dict | None = None,
     ) -> CodexNotification:
-        return CodexNotification(
-            "thread/tokenUsage/updated",
-            {
-                "threadId": thread_id,
-                "tokenUsage": {
-                    "total": {
-                        "inputTokens": total_input,
-                        "outputTokens": total_output,
-                        "totalTokens": total_input + total_output,
-                    }
-                },
+        params: dict = {
+            "threadId": thread_id,
+            "tokenUsage": {
+                "total": {
+                    "inputTokens": total_input,
+                    "outputTokens": total_output,
+                    "totalTokens": total_input + total_output,
+                }
             },
+        }
+        if turn_id is not None:
+            params["turnId"] = turn_id
+        if last is not None:
+            params["tokenUsage"]["last"] = last
+        return CodexNotification("thread/tokenUsage/updated", params)
+
+    async def test_resumed_threads_first_paid_turn_is_metered_via_last(self) -> None:
+        # Reviewer probe: a resumed thread's first notification carries
+        # history AND the new turn. When it belongs to a turn this process
+        # started, the turn-scoped `last` block sizes the new spend and the
+        # implied pre-turn baseline (total - last) excludes the history.
+        runtime = self._runtime()
+        observed: list[tuple[int, int] | None] = []
+        runtime.set_usage_recorder(
+            lambda _tid, prev, _cur: observed.append(
+                None
+                if prev is None
+                else (prev.input_tokens or 0, prev.output_tokens or 0)
+            )
         )
+        runtime._started_turn_ids["turn-ours"] = None
+        runtime._route_notification(
+            self._notification_for(
+                "thread-resumed",
+                7000,
+                900,
+                turn_id="turn-ours",
+                last={"inputTokens": 400, "outputTokens": 100},
+            )
+        )
+        self.assertEqual(observed, [(6600, 800)])
+
+    async def test_resumed_threads_first_turn_falls_back_to_last_total(self) -> None:
+        runtime = self._runtime()
+        observed: list[tuple[int, int] | None] = []
+        runtime.set_usage_recorder(
+            lambda _tid, prev, _cur: observed.append(
+                None
+                if prev is None
+                else (prev.input_tokens or 0, prev.output_tokens or 0)
+            )
+        )
+        runtime._started_turn_ids["turn-ours"] = None
+        runtime._route_notification(
+            self._notification_for(
+                "thread-resumed",
+                7000,
+                900,
+                turn_id="turn-ours",
+                last={"totalTokens": 500},
+            )
+        )
+        # Only the turn total is exposed: it is attributed to input so the
+        # turn is still metered (6500 implied input baseline, output intact).
+        self.assertEqual(observed, [(6500, 900)])
+
+    async def test_history_notifications_without_our_turn_still_baseline(self) -> None:
+        runtime = self._runtime()
+        observed: list[object] = []
+        runtime.set_usage_recorder(
+            lambda _tid, prev, _cur: observed.append(prev)
+        )
+        runtime._route_notification(
+            self._notification_for(
+                "thread-resumed",
+                7000,
+                900,
+                turn_id="turn-history",
+                last={"inputTokens": 400, "outputTokens": 100},
+            )
+        )
+        self.assertEqual(observed, [None])
 
 
 if __name__ == "__main__":

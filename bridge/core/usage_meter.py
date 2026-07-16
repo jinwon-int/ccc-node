@@ -15,9 +15,11 @@ failures are swallowed.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+import fcntl
 import json
 import logging
 import os
@@ -67,6 +69,34 @@ class BudgetDecision:
             f"{self.provider} used {self.used_tokens} of {self.budget_tokens} "
             f"budget tokens on {self.day} ({self.state})"
         )
+
+
+@dataclass(frozen=True, slots=True)
+class UsageReservation:
+    """Opaque handle for one admitted (or rejected) autonomous reservation.
+
+    It pins the accounting day and the exact charged dimensions at admission
+    time, so a later refund always unwinds the same bucket even across a
+    KST midnight rollover.
+    """
+
+    provider: str
+    day: str
+    input_tokens: int
+    output_tokens: int
+    requests: int
+    decision: BudgetDecision
+
+    @property
+    def allowed(self) -> bool:
+        return self.decision.allowed
+
+    @property
+    def state(self) -> BudgetState:
+        return self.decision.state
+
+    def reason(self) -> str:
+        return self.decision.reason()
 
 
 @dataclass(frozen=True, slots=True)
@@ -122,9 +152,13 @@ class UsageMeter:
         self._alert_sink = alert_sink
         self._retention_days = retention_days
         self._clock = clock
-        # Guards counter mutations so admission+charge is one atomic step even
-        # if a caller ever moves meter calls off the event-loop thread.
+        # Thread lock for in-process atomicity; every mutation additionally
+        # takes an exclusive interprocess file lock and re-reads the on-disk
+        # state before applying its delta, so overlapping meter instances or
+        # bridge processes merge spend instead of last-writer-wins losing it.
         self._lock = threading.Lock()
+        self._lock_path = self._path.with_name(self._path.name + ".lock")
+        self._flock_warned = False
         self._budgets: dict[str, int] = {}
         for provider, budget in dict(budgets or {}).items():
             self._validate_provider(provider)
@@ -215,6 +249,47 @@ class UsageMeter:
                 self._path,
             )
 
+    @contextmanager
+    def _locked_state(self, *, save: bool = True) -> Iterator[None]:
+        """Hold the thread + interprocess lock around one reload/apply/write.
+
+        The on-disk state is authoritative: it is re-read under the lock so
+        the caller's delta lands on top of every other writer's spend. If the
+        lock file cannot be used the meter degrades to thread-only locking
+        (logged once) rather than breaking the turn.
+        """
+
+        with self._lock:
+            handle = None
+            try:
+                self._path.parent.mkdir(parents=True, exist_ok=True)
+                fd = os.open(
+                    self._lock_path, os.O_CREAT | os.O_RDWR, 0o600
+                )
+                handle = os.fdopen(fd, "r+b")
+                fcntl.flock(handle, fcntl.LOCK_EX)
+            except OSError:
+                if handle is not None:
+                    handle.close()
+                    handle = None
+                if not self._flock_warned:
+                    self._flock_warned = True
+                    logger.warning(
+                        "Usage meter interprocess lock unavailable at %s; "
+                        "falling back to thread-level locking only",
+                        self._lock_path,
+                    )
+            try:
+                self._days.clear()
+                self._alerted.clear()
+                self._load()
+                yield
+                if save:
+                    self._save()
+            finally:
+                if handle is not None:
+                    handle.close()
+
     # -- helpers -------------------------------------------------------------
 
     @staticmethod
@@ -277,26 +352,26 @@ class UsageMeter:
             "output_tokens": _clamped_count(output_tokens),
             "requests": _clamped_count(requests),
         }
-        with self._lock:
-            alerts = self._apply_record(provider, mode, added)
+        if not any(added.values()):
+            return ()
+        with self._locked_state():
+            alerts = self._apply_record(provider, mode, added, self.current_day())
         for alert in alerts:
             self._emit(alert)
         return alerts
 
     def _apply_record(
-        self, provider: str, mode: str, added: Mapping[str, int]
+        self, provider: str, mode: str, added: Mapping[str, int], day: str
     ) -> tuple[UsageAlert, ...]:
-        """Apply one pre-validated record under the meter lock."""
+        """Apply one pre-validated record to ``day`` under the meter lock."""
 
         if not any(added.values()):
             return ()
-        day = self.current_day()
         bucket = self._bucket(day, provider, mode)
         for key, value in added.items():
             bucket[key] = min(bucket[key] + value, _MAX_COUNT)
         alerts = self._collect_alerts(provider, day)
         self._prune(day)
-        self._save()
         return alerts
 
     def reserve_autonomous_spend(
@@ -306,18 +381,19 @@ class UsageMeter:
         input_tokens: int = 0,
         output_tokens: int = 0,
         requests: int = 0,
-    ) -> BudgetDecision:
+    ) -> UsageReservation:
         """Atomically admit-and-charge one autonomous attempt, prospectively.
 
         Admission requires the *whole* requested reservation to fit under the
         provider's daily cap (``used + reservation <= budget``), and the
-        admission check and the charge happen under one lock with no await
-        point in between. Together that bounds recorded autonomous spend by
-        the cap itself: concurrent attempts cannot jointly overrun it and a
-        single oversized attempt is rejected outright (a blocked decision
-        charges nothing). Callers must therefore reserve the full bounded
-        attempt cost up front — and size the budget to fit at least one
-        maximal attempt, or such work stays deferred by design.
+        admission check and the charge happen under one lock (thread and
+        interprocess) against freshly re-read on-disk state, pinned to one
+        accounting day. Concurrent attempts cannot jointly overrun the cap, a
+        single oversized attempt is rejected outright (a blocked reservation
+        charges nothing), and the returned handle carries the captured day
+        and exact dimensions so a refund always unwinds the same bucket.
+        Callers must size the budget to fit at least one maximal attempt, or
+        such work stays deferred by design.
         """
 
         self._validate_provider(provider)
@@ -327,52 +403,56 @@ class UsageMeter:
             "requests": _clamped_count(requests),
         }
         reserved_tokens = added["input_tokens"] + added["output_tokens"]
-        with self._lock:
+        with self._locked_state():
             day = self.current_day()
             budget = self._budgets.get(provider, 0)
             used = self.used_tokens(provider, day)
             if budget > 0 and used + reserved_tokens > budget:
-                return BudgetDecision(provider, day, "blocked", False, used, budget)
-            alerts = self._apply_record(provider, MODE_AUTONOMOUS, added)
+                decision = BudgetDecision(provider, day, "blocked", False, used, budget)
+                return UsageReservation(
+                    provider, day, added["input_tokens"], added["output_tokens"],
+                    added["requests"], decision,
+                )
+            alerts = self._apply_record(provider, MODE_AUTONOMOUS, added, day)
             state: BudgetState = "ok"
             if budget > 0 and used >= self._warn_threshold(budget):
                 state = "warn"
             decision = BudgetDecision(provider, day, state, True, used, budget)
         for alert in alerts:
             self._emit(alert)
-        return decision
+        return UsageReservation(
+            provider, day, added["input_tokens"], added["output_tokens"],
+            added["requests"], decision,
+        )
 
-    def refund_autonomous_reservation(
-        self,
-        provider: str,
-        *,
-        input_tokens: int = 0,
-        output_tokens: int = 0,
-        requests: int = 0,
-    ) -> None:
-        """Unwind one reservation whose attempt never started.
+    def refund_reservation(self, reservation: UsageReservation) -> None:
+        """Unwind one admitted reservation whose attempt never started.
 
         Only for the caller that just reserved and then lost the work (for
-        example a distill claim race or an already-finished job): the exact
-        reserved amounts are subtracted from today's autonomous bucket,
-        clamped at zero. Alerts already fired are intentionally not
+        example a distill claim race or an already-finished job): the
+        handle's exact dimensions are subtracted from the handle's own
+        accounting day, clamped at zero — a refund after midnight cannot
+        touch another day's spend. Blocked reservations charged nothing and
+        refund as a no-op. Alerts already fired are intentionally not
         retracted, and crashes between reserve and refund leave the charge
         in place — both err toward over-counting, never under-counting.
         """
 
-        self._validate_provider(provider)
+        if not reservation.allowed:
+            return
         removed = {
-            "input_tokens": _clamped_count(input_tokens),
-            "output_tokens": _clamped_count(output_tokens),
-            "requests": _clamped_count(requests),
+            "input_tokens": _clamped_count(reservation.input_tokens),
+            "output_tokens": _clamped_count(reservation.output_tokens),
+            "requests": _clamped_count(reservation.requests),
         }
         if not any(removed.values()):
             return
-        with self._lock:
-            bucket = self._bucket(self.current_day(), provider, MODE_AUTONOMOUS)
+        with self._locked_state():
+            bucket = self._bucket(
+                reservation.day, reservation.provider, MODE_AUTONOMOUS
+            )
             for key, value in removed.items():
                 bucket[key] = max(0, bucket[key] - value)
-            self._save()
 
     def record_codex_thread_usage(
         self,
@@ -451,7 +531,7 @@ class UsageMeter:
         """Gate autonomous spend only; interactive turns are never blocked."""
 
         self._validate_provider(provider)
-        with self._lock:
+        with self._locked_state(save=False):
             day = self.current_day()
             budget = self._budgets.get(provider, 0)
             used = self.used_tokens(provider, day)
@@ -517,4 +597,5 @@ __all__ = [
     "BudgetDecision",
     "UsageAlert",
     "UsageMeter",
+    "UsageReservation",
 ]

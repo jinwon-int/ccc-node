@@ -244,6 +244,11 @@ class CodexSession:
                     if active.turn_id is not None and active.turn_id != returned_turn_id:
                         raise RuntimeError("Codex approval turn does not match turn/start response")
                     active.turn_id = returned_turn_id
+                    runtime = self._runtime
+                    runtime._started_turn_ids[returned_turn_id] = None
+                    runtime._started_turn_ids = dict(
+                        tuple(runtime._started_turn_ids.items())[-512:]
+                    )
                     active.turn_ready.set()
                     self._runtime._flush_pending_notifications(active)
                     while True:
@@ -325,6 +330,10 @@ class CodexRuntime:
         # usage totals contain no prior-session history, so the first
         # observation is real new spend rather than a resume baseline.
         self._created_threads: dict[str, None] = {}
+        # Turn ids this process started, so a resumed thread's first usage
+        # notification can be attributed to our turn (metered via the
+        # turn-scoped `last` block) instead of being discarded as history.
+        self._started_turn_ids: dict[str, None] = {}
         self._account_rate_limits = UsageSnapshot(provider="codex")
         self._usage_recorder: UsageRecorder | None = None
         self._closed = False
@@ -838,12 +847,22 @@ class CodexRuntime:
 
     def _record_thread_usage(self, thread_id: str, params: Mapping[str, JsonValue]) -> None:
         previous = self._thread_usage.get(thread_id)
-        if previous is None and thread_id in self._created_threads:
-            # A thread this process created has no prior-session history in
-            # its cumulative totals: seed a zero baseline so the first turn's
-            # spend is recorded instead of being discarded as resume history.
-            previous = UsageSnapshot(provider="codex", input_tokens=0, output_tokens=0)
         snapshot = parse_codex_thread_usage(params)
+        if previous is None:
+            if thread_id in self._created_threads:
+                # A thread this process created has no prior-session history
+                # in its cumulative totals: a zero baseline records the first
+                # turn's spend instead of discarding it as resume history.
+                previous = UsageSnapshot(
+                    provider="codex", input_tokens=0, output_tokens=0
+                )
+            elif self._is_our_turn_notification(thread_id, params):
+                # A resumed thread's first observation during OUR turn mixes
+                # prior-session history with the new turn. The turn-scoped
+                # `last` block sizes the new spend, so the implied pre-turn
+                # baseline (total - last) excludes history without dropping
+                # the first paid turn.
+                previous = self._implied_pre_turn_baseline(params, snapshot)
         self._thread_usage[thread_id] = snapshot
         self._thread_usage = dict(tuple(self._thread_usage.items())[-128:])
         if self._usage_recorder is None:
@@ -852,6 +871,54 @@ class CodexRuntime:
             self._usage_recorder(thread_id, previous, snapshot)
         except Exception:
             logger.exception("Codex usage recorder failed; dispatch continues")
+
+    def _is_our_turn_notification(
+        self, thread_id: str, params: Mapping[str, JsonValue]
+    ) -> bool:
+        turn_id = self._notification_turn_id(params)
+        if turn_id is not None and turn_id in self._started_turn_ids:
+            return True
+        active = self._active_turns.get(thread_id)
+        return active is not None and not active.finished
+
+    @staticmethod
+    def _implied_pre_turn_baseline(
+        params: Mapping[str, JsonValue], snapshot: UsageSnapshot
+    ) -> UsageSnapshot | None:
+        """Derive the pre-turn cumulative baseline from the `last` block.
+
+        ``total - last`` stays constant across mid-turn updates, so metering
+        the delta against it counts exactly the current turn. Without a
+        parseable ``last`` the observation stays a plain baseline (history is
+        never charged to the budget).
+        """
+
+        token_usage = params.get("tokenUsage", params)
+        if not isinstance(token_usage, Mapping):
+            return None
+        last = token_usage.get("last")
+        if not isinstance(last, Mapping):
+            return None
+
+        def _count(value: object) -> int | None:
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                return None
+            return value
+
+        last_input = _count(last.get("inputTokens"))
+        last_output = _count(last.get("outputTokens"))
+        if last_input is None and last_output is None:
+            # Older shape: only the turn total is exposed; attribute it to
+            # input so the turn is still metered (budget-conservative).
+            last_total = _count(last.get("totalTokens"))
+            if last_total is None:
+                return None
+            last_input, last_output = last_total, 0
+        return UsageSnapshot(
+            provider="codex",
+            input_tokens=max(0, (snapshot.input_tokens or 0) - (last_input or 0)),
+            output_tokens=max(0, (snapshot.output_tokens or 0) - (last_output or 0)),
+        )
 
     def _flush_pending_notifications(self, active: _ActiveTurn) -> None:
         pending = tuple(active.pending_notifications)
