@@ -432,6 +432,11 @@ class CodexAppServerTests(unittest.IsolatedAsyncioTestCase):
         })
         await assert_call(client.thread_resume("thread-1"), "thread/resume", {"threadId": "thread-1"})
         await assert_call(
+            client.thread_rollback("thread-1", num_turns=1),
+            "thread/rollback",
+            {"threadId": "thread-1", "numTurns": 1},
+        )
+        await assert_call(
             client.turn_start(
                 "thread-1",
                 [{"type": "text", "text": "hello"}],

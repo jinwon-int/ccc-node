@@ -68,7 +68,12 @@ class FakeClient:
         self.close_calls = 0
         self.thread_start_calls: list[dict[str, Any]] = []
         self.thread_resume_calls: list[dict[str, Any]] = []
+        self.thread_rollback_calls: list[dict[str, Any]] = []
         self.thread_start_result: Any = {"thread": {"id": "thread-new"}}
+        self.thread_resume_result: Any = None
+        self.thread_rollback_result: Any = None
+        self.thread_rollback_error: BaseException | None = None
+        self.thread_resume_gate: asyncio.Event | None = None
         self.notifications: asyncio.Queue[CodexNotification | BaseException] = asyncio.Queue()
         self.model_result: Any = {"data": []}
         self.rate_limits_result: Any = {"rateLimits": {}}
@@ -105,6 +110,19 @@ class FakeClient:
         model: str | None = None,
     ) -> Any:
         self.thread_resume_calls.append({"thread_id": thread_id, "cwd": cwd, "model": model})
+        if self.thread_resume_gate is not None:
+            await self.thread_resume_gate.wait()
+        if self.thread_resume_result is not None:
+            return self.thread_resume_result
+        return {"thread": {"id": thread_id}}
+
+    async def thread_rollback(self, thread_id: str, *, num_turns: int) -> Any:
+        self.thread_rollback_calls.append({"thread_id": thread_id, "num_turns": num_turns})
+        if self.thread_rollback_error is not None:
+            raise self.thread_rollback_error
+        if self.thread_rollback_result is not None:
+            self.thread_resume_result = self.thread_rollback_result
+            return self.thread_rollback_result
         return {"thread": {"id": thread_id}}
 
     async def list_models(self, *, include_hidden: bool = False) -> Any:
@@ -264,6 +282,196 @@ class CodexRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 ),
                 ModelInfo("codex-b", "Codex B"),
             ),
+        )
+
+    async def test_resume_rolls_back_idle_last_turn_with_orphaned_dynamic_tool_call(
+        self,
+    ) -> None:
+        await self.runtime._ensure_started()
+        client = self.clients[0]
+        client.thread_resume_result = {
+            "thread": {
+                "id": "thread-damaged",
+                "status": {"type": "idle"},
+                "turns": [
+                    {
+                        "id": "turn-ok",
+                        "status": "completed",
+                        "items": [],
+                    },
+                    {
+                        "id": "turn-interrupted",
+                        "status": "interrupted",
+                        "items": [
+                            {
+                                "id": "call-orphan",
+                                "type": "dynamicToolCall",
+                                "status": "inProgress",
+                                "tool": "code_mode",
+                                "arguments": {"private": "must-not-be-logged"},
+                                "contentItems": None,
+                                "success": None,
+                            }
+                        ],
+                    },
+                ],
+            }
+        }
+        client.thread_rollback_result = {
+            "thread": {
+                "id": "thread-damaged",
+                "status": {"type": "idle"},
+                "turns": [{"id": "turn-ok", "status": "completed", "items": []}],
+            }
+        }
+
+        session = await self.runtime.start_or_resume(
+            SessionRequest(
+                working_directory="/workspace",
+                session_id="thread-damaged",
+            )
+        )
+
+        self.assertEqual(session.session_id, "thread-damaged")
+        self.assertEqual(
+            client.thread_rollback_calls,
+            [{"thread_id": "thread-damaged", "num_turns": 1}],
+        )
+
+    async def test_resume_preserves_completed_or_active_dynamic_tool_calls(self) -> None:
+        await self.runtime._ensure_started()
+        client = self.clients[0]
+
+        for thread_status, tool_status, turn_status in (
+            ({"type": "idle"}, "completed", "completed"),
+            ({"type": "active", "activeFlags": []}, "inProgress", "inProgress"),
+        ):
+            client.thread_resume_result = {
+                "thread": {
+                    "id": "thread-safe",
+                    "status": thread_status,
+                    "turns": [
+                        {
+                            "id": "turn-safe",
+                            "status": turn_status,
+                            "items": [
+                                {
+                                    "id": "call-safe",
+                                    "type": "dynamicToolCall",
+                                    "status": tool_status,
+                                    "tool": "code_mode",
+                                    "arguments": {},
+                                    "contentItems": [] if tool_status == "completed" else None,
+                                    "success": tool_status == "completed",
+                                }
+                            ],
+                        }
+                    ],
+                }
+            }
+
+            session = await self.runtime.start_or_resume(
+                SessionRequest(
+                    working_directory="/workspace",
+                    session_id="thread-safe",
+                )
+            )
+            self.assertEqual(session.session_id, "thread-safe")
+
+        self.assertEqual(client.thread_rollback_calls, [])
+
+    async def test_resume_reports_body_free_error_when_orphan_rollback_fails(self) -> None:
+        await self.runtime._ensure_started()
+        client = self.clients[0]
+        client.thread_resume_result = {
+            "thread": {
+                "id": "thread-damaged",
+                "status": {"type": "idle"},
+                "turns": [
+                    {
+                        "id": "turn-interrupted",
+                        "status": "failed",
+                        "items": [
+                            {
+                                "id": "call-orphan",
+                                "type": "dynamicToolCall",
+                                "status": "inProgress",
+                                "tool": "code_mode",
+                                "arguments": {"secret": "provider-payload"},
+                            }
+                        ],
+                    }
+                ],
+            }
+        }
+        client.thread_rollback_error = RuntimeError("provider-payload")
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "^Codex orphaned tool-call recovery failed$",
+        ):
+            await self.runtime.start_or_resume(
+                SessionRequest(
+                    working_directory="/workspace",
+                    session_id="thread-damaged",
+                )
+            )
+
+    async def test_concurrent_resumes_cannot_roll_back_the_same_orphan_twice(self) -> None:
+        await self.runtime._ensure_started()
+        client = self.clients[0]
+        gate = asyncio.Event()
+        client.thread_resume_gate = gate
+        client.thread_resume_result = {
+            "thread": {
+                "id": "thread-damaged",
+                "status": {"type": "idle"},
+                "turns": [
+                    {
+                        "id": "turn-interrupted",
+                        "status": "interrupted",
+                        "items": [
+                            {
+                                "id": "call-orphan",
+                                "type": "dynamicToolCall",
+                                "status": "inProgress",
+                                "tool": "code_mode",
+                                "arguments": {},
+                            }
+                        ],
+                    }
+                ],
+            }
+        }
+        client.thread_rollback_result = {
+            "thread": {
+                "id": "thread-damaged",
+                "status": {"type": "idle"},
+                "turns": [],
+            }
+        }
+        request = SessionRequest(
+            working_directory="/workspace",
+            session_id="thread-damaged",
+        )
+
+        first = asyncio.create_task(self.runtime.start_or_resume(request))
+        while len(client.thread_resume_calls) < 1:
+            await asyncio.sleep(0)
+        second = asyncio.create_task(self.runtime.start_or_resume(request))
+        await asyncio.sleep(0)
+
+        self.assertEqual(len(client.thread_resume_calls), 1)
+        gate.set()
+        sessions = await asyncio.gather(first, second)
+
+        self.assertEqual([session.session_id for session in sessions], [
+            "thread-damaged",
+            "thread-damaged",
+        ])
+        self.assertEqual(
+            client.thread_rollback_calls,
+            [{"thread_id": "thread-damaged", "num_turns": 1}],
         )
 
     async def test_usage_reads_account_without_turn_and_isolates_exact_thread_cache(self) -> None:
