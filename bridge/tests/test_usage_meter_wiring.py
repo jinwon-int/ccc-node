@@ -9,7 +9,13 @@ import tempfile
 from types import SimpleNamespace
 import unittest
 
-from telegram_bot.core.agent_runtime import SessionRequest
+from telegram_bot.core.agent_runtime import (
+    CompletionEvent,
+    ErrorEvent,
+    ResultEvent,
+    SessionRequest,
+    TextDeltaEvent,
+)
 from telegram_bot.core.codex_app_server import CodexNotification
 from telegram_bot.core.codex_runtime import CodexRuntime
 from telegram_bot.core.project_chat import ProjectChatHandler
@@ -159,6 +165,40 @@ class ProjectChatMeterWiringTests(unittest.IsolatedAsyncioTestCase):
         )
 
 
+class _ScriptedTurnSession:
+    def __init__(self, scripts: list, session_id: str) -> None:
+        self._scripts = scripts
+        self.session_id = session_id
+
+    def send_turn(self, message: str, *, approval_handler=None):
+        events = self._scripts.pop(0)
+
+        async def stream():
+            for event in events:
+                yield event
+
+        return stream()
+
+    async def interrupt(self) -> None:
+        return None
+
+
+class _ScriptedTurnRuntime:
+    """Agent runtime double whose session replays scripted event turns."""
+
+    def __init__(self, scripts: list) -> None:
+        self._scripts = list(scripts)
+        self.recorder = None
+
+    def set_usage_recorder(self, recorder) -> None:
+        self.recorder = recorder
+
+    async def start_or_resume(self, request: SessionRequest) -> _ScriptedTurnSession:
+        return _ScriptedTurnSession(
+            self._scripts, request.session_id or "thread-scripted"
+        )
+
+
 class _RecordingJournal:
     """Minimal journal double: enough surface for the deferred-job path."""
 
@@ -249,6 +289,35 @@ class ProductionCompositionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(result, journal.sentinel)
         self.assertEqual(journal.claim_calls, 0)
         self.assertEqual(backend.calls, 0)
+
+    async def test_failed_and_successful_attempts_each_meter_one_request(self) -> None:
+        # Reviewer probe: an attempt that reaches the provider must charge
+        # exactly one request even when the turn ends in an error terminal.
+        runtime = _ScriptedTurnRuntime(
+            [
+                [
+                    TextDeltaEvent("partial answer"),
+                    ErrorEvent(code="codex_turn_failed", message="scripted failure"),
+                ],
+                [
+                    TextDeltaEvent("final answer"),
+                    ResultEvent(result={"status": "completed"}),
+                    CompletionEvent(stop_reason="end_turn"),
+                ],
+            ]
+        )
+        handler = ProjectChatHandler(
+            settings=_settings(self.root, provider="codex"), agent_runtime=runtime
+        )
+        handler._task_ledger_cache = False
+
+        await handler.process_message("first", 7, 9)
+        day_buckets = next(iter(_meter_state(self.root)["days"].values()))
+        self.assertEqual(day_buckets["codex"]["interactive"]["requests"], 1)
+
+        await handler.process_message("second", 7, 9)
+        day_buckets = next(iter(_meter_state(self.root)["days"].values()))
+        self.assertEqual(day_buckets["codex"]["interactive"]["requests"], 2)
 
     async def test_built_distill_worker_rejects_external_meters(self) -> None:
         handler = ProjectChatHandler(

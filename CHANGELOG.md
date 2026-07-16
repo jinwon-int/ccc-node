@@ -71,7 +71,9 @@ All notable changes to the Claude Code node harness. Dates are KST.
   thread's first notification during a turn this process started derives an
   implied pre-turn baseline from the turn-scoped `last` block (total minus
   last) so the first post-resume turn is metered while prior-session
-  history is never counted — plus a per-turn request count, and the distill
+  history is never counted — plus one request per provider attempt,
+  recorded exactly once per turn stream regardless of outcome (success,
+  error terminal, stall abandonment, or cancellation), and the distill
   extraction worker charges every
   autonomous attempt with a conservative pre-spend token reservation
   (2048 overhead + snapshot bytes ÷ 2) until the exec backend can report
