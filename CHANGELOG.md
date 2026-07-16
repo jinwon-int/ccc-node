@@ -5,6 +5,11 @@ All notable changes to the Claude Code node harness. Dates are KST.
 ## [Unreleased]
 
 ### Changed
+- Claude Code now defaults to native `bypassPermissions` mode, matching the
+  no-prompt execution posture used by ccc-node/Codex. New installs and
+  self-updates receive the mode through `settings.base.json`; the independent
+  ccc-node PreToolUse guard continues to enforce Fresh Approval Required
+  boundaries, including catastrophic local `rm`.
 - Claude's service-lifecycle guard now treats direct local detached Compose
   reconciliation (`docker compose up -d [services...]`, including
   `docker-compose` and `--detach`) as autonomous, matching the unrestricted
