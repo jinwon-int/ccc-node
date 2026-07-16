@@ -140,6 +140,8 @@ class AppServerClient(Protocol):
         model: str | None = None,
     ) -> JsonValue: ...
 
+    async def thread_rollback(self, thread_id: str, *, num_turns: int) -> JsonValue: ...
+
     async def turn_start(
         self,
         thread_id: str,
@@ -345,14 +347,37 @@ class CodexRuntime:
                 cwd=request.working_directory,
                 model=request.model,
             )
+            thread_id = self._thread_id(result)
+            turn_lock = self._thread_locks.setdefault(thread_id, asyncio.Lock())
         else:
-            result = await self._client.thread_resume(
-                request.session_id,
-                cwd=request.working_directory,
-                model=request.model,
-            )
-        thread_id = self._thread_id(result)
-        turn_lock = self._thread_locks.setdefault(thread_id, asyncio.Lock())
+            thread_id = request.session_id
+            turn_lock = self._thread_locks.setdefault(thread_id, asyncio.Lock())
+            async with turn_lock:
+                result = await self._client.thread_resume(
+                    thread_id,
+                    cwd=request.working_directory,
+                    model=request.model,
+                )
+                if self._thread_id(result) != thread_id:
+                    raise RuntimeError("Codex resume returned a different thread")
+                if self._has_orphaned_dynamic_tool_call(result):
+                    logger.warning(
+                        "Recovering Codex thread by rolling back its last incomplete "
+                        "dynamic-tool turn"
+                    )
+                    try:
+                        recovered = await self._client.thread_rollback(
+                            thread_id,
+                            num_turns=1,
+                        )
+                        if self._thread_id(recovered) != thread_id:
+                            raise RuntimeError("Codex rollback returned a different thread")
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        raise RuntimeError(
+                            "Codex orphaned tool-call recovery failed"
+                        ) from None
         return CodexSession(
             self,
             thread_id,
@@ -940,6 +965,48 @@ class CodexRuntime:
         if not isinstance(thread_id, str) or not thread_id:
             raise RuntimeError("Codex thread response has invalid thread id")
         return thread_id
+
+    @staticmethod
+    def _has_orphaned_dynamic_tool_call(result: JsonValue) -> bool:
+        """Detect a persisted client-tool request that can no longer finish.
+
+        Codex exposes dynamic tool calls through the normalized thread view. If
+        the app-server is idle but the last incomplete turn still contains an
+        in-progress client tool with no output, resuming it would replay a
+        response item that can never be matched. Only this narrow terminal
+        shape is safe to prune; active and completed turns are preserved.
+        """
+
+        if not isinstance(result, Mapping):
+            return False
+        thread = result.get("thread")
+        if not isinstance(thread, Mapping):
+            return False
+        thread_status = thread.get("status")
+        if isinstance(thread_status, Mapping):
+            thread_status = thread_status.get("type")
+        if thread_status != "idle":
+            return False
+        turns = thread.get("turns")
+        if not isinstance(turns, (list, tuple)) or not turns:
+            return False
+        last_turn = turns[-1]
+        if not isinstance(last_turn, Mapping):
+            return False
+        if last_turn.get("status") not in {"inProgress", "interrupted", "failed"}:
+            return False
+        items = last_turn.get("items")
+        if not isinstance(items, (list, tuple)):
+            return False
+        orphan_types = {"dynamicToolCall", "customToolCall", "custom_tool_call"}
+        return any(
+            isinstance(item, Mapping)
+            and item.get("type") in orphan_types
+            and item.get("status") == "inProgress"
+            and item.get("contentItems") is None
+            and item.get("success") is not True
+            for item in items
+        )
 
     @staticmethod
     def _turn_id(result: JsonValue) -> str:

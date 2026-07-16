@@ -253,6 +253,18 @@ class CodexAppServerClient:
             params["model"] = model
         return await self.request("thread/resume", params)
 
+    async def thread_rollback(self, thread_id: str, *, num_turns: int) -> JsonValue:
+        """Drop incomplete turns from the end of a Codex thread."""
+
+        if not thread_id:
+            raise ValueError("thread id must not be empty")
+        if num_turns < 1:
+            raise ValueError("rollback turn count must be positive")
+        return await self.request(
+            "thread/rollback",
+            {"threadId": thread_id, "numTurns": num_turns},
+        )
+
     async def thread_list(
         self,
         *,
