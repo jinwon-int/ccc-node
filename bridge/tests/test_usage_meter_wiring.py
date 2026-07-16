@@ -29,6 +29,8 @@ def _settings(project_root: Path, provider: str = "claude") -> SimpleNamespace:
         usage_budget_tokens_claude=0,
         usage_budget_tokens_codex=0,
         usage_budget_warn_percent=80,
+        push_enabled=False,
+        push_spool_dir=str(project_root / "spool"),
     )
 
 
@@ -125,6 +127,108 @@ class ProjectChatMeterWiringTests(unittest.IsolatedAsyncioTestCase):
             day_buckets["codex"]["interactive"],
             {"input_tokens": 300, "output_tokens": 50, "requests": 1},
         )
+
+
+class _RecordingJournal:
+    """Minimal journal double: enough surface for the deferred-job path."""
+
+    def __init__(self) -> None:
+        self.claim_calls = 0
+        self.sentinel = object()
+
+    def get(self, job_id: str) -> object:
+        return self.sentinel
+
+    def claim_extraction(self, *args: object, **kwargs: object) -> None:
+        self.claim_calls += 1
+        return None
+
+
+class _CountingBackend:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def extract(self, extraction_input: object) -> object:
+        self.calls += 1
+        return object()
+
+
+class ProductionCompositionTests(unittest.IsolatedAsyncioTestCase):
+    """The composition root wires the shared gate and the owner alert sink."""
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+
+    async def test_budget_alerts_reach_the_owner_push_spool_when_enabled(self) -> None:
+        settings = _settings(self.root)
+        settings.push_enabled = True
+        settings.usage_budget_tokens_codex = 1000
+        handler = ProjectChatHandler(settings=settings)
+        meter = handler.usage_meter
+        assert meter is not None
+
+        meter.record("codex", "interactive", input_tokens=1200)
+
+        spooled = sorted((self.root / "spool").glob("*.json"))
+        self.assertEqual(len(spooled), 2, "warn and enforce alerts must both spool")
+        events = []
+        for path in spooled:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            events.append(payload["event"])
+            self.assertEqual(payload["event"], "usage-budget")
+            self.assertRegex(
+                payload["text"],
+                r"^(⚠️ warn|🛑 enforce): codex used \d+ of \d+ daily budget tokens",
+            )
+            self.assertTrue(payload["dedup"].startswith("usage-budget:"))
+        self.assertEqual(events, ["usage-budget", "usage-budget"])
+
+    async def test_budget_alerts_stay_log_only_when_push_is_disabled(self) -> None:
+        settings = _settings(self.root)
+        settings.usage_budget_tokens_codex = 1000
+        handler = ProjectChatHandler(settings=settings)
+        meter = handler.usage_meter
+        assert meter is not None
+
+        meter.record("codex", "interactive", input_tokens=1200)
+
+        self.assertFalse((self.root / "spool").exists())
+        self.assertEqual(meter.used_tokens("codex"), 1200)
+
+    async def test_built_distill_worker_is_gated_by_the_shared_meter(self) -> None:
+        settings = _settings(self.root, provider="codex")
+        settings.usage_budget_tokens_codex = 1000
+        handler = ProjectChatHandler(
+            settings=settings, agent_runtime=_RecorderRuntime()
+        )
+        meter = handler.usage_meter
+        assert meter is not None
+        meter.record("codex", "interactive", input_tokens=1000)
+
+        journal = _RecordingJournal()
+        backend = _CountingBackend()
+        worker = handler.build_distill_extraction_worker(
+            journal, backend, owner_token="composition-test"
+        )
+        result = await worker.extract_once(job_id="job-1")
+
+        # The shared meter is over budget, so the production-built worker
+        # defers the job without claiming it or calling the provider.
+        self.assertIs(result, journal.sentinel)
+        self.assertEqual(journal.claim_calls, 0)
+        self.assertEqual(backend.calls, 0)
+
+    async def test_built_distill_worker_rejects_external_meters(self) -> None:
+        handler = ProjectChatHandler(
+            settings=_settings(self.root, provider="codex"),
+            agent_runtime=_RecorderRuntime(),
+        )
+        with self.assertRaises(ValueError):
+            handler.build_distill_extraction_worker(
+                _RecordingJournal(), _CountingBackend(), usage_meter=None
+            )
 
 
 class CodexRuntimeRecorderTests(unittest.IsolatedAsyncioTestCase):

@@ -75,9 +75,14 @@ All notable changes to the Claude Code node harness. Dates are KST.
   alarm at `CCC_USAGE_BUDGET_WARN_PERCENT`, default 80%) and one enforce
   alert per provider-day; at the enforce threshold the distill worker defers
   autonomous extraction without claiming the job or burning an attempt while
-  interactive user turns keep flowing by design. `/usage` now appends a
-  compact 7-day local meter report with budget state. Metering never blocks
-  or fails a turn (`CCC_USAGE_METER_ENABLED=false` disables it entirely).
+  interactive user turns keep flowing by design.
+  `ProjectChatHandler.build_distill_extraction_worker` is the composition
+  root for #465's scheduling: it always injects the shared meter (callers
+  cannot substitute their own gate), and budget alerts additionally queue an
+  owner push through the opt-in push-notifier spool (log-only when
+  `CCC_PUSH_ENABLED` is off). `/usage` now appends a compact 7-day local
+  meter report with budget state. Metering never blocks or fails a turn
+  (`CCC_USAGE_METER_ENABLED=false` disables it entirely).
 - Provider conformance contract + capability matrix (#387). The new
   `bridge/core/provider_capabilities.py` is the single source of per-provider
   capability states (`supported`/`degraded`/`unsupported`/`unknown`, each with

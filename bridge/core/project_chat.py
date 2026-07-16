@@ -2,6 +2,7 @@
 Project Chat Handler - Integrates Telegram with Claude Code SDK.
 """
 
+import json
 import os
 import re
 import time
@@ -55,6 +56,7 @@ from telegram_bot.core.usage import (
     parse_claude_result,
 )
 from telegram_bot.core.usage_meter import MODE_INTERACTIVE, UsageMeter
+from telegram_bot.memory.distill_worker import CodexDistillExtractionWorker
 from telegram_bot.core.curated_memory import build_curated_memory_settings
 from telegram_bot.core.session_scope import stream_key
 from telegram_bot.core.web_mcp import build_curated_web_mcp
@@ -247,6 +249,7 @@ class ProjectChatHandler(
                     warn_percent=int(
                         getattr(self._config, "usage_budget_warn_percent", 80) or 80
                     ),
+                    alert_sink=self._write_usage_alert_spool,
                 )
             except Exception:
                 logger.exception(
@@ -265,6 +268,62 @@ class ProjectChatHandler(
         """Node-local durable usage meter, when enabled (#388)."""
 
         return self._usage_meter
+
+    def _write_usage_alert_spool(self, message: str) -> None:
+        """Queue one budget alert for owner push delivery (#388).
+
+        Reuses the opt-in push-notifier spool contract: token isolation,
+        owner-only target resolution, dedup, and rate limiting all stay in
+        PushNotifier. When push is disabled the alert stays log-only (the
+        meter already logged it) and nothing accumulates on disk.
+        """
+
+        if not bool(getattr(self._config, "push_enabled", False)):
+            return
+        spool_dir = Path(
+            getattr(self._config, "push_spool_dir", None)
+            or (Path.home() / ".claude" / "state" / "telegram-spool")
+        )
+        payload = {
+            "event": "usage-budget",
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "text": message,
+            "dedup": f"usage-budget:{message}",
+        }
+        try:
+            spool_dir.mkdir(parents=True, exist_ok=True)
+            target = spool_dir / f"usage-budget-{time.time_ns()}.json"
+            tmp = target.with_suffix(".tmp")
+            tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, target)
+        except OSError:
+            logger.warning("Usage budget alert spool write failed; alert stays log-only")
+
+    def build_distill_extraction_worker(
+        self,
+        journal: Any,
+        backend: Any,
+        **worker_kwargs: Any,
+    ) -> CodexDistillExtractionWorker:
+        """Composition root for distill extraction workers (#465 scheduling).
+
+        Always injects this handler's shared usage meter so autonomous
+        extraction spend is gated by the same daily budget that meters
+        interactive turns (#388). Callers must not supply their own
+        ``usage_meter`` — the gate is a composition invariant, not an option.
+        """
+
+        if "usage_meter" in worker_kwargs:
+            raise ValueError(
+                "usage_meter is injected by the composition root; do not pass it"
+            )
+        return CodexDistillExtractionWorker(
+            journal,
+            backend,
+            usage_meter=self._usage_meter,
+            **worker_kwargs,
+        )
 
     def record_agent_turn_request(self) -> None:
         """Count one completed interactive agent-runtime turn, fail-open."""
