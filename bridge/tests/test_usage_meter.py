@@ -439,3 +439,28 @@ class PersistenceFailureTests(UsageMeterTestCase):
         self.assertFalse(
             meter.reserve_autonomous_spend("codex", input_tokens=1).allowed
         )
+
+
+class TransientSaveRecoveryTests(UsageMeterTestCase):
+    def test_recovery_save_merges_other_writers_spend(self) -> None:
+        # Reviewer probe: A fails to persist 100, B persists 200, then A's
+        # recovered 50-token record must merge to 350 — never 150 — and the
+        # gate must see the full prior spend.
+        meter_a = self.make_meter()
+        meter_b = self.make_meter()
+        self.path.mkdir()  # os.replace onto a directory fails on POSIX
+        with self.assertLogs("telegram_bot.core.usage_meter", level="WARNING"):
+            meter_a.record("codex", MODE_INTERACTIVE, input_tokens=100)
+        self.path.rmdir()
+        meter_b.record("codex", MODE_INTERACTIVE, input_tokens=200)
+
+        meter_a.record("codex", MODE_INTERACTIVE, input_tokens=50)
+
+        raw = json.loads(self.path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            raw["days"][FIXED_DAY]["codex"][MODE_INTERACTIVE]["input_tokens"], 350
+        )
+        gated = self.make_meter(budgets={"codex": 250})
+        self.assertFalse(
+            gated.reserve_autonomous_spend("codex", input_tokens=100).allowed
+        )

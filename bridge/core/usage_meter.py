@@ -159,10 +159,12 @@ class UsageMeter:
         self._lock = threading.Lock()
         self._lock_path = self._path.with_name(self._path.name + ".lock")
         self._flock_warned = False
-        # True while in-memory counters hold deltas a failed _save() could
-        # not persist; _locked_state then skips the disk reload so those
-        # deltas survive (cross-process merge resumes after a good save).
-        self._save_failed = False
+        # Signed counter deltas applied since the last successful save
+        # (day -> provider -> mode -> key). While non-empty, every locked
+        # mutation reloads the authoritative on-disk state and replays these
+        # on top, so a transient save failure neither loses our spend nor
+        # clobbers spend other writers persisted meanwhile.
+        self._pending_deltas: dict[str, dict[str, dict[str, dict[str, int]]]] = {}
         self._budgets: dict[str, int] = {}
         for provider, budget in dict(budgets or {}).items():
             self._validate_provider(provider)
@@ -240,7 +242,7 @@ class UsageMeter:
                     handle.write(payload)
                 os.chmod(tmp_name, 0o600)
                 os.replace(tmp_name, self._path)
-                self._save_failed = False
+                self._pending_deltas.clear()
             except BaseException:
                 try:
                     os.unlink(tmp_name)
@@ -248,7 +250,6 @@ class UsageMeter:
                     pass
                 raise
         except OSError:
-            self._save_failed = True
             logger.warning(
                 "Usage meter state could not be persisted to %s; keeping "
                 "in-memory counters",
@@ -286,10 +287,10 @@ class UsageMeter:
                         self._lock_path,
                     )
             try:
-                if not self._save_failed:
-                    self._days.clear()
-                    self._alerted.clear()
-                    self._load()
+                self._days.clear()
+                self._alerted.clear()
+                self._load()
+                self._replay_pending_deltas()
                 yield
                 if save:
                     self._save()
@@ -298,6 +299,25 @@ class UsageMeter:
                     handle.close()
 
     # -- helpers -------------------------------------------------------------
+
+    def _note_pending_delta(
+        self, day: str, provider: str, mode: str, changes: Mapping[str, int], sign: int
+    ) -> None:
+        bucket = (
+            self._pending_deltas.setdefault(day, {})
+            .setdefault(provider, {})
+            .setdefault(mode, {key: 0 for key in _COUNTER_KEYS})
+        )
+        for key, value in changes.items():
+            bucket[key] += sign * value
+
+    def _replay_pending_deltas(self) -> None:
+        for day, providers in self._pending_deltas.items():
+            for provider, modes in providers.items():
+                for mode, changes in modes.items():
+                    bucket = self._bucket(day, provider, mode)
+                    for key, value in changes.items():
+                        bucket[key] = max(0, min(bucket[key] + value, _MAX_COUNT))
 
     @staticmethod
     def _is_day_key(value: object) -> bool:
@@ -377,6 +397,7 @@ class UsageMeter:
         bucket = self._bucket(day, provider, mode)
         for key, value in added.items():
             bucket[key] = min(bucket[key] + value, _MAX_COUNT)
+        self._note_pending_delta(day, provider, mode, added, 1)
         alerts = self._collect_alerts(provider, day)
         self._prune(day)
         return alerts
@@ -458,8 +479,14 @@ class UsageMeter:
             bucket = self._bucket(
                 reservation.day, reservation.provider, MODE_AUTONOMOUS
             )
-            for key, value in removed.items():
-                bucket[key] = max(0, bucket[key] - value)
+            applied = {
+                key: min(bucket[key], value) for key, value in removed.items()
+            }
+            for key, value in applied.items():
+                bucket[key] = bucket[key] - value
+            self._note_pending_delta(
+                reservation.day, reservation.provider, MODE_AUTONOMOUS, applied, -1
+            )
 
     def record_codex_thread_usage(
         self,
