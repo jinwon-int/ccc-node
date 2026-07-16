@@ -46,6 +46,21 @@ class AutonomousSpendGate(Protocol):
     ) -> object: ...
 
 _SAFE_ERROR_CODE_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+
+# Conservative autonomous pre-spend reservation (#388). The codex exec
+# backend discards provider stdout, so per-attempt token usage is not yet
+# observable here; until #465's cost-metering criterion surfaces actual
+# usage, every extraction attempt charges the budget with an overestimate
+# derived from the bounded snapshot size so repeated background work
+# consumes — and eventually hits — the daily token cap. 2 bytes/token is a
+# deliberate UTF-8 floor (real usage is lower), and the flat overhead covers
+# the extraction prompt, schema, and bounded response.
+_RESERVED_OVERHEAD_TOKENS = 2048
+_RESERVED_BYTES_PER_TOKEN = 2
+
+
+def _reserved_extraction_tokens(snapshot_bytes: int) -> int:
+    return _RESERVED_OVERHEAD_TOKENS + max(0, snapshot_bytes) // _RESERVED_BYTES_PER_TOKEN
 _RETRYABLE_BACKEND_CODES = frozenset(
     {
         "codex_distill_spawn_failed",
@@ -161,7 +176,12 @@ class CodexDistillExtractionWorker:
             )
         if self._usage_meter is not None:
             try:
-                self._usage_meter.record("codex", "autonomous", requests=1)
+                self._usage_meter.record(
+                    "codex",
+                    "autonomous",
+                    input_tokens=_reserved_extraction_tokens(snapshot.byte_count),
+                    requests=1,
+                )
             except Exception:
                 logger.exception("Autonomous usage metering failed; extraction continues")
         try:

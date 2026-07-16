@@ -66,8 +66,11 @@ All notable changes to the Claude Code node harness. Dates are KST.
   turns meter at the reader's `ResultMessage`, Codex interactive turns meter
   via a runtime usage recorder fed by cumulative `thread/tokenUsage/updated`
   deltas (baseline-first so resumed-thread history is never counted) plus a
-  per-turn request count, and the distill extraction worker meters autonomous
-  attempts. Optional per-provider daily token budgets
+  per-turn request count, and the distill extraction worker charges every
+  autonomous attempt with a conservative pre-spend token reservation
+  (2048 overhead + snapshot bytes ÷ 2) until the exec backend can report
+  actual usage, so repeated background work consumes — and eventually
+  hits — the cap. Optional per-provider daily token budgets
   (`CCC_USAGE_BUDGET_TOKENS_CLAUDE`/`_CODEX`, 0 = off) raise one warn (early
   alarm at `CCC_USAGE_BUDGET_WARN_PERCENT`, default 80%) and one enforce
   alert per provider-day; at the enforce threshold the distill worker defers

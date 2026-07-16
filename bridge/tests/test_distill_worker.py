@@ -25,6 +25,7 @@ from telegram_bot.memory.distill_types import (
     DistillTrigger,
     TranscriptMessage,
 )
+from telegram_bot.core.usage_meter import UsageMeter
 from telegram_bot.memory.distill_worker import CodexDistillExtractionWorker
 
 
@@ -446,7 +447,7 @@ class _FakeUsageMeter:
     def __init__(self, *, allowed: bool) -> None:
         self.allowed = allowed
         self.checks: list[str] = []
-        self.records: list[tuple[str, str, int]] = []
+        self.records: list[tuple[str, str, int, int]] = []
 
     def check_autonomous_spend(self, provider: str) -> Any:
         self.checks.append(provider)
@@ -469,7 +470,7 @@ class _FakeUsageMeter:
         output_tokens: int = 0,
         requests: int = 0,
     ) -> tuple[()]:
-        self.records.append((provider, mode, requests))
+        self.records.append((provider, mode, input_tokens, requests))
         return ()
 
 
@@ -522,4 +523,47 @@ async def test_budget_allowed_extraction_meters_one_autonomous_request(
 
     assert result.status is DistillJobStatus.EXTRACTION_DONE
     assert len(backend.calls) == 1
-    assert meter.records == [("codex", "autonomous", 1)]
+    # The reservation charges 2048 overhead + byte_count // 2 for the
+    # 21-byte snapshot, so the token budget is consumed even though the
+    # backend cannot report actual usage yet.
+    assert meter.records == [("codex", "autonomous", 2058, 1)]
+
+
+@pytest.mark.anyio
+async def test_repeated_autonomous_extraction_consumes_budget_and_blocks(
+    tmp_path: Path,
+) -> None:
+    journal = DistillJournal(tmp_path / "journal")
+    journal.initialize()
+    meter = UsageMeter(
+        tmp_path / "usage-meter.json",
+        budgets={"codex": 5000},
+        clock=lambda: 1784170800.0,  # fixed instant, one KST day
+    )
+    backend = SuccessfulBackend()
+    worker = CodexDistillExtractionWorker(
+        journal,
+        backend,
+        owner_token="extract-worker",
+        usage_meter=meter,
+    )
+    jobs = [
+        snapshot_done_job(journal, thread_id=f"thread-budget-{index}")
+        for index in range(6)
+    ]
+
+    results = [await worker.extract_once(job_id=job.job_id) for job in jobs]
+
+    # Each attempt reserves 2048 + byte_count // 2 = 2058 tokens, so the
+    # 5000-token codex budget admits exactly three background extractions on
+    # one day before autonomous spend is blocked; later jobs defer unclaimed.
+    assert len(backend.calls) == 3
+    assert [result.status for result in results[:3]] == (
+        [DistillJobStatus.EXTRACTION_DONE] * 3
+    )
+    assert all(
+        result.status is DistillJobStatus.SNAPSHOT_DONE for result in results[3:]
+    )
+    assert all(result.extraction_attempts == 0 for result in results[3:])
+    assert meter.used_tokens("codex") == 3 * 2058
+    assert meter.check_autonomous_spend("codex").allowed is False
