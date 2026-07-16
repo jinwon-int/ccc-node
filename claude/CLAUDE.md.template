@@ -68,7 +68,8 @@ Service-control boundary (enforced by `guard.py` behind the `guard.sh` shim):
   is autonomous (system services like sshd/ufw/nginx stay gated). Operator-owned.
 - **Detached local Compose reconciliation** — direct
   `docker compose up -d [services...]` (or `docker-compose`/`--detach`) — is
-  autonomous without an allowlist; other Compose lifecycle and indirect/remote
+  autonomous without an allowlist when it is the only top-level command and
+  uses the bare executable name; other Compose lifecycle and indirect/remote
   forms stay gated.
 - Still fresh-approval: non-fleet units on unmanaged hosts, local config-changing
   verbs, other docker/podman/kubectl lifecycle, host power-down, and — regardless
