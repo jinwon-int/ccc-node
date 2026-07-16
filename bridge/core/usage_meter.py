@@ -25,6 +25,7 @@ import logging
 import os
 from pathlib import Path
 import re
+import secrets
 import tempfile
 import threading
 import time
@@ -86,6 +87,10 @@ class UsageReservation:
     output_tokens: int
     requests: int
     decision: BudgetDecision
+    # Opaque ID of the persisted reservation record; empty for blocked
+    # reservations and for handles constructed outside the meter, both of
+    # which refund as no-ops.
+    reservation_id: str = ""
 
     @property
     def allowed(self) -> bool:
@@ -165,6 +170,10 @@ class UsageMeter:
         # on top, so a transient save failure neither loses our spend nor
         # clobbers spend other writers persisted meanwhile.
         self._pending_deltas: dict[str, dict[str, dict[str, dict[str, int]]]] = {}
+        # Durable open-reservation records (id -> day/provider/dimensions) and
+        # their unpersisted create/consume ops, replayed like counter deltas.
+        self._reservations: dict[str, dict] = {}
+        self._pending_reservation_ops: dict[str, dict | None] = {}
         self._budgets: dict[str, int] = {}
         for provider, budget in dict(budgets or {}).items():
             self._validate_provider(provider)
@@ -192,6 +201,27 @@ class UsageMeter:
             return
         self._load_days(raw.get("days"))
         self._load_alerted(raw.get("alerted"))
+        self._load_reservations(raw.get("reservations"))
+
+    def _load_reservations(self, reservations: object) -> None:
+        if not isinstance(reservations, Mapping):
+            return
+        for reservation_id, record in tuple(reservations.items())[:512]:
+            if not isinstance(reservation_id, str) or not reservation_id:
+                continue
+            if not isinstance(record, Mapping):
+                continue
+            day = record.get("day")
+            provider = record.get("provider")
+            if not self._is_day_key(day):
+                continue
+            if not isinstance(provider, str) or not _PROVIDER_RE.match(provider):
+                continue
+            self._reservations[reservation_id] = {
+                "day": day,
+                "provider": provider,
+                **{key: _clamped_count(record.get(key)) for key in _COUNTER_KEYS},
+            }
 
     def _load_days(self, days: object) -> None:
         if not isinstance(days, Mapping):
@@ -228,7 +258,12 @@ class UsageMeter:
 
     def _save(self) -> None:
         payload = json.dumps(
-            {"version": 1, "days": self._days, "alerted": self._alerted},
+            {
+                "version": 1,
+                "days": self._days,
+                "alerted": self._alerted,
+                "reservations": self._reservations,
+            },
             ensure_ascii=True,
             sort_keys=True,
         )
@@ -243,6 +278,7 @@ class UsageMeter:
                 os.chmod(tmp_name, 0o600)
                 os.replace(tmp_name, self._path)
                 self._pending_deltas.clear()
+                self._pending_reservation_ops.clear()
             except BaseException:
                 try:
                     os.unlink(tmp_name)
@@ -289,6 +325,7 @@ class UsageMeter:
             try:
                 self._days.clear()
                 self._alerted.clear()
+                self._reservations.clear()
                 self._load()
                 self._replay_pending_deltas()
                 yield
@@ -318,6 +355,11 @@ class UsageMeter:
                     bucket = self._bucket(day, provider, mode)
                     for key, value in changes.items():
                         bucket[key] = max(0, min(bucket[key] + value, _MAX_COUNT))
+        for reservation_id, record in self._pending_reservation_ops.items():
+            if record is None:
+                self._reservations.pop(reservation_id, None)
+            else:
+                self._reservations[reservation_id] = dict(record)
 
     @staticmethod
     def _is_day_key(value: object) -> bool:
@@ -446,11 +488,16 @@ class UsageMeter:
             if budget > 0 and used >= self._warn_threshold(budget):
                 state = "warn"
             decision = BudgetDecision(provider, day, state, True, used, budget)
+            reservation_id = secrets.token_hex(16)
+            record = {"day": day, "provider": provider, **added}
+            self._reservations[reservation_id] = record
+            self._reservations = dict(tuple(self._reservations.items())[-512:])
+            self._pending_reservation_ops[reservation_id] = dict(record)
         for alert in alerts:
             self._emit(alert)
         return UsageReservation(
             provider, day, added["input_tokens"], added["output_tokens"],
-            added["requests"], decision,
+            added["requests"], decision, reservation_id,
         )
 
     def refund_reservation(self, reservation: UsageReservation) -> None:
@@ -458,35 +505,38 @@ class UsageMeter:
 
         Only for the caller that just reserved and then lost the work (for
         example a distill claim race or an already-finished job): the
-        handle's exact dimensions are subtracted from the handle's own
-        accounting day, clamped at zero — a refund after midnight cannot
-        touch another day's spend. Blocked reservations charged nothing and
-        refund as a no-op. Alerts already fired are intentionally not
+        persisted record's authoritative dimensions are subtracted from its
+        own accounting day, clamped at zero, and the record is consumed
+        atomically exactly once: duplicate, forged, or caller-mutated handles
+        refund nothing, and a refund after midnight cannot touch another
+        day's spend. Blocked reservations charged nothing and refund as a
+        no-op. Alerts already fired are intentionally not
         retracted, and crashes between reserve and refund leave the charge
         in place — both err toward over-counting, never under-counting.
         """
 
-        if not reservation.allowed:
-            return
-        removed = {
-            "input_tokens": _clamped_count(reservation.input_tokens),
-            "output_tokens": _clamped_count(reservation.output_tokens),
-            "requests": _clamped_count(reservation.requests),
-        }
-        if not any(removed.values()):
+        if not reservation.allowed or not reservation.reservation_id:
             return
         with self._locked_state():
-            bucket = self._bucket(
-                reservation.day, reservation.provider, MODE_AUTONOMOUS
-            )
+            record = self._reservations.pop(reservation.reservation_id, None)
+            if record is None:
+                # Unknown, forged, or already-consumed handle: refunding it
+                # must never erase real spend.
+                logger.warning(
+                    "Ignoring unknown or already-consumed usage reservation refund"
+                )
+                return
+            self._pending_reservation_ops[reservation.reservation_id] = None
+            day = str(record["day"])
+            provider = str(record["provider"])
+            bucket = self._bucket(day, provider, MODE_AUTONOMOUS)
             applied = {
-                key: min(bucket[key], value) for key, value in removed.items()
+                key: min(bucket[key], _clamped_count(record.get(key)))
+                for key in _COUNTER_KEYS
             }
             for key, value in applied.items():
                 bucket[key] = bucket[key] - value
-            self._note_pending_delta(
-                reservation.day, reservation.provider, MODE_AUTONOMOUS, applied, -1
-            )
+            self._note_pending_delta(day, provider, MODE_AUTONOMOUS, applied, -1)
 
     def record_codex_thread_usage(
         self,

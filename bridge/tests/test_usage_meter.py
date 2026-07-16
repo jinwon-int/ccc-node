@@ -464,3 +464,61 @@ class TransientSaveRecoveryTests(UsageMeterTestCase):
         self.assertFalse(
             gated.reserve_autonomous_spend("codex", input_tokens=100).allowed
         )
+
+
+class ReservationConsumptionTests(UsageMeterTestCase):
+    def test_duplicate_refunds_consume_the_reservation_once(self) -> None:
+        # Reviewer probe: reserve 100/1, record an unrelated 50/1, refund the
+        # same handle twice — the bucket must end at 50/1, never 0/0.
+        meter = self.make_meter()
+        reservation = meter.reserve_autonomous_spend(
+            "codex", input_tokens=100, requests=1
+        )
+        meter.record("codex", MODE_AUTONOMOUS, input_tokens=50, requests=1)
+        meter.refund_reservation(reservation)
+        with self.assertLogs("telegram_bot.core.usage_meter", level="WARNING"):
+            meter.refund_reservation(reservation)
+
+        raw = json.loads(self.path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            raw["days"][FIXED_DAY]["codex"][MODE_AUTONOMOUS],
+            {"input_tokens": 50, "output_tokens": 0, "requests": 1},
+        )
+
+    def test_forged_handles_refund_nothing(self) -> None:
+        from telegram_bot.core.usage_meter import BudgetDecision, UsageReservation
+
+        meter = self.make_meter()
+        meter.record("codex", MODE_AUTONOMOUS, input_tokens=300, requests=1)
+        forged = UsageReservation(
+            "codex",
+            FIXED_DAY,
+            300,
+            0,
+            1,
+            BudgetDecision("codex", FIXED_DAY, "ok", True, 0, 0),
+            "f" * 32,
+        )
+        with self.assertLogs("telegram_bot.core.usage_meter", level="WARNING"):
+            meter.refund_reservation(forged)
+        defaulted = UsageReservation(
+            "codex",
+            FIXED_DAY,
+            300,
+            0,
+            1,
+            BudgetDecision("codex", FIXED_DAY, "ok", True, 0, 0),
+        )
+        meter.refund_reservation(defaulted)
+        self.assertEqual(meter.used_tokens("codex"), 300)
+
+    def test_refund_after_restart_consumes_the_persisted_reservation(self) -> None:
+        reservation = self.make_meter().reserve_autonomous_spend(
+            "codex", input_tokens=100, requests=1
+        )
+        restarted = self.make_meter()
+        restarted.refund_reservation(reservation)
+        self.assertEqual(restarted.used_tokens("codex"), 0)
+        with self.assertLogs("telegram_bot.core.usage_meter", level="WARNING"):
+            self.make_meter().refund_reservation(reservation)
+        self.assertEqual(self.make_meter().used_tokens("codex"), 0)
