@@ -176,6 +176,7 @@ class AppServerClient(Protocol):
 
 
 ClientFactory = Callable[[ServerRequestHandler], AppServerClient]
+UsageRecorder = Callable[[str, UsageSnapshot | None, UsageSnapshot], object]
 
 
 @dataclass(slots=True)
@@ -321,7 +322,18 @@ class CodexRuntime:
         self._thread_locks: dict[str, asyncio.Lock] = {}
         self._thread_usage: dict[str, UsageSnapshot] = {}
         self._account_rate_limits = UsageSnapshot(provider="codex")
+        self._usage_recorder: UsageRecorder | None = None
         self._closed = False
+
+    def set_usage_recorder(self, recorder: UsageRecorder) -> None:
+        """Observe per-thread cumulative usage snapshots (previous, current).
+
+        The recorder is fail-open: it is invoked from the notification
+        dispatcher and any exception it raises is swallowed after logging so
+        provider event routing can never be broken by metering.
+        """
+
+        self._usage_recorder = recorder
 
     async def _bootstrap_memory(self) -> None:
         if self._memory_bootstrap is None:
@@ -774,8 +786,7 @@ class CodexRuntime:
         if not isinstance(thread_id, str):
             return
         if notification.method == "thread/tokenUsage/updated":
-            self._thread_usage[thread_id] = parse_codex_thread_usage(params)
-            self._thread_usage = dict(tuple(self._thread_usage.items())[-128:])
+            self._record_thread_usage(thread_id, params)
             return
         active = self._active_turns.get(thread_id)
         if active is None or active.finished:
@@ -818,6 +829,18 @@ class CodexRuntime:
             return
         if event is not None:
             active.queue.put_nowait(event)
+
+    def _record_thread_usage(self, thread_id: str, params: Mapping[str, JsonValue]) -> None:
+        previous = self._thread_usage.get(thread_id)
+        snapshot = parse_codex_thread_usage(params)
+        self._thread_usage[thread_id] = snapshot
+        self._thread_usage = dict(tuple(self._thread_usage.items())[-128:])
+        if self._usage_recorder is None:
+            return
+        try:
+            self._usage_recorder(thread_id, previous, snapshot)
+        except Exception:
+            logger.exception("Codex usage recorder failed; dispatch continues")
 
     def _flush_pending_notifications(self, active: _ActiveTurn) -> None:
         pending = tuple(active.pending_notifications)

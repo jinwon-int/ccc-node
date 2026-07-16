@@ -54,6 +54,7 @@ from telegram_bot.core.usage import (
     parse_claude_rate_limit_event,
     parse_claude_result,
 )
+from telegram_bot.core.usage_meter import MODE_INTERACTIVE, UsageMeter
 from telegram_bot.core.curated_memory import build_curated_memory_settings
 from telegram_bot.core.session_scope import stream_key
 from telegram_bot.core.web_mcp import build_curated_web_mcp
@@ -230,7 +231,51 @@ class ProjectChatHandler(
         # (see `_record_claude_rate_limit`), which fire regardless of which
         # chat's stream happens to be open when the CLI emits them.
         self._claude_rate_limit: Optional[UsageSnapshot] = None
+        self._usage_meter: Optional[UsageMeter] = None
+        if getattr(self._config, "usage_meter_enabled", True):
+            try:
+                self._usage_meter = UsageMeter(
+                    self.project_root / ".telegram_bot" / "usage-meter.json",
+                    budgets={
+                        "claude": int(
+                            getattr(self._config, "usage_budget_tokens_claude", 0) or 0
+                        ),
+                        "codex": int(
+                            getattr(self._config, "usage_budget_tokens_codex", 0) or 0
+                        ),
+                    },
+                    warn_percent=int(
+                        getattr(self._config, "usage_budget_warn_percent", 80) or 80
+                    ),
+                )
+            except Exception:
+                logger.exception(
+                    "Usage meter unavailable; continuing without local metering"
+                )
+        if self._usage_meter is not None and self._agent_runtime is not None:
+            set_usage_recorder = getattr(
+                self._agent_runtime, "set_usage_recorder", None
+            )
+            if callable(set_usage_recorder):
+                set_usage_recorder(self._usage_meter.record_codex_thread_usage)
         logger.info(f"ProjectChatHandler initialized for {self.project_root}")
+
+    @property
+    def usage_meter(self) -> Optional[UsageMeter]:
+        """Node-local durable usage meter, when enabled (#388)."""
+
+        return self._usage_meter
+
+    def record_agent_turn_request(self) -> None:
+        """Count one completed interactive agent-runtime turn, fail-open."""
+
+        if self._usage_meter is None:
+            return
+        provider = getattr(self._config, "agent_provider", "claude")
+        try:
+            self._usage_meter.record(provider, MODE_INTERACTIVE, requests=1)
+        except Exception:
+            logger.exception("Interactive usage metering failed; turn continues")
 
     def _stream_key(self, user_id: int, chat_id: int) -> Tuple[int, int]:
         return stream_key(
@@ -273,8 +318,20 @@ class ProjectChatHandler(
         if not isinstance(session_id, str) or not session_id:
             return
         key = (req.user_id, req.chat_id, session_id)
-        self._claude_usage[key] = parse_claude_result(msg, observed_at=self._clock.time())
+        snapshot = parse_claude_result(msg, observed_at=self._clock.time())
+        self._claude_usage[key] = snapshot
         self._claude_usage = dict(tuple(self._claude_usage.items())[-128:])
+        if self._usage_meter is not None:
+            try:
+                self._usage_meter.record(
+                    "claude",
+                    MODE_INTERACTIVE,
+                    input_tokens=snapshot.input_tokens or 0,
+                    output_tokens=snapshot.output_tokens or 0,
+                    requests=1,
+                )
+            except Exception:
+                logger.exception("Claude usage metering failed; turn continues")
 
     def _record_claude_rate_limit(self, msg: RateLimitEvent) -> None:
         parsed = parse_claude_rate_limit_event(msg, observed_at=self._clock.time())

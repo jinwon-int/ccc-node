@@ -438,3 +438,88 @@ def test_extraction_diagnostics_exclude_bodies_tokens_and_thread_id(tmp_path: Pa
         "extraction_output_bytes",
         "error_code",
     }
+
+
+class _FakeUsageMeter:
+    """Structural AutonomousSpendGate double for the budget wiring (#388)."""
+
+    def __init__(self, *, allowed: bool) -> None:
+        self.allowed = allowed
+        self.checks: list[str] = []
+        self.records: list[tuple[str, str, int]] = []
+
+    def check_autonomous_spend(self, provider: str) -> Any:
+        self.checks.append(provider)
+
+        class _Decision:
+            allowed = self.allowed
+
+            @staticmethod
+            def reason() -> str:
+                return "codex used 1000 of 1000 budget tokens (blocked)"
+
+        return _Decision()
+
+    def record(
+        self,
+        provider: str,
+        mode: str,
+        *,
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+        requests: int = 0,
+    ) -> tuple[()]:
+        self.records.append((provider, mode, requests))
+        return ()
+
+
+@pytest.mark.anyio
+async def test_budget_blocked_extraction_defers_without_claiming_or_spending(
+    tmp_path: Path,
+) -> None:
+    journal = DistillJournal(tmp_path / "journal")
+    journal.initialize()
+    job = snapshot_done_job(journal)
+    backend = SuccessfulBackend()
+    meter = _FakeUsageMeter(allowed=False)
+
+    result = await CodexDistillExtractionWorker(
+        journal,
+        backend,
+        owner_token="extract-worker",
+        usage_meter=meter,
+    ).extract_once(job_id=job.job_id)
+
+    # The provider was never called, nothing was metered, and the job was not
+    # claimed: no extraction attempt is burned while the budget blocks, so the
+    # job replays untouched once the daily window resets.
+    assert backend.calls == []
+    assert meter.checks == ["codex"]
+    assert meter.records == []
+    assert result.status is DistillJobStatus.SNAPSHOT_DONE
+    assert result.extraction_attempts == 0
+    persisted = journal.get(job.job_id)
+    assert persisted.status is DistillJobStatus.SNAPSHOT_DONE
+    assert persisted.extraction_attempts == 0
+
+
+@pytest.mark.anyio
+async def test_budget_allowed_extraction_meters_one_autonomous_request(
+    tmp_path: Path,
+) -> None:
+    journal = DistillJournal(tmp_path / "journal")
+    journal.initialize()
+    job = snapshot_done_job(journal)
+    backend = SuccessfulBackend()
+    meter = _FakeUsageMeter(allowed=True)
+
+    result = await CodexDistillExtractionWorker(
+        journal,
+        backend,
+        owner_token="extract-worker",
+        usage_meter=meter,
+    ).extract_once(job_id=job.job_id)
+
+    assert result.status is DistillJobStatus.EXTRACTION_DONE
+    assert len(backend.calls) == 1
+    assert meter.records == [("codex", "autonomous", 1)]

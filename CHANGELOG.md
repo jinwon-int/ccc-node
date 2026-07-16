@@ -58,6 +58,23 @@ All notable changes to the Claude Code node harness. Dates are KST.
   Mixed non-fleet targets and config-changing verbs still fail closed. Refs #534.
 
 ### Added
+- Node-local model-usage metering with daily budget caps (#388). The new
+  `bridge/core/usage_meter.py` durably records body-free token/request
+  counters per KST day × provider × interactive/autonomous mode in
+  `.telegram_bot/usage-meter.json` (atomic owner-only writes, bounded
+  retention, fail-open persistence). Spend sites wired: Claude interactive
+  turns meter at the reader's `ResultMessage`, Codex interactive turns meter
+  via a runtime usage recorder fed by cumulative `thread/tokenUsage/updated`
+  deltas (baseline-first so resumed-thread history is never counted) plus a
+  per-turn request count, and the distill extraction worker meters autonomous
+  attempts. Optional per-provider daily token budgets
+  (`CCC_USAGE_BUDGET_TOKENS_CLAUDE`/`_CODEX`, 0 = off) raise one warn (early
+  alarm at `CCC_USAGE_BUDGET_WARN_PERCENT`, default 80%) and one enforce
+  alert per provider-day; at the enforce threshold the distill worker defers
+  autonomous extraction without claiming the job or burning an attempt while
+  interactive user turns keep flowing by design. `/usage` now appends a
+  compact 7-day local meter report with budget state. Metering never blocks
+  or fails a turn (`CCC_USAGE_METER_ENABLED=false` disables it entirely).
 - Provider conformance contract + capability matrix (#387). The new
   `bridge/core/provider_capabilities.py` is the single source of per-provider
   capability states (`supported`/`degraded`/`unsupported`/`unknown`, each with

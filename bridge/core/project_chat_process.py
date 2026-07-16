@@ -646,12 +646,16 @@ class ProjectChatProcessMixin:
                                 )
                             elif isinstance(event, ErrorEvent):
                                 terminal_error = event
+                            elif isinstance(event, ResultEvent):
+                                # One completed provider turn. Token deltas
+                                # arrive via the runtime usage recorder; this
+                                # counts the request axis (#388).
+                                self.record_agent_turn_request()
                             elif isinstance(
                                 event,
                                 (
                                     ReasoningDeltaEvent,
                                     ApprovalRequestEvent,
-                                    ResultEvent,
                                     CompletionEvent,
                                 ),
                             ):

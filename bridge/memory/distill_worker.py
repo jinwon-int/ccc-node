@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
 import secrets
+from typing import Protocol
 
 from .distill_extraction import (
     DistillBackend,
@@ -13,6 +15,35 @@ from .distill_extraction import (
 )
 from .distill_journal import DistillJournal
 from .distill_types import DistillJob
+
+logger = logging.getLogger(__name__)
+
+
+class _BudgetDecisionLike(Protocol):
+    @property
+    def allowed(self) -> bool: ...
+
+    def reason(self) -> str: ...
+
+
+class AutonomousSpendGate(Protocol):
+    """Structural view of core.usage_meter.UsageMeter used by this worker.
+
+    Declared here as a Protocol so the memory package does not import the
+    core package (keeping the bridge internal import graph acyclic).
+    """
+
+    def check_autonomous_spend(self, provider: str) -> _BudgetDecisionLike: ...
+
+    def record(
+        self,
+        provider: str,
+        mode: str,
+        *,
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+        requests: int = 0,
+    ) -> object: ...
 
 _SAFE_ERROR_CODE_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _RETRYABLE_BACKEND_CODES = frozenset(
@@ -60,6 +91,7 @@ class CodexDistillExtractionWorker:
         lease_seconds: int = 300,
         max_attempts: int = 5,
         wiki_enabled: bool = True,
+        usage_meter: AutonomousSpendGate | None = None,
     ) -> None:
         if lease_seconds <= 0 or max_attempts <= 0 or type(wiki_enabled) is not bool:
             raise ValueError("invalid distill extraction worker configuration")
@@ -69,6 +101,7 @@ class CodexDistillExtractionWorker:
         self._lease_seconds = lease_seconds
         self._max_attempts = max_attempts
         self._wiki_enabled = wiki_enabled
+        self._usage_meter = usage_meter
 
     async def _fail(
         self,
@@ -91,6 +124,17 @@ class CodexDistillExtractionWorker:
         )
 
     async def extract_once(self, *, job_id: str) -> DistillJob:
+        if self._usage_meter is not None:
+            decision = self._usage_meter.check_autonomous_spend("codex")
+            if not decision.allowed:
+                # Budget-blocked autonomous spend (#388): leave the job
+                # unclaimed so no attempt is burned; it replays untouched
+                # once the daily budget window resets or the cap is raised.
+                logger.warning(
+                    "Distill extraction deferred by usage budget: %s",
+                    decision.reason(),
+                )
+                return await asyncio.to_thread(self._journal.get, job_id)
         claimed = await asyncio.to_thread(
             self._journal.claim_extraction,
             job_id,
@@ -115,6 +159,11 @@ class CodexDistillExtractionWorker:
                 error_code="distill_input_invalid",
                 terminal=True,
             )
+        if self._usage_meter is not None:
+            try:
+                self._usage_meter.record("codex", "autonomous", requests=1)
+            except Exception:
+                logger.exception("Autonomous usage metering failed; extraction continues")
         try:
             output = await self._backend.extract(extraction_input)
         except asyncio.CancelledError:

@@ -161,6 +161,42 @@ class Config(BaseSettings):
         alias="CCC_CODEX_MEMORY_BOOTSTRAP_TIMEOUT_SEC",
         description="Timeout for each Codex memory materialize/status command.",
     )
+    usage_meter_enabled: bool = Field(
+        default=True,
+        alias="CCC_USAGE_METER_ENABLED",
+        description=(
+            "Durable node-local usage metering (#388): body-free token/request "
+            "counters per KST day x provider x interactive/autonomous mode in "
+            ".telegram_bot/usage-meter.json. Metering never blocks turns."
+        ),
+    )
+    usage_budget_tokens_claude: int = Field(
+        default=0,
+        ge=0,
+        alias="CCC_USAGE_BUDGET_TOKENS_CLAUDE",
+        description=(
+            "Daily Claude token budget (input+output) for the usage meter. "
+            "0 disables the budget. Crossing warn/enforce thresholds raises "
+            "one alert each per day; enforce blocks autonomous spend only."
+        ),
+    )
+    usage_budget_tokens_codex: int = Field(
+        default=0,
+        ge=0,
+        alias="CCC_USAGE_BUDGET_TOKENS_CODEX",
+        description=(
+            "Daily Codex token budget (input+output) for the usage meter. "
+            "0 disables the budget. Crossing warn/enforce thresholds raises "
+            "one alert each per day; enforce blocks autonomous spend only."
+        ),
+    )
+    usage_budget_warn_percent: int = Field(
+        default=80,
+        ge=1,
+        le=99,
+        alias="CCC_USAGE_BUDGET_WARN_PERCENT",
+        description="Early-alarm percentage of a daily token budget.",
+    )
     claude_cli_path: Optional[Path] = Field(
         default=None,
         description="Optional absolute path to Claude CLI binary (defaults to system PATH)",
