@@ -855,3 +855,60 @@ class ClaudeTerminalLossTokenTests(unittest.IsolatedAsyncioTestCase):
             day_buckets["claude"]["interactive"],
             {"input_tokens": 120, "output_tokens": 25, "requests": 1},
         )
+
+
+class ClaudePerStepUsageTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+
+    @staticmethod
+    def _frame(message_id: str, input_tokens: int, output_tokens: int):
+        return SimpleNamespace(
+            id=message_id,
+            usage={"input_tokens": input_tokens, "output_tokens": output_tokens},
+            model_usage={},
+            total_cost_usd=None,
+        )
+
+    async def test_distinct_steps_accumulate_and_repeats_dedupe(self) -> None:
+        # Reviewer probe: two distinct per-step frames (100/20, 50/10) with a
+        # lost terminal must persist 150/30; a repeated frame for one id
+        # must not add again.
+        handler = ProjectChatHandler(settings=_settings(self.root))
+        request = SimpleNamespace(user_id=7, chat_id=9)
+        handler.record_claude_attempt(request)
+        handler.record_claude_observed_usage(request, self._frame("m1", 100, 20))
+        handler.record_claude_observed_usage(request, self._frame("m2", 50, 10))
+        handler.record_claude_observed_usage(request, self._frame("m2", 50, 10))
+
+        day_buckets = next(iter(_meter_state(self.root)["days"].values()))
+        self.assertEqual(
+            day_buckets["claude"]["interactive"],
+            {"input_tokens": 150, "output_tokens": 30, "requests": 1},
+        )
+
+    async def test_terminal_reconciles_against_whole_tree_totals(self) -> None:
+        # Reviewer probe: a 100/20 top-level result with 200/50 of subagent
+        # activity in model_usage must persist the whole-tree 300/70.
+        handler = ProjectChatHandler(settings=_settings(self.root))
+        request = SimpleNamespace(user_id=7, chat_id=9)
+        handler.record_claude_attempt(request)
+        handler.record_claude_observed_usage(request, self._frame("m1", 100, 20))
+        result = SimpleNamespace(
+            session_id="session-1",
+            usage={"input_tokens": 100, "output_tokens": 20},
+            model_usage={
+                "claude-main": {"inputTokens": 100, "outputTokens": 20},
+                "claude-subagent": {"inputTokens": 200, "outputTokens": 50},
+            },
+            total_cost_usd=None,
+        )
+        handler._record_claude_usage(request, result)
+
+        day_buckets = next(iter(_meter_state(self.root)["days"].values()))
+        self.assertEqual(
+            day_buckets["claude"]["interactive"],
+            {"input_tokens": 300, "output_tokens": 70, "requests": 1},
+        )

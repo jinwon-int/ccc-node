@@ -353,48 +353,106 @@ class ProjectChatHandler(
         except Exception:
             logger.exception("Claude request metering failed; turn continues")
 
-    def record_claude_observed_usage(self, req: Any, message: Any) -> None:
-        """Idempotently meter validated observed usage for one request.
+    @staticmethod
+    def _claude_message_id(message: Any) -> Optional[str]:
+        for candidate in (
+            getattr(message, "id", None),
+            getattr(getattr(message, "message", None), "id", None),
+        ):
+            if isinstance(candidate, str) and candidate:
+                return candidate
+        inner = getattr(message, "message", None)
+        if isinstance(inner, Mapping):
+            value = inner.get("id")
+            if isinstance(value, str) and value:
+                return value
+        return None
 
-        Any SDK frame that carries usage (an AssistantMessage mid-turn or the
-        terminal ResultMessage) is treated as a cumulative observation: only
-        the positive delta beyond this request's high-water marker is
-        recorded, so a reader crash after an AssistantMessage keeps the
-        observed tokens while a later ResultMessage reconciles the remainder
-        without double charging. context_used is the complete validated
-        input total (raw plus cache-creation/read tokens).
-        """
-
-        if self._usage_meter is None:
-            return
+    def _claude_usage_totals(self, message: Any) -> Tuple[int, int]:
         snapshot = parse_claude_result(message, observed_at=self._clock.time())
         input_total = snapshot.context_used
         if input_total is None:
             input_total = snapshot.input_tokens or 0
-        output_total = snapshot.output_tokens or 0
-        previous_input, previous_output = getattr(
-            req, "usage_tokens_recorded", (0, 0)
-        )
-        delta_input = max(0, input_total - previous_input)
-        delta_output = max(0, output_total - previous_output)
-        if not delta_input and not delta_output:
-            return
-        try:
-            req.usage_tokens_recorded = (
-                max(previous_input, input_total),
-                max(previous_output, output_total),
-            )
-        except Exception:
-            return
+        return input_total, snapshot.output_tokens or 0
+
+    def _meter_claude_tokens(self, delta: Tuple[int, int]) -> None:
         try:
             self._usage_meter.record(
                 "claude",
                 MODE_INTERACTIVE,
-                input_tokens=delta_input,
-                output_tokens=delta_output,
+                input_tokens=delta[0],
+                output_tokens=delta[1],
             )
         except Exception:
             logger.exception("Claude usage metering failed; turn continues")
+
+    def record_claude_observed_usage(
+        self, req: Any, message: Any, *, terminal: bool = False
+    ) -> None:
+        """Idempotently meter validated observed usage for one request.
+
+        AssistantMessage usage is per step: distinct message ids accumulate
+        and repeated frames sharing one id dedupe via a per-id high-water
+        mark, so a reader crash after any step keeps every observed step.
+        The terminal result reconciles against the whole-tree totals — the
+        larger of ResultMessage.usage and the model_usage sums (which include
+        subagent activity) — recording only the positive remainder beyond
+        what the steps already metered, so nothing double charges.
+        """
+
+        if self._usage_meter is None:
+            return
+        recorded = getattr(req, "usage_tokens_recorded", (0, 0))
+        if terminal:
+            observed = self._claude_usage_totals(message)
+            from types import SimpleNamespace as _NS
+
+            tree = self._claude_usage_totals(
+                _NS(
+                    usage={},
+                    model_usage=getattr(message, "model_usage", {}) or {},
+                    total_cost_usd=None,
+                )
+            )
+            observed = (max(observed[0], tree[0]), max(observed[1], tree[1]))
+        else:
+            step = self._claude_usage_totals(message)
+            if not any(step):
+                return
+            steps = getattr(req, "usage_step_totals", None)
+            if steps is None:
+                steps = {}
+                try:
+                    req.usage_step_totals = steps
+                except Exception:
+                    return
+            message_id = self._claude_message_id(message)
+            previous_step = steps.get(message_id, (0, 0))
+            merged = (
+                max(previous_step[0], step[0]),
+                max(previous_step[1], step[1]),
+            )
+            if merged == previous_step:
+                return
+            steps[message_id] = merged
+            observed = (
+                sum(value[0] for value in steps.values()),
+                sum(value[1] for value in steps.values()),
+            )
+        delta = (
+            max(0, observed[0] - recorded[0]),
+            max(0, observed[1] - recorded[1]),
+        )
+        if not any(delta):
+            return
+        try:
+            req.usage_tokens_recorded = (
+                max(recorded[0], observed[0]),
+                max(recorded[1], observed[1]),
+            )
+        except Exception:
+            return
+        self._meter_claude_tokens(delta)
 
     def record_agent_turn_request(self) -> None:
         """Count one completed interactive agent-runtime turn, fail-open."""
@@ -451,7 +509,7 @@ class ProjectChatHandler(
         snapshot = parse_claude_result(msg, observed_at=self._clock.time())
         self._claude_usage[key] = snapshot
         self._claude_usage = dict(tuple(self._claude_usage.items())[-128:])
-        self.record_claude_observed_usage(req, msg)
+        self.record_claude_observed_usage(req, msg, terminal=True)
 
     def _record_claude_rate_limit(self, msg: RateLimitEvent) -> None:
         parsed = parse_claude_rate_limit_event(msg, observed_at=self._clock.time())
