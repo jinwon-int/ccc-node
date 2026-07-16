@@ -51,6 +51,22 @@ All notable changes to the Claude Code node harness. Dates are KST.
   Mixed non-fleet targets and config-changing verbs still fail closed. Refs #534.
 
 ### Added
+- Provider conformance contract + capability matrix (#387). The new
+  `bridge/core/provider_capabilities.py` is the single source of per-provider
+  capability states (`supported`/`degraded`/`unsupported`/`unknown`, each with
+  a machine-readable reason and issue dependencies) across 13 runtime axes and
+  the 8 memory-parity axes; `docs/provider-capability-matrix.md` is rendered
+  from it and golden-pinned. A shared `AgentRuntime` behavior suite
+  (`bridge/tests/runtime_conformance.py`) now executes the contract — session
+  lifecycle, streaming delivery with result-before-completion terminal
+  ordering, tool-event pairing, fail-closed approvals, interrupt/liveness,
+  error normalization, and per-session turn serialization — against the real
+  `CodexRuntime` over a scripted fake app-server plus a normative reference
+  runtime, with negative tests proving each contract violation fails the
+  suite. Drift checkers pin the matrix to the session layer's provider set,
+  the runtime/usage/memory-hook surfaces, and the executable coverage, so new
+  provider adapters (#354 successors) must pass the suite and update the
+  matrix to land.
 - A durable provider-neutral Codex distill extraction worker now advances completed
   snapshot jobs through fenced extraction leases, atomically retains one strict result,
   classifies body-free retryable/terminal failures, and recovers cancellation or stale

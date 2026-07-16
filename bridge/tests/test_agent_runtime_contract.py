@@ -78,8 +78,11 @@ class FakeSession:
             yield ReasoningDeltaEvent(text="checking approval")
             yield request
             if decision is ApprovalDecision.ALLOW:
-                yield CompletionEvent(stop_reason="end_turn")
+                # Normative terminal ordering (see tests/runtime_conformance.py):
+                # the ResultEvent precedes the terminal CompletionEvent, which
+                # is always the final event of a turn stream.
                 yield ResultEvent(result={"status": "written"})
+                yield CompletionEvent(stop_reason="end_turn")
             else:
                 yield ErrorEvent(code="approval_denied", message="Approval denied")
 
@@ -119,7 +122,7 @@ class AgentRuntimeContractTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(
             [event.kind for event in events],
-            ["text_delta", "reasoning_delta", "approval_request", "completion", "result"],
+            ["text_delta", "reasoning_delta", "approval_request", "result", "completion"],
         )
         await session.interrupt()
         self.assertTrue(cast(FakeSession, session).interrupted)
