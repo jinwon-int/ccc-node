@@ -41,6 +41,7 @@ files = [
   "bridge/tests/test_agent_runtime_contract.py",
   "bridge/tests/test_codex_app_server.py",
   "bridge/tests/test_codex_runtime.py",
+  "bridge/tests/test_claude_unrestricted.py",
   "bridge/tests/test_provider_capabilities.py",
   "bridge/tests/test_runtime_conformance.py",
   "bridge/tests/test_usage_meter.py",

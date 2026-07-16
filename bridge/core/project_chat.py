@@ -68,6 +68,7 @@ from telegram_bot.core.tool_policy import (  # noqa: E402
     BASH_DISABLED,
     EXECUTION_OWNER_OPERATOR,
     EXECUTION_STRICT_PROJECT,
+    claude_unrestricted_enabled,
     effective_bash_policy,
     missing_callback_requires_denial,
     resolve_bash_policy,
@@ -82,6 +83,7 @@ PROCESS_TIMEOUT = int(os.getenv("CLAUDE_PROCESS_TIMEOUT", "21600"))
 # injects Settings and therefore never reads these module values.
 EXECUTION_PROFILE = EXECUTION_STRICT_PROJECT
 BASH_POLICY = "auto-approve"
+CLAUDE_UNRESTRICTED = False
 
 
 # Pure SDK-stream / text helpers live in core/sdk_text.py (error classification,
@@ -189,6 +191,14 @@ class ProjectChatHandler(
         self._bash_policy = effective_bash_policy(
             resolve_bash_policy(policy),
             self._execution_profile,
+        )
+        unrestricted_flag = (
+            CLAUDE_UNRESTRICTED
+            if compatibility_mode
+            else getattr(self._config, "claude_unrestricted", False)
+        )
+        self._claude_unrestricted = claude_unrestricted_enabled(
+            unrestricted_flag, self._execution_profile
         )
         self._sdk_client_factory = sdk_client_factory or ClaudeSDKClient
         provider = getattr(self._config, "agent_provider", "claude")
@@ -753,10 +763,24 @@ class ProjectChatHandler(
             opts["env"] = {**opts.get("env", {}), **web_mcp["process_env"]}
             opts["system_prompt"] += web_mcp["system_prompt"]
         if self._execution_profile == EXECUTION_OWNER_OPERATOR:
-            # Owner-operated bridges intentionally retain host utility and the
-            # normal Claude Code settings/context chain. Access control, not a
-            # project-root sandbox, is the boundary for this explicit profile.
-            opts["setting_sources"] = ["user", "project", "local"]
+            if self._claude_unrestricted:
+                # Opt-in Codex parity (owner-operator only): drop the host
+                # settings chain so the PreToolUse guard hook is not loaded,
+                # bypass permission checks, and run without the OS sandbox —
+                # matching Codex's never + dangerFullAccess. Memory context is
+                # preserved through the curated settings block so the model
+                # keeps its MEMORY/USER context without the guard.
+                opts["permission_mode"] = "bypassPermissions"
+                opts["setting_sources"] = []
+                curated_settings = build_curated_memory_settings(self._config)
+                if curated_settings is not None:
+                    opts["settings"] = curated_settings
+            else:
+                # Owner-operated bridges intentionally retain host utility and
+                # the normal Claude Code settings/context chain. Access
+                # control (the PreToolUse guard), not a project-root sandbox,
+                # is the boundary for this explicit profile.
+                opts["setting_sources"] = ["user", "project", "local"]
         else:
             # Every non-owner profile suppresses filesystem settings. Even when
             # Bash is disallowed, user/project/local settings can register host
