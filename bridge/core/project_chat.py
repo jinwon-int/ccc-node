@@ -355,17 +355,23 @@ class ProjectChatHandler(
 
     @staticmethod
     def _claude_message_id(message: Any) -> Optional[str]:
+        # claude-agent-sdk AssistantMessage carries step identity in
+        # message_id (with uuid as a per-frame fallback); older/raw shapes
+        # expose id directly or nest it under message.
         for candidate in (
+            getattr(message, "message_id", None),
             getattr(message, "id", None),
+            getattr(message, "uuid", None),
             getattr(getattr(message, "message", None), "id", None),
         ):
             if isinstance(candidate, str) and candidate:
                 return candidate
         inner = getattr(message, "message", None)
         if isinstance(inner, Mapping):
-            value = inner.get("id")
-            if isinstance(value, str) and value:
-                return value
+            for key in ("message_id", "id", "uuid"):
+                value = inner.get(key)
+                if isinstance(value, str) and value:
+                    return value
         return None
 
     def _claude_usage_totals(self, message: Any) -> Tuple[int, int]:

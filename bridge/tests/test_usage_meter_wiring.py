@@ -912,3 +912,47 @@ class ClaudePerStepUsageTests(unittest.IsolatedAsyncioTestCase):
             day_buckets["claude"]["interactive"],
             {"input_tokens": 300, "output_tokens": 70, "requests": 1},
         )
+
+
+class ClaudeSdkShapedStepIdentityTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+
+    @staticmethod
+    def _sdk_frame(message_id: str, uuid: str, input_tokens: int, output_tokens: int):
+        # Production claude-agent-sdk AssistantMessage shape: step identity in
+        # message_id (uuid per frame), no bare `id` attribute.
+        return SimpleNamespace(
+            message_id=message_id,
+            uuid=uuid,
+            usage={"input_tokens": input_tokens, "output_tokens": output_tokens},
+            model_usage={},
+            total_cost_usd=None,
+        )
+
+    async def test_sdk_shaped_distinct_steps_accumulate_after_terminal_loss(
+        self,
+    ) -> None:
+        # Reviewer probe: two real-SDK-shaped steps with distinct message_id
+        # values (100/20 then 50/10) and a lost terminal must persist 150/30,
+        # and a redelivered frame for one message_id must not add again.
+        handler = ProjectChatHandler(settings=_settings(self.root))
+        request = SimpleNamespace(user_id=7, chat_id=9)
+        handler.record_claude_attempt(request)
+        handler.record_claude_observed_usage(
+            request, self._sdk_frame("msg-a", "uuid-1", 100, 20)
+        )
+        handler.record_claude_observed_usage(
+            request, self._sdk_frame("msg-b", "uuid-2", 50, 10)
+        )
+        handler.record_claude_observed_usage(
+            request, self._sdk_frame("msg-b", "uuid-3", 50, 10)
+        )
+
+        day_buckets = next(iter(_meter_state(self.root)["days"].values()))
+        self.assertEqual(
+            day_buckets["claude"]["interactive"],
+            {"input_tokens": 150, "output_tokens": 30, "requests": 1},
+        )
