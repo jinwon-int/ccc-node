@@ -112,7 +112,9 @@ STRICT='CRITICAL: Output exactly one JSON object and nothing else. If no candida
 
 call_claude() {
   local sys="$1" input="$2"
-  printf '%s' "$input" | timeout "$TIMEOUT" claude -p \
+  # CLAUDE_SKILL_REVIEW_BG belongs only to the detached runner. Passing it to
+  # the provider child makes that child's SessionEnd hook start another runner.
+  printf '%s' "$input" | env -u CLAUDE_SKILL_REVIEW_BG timeout "$TIMEOUT" claude -p \
     --model "$MODEL" \
     --no-session-persistence \
     --output-format text \

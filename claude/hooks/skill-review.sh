@@ -24,6 +24,13 @@ TRIGGER="${1:-manual}"
 ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 log() { printf '%s %s\n' "$(ts)" "$*" >> "$LOG" 2>/dev/null; }
 
+# The emergency off-switch must win even when a SessionEnd hook inherits the
+# detached runner marker from its parent `claude -p` process.
+if [ -f "$STATE_DIR/skill-review.disabled" ]; then
+  log "skip reason=disabled trigger=$TRIGGER pid=$$"
+  exit 0
+fi
+
 run_skill_review_bg() {
   cd "${HOME:-/root}" 2>/dev/null || cd / 2>/dev/null || true
   export CLAUDE_SKILL_REVIEW_INFLIGHT=1
@@ -132,11 +139,6 @@ fi
 
 # Distill subprocesses and nested skill-review subprocesses should not recurse.
 if [ -n "${CLAUDE_DISTILL_INFLIGHT:-}" ] || [ -n "${CLAUDE_SKILL_REVIEW_INFLIGHT:-}" ]; then
-  exit 0
-fi
-
-if [ -f "$STATE_DIR/skill-review.disabled" ]; then
-  log "skip reason=disabled trigger=$TRIGGER pid=$$"
   exit 0
 fi
 
