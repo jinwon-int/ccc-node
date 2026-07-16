@@ -3,18 +3,63 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
 import secrets
+from typing import Protocol
 
 from .distill_extraction import (
     DistillBackend,
     DistillExtractionOutput,
     build_extraction_input,
 )
+from .codex_exec_backend import MAX_EXTRACTION_JSON_BYTES
 from .distill_journal import DistillJournal
 from .distill_types import DistillJob
 
+logger = logging.getLogger(__name__)
+
+
+class _ReservationLike(Protocol):
+    @property
+    def allowed(self) -> bool: ...
+
+    def reason(self) -> str: ...
+
+
+class AutonomousSpendGate(Protocol):
+    """Structural view of core.usage_meter.UsageMeter used by this worker.
+
+    Declared here as a Protocol so the memory package does not import the
+    core package (keeping the bridge internal import graph acyclic).
+    """
+
+    def reserve_autonomous_spend(
+        self,
+        provider: str,
+        *,
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+        requests: int = 0,
+    ) -> _ReservationLike: ...
+
+    def refund_reservation(self, reservation: object) -> None: ...
+
 _SAFE_ERROR_CODE_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+
+# Worst-case autonomous pre-spend reservation (#388). The codex exec backend
+# discards provider stdout, so per-attempt token usage is not observable here
+# until #465's cost-metering criterion lands. Every extraction attempt charges
+# a post-serialization bound over the COMPLETE request instead: canonical
+# JSON escaping expands one raw snapshot byte to at most six serialized bytes
+# (backslash-u escapes), BPE tokenizers emit at most ~1 token per serialized
+# byte, the flat overhead covers the extraction prompt and schema, and the
+# output allowance equals the backend's hard output-size cap (output tokens
+# cannot exceed its JSON bytes). Budgets must fit one maximal attempt or that
+# work stays deferred by design.
+_RESERVED_OVERHEAD_TOKENS = 8192
+_RESERVED_TOKENS_PER_BYTE = 6
+_RESERVED_OUTPUT_TOKENS = MAX_EXTRACTION_JSON_BYTES
 _RETRYABLE_BACKEND_CODES = frozenset(
     {
         "codex_distill_spawn_failed",
@@ -56,6 +101,7 @@ class CodexDistillExtractionWorker:
         journal: DistillJournal,
         backend: DistillBackend,
         *,
+        usage_meter: AutonomousSpendGate | None,
         owner_token: str | None = None,
         lease_seconds: int = 300,
         max_attempts: int = 5,
@@ -69,6 +115,7 @@ class CodexDistillExtractionWorker:
         self._lease_seconds = lease_seconds
         self._max_attempts = max_attempts
         self._wiki_enabled = wiki_enabled
+        self._usage_meter = usage_meter
 
     async def _fail(
         self,
@@ -91,6 +138,38 @@ class CodexDistillExtractionWorker:
         )
 
     async def extract_once(self, *, job_id: str) -> DistillJob:
+        reservation: _ReservationLike | None = None
+        if self._usage_meter is not None:
+            # Prospective atomic admit-and-charge (#388): the FULL bounded
+            # attempt cost — flat overhead plus the persisted snapshot's
+            # size charge — is reserved in one meter step before the provider
+            # can run, and admission requires the whole reservation to fit
+            # under the daily cap. Recorded autonomous spend therefore never
+            # crosses the cap; an attempt whose bounded cost alone exceeds
+            # the cap stays deferred until the operator raises the budget.
+            # A blocked decision leaves the job unclaimed, so no attempt is
+            # burned and it replays once the daily window resets.
+            preview = await asyncio.to_thread(self._journal.get, job_id)
+            preview_snapshot = getattr(preview, "snapshot", None)
+            snapshot_bytes = (
+                preview_snapshot.byte_count if preview_snapshot is not None else 0
+            )
+            reserved_tokens = (
+                _RESERVED_OVERHEAD_TOKENS
+                + _RESERVED_OUTPUT_TOKENS
+                + max(0, snapshot_bytes) * _RESERVED_TOKENS_PER_BYTE
+            )
+            reservation = self._usage_meter.reserve_autonomous_spend(
+                "codex",
+                input_tokens=reserved_tokens,
+                requests=1,
+            )
+            if not reservation.allowed:
+                logger.warning(
+                    "Distill extraction deferred by usage budget: %s",
+                    reservation.reason(),
+                )
+                return preview
         claimed = await asyncio.to_thread(
             self._journal.claim_extraction,
             job_id,
@@ -99,6 +178,16 @@ class CodexDistillExtractionWorker:
             max_attempts=self._max_attempts,
         )
         if claimed is None:
+            if self._usage_meter is not None and reservation is not None:
+                # The reserved attempt never started (already done, leased
+                # elsewhere, or exhausted): return the exact reservation —
+                # the handle pins its accounting day and dimensions — so
+                # no-op invocations cannot drain the budget. A crash before
+                # this refund leaves the charge in place — conservative.
+                try:
+                    self._usage_meter.refund_reservation(reservation)
+                except Exception:
+                    logger.exception("Usage reservation refund failed; keeping charge")
             return await asyncio.to_thread(self._journal.get, job_id)
         snapshot = claimed.snapshot
         if snapshot is None or snapshot.thread_hash != claimed.thread_hash:

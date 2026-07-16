@@ -108,6 +108,7 @@ class TelegramBot(
         session_manager: Any,
         project_chat: Any,
         distill_journal: Any = None,
+        distill_extraction_worker: Any = None,
         application_builder_factory: Any = None,
         clock: Any = None,
     ):
@@ -115,6 +116,10 @@ class TelegramBot(
         self._session_manager = session_manager
         self._project_chat = project_chat
         self._distill_journal = distill_journal
+        # Budget-gated distill extraction worker composed by build_context;
+        # retained by the running application so #465's scheduling phase
+        # drives this exact gated instance (#388).
+        self._distill_extraction_worker = distill_extraction_worker
         self._application_builder_factory = (
             application_builder_factory or Application.builder
         )

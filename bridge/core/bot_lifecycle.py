@@ -479,6 +479,7 @@ class BotLifecycleMixin:
             reaper_task = None
             workload_task = None
             dead_session_recovery_task = None
+            distill_extraction_task = None
             health_alerts_task = None
             try:
                 await self.application.start()
@@ -518,6 +519,15 @@ class BotLifecycleMixin:
                 health_alerts_task = asyncio.create_task(
                     self._health_alerts_probe(stop_event), name="health-alerts"
                 )
+                distill_extraction_task = None
+                if (
+                    self._distill_extraction_worker is not None
+                    and self._distill_journal is not None
+                ):
+                    distill_extraction_task = asyncio.create_task(
+                        self._distill_extraction_loop(stop_event),
+                        name="distill-extraction",
+                    )
 
                 await self._supervise_polling(stop_event)
 
@@ -602,6 +612,7 @@ class BotLifecycleMixin:
                     workload_task,
                     dead_session_recovery_task,
                     health_alerts_task,
+                    distill_extraction_task,
                 ):
                     if _task and not _task.done():
                         _task.cancel()
@@ -840,6 +851,50 @@ class BotLifecycleMixin:
             stop_event,
             on_stats=self._record_recovery_stats,
         )
+
+    async def _distill_extraction_loop(self, stop_event: asyncio.Event) -> None:
+        """Drive the budget-gated distill worker over ready snapshot jobs.
+
+        This is the production scheduler for the retained worker (#388): each
+        sweep runs every ready (snapshot_done) job through extract_once, whose
+        prospective reservation gate defers capped work before any provider
+        call. Trigger policy that *creates* jobs remains #465's phase, so on
+        nodes without queued jobs each sweep is a no-op. Fail-open: sweep
+        errors are logged and never end the loop or the bridge.
+        """
+
+        from telegram_bot.memory.distill_types import DistillJobStatus
+
+        worker = self._distill_extraction_worker
+        journal = self._distill_journal
+        interval = float(
+            getattr(self._config, "distill_extraction_poll_interval", 300.0) or 300.0
+        )
+        while not stop_event.is_set():
+            try:
+                jobs = await asyncio.to_thread(journal.list_jobs)
+                for job in jobs:
+                    if stop_event.is_set():
+                        break
+                    # Ready set: fresh snapshots AND transiently failed
+                    # extractions — claim_extraction accepts both, and the
+                    # worker's max-attempts gate bounds the retries.
+                    if job.status not in (
+                        DistillJobStatus.SNAPSHOT_DONE,
+                        DistillJobStatus.EXTRACTION_RETRYABLE_FAILED,
+                    ):
+                        continue
+                    await worker.extract_once(job_id=job.job_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning(
+                    "Distill extraction sweep failed; continuing", exc_info=True
+                )
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=interval)
+            except (TimeoutError, asyncio.TimeoutError):
+                continue
 
     async def _health_alerts_probe(self, stop_event: asyncio.Event) -> None:
         """Detection-only runtime health probe + threshold alerts (#389).

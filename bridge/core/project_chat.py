@@ -2,6 +2,7 @@
 Project Chat Handler - Integrates Telegram with Claude Code SDK.
 """
 
+import json
 import os
 import re
 import time
@@ -54,6 +55,8 @@ from telegram_bot.core.usage import (
     parse_claude_rate_limit_event,
     parse_claude_result,
 )
+from telegram_bot.core.usage_meter import MODE_INTERACTIVE, UsageMeter
+from telegram_bot.memory.distill_worker import CodexDistillExtractionWorker
 from telegram_bot.core.curated_memory import build_curated_memory_settings
 from telegram_bot.core.session_scope import stream_key
 from telegram_bot.core.web_mcp import build_curated_web_mcp
@@ -230,7 +233,245 @@ class ProjectChatHandler(
         # (see `_record_claude_rate_limit`), which fire regardless of which
         # chat's stream happens to be open when the CLI emits them.
         self._claude_rate_limit: Optional[UsageSnapshot] = None
+        self._usage_meter: Optional[UsageMeter] = None
+        if getattr(self._config, "usage_meter_enabled", True):
+            try:
+                self._usage_meter = UsageMeter(
+                    self.project_root / ".telegram_bot" / "usage-meter.json",
+                    budgets={
+                        "claude": int(
+                            getattr(self._config, "usage_budget_tokens_claude", 0) or 0
+                        ),
+                        "codex": int(
+                            getattr(self._config, "usage_budget_tokens_codex", 0) or 0
+                        ),
+                    },
+                    warn_percent=int(
+                        getattr(self._config, "usage_budget_warn_percent", 80) or 80
+                    ),
+                    alert_sink=self._write_usage_alert_spool,
+                )
+            except Exception:
+                logger.exception(
+                    "Usage meter unavailable; continuing without local metering"
+                )
+        if self._usage_meter is not None and self._agent_runtime is not None:
+            set_usage_recorder = getattr(
+                self._agent_runtime, "set_usage_recorder", None
+            )
+            if callable(set_usage_recorder):
+                set_usage_recorder(self._usage_meter.record_codex_thread_usage)
+            set_turn_attempt_recorder = getattr(
+                self._agent_runtime, "set_turn_attempt_recorder", None
+            )
+            if callable(set_turn_attempt_recorder):
+                # The runtime invokes this at its spend boundary (provider
+                # accepted turn/start), so cancelled-before-first-event turns
+                # still count and pre-boundary failures charge nothing.
+                set_turn_attempt_recorder(self.record_agent_turn_request)
         logger.info(f"ProjectChatHandler initialized for {self.project_root}")
+
+    @property
+    def usage_meter(self) -> Optional[UsageMeter]:
+        """Node-local durable usage meter, when enabled (#388)."""
+
+        return self._usage_meter
+
+    def _write_usage_alert_spool(self, message: str) -> None:
+        """Queue one budget alert for owner push delivery (#388).
+
+        Reuses the opt-in push-notifier spool contract: token isolation,
+        owner-only target resolution, dedup, and rate limiting all stay in
+        PushNotifier. When push is disabled the alert stays log-only (the
+        meter already logged it) and nothing accumulates on disk.
+        """
+
+        if not bool(getattr(self._config, "push_enabled", False)):
+            return
+        spool_dir = Path(
+            getattr(self._config, "push_spool_dir", None)
+            or (Path.home() / ".claude" / "state" / "telegram-spool")
+        )
+        payload = {
+            "event": "usage-budget",
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "text": message,
+            "dedup": f"usage-budget:{message}",
+        }
+        try:
+            spool_dir.mkdir(parents=True, exist_ok=True)
+            target = spool_dir / f"usage-budget-{time.time_ns()}.json"
+            tmp = target.with_suffix(".tmp")
+            tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, target)
+        except OSError:
+            logger.warning("Usage budget alert spool write failed; alert stays log-only")
+
+    def build_distill_extraction_worker(
+        self,
+        journal: Any,
+        backend: Any,
+        **worker_kwargs: Any,
+    ) -> CodexDistillExtractionWorker:
+        """Composition root for distill extraction workers (#465 scheduling).
+
+        Always injects this handler's shared usage meter so autonomous
+        extraction spend is gated by the same daily budget that meters
+        interactive turns (#388). Callers must not supply their own
+        ``usage_meter`` — the gate is a composition invariant, not an option.
+        """
+
+        if "usage_meter" in worker_kwargs:
+            raise ValueError(
+                "usage_meter is injected by the composition root; do not pass it"
+            )
+        return CodexDistillExtractionWorker(
+            journal,
+            backend,
+            usage_meter=self._usage_meter,
+            **worker_kwargs,
+        )
+
+    def record_claude_attempt(self, req: Any) -> None:
+        """Meter one Claude request at its spend boundary, exactly once.
+
+        Called by the reader on the first SDK event attributable to a pending
+        request; the per-request flag makes later events no-ops, so a reader
+        crash or cancellation after any output still leaves the attempt
+        counted while normal ResultMessage completion cannot double-charge.
+        """
+
+        if self._usage_meter is None or getattr(req, "usage_attempt_recorded", False):
+            return
+        try:
+            req.usage_attempt_recorded = True
+        except Exception:
+            return
+        try:
+            self._usage_meter.record("claude", MODE_INTERACTIVE, requests=1)
+        except Exception:
+            logger.exception("Claude request metering failed; turn continues")
+
+    @staticmethod
+    def _claude_message_id(message: Any) -> Optional[str]:
+        # claude-agent-sdk AssistantMessage carries step identity in
+        # message_id (with uuid as a per-frame fallback); older/raw shapes
+        # expose id directly or nest it under message.
+        for candidate in (
+            getattr(message, "message_id", None),
+            getattr(message, "id", None),
+            getattr(message, "uuid", None),
+            getattr(getattr(message, "message", None), "id", None),
+        ):
+            if isinstance(candidate, str) and candidate:
+                return candidate
+        inner = getattr(message, "message", None)
+        if isinstance(inner, Mapping):
+            for key in ("message_id", "id", "uuid"):
+                value = inner.get(key)
+                if isinstance(value, str) and value:
+                    return value
+        return None
+
+    def _claude_usage_totals(self, message: Any) -> Tuple[int, int]:
+        snapshot = parse_claude_result(message, observed_at=self._clock.time())
+        input_total = snapshot.context_used
+        if input_total is None:
+            input_total = snapshot.input_tokens or 0
+        return input_total, snapshot.output_tokens or 0
+
+    def _meter_claude_tokens(self, delta: Tuple[int, int]) -> None:
+        if self._usage_meter is None:
+            return
+        try:
+            self._usage_meter.record(
+                "claude",
+                MODE_INTERACTIVE,
+                input_tokens=delta[0],
+                output_tokens=delta[1],
+            )
+        except Exception:
+            logger.exception("Claude usage metering failed; turn continues")
+
+    def record_claude_observed_usage(
+        self, req: Any, message: Any, *, terminal: bool = False
+    ) -> None:
+        """Idempotently meter validated observed usage for one request.
+
+        AssistantMessage usage is per step: distinct message ids accumulate
+        and repeated frames sharing one id dedupe via a per-id high-water
+        mark, so a reader crash after any step keeps every observed step.
+        The terminal result reconciles against the whole-tree totals — the
+        larger of ResultMessage.usage and the model_usage sums (which include
+        subagent activity) — recording only the positive remainder beyond
+        what the steps already metered, so nothing double charges.
+        """
+
+        if self._usage_meter is None:
+            return
+        recorded = getattr(req, "usage_tokens_recorded", (0, 0))
+        if terminal:
+            observed = self._claude_usage_totals(message)
+            from types import SimpleNamespace as _NS
+
+            tree = self._claude_usage_totals(
+                _NS(
+                    usage={},
+                    model_usage=getattr(message, "model_usage", {}) or {},
+                    total_cost_usd=None,
+                )
+            )
+            observed = (max(observed[0], tree[0]), max(observed[1], tree[1]))
+        else:
+            step = self._claude_usage_totals(message)
+            if not any(step):
+                return
+            steps = getattr(req, "usage_step_totals", None)
+            if steps is None:
+                steps = {}
+                try:
+                    req.usage_step_totals = steps
+                except Exception:
+                    return
+            message_id = self._claude_message_id(message)
+            previous_step = steps.get(message_id, (0, 0))
+            merged = (
+                max(previous_step[0], step[0]),
+                max(previous_step[1], step[1]),
+            )
+            if merged == previous_step:
+                return
+            steps[message_id] = merged
+            observed = (
+                sum(value[0] for value in steps.values()),
+                sum(value[1] for value in steps.values()),
+            )
+        delta = (
+            max(0, observed[0] - recorded[0]),
+            max(0, observed[1] - recorded[1]),
+        )
+        if not any(delta):
+            return
+        try:
+            req.usage_tokens_recorded = (
+                max(recorded[0], observed[0]),
+                max(recorded[1], observed[1]),
+            )
+        except Exception:
+            return
+        self._meter_claude_tokens(delta)
+
+    def record_agent_turn_request(self) -> None:
+        """Count one completed interactive agent-runtime turn, fail-open."""
+
+        if self._usage_meter is None:
+            return
+        provider = getattr(self._config, "agent_provider", "claude")
+        try:
+            self._usage_meter.record(provider, MODE_INTERACTIVE, requests=1)
+        except Exception:
+            logger.exception("Interactive usage metering failed; turn continues")
 
     def _stream_key(self, user_id: int, chat_id: int) -> Tuple[int, int]:
         return stream_key(
@@ -273,8 +514,10 @@ class ProjectChatHandler(
         if not isinstance(session_id, str) or not session_id:
             return
         key = (req.user_id, req.chat_id, session_id)
-        self._claude_usage[key] = parse_claude_result(msg, observed_at=self._clock.time())
+        snapshot = parse_claude_result(msg, observed_at=self._clock.time())
+        self._claude_usage[key] = snapshot
         self._claude_usage = dict(tuple(self._claude_usage.items())[-128:])
+        self.record_claude_observed_usage(req, msg, terminal=True)
 
     def _record_claude_rate_limit(self, msg: RateLimitEvent) -> None:
         parsed = parse_claude_rate_limit_event(msg, observed_at=self._clock.time())

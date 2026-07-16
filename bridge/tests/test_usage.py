@@ -388,6 +388,7 @@ async def test_claude_usage_cache_is_exact_conversation_and_session_scoped(
     handler = ProjectChatHandler.__new__(ProjectChatHandler)
     handler._agent_runtime = None
     handler._claude_usage = {}
+    handler._usage_meter = None
     handler._clock = SimpleNamespace(time=lambda: 1000.0)
     handler._config = SimpleNamespace(claude_settings_path=tmp_path / "settings.json")
     message = SimpleNamespace(
@@ -464,6 +465,7 @@ async def test_get_usage_tolerates_handler_without_rate_limit_attribute(
     handler = ProjectChatHandler.__new__(ProjectChatHandler)
     handler._agent_runtime = None
     handler._claude_usage = {}
+    handler._usage_meter = None
     handler._clock = SimpleNamespace(time=lambda: 1000.0)
     handler._config = SimpleNamespace(claude_settings_path=tmp_path / "settings.json")
     assert not hasattr(handler, "_claude_rate_limit")
