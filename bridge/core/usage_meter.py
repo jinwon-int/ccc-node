@@ -357,7 +357,19 @@ class UsageMeter:
                         bucket[key] = max(0, min(bucket[key] + value, _MAX_COUNT))
         for reservation_id, record in self._pending_reservation_ops.items():
             if record is None:
-                self._reservations.pop(reservation_id, None)
+                # Unpersisted refund: replay it only by consuming the
+                # authoritative record. If another process already consumed
+                # it (and persisted that), the record is absent and nothing
+                # is subtracted — the refund must never apply twice.
+                consumed = self._reservations.pop(reservation_id, None)
+                if consumed is not None:
+                    bucket = self._bucket(
+                        str(consumed["day"]), str(consumed["provider"]), MODE_AUTONOMOUS
+                    )
+                    for key in _COUNTER_KEYS:
+                        bucket[key] = max(
+                            0, bucket[key] - _clamped_count(consumed.get(key))
+                        )
             else:
                 self._reservations[reservation_id] = dict(record)
 
@@ -530,13 +542,12 @@ class UsageMeter:
             day = str(record["day"])
             provider = str(record["provider"])
             bucket = self._bucket(day, provider, MODE_AUTONOMOUS)
-            applied = {
-                key: min(bucket[key], _clamped_count(record.get(key)))
-                for key in _COUNTER_KEYS
-            }
-            for key, value in applied.items():
-                bucket[key] = bucket[key] - value
-            self._note_pending_delta(day, provider, MODE_AUTONOMOUS, applied, -1)
+            # The subtraction is deliberately NOT a pending counter delta: if
+            # this save fails, the consume op above replays the refund
+            # conditionally on the authoritative record still existing, so a
+            # refund another process persisted meanwhile is never reapplied.
+            for key in _COUNTER_KEYS:
+                bucket[key] = max(0, bucket[key] - _clamped_count(record.get(key)))
 
     def record_codex_thread_usage(
         self,

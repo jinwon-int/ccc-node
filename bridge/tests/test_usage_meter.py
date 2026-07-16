@@ -522,3 +522,33 @@ class ReservationConsumptionTests(UsageMeterTestCase):
         with self.assertLogs("telegram_bot.core.usage_meter", level="WARNING"):
             self.make_meter().refund_reservation(reservation)
         self.assertEqual(self.make_meter().used_tokens("codex"), 0)
+
+
+class CrossInstanceRefundRecoveryTests(UsageMeterTestCase):
+    def test_failed_save_refund_replay_is_idempotent_across_instances(self) -> None:
+        # Reviewer probe: A's refund save fails, B refunds the same durable
+        # handle and records 50/1, then A records 10/1 — the bucket must be
+        # 60/2, not 10/1: A's replay must not reapply the consumed refund.
+        meter_a = self.make_meter()
+        reservation = meter_a.reserve_autonomous_spend(
+            "codex", input_tokens=100, requests=1
+        )
+        from unittest import mock
+
+        with mock.patch(
+            "telegram_bot.core.usage_meter.os.replace", side_effect=OSError
+        ):
+            with self.assertLogs("telegram_bot.core.usage_meter", level="WARNING"):
+                meter_a.refund_reservation(reservation)
+
+        meter_b = self.make_meter()
+        meter_b.refund_reservation(reservation)
+        meter_b.record("codex", MODE_AUTONOMOUS, input_tokens=50, requests=1)
+
+        meter_a.record("codex", MODE_AUTONOMOUS, input_tokens=10, requests=1)
+
+        raw = json.loads(self.path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            raw["days"][FIXED_DAY]["codex"][MODE_AUTONOMOUS],
+            {"input_tokens": 60, "output_tokens": 0, "requests": 2},
+        )
