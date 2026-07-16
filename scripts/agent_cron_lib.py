@@ -2,10 +2,10 @@
 """Pure schedule + retry helpers for the ccc-node agent-cron CLI.
 
 Extracted from ``agent_cron.py`` so the deterministic cron-matching, schedule
-parsing, and retry-backoff math can be imported and unit tested directly. Unlike
-``agent_cron.py`` — which runs a CLI bootstrap and reads the task store at import
-time — this module has NO side effects: it only defines constants and pure
-functions over their arguments. ``agent_cron.py`` imports these names.
+parsing, and retry-backoff math can be imported and unit tested directly. This
+module has no side effects: it only defines constants and pure functions over
+their arguments. The import-safe ``agent_cron.py`` composition root imports these
+names and dispatches only from ``main()``.
 """
 
 import re

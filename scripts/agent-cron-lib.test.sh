@@ -7,8 +7,9 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 out_file="$(mktemp)"
 trap 'rm -f "$out_file"' EXIT
 
-if python3 "$HERE/agent_cron_lib_test.py" >"$out_file" 2>&1; then
-  ran="$(grep -oE 'Ran [0-9]+ test' "$out_file" | grep -oE '[0-9]+' | head -1)"
+if python3 "$HERE/agent_cron_lib_test.py" >"$out_file" 2>&1 && \
+   python3 "$HERE/agent_cron_schema_test.py" >>"$out_file" 2>&1; then
+  ran="$(grep -oE 'Ran [0-9]+ test' "$out_file" | grep -oE '[0-9]+' | awk '{sum += $1} END {print sum}')"
   echo "----"
   echo "PASS=${ran:-0} FAIL=0"
 else
