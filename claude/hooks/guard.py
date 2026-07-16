@@ -54,6 +54,15 @@ _RELAX_VERBS = {
     "try-restart", "reload-or-restart", "try-reload-or-restart", "force-reload",
 }
 
+# Verbs that make a systemctl/service/pm2 invocation lifecycle-sensitive.  The
+# relaxed subset above may proceed for fleet units; configuration-changing
+# verbs and pm2 delete remain gated.  Read-only verbs such as is-active/status/
+# show are intentionally absent so they can accompany a restart verification.
+_SYSTEMCTL_GATED_VERBS = _RELAX_VERBS | {
+    "disable", "enable", "mask", "unmask", "daemon-reload", "daemon-reexec",
+}
+_PM2_GATED_VERBS = {"start", "restart", "reload", "stop", "delete", "kill"}
+
 # ssh/scp option flags that consume the following token as their value. Getting
 # this list right only ever makes the managed-node relaxation MORE precise;
 # misclassifying leans fail-closed (the target is missed → not relaxed).
@@ -516,6 +525,26 @@ def _quote_strip(s):
     return s.replace('"', "").replace("'", "")
 
 
+def _split_lifecycle_fragments(stmt):
+    """Split a lifecycle statement into command-sized fragments.
+
+    The top-level splitter deliberately preserves a quoted SSH remote body so
+    every blast-radius gate can associate it with the remote target.  Service
+    classification needs a narrower second view: each lifecycle invocation in
+    that body must be judged independently, otherwise trailing read-only
+    verification (``sleep; systemctl is-active/show``) is misread as restart
+    targets.  Quote stripping is conservative here: separators inside a data
+    string can only cause extra inspection and a fail-closed false positive,
+    never hide a lifecycle invocation.
+    """
+    flattened = _quote_strip(stmt)
+    return [
+        fragment.strip()
+        for fragment in re.split(r"(?:&&|\|\||[;&|\n{}()])+", flattened)
+        if fragment.strip()
+    ]
+
+
 # --------------------------------------------------------------------------- #
 # Main evaluation. Raises Deny to block; returns normally to allow.
 # --------------------------------------------------------------------------- #
@@ -839,29 +868,41 @@ def _is_fleet_lifecycle(stmt):
     targets fleet units with a relaxed (pure lifecycle) verb (#436).
 
     Returns False if the statement contains no systemctl/service/pm2 lifecycle at
-    all (so docker/kubectl/bareword denials are unaffected by this check)."""
-    try:
-        toks = shlex.split(stmt)
-    except ValueError:
-        return False
+    all (so docker/kubectl/bareword denials are unaffected by this check).
+
+    Quoted SSH bodies and shell-function bodies are inspected one command at a
+    time.  Read-only service checks do not invalidate an otherwise relaxed
+    restart, but a non-fleet target or config-changing verb still fails closed.
+    """
     saw = False
-    i = 0
-    n = len(toks)
-    while i < n:
-        b = _basename(toks[i])
-        if b == "systemctl":
-            saw = True
-            if not _systemctl_fleet(toks, i):
-                return False
-        elif b == "service":
-            saw = True
-            if not _service_fleet(toks, i):
-                return False
-        elif b == "pm2":
-            saw = True
-            if not _pm2_fleet(toks, i):
-                return False
-        i += 1
+    for fragment in _split_lifecycle_fragments(stmt):
+        try:
+            toks = shlex.split(fragment)
+        except ValueError:
+            return False
+        i = 0
+        n = len(toks)
+        while i < n:
+            b = _basename(toks[i])
+            if b == "systemctl":
+                verb, _verb_i = _systemctl_verb(toks, i)
+                if verb in _SYSTEMCTL_GATED_VERBS:
+                    saw = True
+                    if not _systemctl_fleet(toks, i):
+                        return False
+            elif b == "service":
+                verb = toks[i + 2] if i + 2 < n else None
+                if verb in _SYSTEMCTL_GATED_VERBS:
+                    saw = True
+                    if not _service_fleet(toks, i):
+                        return False
+            elif b == "pm2":
+                verb, _verb_i = _pm2_verb(toks, i)
+                if verb in _PM2_GATED_VERBS:
+                    saw = True
+                    if not _pm2_fleet(toks, i):
+                        return False
+            i += 1
     return saw
 
 
@@ -892,10 +933,9 @@ def _targets_all_fleet(target_toks):
     return found
 
 
-def _systemctl_fleet(toks, i):
+def _systemctl_verb(toks, i):
     n = len(toks)
     j = i + 1
-    verb = None
     while j < n:
         t = toks[j]
         if t in ("-H", "--host", "-M", "--machine"):
@@ -904,12 +944,15 @@ def _systemctl_fleet(toks, i):
         if t.startswith("-"):
             j += 1
             continue
-        verb = t
-        j += 1
-        break
+        return t, j
+    return None, None
+
+
+def _systemctl_fleet(toks, i):
+    verb, verb_i = _systemctl_verb(toks, i)
     if verb not in _RELAX_VERBS:
         return False
-    return _targets_all_fleet(toks[j:])
+    return _targets_all_fleet(toks[verb_i + 1:])
 
 
 def _service_fleet(toks, i):
@@ -923,21 +966,23 @@ def _service_fleet(toks, i):
     return _FLEET_RE.search(unit) is not None
 
 
-def _pm2_fleet(toks, i):
+def _pm2_verb(toks, i):
     n = len(toks)
     j = i + 1
-    verb = None
     while j < n:
         t = toks[j]
         if t.startswith("-"):
             j += 1
             continue
-        verb = t
-        j += 1
-        break
+        return t, j
+    return None, None
+
+
+def _pm2_fleet(toks, i):
+    verb, verb_i = _pm2_verb(toks, i)
     if verb not in ("start", "restart", "reload", "stop", "kill"):
         return False
-    return _targets_all_fleet(toks[j:])
+    return _targets_all_fleet(toks[verb_i + 1:])
 
 
 def _is_readonly_text_search(cn):

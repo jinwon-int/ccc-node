@@ -32,6 +32,10 @@ All notable changes to the Claude Code node harness. Dates are KST.
   (enable/disable/mask/isolate/daemon-*) on the local node, `pm2 delete`,
   docker/podman/kubectl, and local host lifecycle. Compound commands are judged
   per statement; one non-fleet target denies the whole command.
+- Remote fleet restart classification now inspects quoted SSH and shell-function
+  bodies one command at a time, so read-only post-restart verification (`sleep`,
+  `systemctl is-active`, `systemctl show`) no longer turns into false target names.
+  Mixed non-fleet targets and config-changing verbs still fail closed. Refs #534.
 
 ### Added
 - A durable provider-neutral Codex distill extraction worker now advances completed
