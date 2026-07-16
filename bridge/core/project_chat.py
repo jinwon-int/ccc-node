@@ -333,6 +333,26 @@ class ProjectChatHandler(
             **worker_kwargs,
         )
 
+    def record_claude_attempt(self, req: Any) -> None:
+        """Meter one Claude request at its spend boundary, exactly once.
+
+        Called by the reader on the first SDK event attributable to a pending
+        request; the per-request flag makes later events no-ops, so a reader
+        crash or cancellation after any output still leaves the attempt
+        counted while normal ResultMessage completion cannot double-charge.
+        """
+
+        if self._usage_meter is None or getattr(req, "usage_attempt_recorded", False):
+            return
+        try:
+            req.usage_attempt_recorded = True
+        except Exception:
+            return
+        try:
+            self._usage_meter.record("claude", MODE_INTERACTIVE, requests=1)
+        except Exception:
+            logger.exception("Claude request metering failed; turn continues")
+
     def record_agent_turn_request(self) -> None:
         """Count one completed interactive agent-runtime turn, fail-open."""
 
@@ -401,7 +421,6 @@ class ProjectChatHandler(
                     MODE_INTERACTIVE,
                     input_tokens=input_total,
                     output_tokens=snapshot.output_tokens or 0,
-                    requests=1,
                 )
             except Exception:
                 logger.exception("Claude usage metering failed; turn continues")

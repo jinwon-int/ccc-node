@@ -73,6 +73,7 @@ class ProjectChatMeterWiringTests(unittest.IsolatedAsyncioTestCase):
             model_usage={},
             total_cost_usd=None,
         )
+        handler.record_claude_attempt(request)
         handler._record_claude_usage(request, message)
 
         day_buckets = next(iter(_meter_state(self.root)["days"].values()))
@@ -96,6 +97,7 @@ class ProjectChatMeterWiringTests(unittest.IsolatedAsyncioTestCase):
             model_usage={},
             total_cost_usd=None,
         )
+        handler.record_claude_attempt(request)
         handler._record_claude_usage(request, message)
 
         day_buckets = next(iter(_meter_state(self.root)["days"].values()))
@@ -108,6 +110,31 @@ class ProjectChatMeterWiringTests(unittest.IsolatedAsyncioTestCase):
         meter = handler.usage_meter
         assert meter is not None
         self.assertEqual(meter.used_tokens("claude"), 5015)
+
+    async def test_claude_attempt_is_metered_once_even_without_a_result(self) -> None:
+        # Reviewer probe: an accepted query that emits output and then loses
+        # its reader must still count one request; repeated events and a
+        # normal ResultMessage completion never double-charge it.
+        handler = ProjectChatHandler(settings=_settings(self.root))
+        request = SimpleNamespace(user_id=7, chat_id=9)
+        handler.record_claude_attempt(request)
+        handler.record_claude_attempt(request)
+
+        day_buckets = next(iter(_meter_state(self.root)["days"].values()))
+        self.assertEqual(day_buckets["claude"]["interactive"]["requests"], 1)
+
+        message = SimpleNamespace(
+            session_id="session-1",
+            usage={"input_tokens": 100, "output_tokens": 20},
+            model_usage={},
+            total_cost_usd=None,
+        )
+        handler._record_claude_usage(request, message)
+        day_buckets = next(iter(_meter_state(self.root)["days"].values()))
+        self.assertEqual(
+            day_buckets["claude"]["interactive"],
+            {"input_tokens": 100, "output_tokens": 20, "requests": 1},
+        )
 
     async def test_metering_failure_never_breaks_the_result_path(self) -> None:
         handler = ProjectChatHandler(settings=_settings(self.root))
