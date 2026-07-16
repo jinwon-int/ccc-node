@@ -12,6 +12,7 @@ Living operator docs stay at the top level of `docs/`; historical closeouts and 
 | [`skill-autosave.md`](skill-autosave.md) | Hermes-style auto-skillification: skill-review hook, daily sweep cron, Telegram approval flow. |
 | [`self-update.md`](self-update.md) | Pre-approved node maintenance: pull + setup + allowlisted service restarts without loosening the guard. |
 | [`bridge-ops.md`](bridge-ops.md) | Telegram bridge operations and boundaries. |
+| [`provider-capability-matrix.md`](provider-capability-matrix.md) | Generated per-provider capability states (runtime + memory parity) with the conformance-gate contract. |
 | [`bridge-upstream-i18n-policy.md`](bridge-upstream-i18n-policy.md) | Bridge upstream relationship and Korean/i18n policy. |
 | [`a2a-claude-worker.md`](a2a-claude-worker.md) | A2A Claude Code worker lane and native Termux worker preflight. |
 | [`android-termux-claude.md`](android-termux-claude.md) | Android/Termux Claude Code constraints. |
