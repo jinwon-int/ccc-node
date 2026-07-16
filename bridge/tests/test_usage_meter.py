@@ -293,16 +293,56 @@ if __name__ == "__main__":
 
 
 class ReserveTests(UsageMeterTestCase):
-    def test_reserve_is_atomic_admission_and_charge(self) -> None:
+    def test_reserve_is_atomic_and_prospective(self) -> None:
         meter = self.make_meter(budgets={"codex": 5000})
         decisions = [
             meter.reserve_autonomous_spend("codex", input_tokens=2058, requests=1)
             for _ in range(4)
         ]
-        self.assertEqual([d.allowed for d in decisions], [True, True, True, False])
-        self.assertEqual([d.state for d in decisions], ["ok", "ok", "warn", "blocked"])
-        # A blocked reservation charges nothing.
-        self.assertEqual(meter.used_tokens("codex"), 3 * 2058)
+        # Admission requires the whole reservation to fit under the cap:
+        # 2 x 2058 fits, a third would cross 5000 and is rejected without
+        # charging, so the recorded total can never exceed the cap.
+        self.assertEqual([d.allowed for d in decisions], [True, True, False, False])
+        self.assertEqual([d.state for d in decisions], ["ok", "ok", "blocked", "blocked"])
+        self.assertEqual(meter.used_tokens("codex"), 2 * 2058)
+        self.assertLessEqual(meter.used_tokens("codex"), 5000)
+
+    def test_reserve_rejects_a_single_oversized_attempt_outright(self) -> None:
+        meter = self.make_meter(budgets={"codex": 5000})
+        decision = meter.reserve_autonomous_spend("codex", input_tokens=34816)
+        self.assertFalse(decision.allowed)
+        self.assertEqual(decision.state, "blocked")
+        self.assertEqual(meter.used_tokens("codex"), 0)
+
+    def test_reserve_reports_warn_when_admitted_past_the_early_alarm(self) -> None:
+        meter = self.make_meter(budgets={"codex": 10000})
+        sizes = (3000, 3000, 2500, 1000, 600)
+        decisions = [
+            meter.reserve_autonomous_spend("codex", input_tokens=size)
+            for size in sizes
+        ]
+        self.assertEqual(
+            [d.state for d in decisions], ["ok", "ok", "ok", "warn", "blocked"]
+        )
+        self.assertEqual(meter.used_tokens("codex"), 9500)
+
+    def test_refund_unwinds_exactly_one_reservation(self) -> None:
+        meter = self.make_meter(budgets={"codex": 5000})
+        meter.reserve_autonomous_spend("codex", input_tokens=2058, requests=1)
+        meter.refund_autonomous_reservation("codex", input_tokens=2058, requests=1)
+        self.assertEqual(meter.used_tokens("codex"), 0)
+        raw = json.loads(self.path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            raw["days"][FIXED_DAY]["codex"][MODE_AUTONOMOUS],
+            {"input_tokens": 0, "output_tokens": 0, "requests": 0},
+        )
+
+    def test_refund_clamps_at_zero_and_validates_provider(self) -> None:
+        meter = self.make_meter()
+        meter.refund_autonomous_reservation("codex", input_tokens=500)
+        self.assertEqual(meter.used_tokens("codex"), 0)
+        with self.assertRaises(ValueError):
+            meter.refund_autonomous_reservation("../etc", input_tokens=1)
 
     def test_reserve_without_budget_admits_and_charges(self) -> None:
         meter = self.make_meter()

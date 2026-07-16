@@ -37,8 +37,9 @@ def thread_hash(thread_id: str) -> str:
     return hashlib.sha256(thread_id.encode("utf-8")).hexdigest()
 
 
-def snapshot(thread_id: str = "thread-532") -> CodexTranscriptSnapshot:
-    text = "harmless durable fact"
+def snapshot(
+    thread_id: str = "thread-532", text: str = "harmless durable fact"
+) -> CodexTranscriptSnapshot:
     return CodexTranscriptSnapshot(
         thread_hash=thread_hash(thread_id),
         last_turn_id="turn-1",
@@ -83,6 +84,7 @@ def snapshot_done_job(
     journal: DistillJournal,
     *,
     thread_id: str = "thread-532",
+    text: str = "harmless durable fact",
 ) -> DistillJob:
     queued = journal.enqueue_once(
         provider="codex",
@@ -99,7 +101,7 @@ def snapshot_done_job(
         queued.job_id,
         owner_token="snapshot-worker",
         lease_epoch=claimed.lease_epoch,
-        snapshot=snapshot(thread_id),
+        snapshot=snapshot(thread_id, text),
         now=utc(1),
     )
 
@@ -455,7 +457,7 @@ class _FakeUsageMeter:
     def __init__(self, *, allowed: bool) -> None:
         self.allowed = allowed
         self.reserves: list[tuple[str, int, int]] = []
-        self.records: list[tuple[str, str, int, int]] = []
+        self.refunds: list[tuple[str, int, int]] = []
 
     def reserve_autonomous_spend(
         self,
@@ -476,17 +478,15 @@ class _FakeUsageMeter:
 
         return _Decision()
 
-    def record(
+    def refund_autonomous_reservation(
         self,
         provider: str,
-        mode: str,
         *,
         input_tokens: int = 0,
         output_tokens: int = 0,
         requests: int = 0,
-    ) -> tuple[()]:
-        self.records.append((provider, mode, input_tokens, requests))
-        return ()
+    ) -> None:
+        self.refunds.append((provider, input_tokens, requests))
 
 
 @pytest.mark.anyio
@@ -506,12 +506,13 @@ async def test_budget_blocked_extraction_defers_without_claiming_or_spending(
         usage_meter=meter,
     ).extract_once(job_id=job.job_id)
 
-    # The provider was never called, nothing was charged, and the job was not
-    # claimed: no extraction attempt is burned while the budget blocks, so the
-    # job replays untouched once the daily window resets.
+    # The provider was never called, the prospective full-cost reservation
+    # (2048 overhead + 21-byte snapshot // 2) was rejected without charging,
+    # and the job was not claimed: no extraction attempt is burned while the
+    # budget blocks, so the job replays untouched once the daily window resets.
     assert backend.calls == []
-    assert meter.reserves == [("codex", 2048, 1)]
-    assert meter.records == []
+    assert meter.reserves == [("codex", 2058, 1)]
+    assert meter.refunds == []
     assert result.status is DistillJobStatus.SNAPSHOT_DONE
     assert result.extraction_attempts == 0
     persisted = journal.get(job.job_id)
@@ -538,11 +539,11 @@ async def test_budget_allowed_extraction_meters_one_autonomous_request(
 
     assert result.status is DistillJobStatus.EXTRACTION_DONE
     assert len(backend.calls) == 1
-    # Admission atomically charges the 2048-token overhead, and the size
-    # top-up adds byte_count // 2 for the 21-byte snapshot, so the token
-    # budget is consumed even though the backend cannot report actual usage.
-    assert meter.reserves == [("codex", 2048, 1)]
-    assert meter.records == [("codex", "autonomous", 10, 0)]
+    # Admission atomically reserves the full bounded attempt cost up front
+    # (2048 overhead + 21-byte snapshot // 2), so the token budget is
+    # consumed even though the backend cannot report actual usage yet.
+    assert meter.reserves == [("codex", 2058, 1)]
+    assert meter.refunds == []
 
 
 @pytest.mark.anyio
@@ -570,19 +571,24 @@ async def test_repeated_autonomous_extraction_consumes_budget_and_blocks(
 
     results = [await worker.extract_once(job_id=job.job_id) for job in jobs]
 
-    # Each attempt reserves 2048 + byte_count // 2 = 2058 tokens, so the
-    # 5000-token codex budget admits exactly three background extractions on
-    # one day before autonomous spend is blocked; later jobs defer unclaimed.
-    assert len(backend.calls) == 3
-    assert [result.status for result in results[:3]] == (
-        [DistillJobStatus.EXTRACTION_DONE] * 3
+    # Each attempt prospectively reserves 2048 + byte_count // 2 = 2058
+    # tokens, and admission requires the whole reservation to fit under the
+    # 5000-token codex budget: exactly two background extractions are
+    # admitted (2 x 2058 = 4116; a third would cross the cap) and the
+    # recorded total never exceeds the cap. Later jobs defer unclaimed.
+    assert len(backend.calls) == 2
+    assert [result.status for result in results[:2]] == (
+        [DistillJobStatus.EXTRACTION_DONE] * 2
     )
     assert all(
-        result.status is DistillJobStatus.SNAPSHOT_DONE for result in results[3:]
+        result.status is DistillJobStatus.SNAPSHOT_DONE for result in results[2:]
     )
-    assert all(result.extraction_attempts == 0 for result in results[3:])
-    assert meter.used_tokens("codex") == 3 * 2058
-    assert meter.check_autonomous_spend("codex").allowed is False
+    assert all(result.extraction_attempts == 0 for result in results[2:])
+    assert meter.used_tokens("codex") == 2 * 2058
+    assert meter.used_tokens("codex") <= 5000
+    assert (
+        meter.reserve_autonomous_spend("codex", input_tokens=2058).allowed is False
+    )
 
 
 @pytest.mark.anyio
@@ -612,14 +618,84 @@ async def test_concurrent_autonomous_extractions_cannot_overrun_the_cap(
         *(worker.extract_once(job_id=job.job_id) for job in jobs)
     )
 
-    # Admission and the overhead charge are one atomic meter step, so even
-    # fully concurrent attempts admit exactly three extractions under the
-    # 5000-token cap; the rest defer unclaimed with nothing charged.
-    assert len(backend.calls) == 3
-    assert meter.used_tokens("codex") == 3 * 2058
+    # Admission and the full prospective charge are one atomic meter step,
+    # so even fully concurrent attempts admit exactly two extractions under
+    # the 5000-token cap (2 x 2058 fits, a third would cross it); the rest
+    # defer unclaimed with nothing charged and the recorded autonomous total
+    # never exceeds the configured cap.
+    assert len(backend.calls) == 2
+    assert meter.used_tokens("codex") == 2 * 2058
+    assert meter.used_tokens("codex") <= 5000
     done = [r for r in results if r.status is DistillJobStatus.EXTRACTION_DONE]
     deferred = [r for r in results if r.status is DistillJobStatus.SNAPSHOT_DONE]
-    assert len(done) == 3
-    assert len(deferred) == 3
+    assert len(done) == 2
+    assert len(deferred) == 4
     assert all(result.extraction_attempts == 0 for result in deferred)
-    assert meter.check_autonomous_spend("codex").allowed is False
+    assert (
+        meter.reserve_autonomous_spend("codex", input_tokens=2058).allowed is False
+    )
+
+
+@pytest.mark.anyio
+async def test_oversized_attempt_is_rejected_before_the_provider_call(
+    tmp_path: Path,
+) -> None:
+    journal = DistillJournal(tmp_path / "journal")
+    journal.initialize()
+    # 4000 snapshot bytes -> 2048 + 2000 = 4048 prospective tokens, which can
+    # never fit under a 3000-token budget.
+    job = snapshot_done_job(journal, thread_id="thread-huge", text="x" * 4000)
+    meter = UsageMeter(
+        tmp_path / "usage-meter.json",
+        budgets={"codex": 3000},
+        clock=lambda: 1784170800.0,
+    )
+    backend = SuccessfulBackend()
+
+    result = await CodexDistillExtractionWorker(
+        journal,
+        backend,
+        owner_token="extract-worker",
+        usage_meter=meter,
+    ).extract_once(job_id=job.job_id)
+
+    # The single attempt's bounded cost exceeds the cap, so it is rejected
+    # outright before any claim or provider call and nothing is charged: the
+    # recorded autonomous total cannot cross the configured cap.
+    assert backend.calls == []
+    assert result.status is DistillJobStatus.SNAPSHOT_DONE
+    assert result.extraction_attempts == 0
+    assert meter.used_tokens("codex") == 0
+
+
+@pytest.mark.anyio
+async def test_noop_invocations_refund_their_reservation(tmp_path: Path) -> None:
+    journal = DistillJournal(tmp_path / "journal")
+    journal.initialize()
+    job = snapshot_done_job(journal)
+    meter = UsageMeter(
+        tmp_path / "usage-meter.json",
+        budgets={"codex": 10000},
+        clock=lambda: 1784170800.0,
+    )
+    backend = SuccessfulBackend()
+    worker = CodexDistillExtractionWorker(
+        journal,
+        backend,
+        owner_token="extract-worker",
+        usage_meter=meter,
+    )
+
+    first = await worker.extract_once(job_id=job.job_id)
+    second = await worker.extract_once(job_id=job.job_id)
+
+    # The second invocation reserved, lost the claim (the job is already
+    # done), and refunded the exact reservation: repeated no-op invocations
+    # cannot drain the budget.
+    assert first.status is DistillJobStatus.EXTRACTION_DONE
+    assert second.status is DistillJobStatus.EXTRACTION_DONE
+    assert len(backend.calls) == 1
+    assert meter.used_tokens("codex") == 2058
+    raw = json.loads((tmp_path / "usage-meter.json").read_text(encoding="utf-8"))
+    autonomous = raw["days"]["2026-07-16"]["codex"]["autonomous"]
+    assert autonomous == {"input_tokens": 2058, "output_tokens": 0, "requests": 1}

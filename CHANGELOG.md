@@ -70,11 +70,16 @@ All notable changes to the Claude Code node harness. Dates are KST.
   autonomous attempt with a conservative pre-spend token reservation
   (2048 overhead + snapshot bytes ÷ 2) until the exec backend can report
   actual usage, so repeated background work consumes — and eventually
-  hits — the cap. Autonomous admission is atomic: the meter's
-  `reserve_autonomous_spend` admits and charges in one locked step, so
-  concurrent extraction attempts cannot all pass a stale pre-spend check
-  and overrun the cap together (a blocked reservation charges nothing),
-  and a tiny valid budget no longer warns at zero usage. The bridge
+  hits — the cap. Autonomous admission is atomic and prospective: the
+  meter's `reserve_autonomous_spend` admits only when the whole bounded
+  attempt cost (overhead + persisted snapshot size, reserved before the
+  claim) fits under the cap and charges it in the same locked step, so
+  concurrent attempts cannot jointly overrun the cap, a single oversized
+  attempt is rejected outright, and the recorded autonomous total never
+  exceeds the configured cap. No-op invocations (claim lost or job already
+  done) refund their exact reservation, a tiny valid budget no longer warns
+  at zero usage, and budgets must fit at least one maximal attempt or that
+  work stays deferred by design. The bridge
   composition root (`build_context`) now constructs the distill extraction
   worker itself through the handler factory with the shared meter, and the
   worker's `usage_meter` is an explicit required constructor decision.

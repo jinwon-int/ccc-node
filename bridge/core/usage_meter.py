@@ -307,13 +307,17 @@ class UsageMeter:
         output_tokens: int = 0,
         requests: int = 0,
     ) -> BudgetDecision:
-        """Atomically admit-and-charge one autonomous attempt.
+        """Atomically admit-and-charge one autonomous attempt, prospectively.
 
-        Admission (is the provider still under its daily cap?) and the
-        conservative charge happen under one lock with no await point in
-        between, so concurrent autonomous attempts cannot all observe the
-        pre-spend counter and overrun the cap together. A blocked decision
-        charges nothing.
+        Admission requires the *whole* requested reservation to fit under the
+        provider's daily cap (``used + reservation <= budget``), and the
+        admission check and the charge happen under one lock with no await
+        point in between. Together that bounds recorded autonomous spend by
+        the cap itself: concurrent attempts cannot jointly overrun it and a
+        single oversized attempt is rejected outright (a blocked decision
+        charges nothing). Callers must therefore reserve the full bounded
+        attempt cost up front — and size the budget to fit at least one
+        maximal attempt, or such work stays deferred by design.
         """
 
         self._validate_provider(provider)
@@ -322,11 +326,12 @@ class UsageMeter:
             "output_tokens": _clamped_count(output_tokens),
             "requests": _clamped_count(requests),
         }
+        reserved_tokens = added["input_tokens"] + added["output_tokens"]
         with self._lock:
             day = self.current_day()
             budget = self._budgets.get(provider, 0)
             used = self.used_tokens(provider, day)
-            if budget > 0 and used >= budget:
+            if budget > 0 and used + reserved_tokens > budget:
                 return BudgetDecision(provider, day, "blocked", False, used, budget)
             alerts = self._apply_record(provider, MODE_AUTONOMOUS, added)
             state: BudgetState = "ok"
@@ -336,6 +341,38 @@ class UsageMeter:
         for alert in alerts:
             self._emit(alert)
         return decision
+
+    def refund_autonomous_reservation(
+        self,
+        provider: str,
+        *,
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+        requests: int = 0,
+    ) -> None:
+        """Unwind one reservation whose attempt never started.
+
+        Only for the caller that just reserved and then lost the work (for
+        example a distill claim race or an already-finished job): the exact
+        reserved amounts are subtracted from today's autonomous bucket,
+        clamped at zero. Alerts already fired are intentionally not
+        retracted, and crashes between reserve and refund leave the charge
+        in place — both err toward over-counting, never under-counting.
+        """
+
+        self._validate_provider(provider)
+        removed = {
+            "input_tokens": _clamped_count(input_tokens),
+            "output_tokens": _clamped_count(output_tokens),
+            "requests": _clamped_count(requests),
+        }
+        if not any(removed.values()):
+            return
+        with self._lock:
+            bucket = self._bucket(self.current_day(), provider, MODE_AUTONOMOUS)
+            for key, value in removed.items():
+                bucket[key] = max(0, bucket[key] - value)
+            self._save()
 
     def record_codex_thread_usage(
         self,

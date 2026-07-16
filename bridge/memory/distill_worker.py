@@ -42,15 +42,14 @@ class AutonomousSpendGate(Protocol):
         requests: int = 0,
     ) -> _BudgetDecisionLike: ...
 
-    def record(
+    def refund_autonomous_reservation(
         self,
         provider: str,
-        mode: str,
         *,
         input_tokens: int = 0,
         output_tokens: int = 0,
         requests: int = 0,
-    ) -> object: ...
+    ) -> None: ...
 
 _SAFE_ERROR_CODE_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 
@@ -142,17 +141,29 @@ class CodexDistillExtractionWorker:
         )
 
     async def extract_once(self, *, job_id: str) -> DistillJob:
+        reserved_tokens = 0
         if self._usage_meter is not None:
-            # Atomic admit-and-charge (#388): the overhead reservation and the
-            # under-cap admission happen in one meter step, so concurrent
-            # attempts cannot all pass a stale pre-spend check and overrun the
-            # cap together. A blocked decision leaves the job unclaimed — no
-            # attempt is burned and it replays once the daily window resets.
-            # Losing a duplicate-claim race after reserving overcharges by one
-            # overhead reservation; that is intentionally conservative.
+            # Prospective atomic admit-and-charge (#388): the FULL bounded
+            # attempt cost — flat overhead plus the persisted snapshot's
+            # size charge — is reserved in one meter step before the provider
+            # can run, and admission requires the whole reservation to fit
+            # under the daily cap. Recorded autonomous spend therefore never
+            # crosses the cap; an attempt whose bounded cost alone exceeds
+            # the cap stays deferred until the operator raises the budget.
+            # A blocked decision leaves the job unclaimed, so no attempt is
+            # burned and it replays once the daily window resets.
+            preview = await asyncio.to_thread(self._journal.get, job_id)
+            preview_snapshot = getattr(preview, "snapshot", None)
+            snapshot_bytes = (
+                preview_snapshot.byte_count if preview_snapshot is not None else 0
+            )
+            reserved_tokens = (
+                _RESERVED_OVERHEAD_TOKENS
+                + max(0, snapshot_bytes) // _RESERVED_BYTES_PER_TOKEN
+            )
             decision = self._usage_meter.reserve_autonomous_spend(
                 "codex",
-                input_tokens=_RESERVED_OVERHEAD_TOKENS,
+                input_tokens=reserved_tokens,
                 requests=1,
             )
             if not decision.allowed:
@@ -160,7 +171,7 @@ class CodexDistillExtractionWorker:
                     "Distill extraction deferred by usage budget: %s",
                     decision.reason(),
                 )
-                return await asyncio.to_thread(self._journal.get, job_id)
+                return preview
         claimed = await asyncio.to_thread(
             self._journal.claim_extraction,
             job_id,
@@ -169,6 +180,19 @@ class CodexDistillExtractionWorker:
             max_attempts=self._max_attempts,
         )
         if claimed is None:
+            if self._usage_meter is not None:
+                # The reserved attempt never started (already done, leased
+                # elsewhere, or exhausted): return the exact reservation so
+                # no-op invocations cannot drain the budget. A crash before
+                # this refund leaves the charge in place — conservative.
+                try:
+                    self._usage_meter.refund_autonomous_reservation(
+                        "codex",
+                        input_tokens=reserved_tokens,
+                        requests=1,
+                    )
+                except Exception:
+                    logger.exception("Usage reservation refund failed; keeping charge")
             return await asyncio.to_thread(self._journal.get, job_id)
         snapshot = claimed.snapshot
         if snapshot is None or snapshot.thread_hash != claimed.thread_hash:
@@ -185,18 +209,6 @@ class CodexDistillExtractionWorker:
                 error_code="distill_input_invalid",
                 terminal=True,
             )
-        if self._usage_meter is not None:
-            try:
-                # Size-dependent top-up: admission already charged the flat
-                # overhead; this completes the conservative per-attempt
-                # reservation once the claimed snapshot's size is known.
-                self._usage_meter.record(
-                    "codex",
-                    "autonomous",
-                    input_tokens=snapshot.byte_count // _RESERVED_BYTES_PER_TOKEN,
-                )
-            except Exception:
-                logger.exception("Autonomous usage metering failed; extraction continues")
         try:
             output = await self._backend.extract(extraction_input)
         except asyncio.CancelledError:
