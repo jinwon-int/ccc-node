@@ -264,9 +264,11 @@ Any unrecognized `/command` is also forwarded as a skill invocation.
 
 `/usage` uses Codex app-server read methods and already-observed token updates.
 For Claude it uses only existing Agent SDK result metadata plus an optional,
-sanitized status-line snapshot. Missing account windows or a fresh session are
-reported as `unavailable`; the command never launches a provider turn or reads
-transcript/credential files.
+sanitized status-line snapshot. Codex output omits the
+`GPT-5.3-Codex-Spark` bucket and account lifetime/daily history, suppresses
+empty context/session-token rows, and renders reset timestamps in KST. Claude
+continues to report missing data as `unavailable`. The command never launches
+a provider turn or reads transcript/credential files.
 
 ## Environment Variables
 

@@ -8,7 +8,7 @@ import os
 import stat
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from hashlib import sha256
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -19,6 +19,8 @@ MAX_SNAPSHOT_BYTES = 16 * 1024
 SNAPSHOT_TTL_SECONDS = 15 * 60
 MAX_TELEGRAM_USAGE_LENGTH = 3500
 MAX_TOKEN_COUNT = 10**12
+KST = timezone(timedelta(hours=9), name="KST")
+HIDDEN_CODEX_RATE_LIMIT_MARKERS = ("gpt-5.3-codex-spark",)
 
 
 @dataclass(frozen=True, slots=True)
@@ -431,7 +433,7 @@ def _format_reset(timestamp: float | None) -> str:
     if timestamp is None:
         return "reset unavailable"
     try:
-        value = datetime.fromtimestamp(timestamp).astimezone()
+        value = datetime.fromtimestamp(timestamp, tz=KST)
     except (OverflowError, OSError, ValueError):
         return "reset unavailable"
     return value.strftime("%Y-%m-%d %H:%M %Z")
@@ -446,9 +448,18 @@ def render_usage(snapshot: UsageSnapshot) -> str:
 
     title = "Codex" if snapshot.provider == "codex" else "Claude Code"
     lines = [f"📊 Usage · {title}", f"Plan: {snapshot.plan_type or 'unavailable'}"]
-    if snapshot.windows:
+    visible_windows = tuple(
+        window
+        for window in snapshot.windows
+        if snapshot.provider != "codex"
+        or not any(
+            marker in window.label.casefold()
+            for marker in HIDDEN_CODEX_RATE_LIMIT_MARKERS
+        )
+    )
+    if visible_windows:
         lines.append("Rate limits:")
-        for window in snapshot.windows[:MAX_WINDOWS]:
+        for window in visible_windows[:MAX_WINDOWS]:
             remaining = max(0.0, 100.0 - window.used_percent)
             duration = (
                 f" · {window.duration_minutes}m window"
@@ -459,7 +470,7 @@ def render_usage(snapshot: UsageSnapshot) -> str:
                 f"- {window.label}: {window.used_percent:g}% used / "
                 f"{remaining:g}% left{duration} · {_format_reset(window.resets_at)}"
             )
-    else:
+    elif not snapshot.windows:
         lines.append("Rate limits: unavailable")
 
     if snapshot.context_used is not None and snapshot.context_window:
@@ -470,23 +481,20 @@ def render_usage(snapshot: UsageSnapshot) -> str:
         )
     elif snapshot.context_used is not None:
         lines.append(f"Context: {_tokens(snapshot.context_used)} / unavailable")
-    else:
+    elif snapshot.provider != "codex":
         lines.append("Context: unavailable")
-    lines.append(
-        "Session tokens: "
-        f"input {_tokens(snapshot.input_tokens)} · output {_tokens(snapshot.output_tokens)} "
-        f"· total {_tokens(snapshot.total_tokens)}"
+    session_values = (
+        snapshot.input_tokens,
+        snapshot.output_tokens,
+        snapshot.total_tokens,
     )
-    if snapshot.provider == "codex":
-        lines.append(f"Account lifetime tokens: {_tokens(snapshot.lifetime_tokens)}")
-        if snapshot.daily_usage:
-            daily = ", ".join(
-                f"{item.date} {_tokens(item.tokens)}" for item in snapshot.daily_usage[:7]
-            )
-            lines.append(f"Daily: {daily}")
-        else:
-            lines.append("Daily: unavailable")
-    else:
+    if snapshot.provider != "codex" or any(value is not None for value in session_values):
+        lines.append(
+            "Session tokens: "
+            f"input {_tokens(snapshot.input_tokens)} · output {_tokens(snapshot.output_tokens)} "
+            f"· total {_tokens(snapshot.total_tokens)}"
+        )
+    if snapshot.provider != "codex":
         cost = (
             f"${snapshot.total_cost_usd:.4f}"
             if snapshot.total_cost_usd is not None

@@ -6,6 +6,7 @@ import json
 import os
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -14,6 +15,7 @@ import pytest
 from telegram_bot.core.project_chat import ProjectChatHandler
 from telegram_bot.core.usage import (
     MAX_TELEGRAM_USAGE_LENGTH,
+    DailyUsage,
     UsageSnapshot,
     UsageWindow,
     load_claude_status_snapshot,
@@ -324,13 +326,58 @@ def test_collector_prunes_expired_snapshots(tmp_path: Path) -> None:
 
 
 def test_renderer_marks_unavailable_and_is_telegram_bounded() -> None:
-    assert "Rate limits: unavailable" in render_usage(UsageSnapshot(provider="claude"))
+    claude = render_usage(UsageSnapshot(provider="claude"))
+    assert "Rate limits: unavailable" in claude
+    assert "Context: unavailable" in claude
+    assert "Session tokens: input unavailable" in claude
     huge = UsageSnapshot(
         provider="codex",
         windows=tuple(UsageWindow("x" * 80 + str(index), index % 100) for index in range(16)),
         daily_usage=(),
     )
     assert len(render_usage(huge)) <= MAX_TELEGRAM_USAGE_LENGTH
+
+
+def test_codex_renderer_hides_spark_account_history_and_empty_session_lines() -> None:
+    reset = datetime(2026, 7, 16, tzinfo=timezone.utc).timestamp()
+    rendered = render_usage(
+        UsageSnapshot(
+            provider="codex",
+            plan_type="plus",
+            windows=(
+                UsageWindow("GPT-5.3-Codex-Spark primary", 12, resets_at=reset),
+                UsageWindow("Five hour primary", 25, resets_at=reset),
+            ),
+            lifetime_tokens=2_861_652_645,
+            daily_usage=(DailyUsage("2026-02-06", 58_913_824),),
+        )
+    )
+
+    assert "GPT-5.3-Codex-Spark" not in rendered
+    assert "Five hour primary" in rendered
+    assert "2026-07-16 09:00 KST" in rendered
+    assert "Context:" not in rendered
+    assert "Session tokens:" not in rendered
+    assert "Account lifetime tokens:" not in rendered
+    assert "Daily:" not in rendered
+
+
+def test_codex_renderer_keeps_available_context_and_session_tokens() -> None:
+    rendered = render_usage(
+        UsageSnapshot(
+            provider="codex",
+            windows=(UsageWindow("GPT-5.3-Codex-Spark primary", 12),),
+            context_used=500,
+            context_window=2_000,
+            input_tokens=1_000,
+            output_tokens=200,
+            total_tokens=1_200,
+        )
+    )
+
+    assert "Rate limits:" not in rendered
+    assert "Context: 500 / 2,000 (25.0%)" in rendered
+    assert "Session tokens: input 1,000 · output 200 · total 1,200" in rendered
 
 
 @pytest.mark.anyio

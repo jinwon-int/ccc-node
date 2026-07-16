@@ -5,6 +5,9 @@ All notable changes to the Claude Code node harness. Dates are KST.
 ## [Unreleased]
 
 ### Changed
+- Codex `/usage` now hides the `GPT-5.3-Codex-Spark` rate-limit bucket and
+  account lifetime/daily token history, omits unavailable context/session rows,
+  and renders reset timestamps deterministically in KST (UTC+9).
 - Family Wiki log-writing guidance now allocates node/date-scoped
   `LOG-YYYYMMDD-<node>-<seq>` IDs under `[LOG-00]` instead of the collision-prone
   global `LOG-NNNN` max+1 scheme. The wiki skill, slash command, session
