@@ -3,8 +3,7 @@
 
 Run standalone: python3 scripts/agent_cron_lib_test.py
 These exercise the deterministic cron/retry math that previously lived inline in
-agent_cron.py (importable only by running the CLI) and so had only indirect,
-CLI-level coverage via agent-cron.test.sh.
+agent_cron.py and had only indirect CLI-level coverage via agent-cron.test.sh.
 """
 
 import os

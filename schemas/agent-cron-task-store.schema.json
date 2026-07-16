@@ -16,8 +16,8 @@
         "properties": {
           "id": { "type": "string", "pattern": "^[A-Za-z0-9_.-]{1,96}$" },
           "name": { "type": "string" },
-          "schedule": { "type": "string", "minLength": 1 },
-          "prompt": { "type": "string", "minLength": 1 },
+          "schedule": { "type": "string", "minLength": 1, "pattern": ".*\\S.*" },
+          "prompt": { "type": "string", "minLength": 1, "pattern": ".*\\S.*" },
           "enabled": { "type": "boolean" },
           "allowedTools": { "type": "array", "items": { "type": "string" }, "default": [] },
           "permissionMode": { "enum": ["default", "dontAsk", "acceptEdits"] },
@@ -62,6 +62,7 @@
           "retryState": {
             "type": ["object", "null"],
             "additionalProperties": false,
+            "required": ["scheduledAt", "attempt", "lastStatus"],
             "properties": {
               "scheduledAt": { "type": "string", "minLength": 1 },
               "attempt": { "type": "integer", "minimum": 1 },

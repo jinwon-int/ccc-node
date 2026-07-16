@@ -17,19 +17,19 @@ def _die(message, code=2):
     raise SystemExit(code)
 
 
-def _bootstrap_cli():
-    argv = list(_sys.argv[1:])
+def _bootstrap_cli(argv=None):
+    argv = list(_sys.argv[1:] if argv is None else argv)
     home = _Path(_os.environ.get('HOME', str(_Path.home()))).expanduser()
     store_value = _os.environ.get('CCC_AGENT_CRON_STORE') or str(home / '.claude' / 'state' / 'agent-cron' / 'tasks.json')
     cmd_value = argv.pop(0) if argv else 'list'
-    json_value = '0'
+    json_value = False
     at_value = ''
     extra = []
     i = 0
     while i < len(argv):
         arg = argv[i]
         if arg == '--json':
-            json_value = '1'
+            json_value = True
         elif arg == '--store':
             i += 1
             if i >= len(argv) or not argv[i]:
@@ -53,16 +53,14 @@ def _bootstrap_cli():
             _die(f'agent-cron {cmd_value} is not implemented in this read-only slice; no filesystem changes were made.', 2)
         _die(f'Unknown command: {cmd_value}', 2)
 
-    script_root = _Path(__file__).resolve().parents[1]
-    _os.environ['STORE'] = store_value
-    _os.environ['JSON'] = json_value
-    _os.environ['CMD'] = cmd_value
-    _os.environ['AT'] = at_value
-    _os.environ['SCRIPT_ROOT'] = str(script_root)
-    _os.environ['EXTRA_ARGS'] = ' '.join(_shlex.quote(x) for x in extra)
-
-
-_bootstrap_cli()
+    return {
+        'store': store_value,
+        'json': json_value,
+        'command': cmd_value,
+        'at': at_value,
+        'script_root': str(_Path(__file__).resolve().parents[1]),
+        'extra_args': ' '.join(_shlex.quote(x) for x in extra),
+    }
 
 import json
 import os
@@ -75,8 +73,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 # Pure schedule + retry helpers live in agent_cron_lib (no side effects, unit
-# tested directly). agent_cron.py runs a CLI bootstrap at import time so it can't
-# be imported by tests itself; the lib can.
+# tested directly). This composition root is also import-safe; only main()
+# parses arguments and dispatches commands.
 from agent_cron_lib import (  # noqa: E402
     OCCURRENCE_SCAN_LIMIT,
     parse_dt,
@@ -87,145 +85,30 @@ from agent_cron_lib import (  # noqa: E402
     next_occurrence,
     fmt_dt,
 )
+from agent_cron_schema import validate_store  # noqa: E402
+from agent_cron_model import normalize, task_by_id  # noqa: E402
+from agent_cron_repository import (  # noqa: E402
+    load_doc as load_store,
+    write_doc as write_store,
+)
 
-store = Path(os.environ['STORE']).expanduser()
-json_out = os.environ.get('JSON') == '1'
-cmd = os.environ['CMD']
-at_raw = os.environ.get('AT') or ''
-
-ALLOWED_NOTIFY = {'none', 'telegram-owner'}
-ALLOWED_PERMISSION = {'dontAsk', 'acceptEdits', 'default', None}
-ALLOWED_CATCH_UP = {'skip', 'once', 'all', None}
-ID_RX = re.compile(r'^[A-Za-z0-9_.-]{1,96}$')
-
-
-def empty_doc():
-    return {'version': 1, 'tasks': []}
+script_root = Path(__file__).resolve().parents[1]
+store = Path(
+    os.environ.get('CCC_AGENT_CRON_STORE')
+    or Path.home() / '.claude' / 'state' / 'agent-cron' / 'tasks.json'
+).expanduser()
+json_out = False
+cmd = 'list'
+at_raw = ''
+extra_args = ''
 
 
 def load_doc():
-    if not store.exists():
-        return empty_doc(), []
-    try:
-        data = json.loads(store.read_text(encoding='utf-8'))
-    except Exception as e:
-        return None, [f'invalid JSON store: {e}']
-    return data, validate_doc(data)
+    return load_store(store)
 
 
-def validate_doc(data):  # noqa: C901 -- #348 baseline hotspot
-    errors = []
-    if not isinstance(data, dict):
-        return ['store must be a JSON object']
-    if data.get('version') != 1:
-        errors.append('version must be 1')
-    tasks = data.get('tasks')
-    if not isinstance(tasks, list):
-        errors.append('tasks must be an array')
-        return errors
-    seen = set()
-    for idx, task in enumerate(tasks):
-        prefix = f'tasks[{idx}]'
-        if not isinstance(task, dict):
-            errors.append(f'{prefix} must be an object')
-            continue
-        tid = task.get('id')
-        if not isinstance(tid, str) or not ID_RX.match(tid):
-            errors.append(f'{prefix}.id must match {ID_RX.pattern}')
-        elif tid in seen:
-            errors.append(f'duplicate task id: {tid}')
-        else:
-            seen.add(tid)
-        schedule = task.get('schedule')
-        if not isinstance(schedule, str) or not schedule.strip():
-            errors.append(f'{prefix}.schedule is required')
-        prompt = task.get('prompt')
-        if not isinstance(prompt, str) or not prompt.strip():
-            errors.append(f'{prefix}.prompt is required')
-        if not isinstance(task.get('enabled'), bool):
-            errors.append(f'{prefix}.enabled must be boolean')
-        notify = task.get('notify', 'none')
-        if notify not in ALLOWED_NOTIFY:
-            errors.append(f'{prefix}.notify must be one of {sorted(ALLOWED_NOTIFY)}')
-        perm = task.get('permissionMode')
-        if perm not in ALLOWED_PERMISSION:
-            errors.append(f'{prefix}.permissionMode unsupported: {perm}')
-        allowed = task.get('allowedTools', [])
-        if not isinstance(allowed, list) or any(not isinstance(x, str) for x in allowed):
-            errors.append(f'{prefix}.allowedTools must be an array of strings')
-        for field in ('attachMemory', 'attachSkills'):
-            val = task.get(field, [])
-            if not isinstance(val, list) or any(not isinstance(x, str) for x in val):
-                errors.append(f'{prefix}.{field} must be an array of strings')
-        catch_up = task.get('catchUpPolicy')
-        if catch_up not in ALLOWED_CATCH_UP:
-            errors.append(f'{prefix}.catchUpPolicy must be one of skip, once, all')
-        max_catch_up = task.get('maxCatchup', 1)
-        if not isinstance(max_catch_up, int) or max_catch_up < 1 or max_catch_up > 100:
-            errors.append(f'{prefix}.maxCatchup must be an integer from 1 to 100')
-        lock_timeout = task.get('lockTimeoutSec', 0)
-        if not isinstance(lock_timeout, int) or lock_timeout < 0 or lock_timeout > 86400:
-            errors.append(f'{prefix}.lockTimeoutSec must be an integer from 0 to 86400')
-        max_run_history = task.get('maxRunHistory', 20)
-        if not isinstance(max_run_history, int) or max_run_history < 1 or max_run_history > 500:
-            errors.append(f'{prefix}.maxRunHistory must be an integer from 1 to 500')
-        run_history = task.get('runHistory', [])
-        if not isinstance(run_history, list):
-            errors.append(f'{prefix}.runHistory must be an array')
-        else:
-            for hidx, item in enumerate(run_history):
-                hp = f'{prefix}.runHistory[{hidx}]'
-                if not isinstance(item, dict):
-                    errors.append(f'{hp} must be an object')
-                    continue
-                for field in ('runId', 'scheduledAt', 'startedAt', 'status'):
-                    if not isinstance(item.get(field), str) or not item.get(field):
-                        errors.append(f'{hp}.{field} must be a non-empty string')
-                if 'finishedAt' in item and item['finishedAt'] is not None and not isinstance(item['finishedAt'], str):
-                    errors.append(f'{hp}.finishedAt must be string or null')
-                if 'exitCode' in item and item['exitCode'] is not None and not isinstance(item['exitCode'], int):
-                    errors.append(f'{hp}.exitCode must be integer or null')
-                if not isinstance(item.get('attempt', 1), int) or item.get('attempt', 1) < 1:
-                    errors.append(f'{hp}.attempt must be a positive integer')
-                if not isinstance(item.get('notifyState', 'none'), str):
-                    errors.append(f'{hp}.notifyState must be a string')
-        timezone_name = task.get('timezone', 'UTC')
-        if timezone_name != 'UTC':
-            errors.append(f'{prefix}.timezone currently supports UTC only')
-        for field in ('lastRunAt', 'lastStatus', 'lastRunId'):
-            if field in task and task[field] is not None and not isinstance(task[field], str):
-                errors.append(f'{prefix}.{field} must be string or null')
-        retry_policy = task.get('retryPolicy')
-        if retry_policy is not None:
-            if not isinstance(retry_policy, dict):
-                errors.append(f'{prefix}.retryPolicy must be an object')
-            else:
-                for field, default, low, high in (
-                    ('maxAttempts', 1, 1, 10),
-                    ('backoffSec', 60, 0, 86400),
-                    ('backoffMultiplier', 2, 1, 10),
-                    ('maxBackoffSec', 3600, 0, 86400),
-                ):
-                    value = retry_policy.get(field, default)
-                    if not isinstance(value, int) or value < low or value > high:
-                        errors.append(f'{prefix}.retryPolicy.{field} must be an integer from {low} to {high}')
-        retry_state = task.get('retryState')
-        if retry_state is not None:
-            if not isinstance(retry_state, dict):
-                errors.append(f'{prefix}.retryState must be an object')
-            else:
-                for field in ('scheduledAt', 'lastStatus'):
-                    if not isinstance(retry_state.get(field), str) or not retry_state.get(field):
-                        errors.append(f'{prefix}.retryState.{field} must be a non-empty string')
-                if not isinstance(retry_state.get('attempt'), int) or retry_state.get('attempt') < 1:
-                    errors.append(f'{prefix}.retryState.attempt must be a positive integer')
-                if 'retryEligibleAt' in retry_state and retry_state['retryEligibleAt'] is not None and not isinstance(retry_state['retryEligibleAt'], str):
-                    errors.append(f'{prefix}.retryState.retryEligibleAt must be string or null')
-                if 'lastRunId' in retry_state and retry_state['lastRunId'] is not None and not isinstance(retry_state['lastRunId'], str):
-                    errors.append(f'{prefix}.retryState.lastRunId must be string or null')
-        if 'redactProfile' in task and task['redactProfile'] is not None and not isinstance(task['redactProfile'], str):
-            errors.append(f'{prefix}.redactProfile must be string or null')
-    return errors
+def validate_doc(data):
+    return validate_store(data)
 
 
 def lock_path(task_id):
@@ -238,13 +121,6 @@ def boot_id():
         return Path('/proc/sys/kernel/random/boot_id').read_text(encoding='utf-8').strip()
     except OSError:
         return ''
-
-
-def task_by_id(data, task_id):
-    for task in data.get('tasks', []):
-        if task.get('id') == task_id:
-            return task
-    return None
 
 
 def read_lock(task_id):
@@ -299,7 +175,7 @@ def write_lock(path, payload):
 
 
 def parse_lock_args():
-    args = shlex.split(os.environ.get('EXTRA_ARGS', ''))
+    args = shlex.split(extra_args)
     if not args:
         raise ValueError('lock requires a task id')
     task_id = args[0]
@@ -402,36 +278,6 @@ def lock_command(data):
         return {'ok': False, 'taskId': None, 'lockState': 'error', 'error': str(e)}, json_out, 1
 
 
-def normalize(data):
-    out = {'version': 1, 'tasks': []}
-    for t in data.get('tasks', []):
-        out['tasks'].append({
-            'id': t.get('id'),
-            'name': t.get('name') or t.get('id'),
-            'schedule': t.get('schedule'),
-            'enabled': bool(t.get('enabled')),
-            'notify': t.get('notify', 'none'),
-            'allowedTools': t.get('allowedTools', []),
-            'permissionMode': t.get('permissionMode') or 'default',
-            'attachMemory': t.get('attachMemory', []),
-            'attachSkills': t.get('attachSkills', []),
-            'timezone': t.get('timezone', 'UTC'),
-            'catchUpPolicy': t.get('catchUpPolicy', 'skip'),
-            'maxCatchup': t.get('maxCatchup', 1),
-            'lockTimeoutSec': t.get('lockTimeoutSec', 0),
-            'maxRunHistory': t.get('maxRunHistory', 20),
-            'redactProfile': t.get('redactProfile', 'default'),
-            'lastRunAt': t.get('lastRunAt'),
-            'lastStatus': t.get('lastStatus'),
-            'lastRunId': t.get('lastRunId'),
-            'runHistoryCount': len(t.get('runHistory', [])) if isinstance(t.get('runHistory', []), list) else 0,
-            'retryPolicy': t.get('retryPolicy'),
-            'retryState': t.get('retryState'),
-        })
-    out['tasks'].sort(key=lambda x: x['id'] or '')
-    return out
-
-
 def due_plan(data):  # noqa: C901 -- #348 baseline hotspot
     try:
         at = parse_dt(at_raw, '--at') if at_raw else datetime.now(timezone.utc).replace(second=0, microsecond=0)
@@ -528,7 +374,7 @@ def due_plan(data):  # noqa: C901 -- #348 baseline hotspot
 
 
 def parse_scheduler_args():
-    args = shlex.split(os.environ.get('EXTRA_ARGS', ''))
+    args = shlex.split(extra_args)
     dry_run = False
     execute = False
     at_value = at_raw
@@ -775,7 +621,7 @@ def emit_scheduler(result, as_json):
                 print(f"| `{a.get('taskId')}` | `{a.get('action')}` | `{a.get('reason')}` | `{a.get('scheduledAt') or ''}` | `{a.get('lockState')}` |")
 
 def parse_run_args():
-    args = shlex.split(os.environ.get('EXTRA_ARGS', ''))
+    args = shlex.split(extra_args)
     if not args:
         raise ValueError('run requires a task id')
     task_id = args[0]
@@ -857,7 +703,7 @@ def run_dry_plan(data):
 
 
 def headless_metadata(task, execute):
-    headless_cmd = os.environ.get('CCC_HEADLESS_CMD') or str(Path(os.environ.get('SCRIPT_ROOT', '.')) / 'claude' / 'headless.sh')
+    headless_cmd = os.environ.get('CCC_HEADLESS_CMD') or str(script_root / 'claude' / 'headless.sh')
     return {
         'command': headless_cmd,
         'promptBytes': len((task.get('prompt') or '').encode('utf-8')),
@@ -881,14 +727,7 @@ def mutation_flags(lock_acquire, task_write, headless_execute, push_spool_write=
 
 
 def write_doc(data):
-    store.parent.mkdir(parents=True, exist_ok=True)
-    tmp = store.with_name(f'.{store.name}.tmp.{os.getpid()}')
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2, sort_keys=False) + '\n', encoding='utf-8')
-    try:
-        os.chmod(tmp, 0o600)
-    except OSError:
-        pass
-    tmp.replace(store)
+    write_store(store, data)
 
 
 def history_attempt(task, scheduled_at):
@@ -1189,74 +1028,93 @@ def emit_run(result, as_json):
         print(f"- mutations: `{json.dumps(result.get('mutations', {}), ensure_ascii=False, sort_keys=True)}`")
 
 
-data, errors = load_doc()
-if errors:
-    for e in errors:
-        print(f'agent-cron: {e}', file=sys.stderr)
-    sys.exit(1)
-
-if cmd == 'lock':
-    result, as_json, rc = lock_command(data)
-    emit_lock(result, as_json)
-    sys.exit(rc)
-
-if cmd == 'scheduler':
-    result, as_json, rc = scheduler_plan(data)
-    emit_scheduler(result, as_json)
-    sys.exit(rc)
-
-if cmd == 'run':
-    result, as_json, rc = run_dry_plan(data)
-    emit_run(result, as_json)
-    sys.exit(rc)
-
-if cmd == 'status':
-    result = agent_cron_status(data)
-    emit_status(result, json_out)
-    sys.exit(0 if result.get('ok') else 1)
-
-if cmd == 'validate':
-    if json_out:
-        print(json.dumps({'ok': True, 'store': str(store), 'tasks': len(data.get('tasks', []))}, ensure_ascii=False, indent=2))
-    else:
-        print(f'agent-cron store OK: {store} ({len(data.get("tasks", []))} task(s))')
-    sys.exit(0)
-
-if cmd == 'due':
-    plan = due_plan(data)
-    if json_out:
+def emit_due(plan, as_json):
+    if as_json:
         print(json.dumps(plan, ensure_ascii=False, indent=2))
+        return
+    print('# agent-cron due plan\n')
+    print(f"- store: `{plan['store']}`")
+    print(f"- at: `{plan['at']}`")
+    print('- mode: dry-run/read-only; no execution, push, scheduler, systemd, crontab, or state writes\n')
+    if not plan['tasks']:
+        print('No agent-cron tasks are defined.')
     else:
-        print('# agent-cron due plan\n')
-        print(f"- store: `{plan['store']}`")
-        print(f"- at: `{plan['at']}`")
-        print('- mode: dry-run/read-only; no execution, push, scheduler, systemd, crontab, or state writes\n')
-        if not plan['tasks']:
-            print('No agent-cron tasks are defined.')
+        print('| id | status | schedule | due | due count | missed | scheduled at | next due | lock |')
+        print('|---|---|---|---:|---:|---:|---|---|---|')
+        for task in plan['tasks']:
+            print(f"| `{task['id']}` | `{task['status']}` | `{task['schedule']}` | {str(task['due']).lower()} | {task['dueCount']} | {task['missedRuns']} | `{task['scheduledAt'] or ''}` | `{task['nextDueAt'] or ''}` | `{task['lockState']}` |")
+    if plan['errors']:
+        print('\n## Errors')
+        for error in plan['errors']:
+            print(f'- {error}')
+
+
+def emit_list(data, as_json):
+    norm = normalize(data)
+    if as_json:
+        print(json.dumps(norm, ensure_ascii=False, indent=2))
+        return
+    print('# agent-cron tasks\n')
+    print(f'- store: `{store}`')
+    print('- mode: store/list/due only; no execution, push, scheduler, systemd, crontab, or state writes\n')
+    if not norm['tasks']:
+        print('No agent-cron tasks are defined.')
+        return
+    print('| id | schedule | enabled | notify | catch-up | tools | last status |')
+    print('|---|---|---:|---|---|---|---|')
+    for task in norm['tasks']:
+        tools = ','.join(task['allowedTools']) if task['allowedTools'] else '(default)'
+        print(f"| `{task['id']}` | `{task['schedule']}` | {str(task['enabled']).lower()} | `{task['notify']}` | `{task['catchUpPolicy']}` | `{tools}` | `{task.get('lastStatus') or 'unknown'}` |")
+
+
+def _dispatch(data):
+    if cmd == 'lock':
+        result, as_json, rc = lock_command(data)
+        emit_lock(result, as_json)
+        return rc
+    if cmd == 'scheduler':
+        result, as_json, rc = scheduler_plan(data)
+        emit_scheduler(result, as_json)
+        return rc
+    if cmd == 'run':
+        result, as_json, rc = run_dry_plan(data)
+        emit_run(result, as_json)
+        return rc
+    if cmd == 'status':
+        result = agent_cron_status(data)
+        emit_status(result, json_out)
+        return 0 if result.get('ok') else 1
+    if cmd == 'validate':
+        if json_out:
+            print(json.dumps({'ok': True, 'store': str(store), 'tasks': len(data.get('tasks', []))}, ensure_ascii=False, indent=2))
         else:
-            print('| id | status | schedule | due | due count | missed | scheduled at | next due | lock |')
-            print('|---|---|---|---:|---:|---:|---|---|---|')
-            for t in plan['tasks']:
-                print(f"| `{t['id']}` | `{t['status']}` | `{t['schedule']}` | {str(t['due']).lower()} | {t['dueCount']} | {t['missedRuns']} | `{t['scheduledAt'] or ''}` | `{t['nextDueAt'] or ''}` | `{t['lockState']}` |")
-        if plan['errors']:
-            print('\n## Errors')
-            for e in plan['errors']:
-                print(f'- {e}')
-    sys.exit(0 if plan['ok'] else 1)
+            print(f'agent-cron store OK: {store} ({len(data.get("tasks", []))} task(s))')
+        return 0
+    if cmd == 'due':
+        plan = due_plan(data)
+        emit_due(plan, json_out)
+        return 0 if plan['ok'] else 1
+    emit_list(data, json_out)
+    return 0
 
-norm = normalize(data)
-if json_out:
-    print(json.dumps(norm, ensure_ascii=False, indent=2))
-    sys.exit(0)
 
-print('# agent-cron tasks\n')
-print(f'- store: `{store}`')
-print('- mode: store/list/due only; no execution, push, scheduler, systemd, crontab, or state writes\n')
-if not norm['tasks']:
-    print('No agent-cron tasks are defined.')
-    sys.exit(0)
-print('| id | schedule | enabled | notify | catch-up | tools | last status |')
-print('|---|---|---:|---|---|---|---|')
-for t in norm['tasks']:
-    tools = ','.join(t['allowedTools']) if t['allowedTools'] else '(default)'
-    print(f"| `{t['id']}` | `{t['schedule']}` | {str(t['enabled']).lower()} | `{t['notify']}` | `{t['catchUpPolicy']}` | `{tools}` | `{t.get('lastStatus') or 'unknown'}` |")
+def main(argv=None):
+    global at_raw, cmd, extra_args, json_out, script_root, store
+    config = _bootstrap_cli(argv)
+    store = Path(config['store']).expanduser()
+    json_out = bool(config['json'])
+    cmd = config['command']
+    at_raw = config['at']
+    script_root = Path(config['script_root'])
+    extra_args = config['extra_args']
+
+    data, errors = load_doc()
+    if errors:
+        for error in errors:
+            print(f'agent-cron: {error}', file=sys.stderr)
+        return 1
+    return _dispatch(data)
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

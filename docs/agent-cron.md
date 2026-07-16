@@ -15,6 +15,23 @@
 
 Read-only/status modes never acquire locks, execute prompts, write bridge spools, install timers, edit crontab/systemd, send Telegram, call providers, or touch remotes. Execution mode may write task history and owner-only redacted spool entries, but still does not install timers or call Telegram/provider APIs directly.
 
+## Source boundaries
+
+- `schemas/agent-cron-task-store.schema.json` is the structural source of truth.
+- `scripts/agent_cron_schema.py` applies the schema fail-closed without an optional
+  system Python dependency; duplicate task IDs are the only store-level semantic
+  rule layered on top.
+- `scripts/agent_cron_model.py` owns pure task lookup and prompt-free list projections.
+- `scripts/agent_cron_repository.py` owns validated load and private atomic writes.
+- `scripts/agent_cron_lib.py` owns pure schedule and retry calculations.
+- `scripts/agent_cron.py` is an import-safe CLI composition root. Dispatch only runs
+  through `main()`; importing it does not parse commands, print, or mutate the
+  filesystem or process environment.
+
+Planning functions remain read-only and produce explicit mutation metadata. The
+runner applies locks, headless execution, history, retry state, and spool writes only
+after an explicit `run` or `scheduler --execute` dispatch.
+
 ## Fleet closeout pattern
 
 For fleet operations, collect each node's `status --json` output into evidence blocks and summarize only metadata: node, task id, `lastStatus`, `retryEligibleAt`, retry exhaustion, lock state, and safe error class. Do not collect prompts, memory contents, raw env, tokens, chat IDs, or provider output.

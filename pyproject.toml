@@ -38,6 +38,9 @@ files = [
   "bridge/tests/test_codex_app_server.py",
   "bridge/tests/test_codex_runtime.py",
   "scripts/agent_cron_lib.py",
+  "scripts/agent_cron_schema.py",
+  "scripts/agent_cron_model.py",
+  "scripts/agent_cron_repository.py",
 ]
 
 # Baseline exception (issue #348): the TelegramBot mixin modules reference

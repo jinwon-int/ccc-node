@@ -11,7 +11,7 @@ this file records the *why* and the measured context.
 | --- | --- | --- |
 | Branch coverage floor | `fail_under = 72` | `bridge/pyproject.toml` `[tool.coverage.report]`, applied to the CI `--cov` run in `bridge-tests` |
 | Cyclomatic complexity | `C901`, `max-complexity = 15` | root `pyproject.toml` ruff config, `python-lint` job |
-| Type checking | all of `bridge/core` (34 modules) + contract tests + `scripts/agent_cron_lib.py` | root `pyproject.toml` `[tool.mypy]`, `python-lint` job |
+| Type checking | all of `bridge/core` + contract tests + agent-cron schedule/schema/model/repository modules | root `pyproject.toml` `[tool.mypy]`, `python-lint` job |
 
 ## Coverage
 
@@ -54,12 +54,12 @@ review. Refactors should remove markers over time; never add one to new code.
 `project_chat_reader.py::_reader_loop` (37),
 `streaming.py::finalize_draft` (16), `utils/tg_readable.py::_transform` (23),
 `scripts/a2a_termux_native_worker.py::validate_env` (18),
-`scripts/agent_cron.py::due_plan` (18), `scripts/agent_cron.py::validate_doc` (44),
+`scripts/agent_cron.py::due_plan` (18),
 `scripts/ccc_doctor.py::diagnose` (22), `scripts/ccc_doctor.py::main` (16).
 
 ## Mypy scope
 
-All 34 `bridge/core` modules are checked. The `TelegramBot` mixin modules
+All `bridge/core` modules and the typed agent-cron domain modules are checked. The `TelegramBot` mixin modules
 (`bot_access`, `bot_commands`, `bot_delivery`, `bot_lifecycle`, `bot_status`,
 `bot_voice`, `project_chat_history`) reference attributes provided by the
 composing class, which mypy cannot see until the typed-composition/AppContext
