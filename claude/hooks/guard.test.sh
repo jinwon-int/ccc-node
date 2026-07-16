@@ -51,6 +51,8 @@ run allow Bash command 'systemctl status some-service'
 run allow Bash command 'systemctl restart ccc-telegram-bridge.service'
 run allow Bash command 'systemctl restart ccc-telegram-bridge'
 run allow Bash command 'ssh nosuk systemctl restart ccc-telegram-bridge.service'
+run allow Bash command 'ssh nosuk "echo before; systemctl restart ccc-telegram-bridge.service; sleep 4; systemctl is-active ccc-telegram-bridge.service; systemctl show ccc-telegram-bridge.service --property=MainPID"'
+run allow Bash command "restart_peer() { local host=\$1; ssh \"\$host\" 'echo before; systemctl restart ccc-telegram-bridge.service; sleep 4; systemctl is-active ccc-telegram-bridge.service'; }; restart_peer nosuk"
 run allow Bash command 'find . -name "*.ts"'
 run allow Bash command 'grep -r token src/'
 run allow Read command-not-used ''
@@ -103,6 +105,8 @@ run allow Bash command 'ssh nosuk systemctl restart a2a-hermes-worker'
 # ...but non-fleet units, config verbs, host lifecycle, and containers stay gated.
 run deny Bash command 'systemctl restart nginx'
 run deny Bash command 'systemctl restart a2a-broker nginx'
+run deny Bash command 'ssh nosuk "systemctl restart ccc-telegram-bridge.service; systemctl restart nginx"'
+run deny Bash command 'ssh nosuk "systemctl restart ccc-telegram-bridge.service; systemctl daemon-reload"'
 run deny Bash command 'restart-worker'
 run deny Bash command 'stop-broker'
 # reboot-class (recoverable) is autonomous on the LOCAL node...
