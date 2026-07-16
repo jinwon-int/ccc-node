@@ -205,9 +205,12 @@ class ProjectChatReaderMixin:
                 req.last_event_at = now
                 # Spend boundary (#388): the first SDK event proves this
                 # attempt reached the provider, so one request is metered
-                # here — surviving reader crashes and cancellations — and
-                # ResultMessage later records tokens only (no double charge).
+                # here — surviving reader crashes and cancellations. Frames
+                # carrying usage meter their positive delta immediately, so
+                # a lost terminal result keeps the observed tokens and the
+                # ResultMessage reconciles the remainder without doubling.
                 self.record_claude_attempt(req)
+                self.record_claude_observed_usage(req, msg)
                 if (
                     req.typing_callback
                     and not isinstance(msg, ResultMessage)

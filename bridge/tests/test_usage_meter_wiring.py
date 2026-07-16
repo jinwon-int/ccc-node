@@ -798,3 +798,60 @@ class RetryableFailureLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(
             journal.get(job.job_id).status, DistillJobStatus.EXTRACTION_DONE
         )
+
+
+class ClaudeTerminalLossTokenTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+
+    async def test_tokens_survive_a_lost_terminal_and_reconcile_without_doubling(
+        self,
+    ) -> None:
+        # Reviewer probe: an accepted query yields an AssistantMessage with
+        # 100/20 usage, then the reader dies — the tokens must already be
+        # persisted. A later ResultMessage reconciles only the remainder.
+        handler = ProjectChatHandler(settings=_settings(self.root))
+        request = SimpleNamespace(user_id=7, chat_id=9)
+        handler.record_claude_attempt(request)
+        assistant = SimpleNamespace(
+            usage={"input_tokens": 100, "output_tokens": 20},
+            model_usage={},
+            total_cost_usd=None,
+        )
+        handler.record_claude_observed_usage(request, assistant)
+
+        day_buckets = next(iter(_meter_state(self.root)["days"].values()))
+        self.assertEqual(
+            day_buckets["claude"]["interactive"],
+            {"input_tokens": 100, "output_tokens": 20, "requests": 1},
+        )
+
+        # Same-usage terminal: no double charge.
+        result = SimpleNamespace(
+            session_id="session-1",
+            usage={"input_tokens": 100, "output_tokens": 20},
+            model_usage={},
+            total_cost_usd=None,
+        )
+        handler._record_claude_usage(request, result)
+        day_buckets = next(iter(_meter_state(self.root)["days"].values()))
+        self.assertEqual(
+            day_buckets["claude"]["interactive"],
+            {"input_tokens": 100, "output_tokens": 20, "requests": 1},
+        )
+
+        # A larger terminal reconciles only the remainder.
+        bigger = SimpleNamespace(
+            session_id="session-1",
+            usage={"input_tokens": 120, "output_tokens": 25},
+            model_usage={},
+            total_cost_usd=None,
+        )
+        handler._record_claude_usage(request, bigger)
+        day_buckets = next(iter(_meter_state(self.root)["days"].values()))
+        self.assertEqual(
+            day_buckets["claude"]["interactive"],
+            {"input_tokens": 120, "output_tokens": 25, "requests": 1},
+        )

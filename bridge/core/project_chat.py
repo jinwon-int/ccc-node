@@ -353,6 +353,49 @@ class ProjectChatHandler(
         except Exception:
             logger.exception("Claude request metering failed; turn continues")
 
+    def record_claude_observed_usage(self, req: Any, message: Any) -> None:
+        """Idempotently meter validated observed usage for one request.
+
+        Any SDK frame that carries usage (an AssistantMessage mid-turn or the
+        terminal ResultMessage) is treated as a cumulative observation: only
+        the positive delta beyond this request's high-water marker is
+        recorded, so a reader crash after an AssistantMessage keeps the
+        observed tokens while a later ResultMessage reconciles the remainder
+        without double charging. context_used is the complete validated
+        input total (raw plus cache-creation/read tokens).
+        """
+
+        if self._usage_meter is None:
+            return
+        snapshot = parse_claude_result(message, observed_at=self._clock.time())
+        input_total = snapshot.context_used
+        if input_total is None:
+            input_total = snapshot.input_tokens or 0
+        output_total = snapshot.output_tokens or 0
+        previous_input, previous_output = getattr(
+            req, "usage_tokens_recorded", (0, 0)
+        )
+        delta_input = max(0, input_total - previous_input)
+        delta_output = max(0, output_total - previous_output)
+        if not delta_input and not delta_output:
+            return
+        try:
+            req.usage_tokens_recorded = (
+                max(previous_input, input_total),
+                max(previous_output, output_total),
+            )
+        except Exception:
+            return
+        try:
+            self._usage_meter.record(
+                "claude",
+                MODE_INTERACTIVE,
+                input_tokens=delta_input,
+                output_tokens=delta_output,
+            )
+        except Exception:
+            logger.exception("Claude usage metering failed; turn continues")
+
     def record_agent_turn_request(self) -> None:
         """Count one completed interactive agent-runtime turn, fail-open."""
 
@@ -408,22 +451,7 @@ class ProjectChatHandler(
         snapshot = parse_claude_result(msg, observed_at=self._clock.time())
         self._claude_usage[key] = snapshot
         self._claude_usage = dict(tuple(self._claude_usage.items())[-128:])
-        if self._usage_meter is not None:
-            # context_used is the complete validated input total (raw input
-            # plus cache-creation and cache-read tokens); plain input_tokens
-            # alone would under-count cached turns by orders of magnitude.
-            input_total = snapshot.context_used
-            if input_total is None:
-                input_total = snapshot.input_tokens or 0
-            try:
-                self._usage_meter.record(
-                    "claude",
-                    MODE_INTERACTIVE,
-                    input_tokens=input_total,
-                    output_tokens=snapshot.output_tokens or 0,
-                )
-            except Exception:
-                logger.exception("Claude usage metering failed; turn continues")
+        self.record_claude_observed_usage(req, msg)
 
     def _record_claude_rate_limit(self, msg: RateLimitEvent) -> None:
         parsed = parse_claude_rate_limit_event(msg, observed_at=self._clock.time())
