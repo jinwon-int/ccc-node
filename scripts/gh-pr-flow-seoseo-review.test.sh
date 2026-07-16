@@ -27,15 +27,14 @@ EOF
   cat >"$TMP/bin/gh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-if [ "$1 $2 $3 $4" = "auth token --user jinon86" ]; then
-  printf '%s\n' 'FAKE_TEST_TOKEN_DO_NOT_USE'
+printf '%s\n' "$*" >>"$MOCK_GH_LOG"
+if [ "$1 $2" = "api user" ]; then
+  printf '%s\n' "${MOCK_ACTOR:-jinon86}"
 elif [ "$1 $2" = "pr view" ] && [[ " $* " == *" author,baseRefName,state,reviewRequests "* ]]; then
   printf '%s\tmain\tOPEN\t%s\n' "${MOCK_AUTHOR:-seoseo-ai}" "${MOCK_REQUESTED:-true}"
 elif [ "$1 $2" = "pr review" ]; then
-  [ "${GH_TOKEN:-}" = "FAKE_TEST_TOKEN_DO_NOT_USE" ] || exit 91
   : >"$MOCK_REVIEW_MARKER"
 elif [ "$1 $2" = "pr view" ] && [[ " $* " == *" reviewDecision,reviews "* ]]; then
-  [ "${GH_TOKEN:-}" = "FAKE_TEST_TOKEN_DO_NOT_USE" ] || exit 91
   printf '%s\n' '{"reviewDecision":"APPROVED","reviews":[{"author":"jinon86","state":"APPROVED"}]}'
 else
   printf 'unexpected gh call: %s\n' "$*" >&2
@@ -49,6 +48,7 @@ apply_mock_files
 export PATH="$TMP/bin:$PATH"
 export MOCK_SSH_MARKER="$TMP/ssh.called"
 export MOCK_REVIEW_MARKER="$TMP/review.called"
+export MOCK_GH_LOG="$TMP/gh.calls"
 
 if "$HELPER" jinwon-int/ccc-node 535 >"$TMP/no-approval.out" 2>&1; then
   bad "helper accepted a call without fresh explicit approval"
@@ -72,8 +72,18 @@ if CCC_EXPLICIT_USER_APPROVAL=1 "$HELPER" jinwon-int/ccc-node 535 >"$TMP/success
 else
   bad "approved review path failed"
 fi
-if grep -Fq 'FAKE_TEST_TOKEN_DO_NOT_USE' "$TMP/success.out"; then
-  bad "helper leaked the credential value to output"
+if grep -Fq 'auth token' "$MOCK_GH_LOG"; then
+  bad "helper extracted the remote credential"
+else
+  ok
+fi
+
+rm -f "$MOCK_REVIEW_MARKER"
+if MOCK_ACTOR=seoseo-ai CCC_EXPLICIT_USER_APPROVAL=1 \
+   "$HELPER" jinwon-int/ccc-node 535 >"$TMP/wrong-actor.out" 2>&1; then
+  bad "helper accepted a remote actor other than jinon86"
+elif [ -e "$MOCK_REVIEW_MARKER" ]; then
+  bad "helper submitted a review before refusing the wrong actor"
 else
   ok
 fi

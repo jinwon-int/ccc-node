@@ -1,6 +1,6 @@
 ---
 name: gh-pr-flow
-description: Ship code through the PR-first GitHub flow on this node, including protected merges that need the Seoseo-held jinon86 reviewer credential after fresh explicit user approval. Use when committing or pushing code, opening or merging a PR, resolving REVIEW_REQUIRED, or landing a change in jinwon-int repos. Enforces no direct main pushes, green checks, independent review, secret-safe credential handling, squash merge, and verified branch cleanup. Not for Wiki edits (use wiki-record).
+description: Ship code through the PR-first GitHub flow on this node, including protected PRs that need a Seoseo-held jinon86 review or merge after fresh explicit user approval. Use when committing or pushing code, opening or merging a PR, resolving REVIEW_REQUIRED, or landing changes in jinwon-int repos. Enforces no direct main pushes, exact-head and green-check validation, independent review, secret-safe remote credential use, squash merge, and verified cleanup. Not for Wiki edits (use wiki-record).
 ---
 
 # gh-pr-flow — PR-first GitHub flow
@@ -33,7 +33,7 @@ The normal local `gh` identity is `seoseo-ai`. For Wiki content use
    EOF
    ```
 
-3. Push the branch and open a PR against `main`:
+3. Push and open a PR against `main`:
 
    ```bash
    git push -u origin <branch>
@@ -41,41 +41,42 @@ The normal local `gh` identity is `seoseo-ai`. For Wiki content use
      --title "<type>(<scope>): <summary>" --body "<what / why / evidence>"
    ```
 
-4. Inspect the author, requested reviewers, decision, checks, and merge state:
+4. Inspect identity, review, exact head, checks, and merge state:
 
    ```bash
    gh pr view <n> --repo <owner/repo> \
-     --json author,reviewRequests,reviewDecision,mergeable,mergeStateStatus,statusCheckRollup
+     --json author,reviewRequests,reviewDecision,headRefOid,isDraft,mergeable,mergeStateStatus,statusCheckRollup
    ```
 
-5. If checks are green and the PR is mergeable, squash-merge normally:
-
-   ```bash
-   gh pr merge <n> --repo <owner/repo> --squash --delete-branch
-   ```
-
-6. If GitHub reports `REVIEW_REQUIRED`, obtain an independent review. Never use
-   `--admin` merely to bypass the rule.
+5. Resolve `REVIEW_REQUIRED` with an independent reviewer. Never use `--admin`
+   merely to bypass branch protection.
 
    - A `jinon86`-authored PR uses `seoseo-ai` as reviewer when required.
-   - A `seoseo-ai`-authored PR that specifically requests `jinon86` may use the
-     Seoseo-held `jinon86` credential only after the user explicitly approves
-     that exact credential use in the current conversation.
+   - A `seoseo-ai`-authored PR that requests `jinon86` may use the Seoseo-held
+     `jinon86` GitHub session only after the user explicitly approves that exact
+     credential use in the current conversation.
    - Old approvals, memory, environment state, or approval for another PR do
      not count. If approval is absent or ambiguous, stop and ask.
-   - After approval, invoke the bundled helper with the approval flag set only
-     on that command:
+   - After approval, set the approval flag only on this one command:
 
      ```bash
      CCC_EXPLICIT_USER_APPROVAL=1 \
        ~/.claude/skills/gh-pr-flow/approve-via-seoseo.sh <owner/repo> <pr-number>
      ```
 
-   The helper accepts only `jinwon-int/*`, verifies an open `main` PR authored
-   by `seoseo-ai` with `jinon86` requested, refuses self-review, and keeps the
-   token inside the Seoseo SSH process. It returns only safe review status.
-   Retry the ordinary merge command after approval. If auto-merge is disabled
-   or another protection blocks it, report the blocker; do not force it.
+   The helper accepts only `jinwon-int/*`, verifies the remote actor is
+   `jinon86`, and requires an open `main` PR authored by `seoseo-ai` with
+   `jinon86` requested. It refuses self-review and returns only safe review
+   status. The GitHub credential remains behind Seoseo's `gh` session boundary.
+
+6. With required review and checks green, squash-merge normally:
+
+   ```bash
+   gh pr merge <n> --repo <owner/repo> --squash --delete-branch
+   ```
+
+   If local `seoseo-ai` lacks repository merge permission, use the exact-head
+   Seoseo merge fallback below. Do not weaken branch protection.
 
 7. Verify and clean up:
 
@@ -92,6 +93,36 @@ The normal local `gh` identity is `seoseo-ai`. For Wiki content use
    the PR is merged, `main` contains the change, and the remote branch is gone.
    If the PR links an issue with a closing keyword, verify that issue is closed.
 
+## Seoseo `jinon86` exact-head merge fallback
+
+Use this only when all of the following are true:
+
+- The operator explicitly approved merging this specific repository and PR in
+  the current task. Approval does not carry to another PR or a changed head.
+- The local identity cannot merge it, while Seoseo already has the authorized
+  `jinon86` GitHub session.
+- The PR is non-draft, targets `main`, is `MERGEABLE`/`CLEAN`, has all required
+  reviews, and its exact head has passing GitHub checks or documented equivalent
+  validation.
+
+Capture the exact head locally, then call the fail-closed helper:
+
+```bash
+head_sha="$(gh pr view <n> --repo <owner/repo> --json headRefOid --jq .headRefOid)"
+bash ~/.claude/skills/gh-pr-flow/merge-via-seoseo.sh \
+  --repo <owner/repo> --pr <n> --expected-head "$head_sha" \
+  --operator-approved
+```
+
+The helper verifies actor `jinon86`, re-reads the PR on Seoseo, requires the
+same head SHA and clean merge state, rejects pending or failed checks, and uses
+GitHub's merge API with the SHA precondition. It never uses an admin bypass. A
+PR with no reported checks is allowed only when exact-head equivalent evidence
+is already recorded and the operator is told that GitHub reported no checks.
+
+Delete the contributor branch using the identity that owns it. If cleanup
+permission is unavailable, report it rather than moving a credential.
+
 ## Security and merge rules
 
 - Never push directly to `main`; always use a branch and PR.
@@ -99,11 +130,13 @@ The normal local `gh` identity is `seoseo-ai`. For Wiki content use
   independent.
 - Only merge with green required checks and a mergeable state. Report failed or
   pending checks instead of forcing the merge.
-- Never print, copy, persist, or locally retrieve the Seoseo token. In particular,
-  do not run `gh auth token --user jinon86` outside the helper, enable shell trace,
-  switch the persistent local `gh` account, or place credentials in arguments,
+- Never read, print, copy, persist, export, or re-login with the Seoseo token.
+  Run `gh` on Seoseo so the credential stays there. Do not enable shell trace,
+  switch the persistent local account, or put credentials in arguments,
   commits, PR text, logs, or memory.
-- The helper's approval flag records a fresh user decision; it does not grant
-  standing authority. Set it inline for one approved invocation only.
-- Releases, secrets, migrations, and any admin bypass require their own fresh
-  approval even when the PR flow itself is already approved.
+- An approval flag records a fresh user decision; it does not grant standing
+  authority. Set it for one approved invocation only. Review approval and merge
+  approval are separate privileged writes unless the user's current instruction
+  explicitly authorizes both for that exact PR.
+- A merge instruction authorizes the merge, not token disclosure, credential
+  transfer, release/publish, deploy, restart, migration, or another mutation.

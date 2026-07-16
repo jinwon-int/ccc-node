@@ -6,11 +6,18 @@ All notable changes to the Claude Code node harness. Dates are KST.
 
 ### Changed
 - `gh-pr-flow` now handles protected merges that require an independent
-  `jinon86` review of a `seoseo-ai` PR. A narrow helper uses the credential only
-  inside Seoseo after fresh, per-invocation explicit user approval, validates
-  repo/author/base/state/reviewer scope, never prints the token, and leaves the
-  final squash merge on the normal account. Mock regression coverage verifies
-  the approval, repository, self-review, review-request, and leakage gates.
+  `jinon86` review of a `seoseo-ai` PR. A narrow helper uses Seoseo's existing
+  authenticated session only after fresh, per-invocation explicit approval,
+  validates remote actor/repo/author/base/state/reviewer scope, never extracts
+  the token, and leaves the final squash merge on the normal account. Mock
+  regression coverage verifies each gate.
+- `gh-pr-flow` now includes a fail-closed Seoseo merge fallback for the case
+  where local `seoseo-ai` lacks organization merge permission. Each use
+  requires fresh PR-specific operator approval, keeps the existing `jinon86`
+  credential on Seoseo, pins the exact head SHA, rejects draft/non-main/dirty
+  merge state and pending or failed checks, and calls the squash-merge API
+  without an admin bypass. The helper has deterministic no-approval,
+  head-drift, failed-check, legacy-status, dry-run, and merge-path tests.
 - Codex `/usage` now hides the `GPT-5.3-Codex-Spark` rate-limit bucket and
   account lifetime/daily token history, omits unavailable context/session rows,
   and renders reset timestamps deterministically in KST (UTC+9).

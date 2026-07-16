@@ -23,14 +23,17 @@ set -euo pipefail
 repo="$1"
 pr="$2"
 
-token="$(gh auth token --user jinon86)"
-if [ -z "$token" ]; then
-  echo "ERROR: Seoseo-held jinon86 credential is unavailable" >&2
+command -v gh >/dev/null 2>&1 || {
+  echo "ERROR: Seoseo gh is unavailable" >&2
   exit 69
+}
+actor="$(gh api user --jq .login)"
+if [ "$actor" != "jinon86" ]; then
+  echo "ERROR: expected remote GitHub actor jinon86; refusing review" >&2
+  exit 65
 fi
-trap 'unset token' EXIT
 
-metadata="$(GH_TOKEN="$token" gh pr view "$pr" --repo "$repo" \
+metadata="$(gh pr view "$pr" --repo "$repo" \
   --json author,baseRefName,state,reviewRequests \
   --jq '[.author.login, .baseRefName, .state, (([.reviewRequests[].login] | index("jinon86")) != null)] | @tsv')"
 IFS=$'\t' read -r author base state requested <<<"$metadata"
@@ -52,10 +55,10 @@ if [ "$requested" != "true" ]; then
   exit 65
 fi
 
-GH_TOKEN="$token" gh pr review "$pr" --repo "$repo" --approve \
+gh pr review "$pr" --repo "$repo" --approve \
   --body "Approved after explicit operator authorization using the Seoseo-held jinon86 credential." \
   >/dev/null
 
-GH_TOKEN="$token" gh pr view "$pr" --repo "$repo" --json reviewDecision,reviews \
+gh pr view "$pr" --repo "$repo" --json reviewDecision,reviews \
   --jq '{reviewDecision, reviews: [.reviews[] | select(.author.login == "jinon86") | {author: .author.login, state}]}'
 REMOTE

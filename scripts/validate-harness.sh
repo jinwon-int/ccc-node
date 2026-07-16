@@ -185,6 +185,7 @@ for t in claude/hooks/guard.test.sh claude/hooks/observability.test.sh claude/ho
          scripts/agent-cron.test.sh scripts/agent-cron-lib.test.sh scripts/a2a-termux-native-worker.test.sh \
          scripts/a2a-termux-native-worker-health.test.sh \
          scripts/install-memory-refresh-cron.test.sh scripts/ccc-skill-autosave.test.sh \
+         scripts/gh-pr-flow-seoseo-merge.test.sh \
          scripts/ccc-self-update.test.sh scripts/ccc-provenance.test.sh \
          scripts/bridge-watchdog.test.sh \
          scripts/converge-distill-peer.test.sh \
