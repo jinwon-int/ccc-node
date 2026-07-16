@@ -5,6 +5,12 @@ All notable changes to the Claude Code node harness. Dates are KST.
 ## [Unreleased]
 
 ### Changed
+- `gh-pr-flow` now handles protected merges that require an independent
+  `jinon86` review of a `seoseo-ai` PR. A narrow helper uses Seoseo's existing
+  authenticated session only after fresh, per-invocation explicit approval,
+  validates remote actor/repo/author/base/state/reviewer scope, never extracts
+  the token, and leaves the final squash merge on the normal account. Mock
+  regression coverage verifies each gate.
 - `gh-pr-flow` now includes a fail-closed Seoseo merge fallback for the case
   where local `seoseo-ai` lacks organization merge permission. Each use
   requires fresh PR-specific operator approval, keeps the existing `jinon86`

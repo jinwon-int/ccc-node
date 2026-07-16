@@ -128,9 +128,9 @@ if command -v claude >/dev/null 2>&1; then
   fi
 fi
 
-# 2) shell syntax (bash -n) on all hook + top-level scripts
+# 2) shell syntax (bash -n) on hooks, skill helpers, and top-level scripts
 say "== bash -n =="
-mapfile -t SH < <(find claude/hooks scripts -name '*.sh' 2>/dev/null; echo setup.sh; echo claude/mcp-setup.sh; echo claude/headless.sh)
+mapfile -t SH < <(find claude/hooks claude/skills scripts -name '*.sh' 2>/dev/null; echo setup.sh; echo claude/mcp-setup.sh; echo claude/headless.sh)
 for f in "${SH[@]}"; do
   [ -f "$f" ] || continue
   if bash -n "$f" 2>/dev/null; then say "  ok $f"; else err "bash -n: $f"; fi
@@ -191,6 +191,7 @@ for t in claude/hooks/guard.test.sh claude/hooks/observability.test.sh claude/ho
          scripts/converge-distill-peer.test.sh \
          scripts/install-agent-cron-systemd.test.sh \
          scripts/install-skill-autosave-cron.test.sh \
+         scripts/gh-pr-flow-seoseo-review.test.sh \
          scripts/ccc-service-control.test.sh; do
   [ -f "$t" ] || { err "missing test: $t"; continue; }
   if bash "$t" >"$TMP/htest.out" 2>&1; then say "  ok $(grep -E 'PASS=' "$TMP/htest.out" | tail -1) $t";
