@@ -66,6 +66,15 @@ DEFAULT_MARKER_RETENTION = DEFAULT_MAX_QUEUE_DEPTH
 DEFAULT_SEND_TIMEOUT = 15.0
 DEFAULT_LOCK_TIMEOUT = 0.05
 DEFAULT_SCAN_INTERVAL = 60.0
+#: Bounded retry for a transient "conversation root unavailable" (the
+#: conversations_dir stat fails) at scan time. On Android/Termux, app-private
+#: storage is not always immediately stat-able in the first instants after
+#: the bridge process starts, so the startup-time scan can otherwise lose
+#: that race and quarantine a perfectly healthy conversation. A root that
+#: genuinely never appears still raises after the budget is exhausted, so the
+#: quarantine safety net is unchanged for a real removal/corruption.
+DEFAULT_ROOT_RETRY_ATTEMPTS = 3
+DEFAULT_ROOT_RETRY_BACKOFF_SECONDS = 0.1
 
 
 class TranscriptRejected(ValueError):
@@ -331,6 +340,36 @@ def _safe_transcript_path(conversations_dir: Path, session_id: str) -> Path:
     return raw
 
 
+async def _resolve_transcript_path_with_retry(
+    conversations_dir: Path,
+    session_id: str,
+    *,
+    retry_attempts: int = DEFAULT_ROOT_RETRY_ATTEMPTS,
+    retry_backoff_seconds: float = DEFAULT_ROOT_RETRY_BACKOFF_SECONDS,
+) -> Path:
+    """``_safe_transcript_path`` with bounded retry for a transient root miss.
+
+    Only the "conversation root unavailable" reason is retried — that is the
+    one caused by a stat racing storage settle time. "unsafe transcript path"
+    is a content-independent safety rejection (path escapes the root) and
+    must still fail immediately; retrying it would only delay a real
+    rejection without changing the outcome.
+    """
+    attempts = max(int(retry_attempts), 1)
+    last_error: Optional[TranscriptRejected] = None
+    for attempt in range(attempts):
+        try:
+            return _safe_transcript_path(conversations_dir, session_id)
+        except TranscriptRejected as error:
+            if str(error) != "conversation root unavailable":
+                raise
+            last_error = error
+            if attempt < attempts - 1:
+                await asyncio.sleep(max(retry_backoff_seconds, 0.0))
+    assert last_error is not None
+    raise last_error
+
+
 def _live_stream_owned(handler: Any, user_id: int, chat_id: int) -> bool:
     route = getattr(handler, "_stream_key", None)
     route_key = route(user_id, chat_id) if callable(route) else (user_id, chat_id)
@@ -590,6 +629,8 @@ async def recover_dead_session_notifications(  # noqa: C901 -- #348 baseline hot
     send_timeout: float = DEFAULT_SEND_TIMEOUT,
     lock_timeout: float = DEFAULT_LOCK_TIMEOUT,
     max_rejects: int = DEFAULT_MAX_TRANSCRIPT_REJECTS,
+    root_retry_attempts: int = DEFAULT_ROOT_RETRY_ATTEMPTS,
+    root_retry_backoff_seconds: float = DEFAULT_ROOT_RETRY_BACKOFF_SECONDS,
 ) -> RecoveryStats:
     """Scan persisted dead sessions once and deliver bounded terminal notices."""
     stats = RecoveryStats()
@@ -653,7 +694,12 @@ async def recover_dead_session_notifications(  # noqa: C901 -- #348 baseline hot
             quarantine = _valid_quarantine(current.get(QUARANTINE_KEY), session_id)
             path: Optional[Path] = None
             try:
-                path = _safe_transcript_path(Path(conversations_dir), session_id)
+                path = await _resolve_transcript_path_with_retry(
+                    Path(conversations_dir),
+                    session_id,
+                    retry_attempts=root_retry_attempts,
+                    retry_backoff_seconds=root_retry_backoff_seconds,
+                )
                 blocked_hard = quarantine is not None and quarantine.get("hard") is True
                 if quarantine is not None and (
                     blocked_hard or quarantine_blocks_scan(quarantine, session_id, path)

@@ -442,19 +442,24 @@ class TranscriptQuarantineTests(unittest.IsolatedAsyncioTestCase):
     async def test_identityless_rejection_still_retries_pending_notice(self):
         """#424 review: records with identity=null never take the pre-scan
         skip, so the failed-notice retry must stay reachable on the
-        same-fingerprint dedupe path too."""
+        same-fingerprint dedupe path too.
+
+        ``root_retry_attempts=1`` disables the startup-race retry (#541):
+        this test is about the notice-retry/dedupe behavior once the root is
+        settled as permanently missing, not about the retry timing itself.
+        """
         missing_root = self.root / "missing"  # -> "conversation root unavailable"
         self.bot.send_message.side_effect = RuntimeError("network down")
 
         first = await recover_dead_session_notifications(
-            self.bot, self.sessions, self.handler, missing_root
+            self.bot, self.sessions, self.handler, missing_root, root_retry_attempts=1
         )
         self.bot.send_message.side_effect = None
         second = await recover_dead_session_notifications(
-            self.bot, self.sessions, self.handler, missing_root
+            self.bot, self.sessions, self.handler, missing_root, root_retry_attempts=1
         )
         third = await recover_dead_session_notifications(
-            self.bot, self.sessions, self.handler, missing_root
+            self.bot, self.sessions, self.handler, missing_root, root_retry_attempts=1
         )
 
         record = self.sessions.sessions["7:70"][QUARANTINE_KEY]
@@ -466,6 +471,61 @@ class TranscriptQuarantineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((second.quarantined, third.quarantined), (0, 0))
         text = self.bot.send_message.await_args.kwargs["text"]
         self.assertIn("conversation root unavailable", text)
+
+    async def test_transient_root_race_recovers_without_quarantine(self):
+        """The Termux/Android startup storage race (#541): a conversations
+        root that is not yet stat-able when the scan starts, but appears
+        within the retry budget, must recover normally with no quarantine
+        and no owner notice at all."""
+        settling_root = self.root / "settling-root"
+
+        async def _create_after_delay():
+            await asyncio.sleep(0.01)
+            settling_root.mkdir()
+            (settling_root / f"{self.session_id}.jsonl").write_text(
+                _queue("enqueue", content=_task()), encoding="utf-8"
+            )
+
+        creator = asyncio.ensure_future(_create_after_delay())
+        try:
+            stats = await recover_dead_session_notifications(
+                self.bot,
+                self.sessions,
+                self.handler,
+                settling_root,
+                root_retry_attempts=5,
+                root_retry_backoff_seconds=0.01,
+            )
+        finally:
+            await creator
+
+        self.assertEqual(
+            (stats.scanned, stats.delivered, stats.rejected, stats.quarantined),
+            (1, 1, 0, 0),
+        )
+        self.assertNotIn(QUARANTINE_KEY, self.sessions.sessions["7:70"])
+        self.bot.send_message.assert_awaited_once()
+        text = self.bot.send_message.await_args.kwargs["text"]
+        self.assertNotIn("quarantined", text)
+
+    async def test_permanently_missing_root_still_quarantines_after_retry_budget(self):
+        """A root that never appears must still fail safe (quarantine) once
+        the bounded retry budget is exhausted -- the retry only absorbs a
+        transient race, it never masks a real removal/corruption."""
+        missing_root = self.root / "permanently-missing"
+
+        stats = await recover_dead_session_notifications(
+            self.bot,
+            self.sessions,
+            self.handler,
+            missing_root,
+            root_retry_attempts=2,
+            root_retry_backoff_seconds=0.01,
+        )
+
+        self.assertEqual((stats.rejected, stats.quarantined), (1, 1))
+        record = self.sessions.sessions["7:70"][QUARANTINE_KEY]
+        self.assertEqual(record["reason"], "conversation root unavailable")
 
     def _churn_identity(self, tick):
         # Rewrite the transcript with a different byte length so the file's
