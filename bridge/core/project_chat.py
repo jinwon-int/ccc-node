@@ -376,6 +376,8 @@ class ProjectChatHandler(
         return input_total, snapshot.output_tokens or 0
 
     def _meter_claude_tokens(self, delta: Tuple[int, int]) -> None:
+        if self._usage_meter is None:
+            return
         try:
             self._usage_meter.record(
                 "claude",
