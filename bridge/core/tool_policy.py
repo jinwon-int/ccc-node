@@ -183,6 +183,18 @@ def effective_bash_policy(bash_policy: Optional[str], execution_profile: str) ->
     return resolve_bash_policy(bash_policy)
 
 
+def claude_unrestricted_enabled(flag: Any, execution_profile: str) -> bool:
+    """Codex-parity ungoverned Claude execution, gated to owner-operator.
+
+    Fail-closed: the opt-in flag has no effect unless the resolved profile is
+    ``owner-operator`` (which already requires a single-owner allowlist), so a
+    ``strict-project`` or ``disabled`` node can never be widened to host scope
+    by setting it. Only an explicit boolean-true value enables it.
+    """
+
+    return flag is True and execution_profile == EXECUTION_OWNER_OPERATOR
+
+
 def allowed_tools(bash_policy: Optional[str] = None) -> List[str]:
     """Build the SDK allowlist for the selected Bash policy.
 
