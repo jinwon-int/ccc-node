@@ -102,6 +102,12 @@ run allow Bash command 'sudo systemctl stop hermes-gateway'
 run allow Bash command 'systemctl restart a2a-worker@1.service'
 run allow Bash command 'service hermes-broker restart'
 run allow Bash command 'ssh nosuk systemctl restart a2a-hermes-worker'
+# Local detached Compose reconciliation is autonomous, matching ccc-node/Codex
+# auto-approve for the narrow, recoverable `up -d` path.
+run allow Bash command 'docker compose up -d'
+run allow Bash command 'docker compose up -d bridge'
+run allow Bash command 'docker compose up --detach --force-recreate bridge worker'
+run allow Bash command 'docker-compose up -d bridge'
 # ...but non-fleet units, config verbs, host lifecycle, and containers stay gated.
 run deny Bash command 'systemctl restart nginx'
 run deny Bash command 'systemctl restart a2a-broker nginx'
@@ -129,8 +135,17 @@ run deny Bash command 'systemctl daemon-reexec'
 run deny Bash command 'pm2 delete gateway'
 run deny Bash command 'service nginx restart'
 run deny Bash command 'docker restart a2a-broker'
-run deny Bash command 'docker compose up -d bridge'
-run deny Bash command 'docker-compose up -d bridge'
+run deny Bash command 'docker compose up bridge'
+run deny Bash command 'docker compose down'
+run deny Bash command 'docker compose stop bridge'
+run deny Bash command 'docker --host tcp://other:2375 compose up -d bridge'
+run deny Bash command 'DOCKER_HOST=tcp://other:2375 docker compose up -d bridge'
+run deny Bash command 'docker compose up -d bridge' 'DOCKER_HOST=tcp://other:2375'
+run deny Bash command 'docker compose up -d bridge' 'DOCKER_CONTEXT=remote'
+run deny Bash command 'bash -c "docker compose up -d bridge"'
+run deny Bash command 'docker compose up -d "$(printf bridge)"'
+run deny Bash command 'docker compose up -d bridge | sh'
+run deny Bash command 'docker compose up -d bridge && docker rm otherbox'
 run deny Bash command 'podman stop bridge'
 run deny Bash command 'kubectl rollout restart deployment/a2a-broker'
 run allow Bash command 'docker ps --format "{{.Names}}"'
@@ -403,14 +418,14 @@ run allow Bash command 'pm2 stop myapp' "$MS"
 run allow Bash command 'docker restart my-container' "$MS"
 run allow Bash command 'docker stop my-container' "$MS"
 run allow Bash command 'systemctl restart web-frontend' "$MS"
-# ...but system/unlisted units, mixed targets, targetless & compound docker stay gated
+# ...but system/unlisted units, mixed targets, targetless & other compound docker stay gated
 run deny Bash command 'systemctl stop sshd' "$MS"
 run deny Bash command 'systemctl stop ufw' "$MS"
 run deny Bash command 'systemctl restart nginx' "$MS"
 run deny Bash command 'systemctl restart myapp sshd' "$MS"
 run deny Bash command 'systemctl daemon-reload' "$MS"
 run deny Bash command 'docker restart my-container otherbox' "$MS"
-run deny Bash command 'docker compose up -d' "$MS"
+run allow Bash command 'docker compose up -d' "$MS"
 run deny Bash command 'pm2 restart other' "$MS"
 run deny Bash command 'kubectl rollout restart deployment/myapp' "$MS"
 # fleet units keep working regardless of the local-services allowlist

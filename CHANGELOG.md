@@ -5,6 +5,12 @@ All notable changes to the Claude Code node harness. Dates are KST.
 ## [Unreleased]
 
 ### Changed
+- Claude's service-lifecycle guard now treats direct local detached Compose
+  reconciliation (`docker compose up -d [services...]`, including
+  `docker-compose` and `--detach`) as autonomous, matching the unrestricted
+  ccc-node/Codex default for this recoverable path. Other Compose lifecycle
+  verbs, non-detached `up`, remote-daemon selection, wrappers, substitutions,
+  and compound hidden commands remain fail-closed.
 - `gh-pr-flow` now handles protected merges that require an independent
   `jinon86` review of a `seoseo-ai` PR. A narrow helper uses Seoseo's existing
   authenticated session only after fresh, per-invocation explicit approval,
@@ -117,10 +123,11 @@ All notable changes to the Claude Code node harness. Dates are KST.
   Operator-owned `~/.claude/managed-services.allow` (override `CCC_MANAGED_SERVICES_ALLOW`)
   lists the node's own non-fleet local units/containers/processes. `systemctl`/`service`/
   `pm2`/`docker`/`podman` lifecycle is relaxed when EVERY target of the command is listed;
-  a mixed/unlisted target, targetless `daemon-reload`, `docker compose`, a docker
-  remote-daemon flag, and command-substitution targets stay gated, and `kubectl` is never
-  relaxed — so `sshd`/`ufw`/`nginx` stay protected while the node's own apps become
-  self-manageable. Trailing `.service` is tolerated in matching. Write-gated for agents
+  a mixed/unlisted target, targetless `daemon-reload`, Compose lifecycle other than the
+  separately approved direct local detached `up`, a docker remote-daemon flag, and
+  command-substitution targets stay gated, and `kubectl` is never relaxed — so
+  `sshd`/`ufw`/`nginx` stay protected while the node's own apps become self-manageable.
+  Trailing `.service` is tolerated in matching. Write-gated for agents
   (`managed-services-config`); `docs/examples/managed-services.allow.example` documents it.
 - Fail-closed external-node memory isolation (#466):
   `CCC_NODE_ISOLATION_PROFILE=external` provides a higher-priority bridge-to-hook
