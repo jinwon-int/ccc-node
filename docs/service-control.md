@@ -29,10 +29,16 @@ agent account plus a root-owned wrapper and root-owned exact-unit allowlist.
   …), mixed targets, `daemon-reload`, other `docker compose` lifecycle, and
   `kubectl` stay gated. Direct local detached reconciliation —
   `docker compose up -d [services...]` or `docker-compose up --detach` — is
-  autonomous without an allowlist when it is the sole top-level command and
-  uses the bare executable name; remote-daemon flags, wrappers, substitutions,
-  compound commands, and non-detached `up` stay gated. See
-  `docs/examples/managed-services.allow.example`.
+  autonomous without an allowlist. One reconciliation may be wrapped in the
+  fixed operator runbook shape: a literal project `cd`, optional rollback
+  `docker tag`, one `up -d`, then `docker inspect`, bounded `sleep`, and
+  loopback-only health `curl`. A direct `ssh <peer> "..."` form is also allowed
+  when every explicit Compose service is a fleet service. Arbitrary compound
+  commands, external or mutating curl, multiple reconciliations, remote-daemon
+  flags, wrappers, substitutions, and non-detached `up` stay gated. See
+  `docs/examples/managed-services.allow.example`. This guard relaxation makes
+  an approved runbook executable; it does not replace the standing fresh
+  approval requirement for cross-broker mutations.
 - Everything else is fail-closed: `systemctl`/`service`/`pm2` lifecycle of
   non-fleet units on hosts that are not managed, config-changing verbs on the
   local node, `pm2 delete`, and docker/podman/kubectl lifecycle require fresh

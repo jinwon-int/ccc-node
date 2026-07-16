@@ -5,13 +5,15 @@ All notable changes to the Claude Code node harness. Dates are KST.
 ## [Unreleased]
 
 ### Changed
-- Claude's service-lifecycle guard now treats direct local detached Compose
-  reconciliation (`docker compose up -d [services...]`, including
-  `docker-compose` and `--detach`) as autonomous, matching the unrestricted
-  ccc-node/Codex default for this recoverable path. The invocation must be the
-  only top-level command and use the bare `docker`/`docker-compose` executable
-  name; other Compose lifecycle verbs, non-detached `up`, remote-daemon
-  selection, wrappers, substitutions, and compound commands remain fail-closed.
+- Claude's service-lifecycle guard now treats detached Compose reconciliation
+  (`docker compose up -d [services...]`, including `docker-compose` and
+  `--detach`) as autonomous, matching the ccc-node/Codex recoverable path. The
+  exact broker restart/rollback runbook may include literal `cd`, optional
+  `docker tag`, one reconciliation, and bounded read-only `inspect`/`sleep`/
+  loopback-curl verification; direct SSH requires named fleet services. Other
+  Compose lifecycle, multiple reconciliations, remote-daemon selection,
+  wrappers, substitutions, arbitrary compounds, and external/mutating curl
+  remain fail-closed. Refs #544.
 - `gh-pr-flow` now handles protected merges that require an independent
   `jinon86` review of a `seoseo-ai` PR. A narrow helper uses Seoseo's existing
   authenticated session only after fresh, per-invocation explicit approval,
