@@ -858,6 +858,13 @@ parameter = inspect.signature(CodexDistillExtractionWorker.__init__).parameters[
 assert parameter.default is inspect.Parameter.empty, (
     "usage_meter must stay an explicit constructor decision"
 )
+
+from telegram_bot.__main__ import create_app
+
+bot = create_app(context)
+assert bot._distill_extraction_worker is worker, (
+    "the running application must retain the gated worker"
+)
 print("COMPOSED-GATED-WORKER-OK")
 """,
         probe_root=tmp_path,

@@ -166,12 +166,16 @@ class ProjectChatMeterWiringTests(unittest.IsolatedAsyncioTestCase):
 
 
 class _ScriptedTurnSession:
-    def __init__(self, scripts: list, session_id: str) -> None:
-        self._scripts = scripts
+    def __init__(self, runtime: "_ScriptedTurnRuntime", session_id: str) -> None:
+        self._runtime = runtime
         self.session_id = session_id
 
     def send_turn(self, message: str, *, approval_handler=None):
-        events = self._scripts.pop(0)
+        events = self._runtime.scripts.pop(0)
+        if self._runtime.turn_attempt_recorder is not None:
+            # Mirror the real runtime contract: the spend boundary fires when
+            # the provider accepts turn/start, before any event is consumed.
+            self._runtime.turn_attempt_recorder()
 
         async def stream():
             for event in events:
@@ -187,16 +191,18 @@ class _ScriptedTurnRuntime:
     """Agent runtime double whose session replays scripted event turns."""
 
     def __init__(self, scripts: list) -> None:
-        self._scripts = list(scripts)
+        self.scripts = list(scripts)
         self.recorder = None
+        self.turn_attempt_recorder = None
 
     def set_usage_recorder(self, recorder) -> None:
         self.recorder = recorder
 
+    def set_turn_attempt_recorder(self, recorder) -> None:
+        self.turn_attempt_recorder = recorder
+
     async def start_or_resume(self, request: SessionRequest) -> _ScriptedTurnSession:
-        return _ScriptedTurnSession(
-            self._scripts, request.session_id or "thread-scripted"
-        )
+        return _ScriptedTurnSession(self, request.session_id or "thread-scripted")
 
 
 class _RecordingJournal:
@@ -540,6 +546,49 @@ class CodexRuntimeRecorderTests(unittest.IsolatedAsyncioTestCase):
         # Only the turn total is exposed: it is attributed to input so the
         # turn is still metered (6500 implied input baseline, output intact).
         self.assertEqual(observed, [(6500, 900)])
+
+    async def test_turn_cancelled_before_first_event_still_counts_one_request(
+        self,
+    ) -> None:
+        # Reviewer probe: the spend boundary is the accepted turn/start, so a
+        # turn cancelled while waiting for its first event is still charged.
+        class _AcceptingClientStub:
+            async def start(self) -> dict:
+                return {}
+
+            async def thread_start(self, *, cwd: str, model: str | None = None) -> dict:
+                return {"thread": {"id": "thread-cancel"}}
+
+            async def turn_start(self, thread_id: str, input_items, **kwargs) -> dict:
+                return {"turn": {"id": "turn-1"}}
+
+            async def next_notification(self) -> CodexNotification:
+                await asyncio.Event().wait()
+                raise AssertionError("unreachable")
+
+            async def close(self) -> None:
+                return None
+
+        runtime = CodexRuntime(client_factory=lambda handler: _AcceptingClientStub())
+        attempts: list[int] = []
+        runtime.set_turn_attempt_recorder(lambda: attempts.append(1))
+        try:
+            session = await runtime.start_or_resume(
+                SessionRequest(working_directory="/workspace")
+            )
+
+            async def drain() -> None:
+                async for _event in session.send_turn("hello"):
+                    pass
+
+            collector = asyncio.ensure_future(drain())
+            while not attempts:
+                await asyncio.sleep(0.005)
+            collector.cancel()
+            await asyncio.gather(collector, return_exceptions=True)
+        finally:
+            await runtime.close()
+        self.assertEqual(attempts, [1])
 
     async def test_history_notifications_without_our_turn_still_baseline(self) -> None:
         runtime = self._runtime()

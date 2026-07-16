@@ -119,6 +119,7 @@ def create_app(context: AppContext):
         session_manager=context.session_manager,
         project_chat=context.project_chat,
         distill_journal=context.distill_journal,
+        distill_extraction_worker=context.distill_extraction_worker,
         application_builder_factory=context.telegram_port,
         clock=context.clock,
     )

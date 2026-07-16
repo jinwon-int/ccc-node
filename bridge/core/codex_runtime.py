@@ -249,6 +249,7 @@ class CodexSession:
                     runtime._started_turn_ids = dict(
                         tuple(runtime._started_turn_ids.items())[-512:]
                     )
+                    runtime._record_turn_attempt()
                     active.turn_ready.set()
                     self._runtime._flush_pending_notifications(active)
                     while True:
@@ -336,7 +337,28 @@ class CodexRuntime:
         self._started_turn_ids: dict[str, None] = {}
         self._account_rate_limits = UsageSnapshot(provider="codex")
         self._usage_recorder: UsageRecorder | None = None
+        self._turn_attempt_recorder: Callable[[], object] | None = None
         self._closed = False
+
+    def set_turn_attempt_recorder(self, recorder: Callable[[], object]) -> None:
+        """Observe each turn/start the provider accepted (the spend boundary).
+
+        Invoked exactly once per successful ``turn/start`` response — before
+        any event is consumed — so an attempt cancelled while waiting for its
+        first event is still counted, while a ``turn/start`` that failed
+        before reaching the provider charges nothing. Fail-open: recorder
+        exceptions are logged and never break the turn.
+        """
+
+        self._turn_attempt_recorder = recorder
+
+    def _record_turn_attempt(self) -> None:
+        if self._turn_attempt_recorder is None:
+            return
+        try:
+            self._turn_attempt_recorder()
+        except Exception:
+            logger.exception("Turn attempt recorder failed; turn continues")
 
     def set_usage_recorder(self, recorder: UsageRecorder) -> None:
         """Observe per-thread cumulative usage snapshots (previous, current).

@@ -261,6 +261,14 @@ class ProjectChatHandler(
             )
             if callable(set_usage_recorder):
                 set_usage_recorder(self._usage_meter.record_codex_thread_usage)
+            set_turn_attempt_recorder = getattr(
+                self._agent_runtime, "set_turn_attempt_recorder", None
+            )
+            if callable(set_turn_attempt_recorder):
+                # The runtime invokes this at its spend boundary (provider
+                # accepted turn/start), so cancelled-before-first-event turns
+                # still count and pre-boundary failures charge nothing.
+                set_turn_attempt_recorder(self.record_agent_turn_request)
         logger.info(f"ProjectChatHandler initialized for {self.project_root}")
 
     @property

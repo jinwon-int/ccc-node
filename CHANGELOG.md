@@ -72,9 +72,10 @@ All notable changes to the Claude Code node harness. Dates are KST.
   implied pre-turn baseline from the turn-scoped `last` block (total minus
   last) so the first post-resume turn is metered while prior-session
   history is never counted — plus one request per provider attempt,
-  recorded exactly once per turn stream regardless of outcome (success,
-  error terminal, stall abandonment, or cancellation), and the distill
-  extraction worker charges every
+  recorded at the runtime's spend boundary (the accepted `turn/start`) so
+  every outcome including error terminals and turns cancelled before their
+  first event charges exactly once while pre-boundary failures charge
+  nothing, and the distill extraction worker charges every
   autonomous attempt with a conservative pre-spend token reservation
   (2048 overhead + snapshot bytes ÷ 2) until the exec backend can report
   actual usage, so repeated background work consumes — and eventually
@@ -97,8 +98,10 @@ All notable changes to the Claude Code node harness. Dates are KST.
   last-writer-wins (falling back to thread-only locking with a logged
   warning if the lock file is unavailable). The bridge
   composition root (`build_context`) now constructs the distill extraction
-  worker itself through the handler factory with the shared meter, and the
-  worker's `usage_meter` is an explicit required constructor decision.
+  worker itself through the handler factory with the shared meter, the
+  running `TelegramBot` retains that gated instance for #465's scheduling
+  phase, and the worker's `usage_meter` is an explicit required constructor
+  decision.
   Optional per-provider daily token budgets
   (`CCC_USAGE_BUDGET_TOKENS_CLAUDE`/`_CODEX`, 0 = off) raise one warn (early
   alarm at `CCC_USAGE_BUDGET_WARN_PERCENT`, default 80%) and one enforce

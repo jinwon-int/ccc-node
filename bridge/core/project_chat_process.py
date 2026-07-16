@@ -574,7 +574,6 @@ class ProjectChatProcessMixin:
                     nonlocal terminal_error, stalled, pending_completed_message
                     busy_depth = 0
                     approval_pending = False
-                    attempt_reached_provider = False
                     active_tools: dict[str, str] = {}
                     iterator = session.send_turn(
                         user_message,
@@ -601,7 +600,6 @@ class ProjectChatProcessMixin:
                                 stalled = True
                                 return
                             now = asyncio.get_running_loop().time()
-                            attempt_reached_provider = True
                             progress_request.last_event_at = now
                             approval_pending = isinstance(event, ApprovalRequestEvent)
                             if isinstance(event, TextDeltaEvent):
@@ -662,13 +660,8 @@ class ProjectChatProcessMixin:
                                 # objects never escape.
                                 continue
                     finally:
-                        # One provider attempt = one request record (#388),
-                        # regardless of how the stream ended: success, error
-                        # terminal, stall abandonment, or cancellation. The
-                        # first received event proves the attempt reached the
-                        # provider, and this runs exactly once per stream.
-                        if attempt_reached_provider:
-                            self.record_agent_turn_request()
+                        # Request metering happens at the runtime's spend
+                        # boundary (turn/start accepted), not here (#388).
                         # Run the generator's cleanup (turn bookkeeping, locks)
                         # even when the stall guard abandoned it mid-turn; this
                         # also guarantees a late completion event has no
