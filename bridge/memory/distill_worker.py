@@ -33,7 +33,14 @@ class AutonomousSpendGate(Protocol):
     core package (keeping the bridge internal import graph acyclic).
     """
 
-    def check_autonomous_spend(self, provider: str) -> _BudgetDecisionLike: ...
+    def reserve_autonomous_spend(
+        self,
+        provider: str,
+        *,
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+        requests: int = 0,
+    ) -> _BudgetDecisionLike: ...
 
     def record(
         self,
@@ -50,17 +57,13 @@ _SAFE_ERROR_CODE_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 # Conservative autonomous pre-spend reservation (#388). The codex exec
 # backend discards provider stdout, so per-attempt token usage is not yet
 # observable here; until #465's cost-metering criterion surfaces actual
-# usage, every extraction attempt charges the budget with an overestimate
-# derived from the bounded snapshot size so repeated background work
-# consumes — and eventually hits — the daily token cap. 2 bytes/token is a
-# deliberate UTF-8 floor (real usage is lower), and the flat overhead covers
-# the extraction prompt, schema, and bounded response.
+# usage, every extraction attempt charges the budget with an overestimate:
+# the flat overhead (extraction prompt, schema, bounded response) is charged
+# atomically at admission, and the bounded snapshot size tops it up after the
+# claim. 2 bytes/token is a deliberate UTF-8 floor (real usage is lower), so
+# repeated background work consumes — and eventually hits — the daily cap.
 _RESERVED_OVERHEAD_TOKENS = 2048
 _RESERVED_BYTES_PER_TOKEN = 2
-
-
-def _reserved_extraction_tokens(snapshot_bytes: int) -> int:
-    return _RESERVED_OVERHEAD_TOKENS + max(0, snapshot_bytes) // _RESERVED_BYTES_PER_TOKEN
 _RETRYABLE_BACKEND_CODES = frozenset(
     {
         "codex_distill_spawn_failed",
@@ -102,11 +105,11 @@ class CodexDistillExtractionWorker:
         journal: DistillJournal,
         backend: DistillBackend,
         *,
+        usage_meter: AutonomousSpendGate | None,
         owner_token: str | None = None,
         lease_seconds: int = 300,
         max_attempts: int = 5,
         wiki_enabled: bool = True,
-        usage_meter: AutonomousSpendGate | None = None,
     ) -> None:
         if lease_seconds <= 0 or max_attempts <= 0 or type(wiki_enabled) is not bool:
             raise ValueError("invalid distill extraction worker configuration")
@@ -140,11 +143,19 @@ class CodexDistillExtractionWorker:
 
     async def extract_once(self, *, job_id: str) -> DistillJob:
         if self._usage_meter is not None:
-            decision = self._usage_meter.check_autonomous_spend("codex")
+            # Atomic admit-and-charge (#388): the overhead reservation and the
+            # under-cap admission happen in one meter step, so concurrent
+            # attempts cannot all pass a stale pre-spend check and overrun the
+            # cap together. A blocked decision leaves the job unclaimed — no
+            # attempt is burned and it replays once the daily window resets.
+            # Losing a duplicate-claim race after reserving overcharges by one
+            # overhead reservation; that is intentionally conservative.
+            decision = self._usage_meter.reserve_autonomous_spend(
+                "codex",
+                input_tokens=_RESERVED_OVERHEAD_TOKENS,
+                requests=1,
+            )
             if not decision.allowed:
-                # Budget-blocked autonomous spend (#388): leave the job
-                # unclaimed so no attempt is burned; it replays untouched
-                # once the daily budget window resets or the cap is raised.
                 logger.warning(
                     "Distill extraction deferred by usage budget: %s",
                     decision.reason(),
@@ -176,11 +187,13 @@ class CodexDistillExtractionWorker:
             )
         if self._usage_meter is not None:
             try:
+                # Size-dependent top-up: admission already charged the flat
+                # overhead; this completes the conservative per-attempt
+                # reservation once the claimed snapshot's size is known.
                 self._usage_meter.record(
                     "codex",
                     "autonomous",
-                    input_tokens=_reserved_extraction_tokens(snapshot.byte_count),
-                    requests=1,
+                    input_tokens=snapshot.byte_count // _RESERVED_BYTES_PER_TOKEN,
                 )
             except Exception:
                 logger.exception("Autonomous usage metering failed; extraction continues")

@@ -70,7 +70,15 @@ All notable changes to the Claude Code node harness. Dates are KST.
   autonomous attempt with a conservative pre-spend token reservation
   (2048 overhead + snapshot bytes ÷ 2) until the exec backend can report
   actual usage, so repeated background work consumes — and eventually
-  hits — the cap. Optional per-provider daily token budgets
+  hits — the cap. Autonomous admission is atomic: the meter's
+  `reserve_autonomous_spend` admits and charges in one locked step, so
+  concurrent extraction attempts cannot all pass a stale pre-spend check
+  and overrun the cap together (a blocked reservation charges nothing),
+  and a tiny valid budget no longer warns at zero usage. The bridge
+  composition root (`build_context`) now constructs the distill extraction
+  worker itself through the handler factory with the shared meter, and the
+  worker's `usage_meter` is an explicit required constructor decision.
+  Optional per-provider daily token budgets
   (`CCC_USAGE_BUDGET_TOKENS_CLAUDE`/`_CODEX`, 0 = off) raise one warn (early
   alarm at `CCC_USAGE_BUDGET_WARN_PERCENT`, default 80%) and one enforce
   alert per provider-day; at the enforce threshold the distill worker defers

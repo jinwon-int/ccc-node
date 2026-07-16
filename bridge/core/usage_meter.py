@@ -24,6 +24,7 @@ import os
 from pathlib import Path
 import re
 import tempfile
+import threading
 import time
 from typing import Literal
 
@@ -121,6 +122,9 @@ class UsageMeter:
         self._alert_sink = alert_sink
         self._retention_days = retention_days
         self._clock = clock
+        # Guards counter mutations so admission+charge is one atomic step even
+        # if a caller ever moves meter calls off the event-loop thread.
+        self._lock = threading.Lock()
         self._budgets: dict[str, int] = {}
         for provider, budget in dict(budgets or {}).items():
             self._validate_provider(provider)
@@ -273,6 +277,17 @@ class UsageMeter:
             "output_tokens": _clamped_count(output_tokens),
             "requests": _clamped_count(requests),
         }
+        with self._lock:
+            alerts = self._apply_record(provider, mode, added)
+        for alert in alerts:
+            self._emit(alert)
+        return alerts
+
+    def _apply_record(
+        self, provider: str, mode: str, added: Mapping[str, int]
+    ) -> tuple[UsageAlert, ...]:
+        """Apply one pre-validated record under the meter lock."""
+
         if not any(added.values()):
             return ()
         day = self.current_day()
@@ -282,9 +297,45 @@ class UsageMeter:
         alerts = self._collect_alerts(provider, day)
         self._prune(day)
         self._save()
+        return alerts
+
+    def reserve_autonomous_spend(
+        self,
+        provider: str,
+        *,
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+        requests: int = 0,
+    ) -> BudgetDecision:
+        """Atomically admit-and-charge one autonomous attempt.
+
+        Admission (is the provider still under its daily cap?) and the
+        conservative charge happen under one lock with no await point in
+        between, so concurrent autonomous attempts cannot all observe the
+        pre-spend counter and overrun the cap together. A blocked decision
+        charges nothing.
+        """
+
+        self._validate_provider(provider)
+        added = {
+            "input_tokens": _clamped_count(input_tokens),
+            "output_tokens": _clamped_count(output_tokens),
+            "requests": _clamped_count(requests),
+        }
+        with self._lock:
+            day = self.current_day()
+            budget = self._budgets.get(provider, 0)
+            used = self.used_tokens(provider, day)
+            if budget > 0 and used >= budget:
+                return BudgetDecision(provider, day, "blocked", False, used, budget)
+            alerts = self._apply_record(provider, MODE_AUTONOMOUS, added)
+            state: BudgetState = "ok"
+            if budget > 0 and used >= self._warn_threshold(budget):
+                state = "warn"
+            decision = BudgetDecision(provider, day, state, True, used, budget)
         for alert in alerts:
             self._emit(alert)
-        return alerts
+        return decision
 
     def record_codex_thread_usage(
         self,
@@ -329,6 +380,10 @@ class UsageMeter:
 
     # -- budgets / alerts ------------------------------------------------------
 
+    def _warn_threshold(self, budget: int) -> int:
+        # Floor at one token so a tiny valid budget cannot warn at zero usage.
+        return max(1, budget * self._warn_percent // 100)
+
     def _collect_alerts(self, provider: str, day: str) -> tuple[UsageAlert, ...]:
         budget = self._budgets.get(provider, 0)
         if budget <= 0:
@@ -336,7 +391,7 @@ class UsageMeter:
         used = self.used_tokens(provider, day)
         fired = self._alerted.setdefault(day, {}).setdefault(provider, [])
         alerts: list[UsageAlert] = []
-        warn_at = budget * self._warn_percent // 100
+        warn_at = self._warn_threshold(budget)
         if used >= warn_at and "warn" not in fired:
             fired.append("warn")
             alerts.append(UsageAlert(provider, day, "warn", used, budget))
@@ -359,14 +414,15 @@ class UsageMeter:
         """Gate autonomous spend only; interactive turns are never blocked."""
 
         self._validate_provider(provider)
-        day = self.current_day()
-        budget = self._budgets.get(provider, 0)
-        used = self.used_tokens(provider, day)
+        with self._lock:
+            day = self.current_day()
+            budget = self._budgets.get(provider, 0)
+            used = self.used_tokens(provider, day)
         if budget <= 0:
             return BudgetDecision(provider, day, "ok", True, used, budget)
         if used >= budget:
             return BudgetDecision(provider, day, "blocked", False, used, budget)
-        if used >= budget * self._warn_percent // 100:
+        if used >= self._warn_threshold(budget):
             return BudgetDecision(provider, day, "warn", True, used, budget)
         return BudgetDecision(provider, day, "ok", True, used, budget)
 

@@ -34,6 +34,7 @@ class AppContext:
     session_store: Any
     session_manager: Any
     distill_journal: Any
+    distill_extraction_worker: Any
     project_chat: Any
     agent_runtime: Any
     sdk_factory: Any
@@ -82,11 +83,25 @@ def build_context(
         agent_runtime=agent_runtime,
         clock=clock,
     )
+    # Production distill extraction composition (#465 scheduling consumes
+    # this): the worker is built only through the handler factory so its
+    # autonomous spend is always gated by the shared usage meter (#388).
+    from telegram_bot.memory.codex_exec_backend import CodexExecDistillBackend
+
+    wiki_enabled = (
+        settings.node_isolation_profile != "external" and settings.wiki_memory_enabled
+    )
+    distill_extraction_worker = project_chat.build_distill_extraction_worker(
+        distill_journal,
+        CodexExecDistillBackend(wiki_enabled=wiki_enabled),
+        wiki_enabled=wiki_enabled,
+    )
     return AppContext(
         settings=settings,
         session_store=store,
         session_manager=session_manager,
         distill_journal=distill_journal,
+        distill_extraction_worker=distill_extraction_worker,
         project_chat=project_chat,
         agent_runtime=agent_runtime,
         sdk_factory=sdk_factory,

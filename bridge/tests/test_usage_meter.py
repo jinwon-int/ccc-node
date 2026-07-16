@@ -290,3 +290,46 @@ class ReportTests(UsageMeterTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReserveTests(UsageMeterTestCase):
+    def test_reserve_is_atomic_admission_and_charge(self) -> None:
+        meter = self.make_meter(budgets={"codex": 5000})
+        decisions = [
+            meter.reserve_autonomous_spend("codex", input_tokens=2058, requests=1)
+            for _ in range(4)
+        ]
+        self.assertEqual([d.allowed for d in decisions], [True, True, True, False])
+        self.assertEqual([d.state for d in decisions], ["ok", "ok", "warn", "blocked"])
+        # A blocked reservation charges nothing.
+        self.assertEqual(meter.used_tokens("codex"), 3 * 2058)
+
+    def test_reserve_without_budget_admits_and_charges(self) -> None:
+        meter = self.make_meter()
+        decision = meter.reserve_autonomous_spend("codex", input_tokens=100, requests=1)
+        self.assertTrue(decision.allowed)
+        self.assertEqual(decision.state, "ok")
+        self.assertEqual(meter.used_tokens("codex"), 100)
+
+    def test_reserve_records_under_the_autonomous_mode(self) -> None:
+        meter = self.make_meter()
+        meter.reserve_autonomous_spend("codex", input_tokens=64, requests=1)
+        import json as _json
+
+        raw = _json.loads(self.path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            raw["days"][FIXED_DAY]["codex"][MODE_AUTONOMOUS],
+            {"input_tokens": 64, "output_tokens": 0, "requests": 1},
+        )
+
+    def test_reserve_validates_provider(self) -> None:
+        with self.assertRaises(ValueError):
+            self.make_meter().reserve_autonomous_spend("../etc", input_tokens=1)
+
+    def test_tiny_budget_does_not_warn_or_block_at_zero_usage(self) -> None:
+        meter = self.make_meter(budgets={"codex": 1})
+        self.assertEqual(meter.check_autonomous_spend("codex").state, "ok")
+        decision = meter.reserve_autonomous_spend("codex", input_tokens=1)
+        self.assertTrue(decision.allowed)
+        self.assertEqual(decision.state, "ok")
+        self.assertEqual(meter.check_autonomous_spend("codex").state, "blocked")

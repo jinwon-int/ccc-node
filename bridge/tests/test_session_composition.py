@@ -822,3 +822,45 @@ print("PINNED_SDK_PUBLIC_API_OK")
 
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "PINNED_SDK_PUBLIC_API_OK"
+
+
+def test_build_context_composes_a_budget_gated_distill_worker(tmp_path):
+    # Production-composition regression (#388): the real composition root
+    # must construct the distill extraction worker through the handler
+    # factory so its autonomous spend shares the node usage meter, and the
+    # worker must not be constructible without an explicit gate decision.
+    result = _run_probe(
+        """
+import inspect
+import os
+from pathlib import Path
+
+root = Path(os.environ["PROBE_ROOT"])
+(root / "project").mkdir(parents=True, exist_ok=True)
+os.environ["PROJECT_ROOT"] = str(root / "project")
+os.environ["TELEGRAM_BOT_TOKEN"] = "123456:test"
+os.environ["ALLOWED_USER_IDS"] = "1"
+
+from telegram_bot.__main__ import build_context, load_runtime_settings
+from telegram_bot.memory.distill_worker import CodexDistillExtractionWorker
+
+settings = load_runtime_settings()
+context = build_context(settings)
+worker = context.distill_extraction_worker
+assert isinstance(worker, CodexDistillExtractionWorker), type(worker)
+meter = context.project_chat.usage_meter
+assert meter is not None, "the production meter must exist by default"
+assert worker._usage_meter is meter, "the worker must share the handler meter"
+
+parameter = inspect.signature(CodexDistillExtractionWorker.__init__).parameters[
+    "usage_meter"
+]
+assert parameter.default is inspect.Parameter.empty, (
+    "usage_meter must stay an explicit constructor decision"
+)
+print("COMPOSED-GATED-WORKER-OK")
+""",
+        probe_root=tmp_path,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "COMPOSED-GATED-WORKER-OK" in result.stdout
