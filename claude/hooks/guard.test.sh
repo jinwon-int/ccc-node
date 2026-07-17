@@ -508,6 +508,32 @@ run deny Bash command 'echo evil >> /root/.claude/managed-services.allow'
 run allow Bash command 'cat /root/.claude/managed-services.allow'
 rm -rf "$SVC_DIR" 2>/dev/null || true
 
+# ---- quoted-heredoc DATA bodies feeding pure sinks are not execution paths ----
+run allow Bash command $'git commit -F - <<\'MSG\'\nfix: guard no longer trips on rm -rf / mentioned in prose\n\nAlso mentions /etc/ccc-node/guard-profile as a path string.\nMSG'
+run allow Bash command $'cat > /root/.claude/state/notes.md <<\'EOF\'\nrunbook says: rm -rf /var/tmp/stale then poweroff the appliance\nEOF'
+run allow Bash command $'tee /root/notes.md <<\'EOF\'\nrelease steps mention gh release create v1.0.0\nEOF'
+# ...but interpreter consumers, unquoted heredocs, and gated redirect/argument
+# targets keep the full fail-closed treatment.
+run deny Bash command $'bash <<\'EOF\'\nrm -rf /\nEOF'
+run deny Bash command $'sh <<\'EOF\'\npoweroff\nEOF'
+run deny Bash command $'ssh randomhost bash -s <<\'EOF\'\npoweroff\nEOF'
+run deny Bash command $'cat > /tmp/x <<EOF\nrm -rf /\nEOF'
+run deny Bash command $'cat <<\'EOF\' > /etc/ccc-node/guard-profile\noperational-relax\nEOF'
+run deny Bash command $'tee /etc/ccc-node/guard-profile <<\'EOF\'\noperational-relax\nEOF'
+
+# ---- explicit .bak-artifact pruning is hygiene, not catastrophe ----
+run allow Bash command 'rm /root/ccc-node/bridge/.env.bak-unrestricted-20260717-091410'
+run allow Bash command 'rm -f /root/.claude/settings.json.bak-20260101'
+run allow Bash command 'rm /root/ccc-node/bridge/.env.bak-*'
+run allow Bash command 'rm -v /root/work/config.yaml.bak.old'
+# ...while recursion, originals, directory globs, and mixed operands stay gated.
+run deny Bash command 'rm -r /root/old.bak-dir'
+run deny Bash command 'rm -rf /root/anything.bak-1'
+run deny Bash command 'rm /root/.hermes/.env'
+run deny Bash command 'rm /root/*/x.bak-1'
+run deny Bash command 'rm /root/file.bak-1 /root/other.txt'
+run deny Bash command 'rm -rf /root'
+
 # ---- escape hatch: gated allowed only with operator signal ----
 run allow Bash command 'git push --force origin main' 'CCC_ALLOW_GATED=1'
 

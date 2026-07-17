@@ -612,6 +612,85 @@ def _operational_relax_enabled():
 
 
 # --------------------------------------------------------------------------- #
+# Quoted-heredoc data stripping (operator-approved FP fix).
+# --------------------------------------------------------------------------- #
+# A heredoc body is treated as pure DATA — and excluded from pattern gates —
+# only when BOTH hold (anything else falls through unstripped, fail-closed):
+#   1. the delimiter is quoted (<<'EOF' / <<"EOF"): the shell performs NO
+#      parameter/command substitution inside the body, so nothing in the body
+#      executes at parse time;
+#   2. the command consuming stdin is a known pure data sink (cat / tee /
+#      git commit): the body is written or recorded, never interpreted.
+# Interpreter consumers (bash/sh/ssh/python/eval/...) keep their bodies
+# scanned, as do unquoted heredocs (their $(...)/$VAR expand and can execute).
+# Only body LINES are removed: the sink command, its arguments and redirect
+# targets, and both delimiter lines stay visible to every gate — so e.g.
+# `tee /etc/ccc-node/guard-profile <<'EOF'` still trips the operator-config
+# gate on the argument path.
+_HEREDOC_INTRO_RE = re.compile(r"<<-?[ \t]*(['\"])([A-Za-z_][A-Za-z0-9_.-]*)\1")
+_DATA_SINK_CMDS = {"cat", "tee"}
+
+
+def _heredoc_sink_statement(prefix):
+    """Whether the statement text introducing a heredoc is a pure data sink."""
+    # The heredoc attaches to the last statement on its line.
+    seg = re.split(r"[;&|]", prefix)[-1]
+    try:
+        toks = shlex.split(seg)
+    except ValueError:
+        return False
+    # Skip leading VAR=... assignments; ignore redirection operators/targets.
+    words = []
+    for t in toks:
+        if not words and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", t):
+            continue
+        words.append(t)
+    if not words:
+        return False
+    if words[0] in _DATA_SINK_CMDS:
+        return True
+    return len(words) >= 2 and words[0] == "git" and words[1] == "commit"
+
+
+def _strip_quoted_heredoc_data(cmd):
+    """Replace qualifying quoted-heredoc bodies with a data marker."""
+    if "<<" not in cmd or "\n" not in cmd:
+        return cmd
+    lines = cmd.split("\n")
+    out = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        intros = list(_HEREDOC_INTRO_RE.finditer(line))
+        # Exactly one quoted heredoc per line is handled; multiple heredocs on
+        # one line are rare and fall through unstripped (fail-closed).
+        if len(intros) != 1 or not _heredoc_sink_statement(line[: intros[0].start()]):
+            out.append(line)
+            i += 1
+            continue
+        m = intros[0]
+        delim = m.group(2)
+        dash = line[m.start():m.start() + 3] == "<<-"
+        # Find the terminator line; without one, strip nothing (fail-closed).
+        end = None
+        for j in range(i + 1, len(lines)):
+            cand = lines[j].lstrip("\t") if dash else lines[j]
+            if cand == delim:
+                end = j
+                break
+        if end is None:
+            out.append(line)
+            i += 1
+            continue
+        out.append(line)
+        if end > i + 1:
+            out.append("[CCC-HEREDOC-DATA]")
+        out.append(lines[end])
+        i = end + 1
+    return "\n".join(out)
+
+
+# --------------------------------------------------------------------------- #
 # Main evaluation. Raises Deny to block; returns normally to allow.
 # --------------------------------------------------------------------------- #
 def evaluate(tool, cmd, fpath, tool_input_raw):
@@ -652,7 +731,12 @@ def evaluate(tool, cmd, fpath, tool_input_raw):
     if tool != "Bash" or not cmd:
         return
 
-    c = cmd
+    # Quoted-heredoc DATA bodies feeding pure sink commands are stripped before
+    # pattern matching (operator-approved FP fix): a commit message or a notes
+    # file that MENTIONS "rm -rf /" is data, not an execution path. Everything
+    # else about the command (the sink itself, redirect targets, delimiters,
+    # unquoted heredocs, interpreter-fed heredocs) keeps being scanned.
+    c = _strip_quoted_heredoc_data(cmd)
     cn = _quote_strip(c)
     try:
         toks = shlex.split(cn)
@@ -804,11 +888,56 @@ _RM_RE = re.compile(
     r"\brm\b(\s+-[A-Za-z-]*)*\s+(/|~|\$HOME|\$\{HOME\}|/root|/etc|/var|/usr|/bin|/lib)([\s/*]|$)")
 
 
+_RM_PRUNE_SAFE_FLAGS = {"-f", "--force", "-v", "--verbose"}
+_RM_BAK_BASENAME_RE = re.compile(r"\.bak([-.][^/]*)?$")
+
+
+def _rm_is_backup_prune(st):
+    """A non-recursive rm whose EVERY operand names a .bak backup artifact.
+
+    Pruning stale timestamped backups (e.g. ``.env.bak-20260717-091410``)
+    reduces on-disk secret sprawl; treating it as catastrophic forced operator
+    intervention for routine hygiene (operator-approved relaxation, 2026-07-18).
+    Fail-closed: a recursive flag, an unparseable statement, a glob in the
+    DIRECTORY part, or any operand whose basename is not a ``.bak`` /
+    ``.bak-<suffix>`` / ``.bak.<suffix>`` artifact all fall through to the
+    deny. Originals (``.env``, keys, configs) are never matched by the
+    basename rule, so only explicitly-named backup copies are prunable.
+    """
+    try:
+        toks = shlex.split(st)
+    except ValueError:
+        return False
+    if not toks or toks[0] != "rm":
+        return False
+    operands = []
+    for t in toks[1:]:
+        if t == "--":
+            continue
+        if t.startswith("-") and t != "-":
+            if t not in _RM_PRUNE_SAFE_FLAGS:
+                return False          # -r/-R/-d/--recursive/unknown stay gated
+            continue
+        operands.append(t)
+    if not operands:
+        return False
+    for op in operands:
+        dirpart, _, base = op.rpartition("/")
+        if any(ch in dirpart for ch in "*?["):
+            return False              # globbing directories stays gated
+        if not _RM_BAK_BASENAME_RE.search(base):
+            return False
+    return True
+
+
 def _gate_rm(c, statements, managed):
     # Relaxed only when the rm is inside a managed-remote statement (the owned node
-    # governs its own filesystem); a local catastrophic rm always denies.
+    # governs its own filesystem) or is an explicit .bak-artifact pruning; a local
+    # catastrophic rm always denies.
     for st, mgd in zip(statements, managed):
         if not mgd and _RM_RE.search(st):
+            if _rm_is_backup_prune(st):
+                continue
             _deny("rm-catastrophic", "operator_approval_gated", c)
 
 
