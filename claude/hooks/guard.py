@@ -623,12 +623,22 @@ def _operational_relax_enabled():
 #      git commit): the body is written or recorded, never interpreted.
 # Interpreter consumers (bash/sh/ssh/python/eval/...) keep their bodies
 # scanned, as do unquoted heredocs (their $(...)/$VAR expand and can execute).
+#
+# "Pure data sink" is required to be PROVABLY TERMINAL (adversarial review on
+# #571): after the heredoc intro on the same line only plain-file redirects may
+# follow (no `| bash`, no `>(...)` process substitution, no `&&`-chained
+# execution), and the terminator must be the LAST non-blank content of the
+# whole command — otherwise a later statement in the same command could execute
+# what the sink just wrote (`cat > s.sh <<'EOF' ... EOF` + `bash s.sh`).
 # Only body LINES are removed: the sink command, its arguments and redirect
 # targets, and both delimiter lines stay visible to every gate — so e.g.
 # `tee /etc/ccc-node/guard-profile <<'EOF'` still trips the operator-config
 # gate on the argument path.
 _HEREDOC_INTRO_RE = re.compile(r"<<-?[ \t]*(['\"])([A-Za-z_][A-Za-z0-9_.-]*)\1")
 _DATA_SINK_CMDS = {"cat", "tee"}
+# After the intro, only redirection to a LITERAL file path may follow — no
+# pipes, process substitutions, command separators, or expansions.
+_HEREDOC_TAIL_RE = re.compile(r"^([ \t]*>{1,2}[ \t]*[A-Za-z0-9/._+:-]+)*[ \t]*$")
 
 
 def _heredoc_sink_statement(prefix):
@@ -653,25 +663,32 @@ def _heredoc_sink_statement(prefix):
 
 
 def _strip_quoted_heredoc_data(cmd):
-    """Replace qualifying quoted-heredoc bodies with a data marker."""
+    """Replace a qualifying quoted-heredoc body with a data marker.
+
+    Fail-closed on every ambiguity: at most ONE quoted heredoc is stripped per
+    command, and only when the sink is provably terminal (nothing but plain
+    file redirects after the intro; nothing but blank lines after the
+    terminator). Anything else returns the command unmodified so every gate
+    scans the full text.
+    """
     if "<<" not in cmd or "\n" not in cmd:
         return cmd
     lines = cmd.split("\n")
-    out = []
-    i = 0
-    while i < len(lines):
-        line = lines[i]
+    for i, line in enumerate(lines):
         intros = list(_HEREDOC_INTRO_RE.finditer(line))
-        # Exactly one quoted heredoc per line is handled; multiple heredocs on
-        # one line are rare and fall through unstripped (fail-closed).
-        if len(intros) != 1 or not _heredoc_sink_statement(line[: intros[0].start()]):
-            out.append(line)
-            i += 1
+        if not intros:
             continue
+        # Exactly one quoted heredoc, fed by a pure data sink, with nothing but
+        # literal-file redirects after the intro on the same line.
+        if len(intros) != 1:
+            return cmd
         m = intros[0]
+        if not _heredoc_sink_statement(line[: m.start()]):
+            return cmd
+        if not _HEREDOC_TAIL_RE.match(line[m.end():]):
+            return cmd
         delim = m.group(2)
         dash = line[m.start():m.start() + 3] == "<<-"
-        # Find the terminator line; without one, strip nothing (fail-closed).
         end = None
         for j in range(i + 1, len(lines)):
             cand = lines[j].lstrip("\t") if dash else lines[j]
@@ -679,15 +696,17 @@ def _strip_quoted_heredoc_data(cmd):
                 end = j
                 break
         if end is None:
-            out.append(line)
-            i += 1
-            continue
-        out.append(line)
+            return cmd  # unterminated — strip nothing
+        # Provably terminal: nothing but blank lines may follow the terminator,
+        # so no later statement in this command can execute what was written.
+        if any(rest.strip() for rest in lines[end + 1:]):
+            return cmd
+        out = lines[: i + 1]
         if end > i + 1:
             out.append("[CCC-HEREDOC-DATA]")
-        out.append(lines[end])
-        i = end + 1
-    return "\n".join(out)
+        out.extend(lines[end:])
+        return "\n".join(out)
+    return cmd
 
 
 # --------------------------------------------------------------------------- #
@@ -890,6 +909,10 @@ _RM_RE = re.compile(
 
 _RM_PRUNE_SAFE_FLAGS = {"-f", "--force", "-v", "--verbose"}
 _RM_BAK_BASENAME_RE = re.compile(r"\.bak([-.][^/]*)?$")
+# Operands must be LITERAL paths: no $/`` expansions (a variable can expand
+# into extra, unrelated operands — adversarial review on #571), no tilde, no
+# braces, no bracket globs, no whitespace-bearing quoting tricks.
+_RM_LITERAL_OPERAND_RE = re.compile(r"[A-Za-z0-9/._+:*?-]+")
 
 
 def _rm_is_backup_prune(st):
@@ -922,8 +945,10 @@ def _rm_is_backup_prune(st):
     if not operands:
         return False
     for op in operands:
+        if not _RM_LITERAL_OPERAND_RE.fullmatch(op):
+            return False              # $VAR/`cmd`/~/{}/[] operands stay gated
         dirpart, _, base = op.rpartition("/")
-        if any(ch in dirpart for ch in "*?["):
+        if any(ch in dirpart for ch in "*?"):
             return False              # globbing directories stays gated
         if not _RM_BAK_BASENAME_RE.search(base):
             return False

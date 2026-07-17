@@ -520,6 +520,13 @@ run deny Bash command $'ssh randomhost bash -s <<\'EOF\'\npoweroff\nEOF'
 run deny Bash command $'cat > /tmp/x <<EOF\nrm -rf /\nEOF'
 run deny Bash command $'cat <<\'EOF\' > /etc/ccc-node/guard-profile\noperational-relax\nEOF'
 run deny Bash command $'tee /etc/ccc-node/guard-profile <<\'EOF\'\noperational-relax\nEOF'
+# Adversarial (review on #571): the sink must be provably TERMINAL — piped,
+# process-substituted, or later-executed consumers must keep the body scanned.
+run deny Bash command $'cat <<\'EOF\' | bash\nrm -rf /\nEOF'
+run deny Bash command $'cat <<\'EOF\' > >(bash)\nrm -rf /\nEOF'
+run deny Bash command $'cat <<\'EOF\' && poweroff\ndata\nEOF'
+run deny Bash command $'cat > /tmp/s.sh <<\'EOF\'\nrm -rf /\nEOF\nbash /tmp/s.sh'
+run deny Bash command $'tee /tmp/x.sh <<\'EOF\'\npoweroff\nEOF\nsh /tmp/x.sh'
 
 # ---- explicit .bak-artifact pruning is hygiene, not catastrophe ----
 run allow Bash command 'rm /root/ccc-node/bridge/.env.bak-unrestricted-20260717-091410'
@@ -533,6 +540,13 @@ run deny Bash command 'rm /root/.hermes/.env'
 run deny Bash command 'rm /root/*/x.bak-1'
 run deny Bash command 'rm /root/file.bak-1 /root/other.txt'
 run deny Bash command 'rm -rf /root'
+# Adversarial (review on #571): dynamic/expanded operands can split into extra
+# protected paths after shell expansion — only literal operands are prunable.
+run deny Bash command 'rm /root/x.bak-$SUFFIX'
+run deny Bash command 'rm /root/x.bak-`id`'
+run deny Bash command 'rm /root/x.bak-$(date +%s)'
+run deny Bash command 'rm ~/stale.bak-1'
+run deny Bash command 'rm /root/{a,b}.bak-1'
 
 # ---- escape hatch: gated allowed only with operator signal ----
 run allow Bash command 'git push --force origin main' 'CCC_ALLOW_GATED=1'
