@@ -65,6 +65,12 @@ class BotCommandMixin:
             logger.warning("Provider usage read failed for %s", provider)
             snapshot = UsageSnapshot(provider=provider)
         reply = render_usage(snapshot)
+        usage_meter = getattr(self._project_chat, "usage_meter", None)
+        if usage_meter is not None:
+            try:
+                reply = f"{reply}\n\n{usage_meter.render_report(days=7)}"
+            except Exception:
+                logger.warning("Local usage meter report failed")
         await message.reply_text(reply)
         log_debug(user_id, "bot", reply)
 

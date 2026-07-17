@@ -115,6 +115,7 @@ utils/chat_logger.py Per-session debug chat logging
 | `CCC_REQUIRE_ALLOWLIST` | No | Fail-closed allowlist guard (default: true; required for `owner-operator`) |
 | `CCC_BRIDGE_EXECUTION_PROFILE` | No | `strict-project` (default), `owner-operator`, or `disabled` execution boundary |
 | `CCC_BRIDGE_BASH_POLICY` | No | `auto-approve` (default), `auto-review`, `approve-each`, or `disabled`; Codex auto-approve is unrestricted `never + dangerFullAccess` |
+| `CCC_BRIDGE_CLAUDE_UNRESTRICTED` | No | Opt-in Codex parity for the Claude path (default **false**, `owner-operator` only — ignored on every other profile). True runs Claude with `permission_mode=bypassPermissions`, no OS sandbox, and no host settings chain, so the PreToolUse guard hook is **not** loaded — matching Codex's `never + dangerFullAccess`. Memory context is preserved. Default keeps `guard.py` as the boundary; set per node and reversible |
 | `CLAUDE_CLI_PATH` | No | Absolute path to Claude CLI binary |
 | `CLAUDE_PROCESS_TIMEOUT` | No | SDK timeout in seconds (default: 600) |
 | `PROXY_URL` | No | HTTP proxy; start.sh auto-configures env vars |
@@ -128,6 +129,10 @@ utils/chat_logger.py Per-session debug chat logging
 | `CCC_TELEGRAM_MAX_BUBBLE_CHARS` | No | Max characters per Telegram message; long replies split into multiple bubbles at this size (default: 1200, clamped to [200, 4000]) |
 | `CCC_TELEGRAM_OPTION_BUTTONS` | No | Render multiple-choice questions as tappable inline buttons (default: **false**). Off = options shown as text, user types their choice |
 | `CCC_RESUME_PERSISTED_SESSIONS` | No | Auto-resume a persisted session_id after a bridge restart when its SDK transcript still exists on disk (default: **true**). Set false to restore the old never-resume-across-restart behavior |
+| `CCC_USAGE_METER_ENABLED` | No | Durable body-free usage metering per KST day × provider × interactive/autonomous mode in `.telegram_bot/usage-meter.json` (default: true). Never blocks turns |
+| `CCC_USAGE_BUDGET_TOKENS_CLAUDE` | No | Daily Claude token budget (input+output) for the meter; 0 = off (default). Enforce blocks autonomous spend only |
+| `CCC_USAGE_BUDGET_TOKENS_CODEX` | No | Daily Codex token budget (input+output) for the meter; 0 = off (default). Enforce blocks autonomous spend only |
+| `CCC_USAGE_BUDGET_WARN_PERCENT` | No | Early-alarm percentage of a daily token budget (default: 80) |
 | `CCC_DEPS_UNLOCKED` | No | Set 1 to skip the default hash-locked install (`requirements.lock.txt` via `pip --require-hashes`) and use the legacy lower-bound `requirements.txt` flow. Regenerate locks with `scripts/ccc-deps-lock.sh` |
 | `OPENAI_API_KEY` | Voice only | API key for Whisper transcription |
 | `OPENAI_BASE_URL` | No | Optional OpenAI-compatible Whisper API base URL |

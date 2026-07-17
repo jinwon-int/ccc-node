@@ -203,6 +203,14 @@ class ProjectChatReaderMixin:
                 # Any SDK event means the stream is alive; reset the stall clock
                 # so the heartbeat keeps ticking. Silence resumes the countdown.
                 req.last_event_at = now
+                # Spend boundary (#388): the first SDK event proves this
+                # attempt reached the provider, so one request is metered
+                # here — surviving reader crashes and cancellations. Frames
+                # carrying usage meter their positive delta immediately, so
+                # a lost terminal result keeps the observed tokens and the
+                # ResultMessage reconciles the remainder without doubling.
+                self.record_claude_attempt(req)
+                self.record_claude_observed_usage(req, msg)
                 if (
                     req.typing_callback
                     and not isinstance(msg, ResultMessage)

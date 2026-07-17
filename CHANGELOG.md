@@ -5,16 +5,34 @@ All notable changes to the Claude Code node harness. Dates are KST.
 ## [Unreleased]
 
 ### Changed
+- Claude Code now defaults to native `bypassPermissions` mode, matching the
+  no-prompt execution posture used by ccc-node/Codex. New installs and
+  self-updates receive the mode through `settings.base.json`; the independent
+  ccc-node PreToolUse guard continues to enforce Fresh Approval Required
+  boundaries, including catastrophic local `rm`.
+- Opt-in Codex-parity ungoverned Claude execution
+  (`CCC_BRIDGE_CLAUDE_UNRESTRICTED`, default **false**, `owner-operator` only).
+  On a node that sets it true, the bridge's Claude SDK path runs with
+  `permission_mode=bypassPermissions`, no OS sandbox, and no host settings
+  chain — so the PreToolUse `guard.py` hook is not loaded — matching the
+  Codex `never + dangerFullAccess` contract that `auto-approve` already maps
+  to (`bot_access.py`). MEMORY/USER context is preserved through the curated
+  settings block. The flag is fail-closed: `claude_unrestricted_enabled`
+  ignores it on `strict-project`/`disabled` (which stay sandboxed) and honors
+  only an explicit boolean-true, so it can never widen a non-owner node to
+  host scope. Default keeps `guard.py` as the boundary; the change is
+  per-node and reversible. This unifies the two providers' execution scope at
+  the operator's explicit request without dropping the guard for nodes that
+  do not opt in.
 - Claude's service-lifecycle guard now treats detached Compose reconciliation
   (`docker compose up -d [services...]`, including `docker-compose` and
   `--detach`) as autonomous, matching the ccc-node/Codex recoverable path. The
   exact broker restart/rollback runbook may include literal `cd`, optional
   `docker tag`, one reconciliation, and read-only `inspect`/`sleep` (maximum
   300 seconds)/loopback-curl verification; direct SSH requires named fleet
-  services. Other
-  Compose lifecycle, multiple reconciliations, remote-daemon selection,
-  wrappers, substitutions, arbitrary compounds, and external/mutating curl
-  remain fail-closed. Refs #544.
+  services. Other Compose lifecycle, multiple reconciliations, remote-daemon
+  selection, wrappers, substitutions, arbitrary compounds, and
+  external/mutating curl remain fail-closed. Refs #544.
 - `gh-pr-flow` now handles protected merges that require an independent
   `jinon86` review of a `seoseo-ai` PR. A narrow helper uses Seoseo's existing
   authenticated session only after fresh, per-invocation explicit approval,
@@ -61,6 +79,71 @@ All notable changes to the Claude Code node harness. Dates are KST.
   Mixed non-fleet targets and config-changing verbs still fail closed. Refs #534.
 
 ### Added
+- Node-local model-usage metering with daily budget caps (#388). The new
+  `bridge/core/usage_meter.py` durably records body-free token/request
+  counters per KST day × provider × interactive/autonomous mode in
+  `.telegram_bot/usage-meter.json` (atomic owner-only writes, bounded
+  retention, fail-open persistence). Spend sites wired: Claude interactive
+  turns meter at the reader's `ResultMessage` using the complete validated
+  input total (raw plus cache-creation and cache-read tokens), Codex
+  interactive turns meter via a runtime usage recorder fed by cumulative
+  `thread/tokenUsage/updated` deltas — threads the process created start
+  from a zero baseline so their first turn is metered, and a resumed
+  thread's first notification during a turn this process started derives an
+  implied pre-turn baseline from the turn-scoped `last` block (total minus
+  last) so the first post-resume turn is metered while prior-session
+  history is never counted — plus one request per provider attempt,
+  recorded at the runtime's spend boundary (the accepted `turn/start`) so
+  every outcome including error terminals and turns cancelled before their
+  first event charges exactly once while pre-boundary failures charge
+  nothing, and the distill extraction worker charges every
+  autonomous attempt with a worst-case pre-spend token reservation over the complete request
+  (8192 prompt/schema overhead + the backend's hard output-size cap as the
+  output allowance + six tokens per raw snapshot byte, covering canonical
+  JSON escape expansion at ≤1 BPE token per serialized byte) until the exec
+  backend can report actual usage, so repeated background work consumes —
+  and eventually hits — the cap and complete valid input+output cost cannot
+  exceed an admitted budget. Autonomous admission is atomic and prospective: the
+  meter's `reserve_autonomous_spend` admits only when the whole bounded
+  attempt cost (overhead + persisted snapshot size, reserved before the
+  claim) fits under the cap and charges it in the same locked step, so
+  concurrent attempts cannot jointly overrun the cap, a single oversized
+  attempt is rejected outright, and the recorded autonomous total never
+  exceeds the configured cap. Reservations are opaque day-pinned handles:
+  the charge and any later refund target the accounting day captured at
+  admission, so a midnight rollover can neither split a reservation across
+  days nor let a refund erase another day's spend. No-op invocations (claim
+  lost or job already done) refund their exact reservation, a tiny valid
+  budget no longer warns at zero usage, and budgets must fit at least one
+  maximal attempt or that work stays deferred by design. Every meter
+  mutation additionally holds an exclusive interprocess file lock and
+  re-reads the on-disk state before applying its delta, so overlapping
+  meter instances or bridge processes merge spend instead of losing it to
+  last-writer-wins (falling back to thread-only locking with a logged
+  warning if the lock file is unavailable, and preserving unpersisted
+  in-memory deltas across repeated save failures instead of reloading over
+  them). The bridge
+  composition root (`build_context`) now constructs the distill extraction
+  worker itself through the handler factory with the shared meter, the
+  running `TelegramBot` retains that gated instance and drives it from the
+  bridge lifecycle: a fail-open sweep (default every 300s,
+  `distill_extraction_poll_interval`) runs every ready snapshot job through
+  the gated worker, so capped work is deferred before any provider call
+  while job-creating trigger policy remains #465's phase, and the worker's `usage_meter` is an explicit required constructor
+  decision.
+  Optional per-provider daily token budgets
+  (`CCC_USAGE_BUDGET_TOKENS_CLAUDE`/`_CODEX`, 0 = off) raise one warn (early
+  alarm at `CCC_USAGE_BUDGET_WARN_PERCENT`, default 80%) and one enforce
+  alert per provider-day; at the enforce threshold the distill worker defers
+  autonomous extraction without claiming the job or burning an attempt while
+  interactive user turns keep flowing by design.
+  `ProjectChatHandler.build_distill_extraction_worker` is the composition
+  root for #465's scheduling: it always injects the shared meter (callers
+  cannot substitute their own gate), and budget alerts additionally queue an
+  owner push through the opt-in push-notifier spool (log-only when
+  `CCC_PUSH_ENABLED` is off). `/usage` now appends a compact 7-day local
+  meter report with budget state. Metering never blocks or fails a turn
+  (`CCC_USAGE_METER_ENABLED=false` disables it entirely).
 - Provider conformance contract + capability matrix (#387). The new
   `bridge/core/provider_capabilities.py` is the single source of per-provider
   capability states (`supported`/`degraded`/`unsupported`/`unknown`, each with

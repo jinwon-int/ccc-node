@@ -660,6 +660,8 @@ class ProjectChatProcessMixin:
                                 # objects never escape.
                                 continue
                     finally:
+                        # Request metering happens at the runtime's spend
+                        # boundary (turn/start accepted), not here (#388).
                         # Run the generator's cleanup (turn bookkeeping, locks)
                         # even when the stall guard abandoned it mid-turn; this
                         # also guarantees a late completion event has no
