@@ -107,11 +107,16 @@ recorded to `~/.claude/state/approval-needed.log`; the bypass is logged to stder
   docker remote-daemon flag, and command-substitution targets stay gated; `kubectl` is
   never relaxed. Direct local detached reconciliation — `docker compose up -d
   [services...]` or the `docker-compose`/`--detach` equivalents — is autonomous without
-  this allowlist only when it is the sole top-level command and uses the bare
-  executable name. Wrappers, substitutions, compound commands, non-detached `up`, and
-  remote-daemon selection do not enter that carve-out. This keeps `sshd`/`ufw`/`nginx`
+  this allowlist. It may be combined only with a literal project `cd`, optional
+  rollback `docker tag`, and bounded read-only verification (`docker inspect`,
+  `sleep`, loopback-only `curl`). Direct SSH uses the same grammar and requires
+  explicit fleet service names. Wrappers, substitutions, arbitrary compound
+  commands, multiple reconciliations, non-detached `up`, and remote-daemon
+  selection do not enter that carve-out. This keeps `sshd`/`ufw`/`nginx`
   and other system services protected while unblocking the node's own apps. Write-gated for agents
-  (`managed-services-config`). See `docs/examples/managed-services.allow.example`.
+  (`managed-services-config`). Cross-broker mutation still requires fresh
+  in-task approval under the standing orders; this carve-out only makes that
+  approved runbook executable. See `docs/examples/managed-services.allow.example`.
 - Fail-closed: if a pattern is uncertain, prefer gating. Patterns are covered by
   `guard.test.sh` (allow + deny cases, including the force-push relaxation) to avoid
   blocking normal autonomous work.
