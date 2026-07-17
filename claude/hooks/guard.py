@@ -898,6 +898,19 @@ def _safe_loopback_curl(toks):
     return len(urls) == 1 and bool(_LOOPBACK_HTTP_RE.fullmatch(urls[0]))
 
 
+def _safe_post_reconcile_companion(toks):
+    """Read-only verification allowed after the reconciliation: docker inspect,
+    loopback-only curl, and a bounded sleep."""
+    if toks[:2] == ["docker", "inspect"] and len(toks) >= 3:
+        return True
+    if _safe_loopback_curl(toks):
+        return True
+    if toks[0] == "sleep" and len(toks) == 2 \
+            and re.fullmatch(r"\d+(?:[.]\d+)?s?", toks[1]):
+        return float(toks[1].removesuffix("s")) <= _MAX_RUNBOOK_SLEEP_SECONDS
+    return False
+
+
 def _safe_compose_sequence_body(c, *, remote):
     statements = _split_safe_compose_sequence(c)
     if not statements:
@@ -937,18 +950,8 @@ def _safe_compose_sequence_body(c, *, remote):
                 return False
             saw_tag = True
             continue
-        if not post_reconcile:
+        if not post_reconcile or not _safe_post_reconcile_companion(toks):
             return False
-        if toks[:2] == ["docker", "inspect"] and len(toks) >= 3:
-            continue
-        if _safe_loopback_curl(toks):
-            continue
-        if toks[0] == "sleep" and len(toks) == 2 \
-                and re.fullmatch(r"\d+(?:[.]\d+)?s?", toks[1]):
-            seconds = float(toks[1].removesuffix("s"))
-            if seconds <= _MAX_RUNBOOK_SLEEP_SECONDS:
-                continue
-        return False
     return compose_count == 1
 
 
