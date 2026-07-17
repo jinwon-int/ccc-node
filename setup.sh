@@ -12,7 +12,8 @@
 #                              #   plugin registered them. Node-local hooks stay in settings.
 #   ./setup.sh --dry-run       # show what would happen, change nothing (combine with above)
 #   ./setup.sh --no-backup     # skip the durable operator backup (failure rollback remains enabled)
-#   sudo ./setup.sh --operational-relax  # explicitly install the broad operational profile
+#   ./setup.sh --strict-guard  # keep a fresh root install strict instead of seeding operational-relax
+#   sudo ./setup.sh --operational-relax  # explicitly relax an existing profile-less root install
 #
 # Node-identity seeding (optional): when these are given, freshly-seeded CLAUDE.md / MEMORY.md /
 # USER.md have their <PLACEHOLDER> tokens substituted automatically (existing files are never
@@ -28,7 +29,7 @@
 #   --user-context <text>                       -> <USER_CONTEXT>
 set -euo pipefail
 
-DRY=0; WITH_PLUGIN=0; BACKUP=1; OPERATIONAL_RELAX=0
+DRY=0; WITH_PLUGIN=0; BACKUP=1; OPERATIONAL_RELAX=0; STRICT_GUARD=0
 OPT_NODE=""; OPT_DISPLAY=""; OPT_SLOT=""; OPT_FLEET_ROLE=""; OPT_LANG=""
 OPT_USER_NAME=""; OPT_USER_GH=""; OPT_USER_TZ=""; OPT_USER_CONTEXT=""
 need_val() { [ -n "${2:-}" ] || { echo "Flag $1 requires a value" >&2; exit 2; }; }
@@ -57,6 +58,7 @@ while [ $# -gt 0 ]; do
     --dry-run) DRY=1 ;;
     --with-plugin) WITH_PLUGIN=1 ;;
     --no-backup) BACKUP=0 ;;
+    --strict-guard) STRICT_GUARD=1 ;;
     --operational-relax) OPERATIONAL_RELAX=1 ;;
     --node)         need_val "$1" "${2:-}"; OPT_NODE="$2"; shift ;;
     --display)      need_val "$1" "${2:-}"; OPT_DISPLAY="$2"; shift ;;
@@ -94,11 +96,37 @@ fi
 
 ccc_validate_setup_roots "$CLAUDE_DIR" "$HERMES_ROOT" || exit 2
 
+# Capture this before setup installs the hook. Routine setup/self-update must
+# not widen an existing profile-less strict node; the default applies only to a
+# genuinely fresh root ccc-node install.
+CCC_NODE_PREEXISTING=0
+for marker in hooks/guard.py hooks/guard.sh hooks/load-memory.sh hooks/ccc-self-update.sh; do
+  if [ -e "$CLAUDE_DIR/$marker" ] || [ -L "$CLAUDE_DIR/$marker" ]; then
+    CCC_NODE_PREEXISTING=1
+    break
+  fi
+done
+
+if [ "$OPERATIONAL_RELAX" = 1 ] && [ "$STRICT_GUARD" = 1 ]; then
+  echo "ERROR: --operational-relax and --strict-guard are mutually exclusive; no setup changes were made" >&2
+  exit 2
+fi
+
+GUARD_PROFILE_INSTALL=0
+GUARD_PROFILE_REASON=""
 if [ "$OPERATIONAL_RELAX" = 1 ]; then
   if ! _ccc_is_root; then
     echo "ERROR: --operational-relax requires root; no setup changes were made" >&2
     exit 2
   fi
+  GUARD_PROFILE_INSTALL=1
+  GUARD_PROFILE_REASON="explicit operational-relax"
+elif [ "$STRICT_GUARD" = 0 ] && [ "$CCC_NODE_PREEXISTING" = 0 ] && _ccc_is_root; then
+  GUARD_PROFILE_INSTALL=1
+  GUARD_PROFILE_REASON="fresh root default"
+fi
+
+if [ "$GUARD_PROFILE_INSTALL" = 1 ]; then
   if [ ! -e "$GUARD_PROFILE_PATH" ] && [ ! -L "$GUARD_PROFILE_PATH" ]; then
     ccc_validate_setup_guard_profile "$GUARD_PROFILE_PATH" || exit 2
   fi
@@ -243,8 +271,8 @@ neutralize_bypass_if_root() {
   fi
 }
 
-install_requested_operational_relax_profile() {
-  [ "$OPERATIONAL_RELAX" = 1 ] || return 0
+install_operational_relax_profile() {
+  [ "$GUARD_PROFILE_INSTALL" = 1 ] || return 0
 
   # An operator-created file (including an intentionally fail-closed malformed
   # file or symlink) is never replaced by setup.
@@ -259,7 +287,7 @@ install_requested_operational_relax_profile() {
   ccc_validate_setup_guard_profile "$GUARD_PROFILE_PATH" || return 1
   if [ "$DRY" = 1 ]; then
     render_command mkdir -p "$parent"
-    echo "[dry-run] explicit operational-relax: install guard profile -> $GUARD_PROFILE_PATH"
+    echo "[dry-run] $GUARD_PROFILE_REASON: install guard profile -> $GUARD_PROFILE_PATH"
     return 0
   fi
   [ -r "$source" ] || {
@@ -283,7 +311,7 @@ install_requested_operational_relax_profile() {
   # an operator or concurrent installer between the checks above.
   if ln "$tmp" "$GUARD_PROFILE_PATH" 2>/dev/null; then
     rm -f -- "$tmp"
-    note "explicit operational-relax: installed guard profile -> $GUARD_PROFILE_PATH"
+    note "$GUARD_PROFILE_REASON: installed guard profile -> $GUARD_PROFILE_PATH"
   else
     rm -f -- "$tmp"
     if [ -e "$GUARD_PROFILE_PATH" ] || [ -L "$GUARD_PROFILE_PATH" ]; then
@@ -679,7 +707,8 @@ printf '  - CCC_CODEX_CLI_PATH=%s/hooks/ccc-codex\n' "$CLAUDE_DIR"
 printf '  - CCC_CODEX_MEMORY_MATERIALIZER_PATH=%s/hooks/ccc_codex_memory.py\n' "$CLAUDE_DIR"
 printf '  - bridge command=./start.sh --path %s -d\n' "$BRIDGE_DEFAULT_PATH"
 
-# This is the final managed mutation. It runs only after an explicit root opt-in
-# and atomically refuses to overwrite an operator or concurrent profile.
-install_requested_operational_relax_profile
+# This is the final managed mutation. It runs for the approved fresh-root
+# default or an explicit existing-node opt-in and atomically refuses to
+# overwrite an operator or concurrent profile.
+install_operational_relax_profile
 SETUP_TXN_ACTIVE=0

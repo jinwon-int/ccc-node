@@ -211,11 +211,18 @@ ok "root-neutralized settings retain the native catastrophic deny backstop" \
   'jq -e '\''(.permissions.deny // []) as $d | ($d | any(. == "Bash(rm -rf /:*)")) and ($d | any(. == "Bash(git push --force origin main:*)"))'\'' "$root_claude/settings.json" >/dev/null'
 ok "root install retains the semantic PreToolUse guard" \
   '[ -x "$root_claude/hooks/guard.sh" ] && jq -e '\''[.hooks.PreToolUse[].hooks[].command] | any(contains("guard.sh"))'\'' "$root_claude/settings.json" >/dev/null'
-ok "fresh root install remains strict by default" \
-  '[ ! -e "$TMP/root-guard-profile" ]'
+ok "fresh root install seeds operational-relax by default" \
+  '[ -f "$TMP/root-guard-profile" ] && [ ! -L "$TMP/root-guard-profile" ] && grep -qx "operational-relax" "$TMP/root-guard-profile" && [ "$(stat -c %a "$TMP/root-guard-profile")" = 644 ]'
 
-# Explicit root opt-in seeds the profile; setup never overwrites an existing
-# operator choice, and non-root opt-in fails before any managed mutation.
+strict_claude="$TMP/strict-root-claude"
+HOME="$TMP/strict-root-home" CCC_CLAUDE_DIR="$strict_claude" CCC_HERMES_DIR="$TMP/strict-root-hermes" \
+  CCC_SETUP_GUARD_PROFILE_PATH="$TMP/strict-root-guard-profile" \
+  CCC_SETUP_TEST_EUID=0 bash "$SETUP" --no-backup --strict-guard >/dev/null 2>&1
+ok "--strict-guard keeps a fresh root install strict" \
+  '[ ! -e "$TMP/strict-root-guard-profile" ] && [ -x "$strict_claude/hooks/guard.sh" ]'
+
+# Explicit root opt-in remains available for existing/profile-less nodes; setup
+# never overwrites an operator choice, and non-root opt-in fails before mutation.
 relaxed_claude="$TMP/relaxed-root-claude"
 set +e
 HOME="$TMP/relaxed-root-home" CCC_CLAUDE_DIR="$relaxed_claude" CCC_HERMES_DIR="$TMP/relaxed-root-hermes" \
@@ -232,15 +239,15 @@ operator_profile_before="$(sha256sum "$TMP/operator-guard-profile")"
 set +e
 HOME="$TMP/operator-root-home" CCC_CLAUDE_DIR="$TMP/operator-root-claude" CCC_HERMES_DIR="$TMP/operator-root-hermes" \
   CCC_SETUP_GUARD_PROFILE_PATH="$TMP/operator-guard-profile" \
-  CCC_SETUP_TEST_EUID=0 bash "$SETUP" --no-backup --operational-relax >/dev/null 2>&1
+  CCC_SETUP_TEST_EUID=0 bash "$SETUP" --no-backup >/dev/null 2>&1
 operator_rc=$?
 set -e
-ok "explicit opt-in preserves an existing operator guard profile byte-for-byte" \
+ok "fresh root default preserves an existing operator guard profile byte-for-byte" \
   '[ "$operator_rc" = 0 ] && [ "$(sha256sum "$TMP/operator-guard-profile")" = "$operator_profile_before" ] && [ "$(stat -c %a "$TMP/operator-guard-profile")" = 600 ]'
 
 existing_strict_claude="$TMP/existing-strict-claude"
 mkdir -p "$existing_strict_claude/hooks"
-printf '%s\n' '# existing ccc-node marker' > "$existing_strict_claude/hooks/guard.py"
+printf '%s\n' '# existing ccc-node marker with guard drift' > "$existing_strict_claude/hooks/load-memory.sh"
 HOME="$TMP/existing-strict-home" CCC_CLAUDE_DIR="$existing_strict_claude" CCC_HERMES_DIR="$TMP/existing-strict-hermes" \
   CCC_SETUP_GUARD_PROFILE_PATH="$TMP/existing-strict-guard-profile" \
   CCC_SETUP_TEST_EUID=0 bash "$SETUP" --no-backup >/dev/null 2>&1
@@ -266,6 +273,15 @@ nonroot_relax_rc=$?
 set -e
 ok "non-root operational-relax request fails before managed mutation" \
   '[ "$nonroot_relax_rc" = 2 ] && grep -q "requires root" <<<"$nonroot_relax_out" && [ ! -e "$TMP/nonroot-relax-guard-profile" ] && [ ! -e "$TMP/nonroot-relax-claude/settings.json" ]'
+
+set +e
+conflict_out="$(HOME="$TMP/conflict-home" CCC_CLAUDE_DIR="$TMP/conflict-claude" CCC_HERMES_DIR="$TMP/conflict-hermes" \
+  CCC_SETUP_GUARD_PROFILE_PATH="$TMP/conflict-guard-profile" \
+  CCC_SETUP_TEST_EUID=0 bash "$SETUP" --no-backup --operational-relax --strict-guard 2>&1)"
+conflict_rc=$?
+set -e
+ok "conflicting guard flags fail before managed mutation" \
+  '[ "$conflict_rc" = 2 ] && grep -q "mutually exclusive" <<<"$conflict_out" && [ ! -e "$TMP/conflict-guard-profile" ] && [ ! -e "$TMP/conflict-claude/settings.json" ]'
 
 # A node's accumulated/hand-added approvals must survive a re-run (the self-update path).
 printf '%s\n' '{"permissions":{"allow":["Bash(node-local-only:*)"]}}' > "$seed_claude/settings.local.json"

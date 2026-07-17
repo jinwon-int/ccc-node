@@ -13,7 +13,8 @@ git clone https://github.com/jinwon-int/ccc-node.git
 cd ccc-node
 ./setup.sh --dry-run   # preview resolved paths and planned writes
 ./setup.sh             # install harness files/templates into ~/.claude and ~/.hermes
-# Root-only opt-in: sudo ./setup.sh --operational-relax
+# Fresh root installs seed operational-relax; add --strict-guard to opt out.
+# Existing strict root nodes can opt in later: sudo ./setup.sh --operational-relax
 
 # Optional Telegram bridge:
 cd bridge

@@ -2,6 +2,17 @@
 
 Contributions should be small, reviewable, and safe to discuss publicly.
 
+## Operator decisions and review scope
+
+Explicit operator-approved behavior and acceptance criteria are requirements,
+not suggestions for a cleanup or security-review pass. Reviewers may harden the
+implementation while preserving those semantics, but must not invert defaults,
+opt-in/opt-out direction, or the approved operating model without a new,
+explicit operator decision. If a security concern appears to require such a
+policy change, stop and present the conflict instead of silently redesigning the
+change. Authority to tidy, review, approve, or merge a PR does not by itself
+authorize a product-policy reversal.
+
 Before opening a pull request:
 
 1. Keep runtime credentials, local state, generated artifacts, private paths,
