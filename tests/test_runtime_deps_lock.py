@@ -15,6 +15,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 RUNTIME_LOCK = REPO_ROOT / "bridge" / "requirements.lock.txt"
+UNLOCKED_FALLBACK = REPO_ROOT / "bridge" / "requirements.txt"
 CI_LOCK = REPO_ROOT / ".github" / "requirements" / "bridge-ci.txt"
 PYPROJECT = REPO_ROOT / "bridge" / "pyproject.toml"
 START_SH = REPO_ROOT / "bridge" / "start.sh"
@@ -51,6 +52,29 @@ def test_runtime_lock_pins_every_requirement_with_hashes():
         # Hashes continue on following lines; every pin must open a
         # continuation so pip --require-hashes has something to verify.
         assert line.rstrip().endswith("\\"), f"pin without hash continuation: {line!r}"
+
+
+def test_unlocked_fallback_pins_match_the_runtime_lock():
+    """CCC_DEPS_UNLOCKED=1 installs bridge/requirements.txt directly; a lower
+    bound there could pull a breaking major the locked flow never vetted. Every
+    fallback entry must be an exact pin, at the same version the runtime lock
+    resolved."""
+    lock = {_canonical(name): ver for name, ver in _pins(RUNTIME_LOCK).items()}
+    lines = [
+        line.strip()
+        for line in UNLOCKED_FALLBACK.read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+    assert lines, "expected requirements in the unlocked fallback list"
+    for line in lines:
+        match = PIN.match(line)
+        assert match, f"unlocked fallback requirement is not exactly pinned: {line!r}"
+        name, version = match.group(1), match.group(2)
+        locked = lock.get(_canonical(name))
+        assert locked == version, (
+            f"unlocked fallback pin {name}=={version} diverges from "
+            f"requirements.lock.txt ({locked}); regenerate them together"
+        )
 
 
 def test_runtime_lock_headers_record_canonical_generation_command():

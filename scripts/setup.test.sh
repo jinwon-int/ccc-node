@@ -170,8 +170,46 @@ credential_before="$(sha256sum "$rewrite_claude/.credentials.json")"
 out="$(HOME="$TMP/rewrite-home" CCC_CLAUDE_DIR="$rewrite_claude" CCC_HERMES_DIR="$rewrite_hermes" bash "$SETUP" --no-backup 2>&1)"; rc=$?
 ok "custom-path rewrite leaves node-local credentials untouched" \
   '[ "$rc" = 0 ] && [ "$(sha256sum "$rewrite_claude/.credentials.json")" = "$credential_before" ]'
+# Slash commands invoke repo scripts verbatim; installed copies must point at
+# THIS checkout, not the canonical /opt/ccc-node (broken on e.g. /root/ccc-node
+# nodes). Repo templates stay canonical — only installed copies are rewritten.
+ok "setup rewrites the canonical repo path into installed slash commands" \
+  'grep -Fq "$ROOT/scripts/ccc-doctor.sh" "$rewrite_claude/commands/doctor.md" && grep -Fq "git -C $ROOT status" "$rewrite_claude/commands/node-status.md"'
+if [ "$ROOT" != "/opt/ccc-node" ]; then
+  ok "setup leaves no stale /opt/ccc-node reference in installed commands" \
+    '! grep -rq "/opt/ccc-node" "$rewrite_claude/commands"'
+fi
+# Non-cascading regression (PR #563 review): a checkout under a path containing
+# /root/.claude must keep its freshly inserted $SRC intact — the harness-dir
+# pair must not rescan and corrupt the repo-path pair's output.
+cascade_src="$TMP/root/.claude/src"
+mkdir -p "$cascade_src"
+tar -C "$ROOT" --exclude=.git --exclude=bridge/venv --exclude=bridge/logs \
+  --exclude=.harness-tmp -cf - . 2>/dev/null | tar -xf - -C "$cascade_src"
+cascade_claude="$TMP/cascade-claude"
+out="$(HOME="$TMP/cascade-home" CCC_CLAUDE_DIR="$cascade_claude" \
+  CCC_HERMES_DIR="$TMP/cascade-hermes" bash "$cascade_src/setup.sh" --no-backup 2>&1)"; rc=$?
+ok "setup from a /root/.claude-containing checkout installs commands pointing at that checkout" \
+  '[ "$rc" = 0 ] && grep -Fq "$cascade_src/scripts/ccc-doctor.sh" "$cascade_claude/commands/doctor.md"'
+ok "cascade regression: installed commands never point into the harness dir" \
+  '! grep -Fq "$cascade_claude/scripts" "$cascade_claude/commands/doctor.md"'
+# Unsafe checkout paths are rejected up-front (PR #563 review): $SRC is embedded
+# verbatim into slash-command shell text, so whitespace/metacharacter paths must
+# refuse to install rather than produce broken unquoted commands.
+space_src="$TMP/space dir/src"
+mkdir -p "$space_src/scripts/lib"
+cp "$ROOT/setup.sh" "$space_src/setup.sh"
+cp "$ROOT/scripts/lib/harness-paths.sh" "$ROOT/scripts/lib/harness_paths.py" "$space_src/scripts/lib/"
+out="$(HOME="$TMP/space-home" CCC_CLAUDE_DIR="$TMP/space-claude" \
+  CCC_HERMES_DIR="$TMP/space-hermes" bash "$space_src/setup.sh" --dry-run 2>&1)"; rc=$?
+ok "setup refuses a checkout path unsafe for slash-command embedding" \
+  '[ "$rc" = 2 ] && grep -q "unsafe for installed slash commands" <<<"$out" && [ ! -e "$TMP/space-claude" ]'
 ok "setup deploys the shared path library beside installed self-update" \
   '[ -x "$rewrite_claude/hooks/lib/harness-paths.sh" ] && [ -x "$rewrite_claude/hooks/lib/harness_paths.py" ] && cmp -s "$ROOT/scripts/lib/harness-paths.sh" "$rewrite_claude/hooks/lib/harness-paths.sh" && cmp -s "$ROOT/scripts/lib/harness_paths.py" "$rewrite_claude/hooks/lib/harness_paths.py" && grep -Fq "lib/harness-paths.sh" "$rewrite_claude/hooks/ccc-self-update.sh"'
+# checkpoint.sh/distill.sh source lib/mtime-prune.sh behind an if-readable
+# guard; without deploying it, standalone-node pruning is a silent no-op.
+ok "setup deploys the mtime-prune library the pruning hooks source" \
+  '[ -x "$rewrite_claude/hooks/lib/mtime-prune.sh" ] && cmp -s "$ROOT/claude/hooks/lib/mtime-prune.sh" "$rewrite_claude/hooks/lib/mtime-prune.sh"'
 ok "setup installs the Codex launcher and materializer as executable managed hooks" \
   '[ -x "$rewrite_claude/hooks/ccc-codex" ] && [ -x "$rewrite_claude/hooks/ccc_codex_memory.py" ] && cmp -s "$ROOT/scripts/ccc-codex" "$rewrite_claude/hooks/ccc-codex" && cmp -s "$ROOT/scripts/ccc_codex_memory.py" "$rewrite_claude/hooks/ccc_codex_memory.py"'
 codex_dry_out="$(HOME="$nonroot_home" CCC_CLAUDE_DIR="$nonroot_claude" CCC_HERMES_DIR="$nonroot_hermes" CCC_WIKI_AGENT_BIN="$nonroot_wiki" CCC_BRIDGE_DEFAULT_PATH="$nonroot_bridge" bash "$SETUP" --dry-run 2>&1)"; codex_dry_rc=$?
