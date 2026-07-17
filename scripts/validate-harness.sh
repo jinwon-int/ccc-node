@@ -6,7 +6,14 @@
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT" || exit 1
-TMP="${TMPDIR:-/tmp}"; mkdir -p "$TMP" 2>/dev/null || TMP="$ROOT/.harness-tmp"; mkdir -p "$TMP" 2>/dev/null
+# Private scratch dir. Validation writes fixed-name artifacts (rendered.json,
+# guard-profile.out, htest.out, ...); pointing at a SHARED ${TMPDIR:-/tmp} makes
+# runs collide with other users' stale copies — with fs.protected_regular the
+# open is denied outright — and the run false-FAILs (observed on gwakga:
+# /tmp/rendered.json left by another account). Always use a fresh private dir.
+TMP="$(mktemp -d 2>/dev/null || mktemp -d -t ccc-validate 2>/dev/null)" \
+  || { TMP="$ROOT/.harness-tmp.$$"; mkdir -p "$TMP"; }
+trap 'rm -rf "$TMP" 2>/dev/null || true' EXIT
 fail=0
 say() { printf '%s\n' "$*"; }
 err() { printf 'FAIL: %s\n' "$*"; fail=1; }
