@@ -170,6 +170,15 @@ credential_before="$(sha256sum "$rewrite_claude/.credentials.json")"
 out="$(HOME="$TMP/rewrite-home" CCC_CLAUDE_DIR="$rewrite_claude" CCC_HERMES_DIR="$rewrite_hermes" bash "$SETUP" --no-backup 2>&1)"; rc=$?
 ok "custom-path rewrite leaves node-local credentials untouched" \
   '[ "$rc" = 0 ] && [ "$(sha256sum "$rewrite_claude/.credentials.json")" = "$credential_before" ]'
+# Slash commands invoke repo scripts verbatim; installed copies must point at
+# THIS checkout, not the canonical /opt/ccc-node (broken on e.g. /root/ccc-node
+# nodes). Repo templates stay canonical — only installed copies are rewritten.
+ok "setup rewrites the canonical repo path into installed slash commands" \
+  'grep -Fq "$ROOT/scripts/ccc-doctor.sh" "$rewrite_claude/commands/doctor.md" && grep -Fq "git -C $ROOT status" "$rewrite_claude/commands/node-status.md"'
+if [ "$ROOT" != "/opt/ccc-node" ]; then
+  ok "setup leaves no stale /opt/ccc-node reference in installed commands" \
+    '! grep -rq "/opt/ccc-node" "$rewrite_claude/commands"'
+fi
 ok "setup deploys the shared path library beside installed self-update" \
   '[ -x "$rewrite_claude/hooks/lib/harness-paths.sh" ] && [ -x "$rewrite_claude/hooks/lib/harness_paths.py" ] && cmp -s "$ROOT/scripts/lib/harness-paths.sh" "$rewrite_claude/hooks/lib/harness-paths.sh" && cmp -s "$ROOT/scripts/lib/harness_paths.py" "$rewrite_claude/hooks/lib/harness_paths.py" && grep -Fq "lib/harness-paths.sh" "$rewrite_claude/hooks/ccc-self-update.sh"'
 ok "setup installs the Codex launcher and materializer as executable managed hooks" \

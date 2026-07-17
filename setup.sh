@@ -550,17 +550,22 @@ seed "$SRC/hermes/memories/USER.template.md"      "$MEM_DIR/USER.md"
 # honcho.json stays node-local under ~/.hermes (documentation/Hermes-side; not a hard CC dep).
 seed "$SRC/hermes/honcho.template.json"           "$HERMES_ROOT/honcho.json"
 
-# 2b) HOME-path rewrite — the settings/hook/skill templates use /root/.claude as the
-# canonical harness path. On nodes whose harness dir is not /root/.claude (e.g. Termux,
-# HOME=/data/data/com.termux/files/home), rewrite the installed files so settings.json
-# hook *command* paths resolve AND hook internal defaults (${CCC_*:-/root/.claude/...})
-# point at this node's real dir. Without this, claude fails its SessionEnd/Start hooks
-# (hook script not found) and memory/cache/state default to a nonexistent /root path.
-# No-op on standard root-HOME nodes where CLAUDE_DIR == /root/.claude.
-if [ "$CLAUDE_DIR" != "/root/.claude" ]; then
-  note "rewrite /root/.claude -> $CLAUDE_DIR in installed harness files"
+# 2b) Canonical-path rewrite — the settings/hook/skill/command templates use
+# /root/.claude as the canonical harness path and /opt/ccc-node as the canonical
+# repo checkout. On nodes where either differs (e.g. Termux HOME, or a
+# /root/ccc-node checkout like gwakga), rewrite the installed files so
+# settings.json hook *command* paths and hook internal defaults
+# (${CCC_*:-/root/.claude/...}) resolve, AND so the slash commands that invoke
+# repo scripts verbatim (/doctor, /node-status, /security-audit, /agent-cron)
+# point at this node's real checkout instead of a nonexistent /opt/ccc-node.
+# Repo templates stay canonical; only installed copies are rewritten. The
+# /opt/ccc-node pair is applied first so a pathological SRC under the harness
+# dir cannot be corrupted by the second pass.
+# No-op on standard nodes (CLAUDE_DIR == /root/.claude, SRC == /opt/ccc-node).
+if [ "$CLAUDE_DIR" != "/root/.claude" ] || [ "$SRC" != "/opt/ccc-node" ]; then
+  note "rewrite canonical paths (/opt/ccc-node -> $SRC, /root/.claude -> $CLAUDE_DIR) in installed harness files"
   if [ "$DRY" = 1 ]; then
-    render_command rewrite-root-paths "/root/.claude" "$CLAUDE_DIR"
+    render_command rewrite-canonical-paths "/opt/ccc-node" "$SRC" "/root/.claude" "$CLAUDE_DIR"
   else
     rewrite_targets=(
       "$CLAUDE_DIR/settings.json"
@@ -576,14 +581,18 @@ if [ "$CLAUDE_DIR" != "/root/.claude" ]; then
     done
     for rewrite_file in "${rewrite_targets[@]}"; do
       [ -f "$rewrite_file" ] || continue
-      python3 - "$rewrite_file" "$CLAUDE_DIR" <<'PY'
+      python3 - "$rewrite_file" "/opt/ccc-node" "$SRC" "/root/.claude" "$CLAUDE_DIR" <<'PY'
 import sys
 
-path, replacement = sys.argv[1:]
+path = sys.argv[1]
+pairs = list(zip(sys.argv[2::2], sys.argv[3::2]))
 with open(path, encoding="utf-8") as fh:
     content = fh.read()
+for old, new in pairs:
+    if old != new:
+        content = content.replace(old, new)
 with open(path, "w", encoding="utf-8") as fh:
-    fh.write(content.replace("/root/.claude", replacement))
+    fh.write(content)
 PY
     done
   fi
