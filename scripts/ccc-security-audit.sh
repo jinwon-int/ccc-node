@@ -158,21 +158,23 @@ if hook_dir.exists():
 else:
     add('경고', 'hook permissions', 'hook directory not present', 'node may not be installed as ccc-node')
 
-# Settings allowlist posture. Broad Bash(*) is acceptable only with guard present.
+# Settings allowlist posture. A broad Bash(*) allowlist is acceptable when the
+# native permissions.deny backstop is present. ccc-node no longer ships a custom
+# guard hook — the native deny list (enforced in every mode, including
+# bypassPermissions) plus the unprivileged OS account are the boundary.
 settings = claude_dir / 'settings.json'
 if settings.exists():
     try:
         data = json.loads(settings.read_text(encoding='utf-8'))
         allow = data.get('permissions', {}).get('allow', []) or []
         deny = data.get('permissions', {}).get('deny', []) or []
-        hooks = data.get('hooks', {}) or {}
-        has_guard = any('guard.sh' in h.get('command', '') for ev in hooks.values() for group in ([ev] if isinstance(ev, dict) else ev) for h in group.get('hooks', []))
         broad = any(x in allow for x in ['Bash(*)', 'Read(*)', 'Write(*)', 'Edit(*)', 'MultiEdit(*)'])
         secret_deny = any('.env' in x or '.credentials.json' in x or 'id_rsa' in x for x in deny)
-        if broad and has_guard and secret_deny:
-            add('정상', 'settings allowlist', 'broad allowlist is paired with guard hook and secret deny entries', 'none')
-        elif broad and not has_guard:
-            add('위험', 'settings allowlist', 'broad allowlist without guard hook', 'restore guard hook or switch install mode')
+        release_deny = any('npm publish' in x or 'gh release create' in x for x in deny)
+        if broad and secret_deny and release_deny:
+            add('정상', 'settings allowlist', 'broad allowlist is paired with the native secret + release deny backstop', 'none')
+        elif broad and not secret_deny:
+            add('위험', 'settings allowlist', 'broad allowlist without the native secret deny backstop', 'restore permissions.deny from claude/settings.base.json')
         else:
             add('경고', 'settings allowlist', 'nonstandard permissions posture', 'review against ccc-node policy')
     except Exception:

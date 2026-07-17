@@ -295,11 +295,11 @@ class Config(BaseSettings):
             "ignored on every other profile and under root). Default true: a "
             "non-root owner-operator node runs its Claude SDK path with "
             "permission_mode=bypassPermissions, no OS sandbox, and no host "
-            "settings chain — so the PreToolUse guard hook is not loaded — "
-            "matching Codex's never + dangerFullAccess. Set false to keep "
-            "guard.py as the boundary. Ignored under root (Claude Code refuses "
-            "bypassPermissions with root/sudo); memory context is preserved; "
-            "reversible per node."
+            "settings chain — so not even the native permissions.deny backstop "
+            "loads — matching Codex's never + dangerFullAccess. Set false to "
+            "keep the native deny backstop as the boundary. Ignored under root "
+            "(Claude Code refuses bypassPermissions with root/sudo); memory "
+            "context is preserved; reversible per node."
         ),
     )
     telegram_session_scope: Literal[

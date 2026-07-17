@@ -4,6 +4,30 @@ All notable changes to the Claude Code node harness. Dates are KST.
 
 ## [Unreleased]
 
+### Changed
+- **Removed the custom PreToolUse command guard; Claude Code now runs at Codex
+  parity via native permissions.** `guard.py` / `guard.sh` / `guard.test.sh` and
+  the `PreToolUse` guard hook (in `enforcement-overlay.json` and `hooks.json`)
+  are deleted. The execution boundary is now (1) Claude Code's native
+  `permissions.deny` backstop in `settings.base.json` — secret-file reads,
+  `npm publish` / `gh release create`, and best-effort catastrophic shapes
+  (`rm -rf /`, force-push to `main`), which Claude Code enforces in every mode
+  including `bypassPermissions` — and (2) the unprivileged OS account the node
+  runs as (its docker/sudo/SSH grants), exactly like cccnode/Codex. Native Bash
+  deny rules are coarse prefix-globs (they do not catch quoting, env-var
+  prefixes, or `&&`-chained variants), so they are a best-effort catastrophic
+  backstop, not the semantic Fresh-Approval wall the guard enforced.
+  Consequences: the `managed-nodes.allow` / `managed-services.allow` allowlists
+  and the `CCC_ALLOW_GATED=1` operator escape hatch are gone (nothing reads
+  them); the `sudo` `ask` prompt is dropped (the OS sudoers is the gate);
+  fleet-service lifecycle, managed-node operations, and broker Compose runbooks
+  are ordinary work bounded only by the OS account. `RISK-PROFILES.md` (the
+  guard risk-profile model) is removed. Harness self-checks are updated:
+  `ccc-doctor` detects install mode by `PostToolUse` instead of `PreToolUse`,
+  and `ccc-security-audit` / `validate-harness` assert the native deny backstop
+  instead of the guard hook. Run Claude as a non-root user for the no-prompt
+  default; root nodes drop the default and prompt normally.
+
 ### Fixed
 - Root-aware `bypassPermissions` default (fixes a root node bricking every new
   Claude session). Claude Code refuses `--dangerously-skip-permissions` — the

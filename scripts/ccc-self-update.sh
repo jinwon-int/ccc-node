@@ -1,15 +1,14 @@
 #!/usr/bin/env bash
 # ccc-self-update — the PRE-APPROVED node maintenance procedure.
 #
-# Problem this solves: broker/Gateway/worker service control is (correctly)
-# operator_approval_gated in guard.sh, but a fleet node is only useful if it
-# can pick up ccc-node updates and restart its own services. Instead of
-# loosening the gate, this script IS the approval: a fixed, code-reviewed,
-# audited procedure (mirroring the ccc-telegram-bridge restart carve-out
-# rationale) that an agent may invoke as a whole. The blast radius stays
-# operator-controlled because the ONLY services it will ever touch are the
-# ones listed in an operator-owned allowlist file that guard.sh blocks agents
-# from writing:
+# Problem this solves: a fleet node is only useful if it can pick up ccc-node
+# updates and restart its own services. This script IS the approval for that: a
+# fixed, code-reviewed, audited procedure (mirroring the ccc-telegram-bridge
+# restart carve-out rationale) that an agent may invoke as a whole. The blast
+# radius stays operator-controlled because the ONLY services it will ever touch
+# are the ones listed in an operator-owned allowlist file kept out of agent
+# reach by root/operator file ownership (the unprivileged run account is the
+# harness boundary now that the custom guard hook is removed):
 #   ~/.claude/self-update.services   (one systemd unit name per line, # comments)
 #   ~/.claude/self-update.repo       (optional: absolute repo path override)
 #

@@ -1,6 +1,6 @@
 """Opt-in Codex-parity ungoverned Claude execution (CCC_BRIDGE_CLAUDE_UNRESTRICTED).
 
-Verifies the flag reaches Codex parity (no guard settings chain, bypass
+Verifies the flag reaches Codex parity (no settings chain, bypass
 permissions, no OS sandbox) only on owner-operator, and is fail-closed
 everywhere else.
 """
@@ -85,14 +85,14 @@ class ClaudeUnrestrictedWiringTest(unittest.TestCase):
     def test_owner_operator_flag_reaches_codex_parity(self) -> None:
         options = _build_options(profile="owner-operator", unrestricted=True)
         self.assertEqual(options.permission_mode, "bypassPermissions")
-        # No host settings chain => the PreToolUse guard hook is not loaded.
+        # No host settings chain => not even the native deny backstop loads.
         self.assertEqual(options.setting_sources, [])
         # No OS sandbox: host-capable like Codex dangerFullAccess.
         self.assertIsNone(options.sandbox)
         # Bash stays auto-allowed.
         self.assertIn("Bash", options.allowed_tools)
 
-    def test_owner_operator_default_keeps_the_guard_boundary(self) -> None:
+    def test_owner_operator_default_keeps_the_native_deny_boundary(self) -> None:
         options = _build_options(profile="owner-operator", unrestricted=False)
         self.assertEqual(options.permission_mode, "default")
         self.assertEqual(options.setting_sources, ["user", "project", "local"])
@@ -111,9 +111,9 @@ class ClaudeUnrestrictedWiringTest(unittest.TestCase):
         )
         self.assertNotEqual(options.permission_mode, "bypassPermissions")
 
-    def test_flag_is_ignored_under_root_and_keeps_the_guard(self) -> None:
+    def test_flag_is_ignored_under_root_and_keeps_host_settings(self) -> None:
         # Root bridge: Claude Code refuses bypassPermissions, so the flag must
-        # degrade to the normal guarded owner-operator path instead of
+        # degrade to the normal host-settings owner-operator path instead of
         # emitting an option Claude Code would reject.
         options = _build_options(
             profile="owner-operator", unrestricted=True, is_root=True
@@ -125,7 +125,7 @@ class ClaudeUnrestrictedWiringTest(unittest.TestCase):
 class ClaudeUnrestrictedDefaultTest(unittest.TestCase):
     def test_config_default_is_unrestricted(self) -> None:
         # The package default is now Codex parity: an owner-operator node runs
-        # ungoverned unless it explicitly opts back into the guard.
+        # ungoverned unless it explicitly opts back into the native deny backstop.
         self.assertIs(Config.model_fields["claude_unrestricted"].default, True)
 
     def test_default_reaches_parity_on_non_root_owner_operator(self) -> None:
@@ -139,7 +139,7 @@ class ClaudeUnrestrictedDefaultTest(unittest.TestCase):
 
     def test_default_stays_fail_closed_off_profile_and_under_root(self) -> None:
         # The flipped default never widens strict-project/disabled, and root
-        # owner-operator still degrades to the guarded path.
+        # owner-operator still degrades to the host-settings path.
         default = Config.model_fields["claude_unrestricted"].default
         self.assertFalse(
             tool_policy.claude_unrestricted_enabled(default, "strict-project")

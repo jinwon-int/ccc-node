@@ -152,9 +152,9 @@ done
 
 # 3) shellcheck — scoped to reviewed scripts (blocking); others get bash -n only above.
 say "== shellcheck =="
-SC_SCOPE=(claude/hooks/guard.sh claude/hooks/audit.sh claude/hooks/redact.sh \
+SC_SCOPE=(claude/hooks/audit.sh claude/hooks/redact.sh \
           claude/hooks/notify.sh claude/hooks/statusline.sh claude/headless.sh \
-          claude/hooks/guard.test.sh scripts/ccc-service-control.sh \
+          scripts/ccc-service-control.sh \
           scripts/ccc-service-control.test.sh \
           claude/hooks/observability.test.sh scripts/validate-harness.sh \
           scripts/bridge-watchdog.sh scripts/bridge-watchdog.test.sh)
@@ -167,25 +167,33 @@ else
   say "  (shellcheck absent — skipped)"
 fi
 
-# 3b) guard.py — the PreToolUse enforcement logic behind the guard.sh shim. A
-# syntax error would make the shim fail OPEN (guard silently unenforced), so
-# compile it here and confirm setup.sh installs it alongside the shim.
-say "== guard.py (python enforcement) =="
+# 3b) python hooks — a syntax error would make a hook fail at runtime, so
+# compile the tracked python hook(s) here.
+say "== python hooks (compile) =="
 if command -v python3 >/dev/null 2>&1; then
-  if python3 -m py_compile claude/hooks/guard.py 2>/dev/null; then say "  ok claude/hooks/guard.py compiles"; else err "py_compile: claude/hooks/guard.py"; fi
   if python3 -m py_compile claude/hooks/statusline-usage.py 2>/dev/null; then say "  ok claude/hooks/statusline-usage.py compiles"; else err "py_compile: claude/hooks/statusline-usage.py"; fi
 else
   say "  (python3 absent — skipped)"
 fi
-if grep -Fq 'run cp "$SRC/claude/hooks/guard.py"' setup.sh 2>/dev/null; then
-  say "  ok setup.sh installs guard.py"
+# 3b-native) The native permissions.deny backstop replaces the removed guard
+# hook. Assert the secret-read and release denials ship so a broad Bash(*)
+# allowlist is never released without the catastrophic backstop.
+say "== native deny backstop =="
+if command -v jq >/dev/null 2>&1; then
+  if jq -e '(.permissions.deny // []) as $d
+            | ($d | any(. == "Read(**/.env)")) and ($d | any(. == "Bash(npm publish:*)"))' \
+       claude/settings.base.json >/dev/null 2>&1; then
+    say "  ok settings.base.json ships the native deny backstop"
+  else
+    err "settings.base.json missing the native permissions.deny backstop"
+  fi
 else
-  err "setup.sh does not install guard.py (guard.sh shim would fail open)"
+  say "  (jq absent — skipped)"
 fi
 
 # 4) hook tests
 say "== hook tests =="
-for t in claude/hooks/guard.test.sh claude/hooks/observability.test.sh claude/hooks/security-scan.test.sh \
+for t in claude/hooks/observability.test.sh claude/hooks/security-scan.test.sh \
          claude/hooks/checkpoint.test.sh claude/hooks/distill-scope.test.sh claude/hooks/skill-review.test.sh \
          claude/hooks/skill-review/autoinstall.test.sh \
          claude/hooks/lib/mtime-prune.test.sh \
@@ -283,7 +291,7 @@ fi
 # 6c) Rendered standalone settings (base + overlay) must be valid and carry all hook events.
 if jq -s '.[0] as $b | .[1] as $o | $b | .hooks = ($b.hooks + $o.hooks)' \
      claude/settings.base.json claude/hooks/enforcement-overlay.json >"$TMP/rendered.json" 2>/dev/null \
-   && jq -e '.hooks.PreToolUse and .hooks.SessionStart and .statusLine and .outputStyle' "$TMP/rendered.json" >/dev/null 2>&1; then
+   && jq -e '.hooks.PostToolUse and .hooks.SessionStart and .statusLine and .outputStyle' "$TMP/rendered.json" >/dev/null 2>&1; then
   say "  ok rendered standalone settings valid (node-local + portable + statusLine + outputStyle)"
 else
   err "rendered standalone settings (base+overlay) invalid or missing expected keys"

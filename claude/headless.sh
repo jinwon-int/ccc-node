@@ -4,9 +4,10 @@
 # session/cost logging. Prints the model's text result to stdout; logs session_id + cost
 # to stderr. Exit code mirrors the `claude` exit code.
 #
-# Fresh-Approval enforcement (guard.sh) STILL APPLIES here, because non-interactive mode
-# loads the same hooks/settings as an interactive session. Do NOT add --bare for runs that
-# must stay guarded: --bare skips hook/plugin/settings auto-discovery entirely.
+# The native permissions.deny backstop STILL APPLIES here, because non-interactive mode
+# loads the same settings as an interactive session (deny rules are enforced in every
+# permission mode). Do NOT add --bare for runs that must keep the backstop: --bare skips
+# hook/plugin/settings auto-discovery entirely.
 #
 # Usage:
 #   ccc-headless.sh "find and summarize TODOs"

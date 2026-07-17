@@ -1,58 +1,68 @@
 # Service control
 
-`claude/hooks/guard.py` (behind the `guard.sh` shim) is a defense-in-depth
-policy hook, **not a sandbox**. The enforceable boundary is an unprivileged
-agent account plus a root-owned wrapper and root-owned exact-unit allowlist.
+There is **no custom command-guard hook**. ccc-node previously ran a
+`claude/hooks/guard.py` PreToolUse policy hook (behind a `guard.sh` shim) to
+enforce Fresh-Approval semantics; it has been removed. The Claude path now runs
+at Codex parity on Claude Code's native mechanisms, and the enforceable boundary
+is the **unprivileged OS account the node runs as** (e.g. `ccc`) plus its
+group/sudo grants — exactly like cccnode/Codex — with a root-owned wrapper and
+root-owned exact-unit allowlist for the one privileged carve-out (service
+restarts).
+
+Two native Claude Code mechanisms shape the path:
+
+- `permissionMode: bypassPermissions` in `claude/settings.base.json` — no
+  approval prompts for normal autonomous work. `setup.sh` drops this to a
+  prompting mode when the node runs as root, because Claude Code refuses
+  `bypassPermissions` as root.
+- A small native `permissions.deny` backstop in `claude/settings.base.json`,
+  enforced by Claude Code in **every** permission mode (including
+  `bypassPermissions`, precedence deny > ask > allow): secret-file reads
+  (`.env` / `.credentials.json` / `*.pem` / `id_rsa`), release (`npm publish`,
+  `gh release create`), and best-effort catastrophic shapes (`rm -rf /`,
+  force-push to `main`).
+
+Those native Bash deny rules are **coarse prefix-globs** — they do not catch
+quoting, env-var prefixes, or `&&`-chained variants — so they are a best-effort
+catastrophic backstop, **not** the semantic "Fresh Approval Required" wall the
+old `guard.py` parser enforced. Fleet-service lifecycle, managed-node
+operations, broker Compose runbooks, and cross-broker mutations are no longer
+gated by a custom command parser; they are governed by the OS account (its
+sudo/group grants, SSH keys, and file ownership).
 
 ## Policy
 
-- **Fleet-service lifecycle is autonomous** (operator-approved relaxation; see
-  `claude/hooks/RISK-PROFILES.md`): `start`/`restart`/`reload`/`stop`/`kill` of
-  units whose name carries `a2a`/`hermes`/`openclaw`/`broker`/`gateway`/`worker`
-  or is `ccc-telegram-bridge` — locally or toward a peer node
-  (`ssh <node> systemctl restart <unit>`, `systemctl -H <node> …`).
-- **Managed-node operations are autonomous for allowlisted hosts** (opt-in;
-  `~/.claude/managed-nodes.allow`): a Bash statement whose only remote reach
-  (via `ssh`/`scp`/`rsync`/`sftp`/`systemctl -H`) is to a listed host may deploy
-  secrets/keys, clean up remote paths, run remote service **config** verbs
-  (`enable`/`daemon-reload`), and reboot that host. See
-  `docs/examples/managed-nodes.allow.example`. The allowlist is operator-owned
-  and write-gated for agents; with no allowlist the behavior is the fleet-only
-  baseline.
-- **Reboot is autonomous on the LOCAL node and managed nodes** — `reboot` /
-  `shutdown -r` is disruptive but recoverable (the node comes back). It stays
-  gated for an unlisted remote host and for interpreter-mediated forms.
-- **Local non-fleet apps the node self-manages are autonomous for allowlisted
-  units** (opt-in; `~/.claude/managed-services.allow`): `systemctl`/`service`/
-  `pm2`/`docker`/`podman` lifecycle of a LOCAL unit/container is allowed when
-  every target is listed. System services you did not list (`sshd`/`ufw`/`nginx`/
-  …), mixed targets, `daemon-reload`, other `docker compose` lifecycle, and
-  `kubectl` stay gated. Direct local detached reconciliation —
-  `docker compose up -d [services...]` or `docker-compose up --detach` — is
-  autonomous without an allowlist. One reconciliation may be wrapped in the
-  fixed operator runbook shape: a literal project `cd`, optional rollback
-  `docker tag`, one `up -d`, then `docker inspect`, `sleep` bounded to 300
-  seconds, and
-  loopback-only health `curl`. A direct `ssh <peer> "..."` form is also allowed
-  when every explicit Compose service is a fleet service. Arbitrary compound
-  commands, external or mutating curl, multiple reconciliations, remote-daemon
-  flags, wrappers, substitutions, and non-detached `up` stay gated. See
-  `docs/examples/managed-services.allow.example`. This guard relaxation makes
-  an approved runbook executable; it does not replace the standing fresh
-  approval requirement for cross-broker mutations.
-- Everything else is fail-closed: `systemctl`/`service`/`pm2` lifecycle of
-  non-fleet units on hosts that are not managed, config-changing verbs on the
-  local node, `pm2 delete`, and docker/podman/kubectl lifecycle require fresh
-  operator approval. Compound commands are judged per statement; one non-fleet,
-  non-managed target denies the whole command.
-- The down-class of host lifecycle (`poweroff`/`halt`/`shutdown` without `-r`)
-  requires fresh operator approval **everywhere** — local, managed, or unlisted —
-  because a powered-off node stays offline until manual power-on.
+- **Everything the OS account permits runs autonomously.** Under
+  `bypassPermissions` there are no approval prompts and no custom command parser
+  in the path; the only automated blocks are the native `permissions.deny` rules
+  above. Scope what the agent can do by scoping its OS account — sudo grants,
+  group memberships (`docker`/`sudo`), and SSH keys — not by editing a guard
+  allowlist.
+- **Fleet-service lifecycle** (`start`/`restart`/`reload`/`stop`/`kill` of units
+  whose name carries `a2a`/`hermes`/`openclaw`/`broker`/`gateway`/`worker` or is
+  `ccc-telegram-bridge`, locally or toward a peer via `ssh <node> systemctl …` /
+  `systemctl -H <node> …`) runs because the OS account is allowed to run it, so a
+  node can update and recover its own and its peers' services unattended. This is
+  no longer a guard "relaxation" — nothing parses the command first.
+- **Managed-node operations, broker Compose runbooks, and cross-broker
+  mutations** are likewise governed only by the OS account. They succeed or fail
+  on what that account can actually reach (its SSH keys, `docker`-group
+  membership, remote sudo). The old per-statement evaluation — "one non-fleet
+  target denies the whole command," the `managed-nodes.allow` /
+  `managed-services.allow` opt-in allowlists, and the reboot-vs-poweroff split —
+  was `guard.py` behavior and is gone. Bound these by bounding the OS account.
+- **The native deny backstop is a seatbelt, not a wall.** `rm -rf /`, force-push
+  to `main`, `npm publish`, and `gh release create` are denied only in their
+  literal prefix form; quoted, env-var-prefixed, or `&&`-chained variants slip
+  past. Secret-file reads (`.env`, `.credentials.json`, `*.pem`, `id_rsa`) are
+  denied to the `Read` tool in every mode, but this too is a coarse path-glob,
+  not a secret-exfil parser. Do not treat either as Fresh-Approval enforcement.
 - Pre-reviewed self-update remains available through `ccc-self-update.sh`; its
   operator config must be root-owned and unavailable for agent writes.
-- Where a real privilege boundary is required (unprivileged agent account),
-  pre-approved restarts use the installed `ccc-service-control` wrapper and
-  exact `.service` names in `/etc/ccc-node/service-control.allow`.
+- Where a real privilege boundary is required, keep the agent's OS account
+  unprivileged and mediate the one pre-approved privileged action — service
+  restarts — through the installed `ccc-service-control` wrapper and exact
+  `.service` names in `/etc/ccc-node/service-control.allow` (see below).
 
 ## Operator installation (not performed by setup.sh)
 
@@ -92,7 +102,6 @@ allowlist before invoking `/usr/bin/systemctl`.
 ## Verification
 
 ```bash
-bash claude/hooks/guard.test.sh
 bash scripts/ccc-service-control.test.sh
 bash scripts/validate-harness.sh
 ```
