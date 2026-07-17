@@ -741,6 +741,7 @@ _LOOPBACK_HTTP_RE = re.compile(
 _LITERAL_PATH_RE = re.compile(r"/[A-Za-z0-9._/+:-]+")
 _IMAGE_REF_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@-]*")
 _SERVICE_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
+_MAX_RUNBOOK_SLEEP_SECONDS = 300.0
 
 
 def _split_safe_compose_sequence(c):
@@ -916,7 +917,9 @@ def _safe_compose_sequence_body(c, *, remote):
             continue
         if toks[0] == "sleep" and len(toks) == 2 \
                 and re.fullmatch(r"\d+(?:[.]\d+)?s?", toks[1]):
-            continue
+            seconds = float(toks[1].removesuffix("s"))
+            if seconds <= _MAX_RUNBOOK_SLEEP_SECONDS:
+                continue
         return False
     return compose_count == 1
 

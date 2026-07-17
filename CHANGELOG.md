@@ -9,8 +9,9 @@ All notable changes to the Claude Code node harness. Dates are KST.
   (`docker compose up -d [services...]`, including `docker-compose` and
   `--detach`) as autonomous, matching the ccc-node/Codex recoverable path. The
   exact broker restart/rollback runbook may include literal `cd`, optional
-  `docker tag`, one reconciliation, and bounded read-only `inspect`/`sleep`/
-  loopback-curl verification; direct SSH requires named fleet services. Other
+  `docker tag`, one reconciliation, and read-only `inspect`/`sleep` (maximum
+  300 seconds)/loopback-curl verification; direct SSH requires named fleet
+  services. Other
   Compose lifecycle, multiple reconciliations, remote-daemon selection,
   wrappers, substitutions, arbitrary compounds, and external/mutating curl
   remain fail-closed. Refs #544.

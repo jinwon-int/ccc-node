@@ -31,7 +31,8 @@ agent account plus a root-owned wrapper and root-owned exact-unit allowlist.
   `docker compose up -d [services...]` or `docker-compose up --detach` — is
   autonomous without an allowlist. One reconciliation may be wrapped in the
   fixed operator runbook shape: a literal project `cd`, optional rollback
-  `docker tag`, one `up -d`, then `docker inspect`, bounded `sleep`, and
+  `docker tag`, one `up -d`, then `docker inspect`, `sleep` bounded to 300
+  seconds, and
   loopback-only health `curl`. A direct `ssh <peer> "..."` form is also allowed
   when every explicit Compose service is a fleet service. Arbitrary compound
   commands, external or mutating curl, multiple reconciliations, remote-daemon

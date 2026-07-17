@@ -114,6 +114,9 @@ run allow Bash command 'cd /root/work/a2a/a2a-nexus/packages/broker && docker co
 run allow Bash command $'cd /root/work/a2a/a2a-nexus/packages/broker\ndocker compose up -d a2a-broker\ndocker inspect a2a-broker\ncurl --fail --silent --show-error --max-time 5 http://localhost:8787/livez'
 run allow Bash command 'docker tag broker-a2a-broker:rollback-pre1577-20260716 broker-a2a-broker:latest && docker compose up -d a2a-broker'
 run allow Bash command 'ssh seoseo "cd /root/work/a2a/a2a-nexus/packages/broker && docker compose up -d a2a-broker && sleep 4 && docker inspect a2a-broker --format '\''{{.State.Health.Status}}'\'' && curl -fsS http://127.0.0.1:8787/livez"'
+run allow Bash command 'docker compose up -d a2a-broker && sleep 300'
+run deny Bash command 'docker compose up -d a2a-broker && sleep 300.1'
+run deny Bash command 'docker compose up -d a2a-broker && sleep 999999999'
 run allow Bash command 'ssh gwakga "cd /root/work/a2a/a2a-nexus/packages/broker && docker tag broker-a2a-broker:rollback-pre1577-20260716 broker-a2a-broker:latest && docker compose up -d a2a-broker"'
 # ...but non-fleet units, config verbs, host lifecycle, and containers stay gated.
 run deny Bash command 'systemctl restart nginx'
