@@ -181,10 +181,35 @@ seed_home="$TMP/seed-home"; seed_claude="$TMP/seed-claude"; seed_hermes="$TMP/se
 HOME="$seed_home" CCC_CLAUDE_DIR="$seed_claude" CCC_HERMES_DIR="$seed_hermes" \
   bash "$SETUP" --no-backup >/dev/null 2>&1
 ok "setup seeds settings.local.json when absent" '[ -f "$seed_claude/settings.local.json" ]'
-ok "setup installs Claude bypassPermissions as the native default mode" \
-  'jq -e ".permissions.defaultMode == \"bypassPermissions\"" "$seed_claude/settings.json" >/dev/null'
+# Claude Code refuses bypassPermissions under root, so the installed default is
+# root-aware: kept when Claude runs non-root, dropped (guard remains) when root.
+if [ "$(id -u)" -eq 0 ]; then
+  ok "setup drops bypassPermissions default when the setup user is root" \
+    'jq -e ".permissions.defaultMode != \"bypassPermissions\"" "$seed_claude/settings.json" >/dev/null'
+else
+  ok "setup installs Claude bypassPermissions as the native default mode (non-root)" \
+    'jq -e ".permissions.defaultMode == \"bypassPermissions\"" "$seed_claude/settings.json" >/dev/null'
+fi
 ok "seeded settings.local.json carries no broad fleet-wide grants" \
   'jq -e ".permissions.allow == []" "$seed_claude/settings.local.json" >/dev/null'
+
+# Root-run Claude would reject --dangerously-skip-permissions, so setup must
+# neutralize the bypassPermissions default when the run user is root. Simulate
+# root deterministically (independent of the harness uid) with an `id -u` stub.
+root_claude="$TMP/root-bypass-claude"
+mkdir -p "$TMP/root-bin"
+cat > "$TMP/root-bin/id" <<STUB
+#!/bin/sh
+[ "\$1" = "-u" ] && { echo 0; exit 0; }
+exec /usr/bin/id "\$@"
+STUB
+chmod +x "$TMP/root-bin/id"
+HOME="$TMP/root-bypass-home" CCC_CLAUDE_DIR="$root_claude" CCC_HERMES_DIR="$TMP/root-bypass-hermes" \
+  PATH="$TMP/root-bin:$PATH" bash "$SETUP" --no-backup >/dev/null 2>&1
+ok "setup neutralizes bypassPermissions default when Claude runs as root" \
+  'jq -e ".permissions.defaultMode != \"bypassPermissions\"" "$root_claude/settings.json" >/dev/null'
+ok "root-neutralized settings.json still parses with its permissions block intact" \
+  'jq -e ".permissions.allow | type == \"array\"" "$root_claude/settings.json" >/dev/null'
 
 # A node's accumulated/hand-added approvals must survive a re-run (the self-update path).
 printf '%s\n' '{"permissions":{"allow":["Bash(node-local-only:*)"]}}' > "$seed_claude/settings.local.json"

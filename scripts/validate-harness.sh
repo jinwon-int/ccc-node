@@ -29,9 +29,17 @@ for f in claude/settings.base.json claude/settings.local.template.json \
 done
 if jq -e '.permissions.defaultMode == "bypassPermissions"' \
      claude/settings.base.json >/dev/null 2>&1; then
-  say "  ok Claude native permission mode bypasses approval prompts"
+  say "  ok Claude native permission mode bypasses approval prompts (non-root default)"
 else
   err "Claude native permission mode is not bypassPermissions"
+fi
+# Claude Code refuses bypassPermissions under root, so setup must neutralize the
+# default on a root node (the guard remains the boundary). Keep that root-aware
+# install path present so the source default cannot brick root-run nodes.
+if grep -q "neutralize_bypass_if_root" setup.sh; then
+  say "  ok setup neutralizes the bypassPermissions default under root"
+else
+  err "setup.sh missing root-aware bypassPermissions neutralization"
 fi
 
 # 1a) Fail closed if OpenClaw runtime/bootstrap context files are tracked.

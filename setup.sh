@@ -176,6 +176,39 @@ merge_settings_json() {
   fi
 }
 
+# Claude Code refuses --dangerously-skip-permissions (the `bypassPermissions`
+# permission mode) when it runs with root/sudo privileges, so a node whose
+# Claude runs as root would reject every new session if it inherited the
+# `bypassPermissions` default. On such a node, drop the installed default so
+# Claude falls back to its normal prompting mode; the ccc-node PreToolUse
+# guard remains the boundary either way. Non-root nodes keep the no-prompt
+# default. The setup user is used as the proxy for the run user (the dominant
+# case is setup-as-root == service-as-root); the bridge additionally enforces
+# this at runtime for its own SDK path.
+_ccc_is_root() { [ "$(id -u 2>/dev/null || echo 0)" -eq 0 ]; }
+
+neutralize_bypass_if_root() {
+  local dest="$1"
+  _ccc_is_root || return 0
+  if [ "$DRY" = 1 ]; then
+    echo "[dry-run] root node: drop bypassPermissions defaultMode from $dest"
+    return 0
+  fi
+  [ -f "$dest" ] || return 0
+  jq -e '.permissions.defaultMode == "bypassPermissions"' "$dest" >/dev/null 2>&1 || return 0
+  local tmp; tmp="$(mktemp "${dest}.XXXXXX")" || { echo "ERROR: mktemp failed for $dest" >&2; return 1; }
+  if jq 'if (.permissions? and .permissions.defaultMode == "bypassPermissions")
+         then .permissions |= del(.defaultMode) else . end' "$dest" > "$tmp" 2>/dev/null \
+     && jq -e . "$tmp" >/dev/null 2>&1; then
+    mv "$tmp" "$dest"
+    note "root node: dropped bypassPermissions defaultMode (guard remains the boundary)"
+  else
+    rm -f "$tmp"
+    echo "ERROR: failed to neutralize bypassPermissions for root at '$dest' (existing file left untouched)" >&2
+    return 1
+  fi
+}
+
 # Snapshot the existing ~/.claude config BEFORE we overwrite anything. setup.sh unconditionally
 # overwrites settings.json and the hook/output-style/agent/command/skill dirs — on a node that
 # already has a configured identity that is destructive, so we tar a restore point first.
@@ -222,6 +255,7 @@ if [ "$WITH_PLUGIN" = 1 ]; then
 else
   merge_settings_json "$SRC/claude/settings.base.json" "$SRC/claude/hooks/enforcement-overlay.json" "$CLAUDE_DIR/settings.json"
 fi
+neutralize_bypass_if_root "$CLAUDE_DIR/settings.json"
 # settings.local.json is the NODE-LOCAL approvals file — seed it from the
 # template ONLY when absent so a node's accumulated/hand-added approvals are
 # never clobbered by setup or self-update (#454). It is not a managed artifact.
