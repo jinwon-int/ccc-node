@@ -5,7 +5,7 @@ All notable changes to the Claude Code node harness. Dates are KST.
 ## [Unreleased]
 
 ### Added
-- **Operational-relax guard profile** — an opt-in, operator-owned way to relax
+- **Operational-relax guard profile** — an operator-owned way to relax
   the guard's operational categories without weakening the catastrophic
   boundary. When a root-owned `/etc/ccc-node/guard-profile` (regular,
   non-symlink, not group/world writable) contains `operational-relax`,
@@ -21,9 +21,11 @@ All notable changes to the Claude Code node harness. Dates are KST.
   force-push/history-rewrite, DB destructive/migrate/replay, release/publish,
   repo-visibility, host power-down (`poweroff`/`halt`), and operator-config
   writes — retained because an unattended prompt injection over untrusted input
-  (PRs, web, A2A) could otherwise cause irreversible damage. Fleet-wide = the
-  operator installs the profile on each node via provisioning (`setup.sh` does
-  not install it). New in-process unit test `claude/hooks/guard-profile.test.py`
+  (PRs, web, A2A) could otherwise cause irreversible damage. A genuinely fresh
+  root-run `setup.sh` install now seeds the profile by default; `--strict-guard`
+  opts out, non-root setup never writes it, and existing profiles or existing
+  profile-less strict installs are preserved during updates. New in-process
+  unit test `claude/hooks/guard-profile.test.py`
   (11 cases: relaxed-vs-strict lifecycle, mixed reboot/down fail-closed,
   catastrophic-always-denied, reader integrity) wired into
   `validate-harness.sh`; `docs/service-control.md` +

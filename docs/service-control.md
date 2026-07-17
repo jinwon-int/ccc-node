@@ -4,18 +4,20 @@
 policy hook, **not a sandbox**. The enforceable boundary is an unprivileged
 agent account plus a root-owned wrapper and root-owned exact-unit allowlist.
 
-## Operational-relax profile (opt-in, operator-owned)
+## Operational-relax profile (fresh-root default, operator-owned)
 
-By default the guard enforces the full Fresh-Approval boundary below. An
-operator may relax the **operational** categories on a node by installing a
-root-owned `/etc/ccc-node/guard-profile` whose content includes the line
-`operational-relax` (see `docs/examples/guard-profile.example`). When present
+Without a valid profile, the guard enforces the full Fresh-Approval boundary
+below. An operator may relax the **operational** categories on a node by
+installing a root-owned `/etc/ccc-node/guard-profile` whose content includes
+the line `operational-relax` (see `docs/examples/guard-profile.example`). When present
 and valid, the guard treats **all** service/container/orchestrator lifecycle
 (`systemctl`/`service`/`pm2`/`docker`/`podman`/`kubectl`
 start·stop·restart·reload·scale·rollout·…, local or toward any peer) and
-**reboot of any host** as autonomous. Fleet-wide = install it on each node
-through your provisioning; `setup.sh` does **not** install it, so the agent
-cannot enable it via self-update.
+**reboot of any host** as autonomous. On a genuinely fresh root-run ccc-node
+install, `setup.sh` seeds that profile with mode `0644` by default. Pass
+`--strict-guard` to keep a fresh root install strict. Non-root installs never
+write `/etc`; an existing profile is never overwritten; and a profile-less
+existing ccc-node install remains strict during routine setup/self-update.
 
 The profile is **fail-closed and cannot self-escalate**: it is honored only when
 the file is owned by `root` (uid 0), a regular non-symlink, and not group/world

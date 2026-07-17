@@ -1,6 +1,7 @@
-# ccc-node guard profile — operator-owned. Install as /etc/ccc-node/guard-profile,
-# owned by root:root, mode 0644. NOT installed by setup.sh: the agent runs
-# unprivileged and must not be able to relax its own guard.
+# ccc-node guard profile — operator-owned. Fresh root-run setup.sh installs this
+# as /etc/ccc-node/guard-profile, owned by root:root, mode 0644. Use
+# `setup.sh --strict-guard` to keep a fresh root install strict. Non-root setup
+# never writes it, and setup never overwrites an existing operator profile.
 #
 # The `operational-relax` token below makes ALL operational service/container/
 # orchestrator lifecycle (systemctl/service/pm2/docker/podman/kubectl, local or

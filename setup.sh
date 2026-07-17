@@ -12,6 +12,7 @@
 #                              #   plugin registered them. Node-local hooks stay in settings.
 #   ./setup.sh --dry-run       # show what would happen, change nothing (combine with above)
 #   ./setup.sh --no-backup     # skip the durable operator backup (failure rollback remains enabled)
+#   ./setup.sh --strict-guard  # keep a fresh root install on the strict semantic-guard profile
 #
 # Node-identity seeding (optional): when these are given, freshly-seeded CLAUDE.md / MEMORY.md /
 # USER.md have their <PLACEHOLDER> tokens substituted automatically (existing files are never
@@ -27,7 +28,7 @@
 #   --user-context <text>                       -> <USER_CONTEXT>
 set -euo pipefail
 
-DRY=0; WITH_PLUGIN=0; BACKUP=1
+DRY=0; WITH_PLUGIN=0; BACKUP=1; STRICT_GUARD=0
 OPT_NODE=""; OPT_DISPLAY=""; OPT_SLOT=""; OPT_FLEET_ROLE=""; OPT_LANG=""
 OPT_USER_NAME=""; OPT_USER_GH=""; OPT_USER_TZ=""; OPT_USER_CONTEXT=""
 need_val() { [ -n "${2:-}" ] || { echo "Flag $1 requires a value" >&2; exit 2; }; }
@@ -36,6 +37,7 @@ while [ $# -gt 0 ]; do
     --dry-run) DRY=1 ;;
     --with-plugin) WITH_PLUGIN=1 ;;
     --no-backup) BACKUP=0 ;;
+    --strict-guard) STRICT_GUARD=1 ;;
     --node)         need_val "$1" "${2:-}"; OPT_NODE="$2"; shift ;;
     --display)      need_val "$1" "${2:-}"; OPT_DISPLAY="$2"; shift ;;
     --slot)         need_val "$1" "${2:-}"; OPT_SLOT="$2"; shift ;;
@@ -59,6 +61,9 @@ HERMES_ROOT="${CCC_HERMES_DIR:-$HOME/.hermes}"
 HERMES_DIR="$HERMES_ROOT/memories"      # legacy memory location (fallback only)
 WIKI_AGENT_BIN="${CCC_WIKI_AGENT_BIN:-$HOME/.wiki-agent/bin/wiki-agent}"
 BRIDGE_DEFAULT_PATH="${CCC_BRIDGE_DEFAULT_PATH:-$HOME}"
+# Test-only path seam. The runtime guard intentionally reads the fixed
+# /etc/ccc-node/guard-profile path; production setup should use this default.
+GUARD_PROFILE_PATH="${CCC_SETUP_GUARD_PROFILE_PATH:-/etc/ccc-node/guard-profile}"
 HARNESS_PATHS_LIB="$SRC/scripts/lib/harness-paths.sh"
 if [ ! -r "$HARNESS_PATHS_LIB" ]; then
   echo "ERROR: shared harness path library is missing: $HARNESS_PATHS_LIB" >&2
@@ -68,6 +73,16 @@ fi
 . "$HARNESS_PATHS_LIB"
 
 ccc_validate_setup_roots "$CLAUDE_DIR" "$HERMES_ROOT" || exit 2
+
+# Capture this before setup installs the hook. A missing profile on an existing
+# ccc-node node is an intentional strict choice and must not be widened by a
+# routine self-update. Only a genuinely fresh ccc-node install gets the root
+# operational profile by default.
+CCC_NODE_PREEXISTING=0
+if [ -e "$CLAUDE_DIR/hooks/guard.py" ] || [ -L "$CLAUDE_DIR/hooks/guard.py" ] \
+   || [ -e "$CLAUDE_DIR/hooks/guard.sh" ] || [ -L "$CLAUDE_DIR/hooks/guard.sh" ]; then
+  CCC_NODE_PREEXISTING=1
+fi
 
 render_command() {
   printf '[dry-run]'
@@ -206,6 +221,63 @@ neutralize_bypass_if_root() {
     rm -f "$tmp"
     echo "ERROR: failed to neutralize bypassPermissions for root at '$dest' (existing file left untouched)" >&2
     return 1
+  fi
+}
+
+install_fresh_root_guard_profile() {
+  _ccc_is_root || return 0
+
+  # An operator-created file (including an intentionally fail-closed malformed
+  # file or symlink) is never replaced by setup.
+  if [ -e "$GUARD_PROFILE_PATH" ] || [ -L "$GUARD_PROFILE_PATH" ]; then
+    note "guard profile already exists — left untouched: $GUARD_PROFILE_PATH"
+    return 0
+  fi
+  if [ "$STRICT_GUARD" = 1 ]; then
+    note "fresh root install: strict guard requested; no operational-relax profile seeded"
+    return 0
+  fi
+  if [ "$CCC_NODE_PREEXISTING" = 1 ]; then
+    note "existing ccc-node install has no guard profile — kept strict"
+    return 0
+  fi
+
+  local parent source tmp
+  parent="$(dirname "$GUARD_PROFILE_PATH")"
+  source="$SRC/docs/examples/guard-profile.example"
+  ccc_validate_setup_guard_profile "$GUARD_PROFILE_PATH" || return 1
+  if [ "$DRY" = 1 ]; then
+    render_command mkdir -p "$parent"
+    echo "[dry-run] fresh root install: seed operational-relax guard profile -> $GUARD_PROFILE_PATH"
+    return 0
+  fi
+  [ -r "$source" ] || {
+    echo "ERROR: tracked guard profile template is missing: $source" >&2
+    return 1
+  }
+  mkdir -p "$parent"
+  tmp="$(mktemp "$parent/.guard-profile.XXXXXX")" || {
+    echo "ERROR: mktemp failed for $GUARD_PROFILE_PATH" >&2
+    return 1
+  }
+  if ! install -m 0644 "$source" "$tmp"; then
+    rm -f -- "$tmp"
+    echo "ERROR: failed to stage guard profile for $GUARD_PROFILE_PATH" >&2
+    return 1
+  fi
+  # A hard-link create is atomic and refuses to overwrite a profile created by
+  # an operator or concurrent installer between the checks above.
+  if ln "$tmp" "$GUARD_PROFILE_PATH" 2>/dev/null; then
+    rm -f -- "$tmp"
+    note "fresh root install: seeded operational-relax guard profile -> $GUARD_PROFILE_PATH"
+  else
+    rm -f -- "$tmp"
+    if [ -e "$GUARD_PROFILE_PATH" ] || [ -L "$GUARD_PROFILE_PATH" ]; then
+      note "guard profile appeared concurrently — left untouched: $GUARD_PROFILE_PATH"
+    else
+      echo "ERROR: failed to install guard profile at $GUARD_PROFILE_PATH" >&2
+      return 1
+    fi
   fi
 }
 
@@ -593,4 +665,7 @@ printf '  - CCC_CODEX_CLI_PATH=%s/hooks/ccc-codex\n' "$CLAUDE_DIR"
 printf '  - CCC_CODEX_MEMORY_MATERIALIZER_PATH=%s/hooks/ccc_codex_memory.py\n' "$CLAUDE_DIR"
 printf '  - bridge command=./start.sh --path %s -d\n' "$BRIDGE_DEFAULT_PATH"
 
+# This is the final managed mutation. It is fresh-install-only and atomic, so a
+# routine root self-update cannot silently widen an existing strict node.
+install_fresh_root_guard_profile
 SETUP_TXN_ACTIVE=0
