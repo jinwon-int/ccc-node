@@ -1,18 +1,30 @@
-#!/usr/bin/env bash
+#!/bin/bash -p
 # Root-installed broker Compose reconciliation wrapper.
 #
 # Encapsulates the fixed broker runbook (cd project dir, capture the git
 # revision for image labelling, `docker compose up -d <allowlisted services>`)
 # behind a single operator-owned entrypoint, so the runbook need NOT be
 # expressed as fragile ALLOW-grammar inside the PreToolUse guard. The guard
-# still denies raw `docker compose up`; it allows this wrapper by name only
-# because the wrapper is root-owned and the agent cannot alter what it does.
+# accepts only the direct absolute installed path with exact service tokens;
+# raw `docker compose up` and alternate wrapper invocation shapes stay gated.
 # New runbook needs are added HERE (reviewed), not as new guard grammar.
 #
 # See docs/service-control.md. Do not grant to a mutable checkout copy.
 set -uo pipefail
 
 die() { printf 'ccc-broker-reconcile: %s\n' "$*" >&2; exit 2; }
+
+# The guard permits only a direct absolute invocation, and -p prevents caller
+# BASH_ENV/functions from running before these checks. Resolve every helper from
+# root-owned system paths rather than an agent-supplied PATH.
+PATH='/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+export PATH
+unset BASH_ENV ENV CDPATH
+
+for override in DOCKER_HOST DOCKER_CONTEXT DOCKER_CONFIG COMPOSE_FILE \
+  COMPOSE_PROJECT_NAME COMPOSE_PROFILES COMPOSE_ENV_FILES; do
+  [ "${!override+x}" != x ] || die "environment override is not allowed: $override"
+done
 
 [ "$#" -ge 1 ] || die 'usage: ccc-broker-reconcile <service> [<service>...]'
 
@@ -34,6 +46,7 @@ if [ "$dry_run" = 1 ]; then
   dir_file="${CCC_BROKER_RECONCILE_DIR_FILE:-/etc/ccc-node/broker-reconcile.dir}"
   allowlist="${CCC_BROKER_RECONCILE_ALLOWLIST:-/etc/ccc-node/broker-reconcile.allow}"
 else
+  [ "$script_uid" -eq 0 ] || die 'production wrapper must be owned by root'
   dir_file='/etc/ccc-node/broker-reconcile.dir'
   allowlist='/etc/ccc-node/broker-reconcile.allow'
 fi
@@ -75,7 +88,7 @@ while IFS= read -r line || [ -n "$line" ]; do
   line="${line#"${line%%[![:space:]]*}"}"
   line="${line%"${line##*[![:space:]]}"}"
   [ -n "$line" ] || continue
-  printf '%s' "$line" | grep -Eq '^[A-Za-z0-9_.@:-]+$' \
+  printf '%s' "$line" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9_.-]*$' \
     || die "allowlist contains an invalid service entry: $line"
   allow+=("$line")
 done < "$allowlist"
@@ -83,7 +96,7 @@ done < "$allowlist"
 
 # --- every requested service must be a valid token AND allowlisted ---
 for svc in "$@"; do
-  printf '%s' "$svc" | grep -Eq '^[A-Za-z0-9_.@:-]+$' || die "invalid service token: $svc"
+  printf '%s' "$svc" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9_.-]*$' || die "invalid service token: $svc"
   ok=0
   for a in "${allow[@]}"; do [ "$a" = "$svc" ] && ok=1; done
   [ "$ok" -eq 1 ] || die "service is not allowlisted: $svc"
@@ -98,6 +111,6 @@ fi
 
 [ -d "$broker_dir" ] || die "broker dir does not exist: $broker_dir"
 cd "$broker_dir" || die "cannot cd to broker dir: $broker_dir"
-A2A_BROKER_REVISION="$(git rev-parse HEAD 2>/dev/null)" || die 'git rev-parse HEAD failed (broker dir not a git repo?)'
+A2A_BROKER_REVISION="$(/usr/bin/git rev-parse HEAD 2>/dev/null)" || die 'git rev-parse HEAD failed (broker dir not a git repo?)'
 export A2A_BROKER_REVISION
-exec docker compose up -d "$@"
+exec /usr/bin/docker compose up -d "$@"

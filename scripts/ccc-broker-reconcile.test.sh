@@ -24,7 +24,7 @@ run_wrapper() {
   CCC_BROKER_RECONCILE_DIR_FILE="$DIRF" \
   CCC_BROKER_RECONCILE_ALLOWLIST="$ALLOW" \
   CCC_BROKER_RECONCILE_DRY_RUN=1 \
-    bash "$WRAPPER" "$@"
+    "$WRAPPER" "$@"
 }
 
 # --- happy path -------------------------------------------------------------
@@ -54,6 +54,21 @@ ok "service token with shell metacharacter is denied" test "$rc" -ne 0
 
 run_wrapper '../../etc' >/dev/null 2>&1; rc=$?
 ok "path-like service token is denied" test "$rc" -ne 0
+
+printf '%s\n' 'a2a-broker' '--build' > "$ALLOW"; chmod 600 "$ALLOW"
+run_wrapper a2a-broker >/dev/null 2>&1; rc=$?
+ok "allowlist rejects a leading-option pseudo-service" test "$rc" -ne 0
+printf '%s\n' 'a2a-broker' 't2-broker' > "$ALLOW"; chmod 600 "$ALLOW"
+
+COMPOSE_FILE="$TMP/evil.yml" run_wrapper a2a-broker >/dev/null 2>&1; rc=$?
+ok "COMPOSE_FILE override is denied" test "$rc" -ne 0
+DOCKER_HOST='tcp://other:2375' run_wrapper a2a-broker >/dev/null 2>&1; rc=$?
+ok "remote DOCKER_HOST override is denied" test "$rc" -ne 0
+
+printf '%s\n' "touch '$TMP/bash-env-ran'" > "$TMP/evil-bash-env"
+BASH_ENV="$TMP/evil-bash-env" run_wrapper a2a-broker >/dev/null 2>&1; rc=$?
+ok "privileged shebang ignores caller BASH_ENV" \
+  sh -c '[ "$1" -eq 0 ] && [ ! -e "$2" ]' _ "$rc" "$TMP/bash-env-ran"
 
 # --- config integrity -------------------------------------------------------
 chmod 666 "$ALLOW"

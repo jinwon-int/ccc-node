@@ -54,9 +54,10 @@ agent account plus a root-owned wrapper and root-owned exact-unit allowlist.
   pre-approved restarts use the installed `ccc-service-control` wrapper and
   exact `.service` names in `/etc/ccc-node/service-control.allow`.
 - Broker Compose reconciliation uses the installed `ccc-broker-reconcile`
-  wrapper (root-owned, so the agent cannot alter the runbook) instead of raw
-  `docker compose up -d`. This moves the fixed runbook out of the PreToolUse
-  guard's ALLOW-grammar: new runbook needs are reviewed inside the wrapper, not
+  wrapper (root-owned, so the agent cannot alter the wrapper or its operator
+  config) instead of raw `docker compose up -d`. This moves the fixed command
+  shape out of the PreToolUse guard's ALLOW-grammar: new runbook needs are
+  reviewed inside the wrapper, not
   added as guard grammar. The legacy inline Compose grammar remains accepted
   during migration and is removed once the wrapper is deployed fleet-wide.
 
@@ -105,15 +106,19 @@ Same trust model (never grant to a mutable checkout copy):
    `0600`, containing the single absolute broker project directory.
 3. Create `/etc/ccc-node/broker-reconcile.allow`, owned by `root:root`, mode
    `0600`, with one exact Compose service name per line.
-4. The agent invokes `ccc-broker-reconcile <service> [<service>...]`; the
-   immutable wrapper rechecks both root-owned config files, `cd`s to the fixed
-   project dir, exports `A2A_BROKER_REVISION=$(git rev-parse HEAD)`, and runs
-   `docker compose up -d <allowlisted services>`.
+4. The agent invokes
+   `/usr/local/libexec/ccc-broker-reconcile <service> [<service>...]`; the guard
+   accepts only that direct absolute path and exact service tokens. The wrapper
+   rechecks itself and both root-owned config files, rejects daemon/Compose
+   environment overrides, `cd`s to the fixed project dir, exports
+   `A2A_BROKER_REVISION=$(git rev-parse HEAD)`, and runs `/usr/bin/docker compose
+   up -d <allowlisted services>`.
 
 Scope note: this wrapper performs no `sudo` and no privilege escalation. Its
-purpose is runbook **integrity** (root-owned, so the agent cannot change what
-runs) and removing the runbook from the guard's ALLOW-grammar — not privilege
-reduction. For unattended reconciliation the agent account still needs Docker
+purpose is wrapper/config and command-shape **integrity** and removing the
+runbook from the guard's inline Compose grammar — not privilege reduction or
+integrity of the broker checkout/Compose payload itself. For unattended
+reconciliation the agent account still needs Docker
 access, which remains a host-root-equivalent grant (see the note above); the
 wrapper does not change that boundary.
 

@@ -75,10 +75,14 @@ Service-control boundary (enforced by `guard.py` behind the `guard.sh` shim):
   `~/.claude/managed-services.allow` and their `systemctl`/`pm2`/`docker` lifecycle
   is autonomous (system services like sshd/ufw/nginx stay gated). Operator-owned.
 - **Broker Compose reconciliation** — prefer the installed
-  `ccc-broker-reconcile <service>...` wrapper (root-owned; it encapsulates the
-  fixed runbook — project `cd`, `A2A_BROKER_REVISION=$(git rev-parse HEAD)`,
-  `docker compose up -d <allowlisted services>`). New runbook needs go into the
-  reviewed wrapper, NOT into new guard grammar. Read-only verification
+  `/usr/local/libexec/ccc-broker-reconcile <service>...` wrapper (root-owned; it
+  encapsulates the fixed runbook — project `cd`,
+  `A2A_BROKER_REVISION=$(git rev-parse HEAD)`, `docker compose up -d
+  <allowlisted services>`). The guard accepts only this direct absolute
+  entrypoint with exact service tokens; bare/PATH-shadowed, shell-wrapped,
+  compounded, and daemon/Compose-env-overridden forms stay gated. New runbook
+  needs go into the reviewed wrapper, NOT into new inline Compose grammar.
+  Read-only verification
   (`docker inspect`, bounded `sleep`, loopback-only `curl`) is done separately.
   During migration the guard still accepts the legacy inline shape — direct
   `docker compose up -d [services...]` with the same fixed companions (literal
