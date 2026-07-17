@@ -288,16 +288,18 @@ class Config(BaseSettings):
         description="Bash approval UX: auto-approve, approve-each, or disabled.",
     )
     claude_unrestricted: bool = Field(
-        default=False,
+        default=True,
         alias="CCC_BRIDGE_CLAUDE_UNRESTRICTED",
         description=(
-            "Opt-in Codex-parity ungoverned Claude execution (owner-operator "
-            "only; ignored on every other profile). When true, the Claude SDK "
-            "path runs with permission_mode=bypassPermissions, no OS sandbox, "
-            "and no host settings chain — so the PreToolUse guard hook is not "
-            "loaded — matching Codex's never + dangerFullAccess. Memory context "
-            "is preserved. Default false keeps guard.py as the boundary; set per "
-            "node and reversible."
+            "Codex-parity ungoverned Claude execution (owner-operator only; "
+            "ignored on every other profile and under root). Default true: a "
+            "non-root owner-operator node runs its Claude SDK path with "
+            "permission_mode=bypassPermissions, no OS sandbox, and no host "
+            "settings chain — so the PreToolUse guard hook is not loaded — "
+            "matching Codex's never + dangerFullAccess. Set false to keep "
+            "guard.py as the boundary. Ignored under root (Claude Code refuses "
+            "bypassPermissions with root/sudo); memory context is preserved; "
+            "reversible per node."
         ),
     )
     telegram_session_scope: Literal[
