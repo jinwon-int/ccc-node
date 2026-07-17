@@ -470,7 +470,8 @@ def _exfil_stmt(stmt):
 
 
 # --------------------------------------------------------------------------- #
-# statement splitting — QUOTE-AWARE, at top-level ; && || & (not a single |,
+# statement splitting — QUOTE-AWARE, at top-level `;`, newline, `&&`, `||`, and
+# `&` (not a single `|`,
 # matching the bash guard). Quote-awareness is the reason for the shlex rewrite:
 # an operator inside a quoted remote command (`ssh node "a && b"`) must stay
 # within ONE statement so the whole remote command is judged against the ssh
@@ -500,7 +501,7 @@ def _split_statements_toplevel(c):
             buf.append(c[i + 1])
             i += 2
             continue
-        if ch == ";":
+        if ch in (";", "\n"):
             stmts.append("".join(buf))
             buf = []
             i += 1
@@ -605,7 +606,7 @@ def evaluate(tool, cmd, fpath, tool_input_raw):
         statements,
         managed,
         svc_entries,
-        single_toplevel_command=len(statements_raw) == 1,
+        compose_reconciliation=_safe_compose_reconciliation(c),
     )
     _gate_host_lifecycle(c, cn, statements, managed)
     _gate_operator_config(c, cn)              # self-update.* / managed-nodes.allow writes
@@ -734,54 +735,218 @@ def _gate_rm(c, statements, managed):
             _deny("rm-catastrophic", "operator_approval_gated", c)
 
 
-def _local_compose_up_detached(st, *, single_toplevel_command):
-    """Return True only for a direct local ``compose up --detach`` command.
+_LOOPBACK_HTTP_RE = re.compile(
+    r"http://(?:localhost|127(?:[.]\d{1,3}){3}|\[::1\])(?::\d{1,5})?(?:/[^\s]*)?"
+)
+_LITERAL_PATH_RE = re.compile(r"/[A-Za-z0-9._/+:-]+")
+_IMAGE_REF_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@-]*")
+_SERVICE_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
+_MAX_RUNBOOK_SLEEP_SECONDS = 300.0
 
-    This is a deliberately narrow lifecycle relaxation.  A direct detached
-    reconciliation is recoverable and matches the ccc-node/Codex auto-approve
-    path, but Compose's other lifecycle verbs and any indirection remain gated.
-    Reject shell controls, substitutions, wrappers, environment-prefixed
-    daemon selection, and Docker global flags so the carve-out cannot target a
-    remote daemon or hide an adjacent command.
+
+def _split_safe_compose_sequence(c):
+    """Split the narrow Compose runbook grammar, rejecting unsafe controls.
+
+    ``;``, newline, and ``&&`` are accepted sequencing controls. Pipes,
+    backgrounding, and ``||`` are rejected. Quoted controls remain data (for
+    example, an inspect format string or a loopback URL query).
     """
+    stmts = []
+    buf = []
+    quote = None
+    escaped = False
+    i = 0
+    while i < len(c):
+        ch = c[i]
+        if escaped:
+            buf.append(ch)
+            escaped = False
+            i += 1
+            continue
+        if ch == "\\":
+            buf.append(ch)
+            escaped = True
+            i += 1
+            continue
+        if quote:
+            buf.append(ch)
+            if ch == quote:
+                quote = None
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            buf.append(ch)
+            i += 1
+            continue
+        if ch in (";", "\n"):
+            stmts.append("".join(buf).strip())
+            buf = []
+            i += 1
+            continue
+        if ch == "&":
+            if i + 1 < len(c) and c[i + 1] == "&":
+                stmts.append("".join(buf).strip())
+                buf = []
+                i += 2
+                continue
+            return None
+        if ch == "|":
+            return None
+        buf.append(ch)
+        i += 1
+    if quote or escaped:
+        return None
+    stmts.append("".join(buf).strip())
+    return [st for st in stmts if st]
 
-    # This carve-out is for one direct command, not one safe-looking fragment
-    # extracted from a compound command. A preceding `export DOCKER_HOST=...`
-    # or `docker context use ...` can otherwise redirect the later invocation.
-    if not single_toplevel_command:
-        return False
 
-    # An inherited daemon/context selector can redirect an otherwise plain
-    # command. Keep those invocations on the approval-gated path as well.
-    if os.environ.get("DOCKER_HOST") or os.environ.get("DOCKER_CONTEXT"):
-        return False
-    if re.search(r"[;&|`<>{}\n]|\$", st):
-        return False
+def _literal_statement_tokens(st):
+    """Tokenize one direct statement with no shell indirection/redirection."""
+    if re.search(r"[`<>]|\$", st):
+        return None
     try:
         toks = shlex.split(st)
     except ValueError:
-        return False
-    if not toks:
-        return False
+        return None
+    return toks or None
 
-    # Do not trust basename alone: `/tmp/docker` may be an arbitrary wrapper.
-    # PATH resolution of these exact bare names remains the operator boundary.
-    tool = toks[0]
-    if tool == "docker":
-        # Requiring compose immediately after docker rejects global --host/-H,
-        # --context, and other daemon-selection flags.
+
+def _compose_up_detached(st, *, remote):
+    """Return (is_compose, valid) for the direct detached-up grammar."""
+    toks = _literal_statement_tokens(st)
+    if not toks:
+        return False, False
+    if toks[0] == "docker":
         if len(toks) < 3 or toks[1] != "compose":
-            return False
+            return False, False
         args = toks[2:]
-    elif tool == "docker-compose":
+    elif toks[0] == "docker-compose":
         args = toks[1:]
     else:
-        return False
-
-    # Keep the accepted grammar exact: no compose-global options before `up`.
+        return False, False
     if not args or args[0] != "up":
+        return True, False
+    rest = args[1:]
+    if not any(arg in ("-d", "--detach") for arg in rest):
+        return True, False
+    if not remote:
+        return True, True
+
+    # An unlisted remote host gets the same fleet-only relaxation as remote
+    # systemd: require explicit fleet service names. Keep the remote grammar
+    # intentionally small; the broker runbook only needs detached up and an
+    # optional force-recreate/no-deps/build flag.
+    allowed_flags = {
+        "-d", "--detach", "--force-recreate", "--no-deps",
+        "--remove-orphans", "--build", "--no-build", "--renew-anon-volumes",
+    }
+    services = []
+    for arg in rest:
+        if arg in allowed_flags:
+            continue
+        if arg.startswith("-"):
+            return True, False
+        if not _SERVICE_NAME_RE.fullmatch(arg):
+            return True, False
+        services.append(arg)
+    return True, bool(services) and all(_FLEET_RE.search(s) for s in services)
+
+
+def _safe_loopback_curl(toks):
+    if not toks or toks[0] != "curl":
         return False
-    return any(arg in ("-d", "--detach") for arg in args[1:])
+    urls = []
+    i = 1
+    while i < len(toks):
+        t = toks[i]
+        if t in ("--fail", "--silent", "--show-error"):
+            i += 1
+            continue
+        if re.fullmatch(r"-[fsS]+", t):
+            i += 1
+            continue
+        if t in ("--max-time", "--connect-timeout", "--retry"):
+            if i + 1 >= len(toks) or not re.fullmatch(r"\d+(?:[.]\d+)?", toks[i + 1]):
+                return False
+            i += 2
+            continue
+        if t.startswith("-"):
+            return False
+        urls.append(t)
+        i += 1
+    return len(urls) == 1 and bool(_LOOPBACK_HTTP_RE.fullmatch(urls[0]))
+
+
+def _safe_compose_sequence_body(c, *, remote):
+    statements = _split_safe_compose_sequence(c)
+    if not statements:
+        return False
+    compose_count = 0
+    saw_cd = False
+    saw_tag = False
+    post_reconcile = False
+    for st in statements:
+        toks = _literal_statement_tokens(st)
+        if not toks:
+            return False
+        is_compose, compose_ok = _compose_up_detached(st, remote=remote)
+        if is_compose:
+            if not compose_ok or post_reconcile or compose_count:
+                return False
+            compose_count += 1
+            post_reconcile = True
+            continue
+        if toks[0] == "cd":
+            if post_reconcile or saw_cd or len(toks) != 2 \
+                    or not _LITERAL_PATH_RE.fullmatch(toks[1]):
+                return False
+            saw_cd = True
+            continue
+        if toks[:2] == ["docker", "tag"]:
+            if post_reconcile or saw_tag or len(toks) != 4 \
+                    or not all(_IMAGE_REF_RE.fullmatch(t) for t in toks[2:]):
+                return False
+            saw_tag = True
+            continue
+        if not post_reconcile:
+            return False
+        if toks[:2] == ["docker", "inspect"] and len(toks) >= 3:
+            continue
+        if _safe_loopback_curl(toks):
+            continue
+        if toks[0] == "sleep" and len(toks) == 2 \
+                and re.fullmatch(r"\d+(?:[.]\d+)?s?", toks[1]):
+            seconds = float(toks[1].removesuffix("s"))
+            if seconds <= _MAX_RUNBOOK_SLEEP_SECONDS:
+                continue
+        return False
+    return compose_count == 1
+
+
+def _safe_compose_reconciliation(c):
+    """Allow one detached Compose reconciliation plus reviewed companions.
+
+    Accepted local shape: optional literal ``cd`` and/or ``docker tag``, one
+    direct ``compose up -d``, then read-only ``docker inspect``, bounded sleep,
+    and loopback-only curl verification. The same body may be sent as one
+    direct ``ssh host \"...\"`` command when every explicit Compose service is
+    a fleet service. Everything else stays approval-gated.
+    """
+    if os.environ.get("DOCKER_HOST") or os.environ.get("DOCKER_CONTEXT"):
+        return False
+    if _safe_compose_sequence_body(c, remote=False):
+        return True
+    if re.search(r"[`<>]|\$", c):
+        return False
+    try:
+        toks = shlex.split(c)
+    except ValueError:
+        return False
+    if len(toks) != 3 or toks[0] != "ssh" \
+            or not re.fullmatch(r"(?:[A-Za-z0-9_.-]+@)?[A-Za-z0-9_.-]+", toks[1]):
+        return False
+    return _safe_compose_sequence_body(toks[2], remote=True)
 
 
 def _service_lifecycle(
@@ -790,7 +955,7 @@ def _service_lifecycle(
     managed_stmt,
     svc_entries,
     *,
-    single_toplevel_command,
+    compose_reconciliation,
 ):
     # Precedence per statement: managed-remote (owned node) → fleet unit (#436) →
     # managed local service (operator-listed unit/container) → else deny.
@@ -805,9 +970,7 @@ def _service_lifecycle(
                 _deny("service-lifecycle", "operator_approval_gated", cn)
         if re.search(r"\b(docker|podman)\b[^;&|]*\b(run|up|start|restart|stop|kill|rm|pause|unpause|down)\b", st):
             if not (
-                _local_compose_up_detached(
-                    st, single_toplevel_command=single_toplevel_command
-                )
+                compose_reconciliation
                 or _local_service_allowed(st, svc_entries)
             ):
                 _deny("service-lifecycle", "operator_approval_gated", cn)

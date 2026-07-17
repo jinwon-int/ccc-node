@@ -71,11 +71,15 @@ Service-control boundary (enforced by `guard.py` behind the `guard.sh` shim):
 - **Local self-managed apps**: list this node's own non-fleet units/containers in
   `~/.claude/managed-services.allow` and their `systemctl`/`pm2`/`docker` lifecycle
   is autonomous (system services like sshd/ufw/nginx stay gated). Operator-owned.
-- **Detached local Compose reconciliation** — direct
+- **Detached Compose reconciliation** — direct
   `docker compose up -d [services...]` (or `docker-compose`/`--detach`) — is
-  autonomous without an allowlist when it is the only top-level command and
-  uses the bare executable name; other Compose lifecycle and indirect/remote
-  forms stay gated.
+  autonomous without an allowlist. It may include the fixed broker runbook
+  companions: literal project `cd`, optional rollback `docker tag`, then
+  `docker inspect`, bounded `sleep`, and loopback-only health `curl`. Direct SSH
+  requires explicit fleet service names. Arbitrary compound commands, multiple
+  reconciliations, and other Compose lifecycle/indirect forms stay gated. This
+  executable shape does not waive the fresh in-task approval required for a
+  cross-broker mutation.
 - Still fresh-approval: non-fleet units on unmanaged hosts, local config-changing
   verbs, other docker/podman/kubectl lifecycle, host power-down, and — regardless
   of host — force-push to protected branches, release/publish, DB
