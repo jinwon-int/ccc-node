@@ -23,7 +23,9 @@ export TMPDIR="$TMP"
 # Test seam: print the resolved scratch contract and exit (used by
 # scripts/validate-harness.test.sh to pin private-TMP + TMPDIR propagation).
 if [ "${1:-}" = "--print-scratch" ]; then
-  printf '%s %s\n' "$TMP" "$TMPDIR"
+  # One path per line: whitespace in a valid scratch root must not break the
+  # consumer's parsing (review finding on #565).
+  printf '%s\n%s\n' "$TMP" "$TMPDIR"
   exit 0
 fi
 fail=0

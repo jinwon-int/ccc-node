@@ -16,8 +16,13 @@ trap 'rm -rf "$HOSTILE" 2>/dev/null || true' EXIT
 touch "$HOSTILE/rendered.json" "$HOSTILE/checkpoint-guard.out"
 chmod 000 "$HOSTILE/rendered.json" "$HOSTILE/checkpoint-guard.out" 2>/dev/null || true
 
-# shellcheck disable=SC2034  # tmp/tmpdir are referenced inside eval'd ok() assertions
-read -r tmp tmpdir <<<"$(TMPDIR="$HOSTILE" bash "$VALIDATE" --print-scratch)"
+# --print-scratch emits one path per line so whitespace in a valid scratch
+# root cannot break parsing (review finding on #565).
+mapfile -t scratch < <(TMPDIR="$HOSTILE" bash "$VALIDATE" --print-scratch)
+# shellcheck disable=SC2034  # referenced inside eval'd ok() assertions
+tmp="${scratch[0]:-}"
+# shellcheck disable=SC2034  # referenced inside eval'd ok() assertions
+tmpdir="${scratch[1]:-}"
 # NOTE: mktemp -d honours the caller TMPDIR, so the private dir may be NESTED
 # under it — that is fine: hermeticity comes from the fresh unique 0700 dir,
 # not its parent. What must never happen is using the caller dir ITSELF (where
@@ -27,6 +32,19 @@ ok "validate resolves a private scratch dir, never the caller TMPDIR itself" \
 ok "validate exports the private scratch as TMPDIR for child tests" \
   '[ "$tmpdir" = "$tmp" ]'
 ok "scratch dir is cleaned up on exit" '[ ! -d "$tmp" ]'
+
+# A valid scratch root MAY contain whitespace; the contract must hold there too.
+HOSTILE_WS="$HOSTILE/review tmp with spaces"
+mkdir -p "$HOSTILE_WS"
+mapfile -t scratch_ws < <(TMPDIR="$HOSTILE_WS" bash "$VALIDATE" --print-scratch)
+# shellcheck disable=SC2034  # referenced inside eval'd ok() assertions
+tmp_ws="${scratch_ws[0]:-}"
+# shellcheck disable=SC2034  # referenced inside eval'd ok() assertions
+tmpdir_ws="${scratch_ws[1]:-}"
+ok "whitespace scratch root: private dir resolved, not the caller dir itself" \
+  '[ -n "$tmp_ws" ] && [ "$tmp_ws" != "$HOSTILE_WS" ]'
+ok "whitespace scratch root: TMPDIR exported and parsed intact" \
+  '[ "$tmpdir_ws" = "$tmp_ws" ]'
 
 echo "----"
 echo "PASS=$pass FAIL=$fail"
