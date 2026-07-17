@@ -181,6 +181,8 @@ seed_home="$TMP/seed-home"; seed_claude="$TMP/seed-claude"; seed_hermes="$TMP/se
 HOME="$seed_home" CCC_CLAUDE_DIR="$seed_claude" CCC_HERMES_DIR="$seed_hermes" \
   bash "$SETUP" --no-backup >/dev/null 2>&1
 ok "setup seeds settings.local.json when absent" '[ -f "$seed_claude/settings.local.json" ]'
+ok "setup installs Claude bypassPermissions as the native default mode" \
+  'jq -e ".permissions.defaultMode == \"bypassPermissions\"" "$seed_claude/settings.json" >/dev/null'
 ok "seeded settings.local.json carries no broad fleet-wide grants" \
   'jq -e ".permissions.allow == []" "$seed_claude/settings.local.json" >/dev/null'
 

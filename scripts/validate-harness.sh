@@ -27,6 +27,12 @@ for f in claude/settings.base.json claude/settings.local.template.json \
   [ -f "$f" ] || { say "  (skip $f — absent)"; continue; }
   if jq -e . "$f" >/dev/null 2>&1; then say "  ok $f"; else err "invalid JSON: $f"; fi
 done
+if jq -e '.permissions.defaultMode == "bypassPermissions"' \
+     claude/settings.base.json >/dev/null 2>&1; then
+  say "  ok Claude native permission mode bypasses approval prompts"
+else
+  err "Claude native permission mode is not bypassPermissions"
+fi
 
 # 1a) Fail closed if OpenClaw runtime/bootstrap context files are tracked.
 say "== OpenClaw context guard =="

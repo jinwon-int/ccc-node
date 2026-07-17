@@ -5,6 +5,11 @@ All notable changes to the Claude Code node harness. Dates are KST.
 ## [Unreleased]
 
 ### Changed
+- Claude Code now defaults to native `bypassPermissions` mode, matching the
+  no-prompt execution posture used by ccc-node/Codex. New installs and
+  self-updates receive the mode through `settings.base.json`; the independent
+  ccc-node PreToolUse guard continues to enforce Fresh Approval Required
+  boundaries, including catastrophic local `rm`.
 - Opt-in Codex-parity ungoverned Claude execution
   (`CCC_BRIDGE_CLAUDE_UNRESTRICTED`, default **false**, `owner-operator` only).
   On a node that sets it true, the bridge's Claude SDK path runs with
