@@ -183,15 +183,34 @@ def effective_bash_policy(bash_policy: Optional[str], execution_profile: str) ->
     return resolve_bash_policy(bash_policy)
 
 
-def claude_unrestricted_enabled(flag: Any, execution_profile: str) -> bool:
+def running_as_root() -> bool:
+    """Return whether this process runs with root privileges (POSIX only)."""
+
+    geteuid = getattr(os, "geteuid", None)
+    if geteuid is None:
+        return False
+    return geteuid() == 0
+
+
+def claude_unrestricted_enabled(
+    flag: Any, execution_profile: str, *, is_root: bool = False
+) -> bool:
     """Codex-parity ungoverned Claude execution, gated to owner-operator.
 
     Fail-closed: the opt-in flag has no effect unless the resolved profile is
     ``owner-operator`` (which already requires a single-owner allowlist), so a
     ``strict-project`` or ``disabled`` node can never be widened to host scope
     by setting it. Only an explicit boolean-true value enables it.
+
+    ``is_root`` additionally disables it: the unrestricted path emits
+    ``permission_mode=bypassPermissions``, which Claude Code refuses under
+    root/sudo (``--dangerously-skip-permissions cannot be used with
+    root/sudo privileges``). Enabling it on a root bridge would reject every
+    new session, so it degrades to the normal guarded owner-operator path.
     """
 
+    if is_root:
+        return False
     return flag is True and execution_profile == EXECUTION_OWNER_OPERATOR
 
 

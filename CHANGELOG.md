@@ -4,12 +4,28 @@ All notable changes to the Claude Code node harness. Dates are KST.
 
 ## [Unreleased]
 
+### Fixed
+- Root-aware `bypassPermissions` default (fixes a root node bricking every new
+  Claude session). Claude Code refuses `--dangerously-skip-permissions` — the
+  flag `bypassPermissions` maps to — under root/sudo, so the `#552`
+  `settings.base.json` default rejected new sessions on root-run nodes.
+  `setup.sh` now drops the `permissions.defaultMode = bypassPermissions`
+  default when the setup user is root (the PreToolUse guard remains the
+  boundary); non-root nodes keep the no-prompt default. The opt-in bridge flag
+  `CCC_BRIDGE_CLAUDE_UNRESTRICTED` is likewise ignored under root
+  (`claude_unrestricted_enabled(..., is_root=True)` degrades to the guarded
+  owner-operator path with a logged warning) so it cannot brick a root bridge.
+  `validate-harness.sh`/`setup.test.sh` gate the root-neutralization (real +
+  `id`-stubbed root), and the bridge gate/wiring carry root regressions.
+
 ### Changed
 - Claude Code now defaults to native `bypassPermissions` mode, matching the
   no-prompt execution posture used by ccc-node/Codex. New installs and
   self-updates receive the mode through `settings.base.json`; the independent
   ccc-node PreToolUse guard continues to enforce Fresh Approval Required
-  boundaries, including catastrophic local `rm`.
+  boundaries, including catastrophic local `rm`. Root-run nodes are the
+  exception: Claude Code refuses `bypassPermissions` under root, so `setup.sh`
+  drops the default there and the guard alone is the boundary.
 - Opt-in Codex-parity ungoverned Claude execution
   (`CCC_BRIDGE_CLAUDE_UNRESTRICTED`, default **false**, `owner-operator` only).
   On a node that sets it true, the bridge's Claude SDK path runs with

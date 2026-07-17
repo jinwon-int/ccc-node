@@ -28,13 +28,14 @@ def _close_task(coro):
 
 
 def _build_options(
-    *, profile: str, policy: str = "auto-approve", unrestricted: bool
+    *, profile: str, policy: str = "auto-approve", unrestricted: bool, is_root: bool = False
 ):
     _FakeSDKClient.last_options = None
     with (
         patch.object(project_chat, "EXECUTION_PROFILE", profile, create=True),
         patch.object(project_chat, "BASH_POLICY", policy),
         patch.object(project_chat, "CLAUDE_UNRESTRICTED", unrestricted),
+        patch.object(project_chat, "running_as_root", return_value=is_root),
         patch.object(project_chat, "ClaudeSDKClient", _FakeSDKClient),
         patch.object(project_chat.asyncio, "create_task", side_effect=_close_task),
     ):
@@ -62,6 +63,20 @@ class ClaudeUnrestrictedGateTest(unittest.TestCase):
         )
         self.assertFalse(
             tool_policy.claude_unrestricted_enabled(1, "owner-operator")
+        )
+
+    def test_gate_is_disabled_under_root(self) -> None:
+        # Claude Code refuses bypassPermissions under root, so the flag must
+        # degrade even on owner-operator to avoid bricking every new session.
+        self.assertFalse(
+            tool_policy.claude_unrestricted_enabled(
+                True, "owner-operator", is_root=True
+            )
+        )
+        self.assertTrue(
+            tool_policy.claude_unrestricted_enabled(
+                True, "owner-operator", is_root=False
+            )
         )
 
 
@@ -94,6 +109,16 @@ class ClaudeUnrestrictedWiringTest(unittest.TestCase):
             profile="disabled", policy="auto-approve", unrestricted=True
         )
         self.assertNotEqual(options.permission_mode, "bypassPermissions")
+
+    def test_flag_is_ignored_under_root_and_keeps_the_guard(self) -> None:
+        # Root bridge: Claude Code refuses bypassPermissions, so the flag must
+        # degrade to the normal guarded owner-operator path instead of
+        # emitting an option Claude Code would reject.
+        options = _build_options(
+            profile="owner-operator", unrestricted=True, is_root=True
+        )
+        self.assertEqual(options.permission_mode, "default")
+        self.assertEqual(options.setting_sources, ["user", "project", "local"])
 
 
 if __name__ == "__main__":

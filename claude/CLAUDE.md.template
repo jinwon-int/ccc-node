@@ -53,7 +53,10 @@ secrets · releases · DB/replay/migration/prune · manual ACKs · emergency hot
 Claude Code's native permission mode is `bypassPermissions`, the Claude
 equivalent of an unrestricted sandbox with no native approval prompts. The
 ccc-node PreToolUse guard below remains an independent, fail-closed boundary
-for the Fresh Approval Required set.
+for the Fresh Approval Required set. Nodes whose Claude runs as root are the
+exception: Claude Code refuses `bypassPermissions` under root/sudo, so
+`setup.sh` drops the default there and the guard alone is the boundary (run
+Claude as a non-root user to restore the no-prompt default).
 
 Service-control boundary (enforced by `guard.py` behind the `guard.sh` shim):
 - **Fleet-service lifecycle** — start/restart/reload/stop/kill of

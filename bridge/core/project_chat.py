@@ -73,6 +73,7 @@ from telegram_bot.core.tool_policy import (  # noqa: E402
     missing_callback_requires_denial,
     resolve_bash_policy,
     resolve_execution_profile,
+    running_as_root,
     sdk_permission_options,
     strict_bash_sandbox_settings,
 )
@@ -197,9 +198,22 @@ class ProjectChatHandler(
             if compatibility_mode
             else getattr(self._config, "claude_unrestricted", False)
         )
+        is_root = running_as_root()
         self._claude_unrestricted = claude_unrestricted_enabled(
-            unrestricted_flag, self._execution_profile
+            unrestricted_flag, self._execution_profile, is_root=is_root
         )
+        if (
+            unrestricted_flag is True
+            and self._execution_profile == EXECUTION_OWNER_OPERATOR
+            and is_root
+            and not self._claude_unrestricted
+        ):
+            logger.warning(
+                "CCC_BRIDGE_CLAUDE_UNRESTRICTED is set but ignored under root: "
+                "Claude Code refuses bypassPermissions with root/sudo "
+                "privileges. Keeping the guard boundary; run the bridge as a "
+                "non-root user to enable unrestricted execution."
+            )
         self._sdk_client_factory = sdk_client_factory or ClaudeSDKClient
         provider = getattr(self._config, "agent_provider", "claude")
         if provider == "codex" and agent_runtime is None:
