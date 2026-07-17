@@ -74,19 +74,20 @@ Service-control boundary (enforced by `guard.py` behind the `guard.sh` shim):
 - **Local self-managed apps**: list this node's own non-fleet units/containers in
   `~/.claude/managed-services.allow` and their `systemctl`/`pm2`/`docker` lifecycle
   is autonomous (system services like sshd/ufw/nginx stay gated). Operator-owned.
-- **Detached Compose reconciliation** — direct
-  `docker compose up -d [services...]` (or `docker-compose`/`--detach`) — is
-  autonomous without an allowlist. It may include the fixed broker runbook
-  companions: literal project `cd`, optional rollback `docker tag`, one
-  provenance export
-  (`A2A_BROKER_REVISION=$(git rev-parse HEAD)`, the only accepted
-  substitution — side-effect-free), then `docker inspect`, bounded `sleep`, and
-  loopback-only health `curl`. Direct SSH requires explicit fleet service
-  names. Arbitrary compound commands, any other `$(...)`/backtick substitution,
-  multiple reconciliations, and other Compose lifecycle/indirect forms stay
-  gated. This
-  executable shape does not waive the fresh in-task approval required for a
-  cross-broker mutation.
+- **Broker Compose reconciliation** — prefer the installed
+  `ccc-broker-reconcile <service>...` wrapper (root-owned; it encapsulates the
+  fixed runbook — project `cd`, `A2A_BROKER_REVISION=$(git rev-parse HEAD)`,
+  `docker compose up -d <allowlisted services>`). New runbook needs go into the
+  reviewed wrapper, NOT into new guard grammar. Read-only verification
+  (`docker inspect`, bounded `sleep`, loopback-only `curl`) is done separately.
+  During migration the guard still accepts the legacy inline shape — direct
+  `docker compose up -d [services...]` with the same fixed companions (literal
+  `cd`, optional rollback `docker tag`, one provenance
+  `export A2A_BROKER_REVISION=$(git rev-parse HEAD)`) — but that grammar is
+  being retired in favor of the wrapper. Arbitrary compound commands, any other
+  `$(...)`/backtick substitution, multiple reconciliations, and other Compose
+  lifecycle/indirect forms stay gated. None of this waives the fresh in-task
+  approval required for a cross-broker mutation.
 - Still fresh-approval: non-fleet units on unmanaged hosts, local config-changing
   verbs, other docker/podman/kubectl lifecycle, host power-down, and — regardless
   of host — force-push to protected branches, release/publish, DB
