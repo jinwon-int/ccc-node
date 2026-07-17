@@ -4,23 +4,36 @@
 policy hook, **not a sandbox**. The enforceable boundary is an unprivileged
 agent account plus a root-owned wrapper and root-owned exact-unit allowlist.
 
-## Operational-relax profile (opt-in, operator-owned)
+## Operational-relax profile (fresh-root default, operator-owned)
 
-By default the guard enforces the full Fresh-Approval boundary below. An
-operator may relax the **operational** categories on a node by explicitly
-running `sudo ./setup.sh --operational-relax` (or by provisioning the same
-root-owned `/etc/ccc-node/guard-profile` manually). The profile must contain the
-line `operational-relax`; see `docs/examples/guard-profile.example`. When present
+Without a valid profile, the guard enforces the full Fresh-Approval boundary
+below. A genuinely fresh root-run `setup.sh` install seeds the root-owned
+`/etc/ccc-node/guard-profile` by default. Use `--strict-guard` to opt a fresh
+root install out. An existing profile-less strict root node stays strict during
+routine setup/self-update and can be explicitly relaxed later with
+`sudo ./setup.sh --operational-relax`. The profile contains the line
+`operational-relax`; see `docs/examples/guard-profile.example`. When present
 and valid, the guard treats **all** service/container/orchestrator lifecycle
 (`systemctl`/`service`/`pm2`/`docker`/`podman`/`kubectl`
 start·stop·restart·reload·scale·rollout·…, local or toward any peer) and
 **reboot of any host** as autonomous.
 
-Setup remains strict without the explicit flag, rejects a non-root opt-in before
-managed files are changed, validates the destination for symlink components,
-and atomically creates the profile with mode `0644`. It never overwrites an
-existing operator profile, including an intentionally fail-closed malformed
-file or symlink. Routine setup/self-update therefore never widens a node.
+Non-root setup never installs the profile, and a non-root explicit opt-in is
+rejected before managed files change. Setup validates the destination for
+symlink components and atomically creates the profile with mode `0644`. It never
+overwrites an existing operator profile, including an intentionally fail-closed
+malformed file or symlink.
+
+### Operator-approved acceptance criteria (2026-07-17)
+
+- Fresh root ccc-node install: seed `operational-relax` by default.
+- Fresh root strict exception: require the explicit `--strict-guard` opt-out.
+- Existing profile-less install: do not widen during routine setup/self-update.
+- Existing strict root install: retain `--operational-relax` as an explicit
+  later opt-in.
+- Existing operator file or symlink: never overwrite it.
+- Review may harden UID/path/atomicity handling, but changing these default and
+  opt-in/opt-out semantics requires a new explicit operator decision.
 
 The profile is **fail-closed and cannot self-escalate**: it is honored only when
 the file is owned by `root` (uid 0), a regular non-symlink, and not group/world

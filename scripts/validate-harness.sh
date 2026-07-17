@@ -41,11 +41,13 @@ if grep -q "neutralize_bypass_if_root" setup.sh; then
 else
   err "setup.sh missing root-aware bypassPermissions neutralization"
 fi
-if grep -q "install_requested_operational_relax_profile" setup.sh \
+if grep -q "install_operational_relax_profile" setup.sh \
+   && grep -q 'GUARD_PROFILE_REASON="fresh root default"' setup.sh \
+   && grep -q -- "--strict-guard" setup.sh \
    && grep -q -- "--operational-relax" setup.sh; then
-  say "  ok setup keeps strict default and supports explicit root operational-relax opt-in"
+  say "  ok fresh root defaults to operational-relax with strict opt-out and existing-node opt-in"
 else
-  err "setup.sh missing strict-default operational-relax opt-in"
+  err "setup.sh missing approved fresh-root operational-relax policy"
 fi
 
 # 1a) Fail closed if OpenClaw runtime/bootstrap context files are tracked.
