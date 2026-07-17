@@ -209,8 +209,7 @@ class ProjectChatHandler(
             and not self._claude_unrestricted
         ):
             logger.warning(
-                "Codex-parity unrestricted Claude execution "
-                "(CCC_BRIDGE_CLAUDE_UNRESTRICTED) is not applied under root: "
+                "CCC_BRIDGE_CLAUDE_UNRESTRICTED is set but ignored under root: "
                 "Claude Code refuses bypassPermissions with root/sudo "
                 "privileges. Keeping the guard boundary; run the bridge as a "
                 "non-root user to enable unrestricted execution."

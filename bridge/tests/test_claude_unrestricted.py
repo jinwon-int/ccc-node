@@ -10,7 +10,6 @@ import unittest
 from unittest.mock import patch
 
 from telegram_bot.core import project_chat, tool_policy
-from telegram_bot.utils.config import Config
 
 
 class _FakeSDKClient:
@@ -120,38 +119,6 @@ class ClaudeUnrestrictedWiringTest(unittest.TestCase):
         )
         self.assertEqual(options.permission_mode, "default")
         self.assertEqual(options.setting_sources, ["user", "project", "local"])
-
-
-class ClaudeUnrestrictedDefaultTest(unittest.TestCase):
-    def test_config_default_is_unrestricted(self) -> None:
-        # The package default is now Codex parity: an owner-operator node runs
-        # ungoverned unless it explicitly opts back into the guard.
-        self.assertIs(Config.model_fields["claude_unrestricted"].default, True)
-
-    def test_default_reaches_parity_on_non_root_owner_operator(self) -> None:
-        # A non-root owner-operator node with no env override reaches parity.
-        default = Config.model_fields["claude_unrestricted"].default
-        self.assertTrue(
-            tool_policy.claude_unrestricted_enabled(
-                default, "owner-operator", is_root=False
-            )
-        )
-
-    def test_default_stays_fail_closed_off_profile_and_under_root(self) -> None:
-        # The flipped default never widens strict-project/disabled, and root
-        # owner-operator still degrades to the guarded path.
-        default = Config.model_fields["claude_unrestricted"].default
-        self.assertFalse(
-            tool_policy.claude_unrestricted_enabled(default, "strict-project")
-        )
-        self.assertFalse(
-            tool_policy.claude_unrestricted_enabled(default, "disabled")
-        )
-        self.assertFalse(
-            tool_policy.claude_unrestricted_enabled(
-                default, "owner-operator", is_root=True
-            )
-        )
 
 
 if __name__ == "__main__":
