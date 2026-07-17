@@ -179,6 +179,31 @@ if [ "$ROOT" != "/opt/ccc-node" ]; then
   ok "setup leaves no stale /opt/ccc-node reference in installed commands" \
     '! grep -rq "/opt/ccc-node" "$rewrite_claude/commands"'
 fi
+# Non-cascading regression (PR #563 review): a checkout under a path containing
+# /root/.claude must keep its freshly inserted $SRC intact — the harness-dir
+# pair must not rescan and corrupt the repo-path pair's output.
+cascade_src="$TMP/root/.claude/src"
+mkdir -p "$cascade_src"
+tar -C "$ROOT" --exclude=.git --exclude=bridge/venv --exclude=bridge/logs \
+  --exclude=.harness-tmp -cf - . 2>/dev/null | tar -xf - -C "$cascade_src"
+cascade_claude="$TMP/cascade-claude"
+out="$(HOME="$TMP/cascade-home" CCC_CLAUDE_DIR="$cascade_claude" \
+  CCC_HERMES_DIR="$TMP/cascade-hermes" bash "$cascade_src/setup.sh" --no-backup 2>&1)"; rc=$?
+ok "setup from a /root/.claude-containing checkout installs commands pointing at that checkout" \
+  '[ "$rc" = 0 ] && grep -Fq "$cascade_src/scripts/ccc-doctor.sh" "$cascade_claude/commands/doctor.md"'
+ok "cascade regression: installed commands never point into the harness dir" \
+  '! grep -Fq "$cascade_claude/scripts" "$cascade_claude/commands/doctor.md"'
+# Unsafe checkout paths are rejected up-front (PR #563 review): $SRC is embedded
+# verbatim into slash-command shell text, so whitespace/metacharacter paths must
+# refuse to install rather than produce broken unquoted commands.
+space_src="$TMP/space dir/src"
+mkdir -p "$space_src/scripts/lib"
+cp "$ROOT/setup.sh" "$space_src/setup.sh"
+cp "$ROOT/scripts/lib/harness-paths.sh" "$ROOT/scripts/lib/harness_paths.py" "$space_src/scripts/lib/"
+out="$(HOME="$TMP/space-home" CCC_CLAUDE_DIR="$TMP/space-claude" \
+  CCC_HERMES_DIR="$TMP/space-hermes" bash "$space_src/setup.sh" --dry-run 2>&1)"; rc=$?
+ok "setup refuses a checkout path unsafe for slash-command embedding" \
+  '[ "$rc" = 2 ] && grep -q "unsafe for installed slash commands" <<<"$out" && [ ! -e "$TMP/space-claude" ]'
 ok "setup deploys the shared path library beside installed self-update" \
   '[ -x "$rewrite_claude/hooks/lib/harness-paths.sh" ] && [ -x "$rewrite_claude/hooks/lib/harness_paths.py" ] && cmp -s "$ROOT/scripts/lib/harness-paths.sh" "$rewrite_claude/hooks/lib/harness-paths.sh" && cmp -s "$ROOT/scripts/lib/harness_paths.py" "$rewrite_claude/hooks/lib/harness_paths.py" && grep -Fq "lib/harness-paths.sh" "$rewrite_claude/hooks/ccc-self-update.sh"'
 ok "setup installs the Codex launcher and materializer as executable managed hooks" \

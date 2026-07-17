@@ -96,6 +96,17 @@ fi
 
 ccc_validate_setup_roots "$CLAUDE_DIR" "$HERMES_ROOT" || exit 2
 
+# The canonical-path rewrite embeds $SRC verbatim into installed slash-command
+# shell text (allowed-tools patterns and !`...` inline commands), where quoting
+# is not uniformly available. Refuse checkout paths that cannot be embedded
+# safely instead of installing broken, unquoted command paths.
+case "$SRC" in
+  *[!A-Za-z0-9/._-]*)
+    echo "ERROR: checkout path contains characters unsafe for installed slash commands: $SRC" >&2
+    echo "       move the checkout to a path matching [A-Za-z0-9/._-] (canonical: /opt/ccc-node)" >&2
+    exit 2 ;;
+esac
+
 # Capture this before setup installs the hook. Routine setup/self-update must
 # not widen an existing profile-less strict node; the default applies only to a
 # genuinely fresh root ccc-node install.
@@ -558,9 +569,11 @@ seed "$SRC/hermes/honcho.template.json"           "$HERMES_ROOT/honcho.json"
 # (${CCC_*:-/root/.claude/...}) resolve, AND so the slash commands that invoke
 # repo scripts verbatim (/doctor, /node-status, /security-audit, /agent-cron)
 # point at this node's real checkout instead of a nonexistent /opt/ccc-node.
-# Repo templates stay canonical; only installed copies are rewritten. The
-# /opt/ccc-node pair is applied first so a pathological SRC under the harness
-# dir cannot be corrupted by the second pass.
+# Repo templates stay canonical; only installed copies are rewritten. Both
+# pairs are substituted in a SINGLE non-cascading pass (one regex alternation
+# over the original text), so a replacement value is never rescanned — e.g. a
+# checkout under a path containing /root/.claude cannot have its freshly
+# inserted $SRC corrupted by the harness-dir pair.
 # No-op on standard nodes (CLAUDE_DIR == /root/.claude, SRC == /opt/ccc-node).
 if [ "$CLAUDE_DIR" != "/root/.claude" ] || [ "$SRC" != "/opt/ccc-node" ]; then
   note "rewrite canonical paths (/opt/ccc-node -> $SRC, /root/.claude -> $CLAUDE_DIR) in installed harness files"
@@ -582,17 +595,25 @@ if [ "$CLAUDE_DIR" != "/root/.claude" ] || [ "$SRC" != "/opt/ccc-node" ]; then
     for rewrite_file in "${rewrite_targets[@]}"; do
       [ -f "$rewrite_file" ] || continue
       python3 - "$rewrite_file" "/opt/ccc-node" "$SRC" "/root/.claude" "$CLAUDE_DIR" <<'PY'
+import re
 import sys
 
 path = sys.argv[1]
-pairs = list(zip(sys.argv[2::2], sys.argv[3::2]))
-with open(path, encoding="utf-8") as fh:
-    content = fh.read()
-for old, new in pairs:
-    if old != new:
-        content = content.replace(old, new)
-with open(path, "w", encoding="utf-8") as fh:
-    fh.write(content)
+args = sys.argv[2:]
+pairs = {old: new for old, new in zip(args[0::2], args[1::2]) if old != new}
+if pairs:
+    # Single non-cascading pass: every occurrence in the ORIGINAL text is
+    # replaced exactly once and replacement values are never rescanned, so one
+    # pair's output cannot be corrupted by the other pair. Longest token first
+    # for deterministic behavior on overlapping prefixes.
+    pattern = re.compile(
+        "|".join(re.escape(tok) for tok in sorted(pairs, key=len, reverse=True))
+    )
+    with open(path, encoding="utf-8") as fh:
+        content = fh.read()
+    content = pattern.sub(lambda m: pairs[m.group(0)], content)
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(content)
 PY
     done
   fi
