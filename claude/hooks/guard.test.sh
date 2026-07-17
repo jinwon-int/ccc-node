@@ -514,7 +514,7 @@ run allow Bash command 'git push --force origin main' 'CCC_ALLOW_GATED=1'
 # ---- portability: default approval log parent is created under HOME ----
 tmp_home="$(mktemp -d 2>/dev/null || mktemp -d -t ccc-guard-home)"
 payload="$(jq -nc --arg t Bash --arg f command --arg v 'gh release create v1.0.0' '{tool_name:$t, tool_input:{($f):$v}}')"
-rc=0; CCC_APPROVAL_LOG= HOME="$tmp_home" bash "$GUARD" <<<"$payload" >/dev/null 2>&1 || rc=$?
+rc=0; CCC_APPROVAL_LOG='' HOME="$tmp_home" bash "$GUARD" <<<"$payload" >/dev/null 2>&1 || rc=$?
 if [ "$rc" = "2" ] && [ -s "$tmp_home/.claude/state/approval-needed.log" ]; then
   pass=$((pass+1))
 else
