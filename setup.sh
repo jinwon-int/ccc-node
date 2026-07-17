@@ -33,17 +33,19 @@ OPT_NODE=""; OPT_DISPLAY=""; OPT_SLOT=""; OPT_FLEET_ROLE=""; OPT_LANG=""
 OPT_USER_NAME=""; OPT_USER_GH=""; OPT_USER_TZ=""; OPT_USER_CONTEXT=""
 need_val() { [ -n "${2:-}" ] || { echo "Flag $1 requires a value" >&2; exit 2; }; }
 _ccc_is_root() {
-  local uid=""
-  # Deterministic CI seam, accepted only when setup targets a non-runtime temp
-  # profile. Production /etc decisions always use the pinned system id binary.
-  case "${CCC_SETUP_GUARD_PROFILE_PATH:-}" in
-    /tmp/*)
-      case "/${CCC_SETUP_GUARD_PROFILE_PATH#/}/" in
-        */../*) ;;
-        *) uid="${CCC_SETUP_TEST_EUID:-}" ;;
+  local uid="" test_root="" test_profile=""
+  # Deterministic CI seam, accepted only for a canonical profile beneath the
+  # caller's existing writable temp root. Production /etc decisions always use
+  # the pinned system id binary; traversal out of TMPDIR cannot activate this.
+  if [ -n "${CCC_SETUP_TEST_EUID:-}" ] && [ -n "${CCC_SETUP_GUARD_PROFILE_PATH:-}" ]; then
+    test_root="$(/usr/bin/readlink -m -- "${TMPDIR:-/tmp}" 2>/dev/null || true)"
+    test_profile="$(/usr/bin/readlink -m -- "$CCC_SETUP_GUARD_PROFILE_PATH" 2>/dev/null || true)"
+    if [ -n "$test_root" ] && [ -d "$test_root" ] && [ -w "$test_root" ]; then
+      case "$test_profile" in
+        "$test_root"/*) uid="$CCC_SETUP_TEST_EUID" ;;
       esac
-      ;;
-  esac
+    fi
+  fi
   [ -n "$uid" ] || uid="$(/usr/bin/id -u 2>/dev/null || echo invalid)"
   case "$uid" in
     ''|*[!0-9]*) return 1 ;;
