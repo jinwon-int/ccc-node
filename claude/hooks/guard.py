@@ -577,12 +577,19 @@ def _operational_relax_enabled():
     unprivileged and cannot write a root-owned /etc file, so it cannot relax its
     own guard; any error, ambiguity, or weaker ownership fails closed to strict.
 
+    ``CCC_GUARD_ASSUME_STRICT=1`` ignores the profile entirely. This is a
+    STRICT-ONLY seam (it can only tighten, never relax), safe to expose to the
+    environment: the guard test suite uses it so strict-semantics expectations
+    hold on nodes where the operator has enabled operational-relax.
+
     Only the OPERATIONAL gates (service/container/orchestrator lifecycle and
     reboot) consult this. The catastrophic set — rm-catastrophic, secret-exfil,
     force-push/history-rewrite, DB destructive/migrate/replay, release/publish,
     repo-visibility, host power-down (poweroff/halt), and operator-config
     writes — is enforced regardless and never reads this profile.
     """
+    if os.environ.get("CCC_GUARD_ASSUME_STRICT") == "1":
+        return False                         # strict-only seam: can only tighten
     try:
         st = os.lstat(_GUARD_PROFILE_PATH)   # lstat: a symlink is not a regular file
     except OSError:
