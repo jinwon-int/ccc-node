@@ -172,6 +172,23 @@ if command -v shellcheck >/dev/null 2>&1; then
     [ -f "$f" ] || continue
     if shellcheck --severity=warning -e SC2155,SC1090,SC1091 "$f"; then say "  ok $f"; else err "shellcheck: $f"; fi
   done
+  # 3a) Repo-wide error-severity sweep — every tracked script gets at least
+  # error-level lint, so a new script cannot escape shellcheck entirely
+  # (previously anything outside SC_SCOPE only got bash -n). SC_SCOPE keeps
+  # the stricter warning-level bar for reviewed scripts; this pass is
+  # currently clean repo-wide, so it only ever catches new real bugs.
+  if command -v git >/dev/null 2>&1 && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    mapfile -t ALL_SH < <(git ls-files '*.sh')
+    if [ "${#ALL_SH[@]}" -gt 0 ]; then
+      if shellcheck --severity=error "${ALL_SH[@]}"; then
+        say "  ok repo-wide shellcheck (severity=error, ${#ALL_SH[@]} scripts)"
+      else
+        err "repo-wide shellcheck (severity=error)"
+      fi
+    fi
+  else
+    say "  (git unavailable — repo-wide shellcheck sweep skipped)"
+  fi
 else
   say "  (shellcheck absent — skipped)"
 fi
