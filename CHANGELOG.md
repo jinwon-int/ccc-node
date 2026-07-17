@@ -19,6 +19,17 @@ All notable changes to the Claude Code node harness. Dates are KST.
   `id`-stubbed root), and the bridge gate/wiring carry root regressions.
 
 ### Changed
+- The autonomous broker Compose runbook now accepts one provenance
+  `export A2A_BROKER_REVISION=$(git rev-parse HEAD)` companion (also `--short` and the
+  backtick form) before the single `docker compose up -d` reconciliation, so
+  the compose file can label the image with the deployed revision without a
+  fresh-approval gate. `git rev-parse HEAD` is side-effect-free and is the
+  ONLY substitution the runbook accepts: the sequence splitter rejects any
+  top-level `;`/`|`/`&&` first, and a full-match on the exact command leaves
+  no room for a hidden substitution — every other `$(...)`/backtick, a second
+  export, an export after the reconciliation, a redirect, or a non-`A-Z` var
+  name still fails closed (`guard.test.sh` carries the allow/deny regressions,
+  350/0).
 - Claude Code now defaults to native `bypassPermissions` mode, matching the
   no-prompt execution posture used by ccc-node/Codex. New installs and
   self-updates receive the mode through `settings.base.json`; the independent

@@ -743,6 +743,26 @@ _IMAGE_REF_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@-]*")
 _SERVICE_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
 _MAX_RUNBOOK_SLEEP_SECONDS = 300.0
 
+# One whitelisted pre-reconcile companion in the broker Compose runbook:
+# capturing the current git revision into an env var the compose file
+# interpolates (label provenance). `git rev-parse HEAD` is side-effect-free
+# (reads refs, prints a SHA — no hooks/aliases), and _split_safe_compose_sequence
+# has already rejected any top-level `;`/`|`/`&&`/`&`/newline before this runs, so
+# a full-match on the exact command leaves no room for a hidden substitution
+# (e.g. `$(git rev-parse HEAD; rm -rf /)` splits at `;` and fails closed). This
+# is the ONLY `$`-bearing statement the runbook accepts; every other `$` stays
+# hard-denied by _literal_statement_tokens.
+_REVISION_EXPORT_RE = re.compile(
+    r"export[ \t]+A2A_BROKER_REVISION="
+    r"(?:\$\([ \t]*git[ \t]+rev-parse(?:[ \t]+--short)?[ \t]+HEAD[ \t]*\)"
+    r"|`[ \t]*git[ \t]+rev-parse(?:[ \t]+--short)?[ \t]+HEAD[ \t]*`)"
+)
+
+
+def _safe_revision_export(st):
+    """Whether a statement is the whitelisted broker-revision env capture."""
+    return bool(_REVISION_EXPORT_RE.fullmatch(st.strip()))
+
 
 def _split_safe_compose_sequence(c):
     """Split the narrow Compose runbook grammar, rejecting unsafe controls.
@@ -878,6 +898,19 @@ def _safe_loopback_curl(toks):
     return len(urls) == 1 and bool(_LOOPBACK_HTTP_RE.fullmatch(urls[0]))
 
 
+def _safe_post_reconcile_companion(toks):
+    """Read-only verification allowed after the reconciliation: docker inspect,
+    loopback-only curl, and a bounded sleep."""
+    if toks[:2] == ["docker", "inspect"] and len(toks) >= 3:
+        return True
+    if _safe_loopback_curl(toks):
+        return True
+    if toks[0] == "sleep" and len(toks) == 2 \
+            and re.fullmatch(r"\d+(?:[.]\d+)?s?", toks[1]):
+        return float(toks[1].removesuffix("s")) <= _MAX_RUNBOOK_SLEEP_SECONDS
+    return False
+
+
 def _safe_compose_sequence_body(c, *, remote):
     statements = _split_safe_compose_sequence(c)
     if not statements:
@@ -885,8 +918,16 @@ def _safe_compose_sequence_body(c, *, remote):
     compose_count = 0
     saw_cd = False
     saw_tag = False
+    saw_revision_export = False
     post_reconcile = False
     for st in statements:
+        if _safe_revision_export(st):
+            # Whitelisted git-revision env capture — checked before the literal
+            # tokenizer, which would otherwise reject its `$(...)` outright.
+            if post_reconcile or saw_revision_export:
+                return False
+            saw_revision_export = True
+            continue
         toks = _literal_statement_tokens(st)
         if not toks:
             return False
@@ -909,18 +950,8 @@ def _safe_compose_sequence_body(c, *, remote):
                 return False
             saw_tag = True
             continue
-        if not post_reconcile:
+        if not post_reconcile or not _safe_post_reconcile_companion(toks):
             return False
-        if toks[:2] == ["docker", "inspect"] and len(toks) >= 3:
-            continue
-        if _safe_loopback_curl(toks):
-            continue
-        if toks[0] == "sleep" and len(toks) == 2 \
-                and re.fullmatch(r"\d+(?:[.]\d+)?s?", toks[1]):
-            seconds = float(toks[1].removesuffix("s"))
-            if seconds <= _MAX_RUNBOOK_SLEEP_SECONDS:
-                continue
-        return False
     return compose_count == 1
 
 
