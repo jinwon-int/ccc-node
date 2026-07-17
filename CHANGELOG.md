@@ -10,6 +10,20 @@ All notable changes to the Claude Code node harness. Dates are KST.
   self-updates receive the mode through `settings.base.json`; the independent
   ccc-node PreToolUse guard continues to enforce Fresh Approval Required
   boundaries, including catastrophic local `rm`.
+- Opt-in Codex-parity ungoverned Claude execution
+  (`CCC_BRIDGE_CLAUDE_UNRESTRICTED`, default **false**, `owner-operator` only).
+  On a node that sets it true, the bridge's Claude SDK path runs with
+  `permission_mode=bypassPermissions`, no OS sandbox, and no host settings
+  chain — so the PreToolUse `guard.py` hook is not loaded — matching the
+  Codex `never + dangerFullAccess` contract that `auto-approve` already maps
+  to (`bot_access.py`). MEMORY/USER context is preserved through the curated
+  settings block. The flag is fail-closed: `claude_unrestricted_enabled`
+  ignores it on `strict-project`/`disabled` (which stay sandboxed) and honors
+  only an explicit boolean-true, so it can never widen a non-owner node to
+  host scope. Default keeps `guard.py` as the boundary; the change is
+  per-node and reversible. This unifies the two providers' execution scope at
+  the operator's explicit request without dropping the guard for nodes that
+  do not opt in.
 - Claude's service-lifecycle guard now treats direct local detached Compose
   reconciliation (`docker compose up -d [services...]`, including
   `docker-compose` and `--detach`) as autonomous, matching the unrestricted

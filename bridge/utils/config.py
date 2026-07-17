@@ -287,6 +287,19 @@ class Config(BaseSettings):
         alias="CCC_BRIDGE_BASH_POLICY",
         description="Bash approval UX: auto-approve, approve-each, or disabled.",
     )
+    claude_unrestricted: bool = Field(
+        default=False,
+        alias="CCC_BRIDGE_CLAUDE_UNRESTRICTED",
+        description=(
+            "Opt-in Codex-parity ungoverned Claude execution (owner-operator "
+            "only; ignored on every other profile). When true, the Claude SDK "
+            "path runs with permission_mode=bypassPermissions, no OS sandbox, "
+            "and no host settings chain — so the PreToolUse guard hook is not "
+            "loaded — matching Codex's never + dangerFullAccess. Memory context "
+            "is preserved. Default false keeps guard.py as the boundary; set per "
+            "node and reversible."
+        ),
+    )
     telegram_session_scope: Literal[
         "per-user-chat", "shared-groups", "shared-all"
     ] = Field(
