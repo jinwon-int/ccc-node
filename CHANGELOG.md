@@ -20,7 +20,7 @@ All notable changes to the Claude Code node harness. Dates are KST.
 
 ### Changed
 - The autonomous broker Compose runbook now accepts one provenance
-  `export <VAR>=$(git rev-parse HEAD)` companion (also `--short` and the
+  `export A2A_BROKER_REVISION=$(git rev-parse HEAD)` companion (also `--short` and the
   backtick form) before the single `docker compose up -d` reconciliation, so
   the compose file can label the image with the deployed revision without a
   fresh-approval gate. `git rev-parse HEAD` is side-effect-free and is the
@@ -32,7 +32,6 @@ All notable changes to the Claude Code node harness. Dates are KST.
   350/0).
 - Claude Code now defaults to native `bypassPermissions` mode, matching the
   no-prompt execution posture used by ccc-node/Codex. New installs and
-  self-updates receive the mode through `settings.base.json`; the independent New installs and
   self-updates receive the mode through `settings.base.json`; the independent
   ccc-node PreToolUse guard continues to enforce Fresh Approval Required
   boundaries, including catastrophic local `rm`. Root-run nodes are the

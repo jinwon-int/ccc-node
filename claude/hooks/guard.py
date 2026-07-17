@@ -753,14 +753,14 @@ _MAX_RUNBOOK_SLEEP_SECONDS = 300.0
 # is the ONLY `$`-bearing statement the runbook accepts; every other `$` stays
 # hard-denied by _literal_statement_tokens.
 _REVISION_EXPORT_RE = re.compile(
-    r"export[ \t]+[A-Z][A-Z0-9_]*="
+    r"export[ \t]+A2A_BROKER_REVISION="
     r"(?:\$\([ \t]*git[ \t]+rev-parse(?:[ \t]+--short)?[ \t]+HEAD[ \t]*\)"
     r"|`[ \t]*git[ \t]+rev-parse(?:[ \t]+--short)?[ \t]+HEAD[ \t]*`)"
 )
 
 
 def _safe_revision_export(st):
-    """Whether a statement is the whitelisted git-revision env capture."""
+    """Whether a statement is the whitelisted broker-revision env capture."""
     return bool(_REVISION_EXPORT_RE.fullmatch(st.strip()))
 
 
