@@ -35,6 +35,7 @@ import json
 import os
 import re
 import shlex
+import stat
 import sys
 from datetime import datetime, timezone
 
@@ -547,6 +548,48 @@ def _split_lifecycle_fragments(stmt):
 
 
 # --------------------------------------------------------------------------- #
+# Operational-relax profile (operator-owned, fail-closed).
+# --------------------------------------------------------------------------- #
+_GUARD_PROFILE_PATH = "/etc/ccc-node/guard-profile"
+
+
+def _operational_relax_enabled():
+    """Whether the operator enabled the operational-relax profile on THIS node.
+
+    Fail-closed: only a root-owned (uid 0), regular, non-symlink,
+    non-group/world-writable ``/etc/ccc-node/guard-profile`` whose content
+    carries the ``operational-relax`` token enables it. The agent runs
+    unprivileged and cannot write a root-owned /etc file, so it cannot relax its
+    own guard; any error, ambiguity, or weaker ownership fails closed to strict.
+
+    Only the OPERATIONAL gates (service/container/orchestrator lifecycle and
+    reboot) consult this. The catastrophic set — rm-catastrophic, secret-exfil,
+    force-push/history-rewrite, DB destructive/migrate/replay, release/publish,
+    repo-visibility, host power-down (poweroff/halt), and operator-config
+    writes — is enforced regardless and never reads this profile.
+    """
+    try:
+        st = os.lstat(_GUARD_PROFILE_PATH)   # lstat: a symlink is not a regular file
+    except OSError:
+        return False
+    if not stat.S_ISREG(st.st_mode):
+        return False
+    if st.st_uid != 0:                       # must be operator (root)-owned
+        return False
+    if st.st_mode & 0o022:                   # group/world writable → untrusted
+        return False
+    try:
+        with open(_GUARD_PROFILE_PATH, "r", encoding="utf-8", errors="replace") as fh:
+            data = fh.read()
+    except OSError:
+        return False
+    for line in data.splitlines():
+        if line.split("#", 1)[0].strip() == "operational-relax":
+            return True
+    return False
+
+
+# --------------------------------------------------------------------------- #
 # Main evaluation. Raises Deny to block; returns normally to allow.
 # --------------------------------------------------------------------------- #
 def evaluate(tool, cmd, fpath, tool_input_raw):
@@ -581,6 +624,8 @@ def evaluate(tool, cmd, fpath, tool_input_raw):
             _deny("managed-nodes-config", "operator_approval_gated", f"{tool} on {fpath}")
         if fpath.endswith("/managed-services.allow"):
             _deny("managed-services-config", "operator_approval_gated", f"{tool} on {fpath}")
+        if fpath.endswith("/guard-profile"):
+            _deny("guard-profile-config", "operator_approval_gated", f"{tool} on {fpath}")
 
     if tool != "Bash" or not cmd:
         return
@@ -600,6 +645,7 @@ def evaluate(tool, cmd, fpath, tool_input_raw):
     # Judged on the QUOTED statement so a remote command stays intact.
     managed = [stmt_remote_target_managed(st, entries) for st in statements_raw]
 
+    relax = _operational_relax_enabled()      # operator-owned operational-relax profile
     _gate_git(c, cn, toks)                    # force-push / history-rewrite
     _gate_broker_reconcile(c, cn)             # immutable absolute wrapper entrypoint
     _service_lifecycle(
@@ -608,8 +654,9 @@ def evaluate(tool, cmd, fpath, tool_input_raw):
         managed,
         svc_entries,
         compose_reconciliation=_safe_compose_reconciliation(c),
+        relax=relax,
     )
-    _gate_host_lifecycle(c, cn, statements, managed)
+    _gate_host_lifecycle(c, cn, statements, managed, relax=relax)
     _gate_operator_config(c, cn)              # self-update.* / managed-nodes.allow writes
     _gate_db(c)                               # destructive / migrate / replay
     _gate_release(c, cn, toks)                # publish / tag-push / repo visibility
@@ -666,7 +713,7 @@ def _stmt_has_remote_tool(st):
     return False
 
 
-def _gate_host_lifecycle(c, cn, statements, managed):
+def _gate_host_lifecycle(c, cn, statements, managed, relax=False):
     # reboot-class (recoverable) is autonomous on nodes you are entitled to — the
     # LOCAL node and managed remote nodes; an unlisted remote host, interpreter-
     # mediated forms, and the down-class (poweroff/halt/`shutdown` w/o -r, which
@@ -681,13 +728,14 @@ def _gate_host_lifecycle(c, cn, statements, managed):
         # split into words and distinguished — reboot recovers, poweroff does not,
         # even on a managed node.
         kind = _host_lifecycle_cmd_kind(st)
-        if kind == "reboot" and (mgd or not _stmt_has_remote_tool(st)):
-            continue  # direct reboot on the local or a managed node — recoverable
+        if kind == "reboot" and (relax or mgd or not _stmt_has_remote_tool(st)):
+            continue  # direct reboot — recoverable; relax allows any host
         _deny("host-lifecycle", "operator_approval_gated", c)
 
 
 def _gate_operator_config(c, cn):
-    if re.search(r"self-update\.(services|repo)|managed-(nodes|services)\.allow", cn) \
+    if re.search(r"self-update\.(services|repo)|managed-(nodes|services)\.allow"
+                 r"|ccc-node/guard-profile", cn) \
             and not _is_readonly_config_command(cn):
         _deny("self-update-config", "operator_approval_gated", c)
 
@@ -1032,7 +1080,13 @@ def _service_lifecycle(
     svc_entries,
     *,
     compose_reconciliation,
+    relax=False,
 ):
+    # operational-relax (operator-owned profile): all service/container/
+    # orchestrator lifecycle is autonomous on this node. The catastrophic set is
+    # enforced by the other gates and never consults this flag.
+    if relax:
+        return
     # Precedence per statement: managed-remote (owned node) → fleet unit (#436) →
     # managed local service (operator-listed unit/container) → else deny.
     for st, mgd in zip(statements, managed_stmt):

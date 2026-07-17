@@ -4,6 +4,32 @@
 policy hook, **not a sandbox**. The enforceable boundary is an unprivileged
 agent account plus a root-owned wrapper and root-owned exact-unit allowlist.
 
+## Operational-relax profile (opt-in, operator-owned)
+
+By default the guard enforces the full Fresh-Approval boundary below. An
+operator may relax the **operational** categories on a node by installing a
+root-owned `/etc/ccc-node/guard-profile` whose content includes the line
+`operational-relax` (see `docs/examples/guard-profile.example`). When present
+and valid, the guard treats **all** service/container/orchestrator lifecycle
+(`systemctl`/`service`/`pm2`/`docker`/`podman`/`kubectl`
+start·stop·restart·reload·scale·rollout·…, local or toward any peer) and
+**reboot of any host** as autonomous. Fleet-wide = install it on each node
+through your provisioning; `setup.sh` does **not** install it, so the agent
+cannot enable it via self-update.
+
+The profile is **fail-closed and cannot self-escalate**: it is honored only when
+the file is owned by `root` (uid 0), a regular non-symlink, and not group/world
+writable — the unprivileged agent cannot write a root-owned `/etc` file, and the
+guard additionally denies writes to the path. Absent, malformed, or weaker-owned
+→ strict.
+
+It **never** relaxes the catastrophic / injection set, regardless of the
+profile: catastrophic `rm`, secret exfiltration, force-push/history-rewrite of
+protected branches, DB destructive/migrate/replay, release/publish +
+repo-visibility, host power-down (`poweroff`/`halt`), and operator-config
+writes. Those stay enforced because an unattended prompt injection reading
+untrusted input (PRs, web, A2A) could otherwise trigger irreversible damage.
+
 ## Policy
 
 - **Fleet-service lifecycle is autonomous** (operator-approved relaxation; see
@@ -126,6 +152,7 @@ wrapper does not change that boundary.
 
 ```bash
 bash claude/hooks/guard.test.sh
+python3 claude/hooks/guard-profile.test.py
 bash scripts/ccc-service-control.test.sh
 bash scripts/ccc-broker-reconcile.test.sh
 bash scripts/validate-harness.sh

@@ -1,0 +1,15 @@
+# ccc-node guard profile — operator-owned. Install as /etc/ccc-node/guard-profile,
+# owned by root:root, mode 0644. NOT installed by setup.sh: the agent runs
+# unprivileged and must not be able to relax its own guard.
+#
+# The `operational-relax` token below makes ALL operational service/container/
+# orchestrator lifecycle (systemctl/service/pm2/docker/podman/kubectl, local or
+# toward any peer) and reboot-of-any-host autonomous on this node.
+#
+# It NEVER relaxes the catastrophic / injection set — catastrophic rm, secret
+# exfiltration, protected-branch force-push/history-rewrite, DB destructive/
+# migrate/replay, release/publish, repo-visibility, host power-down
+# (poweroff/halt), and operator-config writes stay enforced regardless.
+#
+# Remove this file (or any weaker ownership) to revert the node to strict.
+operational-relax

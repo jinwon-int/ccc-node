@@ -175,6 +175,12 @@ say "== guard.py (python enforcement) =="
 if command -v python3 >/dev/null 2>&1; then
   if python3 -m py_compile claude/hooks/guard.py 2>/dev/null; then say "  ok claude/hooks/guard.py compiles"; else err "py_compile: claude/hooks/guard.py"; fi
   if python3 -m py_compile claude/hooks/statusline-usage.py 2>/dev/null; then say "  ok claude/hooks/statusline-usage.py compiles"; else err "py_compile: claude/hooks/statusline-usage.py"; fi
+  # operational-relax profile logic — in-process unit test (no root / no env seam).
+  if python3 claude/hooks/guard-profile.test.py >"$TMP/guard-profile.out" 2>&1; then
+    say "  ok claude/hooks/guard-profile.test.py ($(grep -oE 'Ran [0-9]+ tests' "$TMP/guard-profile.out" | tail -1))"
+  else
+    err "guard-profile.test.py"; tail -15 "$TMP/guard-profile.out"
+  fi
 else
   say "  (python3 absent — skipped)"
 fi
