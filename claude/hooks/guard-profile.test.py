@@ -118,6 +118,12 @@ class ProfileReaderIntegrityTest(unittest.TestCase):
     def test_root_owned_token_enables(self):
         self.assertTrue(self._enabled(uid=0, mode=0o644, content="operational-relax\n"))
 
+    def test_assume_strict_seam_ignores_a_valid_profile(self):
+        # Strict-only env seam: even a fully qualifying root-owned profile is
+        # ignored, so the test suite can pin strict semantics on relaxed nodes.
+        with mock.patch.dict(os.environ, {"CCC_GUARD_ASSUME_STRICT": "1"}):
+            self.assertFalse(self._enabled(uid=0, mode=0o644, content="operational-relax\n"))
+
     def test_comments_and_whitespace_tolerated(self):
         self.assertTrue(
             self._enabled(uid=0, mode=0o644, content="# fleet policy\n  operational-relax  # on\n")
