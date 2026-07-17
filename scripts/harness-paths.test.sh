@@ -41,6 +41,13 @@ if [ -r "$LIB" ]; then
   mkdir -p "$claude/hooks" "$hermes" "$state" "$repo"
   ok "setup roots accept distinct absolute paths" 'ccc_validate_setup_roots "$claude" "$hermes" >/dev/null 2>&1'
   ok "setup roots reject filesystem root" '! ccc_validate_setup_roots / "$hermes" >/dev/null 2>&1'
+  ok "guard profile accepts a missing absolute target" \
+    'ccc_validate_setup_guard_profile "$TMP/etc/ccc-node/guard-profile" >/dev/null 2>&1'
+  ok "guard profile rejects a relative target" \
+    '! ccc_validate_setup_guard_profile relative/guard-profile >/dev/null 2>&1'
+  mkdir -p "$TMP/real-etc"; ln -s "$TMP/real-etc" "$TMP/symlink-etc"
+  ok "guard profile rejects a symlink path component" \
+    '! ccc_validate_setup_guard_profile "$TMP/symlink-etc/guard-profile" >/dev/null 2>&1'
   ok "self-update roots require state under Claude root" '! ccc_validate_self_update_roots "$claude" "$hermes" "$TMP/outside" >/dev/null 2>&1'
   ok "repository cannot overlap install roots" '! ccc_validate_self_update_repo "$claude/repo" "$claude" "$hermes" >/dev/null 2>&1'
   ok "distinct repository path is accepted" 'ccc_validate_self_update_repo "$repo" "$claude" "$hermes" >/dev/null 2>&1'

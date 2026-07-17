@@ -41,6 +41,12 @@ if grep -q "neutralize_bypass_if_root" setup.sh; then
 else
   err "setup.sh missing root-aware bypassPermissions neutralization"
 fi
+if grep -q "install_requested_operational_relax_profile" setup.sh \
+   && grep -q -- "--operational-relax" setup.sh; then
+  say "  ok setup keeps strict default and supports explicit root operational-relax opt-in"
+else
+  err "setup.sh missing strict-default operational-relax opt-in"
+fi
 
 # 1a) Fail closed if OpenClaw runtime/bootstrap context files are tracked.
 say "== OpenClaw context guard =="

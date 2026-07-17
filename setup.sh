@@ -12,6 +12,7 @@
 #                              #   plugin registered them. Node-local hooks stay in settings.
 #   ./setup.sh --dry-run       # show what would happen, change nothing (combine with above)
 #   ./setup.sh --no-backup     # skip the durable operator backup (failure rollback remains enabled)
+#   sudo ./setup.sh --operational-relax  # explicitly install the broad operational profile
 #
 # Node-identity seeding (optional): when these are given, freshly-seeded CLAUDE.md / MEMORY.md /
 # USER.md have their <PLACEHOLDER> tokens substituted automatically (existing files are never
@@ -27,15 +28,36 @@
 #   --user-context <text>                       -> <USER_CONTEXT>
 set -euo pipefail
 
-DRY=0; WITH_PLUGIN=0; BACKUP=1
+DRY=0; WITH_PLUGIN=0; BACKUP=1; OPERATIONAL_RELAX=0
 OPT_NODE=""; OPT_DISPLAY=""; OPT_SLOT=""; OPT_FLEET_ROLE=""; OPT_LANG=""
 OPT_USER_NAME=""; OPT_USER_GH=""; OPT_USER_TZ=""; OPT_USER_CONTEXT=""
 need_val() { [ -n "${2:-}" ] || { echo "Flag $1 requires a value" >&2; exit 2; }; }
+_ccc_is_root() {
+  local uid="" test_root="" test_profile=""
+  # Deterministic CI seam, accepted only for a canonical profile beneath the
+  # caller's existing writable temp root. Production /etc decisions always use
+  # the pinned system id binary; traversal out of TMPDIR cannot activate this.
+  if [ -n "${CCC_SETUP_TEST_EUID:-}" ] && [ -n "${CCC_SETUP_GUARD_PROFILE_PATH:-}" ]; then
+    test_root="$(/usr/bin/readlink -m -- "${TMPDIR:-/tmp}" 2>/dev/null || true)"
+    test_profile="$(/usr/bin/readlink -m -- "$CCC_SETUP_GUARD_PROFILE_PATH" 2>/dev/null || true)"
+    if [ -n "$test_root" ] && [ -d "$test_root" ] && [ -w "$test_root" ]; then
+      case "$test_profile" in
+        "$test_root"/*) uid="$CCC_SETUP_TEST_EUID" ;;
+      esac
+    fi
+  fi
+  [ -n "$uid" ] || uid="$(/usr/bin/id -u 2>/dev/null || echo invalid)"
+  case "$uid" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  [ "$uid" -eq 0 ]
+}
 while [ $# -gt 0 ]; do
   case "$1" in
     --dry-run) DRY=1 ;;
     --with-plugin) WITH_PLUGIN=1 ;;
     --no-backup) BACKUP=0 ;;
+    --operational-relax) OPERATIONAL_RELAX=1 ;;
     --node)         need_val "$1" "${2:-}"; OPT_NODE="$2"; shift ;;
     --display)      need_val "$1" "${2:-}"; OPT_DISPLAY="$2"; shift ;;
     --slot)         need_val "$1" "${2:-}"; OPT_SLOT="$2"; shift ;;
@@ -59,6 +81,9 @@ HERMES_ROOT="${CCC_HERMES_DIR:-$HOME/.hermes}"
 HERMES_DIR="$HERMES_ROOT/memories"      # legacy memory location (fallback only)
 WIKI_AGENT_BIN="${CCC_WIKI_AGENT_BIN:-$HOME/.wiki-agent/bin/wiki-agent}"
 BRIDGE_DEFAULT_PATH="${CCC_BRIDGE_DEFAULT_PATH:-$HOME}"
+# Test-only path seam. The runtime guard intentionally reads the fixed
+# /etc/ccc-node/guard-profile path; production setup should use this default.
+GUARD_PROFILE_PATH="${CCC_SETUP_GUARD_PROFILE_PATH:-/etc/ccc-node/guard-profile}"
 HARNESS_PATHS_LIB="$SRC/scripts/lib/harness-paths.sh"
 if [ ! -r "$HARNESS_PATHS_LIB" ]; then
   echo "ERROR: shared harness path library is missing: $HARNESS_PATHS_LIB" >&2
@@ -68,6 +93,16 @@ fi
 . "$HARNESS_PATHS_LIB"
 
 ccc_validate_setup_roots "$CLAUDE_DIR" "$HERMES_ROOT" || exit 2
+
+if [ "$OPERATIONAL_RELAX" = 1 ]; then
+  if ! _ccc_is_root; then
+    echo "ERROR: --operational-relax requires root; no setup changes were made" >&2
+    exit 2
+  fi
+  if [ ! -e "$GUARD_PROFILE_PATH" ] && [ ! -L "$GUARD_PROFILE_PATH" ]; then
+    ccc_validate_setup_guard_profile "$GUARD_PROFILE_PATH" || exit 2
+  fi
+fi
 
 render_command() {
   printf '[dry-run]'
@@ -185,7 +220,6 @@ merge_settings_json() {
 # default. The setup user is used as the proxy for the run user (the dominant
 # case is setup-as-root == service-as-root); the bridge additionally enforces
 # this at runtime for its own SDK path.
-_ccc_is_root() { [ "$(id -u 2>/dev/null || echo 0)" -eq 0 ]; }
 
 neutralize_bypass_if_root() {
   local dest="$1"
@@ -206,6 +240,58 @@ neutralize_bypass_if_root() {
     rm -f "$tmp"
     echo "ERROR: failed to neutralize bypassPermissions for root at '$dest' (existing file left untouched)" >&2
     return 1
+  fi
+}
+
+install_requested_operational_relax_profile() {
+  [ "$OPERATIONAL_RELAX" = 1 ] || return 0
+
+  # An operator-created file (including an intentionally fail-closed malformed
+  # file or symlink) is never replaced by setup.
+  if [ -e "$GUARD_PROFILE_PATH" ] || [ -L "$GUARD_PROFILE_PATH" ]; then
+    note "guard profile already exists — left untouched: $GUARD_PROFILE_PATH"
+    return 0
+  fi
+
+  local parent source tmp
+  parent="$(dirname "$GUARD_PROFILE_PATH")"
+  source="$SRC/docs/examples/guard-profile.example"
+  ccc_validate_setup_guard_profile "$GUARD_PROFILE_PATH" || return 1
+  if [ "$DRY" = 1 ]; then
+    render_command mkdir -p "$parent"
+    echo "[dry-run] explicit operational-relax: install guard profile -> $GUARD_PROFILE_PATH"
+    return 0
+  fi
+  [ -r "$source" ] || {
+    echo "ERROR: tracked guard profile template is missing: $source" >&2
+    return 1
+  }
+  mkdir -p "$parent"
+  # Recheck after creating missing parents; do not follow a component swapped to
+  # a symlink between the preflight and the final profile mutation.
+  ccc_validate_setup_guard_profile "$GUARD_PROFILE_PATH" || return 1
+  tmp="$(mktemp "$parent/.guard-profile.XXXXXX")" || {
+    echo "ERROR: mktemp failed for $GUARD_PROFILE_PATH" >&2
+    return 1
+  }
+  if ! install -m 0644 "$source" "$tmp"; then
+    rm -f -- "$tmp"
+    echo "ERROR: failed to stage guard profile for $GUARD_PROFILE_PATH" >&2
+    return 1
+  fi
+  # A hard-link create is atomic and refuses to overwrite a profile created by
+  # an operator or concurrent installer between the checks above.
+  if ln "$tmp" "$GUARD_PROFILE_PATH" 2>/dev/null; then
+    rm -f -- "$tmp"
+    note "explicit operational-relax: installed guard profile -> $GUARD_PROFILE_PATH"
+  else
+    rm -f -- "$tmp"
+    if [ -e "$GUARD_PROFILE_PATH" ] || [ -L "$GUARD_PROFILE_PATH" ]; then
+      note "guard profile appeared concurrently — left untouched: $GUARD_PROFILE_PATH"
+    else
+      echo "ERROR: failed to install guard profile at $GUARD_PROFILE_PATH" >&2
+      return 1
+    fi
   fi
 }
 
@@ -593,4 +679,7 @@ printf '  - CCC_CODEX_CLI_PATH=%s/hooks/ccc-codex\n' "$CLAUDE_DIR"
 printf '  - CCC_CODEX_MEMORY_MATERIALIZER_PATH=%s/hooks/ccc_codex_memory.py\n' "$CLAUDE_DIR"
 printf '  - bridge command=./start.sh --path %s -d\n' "$BRIDGE_DEFAULT_PATH"
 
+# This is the final managed mutation. It runs only after an explicit root opt-in
+# and atomically refuses to overwrite an operator or concurrent profile.
+install_requested_operational_relax_profile
 SETUP_TXN_ACTIVE=0

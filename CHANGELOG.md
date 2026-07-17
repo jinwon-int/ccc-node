@@ -21,9 +21,11 @@ All notable changes to the Claude Code node harness. Dates are KST.
   force-push/history-rewrite, DB destructive/migrate/replay, release/publish,
   repo-visibility, host power-down (`poweroff`/`halt`), and operator-config
   writes — retained because an unattended prompt injection over untrusted input
-  (PRs, web, A2A) could otherwise cause irreversible damage. Fleet-wide = the
-  operator installs the profile on each node via provisioning (`setup.sh` does
-  not install it). New in-process unit test `claude/hooks/guard-profile.test.py`
+  (PRs, web, A2A) could otherwise cause irreversible damage. Setup remains
+  strict by default; an explicit root `setup.sh --operational-relax` opt-in
+  validates the profile path and installs it atomically. Non-root opt-in fails
+  before managed mutation, and existing operator profiles are never overwritten.
+  New in-process unit test `claude/hooks/guard-profile.test.py`
   (11 cases: relaxed-vs-strict lifecycle, mixed reboot/down fail-closed,
   catastrophic-always-denied, reader integrity) wired into
   `validate-harness.sh`; `docs/service-control.md` +

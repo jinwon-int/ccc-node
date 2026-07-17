@@ -6,6 +6,8 @@ SETUP="$ROOT/setup.sh"
 pass=0; fail=0
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
+# Never let a root CI runner touch the real /etc profile.
+export CCC_SETUP_GUARD_PROFILE_PATH="$TMP/default-guard-profile"
 
 ok() { if eval "$2"; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $1"; fi; }
 
@@ -195,17 +197,12 @@ ok "seeded settings.local.json carries no broad fleet-wide grants" \
 
 # Root-run Claude would reject --dangerously-skip-permissions, so setup must
 # neutralize the bypassPermissions default when the run user is root. Simulate
-# root deterministically (independent of the harness uid) with an `id -u` stub.
+# root deterministically with the setup test seam, which is accepted only for a
+# non-runtime /tmp guard-profile target.
 root_claude="$TMP/root-bypass-claude"
-mkdir -p "$TMP/root-bin"
-cat > "$TMP/root-bin/id" <<STUB
-#!/bin/sh
-[ "\$1" = "-u" ] && { echo 0; exit 0; }
-exec /usr/bin/id "\$@"
-STUB
-chmod +x "$TMP/root-bin/id"
 HOME="$TMP/root-bypass-home" CCC_CLAUDE_DIR="$root_claude" CCC_HERMES_DIR="$TMP/root-bypass-hermes" \
-  PATH="$TMP/root-bin:$PATH" bash "$SETUP" --no-backup >/dev/null 2>&1
+  CCC_SETUP_GUARD_PROFILE_PATH="$TMP/root-guard-profile" CCC_SETUP_TEST_EUID=0 \
+  bash "$SETUP" --no-backup >/dev/null 2>&1
 ok "setup neutralizes bypassPermissions default when Claude runs as root" \
   'jq -e ".permissions.defaultMode != \"bypassPermissions\"" "$root_claude/settings.json" >/dev/null'
 ok "root-neutralized settings.json still parses with its permissions block intact" \
@@ -214,6 +211,61 @@ ok "root-neutralized settings retain the native catastrophic deny backstop" \
   'jq -e '\''(.permissions.deny // []) as $d | ($d | any(. == "Bash(rm -rf /:*)")) and ($d | any(. == "Bash(git push --force origin main:*)"))'\'' "$root_claude/settings.json" >/dev/null'
 ok "root install retains the semantic PreToolUse guard" \
   '[ -x "$root_claude/hooks/guard.sh" ] && jq -e '\''[.hooks.PreToolUse[].hooks[].command] | any(contains("guard.sh"))'\'' "$root_claude/settings.json" >/dev/null'
+ok "fresh root install remains strict by default" \
+  '[ ! -e "$TMP/root-guard-profile" ]'
+
+# Explicit root opt-in seeds the profile; setup never overwrites an existing
+# operator choice, and non-root opt-in fails before any managed mutation.
+relaxed_claude="$TMP/relaxed-root-claude"
+set +e
+HOME="$TMP/relaxed-root-home" CCC_CLAUDE_DIR="$relaxed_claude" CCC_HERMES_DIR="$TMP/relaxed-root-hermes" \
+  CCC_SETUP_GUARD_PROFILE_PATH="$TMP/relaxed-root-guard-profile" \
+  CCC_SETUP_TEST_EUID=0 bash "$SETUP" --no-backup --operational-relax >/dev/null 2>&1
+relaxed_rc=$?
+set -e
+ok "--operational-relax seeds a fresh root profile" \
+  '[ "$relaxed_rc" = 0 ] && [ -f "$TMP/relaxed-root-guard-profile" ] && [ ! -L "$TMP/relaxed-root-guard-profile" ] && grep -qx "operational-relax" "$TMP/relaxed-root-guard-profile" && [ "$(stat -c %a "$TMP/relaxed-root-guard-profile")" = 644 ] && [ -x "$relaxed_claude/hooks/guard.sh" ]'
+
+printf '%s\n' '# operator strict choice' > "$TMP/operator-guard-profile"
+chmod 0600 "$TMP/operator-guard-profile"
+operator_profile_before="$(sha256sum "$TMP/operator-guard-profile")"
+set +e
+HOME="$TMP/operator-root-home" CCC_CLAUDE_DIR="$TMP/operator-root-claude" CCC_HERMES_DIR="$TMP/operator-root-hermes" \
+  CCC_SETUP_GUARD_PROFILE_PATH="$TMP/operator-guard-profile" \
+  CCC_SETUP_TEST_EUID=0 bash "$SETUP" --no-backup --operational-relax >/dev/null 2>&1
+operator_rc=$?
+set -e
+ok "explicit opt-in preserves an existing operator guard profile byte-for-byte" \
+  '[ "$operator_rc" = 0 ] && [ "$(sha256sum "$TMP/operator-guard-profile")" = "$operator_profile_before" ] && [ "$(stat -c %a "$TMP/operator-guard-profile")" = 600 ]'
+
+existing_strict_claude="$TMP/existing-strict-claude"
+mkdir -p "$existing_strict_claude/hooks"
+printf '%s\n' '# existing ccc-node marker' > "$existing_strict_claude/hooks/guard.py"
+HOME="$TMP/existing-strict-home" CCC_CLAUDE_DIR="$existing_strict_claude" CCC_HERMES_DIR="$TMP/existing-strict-hermes" \
+  CCC_SETUP_GUARD_PROFILE_PATH="$TMP/existing-strict-guard-profile" \
+  CCC_SETUP_TEST_EUID=0 bash "$SETUP" --no-backup >/dev/null 2>&1
+ok "root self-update does not widen an existing profile-less strict install" \
+  '[ ! -e "$TMP/existing-strict-guard-profile" ]'
+HOME="$TMP/existing-strict-home" CCC_CLAUDE_DIR="$existing_strict_claude" CCC_HERMES_DIR="$TMP/existing-strict-hermes" \
+  CCC_SETUP_GUARD_PROFILE_PATH="$TMP/existing-strict-guard-profile" \
+  CCC_SETUP_TEST_EUID=0 bash "$SETUP" --no-backup --operational-relax >/dev/null 2>&1
+ok "explicit root opt-in can relax an existing profile-less install" \
+  '[ -f "$TMP/existing-strict-guard-profile" ] && grep -qx "operational-relax" "$TMP/existing-strict-guard-profile"'
+
+HOME="$TMP/fresh-nonroot-home" CCC_CLAUDE_DIR="$TMP/fresh-nonroot-claude" CCC_HERMES_DIR="$TMP/fresh-nonroot-hermes" \
+  CCC_SETUP_GUARD_PROFILE_PATH="$TMP/fresh-nonroot-guard-profile" \
+  CCC_SETUP_TEST_EUID=1001 bash "$SETUP" --no-backup >/dev/null 2>&1
+ok "fresh non-root install remains strict by default" \
+  '[ ! -e "$TMP/fresh-nonroot-guard-profile" ]'
+
+set +e
+nonroot_relax_out="$(HOME="$TMP/nonroot-relax-home" CCC_CLAUDE_DIR="$TMP/nonroot-relax-claude" CCC_HERMES_DIR="$TMP/nonroot-relax-hermes" \
+  CCC_SETUP_GUARD_PROFILE_PATH="$TMP/nonroot-relax-guard-profile" \
+  CCC_SETUP_TEST_EUID=1001 bash "$SETUP" --no-backup --operational-relax 2>&1)"
+nonroot_relax_rc=$?
+set -e
+ok "non-root operational-relax request fails before managed mutation" \
+  '[ "$nonroot_relax_rc" = 2 ] && grep -q "requires root" <<<"$nonroot_relax_out" && [ ! -e "$TMP/nonroot-relax-guard-profile" ] && [ ! -e "$TMP/nonroot-relax-claude/settings.json" ]'
 
 # A node's accumulated/hand-added approvals must survive a re-run (the self-update path).
 printf '%s\n' '{"permissions":{"allow":["Bash(node-local-only:*)"]}}' > "$seed_claude/settings.local.json"

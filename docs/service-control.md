@@ -7,15 +7,20 @@ agent account plus a root-owned wrapper and root-owned exact-unit allowlist.
 ## Operational-relax profile (opt-in, operator-owned)
 
 By default the guard enforces the full Fresh-Approval boundary below. An
-operator may relax the **operational** categories on a node by installing a
-root-owned `/etc/ccc-node/guard-profile` whose content includes the line
-`operational-relax` (see `docs/examples/guard-profile.example`). When present
+operator may relax the **operational** categories on a node by explicitly
+running `sudo ./setup.sh --operational-relax` (or by provisioning the same
+root-owned `/etc/ccc-node/guard-profile` manually). The profile must contain the
+line `operational-relax`; see `docs/examples/guard-profile.example`. When present
 and valid, the guard treats **all** service/container/orchestrator lifecycle
 (`systemctl`/`service`/`pm2`/`docker`/`podman`/`kubectl`
 start·stop·restart·reload·scale·rollout·…, local or toward any peer) and
-**reboot of any host** as autonomous. Fleet-wide = install it on each node
-through your provisioning; `setup.sh` does **not** install it, so the agent
-cannot enable it via self-update.
+**reboot of any host** as autonomous.
+
+Setup remains strict without the explicit flag, rejects a non-root opt-in before
+managed files are changed, validates the destination for symlink components,
+and atomically creates the profile with mode `0644`. It never overwrites an
+existing operator profile, including an intentionally fail-closed malformed
+file or symlink. Routine setup/self-update therefore never widens a node.
 
 The profile is **fail-closed and cannot self-escalate**: it is honored only when
 the file is owned by `root` (uid 0), a regular non-symlink, and not group/world
@@ -33,8 +38,8 @@ protected branches, DB destructive/migrate/replay, release/publish +
 repo-visibility, host power-down (`poweroff`/`halt`), and operator-config
 writes. A mixed remote body containing both reboot and any down-class command
 is down-class and remains gated. Those stay enforced because an unattended
-prompt injection reading
-untrusted input (PRs, web, A2A) could otherwise trigger irreversible damage.
+prompt injection reading untrusted input (PRs, web, A2A) could otherwise trigger
+irreversible damage.
 
 ## Policy
 
