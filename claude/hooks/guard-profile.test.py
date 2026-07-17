@@ -63,6 +63,14 @@ ALWAYS_DENIED = [
     "ssh randomhost poweroff",
 ]
 
+# A recoverable reboot must never mask a down-class operation later (or earlier)
+# in the same quoted remote body.
+MIXED_DOWN_CLASS = [
+    'ssh randomhost "reboot ; poweroff"',
+    'ssh randomhost "reboot && halt"',
+    'ssh randomhost "shutdown -r now; shutdown -h now"',
+]
+
 
 class OperationalRelaxGateTest(unittest.TestCase):
     def test_relaxable_denied_strict_but_allowed_when_relaxed(self):
@@ -74,6 +82,12 @@ class OperationalRelaxGateTest(unittest.TestCase):
         for cmd in ALWAYS_DENIED:
             self.assertTrue(_denied(cmd, False), f"strict should deny: {cmd}")
             self.assertTrue(_denied(cmd, True), f"relax must STILL deny: {cmd}")
+
+    def test_mixed_reboot_and_down_class_is_always_denied(self):
+        for cmd in MIXED_DOWN_CLASS:
+            with self.subTest(cmd=cmd):
+                self.assertTrue(_denied(cmd, False), f"strict must deny: {cmd}")
+                self.assertTrue(_denied(cmd, True), f"relax must STILL deny: {cmd}")
 
     def test_writing_the_profile_is_gated(self):
         # The agent must not be able to relax its own guard by writing the file.

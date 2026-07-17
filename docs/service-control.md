@@ -23,11 +23,17 @@ writable — the unprivileged agent cannot write a root-owned `/etc` file, and t
 guard additionally denies writes to the path. Absent, malformed, or weaker-owned
 → strict.
 
+On a root-run node, root ownership cannot isolate the profile from the agent;
+the guard remains a policy hook rather than an OS privilege boundary. Run the
+agent unprivileged when self-enable resistance must be enforceable by the OS.
+
 It **never** relaxes the catastrophic / injection set, regardless of the
 profile: catastrophic `rm`, secret exfiltration, force-push/history-rewrite of
 protected branches, DB destructive/migrate/replay, release/publish +
 repo-visibility, host power-down (`poweroff`/`halt`), and operator-config
-writes. Those stay enforced because an unattended prompt injection reading
+writes. A mixed remote body containing both reboot and any down-class command
+is down-class and remains gated. Those stay enforced because an unattended
+prompt injection reading
 untrusted input (PRs, web, A2A) could otherwise trigger irreversible damage.
 
 ## Policy

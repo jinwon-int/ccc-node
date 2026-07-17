@@ -14,7 +14,8 @@ All notable changes to the Claude Code node harness. Dates are KST.
   peer) and reboot of any host as autonomous. It is **fail-closed** (absent /
   malformed / weaker-owned → strict; the code default is unchanged) and
   **cannot self-escalate** (the unprivileged agent cannot write a root-owned
-  `/etc` file, and the guard also denies writes to the path). It **never**
+  `/etc` file, and the guard also denies writes to the path). On a root-run
+  node the hook is policy, not an OS privilege boundary. It **never**
   relaxes the catastrophic / injection set regardless of the profile:
   catastrophic `rm`, secret exfiltration, protected-branch
   force-push/history-rewrite, DB destructive/migrate/replay, release/publish,
@@ -23,8 +24,9 @@ All notable changes to the Claude Code node harness. Dates are KST.
   (PRs, web, A2A) could otherwise cause irreversible damage. Fleet-wide = the
   operator installs the profile on each node via provisioning (`setup.sh` does
   not install it). New in-process unit test `claude/hooks/guard-profile.test.py`
-  (10 cases: relaxed-vs-strict lifecycle, catastrophic-always-denied, reader
-  integrity) wired into `validate-harness.sh`; `docs/service-control.md` +
+  (11 cases: relaxed-vs-strict lifecycle, mixed reboot/down fail-closed,
+  catastrophic-always-denied, reader integrity) wired into
+  `validate-harness.sh`; `docs/service-control.md` +
   `docs/examples/guard-profile.example` document the operator install.
 - `ccc-broker-reconcile` — a root-owned, operator-installed wrapper that
   encapsulates the fixed broker Compose runbook (`cd` project dir, export

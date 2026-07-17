@@ -547,6 +547,21 @@ def _split_lifecycle_fragments(stmt):
     ]
 
 
+def _split_host_lifecycle_fragments(stmt):
+    """Split quoted remote command bodies without unpacking data expressions.
+
+    Host lifecycle needs command-separator splitting for mixed reboot/down
+    detection, but unlike service parsing must preserve parentheses/braces so
+    ``python -c 'os.system(\"reboot\")'`` cannot become a fake direct command.
+    """
+    flattened = _quote_strip(stmt)
+    return [
+        fragment.strip()
+        for fragment in re.split(r"(?:&&|\|\||[;&|\n])+", flattened)
+        if fragment.strip()
+    ]
+
+
 # --------------------------------------------------------------------------- #
 # Operational-relax profile (operator-owned, fail-closed).
 # --------------------------------------------------------------------------- #
@@ -723,13 +738,19 @@ def _gate_host_lifecycle(c, cn, statements, managed, relax=False):
     for st, mgd in zip(statements, managed):
         if not re.search(r"\b(shutdown|reboot|poweroff|halt)\b", st):
             continue
-        # Classify on the quote-stripped statement so a reboot/poweroff INSIDE an
-        # `ssh <host> "…"` remote command (one shlex token when quoted) is still
-        # split into words and distinguished — reboot recovers, poweroff does not,
-        # even on a managed node.
-        kind = _host_lifecycle_cmd_kind(st)
-        if kind == "reboot" and (relax or mgd or not _stmt_has_remote_tool(st)):
-            continue  # direct reboot — recoverable; relax allows any host
+        # The top-level splitter keeps a quoted SSH body together so remote
+        # ownership is judged once. Classify every command-sized fragment inside
+        # that body: a recoverable reboot must never mask a later/earlier
+        # poweroff, halt, or non-reboot shutdown.
+        kinds = [
+            kind
+            for fragment in _split_host_lifecycle_fragments(st)
+            if (kind := _host_lifecycle_cmd_kind(fragment)) is not None
+        ]
+        if "down" in kinds:
+            _deny("host-lifecycle", "operator_approval_gated", c)
+        if "reboot" in kinds and (relax or mgd or not _stmt_has_remote_tool(st)):
+            continue  # every classified host lifecycle is recoverable reboot
         _deny("host-lifecycle", "operator_approval_gated", c)
 
 
