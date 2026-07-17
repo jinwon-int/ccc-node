@@ -390,6 +390,10 @@ else
   note "settings.local.json already present — left untouched (node-local approvals)"
 fi
 run cp "$SRC/claude/hooks/lib/spawn-detached.sh" "$CLAUDE_DIR/hooks/lib/spawn-detached.sh"
+# Portable mtime pruning (#449): checkpoint.sh and distill.sh source this lib
+# behind an if-readable guard, so leaving it uninstalled silently disables
+# state/checkpoint pruning on every standalone node (unbounded growth).
+run cp "$SRC/claude/hooks/lib/mtime-prune.sh" "$CLAUDE_DIR/hooks/lib/mtime-prune.sh"
 run cp "$SRC/scripts/lib/harness-paths.sh" "$CLAUDE_DIR/hooks/lib/harness-paths.sh"
 run cp "$SRC/scripts/lib/harness_paths.py" "$CLAUDE_DIR/hooks/lib/harness_paths.py"
 run cp "$SRC/claude/hooks/load-memory.sh" "$CLAUDE_DIR/hooks/load-memory.sh"
@@ -446,6 +450,7 @@ run cp "$SRC/scripts/ccc-skill-autosave.sh" "$CLAUDE_DIR/hooks/ccc-skill-autosav
 run cp "$SRC/scripts/ccc-self-update.sh" "$CLAUDE_DIR/hooks/ccc-self-update.sh"
 installed_hook_scripts=(
   "$CLAUDE_DIR/hooks/lib/spawn-detached.sh"
+  "$CLAUDE_DIR/hooks/lib/mtime-prune.sh"
   "$CLAUDE_DIR/hooks/lib/harness-paths.sh"
   "$CLAUDE_DIR/hooks/lib/harness_paths.py"
   "$CLAUDE_DIR/hooks/load-memory.sh"
