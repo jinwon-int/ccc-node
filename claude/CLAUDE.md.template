@@ -59,6 +59,16 @@ exception: Claude Code refuses `bypassPermissions` under root/sudo, so
 Claude as a non-root user to restore the no-prompt default).
 
 Service-control boundary (enforced by `guard.py` behind the `guard.sh` shim):
+- **Operational-relax profile** — if the operator has installed a root-owned
+  `/etc/ccc-node/guard-profile` containing `operational-relax`, ALL
+  service/container/orchestrator lifecycle (systemctl/service/pm2/docker/podman/
+  kubectl, local or toward any peer) and reboot of any host are autonomous on
+  this node. It never relaxes the catastrophic set below (`rm -rf /`, secret
+  exfil, protected force-push, DB destructive/migrate, release/publish,
+  poweroff/halt, including a mixed reboot/down remote body). Absent → the strict
+  per-category rules below apply. An unprivileged agent cannot enable it
+  (root-owned); on a root-run node this hook is policy, not an OS privilege
+  boundary. See `docs/service-control.md`.
 - **Fleet-service lifecycle** — start/restart/reload/stop/kill of
   `a2a`/`hermes`/`openclaw`/`broker`/`gateway`/`worker` units and
   `ccc-telegram-bridge` — is autonomous, locally or toward a peer node
