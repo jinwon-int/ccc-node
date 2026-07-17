@@ -212,7 +212,7 @@ class ProjectChatHandler(
                 "Codex-parity unrestricted Claude execution "
                 "(CCC_BRIDGE_CLAUDE_UNRESTRICTED) is not applied under root: "
                 "Claude Code refuses bypassPermissions with root/sudo "
-                "privileges. Keeping the native deny + OS boundary; run the bridge as a "
+                "privileges. Keeping the guard boundary; run the bridge as a "
                 "non-root user to enable unrestricted execution."
             )
         self._sdk_client_factory = sdk_client_factory or ClaudeSDKClient
@@ -779,12 +779,12 @@ class ProjectChatHandler(
             opts["system_prompt"] += web_mcp["system_prompt"]
         if self._execution_profile == EXECUTION_OWNER_OPERATOR:
             if self._claude_unrestricted:
-                # Codex parity (owner-operator, default; non-root): drop the host
-                # settings chain so not even the native permissions.deny backstop
-                # loads, bypass permission checks, and run without the OS sandbox
-                # — matching Codex's never + dangerFullAccess. Memory context is
-                # preserved through the curated settings block so the model keeps
-                # its MEMORY/USER context.
+                # Opt-in Codex parity (owner-operator only): drop the host
+                # settings chain so the PreToolUse guard hook is not loaded,
+                # bypass permission checks, and run without the OS sandbox —
+                # matching Codex's never + dangerFullAccess. Memory context is
+                # preserved through the curated settings block so the model
+                # keeps its MEMORY/USER context without the guard.
                 opts["permission_mode"] = "bypassPermissions"
                 opts["setting_sources"] = []
                 curated_settings = build_curated_memory_settings(self._config)
@@ -792,10 +792,9 @@ class ProjectChatHandler(
                     opts["settings"] = curated_settings
             else:
                 # Owner-operated bridges intentionally retain host utility and
-                # the normal Claude Code settings/context chain, so the native
-                # permissions.deny backstop applies. That backstop plus the
-                # unprivileged OS account, not a project-root sandbox, is the
-                # boundary for this explicit profile.
+                # the normal Claude Code settings/context chain. Access
+                # control (the PreToolUse guard), not a project-root sandbox,
+                # is the boundary for this explicit profile.
                 opts["setting_sources"] = ["user", "project", "local"]
         else:
             # Every non-owner profile suppresses filesystem settings. Even when

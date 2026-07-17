@@ -180,12 +180,11 @@ merge_settings_json() {
 # permission mode) when it runs with root/sudo privileges, so a node whose
 # Claude runs as root would reject every new session if it inherited the
 # `bypassPermissions` default. On such a node, drop the installed default so
-# Claude falls back to its normal prompting mode. The native `permissions.deny`
-# backstop and the unprivileged OS account remain the boundary either way (deny
-# rules are enforced in every permission mode). Non-root nodes keep the
-# no-prompt default. The setup user is used as the proxy for the run user (the
-# dominant case is setup-as-root == service-as-root); the bridge additionally
-# enforces this at runtime for its own SDK path.
+# Claude falls back to its normal prompting mode; the ccc-node PreToolUse
+# guard remains the boundary either way. Non-root nodes keep the no-prompt
+# default. The setup user is used as the proxy for the run user (the dominant
+# case is setup-as-root == service-as-root); the bridge additionally enforces
+# this at runtime for its own SDK path.
 _ccc_is_root() { [ "$(id -u 2>/dev/null || echo 0)" -eq 0 ]; }
 
 neutralize_bypass_if_root() {
@@ -202,7 +201,7 @@ neutralize_bypass_if_root() {
          then .permissions |= del(.defaultMode) else . end' "$dest" > "$tmp" 2>/dev/null \
      && jq -e . "$tmp" >/dev/null 2>&1; then
     mv "$tmp" "$dest"
-    note "root node: dropped bypassPermissions defaultMode (native deny + OS account remain the boundary)"
+    note "root node: dropped bypassPermissions defaultMode (guard remains the boundary)"
   else
     rm -f "$tmp"
     echo "ERROR: failed to neutralize bypassPermissions for root at '$dest' (existing file left untouched)" >&2
@@ -277,6 +276,8 @@ run cp "$SRC/claude/hooks/refresh-memory.sh" "$CLAUDE_DIR/hooks/refresh-memory.s
 run cp "$SRC/claude/hooks/scan-injection.sh" "$CLAUDE_DIR/hooks/scan-injection.sh"
 run cp "$SRC/claude/hooks/load-tools.sh" "$CLAUDE_DIR/hooks/load-tools.sh"
 run cp "$SRC/claude/hooks/checkpoint.sh" "$CLAUDE_DIR/hooks/checkpoint.sh"
+run cp "$SRC/claude/hooks/guard.sh" "$CLAUDE_DIR/hooks/guard.sh"
+run cp "$SRC/claude/hooks/guard.py" "$CLAUDE_DIR/hooks/guard.py"
 run cp "$SRC/claude/hooks/audit.sh" "$CLAUDE_DIR/hooks/audit.sh"
 run cp "$SRC/claude/hooks/redact.sh" "$CLAUDE_DIR/hooks/redact.sh"
 run cp "$SRC/claude/hooks/notify.sh" "$CLAUDE_DIR/hooks/notify.sh"
@@ -329,6 +330,8 @@ installed_hook_scripts=(
   "$CLAUDE_DIR/hooks/scan-injection.sh"
   "$CLAUDE_DIR/hooks/load-tools.sh"
   "$CLAUDE_DIR/hooks/checkpoint.sh"
+  "$CLAUDE_DIR/hooks/guard.sh"
+  "$CLAUDE_DIR/hooks/guard.py"
   "$CLAUDE_DIR/hooks/audit.sh"
   "$CLAUDE_DIR/hooks/redact.sh"
   "$CLAUDE_DIR/hooks/notify.sh"

@@ -157,7 +157,7 @@ wc -l ~/.claude/state/wiki-candidates.md
 
    - **`dryrun`** — `touch ~/.claude/state/distill.dryrun`. Confirm.
 
-   - **`live`** — flip via rename to a timestamped archive (keeps an auditable trail instead of destroying the toggle file):
+   - **`live`** — flip via rename (NOT `rm` — `guard.sh` blocks `rm-catastrophic`). Use a timestamped archive:
      ```bash
      mv ~/.claude/state/distill.dryrun \
         ~/.claude/state/distill.dryrun.off-$(date -u +%Y%m%d%H%M%S) 2>&1
@@ -198,6 +198,6 @@ wc -l ~/.claude/state/wiki-candidates.md
 - Scope control: by default distill accepts every transcript visible to the node. To restrict a multi-tenant node, set `CCC_DISTILL_SCOPE_CWDS` to a comma/colon-separated allowlist of cwd paths, or write one cwd/project-encoded entry per line to `~/.claude/state/distill.scope`. Out-of-scope transcripts log `skip reason=cwd-out-of-scope` and do not extract, push, or queue.
 - Noise controls (issue #298): wiki-candidates are extracted only when reusable + new + settled (exclusion list in the extract prompt), capped at `CCC_DISTILL_MAX_WIKI_CANDS` (default 3) per session by wiki-queue, and deduped by topic for `CCC_DISTILL_SEEN_TTL_DAYS` (default 7). `/distill compact` cleans pre-existing duplicate backlog.
 - All outputs carry provenance: `source_cwd`/`source_project` in `distill-last.json`, Honcho metadata, and wiki-candidates entries.
-- Prefer `mv` to a timestamped archive name over `rm` on `distill.disabled` / `distill.dryrun` — same disable effect, keeps an auditable trail of when the toggle flipped.
+- DO NOT use `rm` on `distill.disabled` / `distill.dryrun` (guard blocks `rm` + system paths). Always `mv` to a timestamped archive name — same disable effect, no guard friction.
 - Manual fire from inside an active Claude Code session uses **this** session's transcript. If you want to distill some **other** session, set `CLAUDE_DISTILL_TRANSCRIPT=/path/to/other.jsonl` in env before firing.
 - All extract output is redacted before any external send. Even so, never paste raw secrets in the prompt that feeds the trans — the distiller will see them.

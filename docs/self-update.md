@@ -2,10 +2,8 @@
 
 A fleet node must be able to pick up ccc-node updates and restart its own
 services. Direct service control (`restart`/`start`/`reload`/`stop`/`kill`) of
-broker/Gateway/worker units is governed by the node's **OS account** (its
-`sudo`/`docker`-group grants), not a custom guard — a node manages its own
-service lifecycle so it can update and recover unattended. This script is still
-the **pre-approved, audited way to do it as one
+broker/Gateway/worker units is allowed by guard.sh (operator-approved
+relaxation). This script is still the **pre-approved, audited way to do it as one
 atomic step** — pull → `setup.sh` → restart the operator-allowlisted set with
 fail-closed preconditions and rollback — which an agent may invoke as a whole
 rather than composing the steps ad hoc.
@@ -40,16 +38,14 @@ rather than composing the steps ad hoc.
   pressure at 2am. An agent can trigger the whole audited pipeline but cannot
   compose its steps differently.
 - The **blast radius** is bounded by `~/.claude/self-update.services` (one
-  systemd unit per line, `#` comments). With the guard removed, this file is
-  protected by **root/operator file ownership** (the OS boundary): the operator
-  owns and writes it and the agent's unprivileged account cannot, while reads
-  stay allowed. Only the operator decides which units the procedure may ever
-  restart.
+  systemd unit per line, `#` comments). guard.sh denies agent writes to this
+  file (`self-update-config` gate) — Edit/Write tools *and* shell redirection /
+  copy tools — while reads stay allowed. Only the operator decides which units
+  the procedure may ever restart.
 - Direct `systemctl restart|start|reload|stop|kill <broker|gateway|worker|…>` is
-  available because the node's **OS account** is allowed to run it (a node manages
-  its own service lifecycle so it can update and recover unattended) — not because
-  a custom gate relaxes it. This bundled procedure remains the audited way to do
-  "update **and** restart the allowlisted set" atomically.
+  allowed (operator-approved relaxation — a node manages its own service lifecycle
+  so it can update and recover unattended). This bundled procedure remains the
+  audited way to do "update **and** restart the allowlisted set" atomically.
 
 ## Operator setup (once per node)
 
@@ -63,8 +59,9 @@ EOF
 ```
 
 From then on, "이 노드 업데이트하고 재시작해줘" over Telegram (or an agent-cron /
-A2A fleet rollout) resolves to the audited
-`~/.claude/hooks/ccc-self-update.sh run` — no per-restart approval friction.
+A2A fleet rollout) resolves to the guarded, audited
+`~/.claude/hooks/ccc-self-update.sh run` — no `CCC_ALLOW_GATED` needed and no
+per-restart approval friction.
 
 ## Idle gate (don't restart mid-task)
 

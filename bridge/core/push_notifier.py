@@ -1,7 +1,7 @@
 """ccc-node push notifier — owner-only outbound delivery of Claude Code lifecycle
 notifications, decoupled from the hook via a filesystem spool.
 
-Design / approval boundary (baked in, see ccc-node Fresh-Approval policy):
+Design / approval boundary (baked in, see ccc-node RISK-PROFILES + Fresh-Approval):
 - DISABLED by default (``config.push_enabled``). Nothing is ever sent unless an operator
   explicitly opts in. Merging/restarting the bridge with this module present is a no-op.
 - OWNER-ONLY: messages go solely to the resolved owner chat id — the explicit

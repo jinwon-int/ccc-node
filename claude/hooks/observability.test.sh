@@ -57,6 +57,11 @@ printf 'objective: test\n' > "$CCC_WORKING_STATE"
 echo '{}' | bash "$HERE/notify.sh" SessionEnd
 ok "SessionEnd archives ws"        'ls "$TMP/arch"/working-state-*.md >/dev/null 2>&1'
 
+# --- guard.sh: denial writes approval-needed marker (label only, no raw cmd) ---
+echo '{"tool_name":"Bash","tool_input":{"command":"git push --force origin main"}}' | bash "$HERE/guard.sh" >/dev/null 2>&1
+ok "guard logs denial label"       'grep -q "DENY\[force-push\]" "$CCC_APPROVAL_LOG"'
+ok "guard denial omits raw cmd"    '! grep -q "force origin main" "$CCC_APPROVAL_LOG"'
+
 # --- audit.sh records session_id; evidence-gate.sh (Stop) uses it ---
 echo '{"session_id":"sX","tool_name":"Write","tool_input":{"file_path":"/x/a.py"}}' | bash "$HERE/audit.sh"
 ok "audit records session_id"      'grep -q "\"session_id\":\"sX\"" "$CCC_AUDIT_LOG"'

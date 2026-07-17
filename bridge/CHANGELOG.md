@@ -33,15 +33,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Codex-parity Claude execution is now the default (owner-operator).**
   `CCC_BRIDGE_CLAUDE_UNRESTRICTED` flips from opt-in `false` to default `true`,
   so a non-root `owner-operator` node runs its Claude SDK path at Codex parity —
-  `permission_mode=bypassPermissions`, no OS sandbox, and no host settings chain
-  (so not even the native `permissions.deny` backstop loads) — without an env
-  override. Scope is unchanged and narrow: only `owner-operator` is affected (it
-  already requires a single-owner allowlist); `strict-project` (the
-  package-default profile) and `disabled` still ignore the flag and keep their
-  sandbox, and root nodes still degrade to the host-settings path because Claude
-  Code refuses `bypassPermissions` under root/sudo. Existing `owner-operator`
-  deployments that want to keep the native deny backstop must now set
-  `CCC_BRIDGE_CLAUDE_UNRESTRICTED=false` explicitly. To gain the unrestricted posture on a node that currently runs as
+  `permission_mode=bypassPermissions`, no OS sandbox, and no host settings chain,
+  so the PreToolUse `guard.py` hook is not loaded — without an env override.
+  Scope is unchanged and narrow: only `owner-operator` is affected (it already
+  requires a single-owner allowlist); `strict-project` (the package-default
+  profile) and `disabled` still ignore the flag and keep their sandbox, and root
+  nodes still degrade to the guarded path because Claude Code refuses
+  `bypassPermissions` under root/sudo. Existing `owner-operator` deployments that
+  want to keep the guard boundary must now set `CCC_BRIDGE_CLAUDE_UNRESTRICTED=false`
+  explicitly. To gain the unrestricted posture on a node that currently runs as
   root, run the bridge as a non-root user.
 - **Accept all inbound Telegram document types (follow-up to #503/#505).** The
   inbound document path no longer filters by file type: the MIME/extension

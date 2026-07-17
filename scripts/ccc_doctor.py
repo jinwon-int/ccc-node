@@ -29,6 +29,7 @@ HOOK_FILES = [
     "hooks/load-tools.sh",
     "hooks/checkpoint.sh",
     "hooks/statusline.sh",
+    "hooks/guard.sh",
     "hooks/audit.sh",
     "hooks/redact.sh",
     "hooks/notify.sh",
@@ -120,15 +121,12 @@ class Doctor:
             self.settings_valid = True
             self.current_settings = self.load_json(self.settings)
             has_session = self.json_has_path(self.current_settings, "hooks.SessionStart")
-            # PostToolUse (audit) is provided only by the portable overlay/plugin,
-            # so it distinguishes a merged standalone settings.json from a lean
-            # plugin-mode one (the removed guard hook used to serve this role).
-            has_portable = self.json_has_path(self.current_settings, "hooks.PostToolUse")
-            if has_session and has_portable:
+            has_pretool = self.json_has_path(self.current_settings, "hooks.PreToolUse")
+            if has_session and has_pretool:
                 self.mode = "standalone"
-            elif has_session and not has_portable:
+            elif has_session and not has_pretool:
                 self.mode = "plugin"
-            elif not has_session and has_portable:
+            elif not has_session and has_pretool:
                 self.mode = "ambiguous"
             self.add("정상", "settings.json", f"valid JSON; mode: {self.mode}", "none")
 
@@ -153,7 +151,7 @@ class Doctor:
                     self.add("교정가능", f"hook wiring {event}", "missing", "restore node-local hook wiring from settings.base.json")
 
             if self.mode == "standalone":
-                for event in ("PostToolUse", "UserPromptSubmit", "Notification", "Stop", "SessionEnd"):
+                for event in ("PreToolUse", "PostToolUse", "UserPromptSubmit", "Notification", "Stop", "SessionEnd"):
                     if self.json_has_path(self.current_settings, f"hooks.{event}"):
                         self.add("정상", f"portable hook {event}", "settings-owned", "none")
                     else:
@@ -467,7 +465,7 @@ class Doctor:
             if not overlay_path.is_file():
                 return None
             overlay = self.load_json(overlay_path)
-            for event in ("PostToolUse", "UserPromptSubmit", "Notification", "Stop", "SessionEnd"):
+            for event in ("PreToolUse", "PostToolUse", "UserPromptSubmit", "Notification", "Stop", "SessionEnd"):
                 desired["hooks"][event] = (overlay.get("hooks") or {}).get(event)
         return desired
 
