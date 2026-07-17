@@ -601,6 +601,7 @@ def evaluate(tool, cmd, fpath, tool_input_raw):
     managed = [stmt_remote_target_managed(st, entries) for st in statements_raw]
 
     _gate_git(c, cn, toks)                    # force-push / history-rewrite
+    _gate_broker_reconcile(c, cn)             # immutable absolute wrapper entrypoint
     _service_lifecycle(
         cn,
         statements,
@@ -741,6 +742,19 @@ _LOOPBACK_HTTP_RE = re.compile(
 _LITERAL_PATH_RE = re.compile(r"/[A-Za-z0-9._/+:-]+")
 _IMAGE_REF_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@-]*")
 _SERVICE_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
+_BROKER_RECONCILE_PATH = "/usr/local/libexec/ccc-broker-reconcile"
+_BROKER_RECONCILE_MENTION_RE = re.compile(
+    r"(?<![A-Za-z0-9_.-])ccc-broker-reconcile(?![A-Za-z0-9_.-])"
+)
+_BROKER_ENV_OVERRIDES = (
+    "DOCKER_HOST",
+    "DOCKER_CONTEXT",
+    "DOCKER_CONFIG",
+    "COMPOSE_FILE",
+    "COMPOSE_PROJECT_NAME",
+    "COMPOSE_PROFILES",
+    "COMPOSE_ENV_FILES",
+)
 _MAX_RUNBOOK_SLEEP_SECONDS = 300.0
 
 # One whitelisted pre-reconcile companion in the broker Compose runbook:
@@ -978,6 +992,37 @@ def _safe_compose_reconciliation(c):
             or not re.fullmatch(r"(?:[A-Za-z0-9_.-]+@)?[A-Za-z0-9_.-]+", toks[1]):
         return False
     return _safe_compose_sequence_body(toks[2], remote=True)
+
+
+def _safe_broker_reconcile(c):
+    """Accept only the direct immutable broker-wrapper entrypoint.
+
+    No assignment, shell/interpreter wrapper, compound command, alternate path,
+    option-like service, or ambient daemon/Compose override is allowed. The
+    installed wrapper independently rechecks its ownership and configuration.
+    """
+    if any(os.environ.get(name) is not None for name in _BROKER_ENV_OVERRIDES):
+        return False
+    if re.search(r"[;&|<>\n\r`$]", c):
+        return False
+    try:
+        toks = shlex.split(c)
+    except ValueError:
+        return False
+    return (
+        len(toks) >= 2
+        and toks[0] == _BROKER_RECONCILE_PATH
+        and all(_SERVICE_NAME_RE.fullmatch(token) for token in toks[1:])
+    )
+
+
+def _gate_broker_reconcile(c, cn):
+    if not _BROKER_RECONCILE_MENTION_RE.search(c):
+        return
+    if _is_readonly_text_search(cn):
+        return
+    if not _safe_broker_reconcile(c):
+        _deny("broker-reconcile", "operator_approval_gated", c)
 
 
 def _service_lifecycle(

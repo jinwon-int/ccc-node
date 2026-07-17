@@ -4,6 +4,27 @@ All notable changes to the Claude Code node harness. Dates are KST.
 
 ## [Unreleased]
 
+### Added
+- `ccc-broker-reconcile` — a root-owned, operator-installed wrapper that
+  encapsulates the fixed broker Compose runbook (`cd` project dir, export
+  `A2A_BROKER_REVISION=$(git rev-parse HEAD)`, `docker compose up -d
+  <allowlisted services>`) behind one entrypoint, mirroring `ccc-service-control`.
+  Broker reconciliation runs through the wrapper instead of the PreToolUse
+  guard's inline Compose ALLOW-grammar, so future runbook changes are reviewed in
+  the wrapper rather than added as new runbook grammar. The guard permits only
+  the direct absolute `/usr/local/libexec/ccc-broker-reconcile` entrypoint with
+  exact service tokens; bare/PATH-shadowed, interpreter-mediated, compounded,
+  daemon-overridden, and Compose-file-overridden forms stay gated. Raw
+  `docker compose up` stays gated. This is additive and staged: the legacy
+  inline grammar remains accepted during migration and is removed in a follow-up
+  once the wrapper is deployed fleet-wide. The wrapper performs no privilege
+  escalation — it provides wrapper/config and command-shape integrity, not a
+  new privilege boundary or broker checkout/payload integrity.
+  `scripts/ccc-broker-reconcile.test.sh` (19 cases: allowlist enforcement, token
+  validation, ownership/writability/symlink integrity, environment isolation,
+  privileged-shebang behavior, absolute-dir requirement) is wired into
+  `validate-harness.sh`; operator install steps are in `docs/service-control.md`.
+
 ### Fixed
 - Root-aware `bypassPermissions` default (fixes a root node bricking every new
   Claude session). Claude Code refuses `--dangerously-skip-permissions` — the
@@ -38,7 +59,7 @@ All notable changes to the Claude Code node harness. Dates are KST.
   no room for a hidden substitution — every other `$(...)`/backtick, a second
   export, an export after the reconciliation, a redirect, or any other variable
   name still fails closed (`guard.test.sh` carries the allow/deny regressions,
-  352/0).
+  365/0).
 - Claude Code now defaults to native `bypassPermissions` mode, matching the
   no-prompt execution posture used by ccc-node/Codex. New installs and
   self-updates receive the mode through `settings.base.json`; the independent

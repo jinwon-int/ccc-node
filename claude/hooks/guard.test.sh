@@ -137,6 +137,22 @@ run deny Bash command 'export DOCKER_HOST=$(git rev-parse HEAD) && docker compos
 run deny Bash command 'export A2A_BROKER_REVISION=$(git rev-parse HEAD) && export FOO=$(git rev-parse HEAD) && docker compose up -d a2a-broker'
 run deny Bash command 'docker compose up -d a2a-broker && export A2A_BROKER_REVISION=$(git rev-parse HEAD)'
 run deny Bash command 'export A2A_BROKER_REVISION=$(git rev-parse HEAD) > /etc/cron.d/x && docker compose up -d a2a-broker'
+# Root-installed broker wrapper: only one direct absolute entrypoint with exact
+# service tokens is autonomous. Bare/PATH-shadowed/interpreter-mediated forms
+# and daemon/Compose environment overrides stay approval-gated.
+run allow Bash command '/usr/local/libexec/ccc-broker-reconcile a2a-broker'
+run allow Bash command '/usr/local/libexec/ccc-broker-reconcile a2a-broker t2-broker'
+run deny Bash command 'ccc-broker-reconcile a2a-broker'
+run deny Bash command '/tmp/ccc-broker-reconcile a2a-broker'
+run deny Bash command 'PATH=/tmp:$PATH ccc-broker-reconcile a2a-broker'
+run deny Bash command 'bash /usr/local/libexec/ccc-broker-reconcile a2a-broker'
+run deny Bash command 'env /usr/local/libexec/ccc-broker-reconcile a2a-broker'
+run deny Bash command 'COMPOSE_FILE=/tmp/evil.yml /usr/local/libexec/ccc-broker-reconcile a2a-broker'
+run deny Bash command 'DOCKER_HOST=tcp://other:2375 /usr/local/libexec/ccc-broker-reconcile a2a-broker'
+run deny Bash command '/usr/local/libexec/ccc-broker-reconcile a2a-broker' 'COMPOSE_FILE=/tmp/evil.yml'
+run deny Bash command '/usr/local/libexec/ccc-broker-reconcile a2a-broker' 'DOCKER_CONTEXT=remote'
+run deny Bash command '/usr/local/libexec/ccc-broker-reconcile --build'
+run deny Bash command '/usr/local/libexec/ccc-broker-reconcile a2a-broker && rm -rf /tmp/x'
 # ...but non-fleet units, config verbs, host lifecycle, and containers stay gated.
 run deny Bash command 'systemctl restart nginx'
 run deny Bash command 'systemctl restart a2a-broker nginx'
