@@ -14,6 +14,18 @@ cd "$ROOT" || exit 1
 TMP="$(mktemp -d 2>/dev/null || mktemp -d -t ccc-validate 2>/dev/null)" \
   || { TMP="$ROOT/.harness-tmp.$$"; mkdir -p "$TMP"; }
 trap 'rm -rf "$TMP" 2>/dev/null || true' EXIT
+# Child test suites resolve ${TMPDIR:-/tmp} themselves (mktemp, fixed-name
+# artifacts like checkpoint-guard.out) — export the private dir so the WHOLE
+# validation run, children included, stays clear of hostile shared /tmp state
+# (review finding on #565: a stale root-owned checkpoint-guard.out false-FAILed
+# checkpoint.test.sh through the shared caller TMPDIR).
+export TMPDIR="$TMP"
+# Test seam: print the resolved scratch contract and exit (used by
+# scripts/validate-harness.test.sh to pin private-TMP + TMPDIR propagation).
+if [ "${1:-}" = "--print-scratch" ]; then
+  printf '%s %s\n' "$TMP" "$TMPDIR"
+  exit 0
+fi
 fail=0
 say() { printf '%s\n' "$*"; }
 err() { printf 'FAIL: %s\n' "$*"; fail=1; }
@@ -208,6 +220,7 @@ fi
 # 4) hook tests
 say "== hook tests =="
 for t in claude/hooks/guard.test.sh claude/hooks/observability.test.sh claude/hooks/security-scan.test.sh \
+         scripts/validate-harness.test.sh \
          claude/hooks/checkpoint.test.sh claude/hooks/distill-scope.test.sh claude/hooks/skill-review.test.sh \
          claude/hooks/skill-review/autoinstall.test.sh \
          claude/hooks/lib/mtime-prune.test.sh \
