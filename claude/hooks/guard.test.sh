@@ -6,6 +6,22 @@ set -uo pipefail
 # gated case "allow" and silently pass the suite. Strip it; the one escape-hatch case below
 # re-injects it explicitly via `env`.
 unset CCC_ALLOW_GATED
+# Hermetic: every deny case below would otherwise append a DENY record to the
+# operator's REAL ~/.claude/state/approval-needed.log (guard.py falls back to
+# $HOME when CCC_APPROVAL_LOG is unset), polluting the node's approval-needed
+# audit trail on each suite/validate-harness run. Route the suite's records to a
+# throwaway file; the approval-log-under-HOME case below clears the override to
+# exercise the HOME fallback explicitly.
+SUITE_TMP="$(mktemp -d 2>/dev/null || mktemp -d -t ccc-guard-suite)"
+trap 'rm -rf "$SUITE_TMP" 2>/dev/null || true' EXIT
+export CCC_APPROVAL_LOG="$SUITE_TMP/approval-needed.log"
+# Hermetic vs the LIVE node profile: on a node where the operator enabled
+# operational-relax (/etc/ccc-node/guard-profile), the lifecycle deny cases
+# below would read the real profile and flip to allow. CCC_GUARD_ASSUME_STRICT
+# is a strict-only seam in guard.py (it can only tighten), so exporting it here
+# pins the suite to strict semantics on every node. Relax-mode behaviour is
+# covered in-process by guard-profile.test.py.
+export CCC_GUARD_ASSUME_STRICT=1
 HERE="$(cd "$(dirname "$0")" && pwd)"
 GUARD="$HERE/guard.sh"
 pass=0; fail=0
@@ -498,7 +514,7 @@ run allow Bash command 'git push --force origin main' 'CCC_ALLOW_GATED=1'
 # ---- portability: default approval log parent is created under HOME ----
 tmp_home="$(mktemp -d 2>/dev/null || mktemp -d -t ccc-guard-home)"
 payload="$(jq -nc --arg t Bash --arg f command --arg v 'gh release create v1.0.0' '{tool_name:$t, tool_input:{($f):$v}}')"
-rc=0; HOME="$tmp_home" bash "$GUARD" <<<"$payload" >/dev/null 2>&1 || rc=$?
+rc=0; CCC_APPROVAL_LOG='' HOME="$tmp_home" bash "$GUARD" <<<"$payload" >/dev/null 2>&1 || rc=$?
 if [ "$rc" = "2" ] && [ -s "$tmp_home/.claude/state/approval-needed.log" ]; then
   pass=$((pass+1))
 else
