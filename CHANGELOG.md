@@ -18,6 +18,15 @@ All notable changes to the Claude Code node harness. Dates are KST.
   `validate-harness.sh`/`setup.test.sh` gate the root-neutralization (real +
   `id`-stubbed root), and the bridge gate/wiring carry root regressions.
 
+### Security
+- Keep the ccc-node PreToolUse guard as the authoritative semantic
+  Fresh-Approval boundary and keep `CCC_BRIDGE_CLAUDE_UNRESTRICTED` opt-in with
+  a default of `false`. Native Claude permission denies now add
+  defense-in-depth for literal catastrophic root deletion and force-pushes to
+  `main`, while `sudo` remains ask-gated. The native patterns do not replace the
+  guard: `setup.test.sh` pins both layers and `ccc-security-audit` reports a
+  missing native catastrophic backstop as a risk.
+
 ### Changed
 - The autonomous broker Compose runbook now accepts one provenance
   `export A2A_BROKER_REVISION=$(git rev-parse HEAD)` companion (also `--short` and the
@@ -27,9 +36,9 @@ All notable changes to the Claude Code node harness. Dates are KST.
   ONLY substitution the runbook accepts: the sequence splitter rejects any
   top-level `;`/`|`/`&&` first, and a full-match on the exact command leaves
   no room for a hidden substitution — every other `$(...)`/backtick, a second
-  export, an export after the reconciliation, a redirect, or a non-`A-Z` var
+  export, an export after the reconciliation, a redirect, or any other variable
   name still fails closed (`guard.test.sh` carries the allow/deny regressions,
-  350/0).
+  352/0).
 - Claude Code now defaults to native `bypassPermissions` mode, matching the
   no-prompt execution posture used by ccc-node/Codex. New installs and
   self-updates receive the mode through `settings.base.json`; the independent

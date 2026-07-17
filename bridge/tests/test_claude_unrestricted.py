@@ -10,6 +10,7 @@ import unittest
 from unittest.mock import patch
 
 from telegram_bot.core import project_chat, tool_policy
+from telegram_bot.utils.config import Config
 
 
 class _FakeSDKClient:
@@ -119,6 +120,12 @@ class ClaudeUnrestrictedWiringTest(unittest.TestCase):
         )
         self.assertEqual(options.permission_mode, "default")
         self.assertEqual(options.setting_sources, ["user", "project", "local"])
+
+
+class ClaudeUnrestrictedDefaultContractTest(unittest.TestCase):
+    def test_default_remains_guarded_opt_in(self) -> None:
+        """Owner-operator parity must not silently disable the host guard."""
+        self.assertIs(Config.model_fields["claude_unrestricted"].default, False)
 
 
 if __name__ == "__main__":

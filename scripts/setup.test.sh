@@ -210,6 +210,10 @@ ok "setup neutralizes bypassPermissions default when Claude runs as root" \
   'jq -e ".permissions.defaultMode != \"bypassPermissions\"" "$root_claude/settings.json" >/dev/null'
 ok "root-neutralized settings.json still parses with its permissions block intact" \
   'jq -e ".permissions.allow | type == \"array\"" "$root_claude/settings.json" >/dev/null'
+ok "root-neutralized settings retain the native catastrophic deny backstop" \
+  'jq -e '\''(.permissions.deny // []) as $d | ($d | any(. == "Bash(rm -rf /:*)")) and ($d | any(. == "Bash(git push --force origin main:*)"))'\'' "$root_claude/settings.json" >/dev/null'
+ok "root install retains the semantic PreToolUse guard" \
+  '[ -x "$root_claude/hooks/guard.sh" ] && jq -e '\''[.hooks.PreToolUse[].hooks[].command] | any(contains("guard.sh"))'\'' "$root_claude/settings.json" >/dev/null'
 
 # A node's accumulated/hand-added approvals must survive a re-run (the self-update path).
 printf '%s\n' '{"permissions":{"allow":["Bash(node-local-only:*)"]}}' > "$seed_claude/settings.local.json"
