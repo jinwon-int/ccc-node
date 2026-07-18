@@ -206,6 +206,104 @@ class RetryViewTest(unittest.TestCase):
         self.assertFalse(view['ready'])
 
 
+class ScheduleKindsTest(unittest.TestCase):
+    def test_interval_parse(self):
+        spec = lib.parse_schedule('every 30m')
+        self.assertEqual(spec['kind'], 'interval')
+        self.assertEqual(spec['seconds'], 1800)
+        self.assertEqual(lib.parse_schedule('every 2h')['seconds'], 7200)
+        self.assertEqual(lib.parse_schedule('every 1d')['seconds'], 86400)
+
+    def test_interval_bounds(self):
+        with self.assertRaises(ValueError):
+            lib.parse_schedule('every 400d')
+        with self.assertRaises(ValueError):
+            lib.parse_schedule('every 0m')
+
+    def test_once_parse_forms(self):
+        spec = lib.parse_schedule('at 2026-08-01T09:00:00Z')
+        self.assertEqual(spec['kind'], 'once')
+        self.assertEqual(spec['runAt'], _dt(2026, 8, 1, 9, 0))
+        bare = lib.parse_schedule('2026-08-01T09:00:00Z')
+        self.assertEqual(bare['kind'], 'once')
+        self.assertEqual(bare['runAt'], _dt(2026, 8, 1, 9, 0))
+
+    def test_once_naive_anchored_to_task_timezone(self):
+        spec = lib.parse_schedule('at 2026-08-01T09:00', 'Asia/Seoul')
+        self.assertEqual(spec['runAt'], _dt(2026, 8, 1, 0, 0))  # KST-9
+
+    def test_unknown_timezone_fails_closed(self):
+        with self.assertRaises(ValueError):
+            lib.parse_schedule('@daily', 'Mars/OlympusMons')
+
+    def test_cron_kind_marked(self):
+        self.assertEqual(lib.parse_schedule('@daily')['kind'], 'cron')
+
+
+class TimezoneCronTest(unittest.TestCase):
+    def test_kst_daily_9am_matches_midnight_utc(self):
+        spec = lib.parse_schedule('0 9 * * *', 'Asia/Seoul')
+        occ, truncated = lib.schedule_occurrences(
+            spec, _dt(2026, 8, 1, 0, 0), _dt(2026, 8, 2, 0, 0))
+        self.assertFalse(truncated)
+        self.assertEqual(occ, [_dt(2026, 8, 2, 0, 0)])  # 09:00 KST == 00:00 UTC
+
+    def test_next_after_in_task_timezone(self):
+        spec = lib.parse_schedule('0 9 * * *', 'Asia/Seoul')
+        self.assertEqual(lib.next_after(spec, _dt(2026, 8, 1, 1, 0)),
+                         _dt(2026, 8, 2, 0, 0))
+
+
+class IntervalOccurrenceTest(unittest.TestCase):
+    def test_never_run_is_due_once_now(self):
+        spec = lib.parse_schedule('every 30m')
+        occ, truncated = lib.schedule_occurrences(spec, None, _dt(2026, 8, 1, 12, 0))
+        self.assertEqual(occ, [_dt(2026, 8, 1, 12, 0)])
+        self.assertFalse(truncated)
+
+    def test_free_running_from_last_run(self):
+        spec = lib.parse_schedule('every 30m')
+        occ, _ = lib.schedule_occurrences(
+            spec, _dt(2026, 8, 1, 10, 0), _dt(2026, 8, 1, 11, 30))
+        self.assertEqual(occ, [_dt(2026, 8, 1, 10, 30),
+                               _dt(2026, 8, 1, 11, 0),
+                               _dt(2026, 8, 1, 11, 30)])
+
+    def test_anchor_keeps_phase(self):
+        spec = lib.parse_schedule('every 1h')
+        anchor = _dt(2026, 8, 1, 0, 15)
+        occ, _ = lib.schedule_occurrences(
+            spec, _dt(2026, 8, 1, 1, 15), _dt(2026, 8, 1, 3, 20), anchor=anchor)
+        self.assertEqual(occ, [_dt(2026, 8, 1, 2, 15), _dt(2026, 8, 1, 3, 15)])
+
+    def test_next_after_phase_aligned(self):
+        spec = lib.parse_schedule('every 1h')
+        anchor = _dt(2026, 8, 1, 0, 15)
+        self.assertEqual(lib.next_after(spec, _dt(2026, 8, 1, 2, 30), anchor=anchor),
+                         _dt(2026, 8, 1, 3, 15))
+
+
+class OnceOccurrenceTest(unittest.TestCase):
+    def test_due_when_reached_and_not_run(self):
+        spec = lib.parse_schedule('at 2026-08-01T09:00:00Z')
+        occ, _ = lib.schedule_occurrences(spec, None, _dt(2026, 8, 1, 9, 5))
+        self.assertEqual(occ, [_dt(2026, 8, 1, 9, 0)])
+
+    def test_not_due_after_it_already_ran(self):
+        spec = lib.parse_schedule('at 2026-08-01T09:00:00Z')
+        occ, _ = lib.schedule_occurrences(
+            spec, _dt(2026, 8, 1, 9, 0), _dt(2026, 8, 1, 10, 0))
+        self.assertEqual(occ, [])
+
+    def test_not_due_before_run_at(self):
+        spec = lib.parse_schedule('at 2026-08-01T09:00:00Z')
+        occ, _ = lib.schedule_occurrences(spec, None, _dt(2026, 8, 1, 8, 59))
+        self.assertEqual(occ, [])
+        self.assertEqual(lib.next_after(spec, _dt(2026, 8, 1, 8, 59)),
+                         _dt(2026, 8, 1, 9, 0))
+        self.assertIsNone(lib.next_after(spec, _dt(2026, 8, 1, 9, 0)))
+
+
 class FmtDtTest(unittest.TestCase):
     def test_none(self):
         self.assertIsNone(lib.fmt_dt(None))

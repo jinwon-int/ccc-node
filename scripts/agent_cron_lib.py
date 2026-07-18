@@ -11,8 +11,16 @@ names and dispatches only from ``main()``.
 import re
 from datetime import datetime, timedelta, timezone
 
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:  # pragma: no cover - zoneinfo ships with Python >= 3.9
+    ZoneInfo = None
+
 OCCURRENCE_SCAN_LIMIT = 1000
 CRON_FIELD_RX = re.compile(r'^(\*|\*/[1-9][0-9]*|[0-9]+)(,(\*|\*/[1-9][0-9]*|[0-9]+))*$')
+INTERVAL_RX = re.compile(r'^every\s+([1-9][0-9]*)\s*(m|h|d)$')
+INTERVAL_UNIT_SECONDS = {'m': 60, 'h': 3600, 'd': 86400}
+MAX_INTERVAL_SECONDS = 366 * 86400
 SHORTHAND = {
     '@hourly': '0 * * * *',
     '@daily': '0 0 * * *',
@@ -21,6 +29,19 @@ SHORTHAND = {
     '@yearly': '0 0 1 1 *',
     '@annually': '0 0 1 1 *',
 }
+
+
+def resolve_timezone(name):
+    """Resolve a task timezone name to a tzinfo, fail-closed on unknown names."""
+    label = (name or 'UTC').strip() or 'UTC'
+    if label.upper() == 'UTC':
+        return timezone.utc, 'UTC'
+    if ZoneInfo is None:
+        raise ValueError('IANA timezones require Python zoneinfo (>= 3.9)')
+    try:
+        return ZoneInfo(label), label
+    except Exception as e:
+        raise ValueError(f'unknown timezone: {label}') from e
 
 
 def parse_dt(value, field='timestamp'):
@@ -58,18 +79,64 @@ def expand_field(raw, min_v, max_v):
     return vals
 
 
-def parse_schedule(expr):
-    expr = expr.strip()
+def parse_local_dt(value, tz, field='schedule'):
+    """Parse an ISO8601 timestamp; naive values are anchored to ``tz``."""
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f'{field} requires an ISO8601 timestamp')
+    text = value.strip()
+    if text.endswith('Z'):
+        text = text[:-1] + '+00:00'
+    try:
+        dt = datetime.fromisoformat(text)
+    except ValueError as e:
+        raise ValueError(f'{field} is not valid ISO8601: {value}') from e
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=tz)
+    return dt.astimezone(timezone.utc).replace(second=0, microsecond=0)
+
+
+def parse_schedule(expr, tz_name='UTC'):
+    """Parse a schedule into a kind-aware spec.
+
+    Supported forms:
+    - 5-field cron / @shorthand  -> kind 'cron' (matched in the task timezone)
+    - ``every <N>m|h|d``         -> kind 'interval' (fixed period)
+    - ``at <ISO8601>`` or a bare ISO8601 timestamp -> kind 'once'
+      (naive timestamps are anchored to the task timezone)
+    """
+    expr = (expr or '').strip()
+    tz, tz_label = resolve_timezone(tz_name)
     if expr == '@reboot':
         raise ValueError('@reboot is not supported by dry-run due resolver')
+    m = INTERVAL_RX.match(expr)
+    if m:
+        seconds = int(m.group(1)) * INTERVAL_UNIT_SECONDS[m.group(2)]
+        if seconds < 60:
+            raise ValueError('interval must be at least 1 minute')
+        if seconds > MAX_INTERVAL_SECONDS:
+            raise ValueError('interval must be at most 366 days')
+        return {'kind': 'interval', 'seconds': seconds, 'expr': expr,
+                'tz': tz, 'tzName': tz_label}
+    if expr.startswith('at '):
+        run_at = parse_local_dt(expr[3:], tz)
+        return {'kind': 'once', 'runAt': run_at, 'expr': expr,
+                'tz': tz, 'tzName': tz_label}
+    if 'T' in expr and ' ' not in expr:
+        run_at = parse_local_dt(expr, tz)
+        return {'kind': 'once', 'runAt': run_at, 'expr': expr,
+                'tz': tz, 'tzName': tz_label}
     expr = SHORTHAND.get(expr, expr)
     parts = expr.split()
     if len(parts) != 5:
-        raise ValueError('schedule must be a supported @shorthand or 5-field cron')
+        raise ValueError(
+            'schedule must be a supported @shorthand, 5-field cron, '
+            '"every <N>m|h|d", or "at <ISO8601>"'
+        )
     for p in parts:
         if not CRON_FIELD_RX.match(p):
             raise ValueError(f'unsupported cron field: {p}')
     return {
+        'kind': 'cron',
         'minute': expand_field(parts[0], 0, 59),
         'hour': expand_field(parts[1], 0, 23),
         'dom': expand_field(parts[2], 1, 31),
@@ -78,6 +145,8 @@ def parse_schedule(expr):
         'dom_any': parts[2] == '*',
         'dow_any': parts[4] == '*',
         'expr': expr,
+        'tz': tz,
+        'tzName': tz_label,
     }
 
 
@@ -183,13 +252,18 @@ def cron_matches(dt, spec):
     )
 
 
+def _local(dt, spec):
+    tz = spec.get('tz') or timezone.utc
+    return dt if tz is timezone.utc else dt.astimezone(tz)
+
+
 def iter_occurrences(spec, start_exclusive, end_inclusive, cap=OCCURRENCE_SCAN_LIMIT):
     cur = (start_exclusive + timedelta(minutes=1)).replace(second=0, microsecond=0)
     end = end_inclusive.replace(second=0, microsecond=0)
     out = []
     truncated = False
     while cur <= end:
-        if cron_matches(cur, spec):
+        if cron_matches(_local(cur, spec), spec):
             if len(out) >= cap:
                 truncated = True
                 break
@@ -201,10 +275,65 @@ def iter_occurrences(spec, start_exclusive, end_inclusive, cap=OCCURRENCE_SCAN_L
 def next_occurrence(spec, after, max_minutes=366 * 24 * 60):
     cur = (after + timedelta(minutes=1)).replace(second=0, microsecond=0)
     for _ in range(max_minutes):
-        if cron_matches(cur, spec):
+        if cron_matches(_local(cur, spec), spec):
             return cur
         cur += timedelta(minutes=1)
     return None
+
+
+def _interval_next_after(spec, floor, anchor):
+    """First phase-aligned occurrence strictly after ``floor`` (UTC)."""
+    step = spec['seconds']
+    if anchor is None:
+        return floor + timedelta(seconds=step)
+    delta = (floor - anchor).total_seconds()
+    k = int(delta // step) + 1 if delta >= 0 else 0
+    candidate = anchor + timedelta(seconds=k * step)
+    while candidate <= floor:
+        candidate += timedelta(seconds=step)
+    return candidate
+
+
+def schedule_occurrences(spec, last, at, anchor=None, cap=OCCURRENCE_SCAN_LIMIT):
+    """Due occurrences (UTC, ascending) up to ``at``, plus a truncation flag.
+
+    - once: due exactly when runAt <= at and it has not yet run at/after runAt.
+    - interval: phase-anchored to ``anchor`` (or free-running from ``last``);
+      a never-run task without an anchor is due once immediately.
+    - cron: minute-scan matched in the task timezone (existing behavior).
+    """
+    kind = spec.get('kind', 'cron')
+    if kind == 'once':
+        run_at = spec['runAt']
+        if run_at <= at and (last is None or last < run_at):
+            return [run_at], False
+        return [], False
+    if kind == 'interval':
+        if anchor is None and last is None:
+            return [at], False
+        floor = last if (anchor is None or (last is not None and last > anchor)) else anchor
+        out = []
+        truncated = False
+        cur = _interval_next_after(spec, floor, anchor)
+        while cur <= at:
+            if len(out) >= cap:
+                truncated = True
+                break
+            out.append(cur)
+            cur += timedelta(seconds=spec['seconds'])
+        return out, truncated
+    horizon = last or (at - timedelta(days=366))
+    return iter_occurrences(spec, horizon, at, cap)
+
+
+def next_after(spec, at, anchor=None):
+    """Next scheduled occurrence strictly after ``at`` (UTC), or None."""
+    kind = spec.get('kind', 'cron')
+    if kind == 'once':
+        return spec['runAt'] if spec['runAt'] > at else None
+    if kind == 'interval':
+        return _interval_next_after(spec, at, anchor)
+    return next_occurrence(spec, at)
 
 
 def fmt_dt(dt):
