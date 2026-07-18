@@ -22,11 +22,39 @@ mkdir -p "$STATE_DIR" 2>/dev/null || true
 input="$(cat 2>/dev/null)"
 [ -n "$input" ] || { echo "local-facts: no input"; exit 0; }
 
-DISTILL_JSON="$input" python3 - "$FACTS_FILE" "$MAX_FACTS" <<'PY' || exit 0
+AUDIENCE_SCOPED="${CCC_MEMORY_AUDIENCE_SCOPED:-0}"
+MEMORY_AUDIENCE="${CCC_MEMORY_AUDIENCE:-legacy}"
+case "$AUDIENCE_SCOPED:$MEMORY_AUDIENCE" in
+  1:private|1:shared|true:private|true:shared|TRUE:private|TRUE:shared|on:private|on:shared|ON:private|ON:shared|yes:private|yes:shared|YES:private|YES:shared)
+    audience_root="${CCC_MEMORY_AUDIENCE_ROOT:-}"
+    memory_scope="${CCC_MEMORY_SCOPE:-}"
+    valid=0
+    case "$MEMORY_AUDIENCE:$memory_scope" in
+      shared:shared) valid=1 ;;
+      private:private-*)
+        suffix="${memory_scope#private-}"
+        if [ "${#suffix}" = 32 ]; then
+          case "$suffix" in *[!0-9a-f]*) ;; *) valid=1 ;; esac
+        fi
+        ;;
+    esac
+    [ "$valid" = 1 ] \
+      && [ -n "$audience_root" ] \
+      && [ "$STATE_DIR" = "$audience_root/$memory_scope/state" ] \
+      && [ "$FACTS_FILE" = "$audience_root/$memory_scope/state/memory-facts.jsonl" ] \
+      || { echo "local-facts skipped: invalid audience paths"; exit 0; }
+    ;;
+  0:*|false:*|FALSE:*|off:*|OFF:*|no:*|NO:*) ;;
+  *) echo "local-facts skipped: invalid audience metadata"; exit 0 ;;
+esac
+
+DISTILL_JSON="$input" python3 - "$FACTS_FILE" "$MAX_FACTS" "$AUDIENCE_SCOPED" "$MEMORY_AUDIENCE" <<'PY' || exit 0
 import hashlib, json, os, re, sys, tempfile
 from datetime import datetime, timezone
 
 facts_file, max_facts = sys.argv[1], int(sys.argv[2] or 1000)
+audience_scoped = sys.argv[3].lower() not in {"0", "false", "off", "no"}
+memory_audience = sys.argv[4]
 raw = os.environ.get("DISTILL_JSON", "")
 try:
     doc = json.loads(raw)
@@ -79,13 +107,15 @@ for it in items:
         "kind": kind,
         "text": text,
         "review": "auto-local",
-        "privacy": "private",
+        "privacy": "shared" if audience_scoped and memory_audience == "shared" else "private",
         "confidence": 0.7,
         "observed_at": observed_at,
         "entities": [subject] if subject else [],
         "tags": ["distilled"] + ([trigger] if trigger else []),
         "source": {"type": "distill", "session": session, "trigger": trigger},
     }
+    if audience_scoped:
+        fact["audience"] = memory_audience
     added.append(json.dumps(fact, ensure_ascii=False))
 
 if not added:

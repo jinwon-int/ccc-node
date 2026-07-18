@@ -21,6 +21,7 @@ is_disabled() { case "${1:-}" in 0|false|FALSE|off|OFF|no|NO) return 0;; *) retu
 wiki_memory_disabled() {
   [ "${CCC_NODE_ISOLATION_PROFILE:-fleet}" = "external" ] || is_disabled "${CCC_WIKI_MEMORY_ENABLED:-1}"
 }
+honcho_memory_disabled() { is_disabled "${CCC_HONCHO_MEMORY_ENABLED:-1}"; }
 
 # ---- recursion guard (FIRST line of executable logic) ----------------------
 if [ -n "${CLAUDE_DISTILL_INFLIGHT:-}" ]; then
@@ -103,8 +104,12 @@ run_bg_pipeline() {
     return 0
   fi
 
-  bash "$HOOKDIR/distill/honcho-push.sh" < "$STASH" >> "$LOG" 2>&1 || \
-    log "honcho-push non-zero (queued for retry)"
+  if honcho_memory_disabled; then
+    log "honcho-push skipped reason=disabled"
+  else
+    bash "$HOOKDIR/distill/honcho-push.sh" < "$STASH" >> "$LOG" 2>&1 || \
+      log "honcho-push non-zero (queued for retry)"
+  fi
   if wiki_memory_disabled; then
     log "wiki-queue skipped reason=disabled"
   else
@@ -152,11 +157,32 @@ if [ "${CLAUDE_DISTILL_BG:-}" = "1" ]; then
     CLAUDE_DISTILL_DRYRUN="$(jq -r '.dryrun // 0' "$PENDING_JOB" 2>/dev/null)"
     CCC_NODE_ISOLATION_PROFILE="$(jq -r '.isolation_profile // "fleet"' "$PENDING_JOB" 2>/dev/null)"
     CCC_WIKI_MEMORY_ENABLED="$(jq -r '.wiki_memory_enabled // "1"' "$PENDING_JOB" 2>/dev/null)"
+    JOB_MEMORY_AUDIENCE_SCOPED="$(jq -r '.memory_audience_scoped // "0"' "$PENDING_JOB" 2>/dev/null)"
+    JOB_MEMORY_AUDIENCE="$(jq -r '.memory_audience // "legacy"' "$PENDING_JOB" 2>/dev/null)"
+    JOB_MEMORY_SCOPE="$(jq -r '.memory_scope // ""' "$PENDING_JOB" 2>/dev/null)"
+    CCC_HONCHO_MEMORY_ENABLED="$(jq -r '.honcho_memory_enabled // "1"' "$PENDING_JOB" 2>/dev/null)"
+    if ! is_disabled "$JOB_MEMORY_AUDIENCE_SCOPED"; then
+      case "$JOB_MEMORY_AUDIENCE" in private|shared) ;; *)
+        log "pending retained reason=invalid-memory-audience job=$(basename "$PENDING_JOB" .json)"
+        exit 0
+      esac
+      if [ -n "${CCC_MEMORY_SCOPE:-}" ] \
+        && [ -n "$JOB_MEMORY_SCOPE" ] \
+        && [ "$CCC_MEMORY_SCOPE" != "$JOB_MEMORY_SCOPE" ]; then
+        log "pending retained reason=memory-scope-mismatch job=$(basename "$PENDING_JOB" .json)"
+        exit 0
+      fi
+      CCC_MEMORY_AUDIENCE_SCOPED="$JOB_MEMORY_AUDIENCE_SCOPED"
+      CCC_MEMORY_AUDIENCE="$JOB_MEMORY_AUDIENCE"
+      CCC_MEMORY_SCOPE="$JOB_MEMORY_SCOPE"
+    fi
     CCC_MEMORY_USER_LABEL="$(jq -r '.memory_user_label // "Seo Jin On / 서진원"' "$PENDING_JOB" 2>/dev/null)"
     CCC_MEMORY_ASSISTANT_LABEL="$(jq -r '.memory_assistant_label // "dungae, a Hermes Team2 worker"' "$PENDING_JOB" 2>/dev/null)"
     export CLAUDE_DISTILL_TRIGGER CLAUDE_DISTILL_SESSION CLAUDE_DISTILL_TRANSCRIPT
     export CLAUDE_DISTILL_SOURCE_CWD CLAUDE_DISTILL_SOURCE_PROJECT CLAUDE_DISTILL_DRYRUN
     export CCC_NODE_ISOLATION_PROFILE CCC_WIKI_MEMORY_ENABLED
+    export CCC_MEMORY_AUDIENCE_SCOPED CCC_MEMORY_AUDIENCE CCC_MEMORY_SCOPE
+    export CCC_HONCHO_MEMORY_ENABLED
     export CCC_MEMORY_USER_LABEL CCC_MEMORY_ASSISTANT_LABEL
 
     if [ -z "$CLAUDE_DISTILL_SESSION" ] || [ ! -f "$CLAUDE_DISTILL_TRANSCRIPT" ]; then
@@ -320,6 +346,10 @@ if [ ! -f "$PENDING_JOB" ]; then
     --arg created_at "$(ts)" \
     --arg isolation_profile "${CCC_NODE_ISOLATION_PROFILE:-fleet}" \
     --arg wiki_memory_enabled "${CCC_WIKI_MEMORY_ENABLED:-1}" \
+    --arg memory_audience_scoped "${CCC_MEMORY_AUDIENCE_SCOPED:-0}" \
+    --arg memory_audience "${CCC_MEMORY_AUDIENCE:-legacy}" \
+    --arg memory_scope "${CCC_MEMORY_SCOPE:-}" \
+    --arg honcho_memory_enabled "${CCC_HONCHO_MEMORY_ENABLED:-1}" \
     --arg memory_user_label "${CCC_MEMORY_USER_LABEL:-Seo Jin On / 서진원}" \
     --arg memory_assistant_label "${CCC_MEMORY_ASSISTANT_LABEL:-dungae, a Hermes Team2 worker}" \
     --argjson dryrun "$DRYRUN" \
@@ -329,6 +359,10 @@ if [ ! -f "$PENDING_JOB" ]; then
       trigger:$trigger, dryrun:$dryrun, created_at:$created_at,
       isolation_profile:$isolation_profile,
       wiki_memory_enabled:$wiki_memory_enabled,
+      memory_audience_scoped:$memory_audience_scoped,
+      memory_audience:$memory_audience,
+      memory_scope:$memory_scope,
+      honcho_memory_enabled:$honcho_memory_enabled,
       memory_user_label:$memory_user_label,
       memory_assistant_label:$memory_assistant_label}' > "$JOB_TMP"; then
     rm -f "$JOB_TMP" 2>/dev/null || true

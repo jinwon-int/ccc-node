@@ -12,6 +12,10 @@
 # load-memory/load-tools/checkpoint/etc. and avoid recursion.
 set -uo pipefail
 
+case "${CCC_HONCHO_MEMORY_ENABLED:-1}" in
+  0|false|FALSE|off|OFF|no|NO) exit 0 ;;
+esac
+
 # Distill subprocess guard (defensive — SessionStart should already have it set).
 [ -n "${CLAUDE_DISTILL_INFLIGHT:-}" ] || export CLAUDE_DISTILL_INFLIGHT=1
 

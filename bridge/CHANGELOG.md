@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **Telegram bridge memory could cross from DMs into public chats.** The new
+  opt-in `CCC_BRIDGE_MEMORY_MODE=audience-scoped` routes public conversations
+  to one shared local store and each DM to an opaque HMAC-derived private store;
+  DMs can recall shared facts, while groups/channels cannot read DM-private or
+  unscoped legacy sources. Resume/checkpoint/distill queues, local facts, caches,
+  and indexes inherit the same paths, shared facts carry an explicit privacy
+  label, and raw Telegram ids never enter memory paths or hook settings. Global
+  Honcho and Family Wiki read/write paths are disabled in this mode until they
+  have physical audience sessions/labels. Memory plus `shared-all` now fails closed unless
+  an explicit unsafe override restores legacy `curated` behavior.
 - **Outbound file delivery covered too few file types.** Replies that referenced
   an agent-produced file only auto-sent it to Telegram when its extension was one
   of nine hardcoded types (`png/jpg/jpeg/gif/webp/mp4/mp3/pdf/zip`), so common
