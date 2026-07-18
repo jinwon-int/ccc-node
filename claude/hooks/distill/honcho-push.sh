@@ -17,6 +17,13 @@ QUEUE="$STATE_DIR/honcho-queue.jsonl"
 QUEUE_LOCK="$STATE_DIR/.honcho-queue.lock"
 mkdir -p "$STATE_DIR" 2>/dev/null
 
+case "${CCC_HONCHO_MEMORY_ENABLED:-1}" in
+  0|false|FALSE|off|OFF|no|NO)
+    echo "honcho push skipped: disabled"
+    exit 0
+    ;;
+esac
+
 append_retry_payload() {
   # queue-drain holds this lock only for local rename/merge operations, never
   # while calling Honcho. A producer therefore waits only for a short critical

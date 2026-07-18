@@ -46,6 +46,10 @@ PAYLOAD_NO_FACTS='{"session_id":"sess-empty","trigger":"manual","honcho":[],"wik
 unset CCC_NODE
 printf 'seoseo\n' > "$TMP/state/node.txt"
 
+: > "$CURL_STUB_LOG"
+out="$(printf '%s' "$PAYLOAD_WITH_FACTS" | CCC_HONCHO_MEMORY_ENABLED=0 bash "$PUSH" 2>&1)"; rc=$?
+ok "disabled Honcho path performs no network call" '[ "$rc" = 0 ] && grep -q "skipped: disabled" <<<"$out" && [ ! -s "$CURL_STUB_LOG" ]'
+
 out="$(printf '%s' "$PAYLOAD_WITH_FACTS" | CURL_STUB_HTTP=201 bash "$PUSH" 2>&1)"; rc=$?
 ok "success exits 0" '[ "$rc" = 0 ]'
 ok "success reports pushed fact count" 'grep -q "honcho push ok http=201 session=sess-1 facts=1" <<<"$out"'

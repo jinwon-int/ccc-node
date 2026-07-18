@@ -33,8 +33,56 @@ USER_LABEL="${CCC_MEMORY_USER_LABEL:-Seo Jin On}"
 # it regardless (that is part of their definition).
 LOCAL_ENABLED="${CCC_LOCAL_MEMORY_ENABLED:-}"
 QUERY="${CCC_MEMORY_QUERY:-}"
+AUDIENCE_SCOPED="${CCC_MEMORY_AUDIENCE_SCOPED:-0}"
+MEMORY_AUDIENCE="${CCC_MEMORY_AUDIENCE:-legacy}"
+MEMORY_SCOPE="${CCC_MEMORY_SCOPE:-}"
+AUDIENCE_ROOT="${CCC_MEMORY_AUDIENCE_ROOT:-}"
+SHARED_STATE_DIR="${CCC_MEMORY_SHARED_STATE_DIR:-}"
+SHARED_CACHE_DIR="${CCC_MEMORY_SHARED_CACHE_DIR:-}"
+SHARED_MEMDIR="${CCC_MEMORY_SHARED_DIR:-}"
+LEGACY_STATE_DIR="${CCC_MEMORY_LEGACY_STATE_DIR:-${HOME:-/root}/.claude/state}"
+LEGACY_CACHE_DIR="${CCC_MEMORY_LEGACY_CACHE_DIR:-${HOME:-/root}/.claude/hooks/cache}"
+LEGACY_MEMDIR="${CCC_MEMORY_LEGACY_DIR:-${HOME:-/root}/.claude/memories}"
+LEGACY_RESUME_FILE="${CCC_MEMORY_LEGACY_RESUME_FILE:-$LEGACY_STATE_DIR/resume.md}"
+RESUME_FILE="${CCC_RESUME_FILE:-$STATE_DIR/resume.md}"
 
 is_disabled() { case "${1:-}" in 0|false|FALSE|off|OFF|no|NO) return 0;; *) return 1;; esac; }
+
+scoped_paths_valid() {
+  local suffix
+  [ -n "$AUDIENCE_ROOT" ] || return 1
+  case "$MEMORY_AUDIENCE:$MEMORY_SCOPE" in
+    shared:shared) ;;
+    private:private-*)
+      suffix="${MEMORY_SCOPE#private-}"
+      [ "${#suffix}" = 32 ] || return 1
+      case "$suffix" in *[!0-9a-f]*) return 1 ;; esac
+      ;;
+    *) return 1 ;;
+  esac
+  [ "$STATE_DIR" = "$AUDIENCE_ROOT/$MEMORY_SCOPE/state" ] \
+    && [ "$CACHE" = "$AUDIENCE_ROOT/$MEMORY_SCOPE/cache" ] \
+    && [ "$MEMDIR" = "$AUDIENCE_ROOT/$MEMORY_SCOPE/memories" ] \
+    && [ "$RESUME_FILE" = "$AUDIENCE_ROOT/$MEMORY_SCOPE/state/resume.md" ] \
+    && [ "$SHARED_STATE_DIR" = "$AUDIENCE_ROOT/shared/state" ] \
+    && [ "$SHARED_CACHE_DIR" = "$AUDIENCE_ROOT/shared/cache" ] \
+    && [ "$SHARED_MEMDIR" = "$AUDIENCE_ROOT/shared/memories" ]
+}
+
+if ! is_disabled "$AUDIENCE_SCOPED"; then
+  # The legacy Honcho peer/cache is not physically audience-scoped. Keep this
+  # path local-only until Honcho supports a distinct audience session contract.
+  # Family Wiki is also a global source/sink and must remain off here.
+  HONCHO_ENABLED=0
+  WIKI_ENABLED=0
+  if ! scoped_paths_valid; then
+      # Fail closed: an incomplete/malformed scoped environment must never fall
+      # back to global MEMORY/USER or cache paths.
+      jq -n --arg event "$EVENT" \
+        '{hookSpecificOutput:{hookEventName:$event,additionalContext:"Audience-scoped memory unavailable: invalid audience metadata."}}'
+      exit 0
+  fi
+fi
 
 scan_injection_block() { # <label> <text>
   local label="$1" text="$2" scanned
@@ -183,11 +231,11 @@ find_memory_tool() { # <tool-name>
   return 1
 }
 
-run_memory_search_bounded() { # <tool> <query> <limit> <timeout-seconds>
-  local tool="$1" query="$2" limit="$3" timeout_sec="$4"
+run_memory_search_bounded() { # <tool> <query> <limit> <timeout-seconds> [state-dir]
+  local tool="$1" query="$2" limit="$3" timeout_sec="$4" state_override="${5:-}"
   python3 -c 'import math, os, signal, subprocess, sys
 
-tool, query, limit, raw_timeout = sys.argv[1:]
+tool, query, limit, raw_timeout, state_override = sys.argv[1:]
 try:
     timeout = float(raw_timeout)
 except (TypeError, ValueError):
@@ -200,6 +248,9 @@ timeout = min(timeout, 10.0)
 env = os.environ.copy()
 env["CCC_MEMORY_RECORD_USAGE"] = "0"
 env["CCC_MEMORY_SEARCH_LIMIT"] = limit
+if state_override:
+    env["CCC_STATE_DIR"] = state_override
+    env["CCC_MEMORY_INDEX_DB"] = os.path.join(state_override, "memory-index.sqlite")
 try:
     proc = subprocess.Popen(
         [tool, query],
@@ -229,7 +280,40 @@ except subprocess.TimeoutExpired:
     raise SystemExit(0)
 if proc.returncode == 0:
     sys.stdout.buffer.write(stdout)
-' "$tool" "$query" "$limit" "$timeout_sec" 2>/dev/null || true
+' "$tool" "$query" "$limit" "$timeout_sec" "$state_override" 2>/dev/null || true
+}
+
+merge_local_hot() { # <primary-json> <shared-json> [legacy-private-json]
+  PRIMARY_JSON="$1" SHARED_JSON="$2" LEGACY_JSON="${3:-}" python3 - 2>/dev/null <<'PY' || printf '%s' "$1"
+import json, os, sys
+
+def rows(name):
+    try:
+        doc = json.loads(os.environ.get(name, ""))
+    except Exception:
+        return []
+    value = doc.get("results") if isinstance(doc, dict) else None
+    return value if isinstance(value, list) else []
+
+out, seen = [], set()
+for audience, name in (
+    ("private", "PRIMARY_JSON"),
+    ("shared", "SHARED_JSON"),
+    ("private-legacy", "LEGACY_JSON"),
+):
+    for row in rows(name):
+        if not isinstance(row, dict):
+            continue
+        key = (str(row.get("path") or ""), str(row.get("snippet") or ""))
+        if key in seen:
+            continue
+        seen.add(key)
+        item = dict(row)
+        item["memoryAudience"] = audience
+        out.append(item)
+out.sort(key=lambda row: float(row.get("score") or 0), reverse=True)
+sys.stdout.write(json.dumps({"results": out}, ensure_ascii=False))
+PY
 }
 
 build_memory_query() {
@@ -264,8 +348,22 @@ stale_note() { # <label> <file>
 }
 
 # Built-in node memory lives under ~/.claude/memories; legacy Hermes memory is fallback only.
-mem="$(cat "$MEMDIR/MEMORY.md" "$MEMDIR/USER.md" 2>/dev/null)"
-[ -z "$mem" ] && mem="$(cat "${HOME:-/root}/.hermes/memories/MEMORY.md" "${HOME:-/root}/.hermes/memories/USER.md" 2>/dev/null)"
+# Audience-scoped mode treats every unscoped source as private legacy input.
+if ! is_disabled "$AUDIENCE_SCOPED"; then
+  scoped_mem="$(cat "$MEMDIR/MEMORY.md" "$MEMDIR/USER.md" 2>/dev/null)"
+  shared_mem=""
+  [ -n "$SHARED_MEMDIR" ] && shared_mem="$(cat "$SHARED_MEMDIR/MEMORY.md" "$SHARED_MEMDIR/USER.md" 2>/dev/null)"
+  if [ "$MEMORY_AUDIENCE" = "private" ]; then
+    legacy_mem="$(cat "$LEGACY_MEMDIR/MEMORY.md" "$LEGACY_MEMDIR/USER.md" 2>/dev/null)"
+    [ -z "$legacy_mem" ] && legacy_mem="$(cat "${HOME:-/root}/.hermes/memories/MEMORY.md" "${HOME:-/root}/.hermes/memories/USER.md" 2>/dev/null)"
+    mem="$(printf '%s\n%s\n%s' "$legacy_mem" "$shared_mem" "$scoped_mem")"
+  else
+    mem="$scoped_mem"
+  fi
+else
+  mem="$(cat "$MEMDIR/MEMORY.md" "$MEMDIR/USER.md" 2>/dev/null)"
+  [ -z "$mem" ] && mem="$(cat "${HOME:-/root}/.hermes/memories/MEMORY.md" "${HOME:-/root}/.hermes/memories/USER.md" 2>/dev/null)"
+fi
 wiki=""
 if ! is_disabled "$WIKI_ENABLED"; then
   wiki="$(cat "$CACHE/wiki.txt" 2>/dev/null)"
@@ -274,7 +372,11 @@ honcho=""
 if ! is_disabled "$HONCHO_ENABLED" && [ "$PROFILE" != "max-perf" ]; then
   honcho="$(cat "$CACHE/honcho.txt" 2>/dev/null)"
 fi
-resume="$(cat "${CCC_RESUME_FILE:-$STATE_DIR/resume.md}" 2>/dev/null)"
+resume="$(cat "$RESUME_FILE" 2>/dev/null)"
+if ! is_disabled "$AUDIENCE_SCOPED" && [ "$MEMORY_AUDIENCE" = "private" ]; then
+  legacy_resume="$(cat "$LEGACY_RESUME_FILE" 2>/dev/null)"
+  resume="$(printf '%s\n%s' "$legacy_resume" "$resume")"
+fi
 
 # Limit the canonical blocks first (static caps) so we can measure their slack
 # before sizing the local hot block.
@@ -328,7 +430,20 @@ if [ "$PROFILE" = "hybrid" ] || [ "$PROFILE" = "max-perf" ] || ! is_disabled "$L
     # deadline. A short inner deadline drops only local-hot results; canonical
     # MEMORY/USER/cache/resume blocks assembled above still inject. The helper
     # uses Python rather than GNU timeout so the same contract works on Termux.
-    local_hot="$(run_memory_search_bounded "$search_tool" "$QUERY" "$search_limit" "${CCC_MEMORY_SEARCH_TIMEOUT_SEC:-3}")"
+    local_hot="$(run_memory_search_bounded "$search_tool" "$QUERY" "$search_limit" "${CCC_MEMORY_SEARCH_TIMEOUT_SEC:-3}" "$STATE_DIR")"
+    if ! is_disabled "$AUDIENCE_SCOPED" \
+      && [ "$MEMORY_AUDIENCE" = "private" ] \
+      && [ -n "$SHARED_STATE_DIR" ] \
+      && [ "$SHARED_STATE_DIR" != "$STATE_DIR" ]; then
+      shared_hot="$(run_memory_search_bounded "$search_tool" "$QUERY" "$search_limit" "${CCC_MEMORY_SEARCH_TIMEOUT_SEC:-3}" "$SHARED_STATE_DIR")"
+      legacy_hot=""
+      if [ -n "$LEGACY_STATE_DIR" ] \
+        && [ "$LEGACY_STATE_DIR" != "$STATE_DIR" ] \
+        && [ "$LEGACY_STATE_DIR" != "$SHARED_STATE_DIR" ]; then
+        legacy_hot="$(run_memory_search_bounded "$search_tool" "$QUERY" "$search_limit" "${CCC_MEMORY_LEGACY_SEARCH_TIMEOUT_SEC:-2}" "$LEGACY_STATE_DIR")"
+      fi
+      local_hot="$(merge_local_hot "$local_hot" "$shared_hot" "$legacy_hot")"
+    fi
   fi
 fi
 
@@ -364,6 +479,14 @@ ${resume}
 fi
 
 operational_note="Operational facts are mutable — live-check the node before asserting or changing anything."
+audience_note=""
+if ! is_disabled "$AUDIENCE_SCOPED"; then
+  if [ "$MEMORY_AUDIENCE" = "private" ]; then
+    audience_note="Memory audience: private DM plus explicitly shared public facts. Unscoped legacy memory is private-only."
+  else
+    audience_note="Memory audience: shared public facts only. DM-private and unscoped legacy memory are unavailable."
+  fi
+fi
 wiki_block=""
 if ! is_disabled "$WIKI_ENABLED"; then
   operational_note="Operational facts are mutable — live-check the node and verify Wiki source text before asserting or changing anything."
@@ -376,6 +499,7 @@ fi
 ctx="# ${node_label} session memory (auto-injected: $EVENT)
 
 ${resume_block}${operational_note}
+${audience_note}
 Memory profile: ${PROFILE}; last refresh: ${stamp:-never}; ${wiki_note}; ${honcho_note}. A background refresh runs each session for the next one.
 
 ## Built-in MEMORY + USER

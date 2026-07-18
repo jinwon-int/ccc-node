@@ -5,10 +5,14 @@ import asyncio
 import os
 import subprocess
 import sys
+import stat
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from telegram_bot.core.curated_memory import build_curated_memory_settings
+from telegram_bot.core.memory_audience import resolve_memory_audience
 from telegram_bot.core import project_chat
 from telegram_bot.core.bot import TelegramBot
 from telegram_bot.core.session_scope import (
@@ -108,6 +112,89 @@ def test_curated_memory_settings_load_only_memory_lifecycle(tmp_path: Path) -> N
     assert any("distill.sh sessionend" in command for command in commands)
     assert all("guard.py" not in command for command in commands)
     assert all("skill-review" not in command for command in commands)
+
+
+def _audience_settings(tmp_path: Path, scope: str = "shared-groups"):
+    settings = _handler_settings(tmp_path, scope)
+    settings.bridge_memory_mode = "audience-scoped"
+    settings.bot_data_dir = tmp_path / ".telegram_bot"
+    settings.bridge_memory_audience_root = None
+    settings.bridge_memory_audience_key_path = None
+    settings.bridge_unsafe_shared_all_memory = False
+    return settings
+
+
+def test_audience_scopes_are_opaque_stable_and_private(tmp_path: Path) -> None:
+    settings = _audience_settings(tmp_path)
+    first = resolve_memory_audience(settings, user_id=934719283, chat_id=934719283)
+    again = resolve_memory_audience(settings, user_id=934719283, chat_id=934719283)
+    other = resolve_memory_audience(settings, user_id=812345678, chat_id=812345678)
+    public = resolve_memory_audience(settings, user_id=934719283, chat_id=-100456)
+
+    assert first is not None and again is not None and other is not None
+    assert public is not None
+    assert first.kind == "private"
+    assert first.scope == again.scope
+    assert first.scope != other.scope
+    assert first.scope.startswith("private-")
+    assert "934719283" not in first.scope
+    assert public.kind == "shared"
+    assert public.scope == "shared"
+
+    key_path = settings.bot_data_dir / "memory-audience.key"
+    assert key_path.stat().st_size == 32
+    assert stat.S_IMODE(key_path.stat().st_mode) == 0o600
+
+
+def test_audience_key_permissions_fail_closed(tmp_path: Path) -> None:
+    settings = _audience_settings(tmp_path)
+    settings.bot_data_dir.mkdir(mode=0o700)
+    key_path = settings.bot_data_dir / "memory-audience.key"
+    key_path.write_bytes(b"x" * 32)
+    key_path.chmod(0o644)
+
+    with pytest.raises(ValueError, match="permissions must be 0600"):
+        resolve_memory_audience(settings, user_id=1, chat_id=1)
+
+
+def test_audience_settings_keep_public_and_private_sources_separate(tmp_path: Path) -> None:
+    settings = _audience_settings(tmp_path)
+    private = resolve_memory_audience(settings, user_id=934719283, chat_id=934719283)
+    public = resolve_memory_audience(settings, user_id=934719283, chat_id=-100456)
+    assert private is not None and public is not None
+
+    private_raw = build_curated_memory_settings(settings, audience=private)
+    public_raw = build_curated_memory_settings(settings, audience=public)
+    assert private_raw is not None and public_raw is not None
+    private_env = json.loads(private_raw)["env"]
+    public_env = json.loads(public_raw)["env"]
+
+    assert private_env["CCC_MEMORY_AUDIENCE"] == "private"
+    assert public_env["CCC_MEMORY_AUDIENCE"] == "shared"
+    assert private_env["CCC_MEMORY_SHARED_STATE_DIR"] == public_env["CCC_STATE_DIR"]
+    assert private_env["CCC_STATE_DIR"] != public_env["CCC_STATE_DIR"]
+    assert private_env["CCC_HONCHO_MEMORY_ENABLED"] == "0"
+    assert public_env["CCC_HONCHO_MEMORY_ENABLED"] == "0"
+    assert private_env["CCC_WIKI_MEMORY_ENABLED"] == "0"
+    assert public_env["CCC_WIKI_MEMORY_ENABLED"] == "0"
+    assert "934719283" not in private_raw
+    assert "-100456" not in public_raw
+
+
+def test_bridge_memory_rejects_shared_all_without_unsafe_legacy_override(
+    tmp_path: Path,
+) -> None:
+    settings = _handler_settings(tmp_path, "shared-all")
+    settings.bridge_unsafe_shared_all_memory = False
+    with pytest.raises(ValueError, match="shared-all is unsafe"):
+        build_curated_memory_settings(settings)
+
+    settings.bridge_unsafe_shared_all_memory = True
+    assert build_curated_memory_settings(settings) is not None
+
+    settings.bridge_memory_mode = "audience-scoped"
+    with pytest.raises(ValueError, match="cannot run with.*shared-all"):
+        resolve_memory_audience(settings, user_id=1, chat_id=1)
 
 
 class _FakeSDKClient:

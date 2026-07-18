@@ -74,6 +74,24 @@ touch "$offstate/distill.disabled"
 out="$(CCC_STATE_DIR="$offstate" bash "$LOCAL_FACTS" <<<"$PAYLOAD" 2>&1)"; rc=$?
 ok "off-switch skips and writes no facts file" '[ "$rc" = 0 ] && grep -q "disabled" <<<"$out" && [ ! -f "$offstate/memory-facts.jsonl" ]'
 
+# ---- audience privacy labels ----------------------------------------------
+audroot="$TMP/audiences"; private_scope="private-11111111111111111111111111111111"
+sharedstate="$audroot/shared/state"; privatestate="$audroot/$private_scope/state"
+mkdir -p "$sharedstate" "$privatestate"
+CCC_STATE_DIR="$sharedstate" CCC_MEMORY_AUDIENCE_SCOPED=1 CCC_MEMORY_AUDIENCE=shared \
+  CCC_MEMORY_AUDIENCE_ROOT="$audroot" CCC_MEMORY_SCOPE=shared \
+  CCC_MEMORY_FACTS_FILE="$sharedstate/memory-facts.jsonl" \
+  bash "$LOCAL_FACTS" <<<"$PAYLOAD" >/dev/null 2>&1
+CCC_STATE_DIR="$privatestate" CCC_MEMORY_AUDIENCE_SCOPED=1 CCC_MEMORY_AUDIENCE=private \
+  CCC_MEMORY_AUDIENCE_ROOT="$audroot" CCC_MEMORY_SCOPE="$private_scope" \
+  CCC_MEMORY_FACTS_FILE="$privatestate/memory-facts.jsonl" \
+  bash "$LOCAL_FACTS" <<<"$PAYLOAD" >/dev/null 2>&1
+ok "shared audience facts are explicitly public" 'jq -e "select(.privacy == \"shared\" and .audience == \"shared\")" "$sharedstate/memory-facts.jsonl" >/dev/null'
+ok "private audience facts stay private" 'jq -e "select(.privacy == \"private\" and .audience == \"private\")" "$privatestate/memory-facts.jsonl" >/dev/null'
+badstate="$TMP/bad-audience"; mkdir -p "$badstate"
+out="$(CCC_STATE_DIR="$badstate" CCC_MEMORY_AUDIENCE_SCOPED=1 CCC_MEMORY_AUDIENCE=unexpected CCC_MEMORY_AUDIENCE_ROOT="$audroot" CCC_MEMORY_SCOPE=shared bash "$LOCAL_FACTS" <<<"$PAYLOAD" 2>&1)"; rc=$?
+ok "invalid scoped audience fails closed without writing" '[ "$rc" = 0 ] && grep -q "invalid audience" <<<"$out" && [ ! -e "$badstate/memory-facts.jsonl" ]'
+
 # ---- end-to-end recall via index + search ----------------------------------
 # A distilled fact must be locally recallable next session through the hot index.
 if python3 -c "import sqlite3" 2>/dev/null; then

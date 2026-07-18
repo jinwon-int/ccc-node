@@ -81,6 +81,29 @@ class VoiceProviderConfigTests(unittest.TestCase):
             self.assertEqual(enabled.telegram_max_image_bytes, 1048576)
             self.assertEqual(enabled.telegram_max_image_pixels, 1000000)
 
+            with self.assertRaises(ValidationError):
+                module.Config(
+                    telegram_bot_token="123456:abc",
+                    CCC_TELEGRAM_SESSION_SCOPE="shared-all",
+                    CCC_BRIDGE_MEMORY_MODE="curated",
+                    _env_file=None,
+                )
+            unsafe_legacy = module.Config(
+                telegram_bot_token="123456:abc",
+                CCC_TELEGRAM_SESSION_SCOPE="shared-all",
+                CCC_BRIDGE_MEMORY_MODE="curated",
+                CCC_BRIDGE_UNSAFE_SHARED_ALL_MEMORY=True,
+                _env_file=None,
+            )
+            self.assertTrue(unsafe_legacy.bridge_unsafe_shared_all_memory)
+            audience_scoped = module.Config(
+                telegram_bot_token="123456:abc",
+                CCC_TELEGRAM_SESSION_SCOPE="shared-groups",
+                CCC_BRIDGE_MEMORY_MODE="audience-scoped",
+                _env_file=None,
+            )
+            self.assertEqual(audience_scoped.bridge_memory_mode, "audience-scoped")
+
     def test_curated_web_mcp_is_explicit_complete_and_secret_safe(self):
         with TemporaryDirectory() as td:
             module = self._load_config_module(td)

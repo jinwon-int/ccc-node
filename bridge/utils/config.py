@@ -311,13 +311,32 @@ class Config(BaseSettings):
             "senders; shared-all routes every allowed DM and group to one conversation."
         ),
     )
-    bridge_memory_mode: Literal["off", "curated"] = Field(
+    bridge_memory_mode: Literal["off", "curated", "audience-scoped"] = Field(
         default="off",
         alias="CCC_BRIDGE_MEMORY_MODE",
         description=(
             "Opt-in bridge memory lifecycle. curated loads only ccc-node memory/distill "
-            "hooks through flag settings while filesystem setting sources stay disabled."
+            "hooks through flag settings while filesystem setting sources stay disabled; "
+            "audience-scoped keeps group/channel memory shared while DM memory stays private."
         ),
+    )
+    bridge_unsafe_shared_all_memory: bool = Field(
+        default=False,
+        alias="CCC_BRIDGE_UNSAFE_SHARED_ALL_MEMORY",
+        description=(
+            "Explicit unsafe compatibility override for legacy curated memory with "
+            "shared-all. It never permits audience-scoped mode with shared-all."
+        ),
+    )
+    bridge_memory_audience_root: Optional[Path] = Field(
+        default=None,
+        alias="CCC_BRIDGE_MEMORY_AUDIENCE_ROOT",
+        description="Optional private root for audience-scoped bridge memory stores.",
+    )
+    bridge_memory_audience_key_path: Optional[Path] = Field(
+        default=None,
+        alias="CCC_BRIDGE_MEMORY_AUDIENCE_KEY_PATH",
+        description="Optional local 0600 HMAC key path for opaque DM memory scopes.",
     )
     bridge_web_mcp_mode: Literal["off", "searxng-firecrawl"] = Field(
         default="off",
@@ -1021,6 +1040,21 @@ class Config(BaseSettings):
             )
         self.bridge_searxng_url = url
         return self
+
+    @model_validator(mode="after")
+    def validate_bridge_memory_scope(self):
+        if self.telegram_session_scope != "shared-all" or self.bridge_memory_mode == "off":
+            return self
+        if (
+            self.bridge_memory_mode == "curated"
+            and self.bridge_unsafe_shared_all_memory
+        ):
+            return self
+        raise ValueError(
+            "CCC_TELEGRAM_SESSION_SCOPE=shared-all cannot be combined with bridge "
+            "memory. Use shared-groups, or set CCC_BRIDGE_UNSAFE_SHARED_ALL_MEMORY=true "
+            "only for intentional legacy curated behavior."
+        )
 
     # Logging
     log_level: str = Field("INFO", description="Logging level")

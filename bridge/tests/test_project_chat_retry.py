@@ -730,13 +730,15 @@ class ChatScopedStreamTests(unittest.IsolatedAsyncioTestCase):
         handler = project_chat.ProjectChatHandler()
         created = []
 
-        async def fake_create(user_id, model, unsolicited_callback=None):
+        async def fake_create(
+            user_id, model, unsolicited_callback=None, *, chat_id=None
+        ):
             state = project_chat._UserStreamState(
                 client=object(),
                 model=model,
                 unsolicited_callback=unsolicited_callback,
             )
-            created.append((user_id, state))
+            created.append((user_id, chat_id, state))
             return state
 
         handler._create_user_stream = fake_create
@@ -750,6 +752,9 @@ class ChatScopedStreamTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn((7, 7), handler._streams)
         self.assertIn((7, -10042), handler._streams)
         self.assertEqual(len(created), 2)
+        self.assertEqual(
+            [(row[0], row[1]) for row in created], [(7, 7), (7, -10042)]
+        )
 
 
 if __name__ == "__main__":

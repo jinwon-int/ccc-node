@@ -12,6 +12,8 @@ import shlex
 from pathlib import Path
 from typing import Any
 
+from telegram_bot.core.memory_audience import MEMORY_MODE_AUDIENCE_SCOPED, MemoryAudience
+
 
 MEMORY_MODE_OFF = "off"
 MEMORY_MODE_CURATED = "curated"
@@ -26,13 +28,33 @@ def _command(hook_dir: Path, relative: str, *args: str, background: bool = False
     return command
 
 
-def build_curated_memory_settings(settings: Any) -> str | None:
+def build_curated_memory_settings(
+    settings: Any, *, audience: MemoryAudience | None = None
+) -> str | None:
     """Return a deterministic JSON ``--settings`` value, or ``None`` when off."""
 
-    if getattr(settings, "bridge_memory_mode", MEMORY_MODE_OFF) != MEMORY_MODE_CURATED:
+    mode = getattr(settings, "bridge_memory_mode", MEMORY_MODE_OFF)
+    if mode not in {MEMORY_MODE_CURATED, MEMORY_MODE_AUDIENCE_SCOPED}:
         return None
+    session_scope = str(
+        getattr(settings, "telegram_session_scope", "per-user-chat")
+    ).strip().lower().replace("_", "-")
+    unsafe_override = bool(
+        getattr(settings, "bridge_unsafe_shared_all_memory", False)
+    )
+    if session_scope == "shared-all" and (
+        mode == MEMORY_MODE_AUDIENCE_SCOPED or not unsafe_override
+    ):
+        raise ValueError(
+            "bridge memory with shared-all is unsafe; use shared-groups or explicitly "
+            "set CCC_BRIDGE_UNSAFE_SHARED_ALL_MEMORY=true for legacy curated mode"
+        )
+    if mode == MEMORY_MODE_AUDIENCE_SCOPED and audience is None:
+        raise ValueError("audience-scoped memory requires a resolved route audience")
     hook_dir = Path(settings.claude_settings_path).expanduser().parent / "hooks"
     policy_env = dict(settings.hook_policy_environment())
+    if audience is not None:
+        policy_env.update(audience.hook_environment(settings))
     payload = {
         "env": policy_env,
         "hooks": {

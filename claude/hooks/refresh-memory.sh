@@ -18,9 +18,45 @@ WIKI_ENABLED="${CCC_WIKI_MEMORY_ENABLED:-1}"
 ISOLATION_PROFILE="${CCC_NODE_ISOLATION_PROFILE:-fleet}"
 [ "$ISOLATION_PROFILE" = "external" ] && WIKI_ENABLED=0
 PROFILE="${CCC_MEMORY_PROFILE:-honcho}"
-mkdir -p "$CACHE" "$STATE_DIR"
+AUDIENCE_SCOPED="${CCC_MEMORY_AUDIENCE_SCOPED:-0}"
+MEMORY_AUDIENCE="${CCC_MEMORY_AUDIENCE:-legacy}"
+MEMORY_SCOPE="${CCC_MEMORY_SCOPE:-}"
+AUDIENCE_ROOT="${CCC_MEMORY_AUDIENCE_ROOT:-}"
+SHARED_STATE_DIR="${CCC_MEMORY_SHARED_STATE_DIR:-}"
+SHARED_CACHE_DIR="${CCC_MEMORY_SHARED_CACHE_DIR:-}"
+SHARED_MEMDIR="${CCC_MEMORY_SHARED_DIR:-}"
+SHARED_FACTS_FILE="${CCC_MEMORY_SHARED_FACTS_FILE:-}"
+INDEX_DB="${CCC_MEMORY_INDEX_DB:-$STATE_DIR/memory-index.sqlite}"
+FACTS_FILE="${CCC_MEMORY_FACTS_FILE:-$STATE_DIR/memory-facts.jsonl}"
 
 is_disabled() { case "${1:-}" in 0|false|FALSE|off|OFF|no|NO) return 0;; *) return 1;; esac; }
+if ! is_disabled "$AUDIENCE_SCOPED"; then
+  valid=0
+  case "$MEMORY_AUDIENCE:$MEMORY_SCOPE" in
+    shared:shared) valid=1 ;;
+    private:private-*)
+      suffix="${MEMORY_SCOPE#private-}"
+      if [ "${#suffix}" = 32 ]; then
+        case "$suffix" in *[!0-9a-f]*) ;; *) valid=1 ;; esac
+      fi
+      ;;
+  esac
+  [ "$valid" = 1 ] \
+    && [ -n "$AUDIENCE_ROOT" ] \
+    && [ "$STATE_DIR" = "$AUDIENCE_ROOT/$MEMORY_SCOPE/state" ] \
+    && [ "$CACHE" = "$AUDIENCE_ROOT/$MEMORY_SCOPE/cache" ] \
+    && [ "$INDEX_DB" = "$AUDIENCE_ROOT/$MEMORY_SCOPE/state/memory-index.sqlite" ] \
+    && [ "$FACTS_FILE" = "$AUDIENCE_ROOT/$MEMORY_SCOPE/state/memory-facts.jsonl" ] \
+    && [ "$SHARED_STATE_DIR" = "$AUDIENCE_ROOT/shared/state" ] \
+    && [ "$SHARED_CACHE_DIR" = "$AUDIENCE_ROOT/shared/cache" ] \
+    && [ "$SHARED_MEMDIR" = "$AUDIENCE_ROOT/shared/memories" ] \
+    && [ "$SHARED_FACTS_FILE" = "$AUDIENCE_ROOT/shared/state/memory-facts.jsonl" ] \
+    || exit 0
+  HONCHO_ENABLED=0
+  WIKI_ENABLED=0
+fi
+umask 077
+mkdir -p "$CACHE" "$STATE_DIR"
 find_memory_tool() { # <tool-name>
   local name="$1" d
   for d in "${CCC_MEMORY_TOOLS_DIR:-}" "$HOOKDIR" "$HOOKDIR/../../scripts"; do
@@ -168,6 +204,25 @@ if [ -n "$index_script" ]; then
   fi
 fi
 record_status local_index "$index_status" 0 0 "$index_error"
+
+# A private DM can recall shared facts too. Keep the shared index warm without
+# ever importing private paths into it; every path override stays inside the
+# public audience root and both remote memory sources are disabled.
+if ! is_disabled "$AUDIENCE_SCOPED" \
+  && [ "$MEMORY_AUDIENCE" = "private" ] \
+  && [ -n "$index_script" ] \
+  && [ -n "$SHARED_STATE_DIR" ] \
+  && [ "$SHARED_STATE_DIR" != "$STATE_DIR" ]; then
+  mkdir -p "$SHARED_STATE_DIR" "$SHARED_CACHE_DIR" "$SHARED_MEMDIR" 2>/dev/null || true
+  CCC_STATE_DIR="$SHARED_STATE_DIR" \
+  CCC_MEMORY_INDEX_DB="$SHARED_STATE_DIR/memory-index.sqlite" \
+  CCC_MEMORY_CACHE_DIR="$SHARED_CACHE_DIR" \
+  CCC_MEMORY_DIR="$SHARED_MEMDIR" \
+  CCC_MEMORY_FACTS_FILE="${SHARED_FACTS_FILE:-$SHARED_STATE_DIR/memory-facts.jsonl}" \
+  CCC_WIKI_MEMORY_ENABLED=0 \
+  CCC_HONCHO_MEMORY_ENABLED=0 \
+    timeout 30 "$index_script" update >/dev/null 2>&1 || true
+fi
 
 # Merge per-source statuses into one meta document.
 jq -s '{generated_at:(now|todate), sources: map({(.source): del(.source)}) | add}' \

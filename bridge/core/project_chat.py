@@ -59,6 +59,7 @@ from telegram_bot.core.usage_meter import MODE_INTERACTIVE, UsageMeter
 from telegram_bot.memory.distill_worker import CodexDistillExtractionWorker
 from telegram_bot.core.curated_memory import build_curated_memory_settings
 from telegram_bot.core.conversation_paths import claude_project_dir_name
+from telegram_bot.core.memory_audience import resolve_memory_audience
 from telegram_bot.core.session_scope import stream_key
 from telegram_bot.core.web_mcp import build_curated_web_mcp
 
@@ -616,9 +617,13 @@ class ProjectChatHandler(
         user_id: int,
         model: Optional[str],
         unsolicited_callback: Optional[UnsolicitedCallback] = None,
+        chat_id: Optional[int] = None,
     ) -> _UserStreamState:
         state_holder: Dict[str, _UserStreamState] = {}
         bash_policy = self._bash_policy
+        memory_audience = resolve_memory_audience(
+            self._config, user_id=user_id, chat_id=chat_id
+        )
 
         async def can_use_tool(tool_name, tool_input, _context=None):
             logger.debug(
@@ -787,7 +792,9 @@ class ProjectChatHandler(
                 # model keeps its MEMORY/USER context.
                 opts["permission_mode"] = "bypassPermissions"
                 opts["setting_sources"] = []
-                curated_settings = build_curated_memory_settings(self._config)
+                curated_settings = build_curated_memory_settings(
+                    self._config, audience=memory_audience
+                )
                 if curated_settings is not None:
                     opts["settings"] = curated_settings
             else:
@@ -801,7 +808,9 @@ class ProjectChatHandler(
             # Bash is disallowed, user/project/local settings can register host
             # shell hooks independently of the model-facing Bash tool.
             opts["setting_sources"] = []
-            curated_settings = build_curated_memory_settings(self._config)
+            curated_settings = build_curated_memory_settings(
+                self._config, audience=memory_audience
+            )
             if curated_settings is not None:
                 opts["settings"] = curated_settings
             if self._execution_profile == EXECUTION_STRICT_PROJECT and bash_policy != BASH_DISABLED:
@@ -983,7 +992,12 @@ class ProjectChatHandler(
                 state = None
 
             if not state:
-                state = await self._create_user_stream(user_id, model, unsolicited_callback)
+                state = await self._create_user_stream(
+                    user_id,
+                    model,
+                    unsolicited_callback,
+                    chat_id=chat_id,
+                )
                 self._streams[key] = state
             elif unsolicited_callback is not None:
                 # Refresh the route when Telegram supplies a new Bot instance,

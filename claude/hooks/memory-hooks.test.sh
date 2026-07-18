@@ -72,6 +72,58 @@ printf 'Legacy path-with-spaces user fact\n' > "$legacy_home/.hermes/memories/US
 out="$(HOME="$legacy_home" CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$TMP/missing-memory-dir" CCC_HOOK_DIR="$ROOT/claude/hooks" CCC_MEMORY_TOOLS_DIR="$tools" CCC_LOCAL_MEMORY_ENABLED=0 CCC_WIKI_MEMORY_ENABLED=0 CCC_HONCHO_MEMORY_ENABLED=0 CCC_MEMORY_NO_REFRESH=1 bash "$ROOT/claude/hooks/load-memory.sh" SessionStart 2>&1)"; rc=$?
 ok "legacy Hermes fallback quotes HOME paths containing spaces" '[ "$rc" = 0 ] && grep -q "Legacy path-with-spaces memory fact" <<<"$out" && grep -q "Legacy path-with-spaces user fact" <<<"$out"'
 
+# Audience-scoped mode: public surfaces get only shared memory. A private DM
+# gets its own memory plus shared and private-only legacy input.
+audroot="$TMP/audiences"
+private_scope="private-00000000000000000000000000000000"
+legacy_mem="$TMP/legacy-private/memories"
+shared_mem="$audroot/shared/memories"
+private_mem="$audroot/$private_scope/memories"
+mkdir -p "$legacy_mem" "$shared_mem" "$private_mem" \
+  "$audroot/shared/state" "$audroot/shared/cache" \
+  "$audroot/$private_scope/state" "$audroot/$private_scope/cache"
+printf 'LEGACY_PRIVATE_ONLY marker\n' > "$legacy_mem/MEMORY.md"
+printf 'SHARED_PUBLIC marker\n' > "$shared_mem/MEMORY.md"
+printf 'DM_PRIVATE_ONLY marker\n' > "$private_mem/MEMORY.md"
+
+out="$(HOME="$TMP/home" \
+  CCC_MEMORY_AUDIENCE_SCOPED=1 CCC_MEMORY_AUDIENCE=shared CCC_MEMORY_SCOPE=shared \
+  CCC_MEMORY_AUDIENCE_ROOT="$audroot" \
+  CCC_STATE_DIR="$audroot/shared/state" CCC_MEMORY_CACHE_DIR="$audroot/shared/cache" \
+  CCC_RESUME_FILE="$audroot/shared/state/resume.md" \
+  CCC_MEMORY_DIR="$shared_mem" CCC_MEMORY_SHARED_STATE_DIR="$audroot/shared/state" \
+  CCC_MEMORY_SHARED_CACHE_DIR="$audroot/shared/cache" \
+  CCC_MEMORY_SHARED_DIR="$shared_mem" CCC_MEMORY_LEGACY_DIR="$legacy_mem" \
+  CCC_HOOK_DIR="$ROOT/claude/hooks" CCC_MEMORY_TOOLS_DIR="$tools" \
+  CCC_LOCAL_MEMORY_ENABLED=0 CCC_WIKI_MEMORY_ENABLED=1 CCC_HONCHO_MEMORY_ENABLED=1 \
+  CCC_MEMORY_NO_REFRESH=1 bash "$ROOT/claude/hooks/load-memory.sh" SessionStart 2>&1)"; rc=$?
+ok "shared audience injects only public memory" '[ "$rc" = 0 ] && grep -q "SHARED_PUBLIC marker" <<<"$out" && ! grep -q "LEGACY_PRIVATE_ONLY\|DM_PRIVATE_ONLY" <<<"$out"'
+ok "shared audience force-disables unscoped remote sources" '! grep -q "Cached wiki fact\|Cached honcho fact" <<<"$out" && grep -q "shared public facts only" <<<"$out"'
+
+out="$(HOME="$TMP/home" \
+  CCC_MEMORY_AUDIENCE_SCOPED=1 CCC_MEMORY_AUDIENCE=private CCC_MEMORY_SCOPE="$private_scope" \
+  CCC_MEMORY_AUDIENCE_ROOT="$audroot" \
+  CCC_STATE_DIR="$audroot/$private_scope/state" CCC_MEMORY_CACHE_DIR="$audroot/$private_scope/cache" \
+  CCC_RESUME_FILE="$audroot/$private_scope/state/resume.md" \
+  CCC_MEMORY_DIR="$private_mem" CCC_MEMORY_SHARED_STATE_DIR="$audroot/shared/state" \
+  CCC_MEMORY_SHARED_CACHE_DIR="$audroot/shared/cache" \
+  CCC_MEMORY_SHARED_DIR="$shared_mem" CCC_MEMORY_LEGACY_DIR="$legacy_mem" \
+  CCC_HOOK_DIR="$ROOT/claude/hooks" CCC_MEMORY_TOOLS_DIR="$tools" \
+  CCC_LOCAL_MEMORY_ENABLED=0 CCC_WIKI_MEMORY_ENABLED=0 CCC_HONCHO_MEMORY_ENABLED=1 \
+  CCC_MEMORY_NO_REFRESH=1 bash "$ROOT/claude/hooks/load-memory.sh" SessionStart 2>&1)"; rc=$?
+ok "private audience injects private legacy, private scoped, and shared memory" '[ "$rc" = 0 ] && grep -q "LEGACY_PRIVATE_ONLY marker" <<<"$out" && grep -q "DM_PRIVATE_ONLY marker" <<<"$out" && grep -q "SHARED_PUBLIC marker" <<<"$out"'
+ok "private audience still force-disables unscoped Honcho" 'grep -q "Honcho disabled" <<<"$out" && grep -q "private DM plus explicitly shared" <<<"$out"'
+
+out="$(HOME="$TMP/home" \
+  CCC_MEMORY_AUDIENCE_SCOPED=1 CCC_MEMORY_AUDIENCE=shared CCC_MEMORY_SCOPE=shared \
+  CCC_MEMORY_AUDIENCE_ROOT="$audroot" \
+  CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" \
+  CCC_MEMORY_SHARED_STATE_DIR="$audroot/shared/state" \
+  CCC_MEMORY_SHARED_CACHE_DIR="$audroot/shared/cache" \
+  CCC_MEMORY_SHARED_DIR="$shared_mem" CCC_HOOK_DIR="$ROOT/claude/hooks" \
+  CCC_MEMORY_NO_REFRESH=1 bash "$ROOT/claude/hooks/load-memory.sh" SessionStart 2>&1)"; rc=$?
+ok "incomplete scoped paths fail closed before global memory read" '[ "$rc" = 0 ] && grep -q "invalid audience metadata" <<<"$out" && ! grep -q "Node memory: safe fact\|Cached wiki fact\|Cached honcho fact" <<<"$out"'
+
 fakebin="$TMP/bin"; mkdir -p "$fakebin"
 cat > "$fakebin/timeout" <<'SH'
 #!/usr/bin/env bash
