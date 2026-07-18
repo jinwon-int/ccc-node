@@ -17,6 +17,7 @@
 # Env:
 #   CCC_ALLOWED_TOOLS   comma list for --allowedTools (default: Read,Grep,Glob — read-only)
 #   CCC_PERMISSION_MODE permission mode baseline (e.g. dontAsk, acceptEdits); optional
+#   CCC_MODEL           model override passed as --model; optional
 #   CCC_CLAUDE_BIN      claude binary (default: claude)
 set -uo pipefail
 
@@ -32,6 +33,7 @@ command -v "$BIN" >/dev/null 2>&1 || { echo "ccc-headless: '$BIN' not found in P
 
 args=(-p "$PROMPT" --output-format json --allowedTools "$ALLOWED")
 [ -n "${CCC_PERMISSION_MODE:-}" ] && args+=(--permission-mode "$CCC_PERMISSION_MODE")
+[ -n "${CCC_MODEL:-}" ] && args+=(--model "$CCC_MODEL")
 
 ERRF="$(mktemp "${TMPDIR:-/tmp}"/ccc-headless.XXXXXX.err)"
 trap 'rm -f "$ERRF"' EXIT

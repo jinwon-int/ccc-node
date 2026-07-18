@@ -703,17 +703,58 @@ def run_dry_plan(data):
         return {'ok': False, 'mode': 'run-dry-run-read-only', 'taskId': None, 'error': str(e)}, json_out, 1
 
 
-def headless_metadata(task, execute):
-    headless_cmd = os.environ.get('CCC_HEADLESS_CMD') or str(script_root / 'claude' / 'headless.sh')
+DEFAULT_PROMPT_TIMEOUT_SEC = 3600
+DEFAULT_COMMAND_TIMEOUT_SEC = 600
+DEFAULT_OUTPUT_MAX_BYTES = 65536
+
+
+def task_payload(task):
+    payload = task.get('payload') if isinstance(task, dict) else None
+    if not isinstance(payload, dict):
+        payload = {}
+    kind = payload.get('kind') or 'prompt'
+    default_timeout = (
+        DEFAULT_COMMAND_TIMEOUT_SEC if kind == 'command' else DEFAULT_PROMPT_TIMEOUT_SEC
+    )
+    timeout = payload.get('timeoutSec')
+    if not isinstance(timeout, int) or timeout < 1:
+        timeout = default_timeout
+    output_cap = payload.get('outputMaxBytes')
+    if not isinstance(output_cap, int) or output_cap < 1024:
+        output_cap = DEFAULT_OUTPUT_MAX_BYTES
     return {
-        'command': headless_cmd,
-        'promptBytes': len((task.get('prompt') or '').encode('utf-8')),
+        'kind': kind,
+        'argv': payload.get('argv') or [],
+        'cwd': payload.get('cwd'),
+        'model': payload.get('model'),
+        'timeoutSec': timeout,
+        'outputMaxBytes': output_cap,
+    }
+
+
+def headless_metadata(task, execute):
+    payload = task_payload(task)
+    headless_cmd = os.environ.get('CCC_HEADLESS_CMD') or str(script_root / 'claude' / 'headless.sh')
+    meta = {
+        'payloadKind': payload['kind'],
+        'timeoutSec': payload['timeoutSec'],
         'permissionMode': task.get('permissionMode') or 'default',
         'allowedTools': task.get('allowedTools', []),
         'attachMemory': task.get('attachMemory', []),
         'attachSkills': task.get('attachSkills', []),
         'execute': bool(execute),
     }
+    if payload['kind'] == 'command':
+        meta['command'] = ' '.join(payload['argv'])
+        meta['argvLen'] = len(payload['argv'])
+        meta['cwd'] = payload['cwd']
+        meta['outputMaxBytes'] = payload['outputMaxBytes']
+    else:
+        meta['command'] = headless_cmd
+        meta['promptBytes'] = len((task.get('prompt') or '').encode('utf-8'))
+        if payload['model']:
+            meta['model'] = payload['model']
+    return meta
 
 
 def mutation_flags(lock_acquire, task_write, headless_execute, push_spool_write=False, history_append=False):
@@ -805,8 +846,37 @@ def short_text(text, limit=4000):
     return text if len(text) <= limit else text[:limit] + f'\n[truncated {len(text)-limit} chars]'
 
 
+def _cap_bytes(text, cap):
+    raw = (text or '').encode('utf-8', errors='replace')
+    if len(raw) <= cap:
+        return text or ''
+    return raw[:cap].decode('utf-8', errors='ignore') + '\n… [truncated by outputMaxBytes]'
+
+
 def run_headless(task):
+    """Execute the task payload: an agent prompt run or a deterministic command."""
     meta = headless_metadata(task, execute=True)
+    payload = task_payload(task)
+    if payload['kind'] == 'command':
+        argv = payload['argv']
+        if not argv:
+            raise ValueError("payload kind 'command' requires argv")
+        try:
+            proc = subprocess.run(
+                argv, text=True, input='', capture_output=True,
+                cwd=payload['cwd'] or None, timeout=payload['timeoutSec'],
+            )
+        except subprocess.TimeoutExpired:
+            return {**meta, 'exitCode': 124, 'stdout': '',
+                    'stderr': f"command timed out after {payload['timeoutSec']}s",
+                    'timedOut': True}
+        cap = payload['outputMaxBytes']
+        return {
+            **meta,
+            'exitCode': proc.returncode,
+            'stdout': short_text(_cap_bytes(proc.stdout, cap)),
+            'stderr': short_text(_cap_bytes(proc.stderr, cap)),
+        }
     cmd = shlex.split(meta['command'])
     if not cmd:
         raise ValueError('CCC_HEADLESS_CMD resolved to an empty command')
@@ -817,8 +887,18 @@ def run_headless(task):
     perm = task.get('permissionMode') or 'default'
     if perm != 'default':
         env['CCC_PERMISSION_MODE'] = perm
+    if payload['model']:
+        env['CCC_MODEL'] = payload['model']
     prompt = task.get('prompt') or ''
-    proc = subprocess.run(cmd + [prompt], text=True, input='', capture_output=True, env=env)
+    try:
+        proc = subprocess.run(
+            cmd + [prompt], text=True, input='', capture_output=True, env=env,
+            timeout=payload['timeoutSec'],
+        )
+    except subprocess.TimeoutExpired:
+        return {**meta, 'exitCode': 124, 'stdout': '',
+                'stderr': f"prompt run timed out after {payload['timeoutSec']}s",
+                'timedOut': True}
     return {
         **meta,
         'exitCode': proc.returncode,
@@ -958,7 +1038,12 @@ def run_execute(data, task_id, at_value, as_json):
         try:
             headless = run_headless(task)
             ok = headless.get('exitCode') == 0
-            status = 'success' if ok else 'failed'
+            if ok:
+                status = 'success'
+            elif headless.get('timedOut'):
+                status = 'timeout'
+            else:
+                status = 'failed'
             rc = 0 if ok else 1
         except Exception as e:
             headless = {
