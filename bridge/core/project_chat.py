@@ -58,6 +58,7 @@ from telegram_bot.core.usage import (
 from telegram_bot.core.usage_meter import MODE_INTERACTIVE, UsageMeter
 from telegram_bot.memory.distill_worker import CodexDistillExtractionWorker
 from telegram_bot.core.curated_memory import build_curated_memory_settings
+from telegram_bot.core.conversation_paths import claude_project_dir_name
 from telegram_bot.core.session_scope import stream_key
 from telegram_bot.core.web_mcp import build_curated_web_mcp
 
@@ -169,7 +170,7 @@ class ProjectChatHandler(
             os.environ.get("PROJECT_ROOT", Path.cwd()),
         )
         self.project_root = Path(root_value).resolve()
-        project_dir_name = str(self.project_root).replace("/", "-").replace("_", "-")
+        project_dir_name = claude_project_dir_name(self.project_root)
         self.conversations_dir = Path.home() / ".claude" / "projects" / project_dir_name
         profile = (
             EXECUTION_PROFILE
