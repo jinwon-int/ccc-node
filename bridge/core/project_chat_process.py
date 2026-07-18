@@ -25,6 +25,7 @@ from telegram_bot.core.agent_runtime import (
 from telegram_bot.core.heartbeat import tool_label
 from telegram_bot.core.project_chat_types import (
     AgentApprovalCallback,
+    AgentSessionEntry,
     ChatResponse,
     InterimMessageCallback,
     PermissionCallback,
@@ -443,25 +444,20 @@ class ProjectChatProcessMixin:
             progress_terminal_state = TASK_FAILED
             generation = self._next_agent_generation(key)
             self._agent_active_generations[key] = generation
-            session = self._agent_sessions.get(key)
+            entry = self._agent_sessions.get(key)
+            session = entry.session if entry is not None else None
             if new_session or (
-                session is not None
+                entry is not None
                 and (
-                    (session_id is not None and session.session_id != session_id)
-                    or self._agent_session_models.get(key) != model
-                    or self._agent_session_efforts.get(key) != effort
-                    or self._agent_session_approval_policies.get(key) != approval_policy
-                    or self._agent_session_approvals_reviewers.get(key)
-                    != approvals_reviewer
-                    or self._agent_session_sandbox_policies.get(key) != sandbox_policy
+                    (session_id is not None and entry.session.session_id != session_id)
+                    or entry.model != model
+                    or entry.effort != effort
+                    or entry.approval_policy != approval_policy
+                    or entry.approvals_reviewer != approvals_reviewer
+                    or entry.sandbox_policy != sandbox_policy
                 )
             ):
                 self._agent_sessions.pop(key, None)
-                self._agent_session_models.pop(key, None)
-                self._agent_session_efforts.pop(key, None)
-                self._agent_session_approval_policies.pop(key, None)
-                self._agent_session_approvals_reviewers.pop(key, None)
-                self._agent_session_sandbox_policies.pop(key, None)
                 session = None
             try:
                 if session is None:
@@ -476,12 +472,14 @@ class ProjectChatProcessMixin:
                             sandbox_policy=sandbox_policy,
                         )
                     )
-                    self._agent_sessions[key] = session
-                    self._agent_session_models[key] = model
-                    self._agent_session_efforts[key] = effort
-                    self._agent_session_approval_policies[key] = approval_policy
-                    self._agent_session_approvals_reviewers[key] = approvals_reviewer
-                    self._agent_session_sandbox_policies[key] = sandbox_policy
+                    self._agent_sessions[key] = AgentSessionEntry(
+                        session=session,
+                        model=model,
+                        effort=effort,
+                        approval_policy=approval_policy,
+                        approvals_reviewer=approvals_reviewer,
+                        sandbox_policy=sandbox_policy,
+                    )
 
                 self._agent_active_sessions[key] = session
                 self._agent_started_at[key] = asyncio.get_running_loop().time()
@@ -677,13 +675,7 @@ class ProjectChatProcessMixin:
 
                 if stalled:
                     progress_terminal_state = TASK_COMPLETED
-                    if self._agent_sessions.get(key) is session:
-                        self._agent_sessions.pop(key, None)
-                        self._agent_session_models.pop(key, None)
-                        self._agent_session_efforts.pop(key, None)
-                        self._agent_session_approval_policies.pop(key, None)
-                        self._agent_session_approvals_reviewers.pop(key, None)
-                        self._agent_session_sandbox_policies.pop(key, None)
+                    self._drop_agent_session(key, session)
                     await self._interrupt_agent_session(session)
                     final_streamed = False
                     if streaming_handler:
@@ -720,13 +712,7 @@ class ProjectChatProcessMixin:
                 content = content or "(No response)"
                 if terminal_error is not None:
                     progress_terminal_state = TASK_FAILED
-                    if self._agent_sessions.get(key) is session:
-                        self._agent_sessions.pop(key, None)
-                        self._agent_session_models.pop(key, None)
-                        self._agent_session_efforts.pop(key, None)
-                        self._agent_session_approval_policies.pop(key, None)
-                        self._agent_session_approvals_reviewers.pop(key, None)
-                        self._agent_session_sandbox_policies.pop(key, None)
+                    self._drop_agent_session(key, session)
                     return ChatResponse(
                         content=f"❌ Processing failed: {terminal_error.message}",
                         success=False,
@@ -745,13 +731,8 @@ class ProjectChatProcessMixin:
                 )
             except TimeoutError:
                 progress_terminal_state = TASK_TIMEOUT
-                if session is not None and self._agent_sessions.get(key) is session:
-                    self._agent_sessions.pop(key, None)
-                    self._agent_session_models.pop(key, None)
-                    self._agent_session_efforts.pop(key, None)
-                    self._agent_session_approval_policies.pop(key, None)
-                    self._agent_session_approvals_reviewers.pop(key, None)
-                    self._agent_session_sandbox_policies.pop(key, None)
+                if session is not None:
+                    self._drop_agent_session(key, session)
                 if session is not None:
                     await self._interrupt_agent_session(session)
                 await self._cancel_agent_streaming(
@@ -774,13 +755,8 @@ class ProjectChatProcessMixin:
                 raise
             except Exception as exc:
                 progress_terminal_state = TASK_FAILED
-                if session is not None and self._agent_sessions.get(key) is session:
-                    self._agent_sessions.pop(key, None)
-                    self._agent_session_models.pop(key, None)
-                    self._agent_session_efforts.pop(key, None)
-                    self._agent_session_approval_policies.pop(key, None)
-                    self._agent_session_approvals_reviewers.pop(key, None)
-                    self._agent_session_sandbox_policies.pop(key, None)
+                if session is not None:
+                    self._drop_agent_session(key, session)
                 await self._cancel_agent_streaming(
                     streaming_handler, context="returning an agent error"
                 )
