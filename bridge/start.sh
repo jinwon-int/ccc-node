@@ -934,7 +934,9 @@ Environment=HOME=${HOME}
 Environment=PATH=${svc_path}
 ${proxy_env}
 ExecStart=/bin/bash ${SCRIPT_DIR}/start.sh --path ${PROJECT_ROOT}
-Restart=on-failure
+# Recover when the bridge handles a direct SIGTERM as a clean exit. An explicit
+# systemctl stop still suppresses restart, preserving operator stop semantics.
+Restart=always
 RestartSec=3
 TimeoutStopSec=20
 
