@@ -15,3 +15,11 @@
 #
 # Remove this file (or any weaker ownership) to revert the node to strict.
 operational-relax
+
+# OPTIONAL — operator-trust (operator decision 2026-07-18): uncomment on nodes
+# where the sole operator wants mid-tier textual gates demoted from DENY to
+# run-and-audit: non-recursive literal-path rm anywhere, and read-only
+# inspection of operator config files. The catastrophic set listed above is
+# enforced regardless, including operator-config WRITES — the agent can never
+# loosen its own guard, trust or not.
+# operator-trust
