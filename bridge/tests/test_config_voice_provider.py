@@ -104,6 +104,24 @@ class VoiceProviderConfigTests(unittest.TestCase):
             )
             self.assertEqual(audience_scoped.bridge_memory_mode, "audience-scoped")
 
+            # #581: the Codex provider has no audience-scoped CODEX_HOME, so
+            # the leaking combination must fail closed at config load.
+            with self.assertRaises(ValidationError):
+                module.Config(
+                    telegram_bot_token="123456:abc",
+                    CCC_TELEGRAM_SESSION_SCOPE="shared-groups",
+                    CCC_BRIDGE_MEMORY_MODE="audience-scoped",
+                    CCC_AGENT_PROVIDER="codex",
+                    _env_file=None,
+                )
+            codex_curated = module.Config(
+                telegram_bot_token="123456:abc",
+                CCC_BRIDGE_MEMORY_MODE="curated",
+                CCC_AGENT_PROVIDER="codex",
+                _env_file=None,
+            )
+            self.assertEqual(codex_curated.agent_provider, "codex")
+
     def test_curated_web_mcp_is_explicit_complete_and_secret_safe(self):
         with TemporaryDirectory() as td:
             module = self._load_config_module(td)

@@ -37,3 +37,24 @@ def assert_memory_scope_safe(
     if mode == MEMORY_MODE_CURATED and unsafe_shared_all_override:
         return
     raise ValueError(_SHARED_ALL_ERROR)
+
+
+_CODEX_AUDIENCE_ERROR = (
+    "audience-scoped memory cannot run with the Codex provider (#581): "
+    "CODEX_HOME/AGENTS.md is a single global persistent store with no "
+    "per-audience separation, so DM-private memory could reach "
+    "shared-audience Codex runs. Use the Claude provider, or keep "
+    "CCC_BRIDGE_MEMORY_MODE off/curated for Codex nodes."
+)
+
+
+def assert_memory_provider_safe(mode: str, provider: str) -> None:
+    """Raise ValueError for provider/memory-mode combinations that leak.
+
+    The Codex launch surface has no audience-scoped memory store yet
+    (jinwon-int/ccc-node#581); refusing the configuration at load time keeps
+    the #580 isolation guarantee intact until CODEX_HOME is scoped.
+    """
+
+    if mode == MEMORY_MODE_AUDIENCE_SCOPED and str(provider or "").strip().lower() == "codex":
+        raise ValueError(_CODEX_AUDIENCE_ERROR)
