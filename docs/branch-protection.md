@@ -40,3 +40,23 @@ After explicit operator approval, the low-risk next live change is:
 
 Do **not** combine that change with review-count increases, ruleset rewrites, or
 visibility/ownership changes unless separately approved.
+
+## 2026-07-18 — required-review requirement removed (operator decision)
+
+With explicit operator approval (single-operator fleet; review latency was the
+sole merge bottleneck across the 2026-07-17/18 hardening series), the live
+`main` protection was changed:
+
+- action: `DELETE /branches/main/protection/required_pull_request_reviews` —
+  PR review approval is no longer required to merge.
+- preserved (no-op boundary): all 6 required status checks, strict up-to-date
+  branches, and admin enforcement — merges still require full CI green on the
+  exact head, admins included.
+- consequence: independent review (seoseo-ai) remains AVAILABLE and welcome —
+  reviewers can still comment/approve/request changes — but a standing
+  `CHANGES_REQUESTED` no longer hard-blocks a merge. The PR-first flow itself
+  is unchanged: no direct pushes to `main`.
+- rollback: re-create `required_pull_request_reviews` with
+  `required_approving_review_count=1`, stale-review dismissal, and code-owner
+  reviews, per the section above. Do not raise the count above `1` while only
+  two write-capable maintainers exist.
