@@ -158,8 +158,11 @@ if hook_dir.exists():
 else:
     add('경고', 'hook permissions', 'hook directory not present', 'node may not be installed as ccc-node')
 
-# Settings allowlist posture. Broad Bash(*) is acceptable only with the semantic
-# guard present. Native denies are a defense-in-depth backstop, not a replacement.
+# Settings allowlist posture. Operator decision TM-1306 (2026-07-18): the fleet
+# runs the NATIVE Claude Code posture — no semantic PreToolUse guard, no native
+# permissions.deny backstop. Remaining safety layers are behavioral policy,
+# the bridge single-owner allowlist, and the audit trail. A guard hook or deny
+# entries still present indicate a pre-TM-1306 install that needs setup rerun.
 settings = claude_dir / 'settings.json'
 if settings.exists():
     try:
@@ -169,18 +172,10 @@ if settings.exists():
         hooks = data.get('hooks', {}) or {}
         has_guard = any('guard.sh' in h.get('command', '') for ev in hooks.values() for group in ([ev] if isinstance(ev, dict) else ev) for h in group.get('hooks', []))
         broad = any(x in allow for x in ['Bash(*)', 'Read(*)', 'Write(*)', 'Edit(*)', 'MultiEdit(*)'])
-        secret_deny = any('.env' in x or '.credentials.json' in x or 'id_rsa' in x for x in deny)
-        release_deny = any('npm publish' in x or 'gh release create' in x for x in deny)
-        catastrophic_deny = (
-            'Bash(rm -rf /:*)' in deny
-            and 'Bash(git push --force origin main:*)' in deny
-        )
-        if broad and has_guard and secret_deny and release_deny and catastrophic_deny:
-            add('정상', 'settings allowlist', 'broad allowlist is paired with the semantic guard and native deny backstop', 'none')
-        elif broad and not has_guard:
-            add('위험', 'settings allowlist', 'broad allowlist without guard hook', 'restore guard hook or switch install mode')
-        elif broad and not catastrophic_deny:
-            add('위험', 'settings allowlist', 'guard present but native catastrophic deny backstop is incomplete', 'restore permissions.deny from claude/settings.base.json')
+        if has_guard or deny:
+            add('경고', 'settings allowlist', 'legacy enforcement remnants present (guard hook and/or native deny entries)', 'rerun setup.sh to apply the native posture (TM-1306)')
+        elif broad:
+            add('정상', 'settings allowlist', 'native posture: broad allowlist without semantic guard or native deny (operator decision TM-1306)', 'none')
         else:
             add('경고', 'settings allowlist', 'nonstandard permissions posture', 'review against ccc-node policy')
     except Exception:

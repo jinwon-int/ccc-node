@@ -245,10 +245,13 @@ ok "setup neutralizes bypassPermissions default when Claude runs as root" \
   'jq -e ".permissions.defaultMode != \"bypassPermissions\"" "$root_claude/settings.json" >/dev/null'
 ok "root-neutralized settings.json still parses with its permissions block intact" \
   'jq -e ".permissions.allow | type == \"array\"" "$root_claude/settings.json" >/dev/null'
-ok "root-neutralized settings retain the native catastrophic deny backstop" \
-  'jq -e '\''(.permissions.deny // []) as $d | ($d | any(. == "Bash(rm -rf /:*)")) and ($d | any(. == "Bash(git push --force origin main:*)"))'\'' "$root_claude/settings.json" >/dev/null'
-ok "root install retains the semantic PreToolUse guard" \
-  '[ -x "$root_claude/hooks/guard.sh" ] && jq -e '\''[.hooks.PreToolUse[].hooks[].command] | any(contains("guard.sh"))'\'' "$root_claude/settings.json" >/dev/null'
+# TM-1306 native posture: installed settings must carry NO native deny
+# backstop and NO PreToolUse guard wiring (operator decision — the semantic
+# guard was removed from the enforcement path).
+ok "root-neutralized settings carry no native deny backstop (TM-1306)" \
+  'jq -e '\''(.permissions.deny // []) | length == 0'\'' "$root_claude/settings.json" >/dev/null'
+ok "root install wires no PreToolUse guard (TM-1306)" \
+  'jq -e '\''(.hooks.PreToolUse // []) | length == 0'\'' "$root_claude/settings.json" >/dev/null'
 ok "fresh root install seeds operational-relax by default" \
   '[ -f "$TMP/root-guard-profile" ] && [ ! -L "$TMP/root-guard-profile" ] && grep -qx "operational-relax" "$TMP/root-guard-profile" && [ "$(stat -c %a "$TMP/root-guard-profile")" = 644 ]'
 
