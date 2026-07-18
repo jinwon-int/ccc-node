@@ -588,6 +588,16 @@ def _operational_relax_enabled():
     repo-visibility, host power-down (poweroff/halt), and operator-config
     writes — is enforced regardless and never reads this profile.
     """
+    return _guard_profile_has("operational-relax")
+
+
+def _guard_profile_has(token):
+    """Whether the operator-owned guard profile carries ``token``.
+
+    Same fail-closed integrity contract as the original operational-relax
+    reader (root-owned regular non-writable file, strict-only env seam); the
+    token grammar is one bare token per line with ``#`` comments.
+    """
     if os.environ.get("CCC_GUARD_ASSUME_STRICT") == "1":
         return False                         # strict-only seam: can only tighten
     try:
@@ -606,9 +616,20 @@ def _operational_relax_enabled():
     except OSError:
         return False
     for line in data.splitlines():
-        if line.split("#", 1)[0].strip() == "operational-relax":
+        if line.split("#", 1)[0].strip() == token:
             return True
     return False
+
+
+def _operator_trust_enabled():
+    """Operator-trust profile (operator decision 2026-07-18): the operator is
+    the only human principal on this node, so mid-tier textual gates demote
+    from DENY to run-and-audit. The catastrophic backstop — recursive/wholesale
+    rm of protected roots, secret exfil, protected-branch force-push, DB
+    destructive/migrate/replay, release/publish, repo-visibility, host
+    power-down, and operator-config WRITES (the agent must never loosen its own
+    guard) — is enforced regardless and never reads this token."""
+    return _guard_profile_has("operator-trust")
 
 
 # --------------------------------------------------------------------------- #
@@ -823,6 +844,7 @@ def evaluate(tool, cmd, fpath, tool_input_raw):
     managed = [stmt_remote_target_managed(st, entries) for st in statements_raw]
 
     relax = _operational_relax_enabled()      # operator-owned operational-relax profile
+    trust = _operator_trust_enabled()         # operator-owned operator-trust profile
     _gate_git(c, cn, toks)                    # force-push / history-rewrite
     _gate_broker_reconcile(c, cn)             # immutable absolute wrapper entrypoint
     _service_lifecycle(
@@ -834,11 +856,11 @@ def evaluate(tool, cmd, fpath, tool_input_raw):
         relax=relax,
     )
     _gate_host_lifecycle(c, cn, statements, managed, relax=relax)
-    _gate_operator_config(c, cn)              # self-update.* / managed-nodes.allow writes
+    _gate_operator_config(c, cn, statements, trust)  # operator-config writes (reads relax under trust)
     _gate_db(c)                               # destructive / migrate / replay
     _gate_release(c, cn, toks)                # publish / tag-push / repo visibility
     _gate_secret_exfil(c, statements, managed)
-    _gate_rm(c, statements, managed)
+    _gate_rm(c, statements, managed, trust)
 
 
 def _gate_git(c, cn, toks):
@@ -916,11 +938,35 @@ def _gate_host_lifecycle(c, cn, statements, managed, relax=False):
         _deny("host-lifecycle", "operator_approval_gated", c)
 
 
-def _gate_operator_config(c, cn):
-    if re.search(r"self-update\.(services|repo)|managed-(nodes|services)\.allow"
-                 r"|ccc-node/guard-profile", cn) \
-            and not _is_readonly_config_command(cn):
-        _deny("self-update-config", "operator_approval_gated", c)
+_OPERATOR_CONFIG_MENTION_RE = re.compile(
+    r"self-update\.(services|repo)|managed-(nodes|services)\.allow"
+    r"|ccc-node/guard-profile")
+# Read-only inspection of operator config under operator-trust: verbs that only
+# read; the argument charset excludes redirects/substitutions so a write can
+# never hide inside a "read".
+_READONLY_CONFIG_STMT_RE = re.compile(
+    r"\s*(ls|cat|grep|stat|test|wc|sha256sum|head|tail|file|md5sum)"
+    r"(\s+-[A-Za-z0-9_-]*)*(\s+[^;&|<>$`()]+)*\s*")
+
+
+def _gate_operator_config(c, cn, statements=(), trust=False):
+    if not _OPERATOR_CONFIG_MENTION_RE.search(cn):
+        return
+    if _is_readonly_config_command(cn):
+        return
+    if trust and statements:
+        # Operator-trust (operator decision 2026-07-18): READS of operator
+        # config demote to run-and-audit. Deny only when some statement both
+        # mentions a config path and is not a pure read-only command; WRITES
+        # (redirects, tee, sed -i, cp/mv, chmod, rm, Edit/Write tools) still
+        # fail the read-only shape and stay denied.
+        if not any(
+            _OPERATOR_CONFIG_MENTION_RE.search(st)
+            and not _READONLY_CONFIG_STMT_RE.fullmatch(st)
+            for st in statements
+        ):
+            return
+    _deny("self-update-config", "operator_approval_gated", c)
 
 
 def _gate_db(c):
@@ -1007,13 +1053,60 @@ def _rm_is_backup_prune(st):
     return True
 
 
-def _gate_rm(c, statements, managed):
-    # Relaxed only when the rm is inside a managed-remote statement (the owned node
-    # governs its own filesystem) or is an explicit .bak-artifact pruning; a local
-    # catastrophic rm always denies.
+_RM_TRUST_LONG_FLAGS = {"--force", "--verbose", "--interactive"}
+_RM_PROTECTED_WHOLESALE = {"", "/root", "/etc", "/var", "/usr", "/bin", "/lib"}
+
+
+def _rm_is_trusted_single(st):
+    """Under operator-trust: a NON-recursive rm of literal explicit paths
+    demotes to run-and-audit (operator decision 2026-07-18). The catastrophic
+    core stays denied regardless: recursive/dir flags, expansion-capable
+    operands ($/`/~/braces), a protected root itself, or its immediate
+    wholesale ``*`` glob."""
+    try:
+        toks = shlex.split(st)
+    except ValueError:
+        return False
+    if not toks or toks[0] != "rm":
+        return False
+    operands = []
+    for t in toks[1:]:
+        if t == "--":
+            continue
+        if t.startswith("--"):
+            if t not in _RM_TRUST_LONG_FLAGS:
+                return False          # --recursive/--dir/unknown stay gated
+            continue
+        if t.startswith("-") and t != "-":
+            if any(ch in "rRd" for ch in t[1:]):
+                return False          # -r/-R/-d (also inside -rf) stay gated
+            continue
+        operands.append(t)
+    if not operands:
+        return False
+    for op in operands:
+        if not _RM_LITERAL_OPERAND_RE.fullmatch(op):
+            return False              # $VAR/`cmd`/~/{} operands stay gated
+        norm = op.rstrip("/")
+        if norm in _RM_PROTECTED_WHOLESALE:
+            return False              # the protected root itself stays gated
+        parent, _, base = norm.rpartition("/")
+        if base in ("*", "**") and parent.rstrip("/") in _RM_PROTECTED_WHOLESALE:
+            return False              # rm /root/* wholesale stays gated
+    return True
+
+
+def _gate_rm(c, statements, managed, trust=False):
+    # Relaxed when the rm is inside a managed-remote statement (the owned node
+    # governs its own filesystem), is an explicit .bak-artifact pruning, or —
+    # under the operator-trust profile — is a non-recursive literal-path rm.
+    # The catastrophic core (recursive/wholesale protected-root removal)
+    # always denies.
     for st, mgd in zip(statements, managed):
         if not mgd and _RM_RE.search(st):
             if _rm_is_backup_prune(st):
+                continue
+            if trust and _rm_is_trusted_single(st):
                 continue
             _deny("rm-catastrophic", "operator_approval_gated", c)
 
