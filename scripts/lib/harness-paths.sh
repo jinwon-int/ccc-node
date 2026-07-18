@@ -32,13 +32,6 @@ ccc_validate_setup_roots() {
   python3 "$_CCC_HARNESS_PATHS_PY" setup-roots "$@"
 }
 
-ccc_validate_setup_guard_profile() {
-  _ccc_require_path_validator \
-    "ERROR: python3 is required to validate the guard profile path" \
-    "ERROR: shared guard profile path validator is missing" || return 1
-  python3 "$_CCC_HARNESS_PATHS_PY" setup-guard-profile "$@"
-}
-
 ccc_validate_self_update_roots() {
   _ccc_require_path_validator \
     "self-update: python3 is required to validate runtime paths" \

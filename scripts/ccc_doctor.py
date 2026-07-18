@@ -29,7 +29,6 @@ HOOK_FILES = [
     "hooks/load-tools.sh",
     "hooks/checkpoint.sh",
     "hooks/statusline.sh",
-    "hooks/guard.sh",
     "hooks/audit.sh",
     "hooks/redact.sh",
     "hooks/notify.sh",

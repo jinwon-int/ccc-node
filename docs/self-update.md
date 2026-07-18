@@ -2,8 +2,8 @@
 
 A fleet node must be able to pick up ccc-node updates and restart its own
 services. Direct service control (`restart`/`start`/`reload`/`stop`/`kill`) of
-broker/Gateway/worker units is allowed by guard.sh (operator-approved
-relaxation). This script is still the **pre-approved, audited way to do it as one
+broker/Gateway/worker units is autonomous behavioral policy on a fleet node.
+This script is still the **pre-approved, audited way to do it as one
 atomic step** — pull → `setup.sh` → restart the operator-allowlisted set with
 fail-closed preconditions and rollback — which an agent may invoke as a whole
 rather than composing the steps ad hoc.
@@ -38,13 +38,12 @@ rather than composing the steps ad hoc.
   pressure at 2am. An agent can trigger the whole audited pipeline but cannot
   compose its steps differently.
 - The **blast radius** is bounded by `~/.claude/self-update.services` (one
-  systemd unit per line, `#` comments). guard.sh denies agent writes to this
-  file (`self-update-config` gate) — Edit/Write tools *and* shell redirection /
-  copy tools — while reads stay allowed. Only the operator decides which units
-  the procedure may ever restart.
+  systemd unit per line, `#` comments). This file is operator-owned — the agent
+  must not edit it — so only the operator decides which units the procedure may
+  ever restart.
 - Direct `systemctl restart|start|reload|stop|kill <broker|gateway|worker|…>` is
-  allowed (operator-approved relaxation — a node manages its own service lifecycle
-  so it can update and recover unattended). This bundled procedure remains the
+  autonomous behavioral policy — a node manages its own service lifecycle
+  so it can update and recover unattended. This bundled procedure remains the
   audited way to do "update **and** restart the allowlisted set" atomically.
 
 ## Operator setup (once per node)

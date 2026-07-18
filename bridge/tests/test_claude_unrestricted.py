@@ -85,7 +85,7 @@ class ClaudeUnrestrictedWiringTest(unittest.TestCase):
     def test_owner_operator_flag_reaches_codex_parity(self) -> None:
         options = _build_options(profile="owner-operator", unrestricted=True)
         self.assertEqual(options.permission_mode, "bypassPermissions")
-        # No host settings chain => the PreToolUse guard hook is not loaded.
+        # No host settings chain => the node's host hooks/settings are not loaded.
         self.assertEqual(options.setting_sources, [])
         # No OS sandbox: host-capable like Codex dangerFullAccess.
         self.assertIsNone(options.sandbox)

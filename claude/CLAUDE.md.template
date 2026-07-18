@@ -51,68 +51,44 @@ The SessionStart hook (`~/.claude/hooks/load-memory.sh`) auto-injects a snapshot
 secrets · releases · DB/replay/migration/prune · manual ACKs · emergency hotfixes · provider sends/canaries · host power-down (poweroff/halt/shutdown-without-`-r`, any host) · reboot of an unlisted remote host · non-fleet service lifecycle and config-changing verbs · cross-broker mutations (unless pre-approved in-task).
 
 Claude Code's native permission mode is `bypassPermissions`, the Claude
-equivalent of an unrestricted sandbox with no native approval prompts. The
-ccc-node PreToolUse guard below remains an independent, fail-closed boundary
-for the Fresh Approval Required set. Nodes whose Claude runs as root are the
-exception: Claude Code refuses `bypassPermissions` under root/sudo, so
-`setup.sh` drops the default there and the guard alone is the boundary (run
-Claude as a non-root user to restore the no-prompt default).
+equivalent of an unrestricted sandbox with no native approval prompts. This node
+runs that native Claude Code posture: the Fresh Approval Required set is
+**behavioral policy you self-enforce from this file**, not a hook-enforced
+boundary. Nodes whose Claude runs as root are the exception to the no-prompt
+default: Claude Code natively refuses `bypassPermissions` under root/sudo, so
+`setup.sh` drops the default there and Claude falls back to its normal prompting
+mode (run Claude as a non-root user to restore the no-prompt default).
 
-Service-control boundary (enforced by `guard.py` behind the `guard.sh` shim):
-- **Operational-relax profile** — fresh root-run `setup.sh` atomically installs
-  a root-owned `/etc/ccc-node/guard-profile` containing `operational-relax`. ALL
-  service/container/orchestrator lifecycle (systemctl/service/pm2/docker/podman/
-  kubectl, local or toward any peer) and reboot of any host are autonomous on
-  this node. It never relaxes the catastrophic set below (`rm -rf /`, secret
-  exfil, protected force-push, DB destructive/migrate, release/publish,
-  poweroff/halt, including a mixed reboot/down remote body). Use
-  `--strict-guard` to opt out on a fresh root install. Existing profile-less
-  nodes remain strict on routine updates and may opt in later with
-  `--operational-relax`; existing profiles are never overwritten. An
-  unprivileged agent cannot enable it
-  (root-owned); on a root-run node this hook is policy, not an OS privilege
-  boundary. See `docs/service-control.md`.
+Service-control autonomy policy (behavioral — self-enforced, no longer a hook):
+- **Service/container/orchestrator lifecycle** (systemctl/service/pm2/docker/
+  podman/kubectl, local or toward any peer) and **reboot** (`reboot`/`shutdown -r`,
+  recoverable) are autonomous on this node and its operator-managed peers. This
+  never extends to the catastrophic set (`rm -rf /`, secret exfil, protected
+  force-push, DB destructive/migrate, release/publish, poweroff/halt, including a
+  mixed reboot/down remote body), which always requires fresh approval.
 - **Fleet-service lifecycle** — start/restart/reload/stop/kill of
   `a2a`/`hermes`/`openclaw`/`broker`/`gateway`/`worker` units and
   `ccc-telegram-bridge` — is autonomous, locally or toward a peer node
   (`ssh <node> systemctl restart <unit>`).
-- **Managed-node operations** to hosts you list in `~/.claude/managed-nodes.allow`
-  are autonomous: secret/key deployment, remote cleanup, remote service config
-  verbs (enable/daemon-reload), and reboot of that host. The allowlist is
-  operator-owned (agents cannot edit it). With no allowlist, only the fleet-service
-  relaxation applies.
-- **Reboot** (`reboot`/`shutdown -r`, recoverable) is autonomous on the LOCAL node
-  and managed nodes; `poweroff`/`halt` (node stays down) and reboot of an unlisted
-  host stay fresh-approval.
-- **Local self-managed apps**: list this node's own non-fleet units/containers in
-  `~/.claude/managed-services.allow` and their `systemctl`/`pm2`/`docker` lifecycle
-  is autonomous (system services like sshd/ufw/nginx stay gated). Operator-owned.
+- **Managed-node operations** to operator-designated hosts (secret/key
+  deployment, remote cleanup, remote service config verbs, reboot of that host)
+  are autonomous.
+- **Local self-managed apps** — this node's own non-fleet units/containers — may
+  be lifecycle-managed autonomously (system services like sshd/ufw/nginx stay
+  fresh-approval).
 - **Broker Compose reconciliation** — prefer the installed
   `/usr/local/libexec/ccc-broker-reconcile <service>...` wrapper (root-owned; it
   encapsulates the fixed runbook — project `cd`,
   `A2A_BROKER_REVISION=$(git rev-parse HEAD)`, `docker compose up -d
-  <allowlisted services>`). The guard accepts only this direct absolute
-  entrypoint with exact service tokens; bare/PATH-shadowed, shell-wrapped,
-  compounded, and daemon/Compose-env-overridden forms stay gated. New runbook
-  needs go into the reviewed wrapper, NOT into new inline Compose grammar.
-  Read-only verification
-  (`docker inspect`, bounded `sleep`, loopback-only `curl`) is done separately.
-  During migration the guard still accepts the legacy inline shape — direct
-  `docker compose up -d [services...]` with the same fixed companions (literal
-  `cd`, optional rollback `docker tag`, one provenance
-  `export A2A_BROKER_REVISION=$(git rev-parse HEAD)`) — but that grammar is
-  being retired in favor of the wrapper. Arbitrary compound commands, any other
-  `$(...)`/backtick substitution, multiple reconciliations, and other Compose
-  lifecycle/indirect forms stay gated. None of this waives the fresh in-task
-  approval required for a cross-broker mutation.
-- Still fresh-approval: non-fleet units on unmanaged hosts, local config-changing
-  verbs, other docker/podman/kubectl lifecycle, host power-down, and — regardless
-  of host — force-push to protected branches, release/publish, DB
-  destructive/migrate.
+  <allowlisted services>`). New runbook needs go into the reviewed wrapper, NOT
+  into ad-hoc inline Compose grammar. Read-only verification (`docker inspect`,
+  bounded `sleep`, loopback-only `curl`) is separate. None of this waives the
+  fresh in-task approval required for a cross-broker mutation.
+- Still fresh-approval: host power-down, and — regardless of host — force-push to
+  protected branches, release/publish, DB destructive/migrate.
 
-`guard.py` is defense-in-depth; the actual boundary is the unprivileged agent
-account and root-owned wrapper/config. See `docs/service-control.md` and
-`docs/examples/managed-nodes.allow.example` in the ccc-node repository.
+The real boundary on this node is the unprivileged agent account plus
+root-owned wrappers/config, not a hook. See `docs/service-control.md`.
 
 ## Standing Orders
 These orders define what this node may do autonomously, what requires fresh approval, and when to escalate. **Fresh Approval Required always wins** over any autonomous lane below.
