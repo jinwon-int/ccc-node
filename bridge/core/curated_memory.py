@@ -12,11 +12,15 @@ import shlex
 from pathlib import Path
 from typing import Any
 
-from telegram_bot.core.memory_audience import MEMORY_MODE_AUDIENCE_SCOPED, MemoryAudience
+from telegram_bot.core.memory_audience import MemoryAudience
+from telegram_bot.utils.memory_policy import (
+    MEMORY_MODE_AUDIENCE_SCOPED,
+    MEMORY_MODE_CURATED,
+    MEMORY_MODE_OFF,
+    assert_memory_scope_safe,
+)
 
 
-MEMORY_MODE_OFF = "off"
-MEMORY_MODE_CURATED = "curated"
 
 
 def _command(hook_dir: Path, relative: str, *args: str, background: bool = False) -> str:
@@ -36,19 +40,13 @@ def build_curated_memory_settings(
     mode = getattr(settings, "bridge_memory_mode", MEMORY_MODE_OFF)
     if mode not in {MEMORY_MODE_CURATED, MEMORY_MODE_AUDIENCE_SCOPED}:
         return None
-    session_scope = str(
-        getattr(settings, "telegram_session_scope", "per-user-chat")
-    ).strip().lower().replace("_", "-")
-    unsafe_override = bool(
-        getattr(settings, "bridge_unsafe_shared_all_memory", False)
+    assert_memory_scope_safe(
+        mode,
+        getattr(settings, "telegram_session_scope", "per-user-chat"),
+        unsafe_shared_all_override=bool(
+            getattr(settings, "bridge_unsafe_shared_all_memory", False)
+        ),
     )
-    if session_scope == "shared-all" and (
-        mode == MEMORY_MODE_AUDIENCE_SCOPED or not unsafe_override
-    ):
-        raise ValueError(
-            "bridge memory with shared-all is unsafe; use shared-groups or explicitly "
-            "set CCC_BRIDGE_UNSAFE_SHARED_ALL_MEMORY=true for legacy curated mode"
-        )
     if mode == MEMORY_MODE_AUDIENCE_SCOPED and audience is None:
         raise ValueError("audience-scoped memory requires a resolved route audience")
     hook_dir = Path(settings.claude_settings_path).expanduser().parent / "hooks"
