@@ -68,6 +68,9 @@ class SchemaContractTests(unittest.TestCase):
             ("enum", lambda task: task.__setitem__("notify", "channel"), "tasks[0].notify"),
             ("minimum", lambda task: task.__setitem__("maxCatchup", 0), "tasks[0].maxCatchup"),
             ("maximum", lambda task: task.__setitem__("maxCatchup", 101), "tasks[0].maxCatchup"),
+            ("max-runs-minimum", lambda task: task.__setitem__("maxRuns", 0), "tasks[0].maxRuns"),
+            ("run-count-minimum", lambda task: task.__setitem__("runCount", -1), "tasks[0].runCount"),
+            ("not-before-type", lambda task: task.__setitem__("notBefore", 1), "tasks[0].notBefore"),
             ("pattern", lambda task: task.__setitem__("id", "bad id"), "tasks[0].id"),
             ("blank", lambda task: task.__setitem__("prompt", "   "), "tasks[0].prompt"),
         )

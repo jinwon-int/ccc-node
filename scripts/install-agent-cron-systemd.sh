@@ -9,8 +9,11 @@ USER_MODE=0
 SERVICE_NAME="${CCC_AGENT_CRON_SERVICE_NAME:-ccc-agent-cron}"
 ON_CALENDAR="${CCC_AGENT_CRON_ON_CALENDAR:-*-*-* *:*:00}"
 STORE="${CCC_AGENT_CRON_STORE:-$HOME/.claude/state/agent-cron/tasks.json}"
-HEADLESS="${CCC_HEADLESS_CMD:-$ROOT/claude/headless.sh}"
+RUNNER="${CCC_AGENT_CRON_RUNNER:-claude}"
+HEADLESS="${CCC_HEADLESS_CMD:-}"
 CLAUDE_BIN="${CCC_CLAUDE_BIN:-$(command -v claude 2>/dev/null || true)}"
+CODEX_BIN="${CCC_CODEX_BIN:-$(command -v codex 2>/dev/null || true)}"
+CODEX_SANDBOX="${CCC_CODEX_SANDBOX:-read-only}"
 SPOOL="${CCC_AGENT_CRON_PUSH_SPOOL:-${CCC_PUSH_SPOOL:-$HOME/.claude/state/telegram-spool}}"
 SYSTEMD_DIR="${CCC_SYSTEMD_DIR:-}"
 SYSTEMCTL="${CCC_SYSTEMCTL:-systemctl}"
@@ -20,7 +23,8 @@ RESTART=1
 usage() {
   cat <<EOF
 Usage: install-agent-cron-systemd.sh [--dry-run|--apply] [--user] [--service-name NAME]
-       [--on-calendar SPEC] [--store PATH] [--headless PATH] [--spool PATH]
+       [--on-calendar SPEC] [--store PATH] [--runner claude|codex]
+       [--headless PATH] [--spool PATH] [--codex-sandbox MODE]
 
 Installs ${SERVICE_NAME}.service and ${SERVICE_NAME}.timer for one-shot
 agent-cron scheduler execution. Defaults to dry-run. --apply is required for
@@ -37,8 +41,10 @@ while [ $# -gt 0 ]; do
     --service-name) need_val "$1" "${2:-}"; SERVICE_NAME="$2"; shift ;;
     --on-calendar) need_val "$1" "${2:-}"; ON_CALENDAR="$2"; shift ;;
     --store) need_val "$1" "${2:-}"; STORE="$2"; shift ;;
+    --runner) need_val "$1" "${2:-}"; RUNNER="$2"; shift ;;
     --headless) need_val "$1" "${2:-}"; HEADLESS="$2"; shift ;;
     --spool) need_val "$1" "${2:-}"; SPOOL="$2"; shift ;;
+    --codex-sandbox) need_val "$1" "${2:-}"; CODEX_SANDBOX="$2"; shift ;;
     --no-enable) ENABLE=0 ;;
     --no-restart) RESTART=0 ;;
     -h|--help) usage; exit 0 ;;
@@ -50,6 +56,21 @@ done
 case "$SERVICE_NAME" in
   *[!A-Za-z0-9_.@-]*|"" ) echo "invalid service name: $SERVICE_NAME" >&2; exit 2 ;;
 esac
+case "$RUNNER" in
+  claude|codex) ;;
+  *) echo "invalid runner: $RUNNER" >&2; exit 2 ;;
+esac
+case "$CODEX_SANDBOX" in
+  read-only|workspace-write|danger-full-access) ;;
+  *) echo "invalid Codex sandbox: $CODEX_SANDBOX" >&2; exit 2 ;;
+esac
+if [ -z "$HEADLESS" ]; then
+  if [ "$RUNNER" = codex ]; then
+    HEADLESS="$ROOT/codex/headless.sh"
+  else
+    HEADLESS="$ROOT/claude/headless.sh"
+  fi
+fi
 
 if [ -z "$SYSTEMD_DIR" ]; then
   if [ "$USER_MODE" = 1 ]; then
@@ -76,6 +97,8 @@ Environment=HOME=$HOME
 Environment=CCC_AGENT_CRON_STORE=$STORE
 Environment=CCC_HEADLESS_CMD=$HEADLESS
 Environment=CCC_CLAUDE_BIN=$CLAUDE_BIN
+Environment=CCC_CODEX_BIN=$CODEX_BIN
+Environment=CCC_CODEX_SANDBOX=$CODEX_SANDBOX
 Environment=CCC_AGENT_CRON_PUSH_SPOOL=$SPOOL
 ExecStart=$ROOT/scripts/agent-cron.sh scheduler --execute --json
 Nice=5

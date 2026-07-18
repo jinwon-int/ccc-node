@@ -295,14 +295,21 @@ def due_plan(data):  # noqa: C901 -- #348 baseline hotspot
     for idx, task in enumerate(data.get('tasks', [])):
         tid = task.get('id')
         lock = lock_status(tid or f'task-{idx}', task, at)
+        run_limit = run_limit_metadata(task)
+        configured_enabled = bool(task.get('enabled'))
+        effective_enabled = configured_enabled and not run_limit['reached']
         row = {
             'id': tid,
-            'enabled': bool(task.get('enabled')),
+            'enabled': effective_enabled,
+            'configuredEnabled': configured_enabled,
             'schedule': task.get('schedule'),
             'timezone': task.get('timezone', 'UTC'),
             'catchUpPolicy': task.get('catchUpPolicy', 'skip'),
             'maxCatchup': task.get('maxCatchup', 1),
             'lastRunAt': task.get('lastRunAt'),
+            'notBefore': task.get('notBefore'),
+            'maxRuns': task.get('maxRuns'),
+            'runCount': task.get('runCount', 0),
             'retryEligibleAt': None,
             'retryAttempt': None,
             'due': False,
@@ -314,7 +321,8 @@ def due_plan(data):  # noqa: C901 -- #348 baseline hotspot
             'nextDueAt': None,
             'lockPath': lock['lockPath'],
             'lockState': lock['lockState'],
-            'status': 'disabled' if not task.get('enabled') else 'idle',
+            'runLimit': run_limit,
+            'status': 'run-limit-reached' if run_limit['reached'] else ('disabled' if not configured_enabled else 'idle'),
         }
         for k in ('holder', 'lockAgeSec', 'lockTimeoutSec'):
             if k in lock:
@@ -322,13 +330,21 @@ def due_plan(data):  # noqa: C901 -- #348 baseline hotspot
         try:
             spec = parse_schedule(task.get('schedule') or '')
             last = parse_dt(task.get('lastRunAt'), f'tasks[{idx}].lastRunAt')
+            not_before = parse_dt(task.get('notBefore'), f'tasks[{idx}].notBefore')
+            if not_before is not None and at < not_before:
+                row['status'] = 'not-before' if effective_enabled else row['status']
+                row['nextDueAt'] = fmt_dt(next_occurrence(spec, not_before - timedelta(minutes=1)))
+                rows.append(row)
+                continue
             horizon_start = last or (at - timedelta(days=366))
+            if not_before is not None:
+                horizon_start = max(horizon_start, not_before - timedelta(minutes=1))
             occurrences, truncated = iter_occurrences(spec, horizon_start, at)
             raw_missed = len(occurrences)
             row['missedRunsTruncated'] = truncated
             policy = task.get('catchUpPolicy', 'skip')
             max_catch = task.get('maxCatchup', 1)
-            if task.get('enabled') and raw_missed > 0:
+            if effective_enabled and raw_missed > 0:
                 row['due'] = True
                 row['scheduledAt'] = fmt_dt(occurrences[-1])
                 if policy == 'all':
@@ -348,7 +364,7 @@ def due_plan(data):  # noqa: C901 -- #348 baseline hotspot
                 row['retryAttempt'] = retry.get('retryAttempt')
                 if not retry.get('valid', True):
                     row['retryError'] = retry.get('error')
-                elif task.get('enabled') and not row['due']:
+                elif effective_enabled and not row['due']:
                     if retry.get('ready'):
                         row['due'] = True
                         row['dueCount'] = 1
@@ -422,6 +438,7 @@ def agent_cron_status(data):
         'locked': 0,
         'disabled': 0,
         'invalid': 0,
+        'completed': 0,
     }
     for row in plan.get('tasks', []):
         status = row.get('status') or 'unknown'
@@ -431,6 +448,8 @@ def agent_cron_status(data):
         health = 'healthy'
         if status == 'disabled':
             health = 'disabled'
+        elif status == 'run-limit-reached':
+            health = 'completed'
         elif status in {'locked', 'stale-lock'}:
             health = 'locked'
         elif status == 'retry-exhausted':
@@ -503,7 +522,7 @@ def scheduler_actions(plan):
         action = 'skip'
         reason = status or 'unknown'
         if not row.get('enabled'):
-            reason = 'disabled'
+            reason = 'run-limit-reached' if status == 'run-limit-reached' else 'disabled'
         elif row.get('due') and lock_state == 'held':
             reason = 'locked'
         elif row.get('due'):
@@ -688,6 +707,7 @@ def run_dry_plan(data):
                 'probeOnly': True,
             },
             'headless': headless_metadata(task, execute=False),
+            'runLimit': run_limit_metadata(task),
             'notification': {
                 'policy': notify,
                 'delivery': 'preview-only' if notify == 'telegram-owner' else 'none',
@@ -754,6 +774,30 @@ def append_run_history(task, entry):
     if max_history > 500:
         max_history = 500
     task['runHistory'] = history[-max_history:]
+
+
+def run_limit_metadata(task):
+    maximum = task.get('maxRuns')
+    count = task.get('runCount', 0)
+    if not isinstance(count, int) or isinstance(count, bool) or count < 0:
+        count = 0
+    return {
+        'maxRuns': maximum,
+        'runCount': count,
+        'remainingRuns': max(0, maximum - count) if isinstance(maximum, int) and not isinstance(maximum, bool) else None,
+        'reached': isinstance(maximum, int) and not isinstance(maximum, bool) and count >= maximum,
+    }
+
+
+def apply_run_limit(task):
+    if not isinstance(task.get('maxRuns'), int) or isinstance(task.get('maxRuns'), bool):
+        return run_limit_metadata(task)
+    task['runCount'] = run_limit_metadata(task)['runCount'] + 1
+    limit = run_limit_metadata(task)
+    if limit['reached']:
+        task['enabled'] = False
+        task.pop('retryState', None)
+    return limit
 
 
 def acquire_for_run(task_id, task, run_id, scheduled_at, at):
@@ -936,6 +980,9 @@ def run_execute(data, task_id, at_value, as_json):
         'due': bool(row.get('due')),
         'notification': notification_base(task),
     }
+    current_limit = run_limit_metadata(task)
+    if current_limit['reached']:
+        return {**base, 'ok': True, 'status': 'run-limit-reached', 'runLimit': current_limit, 'mutations': mutation_flags(False, False, False)}, as_json, 0
     if not task.get('enabled'):
         return {**base, 'ok': True, 'status': 'disabled', 'mutations': mutation_flags(False, False, False)}, as_json, 0
     if not row.get('due'):
@@ -985,6 +1032,9 @@ def run_execute(data, task_id, at_value, as_json):
         }
         append_run_history(task, entry)
         retry = apply_retry_transition(task, scheduled_at, attempt, run_id, status, at)
+        run_limit = apply_run_limit(task)
+        if run_limit['reached'] and retry.get('retryEligibleAt'):
+            retry = {**retry, 'retryEligibleAt': None, 'cancelledByRunLimit': True}
         task['lastRunAt'] = scheduled_at
         task['lastStatus'] = status
         task['lastRunId'] = run_id
@@ -1000,6 +1050,7 @@ def run_execute(data, task_id, at_value, as_json):
         'headless': headless or headless_metadata(task, execute=True),
         'notification': notification,
         'retry': retry,
+        'runLimit': run_limit,
         'mutations': mutation_flags(True, headless is not None, headless is not None, notification.get('delivery') == 'spooled', True),
     }
     if not release.get('ok'):
