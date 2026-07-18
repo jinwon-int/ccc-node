@@ -28,6 +28,24 @@ Hermes and OpenClaw schedulers):
 - Unknown timezones and malformed expressions fail closed as
   `invalid-schedule` in `due`/`status` output; `due` rows expose `scheduleKind`.
 
+## Payload kinds
+
+Each task runs one payload (default: `prompt`, backward compatible):
+
+- **prompt** (default): the existing headless Claude run of `prompt` via
+  `claude/headless.sh`. Optional `payload.model` is passed through as
+  `--model` (via `CCC_MODEL`). Wall-clock timeout `payload.timeoutSec`
+  (default 3600s).
+- **command**: `payload.argv` runs directly (no shell interpolation, no LLM
+  token spend — watchdog/maintenance jobs). Optional `cwd`,
+  `timeoutSec` (default 600s), `outputMaxBytes` (default 64 KiB, capped
+  capture). `model` is rejected for command payloads.
+
+A timed-out run records status `timeout` (exit code 124) and consumes the
+normal retry policy. Cross-field payload rules (argv required for command,
+argv/cwd rejected for prompt) are enforced fail-closed by `validate` and on
+load.
+
 ## Safety boundaries
 
 Read-only/status modes never acquire locks, execute prompts, write bridge spools, install timers, edit crontab/systemd, send Telegram, call providers, or touch remotes. Execution mode may write task history and owner-only redacted spool entries, but still does not install timers or call Telegram/provider APIs directly.

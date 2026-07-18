@@ -277,7 +277,8 @@ set -u
 printf 'prompt=%s
 allowed=%s
 perm=%s
-' "$1" "${CCC_ALLOWED_TOOLS:-}" "${CCC_PERMISSION_MODE:-}" >> "$FAKE_HEADLESS_LOG"
+model=%s
+' "$1" "${CCC_ALLOWED_TOOLS:-}" "${CCC_PERMISSION_MODE:-}" "${CCC_MODEL:-}" >> "$FAKE_HEADLESS_LOG"
 case "$1" in
   *Fail*) echo "fake failure" >&2; exit 7 ;;
   *) echo "fake result for $1 token=abcdefghijklmnopqrstuvwxyz1234567890" ;;
@@ -307,6 +308,34 @@ out="$(CCC_AGENT_CRON_STORE="$ONESHOT_STORE" CCC_HEADLESS_CMD="$FAKE_HEADLESS" b
 ok "one-shot run succeeds and auto-disables" '[ "$rc" = 0 ] && jq -e ".ok == true and .oneShotDisabled == true" <<<"$out" >/dev/null && jq -e ".tasks[] | select(.id == \"oneshot-run\" and .enabled == false and .lastStatus == \"success\")" "$ONESHOT_STORE" >/dev/null'
 out="$(CCC_AGENT_CRON_STORE="$ONESHOT_STORE" CCC_HEADLESS_CMD="$FAKE_HEADLESS" bash "$CMD" run oneshot-keep --json --at 2026-01-01T00:01:00Z)"; rc=$?
 ok "keepAfterRun one-shot stays enabled" '[ "$rc" = 0 ] && jq -e ".oneShotDisabled == false" <<<"$out" >/dev/null && jq -e ".tasks[] | select(.id == \"oneshot-keep\" and .enabled == true)" "$ONESHOT_STORE" >/dev/null'
+
+PAYLOAD_STORE="$TMP/payload-store/tasks.json"
+mkdir -p "$(dirname "$PAYLOAD_STORE")"
+cat > "$PAYLOAD_STORE" <<'JSON'
+{"version":1,"tasks":[
+  {"id":"cmd-ok","schedule":"* * * * *","prompt":"echo watchdog","enabled":true,"notify":"none","lastRunAt":"2026-01-01T00:00:00Z","payload":{"kind":"command","argv":["sh","-c","echo cmd-stdout-ok"]}},
+  {"id":"cmd-fail","schedule":"* * * * *","prompt":"failing command","enabled":true,"notify":"none","lastRunAt":"2026-01-01T00:00:00Z","payload":{"kind":"command","argv":["sh","-c","echo boom >&2; exit 3"]}},
+  {"id":"cmd-slow","schedule":"* * * * *","prompt":"slow command","enabled":true,"notify":"none","lastRunAt":"2026-01-01T00:00:00Z","payload":{"kind":"command","argv":["sleep","5"],"timeoutSec":1}},
+  {"id":"model-task","schedule":"* * * * *","prompt":"Model override run","enabled":true,"notify":"none","lastRunAt":"2026-01-01T00:00:00Z","payload":{"kind":"prompt","model":"claude-test-model"}}
+]}
+JSON
+out="$(CCC_AGENT_CRON_STORE="$PAYLOAD_STORE" bash "$CMD" run cmd-ok --json --at 2026-01-01T00:01:00Z)"; rc=$?
+ok "command payload runs argv without headless" '[ "$rc" = 0 ] && jq -e ".ok == true and .status == \"success\" and .headless.payloadKind == \"command\" and (.headless.stdout | contains(\"cmd-stdout-ok\"))" <<<"$out" >/dev/null'
+out="$(CCC_AGENT_CRON_STORE="$PAYLOAD_STORE" bash "$CMD" run cmd-fail --json --at 2026-01-01T00:01:00Z 2>&1)"; rc=$?
+ok "command payload propagates failure exit code" '[ "$rc" = 1 ] && jq -e ".ok == false and .status == \"failed\" and .headless.exitCode == 3 and (.headless.stderr | contains(\"boom\"))" <<<"$out" >/dev/null'
+out="$(CCC_AGENT_CRON_STORE="$PAYLOAD_STORE" bash "$CMD" run cmd-slow --json --at 2026-01-01T00:01:00Z 2>&1)"; rc=$?
+ok "command payload times out with distinct status" '[ "$rc" = 1 ] && jq -e ".status == \"timeout\" and .headless.exitCode == 124 and .headless.timedOut == true" <<<"$out" >/dev/null'
+out="$(CCC_AGENT_CRON_STORE="$PAYLOAD_STORE" CCC_HEADLESS_CMD="$FAKE_HEADLESS" bash "$CMD" run model-task --json --at 2026-01-01T00:01:00Z)"; rc=$?
+ok "prompt payload model override reaches headless env" '[ "$rc" = 0 ] && grep -q "model=claude-test-model" "$FAKE_HEADLESS_LOG"'
+out="$(CCC_AGENT_CRON_STORE="$PAYLOAD_STORE" bash "$CMD" run cmd-ok --dry-run --json --at 2026-01-01T00:02:00Z)"; rc=$?
+ok "dry-run previews command payload metadata" '[ "$rc" = 0 ] && jq -e ".headless.payloadKind == \"command\" and .headless.argvLen == 3" <<<"$out" >/dev/null'
+
+BAD_PAYLOAD="$TMP/bad-payload.json"
+cat > "$BAD_PAYLOAD" <<'JSON'
+{"version":1,"tasks":[{"id":"bad-payload","schedule":"* * * * *","prompt":"a","enabled":true,"notify":"none","payload":{"kind":"command"}}]}
+JSON
+out="$(CCC_AGENT_CRON_STORE="$BAD_PAYLOAD" bash "$CMD" validate 2>&1)"; rc=$?
+ok "command payload without argv fails validation" '[ "$rc" = 1 ] && grep -q "argv is required" <<<"$out"'
 
 out="$(CCC_AGENT_CRON_STORE="$EXEC_STORE" CCC_HEADLESS_CMD="$FAKE_HEADLESS" bash "$CMD" run exec-success --json --at 2026-01-01T00:01:00Z)"; rc=$?
 ok "run executes due task with fake headless" '[ "$rc" = 0 ] && jq -e ".ok == true and .status == \"success\" and .mutations.lockAcquire == true and .mutations.taskStoreWrite == true and .mutations.headlessExecute == true" <<<"$out" >/dev/null'

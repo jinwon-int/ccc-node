@@ -145,10 +145,42 @@ def _duplicate_id_errors(value: object) -> list[str]:
     return errors
 
 
+def _payload_errors(value: object) -> list[str]:
+    """Cross-field payload rules the keyword subset cannot express."""
+
+    if not isinstance(value, dict) or not isinstance(value.get("tasks"), list):
+        return []
+    errors: list[str] = []
+    for index, task in enumerate(value["tasks"]):
+        if not isinstance(task, dict):
+            continue
+        payload = task.get("payload")
+        if not isinstance(payload, dict):
+            continue
+        location = f"tasks[{index}].payload"
+        kind = payload.get("kind")
+        if kind == "command":
+            if not payload.get("argv"):
+                errors.append(f"{location}.argv is required for kind 'command'")
+            if "model" in payload:
+                errors.append(f"{location}.model is not allowed for kind 'command'")
+        elif kind == "prompt":
+            for forbidden in ("argv", "cwd"):
+                if forbidden in payload:
+                    errors.append(
+                        f"{location}.{forbidden} is not allowed for kind 'prompt'"
+                    )
+    return errors
+
+
 def validate_store(value: object) -> list[str]:
     """Return stable structural and store-semantic validation errors."""
 
-    return _validate_node(value, load_schema(), "") + _duplicate_id_errors(value)
+    return (
+        _validate_node(value, load_schema(), "")
+        + _duplicate_id_errors(value)
+        + _payload_errors(value)
+    )
 
 
 __all__ = ["SCHEMA_PATH", "load_schema", "validate_store"]
