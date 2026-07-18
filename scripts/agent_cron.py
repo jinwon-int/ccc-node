@@ -69,7 +69,7 @@ import shlex
 import socket
 import subprocess
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 
 # Pure schedule + retry helpers live in agent_cron_lib (no side effects, unit
@@ -81,8 +81,8 @@ from agent_cron_lib import (  # noqa: E402
     parse_schedule,
     retry_view,
     apply_retry_transition,
-    iter_occurrences,
-    next_occurrence,
+    schedule_occurrences,
+    next_after,
     fmt_dt,
 )
 from agent_cron_schema import validate_store  # noqa: E402
@@ -320,10 +320,11 @@ def due_plan(data):  # noqa: C901 -- #348 baseline hotspot
             if k in lock:
                 row[k] = lock[k]
         try:
-            spec = parse_schedule(task.get('schedule') or '')
+            spec = parse_schedule(task.get('schedule') or '', task.get('timezone', 'UTC'))
+            row['scheduleKind'] = spec.get('kind', 'cron')
             last = parse_dt(task.get('lastRunAt'), f'tasks[{idx}].lastRunAt')
-            horizon_start = last or (at - timedelta(days=366))
-            occurrences, truncated = iter_occurrences(spec, horizon_start, at)
+            anchor = parse_dt(task.get('anchorAt'), f'tasks[{idx}].anchorAt')
+            occurrences, truncated = schedule_occurrences(spec, last, at, anchor)
             raw_missed = len(occurrences)
             row['missedRunsTruncated'] = truncated
             policy = task.get('catchUpPolicy', 'skip')
@@ -362,7 +363,7 @@ def due_plan(data):  # noqa: C901 -- #348 baseline hotspot
                         row['status'] = 'retry-wait'
                     elif retry.get('exhausted'):
                         row['status'] = 'retry-exhausted'
-            row['nextDueAt'] = fmt_dt(next_occurrence(spec, at))
+            row['nextDueAt'] = fmt_dt(next_after(spec, at, anchor))
         except Exception as e:
             row['status'] = 'invalid-schedule'
             row['error'] = str(e)
@@ -952,6 +953,7 @@ def run_execute(data, task_id, at_value, as_json):
     status = 'failed'
     ok = False
     rc = 1
+    one_shot_disabled = False
     try:
         try:
             headless = run_headless(task)
@@ -988,6 +990,14 @@ def run_execute(data, task_id, at_value, as_json):
         task['lastRunAt'] = scheduled_at
         task['lastStatus'] = status
         task['lastRunId'] = run_id
+        if status == 'success' and not task.get('keepAfterRun'):
+            try:
+                spec = parse_schedule(task.get('schedule') or '', task.get('timezone', 'UTC'))
+                if spec.get('kind') == 'once':
+                    task['enabled'] = False
+                    one_shot_disabled = True
+            except Exception:
+                pass
         write_doc(data)
     finally:
         release = release_for_run(task_id, run_id)
@@ -999,6 +1009,7 @@ def run_execute(data, task_id, at_value, as_json):
         'lock': {'state': lock.get('state'), 'path': lock.get('path'), 'release': release},
         'headless': headless or headless_metadata(task, execute=True),
         'notification': notification,
+        'oneShotDisabled': one_shot_disabled,
         'retry': retry,
         'mutations': mutation_flags(True, headless is not None, headless is not None, notification.get('delivery') == 'spooled', True),
     }

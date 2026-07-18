@@ -11,6 +11,23 @@
 - `scripts/agent-cron.sh scheduler --dry-run` — one scheduler tick preview.
 - `scripts/agent-cron.sh scheduler --execute` — explicit one-shot execution path for an already-approved scheduler unit.
 
+## Schedule forms
+
+`schedule` accepts four kinds (epic #584-adjacent cron upgrade, referencing the
+Hermes and OpenClaw schedulers):
+
+- **Cron:** 5-field expression or `@hourly|@daily|@weekly|@monthly|@yearly`,
+  matched in the task's `timezone` (IANA name, e.g. `Asia/Seoul`; default UTC).
+- **Interval:** `every <N>m|h|d` (min 1 minute, max 366 days). Free-running from
+  `lastRunAt`; set `anchorAt` (ISO8601) to phase-anchor occurrences
+  (e.g. anchor `..T00:15Z` + `every 1h` fires at :15). A never-run interval task
+  with no anchor is due immediately once.
+- **One-shot:** `at <ISO8601>` or a bare ISO8601 timestamp. Naive timestamps are
+  anchored to the task `timezone`. After a successful run the task is
+  auto-disabled unless `keepAfterRun: true`.
+- Unknown timezones and malformed expressions fail closed as
+  `invalid-schedule` in `due`/`status` output; `due` rows expose `scheduleKind`.
+
 ## Safety boundaries
 
 Read-only/status modes never acquire locks, execute prompts, write bridge spools, install timers, edit crontab/systemd, send Telegram, call providers, or touch remotes. Execution mode may write task history and owner-only redacted spool entries, but still does not install timers or call Telegram/provider APIs directly.
