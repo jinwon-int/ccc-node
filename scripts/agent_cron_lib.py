@@ -11,10 +11,7 @@ names and dispatches only from ``main()``.
 import re
 from datetime import datetime, timedelta, timezone
 
-try:
-    from zoneinfo import ZoneInfo
-except ImportError:  # pragma: no cover - zoneinfo ships with Python >= 3.9
-    ZoneInfo = None
+from zoneinfo import ZoneInfo
 
 OCCURRENCE_SCAN_LIMIT = 1000
 CRON_FIELD_RX = re.compile(r'^(\*|\*/[1-9][0-9]*|[0-9]+)(,(\*|\*/[1-9][0-9]*|[0-9]+))*$')
@@ -36,8 +33,6 @@ def resolve_timezone(name):
     label = (name or 'UTC').strip() or 'UTC'
     if label.upper() == 'UTC':
         return timezone.utc, 'UTC'
-    if ZoneInfo is None:
-        raise ValueError('IANA timezones require Python zoneinfo (>= 3.9)')
     try:
         return ZoneInfo(label), label
     except Exception as e:
