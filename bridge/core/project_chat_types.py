@@ -3,7 +3,7 @@
 import asyncio
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable, Deque, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Deque, Dict, List, Mapping, Optional
 
 from claude_agent_sdk import ClaudeSDKClient
 from telegram_bot.core.agent_runtime import ApprovalDecision, ApprovalRequestEvent
@@ -29,6 +29,25 @@ InterimMessageCallback = Callable[[str], Awaitable[None]]
 # Callback type: async (text, session_id) -> None. Delivers SDK messages that
 # arrive on a live stream after its Telegram request queue has drained.
 UnsolicitedCallback = Callable[[str, Optional[str]], Awaitable[None]]
+
+
+@dataclass
+class AgentSessionEntry:
+    """One provider-neutral agent session plus the parameters it was started
+    with.
+
+    The parameters travel with the session so a staleness check compares one
+    object instead of six parallel dicts, and eviction is a single ``pop`` that
+    cannot forget a field (the old parallel-dict form dropped only four of the
+    six maps in one call site).
+    """
+
+    session: Any
+    model: Optional[str] = None
+    effort: Optional[str] = None
+    approval_policy: Optional[str] = None
+    approvals_reviewer: Optional[str] = None
+    sandbox_policy: Optional[Mapping[str, Any]] = None
 
 
 @dataclass
