@@ -4,6 +4,12 @@
 
 ## Commands
 
+- `scripts/agent-cron.sh add <task-id> --schedule EXPR --prompt TEXT [flags] [--json]` —
+  create a task (validated, atomic write; no execution). See `--help` for flags
+  (timezone, notify, allowed-tools, payload `--argv/--cwd/--model/--timeout-sec`,
+  `--keep-after-run`, `--disabled`, ...).
+- `scripts/agent-cron.sh remove|enable|disable <task-id> [--json]` — store-only
+  mutations; never execute, install timers, or send messages.
 - `scripts/agent-cron.sh list [--json]` — inspect configured tasks.
 - `scripts/agent-cron.sh due [--at ISO8601] [--json]` — read-only due/retry resolver.
 - `scripts/agent-cron.sh status [--at ISO8601] [--json]` — read-only operator rollup for task health, retry wait/exhaustion, lock state, and last run state.
@@ -46,9 +52,16 @@ normal retry policy. Cross-field payload rules (argv required for command,
 argv/cwd rejected for prompt) are enforced fail-closed by `validate` and on
 load.
 
+## Notify modes
+
+- `none` (default) — no spool writes.
+- `telegram-owner` — every run writes a short redacted owner-only spool entry.
+- `telegram-owner-on-failure` — spool only non-success runs (failed/timeout);
+  successful runs report `delivery: skipped-success`.
+
 ## Safety boundaries
 
-Read-only/status modes never acquire locks, execute prompts, write bridge spools, install timers, edit crontab/systemd, send Telegram, call providers, or touch remotes. Execution mode may write task history and owner-only redacted spool entries, but still does not install timers or call Telegram/provider APIs directly.
+Read-only/status modes never acquire locks, execute prompts, write bridge spools, install timers, edit crontab/systemd, send Telegram, call providers, or touch remotes. Execution mode may write task history and owner-only redacted spool entries, but still does not install timers or call Telegram/provider APIs directly. `add`/`remove`/`enable`/`disable` mutate only the validated task store via the same atomic private write path.
 
 ## Source boundaries
 

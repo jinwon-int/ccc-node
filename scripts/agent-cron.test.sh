@@ -309,6 +309,38 @@ ok "one-shot run succeeds and auto-disables" '[ "$rc" = 0 ] && jq -e ".ok == tru
 out="$(CCC_AGENT_CRON_STORE="$ONESHOT_STORE" CCC_HEADLESS_CMD="$FAKE_HEADLESS" bash "$CMD" run oneshot-keep --json --at 2026-01-01T00:01:00Z)"; rc=$?
 ok "keepAfterRun one-shot stays enabled" '[ "$rc" = 0 ] && jq -e ".oneShotDisabled == false" <<<"$out" >/dev/null && jq -e ".tasks[] | select(.id == \"oneshot-keep\" and .enabled == true)" "$ONESHOT_STORE" >/dev/null'
 
+CRUD_STORE="$TMP/crud-store/tasks.json"
+out="$(CCC_AGENT_CRON_STORE="$CRUD_STORE" bash "$CMD" add daily-report --schedule "0 9 * * *" --prompt "Daily report" --timezone Asia/Seoul --notify telegram-owner-on-failure --allowed-tools Read,Grep --json)"; rc=$?
+ok "add creates a task in a fresh store" '[ "$rc" = 0 ] && jq -e ".ok == true and .mutations.taskStoreWrite == true" <<<"$out" >/dev/null && jq -e ".tasks[] | select(.id == \"daily-report\" and .timezone == \"Asia/Seoul\" and .notify == \"telegram-owner-on-failure\" and .enabled == true)" "$CRUD_STORE" >/dev/null'
+out="$(CCC_AGENT_CRON_STORE="$CRUD_STORE" bash "$CMD" add daily-report --schedule "@daily" --prompt "dup" --json 2>&1)"; rc=$?
+ok "add rejects duplicate id" '[ "$rc" = 1 ] && grep -q "already exists" <<<"$out"'
+out="$(CCC_AGENT_CRON_STORE="$CRUD_STORE" bash "$CMD" add bad-sched --schedule "not a schedule" --prompt "x" --json 2>&1)"; rc=$?
+ok "add rejects invalid schedule without writing" '[ "$rc" = 2 ] && ! jq -e ".tasks[] | select(.id == \"bad-sched\")" "$CRUD_STORE" >/dev/null'
+out="$(CCC_AGENT_CRON_STORE="$CRUD_STORE" bash "$CMD" add watchdog --schedule "every 30m" --prompt "disk watchdog" --argv sh --argv -c --argv "df -h" --timeout-sec 30 --json)"; rc=$?
+ok "add creates a command-payload task" '[ "$rc" = 0 ] && jq -e ".tasks[] | select(.id == \"watchdog\") | .payload.kind == \"command\" and .payload.argv == [\"sh\",\"-c\",\"df -h\"] and .payload.timeoutSec == 30" "$CRUD_STORE" >/dev/null'
+out="$(CCC_AGENT_CRON_STORE="$CRUD_STORE" bash "$CMD" disable watchdog --json)"; rc=$?
+ok "disable toggles enabled off" '[ "$rc" = 0 ] && jq -e ".tasks[] | select(.id == \"watchdog\" and .enabled == false)" "$CRUD_STORE" >/dev/null'
+out="$(CCC_AGENT_CRON_STORE="$CRUD_STORE" bash "$CMD" enable watchdog --json)"; rc=$?
+ok "enable toggles enabled on" '[ "$rc" = 0 ] && jq -e ".changed == true" <<<"$out" >/dev/null && jq -e ".tasks[] | select(.id == \"watchdog\" and .enabled == true)" "$CRUD_STORE" >/dev/null'
+out="$(CCC_AGENT_CRON_STORE="$CRUD_STORE" bash "$CMD" remove watchdog --json)"; rc=$?
+ok "remove deletes the task" '[ "$rc" = 0 ] && ! jq -e ".tasks[] | select(.id == \"watchdog\")" "$CRUD_STORE" >/dev/null'
+out="$(CCC_AGENT_CRON_STORE="$CRUD_STORE" bash "$CMD" remove missing-task --json 2>&1)"; rc=$?
+ok "remove unknown id fails" '[ "$rc" = 1 ] && grep -q "not found" <<<"$out"'
+
+NOTIFY_FAIL_STORE="$TMP/notify-fail-store/tasks.json"
+mkdir -p "$(dirname "$NOTIFY_FAIL_STORE")"
+cat > "$NOTIFY_FAIL_STORE" <<'JSON'
+{"version":1,"tasks":[
+  {"id":"nf-ok","schedule":"* * * * *","prompt":"Quiet when fine","enabled":true,"notify":"telegram-owner-on-failure","lastRunAt":"2026-01-01T00:00:00Z"},
+  {"id":"nf-bad","schedule":"* * * * *","prompt":"Loud when Fail","enabled":true,"notify":"telegram-owner-on-failure","lastRunAt":"2026-01-01T00:00:00Z"}
+]}
+JSON
+NF_SPOOL="$TMP/nf-spool"
+out="$(CCC_AGENT_CRON_STORE="$NOTIFY_FAIL_STORE" CCC_HEADLESS_CMD="$FAKE_HEADLESS" CCC_PUSH_SPOOL="$NF_SPOOL" bash "$CMD" run nf-ok --json --at 2026-01-01T00:01:00Z)"; rc=$?
+ok "on-failure notify skips successful runs" '[ "$rc" = 0 ] && jq -e ".notification.delivery == \"skipped-success\"" <<<"$out" >/dev/null && [ -z "$(ls -A "$NF_SPOOL" 2>/dev/null)" ]'
+out="$(CCC_AGENT_CRON_STORE="$NOTIFY_FAIL_STORE" CCC_HEADLESS_CMD="$FAKE_HEADLESS" CCC_PUSH_SPOOL="$NF_SPOOL" bash "$CMD" run nf-bad --json --at 2026-01-01T00:01:00Z 2>&1)"; rc=$?
+ok "on-failure notify spools failed runs" '[ "$rc" = 1 ] && jq -e ".notification.delivery == \"spooled\"" <<<"$out" >/dev/null && [ -n "$(ls -A "$NF_SPOOL" 2>/dev/null)" ]'
+
 PAYLOAD_STORE="$TMP/payload-store/tasks.json"
 mkdir -p "$(dirname "$PAYLOAD_STORE")"
 cat > "$PAYLOAD_STORE" <<'JSON'
