@@ -612,6 +612,156 @@ def _operational_relax_enabled():
 
 
 # --------------------------------------------------------------------------- #
+# Quoted-heredoc data stripping (operator-approved FP fix).
+# --------------------------------------------------------------------------- #
+# A heredoc body is treated as pure DATA — and excluded from pattern gates —
+# only when BOTH hold (anything else falls through unstripped, fail-closed):
+#   1. the delimiter is quoted (<<'EOF' / <<"EOF"): the shell performs NO
+#      parameter/command substitution inside the body, so nothing in the body
+#      executes at parse time;
+#   2. the command consuming stdin is a known pure data sink (cat / tee /
+#      git commit): the body is written or recorded, never interpreted.
+# Interpreter consumers (bash/sh/ssh/python/eval/...) keep their bodies
+# scanned, as do unquoted heredocs (their $(...)/$VAR expand and can execute).
+#
+# "Pure data sink" is required to be PROVABLY TERMINAL (adversarial review on
+# #571): after the heredoc intro on the same line only plain-file redirects may
+# follow (no `| bash`, no `>(...)` process substitution, no `&&`-chained
+# execution), and the terminator must be the LAST non-blank content of the
+# whole command — otherwise a later statement in the same command could execute
+# what the sink just wrote (`cat > s.sh <<'EOF' ... EOF` + `bash s.sh`).
+# Only body LINES are removed: the sink command, its arguments and redirect
+# targets, and both delimiter lines stay visible to every gate — so e.g.
+# `tee /etc/ccc-node/guard-profile <<'EOF'` still trips the operator-config
+# gate on the argument path.
+_HEREDOC_INTRO_RE = re.compile(r"<<-?[ \t]*(['\"])([A-Za-z_][A-Za-z0-9_.-]*)\1")
+# Sink resolution must be IMMUTABLE AND PINNED (adversarial review on #571,
+# round 4): bare command names resolve through mutable shell state — functions
+# (incl. rc-file and exported/inherited ones), aliases, the hash table, and
+# PATH — none of which command-text analysis can prove. An ABSOLUTE path
+# invocation bypasses every one of those resolution channels, so only these
+# exact pinned spellings qualify, and the binary at that path must itself be a
+# root-owned, non-group/world-writable regular file at guard time.
+_DATA_SINK_PATHS = {"/bin/cat", "/usr/bin/cat", "/bin/tee", "/usr/bin/tee"}
+_GIT_SINK_PATHS = {"/bin/git", "/usr/bin/git"}
+# After the intro, only redirection to a LITERAL file path may follow — no
+# pipes, process substitutions, command separators, or expansions.
+_HEREDOC_TAIL_RE = re.compile(r"^([ \t]*>{1,2}[ \t]*[A-Za-z0-9/._+:-]+)*[ \t]*$")
+# After the terminator, only INERT trailing statements may follow (operator
+# request: `cat > notes.md <<'EOF' ... EOF` + `echo saved` is a common data
+# pattern): echo/printf/true/: with purely literal arguments — no command
+# substitution, separators, redirects, or expansions, so a trailing statement
+# provably cannot execute what the sink wrote. Anything else refuses stripping.
+_INERT_TRAILING_RE = re.compile(
+    r"^[ \t]*(?:(?:echo|printf|true|:)(?:[ \t]+[A-Za-z0-9/._+:%,'\"=-]+)*)?[ \t]*$"
+)
+# Sink names are trusted ONLY when nothing in the command (outside the body,
+# which is inert data) can re-bind them (adversarial review on #571): a shell
+# function or alias definition, or a loader/lookup env assignment (PATH,
+# LD_PRELOAD, ...) can turn `cat` into an interpreter. Any such signal refuses
+# stripping — fail closed on redefinition state we cannot prove.
+_SINK_REDEFINITION_RE = re.compile(
+    r"\b(?:cat|tee|git)[ \t]*\([ \t]*\)"            # cat() {...} function defs
+    r"|\bfunction[ \t]+(?:cat|tee|git)\b"            # function cat {...}
+    r"|\balias\b"                                     # any alias definition
+    r"|\bhash\b"                                      # hash-table rebinding
+    r"|\bexport[ \t]+-f\b"                            # function exporting
+    r"|[<>]\("                                        # process substitution
+    r"|\b(?:PATH|BASH_ENV|ENV|LD_PRELOAD|LD_LIBRARY_PATH|IFS)[ \t]*="
+)
+
+
+def _heredoc_sink_statement(prefix):
+    """Whether the statement text introducing a heredoc is a pure data sink."""
+    # The heredoc attaches to the last statement on its line.
+    seg = re.split(r"[;&|]", prefix)[-1]
+    try:
+        words = shlex.split(seg)
+    except ValueError:
+        return False
+    # The statement must START with an ABSOLUTE pinned sink path — no bare
+    # names (mutable resolution), no env-assignment prefixes (FOO=... cat).
+    if not words:
+        return False
+    head = words[0]
+    if head in _DATA_SINK_PATHS:
+        return _pinned_binary(head)
+    if head in _GIT_SINK_PATHS and len(words) >= 2 and words[1] == "commit":
+        return _pinned_binary(head)
+    return False
+
+
+def _pinned_binary(path):
+    """The sink binary itself must be a root-owned, non-writable regular file."""
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return False
+    return stat.S_ISREG(st.st_mode) and st.st_uid == 0 and not (st.st_mode & 0o022)
+
+
+def _strip_quoted_heredoc_data(cmd):
+    """Replace a qualifying quoted-heredoc body with a data marker.
+
+    Fail-closed on every ambiguity: at most ONE quoted heredoc is stripped per
+    command, and only when the sink is provably terminal (nothing but plain
+    file redirects after the intro; nothing but blank lines after the
+    terminator). Anything else returns the command unmodified so every gate
+    scans the full text.
+    """
+    if "<<" not in cmd or "\n" not in cmd:
+        return cmd
+    # Inherited exported shell functions (BASH_FUNC_*) mean name resolution in
+    # the child shell is not provable from the command text — refuse stripping
+    # entirely (absolute-path sinks are immune, but keep the belt with the
+    # suspenders; adversarial review on #571, round 4).
+    if any(k.startswith("BASH_FUNC_") for k in os.environ):
+        return cmd
+    lines = cmd.split("\n")
+    for i, line in enumerate(lines):
+        intros = list(_HEREDOC_INTRO_RE.finditer(line))
+        if not intros:
+            continue
+        # Exactly one quoted heredoc, fed by a pure data sink, with nothing but
+        # literal-file redirects after the intro on the same line.
+        if len(intros) != 1:
+            return cmd
+        m = intros[0]
+        if not _heredoc_sink_statement(line[: m.start()]):
+            return cmd
+        if not _HEREDOC_TAIL_RE.match(line[m.end():]):
+            return cmd
+        delim = m.group(2)
+        dash = line[m.start():m.start() + 3] == "<<-"
+        end = None
+        for j in range(i + 1, len(lines)):
+            cand = lines[j].lstrip("\t") if dash else lines[j]
+            if cand == delim:
+                end = j
+                break
+        if end is None:
+            return cmd  # unterminated — strip nothing
+        # Provably terminal: after the terminator only blank lines or INERT
+        # trailing statements (echo/printf/true/: with literal args) may
+        # follow, so no later statement in this command can execute what the
+        # sink wrote.
+        if any(not _INERT_TRAILING_RE.match(rest) for rest in lines[end + 1:]):
+            return cmd
+        # The sink name must be provably UNSHADOWED: any function/alias/loader
+        # redefinition signal OUTSIDE the body (the body itself is inert data)
+        # refuses stripping. Checked against everything except the body lines.
+        outside = "\n".join(lines[: i + 1] + lines[end:])
+        if _SINK_REDEFINITION_RE.search(outside):
+            return cmd
+        out = lines[: i + 1]
+        if end > i + 1:
+            out.append("[CCC-HEREDOC-DATA]")
+        out.extend(lines[end:])
+        return "\n".join(out)
+    return cmd
+
+
+# --------------------------------------------------------------------------- #
 # Main evaluation. Raises Deny to block; returns normally to allow.
 # --------------------------------------------------------------------------- #
 def evaluate(tool, cmd, fpath, tool_input_raw):
@@ -652,7 +802,12 @@ def evaluate(tool, cmd, fpath, tool_input_raw):
     if tool != "Bash" or not cmd:
         return
 
-    c = cmd
+    # Quoted-heredoc DATA bodies feeding pure sink commands are stripped before
+    # pattern matching (operator-approved FP fix): a commit message or a notes
+    # file that MENTIONS "rm -rf /" is data, not an execution path. Everything
+    # else about the command (the sink itself, redirect targets, delimiters,
+    # unquoted heredocs, interpreter-fed heredocs) keeps being scanned.
+    c = _strip_quoted_heredoc_data(cmd)
     cn = _quote_strip(c)
     try:
         toks = shlex.split(cn)
@@ -804,11 +959,62 @@ _RM_RE = re.compile(
     r"\brm\b(\s+-[A-Za-z-]*)*\s+(/|~|\$HOME|\$\{HOME\}|/root|/etc|/var|/usr|/bin|/lib)([\s/*]|$)")
 
 
+_RM_PRUNE_SAFE_FLAGS = {"-f", "--force", "-v", "--verbose"}
+_RM_BAK_BASENAME_RE = re.compile(r"\.bak([-.][^/]*)?$")
+# Operands must be LITERAL paths: no $/`` expansions (a variable can expand
+# into extra, unrelated operands — adversarial review on #571), no tilde, no
+# braces, no bracket globs, no whitespace-bearing quoting tricks.
+_RM_LITERAL_OPERAND_RE = re.compile(r"[A-Za-z0-9/._+:*?-]+")
+
+
+def _rm_is_backup_prune(st):
+    """A non-recursive rm whose EVERY operand names a .bak backup artifact.
+
+    Pruning stale timestamped backups (e.g. ``.env.bak-20260717-091410``)
+    reduces on-disk secret sprawl; treating it as catastrophic forced operator
+    intervention for routine hygiene (operator-approved relaxation, 2026-07-18).
+    Fail-closed: a recursive flag, an unparseable statement, a glob in the
+    DIRECTORY part, or any operand whose basename is not a ``.bak`` /
+    ``.bak-<suffix>`` / ``.bak.<suffix>`` artifact all fall through to the
+    deny. Originals (``.env``, keys, configs) are never matched by the
+    basename rule, so only explicitly-named backup copies are prunable.
+    """
+    try:
+        toks = shlex.split(st)
+    except ValueError:
+        return False
+    if not toks or toks[0] != "rm":
+        return False
+    operands = []
+    for t in toks[1:]:
+        if t == "--":
+            continue
+        if t.startswith("-") and t != "-":
+            if t not in _RM_PRUNE_SAFE_FLAGS:
+                return False          # -r/-R/-d/--recursive/unknown stay gated
+            continue
+        operands.append(t)
+    if not operands:
+        return False
+    for op in operands:
+        if not _RM_LITERAL_OPERAND_RE.fullmatch(op):
+            return False              # $VAR/`cmd`/~/{}/[] operands stay gated
+        dirpart, _, base = op.rpartition("/")
+        if any(ch in dirpart for ch in "*?"):
+            return False              # globbing directories stays gated
+        if not _RM_BAK_BASENAME_RE.search(base):
+            return False
+    return True
+
+
 def _gate_rm(c, statements, managed):
     # Relaxed only when the rm is inside a managed-remote statement (the owned node
-    # governs its own filesystem); a local catastrophic rm always denies.
+    # governs its own filesystem) or is an explicit .bak-artifact pruning; a local
+    # catastrophic rm always denies.
     for st, mgd in zip(statements, managed):
         if not mgd and _RM_RE.search(st):
+            if _rm_is_backup_prune(st):
+                continue
             _deny("rm-catastrophic", "operator_approval_gated", c)
 
 

@@ -508,6 +508,75 @@ run deny Bash command 'echo evil >> /root/.claude/managed-services.allow'
 run allow Bash command 'cat /root/.claude/managed-services.allow'
 rm -rf "$SVC_DIR" 2>/dev/null || true
 
+# ---- quoted-heredoc DATA bodies feeding pure sinks are not execution paths ----
+run allow Bash command $'/usr/bin/git commit -F - <<\'MSG\'\nfix: guard no longer trips on rm -rf / mentioned in prose\n\nAlso mentions /etc/ccc-node/guard-profile as a path string.\nMSG'
+run allow Bash command $'/usr/bin/cat > /root/.claude/state/notes.md <<\'EOF\'\nrunbook says: rm -rf /var/tmp/stale then poweroff the appliance\nEOF'
+run allow Bash command $'/usr/bin/tee /root/notes.md <<\'EOF\'\nrelease steps mention gh release create v1.0.0\nEOF'
+# ...but interpreter consumers, unquoted heredocs, and gated redirect/argument
+# targets keep the full fail-closed treatment.
+run deny Bash command $'bash <<\'EOF\'\nrm -rf /\nEOF'
+run deny Bash command $'sh <<\'EOF\'\npoweroff\nEOF'
+run deny Bash command $'ssh randomhost bash -s <<\'EOF\'\npoweroff\nEOF'
+run deny Bash command $'cat > /tmp/x <<EOF\nrm -rf /\nEOF'
+run deny Bash command $'cat <<\'EOF\' > /etc/ccc-node/guard-profile\noperational-relax\nEOF'
+run deny Bash command $'tee /etc/ccc-node/guard-profile <<\'EOF\'\noperational-relax\nEOF'
+# Adversarial (review on #571): the sink must be provably TERMINAL — piped,
+# process-substituted, or later-executed consumers must keep the body scanned.
+run deny Bash command $'cat <<\'EOF\' | bash\nrm -rf /\nEOF'
+run deny Bash command $'cat <<\'EOF\' > >(bash)\nrm -rf /\nEOF'
+run deny Bash command $'cat <<\'EOF\' && poweroff\ndata\nEOF'
+run deny Bash command $'cat > /tmp/s.sh <<\'EOF\'\nrm -rf /\nEOF\nbash /tmp/s.sh'
+run deny Bash command $'tee /tmp/x.sh <<\'EOF\'\npoweroff\nEOF\nsh /tmp/x.sh'
+# Adversarial (review on #571, round 3): a sink NAME is only trusted when the
+# command cannot re-bind it — function/alias definitions and loader/lookup env
+# assignments outside the body refuse stripping.
+run deny Bash command $'cat() { bash; }\ncat <<\'EOF\'\nrm -rf /\nEOF'
+run deny Bash command $'function tee { bash; }\ntee /tmp/x <<\'EOF\'\npoweroff\nEOF'
+run deny Bash command $'git() { bash; }\ngit commit -F - <<\'EOF\'\nrm -rf /\nEOF'
+run deny Bash command $'alias cat=bash\ncat <<\'EOF\'\nrm -rf /\nEOF'
+run deny Bash command $'PATH=/tmp/evil:$PATH\ncat <<\'EOF\'\nrm -rf /\nEOF'
+run deny Bash command $'LD_PRELOAD=/tmp/evil.so cat <<\'EOF\'\nrm -rf /\nEOF'
+# Adversarial (review on #571, round 4): sink resolution must be immutable and
+# pinned — BARE names resolve through mutable shell state (rc/exported
+# functions, hash table, PATH) and never qualify, absolute paths do.
+run deny Bash command $'cat > /root/notes.md <<\'EOF\'\nrm -rf /\nEOF'
+run deny Bash command $'git commit -F - <<\'EOF\'\nrm -rf /\nEOF'
+run deny Bash command $'tee /root/notes.md <<\'EOF\'\npoweroff\nEOF'
+run deny Bash command $'/usr/bin/cat > >(bash) <<\'EOF\'\nrm -rf /\nEOF'
+run deny Bash command $'hash -p /tmp/evil/git git\n/usr/bin/git commit -F - <<\'EOF\'\nrm -rf /\nEOF'
+run deny Bash command $'/usr/bin/cat <<\'EOF\'\nrm -rf /\nEOF' 'BASH_FUNC_cat%%=(){bash;}'
+# ...while a body that merely MENTIONS such words stays inert data.
+run allow Bash command $'/usr/bin/git commit -F - <<\'MSG\'\nfeat: add shell alias docs and PATH notes\nMSG'
+# Inert trailing statements after the terminator are fine (echo/printf/true/:
+# with literal args cannot execute what the sink wrote)...
+run allow Bash command $'/usr/bin/cat > /root/.claude/state/notes.md <<\'EOF\'\nrunbook mentions rm -rf /var/tmp/stale and poweroff\nEOF\necho saved'
+run allow Bash command $'/usr/bin/tee /root/notes.md <<\'EOF\'\nmentions gh release create v1.0.0\nEOF\nprintf done\ntrue'
+# ...but anything beyond the inert allowlist still refuses stripping.
+run deny Bash command $'cat > /tmp/s.sh <<\'EOF\'\nrm -rf /\nEOF\necho ok && bash /tmp/s.sh'
+run deny Bash command $'cat > /tmp/s.sh <<\'EOF\'\nrm -rf /\nEOF\necho $(bash /tmp/s.sh)'
+run deny Bash command $'cat > /tmp/s.sh <<\'EOF\'\nrm -rf /\nEOF\necho hi; bash /tmp/s.sh'
+run deny Bash command $'cat > /tmp/s.sh <<\'EOF\'\nrm -rf /\nEOF\necho hi > /tmp/other.sh'
+
+# ---- explicit .bak-artifact pruning is hygiene, not catastrophe ----
+run allow Bash command 'rm /root/ccc-node/bridge/.env.bak-unrestricted-20260717-091410'
+run allow Bash command 'rm -f /root/.claude/settings.json.bak-20260101'
+run allow Bash command 'rm /root/ccc-node/bridge/.env.bak-*'
+run allow Bash command 'rm -v /root/work/config.yaml.bak.old'
+# ...while recursion, originals, directory globs, and mixed operands stay gated.
+run deny Bash command 'rm -r /root/old.bak-dir'
+run deny Bash command 'rm -rf /root/anything.bak-1'
+run deny Bash command 'rm /root/.hermes/.env'
+run deny Bash command 'rm /root/*/x.bak-1'
+run deny Bash command 'rm /root/file.bak-1 /root/other.txt'
+run deny Bash command 'rm -rf /root'
+# Adversarial (review on #571): dynamic/expanded operands can split into extra
+# protected paths after shell expansion — only literal operands are prunable.
+run deny Bash command 'rm /root/x.bak-$SUFFIX'
+run deny Bash command 'rm /root/x.bak-`id`'
+run deny Bash command 'rm /root/x.bak-$(date +%s)'
+run deny Bash command 'rm ~/stale.bak-1'
+run deny Bash command 'rm /root/{a,b}.bak-1'
+
 # ---- escape hatch: gated allowed only with operator signal ----
 run allow Bash command 'git push --force origin main' 'CCC_ALLOW_GATED=1'
 
