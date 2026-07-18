@@ -339,7 +339,7 @@ fi
 # 6c) Rendered standalone settings (base + overlay) must be valid and carry all hook events.
 if jq -s '.[0] as $b | .[1] as $o | $b | .hooks = ($b.hooks + $o.hooks)' \
      claude/settings.base.json claude/hooks/enforcement-overlay.json >"$TMP/rendered.json" 2>/dev/null \
-   && jq -e '.hooks.PreToolUse and .hooks.SessionStart and .statusLine and .outputStyle' "$TMP/rendered.json" >/dev/null 2>&1; then
+   && jq -e '.hooks.SessionStart and .statusLine and .outputStyle' "$TMP/rendered.json" >/dev/null 2>&1; then
   say "  ok rendered standalone settings valid (node-local + portable + statusLine + outputStyle)"
 else
   err "rendered standalone settings (base+overlay) invalid or missing expected keys"

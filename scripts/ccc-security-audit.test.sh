@@ -45,14 +45,20 @@ ok "clean exits 0" '[ "$rc" = 0 ]'
 ok "clean output has security audit heading" 'grep -q "ccc security audit" <<<"$out"'
 ok "clean output reports 정상" 'grep -q "정상" <<<"$out"'
 
-missing_native="$(make_fixture missing-native)"
-jq 'del(.permissions.deny[] | select(. == "Bash(rm -rf /:*)"))' \
-  "$missing_native/home/.claude/settings.json" > "$missing_native/settings.tmp"
-mv "$missing_native/settings.tmp" "$missing_native/home/.claude/settings.json"
-out="$(run_audit "$missing_native")"; rc=$?
-ok "missing native catastrophic deny exits 1" '[ "$rc" = 1 ]'
-ok "missing native catastrophic deny is reported without contents" \
-  'grep -q "native catastrophic deny backstop is incomplete" <<<"$out"'
+# TM-1306 native posture: the clean fixture (no guard hook, no deny entries)
+# must classify 정상; legacy enforcement remnants downgrade to 경고 (exit 0 —
+# rollout-safe) with a rerun-setup hint and no contents printed.
+ok "clean fixture reports the native posture as 정상" \
+  'grep -q "native posture" <<<"$out"'
+legacy="$(make_fixture legacy-remnants)"
+jq '.hooks.PreToolUse = [{"matcher":"Bash","hooks":[{"type":"command","command":"bash /root/.claude/hooks/guard.sh","timeout":10}]}]
+    | .permissions.deny = ["Bash(rm -rf /:*)", "Bash(git push --force origin main:*)"]' \
+  "$legacy/home/.claude/settings.json" > "$legacy/settings.tmp"
+mv "$legacy/settings.tmp" "$legacy/home/.claude/settings.json"
+out="$(run_audit "$legacy")"; rc=$?
+ok "legacy enforcement remnants exit 0 (rollout-safe warning)" '[ "$rc" = 0 ]'
+ok "legacy enforcement remnants are reported with a setup rerun hint" \
+  'grep -q "legacy enforcement remnants" <<<"$out" && grep -q "rerun setup.sh" <<<"$out"'
 
 bad="$(make_fixture bad)"
 printf 'token=%s\n' "$fake_github_token" > "$bad/home/.claude/state/telegram-spool/push.json"
