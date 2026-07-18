@@ -635,7 +635,15 @@ def _operational_relax_enabled():
 # `tee /etc/ccc-node/guard-profile <<'EOF'` still trips the operator-config
 # gate on the argument path.
 _HEREDOC_INTRO_RE = re.compile(r"<<-?[ \t]*(['\"])([A-Za-z_][A-Za-z0-9_.-]*)\1")
-_DATA_SINK_CMDS = {"cat", "tee"}
+# Sink resolution must be IMMUTABLE AND PINNED (adversarial review on #571,
+# round 4): bare command names resolve through mutable shell state — functions
+# (incl. rc-file and exported/inherited ones), aliases, the hash table, and
+# PATH — none of which command-text analysis can prove. An ABSOLUTE path
+# invocation bypasses every one of those resolution channels, so only these
+# exact pinned spellings qualify, and the binary at that path must itself be a
+# root-owned, non-group/world-writable regular file at guard time.
+_DATA_SINK_PATHS = {"/bin/cat", "/usr/bin/cat", "/bin/tee", "/usr/bin/tee"}
+_GIT_SINK_PATHS = {"/bin/git", "/usr/bin/git"}
 # After the intro, only redirection to a LITERAL file path may follow — no
 # pipes, process substitutions, command separators, or expansions.
 _HEREDOC_TAIL_RE = re.compile(r"^([ \t]*>{1,2}[ \t]*[A-Za-z0-9/._+:-]+)*[ \t]*$")
@@ -656,6 +664,9 @@ _SINK_REDEFINITION_RE = re.compile(
     r"\b(?:cat|tee|git)[ \t]*\([ \t]*\)"            # cat() {...} function defs
     r"|\bfunction[ \t]+(?:cat|tee|git)\b"            # function cat {...}
     r"|\balias\b"                                     # any alias definition
+    r"|\bhash\b"                                      # hash-table rebinding
+    r"|\bexport[ \t]+-f\b"                            # function exporting
+    r"|[<>]\("                                        # process substitution
     r"|\b(?:PATH|BASH_ENV|ENV|LD_PRELOAD|LD_LIBRARY_PATH|IFS)[ \t]*="
 )
 
@@ -668,14 +679,25 @@ def _heredoc_sink_statement(prefix):
         words = shlex.split(seg)
     except ValueError:
         return False
-    # The statement must START with the sink word — no env-assignment prefixes
-    # (FOO=... cat): LD_PRELOAD/PATH-style prefixes can re-bind the sink, so
-    # any leading assignment refuses stripping (adversarial review on #571).
+    # The statement must START with an ABSOLUTE pinned sink path — no bare
+    # names (mutable resolution), no env-assignment prefixes (FOO=... cat).
     if not words:
         return False
-    if words[0] in _DATA_SINK_CMDS:
-        return True
-    return len(words) >= 2 and words[0] == "git" and words[1] == "commit"
+    head = words[0]
+    if head in _DATA_SINK_PATHS:
+        return _pinned_binary(head)
+    if head in _GIT_SINK_PATHS and len(words) >= 2 and words[1] == "commit":
+        return _pinned_binary(head)
+    return False
+
+
+def _pinned_binary(path):
+    """The sink binary itself must be a root-owned, non-writable regular file."""
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return False
+    return stat.S_ISREG(st.st_mode) and st.st_uid == 0 and not (st.st_mode & 0o022)
 
 
 def _strip_quoted_heredoc_data(cmd):
@@ -688,6 +710,12 @@ def _strip_quoted_heredoc_data(cmd):
     scans the full text.
     """
     if "<<" not in cmd or "\n" not in cmd:
+        return cmd
+    # Inherited exported shell functions (BASH_FUNC_*) mean name resolution in
+    # the child shell is not provable from the command text — refuse stripping
+    # entirely (absolute-path sinks are immune, but keep the belt with the
+    # suspenders; adversarial review on #571, round 4).
+    if any(k.startswith("BASH_FUNC_") for k in os.environ):
         return cmd
     lines = cmd.split("\n")
     for i, line in enumerate(lines):

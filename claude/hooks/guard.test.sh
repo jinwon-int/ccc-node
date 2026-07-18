@@ -509,9 +509,9 @@ run allow Bash command 'cat /root/.claude/managed-services.allow'
 rm -rf "$SVC_DIR" 2>/dev/null || true
 
 # ---- quoted-heredoc DATA bodies feeding pure sinks are not execution paths ----
-run allow Bash command $'git commit -F - <<\'MSG\'\nfix: guard no longer trips on rm -rf / mentioned in prose\n\nAlso mentions /etc/ccc-node/guard-profile as a path string.\nMSG'
-run allow Bash command $'cat > /root/.claude/state/notes.md <<\'EOF\'\nrunbook says: rm -rf /var/tmp/stale then poweroff the appliance\nEOF'
-run allow Bash command $'tee /root/notes.md <<\'EOF\'\nrelease steps mention gh release create v1.0.0\nEOF'
+run allow Bash command $'/usr/bin/git commit -F - <<\'MSG\'\nfix: guard no longer trips on rm -rf / mentioned in prose\n\nAlso mentions /etc/ccc-node/guard-profile as a path string.\nMSG'
+run allow Bash command $'/usr/bin/cat > /root/.claude/state/notes.md <<\'EOF\'\nrunbook says: rm -rf /var/tmp/stale then poweroff the appliance\nEOF'
+run allow Bash command $'/usr/bin/tee /root/notes.md <<\'EOF\'\nrelease steps mention gh release create v1.0.0\nEOF'
 # ...but interpreter consumers, unquoted heredocs, and gated redirect/argument
 # targets keep the full fail-closed treatment.
 run deny Bash command $'bash <<\'EOF\'\nrm -rf /\nEOF'
@@ -536,12 +536,21 @@ run deny Bash command $'git() { bash; }\ngit commit -F - <<\'EOF\'\nrm -rf /\nEO
 run deny Bash command $'alias cat=bash\ncat <<\'EOF\'\nrm -rf /\nEOF'
 run deny Bash command $'PATH=/tmp/evil:$PATH\ncat <<\'EOF\'\nrm -rf /\nEOF'
 run deny Bash command $'LD_PRELOAD=/tmp/evil.so cat <<\'EOF\'\nrm -rf /\nEOF'
+# Adversarial (review on #571, round 4): sink resolution must be immutable and
+# pinned — BARE names resolve through mutable shell state (rc/exported
+# functions, hash table, PATH) and never qualify, absolute paths do.
+run deny Bash command $'cat > /root/notes.md <<\'EOF\'\nrm -rf /\nEOF'
+run deny Bash command $'git commit -F - <<\'EOF\'\nrm -rf /\nEOF'
+run deny Bash command $'tee /root/notes.md <<\'EOF\'\npoweroff\nEOF'
+run deny Bash command $'/usr/bin/cat > >(bash) <<\'EOF\'\nrm -rf /\nEOF'
+run deny Bash command $'hash -p /tmp/evil/git git\n/usr/bin/git commit -F - <<\'EOF\'\nrm -rf /\nEOF'
+run deny Bash command $'/usr/bin/cat <<\'EOF\'\nrm -rf /\nEOF' 'BASH_FUNC_cat%%=(){bash;}'
 # ...while a body that merely MENTIONS such words stays inert data.
-run allow Bash command $'git commit -F - <<\'MSG\'\nfeat: add shell alias docs and PATH notes\nMSG'
+run allow Bash command $'/usr/bin/git commit -F - <<\'MSG\'\nfeat: add shell alias docs and PATH notes\nMSG'
 # Inert trailing statements after the terminator are fine (echo/printf/true/:
 # with literal args cannot execute what the sink wrote)...
-run allow Bash command $'cat > /root/.claude/state/notes.md <<\'EOF\'\nrunbook mentions rm -rf /var/tmp/stale and poweroff\nEOF\necho saved'
-run allow Bash command $'tee /root/notes.md <<\'EOF\'\nmentions gh release create v1.0.0\nEOF\nprintf done\ntrue'
+run allow Bash command $'/usr/bin/cat > /root/.claude/state/notes.md <<\'EOF\'\nrunbook mentions rm -rf /var/tmp/stale and poweroff\nEOF\necho saved'
+run allow Bash command $'/usr/bin/tee /root/notes.md <<\'EOF\'\nmentions gh release create v1.0.0\nEOF\nprintf done\ntrue'
 # ...but anything beyond the inert allowlist still refuses stripping.
 run deny Bash command $'cat > /tmp/s.sh <<\'EOF\'\nrm -rf /\nEOF\necho ok && bash /tmp/s.sh'
 run deny Bash command $'cat > /tmp/s.sh <<\'EOF\'\nrm -rf /\nEOF\necho $(bash /tmp/s.sh)'
