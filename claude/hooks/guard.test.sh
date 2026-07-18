@@ -26,6 +26,16 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 GUARD="$HERE/guard.sh"
 pass=0; fail=0
 
+# Pinned pure-data sinks are allowlisted by exact absolute path in guard.py,
+# but distro layouts differ: some nodes only ship cat under /bin, others under
+# /usr/bin. Select an existing allowlisted spelling so the heredoc tests
+# exercise sink integrity rather than fail closed on a nonexistent binary.
+PINNED_CAT=""
+for candidate in /usr/bin/cat /bin/cat; do
+  if [ -x "$candidate" ]; then PINNED_CAT="$candidate"; break; fi
+done
+[ -n "$PINNED_CAT" ] || { echo "FAIL: no pinned cat binary found" >&2; exit 1; }
+
 # run <expected:allow|deny> <tool> <field:command|file_path|url|query> <value> [space-separated env assignments]
 run() {
   local expect="$1" tool="$2" field="$3" val="$4" envset="${5:-}"
@@ -510,7 +520,7 @@ rm -rf "$SVC_DIR" 2>/dev/null || true
 
 # ---- quoted-heredoc DATA bodies feeding pure sinks are not execution paths ----
 run allow Bash command $'/usr/bin/git commit -F - <<\'MSG\'\nfix: guard no longer trips on rm -rf / mentioned in prose\n\nAlso mentions /etc/ccc-node/guard-profile as a path string.\nMSG'
-run allow Bash command $'/usr/bin/cat > /root/.claude/state/notes.md <<\'EOF\'\nrunbook says: rm -rf /var/tmp/stale then poweroff the appliance\nEOF'
+run allow Bash command "$PINNED_CAT"$' > /root/.claude/state/notes.md <<\'EOF\'\nrunbook says: rm -rf /var/tmp/stale then poweroff the appliance\nEOF'
 run allow Bash command $'/usr/bin/tee /root/notes.md <<\'EOF\'\nrelease steps mention gh release create v1.0.0\nEOF'
 # ...but interpreter consumers, unquoted heredocs, and gated redirect/argument
 # targets keep the full fail-closed treatment.
@@ -542,14 +552,14 @@ run deny Bash command $'LD_PRELOAD=/tmp/evil.so cat <<\'EOF\'\nrm -rf /\nEOF'
 run deny Bash command $'cat > /root/notes.md <<\'EOF\'\nrm -rf /\nEOF'
 run deny Bash command $'git commit -F - <<\'EOF\'\nrm -rf /\nEOF'
 run deny Bash command $'tee /root/notes.md <<\'EOF\'\npoweroff\nEOF'
-run deny Bash command $'/usr/bin/cat > >(bash) <<\'EOF\'\nrm -rf /\nEOF'
+run deny Bash command "$PINNED_CAT"$' > >(bash) <<\'EOF\'\nrm -rf /\nEOF'
 run deny Bash command $'hash -p /tmp/evil/git git\n/usr/bin/git commit -F - <<\'EOF\'\nrm -rf /\nEOF'
-run deny Bash command $'/usr/bin/cat <<\'EOF\'\nrm -rf /\nEOF' 'BASH_FUNC_cat%%=(){bash;}'
+run deny Bash command "$PINNED_CAT"$' <<\'EOF\'\nrm -rf /\nEOF' 'BASH_FUNC_cat%%=(){bash;}'
 # ...while a body that merely MENTIONS such words stays inert data.
 run allow Bash command $'/usr/bin/git commit -F - <<\'MSG\'\nfeat: add shell alias docs and PATH notes\nMSG'
 # Inert trailing statements after the terminator are fine (echo/printf/true/:
 # with literal args cannot execute what the sink wrote)...
-run allow Bash command $'/usr/bin/cat > /root/.claude/state/notes.md <<\'EOF\'\nrunbook mentions rm -rf /var/tmp/stale and poweroff\nEOF\necho saved'
+run allow Bash command "$PINNED_CAT"$' > /root/.claude/state/notes.md <<\'EOF\'\nrunbook mentions rm -rf /var/tmp/stale and poweroff\nEOF\necho saved'
 run allow Bash command $'/usr/bin/tee /root/notes.md <<\'EOF\'\nmentions gh release create v1.0.0\nEOF\nprintf done\ntrue'
 # ...but anything beyond the inert allowlist still refuses stripping.
 run deny Bash command $'cat > /tmp/s.sh <<\'EOF\'\nrm -rf /\nEOF\necho ok && bash /tmp/s.sh'
