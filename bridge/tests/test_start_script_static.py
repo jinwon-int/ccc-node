@@ -39,6 +39,15 @@ class StartScriptStaticTests(unittest.TestCase):
                     rf"(?m)^\s*echo[^\n]*\$(?:\{{)?{variable}(?:\}})?",
                 )
 
+    def test_systemd_service_recovers_from_clean_process_exit(self):
+        text = _start_text()
+        install_start = text.index("do_install_systemd()")
+        install_end = text.index("do_uninstall_systemd()", install_start)
+        installer = text[install_start:install_end]
+
+        self.assertIn("Restart=always", installer)
+        self.assertNotIn("Restart=on-failure", installer)
+
 
 if __name__ == "__main__":
     unittest.main()

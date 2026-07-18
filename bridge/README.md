@@ -107,9 +107,10 @@ reviewed `scripts/ccc-self-update.sh` path. See
 > **Linux reboot-persistence.** `--install` is macOS/launchd only. On Linux use `--install-systemd`:
 > run as root it writes a system unit to `/etc/systemd/system/ccc-telegram-bridge.service` and
 > runs `systemctl enable --now`; run as a normal user it installs a `systemctl --user` unit under
-> `~/.config/systemd/user`. systemd supervises the bridge in the foreground (restart-on-failure),
-> so do not combine it with `-d`. Override the unit name with `BRIDGE_SERVICE_NAME=...` to run
-> multiple bridges on one host.
+> `~/.config/systemd/user`. systemd supervises the bridge in the foreground with
+> `Restart=always`, so a direct signal that the bridge handles as a clean exit is recovered; an
+> explicit `systemctl stop` remains stopped. Do not combine systemd with `-d`. Override the unit
+> name with `BRIDGE_SERVICE_NAME=...` to run multiple bridges on one host.
 
 ## Usage Examples
 

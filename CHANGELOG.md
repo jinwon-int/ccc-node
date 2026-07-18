@@ -4,6 +4,12 @@ All notable changes to the Claude Code node harness. Dates are KST.
 
 ## [Unreleased]
 
+### Fixed
+- Linux systemd installs now use `Restart=always` so a direct SIGTERM that the
+  bridge handles as a clean exit cannot silently leave Telegram serving down.
+  Explicit `systemctl stop` remains authoritative, and the documented
+  single-supervisor rule still forbids combining systemd with `start.sh -d`.
+
 ## [0.4.0] — 2026-07-18
 
 ### Removed
