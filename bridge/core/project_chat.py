@@ -779,11 +779,11 @@ class ProjectChatHandler(
         if self._execution_profile == EXECUTION_OWNER_OPERATOR:
             if self._claude_unrestricted:
                 # Opt-in Codex parity (owner-operator only): drop the host
-                # settings chain so the PreToolUse guard hook is not loaded,
-                # bypass permission checks, and run without the OS sandbox —
-                # matching Codex's never + dangerFullAccess. Memory context is
-                # preserved through the curated settings block so the model
-                # keeps its MEMORY/USER context without the guard.
+                # settings chain so the node's host hooks/settings are not
+                # loaded, bypass permission checks, and run without the OS
+                # sandbox — matching Codex's never + dangerFullAccess. Memory
+                # context is preserved through the curated settings block so the
+                # model keeps its MEMORY/USER context.
                 opts["permission_mode"] = "bypassPermissions"
                 opts["setting_sources"] = []
                 curated_settings = build_curated_memory_settings(self._config)
@@ -791,9 +791,9 @@ class ProjectChatHandler(
                     opts["settings"] = curated_settings
             else:
                 # Owner-operated bridges intentionally retain host utility and
-                # the normal Claude Code settings/context chain. Access
-                # control (the PreToolUse guard), not a project-root sandbox,
-                # is the boundary for this explicit profile.
+                # the normal Claude Code settings/context chain. Access control
+                # plus the host audit trail, not a project-root sandbox, is the
+                # boundary for this explicit profile.
                 opts["setting_sources"] = ["user", "project", "local"]
         else:
             # Every non-owner profile suppresses filesystem settings. Even when

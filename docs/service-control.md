@@ -1,100 +1,50 @@
 # Service control
 
-`claude/hooks/guard.py` (behind the `guard.sh` shim) is a defense-in-depth
-policy hook, **not a sandbox**. The enforceable boundary is an unprivileged
-agent account plus a root-owned wrapper and root-owned exact-unit allowlist.
+This node runs the native Claude Code posture: there is **no PreToolUse policy
+hook** (the semantic guard was removed, TM-1306). The Fresh-Approval /
+service-control boundary is now two things working together:
 
-## Operational-relax profile (fresh-root default, operator-owned)
+1. **Behavioral policy** the agent self-enforces from `CLAUDE.md` (what is
+   autonomous vs. what needs fresh operator approval), and
+2. **Real OS-level boundaries** — an unprivileged agent account plus root-owned
+   wrappers and root-owned exact-unit allowlists — for anything that must be
+   enforceable by the OS rather than by policy.
 
-Without a valid profile, the guard enforces the full Fresh-Approval boundary
-below. A genuinely fresh root-run `setup.sh` install seeds the root-owned
-`/etc/ccc-node/guard-profile` by default. Use `--strict-guard` to opt a fresh
-root install out. An existing profile-less strict root node stays strict during
-routine setup/self-update and can be explicitly relaxed later with
-`sudo ./setup.sh --operational-relax`. The profile contains the line
-`operational-relax`; see `docs/examples/guard-profile.example`. When present
-and valid, the guard treats **all** service/container/orchestrator lifecycle
-(`systemctl`/`service`/`pm2`/`docker`/`podman`/`kubectl`
-start·stop·restart·reload·scale·rollout·…, local or toward any peer) and
-**reboot of any host** as autonomous.
-
-Non-root setup never installs the profile, and a non-root explicit opt-in is
-rejected before managed files change. Setup validates the destination for
-symlink components and atomically creates the profile with mode `0644`. It never
-overwrites an existing operator profile, including an intentionally fail-closed
-malformed file or symlink.
-
-### Operator-approved acceptance criteria (2026-07-17)
-
-- Fresh root ccc-node install: seed `operational-relax` by default.
-- Fresh root strict exception: require the explicit `--strict-guard` opt-out.
-- Existing profile-less install: do not widen during routine setup/self-update.
-- Existing strict root install: retain `--operational-relax` as an explicit
-  later opt-in.
-- Existing operator file or symlink: never overwrite it.
-- Review may harden UID/path/atomicity handling, but changing these default and
-  opt-in/opt-out semantics requires a new explicit operator decision.
-
-The profile is **fail-closed and cannot self-escalate**: it is honored only when
-the file is owned by `root` (uid 0), a regular non-symlink, and not group/world
-writable — the unprivileged agent cannot write a root-owned `/etc` file, and the
-guard additionally denies writes to the path. Absent, malformed, or weaker-owned
-→ strict.
-
-On a root-run node, root ownership cannot isolate the profile from the agent;
-the guard remains a policy hook rather than an OS privilege boundary. Run the
-agent unprivileged when self-enable resistance must be enforceable by the OS.
-
-It **never** relaxes the catastrophic / injection set, regardless of the
-profile: catastrophic `rm`, secret exfiltration, force-push/history-rewrite of
+The catastrophic / injection set is **always** fresh-approval regardless of
+lane: catastrophic `rm`, secret exfiltration, force-push/history-rewrite of
 protected branches, DB destructive/migrate/replay, release/publish +
 repo-visibility, host power-down (`poweroff`/`halt`), and operator-config
-writes. A mixed remote body containing both reboot and any down-class command
-is down-class and remains gated. Those stay enforced because an unattended
-prompt injection reading untrusted input (PRs, web, A2A) could otherwise trigger
-irreversible damage.
+writes. These stay behaviorally gated because an unattended prompt injection
+reading untrusted input (PRs, web, A2A) could otherwise trigger irreversible
+damage; the OS-level boundaries below are the backstop for the destructive
+subset.
 
-## Policy
+## Policy (behavioral — self-enforced from CLAUDE.md)
 
-- **Fleet-service lifecycle is autonomous** (operator-approved relaxation; see
-  `claude/hooks/RISK-PROFILES.md`): `start`/`restart`/`reload`/`stop`/`kill` of
-  units whose name carries `a2a`/`hermes`/`openclaw`/`broker`/`gateway`/`worker`
-  or is `ccc-telegram-bridge` — locally or toward a peer node
+- **Fleet-service lifecycle is autonomous**: `start`/`restart`/`reload`/`stop`/
+  `kill` of units whose name carries
+  `a2a`/`hermes`/`openclaw`/`broker`/`gateway`/`worker` or is
+  `ccc-telegram-bridge` — locally or toward a peer node
   (`ssh <node> systemctl restart <unit>`, `systemctl -H <node> …`).
-- **Managed-node operations are autonomous for allowlisted hosts** (opt-in;
-  `~/.claude/managed-nodes.allow`): a Bash statement whose only remote reach
-  (via `ssh`/`scp`/`rsync`/`sftp`/`systemctl -H`) is to a listed host may deploy
-  secrets/keys, clean up remote paths, run remote service **config** verbs
-  (`enable`/`daemon-reload`), and reboot that host. See
-  `docs/examples/managed-nodes.allow.example`. The allowlist is operator-owned
-  and write-gated for agents; with no allowlist the behavior is the fleet-only
-  baseline.
+- **Managed-node operations are autonomous for operator-designated hosts**: a
+  statement whose only remote reach (via `ssh`/`scp`/`rsync`/`sftp`/
+  `systemctl -H`) is to an operator-managed host may deploy secrets/keys, clean
+  up remote paths, run remote service **config** verbs (`enable`/`daemon-reload`),
+  and reboot that host.
 - **Reboot is autonomous on the LOCAL node and managed nodes** — `reboot` /
   `shutdown -r` is disruptive but recoverable (the node comes back). It stays
-  gated for an unlisted remote host and for interpreter-mediated forms.
-- **Local non-fleet apps the node self-manages are autonomous for allowlisted
-  units** (opt-in; `~/.claude/managed-services.allow`): `systemctl`/`service`/
-  `pm2`/`docker`/`podman` lifecycle of a LOCAL unit/container is allowed when
-  every target is listed. System services you did not list (`sshd`/`ufw`/`nginx`/
-  …), mixed targets, `daemon-reload`, other `docker compose` lifecycle, and
-  `kubectl` stay gated. Direct local detached reconciliation —
-  `docker compose up -d [services...]` or `docker-compose up --detach` — is
-  autonomous without an allowlist. One reconciliation may be wrapped in the
-  fixed operator runbook shape: a literal project `cd`, optional rollback
-  `docker tag`, one `up -d`, then `docker inspect`, `sleep` bounded to 300
-  seconds, and
-  loopback-only health `curl`. A direct `ssh <peer> "..."` form is also allowed
-  when every explicit Compose service is a fleet service. Arbitrary compound
-  commands, external or mutating curl, multiple reconciliations, remote-daemon
-  flags, wrappers, substitutions, and non-detached `up` stay gated. See
-  `docs/examples/managed-services.allow.example`. This guard relaxation makes
-  an approved runbook executable; it does not replace the standing fresh
-  approval requirement for cross-broker mutations.
-- Everything else is fail-closed: `systemctl`/`service`/`pm2` lifecycle of
-  non-fleet units on hosts that are not managed, config-changing verbs on the
-  local node, `pm2 delete`, and docker/podman/kubectl lifecycle require fresh
-  operator approval. Compound commands are judged per statement; one non-fleet,
-  non-managed target denies the whole command.
+  fresh-approval for an unlisted remote host.
+- **Local non-fleet apps the node self-manages are autonomous**: `systemctl`/
+  `service`/`pm2`/`docker`/`podman` lifecycle of a LOCAL unit/container the
+  operator designated as self-managed. System services you did not designate
+  (`sshd`/`ufw`/`nginx`/…) stay fresh-approval. Direct local detached
+  reconciliation (`docker compose up -d [services...]`) is autonomous, but new
+  runbook needs go through the reviewed `ccc-broker-reconcile` wrapper, not
+  ad-hoc grammar. This does not replace the standing fresh approval requirement
+  for cross-broker mutations.
+- Everything else is fresh-approval: `systemctl`/`service`/`pm2` lifecycle of
+  non-fleet units on unmanaged hosts, config-changing verbs on the local node,
+  `pm2 delete`, and other docker/podman/kubectl lifecycle.
 - The down-class of host lifecycle (`poweroff`/`halt`/`shutdown` without `-r`)
   requires fresh operator approval **everywhere** — local, managed, or unlisted —
   because a powered-off node stays offline until manual power-on.
@@ -105,11 +55,8 @@ irreversible damage.
   exact `.service` names in `/etc/ccc-node/service-control.allow`.
 - Broker Compose reconciliation uses the installed `ccc-broker-reconcile`
   wrapper (root-owned, so the agent cannot alter the wrapper or its operator
-  config) instead of raw `docker compose up -d`. This moves the fixed command
-  shape out of the PreToolUse guard's ALLOW-grammar: new runbook needs are
-  reviewed inside the wrapper, not
-  added as guard grammar. The legacy inline Compose grammar remains accepted
-  during migration and is removed once the wrapper is deployed fleet-wide.
+  config) instead of raw `docker compose up -d`. New runbook needs are reviewed
+  inside the wrapper.
 
 ## Operator installation (not performed by setup.sh)
 
@@ -157,16 +104,15 @@ Same trust model (never grant to a mutable checkout copy):
 3. Create `/etc/ccc-node/broker-reconcile.allow`, owned by `root:root`, mode
    `0600`, with one exact Compose service name per line.
 4. The agent invokes
-   `/usr/local/libexec/ccc-broker-reconcile <service> [<service>...]`; the guard
-   accepts only that direct absolute path and exact service tokens. The wrapper
-   rechecks itself and both root-owned config files, rejects daemon/Compose
-   environment overrides, `cd`s to the fixed project dir, exports
-   `A2A_BROKER_REVISION=$(git rev-parse HEAD)`, and runs `/usr/bin/docker compose
-   up -d <allowlisted services>`.
+   `/usr/local/libexec/ccc-broker-reconcile <service> [<service>...]` with exact
+   service tokens. The wrapper rechecks itself and both root-owned config files,
+   rejects daemon/Compose environment overrides, `cd`s to the fixed project dir,
+   exports `A2A_BROKER_REVISION=$(git rev-parse HEAD)`, and runs
+   `/usr/bin/docker compose up -d <allowlisted services>`.
 
 Scope note: this wrapper performs no `sudo` and no privilege escalation. Its
-purpose is wrapper/config and command-shape **integrity** and removing the
-runbook from the guard's inline Compose grammar — not privilege reduction or
+purpose is wrapper/config and command-shape **integrity** — keeping the runbook
+as a single reviewed root-owned entrypoint — not privilege reduction or
 integrity of the broker checkout/Compose payload itself. For unattended
 reconciliation the agent account still needs Docker
 access, which remains a host-root-equivalent grant (see the note above); the
@@ -175,8 +121,6 @@ wrapper does not change that boundary.
 ## Verification
 
 ```bash
-bash claude/hooks/guard.test.sh
-python3 claude/hooks/guard-profile.test.py
 bash scripts/ccc-service-control.test.sh
 bash scripts/ccc-broker-reconcile.test.sh
 bash scripts/validate-harness.sh

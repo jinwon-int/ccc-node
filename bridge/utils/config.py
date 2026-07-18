@@ -294,10 +294,10 @@ class Config(BaseSettings):
             "Opt-in Codex-parity ungoverned Claude execution (owner-operator "
             "only; ignored on every other profile). When true, the Claude SDK "
             "path runs with permission_mode=bypassPermissions, no OS sandbox, "
-            "and no host settings chain — so the PreToolUse guard hook is not "
-            "loaded — matching Codex's never + dangerFullAccess. Memory context "
-            "is preserved. Default false keeps guard.py as the boundary; set per "
-            "node and reversible."
+            "and no host settings chain — so the node's host hooks/settings are "
+            "not loaded — matching Codex's never + dangerFullAccess. Memory "
+            "context is preserved. Default false keeps the node's normal governed "
+            "path (host settings + audit trail); set per node and reversible."
         ),
     )
     telegram_session_scope: Literal[

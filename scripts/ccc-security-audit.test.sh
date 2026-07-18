@@ -19,9 +19,8 @@ make_fixture() { # <name>
   cp "$ROOT/claude/settings.base.json" "$dir/repo/claude/settings.base.json"
   cp "$ROOT/setup.sh" "$dir/repo/setup.sh"
   cp "$ROOT/claude/hooks/scan-injection.sh" "$dir/repo/claude/hooks/scan-injection.sh"
-  cp "$ROOT/claude/hooks/guard.sh" "$dir/home/.claude/hooks/guard.sh"
   cp "$ROOT/claude/hooks/scan-injection.sh" "$dir/home/.claude/hooks/scan-injection.sh"
-  chmod +x "$dir/home/.claude/hooks/guard.sh" "$dir/home/.claude/hooks/scan-injection.sh"
+  chmod +x "$dir/home/.claude/hooks/scan-injection.sh"
   jq -s '.[0] as $b | .[1] as $o | $b | .hooks = ($b.hooks + $o.hooks)' \
     "$ROOT/claude/settings.base.json" "$ROOT/claude/hooks/enforcement-overlay.json" > "$dir/home/.claude/settings.json"
   printf '{"baseUrl":"https://example.invalid"}\n' > "$dir/home/.hermes/honcho.json"

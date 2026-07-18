@@ -7,13 +7,11 @@
 # Usage:
 #   ./setup.sh                 # standalone: install full settings (portable hooks included)
 #   ./setup.sh --with-plugin   # plugin mode: lean settings; the ccc-node PLUGIN owns the
-#                              #   portable hooks (guard/audit/redact/notify) — avoids the
+#                              #   portable hooks (audit/redact/notify) — avoids the
 #                              #   double-firing you'd get if both settings.json and the
 #                              #   plugin registered them. Node-local hooks stay in settings.
 #   ./setup.sh --dry-run       # show what would happen, change nothing (combine with above)
 #   ./setup.sh --no-backup     # skip the durable operator backup (failure rollback remains enabled)
-#   ./setup.sh --strict-guard  # keep a fresh root install strict instead of seeding operational-relax
-#   sudo ./setup.sh --operational-relax  # explicitly relax an existing profile-less root install
 #
 # Node-identity seeding (optional): when these are given, freshly-seeded CLAUDE.md / MEMORY.md /
 # USER.md have their <PLACEHOLDER> tokens substituted automatically (existing files are never
@@ -29,19 +27,19 @@
 #   --user-context <text>                       -> <USER_CONTEXT>
 set -euo pipefail
 
-DRY=0; WITH_PLUGIN=0; BACKUP=1; OPERATIONAL_RELAX=0; STRICT_GUARD=0
+DRY=0; WITH_PLUGIN=0; BACKUP=1
 OPT_NODE=""; OPT_DISPLAY=""; OPT_SLOT=""; OPT_FLEET_ROLE=""; OPT_LANG=""
 OPT_USER_NAME=""; OPT_USER_GH=""; OPT_USER_TZ=""; OPT_USER_CONTEXT=""
 need_val() { [ -n "${2:-}" ] || { echo "Flag $1 requires a value" >&2; exit 2; }; }
 _ccc_is_root() {
-  local uid="" test_root="" test_profile="" readlink_bin="" candidate
-  # Deterministic CI seam, accepted only for a canonical profile beneath the
-  # caller's existing writable temp root. Resolve readlink only from exact
-  # system paths because distro layouts may place coreutils in /bin or
-  # /usr/bin; never trust PATH for this security boundary. Production /etc
-  # decisions always use the pinned system id binary, and traversal out of
-  # TMPDIR cannot activate this seam.
-  if [ -n "${CCC_SETUP_TEST_EUID:-}" ] && [ -n "${CCC_SETUP_GUARD_PROFILE_PATH:-}" ]; then
+  local uid="" test_root="" test_target="" readlink_bin="" candidate
+  # Deterministic CI seam for the root-aware bypassPermissions neutralization,
+  # accepted only when the install target resolves beneath the caller's existing
+  # writable temp root. Resolve readlink only from exact system paths because
+  # distro layouts may place coreutils in /bin or /usr/bin; never trust PATH for
+  # this security boundary. A production install target (e.g. /root/.claude)
+  # never resolves under TMPDIR, so the seam cannot activate outside tests.
+  if [ -n "${CCC_SETUP_TEST_EUID:-}" ] && [ -n "${CCC_CLAUDE_DIR:-}" ]; then
     for candidate in /usr/bin/readlink /bin/readlink; do
       if [ -f "$candidate" ] && [ -x "$candidate" ] && [ ! -L "$candidate" ]; then
         readlink_bin="$candidate"
@@ -50,10 +48,10 @@ _ccc_is_root() {
     done
     if [ -n "$readlink_bin" ]; then
       test_root="$("$readlink_bin" -m -- "${TMPDIR:-/tmp}" 2>/dev/null || true)"
-      test_profile="$("$readlink_bin" -m -- "$CCC_SETUP_GUARD_PROFILE_PATH" 2>/dev/null || true)"
+      test_target="$("$readlink_bin" -m -- "$CCC_CLAUDE_DIR" 2>/dev/null || true)"
     fi
     if [ -n "$test_root" ] && [ -d "$test_root" ] && [ -w "$test_root" ]; then
-      case "$test_profile" in
+      case "$test_target" in
         "$test_root"/*) uid="$CCC_SETUP_TEST_EUID" ;;
       esac
     fi
@@ -69,8 +67,6 @@ while [ $# -gt 0 ]; do
     --dry-run) DRY=1 ;;
     --with-plugin) WITH_PLUGIN=1 ;;
     --no-backup) BACKUP=0 ;;
-    --strict-guard) STRICT_GUARD=1 ;;
-    --operational-relax) OPERATIONAL_RELAX=1 ;;
     --node)         need_val "$1" "${2:-}"; OPT_NODE="$2"; shift ;;
     --display)      need_val "$1" "${2:-}"; OPT_DISPLAY="$2"; shift ;;
     --slot)         need_val "$1" "${2:-}"; OPT_SLOT="$2"; shift ;;
@@ -94,9 +90,6 @@ HERMES_ROOT="${CCC_HERMES_DIR:-$HOME/.hermes}"
 HERMES_DIR="$HERMES_ROOT/memories"      # legacy memory location (fallback only)
 WIKI_AGENT_BIN="${CCC_WIKI_AGENT_BIN:-$HOME/.wiki-agent/bin/wiki-agent}"
 BRIDGE_DEFAULT_PATH="${CCC_BRIDGE_DEFAULT_PATH:-$HOME}"
-# Test-only path seam. The runtime guard intentionally reads the fixed
-# /etc/ccc-node/guard-profile path; production setup should use this default.
-GUARD_PROFILE_PATH="${CCC_SETUP_GUARD_PROFILE_PATH:-/etc/ccc-node/guard-profile}"
 HARNESS_PATHS_LIB="$SRC/scripts/lib/harness-paths.sh"
 if [ ! -r "$HARNESS_PATHS_LIB" ]; then
   echo "ERROR: shared harness path library is missing: $HARNESS_PATHS_LIB" >&2
@@ -117,42 +110,6 @@ case "$SRC" in
     echo "       move the checkout to a path matching [A-Za-z0-9/._-] (canonical: /opt/ccc-node)" >&2
     exit 2 ;;
 esac
-
-# Capture this before setup installs the hook. Routine setup/self-update must
-# not widen an existing profile-less strict node; the default applies only to a
-# genuinely fresh root ccc-node install.
-CCC_NODE_PREEXISTING=0
-for marker in hooks/guard.py hooks/guard.sh hooks/load-memory.sh hooks/ccc-self-update.sh; do
-  if [ -e "$CLAUDE_DIR/$marker" ] || [ -L "$CLAUDE_DIR/$marker" ]; then
-    CCC_NODE_PREEXISTING=1
-    break
-  fi
-done
-
-if [ "$OPERATIONAL_RELAX" = 1 ] && [ "$STRICT_GUARD" = 1 ]; then
-  echo "ERROR: --operational-relax and --strict-guard are mutually exclusive; no setup changes were made" >&2
-  exit 2
-fi
-
-GUARD_PROFILE_INSTALL=0
-GUARD_PROFILE_REASON=""
-if [ "$OPERATIONAL_RELAX" = 1 ]; then
-  if ! _ccc_is_root; then
-    echo "ERROR: --operational-relax requires root; no setup changes were made" >&2
-    exit 2
-  fi
-  GUARD_PROFILE_INSTALL=1
-  GUARD_PROFILE_REASON="explicit operational-relax"
-elif [ "$STRICT_GUARD" = 0 ] && [ "$CCC_NODE_PREEXISTING" = 0 ] && _ccc_is_root; then
-  GUARD_PROFILE_INSTALL=1
-  GUARD_PROFILE_REASON="fresh root default"
-fi
-
-if [ "$GUARD_PROFILE_INSTALL" = 1 ]; then
-  if [ ! -e "$GUARD_PROFILE_PATH" ] && [ ! -L "$GUARD_PROFILE_PATH" ]; then
-    ccc_validate_setup_guard_profile "$GUARD_PROFILE_PATH" || exit 2
-  fi
-fi
 
 render_command() {
   printf '[dry-run]'
@@ -265,9 +222,9 @@ merge_settings_json() {
 # permission mode) when it runs with root/sudo privileges, so a node whose
 # Claude runs as root would reject every new session if it inherited the
 # `bypassPermissions` default. On such a node, drop the installed default so
-# Claude falls back to its normal prompting mode; the ccc-node PreToolUse
-# guard remains the boundary either way. Non-root nodes keep the no-prompt
-# default. The setup user is used as the proxy for the run user (the dominant
+# Claude falls back to its normal prompting mode (the native Claude Code
+# posture). Non-root nodes keep the no-prompt default. The setup user is used
+# as the proxy for the run user (the dominant
 # case is setup-as-root == service-as-root); the bridge additionally enforces
 # this at runtime for its own SDK path.
 
@@ -285,63 +242,11 @@ neutralize_bypass_if_root() {
          then .permissions |= del(.defaultMode) else . end' "$dest" > "$tmp" 2>/dev/null \
      && jq -e . "$tmp" >/dev/null 2>&1; then
     mv "$tmp" "$dest"
-    note "root node: dropped bypassPermissions defaultMode (guard remains the boundary)"
+    note "root node: dropped bypassPermissions defaultMode (native Claude Code posture)"
   else
     rm -f "$tmp"
     echo "ERROR: failed to neutralize bypassPermissions for root at '$dest' (existing file left untouched)" >&2
     return 1
-  fi
-}
-
-install_operational_relax_profile() {
-  [ "$GUARD_PROFILE_INSTALL" = 1 ] || return 0
-
-  # An operator-created file (including an intentionally fail-closed malformed
-  # file or symlink) is never replaced by setup.
-  if [ -e "$GUARD_PROFILE_PATH" ] || [ -L "$GUARD_PROFILE_PATH" ]; then
-    note "guard profile already exists — left untouched: $GUARD_PROFILE_PATH"
-    return 0
-  fi
-
-  local parent source tmp
-  parent="$(dirname "$GUARD_PROFILE_PATH")"
-  source="$SRC/docs/examples/guard-profile.example"
-  ccc_validate_setup_guard_profile "$GUARD_PROFILE_PATH" || return 1
-  if [ "$DRY" = 1 ]; then
-    render_command mkdir -p "$parent"
-    echo "[dry-run] $GUARD_PROFILE_REASON: install guard profile -> $GUARD_PROFILE_PATH"
-    return 0
-  fi
-  [ -r "$source" ] || {
-    echo "ERROR: tracked guard profile template is missing: $source" >&2
-    return 1
-  }
-  mkdir -p "$parent"
-  # Recheck after creating missing parents; do not follow a component swapped to
-  # a symlink between the preflight and the final profile mutation.
-  ccc_validate_setup_guard_profile "$GUARD_PROFILE_PATH" || return 1
-  tmp="$(mktemp "$parent/.guard-profile.XXXXXX")" || {
-    echo "ERROR: mktemp failed for $GUARD_PROFILE_PATH" >&2
-    return 1
-  }
-  if ! install -m 0644 "$source" "$tmp"; then
-    rm -f -- "$tmp"
-    echo "ERROR: failed to stage guard profile for $GUARD_PROFILE_PATH" >&2
-    return 1
-  fi
-  # A hard-link create is atomic and refuses to overwrite a profile created by
-  # an operator or concurrent installer between the checks above.
-  if ln "$tmp" "$GUARD_PROFILE_PATH" 2>/dev/null; then
-    rm -f -- "$tmp"
-    note "$GUARD_PROFILE_REASON: installed guard profile -> $GUARD_PROFILE_PATH"
-  else
-    rm -f -- "$tmp"
-    if [ -e "$GUARD_PROFILE_PATH" ] || [ -L "$GUARD_PROFILE_PATH" ]; then
-      note "guard profile appeared concurrently — left untouched: $GUARD_PROFILE_PATH"
-    else
-      echo "ERROR: failed to install guard profile at $GUARD_PROFILE_PATH" >&2
-      return 1
-    fi
   fi
 }
 
@@ -382,7 +287,7 @@ run mkdir -p "$CLAUDE_DIR/hooks" "$CLAUDE_DIR/hooks/lib"
 # settings.json is composed from two sources so the portable enforcement/observability
 # hooks have a SINGLE owner (no double-firing):
 #   - claude/settings.base.json          : node-local hooks + statusLine + outputStyle (always)
-#   - claude/hooks/enforcement-overlay.json : portable hooks guard/audit/redact/notify
+#   - claude/hooks/enforcement-overlay.json : portable hooks audit/redact/notify
 # Standalone (default): base + overlay merged → settings.json owns everything.
 # --with-plugin: base only → the ccc-node plugin's hooks/hooks.json owns the portable hooks.
 if [ "$WITH_PLUGIN" = 1 ]; then
@@ -416,8 +321,6 @@ run cp "$SRC/claude/hooks/refresh-memory.sh" "$CLAUDE_DIR/hooks/refresh-memory.s
 run cp "$SRC/claude/hooks/scan-injection.sh" "$CLAUDE_DIR/hooks/scan-injection.sh"
 run cp "$SRC/claude/hooks/load-tools.sh" "$CLAUDE_DIR/hooks/load-tools.sh"
 run cp "$SRC/claude/hooks/checkpoint.sh" "$CLAUDE_DIR/hooks/checkpoint.sh"
-run cp "$SRC/claude/hooks/guard.sh" "$CLAUDE_DIR/hooks/guard.sh"
-run cp "$SRC/claude/hooks/guard.py" "$CLAUDE_DIR/hooks/guard.py"
 run cp "$SRC/claude/hooks/audit.sh" "$CLAUDE_DIR/hooks/audit.sh"
 run cp "$SRC/claude/hooks/redact.sh" "$CLAUDE_DIR/hooks/redact.sh"
 run cp "$SRC/claude/hooks/notify.sh" "$CLAUDE_DIR/hooks/notify.sh"
@@ -471,8 +374,6 @@ installed_hook_scripts=(
   "$CLAUDE_DIR/hooks/scan-injection.sh"
   "$CLAUDE_DIR/hooks/load-tools.sh"
   "$CLAUDE_DIR/hooks/checkpoint.sh"
-  "$CLAUDE_DIR/hooks/guard.sh"
-  "$CLAUDE_DIR/hooks/guard.py"
   "$CLAUDE_DIR/hooks/audit.sh"
   "$CLAUDE_DIR/hooks/redact.sh"
   "$CLAUDE_DIR/hooks/notify.sh"
@@ -507,7 +408,7 @@ run chmod +x "${installed_hook_scripts[@]}"
 # Output style (한국어 구조화 보고) — node-agnostic; settings.json activates it as outputStyle.
 run mkdir -p "$CLAUDE_DIR/output-styles"
 run cp "$SRC/claude/output-styles/"*.md "$CLAUDE_DIR/output-styles/"
-# Headless runner for cron/A2A/CI (`claude -p` wrapper, guard still applies).
+# Headless runner for cron/A2A/CI (`claude -p` wrapper).
 run cp "$SRC/claude/headless.sh" "$CLAUDE_DIR/headless.sh"
 run chmod +x "$CLAUDE_DIR/headless.sh"
 # checkpoint.sh creates its runtime state directory on demand. setup.sh must not
@@ -753,8 +654,4 @@ printf '  - CCC_CODEX_CLI_PATH=%s/hooks/ccc-codex\n' "$CLAUDE_DIR"
 printf '  - CCC_CODEX_MEMORY_MATERIALIZER_PATH=%s/hooks/ccc_codex_memory.py\n' "$CLAUDE_DIR"
 printf '  - bridge command=./start.sh --path %s -d\n' "$BRIDGE_DEFAULT_PATH"
 
-# This is the final managed mutation. It runs for the approved fresh-root
-# default or an explicit existing-node opt-in and atomically refuses to
-# overwrite an operator or concurrent profile.
-install_operational_relax_profile
 SETUP_TXN_ACTIVE=0

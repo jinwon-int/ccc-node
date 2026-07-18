@@ -157,7 +157,7 @@ wc -l ~/.claude/state/wiki-candidates.md
 
    - **`dryrun`** — `touch ~/.claude/state/distill.dryrun`. Confirm.
 
-   - **`live`** — flip via rename (NOT `rm` — `guard.sh` blocks `rm-catastrophic`). Use a timestamped archive:
+   - **`live`** — flip via rename (prefer an archiving `mv` over `rm` so the prior state stays recoverable). Use a timestamped archive:
      ```bash
      mv ~/.claude/state/distill.dryrun \
         ~/.claude/state/distill.dryrun.off-$(date -u +%Y%m%d%H%M%S) 2>&1

@@ -13,8 +13,8 @@ git clone https://github.com/jinwon-int/ccc-node.git
 cd ccc-node
 ./setup.sh --dry-run   # preview resolved paths and planned writes
 ./setup.sh             # install harness files/templates into ~/.claude and ~/.hermes
-# Fresh root installs seed operational-relax; add --strict-guard to opt out.
-# Existing strict root nodes can opt in later: sudo ./setup.sh --operational-relax
+# Root-run nodes: setup drops the bypassPermissions default (Claude Code refuses
+# it under root); run Claude as a non-root user to keep the no-prompt default.
 
 # Optional Telegram bridge:
 cd bridge

@@ -21,6 +21,6 @@ The expected Claude lane has `A2A_OPENCLAW_ANALYSIS_BIN`/`OPENCLAW_BIN` pointing
    - large independent + healthy host → `a2a-explorer` + up to two `a2a-implementer`s on **disjoint write sets** + `a2a-verifier`; you finalize.
 3. **Spawn** the chosen sub-agents (`Agent` tool, `subagent_type: a2a-*`). Shrink the budget under host pressure. Sub-agents are evidence-only, redaction-mandatory, and never finalize.
 4. **You are the single finalizer** — own the terminal evidence packet and any PR (PR-first via the `gh-pr-flow` skill).
-5. **Respect the guard**: Fresh-Approval actions (deploy/secret/DB/force-push/release, non-fleet or local host lifecycle) are denied by `guard.py` (behind the `guard.sh` shim) and require operator approval (`CCC_ALLOW_GATED=1`). Fleet-service restarts (a2a/hermes/broker/gateway/worker/ccc-telegram-bridge, local or peer) and operations to allowlisted managed nodes are autonomous — see `hooks/RISK-PROFILES.md`.
+5. **Respect Fresh Approval**: Fresh-Approval actions (deploy/secret/DB/force-push/release, non-fleet or local host lifecycle) require operator approval — this is behavioral policy from `CLAUDE.md`, not a hook. Fleet-service restarts (a2a/hermes/broker/gateway/worker/ccc-telegram-bridge, local or peer) and operations to operator-managed nodes are autonomous — see the Fresh Approval / Service-control policy in `CLAUDE.md`.
 
 Report the chosen budget + roster and why, then proceed. If the task can't be done from available material, return `status=blocked` rather than guessing.

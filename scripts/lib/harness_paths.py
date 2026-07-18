@@ -52,18 +52,6 @@ def setup_roots(args: list[str]) -> None:
         fail("ERROR: Claude and Hermes install roots must not overlap")
 
 
-def setup_guard_profile(args: list[str]) -> None:
-    if len(args) != 1:
-        fail("ERROR: guard profile validator requires one path")
-    raw = args[0]
-    if not raw or not os.path.isabs(raw):
-        fail("ERROR: guard profile path must be a non-empty absolute path")
-    path = normalized(raw)
-    if path == os.path.sep:
-        fail("ERROR: refusing filesystem-root guard profile path")
-    check_components(path, "ERROR: guard profile path contains symlink component")
-
-
 def self_update_roots(args: list[str]) -> None:
     if len(args) != 3:
         fail("self-update: runtime validator requires Claude, Hermes, and state paths")
@@ -132,7 +120,6 @@ def main() -> None:
     mode, args = sys.argv[1], sys.argv[2:]
     handlers = {
         "setup-roots": setup_roots,
-        "setup-guard-profile": setup_guard_profile,
         "self-update-roots": self_update_roots,
         "self-update-repo": self_update_repo,
         "managed-artifacts": managed_artifacts,

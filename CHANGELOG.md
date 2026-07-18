@@ -4,33 +4,25 @@ All notable changes to the Claude Code node harness. Dates are KST.
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-07-18
+
+### Removed
+- **Semantic PreToolUse guard removed (TM-1306).** The node now runs the native
+  Claude Code posture and Fresh Approval Required is **behavioral policy**
+  (`CLAUDE.md`), not a hook-enforced boundary. Deleted `claude/hooks/guard.py` +
+  `guard.sh` and their tests, the operational-relax / operator-trust guard
+  profile machinery (`/etc/ccc-node/guard-profile`, the `--strict-guard` /
+  `--operational-relax` setup flags, `docs/examples/guard-profile.example`), the
+  managed-node / managed-service allowlists (`managed-nodes.allow`,
+  `managed-services.allow` and their examples), and `RISK-PROFILES.md`. Stage 1
+  (#576) unwired the PreToolUse hook and dropped `permissions.deny`; this stage
+  deletes the now-dormant sources, tests, and profile provisioning. The real
+  OS-level boundaries are unchanged: the unprivileged agent account and the
+  root-owned `ccc-service-control` / `ccc-broker-reconcile` wrappers with their
+  root-owned exact-unit allowlists remain the enforceable service-control
+  boundary.
+
 ### Added
-- **Operational-relax guard profile** — an operator-owned way to relax
-  the guard's operational categories without weakening the catastrophic
-  boundary. When a root-owned `/etc/ccc-node/guard-profile` (regular,
-  non-symlink, not group/world writable) contains `operational-relax`,
-  `guard.py` treats ALL service/container/orchestrator lifecycle
-  (`systemctl`/`service`/`pm2`/`docker`/`podman`/`kubectl`, local or toward any
-  peer) and reboot of any host as autonomous. It is **fail-closed** (absent /
-  malformed / weaker-owned → strict; the code default is unchanged) and
-  **cannot self-escalate** (the unprivileged agent cannot write a root-owned
-  `/etc` file, and the guard also denies writes to the path). On a root-run
-  node the hook is policy, not an OS privilege boundary. It **never**
-  relaxes the catastrophic / injection set regardless of the profile:
-  catastrophic `rm`, secret exfiltration, protected-branch
-  force-push/history-rewrite, DB destructive/migrate/replay, release/publish,
-  repo-visibility, host power-down (`poweroff`/`halt`), and operator-config
-  writes — retained because an unattended prompt injection over untrusted input
-  (PRs, web, A2A) could otherwise cause irreversible damage. A genuinely fresh
-  root-run setup seeds the profile by default; `--strict-guard` opts out.
-  Existing profile-less nodes stay strict during updates and retain
-  `--operational-relax` as an explicit later opt-in. Non-root opt-in fails before
-  managed mutation, and existing operator profiles are never overwritten.
-  New in-process unit test `claude/hooks/guard-profile.test.py`
-  (11 cases: relaxed-vs-strict lifecycle, mixed reboot/down fail-closed,
-  catastrophic-always-denied, reader integrity) wired into
-  `validate-harness.sh`; `docs/service-control.md` +
-  `docs/examples/guard-profile.example` document the operator install.
 - `ccc-broker-reconcile` — a root-owned, operator-installed wrapper that
   encapsulates the fixed broker Compose runbook (`cd` project dir, export
   `A2A_BROKER_REVISION=$(git rev-parse HEAD)`, `docker compose up -d

@@ -7,7 +7,7 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT" || exit 1
 # Private scratch dir. Validation writes fixed-name artifacts (rendered.json,
-# guard-profile.out, htest.out, ...); pointing at a SHARED ${TMPDIR:-/tmp} makes
+# rendered.json, htest.out, ...); pointing at a SHARED ${TMPDIR:-/tmp} makes
 # runs collide with other users' stale copies — with fs.protected_regular the
 # open is denied outright — and the run false-FAILs (observed on gwakga:
 # /tmp/rendered.json left by another account). Always use a fresh private dir.
@@ -54,21 +54,13 @@ if jq -e '.permissions.defaultMode == "bypassPermissions"' \
 else
   err "Claude native permission mode is not bypassPermissions"
 fi
-# Claude Code refuses bypassPermissions under root, so setup must neutralize the
-# default on a root node (the guard remains the boundary). Keep that root-aware
-# install path present so the source default cannot brick root-run nodes.
+# Claude Code natively refuses bypassPermissions under root, so setup must
+# neutralize the default on a root node. Keep that root-aware install path
+# present so the source default cannot brick root-run nodes.
 if grep -q "neutralize_bypass_if_root" setup.sh; then
   say "  ok setup neutralizes the bypassPermissions default under root"
 else
   err "setup.sh missing root-aware bypassPermissions neutralization"
-fi
-if grep -q "install_operational_relax_profile" setup.sh \
-   && grep -q 'GUARD_PROFILE_REASON="fresh root default"' setup.sh \
-   && grep -q -- "--strict-guard" setup.sh \
-   && grep -q -- "--operational-relax" setup.sh; then
-  say "  ok fresh root defaults to operational-relax with strict opt-out and existing-node opt-in"
-else
-  err "setup.sh missing approved fresh-root operational-relax policy"
 fi
 
 # 1a) Fail closed if OpenClaw runtime/bootstrap context files are tracked.
@@ -181,9 +173,9 @@ done
 
 # 3) shellcheck — scoped to reviewed scripts (blocking); others get bash -n only above.
 say "== shellcheck =="
-SC_SCOPE=(claude/hooks/guard.sh claude/hooks/audit.sh claude/hooks/redact.sh \
+SC_SCOPE=(claude/hooks/audit.sh claude/hooks/redact.sh \
           claude/hooks/notify.sh claude/hooks/statusline.sh claude/headless.sh \
-          claude/hooks/guard.test.sh scripts/ccc-service-control.sh \
+          scripts/ccc-service-control.sh \
           scripts/ccc-service-control.test.sh \
           scripts/ccc-broker-reconcile.sh scripts/ccc-broker-reconcile.test.sh \
           claude/hooks/observability.test.sh scripts/validate-harness.sh \
@@ -214,31 +206,18 @@ else
   say "  (shellcheck absent — skipped)"
 fi
 
-# 3b) guard.py — the PreToolUse enforcement logic behind the guard.sh shim. A
-# syntax error would make the shim fail OPEN (guard silently unenforced), so
-# compile it here and confirm setup.sh installs it alongside the shim.
-say "== guard.py (python enforcement) =="
+# 3b) python hook helpers — a syntax error would break the statusline helper, so
+# compile the shipped python here.
+say "== python hook helpers =="
 if command -v python3 >/dev/null 2>&1; then
-  if python3 -m py_compile claude/hooks/guard.py 2>/dev/null; then say "  ok claude/hooks/guard.py compiles"; else err "py_compile: claude/hooks/guard.py"; fi
   if python3 -m py_compile claude/hooks/statusline-usage.py 2>/dev/null; then say "  ok claude/hooks/statusline-usage.py compiles"; else err "py_compile: claude/hooks/statusline-usage.py"; fi
-  # operational-relax profile logic — in-process unit test (no root / no env seam).
-  if python3 claude/hooks/guard-profile.test.py >"$TMP/guard-profile.out" 2>&1; then
-    say "  ok claude/hooks/guard-profile.test.py ($(grep -oE 'Ran [0-9]+ tests' "$TMP/guard-profile.out" | tail -1))"
-  else
-    err "guard-profile.test.py"; tail -15 "$TMP/guard-profile.out"
-  fi
 else
   say "  (python3 absent — skipped)"
-fi
-if grep -Fq 'run cp "$SRC/claude/hooks/guard.py"' setup.sh 2>/dev/null; then
-  say "  ok setup.sh installs guard.py"
-else
-  err "setup.sh does not install guard.py (guard.sh shim would fail open)"
 fi
 
 # 4) hook tests
 say "== hook tests =="
-for t in claude/hooks/guard.test.sh claude/hooks/observability.test.sh claude/hooks/security-scan.test.sh \
+for t in claude/hooks/observability.test.sh claude/hooks/security-scan.test.sh \
          scripts/validate-harness.test.sh \
          claude/hooks/redact.test.sh claude/hooks/scan-injection.test.sh \
          claude/hooks/checkpoint.test.sh claude/hooks/distill-scope.test.sh claude/hooks/skill-review.test.sh \
