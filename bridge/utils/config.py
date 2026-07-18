@@ -10,6 +10,8 @@ from dotenv import dotenv_values
 from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
+from telegram_bot.utils.memory_policy import assert_memory_scope_safe
+
 BOT_PACKAGE_DIR = Path(__file__).resolve().parent.parent
 
 # Compatibility defaults for direct ``Config(...)`` construction. Runtime
@@ -1043,18 +1045,12 @@ class Config(BaseSettings):
 
     @model_validator(mode="after")
     def validate_bridge_memory_scope(self):
-        if self.telegram_session_scope != "shared-all" or self.bridge_memory_mode == "off":
-            return self
-        if (
-            self.bridge_memory_mode == "curated"
-            and self.bridge_unsafe_shared_all_memory
-        ):
-            return self
-        raise ValueError(
-            "CCC_TELEGRAM_SESSION_SCOPE=shared-all cannot be combined with bridge "
-            "memory. Use shared-groups, or set CCC_BRIDGE_UNSAFE_SHARED_ALL_MEMORY=true "
-            "only for intentional legacy curated behavior."
+        assert_memory_scope_safe(
+            self.bridge_memory_mode,
+            self.telegram_session_scope,
+            unsafe_shared_all_override=self.bridge_unsafe_shared_all_memory,
         )
+        return self
 
     # Logging
     log_level: str = Field("INFO", description="Logging level")
