@@ -639,6 +639,17 @@ _DATA_SINK_CMDS = {"cat", "tee"}
 # After the intro, only redirection to a LITERAL file path may follow — no
 # pipes, process substitutions, command separators, or expansions.
 _HEREDOC_TAIL_RE = re.compile(r"^([ \t]*>{1,2}[ \t]*[A-Za-z0-9/._+:-]+)*[ \t]*$")
+# Sink names are trusted ONLY when nothing in the command (outside the body,
+# which is inert data) can re-bind them (adversarial review on #571): a shell
+# function or alias definition, or a loader/lookup env assignment (PATH,
+# LD_PRELOAD, ...) can turn `cat` into an interpreter. Any such signal refuses
+# stripping — fail closed on redefinition state we cannot prove.
+_SINK_REDEFINITION_RE = re.compile(
+    r"\b(?:cat|tee|git)[ \t]*\([ \t]*\)"            # cat() {...} function defs
+    r"|\bfunction[ \t]+(?:cat|tee|git)\b"            # function cat {...}
+    r"|\balias\b"                                     # any alias definition
+    r"|\b(?:PATH|BASH_ENV|ENV|LD_PRELOAD|LD_LIBRARY_PATH|IFS)[ \t]*="
+)
 
 
 def _heredoc_sink_statement(prefix):
@@ -646,15 +657,12 @@ def _heredoc_sink_statement(prefix):
     # The heredoc attaches to the last statement on its line.
     seg = re.split(r"[;&|]", prefix)[-1]
     try:
-        toks = shlex.split(seg)
+        words = shlex.split(seg)
     except ValueError:
         return False
-    # Skip leading VAR=... assignments; ignore redirection operators/targets.
-    words = []
-    for t in toks:
-        if not words and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", t):
-            continue
-        words.append(t)
+    # The statement must START with the sink word — no env-assignment prefixes
+    # (FOO=... cat): LD_PRELOAD/PATH-style prefixes can re-bind the sink, so
+    # any leading assignment refuses stripping (adversarial review on #571).
     if not words:
         return False
     if words[0] in _DATA_SINK_CMDS:
@@ -700,6 +708,12 @@ def _strip_quoted_heredoc_data(cmd):
         # Provably terminal: nothing but blank lines may follow the terminator,
         # so no later statement in this command can execute what was written.
         if any(rest.strip() for rest in lines[end + 1:]):
+            return cmd
+        # The sink name must be provably UNSHADOWED: any function/alias/loader
+        # redefinition signal OUTSIDE the body (the body itself is inert data)
+        # refuses stripping. Checked against everything except the body lines.
+        outside = "\n".join(lines[: i + 1] + lines[end:])
+        if _SINK_REDEFINITION_RE.search(outside):
             return cmd
         out = lines[: i + 1]
         if end > i + 1:

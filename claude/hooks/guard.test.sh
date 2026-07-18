@@ -527,6 +527,17 @@ run deny Bash command $'cat <<\'EOF\' > >(bash)\nrm -rf /\nEOF'
 run deny Bash command $'cat <<\'EOF\' && poweroff\ndata\nEOF'
 run deny Bash command $'cat > /tmp/s.sh <<\'EOF\'\nrm -rf /\nEOF\nbash /tmp/s.sh'
 run deny Bash command $'tee /tmp/x.sh <<\'EOF\'\npoweroff\nEOF\nsh /tmp/x.sh'
+# Adversarial (review on #571, round 3): a sink NAME is only trusted when the
+# command cannot re-bind it — function/alias definitions and loader/lookup env
+# assignments outside the body refuse stripping.
+run deny Bash command $'cat() { bash; }\ncat <<\'EOF\'\nrm -rf /\nEOF'
+run deny Bash command $'function tee { bash; }\ntee /tmp/x <<\'EOF\'\npoweroff\nEOF'
+run deny Bash command $'git() { bash; }\ngit commit -F - <<\'EOF\'\nrm -rf /\nEOF'
+run deny Bash command $'alias cat=bash\ncat <<\'EOF\'\nrm -rf /\nEOF'
+run deny Bash command $'PATH=/tmp/evil:$PATH\ncat <<\'EOF\'\nrm -rf /\nEOF'
+run deny Bash command $'LD_PRELOAD=/tmp/evil.so cat <<\'EOF\'\nrm -rf /\nEOF'
+# ...while a body that merely MENTIONS such words stays inert data.
+run allow Bash command $'git commit -F - <<\'MSG\'\nfeat: add shell alias docs and PATH notes\nMSG'
 
 # ---- explicit .bak-artifact pruning is hygiene, not catastrophe ----
 run allow Bash command 'rm /root/ccc-node/bridge/.env.bak-unrestricted-20260717-091410'
