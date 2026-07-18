@@ -29,7 +29,9 @@ SHARED_FACTS_FILE="${CCC_MEMORY_SHARED_FACTS_FILE:-}"
 INDEX_DB="${CCC_MEMORY_INDEX_DB:-$STATE_DIR/memory-index.sqlite}"
 FACTS_FILE="${CCC_MEMORY_FACTS_FILE:-$STATE_DIR/memory-facts.jsonl}"
 
-is_disabled() { case "${1:-}" in 0|false|FALSE|off|OFF|no|NO) return 0;; *) return 1;; esac; }
+REFRESH_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)" || REFRESH_LIB_DIR="$HOOKDIR"
+# shellcheck source=claude/hooks/lib/hook-common.sh
+. "$REFRESH_LIB_DIR/lib/hook-common.sh" || exit 0
 if ! is_disabled "$AUDIENCE_SCOPED"; then
   valid=0
   case "$MEMORY_AUDIENCE:$MEMORY_SCOPE" in
@@ -57,14 +59,7 @@ if ! is_disabled "$AUDIENCE_SCOPED"; then
 fi
 umask 077
 mkdir -p "$CACHE" "$STATE_DIR"
-find_memory_tool() { # <tool-name>
-  local name="$1" d
-  for d in "${CCC_MEMORY_TOOLS_DIR:-}" "$HOOKDIR" "$HOOKDIR/../../scripts"; do
-    [ -n "$d" ] || continue
-    if [ -x "$d/$name" ]; then printf '%s\n' "$d/$name"; return 0; fi
-  done
-  return 1
-}
+# find_memory_tool comes from lib/hook-common.sh.
 now_iso() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 now_ms() { python3 -c 'import time; print(int(time.time()*1000))'; }
 bytes_for() { [ -f "$1" ] && wc -c < "$1" | tr -d '[:space:]' || printf '0'; }

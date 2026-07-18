@@ -56,9 +56,10 @@ DUP_JACCARD_PCT=60
 DUP_MIN_UNION=6
 
 mkdir -p "$STATE_DIR" 2>/dev/null
-ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+AUTOINSTALL_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)" || AUTOINSTALL_LIB_DIR="${HOME:-/root}/.claude/hooks/skill-review"
+# shellcheck source=claude/hooks/lib/hook-common.sh
+. "$AUTOINSTALL_LIB_DIR/../lib/hook-common.sh" || exit 0
 ts_id() { date -u +%Y%m%d%H%M%S; }
-log() { printf '%s %s\n' "$(ts)" "$*" >> "$LOG" 2>/dev/null; }
 
 resolve_mode() {
   local m="${CCC_SKILL_AUTOSAVE_MODE:-}"

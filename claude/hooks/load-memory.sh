@@ -46,7 +46,9 @@ LEGACY_MEMDIR="${CCC_MEMORY_LEGACY_DIR:-${HOME:-/root}/.claude/memories}"
 LEGACY_RESUME_FILE="${CCC_MEMORY_LEGACY_RESUME_FILE:-$LEGACY_STATE_DIR/resume.md}"
 RESUME_FILE="${CCC_RESUME_FILE:-$STATE_DIR/resume.md}"
 
-is_disabled() { case "${1:-}" in 0|false|FALSE|off|OFF|no|NO) return 0;; *) return 1;; esac; }
+LOAD_MEMORY_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)" || LOAD_MEMORY_LIB_DIR="$HOOKDIR"
+# shellcheck source=claude/hooks/lib/hook-common.sh
+. "$LOAD_MEMORY_LIB_DIR/lib/hook-common.sh" || exit 0
 
 scoped_paths_valid() {
   local suffix
@@ -222,14 +224,7 @@ sys.stdout.write("\n".join(lines))
 PY
 }
 
-find_memory_tool() { # <tool-name>
-  local name="$1" d
-  for d in "${CCC_MEMORY_TOOLS_DIR:-}" "$HOOKDIR" "$HOOKDIR/../../scripts"; do
-    [ -n "$d" ] || continue
-    if [ -x "$d/$name" ]; then printf '%s\n' "$d/$name"; return 0; fi
-  done
-  return 1
-}
+# find_memory_tool comes from lib/hook-common.sh.
 
 run_memory_search_bounded() { # <tool> <query> <limit> <timeout-seconds> [state-dir]
   local tool="$1" query="$2" limit="$3" timeout_sec="$4" state_override="${5:-}"
