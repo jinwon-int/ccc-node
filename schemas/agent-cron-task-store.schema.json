@@ -21,7 +21,7 @@
           "enabled": { "type": "boolean" },
           "allowedTools": { "type": "array", "items": { "type": "string" }, "default": [] },
           "permissionMode": { "enum": ["default", "dontAsk", "acceptEdits"] },
-          "notify": { "enum": ["none", "telegram-owner"], "default": "none" },
+          "notify": { "enum": ["none", "telegram-owner", "telegram-owner-on-failure"], "default": "none" },
           "attachMemory": { "type": "array", "items": { "type": "string" }, "default": [] },
           "attachSkills": { "type": "array", "items": { "type": "string" }, "default": [] },
           "redactProfile": { "type": "string", "default": "default" },

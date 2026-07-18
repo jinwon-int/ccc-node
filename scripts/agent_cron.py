@@ -9,7 +9,7 @@ import shlex as _shlex
 import sys as _sys
 from pathlib import Path as _Path
 
-_USAGE = "Usage: agent-cron.sh [list|validate|status] [--store PATH] [--json]\n       agent-cron.sh due [--store PATH] [--at ISO8601] [--json]\n       agent-cron.sh lock <task-id> --action acquire|release|probe --run-id ID [--scheduled-at ISO8601] [--at ISO8601] [--json]\n       agent-cron.sh run <task-id> --dry-run [--at ISO8601] [--json]\n       agent-cron.sh scheduler --dry-run|--execute [--at ISO8601] [--max-runs N] [--json]\n\nImplemented slices:\n- list/validate: inspect and validate the task definition store.\n- due: read-only dry-run schedule resolver. It reports due tasks, missed windows,\n  catch-up policy, retryEligibleAt state, and lock paths, but never executes\n  prompts or writes state.\n- lock: local atomic task-lock acquire/release/probe primitives only. It writes\n  lock files under the task store's sibling locks/ directory, but never executes\n  prompts, sends notifications, installs schedulers, or updates task history.\n- run --dry-run: read-only execution-plan preview. It combines due, lock probe,\n  task policy, and headless command metadata, but never acquires locks, executes\n  prompts, sends notifications, installs schedulers, or updates task history.\n- scheduler --dry-run: read-only single-tick scheduler plan. It reports which\n  tasks would run or skip, including retry-due tasks, but never installs timers,\n  acquires locks, executes prompts, writes task state, or sends notifications.\n- scheduler --execute: explicit one-shot scheduler executor for approved live/systemd\n  use. It runs at most --max-runs due/retry-due tasks through the existing run path;\n  it never installs timers or edits crontab/systemd.\n- run: explicit manual execution for due enabled tasks. It acquires the task lock,\n  invokes ccc-headless, records lastRunAt/lastStatus/lastRunId, writes a\n  redacted owner-only bridge spool entry when notify=telegram-owner, appends a\n  bounded runHistory entry, records retryState/retryEligibleAt on failure, clears\n  retryState on success, and releases the lock in all normal failure/success\n  paths. It still does not call Telegram\n  or provider APIs, install schedulers, mutate crontab/systemd, or touch remotes.\n\nNo direct Telegram/API send, scheduler bootstrap, systemd/crontab writes,\nprovider sends, or remote-node actions are performed by agent-cron itself.\n"
+_USAGE = "Usage: agent-cron.sh [list|validate|status] [--store PATH] [--json]\n       agent-cron.sh add <task-id> --schedule EXPR --prompt TEXT [--name N] [--timezone IANA] [--notify none|telegram-owner|telegram-owner-on-failure] [--allowed-tools a,b] [--permission-mode M] [--catch-up-policy P] [--max-catchup N] [--lock-timeout-sec N] [--anchor-at ISO] [--keep-after-run] [--disabled] [--argv WORD ...] [--cwd DIR] [--model M] [--timeout-sec N] [--output-max-bytes N] [--json]\n       agent-cron.sh remove|enable|disable <task-id> [--json]\n       agent-cron.sh due [--store PATH] [--at ISO8601] [--json]\n       agent-cron.sh lock <task-id> --action acquire|release|probe --run-id ID [--scheduled-at ISO8601] [--at ISO8601] [--json]\n       agent-cron.sh run <task-id> --dry-run [--at ISO8601] [--json]\n       agent-cron.sh scheduler --dry-run|--execute [--at ISO8601] [--max-runs N] [--json]\n\nImplemented slices:\n- list/validate: inspect and validate the task definition store.\n- due: read-only dry-run schedule resolver. It reports due tasks, missed windows,\n  catch-up policy, retryEligibleAt state, and lock paths, but never executes\n  prompts or writes state.\n- lock: local atomic task-lock acquire/release/probe primitives only. It writes\n  lock files under the task store's sibling locks/ directory, but never executes\n  prompts, sends notifications, installs schedulers, or updates task history.\n- run --dry-run: read-only execution-plan preview. It combines due, lock probe,\n  task policy, and headless command metadata, but never acquires locks, executes\n  prompts, sends notifications, installs schedulers, or updates task history.\n- scheduler --dry-run: read-only single-tick scheduler plan. It reports which\n  tasks would run or skip, including retry-due tasks, but never installs timers,\n  acquires locks, executes prompts, writes task state, or sends notifications.\n- scheduler --execute: explicit one-shot scheduler executor for approved live/systemd\n  use. It runs at most --max-runs due/retry-due tasks through the existing run path;\n  it never installs timers or edits crontab/systemd.\n- run: explicit manual execution for due enabled tasks. It acquires the task lock,\n  invokes ccc-headless, records lastRunAt/lastStatus/lastRunId, writes a\n  redacted owner-only bridge spool entry when notify=telegram-owner, appends a\n  bounded runHistory entry, records retryState/retryEligibleAt on failure, clears\n  retryState on success, and releases the lock in all normal failure/success\n  paths. It still does not call Telegram\n  or provider APIs, install schedulers, mutate crontab/systemd, or touch remotes.\n\nNo direct Telegram/API send, scheduler bootstrap, systemd/crontab writes,\nprovider sends, or remote-node actions are performed by agent-cron itself.\n"
 
 
 def _die(message, code=2):
@@ -48,8 +48,11 @@ def _bootstrap_cli(argv=None):
             break
         i += 1
 
-    if cmd_value not in ('list', 'validate', 'status', 'due', 'lock', 'run', 'scheduler'):
-        if cmd_value in ('execute', 'install', 'enable', 'disable', 'add', 'remove'):
+    if cmd_value not in (
+        'list', 'validate', 'status', 'due', 'lock', 'run', 'scheduler',
+        'add', 'remove', 'enable', 'disable',
+    ):
+        if cmd_value in ('execute', 'install'):
             _die(f'agent-cron {cmd_value} is not implemented in this read-only slice; no filesystem changes were made.', 2)
         _die(f'Unknown command: {cmd_value}', 2)
 
@@ -963,8 +966,11 @@ def build_owner_text(task_id, run_id, scheduled_at, status, headless):
 
 def write_owner_spool(task, task_id, run_id, scheduled_at, status, headless, at):
     base = notification_base(task)
-    if task.get('notify', 'none') != 'telegram-owner':
+    notify = task.get('notify', 'none')
+    if notify not in ('telegram-owner', 'telegram-owner-on-failure'):
         return base
+    if notify == 'telegram-owner-on-failure' and status == 'success':
+        return {**base, 'delivery': 'skipped-success'}
     spool = push_spool_dir()
     text = build_owner_text(task_id, run_id, scheduled_at, status, headless)
     ts = fmt_dt(at) or datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace('+00:00', 'Z')
@@ -1163,7 +1169,150 @@ def emit_list(data, as_json):
         print(f"| `{task['id']}` | `{task['schedule']}` | {str(task['enabled']).lower()} | `{task['notify']}` | `{task['catchUpPolicy']}` | `{tools}` | `{task.get('lastStatus') or 'unknown'}` |")
 
 
+def _crud_str(value, flag):
+    return value
+
+
+def _crud_int(value, flag):
+    try:
+        return int(value)
+    except ValueError:
+        raise ValueError(f'{flag} requires an integer') from None
+
+
+def _crud_csv(value, flag):
+    return [item for item in value.split(',') if item]
+
+
+# flag -> (bucket, field key, cast). bucket 'argv' appends command words.
+CRUD_VALUE_FLAGS = {
+    '--schedule': ('fields', 'schedule', _crud_str),
+    '--prompt': ('fields', 'prompt', _crud_str),
+    '--name': ('fields', 'name', _crud_str),
+    '--timezone': ('fields', 'timezone', _crud_str),
+    '--notify': ('fields', 'notify', _crud_str),
+    '--permission-mode': ('fields', 'permissionMode', _crud_str),
+    '--catch-up-policy': ('fields', 'catchUpPolicy', _crud_str),
+    '--anchor-at': ('fields', 'anchorAt', _crud_str),
+    '--redact-profile': ('fields', 'redactProfile', _crud_str),
+    '--allowed-tools': ('fields', 'allowedTools', _crud_csv),
+    '--max-catchup': ('fields', 'maxCatchup', _crud_int),
+    '--lock-timeout-sec': ('fields', 'lockTimeoutSec', _crud_int),
+    '--max-run-history': ('fields', 'maxRunHistory', _crud_int),
+    '--cwd': ('payload', 'cwd', _crud_str),
+    '--model': ('payload', 'model', _crud_str),
+    '--timeout-sec': ('payload', 'timeoutSec', _crud_int),
+    '--output-max-bytes': ('payload', 'outputMaxBytes', _crud_int),
+    '--argv': ('argv', None, _crud_str),
+}
+CRUD_BOOL_FLAGS = ('--keep-after-run', '--disabled', '--json')
+
+
+def parse_crud_args(raw):
+    """Parse `<task-id> [flags]` for add/remove/enable/disable."""
+    args = shlex.split(raw or '')
+    if not args or args[0].startswith('-'):
+        raise ValueError('a task id is required')
+    task_id = args[0]
+    buckets = {'fields': {}, 'payload': {}}
+    argv = []
+    bools = {flag: False for flag in CRUD_BOOL_FLAGS}
+    i = 1
+    while i < len(args):
+        arg = args[i]
+        if arg in bools:
+            bools[arg] = True
+            i += 1
+            continue
+        spec = CRUD_VALUE_FLAGS.get(arg)
+        if spec is None:
+            raise ValueError(f'unknown flag: {arg}')
+        i += 1
+        if i >= len(args):
+            raise ValueError(f'{arg} requires a value')
+        bucket, key, cast = spec
+        value = cast(args[i], arg)
+        if bucket == 'argv':
+            argv.append(value)
+        else:
+            buckets[bucket][key] = value
+        i += 1
+    fields = buckets['fields']
+    if bools['--keep-after-run']:
+        fields['keepAfterRun'] = True
+    return (task_id, fields, buckets['payload'], argv,
+            bools['--disabled'], bools['--json'])
+
+
+def crud_command(data):
+    try:
+        task_id, fields, payload, argv, disabled, crud_json = parse_crud_args(extra_args)
+    except ValueError as e:
+        return {'ok': False, 'mode': cmd, 'error': str(e)}, json_out, 2
+    as_json = json_out or crud_json
+    base = {'mode': cmd, 'store': str(store), 'taskId': task_id}
+    tasks = data.setdefault('tasks', [])
+    if cmd == 'add':
+        if task_by_id(data, task_id):
+            return {**base, 'ok': False, 'error': 'task id already exists'}, as_json, 1
+        task = {'id': task_id, 'enabled': not disabled, 'prompt': '', 'schedule': ''}
+        task.update(fields)
+        if argv:
+            payload = {'kind': 'command', 'argv': argv, **payload}
+        elif payload:
+            payload = {'kind': 'prompt', **payload}
+        if payload:
+            task['payload'] = payload
+        if not task.get('schedule'):
+            return {**base, 'ok': False, 'error': '--schedule is required'}, as_json, 2
+        if not task.get('prompt'):
+            return {**base, 'ok': False, 'error': '--prompt is required (for command payloads it is the human description)'}, as_json, 2
+        task.setdefault('notify', 'none')
+        try:
+            parse_schedule(task['schedule'], task.get('timezone', 'UTC'))
+        except ValueError as e:
+            return {**base, 'ok': False, 'error': f'invalid schedule: {e}'}, as_json, 2
+        candidate = {**data, 'tasks': tasks + [task]}
+        errors = validate_store(candidate)
+        if errors:
+            return {**base, 'ok': False, 'error': errors[0], 'errors': errors}, as_json, 1
+        tasks.append(task)
+        write_doc(data)
+        return {**base, 'ok': True, 'task': {k: v for k, v in task.items() if k != 'prompt'},
+                'mutations': {'taskStoreWrite': True}}, as_json, 0
+    if fields or payload or argv or disabled:
+        return {**base, 'ok': False, 'error': f'{cmd} accepts no flags'}, as_json, 2
+    task = task_by_id(data, task_id)
+    if not task:
+        return {**base, 'ok': False, 'error': 'task id not found'}, as_json, 1
+    if cmd == 'remove':
+        data['tasks'] = [t for t in tasks if t is not task]
+        write_doc(data)
+        return {**base, 'ok': True, 'mutations': {'taskStoreWrite': True}}, as_json, 0
+    desired = cmd == 'enable'
+    changed = bool(task.get('enabled')) != desired
+    task['enabled'] = desired
+    if changed:
+        write_doc(data)
+    return {**base, 'ok': True, 'enabled': desired, 'changed': changed,
+            'mutations': {'taskStoreWrite': changed}}, as_json, 0
+
+
+def emit_crud(result, as_json):
+    if as_json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
+    if result.get('ok'):
+        print(f"agent-cron {result['mode']} OK: {result.get('taskId')}")
+    else:
+        print(f"agent-cron {result['mode']} failed: {result.get('error')}", file=sys.stderr)
+
+
 def _dispatch(data):
+    if cmd in ('add', 'remove', 'enable', 'disable'):
+        result, as_json, rc = crud_command(data)
+        emit_crud(result, as_json)
+        return rc
     if cmd == 'lock':
         result, as_json, rc = lock_command(data)
         emit_lock(result, as_json)
