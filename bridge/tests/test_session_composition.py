@@ -582,7 +582,8 @@ target.mkdir(mode=0o700)
 os.environ["PROJECT_ROOT"] = str(project)
 os.environ["TELEGRAM_BOT_TOKEN"] = "123456:test"
 
-from telegram_bot.utils.config import Settings, setup_logging
+from telegram_bot.utils.config import Settings
+from telegram_bot.utils.logging_setup import setup_logging
 
 settings = Settings.load(
     project_root=project,
@@ -626,7 +627,8 @@ log_name = "bot.log" if __LOG_KIND__ == "bot" else f"error_{datetime.now():%Y-%m
 os.environ["PROJECT_ROOT"] = str(project)
 os.environ["TELEGRAM_BOT_TOKEN"] = "123456:test"
 
-from telegram_bot.utils.config import Settings, setup_logging
+from telegram_bot.utils.config import Settings
+from telegram_bot.utils.logging_setup import setup_logging
 
 settings = Settings.load(
     project_root=project,
@@ -668,7 +670,8 @@ else:
 os.environ["PROJECT_ROOT"] = str(project)
 os.environ["TELEGRAM_BOT_TOKEN"] = "123456:test"
 
-from telegram_bot.utils.config import Settings, setup_logging
+from telegram_bot.utils.config import Settings
+from telegram_bot.utils.logging_setup import setup_logging
 
 settings = Settings.load(
     project_root=project,
@@ -698,7 +701,7 @@ import os
 from pathlib import Path
 from unittest.mock import patch
 
-from telegram_bot.utils import config as config_module
+from telegram_bot.utils import logging_setup as config_module
 
 logs = Path(os.environ["PROBE_ROOT"]) / "logs"
 logs.mkdir(mode=0o700)
@@ -750,7 +753,8 @@ logs.chmod(0o755)
 os.environ["PROJECT_ROOT"] = str(project)
 os.environ["TELEGRAM_BOT_TOKEN"] = "123456:test"
 
-from telegram_bot.utils.config import Settings, setup_logging
+from telegram_bot.utils.config import Settings
+from telegram_bot.utils.logging_setup import setup_logging
 
 settings = Settings.load(
     project_root=project,

@@ -7,7 +7,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from telegram_bot.utils.config import Settings, bind_config, setup_logging
+from telegram_bot.utils.config import Settings, bind_config
+from telegram_bot.utils.logging_setup import setup_logging
 
 
 def load_runtime_settings(
