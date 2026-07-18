@@ -309,6 +309,9 @@ run cp "$SRC/claude/hooks/lib/spawn-detached.sh" "$CLAUDE_DIR/hooks/lib/spawn-de
 # Shared hook helpers (#584 P0-3): memory/distill/skill hooks hard-source this
 # and no-op (exit 0) when it is missing, so it must ship with the hooks.
 run cp "$SRC/claude/hooks/lib/hook-common.sh" "$CLAUDE_DIR/hooks/lib/hook-common.sh"
+# Shared audience-scope validation (#584 P1-2): load/refresh memory hooks
+# hard-source this; a missing lib no-ops the hook (fail-safe).
+run cp "$SRC/claude/hooks/lib/memory-common.sh" "$CLAUDE_DIR/hooks/lib/memory-common.sh"
 # Portable mtime pruning (#449): checkpoint.sh and distill.sh source this lib
 # behind an if-readable guard, so leaving it uninstalled silently disables
 # state/checkpoint pruning on every standalone node (unbounded growth).
@@ -368,6 +371,7 @@ run cp "$SRC/scripts/ccc-self-update.sh" "$CLAUDE_DIR/hooks/ccc-self-update.sh"
 installed_hook_scripts=(
   "$CLAUDE_DIR/hooks/lib/spawn-detached.sh"
   "$CLAUDE_DIR/hooks/lib/hook-common.sh"
+  "$CLAUDE_DIR/hooks/lib/memory-common.sh"
   "$CLAUDE_DIR/hooks/lib/mtime-prune.sh"
   "$CLAUDE_DIR/hooks/lib/harness-paths.sh"
   "$CLAUDE_DIR/hooks/lib/harness_paths.py"
