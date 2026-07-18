@@ -538,6 +538,15 @@ run deny Bash command $'PATH=/tmp/evil:$PATH\ncat <<\'EOF\'\nrm -rf /\nEOF'
 run deny Bash command $'LD_PRELOAD=/tmp/evil.so cat <<\'EOF\'\nrm -rf /\nEOF'
 # ...while a body that merely MENTIONS such words stays inert data.
 run allow Bash command $'git commit -F - <<\'MSG\'\nfeat: add shell alias docs and PATH notes\nMSG'
+# Inert trailing statements after the terminator are fine (echo/printf/true/:
+# with literal args cannot execute what the sink wrote)...
+run allow Bash command $'cat > /root/.claude/state/notes.md <<\'EOF\'\nrunbook mentions rm -rf /var/tmp/stale and poweroff\nEOF\necho saved'
+run allow Bash command $'tee /root/notes.md <<\'EOF\'\nmentions gh release create v1.0.0\nEOF\nprintf done\ntrue'
+# ...but anything beyond the inert allowlist still refuses stripping.
+run deny Bash command $'cat > /tmp/s.sh <<\'EOF\'\nrm -rf /\nEOF\necho ok && bash /tmp/s.sh'
+run deny Bash command $'cat > /tmp/s.sh <<\'EOF\'\nrm -rf /\nEOF\necho $(bash /tmp/s.sh)'
+run deny Bash command $'cat > /tmp/s.sh <<\'EOF\'\nrm -rf /\nEOF\necho hi; bash /tmp/s.sh'
+run deny Bash command $'cat > /tmp/s.sh <<\'EOF\'\nrm -rf /\nEOF\necho hi > /tmp/other.sh'
 
 # ---- explicit .bak-artifact pruning is hygiene, not catastrophe ----
 run allow Bash command 'rm /root/ccc-node/bridge/.env.bak-unrestricted-20260717-091410'

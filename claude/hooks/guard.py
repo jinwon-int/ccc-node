@@ -639,6 +639,14 @@ _DATA_SINK_CMDS = {"cat", "tee"}
 # After the intro, only redirection to a LITERAL file path may follow — no
 # pipes, process substitutions, command separators, or expansions.
 _HEREDOC_TAIL_RE = re.compile(r"^([ \t]*>{1,2}[ \t]*[A-Za-z0-9/._+:-]+)*[ \t]*$")
+# After the terminator, only INERT trailing statements may follow (operator
+# request: `cat > notes.md <<'EOF' ... EOF` + `echo saved` is a common data
+# pattern): echo/printf/true/: with purely literal arguments — no command
+# substitution, separators, redirects, or expansions, so a trailing statement
+# provably cannot execute what the sink wrote. Anything else refuses stripping.
+_INERT_TRAILING_RE = re.compile(
+    r"^[ \t]*(?:(?:echo|printf|true|:)(?:[ \t]+[A-Za-z0-9/._+:%,'\"=-]+)*)?[ \t]*$"
+)
 # Sink names are trusted ONLY when nothing in the command (outside the body,
 # which is inert data) can re-bind them (adversarial review on #571): a shell
 # function or alias definition, or a loader/lookup env assignment (PATH,
@@ -705,9 +713,11 @@ def _strip_quoted_heredoc_data(cmd):
                 break
         if end is None:
             return cmd  # unterminated — strip nothing
-        # Provably terminal: nothing but blank lines may follow the terminator,
-        # so no later statement in this command can execute what was written.
-        if any(rest.strip() for rest in lines[end + 1:]):
+        # Provably terminal: after the terminator only blank lines or INERT
+        # trailing statements (echo/printf/true/: with literal args) may
+        # follow, so no later statement in this command can execute what the
+        # sink wrote.
+        if any(not _INERT_TRAILING_RE.match(rest) for rest in lines[end + 1:]):
             return cmd
         # The sink name must be provably UNSHADOWED: any function/alias/loader
         # redefinition signal OUTSIDE the body (the body itself is inert data)
