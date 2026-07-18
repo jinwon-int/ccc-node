@@ -34,13 +34,24 @@ OPT_NODE=""; OPT_DISPLAY=""; OPT_SLOT=""; OPT_FLEET_ROLE=""; OPT_LANG=""
 OPT_USER_NAME=""; OPT_USER_GH=""; OPT_USER_TZ=""; OPT_USER_CONTEXT=""
 need_val() { [ -n "${2:-}" ] || { echo "Flag $1 requires a value" >&2; exit 2; }; }
 _ccc_is_root() {
-  local uid="" test_root="" test_profile=""
+  local uid="" test_root="" test_profile="" readlink_bin="" candidate
   # Deterministic CI seam, accepted only for a canonical profile beneath the
-  # caller's existing writable temp root. Production /etc decisions always use
-  # the pinned system id binary; traversal out of TMPDIR cannot activate this.
+  # caller's existing writable temp root. Resolve readlink only from exact
+  # system paths because distro layouts may place coreutils in /bin or
+  # /usr/bin; never trust PATH for this security boundary. Production /etc
+  # decisions always use the pinned system id binary, and traversal out of
+  # TMPDIR cannot activate this seam.
   if [ -n "${CCC_SETUP_TEST_EUID:-}" ] && [ -n "${CCC_SETUP_GUARD_PROFILE_PATH:-}" ]; then
-    test_root="$(/usr/bin/readlink -m -- "${TMPDIR:-/tmp}" 2>/dev/null || true)"
-    test_profile="$(/usr/bin/readlink -m -- "$CCC_SETUP_GUARD_PROFILE_PATH" 2>/dev/null || true)"
+    for candidate in /usr/bin/readlink /bin/readlink; do
+      if [ -f "$candidate" ] && [ -x "$candidate" ] && [ ! -L "$candidate" ]; then
+        readlink_bin="$candidate"
+        break
+      fi
+    done
+    if [ -n "$readlink_bin" ]; then
+      test_root="$("$readlink_bin" -m -- "${TMPDIR:-/tmp}" 2>/dev/null || true)"
+      test_profile="$("$readlink_bin" -m -- "$CCC_SETUP_GUARD_PROFILE_PATH" 2>/dev/null || true)"
+    fi
     if [ -n "$test_root" ] && [ -d "$test_root" ] && [ -w "$test_root" ]; then
       case "$test_profile" in
         "$test_root"/*) uid="$CCC_SETUP_TEST_EUID" ;;
