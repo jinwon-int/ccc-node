@@ -363,13 +363,9 @@ class BotCommandMixin:
             return
 
         conversation_key = self._conversation_key(user_id, chat.id)
-        session, provider_switched = await self._align_active_provider(
-            conversation_key
+        session, provider_switched = await self._switch_provider_if_needed(
+            conversation_key, user_id, chat.id
         )
-        if provider_switched:
-            self._deny_codex_approvals(user_id, chat.id)
-            self._invalidate_codex_approvals(user_id, chat.id)
-            self._runtime_active_sessions.discard(conversation_key)
         try:
             models = tuple(await self._project_chat.list_runtime_models())
         except Exception:
@@ -1024,8 +1020,8 @@ class BotCommandMixin:
         slash_cmd = "/" + parts[1]
 
         async def run_task():
-            session, _ = await self._align_active_provider(
-                conversation_key
+            session, _ = await self._switch_provider_if_needed(
+                conversation_key, user_id, chat.id
             )
             try:
                 await message.chat.send_action(action="typing")
@@ -1074,8 +1070,8 @@ class BotCommandMixin:
         conversation_key = self._conversation_key(user_id, chat.id)
 
         async def run_task():
-            session, _ = await self._align_active_provider(
-                conversation_key
+            session, _ = await self._switch_provider_if_needed(
+                conversation_key, user_id, chat.id
             )
             await message.chat.send_action(action="typing")
             try:

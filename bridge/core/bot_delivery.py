@@ -534,8 +534,8 @@ class BotDeliveryMixin:
             conversation_key = self._conversation_key(user_id, chat_id)
 
             async def run_task():
-                session, _ = await self._align_active_provider(
-                    conversation_key
+                session, _ = await self._switch_provider_if_needed(
+                    conversation_key, user_id, chat_id
                 )
                 await app.bot.send_chat_action(chat_id, action="typing")
                 try:
@@ -600,13 +600,9 @@ class BotDeliveryMixin:
                 )
                 return
             session_key = self._conversation_key(user_id, chat.id)
-            session, provider_switched = await self._align_active_provider(
-                session_key
+            session, provider_switched = await self._switch_provider_if_needed(
+                session_key, user_id, chat.id
             )
-            if provider_switched:
-                self._deny_codex_approvals(user_id, chat.id)
-                self._invalidate_codex_approvals(user_id, chat.id)
-                self._runtime_active_sessions.discard(session_key)
             try:
                 models = tuple(await self._project_chat.list_runtime_models())
             except Exception:
