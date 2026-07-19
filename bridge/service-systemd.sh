@@ -45,6 +45,8 @@ Usage: $0 <install|uninstall> [options]
 Subcommands:
   install     Generate the systemd unit and enable --now it
   uninstall   Disable the service and remove the unit
+  is-managed  Exit 0 iff the bridge unit file exists and systemctl reports it
+              active (used by start.sh --restart to avoid supervisor fights)
 
 Options:
   --project-root <dir>  Project root directory (required for install)
@@ -61,7 +63,7 @@ CALLER=""
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        install|uninstall)
+        install|uninstall|is-managed)
             SUBCOMMAND="$1"
             shift
             ;;
@@ -210,7 +212,24 @@ do_uninstall_systemd() {
     exit 0
 }
 
+do_is_managed() {
+    # Conservative ownership probe for start.sh --restart: report "managed"
+    # only when the unit file for this scope exists AND systemctl says the
+    # service is active. Anything less confident falls through to a normal
+    # process-level restart. Honors the CCC_SYSTEMD_DIR / CCC_SYSTEMCTL test
+    # seams via systemd_paths / SYSTEMCTL_BIN like install/uninstall.
+    command -v "$SYSTEMCTL_BIN" >/dev/null 2>&1 || exit 1
+    systemd_paths
+    [ -f "$SYSTEMD_UNIT_FILE" ] || exit 1
+    if "${SYSTEMCTL[@]}" is-active --quiet "$SYSTEMD_SERVICE" 2>/dev/null; then
+        echo "managed: $SYSTEMD_UNIT_FILE (active)"
+        exit 0
+    fi
+    exit 1
+}
+
 case "$SUBCOMMAND" in
-    install)   do_install_systemd ;;
-    uninstall) do_uninstall_systemd ;;
+    install)    do_install_systemd ;;
+    uninstall)  do_uninstall_systemd ;;
+    is-managed) do_is_managed ;;
 esac

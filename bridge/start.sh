@@ -246,6 +246,10 @@ while [ $# -gt 0 ]; do
             ACTION="stop"
             shift
             ;;
+        --restart)
+            ACTION="restart"
+            shift
+            ;;
         --upgrade)
             ACTION="upgrade"
             shift
@@ -278,6 +282,10 @@ Options:
   --debug             Enable debug/verbose logging
   --status            Show whether the bot is running
   --stop              Stop the running bot
+  --restart           Atomic stop → start → verify-available (add -d to restart
+                      into daemon mode). Exits 0 only once --status reports
+                      "available"; nonzero with a reason otherwise. Refuses
+                      (exit 3) when systemd/launchd manages the bridge.
   --upgrade           Update through canonical ccc-self-update and reinstall if changed
   --version           Print the installed ccc-node checkout identity
   --install           Install as macOS launchd startup service
@@ -905,11 +913,160 @@ cleanup_token_lock_if_safe() {
     fi
 }
 
+# ── Atomic restart (--restart) ──
+# First-class stop→start→verify so rollouts never depend on ad-hoc
+# `--stop && start &` compositions (2026-07-19 fleet rollout: a detached
+# restart silently never executed; the wrong checkout's start.sh was invoked;
+# pre-flight guards were bypassed so token resolution failed after the stop).
+# Reuses the existing code paths only: pre-flight via check_env, stop via
+# do_stop, start via THIS checkout's start.sh (which runs the normal start
+# guards itself), readiness via the do_status internals.
+#
+# Exit codes:
+#   0  restart verified — --status reports "available"
+#   1  stop-failed        (old process refuses to exit within the bound)
+#   2  start-failed       (start invocation failed / process died before ready)
+#   3  supervisor-managed (systemd/launchd owns the bridge; restart it there)
+#   4  not-available-within-timeout
+#
+# Test seams (defaults preserve production behavior):
+#   CCC_BRIDGE_RESTART_STOP_TIMEOUT   seconds to wait for old-process exit (15)
+#   CCC_BRIDGE_RESTART_READY_TIMEOUT  seconds to wait for "available" (45)
+#   CCC_BRIDGE_RESTART_SPAWN          start command override (this start.sh)
+
+RESTART_OLD_PID=""
+RESTART_OLD_SUPERVISOR_PID=""
+
+restart_status_snapshot() {
+    # do_status exits, so run it in a subshell to reuse it as a probe.
+    ( do_status ) 2>/dev/null
+}
+
+restart_live_old_pids() {
+    local pid
+    for pid in "${RESTART_OLD_PID:-}" "${RESTART_OLD_SUPERVISOR_PID:-}"; do
+        [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && printf '%s\n' "$pid"
+    done
+    find_project_bot_pids
+}
+
+do_restart() {
+    local stop_timeout="${CCC_BRIDGE_RESTART_STOP_TIMEOUT:-15}"
+    local ready_timeout="${CCC_BRIDGE_RESTART_READY_TIMEOUT:-45}"
+    local spawn_cmd="${CCC_BRIDGE_RESTART_SPAWN:-$SCRIPT_DIR/start.sh}"
+    local waited live ready new_pid spawn_pid="" restart_log="" unit scope_flag
+
+    # Supervisor-managed bridges: restarting underneath launchd KeepAlive or
+    # systemd Restart=always causes supervisor fights. Conservative check —
+    # refuse only when the manager clearly owns it.
+    if [ -f "$PLIST_FILE" ]; then
+        echo "⚠️  Bridge is managed by launchd ($PLIST_LABEL) — not restarting it here."
+        echo "💡 Restart via the service manager: launchctl kickstart -k gui/$(id -u)/$PLIST_LABEL"
+        exit 3
+    fi
+    if "$SCRIPT_DIR/service-systemd.sh" is-managed >/dev/null 2>&1; then
+        unit="${BRIDGE_SERVICE_NAME:-ccc-telegram-bridge}.service"
+        scope_flag=""
+        [ "$(id -u)" = "0" ] || scope_flag=" --user"
+        echo "⚠️  Bridge is managed by systemd (active unit: $unit) — not restarting it here."
+        echo "💡 Restart via the service manager: systemctl${scope_flag} restart $unit"
+        exit 3
+    fi
+
+    # Pre-flight BEFORE touching the running bot: fail while the old instance
+    # is still up rather than after the stop (the 2026-07-19 mode where the
+    # bot stayed down because the start half could not resolve its token).
+    merge_env_files
+    check_env
+
+    RESTART_OLD_PID="$(read_pid)"
+    RESTART_OLD_SUPERVISOR_PID="$(read_supervisor_pid)"
+    if [ -z "$RESTART_OLD_PID" ]; then
+        RESTART_OLD_PID="$(find_project_bot_pids | head -n1)"
+    fi
+    echo "🔁 Restarting bridge (old PID: ${RESTART_OLD_PID:-none})"
+
+    # Stop: the exact --stop code path (launchd bootout, supervisor, managed
+    # and unmanaged processes, token-lock cleanup). Subshell because do_stop
+    # exits.
+    if ! ( do_stop ); then
+        echo "❌ Restart failed: stop-failed (--stop path exited nonzero)"
+        exit 1
+    fi
+
+    # Bounded wait for the old process(es) to actually exit.
+    waited=0
+    live="$(restart_live_old_pids | tr '\n' ' ' | sed 's/ $//')"
+    while [ -n "$live" ] && [ "$waited" -lt "$stop_timeout" ]; do
+        sleep 1
+        waited=$((waited + 1))
+        live="$(restart_live_old_pids | tr '\n' ' ' | sed 's/ $//')"
+    done
+    if [ -n "$live" ]; then
+        echo "❌ Restart failed: stop-failed — old process refuses to exit after ${stop_timeout}s (PID(s): $live)"
+        echo "   Not starting a new instance on top of it."
+        exit 1
+    fi
+
+    # Start via the same code paths the plain flags use, pinned to THIS
+    # checkout's start.sh (a wrong-checkout start.sh was a 2026-07-19 mode).
+    local spawn_args=("--path" "$PROJECT_ROOT")
+    [ -n "$BOT_DEBUG" ] && spawn_args+=("--debug")
+    if [ "$DAEMON_MODE" -eq 1 ]; then
+        # Same path as `start.sh --path <p> --daemon`.
+        if ! "$spawn_cmd" "${spawn_args[@]}" --daemon; then
+            echo "❌ Restart failed: start-failed (daemon start exited nonzero)"
+            exit 2
+        fi
+    else
+        # Same path as a plain foreground `start.sh --path <p>` run (its own
+        # pre-flight guards, prepare_runtime, exec into the bot). Detached
+        # from this terminal so the verified bridge survives the restart
+        # command exiting; output goes to the restart log.
+        restart_log="$LOGS_DIR/restart.log"
+        nohup "$spawn_cmd" "${spawn_args[@]}" >> "$restart_log" 2>&1 &
+        spawn_pid=$!
+        echo "🚀 Starting bridge (spawn PID: $spawn_pid, log: $restart_log)"
+    fi
+
+    # Bounded readiness verification: poll the --status internals until the
+    # health snapshot renders "available".
+    waited=0
+    ready=0
+    while [ "$waited" -lt "$ready_timeout" ]; do
+        if restart_status_snapshot | grep -q "Bot status: available"; then
+            ready=1
+            break
+        fi
+        if [ -n "$spawn_pid" ] && ! kill -0 "$spawn_pid" 2>/dev/null && ! is_running; then
+            echo "❌ Restart failed: start-failed (spawned process exited before becoming available; see $restart_log)"
+            exit 2
+        fi
+        sleep 1
+        waited=$((waited + 1))
+    done
+
+    if [ "$ready" -ne 1 ]; then
+        echo "❌ Restart failed: not-available-within-timeout (${ready_timeout}s)"
+        echo "── last status ──"
+        restart_status_snapshot
+        echo "💡 The new process (if any) was left running — inspect with: $0 --path \"$PROJECT_ROOT\" --status"
+        exit 4
+    fi
+
+    new_pid="$(read_pid)"
+    echo "✅ Restart verified: bot available (old PID: ${RESTART_OLD_PID:-none} → new PID: ${new_pid:-unknown})"
+    echo "── health ──"
+    restart_status_snapshot
+    exit 0
+}
+
 # ── Dispatch action ──
 
 case "$ACTION" in
     status)    do_status ;;
     stop)      do_stop ;;
+    restart)   do_restart ;;
     install)           do_install ;;
     uninstall)         do_uninstall ;;
     install-systemd)   do_install_systemd ;;
