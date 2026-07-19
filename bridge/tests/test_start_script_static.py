@@ -4,6 +4,9 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 START_SH = ROOT / "start.sh"
+# Service-install machinery extracted from start.sh (#584 P3-2).
+SERVICE_SYSTEMD_SH = ROOT / "service-systemd.sh"
+SERVICE_LAUNCHD_SH = ROOT / "service-launchd.sh"
 
 
 def _start_text() -> str:
@@ -31,22 +34,32 @@ class StartScriptStaticTests(unittest.TestCase):
         self.assertIn("return 0", function_body)
 
     def test_start_sh_never_logs_proxy_values(self):
-        text = _start_text()
-        for variable in ("http_proxy", "https_proxy"):
-            with self.subTest(variable=variable):
-                self.assertNotRegex(
-                    text,
-                    rf"(?m)^\s*echo[^\n]*\$(?:\{{)?{variable}(?:\}})?",
-                )
+        for script in (START_SH, SERVICE_SYSTEMD_SH, SERVICE_LAUNCHD_SH):
+            text = script.read_text(encoding="utf-8")
+            for variable in ("http_proxy", "https_proxy"):
+                with self.subTest(script=script.name, variable=variable):
+                    self.assertNotRegex(
+                        text,
+                        rf"(?m)^\s*echo[^\n]*\$(?:\{{)?{variable}(?:\}})?",
+                    )
 
     def test_systemd_service_recovers_from_clean_process_exit(self):
-        text = _start_text()
+        text = SERVICE_SYSTEMD_SH.read_text(encoding="utf-8")
         install_start = text.index("do_install_systemd()")
         install_end = text.index("do_uninstall_systemd()", install_start)
         installer = text[install_start:install_end]
 
         self.assertIn("Restart=always", installer)
         self.assertNotIn("Restart=on-failure", installer)
+
+    def test_start_sh_dispatches_install_actions_to_subcommand_scripts(self):
+        # The --install/--uninstall(-systemd) machinery lives in the extracted
+        # subcommand scripts; start.sh must keep dispatching to them.
+        text = _start_text()
+        self.assertIn('exec "$SCRIPT_DIR/service-launchd.sh" install', text)
+        self.assertIn('exec "$SCRIPT_DIR/service-launchd.sh" uninstall', text)
+        self.assertIn('exec "$SCRIPT_DIR/service-systemd.sh" install', text)
+        self.assertIn('exec "$SCRIPT_DIR/service-systemd.sh" uninstall', text)
 
 
 if __name__ == "__main__":
