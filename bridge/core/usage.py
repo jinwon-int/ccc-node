@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import stat
 import time
 from dataclasses import dataclass
@@ -24,6 +25,13 @@ KST = timezone(timedelta(hours=9), name="KST")
 HIDDEN_CODEX_RATE_LIMIT_MARKERS = ("gpt-5.3-codex-spark",)
 # Documented claude-agent-sdk RateLimitStatus literals; anything else is dropped.
 RATE_LIMIT_STATUSES = frozenset({"allowed", "allowed_warning", "rejected"})
+# Per-window rate-limit maps passed through RateLimitInfo.raw (see
+# parse_claude_rate_limit_event): container keys we probe, the strict window
+# key shape we accept, and the cap on windows taken from one raw payload.
+RAW_WINDOW_CONTAINER_KEYS = ("windows", "rateLimitWindows", "unifiedRateLimits")
+RAW_WINDOW_KEY_RE = re.compile(r"^[a-z][a-z0-9_]*$")
+MAX_RAW_WINDOW_KEY_LENGTH = 64
+MAX_RAW_WINDOWS = 8
 
 
 @dataclass(frozen=True, slots=True)
@@ -197,6 +205,77 @@ def parse_codex_thread_usage(value: object) -> UsageSnapshot:
     )
 
 
+def _raw_rate_limit_window(key: object, value: object) -> UsageWindow | None:
+    """Validate one strictly window-shaped ``raw`` entry, or drop it.
+
+    Accepted shape (allowlist; anything else returns ``None``): a lowercase
+    snake_case key (``^[a-z][a-z0-9_]*$``, bounded length) mapping to a dict
+    that carries a numeric ``utilization`` in [0, 1] **and** a numeric
+    ``resets_at``/``resetsAt`` epoch timestamp. Booleans, out-of-range or
+    non-finite numbers, and non-dict values are all rejected by the shared
+    ``_number`` bounds.
+    """
+
+    if (
+        not isinstance(key, str)
+        or len(key) > MAX_RAW_WINDOW_KEY_LENGTH
+        or RAW_WINDOW_KEY_RE.fullmatch(key) is None
+        or not isinstance(value, Mapping)
+    ):
+        return None
+    utilization = _number(value.get("utilization"), maximum=1)
+    resets_at = _number(value.get("resets_at", value.get("resetsAt")), maximum=10**11)
+    if utilization is None or resets_at is None:
+        return None
+    return UsageWindow(
+        label=key.replace("_", " "),
+        used_percent=min(100.0, utilization * 100),
+        resets_at=resets_at,
+    )
+
+
+def _raw_rate_limit_windows(
+    raw: object, *, taken_labels: frozenset[str]
+) -> tuple[UsageWindow, ...]:
+    """Extract additional per-window buckets from ``RateLimitInfo.raw``.
+
+    The CLI's internal unified rate-limit state carries a full per-window map
+    (window name -> {utilization, resets_at}) sourced from the
+    ``anthropic-ratelimit-unified-*`` headers, and ``RateLimitInfo.raw``
+    passes the whole event dict through. Probe the known container keys
+    first, then top-level window-shaped entries; every candidate must pass
+    the strict ``_raw_rate_limit_window`` allowlist. Windows whose label is
+    in ``taken_labels`` (the explicitly-modeled primary window) are skipped —
+    primary wins on conflict. At most ``MAX_RAW_WINDOWS`` are returned, in
+    sorted-label order, deterministically.
+    """
+
+    root = _mapping(raw)
+    if not root:
+        return ()
+    candidates: list[tuple[str, object]] = []
+    for container_key in RAW_WINDOW_CONTAINER_KEYS:
+        container = root.get(container_key)
+        if isinstance(container, Mapping):
+            candidates.extend(
+                sorted(container.items(), key=lambda item: str(item[0]))
+            )
+    candidates.extend(
+        item
+        for item in sorted(root.items(), key=lambda item: str(item[0]))
+        if item[0] not in RAW_WINDOW_CONTAINER_KEYS
+    )
+    accepted: dict[str, UsageWindow] = {}
+    for key, value in candidates:
+        if len(accepted) >= MAX_RAW_WINDOWS:
+            break
+        window = _raw_rate_limit_window(key, value)
+        if window is None or window.label in taken_labels or window.label in accepted:
+            continue
+        accepted[window.label] = window
+    return tuple(accepted[label] for label in sorted(accepted))
+
+
 def parse_claude_rate_limit_event(message: object, *, observed_at: float | None = None) -> UsageSnapshot:
     """Parse a Claude Agent SDK ``RateLimitEvent`` from the live message stream.
 
@@ -211,6 +290,17 @@ def parse_claude_rate_limit_event(message: object, *, observed_at: float | None 
     window types keep distinct labels, so the label-keyed union in
     ``merge_usage`` retains every concurrent bucket (five-hour, weekly, and
     per-model-class weekly windows) instead of last-write-wins.
+
+    Newer CLIs additionally pass their whole internal per-window map through
+    ``RateLimitInfo.raw`` (the ``RateLimitEvent`` dataclass itself carries no
+    raw payload field — only ``rate_limit_info``/``uuid``/``session_id`` — so
+    ``info.raw`` is the sole passthrough source). When strictly window-shaped
+    entries are present there (see ``_raw_rate_limit_windows``), each becomes
+    an additional bucket so model-class windows (``seven_day_opus`` etc.)
+    surface as soon as the data exists, without waiting for the CLI to emit a
+    dedicated event of that type. The explicitly-modeled primary window always
+    wins on a label conflict, and behavior is unchanged when ``raw`` holds no
+    such map.
 
     ``overage_status``/``overage_resets_at`` (pay-as-you-go state) are also
     captured when present; the status is allowlisted to the documented
@@ -229,6 +319,11 @@ def parse_claude_rate_limit_event(message: object, *, observed_at: float | None 
                 resets_at=_number(getattr(info, "resets_at", None), maximum=10**11),
             ),
         )
+    windows += _raw_rate_limit_windows(
+        getattr(info, "raw", None),
+        taken_labels=frozenset(window.label for window in windows),
+    )
+    windows = windows[:MAX_WINDOWS]
     overage_status = _text(getattr(info, "overage_status", None))
     if overage_status not in RATE_LIMIT_STATUSES:
         overage_status = None

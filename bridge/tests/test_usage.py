@@ -14,6 +14,7 @@ import pytest
 
 from telegram_bot.core.project_chat import ProjectChatHandler
 from telegram_bot.core.usage import (
+    MAX_RAW_WINDOWS,
     MAX_TELEGRAM_USAGE_LENGTH,
     DailyUsage,
     ModelUsage,
@@ -398,6 +399,140 @@ def test_overage_state_is_parsed_allowlisted_merged_and_rendered() -> None:
     )
     assert unknown.overage_status is None
     assert unknown.overage_resets_at is None
+
+
+def _rate_limit_event(raw: object) -> SimpleNamespace:
+    """Build a scripted RateLimitEvent-shaped message with a raw passthrough."""
+
+    return SimpleNamespace(
+        rate_limit_info=SimpleNamespace(
+            status="allowed",
+            rate_limit_type="five_hour",
+            utilization=0.5,
+            resets_at=1_900_000_000,
+            raw=raw,
+        )
+    )
+
+
+def test_raw_windows_container_adds_model_class_buckets_and_renders() -> None:
+    """A per-window map under a container key in info.raw yields extra buckets
+    (mixed resetsAt/resets_at spellings accepted) alongside the primary."""
+
+    parsed = parse_claude_rate_limit_event(
+        _rate_limit_event(
+            {
+                "windows": {
+                    "five_hour": {"utilization": 0.5, "resetsAt": 1_900_000_000},
+                    "seven_day_opus": {"utilization": 0.12, "resets_at": 1_900_200_000},
+                }
+            }
+        ),
+        observed_at=1000,
+    )
+    assert [(w.label, w.used_percent) for w in parsed.windows] == [
+        ("five hour", pytest.approx(50.0)),
+        ("seven day opus", pytest.approx(12.0)),
+    ]
+    assert parsed.windows[1].resets_at == 1_900_200_000
+    rendered = render_usage(parsed)
+    assert "- five hour: 50% used" in rendered
+    assert "- seven day opus: 12% used" in rendered
+
+
+def test_raw_top_level_window_shaped_keys_are_accepted() -> None:
+    """Window-shaped top-level raw entries count too; non-window siblings
+    (status strings, scalars) are ignored rather than misparsed."""
+
+    parsed = parse_claude_rate_limit_event(
+        _rate_limit_event(
+            {
+                "status": "allowed",
+                "utilization": 0.5,
+                "resetsAt": 1_900_000_000,
+                "seven_day_opus": {"utilization": 0.12, "resetsAt": 1_900_200_000},
+            }
+        ),
+        observed_at=1000,
+    )
+    assert [w.label for w in parsed.windows] == ["five hour", "seven day opus"]
+
+
+def test_raw_window_map_malformed_entries_are_dropped() -> None:
+    parsed = parse_claude_rate_limit_event(
+        _rate_limit_event(
+            {
+                "windows": {
+                    "seven_day_opus": {"utilization": 0.12, "resetsAt": 1_900_200_000},
+                    "over_range": {"utilization": 1.5, "resetsAt": 1_900_200_000},
+                    "negative": {"utilization": -0.1, "resetsAt": 1_900_200_000},
+                    "boolean": {"utilization": True, "resetsAt": 1_900_200_000},
+                    "non_numeric": {"utilization": "0.5", "resetsAt": 1_900_200_000},
+                    "missing_reset": {"utilization": 0.4},
+                    "reset_absurd": {"utilization": 0.4, "resetsAt": 10**12},
+                    "not_a_dict": 0.4,
+                    "Absurd-Key!": {"utilization": 0.4, "resetsAt": 1_900_200_000},
+                    "x" * 65: {"utilization": 0.4, "resetsAt": 1_900_200_000},
+                }
+            }
+        ),
+        observed_at=1000,
+    )
+    assert [w.label for w in parsed.windows] == ["five hour", "seven day opus"]
+
+    # A raw payload with no window map at all keeps today's single-window shape.
+    plain = parse_claude_rate_limit_event(_rate_limit_event({}), observed_at=1000)
+    assert [w.label for w in plain.windows] == ["five hour"]
+    no_raw = parse_claude_rate_limit_event(
+        SimpleNamespace(
+            rate_limit_info=SimpleNamespace(
+                status="allowed",
+                rate_limit_type="five_hour",
+                utilization=0.5,
+                resets_at=1_900_000_000,
+            )
+        ),
+        observed_at=1000,
+    )
+    assert parsed.windows[0] == plain.windows[0] == no_raw.windows[0]
+
+
+def test_raw_window_map_never_overrides_the_primary_window() -> None:
+    parsed = parse_claude_rate_limit_event(
+        _rate_limit_event(
+            {
+                "windows": {
+                    "five_hour": {"utilization": 0.99, "resetsAt": 1_900_999_999},
+                }
+            }
+        ),
+        observed_at=1000,
+    )
+    assert [(w.label, w.used_percent, w.resets_at) for w in parsed.windows] == [
+        ("five hour", pytest.approx(50.0), 1_900_000_000)
+    ]
+
+
+def test_raw_window_map_is_capped_at_eight_windows() -> None:
+    assert MAX_RAW_WINDOWS == 8
+    parsed = parse_claude_rate_limit_event(
+        _rate_limit_event(
+            {
+                "windows": {
+                    f"window_{index:02d}": {
+                        "utilization": 0.1,
+                        "resetsAt": 1_900_000_000,
+                    }
+                    for index in range(10)
+                }
+            }
+        ),
+        observed_at=1000,
+    )
+    assert len(parsed.windows) == 1 + MAX_RAW_WINDOWS
+    assert [w.label for w in parsed.windows] == ["five hour"] + [
+        f"window {index:02d}" for index in range(MAX_RAW_WINDOWS)
+    ]
 
 
 def _run_collector(tmp_path: Path, payload: object, *, state_dir: Path | None = None) -> None:
