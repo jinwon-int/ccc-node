@@ -145,6 +145,10 @@ class StartStatusTests(unittest.TestCase):
         script_root.mkdir(parents=True, exist_ok=True)
         for filename in (
             "start.sh",
+            # start.sh --install/--uninstall dispatch to these subcommand
+            # scripts (extracted service-install machinery, #584 P3-2).
+            "service-launchd.sh",
+            "service-systemd.sh",
             "requirements.txt",
             ".env.example",
             "CHANGELOG.md",
