@@ -217,6 +217,8 @@ def test_claude_accepts_injected_runtime_for_staged_cutover(tmp_path: Path) -> N
 
 
 def test_claude_flag_off_build_context_injects_no_runtime(tmp_path: Path) -> None:
+    # #584 slice C-1: the adapter is default ON, so flag-off is now the
+    # EXPLICIT emergency kill-switch (CCC_CLAUDE_RUNTIME_ADAPTER=0).
     settings_class = _real_settings_class()
     _reload_real_module("telegram_bot.utils.chat_logger")
     _reload_real_module("telegram_bot.utils.health")
@@ -224,7 +226,11 @@ def test_claude_flag_off_build_context_injects_no_runtime(tmp_path: Path) -> Non
 
     settings = settings_class.load(
         project_root=tmp_path / "project",
-        environ={"HOME": str(tmp_path), "TELEGRAM_BOT_TOKEN": "123456:test"},
+        environ={
+            "HOME": str(tmp_path),
+            "TELEGRAM_BOT_TOKEN": "123456:test",
+            "CCC_CLAUDE_RUNTIME_ADAPTER": "0",
+        },
         bot_env_file=tmp_path / "missing.env",
     )
     assert settings.agent_provider == "claude"
@@ -232,13 +238,15 @@ def test_claude_flag_off_build_context_injects_no_runtime(tmp_path: Path) -> Non
 
     context = build_context(settings, sdk_factory=object(), telegram_port=lambda: None)
 
-    # Flag off => zero behavior change: no runtime reaches ProjectChat and
+    # Kill-switch => legacy behavior: no runtime reaches ProjectChat and
     # process_message keeps dispatching to the direct Claude SDK path.
     assert context.agent_runtime is None
     assert context.project_chat._agent_runtime is None
 
 
-def test_claude_flag_on_build_context_injects_claude_runtime(tmp_path: Path) -> None:
+def test_claude_default_build_context_injects_claude_runtime(tmp_path: Path) -> None:
+    # #584 slice C-1: with no flag in the environment the DEFAULT path now
+    # routes the Claude provider through the ClaudeRuntime adapter.
     settings_class = _real_settings_class()
     _reload_real_module("telegram_bot.utils.chat_logger")
     _reload_real_module("telegram_bot.utils.health")
@@ -251,7 +259,6 @@ def test_claude_flag_on_build_context_injects_claude_runtime(tmp_path: Path) -> 
         environ={
             "HOME": str(tmp_path),
             "TELEGRAM_BOT_TOKEN": "123456:test",
-            "CCC_CLAUDE_RUNTIME_ADAPTER": "true",
         },
         bot_env_file=tmp_path / "missing.env",
     )

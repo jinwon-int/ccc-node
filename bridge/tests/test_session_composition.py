@@ -177,11 +177,15 @@ assert context.settings is settings
 assert context.sdk_factory is sdk_factory
 assert context.telegram_port is telegram_port
 assert context.clock is clock
-# Default Claude provider with CCC_CLAUDE_RUNTIME_ADAPTER off (#584 slice B):
-# no agent runtime is composed, so ProjectChat keeps the direct SDK path.
-assert settings.claude_runtime_adapter is False
-assert context.agent_runtime is None
-assert bot._project_chat._agent_runtime is None
+# Default Claude provider with CCC_CLAUDE_RUNTIME_ADAPTER on by default
+# (#584 slice C-1): a ClaudeRuntime adapter is composed for ProjectChat.
+# Its constructor performs no filesystem initialization, preserving this
+# probe's deferred-initialization invariant.
+from telegram_bot.core.claude_runtime import ClaudeRuntime
+
+assert settings.claude_runtime_adapter is True
+assert isinstance(context.agent_runtime, ClaudeRuntime)
+assert bot._project_chat._agent_runtime is context.agent_runtime
 assert bot._config is settings
 assert bot._session_manager.settings is settings
 assert bot._project_chat._config is settings
