@@ -20,7 +20,9 @@ from telegram_bot.core.usage import (
     ModelUsage,
     UsageSnapshot,
     UsageWindow,
+    detect_claude_service,
     load_claude_status_snapshot,
+    local_claude_environment_snapshot,
     merge_usage,
     parse_claude_rate_limit_event,
     parse_claude_result,
@@ -820,4 +822,132 @@ async def test_get_usage_tolerates_handler_without_rate_limit_attribute(
     assert not hasattr(handler, "_claude_rate_limit")
 
     result = await handler.get_usage(1, 2, "claude-x")
+    assert result.windows == ()
+
+
+_SERVICE_ENV_VARS = (
+    "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_MODEL",
+    "CLAUDE_CODE_EFFORT_LEVEL",
+    "CLAUDE_CODE_MAX_CONTEXT_TOKENS",
+)
+
+
+def _clear_service_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in _SERVICE_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
+
+
+def test_detect_claude_service_matches_kimi_hosts(monkeypatch: pytest.MonkeyPatch) -> None:
+    _clear_service_env(monkeypatch)
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://api.kimi.com/coding/")
+    assert detect_claude_service() == "Kimi Code"
+    assert detect_claude_service("https://api.kimi.com/coding/") == "Kimi Code"
+    assert detect_claude_service("api.kimi.com/coding/") == "Kimi Code"
+    assert detect_claude_service("https://KIMI.COM/coding/") == "Kimi Code"
+
+
+def test_detect_claude_service_ignores_anthropic_and_lookalikes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_service_env(monkeypatch)
+    assert detect_claude_service() is None
+    assert detect_claude_service(None) is None
+    assert detect_claude_service("") is None
+    assert detect_claude_service("https://api.anthropic.com") is None
+    assert detect_claude_service("https://notkimi.com/coding/") is None
+    assert detect_claude_service("https://kimi.com.evil.example") is None
+    assert detect_claude_service("not a url at all:://") is None
+
+
+def test_local_claude_environment_snapshot_reads_kimi_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_service_env(monkeypatch)
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://api.kimi.com/coding/")
+    monkeypatch.setenv("ANTHROPIC_MODEL", "k3[1m]")
+    monkeypatch.setenv("CLAUDE_CODE_EFFORT_LEVEL", "max")
+    monkeypatch.setenv("CLAUDE_CODE_MAX_CONTEXT_TOKENS", "1048576")
+    snapshot = local_claude_environment_snapshot()
+    assert snapshot.provider == "claude"
+    assert snapshot.service == "Kimi Code"
+    assert snapshot.plan_type == "Kimi Code · k3[1m] · effort max"
+    assert snapshot.context_window == 1048576
+
+
+def test_local_claude_environment_snapshot_rejects_bad_numbers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_service_env(monkeypatch)
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://api.kimi.com/coding/")
+    monkeypatch.setenv("CLAUDE_CODE_MAX_CONTEXT_TOKENS", "10x; rm -rf /")
+    assert local_claude_environment_snapshot().context_window is None
+    monkeypatch.setenv("CLAUDE_CODE_MAX_CONTEXT_TOKENS", str(10**12))
+    assert local_claude_environment_snapshot().context_window is None
+
+
+def test_local_claude_environment_snapshot_default_env_stays_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_service_env(monkeypatch)
+    assert local_claude_environment_snapshot() == UsageSnapshot(provider="claude")
+
+
+def test_merge_usage_observed_values_override_environment_base() -> None:
+    base = UsageSnapshot(
+        provider="claude",
+        service="Kimi Code",
+        plan_type="Kimi Code · k3[1m]",
+        context_window=1048576,
+    )
+    observed = UsageSnapshot(provider="claude", context_used=123, context_window=262144)
+    merged = merge_usage(base, observed)
+    assert merged.service == "Kimi Code"
+    assert merged.plan_type == "Kimi Code · k3[1m]"
+    assert merged.context_used == 123
+    assert merged.context_window == 262144
+
+
+def test_render_usage_shows_kimi_service_title_and_quota_note() -> None:
+    snapshot = UsageSnapshot(
+        provider="claude",
+        service="Kimi Code",
+        plan_type="Kimi Code · k3[1m] · effort max",
+        context_used=1000,
+        context_window=1048576,
+    )
+    rendered = render_usage(snapshot)
+    assert rendered.splitlines()[0] == "📊 Usage · Kimi Code"
+    assert "Plan: Kimi Code · k3[1m] · effort max" in rendered
+    assert "Kimi quota: rolling 5-hour + weekly windows apply" in rendered
+    assert "Context: 1,000 / 1,048,576" in rendered
+
+
+def test_render_usage_without_service_is_unchanged() -> None:
+    rendered = render_usage(UsageSnapshot(provider="claude"))
+    assert rendered.splitlines()[0] == "📊 Usage · Claude Code"
+    assert "Kimi quota" not in rendered
+
+
+@pytest.mark.anyio
+async def test_get_usage_bases_snapshot_on_kimi_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _clear_service_env(monkeypatch)
+    monkeypatch.setenv("CCC_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://api.kimi.com/coding/")
+    monkeypatch.setenv("ANTHROPIC_MODEL", "k3[1m]")
+    monkeypatch.setenv("CLAUDE_CODE_EFFORT_LEVEL", "max")
+    monkeypatch.setenv("CLAUDE_CODE_MAX_CONTEXT_TOKENS", "1048576")
+    handler = ProjectChatHandler.__new__(ProjectChatHandler)
+    handler._agent_runtime = None
+    handler._claude_usage = {}
+    handler._usage_meter = None
+    handler._clock = SimpleNamespace(time=lambda: 1000.0)
+    handler._config = SimpleNamespace(claude_settings_path=tmp_path / "settings.json")
+
+    result = await handler.get_usage(1, 2, None)
+    assert result.service == "Kimi Code"
+    assert result.plan_type == "Kimi Code · k3[1m] · effort max"
+    assert result.context_window == 1048576
     assert result.windows == ()
