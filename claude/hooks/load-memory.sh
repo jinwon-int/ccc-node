@@ -33,13 +33,6 @@ USER_LABEL="${CCC_MEMORY_USER_LABEL:-Seo Jin On}"
 # it regardless (that is part of their definition).
 LOCAL_ENABLED="${CCC_LOCAL_MEMORY_ENABLED:-}"
 QUERY="${CCC_MEMORY_QUERY:-}"
-AUDIENCE_SCOPED="${CCC_MEMORY_AUDIENCE_SCOPED:-0}"
-MEMORY_AUDIENCE="${CCC_MEMORY_AUDIENCE:-legacy}"
-MEMORY_SCOPE="${CCC_MEMORY_SCOPE:-}"
-AUDIENCE_ROOT="${CCC_MEMORY_AUDIENCE_ROOT:-}"
-SHARED_STATE_DIR="${CCC_MEMORY_SHARED_STATE_DIR:-}"
-SHARED_CACHE_DIR="${CCC_MEMORY_SHARED_CACHE_DIR:-}"
-SHARED_MEMDIR="${CCC_MEMORY_SHARED_DIR:-}"
 LEGACY_STATE_DIR="${CCC_MEMORY_LEGACY_STATE_DIR:-${HOME:-/root}/.claude/state}"
 LEGACY_CACHE_DIR="${CCC_MEMORY_LEGACY_CACHE_DIR:-${HOME:-/root}/.claude/hooks/cache}"
 LEGACY_MEMDIR="${CCC_MEMORY_LEGACY_DIR:-${HOME:-/root}/.claude/memories}"
@@ -49,26 +42,13 @@ RESUME_FILE="${CCC_RESUME_FILE:-$STATE_DIR/resume.md}"
 LOAD_MEMORY_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)" || LOAD_MEMORY_LIB_DIR="$HOOKDIR"
 # shellcheck source=claude/hooks/lib/hook-common.sh
 . "$LOAD_MEMORY_LIB_DIR/lib/hook-common.sh" || exit 0
+# shellcheck source=claude/hooks/lib/memory-common.sh
+. "$LOAD_MEMORY_LIB_DIR/lib/memory-common.sh" || exit 0
 
 scoped_paths_valid() {
-  local suffix
-  [ -n "$AUDIENCE_ROOT" ] || return 1
-  case "$MEMORY_AUDIENCE:$MEMORY_SCOPE" in
-    shared:shared) ;;
-    private:private-*)
-      suffix="${MEMORY_SCOPE#private-}"
-      [ "${#suffix}" = 32 ] || return 1
-      case "$suffix" in *[!0-9a-f]*) return 1 ;; esac
-      ;;
-    *) return 1 ;;
-  esac
-  [ "$STATE_DIR" = "$AUDIENCE_ROOT/$MEMORY_SCOPE/state" ] \
-    && [ "$CACHE" = "$AUDIENCE_ROOT/$MEMORY_SCOPE/cache" ] \
+  memory_scope_core_valid \
     && [ "$MEMDIR" = "$AUDIENCE_ROOT/$MEMORY_SCOPE/memories" ] \
-    && [ "$RESUME_FILE" = "$AUDIENCE_ROOT/$MEMORY_SCOPE/state/resume.md" ] \
-    && [ "$SHARED_STATE_DIR" = "$AUDIENCE_ROOT/shared/state" ] \
-    && [ "$SHARED_CACHE_DIR" = "$AUDIENCE_ROOT/shared/cache" ] \
-    && [ "$SHARED_MEMDIR" = "$AUDIENCE_ROOT/shared/memories" ]
+    && [ "$RESUME_FILE" = "$AUDIENCE_ROOT/$MEMORY_SCOPE/state/resume.md" ]
 }
 
 if ! is_disabled "$AUDIENCE_SCOPED"; then

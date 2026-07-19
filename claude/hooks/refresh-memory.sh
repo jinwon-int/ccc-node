@@ -18,40 +18,18 @@ WIKI_ENABLED="${CCC_WIKI_MEMORY_ENABLED:-1}"
 ISOLATION_PROFILE="${CCC_NODE_ISOLATION_PROFILE:-fleet}"
 [ "$ISOLATION_PROFILE" = "external" ] && WIKI_ENABLED=0
 PROFILE="${CCC_MEMORY_PROFILE:-honcho}"
-AUDIENCE_SCOPED="${CCC_MEMORY_AUDIENCE_SCOPED:-0}"
-MEMORY_AUDIENCE="${CCC_MEMORY_AUDIENCE:-legacy}"
-MEMORY_SCOPE="${CCC_MEMORY_SCOPE:-}"
-AUDIENCE_ROOT="${CCC_MEMORY_AUDIENCE_ROOT:-}"
-SHARED_STATE_DIR="${CCC_MEMORY_SHARED_STATE_DIR:-}"
-SHARED_CACHE_DIR="${CCC_MEMORY_SHARED_CACHE_DIR:-}"
-SHARED_MEMDIR="${CCC_MEMORY_SHARED_DIR:-}"
-SHARED_FACTS_FILE="${CCC_MEMORY_SHARED_FACTS_FILE:-}"
 INDEX_DB="${CCC_MEMORY_INDEX_DB:-$STATE_DIR/memory-index.sqlite}"
 FACTS_FILE="${CCC_MEMORY_FACTS_FILE:-$STATE_DIR/memory-facts.jsonl}"
 
 REFRESH_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)" || REFRESH_LIB_DIR="$HOOKDIR"
 # shellcheck source=claude/hooks/lib/hook-common.sh
 . "$REFRESH_LIB_DIR/lib/hook-common.sh" || exit 0
+# shellcheck source=claude/hooks/lib/memory-common.sh
+. "$REFRESH_LIB_DIR/lib/memory-common.sh" || exit 0
 if ! is_disabled "$AUDIENCE_SCOPED"; then
-  valid=0
-  case "$MEMORY_AUDIENCE:$MEMORY_SCOPE" in
-    shared:shared) valid=1 ;;
-    private:private-*)
-      suffix="${MEMORY_SCOPE#private-}"
-      if [ "${#suffix}" = 32 ]; then
-        case "$suffix" in *[!0-9a-f]*) ;; *) valid=1 ;; esac
-      fi
-      ;;
-  esac
-  [ "$valid" = 1 ] \
-    && [ -n "$AUDIENCE_ROOT" ] \
-    && [ "$STATE_DIR" = "$AUDIENCE_ROOT/$MEMORY_SCOPE/state" ] \
-    && [ "$CACHE" = "$AUDIENCE_ROOT/$MEMORY_SCOPE/cache" ] \
+  memory_scope_core_valid \
     && [ "$INDEX_DB" = "$AUDIENCE_ROOT/$MEMORY_SCOPE/state/memory-index.sqlite" ] \
     && [ "$FACTS_FILE" = "$AUDIENCE_ROOT/$MEMORY_SCOPE/state/memory-facts.jsonl" ] \
-    && [ "$SHARED_STATE_DIR" = "$AUDIENCE_ROOT/shared/state" ] \
-    && [ "$SHARED_CACHE_DIR" = "$AUDIENCE_ROOT/shared/cache" ] \
-    && [ "$SHARED_MEMDIR" = "$AUDIENCE_ROOT/shared/memories" ] \
     && [ "$SHARED_FACTS_FILE" = "$AUDIENCE_ROOT/shared/state/memory-facts.jsonl" ] \
     || exit 0
   HONCHO_ENABLED=0
