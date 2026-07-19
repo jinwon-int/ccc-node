@@ -71,6 +71,26 @@ def build_context(
             memory_materializer_path=settings.codex_memory_materializer_path,
             memory_bootstrap_timeout_seconds=(settings.codex_memory_bootstrap_timeout_seconds),
         )
+    elif (
+        settings.agent_provider == "claude"
+        and getattr(settings, "claude_runtime_adapter", False)
+        and agent_runtime is None
+    ):
+        # #346 staged-cutover canary (#584 slice B): route the Claude provider
+        # through the provider-neutral ClaudeRuntime adapter. Default off; with
+        # the flag off no runtime is injected and ProjectChat keeps the direct
+        # Claude SDK stream path unchanged. The transcripts browsing directory
+        # matches the direct path's resolution of ~/.claude/projects
+        # (ProjectChatHandler.conversations_dir).
+        from telegram_bot.core.claude_runtime import ClaudeRuntime
+        from telegram_bot.core.conversation_paths import claude_project_dir_name
+
+        agent_runtime = ClaudeRuntime(
+            transcripts_dir=Path.home()
+            / ".claude"
+            / "projects"
+            / claude_project_dir_name(Path(settings.project_root).resolve()),
+        )
     telegram_port = telegram_port or Application.builder
     clock = clock or time
     bind_logs_dir(settings.logs_dir)

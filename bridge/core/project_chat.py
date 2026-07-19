@@ -221,7 +221,11 @@ class ProjectChatHandler(
         provider = getattr(self._config, "agent_provider", "claude")
         if provider == "codex" and agent_runtime is None:
             raise ValueError("Codex ProjectChat requires an injected AgentRuntime")
-        self._agent_runtime = agent_runtime if provider == "codex" else None
+        # Codex REQUIRES an injected runtime; Claude ACCEPTS one behind the
+        # #346 staged-cutover canary flag (CCC_CLAUDE_RUNTIME_ADAPTER, wired by
+        # the composition root). Runtime presence is the dispatch signal for
+        # the provider-neutral agent path everywhere downstream.
+        self._agent_runtime = agent_runtime
         self._agent_sessions: Dict[Tuple[int, int], AgentSessionEntry] = {}
         self._agent_active_sessions: Dict[Tuple[int, int], Any] = {}
         self._agent_active_generations: Dict[Tuple[int, int], int] = {}
@@ -493,6 +497,58 @@ class ProjectChatHandler(
         except Exception:
             logger.exception("Interactive usage metering failed; turn continues")
 
+    def record_claude_adapter_attempt(self) -> None:
+        """Meter one Claude adapter-path request at its spend boundary (#388).
+
+        Mirrors ``record_claude_attempt`` for the flagged adapter path
+        (CCC_CLAUDE_RUNTIME_ADAPTER, #584 slice B): the first runtime event of
+        a turn proves the provider accepted the request, so cancellation after
+        any output still charges exactly one request. Codex meters at its own
+        runtime spend boundary via ``set_turn_attempt_recorder``; any runtime
+        exposing that seam meters itself and this helper stays a no-op.
+        """
+
+        if self._usage_meter is None:
+            return
+        if getattr(self._config, "agent_provider", "claude") != "claude":
+            return
+        if callable(getattr(self._agent_runtime, "set_turn_attempt_recorder", None)):
+            return
+        try:
+            self._usage_meter.record("claude", MODE_INTERACTIVE, requests=1)
+        except Exception:
+            logger.exception("Claude request metering failed; turn continues")
+
+    def record_claude_adapter_result(self, event: Any) -> None:
+        """Meter Claude adapter-path tokens from the terminal ResultEvent (#388).
+
+        ClaudeRuntime carries the SDK ResultMessage usage block in its
+        ResultEvent payload, so the adapter path meters the same validated
+        input/output totals the direct path derives via ``parse_claude_result``
+        (raw + cache-creation + cache-read input). Codex tokens meter through
+        the runtime's ``set_usage_recorder`` seam and are excluded here by the
+        provider check, so nothing double charges. Known canary gap: a turn
+        that terminates in ErrorEvent emits no ResultEvent, so its tokens are
+        not metered on the adapter path (the direct path meters per assistant
+        step); the request itself is still counted at the spend boundary.
+        """
+
+        if self._usage_meter is None:
+            return
+        if getattr(self._config, "agent_provider", "claude") != "claude":
+            return
+        payload = getattr(event, "result", None)
+        usage = payload.get("usage") if isinstance(payload, Mapping) else None
+        if not isinstance(usage, Mapping):
+            return
+        from types import SimpleNamespace as _NS
+
+        delta = self._claude_usage_totals(
+            _NS(usage=dict(usage), model_usage={}, total_cost_usd=None)
+        )
+        if any(delta):
+            self._meter_claude_tokens(delta)
+
     def _stream_key(self, user_id: int, chat_id: int) -> Tuple[int, int]:
         return stream_key(
             getattr(self._config, "telegram_session_scope", "per-user-chat"),
@@ -557,9 +613,13 @@ class ProjectChatHandler(
         if self._agent_runtime is not None:
             runtime = self._require_runtime()
             get_usage = getattr(runtime, "get_usage", None)
-            if get_usage is None:
+            if get_usage is not None:
+                return await asyncio.wait_for(get_usage(session_id), timeout=7.0)
+            if getattr(self._config, "agent_provider", "claude") != "claude":
                 return UsageSnapshot(provider="codex")
-            return await asyncio.wait_for(get_usage(session_id), timeout=7.0)
+            # Claude adapter path (#584 slice B): ClaudeRuntime exposes no
+            # usage endpoint, so fall through to the direct-path aggregation
+            # (status-file snapshots and observed rate-limit windows).
 
         result = UsageSnapshot(provider="claude")
         if not session_id:
