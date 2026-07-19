@@ -13,6 +13,7 @@ from datetime import datetime, timedelta, timezone
 from hashlib import sha256
 from pathlib import Path
 from typing import Any, Mapping, Sequence
+from urllib.parse import urlsplit
 
 MAX_WINDOWS = 16
 MAX_MODELS = 16
@@ -64,6 +65,7 @@ class ModelUsage:
 class UsageSnapshot:
     provider: str
     plan_type: str | None = None
+    service: str | None = None
     windows: tuple[UsageWindow, ...] = ()
     context_used: int | None = None
     context_window: int | None = None
@@ -106,6 +108,73 @@ def _text(value: object, *, maximum: int = 80) -> str | None:
 
 def _mapping(value: object) -> Mapping[str, Any]:
     return value if isinstance(value, Mapping) else {}
+
+
+_KNOWN_CLAUDE_SERVICES: tuple[tuple[str, str], ...] = (
+    ("kimi.com", "Kimi Code"),
+)
+
+
+def detect_claude_service(base_url: object = None) -> str | None:
+    """Return a display name for a known third-party Claude-compatible service.
+
+    Reads ``ANTHROPIC_BASE_URL`` when *base_url* is omitted. Returns ``None``
+    for the Anthropic default or unknown hosts so rendering stays unchanged.
+    Only the URL host is inspected; credentials are never touched.
+    """
+    raw = base_url if base_url is not None else os.environ.get("ANTHROPIC_BASE_URL")
+    text = _text(raw, maximum=200)
+    if not text:
+        return None
+    candidate = text if "://" in text else f"https://{text}"
+    try:
+        host = urlsplit(candidate).netloc.casefold()
+    except ValueError:
+        return None
+    if not host:
+        return None
+    for marker, name in _KNOWN_CLAUDE_SERVICES:
+        if host == marker or host.endswith(f".{marker}"):
+            return name
+    return None
+
+
+def _env_int(name: str, *, maximum: int = 10**9) -> int | None:
+    raw = os.environ.get(name)
+    if raw is None:
+        return None
+    text = raw.strip()
+    if not text.isdigit():
+        return None
+    value = int(text)
+    return value if 0 <= value <= maximum else None
+
+
+def local_claude_environment_snapshot() -> UsageSnapshot:
+    """Base snapshot built from local (non-secret) provider environment config.
+
+    Third-party Claude-compatible services (e.g. Kimi Code) emit no
+    rate-limit events, so plan/context would otherwise render "unavailable".
+    Only model/effort/context-size identifiers are read — never credentials.
+    Unknown/Anthropic-default environments return an empty snapshot so
+    existing behavior is byte-identical.
+    """
+    service = detect_claude_service()
+    if service is None:
+        return UsageSnapshot(provider="claude")
+    parts = [service]
+    model = _text(os.environ.get("ANTHROPIC_MODEL"), maximum=80)
+    if model:
+        parts.append(model)
+    effort = _text(os.environ.get("CLAUDE_CODE_EFFORT_LEVEL"), maximum=20)
+    if effort:
+        parts.append(f"effort {effort}")
+    return UsageSnapshot(
+        provider="claude",
+        service=service,
+        plan_type=" · ".join(parts),
+        context_window=_env_int("CLAUDE_CODE_MAX_CONTEXT_TOKENS"),
+    )
 
 
 def _window(label: str, value: object) -> UsageWindow | None:
@@ -493,6 +562,7 @@ def merge_usage(*snapshots: UsageSnapshot) -> UsageSnapshot:
         result = UsageSnapshot(
             provider=result.provider,
             plan_type=newer.plan_type or result.plan_type,
+            service=newer.service or result.service,
             windows=tuple(windows_by_label[key] for key in sorted(windows_by_label))[:MAX_WINDOWS],
             context_used=(
                 newer.context_used if newer.context_used is not None else result.context_used
@@ -656,11 +726,25 @@ def _tokens(value: int | None) -> str:
     return f"{value:,}" if value is not None else "unavailable"
 
 
+def _usage_title(snapshot: UsageSnapshot) -> str:
+    if snapshot.provider == "codex":
+        return "Codex"
+    return snapshot.service or "Claude Code"
+
+
+def _service_quota_note(service: str | None) -> str | None:
+    if service == "Kimi Code":
+        return (
+            "Kimi quota: rolling 5-hour + weekly windows apply — "
+            "see the Kimi Code Console for remaining quota"
+        )
+    return None
+
+
 def render_usage(snapshot: UsageSnapshot) -> str:
     """Render a deterministic, bounded, Telegram-safe plain-text response."""
 
-    title = "Codex" if snapshot.provider == "codex" else "Claude Code"
-    lines = [f"📊 Usage · {title}", f"Plan: {snapshot.plan_type or 'unavailable'}"]
+    lines = [f"📊 Usage · {_usage_title(snapshot)}", f"Plan: {snapshot.plan_type or 'unavailable'}"]
     visible_windows = tuple(
         window
         for window in snapshot.windows
@@ -689,6 +773,9 @@ def render_usage(snapshot: UsageSnapshot) -> str:
         lines.append(
             f"Overage: {snapshot.overage_status} · {_format_reset(snapshot.overage_resets_at)}"
         )
+    quota_note = _service_quota_note(snapshot.service)
+    if quota_note is not None:
+        lines.append(quota_note)
 
     if snapshot.context_used is not None and snapshot.context_window:
         percent = min(100.0, snapshot.context_used * 100 / snapshot.context_window)

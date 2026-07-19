@@ -51,6 +51,7 @@ from telegram_bot.core.usage import (
     SNAPSHOT_TTL_SECONDS,
     UsageSnapshot,
     load_claude_status_snapshot,
+    local_claude_environment_snapshot,
     merge_usage,
     parse_claude_rate_limit_event,
     parse_claude_result,
@@ -637,7 +638,11 @@ class ProjectChatHandler(
             # usage endpoint, so fall through to the direct-path aggregation
             # (status-file snapshots and observed rate-limit windows).
 
-        result = UsageSnapshot(provider="claude")
+        # Base carries non-secret local provider environment (service label,
+        # configured model/effort/context cap) so third-party Claude-compatible
+        # backends without rate-limit events still render meaningfully;
+        # observed snapshots below always override it.
+        result = local_claude_environment_snapshot()
         if not session_id:
             return result
         cached = self._claude_usage.get((user_id, chat_id, session_id))
