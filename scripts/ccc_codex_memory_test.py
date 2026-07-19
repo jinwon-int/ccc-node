@@ -417,6 +417,43 @@ class CodexMemoryMaterializerTest(unittest.TestCase):
         self.assertNotIn(sentinel, completed.stderr)
         self.assertIn(sentinel, (self.codex_home / "AGENTS.md").read_text())
 
+    def test_audience_scoped_env_blocks_materialize_and_status(self) -> None:
+        # #581: the global CODEX_HOME/AGENTS.md store has no per-audience
+        # separation; under audience-scoped memory both refreshing and reusing
+        # the snapshot must fail closed, body-free.
+        env = os.environ.copy()
+        env.update(
+            {
+                "HOME": str(self.home),
+                "CODEX_HOME": str(self.codex_home),
+                "CCC_MEMORY_AUDIENCE_SCOPED": "1",
+            }
+        )
+        for command in ("materialize", "status"):
+            completed = subprocess.run(
+                [sys.executable, str(MODULE_PATH), command, "--json"],
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            self.assertEqual(completed.returncode, 70, completed.stderr)
+            payload = json.loads(completed.stdout)
+            self.assertEqual(payload["code"], "codex_audience_scoped_blocked")
+        self.assertFalse((self.codex_home / "AGENTS.md").exists())
+
+    def test_audience_scoped_off_spellings_do_not_block(self) -> None:
+        for value in ("", "0", "false", "off", "no", "OFF"):
+            self.assertFalse(
+                self.module._audience_scoped_blocked({"CCC_MEMORY_AUDIENCE_SCOPED": value})
+            )
+        for value in ("1", "true", "on", "yes"):
+            self.assertTrue(
+                self.module._audience_scoped_blocked({"CCC_MEMORY_AUDIENCE_SCOPED": value})
+            )
+
     def test_loader_and_errors_are_bounded_body_free_codes(self) -> None:
         with self.assertRaises(self.module.MaterializeError) as caught:
             self.module.load_snapshot(

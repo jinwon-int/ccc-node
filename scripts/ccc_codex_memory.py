@@ -42,6 +42,7 @@ MAX_EXISTING_BYTES = 1024 * 1024
 _HASH_RE = re.compile(r"^- snapshot-sha256: `([0-9a-f]{64})`$", re.MULTILINE)
 _TIME_RE = re.compile(r"^- materialized-at: `([^`]+)`$", re.MULTILINE)
 _EXIT_CODES = {
+    "codex_audience_scoped_blocked": 70,
     "codex_lock_timeout": 20,
     "codex_home_unsafe": 30,
     "codex_agents_unsafe": 30,
@@ -865,9 +866,29 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _audience_scoped_blocked(environ: Mapping[str, str] | None = None) -> bool:
+    """True when audience-scoped memory (#580) is active in the environment.
+
+    CODEX_HOME/AGENTS.md is a single global, persistent store with no
+    per-audience separation (#581). Under audience scoping, materializing a
+    snapshot here — or reusing a previously materialized one — would let
+    DM-private memory reach shared-audience Codex runs. Fail closed instead.
+    """
+    env = os.environ if environ is None else environ
+    raw = (env.get("CCC_MEMORY_AUDIENCE_SCOPED") or "").strip().lower()
+    return raw not in ("", "0", "false", "off", "no")
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     options = MaterializeOptions.from_environ()
+    if _audience_scoped_blocked():
+        payload = {"status": "error", "code": "codex_audience_scoped_blocked"}
+        if getattr(args, "json", False):
+            print(json.dumps(payload, sort_keys=True, separators=(",", ":")))
+        else:
+            print("codex_audience_scoped_blocked", file=sys.stderr)
+        return _EXIT_CODES["codex_audience_scoped_blocked"]
     if args.command == "status":
         result = snapshot_status(options)
         if getattr(args, "json", False):
