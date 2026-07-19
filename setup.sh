@@ -318,6 +318,10 @@ run cp "$SRC/claude/hooks/lib/memory-common.sh" "$CLAUDE_DIR/hooks/lib/memory-co
 run cp "$SRC/claude/hooks/lib/mtime-prune.sh" "$CLAUDE_DIR/hooks/lib/mtime-prune.sh"
 run cp "$SRC/scripts/lib/harness-paths.sh" "$CLAUDE_DIR/hooks/lib/harness-paths.sh"
 run cp "$SRC/scripts/lib/harness_paths.py" "$CLAUDE_DIR/hooks/lib/harness_paths.py"
+# Memory rendering/budget/bounded-search module (#584 P2-1): load-memory.sh
+# invokes this instead of inline heredocs; without it the hook fails open to
+# raw/unfiltered fallbacks, so it must ship alongside the hook.
+run cp "$SRC/claude/hooks/lib/memory_render.py" "$CLAUDE_DIR/hooks/lib/memory_render.py"
 run cp "$SRC/claude/hooks/load-memory.sh" "$CLAUDE_DIR/hooks/load-memory.sh"
 # Codex launch boundary: the launcher and materializer are installed beside
 # load-memory.sh so every direct/app-server run reuses the same snapshot policy.
@@ -375,6 +379,7 @@ installed_hook_scripts=(
   "$CLAUDE_DIR/hooks/lib/mtime-prune.sh"
   "$CLAUDE_DIR/hooks/lib/harness-paths.sh"
   "$CLAUDE_DIR/hooks/lib/harness_paths.py"
+  "$CLAUDE_DIR/hooks/lib/memory_render.py"
   "$CLAUDE_DIR/hooks/load-memory.sh"
   "$CLAUDE_DIR/hooks/ccc-codex"
   "$CLAUDE_DIR/hooks/ccc_codex_memory.py"

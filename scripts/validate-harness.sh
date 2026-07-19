@@ -211,6 +211,7 @@ fi
 say "== python hook helpers =="
 if command -v python3 >/dev/null 2>&1; then
   if python3 -m py_compile claude/hooks/statusline-usage.py 2>/dev/null; then say "  ok claude/hooks/statusline-usage.py compiles"; else err "py_compile: claude/hooks/statusline-usage.py"; fi
+  if python3 -m py_compile claude/hooks/lib/memory_render.py 2>/dev/null; then say "  ok claude/hooks/lib/memory_render.py compiles"; else err "py_compile: claude/hooks/lib/memory_render.py"; fi
 else
   say "  (python3 absent — skipped)"
 fi
@@ -223,6 +224,7 @@ for t in claude/hooks/observability.test.sh claude/hooks/security-scan.test.sh \
          claude/hooks/checkpoint.test.sh claude/hooks/distill-scope.test.sh claude/hooks/skill-review.test.sh \
          claude/hooks/skill-review/autoinstall.test.sh \
          claude/hooks/lib/mtime-prune.test.sh \
+         claude/hooks/lib/memory_render.test.sh \
          claude/hooks/lib/test-stub.test.sh \
          claude/hooks/distill/extract.test.sh claude/hooks/distill/honcho-push.test.sh \
          claude/hooks/distill/queue-drain.test.sh claude/hooks/distill/pending-drain.test.sh claude/hooks/distill/wiki-queue.test.sh \
