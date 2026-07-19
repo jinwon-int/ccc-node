@@ -585,14 +585,28 @@ class ProjectChatHandler(
             return normalized
         return f"{normalized}:{metadata.st_size}:{metadata.st_mtime_ns}"
 
-    def _record_claude_usage(self, req: _PendingRequest, msg: ResultMessage) -> None:
+    def record_claude_result_snapshot(
+        self, user_id: int, chat_id: int, msg: ResultMessage
+    ) -> None:
+        """Cache one terminal ResultMessage's usage/cost snapshot for /usage.
+
+        Message-only apart from the conversation ids, so both Claude paths
+        share it: the direct reader loop via ``_record_claude_usage`` and the
+        adapter path via the ``set_sdk_frame_observer`` seam (#584 C-1
+        follow-up). This is what ``get_usage`` reads for the Context /
+        Session tokens / Session cost lines.
+        """
+
         session_id = msg.session_id
         if not isinstance(session_id, str) or not session_id:
             return
-        key = (req.user_id, req.chat_id, session_id)
+        key = (user_id, chat_id, session_id)
         snapshot = parse_claude_result(msg, observed_at=self._clock.time())
         self._claude_usage[key] = snapshot
         self._claude_usage = dict(tuple(self._claude_usage.items())[-128:])
+
+    def _record_claude_usage(self, req: _PendingRequest, msg: ResultMessage) -> None:
+        self.record_claude_result_snapshot(req.user_id, req.chat_id, msg)
         self.record_claude_observed_usage(req, msg, terminal=True)
 
     def _record_claude_rate_limit(self, msg: RateLimitEvent) -> None:

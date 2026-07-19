@@ -8,6 +8,8 @@ import re
 from collections.abc import Mapping
 from typing import Any, Optional
 
+from claude_agent_sdk import RateLimitEvent, ResultMessage
+
 from telegram_bot.core.agent_runtime import (
     ApprovalDecision,
     ApprovalRequestEvent,
@@ -424,6 +426,42 @@ class ProjectChatProcessMixin:
 
         setter(deliver_unsolicited)
 
+    def _register_agent_frame_observer(
+        self, session: Any, *, user_id: int, chat_id: int
+    ) -> None:
+        """Feed adapter-path SDK frames into the direct-path /usage recorders.
+
+        #584 C-1 follow-up: on the now-default ClaudeRuntime adapter path the
+        legacy reader loop never runs, so nothing recorded the ResultMessage
+        usage/cost snapshots or the RateLimitEvent windows that ``get_usage``
+        aggregates — /usage rendered every line "unavailable" while turns
+        worked. ``ClaudeSession.set_sdk_frame_observer`` replays the raw SDK
+        frames (turn-bearing and between-turns flows alike); this observer
+        routes them into the same recorders the direct reader loop uses.
+
+        Observation-only: token/request metering stays on the slice-B seam
+        (``record_claude_adapter_attempt`` / ``record_claude_adapter_result``),
+        so nothing double-charges the usage meter. Runtimes without the seam
+        (Codex serves /usage from its own ``get_usage`` endpoint) and
+        non-Claude providers are untouched.
+        """
+
+        if getattr(self._config, "agent_provider", "claude") != "claude":
+            return
+        setter = getattr(session, "set_sdk_frame_observer", None)
+        if not callable(setter):
+            return
+
+        def observe_sdk_frame(message: Any) -> None:
+            if isinstance(message, RateLimitEvent):
+                # Account-global windows, deliberately not conversation-scoped
+                # (see ``_claude_rate_limit`` in project_chat).
+                self._record_claude_rate_limit(message)
+            elif isinstance(message, ResultMessage):
+                self.record_claude_result_snapshot(user_id, chat_id, message)
+
+        setter(observe_sdk_frame)
+
     async def _agent_progress_loop(self, request: _PendingRequest) -> None:
         """Keep provider-neutral turns visibly alive between runtime events."""
         try:
@@ -555,6 +593,11 @@ class ProjectChatProcessMixin:
                     chat_id=chat_id,
                     model=model,
                     route_bot=notification_bot or bot,
+                )
+                # Same cadence as the unsolicited route: (re-)register the
+                # /usage observation seam each turn for this conversation.
+                self._register_agent_frame_observer(
+                    session, user_id=user_id, chat_id=chat_id
                 )
                 self._agent_active_sessions[key] = session
                 self._agent_started_at[key] = asyncio.get_running_loop().time()

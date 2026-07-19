@@ -114,6 +114,15 @@ SdkClientFactory = Callable[[ClaudeAgentOptions], SdkClient]
 # continuing after a harness background-task notification).
 UnsolicitedHandler = Callable[[str, "str | None"], Awaitable[None]]
 
+# Optional observation-only seam (#584 C-1 follow-up): a synchronous callback
+# invoked with every raw SDK frame the session reads — turn-bearing and
+# between-turns flows alike — so the bridge can observe the same
+# ResultMessage usage/cost payloads and RateLimitEvent windows the direct
+# reader loop feeds into its /usage recorders. Fire-and-forget and
+# exception-isolated: a broken observer never affects turn processing, and
+# runtimes without the seam (Codex) keep their current behavior.
+SdkFrameObserver = Callable[[Message], None]
+
 
 def _default_sdk_client_factory(options: ClaudeAgentOptions) -> SdkClient:
     return ClaudeSDKClient(options=options)
@@ -168,6 +177,7 @@ class ClaudeSession:
         self._unsolicited_inflight = False
         self._unsolicited_texts: list[str] = []
         self._unsolicited_discard = False
+        self._sdk_frame_observer: SdkFrameObserver | None = None
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -231,6 +241,32 @@ class ClaudeSession:
         """
 
         self._unsolicited_handler = handler
+
+    def set_sdk_frame_observer(self, observer: SdkFrameObserver) -> None:
+        """Register the raw-SDK-frame observation route (optional seam).
+
+        Same optional-seam style as ``set_unsolicited_handler``: callers
+        probe it via ``getattr`` and sessions without it keep their current
+        behavior. The observer runs synchronously for every frame the reader
+        routes — turn and between-turns flows alike, including frames the
+        discard machinery swallows — strictly for observation (the /usage
+        usage-snapshot and rate-limit recorders). It is fail-open: exceptions
+        are logged and never reach turn processing. Re-registration replaces
+        the route.
+        """
+
+        self._sdk_frame_observer = observer
+
+    def _observe_sdk_frame(self, message: Message) -> None:
+        observer = self._sdk_frame_observer
+        if observer is None:
+            return
+        try:
+            observer(message)
+        except Exception:
+            # Observation-only seam: a broken observer must never affect the
+            # frame routing that serves turns and unsolicited delivery.
+            logger.exception("Claude SDK frame observer failed; frame routing continues")
 
     def send_turn(
         self,
@@ -309,6 +345,7 @@ class ClaudeSession:
             self._session_ready.set()
 
     async def _route_message(self, message: Message) -> None:
+        self._observe_sdk_frame(message)
         self._observe_session_id(message)
         active = self._active_turn
         if self._unsolicited_inflight or active is None or active.finished:
