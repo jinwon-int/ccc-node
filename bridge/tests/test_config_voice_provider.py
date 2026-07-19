@@ -155,9 +155,12 @@ class VoiceProviderConfigTests(unittest.TestCase):
     def test_execution_profile_precedence_in_fresh_processes(self):
         source_utils = Path(__file__).resolve().parents[1] / "utils"
         source_config = source_utils / "config.py"
-        # config.py imports the dependency-free memory_policy leaf module, so
-        # the synthetic standalone package must ship it too.
+        # config.py imports the dependency-free memory_policy leaf module and
+        # the per-domain settings mixin leaf modules (#584 P2-3), so the
+        # synthetic standalone package must ship them too.
         source_policy = source_utils / "memory_policy.py"
+        source_voice = source_utils / "settings_voice.py"
+        source_heartbeat = source_utils / "settings_heartbeat.py"
         with TemporaryDirectory() as td:
             root = Path(td)
             package_root = root / "package"
@@ -168,6 +171,8 @@ class VoiceProviderConfigTests(unittest.TestCase):
             (utils / "__init__.py").write_text("", encoding="utf-8")
             shutil.copy2(source_config, utils / "config.py")
             shutil.copy2(source_policy, utils / "memory_policy.py")
+            shutil.copy2(source_voice, utils / "settings_voice.py")
+            shutil.copy2(source_heartbeat, utils / "settings_heartbeat.py")
 
             project_root = root / "project"
             project_env = project_root / ".telegram_bot" / ".env"
