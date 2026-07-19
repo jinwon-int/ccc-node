@@ -12,7 +12,7 @@ normalized ``AgentEvent`` stream that the runtime conformance suite pins.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Callable, Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 import logging
 from pathlib import Path
@@ -108,6 +108,12 @@ class SdkClient(Protocol):
 
 SdkClientFactory = Callable[[ClaudeAgentOptions], SdkClient]
 
+# Optional seam mirroring the direct path's ``UnsolicitedCallback``
+# (project_chat_types): async (text, session_id) -> None. Delivers assistant
+# output produced outside any ``send_turn`` (for example the CLI autonomously
+# continuing after a harness background-task notification).
+UnsolicitedHandler = Callable[[str, "str | None"], Awaitable[None]]
+
 
 def _default_sdk_client_factory(options: ClaudeAgentOptions) -> SdkClient:
     return ClaudeSDKClient(options=options)
@@ -143,6 +149,25 @@ class ClaudeSession:
         self._active_turn: _ActiveTurn | None = None
         self._approval_counter = 0
         self._closed = False
+        # Between-turns ("unsolicited") frame state, mirroring the direct
+        # path's ``_UserStreamState`` machinery (project_chat_reader):
+        #   * handler — optional delivery route; absent = frames are dropped
+        #     exactly as before this seam existed.
+        #   * inflight — once a turn-bearing frame arrives without an active
+        #     ``send_turn``, the autonomous turn keeps ownership of every
+        #     frame through its terminal ResultMessage, even when a new user
+        #     turn is submitted in between.
+        #   * texts — assistant text buffered until that terminal result so
+        #     one autonomous turn delivers as one message.
+        #   * discard — a ``send_turn`` abandoned mid-turn (stall release,
+        #     timeout, cancellation) may leak its late frames onto the
+        #     between-turns listener; swallow them through the next terminal
+        #     ResultMessage so an already-owned answer cannot deliver twice
+        #     (the adapter counterpart of ``stall_swallow_result``).
+        self._unsolicited_handler: UnsolicitedHandler | None = None
+        self._unsolicited_inflight = False
+        self._unsolicited_texts: list[str] = []
+        self._unsolicited_discard = False
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -195,6 +220,18 @@ class ClaudeSession:
             raise RuntimeError("Claude session is not started")
         return self._session_id
 
+    def set_unsolicited_handler(self, handler: UnsolicitedHandler) -> None:
+        """Register the between-turns delivery route (optional seam).
+
+        Mirrors the style of the optional runtime seams project_chat probes
+        via ``getattr`` (``set_usage_recorder`` / ``set_turn_attempt_recorder``
+        on CodexRuntime): runtimes/sessions without the method keep their
+        current behavior. The handler is fail-open — exceptions are logged and
+        never break the reader task. Re-registration replaces the route.
+        """
+
+        self._unsolicited_handler = handler
+
     def send_turn(
         self,
         message: str,
@@ -209,8 +246,10 @@ class ClaudeSession:
             async with lock:
                 active = _ActiveTurn(asyncio.Queue(), approval_handler)
                 self._active_turn = active
+                queried = False
                 try:
                     await client.query(message)
+                    queried = True
                     while True:
                         event = await active.queue.get()
                         yield event
@@ -224,6 +263,13 @@ class ClaudeSession:
                         message=str(exc) or "Claude runtime request failed",
                     )
                 finally:
+                    if queried and not active.finished:
+                        # Abandoned before its terminal frame (stall release,
+                        # timeout, cancellation) while the provider turn may
+                        # still be running: its late frames must be swallowed
+                        # by the between-turns listener, not re-delivered as
+                        # an unsolicited message.
+                        self._unsolicited_discard = True
                     active.finished = True
                     if self._active_turn is active:
                         self._active_turn = None
@@ -245,7 +291,7 @@ class ClaudeSession:
         try:
             async for message in client.receive_messages():
                 try:
-                    self._route_message(message)
+                    await self._route_message(message)
                 except (TypeError, ValueError):
                     # One malformed frame must not take the connection down.
                     continue
@@ -262,12 +308,16 @@ class ClaudeSession:
             # A closed stream can never announce an id; unblock _start.
             self._session_ready.set()
 
-    def _route_message(self, message: Message) -> None:
+    async def _route_message(self, message: Message) -> None:
         self._observe_session_id(message)
         active = self._active_turn
-        if active is None or active.finished:
-            # Unsolicited frames stay a project_chat concern; the adapter only
-            # translates frames belonging to the in-flight turn.
+        if self._unsolicited_inflight or active is None or active.finished:
+            # Same ownership rule as the direct reader loop
+            # (``unsolicited_inflight or not state.pending``): a turn-bearing
+            # frame that arrived without an active ``send_turn`` keeps every
+            # frame through its terminal ResultMessage — a user turn submitted
+            # in between must not steal the autonomous turn's result.
+            await self._handle_unsolicited_frame(message)
             return
         if isinstance(message, StreamEvent):
             self._route_stream_event(active, message)
@@ -291,6 +341,64 @@ class ClaudeSession:
         if isinstance(candidate, str) and candidate:
             self._session_id = candidate
             self._session_ready.set()
+
+    async def _handle_unsolicited_frame(self, message: Message) -> None:
+        """Consume one between-turns SDK frame (direct-path unsolicited mirror).
+
+        Assistant text is buffered until its terminal ResultMessage so the
+        registered handler receives one complete message per autonomous turn,
+        not one per SDK frame. StreamEvent partials only establish ownership;
+        they are never delivered (no live draft exists for an unsolicited
+        turn). Without a registered handler the terminal frame is dropped —
+        the adapter's pre-seam behavior.
+        """
+
+        if self._unsolicited_discard:
+            # Late frames of an abandoned send_turn: swallow everything
+            # through the abandoned turn's terminal ResultMessage so its
+            # answer cannot deliver twice.
+            if isinstance(message, ResultMessage):
+                self._unsolicited_discard = False
+                self._unsolicited_inflight = False
+                self._unsolicited_texts.clear()
+                logger.warning(
+                    "Swallowed late Claude ResultMessage after an abandoned turn: "
+                    "session=%s",
+                    message.session_id,
+                )
+            return
+        if isinstance(message, StreamEvent):
+            # The first token delta establishes turn ownership even though
+            # unsolicited partials are intentionally not delivered.
+            self._unsolicited_inflight = True
+            return
+        if isinstance(message, AssistantMessage):
+            self._unsolicited_inflight = True
+            self._unsolicited_texts.extend(
+                block.text for block in message.content if isinstance(block, TextBlock)
+            )
+            return
+        if not isinstance(message, ResultMessage):
+            return
+        raw = message.result or "\n".join(self._unsolicited_texts)
+        self._unsolicited_texts.clear()
+        self._unsolicited_inflight = False
+        handler = self._unsolicited_handler
+        if handler is None:
+            logger.warning(
+                "Dropping unsolicited Claude result without a registered handler: "
+                "session=%s",
+                message.session_id,
+            )
+            return
+        try:
+            await handler(raw, message.session_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # Fail-open: a broken delivery route must never take down the
+            # reader task that also serves in-turn frames.
+            logger.exception("Unsolicited Claude delivery handler failed")
 
     @staticmethod
     def _route_stream_event(active: _ActiveTurn, message: StreamEvent) -> None:

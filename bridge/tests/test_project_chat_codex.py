@@ -1282,3 +1282,112 @@ async def test_codex_streaming_cancel_failure_never_masks_primary_outcome(
 
     assert "test primary outcome" in caplog.text
     assert "telegram cancel failed" in caplog.text
+
+
+class _RecordingBot:
+    def __init__(self, *, fail: bool = False) -> None:
+        self.sent: list[tuple[int, str]] = []
+        self.fail = fail
+
+    async def send_message(self, *, chat_id: int, text: str, **_kwargs: object) -> None:
+        if self.fail:
+            raise RuntimeError("telegram send failed")
+        self.sent.append((chat_id, text))
+
+
+class UnsolicitedFakeSession(FakeSession):
+    """FakeSession exposing the optional between-turns delivery seam."""
+
+    def __init__(self, session_id: str, events: list[AgentEvent] | None = None) -> None:
+        super().__init__(session_id, events)
+        self.unsolicited_handler = None
+
+    def set_unsolicited_handler(self, handler) -> None:
+        self.unsolicited_handler = handler
+
+
+@pytest.mark.anyio
+async def test_unsolicited_seam_registers_and_delivers_through_the_bot(
+    tmp_path: Path,
+) -> None:
+    # #584 P3-1B: on the adapter path, autonomous output produced between
+    # turns must reach the same conversation via the bot route the direct
+    # path's deliver_unsolicited uses (notification_bot preferred over bot).
+    session = UnsolicitedFakeSession("claude-bg")
+    handler = _handler(tmp_path, FakeRuntime([session]))
+    bot = _RecordingBot()
+    notification_bot = _RecordingBot()
+
+    response = await handler.process_message(
+        "hello", 7, 70, bot=bot, notification_bot=notification_bot
+    )
+
+    assert response.success is True
+    assert session.unsolicited_handler is not None
+
+    await session.unsolicited_handler("background report", "claude-bg")
+    assert notification_bot.sent == [(70, "background report")]
+    assert bot.sent == []
+
+    # Empty runtime text mirrors the direct path's "(No response)" fallback.
+    await session.unsolicited_handler("", None)
+    assert notification_bot.sent[-1] == (70, "(No response)")
+
+    # Oversized results are bounded exactly like the direct path.
+    await session.unsolicited_handler("x" * 5000, "claude-bg")
+    chat_id, text = notification_bot.sent[-1]
+    assert chat_id == 70
+    assert len(text) <= 4000
+    assert text.endswith("… (background result truncated)")
+
+
+@pytest.mark.anyio
+async def test_unsolicited_registration_skipped_without_bot_and_kept_across_turns(
+    tmp_path: Path,
+) -> None:
+    session = UnsolicitedFakeSession("claude-bg")
+    session.events = [TextDeltaEvent("ok"), CompletionEvent("end_turn")]
+    handler = _handler(tmp_path, FakeRuntime([session]))
+
+    # No bot route on this turn: nothing is registered.
+    await handler.process_message("first", 7, 70)
+    assert session.unsolicited_handler is None
+
+    # A later turn carrying a bot registers the route on the cached session;
+    # a bot-less turn afterwards keeps (does not clear) the registration.
+    bot = _RecordingBot()
+    await handler.process_message("second", 7, 70, bot=bot)
+    registered = session.unsolicited_handler
+    assert registered is not None
+    await handler.process_message("third", 7, 70)
+    assert session.unsolicited_handler is registered
+
+    await registered("late background answer", "claude-bg")
+    assert bot.sent == [(70, "late background answer")]
+
+
+@pytest.mark.anyio
+async def test_unsolicited_delivery_failure_is_contained(tmp_path: Path) -> None:
+    session = UnsolicitedFakeSession("claude-bg")
+    handler = _handler(tmp_path, FakeRuntime([session]))
+    bot = _RecordingBot(fail=True)
+
+    await handler.process_message("hello", 7, 70, bot=bot)
+    assert session.unsolicited_handler is not None
+
+    # A broken Telegram route must not raise back into the runtime reader.
+    await session.unsolicited_handler("background report", "claude-bg")
+    assert bot.sent == []
+
+
+@pytest.mark.anyio
+async def test_sessions_without_unsolicited_seam_stay_untouched(tmp_path: Path) -> None:
+    # Codex sessions expose no set_unsolicited_handler; the optional seam
+    # must be probed with getattr and absence must change nothing.
+    session = FakeSession("codex-plain")
+    handler = _handler(tmp_path, FakeRuntime([session]))
+
+    response = await handler.process_message("hello", 7, 70, bot=_RecordingBot())
+
+    assert response.success is True
+    assert not hasattr(session, "unsolicited_handler")

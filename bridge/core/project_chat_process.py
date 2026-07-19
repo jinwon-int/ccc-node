@@ -137,6 +137,7 @@ class ProjectChatProcessMixin:
                 typing_callback=typing_callback,
                 status_callback=status_callback,
                 bot=bot,
+                notification_bot=notification_bot,
                 interim_message_callback=interim_message_callback,
             )
         _log_user_input(
@@ -370,6 +371,59 @@ class ProjectChatProcessMixin:
         except Exception:
             logger.exception("Failed to cancel agent stream while %s", context)
 
+    def _register_agent_unsolicited_handler(
+        self,
+        session: Any,
+        *,
+        user_id: int,
+        chat_id: int,
+        model: Optional[str],
+        route_bot: Optional[Any],
+    ) -> None:
+        """Route runtime-side unsolicited turns to Telegram (#584 P3-1B).
+
+        The adapter counterpart of the direct path's ``deliver_unsolicited``
+        closure plus ``_handle_unsolicited_message`` bookkeeping: assistant
+        output the runtime produced outside any active turn (for example the
+        CLI autonomously continuing after a background-task notification) is
+        cleaned, bounded, and sent to the same conversation. The seam is
+        optional — sessions without ``set_unsolicited_handler`` (Codex) keep
+        their current behavior — and without a route bot any previously
+        registered handler is left in place, mirroring how the direct path
+        keeps an existing stream callback when a request carries no bot.
+        """
+
+        setter = getattr(session, "set_unsolicited_handler", None)
+        if not callable(setter):
+            return
+        if route_bot is None:
+            return
+
+        async def deliver_unsolicited(text: str, session_id: Optional[str]) -> None:
+            content = self._clean_response(text) or "(No response)"
+            payload = content
+            if len(payload) > 4000:
+                payload = f"{payload[:3960]}\n\n… (background result truncated)"
+            try:
+                await route_bot.send_message(chat_id=chat_id, text=payload)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.error(
+                    "Unsolicited Telegram delivery failed: user=%s session=%s error=%s",
+                    user_id,
+                    session_id,
+                    type(exc).__name__,
+                )
+                health_reporter.record_claude_error(
+                    f"Unsolicited Telegram delivery failed: {type(exc).__name__}"
+                )
+                return
+            health_reporter.record_claude_ok()
+            log_chat(user_id, session_id, "assistant", content, model=model)
+
+        setter(deliver_unsolicited)
+
     async def _agent_progress_loop(self, request: _PendingRequest) -> None:
         """Keep provider-neutral turns visibly alive between runtime events."""
         try:
@@ -422,6 +476,7 @@ class ProjectChatProcessMixin:
         status_callback: Optional[StatusCallback],
         bot: Optional[Any],
         interim_message_callback: Optional[InterimMessageCallback],
+        notification_bot: Optional[Any] = None,
     ) -> ChatResponse:
         """Run one provider-neutral turn without changing the Claude SDK path."""
         key = self._stream_key(user_id, chat_id)
@@ -491,6 +546,16 @@ class ProjectChatProcessMixin:
                         sandbox_policy=sandbox_policy,
                     )
 
+                # (Re-)register the between-turns delivery route each turn so
+                # the autonomous-output path always targets the latest bot
+                # reference for this (user_id, chat_id) conversation.
+                self._register_agent_unsolicited_handler(
+                    session,
+                    user_id=user_id,
+                    chat_id=chat_id,
+                    model=model,
+                    route_bot=notification_bot or bot,
+                )
                 self._agent_active_sessions[key] = session
                 self._agent_started_at[key] = asyncio.get_running_loop().time()
                 text_parts: list[str] = []
