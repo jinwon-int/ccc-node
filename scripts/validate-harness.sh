@@ -238,6 +238,7 @@ for t in claude/hooks/observability.test.sh claude/hooks/security-scan.test.sh \
          scripts/gh-pr-flow-seoseo-merge.test.sh \
          scripts/ccc-self-update.test.sh scripts/ccc-provenance.test.sh \
          scripts/bridge-watchdog.test.sh \
+         scripts/ccc-bridge-locate.test.sh \
          bridge/service-install.test.sh \
          bridge/restart.test.sh \
          scripts/converge-distill-peer.test.sh \
