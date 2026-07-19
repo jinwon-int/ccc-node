@@ -101,6 +101,10 @@ TURN_COST_USD = 0.25
 class ScriptedUsageSdkClient:
     """Fake SDK client: each turn answers with usage, rate-limit, and cost."""
 
+    # Optional CLI-internal per-window map passed through RateLimitInfo.raw
+    # (window name -> {utilization, resets_at}); empty by default.
+    rate_limit_raw: dict = {}
+
     def __init__(self, options: ClaudeAgentOptions) -> None:
         self.options = options
         self.session_id = options.resume or "claude-usage-e2e"
@@ -133,6 +137,7 @@ class ScriptedUsageSdkClient:
                     utilization=0.5,
                     overage_status="allowed",
                     overage_resets_at=1_900_100_000,
+                    raw={key: dict(value) for key, value in self.rate_limit_raw.items()},
                 ),
                 uuid=str(uuid.uuid4()),
                 session_id=self.session_id,
@@ -240,6 +245,46 @@ class AdapterUsageObservabilityTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(
                 [window.label for window in other.windows], ["five hour"]
             )
+
+    async def test_raw_window_map_surfaces_model_class_rate_limit_line(self) -> None:
+        """When the CLI passes its per-window map through RateLimitInfo.raw,
+        model-class buckets (e.g. seven_day_opus) render as their own /usage
+        lines even though the event's rate_limit_type only names five_hour."""
+
+        class RawWindowMapSdkClient(ScriptedUsageSdkClient):
+            rate_limit_raw = {
+                "windows": {
+                    "five_hour": {"utilization": 0.5, "resetsAt": 1_900_000_000},
+                    "seven_day_opus": {
+                        "utilization": 0.12,
+                        "resets_at": 1_900_200_000,
+                    },
+                }
+            }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = ClaudeRuntime(sdk_client_factory=RawWindowMapSdkClient)
+            self.addAsyncCleanup(runtime.close)
+            handler = ProjectChatHandler(
+                settings=_settings(Path(tmp)), agent_runtime=runtime
+            )
+            handler._task_ledger_cache = False
+
+            response = await handler.process_message(
+                "how are the limits?", user_id=7, chat_id=70
+            )
+            self.assertTrue(response.success)
+
+            snapshot = await handler.get_usage(7, 70, response.session_id)
+            self.assertEqual(
+                [window.label for window in snapshot.windows],
+                ["five hour", "seven day opus"],
+            )
+            self.assertAlmostEqual(snapshot.windows[1].used_percent, 12.0)
+
+            rendered = render_usage(snapshot)
+            self.assertIn("five hour: 50% used", rendered)
+            self.assertIn("seven day opus: 12% used", rendered)
 
 
 if __name__ == "__main__":
