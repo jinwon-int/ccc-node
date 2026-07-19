@@ -126,18 +126,23 @@ class CapabilityRuntimeDriftTests(unittest.TestCase):
                     CapabilityState.SUPPORTED,
                 )
 
-    def test_claude_runtime_adapter_state_tracks_the_adapter_module(self) -> None:
-        # When a ClaudeRuntime adapter lands, this trips: bind the adapter to
-        # the conformance suite and promote `claude`/`runtime_adapter` in the
-        # capability matrix in the same change.
-        adapter_exists = (
-            importlib.util.find_spec("telegram_bot.core.claude_runtime") is not None
+    def test_claude_runtime_adapter_state_tracks_the_staged_cutover(self) -> None:
+        # #584 slice A: the additive ClaudeRuntime adapter exists and is bound
+        # to the conformance suite, while the live Telegram path still runs
+        # through project_chat. The matrix describes the live path, so the
+        # `claude`/`runtime_adapter` axis flips to supported only in the
+        # cutover change that routes project_chat through the adapter (and
+        # consciously updates this test alongside the matrix).
+        self.assertIsNotNone(
+            importlib.util.find_spec("telegram_bot.core.claude_runtime"),
+            "slice A of #584 ships bridge/core/claude_runtime.py",
         )
-        declared_supported = (
-            capability_status("claude", "runtime_adapter").state
-            is CapabilityState.SUPPORTED
+        self.assertIsNot(
+            capability_status("claude", "runtime_adapter").state,
+            CapabilityState.SUPPORTED,
+            "flip claude/runtime_adapter only in the cutover change that "
+            "routes project_chat through ClaudeRuntime",
         )
-        self.assertEqual(adapter_exists, declared_supported)
 
     def test_codex_session_browsing_claim_matches_the_runtime_surface(self) -> None:
         from telegram_bot.core.codex_runtime import CodexRuntime
