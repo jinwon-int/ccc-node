@@ -127,21 +127,22 @@ class CapabilityRuntimeDriftTests(unittest.TestCase):
                 )
 
     def test_claude_runtime_adapter_state_tracks_the_staged_cutover(self) -> None:
-        # #584 slice A: the additive ClaudeRuntime adapter exists and is bound
-        # to the conformance suite, while the live Telegram path still runs
-        # through project_chat. The matrix describes the live path, so the
-        # `claude`/`runtime_adapter` axis flips to supported only in the
-        # cutover change that routes project_chat through the adapter (and
-        # consciously updates this test alongside the matrix).
+        # #584 slice C-1 (post-cutover invariant): the ClaudeRuntime adapter
+        # exists, is bound to the conformance suite, and is the DEFAULT live
+        # path (CCC_CLAUDE_RUNTIME_ADAPTER defaults on; =0 is only the
+        # emergency kill-switch back to the legacy direct SDK path). The
+        # matrix describes the live path, so `claude`/`runtime_adapter` must
+        # be declared supported; downgrading it again is a conscious
+        # rollback that must update this test alongside the matrix.
         self.assertIsNotNone(
             importlib.util.find_spec("telegram_bot.core.claude_runtime"),
             "slice A of #584 ships bridge/core/claude_runtime.py",
         )
-        self.assertIsNot(
+        self.assertIs(
             capability_status("claude", "runtime_adapter").state,
             CapabilityState.SUPPORTED,
-            "flip claude/runtime_adapter only in the cutover change that "
-            "routes project_chat through ClaudeRuntime",
+            "slice C-1 of #584 routes the Claude provider through "
+            "ClaudeRuntime by default; the matrix must declare it supported",
         )
 
     def test_codex_session_browsing_claim_matches_the_runtime_surface(self) -> None:

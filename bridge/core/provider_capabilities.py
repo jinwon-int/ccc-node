@@ -123,10 +123,11 @@ CAPABILITY_AXES: tuple[CapabilityAxis, ...] = (
         "Provider-neutral runtime adapter",
         "Sessions and turns run behind the AgentRuntime seam and pass the "
         "runtime conformance suite.",
-        claude=_unsupported(
-            "Claude turns run on the direct ClaudeSDKClient path in project_chat; "
-            "no AgentRuntime adapter exists yet.",
-            "#346",
+        claude=_supported(
+            "ClaudeRuntime adapts the Claude Agent SDK to AgentRuntime, passes the "
+            "runtime conformance suite, and is the default live path since the "
+            "#584 slice C-1 cutover (CCC_CLAUDE_RUNTIME_ADAPTER=0 is the "
+            "emergency kill-switch back to the legacy direct SDK path)."
         ),
         codex=_supported(
             "CodexRuntime adapts the app-server protocol to AgentRuntime and passes "
@@ -166,8 +167,9 @@ CAPABILITY_AXES: tuple[CapabilityAxis, ...] = (
         "Normalized reasoning stream",
         "Provider reasoning is normalized as private ReasoningDeltaEvent and "
         "never delivered to the user.",
-        claude=_unsupported(
-            "SDK thinking blocks are not extracted or normalized by the reader path."
+        claude=_supported(
+            "On the default adapter path, SDK ThinkingBlock content normalizes to "
+            "ReasoningDeltaEvent (#599) and the consume loop keeps it private."
         ),
         codex=_supported(
             "item/reasoning textDelta and summaryTextDelta normalize to "

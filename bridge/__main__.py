@@ -10,6 +10,8 @@ from typing import Any
 from telegram_bot.utils.config import Settings, bind_config
 from telegram_bot.utils.logging_setup import setup_logging
 
+logger = logging.getLogger(__name__)
+
 
 def load_runtime_settings(
     *,
@@ -71,26 +73,29 @@ def build_context(
             memory_materializer_path=settings.codex_memory_materializer_path,
             memory_bootstrap_timeout_seconds=(settings.codex_memory_bootstrap_timeout_seconds),
         )
-    elif (
-        settings.agent_provider == "claude"
-        and getattr(settings, "claude_runtime_adapter", False)
-        and agent_runtime is None
-    ):
-        # #346 staged-cutover canary (#584 slice B): route the Claude provider
-        # through the provider-neutral ClaudeRuntime adapter. Default off; with
-        # the flag off no runtime is injected and ProjectChat keeps the direct
+    elif settings.agent_provider == "claude" and agent_runtime is None:
+        # #346 staged cutover (#584 slice C-1): the Claude provider routes
+        # through the provider-neutral ClaudeRuntime adapter by default.
+        # CCC_CLAUDE_RUNTIME_ADAPTER=0 is an emergency per-node kill-switch:
+        # no runtime is injected and ProjectChat keeps the legacy direct
         # Claude SDK stream path unchanged. The transcripts browsing directory
         # matches the direct path's resolution of ~/.claude/projects
         # (ProjectChatHandler.conversations_dir).
-        from telegram_bot.core.claude_runtime import ClaudeRuntime
-        from telegram_bot.core.conversation_paths import claude_project_dir_name
+        if getattr(settings, "claude_runtime_adapter", True):
+            from telegram_bot.core.claude_runtime import ClaudeRuntime
+            from telegram_bot.core.conversation_paths import claude_project_dir_name
 
-        agent_runtime = ClaudeRuntime(
-            transcripts_dir=Path.home()
-            / ".claude"
-            / "projects"
-            / claude_project_dir_name(Path(settings.project_root).resolve()),
-        )
+            logger.info("Claude provider routed through ClaudeRuntime adapter (#346)")
+            agent_runtime = ClaudeRuntime(
+                transcripts_dir=Path.home()
+                / ".claude"
+                / "projects"
+                / claude_project_dir_name(Path(settings.project_root).resolve()),
+            )
+        else:
+            logger.info(
+                "Claude adapter kill-switch active; using legacy direct SDK path"
+            )
     telegram_port = telegram_port or Application.builder
     clock = clock or time
     bind_logs_dir(settings.logs_dir)
@@ -177,7 +182,6 @@ def main() -> None:
 
     bot.validate_runtime_paths()
     setup_logging(settings)
-    logger = logging.getLogger(__name__)
     try:
         bot.run()
     except SystemExit as exc:

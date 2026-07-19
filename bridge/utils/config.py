@@ -123,12 +123,14 @@ class Config(VoiceSettingsMixin, HeartbeatSettingsMixin, BaseSettings):
         description="Agent provider used by ProjectChat.",
     )
     claude_runtime_adapter: bool = Field(
-        default=False,
+        default=True,
         alias="CCC_CLAUDE_RUNTIME_ADAPTER",
         description=(
-            "#346 staged-cutover canary flag: opt-in routing of the Claude "
-            "provider through the provider-neutral ClaudeRuntime adapter. "
-            "Default off keeps the direct Claude SDK stream path unchanged."
+            "#346 staged cutover: route the Claude provider through the "
+            "provider-neutral ClaudeRuntime adapter. Default on since slice "
+            "C-1 (#584); set CCC_CLAUDE_RUNTIME_ADAPTER=0 as an emergency "
+            "per-node kill-switch that falls back to the legacy direct SDK "
+            "path."
         ),
     )
     node_isolation_profile: Literal["fleet", "external"] = Field(
