@@ -193,7 +193,10 @@ def test_agent_provider_settings_default_and_reject_unknown(tmp_path: Path) -> N
         )
 
 
-def test_claude_default_ignores_provider_runtime(tmp_path: Path) -> None:
+def test_claude_accepts_injected_runtime_for_staged_cutover(tmp_path: Path) -> None:
+    # #584 slice B: Codex still REQUIRES an injected runtime; Claude ACCEPTS
+    # one (the CCC_CLAUDE_RUNTIME_ADAPTER flag path). Without an injected
+    # runtime the direct SDK path stays untouched.
     runtime = FakeRuntime()
     sdk_factory = object()
 
@@ -204,7 +207,214 @@ def test_claude_default_ignores_provider_runtime(tmp_path: Path) -> None:
     )
 
     assert handler._sdk_client_factory is sdk_factory
-    assert handler._agent_runtime is None
+    assert handler._agent_runtime is runtime
+
+    direct = ProjectChatHandler(
+        settings=_settings(tmp_path, provider="claude"),
+        sdk_client_factory=cast(object, sdk_factory),
+    )
+    assert direct._agent_runtime is None
+
+
+def test_claude_flag_off_build_context_injects_no_runtime(tmp_path: Path) -> None:
+    settings_class = _real_settings_class()
+    _reload_real_module("telegram_bot.utils.chat_logger")
+    _reload_real_module("telegram_bot.utils.health")
+    from telegram_bot.__main__ import build_context
+
+    settings = settings_class.load(
+        project_root=tmp_path / "project",
+        environ={"HOME": str(tmp_path), "TELEGRAM_BOT_TOKEN": "123456:test"},
+        bot_env_file=tmp_path / "missing.env",
+    )
+    assert settings.agent_provider == "claude"
+    assert settings.claude_runtime_adapter is False
+
+    context = build_context(settings, sdk_factory=object(), telegram_port=lambda: None)
+
+    # Flag off => zero behavior change: no runtime reaches ProjectChat and
+    # process_message keeps dispatching to the direct Claude SDK path.
+    assert context.agent_runtime is None
+    assert context.project_chat._agent_runtime is None
+
+
+def test_claude_flag_on_build_context_injects_claude_runtime(tmp_path: Path) -> None:
+    settings_class = _real_settings_class()
+    _reload_real_module("telegram_bot.utils.chat_logger")
+    _reload_real_module("telegram_bot.utils.health")
+    from telegram_bot.__main__ import build_context
+    from telegram_bot.core.claude_runtime import ClaudeRuntime
+    from telegram_bot.core.conversation_paths import claude_project_dir_name
+
+    settings = settings_class.load(
+        project_root=tmp_path / "project",
+        environ={
+            "HOME": str(tmp_path),
+            "TELEGRAM_BOT_TOKEN": "123456:test",
+            "CCC_CLAUDE_RUNTIME_ADAPTER": "true",
+        },
+        bot_env_file=tmp_path / "missing.env",
+    )
+    assert settings.claude_runtime_adapter is True
+
+    context = build_context(settings, sdk_factory=object(), telegram_port=lambda: None)
+
+    assert isinstance(context.agent_runtime, ClaudeRuntime)
+    assert context.project_chat._agent_runtime is context.agent_runtime
+    # Transcripts browsing resolves exactly like the direct path's
+    # ProjectChatHandler.conversations_dir (~/.claude/projects/<project-dir>).
+    expected_dir = (
+        Path.home()
+        / ".claude"
+        / "projects"
+        / claude_project_dir_name((tmp_path / "project").resolve())
+    )
+    assert context.agent_runtime._transcripts_dir == expected_dir
+    assert context.project_chat.conversations_dir == expected_dir
+
+    # An explicitly injected runtime is still respected under the flag.
+    injected = FakeRuntime()
+    override = build_context(
+        settings,
+        agent_runtime=injected,
+        sdk_factory=object(),
+        telegram_port=lambda: None,
+    )
+    assert override.agent_runtime is injected
+    assert override.project_chat._agent_runtime is injected
+
+
+@pytest.mark.anyio
+async def test_claude_adapter_routes_turns_and_drops_codex_only_policy_knobs(
+    tmp_path: Path,
+) -> None:
+    session = FakeSession("claude-session")
+    runtime = FakeRuntime([session])
+    handler = ProjectChatHandler(
+        settings=_settings(tmp_path, provider="claude"), agent_runtime=runtime
+    )
+    handler._task_ledger_cache = False
+
+    response = await handler.process_message(
+        "hello",
+        user_id=7,
+        chat_id=70,
+        approval_policy="never",
+        approvals_reviewer=None,
+        sandbox_policy={"type": "dangerFullAccess"},
+    )
+
+    # The turn flowed through the agent path, not the direct SDK path.
+    assert session.messages == ["hello"]
+    assert response.success is True
+    assert response.content == "ok"
+    assert response.session_id == "claude-session"
+    # Codex app-server policy knobs (bot_access._codex_*) are not forwarded:
+    # ClaudeRuntime fails closed on sandbox/reviewer policies and rejects
+    # non-Claude permission modes.
+    request = runtime.requests[0]
+    assert request.approval_policy is None
+    assert request.approvals_reviewer is None
+    assert request.sandbox_policy is None
+
+
+@pytest.mark.anyio
+async def test_claude_adapter_approvals_use_the_generation_gated_callback(
+    tmp_path: Path,
+) -> None:
+    approval = ApprovalRequestEvent("approval-1", "Bash", {"command": "ls"}, "run ls")
+    session = FakeSession(
+        "claude-approve",
+        [approval, TextDeltaEvent("done"), CompletionEvent("end_turn")],
+    )
+    handler = ProjectChatHandler(
+        settings=_settings(tmp_path, provider="claude"),
+        agent_runtime=FakeRuntime([session]),
+    )
+    handler._task_ledger_cache = False
+    seen: list[tuple[int, int, str, int]] = []
+
+    async def approve(chat_id, user_id, event, generation):
+        seen.append((chat_id, user_id, event.action, generation))
+        return ApprovalDecision.ALLOW
+
+    response = await handler.process_message(
+        "go", user_id=7, chat_id=70, approval_callback=approve
+    )
+
+    assert session.approvals == [ApprovalDecision.ALLOW]
+    assert len(seen) == 1
+    assert seen[0][:3] == (70, 7, "Bash")
+    assert handler.is_agent_approval_active(7, 70, seen[0][3]) is False
+    assert response.content == "done"
+
+
+@pytest.mark.anyio
+async def test_claude_adapter_meters_request_and_result_tokens(tmp_path: Path) -> None:
+    session = FakeSession(
+        "claude-usage",
+        [
+            TextDeltaEvent("answer"),
+            ResultEvent(
+                {
+                    "usage": {
+                        "input_tokens": 10,
+                        "cache_creation_input_tokens": 2,
+                        "cache_read_input_tokens": 3,
+                        "output_tokens": 4,
+                    }
+                }
+            ),
+            CompletionEvent("end_turn"),
+        ],
+    )
+    handler = ProjectChatHandler(
+        settings=_settings(tmp_path, provider="claude"),
+        agent_runtime=FakeRuntime([session]),
+    )
+    handler._task_ledger_cache = False
+    records: list[tuple[str, str, dict]] = []
+    handler._usage_meter = SimpleNamespace(  # type: ignore[assignment]
+        record=lambda provider, mode, **counts: records.append(
+            (provider, mode, counts)
+        )
+    )
+
+    response = await handler.process_message("meter", user_id=7, chat_id=70)
+
+    assert response.success is True
+    # One request at the spend boundary (first event), then the validated
+    # input total (raw + cache creation + cache read) from the ResultEvent.
+    assert records == [
+        ("claude", "interactive", {"requests": 1}),
+        ("claude", "interactive", {"input_tokens": 15, "output_tokens": 4}),
+    ]
+
+
+@pytest.mark.anyio
+async def test_codex_adapter_path_never_uses_claude_metering(tmp_path: Path) -> None:
+    session = FakeSession(
+        "codex-usage",
+        [
+            TextDeltaEvent("answer"),
+            ResultEvent({"usage": {"input_tokens": 10, "output_tokens": 4}}),
+            CompletionEvent("end_turn"),
+        ],
+    )
+    handler = _handler(tmp_path, FakeRuntime([session]))
+    records: list[tuple[str, str, dict]] = []
+    handler._usage_meter = SimpleNamespace(  # type: ignore[assignment]
+        record=lambda provider, mode, **counts: records.append(
+            (provider, mode, counts)
+        )
+    )
+
+    response = await handler.process_message("meter", user_id=7, chat_id=70)
+
+    # Codex meters at the runtime's own spend boundary (#388); the in-loop
+    # Claude adapter metering must stay silent for it.
+    assert response.success is True
+    assert records == []
 
 
 def test_codex_composition_injects_runtime_without_replacing_sdk_factory(tmp_path: Path) -> None:

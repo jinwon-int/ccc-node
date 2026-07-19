@@ -122,6 +122,15 @@ class Config(VoiceSettingsMixin, HeartbeatSettingsMixin, BaseSettings):
         alias="CCC_AGENT_PROVIDER",
         description="Agent provider used by ProjectChat.",
     )
+    claude_runtime_adapter: bool = Field(
+        default=False,
+        alias="CCC_CLAUDE_RUNTIME_ADAPTER",
+        description=(
+            "#346 staged-cutover canary flag: opt-in routing of the Claude "
+            "provider through the provider-neutral ClaudeRuntime adapter. "
+            "Default off keeps the direct Claude SDK stream path unchanged."
+        ),
+    )
     node_isolation_profile: Literal["fleet", "external"] = Field(
         default="fleet",
         alias="CCC_NODE_ISOLATION_PROFILE",

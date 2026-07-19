@@ -104,6 +104,16 @@ class ProjectChatProcessMixin:
     ) -> ChatResponse:
         del message_id
         if self._agent_runtime is not None:
+            if getattr(self._config, "agent_provider", "claude") == "claude":
+                # Claude adapter path (#584 slice B, CCC_CLAUDE_RUNTIME_ADAPTER):
+                # the bot layer's approval/sandbox knobs are Codex app-server
+                # policies (bot_access._codex_*) that ClaudeRuntime rejects
+                # fail-closed. On this path the approval boundary is the SDK
+                # can_use_tool -> approval_callback seam, so drop the
+                # untranslatable Codex-only knobs instead of forwarding them.
+                approval_policy = None
+                approvals_reviewer = None
+                sandbox_policy = None
             if sensitive_log_event is not None:
                 _log_user_input(
                     user_message=user_message,
@@ -524,6 +534,7 @@ class ProjectChatProcessMixin:
                     getattr(self._config, "terminal_stall_seconds", 0.0) or 0.0
                 )
                 stalled = False
+                attempt_recorded = False
 
                 async def deliver_pending_interim() -> None:
                     """Deliver a completed message only after more turn work appears."""
@@ -570,6 +581,7 @@ class ProjectChatProcessMixin:
                     conversation until the full process timeout.
                     """
                     nonlocal terminal_error, stalled, pending_completed_message
+                    nonlocal attempt_recorded
                     busy_depth = 0
                     approval_pending = False
                     active_tools: dict[str, str] = {}
@@ -599,6 +611,14 @@ class ProjectChatProcessMixin:
                                 return
                             now = asyncio.get_running_loop().time()
                             progress_request.last_event_at = now
+                            if not attempt_recorded:
+                                # Claude adapter-path spend boundary (#388):
+                                # ClaudeRuntime has no turn-attempt seam, so
+                                # the first event of an accepted turn meters
+                                # the request. No-op for runtimes (Codex)
+                                # that meter at their own boundary.
+                                attempt_recorded = True
+                                self.record_claude_adapter_attempt()
                             approval_pending = isinstance(event, ApprovalRequestEvent)
                             if isinstance(event, TextDeltaEvent):
                                 # A new text delta after a completed message proves
@@ -644,12 +664,17 @@ class ProjectChatProcessMixin:
                                 )
                             elif isinstance(event, ErrorEvent):
                                 terminal_error = event
+                            elif isinstance(event, ResultEvent):
+                                # Terminal usage payload: the Claude adapter
+                                # path meters its tokens here (#388); a no-op
+                                # for Codex, which meters via the runtime's
+                                # usage-recorder seam.
+                                self.record_claude_adapter_result(event)
                             elif isinstance(
                                 event,
                                 (
                                     ReasoningDeltaEvent,
                                     ApprovalRequestEvent,
-                                    ResultEvent,
                                     CompletionEvent,
                                 ),
                             ):
