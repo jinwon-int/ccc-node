@@ -38,9 +38,13 @@ MAX_RAW_WINDOWS = 8
 @dataclass(frozen=True, slots=True)
 class UsageWindow:
     label: str
-    used_percent: float
+    # ``None`` marks a count-only local-estimate window (used when a service
+    # publishes no quota/percent data at all, e.g. Kimi Code).
+    used_percent: float | None
     duration_minutes: int | None = None
     resets_at: float | None = None
+    used_count: int | None = None
+    count_unit: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -177,6 +181,38 @@ def local_claude_environment_snapshot() -> UsageSnapshot:
     )
 
 
+_SERVICE_WINDOW_LABELS: dict[str, str] = {
+    "Kimi Code": "Kimi 5-hour",
+}
+
+
+def synthesize_service_windows(
+    service: str | None, rolling: Mapping[str, int] | None
+) -> tuple[UsageWindow, ...]:
+    """Build count-only local-estimate windows for services without quota APIs.
+
+    *rolling* is the meter's trailing-window aggregate for this provider
+    (``{"requests": int, "tokens": int}``). Real rate-limit data always wins:
+    callers must only synthesize when no observed windows exist.
+    """
+    if service is None or not rolling:
+        return ()
+    label = _SERVICE_WINDOW_LABELS.get(service)
+    if label is None:
+        return ()
+    requests = rolling.get("requests")
+    if isinstance(requests, bool) or not isinstance(requests, int) or requests < 0:
+        return ()
+    return (
+        UsageWindow(
+            label=label,
+            used_percent=None,
+            used_count=requests,
+            count_unit="req",
+        ),
+    )
+
+
 def _window(label: str, value: object) -> UsageWindow | None:
     data = _mapping(value)
     used = _percent(data.get("usedPercent", data.get("used_percentage")))
@@ -208,7 +244,7 @@ def parse_codex_rate_limits(value: object) -> UsageSnapshot:
 
     plan_type: str | None = _text(current.get("planType"))
     windows: list[UsageWindow] = []
-    seen: set[tuple[str, float, int | None, float | None]] = set()
+    seen: set[tuple[str, float | None, int | None, float | None]] = set()
     for fallback, snapshot in snapshots:
         plan_type = plan_type or _text(snapshot.get("planType"))
         limit_name = _text(snapshot.get("limitName")) or _text(snapshot.get("limitId")) or fallback
@@ -742,6 +778,25 @@ def _service_quota_note(service: str | None) -> str | None:
     return None
 
 
+def _render_window_line(window: UsageWindow) -> str:
+    if window.used_percent is None:
+        count = (
+            f"{window.used_count:,}" if window.used_count is not None else "unavailable"
+        )
+        unit = f" {window.count_unit}" if window.count_unit else ""
+        return f"- {window.label}: {count}{unit} used (local estimate)"
+    remaining = max(0.0, 100.0 - window.used_percent)
+    duration = (
+        f" · {window.duration_minutes}m window"
+        if window.duration_minutes is not None
+        else ""
+    )
+    return (
+        f"- {window.label}: {window.used_percent:g}% used / "
+        f"{remaining:g}% left{duration} · {_format_reset(window.resets_at)}"
+    )
+
+
 def render_usage(snapshot: UsageSnapshot) -> str:
     """Render a deterministic, bounded, Telegram-safe plain-text response."""
 
@@ -758,16 +813,7 @@ def render_usage(snapshot: UsageSnapshot) -> str:
     if visible_windows:
         lines.append("Rate limits:")
         for window in visible_windows[:MAX_WINDOWS]:
-            remaining = max(0.0, 100.0 - window.used_percent)
-            duration = (
-                f" · {window.duration_minutes}m window"
-                if window.duration_minutes is not None
-                else ""
-            )
-            lines.append(
-                f"- {window.label}: {window.used_percent:g}% used / "
-                f"{remaining:g}% left{duration} · {_format_reset(window.resets_at)}"
-            )
+            lines.append(_render_window_line(window))
     elif not snapshot.windows:
         lines.append("Rate limits: unavailable")
     if snapshot.overage_status is not None:

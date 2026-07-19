@@ -31,6 +31,7 @@ from telegram_bot.core.usage import (
     parse_codex_thread_usage,
     render_usage,
     status_snapshot_name,
+    synthesize_service_windows,
 )
 
 
@@ -951,3 +952,129 @@ async def test_get_usage_bases_snapshot_on_kimi_environment(
     assert result.plan_type == "Kimi Code · k3[1m] · effort max"
     assert result.context_window == 1048576
     assert result.windows == ()
+
+
+def test_synthesize_service_windows_builds_count_only_kimi_window() -> None:
+    windows = synthesize_service_windows(
+        "Kimi Code", {"requests": 47, "tokens": 29_000_000}
+    )
+    assert len(windows) == 1
+    window = windows[0]
+    assert window.label == "Kimi 5-hour"
+    assert window.used_percent is None
+    assert window.used_count == 47
+    assert window.count_unit == "req"
+
+
+def test_synthesize_service_windows_rejects_missing_or_bad_inputs() -> None:
+    assert synthesize_service_windows(None, {"requests": 1}) == ()
+    assert synthesize_service_windows("Kimi Code", None) == ()
+    assert synthesize_service_windows("Kimi Code", {}) == ()
+    assert synthesize_service_windows("Unknown Service", {"requests": 1}) == ()
+    assert synthesize_service_windows("Kimi Code", {"requests": -1}) == ()
+    assert synthesize_service_windows("Kimi Code", {"requests": True}) == ()
+    assert synthesize_service_windows("Kimi Code", {"requests": "47"}) == ()
+
+
+def test_render_usage_count_only_window_skips_percent_and_reset() -> None:
+    snapshot = UsageSnapshot(
+        provider="claude",
+        service="Kimi Code",
+        windows=(
+            UsageWindow(
+                label="Kimi 5-hour",
+                used_percent=None,
+                used_count=47,
+                count_unit="req",
+            ),
+        ),
+    )
+    rendered = render_usage(snapshot)
+    assert "- Kimi 5-hour: 47 req used (local estimate)" in rendered
+    assert "reset unavailable" not in rendered
+    assert "% used" not in rendered
+
+
+def test_render_usage_count_only_window_handles_missing_count() -> None:
+    snapshot = UsageSnapshot(
+        provider="claude",
+        windows=(UsageWindow(label="Kimi 5-hour", used_percent=None),),
+    )
+    rendered = render_usage(snapshot)
+    assert "- Kimi 5-hour: unavailable used (local estimate)" in rendered
+
+
+@pytest.mark.anyio
+async def test_get_usage_synthesizes_kimi_window_from_meter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _clear_service_env(monkeypatch)
+    monkeypatch.setenv("CCC_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://api.kimi.com/coding/")
+    monkeypatch.setenv("ANTHROPIC_MODEL", "k3[1m]")
+    handler = ProjectChatHandler.__new__(ProjectChatHandler)
+    handler._agent_runtime = None
+    handler._claude_usage = {}
+    handler._clock = SimpleNamespace(time=lambda: 1000.0)
+    handler._config = SimpleNamespace(claude_settings_path=tmp_path / "settings.json")
+    handler._usage_meter = SimpleNamespace(
+        rolling_usage=lambda: {"claude": {"requests": 47, "tokens": 29_000_000}}
+    )
+
+    result = await handler.get_usage(1, 2, "claude-x")
+    assert [w.label for w in result.windows] == ["Kimi 5-hour"]
+    assert result.windows[0].used_percent is None
+    assert result.windows[0].used_count == 47
+
+
+@pytest.mark.anyio
+async def test_get_usage_skips_synthesis_without_service_or_meter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _clear_service_env(monkeypatch)
+    monkeypatch.setenv("CCC_STATE_DIR", str(tmp_path / "state"))
+    handler = ProjectChatHandler.__new__(ProjectChatHandler)
+    handler._agent_runtime = None
+    handler._claude_usage = {}
+    handler._clock = SimpleNamespace(time=lambda: 1000.0)
+    handler._config = SimpleNamespace(claude_settings_path=tmp_path / "settings.json")
+    handler._usage_meter = SimpleNamespace(
+        rolling_usage=lambda: {"claude": {"requests": 47, "tokens": 1}}
+    )
+    # No third-party service in env -> no synthesis even with a meter.
+    result = await handler.get_usage(1, 2, None)
+    assert result.windows == ()
+
+    # Service set but meter raises -> windows stay empty, no exception.
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://api.kimi.com/coding/")
+    def _broken():
+        raise RuntimeError("meter gone")
+    handler._usage_meter = SimpleNamespace(rolling_usage=_broken)
+    result = await handler.get_usage(1, 2, None)
+    assert result.service == "Kimi Code"
+    assert result.windows == ()
+
+
+@pytest.mark.anyio
+async def test_get_usage_observed_windows_win_over_synthesis(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _clear_service_env(monkeypatch)
+    monkeypatch.setenv("CCC_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://api.kimi.com/coding/")
+    handler = ProjectChatHandler.__new__(ProjectChatHandler)
+    handler._agent_runtime = None
+    handler._claude_usage = {}
+    handler._clock = SimpleNamespace(time=lambda: 1000.0)
+    handler._config = SimpleNamespace(claude_settings_path=tmp_path / "settings.json")
+    handler._usage_meter = SimpleNamespace(
+        rolling_usage=lambda: {"claude": {"requests": 47, "tokens": 1}}
+    )
+    handler._claude_rate_limit = UsageSnapshot(
+        provider="claude",
+        windows=(UsageWindow(label="five hour", used_percent=50.0),),
+    )
+
+    result = await handler.get_usage(1, 2, "claude-x")
+    assert [w.label for w in result.windows] == ["five hour"]
+    assert result.windows[0].used_percent == 50.0
