@@ -736,7 +736,8 @@ def _service_quota_note(service: str | None) -> str | None:
     if service == "Kimi Code":
         return (
             "Kimi quota: rolling 5-hour + weekly windows apply — "
-            "see the Kimi Code Console for remaining quota"
+            "the meter below is a local estimate only; "
+            "remaining quota is shown in the Kimi Code Console"
         )
     return None
 
