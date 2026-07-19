@@ -611,7 +611,9 @@ class ProjectChatHandler(
 
     def _record_claude_rate_limit(self, msg: RateLimitEvent) -> None:
         parsed = parse_claude_rate_limit_event(msg, observed_at=self._clock.time())
-        if not parsed.windows:
+        # Keep window-less, overage-less events out so they cannot dilute the
+        # accumulated snapshot; overage-only events still carry state to keep.
+        if not parsed.windows and parsed.overage_status is None:
             return
         self._claude_rate_limit = (
             merge_usage(self._claude_rate_limit, parsed)
