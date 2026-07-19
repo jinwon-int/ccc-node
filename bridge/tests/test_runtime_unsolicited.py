@@ -51,6 +51,8 @@ from claude_agent_sdk import (  # noqa: E402 -- must follow the stub purge above
     AssistantMessage,
     ClaudeAgentOptions,
     Message,
+    RateLimitEvent,
+    RateLimitInfo,
     ResultMessage,
     StreamEvent,
     SystemMessage,
@@ -109,7 +111,12 @@ class ManualClaudeSdkClient:
         )
 
     def emit_result(
-        self, *, result: str | None = None, is_error: bool = False
+        self,
+        *,
+        result: str | None = None,
+        is_error: bool = False,
+        usage: dict[str, int] | None = None,
+        total_cost_usd: float | None = None,
     ) -> None:
         self.emit(
             ResultMessage(
@@ -120,6 +127,22 @@ class ManualClaudeSdkClient:
                 num_turns=1,
                 session_id=self.session_id,
                 result=result,
+                usage=usage,
+                total_cost_usd=total_cost_usd,
+            )
+        )
+
+    def emit_rate_limit(self, *, utilization: float = 0.5) -> None:
+        self.emit(
+            RateLimitEvent(
+                rate_limit_info=RateLimitInfo(
+                    status="allowed_warning",
+                    resets_at=1_900_000_000,
+                    rate_limit_type="five_hour",
+                    utilization=utilization,
+                ),
+                uuid=str(uuid.uuid4()),
+                session_id=self.session_id,
             )
         )
 
@@ -343,6 +366,64 @@ class ClaudeRuntimeUnsolicitedTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             self.delivered, [("fresh background report", client.session_id)]
         )
+
+    # -- raw SDK frame observation seam (#584 C-1 follow-up) ---------------
+
+    async def test_frame_observer_sees_turn_unsolicited_and_rate_limit_frames(
+        self,
+    ) -> None:
+        session, client = await self._start_session()
+        session.set_unsolicited_handler(self._handler)
+        frames: list[Message] = []
+        session.set_sdk_frame_observer(frames.append)
+
+        # Turn flow: the scripted assistant+result frames must be observed
+        # while the turn's normalized event stream stays intact.
+        events = await _collect(session.send_turn("hello"))
+        texts = [event.text for event in events if isinstance(event, TextDeltaEvent)]
+        self.assertEqual(texts, ["turn answer"])
+
+        # Between-turns flow: rate-limit and unsolicited frames observed too.
+        client.emit_rate_limit()
+        client.emit_assistant("background report")
+        client.emit_result(result=None)
+        await asyncio.wait_for(self.delivered_event.wait(), timeout=2.0)
+        await self._drain(client)
+
+        self.assertEqual(
+            [type(frame).__name__ for frame in frames],
+            [
+                "AssistantMessage",  # turn flow
+                "ResultMessage",  # turn terminal
+                "RateLimitEvent",  # account-level, no owning turn
+                "AssistantMessage",  # unsolicited flow
+                "ResultMessage",  # unsolicited terminal
+            ],
+        )
+        # Observation-only: unsolicited delivery still happened exactly once.
+        self.assertEqual(self.delivered, [("background report", client.session_id)])
+
+    async def test_broken_frame_observer_never_affects_turns_or_delivery(
+        self,
+    ) -> None:
+        session, client = await self._start_session()
+        session.set_unsolicited_handler(self._handler)
+
+        def broken_observer(_message: Message) -> None:
+            raise RuntimeError("observer exploded")
+
+        session.set_sdk_frame_observer(broken_observer)
+
+        events = await _collect(session.send_turn("hello"))
+        texts = [event.text for event in events if isinstance(event, TextDeltaEvent)]
+        self.assertEqual(texts, ["turn answer"])
+        self.assertIsInstance(events[-1], CompletionEvent)
+
+        client.emit_rate_limit()
+        client.emit_assistant("background report")
+        client.emit_result(result=None)
+        await asyncio.wait_for(self.delivered_event.wait(), timeout=2.0)
+        self.assertEqual(self.delivered, [("background report", client.session_id)])
 
 
 if __name__ == "__main__":

@@ -13,6 +13,12 @@ from typing import cast
 import pytest
 from pydantic import ValidationError
 
+# Imported at module scope on purpose: this module collects before the test
+# modules that inject spec-less claude_agent_sdk stubs, so these classes are
+# the same import generation the telegram_bot.core.project_chat* chain bound —
+# required for the isinstance routing in the SDK frame observer tests below.
+from claude_agent_sdk import RateLimitEvent, RateLimitInfo, ResultMessage
+
 from telegram_bot.core.agent_runtime import (
     AgentEvent,
     ApprovalDecision,
@@ -60,6 +66,7 @@ def _settings(tmp_path: Path, provider: str = "codex") -> SimpleNamespace:
         allowed_user_ids=[7],
         require_allowlist=True,
         claude_cli_path=None,
+        claude_settings_path=tmp_path / "claude" / "settings.json",
         enable_streaming=False,
         enable_partial_streaming=False,
         bot_data_dir=None,
@@ -396,6 +403,103 @@ async def test_claude_adapter_meters_request_and_result_tokens(tmp_path: Path) -
         ("claude", "interactive", {"requests": 1}),
         ("claude", "interactive", {"input_tokens": 15, "output_tokens": 4}),
     ]
+
+
+class ObservableFakeSession(FakeSession):
+    """FakeSession exposing the optional ``set_sdk_frame_observer`` seam."""
+
+    def __init__(self, session_id: str, events: list[AgentEvent] | None = None) -> None:
+        super().__init__(session_id, events)
+        self.frame_observer = None
+
+    def set_sdk_frame_observer(self, observer) -> None:
+        self.frame_observer = observer
+
+
+@pytest.mark.anyio
+async def test_claude_adapter_frames_feed_the_usage_snapshot_recorders(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#584 C-1 follow-up: /usage data flows on the adapter path.
+
+    The registered observer must route raw ResultMessage frames into the
+    conversation-scoped usage/cost snapshot and RateLimitEvent frames into
+    the account-global rate-limit windows — the exact sources ``get_usage``
+    aggregates for the /usage command's Context / Session tokens / Session
+    cost / Rate limits lines.
+    """
+
+    monkeypatch.setenv("CCC_STATE_DIR", str(tmp_path / "state"))
+    session = ObservableFakeSession("claude-observed")
+    handler = ProjectChatHandler(
+        settings=_settings(tmp_path, provider="claude"),
+        agent_runtime=FakeRuntime([session]),
+    )
+    handler._task_ledger_cache = False
+
+    response = await handler.process_message("hello", user_id=7, chat_id=70)
+    assert response.success is True
+    assert callable(session.frame_observer)
+
+    session.frame_observer(
+        RateLimitEvent(
+            rate_limit_info=RateLimitInfo(
+                status="allowed_warning",
+                resets_at=1_900_000_000,
+                rate_limit_type="five_hour",
+                utilization=0.5,
+            ),
+            uuid="rl-1",
+            session_id="claude-observed",
+        )
+    )
+    session.frame_observer(
+        ResultMessage(
+            subtype="success",
+            duration_ms=5,
+            duration_api_ms=3,
+            is_error=False,
+            num_turns=1,
+            session_id="claude-observed",
+            total_cost_usd=0.0123,
+            usage={
+                "input_tokens": 100,
+                "cache_creation_input_tokens": 20,
+                "cache_read_input_tokens": 30,
+                "output_tokens": 40,
+            },
+            result="ok",
+        )
+    )
+
+    snapshot = await handler.get_usage(7, 70, "claude-observed")
+    assert snapshot.input_tokens == 100
+    assert snapshot.output_tokens == 40
+    assert snapshot.context_used == 150  # raw + cache creation + cache read
+    assert snapshot.total_tokens == 190
+    assert snapshot.total_cost_usd == 0.0123
+    assert [window.label for window in snapshot.windows] == ["five hour"]
+    assert snapshot.windows[0].used_percent == 50.0
+    # Session-scoped like the direct path: other conversations see no tokens
+    # while the account-global rate-limit windows surface everywhere.
+    other = await handler.get_usage(7, 71, "claude-observed")
+    assert other.input_tokens is None
+    assert [window.label for window in other.windows] == ["five hour"]
+
+
+@pytest.mark.anyio
+async def test_codex_provider_never_registers_the_claude_frame_observer(
+    tmp_path: Path,
+) -> None:
+    session = ObservableFakeSession("codex-observed")
+    handler = _handler(tmp_path, FakeRuntime([session]))
+
+    response = await handler.process_message("hello", user_id=7, chat_id=70)
+
+    # The observation seam routes into Claude-specific recorders; a Codex
+    # provider must leave it unregistered even when a session exposes it.
+    assert response.success is True
+    assert session.frame_observer is None
 
 
 @pytest.mark.anyio
