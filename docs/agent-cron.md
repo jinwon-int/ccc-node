@@ -8,6 +8,9 @@
   create a task (validated, atomic write; no execution). See `--help` for flags
   (timezone, notify, allowed-tools, payload `--argv/--cwd/--model/--timeout-sec`,
   `--keep-after-run`, `--disabled`, ...).
+- `scripts/agent-cron.sh edit <task-id> [same flags as add] [--json]` — set-only
+  partial update (schedule/timezone re-validated; payload flags merge, `--argv`
+  replaces the whole argv). No clear semantics — unset by remove+add.
 - `scripts/agent-cron.sh remove|enable|disable <task-id> [--json]` — store-only
   mutations; never execute, install timers, or send messages.
 - `scripts/agent-cron.sh list [--json]` — inspect configured tasks.
