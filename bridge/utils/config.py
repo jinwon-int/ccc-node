@@ -7,7 +7,10 @@ from dotenv import dotenv_values
 from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
-from telegram_bot.utils.memory_policy import assert_memory_scope_safe
+from telegram_bot.utils.memory_policy import (
+    assert_memory_provider_safe,
+    assert_memory_scope_safe,
+)
 
 BOT_PACKAGE_DIR = Path(__file__).resolve().parent.parent
 
@@ -1047,6 +1050,7 @@ class Config(BaseSettings):
             self.telegram_session_scope,
             unsafe_shared_all_override=self.bridge_unsafe_shared_all_memory,
         )
+        assert_memory_provider_safe(self.bridge_memory_mode, self.agent_provider)
         return self
 
     # Logging
