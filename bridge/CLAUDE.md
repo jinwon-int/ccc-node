@@ -33,6 +33,7 @@ python -m telegram_bot --path /absolute/path/to/project --debug
 # Lifecycle
 ./start.sh --path /path --status
 ./start.sh --path /path --stop
+./start.sh --path /path --restart     # atomic stop→start→verify-available (add -d for daemon; exit 3 if systemd/launchd-managed)
 ./start.sh --path /path --install    # macOS launchd auto-start
 ./start.sh --path /path --uninstall
 ```
