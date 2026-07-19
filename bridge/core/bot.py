@@ -56,6 +56,7 @@ from telegram_bot.core.bot_delivery import BotDeliveryMixin
 from telegram_bot.core import bot_voice as _bot_voice_module
 from telegram_bot.core.bot_voice import BotVoiceMixin
 from telegram_bot.core.bot_approvals import BotApprovalMixin
+from telegram_bot.core.bot_callbacks import BotCallbackMixin
 
 
 _EXTRACTED_MODULES = (
@@ -97,6 +98,7 @@ class TelegramBot(
     BotAccessMixin,
     BotCommandMixin,
     BotDeliveryMixin,
+    BotCallbackMixin,
     BotVoiceMixin,
     BotApprovalMixin,
 ):
