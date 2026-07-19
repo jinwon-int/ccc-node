@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 MAX_WINDOWS = 16
+MAX_MODELS = 16
 MAX_DAILY_BUCKETS = 14
 MAX_SNAPSHOT_BYTES = 16 * 1024
 SNAPSHOT_TTL_SECONDS = 15 * 60
@@ -21,6 +22,8 @@ MAX_TELEGRAM_USAGE_LENGTH = 3500
 MAX_TOKEN_COUNT = 10**12
 KST = timezone(timedelta(hours=9), name="KST")
 HIDDEN_CODEX_RATE_LIMIT_MARKERS = ("gpt-5.3-codex-spark",)
+# Documented claude-agent-sdk RateLimitStatus literals; anything else is dropped.
+RATE_LIMIT_STATUSES = frozenset({"allowed", "allowed_warning", "rejected"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -38,6 +41,18 @@ class DailyUsage:
 
 
 @dataclass(frozen=True, slots=True)
+class ModelUsage:
+    """Per-model token/cost totals from one SDK ``model_usage`` mapping."""
+
+    model: str
+    input_tokens: int = 0
+    cache_creation_input_tokens: int = 0
+    cache_read_input_tokens: int = 0
+    output_tokens: int = 0
+    cost_usd: float | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class UsageSnapshot:
     provider: str
     plan_type: str | None = None
@@ -50,6 +65,9 @@ class UsageSnapshot:
     lifetime_tokens: int | None = None
     daily_usage: tuple[DailyUsage, ...] = ()
     total_cost_usd: float | None = None
+    models: tuple[ModelUsage, ...] = ()
+    overage_status: str | None = None
+    overage_resets_at: float | None = None
     observed_at: float | None = None
 
 
@@ -189,7 +207,14 @@ def parse_claude_rate_limit_event(message: object, *, observed_at: float | None 
     sessions: the statusLine hook (``load_claude_status_snapshot``'s source)
     only fires from the interactive terminal status bar, which never renders
     here. Each event carries at most one window (``five_hour``/``seven_day``/
-    etc.); callers accumulate across events via ``merge_usage``.
+    etc.); callers accumulate across events via ``merge_usage``. Distinct
+    window types keep distinct labels, so the label-keyed union in
+    ``merge_usage`` retains every concurrent bucket (five-hour, weekly, and
+    per-model-class weekly windows) instead of last-write-wins.
+
+    ``overage_status``/``overage_resets_at`` (pay-as-you-go state) are also
+    captured when present; the status is allowlisted to the documented
+    ``RateLimitStatus`` literals so arbitrary strings never render.
     """
 
     info = getattr(message, "rate_limit_info", None)
@@ -204,11 +229,63 @@ def parse_claude_rate_limit_event(message: object, *, observed_at: float | None 
                 resets_at=_number(getattr(info, "resets_at", None), maximum=10**11),
             ),
         )
+    overage_status = _text(getattr(info, "overage_status", None))
+    if overage_status not in RATE_LIMIT_STATUSES:
+        overage_status = None
+    overage_resets_at = (
+        _number(getattr(info, "overage_resets_at", None), maximum=10**11)
+        if overage_status is not None
+        else None
+    )
     return UsageSnapshot(
         provider="claude",
         windows=windows,
+        overage_status=overage_status.replace("_", " ") if overage_status else None,
+        overage_resets_at=overage_resets_at,
         observed_at=time.time() if observed_at is None else observed_at,
     )
+
+
+def _model_usage_entries(model_usage: Mapping[str, Any]) -> tuple[ModelUsage, ...]:
+    """Build bounded per-model entries from the SDK ``model_usage`` mapping.
+
+    Only models carrying at least one numeric token count or a cost are kept,
+    so identifier-only entries (e.g. a bare ``contextWindow`` mapping) are
+    never surfaced. Both the camelCase names the CLI emits and their
+    snake_case variants are accepted, matching the fallback sums above.
+    """
+
+    entries: list[ModelUsage] = []
+    for raw_name, raw in list(model_usage.items())[:MAX_MODELS]:
+        name = _text(str(raw_name))
+        if name is None:
+            continue
+        model = _mapping(raw)
+        input_tokens = _integer(model.get("inputTokens", model.get("input_tokens"))) or 0
+        cache_creation = (
+            _integer(
+                model.get("cacheCreationInputTokens", model.get("cache_creation_input_tokens"))
+            )
+            or 0
+        )
+        cache_read = (
+            _integer(model.get("cacheReadInputTokens", model.get("cache_read_input_tokens"))) or 0
+        )
+        output_tokens = _integer(model.get("outputTokens", model.get("output_tokens"))) or 0
+        cost_usd = _number(model.get("costUSD", model.get("cost_usd")), maximum=10**9)
+        if not any((input_tokens, cache_creation, cache_read, output_tokens)) and cost_usd is None:
+            continue
+        entries.append(
+            ModelUsage(
+                model=name,
+                input_tokens=input_tokens,
+                cache_creation_input_tokens=cache_creation,
+                cache_read_input_tokens=cache_read,
+                output_tokens=output_tokens,
+                cost_usd=cost_usd,
+            )
+        )
+    return tuple(entries)
 
 
 def parse_claude_result(message: object, *, observed_at: float | None = None) -> UsageSnapshot:
@@ -252,7 +329,9 @@ def parse_claude_result(message: object, *, observed_at: float | None = None) ->
 
     # The SDK's model_usage values are version-dependent mappings. Only accept
     # the documented numeric context-window field when present; never render
-    # arbitrary keys or model/account identifiers.
+    # arbitrary keys or account identifiers. Model ids are surfaced only via
+    # the per-model section, and only when they carry numeric token/cost data
+    # (see _model_usage_entries).
     context_window = None
     for raw in list(model_usage.values())[:16]:
         model = _mapping(raw)
@@ -273,8 +352,38 @@ def parse_claude_result(message: object, *, observed_at: float | None = None) ->
         output_tokens=output_tokens,
         total_tokens=total_tokens,
         total_cost_usd=_number(getattr(message, "total_cost_usd", None), maximum=10**9),
+        models=_model_usage_entries(model_usage),
         observed_at=time.time() if observed_at is None else observed_at,
     )
+
+
+def _merge_models(
+    older: tuple[ModelUsage, ...], newer: tuple[ModelUsage, ...]
+) -> tuple[ModelUsage, ...]:
+    """Sum per-model totals across snapshots, keeping first-seen order."""
+
+    merged: dict[str, ModelUsage] = {entry.model: entry for entry in older}
+    for entry in newer:
+        existing = merged.get(entry.model)
+        if existing is None:
+            merged[entry.model] = entry
+            continue
+        cost_usd = None
+        if existing.cost_usd is not None or entry.cost_usd is not None:
+            cost_usd = (existing.cost_usd or 0.0) + (entry.cost_usd or 0.0)
+        merged[entry.model] = ModelUsage(
+            model=entry.model,
+            input_tokens=existing.input_tokens + entry.input_tokens,
+            cache_creation_input_tokens=(
+                existing.cache_creation_input_tokens + entry.cache_creation_input_tokens
+            ),
+            cache_read_input_tokens=(
+                existing.cache_read_input_tokens + entry.cache_read_input_tokens
+            ),
+            output_tokens=existing.output_tokens + entry.output_tokens,
+            cost_usd=cost_usd,
+        )
+    return tuple(merged.values())[:MAX_MODELS]
 
 
 def merge_usage(*snapshots: UsageSnapshot) -> UsageSnapshot:
@@ -313,6 +422,15 @@ def merge_usage(*snapshots: UsageSnapshot) -> UsageSnapshot:
             daily_usage=newer.daily_usage or result.daily_usage,
             total_cost_usd=(
                 newer.total_cost_usd if newer.total_cost_usd is not None else result.total_cost_usd
+            ),
+            models=_merge_models(result.models, newer.models),
+            overage_status=(
+                newer.overage_status if newer.overage_status is not None else result.overage_status
+            ),
+            overage_resets_at=(
+                newer.overage_resets_at
+                if newer.overage_status is not None
+                else result.overage_resets_at
             ),
             observed_at=(
                 newer.observed_at if newer.observed_at is not None else result.observed_at
@@ -472,6 +590,10 @@ def render_usage(snapshot: UsageSnapshot) -> str:
             )
     elif not snapshot.windows:
         lines.append("Rate limits: unavailable")
+    if snapshot.overage_status is not None:
+        lines.append(
+            f"Overage: {snapshot.overage_status} · {_format_reset(snapshot.overage_resets_at)}"
+        )
 
     if snapshot.context_used is not None and snapshot.context_window:
         percent = min(100.0, snapshot.context_used * 100 / snapshot.context_window)
@@ -494,6 +616,18 @@ def render_usage(snapshot: UsageSnapshot) -> str:
             f"input {_tokens(snapshot.input_tokens)} · output {_tokens(snapshot.output_tokens)} "
             f"· total {_tokens(snapshot.total_tokens)}"
         )
+    if snapshot.models:
+        lines.append("Models:")
+        for entry in snapshot.models[:MAX_MODELS]:
+            tokens_in = (
+                entry.input_tokens
+                + entry.cache_creation_input_tokens
+                + entry.cache_read_input_tokens
+            )
+            line = f"  {entry.model} · in {tokens_in:,} · out {entry.output_tokens:,}"
+            if entry.cost_usd is not None:
+                line += f" · ${entry.cost_usd:.4f}"
+            lines.append(line)
     if snapshot.provider != "codex":
         cost = (
             f"${snapshot.total_cost_usd:.4f}"

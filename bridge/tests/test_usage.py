@@ -16,6 +16,7 @@ from telegram_bot.core.project_chat import ProjectChatHandler
 from telegram_bot.core.usage import (
     MAX_TELEGRAM_USAGE_LENGTH,
     DailyUsage,
+    ModelUsage,
     UsageSnapshot,
     UsageWindow,
     load_claude_status_snapshot,
@@ -136,6 +137,8 @@ def test_claude_sdk_result_parser_uses_only_numeric_usage_fields() -> None:
     assert parsed.context_window == 200_000
     assert parsed.total_tokens == 190
     assert parsed.total_cost_usd == 0.125
+    # No numeric token/cost data for the model, so its id must not surface.
+    assert parsed.models == ()
 
     fallback = parse_claude_result(
         SimpleNamespace(
@@ -156,6 +159,118 @@ def test_claude_sdk_result_parser_uses_only_numeric_usage_fields() -> None:
     assert fallback.input_tokens == 30
     assert fallback.context_used == 35
     assert fallback.output_tokens == 5
+
+
+def test_claude_result_parser_builds_per_model_map_in_both_casings() -> None:
+    parsed = parse_claude_result(
+        SimpleNamespace(
+            usage={"input_tokens": 100, "output_tokens": 40},
+            model_usage={
+                "claude-fable-5": {
+                    "inputTokens": 90,
+                    "cacheCreationInputTokens": 20,
+                    "cacheReadInputTokens": 30,
+                    "outputTokens": 35,
+                    "costUSD": 0.2,
+                    "contextWindow": 200_000,
+                },
+                "claude-haiku-4-5": {
+                    "input_tokens": 10,
+                    "cache_read_input_tokens": 5,
+                    "output_tokens": 5,
+                    "cost_usd": 0.01,
+                },
+                "identifier-only-model": {"contextWindow": 100_000},
+                "account_id": "must-not-appear",
+            },
+            total_cost_usd=0.21,
+        ),
+        observed_at=1000,
+    )
+
+    assert parsed.models == (
+        ModelUsage(
+            model="claude-fable-5",
+            input_tokens=90,
+            cache_creation_input_tokens=20,
+            cache_read_input_tokens=30,
+            output_tokens=35,
+            cost_usd=0.2,
+        ),
+        ModelUsage(
+            model="claude-haiku-4-5",
+            input_tokens=10,
+            cache_read_input_tokens=5,
+            output_tokens=5,
+            cost_usd=0.01,
+        ),
+    )
+    # Identifier-only entries (no numeric token/cost data) never surface.
+    assert all(entry.model != "identifier-only-model" for entry in parsed.models)
+
+
+def test_merge_usage_sums_per_model_totals_across_snapshots() -> None:
+    first = UsageSnapshot(
+        provider="claude",
+        models=(
+            ModelUsage(
+                model="claude-fable-5",
+                input_tokens=100,
+                cache_read_input_tokens=50,
+                output_tokens=10,
+                cost_usd=0.1,
+            ),
+        ),
+    )
+    second = UsageSnapshot(
+        provider="claude",
+        models=(
+            ModelUsage(model="claude-fable-5", input_tokens=20, output_tokens=5),
+            ModelUsage(model="claude-haiku-4-5", input_tokens=7, output_tokens=3, cost_usd=0.01),
+        ),
+    )
+
+    merged = merge_usage(first, second)
+
+    assert merged.models == (
+        ModelUsage(
+            model="claude-fable-5",
+            input_tokens=120,
+            cache_read_input_tokens=50,
+            output_tokens=15,
+            cost_usd=0.1,
+        ),
+        ModelUsage(model="claude-haiku-4-5", input_tokens=7, output_tokens=3, cost_usd=0.01),
+    )
+    # A snapshot without a per-model map keeps the accumulated one intact.
+    assert merge_usage(merged, UsageSnapshot(provider="claude")).models == merged.models
+
+
+def test_renderer_lists_per_model_usage_only_when_present() -> None:
+    rendered = render_usage(
+        UsageSnapshot(
+            provider="claude",
+            models=(
+                ModelUsage(
+                    model="claude-fable-5",
+                    input_tokens=1_234_000,
+                    cache_creation_input_tokens=500,
+                    cache_read_input_tokens=67,
+                    output_tokens=89_012,
+                    cost_usd=0.1234,
+                ),
+                ModelUsage(model="claude-haiku-4-5", input_tokens=100, output_tokens=10),
+            ),
+        )
+    )
+
+    assert "Models:" in rendered
+    assert "  claude-fable-5 · in 1,234,567 · out 89,012 · $0.1234" in rendered
+    # Cost is omitted when the SDK did not report one for the model.
+    assert "  claude-haiku-4-5 · in 100 · out 10" in rendered
+    assert "claude-haiku-4-5 · in 100 · out 10 · $" not in rendered
+
+    assert "Models:" not in render_usage(UsageSnapshot(provider="claude"))
 
 
 def test_claude_rate_limit_event_parser_converts_utilization_and_ignores_incomplete() -> None:
@@ -197,6 +312,92 @@ def test_claude_rate_limit_event_parser_converts_utilization_and_ignores_incompl
         observed_at=1002,
     )
     assert incomplete.windows == ()
+
+
+def test_concurrent_rate_limit_buckets_each_render_and_survive_merge() -> None:
+    """Distinct rate_limit_type buckets (e.g. per-model-class weekly windows)
+    must accumulate as independent lines, never last-write-wins over one slot."""
+
+    events = [
+        parse_claude_rate_limit_event(
+            SimpleNamespace(
+                rate_limit_info=SimpleNamespace(
+                    status="allowed",
+                    rate_limit_type=limit_type,
+                    utilization=utilization,
+                    resets_at=1_900_000_000,
+                )
+            ),
+            observed_at=1000 + index,
+        )
+        for index, (limit_type, utilization) in enumerate(
+            [("five_hour", 0.4), ("seven_day_opus", 0.7), ("seven_day_sonnet", 0.2)]
+        )
+    ]
+
+    merged = merge_usage(*events)
+
+    assert [(w.label, w.used_percent) for w in merged.windows] == [
+        ("five hour", pytest.approx(40.0)),
+        ("seven day opus", pytest.approx(70.0)),
+        ("seven day sonnet", pytest.approx(20.0)),
+    ]
+    rendered = render_usage(merged)
+    assert "- five hour: 40% used" in rendered
+    assert "- seven day opus: 70% used" in rendered
+    assert "- seven day sonnet: 20% used" in rendered
+
+
+def test_overage_state_is_parsed_allowlisted_merged_and_rendered() -> None:
+    parsed = parse_claude_rate_limit_event(
+        SimpleNamespace(
+            rate_limit_info=SimpleNamespace(
+                status="allowed_warning",
+                rate_limit_type="five_hour",
+                utilization=0.9,
+                resets_at=1_900_000_000,
+                overage_status="allowed",
+                overage_resets_at=1_900_100_000,
+            )
+        ),
+        observed_at=1000,
+    )
+    assert parsed.overage_status == "allowed"
+    assert parsed.overage_resets_at == 1_900_100_000
+
+    # Overage state survives merging with later window-only events.
+    window_only = parse_claude_rate_limit_event(
+        SimpleNamespace(
+            rate_limit_info=SimpleNamespace(
+                status="allowed",
+                rate_limit_type="seven_day",
+                utilization=0.1,
+                resets_at=None,
+            )
+        ),
+        observed_at=1001,
+    )
+    merged = merge_usage(parsed, window_only)
+    assert merged.overage_status == "allowed"
+    assert merged.overage_resets_at == 1_900_100_000
+
+    rendered = render_usage(merged)
+    assert "Overage: allowed · " in rendered
+    assert "Overage" not in render_usage(window_only)
+
+    # Undocumented status strings are dropped, never rendered.
+    unknown = parse_claude_rate_limit_event(
+        SimpleNamespace(
+            rate_limit_info=SimpleNamespace(
+                status="allowed",
+                overage_status="secret-account-state",
+                overage_resets_at=1_900_100_000,
+            )
+        ),
+        observed_at=1002,
+    )
+    assert unknown.overage_status is None
+    assert unknown.overage_resets_at is None
 
 
 def _run_collector(tmp_path: Path, payload: object, *, state_dir: Path | None = None) -> None:
@@ -442,16 +643,29 @@ async def test_claude_rate_limit_is_global_unlike_session_scoped_usage(
             session_id="claude-a",
         )
     )
-    # Empty-window events (e.g. overage-only payloads) must not wipe out the
+    # Empty-window events (e.g. status-only payloads) must not wipe out the
     # previously observed real window.
     handler._record_claude_rate_limit(
         SimpleNamespace(rate_limit_info=SimpleNamespace(status="rejected"), session_id="claude-a")
+    )
+    # Overage-only events carry no window but must still record overage state.
+    handler._record_claude_rate_limit(
+        SimpleNamespace(
+            rate_limit_info=SimpleNamespace(
+                status="rejected",
+                overage_status="allowed_warning",
+                overage_resets_at=1_900_100_000,
+            ),
+            session_id="claude-a",
+        )
     )
 
     for user_id, chat_id, session_id in ((7, 9, "claude-a"), (7, 10, "claude-a"), (99, 1, "unrelated")):
         result = await handler.get_usage(user_id, chat_id, session_id)
         assert [w.label for w in result.windows] == ["five hour"]
         assert result.windows[0].used_percent == 50.0
+        assert result.overage_status == "allowed warning"
+        assert result.overage_resets_at == 1_900_100_000
 
 
 @pytest.mark.anyio

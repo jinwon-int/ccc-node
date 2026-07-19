@@ -81,6 +81,20 @@ TURN_USAGE = {
     "cache_read_input_tokens": 300,
     "output_tokens": 50,
 }
+TURN_MODEL_USAGE = {
+    "claude-fable-5": {
+        "inputTokens": 900,
+        "cacheCreationInputTokens": 200,
+        "cacheReadInputTokens": 300,
+        "outputTokens": 40,
+        "costUSD": 0.2,
+    },
+    "claude-haiku-4-5": {
+        "inputTokens": 100,
+        "outputTokens": 10,
+        "costUSD": 0.05,
+    },
+}
 TURN_COST_USD = 0.25
 
 
@@ -117,6 +131,8 @@ class ScriptedUsageSdkClient:
                     resets_at=1_900_000_000,
                     rate_limit_type="five_hour",
                     utilization=0.5,
+                    overage_status="allowed",
+                    overage_resets_at=1_900_100_000,
                 ),
                 uuid=str(uuid.uuid4()),
                 session_id=self.session_id,
@@ -132,6 +148,7 @@ class ScriptedUsageSdkClient:
                 session_id=self.session_id,
                 total_cost_usd=TURN_COST_USD,
                 usage=dict(TURN_USAGE),
+                model_usage={model: dict(raw) for model, raw in TURN_MODEL_USAGE.items()},
                 result="the answer",
             )
         )
@@ -198,12 +215,21 @@ class AdapterUsageObservabilityTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(snapshot.windows[0].used_percent, 50.0)
 
+            self.assertEqual(
+                [entry.model for entry in snapshot.models],
+                ["claude-fable-5", "claude-haiku-4-5"],
+            )
+
             rendered = render_usage(snapshot)
             self.assertIn(
                 "Session tokens: input 1,000 · output 50 · total 1,550", rendered
             )
+            self.assertIn("Models:", rendered)
+            self.assertIn("  claude-fable-5 · in 1,400 · out 40 · $0.2000", rendered)
+            self.assertIn("  claude-haiku-4-5 · in 100 · out 10 · $0.0500", rendered)
             self.assertIn("Session cost: $0.2500", rendered)
             self.assertIn("five hour: 50% used", rendered)
+            self.assertIn("Overage: allowed · ", rendered)
             self.assertNotIn("Rate limits: unavailable", rendered)
             self.assertNotIn("Session cost: unavailable", rendered)
 
