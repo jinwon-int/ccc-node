@@ -322,6 +322,17 @@ out="$(CCC_AGENT_CRON_STORE="$CRUD_STORE" bash "$CMD" disable watchdog --json)";
 ok "disable toggles enabled off" '[ "$rc" = 0 ] && jq -e ".tasks[] | select(.id == \"watchdog\" and .enabled == false)" "$CRUD_STORE" >/dev/null'
 out="$(CCC_AGENT_CRON_STORE="$CRUD_STORE" bash "$CMD" enable watchdog --json)"; rc=$?
 ok "enable toggles enabled on" '[ "$rc" = 0 ] && jq -e ".changed == true" <<<"$out" >/dev/null && jq -e ".tasks[] | select(.id == \"watchdog\" and .enabled == true)" "$CRUD_STORE" >/dev/null'
+out="$(CCC_AGENT_CRON_STORE="$CRUD_STORE" bash "$CMD" edit watchdog --schedule "every 30m" --json)"; rc=$?
+ok "edit updates schedule in place" '[ "$rc" = 0 ] && jq -e ".tasks[] | select(.id == \"watchdog\" and .schedule == \"every 30m\") | .payload.argv == [\"sh\",\"-c\",\"df -h\"]" "$CRUD_STORE" >/dev/null'
+out="$(CCC_AGENT_CRON_STORE="$CRUD_STORE" bash "$CMD" edit watchdog --timeout-sec 45 --json)"; rc=$?
+ok "edit merges payload fields preserving argv" '[ "$rc" = 0 ] && jq -e ".tasks[] | select(.id == \"watchdog\") | .payload.timeoutSec == 45 and .payload.kind == \"command\"" "$CRUD_STORE" >/dev/null'
+out="$(CCC_AGENT_CRON_STORE="$CRUD_STORE" bash "$CMD" edit watchdog --schedule "not a schedule" --json 2>&1)"; rc=$?
+ok "edit rejects invalid schedule without write" '[ "$rc" = 2 ] && jq -e ".tasks[] | select(.id == \"watchdog\" and .schedule == \"every 30m\")" "$CRUD_STORE" >/dev/null'
+out="$(CCC_AGENT_CRON_STORE="$CRUD_STORE" bash "$CMD" edit watchdog --json 2>&1)"; rc=$?
+ok "edit with no flags is rejected" '[ "$rc" = 2 ] && grep -q "at least one field" <<<"$out"'
+out="$(CCC_AGENT_CRON_STORE="$CRUD_STORE" bash "$CMD" edit missing-task --name x --json 2>&1)"; rc=$?
+ok "edit unknown id fails" '[ "$rc" = 1 ] && grep -q "not found" <<<"$out"'
+
 out="$(CCC_AGENT_CRON_STORE="$CRUD_STORE" bash "$CMD" remove watchdog --json)"; rc=$?
 ok "remove deletes the task" '[ "$rc" = 0 ] && ! jq -e ".tasks[] | select(.id == \"watchdog\")" "$CRUD_STORE" >/dev/null'
 out="$(CCC_AGENT_CRON_STORE="$CRUD_STORE" bash "$CMD" remove missing-task --json 2>&1)"; rc=$?
