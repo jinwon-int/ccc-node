@@ -9,6 +9,7 @@ the mixin contract is exercised by the composition tests.
 """
 
 # ruff: noqa: E402
+# mypy: disable-error-code="attr-defined"
 import logging
 import secrets
 from pathlib import Path as FilePath
