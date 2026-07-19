@@ -48,6 +48,14 @@ _MAX_COUNT = 10**12
 _DEFAULT_RETENTION_DAYS = 35
 _COUNTER_KEYS = ("input_tokens", "output_tokens", "requests")
 
+# Rolling-window event ring for quota-style displays (e.g. Kimi Code's 5-hour
+# rolling window). Body-free entries ``[ts, provider, mode, requests, tokens]``;
+# best-effort telemetry, never billing-relevant, so a failed save may drop
+# recent events (unlike the durable daily counters).
+_MAX_EVENTS = 1024
+_EVENT_RETENTION_SECONDS = 26 * 3600
+DEFAULT_ROLLING_WINDOW_SECONDS = 5 * 3600
+
 BudgetState = Literal["ok", "warn", "blocked"]
 AlertKind = Literal["warn", "enforce"]
 
@@ -129,6 +137,14 @@ class UsageAlert:
         )
 
 
+def _rolling_label(seconds: int) -> str:
+    if seconds % 3600 == 0:
+        return f"{seconds // 3600}h"
+    if seconds % 60 == 0:
+        return f"{seconds // 60}m"
+    return f"{seconds}s"
+
+
 def _clamped_count(value: object) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
         return 0
@@ -182,6 +198,7 @@ class UsageMeter:
         self._thread_baselines: dict[str, tuple[int, int]] = {}
         self._days: dict[str, dict[str, dict[str, dict[str, int]]]] = {}
         self._alerted: dict[str, dict[str, list[str]]] = {}
+        self._events: list[list] = []
         self._load()
 
     # -- persistence ---------------------------------------------------------
@@ -202,6 +219,37 @@ class UsageMeter:
         self._load_days(raw.get("days"))
         self._load_alerted(raw.get("alerted"))
         self._load_reservations(raw.get("reservations"))
+        self._load_events(raw.get("events"))
+
+    def _load_events(self, events: object) -> None:
+        if not isinstance(events, list):
+            return
+        now = self._clock()
+        cutoff = now - _EVENT_RETENTION_SECONDS
+        for entry in tuple(events)[-_MAX_EVENTS:]:
+            if not isinstance(entry, (list, tuple)) or len(entry) != 5:
+                continue
+            ts, provider, mode, requests, tokens = entry
+            if (
+                isinstance(ts, bool)
+                or not isinstance(ts, (int, float))
+                or ts < cutoff
+                or ts > now + 300
+            ):
+                continue
+            if not isinstance(provider, str) or not _PROVIDER_RE.match(provider):
+                continue
+            if mode not in _MODES:
+                continue
+            self._events.append(
+                [
+                    float(ts),
+                    provider,
+                    mode,
+                    _clamped_count(requests),
+                    _clamped_count(tokens),
+                ]
+            )
 
     def _load_reservations(self, reservations: object) -> None:
         if not isinstance(reservations, Mapping):
@@ -263,6 +311,7 @@ class UsageMeter:
                 "days": self._days,
                 "alerted": self._alerted,
                 "reservations": self._reservations,
+                "events": self._events,
             },
             ensure_ascii=True,
             sort_keys=True,
@@ -326,6 +375,7 @@ class UsageMeter:
                 self._days.clear()
                 self._alerted.clear()
                 self._reservations.clear()
+                self._events.clear()
                 self._load()
                 self._replay_pending_deltas()
                 yield
@@ -437,9 +487,43 @@ class UsageMeter:
             return ()
         with self._locked_state():
             alerts = self._apply_record(provider, mode, added, self.current_day())
+            self._append_event(provider, mode, added)
         for alert in alerts:
             self._emit(alert)
         return alerts
+
+    def _append_event(self, provider: str, mode: str, added: Mapping[str, int]) -> None:
+        """Append one rolling-window event under the meter lock (caller holds it)."""
+
+        now = self._clock()
+        tokens = added["input_tokens"] + added["output_tokens"]
+        self._events.append([now, provider, mode, added["requests"], tokens])
+        cutoff = now - _EVENT_RETENTION_SECONDS
+        self._events = [event for event in self._events if event[0] >= cutoff][
+            -_MAX_EVENTS:
+        ]
+
+    def rolling_usage(
+        self, *, window_seconds: int = DEFAULT_ROLLING_WINDOW_SECONDS
+    ) -> dict[str, dict[str, int]]:
+        """Body-free per-provider totals over the trailing window.
+
+        This is a local estimate from bridge-side turn records, not the
+        provider's own quota accounting (which some providers, e.g. Kimi
+        Code, do not expose over their API at all).
+        """
+
+        if window_seconds <= 0:
+            raise ValueError("window_seconds must be positive")
+        cutoff = self._clock() - window_seconds
+        totals: dict[str, dict[str, int]] = {}
+        for ts, provider, _mode, requests, tokens in self._events:
+            if ts < cutoff:
+                continue
+            bucket = totals.setdefault(provider, {"requests": 0, "tokens": 0})
+            bucket["requests"] += requests
+            bucket["tokens"] += tokens
+        return totals
 
     def _apply_record(
         self, provider: str, mode: str, added: Mapping[str, int], day: str
@@ -640,11 +724,20 @@ class UsageMeter:
 
     # -- reporting -------------------------------------------------------------
 
-    def render_report(self, *, days: int = 7) -> str:
-        """Render a compact body-free usage summary for the last ``days``."""
+    def render_report(
+        self, *, days: int = 7, rolling_seconds: int = DEFAULT_ROLLING_WINDOW_SECONDS
+    ) -> str:
+        """Render a compact body-free usage summary for the last ``days``.
+
+        ``rolling_seconds`` adds a per-provider trailing-window line (local
+        estimate for providers with rolling quota windows, e.g. Kimi Code's
+        5-hour window); pass 0 to omit it.
+        """
 
         if days <= 0:
             raise ValueError("days must be positive")
+        if rolling_seconds < 0:
+            raise ValueError("rolling_seconds must not be negative")
         today = datetime.strptime(self.current_day(), "%Y-%m-%d").replace(tzinfo=_KST)
         window = [
             (today - timedelta(days=offset)).strftime("%Y-%m-%d")
@@ -675,6 +768,15 @@ class UsageMeter:
                 f"{totals[MODE_AUTONOMOUS]['input_tokens'] + totals[MODE_AUTONOMOUS]['output_tokens']}"
                 f" tok/{totals[MODE_AUTONOMOUS]['requests']} req"
             )
+            if rolling_seconds > 0:
+                rolling = self.rolling_usage(window_seconds=rolling_seconds).get(
+                    provider
+                )
+                if rolling is not None:
+                    lines.append(
+                        f"  last {_rolling_label(rolling_seconds)} (local): "
+                        f"{rolling['requests']} req · {rolling['tokens']} tok"
+                    )
             if decision.budget_tokens > 0:
                 percent = min(
                     999, round(decision.used_tokens * 100 / decision.budget_tokens)
@@ -687,6 +789,7 @@ class UsageMeter:
 
 
 __all__ = [
+    "DEFAULT_ROLLING_WINDOW_SECONDS",
     "MODE_AUTONOMOUS",
     "MODE_INTERACTIVE",
     "BudgetDecision",

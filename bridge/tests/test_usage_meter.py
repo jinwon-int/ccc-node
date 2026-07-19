@@ -552,3 +552,80 @@ class CrossInstanceRefundRecoveryTests(UsageMeterTestCase):
             raw["days"][FIXED_DAY]["codex"][MODE_AUTONOMOUS],
             {"input_tokens": 60, "output_tokens": 0, "requests": 2},
         )
+
+
+class RollingWindowTests(UsageMeterTestCase):
+    def test_rolling_usage_counts_only_events_inside_window(self) -> None:
+        meter = self.make_meter()
+        self.now = FIXED_NOW - 6 * 3600
+        meter.record("claude", MODE_INTERACTIVE, input_tokens=1000, requests=1)
+        self.now = FIXED_NOW - 3 * 3600
+        meter.record("claude", MODE_INTERACTIVE, input_tokens=2000, requests=2)
+        self.now = FIXED_NOW
+        meter.record("codex", MODE_INTERACTIVE, input_tokens=500, requests=1)
+
+        rolling = meter.rolling_usage()
+        self.assertEqual(rolling["claude"], {"requests": 2, "tokens": 2000})
+        self.assertEqual(rolling["codex"], {"requests": 1, "tokens": 500})
+
+    def test_rolling_usage_validates_window(self) -> None:
+        meter = self.make_meter()
+        with self.assertRaises(ValueError):
+            meter.rolling_usage(window_seconds=0)
+        with self.assertRaises(ValueError):
+            meter.rolling_usage(window_seconds=-5)
+
+    def test_rolling_events_survive_reload(self) -> None:
+        meter = self.make_meter()
+        meter.record("claude", MODE_INTERACTIVE, input_tokens=123, requests=1)
+
+        reloaded = self.make_meter()
+        self.assertEqual(
+            reloaded.rolling_usage()["claude"], {"requests": 1, "tokens": 123}
+        )
+
+    def test_rolling_events_drop_entries_older_than_retention(self) -> None:
+        meter = self.make_meter()
+        meter.record("claude", MODE_INTERACTIVE, input_tokens=10, requests=1)
+        self.now = FIXED_NOW + 27 * 3600
+        meter.record("claude", MODE_INTERACTIVE, input_tokens=20, requests=1)
+
+        rolling = meter.rolling_usage(window_seconds=26 * 3600)
+        self.assertEqual(rolling["claude"], {"requests": 1, "tokens": 20})
+        raw = json.loads(self.path.read_text(encoding="utf-8"))
+        self.assertEqual(len(raw["events"]), 1)
+
+    def test_rolling_events_ring_is_bounded(self) -> None:
+        meter = self.make_meter()
+        for _ in range(1030):
+            meter.record("claude", MODE_INTERACTIVE, input_tokens=1)
+        raw = json.loads(self.path.read_text(encoding="utf-8"))
+        self.assertLessEqual(len(raw["events"]), 1024)
+
+    def test_reservations_do_not_create_rolling_events(self) -> None:
+        meter = self.make_meter()
+        reservation = meter.reserve_autonomous_spend(
+            "claude", input_tokens=100, requests=1
+        )
+        self.assertTrue(reservation.allowed)
+        self.assertEqual(meter.rolling_usage(), {})
+
+    def test_render_report_includes_rolling_line(self) -> None:
+        meter = self.make_meter()
+        meter.record("claude", MODE_INTERACTIVE, input_tokens=30, requests=2)
+        report = meter.render_report()
+        self.assertIn("last 5h (local): 2 req · 30 tok", report)
+
+    def test_render_report_rolling_line_can_be_disabled(self) -> None:
+        meter = self.make_meter()
+        meter.record("claude", MODE_INTERACTIVE, input_tokens=30, requests=2)
+        report = meter.render_report(rolling_seconds=0)
+        self.assertNotIn("(local)", report)
+        with self.assertRaises(ValueError):
+            meter.render_report(rolling_seconds=-1)
+
+    def test_render_report_rolling_label_uses_minutes(self) -> None:
+        meter = self.make_meter()
+        meter.record("claude", MODE_INTERACTIVE, input_tokens=30, requests=1)
+        report = meter.render_report(rolling_seconds=1800)
+        self.assertIn("last 30m (local): 1 req · 30 tok", report)
