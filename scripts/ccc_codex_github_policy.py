@@ -17,7 +17,14 @@ import re
 import secrets
 import stat
 import sys
-import tomllib
+
+try:
+    import tomllib as _toml
+except ModuleNotFoundError:  # Python 3.10 fleet nodes
+    try:
+        import tomli as _toml
+    except ModuleNotFoundError:
+        _toml = None
 
 
 PLUGIN_KEY = "github@openai-curated-remote"
@@ -128,9 +135,11 @@ def _read_config(path: Path) -> tuple[str, int, tuple[int, int, int, int]] | Non
 
 
 def _parse(text: str) -> dict[str, object]:
+    if _toml is None:
+        raise PolicyError("toml_parser_unavailable")
     try:
-        parsed = tomllib.loads(text)
-    except tomllib.TOMLDecodeError as exc:
+        parsed = _toml.loads(text)
+    except _toml.TOMLDecodeError as exc:
         raise PolicyError("config_invalid_toml") from exc
     if not isinstance(parsed, dict):
         raise PolicyError("config_invalid_toml")

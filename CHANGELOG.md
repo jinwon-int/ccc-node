@@ -18,6 +18,9 @@ All notable changes to the Claude Code node harness. Dates are KST.
   suite cover idempotence, comment preservation, invalid TOML, and symlinks.
 
 ### Fixed
+- GitHub CLI-first setup now falls back to `tomli` on Python 3.10 nodes instead
+  of importing the Python 3.11-only `tomllib` unconditionally. If neither parser
+  exists, setup still fails closed with a body-free error code.
 - Linux systemd installs now use `Restart=always` so a direct SIGTERM that the
   bridge handles as a clean exit cannot silently leave Telegram serving down.
   Explicit `systemctl stop` remains authoritative, and the documented
