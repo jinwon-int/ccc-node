@@ -23,6 +23,10 @@ from unittest.mock import AsyncMock
 # test_typing_keepalive / test_project_chat_retry).
 os.environ.setdefault("PROJECT_ROOT", str(Path(__file__).resolve().parents[1]))
 
+from sys_modules_isolation import ModuleFakesGuard  # noqa: E402
+
+_sys_modules_guard = ModuleFakesGuard(__name__).begin()
+
 _config_module = types.ModuleType("telegram_bot.utils.config")
 _config_module.config = SimpleNamespace(claude_cli_path=None, terminal_stall_seconds=0.05)
 sys.modules["telegram_bot.utils.config"] = _config_module
@@ -51,6 +55,8 @@ project_chat = importlib.import_module("telegram_bot.core.project_chat")
 ProjectChatHandler = project_chat.ProjectChatHandler
 _PendingRequest = project_chat._PendingRequest
 _UserStreamState = project_chat._UserStreamState
+
+_sys_modules_guard.finish()
 
 
 def _result_message(result="late terminal frame"):

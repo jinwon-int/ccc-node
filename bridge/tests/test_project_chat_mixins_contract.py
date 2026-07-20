@@ -10,8 +10,12 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
+from sys_modules_isolation import ModuleFakesGuard
+
 BRIDGE_DIR = Path(__file__).resolve().parents[1]
 os.environ.setdefault("PROJECT_ROOT", str(BRIDGE_DIR))
+
+_sys_modules_guard = ModuleFakesGuard(__name__).begin()
 
 telegram_bot_pkg = types.ModuleType("telegram_bot")
 telegram_bot_pkg.__path__ = [str(BRIDGE_DIR)]
@@ -31,7 +35,19 @@ sdk_module.TextBlock = type("TextBlock", (), {})
 sdk_module.ToolUseBlock = type("ToolUseBlock", (), {})
 sdk_module.PermissionResultAllow = type("PermissionResultAllow", (), {})
 sdk_module.PermissionResultDeny = type("PermissionResultDeny", (), {})
+sdk_module.__path__ = []
 sys.modules["claude_agent_sdk"] = sdk_module
+
+# Complete the stub set (as test_project_chat_serialization does): tool_policy
+# imports claude_agent_sdk.types, so a solo run of this module must not depend
+# on a sibling test having imported the real SDK first.
+sdk_types_module = types.ModuleType("claude_agent_sdk.types")
+sdk_types_module.HookContext = type("HookContext", (), {})
+sdk_types_module.HookInput = type("HookInput", (), {})
+sdk_types_module.HookJSONOutput = type("HookJSONOutput", (), {})
+sdk_types_module.PermissionResultAllow = sdk_module.PermissionResultAllow
+sdk_types_module.PermissionResultDeny = sdk_module.PermissionResultDeny
+sys.modules["claude_agent_sdk.types"] = sdk_types_module
 
 internal_module = types.ModuleType("claude_agent_sdk._internal")
 transport_pkg = types.ModuleType("claude_agent_sdk._internal.transport")
@@ -68,6 +84,8 @@ for name in [
 project_chat = importlib.import_module("telegram_bot.core.project_chat")
 project_chat_process = importlib.import_module("telegram_bot.core.project_chat_process")
 project_chat_reader = importlib.import_module("telegram_bot.core.project_chat_reader")
+
+_sys_modules_guard.finish()
 
 
 class ProjectChatMixinContractTests(unittest.TestCase):

@@ -7,8 +7,12 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
+from sys_modules_isolation import ModuleFakesGuard
+
 BRIDGE_DIR = Path(__file__).resolve().parents[1]
 os.environ.setdefault("PROJECT_ROOT", str(BRIDGE_DIR))
+
+_sys_modules_guard = ModuleFakesGuard(__name__).begin()
 
 telegram_bot_pkg = types.ModuleType("telegram_bot")
 telegram_bot_pkg.__path__ = [str(BRIDGE_DIR)]
@@ -91,6 +95,8 @@ for name in [
     sys.modules.pop(name, None)
 
 project_chat = importlib.import_module("telegram_bot.core.project_chat")
+
+_sys_modules_guard.finish()
 
 
 class _SerialClient:

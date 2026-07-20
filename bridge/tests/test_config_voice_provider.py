@@ -34,7 +34,15 @@ class VoiceProviderConfigTests(unittest.TestCase):
     def test_execution_profile_defaults_to_strict_project(self):
         with TemporaryDirectory() as td:
             module = self._load_config_module(td)
-            cfg = module.Config(telegram_bot_token="123456:abc", _env_file=None)
+            # Construct under a cleared environment: a live node may export
+            # CCC_BRIDGE_EXECUTION_PROFILE (e.g. owner-operator), and the
+            # pydantic env source would otherwise override the default.
+            with patch.dict(
+                os.environ,
+                {"PROJECT_ROOT": td, "TELEGRAM_BOT_TOKEN": "123456:abc"},
+                clear=True,
+            ):
+                cfg = module.Config(telegram_bot_token="123456:abc", _env_file=None)
             self.assertEqual(cfg.execution_profile, "strict-project")
 
     def test_execution_profile_reads_explicit_env(self):

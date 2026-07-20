@@ -94,10 +94,14 @@ class AccessControlGuardTests(unittest.TestCase):
                 "CCC_REQUIRE_ALLOWLIST",
                 "CCC_BRIDGE_EXECUTION_PROFILE",
                 "CCC_BRIDGE_BASH_POLICY",
+                "CCC_BOT_ENV_FILE",
             ):
                 env.pop(key, None)
             env["BOT_DEBUG"] = "1"
             env["PYTHONPATH"] = str(repo_root / ".github" / "pythonpath")
+            # Isolate from the node's real package fallback bridge/.env (a live
+            # node keeps a populated one with ALLOWED_USER_IDS and a real token).
+            env["CCC_BOT_ENV_FILE"] = str(project_root / "missing-package.env")
 
             result = subprocess.run(
                 [sys.executable, "-m", "telegram_bot", "--path", str(project_root), "--debug"],
@@ -147,10 +151,15 @@ class AccessControlGuardTests(unittest.TestCase):
                 "CCC_REQUIRE_ALLOWLIST",
                 "CCC_BRIDGE_EXECUTION_PROFILE",
                 "CCC_BRIDGE_BASH_POLICY",
+                "CCC_BOT_ENV_FILE",
             ):
                 env.pop(key, None)
             env["BOT_DEBUG"] = "1"
             env["PYTHONPATH"] = str(repo_root / ".github" / "pythonpath")
+            # Isolate from the node's real package fallback bridge/.env (a live
+            # node keeps a populated one with ALLOWED_USER_IDS and a real token,
+            # which would defeat the empty-allowlist refusal under test).
+            env["CCC_BOT_ENV_FILE"] = str(project_root / "missing-package.env")
 
             result = subprocess.run(
                 [sys.executable, "-m", "telegram_bot", "--path", str(project_root), "--debug"],

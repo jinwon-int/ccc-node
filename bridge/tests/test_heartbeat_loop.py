@@ -8,8 +8,12 @@ from collections import deque
 from pathlib import Path
 from types import SimpleNamespace
 
+from sys_modules_isolation import ModuleFakesGuard
+
 os.environ.setdefault("PROJECT_ROOT", str(Path(__file__).resolve().parents[1]))
 BRIDGE_DIR = Path(__file__).resolve().parents[1]
+
+_sys_modules_guard = ModuleFakesGuard(__name__).begin()
 
 telegram_bot_pkg = types.ModuleType("telegram_bot")
 telegram_bot_pkg.__path__ = [str(BRIDGE_DIR)]
@@ -48,7 +52,19 @@ sdk_module.TextBlock = type("TextBlock", (), {})
 sdk_module.ToolUseBlock = type("ToolUseBlock", (), {})
 sdk_module.PermissionResultAllow = _PermissionResultAllow
 sdk_module.PermissionResultDeny = _PermissionResultDeny
+sdk_module.__path__ = []
 sys.modules.setdefault("claude_agent_sdk", sdk_module)
+
+# Complete the stub set (as test_project_chat_retry does): tool_policy imports
+# claude_agent_sdk.types, so a solo run of this module must not depend on a
+# sibling test having imported the real SDK first.
+sdk_types_module = types.ModuleType("claude_agent_sdk.types")
+sdk_types_module.HookContext = type("HookContext", (), {})
+sdk_types_module.HookInput = type("HookInput", (), {})
+sdk_types_module.HookJSONOutput = type("HookJSONOutput", (), {})
+sdk_types_module.PermissionResultAllow = _PermissionResultAllow
+sdk_types_module.PermissionResultDeny = _PermissionResultDeny
+sys.modules.setdefault("claude_agent_sdk.types", sdk_types_module)
 
 internal_module = types.ModuleType("claude_agent_sdk._internal")
 transport_pkg = types.ModuleType("claude_agent_sdk._internal.transport")
@@ -90,6 +106,8 @@ project_chat = importlib.import_module("telegram_bot.core.project_chat")
 ProjectChatHandler = project_chat.ProjectChatHandler
 _PendingRequest = project_chat._PendingRequest
 _UserStreamState = project_chat._UserStreamState
+
+_sys_modules_guard.finish()
 
 
 class HeartbeatLoopTests(unittest.IsolatedAsyncioTestCase):

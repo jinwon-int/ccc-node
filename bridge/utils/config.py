@@ -1,11 +1,17 @@
 import json
 import os
 from collections.abc import Mapping
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Annotated, Any, Literal, Optional, List
 from dotenv import dotenv_values
 from pydantic import Field, SecretStr, field_validator, model_validator
-from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
+from pydantic_settings import (
+    BaseSettings,
+    NoDecode,
+    PydanticBaseSettingsSource,
+    SettingsConfigDict,
+)
 
 from telegram_bot.utils.memory_policy import (
     assert_memory_provider_safe,
@@ -26,6 +32,21 @@ BOT_ENV_FILE_PATH = BOT_PACKAGE_DIR / ".env"  # global fallback (e.g. CLAUDE_CLI
 
 _PLACEHOLDER_TOKENS = {"your_bot_token_here", ""}
 _IMPORT_ENV = dict(os.environ)
+
+# ``Settings.load`` computes the full precedence chain (process env > project
+# .env > package fallback .env) itself and validates the merged mapping.
+# pydantic-core invokes the custom ``BaseSettings.__init__`` even from
+# ``model_validate``, so without intervention that validation would ALSO
+# consult ``os.environ`` and the import-time ``model_config.env_file`` —
+# silently leaking machine state (e.g. a live node's project ``.env`` or an
+# operator's exported profile) into loads that passed explicit ``environ`` /
+# ``bot_env_file`` arguments. While this flag is set,
+# ``settings_customise_sources`` keeps only the init source, so ``load``
+# validates exactly the values it merged. Direct ``Config(...)`` construction
+# is unaffected.
+_LOAD_EXPLICIT_VALUES_ONLY: ContextVar[bool] = ContextVar(
+    "ccc_config_load_explicit_values_only", default=False
+)
 
 LOGS_DIR = BOT_DATA_DIR / "logs"
 SESSION_STORE_PATH = BOT_DATA_DIR / "sessions.json"
@@ -50,6 +71,21 @@ class Config(VoiceSettingsMixin, HeartbeatSettingsMixin, BaseSettings):
     )
 
     @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
+        file_secret_settings: PydanticBaseSettingsSource,
+    ) -> tuple[PydanticBaseSettingsSource, ...]:
+        if _LOAD_EXPLICIT_VALUES_ONLY.get():
+            # ``load`` already merged every permitted source explicitly; do not
+            # let pydantic-settings read os.environ or the import-time env_file.
+            return (init_settings,)
+        return (init_settings, env_settings, dotenv_settings, file_secret_settings)
+
+    @classmethod
     def load(
         cls,
         *,
@@ -60,14 +96,21 @@ class Config(VoiceSettingsMixin, HeartbeatSettingsMixin, BaseSettings):
         """Load settings without mutating the process environment.
 
         Precedence is explicit: process environment, project ``.env``, then the
-        package fallback ``.env``.
+        package fallback ``.env``. Only these three sources are consulted: a
+        call with explicit ``environ`` / ``bot_env_file`` is hermetic and never
+        reads ambient machine state (see ``_LOAD_EXPLICIT_VALUES_ONLY``). The
+        fallback location may be redirected with ``CCC_BOT_ENV_FILE`` in the
+        effective environment (used by subprocess tests to isolate a node's
+        real package ``.env``); ``bot_env_file`` still wins when passed.
         """
         process_values = dict(os.environ if environ is None else environ)
         root_value = project_root if project_root is not None else process_values.get("PROJECT_ROOT")
         if root_value is None or not str(root_value).strip():
             raise ValueError("PROJECT_ROOT must be non-empty to load runtime settings")
         root = Path(root_value).expanduser().resolve()
-        fallback_path = Path(bot_env_file or BOT_ENV_FILE_PATH).expanduser()
+        fallback_path = Path(
+            bot_env_file or process_values.get("CCC_BOT_ENV_FILE") or BOT_ENV_FILE_PATH
+        ).expanduser()
         project_path = root / ".telegram_bot" / ".env"
 
         fallback_values = {
@@ -115,7 +158,11 @@ class Config(VoiceSettingsMixin, HeartbeatSettingsMixin, BaseSettings):
         values.setdefault(
             "CCC_PUSH_SPOOL", home / ".claude" / "state" / "telegram-spool"
         )
-        return cls.model_validate(values)
+        token = _LOAD_EXPLICIT_VALUES_ONLY.set(True)
+        try:
+            return cls.model_validate(values)
+        finally:
+            _LOAD_EXPLICIT_VALUES_ONLY.reset(token)
 
     agent_provider: Literal["claude", "codex"] = Field(
         default="claude",

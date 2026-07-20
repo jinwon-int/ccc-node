@@ -12,6 +12,10 @@ from unittest.mock import AsyncMock, Mock, PropertyMock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from sys_modules_isolation import ModuleFakesGuard
+
+_sys_modules_guard = ModuleFakesGuard(__name__).begin()
+
 _ORIGINAL_PROJECT_ROOT = os.environ.get("PROJECT_ROOT")
 _ORIGINAL_CONFIG_MODULE = sys.modules.get("telegram_bot.utils.config")
 _ORIGINAL_PROJECT_CHAT_MODULE = sys.modules.get("telegram_bot.core.project_chat")
@@ -122,6 +126,10 @@ if _ORIGINAL_BOT_MODULE is None:
     sys.modules.pop("telegram_bot.core.bot", None)
 else:
     sys.modules["telegram_bot.core.bot"] = _ORIGINAL_BOT_MODULE
+
+# The manual restore above covers the modules this file knows it replaced; the
+# guard additionally reverts anything transitively imported under the fakes.
+_sys_modules_guard.finish()
 
 
 def _telegram_bot_module():
