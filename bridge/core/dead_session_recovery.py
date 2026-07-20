@@ -232,7 +232,45 @@ def _open_validated_transcript(path: Path, *, max_file_bytes: int):
         raise
 
 
-def scan_transcript(
+@dataclass(frozen=True)
+class TranscriptQueueReplay:
+    """One safety-validated FIFO replay of a Claude transcript.
+
+    ``pending`` holds the remaining ``(content, enqueue_timestamp)`` pairs in
+    FIFO order (timestamp is the raw ISO-8601 row value, or ``None`` when the
+    row carried none). ``last_assistant_timestamp`` is the raw timestamp of
+    the last ``type == "assistant"`` row, so callers (the #364 P2 wakeup
+    scanner) can decide whether a remaining notification is newer than the
+    last assistant output without a second transcript pass.
+    """
+
+    pending: tuple[tuple[Any, Optional[str]], ...]
+    last_assistant_timestamp: Optional[str]
+
+
+def _apply_queue_operation(
+    pending: deque[tuple[Any, Optional[str]]], row: dict, max_queue_depth: int
+) -> None:
+    """Apply one validated queue-operation row to the replayed FIFO."""
+    operation = row.get("operation")
+    if operation == "enqueue":
+        timestamp = row.get("timestamp")
+        pending.append(
+            (
+                row.get("content"),
+                timestamp if isinstance(timestamp, str) and timestamp else None,
+            )
+        )
+        if len(pending) > max_queue_depth:
+            raise TranscriptRejected("transcript queue exceeds depth limit")
+    elif operation in {"dequeue", "remove"}:
+        if pending:
+            pending.popleft()
+    else:
+        raise TranscriptRejected("unknown queue operation")
+
+
+def replay_transcript_queue(
     path: Path,
     expected_session_id: str,
     *,
@@ -240,14 +278,15 @@ def scan_transcript(
     max_line_bytes: int = DEFAULT_MAX_LINE_BYTES,
     max_lines: int = DEFAULT_MAX_LINES,
     max_queue_depth: int = DEFAULT_MAX_QUEUE_DEPTH,
-) -> list[TaskNotification]:
-    """Replay one transcript FIFO and return remaining terminal task wrappers."""
+) -> TranscriptQueueReplay:
+    """Replay one transcript FIFO under the module's safety limits."""
     expected = _validated_session_id(expected_session_id)
-    pending: deque[Any] = deque()
+    pending: deque[tuple[Any, Optional[str]]] = deque()
+    last_assistant_timestamp: Optional[str] = None
     try:
         stream = _open_validated_transcript(Path(path), max_file_bytes=max_file_bytes)
     except FileNotFoundError:
-        return []
+        return TranscriptQueueReplay(pending=(), last_assistant_timestamp=None)
 
     bytes_seen = 0
     with stream:
@@ -265,22 +304,46 @@ def scan_transcript(
                 raise TranscriptRejected(
                     "transcript contains a malformed line"
                 ) from error
-            if not isinstance(row, dict) or row.get("type") != "queue-operation":
+            if not isinstance(row, dict):
+                continue
+            row_type = row.get("type")
+            if row_type == "assistant":
+                timestamp = row.get("timestamp")
+                if isinstance(timestamp, str) and timestamp:
+                    last_assistant_timestamp = timestamp
+                continue
+            if row_type != "queue-operation":
                 continue
             if row.get("sessionId") != expected:
                 raise TranscriptRejected("queue row session id does not match owner")
-            operation = row.get("operation")
-            if operation == "enqueue":
-                pending.append(row.get("content"))
-                if len(pending) > max_queue_depth:
-                    raise TranscriptRejected("transcript queue exceeds depth limit")
-            elif operation in {"dequeue", "remove"}:
-                if pending:
-                    pending.popleft()
-            else:
-                raise TranscriptRejected("unknown queue operation")
+            _apply_queue_operation(pending, row, max_queue_depth)
 
-    return [item for content in pending if (item := _task_notification(content))]
+    return TranscriptQueueReplay(
+        pending=tuple(pending), last_assistant_timestamp=last_assistant_timestamp
+    )
+
+
+def scan_transcript(
+    path: Path,
+    expected_session_id: str,
+    *,
+    max_file_bytes: int = DEFAULT_MAX_FILE_BYTES,
+    max_line_bytes: int = DEFAULT_MAX_LINE_BYTES,
+    max_lines: int = DEFAULT_MAX_LINES,
+    max_queue_depth: int = DEFAULT_MAX_QUEUE_DEPTH,
+) -> list[TaskNotification]:
+    """Replay one transcript FIFO and return remaining terminal task wrappers."""
+    replay = replay_transcript_queue(
+        path,
+        expected_session_id,
+        max_file_bytes=max_file_bytes,
+        max_line_bytes=max_line_bytes,
+        max_lines=max_lines,
+        max_queue_depth=max_queue_depth,
+    )
+    return [
+        item for content, _ts in replay.pending if (item := _task_notification(content))
+    ]
 
 
 def notification_marker(session_id: str, item: TaskNotification) -> str:
@@ -803,12 +866,18 @@ async def run_periodic_dead_session_recovery(
     conversations_dir: Optional[Path],
     stop_event: asyncio.Event,
     on_stats: Optional[Any] = None,
+    wakeup_tick: Optional[Any] = None,
 ) -> None:
     """Run one bounded scan per interval until the lifecycle stop event is set.
 
     ``on_stats`` (optional sync callable) receives each tick's ``RecoveryStats``
     so the caller can surface counters (e.g. quarantined transcripts) in health
     reporting without this module importing bridge internals.
+
+    ``wakeup_tick`` (optional async callable) runs after each recovery scan on
+    the same cadence — the #364 P2 dead-session wakeup reuses this loop instead
+    of adding a second periodic scanner. ``None`` (the default, and whenever the
+    opt-in wakeup flag is off) keeps this loop's behavior unchanged.
     """
     interval = recovery_interval()
     while not stop_event.is_set():
@@ -827,3 +896,11 @@ async def run_periodic_dead_session_recovery(
             raise
         except Exception as error:  # pragma: no cover - final fail-open boundary
             logger.warning("Dead-session recovery tick failed: %s", type(error).__name__)
+        if wakeup_tick is None:
+            continue
+        try:
+            await wakeup_tick()
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:  # pragma: no cover - final fail-open boundary
+            logger.warning("Dead-session wakeup tick failed: %s", type(error).__name__)

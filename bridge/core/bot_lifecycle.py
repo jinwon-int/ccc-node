@@ -31,6 +31,7 @@ from telegram_bot.core.dead_session_recovery import (
     recover_dead_session_notifications,
     run_periodic_dead_session_recovery,
 )
+from telegram_bot.core.dead_session_wakeup import run_dead_session_wakeup_scan
 from telegram_bot.utils.heartbeat_store import drain_heartbeats, store_path_for
 from telegram_bot.utils.orphan_reaper import (
     run_periodic_reaper,
@@ -850,7 +851,50 @@ class BotLifecycleMixin:
             self._project_chat.conversations_dir,
             stop_event,
             on_stats=self._record_recovery_stats,
+            wakeup_tick=self._build_dead_session_wakeup_tick(),
         )
+
+    def _build_dead_session_wakeup_tick(self):
+        """Per-tick dead-session wakeup runner (#364 P2); None when opted out.
+
+        Rides the recovery loop's cadence instead of adding a second periodic
+        scanner. With the flag off (the default) this returns None and the
+        recovery loop behaves exactly as before.
+        """
+        if not bool(getattr(self._config, "dead_session_wakeup", False)):
+            logger.info(
+                "Dead-session wakeup disabled (opt-in via CCC_DEAD_SESSION_WAKEUP)"
+            )
+            return None
+
+        async def wakeup_tick() -> None:
+            stats = await run_dead_session_wakeup_scan(
+                self.application.bot,
+                self._session_manager,
+                self._project_chat,
+                self._project_chat.conversations_dir,
+                enabled=True,
+                usage_meter=getattr(self._project_chat, "usage_meter", None),
+            )
+            if stats.triggered or stats.failed or stats.rejected:
+                logger.info(
+                    "Dead-session wakeup: scanned=%d triggered=%d delivered=%d "
+                    "failed=%d rejected=%d budget=%d cooldown=%d attempts=%d "
+                    "quarantine=%d active=%d locked=%d",
+                    stats.scanned,
+                    stats.triggered,
+                    stats.delivered,
+                    stats.failed,
+                    stats.rejected,
+                    stats.skipped_budget,
+                    stats.skipped_cooldown,
+                    stats.skipped_attempts,
+                    stats.skipped_quarantine,
+                    stats.skipped_active,
+                    stats.skipped_locked,
+                )
+
+        return wakeup_tick
 
     async def _distill_extraction_loop(self, stop_event: asyncio.Event) -> None:
         """Drive the budget-gated distill worker over ready snapshot jobs.
