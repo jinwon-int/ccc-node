@@ -12,6 +12,10 @@ from unittest.mock import AsyncMock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from sys_modules_isolation import ModuleFakesGuard
+
+_sys_modules_guard = ModuleFakesGuard(__name__).begin()
+
 
 config_module = types.ModuleType("telegram_bot.utils.config")
 config_module.config = SimpleNamespace(
@@ -150,6 +154,10 @@ for _module_name, _original_module in _original_runtime_modules.items():
     else:
         assert isinstance(_original_module, types.ModuleType)
         sys.modules[_module_name] = _original_module
+
+# The manual restore above covers the modules this file knows it replaced; the
+# guard additionally reverts anything transitively imported under the fakes.
+_sys_modules_guard.finish()
 
 
 def _telegram_bot_class():

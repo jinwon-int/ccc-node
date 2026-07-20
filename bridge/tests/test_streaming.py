@@ -10,6 +10,10 @@ from telegram.error import TelegramError
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from sys_modules_isolation import ModuleFakesGuard
+
+_sys_modules_guard = ModuleFakesGuard(__name__).begin()
+
 config_module = types.ModuleType("telegram_bot.utils.config")
 config_module.config = SimpleNamespace(
     draft_update_min_chars=20,
@@ -20,6 +24,8 @@ sys.modules["telegram_bot.utils.config"] = config_module
 
 from telegram_bot.core.streaming import StreamingMessageHandler
 from telegram_bot.utils import tg_entities
+
+_sys_modules_guard.finish()
 
 _ENTITY_OK = tg_entities.available()
 
