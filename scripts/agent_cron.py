@@ -9,7 +9,7 @@ import shlex as _shlex
 import sys as _sys
 from pathlib import Path as _Path
 
-_USAGE = "Usage: agent-cron.sh [list|validate|status] [--store PATH] [--json]\n       agent-cron.sh add <task-id> --schedule EXPR --prompt TEXT [--name N] [--timezone IANA] [--notify none|telegram-owner|telegram-owner-on-failure] [--allowed-tools a,b] [--permission-mode M] [--catch-up-policy P] [--max-catchup N] [--lock-timeout-sec N] [--anchor-at ISO] [--keep-after-run] [--disabled] [--argv WORD ...] [--cwd DIR] [--model M] [--timeout-sec N] [--output-max-bytes N] [--json]\n       agent-cron.sh edit <task-id> [same flags as add; set-only partial update] [--json]\n       agent-cron.sh remove|enable|disable <task-id> [--json]\n       agent-cron.sh due [--store PATH] [--at ISO8601] [--json]\n       agent-cron.sh lock <task-id> --action acquire|release|probe --run-id ID [--scheduled-at ISO8601] [--at ISO8601] [--json]\n       agent-cron.sh run <task-id> --dry-run [--at ISO8601] [--json]\n       agent-cron.sh scheduler --dry-run|--execute [--at ISO8601] [--max-runs N] [--json]\n\nImplemented slices:\n- list/validate: inspect and validate the task definition store.\n- due: read-only dry-run schedule resolver. It reports due tasks, missed windows,\n  catch-up policy, retryEligibleAt state, and lock paths, but never executes\n  prompts or writes state.\n- lock: local atomic task-lock acquire/release/probe primitives only. It writes\n  lock files under the task store's sibling locks/ directory, but never executes\n  prompts, sends notifications, installs schedulers, or updates task history.\n- run --dry-run: read-only execution-plan preview. It combines due, lock probe,\n  task policy, and headless command metadata, but never acquires locks, executes\n  prompts, sends notifications, installs schedulers, or updates task history.\n- scheduler --dry-run: read-only single-tick scheduler plan. It reports which\n  tasks would run or skip, including retry-due tasks, but never installs timers,\n  acquires locks, executes prompts, writes task state, or sends notifications.\n- scheduler --execute: explicit one-shot scheduler executor for approved live/systemd\n  use. It runs at most --max-runs due/retry-due tasks through the existing run path;\n  it never installs timers or edits crontab/systemd.\n- run: explicit manual execution for due enabled tasks. It acquires the task lock,\n  invokes ccc-headless, records lastRunAt/lastStatus/lastRunId, writes a\n  redacted owner-only bridge spool entry when notify=telegram-owner, appends a\n  bounded runHistory entry, records retryState/retryEligibleAt on failure, clears\n  retryState on success, and releases the lock in all normal failure/success\n  paths. It still does not call Telegram\n  or provider APIs, install schedulers, mutate crontab/systemd, or touch remotes.\n\nNo direct Telegram/API send, scheduler bootstrap, systemd/crontab writes,\nprovider sends, or remote-node actions are performed by agent-cron itself.\n"
+_USAGE = "Usage: agent-cron.sh [list|validate|status] [--store PATH] [--json]\n       agent-cron.sh add <task-id> --schedule EXPR --prompt TEXT [--name N] [--timezone IANA] [--notify none|telegram-owner|telegram-owner-on-failure] [--allowed-tools a,b] [--permission-mode M] [--catch-up-policy P] [--max-catchup N] [--lock-timeout-sec N] [--anchor-at ISO] [--not-before ISO] [--max-runs N] [--keep-after-run] [--disabled] [--argv WORD ...] [--cwd DIR] [--model M] [--timeout-sec N] [--output-max-bytes N] [--json]\n       agent-cron.sh edit <task-id> [same flags as add; set-only partial update] [--json]\n       agent-cron.sh remove|enable|disable <task-id> [--json]\n       agent-cron.sh due [--store PATH] [--at ISO8601] [--json]\n       agent-cron.sh lock <task-id> --action acquire|release|probe --run-id ID [--scheduled-at ISO8601] [--at ISO8601] [--json]\n       agent-cron.sh run <task-id> --dry-run [--at ISO8601] [--json]\n       agent-cron.sh scheduler --dry-run|--execute [--at ISO8601] [--max-runs N] [--json]\n\nImplemented slices:\n- list/validate: inspect and validate the task definition store.\n- due: read-only dry-run schedule resolver. It reports due tasks, missed windows,\n  catch-up policy, retryEligibleAt state, and lock paths, but never executes\n  prompts or writes state.\n- lock: local atomic task-lock acquire/release/probe primitives only. It writes\n  lock files under the task store's sibling locks/ directory, but never executes\n  prompts, sends notifications, installs schedulers, or updates task history.\n- run --dry-run: read-only execution-plan preview. It combines due, lock probe,\n  task policy, and headless command metadata, but never acquires locks, executes\n  prompts, sends notifications, installs schedulers, or updates task history.\n- scheduler --dry-run: read-only single-tick scheduler plan. It reports which\n  tasks would run or skip, including retry-due tasks, but never installs timers,\n  acquires locks, executes prompts, writes task state, or sends notifications.\n- scheduler --execute: explicit one-shot scheduler executor for approved live/systemd\n  use. It runs at most --max-runs due/retry-due tasks through the existing run path;\n  it never installs timers or edits crontab/systemd.\n- run: explicit manual execution for due enabled tasks. It acquires the task lock,\n  invokes ccc-headless, records lastRunAt/lastStatus/lastRunId, writes a\n  redacted owner-only bridge spool entry when notify=telegram-owner, appends a\n  bounded runHistory entry, records retryState/retryEligibleAt on failure, clears\n  retryState on success, and releases the lock in all normal failure/success\n  paths. It still does not call Telegram\n  or provider APIs, install schedulers, mutate crontab/systemd, or touch remotes.\n\nNo direct Telegram/API send, scheduler bootstrap, systemd/crontab writes,\nprovider sends, or remote-node actions are performed by agent-cron itself.\n"
 
 
 def _die(message, code=2):
@@ -72,7 +72,7 @@ import shlex
 import socket
 import subprocess
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 # Pure schedule + retry helpers live in agent_cron_lib (no side effects, unit
@@ -298,14 +298,21 @@ def due_plan(data):  # noqa: C901 -- #348 baseline hotspot
     for idx, task in enumerate(data.get('tasks', [])):
         tid = task.get('id')
         lock = lock_status(tid or f'task-{idx}', task, at)
+        run_limit = run_limit_metadata(task)
+        configured_enabled = bool(task.get('enabled'))
+        effective_enabled = configured_enabled and not run_limit['reached']
         row = {
             'id': tid,
-            'enabled': bool(task.get('enabled')),
+            'enabled': effective_enabled,
+            'configuredEnabled': configured_enabled,
             'schedule': task.get('schedule'),
             'timezone': task.get('timezone', 'UTC'),
             'catchUpPolicy': task.get('catchUpPolicy', 'skip'),
             'maxCatchup': task.get('maxCatchup', 1),
             'lastRunAt': task.get('lastRunAt'),
+            'notBefore': task.get('notBefore'),
+            'maxRuns': task.get('maxRuns'),
+            'runCount': task.get('runCount', 0),
             'retryEligibleAt': None,
             'retryAttempt': None,
             'due': False,
@@ -317,7 +324,8 @@ def due_plan(data):  # noqa: C901 -- #348 baseline hotspot
             'nextDueAt': None,
             'lockPath': lock['lockPath'],
             'lockState': lock['lockState'],
-            'status': 'disabled' if not task.get('enabled') else 'idle',
+            'runLimit': run_limit,
+            'status': 'run-limit-reached' if run_limit['reached'] else ('disabled' if not configured_enabled else 'idle'),
         }
         for k in ('holder', 'lockAgeSec', 'lockTimeoutSec'):
             if k in lock:
@@ -326,13 +334,28 @@ def due_plan(data):  # noqa: C901 -- #348 baseline hotspot
             spec = parse_schedule(task.get('schedule') or '', task.get('timezone', 'UTC'))
             row['scheduleKind'] = spec.get('kind', 'cron')
             last = parse_dt(task.get('lastRunAt'), f'tasks[{idx}].lastRunAt')
+            not_before = parse_dt(task.get('notBefore'), f'tasks[{idx}].notBefore')
             anchor = parse_dt(task.get('anchorAt'), f'tasks[{idx}].anchorAt')
-            occurrences, truncated = schedule_occurrences(spec, last, at, anchor)
+            if not_before is not None and at < not_before:
+                row['status'] = 'not-before' if effective_enabled else row['status']
+                if spec.get('kind') == 'interval' and anchor is None:
+                    row['nextDueAt'] = fmt_dt(not_before)
+                else:
+                    row['nextDueAt'] = fmt_dt(next_after(spec, not_before - timedelta(seconds=1), anchor))
+                rows.append(row)
+                continue
+            occurrence_floor = last
+            free_interval = spec.get('kind') == 'interval' and anchor is None and last is None
+            if not_before is not None and not free_interval:
+                activation_floor = not_before - timedelta(seconds=1)
+                if occurrence_floor is None or occurrence_floor < activation_floor:
+                    occurrence_floor = activation_floor
+            occurrences, truncated = schedule_occurrences(spec, occurrence_floor, at, anchor)
             raw_missed = len(occurrences)
             row['missedRunsTruncated'] = truncated
             policy = task.get('catchUpPolicy', 'skip')
             max_catch = task.get('maxCatchup', 1)
-            if task.get('enabled') and raw_missed > 0:
+            if effective_enabled and raw_missed > 0:
                 row['due'] = True
                 row['scheduledAt'] = fmt_dt(occurrences[-1])
                 if policy == 'all':
@@ -352,7 +375,7 @@ def due_plan(data):  # noqa: C901 -- #348 baseline hotspot
                 row['retryAttempt'] = retry.get('retryAttempt')
                 if not retry.get('valid', True):
                     row['retryError'] = retry.get('error')
-                elif task.get('enabled') and not row['due']:
+                elif effective_enabled and not row['due']:
                     if retry.get('ready'):
                         row['due'] = True
                         row['dueCount'] = 1
@@ -426,6 +449,7 @@ def agent_cron_status(data):
         'locked': 0,
         'disabled': 0,
         'invalid': 0,
+        'completed': 0,
     }
     for row in plan.get('tasks', []):
         status = row.get('status') or 'unknown'
@@ -435,6 +459,8 @@ def agent_cron_status(data):
         health = 'healthy'
         if status == 'disabled':
             health = 'disabled'
+        elif status == 'run-limit-reached':
+            health = 'completed'
         elif status in {'locked', 'stale-lock'}:
             health = 'locked'
         elif status == 'retry-exhausted':
@@ -507,7 +533,7 @@ def scheduler_actions(plan):
         action = 'skip'
         reason = status or 'unknown'
         if not row.get('enabled'):
-            reason = 'disabled'
+            reason = 'run-limit-reached' if status == 'run-limit-reached' else 'disabled'
         elif row.get('due') and lock_state == 'held':
             reason = 'locked'
         elif row.get('due'):
@@ -692,6 +718,7 @@ def run_dry_plan(data):
                 'probeOnly': True,
             },
             'headless': headless_metadata(task, execute=False),
+            'runLimit': run_limit_metadata(task),
             'notification': {
                 'policy': notify,
                 'delivery': 'preview-only' if notify == 'telegram-owner' else 'none',
@@ -799,6 +826,30 @@ def append_run_history(task, entry):
     if max_history > 500:
         max_history = 500
     task['runHistory'] = history[-max_history:]
+
+
+def run_limit_metadata(task):
+    maximum = task.get('maxRuns')
+    count = task.get('runCount', 0)
+    if not isinstance(count, int) or isinstance(count, bool) or count < 0:
+        count = 0
+    return {
+        'maxRuns': maximum,
+        'runCount': count,
+        'remainingRuns': max(0, maximum - count) if isinstance(maximum, int) and not isinstance(maximum, bool) else None,
+        'reached': isinstance(maximum, int) and not isinstance(maximum, bool) and count >= maximum,
+    }
+
+
+def apply_run_limit(task):
+    if not isinstance(task.get('maxRuns'), int) or isinstance(task.get('maxRuns'), bool):
+        return run_limit_metadata(task)
+    task['runCount'] = run_limit_metadata(task)['runCount'] + 1
+    limit = run_limit_metadata(task)
+    if limit['reached']:
+        task['enabled'] = False
+        task.pop('retryState', None)
+    return limit
 
 
 def acquire_for_run(task_id, task, run_id, scheduled_at, at):
@@ -1007,7 +1058,7 @@ def write_owner_spool(task, task_id, run_id, scheduled_at, status, headless, at)
         return {**base, 'delivery': 'spool-error', 'redacted': True, 'error': short_text(str(e), 600)}
 
 
-def run_execute(data, task_id, at_value, as_json):
+def run_execute(data, task_id, at_value, as_json):  # noqa: C901 -- #348 baseline hotspot
     task = task_by_id(data, task_id)
     if not task:
         return {'ok': False, 'mode': 'run-execute', 'taskId': task_id, 'error': 'task id not found'}, as_json, 1
@@ -1023,6 +1074,9 @@ def run_execute(data, task_id, at_value, as_json):
         'due': bool(row.get('due')),
         'notification': notification_base(task),
     }
+    current_limit = run_limit_metadata(task)
+    if current_limit['reached']:
+        return {**base, 'ok': True, 'status': 'run-limit-reached', 'runLimit': current_limit, 'mutations': mutation_flags(False, False, False)}, as_json, 0
     if not task.get('enabled'):
         return {**base, 'ok': True, 'status': 'disabled', 'mutations': mutation_flags(False, False, False)}, as_json, 0
     if not row.get('due'):
@@ -1078,6 +1132,9 @@ def run_execute(data, task_id, at_value, as_json):
         }
         append_run_history(task, entry)
         retry = apply_retry_transition(task, scheduled_at, attempt, run_id, status, at)
+        run_limit = apply_run_limit(task)
+        if run_limit['reached'] and retry.get('retryEligibleAt'):
+            retry = {**retry, 'retryEligibleAt': None, 'cancelledByRunLimit': True}
         task['lastRunAt'] = scheduled_at
         task['lastStatus'] = status
         task['lastRunId'] = run_id
@@ -1102,6 +1159,7 @@ def run_execute(data, task_id, at_value, as_json):
         'notification': notification,
         'oneShotDisabled': one_shot_disabled,
         'retry': retry,
+        'runLimit': run_limit,
         'mutations': mutation_flags(True, headless is not None, headless is not None, notification.get('delivery') == 'spooled', True),
     }
     if not release.get('ok'):
@@ -1194,11 +1252,13 @@ CRUD_VALUE_FLAGS = {
     '--permission-mode': ('fields', 'permissionMode', _crud_str),
     '--catch-up-policy': ('fields', 'catchUpPolicy', _crud_str),
     '--anchor-at': ('fields', 'anchorAt', _crud_str),
+    '--not-before': ('fields', 'notBefore', _crud_str),
     '--redact-profile': ('fields', 'redactProfile', _crud_str),
     '--allowed-tools': ('fields', 'allowedTools', _crud_csv),
     '--max-catchup': ('fields', 'maxCatchup', _crud_int),
     '--lock-timeout-sec': ('fields', 'lockTimeoutSec', _crud_int),
     '--max-run-history': ('fields', 'maxRunHistory', _crud_int),
+    '--max-runs': ('fields', 'maxRuns', _crud_int),
     '--cwd': ('payload', 'cwd', _crud_str),
     '--model': ('payload', 'model', _crud_str),
     '--timeout-sec': ('payload', 'timeoutSec', _crud_int),
@@ -1263,8 +1323,9 @@ def _crud_add(data, base, as_json, task_id, fields, payload, argv, disabled):
     task.setdefault('notify', 'none')
     try:
         parse_schedule(task['schedule'], task.get('timezone', 'UTC'))
+        parse_dt(task.get('notBefore'), 'notBefore')
     except ValueError as e:
-        return {**base, 'ok': False, 'error': f'invalid schedule: {e}'}, as_json, 2
+        return {**base, 'ok': False, 'error': f'invalid schedule bounds: {e}'}, as_json, 2
     candidate = {**data, 'tasks': tasks + [task]}
     errors = validate_store(candidate)
     if errors:
@@ -1297,8 +1358,9 @@ def _crud_edit(data, base, as_json, task_id, fields, payload, argv, disabled):
         updated['payload'] = merged_payload
     try:
         parse_schedule(updated.get('schedule') or '', updated.get('timezone', 'UTC'))
+        parse_dt(updated.get('notBefore'), 'notBefore')
     except ValueError as e:
-        return {**base, 'ok': False, 'error': f'invalid schedule: {e}'}, as_json, 2
+        return {**base, 'ok': False, 'error': f'invalid schedule bounds: {e}'}, as_json, 2
     candidate = {**data, 'tasks': [updated if t is task else t for t in tasks]}
     errors = validate_store(candidate)
     if errors:

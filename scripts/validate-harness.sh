@@ -165,7 +165,7 @@ fi
 
 # 2) shell syntax (bash -n) on hooks, skill helpers, and top-level scripts
 say "== bash -n =="
-mapfile -t SH < <(find claude/hooks claude/skills scripts -name '*.sh' 2>/dev/null; echo setup.sh; echo claude/mcp-setup.sh; echo claude/headless.sh)
+mapfile -t SH < <(find claude/hooks claude/skills scripts codex -name '*.sh' 2>/dev/null; echo setup.sh; echo claude/mcp-setup.sh; echo claude/headless.sh)
 for f in "${SH[@]}"; do
   [ -f "$f" ] || continue
   if bash -n "$f" 2>/dev/null; then say "  ok $f"; else err "bash -n: $f"; fi
@@ -174,7 +174,7 @@ done
 # 3) shellcheck — scoped to reviewed scripts (blocking); others get bash -n only above.
 say "== shellcheck =="
 SC_SCOPE=(claude/hooks/audit.sh claude/hooks/redact.sh \
-          claude/hooks/notify.sh claude/hooks/statusline.sh claude/headless.sh \
+          claude/hooks/notify.sh claude/hooks/statusline.sh claude/headless.sh codex/headless.sh \
           scripts/ccc-service-control.sh \
           scripts/ccc-service-control.test.sh \
           scripts/ccc-broker-reconcile.sh scripts/ccc-broker-reconcile.test.sh \
@@ -243,6 +243,7 @@ for t in claude/hooks/observability.test.sh claude/hooks/security-scan.test.sh \
          bridge/restart.test.sh \
          scripts/converge-distill-peer.test.sh \
          scripts/install-agent-cron-systemd.test.sh \
+         codex/headless.test.sh \
          scripts/install-skill-autosave-cron.test.sh \
          scripts/gh-pr-flow-seoseo-review.test.sh \
          scripts/ccc-service-control.test.sh \

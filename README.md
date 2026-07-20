@@ -46,6 +46,7 @@ After setup:
 
 ```text
 claude/                    Claude Code harness templates, hooks, agents, skills, commands
+codex/                     Ephemeral Codex headless runner for agent-cron
 bridge/                    Telegram bridge Python package and startup/setup scripts
 docs/                      Living operator docs
 docs/archive/              Historical closeout/roadmap records

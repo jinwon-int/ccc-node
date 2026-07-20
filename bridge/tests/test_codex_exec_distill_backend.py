@@ -336,7 +336,7 @@ async def test_communicate_failure_terminates_process_group_and_hides_details(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, codex_executable: str
 ) -> None:
     killpg_calls: list[tuple[int, signal.Signals]] = []
-    process: FakeProcess
+    process: FakeProcess | None = None
 
     async def fake_spawn(*args: str, **kwargs: Any) -> FakeProcess:
         del args, kwargs
@@ -350,6 +350,7 @@ async def test_communicate_failure_terminates_process_group_and_hides_details(
 
     def fake_killpg(pid: int, sig: signal.Signals) -> None:
         killpg_calls.append((pid, sig))
+        assert process is not None
         process.returncode = -sig
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_spawn)

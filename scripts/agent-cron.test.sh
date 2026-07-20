@@ -131,7 +131,8 @@ cat > "$DUE" <<'JSON'
     {"id":"hourly-skip","schedule":"@hourly","prompt":"a","enabled":true,"notify":"none","lastRunAt":"2026-01-01T00:00:00Z","catchUpPolicy":"skip"},
     {"id":"hourly-all","schedule":"0 * * * *","prompt":"b","enabled":true,"notify":"none","lastRunAt":"2026-01-01T00:00:00Z","catchUpPolicy":"all","maxCatchup":2},
     {"id":"daily-idle","schedule":"0 0 * * *","prompt":"c","enabled":true,"notify":"none","lastRunAt":"2026-01-01T00:00:00Z"},
-    {"id":"disabled","schedule":"* * * * *","prompt":"d","enabled":false,"notify":"none","lastRunAt":"2026-01-01T00:00:00Z"}
+    {"id":"disabled","schedule":"* * * * *","prompt":"d","enabled":false,"notify":"none","lastRunAt":"2026-01-01T00:00:00Z"},
+    {"id":"future-once","schedule":"27 2 22 7 *","prompt":"e","enabled":true,"notify":"none","notBefore":"2026-07-22T02:27:00Z","maxRuns":1}
   ]
 }
 JSON
@@ -144,7 +145,11 @@ ok "due identifies hourly skip task" 'jq -e ".tasks[] | select(.id == \"hourly-s
 ok "due honours all catch-up max" 'jq -e ".tasks[] | select(.id == \"hourly-all\" and .due == true and .dueCount == 2 and .missedRuns == 0)" <<<"$out" >/dev/null'
 ok "due leaves idle daily task idle" 'jq -e ".tasks[] | select(.id == \"daily-idle\" and .due == false and .nextDueAt == \"2026-01-02T00:00:00Z\")" <<<"$out" >/dev/null'
 ok "due leaves disabled task disabled" 'jq -e ".tasks[] | select(.id == \"disabled\" and .status == \"disabled\" and .due == false)" <<<"$out" >/dev/null'
+ok "notBefore prevents an annual one-time task from catching up early" 'jq -e ".tasks[] | select(.id == \"future-once\" and .status == \"not-before\" and .due == false and .nextDueAt == \"2026-07-22T02:27:00Z\")" <<<"$out" >/dev/null'
 ok "due made no filesystem changes" '[ "$before" = "$after" ]'
+
+out="$(CCC_AGENT_CRON_STORE="$DUE" bash "$CMD" due --json --at 2026-07-22T02:27:00Z)"; rc=$?
+ok "notBefore task becomes due at its bounded first occurrence" '[ "$rc" = 0 ] && jq -e ".tasks[] | select(.id == \"future-once\" and .due == true and .scheduledAt == \"2026-07-22T02:27:00Z\")" <<<"$out" >/dev/null'
 
 DOM_DOW="$TMP/dom-dow.json"
 cat > "$DOM_DOW" <<'JSON'
@@ -268,7 +273,7 @@ ok "run --dry-run made no filesystem changes" '[ "$before" = "$after" ]'
 EXEC_STORE="$TMP/exec-store/tasks.json"
 mkdir -p "$(dirname "$EXEC_STORE")"
 cat > "$EXEC_STORE" <<'JSON'
-{"version":1,"tasks":[{"id":"exec-success","schedule":"* * * * *","prompt":"Run safely","enabled":true,"notify":"none","allowedTools":["Read","Grep"],"permissionMode":"dontAsk","lastRunAt":"2026-01-01T00:00:00Z","lockTimeoutSec":60},{"id":"exec-fail","schedule":"* * * * *","prompt":"Fail safely","enabled":true,"notify":"none","lastRunAt":"2026-01-01T00:00:00Z","lockTimeoutSec":60},{"id":"exec-disabled","schedule":"* * * * *","prompt":"Disabled","enabled":false,"notify":"none","lastRunAt":"2026-01-01T00:00:00Z","lockTimeoutSec":60},{"id":"exec-not-due","schedule":"0 0 * * *","prompt":"Not due","enabled":true,"notify":"none","lastRunAt":"2026-01-01T00:00:00Z","lockTimeoutSec":60},{"id":"exec-notify","schedule":"* * * * *","prompt":"Notify safely","enabled":true,"notify":"telegram-owner","redactProfile":"owner","lastRunAt":"2026-01-01T00:00:00Z","lockTimeoutSec":60},{"id":"exec-notify-fail","schedule":"* * * * *","prompt":"Notify Fail secret","enabled":true,"notify":"telegram-owner","redactProfile":"owner","lastRunAt":"2026-01-01T00:00:00Z","lockTimeoutSec":60},{"id":"exec-history","schedule":"* * * * *","prompt":"History safely","enabled":true,"notify":"none","lastRunAt":"2026-01-01T00:00:00Z","lockTimeoutSec":60,"maxRunHistory":3},{"id":"exec-history-prune","schedule":"* * * * *","prompt":"History prune","enabled":true,"notify":"none","lastRunAt":"2026-01-01T00:00:00Z","lockTimeoutSec":60,"maxRunHistory":2,"runHistory":[{"runId":"old-1","scheduledAt":"2026-01-01T00:00:00Z","startedAt":"2026-01-01T00:00:00Z","finishedAt":"2026-01-01T00:00:00Z","status":"success","exitCode":0,"attempt":1,"notifyState":"none"},{"runId":"old-2","scheduledAt":"2026-01-01T00:01:00Z","startedAt":"2026-01-01T00:01:00Z","finishedAt":"2026-01-01T00:01:00Z","status":"success","exitCode":0,"attempt":1,"notifyState":"none"}]},{"id":"exec-retry","schedule":"* * * * *","prompt":"Fail retry","enabled":true,"notify":"none","lastRunAt":"2026-01-01T00:00:00Z","lockTimeoutSec":60,"retryPolicy":{"maxAttempts":3,"backoffSec":60,"backoffMultiplier":2,"maxBackoffSec":300}},{"id":"exec-retry-success","schedule":"0 0 * * *","prompt":"Run retry success","enabled":true,"notify":"none","lastRunAt":"2026-01-01T00:00:00Z","lockTimeoutSec":60,"retryPolicy":{"maxAttempts":3,"backoffSec":60},"retryState":{"scheduledAt":"2026-01-01T00:00:00Z","attempt":1,"retryEligibleAt":"2026-01-01T00:02:00Z","lastStatus":"failed","lastRunId":"r1"}}]}
+{"version":1,"tasks":[{"id":"exec-success","schedule":"* * * * *","prompt":"Run safely","enabled":true,"notify":"none","allowedTools":["Read","Grep"],"permissionMode":"dontAsk","lastRunAt":"2026-01-01T00:00:00Z","lockTimeoutSec":60},{"id":"exec-fail","schedule":"* * * * *","prompt":"Fail safely","enabled":true,"notify":"none","lastRunAt":"2026-01-01T00:00:00Z","lockTimeoutSec":60},{"id":"exec-disabled","schedule":"* * * * *","prompt":"Disabled","enabled":false,"notify":"none","lastRunAt":"2026-01-01T00:00:00Z","lockTimeoutSec":60},{"id":"exec-not-due","schedule":"0 0 * * *","prompt":"Not due","enabled":true,"notify":"none","lastRunAt":"2026-01-01T00:00:00Z","lockTimeoutSec":60},{"id":"exec-notify","schedule":"* * * * *","prompt":"Notify safely","enabled":true,"notify":"telegram-owner","redactProfile":"owner","lastRunAt":"2026-01-01T00:00:00Z","lockTimeoutSec":60},{"id":"exec-notify-fail","schedule":"* * * * *","prompt":"Notify Fail secret","enabled":true,"notify":"telegram-owner","redactProfile":"owner","lastRunAt":"2026-01-01T00:00:00Z","lockTimeoutSec":60},{"id":"exec-history","schedule":"* * * * *","prompt":"History safely","enabled":true,"notify":"none","lastRunAt":"2026-01-01T00:00:00Z","lockTimeoutSec":60,"maxRunHistory":3},{"id":"exec-history-prune","schedule":"* * * * *","prompt":"History prune","enabled":true,"notify":"none","lastRunAt":"2026-01-01T00:00:00Z","lockTimeoutSec":60,"maxRunHistory":2,"runHistory":[{"runId":"old-1","scheduledAt":"2026-01-01T00:00:00Z","startedAt":"2026-01-01T00:00:00Z","finishedAt":"2026-01-01T00:00:00Z","status":"success","exitCode":0,"attempt":1,"notifyState":"none"},{"runId":"old-2","scheduledAt":"2026-01-01T00:01:00Z","startedAt":"2026-01-01T00:01:00Z","finishedAt":"2026-01-01T00:01:00Z","status":"success","exitCode":0,"attempt":1,"notifyState":"none"}]},{"id":"exec-retry","schedule":"* * * * *","prompt":"Fail retry","enabled":true,"notify":"none","lastRunAt":"2026-01-01T00:00:00Z","lockTimeoutSec":60,"retryPolicy":{"maxAttempts":3,"backoffSec":60,"backoffMultiplier":2,"maxBackoffSec":300}},{"id":"exec-retry-success","schedule":"0 0 * * *","prompt":"Run retry success","enabled":true,"notify":"none","lastRunAt":"2026-01-01T00:00:00Z","lockTimeoutSec":60,"retryPolicy":{"maxAttempts":3,"backoffSec":60},"retryState":{"scheduledAt":"2026-01-01T00:00:00Z","attempt":1,"retryEligibleAt":"2026-01-01T00:02:00Z","lastStatus":"failed","lastRunId":"r1"}},{"id":"exec-once","schedule":"* * * * *","prompt":"Once safely","enabled":true,"notify":"none","lastRunAt":"2026-01-01T00:00:00Z","maxRuns":1},{"id":"exec-once-fail","schedule":"* * * * *","prompt":"Once Fail","enabled":true,"notify":"none","lastRunAt":"2026-01-01T00:00:00Z","maxRuns":1,"retryPolicy":{"maxAttempts":3,"backoffSec":60}}]}
 JSON
 FAKE_HEADLESS="$TMP/fake-headless-exec.sh"
 cat > "$FAKE_HEADLESS" <<'SH'
@@ -310,12 +315,14 @@ out="$(CCC_AGENT_CRON_STORE="$ONESHOT_STORE" CCC_HEADLESS_CMD="$FAKE_HEADLESS" b
 ok "keepAfterRun one-shot stays enabled" '[ "$rc" = 0 ] && jq -e ".oneShotDisabled == false" <<<"$out" >/dev/null && jq -e ".tasks[] | select(.id == \"oneshot-keep\" and .enabled == true)" "$ONESHOT_STORE" >/dev/null'
 
 CRUD_STORE="$TMP/crud-store/tasks.json"
-out="$(CCC_AGENT_CRON_STORE="$CRUD_STORE" bash "$CMD" add daily-report --schedule "0 9 * * *" --prompt "Daily report" --timezone Asia/Seoul --notify telegram-owner-on-failure --allowed-tools Read,Grep --json)"; rc=$?
-ok "add creates a task in a fresh store" '[ "$rc" = 0 ] && jq -e ".ok == true and .mutations.taskStoreWrite == true" <<<"$out" >/dev/null && jq -e ".tasks[] | select(.id == \"daily-report\" and .timezone == \"Asia/Seoul\" and .notify == \"telegram-owner-on-failure\" and .enabled == true)" "$CRUD_STORE" >/dev/null'
+out="$(CCC_AGENT_CRON_STORE="$CRUD_STORE" bash "$CMD" add daily-report --schedule "0 9 * * *" --prompt "Daily report" --timezone Asia/Seoul --notify telegram-owner-on-failure --allowed-tools Read,Grep --not-before 2026-08-01T00:00:00Z --max-runs 1 --json)"; rc=$?
+ok "add creates a bounded task in a fresh store" '[ "$rc" = 0 ] && jq -e ".ok == true and .mutations.taskStoreWrite == true" <<<"$out" >/dev/null && jq -e ".tasks[] | select(.id == \"daily-report\" and .timezone == \"Asia/Seoul\" and .notify == \"telegram-owner-on-failure\" and .notBefore == \"2026-08-01T00:00:00Z\" and .maxRuns == 1 and .enabled == true)" "$CRUD_STORE" >/dev/null'
 out="$(CCC_AGENT_CRON_STORE="$CRUD_STORE" bash "$CMD" add daily-report --schedule "@daily" --prompt "dup" --json 2>&1)"; rc=$?
 ok "add rejects duplicate id" '[ "$rc" = 1 ] && grep -q "already exists" <<<"$out"'
 out="$(CCC_AGENT_CRON_STORE="$CRUD_STORE" bash "$CMD" add bad-sched --schedule "not a schedule" --prompt "x" --json 2>&1)"; rc=$?
 ok "add rejects invalid schedule without writing" '[ "$rc" = 2 ] && ! jq -e ".tasks[] | select(.id == \"bad-sched\")" "$CRUD_STORE" >/dev/null'
+out="$(CCC_AGENT_CRON_STORE="$CRUD_STORE" bash "$CMD" add bad-bound --schedule "@daily" --prompt "x" --not-before never --json 2>&1)"; rc=$?
+ok "add rejects invalid not-before without writing" '[ "$rc" = 2 ] && ! jq -e ".tasks[] | select(.id == \"bad-bound\")" "$CRUD_STORE" >/dev/null'
 out="$(CCC_AGENT_CRON_STORE="$CRUD_STORE" bash "$CMD" add watchdog --schedule "every 30m" --prompt "disk watchdog" --argv sh --argv -c --argv "df -h" --timeout-sec 30 --json)"; rc=$?
 ok "add creates a command-payload task" '[ "$rc" = 0 ] && jq -e ".tasks[] | select(.id == \"watchdog\") | .payload.kind == \"command\" and .payload.argv == [\"sh\",\"-c\",\"df -h\"] and .payload.timeoutSec == 30" "$CRUD_STORE" >/dev/null'
 out="$(CCC_AGENT_CRON_STORE="$CRUD_STORE" bash "$CMD" disable watchdog --json)"; rc=$?
@@ -388,6 +395,14 @@ ok "run records last successful state and releases lock" 'jq -e ".tasks[] | sele
 out="$(CCC_AGENT_CRON_STORE="$EXEC_STORE" CCC_HEADLESS_CMD="$FAKE_HEADLESS" bash "$CMD" run exec-fail --json --at 2026-01-01T00:01:00Z 2>&1)"; rc=$?
 ok "run propagates headless failure" '[ "$rc" = 1 ] && jq -e ".ok == false and .status == \"failed\" and .headless.exitCode == 7" <<<"$out" >/dev/null'
 ok "run failure records state and releases lock" 'jq -e ".tasks[] | select(.id == \"exec-fail\" and .lastRunAt == \"2026-01-01T00:01:00Z\" and .lastStatus == \"failed\")" "$EXEC_STORE" >/dev/null && [ ! -e "$TMP/exec-store/locks/exec-fail.lock" ]'
+
+out="$(CCC_AGENT_CRON_STORE="$EXEC_STORE" CCC_HEADLESS_CMD="$FAKE_HEADLESS" bash "$CMD" run exec-once --json --at 2026-01-01T00:01:00Z)"; rc=$?
+ok "maxRuns disables a successful one-time task" '[ "$rc" = 0 ] && jq -e ".runLimit.reached == true and .runLimit.runCount == 1 and .runLimit.remainingRuns == 0" <<<"$out" >/dev/null && jq -e ".tasks[] | select(.id == \"exec-once\" and .enabled == false and .runCount == 1)" "$EXEC_STORE" >/dev/null'
+out="$(CCC_AGENT_CRON_STORE="$EXEC_STORE" CCC_HEADLESS_CMD="$FAKE_HEADLESS" bash "$CMD" run exec-once --json --at 2026-01-01T00:02:00Z)"; rc=$?
+ok "disabled one-time task cannot recur" '[ "$rc" = 0 ] && jq -e ".status == \"run-limit-reached\" and .mutations.headlessExecute == false" <<<"$out" >/dev/null'
+
+out="$(CCC_AGENT_CRON_STORE="$EXEC_STORE" CCC_HEADLESS_CMD="$FAKE_HEADLESS" bash "$CMD" run exec-once-fail --json --at 2026-01-01T00:01:00Z 2>&1)"; rc=$?
+ok "maxRuns also bounds failures and cancels retry" '[ "$rc" = 1 ] && jq -e ".status == \"failed\" and .runLimit.reached == true and .retry.cancelledByRunLimit == true" <<<"$out" >/dev/null && jq -e ".tasks[] | select(.id == \"exec-once-fail\" and .enabled == false and .runCount == 1 and (has(\"retryState\") | not))" "$EXEC_STORE" >/dev/null'
 
 mkdir -p "$TMP/exec-store/locks"
 boot_id="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || true)"

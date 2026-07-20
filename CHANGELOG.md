@@ -4,6 +4,12 @@ All notable changes to the Claude Code node harness. Dates are KST.
 
 ## [Unreleased]
 
+### Added
+- Agent-cron can now install an ephemeral Codex headless runner with an
+  explicit fail-closed sandbox choice. Bounded tasks support `notBefore`,
+  `maxRuns`, and durable `runCount`, so a future one-time LLM job cannot catch
+  up last year's cron occurrence or remain enabled after its allowed run.
+
 ### Fixed
 - Linux systemd installs now use `Restart=always` so a direct SIGTERM that the
   bridge handles as a clean exit cannot silently leave Telegram serving down.

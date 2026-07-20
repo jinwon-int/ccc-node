@@ -7,7 +7,7 @@
 - `scripts/agent-cron.sh add <task-id> --schedule EXPR --prompt TEXT [flags] [--json]` —
   create a task (validated, atomic write; no execution). See `--help` for flags
   (timezone, notify, allowed-tools, payload `--argv/--cwd/--model/--timeout-sec`,
-  `--keep-after-run`, `--disabled`, ...).
+  `--not-before`, `--max-runs`, `--keep-after-run`, `--disabled`, ...).
 - `scripts/agent-cron.sh edit <task-id> [same flags as add] [--json]` — set-only
   partial update (schedule/timezone re-validated; payload flags merge, `--argv`
   replaces the whole argv). No clear semantics — unset by remove+add.
@@ -19,6 +19,24 @@
 - `scripts/agent-cron.sh run <task-id> --dry-run` — execution-plan preview only.
 - `scripts/agent-cron.sh scheduler --dry-run` — one scheduler tick preview.
 - `scripts/agent-cron.sh scheduler --execute` — explicit one-shot execution path for an already-approved scheduler unit.
+
+## Headless runners
+
+The installer defaults to the existing Claude runner. Use `--runner codex` to
+install the ephemeral Codex runner instead. Codex defaults to
+`CCC_CODEX_SANDBOX=read-only`, sets non-interactive approval policy to `never`,
+and never persists a Codex session. Broader sandboxes require an explicit
+`--codex-sandbox` choice at installation time.
+
+Tasks may set `maxRuns` to a positive integer. For those bounded tasks, every
+completed headless invocation, successful or failed, increments durable
+`runCount`; reaching the limit disables the task and cancels any pending retry.
+This makes `maxRuns: 1`
+safe for one-time LLM jobs without leaving an annually recurring cron enabled.
+Set `notBefore` to the intended UTC activation timestamp so a newly-created
+annual cron expression cannot catch up an occurrence from the previous year.
+For example, a July 22 one-time job uses its normal five-field schedule,
+`notBefore: 2026-07-22T02:27:00Z`, and `maxRuns: 1`.
 
 ## Schedule forms
 

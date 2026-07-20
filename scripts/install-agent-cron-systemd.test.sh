@@ -78,5 +78,16 @@ okc "$RC" 2 "invalid service name exits 2"
 run env CCC_SYSTEMD_DIR="$TMP/sd4" CCC_SYSTEMCTL="$STUB" bash "$SC" --apply --on-calendar '*-*-* 04:00:00' --no-enable --no-restart
 ok "custom OnCalendar honored" 'grep -q "OnCalendar=\*-\*-\* 04:00:00" "$TMP/sd4/ccc-agent-cron.timer"'
 
+# ---- Codex runner: explicit, ephemeral runner with fail-closed sandbox -----
+run env CCC_SYSTEMD_DIR="$TMP/sd5" CCC_SYSTEMCTL="$STUB" bash "$SC" --apply --runner codex --codex-sandbox read-only --no-enable --no-restart
+okc "$RC" 0 "Codex runner apply exits 0"
+ok "Codex runner path selected" 'grep -q "Environment=CCC_HEADLESS_CMD=.*/codex/headless.sh" "$TMP/sd5/ccc-agent-cron.service"'
+ok "Codex read-only sandbox recorded" 'grep -q "Environment=CCC_CODEX_SANDBOX=read-only" "$TMP/sd5/ccc-agent-cron.service"'
+
+run env CCC_SYSTEMD_DIR="$TMP/sd6" CCC_SYSTEMCTL="$STUB" bash "$SC" --apply --runner nope
+okc "$RC" 2 "invalid runner exits 2"
+run env CCC_SYSTEMD_DIR="$TMP/sd6" CCC_SYSTEMCTL="$STUB" bash "$SC" --apply --runner codex --codex-sandbox nope
+okc "$RC" 2 "invalid Codex sandbox exits 2"
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
