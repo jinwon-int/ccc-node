@@ -462,6 +462,28 @@ class UsageMeter:
             for counters in modes.values()
         )
 
+    def period_usage(self, *, days: int = 7) -> dict[str, dict[str, int]]:
+        """Body-free per-provider totals across the trailing ``days`` buckets.
+
+        Complements rolling_usage (sub-day event ring) with the durable daily
+        counters so week-scale quota windows can be estimated locally.
+        """
+
+        if days <= 0:
+            raise ValueError("days must be positive")
+        today = datetime.strptime(self.current_day(), "%Y-%m-%d").replace(tzinfo=_KST)
+        totals: dict[str, dict[str, int]] = {}
+        for offset in range(days):
+            day = (today - timedelta(days=offset)).strftime("%Y-%m-%d")
+            for provider, modes in self._days.get(day, {}).items():
+                bucket = totals.setdefault(provider, {"requests": 0, "tokens": 0})
+                for counters in modes.values():
+                    bucket["requests"] += _clamped_count(counters.get("requests"))
+                    bucket["tokens"] += _clamped_count(
+                        counters.get("input_tokens")
+                    ) + _clamped_count(counters.get("output_tokens"))
+        return totals
+
     # -- recording -----------------------------------------------------------
 
     def record(

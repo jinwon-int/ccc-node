@@ -182,45 +182,58 @@ def local_claude_environment_snapshot() -> UsageSnapshot:
     )
 
 
-_SERVICE_WINDOW_SPECS: dict[str, tuple[str, str]] = {
-    # service -> (window label, env var carrying the operator-configured
-    # request limit for that window). Kimi publishes no per-tier limits over
-    # its API, so the limit is read from local config when the operator
-    # provides it; without one the window stays count-only.
-    "Kimi Code": ("Kimi 5-hour", "CCC_USAGE_KIMI_5H_REQUEST_LIMIT"),
+_SERVICE_WINDOW_SPECS: dict[str, tuple[tuple[str, str, str, str], ...]] = {
+    # service -> ((label, limit env var, usage source, count unit), ...).
+    # Kimi publishes no per-tier limits over its API, so limits come from
+    # operator-configured env (read from the Kimi Code Console once). The
+    # 5-hour window degrades to count-only without a limit; the weekly
+    # window is percent-only and is skipped entirely without one (its 7-day
+    # totals are already shown in the meter section).
+    "Kimi Code": (
+        ("Kimi 5-hour", "CCC_USAGE_KIMI_5H_REQUEST_LIMIT", "rolling", "req"),
+        ("Kimi weekly", "CCC_USAGE_KIMI_WEEKLY_TOKEN_LIMIT", "weekly", "tok"),
+    ),
 }
 
 
 def synthesize_service_windows(
-    service: str | None, rolling: Mapping[str, int] | None
+    service: str | None,
+    rolling: Mapping[str, int] | None,
+    weekly: Mapping[str, int] | None = None,
 ) -> tuple[UsageWindow, ...]:
     """Build count-only local-estimate windows for services without quota APIs.
 
-    *rolling* is the meter's trailing-window aggregate for this provider
-    (``{"requests": int, "tokens": int}``). Real rate-limit data always wins:
-    callers must only synthesize when no observed windows exist. When the
-    operator configured the window's request limit via env (e.g. from the
-    Kimi Code Console), the window also carries it so the renderer can show
-    used/limit and the remaining count.
+    *rolling* is the meter's trailing-5h aggregate and *weekly* its trailing
+    7-day aggregate (``{"requests": int, "tokens": int}``). Real rate-limit
+    data always wins: callers must only synthesize when no observed windows
+    exist. When the operator configured a window's limit via env (e.g. from
+    the Kimi Code Console), the window carries it so the renderer can show
+    used/limit and the used/left percentages.
     """
-    if service is None or not rolling:
+    if service is None:
         return ()
-    spec = _SERVICE_WINDOW_SPECS.get(service)
-    if spec is None:
-        return ()
-    label, limit_env = spec
-    requests = rolling.get("requests")
-    if isinstance(requests, bool) or not isinstance(requests, int) or requests < 0:
-        return ()
-    return (
-        UsageWindow(
-            label=label,
-            used_percent=None,
-            used_count=requests,
-            count_unit="req",
-            count_limit=_env_int(limit_env, maximum=10**7),
-        ),
-    )
+    windows: list[UsageWindow] = []
+    for label, limit_env, source_key, unit in _SERVICE_WINDOW_SPECS.get(service, ()):
+        source = rolling if source_key == "rolling" else weekly
+        if not source:
+            continue
+        limit = _env_int(limit_env, maximum=10**7 if unit == "req" else 10**12)
+        if source_key == "weekly" and limit is None:
+            continue
+        field = "requests" if unit == "req" else "tokens"
+        used = source.get(field)
+        if isinstance(used, bool) or not isinstance(used, int) or used < 0:
+            continue
+        windows.append(
+            UsageWindow(
+                label=label,
+                used_percent=None,
+                used_count=used,
+                count_unit=unit,
+                count_limit=limit,
+            )
+        )
+    return tuple(windows)
 
 
 def _window(label: str, value: object) -> UsageWindow | None:

@@ -629,3 +629,22 @@ class RollingWindowTests(UsageMeterTestCase):
         meter.record("claude", MODE_INTERACTIVE, input_tokens=30, requests=1)
         report = meter.render_report(rolling_seconds=1800)
         self.assertIn("last 30m (local): 1 req · 30 tok", report)
+
+
+class PeriodUsageTests(UsageMeterTestCase):
+    def test_period_usage_aggregates_trailing_day_buckets(self) -> None:
+        meter = self.make_meter()
+        self.now = FIXED_NOW - 8 * 86400
+        meter.record("claude", MODE_INTERACTIVE, input_tokens=1000, requests=1)
+        self.now = FIXED_NOW - 2 * 86400
+        meter.record("claude", MODE_AUTONOMOUS, input_tokens=2000, requests=2)
+        self.now = FIXED_NOW
+        meter.record("claude", MODE_INTERACTIVE, input_tokens=3000, output_tokens=50, requests=3)
+
+        period = meter.period_usage(days=7)
+        self.assertEqual(period["claude"], {"requests": 5, "tokens": 5050})
+
+    def test_period_usage_validates_days(self) -> None:
+        meter = self.make_meter()
+        with self.assertRaises(ValueError):
+            meter.period_usage(days=0)
