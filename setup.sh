@@ -305,38 +305,47 @@ if [ ! -e "$CLAUDE_DIR/settings.local.json" ]; then
 else
   note "settings.local.json already present — left untouched (node-local approvals)"
 fi
-run cp "$SRC/claude/hooks/lib/spawn-detached.sh" "$CLAUDE_DIR/hooks/lib/spawn-detached.sh"
-# Shared hook helpers (#584 P0-3): memory/distill/skill hooks hard-source this
-# and no-op (exit 0) when it is missing, so it must ship with the hooks.
-run cp "$SRC/claude/hooks/lib/hook-common.sh" "$CLAUDE_DIR/hooks/lib/hook-common.sh"
-# Shared audience-scope validation (#584 P1-2): load/refresh memory hooks
-# hard-source this; a missing lib no-ops the hook (fail-safe).
-run cp "$SRC/claude/hooks/lib/memory-common.sh" "$CLAUDE_DIR/hooks/lib/memory-common.sh"
-# Portable mtime pruning (#449): checkpoint.sh and distill.sh source this lib
-# behind an if-readable guard, so leaving it uninstalled silently disables
-# state/checkpoint pruning on every standalone node (unbounded growth).
-run cp "$SRC/claude/hooks/lib/mtime-prune.sh" "$CLAUDE_DIR/hooks/lib/mtime-prune.sh"
+# Hook tree deployment (#569): every deployable file under claude/hooks/ is
+# discovered by the shared walk (ccc_hook_tree_files in scripts/lib/harness-paths.sh)
+# instead of a hand-maintained list — the same convention validate-harness.sh
+# checks, so a new hook or lib file ships the moment it lands in the tree
+# (lib/mtime-prune.sh was missed by the old 3-place hand list, silently
+# disabling standalone pruning fleet-wide, #564). Subdirectories (lib/, distill/,
+# skill-review/) deploy recursively preserving structure; every deployed file is
+# installed executable, matching the historical per-file chmod list.
+mapfile -t hook_tree_files < <(ccc_hook_tree_files "$SRC")
+if [ "${#hook_tree_files[@]}" -eq 0 ]; then
+  echo "ERROR: hook-tree walk found no deployable hooks under $SRC/claude/hooks" >&2
+  exit 2
+fi
+# Dedup on RELATIVE dirs (repo-controlled, newline-free): $CLAUDE_DIR is
+# operator input and may contain characters a line-based dedup would mangle.
+hook_tree_rel_dirs=()
+for _hook_rel in "${hook_tree_files[@]}"; do
+  case "$_hook_rel" in
+    */*) hook_tree_rel_dirs+=("${_hook_rel%/*}") ;;
+  esac
+done
+hook_tree_dirs=("$CLAUDE_DIR/hooks")
+if [ "${#hook_tree_rel_dirs[@]}" -gt 0 ]; then
+  while IFS= read -r _hook_rel_dir; do
+    hook_tree_dirs+=("$CLAUDE_DIR/hooks/$_hook_rel_dir")
+  done < <(printf '%s\n' "${hook_tree_rel_dirs[@]}" | LC_ALL=C sort -u)
+fi
+run mkdir -p "${hook_tree_dirs[@]}"
+hook_tree_targets=()
+for _hook_rel in "${hook_tree_files[@]}"; do
+  run cp "$SRC/claude/hooks/$_hook_rel" "$CLAUDE_DIR/hooks/$_hook_rel"
+  hook_tree_targets+=("$CLAUDE_DIR/hooks/$_hook_rel")
+done
+# Files deployed INTO hooks/ from OUTSIDE claude/hooks/ keep explicit cp lines —
+# the walk covers only the claude/hooks/ tree.
 run cp "$SRC/scripts/lib/harness-paths.sh" "$CLAUDE_DIR/hooks/lib/harness-paths.sh"
 run cp "$SRC/scripts/lib/harness_paths.py" "$CLAUDE_DIR/hooks/lib/harness_paths.py"
-# Memory rendering/budget/bounded-search module (#584 P2-1): load-memory.sh
-# invokes this instead of inline heredocs; without it the hook fails open to
-# raw/unfiltered fallbacks, so it must ship alongside the hook.
-run cp "$SRC/claude/hooks/lib/memory_render.py" "$CLAUDE_DIR/hooks/lib/memory_render.py"
-run cp "$SRC/claude/hooks/load-memory.sh" "$CLAUDE_DIR/hooks/load-memory.sh"
 # Codex launch boundary: the launcher and materializer are installed beside
 # load-memory.sh so every direct/app-server run reuses the same snapshot policy.
 run cp "$SRC/scripts/ccc-codex" "$CLAUDE_DIR/hooks/ccc-codex"
 run cp "$SRC/scripts/ccc_codex_memory.py" "$CLAUDE_DIR/hooks/ccc_codex_memory.py"
-run cp "$SRC/claude/hooks/refresh-memory.sh" "$CLAUDE_DIR/hooks/refresh-memory.sh"
-run cp "$SRC/claude/hooks/scan-injection.sh" "$CLAUDE_DIR/hooks/scan-injection.sh"
-run cp "$SRC/claude/hooks/load-tools.sh" "$CLAUDE_DIR/hooks/load-tools.sh"
-run cp "$SRC/claude/hooks/checkpoint.sh" "$CLAUDE_DIR/hooks/checkpoint.sh"
-run cp "$SRC/claude/hooks/audit.sh" "$CLAUDE_DIR/hooks/audit.sh"
-run cp "$SRC/claude/hooks/redact.sh" "$CLAUDE_DIR/hooks/redact.sh"
-run cp "$SRC/claude/hooks/notify.sh" "$CLAUDE_DIR/hooks/notify.sh"
-run cp "$SRC/claude/hooks/evidence-gate.sh" "$CLAUDE_DIR/hooks/evidence-gate.sh"
-run cp "$SRC/claude/hooks/statusline.sh" "$CLAUDE_DIR/hooks/statusline.sh"
-run cp "$SRC/claude/hooks/statusline-usage.py" "$CLAUDE_DIR/hooks/statusline-usage.py"
 # Memory helper tools used by load-memory.sh / refresh-memory.sh in standalone installs.
 run cp "$SRC/scripts/ccc-memory-index.sh" "$CLAUDE_DIR/hooks/ccc-memory-index.sh"
 run cp "$SRC/scripts/ccc_memory_index.py" "$CLAUDE_DIR/hooks/ccc_memory_index.py"
@@ -349,50 +358,22 @@ run cp "$SRC/scripts/ccc-memory-explain.sh" "$CLAUDE_DIR/hooks/ccc-memory-explai
 run cp "$SRC/scripts/ccc-wiki-triage.sh" "$CLAUDE_DIR/hooks/ccc-wiki-triage.sh"
 run cp "$SRC/scripts/ccc-memory-eval.sh" "$CLAUDE_DIR/hooks/ccc-memory-eval.sh"
 run cp "$SRC/scripts/ccc-memory-benchmark-export.sh" "$CLAUDE_DIR/hooks/ccc-memory-benchmark-export.sh"
-# Session Distiller — PreCompact/SessionEnd trans → Haiku (OAuth) → Honcho push + wiki-candidates queue.
-# See pages/team/dungae/DECISIONS.md [TM-1058] for design rationale.
-run cp "$SRC/claude/hooks/distill.sh" "$CLAUDE_DIR/hooks/distill.sh"
-run mkdir -p "$CLAUDE_DIR/hooks/distill"
-run cp "$SRC/claude/hooks/distill/extract.sh" "$CLAUDE_DIR/hooks/distill/extract.sh"
-run cp "$SRC/claude/hooks/distill/honcho-push.sh" "$CLAUDE_DIR/hooks/distill/honcho-push.sh"
-run cp "$SRC/claude/hooks/distill/wiki-queue.sh" "$CLAUDE_DIR/hooks/distill/wiki-queue.sh"
-run cp "$SRC/claude/hooks/distill/queue-drain.sh" "$CLAUDE_DIR/hooks/distill/queue-drain.sh"
-run cp "$SRC/claude/hooks/distill/pending-drain.sh" "$CLAUDE_DIR/hooks/distill/pending-drain.sh"
-run cp "$SRC/claude/hooks/distill/local-facts.sh" "$CLAUDE_DIR/hooks/distill/local-facts.sh"
-run cp "$SRC/claude/hooks/distill/resume-write.sh" "$CLAUDE_DIR/hooks/distill/resume-write.sh"
-# Skill Review — Hermes-style background skill draft staging (human-approved by
-# default; autoinstall.sh adds the opt-in unattended auto mode, #355).
-run cp "$SRC/claude/hooks/skill-review.sh" "$CLAUDE_DIR/hooks/skill-review.sh"
-run mkdir -p "$CLAUDE_DIR/hooks/skill-review"
-run cp "$SRC/claude/hooks/skill-review/extract.sh" "$CLAUDE_DIR/hooks/skill-review/extract.sh"
-run cp "$SRC/claude/hooks/skill-review/autoinstall.sh" "$CLAUDE_DIR/hooks/skill-review/autoinstall.sh"
 # Skill autosave sweep — covers bridge/SDK sessions that never fire SessionEnd
 # hooks; scheduled separately via scripts/install-skill-autosave-cron.sh.
 run cp "$SRC/scripts/ccc-skill-autosave.sh" "$CLAUDE_DIR/hooks/ccc-skill-autosave.sh"
 # Self-update — the pre-approved node maintenance procedure (pull + setup +
 # restart of operator-allowlisted services only; see docs/self-update.md).
 run cp "$SRC/scripts/ccc-self-update.sh" "$CLAUDE_DIR/hooks/ccc-self-update.sh"
+# Executable files copied into hooks/ from OUTSIDE the claude/hooks/ tree.
+# (ccc_memory_index.py / ccc_memory_search.py are deliberately NOT here: they
+# are python modules invoked via their .sh wrappers and are installed 644.)
+# The hook-tree files discovered by the walk above are chmod'd alongside them —
+# every deployed hook-tree file is executable by convention (#569).
 installed_hook_scripts=(
-  "$CLAUDE_DIR/hooks/lib/spawn-detached.sh"
-  "$CLAUDE_DIR/hooks/lib/hook-common.sh"
-  "$CLAUDE_DIR/hooks/lib/memory-common.sh"
-  "$CLAUDE_DIR/hooks/lib/mtime-prune.sh"
   "$CLAUDE_DIR/hooks/lib/harness-paths.sh"
   "$CLAUDE_DIR/hooks/lib/harness_paths.py"
-  "$CLAUDE_DIR/hooks/lib/memory_render.py"
-  "$CLAUDE_DIR/hooks/load-memory.sh"
   "$CLAUDE_DIR/hooks/ccc-codex"
   "$CLAUDE_DIR/hooks/ccc_codex_memory.py"
-  "$CLAUDE_DIR/hooks/refresh-memory.sh"
-  "$CLAUDE_DIR/hooks/scan-injection.sh"
-  "$CLAUDE_DIR/hooks/load-tools.sh"
-  "$CLAUDE_DIR/hooks/checkpoint.sh"
-  "$CLAUDE_DIR/hooks/audit.sh"
-  "$CLAUDE_DIR/hooks/redact.sh"
-  "$CLAUDE_DIR/hooks/notify.sh"
-  "$CLAUDE_DIR/hooks/evidence-gate.sh"
-  "$CLAUDE_DIR/hooks/statusline.sh"
-  "$CLAUDE_DIR/hooks/statusline-usage.py"
   "$CLAUDE_DIR/hooks/ccc-memory-index.sh"
   "$CLAUDE_DIR/hooks/ccc-memory-search.sh"
   "$CLAUDE_DIR/hooks/ccc-memory-consolidate.sh"
@@ -402,21 +383,10 @@ installed_hook_scripts=(
   "$CLAUDE_DIR/hooks/ccc-wiki-triage.sh"
   "$CLAUDE_DIR/hooks/ccc-memory-eval.sh"
   "$CLAUDE_DIR/hooks/ccc-memory-benchmark-export.sh"
-  "$CLAUDE_DIR/hooks/distill.sh"
-  "$CLAUDE_DIR/hooks/distill/extract.sh"
-  "$CLAUDE_DIR/hooks/distill/honcho-push.sh"
-  "$CLAUDE_DIR/hooks/distill/wiki-queue.sh"
-  "$CLAUDE_DIR/hooks/distill/queue-drain.sh"
-  "$CLAUDE_DIR/hooks/distill/pending-drain.sh"
-  "$CLAUDE_DIR/hooks/distill/local-facts.sh"
-  "$CLAUDE_DIR/hooks/distill/resume-write.sh"
-  "$CLAUDE_DIR/hooks/skill-review.sh"
-  "$CLAUDE_DIR/hooks/skill-review/extract.sh"
-  "$CLAUDE_DIR/hooks/skill-review/autoinstall.sh"
   "$CLAUDE_DIR/hooks/ccc-skill-autosave.sh"
   "$CLAUDE_DIR/hooks/ccc-self-update.sh"
 )
-run chmod +x "${installed_hook_scripts[@]}"
+run chmod +x "${installed_hook_scripts[@]}" "${hook_tree_targets[@]}"
 # Tier 3: status line (node·model·git·context·cost·A2A) wired via settings.json statusLine.
 # Output style (한국어 구조화 보고) — node-agnostic; settings.json activates it as outputStyle.
 run mkdir -p "$CLAUDE_DIR/output-styles"
@@ -515,7 +485,7 @@ if [ "$CLAUDE_DIR" != "/root/.claude" ] || [ "$SRC" != "/opt/ccc-node" ]; then
       "$CLAUDE_DIR/headless.sh"
       "$CLAUDE_DIR/hooks/ccc_memory_index.py"
       "$CLAUDE_DIR/hooks/ccc_memory_search.py"
-      "${installed_hook_scripts[@]}" "${SEEDED[@]}"
+      "${installed_hook_scripts[@]}" "${hook_tree_targets[@]}" "${SEEDED[@]}"
     )
     for source_tree in output-styles agents commands skills; do
       while IFS= read -r -d '' source_file; do

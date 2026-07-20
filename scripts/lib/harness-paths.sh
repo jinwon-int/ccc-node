@@ -14,6 +14,38 @@ CCC_MANAGED_PATHS=(
   agents commands skills CLAUDE.md memories
 )
 
+# Deployable hook inventory (#569) — the SINGLE convention for which files under
+# claude/hooks/ are installed to <claude-dir>/hooks. setup.sh deploys exactly
+# this set (recursively, preserving structure, every file executable) and
+# scripts/validate-harness.sh derives its expected-hooks set from the same walk,
+# so adding a hook or lib file to the tree ships it everywhere with no list to
+# update (the old 3-place hand list silently dropped lib/mtime-prune.sh, #564).
+#
+# A file under claude/hooks/ is DEPLOYED unless it is:
+#   - a test suite (*.test.sh) or the shared test fixture (lib/test-stub.sh),
+#   - Python bytecode (__pycache__/ directories, *.pyc),
+#   - documentation (*.md — tools-cheatsheet.md is SEEDED separately, only when
+#     absent, because nodes may customize it),
+#   - hook WIRING consumed at settings-compose/plugin time, never deployed as a
+#     file (hooks.json, enforcement-overlay.json).
+# validate-harness.sh cross-checks this exclusion list against the walk output,
+# so an accidental new exclusion fails CI instead of silently not shipping.
+ccc_hook_tree_files() { # <repo-root> — emit deployable paths relative to claude/hooks/, sorted
+  local hooks_root="$1/claude/hooks"
+  [ -d "$hooks_root" ] || return 1
+  (
+    cd "$hooks_root" || exit 1
+    find . -name __pycache__ -prune -o -type f \
+      ! -name '*.test.sh' \
+      ! -name 'test-stub.sh' \
+      ! -name '*.pyc' \
+      ! -name '*.md' \
+      ! -name 'hooks.json' \
+      ! -name 'enforcement-overlay.json' \
+      -print
+  ) | sed 's|^\./||' | LC_ALL=C sort
+}
+
 _ccc_require_path_validator() {
   command -v python3 >/dev/null 2>&1 || {
     printf '%s\n' "$1" >&2

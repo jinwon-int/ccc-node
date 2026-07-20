@@ -214,6 +214,17 @@ codex_dry_out="$(HOME="$nonroot_home" CCC_CLAUDE_DIR="$nonroot_claude" CCC_HERME
 ok "setup non-root dry-run includes both Codex managed launch artifacts" \
   '[ "$codex_dry_rc" = 0 ] && grep -Fq "$nonroot_claude/hooks/ccc-codex" <<<"$codex_dry_out" && grep -Fq "$nonroot_claude/hooks/ccc_codex_memory.py" <<<"$codex_dry_out"'
 
+# --- #569: hook-tree walk — deploys recursively, excludes tests/bytecode/wiring,
+# and dry-run only RENDERS the walk (no copies). rewrite_claude is a real install.
+ok "hook-tree walk deploys nested lib/ and distill/ files preserving structure" \
+  '[ -x "$rewrite_claude/hooks/lib/hook-common.sh" ] && [ -x "$rewrite_claude/hooks/distill/resume-write.sh" ] && [ -x "$rewrite_claude/hooks/skill-review/autoinstall.sh" ] && cmp -s "$ROOT/claude/hooks/distill/resume-write.sh" "$rewrite_claude/hooks/distill/resume-write.sh"'
+ok "hook-tree walk installs top-level hooks executable including .py collectors" \
+  '[ -x "$rewrite_claude/hooks/checkpoint.sh" ] && [ -x "$rewrite_claude/hooks/scan-injection.sh" ] && [ -x "$rewrite_claude/hooks/statusline-usage.py" ]'
+ok "hook-tree walk excludes tests, fixtures, bytecode, and settings-compose wiring" \
+  '[ ! -e "$rewrite_claude/hooks/redact.test.sh" ] && [ ! -e "$rewrite_claude/hooks/distill/extract.test.sh" ] && [ ! -e "$rewrite_claude/hooks/lib/test-stub.sh" ] && [ ! -e "$rewrite_claude/hooks/__pycache__" ] && [ ! -e "$rewrite_claude/hooks/hooks.json" ] && [ ! -e "$rewrite_claude/hooks/enforcement-overlay.json" ]'
+ok "hook-tree walk dry-run renders nested hook copies without writing anything" \
+  '[ "$codex_dry_rc" = 0 ] && grep -Fq "$nonroot_claude/hooks/distill/resume-write.sh" <<<"$codex_dry_out" && grep -Fq "$nonroot_claude/hooks/lib/mtime-prune.sh" <<<"$codex_dry_out" && [ ! -e "$nonroot_claude" ]'
+
 # --- #454: settings.local.json is node-local — seeded if absent, never clobbered ---
 seed_home="$TMP/seed-home"; seed_claude="$TMP/seed-claude"; seed_hermes="$TMP/seed-hermes"
 HOME="$seed_home" CCC_CLAUDE_DIR="$seed_claude" CCC_HERMES_DIR="$seed_hermes" \
