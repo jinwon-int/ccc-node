@@ -195,10 +195,13 @@ else:
     add('위험', 'scan-injection.sh', 'missing from repo', 'restore memory-injection scanner')
 
 setup = repo / 'setup.sh'
-if setup.exists() and 'scan-injection.sh' in setup.read_text(encoding='utf-8', errors='replace'):
-    add('정상', 'scanner install wiring', 'setup.sh installs scan-injection.sh', 'none')
+setup_text = setup.read_text(encoding='utf-8', errors='replace') if setup.exists() else ''
+# setup.sh deploys the whole claude/hooks tree via the shared hook-tree walk
+# (ccc_hook_tree_files, #569); an explicit per-file cp is the legacy form.
+if 'ccc_hook_tree_files' in setup_text or 'scan-injection.sh' in setup_text:
+    add('정상', 'scanner install wiring', 'setup.sh installs scan-injection.sh (hook-tree walk)', 'none')
 else:
-    add('위험', 'scanner install wiring', 'setup.sh does not install scan-injection.sh', 'restore setup.sh copy step')
+    add('위험', 'scanner install wiring', 'setup.sh does not install scan-injection.sh', 'restore setup.sh hook-tree deployment')
 
 # Metadata-only content scans.
 scan_tree('push spool redaction', spool_dir)

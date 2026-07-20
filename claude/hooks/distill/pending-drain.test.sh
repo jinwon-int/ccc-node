@@ -117,8 +117,10 @@ wait_for 'grep -q "pending retained reason=pipeline-failed" "$STATE/distill.log"
 ok "failed extraction keeps one retryable pending job" \
   '[ "$(find "$STATE/distill-pending" -maxdepth 1 -type f -name "*.json" | wc -l)" = 1 ]'
 
+# setup.sh deploys (and chmods) the whole claude/hooks tree via the shared
+# hook-tree walk (#569) — assert the launcher is in the walk's deployable set.
 ok "setup installs and chmods the recovery launcher" \
-  'grep -Fq '\''cp "$SRC/claude/hooks/distill/pending-drain.sh"'\'' "$ROOT/setup.sh" && grep -Fq '\''"$CLAUDE_DIR/hooks/distill/pending-drain.sh"'\'' "$ROOT/setup.sh"'
+  '. "$ROOT/scripts/lib/harness-paths.sh" && ccc_hook_tree_files "$ROOT" | grep -Fxq "distill/pending-drain.sh" && grep -Fq '\''ccc_hook_tree_files "$SRC"'\'' "$ROOT/setup.sh"'
 ok "SessionStart schedules bounded pending recovery" \
   'jq -e '\''[.hooks.SessionStart[].hooks[].command] | any(contains("distill/pending-drain.sh"))'\'' "$ROOT/claude/settings.base.json" >/dev/null'
 

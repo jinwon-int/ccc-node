@@ -13,10 +13,15 @@ export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER
 
 # Keep fixtures hermetic when the operator shell exports live self-update
 # settings. In particular, a real busy health file must not defer every fixture
-# update before the tests install their own health file in section 7.
+# update before the tests install their own health file in section 7. Unsetting
+# CCC_SELF_UPDATE_HEALTH_FILE is NOT enough: the script then falls back to the
+# node's real ~/.telegram_bot/health.json, and on a node whose bridge is
+# actively serving a session every fixture update defers (rc=8) and the suite
+# mass-fails. Point it at a nonexistent fixture path instead (fail-open).
 unset CCC_SELF_UPDATE_BRANCH CCC_SELF_UPDATE_SERVICES
-unset CCC_SELF_UPDATE_HEALTH_FILE CCC_SELF_UPDATE_HEALTH_FRESH_SECONDS
+unset CCC_SELF_UPDATE_HEALTH_FRESH_SECONDS
 unset CCC_SELF_UPDATE_BUSY_MAX_SECONDS CCC_SELF_UPDATE_MAX_DEFER_SECONDS
+export CCC_SELF_UPDATE_HEALTH_FILE="$TMP/no-such-health.json"
 
 # Fixture: origin repo with a stub setup.sh, plus a node-side clone.
 ORIGIN="$TMP/origin.git"
@@ -226,7 +231,8 @@ out="$(run_selfup run 2>&1)"; rc=$?
 ok "deferral cap exceeded proceeds despite busy" '[ "$rc" = 0 ]'
 ok "deferral marker cleared after proceeding" '[ ! -f "$STATE/self-update.deferred-since" ]'
 
-rm -f "$HFILE"; unset CCC_SELF_UPDATE_HEALTH_FILE
+# Back to the hermetic nonexistent health file (never the node's real one).
+rm -f "$HFILE"; export CCC_SELF_UPDATE_HEALTH_FILE="$TMP/no-such-health.json"
 
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

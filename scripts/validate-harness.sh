@@ -294,15 +294,45 @@ done
 # 6a) every referenced hook must ALSO be installed by setup.sh — a hook that exists in the
 # repo but is not copied to ~/.claude would be referenced-but-missing on a real install
 # (e.g. evidence-gate.sh was added to the Stop hook but initially omitted from setup.sh).
-say "== referenced hooks installed by setup.sh =="
+# setup.sh no longer hand-lists hook cps: it deploys the shared hook-tree walk
+# (ccc_hook_tree_files, scripts/lib/harness-paths.sh). Derive the expected set from
+# the SAME walk so installer and validator share one convention (#569; the 3-way
+# hand-list drift behind the #564 mtime-prune miss).
+say "== referenced hooks installed by setup.sh (shared hook-tree walk) =="
+# shellcheck source=lib/harness-paths.sh
+. scripts/lib/harness-paths.sh
+if grep -q 'ccc_hook_tree_files "\$SRC"' setup.sh 2>/dev/null; then
+  say "  ok setup.sh deploys hooks via the shared ccc_hook_tree_files walk"
+else
+  err "setup.sh does not deploy hooks via the shared ccc_hook_tree_files walk"
+fi
+mapfile -t DEPLOYED < <(ccc_hook_tree_files "$ROOT")
+[ "${#DEPLOYED[@]}" -gt 0 ] || err "hook-tree walk found no deployable hooks under claude/hooks"
 for r in "${REFS[@]}"; do
   hook="$(basename "$r")"
-  if grep -Fq "run cp \"\$SRC/claude/hooks/$hook\"" setup.sh 2>/dev/null; then
+  if printf '%s\n' "${DEPLOYED[@]}" | grep -Fxq -- "$hook"; then
     say "  ok setup.sh installs $hook"
   else
-    err "setup.sh does not install referenced hook: $hook"
+    err "setup.sh does not install referenced hook: $hook (excluded from the hook-tree walk)"
   fi
 done
+# Full-tree exclusion parity: every file the walk SKIPS must match a documented
+# non-deployable pattern (tests/fixtures, bytecode, docs, settings-compose wiring).
+# An accidental new exclusion in ccc_hook_tree_files — or a deployable file that
+# a future pattern mistakenly swallows — fails here instead of silently shipping
+# an install that is missing the file.
+tree_parity_ok=1
+while IFS= read -r f; do
+  printf '%s\n' "${DEPLOYED[@]}" | grep -Fxq -- "$f" && continue
+  case "$f" in
+    *.test.sh|lib/test-stub.sh|__pycache__/*|*/__pycache__/*|*.pyc|*.md|hooks.json|enforcement-overlay.json)
+      : ;;  # documented exclusion
+    *)
+      tree_parity_ok=0
+      err "claude/hooks/$f is not deployed by the hook-tree walk and matches no documented exclusion" ;;
+  esac
+done < <(cd claude/hooks && find . -type f | sed 's|^\./||' | LC_ALL=C sort)
+[ "$tree_parity_ok" = 1 ] && say "  ok hook-tree exclusions all match documented non-deployable patterns"
 
 # 6b) Single-owner invariant: base (node-local) and overlay (portable) must NOT share any
 # hook event, or a standalone install would double-register; and the overlay must match the
