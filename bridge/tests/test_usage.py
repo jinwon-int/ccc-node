@@ -1078,3 +1078,62 @@ async def test_get_usage_observed_windows_win_over_synthesis(
     result = await handler.get_usage(1, 2, "claude-x")
     assert [w.label for w in result.windows] == ["five hour"]
     assert result.windows[0].used_percent == 50.0
+
+
+def test_synthesize_service_windows_reads_configured_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CCC_USAGE_KIMI_5H_REQUEST_LIMIT", "600")
+    window = synthesize_service_windows("Kimi Code", {"requests": 37, "tokens": 1})[0]
+    assert window.count_limit == 600
+
+
+def test_synthesize_service_windows_rejects_bad_limit_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CCC_USAGE_KIMI_5H_REQUEST_LIMIT", "600; rm -rf /")
+    window = synthesize_service_windows("Kimi Code", {"requests": 37})[0]
+    assert window.count_limit is None
+    monkeypatch.setenv("CCC_USAGE_KIMI_5H_REQUEST_LIMIT", str(10**9))
+    window = synthesize_service_windows("Kimi Code", {"requests": 37})[0]
+    assert window.count_limit is None
+
+
+def test_render_usage_count_window_with_limit_shows_remaining(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for name in ("CCC_USAGE_KIMI_5H_REQUEST_LIMIT",):
+        monkeypatch.delenv(name, raising=False)
+    snapshot = UsageSnapshot(
+        provider="claude",
+        service="Kimi Code",
+        windows=(
+            UsageWindow(
+                label="Kimi 5-hour",
+                used_percent=None,
+                used_count=37,
+                count_unit="req",
+                count_limit=600,
+            ),
+        ),
+    )
+    rendered = render_usage(snapshot)
+    assert (
+        "- Kimi 5-hour: 37/600 req · 6.2% used / 93.8% left (local estimate)"
+        in rendered
+    )
+    # Over-limit usage clamps the left percentage at zero.
+    over = UsageSnapshot(
+        provider="claude",
+        windows=(
+            UsageWindow(
+                label="Kimi 5-hour",
+                used_percent=None,
+                used_count=650,
+                count_unit="req",
+                count_limit=600,
+            ),
+        ),
+    )
+    over_rendered = render_usage(over)
+    assert "108.3% used / 0% left" in over_rendered

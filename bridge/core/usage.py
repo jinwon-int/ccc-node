@@ -45,6 +45,7 @@ class UsageWindow:
     resets_at: float | None = None
     used_count: int | None = None
     count_unit: str | None = None
+    count_limit: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -181,8 +182,12 @@ def local_claude_environment_snapshot() -> UsageSnapshot:
     )
 
 
-_SERVICE_WINDOW_LABELS: dict[str, str] = {
-    "Kimi Code": "Kimi 5-hour",
+_SERVICE_WINDOW_SPECS: dict[str, tuple[str, str]] = {
+    # service -> (window label, env var carrying the operator-configured
+    # request limit for that window). Kimi publishes no per-tier limits over
+    # its API, so the limit is read from local config when the operator
+    # provides it; without one the window stays count-only.
+    "Kimi Code": ("Kimi 5-hour", "CCC_USAGE_KIMI_5H_REQUEST_LIMIT"),
 }
 
 
@@ -193,13 +198,17 @@ def synthesize_service_windows(
 
     *rolling* is the meter's trailing-window aggregate for this provider
     (``{"requests": int, "tokens": int}``). Real rate-limit data always wins:
-    callers must only synthesize when no observed windows exist.
+    callers must only synthesize when no observed windows exist. When the
+    operator configured the window's request limit via env (e.g. from the
+    Kimi Code Console), the window also carries it so the renderer can show
+    used/limit and the remaining count.
     """
     if service is None or not rolling:
         return ()
-    label = _SERVICE_WINDOW_LABELS.get(service)
-    if label is None:
+    spec = _SERVICE_WINDOW_SPECS.get(service)
+    if spec is None:
         return ()
+    label, limit_env = spec
     requests = rolling.get("requests")
     if isinstance(requests, bool) or not isinstance(requests, int) or requests < 0:
         return ()
@@ -209,6 +218,7 @@ def synthesize_service_windows(
             used_percent=None,
             used_count=requests,
             count_unit="req",
+            count_limit=_env_int(limit_env, maximum=10**7),
         ),
     )
 
@@ -784,7 +794,18 @@ def _render_window_line(window: UsageWindow) -> str:
             f"{window.used_count:,}" if window.used_count is not None else "unavailable"
         )
         unit = f" {window.count_unit}" if window.count_unit else ""
-        return f"- {window.label}: {count}{unit} used (local estimate)"
+        line = f"- {window.label}: {count}"
+        if window.count_limit:
+            percent = min(
+                999.0, round((window.used_count or 0) * 1000 / window.count_limit) / 10
+            )
+            line += (
+                f"/{window.count_limit:,}{unit} · {percent:g}% used / "
+                f"{max(0.0, 100.0 - percent):g}% left"
+            )
+        else:
+            line += f"{unit} used"
+        return f"{line} (local estimate)"
     remaining = max(0.0, 100.0 - window.used_percent)
     duration = (
         f" · {window.duration_minutes}m window"
