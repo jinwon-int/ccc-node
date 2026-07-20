@@ -33,40 +33,26 @@ USER_LABEL="${CCC_MEMORY_USER_LABEL:-Seo Jin On}"
 # it regardless (that is part of their definition).
 LOCAL_ENABLED="${CCC_LOCAL_MEMORY_ENABLED:-}"
 QUERY="${CCC_MEMORY_QUERY:-}"
-AUDIENCE_SCOPED="${CCC_MEMORY_AUDIENCE_SCOPED:-0}"
-MEMORY_AUDIENCE="${CCC_MEMORY_AUDIENCE:-legacy}"
-MEMORY_SCOPE="${CCC_MEMORY_SCOPE:-}"
-AUDIENCE_ROOT="${CCC_MEMORY_AUDIENCE_ROOT:-}"
-SHARED_STATE_DIR="${CCC_MEMORY_SHARED_STATE_DIR:-}"
-SHARED_CACHE_DIR="${CCC_MEMORY_SHARED_CACHE_DIR:-}"
-SHARED_MEMDIR="${CCC_MEMORY_SHARED_DIR:-}"
 LEGACY_STATE_DIR="${CCC_MEMORY_LEGACY_STATE_DIR:-${HOME:-/root}/.claude/state}"
 LEGACY_CACHE_DIR="${CCC_MEMORY_LEGACY_CACHE_DIR:-${HOME:-/root}/.claude/hooks/cache}"
 LEGACY_MEMDIR="${CCC_MEMORY_LEGACY_DIR:-${HOME:-/root}/.claude/memories}"
 LEGACY_RESUME_FILE="${CCC_MEMORY_LEGACY_RESUME_FILE:-$LEGACY_STATE_DIR/resume.md}"
 RESUME_FILE="${CCC_RESUME_FILE:-$STATE_DIR/resume.md}"
 
-is_disabled() { case "${1:-}" in 0|false|FALSE|off|OFF|no|NO) return 0;; *) return 1;; esac; }
+LOAD_MEMORY_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)" || LOAD_MEMORY_LIB_DIR="$HOOKDIR"
+# shellcheck source=claude/hooks/lib/hook-common.sh
+. "$LOAD_MEMORY_LIB_DIR/lib/hook-common.sh" || exit 0
+# shellcheck source=claude/hooks/lib/memory-common.sh
+. "$LOAD_MEMORY_LIB_DIR/lib/memory-common.sh" || exit 0
+# Rendering/budget/bounded-search helpers (#584 P2-1): the former inline python3
+# heredocs live in this stdlib-only module. Every caller keeps its fail-open
+# `||` fallback, so a missing module degrades exactly like a heredoc failure.
+MEMORY_RENDER_PY="$LOAD_MEMORY_LIB_DIR/lib/memory_render.py"
 
 scoped_paths_valid() {
-  local suffix
-  [ -n "$AUDIENCE_ROOT" ] || return 1
-  case "$MEMORY_AUDIENCE:$MEMORY_SCOPE" in
-    shared:shared) ;;
-    private:private-*)
-      suffix="${MEMORY_SCOPE#private-}"
-      [ "${#suffix}" = 32 ] || return 1
-      case "$suffix" in *[!0-9a-f]*) return 1 ;; esac
-      ;;
-    *) return 1 ;;
-  esac
-  [ "$STATE_DIR" = "$AUDIENCE_ROOT/$MEMORY_SCOPE/state" ] \
-    && [ "$CACHE" = "$AUDIENCE_ROOT/$MEMORY_SCOPE/cache" ] \
+  memory_scope_core_valid \
     && [ "$MEMDIR" = "$AUDIENCE_ROOT/$MEMORY_SCOPE/memories" ] \
-    && [ "$RESUME_FILE" = "$AUDIENCE_ROOT/$MEMORY_SCOPE/state/resume.md" ] \
-    && [ "$SHARED_STATE_DIR" = "$AUDIENCE_ROOT/shared/state" ] \
-    && [ "$SHARED_CACHE_DIR" = "$AUDIENCE_ROOT/shared/cache" ] \
-    && [ "$SHARED_MEMDIR" = "$AUDIENCE_ROOT/shared/memories" ]
+    && [ "$RESUME_FILE" = "$AUDIENCE_ROOT/$MEMORY_SCOPE/state/resume.md" ]
 }
 
 if ! is_disabled "$AUDIENCE_SCOPED"; then
@@ -96,21 +82,7 @@ scan_injection_block() { # <label> <text>
 
 limit_bytes() { # <max> <text>
   local max="$1"
-  python3 -c 'import sys
-limit = int(sys.argv[1])
-data = sys.stdin.buffer.read()
-if limit > 0 and len(data) > limit:
-    # Reserve room for the truncation marker so the total output stays within
-    # <limit> bytes. Slicing to <limit> and THEN appending the suffix used to
-    # overshoot the declared cap by the suffix length (~38 bytes).
-    suffix = "\n… [truncated by CCC memory budget]\n".encode("utf-8")
-    keep = max(0, limit - len(suffix))
-    text = data[:keep].decode("utf-8", errors="ignore")
-    sys.stdout.buffer.write(text.encode("utf-8"))
-    sys.stdout.buffer.write(suffix)
-else:
-    sys.stdout.buffer.write(data)
-' "$max"
+  python3 "$MEMORY_RENDER_PY" limit-bytes "$max"
 }
 
 # Cross-source injection dedup. The local hot-memory search re-surfaces hits from
@@ -123,66 +95,15 @@ else:
 # Set CCC_MEMORY_INJECT_DEDUP=0/false/off to disable.
 dedup_local_hot() { # <injected-text> <search-json>
   if is_disabled "${CCC_MEMORY_INJECT_DEDUP:-1}"; then printf '%s' "$2"; return 0; fi
-  # JSON is passed via env, not stdin: the heredoc below occupies stdin.
-  INJECTED="$1" SEARCH_JSON="$2" python3 - 2>/dev/null <<'PY' || printf '%s' "$2"
-import json, os, re, sys
-raw = os.environ.get("SEARCH_JSON", "")
-try:
-    doc = json.loads(raw)
-except Exception:
-    sys.stdout.write(raw); sys.exit(0)
-results = doc.get("results") if isinstance(doc, dict) else None
-if not isinstance(results, list) or not results:
-    sys.stdout.write(raw); sys.exit(0)
-
-def norm(t):
-    return " ".join(re.findall(r"[0-9a-z가-힣]+", (t or "").lower()))
-
-injected = norm(os.environ.get("INJECTED", ""))
-kept, dropped = [], 0
-for r in results:
-    if str(r.get("source") or "") not in ("memory", "cache"):
-        kept.append(r); continue
-    snip = str(r.get("snippet") or r.get("content") or r.get("text") or "")
-    snip = snip.replace("[", " ").replace("]", " ")
-    frags = [f for f in (norm(p) for p in re.split(r"\s*(?:…|\.\.\.)\s*", snip)) if len(f) >= 12]
-    if injected and frags and all(f in injected for f in frags):
-        dropped += 1; continue
-    kept.append(r)
-doc["results"] = kept
-if dropped:
-    doc["injectionDedup"] = {"dropped": dropped, "kept": len(kept)}
-sys.stdout.write(json.dumps(doc, ensure_ascii=False))
-PY
+  # JSON is passed via env, not argv: large blocks would risk ARG_MAX limits.
+  INJECTED="$1" SEARCH_JSON="$2" python3 "$MEMORY_RENDER_PY" dedup-local-hot 2>/dev/null || printf '%s' "$2"
 }
 
 # Fail closed immediately when Wiki memory is disabled, even before the next
 # background index update removes a stale wiki.txt row from SQLite.
 filter_disabled_wiki_hits() { # <search-json>
   if ! is_disabled "$WIKI_ENABLED"; then printf '%s' "$1"; return 0; fi
-  SEARCH_JSON="$1" python3 - 2>/dev/null <<'PY' || printf '%s' '{"results":[]}'
-import json, os, pathlib, sys
-raw = os.environ.get("SEARCH_JSON", "")
-try:
-    doc = json.loads(raw)
-except Exception:
-    sys.stdout.write('{"results":[]}'); raise SystemExit(0)
-results = doc.get("results") if isinstance(doc, dict) else None
-if not isinstance(results, list):
-    sys.stdout.write('{"results":[]}'); raise SystemExit(0)
-def visible(row):
-    if not isinstance(row, dict):
-        return False
-    p = pathlib.PurePath(str(row.get("path") or ""))
-    source = str(row.get("source") or "").lower()
-    if p.name in {"wiki.txt", "wiki-candidates.md"}:
-        return False
-    if source == "distill-local":
-        return True
-    return not (p.name == "distill-last.json" or "distill-history" in p.parts or source.startswith("distill"))
-doc["results"] = [row for row in results if visible(row)]
-sys.stdout.write(json.dumps(doc, ensure_ascii=False))
-PY
+  SEARCH_JSON="$1" python3 "$MEMORY_RENDER_PY" filter-disabled-wiki-hits 2>/dev/null || printf '%s' '{"results":[]}'
 }
 
 # Render the (deduped) local hot-memory search JSON as compact, readable lines
@@ -194,126 +115,19 @@ PY
 # Set CCC_MEMORY_INJECT_RENDER=0/false/off to inject the raw JSON instead.
 render_local_hot() { # <search-json>
   if is_disabled "${CCC_MEMORY_INJECT_RENDER:-1}"; then printf '%s' "$1"; return 0; fi
-  SEARCH_JSON="$1" python3 - 2>/dev/null <<'PY' || printf '%s' "$1"
-import json, os, re, sys
-raw = os.environ.get("SEARCH_JSON", "")
-try:
-    doc = json.loads(raw)
-except Exception:
-    sys.stdout.write(raw); sys.exit(0)
-results = doc.get("results") if isinstance(doc, dict) else None
-if not isinstance(results, list):
-    sys.stdout.write(raw); sys.exit(0)
-LABEL = {"memory": "memory", "cache": "cache", "structured": "fact",
-         "state": "distill", "distill-history": "distill", "distill-local": "distill"}
-lines = []
-for r in results:
-    if not isinstance(r, dict):
-        continue
-    snip = str(r.get("snippet") or r.get("content") or r.get("text") or "")
-    snip = re.sub(r"\s+", " ", snip.replace("[", "").replace("]", "")).strip()
-    # FTS snippets bracket matches and wrap gaps in "…"; drop the leading/trailing
-    # ellipsis so the rendered line reads cleanly (internal gaps are kept).
-    snip = re.sub(r"^\s*(?:…|\.\.\.)\s*|\s*(?:…|\.\.\.)\s*$", "", snip)
-    if not snip:
-        continue
-    lines.append(f"- ({LABEL.get(str(r.get('source') or ''), 'memory')}) {snip}")
-sys.stdout.write("\n".join(lines))
-PY
+  SEARCH_JSON="$1" python3 "$MEMORY_RENDER_PY" render-local-hot 2>/dev/null || printf '%s' "$1"
 }
 
-find_memory_tool() { # <tool-name>
-  local name="$1" d
-  for d in "${CCC_MEMORY_TOOLS_DIR:-}" "$HOOKDIR" "$HOOKDIR/../../scripts"; do
-    [ -n "$d" ] || continue
-    if [ -x "$d/$name" ]; then printf '%s\n' "$d/$name"; return 0; fi
-  done
-  return 1
-}
+# find_memory_tool comes from lib/hook-common.sh.
 
 run_memory_search_bounded() { # <tool> <query> <limit> <timeout-seconds> [state-dir]
   local tool="$1" query="$2" limit="$3" timeout_sec="$4" state_override="${5:-}"
-  python3 -c 'import math, os, signal, subprocess, sys
-
-tool, query, limit, raw_timeout, state_override = sys.argv[1:]
-try:
-    timeout = float(raw_timeout)
-except (TypeError, ValueError):
-    timeout = 3.0
-if not math.isfinite(timeout) or timeout <= 0:
-    timeout = 3.0
-# The outer SessionStart hook has a 15-second deadline. Keep enough room for
-# canonical source assembly and JSON rendering even with an excessive override.
-timeout = min(timeout, 10.0)
-env = os.environ.copy()
-env["CCC_MEMORY_RECORD_USAGE"] = "0"
-env["CCC_MEMORY_SEARCH_LIMIT"] = limit
-if state_override:
-    env["CCC_STATE_DIR"] = state_override
-    env["CCC_MEMORY_INDEX_DB"] = os.path.join(state_override, "memory-index.sqlite")
-try:
-    proc = subprocess.Popen(
-        [tool, query],
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        env=env,
-        start_new_session=True,
-    )
-except OSError:
-    raise SystemExit(0)
-try:
-    stdout, _ = proc.communicate(timeout=timeout)
-except subprocess.TimeoutExpired:
-    try:
-        os.killpg(proc.pid, signal.SIGTERM)
-    except OSError:
-        proc.terminate()
-    try:
-        proc.communicate(timeout=0.5)
-    except subprocess.TimeoutExpired:
-        try:
-            os.killpg(proc.pid, signal.SIGKILL)
-        except OSError:
-            proc.kill()
-        proc.communicate()
-    raise SystemExit(0)
-if proc.returncode == 0:
-    sys.stdout.buffer.write(stdout)
-' "$tool" "$query" "$limit" "$timeout_sec" "$state_override" 2>/dev/null || true
+  python3 "$MEMORY_RENDER_PY" run-memory-search-bounded \
+    "$tool" "$query" "$limit" "$timeout_sec" "$state_override" 2>/dev/null || true
 }
 
 merge_local_hot() { # <primary-json> <shared-json> [legacy-private-json]
-  PRIMARY_JSON="$1" SHARED_JSON="$2" LEGACY_JSON="${3:-}" python3 - 2>/dev/null <<'PY' || printf '%s' "$1"
-import json, os, sys
-
-def rows(name):
-    try:
-        doc = json.loads(os.environ.get(name, ""))
-    except Exception:
-        return []
-    value = doc.get("results") if isinstance(doc, dict) else None
-    return value if isinstance(value, list) else []
-
-out, seen = [], set()
-for audience, name in (
-    ("private", "PRIMARY_JSON"),
-    ("shared", "SHARED_JSON"),
-    ("private-legacy", "LEGACY_JSON"),
-):
-    for row in rows(name):
-        if not isinstance(row, dict):
-            continue
-        key = (str(row.get("path") or ""), str(row.get("snippet") or ""))
-        if key in seen:
-            continue
-        seen.add(key)
-        item = dict(row)
-        item["memoryAudience"] = audience
-        out.append(item)
-out.sort(key=lambda row: float(row.get("score") or 0), reverse=True)
-sys.stdout.write(json.dumps({"results": out}, ensure_ascii=False))
-PY
+  PRIMARY_JSON="$1" SHARED_JSON="$2" LEGACY_JSON="${3:-}" python3 "$MEMORY_RENDER_PY" merge-local-hot 2>/dev/null || printf '%s' "$1"
 }
 
 build_memory_query() {
@@ -406,10 +220,7 @@ if ! is_disabled "${CCC_MEMORY_DYNAMIC_BUDGET:-1}"; then
   # alloc = byte budget for local (>= MAX_LOCAL, reclaiming slack up to the total
   # minus a ~1000B scaffold reserve); dyn_limit = results to fetch to fill it
   # (~180B/result, clamped to [5,25]). The final limit_bytes is the hard bound.
-  budget_out="$(python3 -c 'import sys
-total, reserve, maxlocal, bpr, base, maxlim, m, r, w, h = (int(x) for x in sys.argv[1:])
-alloc = max(maxlocal, total - reserve - m - r - w - h)
-print(alloc, max(base, min(maxlim, alloc // bpr)))' \
+  budget_out="$(python3 "$MEMORY_RENDER_PY" dynamic-budget \
     "$MAX_TOTAL" 1000 "$MAX_LOCAL" 180 5 25 "$msize" "$rsize" "$wsize" "$hsize" 2>/dev/null || true)"
   alloc_candidate="${budget_out%% *}"
   limit_candidate="${budget_out##* }"

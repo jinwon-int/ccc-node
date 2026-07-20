@@ -86,12 +86,42 @@ JSON
 out="$(CCC_AGENT_CRON_STORE="$BAD_RETRY" bash "$CMD" validate 2>&1)"; rc=$?
 ok "invalid retryPolicy fails validation" '[ "$rc" = 1 ] && grep -q "retryPolicy.maxAttempts" <<<"$out"'
 
+IANA_TZ="$TMP/iana-tz.json"
+cat > "$IANA_TZ" <<'JSON'
+{"version":1,"tasks":[{"id":"kst-task","schedule":"0 9 * * *","prompt":"a","enabled":true,"notify":"none","timezone":"Asia/Seoul"}]}
+JSON
+out="$(CCC_AGENT_CRON_STORE="$IANA_TZ" bash "$CMD" validate 2>&1)"; rc=$?
+ok "IANA timezone validates" '[ "$rc" = 0 ]'
+out="$(CCC_AGENT_CRON_STORE="$IANA_TZ" bash "$CMD" due --at 2026-08-02T00:00:00Z --json 2>&1)"; rc=$?
+ok "KST 09:00 cron is due at 00:00 UTC" '[ "$rc" = 0 ] && grep -q '"'"'"due": true'"'"' <<<"$out"'
+
 BAD_TZ="$TMP/bad-tz.json"
 cat > "$BAD_TZ" <<'JSON'
-{"version":1,"tasks":[{"id":"bad-tz","schedule":"* * * * *","prompt":"a","enabled":true,"notify":"none","timezone":"Asia/Seoul"}]}
+{"version":1,"tasks":[{"id":"bad-tz","schedule":"* * * * *","prompt":"a","enabled":true,"notify":"none","timezone":"Mars/OlympusMons"}]}
 JSON
-out="$(CCC_AGENT_CRON_STORE="$BAD_TZ" bash "$CMD" validate 2>&1)"; rc=$?
-ok "non-UTC timezone fails closed in this slice" '[ "$rc" = 1 ] && grep -q "timezone" <<<"$out"'
+out="$(CCC_AGENT_CRON_STORE="$BAD_TZ" bash "$CMD" due --json 2>&1)"; rc=$?
+ok "unknown timezone fails closed as invalid-schedule" 'grep -q "invalid-schedule" <<<"$out" && grep -q "unknown timezone" <<<"$out"'
+
+KINDS="$TMP/kinds.json"
+cat > "$KINDS" <<'JSON'
+{"version":1,"tasks":[
+  {"id":"interval-task","schedule":"every 30m","prompt":"a","enabled":true,"notify":"none"},
+  {"id":"once-task","schedule":"at 2026-08-01T09:00:00Z","prompt":"a","enabled":true,"notify":"none"},
+  {"id":"once-done","schedule":"at 2026-08-01T09:00:00Z","prompt":"a","enabled":true,"notify":"none","lastRunAt":"2026-08-01T09:00:00Z"}
+]}
+JSON
+out="$(CCC_AGENT_CRON_STORE="$KINDS" bash "$CMD" due --at 2026-08-01T09:05:00Z --json 2>&1)"; rc=$?
+ok "interval task never run is due" '[ "$rc" = 0 ] && python3 -c "
+import json,sys
+doc=json.loads(sys.argv[1])
+rows={t[\"id\"]:t for t in doc[\"tasks\"]}
+assert rows[\"interval-task\"][\"due\"] is True, rows[\"interval-task\"]
+assert rows[\"interval-task\"][\"scheduleKind\"]==\"interval\"
+assert rows[\"once-task\"][\"due\"] is True
+assert rows[\"once-task\"][\"scheduleKind\"]==\"once\"
+assert rows[\"once-done\"][\"due\"] is False
+assert rows[\"once-done\"][\"nextDueAt\"] is None
+" "$out"'
 
 DUE="$TMP/due.json"
 cat > "$DUE" <<'JSON'
@@ -252,7 +282,8 @@ set -u
 printf 'prompt=%s
 allowed=%s
 perm=%s
-' "$1" "${CCC_ALLOWED_TOOLS:-}" "${CCC_PERMISSION_MODE:-}" >> "$FAKE_HEADLESS_LOG"
+model=%s
+' "$1" "${CCC_ALLOWED_TOOLS:-}" "${CCC_PERMISSION_MODE:-}" "${CCC_MODEL:-}" >> "$FAKE_HEADLESS_LOG"
 case "$1" in
   *Fail*) echo "fake failure" >&2; exit 7 ;;
   *) echo "fake result for $1 token=abcdefghijklmnopqrstuvwxyz1234567890" ;;
@@ -269,6 +300,92 @@ JSON
 out="$(CCC_AGENT_CRON_STORE="$SCHED_EXEC_STORE" CCC_HEADLESS_CMD="$FAKE_HEADLESS" bash "$CMD" scheduler --execute --json --at 2026-01-01T00:01:00Z --max-runs 2)"; rc=$?
 ok "scheduler --execute runs due tasks through run path" '[ "$rc" = 0 ] && jq -e ".mode == \"scheduler-execute-one-shot\" and .executedActions == 2 and .mutations.lockAcquire == true and .mutations.taskStoreWrite == true and .mutations.headlessExecute == true and .mutations.historyAppend == true" <<<"$out" >/dev/null'
 ok "scheduler --execute records success and failure without keeping locks" 'jq -e ".tasks[] | select(.id == \"sched-exec-success\" and .lastStatus == \"success\" and (.runHistory|length)==1)" "$SCHED_EXEC_STORE" >/dev/null && jq -e ".tasks[] | select(.id == \"sched-exec-fail\" and .lastStatus == \"failed\" and (.runHistory|length)==1)" "$SCHED_EXEC_STORE" >/dev/null && [ ! -e "$TMP/scheduler-exec-store/locks/sched-exec-success.lock" ] && [ ! -e "$TMP/scheduler-exec-store/locks/sched-exec-fail.lock" ]'
+
+ONESHOT_STORE="$TMP/oneshot-store/tasks.json"
+mkdir -p "$(dirname "$ONESHOT_STORE")"
+cat > "$ONESHOT_STORE" <<'JSON'
+{"version":1,"tasks":[
+  {"id":"oneshot-run","schedule":"at 2026-01-01T00:01:00Z","prompt":"Run once","enabled":true,"notify":"none"},
+  {"id":"oneshot-keep","schedule":"at 2026-01-01T00:01:00Z","prompt":"Run once kept","enabled":true,"notify":"none","keepAfterRun":true}
+]}
+JSON
+out="$(CCC_AGENT_CRON_STORE="$ONESHOT_STORE" CCC_HEADLESS_CMD="$FAKE_HEADLESS" bash "$CMD" run oneshot-run --json --at 2026-01-01T00:01:00Z)"; rc=$?
+ok "one-shot run succeeds and auto-disables" '[ "$rc" = 0 ] && jq -e ".ok == true and .oneShotDisabled == true" <<<"$out" >/dev/null && jq -e ".tasks[] | select(.id == \"oneshot-run\" and .enabled == false and .lastStatus == \"success\")" "$ONESHOT_STORE" >/dev/null'
+out="$(CCC_AGENT_CRON_STORE="$ONESHOT_STORE" CCC_HEADLESS_CMD="$FAKE_HEADLESS" bash "$CMD" run oneshot-keep --json --at 2026-01-01T00:01:00Z)"; rc=$?
+ok "keepAfterRun one-shot stays enabled" '[ "$rc" = 0 ] && jq -e ".oneShotDisabled == false" <<<"$out" >/dev/null && jq -e ".tasks[] | select(.id == \"oneshot-keep\" and .enabled == true)" "$ONESHOT_STORE" >/dev/null'
+
+CRUD_STORE="$TMP/crud-store/tasks.json"
+out="$(CCC_AGENT_CRON_STORE="$CRUD_STORE" bash "$CMD" add daily-report --schedule "0 9 * * *" --prompt "Daily report" --timezone Asia/Seoul --notify telegram-owner-on-failure --allowed-tools Read,Grep --not-before 2026-08-01T00:00:00Z --max-runs 1 --json)"; rc=$?
+ok "add creates a bounded task in a fresh store" '[ "$rc" = 0 ] && jq -e ".ok == true and .mutations.taskStoreWrite == true" <<<"$out" >/dev/null && jq -e ".tasks[] | select(.id == \"daily-report\" and .timezone == \"Asia/Seoul\" and .notify == \"telegram-owner-on-failure\" and .notBefore == \"2026-08-01T00:00:00Z\" and .maxRuns == 1 and .enabled == true)" "$CRUD_STORE" >/dev/null'
+out="$(CCC_AGENT_CRON_STORE="$CRUD_STORE" bash "$CMD" add daily-report --schedule "@daily" --prompt "dup" --json 2>&1)"; rc=$?
+ok "add rejects duplicate id" '[ "$rc" = 1 ] && grep -q "already exists" <<<"$out"'
+out="$(CCC_AGENT_CRON_STORE="$CRUD_STORE" bash "$CMD" add bad-sched --schedule "not a schedule" --prompt "x" --json 2>&1)"; rc=$?
+ok "add rejects invalid schedule without writing" '[ "$rc" = 2 ] && ! jq -e ".tasks[] | select(.id == \"bad-sched\")" "$CRUD_STORE" >/dev/null'
+out="$(CCC_AGENT_CRON_STORE="$CRUD_STORE" bash "$CMD" add bad-bound --schedule "@daily" --prompt "x" --not-before never --json 2>&1)"; rc=$?
+ok "add rejects invalid not-before without writing" '[ "$rc" = 2 ] && ! jq -e ".tasks[] | select(.id == \"bad-bound\")" "$CRUD_STORE" >/dev/null'
+out="$(CCC_AGENT_CRON_STORE="$CRUD_STORE" bash "$CMD" add watchdog --schedule "every 30m" --prompt "disk watchdog" --argv sh --argv -c --argv "df -h" --timeout-sec 30 --json)"; rc=$?
+ok "add creates a command-payload task" '[ "$rc" = 0 ] && jq -e ".tasks[] | select(.id == \"watchdog\") | .payload.kind == \"command\" and .payload.argv == [\"sh\",\"-c\",\"df -h\"] and .payload.timeoutSec == 30" "$CRUD_STORE" >/dev/null'
+out="$(CCC_AGENT_CRON_STORE="$CRUD_STORE" bash "$CMD" disable watchdog --json)"; rc=$?
+ok "disable toggles enabled off" '[ "$rc" = 0 ] && jq -e ".tasks[] | select(.id == \"watchdog\" and .enabled == false)" "$CRUD_STORE" >/dev/null'
+out="$(CCC_AGENT_CRON_STORE="$CRUD_STORE" bash "$CMD" enable watchdog --json)"; rc=$?
+ok "enable toggles enabled on" '[ "$rc" = 0 ] && jq -e ".changed == true" <<<"$out" >/dev/null && jq -e ".tasks[] | select(.id == \"watchdog\" and .enabled == true)" "$CRUD_STORE" >/dev/null'
+out="$(CCC_AGENT_CRON_STORE="$CRUD_STORE" bash "$CMD" edit watchdog --schedule "every 30m" --json)"; rc=$?
+ok "edit updates schedule in place" '[ "$rc" = 0 ] && jq -e ".tasks[] | select(.id == \"watchdog\" and .schedule == \"every 30m\") | .payload.argv == [\"sh\",\"-c\",\"df -h\"]" "$CRUD_STORE" >/dev/null'
+out="$(CCC_AGENT_CRON_STORE="$CRUD_STORE" bash "$CMD" edit watchdog --timeout-sec 45 --json)"; rc=$?
+ok "edit merges payload fields preserving argv" '[ "$rc" = 0 ] && jq -e ".tasks[] | select(.id == \"watchdog\") | .payload.timeoutSec == 45 and .payload.kind == \"command\"" "$CRUD_STORE" >/dev/null'
+out="$(CCC_AGENT_CRON_STORE="$CRUD_STORE" bash "$CMD" edit watchdog --schedule "not a schedule" --json 2>&1)"; rc=$?
+ok "edit rejects invalid schedule without write" '[ "$rc" = 2 ] && jq -e ".tasks[] | select(.id == \"watchdog\" and .schedule == \"every 30m\")" "$CRUD_STORE" >/dev/null'
+out="$(CCC_AGENT_CRON_STORE="$CRUD_STORE" bash "$CMD" edit watchdog --json 2>&1)"; rc=$?
+ok "edit with no flags is rejected" '[ "$rc" = 2 ] && grep -q "at least one field" <<<"$out"'
+out="$(CCC_AGENT_CRON_STORE="$CRUD_STORE" bash "$CMD" edit missing-task --name x --json 2>&1)"; rc=$?
+ok "edit unknown id fails" '[ "$rc" = 1 ] && grep -q "not found" <<<"$out"'
+
+out="$(CCC_AGENT_CRON_STORE="$CRUD_STORE" bash "$CMD" remove watchdog --json)"; rc=$?
+ok "remove deletes the task" '[ "$rc" = 0 ] && ! jq -e ".tasks[] | select(.id == \"watchdog\")" "$CRUD_STORE" >/dev/null'
+out="$(CCC_AGENT_CRON_STORE="$CRUD_STORE" bash "$CMD" remove missing-task --json 2>&1)"; rc=$?
+ok "remove unknown id fails" '[ "$rc" = 1 ] && grep -q "not found" <<<"$out"'
+
+NOTIFY_FAIL_STORE="$TMP/notify-fail-store/tasks.json"
+mkdir -p "$(dirname "$NOTIFY_FAIL_STORE")"
+cat > "$NOTIFY_FAIL_STORE" <<'JSON'
+{"version":1,"tasks":[
+  {"id":"nf-ok","schedule":"* * * * *","prompt":"Quiet when fine","enabled":true,"notify":"telegram-owner-on-failure","lastRunAt":"2026-01-01T00:00:00Z"},
+  {"id":"nf-bad","schedule":"* * * * *","prompt":"Loud when Fail","enabled":true,"notify":"telegram-owner-on-failure","lastRunAt":"2026-01-01T00:00:00Z"}
+]}
+JSON
+NF_SPOOL="$TMP/nf-spool"
+out="$(CCC_AGENT_CRON_STORE="$NOTIFY_FAIL_STORE" CCC_HEADLESS_CMD="$FAKE_HEADLESS" CCC_PUSH_SPOOL="$NF_SPOOL" bash "$CMD" run nf-ok --json --at 2026-01-01T00:01:00Z)"; rc=$?
+ok "on-failure notify skips successful runs" '[ "$rc" = 0 ] && jq -e ".notification.delivery == \"skipped-success\"" <<<"$out" >/dev/null && [ -z "$(ls -A "$NF_SPOOL" 2>/dev/null)" ]'
+out="$(CCC_AGENT_CRON_STORE="$NOTIFY_FAIL_STORE" CCC_HEADLESS_CMD="$FAKE_HEADLESS" CCC_PUSH_SPOOL="$NF_SPOOL" bash "$CMD" run nf-bad --json --at 2026-01-01T00:01:00Z 2>&1)"; rc=$?
+ok "on-failure notify spools failed runs" '[ "$rc" = 1 ] && jq -e ".notification.delivery == \"spooled\"" <<<"$out" >/dev/null && [ -n "$(ls -A "$NF_SPOOL" 2>/dev/null)" ]'
+
+PAYLOAD_STORE="$TMP/payload-store/tasks.json"
+mkdir -p "$(dirname "$PAYLOAD_STORE")"
+cat > "$PAYLOAD_STORE" <<'JSON'
+{"version":1,"tasks":[
+  {"id":"cmd-ok","schedule":"* * * * *","prompt":"echo watchdog","enabled":true,"notify":"none","lastRunAt":"2026-01-01T00:00:00Z","payload":{"kind":"command","argv":["sh","-c","echo cmd-stdout-ok"]}},
+  {"id":"cmd-fail","schedule":"* * * * *","prompt":"failing command","enabled":true,"notify":"none","lastRunAt":"2026-01-01T00:00:00Z","payload":{"kind":"command","argv":["sh","-c","echo boom >&2; exit 3"]}},
+  {"id":"cmd-slow","schedule":"* * * * *","prompt":"slow command","enabled":true,"notify":"none","lastRunAt":"2026-01-01T00:00:00Z","payload":{"kind":"command","argv":["sleep","5"],"timeoutSec":1}},
+  {"id":"model-task","schedule":"* * * * *","prompt":"Model override run","enabled":true,"notify":"none","lastRunAt":"2026-01-01T00:00:00Z","payload":{"kind":"prompt","model":"claude-test-model"}}
+]}
+JSON
+out="$(CCC_AGENT_CRON_STORE="$PAYLOAD_STORE" bash "$CMD" run cmd-ok --json --at 2026-01-01T00:01:00Z)"; rc=$?
+ok "command payload runs argv without headless" '[ "$rc" = 0 ] && jq -e ".ok == true and .status == \"success\" and .headless.payloadKind == \"command\" and (.headless.stdout | contains(\"cmd-stdout-ok\"))" <<<"$out" >/dev/null'
+out="$(CCC_AGENT_CRON_STORE="$PAYLOAD_STORE" bash "$CMD" run cmd-fail --json --at 2026-01-01T00:01:00Z 2>&1)"; rc=$?
+ok "command payload propagates failure exit code" '[ "$rc" = 1 ] && jq -e ".ok == false and .status == \"failed\" and .headless.exitCode == 3 and (.headless.stderr | contains(\"boom\"))" <<<"$out" >/dev/null'
+out="$(CCC_AGENT_CRON_STORE="$PAYLOAD_STORE" bash "$CMD" run cmd-slow --json --at 2026-01-01T00:01:00Z 2>&1)"; rc=$?
+ok "command payload times out with distinct status" '[ "$rc" = 1 ] && jq -e ".status == \"timeout\" and .headless.exitCode == 124 and .headless.timedOut == true" <<<"$out" >/dev/null'
+out="$(CCC_AGENT_CRON_STORE="$PAYLOAD_STORE" CCC_HEADLESS_CMD="$FAKE_HEADLESS" bash "$CMD" run model-task --json --at 2026-01-01T00:01:00Z)"; rc=$?
+ok "prompt payload model override reaches headless env" '[ "$rc" = 0 ] && grep -q "model=claude-test-model" "$FAKE_HEADLESS_LOG"'
+out="$(CCC_AGENT_CRON_STORE="$PAYLOAD_STORE" bash "$CMD" run cmd-ok --dry-run --json --at 2026-01-01T00:02:00Z)"; rc=$?
+ok "dry-run previews command payload metadata" '[ "$rc" = 0 ] && jq -e ".headless.payloadKind == \"command\" and .headless.argvLen == 3" <<<"$out" >/dev/null'
+
+BAD_PAYLOAD="$TMP/bad-payload.json"
+cat > "$BAD_PAYLOAD" <<'JSON'
+{"version":1,"tasks":[{"id":"bad-payload","schedule":"* * * * *","prompt":"a","enabled":true,"notify":"none","payload":{"kind":"command"}}]}
+JSON
+out="$(CCC_AGENT_CRON_STORE="$BAD_PAYLOAD" bash "$CMD" validate 2>&1)"; rc=$?
+ok "command payload without argv fails validation" '[ "$rc" = 1 ] && grep -q "argv is required" <<<"$out"'
 
 out="$(CCC_AGENT_CRON_STORE="$EXEC_STORE" CCC_HEADLESS_CMD="$FAKE_HEADLESS" bash "$CMD" run exec-success --json --at 2026-01-01T00:01:00Z)"; rc=$?
 ok "run executes due task with fake headless" '[ "$rc" = 0 ] && jq -e ".ok == true and .status == \"success\" and .mutations.lockAcquire == true and .mutations.taskStoreWrite == true and .mutations.headlessExecute == true" <<<"$out" >/dev/null'

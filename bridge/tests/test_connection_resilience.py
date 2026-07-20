@@ -12,6 +12,10 @@ import os
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from sys_modules_isolation import ModuleFakesGuard
+
+_sys_modules_guard = ModuleFakesGuard(__name__).begin()
+
 _ORIGINAL_PROJECT_ROOT = os.environ.get("PROJECT_ROOT")
 _ORIGINAL_CONFIG_MODULE = sys.modules.get("telegram_bot.utils.config")
 # Set PROJECT_ROOT before importing bot modules
@@ -64,6 +68,11 @@ else:
     sys.modules["telegram_bot.utils.config"] = _ORIGINAL_CONFIG_MODULE
 
 sys.modules.pop("telegram_bot.core.bot", None)
+
+# The manual restore above puts back what this module knows it replaced; the
+# guard additionally reverts real modules that were transitively imported
+# while the fake config was active (bot_access, bot_lifecycle, ...).
+_sys_modules_guard.finish()
 
 
 class TestConnectionResilience(unittest.TestCase):

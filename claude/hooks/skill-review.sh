@@ -21,8 +21,9 @@ PENDING_DIR="$STATE_DIR/pending-skills"
 mkdir -p "$STATE_DIR" "$PENDING_DIR" 2>/dev/null
 
 TRIGGER="${1:-manual}"
-ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
-log() { printf '%s %s\n' "$(ts)" "$*" >> "$LOG" 2>/dev/null; }
+SKILL_REVIEW_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)" || SKILL_REVIEW_LIB_DIR="${HOME:-/root}/.claude/hooks"
+# shellcheck source=claude/hooks/lib/hook-common.sh
+. "$SKILL_REVIEW_LIB_DIR/lib/hook-common.sh" || exit 0
 
 # The emergency off-switch must win even when a SessionEnd hook inherits the
 # detached runner marker from its parent `claude -p` process.

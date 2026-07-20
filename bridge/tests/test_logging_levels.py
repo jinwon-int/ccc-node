@@ -11,11 +11,14 @@ INFO, and the console handler stays quiet at WARNING in non-debug mode.
 """
 
 import logging
+import tempfile
+import types
 import unittest
+from pathlib import Path
 
 pytest = None
 try:  # pydantic-backed config; skip cleanly where deps aren't installed.
-    from telegram_bot.utils.config import setup_logging
+    from telegram_bot.utils.logging_setup import setup_logging
     _HAVE_CONFIG = True
 except Exception:  # pragma: no cover - import guard
     _HAVE_CONFIG = False
@@ -27,8 +30,19 @@ class SetupLoggingLevelTest(unittest.TestCase):
         self._root = logging.getLogger()
         self._saved_handlers = list(self._root.handlers)
         self._saved_level = self._root.level
+        # Explicit settings, like the production caller (__main__ always
+        # passes them): other test modules leak fake config modules into
+        # sys.modules, so the ambient-default path is not test-stable.
+        self._tmp = tempfile.TemporaryDirectory()
+        logs_dir = Path(self._tmp.name) / "logs"
+        self._settings = types.SimpleNamespace(
+            logs_dir=logs_dir,
+            log_level="INFO",
+            log_format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        )
 
     def tearDown(self):
+        self._tmp.cleanup()
         for h in list(self._root.handlers):
             if h not in self._saved_handlers:
                 try:
@@ -47,7 +61,7 @@ class SetupLoggingLevelTest(unittest.TestCase):
         ]
 
     def test_root_passes_info_and_console_stays_warning(self):
-        setup_logging()
+        setup_logging(self._settings)
         # Root must pass INFO+ so the INFO file handler actually receives records.
         self.assertLessEqual(self._root.level, logging.INFO)
         # At least one file handler exists and captures INFO.

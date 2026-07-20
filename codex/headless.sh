@@ -13,7 +13,7 @@ fi
 
 BIN="${CCC_CODEX_BIN:-codex}"
 SANDBOX="${CCC_CODEX_SANDBOX:-read-only}"
-MODEL="${CCC_CODEX_MODEL:-}"
+MODEL="${CCC_CODEX_MODEL:-${CCC_MODEL:-}}"
 REASONING="${CCC_CODEX_REASONING_EFFORT:-}"
 PROFILE="${CCC_CODEX_PROFILE:-}"
 WORKDIR="${CCC_CODEX_WORKDIR:-$PWD}"
@@ -21,6 +21,10 @@ WORKDIR="${CCC_CODEX_WORKDIR:-$PWD}"
 case "$SANDBOX" in
   read-only|workspace-write|danger-full-access) ;;
   *) echo "ccc-codex-headless: invalid CCC_CODEX_SANDBOX: $SANDBOX" >&2; exit 2 ;;
+esac
+case "$REASONING" in
+  ''|none|minimal|low|medium|high|xhigh) ;;
+  *) echo "ccc-codex-headless: invalid CCC_CODEX_REASONING_EFFORT: $REASONING" >&2; exit 2 ;;
 esac
 
 command -v "$BIN" >/dev/null 2>&1 || {

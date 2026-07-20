@@ -27,7 +27,7 @@ chmod +x "$FAKE"
 export FAKE_CODEX_ARGS="$TMP/args"
 
 out="$(CCC_CODEX_BIN="$FAKE" CCC_CODEX_SANDBOX=read-only \
-  CCC_CODEX_MODEL=gpt-test CCC_CODEX_REASONING_EFFORT=high \
+  CCC_MODEL=gpt-test CCC_CODEX_REASONING_EFFORT=high \
   CCC_CODEX_WORKDIR="$TMP" bash "$RUNNER" 'inspect safely')"; rc=$?
 ok "runner returns final message" '[ "$rc" = 0 ] && [ "$out" = "bounded final result" ]'
 ok "runner uses ephemeral JSON execution" 'grep -qx -- "--ephemeral" "$FAKE_CODEX_ARGS" && grep -qx -- "--json" "$FAKE_CODEX_ARGS"'
@@ -48,6 +48,9 @@ rc=$?
 # shellcheck disable=SC2034 # consumed through eval in ok()
 after="$(stat -c %Y "$FAKE_CODEX_ARGS")"
 ok "invalid sandbox fails closed before provider invocation" '[ "$rc" = 2 ] && grep -q "invalid CCC_CODEX_SANDBOX" <<<"$out" && [ "$before" = "$after" ]'
+
+out="$(CCC_CODEX_BIN="$FAKE" CCC_CODEX_REASONING_EFFORT='high\" approval_policy=\"on-request' bash "$RUNNER" nope 2>&1)"; rc=$?
+ok "invalid reasoning fails closed before config parsing" '[ "$rc" = 2 ] && grep -q "invalid CCC_CODEX_REASONING_EFFORT" <<<"$out"'
 
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

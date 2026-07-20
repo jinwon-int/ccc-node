@@ -34,7 +34,15 @@ class VoiceProviderConfigTests(unittest.TestCase):
     def test_execution_profile_defaults_to_strict_project(self):
         with TemporaryDirectory() as td:
             module = self._load_config_module(td)
-            cfg = module.Config(telegram_bot_token="123456:abc", _env_file=None)
+            # Construct under a cleared environment: a live node may export
+            # CCC_BRIDGE_EXECUTION_PROFILE (e.g. owner-operator), and the
+            # pydantic env source would otherwise override the default.
+            with patch.dict(
+                os.environ,
+                {"PROJECT_ROOT": td, "TELEGRAM_BOT_TOKEN": "123456:abc"},
+                clear=True,
+            ):
+                cfg = module.Config(telegram_bot_token="123456:abc", _env_file=None)
             self.assertEqual(cfg.execution_profile, "strict-project")
 
     def test_execution_profile_reads_explicit_env(self):
@@ -104,6 +112,24 @@ class VoiceProviderConfigTests(unittest.TestCase):
             )
             self.assertEqual(audience_scoped.bridge_memory_mode, "audience-scoped")
 
+            # #581: the Codex provider has no audience-scoped CODEX_HOME, so
+            # the leaking combination must fail closed at config load.
+            with self.assertRaises(ValidationError):
+                module.Config(
+                    telegram_bot_token="123456:abc",
+                    CCC_TELEGRAM_SESSION_SCOPE="shared-groups",
+                    CCC_BRIDGE_MEMORY_MODE="audience-scoped",
+                    CCC_AGENT_PROVIDER="codex",
+                    _env_file=None,
+                )
+            codex_curated = module.Config(
+                telegram_bot_token="123456:abc",
+                CCC_BRIDGE_MEMORY_MODE="curated",
+                CCC_AGENT_PROVIDER="codex",
+                _env_file=None,
+            )
+            self.assertEqual(codex_curated.agent_provider, "codex")
+
     def test_curated_web_mcp_is_explicit_complete_and_secret_safe(self):
         with TemporaryDirectory() as td:
             module = self._load_config_module(td)
@@ -135,7 +161,14 @@ class VoiceProviderConfigTests(unittest.TestCase):
                     module.Config(**base, **values)
 
     def test_execution_profile_precedence_in_fresh_processes(self):
-        source_config = Path(__file__).resolve().parents[1] / "utils" / "config.py"
+        source_utils = Path(__file__).resolve().parents[1] / "utils"
+        source_config = source_utils / "config.py"
+        # config.py imports the dependency-free memory_policy leaf module and
+        # the per-domain settings mixin leaf modules (#584 P2-3), so the
+        # synthetic standalone package must ship them too.
+        source_policy = source_utils / "memory_policy.py"
+        source_voice = source_utils / "settings_voice.py"
+        source_heartbeat = source_utils / "settings_heartbeat.py"
         with TemporaryDirectory() as td:
             root = Path(td)
             package_root = root / "package"
@@ -145,6 +178,9 @@ class VoiceProviderConfigTests(unittest.TestCase):
             (package / "__init__.py").write_text("", encoding="utf-8")
             (utils / "__init__.py").write_text("", encoding="utf-8")
             shutil.copy2(source_config, utils / "config.py")
+            shutil.copy2(source_policy, utils / "memory_policy.py")
+            shutil.copy2(source_voice, utils / "settings_voice.py")
+            shutil.copy2(source_heartbeat, utils / "settings_heartbeat.py")
 
             project_root = root / "project"
             project_env = project_root / ".telegram_bot" / ".env"

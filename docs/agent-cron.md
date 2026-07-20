@@ -4,6 +4,15 @@
 
 ## Commands
 
+- `scripts/agent-cron.sh add <task-id> --schedule EXPR --prompt TEXT [flags] [--json]` —
+  create a task (validated, atomic write; no execution). See `--help` for flags
+  (timezone, notify, allowed-tools, payload `--argv/--cwd/--model/--timeout-sec`,
+  `--not-before`, `--max-runs`, `--keep-after-run`, `--disabled`, ...).
+- `scripts/agent-cron.sh edit <task-id> [same flags as add] [--json]` — set-only
+  partial update (schedule/timezone re-validated; payload flags merge, `--argv`
+  replaces the whole argv). No clear semantics — unset by remove+add.
+- `scripts/agent-cron.sh remove|enable|disable <task-id> [--json]` — store-only
+  mutations; never execute, install timers, or send messages.
 - `scripts/agent-cron.sh list [--json]` — inspect configured tasks.
 - `scripts/agent-cron.sh due [--at ISO8601] [--json]` — read-only due/retry resolver.
 - `scripts/agent-cron.sh status [--at ISO8601] [--json]` — read-only operator rollup for task health, retry wait/exhaustion, lock state, and last run state.
@@ -29,9 +38,51 @@ annual cron expression cannot catch up an occurrence from the previous year.
 For example, a July 22 one-time job uses its normal five-field schedule,
 `notBefore: 2026-07-22T02:27:00Z`, and `maxRuns: 1`.
 
+## Schedule forms
+
+`schedule` accepts four kinds (epic #584-adjacent cron upgrade, referencing the
+Hermes and OpenClaw schedulers):
+
+- **Cron:** 5-field expression or `@hourly|@daily|@weekly|@monthly|@yearly`,
+  matched in the task's `timezone` (IANA name, e.g. `Asia/Seoul`; default UTC).
+- **Interval:** `every <N>m|h|d` (min 1 minute, max 366 days). Free-running from
+  `lastRunAt`; set `anchorAt` (ISO8601) to phase-anchor occurrences
+  (e.g. anchor `..T00:15Z` + `every 1h` fires at :15). A never-run interval task
+  with no anchor is due immediately once.
+- **One-shot:** `at <ISO8601>` or a bare ISO8601 timestamp. Naive timestamps are
+  anchored to the task `timezone`. After a successful run the task is
+  auto-disabled unless `keepAfterRun: true`.
+- Unknown timezones and malformed expressions fail closed as
+  `invalid-schedule` in `due`/`status` output; `due` rows expose `scheduleKind`.
+
+## Payload kinds
+
+Each task runs one payload (default: `prompt`, backward compatible):
+
+- **prompt** (default): the existing headless Claude run of `prompt` via
+  `claude/headless.sh`. Optional `payload.model` is passed through as
+  `--model` (via `CCC_MODEL`). Wall-clock timeout `payload.timeoutSec`
+  (default 3600s).
+- **command**: `payload.argv` runs directly (no shell interpolation, no LLM
+  token spend — watchdog/maintenance jobs). Optional `cwd`,
+  `timeoutSec` (default 600s), `outputMaxBytes` (default 64 KiB, capped
+  capture). `model` is rejected for command payloads.
+
+A timed-out run records status `timeout` (exit code 124) and consumes the
+normal retry policy. Cross-field payload rules (argv required for command,
+argv/cwd rejected for prompt) are enforced fail-closed by `validate` and on
+load.
+
+## Notify modes
+
+- `none` (default) — no spool writes.
+- `telegram-owner` — every run writes a short redacted owner-only spool entry.
+- `telegram-owner-on-failure` — spool only non-success runs (failed/timeout);
+  successful runs report `delivery: skipped-success`.
+
 ## Safety boundaries
 
-Read-only/status modes never acquire locks, execute prompts, write bridge spools, install timers, edit crontab/systemd, send Telegram, call providers, or touch remotes. Execution mode may write task history and owner-only redacted spool entries, but still does not install timers or call Telegram/provider APIs directly.
+Read-only/status modes never acquire locks, execute prompts, write bridge spools, install timers, edit crontab/systemd, send Telegram, call providers, or touch remotes. Execution mode may write task history and owner-only redacted spool entries, but still does not install timers or call Telegram/provider APIs directly. `add`/`remove`/`enable`/`disable` mutate only the validated task store via the same atomic private write path.
 
 ## Source boundaries
 

@@ -79,3 +79,9 @@ identity**:
   success.
 - Bridge code (`/opt/ccc-node/bridge`) is out of scope — update it separately via
   `bridge/start.sh --upgrade` (its own approval-gated step).
+
+## Bridge restarts: locate the serving checkout first
+Nodes may carry multiple checkouts (/opt/ccc-node, /root/ccc-node, $HOME/ccc-node);
+invoking the wrong checkout's start.sh has caused outages. Before any bridge
+restart, run the read-only `scripts/ccc-bridge-locate.sh` (add `--json` for
+machine output) to find the serving checkout and use the `restartCmd` it prints.

@@ -13,6 +13,10 @@ from unittest.mock import AsyncMock
 BRIDGE_DIR = Path(__file__).resolve().parents[1]
 os.environ.setdefault("PROJECT_ROOT", str(BRIDGE_DIR))
 
+from sys_modules_isolation import ModuleFakesGuard
+
+_sys_modules_guard = ModuleFakesGuard(__name__).begin()
+
 telegram_bot_pkg = types.ModuleType("telegram_bot")
 telegram_bot_pkg.__path__ = [str(BRIDGE_DIR)]
 sys.modules.setdefault("telegram_bot", telegram_bot_pkg)
@@ -90,6 +94,8 @@ sys.modules["telegram_bot.utils.health"] = health_module
 
 sys.modules.pop("telegram_bot.core.project_chat", None)
 from telegram_bot.core import project_chat
+
+_sys_modules_guard.finish()
 
 
 class _FailingRetryClient:

@@ -25,7 +25,9 @@ WIKI_ENABLED="${CCC_WIKI_MEMORY_ENABLED:-1}"
 USER_LABEL="$(printf '%s' "${CCC_MEMORY_USER_LABEL:-Seo Jin On / 서진원}" | tr '\r\n' '  ' | cut -c1-80)"
 ASSISTANT_LABEL="$(printf '%s' "${CCC_MEMORY_ASSISTANT_LABEL:-dungae, a Hermes Team2 worker}" | tr '\r\n' '  ' | cut -c1-80)"
 
-is_disabled() { case "${1:-}" in 0|false|FALSE|off|OFF|no|NO) return 0;; *) return 1;; esac; }
+EXTRACT_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)" || EXTRACT_LIB_DIR="${HOME:-/root}/.claude/hooks/distill"
+# shellcheck source=claude/hooks/lib/hook-common.sh
+. "$EXTRACT_LIB_DIR/../lib/hook-common.sh" || exit 0
 WIKI_ENABLED_JSON=true
 is_disabled "$WIKI_ENABLED" && WIKI_ENABLED_JSON=false
 

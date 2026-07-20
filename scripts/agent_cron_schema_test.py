@@ -85,6 +85,37 @@ class SchemaContractTests(unittest.TestCase):
         payload["tasks"].append(copy.deepcopy(payload["tasks"][0]))  # type: ignore[union-attr,index]
         self.assertIn("duplicate task id: daily", validate_store(payload))
 
+    def test_payload_semantics_fail_closed(self) -> None:
+        store = valid_store()
+        task = store["tasks"][0]
+
+        task["payload"] = {"kind": "command"}
+        self.assertIn(
+            "tasks[0].payload.argv is required for kind 'command'",
+            validate_store(store),
+        )
+
+        task["payload"] = {"kind": "command", "argv": ["sh", "-c", "true"],
+                           "model": "m"}
+        self.assertIn(
+            "tasks[0].payload.model is not allowed for kind 'command'",
+            validate_store(store),
+        )
+
+        task["payload"] = {"kind": "prompt", "argv": ["sh"]}
+        self.assertIn(
+            "tasks[0].payload.argv is not allowed for kind 'prompt'",
+            validate_store(store),
+        )
+
+        task["payload"] = {"kind": "command", "argv": ["sh", "-c", "true"],
+                           "cwd": "/tmp", "timeoutSec": 30,
+                           "outputMaxBytes": 4096}
+        self.assertEqual(validate_store(store), [])
+        task["payload"] = {"kind": "prompt", "model": "claude-test",
+                           "timeoutSec": 60}
+        self.assertEqual(validate_store(store), [])
+
     def test_repository_uses_same_validator_for_reads_and_writes(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "tasks.json"

@@ -21,11 +21,31 @@
           "enabled": { "type": "boolean" },
           "allowedTools": { "type": "array", "items": { "type": "string" }, "default": [] },
           "permissionMode": { "enum": ["default", "dontAsk", "acceptEdits"] },
-          "notify": { "enum": ["none", "telegram-owner"], "default": "none" },
+          "notify": { "enum": ["none", "telegram-owner", "telegram-owner-on-failure"], "default": "none" },
           "attachMemory": { "type": "array", "items": { "type": "string" }, "default": [] },
           "attachSkills": { "type": "array", "items": { "type": "string" }, "default": [] },
           "redactProfile": { "type": "string", "default": "default" },
-          "timezone": { "const": "UTC", "default": "UTC" },
+          "timezone": { "type": "string", "minLength": 1, "maxLength": 64, "default": "UTC" },
+          "anchorAt": { "type": ["string", "null"] },
+          "keepAfterRun": { "type": "boolean", "default": false },
+          "payload": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["kind"],
+            "properties": {
+              "kind": { "enum": ["prompt", "command"] },
+              "argv": {
+                "type": "array",
+                "items": { "type": "string", "minLength": 1 },
+                "minItems": 1,
+                "maxItems": 64
+              },
+              "cwd": { "type": "string", "minLength": 1 },
+              "model": { "type": "string", "minLength": 1, "maxLength": 128 },
+              "timeoutSec": { "type": "integer", "minimum": 1, "maximum": 86400 },
+              "outputMaxBytes": { "type": "integer", "minimum": 1024, "maximum": 1048576 }
+            }
+          },
           "catchUpPolicy": { "enum": ["skip", "once", "all"], "default": "skip" },
           "maxCatchup": { "type": "integer", "minimum": 1, "maximum": 100, "default": 1 },
           "lockTimeoutSec": { "type": "integer", "minimum": 0, "maximum": 86400, "default": 0 },

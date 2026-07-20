@@ -246,6 +246,10 @@ while [ $# -gt 0 ]; do
             ACTION="stop"
             shift
             ;;
+        --restart)
+            ACTION="restart"
+            shift
+            ;;
         --upgrade)
             ACTION="upgrade"
             shift
@@ -278,6 +282,10 @@ Options:
   --debug             Enable debug/verbose logging
   --status            Show whether the bot is running
   --stop              Stop the running bot
+  --restart           Atomic stop → start → verify-available (add -d to restart
+                      into daemon mode). Exits 0 only once --status reports
+                      "available"; nonzero with a reason otherwise. Refuses
+                      (exit 3) when systemd/launchd manages the bridge.
   --upgrade           Update through canonical ccc-self-update and reinstall if changed
   --version           Print the installed ccc-node checkout identity
   --install           Install as macOS launchd startup service
@@ -736,6 +744,20 @@ check_env() {
     fi
 }
 
+# ── Startup-service install/uninstall (extracted subcommands, #584 P3-2) ──
+# The plist/unit generation and loader machinery lives in service-launchd.sh
+# and service-systemd.sh so it is testable in isolation (see
+# service-install.test.sh). Pre-flight guards that depend on start.sh state
+# (check_env, running-instance and token-lock checks) stay here; the
+# subcommands receive everything else via explicit flags/env:
+#   --project-root  validated $PROJECT_ROOT
+#   --proxy-url     PROXY_URL resolved through read_env_with_fallback (project
+#                   .env first, then bot source dir .env — same order as the
+#                   previous inline implementation)
+#   --caller        $0, so user-facing hints keep the invoked script name
+#   CCC_BRIDGE_TOKEN_LOCK_FILE  env: token-lock path from init_token_lock, so
+#                   uninstall can clear a stale lock safely
+
 do_install() {
     check_env
     init_token_lock
@@ -748,235 +770,42 @@ do_install() {
         echo "⚠️  Another instance is already using the same Bot Token (PID: $(cat "$TOKEN_LOCK_FILE")). Stop it first."
         exit 1
     fi
-    echo "📝 Generating launchd plist: $PLIST_FILE"
-    mkdir -p "$(dirname "$PLIST_FILE")"
-    # Ensure .local/bin is in PATH for claude CLI
-    LAUNCHD_PATH="${PATH}"
-    if [ -d "$HOME/.local/bin" ] && ! echo "$LAUNCHD_PATH" | grep -q "$HOME/.local/bin"; then
-        LAUNCHD_PATH="$HOME/.local/bin:$LAUNCHD_PATH"
-    fi
-
-    # Read proxy config for launchd environment
-    local proxy_url
-    proxy_url="$(read_env_with_fallback "PROXY_URL")"
-
-    # Build environment variables section
-    local env_vars
-    env_vars="    <key>EnvironmentVariables</key>
-    <dict>
-        <key>PATH</key>
-        <string>${LAUNCHD_PATH}</string>
-        <key>HOME</key>
-        <string>${HOME}</string>"
-    if [ -n "$proxy_url" ]; then
-        env_vars="$env_vars
-        <key>http_proxy</key>
-        <string>${proxy_url}</string>
-        <key>https_proxy</key>
-        <string>${proxy_url}</string>
-        <key>all_proxy</key>
-        <string>${proxy_url}</string>
-        <key>no_proxy</key>
-        <string>localhost,127.0.0.1,192.168.0.0/16,10.0.0.0/8,172.16.0.0/12</string>"
-    fi
-    env_vars="$env_vars
-    </dict>"
-
-    cat > "$PLIST_FILE" <<PLIST
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
-  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>${PLIST_LABEL}</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>/bin/bash</string>
-        <string>${SCRIPT_DIR}/start.sh</string>
-        <string>--path</string>
-        <string>${PROJECT_ROOT}</string>
-        <string>--_launchd_child</string>
-    </array>
-${env_vars}
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <true/>
-    <key>StandardOutPath</key>
-    <string>${LOGS_DIR}/launchd_stdout.log</string>
-    <key>StandardErrorPath</key>
-    <string>${LOGS_DIR}/launchd_stderr.log</string>
-    <key>WorkingDirectory</key>
-    <string>${REPO_ROOT}</string>
-</dict>
-</plist>
-PLIST
-    # Ensure old service is unloaded first
-    launchctl bootout "gui/$(id -u)/${PLIST_LABEL}" 2>/dev/null
-    # Load using new API
-    if launchctl bootstrap "gui/$(id -u)" "$PLIST_FILE"; then
-        echo "✅ Installed and loaded as startup service"
-        echo "🚀 Bot started via launchd"
-    else
-        echo "⚠️  launchctl bootstrap failed, trying legacy API..."
-        launchctl load -w "$PLIST_FILE"
-    fi
-    # Wait for process to start (up to 5 seconds)
-    echo "⏳ Waiting for bot to initialize..."
-    for i in $(seq 1 10); do
-        sleep 0.5
-        if [ -f "$PID_FILE" ]; then
-            pid="$(cat "$PID_FILE")"
-            if kill -0 "$pid" 2>/dev/null; then
-                echo "✅ Bot process started (PID: $pid)"
-                break
-            fi
-        fi
-    done
-    echo "💡 Use $0 --path \"$PROJECT_ROOT\" --status to check status"
-    echo "💡 Use $0 --path \"$PROJECT_ROOT\" --uninstall to remove startup service"
-    exit 0
+    exec "$SCRIPT_DIR/service-launchd.sh" install \
+        --project-root "$PROJECT_ROOT" \
+        --proxy-url "$(read_env_with_fallback "PROXY_URL")" \
+        --caller "$0"
 }
 
 do_uninstall() {
-    if [ -f "$PLIST_FILE" ]; then
-        echo "🗑️  Uninstalling launchd plist..."
-        # Stop the service first
-        launchctl bootout "gui/$(id -u)/${PLIST_LABEL}" 2>/dev/null || launchctl unload "$PLIST_FILE" 2>/dev/null || true
-        sleep 1
-        # Stop any remaining processes
-        local pid supervisor_pid
-        supervisor_pid="$(read_supervisor_pid)"
-        pid="$(read_pid)"
-        if [ -n "$supervisor_pid" ] && kill -0 "$supervisor_pid" 2>/dev/null; then
-            echo "🛑 Stopping daemon supervisor (PID: $supervisor_pid)..."
-            kill "$supervisor_pid" 2>/dev/null || true
-        fi
-        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-            echo "🛑 Stopping bot process (PID: $pid)..."
-            kill "$pid" 2>/dev/null || true
-        fi
-        cleanup_pid
-        cleanup_supervisor_pid
-        cleanup_token_lock_if_safe "$supervisor_pid" "$pid"
-        # Remove the plist file
-        rm -f "$PLIST_FILE"
-        echo "✅ Startup service uninstalled"
-    else
-        echo "⚪ Startup service not installed (plist not found)"
-    fi
-    exit 0
+    init_token_lock
+    export CCC_BRIDGE_TOKEN_LOCK_FILE="$TOKEN_LOCK_FILE"
+    exec "$SCRIPT_DIR/service-launchd.sh" uninstall \
+        --project-root "$PROJECT_ROOT" \
+        --caller "$0"
 }
 
 # ── Linux systemd startup service (reboot-persistent) ──
-# Mirrors do_install for Linux nodes, where `start.sh --install` (launchd) does not apply.
-# Runs the bridge in the FOREGROUND under systemd supervision (Type=simple): start.sh's own
-# prepare_runtime + exec_bot_once handle venv/deps/token-lock, and systemd handles restart-on-crash
-# and reboot persistence — so we deliberately do NOT pass -d/--daemon here.
-# Service unit name is overridable via BRIDGE_SERVICE_NAME (default ccc-telegram-bridge), letting
-# one host run multiple bridges (e.g. ccc-telegram-bridge-<slug>). Installs a system unit when run
-# as root, otherwise a `systemctl --user` unit under ~/.config/systemd/user.
-
-systemd_paths() {
-    # Sets SYSTEMD_UNIT_FILE, SYSTEMCTL (array), SYSTEMD_SCOPE based on euid.
-    SYSTEMD_SERVICE="${BRIDGE_SERVICE_NAME:-ccc-telegram-bridge}.service"
-    if [ "$(id -u)" = "0" ]; then
-        SYSTEMD_SCOPE="system"
-        SYSTEMD_UNIT_DIR="/etc/systemd/system"
-        SYSTEMCTL=(systemctl)
-    else
-        SYSTEMD_SCOPE="user"
-        SYSTEMD_UNIT_DIR="$HOME/.config/systemd/user"
-        SYSTEMCTL=(systemctl --user)
-    fi
-    SYSTEMD_UNIT_FILE="$SYSTEMD_UNIT_DIR/$SYSTEMD_SERVICE"
-}
+# Mirrors do_install for Linux nodes, where `start.sh --install` (launchd)
+# does not apply. Unit generation and systemctl handling live in
+# service-systemd.sh (see its header for the unit semantics and the
+# BRIDGE_SERVICE_NAME / CCC_SYSTEMD_DIR / CCC_SYSTEMCTL contracts).
 
 do_install_systemd() {
-    if ! command -v systemctl >/dev/null 2>&1; then
+    # Keep the systemd-availability hint BEFORE check_env so macOS users get
+    # "use --install instead" without being walked through token setup first.
+    if ! command -v "${CCC_SYSTEMCTL:-systemctl}" >/dev/null 2>&1; then
         echo "❌ systemctl not found — this host does not use systemd. On macOS use --install instead."
         exit 1
     fi
     check_env
-    systemd_paths
-
-    # Build PATH so the claude CLI (often in ~/.local/bin) is reachable from the unit.
-    local svc_path="$PATH"
-    if [ -d "$HOME/.local/bin" ] && ! echo "$svc_path" | grep -q "$HOME/.local/bin"; then
-        svc_path="$HOME/.local/bin:$svc_path"
-    fi
-    # Optional proxy, mirrored from the launchd installer.
-    local proxy_url proxy_env=""
-    proxy_url="$(read_env_with_fallback "PROXY_URL")"
-    if [ -n "$proxy_url" ]; then
-        proxy_env="Environment=http_proxy=${proxy_url}
-Environment=https_proxy=${proxy_url}
-Environment=all_proxy=${proxy_url}
-Environment=no_proxy=localhost,127.0.0.1,192.168.0.0/16,10.0.0.0/8,172.16.0.0/12"
-    fi
-
-    local wanted_by="default.target"
-    [ "$SYSTEMD_SCOPE" = "system" ] && wanted_by="multi-user.target"
-
-    echo "📝 Generating systemd unit: $SYSTEMD_UNIT_FILE"
-    mkdir -p "$SYSTEMD_UNIT_DIR"
-    cat > "$SYSTEMD_UNIT_FILE" <<UNIT
-[Unit]
-Description=ccc-node Telegram bridge (${PROJECT_SLUG})
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-WorkingDirectory=${REPO_ROOT}
-Environment=HOME=${HOME}
-Environment=PATH=${svc_path}
-${proxy_env}
-ExecStart=/bin/bash ${SCRIPT_DIR}/start.sh --path ${PROJECT_ROOT}
-# Recover when the bridge handles a direct SIGTERM as a clean exit. An explicit
-# systemctl stop still suppresses restart, preserving operator stop semantics.
-Restart=always
-RestartSec=3
-TimeoutStopSec=20
-
-[Install]
-WantedBy=${wanted_by}
-UNIT
-    # Collapse the blank line left when there is no proxy block.
-    sed -i '/^$/d' "$SYSTEMD_UNIT_FILE" 2>/dev/null || true
-
-    "${SYSTEMCTL[@]}" daemon-reload
-    if "${SYSTEMCTL[@]}" enable --now "$SYSTEMD_SERVICE"; then
-        echo "✅ Installed and started as $SYSTEMD_SCOPE service: $SYSTEMD_SERVICE"
-    else
-        echo "⚠️  enable --now failed; unit written to $SYSTEMD_UNIT_FILE — inspect with: ${SYSTEMCTL[*]} status $SYSTEMD_SERVICE"
-        exit 1
-    fi
-    local journal_scope=""
-    [ "$SYSTEMD_SCOPE" = "user" ] && journal_scope="--user "
-    echo "💡 Status: ${SYSTEMCTL[*]} status $SYSTEMD_SERVICE"
-    echo "💡 Logs:   journalctl ${journal_scope}-u $SYSTEMD_SERVICE -f"
-    echo "💡 Remove: $0 --path \"$PROJECT_ROOT\" --uninstall-systemd"
-    exit 0
+    exec "$SCRIPT_DIR/service-systemd.sh" install \
+        --project-root "$PROJECT_ROOT" \
+        --proxy-url "$(read_env_with_fallback "PROXY_URL")" \
+        --caller "$0"
 }
 
 do_uninstall_systemd() {
-    if ! command -v systemctl >/dev/null 2>&1; then
-        echo "❌ systemctl not found — nothing to uninstall."
-        exit 1
-    fi
-    systemd_paths
-    if [ -f "$SYSTEMD_UNIT_FILE" ]; then
-        echo "🗑️  Removing systemd unit: $SYSTEMD_UNIT_FILE"
-        "${SYSTEMCTL[@]}" disable --now "$SYSTEMD_SERVICE" 2>/dev/null || true
-        rm -f "$SYSTEMD_UNIT_FILE"
-        "${SYSTEMCTL[@]}" daemon-reload
-        echo "✅ systemd service uninstalled"
-    else
-        echo "⚪ systemd service not installed ($SYSTEMD_UNIT_FILE not found)"
-    fi
-    exit 0
+    exec "$SCRIPT_DIR/service-systemd.sh" uninstall --caller "$0"
 }
 
 do_version() {
@@ -1084,11 +913,160 @@ cleanup_token_lock_if_safe() {
     fi
 }
 
+# ── Atomic restart (--restart) ──
+# First-class stop→start→verify so rollouts never depend on ad-hoc
+# `--stop && start &` compositions (2026-07-19 fleet rollout: a detached
+# restart silently never executed; the wrong checkout's start.sh was invoked;
+# pre-flight guards were bypassed so token resolution failed after the stop).
+# Reuses the existing code paths only: pre-flight via check_env, stop via
+# do_stop, start via THIS checkout's start.sh (which runs the normal start
+# guards itself), readiness via the do_status internals.
+#
+# Exit codes:
+#   0  restart verified — --status reports "available"
+#   1  stop-failed        (old process refuses to exit within the bound)
+#   2  start-failed       (start invocation failed / process died before ready)
+#   3  supervisor-managed (systemd/launchd owns the bridge; restart it there)
+#   4  not-available-within-timeout
+#
+# Test seams (defaults preserve production behavior):
+#   CCC_BRIDGE_RESTART_STOP_TIMEOUT   seconds to wait for old-process exit (15)
+#   CCC_BRIDGE_RESTART_READY_TIMEOUT  seconds to wait for "available" (45)
+#   CCC_BRIDGE_RESTART_SPAWN          start command override (this start.sh)
+
+RESTART_OLD_PID=""
+RESTART_OLD_SUPERVISOR_PID=""
+
+restart_status_snapshot() {
+    # do_status exits, so run it in a subshell to reuse it as a probe.
+    ( do_status ) 2>/dev/null
+}
+
+restart_live_old_pids() {
+    local pid
+    for pid in "${RESTART_OLD_PID:-}" "${RESTART_OLD_SUPERVISOR_PID:-}"; do
+        [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && printf '%s\n' "$pid"
+    done
+    find_project_bot_pids
+}
+
+do_restart() {
+    local stop_timeout="${CCC_BRIDGE_RESTART_STOP_TIMEOUT:-15}"
+    local ready_timeout="${CCC_BRIDGE_RESTART_READY_TIMEOUT:-45}"
+    local spawn_cmd="${CCC_BRIDGE_RESTART_SPAWN:-$SCRIPT_DIR/start.sh}"
+    local waited live ready new_pid spawn_pid="" restart_log="" unit scope_flag
+
+    # Supervisor-managed bridges: restarting underneath launchd KeepAlive or
+    # systemd Restart=always causes supervisor fights. Conservative check —
+    # refuse only when the manager clearly owns it.
+    if [ -f "$PLIST_FILE" ]; then
+        echo "⚠️  Bridge is managed by launchd ($PLIST_LABEL) — not restarting it here."
+        echo "💡 Restart via the service manager: launchctl kickstart -k gui/$(id -u)/$PLIST_LABEL"
+        exit 3
+    fi
+    if "$SCRIPT_DIR/service-systemd.sh" is-managed >/dev/null 2>&1; then
+        unit="${BRIDGE_SERVICE_NAME:-ccc-telegram-bridge}.service"
+        scope_flag=""
+        [ "$(id -u)" = "0" ] || scope_flag=" --user"
+        echo "⚠️  Bridge is managed by systemd (active unit: $unit) — not restarting it here."
+        echo "💡 Restart via the service manager: systemctl${scope_flag} restart $unit"
+        exit 3
+    fi
+
+    # Pre-flight BEFORE touching the running bot: fail while the old instance
+    # is still up rather than after the stop (the 2026-07-19 mode where the
+    # bot stayed down because the start half could not resolve its token).
+    merge_env_files
+    check_env
+
+    RESTART_OLD_PID="$(read_pid)"
+    RESTART_OLD_SUPERVISOR_PID="$(read_supervisor_pid)"
+    if [ -z "$RESTART_OLD_PID" ]; then
+        RESTART_OLD_PID="$(find_project_bot_pids | head -n1)"
+    fi
+    echo "🔁 Restarting bridge (old PID: ${RESTART_OLD_PID:-none})"
+
+    # Stop: the exact --stop code path (launchd bootout, supervisor, managed
+    # and unmanaged processes, token-lock cleanup). Subshell because do_stop
+    # exits.
+    if ! ( do_stop ); then
+        echo "❌ Restart failed: stop-failed (--stop path exited nonzero)"
+        exit 1
+    fi
+
+    # Bounded wait for the old process(es) to actually exit.
+    waited=0
+    live="$(restart_live_old_pids | tr '\n' ' ' | sed 's/ $//')"
+    while [ -n "$live" ] && [ "$waited" -lt "$stop_timeout" ]; do
+        sleep 1
+        waited=$((waited + 1))
+        live="$(restart_live_old_pids | tr '\n' ' ' | sed 's/ $//')"
+    done
+    if [ -n "$live" ]; then
+        echo "❌ Restart failed: stop-failed — old process refuses to exit after ${stop_timeout}s (PID(s): $live)"
+        echo "   Not starting a new instance on top of it."
+        exit 1
+    fi
+
+    # Start via the same code paths the plain flags use, pinned to THIS
+    # checkout's start.sh (a wrong-checkout start.sh was a 2026-07-19 mode).
+    local spawn_args=("--path" "$PROJECT_ROOT")
+    [ -n "$BOT_DEBUG" ] && spawn_args+=("--debug")
+    if [ "$DAEMON_MODE" -eq 1 ]; then
+        # Same path as `start.sh --path <p> --daemon`.
+        if ! "$spawn_cmd" "${spawn_args[@]}" --daemon; then
+            echo "❌ Restart failed: start-failed (daemon start exited nonzero)"
+            exit 2
+        fi
+    else
+        # Same path as a plain foreground `start.sh --path <p>` run (its own
+        # pre-flight guards, prepare_runtime, exec into the bot). Detached
+        # from this terminal so the verified bridge survives the restart
+        # command exiting; output goes to the restart log.
+        restart_log="$LOGS_DIR/restart.log"
+        nohup "$spawn_cmd" "${spawn_args[@]}" >> "$restart_log" 2>&1 &
+        spawn_pid=$!
+        echo "🚀 Starting bridge (spawn PID: $spawn_pid, log: $restart_log)"
+    fi
+
+    # Bounded readiness verification: poll the --status internals until the
+    # health snapshot renders "available".
+    waited=0
+    ready=0
+    while [ "$waited" -lt "$ready_timeout" ]; do
+        if restart_status_snapshot | grep -q "Bot status: available"; then
+            ready=1
+            break
+        fi
+        if [ -n "$spawn_pid" ] && ! kill -0 "$spawn_pid" 2>/dev/null && ! is_running; then
+            echo "❌ Restart failed: start-failed (spawned process exited before becoming available; see $restart_log)"
+            exit 2
+        fi
+        sleep 1
+        waited=$((waited + 1))
+    done
+
+    if [ "$ready" -ne 1 ]; then
+        echo "❌ Restart failed: not-available-within-timeout (${ready_timeout}s)"
+        echo "── last status ──"
+        restart_status_snapshot
+        echo "💡 The new process (if any) was left running — inspect with: $0 --path \"$PROJECT_ROOT\" --status"
+        exit 4
+    fi
+
+    new_pid="$(read_pid)"
+    echo "✅ Restart verified: bot available (old PID: ${RESTART_OLD_PID:-none} → new PID: ${new_pid:-unknown})"
+    echo "── health ──"
+    restart_status_snapshot
+    exit 0
+}
+
 # ── Dispatch action ──
 
 case "$ACTION" in
     status)    do_status ;;
     stop)      do_stop ;;
+    restart)   do_restart ;;
     install)           do_install ;;
     uninstall)         do_uninstall ;;
     install-systemd)   do_install_systemd ;;

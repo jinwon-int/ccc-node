@@ -56,6 +56,7 @@ from telegram_bot.core.bot_delivery import BotDeliveryMixin
 from telegram_bot.core import bot_voice as _bot_voice_module
 from telegram_bot.core.bot_voice import BotVoiceMixin
 from telegram_bot.core.bot_approvals import BotApprovalMixin
+from telegram_bot.core.bot_callbacks import BotCallbackMixin
 
 
 _EXTRACTED_MODULES = (
@@ -97,6 +98,7 @@ class TelegramBot(
     BotAccessMixin,
     BotCommandMixin,
     BotDeliveryMixin,
+    BotCallbackMixin,
     BotVoiceMixin,
     BotApprovalMixin,
 ):
@@ -288,6 +290,23 @@ class TelegramBot(
         session.update(provider=active_provider, session_id=None, new_session=True)
         session.pop("model", None)
         return session, True
+
+    async def _switch_provider_if_needed(
+        self, session_key: Any, user_id: int, chat_id: int, session=None
+    ):
+        """Align the session provider and reset approval state on a switch.
+
+        The deny/invalidate pair is security-relevant: pending and previously
+        granted Codex approvals belong to the departing provider and must not
+        survive into the new one. Keeping the reset inside this helper means a
+        call site cannot align the provider and forget the reset.
+        """
+        aligned, switched = await self._align_active_provider(session_key, session)
+        if switched:
+            self._deny_codex_approvals(user_id, chat_id)
+            self._invalidate_codex_approvals(user_id, chat_id)
+            self._runtime_active_sessions.discard(session_key)
+        return aligned, switched
 
     async def _reset_for_auto_new_session(
         self, session_key: Any, session: dict[str, Any]
@@ -538,13 +557,9 @@ class TelegramBot(
         await self._seed_scoped_session_from_legacy(
             conversation_key, user_id, chat.id, current_session
         )
-        current_session, provider_switched = await self._align_active_provider(
-            conversation_key, current_session
+        current_session, provider_switched = await self._switch_provider_if_needed(
+            conversation_key, user_id, chat.id, current_session
         )
-        if provider_switched:
-            self._deny_codex_approvals(user_id, chat.id)
-            self._invalidate_codex_approvals(user_id, chat.id)
-            self._runtime_active_sessions.discard(conversation_key)
         current_reply_mode = self._normalize_reply_mode(
             current_session.get("reply_mode")
         )

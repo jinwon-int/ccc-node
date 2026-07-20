@@ -17,14 +17,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from telegram_bot.core.session_scope import (
-    SESSION_SCOPE_SHARED_ALL,
-    is_group_conversation,
-    normalize_session_scope,
+from telegram_bot.core.session_scope import is_group_conversation
+from telegram_bot.utils.memory_policy import (
+    MEMORY_MODE_AUDIENCE_SCOPED,
+    assert_memory_scope_safe,
 )
 
 
-MEMORY_MODE_AUDIENCE_SCOPED = "audience-scoped"
 AUDIENCE_PRIVATE = "private"
 AUDIENCE_SHARED = "shared"
 _KEY_BYTES = 32
@@ -179,12 +178,10 @@ def resolve_memory_audience(
         return None
     if chat_id is None:
         raise ValueError("audience-scoped memory requires a Telegram chat id")
-    if normalize_session_scope(
-        getattr(settings, "telegram_session_scope", "per-user-chat")
-    ) == SESSION_SCOPE_SHARED_ALL:
-        raise ValueError(
-            "audience-scoped memory cannot run with CCC_TELEGRAM_SESSION_SCOPE=shared-all"
-        )
+    assert_memory_scope_safe(
+        MEMORY_MODE_AUDIENCE_SCOPED,
+        getattr(settings, "telegram_session_scope", "per-user-chat"),
+    )
 
     root = _audience_root(settings)
     if is_group_conversation(user_id, chat_id):

@@ -17,7 +17,9 @@
 #   - Dry-run:   touch ~/.claude/state/distill.dryrun (no Honcho/queue writes)
 set -uo pipefail
 
-is_disabled() { case "${1:-}" in 0|false|FALSE|off|OFF|no|NO) return 0;; *) return 1;; esac; }
+DISTILL_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)" || DISTILL_LIB_DIR="${HOME:-/root}/.claude/hooks"
+# shellcheck source=claude/hooks/lib/hook-common.sh
+. "$DISTILL_LIB_DIR/lib/hook-common.sh" || exit 0
 wiki_memory_disabled() {
   [ "${CCC_NODE_ISOLATION_PROFILE:-fleet}" = "external" ] || is_disabled "${CCC_WIKI_MEMORY_ENABLED:-1}"
 }
@@ -46,8 +48,7 @@ TRIGGER="${1:-manual}"   # precompact | sessionend | manual
 DRYRUN=0
 [ -f "$STATE_DIR/distill.dryrun" ] && DRYRUN=1
 
-ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
-log() { printf '%s %s\n' "$(ts)" "$*" >> "$LOG" 2>/dev/null; }
+# ts/log come from lib/hook-common.sh.
 
 # ---- detached pipeline body --------------------------------------------------
 # Shared by both spawn modes (setsid re-entry + legacy subshell fallback).

@@ -8,6 +8,8 @@ import re
 from collections.abc import Mapping
 from typing import Any, Optional
 
+from claude_agent_sdk import RateLimitEvent, ResultMessage
+
 from telegram_bot.core.agent_runtime import (
     ApprovalDecision,
     ApprovalRequestEvent,
@@ -25,6 +27,7 @@ from telegram_bot.core.agent_runtime import (
 from telegram_bot.core.heartbeat import tool_label
 from telegram_bot.core.project_chat_types import (
     AgentApprovalCallback,
+    AgentSessionEntry,
     ChatResponse,
     InterimMessageCallback,
     PermissionCallback,
@@ -103,6 +106,16 @@ class ProjectChatProcessMixin:
     ) -> ChatResponse:
         del message_id
         if self._agent_runtime is not None:
+            if getattr(self._config, "agent_provider", "claude") == "claude":
+                # Claude adapter path (#584 slice B, CCC_CLAUDE_RUNTIME_ADAPTER):
+                # the bot layer's approval/sandbox knobs are Codex app-server
+                # policies (bot_access._codex_*) that ClaudeRuntime rejects
+                # fail-closed. On this path the approval boundary is the SDK
+                # can_use_tool -> approval_callback seam, so drop the
+                # untranslatable Codex-only knobs instead of forwarding them.
+                approval_policy = None
+                approvals_reviewer = None
+                sandbox_policy = None
             if sensitive_log_event is not None:
                 _log_user_input(
                     user_message=user_message,
@@ -126,6 +139,7 @@ class ProjectChatProcessMixin:
                 typing_callback=typing_callback,
                 status_callback=status_callback,
                 bot=bot,
+                notification_bot=notification_bot,
                 interim_message_callback=interim_message_callback,
             )
         _log_user_input(
@@ -359,6 +373,95 @@ class ProjectChatProcessMixin:
         except Exception:
             logger.exception("Failed to cancel agent stream while %s", context)
 
+    def _register_agent_unsolicited_handler(
+        self,
+        session: Any,
+        *,
+        user_id: int,
+        chat_id: int,
+        model: Optional[str],
+        route_bot: Optional[Any],
+    ) -> None:
+        """Route runtime-side unsolicited turns to Telegram (#584 P3-1B).
+
+        The adapter counterpart of the direct path's ``deliver_unsolicited``
+        closure plus ``_handle_unsolicited_message`` bookkeeping: assistant
+        output the runtime produced outside any active turn (for example the
+        CLI autonomously continuing after a background-task notification) is
+        cleaned, bounded, and sent to the same conversation. The seam is
+        optional — sessions without ``set_unsolicited_handler`` (Codex) keep
+        their current behavior — and without a route bot any previously
+        registered handler is left in place, mirroring how the direct path
+        keeps an existing stream callback when a request carries no bot.
+        """
+
+        setter = getattr(session, "set_unsolicited_handler", None)
+        if not callable(setter):
+            return
+        if route_bot is None:
+            return
+
+        async def deliver_unsolicited(text: str, session_id: Optional[str]) -> None:
+            content = self._clean_response(text) or "(No response)"
+            payload = content
+            if len(payload) > 4000:
+                payload = f"{payload[:3960]}\n\n… (background result truncated)"
+            try:
+                await route_bot.send_message(chat_id=chat_id, text=payload)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.error(
+                    "Unsolicited Telegram delivery failed: user=%s session=%s error=%s",
+                    user_id,
+                    session_id,
+                    type(exc).__name__,
+                )
+                health_reporter.record_claude_error(
+                    f"Unsolicited Telegram delivery failed: {type(exc).__name__}"
+                )
+                return
+            health_reporter.record_claude_ok()
+            log_chat(user_id, session_id, "assistant", content, model=model)
+
+        setter(deliver_unsolicited)
+
+    def _register_agent_frame_observer(
+        self, session: Any, *, user_id: int, chat_id: int
+    ) -> None:
+        """Feed adapter-path SDK frames into the direct-path /usage recorders.
+
+        #584 C-1 follow-up: on the now-default ClaudeRuntime adapter path the
+        legacy reader loop never runs, so nothing recorded the ResultMessage
+        usage/cost snapshots or the RateLimitEvent windows that ``get_usage``
+        aggregates — /usage rendered every line "unavailable" while turns
+        worked. ``ClaudeSession.set_sdk_frame_observer`` replays the raw SDK
+        frames (turn-bearing and between-turns flows alike); this observer
+        routes them into the same recorders the direct reader loop uses.
+
+        Observation-only: token/request metering stays on the slice-B seam
+        (``record_claude_adapter_attempt`` / ``record_claude_adapter_result``),
+        so nothing double-charges the usage meter. Runtimes without the seam
+        (Codex serves /usage from its own ``get_usage`` endpoint) and
+        non-Claude providers are untouched.
+        """
+
+        if getattr(self._config, "agent_provider", "claude") != "claude":
+            return
+        setter = getattr(session, "set_sdk_frame_observer", None)
+        if not callable(setter):
+            return
+
+        def observe_sdk_frame(message: Any) -> None:
+            if isinstance(message, RateLimitEvent):
+                # Account-global windows, deliberately not conversation-scoped
+                # (see ``_claude_rate_limit`` in project_chat).
+                self._record_claude_rate_limit(message)
+            elif isinstance(message, ResultMessage):
+                self.record_claude_result_snapshot(user_id, chat_id, message)
+
+        setter(observe_sdk_frame)
+
     async def _agent_progress_loop(self, request: _PendingRequest) -> None:
         """Keep provider-neutral turns visibly alive between runtime events."""
         try:
@@ -411,6 +514,7 @@ class ProjectChatProcessMixin:
         status_callback: Optional[StatusCallback],
         bot: Optional[Any],
         interim_message_callback: Optional[InterimMessageCallback],
+        notification_bot: Optional[Any] = None,
     ) -> ChatResponse:
         """Run one provider-neutral turn without changing the Claude SDK path."""
         key = self._stream_key(user_id, chat_id)
@@ -443,25 +547,20 @@ class ProjectChatProcessMixin:
             progress_terminal_state = TASK_FAILED
             generation = self._next_agent_generation(key)
             self._agent_active_generations[key] = generation
-            session = self._agent_sessions.get(key)
+            entry = self._agent_sessions.get(key)
+            session = entry.session if entry is not None else None
             if new_session or (
-                session is not None
+                entry is not None
                 and (
-                    (session_id is not None and session.session_id != session_id)
-                    or self._agent_session_models.get(key) != model
-                    or self._agent_session_efforts.get(key) != effort
-                    or self._agent_session_approval_policies.get(key) != approval_policy
-                    or self._agent_session_approvals_reviewers.get(key)
-                    != approvals_reviewer
-                    or self._agent_session_sandbox_policies.get(key) != sandbox_policy
+                    (session_id is not None and entry.session.session_id != session_id)
+                    or entry.model != model
+                    or entry.effort != effort
+                    or entry.approval_policy != approval_policy
+                    or entry.approvals_reviewer != approvals_reviewer
+                    or entry.sandbox_policy != sandbox_policy
                 )
             ):
                 self._agent_sessions.pop(key, None)
-                self._agent_session_models.pop(key, None)
-                self._agent_session_efforts.pop(key, None)
-                self._agent_session_approval_policies.pop(key, None)
-                self._agent_session_approvals_reviewers.pop(key, None)
-                self._agent_session_sandbox_policies.pop(key, None)
                 session = None
             try:
                 if session is None:
@@ -476,13 +575,30 @@ class ProjectChatProcessMixin:
                             sandbox_policy=sandbox_policy,
                         )
                     )
-                    self._agent_sessions[key] = session
-                    self._agent_session_models[key] = model
-                    self._agent_session_efforts[key] = effort
-                    self._agent_session_approval_policies[key] = approval_policy
-                    self._agent_session_approvals_reviewers[key] = approvals_reviewer
-                    self._agent_session_sandbox_policies[key] = sandbox_policy
+                    self._agent_sessions[key] = AgentSessionEntry(
+                        session=session,
+                        model=model,
+                        effort=effort,
+                        approval_policy=approval_policy,
+                        approvals_reviewer=approvals_reviewer,
+                        sandbox_policy=sandbox_policy,
+                    )
 
+                # (Re-)register the between-turns delivery route each turn so
+                # the autonomous-output path always targets the latest bot
+                # reference for this (user_id, chat_id) conversation.
+                self._register_agent_unsolicited_handler(
+                    session,
+                    user_id=user_id,
+                    chat_id=chat_id,
+                    model=model,
+                    route_bot=notification_bot or bot,
+                )
+                # Same cadence as the unsolicited route: (re-)register the
+                # /usage observation seam each turn for this conversation.
+                self._register_agent_frame_observer(
+                    session, user_id=user_id, chat_id=chat_id
+                )
                 self._agent_active_sessions[key] = session
                 self._agent_started_at[key] = asyncio.get_running_loop().time()
                 text_parts: list[str] = []
@@ -526,6 +642,7 @@ class ProjectChatProcessMixin:
                     getattr(self._config, "terminal_stall_seconds", 0.0) or 0.0
                 )
                 stalled = False
+                attempt_recorded = False
 
                 async def deliver_pending_interim() -> None:
                     """Deliver a completed message only after more turn work appears."""
@@ -572,6 +689,7 @@ class ProjectChatProcessMixin:
                     conversation until the full process timeout.
                     """
                     nonlocal terminal_error, stalled, pending_completed_message
+                    nonlocal attempt_recorded
                     busy_depth = 0
                     approval_pending = False
                     active_tools: dict[str, str] = {}
@@ -601,6 +719,14 @@ class ProjectChatProcessMixin:
                                 return
                             now = asyncio.get_running_loop().time()
                             progress_request.last_event_at = now
+                            if not attempt_recorded:
+                                # Claude adapter-path spend boundary (#388):
+                                # ClaudeRuntime has no turn-attempt seam, so
+                                # the first event of an accepted turn meters
+                                # the request. No-op for runtimes (Codex)
+                                # that meter at their own boundary.
+                                attempt_recorded = True
+                                self.record_claude_adapter_attempt()
                             approval_pending = isinstance(event, ApprovalRequestEvent)
                             if isinstance(event, TextDeltaEvent):
                                 # A new text delta after a completed message proves
@@ -646,12 +772,17 @@ class ProjectChatProcessMixin:
                                 )
                             elif isinstance(event, ErrorEvent):
                                 terminal_error = event
+                            elif isinstance(event, ResultEvent):
+                                # Terminal usage payload: the Claude adapter
+                                # path meters its tokens here (#388); a no-op
+                                # for Codex, which meters via the runtime's
+                                # usage-recorder seam.
+                                self.record_claude_adapter_result(event)
                             elif isinstance(
                                 event,
                                 (
                                     ReasoningDeltaEvent,
                                     ApprovalRequestEvent,
-                                    ResultEvent,
                                     CompletionEvent,
                                 ),
                             ):
@@ -677,13 +808,7 @@ class ProjectChatProcessMixin:
 
                 if stalled:
                     progress_terminal_state = TASK_COMPLETED
-                    if self._agent_sessions.get(key) is session:
-                        self._agent_sessions.pop(key, None)
-                        self._agent_session_models.pop(key, None)
-                        self._agent_session_efforts.pop(key, None)
-                        self._agent_session_approval_policies.pop(key, None)
-                        self._agent_session_approvals_reviewers.pop(key, None)
-                        self._agent_session_sandbox_policies.pop(key, None)
+                    self._drop_agent_session(key, session)
                     await self._interrupt_agent_session(session)
                     final_streamed = False
                     if streaming_handler:
@@ -720,13 +845,7 @@ class ProjectChatProcessMixin:
                 content = content or "(No response)"
                 if terminal_error is not None:
                     progress_terminal_state = TASK_FAILED
-                    if self._agent_sessions.get(key) is session:
-                        self._agent_sessions.pop(key, None)
-                        self._agent_session_models.pop(key, None)
-                        self._agent_session_efforts.pop(key, None)
-                        self._agent_session_approval_policies.pop(key, None)
-                        self._agent_session_approvals_reviewers.pop(key, None)
-                        self._agent_session_sandbox_policies.pop(key, None)
+                    self._drop_agent_session(key, session)
                     return ChatResponse(
                         content=f"❌ Processing failed: {terminal_error.message}",
                         success=False,
@@ -745,13 +864,8 @@ class ProjectChatProcessMixin:
                 )
             except TimeoutError:
                 progress_terminal_state = TASK_TIMEOUT
-                if session is not None and self._agent_sessions.get(key) is session:
-                    self._agent_sessions.pop(key, None)
-                    self._agent_session_models.pop(key, None)
-                    self._agent_session_efforts.pop(key, None)
-                    self._agent_session_approval_policies.pop(key, None)
-                    self._agent_session_approvals_reviewers.pop(key, None)
-                    self._agent_session_sandbox_policies.pop(key, None)
+                if session is not None:
+                    self._drop_agent_session(key, session)
                 if session is not None:
                     await self._interrupt_agent_session(session)
                 await self._cancel_agent_streaming(
@@ -774,13 +888,8 @@ class ProjectChatProcessMixin:
                 raise
             except Exception as exc:
                 progress_terminal_state = TASK_FAILED
-                if session is not None and self._agent_sessions.get(key) is session:
-                    self._agent_sessions.pop(key, None)
-                    self._agent_session_models.pop(key, None)
-                    self._agent_session_efforts.pop(key, None)
-                    self._agent_session_approval_policies.pop(key, None)
-                    self._agent_session_approvals_reviewers.pop(key, None)
-                    self._agent_session_sandbox_policies.pop(key, None)
+                if session is not None:
+                    self._drop_agent_session(key, session)
                 await self._cancel_agent_streaming(
                     streaming_handler, context="returning an agent error"
                 )

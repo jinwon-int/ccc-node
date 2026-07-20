@@ -9,7 +9,7 @@ import shlex as _shlex
 import sys as _sys
 from pathlib import Path as _Path
 
-_USAGE = "Usage: agent-cron.sh [list|validate|status] [--store PATH] [--json]\n       agent-cron.sh due [--store PATH] [--at ISO8601] [--json]\n       agent-cron.sh lock <task-id> --action acquire|release|probe --run-id ID [--scheduled-at ISO8601] [--at ISO8601] [--json]\n       agent-cron.sh run <task-id> --dry-run [--at ISO8601] [--json]\n       agent-cron.sh scheduler --dry-run|--execute [--at ISO8601] [--max-runs N] [--json]\n\nImplemented slices:\n- list/validate: inspect and validate the task definition store.\n- due: read-only dry-run schedule resolver. It reports due tasks, missed windows,\n  catch-up policy, retryEligibleAt state, and lock paths, but never executes\n  prompts or writes state.\n- lock: local atomic task-lock acquire/release/probe primitives only. It writes\n  lock files under the task store's sibling locks/ directory, but never executes\n  prompts, sends notifications, installs schedulers, or updates task history.\n- run --dry-run: read-only execution-plan preview. It combines due, lock probe,\n  task policy, and headless command metadata, but never acquires locks, executes\n  prompts, sends notifications, installs schedulers, or updates task history.\n- scheduler --dry-run: read-only single-tick scheduler plan. It reports which\n  tasks would run or skip, including retry-due tasks, but never installs timers,\n  acquires locks, executes prompts, writes task state, or sends notifications.\n- scheduler --execute: explicit one-shot scheduler executor for approved live/systemd\n  use. It runs at most --max-runs due/retry-due tasks through the existing run path;\n  it never installs timers or edits crontab/systemd.\n- run: explicit manual execution for due enabled tasks. It acquires the task lock,\n  invokes ccc-headless, records lastRunAt/lastStatus/lastRunId, writes a\n  redacted owner-only bridge spool entry when notify=telegram-owner, appends a\n  bounded runHistory entry, records retryState/retryEligibleAt on failure, clears\n  retryState on success, and releases the lock in all normal failure/success\n  paths. It still does not call Telegram\n  or provider APIs, install schedulers, mutate crontab/systemd, or touch remotes.\n\nNo direct Telegram/API send, scheduler bootstrap, systemd/crontab writes,\nprovider sends, or remote-node actions are performed by agent-cron itself.\n"
+_USAGE = "Usage: agent-cron.sh [list|validate|status] [--store PATH] [--json]\n       agent-cron.sh add <task-id> --schedule EXPR --prompt TEXT [--name N] [--timezone IANA] [--notify none|telegram-owner|telegram-owner-on-failure] [--allowed-tools a,b] [--permission-mode M] [--catch-up-policy P] [--max-catchup N] [--lock-timeout-sec N] [--anchor-at ISO] [--not-before ISO] [--max-runs N] [--keep-after-run] [--disabled] [--argv WORD ...] [--cwd DIR] [--model M] [--timeout-sec N] [--output-max-bytes N] [--json]\n       agent-cron.sh edit <task-id> [same flags as add; set-only partial update] [--json]\n       agent-cron.sh remove|enable|disable <task-id> [--json]\n       agent-cron.sh due [--store PATH] [--at ISO8601] [--json]\n       agent-cron.sh lock <task-id> --action acquire|release|probe --run-id ID [--scheduled-at ISO8601] [--at ISO8601] [--json]\n       agent-cron.sh run <task-id> --dry-run [--at ISO8601] [--json]\n       agent-cron.sh scheduler --dry-run|--execute [--at ISO8601] [--max-runs N] [--json]\n\nImplemented slices:\n- list/validate: inspect and validate the task definition store.\n- due: read-only dry-run schedule resolver. It reports due tasks, missed windows,\n  catch-up policy, retryEligibleAt state, and lock paths, but never executes\n  prompts or writes state.\n- lock: local atomic task-lock acquire/release/probe primitives only. It writes\n  lock files under the task store's sibling locks/ directory, but never executes\n  prompts, sends notifications, installs schedulers, or updates task history.\n- run --dry-run: read-only execution-plan preview. It combines due, lock probe,\n  task policy, and headless command metadata, but never acquires locks, executes\n  prompts, sends notifications, installs schedulers, or updates task history.\n- scheduler --dry-run: read-only single-tick scheduler plan. It reports which\n  tasks would run or skip, including retry-due tasks, but never installs timers,\n  acquires locks, executes prompts, writes task state, or sends notifications.\n- scheduler --execute: explicit one-shot scheduler executor for approved live/systemd\n  use. It runs at most --max-runs due/retry-due tasks through the existing run path;\n  it never installs timers or edits crontab/systemd.\n- run: explicit manual execution for due enabled tasks. It acquires the task lock,\n  invokes ccc-headless, records lastRunAt/lastStatus/lastRunId, writes a\n  redacted owner-only bridge spool entry when notify=telegram-owner, appends a\n  bounded runHistory entry, records retryState/retryEligibleAt on failure, clears\n  retryState on success, and releases the lock in all normal failure/success\n  paths. It still does not call Telegram\n  or provider APIs, install schedulers, mutate crontab/systemd, or touch remotes.\n\nNo direct Telegram/API send, scheduler bootstrap, systemd/crontab writes,\nprovider sends, or remote-node actions are performed by agent-cron itself.\n"
 
 
 def _die(message, code=2):
@@ -48,8 +48,11 @@ def _bootstrap_cli(argv=None):
             break
         i += 1
 
-    if cmd_value not in ('list', 'validate', 'status', 'due', 'lock', 'run', 'scheduler'):
-        if cmd_value in ('execute', 'install', 'enable', 'disable', 'add', 'remove'):
+    if cmd_value not in (
+        'list', 'validate', 'status', 'due', 'lock', 'run', 'scheduler',
+        'add', 'edit', 'remove', 'enable', 'disable',
+    ):
+        if cmd_value in ('execute', 'install'):
             _die(f'agent-cron {cmd_value} is not implemented in this read-only slice; no filesystem changes were made.', 2)
         _die(f'Unknown command: {cmd_value}', 2)
 
@@ -81,8 +84,8 @@ from agent_cron_lib import (  # noqa: E402
     parse_schedule,
     retry_view,
     apply_retry_transition,
-    iter_occurrences,
-    next_occurrence,
+    schedule_occurrences,
+    next_after,
     fmt_dt,
 )
 from agent_cron_schema import validate_store  # noqa: E402
@@ -328,18 +331,26 @@ def due_plan(data):  # noqa: C901 -- #348 baseline hotspot
             if k in lock:
                 row[k] = lock[k]
         try:
-            spec = parse_schedule(task.get('schedule') or '')
+            spec = parse_schedule(task.get('schedule') or '', task.get('timezone', 'UTC'))
+            row['scheduleKind'] = spec.get('kind', 'cron')
             last = parse_dt(task.get('lastRunAt'), f'tasks[{idx}].lastRunAt')
             not_before = parse_dt(task.get('notBefore'), f'tasks[{idx}].notBefore')
+            anchor = parse_dt(task.get('anchorAt'), f'tasks[{idx}].anchorAt')
             if not_before is not None and at < not_before:
                 row['status'] = 'not-before' if effective_enabled else row['status']
-                row['nextDueAt'] = fmt_dt(next_occurrence(spec, not_before - timedelta(minutes=1)))
+                if spec.get('kind') == 'interval' and anchor is None:
+                    row['nextDueAt'] = fmt_dt(not_before)
+                else:
+                    row['nextDueAt'] = fmt_dt(next_after(spec, not_before - timedelta(seconds=1), anchor))
                 rows.append(row)
                 continue
-            horizon_start = last or (at - timedelta(days=366))
-            if not_before is not None:
-                horizon_start = max(horizon_start, not_before - timedelta(minutes=1))
-            occurrences, truncated = iter_occurrences(spec, horizon_start, at)
+            occurrence_floor = last
+            free_interval = spec.get('kind') == 'interval' and anchor is None and last is None
+            if not_before is not None and not free_interval:
+                activation_floor = not_before - timedelta(seconds=1)
+                if occurrence_floor is None or occurrence_floor < activation_floor:
+                    occurrence_floor = activation_floor
+            occurrences, truncated = schedule_occurrences(spec, occurrence_floor, at, anchor)
             raw_missed = len(occurrences)
             row['missedRunsTruncated'] = truncated
             policy = task.get('catchUpPolicy', 'skip')
@@ -378,7 +389,7 @@ def due_plan(data):  # noqa: C901 -- #348 baseline hotspot
                         row['status'] = 'retry-wait'
                     elif retry.get('exhausted'):
                         row['status'] = 'retry-exhausted'
-            row['nextDueAt'] = fmt_dt(next_occurrence(spec, at))
+            row['nextDueAt'] = fmt_dt(next_after(spec, at, anchor))
         except Exception as e:
             row['status'] = 'invalid-schedule'
             row['error'] = str(e)
@@ -722,17 +733,58 @@ def run_dry_plan(data):
         return {'ok': False, 'mode': 'run-dry-run-read-only', 'taskId': None, 'error': str(e)}, json_out, 1
 
 
-def headless_metadata(task, execute):
-    headless_cmd = os.environ.get('CCC_HEADLESS_CMD') or str(script_root / 'claude' / 'headless.sh')
+DEFAULT_PROMPT_TIMEOUT_SEC = 3600
+DEFAULT_COMMAND_TIMEOUT_SEC = 600
+DEFAULT_OUTPUT_MAX_BYTES = 65536
+
+
+def task_payload(task):
+    payload = task.get('payload') if isinstance(task, dict) else None
+    if not isinstance(payload, dict):
+        payload = {}
+    kind = payload.get('kind') or 'prompt'
+    default_timeout = (
+        DEFAULT_COMMAND_TIMEOUT_SEC if kind == 'command' else DEFAULT_PROMPT_TIMEOUT_SEC
+    )
+    timeout = payload.get('timeoutSec')
+    if not isinstance(timeout, int) or timeout < 1:
+        timeout = default_timeout
+    output_cap = payload.get('outputMaxBytes')
+    if not isinstance(output_cap, int) or output_cap < 1024:
+        output_cap = DEFAULT_OUTPUT_MAX_BYTES
     return {
-        'command': headless_cmd,
-        'promptBytes': len((task.get('prompt') or '').encode('utf-8')),
+        'kind': kind,
+        'argv': payload.get('argv') or [],
+        'cwd': payload.get('cwd'),
+        'model': payload.get('model'),
+        'timeoutSec': timeout,
+        'outputMaxBytes': output_cap,
+    }
+
+
+def headless_metadata(task, execute):
+    payload = task_payload(task)
+    headless_cmd = os.environ.get('CCC_HEADLESS_CMD') or str(script_root / 'claude' / 'headless.sh')
+    meta = {
+        'payloadKind': payload['kind'],
+        'timeoutSec': payload['timeoutSec'],
         'permissionMode': task.get('permissionMode') or 'default',
         'allowedTools': task.get('allowedTools', []),
         'attachMemory': task.get('attachMemory', []),
         'attachSkills': task.get('attachSkills', []),
         'execute': bool(execute),
     }
+    if payload['kind'] == 'command':
+        meta['command'] = ' '.join(payload['argv'])
+        meta['argvLen'] = len(payload['argv'])
+        meta['cwd'] = payload['cwd']
+        meta['outputMaxBytes'] = payload['outputMaxBytes']
+    else:
+        meta['command'] = headless_cmd
+        meta['promptBytes'] = len((task.get('prompt') or '').encode('utf-8'))
+        if payload['model']:
+            meta['model'] = payload['model']
+    return meta
 
 
 def mutation_flags(lock_acquire, task_write, headless_execute, push_spool_write=False, history_append=False):
@@ -848,8 +900,37 @@ def short_text(text, limit=4000):
     return text if len(text) <= limit else text[:limit] + f'\n[truncated {len(text)-limit} chars]'
 
 
+def _cap_bytes(text, cap):
+    raw = (text or '').encode('utf-8', errors='replace')
+    if len(raw) <= cap:
+        return text or ''
+    return raw[:cap].decode('utf-8', errors='ignore') + '\n… [truncated by outputMaxBytes]'
+
+
 def run_headless(task):
+    """Execute the task payload: an agent prompt run or a deterministic command."""
     meta = headless_metadata(task, execute=True)
+    payload = task_payload(task)
+    if payload['kind'] == 'command':
+        argv = payload['argv']
+        if not argv:
+            raise ValueError("payload kind 'command' requires argv")
+        try:
+            proc = subprocess.run(
+                argv, text=True, input='', capture_output=True,
+                cwd=payload['cwd'] or None, timeout=payload['timeoutSec'],
+            )
+        except subprocess.TimeoutExpired:
+            return {**meta, 'exitCode': 124, 'stdout': '',
+                    'stderr': f"command timed out after {payload['timeoutSec']}s",
+                    'timedOut': True}
+        cap = payload['outputMaxBytes']
+        return {
+            **meta,
+            'exitCode': proc.returncode,
+            'stdout': short_text(_cap_bytes(proc.stdout, cap)),
+            'stderr': short_text(_cap_bytes(proc.stderr, cap)),
+        }
     cmd = shlex.split(meta['command'])
     if not cmd:
         raise ValueError('CCC_HEADLESS_CMD resolved to an empty command')
@@ -860,8 +941,18 @@ def run_headless(task):
     perm = task.get('permissionMode') or 'default'
     if perm != 'default':
         env['CCC_PERMISSION_MODE'] = perm
+    if payload['model']:
+        env['CCC_MODEL'] = payload['model']
     prompt = task.get('prompt') or ''
-    proc = subprocess.run(cmd + [prompt], text=True, input='', capture_output=True, env=env)
+    try:
+        proc = subprocess.run(
+            cmd + [prompt], text=True, input='', capture_output=True, env=env,
+            timeout=payload['timeoutSec'],
+        )
+    except subprocess.TimeoutExpired:
+        return {**meta, 'exitCode': 124, 'stdout': '',
+                'stderr': f"prompt run timed out after {payload['timeoutSec']}s",
+                'timedOut': True}
     return {
         **meta,
         'exitCode': proc.returncode,
@@ -926,8 +1017,11 @@ def build_owner_text(task_id, run_id, scheduled_at, status, headless):
 
 def write_owner_spool(task, task_id, run_id, scheduled_at, status, headless, at):
     base = notification_base(task)
-    if task.get('notify', 'none') != 'telegram-owner':
+    notify = task.get('notify', 'none')
+    if notify not in ('telegram-owner', 'telegram-owner-on-failure'):
         return base
+    if notify == 'telegram-owner-on-failure' and status == 'success':
+        return {**base, 'delivery': 'skipped-success'}
     spool = push_spool_dir()
     text = build_owner_text(task_id, run_id, scheduled_at, status, headless)
     ts = fmt_dt(at) or datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace('+00:00', 'Z')
@@ -999,11 +1093,17 @@ def run_execute(data, task_id, at_value, as_json):
     status = 'failed'
     ok = False
     rc = 1
+    one_shot_disabled = False
     try:
         try:
             headless = run_headless(task)
             ok = headless.get('exitCode') == 0
-            status = 'success' if ok else 'failed'
+            if ok:
+                status = 'success'
+            elif headless.get('timedOut'):
+                status = 'timeout'
+            else:
+                status = 'failed'
             rc = 0 if ok else 1
         except Exception as e:
             headless = {
@@ -1038,6 +1138,14 @@ def run_execute(data, task_id, at_value, as_json):
         task['lastRunAt'] = scheduled_at
         task['lastStatus'] = status
         task['lastRunId'] = run_id
+        if status == 'success' and not task.get('keepAfterRun'):
+            try:
+                spec = parse_schedule(task.get('schedule') or '', task.get('timezone', 'UTC'))
+                if spec.get('kind') == 'once':
+                    task['enabled'] = False
+                    one_shot_disabled = True
+            except Exception:
+                pass
         write_doc(data)
     finally:
         release = release_for_run(task_id, run_id)
@@ -1049,6 +1157,7 @@ def run_execute(data, task_id, at_value, as_json):
         'lock': {'state': lock.get('state'), 'path': lock.get('path'), 'release': release},
         'headless': headless or headless_metadata(task, execute=True),
         'notification': notification,
+        'oneShotDisabled': one_shot_disabled,
         'retry': retry,
         'runLimit': run_limit,
         'mutations': mutation_flags(True, headless is not None, headless is not None, notification.get('delivery') == 'spooled', True),
@@ -1118,7 +1227,196 @@ def emit_list(data, as_json):
         print(f"| `{task['id']}` | `{task['schedule']}` | {str(task['enabled']).lower()} | `{task['notify']}` | `{task['catchUpPolicy']}` | `{tools}` | `{task.get('lastStatus') or 'unknown'}` |")
 
 
+def _crud_str(value, flag):
+    return value
+
+
+def _crud_int(value, flag):
+    try:
+        return int(value)
+    except ValueError:
+        raise ValueError(f'{flag} requires an integer') from None
+
+
+def _crud_csv(value, flag):
+    return [item for item in value.split(',') if item]
+
+
+# flag -> (bucket, field key, cast). bucket 'argv' appends command words.
+CRUD_VALUE_FLAGS = {
+    '--schedule': ('fields', 'schedule', _crud_str),
+    '--prompt': ('fields', 'prompt', _crud_str),
+    '--name': ('fields', 'name', _crud_str),
+    '--timezone': ('fields', 'timezone', _crud_str),
+    '--notify': ('fields', 'notify', _crud_str),
+    '--permission-mode': ('fields', 'permissionMode', _crud_str),
+    '--catch-up-policy': ('fields', 'catchUpPolicy', _crud_str),
+    '--anchor-at': ('fields', 'anchorAt', _crud_str),
+    '--not-before': ('fields', 'notBefore', _crud_str),
+    '--redact-profile': ('fields', 'redactProfile', _crud_str),
+    '--allowed-tools': ('fields', 'allowedTools', _crud_csv),
+    '--max-catchup': ('fields', 'maxCatchup', _crud_int),
+    '--lock-timeout-sec': ('fields', 'lockTimeoutSec', _crud_int),
+    '--max-run-history': ('fields', 'maxRunHistory', _crud_int),
+    '--max-runs': ('fields', 'maxRuns', _crud_int),
+    '--cwd': ('payload', 'cwd', _crud_str),
+    '--model': ('payload', 'model', _crud_str),
+    '--timeout-sec': ('payload', 'timeoutSec', _crud_int),
+    '--output-max-bytes': ('payload', 'outputMaxBytes', _crud_int),
+    '--argv': ('argv', None, _crud_str),
+}
+CRUD_BOOL_FLAGS = ('--keep-after-run', '--disabled', '--json')
+
+
+def parse_crud_args(raw):
+    """Parse `<task-id> [flags]` for add/remove/enable/disable."""
+    args = shlex.split(raw or '')
+    if not args or args[0].startswith('-'):
+        raise ValueError('a task id is required')
+    task_id = args[0]
+    buckets = {'fields': {}, 'payload': {}}
+    argv = []
+    bools = {flag: False for flag in CRUD_BOOL_FLAGS}
+    i = 1
+    while i < len(args):
+        arg = args[i]
+        if arg in bools:
+            bools[arg] = True
+            i += 1
+            continue
+        spec = CRUD_VALUE_FLAGS.get(arg)
+        if spec is None:
+            raise ValueError(f'unknown flag: {arg}')
+        i += 1
+        if i >= len(args):
+            raise ValueError(f'{arg} requires a value')
+        bucket, key, cast = spec
+        value = cast(args[i], arg)
+        if bucket == 'argv':
+            argv.append(value)
+        else:
+            buckets[bucket][key] = value
+        i += 1
+    fields = buckets['fields']
+    if bools['--keep-after-run']:
+        fields['keepAfterRun'] = True
+    return (task_id, fields, buckets['payload'], argv,
+            bools['--disabled'], bools['--json'])
+
+
+def _crud_add(data, base, as_json, task_id, fields, payload, argv, disabled):
+    tasks = data.setdefault('tasks', [])
+    if task_by_id(data, task_id):
+        return {**base, 'ok': False, 'error': 'task id already exists'}, as_json, 1
+    task = {'id': task_id, 'enabled': not disabled, 'prompt': '', 'schedule': ''}
+    task.update(fields)
+    if argv:
+        payload = {'kind': 'command', 'argv': argv, **payload}
+    elif payload:
+        payload = {'kind': 'prompt', **payload}
+    if payload:
+        task['payload'] = payload
+    if not task.get('schedule'):
+        return {**base, 'ok': False, 'error': '--schedule is required'}, as_json, 2
+    if not task.get('prompt'):
+        return {**base, 'ok': False, 'error': '--prompt is required (for command payloads it is the human description)'}, as_json, 2
+    task.setdefault('notify', 'none')
+    try:
+        parse_schedule(task['schedule'], task.get('timezone', 'UTC'))
+        parse_dt(task.get('notBefore'), 'notBefore')
+    except ValueError as e:
+        return {**base, 'ok': False, 'error': f'invalid schedule bounds: {e}'}, as_json, 2
+    candidate = {**data, 'tasks': tasks + [task]}
+    errors = validate_store(candidate)
+    if errors:
+        return {**base, 'ok': False, 'error': errors[0], 'errors': errors}, as_json, 1
+    tasks.append(task)
+    write_doc(data)
+    return {**base, 'ok': True, 'task': {k: v for k, v in task.items() if k != 'prompt'},
+            'mutations': {'taskStoreWrite': True}}, as_json, 0
+
+
+def _crud_edit(data, base, as_json, task_id, fields, payload, argv, disabled):
+    """Set-only partial update: provided flags overwrite; payload flags merge."""
+    tasks = data.setdefault('tasks', [])
+    task = task_by_id(data, task_id)
+    if not task:
+        return {**base, 'ok': False, 'error': 'task id not found'}, as_json, 1
+    if not (fields or payload or argv or disabled):
+        return {**base, 'ok': False, 'error': 'edit requires at least one field flag'}, as_json, 2
+    updated = {**task}
+    updated.update(fields)
+    if disabled:
+        updated['enabled'] = False
+    if argv or payload:
+        merged_payload = dict(task.get('payload') or {})
+        if argv:
+            merged_payload['kind'] = 'command'
+            merged_payload['argv'] = argv
+        merged_payload.update(payload)
+        merged_payload.setdefault('kind', 'prompt')
+        updated['payload'] = merged_payload
+    try:
+        parse_schedule(updated.get('schedule') or '', updated.get('timezone', 'UTC'))
+        parse_dt(updated.get('notBefore'), 'notBefore')
+    except ValueError as e:
+        return {**base, 'ok': False, 'error': f'invalid schedule bounds: {e}'}, as_json, 2
+    candidate = {**data, 'tasks': [updated if t is task else t for t in tasks]}
+    errors = validate_store(candidate)
+    if errors:
+        return {**base, 'ok': False, 'error': errors[0], 'errors': errors}, as_json, 1
+    task.clear()
+    task.update(updated)
+    write_doc(data)
+    return {**base, 'ok': True, 'task': {k: v for k, v in task.items() if k != 'prompt'},
+            'mutations': {'taskStoreWrite': True}}, as_json, 0
+
+
+def crud_command(data):
+    try:
+        task_id, fields, payload, argv, disabled, crud_json = parse_crud_args(extra_args)
+    except ValueError as e:
+        return {'ok': False, 'mode': cmd, 'error': str(e)}, json_out, 2
+    as_json = json_out or crud_json
+    base = {'mode': cmd, 'store': str(store), 'taskId': task_id}
+    tasks = data.setdefault('tasks', [])
+    if cmd == 'add':
+        return _crud_add(data, base, as_json, task_id, fields, payload, argv, disabled)
+    if cmd == 'edit':
+        return _crud_edit(data, base, as_json, task_id, fields, payload, argv, disabled)
+    if fields or payload or argv or disabled:
+        return {**base, 'ok': False, 'error': f'{cmd} accepts no flags'}, as_json, 2
+    task = task_by_id(data, task_id)
+    if not task:
+        return {**base, 'ok': False, 'error': 'task id not found'}, as_json, 1
+    if cmd == 'remove':
+        data['tasks'] = [t for t in tasks if t is not task]
+        write_doc(data)
+        return {**base, 'ok': True, 'mutations': {'taskStoreWrite': True}}, as_json, 0
+    desired = cmd == 'enable'
+    changed = bool(task.get('enabled')) != desired
+    task['enabled'] = desired
+    if changed:
+        write_doc(data)
+    return {**base, 'ok': True, 'enabled': desired, 'changed': changed,
+            'mutations': {'taskStoreWrite': changed}}, as_json, 0
+
+
+def emit_crud(result, as_json):
+    if as_json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
+    if result.get('ok'):
+        print(f"agent-cron {result['mode']} OK: {result.get('taskId')}")
+    else:
+        print(f"agent-cron {result['mode']} failed: {result.get('error')}", file=sys.stderr)
+
+
 def _dispatch(data):
+    if cmd in ('add', 'edit', 'remove', 'enable', 'disable'):
+        result, as_json, rc = crud_command(data)
+        emit_crud(result, as_json)
+        return rc
     if cmd == 'lock':
         result, as_json, rc = lock_command(data)
         emit_lock(result, as_json)

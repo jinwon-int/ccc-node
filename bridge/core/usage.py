@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import stat
 import time
 from dataclasses import dataclass
@@ -12,8 +13,10 @@ from datetime import datetime, timedelta, timezone
 from hashlib import sha256
 from pathlib import Path
 from typing import Any, Mapping, Sequence
+from urllib.parse import urlsplit
 
 MAX_WINDOWS = 16
+MAX_MODELS = 16
 MAX_DAILY_BUCKETS = 14
 MAX_SNAPSHOT_BYTES = 16 * 1024
 SNAPSHOT_TTL_SECONDS = 15 * 60
@@ -21,14 +24,28 @@ MAX_TELEGRAM_USAGE_LENGTH = 3500
 MAX_TOKEN_COUNT = 10**12
 KST = timezone(timedelta(hours=9), name="KST")
 HIDDEN_CODEX_RATE_LIMIT_MARKERS = ("gpt-5.3-codex-spark",)
+# Documented claude-agent-sdk RateLimitStatus literals; anything else is dropped.
+RATE_LIMIT_STATUSES = frozenset({"allowed", "allowed_warning", "rejected"})
+# Per-window rate-limit maps passed through RateLimitInfo.raw (see
+# parse_claude_rate_limit_event): container keys we probe, the strict window
+# key shape we accept, and the cap on windows taken from one raw payload.
+RAW_WINDOW_CONTAINER_KEYS = ("windows", "rateLimitWindows", "unifiedRateLimits")
+RAW_WINDOW_KEY_RE = re.compile(r"^[a-z][a-z0-9_]*$")
+MAX_RAW_WINDOW_KEY_LENGTH = 64
+MAX_RAW_WINDOWS = 8
 
 
 @dataclass(frozen=True, slots=True)
 class UsageWindow:
     label: str
-    used_percent: float
+    # ``None`` marks a count-only local-estimate window (used when a service
+    # publishes no quota/percent data at all, e.g. Kimi Code).
+    used_percent: float | None
     duration_minutes: int | None = None
     resets_at: float | None = None
+    used_count: int | None = None
+    count_unit: str | None = None
+    count_limit: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -38,9 +55,22 @@ class DailyUsage:
 
 
 @dataclass(frozen=True, slots=True)
+class ModelUsage:
+    """Per-model token/cost totals from one SDK ``model_usage`` mapping."""
+
+    model: str
+    input_tokens: int = 0
+    cache_creation_input_tokens: int = 0
+    cache_read_input_tokens: int = 0
+    output_tokens: int = 0
+    cost_usd: float | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class UsageSnapshot:
     provider: str
     plan_type: str | None = None
+    service: str | None = None
     windows: tuple[UsageWindow, ...] = ()
     context_used: int | None = None
     context_window: int | None = None
@@ -50,6 +80,9 @@ class UsageSnapshot:
     lifetime_tokens: int | None = None
     daily_usage: tuple[DailyUsage, ...] = ()
     total_cost_usd: float | None = None
+    models: tuple[ModelUsage, ...] = ()
+    overage_status: str | None = None
+    overage_resets_at: float | None = None
     observed_at: float | None = None
 
 
@@ -80,6 +113,127 @@ def _text(value: object, *, maximum: int = 80) -> str | None:
 
 def _mapping(value: object) -> Mapping[str, Any]:
     return value if isinstance(value, Mapping) else {}
+
+
+_KNOWN_CLAUDE_SERVICES: tuple[tuple[str, str], ...] = (
+    ("kimi.com", "Kimi Code"),
+)
+
+
+def detect_claude_service(base_url: object = None) -> str | None:
+    """Return a display name for a known third-party Claude-compatible service.
+
+    Reads ``ANTHROPIC_BASE_URL`` when *base_url* is omitted. Returns ``None``
+    for the Anthropic default or unknown hosts so rendering stays unchanged.
+    Only the URL host is inspected; credentials are never touched.
+    """
+    raw = base_url if base_url is not None else os.environ.get("ANTHROPIC_BASE_URL")
+    text = _text(raw, maximum=200)
+    if not text:
+        return None
+    candidate = text if "://" in text else f"https://{text}"
+    try:
+        host = urlsplit(candidate).netloc.casefold()
+    except ValueError:
+        return None
+    if not host:
+        return None
+    for marker, name in _KNOWN_CLAUDE_SERVICES:
+        if host == marker or host.endswith(f".{marker}"):
+            return name
+    return None
+
+
+def _env_int(name: str, *, maximum: int = 10**9) -> int | None:
+    raw = os.environ.get(name)
+    if raw is None:
+        return None
+    text = raw.strip()
+    if not text.isdigit():
+        return None
+    value = int(text)
+    return value if 0 <= value <= maximum else None
+
+
+def local_claude_environment_snapshot() -> UsageSnapshot:
+    """Base snapshot built from local (non-secret) provider environment config.
+
+    Third-party Claude-compatible services (e.g. Kimi Code) emit no
+    rate-limit events, so plan/context would otherwise render "unavailable".
+    Only model/effort/context-size identifiers are read — never credentials.
+    Unknown/Anthropic-default environments return an empty snapshot so
+    existing behavior is byte-identical.
+    """
+    service = detect_claude_service()
+    if service is None:
+        return UsageSnapshot(provider="claude")
+    parts = [service]
+    model = _text(os.environ.get("ANTHROPIC_MODEL"), maximum=80)
+    if model:
+        parts.append(model)
+    effort = _text(os.environ.get("CLAUDE_CODE_EFFORT_LEVEL"), maximum=20)
+    if effort:
+        parts.append(f"effort {effort}")
+    return UsageSnapshot(
+        provider="claude",
+        service=service,
+        plan_type=" · ".join(parts),
+        context_window=_env_int("CLAUDE_CODE_MAX_CONTEXT_TOKENS"),
+    )
+
+
+_SERVICE_WINDOW_SPECS: dict[str, tuple[tuple[str, str, str, str], ...]] = {
+    # service -> ((label, limit env var, usage source, count unit), ...).
+    # Kimi publishes no per-tier limits over its API, so limits come from
+    # operator-configured env (read from the Kimi Code Console once). The
+    # 5-hour window degrades to count-only without a limit; the weekly
+    # window is percent-only and is skipped entirely without one (its 7-day
+    # totals are already shown in the meter section).
+    "Kimi Code": (
+        ("Kimi 5-hour", "CCC_USAGE_KIMI_5H_REQUEST_LIMIT", "rolling", "req"),
+        ("Kimi weekly", "CCC_USAGE_KIMI_WEEKLY_TOKEN_LIMIT", "weekly", "tok"),
+    ),
+}
+
+
+def synthesize_service_windows(
+    service: str | None,
+    rolling: Mapping[str, int] | None,
+    weekly: Mapping[str, int] | None = None,
+) -> tuple[UsageWindow, ...]:
+    """Build count-only local-estimate windows for services without quota APIs.
+
+    *rolling* is the meter's trailing-5h aggregate and *weekly* its trailing
+    7-day aggregate (``{"requests": int, "tokens": int}``). Real rate-limit
+    data always wins: callers must only synthesize when no observed windows
+    exist. When the operator configured a window's limit via env (e.g. from
+    the Kimi Code Console), the window carries it so the renderer can show
+    used/limit and the used/left percentages.
+    """
+    if service is None:
+        return ()
+    windows: list[UsageWindow] = []
+    for label, limit_env, source_key, unit in _SERVICE_WINDOW_SPECS.get(service, ()):
+        source = rolling if source_key == "rolling" else weekly
+        if not source:
+            continue
+        limit = _env_int(limit_env, maximum=10**7 if unit == "req" else 10**12)
+        if source_key == "weekly" and limit is None:
+            continue
+        field = "requests" if unit == "req" else "tokens"
+        used = source.get(field)
+        if isinstance(used, bool) or not isinstance(used, int) or used < 0:
+            continue
+        windows.append(
+            UsageWindow(
+                label=label,
+                used_percent=None,
+                used_count=used,
+                count_unit=unit,
+                count_limit=limit,
+            )
+        )
+    return tuple(windows)
 
 
 def _window(label: str, value: object) -> UsageWindow | None:
@@ -113,7 +267,7 @@ def parse_codex_rate_limits(value: object) -> UsageSnapshot:
 
     plan_type: str | None = _text(current.get("planType"))
     windows: list[UsageWindow] = []
-    seen: set[tuple[str, float, int | None, float | None]] = set()
+    seen: set[tuple[str, float | None, int | None, float | None]] = set()
     for fallback, snapshot in snapshots:
         plan_type = plan_type or _text(snapshot.get("planType"))
         limit_name = _text(snapshot.get("limitName")) or _text(snapshot.get("limitId")) or fallback
@@ -179,6 +333,77 @@ def parse_codex_thread_usage(value: object) -> UsageSnapshot:
     )
 
 
+def _raw_rate_limit_window(key: object, value: object) -> UsageWindow | None:
+    """Validate one strictly window-shaped ``raw`` entry, or drop it.
+
+    Accepted shape (allowlist; anything else returns ``None``): a lowercase
+    snake_case key (``^[a-z][a-z0-9_]*$``, bounded length) mapping to a dict
+    that carries a numeric ``utilization`` in [0, 1] **and** a numeric
+    ``resets_at``/``resetsAt`` epoch timestamp. Booleans, out-of-range or
+    non-finite numbers, and non-dict values are all rejected by the shared
+    ``_number`` bounds.
+    """
+
+    if (
+        not isinstance(key, str)
+        or len(key) > MAX_RAW_WINDOW_KEY_LENGTH
+        or RAW_WINDOW_KEY_RE.fullmatch(key) is None
+        or not isinstance(value, Mapping)
+    ):
+        return None
+    utilization = _number(value.get("utilization"), maximum=1)
+    resets_at = _number(value.get("resets_at", value.get("resetsAt")), maximum=10**11)
+    if utilization is None or resets_at is None:
+        return None
+    return UsageWindow(
+        label=key.replace("_", " "),
+        used_percent=min(100.0, utilization * 100),
+        resets_at=resets_at,
+    )
+
+
+def _raw_rate_limit_windows(
+    raw: object, *, taken_labels: frozenset[str]
+) -> tuple[UsageWindow, ...]:
+    """Extract additional per-window buckets from ``RateLimitInfo.raw``.
+
+    The CLI's internal unified rate-limit state carries a full per-window map
+    (window name -> {utilization, resets_at}) sourced from the
+    ``anthropic-ratelimit-unified-*`` headers, and ``RateLimitInfo.raw``
+    passes the whole event dict through. Probe the known container keys
+    first, then top-level window-shaped entries; every candidate must pass
+    the strict ``_raw_rate_limit_window`` allowlist. Windows whose label is
+    in ``taken_labels`` (the explicitly-modeled primary window) are skipped —
+    primary wins on conflict. At most ``MAX_RAW_WINDOWS`` are returned, in
+    sorted-label order, deterministically.
+    """
+
+    root = _mapping(raw)
+    if not root:
+        return ()
+    candidates: list[tuple[str, object]] = []
+    for container_key in RAW_WINDOW_CONTAINER_KEYS:
+        container = root.get(container_key)
+        if isinstance(container, Mapping):
+            candidates.extend(
+                sorted(container.items(), key=lambda item: str(item[0]))
+            )
+    candidates.extend(
+        item
+        for item in sorted(root.items(), key=lambda item: str(item[0]))
+        if item[0] not in RAW_WINDOW_CONTAINER_KEYS
+    )
+    accepted: dict[str, UsageWindow] = {}
+    for key, value in candidates:
+        if len(accepted) >= MAX_RAW_WINDOWS:
+            break
+        window = _raw_rate_limit_window(key, value)
+        if window is None or window.label in taken_labels or window.label in accepted:
+            continue
+        accepted[window.label] = window
+    return tuple(accepted[label] for label in sorted(accepted))
+
+
 def parse_claude_rate_limit_event(message: object, *, observed_at: float | None = None) -> UsageSnapshot:
     """Parse a Claude Agent SDK ``RateLimitEvent`` from the live message stream.
 
@@ -189,7 +414,25 @@ def parse_claude_rate_limit_event(message: object, *, observed_at: float | None 
     sessions: the statusLine hook (``load_claude_status_snapshot``'s source)
     only fires from the interactive terminal status bar, which never renders
     here. Each event carries at most one window (``five_hour``/``seven_day``/
-    etc.); callers accumulate across events via ``merge_usage``.
+    etc.); callers accumulate across events via ``merge_usage``. Distinct
+    window types keep distinct labels, so the label-keyed union in
+    ``merge_usage`` retains every concurrent bucket (five-hour, weekly, and
+    per-model-class weekly windows) instead of last-write-wins.
+
+    Newer CLIs additionally pass their whole internal per-window map through
+    ``RateLimitInfo.raw`` (the ``RateLimitEvent`` dataclass itself carries no
+    raw payload field — only ``rate_limit_info``/``uuid``/``session_id`` — so
+    ``info.raw`` is the sole passthrough source). When strictly window-shaped
+    entries are present there (see ``_raw_rate_limit_windows``), each becomes
+    an additional bucket so model-class windows (``seven_day_opus`` etc.)
+    surface as soon as the data exists, without waiting for the CLI to emit a
+    dedicated event of that type. The explicitly-modeled primary window always
+    wins on a label conflict, and behavior is unchanged when ``raw`` holds no
+    such map.
+
+    ``overage_status``/``overage_resets_at`` (pay-as-you-go state) are also
+    captured when present; the status is allowlisted to the documented
+    ``RateLimitStatus`` literals so arbitrary strings never render.
     """
 
     info = getattr(message, "rate_limit_info", None)
@@ -204,11 +447,68 @@ def parse_claude_rate_limit_event(message: object, *, observed_at: float | None 
                 resets_at=_number(getattr(info, "resets_at", None), maximum=10**11),
             ),
         )
+    windows += _raw_rate_limit_windows(
+        getattr(info, "raw", None),
+        taken_labels=frozenset(window.label for window in windows),
+    )
+    windows = windows[:MAX_WINDOWS]
+    overage_status = _text(getattr(info, "overage_status", None))
+    if overage_status not in RATE_LIMIT_STATUSES:
+        overage_status = None
+    overage_resets_at = (
+        _number(getattr(info, "overage_resets_at", None), maximum=10**11)
+        if overage_status is not None
+        else None
+    )
     return UsageSnapshot(
         provider="claude",
         windows=windows,
+        overage_status=overage_status.replace("_", " ") if overage_status else None,
+        overage_resets_at=overage_resets_at,
         observed_at=time.time() if observed_at is None else observed_at,
     )
+
+
+def _model_usage_entries(model_usage: Mapping[str, Any]) -> tuple[ModelUsage, ...]:
+    """Build bounded per-model entries from the SDK ``model_usage`` mapping.
+
+    Only models carrying at least one numeric token count or a cost are kept,
+    so identifier-only entries (e.g. a bare ``contextWindow`` mapping) are
+    never surfaced. Both the camelCase names the CLI emits and their
+    snake_case variants are accepted, matching the fallback sums above.
+    """
+
+    entries: list[ModelUsage] = []
+    for raw_name, raw in list(model_usage.items())[:MAX_MODELS]:
+        name = _text(str(raw_name))
+        if name is None:
+            continue
+        model = _mapping(raw)
+        input_tokens = _integer(model.get("inputTokens", model.get("input_tokens"))) or 0
+        cache_creation = (
+            _integer(
+                model.get("cacheCreationInputTokens", model.get("cache_creation_input_tokens"))
+            )
+            or 0
+        )
+        cache_read = (
+            _integer(model.get("cacheReadInputTokens", model.get("cache_read_input_tokens"))) or 0
+        )
+        output_tokens = _integer(model.get("outputTokens", model.get("output_tokens"))) or 0
+        cost_usd = _number(model.get("costUSD", model.get("cost_usd")), maximum=10**9)
+        if not any((input_tokens, cache_creation, cache_read, output_tokens)) and cost_usd is None:
+            continue
+        entries.append(
+            ModelUsage(
+                model=name,
+                input_tokens=input_tokens,
+                cache_creation_input_tokens=cache_creation,
+                cache_read_input_tokens=cache_read,
+                output_tokens=output_tokens,
+                cost_usd=cost_usd,
+            )
+        )
+    return tuple(entries)
 
 
 def parse_claude_result(message: object, *, observed_at: float | None = None) -> UsageSnapshot:
@@ -252,7 +552,9 @@ def parse_claude_result(message: object, *, observed_at: float | None = None) ->
 
     # The SDK's model_usage values are version-dependent mappings. Only accept
     # the documented numeric context-window field when present; never render
-    # arbitrary keys or model/account identifiers.
+    # arbitrary keys or account identifiers. Model ids are surfaced only via
+    # the per-model section, and only when they carry numeric token/cost data
+    # (see _model_usage_entries).
     context_window = None
     for raw in list(model_usage.values())[:16]:
         model = _mapping(raw)
@@ -273,8 +575,38 @@ def parse_claude_result(message: object, *, observed_at: float | None = None) ->
         output_tokens=output_tokens,
         total_tokens=total_tokens,
         total_cost_usd=_number(getattr(message, "total_cost_usd", None), maximum=10**9),
+        models=_model_usage_entries(model_usage),
         observed_at=time.time() if observed_at is None else observed_at,
     )
+
+
+def _merge_models(
+    older: tuple[ModelUsage, ...], newer: tuple[ModelUsage, ...]
+) -> tuple[ModelUsage, ...]:
+    """Sum per-model totals across snapshots, keeping first-seen order."""
+
+    merged: dict[str, ModelUsage] = {entry.model: entry for entry in older}
+    for entry in newer:
+        existing = merged.get(entry.model)
+        if existing is None:
+            merged[entry.model] = entry
+            continue
+        cost_usd = None
+        if existing.cost_usd is not None or entry.cost_usd is not None:
+            cost_usd = (existing.cost_usd or 0.0) + (entry.cost_usd or 0.0)
+        merged[entry.model] = ModelUsage(
+            model=entry.model,
+            input_tokens=existing.input_tokens + entry.input_tokens,
+            cache_creation_input_tokens=(
+                existing.cache_creation_input_tokens + entry.cache_creation_input_tokens
+            ),
+            cache_read_input_tokens=(
+                existing.cache_read_input_tokens + entry.cache_read_input_tokens
+            ),
+            output_tokens=existing.output_tokens + entry.output_tokens,
+            cost_usd=cost_usd,
+        )
+    return tuple(merged.values())[:MAX_MODELS]
 
 
 def merge_usage(*snapshots: UsageSnapshot) -> UsageSnapshot:
@@ -289,6 +621,7 @@ def merge_usage(*snapshots: UsageSnapshot) -> UsageSnapshot:
         result = UsageSnapshot(
             provider=result.provider,
             plan_type=newer.plan_type or result.plan_type,
+            service=newer.service or result.service,
             windows=tuple(windows_by_label[key] for key in sorted(windows_by_label))[:MAX_WINDOWS],
             context_used=(
                 newer.context_used if newer.context_used is not None else result.context_used
@@ -313,6 +646,15 @@ def merge_usage(*snapshots: UsageSnapshot) -> UsageSnapshot:
             daily_usage=newer.daily_usage or result.daily_usage,
             total_cost_usd=(
                 newer.total_cost_usd if newer.total_cost_usd is not None else result.total_cost_usd
+            ),
+            models=_merge_models(result.models, newer.models),
+            overage_status=(
+                newer.overage_status if newer.overage_status is not None else result.overage_status
+            ),
+            overage_resets_at=(
+                newer.overage_resets_at
+                if newer.overage_status is not None
+                else result.overage_resets_at
             ),
             observed_at=(
                 newer.observed_at if newer.observed_at is not None else result.observed_at
@@ -443,11 +785,56 @@ def _tokens(value: int | None) -> str:
     return f"{value:,}" if value is not None else "unavailable"
 
 
+def _usage_title(snapshot: UsageSnapshot) -> str:
+    if snapshot.provider == "codex":
+        return "Codex"
+    return snapshot.service or "Claude Code"
+
+
+def _service_quota_note(service: str | None) -> str | None:
+    if service == "Kimi Code":
+        return (
+            "Kimi quota: rolling 5-hour + weekly windows apply — "
+            "the meter below is a local estimate only; "
+            "remaining quota is shown in the Kimi Code Console"
+        )
+    return None
+
+
+def _render_window_line(window: UsageWindow) -> str:
+    if window.used_percent is None:
+        count = (
+            f"{window.used_count:,}" if window.used_count is not None else "unavailable"
+        )
+        unit = f" {window.count_unit}" if window.count_unit else ""
+        line = f"- {window.label}: {count}"
+        if window.count_limit:
+            percent = min(
+                999.0, round((window.used_count or 0) * 1000 / window.count_limit) / 10
+            )
+            line += (
+                f"/{window.count_limit:,}{unit} · {percent:g}% used / "
+                f"{max(0.0, 100.0 - percent):g}% left"
+            )
+        else:
+            line += f"{unit} used"
+        return f"{line} (local estimate)"
+    remaining = max(0.0, 100.0 - window.used_percent)
+    duration = (
+        f" · {window.duration_minutes}m window"
+        if window.duration_minutes is not None
+        else ""
+    )
+    return (
+        f"- {window.label}: {window.used_percent:g}% used / "
+        f"{remaining:g}% left{duration} · {_format_reset(window.resets_at)}"
+    )
+
+
 def render_usage(snapshot: UsageSnapshot) -> str:
     """Render a deterministic, bounded, Telegram-safe plain-text response."""
 
-    title = "Codex" if snapshot.provider == "codex" else "Claude Code"
-    lines = [f"📊 Usage · {title}", f"Plan: {snapshot.plan_type or 'unavailable'}"]
+    lines = [f"📊 Usage · {_usage_title(snapshot)}", f"Plan: {snapshot.plan_type or 'unavailable'}"]
     visible_windows = tuple(
         window
         for window in snapshot.windows
@@ -460,18 +847,16 @@ def render_usage(snapshot: UsageSnapshot) -> str:
     if visible_windows:
         lines.append("Rate limits:")
         for window in visible_windows[:MAX_WINDOWS]:
-            remaining = max(0.0, 100.0 - window.used_percent)
-            duration = (
-                f" · {window.duration_minutes}m window"
-                if window.duration_minutes is not None
-                else ""
-            )
-            lines.append(
-                f"- {window.label}: {window.used_percent:g}% used / "
-                f"{remaining:g}% left{duration} · {_format_reset(window.resets_at)}"
-            )
+            lines.append(_render_window_line(window))
     elif not snapshot.windows:
         lines.append("Rate limits: unavailable")
+    if snapshot.overage_status is not None:
+        lines.append(
+            f"Overage: {snapshot.overage_status} · {_format_reset(snapshot.overage_resets_at)}"
+        )
+    quota_note = _service_quota_note(snapshot.service)
+    if quota_note is not None:
+        lines.append(quota_note)
 
     if snapshot.context_used is not None and snapshot.context_window:
         percent = min(100.0, snapshot.context_used * 100 / snapshot.context_window)
@@ -494,6 +879,18 @@ def render_usage(snapshot: UsageSnapshot) -> str:
             f"input {_tokens(snapshot.input_tokens)} · output {_tokens(snapshot.output_tokens)} "
             f"· total {_tokens(snapshot.total_tokens)}"
         )
+    if snapshot.models:
+        lines.append("Models:")
+        for entry in snapshot.models[:MAX_MODELS]:
+            tokens_in = (
+                entry.input_tokens
+                + entry.cache_creation_input_tokens
+                + entry.cache_read_input_tokens
+            )
+            line = f"  {entry.model} · in {tokens_in:,} · out {entry.output_tokens:,}"
+            if entry.cost_usd is not None:
+                line += f" · ${entry.cost_usd:.4f}"
+            lines.append(line)
     if snapshot.provider != "codex":
         cost = (
             f"${snapshot.total_cost_usd:.4f}"

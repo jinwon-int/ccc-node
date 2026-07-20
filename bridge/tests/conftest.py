@@ -23,6 +23,8 @@ from pathlib import Path
 
 import pytest
 
+import sys_modules_isolation
+
 BRIDGE_DIR = Path(__file__).resolve().parents[1]
 
 # Minimal env so the real pydantic config validates at import time.
@@ -36,6 +38,23 @@ _VOLATILE_MODULES = (
     "telegram_bot.utils.chat_logger",
     "telegram_bot.core.project_chat",
 )
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _contain_registered_module_fakes(request):
+    """Confine import-time fake sys.modules installations to their own module.
+
+    Modules that install fakes at import (collection) time register the exact
+    diff through ``sys_modules_isolation.ModuleFakesGuard`` and revert it right
+    away, so collection stays pristine. This fixture reinstalls a module's
+    registered fakes only while that module's own tests run and reverts them
+    again at module teardown, keeping every other module's run unpolluted.
+    """
+    undo = sys_modules_isolation.activate(request.module.__name__)
+    try:
+        yield
+    finally:
+        sys_modules_isolation.deactivate(undo)
 
 
 @pytest.fixture(autouse=True)

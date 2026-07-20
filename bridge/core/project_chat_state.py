@@ -130,10 +130,7 @@ class ProjectChatStateMixin:
         if self._agent_runtime is not None:
             await self.stop(user_id, chat_id)
             for key in self._agent_keys_for_user(user_id, chat_id):
-                self._agent_sessions.pop(key, None)
-                self._agent_session_models.pop(key, None)
-                self._agent_session_efforts.pop(key, None)
-                self._agent_session_approval_policies.pop(key, None)
+                self._drop_agent_session(key)
             return
         for state in self._states_for_user(user_id, chat_id):
             for req in list(state.pending):
@@ -148,6 +145,20 @@ class ProjectChatStateMixin:
                 if req.future and not req.future.done():
                     req.future.cancel()
             logger.info(f"Cleared pending permissions for user {user_id} chat {chat_id or '*'}")
+
+    def _drop_agent_session(self, key, session=None) -> None:
+        """Evict the cached agent-session entry for ``key``.
+
+        With ``session`` given, evict only while the cached entry still wraps
+        that exact session object, so a concurrent turn's fresh entry is never
+        removed by a stale turn's cleanup.
+        """
+        entry = self._agent_sessions.get(key)
+        if entry is None:
+            return
+        if session is not None and entry.session is not session:
+            return
+        self._agent_sessions.pop(key, None)
 
     def _agent_keys_for_user(self, user_id: int, chat_id: Optional[int] = None):
         if chat_id is not None:
