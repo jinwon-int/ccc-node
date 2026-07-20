@@ -55,6 +55,7 @@ from telegram_bot.core.usage import (
     merge_usage,
     parse_claude_rate_limit_event,
     parse_claude_result,
+    synthesize_service_windows,
 )
 from telegram_bot.core.usage_meter import MODE_INTERACTIVE, UsageMeter
 from telegram_bot.memory.distill_worker import CodexDistillExtractionWorker
@@ -669,6 +670,24 @@ class ProjectChatHandler(
         rate_limit = getattr(self, "_claude_rate_limit", None)
         if rate_limit is not None:
             result = merge_usage(result, rate_limit)
+        # Third-party services (e.g. Kimi Code) publish no quota data, so no
+        # observed window ever arrives; fall back to the meter's local
+        # rolling-window estimate so /usage is not stuck on "unavailable".
+        # Real observed windows always win — synthesis only fills an empty set.
+        if result.service is not None and not result.windows:
+            meter = getattr(self, "_usage_meter", None)
+            if meter is not None:
+                try:
+                    rolling = meter.rolling_usage().get(result.provider)
+                    windows = synthesize_service_windows(result.service, rolling)
+                except Exception:
+                    logger.debug("Local service window synthesis failed")
+                    windows = ()
+                if windows:
+                    result = merge_usage(
+                        result,
+                        UsageSnapshot(provider=result.provider, windows=windows),
+                    )
         return result
 
     def _get_stream_init_lock(self, user_id: int, chat_id: int) -> asyncio.Lock:
