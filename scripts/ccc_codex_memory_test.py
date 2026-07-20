@@ -81,6 +81,14 @@ class CodexMemoryMaterializerTest(unittest.TestCase):
         self.assertEqual(stat.S_IMODE(metadata.stat().st_mode), 0o600)
         self.assertIn(self.module.BEGIN_MARKER, text)
         self.assertIn(self.module.END_MARKER, text)
+        self.assertIn(
+            f"- github-policy: `{self.module.GITHUB_POLICY_VERSION}`", text
+        )
+        self.assertIn(self.module.GITHUB_POLICY_BLOCK.strip(), text)
+        self.assertLess(
+            text.index(self.module.GITHUB_POLICY_BLOCK.strip()),
+            text.index(self.module.SNAPSHOT_DELIMITER),
+        )
         self.assertIn("NODE_SECRET_SENTINEL", text)
         self.assertNotIn("NODE_SECRET_SENTINEL", meta_text)
         self.assertEqual(meta["snapshot_sha256"], result.snapshot_sha256)
@@ -158,8 +166,28 @@ class CodexMemoryMaterializerTest(unittest.TestCase):
         self.assertTrue(second.startswith(user))
         self.assertEqual(second.count(self.module.BEGIN_MARKER), 1)
         self.assertEqual(second.count(self.module.END_MARKER), 1)
-        self.assertNotIn("first", second)
-        self.assertIn("second", second)
+        self.assertNotIn("\nfirst\n", second)
+        self.assertIn("\nsecond\n", second)
+
+    def test_legacy_block_without_github_policy_is_not_reused(self) -> None:
+        options = self.options()
+        self.module.materialize_snapshot("same-snapshot", options)
+        target = self.codex_home / "AGENTS.md"
+        legacy = target.read_text(encoding="utf-8")
+        legacy = legacy.replace(
+            f"- github-policy: `{self.module.GITHUB_POLICY_VERSION}`\n\n", ""
+        ).replace(f"{self.module.GITHUB_POLICY_BLOCK}\n", "")
+        target.write_text(legacy, encoding="utf-8")
+        target.chmod(0o600)
+
+        status = self.module.snapshot_status(options)
+        self.assertEqual(status.status, "missing")
+        result = self.module.materialize_snapshot("same-snapshot", options)
+        refreshed = target.read_text(encoding="utf-8")
+
+        self.assertEqual(result.status, "updated")
+        self.assertIn(self.module.GITHUB_POLICY_BLOCK.strip(), refreshed)
+        self.assertEqual(refreshed.count(self.module.BEGIN_MARKER), 1)
 
     def test_nonempty_override_is_active_and_empty_override_falls_back(self) -> None:
         self.codex_home.mkdir(mode=0o700)

@@ -88,6 +88,7 @@ CLAUDE_DIR="${CCC_CLAUDE_DIR:-$HOME/.claude}"
 MEM_DIR="$CLAUDE_DIR/memories"          # node-owned memory (Hermes-independent)
 HERMES_ROOT="${CCC_HERMES_DIR:-$HOME/.hermes}"
 HERMES_DIR="$HERMES_ROOT/memories"      # legacy memory location (fallback only)
+CODEX_DIR="${CODEX_HOME:-$HOME/.codex}"
 WIKI_AGENT_BIN="${CCC_WIKI_AGENT_BIN:-$HOME/.wiki-agent/bin/wiki-agent}"
 BRIDGE_DEFAULT_PATH="${CCC_BRIDGE_DEFAULT_PATH:-$HOME}"
 HARNESS_PATHS_LIB="$SRC/scripts/lib/harness-paths.sh"
@@ -597,6 +598,14 @@ WEOF
 }
 warn_placeholder_residue
 
+# GitHub transport policy: Codex's OpenAI-curated GitHub plugin carries a
+# connector-first skill, while ccc-node standardizes on the node-local `gh`
+# identity. Persist the supported per-plugin toggle without re-rendering the
+# rest of config.toml. The helper is fail-closed and atomic; it never prints
+# config contents or follows a config symlink.
+run python3 "$SRC/scripts/ccc_codex_github_policy.py" apply --codex-home "$CODEX_DIR"
+note "Codex GitHub transport pinned to local gh CLI (plugin disabled)"
+
 cat <<'EOF'
 
 ==> Done. Follow-up checklist (do these manually):
@@ -635,6 +644,7 @@ printf '  - CCC_WIKI_AGENT_BIN=%s\n' "$WIKI_AGENT_BIN"
 printf '  - CCC_BRIDGE_DEFAULT_PATH=%s\n' "$BRIDGE_DEFAULT_PATH"
 printf '  - CCC_CODEX_CLI_PATH=%s/hooks/ccc-codex\n' "$CLAUDE_DIR"
 printf '  - CCC_CODEX_MEMORY_MATERIALIZER_PATH=%s/hooks/ccc_codex_memory.py\n' "$CLAUDE_DIR"
+printf '  - CODEX_HOME=%s (GitHub plugin disabled; gh CLI-first)\n' "$CODEX_DIR"
 printf '  - bridge command=./start.sh --path %s -d\n' "$BRIDGE_DEFAULT_PATH"
 
 SETUP_TXN_ACTIVE=0

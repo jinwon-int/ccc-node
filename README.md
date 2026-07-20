@@ -15,6 +15,8 @@ cd ccc-node
 ./setup.sh             # install harness files/templates into ~/.claude and ~/.hermes
 # Root-run nodes: setup drops the bypassPermissions default (Claude Code refuses
 # it under root); run Claude as a non-root user to keep the no-prompt default.
+# setup also disables the OpenAI-curated GitHub plugin in ~/.codex/config.toml;
+# GitHub work uses the node-local authenticated gh CLI by default.
 
 # Optional Telegram bridge:
 cd bridge
@@ -38,6 +40,7 @@ After setup:
 | Doctor diagnostics | Read-only drift report plus conservative dry-run/apply repairs for settings and allowlisted files. | [`docs/doctor.md`](docs/doctor.md) |
 | Security audit | Metadata-only permission/config/redaction checks; no matched secret text printed. | [`docs/security-audit.md`](docs/security-audit.md) |
 | Agent-cron | Durable local task definitions, due/lock/run primitives, explicit scheduler execution. | [`docs/agent-cron.md`](docs/agent-cron.md) |
+| GitHub transport | Local `git` + `gh` CLI by default; the Codex GitHub connector plugin is disabled during setup. | [`docs/github-transport.md`](docs/github-transport.md) |
 | A2A worker lane | Claude Code A2A poller/analysis-backend wiring, native Termux worker preflight. | [`docs/a2a-claude-worker.md`](docs/a2a-claude-worker.md) |
 | Termux parity | Android/Termux constraints and VPS parity notes. | [`docs/android-termux-claude.md`](docs/android-termux-claude.md), [`docs/termux-vps-parity.md`](docs/termux-vps-parity.md) |
 | Release/version anchor | `scripts/ccc-version.sh` exposes the checkout tag/SHA/dirty identity used by doctor and fleet reports; updates use `scripts/ccc-self-update.sh`. | [`docs/version-and-provenance.md`](docs/version-and-provenance.md) |
@@ -66,6 +69,7 @@ setup.sh                   Idempotent bootstrap; refuses to overwrite real node 
 | `CCC_HERMES_DIR` | `$HOME/.hermes` | Hermes-side config templates |
 | `CCC_WIKI_AGENT_BIN` | `$HOME/.wiki-agent/bin/wiki-agent` | Family Wiki reader/writer binary path |
 | `CCC_BRIDGE_DEFAULT_PATH` | `$HOME` | Suggested Telegram bridge workspace |
+| `CODEX_HOME` | `$HOME/.codex` | Codex config target; setup applies the GitHub CLI-first plugin toggle here |
 | `CCC_STATE_DIR` | `$CCC_CLAUDE_DIR/state` | Local node state and memory index |
 | `CCC_MEMORY_PROFILE` | `honcho` | Memory profile: `honcho`, `hybrid`, or `max-perf` |
 | `CCC_MEMORY_CACHE_DIR` | `$CCC_CLAUDE_DIR/hooks/cache` | Wiki/Honcho cache metadata |
