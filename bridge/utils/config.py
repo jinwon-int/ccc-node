@@ -266,6 +266,18 @@ class Config(VoiceSettingsMixin, HeartbeatSettingsMixin, BaseSettings):
         alias="CCC_USAGE_BUDGET_WARN_PERCENT",
         description="Early-alarm percentage of a daily token budget.",
     )
+    dead_session_wakeup: bool = Field(
+        default=False,
+        alias="CCC_DEAD_SESSION_WAKEUP",
+        description=(
+            "Opt-in dead-session wakeup (#364 P2): when a background task "
+            "completes after its Claude session died, resume that session for "
+            "one bounded autonomous turn so the CLI processes its pending "
+            "task notifications and the result reaches the user. Metered as "
+            "autonomous spend and gated by the daily budget; default off = "
+            "no behavior change. Claude provider only."
+        ),
+    )
     claude_cli_path: Optional[Path] = Field(
         default=None,
         description="Optional absolute path to Claude CLI binary (defaults to system PATH)",

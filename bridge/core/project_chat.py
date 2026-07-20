@@ -375,7 +375,11 @@ class ProjectChatHandler(
         except Exception:
             return
         try:
-            self._usage_meter.record("claude", MODE_INTERACTIVE, requests=1)
+            self._usage_meter.record(
+                "claude",
+                getattr(req, "usage_mode", MODE_INTERACTIVE),
+                requests=1,
+            )
         except Exception:
             logger.exception("Claude request metering failed; turn continues")
 
@@ -407,13 +411,15 @@ class ProjectChatHandler(
             input_total = snapshot.input_tokens or 0
         return input_total, snapshot.output_tokens or 0
 
-    def _meter_claude_tokens(self, delta: Tuple[int, int]) -> None:
+    def _meter_claude_tokens(
+        self, delta: Tuple[int, int], mode: str = MODE_INTERACTIVE
+    ) -> None:
         if self._usage_meter is None:
             return
         try:
             self._usage_meter.record(
                 "claude",
-                MODE_INTERACTIVE,
+                mode,
                 input_tokens=delta[0],
                 output_tokens=delta[1],
             )
@@ -486,7 +492,7 @@ class ProjectChatHandler(
             )
         except Exception:
             return
-        self._meter_claude_tokens(delta)
+        self._meter_claude_tokens(delta, mode=getattr(req, "usage_mode", MODE_INTERACTIVE))
 
     def record_agent_turn_request(self) -> None:
         """Count one completed interactive agent-runtime turn, fail-open."""
@@ -499,7 +505,7 @@ class ProjectChatHandler(
         except Exception:
             logger.exception("Interactive usage metering failed; turn continues")
 
-    def record_claude_adapter_attempt(self) -> None:
+    def record_claude_adapter_attempt(self, mode: str = MODE_INTERACTIVE) -> None:
         """Meter one Claude adapter-path request at its spend boundary (#388).
 
         Mirrors ``record_claude_attempt`` for the flagged adapter path
@@ -508,6 +514,10 @@ class ProjectChatHandler(
         any output still charges exactly one request. Codex meters at its own
         runtime spend boundary via ``set_turn_attempt_recorder``; any runtime
         exposing that seam meters itself and this helper stays a no-op.
+
+        ``mode`` distinguishes user turns (interactive, the default) from
+        bridge-initiated turns such as the #364 dead-session wakeup, which
+        meter as autonomous so the #388 budget gate governs them.
         """
 
         if self._usage_meter is None:
@@ -517,11 +527,13 @@ class ProjectChatHandler(
         if callable(getattr(self._agent_runtime, "set_turn_attempt_recorder", None)):
             return
         try:
-            self._usage_meter.record("claude", MODE_INTERACTIVE, requests=1)
+            self._usage_meter.record("claude", mode, requests=1)
         except Exception:
             logger.exception("Claude request metering failed; turn continues")
 
-    def record_claude_adapter_result(self, event: Any) -> None:
+    def record_claude_adapter_result(
+        self, event: Any, mode: str = MODE_INTERACTIVE
+    ) -> None:
         """Meter Claude adapter-path tokens from the terminal ResultEvent (#388).
 
         ClaudeRuntime carries the SDK ResultMessage usage block in its
@@ -549,7 +561,7 @@ class ProjectChatHandler(
             _NS(usage=dict(usage), model_usage={}, total_cost_usd=None)
         )
         if any(delta):
-            self._meter_claude_tokens(delta)
+            self._meter_claude_tokens(delta, mode=mode)
 
     def _stream_key(self, user_id: int, chat_id: int) -> Tuple[int, int]:
         return stream_key(

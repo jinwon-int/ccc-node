@@ -77,6 +77,10 @@ class _PendingRequest:
     # through the ledger so no status indicator can outlive its task record.
     task_id: Optional[str] = None
     sent_session_id: str = "default"
+    # Usage-meter mode this request's spend is recorded under (#388/#364):
+    # "interactive" for user turns (never budget-blocked), "autonomous" for
+    # bridge-initiated turns such as the dead-session wakeup.
+    usage_mode: str = "interactive"
     last_typing_at: float = 0.0
     started_at: float = 0.0
     heartbeat_last_update_at: float = 0.0

@@ -37,6 +37,7 @@ from telegram_bot.core.project_chat_types import (
     _PendingRequest,
     _UserStreamState,
 )
+from telegram_bot.core.usage_meter import MODE_INTERACTIVE
 from telegram_bot.core.task_ledger import (
     CANCELED as TASK_CANCELED,
     COMPLETED as TASK_COMPLETED,
@@ -103,6 +104,7 @@ class ProjectChatProcessMixin:
         notification_bot: Optional[Any] = None,
         interim_message_callback: Optional[InterimMessageCallback] = None,
         sensitive_log_event: Optional[str] = None,
+        usage_mode: str = MODE_INTERACTIVE,
     ) -> ChatResponse:
         del message_id
         if self._agent_runtime is not None:
@@ -141,6 +143,7 @@ class ProjectChatProcessMixin:
                 bot=bot,
                 notification_bot=notification_bot,
                 interim_message_callback=interim_message_callback,
+                usage_mode=usage_mode,
             )
         _log_user_input(
             user_message=user_message,
@@ -176,6 +179,7 @@ class ProjectChatProcessMixin:
             streaming_handler=streaming_handler,
             interim_message_callback=interim_message_callback,
         )
+        request.usage_mode = usage_mode
         request.started_at = loop.time()
         request.task_id = self._ledger_create(user_id, chat_id)
         state: Optional[_UserStreamState] = None
@@ -299,6 +303,7 @@ class ProjectChatProcessMixin:
                         streaming_handler=retry_handler,
                         interim_message_callback=interim_message_callback,
                     )
+                    retry_request.usage_mode = usage_mode
                     retry_request.started_at = loop.time()
                     retry_request.task_id = self._ledger_create(user_id, chat_id)
                     retry_state: Optional[_UserStreamState] = None
@@ -515,6 +520,7 @@ class ProjectChatProcessMixin:
         bot: Optional[Any],
         interim_message_callback: Optional[InterimMessageCallback],
         notification_bot: Optional[Any] = None,
+        usage_mode: str = MODE_INTERACTIVE,
     ) -> ChatResponse:
         """Run one provider-neutral turn without changing the Claude SDK path."""
         key = self._stream_key(user_id, chat_id)
@@ -538,6 +544,7 @@ class ProjectChatProcessMixin:
                 status_callback=status_callback,
                 streaming_handler=streaming_handler,
             )
+            progress_request.usage_mode = usage_mode
             progress_request.started_at = loop.time()
             progress_request.task_id = self._ledger_create(user_id, chat_id)
             progress_task = asyncio.create_task(
@@ -726,7 +733,7 @@ class ProjectChatProcessMixin:
                                 # the request. No-op for runtimes (Codex)
                                 # that meter at their own boundary.
                                 attempt_recorded = True
-                                self.record_claude_adapter_attempt()
+                                self.record_claude_adapter_attempt(mode=usage_mode)
                             approval_pending = isinstance(event, ApprovalRequestEvent)
                             if isinstance(event, TextDeltaEvent):
                                 # A new text delta after a completed message proves
@@ -777,7 +784,7 @@ class ProjectChatProcessMixin:
                                 # path meters its tokens here (#388); a no-op
                                 # for Codex, which meters via the runtime's
                                 # usage-recorder seam.
-                                self.record_claude_adapter_result(event)
+                                self.record_claude_adapter_result(event, mode=usage_mode)
                             elif isinstance(
                                 event,
                                 (
