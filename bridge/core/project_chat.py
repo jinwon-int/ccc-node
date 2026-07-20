@@ -679,7 +679,15 @@ class ProjectChatHandler(
             if meter is not None:
                 try:
                     rolling = meter.rolling_usage().get(result.provider)
-                    windows = synthesize_service_windows(result.service, rolling)
+                    period = getattr(meter, "period_usage", None)
+                    weekly = (
+                        period(days=7).get(result.provider)
+                        if period is not None
+                        else None
+                    )
+                    windows = synthesize_service_windows(
+                        result.service, rolling, weekly
+                    )
                 except Exception:
                     logger.debug("Local service window synthesis failed")
                     windows = ()

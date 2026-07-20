@@ -1137,3 +1137,84 @@ def test_render_usage_count_window_with_limit_shows_remaining(
     )
     over_rendered = render_usage(over)
     assert "108.3% used / 0% left" in over_rendered
+
+
+def test_synthesize_service_windows_weekly_requires_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    weekly = {"requests": 125, "tokens": 53_498_062}
+    # Without a configured weekly limit the weekly window stays hidden and the
+    # 5-hour window still renders count-only.
+    monkeypatch.delenv("CCC_USAGE_KIMI_WEEKLY_TOKEN_LIMIT", raising=False)
+    monkeypatch.delenv("CCC_USAGE_KIMI_5H_REQUEST_LIMIT", raising=False)
+    windows = synthesize_service_windows(
+        "Kimi Code", {"requests": 79, "tokens": 26_000_000}, weekly
+    )
+    assert [w.label for w in windows] == ["Kimi 5-hour"]
+    # With both limits configured both windows appear in spec order.
+    monkeypatch.setenv("CCC_USAGE_KIMI_5H_REQUEST_LIMIT", "359")
+    monkeypatch.setenv("CCC_USAGE_KIMI_WEEKLY_TOKEN_LIMIT", "222908592")
+    windows = synthesize_service_windows(
+        "Kimi Code", {"requests": 79, "tokens": 26_000_000}, weekly
+    )
+    assert [w.label for w in windows] == ["Kimi 5-hour", "Kimi weekly"]
+    five_hour, weekly_window = windows
+    assert (five_hour.used_count, five_hour.count_limit) == (79, 359)
+    assert weekly_window.used_count == 53_498_062
+    assert weekly_window.count_unit == "tok"
+    assert weekly_window.count_limit == 222908592
+    # Missing weekly aggregate hides only the weekly window.
+    windows = synthesize_service_windows("Kimi Code", {"requests": 79}, None)
+    assert [w.label for w in windows] == ["Kimi 5-hour"]
+
+
+def test_render_usage_weekly_window_shows_percentages(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("CCC_USAGE_KIMI_5H_REQUEST_LIMIT", raising=False)
+    monkeypatch.delenv("CCC_USAGE_KIMI_WEEKLY_TOKEN_LIMIT", raising=False)
+    snapshot = UsageSnapshot(
+        provider="claude",
+        service="Kimi Code",
+        windows=(
+            UsageWindow(
+                label="Kimi weekly",
+                used_percent=None,
+                used_count=53_498_062,
+                count_unit="tok",
+                count_limit=222_908_592,
+            ),
+        ),
+    )
+    rendered = render_usage(snapshot)
+    assert (
+        "- Kimi weekly: 53,498,062/222,908,592 tok · 24% used / 76% left "
+        "(local estimate)" in rendered
+    )
+
+
+@pytest.mark.anyio
+async def test_get_usage_synthesizes_weekly_window_from_meter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _clear_service_env(monkeypatch)
+    monkeypatch.setenv("CCC_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://api.kimi.com/coding/")
+    monkeypatch.setenv("ANTHROPIC_MODEL", "k3[1m]")
+    monkeypatch.setenv("CCC_USAGE_KIMI_5H_REQUEST_LIMIT", "359")
+    monkeypatch.setenv("CCC_USAGE_KIMI_WEEKLY_TOKEN_LIMIT", "222908592")
+    handler = ProjectChatHandler.__new__(ProjectChatHandler)
+    handler._agent_runtime = None
+    handler._claude_usage = {}
+    handler._clock = SimpleNamespace(time=lambda: 1000.0)
+    handler._config = SimpleNamespace(claude_settings_path=tmp_path / "settings.json")
+    handler._usage_meter = SimpleNamespace(
+        rolling_usage=lambda: {"claude": {"requests": 79, "tokens": 26_000_000}},
+        period_usage=lambda days=7: {
+            "claude": {"requests": 125, "tokens": 53_498_062}
+        },
+    )
+
+    result = await handler.get_usage(1, 2, "claude-x")
+    assert [w.label for w in result.windows] == ["Kimi 5-hour", "Kimi weekly"]
+    assert result.windows[1].count_limit == 222908592
