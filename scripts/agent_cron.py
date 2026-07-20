@@ -1058,7 +1058,7 @@ def write_owner_spool(task, task_id, run_id, scheduled_at, status, headless, at)
         return {**base, 'delivery': 'spool-error', 'redacted': True, 'error': short_text(str(e), 600)}
 
 
-def run_execute(data, task_id, at_value, as_json):
+def run_execute(data, task_id, at_value, as_json):  # noqa: C901 -- #348 baseline hotspot
     task = task_by_id(data, task_id)
     if not task:
         return {'ok': False, 'mode': 'run-execute', 'taskId': task_id, 'error': 'task id not found'}, as_json, 1
