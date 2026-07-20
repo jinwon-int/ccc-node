@@ -212,6 +212,7 @@ say "== python hook helpers =="
 if command -v python3 >/dev/null 2>&1; then
   if python3 -m py_compile claude/hooks/statusline-usage.py 2>/dev/null; then say "  ok claude/hooks/statusline-usage.py compiles"; else err "py_compile: claude/hooks/statusline-usage.py"; fi
   if python3 -m py_compile claude/hooks/lib/memory_render.py 2>/dev/null; then say "  ok claude/hooks/lib/memory_render.py compiles"; else err "py_compile: claude/hooks/lib/memory_render.py"; fi
+  if python3 -m py_compile scripts/ccc_codex_github_policy.py 2>/dev/null; then say "  ok scripts/ccc_codex_github_policy.py compiles"; else err "py_compile: scripts/ccc_codex_github_policy.py"; fi
 else
   say "  (python3 absent — skipped)"
 fi
@@ -229,7 +230,7 @@ for t in claude/hooks/observability.test.sh claude/hooks/security-scan.test.sh \
          claude/hooks/distill/extract.test.sh claude/hooks/distill/honcho-push.test.sh \
          claude/hooks/distill/queue-drain.test.sh claude/hooks/distill/pending-drain.test.sh claude/hooks/distill/wiki-queue.test.sh \
          claude/hooks/distill/local-facts.test.sh claude/hooks/memory-hooks.test.sh \
-         scripts/ccc-doctor.test.sh scripts/ccc-memory.test.sh scripts/ccc-codex-memory.test.sh scripts/ccc-codex.test.sh scripts/ccc-distill-check.test.sh scripts/ccc-security-audit.test.sh \
+         scripts/ccc-doctor.test.sh scripts/ccc-memory.test.sh scripts/ccc-codex-memory.test.sh scripts/ccc-codex.test.sh scripts/ccc-codex-github-policy.test.sh scripts/ccc-distill-check.test.sh scripts/ccc-security-audit.test.sh \
          scripts/ccc-fleet-matrix.test.sh scripts/ccc-wiki-triage.test.sh scripts/setup.test.sh \
          scripts/harness-paths.test.sh \
          scripts/agent-cron.test.sh scripts/agent-cron-lib.test.sh scripts/a2a-termux-native-worker.test.sh \

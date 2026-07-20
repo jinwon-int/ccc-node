@@ -27,6 +27,7 @@ Summary of MEMORY.md · USER.md from `$HOME/.hermes/memories/`. Operational fact
 ## GitHub Hygiene
 - Operational repos should live under **`jinwon-int`** where possible. Older personal-account duplicates → archive / mark legacy.
 - Canonical: `jinwon-int/a2a-docker-runner`, `jinwon-int/wiki-agent`.
+- Transport: use local `git` + authenticated `gh` CLI for all GitHub reads/writes. Do not use GitHub App/connector/MCP/plugin tools unless the user explicitly requests that transport in the current task; never auto-fallback from a failed `gh` call to a connector.
 - Workflow: PR-first. When CI/validation green & mergeable → squash merge + branch cleanup are automatic.
 - PRs by `<USER_GH>` need a `seoseo-ai` reviewer/merger when applicable.
 

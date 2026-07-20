@@ -49,6 +49,7 @@ ok "setup executor does not evaluate command strings" \
   '! grep -Eq "(^|[[:space:]])eval([[:space:]]|$)" "$SETUP"'
 ok "setup non-root dry-run avoids hardcoded root paths in checklist" '! grep -q "/root/.wiki-agent/bin/wiki-agent" <<<"$out" && ! grep -q -- "--path /root" <<<"$out"'
 ok "setup non-root dry-run writes nothing to override dirs" '[ ! -e "$nonroot_claude" ] && [ ! -e "$nonroot_hermes" ]'
+ok "setup dry-run does not create Codex plugin policy state" '[ ! -e "$nonroot_home/.codex" ]'
 
 out="$(HOME="$TMP/root-guard-home" CCC_CLAUDE_DIR=/ CCC_HERMES_DIR="$TMP/root-guard-hermes" bash "$SETUP" --dry-run 2>&1)"; rc=$?
 ok "setup refuses filesystem-root Claude install target" '[ "$rc" = 2 ] && grep -q "filesystem-root" <<<"$out"'
@@ -241,6 +242,25 @@ else
 fi
 ok "seeded settings.local.json carries no broad fleet-wide grants" \
   'jq -e ".permissions.allow == []" "$seed_claude/settings.local.json" >/dev/null'
+ok "setup disables the OpenAI-curated GitHub plugin for gh CLI-first operation" \
+  'grep -Fq '\''[plugins."github@openai-curated-remote"]'\'' "$seed_home/.codex/config.toml" && grep -Fq '\''enabled = false'\'' "$seed_home/.codex/config.toml"'
+
+policy_home="$TMP/policy-home"
+policy_claude="$TMP/policy-claude"
+policy_hermes="$TMP/policy-hermes"
+policy_codex="$TMP/policy-codex"
+mkdir -p "$policy_codex"
+printf '%s\n' \
+  '# preserve-this-comment' \
+  'sentinel = "KEEP"' \
+  '' \
+  '[plugins."github@openai-curated-remote"]' \
+  'enabled = true # connector-first old state' > "$policy_codex/config.toml"
+HOME="$policy_home" CODEX_HOME="$policy_codex" CCC_CLAUDE_DIR="$policy_claude" \
+  CCC_HERMES_DIR="$policy_hermes" bash "$SETUP" --no-backup >/dev/null 2>&1
+policy_rc=$?
+ok "setup honors CODEX_HOME while preserving unrelated Codex config" \
+  '[ "$policy_rc" = 0 ] && grep -Fq '\''sentinel = "KEEP"'\'' "$policy_codex/config.toml" && grep -Fq '\''# preserve-this-comment'\'' "$policy_codex/config.toml" && grep -Fq '\''enabled = false # connector-first old state'\'' "$policy_codex/config.toml"'
 
 # Root-run Claude would reject --dangerously-skip-permissions, so setup must
 # neutralize the bypassPermissions default when the run user is root. Simulate

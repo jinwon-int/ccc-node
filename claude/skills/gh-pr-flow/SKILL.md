@@ -10,6 +10,16 @@ Use this for code changes that land in GitHub. Operational repos live under
 The normal local `gh` identity is `seoseo-ai`. For Wiki content use
 `wiki-record` instead.
 
+## GitHub transport policy
+
+- Use local `git` and the authenticated `gh` CLI for every GitHub read and write.
+- Do not use GitHub App, connector, MCP, or plugin tools unless the user
+  explicitly requests that transport in the current task.
+- If `gh` fails, report the error; do not automatically retry through a GitHub
+  connector.
+- Run `gh auth status` before the first authenticated GitHub operation when the
+  current session has not already verified it.
+
 ## Procedure
 
 1. Sync and branch:

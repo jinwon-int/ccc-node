@@ -9,6 +9,13 @@ All notable changes to the Claude Code node harness. Dates are KST.
   explicit fail-closed sandbox choice. Bounded tasks support `notBefore`,
   `maxRuns`, and durable `runCount`, so a future one-time LLM job cannot catch
   up last year's cron occurrence or remain enabled after its allowed run.
+- GitHub CLI-first fleet policy for Codex and Claude Code. `setup.sh` now
+  atomically persists `[plugins."github@openai-curated-remote"] enabled = false`
+  without re-rendering or printing the rest of node-local `config.toml`.
+  Codex global guidance and `gh-pr-flow` require local `git` + authenticated
+  `gh`, prohibit automatic connector fallback, and retain an explicit per-task
+  opt-in path for connector use. A fail-closed policy helper and regression
+  suite cover idempotence, comment preservation, invalid TOML, and symlinks.
 
 ### Fixed
 - Linux systemd installs now use `Restart=always` so a direct SIGTERM that the
