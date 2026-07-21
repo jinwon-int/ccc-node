@@ -270,6 +270,14 @@ while [ $# -gt 0 ]; do
             INTERNAL_RUN=1
             shift
             ;;
+        --_reap-competing-pollers)
+            # Internal/testing seam: terminate competing project-bot pollers
+            # for --path and exit. Exercises the same code path the daemon
+            # supervisor runs before an auto-restart (409 self-heal).
+            ACTION="reap-competing-pollers"
+            INTERNAL_RUN=1
+            shift
+            ;;
         -h|--help)
             cat <<EOF
 Usage: $0 <project_path> [options]
@@ -434,6 +442,31 @@ find_project_bot_pids() {
             _ps_argv_is_project_bot "$pid" && printf '%s\n' "$pid"
         fi
     done < <(pgrep -f -- "-m telegram_bot --path" 2>/dev/null || true)
+}
+
+# Terminate competing project-bot pollers for this PROJECT_ROOT — other
+# `python -m telegram_bot --path $PROJECT_ROOT` processes that are NOT the pid
+# passed in "$1" (the still-live current child, if any) and NOT the supervisor
+# itself. The daemon supervisor calls this before an auto-restart: a crash
+# caused by a Telegram getUpdates 409 Conflict means a stray/second poller
+# still holds the token, so without clearing it the relaunch 409s again and the
+# supervisor burns the rapid-crash budget and gives up, leaving the bot down.
+# No-op when no competitor exists (the common case for an ordinary crash).
+reap_competing_pollers() {
+    local keep="${1:-}" pid self_sup
+    self_sup="$(read_supervisor_pid 2>/dev/null || true)"
+    for pid in $(find_project_bot_pids); do
+        [ -n "$keep" ] && [ "$pid" = "$keep" ] && continue
+        [ -n "$self_sup" ] && [ "$pid" = "$self_sup" ] && continue
+        echo "🧹 Clearing competing bot poller (PID: $pid) to resolve token conflict"
+        kill "$pid" 2>/dev/null || true
+        for _ in $(seq 1 5); do
+            kill -0 "$pid" 2>/dev/null || break
+            sleep 1
+        done
+        kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null || true
+    done
+    return 0
 }
 
 cleanup_supervisor_pid() {
@@ -1073,6 +1106,7 @@ case "$ACTION" in
     uninstall-systemd) do_uninstall_systemd ;;
     upgrade)           do_upgrade ;;
     version)           do_version ;;
+    reap-competing-pollers) reap_competing_pollers ""; exit 0 ;;
     run)       ;; # Continue to startup flow below
 esac
 
@@ -1304,6 +1338,12 @@ run_daemon_supervisor() {
         if [ "$restart_delay" -gt "$CCC_RESTART_DELAY_MAX_SECONDS" ]; then
             restart_delay="$CCC_RESTART_DELAY_MAX_SECONDS"
         fi
+        # The current child has already exited and been reaped (child_pid=""),
+        # so any surviving project-bot poller is a stray/second instance holding
+        # the Telegram token. Clear it before relaunching so a getUpdates 409
+        # Conflict self-heals instead of crash-looping to the rapid-crash limit.
+        reap_competing_pollers ""
+
         echo "🔄 Auto-restarting in ${restart_delay} seconds..."
         sleep "$restart_delay"
     done

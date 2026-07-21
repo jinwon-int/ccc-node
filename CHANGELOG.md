@@ -25,6 +25,16 @@ All notable changes to the Claude Code node harness. Dates are KST.
   bridge handles as a clean exit cannot silently leave Telegram serving down.
   Explicit `systemctl stop` remains authoritative, and the documented
   single-supervisor rule still forbids combining systemd with `start.sh -d`.
+- The daemon supervisor now clears a competing project-bot poller before an
+  auto-restart. A crash caused by a Telegram getUpdates 409 Conflict — a stray
+  or second instance still holding the token — previously relaunched straight
+  back into the same conflict until the rapid-crash limit tripped and the
+  supervisor gave up, leaving the bot unresponsive (observed 2026-07-21 on
+  daegyo/gongmyoung; gongyung only recovered by timing). `reap_competing_pollers`
+  (reusing the exact-argv `find_project_bot_pids` oracle) now terminates the
+  surviving poller so the loop self-heals; it is a no-op when no competitor
+  exists. A `--_reap-competing-pollers` internal seam plus regression tests
+  cover kill, no-op, and cross-project isolation.
 
 ## [0.4.0] — 2026-07-18
 
