@@ -4,7 +4,6 @@ import sys
 import tempfile
 import types
 import unittest
-from collections import deque
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -55,7 +54,7 @@ sdk_module.PermissionResultDeny = _PermissionResultDeny
 sdk_module.__path__ = []
 sys.modules.setdefault("claude_agent_sdk", sdk_module)
 
-# Complete the stub set (as test_project_chat_retry does): tool_policy imports
+# Complete the stub set: tool_policy imports
 # claude_agent_sdk.types, so a solo run of this module must not depend on a
 # sibling test having imported the real SDK first.
 sdk_types_module = types.ModuleType("claude_agent_sdk.types")
@@ -105,7 +104,6 @@ sys.modules.pop("telegram_bot.core.project_chat", None)
 project_chat = importlib.import_module("telegram_bot.core.project_chat")
 ProjectChatHandler = project_chat.ProjectChatHandler
 _PendingRequest = project_chat._PendingRequest
-_UserStreamState = project_chat._UserStreamState
 
 _sys_modules_guard.finish()
 
@@ -145,8 +143,8 @@ class HeartbeatLoopTests(unittest.IsolatedAsyncioTestCase):
             future.set_result("done")
         return req
 
-    async def _start_loop(self, state):
-        task = asyncio.create_task(self.handler._typing_keepalive_loop(1, state))
+    async def _start_loop(self, req):
+        task = asyncio.create_task(self.handler._agent_progress_loop(req))
         self.addCleanup(self._cancel, task)
         return task
 
@@ -160,8 +158,7 @@ class HeartbeatLoopTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_sends_heartbeat_after_threshold_without_typing_callback(self):
         req = self._make_request()
-        state = _UserStreamState(client=None, model=None, pending=deque([req]))
-        await self._start_loop(state)
+        await self._start_loop(req)
         await asyncio.wait_for(self.status_event.wait(), timeout=1.0)
         self.assertEqual(req.heartbeat_message_id, 1234)
         self.assertIn("⏳ Working", self.status_calls[0][0])
@@ -171,8 +168,7 @@ class HeartbeatLoopTests(unittest.IsolatedAsyncioTestCase):
         project_chat.config.heartbeat_enabled = False
         self.addCleanup(setattr, project_chat.config, "heartbeat_enabled", True)
         req = self._make_request()
-        state = _UserStreamState(client=None, model=None, pending=deque([req]))
-        await self._start_loop(state)
+        await self._start_loop(req)
         with self.assertRaises(asyncio.TimeoutError):
             await asyncio.wait_for(self.status_event.wait(), timeout=0.1)
         self.assertEqual(self.status_calls, [])
@@ -192,8 +188,7 @@ class HeartbeatLoopTests(unittest.IsolatedAsyncioTestCase):
         now = asyncio.get_running_loop().time()
         req.started_at = now - 2.0
         req.last_visible_progress_at = now
-        state = _UserStreamState(client=None, model=None, pending=deque([req]))
-        await self._start_loop(state)
+        await self._start_loop(req)
         with self.assertRaises(asyncio.TimeoutError):
             await asyncio.wait_for(self.status_event.wait(), timeout=0.1)
         self.assertEqual(self.status_calls, [])
@@ -216,8 +211,7 @@ class HeartbeatLoopTests(unittest.IsolatedAsyncioTestCase):
             self.addCleanup(setattr, project_chat.config, "heartbeat_duration_log_path", None)
 
             req = self._make_request()
-            state = _UserStreamState(client=None, model=None, pending=deque([req]))
-            await self._start_loop(state)
+            await self._start_loop(req)
             await asyncio.wait_for(self.status_event.wait(), timeout=1.0)
             self.assertIn("ETA ~2m 00s", self.status_calls[0][0])
 
@@ -243,8 +237,7 @@ class HeartbeatLoopTests(unittest.IsolatedAsyncioTestCase):
 
             req = self._make_request()
             req.started_at = asyncio.get_running_loop().time() - 300.0  # elapsed 5m
-            state = _UserStreamState(client=None, model=None, pending=deque([req]))
-            await self._start_loop(state)
+            await self._start_loop(req)
             await asyncio.wait_for(self.status_event.wait(), timeout=1.0)
             text = self.status_calls[0][0]
             self.assertIn("Working", text)
@@ -310,16 +303,10 @@ class HeartbeatLoopTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_workload_snapshot_counts_inflight_and_oldest(self):
         now = asyncio.get_running_loop().time()
-        r1 = self._make_request()
-        r1.started_at = now - 30
-        r2 = self._make_request()
-        r2.started_at = now - 10
-        finished = self._make_request(done=True)  # resolved → not in-flight
-        finished.started_at = now - 100
-        state = _UserStreamState(
-            client=None, model=None, pending=deque([r1, r2, finished])
-        )
-        self.handler._streams[(1, 2)] = state
+        self.handler._agent_active_sessions[(1, 2)] = object()
+        self.handler._agent_started_at[(1, 2)] = now - 30
+        self.handler._agent_active_sessions[(3, 4)] = object()
+        self.handler._agent_started_at[(3, 4)] = now - 10
         count, oldest = self.handler.workload_snapshot(now)
         self.assertEqual(count, 2)
         self.assertGreaterEqual(oldest, 29.0)
@@ -336,8 +323,7 @@ class HeartbeatLoopTests(unittest.IsolatedAsyncioTestCase):
             self.handler._task_ledger_cache = None
             req = self._make_request()
             req.task_id = self.handler._ledger_create(1, 2)
-            state = _UserStreamState(client=None, model=None, pending=deque([req]))
-            await self._start_loop(state)
+            await self._start_loop(req)
             await asyncio.wait_for(self.status_event.wait(), timeout=1.0)
             await asyncio.sleep(0)  # let the registration write land
             records = self.handler._task_ledger.records()
@@ -402,8 +388,7 @@ class HeartbeatLoopTests(unittest.IsolatedAsyncioTestCase):
 
             req = self._make_request()
             req.started_at = asyncio.get_running_loop().time() - 30.0
-            state = _UserStreamState(client=None, model=None, pending=deque([req]))
-            await self._start_loop(state)
+            await self._start_loop(req)
             await asyncio.wait_for(self.status_event.wait(), timeout=1.0)
             self.assertIn("ETA ~1m 30s", self.status_calls[0][0])
 

@@ -1003,7 +1003,6 @@ class BotLifecycleMixin:
                 heartbeat_age_factor=float(
                     getattr(settings, "alert_heartbeat_age_factor", 1.0)
                 ),
-                max_dead_streams=int(getattr(settings, "alert_max_dead_streams", 1)),
                 max_pending_notifications=int(
                     getattr(settings, "alert_max_pending_notifications", 10)
                 ),

@@ -1,10 +1,10 @@
 """Between-turns (unsolicited) frame handling for the Claude runtime adapter.
 
-The direct SDK path routes assistant output produced outside an active turn —
-for example the CLI autonomously continuing after a harness background-task
-notification — through ``_UserStreamState``'s unsolicited machinery
-(project_chat_reader).  ``ClaudeRuntime`` must mirror that behavior via the
-optional ``set_unsolicited_handler`` seam: buffer assistant text between
+Assistant output produced outside an active turn — for example the CLI
+autonomously continuing after a harness background-task notification — must
+be delivered (the retired direct SDK path's unsolicited machinery pinned the
+same behavior).  ``ClaudeRuntime`` carries it via the optional
+``set_unsolicited_handler`` seam: buffer assistant text between
 turns, deliver once on the terminal ResultMessage, keep ownership of an
 in-flight autonomous turn when a user turn arrives, and never route mid-turn
 frames to the unsolicited handler.

@@ -63,18 +63,14 @@ class ProjectChatMeterWiringTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(tmp.cleanup)
         self.root = Path(tmp.name)
 
-    async def test_claude_result_messages_meter_interactive_tokens(self) -> None:
+    async def test_claude_result_events_meter_interactive_tokens(self) -> None:
         handler = ProjectChatHandler(settings=_settings(self.root))
         self.assertIsNotNone(handler.usage_meter)
-        request = SimpleNamespace(user_id=7, chat_id=9)
-        message = SimpleNamespace(
-            session_id="session-1",
-            usage={"input_tokens": 120, "output_tokens": 30},
-            model_usage={},
-            total_cost_usd=None,
+        event = SimpleNamespace(
+            result={"usage": {"input_tokens": 120, "output_tokens": 30}}
         )
-        handler.record_claude_attempt(request)
-        handler._record_claude_usage(request, message)
+        handler.record_claude_adapter_attempt()
+        handler.record_claude_adapter_result(event)
 
         day_buckets = next(iter(_meter_state(self.root)["days"].values()))
         self.assertEqual(
@@ -85,20 +81,18 @@ class ProjectChatMeterWiringTests(unittest.IsolatedAsyncioTestCase):
     async def test_claude_cache_tokens_count_toward_the_metered_input(self) -> None:
         handler = ProjectChatHandler(settings=_settings(self.root))
         self.assertIsNotNone(handler.usage_meter)
-        request = SimpleNamespace(user_id=7, chat_id=9)
-        message = SimpleNamespace(
-            session_id="session-1",
-            usage={
-                "input_tokens": 10,
-                "cache_creation_input_tokens": 2000,
-                "cache_read_input_tokens": 3000,
-                "output_tokens": 5,
-            },
-            model_usage={},
-            total_cost_usd=None,
+        event = SimpleNamespace(
+            result={
+                "usage": {
+                    "input_tokens": 10,
+                    "cache_creation_input_tokens": 2000,
+                    "cache_read_input_tokens": 3000,
+                    "output_tokens": 5,
+                }
+            }
         )
-        handler.record_claude_attempt(request)
-        handler._record_claude_usage(request, message)
+        handler.record_claude_adapter_attempt()
+        handler.record_claude_adapter_result(event)
 
         day_buckets = next(iter(_meter_state(self.root)["days"].values()))
         # The complete validated input total (raw + cache creation + cache
@@ -111,25 +105,21 @@ class ProjectChatMeterWiringTests(unittest.IsolatedAsyncioTestCase):
         assert meter is not None
         self.assertEqual(meter.used_tokens("claude"), 5015)
 
-    async def test_claude_attempt_is_metered_once_even_without_a_result(self) -> None:
-        # Reviewer probe: an accepted query that emits output and then loses
-        # its reader must still count one request; repeated events and a
-        # normal ResultMessage completion never double-charge it.
+    async def test_claude_attempt_meters_one_request_without_a_result(self) -> None:
+        # An accepted turn that never reaches its terminal ResultEvent (loop
+        # abandoned, error) still counts exactly the one request recorded at
+        # the spend boundary; the once-per-turn guard lives in the turn loop
+        # (test_project_chat_codex covers it end-to-end).
         handler = ProjectChatHandler(settings=_settings(self.root))
-        request = SimpleNamespace(user_id=7, chat_id=9)
-        handler.record_claude_attempt(request)
-        handler.record_claude_attempt(request)
+        handler.record_claude_adapter_attempt()
 
         day_buckets = next(iter(_meter_state(self.root)["days"].values()))
         self.assertEqual(day_buckets["claude"]["interactive"]["requests"], 1)
 
-        message = SimpleNamespace(
-            session_id="session-1",
-            usage={"input_tokens": 100, "output_tokens": 20},
-            model_usage={},
-            total_cost_usd=None,
+        event = SimpleNamespace(
+            result={"usage": {"input_tokens": 100, "output_tokens": 20}}
         )
-        handler._record_claude_usage(request, message)
+        handler.record_claude_adapter_result(event)
         day_buckets = next(iter(_meter_state(self.root)["days"].values()))
         self.assertEqual(
             day_buckets["claude"]["interactive"],
@@ -145,15 +135,9 @@ class ProjectChatMeterWiringTests(unittest.IsolatedAsyncioTestCase):
             raise RuntimeError("meter offline")
 
         meter.record = explode  # type: ignore[method-assign]
-        request = SimpleNamespace(user_id=7, chat_id=9)
-        message = SimpleNamespace(
-            session_id="session-1",
-            usage={"input_tokens": 1},
-            model_usage={},
-            total_cost_usd=None,
-        )
+        event = SimpleNamespace(result={"usage": {"input_tokens": 1}})
         with self.assertLogs("telegram_bot.core.project_chat", level="ERROR"):
-            handler._record_claude_usage(request, message)
+            handler.record_claude_adapter_result(event)
 
     async def test_meter_can_be_disabled(self) -> None:
         settings = _settings(self.root)
@@ -797,162 +781,4 @@ class RetryableFailureLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(backend.calls, 2)
         self.assertIs(
             journal.get(job.job_id).status, DistillJobStatus.EXTRACTION_DONE
-        )
-
-
-class ClaudeTerminalLossTokenTests(unittest.IsolatedAsyncioTestCase):
-    def setUp(self) -> None:
-        tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(tmp.cleanup)
-        self.root = Path(tmp.name)
-
-    async def test_tokens_survive_a_lost_terminal_and_reconcile_without_doubling(
-        self,
-    ) -> None:
-        # Reviewer probe: an accepted query yields an AssistantMessage with
-        # 100/20 usage, then the reader dies — the tokens must already be
-        # persisted. A later ResultMessage reconciles only the remainder.
-        handler = ProjectChatHandler(settings=_settings(self.root))
-        request = SimpleNamespace(user_id=7, chat_id=9)
-        handler.record_claude_attempt(request)
-        assistant = SimpleNamespace(
-            usage={"input_tokens": 100, "output_tokens": 20},
-            model_usage={},
-            total_cost_usd=None,
-        )
-        handler.record_claude_observed_usage(request, assistant)
-
-        day_buckets = next(iter(_meter_state(self.root)["days"].values()))
-        self.assertEqual(
-            day_buckets["claude"]["interactive"],
-            {"input_tokens": 100, "output_tokens": 20, "requests": 1},
-        )
-
-        # Same-usage terminal: no double charge.
-        result = SimpleNamespace(
-            session_id="session-1",
-            usage={"input_tokens": 100, "output_tokens": 20},
-            model_usage={},
-            total_cost_usd=None,
-        )
-        handler._record_claude_usage(request, result)
-        day_buckets = next(iter(_meter_state(self.root)["days"].values()))
-        self.assertEqual(
-            day_buckets["claude"]["interactive"],
-            {"input_tokens": 100, "output_tokens": 20, "requests": 1},
-        )
-
-        # A larger terminal reconciles only the remainder.
-        bigger = SimpleNamespace(
-            session_id="session-1",
-            usage={"input_tokens": 120, "output_tokens": 25},
-            model_usage={},
-            total_cost_usd=None,
-        )
-        handler._record_claude_usage(request, bigger)
-        day_buckets = next(iter(_meter_state(self.root)["days"].values()))
-        self.assertEqual(
-            day_buckets["claude"]["interactive"],
-            {"input_tokens": 120, "output_tokens": 25, "requests": 1},
-        )
-
-
-class ClaudePerStepUsageTests(unittest.IsolatedAsyncioTestCase):
-    def setUp(self) -> None:
-        tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(tmp.cleanup)
-        self.root = Path(tmp.name)
-
-    @staticmethod
-    def _frame(message_id: str, input_tokens: int, output_tokens: int):
-        return SimpleNamespace(
-            id=message_id,
-            usage={"input_tokens": input_tokens, "output_tokens": output_tokens},
-            model_usage={},
-            total_cost_usd=None,
-        )
-
-    async def test_distinct_steps_accumulate_and_repeats_dedupe(self) -> None:
-        # Reviewer probe: two distinct per-step frames (100/20, 50/10) with a
-        # lost terminal must persist 150/30; a repeated frame for one id
-        # must not add again.
-        handler = ProjectChatHandler(settings=_settings(self.root))
-        request = SimpleNamespace(user_id=7, chat_id=9)
-        handler.record_claude_attempt(request)
-        handler.record_claude_observed_usage(request, self._frame("m1", 100, 20))
-        handler.record_claude_observed_usage(request, self._frame("m2", 50, 10))
-        handler.record_claude_observed_usage(request, self._frame("m2", 50, 10))
-
-        day_buckets = next(iter(_meter_state(self.root)["days"].values()))
-        self.assertEqual(
-            day_buckets["claude"]["interactive"],
-            {"input_tokens": 150, "output_tokens": 30, "requests": 1},
-        )
-
-    async def test_terminal_reconciles_against_whole_tree_totals(self) -> None:
-        # Reviewer probe: a 100/20 top-level result with 200/50 of subagent
-        # activity in model_usage must persist the whole-tree 300/70.
-        handler = ProjectChatHandler(settings=_settings(self.root))
-        request = SimpleNamespace(user_id=7, chat_id=9)
-        handler.record_claude_attempt(request)
-        handler.record_claude_observed_usage(request, self._frame("m1", 100, 20))
-        result = SimpleNamespace(
-            session_id="session-1",
-            usage={"input_tokens": 100, "output_tokens": 20},
-            model_usage={
-                "claude-main": {"inputTokens": 100, "outputTokens": 20},
-                "claude-subagent": {"inputTokens": 200, "outputTokens": 50},
-            },
-            total_cost_usd=None,
-        )
-        handler._record_claude_usage(request, result)
-
-        day_buckets = next(iter(_meter_state(self.root)["days"].values()))
-        self.assertEqual(
-            day_buckets["claude"]["interactive"],
-            {"input_tokens": 300, "output_tokens": 70, "requests": 1},
-        )
-
-
-class ClaudeSdkShapedStepIdentityTests(unittest.IsolatedAsyncioTestCase):
-    def setUp(self) -> None:
-        tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(tmp.cleanup)
-        self.root = Path(tmp.name)
-
-    @staticmethod
-    def _sdk_frame(message_id: str, uuid: str, input_tokens: int, output_tokens: int):
-        # Production claude-agent-sdk AssistantMessage shape: step identity in
-        # message_id (uuid per frame), no bare `id` attribute.
-        return SimpleNamespace(
-            message_id=message_id,
-            uuid=uuid,
-            usage={"input_tokens": input_tokens, "output_tokens": output_tokens},
-            model_usage={},
-            total_cost_usd=None,
-        )
-
-    async def test_sdk_shaped_distinct_steps_accumulate_after_terminal_loss(
-        self,
-    ) -> None:
-        # Reviewer probe: two real-SDK-shaped steps with distinct message_id
-        # values (100/20 then 50/10) and a lost terminal must persist 150/30,
-        # and a redelivered frame for one message_id must not add again.
-        handler = ProjectChatHandler(settings=_settings(self.root))
-        request = SimpleNamespace(user_id=7, chat_id=9)
-        handler.record_claude_attempt(request)
-        handler.record_claude_observed_usage(
-            request, self._sdk_frame("msg-a", "uuid-1", 100, 20)
-        )
-        handler.record_claude_observed_usage(
-            request, self._sdk_frame("msg-b", "uuid-2", 50, 10)
-        )
-        handler.record_claude_observed_usage(
-            request, self._sdk_frame("msg-b", "uuid-3", 50, 10)
-        )
-
-        day_buckets = next(iter(_meter_state(self.root)["days"].values()))
-        self.assertEqual(
-            day_buckets["claude"]["interactive"],
-            {"input_tokens": 150, "output_tokens": 30, "requests": 1},
         )

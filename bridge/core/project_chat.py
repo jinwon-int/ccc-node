@@ -4,35 +4,19 @@ Project Chat Handler - Integrates Telegram with Claude Code SDK.
 
 import json
 import os
-import re
 import time
 import asyncio
 import logging
 from pathlib import Path
-from typing import Any, Callable, Dict, Mapping, Optional, Tuple
+from typing import Any, Dict, Mapping, Optional, Tuple
 
 from claude_agent_sdk import (
-    ClaudeSDKClient,
-    ClaudeAgentOptions,
-    HookMatcher,
-    AssistantMessage,  # noqa: F401
     RateLimitEvent,
     ResultMessage,
-    StreamEvent,  # noqa: F401
-    TextBlock,  # noqa: F401
-    ToolUseBlock,  # noqa: F401
-    PermissionResultAllow,
-    PermissionResultDeny,
 )
 
 from telegram_bot.utils.config import config
-from telegram_bot.utils.chat_logger import log_chat
-from telegram_bot.utils.health import health_reporter
 from telegram_bot.core.task_ledger import (
-    CANCELED as TASK_CANCELED,
-    COMPLETED as TASK_COMPLETED,
-    INPUT_REQUIRED as TASK_INPUT_REQUIRED,
-    WORKING as TASK_WORKING,
     TaskLedger,
     ledger_path_for,
 )
@@ -42,7 +26,6 @@ from telegram_bot.core.heartbeat import (
     should_update_heartbeat,
 )
 from telegram_bot.utils.duration_log import (
-    append_duration_sample,
     default_duration_log_path,
     forecast_samples,
     remaining_ms,
@@ -59,27 +42,20 @@ from telegram_bot.core.usage import (
 )
 from telegram_bot.core.usage_meter import MODE_INTERACTIVE, UsageMeter
 from telegram_bot.memory.distill_worker import CodexDistillExtractionWorker
-from telegram_bot.core.curated_memory import build_curated_memory_settings
 from telegram_bot.core.conversation_paths import claude_project_dir_name
-from telegram_bot.core.memory_audience import resolve_memory_audience
 from telegram_bot.core.session_scope import stream_key
-from telegram_bot.core.web_mcp import build_curated_web_mcp
 
 logger = logging.getLogger(__name__)
 
 
 from telegram_bot.core.tool_policy import (  # noqa: E402
-    BASH_DISABLED,
     EXECUTION_OWNER_OPERATOR,
     EXECUTION_STRICT_PROJECT,
     claude_unrestricted_enabled,
     effective_bash_policy,
-    missing_callback_requires_denial,
     resolve_bash_policy,
     resolve_execution_profile,
     running_as_root,
-    sdk_permission_options,
-    strict_bash_sandbox_settings,
 )
 
 PROCESS_TIMEOUT = int(os.getenv("CLAUDE_PROCESS_TIMEOUT", "21600"))
@@ -116,9 +92,7 @@ from telegram_bot.core.project_chat_types import (  # noqa: E402,F401
     PermissionCallback,
     StatusCallback,
     TypingCallback,
-    UnsolicitedCallback,
     _PendingRequest,
-    _UserStreamState,
 )
 
 
@@ -138,29 +112,26 @@ TYPING_MAX_NO_PROGRESS_SECONDS = _env_int("CCC_TYPING_MAX_NO_PROGRESS_SECONDS", 
 
 from telegram_bot.core.project_chat_history import ProjectChatHistoryMixin  # noqa: E402
 from telegram_bot.core.project_chat_process import ProjectChatProcessMixin  # noqa: E402
-from telegram_bot.core.project_chat_reader import ProjectChatReaderMixin  # noqa: E402
 from telegram_bot.core.project_chat_state import ProjectChatStateMixin  # noqa: E402
 
 
 class ProjectChatHandler(
-    ProjectChatReaderMixin,
     ProjectChatProcessMixin,
     ProjectChatStateMixin,
     ProjectChatHistoryMixin,
 ):
     """
-    Handles Telegram messages using per-conversation long-lived Claude SDK streams.
+    Handles Telegram messages through the provider-neutral AgentRuntime seam.
 
-    Requests for the same Telegram conversation are serialized until the SDK
-    returns a terminal ResultMessage. This preserves the bridge's pending FIFO
-    even when Claude Code internally records queued prompts on a live stream.
+    Requests for the same Telegram conversation are serialized per conversation
+    lock until the runtime turn completes, preserving the bridge's one-turn-at-
+    a-time contract per Telegram conversation.
     """
 
     def __init__(
         self,
         settings: Any = None,
         *,
-        sdk_client_factory: Optional[Callable[..., Any]] = None,
         agent_runtime: Any = None,
         clock: Any = None,
     ):
@@ -219,14 +190,14 @@ class ProjectChatHandler(
                 "privileges. Keeping the guard boundary; run the bridge as a "
                 "non-root user to enable unrestricted execution."
             )
-        self._sdk_client_factory = sdk_client_factory or ClaudeSDKClient
         provider = getattr(self._config, "agent_provider", "claude")
         if provider == "codex" and agent_runtime is None:
             raise ValueError("Codex ProjectChat requires an injected AgentRuntime")
-        # Codex REQUIRES an injected runtime; Claude ACCEPTS one behind the
-        # #346 staged-cutover canary flag (CCC_CLAUDE_RUNTIME_ADAPTER, wired by
-        # the composition root). Runtime presence is the dispatch signal for
-        # the provider-neutral agent path everywhere downstream.
+        # Every provider runs through the provider-neutral AgentRuntime seam
+        # (#584 slice C-2 removed the legacy direct Claude SDK path). The
+        # composition root always injects a runtime; direct construction
+        # without one is a unit-test convenience for pure helpers and fails
+        # fast in process_message via _require_runtime.
         self._agent_runtime = agent_runtime
         self._agent_sessions: Dict[Tuple[int, int], AgentSessionEntry] = {}
         self._agent_active_sessions: Dict[Tuple[int, int], Any] = {}
@@ -238,17 +209,6 @@ class ProjectChatHandler(
         self._clock = clock or time
         self._process_timeout_seconds = PROCESS_TIMEOUT
         self._typing_interval_seconds = TYPING_INTERVAL
-        # Streams are scoped by Telegram conversation, not only user. A single
-        # Telegram user may talk to the bridge in a private DM and a group at the
-        # same time; sharing one Claude stream made pending ResultMessages race
-        # and could swap answers between chats.
-        self._streams: Dict[Tuple[int, int], _UserStreamState] = {}
-        self._stream_init_locks: Dict[Tuple[int, int], asyncio.Lock] = {}
-        # Background stream-teardown tasks spawned from outside the loop task
-        # (e.g. terminal-stall recovery, where the teardown cancels the very
-        # task running the handler). Held here so the GC cannot reap an
-        # in-flight task, and drained/logged via a done-callback.
-        self._teardown_tasks: set["asyncio.Task[Any]"] = set()
         self._conversation_locks: Dict[Tuple[int, int], asyncio.Lock] = {}
         self._claude_usage: Dict[Tuple[int, int, str], UsageSnapshot] = {}
         # Rate-limit windows are a property of the single underlying Claude
@@ -359,51 +319,6 @@ class ProjectChatHandler(
             **worker_kwargs,
         )
 
-    def record_claude_attempt(self, req: Any) -> None:
-        """Meter one Claude request at its spend boundary, exactly once.
-
-        Called by the reader on the first SDK event attributable to a pending
-        request; the per-request flag makes later events no-ops, so a reader
-        crash or cancellation after any output still leaves the attempt
-        counted while normal ResultMessage completion cannot double-charge.
-        """
-
-        if self._usage_meter is None or getattr(req, "usage_attempt_recorded", False):
-            return
-        try:
-            req.usage_attempt_recorded = True
-        except Exception:
-            return
-        try:
-            self._usage_meter.record(
-                "claude",
-                getattr(req, "usage_mode", MODE_INTERACTIVE),
-                requests=1,
-            )
-        except Exception:
-            logger.exception("Claude request metering failed; turn continues")
-
-    @staticmethod
-    def _claude_message_id(message: Any) -> Optional[str]:
-        # claude-agent-sdk AssistantMessage carries step identity in
-        # message_id (with uuid as a per-frame fallback); older/raw shapes
-        # expose id directly or nest it under message.
-        for candidate in (
-            getattr(message, "message_id", None),
-            getattr(message, "id", None),
-            getattr(message, "uuid", None),
-            getattr(getattr(message, "message", None), "id", None),
-        ):
-            if isinstance(candidate, str) and candidate:
-                return candidate
-        inner = getattr(message, "message", None)
-        if isinstance(inner, Mapping):
-            for key in ("message_id", "id", "uuid"):
-                value = inner.get(key)
-                if isinstance(value, str) and value:
-                    return value
-        return None
-
     def _claude_usage_totals(self, message: Any) -> Tuple[int, int]:
         snapshot = parse_claude_result(message, observed_at=self._clock.time())
         input_total = snapshot.context_used
@@ -426,74 +341,6 @@ class ProjectChatHandler(
         except Exception:
             logger.exception("Claude usage metering failed; turn continues")
 
-    def record_claude_observed_usage(
-        self, req: Any, message: Any, *, terminal: bool = False
-    ) -> None:
-        """Idempotently meter validated observed usage for one request.
-
-        AssistantMessage usage is per step: distinct message ids accumulate
-        and repeated frames sharing one id dedupe via a per-id high-water
-        mark, so a reader crash after any step keeps every observed step.
-        The terminal result reconciles against the whole-tree totals — the
-        larger of ResultMessage.usage and the model_usage sums (which include
-        subagent activity) — recording only the positive remainder beyond
-        what the steps already metered, so nothing double charges.
-        """
-
-        if self._usage_meter is None:
-            return
-        recorded = getattr(req, "usage_tokens_recorded", (0, 0))
-        if terminal:
-            observed = self._claude_usage_totals(message)
-            from types import SimpleNamespace as _NS
-
-            tree = self._claude_usage_totals(
-                _NS(
-                    usage={},
-                    model_usage=getattr(message, "model_usage", {}) or {},
-                    total_cost_usd=None,
-                )
-            )
-            observed = (max(observed[0], tree[0]), max(observed[1], tree[1]))
-        else:
-            step = self._claude_usage_totals(message)
-            if not any(step):
-                return
-            steps = getattr(req, "usage_step_totals", None)
-            if steps is None:
-                steps = {}
-                try:
-                    req.usage_step_totals = steps
-                except Exception:
-                    return
-            message_id = self._claude_message_id(message)
-            previous_step = steps.get(message_id, (0, 0))
-            merged = (
-                max(previous_step[0], step[0]),
-                max(previous_step[1], step[1]),
-            )
-            if merged == previous_step:
-                return
-            steps[message_id] = merged
-            observed = (
-                sum(value[0] for value in steps.values()),
-                sum(value[1] for value in steps.values()),
-            )
-        delta = (
-            max(0, observed[0] - recorded[0]),
-            max(0, observed[1] - recorded[1]),
-        )
-        if not any(delta):
-            return
-        try:
-            req.usage_tokens_recorded = (
-                max(recorded[0], observed[0]),
-                max(recorded[1], observed[1]),
-            )
-        except Exception:
-            return
-        self._meter_claude_tokens(delta, mode=getattr(req, "usage_mode", MODE_INTERACTIVE))
-
     def record_agent_turn_request(self) -> None:
         """Count one completed interactive agent-runtime turn, fail-open."""
 
@@ -508,8 +355,7 @@ class ProjectChatHandler(
     def record_claude_adapter_attempt(self, mode: str = MODE_INTERACTIVE) -> None:
         """Meter one Claude adapter-path request at its spend boundary (#388).
 
-        Mirrors ``record_claude_attempt`` for the flagged adapter path
-        (CCC_CLAUDE_RUNTIME_ADAPTER, #584 slice B): the first runtime event of
+        Claude adapter-path spend boundary (#584): the first runtime event of
         a turn proves the provider accepted the request, so cancellation after
         any output still charges exactly one request. Codex meters at its own
         runtime spend boundary via ``set_turn_attempt_recorder``; any runtime
@@ -537,14 +383,13 @@ class ProjectChatHandler(
         """Meter Claude adapter-path tokens from the terminal ResultEvent (#388).
 
         ClaudeRuntime carries the SDK ResultMessage usage block in its
-        ResultEvent payload, so the adapter path meters the same validated
-        input/output totals the direct path derives via ``parse_claude_result``
-        (raw + cache-creation + cache-read input). Codex tokens meter through
-        the runtime's ``set_usage_recorder`` seam and are excluded here by the
-        provider check, so nothing double charges. Known canary gap: a turn
-        that terminates in ErrorEvent emits no ResultEvent, so its tokens are
-        not metered on the adapter path (the direct path meters per assistant
-        step); the request itself is still counted at the spend boundary.
+        ResultEvent payload, so the adapter path meters the validated
+        input/output totals ``parse_claude_result`` derives (raw +
+        cache-creation + cache-read input). Codex tokens meter through the
+        runtime's ``set_usage_recorder`` seam and are excluded here by the
+        provider check, so nothing double charges. Known gap: a turn that
+        terminates in ErrorEvent emits no ResultEvent, so its tokens are not
+        metered; the request itself is still counted at the spend boundary.
         """
 
         if self._usage_meter is None:
@@ -570,44 +415,13 @@ class ProjectChatHandler(
             chat_id,
         )
 
-    def _image_read_fingerprint(self, raw_path: Any) -> Optional[str]:
-        """Identify one unchanged image without reading its payload."""
-
-        if not getattr(self._config, "image_context_guard", False):
-            return None
-        value = str(raw_path or "").strip()
-        if not value:
-            return None
-        path = Path(value).expanduser()
-        if not path.is_absolute():
-            path = self.project_root / path
-        if path.suffix.lower() not in {
-            ".jpg",
-            ".jpeg",
-            ".png",
-            ".gif",
-            ".webp",
-            ".bmp",
-            ".tif",
-            ".tiff",
-        }:
-            return None
-        normalized = str(path.resolve(strict=False))
-        try:
-            metadata = path.stat()
-        except OSError:
-            return normalized
-        return f"{normalized}:{metadata.st_size}:{metadata.st_mtime_ns}"
-
     def record_claude_result_snapshot(
         self, user_id: int, chat_id: int, msg: ResultMessage
     ) -> None:
         """Cache one terminal ResultMessage's usage/cost snapshot for /usage.
 
-        Message-only apart from the conversation ids, so both Claude paths
-        share it: the direct reader loop via ``_record_claude_usage`` and the
-        adapter path via the ``set_sdk_frame_observer`` seam (#584 C-1
-        follow-up). This is what ``get_usage`` reads for the Context /
+        Fed by the adapter path via the ``set_sdk_frame_observer`` seam (#584
+        C-1 follow-up). This is what ``get_usage`` reads for the Context /
         Session tokens / Session cost lines.
         """
 
@@ -618,10 +432,6 @@ class ProjectChatHandler(
         snapshot = parse_claude_result(msg, observed_at=self._clock.time())
         self._claude_usage[key] = snapshot
         self._claude_usage = dict(tuple(self._claude_usage.items())[-128:])
-
-    def _record_claude_usage(self, req: _PendingRequest, msg: ResultMessage) -> None:
-        self.record_claude_result_snapshot(req.user_id, req.chat_id, msg)
-        self.record_claude_observed_usage(req, msg, terminal=True)
 
     def _record_claude_rate_limit(self, msg: RateLimitEvent) -> None:
         parsed = parse_claude_rate_limit_event(msg, observed_at=self._clock.time())
@@ -647,8 +457,8 @@ class ProjectChatHandler(
                 return await asyncio.wait_for(get_usage(session_id), timeout=7.0)
             if getattr(self._config, "agent_provider", "claude") != "claude":
                 return UsageSnapshot(provider="codex")
-            # Claude adapter path (#584 slice B): ClaudeRuntime exposes no
-            # usage endpoint, so fall through to the direct-path aggregation
+            # Claude adapter path (#584): ClaudeRuntime exposes no usage
+            # endpoint, so fall through to the local aggregation below
             # (status-file snapshots and observed rate-limit windows).
 
         # Base carries non-secret local provider environment (service label,
@@ -710,14 +520,6 @@ class ProjectChatHandler(
                     )
         return result
 
-    def _get_stream_init_lock(self, user_id: int, chat_id: int) -> asyncio.Lock:
-        key = self._stream_key(user_id, chat_id)
-        lock = self._stream_init_locks.get(key)
-        if lock is None:
-            lock = asyncio.Lock()
-            self._stream_init_locks[key] = lock
-        return lock
-
     def _get_conversation_lock(self, user_id: int, chat_id: int) -> asyncio.Lock:
         key = self._stream_key(user_id, chat_id)
         lock = self._conversation_locks.get(key)
@@ -726,422 +528,20 @@ class ProjectChatHandler(
             self._conversation_locks[key] = lock
         return lock
 
-    async def _create_user_stream(  # noqa: C901 -- #348 baseline hotspot
-        self,
-        user_id: int,
-        model: Optional[str],
-        unsolicited_callback: Optional[UnsolicitedCallback] = None,
-        chat_id: Optional[int] = None,
-    ) -> _UserStreamState:
-        state_holder: Dict[str, _UserStreamState] = {}
-        bash_policy = self._bash_policy
-        memory_audience = resolve_memory_audience(
-            self._config, user_id=user_id, chat_id=chat_id
-        )
-
-        async def can_use_tool(tool_name, tool_input, _context=None):
-            logger.debug(
-                f"can_use_tool called: tool_name={tool_name}, tool_input type={type(tool_input)}"
-            )
-            # AskUserQuestion: degrade to plain text instead of interactive dialog
-            if tool_name == "AskUserQuestion" and isinstance(tool_input, dict):
-                formatted, _ = _format_ask_user_question(tool_input)
-                logger.debug(f"AskUserQuestion intercepted, formatted: {formatted[:200]}...")
-                s = state_holder.get("state")
-                if s and s.pending:
-                    s.pending[0].synthetic_response = formatted
-                    logger.debug(f"Set synthetic_response for user {user_id}")
-                return PermissionResultDeny(
-                    message=(
-                        "AskUserQuestion tool is not available. "
-                        "CRITICAL: You MUST output the question and numbered options to the user, then STOP and WAIT. "
-                        "Do NOT continue execution. Do NOT make assumptions about the user's choice. "
-                        "Output format:\n\n"
-                        "[Question and context]\n\n"
-                        "1. [First option]\n"
-                        "2. [Second option]\n"
-                        "3. [Third option]\n\n"
-                        "After outputting the options, you MUST stop and wait for the user to respond with their choice."
-                    )
-                )
-            state = state_holder.get("state")
-            if not state or not state.pending:
-                if missing_callback_requires_denial(tool_name, bash_policy):
-                    logger.warning("bash_callback_state_missing user_id=%s", user_id)
-                    return PermissionResultDeny(
-                        message="Bash requires an active per-call permission callback."
-                    )
-                return PermissionResultAllow()
-            req = state.pending[0]
-            callback = req.permission_callback
-            if not callback:
-                if missing_callback_requires_denial(tool_name, bash_policy):
-                    logger.warning("bash_permission_callback_missing user_id=%s", user_id)
-                    return PermissionResultDeny(
-                        message="Bash requires an active per-call permission callback."
-                    )
-                return PermissionResultAllow()
-
-            req.awaiting_permission = True
-            led = self._task_ledger
-            if led and req.task_id:
-                led.set_state(req.task_id, TASK_INPUT_REQUIRED)
-            try:
-                result = await callback(req.chat_id, req.user_id, tool_name, tool_input)
-            finally:
-                req.awaiting_permission = False
-                if led and req.task_id:
-                    led.set_state(req.task_id, TASK_WORKING)
-            if isinstance(result, (PermissionResultAllow, PermissionResultDeny)):
-                return result
-            return PermissionResultAllow() if result else PermissionResultDeny()
-
-        async def dedupe_image_read(input_data, _tool_use_id, _context):
-            tool_input = input_data.get("tool_input", {})
-            fingerprint = self._image_read_fingerprint(
-                tool_input.get("file_path") if isinstance(tool_input, dict) else None
-            )
-            if fingerprint is None:
-                return {}
-            state = state_holder.get("state")
-            if state is None or not state.pending:
-                return {}
-            request = state.pending[0]
-            if fingerprint in request.image_read_fingerprints:
-                logger.info(
-                    "image_context_duplicate_read_denied user_id=%s chat_id=%s",
-                    request.user_id,
-                    request.chat_id,
-                )
-                return {
-                    "hookSpecificOutput": {
-                        "hookEventName": "PreToolUse",
-                        "permissionDecision": "deny",
-                        "permissionDecisionReason": (
-                            "This unchanged image was already read in the current request. "
-                            "Reuse the prior image result instead of embedding it again."
-                        ),
-                    }
-                }
-            request.image_read_fingerprints.add(fingerprint)
-            return {}
-
-        permission_options = sdk_permission_options(bash_policy)
-        sdk_hooks = {
-            event: list(matchers)
-            for event, matchers in permission_options["hooks"].items()
-        }
-        if getattr(self._config, "image_context_guard", False):
-            sdk_hooks.setdefault("PreToolUse", []).append(
-                HookMatcher(matcher="Read", hooks=[dedupe_image_read])
-            )
-        opts: Dict[str, Any] = {
-            "cwd": str(self.project_root),
-            "allowed_tools": permission_options["allowed_tools"],
-            "disallowed_tools": permission_options["disallowed_tools"],
-            "hooks": sdk_hooks,
-            "system_prompt": (
-                "\n\n## Important: User Questions and Choices\n\n"
-                "The AskUserQuestion tool is NOT available in this environment. "
-                "When you need to ask the user a question with multiple choice options:\n\n"
-                "1. Output the question and context clearly\n"
-                "2. List options with numbers (1., 2., 3., etc.)\n"
-                "3. STOP and WAIT for the user's response\n"
-                "4. Do NOT continue execution or make assumptions\n"
-                "5. Do NOT try to use AskUserQuestion tool\n\n"
-                "Example format:\n"
-                "Question: Which option do you prefer?\n\n"
-                "1. Option A - Description\n"
-                "2. Option B - Description\n"
-                "3. Option C - Description\n\n"
-                "After outputting options, you MUST stop and wait for user input.\n\n"
-                "## Important: Sending Images and Files\n\n"
-                "When the user asks you to send/show/deliver an image or file:\n\n"
-                "1. Do NOT use the Read tool to read or analyze the image/file content\n"
-                "2. Simply output the file path in your response (absolute path preferred)\n"
-                "3. The system will automatically detect file paths and send them as messages\n"
-                "4. Supported image formats: .png, .jpg, .jpeg, .gif, .webp\n"
-                "5. Other files will be sent as documents\n\n"
-                "Example: When user says 'send me the generated image', just respond with:\n"
-                "'Here is the image: /path/to/image.png' - the system will send it automatically.\n\n"
-                "After generating an image (e.g., via a skill), ALWAYS include the output file path "
-                "in your response so the system can send it to the user."
-            ),
-            "can_use_tool": can_use_tool,
-            "permission_mode": "default",
-            # Raise stream-json decode buffer from default 1MB to 10MB.
-            # A single CLI->SDK JSON message (usually a large tool_result)
-            # exceeding 1MB was raising:
-            #   "Failed to decode JSON: JSON message exceeded maximum
-            #    buffer size of 1048576 bytes"
-            "max_buffer_size": 10 * 1024 * 1024,
-            # Real token-level streaming: ask the SDK for partial message events
-            # so the reader loop can update the Telegram draft from incremental
-            # text deltas (true typewriter effect). The draft edit cadence stays
-            # throttled by draft_update_min_chars / draft_update_interval.
-            "include_partial_messages": bool(
-                self._config.enable_streaming and self._config.enable_partial_streaming
-            ),
-        }
-        web_mcp = build_curated_web_mcp(self._config)
-        if web_mcp is not None:
-            opts["allowed_tools"] = [
-                tool
-                for tool in opts["allowed_tools"]
-                if tool not in web_mcp["disallowed_tools"]
-            ] + web_mcp["allowed_tools"]
-            opts["disallowed_tools"] = list(
-                dict.fromkeys(opts["disallowed_tools"] + web_mcp["disallowed_tools"])
-            )
-            opts["mcp_servers"] = web_mcp["mcp_servers"]
-            opts["env"] = {**opts.get("env", {}), **web_mcp["process_env"]}
-            opts["system_prompt"] += web_mcp["system_prompt"]
-        if self._execution_profile == EXECUTION_OWNER_OPERATOR:
-            if self._claude_unrestricted:
-                # Opt-in Codex parity (owner-operator only): drop the host
-                # settings chain so the node's host hooks/settings are not
-                # loaded, bypass permission checks, and run without the OS
-                # sandbox — matching Codex's never + dangerFullAccess. Memory
-                # context is preserved through the curated settings block so the
-                # model keeps its MEMORY/USER context.
-                opts["permission_mode"] = "bypassPermissions"
-                opts["setting_sources"] = []
-                curated_settings = build_curated_memory_settings(
-                    self._config, audience=memory_audience
-                )
-                if curated_settings is not None:
-                    opts["settings"] = curated_settings
-            else:
-                # Owner-operated bridges intentionally retain host utility and
-                # the normal Claude Code settings/context chain. Access control
-                # plus the host audit trail, not a project-root sandbox, is the
-                # boundary for this explicit profile.
-                opts["setting_sources"] = ["user", "project", "local"]
-        else:
-            # Every non-owner profile suppresses filesystem settings. Even when
-            # Bash is disallowed, user/project/local settings can register host
-            # shell hooks independently of the model-facing Bash tool.
-            opts["setting_sources"] = []
-            curated_settings = build_curated_memory_settings(
-                self._config, audience=memory_audience
-            )
-            if curated_settings is not None:
-                opts["settings"] = curated_settings
-            if self._execution_profile == EXECUTION_STRICT_PROJECT and bash_policy != BASH_DISABLED:
-                # Strict-project uses the SDK OS sandbox as the Bash boundary.
-                opts["sandbox"] = strict_bash_sandbox_settings(
-                    self.project_root,
-                    str(self._config.claude_cli_path) if self._config.claude_cli_path else None,
-                )
-        if self._config.claude_cli_path:
-            opts["cli_path"] = str(self._config.claude_cli_path)
-        if model:
-            # Normalize model name: ensure at most one [1M] suffix
-            # e.g., "claude-opus-4-7[1M][1m]" -> "claude-opus-4-7[1M]"
-            # e.g., "opus" -> "opus" (alias, unchanged)
-            normalized = re.sub(r"\[(?:1[mM])\]+", "", model)  # Remove all [1M]/[1m] suffixes
-            if normalized != model:
-                # Had suffix, add back single [1M]
-                normalized = f"{normalized}[1m]"
-                logger.info(f"Model normalized: {model!r} -> {normalized!r}")
-            opts["model"] = normalized
-
-        client = self._sdk_client_factory(options=ClaudeAgentOptions(**opts))
-        await client.connect()
-        state = _UserStreamState(
-            client=client,
-            model=model,
-            unsolicited_callback=unsolicited_callback,
-        )
-        state_holder["state"] = state
-        state.reader_task = asyncio.create_task(self._reader_loop(user_id, state))
-        state.typing_task = asyncio.create_task(self._typing_keepalive_loop(user_id, state))
-        return state
-
-    async def _disconnect_stream_state(  # noqa: C901 -- #348 baseline hotspot
-        self, key: Any, state: _UserStreamState, cancel_message: Optional[str] = None
-    ) -> bool:
-        if isinstance(key, tuple):
-            user_id, chat_id = key
-        else:
-            user_id, chat_id = key, "*"
-
-        # Cancel typing keepalive task
-        if state.typing_task and not state.typing_task.done():
-            state.typing_task.cancel()
-            try:
-                await asyncio.wait_for(state.typing_task, timeout=1.0)
-            except (asyncio.TimeoutError, asyncio.CancelledError):
-                pass
-            except Exception as e:
-                logger.error(f"Error cancelling typing task for user {user_id} chat {chat_id}: {e}")
-
-        # Cancel reader task first
-        if state.reader_task and not state.reader_task.done():
-            state.reader_task.cancel()
-            try:
-                await asyncio.wait_for(state.reader_task, timeout=2.0)
-            except asyncio.TimeoutError:
-                logger.warning(
-                    f"Reader task for user {user_id} chat {chat_id} did not complete within timeout"
-                )
-            except asyncio.CancelledError:
-                pass
-            except Exception as e:
-                logger.error(f"Error cancelling reader task for user {user_id} chat {chat_id}: {e}")
-
-        # Fail all pending requests.
-        msg = cancel_message or TASK_TERMINATED_NOTICE
-        # If this disconnect was triggered by a recent stream error (usage limit,
-        # auth, network drop) rather than an explicit user /stop, surface the real
-        # reason instead of the opaque "Task has been terminated." notice.
-        if msg == TASK_TERMINATED_NOTICE and state.last_error:
-            if (self._clock.monotonic() - state.last_error_ts) < CANCEL_REASON_WINDOW_S:
-                reason = describe_cancel_reason(state.last_error)
-                if reason:
-                    msg = reason
-            state.last_error = None
-        while state.pending:
-            req = state.pending.popleft()
-            cleaned = await self._cleanup_heartbeat(req)
-            self._ledger_finish(req, TASK_CANCELED, cleanup_done=cleaned)
-            if not req.future.done():
-                try:
-                    req.future.set_result(
-                        ChatResponse(
-                            content=msg,
-                            success=False,
-                            error=msg,
-                            session_id=state.last_session_id,
-                        )
-                    )
-                except Exception as e:
-                    logger.error(f"Error setting future result: {e}")
-
-        # Disconnect client.  The SDK transport's close() waits up to 5s for a
-        # graceful stdin-EOF shutdown then sends SIGTERM (another 5s) before
-        # SIGKILL — 10s total.  Allow 15s so the subprocess is actually killed
-        # rather than abandoned as an orphan when the outer timeout fires.
-        try:
-            await asyncio.wait_for(state.client.disconnect(), timeout=15.0)
-        except asyncio.TimeoutError:
-            logger.warning(
-                f"Client disconnect for user {user_id} chat {chat_id} timed out after 15s"
-            )
-        except Exception as e:
-            logger.error(f"Error disconnecting client for user {user_id} chat {chat_id}: {e}")
-
-        return True
-
-    def _spawn_teardown_task(self, coro: Any, *, label: str) -> "asyncio.Task[Any]":
-        """Spawn a stream-teardown coroutine from outside the loop task.
-
-        Retains a strong reference in ``self._teardown_tasks`` so the GC cannot
-        reap the task mid-flight, and surfaces exceptions via a done-callback
-        (a raw ``create_task`` would drop them silently). Mirrors the tracking
-        pattern used in ``core/codex_app_server.py`` and ``core/bot_voice.py``.
-        """
-        task = asyncio.create_task(coro)
-        self._teardown_tasks.add(task)
-
-        def _on_done(t: "asyncio.Task[Any]") -> None:
-            self._teardown_tasks.discard(t)
-            try:
-                t.result()
-            except asyncio.CancelledError:
-                logger.debug("Teardown task cancelled (%s)", label)
-            except Exception as exc:  # noqa: BLE001 — surface, do not swallow
-                logger.error(
-                    "Teardown task failed (%s): %s", label, exc, exc_info=True
-                )
-
-        task.add_done_callback(_on_done)
-        return task
-
-    async def _disconnect_user_stream(
-        self, user_id: int, chat_id: Optional[int] = None, cancel_message: Optional[str] = None
-    ) -> bool:
-        if chat_id is not None:
-            key = self._stream_key(user_id, chat_id)
-            state = self._streams.pop(key, None)
-            if not state:
-                return False
-            return await self._disconnect_stream_state(key, state, cancel_message)
-
-        matched = [
-            (key, state)
-            for key, state in list(self._streams.items())
-            if (key[0] if isinstance(key, tuple) else key) == user_id
-        ]
-        if not matched:
-            return False
-        for key, state in matched:
-            self._streams.pop(key, None)
-            await self._disconnect_stream_state(key, state, cancel_message)
-        return True
-
-    async def _get_or_create_stream(
-        self,
-        user_id: int,
-        chat_id: int,
-        model: Optional[str],
-        new_session: bool,
-        unsolicited_callback: Optional[UnsolicitedCallback] = None,
-    ) -> _UserStreamState:
-        key = self._stream_key(user_id, chat_id)
-        lock = self._get_stream_init_lock(user_id, chat_id)
-        async with lock:
-            state = self._streams.get(key)
-
-            # Detect stale stream: reader task ended (e.g. after system sleep/wake)
-            if state and state.reader_task is not None and state.reader_task.done():
-                logger.warning(
-                    f"Stale stream detected for user {user_id} chat {chat_id} (reader task exited), recreating"
-                )
-                await self._disconnect_user_stream(user_id, chat_id)
-                state = None
-
-            if state and (new_session or state.model != model):
-                await self._disconnect_user_stream(user_id, chat_id)
-                state = None
-
-            if not state:
-                state = await self._create_user_stream(
-                    user_id,
-                    model,
-                    unsolicited_callback,
-                    chat_id=chat_id,
-                )
-                self._streams[key] = state
-            elif unsolicited_callback is not None:
-                # Refresh the route when Telegram supplies a new Bot instance,
-                # while preserving the same long-lived SDK stream.
-                state.unsolicited_callback = unsolicited_callback
-            return state
-
     def workload_snapshot(self, now: float) -> tuple[int, float]:
         """Return ``(in_flight_count, oldest_request_age_seconds)``.
 
         Exposes bridge busyness so an external supervisor (the self-update
         procedure) can avoid restarting the bridge mid-request — a restart
-        SIGTERM-kills the in-flight ``claude`` child (exit 143) and destroys
-        the user's work. ``now`` must come from the event loop clock so it is
-        comparable to ``_PendingRequest.started_at``.
+        SIGTERM-kills the in-flight agent child process and destroys the
+        user's work. ``now`` must come from the event loop clock so it is
+        comparable to the recorded turn start times.
         """
         count = len(self._agent_active_sessions)
         oldest_started: Optional[float] = None
         for started_at in self._agent_started_at.values():
             if oldest_started is None or started_at < oldest_started:
                 oldest_started = started_at
-        for state in list(self._streams.values()):
-            for req in list(state.pending):
-                if req.future.done():
-                    continue
-                count += 1
-                if req.started_at > 0 and (
-                    oldest_started is None or req.started_at < oldest_started
-                ):
-                    oldest_started = req.started_at
         oldest_age = (now - oldest_started) if oldest_started is not None else 0.0
         return count, max(0.0, oldest_age)
 
@@ -1313,21 +713,6 @@ class ProjectChatHandler(
             min_samples=int(getattr(config, "heartbeat_forecast_min_samples", 10)),
         )
 
-    def _append_duration_log(self, req: _PendingRequest, msg: ResultMessage) -> None:
-        """Record request duration metadata without prompt/response text."""
-        if not getattr(config, "heartbeat_duration_log_enabled", False):
-            return
-        append_duration_sample(
-            path=self._duration_log_path(),
-            user_id=req.user_id,
-            chat_id=req.chat_id,
-            session_id=msg.session_id or req.requested_session_id,
-            model=req.model,
-            duration_ms=msg.duration_ms,
-            success=not msg.is_error,
-            max_lines=int(getattr(config, "heartbeat_duration_log_max_lines", 10000)),
-        )
-
     def _should_refresh_typing(self, req: _PendingRequest, now: float) -> bool:
         """Return whether Telegram typing should still be asserted for a request."""
         if req.future.done() or req.awaiting_permission:
@@ -1345,130 +730,3 @@ class ProjectChatHandler(
             return False
         return True
 
-    def _terminal_stall_eligible(self, req: _PendingRequest, now: float) -> bool:
-        """True when answer text is the latest activity and the stream went silent.
-
-        Text after every tool start means the turn most likely finished and only
-        its terminal event vanished (#411 C). A running tool or a pending
-        permission keeps the request out of scope — long tool silences are
-        normal and input-required states belong to the user.
-        """
-        grace = float(getattr(config, "terminal_stall_seconds", 0.0) or 0.0)
-        if grace <= 0 or req.future.done():
-            return False
-        if not req.last_assistant_texts or req.last_text_at <= 0:
-            return False
-        if req.last_tool_at >= req.last_text_at or req.awaiting_permission:
-            return False
-        last_event = req.last_event_at or req.started_at
-        return last_event > 0 and now - last_event >= grace
-
-    async def _release_stalled_request(
-        self, user_id: int, state: _UserStreamState, req: _PendingRequest
-    ) -> None:
-        """Terminalize a request whose terminal event never arrived (#411 C).
-
-        Delivers the buffered assistant text exactly once with an explicit
-        stall notice, finishes the ledger record, resolves the future (which
-        releases the conversation FIFO for queued messages), and tears down the
-        silent stream. ``stall_swallow_result`` makes the reader swallow a late
-        ResultMessage that races the teardown, so the answer cannot be
-        delivered twice through the unsolicited route.
-        """
-        if state.pending and state.pending[0] is req:
-            state.pending.popleft()
-        else:
-            return
-        state.stall_swallow_result = True
-        final_streamed = False
-        if req.streaming_handler:
-            try:
-                final_streamed = bool(await req.streaming_handler.finalize_all())
-            except Exception as exc:
-                logger.error(f"Streaming finalization on stall release failed: {exc}")
-        cleaned = await self._cleanup_heartbeat(req)
-        self._ledger_finish(req, TASK_COMPLETED, cleanup_done=cleaned)
-        content = (
-            self._claude_response_content(
-                req, "\n".join(req.last_assistant_texts)
-            )
-            or "(No response)"
-        )
-        logger.warning(
-            "Terminal-event stall released request for user %s chat %s after "
-            "silence following final text — delivering buffered answer",
-            req.user_id,
-            req.chat_id,
-        )
-        try:
-            health_reporter.record_stalled_request()
-        except Exception:
-            pass
-        log_chat(
-            req.user_id,
-            state.last_session_id or req.requested_session_id,
-            "assistant",
-            content,
-            model=req.model,
-        )
-        if not req.future.done():
-            req.future.set_result(
-                ChatResponse(
-                    content=f"{content}\n\n{TERMINAL_STALL_NOTICE}",
-                    success=True,
-                    session_id=state.last_session_id,
-                    streamed=final_streamed,
-                )
-            )
-        # Tear down the dead stream from outside this loop task: the disconnect
-        # cancels state.typing_task, which is the very task running this code.
-        # Tracked + exception-logged so a teardown failure cannot leak the dead
-        # SDK stream silently (see _spawn_teardown_task).
-        self._spawn_teardown_task(
-            self._disconnect_user_stream(user_id, req.chat_id),
-            label=f"stall-teardown user={user_id} chat={req.chat_id}",
-        )
-
-    async def _typing_keepalive_loop(self, user_id: int, state: _UserStreamState) -> None:
-        """Background task that sends typing actions at regular intervals.
-
-        Keeps Telegram typing indicator alive during long tool calls when
-        the SDK stream emits no messages.
-        """
-        try:
-            while True:
-                await asyncio.sleep(TYPING_INTERVAL)
-                if not state.pending:
-                    continue
-                req = state.pending[0]
-                # Once a request's response is finalized (future resolved) it is
-                # about to be popped and delivered — stop refreshing the typing
-                # indicator so it doesn't reassert "typing…" after the agent's
-                # final message. Streamed replies edit drafts rather than sending
-                # a new message, so they never clear typing on their own; a stray
-                # keepalive here is exactly what leaves it stuck.
-                if req.future.done():
-                    continue
-                now = asyncio.get_event_loop().time()
-                if self._terminal_stall_eligible(req, now):
-                    await self._release_stalled_request(user_id, state, req)
-                    continue
-                if not self._should_refresh_typing(req, now):
-                    await self._maybe_update_heartbeat(req, now)
-                    continue
-                if req.typing_callback and now - req.last_typing_at >= TYPING_INTERVAL:
-                    # Re-check immediately before the network call to avoid a
-                    # finalize/permission race reasserting typing after completion.
-                    if not self._should_refresh_typing(req, now):
-                        await self._maybe_update_heartbeat(req, now)
-                        continue
-                    req.last_typing_at = now
-                    try:
-                        await req.typing_callback()
-                    except Exception:
-                        pass
-                await self._maybe_update_heartbeat(req, now)
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            logger.error(f"Typing keepalive loop crashed for user {user_id}: {e}", exc_info=True)

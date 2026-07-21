@@ -132,11 +132,6 @@ class HeartbeatSettingsMixin:
             "lifetime (#307 regression guard). 0 disables this check."
         ),
     )
-    alert_max_dead_streams: int = Field(
-        default=1,
-        alias="CCC_ALERT_MAX_DEAD_STREAMS",
-        description="Alert when at least this many registered streams have a dead reader.",
-    )
     alert_max_pending_notifications: int = Field(
         default=10,
         alias="CCC_ALERT_MAX_PENDING_NOTIFICATIONS",

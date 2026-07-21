@@ -33,9 +33,7 @@ from telegram_bot.core.project_chat_types import (
     PermissionCallback,
     StatusCallback,
     TypingCallback,
-    UnsolicitedCallback,
     _PendingRequest,
-    _UserStreamState,
 )
 from telegram_bot.core.usage_meter import MODE_INTERACTIVE
 from telegram_bot.core.task_ledger import (
@@ -46,12 +44,7 @@ from telegram_bot.core.task_ledger import (
     TIMEOUT as TASK_TIMEOUT,
     WORKING as TASK_WORKING,
 )
-from telegram_bot.core.sdk_text import (
-    RESTART_INTERRUPT_NOTICE,
-    TERMINAL_STALL_NOTICE,
-    _is_retryable_sdk_error,
-    _is_shutdown_signal_error,
-)
+from telegram_bot.core.sdk_text import TERMINAL_STALL_NOTICE
 from telegram_bot.utils.chat_logger import log_chat
 from telegram_bot.utils.health import health_reporter
 
@@ -74,16 +67,8 @@ def _log_user_input(
     log_chat(user_id, session_id, "user", user_message, model=model)
 
 
-def _process_timeout() -> int:
-    """Read the active project_chat module compatibility constant at call time."""
-    import sys
-
-    project_chat = sys.modules["telegram_bot.core.project_chat"]
-    return getattr(project_chat, "PROCESS_TIMEOUT", 21600)
-
-
 class ProjectChatProcessMixin:
-    async def process_message(  # noqa: C901 -- #348 baseline hotspot
+    async def process_message(
         self,
         user_message: str,
         user_id: int,
@@ -107,266 +92,48 @@ class ProjectChatProcessMixin:
         usage_mode: str = MODE_INTERACTIVE,
     ) -> ChatResponse:
         del message_id
-        if self._agent_runtime is not None:
-            if getattr(self._config, "agent_provider", "claude") == "claude":
-                # Claude adapter path (#584 slice B, CCC_CLAUDE_RUNTIME_ADAPTER):
-                # the bot layer's approval/sandbox knobs are Codex app-server
-                # policies (bot_access._codex_*) that ClaudeRuntime rejects
-                # fail-closed. On this path the approval boundary is the SDK
-                # can_use_tool -> approval_callback seam, so drop the
-                # untranslatable Codex-only knobs instead of forwarding them.
-                approval_policy = None
-                approvals_reviewer = None
-                sandbox_policy = None
-            if sensitive_log_event is not None:
-                _log_user_input(
-                    user_message=user_message,
-                    user_id=user_id,
-                    session_id=session_id,
-                    model=model,
-                    sensitive_log_event=sensitive_log_event,
-                )
-            return await self._process_agent_message(
+        # The legacy permission seam (perm: buttons) belonged to the removed
+        # direct SDK path; the runtime path's approval boundary is
+        # approval_callback. Accepted and ignored for caller compatibility.
+        del permission_callback
+        self._require_runtime()
+        if getattr(self._config, "agent_provider", "claude") == "claude":
+            # Claude adapter path (#584): the bot layer's approval/sandbox
+            # knobs are Codex app-server policies (bot_access._codex_*) that
+            # ClaudeRuntime rejects fail-closed. On this path the approval
+            # boundary is the SDK can_use_tool -> approval_callback seam, so
+            # drop the untranslatable Codex-only knobs instead of forwarding
+            # them.
+            approval_policy = None
+            approvals_reviewer = None
+            sandbox_policy = None
+        if sensitive_log_event is not None:
+            _log_user_input(
                 user_message=user_message,
                 user_id=user_id,
-                chat_id=chat_id,
                 session_id=session_id,
                 model=model,
-                effort=effort,
-                approval_policy=approval_policy,
-                approvals_reviewer=approvals_reviewer,
-                sandbox_policy=sandbox_policy,
-                new_session=new_session,
-                approval_callback=approval_callback,
-                typing_callback=typing_callback,
-                status_callback=status_callback,
-                bot=bot,
-                notification_bot=notification_bot,
-                interim_message_callback=interim_message_callback,
-                usage_mode=usage_mode,
+                sensitive_log_event=sensitive_log_event,
             )
-        _log_user_input(
+        return await self._process_agent_message(
             user_message=user_message,
             user_id=user_id,
+            chat_id=chat_id,
             session_id=session_id,
             model=model,
-            sensitive_log_event=sensitive_log_event,
-        )
-
-        loop = asyncio.get_running_loop()
-        future: asyncio.Future = loop.create_future()
-
-        # Create streaming handler only when live streaming is enabled. With it
-        # off (default), the reply is delivered as complete message(s) by the
-        # caller when generation finishes — no live draft.
-        streaming_handler = None
-        if bot and getattr(self._config, "enable_streaming", False):
-            from telegram_bot.core.streaming import StreamingMessageHandler
-
-            streaming_handler = StreamingMessageHandler(
-                bot, chat_id, user_id, settings=self._config
-            )
-
-        request = _PendingRequest(
-            user_id=user_id,
-            chat_id=chat_id,
-            model=model,
-            requested_session_id=session_id,
-            permission_callback=permission_callback,
+            effort=effort,
+            approval_policy=approval_policy,
+            approvals_reviewer=approvals_reviewer,
+            sandbox_policy=sandbox_policy,
+            new_session=new_session,
+            approval_callback=approval_callback,
             typing_callback=typing_callback,
-            future=future,
             status_callback=status_callback,
-            streaming_handler=streaming_handler,
+            bot=bot,
+            notification_bot=notification_bot,
             interim_message_callback=interim_message_callback,
+            usage_mode=usage_mode,
         )
-        request.usage_mode = usage_mode
-        request.started_at = loop.time()
-        request.task_id = self._ledger_create(user_id, chat_id)
-        state: Optional[_UserStreamState] = None
-
-        unsolicited_callback: Optional[UnsolicitedCallback] = None
-        route_bot = notification_bot or bot
-        if route_bot:
-
-            async def deliver_unsolicited(
-                content: str, _session_id: Optional[str]
-            ) -> None:
-                # Background task notifications have no caller waiting to send
-                # the ChatResponse. Keep one SDK result to one Telegram message.
-                text = content
-                if len(text) > 4000:
-                    text = f"{text[:3960]}\n\n… (background result truncated)"
-                await route_bot.send_message(chat_id=chat_id, text=text)
-
-            unsolicited_callback = deliver_unsolicited
-
-        # The Claude Code SDK can internally queue follow-up prompts on a
-        # live stream, so submitting a second query before the first
-        # ResultMessage arrives breaks the bridge's pending FIFO. Serialize
-        # the full send→result window per Telegram conversation.
-        conversation_lock = self._get_conversation_lock(user_id, chat_id)
-        async with conversation_lock:
-            try:
-                state = await getattr(self, "_get_or_create_stream")(
-                    user_id, chat_id, model, new_session, unsolicited_callback
-                )
-                async with state.send_lock:
-                    request.sent_session_id = session_id or state.last_session_id or "default"
-                    state.pending.append(request)
-                    await state.client.query(user_message, session_id=request.sent_session_id)
-                    logger.info(
-                        f"Submitted message to live stream: user={user_id}, pending={len(state.pending)}, "
-                        f"session_key={request.sent_session_id}"
-                    )
-                    if self._config.claude_cli_path:
-                        logger.info(
-                            "Using configured Claude CLI path: %s",
-                            self._config.claude_cli_path,
-                        )
-
-                return await asyncio.wait_for(future, timeout=self._process_timeout_seconds)
-
-            except asyncio.CancelledError:
-                logger.info(f"Task cancelled for user {user_id} - cleaning up")
-                # Clean up streaming drafts if active
-                if streaming_handler:
-                    try:
-                        await streaming_handler.cancel()
-                    except Exception as e:
-                        logger.error(f"Failed to cancel streaming handler: {e}")
-                cleaned = await self._cleanup_heartbeat(request)
-                self._ledger_finish(request, TASK_CANCELED, cleanup_done=cleaned)
-                await self.stop(user_id)
-                # Don't return a message - bot.py will handle the user response
-                raise
-
-            except asyncio.TimeoutError:
-                logger.warning(f"Query timed out for user {user_id} after {self._process_timeout_seconds}s")
-                cleaned = await self._cleanup_heartbeat(request)
-                self._ledger_finish(request, TASK_TIMEOUT, cleanup_done=cleaned)
-                await self.stop(user_id)
-                msg = f"⏰ Timed out after {self._process_timeout_seconds}s. Please retry or simplify your request."
-                health_reporter.record_claude_error(msg)
-                return ChatResponse(content=msg, success=False, error=msg)
-
-            except Exception as e:
-                if state and request in state.pending:
-                    try:
-                        state.pending.remove(request)
-                    except ValueError:
-                        pass
-                cleaned = await self._cleanup_heartbeat(request)
-                self._ledger_finish(request, TASK_FAILED, cleanup_done=cleaned)
-
-                err = str(e)
-                logger.error(
-                    f"SDK error for user {user_id}: {err} (type: {type(e).__name__})",
-                    exc_info=True,
-                )
-
-                # Retry once for transient SDK errors (network/timeout errors)
-                is_retryable = _is_retryable_sdk_error(e)
-                logger.info(
-                    f"Error retryability check for user {user_id}: "
-                    f"is_retryable={is_retryable}, error='{err[:100]}...'"
-                )
-
-                if is_retryable:
-                    logger.warning(
-                        "Retryable SDK error for user %s: %s — reconnecting and retrying",
-                        user_id,
-                        err,
-                    )
-                    logger.info(f"Disconnecting stream for user {user_id} before retry...")
-                    await self._disconnect_user_stream(user_id, chat_id)
-                    logger.info(
-                        f"Stream disconnected for user {user_id}, creating retry request..."
-                    )
-
-                    retry_future: asyncio.Future = loop.create_future()
-                    retry_handler = None
-                    if bot and getattr(self._config, "enable_streaming", False):
-                        from telegram_bot.core.streaming import StreamingMessageHandler
-
-                        retry_handler = StreamingMessageHandler(
-                bot, chat_id, user_id, settings=self._config
-            )
-                    retry_request = _PendingRequest(
-                        user_id=user_id,
-                        chat_id=chat_id,
-                        model=model,
-                        requested_session_id=session_id,
-                        permission_callback=permission_callback,
-                        typing_callback=typing_callback,
-                        future=retry_future,
-                        status_callback=status_callback,
-                        streaming_handler=retry_handler,
-                        interim_message_callback=interim_message_callback,
-                    )
-                    retry_request.usage_mode = usage_mode
-                    retry_request.started_at = loop.time()
-                    retry_request.task_id = self._ledger_create(user_id, chat_id)
-                    retry_state: Optional[_UserStreamState] = None
-                    try:
-                        retry_state = await getattr(self, "_get_or_create_stream")(
-                            user_id,
-                            chat_id,
-                            model,
-                            False,
-                            unsolicited_callback,
-                        )
-                        async with retry_state.send_lock:
-                            retry_request.sent_session_id = (
-                                session_id or retry_state.last_session_id or "default"
-                            )
-                            retry_state.pending.append(retry_request)
-                            await retry_state.client.query(
-                                user_message, session_id=retry_request.sent_session_id
-                            )
-                            logger.info(
-                                "✅ Retry submitted successfully for user %s after reconnection",
-                                user_id,
-                            )
-                        return await asyncio.wait_for(retry_future, timeout=self._process_timeout_seconds)
-                    except Exception as retry_err:
-                        if retry_state and retry_request in retry_state.pending:
-                            try:
-                                retry_state.pending.remove(retry_request)
-                            except ValueError:
-                                pass
-                        cleaned = await self._cleanup_heartbeat(retry_request)
-                        self._ledger_finish(retry_request, TASK_FAILED, cleanup_done=cleaned)
-                        if not retry_future.done():
-                            retry_future.cancel()
-                        logger.error(
-                            "Retry also failed for user %s: %s",
-                            user_id,
-                            retry_err,
-                            exc_info=True,
-                        )
-                        retry_msg = str(retry_err)
-                        health_reporter.record_claude_error(retry_msg)
-                        return ChatResponse(
-                            content=(
-                                RESTART_INTERRUPT_NOTICE
-                                if _is_shutdown_signal_error(retry_msg)
-                                else f"❌ Error: {retry_msg}"
-                            ),
-                            success=False,
-                            error=retry_msg,
-                        )
-
-                logger.error(f"Error processing message: {e}", exc_info=True)
-                health_reporter.record_claude_error(err)
-                return ChatResponse(
-                    content=(
-                        RESTART_INTERRUPT_NOTICE
-                        if _is_shutdown_signal_error(err)
-                        else f"❌ Error: {err}"
-                    ),
-                    success=False,
-                    error=err,
-                )
 
     async def _cancel_agent_streaming(
         self, streaming_handler: Optional[Any], *, context: str
@@ -389,15 +156,13 @@ class ProjectChatProcessMixin:
     ) -> None:
         """Route runtime-side unsolicited turns to Telegram (#584 P3-1B).
 
-        The adapter counterpart of the direct path's ``deliver_unsolicited``
-        closure plus ``_handle_unsolicited_message`` bookkeeping: assistant
-        output the runtime produced outside any active turn (for example the
-        CLI autonomously continuing after a background-task notification) is
-        cleaned, bounded, and sent to the same conversation. The seam is
-        optional — sessions without ``set_unsolicited_handler`` (Codex) keep
-        their current behavior — and without a route bot any previously
-        registered handler is left in place, mirroring how the direct path
-        keeps an existing stream callback when a request carries no bot.
+        Assistant output the runtime produced outside any active turn (for
+        example the CLI autonomously continuing after a background-task
+        notification) is cleaned, bounded, and sent to the same conversation.
+        The seam is optional — sessions without ``set_unsolicited_handler``
+        (Codex) keep their current behavior — and without a route bot any
+        previously registered handler is left in place so a request that
+        carries no bot never severs an existing delivery route.
         """
 
         setter = getattr(session, "set_unsolicited_handler", None)
@@ -434,17 +199,16 @@ class ProjectChatProcessMixin:
     def _register_agent_frame_observer(
         self, session: Any, *, user_id: int, chat_id: int
     ) -> None:
-        """Feed adapter-path SDK frames into the direct-path /usage recorders.
+        """Feed adapter-path SDK frames into the /usage recorders.
 
-        #584 C-1 follow-up: on the now-default ClaudeRuntime adapter path the
-        legacy reader loop never runs, so nothing recorded the ResultMessage
-        usage/cost snapshots or the RateLimitEvent windows that ``get_usage``
-        aggregates — /usage rendered every line "unavailable" while turns
-        worked. ``ClaudeSession.set_sdk_frame_observer`` replays the raw SDK
-        frames (turn-bearing and between-turns flows alike); this observer
-        routes them into the same recorders the direct reader loop uses.
+        #584 C-1 follow-up: without this seam nothing recorded the
+        ResultMessage usage/cost snapshots or the RateLimitEvent windows that
+        ``get_usage`` aggregates — /usage rendered every line "unavailable"
+        while turns worked. ``ClaudeSession.set_sdk_frame_observer`` replays
+        the raw SDK frames (turn-bearing and between-turns flows alike); this
+        observer routes them into the shared recorders.
 
-        Observation-only: token/request metering stays on the slice-B seam
+        Observation-only: token/request metering stays on the adapter seam
         (``record_claude_adapter_attempt`` / ``record_claude_adapter_result``),
         so nothing double-charges the usage meter. Runtimes without the seam
         (Codex serves /usage from its own ``get_usage`` endpoint) and

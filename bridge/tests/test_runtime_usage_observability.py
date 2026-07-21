@@ -52,7 +52,6 @@ for _name in [
     "telegram_bot.core.project_chat",
     "telegram_bot.core.project_chat_history",
     "telegram_bot.core.project_chat_process",
-    "telegram_bot.core.project_chat_reader",
     "telegram_bot.core.project_chat_state",
 ]:
     sys.modules.pop(_name, None)

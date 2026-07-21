@@ -2,21 +2,23 @@
 
 Detection-only: this module observes and reports, it never remediates.
 
-Four structured signals are exported to ``health.json`` on every probe tick and
-evaluated against configurable thresholds:
+Three structured signals are exported to ``health.json`` on every probe tick
+and evaluated against configurable thresholds:
 
-1. **Session liveness** — streams whose reader task has died while the stream
-   is still registered (a dead session that can no longer deliver anything).
-2. **Heartbeat age vs request lifetime** — the oldest in-flight request's age
+1. **Heartbeat age vs request lifetime** — the oldest in-flight request's age
    compared to the configured process timeout. A request older than its own
    lifetime means the lifecycle leaked (the #307 class): nothing should outlive
    ``CLAUDE_PROCESS_TIMEOUT`` now that the terminal-stall guard (#411 C)
    releases silent turns much earlier.
-3. **Pending / dropped notifications** — the push-notifier spool backlog plus
+2. **Pending / dropped notifications** — the push-notifier spool backlog plus
    the cumulative quarantined-transcript counter (notifications recovery gave
    up on, #411 B).
-4. **Orphan children** — PPID-1 ``node claude`` processes from the read-only
+3. **Orphan children** — PPID-1 ``node claude`` processes from the read-only
    orphan probe (#303).
+
+The legacy session-liveness signal (streams with a dead reader task) retired
+with the direct Claude SDK stream path (#584 slice C-2); runtime-path session
+death surfaces through turn errors and the recovery/wakeup scanners instead.
 
 Alert delivery reuses the owner-only push-notifier spool: alerts are written as
 ordinary spool records, so the existing redaction, dedup, rate-limit, and the
@@ -31,8 +33,6 @@ Threshold rationale (documented for #389's acceptance):
   request exceeds ``factor × CLAUDE_PROCESS_TIMEOUT``. Aligned with the request
   lifetime by construction, so the #307 "heartbeat outlives its request"
   regression is caught at the first multiple of the lifetime.
-- ``alert_max_dead_streams`` (default 1): any registered stream with a dead
-  reader is already a delivery outage for that conversation.
 - ``alert_max_pending_notifications`` (default 10): the spool normally drains
   within seconds; a double-digit backlog means delivery is stuck, not busy.
 - ``alert_max_orphan_children`` (default 1): the startup/periodic reaper keeps
@@ -83,8 +83,6 @@ def probe_interval(value: Any, default: float = DEFAULT_PROBE_INTERVAL_SECONDS) 
 class HealthSignals:
     """One probe tick's structured runtime-health snapshot."""
 
-    active_streams: int = 0
-    dead_streams: int = 0
     active_requests: int = 0
     oldest_request_age_seconds: float = 0.0
     request_lifetime_seconds: float = 0.0
@@ -102,7 +100,6 @@ class HealthSignals:
 @dataclass(frozen=True)
 class AlertThresholds:
     heartbeat_age_factor: float = 1.0
-    max_dead_streams: int = 1
     max_pending_notifications: int = 10
     max_orphan_children: int = 1
 
@@ -119,16 +116,6 @@ class Alert:
 def evaluate_alerts(signals: HealthSignals, thresholds: AlertThresholds) -> list[Alert]:
     """Pure threshold evaluation over one signals snapshot."""
     alerts: list[Alert] = []
-    if signals.dead_streams >= max(1, thresholds.max_dead_streams):
-        alerts.append(
-            Alert(
-                code="dead_session_stream",
-                message=(
-                    f"{signals.dead_streams} conversation stream(s) have a dead "
-                    "reader and cannot deliver replies until recreated."
-                ),
-            )
-        )
     lifetime = signals.request_lifetime_seconds
     if (
         lifetime > 0
@@ -251,16 +238,6 @@ class HealthProbe:
     thresholds: AlertThresholds = field(default_factory=AlertThresholds)
 
     def collect(self, now: float) -> HealthSignals:
-        active_streams = 0
-        dead_streams = 0
-        streams = getattr(self.project_chat, "_streams", {}) or {}
-        for state in streams.values():
-            reader = getattr(state, "reader_task", None)
-            if reader is not None and reader.done():
-                dead_streams += 1
-            else:
-                active_streams += 1
-
         try:
             active_requests, oldest_age = self.project_chat.workload_snapshot(now)
         except Exception:
@@ -294,8 +271,6 @@ class HealthProbe:
             orphans = []
 
         return HealthSignals(
-            active_streams=active_streams,
-            dead_streams=dead_streams,
             active_requests=int(active_requests),
             oldest_request_age_seconds=float(oldest_age),
             request_lifetime_seconds=lifetime,

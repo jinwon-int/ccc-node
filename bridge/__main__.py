@@ -56,7 +56,6 @@ def build_context(
     """Compose dependencies without performing filesystem initialization."""
     bind_config(settings)
     from telegram.ext import Application
-    from claude_agent_sdk import ClaudeSDKClient
     from telegram_bot.core.project_chat import ProjectChatHandler
     from telegram_bot.memory.distill_journal import DistillJournal
     from telegram_bot.session.manager import SessionManager
@@ -64,7 +63,6 @@ def build_context(
     from telegram_bot.utils.chat_logger import bind_logs_dir
     from telegram_bot.utils.health import health_reporter
 
-    sdk_factory = sdk_factory or ClaudeSDKClient
     if settings.agent_provider == "codex" and agent_runtime is None:
         from telegram_bot.core.codex_runtime import CodexRuntime
 
@@ -74,28 +72,22 @@ def build_context(
             memory_bootstrap_timeout_seconds=(settings.codex_memory_bootstrap_timeout_seconds),
         )
     elif settings.agent_provider == "claude" and agent_runtime is None:
-        # #346 staged cutover (#584 slice C-1): the Claude provider routes
-        # through the provider-neutral ClaudeRuntime adapter by default.
-        # CCC_CLAUDE_RUNTIME_ADAPTER=0 is an emergency per-node kill-switch:
-        # no runtime is injected and ProjectChat keeps the legacy direct
-        # Claude SDK stream path unchanged. The transcripts browsing directory
-        # matches the direct path's resolution of ~/.claude/projects
-        # (ProjectChatHandler.conversations_dir).
-        if getattr(settings, "claude_runtime_adapter", True):
-            from telegram_bot.core.claude_runtime import ClaudeRuntime
-            from telegram_bot.core.conversation_paths import claude_project_dir_name
+        # #346/#584 cutover complete (slice C-2): the Claude provider always
+        # routes through the provider-neutral ClaudeRuntime adapter; the legacy
+        # direct SDK stream path and its CCC_CLAUDE_RUNTIME_ADAPTER kill-switch
+        # are gone (rollback = git revert). The transcripts browsing directory
+        # matches ~/.claude/projects (ProjectChatHandler.conversations_dir).
+        from telegram_bot.core.claude_runtime import ClaudeRuntime
+        from telegram_bot.core.conversation_paths import claude_project_dir_name
 
-            logger.info("Claude provider routed through ClaudeRuntime adapter (#346)")
-            agent_runtime = ClaudeRuntime(
-                transcripts_dir=Path.home()
-                / ".claude"
-                / "projects"
-                / claude_project_dir_name(Path(settings.project_root).resolve()),
-            )
-        else:
-            logger.info(
-                "Claude adapter kill-switch active; using legacy direct SDK path"
-            )
+        logger.info("Claude provider routed through ClaudeRuntime adapter (#346)")
+        agent_runtime = ClaudeRuntime(
+            sdk_client_factory=sdk_factory,
+            transcripts_dir=Path.home()
+            / ".claude"
+            / "projects"
+            / claude_project_dir_name(Path(settings.project_root).resolve()),
+        )
     telegram_port = telegram_port or Application.builder
     clock = clock or time
     bind_logs_dir(settings.logs_dir)
@@ -105,7 +97,6 @@ def build_context(
     distill_journal = DistillJournal(settings.bot_data_dir / "distill-journal")
     project_chat = ProjectChatHandler(
         settings=settings,
-        sdk_client_factory=sdk_factory,
         agent_runtime=agent_runtime,
         clock=clock,
     )

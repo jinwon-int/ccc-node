@@ -1,22 +1,22 @@
 """End-to-end delivery reliability harness (issue #385).
 
 Boots the real bridge composition — ``TelegramBot`` → ``ProjectChatHandler``
-with the real reader loop, typing keepalive, session store, task ledger, and
-dead-session recovery — over a fake Telegram surface and a scripted Claude SDK
-client. No network, no live provider, no real bot token.
+over the real ``ClaudeRuntime`` adapter (#584), session store, task ledger,
+and dead-session recovery — over a fake Telegram surface and a scripted
+Claude SDK client. No network, no live provider, no real bot token.
 
 Three round-trips are executed for real, not simulated:
 
 1. **Solicited**: a user message flows Telegram → bridge → agent turn →
    the reply reaches the Telegram outbound surface.
-2. **Unsolicited**: a background wakeup turn arrives on the live stream with
-   no pending Telegram request and its output is still delivered
-   (#364 P1 regression guard — the reader used to drop these entirely).
+2. **Unsolicited**: a background wakeup turn arrives on the live session with
+   no active turn and its output is still delivered
+   (#364 P1 / #601 regression guard — dropped entirely before the seam).
 3. **Dead-session recovery**: a terminal task notification persisted in a
    dead session's transcript is delivered on the recovery pass
    (#364 P2 / #372 regression guard).
 
-A negative test re-introduces the old reader drop-condition and shows the
+A negative test re-introduces the old drop-condition and shows the
 unsolicited round-trip then fails — the positive test is the tripwire that
 catches that regression class.
 """
@@ -46,16 +46,23 @@ for name in (
     "telegram_bot.core.project_chat",
     "telegram_bot.core.project_chat_history",
     "telegram_bot.core.project_chat_process",
-    "telegram_bot.core.project_chat_reader",
     "telegram_bot.core.project_chat_state",
+    "telegram_bot.core.claude_runtime",
     "telegram_bot.core.bot",
 ):
     sys.modules.pop(name, None)
 
-from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock  # noqa: E402
+from claude_agent_sdk import (  # noqa: E402
+    AssistantMessage,
+    ResultMessage,
+    SystemMessage,
+    TextBlock,
+)
 
 project_chat_module = importlib.import_module("telegram_bot.core.project_chat")
 ProjectChatHandler = project_chat_module.ProjectChatHandler
+claude_runtime_module = importlib.import_module("telegram_bot.core.claude_runtime")
+ClaudeRuntime = claude_runtime_module.ClaudeRuntime
 bot_module = importlib.import_module("telegram_bot.core.bot")
 TelegramBot = bot_module.TelegramBot
 
@@ -85,9 +92,10 @@ def _real_settings(tmp_path: Path):
 class ScriptedSDKClient:
     """Echo agent over the real ClaudeSDKClient surface.
 
-    ``query`` scripts an assistant+result turn; ``emit_background_turn``
+    ``query`` scripts an assistant+result turn; ``emit_turn`` outside a query
     injects an unsolicited wakeup turn exactly like the CLI does after a
-    background task completes.
+    background task completes. The session id is announced at connect the way
+    the real CLI's init frame does.
     """
 
     def __init__(self, options=None) -> None:
@@ -98,9 +106,15 @@ class ScriptedSDKClient:
 
     async def connect(self) -> None:
         self.connected = True
+        self.inbox.put_nowait(
+            SystemMessage(subtype="init", data={"session_id": "live-session"})
+        )
 
     async def disconnect(self) -> None:
         self.connected = False
+
+    async def interrupt(self) -> None:
+        return None
 
     async def query(self, message: str, session_id: str = "default") -> None:
         self.queries.append((message, session_id))
@@ -108,7 +122,9 @@ class ScriptedSDKClient:
 
     def emit_turn(self, text: str, session_id: str = "live-session") -> None:
         self.inbox.put_nowait(
-            AssistantMessage(content=[TextBlock(text=text)], model="e2e-model")
+            AssistantMessage(
+                content=[TextBlock(text=text)], model="e2e-model"
+            )
         )
         self.inbox.put_nowait(
             ResultMessage(
@@ -184,9 +200,12 @@ class Bridge:
     def __init__(self, tmp_path: Path) -> None:
         self.settings = _real_settings(tmp_path)
         self.client = ScriptedSDKClient()
+        self.runtime = ClaudeRuntime(
+            sdk_client_factory=lambda options: self.client,
+        )
         self.handler = ProjectChatHandler(
             settings=self.settings,
-            sdk_client_factory=lambda options=None, **kwargs: self.client,
+            agent_runtime=self.runtime,
         )
         self.manager = SessionManager(
             SessionStore(self.settings.bot_data_dir / "sessions.json"), self.settings
@@ -244,10 +263,9 @@ async def test_unsolicited_background_turn_reaches_telegram(bridge: Bridge) -> N
     message = await bridge.send_user_text("start")
     await _wait_until(lambda: any("echo: start" in r for r in message.replies))
 
-    # The FIFO is drained; the CLI now wakes the model for a completed
+    # The turn is finished; the CLI now wakes the model for a completed
     # background task and the turn's output arrives unsolicited.
-    state = bridge.handler._streams[(7, 70)]
-    await _wait_until(lambda: not state.pending)
+    await _wait_until(lambda: not bridge.handler._agent_active_sessions)
     bridge.client.emit_turn("Background task finished: build is green")
 
     await _wait_until(
@@ -270,13 +288,14 @@ async def test_reintroduced_drop_condition_is_caught_by_harness(bridge: Bridge) 
     unsolicited round-trip fails — proving the positive test is a tripwire."""
     message = await bridge.send_user_text("start")
     await _wait_until(lambda: any("echo: start" in r for r in message.replies))
-    state = bridge.handler._streams[(7, 70)]
-    await _wait_until(lambda: not state.pending)
+    await _wait_until(lambda: not bridge.handler._agent_active_sessions)
 
-    async def old_drop_behavior(user_id, state, msg):  # the pre-#371 reader
+    session = bridge.handler._agent_sessions[(7, 70)].session
+
+    async def old_drop_behavior(msg):  # the pre-#601 between-turns behavior
         return None
 
-    bridge.handler._handle_unsolicited_message = old_drop_behavior
+    session._handle_unsolicited_frame = old_drop_behavior
     bridge.client.emit_turn("Background task finished: dropped")
 
     with pytest.raises(TimeoutError):

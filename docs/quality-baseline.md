@@ -57,6 +57,12 @@ review. Refactors should remove markers over time; never add one to new code.
 `scripts/agent_cron.py::due_plan` (18),
 `scripts/ccc_doctor.py::diagnose` (22), `scripts/ccc_doctor.py::main` (16).
 
+Retired since introduction (function deleted with the legacy direct Claude
+SDK path, #584 slice C-2): `project_chat.py::_create_user_stream`,
+`project_chat.py::_disconnect_stream_state`,
+`project_chat_process.py::process_message` (rewritten below the threshold),
+`project_chat_reader.py::_reader_loop` (module deleted).
+
 ## Mypy scope
 
 All `bridge/core` modules and the typed agent-cron domain modules are checked. The `TelegramBot` mixin modules

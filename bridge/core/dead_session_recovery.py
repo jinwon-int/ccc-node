@@ -438,16 +438,6 @@ async def _resolve_transcript_path_with_retry(
     raise last_error
 
 
-def _live_stream_owned(handler: Any, user_id: int, chat_id: int) -> bool:
-    route = getattr(handler, "_stream_key", None)
-    route_key = route(user_id, chat_id) if callable(route) else (user_id, chat_id)
-    state = getattr(handler, "_streams", {}).get(route_key)
-    if state is None:
-        return False
-    reader = getattr(state, "reader_task", None)
-    return bool(reader is not None and not reader.done())
-
-
 def _transcript_file_identity(path: Optional[Path]) -> Optional[dict[str, int]]:
     """Cheap lstat-based identity used to detect transcript change without parsing."""
     if path is None:
@@ -775,9 +765,6 @@ async def recover_dead_session_notifications(  # noqa: C901 -- #348 baseline hot
             stats.skipped_locked += 1
             continue
         try:
-            if _live_stream_owned(project_handler, user_id, chat_id):
-                stats.skipped_active += 1
-                continue
             try:
                 current = await session_manager.get_session(storage_key)
             except Exception:
