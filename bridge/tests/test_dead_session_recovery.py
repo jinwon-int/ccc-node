@@ -166,7 +166,6 @@ class DeadSessionScannerTests(unittest.IsolatedAsyncioTestCase):
         })
         self.bot = SimpleNamespace(send_message=AsyncMock(return_value=SimpleNamespace(message_id=1)))
         self.handler = SimpleNamespace(
-            _streams={},
             _get_conversation_lock=lambda _user, _chat: asyncio.Lock(),
         )
 
@@ -185,16 +184,7 @@ class DeadSessionScannerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.bot.send_message.await_args.kwargs["chat_id"], 70)
         self.assertEqual(len(self.sessions.sessions["7:70"][MARKER_KEY]), 1)
 
-    async def test_live_stream_and_locked_conversation_are_skipped(self):
-        reader = SimpleNamespace(done=lambda: False)
-        self.handler._streams[(7, 70)] = SimpleNamespace(reader_task=reader)
-        stats = await recover_dead_session_notifications(
-            self.bot, self.sessions, self.handler, self.root
-        )
-        self.assertEqual(stats.skipped_active, 1)
-        self.bot.send_message.assert_not_awaited()
-
-        self.handler._streams.clear()
+    async def test_locked_conversation_is_skipped(self):
         lock = asyncio.Lock()
         await lock.acquire()
         self.handler._get_conversation_lock = lambda _user, _chat: lock
@@ -322,7 +312,6 @@ class TranscriptQuarantineTests(unittest.IsolatedAsyncioTestCase):
             send_message=AsyncMock(return_value=SimpleNamespace(message_id=1))
         )
         self.handler = SimpleNamespace(
-            _streams={},
             _get_conversation_lock=lambda _user, _chat: asyncio.Lock(),
         )
 

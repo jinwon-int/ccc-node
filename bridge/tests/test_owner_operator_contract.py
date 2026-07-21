@@ -13,13 +13,11 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 PRODUCTION_PROBE = r"""
-import asyncio
 import json
 import os
 from pathlib import Path
 
 import telegram_bot
-from claude_agent_sdk._internal.transport.subprocess_cli import SubprocessCLITransport
 from telegram_bot.utils.config import config
 from telegram_bot.core.bot import enforce_access_control
 
@@ -34,33 +32,7 @@ candidate_imports = all(
     for module in (telegram_bot, project_chat)
 )
 
-
-class FakeSDKClient:
-    last_options = None
-
-    def __init__(self, options):
-        type(self).last_options = options
-
-    async def connect(self):
-        return None
-
-
-def close_task(coro):
-    coro.close()
-    return object()
-
-
-project_chat.asyncio.create_task = close_task
-handler = project_chat.ProjectChatHandler(
-    settings=config,
-    sdk_client_factory=FakeSDKClient,
-)
-asyncio.run(handler._create_user_stream(42, None))
-options = FakeSDKClient.last_options
-assert options is not None
-transport = SubprocessCLITransport(prompt="", options=options)
-transport._cli_path = "/bin/true"
-cli_args = transport._build_command()
+handler = project_chat.ProjectChatHandler(settings=config)
 print(
     json.dumps(
         {
@@ -68,15 +40,8 @@ print(
             "execution_profile": handler._execution_profile,
             "bash_policy": handler._bash_policy,
             "candidate_imports": candidate_imports,
+            "claude_unrestricted": handler._claude_unrestricted,
             "require_allowlist": config.require_allowlist,
-            "sandbox": options.sandbox,
-            "setting_sources": options.setting_sources,
-            "bash_allowed": "Bash" in options.allowed_tools,
-            "bash_disallowed": "Bash" in options.disallowed_tools,
-            "pretool_hook": "PreToolUse" in options.hooks,
-            "normal_setting_sources_cli": (
-                "--setting-sources=user,project,local" in cli_args
-            ),
         },
         sort_keys=True,
     )
@@ -125,32 +90,20 @@ def _probe_owner_profile(tmp_path: Path, bash_policy: str) -> dict:
 
 
 @pytest.mark.parametrize(
-    ("bash_policy", "bash_allowed", "bash_disallowed", "pretool_hook"),
-    [
-        ("auto-approve", True, False, False),
-        ("approve-each", False, False, True),
-        ("disabled", False, True, False),
-    ],
+    "bash_policy",
+    ["auto-approve", "approve-each", "disabled"],
 )
-def test_production_owner_profile_preserves_host_scope_across_bash_policies(
+def test_production_owner_profile_resolves_policy_across_bash_policies(
     tmp_path: Path,
     bash_policy: str,
-    bash_allowed: bool,
-    bash_disallowed: bool,
-    pretool_hook: bool,
 ):
     observed = _probe_owner_profile(tmp_path, bash_policy)
 
     assert observed == {
         "allowed_owner_ids": [42],
-        "bash_allowed": bash_allowed,
-        "bash_disallowed": bash_disallowed,
         "bash_policy": bash_policy,
         "candidate_imports": True,
+        "claude_unrestricted": False,
         "execution_profile": "owner-operator",
-        "normal_setting_sources_cli": True,
-        "pretool_hook": pretool_hook,
         "require_allowlist": True,
-        "sandbox": None,
-        "setting_sources": ["user", "project", "local"],
     }

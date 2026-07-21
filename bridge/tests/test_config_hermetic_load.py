@@ -2,7 +2,9 @@
 
 Incident (2026-07-19): a test calling ``Settings.load(project_root=tmp,
 environ={...}, bot_env_file=missing)`` on a live node still picked up
-``CCC_CLAUDE_RUNTIME_ADAPTER=1`` from the node's real project ``.env``.
+``CCC_CLAUDE_RUNTIME_ADAPTER=1`` from the node's real project ``.env``
+(that flag retired with #584 slice C-2; ``CCC_WIKI_MEMORY_ENABLED`` is the
+boolean probe now).
 Root cause: pydantic-core invokes the custom ``BaseSettings.__init__`` even
 from ``model_validate``, so the pydantic-settings env/dotenv sources
 (``os.environ`` plus the import-time ``model_config.env_file`` baked from the
@@ -39,7 +41,7 @@ def _plant_ambient_machine_state(config_module, tmp_path, monkeypatch):
     ambient_env = ambient_root / ".telegram_bot" / ".env"
     ambient_env.parent.mkdir(parents=True)
     ambient_env.write_text(
-        "CCC_CLAUDE_RUNTIME_ADAPTER=0\n"
+        "CCC_WIKI_MEMORY_ENABLED=0\n"
         "CCC_BRIDGE_EXECUTION_PROFILE=owner-operator\n"
         "ALLOWED_USER_IDS=4242\n",
         encoding="utf-8",
@@ -51,7 +53,7 @@ def _plant_ambient_machine_state(config_module, tmp_path, monkeypatch):
         config_module.Config.model_config, "env_file", [str(ambient_env)]
     )
     # An operator shell exporting its own profile:
-    monkeypatch.setenv("CCC_CLAUDE_RUNTIME_ADAPTER", "0")
+    monkeypatch.setenv("CCC_WIKI_MEMORY_ENABLED", "0")
     monkeypatch.setenv("CCC_BRIDGE_EXECUTION_PROFILE", "owner-operator")
     monkeypatch.setenv("ALLOWED_USER_IDS", "4242")
     monkeypatch.delenv("CCC_BOT_ENV_FILE", raising=False)
@@ -66,7 +68,7 @@ def test_explicit_load_never_reads_ambient_env_file_or_process_env(
     # Control: the planted machine state IS live for implicit construction,
     # proving the simulation is wired into the leak path under test.
     control = config_module.Config(telegram_bot_token="123456:test")
-    assert control.claude_runtime_adapter is False
+    assert control.wiki_memory_enabled is False
     assert control.execution_profile == "owner-operator"
     assert control.allowed_user_ids == [4242]
 
@@ -78,7 +80,7 @@ def test_explicit_load_never_reads_ambient_env_file_or_process_env(
         environ={"TELEGRAM_BOT_TOKEN": "123456:test"},
         bot_env_file=tmp_path / "missing-package.env",
     )
-    assert settings.claude_runtime_adapter is True
+    assert settings.wiki_memory_enabled is True
     assert settings.execution_profile == "strict-project"
     assert settings.allowed_user_ids == []
 

@@ -741,7 +741,7 @@ async def test_claude_usage_cache_is_exact_conversation_and_session_scoped(
         usage={"input_tokens": 100, "output_tokens": 20},
         total_cost_usd=0.01,
     )
-    handler._record_claude_usage(SimpleNamespace(user_id=7, chat_id=9), message)
+    handler.record_claude_result_snapshot(7, 9, message)
 
     exact = await handler.get_usage(7, 9, "claude-a")
     other_chat = await handler.get_usage(7, 10, "claude-a")

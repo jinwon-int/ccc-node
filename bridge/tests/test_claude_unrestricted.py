@@ -1,11 +1,10 @@
 """Opt-in Codex-parity ungoverned Claude execution (CCC_BRIDGE_CLAUDE_UNRESTRICTED).
 
-Verifies the flag reaches Codex parity (no guard settings chain, bypass
-permissions, no OS sandbox) only on owner-operator, and is fail-closed
-everywhere else.
+Verifies the flag resolves to enabled only on owner-operator and is
+fail-closed everywhere else (including under root, where Claude Code refuses
+bypassPermissions).
 """
 
-import asyncio
 import unittest
 from unittest.mock import patch
 
@@ -13,37 +12,13 @@ from telegram_bot.core import project_chat, tool_policy
 from telegram_bot.utils.config import Config
 
 
-class _FakeSDKClient:
-    last_options = None
-
-    def __init__(self, options):
-        type(self).last_options = options
-
-    async def connect(self):
-        return None
-
-
-def _close_task(coro):
-    coro.close()
-    return object()
-
-
-def _build_options(
-    *, profile: str, policy: str = "auto-approve", unrestricted: bool, is_root: bool = False
-):
-    _FakeSDKClient.last_options = None
+def _handler_flag(*, profile: str, unrestricted: bool, is_root: bool = False) -> bool:
     with (
         patch.object(project_chat, "EXECUTION_PROFILE", profile, create=True),
-        patch.object(project_chat, "BASH_POLICY", policy),
         patch.object(project_chat, "CLAUDE_UNRESTRICTED", unrestricted),
         patch.object(project_chat, "running_as_root", return_value=is_root),
-        patch.object(project_chat, "ClaudeSDKClient", _FakeSDKClient),
-        patch.object(project_chat.asyncio, "create_task", side_effect=_close_task),
     ):
-        asyncio.run(project_chat.ProjectChatHandler()._create_user_stream(10, None))
-    options = _FakeSDKClient.last_options
-    assert options is not None
-    return options
+        return project_chat.ProjectChatHandler()._claude_unrestricted
 
 
 class ClaudeUnrestrictedGateTest(unittest.TestCase):
@@ -82,44 +57,26 @@ class ClaudeUnrestrictedGateTest(unittest.TestCase):
 
 
 class ClaudeUnrestrictedWiringTest(unittest.TestCase):
-    def test_owner_operator_flag_reaches_codex_parity(self) -> None:
-        options = _build_options(profile="owner-operator", unrestricted=True)
-        self.assertEqual(options.permission_mode, "bypassPermissions")
-        # No host settings chain => the node's host hooks/settings are not loaded.
-        self.assertEqual(options.setting_sources, [])
-        # No OS sandbox: host-capable like Codex dangerFullAccess.
-        self.assertIsNone(options.sandbox)
-        # Bash stays auto-allowed.
-        self.assertIn("Bash", options.allowed_tools)
+    def test_owner_operator_flag_resolves_enabled(self) -> None:
+        self.assertTrue(_handler_flag(profile="owner-operator", unrestricted=True))
 
     def test_owner_operator_default_keeps_the_guard_boundary(self) -> None:
-        options = _build_options(profile="owner-operator", unrestricted=False)
-        self.assertEqual(options.permission_mode, "default")
-        self.assertEqual(options.setting_sources, ["user", "project", "local"])
-        self.assertIsNone(options.sandbox)
+        self.assertFalse(_handler_flag(profile="owner-operator", unrestricted=False))
 
     def test_flag_is_ignored_on_strict_project(self) -> None:
-        options = _build_options(profile="strict-project", unrestricted=True)
-        # Fail-closed: strict-project stays sandboxed and never bypasses.
-        self.assertNotEqual(options.permission_mode, "bypassPermissions")
-        self.assertEqual(options.setting_sources, [])
-        self.assertIsNotNone(options.sandbox)
+        self.assertFalse(_handler_flag(profile="strict-project", unrestricted=True))
 
-    def test_flag_is_ignored_when_bash_disabled_profile(self) -> None:
-        options = _build_options(
-            profile="disabled", policy="auto-approve", unrestricted=True
-        )
-        self.assertNotEqual(options.permission_mode, "bypassPermissions")
+    def test_flag_is_ignored_on_disabled_profile(self) -> None:
+        self.assertFalse(_handler_flag(profile="disabled", unrestricted=True))
 
     def test_flag_is_ignored_under_root_and_keeps_the_guard(self) -> None:
         # Root bridge: Claude Code refuses bypassPermissions, so the flag must
-        # degrade to the normal guarded owner-operator path instead of
-        # emitting an option Claude Code would reject.
-        options = _build_options(
-            profile="owner-operator", unrestricted=True, is_root=True
-        )
-        self.assertEqual(options.permission_mode, "default")
-        self.assertEqual(options.setting_sources, ["user", "project", "local"])
+        # degrade to the normal guarded owner-operator path (and warn).
+        with self.assertLogs(project_chat.logger, level="WARNING") as logs:
+            self.assertFalse(
+                _handler_flag(profile="owner-operator", unrestricted=True, is_root=True)
+            )
+        self.assertTrue(any("ignored under root" in line for line in logs.output))
 
 
 class ClaudeUnrestrictedDefaultContractTest(unittest.TestCase):

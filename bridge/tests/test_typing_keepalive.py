@@ -1,15 +1,13 @@
-"""Regression tests for the Telegram typing-indicator lifecycle.
+"""Regression tests for the Telegram typing-indicator refresh policy.
 
-Bug: after the agent finished all of its output, the chat could stay stuck on
-"typing…". Root cause: the typing keepalive loop refreshed the indicator off the
-head of state.pending and would fire one more typing action around the moment a
-request's response was finalized (future resolved) but before it was popped.
-Streamed replies edit drafts instead of sending a new message, so they never
-clear typing on their own — a stray keepalive left it stuck.
-
-Fix: the keepalive (and the reader-loop refresh) skip a request whose future is
-already done. These tests pin that: typing is refreshed while genuinely in
-flight, and never after the response is finalized.
+Bug history: after the agent finished all of its output, the chat could stay
+stuck on "typing…" because a refresh fired around response finalization.
+The shared guard is ``_should_refresh_typing``; the runtime-path progress loop
+(``_agent_progress_loop``, exercised end-to-end in test_project_chat_codex)
+consults it before every typing action. These tests pin the guard's
+invariants: typing refreshes only while a request is genuinely in flight, and
+never after finalization, visible progress, a permission wait, or the
+no-progress cap.
 """
 
 import asyncio
@@ -17,15 +15,14 @@ import os
 import sys
 import types
 import unittest
-from collections import deque
 from pathlib import Path
 from types import SimpleNamespace
 
 # project_chat reads config / PROJECT_ROOT / health / chat_logger at import time.
 # Other test modules in this suite replace these in sys.modules with partial
 # fakes, so to stay order-independent we install minimal fakes ourselves and
-# re-import project_chat fresh (the defensive setup used by
-# test_project_chat_retry).
+# re-import project_chat fresh (the defensive setup shared by the
+# project_chat test modules).
 os.environ.setdefault("PROJECT_ROOT", str(Path(__file__).resolve().parents[1]))
 
 from sys_modules_isolation import ModuleFakesGuard  # noqa: E402
@@ -50,177 +47,82 @@ sys.modules["telegram_bot.utils.health"] = _health_module
 import importlib  # noqa: E402
 
 # Re-import fresh and reference the SAME module object for both the classes and
-# the TYPING_INTERVAL patch. Using `from telegram_bot.core import project_chat`
-# here would grab the parent package's cached attribute (the original module a
-# prior test imported), leaving the patch on a different object than the handler
-# actually reads.
+# the TYPING_MAX_NO_PROGRESS_SECONDS patch. Using `from telegram_bot.core
+# import project_chat` here would grab the parent package's cached attribute
+# (the original module a prior test imported), leaving the patch on a different
+# object than the handler actually reads.
 sys.modules.pop("telegram_bot.core.project_chat", None)
 project_chat = importlib.import_module("telegram_bot.core.project_chat")
 ProjectChatHandler = project_chat.ProjectChatHandler
 _PendingRequest = project_chat._PendingRequest
-_UserStreamState = project_chat._UserStreamState
 
 _sys_modules_guard.finish()
 
 
-class TypingKeepaliveTest(unittest.IsolatedAsyncioTestCase):
+class ShouldRefreshTypingTest(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
-        # Shrink the interval so the loop iterates quickly under test.
-        self._orig_interval = project_chat.TYPING_INTERVAL
-        project_chat.TYPING_INTERVAL = 0.01
-        self.addCleanup(setattr, project_chat, "TYPING_INTERVAL", self._orig_interval)
         self.handler = ProjectChatHandler()
-        self.calls = 0
-        self.called = asyncio.Event()
 
-    def _make_request(self, *, done: bool) -> _PendingRequest:
-        async def typing_callback():
-            self.calls += 1
-            self.called.set()
-
+    def _make_request(self, *, done: bool = False) -> _PendingRequest:
         req = _PendingRequest(
             user_id=1,
             chat_id=2,
             model=None,
             requested_session_id=None,
             permission_callback=None,
-            typing_callback=typing_callback,
+            typing_callback=None,
             future=asyncio.get_running_loop().create_future(),
         )
+        req.started_at = asyncio.get_running_loop().time()
         if done:
             req.future.set_result("done")
         return req
 
-    async def _start_loop(self, state):
-        task = asyncio.create_task(self.handler._typing_keepalive_loop(1, state))
-        self.addCleanup(self._cancel, task)
-        return task
-
-    @staticmethod
-    async def _cancel(task):
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
-
     async def test_refreshes_typing_while_in_flight(self):
-        req = self._make_request(done=False)  # still working
-        state = _UserStreamState(client=None, model=None, pending=deque([req]))
-        await self._start_loop(state)
-        # Deterministic: wait until typing is actually sent (or fail on timeout).
-        await asyncio.wait_for(self.called.wait(), timeout=2.0)
-        self.assertGreater(self.calls, 0)
+        req = self._make_request()
+        now = asyncio.get_running_loop().time()
+        self.assertTrue(self.handler._should_refresh_typing(req, now))
 
     async def test_no_typing_after_future_done(self):
-        req = self._make_request(done=True)  # response finalized
-        state = _UserStreamState(client=None, model=None, pending=deque([req]))
-        await self._start_loop(state)
-        with self.assertRaises(asyncio.TimeoutError):
-            await asyncio.wait_for(self.called.wait(), timeout=0.2)
-        self.assertEqual(self.calls, 0, "typing must NOT be sent once the response is finalized")
-
-    async def test_stops_when_future_resolves_mid_run(self):
-        req = self._make_request(done=False)
-        state = _UserStreamState(client=None, model=None, pending=deque([req]))
-        await self._start_loop(state)
-        await asyncio.wait_for(self.called.wait(), timeout=2.0)  # at least one typing
-        # Finalize the response, then assert no further typing is sent.
-        req.future.set_result("done")
-        count_at_finalize = self.calls
-        await asyncio.sleep(0.1)  # several keepalive intervals (0.01 each)
-        self.assertEqual(self.calls, count_at_finalize, "typing kept firing after finalize")
-
-    async def test_no_typing_when_pending_empty(self):
-        state = _UserStreamState(client=None, model=None, pending=deque())
-        await self._start_loop(state)
-        with self.assertRaises(asyncio.TimeoutError):
-            await asyncio.wait_for(self.called.wait(), timeout=0.2)
-        self.assertEqual(self.calls, 0)
-
-    async def test_typing_stops_when_streaming_idle_after_text_shown(self):
-        """Typing must stop when text was already streamed but a tool is still running.
-
-        Scenario: Claude streams reply text (last_visible_progress_at is set), then
-        executes a long Bash/Task tool.  The SDK emits no new events while the tool
-        runs, so last_visible_progress_at stays frozen.  After 2×TYPING_INTERVAL of
-        idle streaming the keepalive must stop refreshing the typing indicator — the
-        heartbeat will take over to signal progress.
-        """
-        req = self._make_request(done=False)
-        # Simulate: streaming text was shown 3×interval ago (tool is now running).
-        now = asyncio.get_event_loop().time()
-        req.last_visible_progress_at = now - project_chat.TYPING_INTERVAL * 3
-        state = _UserStreamState(client=None, model=None, pending=deque([req]))
-        await self._start_loop(state)
-        with self.assertRaises(asyncio.TimeoutError):
-            await asyncio.wait_for(self.called.wait(), timeout=0.2)
-        self.assertEqual(
-            self.calls, 0,
-            "typing must NOT be sent once streaming is idle and text is already shown",
+        req = self._make_request(done=True)
+        now = asyncio.get_running_loop().time()
+        self.assertFalse(
+            self.handler._should_refresh_typing(req, now),
+            "typing must NOT be refreshed once the response is finalized",
         )
 
     async def test_typing_stops_after_any_visible_progress(self):
         """Typing stops once the user can see streamed text/tool progress."""
-        req = self._make_request(done=False)
-        now = asyncio.get_event_loop().time()
+        req = self._make_request()
+        now = asyncio.get_running_loop().time()
         req.last_visible_progress_at = now
-        state = _UserStreamState(client=None, model=None, pending=deque([req]))
-        await self._start_loop(state)
-        with self.assertRaises(asyncio.TimeoutError):
-            await asyncio.wait_for(self.called.wait(), timeout=0.2)
-        self.assertEqual(
-            self.calls,
-            0,
-            "typing must NOT be sent after visible progress has appeared",
+        self.assertFalse(
+            self.handler._should_refresh_typing(req, now),
+            "typing must NOT be refreshed after visible progress has appeared",
         )
 
     async def test_typing_skips_permission_wait(self):
-        """Permission prompts wait for the user; typing must not imply the bot is working."""
-        req = self._make_request(done=False)
+        """Permission prompts wait for the user; typing must not imply work."""
+        req = self._make_request()
         req.awaiting_permission = True
-        state = _UserStreamState(client=None, model=None, pending=deque([req]))
-        await self._start_loop(state)
-        with self.assertRaises(asyncio.TimeoutError):
-            await asyncio.wait_for(self.called.wait(), timeout=0.2)
-        self.assertEqual(self.calls, 0)
+        now = asyncio.get_running_loop().time()
+        self.assertFalse(self.handler._should_refresh_typing(req, now))
 
     async def test_typing_stops_after_no_progress_cap(self):
-        req = self._make_request(done=False)
+        req = self._make_request()
         orig_cap = project_chat.TYPING_MAX_NO_PROGRESS_SECONDS
         setattr(project_chat, "TYPING_MAX_NO_PROGRESS_SECONDS", 0.02)
-        self.addCleanup(setattr, project_chat, "TYPING_MAX_NO_PROGRESS_SECONDS", orig_cap)
-        req.started_at = asyncio.get_event_loop().time() - 1.0
-        state = _UserStreamState(client=None, model=None, pending=deque([req]))
-        await self._start_loop(state)
-        with self.assertRaises(asyncio.TimeoutError):
-            await asyncio.wait_for(self.called.wait(), timeout=0.2)
-        self.assertEqual(self.calls, 0)
+        self.addCleanup(
+            setattr, project_chat, "TYPING_MAX_NO_PROGRESS_SECONDS", orig_cap
+        )
+        now = asyncio.get_running_loop().time()
+        req.started_at = now - 1.0
+        self.assertFalse(self.handler._should_refresh_typing(req, now))
 
     def test_invalid_typing_cap_env_falls_back(self):
         self.assertEqual(project_chat._env_int("MISSING_CCC_TEST_INT", 600), 600)
         with self.assertLogs(project_chat.logger, level="WARNING"):
             self.assertEqual(project_chat._env_int("PATH", 600), 600)
-
-    async def test_reader_loop_does_not_refresh_typing_for_result_message(self):
-        class _OneResultClient:
-            async def receive_messages(self):
-                yield project_chat.ResultMessage(
-                    subtype="success",
-                    duration_ms=1,
-                    duration_api_ms=1,
-                    is_error=False,
-                    num_turns=1,
-                    session_id="s1",
-                    result="done",
-                )
-
-        req = self._make_request(done=False)
-        req.last_typing_at = asyncio.get_event_loop().time() - 100
-        state = _UserStreamState(client=_OneResultClient(), model=None, pending=deque([req]))
-        await self.handler._reader_loop(1, state)
-        self.assertEqual(self.calls, 0, "ResultMessage must not reassert typing")
-        self.assertTrue(req.future.done())
 
 
 if __name__ == "__main__":

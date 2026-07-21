@@ -125,9 +125,9 @@ CAPABILITY_AXES: tuple[CapabilityAxis, ...] = (
         "runtime conformance suite.",
         claude=_supported(
             "ClaudeRuntime adapts the Claude Agent SDK to AgentRuntime, passes the "
-            "runtime conformance suite, and is the default live path since the "
-            "#584 slice C-1 cutover (CCC_CLAUDE_RUNTIME_ADAPTER=0 is the "
-            "emergency kill-switch back to the legacy direct SDK path)."
+            "runtime conformance suite, and is the only Claude path since the "
+            "#584 slice C-2 cutover removed the legacy direct SDK path and its "
+            "kill-switch flag."
         ),
         codex=_supported(
             "CodexRuntime adapts the app-server protocol to AgentRuntime and passes "

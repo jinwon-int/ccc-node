@@ -33,7 +33,6 @@ from telegram_bot.utils.health_alerts import (
 class EvaluateAlertsTests(unittest.TestCase):
     def test_healthy_signals_fire_nothing(self):
         signals = HealthSignals(
-            active_streams=2,
             active_requests=1,
             oldest_request_age_seconds=100.0,
             request_lifetime_seconds=600.0,
@@ -43,7 +42,6 @@ class EvaluateAlertsTests(unittest.TestCase):
 
     def test_each_signal_crossing_fires_its_alert(self):
         cases = {
-            "dead_session_stream": HealthSignals(dead_streams=1),
             "request_outlived_lifetime": HealthSignals(
                 oldest_request_age_seconds=601.0, request_lifetime_seconds=600.0
             ),
@@ -83,7 +81,6 @@ class EvaluateAlertsTests(unittest.TestCase):
 
     def test_alert_messages_are_redaction_safe(self):
         signals = HealthSignals(
-            dead_streams=3,
             oldest_request_age_seconds=1000.0,
             request_lifetime_seconds=600.0,
             pending_notifications=25,
@@ -91,7 +88,7 @@ class EvaluateAlertsTests(unittest.TestCase):
             orphan_children=2,
         )
         fired = evaluate_alerts(signals, AlertThresholds())
-        self.assertEqual(len(fired), 5)
+        self.assertEqual(len(fired), 4)
         for alert in fired:
             # Constant templates + counts only: no filesystem paths, no secrets.
             self.assertNotRegex(alert.message, r"[/\\]")
@@ -138,13 +135,11 @@ class ProbeLoopHotSpinRegressionTests(unittest.IsolatedAsyncioTestCase):
                     health_alerts_interval_seconds=-1,
                     health_alerts_cooldown_seconds=1800.0,
                     alert_heartbeat_age_factor=1.0,
-                    alert_max_dead_streams=1,
                     alert_max_pending_notifications=10,
                     alert_max_orphan_children=1,
                     push_enabled=False,
                 )
                 self._project_chat = SimpleNamespace(
-                    _streams={},
                     workload_snapshot=lambda now: ticks.append(now) or (0, 0.0),
                     _process_timeout_seconds=600.0,
                 )
@@ -168,7 +163,7 @@ class ProbeLoopHotSpinRegressionTests(unittest.IsolatedAsyncioTestCase):
 class AlertGateTests(unittest.TestCase):
     def test_persistent_condition_alerts_once_per_cooldown(self):
         gate = AlertGate(cooldown_seconds=100.0)
-        alert = Alert(code="dead_session_stream", message="m")
+        alert = Alert(code="notification_backlog", message="m")
 
         self.assertEqual(gate.admit([alert], now=0.0), [alert])
         self.assertEqual(gate.admit([alert], now=50.0), [])
@@ -204,7 +199,7 @@ class SpoolTests(unittest.TestCase):
 
 
 class HealthProbeTests(unittest.IsolatedAsyncioTestCase):
-    async def test_collects_all_four_signal_groups_from_synthetic_state(self):
+    async def test_collects_all_signal_groups_from_synthetic_state(self):
         import tempfile
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -213,17 +208,7 @@ class HealthProbeTests(unittest.IsolatedAsyncioTestCase):
             (spool / "pending-1.json").write_text("{}", encoding="utf-8")
             (spool / "pending-2.json").write_text("{}", encoding="utf-8")
 
-            done_task = asyncio.create_task(asyncio.sleep(0))
-            await done_task
-            live_task = asyncio.create_task(asyncio.sleep(60))
-            self.addCleanup(live_task.cancel)
-
             handler = SimpleNamespace(
-                _streams={
-                    ("u1", 1): SimpleNamespace(reader_task=done_task),  # dead
-                    ("u2", 2): SimpleNamespace(reader_task=live_task),  # alive
-                    ("u3", 3): SimpleNamespace(reader_task=None),  # starting up
-                },
                 workload_snapshot=lambda now: (2, 750.0),
                 _process_timeout_seconds=600.0,
             )
@@ -236,8 +221,6 @@ class HealthProbeTests(unittest.IsolatedAsyncioTestCase):
 
             signals = probe.collect(now=1000.0)
 
-            self.assertEqual(signals.dead_streams, 1)
-            self.assertEqual(signals.active_streams, 2)
             self.assertEqual(signals.active_requests, 2)
             self.assertEqual(signals.oldest_request_age_seconds, 750.0)
             self.assertEqual(signals.request_lifetime_seconds, 600.0)
@@ -249,7 +232,6 @@ class HealthProbeTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(
                 sorted(a.code for a in fired),
                 [
-                    "dead_session_stream",
                     "notifications_dropped",
                     "orphan_claude_children",
                     "request_outlived_lifetime",
@@ -263,7 +245,7 @@ class HealthProbeTests(unittest.IsolatedAsyncioTestCase):
         def broken_orphans():
             raise RuntimeError("no /proc")
 
-        handler = SimpleNamespace(_streams=None)
+        handler = SimpleNamespace()
         probe = HealthProbe(
             project_chat=handler,
             spool_dir=Path("/nonexistent/spool"),
@@ -278,8 +260,6 @@ class HealthProbeTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_signals_export_shape_for_health_json(self):
         signals = HealthSignals(
-            active_streams=1,
-            dead_streams=0,
             active_requests=1,
             oldest_request_age_seconds=12.7,
             request_lifetime_seconds=600.0,
@@ -294,8 +274,6 @@ class HealthProbeTests(unittest.IsolatedAsyncioTestCase):
             sorted(data),
             [
                 "active_requests",
-                "active_streams",
-                "dead_streams",
                 "dropped_notifications",
                 "oldest_request_age_seconds",
                 "orphan_children",
@@ -314,16 +292,16 @@ class HealthReporterSignalsTests(unittest.TestCase):
         health_module = importlib.import_module("telegram_bot.utils.health")
         with tempfile.TemporaryDirectory() as tmp:
             reporter = health_module.RuntimeHealthReporter(Path(tmp) / ".telegram_bot")
-            signals = HealthSignals(dead_streams=1, orphan_children=2).as_dict()
+            signals = HealthSignals(pending_notifications=1, orphan_children=2).as_dict()
 
             reporter.record_health_signals(signals, alerts_fired=2)
             reporter.record_health_signals(
-                HealthSignals(dead_streams=0, orphan_children=0).as_dict(),
+                HealthSignals(pending_notifications=0, orphan_children=0).as_dict(),
                 alerts_fired=0,
             )
 
             snapshot = reporter.snapshot()["signals"]
-            self.assertEqual(snapshot["dead_streams"], 0)
+            self.assertEqual(snapshot["pending_notifications"], 0)
             self.assertEqual(snapshot["orphan_children"], 0)
             self.assertEqual(snapshot["alerts_fired"], 2)  # cumulative
             on_disk = json.loads(reporter.health_file.read_text(encoding="utf-8"))

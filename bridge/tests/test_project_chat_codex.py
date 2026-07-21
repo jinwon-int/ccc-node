@@ -8,7 +8,6 @@ import sys
 from collections.abc import AsyncIterator
 from pathlib import Path
 from types import SimpleNamespace
-from typing import cast
 
 import pytest
 from pydantic import ValidationError
@@ -200,36 +199,42 @@ def test_agent_provider_settings_default_and_reject_unknown(tmp_path: Path) -> N
         )
 
 
-def test_claude_accepts_injected_runtime_for_staged_cutover(tmp_path: Path) -> None:
-    # #584 slice B: Codex still REQUIRES an injected runtime; Claude ACCEPTS
-    # one (the CCC_CLAUDE_RUNTIME_ADAPTER flag path). Without an injected
-    # runtime the direct SDK path stays untouched.
+def test_claude_accepts_injected_runtime(tmp_path: Path) -> None:
+    # #584 slice C-2: every provider runs behind the AgentRuntime seam. Codex
+    # REQUIRES an injected runtime at construction; Claude accepts one (the
+    # composition root always injects ClaudeRuntime) and a runtime-less
+    # construction stays a unit-test convenience that fails fast on
+    # process_message via _require_runtime.
     runtime = FakeRuntime()
-    sdk_factory = object()
 
     handler = ProjectChatHandler(
         settings=_settings(tmp_path, provider="claude"),
-        sdk_client_factory=cast(object, sdk_factory),
         agent_runtime=runtime,
     )
 
-    assert handler._sdk_client_factory is sdk_factory
     assert handler._agent_runtime is runtime
 
-    direct = ProjectChatHandler(
-        settings=_settings(tmp_path, provider="claude"),
-        sdk_client_factory=cast(object, sdk_factory),
-    )
+    direct = ProjectChatHandler(settings=_settings(tmp_path, provider="claude"))
     assert direct._agent_runtime is None
+    with pytest.raises(RuntimeError, match="runtime is unavailable"):
+        asyncio_run_process_message(direct)
 
 
-def test_claude_flag_off_build_context_injects_no_runtime(tmp_path: Path) -> None:
-    # #584 slice C-1: the adapter is default ON, so flag-off is now the
-    # EXPLICIT emergency kill-switch (CCC_CLAUDE_RUNTIME_ADAPTER=0).
+def asyncio_run_process_message(handler: ProjectChatHandler) -> None:
+    import asyncio as _asyncio
+
+    _asyncio.run(handler.process_message("hello", user_id=1, chat_id=2))
+
+
+def test_claude_adapter_env_flag_is_a_harmless_noop(tmp_path: Path) -> None:
+    # #584 slice C-2 removed the legacy direct SDK path and its
+    # CCC_CLAUDE_RUNTIME_ADAPTER kill-switch. A node that still exports the
+    # old flag must keep composing the ClaudeRuntime adapter unchanged.
     settings_class = _real_settings_class()
     _reload_real_module("telegram_bot.utils.chat_logger")
     _reload_real_module("telegram_bot.utils.health")
     from telegram_bot.__main__ import build_context
+    from telegram_bot.core.claude_runtime import ClaudeRuntime
 
     settings = settings_class.load(
         project_root=tmp_path / "project",
@@ -241,19 +246,17 @@ def test_claude_flag_off_build_context_injects_no_runtime(tmp_path: Path) -> Non
         bot_env_file=tmp_path / "missing.env",
     )
     assert settings.agent_provider == "claude"
-    assert settings.claude_runtime_adapter is False
+    assert not hasattr(settings, "claude_runtime_adapter")
 
     context = build_context(settings, sdk_factory=object(), telegram_port=lambda: None)
 
-    # Kill-switch => legacy behavior: no runtime reaches ProjectChat and
-    # process_message keeps dispatching to the direct Claude SDK path.
-    assert context.agent_runtime is None
-    assert context.project_chat._agent_runtime is None
+    assert isinstance(context.agent_runtime, ClaudeRuntime)
+    assert context.project_chat._agent_runtime is context.agent_runtime
 
 
 def test_claude_default_build_context_injects_claude_runtime(tmp_path: Path) -> None:
-    # #584 slice C-1: with no flag in the environment the DEFAULT path now
-    # routes the Claude provider through the ClaudeRuntime adapter.
+    # #584: the Claude provider always routes through the ClaudeRuntime
+    # adapter; build_context forwards the injectable SDK client factory to it.
     settings_class = _real_settings_class()
     _reload_real_module("telegram_bot.utils.chat_logger")
     _reload_real_module("telegram_bot.utils.health")
@@ -269,11 +272,11 @@ def test_claude_default_build_context_injects_claude_runtime(tmp_path: Path) -> 
         },
         bot_env_file=tmp_path / "missing.env",
     )
-    assert settings.claude_runtime_adapter is True
-
-    context = build_context(settings, sdk_factory=object(), telegram_port=lambda: None)
+    sdk_factory = object()
+    context = build_context(settings, sdk_factory=sdk_factory, telegram_port=lambda: None)
 
     assert isinstance(context.agent_runtime, ClaudeRuntime)
+    assert context.agent_runtime._sdk_client_factory is sdk_factory
     assert context.project_chat._agent_runtime is context.agent_runtime
     # Transcripts browsing resolves exactly like the direct path's
     # ProjectChatHandler.conversations_dir (~/.claude/projects/<project-dir>).
@@ -286,7 +289,7 @@ def test_claude_default_build_context_injects_claude_runtime(tmp_path: Path) -> 
     assert context.agent_runtime._transcripts_dir == expected_dir
     assert context.project_chat.conversations_dir == expected_dir
 
-    # An explicitly injected runtime is still respected under the flag.
+    # An explicitly injected runtime is still respected.
     injected = FakeRuntime()
     override = build_context(
         settings,
@@ -555,7 +558,7 @@ def test_codex_composition_injects_runtime_without_replacing_sdk_factory(tmp_pat
 
     assert context.agent_runtime is runtime
     assert context.project_chat._agent_runtime is runtime
-    assert context.project_chat._sdk_client_factory is sdk_factory
+    assert context.sdk_factory is sdk_factory
 
 
 def test_codex_composition_wires_memory_bootstrap_settings(

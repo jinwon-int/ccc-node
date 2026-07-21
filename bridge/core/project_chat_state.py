@@ -4,10 +4,7 @@
 
 import asyncio
 import logging
-from typing import List, Optional
-
-from telegram_bot.core.project_chat_types import _UserStreamState
-from telegram_bot.core.sdk_text import TASK_TERMINATED_NOTICE
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -62,89 +59,49 @@ class ProjectChatStateMixin:
         return await self._require_runtime().list_models()
 
     async def stop(self, user_id: int, chat_id: Optional[int] = None) -> bool:
-        """Stop active stream(s) for a user and fail pending requests.
-
-        The default notice is upgraded to a specific reason by
-        ``_disconnect_stream_state`` when a recent SDK/stream error (usage limit,
-        auth, network) is what actually caused the stop.
-        """
-        if self._agent_runtime is not None:
-            sessions = self._active_agent_sessions_for_user(user_id, chat_id)
-            self.invalidate_agent_approvals(user_id, chat_id)
-            await asyncio.gather(
-                *(self._interrupt_agent_session(session) for session in sessions)
-            )
-            for key in self._agent_keys_for_user(user_id, chat_id):
-                if self._agent_active_sessions.get(key) in sessions:
-                    self._agent_active_sessions.pop(key, None)
-                    self._agent_started_at.pop(key, None)
-            return bool(sessions)
-        return await self._disconnect_user_stream(
-            user_id, chat_id=chat_id, cancel_message=TASK_TERMINATED_NOTICE
+        """Interrupt the active agent session(s) for a user/conversation."""
+        sessions = self._active_agent_sessions_for_user(user_id, chat_id)
+        self.invalidate_agent_approvals(user_id, chat_id)
+        await asyncio.gather(
+            *(self._interrupt_agent_session(session) for session in sessions)
         )
-    def _states_for_user(self, user_id: int, chat_id: Optional[int] = None) -> List[_UserStreamState]:
-        if chat_id is not None:
-            state = self._streams.get(self._stream_key(user_id, chat_id))
-            return [state] if state else []
-        return [
-            state
-            for key, state in self._streams.items()
-            if (key[0] if isinstance(key, tuple) else key) == user_id
-        ]
+        for key in self._agent_keys_for_user(user_id, chat_id):
+            if self._agent_active_sessions.get(key) in sessions:
+                self._agent_active_sessions.pop(key, None)
+                self._agent_started_at.pop(key, None)
+        return bool(sessions)
+
     async def cancel_user_streaming(self, user_id: int, chat_id: Optional[int] = None) -> bool:
-        """Cancel streaming drafts for one Telegram conversation, or all user conversations."""
-        states = self._states_for_user(user_id, chat_id)
-        if not states:
-            return False
+        """Compatibility no-op retained for the bot layer (#584 slice C-2).
 
-        cancelled = False
-        for state in states:
-            if not state.pending:
-                continue
-            for req in state.pending:
-                if req.streaming_handler:
-                    try:
-                        await req.streaming_handler.cancel()
-                        cancelled = True
-                    except Exception as e:
-                        logger.error(f"Failed to cancel streaming for user {user_id}: {e}")
+        On the runtime path streaming drafts are cancelled by the turn's own
+        cancellation handling (``_cancel_agent_streaming`` when the awaiting
+        task is cancelled); there is no request FIFO to sweep here anymore.
+        """
+        del user_id, chat_id
+        return False
 
-        return cancelled
     def inflight_count(self, user_id: int, chat_id: Optional[int] = None) -> int:
-        if self._agent_runtime is not None:
-            return len(self._active_agent_sessions_for_user(user_id, chat_id))
-        return sum(len(state.pending) for state in self._states_for_user(user_id, chat_id))
+        return len(self._active_agent_sessions_for_user(user_id, chat_id))
+
     def is_user_busy(self, user_id: int, chat_id: Optional[int] = None) -> bool:
         return self.inflight_count(user_id, chat_id) > 0
-    async def clear_user_stream(self, user_id: int, chat_id: Optional[int] = None) -> None:
-        """Clear active stream(s) for a user to force a new SDK connection (used by /revert).
 
-        Cancels pending request futures first (revert relies on cancellation
-        semantics, not a 'terminated' result), then delegates to the full
-        teardown which cancels AND awaits the reader/typing tasks with timeouts
-        and awaits ``client.disconnect()``. The old implementation fire-and-forgot
-        ``asyncio.create_task(close_fn())`` — an unreferenced task that could be
-        garbage-collected mid-flight, and ``close`` often did not exist on the
-        client (the real method is ``disconnect``), leaking the SDK subprocess.
-        """
-        if self._agent_runtime is not None:
-            await self.stop(user_id, chat_id)
-            for key in self._agent_keys_for_user(user_id, chat_id):
-                self._drop_agent_session(key)
-            return
-        for state in self._states_for_user(user_id, chat_id):
-            for req in list(state.pending):
-                if req.future and not req.future.done():
-                    req.future.cancel()
-        await self._disconnect_user_stream(user_id, chat_id)
-        logger.info(f"Cleared stream for user {user_id} chat {chat_id or '*'}")
+    async def clear_user_stream(self, user_id: int, chat_id: Optional[int] = None) -> None:
+        """Interrupt and evict agent session(s) so the next turn starts fresh
+        (used by /revert)."""
+        await self.stop(user_id, chat_id)
+        for key in self._agent_keys_for_user(user_id, chat_id):
+            self._drop_agent_session(key)
+
     def clear_pending_permissions(self, user_id: int, chat_id: Optional[int] = None) -> None:
-        """Clear pending permission futures for a user."""
-        for state in self._states_for_user(user_id, chat_id):
-            for req in list(state.pending):
-                if req.future and not req.future.done():
-                    req.future.cancel()
-            logger.info(f"Cleared pending permissions for user {user_id} chat {chat_id or '*'}")
+        """Compatibility no-op retained for the bot layer (#584 slice C-2).
+
+        Legacy per-request permission futures lived on the removed direct SDK
+        path's pending FIFO; runtime-path approvals are invalidated through
+        ``invalidate_agent_approvals`` generations instead.
+        """
+        del user_id, chat_id
 
     def _drop_agent_session(self, key, session=None) -> None:
         """Evict the cached agent-session entry for ``key``.

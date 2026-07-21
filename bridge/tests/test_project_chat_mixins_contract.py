@@ -38,7 +38,7 @@ sdk_module.PermissionResultDeny = type("PermissionResultDeny", (), {})
 sdk_module.__path__ = []
 sys.modules["claude_agent_sdk"] = sdk_module
 
-# Complete the stub set (as test_project_chat_serialization does): tool_policy
+# Complete the stub set: tool_policy
 # imports claude_agent_sdk.types, so a solo run of this module must not depend
 # on a sibling test having imported the real SDK first.
 sdk_types_module = types.ModuleType("claude_agent_sdk.types")
@@ -76,14 +76,11 @@ for name in [
     "telegram_bot.core.project_chat",
     "telegram_bot.core.project_chat_history",
     "telegram_bot.core.project_chat_process",
-    "telegram_bot.core.project_chat_reader",
     "telegram_bot.core.project_chat_state",
 ]:
     sys.modules.pop(name, None)
 
 project_chat = importlib.import_module("telegram_bot.core.project_chat")
-project_chat_process = importlib.import_module("telegram_bot.core.project_chat_process")
-project_chat_reader = importlib.import_module("telegram_bot.core.project_chat_reader")
 
 _sys_modules_guard.finish()
 
@@ -98,10 +95,8 @@ class ProjectChatMixinContractTests(unittest.TestCase):
     def test_project_chat_handler_exposes_moved_private_api(self):
         handler = project_chat.ProjectChatHandler()
         moved_methods = [
-            "_reader_loop",
             "process_message",
             "stop",
-            "_states_for_user",
             "cancel_user_streaming",
             "inflight_count",
             "is_user_busy",
@@ -117,18 +112,6 @@ class ProjectChatMixinContractTests(unittest.TestCase):
         for method_name in moved_methods:
             with self.subTest(method_name=method_name):
                 self.assertTrue(callable(getattr(handler, method_name, None)))
-
-    def test_mixin_helpers_read_compat_constants_at_call_time(self):
-        original_typing = project_chat.TYPING_INTERVAL
-        original_timeout = project_chat.PROCESS_TIMEOUT
-        try:
-            project_chat.TYPING_INTERVAL = 0.123
-            project_chat.PROCESS_TIMEOUT = 456
-            self.assertEqual(project_chat_reader._typing_interval(), 0.123)
-            self.assertEqual(project_chat_process._process_timeout(), 456)
-        finally:
-            project_chat.TYPING_INTERVAL = original_typing
-            project_chat.PROCESS_TIMEOUT = original_timeout
 
     def test_history_helpers_use_handler_conversations_dir(self):
         with tempfile.TemporaryDirectory() as tmp:

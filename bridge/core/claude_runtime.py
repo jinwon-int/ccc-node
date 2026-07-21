@@ -1,12 +1,12 @@
-"""Provider-neutral runtime adapter for the Claude Agent SDK (#584 slice A).
+"""Provider-neutral runtime adapter for the Claude Agent SDK (#584 P3-1).
 
 ``ClaudeRuntime`` implements the ``AgentRuntime`` protocol from
-``core.agent_runtime`` on top of ``ClaudeSDKClient``.  It is additive: the
-live Telegram path still runs through ``project_chat`` and switches to this
-adapter only at the flagged cutover.  The SDK-frame -> event translation
-mirrors the semantics of ``project_chat_reader._reader_loop`` (text deltas,
-message boundaries, tool lifecycle, terminal results) re-expressed as the
-normalized ``AgentEvent`` stream that the runtime conformance suite pins.
+``core.agent_runtime`` on top of ``ClaudeSDKClient`` and has been the only
+Claude path since the #584 slice C-2 cutover removed the legacy direct SDK
+stream path.  The SDK-frame -> event translation carries the legacy reader
+loop's semantics (text deltas, message boundaries, tool lifecycle, terminal
+results) re-expressed as the normalized ``AgentEvent`` stream that the
+runtime conformance suite pins.
 """
 
 from __future__ import annotations
@@ -108,10 +108,9 @@ class SdkClient(Protocol):
 
 SdkClientFactory = Callable[[ClaudeAgentOptions], SdkClient]
 
-# Optional seam mirroring the direct path's ``UnsolicitedCallback``
-# (project_chat_types): async (text, session_id) -> None. Delivers assistant
-# output produced outside any ``send_turn`` (for example the CLI autonomously
-# continuing after a harness background-task notification).
+# Between-turns delivery seam: async (text, session_id) -> None. Delivers
+# assistant output produced outside any ``send_turn`` (for example the CLI
+# autonomously continuing after a harness background-task notification).
 UnsolicitedHandler = Callable[[str, "str | None"], Awaitable[None]]
 
 # Optional observation-only seam (#584 C-1 follow-up): a synchronous callback
@@ -158,8 +157,8 @@ class ClaudeSession:
         self._active_turn: _ActiveTurn | None = None
         self._approval_counter = 0
         self._closed = False
-        # Between-turns ("unsolicited") frame state, mirroring the direct
-        # path's ``_UserStreamState`` machinery (project_chat_reader):
+        # Between-turns ("unsolicited") frame state (inherited from the
+        # retired direct path's stream-state machinery):
         #   * handler — optional delivery route; absent = frames are dropped
         #     exactly as before this seam existed.
         #   * inflight — once a turn-bearing frame arrives without an active
@@ -380,7 +379,7 @@ class ClaudeSession:
             self._session_ready.set()
 
     async def _handle_unsolicited_frame(self, message: Message) -> None:
-        """Consume one between-turns SDK frame (direct-path unsolicited mirror).
+        """Consume one between-turns ("unsolicited") SDK frame.
 
         Assistant text is buffered until its terminal ResultMessage so the
         registered handler receives one complete message per autonomous turn,

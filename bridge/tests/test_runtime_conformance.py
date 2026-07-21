@@ -29,7 +29,7 @@ import uuid
 def _purge_injected_sdk_stubs() -> None:
     """Drop spec-less ``claude_agent_sdk`` stubs left by earlier test modules.
 
-    ``test_project_chat_mixins_contract`` and ``test_project_chat_serialization``
+    ``test_project_chat_mixins_contract`` (and similar sibling modules)
     replace ``sys.modules["claude_agent_sdk"]`` with bare stub modules at import
     time and never restore the real package. This module drives the real
     ``ClaudeRuntime`` over real SDK frame types, so remove stub entries (plain

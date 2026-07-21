@@ -206,13 +206,11 @@ def _wakeup_state(record: Any, session_id: str) -> tuple[int, Optional[datetime]
 
 
 def _live_agent_session_owned(handler: Any, user_id: int, chat_id: int) -> bool:
-    """True when the adapter path holds a live session for this conversation.
+    """True when the runtime path holds a live session for this conversation.
 
-    ``_live_stream_owned`` (recovery scanner) covers only the legacy direct
-    ``_streams`` path; on the now-default ClaudeRuntime adapter path a live
-    CLI process is tracked in ``_agent_sessions`` / ``_agent_active_sessions``
-    and will process its own notifications between turns (#601), so waking it
-    from here would double-process.
+    A live CLI process is tracked in ``_agent_sessions`` /
+    ``_agent_active_sessions`` and will process its own notifications between
+    turns (#601), so waking it from here would double-process.
     """
     route = getattr(handler, "_stream_key", None)
     key = route(user_id, chat_id) if callable(route) else (user_id, chat_id)
@@ -222,11 +220,7 @@ def _live_agent_session_owned(handler: Any, user_id: int, chat_id: int) -> bool:
 
 
 def _live_conversation(handler: Any, user_id: int, chat_id: int) -> bool:
-    from telegram_bot.core.dead_session_recovery import _live_stream_owned
-
-    return _live_stream_owned(handler, user_id, chat_id) or _live_agent_session_owned(
-        handler, user_id, chat_id
-    )
+    return _live_agent_session_owned(handler, user_id, chat_id)
 
 
 def recovery_should_defer_to_wakeup(
