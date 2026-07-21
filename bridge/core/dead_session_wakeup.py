@@ -55,13 +55,14 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import logging
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Mapping, Optional
 
 from telegram_bot.core.dead_session_recovery import (
     DEFAULT_LOCK_TIMEOUT,
     DEFAULT_MAX_SESSIONS,
     DEFAULT_SEND_TIMEOUT,
     QUARANTINE_KEY,
+    TranscriptQueueReplay,
     TranscriptRejected,
     _safe_transcript_path,
     _task_notification,
@@ -157,7 +158,11 @@ def find_unconsumed_notifications(
     Raises ``TranscriptRejected`` when the transcript fails the shared safety
     validation; returns ``None`` when nothing qualifies.
     """
-    replay = replay_transcript_queue(Path(path), session_id)
+    return unconsumed_candidate(replay_transcript_queue(Path(path), session_id))
+
+
+def unconsumed_candidate(replay: TranscriptQueueReplay) -> Optional[WakeupCandidate]:
+    """Apply the unconsumed-notification rule to one already-replayed FIFO."""
     last_assistant = _parse_timestamp(replay.last_assistant_timestamp)
     newest: Optional[datetime] = None
     count = 0
@@ -222,6 +227,67 @@ def _live_conversation(handler: Any, user_id: int, chat_id: int) -> bool:
     return _live_stream_owned(handler, user_id, chat_id) or _live_agent_session_owned(
         handler, user_id, chat_id
     )
+
+
+def recovery_should_defer_to_wakeup(
+    project_handler: Any,
+    current: Mapping[str, Any],
+    session_id: str,
+    replay: TranscriptQueueReplay,
+    user_id: int,
+    chat_id: int,
+    *,
+    usage_meter: Any = None,
+    max_attempts_per_session: int = DEFAULT_MAX_ATTEMPTS_PER_SESSION,
+) -> bool:
+    """Should the P1 recovery raw replay defer to this wakeup feature? (#620)
+
+    Wakeup-first with fallback: the recovery scanner calls this (only when
+    ``CCC_DEAD_SESSION_WAKEUP`` is on) before raw-replaying a conversation's
+    pending notifications, and skips the raw replay for that scan when the
+    wakeup can still claim them itself — otherwise one stranded notification
+    produces two user-facing messages (raw replay + autonomous report).
+
+    True only while every claim precondition holds: resume is allowed, no
+    live agent session owns the conversation, wakeup attempts remain for this
+    session, the #388 autonomous budget permits the turn, and the replayed
+    FIFO actually contains an unconsumed candidate under the wakeup detection
+    rule. Every False answer keeps recovery's raw replay as the fail-safe
+    fallback, so a notification can never become permanently undelivered:
+    budget-blocked, attempts-exhausted (a failed wakeup turn consumes its
+    attempt *before* running), or non-claimable conversations deliver raw
+    exactly as before this feature existed.
+
+    The cooldown window alone is deliberately NOT a fallback trigger:
+    attempts remain and the wakeup will claim the notification once the
+    cooldown expires, so recovery keeps deferring — bounded by the attempts
+    cap, which durably increments before every wakeup turn.
+
+    Quarantine needs no gate here: recovery only reaches its deferral point
+    after the transcript parsed safely, having already lifted (and persisted)
+    any stale quarantine record — and it disables deferral itself when that
+    lift fails to persist.
+    """
+    if not resume_persisted_enabled():
+        return False
+    if _live_agent_session_owned(project_handler, user_id, chat_id):
+        # The wakeup scan skips live conversations, so it would never claim
+        # this one; keep recovery's behavior for live-adapter sessions as it
+        # was before #620.
+        return False
+    attempts, _ = _wakeup_state(current.get(WAKEUP_STATE_KEY), session_id)
+    if attempts >= max_attempts_per_session:
+        return False
+    if usage_meter is not None:
+        # Mirror the wakeup's #388 gate, which fails closed on a meter error:
+        # a wakeup that will not spend must not be deferred to.
+        try:
+            decision = usage_meter.check_autonomous_spend("claude")
+        except Exception:
+            return False
+        if not decision.allowed:
+            return False
+    return unconsumed_candidate(replay) is not None
 
 
 def _conversation_route(

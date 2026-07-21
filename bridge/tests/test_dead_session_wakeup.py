@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import tempfile
 import unittest
 from collections.abc import AsyncIterator
@@ -26,7 +27,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Optional
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 from telegram_bot.core.agent_runtime import (
     AgentEvent,
@@ -37,12 +38,17 @@ from telegram_bot.core.agent_runtime import (
     TextDeltaEvent,
     deny_approval,
 )
-from telegram_bot.core.dead_session_recovery import QUARANTINE_KEY
+from telegram_bot.core.dead_session_recovery import (
+    MARKER_KEY,
+    QUARANTINE_KEY,
+    recover_dead_session_notifications,
+)
 from telegram_bot.core.dead_session_wakeup import (
     WAKEUP_NUDGE,
     WAKEUP_STATE_KEY,
     TranscriptRejected,
     find_unconsumed_notifications,
+    recovery_should_defer_to_wakeup,
     run_dead_session_wakeup_scan,
 )
 from telegram_bot.core.project_chat import ProjectChatHandler
@@ -479,6 +485,274 @@ class WakeupScanTests(unittest.TestCase):
         stats = self._scan(handler, manager, max_wakeups_per_scan=1)
         self.assertEqual(stats.triggered, 1)
         self.assertEqual(len(handler.calls), 1)
+
+
+class RecoveryWakeupDedupTests(unittest.TestCase):
+    """#620 wakeup-first hand-off: recovery defers, wakeup claims, fallback.
+
+    One stranded notification must produce exactly one user-facing message:
+    the wakeup's autonomous report when the wakeup can claim it, or the P1
+    raw replay whenever the wakeup is off, skipped, exhausted, or fails —
+    never both, and never neither.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.conversations_dir = Path(self.tmp.name)
+        self.transcript = self.conversations_dir / f"{SESSION}.jsonl"
+        self.transcript.write_text(
+            _assistant_row(T0) + _queue_row("enqueue", T1, content=_task()),
+            encoding="utf-8",
+        )
+        self.bot = _FakeBot()
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def _defer(
+        self,
+        handler: Any,
+        usage_meter: Any = None,
+        max_attempts_per_session: int = 2,
+    ):
+        """Mirror bot_lifecycle._build_dead_session_wakeup_defer's closure."""
+
+        def wakeup_defer(current, session_id, replay, user_id, chat_id) -> bool:
+            return recovery_should_defer_to_wakeup(
+                handler,
+                current,
+                session_id,
+                replay,
+                user_id,
+                chat_id,
+                usage_meter=usage_meter,
+                max_attempts_per_session=max_attempts_per_session,
+            )
+
+        return wakeup_defer
+
+    async def _recover(self, handler: Any, manager: Any, wakeup_defer: Any = None):
+        return await recover_dead_session_notifications(
+            self.bot, manager, handler, self.conversations_dir, wakeup_defer=wakeup_defer
+        )
+
+    def _raw_replay_text(self) -> str:
+        return self.bot.send_message.await_args.kwargs["text"]
+
+    def test_flag_on_eligible_recovery_defers_and_wakeup_claims(self) -> None:
+        handler = _FakeHandler()
+        manager = _FakeSessionManager({"7": _session_record()})
+        defer = self._defer(handler)
+
+        async def scenario() -> None:
+            # Tick N: recovery defers the raw replay instead of delivering.
+            first = await self._recover(handler, manager, defer)
+            self.assertEqual(first.scanned, 1)
+            self.assertEqual(first.deferred_wakeup, 1)
+            self.assertEqual(first.delivered, 0)
+            self.bot.send_message.assert_not_awaited()
+            # Deferral consumes nothing: no delivery marker was written.
+            self.assertNotIn(MARKER_KEY, manager.sessions["7"])
+
+            # Same tick, after the recovery scan: the wakeup claims it.
+            wakeup = await run_dead_session_wakeup_scan(
+                self.bot,
+                manager,
+                handler,
+                self.conversations_dir,
+                enabled=True,
+                now=lambda: NOW,
+            )
+            self.assertEqual(wakeup.triggered, 1)
+            self.assertEqual(wakeup.delivered, 1)
+
+            # The resumed CLI turn dequeues the injected notification and
+            # appends its assistant reply (contract pinned by
+            # DetectionRuleTests.test_dequeued_notification_is_consumed and
+            # TranscriptRecoveryParserTests); simulate those transcript rows.
+            with self.transcript.open("a", encoding="utf-8") as stream:
+                stream.write(_queue_row("dequeue", T2))
+                stream.write(_assistant_row(T2))
+
+            # Tick N+1: recovery finds nothing left — no raw replay, ever.
+            second = await self._recover(handler, manager, defer)
+            self.assertEqual(second.scanned, 1)
+            self.assertEqual((second.delivered, second.deferred_wakeup), (0, 0))
+            self.bot.send_message.assert_awaited_once_with(
+                chat_id=7, text="wakeup report"
+            )
+
+        asyncio.run(scenario())
+
+    def test_flag_off_default_keeps_raw_replay_unchanged(self) -> None:
+        handler = _FakeHandler()
+        manager = _FakeSessionManager({"7": _session_record()})
+
+        async def scenario() -> None:
+            stats = await self._recover(handler, manager, wakeup_defer=None)
+            self.assertEqual((stats.delivered, stats.deferred_wakeup), (1, 0))
+            self.assertEqual(handler.calls, [])
+            self.bot.send_message.assert_awaited_once()
+            self.assertTrue(
+                self._raw_replay_text().startswith("✅ Background task completed")
+            )
+
+        asyncio.run(scenario())
+
+    def test_budget_blocked_wakeup_falls_back_to_raw_delivery(self) -> None:
+        handler = _FakeHandler()
+        manager = _FakeSessionManager({"7": _session_record()})
+        meter = _BlockedMeter()
+        defer = self._defer(handler, usage_meter=meter)
+
+        async def scenario() -> None:
+            stats = await self._recover(handler, manager, defer)
+            self.assertEqual((stats.delivered, stats.deferred_wakeup), (1, 0))
+            self.assertTrue(
+                self._raw_replay_text().startswith("✅ Background task completed")
+            )
+            # The wakeup scan refuses the same conversation: exactly one
+            # user-facing message in total.
+            wakeup = await run_dead_session_wakeup_scan(
+                self.bot,
+                manager,
+                handler,
+                self.conversations_dir,
+                enabled=True,
+                usage_meter=meter,
+                now=lambda: NOW,
+            )
+            self.assertEqual(wakeup.skipped_budget, 1)
+            self.assertEqual(handler.calls, [])
+            self.assertEqual(self.bot.send_message.await_count, 1)
+
+        asyncio.run(scenario())
+
+    def test_exhausted_wakeup_attempts_fall_back_to_raw_delivery(self) -> None:
+        handler = _FakeHandler()
+        manager = _FakeSessionManager(
+            {
+                "7": _session_record(
+                    **{
+                        WAKEUP_STATE_KEY: {
+                            "session_id": SESSION,
+                            "attempts": 2,
+                            "last_attempt_at": T0,
+                        }
+                    }
+                )
+            }
+        )
+        defer = self._defer(handler, max_attempts_per_session=2)
+
+        async def scenario() -> None:
+            stats = await self._recover(handler, manager, defer)
+            self.assertEqual((stats.delivered, stats.deferred_wakeup), (1, 0))
+            self.assertTrue(
+                self._raw_replay_text().startswith("✅ Background task completed")
+            )
+
+        asyncio.run(scenario())
+
+    def test_failed_wakeup_turn_falls_back_to_raw_delivery_on_a_later_tick(self) -> None:
+        handler = _FakeHandler(response=RuntimeError("wakeup turn died"))
+        manager = _FakeSessionManager({"7": _session_record()})
+        defer = self._defer(handler, max_attempts_per_session=1)
+
+        async def scenario() -> None:
+            # Tick N: deferred, then the wakeup claims (attempt persisted
+            # durably before the turn) and the turn fails.
+            first = await self._recover(handler, manager, defer)
+            self.assertEqual((first.deferred_wakeup, first.delivered), (1, 0))
+            wakeup = await run_dead_session_wakeup_scan(
+                self.bot,
+                manager,
+                handler,
+                self.conversations_dir,
+                enabled=True,
+                max_attempts_per_session=1,
+                now=lambda: NOW,
+            )
+            self.assertEqual(wakeup.failed, 1)
+            self.assertEqual(wakeup.delivered, 0)
+
+            # Tick N+1: attempts exhausted -> recovery stops deferring and
+            # delivers the raw replay. Exactly one user-facing message.
+            second = await self._recover(handler, manager, defer)
+            self.assertEqual((second.deferred_wakeup, second.delivered), (0, 1))
+            self.bot.send_message.assert_awaited_once()
+            self.assertTrue(
+                self._raw_replay_text().startswith("✅ Background task completed")
+            )
+
+        asyncio.run(scenario())
+
+    def test_cooldown_alone_keeps_deferring_while_attempts_remain(self) -> None:
+        # A cooldown only delays the wakeup's next claim; attempts remain, so
+        # recovery keeps deferring instead of racing in a raw replay.
+        handler = _FakeHandler()
+        recent = NOW.isoformat().replace("+00:00", "Z")
+        manager = _FakeSessionManager(
+            {
+                "7": _session_record(
+                    **{
+                        WAKEUP_STATE_KEY: {
+                            "session_id": SESSION,
+                            "attempts": 1,
+                            "last_attempt_at": recent,
+                        }
+                    }
+                )
+            }
+        )
+        defer = self._defer(handler, max_attempts_per_session=2)
+
+        async def scenario() -> None:
+            stats = await self._recover(handler, manager, defer)
+            self.assertEqual((stats.deferred_wakeup, stats.delivered), (1, 0))
+            self.bot.send_message.assert_not_awaited()
+
+        asyncio.run(scenario())
+
+    def test_resume_disabled_falls_back_to_raw_delivery(self) -> None:
+        handler = _FakeHandler()
+        manager = _FakeSessionManager({"7": _session_record()})
+        defer = self._defer(handler)
+
+        async def scenario() -> None:
+            with patch.dict(os.environ, {"CCC_RESUME_PERSISTED_SESSIONS": "false"}):
+                stats = await self._recover(handler, manager, defer)
+            self.assertEqual((stats.delivered, stats.deferred_wakeup), (1, 0))
+
+        asyncio.run(scenario())
+
+    def test_live_agent_session_falls_back_to_raw_delivery(self) -> None:
+        # The wakeup never wakes a live adapter conversation, so recovery must
+        # not defer to it either — pre-#620 behavior is preserved.
+        handler = _FakeHandler()
+        handler._agent_sessions[(7, 7)] = object()
+        manager = _FakeSessionManager({"7": _session_record()})
+        defer = self._defer(handler)
+
+        async def scenario() -> None:
+            stats = await self._recover(handler, manager, defer)
+            self.assertEqual((stats.delivered, stats.deferred_wakeup), (1, 0))
+
+        asyncio.run(scenario())
+
+    def test_deferral_predicate_error_fails_safe_to_raw_delivery(self) -> None:
+        handler = _FakeHandler()
+        manager = _FakeSessionManager({"7": _session_record()})
+
+        def broken(current, session_id, replay, user_id, chat_id) -> bool:
+            raise RuntimeError("predicate exploded")
+
+        async def scenario() -> None:
+            stats = await self._recover(handler, manager, broken)
+            self.assertEqual((stats.delivered, stats.deferred_wakeup), (1, 0))
+            self.bot.send_message.assert_awaited_once()
+
+        asyncio.run(scenario())
 
 
 class _MeterRecorder:
