@@ -31,7 +31,10 @@ from telegram_bot.core.dead_session_recovery import (
     recover_dead_session_notifications,
     run_periodic_dead_session_recovery,
 )
-from telegram_bot.core.dead_session_wakeup import run_dead_session_wakeup_scan
+from telegram_bot.core.dead_session_wakeup import (
+    recovery_should_defer_to_wakeup,
+    run_dead_session_wakeup_scan,
+)
 from telegram_bot.utils.heartbeat_store import drain_heartbeats, store_path_for
 from telegram_bot.utils.orphan_reaper import (
     run_periodic_reaper,
@@ -102,12 +105,14 @@ class BotLifecycleMixin:
             self._project_chat.conversations_dir,
             max_delivery_attempts_per_scan=3,
             send_timeout=5.0,
+            wakeup_defer=self._build_dead_session_wakeup_defer(),
         )
         self._record_recovery_stats(stats)
-        if stats.delivered or stats.failed or stats.rejected:
+        if stats.delivered or stats.failed or stats.rejected or stats.deferred_wakeup:
             logger.info(
                 "Dead-session recovery: scanned=%d delivered=%d duplicate=%d failed=%d "
-                "rejected=%d quarantined=%d quarantine_skipped=%d active=%d locked=%d",
+                "rejected=%d quarantined=%d quarantine_skipped=%d deferred_wakeup=%d "
+                "active=%d locked=%d",
                 stats.scanned,
                 stats.delivered,
                 stats.duplicate,
@@ -115,6 +120,7 @@ class BotLifecycleMixin:
                 stats.rejected,
                 stats.quarantined,
                 stats.quarantine_skipped,
+                stats.deferred_wakeup,
                 stats.skipped_active,
                 stats.skipped_locked,
             )
@@ -852,7 +858,33 @@ class BotLifecycleMixin:
             stop_event,
             on_stats=self._record_recovery_stats,
             wakeup_tick=self._build_dead_session_wakeup_tick(),
+            wakeup_defer=self._build_dead_session_wakeup_defer(),
         )
+
+    def _build_dead_session_wakeup_defer(self):
+        """Per-scan recovery→wakeup deferral predicate (#620); None when opted out.
+
+        With ``CCC_DEAD_SESSION_WAKEUP`` off (the default) this returns None
+        and both the startup and periodic recovery scans behave exactly as
+        before. With the flag on, recovery skips the raw replay for
+        conversations the wakeup can still claim (wakeup-first), and delivers
+        raw as before whenever the wakeup cannot (fallback).
+        """
+        if not bool(getattr(self._config, "dead_session_wakeup", False)):
+            return None
+
+        def wakeup_defer(current, session_id, replay, user_id, chat_id) -> bool:
+            return recovery_should_defer_to_wakeup(
+                self._project_chat,
+                current,
+                session_id,
+                replay,
+                user_id,
+                chat_id,
+                usage_meter=getattr(self._project_chat, "usage_meter", None),
+            )
+
+        return wakeup_defer
 
     def _build_dead_session_wakeup_tick(self):
         """Per-tick dead-session wakeup runner (#364 P2); None when opted out.

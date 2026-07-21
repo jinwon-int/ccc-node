@@ -103,6 +103,11 @@ class RecoveryStats:
     #: ``quarantined`` so the every-event health metric stays continuous (#423).
     hard_quarantined: int = 0
     quarantine_skipped: int = 0
+    #: Conversations whose raw replay was handed off to the #620 wakeup-first
+    #: flow this scan (opt-in wakeup on + the wakeup can still claim them).
+    #: The notifications stay pending in the transcript FIFO, so a wakeup
+    #: that never consumes them falls back to raw delivery on a later scan.
+    deferred_wakeup: int = 0
 
 
 def recovery_enabled(environ: Optional[Mapping[str, str]] = None) -> bool:
@@ -679,6 +684,33 @@ async def _quarantine_transcript(
     return consumed
 
 
+def _wakeup_claims(
+    wakeup_defer: Any,
+    current: Mapping[str, Any],
+    session_id: str,
+    replay: TranscriptQueueReplay,
+    user_id: int,
+    chat_id: int,
+    storage_key: Any,
+) -> bool:
+    """Fail-safe wrapper around the #620 wakeup-first deferral predicate.
+
+    A predicate failure gives no evidence the wakeup will actually claim the
+    notifications, so the only safe answer is False: deliver the raw replay
+    now rather than risk a permanently undelivered notification.
+    """
+    try:
+        return bool(wakeup_defer(current, session_id, replay, user_id, chat_id))
+    except Exception as error:
+        logger.warning(
+            "Dead-session wakeup deferral check failed for conversation %s: %s; "
+            "delivering raw replay",
+            storage_key,
+            type(error).__name__,
+        )
+        return False
+
+
 async def recover_dead_session_notifications(  # noqa: C901 -- #348 baseline hotspot
     bot: Any,
     session_manager: Any,
@@ -694,8 +726,20 @@ async def recover_dead_session_notifications(  # noqa: C901 -- #348 baseline hot
     max_rejects: int = DEFAULT_MAX_TRANSCRIPT_REJECTS,
     root_retry_attempts: int = DEFAULT_ROOT_RETRY_ATTEMPTS,
     root_retry_backoff_seconds: float = DEFAULT_ROOT_RETRY_BACKOFF_SECONDS,
+    wakeup_defer: Optional[Any] = None,
 ) -> RecoveryStats:
-    """Scan persisted dead sessions once and deliver bounded terminal notices."""
+    """Scan persisted dead sessions once and deliver bounded terminal notices.
+
+    ``wakeup_defer`` (#620, optional sync callable
+    ``(current_session, session_id, replay, user_id, chat_id) -> bool``) is
+    the wakeup-first hand-off: when it returns True for a conversation with
+    pending notifications, this scan skips that conversation's raw replay and
+    lets the opt-in dead-session wakeup claim it. ``None`` (the default, and
+    always when ``CCC_DEAD_SESSION_WAKEUP`` is off) keeps behavior exactly as
+    before. Deferral never consumes anything — the notifications stay in the
+    transcript FIFO, so unless a wakeup turn dequeues them a later scan
+    delivers them raw; a predicate error also falls back to raw delivery.
+    """
     stats = RecoveryStats()
     if not recovery_enabled() or not conversations_dir:
         return stats
@@ -791,7 +835,23 @@ async def recover_dead_session_notifications(  # noqa: C901 -- #348 baseline hot
                         else:
                             stats.failed += 1
                     continue
-                notifications = await asyncio.to_thread(scan_transcript, path, session_id)
+                if wakeup_defer is None:
+                    replay = None
+                    notifications = await asyncio.to_thread(
+                        scan_transcript, path, session_id
+                    )
+                else:
+                    # Wakeup-first (#620): a single parse still, but expose the
+                    # replayed FIFO to the deferral predicate, which needs the
+                    # enqueue/assistant timestamps scan_transcript discards.
+                    replay = await asyncio.to_thread(
+                        replay_transcript_queue, path, session_id
+                    )
+                    notifications = [
+                        item
+                        for content, _ts in replay.pending
+                        if (item := _task_notification(content))
+                    ]
             except TranscriptRejected as error:
                 if await _quarantine_transcript(
                     bot=bot,
@@ -809,11 +869,40 @@ async def recover_dead_session_notifications(  # noqa: C901 -- #348 baseline hot
                 ):
                     delivery_attempts += 1
                 continue
+            quarantine_lifted = True
             if quarantine is not None:
                 # The transcript changed and parses again — lift the stale
                 # quarantine so this conversation resumes normal recovery.
-                await _persist_quarantine(session_manager, storage_key, None)
+                quarantine_lifted = await _persist_quarantine(
+                    session_manager, storage_key, None
+                )
             stats.scanned += 1
+            if (
+                replay is not None
+                and notifications
+                # A lift that failed to persist leaves the stale quarantine
+                # record visible to the wakeup scan, which would skip the
+                # conversation; deferring would then strand the notification.
+                and quarantine_lifted
+                and _wakeup_claims(
+                    wakeup_defer,
+                    current,
+                    session_id,
+                    replay,
+                    user_id,
+                    chat_id,
+                    storage_key,
+                )
+            ):
+                stats.deferred_wakeup += 1
+                logger.info(
+                    "Dead-session recovery deferred raw replay to wakeup for "
+                    "conversation %s: session=%s pending=%d",
+                    storage_key,
+                    session_id,
+                    len(notifications),
+                )
+                continue
             sent_here = 0
             for item in notifications:
                 marker = notification_marker(session_id, item)
@@ -867,6 +956,7 @@ async def run_periodic_dead_session_recovery(
     stop_event: asyncio.Event,
     on_stats: Optional[Any] = None,
     wakeup_tick: Optional[Any] = None,
+    wakeup_defer: Optional[Any] = None,
 ) -> None:
     """Run one bounded scan per interval until the lifecycle stop event is set.
 
@@ -878,6 +968,12 @@ async def run_periodic_dead_session_recovery(
     the same cadence — the #364 P2 dead-session wakeup reuses this loop instead
     of adding a second periodic scanner. ``None`` (the default, and whenever the
     opt-in wakeup flag is off) keeps this loop's behavior unchanged.
+
+    ``wakeup_defer`` (optional sync callable, see
+    ``recover_dead_session_notifications``) is the #620 wakeup-first hand-off,
+    forwarded to every scan; recovery runs before ``wakeup_tick`` within each
+    interval, so a deferred conversation can be claimed by the wakeup on the
+    same tick.
     """
     interval = recovery_interval()
     while not stop_event.is_set():
@@ -888,7 +984,11 @@ async def run_periodic_dead_session_recovery(
             pass
         try:
             stats = await recover_dead_session_notifications(
-                bot, session_manager, project_handler, conversations_dir
+                bot,
+                session_manager,
+                project_handler,
+                conversations_dir,
+                wakeup_defer=wakeup_defer,
             )
             if on_stats is not None:
                 on_stats(stats)
