@@ -118,6 +118,56 @@ class DoubleLaunchGuardTests(unittest.TestCase):
         root = self._mkdir("ccc-guard-")
         self.assertEqual(self._unmanaged_pids(root), set())
 
+    def _reap(self, project_root: str) -> subprocess.CompletedProcess:
+        env = dict(os.environ)
+        env.pop("PROJECT_ROOT", None)
+        env.pop("CCC_AGENT_PROVIDER", None)
+        return subprocess.run(
+            ["bash", str(self.start_script), project_root, "--_reap-competing-pollers"],
+            cwd=self.repo_root,
+            text=True,
+            capture_output=True,
+            check=False,
+            env=env,
+        )
+
+    def test_reap_clears_competing_poller(self):
+        # A stray poller for this project root (the 409-conflict token holder)
+        # must be terminated by the supervisor's pre-restart reap so the crash
+        # loop self-heals instead of leaving the bot down.
+        root = self._mkdir("ccc-reap-")
+        decoy = self._decoy(root)
+        time.sleep(0.5)
+        self.assertIn(str(decoy.pid), self._unmanaged_pids(root))  # sanity
+        r = self._reap(root)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        for _ in range(50):
+            if decoy.poll() is not None:
+                break
+            time.sleep(0.1)
+        self.assertIsNotNone(decoy.poll(), "competing poller was not terminated")
+
+    def test_reap_no_competitor_is_noop(self):
+        # No competing poller → exit 0, nothing killed, no cleanup log line.
+        root = self._mkdir("ccc-reap-")
+        r = self._reap(root)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn("Clearing competing bot poller", r.stdout)
+
+    def test_reap_leaves_other_project_poller(self):
+        # A poller for a DIFFERENT project root must not be touched.
+        base = self._mkdir("ccc-reap-")
+        root = base + "/proj"
+        other = base + "/proj-other"
+        os.makedirs(root, exist_ok=True)
+        os.makedirs(other, exist_ok=True)
+        keep = self._decoy(other)
+        time.sleep(0.5)
+        r = self._reap(root)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        time.sleep(0.5)
+        self.assertIsNone(keep.poll(), "unrelated project poller was killed")
+
 
 if __name__ == "__main__":
     unittest.main()
