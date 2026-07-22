@@ -4,6 +4,7 @@ import hashlib
 import logging
 import re
 import time
+from dataclasses import dataclass
 from typing import Any, Dict, Optional, cast
 from datetime import datetime, timezone
 
@@ -38,6 +39,16 @@ from telegram_bot.utils.tos_uploader import VolcengineTOSUploader
 
 logger = logging.getLogger(__name__)
 STALE_MESSAGE_SECONDS = 20 * 60  # 20 minutes
+
+
+@dataclass(slots=True)
+class _DistillCheckpointProgress:
+    thread_id: str
+    started_at: float
+    turns: int = 0
+    byte_count: int = 0
+    last_turn_marker: str | None = None
+    pending_discriminator: str | None = None
 
 
 from telegram_bot.core.bot_shared import _PollingRestart, enforce_access_control  # noqa: F401
@@ -94,6 +105,8 @@ class TelegramBot(
         self._push_notifier = PushNotifier(settings)
         # Only sessions created/resumed in current runtime are auto-resumed.
         self._runtime_active_sessions: set[Any] = set()
+        self._distill_checkpoint_progress: Dict[Any, _DistillCheckpointProgress] = {}
+        self._distill_checkpoint_locks: Dict[Any, asyncio.Lock] = {}
         # Serialize first-use legacy seeding per destination. Telegram may
         # dispatch updates from different chats concurrently in shared scopes.
         self._scope_migration_locks: Dict[Any, asyncio.Lock] = {}
@@ -354,6 +367,8 @@ class TelegramBot(
         *,
         user_id: int | None = None,
         chat_id: int | None = None,
+        request_text: str = "",
+        turn_marker: str | None = None,
     ):
         if getattr(response, "success", True) and response.session_id:
             updates = {
@@ -386,6 +401,165 @@ class TelegramBot(
                 remove_fields=remove_fields,
             )
             self._runtime_active_sessions.add(session_key)
+            try:
+                await self._record_codex_checkpoint(
+                    session_key,
+                    response,
+                    request_text=request_text,
+                    turn_marker=turn_marker,
+                    user_id=user_id,
+                    chat_id=chat_id,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                logger.warning(
+                    "Codex checkpoint accounting failed error=%s",
+                    type(error).__name__,
+                )
+
+    def _distill_checkpoint_gates(self) -> tuple[int, int, int]:
+        return (
+            int(getattr(self._config, "codex_distill_checkpoint_turns", 0) or 0),
+            int(getattr(self._config, "codex_distill_checkpoint_bytes", 0) or 0),
+            int(
+                getattr(self._config, "codex_distill_checkpoint_age_seconds", 0)
+                or 0
+            ),
+        )
+
+    @staticmethod
+    def _distill_checkpoint_reached(
+        progress: _DistillCheckpointProgress,
+        gates: tuple[int, int, int],
+        *,
+        now: float,
+    ) -> bool:
+        turn_gate, byte_gate, age_gate = gates
+        elapsed = max(0.0, now - progress.started_at)
+        return (
+            (turn_gate > 0 and progress.turns >= turn_gate)
+            or (byte_gate > 0 and progress.byte_count >= byte_gate)
+            or (age_gate > 0 and elapsed >= age_gate)
+        )
+
+    @staticmethod
+    def _update_distill_checkpoint_progress(
+        progress_by_key: Dict[Any, _DistillCheckpointProgress],
+        session_key: Any,
+        *,
+        thread_id: str,
+        marker_hash: str,
+        turn_bytes: int,
+        now: float,
+    ) -> _DistillCheckpointProgress:
+        progress = progress_by_key.get(session_key)
+        if progress is None or progress.thread_id != thread_id:
+            progress = _DistillCheckpointProgress(thread_id, now)
+            progress_by_key[session_key] = progress
+        if progress.last_turn_marker != marker_hash:
+            progress.turns += 1
+            progress.byte_count += turn_bytes
+            progress.last_turn_marker = marker_hash
+        return progress
+
+    async def _record_codex_checkpoint(
+        self,
+        session_key: Any,
+        response: ChatResponse,
+        *,
+        request_text: str,
+        turn_marker: str | None,
+        user_id: int | None,
+        chat_id: int | None,
+    ) -> None:
+        """Count completed turns and durably enqueue the first reached gate."""
+        if self._active_provider() != "codex":
+            return
+        if getattr(self, "_distill_journal", None) is None:
+            return
+        gates = self._distill_checkpoint_gates()
+        if all(gate <= 0 for gate in gates):
+            return
+        thread_id = response.session_id
+        if not isinstance(thread_id, str) or not thread_id:
+            return
+
+        marker = turn_marker
+        if not isinstance(marker, str) or not marker:
+            content = response.content if isinstance(response.content, str) else ""
+            marker = hashlib.sha256(
+                f"{request_text}\0{content}".encode("utf-8")
+            ).hexdigest()
+        marker_hash = hashlib.sha256(marker.encode("utf-8")).hexdigest()
+
+        progress_by_key = getattr(self, "_distill_checkpoint_progress", None)
+        if progress_by_key is None:
+            progress_by_key = self._distill_checkpoint_progress = {}
+        locks = getattr(self, "_distill_checkpoint_locks", None)
+        if locks is None:
+            locks = self._distill_checkpoint_locks = {}
+        lock = locks.setdefault(session_key, asyncio.Lock())
+
+        async with lock:
+            now = float(self._clock.time())
+            response_text = (
+                response.content if isinstance(response.content, str) else ""
+            )
+            progress = self._update_distill_checkpoint_progress(
+                progress_by_key,
+                session_key,
+                thread_id=thread_id,
+                marker_hash=marker_hash,
+                turn_bytes=(
+                    len(request_text.encode("utf-8"))
+                    + len(response_text.encode("utf-8"))
+                ),
+                now=now,
+            )
+
+            if progress.pending_discriminator is None:
+                if not self._distill_checkpoint_reached(
+                    progress,
+                    gates,
+                    now=now,
+                ):
+                    return
+                digest = hashlib.sha256(
+                    f"{thread_id}\0{marker_hash}".encode("utf-8")
+                ).hexdigest()
+                progress.pending_discriminator = f"checkpoint-turn-v1-{digest}"
+
+            try:
+                session = await self._session_manager.get_session(session_key)
+                if (
+                    session.get("provider") != "codex"
+                    or session.get("session_id") != thread_id
+                ):
+                    progress_by_key.pop(session_key, None)
+                    return
+                job = await self._enqueue_previous_codex_session(
+                    session,
+                    DistillTrigger.CHECKPOINT,
+                    user_id=user_id,
+                    chat_id=chat_id,
+                    discriminator=progress.pending_discriminator,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                logger.warning(
+                    "Codex checkpoint journal enqueue failed error=%s",
+                    type(error).__name__,
+                )
+                return
+
+            if job is not None:
+                progress_by_key[session_key] = _DistillCheckpointProgress(
+                    thread_id=thread_id,
+                    started_at=now,
+                    last_turn_marker=marker_hash,
+                )
 
     @staticmethod
     def _shutdown_distill_discriminator(session: dict[str, Any]) -> str:
@@ -810,6 +984,8 @@ class TelegramBot(
                 response,
                 user_id=user_id,
                 chat_id=chat.id,
+                request_text=send_text,
+                turn_marker=f"telegram-message:{message.message_id}",
             )
             await self._send_reply_by_mode(
                 message=message,

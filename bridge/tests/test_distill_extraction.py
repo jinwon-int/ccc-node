@@ -46,6 +46,11 @@ def test_shutdown_trigger_is_in_checked_in_extraction_schema() -> None:
     assert "shutdown" in schema["$defs"]["DistillTrigger"]["enum"]
 
 
+def test_checkpoint_trigger_is_in_checked_in_extraction_schema() -> None:
+    schema = json.loads(SCHEMA_PATH.read_text())
+    assert "checkpoint" in schema["$defs"]["DistillTrigger"]["enum"]
+
+
 THREAD_HASH = "a" * 64
 
 

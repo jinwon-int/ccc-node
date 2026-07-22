@@ -351,9 +351,9 @@ CAPABILITY_AXES: tuple[CapabilityAxis, ...] = (
             "sink candidates via claude/hooks/distill.sh."
         ),
         codex=_degraded(
-            "Session-reset, explicit, and bounded shutdown-queue triggers, extraction, "
-            "and the local sink are scheduled; checkpoint triggers and Honcho/Wiki "
-            "routing remain pending.",
+            "Session-reset, explicit, opt-in bounded checkpoint, and bounded "
+            "shutdown-queue triggers, extraction, and the local sink are scheduled; "
+            "Honcho/Wiki routing remains pending.",
             "#465",
         ),
     ),

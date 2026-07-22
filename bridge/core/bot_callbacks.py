@@ -145,6 +145,8 @@ class BotCallbackMixin:
                         response,
                         user_id=user_id,
                         chat_id=chat_id,
+                        request_text=choice,
+                        turn_marker=f"telegram-callback:{getattr(query, 'id', choice)}",
                     )
                     await self._send_smart(
                         chat_id,

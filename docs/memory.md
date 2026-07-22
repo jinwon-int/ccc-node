@@ -53,6 +53,13 @@ The Codex write-back path is intentionally staged. The provider-neutral boundary
 accepts an already bounded `CodexTranscriptSnapshot`, redacts credential-like text,
 serializes deterministic input, and validates a strict versioned result.
 
+`CCC_CODEX_DISTILL_CHECKPOINT_TURNS`,
+`CCC_CODEX_DISTILL_CHECKPOINT_BYTES`, and
+`CCC_CODEX_DISTILL_CHECKPOINT_AGE_SECONDS` configure opt-in write-back
+checkpoint gates; all default to `0` (disabled). When multiple gates are
+enabled, the first boundary reached after a completed turn records a durable
+journal job. Snapshot and extraction work remain asynchronous.
+
 - `bridge/memory/distill_extraction.py` contains the input/output models,
   `DistillBackend` protocol, privacy gates, canonical input serializer, strict JSON
   parser, and body-free diagnostics.
@@ -76,9 +83,10 @@ serializes deterministic input, and validates a strict versioned result.
   one strictly validated result or a body-free retryable/terminal failure. Concurrent
   duplicate workers are idempotent, cancellation remains retryable, and stale leases
   resume at extraction without re-reading the user thread.
-- The worker is not scheduled by the bridge lifecycle and performs no
-  local/Honcho/Wiki/resume sink mutation. Runtime scheduling and replay-safe sink phases
-  remain under #465.
+- The bridge lifecycle schedules bounded snapshot, extraction, and audience-routed
+  local/resume sink workers from the durable journal. Session reset, explicit,
+  opt-in checkpoint, and bounded shutdown triggers are supported; Honcho/Wiki
+  sink routing remains under #465.
 
 ## Useful commands
 

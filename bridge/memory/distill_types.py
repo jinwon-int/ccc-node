@@ -20,6 +20,7 @@ class DistillTrigger(str, Enum):
     AUTO_NEW = "auto_new"
     EXPLICIT = "explicit"
     SHUTDOWN = "shutdown"
+    CHECKPOINT = "checkpoint"
 
 
 class DistillJobStatus(str, Enum):
