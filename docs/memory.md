@@ -94,10 +94,16 @@ before claim/provider execution without blocking interactive turns.
   one strictly validated result or a body-free retryable/terminal failure. Concurrent
   duplicate workers are idempotent, cancellation remains retryable, and stale leases
   resume at extraction without re-reading the user thread.
-- The bridge lifecycle schedules bounded snapshot, extraction, and audience-routed
-  local/resume sink workers from the durable journal. Session reset, explicit,
-  opt-in checkpoint, and bounded shutdown triggers are supported; Honcho/Wiki
-  sink routing remains under #465.
+- The bridge lifecycle schedules bounded snapshot, extraction, audience-routed
+  local/resume, and Wiki-candidate workers from the durable journal. Session reset,
+  explicit, opt-in checkpoint, and bounded shutdown triggers are supported. The
+  Wiki worker is composed only when the fleet Wiki policy is enabled and writes one
+  immutable owner-only record per job under
+  `${BOT_DATA_DIR}/wiki-candidates/<job-id>.json`. Records contain only the strict
+  candidate fields plus hashed provenance and remain `review_status=pending`; this
+  path never invokes `wiki-agent`, writes a Wiki page, creates a branch/PR, or merges.
+  Empty candidate sets complete without a queue record. Honcho routing remains under
+  #465.
 - A completed audience-local sink write refreshes that scope's derived SQLite
   index with the installed `ccc-memory-index.sh` before the journal marks the
   local stage done. The bounded subprocess receives only local path/policy
@@ -108,7 +114,7 @@ before claim/provider execution without blocking interactive turns.
 - `scripts/ccc-memory-check.sh --json` reports the journal aggregate under
   `.writeback_queue` without reading any body into its output. It includes queue
   status, valid/pending/invalid counts, journal and snapshot bytes, oldest age,
-  retry-attempt counters, and main/local status counts. `active` means healthy
+  retry-attempt counters, and main/local/Wiki status counts. `active` means healthy
   work remains, `settled` means all valid jobs are terminal-successful,
   `degraded` means a retry/failure or unsafe/malformed record was observed, and
   `missing`/`empty` distinguish an uninitialized queue from an initialized queue

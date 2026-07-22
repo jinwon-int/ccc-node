@@ -354,7 +354,8 @@ CAPABILITY_AXES: tuple[CapabilityAxis, ...] = (
             "Session-reset, explicit, opt-in bounded checkpoint, and bounded "
             "shutdown-queue triggers, extraction, and the local sink are scheduled. "
             "Provider/model/turn-byte/duration accounting and shared warn/enforce "
-            "cost gates are body-free; Honcho/Wiki routing remains pending.",
+            "cost gates are body-free; Wiki candidates enter a local human-review "
+            "queue, while Honcho routing remains pending.",
             "#465",
         ),
     ),
@@ -395,9 +396,9 @@ CAPABILITY_AXES: tuple[CapabilityAxis, ...] = (
             "Distill emits human-gated Wiki candidates via "
             "claude/hooks/distill/wiki-queue.sh."
         ),
-        codex=_unsupported(
-            "No Codex-side Wiki candidate generation exists yet.",
-            "#465",
+        codex=_supported(
+            "Validated candidates are atomically queued in owner-only per-job records; "
+            "the sink performs no Wiki write, branch, PR, or merge."
         ),
     ),
     _axis(
@@ -412,7 +413,7 @@ CAPABILITY_AXES: tuple[CapabilityAxis, ...] = (
         ),
         codex=_degraded(
             "A hermetic audience-scoped A→distill→local index→B snapshot test "
-            "recalls one durable fact exactly once; Honcho/Wiki parity and an "
+            "recalls one durable fact exactly once; Honcho parity and an "
             "approved live provider proof remain pending.",
             "#465",
         ),

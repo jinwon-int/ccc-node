@@ -45,6 +45,54 @@ class DistillLocalSinkStatus(str, Enum):
     UNROUTABLE = "unroutable"
 
 
+class DistillWikiSinkStatus(str, Enum):
+    PENDING = "pending"
+    RUNNING = "running"
+    RETRYABLE_FAILED = "retryable_failed"
+    DONE = "done"
+    TERMINAL_FAILED = "terminal_failed"
+    DISABLED = "disabled"
+
+
+def _parse_wiki_sink_fields(
+    value: Mapping[str, Any],
+    *,
+    extraction_output: object,
+) -> tuple[DistillWikiSinkStatus | None, int, int, str | None, str | None]:
+    attempts = value.get("wiki_sink_attempts", 0)
+    lease_epoch = value.get("wiki_sink_lease_epoch", 0)
+    if type(attempts) is not int or attempts < 0:
+        raise ValueError("invalid distill job wiki_sink_attempts")
+    if type(lease_epoch) is not int or lease_epoch < 0:
+        raise ValueError("invalid distill job wiki_sink_lease_epoch")
+    owner_token = value.get("wiki_sink_owner_token")
+    lease_expires_at = value.get("wiki_sink_lease_expires_at")
+    if owner_token is not None and not isinstance(owner_token, str):
+        raise ValueError("invalid distill job field: wiki_sink_owner_token")
+    if lease_expires_at is not None and not isinstance(lease_expires_at, str):
+        raise ValueError("invalid distill job field: wiki_sink_lease_expires_at")
+    raw_status = value.get("wiki_sink_status")
+    if raw_status is None:
+        status = (
+            DistillWikiSinkStatus.PENDING if extraction_output is not None else None
+        )
+    elif isinstance(raw_status, str):
+        status = DistillWikiSinkStatus(raw_status)
+    else:
+        raise ValueError("invalid distill job field: wiki_sink_status")
+    return status, attempts, lease_epoch, owner_token, lease_expires_at
+
+
+def _validate_wiki_sink_lease(
+    status: DistillWikiSinkStatus | None,
+    owner_token: str | None,
+    lease_expires_at: str | None,
+) -> None:
+    running = status is DistillWikiSinkStatus.RUNNING
+    if running != (owner_token is not None and lease_expires_at is not None):
+        raise ValueError("Wiki sink running state requires a complete lease")
+
+
 @dataclass(frozen=True, slots=True)
 class DistillExtractionAccounting:
     """Body-free accounting for one provider extraction attempt.
@@ -284,6 +332,11 @@ class DistillJob:
     local_sink_status: DistillLocalSinkStatus | None = None
     local_sink_attempts: int = 0
     local_sink_lease_epoch: int = 0
+    wiki_sink_status: DistillWikiSinkStatus | None = None
+    wiki_sink_attempts: int = 0
+    wiki_sink_lease_epoch: int = 0
+    wiki_sink_owner_token: str | None = None
+    wiki_sink_lease_expires_at: str | None = None
 
     def __post_init__(self) -> None:
         if not _SHA256_RE.fullmatch(self.job_id):
@@ -308,6 +361,8 @@ class DistillJob:
             or self.extraction_lease_epoch < 0
             or self.local_sink_attempts < 0
             or self.local_sink_lease_epoch < 0
+            or self.wiki_sink_attempts < 0
+            or self.wiki_sink_lease_epoch < 0
         ):
             raise ValueError("invalid distill job counters")
         validate_memory_route(self.memory_audience, self.memory_scope)
@@ -318,6 +373,11 @@ class DistillJob:
             self.memory_audience is None or self.memory_scope is None
         ):
             raise ValueError("routable local sink status requires a memory route")
+        _validate_wiki_sink_lease(
+            self.wiki_sink_status,
+            self.wiki_sink_owner_token,
+            self.wiki_sink_lease_expires_at,
+        )
         if self.error_code is not None and not _SAFE_ERROR_CODE_RE.fullmatch(
             self.error_code
         ):
@@ -376,6 +436,15 @@ class DistillJob:
             ),
             "local_sink_attempts": self.local_sink_attempts,
             "local_sink_lease_epoch": self.local_sink_lease_epoch,
+            "wiki_sink_status": (
+                self.wiki_sink_status.value
+                if self.wiki_sink_status is not None
+                else None
+            ),
+            "wiki_sink_attempts": self.wiki_sink_attempts,
+            "wiki_sink_lease_epoch": self.wiki_sink_lease_epoch,
+            "wiki_sink_owner_token": self.wiki_sink_owner_token,
+            "wiki_sink_lease_expires_at": self.wiki_sink_lease_expires_at,
         }
 
     @classmethod
@@ -449,6 +518,13 @@ class DistillJob:
             local_sink_status = DistillLocalSinkStatus(raw_local_sink_status)
         else:
             raise ValueError("invalid distill job field: local_sink_status")
+        (
+            wiki_sink_status,
+            wiki_sink_attempts,
+            wiki_sink_lease_epoch,
+            wiki_sink_owner_token,
+            wiki_sink_lease_expires_at,
+        ) = _parse_wiki_sink_fields(value, extraction_output=extraction_output)
         return cls(
             job_id=value["job_id"],
             provider=value["provider"],
@@ -480,4 +556,9 @@ class DistillJob:
             local_sink_status=local_sink_status,
             local_sink_attempts=local_sink_attempts,
             local_sink_lease_epoch=local_sink_lease_epoch,
+            wiki_sink_status=wiki_sink_status,
+            wiki_sink_attempts=wiki_sink_attempts,
+            wiki_sink_lease_epoch=wiki_sink_lease_epoch,
+            wiki_sink_owner_token=wiki_sink_owner_token,
+            wiki_sink_lease_expires_at=wiki_sink_lease_expires_at,
         )

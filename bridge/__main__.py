@@ -40,6 +40,7 @@ class AppContext:
     distill_snapshot_worker: Any
     distill_extraction_worker: Any
     distill_local_sink_worker: Any
+    distill_wiki_sink_worker: Any
     project_chat: Any
     agent_runtime: Any
     sdk_factory: Any
@@ -200,6 +201,16 @@ def build_context(
                 / "ccc-memory-index.sh"
             ),
         )
+    distill_wiki_sink_worker = None
+    if settings.agent_provider == "codex" and wiki_enabled:
+        from telegram_bot.memory.distill_wiki_worker import (
+            CodexDistillWikiSinkWorker,
+        )
+
+        distill_wiki_sink_worker = CodexDistillWikiSinkWorker(
+            distill_journal,
+            queue_dir=settings.bot_data_dir / "wiki-candidates",
+        )
     return AppContext(
         settings=settings,
         session_store=store,
@@ -208,6 +219,7 @@ def build_context(
         distill_snapshot_worker=distill_snapshot_worker,
         distill_extraction_worker=distill_extraction_worker,
         distill_local_sink_worker=distill_local_sink_worker,
+        distill_wiki_sink_worker=distill_wiki_sink_worker,
         project_chat=project_chat,
         agent_runtime=agent_runtime,
         sdk_factory=sdk_factory,
@@ -228,6 +240,7 @@ def create_app(context: AppContext):
         distill_snapshot_worker=context.distill_snapshot_worker,
         distill_extraction_worker=context.distill_extraction_worker,
         distill_local_sink_worker=context.distill_local_sink_worker,
+        distill_wiki_sink_worker=context.distill_wiki_sink_worker,
         application_builder_factory=context.telegram_port,
         clock=context.clock,
     )

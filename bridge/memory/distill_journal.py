@@ -30,6 +30,7 @@ from .distill_types import (
     DistillJobStatus,
     DistillLocalSinkStatus,
     DistillTrigger,
+    DistillWikiSinkStatus,
     validate_memory_route,
 )
 from .distill_extraction import (
@@ -225,6 +226,11 @@ class DistillJournal:
             or job.extraction_output is None
         ):
             raise ValueError("local sink state requires completed extraction")
+        if job.wiki_sink_status is not None and (
+            job.status is not DistillJobStatus.EXTRACTION_DONE
+            or job.extraction_output is None
+        ):
+            raise ValueError("Wiki sink state requires completed extraction")
         return job
 
     def _write_unlocked(self, job: DistillJob) -> None:
@@ -477,9 +483,14 @@ class DistillJournal:
         lease_epoch: int,
         extraction_output: DistillExtractionOutput,
         accounting: DistillExtractionAccounting | None = None,
+        wiki_enabled: bool = True,
         now: datetime | None = None,
     ) -> DistillJob:
+        if type(wiki_enabled) is not bool:
+            raise ValueError("wiki_enabled must be boolean")
         payload = self._canonical_extraction_output(extraction_output)
+        if not wiki_enabled and extraction_output.wiki_candidates:
+            raise ValueError("Wiki-disabled extraction must not contain candidates")
         payload_hash = hashlib.sha256(payload.encode("utf-8")).hexdigest()
         with self._exclusive():
             job = self._read_unlocked(job_id)
@@ -510,6 +521,11 @@ class DistillJournal:
                     DistillLocalSinkStatus.PENDING
                     if job.memory_audience is not None
                     else DistillLocalSinkStatus.UNROUTABLE
+                ),
+                wiki_sink_status=(
+                    DistillWikiSinkStatus.PENDING
+                    if wiki_enabled
+                    else DistillWikiSinkStatus.DISABLED
                 ),
                 error_code=None,
             )
@@ -744,6 +760,156 @@ class DistillJournal:
             self._write_unlocked(failed)
             return failed
 
+    def claim_wiki_sink(
+        self,
+        job_id: str,
+        *,
+        owner_token: str,
+        now: datetime | None = None,
+        lease_seconds: int = 300,
+        max_attempts: int = 5,
+    ) -> DistillJob | None:
+        if not owner_token:
+            raise ValueError("owner_token must not be empty")
+        if lease_seconds <= 0 or max_attempts <= 0:
+            raise ValueError("lease_seconds and max_attempts must be positive")
+        current_time = _normalize_time(now or _utc_now())
+        with self._exclusive():
+            job = self._read_unlocked(job_id)
+            if job.wiki_sink_status not in {
+                DistillWikiSinkStatus.PENDING,
+                DistillWikiSinkStatus.RETRYABLE_FAILED,
+            }:
+                return None
+            if (
+                job.status is not DistillJobStatus.EXTRACTION_DONE
+                or job.extraction_output is None
+            ):
+                raise ValueError("Wiki sink job is missing extraction output")
+            if job.wiki_sink_attempts >= max_attempts:
+                terminal = replace(
+                    job,
+                    wiki_sink_status=DistillWikiSinkStatus.TERMINAL_FAILED,
+                    updated_at=_timestamp(current_time),
+                    wiki_sink_owner_token=None,
+                    wiki_sink_lease_expires_at=None,
+                    error_code="wiki_sink_max_attempts_exceeded",
+                )
+                self._write_unlocked(terminal)
+                return None
+            running = replace(
+                job,
+                wiki_sink_status=DistillWikiSinkStatus.RUNNING,
+                updated_at=_timestamp(current_time),
+                wiki_sink_attempts=job.wiki_sink_attempts + 1,
+                wiki_sink_lease_epoch=job.wiki_sink_lease_epoch + 1,
+                wiki_sink_owner_token=owner_token,
+                wiki_sink_lease_expires_at=_timestamp(
+                    current_time + timedelta(seconds=lease_seconds)
+                ),
+                error_code=None,
+            )
+            self._write_unlocked(running)
+            return running
+
+    @staticmethod
+    def _require_running_wiki_sink(
+        job: DistillJob, owner_token: str, lease_epoch: int
+    ) -> None:
+        if job.wiki_sink_status is not DistillWikiSinkStatus.RUNNING:
+            raise RuntimeError(
+                "invalid Wiki sink transition from "
+                f"{job.wiki_sink_status.value if job.wiki_sink_status else 'none'}"
+            )
+        if (
+            job.wiki_sink_owner_token != owner_token
+            or job.wiki_sink_lease_epoch != lease_epoch
+        ):
+            raise RuntimeError("Wiki sink owner or lease epoch does not match")
+
+    def mark_wiki_sink_done(
+        self,
+        job_id: str,
+        *,
+        owner_token: str,
+        lease_epoch: int,
+        now: datetime | None = None,
+    ) -> DistillJob:
+        with self._exclusive():
+            job = self._read_unlocked(job_id)
+            self._require_running_wiki_sink(job, owner_token, lease_epoch)
+            done = replace(
+                job,
+                wiki_sink_status=DistillWikiSinkStatus.DONE,
+                updated_at=_timestamp(now or _utc_now()),
+                wiki_sink_owner_token=None,
+                wiki_sink_lease_expires_at=None,
+                error_code=None,
+            )
+            self._write_unlocked(done)
+            return done
+
+    def mark_wiki_sink_retryable_failed(
+        self,
+        job_id: str,
+        *,
+        owner_token: str,
+        lease_epoch: int,
+        error_code: str,
+        now: datetime | None = None,
+    ) -> DistillJob:
+        return self._mark_wiki_sink_failed(
+            job_id,
+            owner_token=owner_token,
+            lease_epoch=lease_epoch,
+            error_code=error_code,
+            status=DistillWikiSinkStatus.RETRYABLE_FAILED,
+            now=now,
+        )
+
+    def mark_wiki_sink_terminal_failed(
+        self,
+        job_id: str,
+        *,
+        owner_token: str,
+        lease_epoch: int,
+        error_code: str,
+        now: datetime | None = None,
+    ) -> DistillJob:
+        return self._mark_wiki_sink_failed(
+            job_id,
+            owner_token=owner_token,
+            lease_epoch=lease_epoch,
+            error_code=error_code,
+            status=DistillWikiSinkStatus.TERMINAL_FAILED,
+            now=now,
+        )
+
+    def _mark_wiki_sink_failed(
+        self,
+        job_id: str,
+        *,
+        owner_token: str,
+        lease_epoch: int,
+        error_code: str,
+        status: DistillWikiSinkStatus,
+        now: datetime | None,
+    ) -> DistillJob:
+        self._validate_error_code(error_code)
+        with self._exclusive():
+            job = self._read_unlocked(job_id)
+            self._require_running_wiki_sink(job, owner_token, lease_epoch)
+            failed = replace(
+                job,
+                wiki_sink_status=status,
+                updated_at=_timestamp(now or _utc_now()),
+                wiki_sink_owner_token=None,
+                wiki_sink_lease_expires_at=None,
+                error_code=error_code,
+            )
+            self._write_unlocked(failed)
+            return failed
+
     def mark_retryable_failed(
         self,
         job_id: str,
@@ -806,47 +972,64 @@ class DistillJournal:
                 local_running = (
                     job.local_sink_status is DistillLocalSinkStatus.RUNNING
                 )
+                updated = job
+                changed = 0
+                if (phase_running or local_running) and job.lease_expires_at is not None:
+                    try:
+                        lease_expires = _parse_timestamp(job.lease_expires_at)
+                    except ValueError as error:
+                        raise ValueError("invalid distill job lease timestamp") from error
+                    if lease_expires <= current_time and local_running:
+                        updated = replace(
+                            updated,
+                            local_sink_status=DistillLocalSinkStatus.RETRYABLE_FAILED,
+                            updated_at=_timestamp(current_time),
+                            owner_token=None,
+                            lease_expires_at=None,
+                            error_code="local_sink_lease_expired",
+                        )
+                        changed += 1
+                    elif lease_expires <= current_time and phase_running:
+                        recovery_status = (
+                            DistillJobStatus.QUEUED
+                            if job.status is DistillJobStatus.RUNNING_SNAPSHOT
+                            else DistillJobStatus.EXTRACTION_RETRYABLE_FAILED
+                        )
+                        error_code = (
+                            "lease_expired"
+                            if job.status is DistillJobStatus.RUNNING_SNAPSHOT
+                            else "extraction_lease_expired"
+                        )
+                        updated = replace(
+                            updated,
+                            status=recovery_status,
+                            updated_at=_timestamp(current_time),
+                            owner_token=None,
+                            lease_expires_at=None,
+                            error_code=error_code,
+                        )
+                        changed += 1
                 if (
-                    (not phase_running and not local_running)
-                    or job.lease_expires_at is None
+                    job.wiki_sink_status is DistillWikiSinkStatus.RUNNING
+                    and job.wiki_sink_lease_expires_at is not None
                 ):
-                    continue
-                try:
-                    lease_expires = _parse_timestamp(job.lease_expires_at)
-                except ValueError as error:
-                    raise ValueError("invalid distill job lease timestamp") from error
-                if lease_expires > current_time:
-                    continue
-                if local_running:
-                    queued = replace(
-                        job,
-                        local_sink_status=DistillLocalSinkStatus.RETRYABLE_FAILED,
-                        updated_at=_timestamp(current_time),
-                        owner_token=None,
-                        lease_expires_at=None,
-                        error_code="local_sink_lease_expired",
-                    )
-                else:
-                    recovery_status = (
-                        DistillJobStatus.QUEUED
-                        if job.status is DistillJobStatus.RUNNING_SNAPSHOT
-                        else DistillJobStatus.EXTRACTION_RETRYABLE_FAILED
-                    )
-                    error_code = (
-                        "lease_expired"
-                        if job.status is DistillJobStatus.RUNNING_SNAPSHOT
-                        else "extraction_lease_expired"
-                    )
-                    queued = replace(
-                        job,
-                        status=recovery_status,
-                        updated_at=_timestamp(current_time),
-                        owner_token=None,
-                        lease_expires_at=None,
-                        error_code=error_code,
-                    )
-                self._write_unlocked(queued)
-                recovered += 1
+                    try:
+                        wiki_expires = _parse_timestamp(job.wiki_sink_lease_expires_at)
+                    except ValueError as error:
+                        raise ValueError("invalid Wiki sink lease timestamp") from error
+                    if wiki_expires <= current_time:
+                        updated = replace(
+                            updated,
+                            wiki_sink_status=DistillWikiSinkStatus.RETRYABLE_FAILED,
+                            updated_at=_timestamp(current_time),
+                            wiki_sink_owner_token=None,
+                            wiki_sink_lease_expires_at=None,
+                            error_code="wiki_sink_lease_expired",
+                        )
+                        changed += 1
+                if changed:
+                    self._write_unlocked(updated)
+                    recovered += changed
         return recovered
 
     def diagnostics(self, job_id: str) -> dict[str, Any]:
@@ -877,6 +1060,13 @@ class DistillJournal:
             ),
             "local_sink_attempts": job.local_sink_attempts,
             "local_sink_lease_epoch": job.local_sink_lease_epoch,
+            "wiki_sink_status": (
+                job.wiki_sink_status.value
+                if job.wiki_sink_status is not None
+                else None
+            ),
+            "wiki_sink_attempts": job.wiki_sink_attempts,
+            "wiki_sink_lease_epoch": job.wiki_sink_lease_epoch,
             "message_count": len(snapshot.messages) if snapshot is not None else 0,
             "byte_count": snapshot.byte_count if snapshot is not None else 0,
             "truncated": snapshot.truncated if snapshot is not None else False,

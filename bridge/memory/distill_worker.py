@@ -302,6 +302,7 @@ class CodexDistillExtractionWorker:
             lease_epoch=claimed.extraction_lease_epoch,
             extraction_output=output,
             accounting=accounting,
+            wiki_enabled=self._wiki_enabled,
         )
 
 

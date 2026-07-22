@@ -36,9 +36,9 @@ ok "memory check reports a missing write-back queue without creating it" '[ "$rc
     status:"missing", jobs:0, pending_jobs:0, invalid_records:0,
     record_bytes:0, snapshot_bytes:0,
     oldest_age_seconds:-1, oldest_pending_age_seconds:-1,
-    retries:{snapshot:0, extraction:0, local:0, total:0},
+    retries:{snapshot:0, extraction:0, local:0, wiki:0, total:0},
     accounting:{accounted_attempts:0, turn_bytes:0, duration_ms:0, estimated_max_tokens:0, model_counts:{}},
-    status_counts:{}, local_status_counts:{}
+    status_counts:{}, local_status_counts:{}, wiki_status_counts:{}
   }'\'' >/dev/null <<<"$out" && [ ! -e "$missing_journal" ]'
 
 empty_journal="$TMP/empty-distill-journal"
@@ -82,10 +82,11 @@ ok "memory check aggregates active and degraded write-back state" '[ "$rc" = 0 ]
   and .writeback_queue.snapshot_bytes == 620
   and .writeback_queue.oldest_age_seconds == 120
   and .writeback_queue.oldest_pending_age_seconds == 120
-  and .writeback_queue.retries == {snapshot:4, extraction:4, local:5, total:13}
+  and .writeback_queue.retries == {snapshot:4, extraction:4, local:5, wiki:0, total:13}
   and .writeback_queue.accounting == {accounted_attempts:3, turn_bytes:800, duration_ms:3750, estimated_max_tokens:225000, model_counts:{"gpt-5-mini":3}}
   and .writeback_queue.status_counts == {queued:1, extraction_done:2}
   and .writeback_queue.local_status_counts == {done:1, retryable_failed:1}
+  and .writeback_queue.wiki_status_counts == {}
 '\'' >/dev/null <<<"$out"'
 ok "memory check write-back JSON never exposes journal bodies or identities" '! grep -q "$secret_thread\|$secret_message\|$secret_output\|private-deadbeef\|private-feedface" <<<"$out"'
 text_out="$(CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CCC_DISTILL_JOURNAL_DIR="$journal" CCC_MEMORY_CHECK_NOW_EPOCH=200 bash "$ROOT/scripts/ccc-memory-check.sh" text 2>&1)"; rc=$?
