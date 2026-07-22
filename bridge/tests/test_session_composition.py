@@ -929,6 +929,9 @@ context = build_context(settings)
 worker = context.distill_local_sink_worker
 assert isinstance(worker, CodexDistillLocalSinkWorker), type(worker)
 assert worker._audience_root == root / "audiences"
+assert worker._indexer_path == (
+    Path(settings.codex_memory_materializer_path).parent / "ccc-memory-index.sh"
+)
 bot = create_app(context)
 assert bot._distill_local_sink_worker is worker
 print("COMPOSED-LOCAL-SINK-WORKER-OK")

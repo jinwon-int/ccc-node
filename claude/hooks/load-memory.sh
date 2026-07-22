@@ -126,8 +126,10 @@ run_memory_search_bounded() { # <tool> <query> <limit> <timeout-seconds> [state-
     "$tool" "$query" "$limit" "$timeout_sec" "$state_override" 2>/dev/null || true
 }
 
-merge_local_hot() { # <primary-json> <shared-json> [legacy-private-json]
-  PRIMARY_JSON="$1" SHARED_JSON="$2" LEGACY_JSON="${3:-}" python3 "$MEMORY_RENDER_PY" merge-local-hot 2>/dev/null || printf '%s' "$1"
+merge_local_hot() { # <primary-json> <recent-primary-json> [shared-json] [legacy-private-json]
+  PRIMARY_JSON="$1" RECENT_JSON="${2:-}" SHARED_JSON="${3:-}" LEGACY_JSON="${4:-}" \
+    PRIMARY_AUDIENCE="${MEMORY_AUDIENCE:-private}" \
+    python3 "$MEMORY_RENDER_PY" merge-local-hot 2>/dev/null || printf '%s' "$1"
 }
 
 build_memory_query() {
@@ -231,6 +233,9 @@ if ! is_disabled "${CCC_MEMORY_DYNAMIC_BUDGET:-1}"; then
 fi
 
 local_hot=""
+recent_hot=""
+shared_hot=""
+legacy_hot=""
 if [ "$PROFILE" = "hybrid" ] || [ "$PROFILE" = "max-perf" ] || ! is_disabled "$LOCAL_ENABLED"; then
   search_tool="$(find_memory_tool ccc-memory-search.sh 2>/dev/null || true)"
   if [ -n "$search_tool" ]; then
@@ -242,18 +247,23 @@ if [ "$PROFILE" = "hybrid" ] || [ "$PROFILE" = "max-perf" ] || ! is_disabled "$L
     # MEMORY/USER/cache/resume blocks assembled above still inject. The helper
     # uses Python rather than GNU timeout so the same contract works on Termux.
     local_hot="$(run_memory_search_bounded "$search_tool" "$QUERY" "$search_limit" "${CCC_MEMORY_SEARCH_TIMEOUT_SEC:-3}" "$STATE_DIR")"
-    if ! is_disabled "$AUDIENCE_SCOPED" \
-      && [ "$MEMORY_AUDIENCE" = "private" ] \
-      && [ -n "$SHARED_STATE_DIR" ] \
-      && [ "$SHARED_STATE_DIR" != "$STATE_DIR" ]; then
-      shared_hot="$(run_memory_search_bounded "$search_tool" "$QUERY" "$search_limit" "${CCC_MEMORY_SEARCH_TIMEOUT_SEC:-3}" "$SHARED_STATE_DIR")"
-      legacy_hot=""
-      if [ -n "$LEGACY_STATE_DIR" ] \
-        && [ "$LEGACY_STATE_DIR" != "$STATE_DIR" ] \
-        && [ "$LEGACY_STATE_DIR" != "$SHARED_STATE_DIR" ]; then
-        legacy_hot="$(run_memory_search_bounded "$search_tool" "$QUERY" "$search_limit" "${CCC_MEMORY_LEGACY_SEARCH_TIMEOUT_SEC:-2}" "$LEGACY_STATE_DIR")"
+    if ! is_disabled "$AUDIENCE_SCOPED"; then
+      # A just-committed Codex fact may not match the checkout-derived startup
+      # query yet. The write-back indexer tags these rows `distilled`; merge one
+      # small recent-fact lane so the immediately following isolated thread sees
+      # the durable fact without waiting for another turn or background refresh.
+      recent_hot="$(run_memory_search_bounded "$search_tool" "distilled text" "$search_limit" "${CCC_MEMORY_RECENT_SEARCH_TIMEOUT_SEC:-1}" "$STATE_DIR")"
+      if [ "$MEMORY_AUDIENCE" = "private" ] \
+        && [ -n "$SHARED_STATE_DIR" ] \
+        && [ "$SHARED_STATE_DIR" != "$STATE_DIR" ]; then
+        shared_hot="$(run_memory_search_bounded "$search_tool" "$QUERY" "$search_limit" "${CCC_MEMORY_SEARCH_TIMEOUT_SEC:-3}" "$SHARED_STATE_DIR")"
+        if [ -n "$LEGACY_STATE_DIR" ] \
+          && [ "$LEGACY_STATE_DIR" != "$STATE_DIR" ] \
+          && [ "$LEGACY_STATE_DIR" != "$SHARED_STATE_DIR" ]; then
+          legacy_hot="$(run_memory_search_bounded "$search_tool" "$QUERY" "$search_limit" "${CCC_MEMORY_LEGACY_SEARCH_TIMEOUT_SEC:-2}" "$LEGACY_STATE_DIR")"
+        fi
       fi
-      local_hot="$(merge_local_hot "$local_hot" "$shared_hot" "$legacy_hot")"
+      local_hot="$(merge_local_hot "$local_hot" "$recent_hot" "$shared_hot" "$legacy_hot")"
     fi
   fi
 fi

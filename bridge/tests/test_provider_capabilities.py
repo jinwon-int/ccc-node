@@ -204,12 +204,15 @@ class CapabilityRuntimeDriftTests(unittest.TestCase):
             "memory_writeback_distill",
             "memory_sink_honcho",
             "memory_sink_wiki_candidate",
-            "memory_roundtrip",
         ):
             status = capability_status("codex", axis_key)
             with self.subTest(axis=axis_key):
                 self.assertIsNot(status.state, CapabilityState.SUPPORTED)
                 self.assertIn("#465", status.dependencies)
+        roundtrip = capability_status("codex", "memory_roundtrip")
+        self.assertIs(roundtrip.state, CapabilityState.DEGRADED)
+        self.assertIn("#465", roundtrip.dependencies)
+        self.assertTrue((REPO_ROOT / "bridge/tests/test_distill_roundtrip.py").is_file())
         self.assertIs(
             capability_status("codex", "memory_sink_local").state,
             CapabilityState.SUPPORTED,

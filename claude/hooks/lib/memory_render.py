@@ -206,11 +206,12 @@ def cmd_run_memory_search_bounded(argv):
 
 
 def cmd_merge_local_hot(argv):
-    """env: PRIMARY_JSON, SHARED_JSON, LEGACY_JSON; stdout: merged results JSON.
+    """Merge task/recent/shared/legacy result JSON with audience labels.
 
-    Merges audience-scoped search results (private > shared > private-legacy),
-    dedupes by (path, snippet), tags each row with memoryAudience, and re-sorts
-    by score descending.
+    ``PRIMARY_JSON`` and ``RECENT_JSON`` belong to ``PRIMARY_AUDIENCE``;
+    the remaining sources are shared and private-legacy. Rows are deduped by
+    document path (falling back to snippet when pathless), with the recent lane
+    taking precedence, then re-sorted by score descending.
     """
     def rows(name):
         try:
@@ -220,19 +221,33 @@ def cmd_merge_local_hot(argv):
         value = doc.get("results") if isinstance(doc, dict) else None
         return value if isinstance(value, list) else []
 
-    out, seen = [], set()
+    primary_audience = os.environ.get("PRIMARY_AUDIENCE", "private")
+    if primary_audience not in {"private", "shared"}:
+        primary_audience = "private"
+    out, positions = [], {}
     for audience, name in (
-        ("private", "PRIMARY_JSON"),
+        (primary_audience, "RECENT_JSON"),
+        (primary_audience, "PRIMARY_JSON"),
         ("shared", "SHARED_JSON"),
         ("private-legacy", "LEGACY_JSON"),
     ):
         for row in rows(name):
             if not isinstance(row, dict):
                 continue
-            key = (str(row.get("path") or ""), str(row.get("snippet") or ""))
-            if key in seen:
+            path = str(row.get("path") or "")
+            snippet = str(row.get("snippet") or "")
+            key = ("path", path) if path else ("snippet", snippet)
+            if key in positions:
+                existing = out[positions[key]]
+                try:
+                    existing["score"] = max(
+                        float(existing.get("score") or 0),
+                        float(row.get("score") or 0),
+                    )
+                except (TypeError, ValueError):
+                    pass
                 continue
-            seen.add(key)
+            positions[key] = len(out)
             item = dict(row)
             item["memoryAudience"] = audience
             out.append(item)

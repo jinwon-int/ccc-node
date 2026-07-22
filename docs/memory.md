@@ -87,6 +87,13 @@ journal job. Snapshot and extraction work remain asynchronous.
   local/resume sink workers from the durable journal. Session reset, explicit,
   opt-in checkpoint, and bounded shutdown triggers are supported; Honcho/Wiki
   sink routing remains under #465.
+- A completed audience-local sink write refreshes that scope's derived SQLite
+  index with the installed `ccc-memory-index.sh` before the journal marks the
+  local stage done. The bounded subprocess receives only local path/policy
+  variables, disables Wiki/Honcho and optional embedding commands, suppresses
+  output bodies, and retries safely after a partial fact commit. This makes a
+  newly distilled durable fact available to the immediately following scoped
+  Codex materialization without waiting for the next background refresh.
 - `scripts/ccc-memory-check.sh --json` reports the journal aggregate under
   `.writeback_queue` without reading any body into its output. It includes queue
   status, valid/pending/invalid counts, journal and snapshot bytes, oldest age,

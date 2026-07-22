@@ -192,6 +192,10 @@ def build_context(
         distill_local_sink_worker = CodexDistillLocalSinkWorker(
             distill_journal,
             audience_root=shared_memory_audience(settings).root,
+            indexer_path=(
+                Path(settings.codex_memory_materializer_path).expanduser().parent
+                / "ccc-memory-index.sh"
+            ),
         )
     return AppContext(
         settings=settings,
