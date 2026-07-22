@@ -394,7 +394,7 @@ Codex rollout is source/config driven and must be serial:
 
 1. Install Codex CLI, authenticate it using the CLI's normal login flow, and run repository `setup.sh` so `ccc-codex` plus `ccc_codex_memory.py` are installed under the harness hooks directory.
 2. Set `CCC_AGENT_PROVIDER=codex`. Keep `CCC_CODEX_CLI_PATH` on the installed `ccc-codex` wrapper and set `CCC_CODEX_REAL_CLI_PATH` only when the real binary is not found as `codex`. The package-default `auto-approve` policy is `never + dangerFullAccess`; use an explicit non-default Bash policy if unrestricted host/network access is not intended.
-3. Run `../scripts/ccc-memory-check.sh --json` and require `.codex.status == "ready"`, then run `../scripts/ccc-doctor.sh` and require `readiness: ready`. These diagnostics are body-free and do not start a model turn or poll Telegram.
+3. Run `../scripts/ccc-memory-check.sh --json`, require `.codex.status == "ready"`, and inspect `.writeback_queue` for `degraded` state before running `../scripts/ccc-doctor.sh` and requiring `readiness: ready`. These diagnostics are body-free and do not start a model turn, initialize a missing queue, or poll Telegram.
 4. Stop the existing bridge owner, then start exactly one replacement and verify status. **Two services must never poll the same Telegram bot token concurrently.**
 
 Roll back by stopping the Codex bridge, restoring `CCC_AGENT_PROVIDER=claude`, and starting the prior Claude bridge as the sole poller. Do not overlap old and new services during rollout or rollback.

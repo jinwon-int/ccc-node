@@ -12,6 +12,9 @@ ok() { if eval "$2"; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $
 # fixtures we just built, mutating shared state mid-assertion. Suppress it suite-
 # wide; the one guard test below unsets it to prove the default still fires.
 export CCC_MEMORY_NO_REFRESH=1
+# Never let a memory-check invocation without an explicit fixture inspect a
+# checkout-local or operator journal while this broad suite is running.
+export CCC_DISTILL_JOURNAL_DIR="$TMP/default-distill-journal"
 
 state="$TMP/state"
 cache="$TMP/cache"
@@ -25,6 +28,78 @@ printf 'honcho cache contains practical evidence reports\n' > "$cache/honcho.txt
 
 out="$(CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" bash "$ROOT/scripts/ccc-memory-check.sh" --json 2>&1)"; rc=$?
 ok "memory check json succeeds" '[ "$rc" = 0 ] && jq -e ".wiki.status == \"ok\" and .honcho.status == \"ok\"" >/dev/null <<<"$out"'
+
+missing_journal="$TMP/missing-distill-journal"
+out="$(CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CCC_DISTILL_JOURNAL_DIR="$missing_journal" bash "$ROOT/scripts/ccc-memory-check.sh" --json 2>&1)"; rc=$?
+ok "memory check reports a missing write-back queue without creating it" '[ "$rc" = 0 ] && jq -e '\''
+  .writeback_queue == {
+    status:"missing", jobs:0, pending_jobs:0, invalid_records:0,
+    record_bytes:0, snapshot_bytes:0,
+    oldest_age_seconds:-1, oldest_pending_age_seconds:-1,
+    retries:{snapshot:0, extraction:0, local:0, total:0},
+    status_counts:{}, local_status_counts:{}
+  }'\'' >/dev/null <<<"$out" && [ ! -e "$missing_journal" ]'
+
+empty_journal="$TMP/empty-distill-journal"
+mkdir -m 700 "$empty_journal"
+out="$(CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CCC_DISTILL_JOURNAL_DIR="$empty_journal" bash "$ROOT/scripts/ccc-memory-check.sh" --json 2>&1)"; rc=$?
+ok "memory check reports an empty write-back queue" '[ "$rc" = 0 ] && jq -e '\''.writeback_queue.status == "empty" and .writeback_queue.jobs == 0 and .writeback_queue.invalid_records == 0'\'' >/dev/null <<<"$out"'
+
+journal="$TMP/distill-journal"
+mkdir -m 700 "$journal"
+queued_id="$(printf 'a%.0s' {1..64})"
+done_id="$(printf 'b%.0s' {1..64})"
+retry_id="$(printf 'c%.0s' {1..64})"
+secret_thread="RAW_THREAD_ID_MUST_NOT_LEAK"
+secret_message="RAW_TRANSCRIPT_BODY_MUST_NOT_LEAK"
+secret_output="RAW_EXTRACTION_OUTPUT_MUST_NOT_LEAK"
+cat > "$journal/$queued_id.json" <<JSON
+{"job_id":"$queued_id","provider":"codex","thread_id":"$secret_thread","thread_hash":"$(printf '1%.0s' {1..64})","trigger":"checkpoint","status":"queued","created_at":"1970-01-01T00:01:20.123456Z","updated_at":"1970-01-01T00:01:30Z","attempts":1,"extraction_attempts":0,"local_sink_attempts":0,"snapshot":{"byte_count":120,"messages":[{"role":"user","text":"$secret_message"}]}}
+JSON
+cat > "$journal/$done_id.json" <<JSON
+{"job_id":"$done_id","provider":"codex","thread_id":"$secret_thread-done","thread_hash":"$(printf '2%.0s' {1..64})","trigger":"explicit","status":"extraction_done","created_at":"1970-01-01T00:01:40Z","updated_at":"1970-01-01T00:01:50Z","attempts":1,"extraction_attempts":1,"local_sink_status":"done","local_sink_attempts":1,"snapshot":{"byte_count":200,"messages":[{"role":"assistant","text":"$secret_message"}]},"extraction_output":"$secret_output","memory_scope":"private-deadbeefdeadbeefdeadbeefdeadbeef"}
+JSON
+cat > "$journal/$retry_id.json" <<JSON
+{"job_id":"$retry_id","provider":"codex","thread_id":"$secret_thread-retry","thread_hash":"$(printf '3%.0s' {1..64})","trigger":"shutdown","status":"extraction_done","created_at":"1970-01-01T00:02:00Z","updated_at":"1970-01-01T00:02:10Z","attempts":2,"extraction_attempts":3,"local_sink_status":"retryable_failed","local_sink_attempts":4,"snapshot":{"byte_count":300,"messages":[{"role":"user","text":"$secret_message"}]},"extraction_output":"$secret_output","memory_scope":"private-feedfacefeedfacefeedfacefeedface"}
+JSON
+printf '{malformed %s\n' "$secret_message" > "$journal/$(printf 'd%.0s' {1..64}).json"
+printf '{"thread_id":"%s"}\n' "$secret_thread-symlink" > "$TMP/symlink-target.json"
+ln -s "$TMP/symlink-target.json" "$journal/$(printf 'e%.0s' {1..64}).json"
+oversized_path="$journal/$(printf 'f%.0s' {1..64}).json"
+python3 - "$oversized_path" <<'PY'
+from pathlib import Path
+import sys
+Path(sys.argv[1]).write_bytes(b"x" * (1024 * 1024 + 1))
+PY
+out="$(CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CCC_DISTILL_JOURNAL_DIR="$journal" CCC_MEMORY_CHECK_NOW_EPOCH=200 bash "$ROOT/scripts/ccc-memory-check.sh" --json 2>&1)"; rc=$?
+ok "memory check aggregates active and degraded write-back state" '[ "$rc" = 0 ] && jq -e '\''
+  .writeback_queue.status == "degraded"
+  and .writeback_queue.jobs == 3
+  and .writeback_queue.pending_jobs == 2
+  and .writeback_queue.invalid_records == 3
+  and .writeback_queue.record_bytes > 1048576
+  and .writeback_queue.snapshot_bytes == 620
+  and .writeback_queue.oldest_age_seconds == 120
+  and .writeback_queue.oldest_pending_age_seconds == 120
+  and .writeback_queue.retries == {snapshot:4, extraction:4, local:5, total:13}
+  and .writeback_queue.status_counts == {queued:1, extraction_done:2}
+  and .writeback_queue.local_status_counts == {done:1, retryable_failed:1}
+'\'' >/dev/null <<<"$out"'
+ok "memory check write-back JSON never exposes journal bodies or identities" '! grep -q "$secret_thread\|$secret_message\|$secret_output\|private-deadbeef\|private-feedface" <<<"$out"'
+text_out="$(CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CCC_DISTILL_JOURNAL_DIR="$journal" CCC_MEMORY_CHECK_NOW_EPOCH=200 bash "$ROOT/scripts/ccc-memory-check.sh" text 2>&1)"; rc=$?
+ok "memory check text reports one body-free write-back aggregate" '[ "$rc" = 0 ] && [ "$(grep -c "^- writeback:" <<<"$text_out")" = 1 ] && grep -q "status=degraded jobs=3 pending=2 invalid=3.*oldest=120s.*retries=13" <<<"$text_out" && ! grep -q "$secret_thread\|$secret_message\|$secret_output\|private-deadbeef\|private-feedface" <<<"$text_out"'
+
+active_journal="$TMP/active-distill-journal"
+mkdir -m 700 "$active_journal"
+cp "$journal/$queued_id.json" "$active_journal/$queued_id.json"
+out="$(CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CCC_DISTILL_JOURNAL_DIR="$active_journal" CCC_MEMORY_CHECK_NOW_EPOCH=200 bash "$ROOT/scripts/ccc-memory-check.sh" --json 2>&1)"; rc=$?
+ok "memory check reports a healthy pending write-back queue as active" '[ "$rc" = 0 ] && jq -e '\''.writeback_queue.status == "active" and .writeback_queue.jobs == 1 and .writeback_queue.pending_jobs == 1'\'' >/dev/null <<<"$out"'
+
+settled_journal="$TMP/settled-distill-journal"
+mkdir -m 700 "$settled_journal"
+cp "$journal/$done_id.json" "$settled_journal/$done_id.json"
+out="$(CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CCC_DISTILL_JOURNAL_DIR="$settled_journal" CCC_MEMORY_CHECK_NOW_EPOCH=200 bash "$ROOT/scripts/ccc-memory-check.sh" --json 2>&1)"; rc=$?
+ok "memory check reports a completed write-back queue as settled" '[ "$rc" = 0 ] && jq -e '\''.writeback_queue.status == "settled" and .writeback_queue.jobs == 1 and .writeback_queue.pending_jobs == 0'\'' >/dev/null <<<"$out"'
 
 codex_home="$TMP/codex-home"
 CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CCC_MEMORY_TOOLS_DIR="$ROOT/scripts" CODEX_HOME="$codex_home" python3 "$ROOT/scripts/ccc_codex_memory.py" materialize --json >/dev/null 2>&1
