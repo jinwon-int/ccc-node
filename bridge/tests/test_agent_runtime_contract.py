@@ -212,6 +212,34 @@ class AgentRuntimeContractTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(TypeError):
             cast(dict[str, JsonValue], request.sandbox_policy)["networkAccess"] = True
 
+    async def test_session_request_memory_environment_is_validated_and_immutable(
+        self,
+    ) -> None:
+        environment = {
+            "CODEX_HOME": "/memory/private-opaque/codex",
+            "CCC_MEMORY_SCOPE": "private-opaque",
+        }
+        request = SessionRequest(
+            working_directory="/workspace",
+            memory_environment=environment,
+        )
+
+        environment["CODEX_HOME"] = "/memory/leaking-global"
+
+        assert request.memory_environment is not None
+        self.assertEqual(
+            request.memory_environment["CODEX_HOME"],
+            "/memory/private-opaque/codex",
+        )
+        with self.assertRaises(TypeError):
+            cast(dict[str, str], request.memory_environment)["CODEX_HOME"] = "/forbidden"
+        for invalid in ({"": "value"}, {"BAD\x00NAME": "value"}, {"NAME": "bad\x00value"}):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                SessionRequest(
+                    working_directory="/workspace",
+                    memory_environment=invalid,
+                )
+
     async def test_tool_lifecycle_events_are_typed_immutable_snapshots(self) -> None:
         arguments: dict[str, JsonValue] = {"command": "pwd", "paths": ["."]}
         output: dict[str, JsonValue] = {"exitCode": 0, "lines": ["/workspace"]}

@@ -208,6 +208,7 @@ class SessionRequest:
     approval_policy: str | None = None
     approvals_reviewer: str | None = None
     sandbox_policy: Mapping[str, JsonValue] | None = None
+    memory_environment: Mapping[str, str] | None = None
 
     def __post_init__(self) -> None:
         if not self.working_directory:
@@ -223,6 +224,17 @@ class SessionRequest:
             if not isinstance(frozen_sandbox, Mapping) or not frozen_sandbox:
                 raise ValueError("sandbox policy must not be empty")
             object.__setattr__(self, "sandbox_policy", frozen_sandbox)
+        if self.memory_environment is not None:
+            if not isinstance(self.memory_environment, Mapping) or not self.memory_environment:
+                raise ValueError("memory environment must not be empty")
+            environment: dict[str, str] = {}
+            for name, value in self.memory_environment.items():
+                if not isinstance(name, str) or not name or "\x00" in name:
+                    raise ValueError("memory environment name is invalid")
+                if not isinstance(value, str) or "\x00" in value:
+                    raise ValueError("memory environment value is invalid")
+                environment[name] = value
+            object.__setattr__(self, "memory_environment", MappingProxyType(environment))
         if self.session_id == "":
             raise ValueError("session id must not be empty")
         if self.model == "":

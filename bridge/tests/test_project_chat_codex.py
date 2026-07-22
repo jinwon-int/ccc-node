@@ -144,6 +144,36 @@ async def _wait_until(predicate, *, timeout: float = 1.0) -> None:
             await asyncio.sleep(0)
 
 
+@pytest.mark.anyio
+async def test_project_chat_binds_opaque_codex_audiences_at_request_time(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    settings.bridge_memory_mode = "audience-scoped"
+    settings.telegram_session_scope = "shared-groups"
+    settings.bot_data_dir = tmp_path / ".telegram_bot"
+    settings.bridge_memory_audience_root = None
+    settings.bridge_memory_audience_key_path = None
+    settings.bridge_unsafe_shared_all_memory = False
+    settings.hook_policy_environment = lambda: {"CCC_NODE_ISOLATION_PROFILE": "external"}
+    runtime = FakeRuntime()
+    handler = ProjectChatHandler(settings=settings, agent_runtime=runtime)
+    handler._task_ledger_cache = False
+
+    await handler.process_message("private", 934719283, 934719283, new_session=True)
+    await handler.process_message("shared", 934719283, -100456, new_session=True)
+
+    private_env = runtime.requests[0].memory_environment
+    shared_env = runtime.requests[1].memory_environment
+    assert private_env is not None and shared_env is not None
+    assert private_env["CCC_MEMORY_AUDIENCE"] == "private"
+    assert shared_env["CCC_MEMORY_AUDIENCE"] == "shared"
+    assert private_env["CODEX_HOME"] != shared_env["CODEX_HOME"]
+    serialized = repr((private_env, shared_env))
+    assert "934719283" not in serialized
+    assert "-100456" not in serialized
+
+
 def test_agent_provider_settings_default_and_reject_unknown(tmp_path: Path) -> None:
     settings_class = _real_settings_class()
     environ = {"HOME": str(tmp_path), "TELEGRAM_BOT_TOKEN": "123456:test"}
