@@ -144,6 +144,7 @@ def test_bridge_consumers_do_not_depend_on_session_store_internals() -> None:
     consumers = (
         _BRIDGE_ROOT / "core" / "task_ledger.py",
         _BRIDGE_ROOT / "memory" / "distill_journal.py",
+        _BRIDGE_ROOT / "memory" / "distill_local_sink.py",
         _BRIDGE_ROOT / "utils" / "logging_setup.py",
     )
     for consumer in consumers:

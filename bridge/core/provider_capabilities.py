@@ -367,8 +367,8 @@ CAPABILITY_AXES: tuple[CapabilityAxis, ...] = (
             "(claude/hooks/distill/resume-write.sh, local-facts.sh)."
         ),
         codex=_unsupported(
-            "Extraction results are retained by the distill worker but not yet "
-            "routed to the local sink.",
+            "A replay-safe owner-only local sink primitive is available, but "
+            "retained extraction results are not yet audience-routed to it.",
             "#465",
         ),
     ),
