@@ -409,9 +409,10 @@ CAPABILITY_AXES: tuple[CapabilityAxis, ...] = (
             "SessionEnd write-back feeds the next SessionStart snapshot; both hook "
             "directions carry executable tests (memory-hooks.test.sh, distill/*.test.sh)."
         ),
-        codex=_unknown(
-            "Requires the #465 write-back path plus an approved live "
-            "A→distill→B recall proof.",
+        codex=_degraded(
+            "A hermetic audience-scoped A→distill→local index→B snapshot test "
+            "recalls one durable fact exactly once; Honcho/Wiki parity and an "
+            "approved live provider proof remain pending.",
             "#465",
         ),
     ),

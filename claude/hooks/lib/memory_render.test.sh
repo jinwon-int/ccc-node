@@ -57,15 +57,19 @@ out="$(SEARCH_JSON='BROKEN' python3 "$MOD" render-local-hot)"
 ok "render passes malformed JSON through raw" '[ "$out" = "BROKEN" ]'
 
 # ---- merge-local-hot --------------------------------------------------------
-pj='{"results":[{"path":"/p/a","snippet":"s1","score":0.2}]}'
+pj='{"results":[{"path":"/p/a","snippet":"task s1","score":0.9}]}'
+rj='{"results":[{"path":"/p/r","snippet":"recent","score":1.0},{"path":"/p/a","snippet":"recent full s1","score":0.7}]}'
 sj='{"results":[{"path":"/p/a","snippet":"s1","score":0.9},{"path":"/p/b","snippet":"s2","score":0.8}]}'
 lj='{"results":[{"path":"/p/c","snippet":"s3","score":0.5}]}'
-out="$(PRIMARY_JSON="$pj" SHARED_JSON="$sj" LEGACY_JSON="$lj" python3 "$MOD" merge-local-hot)"
-ok "merge dedupes by (path,snippet) with private precedence" 'jq -e "[.results[] | select(.path==\"/p/a\")] | length == 1 and .[0].memoryAudience == \"private\"" >/dev/null <<<"$out"'
+out="$(PRIMARY_JSON="$pj" RECENT_JSON="$rj" SHARED_JSON="$sj" LEGACY_JSON="$lj" python3 "$MOD" merge-local-hot)"
+ok "merge preserves the recent full snippet and the document's highest score" 'jq -e '\''[.results[] | select(.path=="/p/a")] | length == 1 and .[0].memoryAudience == "private" and .[0].snippet == "recent full s1" and .[0].score == 0.9'\'' >/dev/null <<<"$out"'
 ok "merge tags shared and legacy audiences" 'jq -e "(.results[] | select(.path==\"/p/b\").memoryAudience) == \"shared\" and (.results[] | select(.path==\"/p/c\").memoryAudience) == \"private-legacy\"" >/dev/null <<<"$out"'
-ok "merge sorts by score descending" 'jq -e ".results | map(.path) == [\"/p/b\",\"/p/c\",\"/p/a\"]" >/dev/null <<<"$out"'
+ok "merge tags recent rows with the primary audience" 'jq -e '\''(.results[] | select(.path=="/p/r").memoryAudience) == "private"'\'' >/dev/null <<<"$out"'
+ok "merge sorts by score descending" 'jq -e ".results | map(.path) == [\"/p/r\",\"/p/a\",\"/p/b\",\"/p/c\"]" >/dev/null <<<"$out"'
 out="$(PRIMARY_JSON='junk' SHARED_JSON="$sj" LEGACY_JSON='' python3 "$MOD" merge-local-hot)"
 ok "merge tolerates a malformed source (others still merged)" 'jq -e ".results | length == 2" >/dev/null <<<"$out"'
+out="$(PRIMARY_AUDIENCE=shared PRIMARY_JSON="$pj" RECENT_JSON="$rj" python3 "$MOD" merge-local-hot)"
+ok "merge labels a shared scope's task and recent rows as shared" 'jq -e '\''[.results[].memoryAudience] | all(. == "shared")'\'' >/dev/null <<<"$out"'
 
 # ---- dynamic-budget ---------------------------------------------------------
 # alloc = max(maxlocal, total - reserve - m - r - w - h); limit clamped [base,maxlim].
