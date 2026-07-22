@@ -10,7 +10,6 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 from datetime import datetime, timezone
-import errno
 import fcntl
 import hashlib
 import json
@@ -26,6 +25,8 @@ import subprocess
 import sys
 import time
 from typing import Mapping
+
+import ccc_secure_fs as _secure_fs
 
 BEGIN_MARKER = "<!-- ccc-node:codex-memory:begin -->"
 END_MARKER = "<!-- ccc-node:codex-memory:end -->"
@@ -204,10 +205,10 @@ def _bounded_float(raw: str | None, default: float, *, minimum: float, maximum: 
 
 
 def validate_owned_regular(metadata: os.stat_result | object) -> None:
-    mode = int(getattr(metadata, "st_mode"))
-    owner = int(getattr(metadata, "st_uid"))
-    links = int(getattr(metadata, "st_nlink"))
-    if not stat.S_ISREG(mode) or owner != os.geteuid() or links != 1 or stat.S_IMODE(mode) & 0o022:
+    if _secure_fs.owner_only_regular_violation(
+        metadata,
+        owner_id=os.geteuid(),
+    ):
         raise MaterializeError("codex_agents_unsafe")
 
 
@@ -418,50 +419,11 @@ def _merge_block(text: str, parsed: _ParsedBlock | None, block: str) -> str:
     return text + separator + block + "\n"
 
 
-def _fsync_directory(dir_fd: int) -> bool:
-    try:
-        os.fsync(dir_fd)
-        return True
-    except OSError as exc:
-        if exc.errno in {errno.EINVAL, errno.ENOTSUP, errno.EROFS}:
-            return False
-        raise
-
-
 def _atomic_write(dir_fd: int, name: str, payload: bytes) -> bool:
-    temp_name = f".{name}.tmp.{os.getpid()}.{secrets.token_hex(8)}"
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    descriptor = -1
     try:
-        descriptor = os.open(temp_name, flags, 0o600, dir_fd=dir_fd)
-        os.fchmod(descriptor, 0o600)
-        view = memoryview(payload)
-        while view:
-            written = os.write(descriptor, view)
-            if written <= 0:
-                raise OSError(errno.EIO, "short write")
-            view = view[written:]
-        os.fsync(descriptor)
-        os.close(descriptor)
-        descriptor = -1
-        os.replace(temp_name, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
-        return _fsync_directory(dir_fd)
+        return _secure_fs.atomic_write_bytes_at(dir_fd, name, payload)
     except OSError:
         raise MaterializeError("codex_io_failed") from None
-    finally:
-        if descriptor >= 0:
-            try:
-                os.close(descriptor)
-            except OSError:
-                pass
-        try:
-            os.unlink(temp_name, dir_fd=dir_fd)
-        except FileNotFoundError:
-            pass
-        except OSError:
-            pass
 
 
 def _lock(dir_fd: int, timeout_seconds: float) -> int:

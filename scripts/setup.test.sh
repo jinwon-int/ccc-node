@@ -211,9 +211,13 @@ ok "setup deploys the mtime-prune library the pruning hooks source" \
   '[ -x "$rewrite_claude/hooks/lib/mtime-prune.sh" ] && cmp -s "$ROOT/claude/hooks/lib/mtime-prune.sh" "$rewrite_claude/hooks/lib/mtime-prune.sh"'
 ok "setup installs the Codex launcher and materializer as executable managed hooks" \
   '[ -x "$rewrite_claude/hooks/ccc-codex" ] && [ -x "$rewrite_claude/hooks/ccc_codex_memory.py" ] && cmp -s "$ROOT/scripts/ccc-codex" "$rewrite_claude/hooks/ccc-codex" && cmp -s "$ROOT/scripts/ccc_codex_memory.py" "$rewrite_claude/hooks/ccc_codex_memory.py"'
+ok "setup installs the canonical secure-fs helper beside the Codex materializer" \
+  '[ -f "$rewrite_claude/hooks/ccc_secure_fs.py" ] && [ ! -x "$rewrite_claude/hooks/ccc_secure_fs.py" ] && cmp -s "$ROOT/bridge/utils/secure_fs.py" "$rewrite_claude/hooks/ccc_secure_fs.py"'
+ok "installed Codex materializer imports its colocated secure-fs helper" \
+  'PYTHONDONTWRITEBYTECODE=1 PYTHONPATH= "$rewrite_claude/hooks/ccc_codex_memory.py" --help >/dev/null 2>&1'
 codex_dry_out="$(HOME="$nonroot_home" CCC_CLAUDE_DIR="$nonroot_claude" CCC_HERMES_DIR="$nonroot_hermes" CCC_WIKI_AGENT_BIN="$nonroot_wiki" CCC_BRIDGE_DEFAULT_PATH="$nonroot_bridge" bash "$SETUP" --dry-run 2>&1)"; codex_dry_rc=$?
-ok "setup non-root dry-run includes both Codex managed launch artifacts" \
-  '[ "$codex_dry_rc" = 0 ] && grep -Fq "$nonroot_claude/hooks/ccc-codex" <<<"$codex_dry_out" && grep -Fq "$nonroot_claude/hooks/ccc_codex_memory.py" <<<"$codex_dry_out"'
+ok "setup non-root dry-run includes all Codex managed launch artifacts" \
+  '[ "$codex_dry_rc" = 0 ] && grep -Fq "$nonroot_claude/hooks/ccc-codex" <<<"$codex_dry_out" && grep -Fq "$nonroot_claude/hooks/ccc_codex_memory.py" <<<"$codex_dry_out" && grep -Fq "$nonroot_claude/hooks/ccc_secure_fs.py" <<<"$codex_dry_out"'
 
 # --- #569: hook-tree walk — deploys recursively, excludes tests/bytecode/wiring,
 # and dry-run only RENDERS the walk (no copies). rewrite_claude is a real install.

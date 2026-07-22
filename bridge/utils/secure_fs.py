@@ -5,11 +5,77 @@ from __future__ import annotations
 import errno
 import logging
 import os
+import secrets
 import stat
 import tempfile
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+
+def owner_only_regular_violation(
+    metadata: os.stat_result | object,
+    *,
+    owner_id: int,
+    unsafe_mode_mask: int = 0o022,
+) -> str | None:
+    """Return the first owner-only regular-file invariant violation, if any."""
+    mode = int(getattr(metadata, "st_mode"))
+    if not stat.S_ISREG(mode):
+        return "not_regular"
+    if int(getattr(metadata, "st_nlink")) != 1:
+        return "multiple_links"
+    if int(getattr(metadata, "st_uid")) != owner_id:
+        return "wrong_owner"
+    if stat.S_IMODE(mode) & unsafe_mode_mask:
+        return "unsafe_mode"
+    return None
+
+
+def fsync_directory_fd(dir_fd: int) -> bool:
+    """Sync an open directory, reporting known unsupported filesystems."""
+    try:
+        os.fsync(dir_fd)
+        return True
+    except OSError as error:
+        if error.errno in {errno.EINVAL, errno.ENOTSUP, errno.EROFS}:
+            return False
+        raise
+
+
+def atomic_write_bytes_at(dir_fd: int, name: str, payload: bytes) -> bool:
+    """Atomically replace a file relative to an already-validated directory."""
+    temp_name = f".{name}.tmp.{os.getpid()}.{secrets.token_hex(8)}"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = -1
+    try:
+        descriptor = os.open(temp_name, flags, 0o600, dir_fd=dir_fd)
+        os.fchmod(descriptor, 0o600)
+        view = memoryview(payload)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise OSError(errno.EIO, "short write")
+            view = view[written:]
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = -1
+        os.replace(temp_name, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+        return fsync_directory_fd(dir_fd)
+    finally:
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        try:
+            os.unlink(temp_name, dir_fd=dir_fd)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
 
 
 class SessionStoreDurabilityError(OSError):
@@ -232,11 +298,16 @@ def _secure_existing_state_file(path: Path) -> None:
         metadata = path.lstat()
     except FileNotFoundError:
         return
-    if not stat.S_ISREG(metadata.st_mode) or path.is_symlink():
+    violation = owner_only_regular_violation(
+        metadata,
+        owner_id=os.getuid(),
+        unsafe_mode_mask=0,
+    )
+    if violation == "not_regular" or path.is_symlink():
         raise PermissionError(f"session state must be a regular file: {path}")
-    if metadata.st_nlink != 1:
+    if violation == "multiple_links":
         raise PermissionError(f"session state must not have multiple hard links: {path}")
-    if hasattr(os, "getuid") and metadata.st_uid != os.getuid():
+    if violation == "wrong_owner":
         raise PermissionError(f"session state is not owned by this process: {path}")
     if stat.S_IMODE(metadata.st_mode) != 0o600:
         path.chmod(0o600)
