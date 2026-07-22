@@ -202,7 +202,6 @@ class CapabilityRuntimeDriftTests(unittest.TestCase):
     def test_codex_memory_gaps_track_issue_465(self) -> None:
         for axis_key in (
             "memory_writeback_distill",
-            "memory_sink_local",
             "memory_sink_honcho",
             "memory_sink_wiki_candidate",
             "memory_roundtrip",
@@ -211,6 +210,10 @@ class CapabilityRuntimeDriftTests(unittest.TestCase):
             with self.subTest(axis=axis_key):
                 self.assertIsNot(status.state, CapabilityState.SUPPORTED)
                 self.assertIn("#465", status.dependencies)
+        self.assertIs(
+            capability_status("codex", "memory_sink_local").state,
+            CapabilityState.SUPPORTED,
+        )
 
 
 if __name__ == "__main__":

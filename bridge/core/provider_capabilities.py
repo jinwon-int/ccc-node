@@ -351,9 +351,8 @@ CAPABILITY_AXES: tuple[CapabilityAxis, ...] = (
             "sink candidates via claude/hooks/distill.sh."
         ),
         codex=_degraded(
-            "The snapshot journal, strict extraction boundary, and leased distill "
-            "worker are merged; bridge trigger scheduling and sink routing are "
-            "still pending.",
+            "Session-reset triggers, extraction, and the local sink are scheduled; "
+            "explicit/checkpoint triggers and Honcho/Wiki routing remain pending.",
             "#465",
         ),
     ),
@@ -366,10 +365,9 @@ CAPABILITY_AXES: tuple[CapabilityAxis, ...] = (
             "Distill writes resume.md and local structured facts "
             "(claude/hooks/distill/resume-write.sh, local-facts.sh)."
         ),
-        codex=_unsupported(
-            "The replay-safe writer and independent journal lease state exist, "
-            "but trigger-time audience binding and scheduling are still pending.",
-            "#465",
+        codex=_supported(
+            "Supported session-reset triggers bind an opaque audience route, and "
+            "an independently leased worker writes replay-safe local facts/resume."
         ),
     ),
     _axis(

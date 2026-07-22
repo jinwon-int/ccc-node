@@ -38,6 +38,7 @@ class AppContext:
     session_manager: Any
     distill_journal: Any
     distill_extraction_worker: Any
+    distill_local_sink_worker: Any
     project_chat: Any
     agent_runtime: Any
     sdk_factory: Any
@@ -161,12 +162,24 @@ def build_context(
         ),
         wiki_enabled=wiki_enabled,
     )
+    distill_local_sink_worker = None
+    if settings.bridge_memory_mode == "audience-scoped":
+        from telegram_bot.core.memory_audience import shared_memory_audience
+        from telegram_bot.memory.distill_local_worker import (
+            CodexDistillLocalSinkWorker,
+        )
+
+        distill_local_sink_worker = CodexDistillLocalSinkWorker(
+            distill_journal,
+            audience_root=shared_memory_audience(settings).root,
+        )
     return AppContext(
         settings=settings,
         session_store=store,
         session_manager=session_manager,
         distill_journal=distill_journal,
         distill_extraction_worker=distill_extraction_worker,
+        distill_local_sink_worker=distill_local_sink_worker,
         project_chat=project_chat,
         agent_runtime=agent_runtime,
         sdk_factory=sdk_factory,
@@ -185,6 +198,7 @@ def create_app(context: AppContext):
         project_chat=context.project_chat,
         distill_journal=context.distill_journal,
         distill_extraction_worker=context.distill_extraction_worker,
+        distill_local_sink_worker=context.distill_local_sink_worker,
         application_builder_factory=context.telegram_port,
         clock=context.clock,
     )

@@ -487,6 +487,7 @@ class BotLifecycleMixin:
             workload_task = None
             dead_session_recovery_task = None
             distill_extraction_task = None
+            distill_local_sink_task = None
             health_alerts_task = None
             try:
                 await self.application.start()
@@ -534,6 +535,15 @@ class BotLifecycleMixin:
                     distill_extraction_task = asyncio.create_task(
                         self._distill_extraction_loop(stop_event),
                         name="distill-extraction",
+                    )
+                distill_local_sink_task = None
+                if (
+                    self._distill_local_sink_worker is not None
+                    and self._distill_journal is not None
+                ):
+                    distill_local_sink_task = asyncio.create_task(
+                        self._distill_local_sink_loop(stop_event),
+                        name="distill-local-sink",
                     )
 
                 await self._supervise_polling(stop_event)
@@ -620,6 +630,7 @@ class BotLifecycleMixin:
                     dead_session_recovery_task,
                     health_alerts_task,
                     distill_extraction_task,
+                    distill_local_sink_task,
                 ):
                     if _task and not _task.done():
                         _task.cancel()
@@ -966,6 +977,39 @@ class BotLifecycleMixin:
             except Exception:
                 logger.warning(
                     "Distill extraction sweep failed; continuing", exc_info=True
+                )
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=interval)
+            except (TimeoutError, asyncio.TimeoutError):
+                continue
+
+    async def _distill_local_sink_loop(self, stop_event: asyncio.Event) -> None:
+        """Drive independently leased local write-back without re-extraction."""
+
+        from telegram_bot.memory.distill_types import DistillLocalSinkStatus
+
+        worker = self._distill_local_sink_worker
+        journal = self._distill_journal
+        interval = float(
+            getattr(self._config, "distill_extraction_poll_interval", 300.0) or 300.0
+        )
+        while not stop_event.is_set():
+            try:
+                jobs = await asyncio.to_thread(journal.list_jobs)
+                for job in jobs:
+                    if stop_event.is_set():
+                        break
+                    if job.local_sink_status not in (
+                        DistillLocalSinkStatus.PENDING,
+                        DistillLocalSinkStatus.RETRYABLE_FAILED,
+                    ):
+                        continue
+                    await worker.write_once(job_id=job.job_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning(
+                    "Distill local-sink sweep failed; continuing", exc_info=True
                 )
             try:
                 await asyncio.wait_for(stop_event.wait(), timeout=interval)

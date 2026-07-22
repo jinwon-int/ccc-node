@@ -69,6 +69,7 @@ class TelegramBot(
         project_chat: Any,
         distill_journal: Any = None,
         distill_extraction_worker: Any = None,
+        distill_local_sink_worker: Any = None,
         application_builder_factory: Any = None,
         clock: Any = None,
     ):
@@ -80,6 +81,7 @@ class TelegramBot(
         # retained by the running application so #465's scheduling phase
         # drives this exact gated instance (#388).
         self._distill_extraction_worker = distill_extraction_worker
+        self._distill_local_sink_worker = distill_local_sink_worker
         self._application_builder_factory = (
             application_builder_factory or Application.builder
         )
@@ -206,6 +208,9 @@ class TelegramBot(
         self,
         session: dict[str, Any],
         trigger: DistillTrigger,
+        *,
+        user_id: int | None = None,
+        chat_id: int | None = None,
     ) -> DistillJob | None:
         provider = str(session.get("provider", "claude")).strip().lower()
         thread_id = session.get("session_id")
@@ -214,14 +219,36 @@ class TelegramBot(
         journal = getattr(self, "_distill_journal", None)
         if journal is None:
             return None
+        memory_audience = None
+        memory_scope = None
+        if user_id is not None and chat_id is not None:
+            from telegram_bot.core.memory_audience import resolve_memory_audience
+
+            audience = resolve_memory_audience(
+                self._config,
+                user_id=user_id,
+                chat_id=chat_id,
+            )
+            if audience is not None:
+                memory_audience = audience.kind
+                memory_scope = audience.scope
         return await asyncio.to_thread(
             journal.enqueue_once,
             provider="codex",
             thread_id=thread_id,
             trigger=trigger,
+            memory_audience=memory_audience,
+            memory_scope=memory_scope,
         )
 
-    async def _align_active_provider(self, session_key: Any, session=None):
+    async def _align_active_provider(
+        self,
+        session_key: Any,
+        session=None,
+        *,
+        user_id: int | None = None,
+        chat_id: int | None = None,
+    ):
         """Durably capture a departing Codex thread before provider state resets."""
         if session is None:
             session = await self._session_manager.get_session(session_key)
@@ -231,7 +258,10 @@ class TelegramBot(
         if provider == active_provider:
             return session, False
         await self._enqueue_previous_codex_session(
-            session, DistillTrigger.PROVIDER_SWITCH
+            session,
+            DistillTrigger.PROVIDER_SWITCH,
+            user_id=user_id,
+            chat_id=chat_id,
         )
         align = getattr(self._session_manager, "align_active_provider", None)
         if callable(align):
@@ -259,7 +289,12 @@ class TelegramBot(
         survive into the new one. Keeping the reset inside this helper means a
         call site cannot align the provider and forget the reset.
         """
-        aligned, switched = await self._align_active_provider(session_key, session)
+        aligned, switched = await self._align_active_provider(
+            session_key,
+            session,
+            user_id=user_id,
+            chat_id=chat_id,
+        )
         if switched:
             self._deny_codex_approvals(user_id, chat_id)
             self._invalidate_codex_approvals(user_id, chat_id)
@@ -267,9 +302,19 @@ class TelegramBot(
         return aligned, switched
 
     async def _reset_for_auto_new_session(
-        self, session_key: Any, session: dict[str, Any]
+        self,
+        session_key: Any,
+        session: dict[str, Any],
+        *,
+        user_id: int | None = None,
+        chat_id: int | None = None,
     ) -> None:
-        await self._enqueue_previous_codex_session(session, DistillTrigger.AUTO_NEW)
+        await self._enqueue_previous_codex_session(
+            session,
+            DistillTrigger.AUTO_NEW,
+            user_id=user_id,
+            chat_id=chat_id,
+        )
         await self._session_manager.patch_session(
             session_key,
             updates={"session_id": None, "new_session": False},
@@ -558,7 +603,10 @@ class TelegramBot(
             )
             if auto_new_session:
                 await self._reset_for_auto_new_session(
-                    conversation_key, current_session
+                    conversation_key,
+                    current_session,
+                    user_id=user_id,
+                    chat_id=chat.id,
                 )
                 new_session = True
 
