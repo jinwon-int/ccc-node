@@ -87,10 +87,20 @@ journal job. Snapshot and extraction work remain asynchronous.
   local/resume sink workers from the durable journal. Session reset, explicit,
   opt-in checkpoint, and bounded shutdown triggers are supported; Honcho/Wiki
   sink routing remains under #465.
+- `scripts/ccc-memory-check.sh --json` reports the journal aggregate under
+  `.writeback_queue` without reading any body into its output. It includes queue
+  status, valid/pending/invalid counts, journal and snapshot bytes, oldest age,
+  retry-attempt counters, and main/local status counts. `active` means healthy
+  work remains, `settled` means all valid jobs are terminal-successful,
+  `degraded` means a retry/failure or unsafe/malformed record was observed, and
+  `missing`/`empty` distinguish an uninitialized queue from an initialized queue
+  with no jobs. The read-only diagnostic defaults to
+  `${BOT_DATA_DIR:-${PROJECT_ROOT:-$PWD}/.telegram_bot}/distill-journal`; tests or
+  operators may select another journal with `CCC_DISTILL_JOURNAL_DIR`.
 
 ## Useful commands
 
-- `scripts/ccc-memory-check.sh` — cache and source health.
+- `scripts/ccc-memory-check.sh` — body-free read snapshot and write-back queue health.
 - `scripts/ccc-memory-index.sh` — local index rebuild/update.
 - `scripts/ccc-memory-query.sh` / `scripts/ccc-memory-search.sh` — query/explain recall behavior.
 - `scripts/ccc-memory-eval.sh` — no-network smoke/golden/scenario checks.
