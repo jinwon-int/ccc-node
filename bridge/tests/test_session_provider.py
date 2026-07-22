@@ -791,6 +791,157 @@ async def test_successful_codex_response_persists_provider_and_errors_do_not_ove
 
 
 @pytest.mark.anyio
+async def test_successful_codex_response_persists_opaque_shutdown_route(
+    tmp_path: Path,
+) -> None:
+    manager = make_manager(tmp_path, "codex")
+    bot = bare_bot(manager, provider="codex")
+    bot._config.bridge_memory_mode = "audience-scoped"
+    bot._config.telegram_session_scope = "per-user-chat"
+    bot._config.bridge_memory_audience_root = tmp_path / "audiences"
+    bot._config.bridge_memory_audience_key_path = tmp_path / "audience.key"
+
+    await bot._save_session_id(
+        934719283,
+        ChatResponse("ok", session_id="codex-private"),
+        user_id=934719283,
+        chat_id=934719283,
+    )
+
+    session = await manager.get_session(934719283)
+    assert session["distill_memory_audience"] == "private"
+    scope = session["distill_memory_scope"]
+    assert scope.startswith("private-")
+    assert "934719283" not in scope
+
+
+@pytest.mark.anyio
+async def test_successful_response_clears_stale_route_when_memory_mode_is_off(
+    tmp_path: Path,
+) -> None:
+    manager = make_manager(tmp_path, "codex")
+    await manager.store.set(
+        7,
+        {
+            "provider": "codex",
+            "session_id": "old-thread",
+            "distill_memory_audience": "shared",
+            "distill_memory_scope": "shared",
+        },
+    )
+    bot = bare_bot(manager, provider="codex")
+    bot._config.bridge_memory_mode = "off"
+
+    await bot._save_session_id(
+        7,
+        ChatResponse("ok", session_id="new-thread"),
+        user_id=7,
+        chat_id=7,
+    )
+
+    session = await manager.get_session(7)
+    assert "distill_memory_audience" not in session
+    assert "distill_memory_scope" not in session
+
+
+@pytest.mark.anyio
+async def test_shutdown_distill_enqueues_only_runtime_active_codex_sessions(
+    tmp_path: Path,
+) -> None:
+    from telegram_bot.memory.distill_types import DistillTrigger
+
+    manager = make_manager(tmp_path, "codex")
+    private_scope = "private-" + "a" * 32
+    await manager.store.set(
+        "7:9",
+        {
+            "provider": "codex",
+            "session_id": "active-thread",
+            "last_user_message_at": "2026-07-22T12:00:00+00:00",
+            "distill_memory_audience": "private",
+            "distill_memory_scope": private_scope,
+        },
+    )
+    await manager.store.set(
+        "7:10",
+        {"provider": "codex", "session_id": "inactive-thread"},
+    )
+    await manager.store.set(
+        "7:11",
+        {"provider": "claude", "session_id": "active-claude"},
+    )
+    journal = RecordingDistillJournal()
+    bot = bare_bot(manager, provider="codex")
+    bot._distill_journal = journal
+    bot._runtime_active_sessions = {"7:9", "7:11"}
+
+    await bot._enqueue_shutdown_distills()
+
+    assert len(journal.calls) == 1
+    call = journal.calls[0]
+    assert call["thread_id"] == "active-thread"
+    assert call["trigger"] is DistillTrigger.SHUTDOWN
+    assert call["memory_audience"] == "private"
+    assert call["memory_scope"] == private_scope
+    discriminator = str(call["discriminator"])
+    assert discriminator.startswith("shutdown-turn-v1-")
+    assert "2026-07-22" not in discriminator
+
+
+@pytest.mark.anyio
+async def test_repeated_shutdown_distill_deduplicates_the_same_turn(
+    tmp_path: Path,
+) -> None:
+    from telegram_bot.memory.distill_journal import DistillJournal
+
+    manager = make_manager(tmp_path, "codex")
+    await manager.store.set(
+        "7:9",
+        {
+            "provider": "codex",
+            "session_id": "active-thread",
+            "last_user_message_at": "2026-07-22T12:00:00+00:00",
+        },
+    )
+    journal = DistillJournal(tmp_path / "journal")
+    journal.initialize()
+    bot = bare_bot(manager, provider="codex")
+    bot._distill_journal = journal
+    bot._runtime_active_sessions = {"7:9"}
+
+    await bot._enqueue_shutdown_distills()
+    await bot._enqueue_shutdown_distills()
+
+    jobs = journal.list_jobs()
+    assert len(jobs) == 1
+    assert jobs[0].trigger.value == "shutdown"
+
+
+@pytest.mark.anyio
+async def test_shutdown_distill_is_bounded_and_fails_open(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    manager = make_manager(tmp_path, "codex")
+    await manager.store.set(
+        "7:9",
+        {"provider": "codex", "session_id": "active-thread"},
+    )
+    bot = bare_bot(manager, provider="codex")
+    bot._runtime_active_sessions = {"7:9"}
+    bot._distill_journal = RecordingDistillJournal()
+
+    async def blocked_enqueue(*_args, **_kwargs):
+        await __import__("asyncio").sleep(60)
+
+    bot._enqueue_previous_codex_session = blocked_enqueue
+
+    await bot._enqueue_shutdown_distills(timeout_seconds=0.01)
+
+    assert "timed out" in caplog.text.lower()
+
+
+@pytest.mark.anyio
 async def test_codex_model_callback_is_provider_scoped_and_conversation_safe(
     tmp_path: Path,
 ) -> None:

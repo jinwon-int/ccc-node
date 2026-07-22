@@ -36,7 +36,8 @@
         "new_command",
         "provider_switch",
         "auto_new",
-        "explicit"
+        "explicit",
+        "shutdown"
       ],
       "title": "DistillTrigger",
       "type": "string"

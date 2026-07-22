@@ -41,6 +41,11 @@ def test_explicit_trigger_is_in_checked_in_extraction_schema() -> None:
     assert "explicit" in schema["$defs"]["DistillTrigger"]["enum"]
 
 
+def test_shutdown_trigger_is_in_checked_in_extraction_schema() -> None:
+    schema = json.loads(SCHEMA_PATH.read_text())
+    assert "shutdown" in schema["$defs"]["DistillTrigger"]["enum"]
+
+
 THREAD_HASH = "a" * 64
 
 
@@ -131,7 +136,7 @@ def test_same_snapshot_and_trigger_produce_byte_identical_redacted_input() -> No
     [
         (lambda value: value.update(provider="claude"), "provider"),
         (lambda value: value.update(source_thread_hash="short"), "source_thread_hash"),
-        (lambda value: value.update(trigger="shutdown"), "trigger"),
+        (lambda value: value.update(trigger="manual"), "trigger"),
         (lambda value: value.update(content_trust="instructions"), "content_trust"),
         (lambda value: value.update(extra="smuggled"), "extra"),
         (lambda value: value["messages"][0].update(role="tool"), "role"),
@@ -247,7 +252,7 @@ def test_output_rejects_unknown_fields_at_every_object_boundary(path: tuple[obje
     [
         ("provider", "claude"),
         ("source_thread_hash", "0" * 63),
-        ("trigger", "shutdown"),
+        ("trigger", "manual"),
         ("distilled_at", "not-a-time"),
     ],
 )

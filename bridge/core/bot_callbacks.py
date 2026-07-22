@@ -140,7 +140,12 @@ class BotCallbackMixin:
                             chat_id
                         ),
                     )
-                    await self._save_session_id(conversation_key, response)
+                    await self._save_session_id(
+                        conversation_key,
+                        response,
+                        user_id=user_id,
+                        chat_id=chat_id,
+                    )
                     await self._send_smart(
                         chat_id,
                         response.content,

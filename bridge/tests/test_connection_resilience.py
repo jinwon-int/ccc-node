@@ -278,6 +278,44 @@ class TestConnectionResilience(unittest.TestCase):
 
         self.assertTrue(concurrent_progress)
 
+    def test_signal_stop_queues_shutdown_distill_after_handler_teardown(self):
+        """A real process stop records journal work; reconnect teardown does not own it."""
+        mock_app = Mock()
+        mock_app.initialize = AsyncMock()
+        mock_app.start = AsyncMock()
+        mock_updater = Mock()
+        type(mock_updater).running = PropertyMock(return_value=True)
+        mock_updater.start_polling = AsyncMock()
+        mock_updater.stop = AsyncMock()
+        mock_app.updater = mock_updater
+        type(mock_app).running = PropertyMock(return_value=True)
+        mock_app.stop = AsyncMock()
+        mock_app.shutdown = AsyncMock()
+        mock_app.bot = Mock()
+
+        async def stop_polling(stop_event):
+            stop_event.set()
+
+        async def assert_handlers_stopped():
+            mock_updater.stop.assert_awaited_once_with()
+            mock_app.stop.assert_awaited_once_with()
+            mock_app.shutdown.assert_awaited_once_with()
+
+        self.bot.application = mock_app
+        self.bot.build = Mock()
+        self.bot._on_ready = AsyncMock()
+        self.bot._probe_agent_readiness = Mock(return_value=(True, ""))
+        self.bot._supervise_polling = AsyncMock(side_effect=stop_polling)
+        self.bot._enqueue_shutdown_distills = AsyncMock(
+            side_effect=assert_handlers_stopped
+        )
+        self.bot._project_chat.close = AsyncMock()
+
+        asyncio.run(self.bot._run_async())
+
+        self.bot._enqueue_shutdown_distills.assert_awaited_once_with()
+        self.bot._project_chat.close.assert_awaited_once_with()
+
     def test_runtime_conflict_after_polling_start_fails_closed(self):
         """A Conflict emitted by PTB's polling retry loop AFTER polling started
         must still reach the fail-closed SystemExit path (#418 review).
