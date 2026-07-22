@@ -28,6 +28,7 @@ from .distill_types import (
     DistillExtractionAccounting,
     DistillJob,
     DistillJobStatus,
+    DistillHonchoSinkStatus,
     DistillLocalSinkStatus,
     DistillTrigger,
     DistillWikiSinkStatus,
@@ -231,6 +232,11 @@ class DistillJournal:
             or job.extraction_output is None
         ):
             raise ValueError("Wiki sink state requires completed extraction")
+        if job.honcho_sink_status is not None and (
+            job.status is not DistillJobStatus.EXTRACTION_DONE
+            or job.extraction_output is None
+        ):
+            raise ValueError("Honcho sink state requires completed extraction")
         return job
 
     def _write_unlocked(self, job: DistillJob) -> None:
@@ -484,10 +490,11 @@ class DistillJournal:
         extraction_output: DistillExtractionOutput,
         accounting: DistillExtractionAccounting | None = None,
         wiki_enabled: bool = True,
+        honcho_enabled: bool = True,
         now: datetime | None = None,
     ) -> DistillJob:
-        if type(wiki_enabled) is not bool:
-            raise ValueError("wiki_enabled must be boolean")
+        if type(wiki_enabled) is not bool or type(honcho_enabled) is not bool:
+            raise ValueError("sink enable flags must be boolean")
         payload = self._canonical_extraction_output(extraction_output)
         if not wiki_enabled and extraction_output.wiki_candidates:
             raise ValueError("Wiki-disabled extraction must not contain candidates")
@@ -526,6 +533,11 @@ class DistillJournal:
                     DistillWikiSinkStatus.PENDING
                     if wiki_enabled
                     else DistillWikiSinkStatus.DISABLED
+                ),
+                honcho_sink_status=(
+                    DistillHonchoSinkStatus.PENDING
+                    if honcho_enabled
+                    else DistillHonchoSinkStatus.DISABLED
                 ),
                 error_code=None,
             )
@@ -910,6 +922,123 @@ class DistillJournal:
             self._write_unlocked(failed)
             return failed
 
+    def claim_honcho_sink(
+        self,
+        job_id: str,
+        *,
+        owner_token: str,
+        now: datetime | None = None,
+        lease_seconds: int = 300,
+        max_attempts: int = 5,
+    ) -> DistillJob | None:
+        if not owner_token or lease_seconds <= 0 or max_attempts <= 0:
+            raise ValueError("invalid Honcho sink lease configuration")
+        current = _normalize_time(now or _utc_now())
+        with self._exclusive():
+            job = self._read_unlocked(job_id)
+            if job.honcho_sink_status not in {
+                DistillHonchoSinkStatus.PENDING,
+                DistillHonchoSinkStatus.RETRYABLE_FAILED,
+            }:
+                return None
+            if job.status is not DistillJobStatus.EXTRACTION_DONE or job.extraction_output is None:
+                raise ValueError("Honcho sink job is missing extraction output")
+            if job.honcho_sink_attempts >= max_attempts:
+                terminal = replace(
+                    job,
+                    honcho_sink_status=DistillHonchoSinkStatus.TERMINAL_FAILED,
+                    updated_at=_timestamp(current),
+                    honcho_sink_owner_token=None,
+                    honcho_sink_lease_expires_at=None,
+                    error_code="honcho_sink_max_attempts_exceeded",
+                )
+                self._write_unlocked(terminal)
+                return None
+            running = replace(
+                job,
+                honcho_sink_status=DistillHonchoSinkStatus.RUNNING,
+                updated_at=_timestamp(current),
+                honcho_sink_attempts=job.honcho_sink_attempts + 1,
+                honcho_sink_lease_epoch=job.honcho_sink_lease_epoch + 1,
+                honcho_sink_owner_token=owner_token,
+                honcho_sink_lease_expires_at=_timestamp(
+                    current + timedelta(seconds=lease_seconds)
+                ),
+                error_code=None,
+            )
+            self._write_unlocked(running)
+            return running
+
+    @staticmethod
+    def _require_running_honcho_sink(
+        job: DistillJob, owner_token: str, lease_epoch: int
+    ) -> None:
+        if job.honcho_sink_status is not DistillHonchoSinkStatus.RUNNING:
+            raise RuntimeError("invalid Honcho sink transition")
+        if (
+            job.honcho_sink_owner_token != owner_token
+            or job.honcho_sink_lease_epoch != lease_epoch
+        ):
+            raise RuntimeError("Honcho sink owner or lease epoch does not match")
+
+    def mark_honcho_sink_done(
+        self, job_id: str, *, owner_token: str, lease_epoch: int,
+        now: datetime | None = None,
+    ) -> DistillJob:
+        with self._exclusive():
+            job = self._read_unlocked(job_id)
+            self._require_running_honcho_sink(job, owner_token, lease_epoch)
+            done = replace(
+                job,
+                honcho_sink_status=DistillHonchoSinkStatus.DONE,
+                updated_at=_timestamp(now or _utc_now()),
+                honcho_sink_owner_token=None,
+                honcho_sink_lease_expires_at=None,
+                error_code=None,
+            )
+            self._write_unlocked(done)
+            return done
+
+    def mark_honcho_sink_retryable_failed(
+        self, job_id: str, *, owner_token: str, lease_epoch: int,
+        error_code: str, now: datetime | None = None,
+    ) -> DistillJob:
+        return self._mark_honcho_sink_failed(
+            job_id, owner_token=owner_token, lease_epoch=lease_epoch,
+            error_code=error_code, status=DistillHonchoSinkStatus.RETRYABLE_FAILED,
+            now=now,
+        )
+
+    def mark_honcho_sink_terminal_failed(
+        self, job_id: str, *, owner_token: str, lease_epoch: int,
+        error_code: str, now: datetime | None = None,
+    ) -> DistillJob:
+        return self._mark_honcho_sink_failed(
+            job_id, owner_token=owner_token, lease_epoch=lease_epoch,
+            error_code=error_code, status=DistillHonchoSinkStatus.TERMINAL_FAILED,
+            now=now,
+        )
+
+    def _mark_honcho_sink_failed(
+        self, job_id: str, *, owner_token: str, lease_epoch: int,
+        error_code: str, status: DistillHonchoSinkStatus,
+        now: datetime | None,
+    ) -> DistillJob:
+        self._validate_error_code(error_code)
+        with self._exclusive():
+            job = self._read_unlocked(job_id)
+            self._require_running_honcho_sink(job, owner_token, lease_epoch)
+            failed = replace(
+                job,
+                honcho_sink_status=status,
+                updated_at=_timestamp(now or _utc_now()),
+                honcho_sink_owner_token=None,
+                honcho_sink_lease_expires_at=None,
+                error_code=error_code,
+            )
+            self._write_unlocked(failed)
+            return failed
+
     def mark_retryable_failed(
         self,
         job_id: str,
@@ -1027,6 +1156,26 @@ class DistillJournal:
                             error_code="wiki_sink_lease_expired",
                         )
                         changed += 1
+                if (
+                    job.honcho_sink_status is DistillHonchoSinkStatus.RUNNING
+                    and job.honcho_sink_lease_expires_at is not None
+                ):
+                    try:
+                        honcho_expires = _parse_timestamp(
+                            job.honcho_sink_lease_expires_at
+                        )
+                    except ValueError as error:
+                        raise ValueError("invalid Honcho sink lease timestamp") from error
+                    if honcho_expires <= current_time:
+                        updated = replace(
+                            updated,
+                            honcho_sink_status=DistillHonchoSinkStatus.RETRYABLE_FAILED,
+                            updated_at=_timestamp(current_time),
+                            honcho_sink_owner_token=None,
+                            honcho_sink_lease_expires_at=None,
+                            error_code="honcho_sink_lease_expired",
+                        )
+                        changed += 1
                 if changed:
                     self._write_unlocked(updated)
                     recovered += changed
@@ -1067,6 +1216,13 @@ class DistillJournal:
             ),
             "wiki_sink_attempts": job.wiki_sink_attempts,
             "wiki_sink_lease_epoch": job.wiki_sink_lease_epoch,
+            "honcho_sink_status": (
+                job.honcho_sink_status.value
+                if job.honcho_sink_status is not None
+                else None
+            ),
+            "honcho_sink_attempts": job.honcho_sink_attempts,
+            "honcho_sink_lease_epoch": job.honcho_sink_lease_epoch,
             "message_count": len(snapshot.messages) if snapshot is not None else 0,
             "byte_count": snapshot.byte_count if snapshot is not None else 0,
             "truncated": snapshot.truncated if snapshot is not None else False,

@@ -41,6 +41,7 @@ class AppContext:
     distill_extraction_worker: Any
     distill_local_sink_worker: Any
     distill_wiki_sink_worker: Any
+    distill_honcho_sink_worker: Any
     project_chat: Any
     agent_runtime: Any
     sdk_factory: Any
@@ -176,6 +177,7 @@ def build_context(
             timeout_seconds=settings.codex_distill_timeout_seconds,
         ),
         wiki_enabled=wiki_enabled,
+        honcho_enabled=settings.honcho_memory_enabled,
         model=settings.codex_distill_model,
     )
     distill_snapshot_worker = None
@@ -211,6 +213,22 @@ def build_context(
             distill_journal,
             queue_dir=settings.bot_data_dir / "wiki-candidates",
         )
+    distill_honcho_sink_worker = None
+    if settings.agent_provider == "codex" and settings.honcho_memory_enabled:
+        from telegram_bot.memory.distill_honcho_worker import (
+            CodexDistillHonchoSinkWorker,
+            HonchoHttpSender,
+        )
+
+        distill_honcho_sink_worker = CodexDistillHonchoSinkWorker(
+            distill_journal,
+            outbox_dir=settings.bot_data_dir / "honcho-outbox",
+            sender=HonchoHttpSender(
+                settings.honcho_config_path,
+                node_label=os.environ.get("CCC_NODE", "ccc-node"),
+            ),
+        )
+
     return AppContext(
         settings=settings,
         session_store=store,
@@ -220,6 +238,7 @@ def build_context(
         distill_extraction_worker=distill_extraction_worker,
         distill_local_sink_worker=distill_local_sink_worker,
         distill_wiki_sink_worker=distill_wiki_sink_worker,
+        distill_honcho_sink_worker=distill_honcho_sink_worker,
         project_chat=project_chat,
         agent_runtime=agent_runtime,
         sdk_factory=sdk_factory,
@@ -241,6 +260,7 @@ def create_app(context: AppContext):
         distill_extraction_worker=context.distill_extraction_worker,
         distill_local_sink_worker=context.distill_local_sink_worker,
         distill_wiki_sink_worker=context.distill_wiki_sink_worker,
+        distill_honcho_sink_worker=context.distill_honcho_sink_worker,
         application_builder_factory=context.telegram_port,
         clock=context.clock,
     )

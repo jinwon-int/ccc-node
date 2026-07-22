@@ -490,6 +490,7 @@ class BotLifecycleMixin:
             distill_extraction_task = None
             distill_local_sink_task = None
             distill_wiki_sink_task = None
+            distill_honcho_sink_task = None
             health_alerts_task = None
             try:
                 await self.application.start()
@@ -563,6 +564,15 @@ class BotLifecycleMixin:
                     distill_wiki_sink_task = asyncio.create_task(
                         self._distill_wiki_sink_loop(stop_event),
                         name="distill-wiki-sink",
+                    )
+                distill_honcho_sink_task = None
+                if (
+                    self._distill_honcho_sink_worker is not None
+                    and self._distill_journal is not None
+                ):
+                    distill_honcho_sink_task = asyncio.create_task(
+                        self._distill_honcho_sink_loop(stop_event),
+                        name="distill-honcho-sink",
                     )
 
                 await self._supervise_polling(stop_event)
@@ -652,6 +662,7 @@ class BotLifecycleMixin:
                     distill_extraction_task,
                     distill_local_sink_task,
                     distill_wiki_sink_task,
+                    distill_honcho_sink_task,
                 ):
                     if _task and not _task.done():
                         _task.cancel()
@@ -1102,6 +1113,39 @@ class BotLifecycleMixin:
             except Exception:
                 logger.warning(
                     "Distill Wiki-sink sweep failed; continuing", exc_info=True
+                )
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=interval)
+            except (TimeoutError, asyncio.TimeoutError):
+                continue
+
+    async def _distill_honcho_sink_loop(self, stop_event: asyncio.Event) -> None:
+        """Drive independently leased Honcho delivery from the durable outbox."""
+
+        from telegram_bot.memory.distill_types import DistillHonchoSinkStatus
+
+        worker = self._distill_honcho_sink_worker
+        journal = self._distill_journal
+        interval = float(
+            getattr(self._config, "distill_extraction_poll_interval", 300.0) or 300.0
+        )
+        while not stop_event.is_set():
+            try:
+                await asyncio.to_thread(journal.recover_stale_running)
+                for job in await asyncio.to_thread(journal.list_jobs):
+                    if stop_event.is_set():
+                        break
+                    if job.honcho_sink_status not in (
+                        DistillHonchoSinkStatus.PENDING,
+                        DistillHonchoSinkStatus.RETRYABLE_FAILED,
+                    ):
+                        continue
+                    await worker.write_once(job_id=job.job_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning(
+                    "Distill Honcho-sink sweep failed; continuing", exc_info=True
                 )
             try:
                 await asyncio.wait_for(stop_event.wait(), timeout=interval)

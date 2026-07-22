@@ -15,7 +15,7 @@ ccc-node memory starts from a no-network SessionStart snapshot and refreshes cac
 - `CCC_NODE_ISOLATION_PROFILE=external` is the higher-priority external-node placement policy. The bridge validates and exports it to Claude hooks; it forces Family Wiki off and the PreToolUse guard rejects Family/internal paths, URLs, commands, and MCP calls before the ordinary approval escape hatch.
 - `CCC_WIKI_MEMORY_ENABLED=0` disables the Family Wiki read and write path: no cache injection, refresh, local indexing, distill candidate generation, or Wiki queue writes. Existing cache files are ignored and removed from the local index on its next update/rebuild. An external isolation profile overrides an attempted `=1`.
 - `CCC_MEMORY_USER_LABEL` and `CCC_MEMORY_ASSISTANT_LABEL` set the node-local relationship labels used by memory injection and distill. Defaults preserve the existing Seoyoon fleet behavior.
-- `CCC_HONCHO_MEMORY_ENABLED=0` disables the Honcho read path. A node may therefore run built-in/local memory only, Honcho without Wiki, or the default combined profile.
+- `CCC_HONCHO_MEMORY_ENABLED=0` disables the Honcho read and Codex write-back path. A node may therefore run built-in/local memory only, Honcho without Wiki, or the default combined profile. `CCC_HONCHO_CFG` selects the owner-only endpoint/credential config (default `~/.hermes/honcho.json`).
 
 ## Codex global snapshot materializer
 
@@ -103,7 +103,12 @@ before claim/provider execution without blocking interactive turns.
   candidate fields plus hashed provenance and remain `review_status=pending`; this
   path never invokes `wiki-agent`, writes a Wiki page, creates a branch/PR, or merges.
   Empty candidate sets complete without a queue record. Honcho routing remains under
-  #465.
+  an independent lease: validated facts first enter the owner-only
+  `${BOT_DATA_DIR}/honcho-outbox/<job-id>.json`, then use a stable
+  `Idempotency-Key` for bounded HTTP delivery. Network/config outages keep the
+  outbox record retryable without re-extraction; success acknowledges the record.
+  The Honcho payload contains strict facts and hashed provenance, never raw thread,
+  Telegram route, transcript, or credential values.
 - A completed audience-local sink write refreshes that scope's derived SQLite
   index with the installed `ccc-memory-index.sh` before the journal marks the
   local stage done. The bounded subprocess receives only local path/policy

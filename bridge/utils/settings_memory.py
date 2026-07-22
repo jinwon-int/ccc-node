@@ -31,6 +31,16 @@ class MemorySettingsMixin:
         alias="CCC_WIKI_MEMORY_ENABLED",
         description="Family Wiki memory source/sink toggle; external profile always overrides off.",
     )
+    honcho_memory_enabled: bool = Field(
+        default=True,
+        alias="CCC_HONCHO_MEMORY_ENABLED",
+        description="Honcho read/write memory toggle.",
+    )
+    honcho_config_path: Path = Field(
+        default_factory=lambda: Path.home() / ".hermes" / "honcho.json",
+        alias="CCC_HONCHO_CFG",
+        description="Owner-only node-local Honcho endpoint/credential config.",
+    )
     memory_user_label: str = Field(
         default="Seo Jin On / 서진원",
         alias="CCC_MEMORY_USER_LABEL",
@@ -142,6 +152,7 @@ class MemorySettingsMixin:
             "CCC_WIKI_MEMORY_ENABLED": (
                 "0" if profile == "external" else ("1" if self.wiki_memory_enabled else "0")
             ),
+            "CCC_HONCHO_MEMORY_ENABLED": "1" if self.honcho_memory_enabled else "0",
             "CCC_MEMORY_USER_LABEL": self.memory_user_label,
             "CCC_MEMORY_ASSISTANT_LABEL": self.memory_assistant_label,
         }

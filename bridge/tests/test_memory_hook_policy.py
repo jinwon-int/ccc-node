@@ -42,6 +42,7 @@ def test_external_policy_forces_wiki_off_and_exports_only_validated_fields(tmp_p
     assert exported == {
         "CCC_NODE_ISOLATION_PROFILE": "external",
         "CCC_WIKI_MEMORY_ENABLED": "0",
+        "CCC_HONCHO_MEMORY_ENABLED": "1",
         "CCC_MEMORY_USER_LABEL": "Etter Ahn",
         "CCC_MEMORY_ASSISTANT_LABEL": "Karellen",
     }

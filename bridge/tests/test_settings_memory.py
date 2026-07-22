@@ -11,6 +11,8 @@ from telegram_bot.utils.settings_memory import MemorySettingsMixin
 MEMORY_FIELDS = {
     "node_isolation_profile": "CCC_NODE_ISOLATION_PROFILE",
     "wiki_memory_enabled": "CCC_WIKI_MEMORY_ENABLED",
+    "honcho_memory_enabled": "CCC_HONCHO_MEMORY_ENABLED",
+    "honcho_config_path": "CCC_HONCHO_CFG",
     "memory_user_label": "CCC_MEMORY_USER_LABEL",
     "memory_assistant_label": "CCC_MEMORY_ASSISTANT_LABEL",
     "codex_memory_materializer_path": "CCC_CODEX_MEMORY_MATERIALIZER_PATH",
