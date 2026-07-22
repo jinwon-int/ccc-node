@@ -54,6 +54,7 @@ from telegram import Update
 
 sys.modules.pop("telegram_bot.core.bot", None)
 import telegram_bot.core.bot as bot_module
+from telegram_bot.core import bot_lifecycle as bot_lifecycle_module
 
 TelegramBot = bot_module.TelegramBot
 
@@ -86,19 +87,19 @@ class TestConnectionResilience(unittest.TestCase):
             project_chat=Mock(),
         )
 
-    @patch.object(bot_module, "Application")
-    @patch.object(bot_module, "HTTPXRequest", side_effect=lambda **kwargs: kwargs)
-    def test_builder_configures_timeouts(self, mock_httpx_request, mock_app_class):
+    @patch.object(
+        bot_lifecycle_module, "HTTPXRequest", side_effect=lambda **kwargs: kwargs
+    )
+    def test_builder_configures_timeouts(self, mock_httpx_request):
         """Application.builder() should use dedicated HTTPX requests for polling and API calls."""
         mock_builder = Mock()
-        mock_app_class.builder.return_value = mock_builder
 
         mock_builder.token.return_value = mock_builder
         mock_builder.concurrent_updates.return_value = mock_builder
         mock_builder.get_updates_request.return_value = mock_builder
         mock_builder.request.return_value = mock_builder
         mock_builder.build.return_value = Mock()
-        self.bot._application_builder_factory = mock_app_class.builder
+        self.bot._application_builder_factory = Mock(return_value=mock_builder)
 
         self.bot.build()
 
@@ -129,7 +130,7 @@ class TestConnectionResilience(unittest.TestCase):
     def test_request_builders_use_proxy_and_http11(self):
         """Both request builders should honor proxy settings and force HTTP/1.1."""
         with patch.object(
-            bot_module,
+            bot_lifecycle_module,
             "HTTPXRequest",
             side_effect=lambda **kwargs: kwargs,
         ):
