@@ -39,6 +39,7 @@ from telegram_bot.core.agent_runtime import (
     deny_approval,
 )
 from telegram_bot.core.project_chat import ProjectChatHandler
+from telegram_bot.core.task_ledger import TaskLedger
 
 
 @pytest.fixture
@@ -1256,6 +1257,69 @@ async def test_codex_terminal_stall_releases_turn_and_queued_request_proceeds(
     assert queued.success is True and queued.content == "ok"
     assert follow.messages == ["queued"]
     assert len(runtime.requests) == 2
+
+
+@pytest.mark.anyio
+async def test_turn_admission_timeout_releases_pre_event_waiter_and_fifo(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression for #625: no first event means the text-based #411 guard
+    cannot arm, but the request must still release before the 6h timeout."""
+
+    blocked = StallSession("thread-1", pre_events=[])
+    follow = FakeSession("thread-1")
+    runtime = FakeRuntime([blocked, follow])
+    handler, stalled = _stall_handler(tmp_path, runtime, monkeypatch)
+    handler._config.turn_admission_timeout_seconds = 0.05
+    handler._process_timeout_seconds = 5.0
+
+    first_task = asyncio.create_task(handler.process_message("blocked", 7, 70))
+    await _wait_until(lambda: blocked.messages == ["blocked"])
+    assert handler.waiting_for_turn_snapshot() == 1
+    queued_task = asyncio.create_task(handler.process_message("queued", 7, 70))
+
+    first, queued = await asyncio.wait_for(
+        asyncio.gather(first_task, queued_task), timeout=5
+    )
+
+    assert first.success is False
+    assert first.error == "Agent turn did not start within 0.05s"
+    # Interrupt happens while the iterator still owns the live runtime turn;
+    # only then is the abandoned generator closed.
+    assert blocked.interrupt_calls == 1
+    assert blocked.closed is True
+    assert stalled == [1]
+    assert handler.waiting_for_turn_snapshot() == 0
+    # The cached poisoned session is evicted, so the queued request starts on
+    # a fresh session instead of inheriting the leaked turn lock.
+    assert queued.success is True and queued.content == "ok"
+    assert follow.messages == ["queued"]
+    assert len(runtime.requests) == 2
+
+
+@pytest.mark.anyio
+async def test_task_ledger_marks_pre_event_request_waiting_for_turn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    blocked = StallSession("thread-1", pre_events=[])
+    settings = _settings(tmp_path)
+    settings.bot_data_dir = tmp_path / ".telegram_bot"
+    settings.task_ledger_path = settings.bot_data_dir / "tasks.json"
+    settings.turn_admission_timeout_seconds = 0.2
+    handler = ProjectChatHandler(
+        settings=settings, agent_runtime=FakeRuntime([blocked])
+    )
+    handler._task_ledger_cache = TaskLedger(settings.task_ledger_path)
+
+    task = asyncio.create_task(handler.process_message("blocked", 7, 70))
+    await _wait_until(lambda: blocked.messages == ["blocked"])
+    records = handler._task_ledger.records()
+    assert len(records) == 1
+    assert records[0]["state"] == "waiting-for-turn"
+
+    response = await asyncio.wait_for(task, timeout=5)
+    assert response.success is False
+    assert handler._task_ledger.records() == []
 
 
 @pytest.mark.anyio

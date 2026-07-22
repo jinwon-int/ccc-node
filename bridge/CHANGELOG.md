@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **A missing provider terminal event could still pin the next Telegram request
+  before its first runtime event (#625).** Requests now enter an explicit
+  `waiting-for-turn` ledger/health state and have a separate bounded admission
+  timeout (`CCC_TURN_ADMISSION_TIMEOUT_SECONDS`, default 300s). On timeout the
+  bridge interrupts the live owner before cancelling its event iterator,
+  evicts the poisoned session, and releases the conversation FIFO. The Claude
+  adapter additionally tracks the real owner of each shared session lock,
+  closes that owner, and rotates only the affected lock so a recreated session
+  cannot inherit the dead queue. Long-running tools and approval waits remain
+  governed by their existing post-admission lifecycle guards.
 - **Telegram bridge memory could cross from DMs into public chats.** The new
   opt-in `CCC_BRIDGE_MEMORY_MODE=audience-scoped` routes public conversations
   to one shared local store and each DM to an opaque HMAC-derived private store;

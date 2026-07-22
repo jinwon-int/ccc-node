@@ -22,6 +22,7 @@ from telegram_bot.core.task_ledger import (  # noqa: E402
     INTERRUPTED,
     MAX_TERMINAL_OP_ATTEMPTS,
     TaskLedger,
+    WAITING_FOR_TURN,
     WORKING,
     default_task_ledger_path,
     ledger_path_for,
@@ -76,6 +77,8 @@ class TaskLedgerTests(unittest.TestCase):
 
     def test_nonterminal_state_transitions(self):
         task_id = self.ledger.create(1, 2)
+        self.ledger.set_state(task_id, WAITING_FOR_TURN)
+        self.assertEqual(self._only_record()["state"], WAITING_FOR_TURN)
         self.ledger.set_state(task_id, INPUT_REQUIRED)
         self.assertEqual(self._only_record()["state"], INPUT_REQUIRED)
         self.ledger.set_state(task_id, WORKING)

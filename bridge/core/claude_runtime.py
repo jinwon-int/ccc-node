@@ -279,6 +279,7 @@ class ClaudeSession:
             if client is None or lock is None:
                 raise RuntimeError("Claude session is not started")
             async with lock:
+                self._runtime._turn_owners[self.session_id] = self
                 active = _ActiveTurn(asyncio.Queue(), approval_handler)
                 self._active_turn = active
                 queried = False
@@ -308,16 +309,48 @@ class ClaudeSession:
                     active.finished = True
                     if self._active_turn is active:
                         self._active_turn = None
+                    if self._runtime._turn_owners.get(self.session_id) is self:
+                        self._runtime._turn_owners.pop(self.session_id, None)
 
         return events()
 
     async def interrupt(self) -> None:
+        owner = self._runtime._turn_owners.get(self.session_id)
+        if owner is not None and owner is not self:
+            await owner.interrupt()
+            return
         active = self._active_turn
         client = self._client
         if active is None or active.finished or client is None:
             return
         active.interrupt_requested = True
         await client.interrupt()
+
+    async def abort_stalled_turn(self) -> None:
+        """Close the real lock owner and rotate its poisoned admission lock.
+
+        A second session resumed with the same id shares ``_turn_lock``. If
+        the first session lost its terminal frame, interrupting the waiter
+        alone cannot release that lock and every recreated session would join
+        the same dead queue. Closing the recorded owner terminates its reader;
+        rotating only that session id lets the next clean session proceed
+        while the abandoned generator unwinds on the old lock (#625).
+        """
+
+        session_id = self.session_id
+        owner = self._runtime._turn_owners.get(session_id) or self
+        if owner is not self:
+            # The waiter's ``__anext__`` task is cancelled immediately after
+            # this hook returns. Close its client first so it cannot submit a
+            # prompt in the narrow race where the old owner releases the lock
+            # while the abort is still unwinding.
+            await self.close()
+        await owner.close()
+        owner_lock = owner._turn_lock
+        if self._runtime._session_locks.get(session_id) is owner_lock:
+            self._runtime._session_locks[session_id] = asyncio.Lock()
+        if self._runtime._turn_owners.get(session_id) is owner:
+            self._runtime._turn_owners.pop(session_id, None)
 
     # -- SDK frame translation ---------------------------------------------
 
@@ -623,6 +656,7 @@ class ClaudeRuntime:
         self._transcripts_dir = Path(transcripts_dir) if transcripts_dir is not None else None
         self._session_id_timeout_seconds = session_id_timeout_seconds
         self._session_locks: dict[str, asyncio.Lock] = {}
+        self._turn_owners: dict[str, ClaudeSession] = {}
         self._sessions: list[ClaudeSession] = []
         self._closed = False
 

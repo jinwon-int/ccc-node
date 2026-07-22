@@ -42,6 +42,7 @@ from telegram_bot.core.task_ledger import (
     FAILED as TASK_FAILED,
     INPUT_REQUIRED as TASK_INPUT_REQUIRED,
     TIMEOUT as TASK_TIMEOUT,
+    WAITING_FOR_TURN as TASK_WAITING_FOR_TURN,
     WORKING as TASK_WORKING,
 )
 from telegram_bot.core.sdk_text import TERMINAL_STALL_NOTICE
@@ -311,6 +312,9 @@ class ProjectChatProcessMixin:
             progress_request.usage_mode = usage_mode
             progress_request.started_at = loop.time()
             progress_request.task_id = self._ledger_create(user_id, chat_id)
+            ledger = self._task_ledger
+            if ledger and progress_request.task_id:
+                ledger.set_state(progress_request.task_id, TASK_WAITING_FOR_TURN)
             progress_task = asyncio.create_task(
                 self._agent_progress_loop(progress_request),
                 name=f"agent-progress-{user_id}-{chat_id}",
@@ -372,6 +376,7 @@ class ProjectChatProcessMixin:
                 )
                 self._agent_active_sessions[key] = session
                 self._agent_started_at[key] = asyncio.get_running_loop().time()
+                self._agent_waiting_for_turn.add(key)
                 text_parts: list[str] = []
                 response_parts: list[str] = []
                 current_message_parts: list[str] = []
@@ -412,7 +417,14 @@ class ProjectChatProcessMixin:
                 stall_grace = float(
                     getattr(self._config, "terminal_stall_seconds", 0.0) or 0.0
                 )
+                admission_grace = float(
+                    getattr(
+                        self._config, "turn_admission_timeout_seconds", 0.0
+                    )
+                    or 0.0
+                )
                 stalled = False
+                admission_stalled = False
                 attempt_recorded = False
 
                 async def deliver_pending_interim() -> None:
@@ -459,15 +471,66 @@ class ProjectChatProcessMixin:
                     consuming after the bounded grace instead of holding the
                     conversation until the full process timeout.
                     """
-                    nonlocal terminal_error, stalled, pending_completed_message
+                    nonlocal terminal_error, stalled, admission_stalled
+                    nonlocal pending_completed_message
                     nonlocal attempt_recorded
                     busy_depth = 0
                     approval_pending = False
+                    admitted = False
                     active_tools: dict[str, str] = {}
                     iterator = session.send_turn(
                         user_message,
                         approval_handler=handle_approval,
                     ).__aiter__()
+
+                    async def next_event(timeout: float) -> tuple[bool, Any]:
+                        """Wait without cancelling the iterator before interrupt.
+
+                        asyncio.wait_for() cancels ``__anext__`` before raising its
+                        timeout. Both real runtimes clear their active-turn entry
+                        during that cancellation, making the later interrupt a
+                        no-op. Keep the next-event task alive long enough to
+                        interrupt the owning provider turn first, then cancel and
+                        close the iterator (#625).
+                        """
+
+                        pending = asyncio.create_task(iterator.__anext__())
+                        try:
+                            done, _ = await asyncio.wait((pending,), timeout=timeout)
+                            if done:
+                                return False, pending.result()
+                            await self._interrupt_agent_session(session)
+                            # Once the real owner has received its interrupt,
+                            # remove this waiter from the old shared lock before
+                            # closing/rotating the owner. Otherwise releasing
+                            # that lock can let the timed-out prompt slip into
+                            # the poisoned session during abort cleanup.
+                            pending.cancel()
+                            await asyncio.gather(pending, return_exceptions=True)
+                            abort_stalled_turn = getattr(
+                                session, "abort_stalled_turn", None
+                            )
+                            if callable(abort_stalled_turn):
+                                try:
+                                    await asyncio.wait_for(
+                                        abort_stalled_turn(),
+                                        timeout=self._agent_interrupt_timeout_seconds,
+                                    )
+                                except TimeoutError:
+                                    logger.warning(
+                                        "Agent stalled-turn abort timed out after %.1fs",
+                                        self._agent_interrupt_timeout_seconds,
+                                    )
+                                except Exception:
+                                    logger.exception(
+                                        "Failed to abort stalled agent turn owner"
+                                    )
+                            return True, None
+                        except asyncio.CancelledError:
+                            pending.cancel()
+                            await asyncio.gather(pending, return_exceptions=True)
+                            raise
+
                     try:
                         while True:
                             stall_eligible = (
@@ -477,18 +540,31 @@ class ProjectChatProcessMixin:
                                 and not approval_pending
                             )
                             try:
-                                if stall_eligible:
-                                    event = await asyncio.wait_for(
-                                        iterator.__anext__(), timeout=stall_grace
-                                    )
+                                if not admitted and admission_grace > 0:
+                                    timed_out, event = await next_event(admission_grace)
+                                elif stall_eligible:
+                                    timed_out, event = await next_event(stall_grace)
                                 else:
+                                    timed_out = False
                                     event = await iterator.__anext__()
                             except StopAsyncIteration:
                                 return
-                            except TimeoutError:
-                                stalled = True
+                            if timed_out:
+                                if admitted:
+                                    stalled = True
+                                else:
+                                    admission_stalled = True
                                 return
                             now = asyncio.get_running_loop().time()
+                            if not admitted:
+                                admitted = True
+                                progress_request.waiting_for_turn = False
+                                self._agent_waiting_for_turn.discard(key)
+                                ledger = self._task_ledger
+                                if ledger and progress_request.task_id:
+                                    ledger.set_state(
+                                        progress_request.task_id, TASK_WORKING
+                                    )
                             progress_request.last_event_at = now
                             if not attempt_recorded:
                                 # Claude adapter-path spend boundary (#388):
@@ -577,10 +653,32 @@ class ProjectChatProcessMixin:
                     consume_agent_events(), timeout=self._process_timeout_seconds
                 )
 
+                if admission_stalled:
+                    progress_terminal_state = TASK_TIMEOUT
+                    self._drop_agent_session(key, session)
+                    logger.warning(
+                        "Turn admission timed out for user %s chat %s before the "
+                        "runtime produced its first event",
+                        user_id,
+                        chat_id,
+                    )
+                    try:
+                        health_reporter.record_stalled_request()
+                    except Exception:
+                        pass
+                    message = (
+                        f"Agent turn did not start within {admission_grace:g}s"
+                    )
+                    return ChatResponse(
+                        content=f"⏰ {message}. Please retry your request.",
+                        success=False,
+                        error=message,
+                        session_id=session.session_id,
+                    )
+
                 if stalled:
                     progress_terminal_state = TASK_COMPLETED
                     self._drop_agent_session(key, session)
-                    await self._interrupt_agent_session(session)
                     final_streamed = False
                     if streaming_handler:
                         final_streamed = await streaming_handler.finalize_all()
@@ -690,3 +788,4 @@ class ProjectChatProcessMixin:
                 if self._agent_active_sessions.get(key) is session:
                     self._agent_active_sessions.pop(key, None)
                     self._agent_started_at.pop(key, None)
+                self._agent_waiting_for_turn.discard(key)

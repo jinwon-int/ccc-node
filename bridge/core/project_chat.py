@@ -204,6 +204,7 @@ class ProjectChatHandler(
         self._agent_active_generations: Dict[Tuple[int, int], int] = {}
         self._agent_generation_counters: Dict[Tuple[int, int], int] = {}
         self._agent_started_at: Dict[Tuple[int, int], float] = {}
+        self._agent_waiting_for_turn: set[Tuple[int, int]] = set()
         self._agent_runtime_closed = False
         self._agent_interrupt_timeout_seconds = 10.0
         self._clock = clock or time
@@ -545,6 +546,11 @@ class ProjectChatHandler(
         oldest_age = (now - oldest_started) if oldest_started is not None else 0.0
         return count, max(0.0, oldest_age)
 
+    def waiting_for_turn_snapshot(self) -> int:
+        """Requests registered by the bridge but not admitted by a runtime."""
+
+        return len(self._agent_waiting_for_turn)
+
     @property
     def _task_ledger(self):
         """Lazy persistent task ledger; None when no data dir is configured."""
@@ -729,4 +735,3 @@ class ProjectChatHandler(
         ):
             return False
         return True
-

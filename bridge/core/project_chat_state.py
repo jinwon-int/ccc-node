@@ -69,6 +69,7 @@ class ProjectChatStateMixin:
             if self._agent_active_sessions.get(key) in sessions:
                 self._agent_active_sessions.pop(key, None)
                 self._agent_started_at.pop(key, None)
+                self._agent_waiting_for_turn.discard(key)
         return bool(sessions)
 
     async def cancel_user_streaming(self, user_id: int, chat_id: Optional[int] = None) -> bool:
@@ -145,6 +146,7 @@ class ProjectChatStateMixin:
             return
         self._agent_runtime_closed = True
         self._agent_active_generations.clear()
+        self._agent_waiting_for_turn.clear()
         await asyncio.gather(
             *(
                 self._interrupt_agent_session(session)
