@@ -182,6 +182,7 @@ def test_audience_codex_environment_is_opaque_and_physically_separate(
     tmp_path: Path,
 ) -> None:
     settings = _audience_settings(tmp_path)
+    settings.codex_audience_auth_mode = "keyring"
     private = resolve_memory_audience(settings, user_id=934719283, chat_id=934719283)
     public = resolve_memory_audience(settings, user_id=934719283, chat_id=-100456)
     assert private is not None and public is not None
@@ -193,6 +194,8 @@ def test_audience_codex_environment_is_opaque_and_physically_separate(
     assert public_env["CODEX_HOME"] == str(public.scope_root / "codex")
     assert private_env["CODEX_SQLITE_HOME"] == private_env["CODEX_HOME"]
     assert public_env["CODEX_SQLITE_HOME"] == public_env["CODEX_HOME"]
+    assert private_env["CCC_CODEX_AUDIENCE_AUTH_MODE"] == "keyring"
+    assert public_env["CCC_CODEX_AUDIENCE_AUTH_MODE"] == "keyring"
     assert private_env["CODEX_HOME"] != public_env["CODEX_HOME"]
     assert private_env["CCC_MEMORY_AUDIENCE"] == "private"
     assert public_env["CCC_MEMORY_AUDIENCE"] == "shared"
@@ -352,4 +355,3 @@ def test_first_request_deterministically_seeds_shared_all_session() -> None:
         assert stale_default["session_id"] == "first-group"
 
     asyncio.run(exercise())
-

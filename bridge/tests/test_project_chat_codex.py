@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import stat
 import sys
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -155,6 +156,7 @@ async def test_project_chat_binds_opaque_codex_audiences_at_request_time(
     settings.bridge_memory_audience_root = None
     settings.bridge_memory_audience_key_path = None
     settings.bridge_unsafe_shared_all_memory = False
+    settings.codex_audience_auth_mode = "keyring"
     settings.hook_policy_environment = lambda: {"CCC_NODE_ISOLATION_PROFILE": "external"}
     runtime = FakeRuntime()
     handler = ProjectChatHandler(settings=settings, agent_runtime=runtime)
@@ -593,6 +595,36 @@ def test_codex_composition_injects_runtime_without_replacing_sdk_factory(tmp_pat
     assert context.agent_runtime is runtime
     assert context.project_chat._agent_runtime is runtime
     assert context.sdk_factory is sdk_factory
+
+
+def test_codex_audience_composition_uses_the_keyring_runtime_pool(tmp_path: Path) -> None:
+    settings_class = _real_settings_class()
+    _reload_real_module("telegram_bot.utils.chat_logger")
+    _reload_real_module("telegram_bot.utils.health")
+    from telegram_bot.__main__ import build_context
+    from telegram_bot.core.codex_runtime_pool import CodexRuntimePool
+    from telegram_bot.core.memory_audience import shared_memory_audience
+
+    settings = settings_class.load(
+        project_root=tmp_path / "project",
+        environ={
+            "HOME": str(tmp_path),
+            "TELEGRAM_BOT_TOKEN": "123456:test",
+            "CCC_AGENT_PROVIDER": "codex",
+            "CCC_TELEGRAM_SESSION_SCOPE": "shared-groups",
+            "CCC_BRIDGE_MEMORY_MODE": "audience-scoped",
+            "CCC_CODEX_AUDIENCE_AUTH_MODE": "keyring",
+        },
+        bot_env_file=tmp_path / "missing.env",
+    )
+
+    context = build_context(settings, telegram_port=lambda: None)
+
+    assert isinstance(context.agent_runtime, CodexRuntimePool)
+    assert context.agent_runtime.supports_session_browsing is False
+    shared_home = shared_memory_audience(settings).codex_home
+    assert shared_home.is_dir()
+    assert stat.S_IMODE(shared_home.stat().st_mode) == 0o700
 
 
 def test_codex_composition_wires_memory_bootstrap_settings(

@@ -112,8 +112,8 @@ class VoiceProviderConfigTests(unittest.TestCase):
             )
             self.assertEqual(audience_scoped.bridge_memory_mode, "audience-scoped")
 
-            # #581: the Codex provider has no audience-scoped CODEX_HOME, so
-            # the leaking combination must fail closed at config load.
+            # #581 remains fail-closed unless the operator explicitly selects
+            # the non-copying OS keyring credential boundary.
             with self.assertRaises(ValidationError):
                 module.Config(
                     telegram_bot_token="123456:abc",
@@ -122,6 +122,15 @@ class VoiceProviderConfigTests(unittest.TestCase):
                     CCC_AGENT_PROVIDER="codex",
                     _env_file=None,
                 )
+            codex_audience = module.Config(
+                telegram_bot_token="123456:abc",
+                CCC_TELEGRAM_SESSION_SCOPE="shared-groups",
+                CCC_BRIDGE_MEMORY_MODE="audience-scoped",
+                CCC_AGENT_PROVIDER="codex",
+                CCC_CODEX_AUDIENCE_AUTH_MODE="keyring",
+                _env_file=None,
+            )
+            self.assertEqual(codex_audience.codex_audience_auth_mode, "keyring")
             codex_curated = module.Config(
                 telegram_bot_token="123456:abc",
                 CCC_BRIDGE_MEMORY_MODE="curated",

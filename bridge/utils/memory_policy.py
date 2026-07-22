@@ -41,20 +41,27 @@ def assert_memory_scope_safe(
 
 _CODEX_AUDIENCE_ERROR = (
     "audience-scoped memory cannot run with the Codex provider (#581): "
-    "CODEX_HOME/AGENTS.md is a single global persistent store with no "
-    "per-audience separation, so DM-private memory could reach "
-    "shared-audience Codex runs. Use the Claude provider, or keep "
-    "CCC_BRIDGE_MEMORY_MODE off/curated for Codex nodes."
+    "set CCC_CODEX_AUDIENCE_AUTH_MODE=keyring after provisioning Codex "
+    "credentials in the OS keyring. File credentials are not copied into "
+    "audience homes."
 )
 
 
-def assert_memory_provider_safe(mode: str, provider: str) -> None:
+def assert_memory_provider_safe(
+    mode: str,
+    provider: str,
+    codex_audience_auth_mode: str = "disabled",
+) -> None:
     """Raise ValueError for provider/memory-mode combinations that leak.
 
-    The Codex launch surface has no audience-scoped memory store yet
-    (jinwon-int/ccc-node#581); refusing the configuration at load time keeps
-    the #580 isolation guarantee intact until CODEX_HOME is scoped.
+    Codex is allowed only with its officially supported OS keyring credential
+    store. A file-backed login lives inside ``CODEX_HOME`` and copying it into
+    each audience would multiply long-lived access tokens.
     """
 
-    if mode == MEMORY_MODE_AUDIENCE_SCOPED and str(provider or "").strip().lower() == "codex":
+    if (
+        mode == MEMORY_MODE_AUDIENCE_SCOPED
+        and str(provider or "").strip().lower() == "codex"
+        and str(codex_audience_auth_mode or "").strip().lower() != "keyring"
+    ):
         raise ValueError(_CODEX_AUDIENCE_ERROR)

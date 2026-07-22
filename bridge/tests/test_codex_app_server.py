@@ -411,6 +411,41 @@ class CodexAppServerTests(unittest.IsolatedAsyncioTestCase):
             assert spawn_kwargs["env"] == environment
             await client.close()
 
+    async def test_audience_keyring_mode_is_bound_as_a_codex_config_override(self) -> None:
+        process = FakeProcess()
+        spawn_args: tuple[str, ...] = ()
+
+        async def fake_spawn(*args: str, **_kwargs: Any) -> FakeProcess:
+            nonlocal spawn_args
+            spawn_args = args
+            return process
+
+        environment = {
+            "PATH": "/usr/local/bin:/usr/bin:/bin",
+            "CODEX_HOME": "/private/audience/codex",
+            "CODEX_SQLITE_HOME": "/private/audience/codex",
+            "CCC_CODEX_AUDIENCE_AUTH_MODE": "keyring",
+        }
+        with pytest.MonkeyPatch.context() as monkeypatch:
+            monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_spawn)
+            client = CodexAppServerClient(process_environment=environment)
+
+            await client.start()
+
+            assert spawn_args == (
+                "codex",
+                "--config",
+                'cli_auth_credentials_store="keyring"',
+                "app-server",
+                "--stdio",
+            )
+            await client.close()
+
+        with pytest.raises(ValueError, match="audience auth mode is invalid"):
+            CodexAppServerClient(
+                process_environment={"CCC_CODEX_AUDIENCE_AUTH_MODE": "file"}
+            )
+
     async def test_reader_accepts_lines_larger_than_default_stream_limit(self) -> None:
         # A default StreamReader (64 KiB limit) raises ValueError on this line and
         # tears the connection down; the raised STDOUT_BUFFER_LIMIT reads it whole.

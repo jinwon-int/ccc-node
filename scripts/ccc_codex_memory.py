@@ -851,16 +851,39 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def _audience_scoped_blocked(environ: Mapping[str, str] | None = None) -> bool:
-    """True when audience-scoped memory (#580) is active in the environment.
+    """Reject scoped mode unless every persistent/auth boundary is exact."""
 
-    CODEX_HOME/AGENTS.md is a single global, persistent store with no
-    per-audience separation (#581). Under audience scoping, materializing a
-    snapshot here — or reusing a previously materialized one — would let
-    DM-private memory reach shared-audience Codex runs. Fail closed instead.
-    """
     env = os.environ if environ is None else environ
     raw = (env.get("CCC_MEMORY_AUDIENCE_SCOPED") or "").strip().lower()
-    return raw not in ("", "0", "false", "off", "no")
+    if raw in ("", "0", "false", "off", "no"):
+        return False
+    if (env.get("CCC_CODEX_AUDIENCE_AUTH_MODE") or "").strip().lower() != "keyring":
+        return True
+    audience = (env.get("CCC_MEMORY_AUDIENCE") or "").strip().lower()
+    scope = (env.get("CCC_MEMORY_SCOPE") or "").strip()
+    if audience == "shared":
+        if scope != "shared":
+            return True
+    elif audience == "private":
+        if re.fullmatch(r"private-[0-9a-f]{32}", scope) is None:
+            return True
+    else:
+        return True
+    root_raw = (env.get("CCC_MEMORY_AUDIENCE_ROOT") or "").strip()
+    codex_raw = (env.get("CODEX_HOME") or "").strip()
+    sqlite_raw = (env.get("CODEX_SQLITE_HOME") or "").strip()
+    if not root_raw or not codex_raw or not sqlite_raw:
+        return True
+    root = Path(root_raw).expanduser()
+    codex_home = Path(codex_raw).expanduser()
+    sqlite_home = Path(sqlite_raw).expanduser()
+    if not root.is_absolute() or not codex_home.is_absolute() or not sqlite_home.is_absolute():
+        return True
+    expected = Path(os.path.abspath(root / scope / "codex"))
+    return (
+        Path(os.path.abspath(codex_home)) != expected
+        or Path(os.path.abspath(sqlite_home)) != expected
+    )
 
 
 def main(argv: list[str] | None = None) -> int:

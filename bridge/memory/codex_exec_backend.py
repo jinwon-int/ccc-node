@@ -244,6 +244,13 @@ class CodexExecDistillBackend:
         self._wiki_enabled = wiki_enabled
         self._max_output_bytes = max_output_bytes
         self._environment = dict(os.environ if environment is None else environment)
+        self._audience_auth_mode = (
+            self._environment.get("CCC_CODEX_AUDIENCE_AUTH_MODE", "disabled")
+            .strip()
+            .lower()
+        )
+        if self._audience_auth_mode not in {"disabled", "keyring"}:
+            raise CodexDistillBackendError("codex_distill_config_invalid")
         self._temp_root = Path(temp_root) if temp_root is not None else None
 
     async def extract(
@@ -266,23 +273,29 @@ class CodexExecDistillBackend:
                 output = private_root / "output.json"
                 _create_private_output(output)
                 environment = _minimal_environment(self._environment, temp_root=private_root)
-                argv = (
-                    executable,
-                    "exec",
-                    "--ephemeral",
-                    "--ignore-user-config",
-                    "--ignore-rules",
-                    "--sandbox",
-                    "read-only",
-                    "--skip-git-repo-check",
-                    "--output-schema",
-                    str(schema),
-                    "--output-last-message",
-                    str(output),
-                    "--color",
-                    "never",
-                    DISTILL_EXTRACTION_PROMPT,
+                arguments = [executable, "exec"]
+                if self._audience_auth_mode == "keyring":
+                    arguments.extend(
+                        ("--config", 'cli_auth_credentials_store="keyring"')
+                    )
+                arguments.extend(
+                    (
+                        "--ephemeral",
+                        "--ignore-user-config",
+                        "--ignore-rules",
+                        "--sandbox",
+                        "read-only",
+                        "--skip-git-repo-check",
+                        "--output-schema",
+                        str(schema),
+                        "--output-last-message",
+                        str(output),
+                        "--color",
+                        "never",
+                        DISTILL_EXTRACTION_PROMPT,
+                    )
                 )
+                argv = tuple(arguments)
                 try:
                     process = await asyncio.create_subprocess_exec(
                         *argv,
