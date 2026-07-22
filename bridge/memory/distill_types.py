@@ -54,6 +54,50 @@ class DistillWikiSinkStatus(str, Enum):
     DISABLED = "disabled"
 
 
+class DistillHonchoSinkStatus(str, Enum):
+    PENDING = "pending"
+    RUNNING = "running"
+    RETRYABLE_FAILED = "retryable_failed"
+    DONE = "done"
+    TERMINAL_FAILED = "terminal_failed"
+    DISABLED = "disabled"
+
+
+def _parse_honcho_sink_fields(
+    value: Mapping[str, Any], *, extraction_output: object
+) -> tuple[DistillHonchoSinkStatus | None, int, int, str | None, str | None]:
+    attempts = value.get("honcho_sink_attempts", 0)
+    lease_epoch = value.get("honcho_sink_lease_epoch", 0)
+    if type(attempts) is not int or attempts < 0:
+        raise ValueError("invalid distill job honcho_sink_attempts")
+    if type(lease_epoch) is not int or lease_epoch < 0:
+        raise ValueError("invalid distill job honcho_sink_lease_epoch")
+    owner = value.get("honcho_sink_owner_token")
+    expires = value.get("honcho_sink_lease_expires_at")
+    if owner is not None and not isinstance(owner, str):
+        raise ValueError("invalid distill job field: honcho_sink_owner_token")
+    if expires is not None and not isinstance(expires, str):
+        raise ValueError("invalid distill job field: honcho_sink_lease_expires_at")
+    raw = value.get("honcho_sink_status")
+    if raw is None:
+        status = DistillHonchoSinkStatus.PENDING if extraction_output is not None else None
+    elif isinstance(raw, str):
+        status = DistillHonchoSinkStatus(raw)
+    else:
+        raise ValueError("invalid distill job field: honcho_sink_status")
+    return status, attempts, lease_epoch, owner, expires
+
+
+def _validate_honcho_sink_lease(
+    status: DistillHonchoSinkStatus | None,
+    owner: str | None,
+    expires: str | None,
+) -> None:
+    running = status is DistillHonchoSinkStatus.RUNNING
+    if running != (owner is not None and expires is not None):
+        raise ValueError("Honcho sink running state requires a complete lease")
+
+
 def _parse_wiki_sink_fields(
     value: Mapping[str, Any],
     *,
@@ -337,6 +381,11 @@ class DistillJob:
     wiki_sink_lease_epoch: int = 0
     wiki_sink_owner_token: str | None = None
     wiki_sink_lease_expires_at: str | None = None
+    honcho_sink_status: DistillHonchoSinkStatus | None = None
+    honcho_sink_attempts: int = 0
+    honcho_sink_lease_epoch: int = 0
+    honcho_sink_owner_token: str | None = None
+    honcho_sink_lease_expires_at: str | None = None
 
     def __post_init__(self) -> None:
         if not _SHA256_RE.fullmatch(self.job_id):
@@ -363,6 +412,8 @@ class DistillJob:
             or self.local_sink_lease_epoch < 0
             or self.wiki_sink_attempts < 0
             or self.wiki_sink_lease_epoch < 0
+            or self.honcho_sink_attempts < 0
+            or self.honcho_sink_lease_epoch < 0
         ):
             raise ValueError("invalid distill job counters")
         validate_memory_route(self.memory_audience, self.memory_scope)
@@ -377,6 +428,11 @@ class DistillJob:
             self.wiki_sink_status,
             self.wiki_sink_owner_token,
             self.wiki_sink_lease_expires_at,
+        )
+        _validate_honcho_sink_lease(
+            self.honcho_sink_status,
+            self.honcho_sink_owner_token,
+            self.honcho_sink_lease_expires_at,
         )
         if self.error_code is not None and not _SAFE_ERROR_CODE_RE.fullmatch(
             self.error_code
@@ -445,6 +501,15 @@ class DistillJob:
             "wiki_sink_lease_epoch": self.wiki_sink_lease_epoch,
             "wiki_sink_owner_token": self.wiki_sink_owner_token,
             "wiki_sink_lease_expires_at": self.wiki_sink_lease_expires_at,
+            "honcho_sink_status": (
+                self.honcho_sink_status.value
+                if self.honcho_sink_status is not None
+                else None
+            ),
+            "honcho_sink_attempts": self.honcho_sink_attempts,
+            "honcho_sink_lease_epoch": self.honcho_sink_lease_epoch,
+            "honcho_sink_owner_token": self.honcho_sink_owner_token,
+            "honcho_sink_lease_expires_at": self.honcho_sink_lease_expires_at,
         }
 
     @classmethod
@@ -525,6 +590,13 @@ class DistillJob:
             wiki_sink_owner_token,
             wiki_sink_lease_expires_at,
         ) = _parse_wiki_sink_fields(value, extraction_output=extraction_output)
+        (
+            honcho_sink_status,
+            honcho_sink_attempts,
+            honcho_sink_lease_epoch,
+            honcho_sink_owner_token,
+            honcho_sink_lease_expires_at,
+        ) = _parse_honcho_sink_fields(value, extraction_output=extraction_output)
         return cls(
             job_id=value["job_id"],
             provider=value["provider"],
@@ -561,4 +633,9 @@ class DistillJob:
             wiki_sink_lease_epoch=wiki_sink_lease_epoch,
             wiki_sink_owner_token=wiki_sink_owner_token,
             wiki_sink_lease_expires_at=wiki_sink_lease_expires_at,
+            honcho_sink_status=honcho_sink_status,
+            honcho_sink_attempts=honcho_sink_attempts,
+            honcho_sink_lease_epoch=honcho_sink_lease_epoch,
+            honcho_sink_owner_token=honcho_sink_owner_token,
+            honcho_sink_lease_expires_at=honcho_sink_lease_expires_at,
         )

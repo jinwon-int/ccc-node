@@ -350,13 +350,12 @@ CAPABILITY_AXES: tuple[CapabilityAxis, ...] = (
             "PreCompact/SessionEnd distill transcripts into resume/local facts and "
             "sink candidates via claude/hooks/distill.sh."
         ),
-        codex=_degraded(
+        codex=_supported(
             "Session-reset, explicit, opt-in bounded checkpoint, and bounded "
             "shutdown-queue triggers, extraction, and the local sink are scheduled. "
             "Provider/model/turn-byte/duration accounting and shared warn/enforce "
             "cost gates are body-free; Wiki candidates enter a local human-review "
-            "queue, while Honcho routing remains pending.",
-            "#465",
+            "queue and Honcho facts use an owner-only retrying outbox.",
         ),
     ),
     _axis(
@@ -382,9 +381,9 @@ CAPABILITY_AXES: tuple[CapabilityAxis, ...] = (
             "Redacted payloads push via claude/hooks/distill/honcho-push.sh with the "
             "queue-drain retry path."
         ),
-        codex=_unsupported(
-            "No Codex-side Honcho routing exists yet.",
-            "#465",
+        codex=_supported(
+            "Validated facts use an owner-only per-job outbox, stable idempotency "
+            "keys, independently leased retries, and body-free failures."
         ),
     ),
     _axis(

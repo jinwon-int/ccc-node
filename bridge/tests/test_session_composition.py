@@ -982,6 +982,37 @@ print("COMPOSED-WIKI-SINK-WORKER-OK")
     assert "COMPOSED-WIKI-SINK-WORKER-OK" in result.stdout
 
 
+def test_build_context_composes_honcho_sink_only_when_enabled(tmp_path):
+    result = _run_probe(
+        """
+import os
+from pathlib import Path
+root = Path(os.environ["PROBE_ROOT"])
+(root / "project").mkdir(parents=True, exist_ok=True)
+os.environ.update({
+    "PROJECT_ROOT": str(root / "project"),
+    "TELEGRAM_BOT_TOKEN": "123456:test",
+    "ALLOWED_USER_IDS": "1",
+    "CCC_AGENT_PROVIDER": "codex",
+    "CCC_HONCHO_MEMORY_ENABLED": "1",
+    "CCC_HONCHO_CFG": str(root / "honcho.json"),
+})
+from telegram_bot.__main__ import build_context, create_app, load_runtime_settings
+from telegram_bot.memory.distill_honcho_worker import CodexDistillHonchoSinkWorker
+enabled = build_context(load_runtime_settings())
+worker = enabled.distill_honcho_sink_worker
+assert isinstance(worker, CodexDistillHonchoSinkWorker)
+assert create_app(enabled)._distill_honcho_sink_worker is worker
+os.environ["CCC_HONCHO_MEMORY_ENABLED"] = "0"
+assert build_context(load_runtime_settings()).distill_honcho_sink_worker is None
+print("COMPOSED-HONCHO-SINK-WORKER-OK")
+""",
+        probe_root=tmp_path,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "COMPOSED-HONCHO-SINK-WORKER-OK" in result.stdout
+
+
 def test_build_context_composes_routed_snapshot_worker(tmp_path):
     result = _run_probe(
         """

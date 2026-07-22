@@ -109,10 +109,16 @@ class CodexDistillExtractionWorker:
         lease_seconds: int = 300,
         max_attempts: int = 5,
         wiki_enabled: bool = True,
+        honcho_enabled: bool = True,
         model: str = "provider-default",
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
-        if lease_seconds <= 0 or max_attempts <= 0 or type(wiki_enabled) is not bool:
+        if (
+            lease_seconds <= 0
+            or max_attempts <= 0
+            or type(wiki_enabled) is not bool
+            or type(honcho_enabled) is not bool
+        ):
             raise ValueError("invalid distill extraction worker configuration")
         self._journal = journal
         self._backend = backend
@@ -120,6 +126,7 @@ class CodexDistillExtractionWorker:
         self._lease_seconds = lease_seconds
         self._max_attempts = max_attempts
         self._wiki_enabled = wiki_enabled
+        self._honcho_enabled = honcho_enabled
         self._usage_meter = usage_meter
         try:
             DistillExtractionAccounting(model, 0, 0, 0)
@@ -303,6 +310,7 @@ class CodexDistillExtractionWorker:
             extraction_output=output,
             accounting=accounting,
             wiki_enabled=self._wiki_enabled,
+            honcho_enabled=self._honcho_enabled,
         )
 
 

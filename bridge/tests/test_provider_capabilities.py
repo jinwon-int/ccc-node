@@ -200,14 +200,6 @@ class CapabilityRuntimeDriftTests(unittest.TestCase):
                     )
 
     def test_codex_memory_gaps_track_issue_465(self) -> None:
-        for axis_key in (
-            "memory_writeback_distill",
-            "memory_sink_honcho",
-        ):
-            status = capability_status("codex", axis_key)
-            with self.subTest(axis=axis_key):
-                self.assertIsNot(status.state, CapabilityState.SUPPORTED)
-                self.assertIn("#465", status.dependencies)
         roundtrip = capability_status("codex", "memory_roundtrip")
         self.assertIs(roundtrip.state, CapabilityState.DEGRADED)
         self.assertIn("#465", roundtrip.dependencies)
@@ -225,6 +217,17 @@ class CapabilityRuntimeDriftTests(unittest.TestCase):
         )
         self.assertTrue(
             (REPO_ROOT / "bridge/memory/distill_wiki_worker.py").is_file()
+        )
+        self.assertIs(
+            capability_status("codex", "memory_writeback_distill").state,
+            CapabilityState.SUPPORTED,
+        )
+        self.assertIs(
+            capability_status("codex", "memory_sink_honcho").state,
+            CapabilityState.SUPPORTED,
+        )
+        self.assertTrue(
+            (REPO_ROOT / "bridge/memory/distill_honcho_worker.py").is_file()
         )
 
 

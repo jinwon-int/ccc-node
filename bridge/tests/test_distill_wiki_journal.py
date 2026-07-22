@@ -65,12 +65,19 @@ async def test_wiki_lease_is_single_winner_recoverable_and_local_independent(
     assert local_claimed is not None
     assert local_claimed.wiki_sink_status is DistillWikiSinkStatus.RUNNING
     assert local_claimed.local_sink_status is DistillLocalSinkStatus.RUNNING
+    honcho_claimed = journal.claim_honcho_sink(
+        done.job_id,
+        owner_token="honcho-worker",
+        now=fixtures.utc(2),
+        lease_seconds=10,
+    )
+    assert honcho_claimed is not None
     assert journal.recover_stale_running(now=fixtures.utc(5)) == 0
-    assert journal.recover_stale_running(now=fixtures.utc(13)) == 2
+    assert journal.recover_stale_running(now=fixtures.utc(13)) == 3
     recovered = journal.get(done.job_id)
     assert recovered.wiki_sink_status is DistillWikiSinkStatus.RETRYABLE_FAILED
     assert recovered.local_sink_status is DistillLocalSinkStatus.RETRYABLE_FAILED
-    assert recovered.error_code == "wiki_sink_lease_expired"
+    assert recovered.error_code == "honcho_sink_lease_expired"
 
 
 @pytest.mark.anyio
