@@ -650,6 +650,7 @@ class BotLifecycleMixin:
                             pass
                 await self._graceful_shutdown()
                 if stop_event.is_set():
+                    await self._enqueue_shutdown_distills()
                     close_project_chat = getattr(self._project_chat, "close", None)
                     if close_project_chat is not None:
                         await close_project_chat()

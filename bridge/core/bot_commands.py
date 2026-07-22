@@ -109,7 +109,12 @@ class BotCommandMixin:
             notification_bot=context.bot,
             interim_message_callback=self._make_interim_reply_callback(message),
         )
-        await self._save_session_id(self._conversation_key(user_id, chat.id), response)
+        await self._save_session_id(
+            self._conversation_key(user_id, chat.id),
+            response,
+            user_id=user_id,
+            chat_id=chat.id,
+        )
         # PATCH 2026-05-04: use _reply_smart to auto-split >4096 char responses
         # (Telegram message size limit). Capo's 23TM project has 31+ skills,
         # full /skills listing exceeds limit → "Message is too long" error.
@@ -1130,7 +1135,12 @@ class BotCommandMixin:
                 bot=app.bot,
                 interim_message_callback=self._make_interim_reply_callback(message),
             )
-            await self._save_session_id(conversation_key, response)
+            await self._save_session_id(
+                conversation_key,
+                response,
+                user_id=user_id,
+                chat_id=chat.id,
+            )
             await self._reply_smart(
                 message,
                 response.content,
@@ -1178,7 +1188,12 @@ class BotCommandMixin:
                     bot=app.bot,
                     interim_message_callback=self._make_interim_reply_callback(message),
                 )
-                await self._save_session_id(conversation_key, response)
+                await self._save_session_id(
+                    conversation_key,
+                    response,
+                    user_id=user_id,
+                    chat_id=chat.id,
+                )
                 await self._reply_smart(
                     message,
                     response.content,

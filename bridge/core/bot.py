@@ -1,5 +1,6 @@
 # ruff: noqa: E402
 import asyncio
+import hashlib
 import logging
 import re
 import time
@@ -122,6 +123,8 @@ class TelegramBot(
     _STALE_AUDIO_SECONDS = 24 * 60 * 60
     _WATCHDOG_INTERVAL = 60
     _NETWORK_FAILURE_THRESHOLD = 300  # 5 min of consecutive failures → force exit
+    _SHUTDOWN_DISTILL_MAX_SESSIONS = 128
+    _SHUTDOWN_DISTILL_TIMEOUT_SECONDS = 2.0
 
 
 
@@ -235,6 +238,12 @@ class TelegramBot(
             if audience is not None:
                 memory_audience = audience.kind
                 memory_scope = audience.scope
+        else:
+            stored_audience = session.get("distill_memory_audience")
+            stored_scope = session.get("distill_memory_scope")
+            if isinstance(stored_audience, str) and isinstance(stored_scope, str):
+                memory_audience = stored_audience
+                memory_scope = stored_scope
         enqueue_kwargs = {
             "provider": "codex",
             "thread_id": thread_id,
@@ -338,16 +347,105 @@ class TelegramBot(
         session = await self._session_manager.get_session(session_key)
         return str(session.get("provider", "claude")).strip().lower()
 
-    async def _save_session_id(self, session_key: Any, response: ChatResponse):
+    async def _save_session_id(
+        self,
+        session_key: Any,
+        response: ChatResponse,
+        *,
+        user_id: int | None = None,
+        chat_id: int | None = None,
+    ):
         if getattr(response, "success", True) and response.session_id:
+            updates = {
+                "provider": self._active_provider(),
+                "session_id": response.session_id,
+            }
+            remove_fields: set[str] = set()
+            if user_id is not None and chat_id is not None:
+                from telegram_bot.core.memory_audience import resolve_memory_audience
+
+                audience = resolve_memory_audience(
+                    self._config,
+                    user_id=user_id,
+                    chat_id=chat_id,
+                )
+                if audience is None:
+                    remove_fields.update(
+                        {"distill_memory_audience", "distill_memory_scope"}
+                    )
+                else:
+                    updates.update(
+                        {
+                            "distill_memory_audience": audience.kind,
+                            "distill_memory_scope": audience.scope,
+                        }
+                    )
             await self._session_manager.patch_session(
                 session_key,
-                updates={
-                    "provider": self._active_provider(),
-                    "session_id": response.session_id,
-                },
+                updates=updates,
+                remove_fields=remove_fields,
             )
             self._runtime_active_sessions.add(session_key)
+
+    @staticmethod
+    def _shutdown_distill_discriminator(session: dict[str, Any]) -> str:
+        marker = session.get("last_user_message_at")
+        thread_id = session.get("session_id")
+        digest = hashlib.sha256(
+            f"{thread_id}\0{marker or 'unknown-turn'}".encode("utf-8")
+        ).hexdigest()
+        return f"shutdown-turn-v1-{digest}"
+
+    async def _enqueue_shutdown_distills(
+        self,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> None:
+        """Bound shutdown work to durable journal writes; never call a provider."""
+        if getattr(self, "_distill_journal", None) is None:
+            return
+
+        active_keys = sorted(
+            tuple(getattr(self, "_runtime_active_sessions", ())),
+            key=str,
+        )
+        limit = self._SHUTDOWN_DISTILL_MAX_SESSIONS
+        selected_keys = active_keys[:limit]
+        if len(active_keys) > limit:
+            logger.warning(
+                "Codex shutdown distill queue capped at %d active sessions",
+                limit,
+            )
+
+        async def enqueue_selected() -> None:
+            for session_key in selected_keys:
+                try:
+                    session = await self._session_manager.get_session(session_key)
+                    await self._enqueue_previous_codex_session(
+                        session,
+                        DistillTrigger.SHUTDOWN,
+                        discriminator=self._shutdown_distill_discriminator(session),
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as error:
+                    logger.warning(
+                        "Codex shutdown distill queue entry failed error=%s",
+                        type(error).__name__,
+                    )
+
+        timeout = (
+            self._SHUTDOWN_DISTILL_TIMEOUT_SECONDS
+            if timeout_seconds is None
+            else timeout_seconds
+        )
+        try:
+            await asyncio.wait_for(enqueue_selected(), timeout=timeout)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Codex shutdown distill queue timed out after %.2fs",
+                timeout,
+            )
 
     def _effective_session_id(self, session_key: Any, session: dict) -> Optional[str]:
         """Return a session_id that is safe to auto-resume.
@@ -707,7 +805,12 @@ class TelegramBot(
                 ),
                 sensitive_log_event=sensitive_log_event,
             )
-            await self._save_session_id(conversation_key, response)
+            await self._save_session_id(
+                conversation_key,
+                response,
+                user_id=user_id,
+                chat_id=chat.id,
+            )
             await self._send_reply_by_mode(
                 message=message,
                 user_id=user_id,
