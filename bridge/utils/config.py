@@ -13,11 +13,8 @@ from pydantic_settings import (
     SettingsConfigDict,
 )
 
-from telegram_bot.utils.memory_policy import (
-    assert_memory_provider_safe,
-    assert_memory_scope_safe,
-)
 from telegram_bot.utils.settings_heartbeat import HeartbeatSettingsMixin
+from telegram_bot.utils.settings_memory import MemorySettingsMixin
 from telegram_bot.utils.settings_voice import VoiceSettingsMixin
 
 BOT_PACKAGE_DIR = Path(__file__).resolve().parent.parent
@@ -53,7 +50,14 @@ SESSION_STORE_PATH = BOT_DATA_DIR / "sessions.json"
 CLAUDE_SETTINGS_PATH = Path.home() / ".claude" / "settings.json"
 
 
-class Config(VoiceSettingsMixin, HeartbeatSettingsMixin, BaseSettings):
+# MemorySettingsMixin completes the #584 P2-3 domain split. Keep Config's
+# existing docstring stable because pydantic exports it as JSON Schema metadata.
+class Config(
+    MemorySettingsMixin,
+    VoiceSettingsMixin,
+    HeartbeatSettingsMixin,
+    BaseSettings,
+):
     """Bot configuration.
 
     Domain field clusters live in per-domain mixins (#584 P2-3):
@@ -169,55 +173,10 @@ class Config(VoiceSettingsMixin, HeartbeatSettingsMixin, BaseSettings):
         alias="CCC_AGENT_PROVIDER",
         description="Agent provider used by ProjectChat.",
     )
-    node_isolation_profile: Literal["fleet", "external"] = Field(
-        default="fleet",
-        alias="CCC_NODE_ISOLATION_PROFILE",
-        description="Root policy inherited by Claude memory hooks.",
-    )
-    wiki_memory_enabled: bool = Field(
-        default=True,
-        alias="CCC_WIKI_MEMORY_ENABLED",
-        description="Family Wiki memory source/sink toggle; external profile always overrides off.",
-    )
-    memory_user_label: str = Field(
-        default="Seo Jin On / 서진원",
-        alias="CCC_MEMORY_USER_LABEL",
-        description="Prompt-only user identity label for memory injection/distill.",
-    )
-    memory_assistant_label: str = Field(
-        default="dungae, a Hermes Team2 worker",
-        alias="CCC_MEMORY_ASSISTANT_LABEL",
-        description="Prompt-only assistant identity label for memory distill.",
-    )
-
-    def hook_policy_environment(self) -> dict[str, str]:
-        """Return validated, non-secret policy fields inherited by Claude hooks."""
-        profile = self.node_isolation_profile
-        return {
-            "CCC_NODE_ISOLATION_PROFILE": profile,
-            "CCC_WIKI_MEMORY_ENABLED": (
-                "0" if profile == "external" else ("1" if self.wiki_memory_enabled else "0")
-            ),
-            "CCC_MEMORY_USER_LABEL": self.memory_user_label,
-            "CCC_MEMORY_ASSISTANT_LABEL": self.memory_assistant_label,
-        }
-
     codex_cli_path: str = Field(
         default_factory=lambda: str(Path.home() / ".claude" / "hooks" / "ccc-codex"),
         alias="CCC_CODEX_CLI_PATH",
         description="ccc-node Codex launcher path.",
-    )
-    codex_memory_materializer_path: str = Field(
-        default_factory=lambda: str(Path.home() / ".claude" / "hooks" / "ccc_codex_memory.py"),
-        alias="CCC_CODEX_MEMORY_MATERIALIZER_PATH",
-        description="Body-free Codex memory materializer path.",
-    )
-    codex_memory_bootstrap_timeout_seconds: float = Field(
-        default=14.0,
-        ge=0.1,
-        le=30.0,
-        alias="CCC_CODEX_MEMORY_BOOTSTRAP_TIMEOUT_SEC",
-        description="Timeout for each Codex memory materialize/status command.",
     )
     usage_meter_enabled: bool = Field(
         default=True,
@@ -295,15 +254,7 @@ class Config(VoiceSettingsMixin, HeartbeatSettingsMixin, BaseSettings):
             )
         return v.strip()
 
-    @field_validator("memory_user_label", "memory_assistant_label", mode="before")
-    @classmethod
-    def validate_memory_label(cls, v):
-        value = " ".join(str(v).split())[:80]
-        if not value:
-            raise ValueError("memory identity labels must be non-empty")
-        return value
-
-    @field_validator("codex_cli_path", "codex_memory_materializer_path", mode="before")
+    @field_validator("codex_cli_path", mode="before")
     @classmethod
     def validate_codex_runtime_path(cls, v):
         value = str(v).strip()
@@ -380,33 +331,6 @@ class Config(VoiceSettingsMixin, HeartbeatSettingsMixin, BaseSettings):
             "shared-groups keeps DMs isolated but shares each group among allowlisted "
             "senders; shared-all routes every allowed DM and group to one conversation."
         ),
-    )
-    bridge_memory_mode: Literal["off", "curated", "audience-scoped"] = Field(
-        default="off",
-        alias="CCC_BRIDGE_MEMORY_MODE",
-        description=(
-            "Opt-in bridge memory lifecycle. curated loads only ccc-node memory/distill "
-            "hooks through flag settings while filesystem setting sources stay disabled; "
-            "audience-scoped keeps group/channel memory shared while DM memory stays private."
-        ),
-    )
-    bridge_unsafe_shared_all_memory: bool = Field(
-        default=False,
-        alias="CCC_BRIDGE_UNSAFE_SHARED_ALL_MEMORY",
-        description=(
-            "Explicit unsafe compatibility override for legacy curated memory with "
-            "shared-all. It never permits audience-scoped mode with shared-all."
-        ),
-    )
-    bridge_memory_audience_root: Optional[Path] = Field(
-        default=None,
-        alias="CCC_BRIDGE_MEMORY_AUDIENCE_ROOT",
-        description="Optional private root for audience-scoped bridge memory stores.",
-    )
-    bridge_memory_audience_key_path: Optional[Path] = Field(
-        default=None,
-        alias="CCC_BRIDGE_MEMORY_AUDIENCE_KEY_PATH",
-        description="Optional local 0600 HMAC key path for opaque DM memory scopes.",
     )
     bridge_web_mcp_mode: Literal["off", "searxng-firecrawl"] = Field(
         default="off",
@@ -686,9 +610,10 @@ class Config(VoiceSettingsMixin, HeartbeatSettingsMixin, BaseSettings):
             "draft_update_min_chars / draft_update_interval."
         ),
     )
-    # Heartbeat / health-alerts / task-ledger fields live in
-    # HeartbeatSettingsMixin (utils/settings_heartbeat.py); voice/transcription
-    # fields live in VoiceSettingsMixin (utils/settings_voice.py).
+    # Memory lifecycle fields live in MemorySettingsMixin
+    # (utils/settings_memory.py); heartbeat / health-alerts / task-ledger fields
+    # live in HeartbeatSettingsMixin (utils/settings_heartbeat.py); voice /
+    # transcription fields live in VoiceSettingsMixin (utils/settings_voice.py).
 
     # Inbound documents
     max_document_size_mb: int = Field(
@@ -716,16 +641,6 @@ class Config(VoiceSettingsMixin, HeartbeatSettingsMixin, BaseSettings):
                 "CCC_BRIDGE_FIRECRAWL_API_KEY."
             )
         self.bridge_searxng_url = url
-        return self
-
-    @model_validator(mode="after")
-    def validate_bridge_memory_scope(self):
-        assert_memory_scope_safe(
-            self.bridge_memory_mode,
-            self.telegram_session_scope,
-            unsafe_shared_all_override=self.bridge_unsafe_shared_all_memory,
-        )
-        assert_memory_provider_safe(self.bridge_memory_mode, self.agent_provider)
         return self
 
     # Logging
