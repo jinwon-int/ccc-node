@@ -388,6 +388,29 @@ class CodexAppServerTests(unittest.IsolatedAsyncioTestCase):
             assert spawn_kwargs["limit"] > 64 * 1024
             await client.close()
 
+    async def test_default_factory_binds_an_explicit_process_environment(self) -> None:
+        process = FakeProcess()
+        spawn_kwargs: dict[str, Any] = {}
+
+        async def fake_spawn(*_args: str, **kwargs: Any) -> FakeProcess:
+            nonlocal spawn_kwargs
+            spawn_kwargs = kwargs
+            return process
+
+        environment = {
+            "PATH": "/usr/local/bin:/usr/bin:/bin",
+            "CODEX_HOME": "/private/audience/codex",
+            "CODEX_SQLITE_HOME": "/private/audience/codex",
+        }
+        with pytest.MonkeyPatch.context() as monkeypatch:
+            monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_spawn)
+            client = CodexAppServerClient(process_environment=environment)
+
+            await client.start()
+
+            assert spawn_kwargs["env"] == environment
+            await client.close()
+
     async def test_reader_accepts_lines_larger_than_default_stream_limit(self) -> None:
         # A default StreamReader (64 KiB limit) raises ValueError on this line and
         # tears the connection down; the raised STDOUT_BUFFER_LIMIT reads it whole.

@@ -123,6 +123,7 @@ class CodexAppServerClient:
         writer: AsyncWriter | None = None,
         process_factory: ProcessFactory | None = None,
         executable: str = "codex",
+        process_environment: Mapping[str, str] | None = None,
         server_request_handler: ServerRequestHandler | None = None,
         server_request_timeout: float = 30.0,
         process_shutdown_timeout: float = 5.0,
@@ -135,10 +136,19 @@ class CodexAppServerClient:
             raise ValueError("process shutdown timeout must be positive")
         if not executable.strip():
             raise ValueError("Codex executable must not be empty")
+        if process_environment is not None:
+            for name, value in process_environment.items():
+                if not isinstance(name, str) or not name or "\x00" in name:
+                    raise ValueError("Codex process environment name is invalid")
+                if not isinstance(value, str) or "\x00" in value:
+                    raise ValueError("Codex process environment value is invalid")
         self._reader = reader
         self._writer = writer
         self._executable = executable
         self._process_factory = process_factory or self._spawn_default_process
+        self._process_environment = (
+            dict(process_environment) if process_environment is not None else None
+        )
         self._server_request_handler = server_request_handler
         self._server_request_timeout = server_request_timeout
         self._process_shutdown_timeout = process_shutdown_timeout
@@ -464,14 +474,25 @@ class CodexAppServerClient:
                 await asyncio.gather(self._process_task, return_exceptions=True)
 
     async def _spawn_default_process(self) -> AppServerProcess:
-        process = await asyncio.create_subprocess_exec(
-            self._executable,
-            "app-server",
-            "--stdio",
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            limit=STDOUT_BUFFER_LIMIT,
-        )
+        if self._process_environment is None:
+            process = await asyncio.create_subprocess_exec(
+                self._executable,
+                "app-server",
+                "--stdio",
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                limit=STDOUT_BUFFER_LIMIT,
+            )
+        else:
+            process = await asyncio.create_subprocess_exec(
+                self._executable,
+                "app-server",
+                "--stdio",
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                limit=STDOUT_BUFFER_LIMIT,
+                env=dict(self._process_environment),
+            )
         return cast(AppServerProcess, process)
 
     async def _watch_process(self) -> None:

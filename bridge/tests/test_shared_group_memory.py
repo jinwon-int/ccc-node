@@ -178,6 +178,29 @@ def test_audience_settings_keep_public_and_private_sources_separate(tmp_path: Pa
     assert "-100456" not in public_raw
 
 
+def test_audience_codex_environment_is_opaque_and_physically_separate(
+    tmp_path: Path,
+) -> None:
+    settings = _audience_settings(tmp_path)
+    private = resolve_memory_audience(settings, user_id=934719283, chat_id=934719283)
+    public = resolve_memory_audience(settings, user_id=934719283, chat_id=-100456)
+    assert private is not None and public is not None
+
+    private_env = private.codex_environment(settings)
+    public_env = public.codex_environment(settings)
+
+    assert private_env["CODEX_HOME"] == str(private.scope_root / "codex")
+    assert public_env["CODEX_HOME"] == str(public.scope_root / "codex")
+    assert private_env["CODEX_SQLITE_HOME"] == private_env["CODEX_HOME"]
+    assert public_env["CODEX_SQLITE_HOME"] == public_env["CODEX_HOME"]
+    assert private_env["CODEX_HOME"] != public_env["CODEX_HOME"]
+    assert private_env["CCC_MEMORY_AUDIENCE"] == "private"
+    assert public_env["CCC_MEMORY_AUDIENCE"] == "shared"
+    serialized = json.dumps((private_env, public_env), sort_keys=True)
+    assert "934719283" not in serialized
+    assert "-100456" not in serialized
+
+
 def test_bridge_memory_rejects_shared_all_without_unsafe_legacy_override(
     tmp_path: Path,
 ) -> None:
@@ -329,5 +352,4 @@ def test_first_request_deterministically_seeds_shared_all_session() -> None:
         assert stale_default["session_id"] == "first-group"
 
     asyncio.run(exercise())
-
 

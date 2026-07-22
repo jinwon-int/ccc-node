@@ -92,17 +92,35 @@ async def _stop_bootstrap_process(process: asyncio.subprocess.Process) -> None:
         pass
 
 
-async def _run_materializer_command(path: str, command: str, timeout_seconds: float) -> bool:
+async def _run_materializer_command(
+    path: str,
+    command: str,
+    timeout_seconds: float,
+    *,
+    environment: Mapping[str, str] | None = None,
+) -> bool:
     try:
-        process = await asyncio.create_subprocess_exec(
-            path,
-            command,
-            "--json",
-            stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,
-            start_new_session=True,
-        )
+        if environment is None:
+            process = await asyncio.create_subprocess_exec(
+                path,
+                command,
+                "--json",
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        else:
+            process = await asyncio.create_subprocess_exec(
+                path,
+                command,
+                "--json",
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+                start_new_session=True,
+                env=dict(environment),
+            )
     except OSError:
         return False
     try:
@@ -116,12 +134,27 @@ async def _run_materializer_command(path: str, command: str, timeout_seconds: fl
     return process.returncode == 0 and len(stdout) <= _MEMORY_BOOTSTRAP_MAX_OUTPUT
 
 
-async def _run_codex_memory_bootstrap(path: str, *, timeout_seconds: float) -> None:
+async def _run_codex_memory_bootstrap(
+    path: str,
+    *,
+    timeout_seconds: float,
+    environment: Mapping[str, str] | None = None,
+) -> None:
     if not path.strip() or not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
         raise RuntimeError("codex memory bootstrap unavailable")
-    if await _run_materializer_command(path, "materialize", timeout_seconds):
+    if await _run_materializer_command(
+        path,
+        "materialize",
+        timeout_seconds,
+        environment=environment,
+    ):
         return
-    if await _run_materializer_command(path, "status", timeout_seconds):
+    if await _run_materializer_command(
+        path,
+        "status",
+        timeout_seconds,
+        environment=environment,
+    ):
         logger.warning("Codex memory refresh failed; using the last valid snapshot")
         return
     raise RuntimeError("codex memory bootstrap unavailable")
@@ -287,12 +320,22 @@ class CodexRuntime:
         *,
         cli_path: str = "codex",
         client_factory: ClientFactory | None = None,
+        process_environment: Mapping[str, str] | None = None,
         memory_materializer_path: str | None = None,
         memory_bootstrap_timeout_seconds: float = 14.0,
         memory_bootstrap: MemoryBootstrap | None = None,
     ) -> None:
         if not cli_path.strip():
             raise ValueError("Codex CLI path must not be empty")
+        bound_environment: dict[str, str] | None = None
+        if process_environment is not None:
+            bound_environment = dict(os.environ)
+            for name, value in process_environment.items():
+                if not isinstance(name, str) or not name or "\x00" in name:
+                    raise ValueError("Codex process environment name is invalid")
+                if not isinstance(value, str) or "\x00" in value:
+                    raise ValueError("Codex process environment value is invalid")
+                bound_environment[name] = value
         if memory_bootstrap is not None and memory_materializer_path is not None:
             raise ValueError("configure either memory_bootstrap or memory_materializer_path")
         if memory_materializer_path is not None:
@@ -309,16 +352,24 @@ class CodexRuntime:
                 await _run_codex_memory_bootstrap(
                     path,
                     timeout_seconds=memory_bootstrap_timeout_seconds,
+                    environment=bound_environment,
                 )
 
             memory_bootstrap = configured_bootstrap
-        factory = client_factory or (
-            lambda handler: CodexAppServerClient(
+        if client_factory is not None:
+            self._client = client_factory(self._handle_server_request)
+        elif bound_environment is None:
+            self._client = CodexAppServerClient(
                 executable=cli_path,
-                server_request_handler=handler,
+                server_request_handler=self._handle_server_request,
             )
-        )
-        self._client = factory(self._handle_server_request)
+        else:
+            self._client = CodexAppServerClient(
+                executable=cli_path,
+                process_environment=bound_environment,
+                server_request_handler=self._handle_server_request,
+            )
+        self._process_environment = bound_environment
         self._memory_bootstrap = memory_bootstrap
         self._memory_bootstrap_lock = asyncio.Lock()
         self._start_lock = asyncio.Lock()

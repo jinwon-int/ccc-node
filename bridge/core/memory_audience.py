@@ -57,6 +57,12 @@ class MemoryAudience:
     def shared_root(self) -> Path:
         return self.root / AUDIENCE_SHARED
 
+    @property
+    def codex_home(self) -> Path:
+        """Return the provider store dedicated to this opaque audience."""
+
+        return self.scope_root / "codex"
+
     def hook_environment(self, settings: Any) -> dict[str, str]:
         """Return body-free paths/policy for the existing memory hook stack."""
 
@@ -92,6 +98,24 @@ class MemoryAudience:
             # mode until it has an explicit audience label and read filter.
             "CCC_WIKI_MEMORY_ENABLED": "0",
         }
+        return env
+
+    def codex_environment(self, settings: Any) -> dict[str, str]:
+        """Return the audience overlay for one future Codex process.
+
+        Both the main Codex home and its optional SQLite override are scoped so
+        no process-level persistence can silently fall back to a global store.
+        The caller remains responsible for merging this body-free overlay with
+        its normal process environment.
+        """
+
+        env = self.hook_environment(settings)
+        env.update(
+            {
+                "CODEX_HOME": str(self.codex_home),
+                "CODEX_SQLITE_HOME": str(self.codex_home),
+            }
+        )
         return env
 
 
