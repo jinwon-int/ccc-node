@@ -352,8 +352,9 @@ CAPABILITY_AXES: tuple[CapabilityAxis, ...] = (
         ),
         codex=_degraded(
             "Session-reset, explicit, opt-in bounded checkpoint, and bounded "
-            "shutdown-queue triggers, extraction, and the local sink are scheduled; "
-            "Honcho/Wiki routing remains pending.",
+            "shutdown-queue triggers, extraction, and the local sink are scheduled. "
+            "Provider/model/turn-byte/duration accounting and shared warn/enforce "
+            "cost gates are body-free; Honcho/Wiki routing remains pending.",
             "#465",
         ),
     ),

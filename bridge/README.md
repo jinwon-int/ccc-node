@@ -288,6 +288,8 @@ a provider turn or reads transcript/credential files.
 | `CCC_CODEX_DISTILL_CHECKPOINT_TURNS` | Codex only | `0` | Completed-turn checkpoint gate; 0 disables |
 | `CCC_CODEX_DISTILL_CHECKPOINT_BYTES` | Codex only | `0` | UTF-8 user + assistant byte checkpoint gate; 0 disables |
 | `CCC_CODEX_DISTILL_CHECKPOINT_AGE_SECONDS` | Codex only | `0` | Runtime-age checkpoint gate, evaluated after a completed turn; 0 disables |
+| `CCC_CODEX_DISTILL_MODEL` | Codex only | `provider-default` | Isolated write-back extractor model; a safe non-default ID is passed explicitly with `--model` |
+| `CCC_CODEX_DISTILL_TIMEOUT_SEC` | Codex only | `120` | Per-attempt extraction timeout, bounded to 1–600 seconds |
 | `CCC_CODEX_AUDIENCE_AUTH_MODE` | Scoped Codex only | `disabled` | Set to `keyring` only after Codex credentials are provisioned in the OS keyring; file credentials are never copied |
 | `CLAUDE_CLI_PATH` | No | *(auto-detect)* | Absolute path to Claude CLI binary |
 | `CLAUDE_SETTINGS_PATH` | No | `~/.claude/settings.json` | Path to Claude Code settings file |

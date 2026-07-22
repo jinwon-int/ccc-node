@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 import logging
+import math
 import re
 import secrets
+import time
 from typing import Protocol
 
 from .distill_extraction import (
@@ -15,7 +18,7 @@ from .distill_extraction import (
 )
 from .codex_exec_backend import MAX_EXTRACTION_JSON_BYTES
 from .distill_journal import DistillJournal
-from .distill_types import DistillJob
+from .distill_types import DistillExtractionAccounting, DistillJob
 
 logger = logging.getLogger(__name__)
 
@@ -106,6 +109,8 @@ class CodexDistillExtractionWorker:
         lease_seconds: int = 300,
         max_attempts: int = 5,
         wiki_enabled: bool = True,
+        model: str = "provider-default",
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         if lease_seconds <= 0 or max_attempts <= 0 or type(wiki_enabled) is not bool:
             raise ValueError("invalid distill extraction worker configuration")
@@ -116,6 +121,32 @@ class CodexDistillExtractionWorker:
         self._max_attempts = max_attempts
         self._wiki_enabled = wiki_enabled
         self._usage_meter = usage_meter
+        try:
+            DistillExtractionAccounting(model, 0, 0, 0)
+        except ValueError:
+            raise ValueError("invalid distill extraction worker model") from None
+        self._model = model
+        self._clock = clock
+
+    def _accounting(
+        self,
+        *,
+        snapshot_bytes: int,
+        started_at: float,
+        estimated_max_tokens: int,
+    ) -> DistillExtractionAccounting:
+        elapsed = self._clock() - started_at
+        duration_ms = (
+            min(10**12, round(elapsed * 1000))
+            if math.isfinite(elapsed) and elapsed > 0
+            else 0
+        )
+        return DistillExtractionAccounting(
+            model=self._model,
+            snapshot_bytes=snapshot_bytes,
+            duration_ms=duration_ms,
+            estimated_max_tokens=estimated_max_tokens,
+        )
 
     async def _fail(
         self,
@@ -123,6 +154,7 @@ class CodexDistillExtractionWorker:
         *,
         error_code: str,
         terminal: bool,
+        accounting: DistillExtractionAccounting | None = None,
     ) -> DistillJob:
         method = (
             self._journal.mark_extraction_terminal_failed
@@ -135,10 +167,21 @@ class CodexDistillExtractionWorker:
             owner_token=self._owner_token,
             lease_epoch=claimed.extraction_lease_epoch,
             error_code=error_code,
+            accounting=accounting,
         )
 
     async def extract_once(self, *, job_id: str) -> DistillJob:
         reservation: _ReservationLike | None = None
+        preview = await asyncio.to_thread(self._journal.get, job_id)
+        preview_snapshot = getattr(preview, "snapshot", None)
+        snapshot_bytes = (
+            preview_snapshot.byte_count if preview_snapshot is not None else 0
+        )
+        estimated_max_tokens = (
+            _RESERVED_OVERHEAD_TOKENS
+            + _RESERVED_OUTPUT_TOKENS
+            + max(0, snapshot_bytes) * _RESERVED_TOKENS_PER_BYTE
+        )
         if self._usage_meter is not None:
             # Prospective atomic admit-and-charge (#388): the FULL bounded
             # attempt cost — flat overhead plus the persisted snapshot's
@@ -149,19 +192,9 @@ class CodexDistillExtractionWorker:
             # the cap stays deferred until the operator raises the budget.
             # A blocked decision leaves the job unclaimed, so no attempt is
             # burned and it replays once the daily window resets.
-            preview = await asyncio.to_thread(self._journal.get, job_id)
-            preview_snapshot = getattr(preview, "snapshot", None)
-            snapshot_bytes = (
-                preview_snapshot.byte_count if preview_snapshot is not None else 0
-            )
-            reserved_tokens = (
-                _RESERVED_OVERHEAD_TOKENS
-                + _RESERVED_OUTPUT_TOKENS
-                + max(0, snapshot_bytes) * _RESERVED_TOKENS_PER_BYTE
-            )
             reservation = self._usage_meter.reserve_autonomous_spend(
                 "codex",
-                input_tokens=reserved_tokens,
+                input_tokens=estimated_max_tokens,
                 requests=1,
             )
             if not reservation.allowed:
@@ -205,12 +238,18 @@ class CodexDistillExtractionWorker:
                 terminal=True,
             )
         try:
+            started_at = self._clock()
             output = await self._backend.extract(extraction_input)
         except asyncio.CancelledError:
             await self._fail(
                 claimed,
                 error_code="distill_cancelled",
                 terminal=False,
+                accounting=self._accounting(
+                    snapshot_bytes=snapshot.byte_count,
+                    started_at=started_at,
+                    estimated_max_tokens=estimated_max_tokens,
+                ),
             )
             raise
         except Exception as error:
@@ -219,12 +258,23 @@ class CodexDistillExtractionWorker:
                 claimed,
                 error_code=error_code,
                 terminal=terminal,
+                accounting=self._accounting(
+                    snapshot_bytes=snapshot.byte_count,
+                    started_at=started_at,
+                    estimated_max_tokens=estimated_max_tokens,
+                ),
             )
+        accounting = self._accounting(
+            snapshot_bytes=snapshot.byte_count,
+            started_at=started_at,
+            estimated_max_tokens=estimated_max_tokens,
+        )
         if not isinstance(output, DistillExtractionOutput):
             return await self._fail(
                 claimed,
                 error_code="distill_output_invalid",
                 terminal=True,
+                accounting=accounting,
             )
         provenance = output.provenance
         if (
@@ -236,12 +286,14 @@ class CodexDistillExtractionWorker:
                 claimed,
                 error_code="distill_output_provenance_invalid",
                 terminal=True,
+                accounting=accounting,
             )
         if not self._wiki_enabled and output.wiki_candidates:
             return await self._fail(
                 claimed,
                 error_code="distill_output_wiki_disabled",
                 terminal=True,
+                accounting=accounting,
             )
         return await asyncio.to_thread(
             self._journal.mark_extraction_done,
@@ -249,6 +301,7 @@ class CodexDistillExtractionWorker:
             owner_token=self._owner_token,
             lease_epoch=claimed.extraction_lease_epoch,
             extraction_output=output,
+            accounting=accounting,
         )
 
 

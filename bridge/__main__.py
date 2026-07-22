@@ -171,8 +171,11 @@ def build_context(
         CodexExecDistillBackend(
             wiki_enabled=wiki_enabled,
             environment=distill_environment,
+            model=settings.codex_distill_model,
+            timeout_seconds=settings.codex_distill_timeout_seconds,
         ),
         wiki_enabled=wiki_enabled,
+        model=settings.codex_distill_model,
     )
     distill_snapshot_worker = None
     if settings.agent_provider == "codex":

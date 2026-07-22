@@ -127,6 +127,22 @@ def output_path_from_args(args: tuple[str, ...]) -> Path:
     return Path(args[args.index("--output-last-message") + 1])
 
 
+@pytest.mark.parametrize(
+    "kwargs",
+    (
+        {"model": "-unsafe-model"},
+        {"model": "private model"},
+        {"model": "x" * 129},
+        {"timeout_seconds": 601},
+    ),
+)
+def test_backend_rejects_unbounded_or_argv_unsafe_cost_policy(
+    kwargs: dict[str, Any],
+) -> None:
+    with pytest.raises(CodexDistillBackendError, match="^codex_distill_config_invalid$"):
+        CodexExecDistillBackend(**kwargs)
+
+
 @async_test
 async def test_backend_uses_exact_isolated_argv_private_cwd_and_canonical_stdin(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, codex_executable: str
@@ -149,6 +165,7 @@ async def test_backend_uses_exact_isolated_argv_private_cwd_and_canonical_stdin(
     backend = CodexExecDistillBackend(
         executable=codex_executable,
         schema_path=SCHEMA_PATH,
+        model="gpt-5-mini",
         temp_root=tmp_path,
         environment={
             "HOME": "/home/operator",
@@ -178,6 +195,7 @@ async def test_backend_uses_exact_isolated_argv_private_cwd_and_canonical_stdin(
     assert "--ignore-rules" in args
     assert args[args.index("--sandbox") + 1] == "read-only"
     assert "--skip-git-repo-check" in args
+    assert args[args.index("--model") + 1] == "gpt-5-mini"
     assert Path(args[args.index("--output-schema") + 1]) == SCHEMA_PATH.resolve()
     assert output_path_from_args(args).parent != Path(capture["kwargs"]["cwd"])
     assert capture["stdin"] == canonical_extraction_input_bytes(extraction_input())

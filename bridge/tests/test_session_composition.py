@@ -874,6 +874,8 @@ root = Path(os.environ["PROBE_ROOT"])
 os.environ["PROJECT_ROOT"] = str(root / "project")
 os.environ["TELEGRAM_BOT_TOKEN"] = "123456:test"
 os.environ["ALLOWED_USER_IDS"] = "1"
+os.environ["CCC_CODEX_DISTILL_MODEL"] = "gpt-5-mini"
+os.environ["CCC_CODEX_DISTILL_TIMEOUT_SEC"] = "45"
 
 from telegram_bot.__main__ import build_context, load_runtime_settings
 from telegram_bot.memory.distill_worker import CodexDistillExtractionWorker
@@ -885,6 +887,9 @@ assert isinstance(worker, CodexDistillExtractionWorker), type(worker)
 meter = context.project_chat.usage_meter
 assert meter is not None, "the production meter must exist by default"
 assert worker._usage_meter is meter, "the worker must share the handler meter"
+assert worker._model == "gpt-5-mini"
+assert worker._backend._model == "gpt-5-mini"
+assert worker._backend._timeout_seconds == 45.0
 
 parameter = inspect.signature(CodexDistillExtractionWorker.__init__).parameters[
     "usage_meter"
