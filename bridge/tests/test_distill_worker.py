@@ -171,6 +171,46 @@ async def test_concurrent_workers_extract_once_and_result_survives_reopen(
     assert result.honcho[0].text == "A harmless fact was retained."
 
 
+@pytest.mark.anyio
+async def test_extraction_records_body_free_model_bytes_duration_and_cost_estimate(
+    tmp_path: Path,
+) -> None:
+    journal = DistillJournal(tmp_path / "journal")
+    journal.initialize()
+    job = snapshot_done_job(journal)
+    backend = SuccessfulBackend()
+    ticks = iter((10.0, 10.125))
+
+    result = await CodexDistillExtractionWorker(
+        journal,
+        backend,
+        owner_token="extract-worker",
+        usage_meter=None,
+        model="gpt-5-mini",
+        clock=lambda: next(ticks),
+    ).extract_once(job_id=job.job_id)
+
+    assert result.status is DistillJobStatus.EXTRACTION_DONE
+    assert len(result.extraction_accounting) == 1
+    accounting = result.extraction_accounting[0]
+    assert accounting.model == "gpt-5-mini"
+    assert accounting.snapshot_bytes == snapshot().byte_count
+    assert accounting.duration_ms == 125
+    assert accounting.estimated_max_tokens == 73854
+    diagnostics = journal.diagnostics(job.job_id)
+    assert diagnostics["provider"] == "codex"
+    assert diagnostics["extraction_accounting"] == {
+        "accounted_attempts": 1,
+        "models": {"gpt-5-mini": 1},
+        "snapshot_bytes": snapshot().byte_count,
+        "duration_ms": 125,
+        "estimated_max_tokens": 73854,
+    }
+    rendered = repr(diagnostics)
+    assert "harmless durable fact" not in rendered
+    assert "thread-532" not in rendered
+
+
 @pytest.mark.parametrize(
     ("code", "expected_status"),
     [
@@ -209,6 +249,10 @@ async def test_backend_failure_is_classified_with_body_free_code(
     assert result.error_code == code
     assert result.snapshot == snapshot()
     assert result.extraction_output is None
+    assert len(result.extraction_accounting) == 1
+    assert result.extraction_accounting[0].model == "provider-default"
+    assert result.extraction_accounting[0].snapshot_bytes == snapshot().byte_count
+    assert result.extraction_accounting[0].estimated_max_tokens == 73854
 
 
 @pytest.mark.anyio

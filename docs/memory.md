@@ -60,6 +60,17 @@ checkpoint gates; all default to `0` (disabled). When multiple gates are
 enabled, the first boundary reached after a completed turn records a durable
 journal job. Snapshot and extraction work remain asynchronous.
 
+`CCC_CODEX_DISTILL_MODEL` (default `provider-default`) identifies the isolated
+extractor model; another safe model ID is passed explicitly to `codex exec`.
+`CCC_CODEX_DISTILL_TIMEOUT_SEC` defaults to 120 seconds and is hard-bounded to
+1–600. Each completed provider attempt appends body-free accounting to its
+journal record: model, bounded snapshot bytes, duration in milliseconds, and
+the conservative maximum-token estimate reserved by the shared #388 usage
+meter. This estimate is not actual provider token usage. The existing
+`CCC_USAGE_BUDGET_TOKENS_CODEX` and `CCC_USAGE_BUDGET_WARN_PERCENT` settings
+provide configurable warn/enforce gates; enforce defers autonomous extraction
+before claim/provider execution without blocking interactive turns.
+
 - `bridge/memory/distill_extraction.py` contains the input/output models,
   `DistillBackend` protocol, privacy gates, canonical input serializer, strict JSON
   parser, and body-free diagnostics.
@@ -104,6 +115,9 @@ journal job. Snapshot and extraction work remain asynchronous.
   with no jobs. The read-only diagnostic defaults to
   `${BOT_DATA_DIR:-${PROJECT_ROOT:-$PWD}/.telegram_bot}/distill-journal`; tests or
   operators may select another journal with `CCC_DISTILL_JOURNAL_DIR`.
+  Its `.writeback_queue.accounting` aggregate reports accounted attempts,
+  turn bytes, duration, conservative maximum-token estimates, and safe model
+  counts without emitting transcript, extraction, route, or error bodies.
 
 ## Useful commands
 

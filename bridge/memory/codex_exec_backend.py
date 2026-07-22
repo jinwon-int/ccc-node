@@ -13,6 +13,7 @@ from collections.abc import Mapping
 import math
 import os
 from pathlib import Path
+import re
 import shutil
 import signal
 import stat
@@ -42,6 +43,8 @@ _DEFAULT_SCHEMA = (
 _DEFAULT_PATH = "/usr/local/bin:/usr/bin:/bin"
 _MAX_SCHEMA_BYTES = 256 * 1024
 _MAX_TIMEOUT_SECONDS = 10 * 60.0
+_MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+_PROVIDER_DEFAULT_MODEL = "provider-default"
 
 # Only documented Codex location/auth/TLS/diagnostic variables plus conventional
 # HTTP proxy and locale variables cross the provider boundary. Values belonging to
@@ -220,6 +223,7 @@ class CodexExecDistillBackend:
         *,
         executable: str = "codex",
         schema_path: str | Path = _DEFAULT_SCHEMA,
+        model: str = _PROVIDER_DEFAULT_MODEL,
         timeout_seconds: float = 120.0,
         wiki_enabled: bool = True,
         max_output_bytes: int = MAX_EXTRACTION_JSON_BYTES,
@@ -232,6 +236,8 @@ class CodexExecDistillBackend:
             or not math.isfinite(timeout_seconds)
             or timeout_seconds <= 0
             or timeout_seconds > _MAX_TIMEOUT_SECONDS
+            or not isinstance(model, str)
+            or _MODEL_RE.fullmatch(model) is None
             or type(wiki_enabled) is not bool
             or type(max_output_bytes) is not int
             or max_output_bytes <= 0
@@ -240,6 +246,7 @@ class CodexExecDistillBackend:
             raise CodexDistillBackendError("codex_distill_config_invalid")
         self._executable = executable
         self._schema_path = Path(schema_path)
+        self._model = model
         self._timeout_seconds = float(timeout_seconds)
         self._wiki_enabled = wiki_enabled
         self._max_output_bytes = max_output_bytes
@@ -278,6 +285,8 @@ class CodexExecDistillBackend:
                     arguments.extend(
                         ("--config", 'cli_auth_credentials_store="keyring"')
                     )
+                if self._model != _PROVIDER_DEFAULT_MODEL:
+                    arguments.extend(("--model", self._model))
                 arguments.extend(
                     (
                         "--ephemeral",

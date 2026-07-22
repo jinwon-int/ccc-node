@@ -12,6 +12,7 @@ DISTILL_SCHEMA_VERSION = 1
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _SAFE_ERROR_CODE_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _PRIVATE_MEMORY_SCOPE_RE = re.compile(r"^private-[0-9a-f]{32}$")
+_DISTILL_MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 
 
 class DistillTrigger(str, Enum):
@@ -42,6 +43,80 @@ class DistillLocalSinkStatus(str, Enum):
     DONE = "done"
     TERMINAL_FAILED = "terminal_failed"
     UNROUTABLE = "unroutable"
+
+
+@dataclass(frozen=True, slots=True)
+class DistillExtractionAccounting:
+    """Body-free accounting for one provider extraction attempt.
+
+    ``estimated_max_tokens`` is the conservative pre-spend reservation used by
+    the shared usage meter. It is deliberately not represented as actual
+    provider token usage.
+    """
+
+    model: str
+    snapshot_bytes: int
+    duration_ms: int
+    estimated_max_tokens: int
+
+    def __post_init__(self) -> None:
+        if not _DISTILL_MODEL_RE.fullmatch(self.model):
+            raise ValueError("invalid distill extraction model")
+        for name in ("snapshot_bytes", "duration_ms", "estimated_max_tokens"):
+            value = getattr(self, name)
+            if type(value) is not int or value < 0 or value > 10**12:
+                raise ValueError(f"invalid distill extraction accounting: {name}")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "model": self.model,
+            "snapshot_bytes": self.snapshot_bytes,
+            "duration_ms": self.duration_ms,
+            "estimated_max_tokens": self.estimated_max_tokens,
+        }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> DistillExtractionAccounting:
+        model = value.get("model")
+        snapshot_bytes = value.get("snapshot_bytes")
+        duration_ms = value.get("duration_ms")
+        estimated_max_tokens = value.get("estimated_max_tokens")
+        if not isinstance(model, str):
+            raise ValueError("invalid distill extraction accounting model")
+        if (
+            not isinstance(snapshot_bytes, int)
+            or isinstance(snapshot_bytes, bool)
+            or not isinstance(duration_ms, int)
+            or isinstance(duration_ms, bool)
+            or not isinstance(estimated_max_tokens, int)
+            or isinstance(estimated_max_tokens, bool)
+        ):
+            raise ValueError("invalid distill extraction accounting counters")
+        return cls(model, snapshot_bytes, duration_ms, estimated_max_tokens)
+
+    @classmethod
+    def parse_many(cls, value: object) -> tuple[DistillExtractionAccounting, ...]:
+        if not isinstance(value, list) or any(
+            not isinstance(item, Mapping) for item in value
+        ):
+            raise ValueError("invalid distill job extraction_accounting")
+        return tuple(
+            cls.from_dict(item) for item in value if isinstance(item, Mapping)
+        )
+
+    @staticmethod
+    def validate_for_job(
+        items: tuple[DistillExtractionAccounting, ...],
+        *,
+        attempts: int,
+        snapshot: CodexTranscriptSnapshot | None,
+    ) -> None:
+        if len(items) > attempts:
+            raise ValueError("distill accounting exceeds extraction attempts")
+        if snapshot is not None and any(
+            item.snapshot_bytes != snapshot.byte_count for item in items
+        ):
+            raise ValueError("distill accounting snapshot bytes do not match")
 
 
 def validate_memory_route(audience: str | None, scope: str | None) -> None:
@@ -203,6 +278,7 @@ class DistillJob:
     extraction_lease_epoch: int = 0
     extraction_output: str | None = None
     extraction_output_hash: str | None = None
+    extraction_accounting: tuple[DistillExtractionAccounting, ...] = ()
     memory_audience: str | None = None
     memory_scope: str | None = None
     local_sink_status: DistillLocalSinkStatus | None = None
@@ -260,6 +336,11 @@ class DistillJob:
                 or self.extraction_output_hash != expected_hash
             ):
                 raise ValueError("invalid distill extraction output hash")
+        DistillExtractionAccounting.validate_for_job(
+            self.extraction_accounting,
+            attempts=self.extraction_attempts,
+            snapshot=self.snapshot,
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -283,6 +364,9 @@ class DistillJob:
             "extraction_lease_epoch": self.extraction_lease_epoch,
             "extraction_output": self.extraction_output,
             "extraction_output_hash": self.extraction_output_hash,
+            "extraction_accounting": [
+                item.to_dict() for item in self.extraction_accounting
+            ],
             "memory_audience": self.memory_audience,
             "memory_scope": self.memory_scope,
             "local_sink_status": (
@@ -337,6 +421,7 @@ class DistillJob:
         error_code = value.get("error_code")
         extraction_output = value.get("extraction_output")
         extraction_output_hash = value.get("extraction_output_hash")
+        raw_extraction_accounting = value.get("extraction_accounting", [])
         memory_audience = value.get("memory_audience")
         memory_scope = value.get("memory_scope")
         for name, optional in (
@@ -350,6 +435,9 @@ class DistillJob:
         ):
             if optional is not None and not isinstance(optional, str):
                 raise ValueError(f"invalid distill job field: {name}")
+        extraction_accounting = DistillExtractionAccounting.parse_many(
+            raw_extraction_accounting
+        )
         raw_local_sink_status = value.get("local_sink_status")
         if raw_local_sink_status is None:
             local_sink_status = (
@@ -386,6 +474,7 @@ class DistillJob:
             extraction_lease_epoch=extraction_lease_epoch,
             extraction_output=extraction_output,
             extraction_output_hash=extraction_output_hash,
+            extraction_accounting=extraction_accounting,
             memory_audience=memory_audience,
             memory_scope=memory_scope,
             local_sink_status=local_sink_status,

@@ -23,6 +23,8 @@ MEMORY_FIELDS = {
     "codex_distill_checkpoint_turns": "CCC_CODEX_DISTILL_CHECKPOINT_TURNS",
     "codex_distill_checkpoint_bytes": "CCC_CODEX_DISTILL_CHECKPOINT_BYTES",
     "codex_distill_checkpoint_age_seconds": "CCC_CODEX_DISTILL_CHECKPOINT_AGE_SECONDS",
+    "codex_distill_model": "CCC_CODEX_DISTILL_MODEL",
+    "codex_distill_timeout_seconds": "CCC_CODEX_DISTILL_TIMEOUT_SEC",
 }
 
 
@@ -51,6 +53,35 @@ def test_codex_checkpoint_gates_are_disabled_by_default() -> None:
     assert configured.codex_distill_checkpoint_turns == 12
     assert configured.codex_distill_checkpoint_bytes == 65_536
     assert configured.codex_distill_checkpoint_age_seconds == 21_600
+
+
+def test_codex_distill_provider_cost_settings_are_explicit_and_bounded() -> None:
+    assert Config.model_fields["codex_distill_model"].default == "provider-default"
+    assert Config.model_fields["codex_distill_timeout_seconds"].default == 120.0
+
+    configured = Config(
+        telegram_bot_token="123456:abc",
+        _env_file=None,
+        CCC_CODEX_DISTILL_MODEL="gpt-5-mini",
+        CCC_CODEX_DISTILL_TIMEOUT_SEC=45.5,
+    )
+    assert configured.codex_distill_model == "gpt-5-mini"
+    assert configured.codex_distill_timeout_seconds == 45.5
+
+    for model in ("", "private model", "x" * 129):
+        with pytest.raises(ValidationError, match="CCC_CODEX_DISTILL_MODEL"):
+            Config(
+                telegram_bot_token="123456:abc",
+                _env_file=None,
+                CCC_CODEX_DISTILL_MODEL=model,
+            )
+    for timeout in (0, 601):
+        with pytest.raises(ValidationError, match="CCC_CODEX_DISTILL_TIMEOUT_SEC"):
+            Config(
+                telegram_bot_token="123456:abc",
+                _env_file=None,
+                CCC_CODEX_DISTILL_TIMEOUT_SEC=timeout,
+            )
 
 
 @pytest.mark.parametrize(

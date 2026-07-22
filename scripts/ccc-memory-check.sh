@@ -54,6 +54,7 @@ empty_writeback_json() {
     record_bytes:0, snapshot_bytes:0,
     oldest_age_seconds:-1, oldest_pending_age_seconds:-1,
     retries:{snapshot:0, extraction:0, local:0, total:0},
+    accounting:{accounted_attempts:0, turn_bytes:0, duration_ms:0, estimated_max_tokens:0, model_counts:{}},
     status_counts:{}, local_status_counts:{}
   }'
 }
@@ -121,6 +122,18 @@ writeback_queue_json() {
           and (.extraction_attempts | nnint)
           and (.local_sink_attempts | nnint)
           and ((.snapshot // null) | . == null or (type == "object" and (.byte_count | nnint)))
+          and ((.extraction_accounting // []) |
+            type == "array"
+            and length <= $job.extraction_attempts
+            and all(.[];
+              type == "object"
+              and (.model | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"))
+              and (.snapshot_bytes | nnint)
+              and .snapshot_bytes == ($job.snapshot.byte_count // 0)
+              and (.duration_ms | nnint)
+              and (.estimated_max_tokens | nnint)
+            )
+          )
         )
       | .status as $status
       | (.local_sink_status // null) as $local
@@ -133,6 +146,11 @@ writeback_queue_json() {
           snapshot_retries:.attempts,
           extraction_retries:.extraction_attempts,
           local_retries:.local_sink_attempts,
+          accounting:(
+            [(.extraction_accounting // [])[] | {
+              model, turn_bytes:.snapshot_bytes, duration_ms, estimated_max_tokens
+            }]
+          ),
           pending:(
             ($status | oneof(["queued","running_snapshot","snapshot_done","retryable_failed","running_extraction","extraction_retryable_failed"]))
             or ($status == "extraction_done" and $local == null and $routed)
@@ -158,6 +176,7 @@ writeback_queue_json() {
         record_bytes:$bytes, snapshot_bytes:0,
         oldest_age_seconds:-1, oldest_pending_age_seconds:-1,
         retries:{snapshot:0, extraction:0, local:0, total:0},
+        accounting:{accounted_attempts:0, turn_bytes:0, duration_ms:0, estimated_max_tokens:0, model_counts:{}},
         status_counts:{}, local_status_counts:{}
       }'
     else
@@ -177,6 +196,7 @@ writeback_queue_json() {
       | ([ $jobs[] | .snapshot_retries ] | add // 0) as $snapshot_retries
       | ([ $jobs[] | .extraction_retries ] | add // 0) as $extraction_retries
       | ([ $jobs[] | .local_retries ] | add // 0) as $local_retries
+      | ([ $jobs[] | .accounting[] ]) as $accounting
       | {
           status:(
             if $invalid > 0 or any($jobs[]; .degraded) then "degraded"
@@ -196,6 +216,13 @@ writeback_queue_json() {
             extraction:$extraction_retries,
             local:$local_retries,
             total:($snapshot_retries + $extraction_retries + $local_retries)
+          },
+          accounting:{
+            accounted_attempts:($accounting | length),
+            turn_bytes:([$accounting[] | .turn_bytes] | add // 0),
+            duration_ms:([$accounting[] | .duration_ms] | add // 0),
+            estimated_max_tokens:([$accounting[] | .estimated_max_tokens] | add // 0),
+            model_counts:(reduce $accounting[] as $item ({}; .[$item.model] = ((.[$item.model] // 0) + 1)))
           },
           status_counts:(reduce $jobs[] as $job ({}; .[$job.status] = ((.[$job.status] // 0) + 1))),
           local_status_counts:(reduce ($jobs[] | select(.local_status != null)) as $job ({}; .[$job.local_status] = ((.[$job.local_status] // 0) + 1)))
@@ -285,7 +312,7 @@ printf -- '- codex:   %s kind=%s hash=%s metadata=%s\n' \
   "$(jq -r '.active_kind // "none"' <<<"$codex_json")" \
   "$(jq -r '.snapshot_sha256 // "none"' <<<"$codex_json")" \
   "$(jq -r '.metadata_status // "missing"' <<<"$codex_json")"
-printf -- '- writeback: status=%s jobs=%s pending=%s invalid=%s bytes=%s snapshot_bytes=%s oldest=%ss retries=%s\n' \
+printf -- '- writeback: status=%s jobs=%s pending=%s invalid=%s bytes=%s snapshot_bytes=%s oldest=%ss retries=%s accounted=%s estimated_max_tokens=%s duration_ms=%s\n' \
   "$(jq -r '.status' <<<"$writeback_json")" \
   "$(jq -r '.jobs' <<<"$writeback_json")" \
   "$(jq -r '.pending_jobs' <<<"$writeback_json")" \
@@ -293,4 +320,7 @@ printf -- '- writeback: status=%s jobs=%s pending=%s invalid=%s bytes=%s snapsho
   "$(jq -r '.record_bytes' <<<"$writeback_json")" \
   "$(jq -r '.snapshot_bytes' <<<"$writeback_json")" \
   "$(jq -r '.oldest_age_seconds' <<<"$writeback_json")" \
-  "$(jq -r '.retries.total' <<<"$writeback_json")"
+  "$(jq -r '.retries.total' <<<"$writeback_json")" \
+  "$(jq -r '.accounting.accounted_attempts' <<<"$writeback_json")" \
+  "$(jq -r '.accounting.estimated_max_tokens' <<<"$writeback_json")" \
+  "$(jq -r '.accounting.duration_ms' <<<"$writeback_json")"

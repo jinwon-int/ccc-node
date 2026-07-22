@@ -37,6 +37,7 @@ ok "memory check reports a missing write-back queue without creating it" '[ "$rc
     record_bytes:0, snapshot_bytes:0,
     oldest_age_seconds:-1, oldest_pending_age_seconds:-1,
     retries:{snapshot:0, extraction:0, local:0, total:0},
+    accounting:{accounted_attempts:0, turn_bytes:0, duration_ms:0, estimated_max_tokens:0, model_counts:{}},
     status_counts:{}, local_status_counts:{}
   }'\'' >/dev/null <<<"$out" && [ ! -e "$missing_journal" ]'
 
@@ -57,10 +58,10 @@ cat > "$journal/$queued_id.json" <<JSON
 {"job_id":"$queued_id","provider":"codex","thread_id":"$secret_thread","thread_hash":"$(printf '1%.0s' {1..64})","trigger":"checkpoint","status":"queued","created_at":"1970-01-01T00:01:20.123456Z","updated_at":"1970-01-01T00:01:30Z","attempts":1,"extraction_attempts":0,"local_sink_attempts":0,"snapshot":{"byte_count":120,"messages":[{"role":"user","text":"$secret_message"}]}}
 JSON
 cat > "$journal/$done_id.json" <<JSON
-{"job_id":"$done_id","provider":"codex","thread_id":"$secret_thread-done","thread_hash":"$(printf '2%.0s' {1..64})","trigger":"explicit","status":"extraction_done","created_at":"1970-01-01T00:01:40Z","updated_at":"1970-01-01T00:01:50Z","attempts":1,"extraction_attempts":1,"local_sink_status":"done","local_sink_attempts":1,"snapshot":{"byte_count":200,"messages":[{"role":"assistant","text":"$secret_message"}]},"extraction_output":"$secret_output","memory_scope":"private-deadbeefdeadbeefdeadbeefdeadbeef"}
+{"job_id":"$done_id","provider":"codex","thread_id":"$secret_thread-done","thread_hash":"$(printf '2%.0s' {1..64})","trigger":"explicit","status":"extraction_done","created_at":"1970-01-01T00:01:40Z","updated_at":"1970-01-01T00:01:50Z","attempts":1,"extraction_attempts":1,"extraction_accounting":[{"model":"gpt-5-mini","snapshot_bytes":200,"duration_ms":1250,"estimated_max_tokens":75000}],"local_sink_status":"done","local_sink_attempts":1,"snapshot":{"byte_count":200,"messages":[{"role":"assistant","text":"$secret_message"}]},"extraction_output":"$secret_output","memory_scope":"private-deadbeefdeadbeefdeadbeefdeadbeef"}
 JSON
 cat > "$journal/$retry_id.json" <<JSON
-{"job_id":"$retry_id","provider":"codex","thread_id":"$secret_thread-retry","thread_hash":"$(printf '3%.0s' {1..64})","trigger":"shutdown","status":"extraction_done","created_at":"1970-01-01T00:02:00Z","updated_at":"1970-01-01T00:02:10Z","attempts":2,"extraction_attempts":3,"local_sink_status":"retryable_failed","local_sink_attempts":4,"snapshot":{"byte_count":300,"messages":[{"role":"user","text":"$secret_message"}]},"extraction_output":"$secret_output","memory_scope":"private-feedfacefeedfacefeedfacefeedface"}
+{"job_id":"$retry_id","provider":"codex","thread_id":"$secret_thread-retry","thread_hash":"$(printf '3%.0s' {1..64})","trigger":"shutdown","status":"extraction_done","created_at":"1970-01-01T00:02:00Z","updated_at":"1970-01-01T00:02:10Z","attempts":2,"extraction_attempts":3,"extraction_accounting":[{"model":"gpt-5-mini","snapshot_bytes":300,"duration_ms":1000,"estimated_max_tokens":75000},{"model":"gpt-5-mini","snapshot_bytes":300,"duration_ms":1500,"estimated_max_tokens":75000}],"local_sink_status":"retryable_failed","local_sink_attempts":4,"snapshot":{"byte_count":300,"messages":[{"role":"user","text":"$secret_message"}]},"extraction_output":"$secret_output","memory_scope":"private-feedfacefeedfacefeedfacefeedface"}
 JSON
 printf '{malformed %s\n' "$secret_message" > "$journal/$(printf 'd%.0s' {1..64}).json"
 printf '{"thread_id":"%s"}\n' "$secret_thread-symlink" > "$TMP/symlink-target.json"
@@ -82,6 +83,7 @@ ok "memory check aggregates active and degraded write-back state" '[ "$rc" = 0 ]
   and .writeback_queue.oldest_age_seconds == 120
   and .writeback_queue.oldest_pending_age_seconds == 120
   and .writeback_queue.retries == {snapshot:4, extraction:4, local:5, total:13}
+  and .writeback_queue.accounting == {accounted_attempts:3, turn_bytes:800, duration_ms:3750, estimated_max_tokens:225000, model_counts:{"gpt-5-mini":3}}
   and .writeback_queue.status_counts == {queued:1, extraction_done:2}
   and .writeback_queue.local_status_counts == {done:1, retryable_failed:1}
 '\'' >/dev/null <<<"$out"'

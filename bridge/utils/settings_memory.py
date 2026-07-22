@@ -7,6 +7,7 @@ the same field names, aliases, defaults, and validation order.
 """
 
 from pathlib import Path
+import re
 from typing import Literal, Optional
 
 from pydantic import Field, field_validator, model_validator
@@ -117,6 +118,21 @@ class MemorySettingsMixin:
             "gate. Age is evaluated after a completed Codex turn."
         ),
     )
+    codex_distill_model: str = Field(
+        default="provider-default",
+        alias="CCC_CODEX_DISTILL_MODEL",
+        description=(
+            "Isolated Codex distill model label. provider-default preserves the "
+            "Codex CLI default; another safe model ID is passed explicitly."
+        ),
+    )
+    codex_distill_timeout_seconds: float = Field(
+        default=120.0,
+        ge=1.0,
+        le=600.0,
+        alias="CCC_CODEX_DISTILL_TIMEOUT_SEC",
+        description="Bounded timeout for one isolated Codex distill provider call.",
+    )
 
     def hook_policy_environment(self) -> dict[str, str]:
         """Return validated, non-secret policy fields inherited by Claude hooks."""
@@ -144,6 +160,16 @@ class MemorySettingsMixin:
         value = str(v).strip()
         if not value:
             raise ValueError("Codex runtime paths must be non-empty")
+        return value
+
+    @field_validator("codex_distill_model", mode="before")
+    @classmethod
+    def validate_codex_distill_model(cls, v):
+        if not isinstance(v, str):
+            raise ValueError("CCC_CODEX_DISTILL_MODEL must be a safe model identifier")
+        value = v.strip()
+        if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", value) is None:
+            raise ValueError("CCC_CODEX_DISTILL_MODEL must be a safe model identifier")
         return value
 
     @model_validator(mode="after")

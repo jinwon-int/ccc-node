@@ -135,6 +135,8 @@ utils/chat_logger.py Per-session debug chat logging
 | `CCC_USAGE_BUDGET_TOKENS_CLAUDE` | No | Daily Claude token budget (input+output) for the meter; 0 = off (default). Enforce blocks autonomous spend only |
 | `CCC_USAGE_BUDGET_TOKENS_CODEX` | No | Daily Codex token budget (input+output) for the meter; 0 = off (default). Enforce blocks autonomous spend only |
 | `CCC_USAGE_BUDGET_WARN_PERCENT` | No | Early-alarm percentage of a daily token budget (default: 80) |
+| `CCC_CODEX_DISTILL_MODEL` | Codex only | Isolated memory extractor model label (default: `provider-default`, preserving the Codex CLI default) |
+| `CCC_CODEX_DISTILL_TIMEOUT_SEC` | Codex only | Isolated extractor timeout in seconds, bounded to 1–600 (default: 120) |
 | `CCC_USAGE_KIMI_5H_REQUEST_LIMIT` | No | Operator-configured Kimi Code 5-hour request limit (from the Kimi Code Console); when set, `/usage` shows `used/limit req · X% used / Y% left` for the synthesized `Kimi 5-hour` window (local estimate). Unset = count-only |
 | `CCC_USAGE_KIMI_WEEKLY_TOKEN_LIMIT` | No | Operator-configured Kimi Code weekly token limit (Console shows weekly % only; back-compute the limit once from the meter's 7-day totals). When set, `/usage` adds a `Kimi weekly` percent window (local estimate). Unset = weekly window hidden |
 | `CCC_DEPS_UNLOCKED` | No | Set 1 to skip the default hash-locked install (`requirements.lock.txt` via `pip --require-hashes`) and use the legacy lower-bound `requirements.txt` flow. Regenerate locks with `scripts/ccc-deps-lock.sh` |

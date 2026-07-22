@@ -25,6 +25,7 @@ from telegram_bot.utils.secure_fs import (
 from .distill_types import (
     DISTILL_SCHEMA_VERSION,
     CodexTranscriptSnapshot,
+    DistillExtractionAccounting,
     DistillJob,
     DistillJobStatus,
     DistillLocalSinkStatus,
@@ -475,6 +476,7 @@ class DistillJournal:
         owner_token: str,
         lease_epoch: int,
         extraction_output: DistillExtractionOutput,
+        accounting: DistillExtractionAccounting | None = None,
         now: datetime | None = None,
     ) -> DistillJob:
         payload = self._canonical_extraction_output(extraction_output)
@@ -499,6 +501,11 @@ class DistillJournal:
                 lease_expires_at=None,
                 extraction_output=payload,
                 extraction_output_hash=payload_hash,
+                extraction_accounting=(
+                    job.extraction_accounting + (accounting,)
+                    if accounting is not None
+                    else job.extraction_accounting
+                ),
                 local_sink_status=(
                     DistillLocalSinkStatus.PENDING
                     if job.memory_audience is not None
@@ -516,6 +523,7 @@ class DistillJournal:
         owner_token: str,
         lease_epoch: int,
         error_code: str,
+        accounting: DistillExtractionAccounting | None = None,
         now: datetime | None = None,
     ) -> DistillJob:
         return self._mark_extraction_failed(
@@ -523,6 +531,7 @@ class DistillJournal:
             owner_token=owner_token,
             lease_epoch=lease_epoch,
             error_code=error_code,
+            accounting=accounting,
             status=DistillJobStatus.EXTRACTION_RETRYABLE_FAILED,
             now=now,
         )
@@ -534,6 +543,7 @@ class DistillJournal:
         owner_token: str,
         lease_epoch: int,
         error_code: str,
+        accounting: DistillExtractionAccounting | None = None,
         now: datetime | None = None,
     ) -> DistillJob:
         return self._mark_extraction_failed(
@@ -541,6 +551,7 @@ class DistillJournal:
             owner_token=owner_token,
             lease_epoch=lease_epoch,
             error_code=error_code,
+            accounting=accounting,
             status=DistillJobStatus.EXTRACTION_TERMINAL_FAILED,
             now=now,
         )
@@ -553,6 +564,7 @@ class DistillJournal:
         lease_epoch: int,
         error_code: str,
         status: DistillJobStatus,
+        accounting: DistillExtractionAccounting | None,
         now: datetime | None,
     ) -> DistillJob:
         self._validate_error_code(error_code)
@@ -567,6 +579,11 @@ class DistillJournal:
                 lease_expires_at=None,
                 extraction_output=None,
                 extraction_output_hash=None,
+                extraction_accounting=(
+                    job.extraction_accounting + (accounting,)
+                    if accounting is not None
+                    else job.extraction_accounting
+                ),
                 error_code=error_code,
             )
             self._write_unlocked(failed)
@@ -840,8 +857,12 @@ class DistillJournal:
             if job.extraction_output is not None
             else None
         )
+        model_counts: dict[str, int] = {}
+        for item in job.extraction_accounting:
+            model_counts[item.model] = model_counts.get(item.model, 0) + 1
         return {
             "job_id": job.job_id,
+            "provider": job.provider,
             "thread_hash": job.thread_hash,
             "trigger": job.trigger.value,
             "status": job.status.value,
@@ -864,6 +885,19 @@ class DistillJournal:
                 if job.extraction_output is not None
                 else 0
             ),
+            "extraction_accounting": {
+                "accounted_attempts": len(job.extraction_accounting),
+                "models": model_counts,
+                "snapshot_bytes": sum(
+                    item.snapshot_bytes for item in job.extraction_accounting
+                ),
+                "duration_ms": sum(
+                    item.duration_ms for item in job.extraction_accounting
+                ),
+                "estimated_max_tokens": sum(
+                    item.estimated_max_tokens for item in job.extraction_accounting
+                ),
+            },
             "honcho_count": len(extraction.honcho) if extraction is not None else 0,
             "wiki_candidate_count": (
                 len(extraction.wiki_candidates) if extraction is not None else 0
