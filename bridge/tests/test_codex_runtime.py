@@ -636,6 +636,28 @@ class CodexRuntimeTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaisesRegex(RuntimeError, "memory bootstrap unavailable"):
                 await _run_codex_memory_bootstrap(str(missing), timeout_seconds=1.0)
 
+    async def test_subprocess_bootstrap_binds_the_audience_environment(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            materializer = Path(tmp) / "scoped-materializer"
+            materializer.write_text(
+                "#!/bin/sh\n"
+                '[ "${CODEX_HOME:-}" = "/memory/private-scope/codex" ] || exit 8\n'
+                '[ "${CCC_MEMORY_SCOPE:-}" = "private-opaque" ] || exit 9\n'
+                'case "${1:-}" in materialize|status) exit 0;; *) exit 64;; esac\n',
+                encoding="utf-8",
+            )
+            materializer.chmod(0o700)
+
+            await _run_codex_memory_bootstrap(
+                str(materializer),
+                timeout_seconds=1.0,
+                environment={
+                    "PATH": "/usr/local/bin:/usr/bin:/bin",
+                    "CODEX_HOME": "/memory/private-scope/codex",
+                    "CCC_MEMORY_SCOPE": "private-opaque",
+                },
+            )
+
     async def test_start_rejects_a_malformed_thread_identifier(self) -> None:
         self.clients[0].thread_start_result = {"thread": {"id": ""}}
 
