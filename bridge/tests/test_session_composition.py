@@ -818,6 +818,28 @@ print("RUNTIME_IMPORT_PURE")
     assert result.stdout.strip() == "RUNTIME_IMPORT_PURE"
 
 
+def test_bot_module_does_not_rebroadcast_monkeypatched_globals(tmp_path):
+    result = _run_probe(
+        """
+import types
+
+from telegram_bot.core import bot as bot_module
+from telegram_bot.core import bot_lifecycle
+
+original_request = bot_lifecycle.HTTPXRequest
+bot_module.HTTPXRequest = object()
+
+assert type(bot_module) is types.ModuleType
+assert bot_lifecycle.HTTPXRequest is original_request
+print("BOT_MODULE_GLOBALS_ISOLATED")
+""",
+        probe_root=tmp_path,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "BOT_MODULE_GLOBALS_ISOLATED"
+
+
 def test_pinned_sdk_public_options_and_client_construction_smoke(tmp_path):
     result = _run_probe(
         """

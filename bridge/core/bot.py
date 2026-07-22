@@ -2,9 +2,7 @@
 import asyncio
 import logging
 import re
-import sys
 import time
-import types
 from typing import Any, Dict, Optional, cast
 from datetime import datetime, timezone
 
@@ -22,7 +20,6 @@ from telegram.ext import (
     CallbackQueryHandler,
     filters,
 )
-from telegram.request import HTTPXRequest  # noqa: F401 - compatibility for tests/patches
 from telegram_bot.utils.chat_logger import log_debug
 from telegram_bot.core import session_resume
 from telegram_bot.core.push_notifier import PushNotifier
@@ -43,53 +40,14 @@ STALE_MESSAGE_SECONDS = 20 * 60  # 20 minutes
 
 
 from telegram_bot.core.bot_shared import _PollingRestart, enforce_access_control  # noqa: F401
-from telegram_bot.core import bot_lifecycle as _bot_lifecycle_module
-from telegram_bot.core import bot_status as _bot_status_module
 from telegram_bot.core.bot_status import BotStatusMixin
-from telegram_bot.core import bot_access as _bot_access_module
 from telegram_bot.core.bot_access import BotAccessMixin
 from telegram_bot.core.bot_lifecycle import BotLifecycleMixin
-from telegram_bot.core import bot_commands as _bot_commands_module
 from telegram_bot.core.bot_commands import BotCommandMixin
-from telegram_bot.core import bot_delivery as _bot_delivery_module
 from telegram_bot.core.bot_delivery import BotDeliveryMixin
-from telegram_bot.core import bot_voice as _bot_voice_module
 from telegram_bot.core.bot_voice import BotVoiceMixin
 from telegram_bot.core.bot_approvals import BotApprovalMixin
 from telegram_bot.core.bot_callbacks import BotCallbackMixin
-
-
-_EXTRACTED_MODULES = (
-    _bot_lifecycle_module,
-    _bot_status_module,
-    _bot_access_module,
-    _bot_commands_module,
-    _bot_delivery_module,
-    _bot_voice_module,
-)
-
-
-def _sync_extracted_modules() -> None:
-    """Keep extracted mixin modules aligned with monkeypatched bot globals."""
-    for module in _EXTRACTED_MODULES:
-        module.Application = Application
-        module.HTTPXRequest = HTTPXRequest
-        module.enforce_access_control = enforce_access_control
-
-
-class _BotModule(types.ModuleType):
-    def __setattr__(self, name: str, value: Any) -> None:
-        super().__setattr__(name, value)
-        if name in {
-            "Application",
-            "HTTPXRequest",
-            "enforce_access_control",
-        }:
-            _sync_extracted_modules()
-
-
-_sync_extracted_modules()
-sys.modules[__name__].__class__ = _BotModule
 
 
 class TelegramBot(
