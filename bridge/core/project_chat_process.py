@@ -25,6 +25,7 @@ from telegram_bot.core.agent_runtime import (
     ToolStartedEvent,
 )
 from telegram_bot.core.heartbeat import tool_label
+from telegram_bot.core.memory_audience import resolve_memory_audience
 from telegram_bot.core.project_chat_types import (
     AgentApprovalCallback,
     AgentSessionEntry,
@@ -339,6 +340,15 @@ class ProjectChatProcessMixin:
                 session = None
             try:
                 if session is None:
+                    memory_environment = None
+                    if getattr(self._config, "agent_provider", "claude") == "codex":
+                        audience = resolve_memory_audience(
+                            self._config,
+                            user_id=user_id,
+                            chat_id=chat_id,
+                        )
+                        if audience is not None:
+                            memory_environment = audience.codex_environment(self._config)
                     session = await self._agent_runtime.start_or_resume(
                         SessionRequest(
                             working_directory=str(self.project_root),
@@ -348,6 +358,7 @@ class ProjectChatProcessMixin:
                             approval_policy=approval_policy,
                             approvals_reviewer=approvals_reviewer,
                             sandbox_policy=sandbox_policy,
+                            memory_environment=memory_environment,
                         )
                     )
                     self._agent_sessions[key] = AgentSessionEntry(

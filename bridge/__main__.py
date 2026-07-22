@@ -65,12 +65,37 @@ def build_context(
 
     if settings.agent_provider == "codex" and agent_runtime is None:
         from telegram_bot.core.codex_runtime import CodexRuntime
+        from telegram_bot.utils.memory_policy import MEMORY_MODE_AUDIENCE_SCOPED
 
-        agent_runtime = CodexRuntime(
-            cli_path=settings.codex_cli_path,
-            memory_materializer_path=settings.codex_memory_materializer_path,
-            memory_bootstrap_timeout_seconds=(settings.codex_memory_bootstrap_timeout_seconds),
-        )
+        def build_codex_runtime(process_environment=None):
+            if process_environment is None:
+                return CodexRuntime(
+                    cli_path=settings.codex_cli_path,
+                    memory_materializer_path=settings.codex_memory_materializer_path,
+                    memory_bootstrap_timeout_seconds=(
+                        settings.codex_memory_bootstrap_timeout_seconds
+                    ),
+                )
+            return CodexRuntime(
+                cli_path=settings.codex_cli_path,
+                process_environment=process_environment,
+                memory_materializer_path=settings.codex_memory_materializer_path,
+                memory_bootstrap_timeout_seconds=(
+                    settings.codex_memory_bootstrap_timeout_seconds
+                ),
+            )
+
+        if settings.bridge_memory_mode == MEMORY_MODE_AUDIENCE_SCOPED:
+            from telegram_bot.core.codex_runtime_pool import CodexRuntimePool
+            from telegram_bot.core.memory_audience import shared_memory_audience
+
+            shared = shared_memory_audience(settings)
+            agent_runtime = CodexRuntimePool(
+                shared_environment=shared.codex_environment(settings),
+                runtime_factory=build_codex_runtime,
+            )
+        else:
+            agent_runtime = build_codex_runtime()
     elif settings.agent_provider == "claude" and agent_runtime is None:
         # #346/#584 cutover complete (slice C-2): the Claude provider always
         # routes through the provider-neutral ClaudeRuntime adapter; the legacy

@@ -218,3 +218,15 @@ def resolve_memory_audience(
         hashlib.sha256,
     ).hexdigest()[:32]
     return MemoryAudience(AUDIENCE_PRIVATE, f"private-{digest}", root)
+
+
+def shared_memory_audience(settings: Any) -> MemoryAudience:
+    """Return the route-neutral shared audience for safe metadata operations."""
+
+    if getattr(settings, "bridge_memory_mode", "off") != MEMORY_MODE_AUDIENCE_SCOPED:
+        raise ValueError("shared memory audience requires audience-scoped mode")
+    assert_memory_scope_safe(
+        MEMORY_MODE_AUDIENCE_SCOPED,
+        getattr(settings, "telegram_session_scope", "per-user-chat"),
+    )
+    return MemoryAudience(AUDIENCE_SHARED, AUDIENCE_SHARED, _audience_root(settings))
