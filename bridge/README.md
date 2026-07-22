@@ -285,6 +285,7 @@ a provider turn or reads transcript/credential files.
 | `CCC_CODEX_REAL_CLI_PATH` | Codex only | `codex` | Underlying Codex binary invoked by the launcher |
 | `CCC_CODEX_MEMORY_MATERIALIZER_PATH` | Codex only | `~/.claude/hooks/ccc_codex_memory.py` | Body-free materialize/status command run at thread boundaries |
 | `CCC_CODEX_MEMORY_BOOTSTRAP_TIMEOUT_SEC` | Codex only | `14` | Per-command materializer timeout |
+| `CCC_CODEX_AUDIENCE_AUTH_MODE` | Scoped Codex only | `disabled` | Set to `keyring` only after Codex credentials are provisioned in the OS keyring; file credentials are never copied |
 | `CLAUDE_CLI_PATH` | No | *(auto-detect)* | Absolute path to Claude CLI binary |
 | `CLAUDE_SETTINGS_PATH` | No | `~/.claude/settings.json` | Path to Claude Code settings file |
 | `CLAUDE_PROCESS_TIMEOUT` | No | `600` | SDK timeout in seconds |

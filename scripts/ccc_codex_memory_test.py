@@ -488,10 +488,7 @@ class CodexMemoryMaterializerTest(unittest.TestCase):
         self.assertNotIn(sentinel, completed.stderr)
         self.assertIn(sentinel, (self.codex_home / "AGENTS.md").read_text())
 
-    def test_audience_scoped_env_blocks_materialize_and_status(self) -> None:
-        # #581: the global CODEX_HOME/AGENTS.md store has no per-audience
-        # separation; under audience-scoped memory both refreshing and reusing
-        # the snapshot must fail closed, body-free.
+    def test_audience_scoped_env_requires_exact_keyring_backed_home(self) -> None:
         env = os.environ.copy()
         env.update(
             {
@@ -515,6 +512,58 @@ class CodexMemoryMaterializerTest(unittest.TestCase):
             self.assertEqual(payload["code"], "codex_audience_scoped_blocked")
         self.assertFalse((self.codex_home / "AGENTS.md").exists())
 
+        audience_root = self.root / "audiences"
+        scope = "private-" + "a" * 32
+        audience_home = audience_root / scope / "codex"
+        loader = self.root / "audience-loader.sh"
+        loader.write_text(
+            "#!/bin/sh\nprintf '%s\\n' "
+            + repr(json.dumps({"hookSpecificOutput": {"additionalContext": "scoped"}}))
+            + "\n",
+            encoding="utf-8",
+        )
+        loader.chmod(0o700)
+        scoped_env = os.environ.copy()
+        scoped_env.update(
+            {
+                "HOME": str(self.home),
+                "CODEX_HOME": str(audience_home),
+                "CODEX_SQLITE_HOME": str(audience_home),
+                "CCC_CODEX_MEMORY_LOADER": str(loader),
+                "CCC_MEMORY_AUDIENCE_SCOPED": "1",
+                "CCC_MEMORY_AUDIENCE": "private",
+                "CCC_MEMORY_AUDIENCE_ROOT": str(audience_root),
+                "CCC_MEMORY_SCOPE": scope,
+                "CCC_CODEX_AUDIENCE_AUTH_MODE": "keyring",
+            }
+        )
+        for command in ("materialize", "status"):
+            completed = subprocess.run(
+                [sys.executable, str(MODULE_PATH), command, "--json"],
+                env=scoped_env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertTrue((audience_home / "AGENTS.md").is_file())
+
+        unsafe_env = dict(scoped_env)
+        unsafe_env["CODEX_SQLITE_HOME"] = str(self.codex_home)
+        blocked = subprocess.run(
+            [sys.executable, str(MODULE_PATH), "status", "--json"],
+            env=unsafe_env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        self.assertEqual(blocked.returncode, 70, blocked.stderr)
+        self.assertEqual(json.loads(blocked.stdout)["code"], "codex_audience_scoped_blocked")
+
     def test_audience_scoped_off_spellings_do_not_block(self) -> None:
         for value in ("", "0", "false", "off", "no", "OFF"):
             self.assertFalse(
@@ -524,6 +573,23 @@ class CodexMemoryMaterializerTest(unittest.TestCase):
             self.assertTrue(
                 self.module._audience_scoped_blocked({"CCC_MEMORY_AUDIENCE_SCOPED": value})
             )
+        shared_root = self.root / "audiences"
+        shared_home = shared_root / "shared" / "codex"
+        shared = {
+            "CCC_MEMORY_AUDIENCE_SCOPED": "1",
+            "CCC_MEMORY_AUDIENCE": "shared",
+            "CCC_MEMORY_AUDIENCE_ROOT": str(shared_root),
+            "CCC_MEMORY_SCOPE": "shared",
+            "CCC_CODEX_AUDIENCE_AUTH_MODE": "keyring",
+            "CODEX_HOME": str(shared_home),
+            "CODEX_SQLITE_HOME": str(shared_home),
+        }
+        self.assertFalse(self.module._audience_scoped_blocked(shared))
+        self.assertTrue(
+            self.module._audience_scoped_blocked(
+                {**shared, "CCC_MEMORY_SCOPE": "../private-leak"}
+            )
+        )
 
     def test_loader_and_errors_are_bounded_body_free_codes(self) -> None:
         with self.assertRaises(self.module.MaterializeError) as caught:

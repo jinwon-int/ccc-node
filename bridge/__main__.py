@@ -76,6 +76,10 @@ def build_context(
                         settings.codex_memory_bootstrap_timeout_seconds
                     ),
                 )
+            from telegram_bot.utils.secure_fs import ensure_private_directory
+
+            ensure_private_directory(Path(process_environment["CODEX_HOME"]))
+            ensure_private_directory(Path(process_environment["CODEX_SQLITE_HOME"]))
             return CodexRuntime(
                 cli_path=settings.codex_cli_path,
                 process_environment=process_environment,
@@ -134,9 +138,27 @@ def build_context(
     wiki_enabled = (
         settings.node_isolation_profile != "external" and settings.wiki_memory_enabled
     )
+    distill_environment = None
+    if (
+        settings.agent_provider == "codex"
+        and settings.bridge_memory_mode == "audience-scoped"
+    ):
+        from telegram_bot.core.memory_audience import shared_memory_audience
+
+        distill_environment = dict(os.environ)
+        distill_environment.update(
+            shared_memory_audience(settings).codex_environment(settings)
+        )
+        from telegram_bot.utils.secure_fs import ensure_private_directory
+
+        ensure_private_directory(Path(distill_environment["CODEX_HOME"]))
+        ensure_private_directory(Path(distill_environment["CODEX_SQLITE_HOME"]))
     distill_extraction_worker = project_chat.build_distill_extraction_worker(
         distill_journal,
-        CodexExecDistillBackend(wiki_enabled=wiki_enabled),
+        CodexExecDistillBackend(
+            wiki_enabled=wiki_enabled,
+            environment=distill_environment,
+        ),
         wiki_enabled=wiki_enabled,
     )
     return AppContext(

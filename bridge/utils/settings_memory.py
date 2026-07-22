@@ -52,6 +52,14 @@ class MemorySettingsMixin:
         alias="CCC_CODEX_MEMORY_BOOTSTRAP_TIMEOUT_SEC",
         description="Timeout for each Codex memory materialize/status command.",
     )
+    codex_audience_auth_mode: Literal["disabled", "keyring"] = Field(
+        default="disabled",
+        alias="CCC_CODEX_AUDIENCE_AUTH_MODE",
+        description=(
+            "Credential source for audience-scoped Codex homes. Keyring is the "
+            "only supported activation mode; file credentials are never copied."
+        ),
+    )
     bridge_memory_mode: Literal["off", "curated", "audience-scoped"] = Field(
         default="off",
         alias="CCC_BRIDGE_MEMORY_MODE",
@@ -115,5 +123,9 @@ class MemorySettingsMixin:
             self.telegram_session_scope,
             unsafe_shared_all_override=self.bridge_unsafe_shared_all_memory,
         )
-        assert_memory_provider_safe(self.bridge_memory_mode, self.agent_provider)
+        assert_memory_provider_safe(
+            self.bridge_memory_mode,
+            self.agent_provider,
+            self.codex_audience_auth_mode,
+        )
         return self

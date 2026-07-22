@@ -154,6 +154,7 @@ async def test_backend_uses_exact_isolated_argv_private_cwd_and_canonical_stdin(
             "HOME": "/home/operator",
             "CODEX_HOME": "/home/operator/.codex",
             "CODEX_ACCESS_TOKEN": "synthetic-access-value",
+            "CCC_CODEX_AUDIENCE_AUTH_MODE": "keyring",
             "TELEGRAM_BOT_TOKEN": "must-not-pass",
             "A2A_EDGE_SECRET": "must-not-pass",
             "HONCHO_API_KEY": "must-not-pass",
@@ -167,6 +168,10 @@ async def test_backend_uses_exact_isolated_argv_private_cwd_and_canonical_stdin(
 
     args = capture["args"]
     assert args[0:2] == (codex_executable, "exec")
+    assert args[2:4] == (
+        "--config",
+        'cli_auth_credentials_store="keyring"',
+    )
     assert args[-1] == DISTILL_EXTRACTION_PROMPT
     assert "--ephemeral" in args
     assert "--ignore-user-config" in args

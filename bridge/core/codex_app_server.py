@@ -142,6 +142,13 @@ class CodexAppServerClient:
                     raise ValueError("Codex process environment name is invalid")
                 if not isinstance(value, str) or "\x00" in value:
                     raise ValueError("Codex process environment value is invalid")
+        audience_auth_mode = (
+            (process_environment or {}).get("CCC_CODEX_AUDIENCE_AUTH_MODE", "disabled")
+            .strip()
+            .lower()
+        )
+        if audience_auth_mode not in {"disabled", "keyring"}:
+            raise ValueError("Codex audience auth mode is invalid")
         self._reader = reader
         self._writer = writer
         self._executable = executable
@@ -149,6 +156,7 @@ class CodexAppServerClient:
         self._process_environment = (
             dict(process_environment) if process_environment is not None else None
         )
+        self._audience_auth_mode = audience_auth_mode
         self._server_request_handler = server_request_handler
         self._server_request_timeout = server_request_timeout
         self._process_shutdown_timeout = process_shutdown_timeout
@@ -474,20 +482,22 @@ class CodexAppServerClient:
                 await asyncio.gather(self._process_task, return_exceptions=True)
 
     async def _spawn_default_process(self) -> AppServerProcess:
+        arguments = [self._executable]
+        if self._audience_auth_mode == "keyring":
+            arguments.extend(
+                ("--config", 'cli_auth_credentials_store="keyring"')
+            )
+        arguments.extend(("app-server", "--stdio"))
         if self._process_environment is None:
             process = await asyncio.create_subprocess_exec(
-                self._executable,
-                "app-server",
-                "--stdio",
+                *arguments,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 limit=STDOUT_BUFFER_LIMIT,
             )
         else:
             process = await asyncio.create_subprocess_exec(
-                self._executable,
-                "app-server",
-                "--stdio",
+                *arguments,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 limit=STDOUT_BUFFER_LIMIT,

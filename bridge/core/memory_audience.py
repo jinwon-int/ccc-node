@@ -114,6 +114,9 @@ class MemoryAudience:
             {
                 "CODEX_HOME": str(self.codex_home),
                 "CODEX_SQLITE_HOME": str(self.codex_home),
+                "CCC_CODEX_AUDIENCE_AUTH_MODE": str(
+                    getattr(settings, "codex_audience_auth_mode", "disabled")
+                ),
             }
         )
         return env

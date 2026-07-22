@@ -13,6 +13,7 @@ MEMORY_FIELDS = {
     "memory_assistant_label": "CCC_MEMORY_ASSISTANT_LABEL",
     "codex_memory_materializer_path": "CCC_CODEX_MEMORY_MATERIALIZER_PATH",
     "codex_memory_bootstrap_timeout_seconds": "CCC_CODEX_MEMORY_BOOTSTRAP_TIMEOUT_SEC",
+    "codex_audience_auth_mode": "CCC_CODEX_AUDIENCE_AUTH_MODE",
     "bridge_memory_mode": "CCC_BRIDGE_MEMORY_MODE",
     "bridge_unsafe_shared_all_memory": "CCC_BRIDGE_UNSAFE_SHARED_ALL_MEMORY",
     "bridge_memory_audience_root": "CCC_BRIDGE_MEMORY_AUDIENCE_ROOT",
