@@ -167,6 +167,7 @@ class VoiceProviderConfigTests(unittest.TestCase):
         # the per-domain settings mixin leaf modules (#584 P2-3), so the
         # synthetic standalone package must ship them too.
         source_policy = source_utils / "memory_policy.py"
+        source_memory = source_utils / "settings_memory.py"
         source_voice = source_utils / "settings_voice.py"
         source_heartbeat = source_utils / "settings_heartbeat.py"
         with TemporaryDirectory() as td:
@@ -179,6 +180,7 @@ class VoiceProviderConfigTests(unittest.TestCase):
             (utils / "__init__.py").write_text("", encoding="utf-8")
             shutil.copy2(source_config, utils / "config.py")
             shutil.copy2(source_policy, utils / "memory_policy.py")
+            shutil.copy2(source_memory, utils / "settings_memory.py")
             shutil.copy2(source_voice, utils / "settings_voice.py")
             shutil.copy2(source_heartbeat, utils / "settings_heartbeat.py")
 
