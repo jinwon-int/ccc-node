@@ -18,6 +18,7 @@ class DistillTrigger(str, Enum):
     NEW_COMMAND = "new_command"
     PROVIDER_SWITCH = "provider_switch"
     AUTO_NEW = "auto_new"
+    EXPLICIT = "explicit"
 
 
 class DistillJobStatus(str, Enum):

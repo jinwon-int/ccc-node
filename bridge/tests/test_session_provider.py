@@ -395,6 +395,168 @@ async def test_codex_new_enqueues_previous_thread_before_reset(tmp_path: Path) -
 
 
 @pytest.mark.anyio
+async def test_distill_command_records_current_codex_thread_without_reset(
+    tmp_path: Path,
+) -> None:
+    from telegram_bot.memory.distill_types import DistillTrigger
+
+    manager = make_manager(tmp_path, "codex")
+    await manager.store.set(
+        "7:9",
+        {
+            "provider": "codex",
+            "session_id": "thread-current",
+            "last_user_message_at": "2026-07-22T12:00:00+00:00",
+        },
+    )
+    journal = RecordingDistillJournal()
+    bot = bare_bot(manager, provider="codex")
+    bot._distill_journal = journal
+    bot._config.bridge_memory_mode = "audience-scoped"
+    bot._config.telegram_session_scope = "per-user-chat"
+    bot._config.bridge_memory_audience_root = tmp_path / "audiences"
+    bot._config.bridge_memory_audience_key_path = tmp_path / "audience.key"
+    update = make_update(text="/distill")
+
+    await bot._cmd_distill(update, SimpleNamespace(args=[]))
+
+    assert len(journal.calls) == 1
+    call = journal.calls[0]
+    assert call["provider"] == "codex"
+    assert call["thread_id"] == "thread-current"
+    assert call["trigger"] is DistillTrigger.EXPLICIT
+    discriminator = str(call["discriminator"])
+    assert discriminator.startswith("explicit-turn-v1-")
+    assert "2026-07-22" not in discriminator
+    assert call["memory_audience"] == "shared"
+    assert call["memory_scope"] == "shared"
+    session = await manager.get_session("7:9")
+    assert session["session_id"] == "thread-current"
+    assert session.get("new_session") is not True
+    assert "remains active" in update.message.replies[0][0]
+
+
+@pytest.mark.anyio
+async def test_distill_command_deduplicates_same_turn_and_allows_new_turn(
+    tmp_path: Path,
+) -> None:
+    from telegram_bot.memory.distill_journal import DistillJournal
+    from telegram_bot.memory.distill_types import DistillTrigger
+
+    manager = make_manager(tmp_path, "codex")
+    await manager.store.set(
+        "7:9",
+        {
+            "provider": "codex",
+            "session_id": "thread-current",
+            "last_user_message_at": "2026-07-22T12:00:00+00:00",
+        },
+    )
+    journal = DistillJournal(tmp_path / "journal")
+    journal.initialize()
+    bot = bare_bot(manager, provider="codex")
+    bot._distill_journal = journal
+    bot._config.bridge_memory_mode = "audience-scoped"
+    bot._config.telegram_session_scope = "per-user-chat"
+    bot._config.bridge_memory_audience_root = tmp_path / "audiences"
+    bot._config.bridge_memory_audience_key_path = tmp_path / "audience.key"
+
+    await bot._cmd_distill(make_update(text="/distill"), SimpleNamespace(args=[]))
+    await bot._cmd_distill(make_update(text="/distill"), SimpleNamespace(args=[]))
+    assert len(journal.list_jobs()) == 1
+
+    await manager.patch_session(
+        "7:9", updates={"last_user_message_at": "2026-07-22T12:05:00+00:00"}
+    )
+    await bot._cmd_distill(make_update(text="/distill"), SimpleNamespace(args=[]))
+
+    jobs = journal.list_jobs()
+    assert len(jobs) == 2
+    assert all(job.trigger is DistillTrigger.EXPLICIT for job in jobs)
+    assert len({job.discriminator for job in jobs}) == 2
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("active_provider", "stored_provider", "thread_id", "expected"),
+    [
+        ("claude", "claude", "claude-session", "only for active Codex"),
+        ("codex", "codex", None, "no active Codex session"),
+    ],
+)
+async def test_distill_command_reports_unsupported_or_missing_session(
+    tmp_path: Path,
+    active_provider: str,
+    stored_provider: str,
+    thread_id: str | None,
+    expected: str,
+) -> None:
+    manager = make_manager(tmp_path, active_provider)
+    await manager.store.set(
+        "7:9", {"provider": stored_provider, "session_id": thread_id}
+    )
+    bot = bare_bot(manager, provider=active_provider)
+    journal = RecordingDistillJournal()
+    bot._distill_journal = journal
+    update = make_update(text="/distill")
+
+    await bot._cmd_distill(update, SimpleNamespace(args=[]))
+
+    assert journal.calls == []
+    assert expected in update.message.replies[0][0]
+
+
+@pytest.mark.anyio
+async def test_distill_command_fails_open_without_disclosing_journal_error(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    manager = make_manager(tmp_path, "codex")
+    await manager.store.set(
+        "7:9", {"provider": "codex", "session_id": "thread-current"}
+    )
+    bot = bare_bot(manager, provider="codex")
+
+    class FailingJournal:
+        def enqueue_once(self, **_kwargs):
+            raise RuntimeError("Authorization: Bearer raw-secret")
+
+    bot._distill_journal = FailingJournal()
+    update = make_update(text="/distill")
+
+    await bot._cmd_distill(update, SimpleNamespace(args=[]))
+
+    reply = update.message.replies[0][0]
+    assert "could not be recorded" in reply
+    assert "raw-secret" not in reply
+    assert "Authorization" not in reply
+    assert "raw-secret" not in caplog.text
+    assert "Authorization" not in caplog.text
+
+
+@pytest.mark.anyio
+async def test_distill_command_does_not_snapshot_an_inflight_turn(
+    tmp_path: Path,
+) -> None:
+    manager = make_manager(tmp_path, "codex")
+    await manager.store.set(
+        "7:9", {"provider": "codex", "session_id": "thread-current"}
+    )
+    bot = bare_bot(manager, provider="codex")
+    journal = RecordingDistillJournal()
+    bot._distill_journal = journal
+    bot._tasks = SimpleNamespace(
+        active=lambda _key: SimpleNamespace(done=lambda: False)
+    )
+    update = make_update(text="/distill")
+
+    await bot._cmd_distill(update, SimpleNamespace(args=[]))
+
+    assert journal.calls == []
+    assert "still running" in update.message.replies[0][0]
+
+
+@pytest.mark.anyio
 async def test_provider_switch_enqueues_old_codex_thread_before_alignment(
     tmp_path: Path,
 ) -> None:
@@ -755,6 +917,21 @@ def test_usage_command_handler_is_registered(tmp_path: Path) -> None:
     assert "usage" in commands
 
 
+def test_distill_command_handler_is_registered(tmp_path: Path) -> None:
+    bot = bare_bot(make_manager(tmp_path, "codex"), provider="codex")
+    bot.application = SimpleNamespace(add_handler=Mock())
+
+    bot._setup_handlers()
+
+    handlers = [call.args[0] for call in bot.application.add_handler.call_args_list]
+    commands = {
+        command
+        for handler in handlers
+        for command in getattr(handler, "commands", frozenset())
+    }
+    assert "distill" in commands
+
+
 @pytest.mark.anyio
 async def test_usage_command_is_access_controlled_and_never_starts_turn(tmp_path: Path) -> None:
     manager = make_manager(tmp_path, "codex")
@@ -874,6 +1051,19 @@ async def test_usage_command_is_published_in_bot_menu(tmp_path: Path) -> None:
     assert set_my_commands.await_count == 3
     for call in set_my_commands.await_args_list:
         assert "usage" in {command.command for command in call.args[0]}
+
+
+@pytest.mark.anyio
+async def test_distill_command_is_published_in_bot_menu(tmp_path: Path) -> None:
+    bot = bare_bot(make_manager(tmp_path, "codex"), provider="codex")
+    set_my_commands = AsyncMock()
+    bot.application = SimpleNamespace(bot=SimpleNamespace(set_my_commands=set_my_commands))
+
+    await bot._set_bot_commands()
+
+    assert set_my_commands.await_count == 3
+    for call in set_my_commands.await_args_list:
+        assert "distill" in {command.command for command in call.args[0]}
 
 
 @pytest.mark.anyio

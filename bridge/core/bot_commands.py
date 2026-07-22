@@ -1,5 +1,6 @@
 # ruff: noqa: E402
 import asyncio
+import hashlib
 import json
 import logging
 import re
@@ -197,6 +198,85 @@ class BotCommandMixin:
         self._runtime_active_sessions.discard(conversation_key)
         provider_label = "Claude Code" if active_provider == "claude" else "Codex"
         reply = f"🆕 Switched to new session mode. Your next message will start a new {provider_label} session."
+        await message.reply_text(reply)
+        log_debug(user_id, "bot", reply)
+
+    @staticmethod
+    def _explicit_distill_discriminator(session: dict) -> str:
+        marker = session.get("last_user_message_at")
+        if not isinstance(marker, str) or not marker:
+            marker = "missing-turn-marker"
+        digest = hashlib.sha256(marker.encode("utf-8")).hexdigest()[:32]
+        return f"explicit-turn-v1-{digest}"
+
+    async def _cmd_distill(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Durably request write-back for the current Codex thread without reset."""
+
+        del context
+        if not await self._check_access(update):
+            return
+        user_id = self._require_user(update).id
+        message = self._require_message(update)
+        chat = self._require_chat(update)
+        log_debug(user_id, "command", "/distill")
+
+        if self._active_provider() != "codex":
+            reply = "ℹ️ /distill is available only for active Codex sessions."
+            await message.reply_text(reply)
+            log_debug(user_id, "bot", reply)
+            return
+
+        conversation_key = self._conversation_key(user_id, chat.id)
+        tasks = getattr(self, "_tasks", None)
+        active_task = (
+            tasks.active(conversation_key) or tasks.active(user_id)
+            if tasks is not None
+            else None
+        )
+        if active_task is not None and not active_task.done():
+            reply = (
+                "⏳ The current Codex turn is still running. "
+                "Run /distill again after it finishes."
+            )
+            await message.reply_text(reply)
+            log_debug(user_id, "bot", reply)
+            return
+        session = await self._session_manager.get_session(conversation_key)
+        thread_id = session.get("session_id")
+        if (
+            str(session.get("provider", "")).strip().lower() != "codex"
+            or not isinstance(thread_id, str)
+            or not thread_id
+        ):
+            reply = "ℹ️ There is no active Codex session to distill."
+            await message.reply_text(reply)
+            log_debug(user_id, "bot", reply)
+            return
+
+        try:
+            job = await self._enqueue_previous_codex_session(
+                session,
+                DistillTrigger.EXPLICIT,
+                user_id=user_id,
+                chat_id=chat.id,
+                discriminator=self._explicit_distill_discriminator(session),
+            )
+        except Exception:
+            logger.warning("Explicit Codex distill request could not be recorded")
+            reply = "⚠️ Codex memory distill request could not be recorded."
+            await message.reply_text(reply)
+            log_debug(user_id, "bot", reply)
+            return
+
+        if job is None:
+            reply = "⚠️ Codex memory distill is unavailable on this bridge."
+        else:
+            reply = (
+                "✅ Codex memory distill request recorded. "
+                "The current session remains active."
+            )
         await message.reply_text(reply)
         log_debug(user_id, "bot", reply)
 

@@ -449,6 +449,7 @@ class BotDeliveryMixin:
         """Set bot commands menu"""
         commands = [
             BotCommand("new", "New session"),
+            BotCommand("distill", "Save Codex memory"),
             BotCommand("stop", "Stop execution"),
             BotCommand("model", "Switch model"),
             BotCommand("usage", "View provider usage"),
