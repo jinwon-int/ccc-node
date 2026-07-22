@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import importlib.util
 import fcntl
 import json
@@ -14,6 +15,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 MODULE_PATH = ROOT / "scripts" / "ccc_codex_memory.py"
@@ -66,6 +68,47 @@ class CodexMemoryMaterializerTest(unittest.TestCase):
             **extra,
         }
         return self.module.MaterializeOptions.from_environ(env)
+
+    def test_atomic_write_delegates_to_shared_secure_fs(self) -> None:
+        tree = ast.parse(MODULE_PATH.read_text(encoding="utf-8"))
+        functions = {
+            node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)
+        }
+        self.assertNotIn("_fsync_directory", functions)
+
+        atomic_write = functions["_atomic_write"]
+        calls = {
+            (node.func.value.id, node.func.attr)
+            for node in ast.walk(atomic_write)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+        }
+        self.assertIn(("_secure_fs", "atomic_write_bytes_at"), calls)
+        self.assertTrue(
+            {("os", name) for name in ("open", "write", "fsync", "replace", "unlink")}
+            .isdisjoint(calls)
+        )
+
+        validator_calls = {
+            (node.func.value.id, node.func.attr)
+            for node in ast.walk(functions["validate_owned_regular"])
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+        }
+        self.assertIn(("_secure_fs", "owner_only_regular_violation"), validator_calls)
+
+    def test_shared_atomic_write_error_keeps_body_free_materializer_code(self) -> None:
+        with mock.patch.object(
+            self.module._secure_fs,
+            "atomic_write_bytes_at",
+            side_effect=OSError("write failed"),
+        ):
+            with self.assertRaises(self.module.MaterializeError) as caught:
+                self.module._atomic_write(123, "AGENTS.md", b"secret")
+        self.assertEqual(caught.exception.code, "codex_io_failed")
+        self.assertNotIn("secret", str(caught.exception))
 
     def test_creates_private_base_file_and_body_free_metadata(self) -> None:
         result = self.module.materialize_snapshot("NODE_SECRET_SENTINEL", self.options())

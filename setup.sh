@@ -347,6 +347,10 @@ run cp "$SRC/scripts/lib/harness_paths.py" "$CLAUDE_DIR/hooks/lib/harness_paths.
 # load-memory.sh so every direct/app-server run reuses the same snapshot policy.
 run cp "$SRC/scripts/ccc-codex" "$CLAUDE_DIR/hooks/ccc-codex"
 run cp "$SRC/scripts/ccc_codex_memory.py" "$CLAUDE_DIR/hooks/ccc_codex_memory.py"
+# The materializer runs outside the bridge package after installation. Deploy
+# the canonical secure-fs module beside it instead of maintaining a second copy.
+run cp "$SRC/bridge/utils/secure_fs.py" "$CLAUDE_DIR/hooks/ccc_secure_fs.py"
+run chmod 644 "$CLAUDE_DIR/hooks/ccc_secure_fs.py"
 # Memory helper tools used by load-memory.sh / refresh-memory.sh in standalone installs.
 run cp "$SRC/scripts/ccc-memory-index.sh" "$CLAUDE_DIR/hooks/ccc-memory-index.sh"
 run cp "$SRC/scripts/ccc_memory_index.py" "$CLAUDE_DIR/hooks/ccc_memory_index.py"
