@@ -83,6 +83,7 @@ def build_context(
         logger.info("Claude provider routed through ClaudeRuntime adapter (#346)")
         agent_runtime = ClaudeRuntime(
             sdk_client_factory=sdk_factory,
+            settings=settings,
             transcripts_dir=Path.home()
             / ".claude"
             / "projects"

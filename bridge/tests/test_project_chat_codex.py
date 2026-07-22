@@ -278,6 +278,9 @@ def test_claude_default_build_context_injects_claude_runtime(tmp_path: Path) -> 
 
     assert isinstance(context.agent_runtime, ClaudeRuntime)
     assert context.agent_runtime._sdk_client_factory is sdk_factory
+    # #623: the composition root binds the validated settings so the adapter
+    # applies the execution-profile boundary builders.
+    assert context.agent_runtime._settings is settings
     assert context.project_chat._agent_runtime is context.agent_runtime
     # Transcripts browsing resolves exactly like the direct path's
     # ProjectChatHandler.conversations_dir (~/.claude/projects/<project-dir>).

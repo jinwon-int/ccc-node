@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 import logging
 from pathlib import Path
 import re
-from typing import Protocol, cast
+from typing import Any, Protocol, cast
 
 from claude_agent_sdk import (
     AssistantMessage,
@@ -42,6 +42,9 @@ from claude_agent_sdk import (
     ToolUseBlock,
     UserMessage,
 )
+from claude_agent_sdk.types import SandboxSettings
+
+from telegram_bot.utils.memory_policy import MEMORY_MODE_AUDIENCE_SCOPED, MEMORY_MODE_OFF
 
 from .agent_runtime import (
     AgentEvent,
@@ -64,8 +67,22 @@ from .agent_runtime import (
     ToolStartedEvent,
     deny_approval,
 )
+from .curated_memory import build_curated_memory_settings
 from .project_chat_history import _first_text_block, iter_transcript_messages
 from .sdk_text import _extract_stream_text_delta
+from .tool_policy import (
+    BASH_DISABLED,
+    EXECUTION_OWNER_OPERATOR,
+    EXECUTION_STRICT_PROJECT,
+    claude_unrestricted_enabled,
+    effective_bash_policy,
+    resolve_bash_policy,
+    resolve_execution_profile,
+    running_as_root,
+    sdk_permission_options,
+    strict_bash_sandbox_settings,
+)
+from .web_mcp import build_curated_web_mcp
 
 logger = logging.getLogger(__name__)
 
@@ -647,6 +664,7 @@ class ClaudeRuntime:
         self,
         *,
         sdk_client_factory: SdkClientFactory | None = None,
+        settings: Any = None,
         transcripts_dir: str | Path | None = None,
         session_id_timeout_seconds: float = 30.0,
     ) -> None:
@@ -655,6 +673,30 @@ class ClaudeRuntime:
         self._sdk_client_factory = sdk_client_factory or _default_sdk_client_factory
         self._transcripts_dir = Path(transcripts_dir) if transcripts_dir is not None else None
         self._session_id_timeout_seconds = session_id_timeout_seconds
+        # Execution-profile wiring (#623): with bound bridge settings the
+        # adapter regains the boundary the retired direct stream path built
+        # from tool_policy / curated_memory / web_mcp. Without settings (bare
+        # construction in unit tests and the conformance harness) options
+        # carry only the request-derived fields, as before.
+        self._settings = settings
+        self._execution_profile: str | None = None
+        self._bash_policy: str | None = None
+        self._claude_unrestricted = False
+        if settings is not None:
+            self._execution_profile = resolve_execution_profile(
+                getattr(settings, "execution_profile", EXECUTION_STRICT_PROJECT),
+                allowed_user_ids=getattr(settings, "allowed_user_ids", []),
+                require_allowlist=getattr(settings, "require_allowlist", True),
+            )
+            self._bash_policy = effective_bash_policy(
+                resolve_bash_policy(getattr(settings, "bash_policy", None)),
+                self._execution_profile,
+            )
+            self._claude_unrestricted = claude_unrestricted_enabled(
+                getattr(settings, "claude_unrestricted", False),
+                self._execution_profile,
+                is_root=running_as_root(),
+            )
         self._session_locks: dict[str, asyncio.Lock] = {}
         self._turn_owners: dict[str, ClaudeSession] = {}
         self._sessions: list[ClaudeSession] = []
@@ -708,7 +750,7 @@ class ClaudeRuntime:
             if request.effort not in _EFFORT_LEVELS:
                 raise ValueError(f"unsupported Claude effort: {request.effort!r}")
             effort = cast(EffortLevel, request.effort)
-        return ClaudeAgentOptions(
+        options = ClaudeAgentOptions(
             cwd=request.working_directory,
             model=request.model,
             resume=request.session_id,
@@ -717,6 +759,92 @@ class ClaudeRuntime:
             can_use_tool=can_use_tool,
             include_partial_messages=True,
         )
+        if self._settings is not None:
+            self._apply_execution_profile(options, request)
+        return options
+
+    def _apply_execution_profile(
+        self, options: ClaudeAgentOptions, request: SessionRequest
+    ) -> None:
+        """Wire the execution-profile builders into the adapter options (#623).
+
+        Mirrors the reference wiring of the legacy ``_create_user_stream``
+        (removed in #584 C-2): the tool_policy permission bundle (allow/deny
+        lists plus per-call ask hooks feeding ``can_use_tool``), curated web
+        MCP routing, setting_sources control, curated memory injection, and
+        the strict-project OS Bash sandbox.
+        """
+
+        settings = self._settings
+        permission_options = sdk_permission_options(self._bash_policy)
+        allowed_tools = list(permission_options["allowed_tools"])
+        disallowed_tools = list(permission_options["disallowed_tools"])
+        options.hooks = {
+            event: list(matchers) for event, matchers in permission_options["hooks"].items()
+        }
+        web_mcp = build_curated_web_mcp(settings)
+        if web_mcp is not None:
+            allowed_tools = [
+                tool for tool in allowed_tools if tool not in web_mcp["disallowed_tools"]
+            ] + web_mcp["allowed_tools"]
+            disallowed_tools = list(
+                dict.fromkeys(disallowed_tools + web_mcp["disallowed_tools"])
+            )
+            options.mcp_servers = web_mcp["mcp_servers"]
+            options.env = dict(web_mcp["process_env"])
+            options.system_prompt = web_mcp["system_prompt"]
+        options.allowed_tools = allowed_tools
+        options.disallowed_tools = disallowed_tools
+        if self._execution_profile == EXECUTION_OWNER_OPERATOR:
+            if self._claude_unrestricted:
+                # Opt-in Codex parity (owner-operator only): bypass permission
+                # checks and drop the host settings chain, preserving memory
+                # context through the curated settings block.
+                options.permission_mode = "bypassPermissions"
+                options.setting_sources = []
+                self._apply_curated_memory(options)
+            else:
+                # Owner-operated bridges intentionally retain host utility and
+                # the normal Claude Code settings/context chain.
+                options.setting_sources = ["user", "project", "local"]
+            return
+        # Every non-owner profile suppresses filesystem settings. Even when
+        # Bash is disallowed, user/project/local settings can register host
+        # shell hooks independently of the model-facing Bash tool.
+        options.setting_sources = []
+        self._apply_curated_memory(options)
+        if (
+            self._execution_profile == EXECUTION_STRICT_PROJECT
+            and self._bash_policy != BASH_DISABLED
+        ):
+            # Strict-project uses the SDK OS sandbox as the Bash boundary.
+            cli_path = getattr(settings, "claude_cli_path", None)
+            options.sandbox = cast(
+                SandboxSettings,
+                strict_bash_sandbox_settings(
+                    Path(request.working_directory),
+                    str(cli_path) if cli_path else None,
+                ),
+            )
+
+    def _apply_curated_memory(self, options: ClaudeAgentOptions) -> None:
+        # SessionRequest carries no Telegram route, so the adapter can only
+        # resolve the route-neutral "curated" mode. "audience-scoped" needs a
+        # per-route audience (the legacy resolve_memory_audience seam) this
+        # adapter cannot supply yet. Fail closed — consistent with the other
+        # unsupported policies in ``_build_options`` — rather than silently
+        # starting the session with no memory: a node configured for
+        # audience-scoped isolation must not degrade to unscoped/no-memory
+        # semantics unnoticed. The caller surfaces this as a failed session
+        # so the operator fixes the config or switches memory mode.
+        mode = getattr(self._settings, "bridge_memory_mode", MEMORY_MODE_OFF)
+        if mode == MEMORY_MODE_AUDIENCE_SCOPED:
+            raise ValueError(
+                "Claude runtime does not support audience-scoped bridge memory yet"
+            )
+        curated_settings = build_curated_memory_settings(self._settings, audience=None)
+        if curated_settings is not None:
+            options.settings = curated_settings
 
     # -- SessionBrowser protocol -------------------------------------------
 
