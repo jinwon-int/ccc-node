@@ -129,7 +129,7 @@ def setup_logging(settings: Any = None) -> None:
     logs_dir = runtime_config.logs_dir
     from datetime import datetime
 
-    from telegram_bot.session.store import ensure_private_directory
+    from telegram_bot.utils.secure_fs import ensure_private_directory
 
     ensure_private_directory(logs_dir)
     error_name = f"error_{datetime.now().strftime('%Y-%m-%d')}.log"

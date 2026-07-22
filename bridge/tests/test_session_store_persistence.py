@@ -22,6 +22,8 @@ from telegram_bot.session.store import (  # noqa: E402
     SessionStore,
     SessionStoreCorruptionError,
     SessionStoreValidationError,
+)
+from telegram_bot.utils.secure_fs import (  # noqa: E402
     _validate_existing_directory_components,
 )
 
@@ -662,7 +664,7 @@ def test_temp_write_failure_preserves_disk_and_memory(tmp_path, operation):
     def failing_fdopen(*args, **kwargs):
         return FailingStream(real_fdopen(*args, **kwargs), operation)
 
-    with patch("telegram_bot.session.store.os.fdopen", side_effect=failing_fdopen):
+    with patch("telegram_bot.utils.secure_fs.os.fdopen", side_effect=failing_fdopen):
         with pytest.raises(OSError, match=f"{operation} failed"):
             run(store.update(1, {"version": 2}))
 
@@ -688,7 +690,7 @@ def test_primary_temp_io_failure_after_backup_preserves_state(tmp_path, operatio
             return FailingStream(stream, operation)
         return stream
 
-    with patch("telegram_bot.session.store.os.fdopen", side_effect=fail_primary_fdopen):
+    with patch("telegram_bot.utils.secure_fs.os.fdopen", side_effect=fail_primary_fdopen):
         with pytest.raises(OSError, match=f"{operation} failed"):
             run(store.update(1, {"version": 2}))
 
@@ -713,7 +715,7 @@ def test_primary_file_fsync_failure_after_backup_preserves_state(tmp_path):
                 raise OSError(errno.EIO, "primary file fsync failed")
         return real_fsync(fd)
 
-    with patch("telegram_bot.session.store.os.fsync", side_effect=fail_second_regular_file):
+    with patch("telegram_bot.utils.secure_fs.os.fsync", side_effect=fail_second_regular_file):
         with pytest.raises(OSError, match="primary file fsync failed"):
             run(store.update(1, {"version": 2}))
 
@@ -735,7 +737,7 @@ def test_backup_replace_failure_preserves_primary_and_memory(tmp_path):
             raise OSError("backup replace failed")
         return real_replace(source, destination)
 
-    with patch("telegram_bot.session.store.os.replace", side_effect=fail_backup_replace):
+    with patch("telegram_bot.utils.secure_fs.os.replace", side_effect=fail_backup_replace):
         with pytest.raises(OSError, match="backup replace failed"):
             run(store.update(1, {"version": 2}))
 
@@ -755,7 +757,7 @@ def test_delete_replace_failure_rolls_memory_back(tmp_path):
             raise OSError("replace failed")
         return real_replace(source, destination)
 
-    with patch("telegram_bot.session.store.os.replace", side_effect=fail_primary_replace):
+    with patch("telegram_bot.utils.secure_fs.os.replace", side_effect=fail_primary_replace):
         with pytest.raises(OSError, match="replace failed"):
             run(store.delete(1))
 
@@ -769,7 +771,7 @@ def test_file_fsync_failure_preserves_disk_and_memory(tmp_path):
     run(store.set(1, {"version": 1}))
     before = path.read_bytes()
 
-    with patch("telegram_bot.session.store.os.fsync", side_effect=OSError("fsync failed")):
+    with patch("telegram_bot.utils.secure_fs.os.fsync", side_effect=OSError("fsync failed")):
         with pytest.raises(OSError, match="fsync failed"):
             run(store.update(1, {"version": 2}))
 
@@ -789,7 +791,7 @@ def test_unsupported_directory_fsync_keeps_committed_state(tmp_path, caplog):
             raise OSError(errno.EINVAL, "directory fsync unsupported")
         return real_fsync(fd)
 
-    with patch("telegram_bot.session.store.os.fsync", side_effect=fail_for_directory):
+    with patch("telegram_bot.utils.secure_fs.os.fsync", side_effect=fail_for_directory):
         run(store.update(1, {"version": 2}))
 
     assert read_json(path) == {"telegram_session:1": {"version": 2}}
@@ -809,7 +811,7 @@ def test_backup_directory_fsync_io_error_rolls_back_before_primary_replace(tmp_p
             raise OSError(errno.EIO, "directory fsync failed")
         return real_fsync(fd)
 
-    with patch("telegram_bot.session.store.os.fsync", side_effect=fail_first_directory):
+    with patch("telegram_bot.utils.secure_fs.os.fsync", side_effect=fail_first_directory):
         with pytest.raises(OSError, match="directory fsync failed"):
             run(store.update(1, {"version": 2}))
 
@@ -832,7 +834,7 @@ def test_primary_directory_fsync_io_error_keeps_committed_disk_and_memory(tmp_pa
                 raise OSError(errno.EIO, "directory fsync failed")
         return real_fsync(fd)
 
-    with patch("telegram_bot.session.store.os.fsync", side_effect=fail_second_directory):
+    with patch("telegram_bot.utils.secure_fs.os.fsync", side_effect=fail_second_directory):
         with pytest.raises(OSError, match="directory fsync failed"):
             run(store.update(1, {"version": 2}))
 
@@ -857,7 +859,7 @@ def test_directory_close_error_after_primary_replace_is_nonfatal(tmp_path, caplo
                 raise OSError(errno.EIO, "directory close failed")
 
     with patch(
-        "telegram_bot.session.store.os.close", side_effect=fail_second_directory_close
+        "telegram_bot.utils.secure_fs.os.close", side_effect=fail_second_directory_close
     ):
         run(store.update(1, {"version": 2}))
 
@@ -878,7 +880,7 @@ def test_primary_replace_failure_preserves_disk_and_memory(tmp_path):
             raise OSError("replace failed")
         real_replace(source, destination)
 
-    with patch("telegram_bot.session.store.os.replace", side_effect=fail_primary_replace):
+    with patch("telegram_bot.utils.secure_fs.os.replace", side_effect=fail_primary_replace):
         with pytest.raises(OSError, match="replace failed"):
             run(store.update(1, {"version": 2}))
 
@@ -935,7 +937,7 @@ def test_recovery_rewrite_failure_leaves_corrupt_primary_and_backup_intact(tmp_p
             raise OSError("recovery replace failed")
         return real_replace(source, destination)
 
-    with patch("telegram_bot.session.store.os.replace", side_effect=fail_primary_replace):
+    with patch("telegram_bot.utils.secure_fs.os.replace", side_effect=fail_primary_replace):
         with pytest.raises(OSError, match="recovery replace failed"):
             initialized_store(path)
 

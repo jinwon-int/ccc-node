@@ -15,7 +15,7 @@ import stat
 import threading
 from typing import Any, Iterator
 
-from telegram_bot.session.store import (
+from telegram_bot.utils.secure_fs import (
     _atomic_write_bytes,
     _fsync_directory,
     _validate_storage_directory,
