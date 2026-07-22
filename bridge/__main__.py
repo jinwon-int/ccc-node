@@ -37,6 +37,7 @@ class AppContext:
     session_store: Any
     session_manager: Any
     distill_journal: Any
+    distill_snapshot_worker: Any
     distill_extraction_worker: Any
     distill_local_sink_worker: Any
     project_chat: Any
@@ -95,9 +96,20 @@ def build_context(
             from telegram_bot.core.memory_audience import shared_memory_audience
 
             shared = shared_memory_audience(settings)
+
+            def route_environment(audience: str, scope: str):
+                from telegram_bot.core.memory_audience import MemoryAudience
+                from telegram_bot.memory.distill_types import validate_memory_route
+
+                validate_memory_route(audience, scope)
+                return MemoryAudience(audience, scope, shared.root).codex_environment(
+                    settings
+                )
+
             agent_runtime = CodexRuntimePool(
                 shared_environment=shared.codex_environment(settings),
                 runtime_factory=build_codex_runtime,
+                route_environment_factory=route_environment,
             )
         else:
             agent_runtime = build_codex_runtime()
@@ -162,6 +174,14 @@ def build_context(
         ),
         wiki_enabled=wiki_enabled,
     )
+    distill_snapshot_worker = None
+    if settings.agent_provider == "codex":
+        from telegram_bot.memory.codex_snapshot import CodexThreadSnapshotter
+
+        distill_snapshot_worker = CodexThreadSnapshotter(
+            distill_journal,
+            agent_runtime,
+        )
     distill_local_sink_worker = None
     if settings.bridge_memory_mode == "audience-scoped":
         from telegram_bot.core.memory_audience import shared_memory_audience
@@ -178,6 +198,7 @@ def build_context(
         session_store=store,
         session_manager=session_manager,
         distill_journal=distill_journal,
+        distill_snapshot_worker=distill_snapshot_worker,
         distill_extraction_worker=distill_extraction_worker,
         distill_local_sink_worker=distill_local_sink_worker,
         project_chat=project_chat,
@@ -197,6 +218,7 @@ def create_app(context: AppContext):
         session_manager=context.session_manager,
         project_chat=context.project_chat,
         distill_journal=context.distill_journal,
+        distill_snapshot_worker=context.distill_snapshot_worker,
         distill_extraction_worker=context.distill_extraction_worker,
         distill_local_sink_worker=context.distill_local_sink_worker,
         application_builder_factory=context.telegram_port,

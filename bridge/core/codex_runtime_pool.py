@@ -8,15 +8,24 @@ from typing import Protocol
 
 from .agent_runtime import AgentRuntime, AgentSession, ModelInfo, SessionRequest
 from .usage import UsageSnapshot
+from telegram_bot.memory.distill_types import (
+    CodexTranscriptSnapshot,
+    TranscriptBounds,
+)
 
 
 class _UsageRuntime(AgentRuntime, Protocol):
     async def get_usage(self, thread_id: str | None) -> UsageSnapshot: ...
 
+    async def read_session_snapshot(
+        self, session_id: str, *, bounds: TranscriptBounds
+    ) -> CodexTranscriptSnapshot: ...
+
     async def close(self) -> None: ...
 
 
 RuntimeFactory = Callable[[Mapping[str, str]], _UsageRuntime]
+RouteEnvironmentFactory = Callable[[str, str], Mapping[str, str]]
 EnvironmentKey = tuple[tuple[str, str], ...]
 
 
@@ -36,10 +45,12 @@ class CodexRuntimePool:
         *,
         shared_environment: Mapping[str, str],
         runtime_factory: RuntimeFactory,
+        route_environment_factory: RouteEnvironmentFactory | None = None,
     ) -> None:
         self._shared_environment = dict(shared_environment)
         self._environment_key(self._shared_environment)
         self._runtime_factory = runtime_factory
+        self._route_environment_factory = route_environment_factory
         self._runtimes: dict[EnvironmentKey, _UsageRuntime] = {}
         self._thread_runtimes: dict[str, _UsageRuntime] = {}
         self._lock = asyncio.Lock()
@@ -113,6 +124,33 @@ class CodexRuntimePool:
         else:
             runtime = await self._runtime_for(self._shared_environment)
         return await runtime.get_usage(thread_id)
+
+    async def read_session_snapshot(
+        self,
+        session_id: str,
+        *,
+        bounds: TranscriptBounds,
+        memory_audience: str | None = None,
+        memory_scope: str | None = None,
+    ) -> CodexTranscriptSnapshot:
+        """Read through the runtime reconstructed from one journal-bound route."""
+
+        if not session_id:
+            raise ValueError("session id must not be empty")
+        if memory_audience is None or memory_scope is None:
+            raise ValueError("Codex snapshot requires an audience route")
+        route_environment_factory = self._route_environment_factory
+        if route_environment_factory is None:
+            raise RuntimeError("Codex snapshot route reconstruction is unavailable")
+        environment = route_environment_factory(memory_audience, memory_scope)
+        runtime = await self._runtime_for(environment)
+        async with self._lock:
+            owner = self._thread_runtimes.get(session_id)
+            if owner is not None and owner is not runtime:
+                raise RuntimeError("Codex thread belongs to another audience")
+            self._thread_runtimes[session_id] = runtime
+            self._thread_runtimes = dict(tuple(self._thread_runtimes.items())[-2048:])
+        return await runtime.read_session_snapshot(session_id, bounds=bounds)
 
     async def close(self) -> None:
         async with self._lock:

@@ -486,6 +486,7 @@ class BotLifecycleMixin:
             reaper_task = None
             workload_task = None
             dead_session_recovery_task = None
+            distill_snapshot_task = None
             distill_extraction_task = None
             distill_local_sink_task = None
             health_alerts_task = None
@@ -528,6 +529,14 @@ class BotLifecycleMixin:
                     self._health_alerts_probe(stop_event), name="health-alerts"
                 )
                 distill_extraction_task = None
+                if (
+                    self._distill_snapshot_worker is not None
+                    and self._distill_journal is not None
+                ):
+                    distill_snapshot_task = asyncio.create_task(
+                        self._distill_snapshot_loop(stop_event),
+                        name="distill-snapshot",
+                    )
                 if (
                     self._distill_extraction_worker is not None
                     and self._distill_journal is not None
@@ -629,6 +638,7 @@ class BotLifecycleMixin:
                     workload_task,
                     dead_session_recovery_task,
                     health_alerts_task,
+                    distill_snapshot_task,
                     distill_extraction_task,
                     distill_local_sink_task,
                 ):
@@ -959,6 +969,7 @@ class BotLifecycleMixin:
         )
         while not stop_event.is_set():
             try:
+                await asyncio.to_thread(journal.recover_stale_running)
                 jobs = await asyncio.to_thread(journal.list_jobs)
                 for job in jobs:
                     if stop_event.is_set():
@@ -983,6 +994,40 @@ class BotLifecycleMixin:
             except (TimeoutError, asyncio.TimeoutError):
                 continue
 
+    async def _distill_snapshot_loop(self, stop_event: asyncio.Event) -> None:
+        """Recover queued/stale snapshot jobs through their bound Codex route."""
+
+        from telegram_bot.memory.distill_types import DistillJobStatus
+
+        worker = self._distill_snapshot_worker
+        journal = self._distill_journal
+        interval = float(
+            getattr(self._config, "distill_extraction_poll_interval", 300.0) or 300.0
+        )
+        while not stop_event.is_set():
+            try:
+                await asyncio.to_thread(journal.recover_stale_running)
+                jobs = await asyncio.to_thread(journal.list_jobs)
+                for job in jobs:
+                    if stop_event.is_set():
+                        break
+                    if job.status not in (
+                        DistillJobStatus.QUEUED,
+                        DistillJobStatus.RETRYABLE_FAILED,
+                    ):
+                        continue
+                    await worker.snapshot_once(job_id=job.job_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning(
+                    "Distill snapshot sweep failed; continuing", exc_info=True
+                )
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=interval)
+            except (TimeoutError, asyncio.TimeoutError):
+                continue
+
     async def _distill_local_sink_loop(self, stop_event: asyncio.Event) -> None:
         """Drive independently leased local write-back without re-extraction."""
 
@@ -995,6 +1040,7 @@ class BotLifecycleMixin:
         )
         while not stop_event.is_set():
             try:
+                await asyncio.to_thread(journal.recover_stale_running)
                 jobs = await asyncio.to_thread(journal.list_jobs)
                 for job in jobs:
                     if stop_event.is_set():
