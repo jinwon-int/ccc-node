@@ -37,11 +37,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-# Reuse SessionStore's hardened atomic-write helper (#352) instead of a weaker
-# duplicate: private random temp + fsync(file) + os.replace + fsync(dir). store
-# depends only on the standard library and never imports this package, so there
-# is no import cycle and the ledger stays effectively stdlib + fail-open.
-from telegram_bot.session.store import (
+# Reuse the shared hardened atomic-write helper (#352) instead of a weaker
+# duplicate: private random temp + fsync(file) + os.replace + fsync(dir).
+from telegram_bot.utils.secure_fs import (
     SessionStoreDurabilityError,
     _atomic_write_bytes,
 )
