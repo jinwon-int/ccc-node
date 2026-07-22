@@ -941,6 +941,195 @@ async def test_shutdown_distill_is_bounded_and_fails_open(
     assert "timed out" in caplog.text.lower()
 
 
+def enable_checkpoint(
+    bot,
+    *,
+    turns: int = 0,
+    bytes_: int = 0,
+    age_seconds: int = 0,
+) -> None:
+    bot._config.codex_distill_checkpoint_turns = turns
+    bot._config.codex_distill_checkpoint_bytes = bytes_
+    bot._config.codex_distill_checkpoint_age_seconds = age_seconds
+
+
+@pytest.mark.anyio
+async def test_checkpoint_is_disabled_when_all_gates_are_zero(tmp_path: Path) -> None:
+    manager = make_manager(tmp_path, "codex")
+    bot = bare_bot(manager, provider="codex")
+    bot._distill_journal = RecordingDistillJournal()
+    enable_checkpoint(bot)
+
+    await bot._save_session_id(
+        "7:9",
+        ChatResponse("assistant", session_id="thread"),
+        user_id=7,
+        chat_id=9,
+        request_text="user",
+        turn_marker="message-1",
+    )
+
+    assert bot._distill_journal.calls == []
+
+
+@pytest.mark.anyio
+async def test_checkpoint_turn_gate_enqueues_without_resetting_session(
+    tmp_path: Path,
+) -> None:
+    from telegram_bot.memory.distill_types import DistillTrigger
+
+    manager = make_manager(tmp_path, "codex")
+    bot = bare_bot(manager, provider="codex")
+    journal = RecordingDistillJournal()
+    bot._distill_journal = journal
+    enable_checkpoint(bot, turns=2)
+
+    for index in (1, 2):
+        await bot._save_session_id(
+            "7:9",
+            ChatResponse(f"assistant-{index}", session_id="thread"),
+            user_id=7,
+            chat_id=9,
+            request_text=f"user-{index}",
+            turn_marker=f"message-{index}",
+        )
+
+    assert len(journal.calls) == 1
+    call = journal.calls[0]
+    assert call["trigger"] is DistillTrigger.CHECKPOINT
+    assert str(call["discriminator"]).startswith("checkpoint-turn-v1-")
+    assert "message-2" not in str(call["discriminator"])
+    assert (await manager.get_session("7:9"))["session_id"] == "thread"
+
+
+@pytest.mark.anyio
+async def test_checkpoint_uses_first_reached_utf8_byte_or_age_gate(
+    tmp_path: Path,
+) -> None:
+    manager = make_manager(tmp_path, "codex")
+    bot = bare_bot(manager, provider="codex")
+    journal = RecordingDistillJournal()
+    bot._distill_journal = journal
+    now = {"value": 1000.0}
+    bot._clock = SimpleNamespace(time=lambda: now["value"])
+    turn_bytes = len("사용자응답".encode("utf-8"))
+    enable_checkpoint(bot, turns=100, bytes_=turn_bytes, age_seconds=60)
+
+    await bot._save_session_id(
+        "7:9",
+        ChatResponse("응답", session_id="thread"),
+        user_id=7,
+        chat_id=9,
+        request_text="사용자",
+        turn_marker="message-1",
+    )
+    assert len(journal.calls) == 1
+
+    enable_checkpoint(bot, turns=100, bytes_=1_000_000, age_seconds=60)
+    now["value"] = 1010.0
+    await bot._save_session_id(
+        "7:9",
+        ChatResponse("small", session_id="thread"),
+        user_id=7,
+        chat_id=9,
+        request_text="small",
+        turn_marker="message-2",
+    )
+    assert len(journal.calls) == 1
+
+    now["value"] = 1071.0
+    await bot._save_session_id(
+        "7:9",
+        ChatResponse("small", session_id="thread"),
+        user_id=7,
+        chat_id=9,
+        request_text="small",
+        turn_marker="message-3",
+    )
+    assert len(journal.calls) == 2
+
+
+@pytest.mark.anyio
+async def test_checkpoint_enqueue_failure_is_body_free_and_retries_same_boundary(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    manager = make_manager(tmp_path, "codex")
+    bot = bare_bot(manager, provider="codex")
+    enable_checkpoint(bot, turns=1)
+
+    class FlakyJournal(RecordingDistillJournal):
+        def __init__(self):
+            super().__init__()
+            self.failed = False
+
+        def enqueue_once(self, **kwargs):
+            self.calls.append(kwargs)
+            if not self.failed:
+                self.failed = True
+                raise RuntimeError("Authorization: Bearer raw-secret")
+            return SimpleNamespace(job_id="job-1")
+
+    journal = FlakyJournal()
+    bot._distill_journal = journal
+
+    await bot._save_session_id(
+        "7:9",
+        ChatResponse("first", session_id="thread"),
+        user_id=7,
+        chat_id=9,
+        request_text="first",
+        turn_marker="message-1",
+    )
+    await bot._save_session_id(
+        "7:9",
+        ChatResponse("second", session_id="thread"),
+        user_id=7,
+        chat_id=9,
+        request_text="second",
+        turn_marker="message-2",
+    )
+
+    assert len(journal.calls) == 2
+    assert journal.calls[0]["discriminator"] == journal.calls[1]["discriminator"]
+    assert "raw-secret" not in caplog.text
+    assert "Authorization" not in caplog.text
+
+
+@pytest.mark.anyio
+async def test_concurrent_duplicate_checkpoint_turn_enqueues_once(
+    tmp_path: Path,
+) -> None:
+    import asyncio
+
+    from telegram_bot.memory.distill_journal import DistillJournal
+
+    manager = make_manager(tmp_path, "codex")
+    bot = bare_bot(manager, provider="codex")
+    journal = DistillJournal(tmp_path / "journal")
+    journal.initialize()
+    bot._distill_journal = journal
+    enable_checkpoint(bot, turns=1)
+
+    await asyncio.gather(
+        *(
+            bot._save_session_id(
+                "7:9",
+                ChatResponse("assistant", session_id="thread"),
+                user_id=7,
+                chat_id=9,
+                request_text="user",
+                turn_marker="same-provider-turn",
+            )
+            for _ in range(10)
+        )
+    )
+
+    jobs = journal.list_jobs()
+    assert len(jobs) == 1
+    assert jobs[0].trigger.value == "checkpoint"
+
+
 @pytest.mark.anyio
 async def test_codex_model_callback_is_provider_scoped_and_conversation_safe(
     tmp_path: Path,

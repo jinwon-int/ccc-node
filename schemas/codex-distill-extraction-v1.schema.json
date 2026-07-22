@@ -37,7 +37,8 @@
         "provider_switch",
         "auto_new",
         "explicit",
-        "shutdown"
+        "shutdown",
+        "checkpoint"
       ],
       "title": "DistillTrigger",
       "type": "string"

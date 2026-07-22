@@ -87,6 +87,36 @@ class MemorySettingsMixin:
         alias="CCC_BRIDGE_MEMORY_AUDIENCE_KEY_PATH",
         description="Optional local 0600 HMAC key path for opaque DM memory scopes.",
     )
+    codex_distill_checkpoint_turns: int = Field(
+        default=0,
+        ge=0,
+        le=1_000,
+        alias="CCC_CODEX_DISTILL_CHECKPOINT_TURNS",
+        description=(
+            "Completed Codex turns before a checkpoint journal trigger; 0 disables "
+            "this gate. The first enabled turn/byte/age gate reached triggers."
+        ),
+    )
+    codex_distill_checkpoint_bytes: int = Field(
+        default=0,
+        ge=0,
+        le=16 * 1024 * 1024,
+        alias="CCC_CODEX_DISTILL_CHECKPOINT_BYTES",
+        description=(
+            "UTF-8 user plus assistant bytes before a checkpoint journal trigger; "
+            "0 disables this gate."
+        ),
+    )
+    codex_distill_checkpoint_age_seconds: int = Field(
+        default=0,
+        ge=0,
+        le=7 * 24 * 60 * 60,
+        alias="CCC_CODEX_DISTILL_CHECKPOINT_AGE_SECONDS",
+        description=(
+            "Runtime seconds since the prior checkpoint boundary; 0 disables this "
+            "gate. Age is evaluated after a completed Codex turn."
+        ),
+    )
 
     def hook_policy_environment(self) -> dict[str, str]:
         """Return validated, non-secret policy fields inherited by Claude hooks."""

@@ -114,6 +114,8 @@ class BotCommandMixin:
             response,
             user_id=user_id,
             chat_id=chat.id,
+            request_text=prompt,
+            turn_marker=f"telegram-message:{message.message_id}",
         )
         # PATCH 2026-05-04: use _reply_smart to auto-split >4096 char responses
         # (Telegram message size limit). Capo's 23TM project has 31+ skills,
@@ -1140,6 +1142,8 @@ class BotCommandMixin:
                 response,
                 user_id=user_id,
                 chat_id=chat.id,
+                request_text=slash_cmd,
+                turn_marker=f"telegram-message:{message.message_id}",
             )
             await self._reply_smart(
                 message,
@@ -1193,6 +1197,8 @@ class BotCommandMixin:
                     response,
                     user_id=user_id,
                     chat_id=chat.id,
+                    request_text=slash_cmd,
+                    turn_marker=f"telegram-message:{message.message_id}",
                 )
                 await self._reply_smart(
                     message,
