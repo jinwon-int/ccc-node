@@ -410,11 +410,11 @@ CAPABILITY_AXES: tuple[CapabilityAxis, ...] = (
             "SessionEnd write-back feeds the next SessionStart snapshot; both hook "
             "directions carry executable tests (memory-hooks.test.sh, distill/*.test.sh)."
         ),
-        codex=_degraded(
-            "A hermetic audience-scoped A→distill→local index→B snapshot test "
-            "recalls one durable fact exactly once; Honcho parity and an "
-            "approved live provider proof remain pending.",
-            "#465",
+        codex=_supported(
+            "The hermetic audience-scoped test and an approved isolated live "
+            "provider A→distill→local index→B run on 2026-07-23 both recalled "
+            "one durable fact exactly once; local, Wiki-candidate, and Honcho "
+            "sink states remain independently replayable (#465)."
         ),
     ),
 )

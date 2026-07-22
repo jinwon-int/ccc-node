@@ -199,10 +199,10 @@ class CapabilityRuntimeDriftTests(unittest.TestCase):
                         f"{relative_path} backs the claude {axis_key} claim",
                     )
 
-    def test_codex_memory_gaps_track_issue_465(self) -> None:
+    def test_codex_memory_parity_tracks_issue_465(self) -> None:
         roundtrip = capability_status("codex", "memory_roundtrip")
-        self.assertIs(roundtrip.state, CapabilityState.DEGRADED)
-        self.assertIn("#465", roundtrip.dependencies)
+        self.assertIs(roundtrip.state, CapabilityState.SUPPORTED)
+        self.assertEqual(roundtrip.dependencies, ())
         self.assertTrue((REPO_ROOT / "bridge/tests/test_distill_roundtrip.py").is_file())
         self.assertIs(
             capability_status("codex", "memory_sink_local").state,
