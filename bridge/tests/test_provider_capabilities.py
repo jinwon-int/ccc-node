@@ -203,7 +203,6 @@ class CapabilityRuntimeDriftTests(unittest.TestCase):
         for axis_key in (
             "memory_writeback_distill",
             "memory_sink_honcho",
-            "memory_sink_wiki_candidate",
         ):
             status = capability_status("codex", axis_key)
             with self.subTest(axis=axis_key):
@@ -216,6 +215,16 @@ class CapabilityRuntimeDriftTests(unittest.TestCase):
         self.assertIs(
             capability_status("codex", "memory_sink_local").state,
             CapabilityState.SUPPORTED,
+        )
+        self.assertIs(
+            capability_status("codex", "memory_sink_wiki_candidate").state,
+            CapabilityState.SUPPORTED,
+        )
+        self.assertTrue(
+            (REPO_ROOT / "bridge/memory/distill_wiki_sink.py").is_file()
+        )
+        self.assertTrue(
+            (REPO_ROOT / "bridge/memory/distill_wiki_worker.py").is_file()
         )
 
 

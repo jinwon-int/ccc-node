@@ -83,6 +83,7 @@ class TelegramBot(
         distill_snapshot_worker: Any = None,
         distill_extraction_worker: Any = None,
         distill_local_sink_worker: Any = None,
+        distill_wiki_sink_worker: Any = None,
         application_builder_factory: Any = None,
         clock: Any = None,
     ):
@@ -96,6 +97,7 @@ class TelegramBot(
         # drives this exact gated instance (#388).
         self._distill_extraction_worker = distill_extraction_worker
         self._distill_local_sink_worker = distill_local_sink_worker
+        self._distill_wiki_sink_worker = distill_wiki_sink_worker
         self._application_builder_factory = (
             application_builder_factory or Application.builder
         )

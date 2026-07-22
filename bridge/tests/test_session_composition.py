@@ -947,6 +947,41 @@ print("COMPOSED-LOCAL-SINK-WORKER-OK")
     assert "COMPOSED-LOCAL-SINK-WORKER-OK" in result.stdout
 
 
+def test_build_context_composes_wiki_sink_only_when_policy_enabled(tmp_path):
+    result = _run_probe(
+        """
+import os
+from pathlib import Path
+
+root = Path(os.environ["PROBE_ROOT"])
+(root / "project").mkdir(parents=True, exist_ok=True)
+os.environ["PROJECT_ROOT"] = str(root / "project")
+os.environ["TELEGRAM_BOT_TOKEN"] = "123456:test"
+os.environ["ALLOWED_USER_IDS"] = "1"
+os.environ["CCC_AGENT_PROVIDER"] = "codex"
+os.environ["CCC_NODE_ISOLATION_PROFILE"] = "fleet"
+os.environ["CCC_WIKI_MEMORY_ENABLED"] = "1"
+
+from telegram_bot.__main__ import build_context, create_app, load_runtime_settings
+from telegram_bot.memory.distill_wiki_worker import CodexDistillWikiSinkWorker
+
+enabled = build_context(load_runtime_settings())
+worker = enabled.distill_wiki_sink_worker
+assert isinstance(worker, CodexDistillWikiSinkWorker), type(worker)
+assert worker._sink.queue_dir == enabled.settings.bot_data_dir / "wiki-candidates"
+assert create_app(enabled)._distill_wiki_sink_worker is worker
+
+os.environ["CCC_WIKI_MEMORY_ENABLED"] = "0"
+disabled = build_context(load_runtime_settings())
+assert disabled.distill_wiki_sink_worker is None
+print("COMPOSED-WIKI-SINK-WORKER-OK")
+""",
+        probe_root=tmp_path,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "COMPOSED-WIKI-SINK-WORKER-OK" in result.stdout
+
+
 def test_build_context_composes_routed_snapshot_worker(tmp_path):
     result = _run_probe(
         """

@@ -53,9 +53,9 @@ empty_writeback_json() {
     status:$status, jobs:0, pending_jobs:0, invalid_records:$invalid,
     record_bytes:0, snapshot_bytes:0,
     oldest_age_seconds:-1, oldest_pending_age_seconds:-1,
-    retries:{snapshot:0, extraction:0, local:0, total:0},
+    retries:{snapshot:0, extraction:0, local:0, wiki:0, total:0},
     accounting:{accounted_attempts:0, turn_bytes:0, duration_ms:0, estimated_max_tokens:0, model_counts:{}},
-    status_counts:{}, local_status_counts:{}
+    status_counts:{}, local_status_counts:{}, wiki_status_counts:{}
   }'
 }
 
@@ -117,10 +117,12 @@ writeback_queue_json() {
           and (.trigger | oneof(["new_command","provider_switch","auto_new","explicit","shutdown","checkpoint"]))
           and (.status | oneof(["queued","running_snapshot","snapshot_done","retryable_failed","terminal_failed","running_extraction","extraction_retryable_failed","extraction_done","extraction_terminal_failed"]))
           and ((.local_sink_status // null) | . == null or oneof(["pending","running","retryable_failed","done","terminal_failed","unroutable"]))
+          and ((.wiki_sink_status // null) | . == null or oneof(["pending","running","retryable_failed","done","terminal_failed","disabled"]))
           and (.created_at | journal_epoch != null)
           and (.attempts | nnint)
           and (.extraction_attempts | nnint)
           and (.local_sink_attempts | nnint)
+          and ((.wiki_sink_attempts // 0) | nnint)
           and ((.snapshot // null) | . == null or (type == "object" and (.byte_count | nnint)))
           and ((.extraction_accounting // []) |
             type == "array"
@@ -137,15 +139,18 @@ writeback_queue_json() {
         )
       | .status as $status
       | (.local_sink_status // null) as $local
+      | (.wiki_sink_status // null) as $wiki
       | ((.memory_audience // null) != null or (.memory_scope // null) != null) as $routed
       | {
           status:$status,
           local_status:$local,
+          wiki_status:$wiki,
           created_epoch:(.created_at | journal_epoch),
           snapshot_bytes:((.snapshot.byte_count // 0)),
           snapshot_retries:.attempts,
           extraction_retries:.extraction_attempts,
           local_retries:.local_sink_attempts,
+          wiki_retries:(.wiki_sink_attempts // 0),
           accounting:(
             [(.extraction_accounting // [])[] | {
               model, turn_bytes:.snapshot_bytes, duration_ms, estimated_max_tokens
@@ -155,10 +160,12 @@ writeback_queue_json() {
             ($status | oneof(["queued","running_snapshot","snapshot_done","retryable_failed","running_extraction","extraction_retryable_failed"]))
             or ($status == "extraction_done" and $local == null and $routed)
             or ($status == "extraction_done" and ($local | oneof(["pending","running","retryable_failed"])))
+            or ($status == "extraction_done" and ($wiki | oneof(["pending","running","retryable_failed"])))
           ),
           degraded:(
             ($status | oneof(["retryable_failed","terminal_failed","extraction_retryable_failed","extraction_terminal_failed"]))
             or ($local | oneof(["retryable_failed","terminal_failed"]))
+            or ($wiki | oneof(["retryable_failed","terminal_failed"]))
           )
         }
     ' "$path" 2>/dev/null)"
@@ -175,9 +182,9 @@ writeback_queue_json() {
         status:"degraded", jobs:0, pending_jobs:0, invalid_records:$invalid,
         record_bytes:$bytes, snapshot_bytes:0,
         oldest_age_seconds:-1, oldest_pending_age_seconds:-1,
-        retries:{snapshot:0, extraction:0, local:0, total:0},
+        retries:{snapshot:0, extraction:0, local:0, wiki:0, total:0},
         accounting:{accounted_attempts:0, turn_bytes:0, duration_ms:0, estimated_max_tokens:0, model_counts:{}},
-        status_counts:{}, local_status_counts:{}
+        status_counts:{}, local_status_counts:{}, wiki_status_counts:{}
       }'
     else
       empty_writeback_json empty 0
@@ -196,6 +203,7 @@ writeback_queue_json() {
       | ([ $jobs[] | .snapshot_retries ] | add // 0) as $snapshot_retries
       | ([ $jobs[] | .extraction_retries ] | add // 0) as $extraction_retries
       | ([ $jobs[] | .local_retries ] | add // 0) as $local_retries
+      | ([ $jobs[] | .wiki_retries ] | add // 0) as $wiki_retries
       | ([ $jobs[] | .accounting[] ]) as $accounting
       | {
           status:(
@@ -215,7 +223,8 @@ writeback_queue_json() {
             snapshot:$snapshot_retries,
             extraction:$extraction_retries,
             local:$local_retries,
-            total:($snapshot_retries + $extraction_retries + $local_retries)
+            wiki:$wiki_retries,
+            total:($snapshot_retries + $extraction_retries + $local_retries + $wiki_retries)
           },
           accounting:{
             accounted_attempts:($accounting | length),
@@ -225,7 +234,8 @@ writeback_queue_json() {
             model_counts:(reduce $accounting[] as $item ({}; .[$item.model] = ((.[$item.model] // 0) + 1)))
           },
           status_counts:(reduce $jobs[] as $job ({}; .[$job.status] = ((.[$job.status] // 0) + 1))),
-          local_status_counts:(reduce ($jobs[] | select(.local_status != null)) as $job ({}; .[$job.local_status] = ((.[$job.local_status] // 0) + 1)))
+          local_status_counts:(reduce ($jobs[] | select(.local_status != null)) as $job ({}; .[$job.local_status] = ((.[$job.local_status] // 0) + 1))),
+          wiki_status_counts:(reduce ($jobs[] | select(.wiki_status != null)) as $job ({}; .[$job.wiki_status] = ((.[$job.wiki_status] // 0) + 1)))
         }
     '
 }
