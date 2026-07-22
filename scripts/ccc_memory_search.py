@@ -184,6 +184,23 @@ def fts_query(toks):
         parts.append('"%s %s"' % (a.replace('"', '""'), b.replace('"', '""')))
     return " OR ".join(parts)
 
+def display_snippet(source, content, fallback=""):
+    """Return bounded user-facing text instead of structured metadata noise.
+
+    Structured fact documents prepend provenance/routing fields before their
+    validated ``text:`` line.  Match-centred FTS snippets (and plain
+    ``content[:240]`` fallbacks) can therefore surface only metadata and omit
+    the durable fact that SessionStart needs.  Keep ranking on the complete
+    document, but render the already-redacted fact body for every retrieval
+    lane.
+    """
+    content = content or ""
+    if source == "structured":
+        for line in content.splitlines():
+            if line.startswith("text: "):
+                return line[6:][:240]
+    return fallback or content[:240]
+
 def run_fts(expr, n=None):
     # FTS5 candidate generation joined to memory_docs so the rerank can read
     # content/updated_at for the durability/recency/source signals.
@@ -194,7 +211,8 @@ def run_fts(expr, n=None):
         "FROM memory_fts f LEFT JOIN memory_docs d ON d.path = f.path "
         "WHERE memory_fts MATCH ? ORDER BY bm25 LIMIT ?",
         (expr, n or limit))
-    return [{"path":r["path"],"source":r["source"],"snippet":r["snippet"],
+    return [{"path":r["path"],"source":r["source"],
+             "snippet":display_snippet(r["source"], r["content"], r["snippet"]),
              "bm25":r["bm25"],"content":r["content"] or "","updated_at":r["updated_at"] or ""} for r in cur]
 
 def run_like(toks, n=None):
@@ -207,7 +225,7 @@ def run_like(toks, n=None):
     score_terms = " + ".join(["CASE WHEN lower(content) LIKE ? OR lower(path) LIKE ? THEN 1 ELSE 0 END" for _ in toks])
     sql = f"SELECT path, source, content, updated_at, ({score_terms}) AS hits FROM memory_docs WHERE {clauses} ORDER BY hits DESC, updated_at DESC LIMIT ?"
     cur=con.execute(sql, params + params + [n or limit])
-    return [{"path":r["path"],"source":r["source"],"snippet":(r["content"] or "")[:240],
+    return [{"path":r["path"],"source":r["source"],"snippet":display_snippet(r["source"], r["content"]),
              "bm25":None,"token_hits":r["hits"],"content":r["content"] or "","updated_at":r["updated_at"] or ""} for r in cur]
 
 def rerank(cands):
@@ -278,7 +296,7 @@ def fuzzy_scan(qgrams, n_over):
         sim=len(qgrams & dg)/len(qgrams)
         if sim < 0.34:
             continue
-        out.append({"path":r["path"],"source":r["source"],"snippet":content[:240],
+        out.append({"path":r["path"],"source":r["source"],"snippet":display_snippet(r["source"], content),
                     "content":content,"updated_at":r["updated_at"] or "","fuzzy_sim":round(sim,4)})
     out.sort(key=lambda x: x["fuzzy_sim"], reverse=True)
     return out[:n_over]
@@ -370,7 +388,7 @@ def embedding_scan(qvec, n_over):
         if sim is None or sim < EMBED_MIN_SIM:
             continue
         content=r["content"] or ""
-        out.append({"path":r["path"],"source":r["source"],"snippet":content[:240],
+        out.append({"path":r["path"],"source":r["source"],"snippet":display_snippet(r["source"], content),
                     "content":content,"updated_at":r["updated_at"] or "","cos":round(sim,4)})
     out.sort(key=lambda x: x["cos"], reverse=True)
     return out[:n_over]
@@ -439,7 +457,7 @@ def hybrid(toks):
         # Simple local fusion. It is intentionally explainable and stdlib-only;
         # optional vector lanes can be added later without changing startup safety.
         score=(token_hits*4.0)+(phrase_hit*3.0)+signals["source_boost"]+signals["recency_boost"]+signals["durability_penalty"]+signals["usage_boost"]
-        sn=content[:240]
+        sn=display_snippet(r["source"], content)
         out.append({"path":r["path"],"source":r["source"],"snippet":sn,"score":round(score,4),"signals":signals,"_chash":_chash(content)})
     out.sort(key=lambda x: x["score"], reverse=True)
     return out[:limit]

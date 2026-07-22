@@ -300,6 +300,23 @@ ok "memory index includes structured facts" '[ "$rc" = 0 ] && jq -e ".documents 
 out="$(CCC_STATE_DIR="$state" CCC_MEMORY_INDEX_DB="$state/memory-index.sqlite" CCC_MEMORY_RETRIEVAL=hybrid-local bash "$ROOT/scripts/ccc-memory-search.sh" "current editor Helix" 2>&1)"; rc=$?
 ok "hybrid-local search explains scoring signals" '[ "$rc" = 0 ] && jq -e ".retrievalMode == \"hybrid-local\" and (.results[0].signals.token_hits >= 1)" >/dev/null <<<"$out"'
 
+# Recent distill lookup intentionally matches the structured metadata labels
+# (`distilled text`).  The rendered snippet must still carry the actual fact,
+# even when long metadata / fact prefixes put its unique value outside FTS5's
+# small match-centred token window.
+recent_state="$TMP/recent-structured-state"
+recent_facts="$recent_state/memory-facts.jsonl"
+mkdir -p "$recent_state"
+printf '%s\n' \
+  '{"id":"distill-long-prefix","kind":"preference","text":"This harmless durable preference includes a deliberately long explanatory prefix with enough ordinary words to exceed the metadata centred search snippet window before UNIQUE_RECENT_FACT_MARKER appears.","entities":["user","session","provider","memory","roundtrip"],"tags":["distilled","explicit"],"durability":"durable","privacy":"private","review":"auto-local","source":{"type":"distill","provider":"codex","thread_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","trigger":"explicit","schema_version":1}}' \
+  > "$recent_facts"
+CCC_STATE_DIR="$recent_state" CCC_MEMORY_FACTS_FILE="$recent_facts" bash "$ROOT/scripts/ccc-memory-index.sh" rebuild >/dev/null 2>&1
+out="$(CCC_STATE_DIR="$recent_state" CCC_MEMORY_INDEX_DB="$recent_state/memory-index.sqlite" CCC_MEMORY_FUSION=0 bash "$ROOT/scripts/ccc-memory-search.sh" "distilled text" 2>&1)"; rc=$?
+ok "recent structured lookup renders the durable fact body" '[ "$rc" = 0 ] && jq -e ".results | any(.snippet | contains(\"UNIQUE_RECENT_FACT_MARKER\"))" >/dev/null <<<"$out"'
+CCC_STATE_DIR="$recent_state" CCC_MEMORY_FACTS_FILE="$recent_facts" CCC_MEMORY_DISABLE_FTS5=1 bash "$ROOT/scripts/ccc-memory-index.sh" rebuild >/dev/null 2>&1
+out="$(CCC_STATE_DIR="$recent_state" CCC_MEMORY_INDEX_DB="$recent_state/memory-index.sqlite" CCC_MEMORY_FUSION=0 bash "$ROOT/scripts/ccc-memory-search.sh" "distilled text" 2>&1)"; rc=$?
+ok "recent structured LIKE fallback renders the durable fact body" '[ "$rc" = 0 ] && jq -e ".results | any(.snippet | contains(\"UNIQUE_RECENT_FACT_MARKER\"))" >/dev/null <<<"$out"'
+
 # Default retrieval must apply the durability/source boosts too (not raw bm25),
 # so a keyword-dense volatile fact with EQUAL coverage can't outrank a durable
 # one. Distinct fixture so the only differentiator is the boost.
