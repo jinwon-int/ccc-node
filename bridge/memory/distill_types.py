@@ -11,6 +11,7 @@ from typing import Any, Literal, Mapping
 DISTILL_SCHEMA_VERSION = 1
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _SAFE_ERROR_CODE_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+_PRIVATE_MEMORY_SCOPE_RE = re.compile(r"^private-[0-9a-f]{32}$")
 
 
 class DistillTrigger(str, Enum):
@@ -29,6 +30,27 @@ class DistillJobStatus(str, Enum):
     EXTRACTION_RETRYABLE_FAILED = "extraction_retryable_failed"
     EXTRACTION_DONE = "extraction_done"
     EXTRACTION_TERMINAL_FAILED = "extraction_terminal_failed"
+
+
+class DistillLocalSinkStatus(str, Enum):
+    PENDING = "pending"
+    RUNNING = "running"
+    RETRYABLE_FAILED = "retryable_failed"
+    DONE = "done"
+    TERMINAL_FAILED = "terminal_failed"
+    UNROUTABLE = "unroutable"
+
+
+def validate_memory_route(audience: str | None, scope: str | None) -> None:
+    if audience is None and scope is None:
+        return
+    valid = (audience == "shared" and scope == "shared") or (
+        audience == "private"
+        and isinstance(scope, str)
+        and _PRIVATE_MEMORY_SCOPE_RE.fullmatch(scope) is not None
+    )
+    if not valid:
+        raise ValueError("invalid distill memory audience route")
 
 
 @dataclass(frozen=True, slots=True)
@@ -178,6 +200,11 @@ class DistillJob:
     extraction_lease_epoch: int = 0
     extraction_output: str | None = None
     extraction_output_hash: str | None = None
+    memory_audience: str | None = None
+    memory_scope: str | None = None
+    local_sink_status: DistillLocalSinkStatus | None = None
+    local_sink_attempts: int = 0
+    local_sink_lease_epoch: int = 0
 
     def __post_init__(self) -> None:
         if not _SHA256_RE.fullmatch(self.job_id):
@@ -200,8 +227,18 @@ class DistillJob:
             or self.lease_epoch < 0
             or self.extraction_attempts < 0
             or self.extraction_lease_epoch < 0
+            or self.local_sink_attempts < 0
+            or self.local_sink_lease_epoch < 0
         ):
             raise ValueError("invalid distill job counters")
+        validate_memory_route(self.memory_audience, self.memory_scope)
+        if self.local_sink_status is DistillLocalSinkStatus.UNROUTABLE:
+            if self.memory_audience is not None or self.memory_scope is not None:
+                raise ValueError("unroutable local sink must not carry a route")
+        elif self.local_sink_status is not None and (
+            self.memory_audience is None or self.memory_scope is None
+        ):
+            raise ValueError("routable local sink status requires a memory route")
         if self.error_code is not None and not _SAFE_ERROR_CODE_RE.fullmatch(
             self.error_code
         ):
@@ -243,6 +280,15 @@ class DistillJob:
             "extraction_lease_epoch": self.extraction_lease_epoch,
             "extraction_output": self.extraction_output,
             "extraction_output_hash": self.extraction_output_hash,
+            "memory_audience": self.memory_audience,
+            "memory_scope": self.memory_scope,
+            "local_sink_status": (
+                self.local_sink_status.value
+                if self.local_sink_status is not None
+                else None
+            ),
+            "local_sink_attempts": self.local_sink_attempts,
+            "local_sink_lease_epoch": self.local_sink_lease_epoch,
         }
 
     @classmethod
@@ -266,6 +312,8 @@ class DistillJob:
         lease_epoch = value.get("lease_epoch", 0)
         extraction_attempts = value.get("extraction_attempts", 0)
         extraction_lease_epoch = value.get("extraction_lease_epoch", 0)
+        local_sink_attempts = value.get("local_sink_attempts", 0)
+        local_sink_lease_epoch = value.get("local_sink_lease_epoch", 0)
         schema_version = value.get("schema_version")
         if type(attempts) is not int or attempts < 0:
             raise ValueError("invalid distill job attempts")
@@ -275,6 +323,10 @@ class DistillJob:
             raise ValueError("invalid distill job extraction_attempts")
         if type(extraction_lease_epoch) is not int or extraction_lease_epoch < 0:
             raise ValueError("invalid distill job extraction_lease_epoch")
+        if type(local_sink_attempts) is not int or local_sink_attempts < 0:
+            raise ValueError("invalid distill job local_sink_attempts")
+        if type(local_sink_lease_epoch) is not int or local_sink_lease_epoch < 0:
+            raise ValueError("invalid distill job local_sink_lease_epoch")
         if type(schema_version) is not int or schema_version <= 0:
             raise ValueError("invalid distill job schema_version")
         owner_token = value.get("owner_token")
@@ -282,15 +334,30 @@ class DistillJob:
         error_code = value.get("error_code")
         extraction_output = value.get("extraction_output")
         extraction_output_hash = value.get("extraction_output_hash")
+        memory_audience = value.get("memory_audience")
+        memory_scope = value.get("memory_scope")
         for name, optional in (
             ("owner_token", owner_token),
             ("lease_expires_at", lease_expires_at),
             ("error_code", error_code),
             ("extraction_output", extraction_output),
             ("extraction_output_hash", extraction_output_hash),
+            ("memory_audience", memory_audience),
+            ("memory_scope", memory_scope),
         ):
             if optional is not None and not isinstance(optional, str):
                 raise ValueError(f"invalid distill job field: {name}")
+        raw_local_sink_status = value.get("local_sink_status")
+        if raw_local_sink_status is None:
+            local_sink_status = (
+                DistillLocalSinkStatus.UNROUTABLE
+                if extraction_output is not None and memory_audience is None
+                else None
+            )
+        elif isinstance(raw_local_sink_status, str):
+            local_sink_status = DistillLocalSinkStatus(raw_local_sink_status)
+        else:
+            raise ValueError("invalid distill job field: local_sink_status")
         return cls(
             job_id=value["job_id"],
             provider=value["provider"],
@@ -316,4 +383,9 @@ class DistillJob:
             extraction_lease_epoch=extraction_lease_epoch,
             extraction_output=extraction_output,
             extraction_output_hash=extraction_output_hash,
+            memory_audience=memory_audience,
+            memory_scope=memory_scope,
+            local_sink_status=local_sink_status,
+            local_sink_attempts=local_sink_attempts,
+            local_sink_lease_epoch=local_sink_lease_epoch,
         )
