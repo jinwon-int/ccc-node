@@ -62,6 +62,7 @@ from claude_agent_sdk import (  # noqa: E402 -- must follow the stub purge above
 from telegram_bot.core.agent_runtime import (  # noqa: E402
     AgentEvent,
     CompletionEvent,
+    ErrorEvent,
     SessionRequest,
     TextDeltaEvent,
 )
@@ -366,6 +367,49 @@ class ClaudeRuntimeUnsolicitedTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             self.delivered, [("fresh background report", client.session_id)]
         )
+
+    async def test_abort_stalled_waiter_closes_owner_and_rotates_shared_lock(
+        self,
+    ) -> None:
+        """#625: a waiter on another resumed session must not inherit the
+        first session's permanently held turn lock after recovery."""
+
+        owner, owner_client = await self._start_session()
+        owner_client.turn_scripts.append("hang")
+        owner_task = asyncio.create_task(_collect(owner.send_turn("owner")))
+        await _wait_until(lambda: owner_client.queries == ["owner"])
+
+        waiter = await self.runtime.start_or_resume(
+            SessionRequest(
+                working_directory="/workspace", session_id=owner.session_id
+            )
+        )
+        waiter_client = self.clients[-1]
+        waiter_task = asyncio.create_task(_collect(waiter.send_turn("waiter")))
+        await asyncio.sleep(0.01)
+        self.assertEqual(waiter_client.queries, [])
+
+        await waiter.interrupt()
+        waiter_task.cancel()
+        await asyncio.gather(waiter_task, return_exceptions=True)
+        await waiter.abort_stalled_turn()
+        owner_events = await asyncio.wait_for(owner_task, timeout=2.0)
+
+        self.assertEqual(owner_client.interrupts, 1)
+        self.assertIsInstance(owner_events[-1], ErrorEvent)
+        self.assertEqual(waiter_client.queries, [])
+
+        recovered = await self.runtime.start_or_resume(
+            SessionRequest(
+                working_directory="/workspace", session_id=owner.session_id
+            )
+        )
+        recovered_client = self.clients[-1]
+        recovered_events = await asyncio.wait_for(
+            _collect(recovered.send_turn("recovered")), timeout=2.0
+        )
+        self.assertEqual(recovered_client.queries, ["recovered"])
+        self.assertIsInstance(recovered_events[-1], CompletionEvent)
 
     # -- raw SDK frame observation seam (#584 C-1 follow-up) ---------------
 

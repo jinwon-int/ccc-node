@@ -83,6 +83,10 @@ class _PendingRequest:
     # instead of ticking up forever. 0 until the first event; the stall check
     # falls back to started_at.
     last_event_at: float = 0.0
+    # True until the runtime yields its first normalized event. This separates
+    # a request blocked behind a leaked turn lock/provider admission from work
+    # that the provider has actually started (#625).
+    waiting_for_turn: bool = True
     # Wall-clock of the newest assistant TextBlock / ToolUseBlock (#411 C).
     # A terminal-event stall is only releasable when answer text is the latest
     # meaningful activity: last_text_at > last_tool_at means no tool started

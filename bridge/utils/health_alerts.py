@@ -84,6 +84,7 @@ class HealthSignals:
     """One probe tick's structured runtime-health snapshot."""
 
     active_requests: int = 0
+    waiting_for_turn: int = 0
     oldest_request_age_seconds: float = 0.0
     request_lifetime_seconds: float = 0.0
     pending_notifications: int = 0
@@ -243,6 +244,11 @@ class HealthProbe:
         except Exception:
             active_requests, oldest_age = 0, 0.0
 
+        try:
+            waiting_for_turn = int(self.project_chat.waiting_for_turn_snapshot())
+        except Exception:
+            waiting_for_turn = 0
+
         lifetime = float(getattr(self.project_chat, "_process_timeout_seconds", 0) or 0)
 
         dropped = 0
@@ -272,6 +278,7 @@ class HealthProbe:
 
         return HealthSignals(
             active_requests=int(active_requests),
+            waiting_for_turn=max(0, waiting_for_turn),
             oldest_request_age_seconds=float(oldest_age),
             request_lifetime_seconds=lifetime,
             pending_notifications=count_spool_backlog(self.spool_dir),

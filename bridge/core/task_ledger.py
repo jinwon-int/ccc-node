@@ -14,8 +14,8 @@ that retries until they land (``broker-cleanup-discovery.ts``).
 This module ports that model at bridge scale:
 
 - Every Telegram request gets a ledger record with an explicit state:
-  ``working`` / ``input-required`` and the terminals ``completed`` / ``failed``
-  / ``canceled`` / ``timeout`` / ``interrupted``.
+  ``waiting-for-turn`` / ``working`` / ``input-required`` and the terminals
+  ``completed`` / ``failed`` / ``canceled`` / ``timeout`` / ``interrupted``.
 - The transient "⏳ Working" status message is a *projection* of the record —
   its id is registered here, and terminal transitions must clean it up.
 - If the terminal cleanup edit/delete fails, a ``terminal_op`` stays on the
@@ -50,6 +50,7 @@ logger = logging.getLogger(__name__)
 
 # --- states (A2A vocabulary, plus the bridge-specific terminals) --------------
 WORKING = "working"
+WAITING_FOR_TURN = "waiting-for-turn"
 INPUT_REQUIRED = "input-required"
 COMPLETED = "completed"
 FAILED = "failed"

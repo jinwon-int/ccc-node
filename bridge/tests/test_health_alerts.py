@@ -210,6 +210,7 @@ class HealthProbeTests(unittest.IsolatedAsyncioTestCase):
 
             handler = SimpleNamespace(
                 workload_snapshot=lambda now: (2, 750.0),
+                waiting_for_turn_snapshot=lambda: 1,
                 _process_timeout_seconds=600.0,
             )
             probe = HealthProbe(
@@ -222,6 +223,7 @@ class HealthProbeTests(unittest.IsolatedAsyncioTestCase):
             signals = probe.collect(now=1000.0)
 
             self.assertEqual(signals.active_requests, 2)
+            self.assertEqual(signals.waiting_for_turn, 1)
             self.assertEqual(signals.oldest_request_age_seconds, 750.0)
             self.assertEqual(signals.request_lifetime_seconds, 600.0)
             self.assertEqual(signals.pending_notifications, 2)
@@ -261,6 +263,7 @@ class HealthProbeTests(unittest.IsolatedAsyncioTestCase):
     async def test_signals_export_shape_for_health_json(self):
         signals = HealthSignals(
             active_requests=1,
+            waiting_for_turn=1,
             oldest_request_age_seconds=12.7,
             request_lifetime_seconds=600.0,
             pending_notifications=0,
@@ -279,6 +282,7 @@ class HealthProbeTests(unittest.IsolatedAsyncioTestCase):
                 "orphan_children",
                 "pending_notifications",
                 "request_lifetime_seconds",
+                "waiting_for_turn",
             ],
         )
 

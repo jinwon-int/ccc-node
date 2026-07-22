@@ -158,6 +158,21 @@ class HeartbeatSettingsMixin:
             "timeout only."
         ),
     )
+    turn_admission_timeout_seconds: float = Field(
+        default=300.0,
+        alias="CCC_TURN_ADMISSION_TIMEOUT_SECONDS",
+        ge=0,
+        allow_inf_nan=False,
+        description=(
+            "Fail and release a request when its provider turn produces no first "
+            "event within this many seconds. This bounds waits behind a leaked "
+            "per-session turn lock and provider query/admission hangs that the "
+            "terminal-stall guard cannot see because no answer text exists yet. "
+            "The live session is interrupted before its iterator is closed so a "
+            "late provider result cannot keep the conversation FIFO pinned. Set "
+            "0 to disable and fall back to the full process timeout."
+        ),
+    )
     heartbeat_duration_log_enabled: bool = Field(
         default=True,
         alias="CCC_HEARTBEAT_DURATION_LOG_ENABLED",
