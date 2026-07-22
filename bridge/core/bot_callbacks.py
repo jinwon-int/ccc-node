@@ -225,7 +225,10 @@ class BotCallbackMixin:
             reset_note = None
             if stored_provider != active_provider:
                 await self._enqueue_previous_codex_session(
-                    session, DistillTrigger.PROVIDER_SWITCH
+                    session,
+                    DistillTrigger.PROVIDER_SWITCH,
+                    user_id=user_id,
+                    chat_id=chat.id,
                 )
                 updates.update(session_id=None, new_session=True)
                 remove_fields.add("effort")

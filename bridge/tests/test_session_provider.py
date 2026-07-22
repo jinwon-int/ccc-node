@@ -377,6 +377,10 @@ async def test_codex_new_enqueues_previous_thread_before_reset(tmp_path: Path) -
         observe=lambda: manager.store._local_data["telegram_session:7:9"]["session_id"]
     )
     bot._distill_journal = journal
+    bot._config.bridge_memory_mode = "audience-scoped"
+    bot._config.telegram_session_scope = "per-user-chat"
+    bot._config.bridge_memory_audience_root = tmp_path / "audiences"
+    bot._config.bridge_memory_audience_key_path = tmp_path / "audience.key"
 
     await bot._cmd_new(make_update(), SimpleNamespace(args=[]))
 
@@ -384,6 +388,8 @@ async def test_codex_new_enqueues_previous_thread_before_reset(tmp_path: Path) -
     assert journal.calls[0]["provider"] == "codex"
     assert journal.calls[0]["thread_id"] == "thread-before-new"
     assert journal.calls[0]["trigger"].value == "new_command"
+    assert journal.calls[0]["memory_audience"] == "shared"
+    assert journal.calls[0]["memory_scope"] == "shared"
     assert journal.calls[0]["observed"] == "thread-before-new"
     assert (await manager.get_session("7:9"))["session_id"] is None
 
@@ -429,6 +435,10 @@ async def test_model_command_provider_switch_enqueues_old_codex_thread(
         ]
     )
     bot._distill_journal = journal
+    bot._config.bridge_memory_mode = "audience-scoped"
+    bot._config.telegram_session_scope = "per-user-chat"
+    bot._config.bridge_memory_audience_root = tmp_path / "audiences"
+    bot._config.bridge_memory_audience_key_path = tmp_path / "audience.key"
 
     await bot._cmd_model(make_update(), SimpleNamespace(args=["sonnet"]))
 
@@ -436,6 +446,7 @@ async def test_model_command_provider_switch_enqueues_old_codex_thread(
     assert journal.calls[0]["observed"] == "thread-before-model-command"
     assert journal.calls[0]["thread_id"] == "thread-before-model-command"
     assert journal.calls[0]["trigger"].value == "provider_switch"
+    assert journal.calls[0]["memory_scope"] == "shared"
     session = await manager.get_session("7:9")
     assert session["provider"] == "claude"
     assert session["session_id"] is None
@@ -457,6 +468,10 @@ async def test_model_callback_provider_switch_enqueues_old_codex_thread(
         ]
     )
     bot._distill_journal = journal
+    bot._config.bridge_memory_mode = "audience-scoped"
+    bot._config.telegram_session_scope = "per-user-chat"
+    bot._config.bridge_memory_audience_root = tmp_path / "audiences"
+    bot._config.bridge_memory_audience_key_path = tmp_path / "audience.key"
     bot.application = SimpleNamespace(bot=object())
     query = SimpleNamespace(
         data="model:claude:sonnet",
@@ -476,6 +491,7 @@ async def test_model_callback_provider_switch_enqueues_old_codex_thread(
     assert journal.calls[0]["observed"] == "thread-before-model-callback"
     assert journal.calls[0]["thread_id"] == "thread-before-model-callback"
     assert journal.calls[0]["trigger"].value == "provider_switch"
+    assert journal.calls[0]["memory_scope"] == "shared"
     session = await manager.get_session("7:9")
     assert session["provider"] == "claude"
     assert session["session_id"] is None
@@ -492,12 +508,19 @@ async def test_auto_new_enqueues_old_codex_thread_before_reset(tmp_path: Path) -
         observe=lambda: manager.store._local_data["telegram_session:7:9"]["session_id"]
     )
     bot._distill_journal = journal
+    bot._config.bridge_memory_mode = "audience-scoped"
+    bot._config.telegram_session_scope = "per-user-chat"
+    bot._config.bridge_memory_audience_root = tmp_path / "audiences"
+    bot._config.bridge_memory_audience_key_path = tmp_path / "audience.key"
     session = await manager.get_session("7:9")
 
-    await bot._reset_for_auto_new_session("7:9", session)
+    await bot._reset_for_auto_new_session(
+        "7:9", session, user_id=7, chat_id=9
+    )
 
     assert journal.calls[0]["thread_id"] == "thread-before-auto-new"
     assert journal.calls[0]["trigger"].value == "auto_new"
+    assert journal.calls[0]["memory_scope"] == "shared"
     assert journal.calls[0]["observed"] == "thread-before-auto-new"
     assert session["session_id"] is None
     assert (await manager.get_session("7:9"))["session_id"] is None
@@ -520,6 +543,36 @@ async def test_distill_trigger_is_noop_for_non_codex_or_missing_thread(tmp_path:
         DistillTrigger.NEW_COMMAND,
     ) is None
     assert journal.calls == []
+
+
+@pytest.mark.anyio
+async def test_distill_trigger_binds_private_route_without_raw_telegram_id(
+    tmp_path: Path,
+) -> None:
+    from telegram_bot.memory.distill_types import DistillTrigger
+
+    manager = make_manager(tmp_path, "codex")
+    bot = bare_bot(manager, provider="codex")
+    journal = RecordingDistillJournal()
+    bot._distill_journal = journal
+    bot._config.bridge_memory_mode = "audience-scoped"
+    bot._config.telegram_session_scope = "per-user-chat"
+    bot._config.bridge_memory_audience_root = tmp_path / "audiences"
+    bot._config.bridge_memory_audience_key_path = tmp_path / "audience.key"
+
+    await bot._enqueue_previous_codex_session(
+        {"provider": "codex", "session_id": "thread-private"},
+        DistillTrigger.NEW_COMMAND,
+        user_id=934719283,
+        chat_id=934719283,
+    )
+
+    call = journal.calls[0]
+    assert call["memory_audience"] == "private"
+    scope = str(call["memory_scope"])
+    assert scope.startswith("private-")
+    assert len(scope) == len("private-") + 32
+    assert "934719283" not in scope
 
 
 @pytest.mark.anyio

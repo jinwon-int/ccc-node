@@ -148,7 +148,10 @@ class BotCommandMixin:
 
         session = await self._session_manager.get_session(conversation_key)
         await self._enqueue_previous_codex_session(
-            session, DistillTrigger.NEW_COMMAND
+            session,
+            DistillTrigger.NEW_COMMAND,
+            user_id=user_id,
+            chat_id=chat.id,
         )
         active_provider = self._active_provider()
         provider_changed = session.get("provider") != active_provider
@@ -225,7 +228,10 @@ class BotCommandMixin:
             reset_note = None
             if session["provider"] != active_provider:
                 await self._enqueue_previous_codex_session(
-                    session, DistillTrigger.PROVIDER_SWITCH
+                    session,
+                    DistillTrigger.PROVIDER_SWITCH,
+                    user_id=user_id,
+                    chat_id=chat.id,
                 )
                 updates.update(session_id=None, new_session=True)
                 remove_fields.add("effort")
