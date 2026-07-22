@@ -27,7 +27,9 @@ from .distill_types import (
     CodexTranscriptSnapshot,
     DistillJob,
     DistillJobStatus,
+    DistillLocalSinkStatus,
     DistillTrigger,
+    validate_memory_route,
 )
 from .distill_extraction import (
     DistillExtractionOutput,
@@ -217,6 +219,11 @@ class DistillJournal:
                 parse_extraction_output(job.extraction_output, wiki_enabled=True)
             except (TypeError, ValueError):
                 raise ValueError("invalid distill job extraction output") from None
+        if job.local_sink_status is not None and (
+            job.status is not DistillJobStatus.EXTRACTION_DONE
+            or job.extraction_output is None
+        ):
+            raise ValueError("local sink state requires completed extraction")
         return job
 
     def _write_unlocked(self, job: DistillJob) -> None:
@@ -239,6 +246,8 @@ class DistillJournal:
         trigger: DistillTrigger,
         discriminator: str = _DEFAULT_DISCRIMINATOR,
         schema_version: int = DISTILL_SCHEMA_VERSION,
+        memory_audience: str | None = None,
+        memory_scope: str | None = None,
         now: datetime | None = None,
     ) -> DistillJob:
         if provider != "codex":
@@ -247,6 +256,7 @@ class DistillJournal:
             raise ValueError("thread_id must not be empty")
         if not discriminator:
             raise ValueError("discriminator must not be empty")
+        validate_memory_route(memory_audience, memory_scope)
         trigger = DistillTrigger(trigger)
         timestamp = _timestamp(now or _utc_now())
         thread_hash = hashlib.sha256(thread_id.encode("utf-8")).hexdigest()
@@ -262,6 +272,11 @@ class DistillJournal:
                     or existing.schema_version != schema_version
                 ):
                     raise RuntimeError("distill job hash collision")
+                if (
+                    existing.memory_audience != memory_audience
+                    or existing.memory_scope != memory_scope
+                ):
+                    raise RuntimeError("distill job memory route collision")
                 return existing
             job = DistillJob(
                 job_id=job_id,
@@ -274,6 +289,8 @@ class DistillJournal:
                 schema_version=schema_version,
                 created_at=timestamp,
                 updated_at=timestamp,
+                memory_audience=memory_audience,
+                memory_scope=memory_scope,
             )
             self._write_unlocked(job)
             return job
@@ -482,6 +499,11 @@ class DistillJournal:
                 lease_expires_at=None,
                 extraction_output=payload,
                 extraction_output_hash=payload_hash,
+                local_sink_status=(
+                    DistillLocalSinkStatus.PENDING
+                    if job.memory_audience is not None
+                    else DistillLocalSinkStatus.UNROUTABLE
+                ),
                 error_code=None,
             )
             self._write_unlocked(done)
@@ -556,6 +578,155 @@ class DistillJournal:
             return None
         return parse_extraction_output(job.extraction_output, wiki_enabled=True)
 
+    def claim_local_sink(
+        self,
+        job_id: str,
+        *,
+        owner_token: str,
+        now: datetime | None = None,
+        lease_seconds: int = 300,
+        max_attempts: int = 5,
+    ) -> DistillJob | None:
+        if not owner_token:
+            raise ValueError("owner_token must not be empty")
+        if lease_seconds <= 0 or max_attempts <= 0:
+            raise ValueError("lease_seconds and max_attempts must be positive")
+        current_time = _normalize_time(now or _utc_now())
+        with self._exclusive():
+            job = self._read_unlocked(job_id)
+            if job.local_sink_status not in {
+                DistillLocalSinkStatus.PENDING,
+                DistillLocalSinkStatus.RETRYABLE_FAILED,
+            }:
+                return None
+            if (
+                job.status is not DistillJobStatus.EXTRACTION_DONE
+                or job.extraction_output is None
+                or job.memory_audience is None
+                or job.memory_scope is None
+            ):
+                raise ValueError("local sink job is missing extraction or route")
+            if job.local_sink_attempts >= max_attempts:
+                terminal = replace(
+                    job,
+                    local_sink_status=DistillLocalSinkStatus.TERMINAL_FAILED,
+                    updated_at=_timestamp(current_time),
+                    owner_token=None,
+                    lease_expires_at=None,
+                    error_code="local_sink_max_attempts_exceeded",
+                )
+                self._write_unlocked(terminal)
+                return None
+            running = replace(
+                job,
+                local_sink_status=DistillLocalSinkStatus.RUNNING,
+                updated_at=_timestamp(current_time),
+                local_sink_attempts=job.local_sink_attempts + 1,
+                local_sink_lease_epoch=job.local_sink_lease_epoch + 1,
+                owner_token=owner_token,
+                lease_expires_at=_timestamp(
+                    current_time + timedelta(seconds=lease_seconds)
+                ),
+                error_code=None,
+            )
+            self._write_unlocked(running)
+            return running
+
+    @staticmethod
+    def _require_running_local_sink(
+        job: DistillJob, owner_token: str, lease_epoch: int
+    ) -> None:
+        if job.local_sink_status is not DistillLocalSinkStatus.RUNNING:
+            raise RuntimeError(
+                "invalid local sink transition from "
+                f"{job.local_sink_status.value if job.local_sink_status else 'none'}"
+            )
+        if job.owner_token != owner_token or job.local_sink_lease_epoch != lease_epoch:
+            raise RuntimeError("local sink owner or lease epoch does not match")
+
+    def mark_local_sink_done(
+        self,
+        job_id: str,
+        *,
+        owner_token: str,
+        lease_epoch: int,
+        now: datetime | None = None,
+    ) -> DistillJob:
+        with self._exclusive():
+            job = self._read_unlocked(job_id)
+            self._require_running_local_sink(job, owner_token, lease_epoch)
+            done = replace(
+                job,
+                local_sink_status=DistillLocalSinkStatus.DONE,
+                updated_at=_timestamp(now or _utc_now()),
+                owner_token=None,
+                lease_expires_at=None,
+                error_code=None,
+            )
+            self._write_unlocked(done)
+            return done
+
+    def mark_local_sink_retryable_failed(
+        self,
+        job_id: str,
+        *,
+        owner_token: str,
+        lease_epoch: int,
+        error_code: str,
+        now: datetime | None = None,
+    ) -> DistillJob:
+        return self._mark_local_sink_failed(
+            job_id,
+            owner_token=owner_token,
+            lease_epoch=lease_epoch,
+            error_code=error_code,
+            status=DistillLocalSinkStatus.RETRYABLE_FAILED,
+            now=now,
+        )
+
+    def mark_local_sink_terminal_failed(
+        self,
+        job_id: str,
+        *,
+        owner_token: str,
+        lease_epoch: int,
+        error_code: str,
+        now: datetime | None = None,
+    ) -> DistillJob:
+        return self._mark_local_sink_failed(
+            job_id,
+            owner_token=owner_token,
+            lease_epoch=lease_epoch,
+            error_code=error_code,
+            status=DistillLocalSinkStatus.TERMINAL_FAILED,
+            now=now,
+        )
+
+    def _mark_local_sink_failed(
+        self,
+        job_id: str,
+        *,
+        owner_token: str,
+        lease_epoch: int,
+        error_code: str,
+        status: DistillLocalSinkStatus,
+        now: datetime | None,
+    ) -> DistillJob:
+        self._validate_error_code(error_code)
+        with self._exclusive():
+            job = self._read_unlocked(job_id)
+            self._require_running_local_sink(job, owner_token, lease_epoch)
+            failed = replace(
+                job,
+                local_sink_status=status,
+                updated_at=_timestamp(now or _utc_now()),
+                owner_token=None,
+                lease_expires_at=None,
+                error_code=error_code,
+            )
+            self._write_unlocked(failed)
+            return failed
+
     def mark_retryable_failed(
         self,
         job_id: str,
@@ -611,10 +782,17 @@ class DistillJournal:
             for path in sorted(self.root.glob("*.json")):
                 self._validate_job_name(path)
                 job = self._read_unlocked(path.stem)
-                if job.status not in {
+                phase_running = job.status in {
                     DistillJobStatus.RUNNING_SNAPSHOT,
                     DistillJobStatus.RUNNING_EXTRACTION,
-                } or job.lease_expires_at is None:
+                }
+                local_running = (
+                    job.local_sink_status is DistillLocalSinkStatus.RUNNING
+                )
+                if (
+                    (not phase_running and not local_running)
+                    or job.lease_expires_at is None
+                ):
                     continue
                 try:
                     lease_expires = _parse_timestamp(job.lease_expires_at)
@@ -622,24 +800,34 @@ class DistillJournal:
                     raise ValueError("invalid distill job lease timestamp") from error
                 if lease_expires > current_time:
                     continue
-                recovery_status = (
-                    DistillJobStatus.QUEUED
-                    if job.status is DistillJobStatus.RUNNING_SNAPSHOT
-                    else DistillJobStatus.EXTRACTION_RETRYABLE_FAILED
-                )
-                error_code = (
-                    "lease_expired"
-                    if job.status is DistillJobStatus.RUNNING_SNAPSHOT
-                    else "extraction_lease_expired"
-                )
-                queued = replace(
-                    job,
-                    status=recovery_status,
-                    updated_at=_timestamp(current_time),
-                    owner_token=None,
-                    lease_expires_at=None,
-                    error_code=error_code,
-                )
+                if local_running:
+                    queued = replace(
+                        job,
+                        local_sink_status=DistillLocalSinkStatus.RETRYABLE_FAILED,
+                        updated_at=_timestamp(current_time),
+                        owner_token=None,
+                        lease_expires_at=None,
+                        error_code="local_sink_lease_expired",
+                    )
+                else:
+                    recovery_status = (
+                        DistillJobStatus.QUEUED
+                        if job.status is DistillJobStatus.RUNNING_SNAPSHOT
+                        else DistillJobStatus.EXTRACTION_RETRYABLE_FAILED
+                    )
+                    error_code = (
+                        "lease_expired"
+                        if job.status is DistillJobStatus.RUNNING_SNAPSHOT
+                        else "extraction_lease_expired"
+                    )
+                    queued = replace(
+                        job,
+                        status=recovery_status,
+                        updated_at=_timestamp(current_time),
+                        owner_token=None,
+                        lease_expires_at=None,
+                        error_code=error_code,
+                    )
                 self._write_unlocked(queued)
                 recovered += 1
         return recovered
@@ -661,6 +849,13 @@ class DistillJournal:
             "lease_epoch": job.lease_epoch,
             "extraction_attempts": job.extraction_attempts,
             "extraction_lease_epoch": job.extraction_lease_epoch,
+            "local_sink_status": (
+                job.local_sink_status.value
+                if job.local_sink_status is not None
+                else None
+            ),
+            "local_sink_attempts": job.local_sink_attempts,
+            "local_sink_lease_epoch": job.local_sink_lease_epoch,
             "message_count": len(snapshot.messages) if snapshot is not None else 0,
             "byte_count": snapshot.byte_count if snapshot is not None else 0,
             "truncated": snapshot.truncated if snapshot is not None else False,

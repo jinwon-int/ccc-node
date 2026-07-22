@@ -367,8 +367,8 @@ CAPABILITY_AXES: tuple[CapabilityAxis, ...] = (
             "(claude/hooks/distill/resume-write.sh, local-facts.sh)."
         ),
         codex=_unsupported(
-            "A replay-safe owner-only local sink primitive is available, but "
-            "retained extraction results are not yet audience-routed to it.",
+            "The replay-safe writer and independent journal lease state exist, "
+            "but trigger-time audience binding and scheduling are still pending.",
             "#465",
         ),
     ),
