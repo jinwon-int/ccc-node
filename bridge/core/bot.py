@@ -213,6 +213,7 @@ class TelegramBot(
         *,
         user_id: int | None = None,
         chat_id: int | None = None,
+        discriminator: str | None = None,
     ) -> DistillJob | None:
         provider = str(session.get("provider", "claude")).strip().lower()
         thread_id = session.get("session_id")
@@ -234,13 +235,18 @@ class TelegramBot(
             if audience is not None:
                 memory_audience = audience.kind
                 memory_scope = audience.scope
+        enqueue_kwargs = {
+            "provider": "codex",
+            "thread_id": thread_id,
+            "trigger": trigger,
+            "memory_audience": memory_audience,
+            "memory_scope": memory_scope,
+        }
+        if discriminator is not None:
+            enqueue_kwargs["discriminator"] = discriminator
         return await asyncio.to_thread(
             journal.enqueue_once,
-            provider="codex",
-            thread_id=thread_id,
-            trigger=trigger,
-            memory_audience=memory_audience,
-            memory_scope=memory_scope,
+            **enqueue_kwargs,
         )
 
     async def _align_active_provider(
@@ -430,6 +436,7 @@ class TelegramBot(
         self.application.add_handler(CommandHandler("usage", self._cmd_usage))
         self.application.add_handler(CommandHandler("skills", self._cmd_skills))
         self.application.add_handler(CommandHandler("new", self._cmd_new))
+        self.application.add_handler(CommandHandler("distill", self._cmd_distill))
         self.application.add_handler(CommandHandler("model", self._cmd_model))
         self.application.add_handler(CommandHandler("effort", self._cmd_effort))
         self.application.add_handler(CommandHandler("resume", self._cmd_resume))

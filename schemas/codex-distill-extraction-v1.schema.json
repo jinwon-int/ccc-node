@@ -35,7 +35,8 @@
       "enum": [
         "new_command",
         "provider_switch",
-        "auto_new"
+        "auto_new",
+        "explicit"
       ],
       "title": "DistillTrigger",
       "type": "string"

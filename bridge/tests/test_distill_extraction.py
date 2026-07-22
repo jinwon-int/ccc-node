@@ -34,6 +34,13 @@ from telegram_bot.memory.distill_types import (
 
 ROOT = Path(__file__).resolve().parents[2]
 SCHEMA_PATH = ROOT / "schemas" / "codex-distill-extraction-v1.schema.json"
+
+
+def test_explicit_trigger_is_in_checked_in_extraction_schema() -> None:
+    schema = json.loads(SCHEMA_PATH.read_text())
+    assert "explicit" in schema["$defs"]["DistillTrigger"]["enum"]
+
+
 THREAD_HASH = "a" * 64
 
 
