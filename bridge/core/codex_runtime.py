@@ -660,11 +660,15 @@ class CodexRuntime:
         *,
         bounds: TranscriptBounds | None = None,
         now: datetime | None = None,
+        memory_audience: str | None = None,
+        memory_scope: str | None = None,
     ) -> CodexTranscriptSnapshot:
         """Return a strict, read-only and byte-bounded Codex transcript snapshot."""
 
         if not session_id:
             raise ValueError("session id must not be empty")
+        if memory_audience is not None or memory_scope is not None:
+            raise ValueError("direct Codex runtime cannot route an audience snapshot")
         limits = bounds or TranscriptBounds()
         captured = now or datetime.now(timezone.utc)
         if captured.tzinfo is None:

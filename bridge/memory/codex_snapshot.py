@@ -12,7 +12,12 @@ from .distill_types import CodexTranscriptSnapshot, DistillJob, TranscriptBounds
 
 class SnapshotRuntime(Protocol):
     async def read_session_snapshot(
-        self, session_id: str, *, bounds: TranscriptBounds
+        self,
+        session_id: str,
+        *,
+        bounds: TranscriptBounds,
+        memory_audience: str | None = None,
+        memory_scope: str | None = None,
     ) -> CodexTranscriptSnapshot: ...
 
 
@@ -44,9 +49,18 @@ class CodexThreadSnapshotter:
         if claimed is None:
             return await asyncio.to_thread(self._journal.get, job_id)
         try:
-            snapshot = await self._runtime.read_session_snapshot(
-                claimed.thread_id, bounds=self._bounds
-            )
+            if claimed.memory_audience is None:
+                snapshot = await self._runtime.read_session_snapshot(
+                    claimed.thread_id,
+                    bounds=self._bounds,
+                )
+            else:
+                snapshot = await self._runtime.read_session_snapshot(
+                    claimed.thread_id,
+                    bounds=self._bounds,
+                    memory_audience=claimed.memory_audience,
+                    memory_scope=claimed.memory_scope,
+                )
         except ValueError:
             return await asyncio.to_thread(
                 self._journal.mark_terminal_failed,

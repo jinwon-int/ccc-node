@@ -937,3 +937,38 @@ print("COMPOSED-LOCAL-SINK-WORKER-OK")
     )
     assert result.returncode == 0, result.stderr
     assert "COMPOSED-LOCAL-SINK-WORKER-OK" in result.stdout
+
+
+def test_build_context_composes_routed_snapshot_worker(tmp_path):
+    result = _run_probe(
+        """
+import os
+from pathlib import Path
+
+root = Path(os.environ["PROBE_ROOT"])
+(root / "project").mkdir(parents=True, exist_ok=True)
+os.environ["PROJECT_ROOT"] = str(root / "project")
+os.environ["TELEGRAM_BOT_TOKEN"] = "123456:test"
+os.environ["ALLOWED_USER_IDS"] = "1"
+os.environ["CCC_AGENT_PROVIDER"] = "codex"
+os.environ["CCC_BRIDGE_MEMORY_MODE"] = "audience-scoped"
+os.environ["CCC_BRIDGE_MEMORY_AUDIENCE_ROOT"] = str(root / "audiences")
+os.environ["CCC_CODEX_AUDIENCE_AUTH_MODE"] = "keyring"
+
+from telegram_bot.__main__ import build_context, create_app, load_runtime_settings
+from telegram_bot.memory.codex_snapshot import CodexThreadSnapshotter
+
+settings = load_runtime_settings()
+context = build_context(settings)
+worker = context.distill_snapshot_worker
+assert isinstance(worker, CodexThreadSnapshotter), type(worker)
+assert worker._runtime is context.agent_runtime
+assert context.agent_runtime._route_environment_factory is not None
+bot = create_app(context)
+assert bot._distill_snapshot_worker is worker
+print("COMPOSED-ROUTED-SNAPSHOT-WORKER-OK")
+""",
+        probe_root=tmp_path,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "COMPOSED-ROUTED-SNAPSHOT-WORKER-OK" in result.stdout
