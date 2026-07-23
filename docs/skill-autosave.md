@@ -25,7 +25,7 @@ differ per provider. `skill-review/provider.sh` resolves both.
 | Mode / daily cap / off-switch / ledger / rollback | ✅ identical | ✅ identical |
 | Codex-compat screen (rejects `claude -p`, `~/.claude`, `CLAUDE_*`) | n/a | ✅ isolates Claude-only drafts as pending |
 | Secure install dir (0700, no-symlink leaf, fail-closed) | existing dir untouched | ✅ created owner-only |
-| Candidate **drafting/collection** (SessionEnd → draft) | ✅ (`skill-review.sh` + `extract.sh`) | ⏳ follow-up (reuses #465 Codex session-end/journal) |
+| Candidate **drafting/collection** (SessionEnd → draft) | ✅ (`skill-review.sh` + `extract.sh`) | ⏳ collection engine landed (`bridge/memory/skill_candidate.py`); live bridge-runtime wiring is a canary follow-up |
 
 Select the provider explicitly with `CCC_SKILL_PROVIDER=claude|codex`. When
 unset it auto-detects: a node with a Codex home but no `~/.claude` and no
@@ -34,11 +34,20 @@ unset it auto-detects: a node with a Codex home but no `~/.claude` and no
 
 The Codex install pipeline (gates, cap, ledger, rollback, concurrency-safe
 single-runner lock) is complete and covered by
-`claude/hooks/skill-review/codex-autoinstall.test.sh`. The Codex-native
-**drafting** trigger (turning a Codex session/checkpoint into a candidate,
-reusing the #465 distill journal transport with a distinct skill-candidate
-schema) lands in a follow-up so the live bridge-runtime wiring is reviewed and
-canaried on its own.
+`claude/hooks/skill-review/codex-autoinstall.test.sh`.
+
+The Codex-native **collection engine** — `bridge/memory/skill_candidate.py`
+(#667) — is landed too: a `SkillCandidateOutput` schema deliberately **separate**
+from the memory-fact `DistillExtractionOutput` (it reuses only the neutral
+`DistillProvenance`/`DistillTrigger`/snapshot transport), a backend `Protocol`,
+and an idempotent owner-only `SkillCandidateSink` that stages pending-draft dirs
+in the exact contract the installer above consumes. A staged draft installs into
+`CODEX_HOME/skills` end-to-end via `CCC_SKILL_PROVIDER=codex` autoinstall
+(covered by `bridge/tests/test_skill_candidate.py`). What remains is the **live
+bridge-runtime wiring** — a real `codex exec` backend and hooking the collector
+into the Codex session-end/checkpoint triggers + poll loop behind an opt-in
+flag — which lands in a canary-gated follow-up so runtime activation is reviewed
+on its own.
 
 ## Enable the daily sweep
 
