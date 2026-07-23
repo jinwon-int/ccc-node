@@ -25,7 +25,7 @@ differ per provider. `skill-review/provider.sh` resolves both.
 | Mode / daily cap / off-switch / ledger / rollback | ✅ identical | ✅ identical |
 | Codex-compat screen (rejects `claude -p`, `~/.claude`, `CLAUDE_*`) | n/a | ✅ isolates Claude-only drafts as pending |
 | Secure install dir (0700, no-symlink leaf, fail-closed) | existing dir untouched | ✅ created owner-only |
-| Candidate **drafting/collection** (SessionEnd → draft) | ✅ (`skill-review.sh` + `extract.sh`) | ⏳ collection engine landed (`bridge/memory/skill_candidate.py`); live bridge-runtime wiring is a canary follow-up |
+| Candidate **drafting/collection** (SessionEnd → draft) | ✅ (`skill-review.sh` + `extract.sh`) | ⏳ collection engine + real `codex exec` backend landed (`bridge/memory/skill_candidate.py`, `skill_candidate_backend.py`); live loop/trigger wiring is a canary follow-up |
 
 Select the provider explicitly with `CCC_SKILL_PROVIDER=claude|codex`. When
 unset it auto-detects: a node with a Codex home but no `~/.claude` and no
@@ -43,11 +43,15 @@ from the memory-fact `DistillExtractionOutput` (it reuses only the neutral
 and an idempotent owner-only `SkillCandidateSink` that stages pending-draft dirs
 in the exact contract the installer above consumes. A staged draft installs into
 `CODEX_HOME/skills` end-to-end via `CCC_SKILL_PROVIDER=codex` autoinstall
-(covered by `bridge/tests/test_skill_candidate.py`). What remains is the **live
-bridge-runtime wiring** — a real `codex exec` backend and hooking the collector
-into the Codex session-end/checkpoint triggers + poll loop behind an opt-in
-flag — which lands in a canary-gated follow-up so runtime activation is reviewed
-on its own.
+(covered by `bridge/tests/test_skill_candidate.py`). The real `codex exec`
+backend (`CodexExecSkillCandidateBackend`) is landed too — it reuses the
+schema-neutral isolation runner `run_codex_exec` (factored out of the memory
+distill backend, behavior unchanged) with the skill schema/prompt/parser and a
+redacted stdin payload (`bridge/tests/test_skill_candidate_backend.py`). What
+remains is only the **live loop/trigger wiring** — hooking the collector into
+the Codex session-end/checkpoint triggers + a poll loop behind an opt-in flag —
+which lands in a canary-gated follow-up so runtime activation is reviewed on its
+own.
 
 ## Enable the daily sweep
 
