@@ -154,7 +154,12 @@ Safety rails:
   mode. `CCC_AUTONOMY=kill` (or `touch ~/.claude/state/autonomy.kill`) halts all
   autonomous installs; `CCC_AUTONOMY=dry-run` (or `autonomy.dry-run`) gates and
   reports what *would* install (`dry_run:true`, `would_install:[…]`) but writes
-  nothing. Default `active` — existing nodes are unchanged.
+  nothing. Default `active` — existing nodes are unchanged. **The daily sweep
+  honours the same switch**: under `kill` it exits before doing anything — no
+  deterministic scan, no drafting LLM call, no pending-draft staging, no notify
+  (`ccc-skill-autosave.sh status` shows the live `autonomy:` line). `dry-run`
+  and `active` let the sweep run so drafts still stage for human review; the
+  install layer self-guards, so nothing auto-installs under `dry-run`.
 - **Rollback, always**: every install is reversible, individually or in bulk —
   archives to `~/.claude/state/skill-autosave-rollback/`, never deletes, and
   refuses skills without the autosave marker (hand-authored skills are safe):
