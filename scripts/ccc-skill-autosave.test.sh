@@ -134,5 +134,43 @@ ok "installer is idempotent (single line)" '[ "$(grep -c "ccc-node:skill-autosav
 CCC_CRONTAB_CMD="$TMP/bin/fakecrontab" CCC_CLAUDE_DIR="$TMP/claude" bash "$INSTALLER" --remove --apply >/dev/null 2>&1
 ok "installer --remove clears entry" '! grep -q "ccc-node:skill-autosave" "$CRONFILE"'
 
+# --- 7) fleet autonomy guard (#386): kill halts the whole sweep ---------------
+# kill must stop everything BEFORE the deterministic scan runs — no scan, no
+# drafting LLM call, no pending-draft staging — while dry-run/active proceed so
+# drafts still stage for human review (the install layer self-guards).
+STATE3="$TMP/state3"; PROJECTS3="$TMP/projects3"; SPOOL3="$TMP/spool3"
+make_transcript "$PROJECTS3/-root--work/bridge-sess-3.jsonl" 6
+mkdir -p "$STATE3"
+run_autosave3() {
+  CCC_STATE_DIR="$STATE3" CLAUDE_PROJECTS_DIR="$PROJECTS3" CCC_PUSH_SPOOL="$SPOOL3" \
+  CCC_SKILL_REVIEW_CMD="$REVIEW" CCC_SKILL_SCAN_CMD="$SCAN" SCAN_TOUCH="$TMP/scan3.touched" \
+  CLAUDE_SKILLS_DIR="$TMP/skills3" CCC_SKILL_AUTOSAVE_SETTLE_SECONDS=15 \
+  CCC_NODE=testnode "$@" bash "$AUTOSAVE" run
+}
+
+# 7a) kill via env var
+rm -f "$TMP/scan3.touched"
+run_autosave3 env CCC_AUTONOMY=kill; rc=$?
+ok "autonomy=kill exits 0" '[ "$rc" = 0 ]'
+ok "autonomy=kill skips scan" '[ ! -f "$TMP/scan3.touched" ]'
+ok "autonomy=kill stages no draft" '! find "$STATE3/pending-skills" -name SKILL.md 2>/dev/null | grep -q .'
+ok "autonomy=kill logs reason" 'grep -q "reason=autonomy-kill" "$STATE3/skill-autosave.log"'
+
+# 7b) kill via state file
+rm -f "$TMP/scan3.touched"
+touch "$STATE3/autonomy.kill"
+run_autosave3
+ok "autonomy.kill file skips scan" '[ ! -f "$TMP/scan3.touched" ]'
+rm -f "$STATE3/autonomy.kill"
+
+# 7c) dry-run does NOT halt the sweep (drafting/human-gate path still runs)
+rm -f "$TMP/scan3.touched"
+run_autosave3 env CCC_AUTONOMY=dry-run
+ok "autonomy=dry-run still runs the sweep (scan invoked)" '[ -f "$TMP/scan3.touched" ]'
+
+# 7d) status surfaces the autonomy state
+out="$(CCC_STATE_DIR="$STATE3" CCC_AUTONOMY=kill bash "$AUTOSAVE" status 2>&1)"
+ok "status reflects autonomy=kill" 'printf "%s" "$out" | grep -q "^autonomy: kill"'
+
 echo "pass=$pass fail=$fail"
 [ "$fail" = 0 ]

@@ -40,6 +40,22 @@ REVIEW="${CCC_SKILL_REVIEW_CMD:-$CLAUDE_DIR/hooks/skill-review.sh}"
 SCAN="${CCC_SKILL_SCAN_CMD:-$CLAUDE_DIR/skills/skill-suggest/scan.sh}"
 AUTOINSTALL="${CCC_SKILL_AUTOINSTALL_CMD:-$CLAUDE_DIR/hooks/skill-review/autoinstall.sh}"
 
+# Fleet-wide autonomy guard (#386): a single kill-switch/dry-run above every
+# no-approval write. The installed layout keeps the lib under the claude tree;
+# the repo checkout keeps it beside this script's ../claude. Sourced fail-open —
+# a missing lib leaves ccc_autonomy_state undefined and the sweep runs as today.
+AUTOSAVE_SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || echo .)"
+for _autonomy_lib in \
+  "$CLAUDE_DIR/hooks/lib/autonomy-guard.sh" \
+  "$AUTOSAVE_SELF_DIR/../claude/hooks/lib/autonomy-guard.sh"; do
+  if [ -f "$_autonomy_lib" ]; then
+    # shellcheck source=claude/hooks/lib/autonomy-guard.sh
+    . "$_autonomy_lib" 2>/dev/null || true
+    break
+  fi
+done
+unset _autonomy_lib
+
 MAX_SESSIONS="${CCC_SKILL_AUTOSAVE_MAX_SESSIONS:-3}"
 WINDOW_DAYS="${CCC_SKILL_AUTOSAVE_WINDOW_DAYS:-2}"
 # A processed transcript becomes eligible again only after growing by this many
@@ -74,6 +90,7 @@ MODE="${1:-run}"
 if [ "$MODE" = "status" ]; then
   echo "mode: $(resolve_mode) (approve = human gate, auto = machine gate + post-hoc notify)"
   echo "off-switch: $([ -f "$STATE_DIR/skill-autosave.disabled" ] && echo ON || echo off)"
+  echo "autonomy: $(declare -f ccc_autonomy_state >/dev/null 2>&1 && ccc_autonomy_state || echo active) (kill = skip whole sweep, dry-run = draft/report only)"
   echo "pending skill drafts: $(pending_count)"
   echo "candidates report: $(ls -la "$STATE_DIR/skill-candidates.md" 2>/dev/null || echo none)"
   echo "-- ledger (last 5) --";      tail -5 "$LEDGER" 2>/dev/null
@@ -89,6 +106,20 @@ fi
 
 if [ -f "$STATE_DIR/skill-autosave.disabled" ]; then
   log "skip reason=disabled pid=$$"
+  exit 0
+fi
+
+# Fleet-wide autonomy guard (#386). kill halts the whole sweep: no drafting LLM
+# call, no pending-draft staging, no notify — nothing this sweep does is an
+# approved write. dry-run/active proceed here; the install layer (autoinstall)
+# self-guards, so under dry-run drafts still stage for human review but nothing
+# auto-installs. Fail-open: undefined guard (missing lib) => active.
+AUTONOMY_STATE="active"
+if declare -f ccc_autonomy_state >/dev/null 2>&1; then
+  AUTONOMY_STATE="$(ccc_autonomy_state 2>/dev/null || echo active)"
+fi
+if [ "$AUTONOMY_STATE" = "kill" ]; then
+  log "skip reason=autonomy-kill pid=$$"
   exit 0
 fi
 
