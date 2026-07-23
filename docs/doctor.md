@@ -59,6 +59,21 @@ command payloads, executable/credential paths, auth JSON, tokens, and account
 identity are never included in diagnostics. Missing/non-executable binaries,
 timeouts, unauthenticated or malformed output, and probe exceptions produce
 stable redacted `수동필요` rows, `readiness: failed`, and a nonzero exit.
+
+On a Codex node, doctor also diagnoses the **repo-shipped managed Codex skills**
+(#647) via the read-only `ccc_codex_skills.py plan` contract, body-free:
+
+- Missing or outdated managed skills are `교정가능` — reinstall with `setup.sh`.
+- A drifted managed skill or a user skill that name-collides with a managed one
+  is `교정가능` (drift restore / rename), never a silent overwrite.
+- An unsafe `CODEX_HOME`/skill layout (not owner-only `0700`, or a symlink) is a
+  `수동필요` blocker with a fix action.
+
+These findings are **independent of readiness**: dormant Claude-only harness
+assets (outputStyle/statusLine/hook/overlay drift) on a Codex node stay
+`교정가능`/`정상` and never block the Codex readiness verdict, and unprovisioned
+managed skills are correctable rather than a readiness failure.
+
 Human output adds `provider` and `readiness` headers. `--json` carries the same
 diagnostic information with additive `provider`, `readiness`, `counts`, and
 `rows` fields.
