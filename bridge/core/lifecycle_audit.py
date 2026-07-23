@@ -21,6 +21,7 @@ import threading
 from typing import Iterator
 
 from telegram_bot.core.lifecycle_observation import (
+    LifecycleEventType,
     LifecycleObservation,
     normalize_agent_event,
 )
@@ -121,19 +122,58 @@ class LifecycleObserver:
     swallowed so observability can never break a turn.
     """
 
+    _MAX_TRACKED_SESSIONS = 256
+
     def __init__(self, ledger: LifecycleAuditLedger, *, provider: str) -> None:
         self._ledger = ledger
         self._provider = provider
+        # Per-session running evidence tally for the in-flight turn:
+        # session_ref -> [file_changes, verifications]. Reset on turn completion.
+        self._turn_evidence: dict[str, list[int]] = {}
 
     def observe(self, event: object, *, session_id: object) -> None:
         try:
             observation = normalize_agent_event(
                 provider=self._provider, session_id=session_id, event=event
             )
-            if observation is not None:
-                self._ledger.record(observation)
+            if observation is None:
+                return
+            self._ledger.record(observation)
+            self._surface_evidence(observation)
         except Exception as exc:  # fail-open: never break the turn
             logger.warning("lifecycle observe failed (continuing): %s", exc)
+
+    def _surface_evidence(self, observation: LifecycleObservation) -> None:
+        """Track evidence per turn; on turn completion, record a body-free
+        warning when files changed with no verification action (#645). This only
+        appends a warning observation — it never blocks the turn or re-prompts,
+        so there is no stop loop."""
+
+        session_ref = observation.session_ref
+        if not session_ref:
+            return
+        if observation.event is LifecycleEventType.TOOL_COMPLETED:
+            tally = self._turn_evidence.get(session_ref)
+            if tally is None:
+                if len(self._turn_evidence) >= self._MAX_TRACKED_SESSIONS:
+                    self._turn_evidence.clear()  # bound memory; a rare reset only drops in-flight tallies
+                tally = self._turn_evidence.setdefault(session_ref, [0, 0])
+            tally[0] += 1 if observation.file_change else 0
+            tally[1] += 1 if observation.verification else 0
+        elif observation.event is LifecycleEventType.TURN_COMPLETED:
+            file_changes, verifications = self._turn_evidence.pop(session_ref, [0, 0])
+            if file_changes > 0 and verifications == 0:
+                self._ledger.record(
+                    LifecycleObservation(
+                        event=LifecycleEventType.PROVIDER_NOTIFICATION,
+                        provider=self._provider,
+                        session_ref=session_ref,
+                        turn_ref=observation.turn_ref,
+                        flag="evidence-missing",
+                        file_change=True,
+                        correlation=observation.correlation,
+                    )
+                )
 
 
 def build_lifecycle_observer(config: object) -> "LifecycleObserver | None":
