@@ -1,0 +1,4 @@
+interface:
+  display_name: "CCC Security Audit"
+  short_description: "Run the read-only ccc-node security audit"
+  default_prompt: "Use $ccc-security-audit to assess this node without exposing secrets or changing state."

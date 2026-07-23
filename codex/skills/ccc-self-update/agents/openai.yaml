@@ -1,0 +1,4 @@
+interface:
+  display_name: "CCC Self Update"
+  short_description: "Preview and safely apply ccc-node harness updates"
+  default_prompt: "Use $ccc-self-update to check ccc-node drift and propose a rollback-safe update."

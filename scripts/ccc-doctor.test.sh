@@ -203,7 +203,10 @@ ok "missing settings fails closed instead of claiming repairable" '[ "$rc" = 1 ]
 
 # Keep every human-mode Codex failure probe paired with a JSON non-disclosure assertion.
 claude_default="$(make_fixture claude-default standalone)"
-out_default="$(run_doctor "$claude_default")"; rc_default=$?
+out_default="$(env -u CCC_AGENT_PROVIDER \
+  CCC_DOCTOR_REPO_DIR="$claude_default/repo" \
+  CCC_DOCTOR_CLAUDE_DIR="$claude_default/home/.claude" \
+  bash "$DOCTOR")"; rc_default=$?
 out_claude="$(CCC_AGENT_PROVIDER=claude run_doctor "$claude_default")"; rc_claude=$?
 ok "explicit Claude provider preserves default behavior" '[ "$rc_default" = 0 ] && [ "$rc_claude" = 0 ] && [ "$out_default" = "$out_claude" ]'
 ok "Claude human output reports provider without a Codex probe" 'grep -q "provider.*claude" <<<"$out_claude" && grep -q "readiness.*not-applicable" <<<"$out_claude"'

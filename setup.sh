@@ -610,6 +610,20 @@ warn_placeholder_residue
 run python3 "$SRC/scripts/ccc_codex_github_policy.py" apply --codex-home "$CODEX_DIR"
 note "Codex GitHub transport pinned to local gh CLI (plugin disabled)"
 
+# Repo-shipped Codex skills are installed through a separate fail-closed
+# transaction. The provisioner preflights every target before mutating any,
+# distinguishes ccc-managed provenance from user-authored skills, and rolls the
+# whole set back on a partial update. Plan mode is genuinely read-only and
+# reports only skill names/actions, never skill bodies.
+if [ "$DRY" = 1 ]; then
+  python3 "$SRC/scripts/ccc_codex_skills.py" plan \
+    --repo-root "$SRC" --codex-home "$CODEX_DIR"
+else
+  python3 "$SRC/scripts/ccc_codex_skills.py" apply \
+    --repo-root "$SRC" --codex-home "$CODEX_DIR"
+fi
+note "Codex managed skills reconciled from compatibility catalog"
+
 cat <<'EOF'
 
 ==> Done. Follow-up checklist (do these manually):
@@ -649,6 +663,7 @@ printf '  - CCC_BRIDGE_DEFAULT_PATH=%s\n' "$BRIDGE_DEFAULT_PATH"
 printf '  - CCC_CODEX_CLI_PATH=%s/hooks/ccc-codex\n' "$CLAUDE_DIR"
 printf '  - CCC_CODEX_MEMORY_MATERIALIZER_PATH=%s/hooks/ccc_codex_memory.py\n' "$CLAUDE_DIR"
 printf '  - CODEX_HOME=%s (GitHub plugin disabled; gh CLI-first)\n' "$CODEX_DIR"
+printf '  - Codex managed skills=%s/skills/ccc-* (catalog: codex/compatibility.json)\n' "$CODEX_DIR"
 printf '  - bridge command=./start.sh --path %s -d\n' "$BRIDGE_DEFAULT_PATH"
 
 SETUP_TXN_ACTIVE=0

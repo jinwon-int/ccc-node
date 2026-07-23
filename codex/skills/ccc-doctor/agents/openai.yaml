@@ -1,0 +1,4 @@
+interface:
+  display_name: "CCC Doctor"
+  short_description: "Diagnose provider-aware ccc-node harness drift"
+  default_prompt: "Use $ccc-doctor to diagnose this ccc-node harness and summarize safe next actions."

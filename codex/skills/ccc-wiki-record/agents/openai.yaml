@@ -1,0 +1,4 @@
+interface:
+  display_name: "CCC Wiki Record"
+  short_description: "Record durable Family Wiki knowledge through PRs"
+  default_prompt: "Use $ccc-wiki-record to record this durable decision in the Family Wiki through a reviewable PR."

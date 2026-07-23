@@ -1,0 +1,106 @@
+{
+  "schema_version": 1,
+  "classifications": [
+    {
+      "pattern": "claude/commands/a2a-claim.md",
+      "compatibility": "claude-only",
+      "reason": "Claude sub-agent roster and command runtime"
+    },
+    {
+      "pattern": "claude/commands/agent-cron.md",
+      "compatibility": "adapted",
+      "codex_skill": "ccc-agent-cron"
+    },
+    {
+      "pattern": "claude/commands/doctor.md",
+      "compatibility": "adapted",
+      "codex_skill": "ccc-doctor"
+    },
+    {
+      "pattern": "claude/commands/learn-skill.md",
+      "compatibility": "claude-only",
+      "reason": "Claude transcript and pending-skill contract; tracked by issue 643"
+    },
+    {
+      "pattern": "claude/commands/node-status.md",
+      "compatibility": "adapted",
+      "codex_skill": "ccc-node-status"
+    },
+    {
+      "pattern": "claude/commands/security-audit.md",
+      "compatibility": "adapted",
+      "codex_skill": "ccc-security-audit"
+    },
+    {
+      "pattern": "claude/commands/wiki-log.md",
+      "compatibility": "adapted",
+      "codex_skill": "ccc-wiki-record"
+    },
+    {
+      "pattern": "claude/skills/distill/**",
+      "compatibility": "claude-only",
+      "reason": "Claude hook and transcript pipeline"
+    },
+    {
+      "pattern": "claude/skills/gh-pr-flow/**",
+      "compatibility": "claude-only",
+      "reason": "Claude-local privileged review helpers"
+    },
+    {
+      "pattern": "claude/skills/mcp-add/**",
+      "compatibility": "claude-only",
+      "reason": "Claude MCP registration and settings contract"
+    },
+    {
+      "pattern": "claude/skills/self-update/**",
+      "compatibility": "adapted",
+      "codex_skill": "ccc-self-update"
+    },
+    {
+      "pattern": "claude/skills/skill-suggest/**",
+      "compatibility": "claude-only",
+      "reason": "Claude transcript autosave contract; tracked by issue 643"
+    },
+    {
+      "pattern": "claude/skills/wiki-record/**",
+      "compatibility": "adapted",
+      "codex_skill": "ccc-wiki-record"
+    },
+    {
+      "pattern": "claude/agents/**",
+      "compatibility": "claude-only",
+      "reason": "Claude native sub-agent definitions"
+    },
+    {
+      "pattern": "claude/hooks/**",
+      "compatibility": "claude-only",
+      "reason": "Claude native lifecycle hooks and hook tests"
+    }
+  ],
+  "managed_skills": [
+    {
+      "name": "ccc-agent-cron",
+      "source": "codex/skills/ccc-agent-cron"
+    },
+    {
+      "name": "ccc-doctor",
+      "source": "codex/skills/ccc-doctor"
+    },
+    {
+      "name": "ccc-node-status",
+      "source": "codex/skills/ccc-node-status"
+    },
+    {
+      "name": "ccc-security-audit",
+      "source": "codex/skills/ccc-security-audit"
+    },
+    {
+      "name": "ccc-self-update",
+      "source": "codex/skills/ccc-self-update"
+    },
+    {
+      "name": "ccc-wiki-record",
+      "source": "codex/skills/ccc-wiki-record"
+    }
+  ]
+}
