@@ -54,9 +54,11 @@ deduped). Default off; the tap is fail-open and never blocks a turn.
 
 ## Scope / follow-ups (canary-gated)
 
-- **Claude hook-payload parity**: feeding real Claude hook stdin
-  (`prompt_submitted`/`session_closed`) into the normalizer + ledger (the live
-  observer currently records the provider-neutral AgentEvents only).
+- **Claude hook-payload parity**: `python3 -m telegram_bot.core.lifecycle_hook
+  <event>` reads a Claude hook's stdin JSON, normalizes it, and records to the
+  ledger (fail-open, exit 0, no-op unless `CCC_LIFECYCLE_AUDIT`). This gives the
+  Claude path a feed for hook-only events (`prompt_submitted`/`session_closed`);
+  wiring the bash hooks to pipe into it is the operator's opt-in step.
 - **Evidence-gate detection landed** (body-free): each `tool_completed`
   observation carries `file_change` / `verification` booleans (computed from the
   command, which is never stored), and `evidence_gate(observations)` returns a
