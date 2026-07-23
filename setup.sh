@@ -663,7 +663,7 @@ printf '  - CCC_BRIDGE_DEFAULT_PATH=%s\n' "$BRIDGE_DEFAULT_PATH"
 printf '  - CCC_CODEX_CLI_PATH=%s/hooks/ccc-codex\n' "$CLAUDE_DIR"
 printf '  - CCC_CODEX_MEMORY_MATERIALIZER_PATH=%s/hooks/ccc_codex_memory.py\n' "$CLAUDE_DIR"
 printf '  - CODEX_HOME=%s (GitHub plugin disabled; gh CLI-first)\n' "$CODEX_DIR"
-printf '  - Codex managed skills=%s/skills/ccc-* (catalog: codex/compatibility.json)\n' "$CODEX_DIR"
+printf '  - Codex managed skills=%s/skills (catalog: codex/compatibility.json)\n' "$CODEX_DIR"
 printf '  - bridge command=./start.sh --path %s -d\n' "$BRIDGE_DEFAULT_PATH"
 
 SETUP_TXN_ACTIVE=0

@@ -254,6 +254,7 @@ for t in claude/hooks/observability.test.sh claude/hooks/security-scan.test.sh \
          codex/headless.test.sh \
          scripts/install-skill-autosave-cron.test.sh \
          scripts/gh-pr-flow-seoseo-review.test.sh \
+         scripts/gh-pr-flow-seoseo-ai.test.sh \
          scripts/ccc-service-control.test.sh \
          scripts/ccc-broker-reconcile.test.sh; do
   [ -f "$t" ] || { err "missing test: $t"; continue; }

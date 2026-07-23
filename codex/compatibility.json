@@ -43,8 +43,8 @@
     },
     {
       "pattern": "claude/skills/gh-pr-flow/**",
-      "compatibility": "claude-only",
-      "reason": "Claude-local privileged review helpers"
+      "compatibility": "adapted",
+      "codex_skill": "gh-pr-flow"
     },
     {
       "pattern": "claude/skills/mcp-add/**",
@@ -101,6 +101,10 @@
     {
       "name": "ccc-wiki-record",
       "source": "codex/skills/ccc-wiki-record"
+    },
+    {
+      "name": "gh-pr-flow",
+      "source": "codex/skills/gh-pr-flow"
     }
   ]
 }
