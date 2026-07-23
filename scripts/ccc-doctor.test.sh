@@ -81,6 +81,27 @@ EOF
   chmod +x "$dir/bin/codex"
 }
 
+# Provision the repo-shipped managed Codex skills into a fixture (#647) so the
+# doctor's managed-skill diagnostics see a fully set-up Codex node.
+provision_codex_skills() { # <fixture-dir>
+  local dir="$1"
+  mkdir -p "$dir/repo/scripts"
+  # CODEX_HOME must be owner-only 0700 (managed-skill safety contract).
+  mkdir -p "$dir/home/.codex"; chmod 700 "$dir/home/.codex"
+  # The compatibility catalog classifies the full claude/ + codex/ asset roots,
+  # so the provisioner needs them present to validate; overlay the real trees.
+  cp -r "$ROOT/claude/." "$dir/repo/claude/"
+  cp -r "$ROOT/codex" "$dir/repo/codex"
+  cp "$ROOT/scripts/ccc_codex_skills.py" "$dir/repo/scripts/ccc_codex_skills.py"
+  python3 "$dir/repo/scripts/ccc_codex_skills.py" apply \
+    --repo-root "$dir/repo" --codex-home "$dir/home/.codex" >/dev/null
+}
+
+# Hermetic empty CODEX_HOME default so Codex managed-skill diagnostics never
+# read the runner's real ~/.codex. Provisioned fixtures override it.
+export CODEX_HOME="$TMP/codex-empty-home"
+mkdir -p "$TMP/codex-empty-home"; chmod 700 "$TMP/codex-empty-home"
+
 clean="$(make_fixture clean standalone)"
 out="$(run_doctor "$clean")"; rc=$?
 ok "clean standalone exits 0" '[ "$rc" = 0 ]'
@@ -232,8 +253,13 @@ ok "Codex probe timeout is bounded and fail-closed" '[ "$rc" = 1 ] && grep -q "C
 
 codex_auth="$(make_fixture codex-auth standalone)"
 make_fake_codex "$codex_auth"
+provision_codex_skills "$codex_auth"
+export CODEX_HOME="$codex_auth/home/.codex"
 out="$(FAKE_CODEX_MODE=authenticated CCC_AGENT_PROVIDER=codex CCC_CODEX_CLI_PATH="$codex_auth/bin/codex" run_doctor "$codex_auth")"; rc=$?
 ok "authenticated Codex readiness succeeds" '[ "$rc" = 0 ] && grep -q "provider.*codex" <<<"$out" && grep -q "readiness.*ready" <<<"$out" && grep -q "Codex login.*authenticated" <<<"$out"'
+ok "provisioned managed Codex skills report up to date" 'grep -q "정상.*managed Codex skills.*up to date" <<<"$out"'
+out_unprov="$(FAKE_CODEX_MODE=authenticated CCC_AGENT_PROVIDER=codex CCC_CODEX_CLI_PATH="$codex_auth/bin/codex" CODEX_HOME="$TMP/codex-empty-home" run_doctor "$codex_auth")"; rc_unprov=$?
+ok "unprovisioned managed Codex skills are correctable, not a blocker" '[ "$rc_unprov" = 1 ] && grep -q "교정가능.*managed Codex skills.*provision" <<<"$out_unprov" && grep -q "readiness.*ready" <<<"$out_unprov"'
 
 out="$(FAKE_CODEX_MODE=unauthenticated CCC_AGENT_PROVIDER=codex CCC_CODEX_CLI_PATH="$codex_auth/bin/codex" run_doctor "$codex_auth" 2>&1)"; rc=$?
 ok "unauthenticated Codex readiness fails closed" '[ "$rc" = 1 ] && grep -q "Codex login.*not authenticated" <<<"$out"'

@@ -188,6 +188,11 @@ class Doctor:
         self.check_bridge_status()
         self.check_memory_cache()
         self.check_provider_readiness()
+        # Managed Codex skills are provider-native (#647): diagnose them only on
+        # a Codex node. Claude-only asset findings above stay non-readiness
+        # (교정가능/정상), so they never block a Codex node's readiness.
+        if self.provider == "codex":
+            self.check_codex_managed_skills()
 
     def codex_probe_timeout(self) -> float:
         value = os.environ.get("CCC_CODEX_READINESS_TIMEOUT", "")
@@ -234,6 +239,83 @@ class Doctor:
     def fail_codex_readiness(self, item: str, status: str, action: str) -> None:
         self.readiness = "failed"
         self.add("수동필요", item, status, action)
+
+    def check_codex_managed_skills(self) -> None:
+        """Diagnose repo-shipped managed Codex skills (#647), body-free.
+
+        Reuses the read-only ``ccc_codex_skills.py plan`` contract so the doctor
+        and the provisioner agree on CODEX_HOME safety, managed-skill presence,
+        drift, and user-skill collisions. Never writes.
+        """
+        tool = self.repo / "scripts" / "ccc_codex_skills.py"
+        if not tool.is_file():
+            self.add(
+                "교정가능",
+                "managed Codex skills",
+                "provisioning tool missing",
+                "reinstall ccc-node from the repo",
+            )
+            return
+        codex_home = Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex"))
+        try:
+            proc = subprocess.run(
+                [
+                    sys.executable, str(tool), "plan",
+                    "--repo-root", str(self.repo),
+                    "--codex-home", str(codex_home),
+                ],
+                text=True, capture_output=True,
+                timeout=self.codex_probe_timeout(), check=False,
+            )
+        except subprocess.TimeoutExpired:
+            self.add("수동필요", "managed Codex skills", "plan timed out", "rerun ccc-doctor")
+            return
+        except Exception:
+            self.add("수동필요", "managed Codex skills", "plan failed", "rerun ccc-doctor")
+            return
+
+        if proc.returncode == 0:
+            try:
+                data = json.loads(proc.stdout)
+            except ValueError:
+                self.add("수동필요", "managed Codex skills", "malformed plan output", "rerun ccc-doctor")
+                return
+            skills = data.get("skills") or []
+            pending = [s for s in skills if s.get("status") in ("create", "update")]
+            if not pending:
+                self.add("정상", "managed Codex skills", f"{len(skills)} installed, up to date", "none")
+            else:
+                names = ",".join(sorted(str(s.get("name", "?")) for s in pending))
+                self.add(
+                    "교정가능",
+                    "managed Codex skills",
+                    f"{len(pending)}/{len(skills)} to provision or update ({names})",
+                    "run setup.sh from the repo to install managed Codex skills",
+                )
+            return
+
+        stderr = (proc.stderr or "").strip()
+        code = stderr.split()[-1] if stderr else "plan-error"
+        if code in ("unsafe_codex_home", "unsafe_target"):
+            self.add(
+                "수동필요", "managed Codex skills", f"unsafe layout ({code})",
+                "fix CODEX_HOME/skills to owner-only 0700 with no symlink, then rerun",
+            )
+        elif code == "unmanaged_collision":
+            self.add(
+                "교정가능", "managed Codex skills", "user skill name-collides with a managed skill",
+                "rename the conflicting user skill, then run setup.sh",
+            )
+        elif code == "managed_drift":
+            self.add(
+                "교정가능", "managed Codex skills", "managed skill drifted",
+                "run setup.sh from the repo to restore managed Codex skills",
+            )
+        else:
+            self.add(
+                "수동필요", "managed Codex skills", f"plan failed ({code})",
+                "run scripts/ccc_codex_skills.py plan manually to inspect",
+            )
 
     def check_provider_readiness(self) -> None:
         if self.provider == "claude":
