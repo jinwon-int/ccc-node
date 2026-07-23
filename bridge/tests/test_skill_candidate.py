@@ -35,6 +35,32 @@ from telegram_bot.memory.skill_candidate import (
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 AUTOINSTALL = REPO_ROOT / "claude" / "hooks" / "skill-review" / "autoinstall.sh"
+SKILL_SCHEMA = REPO_ROOT / "schemas" / "codex-skill-candidate-v1.schema.json"
+
+
+def _object_nodes(node: object):
+    if isinstance(node, dict):
+        if node.get("type") == "object" and "properties" in node:
+            yield node
+        for value in node.values():
+            yield from _object_nodes(value)
+    elif isinstance(node, list):
+        for value in node:
+            yield from _object_nodes(value)
+
+
+def test_schema_is_openai_strict_mode_complete() -> None:
+    # Codex `--output-schema` uses OpenAI structured output, which rejects a
+    # schema unless every object lists EVERY property key in `required` (a 400
+    # invalid_json_schema otherwise). This guards the whole schema so a new
+    # optional-looking field can't silently break the real codex backend — the
+    # canary failure that CI's stub backend could not catch.
+    schema = json.loads(SKILL_SCHEMA.read_text())
+    for obj in _object_nodes(schema):
+        properties = set(obj["properties"])
+        required = set(obj.get("required", []))
+        missing = properties - required
+        assert not missing, f"schema object missing from required: {sorted(missing)}"
 THREAD_HASH = hashlib.sha256(b"thread-667").hexdigest()
 JOB_ID = "c" * 64
 
