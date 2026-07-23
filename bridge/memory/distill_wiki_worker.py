@@ -9,7 +9,7 @@ import secrets
 
 from .distill_extraction import parse_extraction_output
 from .distill_journal import DistillJournal
-from .distill_types import DistillJob
+from .distill_types import DistillJob, validate_memory_route
 from .distill_wiki_sink import (
     CodexWikiCandidateSink,
     WikiCandidateCollisionError,
@@ -27,9 +27,12 @@ class CodexDistillWikiSinkWorker:
         owner_token: str | None = None,
         lease_seconds: int = 300,
         max_attempts: int = 5,
+        require_memory_route: bool = False,
     ) -> None:
         if lease_seconds <= 0 or max_attempts <= 0:
             raise ValueError("invalid Wiki sink worker lease configuration")
+        if not isinstance(require_memory_route, bool):
+            raise ValueError("require_memory_route must be a bool")
         self._journal = journal
         self._sink = CodexWikiCandidateSink(
             Path(os.path.abspath(os.fspath(queue_dir)))
@@ -37,6 +40,17 @@ class CodexDistillWikiSinkWorker:
         self._owner_token = owner_token or secrets.token_hex(16)
         self._lease_seconds = lease_seconds
         self._max_attempts = max_attempts
+        self._require_memory_route = require_memory_route
+
+    def _sink_for(self, job: DistillJob) -> CodexWikiCandidateSink:
+        validate_memory_route(job.memory_audience, job.memory_scope)
+        if job.memory_scope is None:
+            return self._sink
+        return CodexWikiCandidateSink(
+            self._sink.queue_dir / job.memory_scope,
+            memory_audience=job.memory_audience,
+            memory_scope=job.memory_scope,
+        )
 
     async def _fail(
         self,
@@ -69,6 +83,12 @@ class CodexDistillWikiSinkWorker:
         if claimed is None:
             return await asyncio.to_thread(self._journal.get, job_id)
         try:
+            if self._require_memory_route and claimed.memory_scope is None:
+                return await self._fail(
+                    claimed,
+                    error_code="wiki_sink_route_missing",
+                    terminal=True,
+                )
             if claimed.extraction_output is None:
                 return await self._fail(
                     claimed,
@@ -79,8 +99,9 @@ class CodexDistillWikiSinkWorker:
                 claimed.extraction_output,
                 wiki_enabled=True,
             )
+            sink = self._sink_for(claimed)
             await asyncio.to_thread(
-                self._sink.write,
+                sink.write,
                 output,
                 job_id=claimed.job_id,
             )

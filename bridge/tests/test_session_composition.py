@@ -1013,7 +1013,7 @@ print("COMPOSED-HONCHO-SINK-WORKER-OK")
     assert "COMPOSED-HONCHO-SINK-WORKER-OK" in result.stdout
 
 
-def test_audience_memory_disables_unscoped_external_distill_sinks(tmp_path):
+def test_audience_memory_composes_scoped_wiki_queue_but_disables_honcho(tmp_path):
     result = _run_probe(
         """
 import os
@@ -1038,16 +1038,20 @@ from telegram_bot.__main__ import build_context, load_runtime_settings
 
 context = build_context(load_runtime_settings())
 assert context.distill_local_sink_worker is not None
-assert context.distill_wiki_sink_worker is None
+assert context.distill_wiki_sink_worker is not None
+assert context.distill_wiki_sink_worker._sink.queue_dir == (
+    context.settings.bot_data_dir / "wiki-candidates"
+)
+assert context.distill_wiki_sink_worker._require_memory_route is True
 assert context.distill_honcho_sink_worker is None
-assert context.distill_extraction_worker._wiki_enabled is False
+assert context.distill_extraction_worker._wiki_enabled is True
 assert context.distill_extraction_worker._honcho_enabled is False
-print("AUDIENCE-GLOBAL-SINKS-DISABLED-OK")
+print("AUDIENCE-SCOPED-WIKI-QUEUE-OK")
 """,
         probe_root=tmp_path,
     )
     assert result.returncode == 0, result.stderr
-    assert "AUDIENCE-GLOBAL-SINKS-DISABLED-OK" in result.stdout
+    assert "AUDIENCE-SCOPED-WIKI-QUEUE-OK" in result.stdout
 
 
 def test_build_context_composes_routed_snapshot_worker(tmp_path):

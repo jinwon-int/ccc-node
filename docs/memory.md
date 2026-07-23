@@ -16,7 +16,7 @@ ccc-node memory starts from a no-network SessionStart snapshot and refreshes cac
 - `CCC_WIKI_MEMORY_ENABLED=0` disables the Family Wiki read and write path: no cache injection, refresh, local indexing, distill candidate generation, or Wiki queue writes. Existing cache files are ignored and removed from the local index on its next update/rebuild. An external isolation profile overrides an attempted `=1`.
 - `CCC_MEMORY_USER_LABEL` and `CCC_MEMORY_ASSISTANT_LABEL` set the node-local relationship labels used by memory injection and distill. Defaults preserve the existing Seoyoon fleet behavior.
 - `CCC_HONCHO_MEMORY_ENABLED=0` disables the Honcho read and Codex write-back path. A node may therefore run built-in/local memory only, Honcho without Wiki, or the default combined profile. `CCC_HONCHO_CFG` selects the owner-only endpoint/credential config (default `~/.hermes/honcho.json`).
-- `CCC_BRIDGE_MEMORY_MODE=audience-scoped` always overrides both global external-memory flags to disabled for that runtime. Until Honcho has a physically separate workspace/session retrieval boundary and Wiki candidates have an audience-labelled queue contract, Codex extraction cannot generate or deliver either sink and composes only the opaque audience-local sink. This is fail-closed: setting `CCC_HONCHO_MEMORY_ENABLED=1` or `CCC_WIKI_MEMORY_ENABLED=1` does not opt a private DM back into an unscoped sink.
+- `CCC_BRIDGE_MEMORY_MODE=audience-scoped` always disables the global Honcho path until Honcho has a physically separate workspace/session retrieval boundary. When Wiki memory is enabled, Codex may generate human-review candidates, but the bridge partitions them under an opaque audience scope and labels every record with its `private` or `shared` audience. No candidate is sent to Family Wiki automatically. Setting `CCC_HONCHO_MEMORY_ENABLED=1` cannot opt a private DM back into an unscoped Honcho sink, and `CCC_WIKI_MEMORY_ENABLED=0` still disables Wiki candidate generation entirely.
 
 ## Codex global snapshot materializer
 
@@ -99,9 +99,14 @@ before claim/provider execution without blocking interactive turns.
   local/resume, and Wiki-candidate workers from the durable journal. Session reset,
   explicit, opt-in checkpoint, and bounded shutdown triggers are supported. The
   Wiki worker is composed only when the fleet Wiki policy is enabled and writes one
-  immutable owner-only record per job under
-  `${BOT_DATA_DIR}/wiki-candidates/<job-id>.json`. Records contain only the strict
-  candidate fields plus hashed provenance and remain `review_status=pending`; this
+  immutable owner-only record per job. Legacy unscoped jobs remain under
+  `${BOT_DATA_DIR}/wiki-candidates/<job-id>.json`; audience-routed jobs are physically
+  partitioned under `${BOT_DATA_DIR}/wiki-candidates/<opaque-scope>/<job-id>.json`
+  and contain explicit `memory_audience` and opaque `memory_scope` labels. Records
+  otherwise contain only the strict candidate fields plus hashed provenance and
+  remain `review_status=pending`; raw Telegram identities are never serialized. In
+  audience-scoped mode, the worker fails closed on a legacy job with no route instead
+  of placing it in the global queue. This
   path never invokes `wiki-agent`, writes a Wiki page, creates a branch/PR, or merges.
   Empty candidate sets complete without a queue record. Honcho routing remains under
   an independent lease: validated facts first enter the owner-only

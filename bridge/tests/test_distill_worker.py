@@ -85,11 +85,15 @@ def snapshot_done_job(
     *,
     thread_id: str = "thread-532",
     text: str = "harmless durable fact",
+    memory_audience: str | None = None,
+    memory_scope: str | None = None,
 ) -> DistillJob:
     queued = journal.enqueue_once(
         provider="codex",
         thread_id=thread_id,
         trigger=DistillTrigger.NEW_COMMAND,
+        memory_audience=memory_audience,
+        memory_scope=memory_scope,
     )
     claimed = journal.claim(
         queued.job_id,
