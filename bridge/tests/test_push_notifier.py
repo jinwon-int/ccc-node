@@ -102,6 +102,48 @@ class DrainTests(unittest.TestCase):
             self.assertFalse((spool / "a.json").exists())
             self.assertTrue((sent / "a.json").exists())
 
+    def test_record_chat_id_delivers_to_allowlisted_chat(self):
+        with TemporaryDirectory() as td, patch.object(
+            pn, "config", _cfg(push_notify_allowed_chats=["-1001234567890"])
+        ):
+            spool = Path(td)
+            sent = spool / "sent"
+            sent.mkdir()
+            (spool / "a.json").write_text(
+                json.dumps(
+                    {"ts": "T", "event": "AgentCronRun", "node": "n",
+                     "text": "weekly report", "chatId": "-1001234567890"}
+                ),
+                encoding="utf-8",
+            )
+            n = PushNotifier()
+            n.spool_dir = spool
+            app = SimpleNamespace(bot=AsyncMock())
+            asyncio.run(n._drain(app, 555, sent))  # owner target 555 is overridden
+            app.bot.send_message.assert_awaited_once()
+            self.assertEqual(app.bot.send_message.await_args.kwargs["chat_id"], -1001234567890)
+
+    def test_record_chat_id_not_allowlisted_is_dropped(self):
+        with TemporaryDirectory() as td, patch.object(pn, "config", _cfg()):
+            spool = Path(td)
+            sent = spool / "sent"
+            sent.mkdir()
+            (spool / "a.json").write_text(
+                json.dumps(
+                    {"ts": "T", "event": "AgentCronRun", "node": "n",
+                     "text": "leak attempt", "chatId": "-1009999999999"}
+                ),
+                encoding="utf-8",
+            )
+            n = PushNotifier()
+            n.spool_dir = spool
+            app = SimpleNamespace(bot=AsyncMock())
+            asyncio.run(n._drain(app, 555, sent))
+            # Never sent to a non-allowlisted chat; archived so it is not retried.
+            app.bot.send_message.assert_not_called()
+            self.assertFalse((spool / "a.json").exists())
+            self.assertTrue((sent / "a.json").exists())
+
     def test_dedup_skips_duplicate(self):
         with TemporaryDirectory() as td, patch.object(pn, "config", _cfg()):
             spool = Path(td)

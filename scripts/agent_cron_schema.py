@@ -119,6 +119,33 @@ def _validate_array(value: list[Any], schema: dict[str, Any], path: str) -> list
     return errors
 
 
+def _matches(value: object, schema: dict[str, Any]) -> bool:
+    """True when ``value`` satisfies ``schema`` (used for the ``if`` keyword)."""
+
+    return not _validate_node(value, schema, "")
+
+
+def _validate_conditionals(value: object, schema: dict[str, Any], path: str) -> list[str]:
+    """Minimal draft-2020-12 ``allOf`` + ``if``/``then``/``else`` support.
+
+    Only the shapes the checked-in schema uses (a property ``enum`` guard in
+    ``if`` selecting a ``required`` list in ``then``) need to be honored so the
+    JSON Schema stays the source of truth.
+    """
+
+    errors: list[str] = []
+    for sub in schema.get("allOf", []) or []:
+        if isinstance(sub, dict):
+            errors.extend(_validate_node(value, sub, path))
+    condition = schema.get("if")
+    if isinstance(condition, dict):
+        branch = "then" if _matches(value, condition) else "else"
+        sub = schema.get(branch)
+        if isinstance(sub, dict):
+            errors.extend(_validate_node(value, sub, path))
+    return errors
+
+
 def _validate_node(value: object, schema: dict[str, Any], path: str) -> list[str]:
     type_errors = _validate_type(value, schema, path)
     if type_errors:
@@ -128,6 +155,7 @@ def _validate_node(value: object, schema: dict[str, Any], path: str) -> list[str
         errors.extend(_validate_object(value, schema, path))
     elif isinstance(value, list):
         errors.extend(_validate_array(value, schema, path))
+    errors.extend(_validate_conditionals(value, schema, path))
     return errors
 
 
