@@ -240,14 +240,22 @@ def test_sink_rejects_job_collision(tmp_path: Path) -> None:
         sink.write(other, job_id=JOB_ID)
 
 
-def test_sink_no_candidates_writes_nothing(tmp_path: Path) -> None:
+def test_sink_no_candidates_writes_dedup_marker(tmp_path: Path) -> None:
     sink = _sink(tmp_path)
     empty = SkillCandidateOutput.model_validate(
         {**_output_payload(), "candidates": []}
     )
     result = sink.write(empty, job_id=JOB_ID)
-    assert result.candidates_staged == 0 and not result.record_written
-    assert not (tmp_path / "skill-candidates" / f"{JOB_ID}.json").exists()
+    # A barren snapshot stages no drafts but IS marked processed, so it is not
+    # re-drafted (and re-charged) on the next sweep.
+    assert result.candidates_staged == 0 and result.record_written
+    assert (tmp_path / "skill-candidates" / f"{JOB_ID}.json").exists()
+    assert sink.has(JOB_ID)
+    assert not (tmp_path / "state" / "pending-skills").exists() or not list(
+        (tmp_path / "state" / "pending-skills").iterdir()
+    )
+    # Idempotent: a second identical write is a no-op.
+    assert not sink.write(empty, job_id=JOB_ID).record_written
 
 
 def test_sink_ten_concurrent_writes_stage_once(tmp_path: Path) -> None:
