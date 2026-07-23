@@ -1618,3 +1618,144 @@ class DocumentFlowTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class _FakeStickerMessage:
+    def __init__(self, sticker):
+        self.voice = None
+        self.photo = []
+        self.document = None
+        self.caption = None
+        self.sticker = sticker
+        self.message_id = 3
+        self.reply_to_message = None
+        self.chat = SimpleNamespace(send_action=AsyncMock())
+        self.replies = []
+
+    async def reply_text(self, text, **kwargs):
+        del kwargs
+        self.replies.append(text)
+
+
+def _sticker_obj(**kw):
+    base = dict(
+        is_animated=False, is_video=False, file_id="stk",
+        file_size=1000, width=512, height=512, emoji="😂", set_name="pack",
+        thumbnail=None,
+    )
+    base.update(kw)
+    return SimpleNamespace(**base)
+
+
+def _build_sticker_update(user_id: int, sticker):
+    message = _FakeStickerMessage(sticker)
+    return SimpleNamespace(
+        message=message,
+        callback_query=None,
+        effective_user=SimpleNamespace(id=user_id),
+        effective_chat=SimpleNamespace(id=1001),
+    )
+
+
+async def _run_now(user_id, run_task, on_overflow):
+    del user_id, on_overflow
+    await run_task()
+    return True
+
+
+def _make_sticker_bot():
+    return _make_bot(
+        settings=config_module.config,
+        session_manager=session_module.session_manager,
+        project_chat=project_chat_module.project_chat_handler,
+    )
+
+
+class StickerFlowTests(unittest.IsolatedAsyncioTestCase):
+    async def test_static_sticker_downloads_and_forwards_with_emoji(self):
+        bot = _make_sticker_bot()
+        bot._check_access = AsyncMock(return_value=True)
+        bot._enqueue_user_task = _run_now
+        bot._download_image_file = AsyncMock(return_value=None)
+        bot._process_user_message_text = AsyncMock()
+        update = _build_sticker_update(11, _sticker_obj(file_id="webp1", emoji="😂"))
+        with TemporaryDirectory() as td:
+            bot._image_dir = Path(td)
+            await bot._handle_sticker_message(update, None)
+        bot._download_image_file.assert_awaited_once()
+        self.assertEqual(bot._download_image_file.await_args.args[0].file_id, "webp1")
+        bot._process_user_message_text.assert_awaited_once()
+        kwargs = bot._process_user_message_text.await_args.kwargs
+        self.assertEqual(kwargs.get("message_source"), "sticker")
+        prompt = bot._process_user_message_text.await_args.args[2]
+        self.assertIn("😂", prompt)
+        self.assertIn(".webp", prompt)  # static sticker saved as .webp
+
+    async def test_animated_sticker_uses_thumbnail(self):
+        bot = _make_sticker_bot()
+        bot._check_access = AsyncMock(return_value=True)
+        bot._enqueue_user_task = _run_now
+        bot._download_image_file = AsyncMock(return_value=None)
+        bot._process_user_message_text = AsyncMock()
+        thumb = SimpleNamespace(file_id="thumb1", file_size=400, width=128, height=128)
+        update = _build_sticker_update(
+            11, _sticker_obj(is_animated=True, thumbnail=thumb, emoji="🎉")
+        )
+        with TemporaryDirectory() as td:
+            bot._image_dir = Path(td)
+            await bot._handle_sticker_message(update, None)
+        self.assertEqual(bot._download_image_file.await_args.args[0].file_id, "thumb1")
+        self.assertIn("🎉", bot._process_user_message_text.await_args.args[2])
+
+    async def test_animated_without_thumbnail_forwards_text_only(self):
+        bot = _make_sticker_bot()
+        bot._check_access = AsyncMock(return_value=True)
+        bot._enqueue_user_task = _run_now
+        bot._download_image_file = AsyncMock(return_value=None)
+        bot._process_user_message_text = AsyncMock()
+        update = _build_sticker_update(
+            11, _sticker_obj(is_video=True, thumbnail=None, emoji="🤖")
+        )
+        await bot._handle_sticker_message(update, None)
+        bot._download_image_file.assert_not_called()
+        bot._process_user_message_text.assert_awaited_once()
+        prompt = bot._process_user_message_text.await_args.args[2]
+        self.assertIn("🤖", prompt)
+        self.assertIn("No viewable image", prompt)
+
+    async def test_download_failure_degrades_to_text_only_not_error(self):
+        bot = _make_sticker_bot()
+        bot._check_access = AsyncMock(return_value=True)
+        bot._enqueue_user_task = _run_now
+        bot._download_image_file = AsyncMock(side_effect=RuntimeError("boom"))
+        bot._process_user_message_text = AsyncMock()
+        update = _build_sticker_update(11, _sticker_obj(emoji="😂"))
+        with TemporaryDirectory() as td:
+            bot._image_dir = Path(td)
+            await bot._handle_sticker_message(update, None)
+        # Still forwarded (emoji), no user-facing error reply.
+        bot._process_user_message_text.assert_awaited_once()
+        self.assertIn("😂", bot._process_user_message_text.await_args.args[2])
+        self.assertEqual(update.message.replies, [])
+
+    async def test_unauthorized_sticker_is_ignored(self):
+        bot = _make_sticker_bot()
+        bot._check_access = AsyncMock(return_value=False)
+        bot._enqueue_user_task = AsyncMock()
+        update = _build_sticker_update(11, _sticker_obj())
+        await bot._handle_sticker_message(update, None)
+        bot._enqueue_user_task.assert_not_called()
+
+    async def test_sticker_queue_overflow_reports_message(self):
+        bot = _make_sticker_bot()
+        bot._check_access = AsyncMock(return_value=True)
+
+        async def overflow(user_id, run_task, on_overflow):
+            del user_id, run_task
+            await on_overflow()
+            return False
+
+        bot._enqueue_user_task = overflow
+        update = _build_sticker_update(11, _sticker_obj())
+        await bot._handle_sticker_message(update, None)
+        self.assertTrue(any("Sticker queue is full" in m for m in update.message.replies))

@@ -292,3 +292,63 @@ class DocumentStorageHelperTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SelectInboundStickerTest(unittest.TestCase):
+    def _sticker(self, **kw):
+        base = dict(
+            is_animated=False, is_video=False, file_id="s1",
+            file_size=1000, width=512, height=512, emoji="😂", set_name="pack",
+        )
+        base.update(kw)
+        return SimpleNamespace(**base)
+
+    def test_static_webp_is_viewable(self):
+        msg = SimpleNamespace(sticker=self._sticker())
+        obj, kind, emoji, set_name = media.select_inbound_sticker(msg)
+        self.assertEqual(kind, "static")
+        self.assertEqual(obj.file_id, "s1")
+        self.assertEqual((emoji, set_name), ("😂", "pack"))
+
+    def test_animated_uses_thumbnail(self):
+        thumb = SimpleNamespace(file_id="t1", file_size=400, width=128, height=128)
+        msg = SimpleNamespace(sticker=self._sticker(is_animated=True, thumbnail=thumb, emoji="🎉"))
+        obj, kind, emoji, _ = media.select_inbound_sticker(msg)
+        self.assertEqual(kind, "thumbnail")
+        self.assertEqual(obj.file_id, "t1")
+        self.assertEqual(emoji, "🎉")
+
+    def test_animated_without_thumbnail_is_text_only(self):
+        msg = SimpleNamespace(sticker=self._sticker(is_video=True, thumbnail=None, emoji="🤖"))
+        obj, kind, emoji, _ = media.select_inbound_sticker(msg)
+        self.assertIsNone(obj)
+        self.assertEqual(kind, "text-only")
+        self.assertEqual(emoji, "🤖")
+
+    def test_oversize_static_degrades_to_text_only(self):
+        msg = SimpleNamespace(sticker=self._sticker(file_size=10_000_000))
+        obj, kind, emoji, _ = media.select_inbound_sticker(msg, max_bytes=1_000_000)
+        self.assertIsNone(obj)
+        self.assertEqual(kind, "text-only")
+        self.assertEqual(emoji, "😂")  # emoji still passed through — never a silent drop
+
+    def test_no_sticker_is_none(self):
+        obj, kind, emoji, set_name = media.select_inbound_sticker(SimpleNamespace(sticker=None))
+        self.assertEqual((obj, kind, emoji, set_name), (None, "none", "", ""))
+
+
+class StickerPromptTest(unittest.TestCase):
+    def test_with_image_includes_path_and_emoji(self):
+        p = media.build_sticker_prompt(Path("/tmp/s.webp"), "😂", "pack", has_image=True)
+        self.assertIn("/tmp/s.webp", p)
+        self.assertIn("😂", p)
+        self.assertIn("pack", p)
+
+    def test_text_only_notes_no_image_but_keeps_emoji(self):
+        p = media.build_sticker_prompt(None, "🎉", "", has_image=False)
+        self.assertIn("No viewable image", p)
+        self.assertIn("🎉", p)
+
+    def test_no_emoji_no_pack_no_image_is_explicit(self):
+        p = media.build_sticker_prompt(None, "", "", has_image=False)
+        self.assertIn("no emoji or pack name", p)
