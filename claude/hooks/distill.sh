@@ -68,13 +68,23 @@ fi
 if [ "$AUTONOMY_STATE" = "kill" ]; then
   printf '%s skipped reason=autonomy-kill trigger=%s\n' \
     "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${1:-unknown}" >> "$LOG" 2>/dev/null
+  # Record once per real trigger (foreground only) into the shared fleet ledger;
+  # bg re-exec / pending-drain re-hit the same guard and must not double-log.
+  if [ -z "${CLAUDE_DISTILL_BG:-}" ] && declare -f ccc_autonomy_record >/dev/null 2>&1; then
+    CCC_STATE_DIR="$STATE_DIR" ccc_autonomy_record distill kill "${1:-manual}"
+  fi
   exit 0
 fi
 
 TRIGGER="${1:-manual}"   # precompact | sessionend | manual
 DRYRUN=0
 [ -f "$STATE_DIR/distill.dryrun" ] && DRYRUN=1
-[ "$AUTONOMY_STATE" = "dry-run" ] && DRYRUN=1
+if [ "$AUTONOMY_STATE" = "dry-run" ]; then
+  DRYRUN=1
+  if [ -z "${CLAUDE_DISTILL_BG:-}" ] && declare -f ccc_autonomy_record >/dev/null 2>&1; then
+    CCC_STATE_DIR="$STATE_DIR" ccc_autonomy_record distill dry-run "$TRIGGER"
+  fi
+fi
 
 # ts/log come from lib/hook-common.sh.
 

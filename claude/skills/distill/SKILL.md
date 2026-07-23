@@ -46,6 +46,10 @@ wc -l ~/.claude/state/wiki-candidates.md
    > `~/.claude/state/autonomy.dry-run`) forces `DRY-RUN` even without
    > `distill.dryrun`. Honored on every entry path (foreground, bg re-entry,
    > SessionStart pending-drain). It never *relaxes* a stricter local toggle.
+   > When it stops or gates distill it appends one body-free line to the shared
+   > fleet ledger `~/.claude/state/autonomy-ledger.jsonl` (`{ts, layer, state,
+   > detail}`, owner-only) alongside skill-autosave/autoinstall — one place to
+   > see everything the switch blocked.
 
 2. **Dispatch on `$ARGUMENTS`**:
 

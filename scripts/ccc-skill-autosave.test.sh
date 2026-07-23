@@ -155,6 +155,7 @@ ok "autonomy=kill exits 0" '[ "$rc" = 0 ]'
 ok "autonomy=kill skips scan" '[ ! -f "$TMP/scan3.touched" ]'
 ok "autonomy=kill stages no draft" '! find "$STATE3/pending-skills" -name SKILL.md 2>/dev/null | grep -q .'
 ok "autonomy=kill logs reason" 'grep -q "reason=autonomy-kill" "$STATE3/skill-autosave.log"'
+ok "autonomy=kill records to shared fleet ledger" 'grep -q "\"layer\":\"skill-autosave\"" "$STATE3/autonomy-ledger.jsonl" && grep -q "\"state\":\"kill\"" "$STATE3/autonomy-ledger.jsonl"'
 
 # 7b) kill via state file
 rm -f "$TMP/scan3.touched"

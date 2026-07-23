@@ -120,6 +120,8 @@ if declare -f ccc_autonomy_state >/dev/null 2>&1; then
 fi
 if [ "$AUTONOMY_STATE" = "kill" ]; then
   log "skip reason=autonomy-kill pid=$$"
+  declare -f ccc_autonomy_record >/dev/null 2>&1 \
+    && CCC_STATE_DIR="$STATE_DIR" ccc_autonomy_record skill-autosave kill sweep
   exit 0
 fi
 
