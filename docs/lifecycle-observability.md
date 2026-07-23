@@ -57,8 +57,13 @@ deduped). Default off; the tap is fail-open and never blocks a turn.
 - **Claude hook-payload parity**: feeding real Claude hook stdin
   (`prompt_submitted`/`session_closed`) into the normalizer + ledger (the live
   observer currently records the provider-neutral AgentEvents only).
-- **Evidence gate + notification/checkpoint parity** on the Codex path
-  (criteria for `Stop`/`Notification`/`PreCompact` equivalents).
+- **Evidence-gate detection landed** (body-free): each `tool_completed`
+  observation carries `file_change` / `verification` booleans (computed from the
+  command, which is never stored), and `evidence_gate(observations)` returns a
+  provider-neutral verdict — a turn that changed files but ran no verification
+  action needs evidence. **Surfacing** the verdict (warning delivery on turn
+  completion, without a stop loop) and `Notification`/`PreCompact` checkpoint
+  parity remain follow-ups.
 - **Redaction unification**: `skill_candidate` and `distill_extraction` now
   import the canonical set from `bridge/utils/redaction.py`; `agent_cron`
   (broader owner-spool set) and the bash `audit.sh`/`notify.sh` copies remain.
