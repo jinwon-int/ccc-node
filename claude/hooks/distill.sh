@@ -20,6 +20,11 @@ set -uo pipefail
 DISTILL_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)" || DISTILL_LIB_DIR="${HOME:-/root}/.claude/hooks"
 # shellcheck source=claude/hooks/lib/hook-common.sh
 . "$DISTILL_LIB_DIR/lib/hook-common.sh" || exit 0
+# Fleet-wide autonomy guard (#386): one kill-switch/dry-run above this layer's
+# own distill.disabled/distill.dryrun toggles. Sourced fail-open — a missing lib
+# leaves ccc_autonomy_state undefined and distill behaves exactly as today.
+# shellcheck source=claude/hooks/lib/autonomy-guard.sh
+[ -r "$DISTILL_LIB_DIR/lib/autonomy-guard.sh" ] && . "$DISTILL_LIB_DIR/lib/autonomy-guard.sh" 2>/dev/null || true
 wiki_memory_disabled() {
   [ "${CCC_NODE_ISOLATION_PROFILE:-fleet}" = "external" ] || is_disabled "${CCC_WIKI_MEMORY_ENABLED:-1}"
 }
@@ -44,9 +49,27 @@ if [ -f "$STATE_DIR/distill.disabled" ]; then
   exit 0
 fi
 
+# ---- fleet autonomy guard (#386) -------------------------------------------
+# Resolved once, above this layer's own toggles, and honored on every entry path
+# (foreground enqueue, bg re-entry, SessionStart pending-drain — all reach here).
+#   kill    -> skip the whole distill: no extract LLM call, no local/external write.
+#   dry-run -> force DRYRUN so the extract still stashes locally for debugging but
+#              no Honcho/wiki/local-facts write happens (report-only).
+# Fail-open: undefined guard (missing lib) => "active" => unchanged behavior.
+AUTONOMY_STATE="active"
+if declare -f ccc_autonomy_state >/dev/null 2>&1; then
+  AUTONOMY_STATE="$(ccc_autonomy_state 2>/dev/null || echo active)"
+fi
+if [ "$AUTONOMY_STATE" = "kill" ]; then
+  printf '%s skipped reason=autonomy-kill trigger=%s\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${1:-unknown}" >> "$LOG" 2>/dev/null
+  exit 0
+fi
+
 TRIGGER="${1:-manual}"   # precompact | sessionend | manual
 DRYRUN=0
 [ -f "$STATE_DIR/distill.dryrun" ] && DRYRUN=1
+[ "$AUTONOMY_STATE" = "dry-run" ] && DRYRUN=1
 
 # ts/log come from lib/hook-common.sh.
 
@@ -63,6 +86,9 @@ run_bg_pipeline() {
   export CLAUDE_DISTILL_INFLIGHT=1
   local TRIGGER="${CLAUDE_DISTILL_TRIGGER:-manual}"
   local DRYRUN="${CLAUDE_DISTILL_DRYRUN:-0}"
+  # Fleet dry-run stays authoritative even for a job enqueued before dry-run was
+  # toggled and drained later — never downgrade a job's own dryrun, only raise.
+  [ "${AUTONOMY_STATE:-active}" = "dry-run" ] && DRYRUN=1
   local HOOKDIR
   HOOKDIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)" || HOOKDIR=${HOME:-/root}/.claude/hooks
   # shellcheck source=claude/hooks/lib/mtime-prune.sh

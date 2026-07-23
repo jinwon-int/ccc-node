@@ -40,6 +40,13 @@ wc -l ~/.claude/state/wiki-candidates.md
    ```
    Compute the effective mode: `OFF` if `distill.disabled` exists, else `DRY-RUN` if `distill.dryrun` exists, else `LIVE`.
 
+   > **Fleet autonomy guard (#386)** sits *above* these toggles: `CCC_AUTONOMY=kill`
+   > (or `~/.claude/state/autonomy.kill`) makes distill skip entirely like `OFF` —
+   > no extract LLM call, no local/external write — and `CCC_AUTONOMY=dry-run` (or
+   > `~/.claude/state/autonomy.dry-run`) forces `DRY-RUN` even without
+   > `distill.dryrun`. Honored on every entry path (foreground, bg re-entry,
+   > SessionStart pending-drain). It never *relaxes* a stricter local toggle.
+
 2. **Dispatch on `$ARGUMENTS`**:
 
    - **`status`** — no mutation. Read & report:

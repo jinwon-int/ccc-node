@@ -115,5 +115,42 @@ ok "old snapshots survive future runs" 'find "$STATE/distill-history" -maxdepth 
 ok "distill, skill-review, and load-memory share one detached-spawn helper" \
   '[ -f "$HERE/lib/spawn-detached.sh" ] && grep -q '\''spawn_detached '\'' "$DISTILL" && grep -q '\''spawn_detached '\'' "$HERE/skill-review.sh" && grep -q '\''spawn_detached '\'' "$HERE/load-memory.sh"'
 
+# --- fleet autonomy guard (#386) ---------------------------------------------
+# kill halts the whole distill (before scope/turn gates); dry-run forces DRYRUN
+# so no Honcho/wiki/local-facts write happens even without a distill.dryrun file.
+STATE_A="$TMP/state-autonomy"; mkdir -p "$STATE_A"
+TRANS_A="$TMP/projects/-root--openclaw-workspace/sess-autonomy.jsonl"
+make_transcript "$TRANS_A" 6 "user"
+run_a() { # $1 = extra env assignment(s) as a single string; reads stdin payload
+  : > "$STATE_A/distill.log"
+  payload_other sess-autonomy "$TRANS_A" "/root/.openclaw/workspace" \
+    | env CCC_STATE_DIR="$STATE_A" CCC_DISTILL_SCOPE_CWDS="/root/.openclaw/workspace" $1 \
+      bash "$DISTILL" sessionend >/dev/null 2>&1
+}
+
+# 7a) kill via env var — skip before any gate, no bg spawn
+run_a "CCC_AUTONOMY=kill"; rc=$?
+ok "autonomy=kill exits 0" '[ "$rc" = 0 ]'
+ok "autonomy=kill logs skip reason" 'grep -q "skipped reason=autonomy-kill" "$STATE_A/distill.log"'
+ok "autonomy=kill spawns no background" '! grep -q "spawned bg" "$STATE_A/distill.log"'
+ok "autonomy=kill does not reach start line" '! grep -q "^.*start trigger=" "$STATE_A/distill.log"'
+
+# 7b) kill via state file
+touch "$STATE_A/autonomy.kill"
+run_a ""; rc=$?
+ok "autonomy.kill file exits 0" '[ "$rc" = 0 ]'
+ok "autonomy.kill file logs skip reason" 'grep -q "skipped reason=autonomy-kill" "$STATE_A/distill.log"'
+rm -f "$STATE_A/autonomy.kill"
+
+# 7c) dry-run forces DRYRUN=1 without a distill.dryrun file, and still proceeds
+run_a "CCC_AUTONOMY=dry-run"; rc=$?
+ok "autonomy=dry-run exits 0" '[ "$rc" = 0 ]'
+ok "autonomy=dry-run forces dryrun in start line" 'grep -q "start trigger=sessionend dryrun=1" "$STATE_A/distill.log"'
+ok "autonomy=dry-run still enqueues/spawns (not halted)" 'grep -qE "enqueued|enqueue dedup|spawned bg" "$STATE_A/distill.log"'
+
+# 7d) baseline: active leaves DRYRUN=0 (behavior unchanged)
+run_a "CCC_AUTONOMY=active"
+ok "autonomy=active keeps dryrun=0 (baseline)" 'grep -q "start trigger=sessionend dryrun=0" "$STATE_A/distill.log"'
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
