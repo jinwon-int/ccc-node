@@ -16,6 +16,7 @@ ccc-node memory starts from a no-network SessionStart snapshot and refreshes cac
 - `CCC_WIKI_MEMORY_ENABLED=0` disables the Family Wiki read and write path: no cache injection, refresh, local indexing, distill candidate generation, or Wiki queue writes. Existing cache files are ignored and removed from the local index on its next update/rebuild. An external isolation profile overrides an attempted `=1`.
 - `CCC_MEMORY_USER_LABEL` and `CCC_MEMORY_ASSISTANT_LABEL` set the node-local relationship labels used by memory injection and distill. Defaults preserve the existing Seoyoon fleet behavior.
 - `CCC_HONCHO_MEMORY_ENABLED=0` disables the Honcho read and Codex write-back path. A node may therefore run built-in/local memory only, Honcho without Wiki, or the default combined profile. `CCC_HONCHO_CFG` selects the owner-only endpoint/credential config (default `~/.hermes/honcho.json`).
+- `CCC_BRIDGE_MEMORY_MODE=audience-scoped` always overrides both global external-memory flags to disabled for that runtime. Until Honcho has a physically separate workspace/session retrieval boundary and Wiki candidates have an audience-labelled queue contract, Codex extraction cannot generate or deliver either sink and composes only the opaque audience-local sink. This is fail-closed: setting `CCC_HONCHO_MEMORY_ENABLED=1` or `CCC_WIKI_MEMORY_ENABLED=1` does not opt a private DM back into an unscoped sink.
 
 ## Codex global snapshot materializer
 

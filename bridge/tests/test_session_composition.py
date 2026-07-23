@@ -1013,6 +1013,43 @@ print("COMPOSED-HONCHO-SINK-WORKER-OK")
     assert "COMPOSED-HONCHO-SINK-WORKER-OK" in result.stdout
 
 
+def test_audience_memory_disables_unscoped_external_distill_sinks(tmp_path):
+    result = _run_probe(
+        """
+import os
+from pathlib import Path
+
+root = Path(os.environ["PROBE_ROOT"])
+(root / "project").mkdir(parents=True, exist_ok=True)
+os.environ.update({
+    "PROJECT_ROOT": str(root / "project"),
+    "TELEGRAM_BOT_TOKEN": "123456:test",
+    "ALLOWED_USER_IDS": "1",
+    "CCC_AGENT_PROVIDER": "codex",
+    "CCC_BRIDGE_MEMORY_MODE": "audience-scoped",
+    "CCC_BRIDGE_MEMORY_AUDIENCE_ROOT": str(root / "audiences"),
+    "CCC_CODEX_AUDIENCE_AUTH_MODE": "keyring",
+    "CCC_WIKI_MEMORY_ENABLED": "1",
+    "CCC_HONCHO_MEMORY_ENABLED": "1",
+    "CCC_HONCHO_CFG": str(root / "honcho.json"),
+})
+
+from telegram_bot.__main__ import build_context, load_runtime_settings
+
+context = build_context(load_runtime_settings())
+assert context.distill_local_sink_worker is not None
+assert context.distill_wiki_sink_worker is None
+assert context.distill_honcho_sink_worker is None
+assert context.distill_extraction_worker._wiki_enabled is False
+assert context.distill_extraction_worker._honcho_enabled is False
+print("AUDIENCE-GLOBAL-SINKS-DISABLED-OK")
+""",
+        probe_root=tmp_path,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "AUDIENCE-GLOBAL-SINKS-DISABLED-OK" in result.stdout
+
+
 def test_build_context_composes_routed_snapshot_worker(tmp_path):
     result = _run_probe(
         """
