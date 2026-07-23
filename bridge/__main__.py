@@ -150,8 +150,15 @@ def build_context(
     # autonomous spend is always gated by the shared usage meter (#388).
     from telegram_bot.memory.codex_exec_backend import CodexExecDistillBackend
 
+    audience_scoped = settings.bridge_memory_mode == "audience-scoped"
     wiki_enabled = (
-        settings.node_isolation_profile != "external" and settings.wiki_memory_enabled
+        not audience_scoped
+        and settings.node_isolation_profile != "external"
+        and settings.wiki_memory_enabled
+    )
+    honcho_enabled = (
+        not audience_scoped
+        and settings.honcho_memory_enabled
     )
     distill_environment = None
     if (
@@ -177,7 +184,7 @@ def build_context(
             timeout_seconds=settings.codex_distill_timeout_seconds,
         ),
         wiki_enabled=wiki_enabled,
-        honcho_enabled=settings.honcho_memory_enabled,
+        honcho_enabled=honcho_enabled,
         model=settings.codex_distill_model,
     )
     distill_snapshot_worker = None
@@ -214,7 +221,7 @@ def build_context(
             queue_dir=settings.bot_data_dir / "wiki-candidates",
         )
     distill_honcho_sink_worker = None
-    if settings.agent_provider == "codex" and settings.honcho_memory_enabled:
+    if settings.agent_provider == "codex" and honcho_enabled:
         from telegram_bot.memory.distill_honcho_worker import (
             CodexDistillHonchoSinkWorker,
             HonchoHttpSender,
