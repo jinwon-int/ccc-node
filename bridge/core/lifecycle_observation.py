@@ -253,6 +253,51 @@ def normalize_codex_app_server(
     return None
 
 
+# --------------------------------------------------------------------------- #
+# Live AgentEvent normalization (both providers converge on AgentRuntime events)
+# --------------------------------------------------------------------------- #
+
+def normalize_agent_event(
+    *, provider: str, session_id: object, event: object
+) -> LifecycleObservation | None:
+    """Normalize a provider-neutral ``AgentEvent`` (the live bridge seam).
+
+    Duck-typed by class name to avoid importing the runtime event module into
+    this low-level layer. Only tool/turn/approval events carry lifecycle signal;
+    everything else returns None.
+    """
+
+    kind = type(event).__name__
+    session_ref = _ref(session_id)
+
+    if kind == "ToolCompletedEvent":
+        tool = str(getattr(event, "tool_name", "") or "")
+        if not is_auditable_tool(tool):
+            return None
+        success = bool(getattr(event, "success", False))
+        return LifecycleObservation(
+            event=LifecycleEventType.TOOL_COMPLETED, provider=provider,
+            session_ref=session_ref, tool=tool,
+            tool_status="success" if success else "failure",
+            correlation=_ref(getattr(event, "tool_call_id", None)) or _ref(f"{session_id}:{tool}"),
+        )
+    if kind == "CompletionEvent":
+        stop = str(getattr(event, "stop_reason", "") or "")
+        return LifecycleObservation(
+            event=LifecycleEventType.TURN_COMPLETED, provider=provider,
+            session_ref=session_ref,
+            tool_status="success" if stop in ("end_turn", "completed") else "failure",
+            correlation=_ref(f"{session_id}:turn:{stop}"),
+        )
+    if kind == "ApprovalRequestEvent":
+        return LifecycleObservation(
+            event=LifecycleEventType.PROVIDER_NOTIFICATION, provider=provider,
+            session_ref=session_ref, flag="approval",
+            correlation=_ref(getattr(event, "request_id", None)),
+        )
+    return None
+
+
 __all__ = [
     "SCHEMA_VERSION",
     "LifecycleEventType",
@@ -260,4 +305,5 @@ __all__ = [
     "is_auditable_tool",
     "normalize_claude_hook",
     "normalize_codex_app_server",
+    "normalize_agent_event",
 ]

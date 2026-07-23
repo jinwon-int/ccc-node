@@ -586,6 +586,11 @@ class ProjectChatProcessMixin:
                                 attempt_recorded = True
                                 self.record_claude_adapter_attempt(mode=usage_mode)
                             approval_pending = isinstance(event, ApprovalRequestEvent)
+                            # Opt-in lifecycle audit (#645): fail-open tap, never
+                            # blocks the turn. No-op on a default node.
+                            _observer = getattr(self, "_lifecycle_observer", None)
+                            if _observer is not None:
+                                _observer.observe(event, session_id=session.session_id)
                             if isinstance(event, TextDeltaEvent):
                                 # A new text delta after a completed message proves
                                 # the prior message was interim rather than final.

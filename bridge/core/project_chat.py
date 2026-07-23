@@ -111,6 +111,7 @@ TYPING_INTERVAL = 4  # Telegram typing status expires after ~5s
 TYPING_MAX_NO_PROGRESS_SECONDS = _env_int("CCC_TYPING_MAX_NO_PROGRESS_SECONDS", 600)
 
 from telegram_bot.core.project_chat_history import ProjectChatHistoryMixin  # noqa: E402
+from telegram_bot.core.lifecycle_audit import build_lifecycle_observer  # noqa: E402
 from telegram_bot.core.project_chat_process import ProjectChatProcessMixin  # noqa: E402
 from telegram_bot.core.project_chat_state import ProjectChatStateMixin  # noqa: E402
 
@@ -208,6 +209,8 @@ class ProjectChatHandler(
         self._agent_runtime_closed = False
         self._agent_interrupt_timeout_seconds = 10.0
         self._clock = clock or time
+        # Opt-in lifecycle audit observer (#645); None on a default node.
+        self._lifecycle_observer = build_lifecycle_observer(self._config)
         self._process_timeout_seconds = PROCESS_TIMEOUT
         self._typing_interval_seconds = TYPING_INTERVAL
         self._conversation_locks: Dict[Tuple[int, int], asyncio.Lock] = {}

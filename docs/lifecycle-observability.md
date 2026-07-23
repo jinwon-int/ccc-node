@@ -26,8 +26,14 @@ parity does not depend on Claude-only hook payloads.
   **bounded** (newest-N + per-record byte cap), **deduped** (by `dedup_key`),
   **fail-open** audit ledger. A write failure returns a body-free status and
   never raises into a turn path.
+- **Live opt-in wiring** — `normalize_agent_event` maps live `AgentEvent`s
+  (tool/turn/approval) for both providers; a `LifecycleObserver` (built by
+  `build_lifecycle_observer`, gated by **`CCC_LIFECYCLE_AUDIT`**, default **off**)
+  taps the bridge event consume loop and records to the ledger. The tap is
+  fail-open and a no-op on a default node.
 - Capability matrix: a `lifecycle_observability` axis (both providers
-  `degraded` — contract landed, live wiring pending).
+  `degraded` — contract + opt-in observer landed; hook-payload/evidence/notify
+  parity pending).
 
 ## Event mapping
 
@@ -39,10 +45,18 @@ parity does not depend on Claude-only hook payloads.
 | `session_closed` | `SessionEnd` hook | thread teardown (follow-up) |
 | `provider_notification` | `Notification` hook | `*requestApproval` |
 
+## Enabling (opt-in, canary)
+
+Set `CCC_LIFECYCLE_AUDIT=true` on a node's bridge `.env` and restart. Live
+tool/turn/approval `AgentEvent`s then record body-free observations into
+`<bot_data_dir>/lifecycle-audit/lifecycle-audit.jsonl` (owner-only, bounded,
+deduped). Default off; the tap is fail-open and never blocks a turn.
+
 ## Scope / follow-ups (canary-gated)
 
-- **Live wiring**: feeding real Claude hook stdin and Codex `AgentEvent`s into
-  the normalizers and the audit ledger from the bridge runtime.
+- **Claude hook-payload parity**: feeding real Claude hook stdin
+  (`prompt_submitted`/`session_closed`) into the normalizer + ledger (the live
+  observer currently records the provider-neutral AgentEvents only).
 - **Evidence gate + notification/checkpoint parity** on the Codex path
   (criteria for `Stop`/`Notification`/`PreCompact` equivalents).
 - **Redaction unification**: migrate the remaining per-module credential

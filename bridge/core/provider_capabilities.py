@@ -428,14 +428,16 @@ CAPABILITY_AXES: tuple[CapabilityAxis, ...] = (
         "LifecycleObservation contract for audit/redact/evidence/notify parity.",
         claude=_degraded(
             "The shared LifecycleObservation contract, credential redaction, and "
-            "owner-only bounded audit ledger are landed and normalize Claude hook "
-            "payloads; wiring the hooks to feed the normalizer is a follow-up.",
+            "owner-only bounded audit ledger are landed; live AgentEvents record via "
+            "the opt-in CCC_LIFECYCLE_AUDIT observer. Claude hook-payload parity "
+            "(prompt/session-close) and evidence/notify parity remain follow-ups.",
             "#645",
         ),
         codex=_degraded(
             "App-server tool/turn/approval events normalize to LifecycleObservation "
-            "via the shared contract; wiring the normalizer + audit ledger into the "
-            "live runtime is a canary follow-up.",
+            "and record via the opt-in CCC_LIFECYCLE_AUDIT observer in the live "
+            "consume loop; evidence-gate and notification/checkpoint parity remain "
+            "follow-ups.",
             "#645",
         ),
     ),
