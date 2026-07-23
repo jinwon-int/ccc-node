@@ -18,6 +18,14 @@ All notable changes to the Claude Code node harness. Dates are KST.
   suite cover idempotence, comment preservation, invalid TOML, and symlinks.
 
 ### Fixed
+- `claude/mcp-setup.sh` now registers stdio MCP servers as `node <abs cli>` on
+  Termux/Android instead of `npx -y <pkg>`. The package bins start with
+  `#!/usr/bin/env node`, and the agent's MCP spawn context does not carry
+  termux-exec (Claude subprocess; Codex `rmcp` `env_clear()`), so `/usr/bin/env`
+  was unresolved and every server failed to connect ("`<bin>`: not found").
+  On Termux the package is installed globally and launched via `node`, which
+  bypasses the shebang; Linux keeps `npx -y`. Platform-branching regression test
+  added. (#663)
 - The memory-audience 0700 guard now self-heals a bridge-owned key-parent
   directory instead of failing closed forever. `load_or_create_audience_key`
   used `Path.mkdir(mode=0o700, exist_ok=True)`, which only applies the mode when
