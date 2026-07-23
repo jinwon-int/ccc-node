@@ -186,3 +186,50 @@ def test_agent_unknown_event_is_none() -> None:
     class _TextDeltaEvent:
         text = "x"
     assert _norm_agent(_TextDeltaEvent()) is None
+
+
+# --------------------------------------------------------------------------- #
+# Evidence gate (body-free): file-change without a verification action.
+# --------------------------------------------------------------------------- #
+
+def _claude_tool(tool, **tool_input):
+    from telegram_bot.core.lifecycle_observation import normalize_claude_hook
+    return normalize_claude_hook(
+        "PostToolUse", {"tool_name": tool, "tool_input": tool_input, "session_id": "s"}
+    )
+
+
+def test_file_change_and_verification_flags_are_body_free() -> None:
+    edit = _claude_tool("Edit", file_path="/x")
+    assert edit.file_change and not edit.verification
+    verify = _claude_tool("Bash", command="pytest -q && ruff check")
+    assert verify.verification and not verify.file_change
+    # The command text is never persisted.
+    assert "pytest" not in json.dumps(verify.to_record())
+    assert "ruff" not in json.dumps(verify.to_record())
+
+
+def test_evidence_gate_needs_evidence_when_files_change_without_verification() -> None:
+    from telegram_bot.core.lifecycle_observation import evidence_gate
+    verdict = evidence_gate([_claude_tool("Edit", file_path="/a"), _claude_tool("Bash", command="rm -rf x")])
+    assert verdict.needs_evidence and verdict.file_changes == 1 and verdict.verifications == 0
+
+
+def test_evidence_gate_satisfied_by_a_verification_action() -> None:
+    from telegram_bot.core.lifecycle_observation import evidence_gate
+    verdict = evidence_gate([_claude_tool("Write", file_path="/a"), _claude_tool("Bash", command="pytest")])
+    assert not verdict.needs_evidence and verdict.verifications == 1
+
+
+def test_evidence_gate_ignores_pure_read_and_non_mutating_turns() -> None:
+    from telegram_bot.core.lifecycle_observation import evidence_gate
+    # No file change → nothing to gate (a verification-free read turn is fine).
+    verdict = evidence_gate([_claude_tool("Bash", command="ls -la")])
+    assert not verdict.needs_evidence and verdict.file_changes == 0
+
+
+def test_codex_file_change_and_verification() -> None:
+    fc = normalize_codex_app_server(_codex_tool(item={"type": "fileChange", "status": "completed"}))
+    assert fc.file_change
+    ver = normalize_codex_app_server(_codex_tool(item={"type": "commandExecution", "status": "completed", "command": "pytest -q"}))
+    assert ver.verification and "pytest" not in json.dumps(ver.to_record())

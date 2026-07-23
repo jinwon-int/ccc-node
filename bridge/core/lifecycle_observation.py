@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from enum import Enum
 from hashlib import sha256
 import re
-from typing import Any, Final, Mapping
+from typing import Any, Final, Iterable, Mapping
 
 from telegram_bot.utils.redaction import contains_credential
 
@@ -38,6 +38,19 @@ _NON_TOOL_ITEM_TYPES: Final = frozenset(
     {"agentMessage", "userMessage", "reasoning", "plan",
      "enteredReviewMode", "exitedReviewMode"}
 )
+# Tools that change files (evidence-gate: a turn that changed files should show
+# a verification signal). Snake/camel tokens.
+_FILE_CHANGE_TOKENS: Final = frozenset(
+    {"write", "edit", "multiedit", "notebookedit", "filechange", "patch",
+     "applypatch", "change"}
+)
+# A verification action — mirrors claude/hooks/evidence-gate.sh's evidence regex.
+# Runs against the command only to compute a boolean; the command is never stored.
+_EVIDENCE_RE: Final = re.compile(
+    r"\b(pytest|test|validate|verify|--dry-run|--check|shellcheck|bats|"
+    r"gh pr checks|git diff|git status|lint|ruff|mypy|tsc|typecheck)\b",
+    re.IGNORECASE,
+)
 _ISO_TS_RE: Final = re.compile(r"^\d{4}-\d{2}-\d{2}T[\d:.+Z-]{4,}$")
 
 
@@ -49,6 +62,11 @@ class LifecycleEventType(str, Enum):
     PROVIDER_NOTIFICATION = "provider_notification"
 
 
+def _tool_tokens(name: str) -> list[str]:
+    spaced = _CAMEL_SPLIT_RE.sub(r"\1 \2", name).lower()
+    return [tok for tok in re.split(r"[^a-z0-9]+", spaced) if tok]
+
+
 def is_auditable_tool(name: str) -> bool:
     """A tool completion is auditable unless the tool is clearly read-only.
 
@@ -56,9 +74,18 @@ def is_auditable_tool(name: str) -> bool:
     """
     if not name:
         return False
-    spaced = _CAMEL_SPLIT_RE.sub(r"\1 \2", name).lower()
-    tokens = [tok for tok in re.split(r"[^a-z0-9]+", spaced) if tok]
-    return not any(tok in _READ_ONLY_TOKENS for tok in tokens)
+    return not any(tok in _READ_ONLY_TOKENS for tok in _tool_tokens(name))
+
+
+def is_file_change_tool(name: str) -> bool:
+    """True when the tool changes files (Write/Edit/…, fileChange, apply_patch)."""
+    return any(tok in _FILE_CHANGE_TOKENS for tok in _tool_tokens(name))
+
+
+def is_verification_command(command: object) -> bool:
+    """True when a command text looks like a verification action. Body-free:
+    only the boolean is used, the command is never stored."""
+    return isinstance(command, str) and _EVIDENCE_RE.search(command) is not None
 
 
 def _ref(value: object) -> str | None:
@@ -87,6 +114,8 @@ class LifecycleObservation:
     tool_status: str | None = None       # "success" | "failure"
     target_shape: str | None = None      # "file" | "command" | None
     flag: str | None = None              # e.g. "possible-raw-credential"
+    file_change: bool = False            # tool changed files (evidence-gate)
+    verification: bool = False           # tool ran a verification action
     correlation: str | None = None       # opaque per-event id (dedup)
     observed_at: str | None = None
     schema_version: int = SCHEMA_VERSION
@@ -119,6 +148,9 @@ class LifecycleObservation:
         ):
             if value is not None:
                 record[key] = value
+        for key, flag in (("file_change", self.file_change), ("verification", self.verification)):
+            if flag:
+                record[key] = True
         return record
 
 
@@ -143,8 +175,10 @@ def normalize_claude_hook(
             return None
         tool_input = payload.get("tool_input")
         target_shape = None
+        command = ""
         if isinstance(tool_input, Mapping):
-            if tool_input.get("command"):
+            command = str(tool_input.get("command") or "")
+            if command:
                 target_shape = "command"
             elif tool_input.get("file_path"):
                 target_shape = "file"
@@ -157,6 +191,8 @@ def normalize_claude_hook(
             session_ref=session_ref, tool=tool,
             tool_status="success" if success else "failure",
             target_shape=target_shape,
+            file_change=is_file_change_tool(tool) or target_shape == "file",
+            verification=is_verification_command(command),
             correlation=_ref(f"{payload.get('session_id')}:{tool}:{target_shape}:{ts}"),
             observed_at=ts,
         )
@@ -222,10 +258,13 @@ def normalize_codex_app_server(
         status = str(item.get("status") or "")
         exit_code = item.get("exitCode")
         success = status in ("completed", "success") and exit_code in (None, 0)
+        command = str(item.get("command") or "")
         return LifecycleObservation(
             event=LifecycleEventType.TOOL_COMPLETED, provider="codex",
             session_ref=session_ref, turn_ref=turn_ref, tool=item_type,
             tool_status="success" if success else "failure",
+            file_change=is_file_change_tool(item_type),
+            verification=is_verification_command(command),
             correlation=_ref(item.get("id")) or _ref(f"{params.get('turnId')}:{item_type}"),
             observed_at=ts,
         )
@@ -254,6 +293,44 @@ def normalize_codex_app_server(
 
 
 # --------------------------------------------------------------------------- #
+# Evidence gate (body-free, provider-neutral)
+# --------------------------------------------------------------------------- #
+
+@dataclass(frozen=True, slots=True)
+class EvidenceVerdict:
+    needs_evidence: bool
+    file_changes: int
+    verifications: int
+
+
+def evidence_gate(
+    observations: "Iterable[LifecycleObservation]",
+) -> EvidenceVerdict:
+    """Provider-neutral evidence gate over one session's observations.
+
+    A turn that changed files but ran no verification action
+    (test/validate/verify/diff/lint/…) needs evidence. Pure query over the
+    body-free ``file_change``/``verification`` flags — no command text, no
+    delivery, no provider recursion; the caller decides how to surface it.
+    """
+
+    file_changes = 0
+    verifications = 0
+    for obs in observations:
+        if getattr(obs, "event", None) is not LifecycleEventType.TOOL_COMPLETED:
+            continue
+        if getattr(obs, "file_change", False):
+            file_changes += 1
+        if getattr(obs, "verification", False):
+            verifications += 1
+    return EvidenceVerdict(
+        needs_evidence=file_changes > 0 and verifications == 0,
+        file_changes=file_changes,
+        verifications=verifications,
+    )
+
+
+# --------------------------------------------------------------------------- #
 # Live AgentEvent normalization (both providers converge on AgentRuntime events)
 # --------------------------------------------------------------------------- #
 
@@ -275,10 +352,16 @@ def normalize_agent_event(
         if not is_auditable_tool(tool):
             return None
         success = bool(getattr(event, "success", False))
+        # Best-effort verification signal from the tool arguments when the event
+        # carries them (ToolCompletedEvent may not); body-free boolean only.
+        args = getattr(event, "arguments", None) or getattr(event, "result", None)
+        command = args.get("command") if isinstance(args, Mapping) else ""
         return LifecycleObservation(
             event=LifecycleEventType.TOOL_COMPLETED, provider=provider,
             session_ref=session_ref, tool=tool,
             tool_status="success" if success else "failure",
+            file_change=is_file_change_tool(tool),
+            verification=is_verification_command(command),
             correlation=_ref(getattr(event, "tool_call_id", None)) or _ref(f"{session_id}:{tool}"),
         )
     if kind == "CompletionEvent":
@@ -302,7 +385,11 @@ __all__ = [
     "SCHEMA_VERSION",
     "LifecycleEventType",
     "LifecycleObservation",
+    "EvidenceVerdict",
     "is_auditable_tool",
+    "is_file_change_tool",
+    "is_verification_command",
+    "evidence_gate",
     "normalize_claude_hook",
     "normalize_codex_app_server",
     "normalize_agent_event",
