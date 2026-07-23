@@ -353,8 +353,15 @@ class SkillCandidateCollector:
         if provenance.source_thread_hash != snapshot.thread_hash:
             raise ValueError("provenance thread hash must match the snapshot")
         output = await self._backend.extract(snapshot=snapshot, provenance=provenance)
-        if output.provenance != provenance:
-            raise ValueError("backend altered the provenance")
+        # Identity fields only — the model generates its own distilled_at, so a
+        # full-equality check would always fail (the backend enforces the same).
+        echoed = output.provenance
+        if (
+            echoed.provider != provenance.provider
+            or echoed.source_thread_hash != provenance.source_thread_hash
+            or echoed.trigger != provenance.trigger
+        ):
+            raise ValueError("backend altered the provenance identity")
         return self._sink.write(output, job_id=job_id)
 
 

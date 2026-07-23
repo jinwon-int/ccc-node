@@ -134,6 +134,20 @@ async def test_backend_returns_validated_output(tmp_path: Path) -> None:
 
 
 @async_test
+async def test_backend_accepts_model_generated_distilled_at(tmp_path: Path) -> None:
+    # The model cannot know our distilled_at and generates its own; only the
+    # identity fields (provider/thread hash/trigger) must be echoed. A differing
+    # distilled_at must NOT be rejected (the real-node canary failure).
+    payload = json.loads(_valid_output_json())
+    payload["provenance"]["distilled_at"] = "2026-01-01T00:00:00Z"  # != our provenance
+    output = json.dumps(payload).replace("'", "'\\''")
+    executable = _stub(tmp_path, f"printf '%s' '{output}' > \"$OUT\"\nexit 0")
+    backend = _backend(tmp_path, executable)
+    result = await backend.extract(snapshot=_snapshot(), provenance=_provenance())
+    assert result.candidates[0].name == "codex-release-check"
+
+
+@async_test
 async def test_backend_rejects_provenance_mismatch(tmp_path: Path) -> None:
     # Stub echoes a different trigger than the backend passed in.
     output = _valid_output_json(trigger="shutdown").replace("'", "'\\''")

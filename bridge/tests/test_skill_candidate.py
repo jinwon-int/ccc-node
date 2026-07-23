@@ -288,6 +288,19 @@ def test_collector_stages_from_snapshot(tmp_path: Path) -> None:
     assert result.candidates_staged == 1 and backend.calls == 1
 
 
+def test_collector_accepts_model_generated_distilled_at(tmp_path: Path) -> None:
+    # Model output echoes identity fields but its own distilled_at — must be
+    # accepted (only provider/thread hash/trigger are enforced).
+    payload = _output_payload()
+    payload["provenance"]["distilled_at"] = "2026-01-01T00:00:00Z"
+    out = SkillCandidateOutput.model_validate(payload)
+    collector = SkillCandidateCollector(_FakeBackend(out), _sink(tmp_path))
+    result = asyncio.run(
+        collector.collect(snapshot=_snapshot(), provenance=_provenance(), job_id=JOB_ID)
+    )
+    assert result.candidates_staged == 1
+
+
 def test_collector_rejects_provenance_snapshot_mismatch(tmp_path: Path) -> None:
     out = SkillCandidateOutput.model_validate(_output_payload())
     collector = SkillCandidateCollector(_FakeBackend(out), _sink(tmp_path))
