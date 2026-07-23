@@ -55,9 +55,10 @@ job, so memory distill is unaffected), drafts via the backend, and stages
 pending drafts through the idempotent sink for the provider-aware installer.
 Composition is three-guarded (Codex node **and** flag on **and** a distill
 journal), so every other node's startup is unchanged — verified by the
-composition suite. **Enabling the flag on a live node is canary-gated**: confirm
-the bridge starts cleanly and watch the first drafts under review before wider
-rollout.
+composition suite. **Enabling the flag on a live node is canary-gated** — follow
+[`codex-skill-collector-activation.md`](codex-skill-collector-activation.md)
+(baseline → enable → verify clean startup → review first drafts → observe →
+widen; rollback = disable + restart).
 
 ## Enable the daily sweep
 
