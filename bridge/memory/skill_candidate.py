@@ -316,8 +316,6 @@ class SkillCandidateSink:
         with self._exclusive():
             record_path = self.queue_dir / f"{job_id}.json"
             self._validate_regular_file(record_path)
-            if count == 0:
-                return SkillCandidateStageResult(0, False)
             staged = [
                 self._safe_id(job_id, index, candidate.name)
                 for index, candidate in enumerate(output.candidates)
@@ -327,9 +325,14 @@ class SkillCandidateSink:
                 if record_path.read_bytes() == payload:
                     return SkillCandidateStageResult(count, False)
                 raise SkillCandidateCollisionError("skill-candidate job collision")
-            os.makedirs(self.pending_dir, mode=0o700, exist_ok=True)
-            for candidate, safe_id in zip(output.candidates, staged):
-                self._write_draft(candidate, safe_id=safe_id, output=output)
+            # Stage drafts only when there are candidates; the job marker is
+            # written for EVERY processed job (including zero-candidate ones) so
+            # a barren snapshot is not re-drafted (and re-charged) on every
+            # sweep — has() then dedupes it.
+            if count > 0:
+                os.makedirs(self.pending_dir, mode=0o700, exist_ok=True)
+                for candidate, safe_id in zip(output.candidates, staged):
+                    self._write_draft(candidate, safe_id=safe_id, output=output)
             # Marker written last: a crash mid-stage leaves gated drafts (safe),
             # never a "done" marker with no drafts.
             _atomic_write_bytes(record_path, payload)
