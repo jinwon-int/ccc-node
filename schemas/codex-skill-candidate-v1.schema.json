@@ -1,0 +1,119 @@
+{
+  "$defs": {
+    "DistillProvenance": {
+      "additionalProperties": false,
+      "properties": {
+        "distilled_at": {
+          "format": "date-time",
+          "title": "Distilled At",
+          "type": "string"
+        },
+        "provider": {
+          "const": "codex",
+          "title": "Provider",
+          "type": "string"
+        },
+        "source_thread_hash": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Source Thread Hash",
+          "type": "string"
+        },
+        "trigger": {
+          "$ref": "#/$defs/DistillTrigger"
+        }
+      },
+      "required": [
+        "provider",
+        "source_thread_hash",
+        "trigger",
+        "distilled_at"
+      ],
+      "title": "DistillProvenance",
+      "type": "object"
+    },
+    "DistillTrigger": {
+      "enum": [
+        "new_command",
+        "provider_switch",
+        "auto_new",
+        "explicit",
+        "shutdown",
+        "checkpoint"
+      ],
+      "title": "DistillTrigger",
+      "type": "string"
+    },
+    "SkillCandidate": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "maxLength": 64,
+          "minLength": 1,
+          "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$",
+          "title": "Name",
+          "type": "string"
+        },
+        "summary": {
+          "maxLength": 600,
+          "minLength": 1,
+          "title": "Summary",
+          "type": "string"
+        },
+        "reason": {
+          "maxLength": 600,
+          "minLength": 1,
+          "title": "Reason",
+          "type": "string"
+        },
+        "evidence_excerpt": {
+          "default": "",
+          "maxLength": 200,
+          "title": "Evidence Excerpt",
+          "type": "string"
+        },
+        "skill_md": {
+          "description": "Complete SKILL.md with YAML frontmatter; no credentials or injected directives.",
+          "maxLength": 16384,
+          "minLength": 1,
+          "title": "Skill Md",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "summary",
+        "reason",
+        "skill_md"
+      ],
+      "title": "SkillCandidate",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "description": "Codex-native skill-candidate extraction output (#667). Distinct from codex-distill-extraction (memory facts): reuses only the neutral provenance/trigger contract.",
+  "properties": {
+    "schema_version": {
+      "const": 1,
+      "title": "Schema Version",
+      "type": "integer"
+    },
+    "provenance": {
+      "$ref": "#/$defs/DistillProvenance"
+    },
+    "candidates": {
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/SkillCandidate"
+      },
+      "maxItems": 2,
+      "title": "Candidates",
+      "type": "array"
+    }
+  },
+  "required": [
+    "schema_version",
+    "provenance"
+  ],
+  "title": "SkillCandidateOutput",
+  "type": "object"
+}
