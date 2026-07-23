@@ -215,6 +215,101 @@ def _read_private_output(path: Path, *, max_bytes: int) -> bytes:
     return payload
 
 
+async def run_codex_exec(
+    *,
+    executable: str,
+    schema_path: str | Path,
+    model: str,
+    prompt: str,
+    stdin_bytes: bytes,
+    timeout_seconds: float,
+    max_output_bytes: int,
+    environment: Mapping[str, str],
+    temp_root: str | Path | None = None,
+    audience_auth_mode: str = "disabled",
+) -> bytes:
+    """Run one isolated ``codex exec`` and return its raw output bytes.
+
+    Schema-neutral: the mechanics (schema/executable validation, private
+    tempdir + output file, sandboxed subprocess, bounded private read) are the
+    same for any strict-output extraction. Callers own the input serialization,
+    the prompt, and the output parsing. Raises ``CodexDistillBackendError`` with
+    a stable body-free code on every failure. No journal/sink is touched.
+    """
+
+    schema = _validate_schema(Path(schema_path))
+    resolved = _resolve_executable(executable, environment)
+    try:
+        with tempfile.TemporaryDirectory(
+            prefix="ccc-codex-exec-",
+            dir=Path(temp_root) if temp_root is not None else None,
+        ) as private_root_raw:
+            private_root = Path(private_root_raw)
+            private_root.chmod(0o700)
+            cwd = private_root / "cwd"
+            cwd.mkdir(mode=0o700)
+            output = private_root / "output.json"
+            _create_private_output(output)
+            sub_environment = _minimal_environment(environment, temp_root=private_root)
+            arguments = [resolved, "exec"]
+            if audience_auth_mode == "keyring":
+                arguments.extend(("--config", 'cli_auth_credentials_store="keyring"'))
+            if model != _PROVIDER_DEFAULT_MODEL:
+                arguments.extend(("--model", model))
+            arguments.extend(
+                (
+                    "--ephemeral",
+                    "--ignore-user-config",
+                    "--ignore-rules",
+                    "--sandbox",
+                    "read-only",
+                    "--skip-git-repo-check",
+                    "--output-schema",
+                    str(schema),
+                    "--output-last-message",
+                    str(output),
+                    "--color",
+                    "never",
+                    prompt,
+                )
+            )
+            argv = tuple(arguments)
+            try:
+                process = await asyncio.create_subprocess_exec(
+                    *argv,
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                    cwd=str(cwd),
+                    env=sub_environment,
+                    start_new_session=True,
+                    preexec_fn=_private_umask,
+                )
+            except OSError:
+                raise CodexDistillBackendError("codex_distill_spawn_failed") from None
+            try:
+                await asyncio.wait_for(
+                    process.communicate(input=stdin_bytes),
+                    timeout=timeout_seconds,
+                )
+            except asyncio.CancelledError:
+                await _stop_process(process)
+                raise
+            except TimeoutError:
+                await _stop_process(process)
+                raise CodexDistillBackendError("codex_distill_timeout") from None
+            except OSError:
+                await _stop_process(process)
+                raise CodexDistillBackendError("codex_distill_io_failed") from None
+            if process.returncode != 0:
+                raise CodexDistillBackendError("codex_distill_nonzero_exit")
+            return _read_private_output(output, max_bytes=max_output_bytes)
+    except CodexDistillBackendError:
+        raise
+    except OSError:
+        raise CodexDistillBackendError("codex_distill_io_failed") from None
+
+
 class CodexExecDistillBackend:
     """Run a single isolated Codex extraction without journal or sink mutation."""
 
@@ -265,83 +360,19 @@ class CodexExecDistillBackend:
     ) -> DistillExtractionOutput:
         if not isinstance(extraction_input, DistillExtractionInput):
             raise CodexDistillBackendError("codex_distill_input_invalid")
-        schema = _validate_schema(self._schema_path)
-        executable = _resolve_executable(self._executable, self._environment)
         payload = canonical_extraction_input_bytes(extraction_input)
-        try:
-            with tempfile.TemporaryDirectory(
-                prefix="ccc-codex-distill-",
-                dir=self._temp_root,
-            ) as private_root_raw:
-                private_root = Path(private_root_raw)
-                private_root.chmod(0o700)
-                cwd = private_root / "cwd"
-                cwd.mkdir(mode=0o700)
-                output = private_root / "output.json"
-                _create_private_output(output)
-                environment = _minimal_environment(self._environment, temp_root=private_root)
-                arguments = [executable, "exec"]
-                if self._audience_auth_mode == "keyring":
-                    arguments.extend(
-                        ("--config", 'cli_auth_credentials_store="keyring"')
-                    )
-                if self._model != _PROVIDER_DEFAULT_MODEL:
-                    arguments.extend(("--model", self._model))
-                arguments.extend(
-                    (
-                        "--ephemeral",
-                        "--ignore-user-config",
-                        "--ignore-rules",
-                        "--sandbox",
-                        "read-only",
-                        "--skip-git-repo-check",
-                        "--output-schema",
-                        str(schema),
-                        "--output-last-message",
-                        str(output),
-                        "--color",
-                        "never",
-                        DISTILL_EXTRACTION_PROMPT,
-                    )
-                )
-                argv = tuple(arguments)
-                try:
-                    process = await asyncio.create_subprocess_exec(
-                        *argv,
-                        stdin=asyncio.subprocess.PIPE,
-                        stdout=asyncio.subprocess.DEVNULL,
-                        stderr=asyncio.subprocess.DEVNULL,
-                        cwd=str(cwd),
-                        env=environment,
-                        start_new_session=True,
-                        preexec_fn=_private_umask,
-                    )
-                except OSError:
-                    raise CodexDistillBackendError("codex_distill_spawn_failed") from None
-                try:
-                    await asyncio.wait_for(
-                        process.communicate(input=payload),
-                        timeout=self._timeout_seconds,
-                    )
-                except asyncio.CancelledError:
-                    await _stop_process(process)
-                    raise
-                except TimeoutError:
-                    await _stop_process(process)
-                    raise CodexDistillBackendError("codex_distill_timeout") from None
-                except OSError:
-                    await _stop_process(process)
-                    raise CodexDistillBackendError("codex_distill_io_failed") from None
-                if process.returncode != 0:
-                    raise CodexDistillBackendError("codex_distill_nonzero_exit")
-                output_payload = _read_private_output(
-                    output,
-                    max_bytes=self._max_output_bytes,
-                )
-        except CodexDistillBackendError:
-            raise
-        except OSError:
-            raise CodexDistillBackendError("codex_distill_io_failed") from None
+        output_payload = await run_codex_exec(
+            executable=self._executable,
+            schema_path=self._schema_path,
+            model=self._model,
+            prompt=DISTILL_EXTRACTION_PROMPT,
+            stdin_bytes=payload,
+            timeout_seconds=self._timeout_seconds,
+            max_output_bytes=self._max_output_bytes,
+            environment=self._environment,
+            temp_root=self._temp_root,
+            audience_auth_mode=self._audience_auth_mode,
+        )
         try:
             result = parse_extraction_output(
                 output_payload,
@@ -363,4 +394,5 @@ __all__ = [
     "DISTILL_EXTRACTION_PROMPT",
     "CodexDistillBackendError",
     "CodexExecDistillBackend",
+    "run_codex_exec",
 ]
