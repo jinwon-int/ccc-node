@@ -18,6 +18,13 @@ All notable changes to the Claude Code node harness. Dates are KST.
   suite cover idempotence, comment preservation, invalid TOML, and symlinks.
 
 ### Fixed
+- The Claude bridge runtime now launches its injected web MCP servers via
+  `node <abs cli>` on Termux/Android instead of `npx -y <pkg>`. `web_mcp.py`
+  (consumed by `claude_runtime.py` as `options.mcp_servers`) hardcoded `npx`,
+  whose `#!/usr/bin/env node` bin shebang is unresolved in the agent MCP spawn
+  context there, so bridge sessions had no searxng/firecrawl. Falls back to
+  `npx -y` on other platforms and when the global cli is unresolved; the
+  Firecrawl key stays in `process_env`. Complements #664 (the CLI path). (#669)
 - `claude/mcp-setup.sh` now registers stdio MCP servers as `node <abs cli>` on
   Termux/Android instead of `npx -y <pkg>`. The package bins start with
   `#!/usr/bin/env node`, and the agent's MCP spawn context does not carry
