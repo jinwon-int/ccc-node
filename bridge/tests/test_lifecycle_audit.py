@@ -131,3 +131,56 @@ def test_build_observer_is_opt_in(tmp_path: Path) -> None:
     assert isinstance(on, LifecycleObserver)
     # On but unsupported provider → None (fail-closed).
     assert build_lifecycle_observer(SimpleNamespace(lifecycle_audit_enabled=True, agent_provider="gpt", bot_data_dir=tmp_path)) is None
+
+
+class _CompletionEvent:
+    __name__ = "CompletionEvent"
+
+    def __init__(self, stop_reason="end_turn"):
+        self.stop_reason = stop_reason
+
+
+def _tool(name, command=None):
+    ev = _ToolCompletedEvent(tool_name=name)
+    ev.__class__.__name__ = "ToolCompletedEvent"
+    if command is not None:
+        ev.arguments = {"command": command}
+    return ev
+
+
+def _turn():
+    ev = _CompletionEvent()
+    ev.__class__.__name__ = "CompletionEvent"
+    return ev
+
+
+def _records(tmp_path):
+    p = tmp_path / "audit" / "lifecycle-audit.jsonl"
+    return [json.loads(line) for line in p.read_text().splitlines()] if p.exists() else []
+
+
+def test_observer_surfaces_missing_evidence_warning(tmp_path: Path) -> None:
+    from telegram_bot.core.lifecycle_audit import LifecycleObserver
+    observer = LifecycleObserver(LifecycleAuditLedger(tmp_path / "audit"), provider="codex")
+    observer.observe(_tool("Edit"), session_id="s1")          # file change
+    observer.observe(_tool("Bash", command="rm -rf x"), session_id="s1")  # no verify
+    observer.observe(_turn(), session_id="s1")                # turn end → warn
+    warnings = [r for r in _records(tmp_path) if r.get("flag") == "evidence-missing"]
+    assert len(warnings) == 1 and warnings[0]["event"] == "provider_notification"
+
+
+def test_observer_no_warning_when_verified(tmp_path: Path) -> None:
+    from telegram_bot.core.lifecycle_audit import LifecycleObserver
+    observer = LifecycleObserver(LifecycleAuditLedger(tmp_path / "audit"), provider="codex")
+    observer.observe(_tool("Write"), session_id="s1")
+    observer.observe(_tool("Bash", command="pytest -q"), session_id="s1")  # verification
+    observer.observe(_turn(), session_id="s1")
+    assert not [r for r in _records(tmp_path) if r.get("flag") == "evidence-missing"]
+
+
+def test_observer_no_warning_without_file_change(tmp_path: Path) -> None:
+    from telegram_bot.core.lifecycle_audit import LifecycleObserver
+    observer = LifecycleObserver(LifecycleAuditLedger(tmp_path / "audit"), provider="codex")
+    observer.observe(_tool("Bash", command="ls"), session_id="s1")  # not a file change
+    observer.observe(_turn(), session_id="s1")
+    assert not [r for r in _records(tmp_path) if r.get("flag") == "evidence-missing"]
