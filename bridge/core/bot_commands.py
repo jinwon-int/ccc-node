@@ -287,6 +287,89 @@ class BotCommandMixin:
         await message.reply_text(reply)
         log_debug(user_id, "bot", reply)
 
+    async def _cmd_memory_promote(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Promote one validated private local fact after an explicit DM command."""
+
+        if not await self._check_access(update):
+            return
+        message = self._require_message(update)
+        if (
+            getattr(self._config, "bridge_memory_mode", "off") != "audience-scoped"
+            or getattr(self, "_memory_promoter", None) is None
+            or getattr(self, "_distill_local_sink_worker", None) is None
+        ):
+            await message.reply_text(
+                "ℹ️ Explicit memory promotion is unavailable on this bridge."
+            )
+            return
+
+        user_id = self._require_user(update).id
+        chat_id = self._require_chat(update).id
+        from telegram_bot.core.memory_audience import resolve_memory_audience
+
+        audience = resolve_memory_audience(
+            self._config,
+            user_id=user_id,
+            chat_id=chat_id,
+        )
+        if audience is None or audience.kind != "private":
+            await message.reply_text(
+                "❌ Memory promotion is allowed only from your private DM."
+            )
+            return
+        args = context.args or []
+        if (
+            len(args) != 1
+            or re.fullmatch(r"distill-[0-9a-f]{12}", args[0]) is None
+        ):
+            await message.reply_text(
+                "Usage: /memory_promote distill-<12 lowercase hex>"
+            )
+            return
+
+        fact_id = args[0]
+        try:
+            result = await asyncio.to_thread(
+                self._memory_promoter.promote,
+                source_scope=audience.scope,
+                fact_id=fact_id,
+            )
+            await self._distill_local_sink_worker.refresh_route(
+                audience="shared",
+                scope="shared",
+            )
+        except LookupError:
+            await message.reply_text(
+                "ℹ️ That fact was not found in your private memory."
+            )
+            return
+        except ValueError:
+            logger.warning("Private memory promotion rejected by validation")
+            await message.reply_text(
+                "⚠️ That private fact is not eligible for promotion."
+            )
+            return
+        except Exception:
+            logger.warning("Private memory promotion or shared index refresh failed")
+            await message.reply_text(
+                "⚠️ Memory promotion could not be completed. You can retry safely."
+            )
+            return
+
+        if result.promoted:
+            reply = (
+                f"✅ Promoted {fact_id} to shared memory as "
+                f"{result.destination_fact_id}."
+            )
+        else:
+            reply = (
+                f"✅ {fact_id} was already promoted as "
+                f"{result.destination_fact_id}; shared memory was refreshed."
+            )
+        await message.reply_text(reply)
+
     def _get_real_model(self, session: dict) -> str:
         """Get current model from session or ~/.claude/settings.json"""
         if model := session.get("model"):

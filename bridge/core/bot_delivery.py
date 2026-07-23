@@ -461,11 +461,17 @@ class BotDeliveryMixin:
             BotCommand("skill", "Run skill"),
             BotCommand("command", "Run command"),
         ]
-        for scope in (
-            BotCommandScopeAllPrivateChats(),
-            BotCommandScopeAllGroupChats(),
-            BotCommandScopeAllChatAdministrators(),
-        ):
+        private_commands = list(commands)
+        if getattr(self._config, "bridge_memory_mode", "off") == "audience-scoped":
+            private_commands.insert(
+                2, BotCommand("memory_promote", "Promote a private memory fact")
+            )
+        scopes = (
+            (private_commands, BotCommandScopeAllPrivateChats()),
+            (commands, BotCommandScopeAllGroupChats()),
+            (commands, BotCommandScopeAllChatAdministrators()),
+        )
+        for scoped_commands, scope in scopes:
             app = self._require_application()
-            await app.bot.set_my_commands(commands, scope=scope)
+            await app.bot.set_my_commands(scoped_commands, scope=scope)
         logger.info("Bot commands set")

@@ -37,6 +37,7 @@ files = [
   "bridge/memory/distill_journal.py",
   "bridge/memory/distill_types.py",
   "bridge/memory/distill_worker.py",
+  "bridge/memory/promotion.py",
   "bridge/tests/runtime_conformance.py",
   "bridge/tests/test_agent_runtime_contract.py",
   "bridge/tests/test_codex_app_server.py",

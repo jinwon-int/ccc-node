@@ -15,6 +15,7 @@ from .distill_extraction import parse_extraction_output
 from .distill_journal import DistillJournal
 from .distill_local_sink import CodexLocalMemorySink
 from .distill_types import DistillJob
+from .distill_types import validate_memory_route
 
 
 _INDEX_ENV_ALLOWLIST = (
@@ -164,10 +165,15 @@ class CodexDistillLocalSinkWorker:
             raise _LocalIndexError(terminal=True)
         return candidate
 
-    def _index_environment(self, claimed: DistillJob) -> dict[str, str]:
-        scope = claimed.memory_scope
-        audience = claimed.memory_audience
-        if audience not in {"private", "shared"} or scope is None:
+    def _index_environment(
+        self,
+        *,
+        audience: str,
+        scope: str,
+    ) -> dict[str, str]:
+        try:
+            validate_memory_route(audience, scope)
+        except ValueError:
             raise _LocalIndexError(terminal=True)
         scope_root = self._audience_root / scope
         state_dir = scope_root / "state"
@@ -198,7 +204,13 @@ class CodexDistillLocalSinkWorker:
         )
         return environment
 
-    async def _refresh_index(self, claimed: DistillJob) -> None:
+    async def refresh_route(self, *, audience: str, scope: str) -> None:
+        """Refresh one validated local audience without exposing index output."""
+
+        try:
+            validate_memory_route(audience, scope)
+        except ValueError:
+            raise _LocalIndexError(terminal=True) from None
         indexer = self._validated_indexer()
         if indexer is None:
             return
@@ -209,7 +221,7 @@ class CodexDistillLocalSinkWorker:
                 stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL,
-                env=self._index_environment(claimed),
+                env=self._index_environment(audience=audience, scope=scope),
                 start_new_session=True,
             )
         except _LocalIndexError:
@@ -253,7 +265,11 @@ class CodexDistillLocalSinkWorker:
             )
             sink = self._sink_for(claimed)
             await asyncio.to_thread(sink.write, output, job_id=claimed.job_id)
-            await self._refresh_index(claimed)
+            audience = claimed.memory_audience
+            scope = claimed.memory_scope
+            if audience is None or scope is None:
+                raise ValueError("local sink job has no safe audience route")
+            await self.refresh_route(audience=audience, scope=scope)
         except asyncio.CancelledError:
             await self._fail(
                 claimed,
