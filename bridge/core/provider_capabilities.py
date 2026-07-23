@@ -420,6 +420,25 @@ CAPABILITY_AXES: tuple[CapabilityAxis, ...] = (
             "sink states remain independently replayable (#465)."
         ),
     ),
+    _axis(
+        "lifecycle_observability",
+        RUNTIME_GROUP,
+        "Lifecycle observability",
+        "Interactive lifecycle events normalize into one shared, body-free "
+        "LifecycleObservation contract for audit/redact/evidence/notify parity.",
+        claude=_degraded(
+            "The shared LifecycleObservation contract, credential redaction, and "
+            "owner-only bounded audit ledger are landed and normalize Claude hook "
+            "payloads; wiring the hooks to feed the normalizer is a follow-up.",
+            "#645",
+        ),
+        codex=_degraded(
+            "App-server tool/turn/approval events normalize to LifecycleObservation "
+            "via the shared contract; wiring the normalizer + audit ledger into the "
+            "live runtime is a canary follow-up.",
+            "#645",
+        ),
+    ),
 )
 
 
