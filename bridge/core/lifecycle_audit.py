@@ -11,11 +11,14 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import datetime, timezone
 import fcntl
+from hashlib import sha256
 import json
 import logging
 import os
 from pathlib import Path
+import socket
 import stat
 import threading
 from typing import Iterator
@@ -124,9 +127,18 @@ class LifecycleObserver:
 
     _MAX_TRACKED_SESSIONS = 256
 
-    def __init__(self, ledger: LifecycleAuditLedger, *, provider: str) -> None:
+    def __init__(
+        self,
+        ledger: LifecycleAuditLedger,
+        *,
+        provider: str,
+        spool_dir: Path | None = None,
+        notify: bool = False,
+    ) -> None:
         self._ledger = ledger
         self._provider = provider
+        self._spool_dir = Path(spool_dir) if spool_dir is not None else None
+        self._notify = bool(notify) and self._spool_dir is not None
         # Per-session running evidence tally for the in-flight turn:
         # session_ref -> [file_changes, verifications]. Reset on turn completion.
         self._turn_evidence: dict[str, list[int]] = {}
@@ -174,6 +186,39 @@ class LifecycleObserver:
                         correlation=observation.correlation,
                     )
                 )
+                if self._notify:
+                    self._spool_evidence_notice(session_ref, observation.turn_ref)
+
+    def _spool_evidence_notice(self, session_ref: str, turn_ref: str | None) -> None:
+        """Write a body-free owner notice to the push spool (delivery is still
+        gated by the push notifier). Fail-open; deduped by an O_EXCL filename."""
+        if self._spool_dir is None:
+            return
+        try:
+            ensure_private_directory(self._spool_dir)
+            ts = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+            dedup = f"lifecycle-evidence:{session_ref}:{turn_ref}"
+            record = {
+                "ts": ts,
+                "event": "LifecycleEvidenceGate",
+                "node": socket.gethostname(),
+                "text": (
+                    f"⚠️ ccc-node: a {self._provider} turn changed files with no "
+                    "verification action (test/lint/diff). Review or add a check."
+                ),
+                "dedup": dedup,
+            }
+            payload = (json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8")
+            name = f"{ts.replace(':', '-')}-lifecycle-evidence-{sha256(dedup.encode()).hexdigest()[:12]}.json"
+            fd = os.open(str(self._spool_dir / name), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            try:
+                os.write(fd, payload)
+            finally:
+                os.close(fd)
+        except FileExistsError:
+            return  # already spooled for this turn — deduped
+        except Exception as exc:  # fail-open
+            logger.warning("lifecycle evidence spool failed (continuing): %s", exc)
 
 
 def build_lifecycle_observer(config: object) -> "LifecycleObserver | None":
@@ -189,7 +234,12 @@ def build_lifecycle_observer(config: object) -> "LifecycleObserver | None":
         return None
     base = getattr(config, "bot_data_dir", None) or (Path.home() / ".claude" / "state")
     ledger = LifecycleAuditLedger(Path(base) / "lifecycle-audit")
-    return LifecycleObserver(ledger, provider=provider)
+    notify = bool(getattr(config, "lifecycle_audit_notify", False))
+    spool_dir = getattr(config, "push_spool_dir", None) if notify else None
+    return LifecycleObserver(
+        ledger, provider=provider,
+        spool_dir=Path(spool_dir) if spool_dir else None, notify=notify,
+    )
 
 
 __all__ = [
