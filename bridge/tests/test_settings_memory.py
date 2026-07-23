@@ -27,6 +27,8 @@ MEMORY_FIELDS = {
     "codex_distill_checkpoint_age_seconds": "CCC_CODEX_DISTILL_CHECKPOINT_AGE_SECONDS",
     "codex_distill_model": "CCC_CODEX_DISTILL_MODEL",
     "codex_distill_timeout_seconds": "CCC_CODEX_DISTILL_TIMEOUT_SEC",
+    "codex_skill_collector_enabled": "CCC_CODEX_SKILL_COLLECTOR",
+    "codex_skill_pending_dir": "CCC_SKILL_REVIEW_PENDING_DIR",
 }
 
 
@@ -102,3 +104,8 @@ def test_codex_checkpoint_gates_have_hard_bounds(alias: str, value: int) -> None
             _env_file=None,
             **{alias: value},
         )
+
+
+def test_codex_skill_collector_defaults_off() -> None:
+    # A non-opted node must never build the collector: the flag defaults off.
+    assert Config.model_fields["codex_skill_collector_enabled"].default is False

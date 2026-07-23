@@ -245,6 +245,16 @@ class SkillCandidateSink:
                 finally:
                     os.close(descriptor)
 
+    def has(self, job_id: str) -> bool:
+        """True when a job's candidates were already staged (marker present).
+
+        Lets a collector skip the expensive backend call for jobs it already
+        processed — the write path stays idempotent regardless.
+        """
+        if not isinstance(job_id, str) or not _SHA256_RE.fullmatch(job_id):
+            return False
+        return (self.queue_dir / f"{job_id}.json").exists()
+
     @staticmethod
     def _safe_id(job_id: str, index: int, name: str) -> str:
         raw = f"{job_id[:16]}-{index}-{name}"

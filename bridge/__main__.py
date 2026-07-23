@@ -37,6 +37,7 @@ class AppContext:
     session_store: Any
     session_manager: Any
     distill_journal: Any
+    skill_candidate_collector_worker: Any
     distill_snapshot_worker: Any
     distill_extraction_worker: Any
     distill_local_sink_worker: Any
@@ -243,11 +244,42 @@ def build_context(
             require_memory_route=audience_scoped,
         )
 
+    # Opt-in Codex skill-candidate collector (#667). Three-guard: Codex node,
+    # flag on, and a distill journal to read snapshots from. Default off, so
+    # every other node's composition is unchanged. Activation is canary-gated.
+    skill_candidate_collector_worker = None
+    if (
+        settings.agent_provider == "codex"
+        and getattr(settings, "codex_skill_collector_enabled", False)
+        and distill_journal is not None
+    ):
+        from telegram_bot.memory.skill_candidate import SkillCandidateSink
+        from telegram_bot.memory.skill_candidate_backend import (
+            CodexExecSkillCandidateBackend,
+        )
+        from telegram_bot.memory.skill_candidate_worker import (
+            SkillCandidateCollectorWorker,
+        )
+
+        skill_candidate_collector_worker = SkillCandidateCollectorWorker(
+            journal=distill_journal,
+            backend=CodexExecSkillCandidateBackend(
+                model=settings.codex_distill_model,
+                timeout_seconds=settings.codex_distill_timeout_seconds,
+                audience_auth_mode=settings.codex_audience_auth_mode,
+            ),
+            sink=SkillCandidateSink(
+                settings.bot_data_dir / "skill-candidates",
+                settings.codex_skill_pending_dir,
+            ),
+        )
+
     return AppContext(
         settings=settings,
         session_store=store,
         session_manager=session_manager,
         distill_journal=distill_journal,
+        skill_candidate_collector_worker=skill_candidate_collector_worker,
         distill_snapshot_worker=distill_snapshot_worker,
         distill_extraction_worker=distill_extraction_worker,
         distill_local_sink_worker=distill_local_sink_worker,
@@ -271,6 +303,7 @@ def create_app(context: AppContext):
         session_manager=context.session_manager,
         project_chat=context.project_chat,
         distill_journal=context.distill_journal,
+        skill_candidate_collector_worker=context.skill_candidate_collector_worker,
         distill_snapshot_worker=context.distill_snapshot_worker,
         distill_extraction_worker=context.distill_extraction_worker,
         distill_local_sink_worker=context.distill_local_sink_worker,
