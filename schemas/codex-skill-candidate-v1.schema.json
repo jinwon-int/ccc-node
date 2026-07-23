@@ -83,6 +83,7 @@
         "name",
         "summary",
         "reason",
+        "evidence_excerpt",
         "skill_md"
       ],
       "title": "SkillCandidate",
@@ -112,7 +113,8 @@
   },
   "required": [
     "schema_version",
-    "provenance"
+    "provenance",
+    "candidates"
   ],
   "title": "SkillCandidateOutput",
   "type": "object"
