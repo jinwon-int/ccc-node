@@ -64,8 +64,11 @@ deduped). Default off; the tap is fail-open and never blocks a turn.
   action needs evidence. When the opt-in observer is on, it tallies evidence per
   turn and, on turn completion, **records a body-free `evidence-missing` warning
   observation** to the ledger — it only appends a record, never blocks the turn
-  or re-prompts, so there is no stop loop. Delivering that warning to the user
-  (Telegram) and `Notification`/`PreCompact` checkpoint parity remain follow-ups.
+  or re-prompts, so there is no stop loop. With `CCC_LIFECYCLE_AUDIT_NOTIFY=true`
+  (a second opt-in) it also writes a body-free owner notice to the push spool;
+  the actual Telegram send stays gated by the push notifier
+  (`CCC_PUSH_ENABLED`) — no direct provider send. `Notification`/`PreCompact`
+  checkpoint parity remain follow-ups.
 - **Redaction unification**: `skill_candidate` and `distill_extraction` now
   import the canonical set from `bridge/utils/redaction.py`; `agent_cron`
   (broader owner-spool set) and the bash `audit.sh`/`notify.sh` copies remain.

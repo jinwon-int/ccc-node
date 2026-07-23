@@ -184,3 +184,34 @@ def test_observer_no_warning_without_file_change(tmp_path: Path) -> None:
     observer.observe(_tool("Bash", command="ls"), session_id="s1")  # not a file change
     observer.observe(_turn(), session_id="s1")
     assert not [r for r in _records(tmp_path) if r.get("flag") == "evidence-missing"]
+
+
+def test_observer_spools_owner_notice_when_notify_on(tmp_path: Path) -> None:
+    from telegram_bot.core.lifecycle_audit import LifecycleObserver
+    spool = tmp_path / "spool"
+    observer = LifecycleObserver(
+        LifecycleAuditLedger(tmp_path / "audit"), provider="codex",
+        spool_dir=spool, notify=True,
+    )
+    observer.observe(_tool("Edit"), session_id="s1")
+    observer.observe(_tool("Bash", command="rm -rf x"), session_id="s1")
+    observer.observe(_turn(), session_id="s1")
+    files = list(spool.glob("*.json"))
+    assert len(files) == 1
+    rec = json.loads(files[0].read_text())
+    assert rec["event"] == "LifecycleEvidenceGate" and "verification" in rec["text"]
+    # Body-free: no session id or command in the notice.
+    assert "s1" not in json.dumps(rec) and "rm -rf" not in json.dumps(rec)
+
+
+def test_observer_does_not_spool_when_notify_off(tmp_path: Path) -> None:
+    from telegram_bot.core.lifecycle_audit import LifecycleObserver
+    spool = tmp_path / "spool"
+    observer = LifecycleObserver(
+        LifecycleAuditLedger(tmp_path / "audit"), provider="codex", spool_dir=spool, notify=False,
+    )
+    observer.observe(_tool("Edit"), session_id="s1")
+    observer.observe(_turn(), session_id="s1")
+    # Ledger warning still recorded, but no owner notice spooled.
+    assert [r for r in _records(tmp_path) if r.get("flag") == "evidence-missing"]
+    assert not spool.exists() or not list(spool.glob("*.json"))

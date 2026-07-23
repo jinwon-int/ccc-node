@@ -416,6 +416,16 @@ class Config(
             "fail-open, never blocks a turn."
         ),
     )
+    lifecycle_audit_notify: bool = Field(
+        default=False,
+        alias="CCC_LIFECYCLE_AUDIT_NOTIFY",
+        description=(
+            "Opt-in (#645): additionally spool a body-free owner notice when the "
+            "evidence gate flags a file-changing turn with no verification. "
+            "Requires lifecycle_audit_enabled; delivery is still gated by the "
+            "push notifier (CCC_PUSH_ENABLED). Default off."
+        ),
+    )
 
     @field_validator("push_enabled", mode="before")
     @classmethod
