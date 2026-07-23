@@ -24,10 +24,17 @@ class WikiBackend:
         return fixtures.wiki_output_for(extraction_input)
 
 
-async def wiki_job(journal: DistillJournal):  # type: ignore[no-untyped-def]
+async def wiki_job(
+    journal: DistillJournal,
+    *,
+    memory_audience: str | None = None,
+    memory_scope: str | None = None,
+):  # type: ignore[no-untyped-def]
     snapshot_done = fixtures.snapshot_done_job(
         journal,
         thread_id="thread-wiki-worker",
+        memory_audience=memory_audience,
+        memory_scope=memory_scope,
     )
     return await CodexDistillExtractionWorker(
         journal,
@@ -54,6 +61,63 @@ async def test_worker_queues_validated_candidate_for_human_review(tmp_path: Path
     record = json.loads((queue / f"{job.job_id}.json").read_text())
     assert record["review_status"] == "pending"
     assert record["candidates"][0]["suggested_path"].startswith("pages/nodes/")
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("memory_audience", "scope"),
+    [
+        ("private", "private-0123456789abcdef0123456789abcdef"),
+        ("shared", "shared"),
+    ],
+)
+async def test_worker_routes_candidate_to_opaque_audience_queue(
+    tmp_path: Path,
+    memory_audience: str,
+    scope: str,
+) -> None:
+    journal = DistillJournal(tmp_path / "journal")
+    journal.initialize()
+    job = await wiki_job(
+        journal,
+        memory_audience=memory_audience,
+        memory_scope=scope,
+    )
+    queue = tmp_path / "wiki-candidates"
+    worker = CodexDistillWikiSinkWorker(
+        journal, queue_dir=queue, owner_token="wiki-worker"
+    )
+
+    result = await worker.write_once(job_id=job.job_id)
+
+    assert result.wiki_sink_status is DistillWikiSinkStatus.DONE
+    path = queue / scope / f"{job.job_id}.json"
+    record = json.loads(path.read_text())
+    assert record["memory_audience"] == memory_audience
+    assert record["memory_scope"] == scope
+    assert not (queue / f"{job.job_id}.json").exists()
+
+
+@pytest.mark.anyio
+async def test_route_required_worker_rejects_legacy_unscoped_job(
+    tmp_path: Path,
+) -> None:
+    journal = DistillJournal(tmp_path / "journal")
+    journal.initialize()
+    job = await wiki_job(journal)
+    queue = tmp_path / "wiki-candidates"
+    worker = CodexDistillWikiSinkWorker(
+        journal,
+        queue_dir=queue,
+        owner_token="wiki-worker",
+        require_memory_route=True,
+    )
+
+    result = await worker.write_once(job_id=job.job_id)
+
+    assert result.wiki_sink_status is DistillWikiSinkStatus.TERMINAL_FAILED
+    assert result.error_code == "wiki_sink_route_missing"
+    assert not (queue / f"{job.job_id}.json").exists()
 
 
 @pytest.mark.anyio
@@ -147,4 +211,3 @@ async def test_lifecycle_loop_drives_pending_wiki_work(tmp_path: Path) -> None:
         await asyncio.wait_for(task, timeout=2)
 
     assert journal.get(job.job_id).wiki_sink_status is DistillWikiSinkStatus.DONE
-

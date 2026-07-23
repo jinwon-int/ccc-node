@@ -16,6 +16,7 @@ from typing import Iterator
 from telegram_bot.utils.secure_fs import _atomic_write_bytes, ensure_private_directory
 
 from .distill_extraction import DistillExtractionOutput
+from .distill_types import validate_memory_route
 
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -39,8 +40,19 @@ class CodexWikiCandidateSink:
     invokes ``wiki-agent``, creates a branch or PR, or writes to a Wiki tree.
     """
 
-    def __init__(self, queue_dir: Path) -> None:
+    def __init__(
+        self,
+        queue_dir: Path,
+        *,
+        memory_audience: str | None = None,
+        memory_scope: str | None = None,
+    ) -> None:
+        validate_memory_route(memory_audience, memory_scope)
         self.queue_dir = Path(os.path.abspath(os.fspath(queue_dir)))
+        if memory_scope is not None and self.queue_dir.name != memory_scope:
+            raise ValueError("Wiki candidate queue must match memory scope")
+        self._memory_audience = memory_audience
+        self._memory_scope = memory_scope
         self._lock_path = self.queue_dir / ".wiki-candidate-sink.lock"
         self._thread_lock = threading.RLock()
 
@@ -92,8 +104,7 @@ class CodexWikiCandidateSink:
                 finally:
                     os.close(descriptor)
 
-    @staticmethod
-    def _payload(output: DistillExtractionOutput, *, job_id: str) -> bytes:
+    def _payload(self, output: DistillExtractionOutput, *, job_id: str) -> bytes:
         provenance = output.provenance
         record = {
             "schema_version": output.schema_version,
@@ -110,6 +121,9 @@ class CodexWikiCandidateSink:
                 for candidate in output.wiki_candidates
             ],
         }
+        if self._memory_audience is not None:
+            record["memory_audience"] = self._memory_audience
+            record["memory_scope"] = self._memory_scope
         return json.dumps(
             record,
             ensure_ascii=False,

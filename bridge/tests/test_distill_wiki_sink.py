@@ -16,6 +16,7 @@ from telegram_bot.memory.distill_wiki_sink import CodexWikiCandidateSink
 
 JOB_ID = "a" * 64
 THREAD_HASH = "b" * 64
+PRIVATE_SCOPE = "private-0123456789abcdef0123456789abcdef"
 
 
 def extraction_output(*, candidates: bool = True) -> DistillExtractionOutput:
@@ -90,6 +91,59 @@ def test_writes_owner_only_human_review_record_without_raw_identity(
     assert "telegram" not in serialized.lower()
     assert stat.S_IMODE(queue.stat().st_mode) == 0o700
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+def test_routed_candidates_are_partitioned_and_audience_labelled(
+    tmp_path: Path,
+) -> None:
+    queue = tmp_path / "wiki-candidates"
+    other_scope = "private-fedcba9876543210fedcba9876543210"
+    private_sink = CodexWikiCandidateSink(
+        queue / PRIVATE_SCOPE,
+        memory_audience="private",
+        memory_scope=PRIVATE_SCOPE,
+    )
+    other_sink = CodexWikiCandidateSink(
+        queue / other_scope,
+        memory_audience="private",
+        memory_scope=other_scope,
+    )
+
+    private_sink.write(extraction_output(), job_id=JOB_ID)
+    other_sink.write(extraction_output(), job_id=JOB_ID)
+
+    private_path = queue / PRIVATE_SCOPE / f"{JOB_ID}.json"
+    other_path = queue / other_scope / f"{JOB_ID}.json"
+    record = json.loads(private_path.read_text())
+    assert record["memory_audience"] == "private"
+    assert record["memory_scope"] == PRIVATE_SCOPE
+    assert private_path.is_file()
+    assert other_path.is_file()
+    assert not (queue / f"{JOB_ID}.json").exists()
+    assert stat.S_IMODE((queue / PRIVATE_SCOPE).stat().st_mode) == 0o700
+    assert stat.S_IMODE(private_path.stat().st_mode) == 0o600
+
+
+@pytest.mark.parametrize(
+    ("memory_audience", "memory_scope"),
+    [
+        ("private", None),
+        (None, PRIVATE_SCOPE),
+        ("private", "../unsafe"),
+        ("shared", PRIVATE_SCOPE),
+    ],
+)
+def test_rejects_invalid_candidate_memory_route(
+    tmp_path: Path,
+    memory_audience: str | None,
+    memory_scope: str | None,
+) -> None:
+    with pytest.raises(ValueError, match="memory audience route"):
+        CodexWikiCandidateSink(
+            tmp_path / "wiki-candidates",
+            memory_audience=memory_audience,
+            memory_scope=memory_scope,
+        )
 
 
 @pytest.mark.anyio

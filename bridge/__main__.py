@@ -152,8 +152,7 @@ def build_context(
 
     audience_scoped = settings.bridge_memory_mode == "audience-scoped"
     wiki_enabled = (
-        not audience_scoped
-        and settings.node_isolation_profile != "external"
+        settings.node_isolation_profile != "external"
         and settings.wiki_memory_enabled
     )
     honcho_enabled = (
@@ -219,6 +218,7 @@ def build_context(
         distill_wiki_sink_worker = CodexDistillWikiSinkWorker(
             distill_journal,
             queue_dir=settings.bot_data_dir / "wiki-candidates",
+            require_memory_route=audience_scoped,
         )
     distill_honcho_sink_worker = None
     if settings.agent_provider == "codex" and honcho_enabled:

@@ -18,6 +18,11 @@ All notable changes to the Claude Code node harness. Dates are KST.
   suite cover idempotence, comment preservation, invalid TOML, and symlinks.
 
 ### Fixed
+- Audience-scoped Codex distillation can now produce human-review Wiki candidates
+  without returning to the global queue. Candidate records are labelled `private`
+  or `shared`, physically partitioned by opaque memory scope, and remain local and
+  owner-only; the legacy unscoped queue layout is unchanged and Honcho remains
+  disabled in audience-scoped mode.
 - GitHub CLI-first setup now falls back to `tomli` on Python 3.10 nodes instead
   of importing the Python 3.11-only `tomllib` unconditionally. If neither parser
   exists, setup still fails closed with a body-free error code.
