@@ -186,6 +186,14 @@ def load_or_create_audience_key(settings: Any) -> bytes:
     parent_info = path.parent.stat()
     if not stat.S_ISDIR(parent_info.st_mode):
         raise ValueError(f"memory audience key parent is not a directory: {path.parent}")
+    # Path.mkdir(mode=..., exist_ok=True) only applies the mode when it *creates*
+    # the directory; a .telegram_bot created earlier by start.sh/legacy code under
+    # the default umask 022 (-> 0755) is left untouched and would then fail the
+    # guard below forever. Self-heal a bridge-OWNED parent by tightening it to
+    # 0700. A parent owned by another user is a real exposure and still raises.
+    if parent_info.st_uid == os.geteuid() and stat.S_IMODE(parent_info.st_mode) & 0o077:
+        os.chmod(path.parent, 0o700)
+        parent_info = path.parent.stat()
     if parent_info.st_uid != os.geteuid() or stat.S_IMODE(parent_info.st_mode) & 0o077:
         raise ValueError(
             "memory audience key parent must be bridge-owned and mode 0700: "

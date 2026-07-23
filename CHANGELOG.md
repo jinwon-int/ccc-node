@@ -18,6 +18,15 @@ All notable changes to the Claude Code node harness. Dates are KST.
   suite cover idempotence, comment preservation, invalid TOML, and symlinks.
 
 ### Fixed
+- The memory-audience 0700 guard now self-heals a bridge-owned key-parent
+  directory instead of failing closed forever. `load_or_create_audience_key`
+  used `Path.mkdir(mode=0o700, exist_ok=True)`, which only applies the mode when
+  it *creates* the directory — so a `.telegram_bot` created earlier under the
+  default umask 022 (→ 0755) stayed loose and the bot answered every message
+  with "memory audience key parent must be bridge-owned and mode 0700" (observed
+  on 8/12 fleet nodes, 2026-07-22). A bridge-owned parent is now tightened to
+  0700 with an explicit `chmod`; a parent owned by another user is a real
+  exposure and still fails closed. Regression tests added. (#659)
 - Audience-scoped Honcho recall and write-back now use physically distinct
   server-side workspaces derived from opaque memory scopes. Shared routes can
   access only the shared workspace; private routes can access their private and
