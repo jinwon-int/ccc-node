@@ -89,14 +89,14 @@ class CodexManagedSkillsTest(unittest.TestCase):
         payload = json.loads(result.stdout)
         self.assertTrue(payload["ok"])
         self.assertGreater(payload["classified_assets"], 20)
-        self.assertEqual(payload["managed_skills"], 6)
+        self.assertEqual(payload["managed_skills"], 7)
 
     def test_plan_is_body_free_and_does_not_create_codex_home(self) -> None:
         result = run_tool("plan", "--codex-home", str(self.home))
         self.assertEqual(result.returncode, 0, result.stderr)
         payload = json.loads(result.stdout)
         self.assertEqual({item["status"] for item in payload["skills"]}, {"create"})
-        self.assertEqual(len(payload["skills"]), 6)
+        self.assertEqual(len(payload["skills"]), 7)
         self.assertFalse(self.home.exists())
         self.assertNotIn("description", result.stdout.lower())
         self.assertNotIn("procedure", result.stdout.lower())
@@ -107,7 +107,7 @@ class CodexManagedSkillsTest(unittest.TestCase):
         first_digest = tree_digest(self.home)
         payload = json.loads(first.stdout)
         names = {item["name"] for item in payload["skills"]}
-        self.assertEqual(len(names), 6)
+        self.assertEqual(len(names), 7)
         for name in names:
             target = self.home / "skills" / name
             marker = json.loads((target / ".ccc-node-managed.json").read_text())

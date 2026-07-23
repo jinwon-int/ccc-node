@@ -1,0 +1,4 @@
+interface:
+  display_name: "GitHub PR Flow"
+  short_description: "Exact-head review and protected squash merge"
+  default_prompt: "Use $gh-pr-flow to validate, independently approve, and safely merge this pull request."

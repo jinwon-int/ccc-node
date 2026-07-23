@@ -18,7 +18,7 @@ Each asset is `shared`, `adapted`, `claude-only`, `codex-only`, or
 other asset is unclassified, matches multiple rules, or a managed Codex skill
 contains a harness-specific reference that Codex cannot use.
 
-The first managed set is:
+The managed set is:
 
 | Skill | Purpose |
 |---|---|
@@ -28,6 +28,7 @@ The first managed set is:
 | `ccc-agent-cron` | Scheduled-task inspection and explicit execution boundary |
 | `ccc-self-update` | Drift check and approval-gated transactional update |
 | `ccc-wiki-record` | Family Wiki PR-first durable recording |
+| `gh-pr-flow` | Exact-head protected PR review and normal squash merge |
 
 Claude-native lifecycle hooks, sub-agent definitions, MCP registration, and
 transcript skill-autosave assets are not copied or presented as Codex features.
@@ -73,4 +74,6 @@ provenance lets it converge back transactionally.
 This static catalog does not collect sessions, generate candidates, switch
 `off|approve|auto`, or install learned skills. Those remain #643. Provider-aware
 doctor reporting and scoped repair of managed-skill drift remain the next #647
-slice.
+slice. `gh-pr-flow` never moves a GitHub credential: its approval helper runs
+`gh` on Seoseo with the root-owned isolated config and owner-only credential
+file, and returns only body-free gate results.
