@@ -161,7 +161,15 @@ class CodexExecSkillCandidateBackend:
             result = parse_skill_candidate_output(output_payload)
         except SkillCandidateParseError:
             raise SkillCandidateBackendError("skill_candidate_output_invalid") from None
-        if result.provenance != provenance:
+        # Verify the model echoed the identity fields we asked it to copy. NOT
+        # distilled_at — the model generates its own timestamp (it cannot know
+        # ours), so full-equality would always fail. Mirrors the distill backend.
+        echoed = result.provenance
+        if (
+            echoed.provider != provenance.provider
+            or echoed.source_thread_hash != provenance.source_thread_hash
+            or echoed.trigger != provenance.trigger
+        ):
             raise SkillCandidateBackendError("skill_candidate_output_invalid")
         return result
 
