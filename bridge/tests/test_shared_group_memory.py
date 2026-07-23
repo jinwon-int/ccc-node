@@ -115,6 +115,8 @@ def _audience_settings(tmp_path: Path, scope: str = "shared-groups"):
     settings = _handler_settings(tmp_path, scope)
     settings.bridge_memory_mode = "audience-scoped"
     settings.bot_data_dir = tmp_path / ".telegram_bot"
+    settings.honcho_memory_enabled = True
+    settings.honcho_config_path = tmp_path / "honcho.json"
     settings.bridge_memory_audience_root = None
     settings.bridge_memory_audience_key_path = None
     settings.bridge_unsafe_shared_all_memory = False
@@ -170,8 +172,14 @@ def test_audience_settings_keep_public_and_private_sources_separate(tmp_path: Pa
     assert public_env["CCC_MEMORY_AUDIENCE"] == "shared"
     assert private_env["CCC_MEMORY_SHARED_STATE_DIR"] == public_env["CCC_STATE_DIR"]
     assert private_env["CCC_STATE_DIR"] != public_env["CCC_STATE_DIR"]
-    assert private_env["CCC_HONCHO_MEMORY_ENABLED"] == "0"
-    assert public_env["CCC_HONCHO_MEMORY_ENABLED"] == "0"
+    assert private_env["CCC_HONCHO_MEMORY_ENABLED"] == "1"
+    assert public_env["CCC_HONCHO_MEMORY_ENABLED"] == "1"
+    assert private_env["CCC_HONCHO_AUDIENCE_SCOPED"] == "1"
+    assert public_env["CCC_HONCHO_AUDIENCE_SCOPED"] == "1"
+    assert private_env["CCC_HONCHO_WORKSPACE_SCOPE"] == private.scope
+    assert public_env["CCC_HONCHO_WORKSPACE_SCOPE"] == "shared"
+    assert private_env["CCC_HONCHO_SHARED_WORKSPACE_SCOPE"] == "shared"
+    assert private_env["CCC_HONCHO_CFG"] == str(settings.honcho_config_path)
     assert private_env["CCC_WIKI_MEMORY_ENABLED"] == "0"
     assert public_env["CCC_WIKI_MEMORY_ENABLED"] == "0"
     assert "934719283" not in private_raw

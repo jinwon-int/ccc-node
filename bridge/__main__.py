@@ -156,8 +156,7 @@ def build_context(
         and settings.wiki_memory_enabled
     )
     honcho_enabled = (
-        not audience_scoped
-        and settings.honcho_memory_enabled
+        settings.honcho_memory_enabled
     )
     distill_environment = None
     if (
@@ -234,6 +233,7 @@ def build_context(
                 settings.honcho_config_path,
                 node_label=os.environ.get("CCC_NODE", "ccc-node"),
             ),
+            require_memory_route=audience_scoped,
         )
 
     return AppContext(

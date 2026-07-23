@@ -156,5 +156,109 @@ out="$(PATH="$fakebin:$PATH" WIKI_CALL_MARKER="$TMP/wiki-called" HOME="$TMP/home
 ok "wiki-disabled refresh does not invoke wiki-agent" '[ "$rc" = 0 ] && [ ! -e "$TMP/wiki-called" ]'
 ok "wiki-disabled refresh reports effective disabled status" 'jq -e ".sources.wiki.status == \"disabled\" and .sources.wiki.bytes == 0" "$cache/meta.json" >/dev/null'
 
+cat > "$fakebin/curl" <<'SH'
+#!/usr/bin/env bash
+url=""
+for arg in "$@"; do
+  case "$arg" in http://*|https://*) url="$arg" ;; esac
+done
+printf '%s\n' "$url" >> "${HONCHO_URL_LOG:?}"
+case "$url" in
+  *family--ccc-private-00000000000000000000000000000000*)
+    printf '{"content":"PRIVATE_HONCHO_ONLY"}\n'
+    ;;
+  *family--ccc-shared*)
+    printf '{"content":"SHARED_HONCHO_PUBLIC"}\n'
+    ;;
+  */workspaces/family/peers/*)
+    printf '{"content":"LEGACY_HONCHO_PRIVATE_ONLY"}\n'
+    ;;
+  *)
+    printf '{"content":""}\n'
+    ;;
+esac
+SH
+chmod +x "$fakebin/curl"
+honcho_cfg="$TMP/honcho.json"
+printf '%s\n' '{"baseUrl":"https://honcho.invalid","workspace":"family","peerName":"peer-a"}' > "$honcho_cfg"
+chmod 600 "$honcho_cfg"
+honcho_url_log="$TMP/honcho-urls.log"
+
+: > "$honcho_url_log"
+rm -f "$audroot/shared/cache/honcho.txt"
+out="$(PATH="$fakebin:$PATH" HONCHO_URL_LOG="$honcho_url_log" HOME="$TMP/home" \
+  CCC_MEMORY_AUDIENCE_SCOPED=1 CCC_MEMORY_AUDIENCE=shared CCC_MEMORY_SCOPE=shared \
+  CCC_MEMORY_AUDIENCE_ROOT="$audroot" \
+  CCC_STATE_DIR="$audroot/shared/state" CCC_MEMORY_CACHE_DIR="$audroot/shared/cache" \
+  CCC_MEMORY_DIR="$shared_mem" CCC_MEMORY_INDEX_DB="$audroot/shared/state/memory-index.sqlite" \
+  CCC_MEMORY_FACTS_FILE="$audroot/shared/state/memory-facts.jsonl" \
+  CCC_MEMORY_SHARED_STATE_DIR="$audroot/shared/state" \
+  CCC_MEMORY_SHARED_CACHE_DIR="$audroot/shared/cache" \
+  CCC_MEMORY_SHARED_DIR="$shared_mem" \
+  CCC_MEMORY_SHARED_FACTS_FILE="$audroot/shared/state/memory-facts.jsonl" \
+  CCC_HOOK_DIR="$ROOT/claude/hooks" CCC_MEMORY_TOOLS_DIR="$tools" \
+  CCC_WIKI_MEMORY_ENABLED=0 CCC_HONCHO_MEMORY_ENABLED=1 \
+  CCC_HONCHO_AUDIENCE_SCOPED=1 CCC_HONCHO_WORKSPACE_SCOPE=shared \
+  CCC_HONCHO_SHARED_WORKSPACE_SCOPE=shared CCC_HONCHO_CFG="$honcho_cfg" \
+  bash "$ROOT/claude/hooks/refresh-memory.sh" 2>&1)"; rc=$?
+ok "shared audience refresh queries only its physical Honcho workspace" \
+  '[ "$rc" = 0 ] && [ "$(wc -l < "$honcho_url_log")" = 1 ] && grep -q "family--ccc-shared" "$honcho_url_log" && ! grep -q "private-\|/workspaces/family/" "$honcho_url_log"'
+ok "shared audience cache contains no private or legacy Honcho result" \
+  'grep -q "SHARED_HONCHO_PUBLIC" "$audroot/shared/cache/honcho.txt" && ! grep -q "PRIVATE_HONCHO_ONLY\|LEGACY_HONCHO_PRIVATE_ONLY" "$audroot/shared/cache/honcho.txt"'
+
+: > "$honcho_url_log"
+rm -f "$audroot/$private_scope/cache/honcho.txt"
+out="$(PATH="$fakebin:$PATH" HONCHO_URL_LOG="$honcho_url_log" HOME="$TMP/home" \
+  CCC_MEMORY_AUDIENCE_SCOPED=1 CCC_MEMORY_AUDIENCE=private CCC_MEMORY_SCOPE="$private_scope" \
+  CCC_MEMORY_AUDIENCE_ROOT="$audroot" \
+  CCC_STATE_DIR="$audroot/$private_scope/state" CCC_MEMORY_CACHE_DIR="$audroot/$private_scope/cache" \
+  CCC_MEMORY_DIR="$private_mem" CCC_MEMORY_INDEX_DB="$audroot/$private_scope/state/memory-index.sqlite" \
+  CCC_MEMORY_FACTS_FILE="$audroot/$private_scope/state/memory-facts.jsonl" \
+  CCC_MEMORY_SHARED_STATE_DIR="$audroot/shared/state" \
+  CCC_MEMORY_SHARED_CACHE_DIR="$audroot/shared/cache" \
+  CCC_MEMORY_SHARED_DIR="$shared_mem" \
+  CCC_MEMORY_SHARED_FACTS_FILE="$audroot/shared/state/memory-facts.jsonl" \
+  CCC_HOOK_DIR="$ROOT/claude/hooks" CCC_MEMORY_TOOLS_DIR="$tools" \
+  CCC_WIKI_MEMORY_ENABLED=0 CCC_HONCHO_MEMORY_ENABLED=1 \
+  CCC_HONCHO_AUDIENCE_SCOPED=1 CCC_HONCHO_WORKSPACE_SCOPE="$private_scope" \
+  CCC_HONCHO_SHARED_WORKSPACE_SCOPE=shared CCC_HONCHO_CFG="$honcho_cfg" \
+  bash "$ROOT/claude/hooks/refresh-memory.sh" 2>&1)"; rc=$?
+ok "private audience refresh queries private shared and private-only legacy workspaces" \
+  '[ "$rc" = 0 ] && [ "$(wc -l < "$honcho_url_log")" = 3 ] && grep -q "family--ccc-$private_scope" "$honcho_url_log" && grep -q "family--ccc-shared" "$honcho_url_log" && grep -q "/workspaces/family/peers/" "$honcho_url_log"'
+ok "private audience cache labels all allowed Honcho sources" \
+  'grep -q "PRIVATE_HONCHO_ONLY" "$audroot/$private_scope/cache/honcho.txt" && grep -q "SHARED_HONCHO_PUBLIC" "$audroot/$private_scope/cache/honcho.txt" && grep -q "LEGACY_HONCHO_PRIVATE_ONLY" "$audroot/$private_scope/cache/honcho.txt"'
+
+out="$(HOME="$TMP/home" \
+  CCC_MEMORY_AUDIENCE_SCOPED=1 CCC_MEMORY_AUDIENCE=shared CCC_MEMORY_SCOPE=shared \
+  CCC_MEMORY_AUDIENCE_ROOT="$audroot" \
+  CCC_STATE_DIR="$audroot/shared/state" CCC_MEMORY_CACHE_DIR="$audroot/shared/cache" \
+  CCC_RESUME_FILE="$audroot/shared/state/resume.md" CCC_MEMORY_DIR="$shared_mem" \
+  CCC_MEMORY_SHARED_STATE_DIR="$audroot/shared/state" \
+  CCC_MEMORY_SHARED_CACHE_DIR="$audroot/shared/cache" \
+  CCC_MEMORY_SHARED_DIR="$shared_mem" \
+  CCC_HOOK_DIR="$ROOT/claude/hooks" CCC_MEMORY_TOOLS_DIR="$tools" \
+  CCC_LOCAL_MEMORY_ENABLED=0 CCC_WIKI_MEMORY_ENABLED=0 CCC_HONCHO_MEMORY_ENABLED=1 \
+  CCC_HONCHO_AUDIENCE_SCOPED=1 CCC_HONCHO_WORKSPACE_SCOPE=shared \
+  CCC_HONCHO_SHARED_WORKSPACE_SCOPE=shared CCC_MEMORY_NO_REFRESH=1 \
+  bash "$ROOT/claude/hooks/load-memory.sh" SessionStart 2>&1)"; rc=$?
+ok "shared audience injects only its physically scoped Honcho cache" \
+  '[ "$rc" = 0 ] && grep -q "SHARED_HONCHO_PUBLIC" <<<"$out" && ! grep -q "PRIVATE_HONCHO_ONLY\|LEGACY_HONCHO_PRIVATE_ONLY" <<<"$out"'
+
+out="$(HOME="$TMP/home" \
+  CCC_MEMORY_AUDIENCE_SCOPED=1 CCC_MEMORY_AUDIENCE=private CCC_MEMORY_SCOPE="$private_scope" \
+  CCC_MEMORY_AUDIENCE_ROOT="$audroot" \
+  CCC_STATE_DIR="$audroot/$private_scope/state" CCC_MEMORY_CACHE_DIR="$audroot/$private_scope/cache" \
+  CCC_RESUME_FILE="$audroot/$private_scope/state/resume.md" CCC_MEMORY_DIR="$private_mem" \
+  CCC_MEMORY_SHARED_STATE_DIR="$audroot/shared/state" \
+  CCC_MEMORY_SHARED_CACHE_DIR="$audroot/shared/cache" \
+  CCC_MEMORY_SHARED_DIR="$shared_mem" CCC_MEMORY_LEGACY_DIR="$legacy_mem" \
+  CCC_HOOK_DIR="$ROOT/claude/hooks" CCC_MEMORY_TOOLS_DIR="$tools" \
+  CCC_LOCAL_MEMORY_ENABLED=0 CCC_WIKI_MEMORY_ENABLED=0 CCC_HONCHO_MEMORY_ENABLED=1 \
+  CCC_HONCHO_AUDIENCE_SCOPED=1 CCC_HONCHO_WORKSPACE_SCOPE="$private_scope" \
+  CCC_HONCHO_SHARED_WORKSPACE_SCOPE=shared CCC_MEMORY_NO_REFRESH=1 \
+  bash "$ROOT/claude/hooks/load-memory.sh" SessionStart 2>&1)"; rc=$?
+ok "private audience injects private shared and private-only legacy Honcho cache" \
+  '[ "$rc" = 0 ] && grep -q "PRIVATE_HONCHO_ONLY" <<<"$out" && grep -q "SHARED_HONCHO_PUBLIC" <<<"$out" && grep -q "LEGACY_HONCHO_PRIVATE_ONLY" <<<"$out"'
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

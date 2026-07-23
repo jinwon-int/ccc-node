@@ -16,6 +16,9 @@ SHARED_STATE_DIR="${CCC_MEMORY_SHARED_STATE_DIR:-}"
 SHARED_CACHE_DIR="${CCC_MEMORY_SHARED_CACHE_DIR:-}"
 SHARED_MEMDIR="${CCC_MEMORY_SHARED_DIR:-}"
 SHARED_FACTS_FILE="${CCC_MEMORY_SHARED_FACTS_FILE:-}"
+HONCHO_AUDIENCE_SCOPED="${CCC_HONCHO_AUDIENCE_SCOPED:-0}"
+HONCHO_WORKSPACE_SCOPE="${CCC_HONCHO_WORKSPACE_SCOPE:-}"
+HONCHO_SHARED_WORKSPACE_SCOPE="${CCC_HONCHO_SHARED_WORKSPACE_SCOPE:-}"
 
 # memory_scope_core_valid — audience:scope shape plus the scoped paths every
 # memory hook shares. Callers add their hook-specific path checks on top:
@@ -37,4 +40,12 @@ memory_scope_core_valid() {
     && [ "$SHARED_STATE_DIR" = "$AUDIENCE_ROOT/shared/state" ] \
     && [ "$SHARED_CACHE_DIR" = "$AUDIENCE_ROOT/shared/cache" ] \
     && [ "$SHARED_MEMDIR" = "$AUDIENCE_ROOT/shared/memories" ]
+}
+
+# Honcho may be enabled in audience mode only when its server-side workspace
+# suffixes are bound to the same validated opaque route.
+honcho_scope_valid() {
+  ! is_disabled "$HONCHO_AUDIENCE_SCOPED" \
+    && [ "$HONCHO_WORKSPACE_SCOPE" = "$MEMORY_SCOPE" ] \
+    && [ "$HONCHO_SHARED_WORKSPACE_SCOPE" = "shared" ]
 }
