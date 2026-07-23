@@ -1,0 +1,4 @@
+interface:
+  display_name: "CCC Agent Cron"
+  short_description: "Inspect and safely manage ccc-node scheduled tasks"
+  default_prompt: "Use $ccc-agent-cron to inspect scheduled agent tasks and explain their execution boundary."

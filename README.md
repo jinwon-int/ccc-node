@@ -69,7 +69,7 @@ setup.sh                   Idempotent bootstrap; refuses to overwrite real node 
 | `CCC_HERMES_DIR` | `$HOME/.hermes` | Hermes-side config templates |
 | `CCC_WIKI_AGENT_BIN` | `$HOME/.wiki-agent/bin/wiki-agent` | Family Wiki reader/writer binary path |
 | `CCC_BRIDGE_DEFAULT_PATH` | `$HOME` | Suggested Telegram bridge workspace |
-| `CODEX_HOME` | `$HOME/.codex` | Codex config target; setup applies the GitHub CLI-first plugin toggle here |
+| `CODEX_HOME` | `$HOME/.codex` | Codex config and managed-skill target; setup applies the GitHub CLI-first toggle and reconciles the explicit compatibility catalog |
 | `CCC_STATE_DIR` | `$CCC_CLAUDE_DIR/state` | Local node state and memory index |
 | `CCC_MEMORY_PROFILE` | `honcho` | Memory profile: `honcho`, `hybrid`, or `max-perf` |
 | `CCC_MEMORY_CACHE_DIR` | `$CCC_CLAUDE_DIR/hooks/cache` | Wiki/Honcho cache metadata |

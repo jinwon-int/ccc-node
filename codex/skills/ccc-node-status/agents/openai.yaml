@@ -1,0 +1,4 @@
+interface:
+  display_name: "CCC Node Status"
+  short_description: "Inspect ccc-node source, bridge, and scheduler health"
+  default_prompt: "Use $ccc-node-status to inspect this node and report its current operational health."

@@ -50,6 +50,8 @@ ok "setup executor does not evaluate command strings" \
 ok "setup non-root dry-run avoids hardcoded root paths in checklist" '! grep -q "/root/.wiki-agent/bin/wiki-agent" <<<"$out" && ! grep -q -- "--path /root" <<<"$out"'
 ok "setup non-root dry-run writes nothing to override dirs" '[ ! -e "$nonroot_claude" ] && [ ! -e "$nonroot_hermes" ]'
 ok "setup dry-run does not create Codex plugin policy state" '[ ! -e "$nonroot_home/.codex" ]'
+ok "setup dry-run reports Codex managed skills without creating CODEX_HOME" \
+  '[ "$rc" = 0 ] && grep -Fq "ccc-doctor" <<<"$out" && grep -Fq "create" <<<"$out" && [ ! -e "$nonroot_home/.codex" ]'
 
 out="$(HOME="$TMP/root-guard-home" CCC_CLAUDE_DIR=/ CCC_HERMES_DIR="$TMP/root-guard-hermes" bash "$SETUP" --dry-run 2>&1)"; rc=$?
 ok "setup refuses filesystem-root Claude install target" '[ "$rc" = 2 ] && grep -q "filesystem-root" <<<"$out"'
@@ -169,6 +171,8 @@ credential_before="$(sha256sum "$rewrite_claude/.credentials.json")"
 out="$(HOME="$TMP/rewrite-home" CCC_CLAUDE_DIR="$rewrite_claude" CCC_HERMES_DIR="$rewrite_hermes" bash "$SETUP" --no-backup 2>&1)"; rc=$?
 ok "custom-path rewrite leaves node-local credentials untouched" \
   '[ "$rc" = 0 ] && [ "$(sha256sum "$rewrite_claude/.credentials.json")" = "$credential_before" ]'
+ok "setup installs the Codex common managed skill set with provenance" \
+  '[ -f "$TMP/rewrite-home/.codex/skills/ccc-doctor/SKILL.md" ] && [ -f "$TMP/rewrite-home/.codex/skills/ccc-node-status/SKILL.md" ] && [ -f "$TMP/rewrite-home/.codex/skills/ccc-security-audit/SKILL.md" ] && [ -f "$TMP/rewrite-home/.codex/skills/ccc-agent-cron/SKILL.md" ] && [ -f "$TMP/rewrite-home/.codex/skills/ccc-self-update/SKILL.md" ] && [ -f "$TMP/rewrite-home/.codex/skills/ccc-wiki-record/SKILL.md" ] && jq -e ".manager == \"ccc-node\"" "$TMP/rewrite-home/.codex/skills/ccc-doctor/.ccc-node-managed.json" >/dev/null'
 # Slash commands invoke repo scripts verbatim; installed copies must point at
 # THIS checkout, not the canonical /opt/ccc-node (broken on e.g. /root/ccc-node
 # nodes). Repo templates stay canonical — only installed copies are rewritten.
@@ -254,6 +258,7 @@ policy_claude="$TMP/policy-claude"
 policy_hermes="$TMP/policy-hermes"
 policy_codex="$TMP/policy-codex"
 mkdir -p "$policy_codex"
+chmod 700 "$policy_codex"
 printf '%s\n' \
   '# preserve-this-comment' \
   'sentinel = "KEEP"' \
@@ -265,6 +270,8 @@ HOME="$policy_home" CODEX_HOME="$policy_codex" CCC_CLAUDE_DIR="$policy_claude" \
 policy_rc=$?
 ok "setup honors CODEX_HOME while preserving unrelated Codex config" \
   '[ "$policy_rc" = 0 ] && grep -Fq '\''sentinel = "KEEP"'\'' "$policy_codex/config.toml" && grep -Fq '\''# preserve-this-comment'\'' "$policy_codex/config.toml" && grep -Fq '\''enabled = false # connector-first old state'\'' "$policy_codex/config.toml"'
+ok "setup honors CODEX_HOME for managed skills" \
+  '[ -f "$policy_codex/skills/ccc-doctor/SKILL.md" ] && [ "$(stat -c %a "$policy_codex/skills/ccc-doctor/SKILL.md")" = 600 ]'
 
 # Root-run Claude would reject --dangerously-skip-permissions, so setup must
 # neutralize the bypassPermissions default when the run user is root. Simulate

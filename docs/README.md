@@ -10,6 +10,7 @@ Living operator docs stay at the top level of `docs/`; historical closeouts and 
 | [`security-audit.md`](security-audit.md) | Read-only security audit and fleet matrix reporting. |
 | [`agent-cron.md`](agent-cron.md) | Durable local task definitions, due/lock/run/scheduler commands. |
 | [`skill-autosave.md`](skill-autosave.md) | Hermes-style auto-skillification: skill-review hook, daily sweep cron, Telegram approval flow. |
+| [`codex-managed-skills.md`](codex-managed-skills.md) | Static Codex operating-skill catalog, safe provisioning, collision policy, and rollback. |
 | [`self-update.md`](self-update.md) | Pre-approved node maintenance: pull + setup + allowlisted service restarts without loosening the guard. |
 | [`bridge-ops.md`](bridge-ops.md) | Telegram bridge operations and boundaries. |
 | [`provider-capability-matrix.md`](provider-capability-matrix.md) | Generated per-provider capability states (runtime + memory parity) with the conformance-gate contract. |
