@@ -57,7 +57,28 @@ else
   exit 92
 fi
 EOF
-chmod +x "$TMP/bin/ssh" "$TMP/bin/gh"
+
+cat >"$TMP/bin/stat" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+[ "${1:-}" = "-c" ] || { echo "unexpected stat invocation" >&2; exit 93; }
+case "${2:-}:${3:-}" in
+  "%a:$MOCK_EXPECTED_CONFIG")
+    printf '%s\n' '700'
+    ;;
+  "%U:%G:$MOCK_EXPECTED_CONFIG")
+    printf '%s\n' 'root:root'
+    ;;
+  "%a:%U:%G:$MOCK_EXPECTED_CONFIG/hosts.yml")
+    printf '%s\n' "${MOCK_CREDENTIAL_STAT:-600:root:root}"
+    ;;
+  *)
+    echo "unexpected stat target" >&2
+    exit 93
+    ;;
+esac
+EOF
+chmod +x "$TMP/bin/ssh" "$TMP/bin/gh" "$TMP/bin/stat"
 
 export PATH="$TMP/bin:$PATH"
 export MOCK_SSH_MARKER="$TMP/ssh.called"
@@ -136,16 +157,15 @@ else
   ok
 fi
 
-chmod 644 "$TMP/review-config/hosts.yml"
 rm -f "$MOCK_REVIEW_MARKER"
-if run_helper >"$TMP/unsafe-mode.out" 2>&1; then
+if MOCK_CREDENTIAL_STAT=644:root:root \
+   run_helper >"$TMP/unsafe-mode.out" 2>&1; then
   bad "helper accepted a non-owner-only credential file"
 elif [ -e "$MOCK_REVIEW_MARKER" ]; then
   bad "helper submitted a review with an unsafe credential file"
 else
   ok
 fi
-chmod 600 "$TMP/review-config/hosts.yml"
 
 if grep -Fq 'auth token' "$MOCK_GH_LOG"; then
   bad "helper extracted the remote credential"
