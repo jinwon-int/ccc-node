@@ -89,3 +89,45 @@ def test_no_uid_leak_and_no_symlink(tmp_path: Path) -> None:
     assert not stat.S_ISLNK(meta.st_mode)
     if hasattr(os, "getuid"):
         assert meta.st_uid == os.getuid()
+
+
+class _ToolCompletedEvent:
+    __name__ = "ToolCompletedEvent"
+
+    def __init__(self, tool_name="Bash", success=True, tool_call_id="c1"):
+        self.tool_name = tool_name
+        self.success = success
+        self.tool_call_id = tool_call_id
+
+
+def test_observer_records_agent_event(tmp_path: Path) -> None:
+    from telegram_bot.core.lifecycle_audit import LifecycleObserver
+    ledger = LifecycleAuditLedger(tmp_path / "audit")
+    observer = LifecycleObserver(ledger, provider="codex")
+    ev = _ToolCompletedEvent()
+    ev.__class__.__name__ = "ToolCompletedEvent"
+    observer.observe(ev, session_id="s1")
+    lines = (tmp_path / "audit" / "lifecycle-audit.jsonl").read_text().splitlines()
+    assert len(lines) == 1 and json.loads(lines[0])["event"] == "tool_completed"
+
+
+def test_observer_is_fail_open_on_bad_event(tmp_path: Path) -> None:
+    from telegram_bot.core.lifecycle_audit import LifecycleObserver
+    observer = LifecycleObserver(LifecycleAuditLedger(tmp_path / "audit"), provider="codex")
+    # Neither a known event nor a recordable one → no raise, no write.
+    observer.observe(object(), session_id="s1")
+    assert not (tmp_path / "audit" / "lifecycle-audit.jsonl").exists()
+
+
+def test_build_observer_is_opt_in(tmp_path: Path) -> None:
+    from types import SimpleNamespace
+    from telegram_bot.core.lifecycle_audit import build_lifecycle_observer, LifecycleObserver
+    # Default off → no observer (a default node builds nothing).
+    assert build_lifecycle_observer(SimpleNamespace(lifecycle_audit_enabled=False, agent_provider="codex")) is None
+    # On + supported provider → observer.
+    on = build_lifecycle_observer(
+        SimpleNamespace(lifecycle_audit_enabled=True, agent_provider="codex", bot_data_dir=tmp_path)
+    )
+    assert isinstance(on, LifecycleObserver)
+    # On but unsupported provider → None (fail-closed).
+    assert build_lifecycle_observer(SimpleNamespace(lifecycle_audit_enabled=True, agent_provider="gpt", bot_data_dir=tmp_path)) is None

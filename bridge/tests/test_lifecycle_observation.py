@@ -136,3 +136,53 @@ def test_shared_redaction_covers_token_shapes() -> None:
     redacted = redact_credentials("bot " + BOT_TOKEN + " gh " + GH_TOKEN)
     assert BOT_TOKEN not in redacted and GH_TOKEN not in redacted
     assert "[REDACTED_CREDENTIAL]" in redacted
+
+
+# --------------------------------------------------------------------------- #
+# Live AgentEvent normalization (duck-typed).
+# --------------------------------------------------------------------------- #
+
+class _ToolCompletedEvent:
+    def __init__(self, tool_name, success=True, tool_call_id="c1"):
+        self.tool_name = tool_name
+        self.success = success
+        self.tool_call_id = tool_call_id
+
+
+class _CompletionEvent:
+    def __init__(self, stop_reason):
+        self.stop_reason = stop_reason
+
+
+class _ApprovalRequestEvent:
+    def __init__(self, request_id="r1"):
+        self.request_id = request_id
+
+
+def _norm_agent(event, provider="codex", session_id="sess"):
+    from telegram_bot.core.lifecycle_observation import normalize_agent_event
+    # Rename the class so duck-typing by __name__ matches the runtime event.
+    event.__class__.__name__ = type(event).__name__.lstrip("_")
+    return normalize_agent_event(provider=provider, session_id=session_id, event=event)
+
+
+def test_agent_tool_completed_normalizes() -> None:
+    obs = _norm_agent(_ToolCompletedEvent("Bash", success=True))
+    assert obs.event is LifecycleEventType.TOOL_COMPLETED and obs.tool_status == "success"
+    assert obs.tool == "Bash" and "sess" not in (obs.session_ref or "")
+
+
+def test_agent_read_only_tool_skipped() -> None:
+    assert _norm_agent(_ToolCompletedEvent("Read")) is None
+
+
+def test_agent_completion_and_approval() -> None:
+    assert _norm_agent(_CompletionEvent("end_turn")).event is LifecycleEventType.TURN_COMPLETED
+    assert _norm_agent(_CompletionEvent("error")).tool_status == "failure"
+    assert _norm_agent(_ApprovalRequestEvent()).event is LifecycleEventType.PROVIDER_NOTIFICATION
+
+
+def test_agent_unknown_event_is_none() -> None:
+    class _TextDeltaEvent:
+        text = "x"
+    assert _norm_agent(_TextDeltaEvent()) is None

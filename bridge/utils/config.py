@@ -407,6 +407,15 @@ class Config(
             "record-targeted chat delivery is disabled (fail-closed)."
         ),
     )
+    lifecycle_audit_enabled: bool = Field(
+        default=False,
+        alias="CCC_LIFECYCLE_AUDIT",
+        description=(
+            "Opt-in (#645): record body-free LifecycleObservation audit records "
+            "from live AgentEvents into an owner-only bounded ledger. Default off; "
+            "fail-open, never blocks a turn."
+        ),
+    )
 
     @field_validator("push_enabled", mode="before")
     @classmethod

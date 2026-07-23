@@ -20,7 +20,10 @@ import stat
 import threading
 from typing import Iterator
 
-from telegram_bot.core.lifecycle_observation import LifecycleObservation
+from telegram_bot.core.lifecycle_observation import (
+    LifecycleObservation,
+    normalize_agent_event,
+)
 from telegram_bot.utils.secure_fs import _atomic_write_bytes, ensure_private_directory
 
 logger = logging.getLogger(__name__)
@@ -110,4 +113,48 @@ class LifecycleAuditLedger:
             return AuditWriteResult(False, reason="write-error")
 
 
-__all__ = ["AuditWriteResult", "LifecycleAuditLedger"]
+class LifecycleObserver:
+    """Fail-open tap that records live AgentEvents to the audit ledger (#645).
+
+    Wired into the bridge event consume loop behind an opt-in flag. ``observe``
+    normalizes an AgentEvent and records it; anything that goes wrong is
+    swallowed so observability can never break a turn.
+    """
+
+    def __init__(self, ledger: LifecycleAuditLedger, *, provider: str) -> None:
+        self._ledger = ledger
+        self._provider = provider
+
+    def observe(self, event: object, *, session_id: object) -> None:
+        try:
+            observation = normalize_agent_event(
+                provider=self._provider, session_id=session_id, event=event
+            )
+            if observation is not None:
+                self._ledger.record(observation)
+        except Exception as exc:  # fail-open: never break the turn
+            logger.warning("lifecycle observe failed (continuing): %s", exc)
+
+
+def build_lifecycle_observer(config: object) -> "LifecycleObserver | None":
+    """Build the opt-in observer, or None when disabled (#645).
+
+    Returns None unless ``lifecycle_audit_enabled`` is set and the provider is
+    supported, so a default node builds nothing.
+    """
+    if not getattr(config, "lifecycle_audit_enabled", False):
+        return None
+    provider = str(getattr(config, "agent_provider", "claude") or "claude")
+    if provider not in ("claude", "codex"):
+        return None
+    base = getattr(config, "bot_data_dir", None) or (Path.home() / ".claude" / "state")
+    ledger = LifecycleAuditLedger(Path(base) / "lifecycle-audit")
+    return LifecycleObserver(ledger, provider=provider)
+
+
+__all__ = [
+    "AuditWriteResult",
+    "LifecycleAuditLedger",
+    "LifecycleObserver",
+    "build_lifecycle_observer",
+]
