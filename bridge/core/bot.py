@@ -746,6 +746,10 @@ class TelegramBot(
             group=2,
         )
         self.application.add_handler(
+            MessageHandler(filters.Sticker.ALL, self._handle_sticker_message),
+            group=2,
+        )
+        self.application.add_handler(
             MessageHandler(
                 filters.Document.ALL & ~filters.Document.IMAGE,
                 self._handle_document_message,

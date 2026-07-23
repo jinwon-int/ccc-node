@@ -399,6 +399,23 @@ class BotVoiceMixin:
     def _build_image_prompt(image_path: FilePath, caption: str) -> str:
         return media.build_image_prompt(image_path, caption)
 
+    def _select_inbound_sticker(
+        self, message: Message
+    ) -> Tuple[Optional[Any], str, str, str]:
+        if not getattr(self._config, "image_context_guard", False):
+            return media.select_inbound_sticker(message)
+        return media.select_inbound_sticker(
+            message,
+            max_bytes=getattr(self._config, "telegram_max_image_bytes", 5 * 1024 * 1024),
+            max_pixels=getattr(self._config, "telegram_max_image_pixels", 4_000_000),
+        )
+
+    @staticmethod
+    def _build_sticker_prompt(
+        image_path: Optional[FilePath], emoji: str, set_name: str, *, has_image: bool
+    ) -> str:
+        return media.build_sticker_prompt(image_path, emoji, set_name, has_image=has_image)
+
     async def _download_telegram_file(self, file_id: str, destination: FilePath) -> None:
         app = self._require_application()
         telegram_file = await app.bot.get_file(file_id)
@@ -790,6 +807,109 @@ class BotVoiceMixin:
         async def on_overflow():
             reply = (
                 f"⏳ Image queue is full ({self._MAX_INFLIGHT_MESSAGES} active tasks). "
+                "Please wait or send /stop to terminate running tasks."
+            )
+            await message.reply_text(reply)
+            log_debug(user_id, "bot", reply)
+
+        await self._enqueue_user_task(conversation_key, run_task, on_overflow)
+
+    async def _handle_sticker_message(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ):
+        del context
+        if not await self._check_access(update):
+            return
+        message = self._require_message(update)
+        image, sticker_kind, emoji, set_name = self._select_inbound_sticker(message)
+        if sticker_kind == "none":
+            return
+
+        user_id = self._require_user(update).id
+        chat = self._require_chat(update)
+        conversation_key = self._conversation_key(user_id, chat.id)
+        log_debug(
+            user_id,
+            "sticker",
+            f"{sticker_kind} emoji={emoji or '-'} set={set_name or '-'}",
+        )
+
+        async def run_task():
+            start = time.perf_counter()
+            cleanup_paths: List[FilePath] = []
+            outcome = "failed"
+            image_path: Optional[FilePath] = None
+            try:
+                if image is not None:
+                    self._image_dir.mkdir(parents=True, exist_ok=True)
+                    # Static stickers are .webp; animated/video previews
+                    # (Telegram PhotoSize thumbnails) are .jpg.
+                    extension = "webp" if sticker_kind == "static" else "jpg"
+                    candidate = self._image_dir / self._build_image_file_name(
+                        user_id=user_id, extension=extension
+                    )
+                    cleanup_paths.append(candidate)
+                    try:
+                        await self._download_image_file(image, candidate)
+                        image_path = candidate
+                    except Exception as exc:
+                        # A sticker always has emoji context, so a failed image
+                        # download degrades to text-only instead of erroring.
+                        logger.warning(
+                            "Sticker image download failed for user %s; "
+                            "falling back to emoji/pack text: %s",
+                            user_id,
+                            exc,
+                        )
+                        image_path = None
+                    if image_path is not None and getattr(
+                        self._config, "image_context_guard", False
+                    ):
+                        try:
+                            actual_bytes = image_path.stat().st_size
+                        except OSError:
+                            actual_bytes = 0
+                        max_bytes = getattr(
+                            self._config, "telegram_max_image_bytes", 5 * 1024 * 1024
+                        )
+                        if actual_bytes > max_bytes:
+                            image_path = None  # degrade to text-only, keep emoji
+
+                prompt = self._build_sticker_prompt(
+                    image_path, emoji, set_name, has_image=image_path is not None
+                )
+                reply_prefix = build_reply_context_prefix(
+                    message,
+                    bot_user_id=self._own_bot_id(),
+                    owner_user_id=user_id,
+                )
+                if reply_prefix:
+                    prompt = f"{reply_prefix}\n\n{prompt}"
+                await self._process_user_message_text(
+                    update,
+                    user_id,
+                    prompt,
+                    message_source="sticker",
+                )
+                outcome = "success"
+            except asyncio.CancelledError:
+                outcome = "cancelled"
+                logger.info("Sticker processing cancelled for user %s", user_id)
+                raise
+            finally:
+                await self._audio_processor.cleanup_audio_files(cleanup_paths)
+                elapsed_ms = int((time.perf_counter() - start) * 1000)
+                logger.info(
+                    "Sticker processing result user_id=%s kind=%s outcome=%s elapsed_ms=%s",
+                    user_id,
+                    sticker_kind,
+                    outcome,
+                    elapsed_ms,
+                )
+
+        async def on_overflow():
+            reply = (
+                f"⏳ Sticker queue is full ({self._MAX_INFLIGHT_MESSAGES} active tasks). "
                 "Please wait or send /stop to terminate running tasks."
             )
             await message.reply_text(reply)

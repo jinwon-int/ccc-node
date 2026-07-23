@@ -1441,6 +1441,46 @@ def test_document_handlers_match_pdf_once_without_overlapping_images(tmp_path: P
     assert matching_callbacks(image) == ["_handle_photo_message"]
 
 
+def _telegram_sticker_update() -> Update:
+    return Update.de_json(
+        {
+            "update_id": 1,
+            "message": {
+                "message_id": 1,
+                "date": 1_700_000_000,
+                "chat": {"id": 9, "type": "private"},
+                "from": {"id": 7, "is_bot": False, "first_name": "Test"},
+                "sticker": {
+                    "file_id": "sticker-id",
+                    "file_unique_id": "unique-id",
+                    "type": "regular",
+                    "width": 512,
+                    "height": 512,
+                    "is_animated": False,
+                    "is_video": False,
+                    "emoji": "😂",
+                },
+            },
+        },
+        Bot("123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijk"),
+    )
+
+
+def test_sticker_routes_only_to_the_sticker_handler(tmp_path: Path) -> None:
+    bot = bare_bot(make_manager(tmp_path, "claude"), provider="claude")
+    bot.application = SimpleNamespace(add_handler=Mock())
+    bot._setup_handlers()
+    handlers = [
+        call.args[0]
+        for call in bot.application.add_handler.call_args_list
+        if isinstance(call.args[0], MessageHandler)
+    ]
+    sticker = _telegram_sticker_update()
+    matched = [h.callback.__name__ for h in handlers if h.check_update(sticker)]
+    # A sticker must route to the sticker handler only — not photo/text/document.
+    assert matched == ["_handle_sticker_message"]
+
+
 @pytest.mark.anyio
 async def test_effort_command_is_published_in_bot_menu(tmp_path: Path) -> None:
     bot = bare_bot(make_manager(tmp_path, "codex"), provider="codex")

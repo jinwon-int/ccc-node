@@ -180,6 +180,89 @@ def build_image_prompt(image_path: FilePath, caption: str) -> str:
     return prompt
 
 
+def select_inbound_sticker(
+    message: Any,
+    *,
+    max_bytes: Optional[int] = None,
+    max_pixels: Optional[int] = None,
+) -> Tuple[Optional[Any], str, str, str]:
+    """Return (downloadable image object | None, kind, emoji, set_name).
+
+    kind is one of:
+      - ``"static"``    the sticker itself (a viewable ``.webp``),
+      - ``"thumbnail"`` an animated/video sticker's static preview image,
+      - ``"text-only"`` no viewable image (animated/video without a preview, or
+                        an image that exceeded the size caps) — the emoji/pack
+                        are still returned so the sticker is never silently
+                        dropped,
+      - ``"none"``      the message carries no sticker.
+
+    ``emoji`` and ``set_name`` are always best-effort strings ("" when absent).
+    """
+
+    sticker = getattr(message, "sticker", None)
+    if sticker is None:
+        return None, "none", "", ""
+    emoji = str(getattr(sticker, "emoji", "") or "")
+    set_name = str(getattr(sticker, "set_name", "") or "")
+
+    def _within_caps(obj: Any) -> bool:
+        file_size = int(getattr(obj, "file_size", 0) or 0)
+        pixels = int(getattr(obj, "width", 0) or 0) * int(getattr(obj, "height", 0) or 0)
+        if max_bytes is not None and file_size > max_bytes:
+            return False
+        if max_pixels is not None and pixels > max_pixels:
+            return False
+        return True
+
+    is_animated = bool(getattr(sticker, "is_animated", False))
+    is_video = bool(getattr(sticker, "is_video", False))
+    if not is_animated and not is_video:
+        # Static stickers are plain .webp images the agent can view directly.
+        if _within_caps(sticker):
+            return sticker, "static", emoji, set_name
+        return None, "text-only", emoji, set_name
+
+    # Animated (.tgs/Lottie) and video (.webm) stickers are not directly
+    # viewable; fall back to the static thumbnail preview when present.
+    thumbnail = getattr(sticker, "thumbnail", None)
+    if thumbnail is not None and _within_caps(thumbnail):
+        return thumbnail, "thumbnail", emoji, set_name
+    return None, "text-only", emoji, set_name
+
+
+def build_sticker_prompt(
+    image_path: Optional[FilePath],
+    emoji: str,
+    set_name: str,
+    *,
+    has_image: bool,
+) -> str:
+    emoji = (emoji or "").strip()
+    set_name = (set_name or "").strip()
+    lines = []
+    if has_image and image_path is not None:
+        lines.append(
+            "The user sent an inbound Telegram sticker (provided as an image). "
+            "React to it and answer the user's request."
+        )
+        lines.append(f"Local image path: {image_path}")
+    else:
+        lines.append(
+            "The user sent an inbound Telegram sticker. No viewable image is "
+            "available (an animated/video sticker without a preview, or it "
+            "exceeded the size limit), so respond based on its emoji and pack."
+        )
+    if emoji:
+        lines.append(f"Sticker emoji: {emoji}")
+    if set_name:
+        lines.append(f"Sticker pack: {set_name}")
+    if not emoji and not set_name and not (has_image and image_path is not None):
+        lines.append("The sticker carries no emoji or pack name.")
+    lines.append("Acknowledge the sticker naturally; do not silently ignore it.")
+    return "\n".join(lines)
+
+
 _DOCUMENT_MIME_EXTENSIONS = {
     "application/json": ".json",
     "application/msword": ".doc",
