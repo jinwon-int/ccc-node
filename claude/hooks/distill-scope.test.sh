@@ -134,6 +134,7 @@ ok "autonomy=kill exits 0" '[ "$rc" = 0 ]'
 ok "autonomy=kill logs skip reason" 'grep -q "skipped reason=autonomy-kill" "$STATE_A/distill.log"'
 ok "autonomy=kill spawns no background" '! grep -q "spawned bg" "$STATE_A/distill.log"'
 ok "autonomy=kill does not reach start line" '! grep -q "^.*start trigger=" "$STATE_A/distill.log"'
+ok "autonomy=kill records to shared fleet ledger" 'grep -q "\"layer\":\"distill\"" "$STATE_A/autonomy-ledger.jsonl" && grep -q "\"state\":\"kill\"" "$STATE_A/autonomy-ledger.jsonl"'
 
 # 7b) kill via state file
 touch "$STATE_A/autonomy.kill"

@@ -260,10 +260,16 @@ do_run() {
   fi
   if [ "$AUTONOMY_STATE" = "kill" ]; then
     log "skip reason=autonomy-kill trigger=$TRIGGER"
+    declare -f ccc_autonomy_record >/dev/null 2>&1 \
+      && ccc_autonomy_record autoinstall kill "$TRIGGER"
     printf '{"mode":"auto","skipped":"autonomy-kill"}\n'
     return 0
   fi
-  [ "$AUTONOMY_STATE" = "dry-run" ] && AUTONOMY_DRY=1
+  if [ "$AUTONOMY_STATE" = "dry-run" ]; then
+    AUTONOMY_DRY=1
+    declare -f ccc_autonomy_record >/dev/null 2>&1 \
+      && ccc_autonomy_record autoinstall dry-run "$TRIGGER"
+  fi
 
   # Fail closed if the install target is unsafe (symlinked leaf / non-dir).
   # For Codex the directory is created owner-only (0700); an existing regular

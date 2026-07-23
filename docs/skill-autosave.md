@@ -160,6 +160,13 @@ Safety rails:
   (`ccc-skill-autosave.sh status` shows the live `autonomy:` line). `dry-run`
   and `active` let the sweep run so drafts still stage for human review; the
   install layer self-guards, so nothing auto-installs under `dry-run`.
+  Every layer that the switch stops or gates (skill-autosave sweep, autoinstall,
+  distill) appends one **body-free** line — `{ts, layer, state, detail}`, no
+  payload — to a shared fleet ledger at
+  `~/.claude/state/autonomy-ledger.jsonl` (owner-only `0600`, newest
+  `CCC_AUTONOMY_LEDGER_MAX` lines, default 500), so an operator can see in one
+  place what the kill/dry-run switch actually blocked across the node:
+  `tail ~/.claude/state/autonomy-ledger.jsonl`.
 - **Rollback, always**: every install is reversible, individually or in bulk —
   archives to `~/.claude/state/skill-autosave-rollback/`, never deletes, and
   refuses skills without the autosave marker (hand-authored skills are safe):
