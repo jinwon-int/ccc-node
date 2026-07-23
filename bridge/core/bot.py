@@ -86,6 +86,7 @@ class TelegramBot(
         memory_promoter: Any = None,
         distill_wiki_sink_worker: Any = None,
         distill_honcho_sink_worker: Any = None,
+        skill_candidate_collector_worker: Any = None,
         application_builder_factory: Any = None,
         clock: Any = None,
     ):
@@ -102,6 +103,7 @@ class TelegramBot(
         self._memory_promoter = memory_promoter
         self._distill_wiki_sink_worker = distill_wiki_sink_worker
         self._distill_honcho_sink_worker = distill_honcho_sink_worker
+        self._skill_candidate_collector_worker = skill_candidate_collector_worker
         self._application_builder_factory = (
             application_builder_factory or Application.builder
         )

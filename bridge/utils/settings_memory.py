@@ -41,6 +41,23 @@ class MemorySettingsMixin:
         alias="CCC_HONCHO_CFG",
         description="Owner-only node-local Honcho endpoint/credential config.",
     )
+    codex_skill_collector_enabled: bool = Field(
+        default=False,
+        alias="CCC_CODEX_SKILL_COLLECTOR",
+        description=(
+            "Opt-in (#667): on a Codex node, drive the skill-candidate collector "
+            "off the distill journal's snapshots and stage pending drafts for the "
+            "provider-aware installer. Default off; activation is canary-gated."
+        ),
+    )
+    codex_skill_pending_dir: Path = Field(
+        default_factory=lambda: Path.home() / ".claude" / "state" / "pending-skills",
+        alias="CCC_SKILL_REVIEW_PENDING_DIR",
+        description=(
+            "Pending-draft directory the skill-candidate collector stages into; "
+            "must match the Codex autoinstall PENDING_DIR."
+        ),
+    )
     memory_user_label: str = Field(
         default="Seo Jin On / 서진원",
         alias="CCC_MEMORY_USER_LABEL",

@@ -491,6 +491,7 @@ class BotLifecycleMixin:
             distill_local_sink_task = None
             distill_wiki_sink_task = None
             distill_honcho_sink_task = None
+            skill_candidate_collector_task = None
             health_alerts_task = None
             try:
                 await self.application.start()
@@ -573,6 +574,14 @@ class BotLifecycleMixin:
                     distill_honcho_sink_task = asyncio.create_task(
                         self._distill_honcho_sink_loop(stop_event),
                         name="distill-honcho-sink",
+                    )
+                if (
+                    self._skill_candidate_collector_worker is not None
+                    and self._distill_journal is not None
+                ):
+                    skill_candidate_collector_task = asyncio.create_task(
+                        self._skill_candidate_collector_loop(stop_event),
+                        name="skill-candidate-collector",
                     )
 
                 await self._supervise_polling(stop_event)
@@ -663,6 +672,7 @@ class BotLifecycleMixin:
                     distill_local_sink_task,
                     distill_wiki_sink_task,
                     distill_honcho_sink_task,
+                    skill_candidate_collector_task,
                 ):
                     if _task and not _task.done():
                         _task.cancel()
@@ -1113,6 +1123,42 @@ class BotLifecycleMixin:
             except Exception:
                 logger.warning(
                     "Distill Wiki-sink sweep failed; continuing", exc_info=True
+                )
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=interval)
+            except (TimeoutError, asyncio.TimeoutError):
+                continue
+
+    async def _skill_candidate_collector_loop(self, stop_event: asyncio.Event) -> None:
+        """Stage Codex skill candidates from distill snapshots (#667, opt-in).
+
+        Read-only against the distill journal: it only reads jobs that already
+        carry a snapshot and stages via the idempotent sink. Never mutates a
+        distill job, so the memory-distill pipeline is unaffected.
+        """
+
+        worker = self._skill_candidate_collector_worker
+        journal = self._distill_journal
+        interval = float(
+            getattr(self._config, "distill_extraction_poll_interval", 300.0) or 300.0
+        )
+        while not stop_event.is_set():
+            try:
+                jobs = await asyncio.to_thread(journal.list_jobs)
+                for job in jobs:
+                    if stop_event.is_set():
+                        break
+                    if getattr(job, "snapshot", None) is None:
+                        continue
+                    if getattr(job, "provider", None) != "codex":
+                        continue
+                    await worker.collect_once(job_id=job.job_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning(
+                    "Skill-candidate collector sweep failed; continuing",
+                    exc_info=True,
                 )
             try:
                 await asyncio.wait_for(stop_event.wait(), timeout=interval)
