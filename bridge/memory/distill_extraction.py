@@ -46,25 +46,11 @@ _DIRECTIVE_RE = re.compile(
     r"\bsystem\s+prompt\s*[:=])",
     re.IGNORECASE,
 )
-_CREDENTIAL_PATTERNS = (
-    re.compile(
-        r"(?:\bauthorization\s*:\s*)?\bbearer\s+[A-Za-z0-9._~+/=-]{16,}",
-        re.IGNORECASE,
-    ),
-    re.compile(r"\b[0-9]{6,12}:[A-Za-z0-9_-]{20,}\b"),
-    re.compile(r"\bgh(?:p|o|u|s|r)_[A-Za-z0-9]{20,}\b"),
-    re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}\b"),
-    re.compile(r"\bsk-[A-Za-z0-9_-]{20,}\b"),
-    re.compile(
-        r"\b(?:api[_-]?key|access[_-]?token|refresh[_-]?token|"
-        r"secret|password)\s*[:=]\s*[^\s,;]{12,}",
-        re.IGNORECASE,
-    ),
-    re.compile(
-        r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----.*?"
-        r"(?:-----END (?:RSA |EC |OPENSSH )?PRIVATE KEY-----|\Z)",
-        re.IGNORECASE | re.DOTALL,
-    ),
+# Shared canonical credential set (bridge/utils/redaction.py). This module's
+# copy was the source of that set; importing it keeps redaction consistent and
+# adds the AWS-key (AKIA) shape.
+from telegram_bot.utils.redaction import (  # noqa: E402
+    CREDENTIAL_PATTERNS as _CREDENTIAL_PATTERNS,
 )
 EvidenceId = Annotated[
     str,

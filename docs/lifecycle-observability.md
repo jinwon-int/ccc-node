@@ -59,8 +59,8 @@ deduped). Default off; the tap is fail-open and never blocks a turn.
   observer currently records the provider-neutral AgentEvents only).
 - **Evidence gate + notification/checkpoint parity** on the Codex path
   (criteria for `Stop`/`Notification`/`PreCompact` equivalents).
-- **Redaction unification**: migrate the remaining per-module credential
-  pattern copies (`distill_extraction`, `skill_candidate`, `agent_cron`,
-  `audit.sh`) onto `bridge/utils/redaction.py`.
+- **Redaction unification**: `skill_candidate` and `distill_extraction` now
+  import the canonical set from `bridge/utils/redaction.py`; `agent_cron`
+  (broader owner-spool set) and the bash `audit.sh`/`notify.sh` copies remain.
 - Autonomous-write rollback/kill-switch is **#386**; Codex memory write-back is
   **#465** — out of scope here.

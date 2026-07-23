@@ -31,6 +31,7 @@ from typing import Iterator, Protocol, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from telegram_bot.utils.redaction import CREDENTIAL_PATTERNS as _CREDENTIAL_PATTERNS
 from telegram_bot.utils.secure_fs import _atomic_write_bytes, ensure_private_directory
 
 from .distill_extraction import DistillProvenance
@@ -57,22 +58,8 @@ _DIRECTIVE_RE = re.compile(
     r"\bsystem\s+prompt\s*[:=])",
     re.IGNORECASE,
 )
-_CREDENTIAL_PATTERNS = (
-    re.compile(r"(?:\bauthorization\s*:\s*)?\bbearer\s+[A-Za-z0-9._~+/=-]{16,}", re.IGNORECASE),
-    re.compile(r"\bgh(?:p|o|u|s|r)_[A-Za-z0-9]{20,}\b"),
-    re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}\b"),
-    re.compile(r"\bsk-[A-Za-z0-9_-]{20,}\b"),
-    re.compile(r"\bAKIA[A-Z0-9]{16}\b"),
-    re.compile(
-        r"\b(?:api[_-]?key|access[_-]?token|refresh[_-]?token|secret|password)"
-        r"\s*[:=]\s*[^\s,;]{12,}",
-        re.IGNORECASE,
-    ),
-    re.compile(
-        r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----",
-        re.IGNORECASE,
-    ),
-)
+# Credential patterns are the shared canonical set (bridge/utils/redaction.py);
+# imported above as _CREDENTIAL_PATTERNS so the validators/backend are unchanged.
 
 
 class _StrictModel(BaseModel):
