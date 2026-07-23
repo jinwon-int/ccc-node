@@ -152,5 +152,17 @@ ok "autonomy=dry-run still enqueues/spawns (not halted)" 'grep -qE "enqueued|enq
 run_a "CCC_AUTONOMY=active"
 ok "autonomy=active keeps dryrun=0 (baseline)" 'grep -q "start trigger=sessionend dryrun=0" "$STATE_A/distill.log"'
 
+# 7e) regression: the file switch must be read from distill's own state dir, not
+# the lib's CCC_CLAUDE_DIR/state default. Non-root shape: CCC_STATE_DIR unset,
+# CCC_CLAUDE_DIR pointed elsewhere, autonomy.kill dropped beside distill's other
+# toggles ($HOME/.claude/state). Without the state-dir scoping this kill is
+# silently ignored (lib reads $CCC_CLAUDE_DIR/state instead).
+HOME_NR="$TMP/home-nr"; mkdir -p "$HOME_NR/.claude/state"
+touch "$HOME_NR/.claude/state/autonomy.kill"
+env -u CCC_STATE_DIR HOME="$HOME_NR" CCC_CLAUDE_DIR="$TMP/other-claude" \
+  bash "$DISTILL" sessionend </dev/null >/dev/null 2>&1
+ok "file kill honored at distill's state dir despite divergent CCC_CLAUDE_DIR" \
+  'grep -q "skipped reason=autonomy-kill" "$HOME_NR/.claude/state/distill.log"'
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

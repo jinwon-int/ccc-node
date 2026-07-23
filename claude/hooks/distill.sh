@@ -58,7 +58,12 @@ fi
 # Fail-open: undefined guard (missing lib) => "active" => unchanged behavior.
 AUTONOMY_STATE="active"
 if declare -f ccc_autonomy_state >/dev/null 2>&1; then
-  AUTONOMY_STATE="$(ccc_autonomy_state 2>/dev/null || echo active)"
+  # Scope the lib's state-dir to distill's own STATE_DIR (the guard lib otherwise
+  # honors CCC_CLAUDE_DIR, which distill.sh does not) so the autonomy.kill /
+  # autonomy.dry-run files are read from the exact dir that holds distill's own
+  # toggles — a mismatch would silently defeat the kill switch on non-root
+  # installs. Env-var form (CCC_AUTONOMY=…) is unaffected. Local override only.
+  AUTONOMY_STATE="$(CCC_STATE_DIR="$STATE_DIR" ccc_autonomy_state 2>/dev/null || echo active)"
 fi
 if [ "$AUTONOMY_STATE" = "kill" ]; then
   printf '%s skipped reason=autonomy-kill trigger=%s\n' \
