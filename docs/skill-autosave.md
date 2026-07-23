@@ -11,6 +11,35 @@ rollback, Hermes-style. Three layers cooperate:
 | `scripts/ccc-skill-autosave.sh` | daily cron (this doc) | Covers what hooks cannot: Telegram-bridge / SDK sessions never fire SessionEnd, so the sweep pushes their recent transcripts through the same skill-review pipeline, refreshes the deterministic candidate report (`skill-suggest/scan.sh`), and queues an owner Telegram notification — an approval reminder in approve mode, or the autoinstall install/block notice in auto mode. |
 | `/skill-suggest` skill | operator (terminal or Telegram) | approve mode: reviews pending drafts + ranked candidates and installs approved skills into `~/.claude/skills/`. auto mode: post-hoc review — list, audit and roll back auto-installed skills. |
 
+## Provider support (Claude / Codex)
+
+The install/gate/ledger/rollback pipeline (`skill-review/autoinstall.sh`) is
+provider-neutral: it screens a `SKILL.md` and installs the passing draft into a
+skills directory. Only the **install target** and a **compatibility screen**
+differ per provider. `skill-review/provider.sh` resolves both.
+
+| Capability | Claude | Codex |
+|---|---|---|
+| Install target | `~/.claude/skills/<name>/` (`CLAUDE_SKILLS_DIR`) | `${CODEX_HOME:-~/.codex}/skills/<name>/` (`CODEX_SKILLS_DIR`) |
+| Machine gates (secret / node-fact / dedup / lint) | ✅ identical | ✅ identical |
+| Mode / daily cap / off-switch / ledger / rollback | ✅ identical | ✅ identical |
+| Codex-compat screen (rejects `claude -p`, `~/.claude`, `CLAUDE_*`) | n/a | ✅ isolates Claude-only drafts as pending |
+| Secure install dir (0700, no-symlink leaf, fail-closed) | existing dir untouched | ✅ created owner-only |
+| Candidate **drafting/collection** (SessionEnd → draft) | ✅ (`skill-review.sh` + `extract.sh`) | ⏳ follow-up (reuses #465 Codex session-end/journal) |
+
+Select the provider explicitly with `CCC_SKILL_PROVIDER=claude|codex`. When
+unset it auto-detects: a node with a Codex home but no `~/.claude` and no
+`claude` binary resolves to `codex`; everything else stays `claude`
+(back-compatible — existing Claude nodes are unchanged).
+
+The Codex install pipeline (gates, cap, ledger, rollback, concurrency-safe
+single-runner lock) is complete and covered by
+`claude/hooks/skill-review/codex-autoinstall.test.sh`. The Codex-native
+**drafting** trigger (turning a Codex session/checkpoint into a candidate,
+reusing the #465 distill journal transport with a distinct skill-candidate
+schema) lands in a follow-up so the live bridge-runtime wiring is reviewed and
+canaried on its own.
+
 ## Enable the daily sweep
 
 ```bash
@@ -82,6 +111,10 @@ surface + enforced authoring standards + after-the-fact visibility:
 4. **Structure lint** (Hermes HARDLINE-style): frontmatter with kebab-case
    `name` (≤64), routing-friendly `description` (20–1024 chars), non-trivial
    body with headings.
+5. **Codex-compat** (Codex provider only): a draft that hard-codes the Claude
+   CLI (`claude -p`), the `~/.claude` tree, or `CLAUDE_*` env can't run on a
+   Codex node, so it is isolated as pending (`codex-incompat <label>`) instead
+   of installed. Prose that merely mentions "Claude Code" is untouched.
 
 Passing drafts are installed to `~/.claude/skills/<name>/` immediately and
 recorded in the `installed-by=autosave` ledger
@@ -110,6 +143,29 @@ Safety rails:
 
 - **Node-local only**: auto mode never touches the ccc-node template repo —
   promoting a skill into `claude/skills/` remains PR-first.
+- **Concurrency-safe**: an atomic single-runner lock means the same checkpoint
+  processed many times at once installs exactly once — no duplicate
+  candidate/ledger/install rows.
+
+## Migration & rollback (Claude ↔ Codex)
+
+Skills are **not** mirrored across providers automatically — the install target
+is chosen from the active provider, never both. To move an autosave-installed
+skill between providers, roll it back on the source and let the target node
+re-draft/install it, or copy the `SKILL.md` by hand (Codex reads the same
+frontmatter/dir layout). Rollback is provider-scoped and marker-driven, so it
+works identically on either surface and always refuses hand-authored skills:
+
+```bash
+# Codex node (CCC_SKILL_PROVIDER=codex): operates on ${CODEX_HOME}/skills
+CCC_SKILL_PROVIDER=codex ~/.claude/hooks/skill-review/autoinstall.sh list
+CCC_SKILL_PROVIDER=codex ~/.claude/hooks/skill-review/autoinstall.sh rollback <name>
+CCC_SKILL_PROVIDER=codex ~/.claude/hooks/skill-review/autoinstall.sh rollback --all
+```
+
+A Claude-authored skill that hard-codes Claude-only couplings is rejected by the
+Codex-compat gate on a Codex node (`codex-incompat`) rather than installed —
+rework it to be provider-neutral before it can autosave there.
 
 ## Operations
 
@@ -125,4 +181,6 @@ each drafting run is an LLM call), `CCC_SKILL_AUTOSAVE_WINDOW_DAYS` (2),
 re-reviewed only after growing this much), `CCC_SKILL_AUTOSAVE_NOTIFY` (1),
 `CCC_SKILL_AUTOSAVE_SETTLE_SECONDS` (90), `CCC_SKILL_AUTOSAVE_MODE`
 (approve|auto, default approve), `CCC_SKILL_AUTOSAVE_DAILY_CAP` (3 — auto-mode
-installs per UTC day).
+installs per UTC day), `CCC_SKILL_PROVIDER` (claude|codex, default auto-detect —
+selects the install surface), `CODEX_SKILLS_DIR` (Codex install target override,
+default `${CODEX_HOME:-~/.codex}/skills`).
