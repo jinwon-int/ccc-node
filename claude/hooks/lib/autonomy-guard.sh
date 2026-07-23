@@ -55,11 +55,19 @@ ccc_autonomy_record() {
   detail="$(printf '%s' "$detail" | tr -cd 'A-Za-z0-9._:=/ -' | cut -c1-80)"
   (
     umask 077
-    local dir file ts max n tmp
+    local dir file lock ts max n tmp
     dir="$(ccc_autonomy_state_dir)"
     file="$dir/autonomy-ledger.jsonl"
+    lock="$file.lock"
     ts="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)" || ts=""
     mkdir -p "$dir" 2>/dev/null || exit 0
+    # Serialize append+trim across layers (they all write this one file). The
+    # trim below is read-then-rename; without a lock a concurrent append landing
+    # between the snapshot and the mv would be clobbered — the newest record, the
+    # one the bound is meant to keep. Hold an exclusive lock for both the append
+    # and the trim so they act as one unit. Best-effort: if flock is unavailable
+    # we proceed unlocked (append is atomic; only the rare trim race remains).
+    exec 9>>"$lock" 2>/dev/null && flock 9 2>/dev/null || true
     printf '{"ts":"%s","layer":"%s","state":"%s","detail":"%s"}\n' \
       "$ts" "$layer" "$state" "$detail" >> "$file" 2>/dev/null || exit 0
     chmod 600 "$file" 2>/dev/null || true

@@ -63,6 +63,19 @@ i=0; while [ "$i" -lt 30 ]; do CCC_AUTONOMY_LEDGER_MAX=10 ccc_autonomy_record di
 ok "ledger bounded to max"   '[ "$(wc -l < "$LEDGER" | tr -d " ")" = 10 ]'
 ok "bound keeps newest"      'grep -q "\"detail\":\"t29\"" "$LEDGER" && ! grep -q "\"detail\":\"t0\"" "$LEDGER"'
 
+# ---- concurrency: parallel writers never corrupt / tear the ledger ----------
+# Many layers write the one shared file; the append+trim must stay lock-safe.
+rm -f "$LEDGER" "$LEDGER.lock"
+i=0; while [ "$i" -lt 25 ]; do
+  ( CCC_AUTONOMY_LEDGER_MAX=8 ccc_autonomy_record distill kill "p$i" ) &
+  i=$((i+1))
+done
+wait
+ok "concurrent writers: every line is valid json (no torn writes)" \
+  'while IFS= read -r l; do printf "%s" "$l" | jq -e . >/dev/null 2>&1 || exit 1; done < "$LEDGER"'
+ok "concurrent writers: bound is respected" \
+  '[ "$(wc -l < "$LEDGER" | tr -d " ")" -le 8 ] && [ "$(wc -l < "$LEDGER" | tr -d " ")" -ge 1 ]'
+
 # ---- fail-open: unwritable dir never affects the caller ---------------------
 BAD="$TMP/bad"; : > "$BAD"   # a regular file where a dir is expected
 rc=0; CCC_STATE_DIR="$BAD/nope" ccc_autonomy_record distill kill x || rc=$?
