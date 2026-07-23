@@ -928,17 +928,20 @@ os.environ["CCC_BRIDGE_MEMORY_AUDIENCE_ROOT"] = str(root / "audiences")
 
 from telegram_bot.__main__ import build_context, create_app, load_runtime_settings
 from telegram_bot.memory.distill_local_worker import CodexDistillLocalSinkWorker
+from telegram_bot.memory.promotion import CodexMemoryPromoter
 
 settings = load_runtime_settings()
 context = build_context(settings)
 worker = context.distill_local_sink_worker
 assert isinstance(worker, CodexDistillLocalSinkWorker), type(worker)
+assert isinstance(context.memory_promoter, CodexMemoryPromoter), type(context.memory_promoter)
 assert worker._audience_root == root / "audiences"
 assert worker._indexer_path == (
     Path(settings.codex_memory_materializer_path).parent / "ccc-memory-index.sh"
 )
 bot = create_app(context)
 assert bot._distill_local_sink_worker is worker
+assert bot._memory_promoter is context.memory_promoter
 print("COMPOSED-LOCAL-SINK-WORKER-OK")
 """,
         probe_root=tmp_path,

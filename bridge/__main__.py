@@ -40,6 +40,7 @@ class AppContext:
     distill_snapshot_worker: Any
     distill_extraction_worker: Any
     distill_local_sink_worker: Any
+    memory_promoter: Any
     distill_wiki_sink_worker: Any
     distill_honcho_sink_worker: Any
     project_chat: Any
@@ -194,6 +195,7 @@ def build_context(
             agent_runtime,
         )
     distill_local_sink_worker = None
+    memory_promoter = None
     if settings.bridge_memory_mode == "audience-scoped":
         from telegram_bot.core.memory_audience import shared_memory_audience
         from telegram_bot.memory.distill_local_worker import (
@@ -207,6 +209,11 @@ def build_context(
                 Path(settings.codex_memory_materializer_path).expanduser().parent
                 / "ccc-memory-index.sh"
             ),
+        )
+        from telegram_bot.memory.promotion import CodexMemoryPromoter
+
+        memory_promoter = CodexMemoryPromoter(
+            shared_memory_audience(settings).root,
         )
     distill_wiki_sink_worker = None
     if settings.agent_provider == "codex" and wiki_enabled:
@@ -244,6 +251,7 @@ def build_context(
         distill_snapshot_worker=distill_snapshot_worker,
         distill_extraction_worker=distill_extraction_worker,
         distill_local_sink_worker=distill_local_sink_worker,
+        memory_promoter=memory_promoter,
         distill_wiki_sink_worker=distill_wiki_sink_worker,
         distill_honcho_sink_worker=distill_honcho_sink_worker,
         project_chat=project_chat,
@@ -266,6 +274,7 @@ def create_app(context: AppContext):
         distill_snapshot_worker=context.distill_snapshot_worker,
         distill_extraction_worker=context.distill_extraction_worker,
         distill_local_sink_worker=context.distill_local_sink_worker,
+        memory_promoter=context.memory_promoter,
         distill_wiki_sink_worker=context.distill_wiki_sink_worker,
         distill_honcho_sink_worker=context.distill_honcho_sink_worker,
         application_builder_factory=context.telegram_port,

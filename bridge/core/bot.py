@@ -83,6 +83,7 @@ class TelegramBot(
         distill_snapshot_worker: Any = None,
         distill_extraction_worker: Any = None,
         distill_local_sink_worker: Any = None,
+        memory_promoter: Any = None,
         distill_wiki_sink_worker: Any = None,
         distill_honcho_sink_worker: Any = None,
         application_builder_factory: Any = None,
@@ -98,6 +99,7 @@ class TelegramBot(
         # drives this exact gated instance (#388).
         self._distill_extraction_worker = distill_extraction_worker
         self._distill_local_sink_worker = distill_local_sink_worker
+        self._memory_promoter = memory_promoter
         self._distill_wiki_sink_worker = distill_wiki_sink_worker
         self._distill_honcho_sink_worker = distill_honcho_sink_worker
         self._application_builder_factory = (
@@ -713,6 +715,9 @@ class TelegramBot(
         self.application.add_handler(CommandHandler("skills", self._cmd_skills))
         self.application.add_handler(CommandHandler("new", self._cmd_new))
         self.application.add_handler(CommandHandler("distill", self._cmd_distill))
+        self.application.add_handler(
+            CommandHandler("memory_promote", self._cmd_memory_promote)
+        )
         self.application.add_handler(CommandHandler("model", self._cmd_model))
         self.application.add_handler(CommandHandler("effort", self._cmd_effort))
         self.application.add_handler(CommandHandler("resume", self._cmd_resume))

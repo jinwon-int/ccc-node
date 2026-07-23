@@ -535,6 +535,80 @@ async def test_distill_command_fails_open_without_disclosing_journal_error(
 
 
 @pytest.mark.anyio
+async def test_memory_promote_command_is_private_explicit_and_refreshes_shared_index(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    manager = make_manager(tmp_path, "codex")
+    bot = bare_bot(manager, provider="codex")
+    bot._config.bridge_memory_mode = "audience-scoped"
+    bot._config.telegram_session_scope = "shared-groups"
+    bot._config.bridge_memory_audience_root = tmp_path / "audiences"
+    bot._config.bridge_memory_audience_key_path = tmp_path / "audience.key"
+    bot._memory_promoter = Mock(
+        promote=Mock(
+            return_value=SimpleNamespace(
+                promoted=True,
+                destination_fact_id="promoted-" + "a" * 16,
+            )
+        )
+    )
+    bot._distill_local_sink_worker = SimpleNamespace(refresh_route=AsyncMock())
+    update = make_update(
+        user_id=934719283,
+        chat_id=934719283,
+        text="/memory_promote distill-" + "b" * 12,
+    )
+
+    await bot._cmd_memory_promote(
+        update,
+        SimpleNamespace(args=["distill-" + "b" * 12]),
+    )
+
+    call = bot._memory_promoter.promote.call_args
+    assert call.kwargs["fact_id"] == "distill-" + "b" * 12
+    assert call.kwargs["source_scope"].startswith("private-")
+    assert "934719283" not in call.kwargs["source_scope"]
+    bot._distill_local_sink_worker.refresh_route.assert_awaited_once_with(
+        audience="shared",
+        scope="shared",
+    )
+    assert "promoted" in update.message.replies[0][0].lower()
+    assert "934719283" not in caplog.text
+
+
+@pytest.mark.anyio
+async def test_memory_promote_command_denies_groups_and_invalid_arguments(
+    tmp_path: Path,
+) -> None:
+    manager = make_manager(tmp_path, "codex")
+    bot = bare_bot(manager, provider="codex")
+    bot._config.bridge_memory_mode = "audience-scoped"
+    bot._config.telegram_session_scope = "shared-groups"
+    bot._config.bridge_memory_audience_root = tmp_path / "audiences"
+    bot._config.bridge_memory_audience_key_path = tmp_path / "audience.key"
+    bot._memory_promoter = Mock(promote=Mock())
+    bot._distill_local_sink_worker = SimpleNamespace(refresh_route=AsyncMock())
+
+    group = make_update(
+        user_id=7,
+        chat_id=-1009,
+        text="/memory_promote distill-" + "b" * 12,
+    )
+    await bot._cmd_memory_promote(
+        group,
+        SimpleNamespace(args=["distill-" + "b" * 12]),
+    )
+    invalid = make_update(user_id=7, chat_id=7, text="/memory_promote arbitrary")
+    await bot._cmd_memory_promote(invalid, SimpleNamespace(args=["arbitrary"]))
+
+    bot._memory_promoter.promote.assert_not_called()
+    bot._distill_local_sink_worker.refresh_route.assert_not_awaited()
+    assert "private" in group.message.replies[0][0].lower()
+    assert "/memory_promote distill-" in invalid.message.replies[0][0]
+
+
+@pytest.mark.anyio
 async def test_distill_command_does_not_snapshot_an_inflight_turn(
     tmp_path: Path,
 ) -> None:
@@ -1404,6 +1478,31 @@ async def test_distill_command_is_published_in_bot_menu(tmp_path: Path) -> None:
     assert set_my_commands.await_count == 3
     for call in set_my_commands.await_args_list:
         assert "distill" in {command.command for command in call.args[0]}
+
+
+@pytest.mark.anyio
+async def test_memory_promote_menu_is_only_published_in_audience_mode(
+    tmp_path: Path,
+) -> None:
+    bot = bare_bot(make_manager(tmp_path, "codex"), provider="codex")
+    set_my_commands = AsyncMock()
+    bot.application = SimpleNamespace(bot=SimpleNamespace(set_my_commands=set_my_commands))
+
+    bot._config.bridge_memory_mode = "off"
+    await bot._set_bot_commands()
+    assert all(
+        "memory_promote" not in {command.command for command in call.args[0]}
+        for call in set_my_commands.await_args_list
+    )
+
+    set_my_commands.reset_mock()
+    bot._config.bridge_memory_mode = "audience-scoped"
+    await bot._set_bot_commands()
+    command_sets = [
+        {command.command for command in call.args[0]}
+        for call in set_my_commands.await_args_list
+    ]
+    assert sum("memory_promote" in commands for commands in command_sets) == 1
 
 
 @pytest.mark.anyio
