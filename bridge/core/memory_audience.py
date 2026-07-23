@@ -90,12 +90,27 @@ class MemoryAudience:
             "CCC_MEMORY_LEGACY_CACHE_DIR": str(claude_root / "hooks" / "cache"),
             "CCC_MEMORY_LEGACY_DIR": str(claude_root / "memories"),
             "CCC_MEMORY_LEGACY_RESUME_FILE": str(claude_root / "state" / "resume.md"),
-            # Honcho's legacy peer-wide recall is not physically audience
-            # scoped.  Disable both reads and sends until it can use separate
-            # audience sessions; local scoped facts remain fully functional.
-            "CCC_HONCHO_MEMORY_ENABLED": "0",
-            # Family Wiki is another global sink/source. Keep it outside this
-            # mode until it has an explicit audience label and read filter.
+            # Honcho derives a distinct server-side workspace from this opaque
+            # scope. Private recall may additionally read the shared workspace
+            # and the private-only legacy workspace; public routes never do.
+            "CCC_HONCHO_MEMORY_ENABLED": (
+                "1" if getattr(settings, "honcho_memory_enabled", False) else "0"
+            ),
+            "CCC_HONCHO_AUDIENCE_SCOPED": "1",
+            "CCC_HONCHO_WORKSPACE_SCOPE": self.scope,
+            "CCC_HONCHO_SHARED_WORKSPACE_SCOPE": AUDIENCE_SHARED,
+            "CCC_HONCHO_CFG": str(
+                Path(
+                    getattr(
+                        settings,
+                        "honcho_config_path",
+                        Path.home() / ".hermes" / "honcho.json",
+                    )
+                ).expanduser()
+            ),
+            # Family Wiki reads still use one global cache. Candidate writes
+            # are separately routed by the bridge worker, but hook reads stay
+            # disabled until they have an audience filter.
             "CCC_WIKI_MEMORY_ENABLED": "0",
         }
         return env

@@ -16,7 +16,7 @@ ccc-node memory starts from a no-network SessionStart snapshot and refreshes cac
 - `CCC_WIKI_MEMORY_ENABLED=0` disables the Family Wiki read and write path: no cache injection, refresh, local indexing, distill candidate generation, or Wiki queue writes. Existing cache files are ignored and removed from the local index on its next update/rebuild. An external isolation profile overrides an attempted `=1`.
 - `CCC_MEMORY_USER_LABEL` and `CCC_MEMORY_ASSISTANT_LABEL` set the node-local relationship labels used by memory injection and distill. Defaults preserve the existing Seoyoon fleet behavior.
 - `CCC_HONCHO_MEMORY_ENABLED=0` disables the Honcho read and Codex write-back path. A node may therefore run built-in/local memory only, Honcho without Wiki, or the default combined profile. `CCC_HONCHO_CFG` selects the owner-only endpoint/credential config (default `~/.hermes/honcho.json`).
-- `CCC_BRIDGE_MEMORY_MODE=audience-scoped` always disables the global Honcho path until Honcho has a physically separate workspace/session retrieval boundary. When Wiki memory is enabled, Codex may generate human-review candidates, but the bridge partitions them under an opaque audience scope and labels every record with its `private` or `shared` audience. No candidate is sent to Family Wiki automatically. Setting `CCC_HONCHO_MEMORY_ENABLED=1` cannot opt a private DM back into an unscoped Honcho sink, and `CCC_WIKI_MEMORY_ENABLED=0` still disables Wiki candidate generation entirely.
+- `CCC_BRIDGE_MEMORY_MODE=audience-scoped` derives a distinct Honcho workspace as `<configured-workspace>--ccc-<opaque-scope>`. Shared routes read and write only the shared workspace. Private routes write only their private workspace and may recall that workspace plus the shared workspace and the original configured workspace as private-only legacy input. The legacy workspace is never queried by a group/channel route or copied into shared storage. When Wiki memory is enabled, Codex may generate human-review candidates, but the bridge partitions them under an opaque audience scope and labels every record with its `private` or `shared` audience. No candidate is sent to Family Wiki automatically. `CCC_HONCHO_MEMORY_ENABLED=0` and `CCC_WIKI_MEMORY_ENABLED=0` still disable their respective paths.
 
 ## Codex global snapshot materializer
 
@@ -109,12 +109,15 @@ before claim/provider execution without blocking interactive turns.
   of placing it in the global queue. This
   path never invokes `wiki-agent`, writes a Wiki page, creates a branch/PR, or merges.
   Empty candidate sets complete without a queue record. Honcho routing remains under
-  an independent lease: validated facts first enter the owner-only
-  `${BOT_DATA_DIR}/honcho-outbox/<job-id>.json`, then use a stable
-  `Idempotency-Key` for bounded HTTP delivery. Network/config outages keep the
-  outbox record retryable without re-extraction; success acknowledges the record.
-  The Honcho payload contains strict facts and hashed provenance, never raw thread,
-  Telegram route, transcript, or credential values.
+  an independent lease: legacy jobs use the owner-only
+  `${BOT_DATA_DIR}/honcho-outbox/<job-id>.json`, while audience-routed jobs use
+  `${BOT_DATA_DIR}/honcho-outbox/<opaque-scope>/<job-id>.json` and deliver to the
+  matching physical Honcho workspace with explicit audience/scope labels. Audience
+  mode rejects a legacy job with no route rather than sending it globally. Delivery
+  uses a stable `Idempotency-Key`; network/config outages keep the scoped outbox
+  record retryable without re-extraction, and success acknowledges it. The Honcho
+  payload contains strict facts, opaque route labels, and hashed provenance, never a
+  raw thread, Telegram numeric identity, transcript, or credential value.
 - A completed audience-local sink write refreshes that scope's derived SQLite
   index with the installed `ccc-memory-index.sh` before the journal marks the
   local stage done. The bounded subprocess receives only local path/policy

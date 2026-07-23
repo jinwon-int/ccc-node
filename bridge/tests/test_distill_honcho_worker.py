@@ -54,6 +54,8 @@ async def test_worker_delivers_stable_body_safe_record_and_acks_outbox(
     record = sender.records[0]
     assert record["idempotency_key"] == f"ccc-distill-{job.job_id}"
     assert record["session_id"] == f"codex-distill-{job.job_id[:24]}"
+    assert record["memory_audience"] == "private"
+    assert record["memory_scope"] == job.memory_scope
     assert record["provenance"] == {
         "provider": "codex",
         "source_thread_hash": job.thread_hash,
@@ -62,8 +64,9 @@ async def test_worker_delivers_stable_body_safe_record_and_acks_outbox(
     }
     serialized = json.dumps(record)
     assert job.thread_id not in serialized
-    assert str(job.memory_scope) not in serialized
+    assert "telegram-user-123" not in serialized
     assert list(outbox.glob("*.json")) == []
+    assert list((outbox / str(job.memory_scope)).glob("*.json")) == []
 
 
 @pytest.mark.anyio
@@ -84,14 +87,45 @@ async def test_delivery_failure_preserves_one_outbox_and_retries_without_extract
     assert failed.honcho_sink_status is DistillHonchoSinkStatus.RETRYABLE_FAILED
     assert failed.error_code == "honcho_sink_delivery_failed"
     assert failed.extraction_attempts == job.extraction_attempts
-    assert len(list(outbox.glob("*.json"))) == 1
+    scoped_outbox = outbox / str(job.memory_scope)
+    assert len(list(scoped_outbox.glob("*.json"))) == 1
+    assert list(outbox.glob("*.json")) == []
 
     sender.fail = False
     completed = await worker.write_once(job_id=job.job_id)
     assert completed.honcho_sink_status is DistillHonchoSinkStatus.DONE
     assert completed.extraction_attempts == job.extraction_attempts
     assert len(sender.records) == 2
-    assert list(outbox.glob("*.json")) == []
+    assert list(scoped_outbox.glob("*.json")) == []
+
+
+@pytest.mark.anyio
+async def test_route_required_worker_rejects_legacy_unscoped_job(
+    tmp_path: Path,
+) -> None:
+    journal = DistillJournal(tmp_path / "journal")
+    journal.initialize()
+    job = await extracted_job(
+        journal,
+        memory_audience=None,
+        memory_scope=None,
+    )
+    outbox = tmp_path / "honcho-outbox"
+    sender = RecordingSender()
+    worker = CodexDistillHonchoSinkWorker(
+        journal,
+        outbox_dir=outbox,
+        sender=sender,
+        owner_token="honcho-worker",
+        require_memory_route=True,
+    )
+
+    result = await worker.write_once(job_id=job.job_id)
+
+    assert result.honcho_sink_status is DistillHonchoSinkStatus.TERMINAL_FAILED
+    assert result.error_code == "honcho_sink_route_missing"
+    assert sender.records == []
+    assert list(outbox.rglob("*.json")) == []
 
 
 @pytest.mark.anyio
@@ -167,6 +201,63 @@ def test_http_sender_uses_stable_idempotency_and_keeps_token_out_of_record(
     assert requests[1][0].headers["Authorization"] == "Bearer raw-token-must-not-persist"
     assert "test%20space" in requests[1][0].full_url
     assert "raw-token" not in json.dumps(record)
+
+
+def test_http_sender_routes_private_and_shared_to_distinct_workspaces(
+    tmp_path: Path,
+) -> None:
+    config = tmp_path / "honcho.json"
+    config.write_text(json.dumps({
+        "baseUrl": "https://honcho.invalid",
+        "workspace": "family",
+        "aiPeer": "peer-a",
+    }))
+    config.chmod(0o600)
+    requests = []
+
+    class Response:
+        status = 201
+        def __enter__(self):  # type: ignore[no-untyped-def]
+            return self
+        def __exit__(self, *args):  # type: ignore[no-untyped-def]
+            return False
+
+    def urlopen(request, **kwargs):  # type: ignore[no-untyped-def]
+        requests.append((request, kwargs))
+        return Response()
+
+    private_scope = "private-0123456789abcdef0123456789abcdef"
+    base_record = {
+        "idempotency_key": "ccc-distill-" + "a" * 64,
+        "session_id": "codex-distill-" + "a" * 24,
+        "facts": [{"kind": "observation", "text": "harmless", "subject": "session"}],
+        "provenance": {"provider": "codex", "source_thread_hash": "b" * 64},
+    }
+    private_record = {
+        **base_record,
+        "memory_audience": "private",
+        "memory_scope": private_scope,
+    }
+    shared_record = {
+        **base_record,
+        "memory_audience": "shared",
+        "memory_scope": "shared",
+    }
+
+    with patch(
+        "telegram_bot.memory.distill_honcho_worker.urllib_request.urlopen",
+        side_effect=urlopen,
+    ):
+        sender = HonchoHttpSender(config, node_label="jingun")
+        sender.send(private_record)
+        sender.send(shared_record)
+
+    urls = [request.full_url for request, _kwargs in requests]
+    assert len(urls) == 4
+    assert any(f"family--ccc-{private_scope}" in url for url in urls)
+    assert any("family--ccc-shared" in url for url in urls)
+    assert all("/workspaces/family/" not in url for url in urls)
+    assert all("934719283" not in url for url in urls)
 
 
 def test_http_sender_rejects_symlink_config_without_opening_target(tmp_path: Path) -> None:

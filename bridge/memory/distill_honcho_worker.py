@@ -21,11 +21,16 @@ from telegram_bot.utils.secure_fs import _atomic_write_bytes, ensure_private_dir
 
 from .distill_extraction import DistillExtractionOutput, parse_extraction_output
 from .distill_journal import DistillJournal
-from .distill_types import DistillJob
+from .distill_types import DistillJob, validate_memory_route
 
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _MAX_RECORD_BYTES = 64 * 1024
+_AUDIENCE_WORKSPACE_SEPARATOR = "--ccc-"
+
+
+def _audience_workspace(workspace: str, scope: str) -> str:
+    return f"{workspace}{_AUDIENCE_WORKSPACE_SEPARATOR}{scope}"
 
 
 class HonchoDeliveryError(RuntimeError):
@@ -131,6 +136,8 @@ class HonchoHttpSender:
         key = record.get("idempotency_key")
         facts = record.get("facts")
         provenance = record.get("provenance")
+        memory_audience = record.get("memory_audience")
+        memory_scope = record.get("memory_scope")
         if (
             not isinstance(session_id, str)
             or not isinstance(key, str)
@@ -138,13 +145,29 @@ class HonchoHttpSender:
             or not isinstance(provenance, dict)
         ):
             raise HonchoDeliveryError("honcho_record_invalid", terminal=True)
+        try:
+            validate_memory_route(memory_audience, memory_scope)
+        except ValueError:
+            raise HonchoDeliveryError("honcho_record_invalid", terminal=True) from None
+        if memory_scope is not None:
+            workspace = _audience_workspace(workspace, memory_scope)
         workspace_path = urllib_parse.quote(workspace, safe="")
         session_path = urllib_parse.quote(session_id, safe="")
+        route_metadata: dict[str, object] = {}
+        if memory_audience is not None:
+            route_metadata = {
+                "memory_audience": memory_audience,
+                "memory_scope": memory_scope,
+            }
         self._request(
             f"{base}/v3/workspaces/{workspace_path}/sessions",
             payload={
                 "id": session_id,
-                "metadata": {"source": "codex-distill", "node": self._node_label},
+                "metadata": {
+                    "source": "codex-distill",
+                    "node": self._node_label,
+                    **route_metadata,
+                },
             },
             token=token,
             idempotency_key=key + "-session",
@@ -163,7 +186,7 @@ class HonchoHttpSender:
                     "metadata": {
                         "source": "codex-distill", "node": self._node_label,
                         "idempotency_key": key, "provenance": provenance,
-                        "facts": facts,
+                        "facts": facts, **route_metadata,
                     },
                 }],
             },
@@ -173,8 +196,19 @@ class HonchoHttpSender:
 
 
 class CodexHonchoOutbox:
-    def __init__(self, root: Path) -> None:
+    def __init__(
+        self,
+        root: Path,
+        *,
+        memory_audience: str | None = None,
+        memory_scope: str | None = None,
+    ) -> None:
+        validate_memory_route(memory_audience, memory_scope)
         self.root = Path(os.path.abspath(os.fspath(root)))
+        if memory_scope is not None and self.root.name != memory_scope:
+            raise ValueError("Honcho outbox must match memory scope")
+        self._memory_audience = memory_audience
+        self._memory_scope = memory_scope
         self._lock_path = self.root / ".honcho-outbox.lock"
         self._thread_lock = threading.RLock()
 
@@ -215,10 +249,11 @@ class CodexHonchoOutbox:
                 finally:
                     os.close(fd)
 
-    @staticmethod
-    def record(output: DistillExtractionOutput, *, job_id: str) -> dict[str, object]:
+    def record(
+        self, output: DistillExtractionOutput, *, job_id: str
+    ) -> dict[str, object]:
         provenance = output.provenance
-        return {
+        record: dict[str, object] = {
             "schema_version": output.schema_version,
             "idempotency_key": f"ccc-distill-{job_id}",
             "session_id": f"codex-distill-{job_id[:24]}",
@@ -230,6 +265,10 @@ class CodexHonchoOutbox:
             },
             "facts": [fact.model_dump(mode="json") for fact in output.honcho],
         }
+        if self._memory_audience is not None:
+            record["memory_audience"] = self._memory_audience
+            record["memory_scope"] = self._memory_scope
+        return record
 
     def enqueue(
         self, output: DistillExtractionOutput, *, job_id: str
@@ -270,16 +309,29 @@ class CodexDistillHonchoSinkWorker:
     def __init__(
         self, journal: DistillJournal, *, outbox_dir: Path, sender: HonchoSender,
         owner_token: str | None = None, lease_seconds: int = 300,
-        max_attempts: int = 5,
+        max_attempts: int = 5, require_memory_route: bool = False,
     ) -> None:
         if lease_seconds <= 0 or max_attempts <= 0:
             raise ValueError("invalid Honcho sink worker configuration")
+        if not isinstance(require_memory_route, bool):
+            raise ValueError("require_memory_route must be a bool")
         self._journal = journal
         self._outbox = CodexHonchoOutbox(outbox_dir)
         self._sender = sender
         self._owner_token = owner_token or secrets.token_hex(16)
         self._lease_seconds = lease_seconds
         self._max_attempts = max_attempts
+        self._require_memory_route = require_memory_route
+
+    def _outbox_for(self, job: DistillJob) -> CodexHonchoOutbox:
+        validate_memory_route(job.memory_audience, job.memory_scope)
+        if job.memory_scope is None:
+            return self._outbox
+        return CodexHonchoOutbox(
+            self._outbox.root / job.memory_scope,
+            memory_audience=job.memory_audience,
+            memory_scope=job.memory_scope,
+        )
 
     async def _fail(
         self, claimed: DistillJob, *, code: str, terminal: bool
@@ -303,17 +355,22 @@ class CodexDistillHonchoSinkWorker:
         if claimed is None:
             return await asyncio.to_thread(self._journal.get, job_id)
         try:
+            if self._require_memory_route and claimed.memory_scope is None:
+                return await self._fail(
+                    claimed, code="honcho_sink_route_missing", terminal=True
+                )
             if claimed.extraction_output is None:
                 return await self._fail(
                     claimed, code="honcho_sink_output_missing", terminal=True
                 )
             output = parse_extraction_output(claimed.extraction_output, wiki_enabled=True)
+            outbox = self._outbox_for(claimed)
             record = await asyncio.to_thread(
-                self._outbox.enqueue, output, job_id=claimed.job_id
+                outbox.enqueue, output, job_id=claimed.job_id
             )
             if record is not None:
                 await asyncio.to_thread(self._sender.send, record)
-                await asyncio.to_thread(self._outbox.ack, claimed.job_id)
+                await asyncio.to_thread(outbox.ack, claimed.job_id)
         except asyncio.CancelledError:
             await self._fail(claimed, code="honcho_sink_cancelled", terminal=False)
             raise

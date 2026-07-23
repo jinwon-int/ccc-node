@@ -18,6 +18,11 @@ All notable changes to the Claude Code node harness. Dates are KST.
   suite cover idempotence, comment preservation, invalid TOML, and symlinks.
 
 ### Fixed
+- Audience-scoped Honcho recall and write-back now use physically distinct
+  server-side workspaces derived from opaque memory scopes. Shared routes can
+  access only the shared workspace; private routes can access their private and
+  shared workspaces plus private-only legacy recall. Outboxes are partitioned by
+  scope, and a legacy unscoped job fails closed in audience mode.
 - Audience-scoped Codex distillation can now produce human-review Wiki candidates
   without returning to the global queue. Candidate records are labelled `private`
   or `shared`, physically partitioned by opaque memory scope, and remain local and

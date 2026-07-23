@@ -32,8 +32,10 @@ if ! is_disabled "$AUDIENCE_SCOPED"; then
     && [ "$FACTS_FILE" = "$AUDIENCE_ROOT/$MEMORY_SCOPE/state/memory-facts.jsonl" ] \
     && [ "$SHARED_FACTS_FILE" = "$AUDIENCE_ROOT/shared/state/memory-facts.jsonl" ] \
     || exit 0
-  HONCHO_ENABLED=0
   WIKI_ENABLED=0
+  if ! honcho_scope_valid; then
+    HONCHO_ENABLED=0
+  fi
 fi
 umask 077
 mkdir -p "$CACHE" "$STATE_DIR"
@@ -101,8 +103,27 @@ refresh_wiki() {
   record_status wiki "$status" "$duration" "$bytes" "$err" "$q"
 }
 
+honcho_chat() { # <base> <workspace> <peer> <target> <token> <reasoning> <query> <output> <error>
+  local honcho="$1" workspace="$2" peer="$3" target="$4" token="$5"
+  local rl="$6" query="$7" output="$8" error="$9" workspace_path peer_path
+  local -a auth_args=()
+  workspace_path="$(jq -rn --arg value "$workspace" '$value|@uri')"
+  peer_path="$(jq -rn --arg value "$peer" '$value|@uri')"
+  if [ -n "$token" ]; then
+    auth_args=(-H "Authorization: Bearer $token")
+  fi
+  timeout "$HONCHO_TIMEOUT" curl -sS -X POST \
+    "$honcho/v3/workspaces/$workspace_path/peers/$peer_path/chat" \
+    -H 'Content-Type: application/json' \
+    "${auth_args[@]}" \
+    -d "$(jq -n --arg query "$query" --arg target "$target" --arg rl "$rl" \
+      '{query:$query,target:$target,reasoning_level:$rl}')" \
+    2>"$error" | jq -r '.content // empty' > "$output" 2>>"$error"
+}
+
 refresh_honcho() {
-  local start end duration honcho ws peer target token tmp status err query
+  local start end duration honcho ws peer target token tmp status err query rl
+  local private_tmp shared_tmp legacy_tmp
   start="$(now_ms)"
   tmp="$CACHE/honcho.txt.tmp.$$"
   status="ok"; err=""; query=""
@@ -124,17 +145,41 @@ refresh_honcho() {
     if [ -z "$honcho" ] || [ -z "$peer" ]; then
       status="missing"; err="honcho baseUrl or peerName missing"
     else
-      auth_args=()
-      if [ -n "$token" ]; then
-        auth_header="$(printf '%s: %s %s' 'Authorization' 'Bearer' "$token")"
-        auth_args=(-H "$auth_header")
-      fi
-      if ! timeout "$HONCHO_TIMEOUT" curl -sS -X POST \
-        "$honcho/v3/workspaces/$ws/peers/$peer/chat" \
-        -H 'Content-Type: application/json' \
-        "${auth_args[@]}" \
-        -d "$(jq -n --arg query "$query" --arg target "$target" --arg rl "$rl" '{query:$query,target:$target,reasoning_level:$rl}')" \
-        2>"$tmp.err" | jq -r '.content // empty' > "$tmp" 2>>"$tmp.err"; then
+      if ! is_disabled "$AUDIENCE_SCOPED"; then
+        private_tmp="$tmp.private"
+        shared_tmp="$tmp.shared"
+        legacy_tmp="$tmp.legacy"
+        if [ "$MEMORY_AUDIENCE" = "shared" ]; then
+          if honcho_chat "$honcho" "$ws--ccc-$HONCHO_SHARED_WORKSPACE_SCOPE" \
+            "$peer" "$target" "$token" "$rl" "$query" "$shared_tmp" "$tmp.err"; then
+            {
+              printf '### Honcho shared audience\n'
+              cat "$shared_tmp"
+            } > "$tmp"
+            mv "$tmp" "$CACHE/honcho.txt"
+          else
+            status="error"; err="$(tr '\n' ' ' < "$tmp.err" | cut -c1-240)"
+          fi
+        elif honcho_chat "$honcho" "$ws--ccc-$HONCHO_WORKSPACE_SCOPE" \
+          "$peer" "$target" "$token" "$rl" "$query" "$private_tmp" "$tmp.err" \
+          && honcho_chat "$honcho" "$ws--ccc-$HONCHO_SHARED_WORKSPACE_SCOPE" \
+          "$peer" "$target" "$token" "$rl" "$query" "$shared_tmp" "$tmp.err" \
+          && honcho_chat "$honcho" "$ws" "$peer" "$target" "$token" "$rl" \
+          "$query" "$legacy_tmp" "$tmp.err"; then
+          {
+            printf '### Honcho private audience\n'
+            cat "$private_tmp"
+            printf '\n\n### Honcho shared audience\n'
+            cat "$shared_tmp"
+            printf '\n\n### Honcho private-only legacy\n'
+            cat "$legacy_tmp"
+          } > "$tmp"
+          mv "$tmp" "$CACHE/honcho.txt"
+        else
+          status="error"; err="$(tr '\n' ' ' < "$tmp.err" | cut -c1-240)"
+        fi
+      elif ! honcho_chat "$honcho" "$ws" "$peer" "$target" "$token" "$rl" \
+        "$query" "$tmp" "$tmp.err"; then
         status="error"; err="$(tr '\n' ' ' < "$tmp.err" | cut -c1-240)"
       elif [ ! -s "$tmp" ]; then
         status="empty"; err="empty Honcho response"
@@ -143,7 +188,7 @@ refresh_honcho() {
       fi
     fi
   fi
-  rm -f "$tmp" "$tmp.err"
+  rm -f "$tmp" "$tmp.err" "$tmp.private" "$tmp.shared" "$tmp.legacy"
   end="$(now_ms)"; duration="$((end - start))"
   record_status honcho "$status" "$duration" "$(bytes_for "$CACHE/honcho.txt")" "$err" "$query"
 }

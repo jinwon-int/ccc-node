@@ -56,10 +56,8 @@ scoped_paths_valid() {
 }
 
 if ! is_disabled "$AUDIENCE_SCOPED"; then
-  # The legacy Honcho peer/cache is not physically audience-scoped. Keep this
-  # path local-only until Honcho supports a distinct audience session contract.
-  # Family Wiki is also a global source/sink and must remain off here.
-  HONCHO_ENABLED=0
+  # Family Wiki reads remain global. Honcho is allowed only through a
+  # server-side workspace suffix bound to this validated opaque route.
   WIKI_ENABLED=0
   if ! scoped_paths_valid; then
       # Fail closed: an incomplete/malformed scoped environment must never fall
@@ -67,6 +65,9 @@ if ! is_disabled "$AUDIENCE_SCOPED"; then
       jq -n --arg event "$EVENT" \
         '{hookSpecificOutput:{hookEventName:$event,additionalContext:"Audience-scoped memory unavailable: invalid audience metadata."}}'
       exit 0
+  fi
+  if ! honcho_scope_valid; then
+    HONCHO_ENABLED=0
   fi
 fi
 

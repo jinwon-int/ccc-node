@@ -383,7 +383,10 @@ CAPABILITY_AXES: tuple[CapabilityAxis, ...] = (
         ),
         codex=_supported(
             "Validated facts use an owner-only per-job outbox, stable idempotency "
-            "keys, independently leased retries, and body-free failures."
+            "keys, independently leased retries, and body-free failures. "
+            "Audience-scoped jobs additionally use scope-partitioned outboxes and "
+            "physically distinct Honcho workspaces; unscoped jobs fail closed in "
+            "that mode."
         ),
     ),
     _axis(
