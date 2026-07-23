@@ -61,6 +61,8 @@ AUTOINSTALL_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pw
 . "$AUTOINSTALL_LIB_DIR/../lib/hook-common.sh" || exit 0
 # shellcheck source=claude/hooks/skill-review/provider.sh
 . "$AUTOINSTALL_LIB_DIR/provider.sh" 2>/dev/null || true
+# shellcheck source=claude/hooks/lib/autonomy-guard.sh
+. "$AUTOINSTALL_LIB_DIR/../lib/autonomy-guard.sh" 2>/dev/null || true
 ts_id() { date -u +%Y%m%d%H%M%S; }
 
 # Provider-neutral install target (#643): the gate/ledger/rollback pipeline is
@@ -249,6 +251,20 @@ do_run() {
     return 0
   fi
 
+  # Fleet-wide autonomy guard (#386): a single kill-switch/dry-run above this
+  # layer's own mode. kill => install nothing; dry-run => gate + report what
+  # would install, write nothing.
+  local AUTONOMY_STATE="active" AUTONOMY_DRY=0
+  if declare -f ccc_autonomy_state >/dev/null 2>&1; then
+    AUTONOMY_STATE="$(ccc_autonomy_state 2>/dev/null || echo active)"
+  fi
+  if [ "$AUTONOMY_STATE" = "kill" ]; then
+    log "skip reason=autonomy-kill trigger=$TRIGGER"
+    printf '{"mode":"auto","skipped":"autonomy-kill"}\n'
+    return 0
+  fi
+  [ "$AUTONOMY_STATE" = "dry-run" ] && AUTONOMY_DRY=1
+
   # Fail closed if the install target is unsafe (symlinked leaf / non-dir).
   # For Codex the directory is created owner-only (0700); an existing regular
   # Claude skills dir is accepted untouched. #643.
@@ -279,7 +295,7 @@ do_run() {
   fi
 
   local work dir id f name desc verdict rec sha sid dest
-  local -a installed=() blocked=() newly_blocked=()
+  local -a installed=() blocked=() newly_blocked=() would_install=()
   local deferred=0 today_used
   work="$(mktemp -d 2>/dev/null)" || work="$STATE_DIR/.autoinstall-work.$$"
   mkdir -p "$work" 2>/dev/null
@@ -329,6 +345,14 @@ do_run() {
       continue
     fi
 
+    # Dry-run (#386): the draft passed every gate and would install, but the
+    # fleet autonomy guard is muted — report it and write nothing.
+    if [ "$AUTONOMY_DRY" = 1 ]; then
+      would_install+=("$name")
+      log "dry-run id=$id name=$name reason=autonomy-dry-run trigger=$TRIGGER"
+      continue
+    fi
+
     # Install: narrow write surface — only $SKILLS_DIR/<kebab-name>/.
     dest="$SKILLS_DIR/$name"
     sid="$(jq -r '.session_id // empty' "$dir/meta.json" 2>/dev/null)"
@@ -359,10 +383,13 @@ do_run() {
     --argjson installed "$(printf '%s\n' "${installed[@]:-}" | jq -R . | jq -sc 'map(select(length>0))')" \
     --argjson blocked "$(printf '%s\n' "${blocked[@]:-}" | jq -sc 'map(select(type=="object"))' 2>/dev/null || printf '[]')" \
     --argjson newly_blocked "$(printf '%s\n' "${newly_blocked[@]:-}" | jq -R . | jq -sc 'map(select(length>0))')" \
+    --argjson would_install "$(printf '%s\n' "${would_install[@]:-}" | jq -R . | jq -sc 'map(select(length>0))')" \
     --argjson deferred "$deferred" \
     --argjson pending "$(pending_count)" \
-    '{mode:"auto", installed:$installed, blocked:$blocked,
-      newly_blocked:$newly_blocked, deferred:$deferred, pending:$pending}')"
+    --arg autonomy "$AUTONOMY_STATE" \
+    '{mode:"auto", autonomy:$autonomy, installed:$installed, blocked:$blocked,
+      newly_blocked:$newly_blocked, would_install:$would_install,
+      dry_run:($autonomy=="dry-run"), deferred:$deferred, pending:$pending}')"
   printf '%s\n' "$summary"
   log "run done $summary"
   notify_summary "$summary"

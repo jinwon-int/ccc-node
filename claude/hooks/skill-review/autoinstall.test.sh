@@ -209,5 +209,34 @@ ok "rollback --all leaves hand-made skill" '[ -f "$SKILLS/hand-made/SKILL.md" ]'
 out="$(run_auto bash "$AUTO" status)"
 ok "status reports mode and cap" 'grep -q "^mode: approve" <<<"$out" && grep -q "daily cap:" <<<"$out"'
 
+# --- 11) fleet autonomy guard (#386): kill + dry-run over auto mode ------------
+A_STATE="$TMP/autonomy-state"; A_SKILLS="$TMP/autonomy-skills"
+mkdir -p "$A_STATE/pending-skills" "$A_SKILLS"
+make_draft_at() { # <store> <skills> <id> <name> <desc>
+  local st="$1" sk="$2" id="$3" nm="$4" desc="$5"
+  mkdir -p "$st/pending-skills/$id"
+  printf -- '---\nname: %s\ndescription: %s\n---\n\n# %s\n\n## Procedure\n1. Step.\n2. Verify.\n3. Record.\n4. Confirm.\n5. Done.\n' "$nm" "$desc" "$nm" > "$st/pending-skills/$id/SKILL.md"
+  jq -nc --arg id "$id" --arg name "$nm" '{id:$id,name:$name,status:"pending",session_id:"s"}' > "$st/pending-skills/$id/meta.json"
+}
+
+# CCC_AUTONOMY=kill halts autonomous install regardless of auto mode.
+make_draft_at "$A_STATE" "$A_SKILLS" a-kill kill-me "Capture the recurring autonomy kill-switch verification procedure now."
+out="$(CCC_STATE_DIR="$A_STATE" CLAUDE_SKILLS_DIR="$A_SKILLS" CCC_PUSH_SPOOL="$TMP/aspool" CCC_AUTONOMY=kill CCC_SKILL_AUTOSAVE_MODE=auto bash "$AUTO" run)"
+ok "CCC_AUTONOMY=kill installs nothing" 'jq -e ".skipped == \"autonomy-kill\"" >/dev/null <<<"$out" && [ ! -e "$A_SKILLS/kill-me" ]'
+
+# CCC_AUTONOMY=dry-run gates + reports would_install but writes nothing.
+out="$(CCC_STATE_DIR="$A_STATE" CLAUDE_SKILLS_DIR="$A_SKILLS" CCC_PUSH_SPOOL="$TMP/aspool" CCC_AUTONOMY=dry-run CCC_SKILL_AUTOSAVE_MODE=auto bash "$AUTO" run)"
+ok "CCC_AUTONOMY=dry-run reports would_install, writes nothing" 'jq -e ".dry_run == true and (.would_install | index(\"kill-me\") != null) and (.installed | length == 0)" >/dev/null <<<"$out" && [ ! -e "$A_SKILLS/kill-me" ] && [ ! -s "$A_STATE/skill-autosave-install.jsonl" ]'
+
+# File switch: autonomy.dry-run in the state dir.
+touch "$A_STATE/autonomy.dry-run"
+out="$(CCC_STATE_DIR="$A_STATE" CLAUDE_SKILLS_DIR="$A_SKILLS" CCC_PUSH_SPOOL="$TMP/aspool" CCC_SKILL_AUTOSAVE_MODE=auto bash "$AUTO" run)"
+ok "autonomy.dry-run file mutes install" 'jq -e ".dry_run == true and (.installed | length == 0)" >/dev/null <<<"$out" && [ ! -e "$A_SKILLS/kill-me" ]'
+rm -f "$A_STATE/autonomy.dry-run"
+
+# active (default) still installs.
+out="$(CCC_STATE_DIR="$A_STATE" CLAUDE_SKILLS_DIR="$A_SKILLS" CCC_PUSH_SPOOL="$TMP/aspool" CCC_SKILL_AUTOSAVE_MODE=auto bash "$AUTO" run)"
+ok "default autonomy=active installs" '[ -f "$A_SKILLS/kill-me/SKILL.md" ]'
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

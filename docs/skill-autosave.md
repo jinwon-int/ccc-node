@@ -150,6 +150,11 @@ Safety rails:
   per UTC day; over-cap drafts stay pending and retry later.
 - **Off-switch**: `touch ~/.claude/state/skill-autosave.disabled` also stops
   auto installs.
+- **Fleet autonomy guard (#386)**: a single switch above every layer's own
+  mode. `CCC_AUTONOMY=kill` (or `touch ~/.claude/state/autonomy.kill`) halts all
+  autonomous installs; `CCC_AUTONOMY=dry-run` (or `autonomy.dry-run`) gates and
+  reports what *would* install (`dry_run:true`, `would_install:[…]`) but writes
+  nothing. Default `active` — existing nodes are unchanged.
 - **Rollback, always**: every install is reversible, individually or in bulk —
   archives to `~/.claude/state/skill-autosave-rollback/`, never deletes, and
   refuses skills without the autosave marker (hand-authored skills are safe):
