@@ -219,6 +219,13 @@ fi
 
 # 4) hook tests
 say "== hook tests =="
+if python3 scripts/ccc_codex_skills.py validate --repo-root . >"$TMP/codex-skills-validate.out" 2>&1 \
+   && python3 scripts/ccc_codex_skills_test.py >"$TMP/codex-skills-test.out" 2>&1; then
+  say "  ok Codex compatibility catalog + managed-skill transaction tests"
+else
+  err "Codex managed-skill validation/tests failed"
+  tail -10 "$TMP/codex-skills-validate.out" "$TMP/codex-skills-test.out" 2>/dev/null
+fi
 for t in claude/hooks/observability.test.sh claude/hooks/security-scan.test.sh \
          scripts/validate-harness.test.sh \
          claude/hooks/redact.test.sh claude/hooks/scan-injection.test.sh \
@@ -263,6 +270,7 @@ fm_check() { # <file>
   awk 'NR>1 && /^---/{exit} {print}' "$f" | grep -q '^description:' || err "no description: in $f"
 }
 for f in claude/skills/*/SKILL.md; do [ -f "$f" ] && fm_check "$f" && say "  ok $f"; done
+for f in codex/skills/*/SKILL.md; do [ -f "$f" ] && fm_check "$f" && say "  ok $f"; done
 for f in claude/agents/*.md;      do [ -f "$f" ] && fm_check "$f" && say "  ok $f"; done
 # A2A subagent cost-tier metadata (#54): advisory only; no hard-coded model routing.
 for f in claude/agents/a2a-*.md; do
