@@ -4,9 +4,12 @@ notifications, decoupled from the hook via a filesystem spool.
 Design / approval boundary (baked in, see ccc-node Fresh-Approval policy):
 - DISABLED by default (``config.push_enabled``). Nothing is ever sent unless an operator
   explicitly opts in. Merging/restarting the bridge with this module present is a no-op.
-- OWNER-ONLY: messages go solely to the resolved owner chat id — the explicit
-  ``CCC_PUSH_CHAT_ID``, or the sole ``ALLOWED_USER_IDS`` entry when unambiguous. Never to
-  an arbitrary chat. If the target is ambiguous, the notifier stays silent.
+- OWNER-DEFAULT: messages go to the resolved owner chat id — the explicit
+  ``CCC_PUSH_CHAT_ID``, or the sole ``ALLOWED_USER_IDS`` entry when unambiguous. If the
+  target is ambiguous, the notifier stays silent. A spool record MAY name an explicit
+  ``chatId`` (agent-cron group/channel delivery, #665), but it is delivered ONLY when that
+  id is on the ``CCC_AGENT_CRON_NOTIFY_ALLOWED_CHATS`` allowlist — re-validated here on read
+  (defense in depth); a non-allowlisted chat id is dropped, never sent. Never an arbitrary chat.
 - TOKEN ISOLATION: the Claude Code hook (notify.sh) never touches the bot token. It only
   writes short, pre-redacted summary files into the spool; this module (inside the bridge,
   which already holds the token) performs delivery.
@@ -17,9 +20,11 @@ Design / approval boundary (baked in, see ccc-node Fresh-Approval policy):
 import asyncio
 import json
 import logging
+import os
+import re
 import time
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Union
 
 from telegram.ext import Application
 
@@ -45,8 +50,40 @@ class PushNotifier:
         )
         self.interval: float = float(getattr(self._config, "push_poll_interval", 3.0))
         self.max_per_minute: int = int(getattr(self._config, "push_max_per_minute", 10))
+        self._notify_allowed_chats: set = self._load_notify_allowlist()
         self._recent: Dict[str, float] = {}
         self._sent_times: List[float] = []
+
+    def _load_notify_allowlist(self) -> set:
+        """Allowlisted group/channel chat ids for record-targeted delivery (#665).
+
+        Fail-closed: empty allowlist ⇒ no record may target a non-owner chat.
+        """
+        configured = getattr(self._config, "push_notify_allowed_chats", None)
+        if configured:
+            return {str(c).strip() for c in configured if str(c).strip()}
+        raw = os.environ.get("CCC_AGENT_CRON_NOTIFY_ALLOWED_CHATS", "") or ""
+        return {part for part in re.split(r"[,\s]+", raw.strip()) if part}
+
+    def _target_for_record(
+        self, data: dict, owner_target: int
+    ) -> Optional[Union[int, str]]:
+        """Owner target by default; an allowlisted record ``chatId`` overrides it.
+
+        Returns ``None`` (drop, never send) when the record names a chat id that
+        is not on the allowlist — the spool file is not trusted blindly.
+        """
+        chat_id = data.get("chatId")
+        if not chat_id:
+            return owner_target
+        chat_id = str(chat_id).strip()
+        if chat_id not in self._notify_allowed_chats:
+            logger.warning(
+                "Push record targets a non-allowlisted chat id; dropping (event=%s)",
+                data.get("event", "notify"),
+            )
+            return None
+        return int(chat_id) if re.fullmatch(r"-?[0-9]+", chat_id) else chat_id
 
     def _resolve_target(self) -> Optional[int]:
         """Owner-only target: explicit chat id, else the single allowed user id."""
@@ -105,6 +142,12 @@ class PushNotifier:
                 self._archive(p, sent_dir)
                 continue
 
+            record_target = self._target_for_record(data, target)
+            if record_target is None:
+                # Record named a non-allowlisted chat id — never send it.
+                self._archive(p, sent_dir)
+                continue
+
             now = time.time()
             key = data.get("dedup") or text
             if key in self._recent and now - self._recent[key] < _DEDUP_WINDOW_SECONDS:
@@ -117,7 +160,9 @@ class PushNotifier:
                 return
 
             try:
-                await application.bot.send_message(chat_id=target, text=self._format(data))
+                await application.bot.send_message(
+                    chat_id=record_target, text=self._format(data)
+                )
             except Exception as e:
                 logger.warning("Push send failed (will retry next cycle): %s", e)
                 return  # keep file; stop this cycle to preserve order

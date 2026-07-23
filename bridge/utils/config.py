@@ -1,4 +1,5 @@
 import json
+import re
 import os
 from collections.abc import Mapping
 from contextvars import ContextVar
@@ -397,6 +398,15 @@ class Config(
         alias="CCC_PUSH_MAX_PER_MINUTE",
         description="Rate limit: max push messages delivered per minute.",
     )
+    push_notify_allowed_chats: List[str] = Field(
+        default_factory=list,
+        alias="CCC_AGENT_CRON_NOTIFY_ALLOWED_CHATS",
+        description=(
+            "Allowlist of group/channel chat ids an agent-cron task may target "
+            "with notify=telegram-chat* (#665). CSV or JSON list; empty = "
+            "record-targeted chat delivery is disabled (fail-closed)."
+        ),
+    )
 
     @field_validator("push_enabled", mode="before")
     @classmethod
@@ -421,6 +431,26 @@ class Config(
         raise ValueError(
             "CCC_REQUIRE_ALLOWLIST must be a boolean: true/false, yes/no, on/off, or 1/0"
         )
+
+    @field_validator("push_notify_allowed_chats", mode="before")
+    @classmethod
+    def parse_push_notify_allowed_chats(cls, v):
+        """Parse the notify chat allowlist from CSV or JSON list into strings."""
+        if isinstance(v, str):
+            value = v.strip()
+            if not value:
+                return []
+            if value.startswith("["):
+                parsed = json.loads(value)
+                if not isinstance(parsed, list):
+                    raise ValueError(
+                        "CCC_AGENT_CRON_NOTIFY_ALLOWED_CHATS JSON value must be a list"
+                    )
+                return [str(x).strip() for x in parsed if str(x).strip()]
+            return [x.strip() for x in re.split(r"[,\s]+", value) if x.strip()]
+        if isinstance(v, (list, tuple)):
+            return [str(x).strip() for x in v if str(x).strip()]
+        return v
 
     @field_validator("allowed_user_ids", mode="before")
     @classmethod

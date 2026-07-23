@@ -79,6 +79,17 @@ load.
 - `telegram-owner` — every run writes a short redacted owner-only spool entry.
 - `telegram-owner-on-failure` — spool only non-success runs (failed/timeout);
   successful runs report `delivery: skipped-success`.
+- `telegram-chat` / `telegram-chat-on-failure` (#665) — deliver to a specific
+  group/channel chat instead of the owner DM. Requires `--notify-chat-id <id>`
+  (numeric group id like `-1001234567890`, or `@channelusername`); the schema
+  fails closed if the chat target is set without an id. The chat id must be on
+  the **allowlist** `CCC_AGENT_CRON_NOTIFY_ALLOWED_CHATS` (CSV/JSON) — an
+  out-of-allowlist target reports `delivery: blocked-not-allowlisted` and writes
+  nothing. The spool record adds `recipient: chat` + `chatId`; the same
+  spool/redaction/audit path as owner delivery is reused (no per-task token
+  handling). The bridge push notifier **re-validates** the chat id against the
+  same allowlist on read before sending (defense in depth), so a forged spool
+  file can never reach an un-allowlisted chat.
 
 ## Safety boundaries
 

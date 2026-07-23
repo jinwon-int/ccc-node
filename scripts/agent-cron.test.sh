@@ -461,5 +461,25 @@ out="$(CCC_AGENT_CRON_STORE="$STATUS_STORE" CCC_NODE="test-node" bash "$CMD" sta
 ok "status --json emits read-only operator rollup" '[ "$rc" = 0 ] && jq -e ".mode == \"status-read-only\" and .mutations.lockAcquire == false and .mutations.taskStoreWrite == false and .mutations.pushSpoolWrite == false" <<<"$out" >/dev/null'
 ok "status reports failed and retry-exhausted tasks" 'jq -e ".tasks[] | select(.id == \"status-failed\" and .health == \"failed\" and .node == \"test-node\")" <<<"$out" >/dev/null && jq -e ".tasks[] | select(.id == \"status-retry-exhausted\" and .health == \"retry-exhausted\" and .retryExhausted == true)" <<<"$out" >/dev/null'
 
+# --- #665: group/channel (telegram-chat) notify delivery + allowlist ---
+CHAT_CRUD="$TMP/chat-crud/tasks.json"
+out="$(CCC_AGENT_CRON_STORE="$CHAT_CRUD" bash "$CMD" add chat-report --schedule "0 9 * * *" --prompt "Weekly report" --notify telegram-chat --notify-chat-id -1001234567890 --json)"; rc=$?
+ok "add accepts telegram-chat with a chat id" '[ "$rc" = 0 ] && jq -e ".tasks[] | select(.id == \"chat-report\" and .notify == \"telegram-chat\" and .notifyChatId == \"-1001234567890\")" "$CHAT_CRUD" >/dev/null'
+
+out="$(CCC_AGENT_CRON_STORE="$TMP/chat-crud2/tasks.json" bash "$CMD" add chat-noid --schedule "@daily" --prompt "x" --notify telegram-chat --json 2>&1)"; rc=$?
+ok "add rejects telegram-chat without a chat id" '[ "$rc" != 0 ]'
+
+CHAT_STORE="$TMP/chat-store/tasks.json"; mkdir -p "$(dirname "$CHAT_STORE")"
+cat > "$CHAT_STORE" <<'JSON'
+{"version":1,"tasks":[{"id":"chat-run","schedule":"* * * * *","prompt":"post report","enabled":true,"notify":"telegram-chat","notifyChatId":"-1001234567890","lastRunAt":"2026-01-01T00:00:00Z"}]}
+JSON
+CHAT_SPOOL="$TMP/chat-spool"
+out="$(CCC_AGENT_CRON_STORE="$CHAT_STORE" CCC_HEADLESS_CMD="$FAKE_HEADLESS" CCC_PUSH_SPOOL="$CHAT_SPOOL" CCC_AGENT_CRON_NOTIFY_ALLOWED_CHATS="-1001234567890" bash "$CMD" run chat-run --json --at 2026-01-01T00:01:00Z)"; rc=$?
+ok "allowlisted telegram-chat spools with recipient=chat and chatId" '[ "$rc" = 0 ] && jq -e ".notification.delivery == \"spooled\"" <<<"$out" >/dev/null && f="$(find "$CHAT_SPOOL" -maxdepth 1 -type f -name "*.json" | head -1)" && jq -e ".recipient == \"chat\" and .chatId == \"-1001234567890\" and .event == \"AgentCronRun\"" "$f" >/dev/null'
+
+CHAT_SPOOL2="$TMP/chat-spool-blocked"
+out="$(CCC_AGENT_CRON_STORE="$CHAT_STORE" CCC_HEADLESS_CMD="$FAKE_HEADLESS" CCC_PUSH_SPOOL="$CHAT_SPOOL2" bash "$CMD" run chat-run --json --at 2026-01-01T00:02:00Z)"; rc=$?
+ok "non-allowlisted telegram-chat is blocked, nothing spooled" '[ "$rc" = 0 ] && jq -e ".notification.delivery == \"blocked-not-allowlisted\"" <<<"$out" >/dev/null && [ -z "$(ls -A "$CHAT_SPOOL2" 2>/dev/null)" ]'
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
