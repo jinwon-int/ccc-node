@@ -124,5 +124,23 @@ ok "setup installs and chmods the recovery launcher" \
 ok "SessionStart schedules bounded pending recovery" \
   'jq -e '\''[.hooks.SessionStart[].hooks[].command] | any(contains("distill/pending-drain.sh"))'\'' "$ROOT/claude/settings.base.json" >/dev/null'
 
+# --- fleet autonomy guard (#386): kill drains nothing, dry-run proceeds -------
+# One retryable pending job is on disk from the failure case above. Under kill
+# the launcher must spawn nothing and retain the job; under dry-run it proceeds.
+: > "$STATE/distill.log"
+before_jobs="$(find "$STATE/distill-pending" -maxdepth 1 -type f -name '*.json' | wc -l | tr -d '[:space:]')"
+ok "precondition: a pending job exists to drain" '[ "$before_jobs" -ge 1 ]'
+HOME="$TMP/home" CCC_STATE_DIR="$STATE" CCC_AUTONOMY=kill bash "$DRAIN" >/dev/null 2>&1
+ok "autonomy=kill drain spawns nothing" '! grep -q "\[pending-drain\] spawned job=" "$STATE/distill.log"'
+ok "autonomy=kill drain logs skip reason" 'grep -q "\[pending-drain\] skip reason=autonomy-kill" "$STATE/distill.log"'
+ok "autonomy=kill drain retains pending jobs" \
+  '[ "$(find "$STATE/distill-pending" -maxdepth 1 -type f -name "*.json" | wc -l | tr -d " ")" = "$before_jobs" ]'
+
+: > "$STATE/distill.log"
+printf '%s\n' success > "$CLAUDE_STUB_MODE_FILE"
+HOME="$TMP/home" CCC_STATE_DIR="$STATE" CCC_AUTONOMY=dry-run bash "$DRAIN" >/dev/null 2>&1
+ok "autonomy=dry-run drain is not halted (reaches spawn)" \
+  'wait_for '\''grep -q "\[pending-drain\] spawned job=" "$STATE/distill.log"'\'' && ! grep -q "skip reason=autonomy-kill" "$STATE/distill.log"'
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

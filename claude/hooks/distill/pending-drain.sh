@@ -33,6 +33,24 @@ SPAWN_HELPER="$HOOKDIR/lib/spawn-detached.sh"
 # shellcheck source=claude/hooks/lib/spawn-detached.sh
 . "$SPAWN_HELPER"
 
+# Fleet autonomy guard (#386): under kill, drain nothing. Each worker would only
+# re-exec distill.sh and exit at its own kill guard, so skip the pointless
+# spawns entirely — completing the "kill halts everything" contract. dry-run
+# proceeds (each job's distill.sh forces DRYRUN and writes nothing external).
+# Fail-open: missing lib => active. Scope the lib's state dir to this launcher's
+# STATE_DIR so it reads the same autonomy.kill file distill uses. No ledger
+# record here (SessionStart fires often; the primary decision points already
+# record) — a distill.log line mirrors the distill.disabled short-circuit above.
+if [ -r "$HOOKDIR/lib/autonomy-guard.sh" ]; then
+  # shellcheck source=claude/hooks/lib/autonomy-guard.sh
+  . "$HOOKDIR/lib/autonomy-guard.sh" 2>/dev/null || true
+fi
+if declare -f ccc_autonomy_state >/dev/null 2>&1 \
+  && [ "$(CCC_STATE_DIR="$STATE_DIR" ccc_autonomy_state 2>/dev/null || echo active)" = kill ]; then
+  log "skip reason=autonomy-kill"
+  exit 0
+fi
+
 run_pending_job() {
   # SessionStart's Honcho drain uses CLAUDE_DISTILL_INFLIGHT, but this recovery
   # launcher must re-enter distill.sh before that guard. Remove any inherited
