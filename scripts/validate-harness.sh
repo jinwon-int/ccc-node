@@ -231,6 +231,7 @@ for t in claude/hooks/observability.test.sh claude/hooks/security-scan.test.sh \
          claude/hooks/redact.test.sh claude/hooks/scan-injection.test.sh \
          claude/hooks/checkpoint.test.sh claude/hooks/distill-scope.test.sh claude/hooks/skill-review.test.sh \
          claude/hooks/skill-review/autoinstall.test.sh \
+         claude/hooks/skill-review/codex-autoinstall.test.sh \
          claude/hooks/lib/mtime-prune.test.sh \
          claude/hooks/lib/memory_render.test.sh \
          claude/hooks/lib/test-stub.test.sh \

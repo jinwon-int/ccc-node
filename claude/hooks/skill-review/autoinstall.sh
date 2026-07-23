@@ -59,7 +59,20 @@ mkdir -p "$STATE_DIR" 2>/dev/null
 AUTOINSTALL_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)" || AUTOINSTALL_LIB_DIR="${HOME:-/root}/.claude/hooks/skill-review"
 # shellcheck source=claude/hooks/lib/hook-common.sh
 . "$AUTOINSTALL_LIB_DIR/../lib/hook-common.sh" || exit 0
+# shellcheck source=claude/hooks/skill-review/provider.sh
+. "$AUTOINSTALL_LIB_DIR/provider.sh" 2>/dev/null || true
 ts_id() { date -u +%Y%m%d%H%M%S; }
+
+# Provider-neutral install target (#643): the gate/ledger/rollback pipeline is
+# identical across providers; only the skills directory and a compatibility
+# screen differ. Falls back to the historical Claude default if provider.sh is
+# somehow unavailable, so existing Claude nodes are unchanged.
+if declare -f ccc_skill_provider >/dev/null 2>&1; then
+  SKILL_PROVIDER="$(ccc_skill_provider)"
+  SKILLS_DIR="$(ccc_skills_dir "$SKILL_PROVIDER")"
+else
+  SKILL_PROVIDER="claude"
+fi
 
 resolve_mode() {
   local m="${CCC_SKILL_AUTOSAVE_MODE:-}"
@@ -155,6 +168,26 @@ gate_node_specific() { # <skill.md> — hardcoded node facts stay human-reviewed
   return 0
 }
 
+gate_codex_compat() { # <skill.md> — Codex nodes reject Claude-only couplings
+  # No-op for the Claude provider. On a Codex node a draft that hard-codes the
+  # Claude CLI, the ~/.claude tree, or CLAUDE_* env can't run, so it stays
+  # human-reviewed (pending) instead of installing. Prose that merely mentions
+  # "Claude Code" is untouched — only concrete path/CLI/env couplings match, and
+  # the reason is a label only so markers/logs stay redaction-safe.
+  local f="$1"
+  [ "${SKILL_PROVIDER:-claude}" = "codex" ] || return 0
+  if grep -qE '(^|[^A-Za-z0-9_-])claude[[:space:]]+-p([[:space:]]|$)' "$f" 2>/dev/null; then
+    printf 'codex-incompat claude-cli'; return 1
+  fi
+  if grep -qE '(^|[^A-Za-z0-9_])(~|\$HOME|\$\{HOME[^}]*\})?/?\.claude/' "$f" 2>/dev/null; then
+    printf 'codex-incompat claude-home'; return 1
+  fi
+  if grep -qE 'CLAUDE_(SKILLS_DIR|PROJECTS_DIR|CLI_PATH|CONFIG|CODE)' "$f" 2>/dev/null; then
+    printf 'codex-incompat claude-env'; return 1
+  fi
+  return 0
+}
+
 norm_name() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -dc 'a-z0-9'; }
 
 desc_tokens() { # <text> — one lowercase token (len>=3) per line, unique+sorted
@@ -216,12 +249,41 @@ do_run() {
     return 0
   fi
 
+  # Fail closed if the install target is unsafe (symlinked leaf / non-dir).
+  # For Codex the directory is created owner-only (0700); an existing regular
+  # Claude skills dir is accepted untouched. #643.
+  if declare -f ccc_ensure_skills_dir >/dev/null 2>&1; then
+    if ! ccc_ensure_skills_dir "$SKILLS_DIR"; then
+      log "skip reason=unsafe-skills-dir provider=$SKILL_PROVIDER dir=$SKILLS_DIR trigger=$TRIGGER"
+      printf '{"mode":"auto","skipped":"unsafe-skills-dir","provider":"%s"}\n' "$SKILL_PROVIDER"
+      return 0
+    fi
+  fi
+
+  # Atomic single-runner lock (#643 concurrency safety): mkdir is atomic, so at
+  # most one runner installs at a time. Concurrent runners no-op (drafts stay
+  # pending and are retried), which keeps candidates/ledger/installs duplicate
+  # free even when the same checkpoint is processed many times at once. A stale
+  # lock (>5 min, e.g. a killed runner) is reclaimed.
+  local LOCKDIR="$STATE_DIR/.autoinstall.lock" locked=0
+  if mkdir "$LOCKDIR" 2>/dev/null; then
+    locked=1
+  elif find "$LOCKDIR" -maxdepth 0 -mmin +5 2>/dev/null | grep -q .; then
+    rm -rf "$LOCKDIR" 2>/dev/null
+    mkdir "$LOCKDIR" 2>/dev/null && locked=1
+  fi
+  if [ "$locked" != 1 ]; then
+    log "skip reason=locked trigger=$TRIGGER"
+    printf '{"mode":"auto","skipped":"locked"}\n'
+    return 0
+  fi
+
   local work dir id f name desc verdict rec sha sid dest
   local -a installed=() blocked=() newly_blocked=()
   local deferred=0 today_used
   work="$(mktemp -d 2>/dev/null)" || work="$STATE_DIR/.autoinstall-work.$$"
   mkdir -p "$work" 2>/dev/null
-  trap 'rm -rf "$work" 2>/dev/null' RETURN
+  trap 'rm -rf "$work" 2>/dev/null; rmdir "$LOCKDIR" 2>/dev/null' RETURN
   today_used="$(installs_today)"
   case "$today_used" in ''|*[!0-9]*) today_used=0 ;; esac
 
@@ -252,6 +314,9 @@ do_run() {
       record_block "$dir" "$id" "$verdict"; continue
     fi
     if ! verdict="$(gate_node_specific "$f")"; then
+      record_block "$dir" "$id" "$verdict"; continue
+    fi
+    if ! verdict="$(gate_codex_compat "$f")"; then
       record_block "$dir" "$id" "$verdict"; continue
     fi
     if ! verdict="$(gate_dedup "$name" "$desc" "$work")"; then
@@ -412,6 +477,7 @@ do_list() {
 
 do_status() {
   echo "mode: $(resolve_mode)"
+  echo "provider: ${SKILL_PROVIDER:-claude} (skills dir: $SKILLS_DIR)"
   echo "off-switch: $([ -f "$STATE_DIR/skill-autosave.disabled" ] && echo ON || echo off)"
   echo "daily cap: $(installs_today)/$DAILY_CAP used today"
   echo "pending drafts: $(pending_count)"
