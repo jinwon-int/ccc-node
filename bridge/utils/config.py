@@ -296,6 +296,23 @@ class Config(
         alias="CCC_REQUIRE_ALLOWLIST",
         description="Refuse to start when ALLOWED_USER_IDS is empty (fail-closed access control).",
     )
+    restart_handoff: Literal["off", "systemd"] = Field(
+        default="off",
+        alias="CCC_BRIDGE_RESTART_HANDOFF",
+        description="Owner-only external bridge restart handoff; disabled by default.",
+    )
+    restart_service_unit: str = Field(
+        default="ccc-telegram-bridge.service",
+        alias="CCC_BRIDGE_RESTART_UNIT",
+        description="Exact allowlisted systemd bridge unit used by /restart.",
+    )
+    restart_delay_seconds: int = Field(
+        default=5,
+        ge=5,
+        le=30,
+        alias="CCC_BRIDGE_RESTART_DELAY_SECONDS",
+        description="Delay before the external transient restart worker runs (5-30s).",
+    )
     execution_profile: str = Field(
         default="strict-project",
         alias="CCC_BRIDGE_EXECUTION_PROFILE",
@@ -450,6 +467,18 @@ class Config(
         raise ValueError(
             "CCC_REQUIRE_ALLOWLIST must be a boolean: true/false, yes/no, on/off, or 1/0"
         )
+
+    @field_validator("restart_service_unit")
+    @classmethod
+    def validate_restart_service_unit(cls, v):
+        value = str(v).strip()
+        if not re.fullmatch(
+            r"ccc-telegram-bridge(?:-[A-Za-z0-9_.@:-]+)?\.service", value
+        ):
+            raise ValueError(
+                "CCC_BRIDGE_RESTART_UNIT must name a ccc-telegram-bridge*.service unit"
+            )
+        return value
 
     @field_validator("push_notify_allowed_chats", mode="before")
     @classmethod

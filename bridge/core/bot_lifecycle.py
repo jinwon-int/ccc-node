@@ -13,6 +13,7 @@ from telegram.ext import Application
 from telegram.request import BaseRequest, HTTPXRequest
 
 from telegram_bot.core import crash_policy, media
+from telegram_bot.core import restart_handoff
 from telegram_bot.core.bot_shared import _PollingRestart, enforce_access_control
 from telegram_bot.core.tool_policy import (
     EXECUTION_OWNER_OPERATOR,
@@ -45,6 +46,44 @@ logger = logging.getLogger(__name__)
 
 
 class BotLifecycleMixin:
+    async def _restart_receipt_loop(self, stop_event: asyncio.Event) -> None:
+        """Deliver a terminal restart receipt after the replacement is healthy."""
+        while not stop_event.is_set():
+            try:
+                receipt = await asyncio.to_thread(
+                    restart_handoff.read_receipt, self._config.bot_data_dir
+                )
+                if receipt and receipt.get("state") in restart_handoff.TERMINAL_STATES:
+                    request_id = str(receipt.get("request_id", ""))
+                    if receipt["state"] == "completed":
+                        text = (
+                            f"✅ Bridge restart completed ({request_id[:8]}). "
+                            f"New PID: {receipt.get('new_pid', 'unknown')}."
+                        )
+                    else:
+                        text = (
+                            f"❌ Bridge restart failed ({request_id[:8]}): "
+                            f"{receipt.get('reason_code', 'worker_error')}."
+                        )
+                    await self.application.bot.send_message(
+                        chat_id=int(receipt["chat_id"]), text=text
+                    )
+                    await asyncio.to_thread(
+                        restart_handoff.archive_receipt,
+                        self._config.bot_data_dir,
+                        request_id,
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "Restart receipt delivery deferred: %s", type(exc).__name__
+                )
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=2)
+            except asyncio.TimeoutError:
+                pass
+
     async def _on_ready(self, application: Application):
         """Called after application.initialize() — sets up commands and cleanup."""
         self._audio_dir.mkdir(parents=True, exist_ok=True)
@@ -493,6 +532,7 @@ class BotLifecycleMixin:
             distill_honcho_sink_task = None
             skill_candidate_collector_task = None
             health_alerts_task = None
+            restart_receipt_task = None
             try:
                 await self.application.start()
                 await self.application.updater.start_polling(
@@ -531,6 +571,10 @@ class BotLifecycleMixin:
                 health_alerts_task = asyncio.create_task(
                     self._health_alerts_probe(stop_event), name="health-alerts"
                 )
+                if getattr(self._config, "restart_handoff", "off") == "systemd":
+                    restart_receipt_task = asyncio.create_task(
+                        self._restart_receipt_loop(stop_event), name="restart-receipt"
+                    )
                 distill_extraction_task = None
                 if (
                     self._distill_snapshot_worker is not None
@@ -667,6 +711,7 @@ class BotLifecycleMixin:
                     workload_task,
                     dead_session_recovery_task,
                     health_alerts_task,
+                    restart_receipt_task,
                     distill_snapshot_task,
                     distill_extraction_task,
                     distill_local_sink_task,

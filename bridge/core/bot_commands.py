@@ -17,6 +17,7 @@ from telegram.ext import (
     ContextTypes,
 )
 from telegram_bot.core import revert as revert_ops
+from telegram_bot.core import restart_handoff
 from telegram_bot.core.usage import UsageSnapshot, render_usage
 from telegram_bot.memory.distill_types import DistillTrigger
 from .conversation_paths import resolve_conversation_file
@@ -42,6 +43,51 @@ class BotCommandMixin:
         welcome_text = f"👋 Hello, {user.first_name}! Send a message to start chatting, or use /skills to view available skills."
         await message.reply_text(welcome_text)
         log_debug(user.id, "bot", welcome_text)
+
+    async def _cmd_restart(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Schedule an owner-only restart outside the bridge's systemd cgroup."""
+        if not await self._check_access(update):
+            return
+        user = self._require_user(update)
+        message = self._require_message(update)
+        chat = self._require_chat(update)
+        log_debug(user.id, "command", "/restart")
+
+        allowed = list(dict.fromkeys(getattr(self._config, "allowed_user_ids", [])))
+        if (
+            getattr(self._config, "restart_handoff", "off") != "systemd"
+            or len(allowed) != 1
+            or allowed[0] != user.id
+            or getattr(chat, "type", None) != "private"
+        ):
+            reply = (
+                "⛔ Safe restart is unavailable. It requires systemd opt-in and "
+                "a private chat with the sole allowlisted owner."
+            )
+            await message.reply_text(reply)
+            log_debug(user.id, "bot", reply)
+            return
+
+        try:
+            scheduled = await asyncio.to_thread(
+                restart_handoff.schedule_restart,
+                data_dir=self._config.bot_data_dir,
+                chat_id=chat.id,
+                unit=self._config.restart_service_unit,
+                delay_seconds=self._config.restart_delay_seconds,
+            )
+        except restart_handoff.RestartHandoffError as exc:
+            reply = f"❌ Restart was not scheduled ({exc.code}). The bridge is still running."
+            await message.reply_text(reply)
+            log_debug(user.id, "bot", reply)
+            return
+
+        reply = (
+            f"♻️ Restart scheduled ({scheduled.request_id[:8]}). "
+            "I will report when the replacement bridge is healthy."
+        )
+        await message.reply_text(reply)
+        log_debug(user.id, "bot", reply)
 
     async def _cmd_usage(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Render local/read-only provider usage without starting an agent turn."""

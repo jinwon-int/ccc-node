@@ -5,6 +5,13 @@ All notable changes to the Claude Code node harness. Dates are KST.
 ## [Unreleased]
 
 ### Added
+- The Telegram bridge now has an opt-in, sole-owner `/restart` control plane
+  for Linux systemd nodes. A delayed transient worker outside the bridge cgroup
+  performs the restart, validates a new MainPID and fresh available health, and
+  leaves a durable body-free completion receipt for the replacement bridge.
+  The target remains restricted to `ccc-telegram-bridge*.service`; group,
+  multi-owner, duplicate, unsupported, and default-off paths fail closed.
+  (#708)
 - Agent-cron can now install an ephemeral Codex headless runner with an
   explicit fail-closed sandbox choice. Bounded tasks support `notBefore`,
   `maxRuns`, and durable `runCount`, so a future one-time LLM job cannot catch

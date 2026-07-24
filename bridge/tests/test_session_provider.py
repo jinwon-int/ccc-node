@@ -41,7 +41,7 @@ def make_update(*, user_id: int = 7, chat_id: int = 9, text: str = ""):
     message = Message(text)
     return SimpleNamespace(
         effective_user=SimpleNamespace(id=user_id),
-        effective_chat=SimpleNamespace(id=chat_id),
+        effective_chat=SimpleNamespace(id=chat_id, type="private"),
         message=message,
         callback_query=None,
     )
@@ -1518,6 +1518,63 @@ async def test_distill_command_is_published_in_bot_menu(tmp_path: Path) -> None:
     assert set_my_commands.await_count == 3
     for call in set_my_commands.await_args_list:
         assert "distill" in {command.command for command in call.args[0]}
+
+
+@pytest.mark.anyio
+async def test_restart_command_is_private_menu_only(tmp_path: Path) -> None:
+    bot = bare_bot(make_manager(tmp_path, "codex"), provider="codex")
+    set_my_commands = AsyncMock()
+    bot.application = SimpleNamespace(bot=SimpleNamespace(set_my_commands=set_my_commands))
+
+    await bot._set_bot_commands()
+
+    command_sets = [
+        {command.command for command in call.args[0]}
+        for call in set_my_commands.await_args_list
+    ]
+    assert sum("restart" in commands for commands in command_sets) == 1
+
+
+@pytest.mark.anyio
+async def test_restart_command_schedules_for_sole_owner_private_chat(
+    tmp_path: Path,
+) -> None:
+    bot = bare_bot(make_manager(tmp_path, "codex"), provider="codex")
+    bot._config.allowed_user_ids = [7]
+    bot._config.restart_handoff = "systemd"
+    bot._config.bot_data_dir = tmp_path
+    bot._config.restart_service_unit = "ccc-telegram-bridge.service"
+    bot._config.restart_delay_seconds = 5
+    update = make_update()
+
+    scheduled = SimpleNamespace(request_id="abcdef123456")
+    with patch(
+        "telegram_bot.core.bot_commands.restart_handoff.schedule_restart",
+        return_value=scheduled,
+    ) as schedule:
+        await bot._cmd_restart(update, SimpleNamespace())
+
+    schedule.assert_called_once()
+    assert "abcdef12" in update.message.replies[0][0]
+
+
+@pytest.mark.anyio
+async def test_restart_command_fails_closed_for_group_or_multiple_owners(
+    tmp_path: Path,
+) -> None:
+    bot = bare_bot(make_manager(tmp_path, "codex"), provider="codex")
+    bot._config.allowed_user_ids = [7, 8]
+    bot._config.restart_handoff = "systemd"
+    update = make_update()
+    update.effective_chat.type = "group"
+
+    with patch(
+        "telegram_bot.core.bot_commands.restart_handoff.schedule_restart"
+    ) as schedule:
+        await bot._cmd_restart(update, SimpleNamespace())
+
+    schedule.assert_not_called()
+    assert "unavailable" in update.message.replies[0][0]
 
 
 @pytest.mark.anyio
