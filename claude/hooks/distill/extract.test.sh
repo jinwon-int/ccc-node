@@ -6,7 +6,7 @@ EXTRACT="$HERE/extract.sh"
 # shellcheck source=claude/hooks/lib/test-stub.sh
 . "$HERE/../lib/test-stub.sh"
 pass=0; fail=0
-TMP="$(mktemp -d)"
+TMP="$(ccc_test_tmpdir)" || exit 1
 fake_github_token="ghp_""12345678901234567890"
 trap 'rm -rf "$TMP"' EXIT
 

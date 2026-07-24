@@ -8,6 +8,8 @@ set -uo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 SUT="$HERE/mcp-setup.sh"
+# shellcheck source=claude/hooks/lib/test-stub.sh
+. "$HERE/hooks/lib/test-stub.sh"
 pass=0; fail=0
 ok() { if eval "$2"; then pass=$((pass + 1)); else fail=$((fail + 1)); echo "FAIL: $1"; fi; }
 
@@ -17,7 +19,7 @@ NODE_DIR="$(dirname "$(command -v node)")"
 # /usr/bin/env, so `#!/usr/bin/env bash` stubs would not execute under `env -i`.
 BASH_BIN="$(command -v bash)"
 
-TMP="$(mktemp -d)"
+TMP="$(ccc_test_tmpdir)" || exit 1
 trap 'rm -rf "$TMP"' EXIT
 BIN="$TMP/bin"; mkdir -p "$BIN"
 GROOT="$TMP/gmodules"

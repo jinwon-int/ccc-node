@@ -7,7 +7,7 @@ DRAIN="$HERE/queue-drain.sh"
 . "$HERE/../lib/test-stub.sh"
 PUSH="$HERE/honcho-push.sh"
 pass=0; fail=0
-TMP="$(mktemp -d)"
+TMP="$(ccc_test_tmpdir)" || exit 1
 trap 'rm -rf "$TMP"' EXIT
 
 ok() { if eval "$2"; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $1"; fi; }

@@ -3,8 +3,10 @@
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TOOL="$ROOT/scripts/a2a-termux-native-worker.sh"
+# shellcheck source=claude/hooks/lib/test-stub.sh
+. "$ROOT/claude/hooks/lib/test-stub.sh"
 pass=0; fail=0
-TMP="$(mktemp -d)"
+TMP="$(ccc_test_tmpdir)" || exit 1
 trap 'rm -rf "$TMP"' EXIT
 
 ok() { if eval "$2"; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $1"; fi; }
@@ -282,9 +284,9 @@ ok "failed exec stays fail-closed (no traceback)" '[ "$rc" = 2 ] && grep -q "fai
 # A2A_PYTHON_HARNESS + a bash executable stub so the tests need no real
 # python3, ssh, or curl on the network side.
 
-SUP_TMP="$(mktemp -d)"
-# NB: don't cleanup SUP_TMP inside a nested EXIT trap — the outer trap on line 8
-# already covers $TMP, and we bind SUP_TMP to $TMP so cleanup piggy-backs.
+SUP_TMP="$(ccc_test_tmpdir)" || exit 1
+# NB: don't cleanup SUP_TMP inside a nested EXIT trap — the outer trap already
+# covers $TMP, and we bind SUP_TMP to $TMP so cleanup piggy-backs.
 mv "$SUP_TMP" "$TMP/sup" && SUP_TMP="$TMP/sup"
 
 # Mock Python harness: `check` always OK, `run` sleeps so the supervisor's

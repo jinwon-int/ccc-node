@@ -3,7 +3,9 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 HELPER="$ROOT/codex/skills/gh-pr-flow/scripts/approve-via-seoseo-ai.sh"
-TMP="$(mktemp -d)"
+# shellcheck source=claude/hooks/lib/test-stub.sh
+. "$ROOT/claude/hooks/lib/test-stub.sh"
+TMP="$(ccc_test_tmpdir)" || exit 1
 trap 'rm -rf "$TMP"' EXIT
 PASS=0
 FAIL=0

@@ -14,9 +14,11 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 HEALTH="$ROOT/scripts/a2a-termux-native-worker-health.sh"
 HARNESS="$ROOT/scripts/a2a-termux-native-worker.sh"
+# shellcheck source=claude/hooks/lib/test-stub.sh
+. "$ROOT/claude/hooks/lib/test-stub.sh"
 
 pass=0; fail=0
-TMP="$(mktemp -d)"
+TMP="$(ccc_test_tmpdir)" || exit 1
 # Resolve real setsid BEFORE we prepend $TMP/bin (with mock setsid) to PATH,
 # so the fake-supervisor helpers can detach properly (ppid=1) while the
 # health check under test still sees the mock.

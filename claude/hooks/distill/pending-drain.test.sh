@@ -10,7 +10,7 @@ DRAIN="$HERE/pending-drain.sh"
 . "$HERE/../lib/test-stub.sh"
 
 pass=0; fail=0
-TMP="$(mktemp -d)"
+TMP="$(ccc_test_tmpdir)" || exit 1
 trap 'pgid="$(cat "$TMP/claude.pgid" 2>/dev/null || true)"; [ -z "$pgid" ] || kill -KILL -- "-$pgid" 2>/dev/null || true; rm -rf "$TMP"' EXIT
 
 ok() { if eval "$2"; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $1"; fi; }
