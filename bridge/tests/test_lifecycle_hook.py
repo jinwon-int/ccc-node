@@ -56,3 +56,8 @@ def test_malformed_stdin_is_a_noop(monkeypatch, tmp_path) -> None:
 def test_unknown_event_is_a_noop(monkeypatch, tmp_path) -> None:
     rc, records = _run(monkeypatch, tmp_path, "Nope", {"session_id": "s"})
     assert rc == 0 and records == []
+
+
+def test_empty_notification_is_a_noop(monkeypatch, tmp_path) -> None:
+    rc, records = _run(monkeypatch, tmp_path, "Notification", {"session_id": "s"})
+    assert rc == 0 and records == []

@@ -217,6 +217,16 @@ def normalize_claude_hook(
             correlation=_ref(f"{payload.get('session_id')}:end"), observed_at=ts,
         )
     if event_name == "Notification":
+        notice = next(
+            (
+                value
+                for value in (payload.get("message"), payload.get("notification"))
+                if isinstance(value, str) and value.strip()
+            ),
+            None,
+        )
+        if notice is None:
+            return None
         return LifecycleObservation(
             event=LifecycleEventType.PROVIDER_NOTIFICATION, provider="claude",
             session_ref=session_ref, flag="notification",

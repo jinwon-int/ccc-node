@@ -164,6 +164,10 @@ class MemorySettingsMixin:
     def hook_policy_environment(self) -> dict[str, str]:
         """Return validated, non-secret policy fields inherited by Claude hooks."""
         profile = self.node_isolation_profile
+        audit_enabled = bool(getattr(self, "lifecycle_audit_enabled", False))
+        audit_base = Path(
+            getattr(self, "bot_data_dir", Path.home() / ".telegram_bot")
+        ) / "lifecycle-audit"
         return {
             "CCC_NODE_ISOLATION_PROFILE": profile,
             "CCC_WIKI_MEMORY_ENABLED": (
@@ -172,6 +176,11 @@ class MemorySettingsMixin:
             "CCC_HONCHO_MEMORY_ENABLED": "1" if self.honcho_memory_enabled else "0",
             "CCC_MEMORY_USER_LABEL": self.memory_user_label,
             "CCC_MEMORY_ASSISTANT_LABEL": self.memory_assistant_label,
+            # The bridge settings loader does not mutate os.environ. Export the
+            # validated, non-secret lifecycle gate/path explicitly so Claude
+            # hook subprocesses write to the same ledger as live AgentEvents.
+            "CCC_LIFECYCLE_AUDIT": "1" if audit_enabled else "0",
+            "CCC_LIFECYCLE_AUDIT_DIR": str(audit_base),
         }
 
     @field_validator("memory_user_label", "memory_assistant_label", mode="before")

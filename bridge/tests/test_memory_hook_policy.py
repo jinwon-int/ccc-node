@@ -1,4 +1,6 @@
 import importlib
+import io
+import json
 import sys
 from pathlib import Path
 
@@ -45,6 +47,8 @@ def test_external_policy_forces_wiki_off_and_exports_only_validated_fields(tmp_p
         "CCC_HONCHO_MEMORY_ENABLED": "1",
         "CCC_MEMORY_USER_LABEL": "Etter Ahn",
         "CCC_MEMORY_ASSISTANT_LABEL": "Karellen",
+        "CCC_LIFECYCLE_AUDIT": "0",
+        "CCC_LIFECYCLE_AUDIT_DIR": str(settings.bot_data_dir / "lifecycle-audit"),
     }
     assert "TELEGRAM_BOT_TOKEN" not in exported
 
@@ -58,6 +62,46 @@ def test_fleet_policy_preserves_explicit_wiki_disable(tmp_path):
         },
     )
     assert settings.hook_policy_environment()["CCC_WIKI_MEMORY_ENABLED"] == "0"
+
+
+def test_hook_policy_exports_validated_lifecycle_gate_and_shared_ledger(tmp_path):
+    settings = _load(
+        tmp_path,
+        {
+            "CCC_LIFECYCLE_AUDIT": "1",
+        },
+    )
+    exported = settings.hook_policy_environment()
+    assert exported["CCC_LIFECYCLE_AUDIT"] == "1"
+    assert exported["CCC_LIFECYCLE_AUDIT_DIR"] == str(
+        settings.bot_data_dir / "lifecycle-audit"
+    )
+
+
+def test_exported_hook_env_drives_python_cli_to_live_observer_ledger(
+    tmp_path, monkeypatch
+):
+    from telegram_bot.core import lifecycle_hook
+
+    settings = _load(tmp_path, {"CCC_LIFECYCLE_AUDIT": "1"})
+    exported = settings.hook_policy_environment()
+    for key, value in exported.items():
+        monkeypatch.setenv(key, value)
+
+    payload = {
+        "session_id": "shared-ledger-session",
+        "tool_name": "Write",
+        "tool_input": {"file_path": "/never-persist-this"},
+    }
+    rc = lifecycle_hook.main(
+        ["lifecycle_hook", "PostToolUse"],
+        stdin=io.StringIO(json.dumps(payload)),
+    )
+    ledger = settings.bot_data_dir / "lifecycle-audit" / "lifecycle-audit.jsonl"
+    assert rc == 0 and ledger.is_file()
+    record = json.loads(ledger.read_text().strip())
+    assert record["event"] == "tool_completed"
+    assert "never-persist-this" not in json.dumps(record)
 
 
 def test_unknown_isolation_profile_fails_closed_at_config_validation(tmp_path):
