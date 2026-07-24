@@ -320,12 +320,13 @@ class TelegramBot(
     async def _switch_provider_if_needed(
         self, session_key: Any, user_id: int, chat_id: int, session=None
     ):
-        """Align the session provider and reset approval state on a switch.
+        """Align provider and memory route before reusing a persisted session.
 
         The deny/invalidate pair is security-relevant: pending and previously
-        granted Codex approvals belong to the departing provider and must not
-        survive into the new one. Keeping the reset inside this helper means a
-        call site cannot align the provider and forget the reset.
+        granted Codex approvals belong to the departing provider/route and must
+        not survive into the new one.  A session created before audience-scoped
+        mode has no trustworthy route label, so it is reset instead of being
+        resumed under whichever Telegram surface happens to reference it.
         """
         aligned, switched = await self._align_active_provider(
             session_key,
@@ -333,11 +334,44 @@ class TelegramBot(
             user_id=user_id,
             chat_id=chat_id,
         )
-        if switched:
+        route_reset = False
+        from telegram_bot.core.memory_audience import resolve_memory_audience
+
+        audience = resolve_memory_audience(
+            self._config,
+            user_id=user_id,
+            chat_id=chat_id,
+        )
+        if audience is not None and aligned.get("session_id"):
+            stored_route = (
+                aligned.get("distill_memory_audience"),
+                aligned.get("distill_memory_scope"),
+            )
+            expected_route = (audience.kind, audience.scope)
+            if stored_route != expected_route:
+                await self._session_manager.patch_session(
+                    session_key,
+                    updates={"session_id": None, "new_session": False},
+                    remove_fields={
+                        "resume_list",
+                        "distill_memory_audience",
+                        "distill_memory_scope",
+                    },
+                )
+                aligned.update(session_id=None, new_session=False)
+                aligned.pop("resume_list", None)
+                aligned.pop("distill_memory_audience", None)
+                aligned.pop("distill_memory_scope", None)
+                route_reset = True
+                logger.warning(
+                    "Reset persisted %s session without a matching memory route",
+                    aligned.get("provider", self._active_provider()),
+                )
+        if switched or route_reset:
             self._deny_codex_approvals(user_id, chat_id)
             self._invalidate_codex_approvals(user_id, chat_id)
             self._runtime_active_sessions.discard(session_key)
-        return aligned, switched
+        return aligned, switched or route_reset
 
     async def _reset_for_auto_new_session(
         self,

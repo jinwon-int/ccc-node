@@ -13,6 +13,7 @@ import hmac
 import os
 import secrets
 import stat
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -136,6 +137,17 @@ class MemoryAudience:
         )
         return env
 
+    def claude_environment(self, settings: Any) -> dict[str, str]:
+        """Return the exact hook overlay for one Claude SDK session.
+
+        Claude receives this mapping through ``SessionRequest`` and rebuilds
+        it from the resolved route before constructing flag settings. Keeping
+        the provider method separate from ``codex_environment`` prevents
+        Codex credential/home variables from leaking into Claude settings.
+        """
+
+        return self.hook_environment(settings)
+
 
 def _audience_root(settings: Any) -> Path:
     configured = getattr(settings, "bridge_memory_audience_root", None)
@@ -153,6 +165,45 @@ def _key_path(settings: Any) -> Path:
     if configured:
         return Path(configured).expanduser().resolve()
     return _audience_root(settings).parent / "memory-audience.key"
+
+
+def audience_from_claude_environment(
+    settings: Any, environment: Mapping[str, str] | None
+) -> MemoryAudience:
+    """Reconstruct and validate one Claude route without trusting its paths.
+
+    ``SessionRequest.memory_environment`` is provider-neutral and therefore
+    intentionally opaque to the runtime contract.  The Claude adapter must not
+    inject an arbitrary caller-supplied environment into hook settings, so this
+    helper accepts only the byte-for-byte mapping that the canonical audience
+    resolver would have produced for the declared kind/scope.
+    """
+
+    if environment is None:
+        raise ValueError("Claude audience-scoped memory requires a route environment")
+    kind = environment.get("CCC_MEMORY_AUDIENCE")
+    scope = environment.get("CCC_MEMORY_SCOPE")
+    if kind == AUDIENCE_SHARED:
+        if scope != AUDIENCE_SHARED:
+            raise ValueError("Claude shared memory route is invalid")
+    elif kind == AUDIENCE_PRIVATE:
+        suffix = (scope or "").removeprefix("private-")
+        if (
+            not isinstance(scope, str)
+            or not scope.startswith("private-")
+            or len(suffix) != 32
+            or any(char not in "0123456789abcdef" for char in suffix)
+        ):
+            raise ValueError("Claude private memory route is invalid")
+    else:
+        raise ValueError("Claude memory audience is invalid")
+
+    assert isinstance(kind, str) and isinstance(scope, str)
+    audience = MemoryAudience(kind, scope, _audience_root(settings))
+    expected = audience.claude_environment(settings)
+    if dict(environment) != expected:
+        raise ValueError("Claude audience environment does not match the resolved route")
+    return audience
 
 
 def _read_private_key(path: Path) -> bytes:

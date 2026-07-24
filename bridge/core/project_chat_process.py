@@ -341,14 +341,17 @@ class ProjectChatProcessMixin:
             try:
                 if session is None:
                     memory_environment = None
-                    if getattr(self._config, "agent_provider", "claude") == "codex":
-                        audience = resolve_memory_audience(
-                            self._config,
-                            user_id=user_id,
-                            chat_id=chat_id,
-                        )
-                        if audience is not None:
+                    provider = getattr(self._config, "agent_provider", "claude")
+                    audience = resolve_memory_audience(
+                        self._config,
+                        user_id=user_id,
+                        chat_id=chat_id,
+                    )
+                    if audience is not None:
+                        if provider == "codex":
                             memory_environment = audience.codex_environment(self._config)
+                        else:
+                            memory_environment = audience.claude_environment(self._config)
                     session = await self._agent_runtime.start_or_resume(
                         SessionRequest(
                             working_directory=str(self.project_root),

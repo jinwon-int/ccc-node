@@ -219,6 +219,129 @@ async def test_resume_provider_mismatch_rejects_without_mutation(tmp_path: Path)
 
 
 @pytest.mark.anyio
+async def test_claude_audience_scoped_resume_browser_is_disabled(
+    tmp_path: Path,
+) -> None:
+    manager = make_manager(tmp_path, "claude")
+    await manager.store.set(
+        "7:9",
+        {
+            "provider": "claude",
+            "session_id": "private-session",
+            "resume_list": [["private-session", "private preview", "claude"]],
+        },
+    )
+    project_chat = SimpleNamespace(
+        list_sessions=Mock(side_effect=AssertionError("must not list transcripts"))
+    )
+    bot = bare_bot(manager, provider="claude", project_chat=project_chat)
+    bot._config.bridge_memory_mode = "audience-scoped"
+    update = make_update()
+
+    await bot._cmd_resume(update, SimpleNamespace(args=[]))
+
+    project_chat.list_sessions.assert_not_called()
+    session = await manager.get_session("7:9")
+    assert "resume_list" not in session
+    assert "disabled" in update.message.replies[0][0].lower()
+
+
+@pytest.mark.anyio
+async def test_claude_audience_scoped_stale_resume_selection_is_cleared(
+    tmp_path: Path,
+) -> None:
+    manager = make_manager(tmp_path, "claude")
+    await manager.store.set(
+        "7:9",
+        {
+            "provider": "claude",
+            "resume_list": [["private-session", "private preview", "claude"]],
+        },
+    )
+    project_chat = SimpleNamespace(
+        get_session_last_assistant_message=Mock(
+            side_effect=AssertionError("must not read selected transcript")
+        )
+    )
+    bot = bare_bot(manager, provider="claude", project_chat=project_chat)
+    bot._config.bridge_memory_mode = "audience-scoped"
+    bot._resolve_codex_approval_text = AsyncMock(return_value=None)
+    bot._maybe_capture_outside_approval = AsyncMock()
+    bot._enqueue_user_task = AsyncMock(return_value=True)
+    update = make_update(text="1")
+
+    await bot._handle_text_message(update, SimpleNamespace())
+
+    project_chat.get_session_last_assistant_message.assert_not_called()
+    session = await manager.get_session("7:9")
+    assert "resume_list" not in session
+    assert session.get("session_id") is None
+    assert not update.message.replies
+
+
+@pytest.mark.anyio
+async def test_audience_scoped_session_without_matching_route_is_reset(
+    tmp_path: Path,
+) -> None:
+    manager = make_manager(tmp_path, "claude")
+    await manager.store.set(
+        "7:9",
+        {
+            "provider": "claude",
+            "session_id": "legacy-unscoped",
+            "resume_list": [["legacy-unscoped", "private preview", "claude"]],
+        },
+    )
+    bot = bare_bot(manager, provider="claude")
+    bot._config.bridge_memory_mode = "audience-scoped"
+    bot._config.telegram_session_scope = "shared-groups"
+    bot._config.project_root = tmp_path
+    bot._config.bot_data_dir = tmp_path / ".telegram_bot"
+    bot._config.bridge_memory_audience_root = None
+    bot._config.bridge_memory_audience_key_path = None
+    bot._config.bridge_unsafe_shared_all_memory = False
+
+    session, reset = await bot._switch_provider_if_needed("7:9", 7, 9)
+
+    assert reset is True
+    assert session["session_id"] is None
+    persisted = await manager.get_session("7:9")
+    assert persisted["session_id"] is None
+    assert "resume_list" not in persisted
+    assert "distill_memory_audience" not in persisted
+    assert "distill_memory_scope" not in persisted
+
+
+@pytest.mark.anyio
+async def test_audience_scoped_session_with_matching_route_is_preserved(
+    tmp_path: Path,
+) -> None:
+    manager = make_manager(tmp_path, "claude")
+    await manager.store.set(
+        "7:9",
+        {
+            "provider": "claude",
+            "session_id": "shared-session",
+            "distill_memory_audience": "shared",
+            "distill_memory_scope": "shared",
+        },
+    )
+    bot = bare_bot(manager, provider="claude")
+    bot._config.bridge_memory_mode = "audience-scoped"
+    bot._config.telegram_session_scope = "shared-groups"
+    bot._config.project_root = tmp_path
+    bot._config.bot_data_dir = tmp_path / ".telegram_bot"
+    bot._config.bridge_memory_audience_root = None
+    bot._config.bridge_memory_audience_key_path = None
+    bot._config.bridge_unsafe_shared_all_memory = False
+
+    session, reset = await bot._switch_provider_if_needed("7:9", 7, 9)
+
+    assert reset is False
+    assert session["session_id"] == "shared-session"
+
+
+@pytest.mark.anyio
 async def test_history_uses_conversation_scope_and_labels_legacy_claude(tmp_path: Path) -> None:
     manager = make_manager(tmp_path, "claude")
     await manager.store.set("7:9", {"session_id": "right"})

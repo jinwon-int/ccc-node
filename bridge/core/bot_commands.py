@@ -664,6 +664,26 @@ class BotCommandMixin:
         conversation_key = self._conversation_key(user_id, chat.id)
         log_debug(user_id, "command", "/resume")
         active_provider = self._active_provider()
+        if (
+            active_provider == "claude"
+            and getattr(self._config, "bridge_memory_mode", "off")
+            == "audience-scoped"
+        ):
+            # Claude transcript discovery is one global filesystem view. Until
+            # the SDK exposes an audience-scoped browser, listing it could put
+            # a DM preview into a group or another user's DM. Existing session
+            # ids remain usable only through their route-bound session record.
+            await self._session_manager.patch_session(
+                conversation_key,
+                remove_fields={"resume_list"},
+            )
+            reply = (
+                "🔒 Claude session browsing is disabled while private memory "
+                "is audience-scoped. Use /new to start a fresh session."
+            )
+            await message.reply_text(reply)
+            log_debug(user_id, "bot", reply)
+            return
         stored_provider = await self._session_provider(
             conversation_key
         )
