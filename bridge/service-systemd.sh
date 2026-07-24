@@ -47,6 +47,10 @@ Subcommands:
   uninstall   Disable the service and remove the unit
   is-managed  Exit 0 iff the bridge unit file exists and systemctl reports it
               active (used by start.sh --restart to avoid supervisor fights)
+  main-pid    Print the MainPID of the active managed bridge unit (same
+              ownership rule as is-managed); exit 1 with no output otherwise
+              (used by start.sh --status to reconcile a service-managed bot
+              whose pid file was lost to the concurrent-instance race)
 
 Options:
   --project-root <dir>  Project root directory (required for install)
@@ -63,7 +67,7 @@ CALLER=""
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        install|uninstall|is-managed)
+        install|uninstall|is-managed|main-pid)
             SUBCOMMAND="$1"
             shift
             ;;
@@ -228,8 +232,27 @@ do_is_managed() {
     exit 1
 }
 
+do_main_pid() {
+    # Print the MainPID of the active managed bridge unit for this scope, or
+    # exit 1 with no output. Same conservative ownership rule as is-managed:
+    # systemctl available, unit file present for this scope, service active.
+    # start.sh --status uses this to recognize a service-managed bot whose pid
+    # file was lost to the concurrent-instance race as "available" rather than
+    # "degraded". Honors the CCC_SYSTEMD_DIR / CCC_SYSTEMCTL test seams.
+    command -v "$SYSTEMCTL_BIN" >/dev/null 2>&1 || exit 1
+    systemd_paths
+    [ -f "$SYSTEMD_UNIT_FILE" ] || exit 1
+    "${SYSTEMCTL[@]}" is-active --quiet "$SYSTEMD_SERVICE" 2>/dev/null || exit 1
+    local main_pid
+    main_pid="$("${SYSTEMCTL[@]}" show "$SYSTEMD_SERVICE" -p MainPID --value 2>/dev/null)"
+    [ -n "$main_pid" ] && [ "$main_pid" != "0" ] || exit 1
+    printf '%s\n' "$main_pid"
+    exit 0
+}
+
 case "$SUBCOMMAND" in
     install)    do_install_systemd ;;
     uninstall)  do_uninstall_systemd ;;
     is-managed) do_is_managed ;;
+    main-pid)   do_main_pid ;;
 esac
