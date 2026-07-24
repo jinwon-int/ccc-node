@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Owner-only external bridge restart handoff (#708).** Linux systemd nodes
+  can opt in with `CCC_BRIDGE_RESTART_HANDOFF=systemd` to expose `/restart` in
+  private chats. The bridge durably prepares a body-free receipt, asks
+  `systemd-run` to create a delayed worker outside the target cgroup, and
+  acknowledges only after systemd accepts that worker. The worker revalidates
+  the exact `ccc-telegram-bridge*.service` target, restarts it without a shell,
+  and requires a replacement MainPID plus fresh `available` health before the
+  new bridge reports completion. Empty/multiple-owner allowlists, group chats,
+  unsupported managers, duplicate active requests, unsafe receipt files, and
+  arbitrary units fail closed. The #706 raw in-tree restart guard remains.
+
 ### Fixed
 - **An in-turn `start.sh --restart` could stop its own bridge and die before
   relaunching it (#706).** Restart now walks the caller's parent chain before

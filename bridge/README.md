@@ -262,6 +262,7 @@ it as supported; otherwise the override is removed and the bot reports the reset
 | `/effort [value\|default]` | Select or reset per-conversation Codex reasoning effort |
 | `/resume` | Browse and resume a previous session (shows progress summary with last assistant message) |
 | `/stop` | Interrupt execution immediately (bypasses queue, cancels active task) |
+| `/restart` | Safely restart an opted-in Linux systemd bridge (sole owner, private chat only) |
 | `/history` | View recent conversation history |
 | `/revert` | Revert to a previous conversation state (browse history, select message, choose restore mode) |
 | `/skills` | List available Claude Code skills |
@@ -285,6 +286,9 @@ a provider turn or reads transcript/credential files.
 | `TELEGRAM_BOT_TOKEN` | Yes | — | Telegram Bot API token |
 | `ALLOWED_USER_IDS` | No | *(allow all)* | Comma-separated user ID whitelist; `owner-operator` requires exactly one owner |
 | `CCC_REQUIRE_ALLOWLIST` | No | `true` | Refuse startup when the allowlist is empty; must stay true for `owner-operator` |
+| `CCC_BRIDGE_RESTART_HANDOFF` | No | `off` | Set `systemd` to enable sole-owner DM `/restart` through an external transient unit |
+| `CCC_BRIDGE_RESTART_UNIT` | No | `ccc-telegram-bridge.service` | Exact `ccc-telegram-bridge*.service` target allowlist |
+| `CCC_BRIDGE_RESTART_DELAY_SECONDS` | No | `5` | Delay (5–30s) before the external worker restarts the bridge |
 | `CCC_BRIDGE_EXECUTION_PROFILE` | No | `strict-project` | Execution boundary: `strict-project`, `owner-operator`, or `disabled` |
 | `CCC_BRIDGE_BASH_POLICY` | No | `auto-approve` | Bash approval UX; Codex default is unrestricted `never + dangerFullAccess` |
 | `CCC_AGENT_PROVIDER` | No | `claude` | Agent provider: `claude` or `codex` |

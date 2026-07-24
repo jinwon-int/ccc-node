@@ -462,6 +462,7 @@ class BotDeliveryMixin:
             BotCommand("command", "Run command"),
         ]
         private_commands = list(commands)
+        private_commands.insert(3, BotCommand("restart", "Restart bridge safely"))
         if getattr(self._config, "bridge_memory_mode", "off") == "audience-scoped":
             private_commands.insert(
                 2, BotCommand("memory_promote", "Promote a private memory fact")
