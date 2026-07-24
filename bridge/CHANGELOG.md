@@ -20,6 +20,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   arbitrary units fail closed. The #706 raw in-tree restart guard remains.
 
 ### Fixed
+- **Claude audience-scoped memory now preserves the DM/group privacy boundary.**
+  Telegram routes pass an opaque, canonical memory environment into each
+  Claude SDK session; the runtime reconstructs and byte-for-byte validates that
+  route before installing SessionStart/compact/distill hooks. Groups therefore
+  read and write only the shared store, while DMs read their private store plus
+  explicitly shared facts and private-only legacy memory. Persisted sessions
+  without a matching route label are reset before history access. Claude
+  `/resume` and `/revert` controls are disabled in this mode because its global
+  transcript directory cannot safely produce audience-filtered previews or
+  mutations.
 - **An in-turn `start.sh --restart` could stop its own bridge and die before
   relaunching it (#706).** Restart now walks the caller's parent chain before
   any destructive action and refuses with exit 5 when the driver is a

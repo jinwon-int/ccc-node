@@ -69,6 +69,7 @@ from .agent_runtime import (
     deny_approval,
 )
 from .curated_memory import build_curated_memory_settings
+from .memory_audience import audience_from_claude_environment
 from .project_chat_history import _first_text_block, iter_transcript_messages
 from .sdk_text import _extract_stream_text_delta
 from .tool_policy import (
@@ -811,7 +812,16 @@ class ClaudeRuntime:
                 # context through the curated settings block.
                 options.permission_mode = "bypassPermissions"
                 options.setting_sources = []
-                self._apply_curated_memory(options)
+                self._apply_curated_memory(options, request)
+            elif (
+                getattr(settings, "bridge_memory_mode", MEMORY_MODE_OFF)
+                == MEMORY_MODE_AUDIENCE_SCOPED
+            ):
+                # Audience isolation is stronger than owner-operator's normal
+                # host-settings convenience. Loading the global user/project
+                # settings chain here could re-register unscoped memory hooks.
+                options.setting_sources = []
+                self._apply_curated_memory(options, request)
             else:
                 # Owner-operated bridges intentionally retain host utility and
                 # the normal Claude Code settings/context chain.
@@ -821,7 +831,7 @@ class ClaudeRuntime:
         # Bash is disallowed, user/project/local settings can register host
         # shell hooks independently of the model-facing Bash tool.
         options.setting_sources = []
-        self._apply_curated_memory(options)
+        self._apply_curated_memory(options, request)
         if (
             self._execution_profile == EXECUTION_STRICT_PROJECT
             and self._bash_policy != BASH_DISABLED
@@ -836,22 +846,26 @@ class ClaudeRuntime:
                 ),
             )
 
-    def _apply_curated_memory(self, options: ClaudeAgentOptions) -> None:
-        # SessionRequest carries no Telegram route, so the adapter can only
-        # resolve the route-neutral "curated" mode. "audience-scoped" needs a
-        # per-route audience (the legacy resolve_memory_audience seam) this
-        # adapter cannot supply yet. Fail closed — consistent with the other
-        # unsupported policies in ``_build_options`` — rather than silently
-        # starting the session with no memory: a node configured for
-        # audience-scoped isolation must not degrade to unscoped/no-memory
-        # semantics unnoticed. The caller surfaces this as a failed session
-        # so the operator fixes the config or switches memory mode.
+    def _apply_curated_memory(
+        self, options: ClaudeAgentOptions, request: SessionRequest
+    ) -> None:
+        """Attach only the canonical memory route resolved for this request."""
+
         mode = getattr(self._settings, "bridge_memory_mode", MEMORY_MODE_OFF)
+        audience = None
         if mode == MEMORY_MODE_AUDIENCE_SCOPED:
-            raise ValueError(
-                "Claude runtime does not support audience-scoped bridge memory yet"
+            audience = audience_from_claude_environment(
+                self._settings,
+                request.memory_environment,
             )
-        curated_settings = build_curated_memory_settings(self._settings, audience=None)
+        elif request.memory_environment is not None:
+            raise ValueError(
+                "Claude memory environment requires audience-scoped bridge memory"
+            )
+        curated_settings = build_curated_memory_settings(
+            self._settings,
+            audience=audience,
+        )
         if curated_settings is not None:
             options.settings = curated_settings
 

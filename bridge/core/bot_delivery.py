@@ -98,6 +98,19 @@ class BotDeliveryMixin:
 
         # Check resume selection (user replies with a number)
         resume_list = session.get("resume_list")
+        if (
+            resume_list
+            and self._active_provider() == "claude"
+            and getattr(self._config, "bridge_memory_mode", "off")
+            == "audience-scoped"
+        ):
+            # Clear selections created before isolation was enabled. A stale
+            # transcript id has no trustworthy audience binding.
+            await self._session_manager.patch_session(
+                conversation_key,
+                remove_fields={"resume_list"},
+            )
+            resume_list = None
         if resume_list and text.strip().isdigit():
             log_debug(user_id, "user", text)
             idx = int(text.strip()) - 1
