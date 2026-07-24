@@ -655,17 +655,15 @@ class BotCommandMixin:
         await message.reply_text(reply, reply_markup=InlineKeyboardMarkup(buttons))
         log_debug(user_id, "bot", reply)
 
-    async def _cmd_resume(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not await self._check_access(update):
-            return
-        user_id = self._require_user(update).id
-        message = self._require_message(update)
-        chat = self._require_chat(update)
-        conversation_key = self._conversation_key(user_id, chat.id)
-        log_debug(user_id, "command", "/resume")
-        active_provider = self._active_provider()
+    async def _reject_unsafe_claude_resume(
+        self,
+        *,
+        conversation_key,
+        user_id: int,
+        message,
+    ) -> bool:
         if (
-            active_provider == "claude"
+            self._active_provider() == "claude"
             and getattr(self._config, "bridge_memory_mode", "off")
             == "audience-scoped"
         ):
@@ -683,6 +681,23 @@ class BotCommandMixin:
             )
             await message.reply_text(reply)
             log_debug(user_id, "bot", reply)
+            return True
+        return False
+
+    async def _cmd_resume(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not await self._check_access(update):
+            return
+        user_id = self._require_user(update).id
+        message = self._require_message(update)
+        chat = self._require_chat(update)
+        conversation_key = self._conversation_key(user_id, chat.id)
+        log_debug(user_id, "command", "/resume")
+        active_provider = self._active_provider()
+        if await self._reject_unsafe_claude_resume(
+            conversation_key=conversation_key,
+            user_id=user_id,
+            message=message,
+        ):
             return
         stored_provider = await self._session_provider(
             conversation_key
