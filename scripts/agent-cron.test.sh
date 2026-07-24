@@ -472,7 +472,7 @@ for raw in cases:
     assert module._canonical_redaction.REDACTION_MARKER in redacted
     assert module.redact_for_owner(redacted) == redacted
 
-boundary = "x" * 850 + private_key + "tail"
+boundary = ("safe " * 170) + private_key + "tail"
 bounded = module.redact_for_owner(boundary, 900)
 assert bounded is not None and private_key not in bounded
 assert module._canonical_redaction.REDACTION_MARKER in bounded
@@ -518,6 +518,44 @@ PY
 )"; rc=$?
 ok "missing canonical redactor blocks only notification without stale fallback" \
   '[ "$rc" = 0 ] && jq -e ".delivery == \"blocked-redaction-unavailable\" and .redacted == false" <<<"$out" >/dev/null && ! grep -q "ZZZZZZZZ" <<<"$out"'
+
+mkdir -p "$ISOLATED/bridge/utils"
+cat > "$ISOLATED/bridge/utils/redaction.py" <<'PY'
+raise RuntimeError("broken canonical redaction fixture")
+PY
+out="$(python3 - "$ISOLATED" "$TMP/broken-redaction-spool" <<'PY'
+import importlib.util
+import json
+import os
+from pathlib import Path
+import sys
+
+root = Path(sys.argv[1])
+spool = Path(sys.argv[2])
+sys.path.insert(0, str(root / "scripts"))
+spec = importlib.util.spec_from_file_location("broken_redaction_agent_cron", root / "scripts" / "agent_cron.py")
+assert spec and spec.loader
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+assert module._canonical_redaction is None
+os.environ["CCC_PUSH_SPOOL"] = str(spool)
+secret = "sk-" + "Y" * 24
+result = module.write_owner_spool(
+    {"notify": "telegram-owner"},
+    "task",
+    "run",
+    "2026-01-01T00:00:00Z",
+    "success",
+    {"exitCode": 0, "stdout": secret, "stderr": ""},
+    None,
+)
+assert result["delivery"] == "blocked-redaction-unavailable"
+assert not spool.exists()
+print(json.dumps(result, sort_keys=True))
+PY
+)"; rc=$?
+ok "broken canonical module also blocks notification without body leakage" \
+  '[ "$rc" = 0 ] && jq -e ".delivery == \"blocked-redaction-unavailable\"" <<<"$out" >/dev/null && ! grep -q "YYYYYYYY" <<<"$out"'
 
 cp "$ROOT/scripts/agent-cron.sh" "$ISOLATED/scripts/"
 mkdir -p "$ISOLATED/schemas"
