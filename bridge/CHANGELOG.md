@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **A losing concurrent bot instance could delete the surviving instance's pid /
+  token-lock files, orphaning a healthy bot (#703).** Root cause of the false
+  `degraded`/DOWN race that PR #702 papered over at the reporting layer: a
+  newcomer overwrote the shared `bot.pid` in `initialize_process()`, then on
+  exit (after losing the Telegram getUpdates conflict) unlinked it because it
+  now recorded the newcomer's own pid — leaving the survivor unregistered.
+  `_write_pid_locked()` now refuses to clobber a pid file that records a
+  *different, live* process, and the token-lock teardown only unlinks a lock
+  that still records this pid (or a dead one), mirroring the existing pid-file
+  ownership guard. Legitimate reclaim of a dead-pid file and normal cleanup are
+  unchanged.
 - **`--status` mis-reported a healthy, systemd-managed bridge as `degraded` when
   its pid file was lost to the concurrent-instance race.** When the pid file is
   missing or stale but a live project bot is the active systemd `MainPID`,

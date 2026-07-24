@@ -19,6 +19,33 @@ def _normalize_reason(value: Optional[str]) -> str:
     return " ".join(str(value).split())[:500]
 
 
+def _pid_is_alive(pid_text: Optional[str]) -> bool:
+    """True iff ``pid_text`` parses to a positive pid of a live process.
+
+    Used to decide ownership of the shared pid / token-lock files without
+    clobbering a concurrent surviving instance. A ``PermissionError`` from
+    ``os.kill(pid, 0)`` means the pid exists but is owned by another user, which
+    still counts as alive.
+    """
+    if not pid_text:
+        return False
+    try:
+        pid = int(pid_text)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
 class RuntimeHealthReporter:
     SCHEMA_VERSION = 1
 
@@ -97,6 +124,20 @@ class RuntimeHealthReporter:
 
     def _write_pid_locked(self) -> None:
         self._ensure_runtime_dir()
+        # Do not clobber a pid file that still records a *different, live* bot
+        # for this project (a concurrent instance / guard race). Overwriting it
+        # would make THIS process the recorded owner; if this process is then
+        # the one that loses the Telegram getUpdates conflict and exits,
+        # cleanup_runtime_files() would unlink the file and orphan the survivor
+        # — a live bot that `start.sh --status` reports as dead (observed:
+        # jingun 2026-07-24, daegyo 2026-07-08). Claim the pid file only when it
+        # is absent, empty, records a dead pid, or already records us.
+        try:
+            recorded = self._pid_file.read_text(encoding="utf-8").strip()
+        except (FileNotFoundError, OSError):
+            recorded = ""
+        if recorded and recorded != str(os.getpid()) and _pid_is_alive(recorded):
+            return
         self._pid_file.write_text(f"{os.getpid()}\n", encoding="utf-8")
 
     def _write_health_locked(self) -> None:
@@ -331,10 +372,22 @@ class RuntimeHealthReporter:
                 except FileNotFoundError:
                     pass
             if self._owns_token_lock and self._token_lock_file:
+                # Same survivor-safety as the pid file: only remove the token
+                # lock if it still records THIS process (or a now-dead pid). A
+                # losing instance that set BOT_OWNS_TOKEN_LOCK=1 must not delete
+                # a lock the survivor has since overwritten with its own pid.
+                lock_path = Path(self._token_lock_file)
                 try:
-                    Path(self._token_lock_file).unlink()
-                except FileNotFoundError:
-                    pass
+                    lock_recorded = lock_path.read_text(encoding="utf-8").strip()
+                except (FileNotFoundError, OSError):
+                    lock_recorded = ""
+                if lock_recorded == str(os.getpid()) or not _pid_is_alive(
+                    lock_recorded
+                ):
+                    try:
+                        lock_path.unlink()
+                    except FileNotFoundError:
+                        pass
 
 
 class DeferredHealthReporter:
