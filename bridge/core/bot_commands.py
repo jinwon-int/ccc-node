@@ -655,6 +655,13 @@ class BotCommandMixin:
         await message.reply_text(reply, reply_markup=InlineKeyboardMarkup(buttons))
         log_debug(user_id, "bot", reply)
 
+    def _claude_scoped_transcript_controls_disabled(self) -> bool:
+        return (
+            self._active_provider() == "claude"
+            and getattr(self._config, "bridge_memory_mode", "off")
+            == "audience-scoped"
+        )
+
     async def _reject_unsafe_claude_resume(
         self,
         *,
@@ -662,11 +669,7 @@ class BotCommandMixin:
         user_id: int,
         message,
     ) -> bool:
-        if (
-            self._active_provider() == "claude"
-            and getattr(self._config, "bridge_memory_mode", "off")
-            == "audience-scoped"
-        ):
+        if self._claude_scoped_transcript_controls_disabled():
             # Claude transcript discovery is one global filesystem view. Until
             # the SDK exposes an audience-scoped browser, listing it could put
             # a DM preview into a group or another user's DM. Existing session
@@ -683,6 +686,52 @@ class BotCommandMixin:
             log_debug(user_id, "bot", reply)
             return True
         return False
+
+    async def _show_codex_resume_sessions(
+        self,
+        *,
+        conversation_key,
+        user_id: int,
+        message,
+    ) -> None:
+        """Render the provider-scoped Codex thread browser."""
+
+        try:
+            codex_sessions = await self._project_chat.list_runtime_sessions(limit=10)
+        except Exception:
+            logger.warning("Codex session browsing failed")
+            reply = "⚠️ Codex session history is unavailable."
+            await message.reply_text(reply)
+            log_debug(user_id, "bot", reply)
+            return
+        if not codex_sessions:
+            reply = "📭 No Codex session history found."
+            await message.reply_text(reply)
+            log_debug(user_id, "bot", reply)
+            return
+
+        resume_list = []
+        lines = ["📋 Session History\n"]
+        for index, item in enumerate(codex_sessions, 1):
+            label = item.title or item.preview or item.id
+            label = re.sub(r"https?://\S+", "", label)
+            label = " ".join(label.split())[:120] or item.id
+            resume_list.append([item.id, label, "codex"])
+            details = " · ".join(
+                " ".join(value.split())[:80]
+                for value in (item.model, item.cwd)
+                if value
+            )
+            provider_tag = f"codex · {details}" if details else "codex"
+            lines.append(f"{index}. {label} [{provider_tag}]")
+        lines.append("\nReply with a number to switch to that session:")
+        await self._session_manager.patch_session(
+            conversation_key,
+            updates={"resume_list": resume_list},
+        )
+        reply = "\n".join(lines)
+        await message.reply_text(reply)
+        log_debug(user_id, "bot", reply)
 
     async def _cmd_resume(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_access(update):
@@ -711,41 +760,11 @@ class BotCommandMixin:
             log_debug(user_id, "bot", reply)
             return
         if active_provider == "codex":
-            try:
-                codex_sessions = await self._project_chat.list_runtime_sessions(limit=10)
-            except Exception:
-                logger.warning("Codex session browsing failed")
-                reply = "⚠️ Codex session history is unavailable."
-                await message.reply_text(reply)
-                log_debug(user_id, "bot", reply)
-                return
-            if not codex_sessions:
-                reply = "📭 No Codex session history found."
-                await message.reply_text(reply)
-                log_debug(user_id, "bot", reply)
-                return
-            resume_list = []
-            lines = ["📋 Session History\n"]
-            for index, item in enumerate(codex_sessions, 1):
-                label = item.title or item.preview or item.id
-                label = re.sub(r"https?://\S+", "", label)
-                label = " ".join(label.split())[:120] or item.id
-                resume_list.append([item.id, label, "codex"])
-                details = " · ".join(
-                    " ".join(value.split())[:80]
-                    for value in (item.model, item.cwd)
-                    if value
-                )
-                provider_tag = f"codex · {details}" if details else "codex"
-                lines.append(f"{index}. {label} [{provider_tag}]")
-            lines.append("\nReply with a number to switch to that session:")
-            await self._session_manager.patch_session(
-                conversation_key,
-                updates={"resume_list": resume_list},
+            await self._show_codex_resume_sessions(
+                conversation_key=conversation_key,
+                user_id=user_id,
+                message=message,
             )
-            reply = "\n".join(lines)
-            await message.reply_text(reply)
-            log_debug(user_id, "bot", reply)
             return
         sessions = self._project_chat.list_sessions(limit=10)
         if not sessions:
@@ -857,6 +876,12 @@ class BotCommandMixin:
 
         conversation_key = self._conversation_key(user_id, chat.id)
         session = await self._session_manager.get_session(conversation_key)
+        session, _route_aligned = await self._switch_provider_if_needed(
+            conversation_key,
+            user_id,
+            chat.id,
+            session,
+        )
         session_id = session.get("session_id")
 
         if not session_id:
@@ -938,6 +963,15 @@ class BotCommandMixin:
         message = self._require_message(update)
         log_debug(user_id, "command", "/revert")
 
+        if self._claude_scoped_transcript_controls_disabled():
+            reply = (
+                "🔒 Claude transcript revert is disabled while private memory "
+                "is audience-scoped. Use /new to start a fresh session."
+            )
+            await message.reply_text(reply)
+            log_debug(user_id, "bot", reply)
+            return
+
         session = await self._session_manager.get_session(user_id)
         session_id = session.get("session_id")
 
@@ -972,6 +1006,13 @@ class BotCommandMixin:
         query = self._require_callback_query(update)
         user_id = self._require_user(update).id
         chat_id = update.effective_chat.id if update.effective_chat else None
+
+        if self._claude_scoped_transcript_controls_disabled():
+            await query.edit_message_text(
+                "🔒 This Claude transcript control is disabled while private "
+                "memory is audience-scoped."
+            )
+            return
 
         # Parse callback data
         parts = data.split(":")
@@ -1022,69 +1063,81 @@ class BotCommandMixin:
             await query.edit_message_text(reply, reply_markup=keyboard)
 
         elif action == "mode":
-            # Handle mode selection - execute revert
             msg_index = int(parts[2])
             mode = parts[3]
-
-            if mode == "cancel":
-                await query.edit_message_text("❌ Revert cancelled")
-                return
-
-            # Execute revert operation
-            await query.edit_message_text("⏳ Reverting to selected message...")
-
-            # Get selected message info BEFORE revert (since it will be deleted)
-            messages = await asyncio.to_thread(
-                self._project_chat.get_conversation_history, session_id, limit=50
+            await self._handle_revert_mode_callback(
+                query,
+                user_id=user_id,
+                chat_id=chat_id,
+                session_id=session_id,
+                msg_index=msg_index,
+                mode=mode,
             )
-            selected_msg = next((m for m in messages if m["index"] == msg_index), None)
 
-            timestamp_str = ""
-            content_preview = ""
-            if selected_msg:
-                timestamp = selected_msg.get("timestamp", "")
-                try:
-                    from datetime import datetime
+    async def _handle_revert_mode_callback(
+        self,
+        query,
+        *,
+        user_id: int,
+        chat_id: Optional[int],
+        session_id: str,
+        msg_index: int,
+        mode: str,
+    ) -> None:
+        """Execute one already route-authorized revert mode selection."""
 
-                    dt = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
-                    timestamp_str = dt.strftime("%Y-%m-%d %H:%M:%S")
-                except Exception:
-                    timestamp_str = (
-                        timestamp[:19] if len(timestamp) >= 19 else timestamp
-                    )
+        if mode == "cancel":
+            await query.edit_message_text("❌ Revert cancelled")
+            return
 
-                # Get content preview
-                content = selected_msg.get("content", "")
-                content_preview = content[:80] + "..." if len(content) > 80 else content
-                content_preview = content_preview.replace("\n", " ")
+        await query.edit_message_text("⏳ Reverting to selected message...")
+        messages = await asyncio.to_thread(
+            self._project_chat.get_conversation_history, session_id, limit=50
+        )
+        selected_msg = next((m for m in messages if m["index"] == msg_index), None)
 
+        timestamp_str = ""
+        content_preview = ""
+        if selected_msg:
+            timestamp = selected_msg.get("timestamp", "")
             try:
-                success = await self._execute_revert(
-                    user_id, session_id, msg_index, mode, chat_id=chat_id
-                )
+                from datetime import datetime
 
-                if success:
-                    if timestamp_str and content_preview:
-                        await query.edit_message_text(
-                            f"✅ Reverted to before:\n\n"
-                            f"[{timestamp_str}]\n"
-                            f"{content_preview}\n\n"
-                            f"Conversation state restored."
-                        )
-                    elif timestamp_str:
-                        await query.edit_message_text(
-                            f"✅ Reverted to before [{timestamp_str}]. Conversation state restored."
-                        )
-                    else:
-                        await query.edit_message_text(
-                            "✅ Revert completed successfully."
-                        )
+                dt = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+                timestamp_str = dt.strftime("%Y-%m-%d %H:%M:%S")
+            except Exception:
+                timestamp_str = timestamp[:19] if len(timestamp) >= 19 else timestamp
+
+            content = selected_msg.get("content", "")
+            content_preview = content[:80] + "..." if len(content) > 80 else content
+            content_preview = content_preview.replace("\n", " ")
+
+        try:
+            success = await self._execute_revert(
+                user_id, session_id, msg_index, mode, chat_id=chat_id
+            )
+
+            if success:
+                if timestamp_str and content_preview:
+                    await query.edit_message_text(
+                        f"✅ Reverted to before:\n\n"
+                        f"[{timestamp_str}]\n"
+                        f"{content_preview}\n\n"
+                        f"Conversation state restored."
+                    )
+                elif timestamp_str:
+                    await query.edit_message_text(
+                        f"✅ Reverted to before [{timestamp_str}]. "
+                        "Conversation state restored."
+                    )
                 else:
-                    await query.edit_message_text("❌ Revert operation failed")
+                    await query.edit_message_text("✅ Revert completed successfully.")
+            else:
+                await query.edit_message_text("❌ Revert operation failed")
 
-            except Exception as e:
-                logger.error(f"Revert operation failed: {e}", exc_info=True)
-                await query.edit_message_text(f"❌ Revert failed: {e}")
+        except Exception as e:
+            logger.error(f"Revert operation failed: {e}", exc_info=True)
+            await query.edit_message_text(f"❌ Revert failed: {e}")
 
     async def _execute_revert(
         self, user_id: int, session_id: str, msg_index: int, mode: str,

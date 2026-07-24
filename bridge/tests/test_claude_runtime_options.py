@@ -119,6 +119,32 @@ def test_owner_operator_retains_host_settings_chain(tmp_path: Path) -> None:
     assert options.settings is None
 
 
+def test_owner_operator_audience_scope_suppresses_global_settings(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(
+        tmp_path,
+        execution_profile="owner-operator",
+        bridge_memory_mode="audience-scoped",
+    )
+    audience = MemoryAudience(
+        "shared",
+        "shared",
+        settings.bot_data_dir / "memory-audiences",
+    )
+    options = _build(
+        ClaudeRuntime(settings=settings),
+        tmp_path,
+        memory_environment=audience.claude_environment(settings),
+    )
+
+    assert options.setting_sources == []
+    assert options.settings is not None
+    env = json.loads(options.settings)["env"]
+    assert env["CCC_MEMORY_AUDIENCE"] == "shared"
+    assert env["CCC_MEMORY_SCOPE"] == "shared"
+
+
 def test_owner_operator_unrestricted_bypasses_with_curated_memory(
     tmp_path: Path, monkeypatch
 ) -> None:

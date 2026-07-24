@@ -29,8 +29,9 @@ All notable changes to the Claude Code node harness. Dates are KST.
   Each Telegram route receives an opaque, validated hook environment: groups
   use only shared memory, while DMs add a per-user private store and private-only
   legacy recall. Sessions created before route labelling are reset instead of
-  resumed across the new boundary, and global Claude transcript `/resume`
-  browsing is disabled while scoped mode is active.
+  resumed across the new boundary, history reads validate the route first, and
+  global Claude transcript `/resume` and `/revert` controls are disabled while
+  scoped mode is active.
 - In-turn bridge self-restarts now fail safely before stop. If a Claude/Codex
   Bash call runs `start.sh --restart` from below the serving bot or daemon
   supervisor, the command exits 5 with an external recovery hint instead of

@@ -813,6 +813,15 @@ class ClaudeRuntime:
                 options.permission_mode = "bypassPermissions"
                 options.setting_sources = []
                 self._apply_curated_memory(options, request)
+            elif (
+                getattr(settings, "bridge_memory_mode", MEMORY_MODE_OFF)
+                == MEMORY_MODE_AUDIENCE_SCOPED
+            ):
+                # Audience isolation is stronger than owner-operator's normal
+                # host-settings convenience. Loading the global user/project
+                # settings chain here could re-register unscoped memory hooks.
+                options.setting_sources = []
+                self._apply_curated_memory(options, request)
             else:
                 # Owner-operated bridges intentionally retain host utility and
                 # the normal Claude Code settings/context chain.

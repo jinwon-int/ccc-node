@@ -363,6 +363,62 @@ async def test_history_uses_conversation_scope_and_labels_legacy_claude(tmp_path
 
 
 @pytest.mark.anyio
+async def test_audience_scoped_history_resets_unlabelled_session_before_read(
+    tmp_path: Path,
+) -> None:
+    manager = make_manager(tmp_path, "claude")
+    project_chat = SimpleNamespace(
+        get_recent_messages=Mock(
+            side_effect=AssertionError("must not read unlabelled transcript")
+        )
+    )
+    bot = bare_bot(manager, provider="claude", project_chat=project_chat)
+    bot._config.bridge_memory_mode = "audience-scoped"
+    bot._config.telegram_session_scope = "shared-groups"
+    bot._config.project_root = tmp_path
+    bot._config.bot_data_dir = tmp_path / ".telegram_bot"
+    bot._config.bridge_memory_audience_root = None
+    bot._config.bridge_memory_audience_key_path = None
+    bot._config.bridge_unsafe_shared_all_memory = False
+    conversation_key = bot._conversation_key(7, 9)
+    await manager.store.set(
+        conversation_key,
+        {"provider": "claude", "session_id": "legacy-unscoped"},
+    )
+    update = make_update(chat_id=9)
+
+    await bot._cmd_history(update, SimpleNamespace(args=[]))
+
+    project_chat.get_recent_messages.assert_not_called()
+    assert "no active session" in update.message.replies[0][0].lower()
+    assert (await manager.get_session(conversation_key))["session_id"] is None
+
+
+@pytest.mark.anyio
+async def test_audience_scoped_claude_revert_is_disabled_before_transcript_read(
+    tmp_path: Path,
+) -> None:
+    manager = make_manager(tmp_path, "claude")
+    await manager.store.set(
+        7,
+        {"provider": "claude", "session_id": "private-session"},
+    )
+    project_chat = SimpleNamespace(
+        get_conversation_history=Mock(
+            side_effect=AssertionError("must not read global transcript")
+        )
+    )
+    bot = bare_bot(manager, provider="claude", project_chat=project_chat)
+    bot._config.bridge_memory_mode = "audience-scoped"
+    update = make_update(user_id=7, chat_id=9)
+
+    await bot._cmd_revert(update, SimpleNamespace(args=[]))
+
+    project_chat.get_conversation_history.assert_not_called()
+    assert "disabled" in update.message.replies[0][0].lower()
+
+
+@pytest.mark.anyio
 async def test_codex_resume_uses_runtime_and_persists_canonical_provider_entries(
     tmp_path: Path,
 ) -> None:
