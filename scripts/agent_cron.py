@@ -66,6 +66,7 @@ def _bootstrap_cli(argv=None):
     }
 
 import json
+import importlib.util
 import os
 import re
 import shlex
@@ -96,6 +97,24 @@ from agent_cron_repository import (  # noqa: E402
 )
 
 script_root = Path(__file__).resolve().parents[1]
+_canonical_redaction = None
+_redaction_source = script_root / 'bridge' / 'utils' / 'redaction.py'
+if _redaction_source.is_file():
+    try:
+        # Load the canonical file from this exact checkout.  The bridge uses a
+        # setuptools package-dir mapping, so an unpackaged checkout cannot be
+        # imported as ``telegram_bot`` merely by changing PYTHONPATH.
+        _redaction_spec = importlib.util.spec_from_file_location(
+            '_ccc_agent_cron_redaction', _redaction_source
+        )
+        if _redaction_spec is not None and _redaction_spec.loader is not None:
+            _candidate_redaction = importlib.util.module_from_spec(_redaction_spec)
+            _redaction_spec.loader.exec_module(_candidate_redaction)
+            _canonical_redaction = _candidate_redaction
+    except Exception:
+        # A scheduled run may continue, but owner notification must fail closed
+        # below when redaction cannot be guaranteed.
+        _canonical_redaction = None
 store = Path(
     os.environ.get('CCC_AGENT_CRON_STORE')
     or Path.home() / '.claude' / 'state' / 'agent-cron' / 'tasks.json'
@@ -974,19 +993,45 @@ def safe_name(value):
     return re.sub(r'[^A-Za-z0-9_.-]+', '-', str(value or 'unknown'))[:120] or 'unknown'
 
 
+_OWNER_REDACTION_HARDENING = (
+    # These deliberately remain broader than the canonical credential shapes:
+    # the owner spool historically masks short/near-token values and arbitrary
+    # long runs even at the cost of false positives.
+    re.compile(r'(?i)\bbearer\s+[A-Za-z0-9._~+/=-]{8,}'),
+    re.compile(
+        r'(?i)\b(?:token|secret|password|passwd|api[_-]?key|authorization)'
+        r'\s*[:=]\s*[^\s,;]+'
+    ),
+    re.compile(
+        r'(?i)\b(?:ghp|gho|ghu|ghs|github_pat|sk|xox[baprs])'
+        r'-?[A-Za-z0-9_./+=-]{8,}'
+    ),
+    re.compile(r'[A-Za-z0-9_./+=-]{24,}'),
+)
+
+
 def redact_for_owner(text, limit=1200):
-    text = short_text(text or '', limit)
-    # Mask common secret-bearing assignments and bearer headers first, then long
-    # token-shaped runs. Keep this conservative: the spool is operator-visible.
-    patterns = [
-        (r'(?i)(bearer\s+)[A-Za-z0-9._~+/=-]{8,}', r'\1[REDACTED]'),
-        (r'(?i)\b(token|secret|password|passwd|api[_-]?key|authorization)\s*[:=]\s*[^\s,;]+', r'\1=[REDACTED]'),
-        (r'\b(ghp|gho|ghu|ghs|github_pat|sk|xox[baprs])-?[A-Za-z0-9_./+=-]{8,}', r'[REDACTED]'),
-        (r'[A-Za-z0-9_./+=-]{24,}', r'[REDACTED]'),
-    ]
-    for rx, repl in patterns:
-        text = re.sub(rx, repl, text)
-    return text
+    """Canonical credential redaction plus conservative owner-spool hardening.
+
+    Return ``None`` when the checkout's canonical implementation cannot be
+    loaded or applied.  Callers must then suppress captured output instead of
+    risking a stale/fail-open redaction path.
+    """
+    if _canonical_redaction is None:
+        return None
+    try:
+        redacted = _canonical_redaction.redact_credentials(
+            '' if text is None else str(text)
+        )
+        marker = _canonical_redaction.REDACTION_MARKER
+        for pattern in _OWNER_REDACTION_HARDENING:
+            redacted = pattern.sub(marker, redacted)
+        # Defense in depth: canonical matches must never survive into a spool.
+        if _canonical_redaction.contains_credential(redacted):
+            redacted = marker
+        return short_text(redacted, limit)
+    except Exception:
+        return None
 
 
 def notification_base(task):
@@ -1000,8 +1045,12 @@ def notification_base(task):
 
 
 def build_owner_text(task_id, run_id, scheduled_at, status, headless):
-    stdout = redact_for_owner((headless or {}).get('stdout', ''), 900).strip()
-    stderr = redact_for_owner((headless or {}).get('stderr', ''), 900).strip()
+    stdout = redact_for_owner((headless or {}).get('stdout', ''), 900)
+    stderr = redact_for_owner((headless or {}).get('stderr', ''), 900)
+    if stdout is None or stderr is None:
+        return None
+    stdout = stdout.strip()
+    stderr = stderr.strip()
     lines = [
         f"agent-cron task {task_id} finished with status={status}",
         f"scheduledAt={scheduled_at or ''}",
@@ -1049,6 +1098,13 @@ def write_owner_spool(task, task_id, run_id, scheduled_at, status, headless, at)
         recipient = 'chat'
     spool = push_spool_dir()
     text = build_owner_text(task_id, run_id, scheduled_at, status, headless)
+    if text is None:
+        return {
+            **base,
+            'delivery': 'blocked-redaction-unavailable',
+            'redacted': False,
+            'reason': 'canonical-redaction-unavailable',
+        }
     ts = fmt_dt(at) or datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace('+00:00', 'Z')
     payload = {
         'version': 1,

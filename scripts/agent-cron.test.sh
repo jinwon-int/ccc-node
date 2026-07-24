@@ -422,10 +422,126 @@ ok "run skips disabled task without lock" '[ "$rc" = 0 ] && jq -e ".ok == true a
 out="$(CCC_AGENT_CRON_STORE="$EXEC_STORE" CCC_HEADLESS_CMD="$FAKE_HEADLESS" bash "$CMD" run exec-not-due --json --at 2026-01-01T00:02:00Z)"; rc=$?
 ok "run skips not-due task without lock" '[ "$rc" = 0 ] && jq -e ".ok == true and .status == \"not-due\" and .mutations.lockAcquire == false" <<<"$out" >/dev/null && [ ! -e "$TMP/exec-store/locks/exec-not-due.lock" ]'
 
+python3 - "$ROOT" <<'PY'
+import importlib.util
+import json
+from pathlib import Path
+import sys
+
+root = Path(sys.argv[1])
+sys.path.insert(0, str(root / "scripts"))
+spec = importlib.util.spec_from_file_location("agent_cron_redaction_test", root / "scripts" / "agent_cron.py")
+assert spec and spec.loader
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+assert module._canonical_redaction is not None
+assert Path(module._canonical_redaction.__file__).resolve() == (
+    root / "bridge" / "utils" / "redaction.py"
+).resolve()
+
+telegram = "123456789:" + "A" * 24
+aws = "AKIA" + "B" * 16
+github = "ghp_" + "C" * 24
+github_pat = "github_pat_" + "D" * 24
+openai = "sk-" + "E" * 24
+private_key = (
+    "-----BEGIN PRIVATE KEY-----\n" + "F" * 80 + "\n-----END PRIVATE KEY-----"
+)
+truncated_key = "-----BEGIN OPENSSH PRIVATE KEY-----\n" + "G" * 80
+short_bearer = "Bearer " + "H" * 10
+assignment = "passwd=" + "I" * 8
+slack = "xoxb-" + "J" * 20
+generic = "K" * 30
+cases = (
+    telegram,
+    aws,
+    github,
+    github_pat,
+    openai,
+    private_key,
+    truncated_key,
+    short_bearer,
+    assignment,
+    slack,
+    generic,
+)
+for raw in cases:
+    redacted = module.redact_for_owner("prefix " + raw + " suffix")
+    assert redacted is not None
+    assert raw not in redacted
+    assert module._canonical_redaction.REDACTION_MARKER in redacted
+    assert module.redact_for_owner(redacted) == redacted
+
+boundary = "x" * 850 + private_key + "tail"
+bounded = module.redact_for_owner(boundary, 900)
+assert bounded is not None and private_key not in bounded
+assert module._canonical_redaction.REDACTION_MARKER in bounded
+json.loads(json.dumps({"text": module.redact_for_owner("safe\0text")}))
+PY
+rc=$?
+ok "owner redaction uses exact canonical source and preserves broader hardening" '[ "$rc" = 0 ]'
+
+ISOLATED="$TMP/redaction-unavailable"
+mkdir -p "$ISOLATED/scripts"
+cp "$ROOT/scripts"/agent_cron*.py "$ISOLATED/scripts/"
+out="$(python3 - "$ISOLATED" "$TMP/redaction-unavailable-spool" <<'PY'
+import importlib.util
+import json
+import os
+from pathlib import Path
+import sys
+
+root = Path(sys.argv[1])
+spool = Path(sys.argv[2])
+sys.path.insert(0, str(root / "scripts"))
+spec = importlib.util.spec_from_file_location("isolated_agent_cron", root / "scripts" / "agent_cron.py")
+assert spec and spec.loader
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+assert module._canonical_redaction is None
+os.environ["CCC_PUSH_SPOOL"] = str(spool)
+secret = "ghp_" + "Z" * 24
+result = module.write_owner_spool(
+    {"notify": "telegram-owner"},
+    "task",
+    "run",
+    "2026-01-01T00:00:00Z",
+    "success",
+    {"exitCode": 0, "stdout": secret, "stderr": ""},
+    None,
+)
+assert result["delivery"] == "blocked-redaction-unavailable"
+assert result["reason"] == "canonical-redaction-unavailable"
+assert not spool.exists()
+print(json.dumps(result, sort_keys=True))
+PY
+)"; rc=$?
+ok "missing canonical redactor blocks only notification without stale fallback" \
+  '[ "$rc" = 0 ] && jq -e ".delivery == \"blocked-redaction-unavailable\" and .redacted == false" <<<"$out" >/dev/null && ! grep -q "ZZZZZZZZ" <<<"$out"'
+
+cp "$ROOT/scripts/agent-cron.sh" "$ISOLATED/scripts/"
+mkdir -p "$ISOLATED/schemas"
+cp "$ROOT/schemas/agent-cron-task-store.schema.json" "$ISOLATED/schemas/"
+cat > "$ISOLATED/tasks.json" <<'JSON'
+{"version":1,"tasks":[{"id":"no-redactor","schedule":"* * * * *","prompt":"Safe run","enabled":true,"notify":"telegram-owner","lastRunAt":"2026-01-01T00:00:00Z"}]}
+JSON
+cat > "$ISOLATED/fake-headless.sh" <<'SH'
+#!/usr/bin/env bash
+printf 'ghp_%024d\n' 0
+SH
+chmod +x "$ISOLATED/fake-headless.sh"
+out="$(CCC_AGENT_CRON_STORE="$ISOLATED/tasks.json" \
+  CCC_HEADLESS_CMD="$ISOLATED/fake-headless.sh" \
+  CCC_PUSH_SPOOL="$TMP/redaction-unavailable-spool" \
+  bash "$ISOLATED/scripts/agent-cron.sh" run no-redactor \
+  --at 2026-01-01T00:01:00Z 2>&1)"; rc=$?
+ok "redactor failure preserves task execution and history while suppressing spool" \
+  '[ "$rc" = 0 ] && jq -e ".tasks[] | select(.id == \"no-redactor\" and .lastStatus == \"success\" and .runHistory[0].notifyState == \"blocked-redaction-unavailable\")" "$ISOLATED/tasks.json" >/dev/null && [ ! -e "$TMP/redaction-unavailable-spool" ] && ! grep -q "00000000000000000000" <<<"$out"'
+
 SPOOL="$TMP/agent-spool"
 out="$(CCC_AGENT_CRON_STORE="$EXEC_STORE" CCC_HEADLESS_CMD="$FAKE_HEADLESS" CCC_PUSH_SPOOL="$SPOOL" bash "$CMD" run exec-notify --json --at 2026-01-01T00:03:00Z)"; rc=$?
 ok "run writes owner-only redacted spool for successful notify task" '[ "$rc" = 0 ] && jq -e ".ok == true and .notification.policy == \"telegram-owner\" and .notification.delivery == \"spooled\" and .notification.redacted == true and .mutations.pushSpoolWrite == true" <<<"$out" >/dev/null && [ "$(find "$SPOOL" -maxdepth 1 -type f -name "*.json" | wc -l)" = 1 ]'
-ok "spool payload is owner-only, redacted, and bridge-compatible" 'f="$(find "$SPOOL" -maxdepth 1 -type f -name "*.json" | head -1)"; jq -e ".event == \"AgentCronRun\" and .recipient == \"owner\" and .taskId == \"exec-notify\" and .status == \"success\" and (.text | contains(\"abcdefghijklmnopqrstuvwxyz1234567890\") | not) and (.text | contains(\"[REDACTED]\") )" "$f" >/dev/null'
+ok "spool payload is owner-only, canonically redacted, and bridge-compatible" 'f="$(find "$SPOOL" -maxdepth 1 -type f -name "*.json" | head -1)"; jq -e ".event == \"AgentCronRun\" and .recipient == \"owner\" and .taskId == \"exec-notify\" and .status == \"success\" and (.text | contains(\"abcdefghijklmnopqrstuvwxyz1234567890\") | not) and (.text | contains(\"[REDACTED_CREDENTIAL]\") )" "$f" >/dev/null'
 
 out="$(CCC_AGENT_CRON_STORE="$EXEC_STORE" CCC_HEADLESS_CMD="$FAKE_HEADLESS" CCC_PUSH_SPOOL="$SPOOL" bash "$CMD" run exec-notify-fail --json --at 2026-01-01T00:03:00Z 2>&1)"; rc=$?
 ok "run writes owner-only spool for failed notify task" '[ "$rc" = 1 ] && jq -e ".ok == false and .status == \"failed\" and .notification.delivery == \"spooled\" and .mutations.pushSpoolWrite == true" <<<"$out" >/dev/null && find "$SPOOL" -maxdepth 1 -type f -name "*.json" -print0 | xargs -0 jq -e "select(.taskId == \"exec-notify-fail\" and .status == \"failed\" and .recipient == \"owner\")" >/dev/null && [ ! -e "$TMP/exec-store/locks/exec-notify-fail.lock" ]'

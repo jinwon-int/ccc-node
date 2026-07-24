@@ -91,6 +91,14 @@ load.
   same allowlist on read before sending (defense in depth), so a forged spool
   file can never reach an un-allowlisted chat.
 
+Owner/chat spool text uses the canonical credential patterns from this
+checkout's `bridge/utils/redaction.py`, followed by the deliberately broader
+agent-cron owner-spool masks for short bearer/assignment/near-token values and
+arbitrary long runs. Redaction happens before the display-length cap. If the
+canonical module cannot be loaded, task execution and history remain intact but
+notification delivery reports `blocked-redaction-unavailable` and writes no
+captured output to the spool.
+
 ## Safety boundaries
 
 Read-only/status modes never acquire locks, execute prompts, write bridge spools, install timers, edit crontab/systemd, send Telegram, call providers, or touch remotes. Execution mode may write task history and owner-only redacted spool entries, but still does not install timers or call Telegram/provider APIs directly. `add`/`remove`/`enable`/`disable` mutate only the validated task store via the same atomic private write path.

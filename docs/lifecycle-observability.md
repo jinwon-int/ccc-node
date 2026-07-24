@@ -91,7 +91,11 @@ deduped). Default off; the tap is fail-open and never blocks a turn.
 - **Redaction residuals**: `skill_candidate` and `distill_extraction` import the
   canonical set from `bridge/utils/redaction.py`. Bash lifecycle persistence is
   now body-free instead of maintaining another replacement regex. `agent_cron`
-  still has a broader owner-spool redaction set and remains a follow-up.
+  also loads that exact checkout source before building owner-spool text, then
+  applies its intentionally broader short-token/assignment/long-run hardening.
+  Redaction runs before output truncation. If the canonical module is missing
+  or fails, the scheduled run continues but captured output is not spooled
+  (`blocked-redaction-unavailable`); no stale regex fallback is used.
 - **No synthetic compaction**: Codex exposes no official `PreCompact` event in
   the current runtime contract, so this slice does not invent one or promote
   the capability. Checkpoint parity remains degraded until an official
