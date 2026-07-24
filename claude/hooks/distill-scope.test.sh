@@ -73,6 +73,9 @@ else
 fi
 SH
 chmod +x "$TMP/bin/claude"
+write_exec_stub "$TMP/bin/setsid" <<'SH'
+exec "$@"
+SH
 PATH="$TMP/bin:$PATH"
 touch "$STATE/distill.dryrun"
 : > "$STATE/distill.log"
@@ -81,11 +84,13 @@ make_transcript "$TRANS_REAL" 3 "user"
 out="$(payload_other sess-real "$TRANS_REAL" "/root/.openclaw/workspace" \
   | CCC_STATE_DIR="$STATE" CCC_DISTILL_SCOPE_CWDS="/root/.openclaw/workspace" bash "$DISTILL" sessionend 2>&1)"; rc=$?
 for _ in $(seq 1 25); do
-  grep -q "dry-run skipping honcho/wiki push" "$STATE/distill.log" && break
+  grep -q "dry-run skipping local/honcho/wiki writes" "$STATE/distill.log" && break
   sleep 0.1
 done
 ok "three real turns exit 0" '[ "$rc" = 0 ]'
-ok "three real turns pass turn gate and spawn" 'grep -q "spawned bg" "$STATE/distill.log" && grep -q "dry-run skipping honcho/wiki push" "$STATE/distill.log"'
+ok "three real turns pass turn gate and spawn" 'grep -q "spawned bg" "$STATE/distill.log" && grep -q "dry-run skipping local/honcho/wiki writes" "$STATE/distill.log"'
+ok "distill dry-run writes no local memory or rollback head" \
+  '[ ! -e "$STATE/resume.md" ] && [ ! -e "$STATE/memory-facts.jsonl" ] && [ ! -e "$STATE/memory-rollback" ]'
 
 : > "$STATE/distill.log"
 rm -rf "$STATE/distill-history"

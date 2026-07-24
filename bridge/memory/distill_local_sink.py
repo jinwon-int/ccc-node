@@ -15,11 +15,11 @@ import threading
 from typing import Iterator
 
 from telegram_bot.utils.secure_fs import (
-    _atomic_write_bytes,
     ensure_private_directory,
 )
 
 from .distill_extraction import DistillExtractionOutput
+from .local_memory_transaction import LocalMemoryTransaction
 
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -129,11 +129,10 @@ class CodexLocalMemorySink:
                 finally:
                     os.close(descriptor)
 
-    def _read_existing_facts(self) -> tuple[list[str], set[str]]:
-        self._validate_regular_file(self._facts_path)
-        if not self._facts_path.exists():
+    @staticmethod
+    def _read_existing_facts(payload: bytes | None) -> tuple[list[str], set[str]]:
+        if payload is None:
             return [], set()
-        payload = self._facts_path.read_bytes()
         if len(payload) > _MAX_EXISTING_FACT_BYTES:
             raise ValueError("local memory facts exceed the safe read bound")
         lines = [line for line in payload.decode("utf-8").splitlines() if line.strip()]
@@ -149,13 +148,14 @@ class CodexLocalMemorySink:
                     seen.add(normalized)
         return lines, seen
 
-    def _write_facts(
+    def _render_facts(
         self,
         output: DistillExtractionOutput,
         *,
         job_id: str,
-    ) -> int:
-        lines, seen = self._read_existing_facts()
+        existing_payload: bytes | None,
+    ) -> tuple[bytes | None, int]:
+        lines, seen = self._read_existing_facts(existing_payload)
         provenance = output.provenance
         added: list[str] = []
         for item in output.honcho:
@@ -198,13 +198,10 @@ class CodexLocalMemorySink:
                 )
             )
         if not added:
-            return 0
+            return None, 0
         bounded_lines = (lines + added)[-self.max_facts :]
         payload = ("\n".join(bounded_lines) + "\n").encode("utf-8")
-        self._validate_regular_file(self._facts_path)
-        _atomic_write_bytes(self._facts_path, payload)
-        self._validate_regular_file(self._facts_path)
-        return len(added)
+        return payload, len(added)
 
     def _render_resume(self, output: DistillExtractionOutput) -> bytes | None:
         resume = output.resume
@@ -244,13 +241,34 @@ class CodexLocalMemorySink:
         with self._exclusive():
             self._validate_regular_file(self._facts_path)
             self._validate_regular_file(self._resume_path)
-            facts_added = self._write_facts(output, job_id=job_id)
             resume_payload = self._render_resume(output)
             resume_written = resume_payload is not None
-            if resume_payload is not None:
-                self._validate_regular_file(self._resume_path)
-                _atomic_write_bytes(self._resume_path, resume_payload)
-                self._validate_regular_file(self._resume_path)
+            facts_added = 0
+
+            def transform(
+                current: dict[str, bytes | None],
+            ) -> dict[str, bytes | None]:
+                nonlocal facts_added
+                desired: dict[str, bytes | None] = {}
+                facts_payload, facts_added = self._render_facts(
+                    output,
+                    job_id=job_id,
+                    existing_payload=current["memory-facts.jsonl"],
+                )
+                if facts_payload is not None:
+                    desired["memory-facts.jsonl"] = facts_payload
+                if resume_payload is not None:
+                    desired["resume.md"] = resume_payload
+                return desired
+
+            LocalMemoryTransaction(self.state_dir).commit(
+                transform,
+                provider="codex",
+                actor="distill",
+                tool="local-memory-sink",
+                session=job_id,
+                diff="mode-both",
+            )
             return LocalSinkWriteResult(facts_added, resume_written)
 
 
