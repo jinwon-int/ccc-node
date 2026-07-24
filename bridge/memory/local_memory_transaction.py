@@ -36,6 +36,29 @@ _TARGETS = ("memory-facts.jsonl", "resume.md")
 _SAFE_LABEL_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 _ACTION_RE = re.compile(r"^[0-9a-f]{32}$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_SESSION_REF_RE = re.compile(r"^[0-9a-f]{16}$")
+_TIMESTAMP_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+_MANIFEST_STATES = frozenset(
+    {"prepared", "committed", "undoing", "rolled_back", "aborted", "superseded"}
+)
+_MANIFEST_KEYS = frozenset(
+    {
+        "schema",
+        "action_id",
+        "state",
+        "parent",
+        "provider",
+        "actor",
+        "tool",
+        "diff",
+        "session",
+        "created_at",
+        "targets",
+    }
+)
+_TARGET_KEYS = frozenset(
+    {"before_exists", "after_exists", "before_hash", "after_hash"}
+)
 _MAX_MANIFEST_BYTES = 64 * 1024
 _MAX_LEDGER_BYTES = 1024 * 1024
 _ABSENT_HASH = hashlib.sha256(b"ccc-node:absent:v1").hexdigest()
@@ -210,8 +233,37 @@ class LocalMemoryTransaction:
             raise LocalMemorySecurityError("rollback manifest schema is invalid")
         if manifest.get("action_id") != action_id:
             raise LocalMemorySecurityError("rollback manifest action id is invalid")
+        self._validate_manifest_metadata(manifest)
         self._validate_manifest_targets(manifest)
+        self._validate_action_entries(action_dir, manifest)
         return manifest
+
+    @staticmethod
+    def _validate_manifest_metadata(manifest: Mapping[str, object]) -> None:
+        if set(manifest) != _MANIFEST_KEYS:
+            raise LocalMemorySecurityError("rollback manifest fields are invalid")
+        if manifest.get("state") not in _MANIFEST_STATES:
+            raise LocalMemorySecurityError("rollback manifest state is invalid")
+        action_id = manifest.get("action_id")
+        parent = manifest.get("parent")
+        if parent is not None and (
+            not isinstance(parent, str)
+            or not _ACTION_RE.fullmatch(parent)
+            or parent == action_id
+        ):
+            raise LocalMemorySecurityError("rollback manifest parent is invalid")
+        for field in ("provider", "actor", "tool", "diff"):
+            value = manifest.get(field)
+            if not isinstance(value, str) or not _SAFE_LABEL_RE.fullmatch(value):
+                raise LocalMemorySecurityError(
+                    f"rollback manifest {field} is invalid"
+                )
+        session = manifest.get("session")
+        if not isinstance(session, str) or not _SESSION_REF_RE.fullmatch(session):
+            raise LocalMemorySecurityError("rollback manifest session is invalid")
+        created_at = manifest.get("created_at")
+        if not isinstance(created_at, str) or not _TIMESTAMP_RE.fullmatch(created_at):
+            raise LocalMemorySecurityError("rollback manifest timestamp is invalid")
 
     @staticmethod
     def _validate_manifest_targets(manifest: Mapping[str, object]) -> None:
@@ -220,7 +272,7 @@ class LocalMemoryTransaction:
             raise LocalMemorySecurityError("rollback manifest target set is invalid")
         for name in _TARGETS:
             item = targets[name]
-            if not isinstance(item, dict):
+            if not isinstance(item, dict) or set(item) != _TARGET_KEYS:
                 raise LocalMemorySecurityError("rollback manifest target is invalid")
             for key in ("before_hash", "after_hash"):
                 if not isinstance(item.get(key), str) or not _SHA256_RE.fullmatch(item[key]):
@@ -229,6 +281,35 @@ class LocalMemoryTransaction:
                 item.get("after_exists"), bool
             ):
                 raise LocalMemorySecurityError("rollback manifest existence flag is invalid")
+            for side in ("before", "after"):
+                if not item[f"{side}_exists"] and item[f"{side}_hash"] != _ABSENT_HASH:
+                    raise LocalMemorySecurityError(
+                        "rollback manifest absent-target hash is invalid"
+                    )
+
+    def _validate_action_entries(
+        self,
+        action_dir: Path,
+        manifest: Mapping[str, object],
+    ) -> None:
+        allowed = {"manifest.json", *(f"before-{name}" for name in _TARGETS)}
+        entries = {entry.name: entry for entry in action_dir.iterdir()}
+        if not set(entries).issubset(allowed):
+            raise LocalMemorySecurityError("rollback action contains an unsafe entry")
+        state = str(manifest["state"])
+        targets = manifest["targets"]
+        for name in _TARGETS:
+            snapshot_name = f"before-{name}"
+            snapshot = entries.get(snapshot_name)
+            before_exists = bool(targets[name]["before_exists"])
+            if snapshot is not None:
+                if not before_exists:
+                    raise LocalMemorySecurityError(
+                        "rollback action has an unexpected pre-image"
+                    )
+                _validate_regular(snapshot)
+            elif before_exists and state in {"prepared", "committed", "undoing"}:
+                raise LocalMemorySecurityError("rollback action pre-image is missing")
 
     def _read_head(self) -> str | None:
         metadata = _validate_regular(self.head_path)
@@ -348,6 +429,13 @@ class LocalMemoryTransaction:
         if not self._state_matches(self._read_targets(), manifest, "before"):
             raise LocalMemoryTransactionError("rollback restore verification failed")
 
+    def _purge_snapshots(self, manifest: Mapping[str, object]) -> None:
+        for name in _TARGETS:
+            snapshot = self._snapshot_path(str(manifest["action_id"]), name)
+            if _validate_regular(snapshot) is not None:
+                snapshot.unlink()
+        _fsync_directory(self._action_dir(str(manifest["action_id"])))
+
     def _finish_prepared(self, manifest: dict[str, object]) -> None:
         current = self._read_targets()
         if self._state_matches(current, manifest, "after"):
@@ -369,9 +457,10 @@ class LocalMemoryTransaction:
             if not allowed:
                 raise LocalMemoryConflict("prepared action encountered an unknown target state")
         self._restore_before(manifest)
+        self._record_event(manifest, "abort")
         manifest["state"] = "aborted"
         self._write_manifest(manifest)
-        self._record_event(manifest, "abort")
+        self._purge_snapshots(manifest)
 
     def _finish_undo(self, manifest: dict[str, object]) -> None:
         current = self._read_targets()
@@ -386,9 +475,10 @@ class LocalMemoryTransaction:
             raise LocalMemoryConflict("undo recovery encountered an unknown target state")
         self._restore_before(manifest)
         self._write_head(None)
+        self._record_event(manifest, "rollback")
         manifest["state"] = "rolled_back"
         self._write_manifest(manifest)
-        self._record_event(manifest, "rollback")
+        self._purge_snapshots(manifest)
 
     def _discard_unprepared_action(self, path: Path) -> None:
         allowed = {f"before-{name}" for name in _TARGETS}
@@ -412,6 +502,8 @@ class LocalMemoryTransaction:
             manifest = self._read_manifest(path.name)
             if manifest.get("state") in {"prepared", "undoing"}:
                 candidates.append(manifest)
+            elif manifest.get("state") in {"aborted", "rolled_back", "superseded"}:
+                self._purge_snapshots(manifest)
         if len(candidates) > 1:
             raise LocalMemoryConflict("multiple incomplete rollback actions exist")
         if candidates:
@@ -437,12 +529,10 @@ class LocalMemoryTransaction:
         if manifest.get("state") not in {"committed", "superseded"}:
             return
         if manifest.get("state") == "committed":
+            self._record_event(manifest, "supersede")
             manifest["state"] = "superseded"
             self._write_manifest(manifest)
-        for name in _TARGETS:
-            self._snapshot_path(action_id, name).unlink(missing_ok=True)
-        _fsync_directory(self._action_dir(action_id))
-        self._record_event(manifest, "supersede")
+        self._purge_snapshots(manifest)
 
     def commit(
         self,

@@ -72,6 +72,7 @@ def test_commit_and_idempotent_rollback_restore_exact_private_preimages(
     assert (state / "memory-facts.jsonl").read_bytes() == f"old facts {secret}\n".encode()
     assert (state / "resume.md").read_bytes() == f"old resume {secret}\n".encode()
     assert transaction.rollback(committed.action_id).status == "already-rolled-back"
+    assert not list(action_root.glob("before-*"))
 
 
 def test_only_latest_head_is_undoable_and_manual_changes_fail_cas(tmp_path: Path) -> None:
@@ -93,6 +94,8 @@ def test_only_latest_head_is_undoable_and_manual_changes_fail_cas(tmp_path: Path
         diff="mode-both",
     )
     assert first.action_id and second.action_id
+    first_action = state / "memory-rollback" / "actions" / first.action_id
+    assert not list(first_action.glob("before-*"))
 
     with pytest.raises(LocalMemoryConflict, match="latest"):
         LocalMemoryTransaction(state).rollback(first.action_id)
@@ -150,6 +153,7 @@ def test_recovery_aborts_a_partial_commit_before_starting_the_next(
             session="partial",
             diff="mode-both",
         )
+    aborted_action = next((state / "memory-rollback" / "actions").iterdir())
 
     recovered = LocalMemoryTransaction(state).commit(
         replace_both(b"final facts\n", b"final resume\n"),
@@ -160,6 +164,8 @@ def test_recovery_aborts_a_partial_commit_before_starting_the_next(
         diff="mode-both",
     )
     assert recovered.action_id
+    assert json.loads((aborted_action / "manifest.json").read_text())["state"] == "aborted"
+    assert not list(aborted_action.glob("before-*"))
     LocalMemoryTransaction(state).rollback(recovered.action_id)
     assert (state / "memory-facts.jsonl").read_bytes() == b"old facts\n"
     assert (state / "resume.md").read_bytes() == b"old resume\n"
@@ -225,6 +231,49 @@ def test_rollback_authenticates_all_preimages_before_mutating_targets(
 
     assert (state / "memory-facts.jsonl").read_bytes() == b"new facts\n"
     assert (state / "resume.md").read_bytes() == b"new resume\n"
+
+
+def test_corrupt_manifest_metadata_is_rejected_without_entering_the_ledger(
+    tmp_path: Path,
+) -> None:
+    state = private_state(tmp_path)
+    result = LocalMemoryTransaction(state).commit(
+        replace_both(b"new facts\n", b"new resume\n"),
+        provider="codex",
+        actor="distill",
+        tool="local-memory-sink",
+        session="job",
+        diff="mode-both",
+    )
+    assert result.action_id
+    rollback = state / "memory-rollback"
+    manifest_path = rollback / "actions" / result.action_id / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["actor"] = "raw secret body"
+    manifest_path.write_text(json.dumps(manifest))
+
+    with pytest.raises(LocalMemorySecurityError, match="actor"):
+        LocalMemoryTransaction(state).rollback(result.action_id)
+
+    assert "raw secret body" not in (rollback / "ledger.jsonl").read_text()
+
+
+def test_action_with_unexpected_entry_is_rejected(tmp_path: Path) -> None:
+    state = private_state(tmp_path)
+    result = LocalMemoryTransaction(state).commit(
+        replace_both(b"new facts\n", b"new resume\n"),
+        provider="codex",
+        actor="distill",
+        tool="local-memory-sink",
+        session="job",
+        diff="mode-both",
+    )
+    assert result.action_id
+    action = state / "memory-rollback" / "actions" / result.action_id
+    (action / "unexpected").write_text("must not be accepted")
+
+    with pytest.raises(LocalMemorySecurityError, match="unsafe entry"):
+        LocalMemoryTransaction(state).rollback(result.action_id)
 
 
 @pytest.mark.parametrize("link_kind", ["symlink", "hardlink"])
