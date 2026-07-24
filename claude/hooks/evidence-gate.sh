@@ -41,7 +41,7 @@ fi
 state_dir="$(ccc_lifecycle_state_dir 2>/dev/null || true)"
 LOG="${CCC_AUDIT_LOG:-${state_dir:+$state_dir/audit.jsonl}}"
 [ -n "$LOG" ] || exit 0
-[ -f "$LOG" ] || exit 0
+[ -f "$LOG" ] && [ ! -L "$LOG" ] && [ -O "$LOG" ] || exit 0
 
 # Audit entries for this session only. Raw session_id matching keeps existing
 # pre-upgrade records readable; new records use only the opaque session_ref.

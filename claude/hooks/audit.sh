@@ -48,11 +48,8 @@ record="$(jq -nc --arg ts "$ts" --arg tool "$tool" --arg ref "$session_ref" \
 
 state_dir="$(ccc_lifecycle_state_dir 2>/dev/null || true)"
 LOG="${CCC_AUDIT_LOG:-${state_dir:+$state_dir/audit.jsonl}}"
-if [ -n "$LOG" ] && [ ! -L "$LOG" ]; then
-  mkdir -p "$(dirname "$LOG")" 2>/dev/null
-  chmod 700 "$(dirname "$LOG")" 2>/dev/null || true
-  printf '%s\n' "$record" >> "$LOG" 2>/dev/null || true
-  chmod 600 "$LOG" 2>/dev/null || true
+if command -v ccc_lifecycle_append_line >/dev/null 2>&1; then
+  ccc_lifecycle_append_line "$LOG" "$record" || true
 fi
 
 exit 0

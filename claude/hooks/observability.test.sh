@@ -56,12 +56,22 @@ ok "push spool writes when opt-in"  'ls "$TMP/spool"/*.json >/dev/null 2>&1'
 ok "push spool is body-free" \
   '! grep -Fq "$fake_github_token" "$TMP/spool"/*.json && jq -e ".text == \"Claude notification requires operator attention.\"" "$TMP/spool"/*.json >/dev/null'
 ok "push spool carries node label"  'cat "$TMP/spool"/*.json | grep -q "testnode"'
+spool_count="$(find "$TMP/spool" -maxdepth 1 -type f -name '*.json' | wc -l | tr -d '[:space:]')"
+printf '{"message":"approve %s now"}\n' "$fake_github_token" \
+  | CCC_NOTIFY_TELEGRAM=1 CCC_NODE=testnode CCC_PUSH_SPOOL="$TMP/spool" bash "$HERE/notify.sh" Notification
+ok "push spool dedups an exact retry" \
+  '[ "$(find "$TMP/spool" -maxdepth 1 -type f -name "*.json" | wc -l | tr -d "[:space:]")" = "$spool_count" ]'
+ok "push spool dedup is payload-stable" \
+  'jq -e ".dedup | startswith(\"lifecycle:Notification:\")" "$TMP/spool"/*.json >/dev/null'
 
 # SessionEnd archives the working-state file
 export CCC_WORKING_STATE="$TMP/ws.md"; export CCC_SESSION_ARCHIVE="$TMP/arch"
 printf 'objective: test\n' > "$CCC_WORKING_STATE"
 echo '{}' | bash "$HERE/notify.sh" SessionEnd
 ok "SessionEnd archives ws"        'ls "$TMP/arch"/working-state-*.md >/dev/null 2>&1'
+echo '{}' | bash "$HERE/notify.sh" SessionEnd
+ok "SessionEnd archive is atomic and retry-deduped" \
+  '[ "$(find "$TMP/arch" -maxdepth 1 -type f -name "working-state-*.md" | wc -l | tr -d "[:space:]")" = 1 ] && [ "$(stat -c "%a" "$TMP/arch"/working-state-*.md)" = 600 ]'
 
 # --- audit.sh stores an opaque session_ref; evidence-gate.sh still scopes by it ---
 echo '{"session_id":"sX","tool_name":"Write","tool_input":{"file_path":"/x/a.py"}}' | bash "$HERE/audit.sh"
@@ -114,6 +124,13 @@ ok "notification hook invokes canonical lifecycle module" \
 ok "notification body never reaches legacy files" \
   '! grep -R -Fq "sensitive provider body" "$CCC_AUDIT_LOG" "$CCC_APPROVAL_LOG" "$TMP/spool"'
 
+audit_count="$(wc -l < "$CCC_AUDIT_LOG" | tr -d '[:space:]')"
+approval_count="$(wc -l < "$CCC_APPROVAL_LOG" | tr -d '[:space:]')"
+printf 'not-json' | bash "$HERE/notify.sh" Notification
+printf '{}' | bash "$HERE/notify.sh" '../../invalid'
+ok "malformed/unknown notifications create no false attention" \
+  '[ "$(wc -l < "$CCC_AUDIT_LOG" | tr -d "[:space:]")" = "$audit_count" ] && [ "$(wc -l < "$CCC_APPROVAL_LOG" | tr -d "[:space:]")" = "$approval_count" ]'
+
 # Refuse direct symlink targets and survive environments without HOME/state.
 printf 'sentinel\n' > "$TMP/external-audit"
 ln -s "$TMP/external-audit" "$TMP/audit-link"
@@ -121,6 +138,23 @@ printf '%s' '{"tool_name":"Write","tool_input":{"file_path":"/x"}}' \
   | CCC_AUDIT_LOG="$TMP/audit-link" bash "$HERE/audit.sh"
 ok "audit refuses a symlink target" \
   '[ "$(cat "$TMP/external-audit")" = "sentinel" ]'
+mkdir "$TMP/external-parent"
+ln -s "$TMP/external-parent" "$TMP/audit-parent-link"
+printf '%s' '{"tool_name":"Write","tool_input":{"file_path":"/x"}}' \
+  | CCC_AUDIT_LOG="$TMP/audit-parent-link/audit.jsonl" bash "$HERE/audit.sh"
+ok "audit refuses a symlink parent" '[ ! -e "$TMP/external-parent/audit.jsonl" ]'
+mkdir "$TMP/nested-root" "$TMP/nested-target"
+ln -s "$TMP/nested-target" "$TMP/nested-root/link"
+printf '%s' '{"tool_name":"Write","tool_input":{"file_path":"/x"}}' \
+  | CCC_AUDIT_LOG="$TMP/nested-root/link/state/audit.jsonl" bash "$HERE/audit.sh"
+ok "audit refuses a symlink in any parent component" \
+  '[ ! -e "$TMP/nested-target/state/audit.jsonl" ]'
+mkdir "$TMP/shared-parent"
+chmod 755 "$TMP/shared-parent"
+printf '%s' '{"tool_name":"Write","tool_input":{"file_path":"/x"}}' \
+  | CCC_AUDIT_LOG="$TMP/shared-parent/audit.jsonl" bash "$HERE/audit.sh"
+ok "audit refuses and never chmods a non-private override parent" \
+  '[ ! -e "$TMP/shared-parent/audit.jsonl" ] && [ "$(stat -c "%a" "$TMP/shared-parent")" = 755 ]'
 
 env -u HOME -u CCC_STATE_DIR -u CCC_AUDIT_LOG \
   bash "$HERE/notify.sh" Notification <<< '{"message":"no-home-body"}'

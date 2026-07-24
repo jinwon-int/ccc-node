@@ -40,8 +40,11 @@ parity does not depend on Claude-only hook payloads.
 - **Body-free legacy compatibility records** — the legacy audit/evidence
   helpers retain their existing opt-in behavior without persisting raw
   commands, paths, session IDs, or provider notification bodies. Session scope
-  is an opaque hash and evidence is stored as booleans. Owner spool text is a
-  fixed body-free notice.
+  is an opaque hash and evidence is stored as booleans. Existing state parents
+  must already be owner-only; new ones are created `0700`, files are `0600`,
+  and symlink targets/parents are refused. Owner spool text is a fixed body-free
+  notice with payload-stable retry dedup. Session archives are published from a
+  private temp file without overwriting an existing destination.
 - Capability matrix: a `lifecycle_observability` axis (both providers remain
   `degraded`; Claude hook-payload feed is wired, while provider notification
   delivery and an official Codex checkpoint boundary remain follow-ups).

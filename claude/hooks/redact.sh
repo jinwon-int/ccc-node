@@ -18,11 +18,10 @@ if grep -Eq '(ghp_|gho_|ghs_|ghr_|github_pat_)[A-Za-z0-9_]{20,}|(sk-)[A-Za-z0-9_
   state_dir="$(ccc_lifecycle_state_dir 2>/dev/null || true)"
   LOG="${CCC_AUDIT_LOG:-${state_dir:+$state_dir/audit.jsonl}}"
   ts="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)"
-  if [ -n "$LOG" ] && [ ! -L "$LOG" ]; then
-    mkdir -p "$(dirname "$LOG")" 2>/dev/null
-    chmod 700 "$(dirname "$LOG")" 2>/dev/null || true
-    jq -nc --arg ts "$ts" '{ts:$ts, event:"UserPromptSubmit", flag:"possible-raw-credential"}' >> "$LOG" 2>/dev/null
-    chmod 600 "$LOG" 2>/dev/null || true
+  record="$(jq -nc --arg ts "$ts" \
+    '{ts:$ts, event:"UserPromptSubmit", flag:"possible-raw-credential"}' 2>/dev/null || true)"
+  if [ -n "$record" ] && command -v ccc_lifecycle_append_line >/dev/null 2>&1; then
+    ccc_lifecycle_append_line "$LOG" "$record" || true
   fi
   jq -nc '{hookSpecificOutput:{hookEventName:"UserPromptSubmit", additionalContext:"⚠️ ccc-node guard: the submitted prompt appears to contain a raw credential. Per FW-03, do NOT echo, store, log, or commit it — reference its location/handling only and treat it as sensitive."}}'
 fi
