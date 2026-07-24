@@ -87,6 +87,11 @@ class ManualClaudeSdkClient:
         self.turn_scripts: deque[str] = deque()
         self.interrupts = 0
         self._messages: asyncio.Queue[Message | None] = asyncio.Queue()
+        self.disconnect_gate: asyncio.Event | None = None
+        self.disconnect_started = asyncio.Event()
+        self.disconnected = asyncio.Event()
+        self.disconnect_calls = 0
+        self.disconnect_cancellations = 0
 
     # -- manual frame emission ---------------------------------------------
 
@@ -186,7 +191,16 @@ class ManualClaudeSdkClient:
         self.interrupts += 1
 
     async def disconnect(self) -> None:
+        self.disconnect_calls += 1
+        self.disconnect_started.set()
+        try:
+            if self.disconnect_gate is not None:
+                await self.disconnect_gate.wait()
+        except asyncio.CancelledError:
+            self.disconnect_cancellations += 1
+            raise
         self._messages.put_nowait(None)
+        self.disconnected.set()
 
 
 async def _collect(stream: AsyncIterator[AgentEvent]) -> list[AgentEvent]:
@@ -404,6 +418,68 @@ class ClaudeRuntimeUnsolicitedTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(owner_client.interrupts, 1)
         self.assertIsInstance(owner_events[-1], ErrorEvent)
         self.assertEqual(waiter_client.queries, [])
+
+        recovered = await self.runtime.start_or_resume(
+            SessionRequest(
+                working_directory="/workspace", session_id=owner.session_id
+            )
+        )
+        recovered_client = self.clients[-1]
+        recovered_events = await asyncio.wait_for(
+            _collect(recovered.send_turn("recovered")), timeout=2.0
+        )
+        self.assertEqual(recovered_client.queries, ["recovered"])
+        self.assertIsInstance(recovered_events[-1], CompletionEvent)
+
+    async def test_abort_timeout_keeps_disconnects_alive_and_rotates_lock(
+        self,
+    ) -> None:
+        """#691: the caller's short abort timeout must not cancel either
+        SDK disconnect or leave the shared lock poisoned."""
+
+        owner, owner_client = await self._start_session()
+        owner_client.turn_scripts.append("hang")
+        owner_task = asyncio.create_task(_collect(owner.send_turn("owner")))
+        await _wait_until(lambda: owner_client.queries == ["owner"])
+
+        waiter = await self.runtime.start_or_resume(
+            SessionRequest(
+                working_directory="/workspace", session_id=owner.session_id
+            )
+        )
+        waiter_client = self.clients[-1]
+        waiter_task = asyncio.create_task(_collect(waiter.send_turn("waiter")))
+        await asyncio.sleep(0.01)
+        self.assertEqual(waiter_client.queries, [])
+
+        owner_client.disconnect_gate = asyncio.Event()
+        waiter_client.disconnect_gate = asyncio.Event()
+        owner_lock = owner._turn_lock
+
+        with self.assertRaises(TimeoutError):
+            await asyncio.wait_for(waiter.abort_stalled_turn(), timeout=0.01)
+
+        await asyncio.wait_for(owner_client.disconnect_started.wait(), timeout=2.0)
+        await asyncio.wait_for(waiter_client.disconnect_started.wait(), timeout=2.0)
+        self.assertEqual(owner_client.disconnect_cancellations, 0)
+        self.assertEqual(waiter_client.disconnect_cancellations, 0)
+        self.assertIsNot(self.runtime._session_locks[owner.session_id], owner_lock)
+        self.assertNotIn(owner.session_id, self.runtime._turn_owners)
+
+        owner_client.disconnect_gate.set()
+        waiter_client.disconnect_gate.set()
+        await asyncio.gather(owner.close(), waiter.close())
+        owner_events = await asyncio.wait_for(owner_task, timeout=2.0)
+        waiter_outcome = await asyncio.wait_for(
+            asyncio.gather(waiter_task, return_exceptions=True), timeout=2.0
+        )
+        self.assertIsInstance(owner_events[-1], ErrorEvent)
+        self.assertIsInstance(waiter_outcome[0], RuntimeError)
+        self.assertEqual(waiter_client.queries, [])
+        self.assertEqual(owner_client.disconnect_calls, 1)
+        self.assertEqual(waiter_client.disconnect_calls, 1)
+        self.assertTrue(owner_client.disconnected.is_set())
+        self.assertTrue(waiter_client.disconnected.is_set())
 
         recovered = await self.runtime.start_or_resume(
             SessionRequest(
