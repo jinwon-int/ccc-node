@@ -172,6 +172,7 @@ class ClaudeSession:
         self._session_ready = asyncio.Event()
         self._client: SdkClient | None = None
         self._reader_task: asyncio.Task[None] | None = None
+        self._close_task: asyncio.Task[None] | None = None
         self._turn_lock: asyncio.Lock | None = None
         self._active_turn: _ActiveTurn | None = None
         self._approval_counter = 0
@@ -224,21 +225,50 @@ class ClaudeSession:
             raise
 
     async def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        self._fail_active_turn("claude_runtime_closed", "Claude runtime closed")
-        if self._reader_task is not None:
-            self._reader_task.cancel()
-            await asyncio.gather(self._reader_task, return_exceptions=True)
-            self._reader_task = None
-        if self._client is not None:
+        close_task = self._begin_close()
+        if close_task is not None:
+            await asyncio.shield(close_task)
+
+    def _begin_close(self) -> asyncio.Task[None] | None:
+        """Synchronously seal the session and start its single cleanup task."""
+
+        if self._close_task is None:
+            if self._closed:
+                return None
+            self._closed = True
+            self._fail_active_turn("claude_runtime_closed", "Claude runtime closed")
+            reader_task = self._reader_task
+            if reader_task is not None:
+                reader_task.cancel()
+                self._reader_task = None
+            client = self._client
+            if reader_task is None and client is None:
+                return None
+            # Keep cleanup in a separate single-flight task. Project-chat puts
+            # stalled-turn abort behind asyncio.wait_for(); cancelling that
+            # caller must not cancel the SDK's bounded TERM/KILL escalation.
+            # A later close() joins the same task instead of trusting the
+            # already-set _closed flag and abandoning a half-closed client.
+            self._close_task = asyncio.create_task(
+                self._finish_close(reader_task, client)
+            )
+        return self._close_task
+
+    async def _finish_close(
+        self,
+        reader_task: asyncio.Task[None] | None,
+        client: SdkClient | None,
+    ) -> None:
+        if reader_task is not None:
+            await asyncio.gather(reader_task, return_exceptions=True)
+        if client is not None:
             try:
-                await self._client.disconnect()
-            except asyncio.CancelledError:
-                raise
+                await client.disconnect()
             except Exception:
                 logger.exception("Claude SDK client disconnect failed during close")
+            finally:
+                if self._client is client:
+                    self._client = None
 
     # -- AgentSession protocol ---------------------------------------------
 
@@ -298,6 +328,11 @@ class ClaudeSession:
             if client is None or lock is None:
                 raise RuntimeError("Claude session is not started")
             async with lock:
+                # A resumed waiter can capture its client before blocking on a
+                # shared lock. Re-check after admission so _begin_close() can
+                # seal it synchronously before the old owner releases (#625).
+                if self._closed:
+                    raise RuntimeError("Claude session is closed")
                 self._runtime._turn_owners[self.session_id] = self
                 active = _ActiveTurn(asyncio.Queue(), approval_handler)
                 self._active_turn = active
@@ -358,18 +393,31 @@ class ClaudeSession:
 
         session_id = self.session_id
         owner = self._runtime._turn_owners.get(session_id) or self
-        if owner is not self:
-            # The waiter's ``__anext__`` task is cancelled immediately after
-            # this hook returns. Close its client first so it cannot submit a
-            # prompt in the narrow race where the old owner releases the lock
-            # while the abort is still unwinding.
-            await self.close()
-        await owner.close()
         owner_lock = owner._turn_lock
-        if self._runtime._session_locks.get(session_id) is owner_lock:
-            self._runtime._session_locks[session_id] = asyncio.Lock()
-        if self._runtime._turn_owners.get(session_id) is owner:
-            self._runtime._turn_owners.pop(session_id, None)
+        # Preserve #625's waiter-before-owner safety without making the
+        # waiter's full graceful disconnect a prerequisite for owner cleanup.
+        # _begin_close() has no await: the waiter is sealed before the owner
+        # can release the old lock, and send_turn re-checks that seal after
+        # admission. The SDK cleanup tasks may then progress concurrently.
+        close_tasks: list[asyncio.Task[None]] = []
+        waiter_close = self._begin_close()
+        if waiter_close is not None:
+            close_tasks.append(waiter_close)
+        if owner is not self:
+            owner_close = owner._begin_close()
+            if owner_close is not None:
+                close_tasks.append(owner_close)
+        try:
+            await asyncio.gather(*(asyncio.shield(task) for task in close_tasks))
+        finally:
+            # The project-chat abort guard is deliberately shorter than the
+            # SDK's worst-case graceful-close window. Rotate ownership even if
+            # that guard expires; each close's shielded cleanup task keeps
+            # running and remains joinable by a later close().
+            if self._runtime._session_locks.get(session_id) is owner_lock:
+                self._runtime._session_locks[session_id] = asyncio.Lock()
+            if self._runtime._turn_owners.get(session_id) is owner:
+                self._runtime._turn_owners.pop(session_id, None)
 
     # -- SDK frame translation ---------------------------------------------
 

@@ -20,6 +20,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   arbitrary units fail closed. The #706 raw in-tree restart guard remains.
 
 ### Fixed
+- **A timed-out Claude turn abort could cancel SDK shutdown before it reached
+  its bounded subprocess TERM/KILL escalation (#691).** Claude sessions now
+  seal synchronously and keep one shielded, joinable cleanup task, so a short
+  project-chat abort timeout cannot abandon `disconnect()` or make later
+  `close()` calls trust a half-closed flag. Stalled shared-session recovery
+  seals the waiter before starting owner cleanup, rechecks that seal after lock
+  admission, and rotates the poisoned lock in `finally`; a fresh session can
+  proceed while only the old waiter/owner clients finish shutdown.
 - **Claude audience-scoped memory now preserves the DM/group privacy boundary.**
   Telegram routes pass an opaque, canonical memory environment into each
   Claude SDK session; the runtime reconstructs and byte-for-byte validates that
