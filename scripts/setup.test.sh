@@ -225,6 +225,8 @@ ok "installed Codex materializer imports its colocated secure-fs helper" \
   'PYTHONDONTWRITEBYTECODE=1 PYTHONPATH= "$rewrite_claude/hooks/ccc_codex_memory.py" --help >/dev/null 2>&1'
 ok "installed local-memory transaction imports its colocated secure-fs helper" \
   'PYTHONDONTWRITEBYTECODE=1 PYTHONPATH= python3 "$rewrite_claude/hooks/ccc_local_memory_transaction.py" --help >/dev/null 2>&1'
+ok "source-checkout local-memory transaction imports canonical secure-fs directly" \
+  'PYTHONDONTWRITEBYTECODE=1 PYTHONPATH= python3 -S "$ROOT/bridge/memory/local_memory_transaction.py" --help >/dev/null 2>&1'
 codex_dry_out="$(HOME="$nonroot_home" CCC_CLAUDE_DIR="$nonroot_claude" CCC_HERMES_DIR="$nonroot_hermes" CCC_WIKI_AGENT_BIN="$nonroot_wiki" CCC_BRIDGE_DEFAULT_PATH="$nonroot_bridge" bash "$SETUP" --dry-run 2>&1)"; codex_dry_rc=$?
 ok "setup non-root dry-run includes all Codex managed launch artifacts" \
   '[ "$codex_dry_rc" = 0 ] && grep -Fq "$nonroot_claude/hooks/ccc-codex" <<<"$codex_dry_out" && grep -Fq "$nonroot_claude/hooks/ccc_codex_memory.py" <<<"$codex_dry_out" && grep -Fq "$nonroot_claude/hooks/ccc_secure_fs.py" <<<"$codex_dry_out" && grep -Fq "$nonroot_claude/hooks/ccc_local_memory_transaction.py" <<<"$codex_dry_out"'

@@ -258,6 +258,31 @@ def test_corrupt_manifest_metadata_is_rejected_without_entering_the_ledger(
     assert "raw secret body" not in (rollback / "ledger.jsonl").read_text()
 
 
+@pytest.mark.parametrize("corrupt_line", ["null\n", "\"raw body\"\n", "{broken\n"])
+def test_corrupt_ledger_is_rejected_as_a_security_error(
+    tmp_path: Path,
+    corrupt_line: str,
+) -> None:
+    state = private_state(tmp_path)
+    result = LocalMemoryTransaction(state).commit(
+        replace_both(b"new facts\n", b"new resume\n"),
+        provider="codex",
+        actor="distill",
+        tool="local-memory-sink",
+        session="job",
+        diff="mode-both",
+    )
+    assert result.action_id
+    ledger = state / "memory-rollback" / "ledger.jsonl"
+    ledger.write_text(corrupt_line)
+
+    with pytest.raises(LocalMemorySecurityError, match="ledger"):
+        LocalMemoryTransaction(state).rollback(result.action_id)
+
+    assert (state / "memory-facts.jsonl").read_bytes() == b"new facts\n"
+    assert (state / "resume.md").read_bytes() == b"new resume\n"
+
+
 def test_action_with_unexpected_entry_is_rejected(tmp_path: Path) -> None:
     state = private_state(tmp_path)
     result = LocalMemoryTransaction(state).commit(

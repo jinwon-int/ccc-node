@@ -13,12 +13,14 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import fcntl
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
 import re
 import secrets
 import stat
+import sys
 from typing import Callable, Iterator, Mapping, Sequence
 
 try:
@@ -28,7 +30,26 @@ try:
         ensure_private_directory,
     )
 except ModuleNotFoundError:  # Standalone hook-tree copy installed by setup.sh.
-    from ccc_secure_fs import _atomic_write_bytes, _fsync_directory, ensure_private_directory
+    try:
+        from ccc_secure_fs import (
+            _atomic_write_bytes,
+            _fsync_directory,
+            ensure_private_directory,
+        )
+    except ModuleNotFoundError:  # Direct execution from a source checkout.
+        secure_fs_source = Path(__file__).resolve().parents[1] / "utils/secure_fs.py"
+        secure_fs_spec = importlib.util.spec_from_file_location(
+            "ccc_secure_fs",
+            secure_fs_source,
+        )
+        if secure_fs_spec is None or secure_fs_spec.loader is None:
+            raise
+        secure_fs_module = importlib.util.module_from_spec(secure_fs_spec)
+        sys.modules[secure_fs_spec.name] = secure_fs_module
+        secure_fs_spec.loader.exec_module(secure_fs_module)
+        _atomic_write_bytes = secure_fs_module._atomic_write_bytes
+        _fsync_directory = secure_fs_module._fsync_directory
+        ensure_private_directory = secure_fs_module.ensure_private_directory
 
 
 _SCHEMA = "ccc.local-memory-rollback.v1"
@@ -58,6 +79,22 @@ _MANIFEST_KEYS = frozenset(
 )
 _TARGET_KEYS = frozenset(
     {"before_exists", "after_exists", "before_hash", "after_hash"}
+)
+_LEDGER_EVENTS = frozenset({"commit", "abort", "rollback", "supersede"})
+_LEDGER_KEYS = frozenset(
+    {
+        "schema",
+        "event",
+        "action_id",
+        "actor",
+        "tool",
+        "provider",
+        "scope",
+        "targets",
+        "diff",
+        "session",
+        "ts",
+    }
 )
 _MAX_MANIFEST_BYTES = 64 * 1024
 _MAX_LEDGER_BYTES = 1024 * 1024
@@ -332,23 +369,52 @@ class LocalMemoryTransaction:
         _atomic_write_bytes(self._manifest_path(action_id), _json_bytes(manifest))
         _validate_regular(self._manifest_path(action_id))
 
-    def _event_exists(self, action_id: str, event: str) -> bool:
+    @staticmethod
+    def _validate_ledger_record(item: object) -> dict[str, object]:
+        if not isinstance(item, dict) or set(item) != _LEDGER_KEYS:
+            raise LocalMemorySecurityError("rollback ledger record is invalid")
+        if item.get("schema") != _SCHEMA or item.get("event") not in _LEDGER_EVENTS:
+            raise LocalMemorySecurityError("rollback ledger schema is invalid")
+        action_id = item.get("action_id")
+        if not isinstance(action_id, str) or not _ACTION_RE.fullmatch(action_id):
+            raise LocalMemorySecurityError("rollback ledger action id is invalid")
+        for field in ("provider", "actor", "tool", "diff"):
+            value = item.get(field)
+            if not isinstance(value, str) or not _SAFE_LABEL_RE.fullmatch(value):
+                raise LocalMemorySecurityError(f"rollback ledger {field} is invalid")
+        if item.get("scope") != "local-memory" or item.get("targets") != list(_TARGETS):
+            raise LocalMemorySecurityError("rollback ledger target scope is invalid")
+        session = item.get("session")
+        if not isinstance(session, str) or not _SESSION_REF_RE.fullmatch(session):
+            raise LocalMemorySecurityError("rollback ledger session is invalid")
+        timestamp = item.get("ts")
+        if not isinstance(timestamp, str) or not _TIMESTAMP_RE.fullmatch(timestamp):
+            raise LocalMemorySecurityError("rollback ledger timestamp is invalid")
+        return item
+
+    def _read_ledger_records(self) -> list[dict[str, object]]:
         metadata = _validate_regular(self.ledger_path)
         if metadata is None:
-            return False
+            return []
         payload = _read_bounded(self.ledger_path, _MAX_LEDGER_BYTES)
+        records: list[dict[str, object]] = []
         for line in payload.splitlines():
             try:
                 item = json.loads(line)
             except (TypeError, ValueError):
-                continue
-            if item.get("action_id") == action_id and item.get("event") == event:
-                return True
-        return False
+                raise LocalMemorySecurityError(
+                    "rollback ledger contains invalid JSON"
+                ) from None
+            records.append(self._validate_ledger_record(item))
+        return records
 
     def _record_event(self, manifest: Mapping[str, object], event: str) -> None:
         action_id = str(manifest["action_id"])
-        if self._event_exists(action_id, event):
+        records = self._read_ledger_records()
+        if any(
+            item["action_id"] == action_id and item["event"] == event
+            for item in records
+        ):
             return
         record = {
             "schema": _SCHEMA,
@@ -363,10 +429,8 @@ class LocalMemoryTransaction:
             "session": manifest["session"],
             "ts": _now(),
         }
-        existing = b""
-        if _validate_regular(self.ledger_path) is not None:
-            existing = _read_bounded(self.ledger_path, _MAX_LEDGER_BYTES)
-        lines = [line for line in existing.splitlines(keepends=True) if line.strip()]
+        self._validate_ledger_record(record)
+        lines = [_json_bytes(item) for item in records]
         lines.append(_json_bytes(record))
         while len(b"".join(lines)) > _MAX_LEDGER_BYTES and len(lines) > 1:
             lines.pop(0)
