@@ -20,6 +20,7 @@ from telegram_bot.core.task_ledger import (
     TaskLedger,
     ledger_path_for,
 )
+from telegram_bot.core.request_lifecycle import RequestPhase
 from telegram_bot.core.heartbeat import (
     compose_heartbeat_text,
     has_recent_visible_progress,
@@ -153,11 +154,7 @@ class ProjectChatHandler(
             if compatibility_mode
             else getattr(self._config, "execution_profile", EXECUTION_STRICT_PROJECT)
         )
-        policy = (
-            BASH_POLICY
-            if compatibility_mode
-            else getattr(self._config, "bash_policy", None)
-        )
+        policy = BASH_POLICY if compatibility_mode else getattr(self._config, "bash_policy", None)
         if compatibility_mode:
             self._execution_profile = profile
         else:
@@ -229,26 +226,16 @@ class ProjectChatHandler(
                 self._usage_meter = UsageMeter(
                     self.project_root / ".telegram_bot" / "usage-meter.json",
                     budgets={
-                        "claude": int(
-                            getattr(self._config, "usage_budget_tokens_claude", 0) or 0
-                        ),
-                        "codex": int(
-                            getattr(self._config, "usage_budget_tokens_codex", 0) or 0
-                        ),
+                        "claude": int(getattr(self._config, "usage_budget_tokens_claude", 0) or 0),
+                        "codex": int(getattr(self._config, "usage_budget_tokens_codex", 0) or 0),
                     },
-                    warn_percent=int(
-                        getattr(self._config, "usage_budget_warn_percent", 80) or 80
-                    ),
+                    warn_percent=int(getattr(self._config, "usage_budget_warn_percent", 80) or 80),
                     alert_sink=self._write_usage_alert_spool,
                 )
             except Exception:
-                logger.exception(
-                    "Usage meter unavailable; continuing without local metering"
-                )
+                logger.exception("Usage meter unavailable; continuing without local metering")
         if self._usage_meter is not None and self._agent_runtime is not None:
-            set_usage_recorder = getattr(
-                self._agent_runtime, "set_usage_recorder", None
-            )
+            set_usage_recorder = getattr(self._agent_runtime, "set_usage_recorder", None)
             if callable(set_usage_recorder):
                 set_usage_recorder(self._usage_meter.record_codex_thread_usage)
             set_turn_attempt_recorder = getattr(
@@ -313,9 +300,7 @@ class ProjectChatHandler(
         """
 
         if "usage_meter" in worker_kwargs:
-            raise ValueError(
-                "usage_meter is injected by the composition root; do not pass it"
-            )
+            raise ValueError("usage_meter is injected by the composition root; do not pass it")
         return CodexDistillExtractionWorker(
             journal,
             backend,
@@ -330,9 +315,7 @@ class ProjectChatHandler(
             input_total = snapshot.input_tokens or 0
         return input_total, snapshot.output_tokens or 0
 
-    def _meter_claude_tokens(
-        self, delta: Tuple[int, int], mode: str = MODE_INTERACTIVE
-    ) -> None:
+    def _meter_claude_tokens(self, delta: Tuple[int, int], mode: str = MODE_INTERACTIVE) -> None:
         if self._usage_meter is None:
             return
         try:
@@ -381,9 +364,7 @@ class ProjectChatHandler(
         except Exception:
             logger.exception("Claude request metering failed; turn continues")
 
-    def record_claude_adapter_result(
-        self, event: Any, mode: str = MODE_INTERACTIVE
-    ) -> None:
+    def record_claude_adapter_result(self, event: Any, mode: str = MODE_INTERACTIVE) -> None:
         """Meter Claude adapter-path tokens from the terminal ResultEvent (#388).
 
         ClaudeRuntime carries the SDK ResultMessage usage block in its
@@ -419,9 +400,7 @@ class ProjectChatHandler(
             chat_id,
         )
 
-    def record_claude_result_snapshot(
-        self, user_id: int, chat_id: int, msg: ResultMessage
-    ) -> None:
+    def record_claude_result_snapshot(self, user_id: int, chat_id: int, msg: ResultMessage) -> None:
         """Cache one terminal ResultMessage's usage/cost snapshot for /usage.
 
         Fed by the adapter path via the ``set_sdk_frame_observer`` seam (#584
@@ -449,9 +428,7 @@ class ProjectChatHandler(
             else parsed
         )
 
-    async def get_usage(
-        self, user_id: int, chat_id: int, session_id: str | None
-    ) -> UsageSnapshot:
+    async def get_usage(self, user_id: int, chat_id: int, session_id: str | None) -> UsageSnapshot:
         """Return provider usage already observed for this exact conversation."""
 
         if self._agent_runtime is not None:
@@ -482,12 +459,11 @@ class ProjectChatHandler(
             result = merge_usage(result, cached)
         state_root = Path(
             os.environ.get(
-                "CCC_STATE_DIR", str(Path(self._config.claude_settings_path).parent / "state")
+                "CCC_STATE_DIR",
+                str(Path(self._config.claude_settings_path).parent / "state"),
             )
         )
-        status = load_claude_status_snapshot(
-            state_root / "usage", session_id, now=now
-        )
+        status = load_claude_status_snapshot(state_root / "usage", session_id, now=now)
         if status is not None:
             result = merge_usage(result, status)
         # Global, not session-scoped by design — see `_claude_rate_limit`.
@@ -506,14 +482,8 @@ class ProjectChatHandler(
                 try:
                     rolling = meter.rolling_usage().get(result.provider)
                     period = getattr(meter, "period_usage", None)
-                    weekly = (
-                        period(days=7).get(result.provider)
-                        if period is not None
-                        else None
-                    )
-                    windows = synthesize_service_windows(
-                        result.service, rolling, weekly
-                    )
+                    weekly = period(days=7).get(result.provider) if period is not None else None
+                    windows = synthesize_service_windows(result.service, rolling, weekly)
                 except Exception:
                     logger.debug("Local service window synthesis failed")
                     windows = ()
@@ -567,14 +537,40 @@ class ProjectChatHandler(
         self._task_ledger_cache = TaskLedger(path) if path else False
         return self._task_ledger_cache or None
 
-    def _ledger_create(self, user_id: int, chat_id: int):
+    def _ledger_create(
+        self,
+        user_id: int,
+        chat_id: int,
+        *,
+        initial_state: str = RequestPhase.WORKING.value,
+    ):
         led = self._task_ledger
-        return led.create(user_id, chat_id) if led else None
+        if not led:
+            return None
+        try:
+            return led.create(user_id, chat_id, initial_state=initial_state)
+        except Exception as exc:
+            logger.warning("Task ledger create failed: %s", type(exc).__name__)
+            return None
+
+    def _project_request_phase(self, req: _PendingRequest) -> None:
+        """Best-effort durable projection of the in-memory request phase."""
+
+        led = self._task_ledger
+        if not led or not req.task_id or req.lifecycle.is_terminal:
+            return
+        try:
+            led.set_state(req.task_id, req.lifecycle.phase.value)
+        except Exception as exc:
+            logger.warning("Task ledger phase projection failed: %s", type(exc).__name__)
 
     def _ledger_finish(self, req: _PendingRequest, state: str, *, cleanup_done: bool) -> None:
         led = self._task_ledger
         if led and req.task_id:
-            led.finish(req.task_id, state, cleanup_done=cleanup_done)
+            try:
+                led.finish(req.task_id, state, cleanup_done=cleanup_done)
+            except Exception as exc:
+                logger.warning("Task ledger finish failed: %s", type(exc).__name__)
 
     async def _cleanup_heartbeat(self, req: _PendingRequest) -> bool:
         """Delete/clear the transient heartbeat message for a request.
@@ -601,14 +597,20 @@ class ProjectChatHandler(
             if led and req.task_id:
                 # Offload the (now fsync-backed) ledger write off the event loop
                 # so a heartbeat-path mutation never stalls message delivery.
-                await asyncio.to_thread(led.set_status_message, req.task_id, None)
+                try:
+                    await asyncio.to_thread(led.set_status_message, req.task_id, None)
+                except Exception as exc:
+                    logger.warning(
+                        "Task ledger heartbeat cleanup projection failed: %s",
+                        type(exc).__name__,
+                    )
         return cleaned
 
     async def _maybe_update_heartbeat(self, req: _PendingRequest, now: float) -> None:
         """Send or edit a fail-open long-running task heartbeat."""
         if not getattr(config, "heartbeat_enabled", True):
             return
-        if not req.status_callback or req.future.done():
+        if not req.status_callback or req.future.done() or req.lifecycle.is_terminal:
             return
 
         # Stall guard: if the SDK stream has gone silent for too long the request
@@ -681,9 +683,7 @@ class ProjectChatHandler(
                 if led and req.task_id:
                     # Offload the (now fsync-backed) ledger write off the event
                     # loop so a heartbeat-path mutation never stalls delivery.
-                    await asyncio.to_thread(
-                        led.set_status_message, req.task_id, message_id
-                    )
+                    await asyncio.to_thread(led.set_status_message, req.task_id, message_id)
         except Exception as e:
             logger.warning(
                 "Heartbeat update failed for user %s chat %s: %s",
@@ -696,12 +696,9 @@ class ProjectChatHandler(
         path = getattr(self._config, "heartbeat_duration_log_path", None)
         if path is None:
             bot_data_dir = (
-                getattr(self._config, "bot_data_dir", None)
-                or self.project_root / ".telegram_bot"
+                getattr(self._config, "bot_data_dir", None) or self.project_root / ".telegram_bot"
             )
-            return default_duration_log_path(
-                Path(bot_data_dir)
-            )
+            return default_duration_log_path(Path(bot_data_dir))
         return Path(path)
 
     def _load_heartbeat_forecast(self, req: _PendingRequest) -> None:
@@ -724,7 +721,7 @@ class ProjectChatHandler(
 
     def _should_refresh_typing(self, req: _PendingRequest, now: float) -> bool:
         """Return whether Telegram typing should still be asserted for a request."""
-        if req.future.done() or req.awaiting_permission:
+        if req.future.done() or req.lifecycle.is_terminal or req.awaiting_permission:
             return False
         # After any visible draft/tool progress, stop typing entirely. Telegram
         # draft edits do not clear typing; progress/heartbeat should represent

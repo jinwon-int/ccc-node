@@ -133,9 +133,7 @@ class TaskLedger:
         return {}
 
     def _write(self, records: Dict[str, Dict[str, Any]]) -> None:
-        payload = json.dumps(
-            records, ensure_ascii=False, separators=(",", ":")
-        ).encode("utf-8")
+        payload = json.dumps(records, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         # Preserve the current-good file as .bak before overwriting, mirroring
         # SessionStore's durability contract (#352). Best-effort: a backup hiccup
         # must never block the primary write (fail-open ledger).
@@ -168,8 +166,10 @@ class TaskLedger:
                 return None
 
     # --- lifecycle -------------------------------------------------------------
-    def create(self, user_id: int, chat_id: int) -> str:
+    def create(self, user_id: int, chat_id: int, *, initial_state: str = WORKING) -> str:
         """Register a new in-flight request; returns its task id."""
+        if initial_state not in {WORKING, WAITING_FOR_TURN, INPUT_REQUIRED}:
+            raise ValueError(f"invalid initial task state: {initial_state}")
         task_id = uuid.uuid4().hex
 
         def _do(records):
@@ -177,7 +177,7 @@ class TaskLedger:
                 "task_id": task_id,
                 "user_id": int(user_id),
                 "chat_id": int(chat_id),
-                "state": WORKING,
+                "state": initial_state,
                 "status_message_id": None,
                 "created_at": _utc_now_iso(),
                 "updated_at": _utc_now_iso(),
@@ -200,9 +200,7 @@ class TaskLedger:
 
         self._mutate(_do)
 
-    def set_status_message(
-        self, task_id: Optional[str], message_id: Optional[int]
-    ) -> None:
+    def set_status_message(self, task_id: Optional[str], message_id: Optional[int]) -> None:
         """Register (or clear) the transient status message projected from this task."""
         if not task_id:
             return
