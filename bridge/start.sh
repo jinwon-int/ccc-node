@@ -514,15 +514,40 @@ render_status_from_health() {
 
 # ── Action handlers ──
 
+# MainPID of the active systemd service that manages THIS bridge, if any (empty
+# when no systemd unit owns it, systemctl is unavailable, or the unit is
+# inactive). Delegates the scope/unit-name/ownership rules to service-systemd.sh
+# so --status agrees with --restart on what "managed" means.
+service_managed_main_pid() {
+    local main_pid
+    main_pid="$("$SCRIPT_DIR/service-systemd.sh" main-pid 2>/dev/null)" || return 1
+    [ -n "$main_pid" ] && [ "$main_pid" != "0" ] || return 1
+    printf '%s\n' "$main_pid"
+}
+
 # Shared fallback for do_status when the pid file is missing or stale: a bot
 # process for this project may still be alive (unmanaged — e.g. its pid file
 # was deleted by a dying concurrent instance, or it was started foreground in
 # an ssh session). Report it instead of declaring the bot dead.
 report_unmanaged_or_dead() {
-    local reason="$1" live_pids agent_label
+    local reason="$1" live_pids agent_label managed_pid
     agent_label="$(configured_agent_label)"
     live_pids="$(find_project_bot_pids | tr '\n' ' ' | sed 's/ $//')"
     if [ -n "$live_pids" ]; then
+        # Reconcile with the service manager first: if the live project bot is
+        # the active systemd MainPID, the bot is genuinely service-managed and
+        # healthy — its pid file was merely lost to the concurrent-instance race
+        # (see find_project_bot_pids). Report the true health snapshot as
+        # "available" instead of "degraded" so fleet watchdogs and operators are
+        # not misled by a bookkeeping gap the service manager already covers.
+        managed_pid="$(service_managed_main_pid 2>/dev/null || true)"
+        if [ -n "$managed_pid" ] && kill -0 "$managed_pid" 2>/dev/null \
+            && printf ' %s ' "$live_pids" | grep -q " $managed_pid "; then
+            render_status_from_health \
+                "$HEALTH_FILE" "$managed_pid" "$HEALTH_STALE_SECONDS" \
+                "$(configured_agent_provider)"
+            return 0
+        fi
         echo "🟡 Bot status: degraded"
         print_component_status "Process" "alive" "unmanaged PID(s): $live_pids ($reason)"
         print_component_status "Service" "degraded" "running without pid file; not recoverable by --status/--stop bookkeeping"

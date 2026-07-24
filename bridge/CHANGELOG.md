@@ -8,6 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **`--status` mis-reported a healthy, systemd-managed bridge as `degraded` when
+  its pid file was lost to the concurrent-instance race.** When the pid file is
+  missing or stale but a live project bot is the active systemd `MainPID`,
+  `--status` now reconciles against the service manager and renders the real
+  health snapshot (`available`) instead of `degraded (no PID file)`. A new
+  `service-systemd.sh main-pid` subcommand exposes the active unit's `MainPID`
+  using the same conservative ownership rule as `is-managed`, so `--status`,
+  `--restart`, and the fleet watchdogs agree on what "managed" means. Genuinely
+  unmanaged orphans (no systemd owner) still report `degraded`.
 - **A missing provider terminal event could still pin the next Telegram request
   before its first runtime event (#625).** Requests now enter an explicit
   `waiting-for-turn` ledger/health state and have a separate bounded admission
