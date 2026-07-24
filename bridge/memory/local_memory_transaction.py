@@ -339,8 +339,12 @@ class LocalMemoryTransaction:
         )
 
     def _restore_before(self, manifest: Mapping[str, object]) -> None:
+        # Authenticate every body-bearing pre-image before mutating either
+        # target.  Otherwise a corrupt later snapshot could leave the first
+        # target restored and the second target unchanged.
+        preimages = {name: self._read_before(manifest, name) for name in _TARGETS}
         for name in _TARGETS:
-            self._write_target(name, self._read_before(manifest, name))
+            self._write_target(name, preimages[name])
         if not self._state_matches(self._read_targets(), manifest, "before"):
             raise LocalMemoryTransactionError("rollback restore verification failed")
 

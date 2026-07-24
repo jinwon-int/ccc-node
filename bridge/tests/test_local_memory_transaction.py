@@ -202,6 +202,31 @@ def test_recovery_finishes_a_partial_undo_idempotently(
     assert (state / "resume.md").read_bytes() == b"old resume\n"
 
 
+def test_rollback_authenticates_all_preimages_before_mutating_targets(
+    tmp_path: Path,
+) -> None:
+    state = private_state(tmp_path)
+    write_state(state, "memory-facts.jsonl", b"old facts\n")
+    write_state(state, "resume.md", b"old resume\n")
+    result = LocalMemoryTransaction(state).commit(
+        replace_both(b"new facts\n", b"new resume\n"),
+        provider="codex",
+        actor="distill",
+        tool="local-memory-sink",
+        session="job",
+        diff="mode-both",
+    )
+    assert result.action_id
+    action = state / "memory-rollback" / "actions" / result.action_id
+    (action / "before-resume.md").write_bytes(b"corrupt preimage\n")
+
+    with pytest.raises(LocalMemorySecurityError, match="pre-image hash"):
+        LocalMemoryTransaction(state).rollback(result.action_id)
+
+    assert (state / "memory-facts.jsonl").read_bytes() == b"new facts\n"
+    assert (state / "resume.md").read_bytes() == b"new resume\n"
+
+
 @pytest.mark.parametrize("link_kind", ["symlink", "hardlink"])
 def test_commit_rejects_linked_targets_without_mutating_the_peer(
     tmp_path: Path,
