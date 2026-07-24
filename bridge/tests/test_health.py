@@ -120,6 +120,102 @@ class RuntimeHealthReporterTests(unittest.TestCase):
                 str(other_pid),
             )
 
+    def _spawn_live_pid(self) -> int:
+        """A real, live process pid (a short sleeper) cleaned up after the test."""
+        import subprocess
+
+        proc = subprocess.Popen(["sleep", "30"])
+        self.addCleanup(proc.kill)
+        return proc.pid
+
+    def test_write_pid_does_not_clobber_live_foreign_instance(self):
+        """The survivor race root cause (#703): a newcomer must NOT overwrite a
+        pid file that records a different, live bot — otherwise, when the
+        newcomer later loses the getUpdates conflict and exits, its own cleanup
+        deletes the file and orphans the survivor."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_root = Path(tmpdir)
+            module = self._load_health_module(project_root)
+            reporter = module.RuntimeHealthReporter(project_root / ".telegram_bot")
+
+            survivor_pid = self._spawn_live_pid()
+            reporter.pid_file.parent.mkdir(parents=True, exist_ok=True)
+            reporter.pid_file.write_text(f"{survivor_pid}\n", encoding="utf-8")
+
+            with patch.dict(
+                os.environ,
+                {"BOT_PROCESS_MODE": "foreground", "BOT_OWNS_TOKEN_LOCK": "0"},
+                clear=False,
+            ):
+                # Newcomer initializes while the survivor is alive …
+                reporter.initialize_process()
+                self.assertEqual(
+                    reporter.pid_file.read_text(encoding="utf-8").strip(),
+                    str(survivor_pid),
+                    "newcomer must not clobber a live survivor's pid file",
+                )
+                # … and when the newcomer exits, it must not delete it.
+                reporter.cleanup_runtime_files()
+
+            self.assertTrue(reporter.pid_file.exists())
+            self.assertEqual(
+                reporter.pid_file.read_text(encoding="utf-8").strip(),
+                str(survivor_pid),
+            )
+
+    def test_write_pid_claims_file_recording_dead_pid(self):
+        """Legitimate restart: a pid file recording a dead pid is reclaimed."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_root = Path(tmpdir)
+            module = self._load_health_module(project_root)
+            reporter = module.RuntimeHealthReporter(project_root / ".telegram_bot")
+
+            reporter.pid_file.parent.mkdir(parents=True, exist_ok=True)
+            reporter.pid_file.write_text("999999\n", encoding="utf-8")  # dead
+
+            with patch.dict(
+                os.environ,
+                {"BOT_PROCESS_MODE": "foreground", "BOT_OWNS_TOKEN_LOCK": "0"},
+                clear=False,
+            ):
+                reporter.initialize_process()
+
+            self.assertEqual(
+                reporter.pid_file.read_text(encoding="utf-8").strip(),
+                str(os.getpid()),
+            )
+
+    def test_cleanup_preserves_token_lock_owned_by_live_survivor(self):
+        """A losing instance (BOT_OWNS_TOKEN_LOCK=1) must not delete a token
+        lock the survivor has overwritten with its own live pid (#703)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_root = Path(tmpdir)
+            module = self._load_health_module(project_root)
+            reporter = module.RuntimeHealthReporter(project_root / ".telegram_bot")
+
+            lock_file = project_root / ".telegram_bot" / "token.lock"
+            lock_file.parent.mkdir(parents=True, exist_ok=True)
+            survivor_pid = self._spawn_live_pid()
+            lock_file.write_text(f"{survivor_pid}\n", encoding="utf-8")
+
+            with patch.dict(
+                os.environ,
+                {
+                    "BOT_PROCESS_MODE": "foreground",
+                    "BOT_TOKEN_LOCK_FILE": str(lock_file),
+                    "BOT_OWNS_TOKEN_LOCK": "1",
+                },
+                clear=False,
+            ):
+                reporter.initialize_process()
+                reporter.cleanup_runtime_files()
+
+            self.assertTrue(lock_file.exists())
+            self.assertEqual(
+                lock_file.read_text(encoding="utf-8").strip(),
+                str(survivor_pid),
+            )
+
     def test_codex_provider_reports_active_agent_and_legacy_alias(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             project_root = Path(tmpdir)
