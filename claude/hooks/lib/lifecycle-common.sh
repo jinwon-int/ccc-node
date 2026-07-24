@@ -91,3 +91,19 @@ ccc_lifecycle_append_line() { # <file> <already-body-free-line>
   chmod 600 "$path" 2>/dev/null || return 1
   printf '%s\n' "$line" >> "$path" 2>/dev/null
 }
+
+ccc_lifecycle_append_unique_line() { # <file> <body-free-line> <opaque-dedup>
+  local path="${1:-}" line="${2:-}" dedup="${3:-}" directory
+  [ -n "$path" ] && [ -n "$dedup" ] || return 1
+  directory="$(dirname "$path")" || return 1
+  ccc_lifecycle_prepare_private_dir "$directory" || return 1
+  if [ -e "$path" ]; then
+    [ -f "$path" ] && [ ! -L "$path" ] && [ -O "$path" ] || return 1
+  else
+    (set -o noclobber; : > "$path") 2>/dev/null || true
+    [ -f "$path" ] && [ ! -L "$path" ] && [ -O "$path" ] || return 1
+  fi
+  chmod 600 "$path" 2>/dev/null || return 1
+  grep -Fq -- "$dedup" "$path" 2>/dev/null && return 0
+  printf '%s\n' "$line" >> "$path" 2>/dev/null
+}

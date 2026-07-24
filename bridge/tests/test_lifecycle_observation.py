@@ -111,6 +111,11 @@ def test_empty_or_unknown_claude_notification_is_noise() -> None:
     assert normalize_claude_hook("Notification", {}) is None
     assert normalize_claude_hook("Notification", {"session_id": "s"}) is None
     assert normalize_claude_hook("Notification", {"message": "   "}) is None
+    assert normalize_claude_hook("Notification", {"message": 123}) is None
+    assert normalize_claude_hook("Notification", {"message": {}}) is None
+    assert normalize_claude_hook(
+        "Notification", {"message": "   ", "notification": "fallback"}
+    ).event is LifecycleEventType.PROVIDER_NOTIFICATION
 
 
 def test_failed_tool_status() -> None:

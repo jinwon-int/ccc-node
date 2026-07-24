@@ -21,7 +21,8 @@ esac
 canonical_input="$(printf '%s' "$input" | jq -cS 'select(type == "object")' 2>/dev/null)"
 [ -n "$canonical_input" ] || exit 0
 message_present="$(printf '%s' "$canonical_input" \
-  | jq -r '((.message // .notification // "") != "")' 2>/dev/null)"
+  | jq -r '[.message?, .notification?]
+           | any(.[]; (type == "string") and test("\\S"))' 2>/dev/null)"
 # Empty/unknown Notification objects are not operator attention. Stop and
 # SessionEnd legitimately carry no message, so this gate is event-specific.
 [ "$EVENT" != "Notification" ] || [ "$message_present" = "true" ] || exit 0
@@ -40,19 +41,27 @@ event_digest=""
 if command -v ccc_lifecycle_digest >/dev/null 2>&1; then
   event_digest="$(ccc_lifecycle_digest "$EVENT:$canonical_input" 2>/dev/null || true)"
 fi
+dedup="${event_digest:+lifecycle:$EVENT:$event_digest}"
 
 record="$(jq -nc --arg ts "$ts" --arg ev "$EVENT" --arg ref "$session_ref" \
-    --argjson present "${message_present:-false}" \
+    --arg dedup "$dedup" --argjson present "${message_present:-false}" \
     '{ts:$ts, event:$ev}
      + (if $ref != "" then {session_ref:$ref} else {} end)
+     + (if $dedup != "" then {dedup:$dedup} else {} end)
      + (if $present then {message_present:true} else {} end)' 2>/dev/null || true)"
-if [ -n "$record" ] && command -v ccc_lifecycle_append_line >/dev/null 2>&1; then
-  ccc_lifecycle_append_line "$LOG" "$record" || true
+if [ -n "$record" ]; then
+  if [ -n "$dedup" ] && command -v ccc_lifecycle_append_unique_line >/dev/null 2>&1; then
+    ccc_lifecycle_append_unique_line "$LOG" "$record" "$dedup" || true
+  elif command -v ccc_lifecycle_append_line >/dev/null 2>&1; then
+    ccc_lifecycle_append_line "$LOG" "$record" || true
+  fi
 fi
 
 if [ "$EVENT" = "Notification" ] \
-   && command -v ccc_lifecycle_append_line >/dev/null 2>&1; then
-  ccc_lifecycle_append_line "$APPROVAL" "$ts	attention-needed" || true
+   && [ -n "$dedup" ] \
+   && command -v ccc_lifecycle_append_unique_line >/dev/null 2>&1; then
+  ccc_lifecycle_append_unique_line \
+    "$APPROVAL" "$ts	attention-needed	$dedup" "$dedup" || true
 fi
 
 # Opt-in (CCC_NOTIFY_TELEGRAM=1): enqueue an owner-only Telegram push via the bridge spool.
@@ -66,7 +75,6 @@ if [ "${CCC_NOTIFY_TELEGRAM:-0}" = "1" ] && { [ "$EVENT" = "Notification" ] || [
     node="${CCC_NODE:-$(hostname -s 2>/dev/null || echo node)}"
     summary="Claude notification requires operator attention."
     [ "$EVENT" = "Stop" ] && summary="Claude session stopped or is waiting."
-    dedup="lifecycle:$EVENT:$event_digest"
     tmp="$(mktemp "$SPOOL/.lifecycle-notice.XXXXXX" 2>/dev/null || true)"
     fname="$SPOOL/lifecycle-${EVENT}-${event_digest:0:24}.json"
     if [ -n "$tmp" ] && jq -nc --arg ts "$ts" --arg ev "$EVENT" --arg node "$node" \

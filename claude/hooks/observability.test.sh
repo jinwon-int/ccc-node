@@ -57,12 +57,16 @@ ok "push spool is body-free" \
   '! grep -Fq "$fake_github_token" "$TMP/spool"/*.json && jq -e ".text == \"Claude notification requires operator attention.\"" "$TMP/spool"/*.json >/dev/null'
 ok "push spool carries node label"  'cat "$TMP/spool"/*.json | grep -q "testnode"'
 spool_count="$(find "$TMP/spool" -maxdepth 1 -type f -name '*.json' | wc -l | tr -d '[:space:]')"
+audit_count_before_retry="$(wc -l < "$CCC_AUDIT_LOG" | tr -d '[:space:]')"
+approval_count_before_retry="$(wc -l < "$CCC_APPROVAL_LOG" | tr -d '[:space:]')"
 printf '{  "message" : "approve %s now" }\n' "$fake_github_token" \
   | CCC_NOTIFY_TELEGRAM=1 CCC_NODE=testnode CCC_PUSH_SPOOL="$TMP/spool" bash "$HERE/notify.sh" Notification
 ok "push spool dedups a semantically identical retry" \
   '[ "$(find "$TMP/spool" -maxdepth 1 -type f -name "*.json" | wc -l | tr -d "[:space:]")" = "$spool_count" ]'
 ok "push spool dedup is payload-stable" \
   'jq -e ".dedup | startswith(\"lifecycle:Notification:\")" "$TMP/spool"/*.json >/dev/null'
+ok "notification audit and approval logs dedup the retry" \
+  '[ "$(wc -l < "$CCC_AUDIT_LOG" | tr -d "[:space:]")" = "$audit_count_before_retry" ] && [ "$(wc -l < "$CCC_APPROVAL_LOG" | tr -d "[:space:]")" = "$approval_count_before_retry" ]'
 
 # SessionEnd archives the working-state file
 export CCC_WORKING_STATE="$TMP/ws.md"; export CCC_SESSION_ARCHIVE="$TMP/arch"
@@ -129,8 +133,16 @@ approval_count="$(wc -l < "$CCC_APPROVAL_LOG" | tr -d '[:space:]')"
 printf 'not-json' | bash "$HERE/notify.sh" Notification
 printf '{}' | bash "$HERE/notify.sh" '../../invalid'
 printf '{}' | bash "$HERE/notify.sh" Notification
+printf '{"message":"   "}' | bash "$HERE/notify.sh" Notification
+printf '{"message":123}' | bash "$HERE/notify.sh" Notification
+printf '{"message":{}}' | bash "$HERE/notify.sh" Notification
 ok "malformed/unknown notifications create no false attention" \
   '[ "$(wc -l < "$CCC_AUDIT_LOG" | tr -d "[:space:]")" = "$audit_count" ] && [ "$(wc -l < "$CCC_APPROVAL_LOG" | tr -d "[:space:]")" = "$approval_count" ]'
+
+printf '{"message":"   ","notification":"fallback attention"}' \
+  | bash "$HERE/notify.sh" Notification
+ok "notification falls back to a valid alternate string" \
+  '[ "$(wc -l < "$CCC_AUDIT_LOG" | tr -d "[:space:]")" = $((audit_count + 1)) ] && [ "$(wc -l < "$CCC_APPROVAL_LOG" | tr -d "[:space:]")" = $((approval_count + 1)) ]'
 
 # Refuse direct symlink targets and survive environments without HOME/state.
 printf 'sentinel\n' > "$TMP/external-audit"
