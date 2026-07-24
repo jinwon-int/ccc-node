@@ -12,6 +12,37 @@ trap 'rm -rf "$TMP"' EXIT
 
 ok() { if eval "$2"; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $1"; fi; }
 
+argv_is_deny_all() {
+  local file="$1" expected_calls="$2"
+  awk -v expected="$expected_calls" '
+    $0 == "<CALL>" { calls++ }
+    $0 == "<--tools>" {
+      getline
+      if ($0 == "<>") tools++
+    }
+    $0 == "<--disallowedTools>" {
+      getline
+      if ($0 == "<mcp__*>") mcp++
+    }
+    $0 == "<--strict-mcp-config>" { strict++ }
+    $0 == "<--permission-mode>" {
+      getline
+      if ($0 == "<dontAsk>") mode++
+    }
+    END {
+      exit !(calls == expected && tools == expected && mcp == expected && strict == expected && mode == expected)
+    }
+  ' "$file"
+}
+
+tool_env_is_unset() {
+  local file="$1" expected_calls="$2"
+  awk -v expected="$expected_calls" '
+    $0 == "<unset>" { unset_count++ }
+    END { exit !(NR == expected && unset_count == expected) }
+  ' "$file"
+}
+
 make_transcript() {
   local path="$1"
   cat > "$path" <<'JSONL'
@@ -31,10 +62,21 @@ set -uo pipefail
 mode="${CLAUDE_STUB_MODE:-valid}"
 count_file="${CLAUDE_STUB_COUNT_FILE:?}"
 input_file="${CLAUDE_STUB_INPUT_FILE:-}"
+args_file="${CLAUDE_STUB_ARGS_FILE:-}"
+tool_env_file="${CLAUDE_STUB_TOOL_ENV_FILE:-}"
 count=0
 [ -f "$count_file" ] && count="$(cat "$count_file")"
 count=$((count + 1))
 printf '%s' "$count" > "$count_file"
+if [ -n "$args_file" ]; then
+  {
+    printf '<CALL>\n'
+    printf '<%s>\n' "$@"
+  } >> "$args_file"
+fi
+if [ -n "$tool_env_file" ]; then
+  printf '<%s>\n' "${CCC_ALLOWED_TOOLS-unset}" >> "$tool_env_file"
+fi
 if [ -n "$input_file" ]; then cat > "$input_file"; else cat >/dev/null; fi
 case "$mode" in
   valid)
@@ -62,7 +104,13 @@ SH
   export CLAUDE_STUB_MODE="$mode"
   export CLAUDE_STUB_COUNT_FILE="$TMP/count-$mode"
   export CLAUDE_STUB_INPUT_FILE="$TMP/input-$mode.txt"
+  export CLAUDE_STUB_ARGS_FILE="$TMP/args-$mode.txt"
+  export CLAUDE_STUB_TOOL_ENV_FILE="$TMP/tool-env-$mode.txt"
+  # A hostile inherited wrapper setting must not widen the direct extractor.
+  export CCC_ALLOWED_TOOLS="Bash,Edit,Write"
   : > "$CLAUDE_STUB_COUNT_FILE"
+  : > "$CLAUDE_STUB_ARGS_FILE"
+  : > "$CLAUDE_STUB_TOOL_ENV_FILE"
 }
 
 run_extract() {
@@ -88,6 +136,8 @@ ok "valid JSON exits 0" '[ "$rc" = 0 ]'
 ok "valid JSON is tagged with session metadata" 'jq -e ".session_id == \"sess-test\" and .trigger == \"manual\" and (.honcho|length)==1" <<<"$out" >/dev/null'
 ok "valid JSON carries source cwd metadata" 'jq -e ".source_cwd == \"/root/project-a\" and .source_project == \"-root-project-a\"" <<<"$out" >/dev/null'
 ok "transcript input is redacted before claude" '! grep -q "$fake_github_token\|Bearer abcdefghijklmnopqrstuvwxyz123456" "$TMP/input-valid.txt" && grep -q "REDACTED" "$TMP/input-valid.txt"'
+ok "hostile inherited allowlist cannot enable tools" \
+  'argv_is_deny_all "$TMP/args-valid.txt" 1 && tool_env_is_unset "$TMP/tool-env-valid.txt" 1 && ! grep -q "<Bash>\\|<Edit>\\|<Write>" "$TMP/args-valid.txt"'
 
 export CCC_NODE_ISOLATION_PROFILE=external
 export CCC_WIKI_MEMORY_ENABLED=1
@@ -105,11 +155,15 @@ run_extract "$TRANSCRIPT" drift
 ok "JSON-drift retry exits 0" '[ "$rc" = 0 ] && jq -e ".honcho == [] and .wiki_candidates == []" <<<"$out" >/dev/null'
 ok "JSON-drift retry logs recovery" 'grep -q "recovered on JSON-drift retry" "$TMP/stderr-drift"'
 ok "JSON-drift invokes claude twice" '[ "$(cat "$TMP/count-drift")" = 2 ]'
+ok "JSON-drift retry preserves deny-all tool policy" \
+  'argv_is_deny_all "$TMP/args-drift.txt" 2 && tool_env_is_unset "$TMP/tool-env-drift.txt" 2'
 
 run_extract "$TRANSCRIPT" timeout 1
 ok "timeout retry exits 0" '[ "$rc" = 0 ] && jq -e ".honcho == [] and .wiki_candidates == []" <<<"$out" >/dev/null'
 ok "timeout retry logs recovery" 'grep -q "recovered on timeout retry" "$TMP/stderr-timeout"'
 ok "timeout retry invokes claude twice" '[ "$(cat "$TMP/count-timeout")" = 2 ]'
+ok "timeout retry preserves deny-all tool policy" \
+  'argv_is_deny_all "$TMP/args-timeout.txt" 2 && tool_env_is_unset "$TMP/tool-env-timeout.txt" 2'
 
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
