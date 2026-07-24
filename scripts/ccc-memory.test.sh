@@ -2,6 +2,8 @@
 # Tests for ccc memory cache/index/eval helpers.
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# shellcheck source=claude/hooks/lib/test-stub.sh
+. "$ROOT/claude/hooks/lib/test-stub.sh"
 pass=0; fail=0
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
@@ -20,6 +22,7 @@ state="$TMP/state"
 cache="$TMP/cache"
 mem="$TMP/memories"
 mkdir -p "$state" "$cache" "$mem"
+chmod 700 "$state"
 printf 'test-node\n' > "$state/node.txt"
 printf 'allowed operation policy\n' > "$mem/MEMORY.md"
 printf 'user likes concise Korean reports\n' > "$mem/USER.md"
@@ -633,6 +636,11 @@ ok "installed memory eval finds helper tools beside hooks" '[ "$rc" = 0 ] && jq 
 gr_state="$TMP/guard-state"; gr_hook="$TMP/guard-hookdir"
 mkdir -p "$gr_state/cache" "$gr_state/mem" "$gr_hook"
 gr_fifo="$TMP/guard.fifo"
+gr_setsid_bin="$TMP/guard-setsid-bin"
+mkdir -p "$gr_setsid_bin"
+write_exec_stub "$gr_setsid_bin/setsid" <<'SH'
+exec "$@"
+SH
 cat > "$gr_hook/refresh-memory.sh" <<'SH'
 #!/usr/bin/env bash
 printf 'fired\n' > "$CCC_GUARD_FIFO" 2>/dev/null || true
@@ -646,7 +654,7 @@ gr_run() { # env-prefix args become extra assignments; -u clears the suite-wide 
     bash "$ROOT/claude/hooks/load-memory.sh" SessionStart >/dev/null 2>&1
 }
 rm -f "$gr_fifo"; mkfifo "$gr_fifo"
-gr_run
+gr_run PATH="$gr_setsid_bin:$PATH"
 if read -t 5 _l <>"$gr_fifo"; then gr_default=fired; else gr_default=silent; fi
 ok "load-memory fires the background refresh by default" '[ "$gr_default" = fired ]'
 

@@ -114,30 +114,41 @@ async def test_ten_concurrent_replays_append_each_fact_once(tmp_path: Path) -> N
     assert facts[0]["audience"] == "shared"
 
 
-def test_replay_after_partial_commit_does_not_duplicate_fact(tmp_path: Path) -> None:
+def test_replay_after_partial_commit_recovers_both_targets_then_writes_once(
+    tmp_path: Path,
+) -> None:
     state_dir = tmp_path / "state"
     sink = CodexLocalMemorySink(state_dir, audience="private")
     output = extraction_output()
 
-    from telegram_bot.memory import distill_local_sink as module
+    from telegram_bot.memory.local_memory_transaction import LocalMemoryTransaction
 
-    real_write = module._atomic_write_bytes
+    real_write = LocalMemoryTransaction._write_target
     calls = 0
 
-    def fail_second_write(destination: Path, payload: bytes) -> None:
+    def fail_second_write(
+        transaction: LocalMemoryTransaction,
+        name: str,
+        payload: bytes | None,
+    ) -> None:
         nonlocal calls
         calls += 1
         if calls == 2:
             raise OSError("simulated crash without sensitive body")
-        real_write(destination, payload)
+        real_write(transaction, name, payload)
 
-    with patch.object(module, "_atomic_write_bytes", side_effect=fail_second_write):
+    with patch.object(
+        LocalMemoryTransaction,
+        "_write_target",
+        autospec=True,
+        side_effect=fail_second_write,
+    ):
         with pytest.raises(OSError, match="simulated crash"):
             sink.write(output, job_id=JOB_ID)
 
     replay = sink.write(output, job_id=JOB_ID)
 
-    assert replay.facts_added == 0
+    assert replay.facts_added == 1
     assert replay.resume_written is True
     assert len(read_facts(state_dir / "memory-facts.jsonl")) == 1
 

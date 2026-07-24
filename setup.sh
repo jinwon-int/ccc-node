@@ -351,6 +351,11 @@ run cp "$SRC/scripts/ccc_codex_memory.py" "$CLAUDE_DIR/hooks/ccc_codex_memory.py
 # the canonical secure-fs module beside it instead of maintaining a second copy.
 run cp "$SRC/bridge/utils/secure_fs.py" "$CLAUDE_DIR/hooks/ccc_secure_fs.py"
 run chmod 644 "$CLAUDE_DIR/hooks/ccc_secure_fs.py"
+# Claude's distill committer imports the same crash-recoverable transaction
+# implementation as the Codex bridge.  Install the canonical module beside the
+# existing standalone secure-fs copy instead of forking provider logic.
+run cp "$SRC/bridge/memory/local_memory_transaction.py" "$CLAUDE_DIR/hooks/ccc_local_memory_transaction.py"
+run chmod 644 "$CLAUDE_DIR/hooks/ccc_local_memory_transaction.py"
 # Memory helper tools used by load-memory.sh / refresh-memory.sh in standalone installs.
 run cp "$SRC/scripts/ccc-memory-index.sh" "$CLAUDE_DIR/hooks/ccc-memory-index.sh"
 run cp "$SRC/scripts/ccc_memory_index.py" "$CLAUDE_DIR/hooks/ccc_memory_index.py"

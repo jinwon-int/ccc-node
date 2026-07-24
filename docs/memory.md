@@ -49,6 +49,45 @@ There is no Codex user-session A2A launch path in current ccc-node main. The #47
 - Diagnostics should report counts, statuses, paths, and cache ages only; do not print memory snippets or secrets in fleet reports.
 - On Termux, use `${TMPDIR:-$HOME/tmp}` for scratch and keep state under the user's writable home/state directory.
 
+## Local-memory rollback head
+
+Claude and Codex commit `memory-facts.jsonl` plus `resume.md` through the same
+local transaction implementation. Each changed state directory keeps one
+undoable head under `memory-rollback/`:
+
+- `HEAD` contains an opaque action id.
+- `actions/<id>/` contains owner-only (`0700`/`0600`) pre-images and a
+  body-free manifest.
+- `ledger.jsonl` records bounded actor/tool/target/diff/session-hash metadata;
+  memory bodies, raw session/thread ids, and tokens are never copied into it.
+
+Commit recovery is state-machine based. An interrupted prepared commit is
+either completed when both targets are already at their post-image, or restored
+to both pre-images when the targets are mixed. Interrupted undo resumes from a
+durable `undoing` state. An unknown target hash stops recovery without
+overwriting either file.
+
+Only the latest committed head is undoable. A newer autonomous action, a manual
+edit, an unsafe owner/mode, a symlink/hardlink, a missing/corrupt pre-image, or
+any post-image mismatch makes rollback fail closed. A successful repeated
+request is an idempotent `already-rolled-back` no-op. A new commit marks the
+previous head `superseded` and removes its body-bearing snapshots, so retained
+rollback content is bounded to one action per state directory.
+
+The rollback entry point is manual-only; no hook, cron, Telegram command, or
+provider call invokes it automatically:
+
+```bash
+state="${CCC_STATE_DIR:-$HOME/.claude/state}"
+action_id="$(tr -d '\n' < "$state/memory-rollback/HEAD")"
+python3 "${CCC_CLAUDE_DIR:-$HOME/.claude}/hooks/ccc_local_memory_transaction.py" \
+  rollback --state-dir "$state" --action-id "$action_id"
+```
+
+Audience-scoped memory uses a separate state directory and rollback head for
+each opaque private/shared scope. The operation affects local memory only; it
+does not undo Honcho delivery or a Wiki candidate.
+
 ## Codex distill extraction backend
 
 The Codex write-back path is intentionally staged. The provider-neutral boundary

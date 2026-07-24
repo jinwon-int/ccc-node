@@ -5,6 +5,7 @@
 # append-time dedup, bounded growth, fail-open, and an off-switch. The final
 # block proves the end-to-end recall: index rebuild + search surfaces the fact.
 set -uo pipefail
+umask 077
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/../../.." && pwd)"
 LOCAL_FACTS="$HERE/local-facts.sh"
@@ -109,6 +110,27 @@ if python3 -c "import sqlite3" 2>/dev/null; then
 else
   echo "skip: end-to-end recall (python sqlite3 absent)"
 fi
+
+# ---- provider-neutral two-target rollback transaction (#386) ---------------
+combo="$TMP/combo"; mkdir -m 700 "$combo"
+printf '{"id":"old","text":"old retained fact"}\n' > "$combo/memory-facts.jsonl"
+printf '%s\n' '- 마지막 작업: old resume' > "$combo/resume.md"
+chmod 600 "$combo/memory-facts.jsonl" "$combo/resume.md"
+combo_facts_before="$(cat "$combo/memory-facts.jsonl")"
+combo_resume_before="$(cat "$combo/resume.md")"
+COMBO_PAYLOAD='{"session_id":"raw-session-must-not-enter-ledger","trigger":"sessionend","honcho":[
+  {"kind":"fact","text":"new transactional fact","subject":"ccc"}
+],"resume":{"last_activity":"new transactional resume","pending_action":"","awaiting_user":false,"open_question":"","next_step":"","evidence":[]}}'
+out="$(CCC_STATE_DIR="$combo" python3 "$HERE/local-memory-commit.py" --mode both <<<"$COMBO_PAYLOAD" 2>&1)"; rc=$?
+combo_action="$(tr -d '\n' < "$combo/memory-rollback/HEAD" 2>/dev/null)"
+ok "combined Claude local write commits facts and resume under one action" \
+  '[ "$rc" = 0 ] && grep -q "new transactional fact" "$combo/memory-facts.jsonl" && grep -q "new transactional resume" "$combo/resume.md" && [ "${#combo_action}" = 32 ] && [ "$(jq -r "select(.event==\"commit\") | .action_id" "$combo/memory-rollback/ledger.jsonl" | wc -l)" = 1 ]'
+ok "Claude rollback metadata is owner-only and body-free" \
+  '[ "$(stat -c %a "$combo/memory-rollback")" = 700 ] && [ "$(stat -c %a "$combo/memory-rollback/ledger.jsonl")" = 600 ] && ! grep -R "new transactional fact\\|new transactional resume\\|raw-session-must-not-enter-ledger" "$combo/memory-rollback/ledger.jsonl" "$combo/memory-rollback/actions/"*/manifest.json'
+out="$(python3 "$ROOT/bridge/memory/local_memory_transaction.py" rollback \
+  --state-dir "$combo" --action-id "$combo_action" 2>&1)"; rc=$?
+ok "Claude latest-head rollback restores both exact pre-images" \
+  '[ "$rc" = 0 ] && [ "$(cat "$combo/memory-facts.jsonl")" = "$combo_facts_before" ] && [ "$(cat "$combo/resume.md")" = "$combo_resume_before" ]'
 
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

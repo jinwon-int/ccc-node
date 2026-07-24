@@ -132,8 +132,6 @@ run_bg_pipeline() {
     cp -p "$STASH" "$STASH_DIR/$(date -u +%Y%m%d-%H%M%S)-${BASHPID:-$$}.json" 2>/dev/null || true
   fi
   printf '%s' "$EXTRACT_OUT" > "$STASH" 2>/dev/null
-  bash "$HOOKDIR/distill/resume-write.sh" < "$STASH" >> "$LOG" 2>&1 || \
-    log "resume-write non-zero"
   if [ "$HISTORY_KEEP" -gt 0 ]; then
     # Portable, whitespace-safe prune (busybox find has no -printf; see #449).
     if declare -F prune_keep_newest >/dev/null 2>&1; then
@@ -142,9 +140,15 @@ run_bg_pipeline() {
   fi
 
   if [ "$DRYRUN" = "1" ]; then
-    log "dry-run skipping honcho/wiki push (see $STASH) trigger=$TRIGGER pid=$PIPE_PID elapsed_s=$(elapsed_s)"
+    log "dry-run skipping local/honcho/wiki writes (see $STASH) trigger=$TRIGGER pid=$PIPE_PID elapsed_s=$(elapsed_s)"
     return 0
   fi
+
+  # One provider-neutral local-memory transaction owns resume + facts together.
+  # It persists owner-only pre-images and a body-free rollback head before
+  # returning success; no external sink call runs while its lock is held.
+  python3 "$HOOKDIR/distill/local-memory-commit.py" --mode both < "$STASH" >> "$LOG" 2>&1 || \
+    log "local-memory-commit non-zero"
 
   if honcho_memory_disabled; then
     log "honcho-push skipped reason=disabled"
@@ -158,9 +162,6 @@ run_bg_pipeline() {
     bash "$HOOKDIR/distill/wiki-queue.sh" < "$STASH" >> "$LOG" 2>&1 || \
       log "wiki-queue non-zero"
   fi
-  bash "$HOOKDIR/distill/local-facts.sh" < "$STASH" >> "$LOG" 2>&1 || \
-    log "local-facts non-zero"
-
   log "done trigger=$TRIGGER pid=$PIPE_PID elapsed_s=$(elapsed_s)"
   return 0
 }
