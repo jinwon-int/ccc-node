@@ -144,6 +144,19 @@ printf '{"message":"   ","notification":"fallback attention"}' \
 ok "notification falls back to a valid alternate string" \
   '[ "$(wc -l < "$CCC_AUDIT_LOG" | tr -d "[:space:]")" = $((audit_count + 1)) ] && [ "$(wc -l < "$CCC_APPROVAL_LOG" | tr -d "[:space:]")" = $((approval_count + 1)) ]'
 
+# Digest helpers are best-effort. A missing hash implementation must only
+# disable retry dedup, not suppress the operator-attention marker.
+mkdir "$TMP/fail-digest"
+printf '%s\n' '#!/usr/bin/env bash' 'exit 1' > "$TMP/fail-digest/sha256sum"
+chmod +x "$TMP/fail-digest/sha256sum"
+approval_count="$(wc -l < "$CCC_APPROVAL_LOG" | tr -d '[:space:]')"
+printf '{"message":"digest unavailable"}' \
+  | PATH="$TMP/fail-digest:$PATH" bash "$HERE/notify.sh" Notification
+ok "notification writes approval marker when digest is unavailable" \
+  '[ "$(wc -l < "$CCC_APPROVAL_LOG" | tr -d "[:space:]")" = $((approval_count + 1)) ] && tail -1 "$CCC_APPROVAL_LOG" | grep -q "attention-needed"'
+ok "digest fallback approval remains body-free" \
+  '! grep -Fq "digest unavailable" "$CCC_APPROVAL_LOG"'
+
 # Refuse direct symlink targets and survive environments without HOME/state.
 printf 'sentinel\n' > "$TMP/external-audit"
 ln -s "$TMP/external-audit" "$TMP/audit-link"

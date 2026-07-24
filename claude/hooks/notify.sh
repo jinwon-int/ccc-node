@@ -57,11 +57,14 @@ if [ -n "$record" ]; then
   fi
 fi
 
-if [ "$EVENT" = "Notification" ] \
-   && [ -n "$dedup" ] \
-   && command -v ccc_lifecycle_append_unique_line >/dev/null 2>&1; then
-  ccc_lifecycle_append_unique_line \
-    "$APPROVAL" "$ts	attention-needed	$dedup" "$dedup" || true
+if [ "$EVENT" = "Notification" ]; then
+  if [ -n "$dedup" ] \
+     && command -v ccc_lifecycle_append_unique_line >/dev/null 2>&1; then
+    ccc_lifecycle_append_unique_line \
+      "$APPROVAL" "$ts	attention-needed	$dedup" "$dedup" || true
+  elif command -v ccc_lifecycle_append_line >/dev/null 2>&1; then
+    ccc_lifecycle_append_line "$APPROVAL" "$ts	attention-needed" || true
+  fi
 fi
 
 # Opt-in (CCC_NOTIFY_TELEGRAM=1): enqueue an owner-only Telegram push via the bridge spool.
