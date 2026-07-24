@@ -18,22 +18,27 @@ case "$EVENT" in
 esac
 # A malformed payload is not a lifecycle event. Stay fail-open without creating
 # a false approval marker or a synthetic notification.
-printf '%s' "$input" | jq -e 'type == "object"' >/dev/null 2>&1 || exit 0
+canonical_input="$(printf '%s' "$input" | jq -cS 'select(type == "object")' 2>/dev/null)"
+[ -n "$canonical_input" ] || exit 0
+message_present="$(printf '%s' "$canonical_input" \
+  | jq -r '((.message // .notification // "") != "")' 2>/dev/null)"
+# Empty/unknown Notification objects are not operator attention. Stop and
+# SessionEnd legitimately carry no message, so this gate is event-specific.
+[ "$EVENT" != "Notification" ] || [ "$message_present" = "true" ] || exit 0
 printf '%s' "$input" | bash "$HERE/lifecycle-feed.sh" "$EVENT" >/dev/null 2>&1 || true
 state_dir="$(ccc_lifecycle_state_dir 2>/dev/null || true)"
 LOG="${CCC_AUDIT_LOG:-${state_dir:+$state_dir/audit.jsonl}}"
 APPROVAL="${CCC_APPROVAL_LOG:-${state_dir:+$state_dir/approval-needed.log}}"
 
 ts="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)"
-message_present="$(printf '%s' "$input" | jq -r '((.message // .notification // "") != "")' 2>/dev/null)"
-sid="$(printf '%s' "$input" | jq -r '.session_id // empty' 2>/dev/null)"
+sid="$(printf '%s' "$canonical_input" | jq -r '.session_id // empty' 2>/dev/null)"
 session_ref=""
 if command -v ccc_lifecycle_ref >/dev/null 2>&1; then
   session_ref="$(ccc_lifecycle_ref "$sid" 2>/dev/null || true)"
 fi
 event_digest=""
 if command -v ccc_lifecycle_digest >/dev/null 2>&1; then
-  event_digest="$(ccc_lifecycle_digest "$EVENT:$input" 2>/dev/null || true)"
+  event_digest="$(ccc_lifecycle_digest "$EVENT:$canonical_input" 2>/dev/null || true)"
 fi
 
 record="$(jq -nc --arg ts "$ts" --arg ev "$EVENT" --arg ref "$session_ref" \

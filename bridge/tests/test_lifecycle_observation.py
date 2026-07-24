@@ -48,7 +48,9 @@ def test_event_type_coverage() -> None:
     assert normalize_claude_hook("UserPromptSubmit", {"prompt": "hi", "session_id": "s"}).event is LifecycleEventType.PROMPT_SUBMITTED
     assert normalize_claude_hook("Stop", {"session_id": "s"}).event is LifecycleEventType.TURN_COMPLETED
     assert normalize_claude_hook("SessionEnd", {"session_id": "s"}).event is LifecycleEventType.SESSION_CLOSED
-    assert normalize_claude_hook("Notification", {"session_id": "s"}).event is LifecycleEventType.PROVIDER_NOTIFICATION
+    assert normalize_claude_hook(
+        "Notification", {"session_id": "s", "message": "attention"}
+    ).event is LifecycleEventType.PROVIDER_NOTIFICATION
     assert normalize_codex_app_server({"method": "turn/started", "params": {"threadId": "t", "turnId": "u"}}).event is LifecycleEventType.PROMPT_SUBMITTED
     assert normalize_codex_app_server({"method": "turn/completed", "params": {"turn": {"status": "completed"}}}).event is LifecycleEventType.TURN_COMPLETED
     assert normalize_codex_app_server({"method": "item/commandExecution/requestApproval", "params": {"turnId": "u"}}).event is LifecycleEventType.PROVIDER_NOTIFICATION
@@ -103,6 +105,12 @@ def test_malformed_events_return_none_not_raise() -> None:
     assert normalize_codex_app_server({"method": "item/completed", "params": {}}) is None
     assert normalize_codex_app_server({"method": "unknown/method", "params": {}}) is None
     assert normalize_codex_app_server("nope") is None  # type: ignore[arg-type]
+
+
+def test_empty_or_unknown_claude_notification_is_noise() -> None:
+    assert normalize_claude_hook("Notification", {}) is None
+    assert normalize_claude_hook("Notification", {"session_id": "s"}) is None
+    assert normalize_claude_hook("Notification", {"message": "   "}) is None
 
 
 def test_failed_tool_status() -> None:
