@@ -79,7 +79,10 @@ class ManualClaudeSdkClient:
 
     def __init__(self, options: ClaudeAgentOptions) -> None:
         self.options = options
-        self.session_id = options.resume or "claude-unsolicited-session"
+        self.session_id = (
+            options.resume or options.session_id or "claude-unsolicited-session"
+        )
+        self._initialized = False
         self.queries: list[str] = []
         self.turn_scripts: deque[str] = deque()
         self.interrupts = 0
@@ -153,14 +156,17 @@ class ManualClaudeSdkClient:
     # -- SdkClient protocol ------------------------------------------------
 
     async def connect(self) -> None:
-        self.emit(
-            SystemMessage(
-                subtype="init",
-                data={"session_id": self.session_id, "cwd": "/workspace"},
-            )
-        )
+        pass
 
     async def query(self, prompt: str) -> None:
+        if not self._initialized:
+            self._initialized = True
+            self.emit(
+                SystemMessage(
+                    subtype="init",
+                    data={"session_id": self.session_id, "cwd": "/workspace"},
+                )
+            )
         self.queries.append(prompt)
         script = self.turn_scripts.popleft() if self.turn_scripts else "answer"
         if script == "answer":
@@ -437,6 +443,7 @@ class ClaudeRuntimeUnsolicitedTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             [type(frame).__name__ for frame in frames],
             [
+                "SystemMessage",  # first-query session initialization
                 "AssistantMessage",  # turn flow
                 "ResultMessage",  # turn terminal
                 "RateLimitEvent",  # account-level, no owning turn

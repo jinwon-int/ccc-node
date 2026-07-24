@@ -18,6 +18,7 @@ import logging
 from pathlib import Path
 import re
 from typing import Any, Protocol, cast
+import uuid
 
 from claude_agent_sdk import (
     AssistantMessage,
@@ -710,8 +711,16 @@ class ClaudeRuntime:
     async def start_or_resume(self, request: SessionRequest) -> ClaudeSession:
         if self._closed:
             raise RuntimeError("Claude runtime is closed")
-        session = ClaudeSession(self, request.session_id)
+        # In streaming-input mode the real SDK does not emit the initial
+        # system frame until the first query is written.  The neutral runtime
+        # must return a stable session id before ``send_turn`` can be called,
+        # so allocate the UUID here and ask Claude Code to use it rather than
+        # waiting for a frame that cannot arrive yet.
+        session_id = request.session_id or str(uuid.uuid4())
+        session = ClaudeSession(self, session_id)
         options = self._build_options(request, session._handle_permission_request)
+        if request.session_id is None:
+            options.session_id = session_id
         client = self._sdk_client_factory(options)
         await session._start(client, timeout_seconds=self._session_id_timeout_seconds)
         self._sessions.append(session)

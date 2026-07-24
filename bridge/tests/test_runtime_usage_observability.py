@@ -106,7 +106,8 @@ class ScriptedUsageSdkClient:
 
     def __init__(self, options: ClaudeAgentOptions) -> None:
         self.options = options
-        self.session_id = options.resume or "claude-usage-e2e"
+        self.session_id = options.resume or options.session_id or "claude-usage-e2e"
+        self._initialized = False
         self._messages: asyncio.Queue[Message | None] = asyncio.Queue()
 
     def _emit(self, message: Message) -> None:
@@ -115,11 +116,14 @@ class ScriptedUsageSdkClient:
     # -- SdkClient protocol ------------------------------------------------
 
     async def connect(self) -> None:
-        self._emit(
-            SystemMessage(subtype="init", data={"session_id": self.session_id})
-        )
+        pass
 
     async def query(self, prompt: str) -> None:
+        if not self._initialized:
+            self._initialized = True
+            self._emit(
+                SystemMessage(subtype="init", data={"session_id": self.session_id})
+            )
         self._emit(
             AssistantMessage(
                 content=[TextBlock(text="the answer")],
@@ -203,7 +207,8 @@ class AdapterUsageObservabilityTests(unittest.IsolatedAsyncioTestCase):
                 "how much did that cost?", user_id=7, chat_id=70
             )
             self.assertTrue(response.success)
-            self.assertEqual(response.session_id, "claude-usage-e2e")
+            assert response.session_id is not None
+            self.assertEqual(uuid.UUID(response.session_id).version, 4)
 
             # The exact accessor the /usage command reads (bot_commands).
             snapshot = await handler.get_usage(7, 70, response.session_id)

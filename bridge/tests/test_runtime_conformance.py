@@ -489,11 +489,11 @@ class ScriptedClaudeSdkClient:
     """Deterministic fake Claude SDK client driven by canonical turn scripts.
 
     Implements the subset of the ``ClaudeSDKClient`` surface that
-    ``ClaudeRuntime`` uses.  ``connect`` announces the SDK session id via a
-    ``system`` frame (as the CLI does at startup) and ``query`` consumes the
-    next queued script for the session, emitting the matching SDK frames, so
-    the shared conformance scenarios run against the real adapter with no
-    live provider.
+    ``ClaudeRuntime`` uses.  Like the real streaming-input SDK, ``connect``
+    only initializes the transport; the first ``query`` emits the initial
+    ``system`` frame and then consumes the next queued script for the session.
+    This keeps the conformance harness honest about the pre-turn handshake
+    while running without a live provider or subprocess.
     """
 
     def __init__(self, options: ClaudeAgentOptions, state: _ClaudeScriptState) -> None:
@@ -501,9 +501,12 @@ class ScriptedClaudeSdkClient:
         self._state = state
         if options.resume:
             self.session_id = options.resume
+        elif options.session_id:
+            self.session_id = options.session_id
         else:
             state.session_counter += 1
             self.session_id = f"claude-session-{state.session_counter}"
+        self._initialized = False
         self._messages: asyncio.Queue[Message | None] = asyncio.Queue()
         self._tasks: list[asyncio.Task[None]] = []
 
@@ -629,12 +632,7 @@ class ScriptedClaudeSdkClient:
     # -- SdkClient protocol ------------------------------------------------
 
     async def connect(self) -> None:
-        self._emit(
-            SystemMessage(
-                subtype="init",
-                data={"session_id": self.session_id, "cwd": "/workspace"},
-            )
-        )
+        pass
 
     async def receive_messages(self) -> AsyncIterator[Message]:
         while True:
@@ -644,6 +642,14 @@ class ScriptedClaudeSdkClient:
             yield message
 
     async def query(self, prompt: str) -> None:
+        if not self._initialized:
+            self._initialized = True
+            self._emit(
+                SystemMessage(
+                    subtype="init",
+                    data={"session_id": self.session_id, "cwd": "/workspace"},
+                )
+            )
         self._state.turn_starts.append((self.session_id, prompt))
         self._state.turn_counter += 1
         turn_id = f"turn-{self._state.turn_counter}"
