@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Tests for bridge/start.sh --restart (atomic stop→start→verify) and the
 # service-systemd.sh is-managed probe it uses. Hermetic: fake HOME, fake
-# CCC_SYSTEMD_DIR, stubbed systemctl, fake bot processes (plain sleepers) and
-# a CCC_BRIDGE_RESTART_SPAWN fake start command — the real bridge on this
-# node is never probed, signaled, or started.
+# CCC_SYSTEMD_DIR, stubbed systemctl, owned fake bot/provider processes and a
+# CCC_BRIDGE_RESTART_SPAWN fake start command — the real bridge on this node is
+# never probed, signaled, or started.
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 START="$HERE/start.sh"
@@ -15,6 +15,7 @@ okc() { if [ "$1" = "$2" ]; then pass=$((pass+1)); else fail=$((fail+1)); echo "
 TMP="$(mktemp -d)"
 SPAWNED_PIDS="$TMP/spawned.pids"
 : > "$SPAWNED_PIDS"
+SELF_PARENT=""
 cleanup() {
     # Only ever kill pids we spawned AND that are still plain `sleep`
     # processes — never a blind kill of pid-file contents.
@@ -26,6 +27,13 @@ cleanup() {
             kill "$p" 2>/dev/null || true
         fi
     done < "$SPAWNED_PIDS"
+    if [ -n "$SELF_PARENT" ] && kill -0 "$SELF_PARENT" 2>/dev/null; then
+        local self_args
+        self_args="$(tr '\0' ' ' < "/proc/$SELF_PARENT/cmdline" 2>/dev/null || true)"
+        case "$self_args" in
+            *"$TMP/fake-provider-self"*) kill "$SELF_PARENT" 2>/dev/null || true ;;
+        esac
+    fi
     rm -rf "$TMP"
 }
 trap cleanup EXIT
@@ -84,6 +92,53 @@ run env CCC_SYSTEMD_DIR="$SD_MANAGED" CCC_SYSTEMCTL="$SC_INACTIVE" bash "$SSD" i
 okc "$RC" 1 "is-managed: unit file but inactive => not managed (conservative)"
 run env CCC_SYSTEMD_DIR="$SD_EMPTY" CCC_SYSTEMCTL="$SC_OK" bash "$SSD" is-managed
 okc "$RC" 1 "is-managed: no unit file => not managed"
+
+# ---- self-restart: refuse before stop, including inactive systemd drift -----
+# Reproduce the nosuk topology from #706: a systemd unit exists but is inactive,
+# while a detached provider process serves the bot and invokes --restart -d
+# through an in-turn Bash child. The restart driver must return before killing
+# its ancestor or dispatching a replacement.
+new_project self "123456:TEST-restart-self"
+SELF_OUT="$TMP/self.out"
+SELF_RC="$TMP/self.rc"
+SELF_SPAWNED="$TMP/self-spawned"
+FAKE_SELF_SPAWN="$TMP/fake-start-self"
+printf '#!/usr/bin/env bash\ntouch "%s"\nexit 0\n' "$SELF_SPAWNED" > "$FAKE_SELF_SPAWN"
+chmod +x "$FAKE_SELF_SPAWN"
+FAKE_SELF_PROVIDER="$TMP/fake-provider-self"
+cat > "$FAKE_SELF_PROVIDER" <<EOF
+#!/usr/bin/env bash
+echo "\$\$" > "$BD/bot.pid"
+HOME="$HOMEDIR" CCC_SYSTEMD_DIR="$SD_MANAGED" CCC_SYSTEMCTL="$SC_INACTIVE" \\
+    CCC_BRIDGE_RESTART_SPAWN="$FAKE_SELF_SPAWN" \\
+    bash "$START" --path "$PROJ" --restart -d >"$SELF_OUT" 2>&1
+printf '%s\\n' "\$?" > "$SELF_RC"
+sleep 300 &
+keeper=\$!
+echo "\$keeper" >> "$SPAWNED_PIDS"
+wait "\$keeper"
+EOF
+chmod +x "$FAKE_SELF_PROVIDER"
+bash "$FAKE_SELF_PROVIDER" &
+SELF_PARENT=$!
+for _ in $(seq 1 100); do
+    [ -s "$SELF_RC" ] && break
+    sleep 0.05
+done
+SELF_RESULT="$(cat "$SELF_RC" 2>/dev/null || echo missing)"
+okc "$SELF_RESULT" 5 "in-bridge restart exits 5 before destructive stop"
+ok "self-restart leaves the serving ancestor alive" \
+   'kill -0 "$SELF_PARENT" 2>/dev/null'
+ok "self-restart leaves the pid file untouched" \
+   '[ "$(cat "$BD/bot.pid")" = "$SELF_PARENT" ]'
+ok "self-restart does not dispatch a replacement" '[ ! -e "$SELF_SPAWNED" ]'
+ok "self-restart explains the process-tree refusal" \
+   'grep -q "inside the target bridge process tree" "$SELF_OUT" && grep -q "refused-before-stop" "$SELF_OUT"'
+ok "self-restart gives external systemd and unmanaged recovery lanes" \
+   'grep -q "systemctl.*restart ccc-telegram-bridge.service" "$SELF_OUT" && grep -q "shell outside the bridge tree" "$SELF_OUT"'
+kill "$SELF_PARENT" 2>/dev/null || true
+wait "$SELF_PARENT" 2>/dev/null || true
+SELF_PARENT=""
 
 # ---- foreground restart: replaces the PID and verifies availability ---------
 new_project fg "123456:TEST-restart-fg"

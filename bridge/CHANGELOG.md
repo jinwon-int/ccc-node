@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **An in-turn `start.sh --restart` could stop its own bridge and die before
+  relaunching it (#706).** Restart now walks the caller's parent chain before
+  any destructive action and refuses with exit 5 when the driver is a
+  descendant of the target bot or daemon supervisor. The old bridge remains
+  available and the error names the external systemd/unmanaged recovery lanes;
+  the guard also covers an installed-but-inactive systemd unit alongside a
+  detached serving bridge.
 - **A losing concurrent bot instance could delete the surviving instance's pid /
   token-lock files, orphaning a healthy bot (#703).** Root cause of the false
   `degraded`/DOWN race that PR #702 papered over at the reporting layer: a
