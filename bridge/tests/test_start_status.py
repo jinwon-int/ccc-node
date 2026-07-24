@@ -293,6 +293,87 @@ class StartStatusTests(unittest.TestCase):
             # The decoy must survive a status probe.
             self.assertIsNone(decoy.poll())
 
+    def _make_fake_systemctl(self, bin_dir: Path, main_pid: int) -> Path:
+        """Fake systemctl reporting the bridge unit active with ``main_pid``.
+
+        Handles the optional leading ``--user`` scope flag so it works whether
+        the test runs as root (system scope) or non-root (user scope).
+        """
+        fake = bin_dir / "systemctl"
+        fake.write_text(
+            "#!/bin/sh\n"
+            '[ "$1" = "--user" ] && shift\n'
+            'cmd="$1"; shift\n'
+            "case \"$cmd\" in\n"
+            "  is-active) exit 0 ;;\n"
+            f'  show) echo "{main_pid}" ;;\n'
+            "  *) exit 0 ;;\n"
+            "esac\n",
+            encoding="utf-8",
+        )
+        fake.chmod(0o755)
+        return fake
+
+    def test_status_service_managed_mainpid_reconciles_to_available(self):
+        # A bot whose pid file was lost to the concurrent-instance race but which
+        # is still the active systemd MainPID must report "available" (via the
+        # real health snapshot), not "degraded" — otherwise fleet watchdogs raise
+        # a false DOWN for a healthy, service-managed bridge.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_root = self._prepare_project(tmpdir)
+            decoy = self._spawn_unmanaged_decoy(project_root)
+            # No bot.pid on disk; health is fresh and owned by the live pid.
+            self._write_health(
+                project_root, pid=decoy.pid, service_state="available"
+            )
+
+            fake_bin = Path(tmpdir) / "fake-bin"
+            fake_bin.mkdir(parents=True, exist_ok=True)
+            fake_systemctl = self._make_fake_systemctl(fake_bin, decoy.pid)
+            systemd_dir = Path(tmpdir) / "systemd-units"
+            systemd_dir.mkdir(parents=True, exist_ok=True)
+            (systemd_dir / "ccc-telegram-bridge.service").write_text(
+                "[Service]\n", encoding="utf-8"
+            )
+
+            env = os.environ.copy()
+            env["CCC_SYSTEMCTL"] = str(fake_systemctl)
+            env["CCC_SYSTEMD_DIR"] = str(systemd_dir)
+
+            result = self._run_status(project_root, env=env)
+
+            self.assertEqual(result.returncode, 0)
+            self.assertIn("Bot status: available", result.stdout)
+            self.assertNotIn("degraded", result.stdout)
+            self.assertNotIn("no PID file", result.stdout)
+            self.assertIsNone(decoy.poll())
+
+    def test_status_unmanaged_without_systemd_owner_stays_degraded(self):
+        # Same missing-pid-file situation, but no systemd unit owns the pid
+        # (unit file absent) → the reconcile must NOT fire and the honest
+        # "degraded / no PID file" report is preserved.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_root = self._prepare_project(tmpdir)
+            decoy = self._spawn_unmanaged_decoy(project_root)
+
+            fake_bin = Path(tmpdir) / "fake-bin"
+            fake_bin.mkdir(parents=True, exist_ok=True)
+            fake_systemctl = self._make_fake_systemctl(fake_bin, decoy.pid)
+            empty_systemd_dir = Path(tmpdir) / "systemd-units-empty"
+            empty_systemd_dir.mkdir(parents=True, exist_ok=True)
+
+            env = os.environ.copy()
+            env["CCC_SYSTEMCTL"] = str(fake_systemctl)
+            env["CCC_SYSTEMD_DIR"] = str(empty_systemd_dir)  # no unit file here
+
+            result = self._run_status(project_root, env=env)
+
+            self.assertEqual(result.returncode, 0)
+            self.assertIn("Bot status: degraded", result.stdout)
+            self.assertIn(f"unmanaged PID(s): {decoy.pid}", result.stdout)
+            self.assertIn("no PID file", result.stdout)
+            self.assertIsNone(decoy.poll())
+
     def test_stop_stops_unmanaged_process(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             project_root = self._prepare_project(tmpdir)
