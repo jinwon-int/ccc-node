@@ -173,7 +173,8 @@ done
 
 # 3) shellcheck — scoped to reviewed scripts (blocking); others get bash -n only above.
 say "== shellcheck =="
-SC_SCOPE=(claude/hooks/audit.sh claude/hooks/redact.sh \
+SC_SCOPE=(claude/hooks/audit.sh claude/hooks/redact.sh claude/hooks/lifecycle-feed.sh \
+          claude/hooks/lib/lifecycle-common.sh \
           claude/hooks/notify.sh claude/hooks/statusline.sh claude/headless.sh codex/headless.sh \
           scripts/ccc-service-control.sh \
           scripts/ccc-service-control.test.sh \

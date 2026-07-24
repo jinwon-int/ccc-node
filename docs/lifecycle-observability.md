@@ -31,9 +31,20 @@ parity does not depend on Claude-only hook payloads.
   `build_lifecycle_observer`, gated by **`CCC_LIFECYCLE_AUDIT`**, default **off**)
   taps the bridge event consume loop and records to the ledger. The tap is
   fail-open and a no-op on a default node.
-- Capability matrix: a `lifecycle_observability` axis (both providers
-  `degraded` — contract + opt-in observer landed; hook-payload/evidence/notify
-  parity pending).
+- **Claude Bash-hook feed** — the installed `audit.sh`, `redact.sh`, and
+  `notify.sh` hooks pass their original stdin to `lifecycle-feed.sh`, which
+  invokes the same `telegram_bot.core.lifecycle_hook` CLI. The bridge exports
+  the validated gate and shared ledger path to hook subprocesses. The feed is
+  default-off, fail-open, and supports an explicit `CCC_LIFECYCLE_PYTHON`
+  interpreter override for non-standard installs.
+- **Body-free legacy compatibility records** — the legacy audit/evidence
+  helpers retain their existing opt-in behavior without persisting raw
+  commands, paths, session IDs, or provider notification bodies. Session scope
+  is an opaque hash and evidence is stored as booleans. Owner spool text is a
+  fixed body-free notice.
+- Capability matrix: a `lifecycle_observability` axis (both providers remain
+  `degraded`; Claude hook-payload feed is wired, while provider notification
+  delivery and an official Codex checkpoint boundary remain follow-ups).
 
 ## Event mapping
 
@@ -48,7 +59,8 @@ parity does not depend on Claude-only hook payloads.
 ## Enabling (opt-in, canary)
 
 Set `CCC_LIFECYCLE_AUDIT=true` on a node's bridge `.env` and restart. Live
-tool/turn/approval `AgentEvent`s then record body-free observations into
+tool/turn/approval `AgentEvent`s and installed Claude Bash hooks then record
+body-free observations into
 `<bot_data_dir>/lifecycle-audit/lifecycle-audit.jsonl` (owner-only, bounded,
 deduped). Default off; the tap is fail-open and never blocks a turn.
 
@@ -56,9 +68,10 @@ deduped). Default off; the tap is fail-open and never blocks a turn.
 
 - **Claude hook-payload parity**: `python3 -m telegram_bot.core.lifecycle_hook
   <event>` reads a Claude hook's stdin JSON, normalizes it, and records to the
-  ledger (fail-open, exit 0, no-op unless `CCC_LIFECYCLE_AUDIT`). This gives the
-  Claude path a feed for hook-only events (`prompt_submitted`/`session_closed`);
-  wiring the bash hooks to pipe into it is the operator's opt-in step.
+  ledger (fail-open, exit 0, no-op unless `CCC_LIFECYCLE_AUDIT`). The shipped
+  Bash hooks now feed it for hook-only events such as
+  `prompt_submitted`/`session_closed`; enabling the audit gate remains the
+  operator's opt-in step.
 - **Evidence-gate detection landed** (body-free): each `tool_completed`
   observation carries `file_change` / `verification` booleans (computed from the
   command, which is never stored), and `evidence_gate(observations)` returns a
@@ -71,8 +84,13 @@ deduped). Default off; the tap is fail-open and never blocks a turn.
   the actual Telegram send stays gated by the push notifier
   (`CCC_PUSH_ENABLED`) — no direct provider send. `Notification`/`PreCompact`
   checkpoint parity remain follow-ups.
-- **Redaction unification**: `skill_candidate` and `distill_extraction` now
-  import the canonical set from `bridge/utils/redaction.py`; `agent_cron`
-  (broader owner-spool set) and the bash `audit.sh`/`notify.sh` copies remain.
+- **Redaction residuals**: `skill_candidate` and `distill_extraction` import the
+  canonical set from `bridge/utils/redaction.py`. Bash lifecycle persistence is
+  now body-free instead of maintaining another replacement regex. `agent_cron`
+  still has a broader owner-spool redaction set and remains a follow-up.
+- **No synthetic compaction**: Codex exposes no official `PreCompact` event in
+  the current runtime contract, so this slice does not invent one or promote
+  the capability. Checkpoint parity remains degraded until an official
+  provider boundary can be observed.
 - Autonomous-write rollback/kill-switch is **#386**; Codex memory write-back is
   **#465** — out of scope here.

@@ -429,8 +429,9 @@ CAPABILITY_AXES: tuple[CapabilityAxis, ...] = (
         claude=_degraded(
             "The shared LifecycleObservation contract, credential redaction, and "
             "owner-only bounded audit ledger are landed; live AgentEvents record via "
-            "the opt-in CCC_LIFECYCLE_AUDIT observer. Claude hook-payload parity "
-            "(prompt/session-close) and evidence/notify parity remain follow-ups.",
+            "the opt-in CCC_LIFECYCLE_AUDIT observer, and installed Bash hooks feed "
+            "prompt/tool/notification/turn/session payloads into the same body-free "
+            "CLI path. Provider notification delivery parity remains a follow-up.",
             "#645",
         ),
         codex=_degraded(

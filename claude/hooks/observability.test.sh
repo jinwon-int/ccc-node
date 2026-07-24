@@ -10,7 +10,7 @@ fake_github_token="ghp_""12345678901234567890"
 export CCC_APPROVAL_LOG="$TMP/approval.log"
 ok() { if eval "$2"; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $1"; fi; }
 
-# --- audit.sh: records mutating tools, skips read-only, redacts secrets ---
+# --- audit.sh: records body-free mutation metadata, skips read-only ---
 echo '{"tool_name":"Bash","tool_input":{"command":"git commit -m x"}}' | bash "$HERE/audit.sh"
 ok "audit records Bash"            'grep -q "\"tool\":\"Bash\"" "$CCC_AUDIT_LOG"'
 
@@ -18,13 +18,15 @@ echo '{"tool_name":"Read","tool_input":{"file_path":"/x"}}' | bash "$HERE/audit.
 ok "audit skips Read"              '[ "$(grep -c Read "$CCC_AUDIT_LOG")" = "0" ]'
 
 printf '{"tool_name":"Bash","tool_input":{"command":"deploy --token=%s"}}\n' "$fake_github_token" | bash "$HERE/audit.sh"
-ok "audit redacts ghp token"       'grep -q "<redacted>" "$CCC_AUDIT_LOG" && ! grep -q "ABCDEF1234567890abcdef" "$CCC_AUDIT_LOG"'
+ok "audit stores no raw command/token" \
+  '! grep -Fq "$fake_github_token" "$CCC_AUDIT_LOG" && ! jq -e "has(\"command\")" "$CCC_AUDIT_LOG" >/dev/null'
 
 echo '{"tool_name":"Bash","tool_input":{"command":"curl -H \"authorization: Bearer sk-abcdefghijklmnop1234\""}}' | bash "$HERE/audit.sh"
-ok "audit redacts bearer/sk"       '! grep -q "abcdefghijklmnop1234" "$CCC_AUDIT_LOG"'
+ok "audit stores no bearer/sk"     '! grep -q "abcdefghijklmnop1234" "$CCC_AUDIT_LOG"'
 
 echo '{"tool_name":"Write","tool_input":{"file_path":"/opt/x/foo.md"}}' | bash "$HERE/audit.sh"
-ok "audit records Write file_path" 'grep -q "foo.md" "$CCC_AUDIT_LOG"'
+ok "audit reduces Write path to shape" \
+  '! grep -q "foo.md" "$CCC_AUDIT_LOG" && jq -e "select(.tool==\"Write\") | .target_shape==\"file\" and .file_change==true" "$CCC_AUDIT_LOG" >/dev/null'
 
 # --- redact.sh: warns on raw credential in prompt, silent otherwise ---
 out="$(printf '{"prompt":"please use %s to auth"}\n' "$fake_github_token" | bash "$HERE/redact.sh")"
@@ -36,7 +38,10 @@ ok "redact silent on clean prompt" '[ -z "$out" ]'
 # --- notify.sh: records event + approval marker on Notification ---
 echo '{"message":"Claude needs your permission"}' | bash "$HERE/notify.sh" Notification
 ok "notify logs Notification"      'grep -q "\"event\":\"Notification\"" "$CCC_AUDIT_LOG"'
-ok "notify writes approval marker" 'grep -q "permission" "$CCC_APPROVAL_LOG"'
+ok "notify writes body-free approval marker" \
+  'grep -q "attention-needed" "$CCC_APPROVAL_LOG" && ! grep -q "permission" "$CCC_APPROVAL_LOG"'
+ok "notify stores no raw message" \
+  '! grep -q "Claude needs your permission" "$CCC_AUDIT_LOG" "$CCC_APPROVAL_LOG"'
 
 echo '{}' | bash "$HERE/notify.sh" Stop
 ok "notify logs Stop"              'grep -q "\"event\":\"Stop\"" "$CCC_AUDIT_LOG"'
@@ -48,7 +53,8 @@ ok "push spool off by default"     '[ ! -d "$TMP/spool" ]'
 printf '{"message":"approve %s now"}\n' "$fake_github_token" \
   | CCC_NOTIFY_TELEGRAM=1 CCC_NODE=testnode CCC_PUSH_SPOOL="$TMP/spool" bash "$HERE/notify.sh" Notification
 ok "push spool writes when opt-in"  'ls "$TMP/spool"/*.json >/dev/null 2>&1'
-ok "push spool redacts token"       'cat "$TMP/spool"/*.json | grep -q "\\[REDACTED\\]" && ! cat "$TMP/spool"/*.json | grep -q "ABCDEFGHIJKLMNOPQRSTUVWXYZ012345"'
+ok "push spool is body-free" \
+  '! grep -Fq "$fake_github_token" "$TMP/spool"/*.json && jq -e ".text == \"Claude notification requires operator attention.\"" "$TMP/spool"/*.json >/dev/null'
 ok "push spool carries node label"  'cat "$TMP/spool"/*.json | grep -q "testnode"'
 
 # SessionEnd archives the working-state file
@@ -57,9 +63,10 @@ printf 'objective: test\n' > "$CCC_WORKING_STATE"
 echo '{}' | bash "$HERE/notify.sh" SessionEnd
 ok "SessionEnd archives ws"        'ls "$TMP/arch"/working-state-*.md >/dev/null 2>&1'
 
-# --- audit.sh records session_id; evidence-gate.sh (Stop) uses it ---
+# --- audit.sh stores an opaque session_ref; evidence-gate.sh still scopes by it ---
 echo '{"session_id":"sX","tool_name":"Write","tool_input":{"file_path":"/x/a.py"}}' | bash "$HERE/audit.sh"
-ok "audit records session_id"      'grep -q "\"session_id\":\"sX\"" "$CCC_AUDIT_LOG"'
+ok "audit hashes session_id" \
+  '! grep -q "\"session_id\":\"sX\"" "$CCC_AUDIT_LOG" && jq -e "select(.tool==\"Write\") | (.session_ref | length)==16" "$CCC_AUDIT_LOG" >/dev/null'
 
 out="$(echo '{"session_id":"sX"}' | bash "$HERE/evidence-gate.sh")"
 ok "evidence gate off by default"  '[ -z "$out" ]'
@@ -76,6 +83,49 @@ ok "evidence gate ignores other sessions" '[ -z "$out" ]'
 echo '{"session_id":"sX","tool_name":"Bash","tool_input":{"command":"git diff --stat"}}' | bash "$HERE/audit.sh"
 out="$(echo '{"session_id":"sX"}' | CCC_EVIDENCE_GATE=1 bash "$HERE/evidence-gate.sh")"
 ok "evidence gate passes with verification" '[ -z "$out" ]'
+
+# --- actual Bash hook -> canonical lifecycle CLI feed, opt-in and fail-open ---
+fake_python="$TMP/fake-python"
+printf '%s\n' \
+  '#!/usr/bin/env bash' \
+  'printf "%s\n" "$*" > "$CCC_LIFECYCLE_CAPTURE.args"' \
+  'cat > "$CCC_LIFECYCLE_CAPTURE.stdin"' \
+  'exit 0' > "$fake_python"
+chmod +x "$fake_python"
+export CCC_LIFECYCLE_CAPTURE="$TMP/lifecycle-capture"
+rm -f "$CCC_LIFECYCLE_CAPTURE.args" "$CCC_LIFECYCLE_CAPTURE.stdin"
+echo '{"session_id":"feed-off","tool_name":"Write","tool_input":{"file_path":"/secret/path"}}' \
+  | CCC_LIFECYCLE_PYTHON="$fake_python" bash "$HERE/audit.sh"
+ok "lifecycle feed is disabled by default" '[ ! -e "$CCC_LIFECYCLE_CAPTURE.args" ]'
+
+payload='{"session_id":"feed-on","tool_name":"Write","tool_input":{"file_path":"/secret/path"}}'
+printf '%s' "$payload" \
+  | CCC_LIFECYCLE_AUDIT=1 CCC_LIFECYCLE_PYTHON="$fake_python" bash "$HERE/audit.sh"
+ok "audit hook invokes canonical lifecycle module" \
+  'grep -Fq -- "-m telegram_bot.core.lifecycle_hook PostToolUse" "$CCC_LIFECYCLE_CAPTURE.args"'
+ok "audit hook forwards exact payload only to CLI stdin" \
+  '[ "$(cat "$CCC_LIFECYCLE_CAPTURE.stdin")" = "$payload" ]'
+
+rm -f "$CCC_LIFECYCLE_CAPTURE.args" "$CCC_LIFECYCLE_CAPTURE.stdin"
+printf '%s' '{"message":"sensitive provider body"}' \
+  | CCC_LIFECYCLE_AUDIT=1 CCC_LIFECYCLE_PYTHON="$fake_python" bash "$HERE/notify.sh" Notification
+ok "notification hook invokes canonical lifecycle module" \
+  'grep -Fq -- "-m telegram_bot.core.lifecycle_hook Notification" "$CCC_LIFECYCLE_CAPTURE.args"'
+ok "notification body never reaches legacy files" \
+  '! grep -R -Fq "sensitive provider body" "$CCC_AUDIT_LOG" "$CCC_APPROVAL_LOG" "$TMP/spool"'
+
+# Refuse direct symlink targets and survive environments without HOME/state.
+printf 'sentinel\n' > "$TMP/external-audit"
+ln -s "$TMP/external-audit" "$TMP/audit-link"
+printf '%s' '{"tool_name":"Write","tool_input":{"file_path":"/x"}}' \
+  | CCC_AUDIT_LOG="$TMP/audit-link" bash "$HERE/audit.sh"
+ok "audit refuses a symlink target" \
+  '[ "$(cat "$TMP/external-audit")" = "sentinel" ]'
+
+env -u HOME -u CCC_STATE_DIR -u CCC_AUDIT_LOG \
+  bash "$HERE/notify.sh" Notification <<< '{"message":"no-home-body"}'
+rc=$?
+ok "notify is fail-open without HOME/state" '[ "$rc" = 0 ]'
 
 rm -rf "$TMP"
 echo "----"; echo "PASS=$pass FAIL=$fail"
