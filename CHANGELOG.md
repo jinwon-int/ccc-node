@@ -18,6 +18,10 @@ All notable changes to the Claude Code node harness. Dates are KST.
   suite cover idempotence, comment preservation, invalid TOML, and symlinks.
 
 ### Fixed
+- In-turn bridge self-restarts now fail safely before stop. If a Claude/Codex
+  Bash call runs `start.sh --restart` from below the serving bot or daemon
+  supervisor, the command exits 5 with an external recovery hint instead of
+  killing its own restart driver and leaving Telegram offline. (#706)
 - The Claude bridge runtime now launches its injected web MCP servers via
   `node <abs cli>` on Termux/Android instead of `npx -y <pkg>`. `web_mcp.py`
   (consumed by `claude_runtime.py` as `options.mcp_servers`) hardcoded `npx`,

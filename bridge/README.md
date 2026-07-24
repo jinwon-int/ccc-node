@@ -97,6 +97,7 @@ reviewed `scripts/ccc-self-update.sh` path. See
 ./start.sh --path /path/to/project --debug      # Debug mode
 ./start.sh --path /path/to/project --status     # Check status
 ./start.sh --path /path/to/project --stop       # Stop
+./start.sh --path /path/to/project --restart    # External shell only; refuses in-bridge self-restart
 ./start.sh --path /path/to/project --upgrade    # Update to latest version
 ./start.sh --path /path/to/project --install    # macOS only: install startup service
 ./start.sh --path /path/to/project --uninstall  # macOS only: remove startup service
@@ -111,6 +112,12 @@ reviewed `scripts/ccc-self-update.sh` path. See
 > `Restart=always`, so a direct signal that the bridge handles as a clean exit is recovered; an
 > explicit `systemctl stop` remains stopped. Do not combine systemd with `-d`. Override the unit
 > name with `BRIDGE_SERVICE_NAME=...` to run multiple bridges on one host.
+
+> **Restart ownership.** Run `--restart` from a shell outside the serving
+> bridge process tree. An agent turn that tries to restart its own bridge is
+> refused before stop (exit 5), because stopping the ancestor would also kill
+> the restart driver. For systemd installations use `systemctl restart
+> ccc-telegram-bridge.service`.
 
 ## Usage Examples
 

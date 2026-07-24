@@ -293,7 +293,8 @@ Options:
   --restart           Atomic stop → start → verify-available (add -d to restart
                       into daemon mode). Exits 0 only once --status reports
                       "available"; nonzero with a reason otherwise. Refuses
-                      (exit 3) when systemd/launchd manages the bridge.
+                      when systemd/launchd manages the bridge (exit 3), or
+                      when invoked from inside the target bridge tree (exit 5).
   --upgrade           Update through canonical ccc-self-update and reinstall if changed
   --version           Print the installed ccc-node checkout identity
   --install           Install as macOS launchd startup service
@@ -442,6 +443,64 @@ find_project_bot_pids() {
             _ps_argv_is_project_bot "$pid" && printf '%s\n' "$pid"
         fi
     done < <(pgrep -f -- "-m telegram_bot --path" 2>/dev/null || true)
+}
+
+# Print the direct parent pid of "$1". Linux /proc is preferred because it
+# avoids locale/formatting differences; ps keeps the guard available on macOS
+# and other /proc-less hosts. Failure is conservative: callers simply fall
+# through to the existing lifecycle guards.
+_parent_pid_of() {
+    local pid="$1" ppid=""
+    case "$pid" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    if [ -r "/proc/$pid/status" ]; then
+        ppid="$(awk '$1 == "PPid:" { print $2; exit }' "/proc/$pid/status" 2>/dev/null)"
+    else
+        ppid="$(ps -o ppid= -p "$pid" 2>/dev/null | awk 'NR == 1 { print $1 }')"
+    fi
+    case "$ppid" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    printf '%s\n' "$ppid"
+}
+
+# True when process "$1" is "$2" or descends from it. Bound the walk so a
+# corrupt/test process table cannot loop forever.
+_pid_descends_from() {
+    local current="$1" ancestor="$2" parent hops=0
+    case "$current" in ''|*[!0-9]*) return 1 ;; esac
+    case "$ancestor" in ''|*[!0-9]*) return 1 ;; esac
+    while [ "$current" -gt 0 ] && [ "$hops" -lt 128 ]; do
+        [ "$current" = "$ancestor" ] && return 0
+        parent="$(_parent_pid_of "$current")" || return 1
+        [ "$parent" = "$current" ] && return 1
+        current="$parent"
+        hops=$((hops + 1))
+    done
+    return 1
+}
+
+# Print the target bridge ancestor when this start.sh is itself running below
+# the live bot/supervisor. An in-turn Claude/Codex Bash call has exactly this
+# shape: bridge -> provider -> shell -> start.sh. Letting --restart reach
+# do_stop would terminate the restart driver before its start/readiness half,
+# leaving Telegram offline (#706).
+restart_caller_bridge_ancestor() {
+    local caller="${BASHPID:-$$}" pid
+    for pid in "$(read_pid 2>/dev/null || true)" \
+               "$(read_supervisor_pid 2>/dev/null || true)" \
+               $(find_project_bot_pids); do
+        case "$pid" in
+            ''|*[!0-9]*) continue ;;
+        esac
+        kill -0 "$pid" 2>/dev/null || continue
+        if _pid_descends_from "$caller" "$pid"; then
+            printf '%s\n' "$pid"
+            return 0
+        fi
+    done
+    return 1
 }
 
 # Terminate competing project-bot pollers for this PROJECT_ROOT — other
@@ -986,6 +1045,7 @@ cleanup_token_lock_if_safe() {
 #   2  start-failed       (start invocation failed / process died before ready)
 #   3  supervisor-managed (systemd/launchd owns the bridge; restart it there)
 #   4  not-available-within-timeout
+#   5  self-invoked       (caller is inside the target bridge process tree)
 #
 # Test seams (defaults preserve production behavior):
 #   CCC_BRIDGE_RESTART_STOP_TIMEOUT   seconds to wait for old-process exit (15)
@@ -1013,6 +1073,27 @@ do_restart() {
     local ready_timeout="${CCC_BRIDGE_RESTART_READY_TIMEOUT:-45}"
     local spawn_cmd="${CCC_BRIDGE_RESTART_SPAWN:-$SCRIPT_DIR/start.sh}"
     local waited live ready new_pid spawn_pid="" restart_log="" unit scope_flag
+    local caller_ancestor="" daemon_hint=""
+
+    # Refuse before ANY destructive lifecycle action when this restart driver
+    # is a descendant of the bridge it would stop. This is intentionally before
+    # the service-manager probe: an installed-but-inactive systemd unit can
+    # coexist with a detached serving bridge, which is the exact nosuk incident
+    # topology from #706.
+    caller_ancestor="$(restart_caller_bridge_ancestor 2>/dev/null || true)"
+    if [ -n "$caller_ancestor" ]; then
+        unit="${BRIDGE_SERVICE_NAME:-ccc-telegram-bridge}.service"
+        scope_flag=""
+        [ "$(id -u)" = "0" ] || scope_flag=" --user"
+        [ "$DAEMON_MODE" -eq 1 ] && daemon_hint=" -d"
+        echo "⚠️  Restart refused: this command is running inside the target bridge process tree."
+        echo "   owner=target-bridge caller=descendant action=refused-before-stop"
+        echo "   Stopping it here would terminate the restart driver before start/readiness verification."
+        echo "💡 Re-run from a shell outside the bridge tree:"
+        echo "   systemctl${scope_flag} restart $unit    # systemd installation"
+        echo "   $0 --path \"$PROJECT_ROOT\" --restart${daemon_hint}    # unmanaged installation"
+        exit 5
+    fi
 
     # Supervisor-managed bridges: restarting underneath launchd KeepAlive or
     # systemd Restart=always causes supervisor fights. Conservative check —
