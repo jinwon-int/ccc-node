@@ -180,7 +180,15 @@ fi
 
 call_claude() {
   local sys="$1" input="$2"
-  printf '%s' "$input" | timeout "$TIMEOUT" claude -p \
+  # Extraction is model-only: the fixed downstream dispatchers own every
+  # memory/Wiki write. Do not let permissive parent settings widen this child.
+  # `--allowedTools` only pre-approves, so remove all built-ins, deny inherited
+  # MCP tools/config, and fail unexpected permission requests without prompting.
+  printf '%s' "$input" | env -u CCC_ALLOWED_TOOLS timeout "$TIMEOUT" claude -p \
+    --tools "" \
+    --disallowedTools "mcp__*" \
+    --strict-mcp-config \
+    --permission-mode dontAsk \
     --model "$MODEL" \
     --no-session-persistence \
     --output-format text \

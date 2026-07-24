@@ -114,7 +114,19 @@ call_claude() {
   local sys="$1" input="$2"
   # CLAUDE_SKILL_REVIEW_BG belongs only to the detached runner. Passing it to
   # the provider child makes that child's SessionEnd hook start another runner.
-  printf '%s' "$input" | env -u CLAUDE_SKILL_REVIEW_BG timeout "$TIMEOUT" claude -p \
+  #
+  # This autonomous pass only produces JSON text; every filesystem mutation is
+  # performed later by the fixed, machine-gated installer. Keep the model
+  # runtime tool-free even when the parent environment or user settings are
+  # permissive. `--allowedTools` is not a restriction (it only pre-approves),
+  # so hide every built-in tool, deny inherited MCP tools/config, and make any
+  # unexpected permission request fail instead of prompting.
+  printf '%s' "$input" | env -u CLAUDE_SKILL_REVIEW_BG -u CCC_ALLOWED_TOOLS \
+    timeout "$TIMEOUT" claude -p \
+    --tools "" \
+    --disallowedTools "mcp__*" \
+    --strict-mcp-config \
+    --permission-mode dontAsk \
     --model "$MODEL" \
     --no-session-persistence \
     --output-format text \

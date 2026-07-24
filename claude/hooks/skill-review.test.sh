@@ -11,6 +11,26 @@ trap 'rm -rf "$TMP"' EXIT
 
 ok() { if eval "$2"; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $1"; fi; }
 
+argv_is_deny_all() {
+  local file="$1"
+  awk '
+    $0 == "<--tools>" {
+      getline
+      if ($0 == "<>") tools=1
+    }
+    $0 == "<--disallowedTools>" {
+      getline
+      if ($0 == "<mcp__*>") mcp=1
+    }
+    $0 == "<--strict-mcp-config>" { strict=1 }
+    $0 == "<--permission-mode>" {
+      getline
+      if ($0 == "<dontAsk>") mode=1
+    }
+    END { exit !(tools && mcp && strict && mode) }
+  ' "$file"
+}
+
 make_transcript() {
   local path="$1" turns="${2:-6}"
   mkdir -p "$(dirname "$path")"
@@ -38,6 +58,12 @@ if [ -n "${CLAUDE_ENV_SNAPSHOT:-}" ]; then
     "${CLAUDE_SKILL_REVIEW_INFLIGHT-unset}" \
     "${CLAUDE_DISTILL_INFLIGHT-unset}" \
     > "$CLAUDE_ENV_SNAPSHOT"
+fi
+if [ -n "${CLAUDE_ARGS_SNAPSHOT:-}" ]; then
+  printf '<%s>\n' "$@" > "$CLAUDE_ARGS_SNAPSHOT"
+fi
+if [ -n "${CLAUDE_TOOL_ENV_SNAPSHOT:-}" ]; then
+  printf '<%s>\n' "${CCC_ALLOWED_TOOLS-unset}" > "$CLAUDE_TOOL_ENV_SNAPSHOT"
 fi
 cat <<'JSON'
 {"skill_candidates":[{"name":"deploy-checklist","category":"ops","summary":"Capture a recurring deploy checklist.","reason":"The transcript repeats a multi-step deploy verification flow.","evidence_excerpt":"automate recurring deploy checklist","skill_md":"---\nname: deploy-checklist\ndescription: Capture deploy checklist procedures.\n---\n\n# Deploy Checklist\n\n## When to Use\n- Use when deploy verification repeats.\n\n## Procedure\n1. Inspect git state.\n2. Run the verified checklist.\n\n## Safety\n- Never store raw secrets.\n\n## Verification\n- Confirm the checklist output is recorded.\n"}]}
@@ -119,13 +145,19 @@ ok "disabled background re-entry is logged" 'grep -q "skip reason=disabled" "$ST
 # The provider child keeps recursion guards but must not inherit the runner
 # marker, otherwise its own SessionEnd hook launches another detached review.
 SNAPSHOT_PROVIDER="$TMP/provider-env"
+SNAPSHOT_ARGS="$TMP/provider-args"
+SNAPSHOT_TOOL_ENV="$TMP/provider-tool-env"
 out="$(CLAUDE_SKILL_REVIEW_TRANSCRIPT="$TRANS" CLAUDE_SKILL_REVIEW_SESSION=sess-provider \
   CLAUDE_SKILL_REVIEW_BG=1 CLAUDE_SKILL_REVIEW_INFLIGHT=1 CLAUDE_DISTILL_INFLIGHT=1 \
-  CLAUDE_ENV_SNAPSHOT="$SNAPSHOT_PROVIDER" \
+  CLAUDE_ENV_SNAPSHOT="$SNAPSHOT_PROVIDER" CLAUDE_ARGS_SNAPSHOT="$SNAPSHOT_ARGS" \
+  CLAUDE_TOOL_ENV_SNAPSHOT="$SNAPSHOT_TOOL_ENV" \
+  CCC_ALLOWED_TOOLS="Bash,Edit,Write" \
   bash "$HERE/skill-review/extract.sh" 2>&1)"; rc=$?
 ok "provider environment probe exits 0" '[ "$rc" = 0 ]'
 ok "provider drops runner marker and keeps recursion guards" \
   '[ "$(cat "$SNAPSHOT_PROVIDER" 2>/dev/null)" = "unset|1|1" ]'
+ok "skill extractor denies built-in and MCP tools despite hostile inherited allowlist" \
+  'argv_is_deny_all "$SNAPSHOT_ARGS" && [ "$(cat "$SNAPSHOT_TOOL_ENV")" = "<unset>" ] && ! grep -q "<Bash>\\|<Edit>\\|<Write>" "$SNAPSHOT_ARGS"'
 
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
