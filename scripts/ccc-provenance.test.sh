@@ -5,9 +5,11 @@ set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 START="$ROOT/bridge/start.sh"
+# shellcheck source=claude/hooks/lib/test-stub.sh
+. "$ROOT/claude/hooks/lib/test-stub.sh"
 pass=0
 fail=0
-TMP="$(mktemp -d)"
+TMP="$(ccc_test_tmpdir)" || exit 1
 trap 'rm -rf "$TMP"' EXIT
 
 ok() {

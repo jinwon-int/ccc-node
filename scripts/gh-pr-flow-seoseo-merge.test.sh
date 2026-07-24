@@ -3,7 +3,9 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SCRIPT="$ROOT/claude/skills/gh-pr-flow/merge-via-seoseo.sh"
-TMP="$(mktemp -d)"
+# shellcheck source=claude/hooks/lib/test-stub.sh
+. "$ROOT/claude/hooks/lib/test-stub.sh"
+TMP="$(ccc_test_tmpdir)" || exit 1
 trap 'rm -rf "$TMP"' EXIT
 
 PASS=0

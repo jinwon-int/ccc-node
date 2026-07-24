@@ -2,9 +2,11 @@
 # No-network smoke tests for load-memory.sh and refresh-memory.sh.
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+# shellcheck source=claude/hooks/lib/test-stub.sh
+. "$ROOT/claude/hooks/lib/test-stub.sh"
 pass=0; fail=0
 BASE_TMP="${TMPDIR:-/tmp}"; mkdir -p "$BASE_TMP"
-TMP="$(mktemp -d "$BASE_TMP/ccc-memory-hooks-test.XXXXXX")"
+TMP="$(ccc_test_tmpdir "$BASE_TMP/ccc-memory-hooks-test.XXXXXX")" || exit 1
 trap 'rm -rf "$TMP"' EXIT
 ok() { if eval "$2"; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $1"; fi; }
 
