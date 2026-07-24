@@ -488,9 +488,14 @@ _pid_descends_from() {
 # leaving Telegram offline (#706).
 restart_caller_bridge_ancestor() {
     local caller="${BASHPID:-$$}" pid
-    for pid in "$(read_pid 2>/dev/null || true)" \
-               "$(read_supervisor_pid 2>/dev/null || true)" \
-               $(find_project_bot_pids); do
+    local -a candidates=(
+        "$(read_pid 2>/dev/null || true)"
+        "$(read_supervisor_pid 2>/dev/null || true)"
+    )
+    while IFS= read -r pid; do
+        candidates+=("$pid")
+    done < <(find_project_bot_pids)
+    for pid in "${candidates[@]}"; do
         case "$pid" in
             ''|*[!0-9]*) continue ;;
         esac
