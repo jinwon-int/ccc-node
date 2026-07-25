@@ -5,7 +5,7 @@
 import asyncio
 import logging
 import re
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from typing import Any, Optional
 
 from claude_agent_sdk import RateLimitEvent, ResultMessage
@@ -13,18 +13,9 @@ from claude_agent_sdk import RateLimitEvent, ResultMessage
 from telegram_bot.core.agent_runtime import (
     ApprovalDecision,
     ApprovalRequestEvent,
-    CompletionEvent,
-    ErrorEvent,
     JsonValue as AgentJsonValue,
-    MessageCompletedEvent,
-    ReasoningDeltaEvent,
-    ResultEvent,
     SessionRequest,
-    TextDeltaEvent,
-    ToolCompletedEvent,
-    ToolStartedEvent,
 )
-from telegram_bot.core.heartbeat import tool_label
 from telegram_bot.core.memory_audience import resolve_memory_audience
 from telegram_bot.core.agent_session_registry import ActiveToken
 from telegram_bot.core.project_chat_types import (
@@ -41,6 +32,17 @@ from telegram_bot.core.project_chat_output import TurnOutputBuffer
 from telegram_bot.core.project_chat_event_stream import (
     EventWaitTimeout,
     TimeoutPreservingEventReader,
+)
+from telegram_bot.core.project_chat_turn_state import (
+    ErrorTransition,
+    IgnoredTransition,
+    MessageCompletedTransition,
+    ResultTransition,
+    TextDeltaTransition,
+    ToolCompletedTransition,
+    ToolStartedTransition,
+    TurnEventTransition,
+    TurnEventState,
 )
 from telegram_bot.core.request_lifecycle import (
     RequestPhase,
@@ -280,6 +282,59 @@ class ProjectChatProcessMixin:
         except Exception:
             logger.exception("Provider-neutral progress loop failed")
 
+    async def _apply_turn_event_transition(
+        self,
+        transition: TurnEventTransition,
+        *,
+        now: float,
+        request: _PendingRequest,
+        output: TurnOutputBuffer,
+        streaming_handler: Optional[Any],
+        deliver_pending_interim: Callable[[], Awaitable[None]],
+        usage_mode: str,
+    ) -> None:
+        """Execute the existing ordered effects for one typed turn transition."""
+
+        if isinstance(transition, TextDeltaTransition):
+            # A new text delta after a completed message proves the prior
+            # message was interim rather than final.
+            await deliver_pending_interim()
+            request.last_text_at = now
+            output.append_delta(transition.event.text)
+            if streaming_handler:
+                await streaming_handler.update_if_needed(transition.event.text)
+                request.last_visible_progress_at = now
+            return
+        if isinstance(transition, MessageCompletedTransition):
+            output.complete_message(self._clean_response)
+            return
+        if isinstance(transition, ToolStartedTransition):
+            # Tool work means the completed text should be a separate bubble
+            # now, not at turn completion.
+            await deliver_pending_interim()
+            request.last_tool_at = now
+            if transition.current_tool_label is not None:
+                request.current_tool_label = transition.current_tool_label
+            if streaming_handler:
+                await streaming_handler.add_tool_call(
+                    transition.event.tool_name,
+                    dict(transition.event.arguments),
+                )
+                request.last_visible_progress_at = now
+            return
+        if isinstance(transition, ToolCompletedTransition):
+            request.current_tool_label = transition.current_tool_label
+            return
+        if isinstance(transition, ResultTransition):
+            # Terminal usage payload: the Claude adapter path meters its tokens
+            # here; Codex meters via the runtime's usage-recorder seam.
+            self.record_claude_adapter_result(transition.event, mode=usage_mode)
+            return
+        if isinstance(transition, (ErrorTransition, IgnoredTransition)):
+            # Error payload is retained by TurnEventState for the outer response.
+            # Reasoning remains private; approval/completion are already consumed.
+            return
+
     async def _process_agent_message(  # noqa: C901 -- #348 baseline hotspot
         self,
         *,
@@ -436,7 +491,7 @@ class ProjectChatProcessMixin:
                     )
                 generation = turn_token.generation
                 output = TurnOutputBuffer()
-                terminal_error: ErrorEvent | None = None
+                turn_state = TurnEventState()
 
                 async def handle_approval(
                     event: ApprovalRequestEvent,
@@ -479,7 +534,6 @@ class ProjectChatProcessMixin:
                 )
                 stalled = False
                 admission_stalled = False
-                attempt_recorded = False
 
                 async def deliver_pending_interim() -> None:
                     """Deliver a completed message only after more turn work appears."""
@@ -511,12 +565,7 @@ class ProjectChatProcessMixin:
                     consuming after the bounded grace instead of holding the
                     conversation until the full process timeout.
                     """
-                    nonlocal terminal_error, stalled, admission_stalled
-                    nonlocal attempt_recorded
-                    busy_depth = 0
-                    approval_pending = False
-                    admitted = False
-                    active_tools: dict[str, str] = {}
+                    nonlocal stalled, admission_stalled
                     iterator = session.send_turn(
                         user_message,
                         approval_handler=handle_approval,
@@ -571,11 +620,11 @@ class ProjectChatProcessMixin:
                             stall_eligible = (
                                 stall_grace > 0
                                 and output.has_text
-                                and busy_depth <= 0
-                                and not approval_pending
+                                and turn_state.busy_depth <= 0
+                                and not turn_state.approval_pending
                             )
                             try:
-                                if not admitted and admission_grace > 0:
+                                if not turn_state.admitted and admission_grace > 0:
                                     timed_out, event = await next_event(admission_grace)
                                 elif stall_eligible:
                                     timed_out, event = await next_event(stall_grace)
@@ -585,13 +634,13 @@ class ProjectChatProcessMixin:
                             except StopAsyncIteration:
                                 return
                             if timed_out:
-                                if admitted:
+                                if turn_state.admitted:
                                     stalled = True
                                 else:
                                     admission_stalled = True
                                 return
                             now = asyncio.get_running_loop().time()
-                            if not admitted:
+                            if not turn_state.admitted:
                                 request_admitted = progress_request.lifecycle.admit()
                                 if (
                                     not request_admitted
@@ -606,79 +655,34 @@ class ProjectChatProcessMixin:
                                         "admission was already closed"
                                     )
                                     return
-                                admitted = True
+                                turn_state.mark_admitted()
                                 self._agent_session_registry.admit_if_same(turn_token)
                                 if request_admitted:
                                     self._project_request_phase(progress_request)
                             progress_request.last_event_at = now
-                            if not attempt_recorded:
+                            if turn_state.needs_attempt_recording:
                                 # Claude adapter-path spend boundary (#388):
                                 # ClaudeRuntime has no turn-attempt seam, so
                                 # the first event of an accepted turn meters
                                 # the request. No-op for runtimes (Codex)
                                 # that meter at their own boundary.
-                                attempt_recorded = True
                                 self.record_claude_adapter_attempt(mode=usage_mode)
-                            approval_pending = isinstance(event, ApprovalRequestEvent)
+                                turn_state.mark_attempt_recorded()
                             # Opt-in lifecycle audit (#645): fail-open tap, never
                             # blocks the turn. No-op on a default node.
                             _observer = getattr(self, "_lifecycle_observer", None)
                             if _observer is not None:
                                 _observer.observe(event, session_id=session.session_id)
-                            if isinstance(event, TextDeltaEvent):
-                                # A new text delta after a completed message proves
-                                # the prior message was interim rather than final.
-                                await deliver_pending_interim()
-                                progress_request.last_text_at = now
-                                output.append_delta(event.text)
-                                if streaming_handler:
-                                    await streaming_handler.update_if_needed(event.text)
-                                    progress_request.last_visible_progress_at = now
-                            elif isinstance(event, MessageCompletedEvent):
-                                output.complete_message(self._clean_response)
-                            elif isinstance(event, ToolStartedEvent):
-                                # Look ahead by one meaningful lifecycle event:
-                                # tool work means the completed text should be a
-                                # separate bubble now, not at turn completion.
-                                await deliver_pending_interim()
-                                busy_depth += 1
-                                progress_request.last_tool_at = now
-                                label = tool_label(event.tool_name, dict(event.arguments))
-                                if label is not None:
-                                    active_tools[event.tool_call_id] = label
-                                    progress_request.current_tool_label = label
-                                if streaming_handler:
-                                    await streaming_handler.add_tool_call(
-                                        event.tool_name,
-                                        dict(event.arguments),
-                                    )
-                                    progress_request.last_visible_progress_at = now
-                            elif isinstance(event, ToolCompletedEvent):
-                                busy_depth = max(0, busy_depth - 1)
-                                active_tools.pop(event.tool_call_id, None)
-                                progress_request.current_tool_label = (
-                                    list(active_tools.values())[-1] if active_tools else None
-                                )
-                            elif isinstance(event, ErrorEvent):
-                                terminal_error = event
-                            elif isinstance(event, ResultEvent):
-                                # Terminal usage payload: the Claude adapter
-                                # path meters its tokens here (#388); a no-op
-                                # for Codex, which meters via the runtime's
-                                # usage-recorder seam.
-                                self.record_claude_adapter_result(event, mode=usage_mode)
-                            elif isinstance(
-                                event,
-                                (
-                                    ReasoningDeltaEvent,
-                                    ApprovalRequestEvent,
-                                    CompletionEvent,
-                                ),
-                            ):
-                                # Reasoning remains private. Other normalized
-                                # lifecycle events are consumed so provider
-                                # objects never escape.
-                                continue
+                            transition = turn_state.observe(event)
+                            await self._apply_turn_event_transition(
+                                transition,
+                                now=now,
+                                request=progress_request,
+                                output=output,
+                                streaming_handler=streaming_handler,
+                                deliver_pending_interim=deliver_pending_interim,
+                                usage_mode=usage_mode,
+                            )
                     finally:
                         # Request metering happens at the runtime's spend
                         # boundary (turn/start accepted), not here (#388).
@@ -763,6 +767,7 @@ class ProjectChatProcessMixin:
                 if not content and output.interim_delivered:
                     streamed = True
                 content = content or "(No response)"
+                terminal_error = turn_state.terminal_error
                 if terminal_error is not None:
                     terminal_won = _claim_request_terminal(
                         progress_request,
