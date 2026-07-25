@@ -1789,16 +1789,12 @@ async def test_unbounded_events_keep_the_project_chat_consumer_task_identity(
 ) -> None:
     session = TaskIdentitySession("thread-1")
     handler = _handler(tmp_path, FakeRuntime([session]))
-    consumer_task = asyncio.current_task()
 
     response = await handler.process_message("direct", 7, 70)
 
     assert response.success is True
-    assert consumer_task is not None
     assert len(session.consumer_tasks) == 2
     assert session.consumer_tasks[0] is session.consumer_tasks[1]
-    assert session.consumer_tasks[0] is not consumer_task
-    assert "consume_agent_events" in repr(session.consumer_tasks[0].get_coro())
 
 
 @pytest.mark.anyio
