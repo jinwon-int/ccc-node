@@ -11,6 +11,7 @@ from typing import Any, Optional
 from claude_agent_sdk import RateLimitEvent, ResultMessage
 
 from telegram_bot.core.agent_runtime import (
+    AgentEvent,
     ApprovalDecision,
     ApprovalRequestEvent,
     JsonValue as AgentJsonValue,
@@ -29,9 +30,10 @@ from telegram_bot.core.project_chat_types import (
     _PendingRequest,
 )
 from telegram_bot.core.project_chat_output import TurnOutputBuffer
-from telegram_bot.core.project_chat_event_stream import (
-    EventWaitTimeout,
-    TimeoutPreservingEventReader,
+from telegram_bot.core.project_chat_turn_consumer import (
+    TurnEventDirective,
+    TurnStreamOutcome,
+    consume_turn_stream,
 )
 from telegram_bot.core.project_chat_turn_state import (
     ErrorTransition,
@@ -532,8 +534,6 @@ class ProjectChatProcessMixin:
                 admission_grace = float(
                     getattr(self._config, "turn_admission_timeout_seconds", 0.0) or 0.0
                 )
-                stalled = False
-                admission_stalled = False
 
                 async def deliver_pending_interim() -> None:
                     """Deliver a completed message only after more turn work appears."""
@@ -556,151 +556,78 @@ class ProjectChatProcessMixin:
                             )
                     output.resolve_pending_interim(delivered=delivered)
 
-                async def consume_agent_events() -> None:  # noqa: C901 -- lifecycle router
-                    """Consume one turn's events with a terminal-event stall guard.
-
-                    The same lifecycle invariant as the Claude reader (#411 C):
-                    once answer text exists and no tool or approval is pending,
-                    prolonged silence means the completion event vanished — stop
-                    consuming after the bounded grace instead of holding the
-                    conversation until the full process timeout.
-                    """
-                    nonlocal stalled, admission_stalled
-                    iterator = session.send_turn(
-                        user_message,
-                        approval_handler=handle_approval,
-                    ).__aiter__()
-                    event_reader = TimeoutPreservingEventReader(iterator)
-
-                    async def next_event(timeout: float) -> tuple[bool, Any]:
-                        """Wait without cancelling the iterator before interrupt.
-
-                        The typed reader retains one bounded ``__anext__`` on
-                        timeout. Both real runtimes clear their active-turn
-                        entry when that read is cancelled, so interrupt the
-                        owning provider first and only then reap the read
-                        (#625/#346).
-                        """
-
-                        try:
-                            try:
-                                event = await event_reader.read(timeout)
-                            except EventWaitTimeout:
-                                pass
-                            else:
-                                return False, event
-                            await self._interrupt_agent_session(session)
-                            # Once the real owner has received its interrupt,
-                            # remove this waiter from the old shared lock before
-                            # closing/rotating the owner. Otherwise releasing
-                            # that lock can let the timed-out prompt slip into
-                            # the poisoned session during abort cleanup.
-                            await event_reader.cancel_pending()
-                            abort_stalled_turn = getattr(session, "abort_stalled_turn", None)
-                            if callable(abort_stalled_turn):
-                                try:
-                                    await asyncio.wait_for(
-                                        abort_stalled_turn(),
-                                        timeout=self._agent_interrupt_timeout_seconds,
-                                    )
-                                except TimeoutError:
-                                    logger.warning(
-                                        "Agent stalled-turn abort timed out after %.1fs",
-                                        self._agent_interrupt_timeout_seconds,
-                                    )
-                                except Exception:
-                                    logger.exception("Failed to abort stalled agent turn owner")
-                            return True, None
-                        except asyncio.CancelledError:
-                            await event_reader.cancel_pending()
-                            raise
-
-                    try:
-                        while True:
-                            stall_eligible = (
-                                stall_grace > 0
-                                and output.has_text
-                                and turn_state.busy_depth <= 0
-                                and not turn_state.approval_pending
+                async def apply_agent_event(
+                    event: AgentEvent,
+                    now: float,
+                ) -> TurnEventDirective:
+                    if not turn_state.admitted:
+                        request_admitted = progress_request.lifecycle.admit()
+                        if (
+                            not request_admitted
+                            and progress_request.lifecycle.phase
+                            not in {
+                                RequestPhase.WORKING,
+                                RequestPhase.INPUT_REQUIRED,
+                            }
+                        ):
+                            logger.warning(
+                                "Discarding runtime event after request "
+                                "admission was already closed"
                             )
-                            try:
-                                if not turn_state.admitted and admission_grace > 0:
-                                    timed_out, event = await next_event(admission_grace)
-                                elif stall_eligible:
-                                    timed_out, event = await next_event(stall_grace)
-                                else:
-                                    timed_out = False
-                                    event = await iterator.__anext__()
-                            except StopAsyncIteration:
-                                return
-                            if timed_out:
-                                if turn_state.admitted:
-                                    stalled = True
-                                else:
-                                    admission_stalled = True
-                                return
-                            now = asyncio.get_running_loop().time()
-                            if not turn_state.admitted:
-                                request_admitted = progress_request.lifecycle.admit()
-                                if (
-                                    not request_admitted
-                                    and progress_request.lifecycle.phase
-                                    not in {
-                                        RequestPhase.WORKING,
-                                        RequestPhase.INPUT_REQUIRED,
-                                    }
-                                ):
-                                    logger.warning(
-                                        "Discarding runtime event after request "
-                                        "admission was already closed"
-                                    )
-                                    return
-                                turn_state.mark_admitted()
-                                self._agent_session_registry.admit_if_same(turn_token)
-                                if request_admitted:
-                                    self._project_request_phase(progress_request)
-                            progress_request.last_event_at = now
-                            if turn_state.needs_attempt_recording:
-                                # Claude adapter-path spend boundary (#388):
-                                # ClaudeRuntime has no turn-attempt seam, so
-                                # the first event of an accepted turn meters
-                                # the request. No-op for runtimes (Codex)
-                                # that meter at their own boundary.
-                                self.record_claude_adapter_attempt(mode=usage_mode)
-                                turn_state.mark_attempt_recorded()
-                            # Opt-in lifecycle audit (#645): fail-open tap, never
-                            # blocks the turn. No-op on a default node.
-                            _observer = getattr(self, "_lifecycle_observer", None)
-                            if _observer is not None:
-                                _observer.observe(event, session_id=session.session_id)
-                            transition = turn_state.observe(event)
-                            await self._apply_turn_event_transition(
-                                transition,
-                                now=now,
-                                request=progress_request,
-                                output=output,
-                                streaming_handler=streaming_handler,
-                                deliver_pending_interim=deliver_pending_interim,
-                                usage_mode=usage_mode,
-                            )
-                    finally:
-                        # Request metering happens at the runtime's spend
-                        # boundary (turn/start accepted), not here (#388).
-                        # Run the generator's cleanup (turn bookkeeping, locks)
-                        # even when the stall guard abandoned it mid-turn; this
-                        # also guarantees a late completion event has no
-                        # consumer left, so the answer cannot deliver twice.
-                        await event_reader.cancel_pending()
-                        try:
-                            await iterator.aclose()
-                        except Exception:
-                            pass
+                            return TurnEventDirective.STOP
+                        turn_state.mark_admitted()
+                        self._agent_session_registry.admit_if_same(turn_token)
+                        if request_admitted:
+                            self._project_request_phase(progress_request)
+                    progress_request.last_event_at = now
+                    if turn_state.needs_attempt_recording:
+                        # Claude adapter-path spend boundary (#388): ClaudeRuntime
+                        # has no turn-attempt seam, so the first accepted event
+                        # meters the request. Codex meters at its own boundary.
+                        self.record_claude_adapter_attempt(mode=usage_mode)
+                        turn_state.mark_attempt_recorded()
+                    # Opt-in lifecycle audit (#645): fail-open tap, never blocks
+                    # the turn. No-op on a default node.
+                    _observer = getattr(self, "_lifecycle_observer", None)
+                    if _observer is not None:
+                        _observer.observe(event, session_id=session.session_id)
+                    transition = turn_state.observe(event)
+                    await self._apply_turn_event_transition(
+                        transition,
+                        now=now,
+                        request=progress_request,
+                        output=output,
+                        streaming_handler=streaming_handler,
+                        deliver_pending_interim=deliver_pending_interim,
+                        usage_mode=usage_mode,
+                    )
+                    return TurnEventDirective.CONTINUE
 
-                await asyncio.wait_for(
-                    consume_agent_events(), timeout=self._process_timeout_seconds
+                async def interrupt_turn() -> None:
+                    await self._interrupt_agent_session(session)
+
+                abort_stalled_turn = getattr(session, "abort_stalled_turn", None)
+                if not callable(abort_stalled_turn):
+                    abort_stalled_turn = None
+                turn_outcome = await asyncio.wait_for(
+                    consume_turn_stream(
+                        session.send_turn(
+                            user_message,
+                            approval_handler=handle_approval,
+                        ).__aiter__(),
+                        state=turn_state,
+                        has_text=lambda: output.has_text,
+                        on_event=apply_agent_event,
+                        interrupt=interrupt_turn,
+                        abort_stalled_turn=abort_stalled_turn,
+                        admission_timeout_seconds=admission_grace,
+                        terminal_stall_seconds=stall_grace,
+                        interrupt_timeout_seconds=self._agent_interrupt_timeout_seconds,
+                    ),
+                    timeout=self._process_timeout_seconds,
                 )
 
-                if admission_stalled:
+                if turn_outcome is TurnStreamOutcome.ADMISSION_TIMEOUT:
                     terminal_won = _claim_request_terminal(
                         progress_request,
                         RequestPhase.TIMEOUT,
@@ -726,7 +653,7 @@ class ProjectChatProcessMixin:
                         session_id=session.session_id,
                     )
 
-                if stalled:
+                if turn_outcome is TurnStreamOutcome.TERMINAL_STALL:
                     terminal_won = _claim_request_terminal(
                         progress_request,
                         RequestPhase.COMPLETED,
