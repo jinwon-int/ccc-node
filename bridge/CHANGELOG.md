@@ -13,7 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   current runtime error in one independently tested, I/O-free per-turn state
   object. Typed transitions preserve the existing event order while runtime
   reads, approvals, output delivery, lifecycle authority, session ownership,
-  metering effects, and finalization remain with the orchestrator. The
+  metering effects, and finalization remain with the orchestrator. Tool depth
+  is derived from distinct active call IDs, so duplicate starts and unrelated
+  completions cannot prematurely enable or indefinitely suppress stall
+  recovery. The
   `_process_agent_message` complexity baseline drops from 82 to 72 and its
   nested event consumer from 30 to 20 without adding a new suppression.
 - **Typed timeout-preserving ProjectChat event reads (#346).** Bounded

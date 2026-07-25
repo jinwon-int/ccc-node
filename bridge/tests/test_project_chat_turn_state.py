@@ -4,6 +4,7 @@ from typing import cast
 
 import pytest
 
+from telegram_bot.core import project_chat_turn_state as turn_state_module
 from telegram_bot.core.agent_runtime import (
     AgentEvent,
     ApprovalRequestEvent,
@@ -37,6 +38,7 @@ def test_turn_state_starts_without_lifecycle_or_io_authority() -> None:
     assert state.needs_attempt_recording is True
     assert state.terminal_error is None
     assert state.active_tools == {}
+    assert state.active_tool_ids == set()
     assert state.current_tool_label is None
 
 
@@ -133,6 +135,68 @@ def test_duplicate_or_unknown_tool_completion_never_makes_depth_negative() -> No
     assert isinstance(second, ToolCompletedTransition)
     assert state.busy_depth == 0
     assert state.active_tools == {}
+
+
+def test_unknown_completion_cannot_release_a_different_active_tool() -> None:
+    state = TurnEventState()
+    state.observe(ToolStartedEvent("tool-1", "Bash", {"command": "sleep 1"}))
+
+    state.observe(
+        ToolCompletedEvent("unknown", "Bash", result=None, success=False)
+    )
+
+    assert state.busy_depth == 1
+    assert state.active_tool_ids == {"tool-1"}
+    assert state.current_tool_label == "Bash: sleep 1"
+
+    state.observe(
+        ToolCompletedEvent("tool-1", "Bash", result=None, success=True)
+    )
+
+    assert state.busy_depth == 0
+    assert state.active_tool_ids == set()
+
+
+def test_duplicate_start_counts_one_active_call_id() -> None:
+    state = TurnEventState()
+    started = ToolStartedEvent("tool-1", "Bash", {"command": "echo duplicate"})
+
+    state.observe(started)
+    state.observe(started)
+
+    assert state.busy_depth == 1
+    assert state.active_tool_ids == {"tool-1"}
+    assert state.active_tools == {"tool-1": "Bash: echo duplicate"}
+
+    state.observe(
+        ToolCompletedEvent("tool-1", "Bash", result=None, success=True)
+    )
+
+    assert state.busy_depth == 0
+    assert state.active_tool_ids == set()
+    assert state.active_tools == {}
+
+
+def test_tool_without_label_still_balances_by_call_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(turn_state_module, "tool_label", lambda _name, _input: None)
+    state = TurnEventState()
+
+    started = state.observe(ToolStartedEvent("tool-1", "Custom", {}))
+
+    assert isinstance(started, ToolStartedTransition)
+    assert started.current_tool_label is None
+    assert state.busy_depth == 1
+    assert state.active_tool_ids == {"tool-1"}
+    assert state.active_tools == {}
+
+    state.observe(
+        ToolCompletedEvent("tool-1", "Custom", result=None, success=True)
+    )
+
+    assert state.busy_depth == 0
+    assert state.active_tool_ids == set()
 
 
 def test_error_projection_preserves_current_latest_error_behavior() -> None:

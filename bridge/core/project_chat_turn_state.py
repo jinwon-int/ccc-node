@@ -79,12 +79,18 @@ class TurnEventState:
     metering, and finalization deliberately remain with the caller.
     """
 
-    busy_depth: int = 0
     approval_pending: bool = False
     admitted: bool = False
     attempt_recorded: bool = False
     terminal_error: ErrorEvent | None = None
     active_tools: dict[str, str] = field(default_factory=dict)
+    active_tool_ids: set[str] = field(default_factory=set)
+
+    @property
+    def busy_depth(self) -> int:
+        """Return the number of distinct active provider tool calls."""
+
+        return len(self.active_tool_ids)
 
     @property
     def current_tool_label(self) -> str | None:
@@ -114,14 +120,15 @@ class TurnEventState:
         if isinstance(event, MessageCompletedEvent):
             return MessageCompletedTransition(event)
         if isinstance(event, ToolStartedEvent):
-            self.busy_depth += 1
+            self.active_tool_ids.add(event.tool_call_id)
             label = tool_label(event.tool_name, dict(event.arguments))
             if label is not None:
                 self.active_tools[event.tool_call_id] = label
             return ToolStartedTransition(event, label)
         if isinstance(event, ToolCompletedEvent):
-            self.busy_depth = max(0, self.busy_depth - 1)
-            self.active_tools.pop(event.tool_call_id, None)
+            if event.tool_call_id in self.active_tool_ids:
+                self.active_tool_ids.remove(event.tool_call_id)
+                self.active_tools.pop(event.tool_call_id, None)
             return ToolCompletedTransition(event, self.current_tool_label)
         if isinstance(event, ErrorEvent):
             self.terminal_error = event
