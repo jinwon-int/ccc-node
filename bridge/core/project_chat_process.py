@@ -38,6 +38,10 @@ from telegram_bot.core.project_chat_types import (
     _PendingRequest,
 )
 from telegram_bot.core.project_chat_output import TurnOutputBuffer
+from telegram_bot.core.project_chat_event_stream import (
+    EventWaitTimeout,
+    TimeoutPreservingEventReader,
+)
 from telegram_bot.core.request_lifecycle import (
     RequestPhase,
     TerminalAttemptKind,
@@ -517,31 +521,32 @@ class ProjectChatProcessMixin:
                         user_message,
                         approval_handler=handle_approval,
                     ).__aiter__()
+                    event_reader = TimeoutPreservingEventReader(iterator)
 
                     async def next_event(timeout: float) -> tuple[bool, Any]:
                         """Wait without cancelling the iterator before interrupt.
 
-                        asyncio.wait_for() cancels ``__anext__`` before raising its
-                        timeout. Both real runtimes clear their active-turn entry
-                        during that cancellation, making the later interrupt a
-                        no-op. Keep the next-event task alive long enough to
-                        interrupt the owning provider turn first, then cancel and
-                        close the iterator (#625).
+                        The typed reader retains one bounded ``__anext__`` on
+                        timeout. Both real runtimes clear their active-turn
+                        entry when that read is cancelled, so interrupt the
+                        owning provider first and only then reap the read
+                        (#625/#346).
                         """
 
-                        pending = asyncio.create_task(iterator.__anext__())
                         try:
-                            done, _ = await asyncio.wait((pending,), timeout=timeout)
-                            if done:
-                                return False, pending.result()
+                            try:
+                                event = await event_reader.read(timeout)
+                            except EventWaitTimeout:
+                                pass
+                            else:
+                                return False, event
                             await self._interrupt_agent_session(session)
                             # Once the real owner has received its interrupt,
                             # remove this waiter from the old shared lock before
                             # closing/rotating the owner. Otherwise releasing
                             # that lock can let the timed-out prompt slip into
                             # the poisoned session during abort cleanup.
-                            pending.cancel()
-                            await asyncio.gather(pending, return_exceptions=True)
+                            await event_reader.cancel_pending()
                             abort_stalled_turn = getattr(session, "abort_stalled_turn", None)
                             if callable(abort_stalled_turn):
                                 try:
@@ -558,8 +563,7 @@ class ProjectChatProcessMixin:
                                     logger.exception("Failed to abort stalled agent turn owner")
                             return True, None
                         except asyncio.CancelledError:
-                            pending.cancel()
-                            await asyncio.gather(pending, return_exceptions=True)
+                            await event_reader.cancel_pending()
                             raise
 
                     try:
@@ -682,6 +686,7 @@ class ProjectChatProcessMixin:
                         # even when the stall guard abandoned it mid-turn; this
                         # also guarantees a late completion event has no
                         # consumer left, so the answer cannot deliver twice.
+                        await event_reader.cancel_pending()
                         try:
                             await iterator.aclose()
                         except Exception:

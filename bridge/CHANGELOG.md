@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Typed timeout-preserving ProjectChat event reads (#346).** Bounded
+  admission and terminal-stall waits now retain one exact provider
+  `__anext__` task without cancelling it on timeout, so ProjectChat can keep
+  the established interrupt-before-cancel order. The reader is independently
+  tested for late events, repeated timeouts, iterator failures, consumer
+  cancellation, and single-consumer ownership while unbounded reads,
+  provider policy, lifecycle state, delivery, and iterator closure remain
+  with the existing orchestrator.
 - **Typed ProjectChat agent-session registry (#346).** Cached wrappers, active
   turn ownership, approval generations, start times, and admission state now
   move through one independently tested registry instead of six parallel
