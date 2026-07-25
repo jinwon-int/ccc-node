@@ -337,8 +337,10 @@ CAPABILITY_AXES: tuple[CapabilityAxis, ...] = (
             "claude/hooks/load-memory.sh."
         ),
         codex=_degraded(
-            "Cold resume re-reads the refreshed global snapshot, but a real provider "
-            "compaction event has not been forced in a live gate."
+            "Cold resume re-reads the refreshed global snapshot, but the app-server "
+            "exposes no official PreCompact/PostCompact event and turn/completed is "
+            "not treated as compaction. Provider compaction checkpoint/reinjection "
+            "therefore remains unverified."
         ),
     ),
     _axis(
@@ -424,22 +426,24 @@ CAPABILITY_AXES: tuple[CapabilityAxis, ...] = (
         "lifecycle_observability",
         RUNTIME_GROUP,
         "Lifecycle observability",
-        "Interactive lifecycle events normalize into one shared, body-free "
-        "LifecycleObservation contract for audit/redact/evidence/notify parity.",
-        claude=_degraded(
-            "The shared LifecycleObservation contract, credential redaction, and "
-            "owner-only bounded audit ledger are landed; live AgentEvents record via "
-            "the opt-in CCC_LIFECYCLE_AUDIT observer, and installed Bash hooks feed "
-            "prompt/tool/notification/turn/session payloads into the same body-free "
-            "CLI path. Provider notification delivery parity remains a follow-up.",
-            "#645",
+        "Explicitly enabled, allowlisted lifecycle metadata normalizes into one "
+        "body-free observation contract for bounded audit and evidence surfacing. "
+        "Compaction checkpoint/reinjection is tracked separately under "
+        "memory_postcompact_reinject.",
+        claude=_supported(
+            "With CCC_LIFECYCLE_AUDIT opt-in, installed hooks and live AgentEvents "
+            "normalize allowlisted prompt/tool/notification/turn/session metadata "
+            "into body-free records. The ledger is bounded, owner-only, and fail-open; "
+            "evidence warnings may enqueue optional body-free owner spool records. "
+            "Final Telegram delivery is outside this capability."
         ),
-        codex=_degraded(
-            "App-server tool/turn/approval events normalize to LifecycleObservation "
-            "and record via the opt-in CCC_LIFECYCLE_AUDIT observer in the live "
-            "consume loop; evidence-gate and notification/checkpoint parity remain "
-            "follow-ups.",
-            "#645",
+        codex=_supported(
+            "With CCC_LIFECYCLE_AUDIT opt-in, allowlisted active-turn tool/turn/"
+            "approval events normalize into body-free records; unsupported notification "
+            "methods are ignored and account telemetry remains separate. The ledger is "
+            "bounded, owner-only, and fail-open; evidence warnings may enqueue optional "
+            "body-free owner spool records. Final Telegram delivery and compaction "
+            "semantics are outside this capability."
         ),
     ),
 )
