@@ -29,6 +29,13 @@ EXECUTION_OWNER_OPERATOR = "owner-operator"
 EXECUTION_STRICT_PROJECT = "strict-project"
 EXECUTION_DISABLED = "disabled"
 
+# Optional egress allowlist for the strict-project Bash sandbox. Empty by
+# default so the historical non-widenable contract (no network) is unchanged;
+# a node opts in via its bridge .env (survives setup.sh). Values are domain
+# patterns forwarded to the SDK sandbox ``network.allowedDomains`` (e.g.
+# ``pypi.org``, ``*.github.com``). Filesystem isolation is untouched.
+SANDBOX_ALLOWED_DOMAINS_ENV = "CCC_BRIDGE_SANDBOX_ALLOWED_DOMAINS"
+
 
 def owner_operator_access_is_safe(
     allowed_user_ids: Optional[Sequence[int]], require_allowlist: bool
@@ -109,6 +116,26 @@ def _sandbox_runtime_read_paths(configured_cli_path: Optional[str] = None) -> Li
     return result
 
 
+def _sandbox_allowed_domains() -> List[str]:
+    """Optional, opt-in egress allowlist for the strict-project Bash sandbox.
+
+    Read from ``CCC_BRIDGE_SANDBOX_ALLOWED_DOMAINS`` (comma/space separated).
+    Default empty preserves the historical no-network contract; only the listed
+    domains become reachable and filesystem isolation is never widened. Order is
+    preserved and duplicates removed.
+    """
+
+    raw = os.getenv(SANDBOX_ALLOWED_DOMAINS_ENV, "")
+    seen: set[str] = set()
+    result: List[str] = []
+    for token in raw.replace(",", " ").split():
+        token = token.strip()
+        if token and token not in seen:
+            seen.add(token)
+            result.append(token)
+    return result
+
+
 def strict_bash_sandbox_settings(
     project_root: Path, configured_cli_path: Optional[str] = None
 ) -> Dict[str, Any]:
@@ -129,7 +156,7 @@ def strict_bash_sandbox_settings(
         *_SANDBOX_RUNTIME_READ_PATHS,
         *_sandbox_runtime_read_paths(configured_cli_path),
     ]
-    return {
+    settings: Dict[str, Any] = {
         "enabled": True,
         "autoAllowBashIfSandboxed": True,
         "failIfUnavailable": True,
@@ -148,6 +175,12 @@ def strict_bash_sandbox_settings(
             "denyWrite": [],
         },
     }
+    # Opt-in egress allowlist (default empty => unchanged no-network contract).
+    # Only network is affected; filesystem denyRead=["/"] isolation is preserved.
+    allowed_domains = _sandbox_allowed_domains()
+    if allowed_domains:
+        settings["network"] = {"allowedDomains": allowed_domains}
+    return settings
 
 
 STRUCTURED_ALLOWED_TOOLS = (
