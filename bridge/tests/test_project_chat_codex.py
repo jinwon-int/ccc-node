@@ -1759,6 +1759,15 @@ class TaskIdentitySession(FakeSession):
         return stream()
 
 
+class TaskIdentityObserver:
+    def __init__(self) -> None:
+        self.consumer_tasks: list[asyncio.Task[object] | None] = []
+
+    def observe(self, event: AgentEvent, *, session_id: str | None) -> None:
+        del event, session_id
+        self.consumer_tasks.append(asyncio.current_task())
+
+
 def _stall_handler(
     tmp_path: Path, runtime: FakeRuntime, monkeypatch: pytest.MonkeyPatch
 ) -> tuple[ProjectChatHandler, list[int]]:
@@ -1789,12 +1798,15 @@ async def test_unbounded_events_keep_the_project_chat_consumer_task_identity(
 ) -> None:
     session = TaskIdentitySession("thread-1")
     handler = _handler(tmp_path, FakeRuntime([session]))
+    observer = TaskIdentityObserver()
+    handler._lifecycle_observer = observer
 
     response = await handler.process_message("direct", 7, 70)
 
     assert response.success is True
     assert len(session.consumer_tasks) == 2
-    assert session.consumer_tasks[0] is session.consumer_tasks[1]
+    assert len(observer.consumer_tasks) == 2
+    assert session.consumer_tasks == observer.consumer_tasks
 
 
 @pytest.mark.anyio
