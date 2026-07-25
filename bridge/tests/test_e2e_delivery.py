@@ -265,7 +265,9 @@ async def test_unsolicited_background_turn_reaches_telegram(bridge: Bridge) -> N
 
     # The turn is finished; the CLI now wakes the model for a completed
     # background task and the turn's output arrives unsolicited.
-    await _wait_until(lambda: not bridge.handler._agent_active_sessions)
+    await _wait_until(
+        lambda: bridge.handler.session_resource_snapshot()["active_sessions"] == 0
+    )
     bridge.client.emit_turn("Background task finished: build is green")
 
     await _wait_until(
@@ -288,9 +290,13 @@ async def test_reintroduced_drop_condition_is_caught_by_harness(bridge: Bridge) 
     unsolicited round-trip fails — proving the positive test is a tripwire."""
     message = await bridge.send_user_text("start")
     await _wait_until(lambda: any("echo: start" in r for r in message.replies))
-    await _wait_until(lambda: not bridge.handler._agent_active_sessions)
+    await _wait_until(
+        lambda: bridge.handler.session_resource_snapshot()["active_sessions"] == 0
+    )
 
-    session = bridge.handler._agent_sessions[(7, 70)].session
+    cached = bridge.handler._agent_session_registry.get_cached((7, 70))
+    assert cached is not None
+    session = cached.entry.session
 
     async def old_drop_behavior(msg):  # the pre-#601 between-turns behavior
         return None

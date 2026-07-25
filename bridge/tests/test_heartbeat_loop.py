@@ -313,10 +313,16 @@ class HeartbeatLoopTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_workload_snapshot_counts_inflight_and_oldest(self):
         now = asyncio.get_running_loop().time()
-        self.handler._agent_active_sessions[(1, 2)] = object()
-        self.handler._agent_started_at[(1, 2)] = now - 30
-        self.handler._agent_active_sessions[(3, 4)] = object()
-        self.handler._agent_started_at[(3, 4)] = now - 10
+        self.handler._agent_session_registry.register_active(
+            (1, 2),
+            object(),
+            started_at=now - 30,
+        )
+        self.handler._agent_session_registry.register_active(
+            (3, 4),
+            object(),
+            started_at=now - 10,
+        )
         count, oldest = self.handler.workload_snapshot(now)
         self.assertEqual(count, 2)
         self.assertGreaterEqual(oldest, 29.0)

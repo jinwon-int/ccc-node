@@ -47,6 +47,7 @@ from telegram_bot.core.dead_session_wakeup import (
     WAKEUP_NUDGE,
     WAKEUP_STATE_KEY,
     TranscriptRejected,
+    _live_agent_session_owned,
     find_unconsumed_notifications,
     recovery_should_defer_to_wakeup,
     run_dead_session_wakeup_scan,
@@ -222,8 +223,7 @@ class _FakeHandler:
     ) -> None:
         self._locks: dict[tuple[int, int], asyncio.Lock] = {}
         self._streams: dict[tuple[int, int], Any] = {}
-        self._agent_sessions: dict[tuple[int, int], Any] = {}
-        self._agent_active_sessions: dict[tuple[int, int], Any] = {}
+        self._live_agent_sessions: set[tuple[int, int]] = set()
         self.journal = journal if journal is not None else []
         self._response = response or SimpleNamespace(
             content="wakeup report",
@@ -236,6 +236,9 @@ class _FakeHandler:
 
     def _stream_key(self, user_id: int, chat_id: int) -> tuple[int, int]:
         return (user_id, chat_id)
+
+    def has_live_agent_session(self, user_id: int, chat_id: int) -> bool:
+        return (user_id, chat_id) in self._live_agent_sessions
 
     def _get_conversation_lock(self, user_id: int, chat_id: int) -> asyncio.Lock:
         return self._locks.setdefault((user_id, chat_id), asyncio.Lock())
@@ -444,11 +447,20 @@ class WakeupScanTests(unittest.TestCase):
 
     def test_live_agent_session_is_not_woken(self) -> None:
         handler = _FakeHandler()
-        handler._agent_sessions[(7, 7)] = object()
+        handler._live_agent_sessions.add((7, 7))
         manager = _FakeSessionManager({"7": _session_record()})
         stats = self._scan(handler, manager)
         self.assertEqual(stats.skipped_active, 1)
         self.assertEqual(handler.calls, [])
+
+    def test_missing_or_broken_ownership_seam_fails_closed(self) -> None:
+        class BrokenOwnership:
+            def has_live_agent_session(self, user_id: int, chat_id: int) -> bool:
+                del user_id, chat_id
+                raise RuntimeError("ownership unavailable")
+
+        self.assertTrue(_live_agent_session_owned(object(), 7, 7))
+        self.assertTrue(_live_agent_session_owned(BrokenOwnership(), 7, 7))
 
     def test_dead_wakeup_turn_still_consumes_attempt_budget(self) -> None:
         handler = _FakeHandler(response=RuntimeError("bridge died mid-turn"))
@@ -730,7 +742,7 @@ class RecoveryWakeupDedupTests(unittest.TestCase):
         # The wakeup never wakes a live adapter conversation, so recovery must
         # not defer to it either — pre-#620 behavior is preserved.
         handler = _FakeHandler()
-        handler._agent_sessions[(7, 7)] = object()
+        handler._live_agent_sessions.add((7, 7))
         manager = _FakeSessionManager({"7": _session_record()})
         defer = self._defer(handler)
 

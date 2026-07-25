@@ -114,6 +114,18 @@ class CloseableFakeSession(FakeSession):
         self.close_calls += 1
 
 
+class BlockingInterruptSession(FakeSession):
+    def __init__(self, session_id: str) -> None:
+        super().__init__(session_id)
+        self.interrupt_started = asyncio.Event()
+        self.interrupt_release = asyncio.Event()
+
+    async def interrupt(self) -> None:
+        self.interrupt_calls += 1
+        self.interrupt_started.set()
+        await self.interrupt_release.wait()
+
+
 class FakeRuntime:
     def __init__(self, sessions: list[FakeSession] | None = None) -> None:
         self.sessions = sessions or []
@@ -160,6 +172,20 @@ async def _wait_until(predicate, *, timeout: float = 1.0) -> None:
     async with asyncio.timeout(timeout):
         while not predicate():
             await asyncio.sleep(0)
+
+
+def test_project_chat_registry_has_no_parallel_mapping_aliases(tmp_path: Path) -> None:
+    handler = _handler(tmp_path, FakeRuntime())
+
+    for legacy_name in (
+        "_agent_sessions",
+        "_agent_active_sessions",
+        "_agent_active_generations",
+        "_agent_generation_counters",
+        "_agent_started_at",
+        "_agent_waiting_for_turn",
+    ):
+        assert not hasattr(handler, legacy_name)
 
 
 @pytest.mark.anyio
@@ -482,13 +508,19 @@ async def test_session_guard_closes_expired_idle_session_but_protects_active(
     active = CloseableFakeSession("active")
     idle_key = (7, 70)
     active_key = (7, 71)
-    handler._agent_sessions[idle_key] = AgentSessionEntry(
-        session=idle, last_used_at=50.0
+    handler._agent_session_registry.put_cached(
+        idle_key,
+        AgentSessionEntry(session=idle, last_used_at=50.0),
     )
-    handler._agent_sessions[active_key] = AgentSessionEntry(
-        session=active, last_used_at=50.0
+    handler._agent_session_registry.put_cached(
+        active_key,
+        AgentSessionEntry(session=active, last_used_at=50.0),
     )
-    handler._agent_active_sessions[active_key] = active
+    handler._agent_session_registry.register_active(
+        active_key,
+        active,
+        started_at=50.0,
+    )
     monkeypatch.setitem(
         handler.enforce_session_resource_limits.__func__.__globals__,
         "process_tree_rss_mb",
@@ -499,8 +531,8 @@ async def test_session_guard_closes_expired_idle_session_but_protects_active(
 
     assert idle.close_calls == 1
     assert active.close_calls == 0
-    assert idle_key not in handler._agent_sessions
-    assert active_key in handler._agent_sessions
+    assert handler._agent_session_registry.get_cached(idle_key) is None
+    assert handler._agent_session_registry.get_cached(active_key) is not None
     assert snapshot["resident_sessions"] == 1
     assert snapshot["active_sessions"] == 1
     assert snapshot["evictions"] == 1
@@ -519,8 +551,12 @@ async def test_session_guard_enforces_lru_cap_for_idle_claude_sessions(
     handler = ProjectChatHandler(settings=settings, agent_runtime=runtime)
     sessions = [CloseableFakeSession(str(index)) for index in range(3)]
     for index, session in enumerate(sessions):
-        handler._agent_sessions[(7, 70 + index)] = AgentSessionEntry(
-            session=session, last_used_at=10.0 + index
+        handler._agent_session_registry.put_cached(
+            (7, 70 + index),
+            AgentSessionEntry(
+                session=session,
+                last_used_at=10.0 + index,
+            ),
         )
     monkeypatch.setitem(
         handler.enforce_session_resource_limits.__func__.__globals__,
@@ -547,8 +583,12 @@ async def test_session_guard_recycles_idle_codex_runtime_above_rss_limit(
     settings.codex_max_session_attachments = 0
     runtime = FakeRuntime()
     handler = ProjectChatHandler(settings=settings, agent_runtime=runtime)
-    handler._agent_sessions[(7, 70)] = AgentSessionEntry(
-        session=FakeSession("thread-old"), last_used_at=100.0
+    handler._agent_session_registry.put_cached(
+        (7, 70),
+        AgentSessionEntry(
+            session=FakeSession("thread-old"),
+            last_used_at=100.0,
+        ),
     )
     monkeypatch.setitem(
         handler.enforce_session_resource_limits.__func__.__globals__,
@@ -559,7 +599,7 @@ async def test_session_guard_recycles_idle_codex_runtime_above_rss_limit(
     snapshot = await handler.enforce_session_resource_limits(now=200.0)
 
     assert runtime.recycle_calls == 1
-    assert handler._agent_sessions == {}
+    assert handler._agent_session_registry.metrics().resident_sessions == 0
     assert snapshot["tree_rss_mb"] == 150.0
     assert snapshot["evictions"] == 1
     assert snapshot["runtime_recycles"] == 1
@@ -579,10 +619,15 @@ async def test_session_guard_defers_codex_rss_recycle_until_all_turns_are_idle(
     handler = ProjectChatHandler(settings=settings, agent_runtime=runtime)
     session = FakeSession("thread-active")
     key = (7, 70)
-    handler._agent_sessions[key] = AgentSessionEntry(
-        session=session, last_used_at=100.0
+    handler._agent_session_registry.put_cached(
+        key,
+        AgentSessionEntry(session=session, last_used_at=100.0),
     )
-    handler._agent_active_sessions[key] = session
+    active_token = handler._agent_session_registry.register_active(
+        key,
+        session,
+        started_at=100.0,
+    )
     monkeypatch.setitem(
         handler.enforce_session_resource_limits.__func__.__globals__,
         "process_tree_rss_mb",
@@ -590,7 +635,7 @@ async def test_session_guard_defers_codex_rss_recycle_until_all_turns_are_idle(
     )
 
     busy = await handler.enforce_session_resource_limits(now=200.0)
-    handler._agent_active_sessions.clear()
+    handler._agent_session_registry.deactivate_if_same(active_token)
     idle = await handler.enforce_session_resource_limits(now=201.0)
 
     assert busy["active_sessions"] == 1
@@ -598,6 +643,68 @@ async def test_session_guard_defers_codex_rss_recycle_until_all_turns_are_idle(
     assert runtime.recycle_calls == 1
     assert idle["active_sessions"] == 0
     assert idle["runtime_recycles"] == 1
+
+
+@pytest.mark.anyio
+async def test_stop_holds_session_guard_until_stale_interrupt_finishes(
+    tmp_path: Path,
+) -> None:
+    session = BlockingInterruptSession("reused")
+    runtime = FakeRuntime()
+    handler = _handler(tmp_path, runtime)
+    key = (7, 70)
+    handler._agent_session_registry.put_cached(
+        key,
+        AgentSessionEntry(session=session, last_used_at=1.0),
+    )
+    first = handler._agent_session_registry.register_active(
+        key,
+        session,
+        started_at=1.0,
+    )
+
+    stopping = asyncio.create_task(handler.stop(7, 70))
+    await asyncio.wait_for(session.interrupt_started.wait(), timeout=0.2)
+    replacement = asyncio.create_task(
+        handler.process_message("replacement", 7, 70)
+    )
+    await asyncio.sleep(0)
+
+    assert handler._agent_session_registry.active_handle_if_same(first) is not None
+    assert session.messages == []
+
+    session.interrupt_release.set()
+    assert await asyncio.wait_for(stopping, timeout=0.2)
+    response = await asyncio.wait_for(replacement, timeout=0.2)
+
+    assert response.success
+    assert session.messages == ["replacement"]
+    assert session.interrupt_calls == 1
+
+
+@pytest.mark.anyio
+async def test_close_blocks_prechecked_request_at_under_lock_runtime_recheck(
+    tmp_path: Path,
+) -> None:
+    runtime = FakeRuntime()
+    handler = _handler(tmp_path, runtime)
+    await handler._session_guard_lock.acquire()
+    closing = asyncio.create_task(handler.close())
+    await asyncio.sleep(0)
+    waiting_request = asyncio.create_task(
+        handler.process_message("must not attach", 7, 70)
+    )
+    await asyncio.sleep(0)
+
+    handler._session_guard_lock.release()
+    await asyncio.wait_for(closing, timeout=0.2)
+    response = await asyncio.wait_for(waiting_request, timeout=0.2)
+
+    assert not response.success
+    assert response.error == "Agent runtime is unavailable"
+    assert runtime.requests == []
+    assert runtime.close_calls == 1
+    assert handler.session_resource_snapshot()["active_sessions"] == 0
 
 
 @pytest.mark.anyio
