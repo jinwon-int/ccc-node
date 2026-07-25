@@ -87,6 +87,7 @@ class RequestProgressCoordinator:
         append_duration_log: DurationLogAppend,
         ledger_finish: LedgerFinish,
         reap_timeout_seconds: float = 5.0,
+        clock: Callable[[], float] | None = None,
     ) -> None:
         if reap_timeout_seconds <= 0:
             raise ValueError("reap_timeout_seconds must be positive")
@@ -96,6 +97,12 @@ class RequestProgressCoordinator:
         self._append_duration_log = append_duration_log
         self._ledger_finish = ledger_finish
         self._reap_timeout_seconds = reap_timeout_seconds
+        self._clock = clock
+
+    def _now(self) -> float:
+        if self._clock is not None:
+            return self._clock()
+        return asyncio.get_running_loop().time()
 
     def start(
         self,
@@ -125,7 +132,7 @@ class RequestProgressCoordinator:
             streaming_handler=streaming_handler,
         )
         request.usage_mode = usage_mode
-        request.started_at = loop.time()
+        request.started_at = self._now()
         request.task_id = self._ledger_create(
             user_id,
             chat_id,
@@ -143,7 +150,6 @@ class RequestProgressCoordinator:
         *,
         terminal_outcome: RequestPhase,
         session_id: str | None,
-        duration_ms: int,
     ) -> None:
         """Run already-authorized finalization effects exactly once, in order."""
 
@@ -160,11 +166,12 @@ class RequestProgressCoordinator:
         )
 
         cleaned = await self._cleanup_heartbeat(request)
+        duration_ms = int(max(0.0, self._now() - request.started_at) * 1000)
         await asyncio.to_thread(
             self._append_duration_log,
             request,
             session_id=session_id,
-            duration_ms=max(0, int(duration_ms)),
+            duration_ms=duration_ms,
             success=terminal_outcome is RequestPhase.COMPLETED,
         )
         self._ledger_finish(

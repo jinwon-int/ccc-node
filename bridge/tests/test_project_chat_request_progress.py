@@ -72,21 +72,32 @@ class EffectRecorder:
         self.finish_args = (state, cleanup_done)
 
 
+class MutableClock:
+    def __init__(self, value: float) -> None:
+        self.value = value
+
+    def __call__(self) -> float:
+        return self.value
+
+
 def _coordinator(
     recorder: EffectRecorder,
     *,
     progress_loop: Callable[[_PendingRequest], Awaitable[None]] | None = None,
+    cleanup_heartbeat: Callable[[_PendingRequest], Awaitable[bool]] | None = None,
     append_duration_log=None,
     ledger_finish=None,
     reap_timeout_seconds: float = 0.1,
+    clock: Callable[[], float] | None = None,
 ) -> RequestProgressCoordinator:
     return RequestProgressCoordinator(
         ledger_create=recorder.ledger_create,
         progress_loop=progress_loop or recorder.progress_loop,
-        cleanup_heartbeat=recorder.cleanup_heartbeat,
+        cleanup_heartbeat=cleanup_heartbeat or recorder.cleanup_heartbeat,
         append_duration_log=append_duration_log or recorder.append_duration_log,
         ledger_finish=ledger_finish or recorder.ledger_finish,
         reap_timeout_seconds=reap_timeout_seconds,
+        clock=clock,
     )
 
 
@@ -106,15 +117,16 @@ def _start(coordinator: RequestProgressCoordinator) -> RequestProgressHandle:
 @pytest.mark.anyio
 async def test_start_and_finalize_preserve_effect_order_and_values() -> None:
     recorder = EffectRecorder(cleaned=False)
-    coordinator = _coordinator(recorder)
+    clock = MutableClock(10.0)
+    coordinator = _coordinator(recorder, clock=clock)
     handle = _start(coordinator)
     await asyncio.sleep(0)
+    clock.value = 10.125
 
     await coordinator.finalize(
         handle,
         terminal_outcome=RequestPhase.COMPLETED,
         session_id="resolved-session",
-        duration_ms=123,
     )
 
     assert handle.request.user_id == 7
@@ -134,22 +146,51 @@ async def test_start_and_finalize_preserve_effect_order_and_values() -> None:
         "duration",
         "ledger-finish",
     ]
-    assert recorder.duration_args == ("resolved-session", 123, True)
+    assert recorder.duration_args == ("resolved-session", 125, True)
     assert recorder.finish_args == ("completed", False)
+
+
+@pytest.mark.anyio
+async def test_duration_is_sampled_after_heartbeat_cleanup() -> None:
+    recorder = EffectRecorder()
+    clock = MutableClock(10.0)
+
+    async def cleanup_after_delay(request: _PendingRequest) -> bool:
+        assert request.task_id == "task-1"
+        recorder.order.append("heartbeat-cleanup")
+        clock.value = 11.25
+        return True
+
+    coordinator = _coordinator(
+        recorder,
+        cleanup_heartbeat=cleanup_after_delay,
+        clock=clock,
+    )
+    handle = _start(coordinator)
+
+    await coordinator.finalize(
+        handle,
+        terminal_outcome=RequestPhase.COMPLETED,
+        session_id="resolved-session",
+    )
+
+    assert recorder.order.index("heartbeat-cleanup") < recorder.order.index("duration")
+    assert recorder.duration_args == ("resolved-session", 1250, True)
 
 
 @pytest.mark.anyio
 async def test_already_completed_future_is_not_set_twice() -> None:
     recorder = EffectRecorder()
-    coordinator = _coordinator(recorder)
+    clock = MutableClock(10.0)
+    coordinator = _coordinator(recorder, clock=clock)
     handle = _start(coordinator)
     handle.request.future.set_result(None)
+    clock.value = 9.0
 
     await coordinator.finalize(
         handle,
         terminal_outcome=RequestPhase.FAILED,
         session_id=None,
-        duration_ms=-5,
     )
 
     assert recorder.duration_args == (None, 0, False)
@@ -167,7 +208,6 @@ async def test_independently_cancelled_progress_task_is_reaped_then_finalized() 
         handle,
         terminal_outcome=RequestPhase.CANCELED,
         session_id="session",
-        duration_ms=1,
     )
 
     assert handle.task.cancelled()
@@ -200,7 +240,6 @@ async def test_stalled_progress_task_is_cancelled_and_gathered_before_cleanup() 
         handle,
         terminal_outcome=RequestPhase.TIMEOUT,
         session_id=None,
-        duration_ms=2,
     )
 
     assert cancelled.is_set()
@@ -218,7 +257,6 @@ async def test_duplicate_finalize_fails_closed_without_repeating_effects() -> No
         handle,
         terminal_outcome=RequestPhase.INTERRUPTED,
         session_id=None,
-        duration_ms=3,
     )
     first_order = list(recorder.order)
 
@@ -230,7 +268,6 @@ async def test_duplicate_finalize_fails_closed_without_repeating_effects() -> No
             handle,
             terminal_outcome=RequestPhase.INTERRUPTED,
             session_id=None,
-            duration_ms=3,
         )
 
     assert recorder.order == first_order
@@ -239,9 +276,10 @@ async def test_duplicate_finalize_fails_closed_without_repeating_effects() -> No
 @pytest.mark.anyio
 async def test_process_finalizer_claims_fallback_and_resolves_live_session() -> None:
     recorder = EffectRecorder()
-    coordinator = _coordinator(recorder)
+    clock = MutableClock(10.0)
+    coordinator = _coordinator(recorder, clock=clock)
     handle = _start(coordinator)
-    handle.request.started_at = 10.0
+    clock.value = 10.125
 
     class Session:
         session_id = "live-session"
@@ -251,7 +289,6 @@ async def test_process_finalizer_claims_fallback_and_resolves_live_session() -> 
         handle=handle,
         session=Session(),
         requested_session_id="requested-session",
-        finished_at=10.125,
     )
 
     assert handle.request.lifecycle.terminal_outcome is RequestPhase.FAILED
@@ -262,9 +299,10 @@ async def test_process_finalizer_claims_fallback_and_resolves_live_session() -> 
 @pytest.mark.anyio
 async def test_process_finalizer_uses_requested_session_fallback_exactly_once() -> None:
     recorder = EffectRecorder()
-    coordinator = _coordinator(recorder)
+    clock = MutableClock(10.0)
+    coordinator = _coordinator(recorder, clock=clock)
     handle = _start(coordinator)
-    handle.request.started_at = 10.0
+    clock.value = 11.0
     handle.request.lifecycle.try_terminal(
         RequestPhase.INTERRUPTED,
         cause="restart",
@@ -280,7 +318,6 @@ async def test_process_finalizer_uses_requested_session_fallback_exactly_once() 
         handle=handle,
         session=UnreadableSession(),
         requested_session_id="requested-session",
-        finished_at=11.0,
     )
     first_order = list(recorder.order)
 
@@ -289,7 +326,6 @@ async def test_process_finalizer_uses_requested_session_fallback_exactly_once() 
         handle=handle,
         session=None,
         requested_session_id="different-session",
-        finished_at=12.0,
     )
 
     assert recorder.duration_args == ("requested-session", 1000, False)
@@ -313,7 +349,6 @@ async def test_duration_failure_propagates_before_ledger_finish() -> None:
             handle,
             terminal_outcome=RequestPhase.FAILED,
             session_id=None,
-            duration_ms=4,
         )
 
     assert "heartbeat-cleanup" in recorder.order
@@ -337,7 +372,6 @@ async def test_ledger_failure_propagates_after_duration() -> None:
             handle,
             terminal_outcome=RequestPhase.FAILED,
             session_id=None,
-            duration_ms=5,
         )
 
     assert recorder.order.index("duration") < recorder.order.index("ledger-failed")
@@ -368,7 +402,6 @@ async def test_caller_cancellation_propagates_and_cancels_progress_task() -> Non
             handle,
             terminal_outcome=RequestPhase.CANCELED,
             session_id=None,
-            duration_ms=6,
         )
     )
     await started.wait()

@@ -82,7 +82,6 @@ async def _finalize_request_progress(
     handle: RequestProgressHandle,
     session: Any | None,
     requested_session_id: str | None,
-    finished_at: float,
 ) -> None:
     """Keep lifecycle authority in the caller and delegate only ordered effects."""
 
@@ -108,13 +107,6 @@ async def _finalize_request_progress(
         handle,
         terminal_outcome=terminal_outcome,
         session_id=resolved_session_id,
-        duration_ms=int(
-            max(
-                0.0,
-                finished_at - request.started_at,
-            )
-            * 1000
-        ),
     )
 
 
@@ -824,7 +816,6 @@ class ProjectChatProcessMixin:
                         handle=progress_handle,
                         session=session,
                         requested_session_id=session_id,
-                        finished_at=loop.time(),
                     )
                 finally:
                     if turn_token is not None:
