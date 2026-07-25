@@ -8,6 +8,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Typed provider-neutral turn stream consumer (#346).** Admission waits,
+  terminal-stall waits, event sequencing, and the ordered
+  interrupt→pending-read drain→stalled-owner abort→iterator-close path now
+  live behind one independently tested typed boundary. The consumer returns
+  explicit completed/admission-timeout/terminal-stall outcomes instead of
+  mutating nested `nonlocal` flags, while lifecycle and approval authority,
+  session ownership, ledger finalization, usage metering, output delivery,
+  and response construction remain with their existing owners. Direct tests
+  cover timeout races, tool/approval suppression, callback failures, cleanup
+  order, abort failure, and repeated cancellation. The nested CC 20 consumer
+  and its suppression are removed, `_process_agent_message` drops from CC 72
+  to 64, and the largest new function is CC 8.
 - **Typed provider-neutral turn event state (#346).** ProjectChat now keeps
   admission, attempt metering, approval-pending, tool balance/labels, and the
   current runtime error in one independently tested, I/O-free per-turn state
