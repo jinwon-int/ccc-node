@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import suppress
+from dataclasses import FrozenInstanceError
 from datetime import datetime, timezone
 from pathlib import Path
 import tempfile
@@ -948,6 +949,275 @@ class CodexRuntimeTests(unittest.IsolatedAsyncioTestCase):
             client.turn_start_calls[0]["sandbox_policy"],
             {"type": "workspaceWrite", "networkAccess": False},
         )
+        diagnostics = self.runtime.async_completion_diagnostics()
+        self.assertEqual(diagnostics.unowned_completed, 0)
+        self.assertEqual(diagnostics.late_active_duplicates, 0)
+
+    async def test_unowned_completion_stays_degraded_and_body_free(self) -> None:
+        await self.runtime.start_or_resume(
+            SessionRequest(working_directory="/workspace", session_id="thread-known")
+        )
+
+        self.runtime._route_notification(
+            CodexNotification(
+                "turn/completed",
+                {
+                    "threadId": "thread-known",
+                    "turn": {
+                        "id": "turn-detached",
+                        "status": "completed",
+                        "itemsView": "full",
+                        "items": [
+                            {
+                                "id": "message-secret",
+                                "type": "agentMessage",
+                                "text": "sensitive detached output",
+                            }
+                        ],
+                    },
+                },
+            )
+        )
+
+        diagnostics = self.runtime.async_completion_diagnostics()
+        self.assertFalse(self.runtime.supports_async_completion_delivery)
+        self.assertEqual(
+            set(diagnostics.__dataclass_fields__),
+            {
+                "state",
+                "unowned_completed",
+                "late_active_duplicates",
+                "recent_terminal_turns",
+            },
+        )
+        self.assertEqual(diagnostics.state, "degraded")
+        self.assertEqual(diagnostics.unowned_completed, 1)
+        self.assertEqual(diagnostics.late_active_duplicates, 0)
+        self.assertNotIn("thread-known", repr(diagnostics))
+        self.assertNotIn("turn-detached", repr(diagnostics))
+        self.assertNotIn("sensitive", repr(diagnostics))
+        with self.assertRaises(FrozenInstanceError):
+            setattr(diagnostics, "unowned_completed", 2)
+
+    async def test_unowned_completion_diagnostics_fail_closed_on_invalid_shapes(
+        self,
+    ) -> None:
+        await self.runtime.start_or_resume(
+            SessionRequest(working_directory="/workspace", session_id="thread-known")
+        )
+        notifications = [
+            CodexNotification(
+                "turn/completed",
+                {
+                    "threadId": "thread-unknown",
+                    "turn": {
+                        "id": "turn-unknown",
+                        "status": "completed",
+                        "items": [],
+                    },
+                },
+            ),
+            CodexNotification(
+                "turn/completed",
+                {
+                    "threadId": "thread-known",
+                    "turn": {"id": "turn-failed", "status": "failed", "items": []},
+                },
+            ),
+            CodexNotification(
+                "turn/completed",
+                {
+                    "threadId": "thread-known",
+                    "turn": {"id": "../turn", "status": "completed", "items": []},
+                },
+            ),
+            CodexNotification(
+                "turn/completed",
+                {
+                    "threadId": "thread-known",
+                    "turn": {
+                        "id": "turn-partial",
+                        "status": "completed",
+                        "itemsView": "partial",
+                        "items": [],
+                    },
+                },
+            ),
+            CodexNotification(
+                "turn/completed",
+                {
+                    "threadId": "thread-known",
+                    "turn": {"id": "turn-no-items", "status": "completed"},
+                },
+            ),
+            CodexNotification(
+                "turn/completed",
+                {
+                    "threadId": "thread-known",
+                    "turn": {
+                        "id": "turn-non-json-items",
+                        "status": "completed",
+                        "items": cast(Any, ()),
+                    },
+                },
+            ),
+            CodexNotification(
+                "future/completed",
+                {
+                    "threadId": "thread-known",
+                    "turn": {
+                        "id": "turn-future",
+                        "status": "completed",
+                        "items": [],
+                    },
+                },
+            ),
+            CodexNotification(
+                "item/agentMessage/delta",
+                {
+                    "threadId": "thread-known",
+                    "turnId": "turn-delta",
+                    "delta": "not a completion",
+                },
+            ),
+            CodexNotification(
+                "item/completed",
+                {
+                    "threadId": "thread-known",
+                    "turnId": "turn-tool",
+                    "item": {
+                        "id": "tool-1",
+                        "type": "commandExecution",
+                        "status": "completed",
+                    },
+                },
+            ),
+        ]
+
+        for notification in notifications:
+            self.runtime._route_notification(notification)
+
+        diagnostics = self.runtime.async_completion_diagnostics()
+        self.assertEqual(diagnostics.unowned_completed, 0)
+        self.assertEqual(diagnostics.late_active_duplicates, 0)
+        self.assertEqual(diagnostics.recent_terminal_turns, 0)
+
+    async def test_completed_active_turn_tombstone_blocks_late_duplicate_promotion(
+        self,
+    ) -> None:
+        session = await self.runtime.start_or_resume(
+            SessionRequest(working_directory="/workspace", session_id="thread-known")
+        )
+        client = self.clients[0]
+        notification = CodexNotification(
+            "turn/completed",
+            {
+                "threadId": "thread-known",
+                "turn": {
+                    "id": "turn-1",
+                    "status": "completed",
+                    "items": [],
+                },
+            },
+        )
+
+        async def collect() -> list[AgentEvent]:
+            return [event async for event in session.send_turn("finish normally")]
+
+        pending = asyncio.create_task(collect())
+        await client.turn_started.wait()
+        active = self.runtime._active_turns["thread-known"]
+        while active.turn_id is None:
+            await asyncio.sleep(0)
+        self.runtime._route_notification(notification)
+        self.runtime._route_notification(
+            CodexNotification(
+                "turn/completed",
+                {
+                    "threadId": "thread-known",
+                    "turn": {
+                        "id": "turn-mismatched-while-finished",
+                        "status": "completed",
+                        "items": [],
+                    },
+                },
+            )
+        )
+        events = await asyncio.wait_for(pending, timeout=0.2)
+
+        self.assertEqual(
+            sum(event.kind == "completion" for event in events),
+            1,
+        )
+        before_duplicate = self.runtime.async_completion_diagnostics()
+        self.assertEqual(before_duplicate.unowned_completed, 0)
+        self.assertEqual(before_duplicate.late_active_duplicates, 0)
+        self.assertEqual(before_duplicate.recent_terminal_turns, 1)
+
+        self.runtime._route_notification(notification)
+
+        after_duplicate = self.runtime.async_completion_diagnostics()
+        self.assertEqual(after_duplicate.unowned_completed, 0)
+        self.assertEqual(after_duplicate.late_active_duplicates, 1)
+        self.assertEqual(after_duplicate.recent_terminal_turns, 1)
+
+    async def test_terminal_turn_tombstones_are_bounded(self) -> None:
+        await self.runtime.start_or_resume(
+            SessionRequest(working_directory="/workspace", session_id="thread-known")
+        )
+        for index in range(513):
+            self.runtime._remember_terminal_turn(f"turn-{index}")
+
+        diagnostics = self.runtime.async_completion_diagnostics()
+        self.assertEqual(diagnostics.recent_terminal_turns, 512)
+        self.assertNotIn("turn-0", self.runtime._recent_terminal_turn_ids)
+        self.assertIn("turn-512", self.runtime._recent_terminal_turn_ids)
+
+        self.runtime._remember_terminal_turn("turn-512")
+        self.assertEqual(
+            self.runtime.async_completion_diagnostics().recent_terminal_turns,
+            512,
+        )
+        self.runtime._route_notification(
+            CodexNotification(
+                "turn/completed",
+                {
+                    "threadId": "thread-known",
+                    "turn": {
+                        "id": "turn-0",
+                        "status": "completed",
+                        "items": [],
+                    },
+                },
+            )
+        )
+        after_evicted = self.runtime.async_completion_diagnostics()
+        self.assertEqual(after_evicted.unowned_completed, 1)
+        self.assertEqual(after_evicted.late_active_duplicates, 0)
+
+    async def test_async_completion_diagnostic_counters_saturate(self) -> None:
+        await self.runtime.start_or_resume(
+            SessionRequest(working_directory="/workspace", session_id="thread-known")
+        )
+        self.runtime._ignored_unowned_completions = (1 << 31) - 1
+        self.runtime._route_notification(
+            CodexNotification(
+                "turn/completed",
+                {
+                    "threadId": "thread-known",
+                    "turn": {
+                        "id": "turn-saturated",
+                        "status": "completed",
+                        "items": [],
+                    },
+                },
+            )
+        )
+
+        self.assertEqual(
+            self.runtime.async_completion_diagnostics().unowned_completed,
+            (1 << 31) - 1,
+        )
 
     async def test_completed_agent_message_emits_semantic_boundary(self) -> None:
         # A completed agentMessage is a provider-neutral lifecycle boundary, not
@@ -1381,6 +1651,10 @@ class CodexRuntimeTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(cast(Any, failed_events[-1]).code, "codex_turn_failed")
         self.assertEqual(cast(Any, interrupted_events[-1]).code, "interrupted")
+        diagnostics = self.runtime.async_completion_diagnostics()
+        self.assertEqual(diagnostics.recent_terminal_turns, 0)
+        self.assertEqual(diagnostics.unowned_completed, 0)
+        self.assertEqual(diagnostics.late_active_duplicates, 0)
 
     async def test_approval_missing_handler_callback_error_and_permissions_are_fail_closed(self) -> None:
         session = await self.runtime.start_or_resume(SessionRequest(working_directory="/workspace"))

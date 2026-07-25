@@ -300,6 +300,28 @@ CAPABILITY_AXES: tuple[CapabilityAxis, ...] = (
         ),
     ),
     _axis(
+        "async_completion_delivery",
+        RUNTIME_GROUP,
+        "Out-of-turn completion delivery",
+        "Assistant output that finishes outside the bridge's exact active turn "
+        "has a documented bounded delivery or inactive-session recovery boundary.",
+        claude=_supported(
+            "Live SDK unsolicited output uses the optional session handler, while "
+            "terminal Claude transcript notifications use bounded provider-specific "
+            "dead-session recovery. Its replay remains provider-specific and "
+            "explicitly at-least-once."
+        ),
+        codex=_degraded(
+            "Only turn/completed for the exact bridge-owned active turn is handled. "
+            "The official app-server contract exposes no detached ownership signal, "
+            "so otherwise-valid unowned completions remain undelivered and are counted "
+            "only through body-free bounded diagnostics; no Telegram send, journal, "
+            "thread/read replay, or Claude transcript inference occurs. Runtime reports "
+            "supports_async_completion_delivery=false.",
+            "#646",
+        ),
+    ),
+    _axis(
         "memory_session_resume",
         MEMORY_GROUP,
         "Memory: session resume",
