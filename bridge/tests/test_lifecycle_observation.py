@@ -107,6 +107,27 @@ def test_malformed_events_return_none_not_raise() -> None:
     assert normalize_codex_app_server("nope") is None  # type: ignore[arg-type]
 
 
+def test_codex_turn_completion_is_not_inferred_as_compaction() -> None:
+    completed = normalize_codex_app_server(
+        {
+            "method": "turn/completed",
+            "params": {
+                "threadId": "t",
+                "turnId": "u",
+                "turn": {"status": "completed"},
+            },
+        }
+    )
+    assert completed is not None
+    assert completed.event is LifecycleEventType.TURN_COMPLETED
+    assert (
+        normalize_codex_app_server(
+            {"method": "thread/compacted", "params": {"threadId": "t"}}
+        )
+        is None
+    )
+
+
 def test_empty_or_unknown_claude_notification_is_noise() -> None:
     assert normalize_claude_hook("Notification", {}) is None
     assert normalize_claude_hook("Notification", {"session_id": "s"}) is None

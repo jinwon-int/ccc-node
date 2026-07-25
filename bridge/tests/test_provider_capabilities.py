@@ -230,6 +230,54 @@ class CapabilityRuntimeDriftTests(unittest.TestCase):
             (REPO_ROOT / "bridge/memory/distill_honcho_worker.py").is_file()
         )
 
+    def test_lifecycle_observability_claim_matches_the_opt_in_surfaces(self) -> None:
+        from telegram_bot.core import (
+            lifecycle_audit,
+            lifecycle_hook,
+            lifecycle_observation,
+        )
+
+        axis = next(
+            item for item in CAPABILITY_AXES if item.key == "lifecycle_observability"
+        )
+        self.assertIn("memory_postcompact_reinject", axis.description)
+        for provider in SUPPORTED_PROVIDERS:
+            with self.subTest(provider=provider):
+                status = capability_status(provider, "lifecycle_observability")
+                self.assertIs(status.state, CapabilityState.SUPPORTED)
+                self.assertEqual(status.dependencies, ())
+                for boundary in ("opt-in", "body-free", "bounded", "owner-only", "fail-open"):
+                    self.assertIn(boundary, status.reason)
+                self.assertIn("Final Telegram delivery", status.reason)
+
+        for member in (
+            "LifecycleAuditLedger",
+            "LifecycleObserver",
+            "build_lifecycle_observer",
+        ):
+            self.assertTrue(hasattr(lifecycle_audit, member))
+        self.assertTrue(hasattr(lifecycle_hook, "main"))
+        for member in (
+            "LifecycleObservation",
+            "normalize_agent_event",
+            "normalize_claude_hook",
+            "normalize_codex_app_server",
+        ):
+            self.assertTrue(hasattr(lifecycle_observation, member))
+        for relative_path in (
+            "claude/hooks/lifecycle-feed.sh",
+            "claude/hooks/audit.sh",
+            "claude/hooks/redact.sh",
+            "claude/hooks/notify.sh",
+        ):
+            self.assertTrue((REPO_ROOT / relative_path).is_file())
+
+    def test_codex_postcompact_claim_does_not_infer_a_provider_event(self) -> None:
+        status = capability_status("codex", "memory_postcompact_reinject")
+        self.assertIs(status.state, CapabilityState.DEGRADED)
+        self.assertIn("no official PreCompact/PostCompact event", status.reason)
+        self.assertIn("turn/completed is not treated as compaction", status.reason)
+
 
 if __name__ == "__main__":
     unittest.main()
