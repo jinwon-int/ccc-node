@@ -26,6 +26,7 @@ from telegram_bot.core.agent_runtime import (
 )
 from telegram_bot.core.heartbeat import tool_label
 from telegram_bot.core.memory_audience import resolve_memory_audience
+from telegram_bot.core.agent_session_registry import ActiveToken
 from telegram_bot.core.project_chat_types import (
     AgentApprovalCallback,
     AgentSessionEntry,
@@ -331,16 +332,17 @@ class ProjectChatProcessMixin:
                 self._agent_progress_loop(progress_request),
                 name=f"agent-progress-{user_id}-{chat_id}",
             )
-            generation = self._next_agent_generation(key)
-            self._agent_active_generations[key] = generation
             session = None
+            turn_token: ActiveToken | None = None
             try:
                 # Session construction and the periodic resource guard share
                 # this short critical section. It prevents an idle-runtime
                 # recycle from landing between start_or_resume() and active
                 # registration, while turns remain parallel after admission.
                 async with self._session_guard_lock:
-                    entry = self._agent_sessions.get(key)
+                    runtime = self._require_runtime()
+                    cached = self._agent_session_registry.get_cached(key)
+                    entry = cached.entry if cached is not None else None
                     session = entry.session if entry is not None else None
                     if new_session or (
                         entry is not None
@@ -376,7 +378,7 @@ class ProjectChatProcessMixin:
                                 memory_environment = audience.claude_environment(
                                     self._config
                                 )
-                        session = await self._agent_runtime.start_or_resume(
+                        session = await runtime.start_or_resume(
                             SessionRequest(
                                 working_directory=str(self.project_root),
                                 session_id=None if new_session else session_id,
@@ -389,17 +391,24 @@ class ProjectChatProcessMixin:
                             )
                         )
                         self._agent_session_attachments += 1
-                        self._agent_sessions[key] = AgentSessionEntry(
-                            session=session,
-                            model=model,
-                            effort=effort,
-                            approval_policy=approval_policy,
-                            approvals_reviewer=approvals_reviewer,
-                            sandbox_policy=sandbox_policy,
-                            last_used_at=loop.time(),
+                        self._agent_session_registry.put_cached(
+                            key,
+                            AgentSessionEntry(
+                                session=session,
+                                model=model,
+                                effort=effort,
+                                approval_policy=approval_policy,
+                                approvals_reviewer=approvals_reviewer,
+                                sandbox_policy=sandbox_policy,
+                                last_used_at=loop.time(),
+                            ),
                         )
-                    else:
-                        entry.last_used_at = loop.time()
+                    elif cached is not None:
+                        self._agent_session_registry.touch_cached_if_same(
+                            key,
+                            cached.token,
+                            loop.time(),
+                        )
 
                     # (Re-)register the between-turns delivery route each turn
                     # so the autonomous-output path always targets the latest
@@ -416,9 +425,12 @@ class ProjectChatProcessMixin:
                     self._register_agent_frame_observer(
                         session, user_id=user_id, chat_id=chat_id
                     )
-                    self._agent_active_sessions[key] = session
-                    self._agent_started_at[key] = loop.time()
-                    self._agent_waiting_for_turn.add(key)
+                    turn_token = self._agent_session_registry.register_active(
+                        key,
+                        session,
+                        started_at=loop.time(),
+                    )
+                generation = turn_token.generation
                 output = TurnOutputBuffer()
                 terminal_error: ErrorEvent | None = None
 
@@ -434,7 +446,7 @@ class ProjectChatProcessMixin:
                     # that boundary even though consume_agent_events has not
                     # observed the event yet.
                     if progress_request.lifecycle.admit():
-                        self._agent_waiting_for_turn.discard(key)
+                        self._agent_session_registry.admit_if_same(turn_token)
                         self._project_request_phase(progress_request)
                     approval_lease = progress_request.lifecycle.begin_approval()
                     if approval_lease is None:
@@ -591,7 +603,7 @@ class ProjectChatProcessMixin:
                                     )
                                     return
                                 admitted = True
-                                self._agent_waiting_for_turn.discard(key)
+                                self._agent_session_registry.admit_if_same(turn_token)
                                 if request_admitted:
                                     self._project_request_phase(progress_request)
                             progress_request.last_event_at = now
@@ -866,12 +878,8 @@ class ProjectChatProcessMixin:
                             terminal_outcome.value,
                             cleanup_done=cleaned,
                         )
-                if self._agent_active_generations.get(key) == generation:
-                    self._agent_active_generations.pop(key, None)
-                entry = self._agent_sessions.get(key)
-                if entry is not None and entry.session is session:
-                    entry.last_used_at = loop.time()
-                if self._agent_active_sessions.get(key) is session:
-                    self._agent_active_sessions.pop(key, None)
-                    self._agent_started_at.pop(key, None)
-                self._agent_waiting_for_turn.discard(key)
+                if turn_token is not None:
+                    self._agent_session_registry.deactivate_if_same(
+                        turn_token,
+                        touch_at=loop.time(),
+                    )

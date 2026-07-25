@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Typed ProjectChat agent-session registry (#346).** Cached wrappers, active
+  turn ownership, approval generations, start times, and admission state now
+  move through one independently tested registry instead of six parallel
+  mixin containers. Exact cache/turn tokens protect stale cleanup and LRU
+  eviction, generation high-water survives recycling, health remains
+  body-free, and stop/close serialize attachment so an old interrupt cannot
+  reach a newly registered turn.
 - **Default-on resident session resource guard.** A 60-second body-free sweep
   closes conversation-local runtimes after four idle hours, keeps at most two
   cached sessions with active-turn protection, and applies a 1 GiB bridge-tree

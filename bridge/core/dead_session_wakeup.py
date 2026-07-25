@@ -55,7 +55,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import logging
 from pathlib import Path
-from typing import Any, Callable, Mapping, Optional
+from typing import Any, Callable, Mapping, Optional, Protocol, runtime_checkable
 
 from telegram_bot.core.dead_session_recovery import (
     DEFAULT_LOCK_TIMEOUT,
@@ -79,6 +79,13 @@ from telegram_bot.core.session_resume import (
 from telegram_bot.core.usage_meter import MODE_AUTONOMOUS
 
 logger = logging.getLogger(__name__)
+
+
+@runtime_checkable
+class ConversationOwnership(Protocol):
+    """Typed live-session ownership seam supplied by ProjectChatHandler."""
+
+    def has_live_agent_session(self, user_id: int, chat_id: int) -> bool: ...
 
 #: The one-turn resume prompt. The SDK requires a query to start a turn; the
 #: CLI injects every pending queued item (including task notifications) as
@@ -208,15 +215,18 @@ def _wakeup_state(record: Any, session_id: str) -> tuple[int, Optional[datetime]
 def _live_agent_session_owned(handler: Any, user_id: int, chat_id: int) -> bool:
     """True when the runtime path holds a live session for this conversation.
 
-    A live CLI process is tracked in ``_agent_sessions`` /
-    ``_agent_active_sessions`` and will process its own notifications between
-    turns (#601), so waking it from here would double-process.
+    Cached or active ownership will process its own notifications between
+    turns (#601), so waking it from here would double-process. Missing or
+    broken ownership implementations fail closed rather than guessing from
+    private ProjectChat state.
     """
-    route = getattr(handler, "_stream_key", None)
-    key = route(user_id, chat_id) if callable(route) else (user_id, chat_id)
-    if key in (getattr(handler, "_agent_active_sessions", None) or {}):
+    if not isinstance(handler, ConversationOwnership):
         return True
-    return key in (getattr(handler, "_agent_sessions", None) or {})
+    try:
+        return bool(handler.has_live_agent_session(user_id, chat_id))
+    except Exception:
+        logger.warning("Live conversation ownership check failed closed", exc_info=True)
+        return True
 
 
 def _live_conversation(handler: Any, user_id: int, chat_id: int) -> bool:

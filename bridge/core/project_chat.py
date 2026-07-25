@@ -88,7 +88,6 @@ from telegram_bot.core.sdk_text import (  # noqa: E402,F401
 
 
 from telegram_bot.core.project_chat_types import (  # noqa: E402,F401
-    AgentSessionEntry,
     ChatResponse,
     AgentApprovalCallback,
     PermissionCallback,
@@ -96,6 +95,7 @@ from telegram_bot.core.project_chat_types import (  # noqa: E402,F401
     TypingCallback,
     _PendingRequest,
 )
+from telegram_bot.core.agent_session_registry import AgentSessionRegistry  # noqa: E402
 
 
 def _env_int(name: str, default: int) -> int:
@@ -198,12 +198,7 @@ class ProjectChatHandler(
         # without one is a unit-test convenience for pure helpers and fails
         # fast in process_message via _require_runtime.
         self._agent_runtime = agent_runtime
-        self._agent_sessions: Dict[Tuple[int, int], AgentSessionEntry] = {}
-        self._agent_active_sessions: Dict[Tuple[int, int], Any] = {}
-        self._agent_active_generations: Dict[Tuple[int, int], int] = {}
-        self._agent_generation_counters: Dict[Tuple[int, int], int] = {}
-        self._agent_started_at: Dict[Tuple[int, int], float] = {}
-        self._agent_waiting_for_turn: set[Tuple[int, int]] = set()
+        self._agent_session_registry = AgentSessionRegistry()
         self._agent_runtime_closed = False
         self._agent_interrupt_timeout_seconds = 10.0
         self._session_guard_lock = asyncio.Lock()
@@ -518,18 +513,16 @@ class ProjectChatHandler(
         user's work. ``now`` must come from the event loop clock so it is
         comparable to the recorded turn start times.
         """
-        count = len(self._agent_active_sessions)
-        oldest_started: Optional[float] = None
-        for started_at in self._agent_started_at.values():
-            if oldest_started is None or started_at < oldest_started:
-                oldest_started = started_at
+        metrics = self._agent_session_registry.metrics()
+        count = metrics.active_sessions
+        oldest_started = metrics.oldest_started_at
         oldest_age = (now - oldest_started) if oldest_started is not None else 0.0
         return count, max(0.0, oldest_age)
 
     def waiting_for_turn_snapshot(self) -> int:
         """Requests registered by the bridge but not admitted by a runtime."""
 
-        return len(self._agent_waiting_for_turn)
+        return self._agent_session_registry.metrics().waiting_for_turn
 
     @property
     def _task_ledger(self):

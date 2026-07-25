@@ -1,23 +1,44 @@
 """Stream state/control mixin for ProjectChatHandler."""
 
-# mypy: disable-error-code="attr-defined,has-type"
-
 import asyncio
 import logging
-from typing import Optional
+from typing import Any, Optional
 
+from telegram_bot.core.agent_session_registry import (
+    AgentSessionRegistry,
+    IdleSessionCandidate,
+    StreamKey,
+)
 from telegram_bot.utils.session_resource_guard import process_tree_rss_mb
 
 logger = logging.getLogger(__name__)
 
 
 class ProjectChatStateMixin:
+    _agent_interrupt_timeout_seconds: float
+    _agent_runtime: Any
+    _agent_runtime_closed: bool
+    _agent_runtime_recycle_pending: bool
+    _agent_session_attachments: int
+    _agent_session_registry: AgentSessionRegistry
+    _config: Any
+    _session_guard_evictions: int
+    _session_guard_last_tree_rss_mb: float
+    _session_guard_lock: asyncio.Lock
+    _session_guard_runtime_recycles: int
+
+    def _stream_key(self, user_id: int, chat_id: int) -> StreamKey:
+        """Implemented by the ProjectChatHandler composition root."""
+
+        raise NotImplementedError
+
     def session_resource_snapshot(self) -> dict[str, int | float]:
         """Return body-free counters for health.json and fleet diagnostics."""
 
+        metrics = self._agent_session_registry.metrics()
         return {
-            "resident_sessions": len(self._agent_sessions),
-            "active_sessions": len(self._agent_active_sessions),
+            "resident_sessions": metrics.resident_sessions,
+            "active_sessions": metrics.active_sessions,
             "tree_rss_mb": self._session_guard_last_tree_rss_mb,
             "evictions": self._session_guard_evictions,
             "runtime_recycles": self._session_guard_runtime_recycles,
@@ -38,28 +59,23 @@ class ProjectChatStateMixin:
             return self.session_resource_snapshot()
         current = asyncio.get_running_loop().time() if now is None else float(now)
         async with self._session_guard_lock:
-            active_keys = set(self._agent_active_sessions)
-            idle = [
-                (key, entry)
-                for key, entry in self._agent_sessions.items()
-                if key not in active_keys
-            ]
-            idle.sort(key=lambda item: float(getattr(item[1], "last_used_at", 0.0)))
+            metrics = self._agent_session_registry.metrics()
+            idle = self._agent_session_registry.idle_lru_candidates()
 
             ttl = int(getattr(self._config, "session_idle_ttl_seconds", 4 * 60 * 60))
-            candidates: list[object] = [
-                key
-                for key, entry in idle
-                if current - float(getattr(entry, "last_used_at", 0.0)) >= ttl
+            candidates: list[IdleSessionCandidate] = [
+                candidate
+                for candidate in idle
+                if current - candidate.last_used_at >= ttl
             ]
 
             maximum = int(getattr(self._config, "max_resident_sessions", 2))
-            projected = len(self._agent_sessions) - len(candidates)
+            projected = metrics.resident_sessions - len(candidates)
             if projected > maximum:
-                for key, _entry in idle:
-                    if key in candidates:
+                for candidate in idle:
+                    if candidate in candidates:
                         continue
-                    candidates.append(key)
+                    candidates.append(candidate)
                     projected -= 1
                     if projected <= maximum:
                         break
@@ -70,27 +86,32 @@ class ProjectChatStateMixin:
                 getattr(self._config, "session_tree_rss_limit_mb", 1024)
             )
             memory_high = rss_limit > 0 and rss_mb >= rss_limit
-            if memory_high and not active_keys:
-                for key, _entry in idle:
-                    if key not in candidates:
-                        candidates.append(key)
+            if memory_high and metrics.active_sessions == 0:
+                for candidate in idle:
+                    if candidate not in candidates:
+                        candidates.append(candidate)
 
             evicted = 0
-            for key in candidates:
-                if key in self._agent_active_sessions:
+            for candidate in candidates:
+                entry = self._agent_session_registry.drop_idle_cached_if_same(
+                    candidate
+                )
+                if entry is None:
                     continue
-                before = len(self._agent_sessions)
-                await self._drop_agent_session(key)
-                evicted += int(len(self._agent_sessions) < before)
+                await self._close_agent_session(entry.session)
+                evicted += 1
             if evicted:
                 self._session_guard_evictions += evicted
                 if getattr(self._config, "agent_provider", "claude") == "codex":
                     self._agent_runtime_recycle_pending = True
+                resident = (
+                    self._agent_session_registry.metrics().resident_sessions
+                )
                 logger.info(
                     "Session resource guard evicted %d idle session(s); "
                     "resident=%d rss_mb=%.1f",
                     evicted,
-                    len(self._agent_sessions),
+                    resident,
                     rss_mb,
                 )
 
@@ -103,7 +124,7 @@ class ProjectChatStateMixin:
             )
             if (
                 getattr(self._config, "agent_provider", "claude") == "codex"
-                and not self._agent_active_sessions
+                and self._agent_session_registry.metrics().active_sessions == 0
                 and (
                     memory_high
                     or attachment_high
@@ -131,13 +152,13 @@ class ProjectChatStateMixin:
         if limit <= 0 or self._agent_session_attachments < limit:
             return
         self._agent_runtime_recycle_pending = True
-        if not self._agent_active_sessions:
+        if self._agent_session_registry.metrics().active_sessions == 0:
             await self._recycle_agent_runtime_locked("attachment-cap")
 
     async def _recycle_agent_runtime_locked(self, reason: str) -> bool:
         """Restart a shared idle runtime while preserving durable thread ids."""
 
-        if self._agent_active_sessions:
+        if self._agent_session_registry.metrics().active_sessions:
             self._agent_runtime_recycle_pending = True
             return False
         recycle = getattr(self._agent_runtime, "recycle", None)
@@ -148,7 +169,9 @@ class ProjectChatStateMixin:
         # Cached CodexSession wrappers belong to the old app-server connection.
         # The bot/session store still owns their durable thread ids, so the next
         # message reconstructs a wrapper through thread/resume.
-        self._agent_sessions.clear()
+        if self._agent_session_registry.clear_cached_if_idle() is None:
+            self._agent_runtime_recycle_pending = True
+            return False
         try:
             recycled = await asyncio.wait_for(recycle(), timeout=15.0)
         except TimeoutError:
@@ -165,27 +188,21 @@ class ProjectChatStateMixin:
         logger.info("Session resource guard recycled idle runtime reason=%s", reason)
         return True
 
-    def _next_agent_generation(self, key) -> int:
-        generation = self._agent_generation_counters.get(key, 0) + 1
-        self._agent_generation_counters[key] = generation
-        return generation
-
     def is_agent_approval_active(
         self, user_id: int, chat_id: int, generation: int
     ) -> bool:
         key = self._stream_key(user_id, chat_id)
         return (
             not self._agent_runtime_closed
-            and self._agent_active_generations.get(key) == generation
-            and key in self._agent_active_sessions
+            and self._agent_session_registry.approval_is_active(key, generation)
         )
 
     def invalidate_agent_approvals(
         self, user_id: int, chat_id: Optional[int] = None
     ) -> None:
-        for key in self._agent_keys_for_user(user_id, chat_id):
-            self._next_agent_generation(key)
-            self._agent_active_generations.pop(key, None)
+        self._agent_session_registry.invalidate_approvals(
+            self._agent_keys_for_user(user_id, chat_id)
+        )
 
     def _require_runtime(self):
         if self._agent_runtime is None or self._agent_runtime_closed:
@@ -215,17 +232,32 @@ class ProjectChatStateMixin:
 
     async def stop(self, user_id: int, chat_id: Optional[int] = None) -> bool:
         """Interrupt the active agent session(s) for a user/conversation."""
-        sessions = self._active_agent_sessions_for_user(user_id, chat_id)
-        self.invalidate_agent_approvals(user_id, chat_id)
-        await asyncio.gather(
-            *(self._interrupt_agent_session(session) for session in sessions)
-        )
-        for key in self._agent_keys_for_user(user_id, chat_id):
-            if self._agent_active_sessions.get(key) in sessions:
-                self._agent_active_sessions.pop(key, None)
-                self._agent_started_at.pop(key, None)
-                self._agent_waiting_for_turn.discard(key)
-        return bool(sessions)
+        # The resource guard also serializes session attachment. Holding it
+        # through interrupt prevents a stale handle for turn A from reaching a
+        # newly registered turn B that reused the same session wrapper.
+        async with self._session_guard_lock:
+            keys = self._agent_keys_for_user(user_id, chat_id)
+            handles = self._agent_session_registry.active_handles_for_keys(keys)
+            self._agent_session_registry.invalidate_approvals(keys)
+            current = tuple(
+                owned
+                for handle in handles
+                if (
+                    owned := self._agent_session_registry.active_handle_if_same(
+                        handle.token
+                    )
+                )
+                is not None
+            )
+            await asyncio.gather(
+                *(
+                    self._interrupt_agent_session(handle.session)
+                    for handle in current
+                )
+            )
+            for handle in handles:
+                self._agent_session_registry.deactivate_if_same(handle.token)
+            return bool(handles)
 
     async def cancel_user_streaming(self, user_id: int, chat_id: Optional[int] = None) -> bool:
         """Compatibility no-op retained for the bot layer (#584 slice C-2).
@@ -259,7 +291,11 @@ class ProjectChatStateMixin:
         """
         del user_id, chat_id
 
-    async def _drop_agent_session(self, key, session=None) -> None:
+    async def _drop_agent_session(
+        self,
+        key: StreamKey,
+        session: Any = None,
+    ) -> None:
         """Evict and close the cached agent-session entry for ``key``.
 
         With ``session`` given, evict only while the cached entry still wraps
@@ -268,13 +304,20 @@ class ProjectChatStateMixin:
         conversation-local ``close`` method (currently Codex) remain a cheap
         wrapper over their shared runtime.
         """
-        entry = self._agent_sessions.get(key)
-        if entry is None:
+        cached = self._agent_session_registry.get_cached(key)
+        if cached is None:
             return
-        if session is not None and entry.session is not session:
+        if session is not None and cached.entry.session is not session:
             return
-        self._agent_sessions.pop(key, None)
-        close = getattr(entry.session, "close", None)
+        entry = self._agent_session_registry.drop_cached_if_same(
+            key,
+            cached.token,
+        )
+        if entry is not None:
+            await self._close_agent_session(entry.session)
+
+    async def _close_agent_session(self, session: Any) -> None:
+        close = getattr(session, "close", None)
         if not callable(close):
             return
         try:
@@ -289,14 +332,32 @@ class ProjectChatStateMixin:
         except Exception:
             logger.exception("Agent session close failed")
 
-    def _agent_keys_for_user(self, user_id: int, chat_id: Optional[int] = None):
+    def _agent_keys_for_user(
+        self,
+        user_id: int,
+        chat_id: Optional[int] = None,
+    ) -> tuple[StreamKey, ...]:
         if chat_id is not None:
-            return [self._stream_key(user_id, chat_id)]
-        return [key for key in self._agent_sessions if key[0] == user_id]
+            return (self._stream_key(user_id, chat_id),)
+        return self._agent_session_registry.keys_for_user(user_id)
 
-    def _active_agent_sessions_for_user(self, user_id: int, chat_id: Optional[int] = None):
+    def _active_agent_sessions_for_user(
+        self,
+        user_id: int,
+        chat_id: Optional[int] = None,
+    ) -> list[Any]:
         keys = self._agent_keys_for_user(user_id, chat_id)
-        return [self._agent_active_sessions[key] for key in keys if key in self._agent_active_sessions]
+        return [
+            handle.session
+            for handle in self._agent_session_registry.active_handles_for_keys(keys)
+        ]
+
+    def has_live_agent_session(self, user_id: int, chat_id: int) -> bool:
+        """Typed ownership seam used by dead-session wakeup."""
+
+        return self._agent_session_registry.has_live_owner(
+            self._stream_key(user_id, chat_id)
+        )
 
     async def _interrupt_agent_session(self, session) -> None:
         try:
@@ -315,20 +376,32 @@ class ProjectChatStateMixin:
         """Interrupt active Codex turns and close its shared runtime once."""
         if self._agent_runtime is None or self._agent_runtime_closed:
             return
-        self._agent_runtime_closed = True
-        self._agent_active_generations.clear()
-        self._agent_waiting_for_turn.clear()
-        await asyncio.gather(
-            *(
-                self._interrupt_agent_session(session)
-                for session in tuple(self._agent_active_sessions.values())
+        async with self._session_guard_lock:
+            if self._agent_runtime is None or self._agent_runtime_closed:
+                return
+            self._agent_runtime_closed = True
+            handles = self._agent_session_registry.prepare_close()
+            current = tuple(
+                owned
+                for handle in handles
+                if (
+                    owned := self._agent_session_registry.active_handle_if_same(
+                        handle.token
+                    )
+                )
+                is not None
             )
-        )
-        close = getattr(self._agent_runtime, "close", None)
-        if close is not None:
-            try:
-                await asyncio.wait_for(close(), timeout=10.0)
-            except TimeoutError:
-                logger.warning("Agent runtime close timed out after 10s")
-            except Exception:
-                logger.exception("Agent runtime close failed")
+            await asyncio.gather(
+                *(
+                    self._interrupt_agent_session(handle.session)
+                    for handle in current
+                )
+            )
+            close = getattr(self._agent_runtime, "close", None)
+            if close is not None:
+                try:
+                    await asyncio.wait_for(close(), timeout=10.0)
+                except TimeoutError:
+                    logger.warning("Agent runtime close timed out after 10s")
+                except Exception:
+                    logger.exception("Agent runtime close failed")
