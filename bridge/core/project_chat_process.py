@@ -333,72 +333,92 @@ class ProjectChatProcessMixin:
             )
             generation = self._next_agent_generation(key)
             self._agent_active_generations[key] = generation
-            entry = self._agent_sessions.get(key)
-            session = entry.session if entry is not None else None
-            if new_session or (
-                entry is not None
-                and (
-                    (session_id is not None and entry.session.session_id != session_id)
-                    or entry.model != model
-                    or entry.effort != effort
-                    or entry.approval_policy != approval_policy
-                    or entry.approvals_reviewer != approvals_reviewer
-                    or entry.sandbox_policy != sandbox_policy
-                )
-            ):
-                await self._drop_agent_session(key, session)
-                session = None
+            session = None
             try:
-                if session is None:
-                    memory_environment = None
-                    provider = getattr(self._config, "agent_provider", "claude")
-                    audience = resolve_memory_audience(
-                        self._config,
-                        user_id=user_id,
-                        chat_id=chat_id,
-                    )
-                    if audience is not None:
-                        if provider == "codex":
-                            memory_environment = audience.codex_environment(self._config)
-                        else:
-                            memory_environment = audience.claude_environment(self._config)
-                    session = await self._agent_runtime.start_or_resume(
-                        SessionRequest(
-                            working_directory=str(self.project_root),
-                            session_id=None if new_session else session_id,
+                # Session construction and the periodic resource guard share
+                # this short critical section. It prevents an idle-runtime
+                # recycle from landing between start_or_resume() and active
+                # registration, while turns remain parallel after admission.
+                async with self._session_guard_lock:
+                    entry = self._agent_sessions.get(key)
+                    session = entry.session if entry is not None else None
+                    if new_session or (
+                        entry is not None
+                        and (
+                            (
+                                session_id is not None
+                                and entry.session.session_id != session_id
+                            )
+                            or entry.model != model
+                            or entry.effort != effort
+                            or entry.approval_policy != approval_policy
+                            or entry.approvals_reviewer != approvals_reviewer
+                            or entry.sandbox_policy != sandbox_policy
+                        )
+                    ):
+                        await self._drop_agent_session(key, session)
+                        session = None
+                    if session is None:
+                        await self._prepare_agent_session_start_locked()
+                        memory_environment = None
+                        provider = getattr(self._config, "agent_provider", "claude")
+                        audience = resolve_memory_audience(
+                            self._config,
+                            user_id=user_id,
+                            chat_id=chat_id,
+                        )
+                        if audience is not None:
+                            if provider == "codex":
+                                memory_environment = audience.codex_environment(
+                                    self._config
+                                )
+                            else:
+                                memory_environment = audience.claude_environment(
+                                    self._config
+                                )
+                        session = await self._agent_runtime.start_or_resume(
+                            SessionRequest(
+                                working_directory=str(self.project_root),
+                                session_id=None if new_session else session_id,
+                                model=model,
+                                effort=effort,
+                                approval_policy=approval_policy,
+                                approvals_reviewer=approvals_reviewer,
+                                sandbox_policy=sandbox_policy,
+                                memory_environment=memory_environment,
+                            )
+                        )
+                        self._agent_session_attachments += 1
+                        self._agent_sessions[key] = AgentSessionEntry(
+                            session=session,
                             model=model,
                             effort=effort,
                             approval_policy=approval_policy,
                             approvals_reviewer=approvals_reviewer,
                             sandbox_policy=sandbox_policy,
-                            memory_environment=memory_environment,
+                            last_used_at=loop.time(),
                         )
-                    )
-                    self._agent_sessions[key] = AgentSessionEntry(
-                        session=session,
-                        model=model,
-                        effort=effort,
-                        approval_policy=approval_policy,
-                        approvals_reviewer=approvals_reviewer,
-                        sandbox_policy=sandbox_policy,
-                    )
+                    else:
+                        entry.last_used_at = loop.time()
 
-                # (Re-)register the between-turns delivery route each turn so
-                # the autonomous-output path always targets the latest bot
-                # reference for this (user_id, chat_id) conversation.
-                self._register_agent_unsolicited_handler(
-                    session,
-                    user_id=user_id,
-                    chat_id=chat_id,
-                    model=model,
-                    route_bot=notification_bot or bot,
-                )
-                # Same cadence as the unsolicited route: (re-)register the
-                # /usage observation seam each turn for this conversation.
-                self._register_agent_frame_observer(session, user_id=user_id, chat_id=chat_id)
-                self._agent_active_sessions[key] = session
-                self._agent_started_at[key] = asyncio.get_running_loop().time()
-                self._agent_waiting_for_turn.add(key)
+                    # (Re-)register the between-turns delivery route each turn
+                    # so the autonomous-output path always targets the latest
+                    # bot reference for this conversation.
+                    self._register_agent_unsolicited_handler(
+                        session,
+                        user_id=user_id,
+                        chat_id=chat_id,
+                        model=model,
+                        route_bot=notification_bot or bot,
+                    )
+                    # Same cadence as the unsolicited route: (re-)register the
+                    # /usage observation seam each turn.
+                    self._register_agent_frame_observer(
+                        session, user_id=user_id, chat_id=chat_id
+                    )
+                    self._agent_active_sessions[key] = session
+                    self._agent_started_at[key] = loop.time()
+                    self._agent_waiting_for_turn.add(key)
                 output = TurnOutputBuffer()
                 terminal_error: ErrorEvent | None = None
 
@@ -848,6 +868,9 @@ class ProjectChatProcessMixin:
                         )
                 if self._agent_active_generations.get(key) == generation:
                     self._agent_active_generations.pop(key, None)
+                entry = self._agent_sessions.get(key)
+                if entry is not None and entry.session is session:
+                    entry.last_used_at = loop.time()
                 if self._agent_active_sessions.get(key) is session:
                     self._agent_active_sessions.pop(key, None)
                     self._agent_started_at.pop(key, None)

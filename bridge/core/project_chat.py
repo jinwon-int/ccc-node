@@ -206,6 +206,12 @@ class ProjectChatHandler(
         self._agent_waiting_for_turn: set[Tuple[int, int]] = set()
         self._agent_runtime_closed = False
         self._agent_interrupt_timeout_seconds = 10.0
+        self._session_guard_lock = asyncio.Lock()
+        self._session_guard_evictions = 0
+        self._session_guard_runtime_recycles = 0
+        self._session_guard_last_tree_rss_mb = 0.0
+        self._agent_session_attachments = 0
+        self._agent_runtime_recycle_pending = False
         self._clock = clock or time
         # Opt-in lifecycle audit observer (#645); None on a default node.
         self._lifecycle_observer = build_lifecycle_observer(self._config)

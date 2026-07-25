@@ -279,6 +279,61 @@ class Config(
             "or off to disable."
         ),
     )
+    session_guard_enabled: bool = Field(
+        default=True,
+        alias="CCC_BRIDGE_SESSION_GUARD_ENABLED",
+        description=(
+            "Bound resident agent sessions and recycle an idle oversized runtime. "
+            "The guard never interrupts an active request."
+        ),
+    )
+    session_guard_interval_seconds: float = Field(
+        default=60.0,
+        ge=10.0,
+        le=3600.0,
+        alias="CCC_BRIDGE_SESSION_GUARD_INTERVAL_SECONDS",
+        description="Seconds between idle session-resource guard sweeps.",
+    )
+    session_idle_ttl_seconds: int = Field(
+        default=4 * 60 * 60,
+        ge=60,
+        le=7 * 24 * 60 * 60,
+        alias="CCC_BRIDGE_SESSION_IDLE_TTL_SECONDS",
+        description=(
+            "Close a conversation-local runtime after this many idle seconds. "
+            "The persisted provider session id remains resumable."
+        ),
+    )
+    max_resident_sessions: int = Field(
+        default=2,
+        ge=1,
+        le=64,
+        alias="CCC_BRIDGE_MAX_RESIDENT_SESSIONS",
+        description=(
+            "Maximum cached provider sessions. Least-recently-used idle sessions "
+            "are closed first; active sessions are never evicted."
+        ),
+    )
+    session_tree_rss_limit_mb: int = Field(
+        default=1024,
+        ge=0,
+        le=1024 * 1024,
+        alias="CCC_BRIDGE_SESSION_TREE_RSS_LIMIT_MB",
+        description=(
+            "Idle bridge process-tree RSS high-water mark in MiB. Zero disables "
+            "the memory watermark."
+        ),
+    )
+    codex_max_session_attachments: int = Field(
+        default=2,
+        ge=0,
+        le=1024,
+        alias="CCC_BRIDGE_CODEX_MAX_ATTACHMENTS",
+        description=(
+            "Recycle the idle Codex app-server before exceeding this many "
+            "conversation attachments. Zero disables the attachment bound."
+        ),
+    )
 
     # Access Control - comma-separated list of allowed user IDs (if empty, allow all)
     allowed_user_ids: Annotated[List[int], NoDecode] = Field(

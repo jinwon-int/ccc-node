@@ -2,8 +2,8 @@
 
 Detection-only: this module observes and reports, it never remediates.
 
-Three structured signals are exported to ``health.json`` on every probe tick
-and evaluated against configurable thresholds:
+Runtime signals are exported to ``health.json`` on every probe tick. The three
+alert groups evaluated against configurable thresholds are:
 
 1. **Heartbeat age vs request lifetime** — the oldest in-flight request's age
    compared to the configured process timeout. A request older than its own
@@ -19,6 +19,9 @@ and evaluated against configurable thresholds:
 The legacy session-liveness signal (streams with a dead reader task) retired
 with the direct Claude SDK stream path (#584 slice C-2); runtime-path session
 death surfaces through turn errors and the recovery/wakeup scanners instead.
+Body-free resident-session counts, process-tree RSS, guard evictions, Codex
+attachments, and runtime recycles are exported for fleet diagnostics but do
+not independently fire alerts: the resource guard owns bounded remediation.
 
 Alert delivery reuses the owner-only push-notifier spool: alerts are written as
 ordinary spool records, so the existing redaction, dedup, rate-limit, and the
@@ -90,11 +93,18 @@ class HealthSignals:
     pending_notifications: int = 0
     dropped_notifications: int = 0
     orphan_children: int = 0
+    resident_sessions: int = 0
+    active_sessions: int = 0
+    session_tree_rss_mb: float = 0.0
+    session_guard_evictions: int = 0
+    runtime_recycles: int = 0
+    codex_attachments: int = 0
 
     def as_dict(self) -> dict[str, Any]:
         data = asdict(self)
         data["oldest_request_age_seconds"] = int(self.oldest_request_age_seconds)
         data["request_lifetime_seconds"] = int(self.request_lifetime_seconds)
+        data["session_tree_rss_mb"] = int(self.session_tree_rss_mb)
         return data
 
 
@@ -276,6 +286,12 @@ class HealthProbe:
         except Exception:
             orphans = []
 
+        resources: dict[str, Any] = {}
+        try:
+            resources = dict(self.project_chat.session_resource_snapshot())
+        except Exception:
+            resources = {}
+
         return HealthSignals(
             active_requests=int(active_requests),
             waiting_for_turn=max(0, waiting_for_turn),
@@ -284,4 +300,10 @@ class HealthProbe:
             pending_notifications=count_spool_backlog(self.spool_dir),
             dropped_notifications=dropped,
             orphan_children=len(orphans),
+            resident_sessions=max(0, int(resources.get("resident_sessions", 0))),
+            active_sessions=max(0, int(resources.get("active_sessions", 0))),
+            session_tree_rss_mb=max(0.0, float(resources.get("tree_rss_mb", 0.0))),
+            session_guard_evictions=max(0, int(resources.get("evictions", 0))),
+            runtime_recycles=max(0, int(resources.get("runtime_recycles", 0))),
+            codex_attachments=max(0, int(resources.get("codex_attachments", 0))),
         )

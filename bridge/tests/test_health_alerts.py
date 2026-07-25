@@ -11,6 +11,7 @@ import sys
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
@@ -160,6 +161,38 @@ class ProbeLoopHotSpinRegressionTests(unittest.IsolatedAsyncioTestCase):
         )
 
 
+class SessionResourceGuardLoopTests(unittest.IsolatedAsyncioTestCase):
+    async def test_guard_loop_runs_enforcement_and_stops_cleanly(self):
+        from telegram_bot.core.bot_lifecycle import BotLifecycleMixin
+
+        stop = asyncio.Event()
+        calls = 0
+
+        async def enforce():
+            nonlocal calls
+            calls += 1
+            stop.set()
+
+        async def immediate_timeout(awaitable, *, timeout):
+            del timeout
+            awaitable.close()
+            raise asyncio.TimeoutError
+
+        bot = type("Bot", (BotLifecycleMixin,), {})()
+        bot._config = SimpleNamespace(session_guard_interval_seconds=10.0)
+        bot._project_chat = SimpleNamespace(
+            enforce_session_resource_limits=enforce
+        )
+
+        with patch(
+            "telegram_bot.core.bot_lifecycle.asyncio.wait_for",
+            new=immediate_timeout,
+        ):
+            await bot._session_resource_guard(stop)
+
+        self.assertEqual(calls, 1)
+
+
 class AlertGateTests(unittest.TestCase):
     def test_persistent_condition_alerts_once_per_cooldown(self):
         gate = AlertGate(cooldown_seconds=100.0)
@@ -211,6 +244,14 @@ class HealthProbeTests(unittest.IsolatedAsyncioTestCase):
             handler = SimpleNamespace(
                 workload_snapshot=lambda now: (2, 750.0),
                 waiting_for_turn_snapshot=lambda: 1,
+                session_resource_snapshot=lambda: {
+                    "resident_sessions": 3,
+                    "active_sessions": 2,
+                    "tree_rss_mb": 1234.5,
+                    "evictions": 4,
+                    "runtime_recycles": 2,
+                    "codex_attachments": 1,
+                },
                 _process_timeout_seconds=600.0,
             )
             probe = HealthProbe(
@@ -229,6 +270,12 @@ class HealthProbeTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(signals.pending_notifications, 2)
             self.assertEqual(signals.dropped_notifications, 3)
             self.assertEqual(signals.orphan_children, 2)
+            self.assertEqual(signals.resident_sessions, 3)
+            self.assertEqual(signals.active_sessions, 2)
+            self.assertEqual(signals.session_tree_rss_mb, 1234.5)
+            self.assertEqual(signals.session_guard_evictions, 4)
+            self.assertEqual(signals.runtime_recycles, 2)
+            self.assertEqual(signals.codex_attachments, 1)
 
             fired = evaluate_alerts(signals, AlertThresholds())
             self.assertEqual(
@@ -269,6 +316,12 @@ class HealthProbeTests(unittest.IsolatedAsyncioTestCase):
             pending_notifications=0,
             dropped_notifications=0,
             orphan_children=0,
+            resident_sessions=2,
+            active_sessions=1,
+            session_tree_rss_mb=1024.9,
+            session_guard_evictions=3,
+            runtime_recycles=1,
+            codex_attachments=2,
         )
         data = signals.as_dict()
         self.assertEqual(data["oldest_request_age_seconds"], 12)
@@ -277,14 +330,21 @@ class HealthProbeTests(unittest.IsolatedAsyncioTestCase):
             sorted(data),
             [
                 "active_requests",
+                "active_sessions",
+                "codex_attachments",
                 "dropped_notifications",
                 "oldest_request_age_seconds",
                 "orphan_children",
                 "pending_notifications",
                 "request_lifetime_seconds",
+                "resident_sessions",
+                "runtime_recycles",
+                "session_guard_evictions",
+                "session_tree_rss_mb",
                 "waiting_for_turn",
             ],
         )
+        self.assertEqual(data["session_tree_rss_mb"], 1024)
 
 
 class HealthReporterSignalsTests(unittest.TestCase):

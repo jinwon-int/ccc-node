@@ -357,18 +357,31 @@ class CodexRuntime:
 
             memory_bootstrap = configured_bootstrap
         if client_factory is not None:
-            self._client = client_factory(self._handle_server_request)
+            self._client_factory = client_factory
         elif bound_environment is None:
-            self._client = CodexAppServerClient(
-                executable=cli_path,
-                server_request_handler=self._handle_server_request,
-            )
+
+            def default_client_factory(
+                handler: ServerRequestHandler,
+            ) -> AppServerClient:
+                return CodexAppServerClient(
+                    executable=cli_path,
+                    server_request_handler=handler,
+                )
+
+            self._client_factory = default_client_factory
         else:
-            self._client = CodexAppServerClient(
-                executable=cli_path,
-                process_environment=bound_environment,
-                server_request_handler=self._handle_server_request,
-            )
+
+            def environment_client_factory(
+                handler: ServerRequestHandler,
+            ) -> AppServerClient:
+                return CodexAppServerClient(
+                    executable=cli_path,
+                    process_environment=bound_environment,
+                    server_request_handler=handler,
+                )
+
+            self._client_factory = environment_client_factory
+        self._client = self._client_factory(self._handle_server_request)
         self._process_environment = bound_environment
         self._memory_bootstrap = memory_bootstrap
         self._memory_bootstrap_lock = asyncio.Lock()
@@ -846,14 +859,60 @@ class CodexRuntime:
         return value if isinstance(value, str) and value else None
 
     async def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        self._fail_active_turns("codex_runtime_closed", "Codex runtime closed")
-        if self._dispatcher_task is not None:
-            self._dispatcher_task.cancel()
-            await asyncio.gather(self._dispatcher_task, return_exceptions=True)
-        await self._client.close()
+        async with self._start_lock:
+            if self._closed:
+                return
+            self._closed = True
+            self._fail_active_turns("codex_runtime_closed", "Codex runtime closed")
+            if self._dispatcher_task is not None:
+                self._dispatcher_task.cancel()
+                await asyncio.gather(self._dispatcher_task, return_exceptions=True)
+                self._dispatcher_task = None
+            self._started = False
+            await self._client.close()
+
+    async def recycle(self) -> bool:
+        """Replace an idle app-server connection and its MCP subprocess tree.
+
+        Codex threads are durable outside this process. The bridge discards its
+        lightweight ``CodexSession`` wrappers before calling this method, then
+        reconstructs them with ``thread/resume`` on the next message.
+        """
+
+        async with self._start_lock:
+            if self._closed or self._active_turns:
+                return False
+            if not self._started:
+                return False
+
+            dispatcher = self._dispatcher_task
+            self._dispatcher_task = None
+            self._started = False
+            if dispatcher is not None:
+                dispatcher.cancel()
+                await asyncio.gather(dispatcher, return_exceptions=True)
+            self._thread_locks.clear()
+            self._thread_usage.clear()
+            self._created_threads.clear()
+            self._started_turn_ids.clear()
+            self._account_rate_limits = UsageSnapshot(provider="codex")
+            close_task = asyncio.create_task(self._client.close())
+            try:
+                await asyncio.shield(close_task)
+            except asyncio.CancelledError:
+                # Rebuild only after the old process tree reached its bounded
+                # close boundary. Leaving a closed client installed would make
+                # the next thread/resume permanently fail after guard timeout
+                # or process shutdown cancellation.
+                await asyncio.gather(close_task, return_exceptions=True)
+                self._client = self._client_factory(self._handle_server_request)
+                raise
+            except Exception:
+                logger.exception("Codex app-server close failed during idle recycle")
+
+            self._client = self._client_factory(self._handle_server_request)
+            logger.info("Recycled idle Codex app-server connection")
+            return True
 
     async def _dispatch_notifications(self) -> None:
         try:

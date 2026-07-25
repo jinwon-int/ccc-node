@@ -237,6 +237,12 @@ Claude:  ...
 | `CLAUDE_SETTINGS_PATH` | 否 | `~/.claude/settings.json` | Claude Code settings 文件路径 |
 | `CLAUDE_PROCESS_TIMEOUT` | 否 | `600` | SDK 超时时间（秒） |
 | `AUTO_NEW_SESSION_AFTER_HOURS` | 否 | `24` | 空闲 N 小时后自动启动新会话；设为 `0`/`false`/`off` 禁用 |
+| `CCC_BRIDGE_SESSION_GUARD_ENABLED` | 否 | `true` | 限制常驻会话资源，绝不驱逐活动请求 |
+| `CCC_BRIDGE_SESSION_GUARD_INTERVAL_SECONDS` | 否 | `60` | 空闲资源守卫扫描间隔（10–3600 秒） |
+| `CCC_BRIDGE_SESSION_IDLE_TTL_SECONDS` | 否 | `14400` | 达到空闲时限后关闭本地运行时；持久会话 ID 仍可恢复 |
+| `CCC_BRIDGE_MAX_RESIDENT_SESSIONS` | 否 | `2` | 常驻会话 LRU 上限；活动会话受保护 |
+| `CCC_BRIDGE_SESSION_TREE_RSS_LIMIT_MB` | 否 | `1024` | 空闲桥接进程树 RSS 上限；`0` 禁用 |
+| `CCC_BRIDGE_CODEX_MAX_ATTACHMENTS` | 仅 Codex | `2` | 第三次会话附加前回收空闲 app-server；`0` 禁用 |
 | `DRAFT_UPDATE_MIN_CHARS` | 否 | `150` | 流式响应草稿更新的最小字符数 |
 | `DRAFT_UPDATE_INTERVAL` | 否 | `1.0` | 流式响应草稿更新的最小间隔（秒） |
 | `ENABLE_STREAMING_TOOL_CALLS` | 否 | `false` | 在 Telegram 流式消息中显示 Claude 工具调用 |

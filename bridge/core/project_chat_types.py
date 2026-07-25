@@ -40,6 +40,10 @@ class AgentSessionEntry:
     approval_policy: Optional[str] = None
     approvals_reviewer: Optional[str] = None
     sandbox_policy: Optional[Mapping[str, Any]] = None
+    # Event-loop monotonic timestamp. It is intentionally process-local and
+    # body-free: persisted provider session ids remain the durable resume
+    # authority while this value only drives resident-resource eviction.
+    last_used_at: float = 0.0
 
 
 @dataclass

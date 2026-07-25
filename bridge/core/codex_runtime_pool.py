@@ -21,6 +21,8 @@ class _UsageRuntime(AgentRuntime, Protocol):
         self, session_id: str, *, bounds: TranscriptBounds
     ) -> CodexTranscriptSnapshot: ...
 
+    async def recycle(self) -> bool: ...
+
     async def close(self) -> None: ...
 
 
@@ -161,3 +163,22 @@ class CodexRuntimePool:
             self._runtimes.clear()
             self._thread_runtimes.clear()
         await asyncio.gather(*(runtime.close() for runtime in runtimes))
+
+    async def recycle(self) -> bool:
+        """Recycle every currently materialized, idle audience runtime."""
+
+        async with self._lock:
+            if self._closed:
+                return False
+            runtimes = tuple(self._runtimes.values())
+        if not runtimes:
+            return False
+        results = await asyncio.gather(
+            *(
+                runtime.recycle()
+                for runtime in runtimes
+                if callable(getattr(runtime, "recycle", None))
+            ),
+            return_exceptions=True,
+        )
+        return any(result is True for result in results)
