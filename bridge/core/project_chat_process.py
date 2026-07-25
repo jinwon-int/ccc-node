@@ -346,7 +346,7 @@ class ProjectChatProcessMixin:
                     or entry.sandbox_policy != sandbox_policy
                 )
             ):
-                self._agent_sessions.pop(key, None)
+                await self._drop_agent_session(key, session)
                 session = None
             try:
                 if session is None:
@@ -666,7 +666,7 @@ class ProjectChatProcessMixin:
                         cause="admission-timeout",
                     )
                     if terminal_won:
-                        self._drop_agent_session(key, session)
+                        await self._drop_agent_session(key, session)
                     logger.warning(
                         "Turn admission timed out for user %s chat %s before the "
                         "runtime produced its first event",
@@ -692,7 +692,7 @@ class ProjectChatProcessMixin:
                         cause="terminal-stall",
                     )
                     if terminal_won:
-                        self._drop_agent_session(key, session)
+                        await self._drop_agent_session(key, session)
                     final_streamed = False
                     if streaming_handler:
                         final_streamed = await streaming_handler.finalize_all()
@@ -733,7 +733,7 @@ class ProjectChatProcessMixin:
                         cause="runtime-error",
                     )
                     if terminal_won:
-                        self._drop_agent_session(key, session)
+                        await self._drop_agent_session(key, session)
                     return ChatResponse(
                         content=f"❌ Processing failed: {terminal_error.message}",
                         success=False,
@@ -761,7 +761,7 @@ class ProjectChatProcessMixin:
                     cause="process-timeout",
                 )
                 if terminal_won and session is not None:
-                    self._drop_agent_session(key, session)
+                    await self._drop_agent_session(key, session)
                 if terminal_won and session is not None:
                     await self._interrupt_agent_session(session)
                 if terminal_won:
@@ -795,7 +795,7 @@ class ProjectChatProcessMixin:
                     cause="runtime-exception",
                 )
                 if terminal_won and session is not None:
-                    self._drop_agent_session(key, session)
+                    await self._drop_agent_session(key, session)
                 if terminal_won:
                     await self._cancel_agent_streaming(
                         streaming_handler, context="returning an agent error"
@@ -825,6 +825,22 @@ class ProjectChatProcessMixin:
                     cleaned = await self._cleanup_heartbeat(progress_request)
                     terminal_outcome = progress_request.lifecycle.terminal_outcome
                     if terminal_outcome is not None:
+                        resolved_session_id = session_id
+                        if session is not None:
+                            try:
+                                resolved_session_id = session.session_id
+                            except Exception:
+                                pass
+                        await asyncio.to_thread(
+                            self._append_duration_log,
+                            progress_request,
+                            session_id=resolved_session_id,
+                            duration_ms=int(
+                                max(0.0, loop.time() - progress_request.started_at)
+                                * 1000
+                            ),
+                            success=terminal_outcome is RequestPhase.COMPLETED,
+                        )
                         self._ledger_finish(
                             progress_request,
                             terminal_outcome.value,

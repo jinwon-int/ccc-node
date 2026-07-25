@@ -269,6 +269,7 @@ class ClaudeSession:
             finally:
                 if self._client is client:
                     self._client = None
+                self._runtime._forget_session(self)
 
     # -- AgentSession protocol ---------------------------------------------
 
@@ -755,6 +756,14 @@ class ClaudeRuntime:
     def _session_lock(self, session_id: str) -> asyncio.Lock:
         return self._session_locks.setdefault(session_id, asyncio.Lock())
 
+    def _forget_session(self, session: ClaudeSession) -> None:
+        """Drop a closed conversation session from the runtime registry."""
+
+        try:
+            self._sessions.remove(session)
+        except ValueError:
+            pass
+
     # -- AgentRuntime protocol ---------------------------------------------
 
     async def start_or_resume(self, request: SessionRequest) -> ClaudeSession:
@@ -782,9 +791,10 @@ class ClaudeRuntime:
         if self._closed:
             return
         self._closed = True
-        for session in self._sessions:
-            await session.close()
+        sessions = tuple(self._sessions)
         self._sessions.clear()
+        for session in sessions:
+            await session.close()
 
     def _build_options(
         self, request: SessionRequest, can_use_tool: CanUseTool

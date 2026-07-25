@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import json
 import stat
 import sys
 from collections.abc import AsyncIterator
@@ -100,6 +101,15 @@ class FakeSession:
 
     async def interrupt(self) -> None:
         self.interrupt_calls += 1
+
+
+class CloseableFakeSession(FakeSession):
+    def __init__(self, session_id: str, events: list[AgentEvent] | None = None) -> None:
+        super().__init__(session_id, events)
+        self.close_calls = 0
+
+    async def close(self) -> None:
+        self.close_calls += 1
 
 
 class FakeRuntime:
@@ -406,6 +416,69 @@ async def test_claude_adapter_routes_turns_and_drops_codex_only_policy_knobs(
     assert request.approval_policy is None
     assert request.approvals_reviewer is None
     assert request.sandbox_policy is None
+
+
+@pytest.mark.anyio
+async def test_claude_new_session_closes_replaced_conversation_session(
+    tmp_path: Path,
+) -> None:
+    previous = CloseableFakeSession("claude-previous")
+    replacement = CloseableFakeSession("claude-replacement")
+    runtime = FakeRuntime([previous, replacement])
+    handler = ProjectChatHandler(
+        settings=_settings(tmp_path, provider="claude"), agent_runtime=runtime
+    )
+    handler._task_ledger_cache = False
+
+    first = await handler.process_message("first", user_id=7, chat_id=70)
+    second = await handler.process_message(
+        "second", user_id=7, chat_id=70, new_session=True
+    )
+
+    assert first.session_id == "claude-previous"
+    assert second.session_id == "claude-replacement"
+    assert previous.close_calls == 1
+    assert replacement.close_calls == 0
+    assert len(runtime.requests) == 2
+
+
+@pytest.mark.anyio
+async def test_runtime_path_appends_terminal_duration_samples(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path, provider="claude")
+    settings.bot_data_dir = tmp_path / ".telegram_bot"
+    settings.heartbeat_duration_log_enabled = True
+    settings.heartbeat_duration_log_max_lines = 100
+    runtime = FakeRuntime(
+        [
+            FakeSession("claude-success"),
+            FakeSession("claude-failure", [ErrorEvent("failed", "provider failed")]),
+        ]
+    )
+    handler = ProjectChatHandler(settings=settings, agent_runtime=runtime)
+    handler._task_ledger_cache = False
+
+    success = await handler.process_message("first", user_id=7, chat_id=70)
+    failure = await handler.process_message(
+        "second", user_id=7, chat_id=70, new_session=True
+    )
+
+    rows = [
+        json.loads(line)
+        for line in (settings.bot_data_dir / "duration.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert success.success is True
+    assert failure.success is False
+    assert [row["success"] for row in rows] == [True, False]
+    assert [row["session_id"] for row in rows] == [
+        "claude-success",
+        "claude-failure",
+    ]
+    assert all(isinstance(row["duration_ms"], int) and row["duration_ms"] >= 0 for row in rows)
+    assert all("first" not in repr(row) and "second" not in repr(row) for row in rows)
 
 
 @pytest.mark.anyio
