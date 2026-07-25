@@ -40,9 +40,7 @@ class _PermissionResultDeny:
 
 sdk_module.ClaudeSDKClient = _DummySDKClient
 sdk_module.ClaudeAgentOptions = _DummyAgentOptions
-sdk_module.HookMatcher = type(
-    "HookMatcher", (), {"__init__": lambda self, **kwargs: None}
-)
+sdk_module.HookMatcher = type("HookMatcher", (), {"__init__": lambda self, **kwargs: None})
 sdk_module.AssistantMessage = type("AssistantMessage", (), {})
 sdk_module.RateLimitEvent = type("RateLimitEvent", (), {})
 sdk_module.ResultMessage = type("ResultMessage", (), {})
@@ -171,6 +169,18 @@ class HeartbeatLoopTests(unittest.IsolatedAsyncioTestCase):
         await self._start_loop(req)
         with self.assertRaises(asyncio.TimeoutError):
             await asyncio.wait_for(self.status_event.wait(), timeout=0.1)
+        self.assertEqual(self.status_calls, [])
+
+    async def test_terminal_request_suppresses_heartbeat_before_future_done(self):
+        req = self._make_request()
+        req.lifecycle.try_terminal(
+            project_chat.RequestPhase.TIMEOUT,
+            cause="process-timeout",
+        )
+        await self.handler._maybe_update_heartbeat(
+            req,
+            asyncio.get_running_loop().time() + 60.0,
+        )
         self.assertEqual(self.status_calls, [])
 
     async def test_cleanup_deletes_existing_heartbeat(self):
@@ -366,6 +376,32 @@ class HeartbeatLoopTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(cleaned)
             self.handler._ledger_finish(req, "completed", cleanup_done=cleaned)
             self.assertEqual(self.handler._task_ledger.records(), [])
+
+    async def test_ledger_projection_failures_do_not_change_lifecycle(self):
+        class ExplodingLedger:
+            def set_state(self, *args, **kwargs):
+                raise OSError("projection unavailable")
+
+            def finish(self, *args, **kwargs):
+                raise OSError("finish unavailable")
+
+        req = self._make_request()
+        req.task_id = "task"
+        self.handler._task_ledger_cache = ExplodingLedger()
+        self.addCleanup(setattr, self.handler, "_task_ledger_cache", False)
+
+        self.assertTrue(req.lifecycle.admit())
+        with self.assertLogs(project_chat.logger, level="WARNING"):
+            self.handler._project_request_phase(req)
+        self.assertEqual(req.lifecycle.phase, project_chat.RequestPhase.WORKING)
+
+        req.lifecycle.try_terminal(
+            project_chat.RequestPhase.COMPLETED,
+            cause="normal-completion",
+        )
+        with self.assertLogs(project_chat.logger, level="WARNING"):
+            self.handler._ledger_finish(req, "completed", cleanup_done=True)
+        self.assertEqual(req.lifecycle.phase, project_chat.RequestPhase.COMPLETED)
 
     async def test_forecast_shrinks_as_task_progresses(self):
         # Same history, elapsed 30s -> remaining should be ~1m 30s, not the

@@ -104,7 +104,17 @@ class ShouldRefreshTypingTest(unittest.IsolatedAsyncioTestCase):
     async def test_typing_skips_permission_wait(self):
         """Permission prompts wait for the user; typing must not imply work."""
         req = self._make_request()
-        req.awaiting_permission = True
+        self.assertTrue(req.lifecycle.admit())
+        self.assertIsNotNone(req.lifecycle.begin_approval())
+        now = asyncio.get_running_loop().time()
+        self.assertFalse(self.handler._should_refresh_typing(req, now))
+
+    async def test_typing_stops_as_soon_as_request_is_terminal(self):
+        req = self._make_request()
+        req.lifecycle.try_terminal(
+            project_chat.RequestPhase.CANCELED,
+            cause="request-canceled",
+        )
         now = asyncio.get_running_loop().time()
         self.assertFalse(self.handler._should_refresh_typing(req, now))
 
@@ -112,9 +122,7 @@ class ShouldRefreshTypingTest(unittest.IsolatedAsyncioTestCase):
         req = self._make_request()
         orig_cap = project_chat.TYPING_MAX_NO_PROGRESS_SECONDS
         setattr(project_chat, "TYPING_MAX_NO_PROGRESS_SECONDS", 0.02)
-        self.addCleanup(
-            setattr, project_chat, "TYPING_MAX_NO_PROGRESS_SECONDS", orig_cap
-        )
+        self.addCleanup(setattr, project_chat, "TYPING_MAX_NO_PROGRESS_SECONDS", orig_cap)
         now = asyncio.get_running_loop().time()
         req.started_at = now - 1.0
         self.assertFalse(self.handler._should_refresh_typing(req, now))

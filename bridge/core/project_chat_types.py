@@ -5,15 +5,14 @@ from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, List, Mapping, Optional
 
 from telegram_bot.core.agent_runtime import ApprovalDecision, ApprovalRequestEvent
+from telegram_bot.core.request_lifecycle import RequestLifecycle
 
 
 # Callback type: async (chat_id, user_id, tool_name, tool_input) -> bool | PermissionResult
 PermissionCallback = Callable[[int, int, str, Dict[str, Any]], Awaitable]
 # Explicit provider-neutral approval bridge. The generation is owned by
 # ProjectChat and lets the Telegram side reject stale buttons fail-closed.
-AgentApprovalCallback = Callable[
-    [int, int, ApprovalRequestEvent, int], Awaitable[ApprovalDecision]
-]
+AgentApprovalCallback = Callable[[int, int, ApprovalRequestEvent, int], Awaitable[ApprovalDecision]]
 # Callback type: async () -> Any, sends typing action
 TypingCallback = Callable[[], Awaitable[Any]]
 # Callback type: async (text, message_id) -> message_id | None. When text is
@@ -83,10 +82,9 @@ class _PendingRequest:
     # instead of ticking up forever. 0 until the first event; the stall check
     # falls back to started_at.
     last_event_at: float = 0.0
-    # True until the runtime yields its first normalized event. This separates
-    # a request blocked behind a leaked turn lock/provider admission from work
-    # that the provider has actually started (#625).
-    waiting_for_turn: bool = True
+    # One in-memory lifecycle authority. TaskLedger and the legacy waiting set
+    # are best-effort projections of this state (#346).
+    lifecycle: RequestLifecycle = field(default_factory=RequestLifecycle)
     # Wall-clock of the newest assistant TextBlock / ToolUseBlock (#411 C).
     # A terminal-event stall is only releasable when answer text is the latest
     # meaningful activity: last_text_at > last_tool_at means no tool started
@@ -96,9 +94,20 @@ class _PendingRequest:
     last_tool_at: float = 0.0
     current_tool_label: Optional[str] = None
     last_visible_progress_at: float = 0.0
-    awaiting_permission: bool = False
     heartbeat_forecast_loaded: bool = False
     # Duration samples the per-tick remaining-time ETA conditions on (loaded
     # once per request; the estimate itself is recomputed every heartbeat).
     heartbeat_forecast_samples: List[int] = field(default_factory=list)
     streaming_handler: Optional[Any] = None  # StreamingMessageHandler instance
+
+    @property
+    def waiting_for_turn(self) -> bool:
+        """Compatibility view for admission/health callers."""
+
+        return self.lifecycle.is_waiting_for_turn
+
+    @property
+    def awaiting_permission(self) -> bool:
+        """Compatibility view for heartbeat/typing callers."""
+
+        return self.lifecycle.is_input_required

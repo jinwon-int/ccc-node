@@ -47,6 +47,17 @@ class TaskLedgerTests(unittest.TestCase):
         self.assertEqual(rec["state"], WORKING)
         self.assertIsNone(rec["status_message_id"])
 
+    def test_create_accepts_waiting_for_turn_as_initial_projection(self):
+        task_id = self.ledger.create(1, 2, initial_state=WAITING_FOR_TURN)
+        rec = self._only_record()
+        self.assertEqual(rec["task_id"], task_id)
+        self.assertEqual(rec["state"], WAITING_FOR_TURN)
+
+    def test_create_rejects_terminal_initial_projection(self):
+        with self.assertRaises(ValueError):
+            self.ledger.create(1, 2, initial_state=COMPLETED)
+        self.assertEqual(self.ledger.records(), [])
+
     def test_finish_with_clean_cleanup_purges(self):
         task_id = self.ledger.create(1, 2)
         self.ledger.finish(task_id, COMPLETED, cleanup_done=True)
@@ -95,9 +106,7 @@ class TaskLedgerTests(unittest.TestCase):
         self.assertEqual(len(ops), 1)
         self.assertEqual(ops[0][0], task_id)
         self.ledger.resolve_terminal_op(task_id, success=False)
-        self.assertEqual(
-            self.ledger.pending_terminal_ops()[0][1]["attempts"], 1
-        )
+        self.assertEqual(self.ledger.pending_terminal_ops()[0][1]["attempts"], 1)
         self.ledger.resolve_terminal_op(task_id, success=True)
         self.assertEqual(self.ledger.records(), [])
 
@@ -132,9 +141,7 @@ class TaskLedgerTests(unittest.TestCase):
     def test_path_resolution(self):
         override = Path("/tmp/custom-tasks.json")
         self.assertEqual(ledger_path_for(Path("/data"), override), override)
-        self.assertEqual(
-            ledger_path_for(Path("/data")), default_task_ledger_path(Path("/data"))
-        )
+        self.assertEqual(ledger_path_for(Path("/data")), default_task_ledger_path(Path("/data")))
         self.assertIsNone(ledger_path_for(None))
 
 
