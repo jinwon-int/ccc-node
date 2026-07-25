@@ -58,6 +58,32 @@ def test_curated_web_mcp_builds_only_search_and_scrape(tmp_path: Path) -> None:
     assert options["process_env"] == {"FIRECRAWL_API_KEY": "fc-test-secret"}
 
 
+def test_firecrawl_mode_builds_search_and_scrape_without_searxng(tmp_path: Path) -> None:
+    options = build_curated_web_mcp(_settings(tmp_path, "firecrawl"))
+    assert options is not None
+    assert options["allowed_tools"] == [FIRECRAWL_SEARCH_TOOL, FIRECRAWL_SCRAPE_TOOL]
+    assert options["disallowed_tools"] == [
+        "WebSearch",
+        "WebFetch",
+        SEARXNG_SEARCH_TOOL,
+        SEARXNG_FETCH_TOOL,
+    ]
+    assert set(options["mcp_servers"]) == {"firecrawl"}
+    assert options["process_env"] == {"FIRECRAWL_API_KEY": "fc-test-secret"}
+    assert options["system_prompt"] == web_mcp.FIRECRAWL_ROUTING_PROMPT
+
+
+def test_firecrawl_mode_requires_key(tmp_path: Path) -> None:
+    settings = _settings(tmp_path, "firecrawl")
+    settings.bridge_firecrawl_api_key = None
+    try:
+        build_curated_web_mcp(settings)
+    except ValueError:
+        pass
+    else:  # pragma: no cover
+        raise AssertionError("expected ValueError for missing firecrawl key")
+
+
 def test_serialized_mcp_config_excludes_firecrawl_key(tmp_path: Path) -> None:
     web = build_curated_web_mcp(_settings(tmp_path))
     assert web is not None
