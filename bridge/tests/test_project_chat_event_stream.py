@@ -52,6 +52,31 @@ class ControlledIterator(AsyncIterator[str]):
         return item
 
 
+class DelayedCancellationIterator(ControlledIterator):
+    def __init__(self) -> None:
+        super().__init__()
+        self.cleanup_started = asyncio.Event()
+        self.cleanup_release = asyncio.Event()
+        self.order: list[str] = []
+
+    async def __anext__(self) -> str:
+        self.read_calls += 1
+        self.active_reads += 1
+        self.max_active_reads = max(self.max_active_reads, self.active_reads)
+        try:
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.order.append("pending-cancel-start")
+                self.cleanup_started.set()
+                await self.cleanup_release.wait()
+                self.cancelled_reads += 1
+                self.order.append("pending-cancel-done")
+                raise
+        finally:
+            self.active_reads -= 1
+
+
 async def _wait_until(predicate, *, timeout: float = 1.0) -> None:
     async with asyncio.timeout(timeout):
         while not predicate():
@@ -130,6 +155,41 @@ async def test_consumer_cancellation_cancels_and_reaps_the_pending_read() -> Non
     assert events.active_reads == 0
     assert events.cancelled_reads == 1
     await reader.cancel_pending()
+    assert events.cancelled_reads == 1
+
+
+@pytest.mark.anyio
+async def test_repeated_consumer_cancellation_cannot_overtake_pending_drain() -> None:
+    events = DelayedCancellationIterator()
+    reader = TimeoutPreservingEventReader(events)
+
+    async def consume_and_close() -> None:
+        try:
+            await reader.read(60.0)
+        finally:
+            await reader.cancel_pending()
+            assert events.active_reads == 0
+            events.order.append("aclose")
+
+    consumer = asyncio.create_task(consume_and_close())
+    await _wait_until(lambda: events.active_reads == 1)
+    consumer.cancel()
+    await events.cleanup_started.wait()
+
+    consumer.cancel()
+    await asyncio.sleep(0)
+    assert "aclose" not in events.order
+
+    events.cleanup_release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await consumer
+
+    assert events.order == [
+        "pending-cancel-start",
+        "pending-cancel-done",
+        "aclose",
+    ]
+    assert events.active_reads == 0
     assert events.cancelled_reads == 1
 
 

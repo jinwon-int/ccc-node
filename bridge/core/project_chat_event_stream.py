@@ -66,11 +66,37 @@ class TimeoutPreservingEventReader(Generic[EventT]):
         """Cancel and reap the retained read, if any."""
 
         pending = self._pending
-        self._pending = None
         if pending is None:
             return
         pending.cancel()
-        await asyncio.gather(pending, return_exceptions=True)
+        interrupted = await self._drain_pending(pending)
+        if self._pending is pending:
+            self._pending = None
+        if interrupted:
+            raise asyncio.CancelledError
+
+    @staticmethod
+    async def _drain_pending(pending: asyncio.Task[EventT]) -> bool:
+        """Finish reaping even if the caller is cancelled more than once."""
+
+        current = asyncio.current_task()
+        cancellation_count = current.cancelling() if current is not None else 0
+        interrupted = False
+        while True:
+            try:
+                await asyncio.shield(pending)
+            except asyncio.CancelledError:
+                new_count = current.cancelling() if current is not None else 0
+                if new_count > cancellation_count:
+                    interrupted = True
+                    cancellation_count = new_count
+                if pending.done():
+                    break
+            except BaseException:
+                break
+            else:
+                break
+        return interrupted
 
 
 __all__ = ["EventWaitTimeout", "TimeoutPreservingEventReader"]
