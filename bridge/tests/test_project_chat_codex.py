@@ -1665,6 +1665,109 @@ class StallSession(FakeSession):
         return stream()
 
 
+class OrderedStallIterator(AsyncIterator[AgentEvent]):
+    """A closeable iterator that records timeout cleanup ordering."""
+
+    def __init__(self, events: list[AgentEvent], order: list[str]) -> None:
+        self.events = list(events)
+        self.order = order
+        self.block = asyncio.Event()
+        self.close_calls = 0
+
+    def __aiter__(self) -> OrderedStallIterator:
+        return self
+
+    async def __anext__(self) -> AgentEvent:
+        if self.events:
+            return self.events.pop(0)
+        try:
+            await self.block.wait()
+        except asyncio.CancelledError:
+            self.order.append("pending-cancel")
+            raise
+        raise StopAsyncIteration
+
+    async def aclose(self) -> None:
+        self.close_calls += 1
+        self.order.append("aclose")
+
+
+class OrderedStallSession(FakeSession):
+    def __init__(self, session_id: str) -> None:
+        super().__init__(session_id)
+        self.order: list[str] = []
+        self.iterator = OrderedStallIterator(
+            [TextDeltaEvent("partial answer")],
+            self.order,
+        )
+
+    def send_turn(
+        self,
+        message: str,
+        *,
+        approval_handler: ApprovalHandler = deny_approval,
+    ) -> AsyncIterator[AgentEvent]:
+        del approval_handler
+        self.messages.append(message)
+        return self.iterator
+
+    async def interrupt(self) -> None:
+        self.interrupt_calls += 1
+        self.order.append("interrupt")
+
+    async def abort_stalled_turn(self) -> None:
+        self.order.append("abort")
+
+
+class BlockingOrderedInterruptSession(OrderedStallSession):
+    def __init__(self, session_id: str) -> None:
+        super().__init__(session_id)
+        self.interrupt_started = asyncio.Event()
+        self.interrupt_release = asyncio.Event()
+
+    async def interrupt(self) -> None:
+        self.interrupt_calls += 1
+        self.order.append("interrupt")
+        self.interrupt_started.set()
+        try:
+            await self.interrupt_release.wait()
+        except asyncio.CancelledError:
+            self.order.append("interrupt-cancel")
+            raise
+
+
+class TaskIdentitySession(FakeSession):
+    def __init__(self, session_id: str) -> None:
+        super().__init__(session_id)
+        self.consumer_tasks: list[asyncio.Task[object] | None] = []
+
+    def send_turn(
+        self,
+        message: str,
+        *,
+        approval_handler: ApprovalHandler = deny_approval,
+    ) -> AsyncIterator[AgentEvent]:
+        del approval_handler
+
+        async def stream() -> AsyncIterator[AgentEvent]:
+            self.messages.append(message)
+            self.consumer_tasks.append(asyncio.current_task())
+            yield TextDeltaEvent("direct")
+            self.consumer_tasks.append(asyncio.current_task())
+            yield CompletionEvent("end_turn")
+
+        return stream()
+
+
+class TaskIdentityObserver:
+    def __init__(self) -> None:
+        self.consumer_tasks: list[asyncio.Task[object] | None] = []
+
+    def observe(self, event: AgentEvent, *, session_id: str | None) -> None:
+        del event, session_id
+        self.consumer_tasks.append(asyncio.current_task())
+
+
 def _stall_handler(
     tmp_path: Path, runtime: FakeRuntime, monkeypatch: pytest.MonkeyPatch
 ) -> tuple[ProjectChatHandler, list[int]]:
@@ -1687,6 +1790,67 @@ def _stall_handler(
     handler = ProjectChatHandler(settings=settings, agent_runtime=runtime)
     handler._task_ledger_cache = False
     return handler, stalled
+
+
+@pytest.mark.anyio
+async def test_unbounded_events_keep_the_project_chat_consumer_task_identity(
+    tmp_path: Path,
+) -> None:
+    session = TaskIdentitySession("thread-1")
+    handler = _handler(tmp_path, FakeRuntime([session]))
+    observer = TaskIdentityObserver()
+    handler._lifecycle_observer = observer
+
+    response = await handler.process_message("direct", 7, 70)
+
+    assert response.success is True
+    assert len(session.consumer_tasks) == 2
+    assert len(observer.consumer_tasks) == 2
+    assert session.consumer_tasks == observer.consumer_tasks
+
+
+@pytest.mark.anyio
+async def test_terminal_stall_preserves_interrupt_cancel_abort_close_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    session = OrderedStallSession("thread-1")
+    handler, _ = _stall_handler(tmp_path, FakeRuntime([session]), monkeypatch)
+
+    response = await asyncio.wait_for(
+        handler.process_message("ordered", 7, 70),
+        timeout=5,
+    )
+
+    assert response.success is True
+    assert session.order == ["interrupt", "pending-cancel", "abort", "aclose"]
+    assert session.iterator.close_calls == 1
+
+
+@pytest.mark.anyio
+async def test_cancellation_during_interrupt_reaps_read_before_iterator_close(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    session = BlockingOrderedInterruptSession("thread-1")
+    handler, _ = _stall_handler(tmp_path, FakeRuntime([session]), monkeypatch)
+    handler._agent_interrupt_timeout_seconds = 0.01
+    task = asyncio.create_task(handler.process_message("cancel", 7, 70))
+    await session.interrupt_started.wait()
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert session.order == [
+        "interrupt",
+        "interrupt-cancel",
+        "pending-cancel",
+        "aclose",
+        # The outer request-cancellation path independently performs its
+        # existing best-effort session interrupt after stream cleanup.
+        "interrupt",
+        "interrupt-cancel",
+    ]
+    assert session.iterator.close_calls == 1
 
 
 @pytest.mark.anyio
