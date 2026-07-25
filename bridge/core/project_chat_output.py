@@ -14,8 +14,8 @@ class TurnOutputBuffer:
 
     A completed provider message remains pending until later turn activity
     proves that it was interim.  The caller owns Telegram/stream delivery and
-    reports its outcome back through :meth:`resolve_interim`; this object owns
-    only the typed, independently testable output state.
+    reports its outcome back through :meth:`resolve_pending_interim`; this
+    object owns only the typed, independently testable output state.
     """
 
     _current_message_parts: list[str] = field(default_factory=list)
@@ -32,6 +32,12 @@ class TurnOutputBuffer:
     def interim_delivered(self) -> bool:
         return self._interim_delivered
 
+    @property
+    def pending_interim(self) -> str | None:
+        """Peek at pending content; delivery cancellation leaves it intact."""
+
+        return self._pending_completed_message
+
     def append_delta(self, text: str) -> None:
         if not text:
             return
@@ -44,15 +50,14 @@ class TurnOutputBuffer:
         if completed:
             self._pending_completed_message = completed
 
-    def take_pending_interim(self) -> str | None:
+    def resolve_pending_interim(self, *, delivered: bool) -> None:
         content = self._pending_completed_message
+        if content is None:
+            return
         self._pending_completed_message = None
-        return content
-
-    def resolve_interim(self, content: str, *, delivered: bool) -> None:
         if delivered:
             self._interim_delivered = True
-        elif content:
+        else:
             self._response_parts.append(content)
 
     def render(self, cleaner: TextCleaner) -> str:

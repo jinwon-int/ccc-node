@@ -447,7 +447,7 @@ class ProjectChatProcessMixin:
 
                 async def deliver_pending_interim() -> None:
                     """Deliver a completed message only after more turn work appears."""
-                    content = output.take_pending_interim()
+                    content = output.pending_interim
                     if content is None:
                         return
                     delivered = False
@@ -464,7 +464,7 @@ class ProjectChatProcessMixin:
                                 "Interim assistant message delivery failed; "
                                 "retaining it for final delivery"
                             )
-                    output.resolve_interim(content, delivered=delivered)
+                    output.resolve_pending_interim(delivered=delivered)
 
                 async def consume_agent_events() -> None:  # noqa: C901 -- lifecycle router
                     """Consume one turn's events with a terminal-event stall guard.

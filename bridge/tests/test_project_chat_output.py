@@ -24,14 +24,14 @@ def test_successful_interim_is_not_repeated_in_final_render() -> None:
     output.append_delta("first")
     output.complete_message(_clean)
 
-    interim = output.take_pending_interim()
+    interim = output.pending_interim
     assert interim == "first"
-    output.resolve_interim(interim, delivered=True)
+    output.resolve_pending_interim(delivered=True)
     output.append_delta("second")
 
     assert output.interim_delivered
     assert output.render(_clean) == "second"
-    assert output.take_pending_interim() is None
+    assert output.pending_interim is None
 
 
 def test_failed_interim_is_retained_before_later_output() -> None:
@@ -39,9 +39,9 @@ def test_failed_interim_is_retained_before_later_output() -> None:
     output.append_delta("first")
     output.complete_message(_clean)
 
-    interim = output.take_pending_interim()
+    interim = output.pending_interim
     assert interim == "first"
-    output.resolve_interim(interim, delivered=False)
+    output.resolve_pending_interim(delivered=False)
     output.append_delta("second")
     output.complete_message(_clean)
 
@@ -53,9 +53,9 @@ def test_retained_pending_and_current_preserve_order_without_duplicates() -> Non
     output = TurnOutputBuffer()
     output.append_delta("retained")
     output.complete_message(_clean)
-    retained = output.take_pending_interim()
+    retained = output.pending_interim
     assert retained is not None
-    output.resolve_interim(retained, delivered=False)
+    output.resolve_pending_interim(delivered=False)
 
     output.append_delta("pending")
     output.complete_message(_clean)
@@ -73,15 +73,27 @@ def test_empty_delta_and_cleaned_empty_completion_are_noise() -> None:
     output.complete_message(_clean)
 
     assert output.has_text
-    assert output.take_pending_interim() is None
+    assert output.pending_interim is None
     assert output.render(_clean) == ""
 
 
-def test_pending_take_is_one_shot() -> None:
+def test_pending_peek_survives_unresolved_delivery() -> None:
     output = TurnOutputBuffer()
     output.append_delta("one")
     output.complete_message(_clean)
 
-    assert output.take_pending_interim() == "one"
-    assert output.take_pending_interim() is None
-    assert output.render(_clean) == ""
+    assert output.pending_interim == "one"
+    assert output.pending_interim == "one"
+    assert output.render(_clean) == "one"
+
+
+def test_pending_resolution_is_one_shot() -> None:
+    output = TurnOutputBuffer()
+    output.append_delta("one")
+    output.complete_message(_clean)
+
+    output.resolve_pending_interim(delivered=False)
+    output.resolve_pending_interim(delivered=False)
+
+    assert output.pending_interim is None
+    assert output.render(_clean) == "one"
