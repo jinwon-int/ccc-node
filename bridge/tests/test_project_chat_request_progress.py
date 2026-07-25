@@ -250,12 +250,12 @@ async def test_process_finalizer_claims_fallback_and_resolves_live_session() -> 
         handle=handle,
         session=Session(),
         requested_session_id="requested-session",
-        finished_at=handle.request.started_at + 0.123,
+        finished_at=handle.request.started_at + 0.125,
     )
 
     assert handle.request.lifecycle.terminal_outcome is RequestPhase.FAILED
     assert handle.request.lifecycle.terminal_cause == "finalizer-fallback"
-    assert recorder.duration_args == ("live-session", 123, False)
+    assert recorder.duration_args == ("live-session", 125, False)
 
 
 @pytest.mark.anyio
