@@ -93,7 +93,7 @@ class ProjectChatStateMixin:
         (used by /revert)."""
         await self.stop(user_id, chat_id)
         for key in self._agent_keys_for_user(user_id, chat_id):
-            self._drop_agent_session(key)
+            await self._drop_agent_session(key)
 
     def clear_pending_permissions(self, user_id: int, chat_id: Optional[int] = None) -> None:
         """Compatibility no-op retained for the bot layer (#584 slice C-2).
@@ -104,12 +104,14 @@ class ProjectChatStateMixin:
         """
         del user_id, chat_id
 
-    def _drop_agent_session(self, key, session=None) -> None:
-        """Evict the cached agent-session entry for ``key``.
+    async def _drop_agent_session(self, key, session=None) -> None:
+        """Evict and close the cached agent-session entry for ``key``.
 
         With ``session`` given, evict only while the cached entry still wraps
         that exact session object, so a concurrent turn's fresh entry is never
-        removed by a stale turn's cleanup.
+        removed by a stale turn's cleanup. Provider sessions without a
+        conversation-local ``close`` method (currently Codex) remain a cheap
+        wrapper over their shared runtime.
         """
         entry = self._agent_sessions.get(key)
         if entry is None:
@@ -117,6 +119,20 @@ class ProjectChatStateMixin:
         if session is not None and entry.session is not session:
             return
         self._agent_sessions.pop(key, None)
+        close = getattr(entry.session, "close", None)
+        if not callable(close):
+            return
+        try:
+            await asyncio.wait_for(
+                close(), timeout=self._agent_interrupt_timeout_seconds
+            )
+        except TimeoutError:
+            logger.warning(
+                "Agent session close timed out after %.1fs",
+                self._agent_interrupt_timeout_seconds,
+            )
+        except Exception:
+            logger.exception("Agent session close failed")
 
     def _agent_keys_for_user(self, user_id: int, chat_id: Optional[int] = None):
         if chat_id is not None:

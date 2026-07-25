@@ -27,6 +27,7 @@ from telegram_bot.core.heartbeat import (
     should_update_heartbeat,
 )
 from telegram_bot.utils.duration_log import (
+    append_duration_sample,
     default_duration_log_path,
     forecast_samples,
     remaining_ms,
@@ -700,6 +701,31 @@ class ProjectChatHandler(
             )
             return default_duration_log_path(Path(bot_data_dir))
         return Path(path)
+
+    def _append_duration_log(
+        self,
+        req: _PendingRequest,
+        *,
+        session_id: Optional[str],
+        duration_ms: int,
+        success: bool,
+    ) -> None:
+        """Record one terminal request without prompt or response content."""
+
+        if not getattr(self._config, "heartbeat_duration_log_enabled", True):
+            return
+        append_duration_sample(
+            path=self._duration_log_path(),
+            user_id=req.user_id,
+            chat_id=req.chat_id,
+            session_id=session_id or req.requested_session_id,
+            model=req.model,
+            duration_ms=max(0, int(duration_ms)),
+            success=success,
+            max_lines=int(
+                getattr(self._config, "heartbeat_duration_log_max_lines", 10000)
+            ),
+        )
 
     def _load_heartbeat_forecast(self, req: _PendingRequest) -> None:
         """Load the duration samples the ETA conditions on (once per request).

@@ -20,6 +20,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   arbitrary units fail closed. The #706 raw in-tree restart guard remains.
 
 ### Fixed
+- **Replaced Claude conversations no longer leave their SDK and MCP process
+  trees alive until the whole bridge restarts.** Session eviction now closes
+  conversation-local runtimes with a bounded, fail-open cleanup; closed Claude
+  sessions also remove themselves from the runtime registry. `/new`, model or
+  policy changes, runtime failures, stalls, timeouts, and `/revert` therefore
+  release the superseded client instead of accumulating hidden child trees.
+- **Heartbeat duration samples are recorded again on the provider-neutral
+  runtime path.** The Claude adapter cutover had retained ETA reads but dropped
+  the terminal write call, leaving `duration.jsonl` stale. Every finalized
+  request now appends body-free wall-clock metadata off the event loop,
+  including failed, canceled, and timed-out outcomes.
 - **A timed-out Claude turn abort could cancel SDK shutdown before it reached
   its bounded subprocess TERM/KILL escalation (#691).** Claude sessions now
   seal synchronously and keep one shielded, joinable cleanup task, so a short

@@ -249,6 +249,17 @@ class ClaudeRuntimeUnsolicitedTests(unittest.IsolatedAsyncioTestCase):
         for _ in range(5):
             await asyncio.sleep(0)
 
+    async def test_closed_session_disconnects_and_leaves_runtime_registry(self) -> None:
+        session, client = await self._start_session()
+
+        self.assertIn(session, self.runtime._sessions)
+        await session.close()
+
+        self.assertEqual(client.disconnect_calls, 1)
+        self.assertNotIn(session, self.runtime._sessions)
+        await session.close()
+        self.assertEqual(client.disconnect_calls, 1)
+
     # -- between-turns delivery --------------------------------------------
 
     async def test_between_turns_output_is_delivered_then_turns_still_work(self) -> None:
