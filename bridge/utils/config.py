@@ -350,12 +350,13 @@ class Config(
             "senders; shared-all routes every allowed DM and group to one conversation."
         ),
     )
-    bridge_web_mcp_mode: Literal["off", "searxng-firecrawl"] = Field(
+    bridge_web_mcp_mode: Literal["off", "searxng-firecrawl", "firecrawl"] = Field(
         default="off",
         alias="CCC_BRIDGE_WEB_MCP_MODE",
         description=(
-            "Opt-in curated bridge web routing. searxng-firecrawl injects only the "
-            "SearXNG search and Firecrawl scrape MCP tools without loading user settings."
+            "Opt-in curated bridge web routing. searxng-firecrawl injects SearXNG "
+            "search + Firecrawl scrape; firecrawl injects Firecrawl search + scrape "
+            "only (no SearXNG). Neither loads user filesystem settings."
         ),
     )
     bridge_searxng_url: Optional[str] = Field(
@@ -706,19 +707,20 @@ class Config(
     def validate_bridge_web_mcp_config(self):
         if self.bridge_web_mcp_mode == "off":
             return self
-        url = str(self.bridge_searxng_url or "").strip().rstrip("/")
         key = self.bridge_firecrawl_api_key
-        if not url.startswith("https://"):
-            raise ValueError(
-                "CCC_BRIDGE_WEB_MCP_MODE=searxng-firecrawl requires an HTTPS "
-                "CCC_BRIDGE_SEARXNG_URL."
-            )
         if key is None or not key.get_secret_value().strip():
             raise ValueError(
-                "CCC_BRIDGE_WEB_MCP_MODE=searxng-firecrawl requires "
+                f"CCC_BRIDGE_WEB_MCP_MODE={self.bridge_web_mcp_mode} requires "
                 "CCC_BRIDGE_FIRECRAWL_API_KEY."
             )
-        self.bridge_searxng_url = url
+        if self.bridge_web_mcp_mode == "searxng-firecrawl":
+            url = str(self.bridge_searxng_url or "").strip().rstrip("/")
+            if not url.startswith("https://"):
+                raise ValueError(
+                    "CCC_BRIDGE_WEB_MCP_MODE=searxng-firecrawl requires an HTTPS "
+                    "CCC_BRIDGE_SEARXNG_URL."
+                )
+            self.bridge_searxng_url = url
         return self
 
     # Logging
