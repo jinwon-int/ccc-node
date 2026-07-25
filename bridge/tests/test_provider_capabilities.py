@@ -278,6 +278,32 @@ class CapabilityRuntimeDriftTests(unittest.TestCase):
         self.assertIn("no official PreCompact/PostCompact event", status.reason)
         self.assertIn("turn/completed is not treated as compaction", status.reason)
 
+    def test_codex_async_completion_claim_stays_fail_closed(self) -> None:
+        from telegram_bot.core.codex_runtime import CodexRuntime
+
+        status = capability_status("codex", "async_completion_delivery")
+        self.assertIs(status.state, CapabilityState.DEGRADED)
+        self.assertEqual(status.dependencies, ("#646",))
+        for boundary in (
+            "exact bridge-owned active turn",
+            "no detached ownership signal",
+            "body-free bounded diagnostics",
+            "no Telegram send",
+            "journal",
+            "thread/read replay",
+            "Claude transcript inference",
+            "supports_async_completion_delivery=false",
+        ):
+            self.assertIn(boundary, status.reason)
+        self.assertTrue(hasattr(CodexRuntime, "supports_async_completion_delivery"))
+        self.assertTrue(hasattr(CodexRuntime, "async_completion_diagnostics"))
+        claude = capability_status("claude", "async_completion_delivery")
+        self.assertIs(claude.state, CapabilityState.SUPPORTED)
+        self.assertIn("provider-specific", claude.reason)
+        self.assertIn("at-least-once", claude.reason)
+        for forbidden in ("ownership", "durable delivery", "exactly-once"):
+            self.assertNotIn(forbidden, claude.reason)
+
 
 if __name__ == "__main__":
     unittest.main()
