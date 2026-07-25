@@ -241,6 +241,7 @@ async def test_process_finalizer_claims_fallback_and_resolves_live_session() -> 
     recorder = EffectRecorder()
     coordinator = _coordinator(recorder)
     handle = _start(coordinator)
+    handle.request.started_at = 10.0
 
     class Session:
         session_id = "live-session"
@@ -250,7 +251,7 @@ async def test_process_finalizer_claims_fallback_and_resolves_live_session() -> 
         handle=handle,
         session=Session(),
         requested_session_id="requested-session",
-        finished_at=handle.request.started_at + 0.125,
+        finished_at=10.125,
     )
 
     assert handle.request.lifecycle.terminal_outcome is RequestPhase.FAILED
@@ -263,6 +264,7 @@ async def test_process_finalizer_uses_requested_session_fallback_exactly_once() 
     recorder = EffectRecorder()
     coordinator = _coordinator(recorder)
     handle = _start(coordinator)
+    handle.request.started_at = 10.0
     handle.request.lifecycle.try_terminal(
         RequestPhase.INTERRUPTED,
         cause="restart",
@@ -278,7 +280,7 @@ async def test_process_finalizer_uses_requested_session_fallback_exactly_once() 
         handle=handle,
         session=UnreadableSession(),
         requested_session_id="requested-session",
-        finished_at=handle.request.started_at + 1.0,
+        finished_at=11.0,
     )
     first_order = list(recorder.order)
 
@@ -287,7 +289,7 @@ async def test_process_finalizer_uses_requested_session_fallback_exactly_once() 
         handle=handle,
         session=None,
         requested_session_id="different-session",
-        finished_at=handle.request.started_at + 2.0,
+        finished_at=12.0,
     )
 
     assert recorder.duration_args == ("requested-session", 1000, False)
