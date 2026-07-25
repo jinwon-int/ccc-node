@@ -10,6 +10,7 @@ import hashlib
 import logging
 import math
 import os
+import re
 import signal
 import time
 from typing import Literal, Protocol, cast
@@ -210,6 +211,26 @@ class AppServerClient(Protocol):
 
 ClientFactory = Callable[[ServerRequestHandler], AppServerClient]
 UsageRecorder = Callable[[str, UsageSnapshot | None, UsageSnapshot], object]
+_CODEX_OPAQUE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
+_RECENT_TERMINAL_TURN_LIMIT = 512
+_ASYNC_DIAGNOSTIC_COUNTER_MAX = (1 << 31) - 1
+
+
+@dataclass(frozen=True, slots=True)
+class AsyncCompletionDiagnostics:
+    """Body-free evidence for the intentionally degraded Codex boundary.
+
+    Codex app-server currently has no documented notification that proves a
+    completed turn is an owned detached/background task.  The runtime therefore
+    keeps ignoring otherwise-valid ``turn/completed`` notifications that do not
+    match its exact active turn.  These counters make that fail-closed behavior
+    observable without retaining provider ids, items, output, or raw payloads.
+    """
+
+    state: Literal["degraded"]
+    unowned_completed: int
+    late_active_duplicates: int
+    recent_terminal_turns: int
 
 
 @dataclass(slots=True)
@@ -389,7 +410,29 @@ class CodexRuntime:
         self._account_rate_limits = UsageSnapshot(provider="codex")
         self._usage_recorder: UsageRecorder | None = None
         self._turn_attempt_recorder: Callable[[], object] | None = None
+        # Bounded body-free tombstones distinguish a delayed duplicate of a
+        # bridge-owned terminal turn from a different unowned completion.  The
+        # ids never leave this in-memory map and are not exposed by diagnostics.
+        self._recent_terminal_turn_ids: dict[str, None] = {}
+        self._ignored_unowned_completions = 0
+        self._ignored_late_active_duplicates = 0
         self._closed = False
+
+    @property
+    def supports_async_completion_delivery(self) -> bool:
+        """Whether detached Codex completion delivery has a safe provider seam."""
+
+        return False
+
+    def async_completion_diagnostics(self) -> AsyncCompletionDiagnostics:
+        """Return only bounded counters; never expose provider payload content."""
+
+        return AsyncCompletionDiagnostics(
+            state="degraded",
+            unowned_completed=self._ignored_unowned_completions,
+            late_active_duplicates=self._ignored_late_active_duplicates,
+            recent_terminal_turns=len(self._recent_terminal_turn_ids),
+        )
 
     def set_turn_attempt_recorder(self, recorder: Callable[[], object]) -> None:
         """Observe each turn/start the provider accepted (the spend boundary).
@@ -880,8 +923,8 @@ class CodexRuntime:
         if notification.method == "thread/tokenUsage/updated":
             self._record_thread_usage(thread_id, params)
             return
-        active = self._active_turns.get(thread_id)
-        if active is None or active.finished:
+        active = self._routable_active_turn(notification, thread_id)
+        if active is None:
             return
         if active.turn_id is None:
             active.pending_notifications.append(notification)
@@ -921,6 +964,75 @@ class CodexRuntime:
             return
         if event is not None:
             active.queue.put_nowait(event)
+
+    def _routable_active_turn(
+        self,
+        notification: CodexNotification,
+        thread_id: str,
+    ) -> _ActiveTurn | None:
+        active = self._active_turns.get(thread_id)
+        if active is None:
+            self._observe_unowned_completion(notification, thread_id)
+            return None
+        if active.finished:
+            # A duplicate of the exact terminal notification may arrive before
+            # send_turn's finally removes the active entry. A different turn
+            # while that finished owner is still present is an active mismatch,
+            # not an async-completion observation.
+            if self._notification_turn_id(notification.params) == active.turn_id:
+                self._observe_unowned_completion(notification, thread_id)
+            return None
+        return active
+
+    def _observe_unowned_completion(
+        self,
+        notification: CodexNotification,
+        thread_id: str,
+    ) -> None:
+        """Count, but never promote, one otherwise-valid unowned completion.
+
+        A known thread plus a successful ``turn/completed`` shape does not prove
+        detached-task ownership.  It may be another client, a cleanup race, or
+        a delayed duplicate.  Keep the current no-delivery behavior and retain
+        only aggregate evidence for future provider-capability work (#646).
+        """
+
+        if notification.method != "turn/completed":
+            return
+        if thread_id not in self._thread_locks:
+            return
+        turn = notification.params.get("turn")
+        if not isinstance(turn, Mapping):
+            return
+        turn_id = turn.get("id")
+        if not isinstance(turn_id, str) or _CODEX_OPAQUE_ID_RE.fullmatch(turn_id) is None:
+            return
+        if turn.get("status") != "completed":
+            return
+        items = turn.get("items")
+        if not isinstance(items, list):
+            return
+        items_view = turn.get("itemsView", "full")
+        if items_view != "full":
+            return
+        if turn_id in self._recent_terminal_turn_ids:
+            self._ignored_late_active_duplicates = min(
+                self._ignored_late_active_duplicates + 1,
+                _ASYNC_DIAGNOSTIC_COUNTER_MAX,
+            )
+        else:
+            self._ignored_unowned_completions = min(
+                self._ignored_unowned_completions + 1,
+                _ASYNC_DIAGNOSTIC_COUNTER_MAX,
+            )
+
+    def _remember_terminal_turn(self, turn_id: str) -> None:
+        if _CODEX_OPAQUE_ID_RE.fullmatch(turn_id) is None:
+            return
+        self._recent_terminal_turn_ids[turn_id] = None
+        self._recent_terminal_turn_ids = dict(
+            tuple(self._recent_terminal_turn_ids.items())[-_RECENT_TERMINAL_TURN_LIMIT:]
+        )
 
     def _record_thread_usage(self, thread_id: str, params: Mapping[str, JsonValue]) -> None:
         previous = self._thread_usage.get(thread_id)
@@ -1040,15 +1152,17 @@ class CodexRuntime:
         success = status in {"completed", "success"} and exit_code in {None, 0}
         return ToolCompletedEvent(item_id, tool_name, snapshot, success)
 
-    @staticmethod
-    def _complete_turn(active: _ActiveTurn, params: Mapping[str, JsonValue]) -> None:
+    def _complete_turn(self, active: _ActiveTurn, params: Mapping[str, JsonValue]) -> None:
         turn = params.get("turn")
         if not isinstance(turn, Mapping):
             return
+        turn_id = turn.get("id")
         status = turn.get("status")
         if status in {"completed", "success"}:
             active.queue.put_nowait(ResultEvent(cast(AgentJsonValue, turn)))
             active.queue.put_nowait(CompletionEvent("end_turn"))
+            if isinstance(turn_id, str):
+                self._remember_terminal_turn(turn_id)
         elif status in {"interrupted", "cancelled"}:
             active.queue.put_nowait(ErrorEvent("interrupted", "Codex turn was interrupted"))
         else:
