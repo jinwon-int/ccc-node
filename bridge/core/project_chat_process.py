@@ -36,6 +36,7 @@ from telegram_bot.core.project_chat_types import (
     TypingCallback,
     _PendingRequest,
 )
+from telegram_bot.core.project_chat_output import TurnOutputBuffer
 from telegram_bot.core.request_lifecycle import (
     RequestPhase,
     TerminalAttemptKind,
@@ -398,11 +399,7 @@ class ProjectChatProcessMixin:
                 self._agent_active_sessions[key] = session
                 self._agent_started_at[key] = asyncio.get_running_loop().time()
                 self._agent_waiting_for_turn.add(key)
-                text_parts: list[str] = []
-                response_parts: list[str] = []
-                current_message_parts: list[str] = []
-                pending_completed_message: str | None = None
-                interim_delivered = False
+                output = TurnOutputBuffer()
                 terminal_error: ErrorEvent | None = None
 
                 async def handle_approval(
@@ -450,8 +447,7 @@ class ProjectChatProcessMixin:
 
                 async def deliver_pending_interim() -> None:
                     """Deliver a completed message only after more turn work appears."""
-                    nonlocal pending_completed_message, interim_delivered
-                    content = pending_completed_message
+                    content = output.take_pending_interim()
                     if content is None:
                         return
                     delivered = False
@@ -468,20 +464,7 @@ class ProjectChatProcessMixin:
                                 "Interim assistant message delivery failed; "
                                 "retaining it for final delivery"
                             )
-                    if delivered:
-                        interim_delivered = True
-                    else:
-                        response_parts.append(content)
-                    pending_completed_message = None
-
-                def response_content() -> str:
-                    parts = list(response_parts)
-                    if pending_completed_message is not None:
-                        parts.append(pending_completed_message)
-                    current = self._clean_response("".join(current_message_parts))
-                    if current:
-                        parts.append(current)
-                    return "\n\n".join(part for part in parts if part)
+                    output.resolve_interim(content, delivered=delivered)
 
                 async def consume_agent_events() -> None:  # noqa: C901 -- lifecycle router
                     """Consume one turn's events with a terminal-event stall guard.
@@ -493,7 +476,6 @@ class ProjectChatProcessMixin:
                     conversation until the full process timeout.
                     """
                     nonlocal terminal_error, stalled, admission_stalled
-                    nonlocal pending_completed_message
                     nonlocal attempt_recorded
                     busy_depth = 0
                     approval_pending = False
@@ -552,7 +534,7 @@ class ProjectChatProcessMixin:
                         while True:
                             stall_eligible = (
                                 stall_grace > 0
-                                and bool(text_parts)
+                                and output.has_text
                                 and busy_depth <= 0
                                 and not approval_pending
                             )
@@ -612,16 +594,12 @@ class ProjectChatProcessMixin:
                                 # the prior message was interim rather than final.
                                 await deliver_pending_interim()
                                 progress_request.last_text_at = now
-                                text_parts.append(event.text)
-                                current_message_parts.append(event.text)
+                                output.append_delta(event.text)
                                 if streaming_handler:
                                     await streaming_handler.update_if_needed(event.text)
                                     progress_request.last_visible_progress_at = now
                             elif isinstance(event, MessageCompletedEvent):
-                                completed = self._clean_response("".join(current_message_parts))
-                                current_message_parts.clear()
-                                if completed:
-                                    pending_completed_message = completed
+                                output.complete_message(self._clean_response)
                             elif isinstance(event, ToolStartedEvent):
                                 # Look ahead by one meaningful lifecycle event:
                                 # tool work means the completed text should be a
@@ -728,9 +706,9 @@ class ProjectChatProcessMixin:
                         health_reporter.record_stalled_request()
                     except Exception:
                         pass
-                    content = response_content()
+                    content = output.render(self._clean_response)
                     streamed = final_streamed
-                    if not content and interim_delivered:
+                    if not content and output.interim_delivered:
                         streamed = True
                     content = content or "(No response)"
                     return ChatResponse(
@@ -743,9 +721,9 @@ class ProjectChatProcessMixin:
                 final_streamed = False
                 if streaming_handler:
                     final_streamed = await streaming_handler.finalize_all()
-                content = response_content()
+                content = output.render(self._clean_response)
                 streamed = final_streamed
-                if not content and interim_delivered:
+                if not content and output.interim_delivered:
                     streamed = True
                 content = content or "(No response)"
                 if terminal_error is not None:
