@@ -67,6 +67,7 @@ class FakeClient:
         self.server_request_handler = server_request_handler
         self.start_calls = 0
         self.close_calls = 0
+        self.close_gate: asyncio.Event | None = None
         self.thread_start_calls: list[dict[str, Any]] = []
         self.thread_resume_calls: list[dict[str, Any]] = []
         self.thread_rollback_calls: list[dict[str, Any]] = []
@@ -203,6 +204,8 @@ class FakeClient:
 
     async def close(self) -> None:
         self.close_calls += 1
+        if self.close_gate is not None:
+            await self.close_gate.wait()
 
 
 class CodexRuntimeTests(unittest.IsolatedAsyncioTestCase):
@@ -284,6 +287,76 @@ class CodexRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 ModelInfo("codex-b", "Codex B"),
             ),
         )
+
+    async def test_idle_recycle_replaces_app_server_and_resumes_durable_thread(
+        self,
+    ) -> None:
+        first_session = await self.runtime.start_or_resume(
+            SessionRequest(working_directory="/workspace")
+        )
+        first_client = self.clients[0]
+
+        recycled = await self.runtime.recycle()
+        resumed = await self.runtime.start_or_resume(
+            SessionRequest(
+                working_directory="/workspace",
+                session_id=first_session.session_id,
+            )
+        )
+
+        self.assertTrue(recycled)
+        self.assertEqual(first_client.close_calls, 1)
+        self.assertEqual(len(self.clients), 2)
+        second_client = self.clients[1]
+        self.assertEqual(second_client.start_calls, 1)
+        self.assertEqual(
+            second_client.thread_resume_calls,
+            [
+                {
+                    "thread_id": "thread-new",
+                    "cwd": "/workspace",
+                    "model": None,
+                }
+            ],
+        )
+        self.assertEqual(resumed.session_id, "thread-new")
+
+    async def test_recycle_refuses_unstarted_or_active_runtime(self) -> None:
+        self.assertFalse(await self.runtime.recycle())
+        await self.runtime._ensure_started()
+        self.runtime._active_turns["thread-active"] = cast(Any, object())
+
+        self.assertFalse(await self.runtime.recycle())
+        self.assertEqual(self.clients[0].close_calls, 0)
+
+        self.runtime._active_turns.clear()
+
+    async def test_cancelled_recycle_finishes_close_and_installs_fresh_client(
+        self,
+    ) -> None:
+        await self.runtime._ensure_started()
+        first_client = self.clients[0]
+        first_client.close_gate = asyncio.Event()
+        task = asyncio.create_task(self.runtime.recycle())
+        while first_client.close_calls == 0:
+            await asyncio.sleep(0)
+
+        task.cancel()
+        await asyncio.sleep(0)
+        self.assertFalse(task.done())
+        first_client.close_gate.set()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+
+        self.assertEqual(len(self.clients), 2)
+        session = await self.runtime.start_or_resume(
+            SessionRequest(
+                working_directory="/workspace",
+                session_id="thread-after-cancel",
+            )
+        )
+        self.assertEqual(session.session_id, "thread-after-cancel")
+        self.assertEqual(self.clients[1].start_calls, 1)
 
     async def test_resume_rolls_back_idle_last_turn_with_orphaned_dynamic_tool_call(
         self,

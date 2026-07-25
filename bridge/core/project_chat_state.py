@@ -6,10 +6,165 @@ import asyncio
 import logging
 from typing import Optional
 
+from telegram_bot.utils.session_resource_guard import process_tree_rss_mb
+
 logger = logging.getLogger(__name__)
 
 
 class ProjectChatStateMixin:
+    def session_resource_snapshot(self) -> dict[str, int | float]:
+        """Return body-free counters for health.json and fleet diagnostics."""
+
+        return {
+            "resident_sessions": len(self._agent_sessions),
+            "active_sessions": len(self._agent_active_sessions),
+            "tree_rss_mb": self._session_guard_last_tree_rss_mb,
+            "evictions": self._session_guard_evictions,
+            "runtime_recycles": self._session_guard_runtime_recycles,
+            "codex_attachments": self._agent_session_attachments,
+        }
+
+    async def enforce_session_resource_limits(
+        self, *, now: float | None = None
+    ) -> dict[str, int | float]:
+        """Close least-recently-used idle sessions and recycle idle Codex.
+
+        The provider's durable session id lives in ``sessions.json`` and is not
+        changed here. A later message therefore resumes the same conversation.
+        Active turns are never evicted or used as a runtime-recycle boundary.
+        """
+
+        if not bool(getattr(self._config, "session_guard_enabled", False)):
+            return self.session_resource_snapshot()
+        current = asyncio.get_running_loop().time() if now is None else float(now)
+        async with self._session_guard_lock:
+            active_keys = set(self._agent_active_sessions)
+            idle = [
+                (key, entry)
+                for key, entry in self._agent_sessions.items()
+                if key not in active_keys
+            ]
+            idle.sort(key=lambda item: float(getattr(item[1], "last_used_at", 0.0)))
+
+            ttl = int(getattr(self._config, "session_idle_ttl_seconds", 4 * 60 * 60))
+            candidates: list[object] = [
+                key
+                for key, entry in idle
+                if current - float(getattr(entry, "last_used_at", 0.0)) >= ttl
+            ]
+
+            maximum = int(getattr(self._config, "max_resident_sessions", 2))
+            projected = len(self._agent_sessions) - len(candidates)
+            if projected > maximum:
+                for key, _entry in idle:
+                    if key in candidates:
+                        continue
+                    candidates.append(key)
+                    projected -= 1
+                    if projected <= maximum:
+                        break
+
+            rss_mb = await asyncio.to_thread(process_tree_rss_mb)
+            self._session_guard_last_tree_rss_mb = rss_mb
+            rss_limit = int(
+                getattr(self._config, "session_tree_rss_limit_mb", 1024)
+            )
+            memory_high = rss_limit > 0 and rss_mb >= rss_limit
+            if memory_high and not active_keys:
+                for key, _entry in idle:
+                    if key not in candidates:
+                        candidates.append(key)
+
+            evicted = 0
+            for key in candidates:
+                if key in self._agent_active_sessions:
+                    continue
+                before = len(self._agent_sessions)
+                await self._drop_agent_session(key)
+                evicted += int(len(self._agent_sessions) < before)
+            if evicted:
+                self._session_guard_evictions += evicted
+                if getattr(self._config, "agent_provider", "claude") == "codex":
+                    self._agent_runtime_recycle_pending = True
+                logger.info(
+                    "Session resource guard evicted %d idle session(s); "
+                    "resident=%d rss_mb=%.1f",
+                    evicted,
+                    len(self._agent_sessions),
+                    rss_mb,
+                )
+
+            attachment_limit = int(
+                getattr(self._config, "codex_max_session_attachments", 2)
+            )
+            attachment_high = (
+                attachment_limit > 0
+                and self._agent_session_attachments >= attachment_limit
+            )
+            if (
+                getattr(self._config, "agent_provider", "claude") == "codex"
+                and not self._agent_active_sessions
+                and (
+                    memory_high
+                    or attachment_high
+                    or self._agent_runtime_recycle_pending
+                )
+            ):
+                reason = (
+                    "rss-high"
+                    if memory_high
+                    else "attachment-cap"
+                    if attachment_high
+                    else "idle-eviction"
+                )
+                await self._recycle_agent_runtime_locked(reason)
+            return self.session_resource_snapshot()
+
+    async def _prepare_agent_session_start_locked(self) -> None:
+        """Recycle before a new Codex attachment would exceed the hard cap."""
+
+        if not bool(getattr(self._config, "session_guard_enabled", False)):
+            return
+        if getattr(self._config, "agent_provider", "claude") != "codex":
+            return
+        limit = int(getattr(self._config, "codex_max_session_attachments", 2))
+        if limit <= 0 or self._agent_session_attachments < limit:
+            return
+        self._agent_runtime_recycle_pending = True
+        if not self._agent_active_sessions:
+            await self._recycle_agent_runtime_locked("attachment-cap")
+
+    async def _recycle_agent_runtime_locked(self, reason: str) -> bool:
+        """Restart a shared idle runtime while preserving durable thread ids."""
+
+        if self._agent_active_sessions:
+            self._agent_runtime_recycle_pending = True
+            return False
+        recycle = getattr(self._agent_runtime, "recycle", None)
+        if not callable(recycle):
+            logger.warning("Session resource guard cannot recycle this agent runtime")
+            return False
+
+        # Cached CodexSession wrappers belong to the old app-server connection.
+        # The bot/session store still owns their durable thread ids, so the next
+        # message reconstructs a wrapper through thread/resume.
+        self._agent_sessions.clear()
+        try:
+            recycled = await asyncio.wait_for(recycle(), timeout=15.0)
+        except TimeoutError:
+            logger.warning("Agent runtime recycle timed out after 15s")
+            return False
+        except Exception:
+            logger.exception("Agent runtime recycle failed")
+            return False
+        if not recycled:
+            return False
+        self._agent_session_attachments = 0
+        self._agent_runtime_recycle_pending = False
+        self._session_guard_runtime_recycles += 1
+        logger.info("Session resource guard recycled idle runtime reason=%s", reason)
+        return True
+
     def _next_agent_generation(self, key) -> int:
         generation = self._agent_generation_counters.get(key, 0) + 1
         self._agent_generation_counters[key] = generation

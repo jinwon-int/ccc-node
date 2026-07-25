@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import math
 import os
 import signal
 import shutil
@@ -532,6 +533,7 @@ class BotLifecycleMixin:
             distill_honcho_sink_task = None
             skill_candidate_collector_task = None
             health_alerts_task = None
+            session_resource_guard_task = None
             restart_receipt_task = None
             try:
                 await self.application.start()
@@ -571,6 +573,11 @@ class BotLifecycleMixin:
                 health_alerts_task = asyncio.create_task(
                     self._health_alerts_probe(stop_event), name="health-alerts"
                 )
+                if getattr(self._config, "session_guard_enabled", False):
+                    session_resource_guard_task = asyncio.create_task(
+                        self._session_resource_guard(stop_event),
+                        name="session-resource-guard",
+                    )
                 if getattr(self._config, "restart_handoff", "off") == "systemd":
                     restart_receipt_task = asyncio.create_task(
                         self._restart_receipt_loop(stop_event), name="restart-receipt"
@@ -711,6 +718,7 @@ class BotLifecycleMixin:
                     workload_task,
                     dead_session_recovery_task,
                     health_alerts_task,
+                    session_resource_guard_task,
                     restart_receipt_task,
                     distill_snapshot_task,
                     distill_extraction_task,
@@ -1309,6 +1317,40 @@ class BotLifecycleMixin:
                 raise
             except Exception as exc:  # detection must never hurt the bridge
                 logger.debug("Health probe tick failed: %s", type(exc).__name__)
+
+    async def _session_resource_guard(self, stop_event: asyncio.Event) -> None:
+        """Periodically release idle provider and MCP process trees.
+
+        Enforcement is delegated to ProjectChat, which owns the active-session
+        registry and can therefore guarantee that no in-flight request is
+        interrupted. Failures are logged and retried on the next bounded tick.
+        """
+
+        raw_interval = getattr(
+            self._config, "session_guard_interval_seconds", 60.0
+        )
+        try:
+            interval = float(raw_interval)
+        except (TypeError, ValueError):
+            interval = 60.0
+        if not math.isfinite(interval):
+            interval = 60.0
+        interval = min(max(interval, 10.0), 3600.0)
+        while not stop_event.is_set():
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=interval)
+                return
+            except asyncio.TimeoutError:
+                pass
+            try:
+                await self._project_chat.enforce_session_resource_limits()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning(
+                    "Session resource guard sweep failed; continuing",
+                    exc_info=True,
+                )
 
     async def _workload_reporter(self, stop_event: asyncio.Event):
         """Publish in-flight request count to health.json on a fixed interval.

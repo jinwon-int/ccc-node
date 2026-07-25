@@ -28,6 +28,7 @@ class _Runtime:
         self.requests: list[SessionRequest] = []
         self.snapshot_requests: list[str] = []
         self.closed = False
+        self.recycle_calls = 0
 
     async def start_or_resume(self, request: SessionRequest) -> _Session:
         self.requests.append(request)
@@ -54,6 +55,10 @@ class _Runtime:
 
     async def close(self) -> None:
         self.closed = True
+
+    async def recycle(self) -> bool:
+        self.recycle_calls += 1
+        return True
 
 
 def _environment(scope: str) -> dict[str, str]:
@@ -110,6 +115,32 @@ async def test_pool_reuses_one_runtime_per_environment_and_routes_usage() -> Non
 
     await pool.close()
     assert all(runtime.closed for runtime in runtimes)
+
+
+@pytest.mark.anyio
+async def test_pool_recycles_each_materialized_audience_runtime() -> None:
+    runtimes: list[_Runtime] = []
+
+    def factory(environment: Mapping[str, str]) -> _Runtime:
+        runtime = _Runtime(environment)
+        runtimes.append(runtime)
+        return runtime
+
+    pool = CodexRuntimePool(
+        shared_environment=_environment("shared"),
+        runtime_factory=factory,
+    )
+    for scope in ("private-a", "private-b"):
+        await pool.start_or_resume(
+            SessionRequest(
+                working_directory="/workspace",
+                session_id=f"thread-{scope}",
+                memory_environment=_environment(scope),
+            )
+        )
+
+    assert await pool.recycle() is True
+    assert [runtime.recycle_calls for runtime in runtimes] == [1, 1]
 
 
 @pytest.mark.anyio

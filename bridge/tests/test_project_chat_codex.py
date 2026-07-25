@@ -41,6 +41,7 @@ from telegram_bot.core.agent_runtime import (
     deny_approval,
 )
 from telegram_bot.core.project_chat import ProjectChatHandler
+from telegram_bot.core.project_chat_types import AgentSessionEntry
 from telegram_bot.core.task_ledger import TaskLedger
 
 
@@ -73,6 +74,7 @@ def _settings(tmp_path: Path, provider: str = "codex") -> SimpleNamespace:
         enable_partial_streaming=False,
         bot_data_dir=None,
         task_ledger_path=None,
+        session_guard_enabled=False,
     )
 
 
@@ -117,6 +119,7 @@ class FakeRuntime:
         self.sessions = sessions or []
         self.requests: list[SessionRequest] = []
         self.close_calls = 0
+        self.recycle_calls = 0
         self.supports_session_browsing = True
         self.session_summaries = (SessionSummary("thread-1", preview="hello"),)
         self.session_history = SessionHistory(
@@ -141,6 +144,10 @@ class FakeRuntime:
 
     async def close(self) -> None:
         self.close_calls += 1
+
+    async def recycle(self) -> bool:
+        self.recycle_calls += 1
+        return True
 
 
 def _handler(tmp_path: Path, runtime: FakeRuntime) -> ProjectChatHandler:
@@ -238,6 +245,12 @@ def test_agent_provider_settings_default_and_reject_unknown(tmp_path: Path) -> N
     assert settings.codex_memory_materializer_path == str(
         tmp_path / ".claude" / "hooks" / "ccc_codex_memory.py"
     )
+    assert settings.session_guard_enabled is True
+    assert settings.session_guard_interval_seconds == 60.0
+    assert settings.session_idle_ttl_seconds == 4 * 60 * 60
+    assert settings.max_resident_sessions == 2
+    assert settings.session_tree_rss_limit_mb == 1024
+    assert settings.codex_max_session_attachments == 2
     codex_settings = settings_class.load(
         project_root=tmp_path / "project",
         environ={
@@ -246,6 +259,12 @@ def test_agent_provider_settings_default_and_reject_unknown(tmp_path: Path) -> N
             "CCC_CODEX_CLI_PATH": "/opt/bin/codex-test",
             "CCC_CODEX_MEMORY_MATERIALIZER_PATH": "/opt/lib/ccc-materialize",
             "CCC_CODEX_MEMORY_BOOTSTRAP_TIMEOUT_SEC": "4.5",
+            "CCC_BRIDGE_SESSION_GUARD_ENABLED": "false",
+            "CCC_BRIDGE_SESSION_GUARD_INTERVAL_SECONDS": "120",
+            "CCC_BRIDGE_SESSION_IDLE_TTL_SECONDS": "7200",
+            "CCC_BRIDGE_MAX_RESIDENT_SESSIONS": "3",
+            "CCC_BRIDGE_SESSION_TREE_RSS_LIMIT_MB": "2048",
+            "CCC_BRIDGE_CODEX_MAX_ATTACHMENTS": "4",
         },
         bot_env_file=tmp_path / "missing.env",
     )
@@ -253,6 +272,12 @@ def test_agent_provider_settings_default_and_reject_unknown(tmp_path: Path) -> N
     assert codex_settings.codex_cli_path == "/opt/bin/codex-test"
     assert codex_settings.codex_memory_materializer_path == "/opt/lib/ccc-materialize"
     assert codex_settings.codex_memory_bootstrap_timeout_seconds == 4.5
+    assert codex_settings.session_guard_enabled is False
+    assert codex_settings.session_guard_interval_seconds == 120.0
+    assert codex_settings.session_idle_ttl_seconds == 7200
+    assert codex_settings.max_resident_sessions == 3
+    assert codex_settings.session_tree_rss_limit_mb == 2048
+    assert codex_settings.codex_max_session_attachments == 4
     custom_harness = tmp_path / "custom-claude"
     custom_settings = settings_class.load(
         project_root=tmp_path / "project",
@@ -440,6 +465,163 @@ async def test_claude_new_session_closes_replaced_conversation_session(
     assert previous.close_calls == 1
     assert replacement.close_calls == 0
     assert len(runtime.requests) == 2
+
+
+@pytest.mark.anyio
+async def test_session_guard_closes_expired_idle_session_but_protects_active(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings(tmp_path, provider="claude")
+    settings.session_guard_enabled = True
+    settings.session_idle_ttl_seconds = 100
+    settings.max_resident_sessions = 10
+    settings.session_tree_rss_limit_mb = 0
+    runtime = FakeRuntime()
+    handler = ProjectChatHandler(settings=settings, agent_runtime=runtime)
+    idle = CloseableFakeSession("idle")
+    active = CloseableFakeSession("active")
+    idle_key = (7, 70)
+    active_key = (7, 71)
+    handler._agent_sessions[idle_key] = AgentSessionEntry(
+        session=idle, last_used_at=50.0
+    )
+    handler._agent_sessions[active_key] = AgentSessionEntry(
+        session=active, last_used_at=50.0
+    )
+    handler._agent_active_sessions[active_key] = active
+    monkeypatch.setitem(
+        handler.enforce_session_resource_limits.__func__.__globals__,
+        "process_tree_rss_mb",
+        lambda: 0.0,
+    )
+
+    snapshot = await handler.enforce_session_resource_limits(now=200.0)
+
+    assert idle.close_calls == 1
+    assert active.close_calls == 0
+    assert idle_key not in handler._agent_sessions
+    assert active_key in handler._agent_sessions
+    assert snapshot["resident_sessions"] == 1
+    assert snapshot["active_sessions"] == 1
+    assert snapshot["evictions"] == 1
+
+
+@pytest.mark.anyio
+async def test_session_guard_enforces_lru_cap_for_idle_claude_sessions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings(tmp_path, provider="claude")
+    settings.session_guard_enabled = True
+    settings.session_idle_ttl_seconds = 10_000
+    settings.max_resident_sessions = 2
+    settings.session_tree_rss_limit_mb = 0
+    runtime = FakeRuntime()
+    handler = ProjectChatHandler(settings=settings, agent_runtime=runtime)
+    sessions = [CloseableFakeSession(str(index)) for index in range(3)]
+    for index, session in enumerate(sessions):
+        handler._agent_sessions[(7, 70 + index)] = AgentSessionEntry(
+            session=session, last_used_at=10.0 + index
+        )
+    monkeypatch.setitem(
+        handler.enforce_session_resource_limits.__func__.__globals__,
+        "process_tree_rss_mb",
+        lambda: 0.0,
+    )
+
+    snapshot = await handler.enforce_session_resource_limits(now=100.0)
+
+    assert [session.close_calls for session in sessions] == [1, 0, 0]
+    assert snapshot["resident_sessions"] == 2
+    assert snapshot["evictions"] == 1
+
+
+@pytest.mark.anyio
+async def test_session_guard_recycles_idle_codex_runtime_above_rss_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings(tmp_path, provider="codex")
+    settings.session_guard_enabled = True
+    settings.session_idle_ttl_seconds = 10_000
+    settings.max_resident_sessions = 10
+    settings.session_tree_rss_limit_mb = 100
+    settings.codex_max_session_attachments = 0
+    runtime = FakeRuntime()
+    handler = ProjectChatHandler(settings=settings, agent_runtime=runtime)
+    handler._agent_sessions[(7, 70)] = AgentSessionEntry(
+        session=FakeSession("thread-old"), last_used_at=100.0
+    )
+    monkeypatch.setitem(
+        handler.enforce_session_resource_limits.__func__.__globals__,
+        "process_tree_rss_mb",
+        lambda: 150.0,
+    )
+
+    snapshot = await handler.enforce_session_resource_limits(now=200.0)
+
+    assert runtime.recycle_calls == 1
+    assert handler._agent_sessions == {}
+    assert snapshot["tree_rss_mb"] == 150.0
+    assert snapshot["evictions"] == 1
+    assert snapshot["runtime_recycles"] == 1
+
+
+@pytest.mark.anyio
+async def test_session_guard_defers_codex_rss_recycle_until_all_turns_are_idle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings(tmp_path, provider="codex")
+    settings.session_guard_enabled = True
+    settings.session_idle_ttl_seconds = 10_000
+    settings.max_resident_sessions = 10
+    settings.session_tree_rss_limit_mb = 100
+    settings.codex_max_session_attachments = 0
+    runtime = FakeRuntime()
+    handler = ProjectChatHandler(settings=settings, agent_runtime=runtime)
+    session = FakeSession("thread-active")
+    key = (7, 70)
+    handler._agent_sessions[key] = AgentSessionEntry(
+        session=session, last_used_at=100.0
+    )
+    handler._agent_active_sessions[key] = session
+    monkeypatch.setitem(
+        handler.enforce_session_resource_limits.__func__.__globals__,
+        "process_tree_rss_mb",
+        lambda: 150.0,
+    )
+
+    busy = await handler.enforce_session_resource_limits(now=200.0)
+    handler._agent_active_sessions.clear()
+    idle = await handler.enforce_session_resource_limits(now=201.0)
+
+    assert busy["active_sessions"] == 1
+    assert busy["runtime_recycles"] == 0
+    assert runtime.recycle_calls == 1
+    assert idle["active_sessions"] == 0
+    assert idle["runtime_recycles"] == 1
+
+
+@pytest.mark.anyio
+async def test_codex_attachment_cap_recycles_before_third_session_wrapper(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path, provider="codex")
+    settings.session_guard_enabled = True
+    settings.codex_max_session_attachments = 2
+    settings.session_tree_rss_limit_mb = 0
+    runtime = FakeRuntime(
+        [FakeSession("one"), FakeSession("two"), FakeSession("three")]
+    )
+    handler = ProjectChatHandler(settings=settings, agent_runtime=runtime)
+    handler._task_ledger_cache = False
+
+    await handler.process_message("first", 7, 70, new_session=True)
+    await handler.process_message("second", 7, 70, new_session=True)
+    await handler.process_message("third", 7, 70, new_session=True)
+
+    assert runtime.recycle_calls == 1
+    assert [request.session_id for request in runtime.requests] == [None, None, None]
+    assert handler._agent_session_attachments == 1
+    assert handler.session_resource_snapshot()["runtime_recycles"] == 1
 
 
 @pytest.mark.anyio

@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Default-on resident session resource guard.** A 60-second body-free sweep
+  closes conversation-local runtimes after four idle hours, keeps at most two
+  cached sessions with active-turn protection, and applies a 1 GiB bridge-tree
+  RSS high-water mark. Codex additionally recycles its idle app-server before
+  a third conversation attachment so superseded MCP subprocess generations
+  cannot accumulate. Durable provider session ids are never deleted: the next
+  message reconnects and resumes the same conversation. Health signals expose
+  resident/active counts, RSS, evictions, attachments, and runtime recycles.
 - **Fail-closed Codex async-completion capability boundary (#646).** The
   runtime now exposes a body-free degraded diagnostic for otherwise-valid
   `turn/completed` notifications that do not match its exact active turn,
