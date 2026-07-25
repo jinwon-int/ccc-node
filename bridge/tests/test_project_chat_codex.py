@@ -771,6 +771,23 @@ async def test_runtime_path_appends_terminal_duration_samples(
 
 
 @pytest.mark.anyio
+async def test_finalization_failure_still_deactivates_active_session(
+    tmp_path: Path,
+) -> None:
+    handler = _handler(tmp_path, FakeRuntime([FakeSession("finalize-failure")]))
+
+    def fail_duration(*_args, **_kwargs) -> None:
+        raise OSError("duration unavailable")
+
+    handler._append_duration_log = fail_duration
+
+    with pytest.raises(OSError, match="duration unavailable"):
+        await handler.process_message("finish", user_id=7, chat_id=70)
+
+    assert handler.session_resource_snapshot()["active_sessions"] == 0
+
+
+@pytest.mark.anyio
 async def test_claude_adapter_approvals_use_the_generation_gated_callback(
     tmp_path: Path,
 ) -> None:

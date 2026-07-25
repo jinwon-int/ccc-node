@@ -30,6 +30,10 @@ from telegram_bot.core.project_chat_types import (
     _PendingRequest,
 )
 from telegram_bot.core.project_chat_output import TurnOutputBuffer
+from telegram_bot.core.project_chat_request_progress import (
+    RequestProgressCoordinator,
+    RequestProgressHandle,
+)
 from telegram_bot.core.project_chat_turn_consumer import (
     TurnEventDirective,
     TurnStreamOutcome,
@@ -70,6 +74,48 @@ def _claim_request_terminal(request: _PendingRequest, phase: RequestPhase, *, ca
             attempt.cause,
         )
     return attempt.kind is TerminalAttemptKind.WON
+
+
+async def _finalize_request_progress(
+    *,
+    coordinator: RequestProgressCoordinator,
+    handle: RequestProgressHandle,
+    session: Any | None,
+    requested_session_id: str | None,
+    finished_at: float,
+) -> None:
+    """Keep lifecycle authority in the caller and delegate only ordered effects."""
+
+    request = handle.request
+    if not request.lifecycle.is_terminal:
+        _claim_request_terminal(
+            request,
+            RequestPhase.FAILED,
+            cause="finalizer-fallback",
+        )
+    if not request.lifecycle.begin_finalization():
+        return
+
+    terminal_outcome = request.lifecycle.terminal_outcome
+    assert terminal_outcome is not None
+    resolved_session_id = requested_session_id
+    if session is not None:
+        try:
+            resolved_session_id = session.session_id
+        except Exception:
+            pass
+    await coordinator.finalize(
+        handle,
+        terminal_outcome=terminal_outcome,
+        session_id=resolved_session_id,
+        duration_ms=int(
+            max(
+                0.0,
+                finished_at - request.started_at,
+            )
+            * 1000
+        ),
+    )
 
 
 def _log_user_input(
@@ -370,29 +416,24 @@ class ProjectChatProcessMixin:
 
         async with self._get_conversation_lock(user_id, chat_id):
             loop = asyncio.get_running_loop()
-            progress_future: asyncio.Future[None] = loop.create_future()
-            progress_request = _PendingRequest(
+            progress_coordinator = RequestProgressCoordinator(
+                ledger_create=self._ledger_create,
+                progress_loop=self._agent_progress_loop,
+                cleanup_heartbeat=self._cleanup_heartbeat,
+                append_duration_log=self._append_duration_log,
+                ledger_finish=self._ledger_finish,
+            )
+            progress_handle = progress_coordinator.start(
                 user_id=user_id,
                 chat_id=chat_id,
                 model=model,
                 requested_session_id=session_id,
-                permission_callback=None,
                 typing_callback=typing_callback,
-                future=progress_future,
                 status_callback=status_callback,
                 streaming_handler=streaming_handler,
+                usage_mode=usage_mode,
             )
-            progress_request.usage_mode = usage_mode
-            progress_request.started_at = loop.time()
-            progress_request.task_id = self._ledger_create(
-                user_id,
-                chat_id,
-                initial_state=RequestPhase.WAITING_FOR_TURN.value,
-            )
-            progress_task = asyncio.create_task(
-                self._agent_progress_loop(progress_request),
-                name=f"agent-progress-{user_id}-{chat_id}",
-            )
+            progress_request = progress_handle.request
             session = None
             turn_token: ActiveToken | None = None
             try:
@@ -777,46 +818,17 @@ class ProjectChatProcessMixin:
                     session_id=session.session_id if session is not None else session_id,
                 )
             finally:
-                if not progress_request.lifecycle.is_terminal:
-                    _claim_request_terminal(
-                        progress_request,
-                        RequestPhase.FAILED,
-                        cause="finalizer-fallback",
+                try:
+                    await _finalize_request_progress(
+                        coordinator=progress_coordinator,
+                        handle=progress_handle,
+                        session=session,
+                        requested_session_id=session_id,
+                        finished_at=loop.time(),
                     )
-                if progress_request.lifecycle.begin_finalization():
-                    if not progress_future.done():
-                        progress_future.set_result(None)
-                    try:
-                        await asyncio.wait_for(progress_task, timeout=5.0)
-                    except TimeoutError:
-                        progress_task.cancel()
-                        await asyncio.gather(progress_task, return_exceptions=True)
-                    cleaned = await self._cleanup_heartbeat(progress_request)
-                    terminal_outcome = progress_request.lifecycle.terminal_outcome
-                    if terminal_outcome is not None:
-                        resolved_session_id = session_id
-                        if session is not None:
-                            try:
-                                resolved_session_id = session.session_id
-                            except Exception:
-                                pass
-                        await asyncio.to_thread(
-                            self._append_duration_log,
-                            progress_request,
-                            session_id=resolved_session_id,
-                            duration_ms=int(
-                                max(0.0, loop.time() - progress_request.started_at)
-                                * 1000
-                            ),
-                            success=terminal_outcome is RequestPhase.COMPLETED,
+                finally:
+                    if turn_token is not None:
+                        self._agent_session_registry.deactivate_if_same(
+                            turn_token,
+                            touch_at=loop.time(),
                         )
-                        self._ledger_finish(
-                            progress_request,
-                            terminal_outcome.value,
-                            cleanup_done=cleaned,
-                        )
-                if turn_token is not None:
-                    self._agent_session_registry.deactivate_if_same(
-                        turn_token,
-                        touch_at=loop.time(),
-                    )
