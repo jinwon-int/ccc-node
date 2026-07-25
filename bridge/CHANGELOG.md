@@ -8,6 +8,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Typed ProjectChat request-progress coordinator (#346).** Request creation,
+  progress-task ownership, bounded reap, heartbeat cleanup, duration logging,
+  and task-ledger finish now run through an independently tested typed
+  component with a minimal request/task handle. `RequestLifecycle` and its
+  caller remain the only terminal and finalization-winner authority; session,
+  response, stream, approval, and delivery state stay outside the component.
+  Finalization effects remain ordered and exactly-once, independently canceled
+  progress tasks are reaped, caller cancellation still propagates, and active
+  session tokens now deactivate from an outer `finally` even if a finalization
+  callback fails. Duration is sampled after progress reap and heartbeat cleanup
+  to preserve the prior elapsed-time boundary. `_process_agent_message` drops
+  from CC 64 to 57, and the largest new function is CC 6.
 - **Typed provider-neutral turn stream consumer (#346).** Admission waits,
   terminal-stall waits, event sequencing, and the ordered
   interrupt→pending-read drain→stalled-owner abort→iterator-close path now
