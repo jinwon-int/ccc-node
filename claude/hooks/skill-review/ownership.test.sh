@@ -121,6 +121,58 @@ out="$(tool guard-proposal --proposal "$TMP/pinned-proposal.json")"; rc=$?
 ok "pin blocks a previously read autonomous proposal" '[ "$rc" = 3 ] && jq -e ".code == \"autonomous_write_denied_pinned\"" >/dev/null <<<"$out"'
 tool unpin user-two >/dev/null
 
+# Deterministically simulate a ctime-only change between the two target fstats.
+TOOL_PATH="$TOOL" SKILLS_PATH="$SKILLS" STATE_PATH="$STATE" python3 - <<'PY'
+import importlib.util
+import os
+from pathlib import Path
+import stat
+import sys
+
+spec = importlib.util.spec_from_file_location("ownership_ctime_test", os.environ["TOOL_PATH"])
+assert spec is not None and spec.loader is not None
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+real_fstat = module.os.fstat
+regular_calls = 0
+
+
+class StatProxy:
+    def __init__(self, original: os.stat_result, ctime_ns: int):
+        self._original = original
+        self.st_ctime_ns = ctime_ns
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._original, name)
+
+
+def drifted_fstat(descriptor: int) -> os.stat_result | StatProxy:
+    global regular_calls
+    result = real_fstat(descriptor)
+    if stat.S_ISREG(result.st_mode):
+        regular_calls += 1
+        if regular_calls == 2:
+            return StatProxy(result, result.st_ctime_ns + 1)
+    return result
+
+
+module.os.fstat = drifted_fstat
+context = module.Context(
+    provider="claude",
+    skills_dir=Path(os.environ["SKILLS_PATH"]),
+    state_dir=Path(os.environ["STATE_PATH"]),
+    uid=os.geteuid(),
+)
+try:
+    module._read_target(context, "user-two", "SKILL.md")
+except module.ContractError as error:
+    raise SystemExit(0 if error.code == "target_changed_during_read" else 1)
+raise SystemExit(1)
+PY
+rc=$?
+ok "ctime-only target drift is rejected" '[ "$rc" = 0 ]'
+
 # Managed provenance wins over autosave and stays self-update-only.
 make_skill bundled-one
 sha="$(sha256sum "$SKILLS/bundled-one/SKILL.md" | awk '{print $1}')"
@@ -173,6 +225,24 @@ jq -nc --arg path "$SKILLS/future-one/SKILL.md" --arg sha "$future_sha" '{
 chmod 600 "$SKILLS/future-one/.autosave-meta.json"
 out="$(tool status future-one)"
 ok "unknown autosave schema cannot downgrade to legacy" 'jq -e ".skills[0].classification == \"unknown/unreadable\"" >/dev/null <<<"$out"'
+
+make_skill float-version
+tool adopt float-version >/dev/null
+sed 's/"schema_version":2/"schema_version":2.0/' \
+  "$SKILLS/float-version/.autosave-meta.json" > "$TMP/float-marker"
+mv "$TMP/float-marker" "$SKILLS/float-version/.autosave-meta.json"
+chmod 600 "$SKILLS/float-version/.autosave-meta.json"
+out="$(tool status float-version)"
+ok "numeric float v2 schema fails closed" 'jq -e ".skills[0].classification == \"unknown/unreadable\"" >/dev/null <<<"$out"'
+
+make_skill string-version
+tool adopt string-version >/dev/null
+sed 's/"schema_version":2/"schema_version":"2"/' \
+  "$SKILLS/string-version/.autosave-meta.json" > "$TMP/string-marker"
+mv "$TMP/string-marker" "$SKILLS/string-version/.autosave-meta.json"
+chmod 600 "$SKILLS/string-version/.autosave-meta.json"
+out="$(tool status string-version)"
+ok "string v2 schema fails closed" 'jq -e ".skills[0].classification == \"unknown/unreadable\"" >/dev/null <<<"$out"'
 
 make_skill bool-revision
 tool adopt bool-revision >/dev/null

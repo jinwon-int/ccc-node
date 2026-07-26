@@ -323,8 +323,20 @@ def _read_target(context: Context, name: str, relative: str) -> TargetSnapshot:
             raise ContractError("target_too_large")
         after = os.fstat(target_fd)
         if (
-            (metadata.st_dev, metadata.st_ino, metadata.st_size, metadata.st_mtime_ns)
-            != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+            (
+                metadata.st_dev,
+                metadata.st_ino,
+                metadata.st_size,
+                metadata.st_mtime_ns,
+                metadata.st_ctime_ns,
+            )
+            != (
+                after.st_dev,
+                after.st_ino,
+                after.st_size,
+                after.st_mtime_ns,
+                after.st_ctime_ns,
+            )
         ):
             raise ContractError("target_changed_during_read")
         final_directory = os.fstat(descriptors[0])
@@ -410,7 +422,7 @@ def _validate_autosave_marker(
     skill_sha: str,
 ) -> tuple[int, str]:
     marker = _safe_json_file(path, owner=context.uid)
-    if marker.get("schema_version") == 2:
+    if type(marker.get("schema_version")) is int and marker["schema_version"] == 2:
         marker = _safe_json_file(path, owner=context.uid, exact_mode=0o600)
         if (
             marker.get("schema_version") != 2
