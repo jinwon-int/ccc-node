@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Typed Telegram voice composition contract (#346).** Voice handling now
+  declares its composed task, media, delivery, access, queue, and Telegram
+  dependencies explicitly, removing the `core.bot_voice` mypy exception
+  without changing voice, document, image, sticker, or reply behavior.
 - **Typed smart-reply source signature (#346).** Delivery now declares its
   Telegram message input and asynchronous `None` result explicitly, enabling
   the next bounded voice-composition contract without changing reply behavior.

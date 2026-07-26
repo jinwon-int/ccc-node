@@ -5,17 +5,22 @@ import os
 import platform
 import time
 from pathlib import Path as FilePath
-from typing import Any, List, Optional, Protocol, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Protocol, Tuple
 
 from telegram import (
-    Update,
+    Chat,
+    InlineKeyboardMarkup,
     Message,
+    Update,
+    User,
 )
 from telegram.ext import (
+    Application,
     ContextTypes,
 )
 from telegram_bot.core import media
 from telegram_bot.core.bot_shared import build_reply_context_prefix
+from telegram_bot.utils.audio_processor import AudioProcessor
 from telegram_bot.utils.chat_logger import log_debug
 from telegram_bot.utils.transcription import (
     EmptyTranscriptionError,
@@ -126,8 +131,73 @@ class _VoiceConfig(Protocol):
     def telegram_max_image_pixels(self) -> int: ...
 
 
+class _ProcessUserMessageText(Protocol):
+    def __call__(
+        self,
+        update: Update,
+        user_id: int,
+        text: str,
+        message_source: str = "text",
+        voice_input_preview: Optional[str] = None,
+        sensitive_log_event: Optional[str] = None,
+    ) -> Awaitable[None]: ...
+
+
+class _ReplySmart(Protocol):
+    def __call__(
+        self,
+        message: Message,
+        content: str,
+        parse_mode: str = "Markdown",
+        force_options: bool = False,
+        streamed: bool = False,
+        user_id: Optional[int] = None,
+    ) -> Awaitable[None]: ...
+
+
 class BotVoiceMixin:
     _config: _VoiceConfig
+    _user_voice_tasks: Dict[Any, set[asyncio.Task[Any]]]
+    _audio_processor: AudioProcessor
+    _audio_dir: FilePath
+    _image_dir: FilePath
+    _document_dir: FilePath
+    _resolve_paths: Callable[[str], List[FilePath]]
+    _split_paths_by_scope: Callable[
+        [List[FilePath]],
+        Tuple[List[FilePath], List[FilePath]],
+    ]
+    _send_file_paths: Callable[[int, List[FilePath]], Awaitable[None]]
+    _maybe_prompt_outside_files: Callable[
+        [int, Optional[int], List[FilePath]],
+        Awaitable[None],
+    ]
+    _extract_options: Callable[[str], List[str]]
+    _build_option_keyboard: Callable[
+        [List[str]],
+        Optional[InlineKeyboardMarkup],
+    ]
+    _reply_smart: _ReplySmart
+    _require_application: Callable[
+        [],
+        Application[Any, Any, Any, Any, Any, Any],
+    ]
+    _check_access: Callable[[Update], Awaitable[bool]]
+    _require_message: Callable[[Update], Message]
+    _require_user: Callable[[Update], User]
+    _require_chat: Callable[[Update], Chat]
+    _conversation_key: Callable[[int, int | None], Any]
+    _own_bot_id: Callable[[], int | None]
+    _process_user_message_text: _ProcessUserMessageText
+    _enqueue_user_task: Callable[
+        [
+            int,
+            Callable[[], Awaitable[None]],
+            Callable[[], Awaitable[None]],
+        ],
+        Awaitable[bool],
+    ]
+    _MAX_INFLIGHT_MESSAGES: int
 
     # Lazily constructed voice collaborators (initialized to None by the
     # composing TelegramBot); annotated here so mypy can type the lazy-init
