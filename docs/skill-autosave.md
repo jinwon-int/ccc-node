@@ -57,7 +57,9 @@ idempotent sink for the provider-aware installer. Composition remains
 three-guarded (Codex node **and** no explicit opt-out **and** a distill journal),
 so Claude startup is unchanged. A sweep attempts one unprocessed job by default
 (`CCC_CODEX_SKILL_COLLECTOR_MAX_JOBS_PER_SWEEP`, range 1–10), shares the
-autonomous Codex usage meter, and durably backs off failed jobs. See
+autonomous Codex usage meter, takes a non-blocking per-job lease, refunds
+reservations abandoned before provider start, and durably backs off failed or
+canceled attempts. See
 [`codex-skill-collector-activation.md`](codex-skill-collector-activation.md)
 for deployment verification and opt-out rollback. This changes candidate
 staging only; `CCC_SKILL_AUTOSAVE_MODE` remains `approve` by default.

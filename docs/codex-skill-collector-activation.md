@@ -15,9 +15,12 @@ installed without the existing review gate.
 - One provider attempt is allowed per sweep by default, preventing a first
   start from bursting through historical snapshots. Operators may set
   `CCC_CODEX_SKILL_COLLECTOR_MAX_JOBS_PER_SWEEP=1..10`.
+- A non-blocking per-job owner-only lease prevents concurrent collectors from
+  duplicating the same provider attempt. Contenders defer to a later sweep.
 - Provider attempts share the node autonomous usage meter. A configured
   `CCC_USAGE_BUDGET_TOKENS_CODEX` blocks the call prospectively when the full
-  bounded reservation cannot fit.
+  bounded reservation cannot fit. Reservations abandoned before provider start
+  are refunded; started attempts remain body-free metered on failure or cancel.
 - Backend failures use durable exponential backoff (five minutes up to one day)
   and retain only a body-free error code.
 - Successful and zero-candidate jobs receive idempotent markers and are not

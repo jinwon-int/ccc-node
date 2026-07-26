@@ -248,6 +248,54 @@ class SkillCandidateSink:
             raise ValueError("job_id must be a SHA-256 hex digest")
         return self.queue_dir / ".retries" / f"{job_id}.json"
 
+    def _claim_path(self, job_id: str) -> Path:
+        if not isinstance(job_id, str) or not _SHA256_RE.fullmatch(job_id):
+            raise ValueError("job_id must be a SHA-256 hex digest")
+        return self.queue_dir / ".claims" / f"{job_id}.lock"
+
+    @contextmanager
+    def claim(self, job_id: str) -> Iterator[bool]:
+        """Try to own one provider attempt for ``job_id`` across processes.
+
+        The empty owner-only lock file intentionally persists so every process
+        always locks the same inode. A contending collector returns ``False``
+        immediately instead of waiting and later replaying the provider call.
+        """
+
+        path = self._claim_path(job_id)
+        ensure_private_directory(self.queue_dir)
+        ensure_private_directory(path.parent)
+        self._validate_regular_file(path)
+        flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(path, flags, 0o600)
+        acquired = False
+        try:
+            os.fchmod(descriptor, 0o600)
+            metadata = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_nlink != 1
+                or (
+                    hasattr(os, "getuid")
+                    and metadata.st_uid != os.getuid()
+                )
+            ):
+                raise PermissionError("skill-candidate claim is unsafe")
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+            except BlockingIOError:
+                yield False
+                return
+            yield True
+        finally:
+            try:
+                if acquired:
+                    fcntl.flock(descriptor, fcntl.LOCK_UN)
+            finally:
+                os.close(descriptor)
+
     def _read_retry_unlocked(self, path: Path, *, job_id: str) -> dict[str, object] | None:
         self._validate_regular_file(path)
         if not path.exists():
