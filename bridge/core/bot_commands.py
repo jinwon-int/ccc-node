@@ -627,7 +627,7 @@ class BotCommandMixin:
 
         if context.args:
             name = context.args[0]
-            updates = {"provider": active_provider, "model": name}
+            updates: dict[str, Any] = {"provider": active_provider, "model": name}
             remove_fields = set()
             reset_note = None
             if session["provider"] != active_provider:
