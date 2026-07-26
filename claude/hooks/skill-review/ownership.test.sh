@@ -71,6 +71,7 @@ ok "adopt makes skill autonomous-managed" 'jq -e ".skill.classification == \"aut
 ok "adopt marker is v2 and non-rollbackable" 'jq -e ".schema_version == 2 and .created_by == \"operator-adopt\" and .rollback_eligible == false" "$SKILLS/user-one/.autosave-meta.json" >/dev/null'
 ok "adopt marker is owner-only" '[ "$(stat -c %a "$SKILLS/user-one/.autosave-meta.json")" = 600 ]'
 ok "ownership ledger is owner-only and body-free" '[ "$(stat -c %a "$STATE/skill-autosave-ownership.jsonl")" = 600 ] && jq -e "select(.event == \"adopt\") | has(\"content\") | not" "$STATE/skill-autosave-ownership.jsonl" >/dev/null'
+ok "adopt audit has durable prepared and terminal phases" 'jq -s -e "[.[] | select(.event == \"adopt\" and .name == \"user-one\")] | group_by(.transaction_id) | any(map(.outcome) == [\"prepared\", \"changed\"])" "$STATE/skill-autosave-ownership.jsonl" >/dev/null'
 tool rollback-check user-one >/dev/null 2>&1; rc=$?
 ok "adopted user skill is never rollback eligible" '[ "$rc" != 0 ]'
 
@@ -160,6 +161,32 @@ ok "matching legacy marker migrates read-only in memory" 'jq -e ".skills[0].clas
 printf '\n# manual drift\n' >> "$SKILLS/legacy-one/SKILL.md"
 out="$(tool status legacy-one)"
 ok "legacy SHA mismatch fails closed" 'jq -e ".skills[0].classification == \"unknown/unreadable\"" >/dev/null <<<"$out"'
+
+# Unknown schemas, bool revisions, and loose v2 permissions never downgrade to
+# the legacy contract or acquire autonomous authority.
+make_skill future-one
+future_sha="$(sha256sum "$SKILLS/future-one/SKILL.md" | awk '{print $1}')"
+jq -nc --arg path "$SKILLS/future-one/SKILL.md" --arg sha "$future_sha" '{
+  schema_version: 3, installed_by: "autosave", name: "future-one",
+  path: $path, sha256: $sha
+}' > "$SKILLS/future-one/.autosave-meta.json"
+chmod 600 "$SKILLS/future-one/.autosave-meta.json"
+out="$(tool status future-one)"
+ok "unknown autosave schema cannot downgrade to legacy" 'jq -e ".skills[0].classification == \"unknown/unreadable\"" >/dev/null <<<"$out"'
+
+make_skill bool-revision
+tool adopt bool-revision >/dev/null
+jq '.provenance_revision = true' "$SKILLS/bool-revision/.autosave-meta.json" > "$TMP/bool-marker"
+mv "$TMP/bool-marker" "$SKILLS/bool-revision/.autosave-meta.json"
+chmod 600 "$SKILLS/bool-revision/.autosave-meta.json"
+out="$(tool status bool-revision)"
+ok "boolean provenance revision fails closed" 'jq -e ".skills[0].classification == \"unknown/unreadable\"" >/dev/null <<<"$out"'
+
+make_skill loose-v2
+tool adopt loose-v2 >/dev/null
+chmod 644 "$SKILLS/loose-v2/.autosave-meta.json"
+out="$(tool status loose-v2)"
+ok "v2 provenance must remain owner-only" 'jq -e ".skills[0].classification == \"unknown/unreadable\"" >/dev/null <<<"$out"'
 
 # External/repo and unsafe path forms never become autonomous.
 make_skill repo-one

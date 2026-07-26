@@ -225,6 +225,11 @@ Operator controls are provider-scoped and return JSON with no skill body or
 secret. State lives under `~/.claude/state/` in an owner-only directory:
 `skill-autosave-control.json` is the pin overlay and
 `skill-autosave-ownership.jsonl` is a `0600` body-free audit ledger.
+Every owner-state mutation first fsyncs a `prepared` transaction row before
+publishing its marker, control file, or receipt, then records a terminal row.
+The prepared row is durable evidence even if a later terminal append is
+interrupted, so published ownership state is never created without an audit
+record.
 
 ```bash
 AUTO=~/.claude/hooks/skill-review/autoinstall.sh
@@ -258,7 +263,9 @@ single-link, owner-held `0600` files. The marker contains no skill body.
 Migration is conservative and does not rewrite existing files during status:
 
 - a legacy `installed_by=autosave` marker is recognized as revision `0` only
-  when its name/path shape and recorded SHA-256 match the current `SKILL.md`;
+  when it has no `schema_version`, and its name/path shape and recorded
+  SHA-256 match the current `SKILL.md`;
+- unknown/future `schema_version` values never downgrade to the legacy parser;
 - legacy SHA drift, corrupt metadata, unsafe permissions, or unreadable files
   become `unknown/unreadable`, never an inferred owner;
 - a missing autosave marker on an otherwise safe local skill means
@@ -292,7 +299,10 @@ validated skill root and compares file device/inode/size/mtime, content hash,
 ownership, pin state, and provenance. Mismatch, expiry, cross-attempt or
 cross-operation use, path drift, and replay are denied. Every receipt is
 single-use and is consumed on an authorization decision or checked denial.
-Actual patch/write generation and application remain out of scope for #750.
+The successful response is a validation result for the exact proposal, not a
+reusable capability: a future apply engine must perform this validation
+immediately in its own write path. Actual patch/write generation, application,
+and that atomic apply integration remain out of scope for #750.
 
 ## Migration & rollback (Claude ↔ Codex)
 

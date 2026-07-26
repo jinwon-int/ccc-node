@@ -382,8 +382,12 @@ do_run() {
     # Install: narrow write surface — only $SKILLS_DIR/<kebab-name>/.
     dest="$SKILLS_DIR/$name"
     sid="$(jq -r '.session_id // empty' "$dir/meta.json" 2>/dev/null)"
-    if ! mkdir -p "$dest" 2>/dev/null \
-       || ! cp "$f" "$dest/SKILL.md" 2>/dev/null; then
+    if ! mkdir "$dest" 2>/dev/null; then
+      log "install failed id=$id name=$name reason=write-error trigger=$TRIGGER"
+      continue
+    fi
+    if ! cp "$f" "$dest/SKILL.md" 2>/dev/null; then
+      rmdir "$dest" 2>/dev/null || true
       log "install failed id=$id name=$name reason=write-error trigger=$TRIGGER"
       continue
     fi
@@ -393,8 +397,11 @@ do_run() {
       # been published as installed yet. Fail closed and leave the draft
       # pending if durable v2 provenance cannot be established.
       rm -f "$dest/SKILL.md" "$dest/.autosave-meta.json" 2>/dev/null
-      rmdir "$dest" 2>/dev/null || true
-      log "install failed id=$id name=$name reason=provenance-write trigger=$TRIGGER"
+      if rmdir "$dest" 2>/dev/null; then
+        log "install failed id=$id name=$name reason=provenance-write cleanup=complete trigger=$TRIGGER"
+      else
+        log "install failed id=$id name=$name reason=provenance-write cleanup=incomplete trigger=$TRIGGER"
+      fi
       continue
     fi
     rec="$(jq -nc --arg ts "$(ts)" --arg id "$id" --arg name "$name" \

@@ -228,12 +228,27 @@ def _safe_json_file(
                 chunks.append(chunk)
                 remaining -= len(chunk)
             payload = b"".join(chunks)
+            after = os.fstat(descriptor)
+            if (
+                opened.st_dev,
+                opened.st_ino,
+                opened.st_size,
+                opened.st_mtime_ns,
+                opened.st_ctime_ns,
+            ) != (
+                after.st_dev,
+                after.st_ino,
+                after.st_size,
+                after.st_mtime_ns,
+                after.st_ctime_ns,
+            ):
+                raise ContractError("metadata_changed_during_read")
         finally:
             os.close(descriptor)
         if len(payload) > max_bytes:
             raise ContractError("metadata_too_large")
         value = json.loads(payload)
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, RecursionError):
         raise ContractError("metadata_unreadable") from None
     if not isinstance(value, dict):
         raise ContractError("metadata_invalid")
@@ -254,6 +269,9 @@ def _relative_parts(relative: str) -> tuple[str, ...]:
 
 def _read_target(context: Context, name: str, relative: str) -> TargetSnapshot:
     skill_dir = _validate_skill_dir(context, name)
+    expected_directory = _lstat(skill_dir)
+    if expected_directory is None:
+        raise ContractError("skill_missing")
     parts = _relative_parts(relative)
     directory_flags = (
         os.O_RDONLY
@@ -266,6 +284,15 @@ def _read_target(context: Context, name: str, relative: str) -> TargetSnapshot:
     try:
         current = os.open(skill_dir, directory_flags)
         descriptors.append(current)
+        opened_directory = os.fstat(current)
+        if (
+            opened_directory.st_dev != expected_directory.st_dev
+            or opened_directory.st_ino != expected_directory.st_ino
+            or not stat.S_ISDIR(opened_directory.st_mode)
+            or opened_directory.st_uid != context.uid
+            or stat.S_IMODE(opened_directory.st_mode) & 0o022
+        ):
+            raise ContractError("skill_directory_changed")
         for component in parts[:-1]:
             current = os.open(component, directory_flags, dir_fd=current)
             metadata = os.fstat(current)
@@ -300,6 +327,16 @@ def _read_target(context: Context, name: str, relative: str) -> TargetSnapshot:
             != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
         ):
             raise ContractError("target_changed_during_read")
+        final_directory = os.fstat(descriptors[0])
+        path_directory = _lstat(skill_dir)
+        if (
+            path_directory is None
+            or (opened_directory.st_dev, opened_directory.st_ino)
+            != (final_directory.st_dev, final_directory.st_ino)
+            or (opened_directory.st_dev, opened_directory.st_ino)
+            != (path_directory.st_dev, path_directory.st_ino)
+        ):
+            raise ContractError("skill_directory_changed")
         return TargetSnapshot(
             relative="/".join(parts),
             content=content,
@@ -329,7 +366,7 @@ def _load_controls(context: Context) -> dict[str, Any]:
         return {"schema_version": 1, "revision": 0, "records": {}}
     if (
         value.get("schema_version") != 1
-        or not isinstance(value.get("revision"), int)
+        or type(value.get("revision")) is not int
         or value["revision"] < 0
         or not isinstance(value.get("records"), dict)
     ):
@@ -374,8 +411,9 @@ def _validate_autosave_marker(
 ) -> tuple[int, str]:
     marker = _safe_json_file(path, owner=context.uid)
     if marker.get("schema_version") == 2:
+        marker = _safe_json_file(path, owner=context.uid, exact_mode=0o600)
         if (
-            stat.S_IMODE(path.lstat().st_mode) != 0o600
+            marker.get("schema_version") != 2
             or marker.get("manager") != "ccc-node-skill-autosave"
             or marker.get("ownership") != "autosave-managed"
             or marker.get("name") != name
@@ -383,12 +421,14 @@ def _validate_autosave_marker(
             or marker.get("target_id") != _target_id(context, name)
             or marker.get("skill_sha256") != skill_sha
             or marker.get("created_by") not in {"ccc-node", "operator-adopt"}
-            or not isinstance(marker.get("provenance_revision"), int)
+            or type(marker.get("provenance_revision")) is not int
             or marker["provenance_revision"] < 1
             or not isinstance(marker.get("rollback_eligible"), bool)
         ):
             raise ContractError("autosave_metadata_invalid")
         return marker["provenance_revision"], _sha256(_canonical_json(marker))
+    if "schema_version" in marker:
+        raise ContractError("autosave_metadata_invalid")
     if (
         marker.get("installed_by") != "autosave"
         or marker.get("name") != name
@@ -406,41 +446,24 @@ def _classification(context: Context, name: str) -> dict[str, Any]:
     target_id = _target_id(context, name)
     try:
         skill_dir = _validate_skill_dir(context, name)
+        directory_before = _lstat(skill_dir)
+        if directory_before is None:
+            raise ContractError("skill_missing")
         skill = _read_target(context, name, "SKILL.md")
         controls = _load_controls(context)
         pin = _control_record(context, controls, name)
-    except ContractError as error:
-        base = (
-            "external/repo-installed"
-            if error.code == "external_or_symlink_skill"
-            else "unknown/unreadable"
+        managed_path = skill_dir / _MANAGED_MARKER
+        autosave_path = skill_dir / _AUTOSAVE_MARKER
+        managed_exists = _lstat(managed_path) is not None
+        autosave_exists = _lstat(autosave_path) is not None
+        external_exists = any(
+            _lstat(skill_dir / marker) is not None
+            for marker in (".git", ".repo-installed.json", ".external-skill.json")
         )
-        return {
-            "name": name,
-            "provider": context.provider,
-            "target_id": target_id,
-            "classification": base,
-            "base_classification": base,
-            "pinned": False,
-            "autonomous_write_allowed": False,
-            "reason": error.code,
-            "provenance_revision": None,
-            "provenance_sha256": None,
-        }
-
-    managed_path = skill_dir / _MANAGED_MARKER
-    autosave_path = skill_dir / _AUTOSAVE_MARKER
-    managed_exists = _lstat(managed_path) is not None
-    autosave_exists = _lstat(autosave_path) is not None
-    external_exists = any(
-        _lstat(skill_dir / marker) is not None
-        for marker in (".git", ".repo-installed.json", ".external-skill.json")
-    )
-    base = "user-owned"
-    reason = "no-autonomous-provenance"
-    revision: int | None = None
-    provenance_sha: str | None = None
-    try:
+        base = "user-owned"
+        reason = "no-autonomous-provenance"
+        revision: int | None = None
+        provenance_sha: str | None = None
         if managed_exists:
             managed = _validate_managed_marker(context, name, managed_path)
             base = "managed/bundled"
@@ -463,11 +486,42 @@ def _classification(context: Context, name: str) -> dict[str, Any]:
         elif external_exists:
             base = "external/repo-installed"
             reason = "external-provenance-marker"
-    except ContractError as error:
-        base = "unknown/unreadable"
-        reason = error.code
-        revision = None
-        provenance_sha = None
+        directory_after = _lstat(skill_dir)
+        if (
+            directory_after is None
+            or (
+                directory_before.st_dev,
+                directory_before.st_ino,
+                directory_before.st_mtime_ns,
+                directory_before.st_ctime_ns,
+            )
+            != (
+                directory_after.st_dev,
+                directory_after.st_ino,
+                directory_after.st_mtime_ns,
+                directory_after.st_ctime_ns,
+            )
+        ):
+            raise ContractError("skill_directory_changed")
+    except (ContractError, FileNotFoundError) as error:
+        code = error.code if isinstance(error, ContractError) else "metadata_changed_during_read"
+        base = (
+            "external/repo-installed"
+            if code == "external_or_symlink_skill"
+            else "unknown/unreadable"
+        )
+        return {
+            "name": name,
+            "provider": context.provider,
+            "target_id": target_id,
+            "classification": base,
+            "base_classification": base,
+            "pinned": False,
+            "autonomous_write_allowed": False,
+            "reason": code,
+            "provenance_revision": None,
+            "provenance_sha256": None,
+        }
 
     pinned = pin is not None
     classification = "pinned" if pinned else base
@@ -532,7 +586,14 @@ def _prepare_state(context: Context) -> None:
 def _preflight_mutation_state(context: Context) -> None:
     metadata = _lstat(context.state_dir)
     if metadata is not None:
-        _ensure_private_dir(context.state_dir, context)
+        _validate_existing_components(context.state_dir)
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or stat.S_ISLNK(metadata.st_mode)
+            or metadata.st_uid != context.uid
+            or stat.S_IMODE(metadata.st_mode) != 0o700
+        ):
+            raise ContractError("unsafe_state_directory")
         _preflight_ledger(context)
         return
     _validate_existing_components(context.state_dir.parent)
@@ -550,7 +611,15 @@ def _preflight_mutation_state(context: Context) -> None:
 def _write_private_atomic(path: Path, value: object, context: Context) -> None:
     payload = _canonical_json(value)
     _ensure_private_dir(path.parent, context)
-    temporary = path.parent / f".{path.name}.tmp.{uuid.uuid4().hex}"
+    directory_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_DIRECTORY", 0)
+    )
+    directory_fd: int | None = None
+    descriptor: int | None = None
+    temporary = f".{path.name}.tmp.{uuid.uuid4().hex}"
     flags = (
         os.O_WRONLY
         | os.O_CREAT
@@ -558,8 +627,16 @@ def _write_private_atomic(path: Path, value: object, context: Context) -> None:
         | getattr(os, "O_CLOEXEC", 0)
         | getattr(os, "O_NOFOLLOW", 0)
     )
-    descriptor = os.open(temporary, flags, 0o600)
     try:
+        directory_fd = os.open(path.parent, directory_flags)
+        directory_metadata = os.fstat(directory_fd)
+        if (
+            not stat.S_ISDIR(directory_metadata.st_mode)
+            or directory_metadata.st_uid != context.uid
+            or stat.S_IMODE(directory_metadata.st_mode) != 0o700
+        ):
+            raise ContractError("unsafe_state_directory")
+        descriptor = os.open(temporary, flags, 0o600, dir_fd=directory_fd)
         os.fchmod(descriptor, 0o600)
         view = memoryview(payload)
         while view:
@@ -568,16 +645,26 @@ def _write_private_atomic(path: Path, value: object, context: Context) -> None:
                 raise OSError("short write")
             view = view[written:]
         os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = None
+        os.replace(
+            temporary,
+            path.name,
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+        )
+        os.fsync(directory_fd)
     except OSError:
-        try:
-            temporary.unlink()
-        except OSError:
-            pass
         raise ContractError("metadata_write_failed") from None
     finally:
-        os.close(descriptor)
-    os.replace(temporary, path)
-    os.chmod(path, 0o600, follow_symlinks=False)
+        if descriptor is not None:
+            os.close(descriptor)
+        if directory_fd is not None:
+            try:
+                os.unlink(temporary, dir_fd=directory_fd)
+            except OSError:
+                pass
+            os.close(directory_fd)
 
 
 def _preflight_ledger(context: Context) -> None:
@@ -596,6 +683,7 @@ def _preflight_ledger(context: Context) -> None:
 def _append_ledger(context: Context, record: dict[str, Any]) -> None:
     _preflight_ledger(context)
     path = context.state_dir / _LEDGER_FILE
+    before = _lstat(path)
     flags = (
         os.O_WRONLY
         | os.O_APPEND
@@ -603,9 +691,21 @@ def _append_ledger(context: Context, record: dict[str, Any]) -> None:
         | getattr(os, "O_CLOEXEC", 0)
         | getattr(os, "O_NOFOLLOW", 0)
     )
-    descriptor = os.open(path, flags, 0o600)
+    descriptor: int | None = None
     try:
-        os.fchmod(descriptor, 0o600)
+        descriptor = os.open(path, flags, 0o600)
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_uid != context.uid
+            or opened.st_nlink != 1
+            or stat.S_IMODE(opened.st_mode) != 0o600
+            or (
+                before is not None
+                and (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino)
+            )
+        ):
+            raise ContractError("unsafe_ownership_ledger")
         payload = _canonical_json(record)
         view = memoryview(payload)
         while view:
@@ -614,8 +714,52 @@ def _append_ledger(context: Context, record: dict[str, Any]) -> None:
                 raise ContractError("ownership_ledger_write_failed")
             view = view[written:]
         os.fsync(descriptor)
+    except OSError:
+        raise ContractError("ownership_ledger_write_failed") from None
     finally:
-        os.close(descriptor)
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def _transaction_record(
+    event: str,
+    transaction_id: str,
+    *,
+    outcome: str,
+    fields: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "event": event,
+        "transaction_id": transaction_id,
+        "ts": _timestamp(),
+        **fields,
+        "outcome": outcome,
+    }
+
+
+def _finish_transaction(
+    context: Context,
+    event: str,
+    transaction_id: str,
+    *,
+    outcome: str,
+    fields: dict[str, Any],
+) -> bool:
+    """Best-effort terminal row; the durable prepared row prevents audit gaps."""
+    try:
+        _append_ledger(
+            context,
+            _transaction_record(
+                event,
+                transaction_id,
+                outcome=outcome,
+                fields=fields,
+            ),
+        )
+    except ContractError:
+        return False
+    return True
 
 
 class _MutationLock:
@@ -632,18 +776,28 @@ class _MutationLock:
             | getattr(os, "O_CLOEXEC", 0)
             | getattr(os, "O_NOFOLLOW", 0)
         )
-        self.descriptor = os.open(path, flags, 0o600)
-        metadata = os.fstat(self.descriptor)
-        if (
-            not stat.S_ISREG(metadata.st_mode)
-            or metadata.st_uid != self.context.uid
-            or metadata.st_nlink != 1
-        ):
-            os.close(self.descriptor)
-            self.descriptor = None
-            raise ContractError("unsafe_ownership_lock")
-        os.fchmod(self.descriptor, 0o600)
-        fcntl.flock(self.descriptor, fcntl.LOCK_EX)
+        try:
+            self.descriptor = os.open(path, flags, 0o600)
+            metadata = os.fstat(self.descriptor)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != self.context.uid
+                or metadata.st_nlink != 1
+                or stat.S_IMODE(metadata.st_mode) & 0o077
+            ):
+                raise ContractError("unsafe_ownership_lock")
+            os.fchmod(self.descriptor, 0o600)
+            fcntl.flock(self.descriptor, fcntl.LOCK_EX)
+        except (OSError, ContractError) as error:
+            if self.descriptor is not None:
+                try:
+                    os.close(self.descriptor)
+                except OSError:
+                    pass
+                self.descriptor = None
+            if isinstance(error, ContractError):
+                raise
+            raise ContractError("ownership_lock_failed") from None
         return self
 
     def __exit__(self, *_args: object) -> None:
@@ -667,6 +821,7 @@ def _write_marker_exclusive(
     directory_fd = os.open(skill_dir, directory_flags)
     temporary = f".{_AUTOSAVE_MARKER}.tmp.{uuid.uuid4().hex}"
     descriptor: int | None = None
+    published = False
     try:
         try:
             os.stat(_AUTOSAVE_MARKER, dir_fd=directory_fd, follow_symlinks=False)
@@ -703,9 +858,16 @@ def _write_marker_exclusive(
             )
         except FileExistsError:
             raise ContractError("autosave_marker_already_exists") from None
+        published = True
         os.unlink(temporary, dir_fd=directory_fd)
         os.fsync(directory_fd)
     except OSError:
+        if published:
+            try:
+                os.unlink(_AUTOSAVE_MARKER, dir_fd=directory_fd)
+                os.fsync(directory_fd)
+            except OSError:
+                pass
         raise ContractError("autosave_marker_write_failed") from None
     finally:
         if descriptor is not None:
@@ -743,8 +905,6 @@ def _command_list_unmanaged(context: Context) -> dict[str, Any]:
 
 def _command_adopt(context: Context, name: str, dry_run: bool) -> dict[str, Any]:
     before = _classification(context, name)
-    if dry_run:
-        _preflight_mutation_state(context)
     if before["base_classification"] == "autosave-managed":
         return {
             "ok": True,
@@ -756,6 +916,8 @@ def _command_adopt(context: Context, name: str, dry_run: bool) -> dict[str, Any]
         }
     if before["base_classification"] != "user-owned":
         raise ContractError(f"adopt_denied_{before['base_classification'].replace('/', '_')}")
+    if dry_run:
+        _preflight_mutation_state(context)
     result = {
         "ok": True,
         "command": "adopt",
@@ -787,21 +949,41 @@ def _command_adopt(context: Context, name: str, dry_run: bool) -> dict[str, Any]
             "provenance_revision": 1,
             "created_at": _timestamp(),
         }
-        _write_marker_exclusive(context, _validate_skill_dir(context, name), marker)
+        transaction_id = uuid.uuid4().hex
+        transaction_fields = {
+            "provider": context.provider,
+            "name": name,
+            "target_id": current["target_id"],
+            "from_revision": None,
+            "to_revision": 1,
+            "metadata_sha256": _sha256(_canonical_json(marker)),
+        }
         _append_ledger(
             context,
-            {
-                "schema_version": 1,
-                "event": "adopt",
-                "ts": _timestamp(),
-                "provider": context.provider,
-                "name": name,
-                "target_id": current["target_id"],
-                "from_revision": None,
-                "to_revision": 1,
-                "metadata_sha256": _sha256(_canonical_json(marker)),
-                "outcome": "changed",
-            },
+            _transaction_record(
+                "adopt",
+                transaction_id,
+                outcome="prepared",
+                fields=transaction_fields,
+            ),
+        )
+        try:
+            _write_marker_exclusive(context, _validate_skill_dir(context, name), marker)
+        except ContractError:
+            _finish_transaction(
+                context,
+                "adopt",
+                transaction_id,
+                outcome="aborted",
+                fields=transaction_fields,
+            )
+            raise
+        _finish_transaction(
+            context,
+            "adopt",
+            transaction_id,
+            outcome="changed",
+            fields=transaction_fields,
         )
     result["skill"] = _classification(context, name)
     return result
@@ -829,21 +1011,41 @@ def _command_mark_created(context: Context, name: str) -> dict[str, Any]:
             "provenance_revision": 1,
             "created_at": _timestamp(),
         }
-        _write_marker_exclusive(context, _validate_skill_dir(context, name), marker)
+        transaction_id = uuid.uuid4().hex
+        transaction_fields = {
+            "provider": context.provider,
+            "name": name,
+            "target_id": current["target_id"],
+            "from_revision": None,
+            "to_revision": 1,
+            "metadata_sha256": _sha256(_canonical_json(marker)),
+        }
         _append_ledger(
             context,
-            {
-                "schema_version": 1,
-                "event": "create",
-                "ts": _timestamp(),
-                "provider": context.provider,
-                "name": name,
-                "target_id": current["target_id"],
-                "from_revision": None,
-                "to_revision": 1,
-                "metadata_sha256": _sha256(_canonical_json(marker)),
-                "outcome": "changed",
-            },
+            _transaction_record(
+                "create",
+                transaction_id,
+                outcome="prepared",
+                fields=transaction_fields,
+            ),
+        )
+        try:
+            _write_marker_exclusive(context, _validate_skill_dir(context, name), marker)
+        except ContractError:
+            _finish_transaction(
+                context,
+                "create",
+                transaction_id,
+                outcome="aborted",
+                fields=transaction_fields,
+            )
+            raise
+        _finish_transaction(
+            context,
+            "create",
+            transaction_id,
+            outcome="changed",
+            fields=transaction_fields,
         )
     return {
         "ok": True,
@@ -861,8 +1063,15 @@ def _command_rollback_check(context: Context, name: str) -> dict[str, Any]:
         raise ContractError("rollback_denied_not_autosave_managed")
     marker_path = _validate_skill_dir(context, name) / _AUTOSAVE_MARKER
     marker = _safe_json_file(marker_path, owner=context.uid)
-    if marker.get("schema_version") == 2 and marker.get("rollback_eligible") is not True:
-        raise ContractError("rollback_denied_not_rollback_eligible")
+    if marker.get("schema_version") == 2:
+        marker = _safe_json_file(marker_path, owner=context.uid, exact_mode=0o600)
+        if (
+            marker.get("created_by") != "ccc-node"
+            or marker.get("rollback_eligible") is not True
+        ):
+            raise ContractError("rollback_denied_not_rollback_eligible")
+    elif "schema_version" in marker or marker.get("installed_by") != "autosave":
+        raise ContractError("rollback_denied_unknown_marker_schema")
     return {
         "ok": True,
         "command": "rollback-check",
@@ -875,8 +1084,6 @@ def _command_rollback_check(context: Context, name: str) -> dict[str, Any]:
 def _command_pin(context: Context, name: str, pin: bool, dry_run: bool) -> dict[str, Any]:
     verb = "pin" if pin else "unpin"
     before = _classification(context, name)
-    if dry_run:
-        _preflight_mutation_state(context)
     if before["base_classification"] not in {"user-owned", "autosave-managed"}:
         raise ContractError(f"{verb}_denied_{before['base_classification'].replace('/', '_')}")
     if before["pinned"] == pin:
@@ -889,6 +1096,7 @@ def _command_pin(context: Context, name: str, pin: bool, dry_run: bool) -> dict[
             "skill": before,
         }
     if dry_run:
+        _preflight_mutation_state(context)
         return {
             "ok": True,
             "command": verb,
@@ -903,6 +1111,15 @@ def _command_pin(context: Context, name: str, pin: bool, dry_run: bool) -> dict[
         current = _classification(context, name)
         if current["base_classification"] not in {"user-owned", "autosave-managed"}:
             raise ContractError(f"{verb}_state_changed")
+        if current["pinned"] == pin:
+            return {
+                "ok": True,
+                "command": verb,
+                "changed": False,
+                "dry_run": False,
+                "reason": "already-pinned" if pin else "already-unpinned",
+                "skill": current,
+            }
         controls = _load_controls(context)
         _preflight_ledger(context)
         records = dict(controls["records"])
@@ -923,21 +1140,41 @@ def _command_pin(context: Context, name: str, pin: bool, dry_run: bool) -> dict[
             "revision": next_revision,
             "records": records,
         }
-        _write_private_atomic(context.state_dir / _CONTROL_FILE, updated, context)
+        transaction_id = uuid.uuid4().hex
+        transaction_fields = {
+            "provider": context.provider,
+            "name": name,
+            "target_id": current["target_id"],
+            "from_revision": controls["revision"],
+            "to_revision": next_revision,
+            "metadata_sha256": _sha256(_canonical_json(updated)),
+        }
         _append_ledger(
             context,
-            {
-                "schema_version": 1,
-                "event": verb,
-                "ts": _timestamp(),
-                "provider": context.provider,
-                "name": name,
-                "target_id": current["target_id"],
-                "from_revision": controls["revision"],
-                "to_revision": next_revision,
-                "metadata_sha256": _sha256(_canonical_json(updated)),
-                "outcome": "changed",
-            },
+            _transaction_record(
+                verb,
+                transaction_id,
+                outcome="prepared",
+                fields=transaction_fields,
+            ),
+        )
+        try:
+            _write_private_atomic(context.state_dir / _CONTROL_FILE, updated, context)
+        except ContractError:
+            _finish_transaction(
+                context,
+                verb,
+                transaction_id,
+                outcome="aborted",
+                fields=transaction_fields,
+            )
+            raise
+        _finish_transaction(
+            context,
+            verb,
+            transaction_id,
+            outcome="changed",
+            fields=transaction_fields,
         )
     return {
         "ok": True,
@@ -998,25 +1235,44 @@ def _command_read_target(
         "consumed": False,
     }
     with _MutationLock(context):
-        _preflight_ledger(context)
-        receipt_dir = context.state_dir / _RECEIPT_DIR
-        if not receipt_dir.exists():
-            _ensure_private_dir(receipt_dir, context)
-        _write_private_atomic(receipt_dir / f"{receipt_id}.json", receipt, context)
+        transaction_id = uuid.uuid4().hex
+        transaction_fields = {
+            "provider": context.provider,
+            "name": name,
+            "target_id": classification["target_id"],
+            "receipt_id": receipt_id,
+            "relative_target_sha256": _sha256(snapshot.relative.encode()),
+            "content_sha256": snapshot.sha256,
+        }
         _append_ledger(
             context,
-            {
-                "schema_version": 1,
-                "event": "read-receipt",
-                "ts": _timestamp(),
-                "provider": context.provider,
-                "name": name,
-                "target_id": classification["target_id"],
-                "receipt_id": receipt_id,
-                "relative_target_sha256": _sha256(snapshot.relative.encode()),
-                "content_sha256": snapshot.sha256,
-                "outcome": "created",
-            },
+            _transaction_record(
+                "read-receipt",
+                transaction_id,
+                outcome="prepared",
+                fields=transaction_fields,
+            ),
+        )
+        receipt_dir = context.state_dir / _RECEIPT_DIR
+        try:
+            if not receipt_dir.exists():
+                _ensure_private_dir(receipt_dir, context)
+            _write_private_atomic(receipt_dir / f"{receipt_id}.json", receipt, context)
+        except ContractError:
+            _finish_transaction(
+                context,
+                "read-receipt",
+                transaction_id,
+                outcome="aborted",
+                fields=transaction_fields,
+            )
+            raise
+        _finish_transaction(
+            context,
+            "read-receipt",
+            transaction_id,
+            outcome="created",
+            fields=transaction_fields,
         )
     try:
         content_text = snapshot.content.decode("utf-8")
@@ -1046,9 +1302,12 @@ def _parse_timestamp(value: object) -> datetime:
     if not isinstance(value, str):
         raise ContractError("receipt_invalid")
     try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError:
         raise ContractError("receipt_invalid") from None
+    if parsed.tzinfo is None:
+        raise ContractError("receipt_invalid")
+    return parsed
 
 
 def _consume_receipt(
@@ -1064,8 +1323,7 @@ def _consume_receipt(
     _write_private_atomic(receipt_path, updated, context)
 
 
-def _command_guard_proposal(context: Context, proposal_path: Path) -> dict[str, Any]:
-    proposal = _proposal(proposal_path, context)
+def _validate_proposal_fields(proposal: dict[str, Any]) -> None:
     required = {
         "attempt_id",
         "receipt_id",
@@ -1080,6 +1338,44 @@ def _command_guard_proposal(context: Context, proposal_path: Path) -> dict[str, 
     }
     if not required.issubset(proposal):
         raise ContractError("proposal_fields_missing")
+    if (
+        type(proposal.get("schema_version")) is not int
+        or not isinstance(proposal.get("attempt_id"), str)
+        or not _ATTEMPT_RE.fullmatch(proposal["attempt_id"])
+        or proposal.get("operation") not in _ALLOWED_OPERATIONS
+        or proposal.get("provider") not in {"claude", "codex"}
+        or not isinstance(proposal.get("name"), str)
+        or not _NAME_RE.fullmatch(proposal["name"])
+        or not isinstance(proposal.get("target_id"), str)
+        or not re.fullmatch(r"[0-9a-f]{64}", proposal["target_id"])
+        or not isinstance(proposal.get("relative_target"), str)
+        or not isinstance(proposal.get("expected_sha256"), str)
+        or not re.fullmatch(r"[0-9a-f]{64}", proposal["expected_sha256"])
+        or (
+            proposal.get("expected_provenance_revision") is not None
+            and (
+                type(proposal["expected_provenance_revision"]) is not int
+                or proposal["expected_provenance_revision"] < 0
+            )
+        )
+        or (
+            proposal.get("expected_provenance_sha256") is not None
+            and (
+                not isinstance(proposal["expected_provenance_sha256"], str)
+                or not re.fullmatch(
+                    r"[0-9a-f]{64}",
+                    proposal["expected_provenance_sha256"],
+                )
+            )
+        )
+    ):
+        raise ContractError("proposal_fields_invalid")
+    _relative_parts(proposal["relative_target"])
+
+
+def _command_guard_proposal(context: Context, proposal_path: Path) -> dict[str, Any]:
+    proposal = _proposal(proposal_path, context)
+    _validate_proposal_fields(proposal)
     receipt_id = proposal["receipt_id"]
     if not isinstance(receipt_id, str) or not re.fullmatch(r"[0-9a-f]{32}", receipt_id):
         raise ContractError("receipt_id_invalid")
@@ -1094,8 +1390,25 @@ def _command_guard_proposal(context: Context, proposal_path: Path) -> dict[str, 
             raise ContractError("receipt_invalid")
         if receipt.get("consumed") is not False:
             raise ContractError("receipt_consumed")
+        transaction_id = uuid.uuid4().hex
         outcome = "denied"
         code = "proposal_receipt_mismatch"
+        transaction_fields = {
+            "provider": context.provider,
+            "name": proposal["name"],
+            "target_id": proposal["target_id"],
+            "receipt_id": receipt_id,
+            "operation": proposal["operation"],
+        }
+        _append_ledger(
+            context,
+            _transaction_record(
+                "write-guard",
+                transaction_id,
+                outcome="prepared",
+                fields=transaction_fields,
+            ),
+        )
         comparable = (
             "attempt_id",
             "operation",
@@ -1141,25 +1454,29 @@ def _command_guard_proposal(context: Context, proposal_path: Path) -> dict[str, 
                 != receipt["expected_provenance_sha256"]
             ):
                 raise ContractError("provenance_drift")
+            if _now() > _parse_timestamp(receipt.get("expires_at")):
+                raise ContractError("receipt_expired")
             outcome = "authorized"
             code = "authorized"
         except ContractError as error:
             code = error.code
-        _consume_receipt(context, receipt_path, receipt, outcome)
-        _append_ledger(
+        try:
+            _consume_receipt(context, receipt_path, receipt, outcome)
+        except ContractError:
+            _finish_transaction(
+                context,
+                "write-guard",
+                transaction_id,
+                outcome="consume-failed",
+                fields={**transaction_fields, "code": code},
+            )
+            raise
+        _finish_transaction(
             context,
-            {
-                "schema_version": 1,
-                "event": "write-guard",
-                "ts": _timestamp(),
-                "provider": context.provider,
-                "name": str(proposal.get("name", ""))[:64],
-                "target_id": str(proposal.get("target_id", ""))[:64],
-                "receipt_id": receipt_id,
-                "operation": str(proposal.get("operation", ""))[:16],
-                "outcome": outcome,
-                "code": code,
-            },
+            "write-guard",
+            transaction_id,
+            outcome=outcome,
+            fields={**transaction_fields, "code": code},
         )
     return {
         "ok": outcome == "authorized",
@@ -1234,6 +1551,9 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     except OSError:
         print(json.dumps({"ok": False, "code": "filesystem_error"}, sort_keys=True))
+        return 2
+    except (TypeError, ValueError, RecursionError):
+        print(json.dumps({"ok": False, "code": "invalid_data"}, sort_keys=True))
         return 2
     print(json.dumps(result, ensure_ascii=False, sort_keys=True))
     if args.command == "guard-proposal" and not result["allowed"]:
