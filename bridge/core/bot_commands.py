@@ -47,8 +47,10 @@ from telegram_bot.core.project_chat_types import (
     StatusCallback,
     TypingCallback,
 )
+from telegram_bot.core.task_queue import UserTaskQueue
 from telegram_bot.core.usage import UsageSnapshot, render_usage
 from telegram_bot.memory.distill_types import DistillJob, DistillTrigger
+from telegram_bot.memory.promotion import MemoryPromotionResult
 from .conversation_paths import resolve_conversation_file
 from telegram_bot.utils.chat_logger import log_debug
 from telegram_bot.utils import tg_errors
@@ -190,6 +192,49 @@ class _SaveSessionId(Protocol):
     ) -> Awaitable[None]: ...
 
 
+class _ReplySmart(Protocol):
+    def __call__(
+        self,
+        message: Message,
+        content: str,
+        parse_mode: str = "Markdown",
+        force_options: bool = False,
+        streamed: bool = False,
+        user_id: int | None = None,
+    ) -> Awaitable[None]: ...
+
+
+class _BuildHistoryKeyboard(Protocol):
+    def __call__(
+        self,
+        messages: list[dict[str, Any]],
+        page: int = 0,
+        page_size: int = 10,
+    ) -> InlineKeyboardMarkup: ...
+
+
+class _MemoryPromoter(Protocol):
+    def promote(
+        self,
+        *,
+        source_scope: str,
+        fact_id: str,
+    ) -> MemoryPromotionResult: ...
+
+
+class _CommandDistillLocalSinkWorker(Protocol):
+    async def refresh_route(
+        self,
+        *,
+        audience: str,
+        scope: str,
+    ) -> None: ...
+
+
+class _CommandClock(Protocol):
+    def time(self) -> float: ...
+
+
 class BotCommandMixin:
     _config: _CommandConfig
     _session_manager: _CommandSessionManager
@@ -220,6 +265,18 @@ class BotCommandMixin:
         Mapping[str, AgentJsonValue] | None,
     ]
     _codex_approval_callback: AgentApprovalCallback
+    _make_status_callback: Callable[[Any, int], StatusCallback]
+    _make_interim_reply_callback: Callable[[Message], InterimMessageCallback]
+    _reply_smart: _ReplySmart
+    _runtime_active_sessions: set[Any]
+    _memory_promoter: _MemoryPromoter
+    _distill_local_sink_worker: _CommandDistillLocalSinkWorker
+    MODELS: list[tuple[str, str]]
+    _clock: _CommandClock
+    _tasks: UserTaskQueue
+    _build_history_keyboard: _BuildHistoryKeyboard
+    _build_revert_mode_keyboard: Callable[[int], InlineKeyboardMarkup]
+    _user_voice_tasks: dict[Any, set[asyncio.Task[Any]]]
 
     async def _cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_access(update):
