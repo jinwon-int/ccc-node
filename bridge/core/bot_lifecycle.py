@@ -8,7 +8,7 @@ import shutil
 import subprocess
 from datetime import datetime
 from pathlib import Path as FilePath
-from typing import Any, Callable, Optional, Protocol
+from typing import Any, Callable, Optional, Protocol, cast
 
 import telegram.error
 from telegram import Update
@@ -187,7 +187,7 @@ class BotLifecycleMixin:
     _STALE_AUDIO_SECONDS: int
     _WATCHDOG_INTERVAL: int
     _NETWORK_FAILURE_THRESHOLD: int
-    application: Application
+    application: Optional[Application]
     _application_builder_factory: Callable[[], Any]
     _cleanup_stale_audio_files: _CleanupStaleAudioFiles
     _set_bot_commands: _SetBotCommands
@@ -204,6 +204,7 @@ class BotLifecycleMixin:
                     restart_handoff.read_receipt, self._config.bot_data_dir
                 )
                 if receipt and receipt.get("state") in restart_handoff.TERMINAL_STATES:
+                    application = cast(Application, self.application)
                     request_id = str(receipt.get("request_id", ""))
                     if receipt["state"] == "completed":
                         text = (
@@ -215,7 +216,7 @@ class BotLifecycleMixin:
                             f"❌ Bridge restart failed ({request_id[:8]}): "
                             f"{receipt.get('reason_code', 'worker_error')}."
                         )
-                    await self.application.bot.send_message(
+                    await application.bot.send_message(
                         chat_id=int(receipt["chat_id"]), text=text
                     )
                     await asyncio.to_thread(
@@ -1156,8 +1157,9 @@ class BotLifecycleMixin:
             return None
 
         async def wakeup_tick() -> None:
+            application = cast(Application, self.application)
             stats = await run_dead_session_wakeup_scan(
-                self.application.bot,
+                application.bot,
                 self._session_manager,
                 self._project_chat,
                 self._project_chat.conversations_dir,
