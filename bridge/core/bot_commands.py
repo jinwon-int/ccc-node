@@ -18,11 +18,16 @@ from typing import (
 )
 
 from telegram import (
-    Update,
+    CallbackQuery,
+    Chat,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    Message,
+    Update,
+    User,
 )
 from telegram.ext import (
+    Application,
     CommandHandler,
     ContextTypes,
 )
@@ -154,6 +159,16 @@ class BotCommandMixin:
     _config: _CommandConfig
     _session_manager: _CommandSessionManager
     _project_chat: _CommandProjectChat
+    _require_application: Callable[
+        [],
+        Application[Any, Any, Any, Any, Any, Any],
+    ]
+    _check_access: Callable[[Update], Awaitable[bool]]
+    _require_message: Callable[[Update], Message]
+    _require_user: Callable[[Update], User]
+    _require_chat: Callable[[Update], Chat]
+    _require_callback_query: Callable[[Update], CallbackQuery]
+    _conversation_key: Callable[[int, int | None], Any]
 
     async def _cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_access(update):
