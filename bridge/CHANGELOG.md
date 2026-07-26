@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Final Telegram command mypy ratchet (#346).** Removed the last
+  `core.bot_commands` `attr-defined` exception after the typed composition
+  boundary reached zero package-complete mypy errors.
+
 ### Added
 - **Typed Telegram command state boundary (#346).** Command handling now
   declares its queue, callback, memory, clock, model, keyboard, and task-state
