@@ -64,6 +64,5 @@ module = [
   "core.bot_delivery",
   "core.bot_lifecycle",
   "core.bot_voice",
-  "core.project_chat_history",
 ]
 disable_error_code = ["attr-defined"]
