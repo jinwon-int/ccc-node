@@ -60,6 +60,8 @@ def iter_transcript_messages(
 
 
 class ProjectChatHistoryMixin:
+    conversations_dir: Path
+
     def list_sessions(self, limit: int = 10) -> List[Tuple[str, str, float]]:
         """List recent conversations: [(session_id, first_user_msg, mtime)]"""
         conv_dir = self.conversations_dir

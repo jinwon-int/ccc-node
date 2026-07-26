@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Typed ProjectChat history mixin contract (#346).** Transcript history now
+  declares its composed conversation-directory dependency explicitly,
+  removing `core.project_chat_history` from the `attr-defined` mypy exception
+  without changing transcript parsing, filtering, ordering, or cleanup.
 - **Typed Telegram status mixin contract (#346).** The heartbeat status
   callback now declares its read-only configuration dependency explicitly,
   removing `core.bot_status` from the `attr-defined` mypy exception without
