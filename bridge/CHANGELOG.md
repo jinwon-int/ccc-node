@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Typed Telegram command settings contract (#346).** Command handling now
+  declares its read-only restart, data-directory, and Claude settings
+  dependencies without changing command behavior or the remaining composition
+  ratchet.
 - **Typed Telegram lifecycle composition contract (#346).** Lifecycle handling
   now declares its composed configuration, session, polling, distill, push,
   filesystem, and cross-mixin dependencies explicitly, removing the

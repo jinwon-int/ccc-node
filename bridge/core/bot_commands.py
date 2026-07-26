@@ -4,8 +4,9 @@ import hashlib
 import json
 import logging
 import re
-from typing import Awaitable, Callable, Optional
 from datetime import datetime
+from pathlib import Path as FilePath
+from typing import Awaitable, Callable, Optional, Protocol
 
 from telegram import (
     Update,
@@ -32,7 +33,24 @@ from telegram_bot.core.bot_shared import (
     _esc_md2,
 )
 
+
+class _CommandConfig(Protocol):
+    @property
+    def bot_data_dir(self) -> FilePath: ...
+
+    @property
+    def restart_service_unit(self) -> str: ...
+
+    @property
+    def restart_delay_seconds(self) -> int: ...
+
+    @property
+    def claude_settings_path(self) -> FilePath: ...
+
+
 class BotCommandMixin:
+    _config: _CommandConfig
+
     async def _cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_access(update):
             return
