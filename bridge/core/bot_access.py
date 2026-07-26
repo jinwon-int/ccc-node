@@ -3,7 +3,7 @@ import json
 import logging
 from datetime import datetime, timezone
 from pathlib import Path as FilePath
-from typing import Any, Iterable, List, Optional
+from typing import Any, Callable, Iterable, List, Mapping, Optional, Protocol, Sequence
 
 from claude_agent_sdk.types import PermissionResultAllow, PermissionResultDeny
 from telegram import Update
@@ -15,7 +15,51 @@ logger = logging.getLogger(__name__)
 STALE_MESSAGE_SECONDS = 20 * 60  # 20 minutes
 
 
+class _AccessConfig(Protocol):
+    @property
+    def allowed_user_ids(self) -> Sequence[int]: ...
+
+    @property
+    def project_root(self) -> FilePath | str: ...
+
+    @property
+    def execution_profile(self) -> str: ...
+
+    @property
+    def require_allowlist(self) -> bool: ...
+
+    @property
+    def bash_policy(self) -> str | None: ...
+
+
+class _AccessSessionManager(Protocol):
+    async def get_session(self, key: Any) -> dict[str, Any]: ...
+
+    async def patch_session(
+        self,
+        key: Any,
+        *,
+        updates: Mapping[str, Any] | None = None,
+        remove_fields: Iterable[str] = (),
+    ) -> None: ...
+
+    async def patch_session_if(
+        self,
+        key: Any,
+        *,
+        expected: Mapping[str, Any],
+        updates: Mapping[str, Any] | None = None,
+        remove_fields: Iterable[str] = (),
+    ) -> bool: ...
+
+
 class BotAccessMixin:
+    _config: _AccessConfig
+    _session_manager: _AccessSessionManager
+    _conversation_key: Callable[[int, int | None], Any]
+    _ALLOW_OUTSIDE_ONCE_TOKEN: str
+    _DENY_OUTSIDE_TOKEN: str
+
     def _check_user_access(self, user_id: int) -> bool:
         """Check if user has permission to use the bot"""
         if not self._config.allowed_user_ids:

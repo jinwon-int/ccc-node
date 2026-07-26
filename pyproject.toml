@@ -59,7 +59,6 @@ files = [
 # modules get full checking. Any change to this list is review-visible here.
 [[tool.mypy.overrides]]
 module = [
-  "core.bot_access",
   "core.bot_commands",
   "core.bot_delivery",
   "core.bot_lifecycle",
