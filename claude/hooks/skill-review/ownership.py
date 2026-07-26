@@ -2828,8 +2828,9 @@ def _recover_incremental_transaction(
     """Finish an interrupted prepared transaction while holding _MutationLock.
 
     Returns ``applied`` when durable mutation already happened (or is safely
-    completed), and ``aborted`` when no mutation happened and a fresh attempt
-    may proceed. Any ambiguous state is recorded as conflict and fails closed.
+    completed), ``rolled_back`` when a partial marker mutation was restored,
+    and ``aborted`` when no mutation happened and a fresh attempt may proceed.
+    Any ambiguous state is recorded as conflict and fails closed.
     """
 
     proposal_id = envelope["proposal_id"]
@@ -2922,6 +2923,7 @@ def _recover_incremental_transaction(
         raise ContractError("incremental_recovery_backup_invalid")
     target_state = _incremental_target_state(context, backup)
     marker_state = _incremental_marker_state(context, backup)
+    rolled_back = False
     if target_state == "after" and marker_state == "before":
         _write_existing_json_in_skill(
             context,
@@ -2938,12 +2940,14 @@ def _recover_incremental_transaction(
             backup["marker_before"],
         )
         marker_state = "before"
+        rolled_back = True
     if target_state == "after" and marker_state == "after":
         _append_recovery_terminal(context, prepared, outcome="applied")
         return "applied"
     if target_state == "before" and marker_state == "before":
-        _append_recovery_terminal(context, prepared, outcome="aborted")
-        return "aborted"
+        outcome = "rolled_back" if rolled_back else "aborted"
+        _append_recovery_terminal(context, prepared, outcome=outcome)
+        return outcome
     _append_recovery_terminal(context, prepared, outcome="conflict")
     raise ContractError("incremental_recovery_conflict")
 

@@ -406,6 +406,91 @@ rc=$?
 ok "prepared replay recovers durable mutation exactly once" \
   '[ "$rc" = 0 ] && [ "$(jq -s "[.[] | select(.event == \"skill-proposal-apply\" and .proposal_id == (\"9\"*64) and .outcome == \"applied\")] | length" "$STATE/skill-autosave-ownership.jsonl")" = 1 ]'
 
+# A crash after marker mutation but before target mutation is an active
+# rollback, not a no-op abort. Recovery restores the marker, records one
+# rolled_back terminal, and releases the automatic cap reservation.
+make_created_skill recover-marker-only
+make_patch recover-marker-only SKILL.md "1. Read." "1. Read marker recovery." "$(printf 'f%.0s' {1..64})" "$TMP/recover-marker.json"
+TOOL_PATH="$TOOL" SKILLS_PATH="$SKILLS" STATE_PATH="$STATE" PROPOSAL_PATH="$TMP/recover-marker.json" python3 - <<'PY'
+import importlib.util
+import os
+from pathlib import Path
+import sys
+
+spec = importlib.util.spec_from_file_location("ownership_incremental_marker_recovery", os.environ["TOOL_PATH"])
+assert spec is not None and spec.loader is not None
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+context = module.Context(
+    provider="codex",
+    skills_dir=Path(os.environ["SKILLS_PATH"]),
+    state_dir=Path(os.environ["STATE_PATH"]),
+    uid=os.geteuid(),
+)
+with module._MutationLock(context):
+    envelope = module._incremental_proposal(
+        Path(os.environ["PROPOSAL_PATH"]),
+        context,
+    )
+    plan = module._build_incremental_plan(
+        context,
+        envelope,
+        automatic=True,
+    )
+    backup = module._incremental_backup(context, plan)
+    fields = module._incremental_transaction_fields(
+        context,
+        plan,
+        backup,
+        automatic=True,
+        cap_day="2098-01-01",
+        cap_slot=1,
+    )
+    prepared = module._transaction_record(
+        "skill-proposal-apply",
+        "marker-only-recovery",
+        outcome="prepared",
+        fields=fields,
+    )
+    module._append_ledger(context, prepared)
+    module._write_existing_json_in_skill(
+        context,
+        plan.name,
+        module._AUTOSAVE_MARKER,
+        plan.marker_after,
+    )
+    outcome = module._recover_incremental_transaction(
+        context,
+        prepared,
+        envelope,
+    )
+    assert outcome == "rolled_back"
+    assert module._read_target(
+        context,
+        plan.name,
+        plan.relative,
+    ).sha256 == module._sha256(plan.old_payload)
+    marker = module._safe_json_file(
+        context.skills_dir / plan.name / module._AUTOSAVE_MARKER,
+        owner=context.uid,
+        exact_mode=0o600,
+    )
+    assert module._sha256(module._canonical_json(marker)) == plan.marker_before_sha256
+    rows = module._read_ledger(context)
+    assert module._automatic_cap_used(rows, "2098-01-01") == 0
+    terminals = [
+        row
+        for row in rows
+        if row.get("transaction_id") == "marker-only-recovery"
+        and row.get("outcome") == "rolled_back"
+    ]
+    assert len(terminals) == 1
+PY
+rc=$?
+ok "marker-only recovery records rolled_back and releases cap" \
+  '[ "$rc" = 0 ] && jq -s -e "[.[] | select(.transaction_id == \"marker-only-recovery\" and .outcome == \"rolled_back\")] | length == 1" "$STATE/skill-autosave-ownership.jsonl" >/dev/null'
+
 # Cap accounting rejects impossible or corrupted transaction state instead of
 # letting an unknown last outcome release a previously consumed slot.
 jq -nc '{
