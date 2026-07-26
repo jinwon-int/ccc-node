@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Typed Telegram approval mixin contract (#346).** The approval bridge now
+  declares its composed configuration, project-chat approval port, injected
+  callables, and bounded pending state explicitly, removing the file-wide
+  `attr-defined` suppression without changing approval ownership, timeout,
+  replay, race, or cleanup behavior.
 - **Typed ProjectChat request-progress coordinator (#346).** Request creation,
   progress-task ownership, bounded reap, heartbeat cleanup, duration logging,
   and task-ledger finish now run through an independently tested typed
