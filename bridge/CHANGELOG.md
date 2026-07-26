@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Typed Telegram voice settings contract (#346).** Voice handling now declares
+  its read-only configuration dependency explicitly, removing the settings
+  `Any` boundary while the external `BotVoiceMixin` composition exception
+  remains separately tracked.
 - **Typed Telegram delivery mixin contract (#346).** Delivery now declares its
   composed configuration, session, Telegram, artifact, and queue dependencies,
   removing `core.bot_delivery` from the `attr-defined` mypy exception without
