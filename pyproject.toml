@@ -51,14 +51,3 @@ files = [
   "scripts/agent_cron_model.py",
   "scripts/agent_cron_repository.py",
 ]
-
-# Baseline exception (issue #348): the TelegramBot mixin modules reference
-# attributes provided by the composing class, which mypy cannot see until the
-# typed-composition/AppContext refactor lands. Only attr-defined is disabled,
-# only for these modules, so every other error class still gates them and new
-# modules get full checking. Any change to this list is review-visible here.
-[[tool.mypy.overrides]]
-module = [
-  "core.bot_commands",
-]
-disable_error_code = ["attr-defined"]
