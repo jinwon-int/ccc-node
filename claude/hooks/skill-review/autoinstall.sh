@@ -30,6 +30,9 @@
 #   rollback <name>     archive an autosave-installed skill (undo)
 #   rollback --all      archive every autosave-installed skill
 #   status              one-screen mode/cap/ledger summary
+#   ownership-status    ownership/pin/autonomous-write classification (JSON)
+#   list-unmanaged      protected/non-autonomous skills (JSON)
+#   adopt|pin|unpin     explicit owner controls (support --dry-run)
 set -uo pipefail
 export LC_ALL=C
 
@@ -63,6 +66,7 @@ AUTOINSTALL_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pw
 . "$AUTOINSTALL_LIB_DIR/provider.sh" 2>/dev/null || true
 # shellcheck source=claude/hooks/lib/autonomy-guard.sh
 . "$AUTOINSTALL_LIB_DIR/../lib/autonomy-guard.sh" 2>/dev/null || true
+OWNERSHIP_TOOL="$AUTOINSTALL_LIB_DIR/ownership.py"
 ts_id() { date -u +%Y%m%d%H%M%S; }
 
 # Provider-neutral install target (#643): the gate/ledger/rollback pipeline is
@@ -75,6 +79,22 @@ if declare -f ccc_skill_provider >/dev/null 2>&1; then
 else
   SKILL_PROVIDER="claude"
 fi
+
+ownership_cmd() {
+  command -v python3 >/dev/null 2>&1 || {
+    printf '{"ok":false,"code":"python3_missing"}\n' >&2
+    return 2
+  }
+  [ -r "$OWNERSHIP_TOOL" ] || {
+    printf '{"ok":false,"code":"ownership_tool_missing"}\n' >&2
+    return 2
+  }
+  python3 "$OWNERSHIP_TOOL" \
+    --provider "$SKILL_PROVIDER" \
+    --skills-dir "$SKILLS_DIR" \
+    --state-dir "$STATE_DIR" \
+    "$@"
+}
 
 resolve_mode() {
   local m="${CCC_SKILL_AUTOSAVE_MODE:-}"
@@ -368,12 +388,20 @@ do_run() {
       continue
     fi
     sha="$(file_sha "$dest/SKILL.md")"
+    if ! ownership_cmd mark-created "$name" >/dev/null; then
+      # This directory was created by this locked install attempt and has not
+      # been published as installed yet. Fail closed and leave the draft
+      # pending if durable v2 provenance cannot be established.
+      rm -f "$dest/SKILL.md" "$dest/.autosave-meta.json" 2>/dev/null
+      rmdir "$dest" 2>/dev/null || true
+      log "install failed id=$id name=$name reason=provenance-write trigger=$TRIGGER"
+      continue
+    fi
     rec="$(jq -nc --arg ts "$(ts)" --arg id "$id" --arg name "$name" \
       --arg path "$dest/SKILL.md" --arg sid "$sid" --arg sha "$sha" --arg trg "$TRIGGER" \
       '{event:"install", ts:$ts, id:$id, name:$name, path:$path,
         session_id:$sid, sha256:$sha, installed_by:"autosave", trigger:$trg}')"
     printf '%s\n' "$rec" >> "$LEDGER" 2>/dev/null || true
-    printf '%s\n' "$rec" > "$dest/.autosave-meta.json" 2>/dev/null || true
     if [ -f "$dir/meta.json" ]; then
       jq --arg at "$(ts)" '.status="installed" | .installed_by="autosave" | .installed_at=$at' \
         "$dir/meta.json" > "$dir/meta.json.tmp" 2>/dev/null \
@@ -449,8 +477,8 @@ rollback_one() { # <name>
   local name="$1" dir arch
   printf '%s' "$name" | grep -qE "$KEBAB" || { echo "rollback: invalid name: $name" >&2; return 1; }
   dir="$SKILLS_DIR/$name"
-  if [ ! -f "$dir/.autosave-meta.json" ]; then
-    echo "rollback: $name is not autosave-installed (no .autosave-meta.json) — refusing" >&2
+  if ! ownership_cmd rollback-check "$name" >/dev/null; then
+    echo "rollback: $name is not an unpinned rollback-eligible autosave install — refusing" >&2
     return 1
   fi
   mkdir -p "$ROLLBACK_DIR" 2>/dev/null
@@ -524,5 +552,8 @@ case "$MODE_VERB" in
   list) do_list ;;
   rollback) shift; do_rollback "${1:-}" ;;
   status) do_status ;;
-  *) echo "usage: autoinstall.sh [run|list|rollback <name>|--all|status]" >&2; exit 2 ;;
+  ownership-status) shift; ownership_cmd status "$@" ;;
+  list-unmanaged) shift; ownership_cmd list-unmanaged "$@" ;;
+  adopt|pin|unpin) shift; ownership_cmd "$MODE_VERB" "$@" ;;
+  *) echo "usage: autoinstall.sh [run|list|rollback <name>|--all|status|ownership-status [name]|list-unmanaged|adopt <name> [--dry-run]|pin <name> [--dry-run]|unpin <name> [--dry-run]]" >&2; exit 2 ;;
 esac

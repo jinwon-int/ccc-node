@@ -143,7 +143,8 @@ surface + enforced authoring standards + after-the-fact visibility:
 Passing drafts are installed to `~/.claude/skills/<name>/` immediately and
 recorded in the `installed-by=autosave` ledger
 (`~/.claude/state/skill-autosave-install.jsonl`) plus an in-dir
-`.autosave-meta.json` marker. Failing drafts are **never dropped**: they stay
+owner-only `.autosave-meta.json` v2 provenance marker. Failing drafts are
+**never dropped**: they stay
 in the pending queue with an `autosave-block.json` reason and keep the normal
 human review path. The Telegram push becomes a post-hoc notice ("스킬 자동
 설치 N건 …"), not an approval request.
@@ -171,9 +172,12 @@ Safety rails:
   `CCC_AUTONOMY_LEDGER_MAX` lines, default 500), so an operator can see in one
   place what the kill/dry-run switch actually blocked across the node:
   `tail ~/.claude/state/autonomy-ledger.jsonl`.
-- **Rollback, always**: every install is reversible, individually or in bulk —
-  archives to `~/.claude/state/skill-autosave-rollback/`, never deletes, and
-  refuses skills without the autosave marker (hand-authored skills are safe):
+- **Rollback, always**: every autosave-created install is reversible,
+  individually or in bulk — archives to
+  `~/.claude/state/skill-autosave-rollback/`, never deletes, and uses the
+  shared ownership classifier rather than marker presence alone. Adopted,
+  pinned, managed/bundled, conflicting, drifted, and unreadable skills are
+  refused:
 
   ```bash
   ~/.claude/hooks/skill-review/autoinstall.sh list
@@ -187,6 +191,108 @@ Safety rails:
 - **Concurrency-safe**: an atomic single-runner lock means the same checkpoint
   processed many times at once installs exactly once — no duplicate
   candidate/ledger/install rows.
+
+## Autonomous mutation ownership contract (#750)
+
+This contract establishes who a future background curator may modify. It does
+not generate or apply a skill patch yet. Foreground user-approved installs and
+the transactional `ccc_codex_skills.py` setup/self-update path remain separate
+authority domains and do not call this autonomous write gate.
+
+The classifier uses this fail-closed precedence:
+
+1. unsafe/unreadable path or metadata → `unknown/unreadable`;
+2. a valid `.ccc-node-managed.json` → `managed/bundled` (wins over an
+   autosave marker; a dual-marker conflict is reported and remains read-only);
+3. valid current or legacy `.autosave-meta.json` → `autosave-managed`;
+4. a verifiable repository/external marker → `external/repo-installed`;
+5. a normal readable skill with no autonomous provenance → `user-owned`;
+6. the separate pin control overlays any otherwise valid local class as
+   `pinned`.
+
+Only `autosave-managed` and unpinned is eligible for an autonomous write
+proposal. Every other row is read-only to autonomous work:
+
+| Base ownership | Unpinned autonomous write | Pinned autonomous write | Authority that may change it |
+|---|---:|---:|---|
+| `autosave-managed` | exact-read guard required | denied | future autosave curator / explicit owner control |
+| `user-owned` | denied | denied | foreground owner; `adopt` may transfer control |
+| `managed/bundled` | denied | denied | setup/self-update only |
+| `external/repo-installed` | denied | denied | its external installer/foreground owner |
+| `unknown/unreadable` | denied | denied | repair provenance/path first |
+
+Operator controls are provider-scoped and return JSON with no skill body or
+secret. State lives under `~/.claude/state/` in an owner-only directory:
+`skill-autosave-control.json` is the pin overlay and
+`skill-autosave-ownership.jsonl` is a `0600` body-free audit ledger.
+
+```bash
+AUTO=~/.claude/hooks/skill-review/autoinstall.sh
+
+$AUTO ownership-status                 # all skills
+$AUTO ownership-status <name>          # one skill
+$AUTO list-unmanaged
+$AUTO adopt <name> --dry-run
+$AUTO adopt <name>
+$AUTO pin <name> --dry-run
+$AUTO pin <name>
+$AUTO unpin <name>
+```
+
+`adopt` accepts exactly one safe, owner-held, provider-root-local user skill.
+It refuses traversal, symlinks, hardlinks, managed/external markers, corrupt
+metadata, and unsafe roots. Adoption writes `.autosave-meta.json` v2 with
+`created_by=operator-adopt` and `rollback_eligible=false`; rollback can never
+archive an adopted user skill. Pin is a separate overlay, so unpin restores
+the original ownership rather than guessing it. Dry-run performs the same
+classification but does not create state, metadata, receipts, or ledger rows.
+
+### Provenance and legacy migration
+
+New autosave markers have `schema_version=2`,
+`manager=ccc-node-skill-autosave`, provider/name/opaque target identity,
+`created_by` (`ccc-node` or `operator-adopt`), `skill_sha256`,
+`provenance_revision`, `rollback_eligible`, and a timestamp. They are regular,
+single-link, owner-held `0600` files. The marker contains no skill body.
+
+Migration is conservative and does not rewrite existing files during status:
+
+- a legacy `installed_by=autosave` marker is recognized as revision `0` only
+  when its name/path shape and recorded SHA-256 match the current `SKILL.md`;
+- legacy SHA drift, corrupt metadata, unsafe permissions, or unreadable files
+  become `unknown/unreadable`, never an inferred owner;
+- a missing autosave marker on an otherwise safe local skill means
+  `user-owned`, not autosave-managed;
+- repository/external ownership is classified only from verifiable signals;
+  it is never guessed from a name;
+- valid bundled provenance remains setup/self-update-owned even if an autosave
+  marker is also present.
+
+### Exact read-before-write receipt
+
+The future curator must read every exact file it proposes to change through
+the deployed ownership tool. The read returns the content to that review
+attempt and stores a short-lived owner-only receipt; only the audit metadata is
+body-free:
+
+```bash
+OWN=~/.claude/hooks/skill-review/ownership.py
+
+python3 "$OWN" read-target <skill> SKILL.md \
+  --attempt-id <review-attempt-id> --operation patch > read.json
+
+python3 "$OWN" guard-proposal --proposal proposal.json
+```
+
+`proposal.json` has schema version `1` and copies the receipt's `attempt_id`,
+`receipt_id`, operation (`patch`, `edit`, or `write_file`), provider, name,
+opaque target id, exact root-relative target, expected SHA-256, and expected
+provenance revision/hash. The guard reopens the target no-follow from the
+validated skill root and compares file device/inode/size/mtime, content hash,
+ownership, pin state, and provenance. Mismatch, expiry, cross-attempt or
+cross-operation use, path drift, and replay are denied. Every receipt is
+single-use and is consumed on an authorization decision or checked denial.
+Actual patch/write generation and application remain out of scope for #750.
 
 ## Migration & rollback (Claude ↔ Codex)
 

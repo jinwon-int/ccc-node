@@ -234,7 +234,7 @@ ok "setup non-root dry-run includes all Codex managed launch artifacts" \
 # --- #569: hook-tree walk — deploys recursively, excludes tests/bytecode/wiring,
 # and dry-run only RENDERS the walk (no copies). rewrite_claude is a real install.
 ok "hook-tree walk deploys nested lib/ and distill/ files preserving structure" \
-  '[ -x "$rewrite_claude/hooks/lib/hook-common.sh" ] && [ -x "$rewrite_claude/hooks/distill/resume-write.sh" ] && [ -x "$rewrite_claude/hooks/skill-review/autoinstall.sh" ] && cmp -s "$ROOT/claude/hooks/distill/resume-write.sh" "$rewrite_claude/hooks/distill/resume-write.sh"'
+  '[ -x "$rewrite_claude/hooks/lib/hook-common.sh" ] && [ -x "$rewrite_claude/hooks/distill/resume-write.sh" ] && [ -x "$rewrite_claude/hooks/skill-review/autoinstall.sh" ] && [ -x "$rewrite_claude/hooks/skill-review/ownership.py" ] && cmp -s "$ROOT/claude/hooks/distill/resume-write.sh" "$rewrite_claude/hooks/distill/resume-write.sh" && cmp -s "$ROOT/claude/hooks/skill-review/ownership.py" "$rewrite_claude/hooks/skill-review/ownership.py"'
 ok "hook-tree walk installs top-level hooks executable including .py collectors" \
   '[ -x "$rewrite_claude/hooks/checkpoint.sh" ] && [ -x "$rewrite_claude/hooks/scan-injection.sh" ] && [ -x "$rewrite_claude/hooks/statusline-usage.py" ]'
 ok "hook-tree walk installs lifecycle feed and opaque-ref helper" \
