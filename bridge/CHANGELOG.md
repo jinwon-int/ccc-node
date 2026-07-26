@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Typed smart-reply source signature (#346).** Delivery now declares its
+  Telegram message input and asynchronous `None` result explicitly, enabling
+  the next bounded voice-composition contract without changing reply behavior.
 - **Typed Telegram voice settings contract (#346).** Voice handling now declares
   its read-only configuration dependency explicitly, removing the settings
   `Any` boundary while the external `BotVoiceMixin` composition exception
