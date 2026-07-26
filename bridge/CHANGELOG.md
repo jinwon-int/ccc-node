@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Typed Telegram delivery mixin contract (#346).** Delivery now declares its
+  composed configuration, session, Telegram, artifact, and queue dependencies,
+  removing `core.bot_delivery` from the `attr-defined` mypy exception without
+  changing rendering, file handling, resume, or approval behavior.
 - **Typed Telegram access mixin contract (#346).** Access and permission
   handling now declares its composed configuration, session, conversation-key,
   and approval-token dependencies explicitly, removing `core.bot_access` from
