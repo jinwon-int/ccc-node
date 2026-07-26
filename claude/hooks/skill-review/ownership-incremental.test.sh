@@ -160,6 +160,160 @@ out="$(tool apply-proposal --proposal "$TMP/hardlink.json")"; rc=$?
 ok "hardlinked patch target is rejected" \
   '[ "$rc" = 2 ] && jq -e ".code == \"unsafe_target_file\"" >/dev/null <<<"$out" && grep -q "repeat once" "$TMP/hardlink-copy"'
 
+# A non-cooperating same-owner writer can create a new leaf after the old
+# target has been claimed but before the proposal publishes. The no-replace
+# commit must preserve that raced leaf and record conflict instead of
+# overwriting it.
+make_skill patch-race
+make_patch patch-race SKILL.md "1. Read." "1. Read proposed." "$(printf 'c%.0s' {1..64})" "$TMP/patch-race.json"
+TOOL_PATH="$TOOL" SKILLS_PATH="$SKILLS" STATE_PATH="$STATE" PROPOSAL_PATH="$TMP/patch-race.json" python3 - <<'PY'
+import importlib.util
+import os
+from pathlib import Path
+import sys
+
+spec = importlib.util.spec_from_file_location("ownership_incremental_patch_race", os.environ["TOOL_PATH"])
+assert spec is not None and spec.loader is not None
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+context = module.Context(
+    provider="codex",
+    skills_dir=Path(os.environ["SKILLS_PATH"]),
+    state_dir=Path(os.environ["STATE_PATH"]),
+    uid=os.geteuid(),
+)
+real_rename = module._rename_noreplace
+injected = False
+external = (
+    b"---\nname: patch-race\n"
+    b"description: External writer content must survive the proposal race.\n"
+    b"---\n\n# External\n\n## Procedure\n1. Preserve external update.\n"
+)
+
+
+def race_before_publish(parent_fd, source, destination):
+    global injected
+    if (
+        not injected
+        and source.startswith(".ccc-skill-proposal.")
+        and destination == "SKILL.md"
+    ):
+        descriptor = os.open(
+            destination,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+            dir_fd=parent_fd,
+        )
+        try:
+            os.write(descriptor, external)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        injected = True
+    return real_rename(parent_fd, source, destination)
+
+
+module._rename_noreplace = race_before_publish
+try:
+    module._command_apply_proposal(
+        context,
+        Path(os.environ["PROPOSAL_PATH"]),
+        dry_run=False,
+        automatic=False,
+        daily_cap=None,
+    )
+except module.ContractError as error:
+    assert error.code == "incremental_rollback_conflict"
+else:
+    raise SystemExit(1)
+assert (context.skills_dir / "patch-race" / "SKILL.md").read_bytes() == external
+PY
+rc=$?
+ok "raced patch leaf is preserved without overwrite" \
+  '[ "$rc" = 0 ] && grep -q "External writer content" "$SKILLS/patch-race/SKILL.md" && jq -s -e "[.[] | select(.event == \"skill-proposal-apply\" and .proposal_id == (\"c\"*64) and .outcome == \"conflict\")] | length == 1" "$STATE/skill-autosave-ownership.jsonl" >/dev/null'
+
+# If the canonical parent drifts after a no-replace support-file link and a
+# concurrent writer replaces the published leaf, rollback must not unlink the
+# writer's entry.
+make_skill write-race
+mkdir -m 700 "$SKILLS/write-race/references"
+TOOL_PATH="$TOOL" SKILLS_PATH="$SKILLS" STATE_PATH="$STATE" python3 - <<'PY'
+from contextlib import contextmanager
+import importlib.util
+import os
+from pathlib import Path
+from types import SimpleNamespace
+import sys
+
+spec = importlib.util.spec_from_file_location("ownership_incremental_write_race", os.environ["TOOL_PATH"])
+assert spec is not None and spec.loader is not None
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+context = module.Context(
+    provider="codex",
+    skills_dir=Path(os.environ["SKILLS_PATH"]),
+    state_dir=Path(os.environ["STATE_PATH"]),
+    uid=os.geteuid(),
+)
+real_parent = module._target_parent_fd
+calls = 0
+external = b"external support writer wins\n"
+
+
+@contextmanager
+def drift_after_link(context_arg, name, relative):
+    global calls
+    with real_parent(context_arg, name, relative) as opened:
+        calls += 1
+        parent_fd, leaf, parent = opened
+        if calls == 3:
+            replacement = ".external-support-replacement"
+            descriptor = os.open(
+                replacement,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+                dir_fd=parent_fd,
+            )
+            try:
+                os.write(descriptor, external)
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+            os.replace(
+                replacement,
+                leaf,
+                src_dir_fd=parent_fd,
+                dst_dir_fd=parent_fd,
+            )
+            parent = SimpleNamespace(
+                st_dev=parent.st_dev,
+                st_ino=parent.st_ino + 1,
+            )
+        yield parent_fd, leaf, parent
+
+
+module._target_parent_fd = drift_after_link
+try:
+    module._create_target_noreplace(
+        context,
+        "write-race",
+        "references/new.md",
+        b"proposal support content\n",
+    )
+except module.ContractError as error:
+    assert error.code == "target_parent_drift"
+else:
+    raise SystemExit(1)
+assert (
+    context.skills_dir / "write-race" / "references" / "new.md"
+).read_bytes() == external
+PY
+rc=$?
+ok "parent-drift rollback never unlinks a raced support leaf" \
+  '[ "$rc" = 0 ] && grep -q "external support writer wins" "$SKILLS/write-race/references/new.md" && ! find "$SKILLS/write-race/references" -name ".ccc-skill-proposal.*" | grep -q .'
+
 # Adopted user skills are incrementally writable only with explicit owner
 # approval; unattended mutation is refused because whole-skill rollback is
 # intentionally unavailable for adopted content.

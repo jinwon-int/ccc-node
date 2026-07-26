@@ -95,6 +95,10 @@ Automatic daily-cap reservation uses this same locked ledger, so concurrent
 workers cannot consume the final slot twice. Automatic mutation is limited to
 rollback-eligible autosave-created skills; an operator-adopted skill can be
 improved through explicit approval but is never changed unattended.
+Existing-file updates use a Linux `renameat2(RENAME_NOREPLACE)` claim and
+no-replace publish sequence. A non-cooperating same-owner rename can cause a
+brief unavailable/conflict state, but its entry is preserved rather than
+silently overwritten; recovery then fails closed for operator resolution.
 
 Review and apply a v2 draft without copying files by hand:
 

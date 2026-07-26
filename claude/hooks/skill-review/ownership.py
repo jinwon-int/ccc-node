@@ -7,8 +7,10 @@ import argparse
 import base64
 import binascii
 from contextlib import contextmanager
+import ctypes
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+import errno
 import fcntl
 import hashlib
 import json
@@ -84,6 +86,7 @@ _NODE_FACT_RE = re.compile(
 _CODEX_INCOMPAT_RE = re.compile(
     r"(?:\bclaude\s+-p\b|~/\.claude\b|\bCLAUDE_[A-Z0-9_]+\b)"
 )
+_RENAME_NOREPLACE = 1
 
 
 class ContractError(RuntimeError):
@@ -2211,6 +2214,101 @@ def _command_validate_incremental_proposal(
     }
 
 
+def _rename_noreplace(
+    parent_fd: int,
+    source: str,
+    destination: str,
+) -> None:
+    """Move one entry without ever replacing an existing destination."""
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    renameat2 = getattr(libc, "renameat2", None)
+    if renameat2 is None:
+        raise ContractError("incremental_atomic_noreplace_unsupported")
+    renameat2.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    ]
+    renameat2.restype = ctypes.c_int
+    result = renameat2(
+        parent_fd,
+        os.fsencode(source),
+        parent_fd,
+        os.fsencode(destination),
+        _RENAME_NOREPLACE,
+    )
+    if result == 0:
+        return
+    error_number = ctypes.get_errno()
+    if error_number == errno.EEXIST:
+        raise FileExistsError(destination)
+    if error_number == errno.ENOENT:
+        raise FileNotFoundError(source)
+    if error_number in {errno.ENOSYS, errno.EINVAL}:
+        raise ContractError("incremental_atomic_noreplace_unsupported")
+    raise OSError(error_number, "renameat2 failed")
+
+
+def _claimed_target_matches(
+    parent_fd: int,
+    name: str,
+    expected: TargetSnapshot,
+    *,
+    uid: int,
+) -> bool:
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    descriptor = os.open(name, flags, dir_fd=parent_fd)
+    try:
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != uid
+            or before.st_nlink != 1
+            or stat.S_IMODE(before.st_mode) & 0o022
+            or before.st_size > _MAX_TARGET_BYTES
+            or (before.st_dev, before.st_ino)
+            != (expected.device, expected.inode)
+        ):
+            return False
+        chunks: list[bytes] = []
+        remaining = _MAX_TARGET_BYTES + 1
+        while remaining > 0:
+            chunk = os.read(descriptor, min(65536, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        payload = b"".join(chunks)
+        after = os.fstat(descriptor)
+        return (
+            len(payload) <= _MAX_TARGET_BYTES
+            and _sha256(payload) == expected.sha256
+            and (
+                before.st_dev,
+                before.st_ino,
+                before.st_size,
+                before.st_mtime_ns,
+                before.st_ctime_ns,
+            )
+            == (
+                after.st_dev,
+                after.st_ino,
+                after.st_size,
+                after.st_mtime_ns,
+                after.st_ctime_ns,
+            )
+        )
+    finally:
+        os.close(descriptor)
+
+
 @contextmanager
 def _target_parent_fd(
     context: Context, name: str, relative: str
@@ -2295,7 +2393,52 @@ def _support_stats(context: Context, name: str) -> tuple[int, int]:
     return count, total
 
 
-def _replace_target_atomic(
+def _write_temporary_target(
+    parent_fd: int,
+    name: str,
+    payload: bytes,
+    *,
+    mode: int,
+) -> tuple[int, int]:
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    descriptor = os.open(name, flags, mode, dir_fd=parent_fd)
+    try:
+        os.fchmod(descriptor, mode)
+        view = memoryview(payload)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise OSError
+            view = view[written:]
+        os.fsync(descriptor)
+        metadata = os.fstat(descriptor)
+        return metadata.st_dev, metadata.st_ino
+    finally:
+        os.close(descriptor)
+
+
+def _unlink_if_identity(
+    parent_fd: int,
+    name: str,
+    identity: tuple[int, int] | None,
+) -> None:
+    if identity is None:
+        return
+    try:
+        current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if (current.st_dev, current.st_ino) == identity:
+            os.unlink(name, dir_fd=parent_fd)
+    except OSError:
+        pass
+
+
+def _replace_target_no_clobber(
     context: Context,
     name: str,
     relative: str,
@@ -2304,80 +2447,131 @@ def _replace_target_atomic(
     payload: bytes,
     mode: int,
 ) -> None:
-    temporary = f".ccc-skill-proposal.{uuid.uuid4().hex}"
-    descriptor: int | None = None
+    nonce = uuid.uuid4().hex
+    temporary = f".ccc-skill-proposal.{nonce}"
+    previous = f".ccc-skill-previous.{nonce}"
+    temporary_identity: tuple[int, int] | None = None
+    previous_claimed = False
+    published = False
     with _target_parent_fd(context, name, relative) as (parent_fd, leaf, _parent):
-        flags = (
-            os.O_WRONLY
-            | os.O_CREAT
-            | os.O_EXCL
-            | getattr(os, "O_CLOEXEC", 0)
-            | getattr(os, "O_NOFOLLOW", 0)
-        )
         try:
-            descriptor = os.open(temporary, flags, mode, dir_fd=parent_fd)
-            os.fchmod(descriptor, mode)
-            view = memoryview(payload)
-            while view:
-                written = os.write(descriptor, view)
-                if written <= 0:
-                    raise OSError
-                view = view[written:]
-            os.fsync(descriptor)
-            os.close(descriptor)
-            descriptor = None
+            temporary_identity = _write_temporary_target(
+                parent_fd,
+                temporary,
+                payload,
+                mode=mode,
+            )
+            try:
+                _rename_noreplace(parent_fd, leaf, previous)
+            except FileNotFoundError:
+                raise ContractError("target_drift")
+            except FileExistsError:
+                raise ContractError("incremental_write_failed") from None
+            previous_claimed = True
+            if not _claimed_target_matches(
+                parent_fd,
+                previous,
+                expected,
+                uid=context.uid,
+            ):
+                try:
+                    _rename_noreplace(parent_fd, previous, leaf)
+                except FileExistsError:
+                    raise ContractError("incremental_rollback_conflict") from None
+                previous_claimed = False
+                os.fsync(parent_fd)
+                raise ContractError("target_drift")
+            try:
+                _rename_noreplace(parent_fd, temporary, leaf)
+            except (FileExistsError, FileNotFoundError):
+                raise ContractError("incremental_rollback_conflict") from None
+            published = True
             current = os.stat(leaf, dir_fd=parent_fd, follow_symlinks=False)
             if (
                 not stat.S_ISREG(current.st_mode)
                 or current.st_uid != context.uid
                 or current.st_nlink != 1
-                or (
-                    current.st_dev,
-                    current.st_ino,
-                    current.st_size,
-                    current.st_mtime_ns,
-                    current.st_ctime_ns,
-                )
-                != (
-                    expected.device,
-                    expected.inode,
-                    expected.size,
-                    expected.mtime_ns,
-                    expected.ctime_ns,
+                or (current.st_dev, current.st_ino) != temporary_identity
+                or not _claimed_target_matches(
+                    parent_fd,
+                    previous,
+                    expected,
+                    uid=context.uid,
                 )
             ):
-                raise ContractError("target_drift")
-            os.replace(
-                temporary,
-                leaf,
-                src_dir_fd=parent_fd,
-                dst_dir_fd=parent_fd,
-            )
+                raise ContractError("incremental_rollback_conflict")
+            os.unlink(previous, dir_fd=parent_fd)
+            previous_claimed = False
             os.fsync(parent_fd)
+        except ContractError:
+            raise
         except OSError:
             raise ContractError("incremental_write_failed") from None
         finally:
-            if descriptor is not None:
-                os.close(descriptor)
+            _unlink_if_identity(parent_fd, temporary, temporary_identity)
+            if previous_claimed and not published:
+                try:
+                    _rename_noreplace(parent_fd, previous, leaf)
+                    os.fsync(parent_fd)
+                except (ContractError, OSError):
+                    pass
+
+
+def _remove_target_if_snapshot(
+    context: Context,
+    name: str,
+    relative: str,
+    *,
+    expected: TargetSnapshot,
+) -> None:
+    """Remove only the exact inspected entry, preserving any raced replacement."""
+
+    quarantine = f".ccc-skill-remove.{uuid.uuid4().hex}"
+    claimed = False
+    with _target_parent_fd(context, name, relative) as (parent_fd, leaf, _parent):
+        try:
             try:
-                os.unlink(temporary, dir_fd=parent_fd)
-            except OSError:
-                pass
+                _rename_noreplace(parent_fd, leaf, quarantine)
+            except FileNotFoundError:
+                raise ContractError("target_drift") from None
+            except FileExistsError:
+                raise ContractError("incremental_write_failed") from None
+            claimed = True
+            if not _claimed_target_matches(
+                parent_fd,
+                quarantine,
+                expected,
+                uid=context.uid,
+            ):
+                try:
+                    _rename_noreplace(parent_fd, quarantine, leaf)
+                except FileExistsError:
+                    raise ContractError("incremental_rollback_conflict") from None
+                claimed = False
+                os.fsync(parent_fd)
+                raise ContractError("target_drift")
+            os.unlink(quarantine, dir_fd=parent_fd)
+            claimed = False
+            os.fsync(parent_fd)
+        except ContractError:
+            raise
+        except OSError:
+            raise ContractError("incremental_write_failed") from None
+        finally:
+            if claimed:
+                try:
+                    _rename_noreplace(parent_fd, quarantine, leaf)
+                    os.fsync(parent_fd)
+                except (ContractError, OSError):
+                    pass
 
 
 def _create_target_noreplace(
     context: Context, name: str, relative: str, payload: bytes
 ) -> None:
     temporary = f".ccc-skill-proposal.{uuid.uuid4().hex}"
-    descriptor: int | None = None
+    temporary_identity: tuple[int, int] | None = None
     with _target_parent_fd(context, name, relative) as (parent_fd, leaf, parent_before):
-        flags = (
-            os.O_WRONLY
-            | os.O_CREAT
-            | os.O_EXCL
-            | getattr(os, "O_CLOEXEC", 0)
-            | getattr(os, "O_NOFOLLOW", 0)
-        )
         try:
             try:
                 os.stat(leaf, dir_fd=parent_fd, follow_symlinks=False)
@@ -2385,17 +2579,12 @@ def _create_target_noreplace(
                 pass
             else:
                 raise ContractError("target_already_exists")
-            descriptor = os.open(temporary, flags, 0o600, dir_fd=parent_fd)
-            os.fchmod(descriptor, 0o600)
-            view = memoryview(payload)
-            while view:
-                written = os.write(descriptor, view)
-                if written <= 0:
-                    raise OSError
-                view = view[written:]
-            os.fsync(descriptor)
-            os.close(descriptor)
-            descriptor = None
+            temporary_identity = _write_temporary_target(
+                parent_fd,
+                temporary,
+                payload,
+                mode=0o600,
+            )
             with _target_parent_fd(context, name, relative) as (
                 current_parent_fd,
                 _current_leaf,
@@ -2416,6 +2605,9 @@ def _create_target_noreplace(
                 )
             except FileExistsError:
                 raise ContractError("target_already_exists") from None
+            linked = os.stat(leaf, dir_fd=parent_fd, follow_symlinks=False)
+            if (linked.st_dev, linked.st_ino) != temporary_identity:
+                raise ContractError("incremental_rollback_conflict")
             with _target_parent_fd(context, name, relative) as (
                 current_parent_fd,
                 _current_leaf,
@@ -2425,20 +2617,20 @@ def _create_target_noreplace(
                     parent_before.st_dev,
                     parent_before.st_ino,
                 ):
-                    os.unlink(leaf, dir_fd=parent_fd)
                     os.fsync(parent_fd)
                     raise ContractError("target_parent_drift")
+            linked = os.stat(leaf, dir_fd=parent_fd, follow_symlinks=False)
+            if (linked.st_dev, linked.st_ino) != temporary_identity:
+                raise ContractError("incremental_rollback_conflict")
             os.unlink(temporary, dir_fd=parent_fd)
+            temporary_identity = None
             os.fsync(parent_fd)
+        except ContractError:
+            raise
         except OSError:
             raise ContractError("incremental_write_failed") from None
         finally:
-            if descriptor is not None:
-                os.close(descriptor)
-            try:
-                os.unlink(temporary, dir_fd=parent_fd)
-            except OSError:
-                pass
+            _unlink_if_identity(parent_fd, temporary, temporary_identity)
 
 
 def _write_existing_json_in_skill(
@@ -2451,7 +2643,7 @@ def _write_existing_json_in_skill(
     metadata = _lstat(context.skills_dir / name / relative)
     if metadata is None:
         raise ContractError("target_missing")
-    _replace_target_atomic(
+    _replace_target_no_clobber(
         context,
         name,
         relative,
@@ -3064,7 +3256,7 @@ def _publish_incremental_plan(
         metadata = _lstat(context.skills_dir / plan.name / plan.relative)
         if metadata is None:
             raise ContractError("target_missing")
-        _replace_target_atomic(
+        _replace_target_no_clobber(
             context,
             plan.name,
             plan.relative,
@@ -3112,15 +3304,18 @@ def _rollback_incremental_plan(
     plan: IncrementalMutationPlan,
 ) -> None:
     if plan.old_payload is None:
-        with _target_parent_fd(
+        current = _read_target(
             context,
             plan.name,
             plan.relative,
-        ) as (parent_fd, leaf, _parent):
-            current = _read_target(context, plan.name, plan.relative)
-            if current.sha256 == _sha256(plan.new_payload):
-                os.unlink(leaf, dir_fd=parent_fd)
-                os.fsync(parent_fd)
+        )
+        if current.sha256 == _sha256(plan.new_payload):
+            _remove_target_if_snapshot(
+                context,
+                plan.name,
+                plan.relative,
+                expected=current,
+            )
     else:
         current = _read_target(context, plan.name, plan.relative)
         if current.sha256 == _sha256(plan.new_payload):
@@ -3129,7 +3324,7 @@ def _rollback_incremental_plan(
             )
             if metadata is None:
                 raise ContractError("target_missing")
-            _replace_target_atomic(
+            _replace_target_no_clobber(
                 context,
                 plan.name,
                 plan.relative,
@@ -3203,7 +3398,16 @@ def _apply_incremental_plan(
     try:
         _publish_incremental_plan(context, plan)
         mutated = True
-    except ContractError:
+    except ContractError as error:
+        if error.code == "incremental_rollback_conflict":
+            _finish_transaction(
+                context,
+                "skill-proposal-apply",
+                transaction_id,
+                outcome="conflict",
+                fields=fields,
+            )
+            raise
         try:
             mutated = _incremental_target_matches_new(context, plan)
         except ContractError:
