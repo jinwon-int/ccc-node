@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Typed Telegram lifecycle composition contract (#346).** Lifecycle handling
+  now declares its composed configuration, session, polling, distill, push,
+  filesystem, and cross-mixin dependencies explicitly, removing the
+  `core.bot_lifecycle` mypy exception without changing runtime behavior.
 - **Typed Telegram voice composition contract (#346).** Voice handling now
   declares its composed task, media, delivery, access, queue, and Telegram
   dependencies explicitly, removing the `core.bot_voice` mypy exception

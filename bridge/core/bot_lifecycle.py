@@ -6,11 +6,13 @@ import os
 import signal
 import shutil
 import subprocess
-from typing import Optional
+from datetime import datetime
+from pathlib import Path as FilePath
+from typing import Any, Callable, Optional, Protocol, cast
 
 import telegram.error
 from telegram import Update
-from telegram.ext import Application
+from telegram.ext import Application, ContextTypes
 from telegram.request import BaseRequest, HTTPXRequest
 
 from telegram_bot.core import crash_policy, media
@@ -37,6 +39,8 @@ from telegram_bot.core.dead_session_wakeup import (
     recovery_should_defer_to_wakeup,
     run_dead_session_wakeup_scan,
 )
+from telegram_bot.memory.distill_types import DistillJob
+from telegram_bot.memory.skill_candidate import SkillCandidateStageResult
 from telegram_bot.utils.heartbeat_store import drain_heartbeats, store_path_for
 from telegram_bot.utils.orphan_reaper import (
     run_periodic_reaper,
@@ -46,7 +50,152 @@ from telegram_bot.utils.orphan_reaper import (
 logger = logging.getLogger(__name__)
 
 
+class _LifecycleConfig(Protocol):
+    @property
+    def bot_data_dir(self) -> FilePath: ...
+
+    @property
+    def telegram_bot_token(self) -> str: ...
+
+    @property
+    def claude_cli_path(self) -> Optional[FilePath]: ...
+
+
+class _LifecycleSessionManager(Protocol):
+    def validate_storage_path(self) -> None: ...
+
+    def initialize(self) -> None: ...
+
+
+class _LifecycleProjectChat(Protocol):
+    @property
+    def conversations_dir(self) -> FilePath: ...
+
+    @property
+    def usage_meter(self) -> Any | None: ...
+
+    def workload_snapshot(self, now: float) -> tuple[int, float]: ...
+
+    async def enforce_session_resource_limits(
+        self, *, now: float | None = None
+    ) -> dict[str, int | float]: ...
+
+    async def close(self) -> None: ...
+
+
+class _LifecycleDistillJournal(Protocol):
+    def validate_path(self) -> None: ...
+
+    def initialize(self) -> None: ...
+
+    def recover_stale_running(self, *, now: datetime | None = None) -> int: ...
+
+    def list_jobs(self) -> tuple[DistillJob, ...]: ...
+
+
+class _LifecyclePushNotifier(Protocol):
+    @property
+    def spool_dir(self) -> FilePath: ...
+
+    async def run(
+        self, application: Application, stop_event: asyncio.Event
+    ) -> None: ...
+
+
+class _LifecycleClock(Protocol):
+    def time(self) -> float: ...
+
+
+class _DistillSnapshotWorker(Protocol):
+    async def snapshot_once(self, *, job_id: str) -> DistillJob: ...
+
+
+class _DistillExtractionWorker(Protocol):
+    async def extract_once(self, *, job_id: str) -> DistillJob: ...
+
+
+class _DistillLocalSinkWorker(Protocol):
+    async def write_once(self, *, job_id: str) -> DistillJob: ...
+
+
+class _DistillWikiSinkWorker(Protocol):
+    async def write_once(self, *, job_id: str) -> DistillJob: ...
+
+
+class _DistillHonchoSinkWorker(Protocol):
+    async def write_once(self, *, job_id: str) -> DistillJob: ...
+
+
+class _SkillCandidateCollectorWorker(Protocol):
+    async def collect_once(
+        self, *, job_id: str
+    ) -> SkillCandidateStageResult | None: ...
+
+
+class _CleanupStaleAudioFiles(Protocol):
+    async def __call__(
+        self, audio_dir: FilePath, max_age_seconds: int
+    ) -> int: ...
+
+
+class _SetBotCommands(Protocol):
+    async def __call__(self) -> None: ...
+
+
+class _DenyCodexApprovals(Protocol):
+    def __call__(
+        self,
+        user_id: int | None = None,
+        chat_id: int | None = None,
+    ) -> int: ...
+
+
+class _EnqueueShutdownDistills(Protocol):
+    async def __call__(
+        self, *, timeout_seconds: float | None = None
+    ) -> None: ...
+
+
+class _SetupHandlers(Protocol):
+    def __call__(self) -> None: ...
+
+
+class _ErrorHandler(Protocol):
+    async def __call__(
+        self,
+        update: object,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None: ...
+
+
 class BotLifecycleMixin:
+    _config: _LifecycleConfig
+    _session_manager: _LifecycleSessionManager
+    _project_chat: _LifecycleProjectChat
+    _distill_journal: _LifecycleDistillJournal
+    _distill_snapshot_worker: _DistillSnapshotWorker
+    _distill_extraction_worker: _DistillExtractionWorker
+    _distill_local_sink_worker: _DistillLocalSinkWorker
+    _distill_wiki_sink_worker: _DistillWikiSinkWorker
+    _distill_honcho_sink_worker: _DistillHonchoSinkWorker
+    _skill_candidate_collector_worker: _SkillCandidateCollectorWorker
+    _push_notifier: _LifecyclePushNotifier
+    _clock: _LifecycleClock
+    _audio_dir: FilePath
+    _image_dir: FilePath
+    _document_dir: FilePath
+    _STALE_AUDIO_SECONDS: int
+    _WATCHDOG_INTERVAL: int
+    _NETWORK_FAILURE_THRESHOLD: int
+    application: Optional[Application]
+    _application_builder_factory: Callable[[], Any]
+    _cleanup_stale_audio_files: _CleanupStaleAudioFiles
+    _set_bot_commands: _SetBotCommands
+    _deny_codex_approvals: _DenyCodexApprovals
+    _enqueue_shutdown_distills: _EnqueueShutdownDistills
+    _setup_handlers: _SetupHandlers
+    _error_handler: _ErrorHandler
+
     async def _restart_receipt_loop(self, stop_event: asyncio.Event) -> None:
         """Deliver a terminal restart receipt after the replacement is healthy."""
         while not stop_event.is_set():
@@ -55,6 +204,7 @@ class BotLifecycleMixin:
                     restart_handoff.read_receipt, self._config.bot_data_dir
                 )
                 if receipt and receipt.get("state") in restart_handoff.TERMINAL_STATES:
+                    application = cast(Application, self.application)
                     request_id = str(receipt.get("request_id", ""))
                     if receipt["state"] == "completed":
                         text = (
@@ -66,7 +216,7 @@ class BotLifecycleMixin:
                             f"❌ Bridge restart failed ({request_id[:8]}): "
                             f"{receipt.get('reason_code', 'worker_error')}."
                         )
-                    await self.application.bot.send_message(
+                    await application.bot.send_message(
                         chat_id=int(receipt["chat_id"]), text=text
                     )
                     await asyncio.to_thread(
@@ -1007,8 +1157,9 @@ class BotLifecycleMixin:
             return None
 
         async def wakeup_tick() -> None:
+            application = cast(Application, self.application)
             stats = await run_dead_session_wakeup_scan(
-                self.application.bot,
+                application.bot,
                 self._session_manager,
                 self._project_chat,
                 self._project_chat.conversations_dir,

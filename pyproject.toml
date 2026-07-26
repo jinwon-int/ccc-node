@@ -60,6 +60,5 @@ files = [
 [[tool.mypy.overrides]]
 module = [
   "core.bot_commands",
-  "core.bot_lifecycle",
 ]
 disable_error_code = ["attr-defined"]
