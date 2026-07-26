@@ -6,7 +6,16 @@ import logging
 import re
 from datetime import datetime
 from pathlib import Path as FilePath
-from typing import Any, Awaitable, Callable, Iterable, Mapping, Optional, Protocol
+from typing import (
+    Any,
+    Awaitable,
+    Callable,
+    Iterable,
+    Mapping,
+    Optional,
+    Protocol,
+    Sequence,
+)
 
 from telegram import (
     Update,
@@ -19,6 +28,20 @@ from telegram.ext import (
 )
 from telegram_bot.core import revert as revert_ops
 from telegram_bot.core import restart_handoff
+from telegram_bot.core.agent_runtime import (
+    JsonValue as AgentJsonValue,
+    ModelInfo,
+    SessionHistory,
+    SessionSummary,
+)
+from telegram_bot.core.project_chat_types import (
+    AgentApprovalCallback,
+    ChatResponse,
+    InterimMessageCallback,
+    PermissionCallback,
+    StatusCallback,
+    TypingCallback,
+)
 from telegram_bot.core.usage import UsageSnapshot, render_usage
 from telegram_bot.memory.distill_types import DistillTrigger
 from .conversation_paths import resolve_conversation_file
@@ -60,9 +83,77 @@ class _CommandSessionManager(Protocol):
     ) -> None: ...
 
 
+class _CommandProjectChat(Protocol):
+    @property
+    def conversations_dir(self) -> FilePath: ...
+
+    async def get_usage(
+        self, user_id: int, chat_id: int, session_id: str | None
+    ) -> UsageSnapshot: ...
+
+    async def process_message(
+        self,
+        user_message: str,
+        user_id: int,
+        chat_id: int,
+        message_id: Optional[int] = None,
+        session_id: Optional[str] = None,
+        model: Optional[str] = None,
+        effort: Optional[str] = None,
+        approval_policy: Optional[str] = None,
+        approvals_reviewer: Optional[str] = None,
+        sandbox_policy: Optional[Mapping[str, AgentJsonValue]] = None,
+        new_session: bool = False,
+        permission_callback: Optional[PermissionCallback] = None,
+        approval_callback: Optional[AgentApprovalCallback] = None,
+        typing_callback: Optional[TypingCallback] = None,
+        status_callback: Optional[StatusCallback] = None,
+        bot: Optional[Any] = None,
+        notification_bot: Optional[Any] = None,
+        interim_message_callback: Optional[InterimMessageCallback] = None,
+        sensitive_log_event: Optional[str] = None,
+        usage_mode: str = ...,
+    ) -> ChatResponse: ...
+
+    async def list_runtime_models(self) -> Sequence[ModelInfo]: ...
+
+    async def list_runtime_sessions(
+        self, *, limit: int = 10
+    ) -> Sequence[SessionSummary]: ...
+
+    async def read_runtime_session(
+        self, session_id: str, *, limit: int = 5
+    ) -> SessionHistory: ...
+
+    def list_sessions(self, limit: int = 10) -> list[tuple[str, str, float]]: ...
+
+    async def stop(self, user_id: int, chat_id: Optional[int] = None) -> bool: ...
+
+    def get_recent_messages(
+        self, session_id: str, limit: int = 5
+    ) -> list[dict[str, Any]]: ...
+
+    def get_conversation_history(
+        self, session_id: str, limit: int = 50
+    ) -> list[dict[str, Any]]: ...
+
+    async def clear_user_stream(
+        self, user_id: int, chat_id: Optional[int] = None
+    ) -> None: ...
+
+    def clear_pending_permissions(
+        self, user_id: int, chat_id: Optional[int] = None
+    ) -> None: ...
+
+    async def cancel_user_streaming(
+        self, user_id: int, chat_id: Optional[int] = None
+    ) -> bool: ...
+
+
 class BotCommandMixin:
     _config: _CommandConfig
     _session_manager: _CommandSessionManager
+    _project_chat: _CommandProjectChat
 
     async def _cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_access(update):
