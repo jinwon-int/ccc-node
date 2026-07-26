@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Typed Telegram command access boundary (#346).** Command handling now
+  declares its application, access-check, update projection, and conversation
+  key callables without changing authorization or handler behavior.
 - **Typed Telegram command project-chat boundary (#346).** Command handling now
   declares its usage, runtime browsing, transcript, and message-processing
   dependencies without changing provider or conversation behavior.
