@@ -528,13 +528,13 @@ class BotDeliveryMixin:
 
     async def _reply_smart(
         self,
-        message,
+        message: Message,
         content: str,
         parse_mode: str = "Markdown",
         force_options: bool = False,
         streamed: bool = False,
         user_id: Optional[int] = None,
-    ):
+    ) -> None:
         """Reply with text (splitting if needed), send referenced files, and add option buttons."""
         # Skip text sending if already streamed
         if not streamed:
