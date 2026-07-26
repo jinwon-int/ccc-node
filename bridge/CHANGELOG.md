@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Typed Telegram command project-chat boundary (#346).** Command handling now
+  declares its usage, runtime browsing, transcript, and message-processing
+  dependencies without changing provider or conversation behavior.
 - **Typed Telegram command session boundary (#346).** Command handling now
   declares its session read-and-patch dependency without changing persistence
   behavior or the remaining composition ratchet.
