@@ -360,6 +360,8 @@ def test_staged_draft_installs_into_codex_skills(tmp_path: Path) -> None:
     codex_skills = tmp_path / "codex" / "skills"
     sink = SkillCandidateSink(tmp_path / "skill-candidates", state / "pending-skills")
     sink.write(SkillCandidateOutput.model_validate(_output_payload()), job_id=JOB_ID)
+    # Autonomous ownership state is deliberately restricted to the owner.
+    state.chmod(0o700)
 
     env = {
         **os.environ,
