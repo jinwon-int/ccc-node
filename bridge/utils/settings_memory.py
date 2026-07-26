@@ -42,12 +42,23 @@ class MemorySettingsMixin:
         description="Owner-only node-local Honcho endpoint/credential config.",
     )
     codex_skill_collector_enabled: bool = Field(
-        default=False,
+        default=True,
         alias="CCC_CODEX_SKILL_COLLECTOR",
         description=(
-            "Opt-in (#667): on a Codex node, drive the skill-candidate collector "
-            "off the distill journal's snapshots and stage pending drafts for the "
-            "provider-aware installer. Default off; activation is canary-gated."
+            "On Codex nodes, drive the skill-candidate collector from distill "
+            "journal snapshots and stage pending drafts for the provider-aware "
+            "installer. Default on; set false for an immediate node-local opt-out."
+        ),
+    )
+    codex_skill_collector_max_jobs_per_sweep: int = Field(
+        default=1,
+        ge=1,
+        le=10,
+        alias="CCC_CODEX_SKILL_COLLECTOR_MAX_JOBS_PER_SWEEP",
+        description=(
+            "Hard bound on skill-candidate provider attempts per collector sweep. "
+            "The default of one prevents a newly enabled node from bursting through "
+            "a historical distill-snapshot backlog."
         ),
     )
     codex_skill_pending_dir: Path = Field(

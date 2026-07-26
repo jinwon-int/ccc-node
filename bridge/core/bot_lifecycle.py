@@ -127,6 +127,8 @@ class _DistillHonchoSinkWorker(Protocol):
 
 
 class _SkillCandidateCollectorWorker(Protocol):
+    def should_collect(self, *, job_id: str) -> bool: ...
+
     async def collect_once(
         self, *, job_id: str
     ) -> SkillCandidateStageResult | None: ...
@@ -1334,11 +1336,12 @@ class BotLifecycleMixin:
                 continue
 
     async def _skill_candidate_collector_loop(self, stop_event: asyncio.Event) -> None:
-        """Stage Codex skill candidates from distill snapshots (#667, opt-in).
+        """Stage Codex skill candidates from distill snapshots (#667, #749).
 
         Read-only against the distill journal: it only reads jobs that already
         carry a snapshot and stages via the idempotent sink. Never mutates a
-        distill job, so the memory-distill pipeline is unaffected.
+        distill job, so the memory-distill pipeline is unaffected. Provider
+        attempts per sweep are hard-bounded to avoid a first-start backlog burst.
         """
 
         worker = self._skill_candidate_collector_worker
@@ -1346,17 +1349,40 @@ class BotLifecycleMixin:
         interval = float(
             getattr(self._config, "distill_extraction_poll_interval", 300.0) or 300.0
         )
+        max_jobs = int(
+            getattr(
+                self._config,
+                "codex_skill_collector_max_jobs_per_sweep",
+                1,
+            )
+            or 1
+        )
         while not stop_event.is_set():
             try:
                 jobs = await asyncio.to_thread(journal.list_jobs)
+                attempted = 0
                 for job in jobs:
-                    if stop_event.is_set():
+                    if stop_event.is_set() or attempted >= max_jobs:
                         break
                     if getattr(job, "snapshot", None) is None:
                         continue
                     if getattr(job, "provider", None) != "codex":
                         continue
-                    await worker.collect_once(job_id=job.job_id)
+                    if not await asyncio.to_thread(
+                        worker.should_collect, job_id=job.job_id
+                    ):
+                        continue
+                    attempted += 1
+                    try:
+                        await worker.collect_once(job_id=job.job_id)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        logger.warning(
+                            "Skill-candidate job failed; backing off job_id=%s",
+                            job.job_id,
+                            exc_info=True,
+                        )
             except asyncio.CancelledError:
                 raise
             except Exception:

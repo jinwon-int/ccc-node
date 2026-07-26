@@ -28,6 +28,7 @@ MEMORY_FIELDS = {
     "codex_distill_model": "CCC_CODEX_DISTILL_MODEL",
     "codex_distill_timeout_seconds": "CCC_CODEX_DISTILL_TIMEOUT_SEC",
     "codex_skill_collector_enabled": "CCC_CODEX_SKILL_COLLECTOR",
+    "codex_skill_collector_max_jobs_per_sweep": "CCC_CODEX_SKILL_COLLECTOR_MAX_JOBS_PER_SWEEP",
     "codex_skill_pending_dir": "CCC_SKILL_REVIEW_PENDING_DIR",
 }
 
@@ -106,6 +107,27 @@ def test_codex_checkpoint_gates_have_hard_bounds(alias: str, value: int) -> None
         )
 
 
-def test_codex_skill_collector_defaults_off() -> None:
-    # A non-opted node must never build the collector: the flag defaults off.
-    assert Config.model_fields["codex_skill_collector_enabled"].default is False
+def test_codex_skill_collector_defaults_on_with_explicit_opt_out() -> None:
+    assert Config.model_fields["codex_skill_collector_enabled"].default is True
+    assert (
+        Config.model_fields["codex_skill_collector_max_jobs_per_sweep"].default == 1
+    )
+
+    configured = Config(
+        telegram_bot_token="123456:abc",
+        _env_file=None,
+        CCC_CODEX_SKILL_COLLECTOR=False,
+        CCC_CODEX_SKILL_COLLECTOR_MAX_JOBS_PER_SWEEP=3,
+    )
+    assert configured.codex_skill_collector_enabled is False
+    assert configured.codex_skill_collector_max_jobs_per_sweep == 3
+
+    for value in (0, 11):
+        with pytest.raises(
+            ValidationError, match="CCC_CODEX_SKILL_COLLECTOR_MAX_JOBS_PER_SWEEP"
+        ):
+            Config(
+                telegram_bot_token="123456:abc",
+                _env_file=None,
+                CCC_CODEX_SKILL_COLLECTOR_MAX_JOBS_PER_SWEEP=value,
+            )

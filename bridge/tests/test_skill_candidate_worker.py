@@ -12,6 +12,9 @@ import hashlib
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
+from telegram_bot.core.bot_lifecycle import BotLifecycleMixin
 from telegram_bot.memory.distill_types import (
     CodexTranscriptSnapshot,
     DistillTrigger,
@@ -98,9 +101,55 @@ class _FakeBackend:
         return self._output
 
 
-def _worker(tmp_path: Path, journal, backend) -> SkillCandidateCollectorWorker:
+class _FailingBackend:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def extract(self, *, snapshot, provenance):  # noqa: ARG002
+        self.calls += 1
+        error = RuntimeError("body must not enter retry state")
+        error.code = "skill_candidate_nonzero_exit"  # type: ignore[attr-defined]
+        raise error
+
+
+class _Reservation:
+    def __init__(self, allowed: bool) -> None:
+        self.allowed = allowed
+
+    def reason(self) -> str:
+        return "blocked-test"
+
+
+class _Meter:
+    def __init__(self, *, allowed: bool = True) -> None:
+        self.allowed = allowed
+        self.reservations = []
+        self.refunds = []
+
+    def reserve_autonomous_spend(self, provider: str, **amounts):
+        self.reservations.append((provider, amounts))
+        return _Reservation(self.allowed)
+
+    def refund_reservation(self, reservation) -> None:
+        self.refunds.append(reservation)
+
+
+def _worker(
+    tmp_path: Path,
+    journal,
+    backend,
+    *,
+    usage_meter=None,
+    clock=lambda: 1_000.0,
+) -> SkillCandidateCollectorWorker:
     sink = SkillCandidateSink(tmp_path / "skill-candidates", tmp_path / "state" / "pending-skills")
-    return SkillCandidateCollectorWorker(journal=journal, backend=backend, sink=sink)
+    return SkillCandidateCollectorWorker(
+        journal=journal,
+        backend=backend,
+        sink=sink,
+        usage_meter=usage_meter,
+        clock=clock,
+    )
 
 
 def test_collect_stages_from_a_snapshot_job(tmp_path: Path) -> None:
@@ -137,3 +186,136 @@ def test_collect_skips_non_codex_job(tmp_path: Path) -> None:
     worker = _worker(tmp_path, _FakeJournal(_job(provider="claude")), backend)
     assert asyncio.run(worker.collect_once(job_id=JOB_ID)) is None
     assert backend.calls == 0
+
+
+def test_collect_reserves_body_free_autonomous_usage(tmp_path: Path) -> None:
+    backend = _FakeBackend(_output())
+    meter = _Meter()
+    worker = _worker(
+        tmp_path,
+        _FakeJournal(_job()),
+        backend,
+        usage_meter=meter,
+    )
+    result = asyncio.run(worker.collect_once(job_id=JOB_ID))
+    assert result is not None and result.candidates_staged == 1
+    assert backend.calls == 1
+    assert len(meter.reservations) == 1
+    provider, amounts = meter.reservations[0]
+    assert provider == "codex"
+    assert amounts["requests"] == 1
+    assert amounts["input_tokens"] > _snapshot().byte_count
+    assert amounts["output_tokens"] == 64 * 1024
+    assert meter.refunds == []
+
+
+def test_budget_block_defers_without_backend_call(tmp_path: Path) -> None:
+    backend = _FakeBackend(_output())
+    meter = _Meter(allowed=False)
+    worker = _worker(
+        tmp_path,
+        _FakeJournal(_job()),
+        backend,
+        usage_meter=meter,
+    )
+    assert asyncio.run(worker.collect_once(job_id=JOB_ID)) is None
+    assert backend.calls == 0
+    assert len(meter.reservations) == 1
+    assert worker.should_collect(job_id=JOB_ID) is True
+
+
+def test_backend_failure_gets_durable_exponential_backoff(tmp_path: Path) -> None:
+    now = [1_000.0]
+    backend = _FailingBackend()
+    worker = _worker(
+        tmp_path,
+        _FakeJournal(_job()),
+        backend,
+        clock=lambda: now[0],
+    )
+
+    with pytest.raises(RuntimeError):
+        asyncio.run(worker.collect_once(job_id=JOB_ID))
+    assert backend.calls == 1
+    assert worker.should_collect(job_id=JOB_ID) is False
+
+    # A new worker (simulating a process restart) observes the same durable
+    # retry state and does not immediately call the provider again.
+    restarted = _worker(
+        tmp_path,
+        _FakeJournal(_job()),
+        backend,
+        clock=lambda: now[0],
+    )
+    assert asyncio.run(restarted.collect_once(job_id=JOB_ID)) is None
+    assert backend.calls == 1
+
+    now[0] += 5 * 60
+    assert restarted.should_collect(job_id=JOB_ID) is True
+    with pytest.raises(RuntimeError):
+        asyncio.run(restarted.collect_once(job_id=JOB_ID))
+    assert backend.calls == 2
+
+    retry_path = tmp_path / "skill-candidates" / ".retries" / f"{JOB_ID}.json"
+    assert retry_path.exists()
+    assert (retry_path.stat().st_mode & 0o777) == 0o600
+
+
+def test_retry_directory_symlink_fails_closed_before_provider_call(
+    tmp_path: Path,
+) -> None:
+    queue = tmp_path / "skill-candidates"
+    outside = tmp_path / "outside"
+    queue.mkdir(mode=0o700)
+    outside.mkdir(mode=0o700)
+    (queue / ".retries").symlink_to(outside, target_is_directory=True)
+    backend = _FakeBackend(_output())
+    worker = _worker(tmp_path, _FakeJournal(_job()), backend)
+
+    with pytest.raises((PermissionError, ValueError)):
+        worker.should_collect(job_id=JOB_ID)
+    assert backend.calls == 0
+
+
+def test_collector_loop_hard_bounds_provider_attempts_per_sweep() -> None:
+    stop_event = asyncio.Event()
+
+    class _Journal:
+        calls = 0
+
+        def list_jobs(self):
+            self.calls += 1
+            if self.calls > 1:
+                stop_event.set()
+            return tuple(
+                SimpleNamespace(
+                    job_id=f"{index:x}" * 64,
+                    provider="codex",
+                    snapshot=object(),
+                )
+                for index in range(1, 6)
+            )
+
+    class _Worker:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def should_collect(self, *, job_id: str) -> bool:
+            return True
+
+        async def collect_once(self, *, job_id: str):
+            self.calls.append(job_id)
+
+    worker = _Worker()
+    lifecycle = SimpleNamespace(
+        _skill_candidate_collector_worker=worker,
+        _distill_journal=_Journal(),
+        _config=SimpleNamespace(
+            distill_extraction_poll_interval=0.001,
+            codex_skill_collector_max_jobs_per_sweep=2,
+        ),
+    )
+    asyncio.run(
+        BotLifecycleMixin._skill_candidate_collector_loop(lifecycle, stop_event)
+    )
+    assert len(worker.calls) == 2

@@ -1,91 +1,86 @@
-# Codex skill-candidate collector — activation runbook (canary)
+# Codex skill-candidate collector — default-ON operations
 
-The Codex skill-candidate collector (#667) is implemented and **off by default**
-(`CCC_CODEX_SKILL_COLLECTOR`). Enabling it is a **node-local operational change**
-— not a repo change — and follows a canary rollout. See
-[`skill-autosave.md`](skill-autosave.md) for what the collector does. Rollout is
-tracked in the ops issue for #667.
+The Codex skill-candidate collector (#667, #749) is enabled by default on
+**Codex** nodes. Claude nodes never compose the worker. A node-local
+`CCC_CODEX_SKILL_COLLECTOR=false` remains the immediate opt-out.
 
-## Preconditions
+The collector only creates pending drafts. It does **not** change the installer
+policy: `CCC_SKILL_AUTOSAVE_MODE` remains `approve` by default, so no skill is
+installed without the existing review gate.
 
-- The node runs the **Codex** provider (`agent_provider == "codex"`).
-- The distill journal is active (the collector reads its snapshots read-only).
-- You have operator approval to activate on this specific node.
+## Runtime boundaries
 
-## Why this needs a canary
+- The collector reads already-captured distill snapshots without claiming or
+  mutating distill jobs.
+- One provider attempt is allowed per sweep by default, preventing a first
+  start from bursting through historical snapshots. Operators may set
+  `CCC_CODEX_SKILL_COLLECTOR_MAX_JOBS_PER_SWEEP=1..10`.
+- Provider attempts share the node autonomous usage meter. A configured
+  `CCC_USAGE_BUDGET_TOKENS_CODEX` blocks the call prospectively when the full
+  bounded reservation cannot fit.
+- Backend failures use durable exponential backoff (five minutes up to one day)
+  and retain only a body-free error code.
+- Successful and zero-candidate jobs receive idempotent markers and are not
+  charged again.
 
-`build_context` and `bot_lifecycle` run on **every** node's startup. The
-collector is three-guarded (Codex node **and** flag on **and** a distill
-journal), so a default node is unaffected — but flag activation changes runtime
-behavior and CI cannot smoke-test a real bridge start. Confirm startup on one
-node before widening.
+## Deployment verification
 
-## Activation steps
+Changing the repository default does not restart or deploy a live node. After
+an independently approved node update/restart:
 
-1. **Baseline** — confirm the bridge is healthy now:
+1. Confirm the bridge is healthy:
 
    ```bash
    /opt/ccc-node/bridge/start.sh --path /root --status
    ```
 
-2. **Enable the flag** in the node-local bridge env (project `.env`, e.g.
-   `/root/.telegram_bot/.env`) — never in the repo default:
-
-   ```dotenv
-   CCC_CODEX_SKILL_COLLECTOR=true
-   # Optional: point the sink at the Codex autoinstall PENDING_DIR if non-default
-   # CCC_SKILL_REVIEW_PENDING_DIR=/root/.claude/state/pending-skills
-   ```
-
-3. **Restart** the bridge and **verify clean startup** (no tracebacks; the
-   `skill-candidate-collector` loop task starts):
+2. Confirm the node uses the Codex provider and does not carry an intentional
+   opt-out:
 
    ```bash
-   /opt/ccc-node/bridge/start.sh --path /root --restart
-   /opt/ccc-node/bridge/start.sh --path /root --status
+   grep -E '^(CCC_AGENT_PROVIDER|CCC_CODEX_SKILL_COLLECTOR)=' \
+     /root/.telegram_bot/.env
    ```
 
-   If startup fails, roll back immediately (below).
+   Absence of `CCC_CODEX_SKILL_COLLECTOR` means the default (`true`). Never
+   print the rest of the env file.
 
-4. **Review the first drafts** — after some Codex sessions checkpoint, staged
-   candidates appear under the pending-skills dir. Confirm they are
-   redaction-safe and well-formed **before** trusting auto-install:
+3. Review staged drafts and keep installation in approve mode:
 
    ```bash
-   ~/.claude/hooks/skill-review/autoinstall.sh status   # CCC_SKILL_PROVIDER=codex
+   CCC_SKILL_PROVIDER=codex \
+     ~/.claude/hooks/skill-review/autoinstall.sh status
    ls ~/.claude/state/pending-skills/
    ```
 
-   Keep autoinstall in **approve** mode (the default) for the canary; only move
-   to `auto` after the drafts look right.
+4. Check body-free usage/backoff diagnostics for unexpected repeated failures.
+   Candidate bodies and transcript text must not be logged.
 
-5. **Observe** for an agreed window (e.g. 3–7 days): no startup regressions, no
-   secret/path leakage in staged drafts, no runaway spend (metered by #388).
+## Opt out / rollback
 
-6. **Widen** to more nodes only after the canary is clean, one node at a time.
-
-## Rollback (always available)
-
-Disable the flag and restart — the collector stops; nothing else changes:
+Set the explicit node-local override:
 
 ```dotenv
 CCC_CODEX_SKILL_COLLECTOR=false
 ```
 
+Apply it only through the approved node configuration/restart procedure. The
+collector then stops issuing provider calls; memory distill and already staged
+drafts are unchanged.
+
+Pending drafts remain available for normal human review. If the operator had
+separately enabled auto-install, marker-owned installs can be rolled back:
+
 ```bash
-/opt/ccc-node/bridge/start.sh --path /root --restart
+CCC_SKILL_PROVIDER=codex \
+  ~/.claude/hooks/skill-review/autoinstall.sh rollback --all
 ```
 
-Any drafts already staged remain in the pending queue for normal human review;
-none were auto-installed unless autoinstall was explicitly in `auto` mode. To
-also undo auto-installed skills, use the marker-driven rollback:
+Rollback refuses hand-authored skills without the autosave marker.
 
-```bash
-CCC_SKILL_PROVIDER=codex ~/.claude/hooks/skill-review/autoinstall.sh rollback --all
-```
+## Rollout evidence
 
-## Safety boundary
-
-- Flag activation is per-node and reversible; **do not** flip the fleet default.
-- No provider send / release / secret movement is part of activation.
-- Enabling on a node requires fresh operator approval for that node.
+The original canary is tracked in #673. It exposed and fixed strict structured
+output (#675), provenance comparison (#676), and zero-candidate replay (#677)
+before the source default changed. Fleet deployment, service restart, provider
+send, and release remain separate operational actions.

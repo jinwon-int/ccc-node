@@ -6,8 +6,8 @@ serialization, and parser. No journal or sink is touched here. Input text is
 redacted before it crosses the provider boundary; every failure is a stable,
 body-free error.
 
-This backend is wired into no live loop by itself — activation is a separate
-canary-gated change.
+The bridge's Codex-only collector worker invokes this backend. The module itself
+still has no journal, scheduler, or install side effects.
 """
 
 from __future__ import annotations
@@ -47,7 +47,7 @@ _SKILL_SCHEMA: Final = (
 _MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _PROVIDER_DEFAULT_MODEL = "provider-default"
 _MAX_TIMEOUT_SECONDS = 10 * 60.0
-_MAX_OUTPUT_BYTES = 64 * 1024
+MAX_SKILL_CANDIDATE_OUTPUT_BYTES: Final = 64 * 1024
 _REDACTION_MARKER = "[REDACTED]"
 
 
@@ -102,7 +102,7 @@ class CodexExecSkillCandidateBackend:
         schema_path: str | Path = _SKILL_SCHEMA,
         model: str = _PROVIDER_DEFAULT_MODEL,
         timeout_seconds: float = 120.0,
-        max_output_bytes: int = _MAX_OUTPUT_BYTES,
+        max_output_bytes: int = MAX_SKILL_CANDIDATE_OUTPUT_BYTES,
         environment: dict[str, str] | None = None,
         temp_root: str | Path | None = None,
         audience_auth_mode: str = "disabled",
@@ -117,7 +117,7 @@ class CodexExecSkillCandidateBackend:
             or _MODEL_RE.fullmatch(model) is None
             or type(max_output_bytes) is not int
             or max_output_bytes <= 0
-            or max_output_bytes > _MAX_OUTPUT_BYTES
+            or max_output_bytes > MAX_SKILL_CANDIDATE_OUTPUT_BYTES
             or audience_auth_mode not in {"disabled", "keyring"}
         ):
             raise SkillCandidateBackendError("skill_candidate_config_invalid")
@@ -176,6 +176,7 @@ class CodexExecSkillCandidateBackend:
 
 __all__ = [
     "SKILL_CANDIDATE_PROMPT",
+    "MAX_SKILL_CANDIDATE_OUTPUT_BYTES",
     "SkillCandidateBackendError",
     "CodexExecSkillCandidateBackend",
     "canonical_skill_candidate_input_bytes",
