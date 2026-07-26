@@ -25,7 +25,7 @@ differ per provider. `skill-review/provider.sh` resolves both.
 | Mode / daily cap / off-switch / ledger / rollback | ✅ identical | ✅ identical |
 | Codex-compat screen (rejects `claude -p`, `~/.claude`, `CLAUDE_*`) | n/a | ✅ isolates Claude-only drafts as pending |
 | Secure install dir (0700, no-symlink leaf, fail-closed) | existing dir untouched | ✅ created owner-only |
-| Candidate **drafting/collection** (SessionEnd → draft) | ✅ (`skill-review.sh` + `extract.sh`) | ✅ engine + real `codex exec` backend + opt-in collector loop (`CCC_CODEX_SKILL_COLLECTOR`, default off); enabling on a node is canary-gated |
+| Candidate **drafting/collection** (SessionEnd → draft) | ✅ (`skill-review.sh` + `extract.sh`) | ✅ engine + real `codex exec` backend + Codex-only default-ON collector (`CCC_CODEX_SKILL_COLLECTOR=false` opts out) |
 
 Select the provider explicitly with `CCC_SKILL_PROVIDER=claude|codex`. When
 unset it auto-detects: a node with a Codex home but no `~/.claude` and no
@@ -48,17 +48,21 @@ backend (`CodexExecSkillCandidateBackend`) reuses the schema-neutral isolation
 runner `run_codex_exec` (factored out of the memory distill backend, behavior
 unchanged) with the skill schema/prompt/parser and a redacted stdin payload.
 
-The **opt-in collector loop** is wired too (`CCC_CODEX_SKILL_COLLECTOR`, default
-**off**). When enabled on a Codex node, `SkillCandidateCollectorWorker` reads the
-distill journal's snapshots **read-only** (it never claims or mutates a distill
-job, so memory distill is unaffected), drafts via the backend, and stages
-pending drafts through the idempotent sink for the provider-aware installer.
-Composition is three-guarded (Codex node **and** flag on **and** a distill
-journal), so every other node's startup is unchanged — verified by the
-composition suite. **Enabling the flag on a live node is canary-gated** — follow
+The collector loop is default **on for Codex nodes**
+(`CCC_CODEX_SKILL_COLLECTOR=false` opts out).
+`SkillCandidateCollectorWorker` reads the distill journal's snapshots
+**read-only** (it never claims or mutates a distill job, so memory distill is
+unaffected), drafts via the backend, and stages pending drafts through the
+idempotent sink for the provider-aware installer. Composition remains
+three-guarded (Codex node **and** no explicit opt-out **and** a distill journal),
+so Claude startup is unchanged. A sweep attempts one unprocessed job by default
+(`CCC_CODEX_SKILL_COLLECTOR_MAX_JOBS_PER_SWEEP`, range 1–10), shares the
+autonomous Codex usage meter, takes a non-blocking per-job lease, refunds
+reservations abandoned before provider start, and durably backs off failed or
+canceled attempts. See
 [`codex-skill-collector-activation.md`](codex-skill-collector-activation.md)
-(baseline → enable → verify clean startup → review first drafts → observe →
-widen; rollback = disable + restart).
+for deployment verification and opt-out rollback. This changes candidate
+staging only; `CCC_SKILL_AUTOSAVE_MODE` remains `approve` by default.
 
 ## Enable the daily sweep
 
@@ -220,4 +224,6 @@ re-reviewed only after growing this much), `CCC_SKILL_AUTOSAVE_NOTIFY` (1),
 (approve|auto, default approve), `CCC_SKILL_AUTOSAVE_DAILY_CAP` (3 — auto-mode
 installs per UTC day), `CCC_SKILL_PROVIDER` (claude|codex, default auto-detect —
 selects the install surface), `CODEX_SKILLS_DIR` (Codex install target override,
-default `${CODEX_HOME:-~/.codex}/skills`).
+default `${CODEX_HOME:-~/.codex}/skills`),
+`CCC_CODEX_SKILL_COLLECTOR` (Codex-only candidate collection, default true),
+`CCC_CODEX_SKILL_COLLECTOR_MAX_JOBS_PER_SWEEP` (default 1, range 1–10).

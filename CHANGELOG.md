@@ -4,6 +4,16 @@ All notable changes to the Claude Code node harness. Dates are KST.
 
 ## [Unreleased]
 
+### Changed
+- Codex nodes now compose the skill-candidate collector by default, with
+  `CCC_CODEX_SKILL_COLLECTOR=false` as an explicit node-local opt-out. Candidate
+  collection remains separate from installation (`approve` is still the
+  installer default), processes at most one historical snapshot per sweep by
+  default, takes a non-blocking per-job lease, shares the autonomous Codex
+  usage meter, refunds reservations abandoned before provider start, and
+  durably backs off body-free backend failures and cancellations. Claude
+  composition is unchanged. (#749)
+
 ## [0.5.0] — 2026-07-26
 
 ### Added

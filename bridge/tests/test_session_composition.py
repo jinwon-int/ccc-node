@@ -912,6 +912,51 @@ print("COMPOSED-GATED-WORKER-OK")
     assert "COMPOSED-GATED-WORKER-OK" in result.stdout
 
 
+def test_build_context_defaults_codex_skill_collector_on_with_opt_out(tmp_path):
+    result = _run_probe(
+        """
+import inspect
+import os
+from pathlib import Path
+
+root = Path(os.environ["PROBE_ROOT"])
+(root / "project").mkdir(parents=True, exist_ok=True)
+os.environ["PROJECT_ROOT"] = str(root / "project")
+os.environ["TELEGRAM_BOT_TOKEN"] = "123456:test"
+os.environ["ALLOWED_USER_IDS"] = "1"
+os.environ["CCC_AGENT_PROVIDER"] = "codex"
+
+from telegram_bot.__main__ import build_context, load_runtime_settings
+from telegram_bot.memory.skill_candidate_worker import SkillCandidateCollectorWorker
+
+default_context = build_context(load_runtime_settings())
+worker = default_context.skill_candidate_collector_worker
+assert isinstance(worker, SkillCandidateCollectorWorker), type(worker)
+assert worker._usage_meter is default_context.project_chat.usage_meter
+
+parameter = inspect.signature(SkillCandidateCollectorWorker.__init__).parameters[
+    "usage_meter"
+]
+assert parameter.default is inspect.Parameter.empty, (
+    "usage_meter must stay an explicit constructor decision"
+)
+
+os.environ["CCC_CODEX_SKILL_COLLECTOR"] = "false"
+opted_out = build_context(load_runtime_settings())
+assert opted_out.skill_candidate_collector_worker is None
+
+os.environ.pop("CCC_CODEX_SKILL_COLLECTOR")
+os.environ["CCC_AGENT_PROVIDER"] = "claude"
+claude_context = build_context(load_runtime_settings())
+assert claude_context.skill_candidate_collector_worker is None
+print("CODEX-SKILL-COLLECTOR-DEFAULT-ON-OK")
+""",
+        probe_root=tmp_path,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "CODEX-SKILL-COLLECTOR-DEFAULT-ON-OK" in result.stdout
+
+
 def test_build_context_composes_audience_local_sink_worker(tmp_path):
     result = _run_probe(
         """

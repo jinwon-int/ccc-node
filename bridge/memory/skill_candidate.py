@@ -8,12 +8,10 @@ pending-draft directories that the provider-aware ``autoinstall.sh``
 reuses the neutral transport types (``DistillProvenance``, ``DistillTrigger``,
 ``CodexTranscriptSnapshot``) but never the memory-fact schema or sinks.
 
-Nothing here connects to the live bot loops or the distill journal. The
-collector accepts an already bounded/redacted snapshot and a backend that
-returns a validated ``SkillCandidateOutput``; the sink writes owner-only,
-idempotent pending-draft dirs. Wiring the collector into the bridge runtime
-(trigger fan-out, poll loop, a real ``codex exec`` backend) is a separate
-canary-gated change.
+Nothing in this module connects to the live bot loop or mutates the distill
+journal. The runtime worker supplies an already bounded/redacted snapshot and a
+backend that returns a validated ``SkillCandidateOutput``; the sink writes
+owner-only, idempotent pending-draft dirs.
 """
 
 from __future__ import annotations
@@ -22,12 +20,13 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 import fcntl
 import json
+import math
 import os
 from pathlib import Path
 import re
 import stat
 import threading
-from typing import Iterator, Protocol, runtime_checkable
+from typing import Iterator, Protocol, cast, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -44,6 +43,8 @@ _MAX_OUTPUT_JSON_BYTES = 64 * 1024
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _KEBAB_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 _SAFE_ID_RE = re.compile(r"[^A-Za-z0-9._-]+")
+_SAFE_ERROR_CODE_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+_RETRY_SCHEMA_VERSION = 1
 
 # Redaction / injection guards applied to the skill body before it is ever
 # staged, so a leaked credential or a prompt-injection directive fails closed
@@ -241,6 +242,168 @@ class SkillCandidateSink:
         if not isinstance(job_id, str) or not _SHA256_RE.fullmatch(job_id):
             return False
         return (self.queue_dir / f"{job_id}.json").exists()
+
+    def _retry_path(self, job_id: str) -> Path:
+        if not isinstance(job_id, str) or not _SHA256_RE.fullmatch(job_id):
+            raise ValueError("job_id must be a SHA-256 hex digest")
+        return self.queue_dir / ".retries" / f"{job_id}.json"
+
+    def _claim_path(self, job_id: str) -> Path:
+        if not isinstance(job_id, str) or not _SHA256_RE.fullmatch(job_id):
+            raise ValueError("job_id must be a SHA-256 hex digest")
+        return self.queue_dir / ".claims" / f"{job_id}.lock"
+
+    @contextmanager
+    def claim(self, job_id: str) -> Iterator[bool]:
+        """Try to own one provider attempt for ``job_id`` across processes.
+
+        The empty owner-only lock file intentionally persists so every process
+        always locks the same inode. A contending collector returns ``False``
+        immediately instead of waiting and later replaying the provider call.
+        """
+
+        path = self._claim_path(job_id)
+        ensure_private_directory(self.queue_dir)
+        ensure_private_directory(path.parent)
+        self._validate_regular_file(path)
+        flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(path, flags, 0o600)
+        acquired = False
+        try:
+            os.fchmod(descriptor, 0o600)
+            metadata = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_nlink != 1
+                or (
+                    hasattr(os, "getuid")
+                    and metadata.st_uid != os.getuid()
+                )
+            ):
+                raise PermissionError("skill-candidate claim is unsafe")
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+            except BlockingIOError:
+                yield False
+                return
+            yield True
+        finally:
+            try:
+                if acquired:
+                    fcntl.flock(descriptor, fcntl.LOCK_UN)
+            finally:
+                os.close(descriptor)
+
+    def _read_retry_unlocked(self, path: Path, *, job_id: str) -> dict[str, object] | None:
+        self._validate_regular_file(path)
+        if not path.exists():
+            return None
+        try:
+            record = json.loads(path.read_bytes())
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError("skill-candidate retry state is invalid") from exc
+        if (
+            not isinstance(record, dict)
+            or record.get("schema_version") != _RETRY_SCHEMA_VERSION
+            or record.get("job_id") != job_id
+            or type(record.get("attempts")) is not int
+            or int(record["attempts"]) < 1
+            or not isinstance(record.get("next_retry_at"), (int, float))
+            or isinstance(record.get("next_retry_at"), bool)
+            or not math.isfinite(float(record["next_retry_at"]))
+            or float(record["next_retry_at"]) < 0
+            or not isinstance(record.get("error_code"), str)
+            or _SAFE_ERROR_CODE_RE.fullmatch(str(record["error_code"])) is None
+        ):
+            raise ValueError("skill-candidate retry state is invalid")
+        return record
+
+    def retry_ready(self, job_id: str, *, now: float) -> bool:
+        """Return whether a failed job's durable backoff window has elapsed.
+
+        Corrupt/untrusted retry state raises and therefore fails closed before
+        another provider call.
+        """
+
+        if (
+            not isinstance(now, (int, float))
+            or isinstance(now, bool)
+            or not math.isfinite(float(now))
+            or float(now) < 0
+        ):
+            raise ValueError("now must be a finite non-negative timestamp")
+        path = self._retry_path(job_id)
+        with self._exclusive():
+            ensure_private_directory(path.parent)
+            record = self._read_retry_unlocked(path, job_id=job_id)
+            return record is None or float(
+                cast(int | float, record["next_retry_at"])
+            ) <= float(now)
+
+    def record_retry_failure(
+        self,
+        job_id: str,
+        *,
+        error_code: str,
+        now: float,
+        base_delay_seconds: float,
+        max_delay_seconds: float,
+    ) -> None:
+        """Durably apply exponential backoff using body-free error metadata."""
+
+        if (
+            not isinstance(error_code, str)
+            or _SAFE_ERROR_CODE_RE.fullmatch(error_code) is None
+            or not isinstance(now, (int, float))
+            or isinstance(now, bool)
+            or not math.isfinite(float(now))
+            or float(now) < 0
+            or not isinstance(base_delay_seconds, (int, float))
+            or isinstance(base_delay_seconds, bool)
+            or not math.isfinite(float(base_delay_seconds))
+            or float(base_delay_seconds) <= 0
+            or not isinstance(max_delay_seconds, (int, float))
+            or isinstance(max_delay_seconds, bool)
+            or not math.isfinite(float(max_delay_seconds))
+            or float(max_delay_seconds) < float(base_delay_seconds)
+        ):
+            raise ValueError("invalid skill-candidate retry configuration")
+        path = self._retry_path(job_id)
+        with self._exclusive():
+            ensure_private_directory(path.parent)
+            current = self._read_retry_unlocked(path, job_id=job_id)
+            attempts = (
+                cast(int, current["attempts"]) + 1 if current is not None else 1
+            )
+            exponent = min(attempts - 1, 30)
+            delay = min(
+                float(max_delay_seconds),
+                float(base_delay_seconds) * (2**exponent),
+            )
+            payload = json.dumps(
+                {
+                    "schema_version": _RETRY_SCHEMA_VERSION,
+                    "job_id": job_id,
+                    "attempts": attempts,
+                    "error_code": error_code,
+                    "next_retry_at": float(now) + delay,
+                },
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            _atomic_write_bytes(path, payload)
+
+    def clear_retry(self, job_id: str) -> None:
+        """Remove retry metadata after a successful/zero-candidate stage."""
+
+        path = self._retry_path(job_id)
+        with self._exclusive():
+            ensure_private_directory(path.parent)
+            self._validate_regular_file(path)
+            path.unlink(missing_ok=True)
 
     @staticmethod
     def _safe_id(job_id: str, index: int, name: str) -> str:

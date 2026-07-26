@@ -244,13 +244,13 @@ def build_context(
             require_memory_route=audience_scoped,
         )
 
-    # Opt-in Codex skill-candidate collector (#667). Three-guard: Codex node,
-    # flag on, and a distill journal to read snapshots from. Default off, so
-    # every other node's composition is unchanged. Activation is canary-gated.
+    # Default-on Codex skill-candidate collector (#749). Three-guard: Codex
+    # node, no explicit opt-out, and a distill journal to read snapshots from.
+    # Claude composition is unchanged and installation remains approve-first.
     skill_candidate_collector_worker = None
     if (
         settings.agent_provider == "codex"
-        and getattr(settings, "codex_skill_collector_enabled", False)
+        and getattr(settings, "codex_skill_collector_enabled", True)
         and distill_journal is not None
     ):
         from telegram_bot.memory.skill_candidate import SkillCandidateSink
@@ -272,6 +272,7 @@ def build_context(
                 settings.bot_data_dir / "skill-candidates",
                 settings.codex_skill_pending_dir,
             ),
+            usage_meter=project_chat.usage_meter,
         )
 
     return AppContext(
