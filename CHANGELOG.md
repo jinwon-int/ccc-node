@@ -4,6 +4,8 @@ All notable changes to the Claude Code node harness. Dates are KST.
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-07-26
+
 ### Added
 - The Telegram bridge now has an opt-in, sole-owner `/restart` control plane
   for Linux systemd nodes. A delayed transient worker outside the bridge cgroup
