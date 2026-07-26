@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Typed Telegram access mixin contract (#346).** Access and permission
+  handling now declares its composed configuration, session, conversation-key,
+  and approval-token dependencies explicitly, removing `core.bot_access` from
+  the `attr-defined` mypy exception without changing policy behavior.
 - **Typed ProjectChat history mixin contract (#346).** Transcript history now
   declares its composed conversation-directory dependency explicitly,
   removing `core.project_chat_history` from the `attr-defined` mypy exception
