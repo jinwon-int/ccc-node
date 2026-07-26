@@ -1,5 +1,6 @@
 import logging
-from typing import Any, Optional
+from pathlib import Path
+from typing import Any, Optional, Protocol
 
 import telegram.error
 
@@ -12,7 +13,20 @@ from telegram_bot.utils.heartbeat_store import (
 logger = logging.getLogger(__name__)
 
 
+class _StatusConfig(Protocol):
+    @property
+    def bot_data_dir(self) -> Path | None: ...
+
+    @property
+    def heartbeat_store_path(self) -> Path | None: ...
+
+    @property
+    def heartbeat_delete_on_done(self) -> bool: ...
+
+
 class BotStatusMixin:
+    _config: _StatusConfig
+
     def _heartbeat_store_path(self):
         """Resolve the heartbeat id registry path, or None when unavailable."""
         return store_path_for(
