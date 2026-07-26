@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Typed Telegram status mixin contract (#346).** The heartbeat status
+  callback now declares its read-only configuration dependency explicitly,
+  removing `core.bot_status` from the `attr-defined` mypy exception without
+  changing heartbeat delivery, persistence, or cleanup behavior.
 - **Typed Telegram approval mixin contract (#346).** The approval bridge now
   declares its composed configuration, project-chat approval port, injected
   callables, and bounded pending state explicitly, removing the file-wide

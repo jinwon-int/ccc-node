@@ -63,7 +63,6 @@ module = [
   "core.bot_commands",
   "core.bot_delivery",
   "core.bot_lifecycle",
-  "core.bot_status",
   "core.bot_voice",
   "core.project_chat_history",
 ]
