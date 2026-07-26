@@ -61,6 +61,5 @@ files = [
 module = [
   "core.bot_commands",
   "core.bot_lifecycle",
-  "core.bot_voice",
 ]
 disable_error_code = ["attr-defined"]
