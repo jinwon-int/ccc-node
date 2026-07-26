@@ -4,6 +4,18 @@ All notable changes to the Claude Code node harness. Dates are KST.
 
 ## [Unreleased]
 
+### Added
+- Skill autosave now has a provider-neutral autonomous-mutation ownership
+  contract. A shared fail-closed classifier distinguishes autosave-managed,
+  user-owned, bundled/managed, external/repo-installed, pinned, and
+  unknown/unreadable skills; exposes owner-only `adopt`, `pin`, `unpin`,
+  status, and list-unmanaged controls with dry-run support; and issues
+  single-use exact-read receipts bound to the review attempt, operation,
+  target identity, content hash, and provenance revision. Bundled provenance
+  keeps priority over autosave, legacy markers require a current SHA match,
+  and rollback now refuses adopted, pinned, conflicting, or invalid
+  provenance. (#750)
+
 ### Changed
 - Codex nodes now compose the skill-candidate collector by default, with
   `CCC_CODEX_SKILL_COLLECTOR=false` as an explicit node-local opt-out. Candidate

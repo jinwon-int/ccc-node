@@ -15,6 +15,7 @@ SKILLS="$TMP/skills"
 SPOOL="$TMP/spool"
 PENDING="$STATE/pending-skills"
 mkdir -p "$STATE" "$SKILLS" "$PENDING"
+chmod 700 "$STATE"
 
 run_auto() { # [extra env assignments...] verb [args...]
   CCC_STATE_DIR="$STATE" CLAUDE_SKILLS_DIR="$SKILLS" CCC_PUSH_SPOOL="$SPOOL" \
@@ -58,7 +59,7 @@ ok "approve mode writes no ledger" '[ ! -s "$STATE/skill-autosave-install.jsonl"
 # --- 2) auto mode: clean draft is installed + ledgered + notified ---------------
 out="$(run_auto env CCC_SKILL_AUTOSAVE_MODE=auto CCC_SKILL_AUTOSAVE_TRIGGER=test bash "$AUTO" run)"
 ok "clean draft installed" '[ -f "$SKILLS/clean-one/SKILL.md" ]'
-ok "install marker written in skill dir" 'jq -e ".installed_by == \"autosave\"" "$SKILLS/clean-one/.autosave-meta.json" >/dev/null'
+ok "v2 install marker written owner-only" 'jq -e ".schema_version == 2 and .installed_by == \"autosave\" and .created_by == \"ccc-node\" and .rollback_eligible == true" "$SKILLS/clean-one/.autosave-meta.json" >/dev/null && [ "$(stat -c %a "$SKILLS/clean-one/.autosave-meta.json")" = 600 ]'
 ok "ledger records installed-by=autosave" 'jq -e "select(.event==\"install\") | .installed_by == \"autosave\" and .name == \"clean-one\" and .trigger == \"test\"" "$STATE/skill-autosave-install.jsonl" >/dev/null'
 ok "draft archived as installed" 'ls -d "$PENDING/20260101-000000-a-clean-one.installed-"* >/dev/null 2>&1'
 ok "summary lists installed name" 'jq -e ".installed == [\"clean-one\"]" >/dev/null <<<"$out"'
@@ -72,6 +73,18 @@ make_draft 20260101-000001-b-mode-file mode-file-skill "Summarize the recurring 
 out="$(run_auto bash "$AUTO" run)"
 ok "mode state file enables auto" '[ -f "$SKILLS/mode-file-skill/SKILL.md" ]'
 rm -f "$STATE/skill-autosave.mode"
+
+# Provenance failure removes only the exclusively-created install directory,
+# leaves the draft pending, and never publishes an install ledger row.
+make_draft 20260101-000001-c-provenance provenance-fail "Capture the recurring provenance failure recovery procedure."
+mkdir -p "$TMP/fail-bin"
+printf '#!/bin/sh\nexit 2\n' > "$TMP/fail-bin/python3"
+chmod +x "$TMP/fail-bin/python3"
+out="$(run_auto env PATH="$TMP/fail-bin:$PATH" CCC_SKILL_AUTOSAVE_MODE=auto bash "$AUTO" run)"
+ok "provenance failure leaves no partial install directory" '[ ! -e "$SKILLS/provenance-fail" ]'
+ok "provenance failure leaves draft pending and unledgered" '[ -d "$PENDING/20260101-000001-c-provenance" ] && ! jq -e "select(.event == \"install\" and .name == \"provenance-fail\")" "$STATE/skill-autosave-install.jsonl" >/dev/null'
+ok "provenance cleanup result is explicit" 'grep -q "name=provenance-fail reason=provenance-write cleanup=complete" "$STATE/skill-autoinstall.log"'
+rm -rf "$PENDING/20260101-000001-c-provenance"
 
 # --- 3) secret drafts are blocked and stay pending ------------------------------
 : > "$STATE/skill-autosave-install.jsonl"
@@ -166,6 +179,7 @@ ok "similar description blocked" 'jq -e ".reason | startswith(\"dedup descriptio
 # --- 7) daily cap defers (not blocks) ----------------------------------------------
 CAP_STATE="$TMP/capstate"; CAP_SKILLS="$TMP/capskills"; CAP_SPOOL="$TMP/capspool"
 mkdir -p "$CAP_STATE/pending-skills" "$CAP_SKILLS"
+chmod 700 "$CAP_STATE"
 PENDING_SAVE="$PENDING"; STATE_SAVE="$STATE"; SKILLS_SAVE="$SKILLS"
 STATE="$CAP_STATE"; SKILLS="$CAP_SKILLS"; PENDING="$CAP_STATE/pending-skills"
 make_draft 20260101-000011-l-cap1 cap-one "Capture the first recurring maintenance procedure for the fleet nodes."
@@ -205,6 +219,12 @@ run_auto bash "$AUTO" rollback --all >/dev/null 2>&1
 ok "rollback --all clears autosave installs" '! find "$SKILLS" -name .autosave-meta.json | grep -q .'
 ok "rollback --all leaves hand-made skill" '[ -f "$SKILLS/hand-made/SKILL.md" ]'
 
+out="$(run_auto bash "$AUTO" adopt hand-made --dry-run)"
+ok "autoinstall proxy exposes adopt dry-run" 'jq -e ".dry_run == true and .reason == \"would-adopt\"" >/dev/null <<<"$out"'
+run_auto bash "$AUTO" adopt hand-made >/dev/null
+run_auto bash "$AUTO" rollback hand-made >/dev/null 2>&1; rc=$?
+ok "adopted hand-made skill cannot be rolled back" '[ "$rc" != 0 ] && [ -f "$SKILLS/hand-made/SKILL.md" ] && jq -e ".created_by == \"operator-adopt\" and .rollback_eligible == false" "$SKILLS/hand-made/.autosave-meta.json" >/dev/null'
+
 # --- 10) status is read-only ------------------------------------------------------------
 out="$(run_auto bash "$AUTO" status)"
 ok "status reports mode and cap" 'grep -q "^mode: approve" <<<"$out" && grep -q "daily cap:" <<<"$out"'
@@ -212,6 +232,7 @@ ok "status reports mode and cap" 'grep -q "^mode: approve" <<<"$out" && grep -q 
 # --- 11) fleet autonomy guard (#386): kill + dry-run over auto mode ------------
 A_STATE="$TMP/autonomy-state"; A_SKILLS="$TMP/autonomy-skills"
 mkdir -p "$A_STATE/pending-skills" "$A_SKILLS"
+chmod 700 "$A_STATE"
 make_draft_at() { # <store> <skills> <id> <name> <desc>
   local st="$1" sk="$2" id="$3" nm="$4" desc="$5"
   mkdir -p "$st/pending-skills/$id"

@@ -24,6 +24,7 @@ CLAUDE_SKILLS="$TMP/claude-skills"   # must stay empty: Codex must not touch it
 SPOOL="$TMP/spool"
 PENDING="$STATE/pending-skills"
 mkdir -p "$STATE" "$PENDING" "$CLAUDE_SKILLS"
+chmod 700 "$STATE"
 
 # Codex-provider run: note CODEX_SKILLS_DIR is the install target and
 # CLAUDE_SKILLS_DIR is also set (to a separate empty dir) to prove the provider
@@ -71,7 +72,7 @@ ok "codex approve leaves draft pending" '[ -d "$PENDING/20260101-000000-a-clean"
 out="$(run_codex env CCC_SKILL_AUTOSAVE_MODE=auto CCC_SKILL_AUTOSAVE_TRIGGER=test bash "$AUTO" run)"
 ok "codex clean draft installed into codex skills dir" '[ -f "$CODEX_SKILLS/codex-clean-one/SKILL.md" ]'
 ok "codex install never touched claude skills dir" '[ -z "$(ls -A "$CLAUDE_SKILLS" 2>/dev/null)" ]'
-ok "codex install marker written" 'jq -e ".installed_by == \"autosave\"" "$CODEX_SKILLS/codex-clean-one/.autosave-meta.json" >/dev/null'
+ok "codex v2 install marker written owner-only" 'jq -e ".schema_version == 2 and .installed_by == \"autosave\" and .created_by == \"ccc-node\" and .rollback_eligible == true" "$CODEX_SKILLS/codex-clean-one/.autosave-meta.json" >/dev/null && [ "$(stat -c %a "$CODEX_SKILLS/codex-clean-one/.autosave-meta.json")" = 600 ]'
 ok "codex ledger records install" 'jq -e "select(.event==\"install\") | .name == \"codex-clean-one\" and .trigger == \"test\"" "$STATE/skill-autosave-install.jsonl" >/dev/null'
 ok "codex draft archived as installed" 'ls -d "$PENDING/20260101-000000-a-clean.installed-"* >/dev/null 2>&1'
 ok "codex post-hoc notification queued" 'ls "$SPOOL"/*SkillAutoInstall*.json >/dev/null 2>&1'
@@ -181,6 +182,7 @@ ok "codex existing skill content unchanged" '[ "$(sha256sum "$CODEX_SKILLS/user-
 # --- 7) concurrency: same checkpoint processed 10x → single install, no dup -----
 CC_STATE="$TMP/cc-state"; CC_CODEX="$TMP/cc-codex/skills"; CC_SPOOL="$TMP/cc-spool"
 mkdir -p "$CC_STATE/pending-skills"
+chmod 700 "$CC_STATE"
 mkdir -p "$CC_CODEX"   # pre-create so all racers share one install target
 cc_make() {
   mkdir -p "$CC_STATE/pending-skills/race-1"
@@ -208,6 +210,7 @@ ok "concurrent 10x writes exactly one install ledger row" '[ "$(jq -r "select(.e
 # --- 8) daily cap defers on the Codex surface -----------------------------------
 CAP_STATE="$TMP/cap-state"; CAP_CODEX="$TMP/cap-codex/skills"; CAP_SPOOL="$TMP/cap-spool"
 mkdir -p "$CAP_STATE/pending-skills" "$CAP_CODEX"
+chmod 700 "$CAP_STATE"
 mkdir -p "$CAP_STATE/pending-skills/cap-a" "$CAP_STATE/pending-skills/cap-b"
 printf -- '---\nname: codex-cap-a\ndescription: Capture the first recurring Codex maintenance procedure for the fleet nodes.\n---\n\n# A\n\n## Procedure\n1. Step.\n2. Verify.\n3. Record.\n4. Confirm.\n5. Done.\n' > "$CAP_STATE/pending-skills/cap-a/SKILL.md"
 printf -- '---\nname: codex-cap-b\ndescription: Capture the second recurring Codex maintenance procedure for backup checks.\n---\n\n# B\n\n## Procedure\n1. Step.\n2. Verify.\n3. Record.\n4. Confirm.\n5. Done.\n' > "$CAP_STATE/pending-skills/cap-b/SKILL.md"
@@ -221,6 +224,7 @@ ok "codex over-cap draft deferred, not blocked" 'jq -e ".deferred == 1" >/dev/nu
 # --- 9) secure install-dir contract: symlinked skills dir fails closed -----------
 SL_STATE="$TMP/sl-state"; SL_REAL="$TMP/sl-real"; SL_LINK="$TMP/sl-link"
 mkdir -p "$SL_STATE/pending-skills" "$SL_REAL"
+chmod 700 "$SL_STATE"
 ln -s "$SL_REAL" "$SL_LINK"
 mkdir -p "$SL_STATE/pending-skills/sl-1"
 printf -- '---\nname: codex-symlink-target\ndescription: Capture the recurring Codex secure install directory verification procedure.\n---\n\n# S\n\n## Procedure\n1. Step.\n2. Verify.\n3. Record.\n4. Confirm.\n5. Done.\n' > "$SL_STATE/pending-skills/sl-1/SKILL.md"
