@@ -2,19 +2,36 @@
 import logging
 import secrets
 from pathlib import Path as FilePath
-from typing import Any, Dict, List, Optional, Tuple
+from typing import (
+    AbstractSet,
+    Any,
+    Awaitable,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Mapping,
+    Optional,
+    Pattern,
+    Protocol,
+    Tuple,
+)
 
 import telegram.error
 from telegram import (
-    Update,
+    BotCommand,
+    BotCommandScopeAllChatAdministrators,
+    BotCommandScopeAllGroupChats,
+    BotCommandScopeAllPrivateChats,
+    Chat,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
-    BotCommand,
-    BotCommandScopeAllPrivateChats,
-    BotCommandScopeAllGroupChats,
-    BotCommandScopeAllChatAdministrators,
+    Message,
+    Update,
+    User,
 )
 from telegram.ext import (
+    Application,
     ContextTypes,
 )
 from telegram_bot.core import ui
@@ -37,7 +54,113 @@ MAX_SEND_FILE_BYTES = 50 * 1024 * 1024
 
 
 
+class _DeliveryConfig(Protocol):
+    @property
+    def bridge_memory_mode(self) -> str: ...
+
+    @property
+    def telegram_max_bubble_chars(self) -> int: ...
+
+    @property
+    def enable_readable_renderer(self) -> bool: ...
+
+    @property
+    def enable_loose_spacing(self) -> bool: ...
+
+    @property
+    def spacing_lines(self) -> int: ...
+
+    @property
+    def enable_entity_renderer(self) -> bool: ...
+
+    @property
+    def enable_option_buttons(self) -> bool: ...
+
+
+class _DeliverySessionManager(Protocol):
+    async def get_session(self, user_id: int) -> Dict[str, Any]: ...
+
+    async def patch_session(
+        self,
+        user_id: int,
+        *,
+        updates: Optional[Mapping[str, Any]] = None,
+        remove_fields: Iterable[str] = (),
+    ) -> None: ...
+
+    async def get_pending_question(
+        self, user_id: int
+    ) -> Optional[Dict[str, Any]]: ...
+
+    async def clear_pending_question(self, user_id: int) -> None: ...
+
+
+class _DeliveryProjectChat(Protocol):
+    def get_session_last_assistant_message(
+        self, session_id: str, max_chars: int = 300
+    ) -> Optional[str]: ...
+
+
+class _SendContentArtifacts(Protocol):
+    def __call__(
+        self,
+        message: Message,
+        content: str,
+        force_options: bool,
+        user_id: Optional[int] = None,
+    ) -> Awaitable[None]: ...
+
+
+class _ProcessUserMessageText(Protocol):
+    def __call__(
+        self,
+        update: Update,
+        user_id: int,
+        text: str,
+        message_source: str = "text",
+        voice_input_preview: Optional[str] = None,
+        sensitive_log_event: Optional[str] = None,
+    ) -> Awaitable[None]: ...
+
+
 class BotDeliveryMixin:
+    _config: _DeliveryConfig
+    _session_manager: _DeliverySessionManager
+    _project_chat: _DeliveryProjectChat
+    _send_content_artifacts: _SendContentArtifacts
+    _process_user_message_text: _ProcessUserMessageText
+    _require_application: Callable[
+        [],
+        Application[Any, Any, Any, Any, Any, Any],
+    ]
+    _check_access: Callable[[Update], Awaitable[bool]]
+    _require_message: Callable[[Update], Message]
+    _require_user: Callable[[Update], User]
+    _require_chat: Callable[[Update], Chat]
+    _conversation_key: Callable[[int, int | None], Any]
+    _resolve_codex_approval_text: Callable[
+        [int, int, str],
+        Awaitable[str | None],
+    ]
+    _active_provider: Callable[[], str]
+    _maybe_capture_outside_approval: Callable[
+        [int, str, int | None],
+        Awaitable[None],
+    ]
+    _own_bot_id: Callable[[], int | None]
+    _enqueue_user_task: Callable[
+        [
+            int,
+            Callable[[], Awaitable[None]],
+            Callable[[], Awaitable[None]],
+        ],
+        Awaitable[bool],
+    ]
+    _project_root: Callable[[], FilePath]
+    _runtime_active_sessions: set[Any]
+    _FILE_PATH_RE: Pattern[str]
+    _IMAGE_EXTS: AbstractSet[str]
+
     def _make_interim_reply_callback(self, message):
         """Build a renderer-preserving callback for an interim reply bubble."""
 

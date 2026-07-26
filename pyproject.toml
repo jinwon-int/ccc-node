@@ -60,7 +60,6 @@ files = [
 [[tool.mypy.overrides]]
 module = [
   "core.bot_commands",
-  "core.bot_delivery",
   "core.bot_lifecycle",
   "core.bot_voice",
 ]
