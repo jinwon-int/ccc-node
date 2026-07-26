@@ -5,7 +5,7 @@ import os
 import platform
 import time
 from pathlib import Path as FilePath
-from typing import Any, List, Optional, Tuple
+from typing import Any, List, Optional, Protocol, Tuple
 
 from telegram import (
     Update,
@@ -31,7 +31,104 @@ STALE_MESSAGE_SECONDS = 20 * 60  # 20 minutes
 
 
 
+class _VoiceConfig(Protocol):
+    @property
+    def transcription_provider(self) -> str: ...
+
+    @property
+    def openai_api_key(self) -> str | None: ...
+
+    @property
+    def openai_base_url(self) -> str | None: ...
+
+    @property
+    def whisper_model(self) -> str: ...
+
+    @property
+    def max_voice_duration(self) -> int: ...
+
+    @property
+    def ffmpeg_path(self) -> str | None: ...
+
+    @property
+    def voice_reply_persona(self) -> str: ...
+
+    @property
+    def volcengine_app_id(self) -> str | None: ...
+
+    @property
+    def volcengine_token(self) -> str | None: ...
+
+    @property
+    def volcengine_access_key(self) -> str | None: ...
+
+    @property
+    def volcengine_secret_access_key(self) -> str | None: ...
+
+    @property
+    def volcengine_tos_bucket_name(self) -> str | None: ...
+
+    @property
+    def volcengine_tos_endpoint(self) -> str: ...
+
+    @property
+    def volcengine_tos_region(self) -> str: ...
+
+    @property
+    def volcengine_tos_signed_url_ttl_seconds(self) -> int: ...
+
+    @property
+    def volcengine_cluster(self) -> str: ...
+
+    @property
+    def volcengine_resource_id(self) -> str: ...
+
+    @property
+    def volcengine_model_name(self) -> str: ...
+
+    @property
+    def volcengine_submit_endpoint(self) -> str: ...
+
+    @property
+    def volcengine_query_endpoint(self) -> str: ...
+
+    @property
+    def volcengine_timeout_seconds(self) -> float: ...
+
+    @property
+    def volcengine_max_retries(self) -> int: ...
+
+    @property
+    def volcengine_initial_backoff(self) -> float: ...
+
+    @property
+    def volcengine_poll_interval_seconds(self) -> float: ...
+
+    @property
+    def volcengine_max_poll_seconds(self) -> float: ...
+
+    @property
+    def telegram_bot_token(self) -> str: ...
+
+    @property
+    def enable_option_buttons(self) -> bool: ...
+
+    @property
+    def max_document_size_mb(self) -> int: ...
+
+    @property
+    def image_context_guard(self) -> bool: ...
+
+    @property
+    def telegram_max_image_bytes(self) -> int: ...
+
+    @property
+    def telegram_max_image_pixels(self) -> int: ...
+
+
 class BotVoiceMixin:
+    _config: _VoiceConfig
+
     # Lazily constructed voice collaborators (initialized to None by the
     # composing TelegramBot); annotated here so mypy can type the lazy-init
     # getters below.
@@ -40,7 +137,7 @@ class BotVoiceMixin:
     _volcengine_tos_uploader: Optional[VolcengineTOSUploader]
     _tts_synthesizer: Optional[MacOSTtsSynthesizer]
 
-    def _voice_config(self):
+    def _voice_config(self) -> _VoiceConfig:
         return self._config
 
     def _prune_voice_tasks(self, key: Any) -> set[asyncio.Task]:
