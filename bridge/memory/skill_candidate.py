@@ -19,16 +19,19 @@ from __future__ import annotations
 from contextlib import contextmanager
 from dataclasses import dataclass
 import fcntl
+import hashlib
 import json
 import math
 import os
 from pathlib import Path
+from pathlib import PurePosixPath
 import re
 import stat
 import threading
-from typing import Iterator, Protocol, cast, runtime_checkable
+from typing import Annotated, Iterator, Literal, Protocol, cast, runtime_checkable
+import uuid
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from telegram_bot.utils.redaction import CREDENTIAL_PATTERNS as _CREDENTIAL_PATTERNS
 from telegram_bot.utils.secure_fs import _atomic_write_bytes, ensure_private_directory
@@ -39,9 +42,12 @@ from .distill_types import CodexTranscriptSnapshot
 # Candidate bounds. Kept small: this is a review queue, not a bulk importer.
 _MAX_CANDIDATES = 2
 _MAX_SKILL_MD_BYTES = 16 * 1024
+_MAX_PATCH_TEXT_BYTES = 32 * 1024
+_MAX_SUPPORT_FILE_BYTES = 48 * 1024
 _MAX_OUTPUT_JSON_BYTES = 64 * 1024
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _KEBAB_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+_SAFE_PATH_COMPONENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _SAFE_ID_RE = re.compile(r"[^A-Za-z0-9._-]+")
 _SAFE_ERROR_CODE_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _RETRY_SCHEMA_VERSION = 1
@@ -68,7 +74,11 @@ class _StrictModel(BaseModel):
 
 
 class SkillCandidate(_StrictModel):
-    """One reusable-procedure proposal, ready to stage as a pending draft."""
+    """Legacy schema-v1 create-only candidate.
+
+    Kept as an input adapter so already-produced v1 output remains readable.
+    New extraction uses the action-discriminated proposal classes below.
+    """
 
     name: str = Field(min_length=1, max_length=64)
     summary: str = Field(min_length=1, max_length=600)
@@ -108,22 +118,231 @@ class SkillCandidate(_StrictModel):
         return value
 
 
-class SkillCandidateOutput(_StrictModel):
-    """Validated backend output. NOT a ``DistillExtractionOutput``."""
+def _validate_public_text(value: str) -> str:
+    if _DIRECTIVE_RE.search(value):
+        raise ValueError("field contains an injected directive")
+    for pattern in _CREDENTIAL_PATTERNS:
+        if pattern.search(value):
+            raise ValueError("field contains a credential-like value")
+    return value
 
-    schema_version: int = Field(ge=1, le=1)
-    provenance: DistillProvenance
-    candidates: tuple[SkillCandidate, ...] = Field(default=())
 
-    @field_validator("candidates")
+def _validate_relative_target(value: str, *, create_only: bool) -> str:
+    if (
+        not value
+        or "\x00" in value
+        or "\\" in value
+        or value.startswith("/")
+        or "//" in value
+    ):
+        raise ValueError("relative_target must be a canonical POSIX relative path")
+    parts = value.split("/")
+    if any(
+        part in {"", ".", ".."} or not _SAFE_PATH_COMPONENT_RE.fullmatch(part)
+        for part in parts
+    ):
+        raise ValueError("relative_target contains an unsafe path component")
+    candidate = PurePosixPath(value)
+    if candidate.is_absolute() or candidate.as_posix() != value:
+        raise ValueError("relative_target must be canonical")
+    if create_only:
+        if parts[0] not in {"references", "scripts", "templates"} or len(parts) < 2:
+            raise ValueError("write_file target must be under an allowlisted support directory")
+    elif value != "SKILL.md" and (
+        parts[0] not in {"references", "scripts", "templates"} or len(parts) < 2
+    ):
+        raise ValueError("patch target must be SKILL.md or an allowlisted support file")
+    return value
+
+
+class SkillCreateProposal(_StrictModel):
+    action: Literal["create"]
+    name: str = Field(min_length=1, max_length=64)
+    summary: str = Field(min_length=1, max_length=600)
+    reason: str = Field(min_length=1, max_length=600)
+    evidence_excerpt: str = Field(default="", max_length=200)
+    skill_md: str = Field(min_length=1, max_length=_MAX_SKILL_MD_BYTES)
+
+    @field_validator("name")
     @classmethod
-    def _validate_candidates(cls, value: tuple[SkillCandidate, ...]) -> tuple[SkillCandidate, ...]:
-        if len(value) > _MAX_CANDIDATES:
-            raise ValueError(f"at most {_MAX_CANDIDATES} candidates")
-        names = [candidate.name for candidate in value]
-        if len(set(names)) != len(names):
-            raise ValueError("candidate names must be unique")
+    def _validate_name(cls, value: str) -> str:
+        if not _KEBAB_RE.fullmatch(value):
+            raise ValueError("name must be lowercase kebab-case")
         return value
+
+    @field_validator("skill_md")
+    @classmethod
+    def _validate_skill_md(cls, value: str) -> str:
+        if not value.startswith("---"):
+            raise ValueError("skill_md must start with YAML frontmatter")
+        if len(value.encode("utf-8")) > _MAX_SKILL_MD_BYTES:
+            raise ValueError("skill_md exceeds UTF-8 byte bound")
+        return _validate_public_text(value)
+
+    @field_validator("summary", "reason", "evidence_excerpt")
+    @classmethod
+    def _validate_text(cls, value: str) -> str:
+        return _validate_public_text(value)
+
+
+class SkillPatchProposal(_StrictModel):
+    action: Literal["patch"]
+    target_skill: str = Field(min_length=1, max_length=64)
+    relative_target: str = Field(min_length=1, max_length=240)
+    expected_sha256: str
+    old_text: str = Field(min_length=1, max_length=_MAX_PATCH_TEXT_BYTES)
+    new_text: str = Field(max_length=_MAX_PATCH_TEXT_BYTES)
+    improvement_reason: str = Field(min_length=1, max_length=600)
+    reason: str = Field(min_length=1, max_length=600)
+    evidence_excerpt: str = Field(default="", max_length=200)
+
+    @field_validator("target_skill")
+    @classmethod
+    def _validate_target_skill(cls, value: str) -> str:
+        if not _KEBAB_RE.fullmatch(value):
+            raise ValueError("target_skill must be lowercase kebab-case")
+        return value
+
+    @field_validator("relative_target")
+    @classmethod
+    def _validate_target(cls, value: str) -> str:
+        return _validate_relative_target(value, create_only=False)
+
+    @field_validator("expected_sha256")
+    @classmethod
+    def _validate_sha(cls, value: str) -> str:
+        if not _SHA256_RE.fullmatch(value):
+            raise ValueError("expected_sha256 must be lowercase SHA-256")
+        return value
+
+    @field_validator("old_text", "new_text")
+    @classmethod
+    def _validate_patch_text(cls, value: str) -> str:
+        if len(value.encode("utf-8")) > _MAX_PATCH_TEXT_BYTES:
+            raise ValueError("patch text exceeds UTF-8 byte bound")
+        return _validate_public_text(value)
+
+    @field_validator("improvement_reason", "reason", "evidence_excerpt")
+    @classmethod
+    def _validate_text(cls, value: str) -> str:
+        return _validate_public_text(value)
+
+
+class SkillWriteFileProposal(_StrictModel):
+    action: Literal["write_file"]
+    target_skill: str = Field(min_length=1, max_length=64)
+    relative_target: str = Field(min_length=1, max_length=240)
+    expected_absent: Literal[True]
+    expected_provenance_revision: int = Field(ge=0)
+    expected_provenance_sha256: str
+    content: str = Field(min_length=1, max_length=_MAX_SUPPORT_FILE_BYTES)
+    improvement_reason: str = Field(min_length=1, max_length=600)
+    reason: str = Field(min_length=1, max_length=600)
+    evidence_excerpt: str = Field(default="", max_length=200)
+
+    @field_validator("target_skill")
+    @classmethod
+    def _validate_target_skill(cls, value: str) -> str:
+        if not _KEBAB_RE.fullmatch(value):
+            raise ValueError("target_skill must be lowercase kebab-case")
+        return value
+
+    @field_validator("relative_target")
+    @classmethod
+    def _validate_target(cls, value: str) -> str:
+        return _validate_relative_target(value, create_only=True)
+
+    @field_validator("expected_provenance_sha256")
+    @classmethod
+    def _validate_sha(cls, value: str) -> str:
+        if not _SHA256_RE.fullmatch(value):
+            raise ValueError("expected_provenance_sha256 must be lowercase SHA-256")
+        return value
+
+    @field_validator("content")
+    @classmethod
+    def _validate_content(cls, value: str) -> str:
+        if len(value.encode("utf-8")) > _MAX_SUPPORT_FILE_BYTES:
+            raise ValueError("content exceeds UTF-8 byte bound")
+        return _validate_public_text(value)
+
+    @field_validator("improvement_reason", "reason", "evidence_excerpt")
+    @classmethod
+    def _validate_text(cls, value: str) -> str:
+        return _validate_public_text(value)
+
+
+class SkillNoopProposal(_StrictModel):
+    action: Literal["noop"]
+    reason: str = Field(min_length=1, max_length=600)
+    evidence_excerpt: str = Field(default="", max_length=200)
+
+    @field_validator("reason", "evidence_excerpt")
+    @classmethod
+    def _validate_text(cls, value: str) -> str:
+        return _validate_public_text(value)
+
+
+SkillProposal = Annotated[
+    SkillCreateProposal | SkillPatchProposal | SkillWriteFileProposal | SkillNoopProposal,
+    Field(discriminator="action"),
+]
+
+
+class SkillCandidateOutput(_StrictModel):
+    """Validated schema-v2 backend output with a schema-v1 input adapter."""
+
+    schema_version: Literal[2]
+    provenance: DistillProvenance
+    proposals: tuple[SkillProposal, ...] = Field(default=())
+
+    @model_validator(mode="before")
+    @classmethod
+    def _upgrade_schema_v1(cls, value: object) -> object:
+        if not isinstance(value, dict) or value.get("schema_version") != 1:
+            return value
+        legacy = dict(value)
+        raw_candidates = legacy.pop("candidates", None)
+        if not isinstance(raw_candidates, (list, tuple)):
+            return value
+        proposals: list[dict[str, object]] = []
+        for raw in raw_candidates:
+            if not isinstance(raw, dict):
+                return value
+            proposals.append({"action": "create", **raw})
+        legacy["schema_version"] = 2
+        legacy["proposals"] = proposals
+        return legacy
+
+    @field_validator("proposals")
+    @classmethod
+    def _validate_proposals(
+        cls, value: tuple[SkillProposal, ...]
+    ) -> tuple[SkillProposal, ...]:
+        if len(value) > _MAX_CANDIDATES:
+            raise ValueError(f"at most {_MAX_CANDIDATES} proposals")
+        identities = [
+            (
+                proposal.action,
+                getattr(proposal, "name", None)
+                or getattr(proposal, "target_skill", None),
+                getattr(proposal, "relative_target", None),
+            )
+            for proposal in value
+        ]
+        if len(set(identities)) != len(identities):
+            raise ValueError("proposal identities must be unique")
+        return value
+
+    @property
+    def candidates(self) -> tuple[SkillCreateProposal, ...]:
+        """Compatibility view for callers that only consumed v1 creates."""
+
+        return tuple(
+            proposal
+            for proposal in self.proposals
+            if isinstance(proposal, SkillCreateProposal)
+        )
 
 
 class SkillCandidateParseError(ValueError):
@@ -192,8 +411,8 @@ class SkillCandidateSink:
     the same checkpoint a no-op — so the same snapshot handled many times at
     once stages each draft exactly once. The drafts themselves are written into
     ``pending_dir`` in the exact contract ``autoinstall.sh`` consumes
-    (``<safe_id>/{SKILL.md,meta.json}``), so the merged provider-aware installer
-    (``CCC_SKILL_PROVIDER=codex``) installs them into ``CODEX_HOME/skills``.
+    (``<safe_id>/{proposal.json,meta.json}``), so the provider-aware installer
+    can route create and incremental actions without mixed payloads.
     """
 
     def __init__(self, queue_dir: Path, pending_dir: Path) -> None:
@@ -410,19 +629,27 @@ class SkillCandidateSink:
         raw = f"{job_id[:16]}-{index}-{name}"
         return _SAFE_ID_RE.sub("-", raw)[:160]
 
-    def _job_record(self, output: SkillCandidateOutput, *, job_id: str, staged: list[str]) -> bytes:
+    def _job_record(
+        self,
+        output: SkillCandidateOutput,
+        *,
+        job_id: str,
+        staged: list[str],
+        noop_count: int,
+    ) -> bytes:
         provenance = output.provenance
         record = {
             "schema_version": output.schema_version,
             "job_id": job_id,
-            "review_status": "staged",
+            "review_status": "staged" if staged else "complete",
             "provenance": {
                 "provider": provenance.provider,
                 "source_thread_hash": provenance.source_thread_hash,
                 "trigger": provenance.trigger.value,
                 "distilled_at": provenance.distilled_at,
             },
-            "staged_drafts": staged,
+            "staged_proposals": staged,
+            "noop_count": noop_count,
         }
         return json.dumps(
             record,
@@ -432,29 +659,218 @@ class SkillCandidateSink:
             separators=(",", ":"),
         ).encode("utf-8")
 
-    def _write_draft(self, candidate: SkillCandidate, *, safe_id: str, output: SkillCandidateOutput) -> None:
+    @staticmethod
+    def _proposal_id(
+        proposal: SkillProposal,
+        *,
+        job_id: str,
+        index: int,
+        output: SkillCandidateOutput,
+    ) -> str:
+        canonical = json.dumps(
+            {
+                "schema_version": output.schema_version,
+                "job_id": job_id,
+                "index": index,
+                "provenance": output.provenance.model_dump(mode="json"),
+                "proposal": proposal.model_dump(mode="json"),
+            },
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return hashlib.sha256(canonical).hexdigest()
+
+    def _write_proposal(
+        self,
+        proposal: SkillProposal,
+        *,
+        safe_id: str,
+        proposal_id: str,
+        output: SkillCandidateOutput,
+    ) -> None:
         provenance = output.provenance
         dest = self.pending_dir / safe_id
-        # Deterministic dir name: a retried job maps to the same path. If the
-        # draft dir already exists (or was archived by a prior install) the job
-        # record guard above already made this a no-op, so we only reach here on
-        # a genuinely new job.
-        os.makedirs(dest, mode=0o700, exist_ok=True)
-        _atomic_write_bytes(dest / "SKILL.md", candidate.skill_md.encode("utf-8"))
+        payload = {
+            "schema_version": 2,
+            "proposal_id": proposal_id,
+            "provenance": provenance.model_dump(mode="json"),
+            "proposal": proposal.model_dump(mode="json"),
+        }
+        proposal_bytes = json.dumps(
+            payload,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        target_name = getattr(proposal, "name", None) or getattr(
+            proposal, "target_skill", None
+        )
         meta = {
             "id": safe_id,
-            "name": candidate.name,
+            "proposal_id": proposal_id,
+            "action": proposal.action,
+            "name": target_name,
             "status": "pending",
             "session_id": provenance.source_thread_hash,
             "trigger": provenance.trigger.value,
             "staged_at": provenance.distilled_at,
             "source": "codex-skill-collector",
-            "summary": candidate.summary,
-            "reason": candidate.reason,
+            "summary": getattr(proposal, "summary", ""),
+            "reason": proposal.reason,
         }
-        _atomic_write_bytes(
-            dest / "meta.json",
-            json.dumps(meta, ensure_ascii=False, allow_nan=False, sort_keys=True).encode("utf-8"),
+        meta_bytes = json.dumps(
+            meta,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+        ).encode("utf-8")
+        ensure_private_directory(self.pending_dir)
+        try:
+            dest.lstat()
+        except FileNotFoundError:
+            pass
+        else:
+            if self._existing_proposal_matches(
+                dest,
+                proposal_bytes=proposal_bytes,
+                meta_bytes=meta_bytes,
+            ):
+                return
+            raise SkillCandidateCollisionError(
+                "skill-candidate proposal collision"
+            )
+        temporary = self.pending_dir / f".stage-{safe_id}-{uuid.uuid4().hex}"
+        os.mkdir(temporary, mode=0o700)
+        try:
+            _atomic_write_bytes(temporary / "proposal.json", proposal_bytes)
+            _atomic_write_bytes(temporary / "meta.json", meta_bytes)
+            directory_fd = os.open(
+                temporary,
+                os.O_RDONLY
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_DIRECTORY", 0),
+            )
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+            os.rename(temporary, dest)
+            parent_fd = os.open(
+                self.pending_dir,
+                os.O_RDONLY
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_DIRECTORY", 0),
+            )
+            try:
+                os.fsync(parent_fd)
+            finally:
+                os.close(parent_fd)
+        except Exception:
+            for name in ("proposal.json", "meta.json"):
+                (temporary / name).unlink(missing_ok=True)
+            try:
+                temporary.rmdir()
+            except OSError:
+                pass
+            raise
+
+    @staticmethod
+    def _read_exact_private(path: Path, *, max_bytes: int) -> bytes:
+        metadata = path.lstat()
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or stat.S_ISLNK(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or metadata.st_uid != os.getuid()
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or metadata.st_size > max_bytes
+        ):
+            raise SkillCandidateCollisionError("unsafe staged proposal")
+        descriptor = os.open(
+            path,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        try:
+            opened = os.fstat(descriptor)
+            if (
+                (opened.st_dev, opened.st_ino)
+                != (metadata.st_dev, metadata.st_ino)
+                or not stat.S_ISREG(opened.st_mode)
+                or opened.st_uid != os.getuid()
+                or opened.st_nlink != 1
+                or stat.S_IMODE(opened.st_mode) != 0o600
+                or opened.st_size > max_bytes
+            ):
+                raise SkillCandidateCollisionError("staged proposal changed")
+            chunks: list[bytes] = []
+            remaining = max_bytes + 1
+            while remaining > 0:
+                chunk = os.read(descriptor, min(65536, remaining))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            content = b"".join(chunks)
+            after = os.fstat(descriptor)
+            if (
+                len(content) > max_bytes
+                or (
+                    opened.st_dev,
+                    opened.st_ino,
+                    opened.st_size,
+                    opened.st_mtime_ns,
+                    opened.st_ctime_ns,
+                )
+                != (
+                    after.st_dev,
+                    after.st_ino,
+                    after.st_size,
+                    after.st_mtime_ns,
+                    after.st_ctime_ns,
+                )
+            ):
+                raise SkillCandidateCollisionError("staged proposal changed")
+            return content
+        finally:
+            os.close(descriptor)
+
+    @classmethod
+    def _existing_proposal_matches(
+        cls,
+        dest: Path,
+        *,
+        proposal_bytes: bytes,
+        meta_bytes: bytes,
+    ) -> bool:
+        metadata = dest.lstat()
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or stat.S_ISLNK(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+            or stat.S_IMODE(metadata.st_mode) != 0o700
+        ):
+            raise SkillCandidateCollisionError("unsafe staged proposal directory")
+        entries = {entry.name for entry in os.scandir(dest)}
+        if entries != {"proposal.json", "meta.json"}:
+            return False
+        return (
+            cls._read_exact_private(
+                dest / "proposal.json",
+                max_bytes=_MAX_OUTPUT_JSON_BYTES,
+            )
+            == proposal_bytes
+            and cls._read_exact_private(
+                dest / "meta.json",
+                max_bytes=16 * 1024,
+            )
+            == meta_bytes
         )
 
     def write(self, output: SkillCandidateOutput, *, job_id: str) -> SkillCandidateStageResult:
@@ -462,15 +878,37 @@ class SkillCandidateSink:
             raise ValueError("output must be a validated SkillCandidateOutput")
         if not isinstance(job_id, str) or not _SHA256_RE.fullmatch(job_id):
             raise ValueError("job_id must be a SHA-256 hex digest")
-        count = len(output.candidates)
+        staged_proposals = [
+            proposal for proposal in output.proposals if proposal.action != "noop"
+        ]
+        count = len(staged_proposals)
+        noop_count = len(output.proposals) - count
         with self._exclusive():
             record_path = self.queue_dir / f"{job_id}.json"
             self._validate_regular_file(record_path)
-            staged = [
-                self._safe_id(job_id, index, candidate.name)
-                for index, candidate in enumerate(output.candidates)
-            ]
-            payload = self._job_record(output, job_id=job_id, staged=staged)
+            staged: list[str] = []
+            prepared: list[tuple[SkillProposal, str, str]] = []
+            for index, proposal in enumerate(output.proposals):
+                if proposal.action == "noop":
+                    continue
+                proposal_id = self._proposal_id(
+                    proposal,
+                    job_id=job_id,
+                    index=index,
+                    output=output,
+                )
+                target_name = getattr(proposal, "name", None) or getattr(
+                    proposal, "target_skill", "proposal"
+                )
+                safe_id = self._safe_id(job_id, index, str(target_name))
+                staged.append(safe_id)
+                prepared.append((proposal, safe_id, proposal_id))
+            payload = self._job_record(
+                output,
+                job_id=job_id,
+                staged=staged,
+                noop_count=noop_count,
+            )
             if record_path.exists():
                 if record_path.read_bytes() == payload:
                     return SkillCandidateStageResult(count, False)
@@ -480,9 +918,14 @@ class SkillCandidateSink:
             # a barren snapshot is not re-drafted (and re-charged) on every
             # sweep — has() then dedupes it.
             if count > 0:
-                os.makedirs(self.pending_dir, mode=0o700, exist_ok=True)
-                for candidate, safe_id in zip(output.candidates, staged):
-                    self._write_draft(candidate, safe_id=safe_id, output=output)
+                ensure_private_directory(self.pending_dir)
+                for proposal, safe_id, proposal_id in prepared:
+                    self._write_proposal(
+                        proposal,
+                        safe_id=safe_id,
+                        proposal_id=proposal_id,
+                        output=output,
+                    )
             # Marker written last: a crash mid-stage leaves gated drafts (safe),
             # never a "done" marker with no drafts.
             _atomic_write_bytes(record_path, payload)
@@ -520,6 +963,11 @@ class SkillCandidateCollector:
 
 __all__ = [
     "SkillCandidate",
+    "SkillCreateProposal",
+    "SkillPatchProposal",
+    "SkillWriteFileProposal",
+    "SkillNoopProposal",
+    "SkillProposal",
     "SkillCandidateOutput",
     "SkillCandidateParseError",
     "parse_skill_candidate_output",

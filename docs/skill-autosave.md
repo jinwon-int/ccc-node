@@ -25,7 +25,7 @@ differ per provider. `skill-review/provider.sh` resolves both.
 | Mode / daily cap / off-switch / ledger / rollback | ✅ identical | ✅ identical |
 | Codex-compat screen (rejects `claude -p`, `~/.claude`, `CLAUDE_*`) | n/a | ✅ isolates Claude-only drafts as pending |
 | Secure install dir (0700, no-symlink leaf, fail-closed) | existing dir untouched | ✅ created owner-only |
-| Candidate **drafting/collection** (SessionEnd → draft) | ✅ (`skill-review.sh` + `extract.sh`) | ✅ engine + real `codex exec` backend + Codex-only default-ON collector (`CCC_CODEX_SKILL_COLLECTOR=false` opts out) |
+| Candidate **drafting/collection** (SessionEnd → draft) | ✅ (`skill-review.sh` + `extract.sh`) | ✅ v2 create/patch/write_file/noop engine + real `codex exec` backend + Codex-only default-ON collector (`CCC_CODEX_SKILL_COLLECTOR=false` opts out) |
 
 Select the provider explicitly with `CCC_SKILL_PROVIDER=claude|codex`. When
 unset it auto-detects: a node with a Codex home but no `~/.claude` and no
@@ -63,6 +63,52 @@ canceled attempts. See
 [`codex-skill-collector-activation.md`](codex-skill-collector-activation.md)
 for deployment verification and opt-out rollback. This changes candidate
 staging only; `CCC_SKILL_AUTOSAVE_MODE` remains `approve` by default.
+
+### Incremental proposals (#751)
+
+The Codex collector now prefers improving an eligible existing skill over
+creating a near-duplicate. Its bounded, redacted inventory contains at most
+eight unpinned `autosave-managed` skills, four safe files per skill, 16 KiB per
+file and 64 KiB total content. Read-only overlap metadata enters model input
+only after credential, endpoint, node-fact and prompt-injection sanitization.
+Inventory is advisory: apply always reclassifies and reopens the exact target
+under the ownership lock.
+
+Each owner-only pending directory contains exactly one `proposal.json` plus
+`meta.json`. The action is one of:
+
+- `create`: a complete new `SKILL.md`;
+- `patch`: one unique old-text replacement in `SKILL.md` or an allowlisted
+  `references/`, `scripts/` or `templates/` file, bound to its exact SHA-256;
+- `write_file`: no-replace creation below an allowlisted support directory,
+  bound to provenance revision/hash and `expected_absent=true`;
+- `noop`: records the job complete without staging a draft.
+
+Patch and support-file apply run entirely inside the ownership mutation lock.
+The engine rechecks ownership, pin state, hashes, path components, link count,
+content gates and support caps. It fsyncs a body-free `prepared` ledger row
+before mutation and a terminal row after it. An owner-only backup supports
+crash recovery; the existing whole-skill archive rollback remains available
+for autosave-created skills. Replay after an interrupted terminal append
+reconciles the exact target and marker and records one terminal outcome.
+Automatic daily-cap reservation uses this same locked ledger, so concurrent
+workers cannot consume the final slot twice. Automatic mutation is limited to
+rollback-eligible autosave-created skills; an operator-adopted skill can be
+improved through explicit approval but is never changed unattended.
+
+Review and apply a v2 draft without copying files by hand:
+
+```bash
+AUTO="${CCC_CLAUDE_DIR:-$HOME/.claude}/hooks/skill-review/autoinstall.sh"
+bash "$AUTO" render <draft-id>
+bash "$AUTO" apply <draft-id>
+```
+
+`render` shows target, expected hashes, provenance and exact diff/content.
+`apply` routes through the locked ownership engine and archives the reviewed
+draft. A directory containing both legacy `SKILL.md` and v2 `proposal.json`
+fails closed. Schema-v1 create-only backend output remains accepted and is
+migrated in memory; new backend output uses strict schema v2.
 
 ## Enable the daily sweep
 
@@ -106,9 +152,10 @@ notification, so a quiet node stays quiet.
 ## Review / approve from Telegram
 
 Ask the bot to run `/skill-suggest` (or "스킬 후보 검토해줘"). It lists pending
-drafts and ranked candidates; approval copies the draft into
-`~/.claude/skills/<name>/SKILL.md`. In the default approve mode nothing is
-ever installed without approval.
+drafts and ranked candidates. Legacy create-only drafts retain their existing
+review path; v2 proposals are rendered and applied through `autoinstall.sh`
+as shown above. In the default approve mode nothing is installed or mutated
+without approval.
 
 ## Auto mode — unattended install with post-hoc review (#355)
 
@@ -194,10 +241,11 @@ Safety rails:
 
 ## Autonomous mutation ownership contract (#750)
 
-This contract establishes who a future background curator may modify. It does
-not generate or apply a skill patch yet. Foreground user-approved installs and
-the transactional `ccc_codex_skills.py` setup/self-update path remain separate
-authority domains and do not call this autonomous write gate.
+This contract establishes who a background curator may modify. The #751
+incremental engine above consumes this classification and exact-target
+contract. Foreground user-approved installs and the transactional
+`ccc_codex_skills.py` setup/self-update path remain separate authority domains
+and do not bypass this autonomous write gate.
 
 The classifier uses this fail-closed precedence:
 
@@ -303,9 +351,9 @@ ownership, pin state, and provenance. Mismatch, expiry, cross-attempt or
 cross-operation use, path drift, and replay are denied. Every receipt is
 single-use and is consumed on an authorization decision or checked denial.
 The successful response is a validation result for the exact proposal, not a
-reusable capability: a future apply engine must perform this validation
-immediately in its own write path. Actual patch/write generation, application,
-and that atomic apply integration remain out of scope for #750.
+reusable capability. The #751 apply path performs equivalent exact target and
+provenance validation again under the mutation lock; it never treats a prior
+read or inventory snapshot as write authority.
 
 ## Migration & rollback (Claude ↔ Codex)
 
