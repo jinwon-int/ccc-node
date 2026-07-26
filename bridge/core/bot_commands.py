@@ -6,7 +6,7 @@ import logging
 import re
 from datetime import datetime
 from pathlib import Path as FilePath
-from typing import Awaitable, Callable, Optional, Protocol
+from typing import Any, Awaitable, Callable, Iterable, Mapping, Optional, Protocol
 
 from telegram import (
     Update,
@@ -48,8 +48,21 @@ class _CommandConfig(Protocol):
     def claude_settings_path(self) -> FilePath: ...
 
 
+class _CommandSessionManager(Protocol):
+    async def get_session(self, key: Any) -> dict[str, Any]: ...
+
+    async def patch_session(
+        self,
+        key: Any,
+        *,
+        updates: Optional[Mapping[str, Any]] = None,
+        remove_fields: Iterable[str] = (),
+    ) -> None: ...
+
+
 class BotCommandMixin:
     _config: _CommandConfig
+    _session_manager: _CommandSessionManager
 
     async def _cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_access(update):

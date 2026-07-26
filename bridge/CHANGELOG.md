@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Typed Telegram command session boundary (#346).** Command handling now
+  declares its session read-and-patch dependency without changing persistence
+  behavior or the remaining composition ratchet.
 - **Typed Telegram command settings contract (#346).** Command handling now
   declares its read-only restart, data-directory, and Claude settings
   dependencies without changing command behavior or the remaining composition
