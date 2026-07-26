@@ -187,6 +187,14 @@ chmod 600 "$TMP/bad-op-proposal.json"
 out="$(tool guard-proposal --proposal "$TMP/bad-op-proposal.json")"; rc=$?
 ok "array operation is a stable contract rejection" '[ "$rc" = 2 ] && jq -e ".code == \"proposal_fields_invalid\"" >/dev/null <<<"$out"'
 
+read_json="$(tool read-target user-two SKILL.md --attempt-id review-bool-proposal --operation patch)"
+proposal_from_read "$read_json" "$TMP/bool-proposal.json"
+jq '.schema_version = true' "$TMP/bool-proposal.json" > "$TMP/bool-proposal.tmp"
+mv "$TMP/bool-proposal.tmp" "$TMP/bool-proposal.json"
+chmod 600 "$TMP/bool-proposal.json"
+out="$(tool guard-proposal --proposal "$TMP/bool-proposal.json")"; rc=$?
+ok "boolean proposal schema is rejected" '[ "$rc" = 2 ] && jq -e ".code == \"proposal_schema_invalid\"" >/dev/null <<<"$out"'
+
 read_json="$(tool read-target user-two SKILL.md --attempt-id review-bad-provider --operation patch)"
 proposal_from_read "$read_json" "$TMP/bad-provider-proposal.json"
 jq '.provider = {}' "$TMP/bad-provider-proposal.json" > "$TMP/bad-provider-proposal.tmp"
@@ -391,6 +399,12 @@ cp "$SKILLS/user-two/.autosave-meta.json" "$SKILLS/bundled-one/.autosave-meta.js
 chmod 600 "$SKILLS/bundled-one/.autosave-meta.json"
 out="$(tool status bundled-one)"
 ok "managed marker keeps precedence during dual-marker conflict" 'jq -e ".skills[0].base_classification == \"managed/bundled\" and .skills[0].reason == \"managed-marker-conflicts-with-autosave\"" >/dev/null <<<"$out"'
+sed 's/"schema_version":1/"schema_version":1.0/' \
+  "$SKILLS/bundled-one/.ccc-node-managed.json" > "$TMP/managed-float"
+mv "$TMP/managed-float" "$SKILLS/bundled-one/.ccc-node-managed.json"
+chmod 600 "$SKILLS/bundled-one/.ccc-node-managed.json"
+out="$(tool status bundled-one)"
+ok "float managed schema fails closed" 'jq -e ".skills[0].classification == \"unknown/unreadable\"" >/dev/null <<<"$out"'
 
 # Missing marker is user-owned; corrupt/mismatched metadata is unknown fail-closed.
 make_skill corrupt-one
@@ -493,6 +507,13 @@ printf '{broken\n' > "$BAD_STATE/skill-autosave-control.json"
 chmod 600 "$BAD_STATE/skill-autosave-control.json"
 out="$(python3 "$TOOL" --provider claude --skills-dir "$SKILLS" --state-dir "$BAD_STATE" status user-two)"
 ok "corrupt pin provenance fails all autonomous writes closed" 'jq -e ".skills[0].classification == \"unknown/unreadable\" and (.skills[0].autonomous_write_allowed | not)" >/dev/null <<<"$out"'
+
+BOOL_STATE="$TMP/bool-state"
+mkdir -m 700 "$BOOL_STATE"
+jq -nc '{schema_version:true, revision:0, records:{}}' > "$BOOL_STATE/skill-autosave-control.json"
+chmod 600 "$BOOL_STATE/skill-autosave-control.json"
+out="$(python3 "$TOOL" --provider claude --skills-dir "$SKILLS" --state-dir "$BOOL_STATE" status user-two)"
+ok "boolean control schema fails all autonomous writes closed" 'jq -e ".skills[0].classification == \"unknown/unreadable\" and (.skills[0].autonomous_write_allowed | not)" >/dev/null <<<"$out"'
 
 echo "----"
 echo "PASS=$pass FAIL=$fail"

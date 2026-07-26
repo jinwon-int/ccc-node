@@ -380,7 +380,8 @@ def _load_controls(context: Context) -> dict[str, Any]:
     except FileNotFoundError:
         return {"schema_version": 1, "revision": 0, "records": {}}
     if (
-        value.get("schema_version") != 1
+        type(value.get("schema_version")) is not int
+        or value["schema_version"] != 1
         or type(value.get("revision")) is not int
         or value["revision"] < 0
         or not isinstance(value.get("records"), dict)
@@ -407,7 +408,8 @@ def _control_record(context: Context, controls: dict[str, Any], name: str) -> di
 def _validate_managed_marker(context: Context, name: str, path: Path) -> dict[str, Any]:
     marker = _safe_json_file(path, owner=context.uid)
     if (
-        marker.get("schema_version") != 1
+        type(marker.get("schema_version")) is not int
+        or marker["schema_version"] != 1
         or marker.get("manager") != "ccc-node"
         or marker.get("name") != name
         or not isinstance(marker.get("source"), str)
@@ -590,20 +592,56 @@ def _skill_names(context: Context) -> list[str]:
 
 def _ensure_private_dir(path: Path, context: Context) -> None:
     _validate_existing_components(path.parent)
-    metadata = _lstat(path)
-    if metadata is None:
-        try:
-            path.mkdir(mode=0o700, parents=False)
-        except OSError:
-            raise ContractError("state_directory_create_failed") from None
-        metadata = path.lstat()
+    parent = _lstat(path.parent)
     if (
-        not stat.S_ISDIR(metadata.st_mode)
-        or stat.S_ISLNK(metadata.st_mode)
-        or metadata.st_uid != context.uid
-        or stat.S_IMODE(metadata.st_mode) != 0o700
+        parent is None
+        or not stat.S_ISDIR(parent.st_mode)
+        or stat.S_ISLNK(parent.st_mode)
+        or parent.st_uid != context.uid
+        or stat.S_IMODE(parent.st_mode) & 0o022
     ):
-        raise ContractError("unsafe_state_directory")
+        raise ContractError("unsafe_state_parent")
+    directory_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_DIRECTORY", 0)
+    )
+    parent_fd: int | None = None
+    try:
+        parent_fd = os.open(path.parent, directory_flags)
+        opened_parent = os.fstat(parent_fd)
+        if (
+            (opened_parent.st_dev, opened_parent.st_ino)
+            != (parent.st_dev, parent.st_ino)
+            or not stat.S_ISDIR(opened_parent.st_mode)
+            or opened_parent.st_uid != context.uid
+            or stat.S_IMODE(opened_parent.st_mode) & 0o022
+        ):
+            raise ContractError("unsafe_state_parent")
+        try:
+            metadata = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            try:
+                os.mkdir(path.name, mode=0o700, dir_fd=parent_fd)
+            except FileExistsError:
+                pass
+            except OSError:
+                raise ContractError("state_directory_create_failed") from None
+            metadata = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+            os.fsync(parent_fd)
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or stat.S_ISLNK(metadata.st_mode)
+            or metadata.st_uid != context.uid
+            or stat.S_IMODE(metadata.st_mode) != 0o700
+        ):
+            raise ContractError("unsafe_state_directory")
+    except OSError:
+        raise ContractError("state_directory_create_failed") from None
+    finally:
+        if parent_fd is not None:
+            os.close(parent_fd)
 
 
 def _prepare_state(context: Context) -> None:
@@ -611,7 +649,14 @@ def _prepare_state(context: Context) -> None:
         _ensure_private_dir(context.state_dir, context)
         return
     parent = context.state_dir.parent
-    if not parent.exists():
+    parent_metadata = _lstat(parent)
+    if (
+        parent_metadata is None
+        or not stat.S_ISDIR(parent_metadata.st_mode)
+        or stat.S_ISLNK(parent_metadata.st_mode)
+        or parent_metadata.st_uid != context.uid
+        or stat.S_IMODE(parent_metadata.st_mode) & 0o022
+    ):
         raise ContractError("state_parent_missing")
     _ensure_private_dir(context.state_dir, context)
 
@@ -717,6 +762,12 @@ def _append_ledger(context: Context, record: dict[str, Any]) -> None:
     _preflight_ledger(context)
     path = context.state_dir / _LEDGER_FILE
     before = _lstat(path)
+    directory_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_DIRECTORY", 0)
+    )
     flags = (
         os.O_WRONLY
         | os.O_APPEND
@@ -724,9 +775,18 @@ def _append_ledger(context: Context, record: dict[str, Any]) -> None:
         | getattr(os, "O_CLOEXEC", 0)
         | getattr(os, "O_NOFOLLOW", 0)
     )
+    directory_fd: int | None = None
     descriptor: int | None = None
     try:
-        descriptor = os.open(path, flags, 0o600)
+        directory_fd = os.open(context.state_dir, directory_flags)
+        directory = os.fstat(directory_fd)
+        if (
+            not stat.S_ISDIR(directory.st_mode)
+            or directory.st_uid != context.uid
+            or stat.S_IMODE(directory.st_mode) != 0o700
+        ):
+            raise ContractError("unsafe_state_directory")
+        descriptor = os.open(_LEDGER_FILE, flags, 0o600, dir_fd=directory_fd)
         opened = os.fstat(descriptor)
         if (
             not stat.S_ISREG(opened.st_mode)
@@ -747,11 +807,14 @@ def _append_ledger(context: Context, record: dict[str, Any]) -> None:
                 raise ContractError("ownership_ledger_write_failed")
             view = view[written:]
         os.fsync(descriptor)
+        os.fsync(directory_fd)
     except OSError:
         raise ContractError("ownership_ledger_write_failed") from None
     finally:
         if descriptor is not None:
             os.close(descriptor)
+        if directory_fd is not None:
+            os.close(directory_fd)
 
 
 def _transaction_record(
@@ -762,11 +825,11 @@ def _transaction_record(
     fields: dict[str, Any],
 ) -> dict[str, Any]:
     return {
+        **fields,
         "schema_version": 1,
         "event": event,
         "transaction_id": transaction_id,
         "ts": _timestamp(),
-        **fields,
         "outcome": outcome,
     }
 
@@ -1455,7 +1518,10 @@ def _command_read_target(
 
 def _proposal(path: Path, context: Context) -> dict[str, Any]:
     value = _safe_json_file(path, owner=context.uid, max_bytes=_MAX_JSON_BYTES)
-    if value.get("schema_version") != 1:
+    if (
+        type(value.get("schema_version")) is not int
+        or value["schema_version"] != 1
+    ):
         raise ContractError("proposal_schema_invalid")
     return value
 
