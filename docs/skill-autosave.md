@@ -265,6 +265,9 @@ Migration is conservative and does not rewrite existing files during status:
 - a legacy `installed_by=autosave` marker is recognized as revision `0` only
   when it has no `schema_version`, and its name/path shape and recorded
   SHA-256 match the current `SKILL.md`;
+- legacy revision `0` remains visible for migration, but destructive rollback
+  requires an explicit v2 `created_by=ccc-node` and
+  `rollback_eligible=true` marker;
 - unknown/future `schema_version` values never downgrade to the legacy parser;
 - legacy SHA drift, corrupt metadata, unsafe permissions, or unreadable files
   become `unknown/unreadable`, never an inferred owner;
@@ -311,7 +314,9 @@ is chosen from the active provider, never both. To move an autosave-installed
 skill between providers, roll it back on the source and let the target node
 re-draft/install it, or copy the `SKILL.md` by hand (Codex reads the same
 frontmatter/dir layout). Rollback is provider-scoped and marker-driven, so it
-works identically on either surface and always refuses hand-authored skills:
+works identically on either surface and always refuses hand-authored, adopted,
+pinned, legacy, or invalid-provenance skills. Eligibility validation and the
+archive rename run under the same ownership lock:
 
 ```bash
 # Codex node (CCC_SKILL_PROVIDER=codex): operates on ${CODEX_HOME}/skills

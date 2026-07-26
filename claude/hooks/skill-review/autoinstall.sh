@@ -43,7 +43,6 @@ PENDING_DIR="${CCC_SKILL_REVIEW_PENDING_DIR:-$STATE_DIR/pending-skills}"
 SPOOL="${CCC_PUSH_SPOOL:-$STATE_DIR/telegram-spool}"
 LOG="$STATE_DIR/skill-autoinstall.log"
 LEDGER="$STATE_DIR/skill-autosave-install.jsonl"
-ROLLBACK_DIR="$STATE_DIR/skill-autosave-rollback"
 MODE_FILE="$STATE_DIR/skill-autosave.mode"
 
 DAILY_CAP="${CCC_SKILL_AUTOSAVE_DAILY_CAP:-3}"
@@ -481,16 +480,14 @@ notify_summary() { # <summary-json>
 # ---------------------------------------------------------------------------
 
 rollback_one() { # <name>
-  local name="$1" dir arch
+  local name="$1" archive_json arch
   printf '%s' "$name" | grep -qE "$KEBAB" || { echo "rollback: invalid name: $name" >&2; return 1; }
-  dir="$SKILLS_DIR/$name"
-  if ! ownership_cmd rollback-check "$name" >/dev/null; then
+  if ! archive_json="$(ownership_cmd rollback-archive "$name")"; then
     echo "rollback: $name is not an unpinned rollback-eligible autosave install — refusing" >&2
     return 1
   fi
-  mkdir -p "$ROLLBACK_DIR" 2>/dev/null
-  arch="$ROLLBACK_DIR/$name.$(ts_id)"
-  mv "$dir" "$arch" 2>/dev/null || { echo "rollback: failed to archive $dir" >&2; return 1; }
+  arch="$(jq -r '.archive_path // empty' <<<"$archive_json" 2>/dev/null)"
+  [ -n "$arch" ] || { echo "rollback: archive result missing for $name" >&2; return 1; }
   jq -nc --arg ts "$(ts)" --arg name "$name" --arg arch "$arch" \
     '{event:"rollback", ts:$ts, name:$name, archived_to:$arch}' >> "$LEDGER" 2>/dev/null || true
   log "rollback name=$name archived_to=$arch"

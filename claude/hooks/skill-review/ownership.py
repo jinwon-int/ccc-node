@@ -25,6 +25,7 @@ _MANAGED_MARKER = ".ccc-node-managed.json"
 _CONTROL_FILE = "skill-autosave-control.json"
 _LEDGER_FILE = "skill-autosave-ownership.jsonl"
 _RECEIPT_DIR = "skill-autosave-read-receipts"
+_ROLLBACK_DIR = "skill-autosave-rollback"
 _LOCK_FILE = ".skill-autosave-ownership.lock"
 _MAX_JSON_BYTES = 64 * 1024
 _MAX_TARGET_BYTES = 1024 * 1024
@@ -834,9 +835,12 @@ class _MutationLock:
 
     def __exit__(self, *_args: object) -> None:
         if self.descriptor is not None:
-            fcntl.flock(self.descriptor, fcntl.LOCK_UN)
-            os.close(self.descriptor)
+            descriptor = self.descriptor
             self.descriptor = None
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            finally:
+                os.close(descriptor)
 
 
 def _write_marker_exclusive(
@@ -950,21 +954,26 @@ def _command_adopt(context: Context, name: str, dry_run: bool) -> dict[str, Any]
         raise ContractError(f"adopt_denied_{before['base_classification'].replace('/', '_')}")
     if dry_run:
         _preflight_mutation_state(context)
-    result = {
-        "ok": True,
-        "command": "adopt",
-        "changed": not dry_run,
-        "dry_run": dry_run,
-        "reason": "would-adopt" if dry_run else "adopted",
-        "target_id": before["target_id"],
-        "from": before["classification"],
-        "to": "pinned" if before["pinned"] else "autosave-managed",
-    }
     if dry_run:
-        return result
+        return {
+            "ok": True,
+            "command": "adopt",
+            "changed": False,
+            "dry_run": True,
+            "reason": "would-adopt",
+            "target_id": before["target_id"],
+            "from": before["classification"],
+            "to": "pinned" if before["pinned"] else "autosave-managed",
+        }
     with _MutationLock(context):
         current = _classification(context, name)
         if current["base_classification"] != "user-owned":
+            raise ContractError("adopt_state_changed")
+        if (
+            current["target_id"] != before["target_id"]
+            or current["skill_sha256"] != before["skill_sha256"]
+            or current["pinned"] != before["pinned"]
+        ):
             raise ContractError("adopt_state_changed")
         _preflight_ledger(context)
         marker = {
@@ -1017,8 +1026,18 @@ def _command_adopt(context: Context, name: str, dry_run: bool) -> dict[str, Any]
             outcome="changed",
             fields=transaction_fields,
         )
-    result["skill"] = _classification(context, name)
-    return result
+        after = _classification(context, name)
+    return {
+        "ok": True,
+        "command": "adopt",
+        "changed": True,
+        "dry_run": False,
+        "reason": "adopted",
+        "target_id": current["target_id"],
+        "from": current["classification"],
+        "to": after["classification"],
+        "skill": after,
+    }
 
 
 def _command_mark_created(context: Context, name: str) -> dict[str, Any]:
@@ -1087,29 +1106,139 @@ def _command_mark_created(context: Context, name: str) -> dict[str, Any]:
     }
 
 
-def _command_rollback_check(context: Context, name: str) -> dict[str, Any]:
+def _rollback_record(context: Context, name: str) -> dict[str, Any]:
     record = _classification(context, name)
     if record["pinned"]:
         raise ContractError("rollback_denied_pinned")
     if record["base_classification"] != "autosave-managed":
         raise ContractError("rollback_denied_not_autosave_managed")
     marker_path = _validate_skill_dir(context, name) / _AUTOSAVE_MARKER
-    marker = _safe_json_file(marker_path, owner=context.uid)
-    if marker.get("schema_version") == 2:
+    try:
         marker = _safe_json_file(marker_path, owner=context.uid, exact_mode=0o600)
-        if (
-            marker.get("created_by") != "ccc-node"
-            or marker.get("rollback_eligible") is not True
-        ):
-            raise ContractError("rollback_denied_not_rollback_eligible")
-    elif "schema_version" in marker or marker.get("installed_by") != "autosave":
+    except (ContractError, FileNotFoundError):
+        raise ContractError("rollback_denied_unknown_marker_schema") from None
+    if (
+        type(marker.get("schema_version")) is not int
+        or marker["schema_version"] != 2
+        or marker.get("created_by") != "ccc-node"
+        or marker.get("rollback_eligible") is not True
+    ):
         raise ContractError("rollback_denied_unknown_marker_schema")
+    return record
+
+
+def _command_rollback_check(context: Context, name: str) -> dict[str, Any]:
+    record = _rollback_record(context, name)
     return {
         "ok": True,
         "command": "rollback-check",
         "allowed": True,
         "name": name,
         "target_id": record["target_id"],
+    }
+
+
+def _command_rollback_archive(context: Context, name: str) -> dict[str, Any]:
+    with _MutationLock(context):
+        record = _rollback_record(context, name)
+        rollback_dir = context.state_dir / _ROLLBACK_DIR
+        archive_name = (
+            f"{name}.{_now().strftime('%Y%m%d%H%M%S')}.{uuid.uuid4().hex[:8]}"
+        )
+        transaction_id = uuid.uuid4().hex
+        transaction_fields = {
+            "provider": context.provider,
+            "name": name,
+            "target_id": record["target_id"],
+            "archive_name_sha256": _sha256(archive_name.encode()),
+        }
+        _append_ledger(
+            context,
+            _transaction_record(
+                "rollback",
+                transaction_id,
+                outcome="prepared",
+                fields=transaction_fields,
+            ),
+        )
+        _ensure_private_dir(rollback_dir, context)
+        directory_flags = (
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_DIRECTORY", 0)
+        )
+        skills_fd: int | None = None
+        rollback_fd: int | None = None
+        renamed = False
+        durable = True
+        try:
+            skills_fd = os.open(context.skills_dir, directory_flags)
+            rollback_fd = os.open(rollback_dir, directory_flags)
+            source = os.stat(name, dir_fd=skills_fd, follow_symlinks=False)
+            if (
+                not stat.S_ISDIR(source.st_mode)
+                or source.st_uid != context.uid
+                or stat.S_IMODE(source.st_mode) & 0o022
+            ):
+                raise ContractError("rollback_source_changed")
+            try:
+                os.stat(archive_name, dir_fd=rollback_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            else:
+                raise ContractError("rollback_archive_exists")
+            os.rename(
+                name,
+                archive_name,
+                src_dir_fd=skills_fd,
+                dst_dir_fd=rollback_fd,
+            )
+            renamed = True
+            try:
+                os.fsync(skills_fd)
+                os.fsync(rollback_fd)
+            except OSError:
+                durable = False
+        except ContractError:
+            _finish_transaction(
+                context,
+                "rollback",
+                transaction_id,
+                outcome="aborted",
+                fields=transaction_fields,
+            )
+            raise
+        except OSError:
+            _finish_transaction(
+                context,
+                "rollback",
+                transaction_id,
+                outcome="aborted",
+                fields=transaction_fields,
+            )
+            raise ContractError("rollback_archive_failed") from None
+        finally:
+            if skills_fd is not None:
+                os.close(skills_fd)
+            if rollback_fd is not None:
+                os.close(rollback_fd)
+        if not renamed:
+            raise ContractError("rollback_archive_failed")
+        _finish_transaction(
+            context,
+            "rollback",
+            transaction_id,
+            outcome="archived" if durable else "archived-durability-uncertain",
+            fields=transaction_fields,
+        )
+    return {
+        "ok": True,
+        "command": "rollback-archive",
+        "changed": True,
+        "name": name,
+        "archive_path": str(rollback_dir / archive_name),
+        "durable": durable,
     }
 
 
@@ -1261,6 +1390,7 @@ def _command_read_target(
             "inode": snapshot.inode,
             "size": snapshot.size,
             "mtime_ns": snapshot.mtime_ns,
+            "ctime_ns": snapshot.ctime_ns,
         },
         "created_at": _timestamp(created),
         "expires_at": _timestamp(created + timedelta(seconds=_receipt_ttl_seconds())),
@@ -1412,12 +1542,79 @@ def _validate_receipt_context(
     receipt_id: str,
     context: Context,
 ) -> None:
-    if receipt.get("schema_version") != 1 or receipt.get("receipt_id") != receipt_id:
+    if (
+        type(receipt.get("schema_version")) is not int
+        or receipt["schema_version"] != 1
+        or receipt.get("receipt_id") != receipt_id
+    ):
         raise ContractError("receipt_invalid")
     if receipt.get("consumed") is not False:
         raise ContractError("receipt_consumed")
     if receipt.get("provider") != context.provider:
         raise ContractError("receipt_context_mismatch")
+
+
+def _validate_receipt_payload(receipt: dict[str, Any]) -> None:
+    required = {
+        "attempt_id",
+        "operation",
+        "provider",
+        "name",
+        "target_id",
+        "relative_target",
+        "expected_sha256",
+        "expected_provenance_revision",
+        "expected_provenance_sha256",
+        "file_identity",
+        "created_at",
+        "expires_at",
+    }
+    if not required.issubset(receipt):
+        raise ContractError("receipt_invalid")
+    identity = receipt["file_identity"]
+    if (
+        not isinstance(receipt["attempt_id"], str)
+        or not _ATTEMPT_RE.fullmatch(receipt["attempt_id"])
+        or not isinstance(receipt["operation"], str)
+        or receipt["operation"] not in _ALLOWED_OPERATIONS
+        or not isinstance(receipt["provider"], str)
+        or receipt["provider"] not in {"claude", "codex"}
+        or not isinstance(receipt["name"], str)
+        or not _NAME_RE.fullmatch(receipt["name"])
+        or not isinstance(receipt["target_id"], str)
+        or not re.fullmatch(r"[0-9a-f]{64}", receipt["target_id"])
+        or not isinstance(receipt["relative_target"], str)
+        or not isinstance(receipt["expected_sha256"], str)
+        or not re.fullmatch(r"[0-9a-f]{64}", receipt["expected_sha256"])
+        or (
+            receipt["expected_provenance_revision"] is not None
+            and (
+                type(receipt["expected_provenance_revision"]) is not int
+                or receipt["expected_provenance_revision"] < 0
+            )
+        )
+        or (
+            receipt["expected_provenance_sha256"] is not None
+            and (
+                not isinstance(receipt["expected_provenance_sha256"], str)
+                or not re.fullmatch(
+                    r"[0-9a-f]{64}",
+                    receipt["expected_provenance_sha256"],
+                )
+            )
+        )
+        or not isinstance(identity, dict)
+        or any(
+            type(identity.get(field)) is not int or identity[field] < 0
+            for field in ("device", "inode", "size", "mtime_ns", "ctime_ns")
+        )
+    ):
+        raise ContractError("receipt_invalid")
+    _relative_parts(receipt["relative_target"])
+    created = _parse_timestamp(receipt["created_at"])
+    expires = _parse_timestamp(receipt["expires_at"])
+    if expires <= created:
+        raise ContractError("receipt_invalid")
 
 
 def _command_guard_proposal(context: Context, proposal_path: Path) -> dict[str, Any]:
@@ -1465,6 +1662,7 @@ def _command_guard_proposal(context: Context, proposal_path: Path) -> dict[str, 
             "expected_provenance_sha256",
         )
         try:
+            _validate_receipt_payload(receipt)
             if any(proposal.get(field) != receipt.get(field) for field in comparable):
                 raise ContractError(code)
             if proposal["operation"] not in _ALLOWED_OPERATIONS:
@@ -1485,6 +1683,7 @@ def _command_guard_proposal(context: Context, proposal_path: Path) -> dict[str, 
                 or snapshot.inode != identity.get("inode")
                 or snapshot.size != identity.get("size")
                 or snapshot.mtime_ns != identity.get("mtime_ns")
+                or snapshot.ctime_ns != identity.get("ctime_ns")
             ):
                 raise ContractError("target_drift")
             classification = _classification(context, proposal["name"])
@@ -1559,6 +1758,8 @@ def _parser() -> argparse.ArgumentParser:
     mark_parser.add_argument("name")
     rollback_parser = subparsers.add_parser("rollback-check")
     rollback_parser.add_argument("name")
+    rollback_archive_parser = subparsers.add_parser("rollback-archive")
+    rollback_archive_parser.add_argument("name")
     return parser
 
 
@@ -1576,6 +1777,8 @@ def main(argv: list[str] | None = None) -> int:
             result = _command_mark_created(context, args.name)
         elif args.command == "rollback-check":
             result = _command_rollback_check(context, args.name)
+        elif args.command == "rollback-archive":
+            result = _command_rollback_archive(context, args.name)
         elif args.command == "pin":
             result = _command_pin(context, args.name, True, args.dry_run)
         elif args.command == "unpin":

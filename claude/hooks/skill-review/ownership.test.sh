@@ -65,6 +65,54 @@ after="$(find "$STATE" "$SKILLS/user-one" -printf '%P:%s:%T@\\n' | sort)"
 ok "adopt dry-run reports transition" 'jq -e ".dry_run == true and .changed == false and .reason == \"would-adopt\"" >/dev/null <<<"$out"'
 ok "adopt dry-run has no filesystem effect" '[ "$before" = "$after" ]'
 
+# A pin/skill transition while adopt waits for the mutation lock is rejected
+# instead of returning stale pre-lock transition metadata.
+make_skill adopt-race
+TOOL_PATH="$TOOL" SKILLS_PATH="$SKILLS" STATE_PATH="$STATE" python3 - <<'PY'
+import importlib.util
+import os
+from pathlib import Path
+import sys
+
+spec = importlib.util.spec_from_file_location("ownership_adopt_race_test", os.environ["TOOL_PATH"])
+assert spec is not None and spec.loader is not None
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+real_classification = module._classification
+classification_calls = 0
+
+
+def raced_classification(context: object, name: str) -> dict[str, object]:
+    global classification_calls
+    record = dict(real_classification(context, name))
+    classification_calls += 1
+    if classification_calls == 2:
+        record["pinned"] = True
+        record["classification"] = "pinned"
+        record["autonomous_write_allowed"] = False
+    return record
+
+
+module._classification = raced_classification
+context = module.Context(
+    provider="claude",
+    skills_dir=Path(os.environ["SKILLS_PATH"]),
+    state_dir=Path(os.environ["STATE_PATH"]),
+    uid=os.geteuid(),
+)
+try:
+    module._command_adopt(context, "adopt-race", False)
+except module.ContractError as error:
+    marker = Path(os.environ["SKILLS_PATH"]) / "adopt-race" / ".autosave-meta.json"
+    raise SystemExit(
+        0 if error.code == "adopt_state_changed" and not marker.exists() else 1
+    )
+raise SystemExit(1)
+PY
+rc=$?
+ok "adopt rejects a locked-state pin race" '[ "$rc" = 0 ]'
+
 # Explicit adopt produces owner-only v2 provenance and body-free ledger.
 out="$(tool adopt user-one)"
 ok "adopt makes skill autonomous-managed" 'jq -e ".skill.classification == \"autosave-managed\" and .skill.autonomous_write_allowed" >/dev/null <<<"$out"'
@@ -74,6 +122,14 @@ ok "ownership ledger is owner-only and body-free" '[ "$(stat -c %a "$STATE/skill
 ok "adopt audit has durable prepared and terminal phases" 'jq -s -e "[.[] | select(.event == \"adopt\" and .name == \"user-one\")] | group_by(.transaction_id) | any(map(.outcome) == [\"prepared\", \"changed\"])" "$STATE/skill-autosave-ownership.jsonl" >/dev/null'
 tool rollback-check user-one >/dev/null 2>&1; rc=$?
 ok "adopted user skill is never rollback eligible" '[ "$rc" != 0 ]'
+
+# V2 ccc-node rollback validation and archive rename share one ownership lock.
+make_skill rollback-one
+tool mark-created rollback-one >/dev/null
+out="$(tool rollback-archive rollback-one)"
+archive_path="$(jq -r '.archive_path' <<<"$out")"
+ok "rollback archive moves only eligible v2 install" '[ ! -e "$SKILLS/rollback-one" ] && [ -f "$archive_path/SKILL.md" ] && jq -e ".changed == true and .durable == true" >/dev/null <<<"$out"'
+ok "rollback archive has prepared and terminal audit phases" 'jq -s -e "[.[] | select(.event == \"rollback\" and .name == \"rollback-one\")] | group_by(.transaction_id) | any(map(.outcome) == [\"prepared\", \"archived\"])" "$STATE/skill-autosave-ownership.jsonl" >/dev/null'
 
 # Pin is an overlay: it blocks autonomous mutation without erasing ownership.
 before="$(find "$STATE" -printf '%P:%s:%T@\\n' | sort)"
@@ -143,6 +199,27 @@ read_json="$(tool read-target user-two SKILL.md --attempt-id review-provider-con
 proposal_from_read "$read_json" "$TMP/provider-context-proposal.json"
 out="$(python3 "$TOOL" --provider codex --skills-dir "$SKILLS" --state-dir "$STATE" guard-proposal --proposal "$TMP/provider-context-proposal.json")"; rc=$?
 ok "receipt is bound directly to provider context" '[ "$rc" = 2 ] && jq -e ".code == \"receipt_context_mismatch\"" >/dev/null <<<"$out"'
+
+read_json="$(tool read-target user-two SKILL.md --attempt-id review-missing-nullable --operation patch)"
+proposal_from_read "$read_json" "$TMP/missing-nullable-proposal.json"
+receipt_id="$(jq -r '.receipt.receipt_id' <<<"$read_json")"
+receipt_path="$STATE/skill-autosave-read-receipts/$receipt_id.json"
+jq 'del(.expected_provenance_sha256)' "$receipt_path" > "$TMP/missing-nullable-receipt"
+mv "$TMP/missing-nullable-receipt" "$receipt_path"
+chmod 600 "$receipt_path"
+out="$(tool guard-proposal --proposal "$TMP/missing-nullable-proposal.json")"; rc=$?
+ok "missing nullable receipt key is denied without KeyError" '[ "$rc" = 3 ] && jq -e ".code == \"receipt_invalid\"" >/dev/null <<<"$out"'
+ok "malformed receipt denial is single-use" 'jq -e ".consumed == true and .outcome == \"denied\"" "$receipt_path" >/dev/null'
+
+read_json="$(tool read-target user-two SKILL.md --attempt-id review-bool-schema --operation patch)"
+proposal_from_read "$read_json" "$TMP/bool-schema-proposal.json"
+receipt_id="$(jq -r '.receipt.receipt_id' <<<"$read_json")"
+receipt_path="$STATE/skill-autosave-read-receipts/$receipt_id.json"
+jq '.schema_version = true' "$receipt_path" > "$TMP/bool-schema-receipt"
+mv "$TMP/bool-schema-receipt" "$receipt_path"
+chmod 600 "$receipt_path"
+out="$(tool guard-proposal --proposal "$TMP/bool-schema-proposal.json")"; rc=$?
+ok "boolean receipt schema is a stable rejection" '[ "$rc" = 2 ] && jq -e ".code == \"receipt_invalid\"" >/dev/null <<<"$out"'
 
 # Deterministically simulate a ctime-only change between the two target fstats.
 TOOL_PATH="$TOOL" SKILLS_PATH="$SKILLS" STATE_PATH="$STATE" python3 - <<'PY'
@@ -331,6 +408,8 @@ jq -nc --arg path "$SKILLS/legacy-one/SKILL.md" --arg sha "$legacy_sha" '{
 chmod 644 "$SKILLS/legacy-one/.autosave-meta.json"
 out="$(tool status legacy-one)"
 ok "matching legacy marker migrates read-only in memory" 'jq -e ".skills[0].classification == \"autosave-managed\" and .skills[0].provenance_revision == 0" >/dev/null <<<"$out"'
+out="$(tool rollback-check legacy-one)"; rc=$?
+ok "legacy marker is never destructive-rollback eligible" '[ "$rc" != 0 ] && jq -e ".code == \"rollback_denied_unknown_marker_schema\"" >/dev/null <<<"$out"'
 printf '\n# manual drift\n' >> "$SKILLS/legacy-one/SKILL.md"
 out="$(tool status legacy-one)"
 ok "legacy SHA mismatch fails closed" 'jq -e ".skills[0].classification == \"unknown/unreadable\"" >/dev/null <<<"$out"'
