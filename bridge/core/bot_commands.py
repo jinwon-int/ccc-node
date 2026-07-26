@@ -48,7 +48,7 @@ from telegram_bot.core.project_chat_types import (
     TypingCallback,
 )
 from telegram_bot.core.usage import UsageSnapshot, render_usage
-from telegram_bot.memory.distill_types import DistillTrigger
+from telegram_bot.memory.distill_types import DistillJob, DistillTrigger
 from .conversation_paths import resolve_conversation_file
 from telegram_bot.utils.chat_logger import log_debug
 from telegram_bot.utils import tg_errors
@@ -155,6 +155,41 @@ class _CommandProjectChat(Protocol):
     ) -> bool: ...
 
 
+class _EnqueuePreviousCodexSession(Protocol):
+    def __call__(
+        self,
+        session: dict[str, Any],
+        trigger: DistillTrigger,
+        *,
+        user_id: int | None = None,
+        chat_id: int | None = None,
+        discriminator: str | None = None,
+    ) -> Awaitable[DistillJob | None]: ...
+
+
+class _SwitchProviderIfNeeded(Protocol):
+    def __call__(
+        self,
+        session_key: Any,
+        user_id: int,
+        chat_id: int,
+        session: dict[str, Any] | None = None,
+    ) -> Awaitable[tuple[dict[str, Any], bool]]: ...
+
+
+class _SaveSessionId(Protocol):
+    def __call__(
+        self,
+        session_key: Any,
+        response: ChatResponse,
+        *,
+        user_id: int | None = None,
+        chat_id: int | None = None,
+        request_text: str = "",
+        turn_marker: str | None = None,
+    ) -> Awaitable[None]: ...
+
+
 class BotCommandMixin:
     _config: _CommandConfig
     _session_manager: _CommandSessionManager
@@ -169,6 +204,22 @@ class BotCommandMixin:
     _require_chat: Callable[[Update], Chat]
     _require_callback_query: Callable[[Update], CallbackQuery]
     _conversation_key: Callable[[int, int | None], Any]
+    _active_provider: Callable[[], str]
+    _enqueue_previous_codex_session: _EnqueuePreviousCodexSession
+    _switch_provider_if_needed: _SwitchProviderIfNeeded
+    _session_provider: Callable[[Any], Awaitable[str]]
+    _save_session_id: _SaveSessionId
+    _cancel_user_voice_tasks: Callable[[Any], Awaitable[int]]
+    _invalidate_codex_approvals: Callable[[int, int], None]
+    _deny_codex_approvals: Callable[[int | None, int | None], int]
+    _permission_callback: PermissionCallback
+    _codex_approval_policy: Callable[[], str]
+    _codex_approvals_reviewer: Callable[[], str | None]
+    _codex_sandbox_policy: Callable[
+        [],
+        Mapping[str, AgentJsonValue] | None,
+    ]
+    _codex_approval_callback: AgentApprovalCallback
 
     async def _cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_access(update):

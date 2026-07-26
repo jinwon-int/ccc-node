@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Typed Telegram command provider boundary (#346).** Command handling now
+  declares its provider, session, approval, and voice callables without
+  changing command or runtime behavior.
 - **Typed Telegram command access boundary (#346).** Command handling now
   declares its application, access-check, update projection, and conversation
   key callables without changing authorization or handler behavior.
