@@ -121,6 +121,29 @@ out="$(tool guard-proposal --proposal "$TMP/pinned-proposal.json")"; rc=$?
 ok "pin blocks a previously read autonomous proposal" '[ "$rc" = 3 ] && jq -e ".code == \"autonomous_write_denied_pinned\"" >/dev/null <<<"$out"'
 tool unpin user-two >/dev/null
 
+# Malformed structured values fail with stable contract codes before set
+# membership or receipt lookup; a receipt is also bound to its provider context.
+read_json="$(tool read-target user-two SKILL.md --attempt-id review-bad-op --operation patch)"
+proposal_from_read "$read_json" "$TMP/bad-op-proposal.json"
+jq '.operation = []' "$TMP/bad-op-proposal.json" > "$TMP/bad-op-proposal.tmp"
+mv "$TMP/bad-op-proposal.tmp" "$TMP/bad-op-proposal.json"
+chmod 600 "$TMP/bad-op-proposal.json"
+out="$(tool guard-proposal --proposal "$TMP/bad-op-proposal.json")"; rc=$?
+ok "array operation is a stable contract rejection" '[ "$rc" = 2 ] && jq -e ".code == \"proposal_fields_invalid\"" >/dev/null <<<"$out"'
+
+read_json="$(tool read-target user-two SKILL.md --attempt-id review-bad-provider --operation patch)"
+proposal_from_read "$read_json" "$TMP/bad-provider-proposal.json"
+jq '.provider = {}' "$TMP/bad-provider-proposal.json" > "$TMP/bad-provider-proposal.tmp"
+mv "$TMP/bad-provider-proposal.tmp" "$TMP/bad-provider-proposal.json"
+chmod 600 "$TMP/bad-provider-proposal.json"
+out="$(tool guard-proposal --proposal "$TMP/bad-provider-proposal.json")"; rc=$?
+ok "object provider is a stable contract rejection" '[ "$rc" = 2 ] && jq -e ".code == \"proposal_fields_invalid\"" >/dev/null <<<"$out"'
+
+read_json="$(tool read-target user-two SKILL.md --attempt-id review-provider-context --operation patch)"
+proposal_from_read "$read_json" "$TMP/provider-context-proposal.json"
+out="$(python3 "$TOOL" --provider codex --skills-dir "$SKILLS" --state-dir "$STATE" guard-proposal --proposal "$TMP/provider-context-proposal.json")"; rc=$?
+ok "receipt is bound directly to provider context" '[ "$rc" = 2 ] && jq -e ".code == \"receipt_context_mismatch\"" >/dev/null <<<"$out"'
+
 # Deterministically simulate a ctime-only change between the two target fstats.
 TOOL_PATH="$TOOL" SKILLS_PATH="$SKILLS" STATE_PATH="$STATE" python3 - <<'PY'
 import importlib.util
@@ -172,6 +195,104 @@ raise SystemExit(1)
 PY
 rc=$?
 ok "ctime-only target drift is rejected" '[ "$rc" = 0 ]'
+
+# Simulate SKILL.md changing after the first snapshot but before the
+# classification decision is returned.
+TOOL_PATH="$TOOL" SKILLS_PATH="$SKILLS" STATE_PATH="$STATE" python3 - <<'PY'
+import dataclasses
+import importlib.util
+import os
+from pathlib import Path
+import sys
+
+spec = importlib.util.spec_from_file_location("ownership_classification_test", os.environ["TOOL_PATH"])
+assert spec is not None and spec.loader is not None
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+real_read_target = module._read_target
+read_calls = 0
+
+
+def drifted_read(context: object, name: str, relative: str) -> object:
+    global read_calls
+    snapshot = real_read_target(context, name, relative)
+    if relative == "SKILL.md":
+        read_calls += 1
+        if read_calls == 2:
+            return dataclasses.replace(snapshot, ctime_ns=snapshot.ctime_ns + 1)
+    return snapshot
+
+
+module._read_target = drifted_read
+context = module.Context(
+    provider="claude",
+    skills_dir=Path(os.environ["SKILLS_PATH"]),
+    state_dir=Path(os.environ["STATE_PATH"]),
+    uid=os.geteuid(),
+)
+record = module._classification(context, "user-two")
+raise SystemExit(
+    0
+    if record["classification"] == "unknown/unreadable"
+    and record["reason"] == "skill_changed_during_classification"
+    else 1
+)
+PY
+rc=$?
+ok "classification rejects post-snapshot skill drift" '[ "$rc" = 0 ]'
+
+# Simulate the marker changing from integer v2 to float v2 between its normal
+# and exact-mode reads.
+TOOL_PATH="$TOOL" SKILLS_PATH="$SKILLS" STATE_PATH="$STATE" python3 - <<'PY'
+import hashlib
+import importlib.util
+import os
+from pathlib import Path
+import sys
+
+spec = importlib.util.spec_from_file_location("ownership_schema_race_test", os.environ["TOOL_PATH"])
+assert spec is not None and spec.loader is not None
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+real_safe_json = module._safe_json_file
+marker_reads = 0
+
+
+def changed_schema(path: Path, **kwargs: object) -> dict[str, object]:
+    global marker_reads
+    value = real_safe_json(path, **kwargs)
+    if path.name == ".autosave-meta.json":
+        marker_reads += 1
+        if marker_reads == 2:
+            value = dict(value)
+            value["schema_version"] = 2.0
+    return value
+
+
+module._safe_json_file = changed_schema
+skills = Path(os.environ["SKILLS_PATH"])
+context = module.Context(
+    provider="claude",
+    skills_dir=skills,
+    state_dir=Path(os.environ["STATE_PATH"]),
+    uid=os.geteuid(),
+)
+skill_sha = hashlib.sha256((skills / "user-two" / "SKILL.md").read_bytes()).hexdigest()
+try:
+    module._validate_autosave_marker(
+        context,
+        "user-two",
+        skills / "user-two" / ".autosave-meta.json",
+        skill_sha,
+    )
+except module.ContractError as error:
+    raise SystemExit(0 if error.code == "autosave_metadata_invalid" else 1)
+raise SystemExit(1)
+PY
+rc=$?
+ok "v2 schema type is rechecked on the exact marker read" '[ "$rc" = 0 ]'
 
 # Managed provenance wins over autosave and stays self-update-only.
 make_skill bundled-one

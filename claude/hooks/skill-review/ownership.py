@@ -54,6 +54,7 @@ class TargetSnapshot:
     inode: int
     size: int
     mtime_ns: int
+    ctime_ns: int
 
 
 def _now() -> datetime:
@@ -357,6 +358,7 @@ def _read_target(context: Context, name: str, relative: str) -> TargetSnapshot:
             inode=after.st_ino,
             size=after.st_size,
             mtime_ns=after.st_mtime_ns,
+            ctime_ns=after.st_ctime_ns,
         )
     except FileNotFoundError:
         raise ContractError("target_missing") from None
@@ -425,7 +427,8 @@ def _validate_autosave_marker(
     if type(marker.get("schema_version")) is int and marker["schema_version"] == 2:
         marker = _safe_json_file(path, owner=context.uid, exact_mode=0o600)
         if (
-            marker.get("schema_version") != 2
+            type(marker.get("schema_version")) is not int
+            or marker["schema_version"] != 2
             or marker.get("manager") != "ccc-node-skill-autosave"
             or marker.get("ownership") != "autosave-managed"
             or marker.get("name") != name
@@ -498,6 +501,23 @@ def _classification(context: Context, name: str) -> dict[str, Any]:
         elif external_exists:
             base = "external/repo-installed"
             reason = "external-provenance-marker"
+        skill_after = _read_target(context, name, "SKILL.md")
+        if (
+            skill.sha256,
+            skill.device,
+            skill.inode,
+            skill.size,
+            skill.mtime_ns,
+            skill.ctime_ns,
+        ) != (
+            skill_after.sha256,
+            skill_after.device,
+            skill_after.inode,
+            skill_after.size,
+            skill_after.mtime_ns,
+            skill_after.ctime_ns,
+        ):
+            raise ContractError("skill_changed_during_classification")
         directory_after = _lstat(skill_dir)
         if (
             directory_after is None
@@ -1354,7 +1374,9 @@ def _validate_proposal_fields(proposal: dict[str, Any]) -> None:
         type(proposal.get("schema_version")) is not int
         or not isinstance(proposal.get("attempt_id"), str)
         or not _ATTEMPT_RE.fullmatch(proposal["attempt_id"])
+        or not isinstance(proposal.get("operation"), str)
         or proposal.get("operation") not in _ALLOWED_OPERATIONS
+        or not isinstance(proposal.get("provider"), str)
         or proposal.get("provider") not in {"claude", "codex"}
         or not isinstance(proposal.get("name"), str)
         or not _NAME_RE.fullmatch(proposal["name"])
@@ -1385,6 +1407,19 @@ def _validate_proposal_fields(proposal: dict[str, Any]) -> None:
     _relative_parts(proposal["relative_target"])
 
 
+def _validate_receipt_context(
+    receipt: dict[str, Any],
+    receipt_id: str,
+    context: Context,
+) -> None:
+    if receipt.get("schema_version") != 1 or receipt.get("receipt_id") != receipt_id:
+        raise ContractError("receipt_invalid")
+    if receipt.get("consumed") is not False:
+        raise ContractError("receipt_consumed")
+    if receipt.get("provider") != context.provider:
+        raise ContractError("receipt_context_mismatch")
+
+
 def _command_guard_proposal(context: Context, proposal_path: Path) -> dict[str, Any]:
     proposal = _proposal(proposal_path, context)
     _validate_proposal_fields(proposal)
@@ -1398,10 +1433,7 @@ def _command_guard_proposal(context: Context, proposal_path: Path) -> dict[str, 
             receipt = _safe_json_file(receipt_path, owner=context.uid, exact_mode=0o600)
         except FileNotFoundError:
             raise ContractError("receipt_missing") from None
-        if receipt.get("schema_version") != 1 or receipt.get("receipt_id") != receipt_id:
-            raise ContractError("receipt_invalid")
-        if receipt.get("consumed") is not False:
-            raise ContractError("receipt_consumed")
+        _validate_receipt_context(receipt, receipt_id, context)
         transaction_id = uuid.uuid4().hex
         outcome = "denied"
         code = "proposal_receipt_mismatch"
