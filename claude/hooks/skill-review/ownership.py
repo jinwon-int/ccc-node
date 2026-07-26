@@ -51,6 +51,12 @@ _DISTILL_TRIGGERS = {
 }
 _PROPOSAL_ID_RE = re.compile(r"^[0-9a-f]{64}$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_INCREMENTAL_TERMINAL_OUTCOMES = {
+    "aborted",
+    "applied",
+    "conflict",
+    "rolled_back",
+}
 _SAFE_PATH_COMPONENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _DIRECTIVE_RE = re.compile(
     r"(?:<\s*/?\s*(?:system|developer)\s*>|"
@@ -2687,19 +2693,43 @@ def _proposal_ledger_state(
 
 
 def _automatic_cap_used(rows: list[dict[str, Any]], cap_day: str) -> int:
-    states: dict[str, str] = {}
+    transactions: dict[str, tuple[str, str]] = {}
     for row in rows:
         proposal_id = row.get("proposal_id")
+        transaction_id = row.get("transaction_id")
         outcome = row.get("outcome")
         if (
-            row.get("event") == "skill-proposal-apply"
-            and row.get("automatic") is True
-            and row.get("cap_day") == cap_day
-            and isinstance(proposal_id, str)
-            and isinstance(outcome, str)
+            row.get("event") != "skill-proposal-apply"
+            or row.get("automatic") is not True
+            or row.get("cap_day") != cap_day
         ):
-            states[proposal_id] = outcome
-    return sum(outcome in {"prepared", "applied"} for outcome in states.values())
+            continue
+        if (
+            not isinstance(proposal_id, str)
+            or not _PROPOSAL_ID_RE.fullmatch(proposal_id)
+            or not isinstance(transaction_id, str)
+            or not transaction_id
+            or not isinstance(outcome, str)
+            or outcome not in {"prepared", *_INCREMENTAL_TERMINAL_OUTCOMES}
+        ):
+            raise ContractError("incremental_ledger_state_invalid")
+        previous = transactions.get(transaction_id)
+        if outcome == "prepared":
+            if previous is not None:
+                raise ContractError("incremental_ledger_state_invalid")
+        elif (
+            previous is None
+            or previous[0] != proposal_id
+            or previous[1] != "prepared"
+        ):
+            raise ContractError("incremental_ledger_state_invalid")
+        transactions[transaction_id] = (proposal_id, outcome)
+    active_proposals = {
+        proposal_id
+        for proposal_id, outcome in transactions.values()
+        if outcome in {"prepared", "applied"}
+    }
+    return len(active_proposals)
 
 
 def _command_automatic_usage(

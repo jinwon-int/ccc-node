@@ -406,6 +406,22 @@ rc=$?
 ok "prepared replay recovers durable mutation exactly once" \
   '[ "$rc" = 0 ] && [ "$(jq -s "[.[] | select(.event == \"skill-proposal-apply\" and .proposal_id == (\"9\"*64) and .outcome == \"applied\")] | length" "$STATE/skill-autosave-ownership.jsonl")" = 1 ]'
 
+# Cap accounting rejects impossible or corrupted transaction state instead of
+# letting an unknown last outcome release a previously consumed slot.
+jq -nc '{
+  schema_version:1,
+  event:"skill-proposal-apply",
+  transaction_id:"invalid-cap-transition",
+  ts:"2099-01-01T00:00:00Z",
+  outcome:"unknown-terminal",
+  proposal_id:("e"*64),
+  automatic:true,
+  cap_day:"2099-01-01"
+}' >> "$STATE/skill-autosave-ownership.jsonl"
+out="$(tool automatic-usage --day 2099-01-01)"; rc=$?
+ok "invalid cap-ledger transition fails closed" \
+  '[ "$rc" = 2 ] && jq -e ".code == \"incremental_ledger_state_invalid\"" >/dev/null <<<"$out"'
+
 echo "----"
 echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
