@@ -1,16 +1,16 @@
 """Owner-only Telegram bridge for provider-neutral agent approvals."""
 
-# mypy: disable-error-code="attr-defined"
-
 from __future__ import annotations
 
 import asyncio
 import logging
 import secrets
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Protocol
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application
 
 from telegram_bot.core.agent_runtime import ApprovalDecision, ApprovalRequestEvent
 
@@ -69,11 +69,38 @@ class _PendingCodexApproval:
     message_id: int | None = None
 
 
+class _ApprovalConfig(Protocol):
+    @property
+    def allowed_user_ids(self) -> Sequence[int]: ...
+
+
+class _ApprovalProjectChat(Protocol):
+    def invalidate_agent_approvals(
+        self, user_id: int, chat_id: int | None = None
+    ) -> None: ...
+
+    def is_agent_approval_active(
+        self, user_id: int, chat_id: int, generation: int
+    ) -> bool: ...
+
+
 class BotApprovalMixin:
     """Manage bounded, one-shot approval tokens without exposing request data."""
 
+    _config: _ApprovalConfig
+    _project_chat: _ApprovalProjectChat
+    _pending_codex_approvals: dict[str, _PendingCodexApproval]
+    _codex_approval_timeout_seconds: float
+    _codex_approval_max_pending: int
+    _bash_policy: Callable[[], str]
+    _conversation_key: Callable[[int, int | None], Any]
+    _require_application: Callable[
+        [],
+        Application[Any, Any, Any, Any, Any, Any],
+    ]
+
     def _initialize_codex_approvals(self) -> None:
-        self._pending_codex_approvals: dict[str, _PendingCodexApproval] = {}
+        self._pending_codex_approvals = {}
         self._codex_approval_timeout_seconds = 60.0
         self._codex_approval_max_pending = 32
 
