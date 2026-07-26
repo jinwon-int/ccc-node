@@ -1,0 +1,268 @@
+{
+  "$defs": {
+    "DistillProvenance": {
+      "additionalProperties": false,
+      "properties": {
+        "distilled_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "provider": {
+          "const": "codex",
+          "type": "string"
+        },
+        "source_thread_hash": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "trigger": {
+          "enum": [
+            "new_command",
+            "provider_switch",
+            "auto_new",
+            "explicit",
+            "shutdown",
+            "checkpoint"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "provider",
+        "source_thread_hash",
+        "trigger",
+        "distilled_at"
+      ],
+      "type": "object"
+    },
+    "CreateProposal": {
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "const": "create",
+          "type": "string"
+        },
+        "name": {
+          "maxLength": 64,
+          "minLength": 1,
+          "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$",
+          "type": "string"
+        },
+        "summary": {
+          "maxLength": 600,
+          "minLength": 1,
+          "type": "string"
+        },
+        "reason": {
+          "maxLength": 600,
+          "minLength": 1,
+          "type": "string"
+        },
+        "evidence_excerpt": {
+          "maxLength": 200,
+          "type": "string"
+        },
+        "skill_md": {
+          "description": "Complete SKILL.md with YAML frontmatter; no credentials or injected directives.",
+          "maxLength": 16384,
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "action",
+        "name",
+        "summary",
+        "reason",
+        "evidence_excerpt",
+        "skill_md"
+      ],
+      "type": "object"
+    },
+    "NoopProposal": {
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "const": "noop",
+          "type": "string"
+        },
+        "reason": {
+          "maxLength": 600,
+          "minLength": 1,
+          "type": "string"
+        },
+        "evidence_excerpt": {
+          "maxLength": 200,
+          "type": "string"
+        }
+      },
+      "required": [
+        "action",
+        "reason",
+        "evidence_excerpt"
+      ],
+      "type": "object"
+    },
+    "PatchProposal": {
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "const": "patch",
+          "type": "string"
+        },
+        "target_skill": {
+          "maxLength": 64,
+          "minLength": 1,
+          "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$",
+          "type": "string"
+        },
+        "relative_target": {
+          "maxLength": 240,
+          "minLength": 1,
+          "type": "string"
+        },
+        "expected_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "old_text": {
+          "maxLength": 32768,
+          "minLength": 1,
+          "type": "string"
+        },
+        "new_text": {
+          "maxLength": 32768,
+          "type": "string"
+        },
+        "improvement_reason": {
+          "maxLength": 600,
+          "minLength": 1,
+          "type": "string"
+        },
+        "reason": {
+          "maxLength": 600,
+          "minLength": 1,
+          "type": "string"
+        },
+        "evidence_excerpt": {
+          "maxLength": 200,
+          "type": "string"
+        }
+      },
+      "required": [
+        "action",
+        "target_skill",
+        "relative_target",
+        "expected_sha256",
+        "old_text",
+        "new_text",
+        "improvement_reason",
+        "reason",
+        "evidence_excerpt"
+      ],
+      "type": "object"
+    },
+    "WriteFileProposal": {
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "const": "write_file",
+          "type": "string"
+        },
+        "target_skill": {
+          "maxLength": 64,
+          "minLength": 1,
+          "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$",
+          "type": "string"
+        },
+        "relative_target": {
+          "maxLength": 240,
+          "minLength": 1,
+          "type": "string"
+        },
+        "expected_absent": {
+          "const": true,
+          "type": "boolean"
+        },
+        "expected_provenance_revision": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "expected_provenance_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "content": {
+          "maxLength": 49152,
+          "minLength": 1,
+          "type": "string"
+        },
+        "improvement_reason": {
+          "maxLength": 600,
+          "minLength": 1,
+          "type": "string"
+        },
+        "reason": {
+          "maxLength": 600,
+          "minLength": 1,
+          "type": "string"
+        },
+        "evidence_excerpt": {
+          "maxLength": 200,
+          "type": "string"
+        }
+      },
+      "required": [
+        "action",
+        "target_skill",
+        "relative_target",
+        "expected_absent",
+        "expected_provenance_revision",
+        "expected_provenance_sha256",
+        "content",
+        "improvement_reason",
+        "reason",
+        "evidence_excerpt"
+      ],
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "description": "Codex-native incremental skill proposal output. Existing schema-v1 create-only output remains accepted by the local parser but the backend emits v2.",
+  "properties": {
+    "schema_version": {
+      "const": 2,
+      "type": "integer"
+    },
+    "provenance": {
+      "$ref": "#/$defs/DistillProvenance"
+    },
+    "proposals": {
+      "items": {
+        "oneOf": [
+          {
+            "$ref": "#/$defs/CreateProposal"
+          },
+          {
+            "$ref": "#/$defs/PatchProposal"
+          },
+          {
+            "$ref": "#/$defs/WriteFileProposal"
+          },
+          {
+            "$ref": "#/$defs/NoopProposal"
+          }
+        ]
+      },
+      "maxItems": 2,
+      "type": "array"
+    }
+  },
+  "required": [
+    "schema_version",
+    "provenance",
+    "proposals"
+  ],
+  "title": "SkillCandidateOutputV2",
+  "type": "object"
+}

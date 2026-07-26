@@ -1,11 +1,15 @@
 ---
 name: skill-suggest
-description: Detect frequently-repeated procedures from this node's Claude Code transcripts and propose new skills (human-in-the-loop), and review or roll back skills the autosave auto mode installed. Use when asked to find automatable routines, "what should be a skill", to review skill candidates, or to list/rollback auto-installed (autosave) skills. Scans transcripts, ranks repeated command shapes, and drafts SKILL.md proposals for approval — this skill itself never installs anything without the user's OK.
+description: Detect repeated procedures and review create, patch, or support-file skill proposals (human-in-the-loop), and audit or roll back autosave auto-mode changes. Use when asked to find automatable routines, improve an existing skill, review skill candidates, or list and roll back autosave-installed skills.
 ---
 
 # skill-suggest — propose skills from repeated work (+ autosave post-hoc review)
 
-Approximates "auto-skillification": find procedures you keep repeating and turn the good ones into skills. Detection is automatic; **anything this skill authors/installs requires user approval** (no silent skill creation). Hermes-style Skill Review may also stage draft `SKILL.md` packages under `~/.claude/state/pending-skills/` after SessionEnd.
+Approximates "auto-skillification": find procedures you keep repeating and
+either improve the matching skill or create a distinct one. Detection is
+automatic; **anything this skill authors or applies requires user approval**.
+Skill Review may stage legacy `SKILL.md` drafts or isolated v2
+`proposal.json` create/patch/write_file packages under the pending queue.
 
 Two autosave modes change what "review" means here (`docs/skill-autosave.md`):
 - **approve** (default): drafts wait in the pending queue; this skill is the approval gate (step 1 below).
@@ -22,9 +26,20 @@ Two autosave modes change what "review" means here (`docs/skill-autosave.md`):
    ```bash
    STATE="${CCC_STATE_DIR:-$HOME/.claude/state}"
    jq . "$STATE/pending-skills/<id>/meta.json"
-   sed -n '1,220p' "$STATE/pending-skills/<id>/SKILL.md"
+   AUTO="${CCC_CLAUDE_DIR:-$HOME/.claude}/hooks/skill-review/autoinstall.sh"
+   if [ -f "$STATE/pending-skills/<id>/proposal.json" ]; then
+     bash "$AUTO" render <id>
+   else
+     sed -n '1,220p' "$STATE/pending-skills/<id>/SKILL.md"
+   fi
    ```
-   Approve only after reading the full draft and checking for node-specific facts or secrets:
+   For a v2 proposal, approve only after checking its exact target, expected
+   hashes, provenance and full diff/content. Never copy v2 content by hand:
+   ```bash
+   bash "$AUTO" apply <id>
+   ```
+   For a legacy `SKILL.md` draft, approve only after reading the full draft and
+   checking for node-specific facts or secrets:
    ```bash
    STATE="${CCC_STATE_DIR:-$HOME/.claude/state}"
    id="<id>"

@@ -30,6 +30,7 @@ from .skill_candidate_backend import (
     SKILL_CANDIDATE_PROMPT,
     canonical_skill_candidate_input_bytes,
 )
+from .skill_candidate_inventory import MAX_INVENTORY_JSON_BYTES
 
 logger = logging.getLogger(__name__)
 
@@ -157,6 +158,7 @@ class SkillCandidateCollectorWorker:
                             _RESERVED_OVERHEAD_TOKENS
                             + len(SKILL_CANDIDATE_PROMPT.encode("utf-8"))
                             + len(payload)
+                            + MAX_INVENTORY_JSON_BYTES
                         ),
                         output_tokens=MAX_SKILL_CANDIDATE_OUTPUT_BYTES,
                         requests=1,

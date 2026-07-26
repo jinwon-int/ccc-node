@@ -33,6 +33,8 @@
 #   ownership-status    ownership/pin/autonomous-write classification (JSON)
 #   list-unmanaged      protected/non-autonomous skills (JSON)
 #   adopt|pin|unpin     explicit owner controls (support --dry-run)
+#   render <draft-id>   render one v2 action/target/diff for owner review
+#   apply <draft-id>    explicitly apply one reviewed v2 proposal
 set -uo pipefail
 export LC_ALL=C
 
@@ -118,13 +120,42 @@ fm_close_line() { awk 'NR>1 && /^---[[:space:]]*$/{print NR; exit}' "$1" 2>/dev/
 
 pending_drafts() {
   find "$PENDING_DIR" -mindepth 1 -maxdepth 1 -type d 2>/dev/null \
-    | grep -Ev '\.(approved|rejected|installed)-[0-9]+$' | sort
+    | grep -Ev '/\.stage-|(\.(approved|rejected|installed)-[0-9]+$)' | sort
 }
 
 pending_count() { pending_drafts | grep -c . ; }
 
 installs_today() {
   jq -r 'select(.event=="install") | .ts' "$LEDGER" 2>/dev/null | grep -c "^$(date -u +%F)"
+}
+
+incremental_installs_today() {
+  local value day
+  if value="$(ownership_cmd automatic-usage 2>/dev/null | jq -r '.used // empty' 2>/dev/null)"; then
+    case "$value" in ''|*[!0-9]*) return 1 ;; esac
+    printf '%s\n' "$value"
+    return 0
+  fi
+  day="$(date -u +%F)"
+  if [ ! -e "$STATE_DIR/skill-autosave-ownership.jsonl" ]; then
+    printf '0\n'
+    return 0
+  fi
+  value="$(jq -s -r --arg day "$day" '
+    reduce (
+      .[]
+      | select(
+          .event == "skill-proposal-apply"
+          and .automatic == true
+          and .cap_day == $day
+          and (.proposal_id | type) == "string"
+          and (.outcome | type) == "string"
+        )
+    ) as $row ({}; .[$row.proposal_id] = $row.outcome)
+    | [.[] | select(. == "prepared" or . == "applied")] | length
+  ' "$STATE_DIR/skill-autosave-ownership.jsonl" 2>/dev/null)" || return 1
+  case "$value" in ''|*[!0-9]*) return 1 ;; esac
+  printf '%s\n' "$value"
 }
 
 # ---------------------------------------------------------------------------
@@ -319,14 +350,20 @@ do_run() {
     return 0
   fi
 
-  local work dir id f name desc verdict rec sha sid dest
+  local work dir id f name desc verdict rec sha sid dest proposal_file action apply_json apply_rc validation_json
   local -a installed=() blocked=() newly_blocked=() would_install=()
-  local deferred=0 today_used
+  local deferred=0 today_used legacy_used incremental_used incremental_cap
   work="$(mktemp -d 2>/dev/null)" || work="$STATE_DIR/.autoinstall-work.$$"
   mkdir -p "$work" 2>/dev/null
   trap 'rm -rf "$work" 2>/dev/null; rmdir "$LOCKDIR" 2>/dev/null' RETURN
-  today_used="$(installs_today)"
-  case "$today_used" in ''|*[!0-9]*) today_used=0 ;; esac
+  legacy_used="$(installs_today)"
+  case "$legacy_used" in ''|*[!0-9]*) legacy_used=0 ;; esac
+  if ! incremental_used="$(incremental_installs_today)"; then
+    log "skip reason=incremental-usage-unavailable trigger=$TRIGGER"
+    printf '{"mode":"auto","skipped":"incremental-usage-unavailable"}\n'
+    return 0
+  fi
+  today_used=$((legacy_used + incremental_used))
 
   # Appends to do_run's blocked/newly_blocked via bash dynamic scoping. The
   # -d re-check swallows the hook/sweep race: if the other layer installed and
@@ -345,7 +382,82 @@ do_run() {
   while IFS= read -r dir; do
     [ -d "$dir" ] || continue
     id="$(basename "$dir")"
+    proposal_file="$dir/proposal.json"
     f="$dir/SKILL.md"
+    if [ -f "$proposal_file" ]; then
+      if [ -e "$f" ]; then
+        record_block "$dir" "$id" "proposal mixed-payload"; continue
+      fi
+      validation_json="$(ownership_cmd validate-proposal --proposal "$proposal_file" 2>/dev/null)"
+      apply_rc=$?
+      if [ "$apply_rc" -ne 0 ]; then
+        verdict="$(jq -r '.code // "incremental_proposal_invalid"' <<<"$validation_json" 2>/dev/null)"
+        record_block "$dir" "$id" "$verdict"; continue
+      fi
+      action="$(jq -r '.action // empty' <<<"$validation_json" 2>/dev/null)"
+      case "$action" in
+        create)
+          f="$work/$id.SKILL.md"
+          if ! jq -j '.proposal.skill_md' "$proposal_file" > "$f" 2>/dev/null; then
+            record_block "$dir" "$id" "proposal invalid-create"; continue
+          fi
+          ;;
+        patch|write_file)
+          if [ $((today_used + ${#installed[@]})) -ge "$DAILY_CAP" ]; then
+            deferred=$((deferred + 1))
+            log "deferred id=$id reason=daily-cap cap=$DAILY_CAP trigger=$TRIGGER"
+            continue
+          fi
+          if [ "$AUTONOMY_DRY" = 1 ]; then
+            apply_json="$(ownership_cmd apply-proposal --proposal "$proposal_file" --dry-run 2>/dev/null)"
+            apply_rc=$?
+            if [ "$apply_rc" -ne 0 ]; then
+              verdict="$(jq -r '.code // "proposal-dry-run-failed"' <<<"$apply_json" 2>/dev/null)"
+              record_block "$dir" "$id" "$verdict"; continue
+            fi
+            name="$(jq -r '.proposal.target_skill' "$proposal_file" 2>/dev/null)"
+            would_install+=("$name:$action")
+            log "dry-run id=$id name=$name action=$action reason=autonomy-dry-run trigger=$TRIGGER"
+            continue
+          fi
+          incremental_cap=$((DAILY_CAP - legacy_used))
+          if [ "$incremental_cap" -lt 1 ]; then
+            deferred=$((deferred + 1))
+            log "deferred id=$id reason=daily-cap cap=$DAILY_CAP trigger=$TRIGGER"
+            continue
+          fi
+          apply_json="$(ownership_cmd apply-proposal --proposal "$proposal_file" \
+            --automatic --daily-cap "$incremental_cap" 2>/dev/null)"
+          apply_rc=$?
+          if [ "$apply_rc" -ne 0 ]; then
+            verdict="$(jq -r '.code // "proposal-apply-failed"' <<<"$apply_json" 2>/dev/null)"
+            if [ "$verdict" = "incremental_daily_cap_exhausted" ]; then
+              deferred=$((deferred + 1))
+              log "deferred id=$id reason=daily-cap cap=$DAILY_CAP trigger=$TRIGGER"
+              continue
+            fi
+            record_block "$dir" "$id" "$verdict"; continue
+          fi
+          name="$(jq -r '.proposal.target_skill' "$proposal_file" 2>/dev/null)"
+          if [ -f "$dir/meta.json" ]; then
+            jq --arg at "$(ts)" '.status="installed" | .installed_by="autosave" | .installed_at=$at' \
+              "$dir/meta.json" > "$dir/meta.json.tmp" 2>/dev/null \
+              && mv "$dir/meta.json.tmp" "$dir/meta.json" 2>/dev/null || rm -f "$dir/meta.json.tmp"
+          fi
+          rm -f "$dir/autosave-block.json" 2>/dev/null
+          mv "$dir" "$dir.installed-$(ts_id)" 2>/dev/null || true
+          installed+=("$name:$action")
+          log "installed id=$id name=$name action=$action trigger=$TRIGGER"
+          continue
+          ;;
+        noop)
+          record_block "$dir" "$id" "proposal staged-noop"; continue
+          ;;
+        *)
+          record_block "$dir" "$id" "proposal invalid-action"; continue
+          ;;
+      esac
+    fi
     if ! verdict="$(gate_lint "$f")"; then
       record_block "$dir" "$id" "$verdict"; continue
     fi
@@ -416,6 +528,7 @@ do_run() {
     rm -f "$dir/autosave-block.json" 2>/dev/null
     mv "$dir" "$dir.installed-$(ts_id)" 2>/dev/null || true
     installed+=("$name")
+    legacy_used=$((legacy_used + 1))
     log "installed id=$id name=$name sha=$sha trigger=$TRIGGER"
   done < <(pending_drafts)
 
@@ -541,23 +654,194 @@ do_list() {
 }
 
 do_status() {
+  local legacy_used incremental_used total_used
+  legacy_used="$(installs_today)"
+  case "$legacy_used" in ''|*[!0-9]*) legacy_used=0 ;; esac
+  if incremental_used="$(incremental_installs_today)"; then
+    total_used=$((legacy_used + incremental_used))
+  else
+    total_used="unknown"
+  fi
   echo "mode: $(resolve_mode)"
   echo "provider: ${SKILL_PROVIDER:-claude} (skills dir: $SKILLS_DIR)"
   echo "off-switch: $([ -f "$STATE_DIR/skill-autosave.disabled" ] && echo ON || echo off)"
-  echo "daily cap: $(installs_today)/$DAILY_CAP used today"
+  echo "daily cap: $total_used/$DAILY_CAP used today"
   echo "pending drafts: $(pending_count)"
   echo "-- install ledger (last 5) --"; tail -5 "$LEDGER" 2>/dev/null || true
   echo "-- log (last 5) --"; tail -5 "$LOG" 2>/dev/null || true
+}
+
+proposal_dir() { # <draft-id>
+  local id="$1" dir
+  printf '%s' "$id" | grep -qE '^[A-Za-z0-9][A-Za-z0-9._-]{0,159}$' || return 2
+  dir="$PENDING_DIR/$id"
+  [ -d "$dir" ] && [ ! -L "$dir" ] || return 2
+  printf '%s\n' "$dir"
+}
+
+do_render() {
+  local dir proposal validation rc
+  dir="$(proposal_dir "${1:-}")" || {
+    echo "render: invalid or missing draft id" >&2
+    return 2
+  }
+  proposal="$dir/proposal.json"
+  if [ ! -f "$proposal" ] || [ -L "$proposal" ] || [ -e "$dir/SKILL.md" ]; then
+    echo "render: draft is not an isolated v2 proposal" >&2
+    return 2
+  fi
+  validation="$(ownership_cmd validate-proposal --proposal "$proposal")"
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    printf '%s\n' "$validation"
+    return "$rc"
+  fi
+  jq '{
+    proposal_id,
+    action:.proposal.action,
+    name:(.proposal.name // .proposal.target_skill // null),
+    relative_target:(.proposal.relative_target // null),
+    expected_sha256:(.proposal.expected_sha256 // null),
+    expected_provenance_revision:(.proposal.expected_provenance_revision // null),
+    improvement_reason:(.proposal.improvement_reason // null),
+    reason:.proposal.reason,
+    evidence_excerpt:.proposal.evidence_excerpt,
+    old_text:(.proposal.old_text // null),
+    new_text:(.proposal.new_text // null),
+    content:(.proposal.content // null),
+    skill_md:(.proposal.skill_md // null),
+    provenance
+  }' "$proposal"
+}
+
+do_apply() {
+  local dir proposal action result rc f name desc verdict dest sid sha rec lockdir validation
+  dir="$(proposal_dir "${1:-}")" || {
+    echo "apply: invalid or missing draft id" >&2
+    return 2
+  }
+  proposal="$dir/proposal.json"
+  if [ ! -f "$proposal" ] || [ -L "$proposal" ] || [ -e "$dir/SKILL.md" ]; then
+    echo "apply: draft is not an isolated v2 proposal" >&2
+    return 2
+  fi
+  validation="$(ownership_cmd validate-proposal --proposal "$proposal")"
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    printf '%s\n' "$validation"
+    return "$rc"
+  fi
+  action="$(jq -r '.action // empty' <<<"$validation" 2>/dev/null)"
+  case "$action" in
+    patch|write_file)
+      result="$(ownership_cmd apply-proposal --proposal "$proposal")"
+      rc=$?
+      [ "$rc" = 0 ] || {
+        printf '%s\n' "$result"
+        return "$rc"
+      }
+      ;;
+    create)
+      lockdir="$STATE_DIR/.autoinstall.lock"
+      mkdir "$lockdir" 2>/dev/null || {
+        echo '{"ok":false,"code":"autoinstall_locked"}'
+        return 2
+      }
+      trap 'rmdir "$lockdir" 2>/dev/null' RETURN
+      f="$dir/.approved-SKILL.md"
+      jq -j '.proposal.skill_md' "$proposal" > "$f" 2>/dev/null || {
+        rm -f "$f"
+        echo '{"ok":false,"code":"incremental_create_invalid"}'
+        return 2
+      }
+      verdict="$(gate_lint "$f")" || {
+        rm -f "$f"
+        jq -nc --arg code "$verdict" '{ok:false,code:$code}'
+        return 2
+      }
+      name="$(fm_field "$f" name)"
+      desc="$(fm_field "$f" description)"
+      verdict="$(gate_secrets "$f")" || {
+        rm -f "$f"
+        jq -nc --arg code "$verdict" '{ok:false,code:$code}'
+        return 2
+      }
+      verdict="$(gate_node_specific "$f")" || {
+        rm -f "$f"
+        jq -nc --arg code "$verdict" '{ok:false,code:$code}'
+        return 2
+      }
+      verdict="$(gate_codex_compat "$f")" || {
+        rm -f "$f"
+        jq -nc --arg code "$verdict" '{ok:false,code:$code}'
+        return 2
+      }
+      verdict="$(gate_dedup "$name" "$desc" "$dir")" || {
+        rm -f "$f"
+        jq -nc --arg code "$verdict" '{ok:false,code:$code}'
+        return 2
+      }
+      if declare -f ccc_ensure_skills_dir >/dev/null 2>&1; then
+        ccc_ensure_skills_dir "$SKILLS_DIR" || {
+          rm -f "$f"
+          echo '{"ok":false,"code":"unsafe-skills-dir"}'
+          return 2
+        }
+      fi
+      dest="$SKILLS_DIR/$name"
+      mkdir "$dest" 2>/dev/null || {
+        rm -f "$f"
+        echo '{"ok":false,"code":"create-target-exists"}'
+        return 2
+      }
+      if ! cp "$f" "$dest/SKILL.md" 2>/dev/null \
+        || ! ownership_cmd mark-created "$name" >/dev/null; then
+        rm -f "$dest/SKILL.md" "$dest/.autosave-meta.json" "$f" 2>/dev/null
+        rmdir "$dest" 2>/dev/null || true
+        echo '{"ok":false,"code":"create-publish-failed"}'
+        return 2
+      fi
+      rm -f "$f"
+      sha="$(file_sha "$dest/SKILL.md")"
+      sid="$(jq -r '.provenance.source_thread_hash // empty' "$proposal" 2>/dev/null)"
+      rec="$(jq -nc --arg ts "$(ts)" --arg id "$(basename "$dir")" --arg name "$name" \
+        --arg path "$dest/SKILL.md" --arg sid "$sid" --arg sha "$sha" --arg trg "$TRIGGER" \
+        '{event:"install",ts:$ts,id:$id,name:$name,path:$path,session_id:$sid,
+          sha256:$sha,installed_by:"approved",trigger:$trg}')"
+      printf '%s\n' "$rec" >> "$LEDGER" 2>/dev/null || true
+      result="$(jq -nc --arg name "$name" --arg sha "$sha" \
+        '{ok:true,command:"apply",action:"create",changed:true,name:$name,sha256:$sha}')"
+      ;;
+    *)
+      echo '{"ok":false,"code":"incremental_action_invalid"}'
+      return 2
+      ;;
+  esac
+  if [ -f "$dir/meta.json" ]; then
+    if jq --arg at "$(ts)" \
+      '.status="approved" | .installed_by="owner-approved" | .installed_at=$at' \
+      "$dir/meta.json" > "$dir/meta.json.tmp" 2>/dev/null; then
+      mv "$dir/meta.json.tmp" "$dir/meta.json" 2>/dev/null \
+        || rm -f "$dir/meta.json.tmp"
+    else
+      rm -f "$dir/meta.json.tmp"
+    fi
+  fi
+  rm -f "$dir/autosave-block.json" 2>/dev/null
+  mv "$dir" "$dir.approved-$(ts_id)" 2>/dev/null || true
+  printf '%s\n' "$result"
 }
 
 MODE_VERB="${1:-run}"
 case "$MODE_VERB" in
   run) do_run ;;
   list) do_list ;;
+  render) shift; do_render "${1:-}" ;;
+  apply) shift; do_apply "${1:-}" ;;
   rollback) shift; do_rollback "${1:-}" ;;
   status) do_status ;;
   ownership-status) shift; ownership_cmd status "$@" ;;
   list-unmanaged) shift; ownership_cmd list-unmanaged "$@" ;;
   adopt|pin|unpin) shift; ownership_cmd "$MODE_VERB" "$@" ;;
-  *) echo "usage: autoinstall.sh [run|list|rollback <name>|--all|status|ownership-status [name]|list-unmanaged|adopt <name> [--dry-run]|pin <name> [--dry-run]|unpin <name> [--dry-run]]" >&2; exit 2 ;;
+  *) echo "usage: autoinstall.sh [run|list|render <draft-id>|apply <draft-id>|rollback <name>|--all|status|ownership-status [name]|list-unmanaged|adopt <name> [--dry-run]|pin <name> [--dry-run]|unpin <name> [--dry-run]]" >&2; exit 2 ;;
 esac

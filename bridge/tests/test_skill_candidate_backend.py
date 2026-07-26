@@ -68,15 +68,16 @@ def _valid_output_json(*, trigger: str = "checkpoint") -> str:
     )
     return json.dumps(
         {
-            "schema_version": 1,
+            "schema_version": 2,
             "provenance": {
                 "provider": "codex",
                 "source_thread_hash": THREAD_HASH,
                 "trigger": trigger,
                 "distilled_at": "2026-07-23T10:00:00Z",
             },
-            "candidates": [
+            "proposals": [
                 {
+                    "action": "create",
                     "name": "codex-release-check",
                     "summary": "Capture the recurring Codex release verification checklist procedure.",
                     "reason": "The session repeated the same release verification steps.",
@@ -206,3 +207,23 @@ def test_backend_rejects_snapshot_provenance_mismatch(tmp_path: Path) -> None:
     with pytest.raises(SkillCandidateBackendError) as exc:
         asyncio.run(backend.extract(snapshot=_snapshot(), provenance=bad))
     assert exc.value.code == "skill_candidate_input_invalid"
+
+
+@async_test
+async def test_backend_maps_inventory_failure_to_body_free_code(
+    tmp_path: Path,
+) -> None:
+    class BrokenInventory:
+        def build(self) -> dict[str, object]:
+            raise OSError("sensitive local path")
+
+    executable = _stub(tmp_path, "exit 0")
+    backend = _backend(
+        tmp_path,
+        executable,
+        inventory_builder=BrokenInventory(),  # type: ignore[arg-type]
+    )
+    with pytest.raises(SkillCandidateBackendError) as exc:
+        await backend.extract(snapshot=_snapshot(), provenance=_provenance())
+    assert exc.value.code == "skill_candidate_inventory_failed"
+    assert "sensitive" not in str(exc.value)
