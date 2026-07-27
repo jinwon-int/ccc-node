@@ -31,7 +31,10 @@ coverage and are not comparable):
 **Floor policy**: `fail_under` stays ~2 points under the measured total so
 environment noise cannot flake the gate, and is raised in the same PR whenever
 a change lifts the measured total by more than that buffer. Staged targets:
-72 (now) → 75 → 80 as `bot_commands`/`bot_delivery` gain behavior tests.
+72 → 75 → 80 as `bot_commands`/`bot_delivery` gain behavior tests. **80 reached
+2026-07-27**: measured branch coverage 81.53% (1,753 tests) after the #346
+typed-composition refactor and the behavior-test waves, so the floor ratchets
+72 → 80 (1.5pt buffer).
 Never lower the floor to admit a regression; lowering requires an issue that
 explains why the coverage was lost.
 
