@@ -39,6 +39,7 @@ SPOOL="${CCC_PUSH_SPOOL:-$STATE_DIR/telegram-spool}"
 REVIEW="${CCC_SKILL_REVIEW_CMD:-$CLAUDE_DIR/hooks/skill-review.sh}"
 SCAN="${CCC_SKILL_SCAN_CMD:-$CLAUDE_DIR/skills/skill-suggest/scan.sh}"
 AUTOINSTALL="${CCC_SKILL_AUTOINSTALL_CMD:-$CLAUDE_DIR/hooks/skill-review/autoinstall.sh}"
+CURATOR="${CCC_SKILL_CURATOR_CMD:-$CLAUDE_DIR/hooks/skill-review/curator.py}"
 
 # Fleet-wide autonomy guard (#386): a single kill-switch/dry-run above every
 # no-approval write. The installed layout keeps the lib under the claude tree;
@@ -91,6 +92,7 @@ if [ "$MODE" = "status" ]; then
   echo "mode: $(resolve_mode) (approve = human gate, auto = machine gate + post-hoc notify)"
   echo "off-switch: $([ -f "$STATE_DIR/skill-autosave.disabled" ] && echo ON || echo off)"
   echo "autonomy: $(declare -f ccc_autonomy_state >/dev/null 2>&1 && ccc_autonomy_state || echo active) (kill = skip whole sweep, dry-run = draft/report only)"
+  echo "curator: ${CCC_SKILL_CURATOR_ENABLED:-false} (enabled=true lets the sweep run the deterministic stale/archive lifecycle; first auto run only seeds the interval timer)"
   echo "pending skill drafts: $(pending_count)"
   echo "candidates report: $(ls -la "$STATE_DIR/skill-candidates.md" 2>/dev/null || echo none)"
   echo "-- ledger (last 5) --";      tail -5 "$LEDGER" 2>/dev/null
@@ -204,6 +206,26 @@ if [ "$EFFECTIVE_MODE" = "auto" ]; then
     # Fall back to the approve-mode reminder below rather than going silent.
     EFFECTIVE_MODE="approve"
     log "autoinstall skipped reason=missing path=$AUTOINSTALL"
+  fi
+fi
+
+# --- 2c) curator lifecycle (#752, opt-in) --------------------------------------
+# Deterministic stale/archive lifecycle for autosave-managed skills. Default
+# OFF fleet-wide; enabling requires CCC_SKILL_CURATOR_ENABLED=true plus a
+# separate rollout decision (see docs/skill-autosave.md). The curator self-
+# gates (first-run deferral, interval, min-idle) and never calls a provider.
+# Under autonomy dry-run it reports only; kill already exited above.
+if [ "${CCC_SKILL_CURATOR_ENABLED:-false}" = "true" ]; then
+  if [ ! -f "$CURATOR" ]; then
+    log "curator skipped reason=missing path=$CURATOR"
+  elif ! command -v python3 >/dev/null 2>&1; then
+    log "curator skipped reason=no-python3"
+  else
+    curator_args="run --auto"
+    [ "$AUTONOMY_STATE" = "dry-run" ] && curator_args="run --auto --dry-run"
+    summary="$(python3 "$CURATOR" $curator_args 2>>"$LOG")" \
+      && log "curator $(printf '%s' "$summary" | head -c 500)" \
+      || log "curator failed (non-fatal)"
   fi
 fi
 
