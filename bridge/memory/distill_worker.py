@@ -261,6 +261,18 @@ class CodexDistillExtractionWorker:
             raise
         except Exception as error:
             error_code, terminal = _body_free_error_code(error)
+            # Status only — never provider output. A nonzero exit otherwise
+            # reaches the journal as one opaque code whatever the cause was
+            # (#760 was a schema rejection and had to be reproduced by hand).
+            # Recorded codes are unchanged; this is a log line beside them.
+            exit_status = getattr(error, "exit_status", None)
+            if isinstance(exit_status, int):
+                logger.warning(
+                    "Distill extraction failed: code=%s terminal=%s provider_exit_status=%d",
+                    error_code,
+                    terminal,
+                    exit_status,
+                )
             return await self._fail(
                 claimed,
                 error_code=error_code,
