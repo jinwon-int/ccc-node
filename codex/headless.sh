@@ -17,6 +17,8 @@ MODEL="${CCC_CODEX_MODEL:-${CCC_MODEL:-}}"
 REASONING="${CCC_CODEX_REASONING_EFFORT:-}"
 PROFILE="${CCC_CODEX_PROFILE:-}"
 WORKDIR="${CCC_CODEX_WORKDIR:-$PWD}"
+# Wall-clock cap in seconds (0 disables). Guards against a run that never returns.
+TMO="${CCC_HEADLESS_TIMEOUT:-1500}"
 
 case "$SANDBOX" in
   read-only|workspace-write|danger-full-access) ;;
@@ -55,8 +57,20 @@ args=(
 [ -n "$MODEL" ] && args+=(-m "$MODEL")
 [ -n "$REASONING" ] && args+=(-c "model_reasoning_effort=\"$REASONING\"")
 
-"$BIN" "${args[@]}" "$PROMPT" >"$EVENTS" 2>"$ERR"
+runner=("$BIN")
+case "$TMO" in
+  0|'') ;;
+  *[!0-9]*) echo "ccc-codex-headless: invalid CCC_HEADLESS_TIMEOUT: $TMO" >&2; exit 2 ;;
+  *) command -v timeout >/dev/null 2>&1 && runner=(timeout -k 30 "$TMO" "$BIN") ;;
+esac
+
+"${runner[@]}" "${args[@]}" "$PROMPT" >"$EVENTS" 2>"$ERR"
 rc=$?
+if [ "$rc" -eq 124 ]; then
+  echo "ccc-codex-headless: codex exceeded CCC_HEADLESS_TIMEOUT=${TMO}s and was killed" >&2
+  cat "$ERR" >&2
+  exit 124
+fi
 if [ "$rc" -ne 0 ]; then
   echo "ccc-codex-headless: codex exited $rc" >&2
   cat "$ERR" >&2

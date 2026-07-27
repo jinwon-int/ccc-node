@@ -103,6 +103,29 @@ captured output to the spool.
 
 Read-only/status modes never acquire locks, execute prompts, write bridge spools, install timers, edit crontab/systemd, send Telegram, call providers, or touch remotes. Execution mode may write task history and owner-only redacted spool entries, but still does not install timers or call Telegram/provider APIs directly. `add`/`remove`/`enable`/`disable` mutate only the validated task store via the same atomic private write path.
 
+### Hang guards
+
+A tick that never returns is the failure mode to design against: `Type=oneshot`
+defaults to `TimeoutStartSec=infinity`, so one stuck run pins the unit in
+`activating` and **the timer never fires again** until an operator intervenes.
+Two independent caps exist:
+
+- `TimeoutStartSec=` is always emitted by `install-agent-cron-systemd.sh`
+  (default `1800`; override with `--timeout-start SEC` or
+  `CCC_AGENT_CRON_TIMEOUT_START`, `infinity` to opt out).
+- Both headless runners wrap the provider CLI in `timeout` — `CCC_HEADLESS_TIMEOUT`
+  seconds (default `1500`, `0` disables), exiting `124` when tripped. This is the
+  only cap on Termux nodes, which have no systemd.
+
+Task prompts must not instruct the agent to block on an external condition.
+An observed real failure: a task told the agent to wait for a PR to become
+mergeable, and it emitted `until state=$(gh api …) && echo "$state" | grep -q
+'"m":true\|"m":false'; do sleep 5; done`. The PR was then merged, GitHub began
+returning `mergeable: null` for the closed PR, and the exit condition became
+unreachable — the loop ran for 11 days. Prefer a bounded number of polls with an
+explicit deadline, and treat "condition never became true" as a reportable
+outcome rather than something to wait out.
+
 ## Source boundaries
 
 - `schemas/agent-cron-task-store.schema.json` is the structural source of truth.
