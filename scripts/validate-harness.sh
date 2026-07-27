@@ -228,6 +228,12 @@ else
   err "Codex managed-skill validation/tests failed"
   tail -10 "$TMP/codex-skills-validate.out" "$TMP/codex-skills-test.out" 2>/dev/null
 fi
+if python3 scripts/ccc_doctor_bootpath_test.py >"$TMP/doctor-bootpath-test.out" 2>&1; then
+  say "  ok doctor bridge boot-path guard tests"
+else
+  err "doctor bridge boot-path guard tests failed"
+  tail -10 "$TMP/doctor-bootpath-test.out" 2>/dev/null
+fi
 for t in claude/hooks/observability.test.sh claude/hooks/security-scan.test.sh \
          scripts/validate-harness.test.sh \
          claude/hooks/redact.test.sh claude/hooks/scan-injection.test.sh \

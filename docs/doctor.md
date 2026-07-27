@@ -9,6 +9,13 @@
 - SessionStart/PostCompact memory bootstrap hooks and portable enforcement hook wiring.
 - Installed hook scripts and output-style files under the target Claude directory.
 - Telegram bridge status output when `bridge/start.sh` is present.
+- **Bridge boot path**: the systemd unit that would restart the bridge must point at the
+  checkout the bridge is *actually* serving from. A node can hold several checkouts
+  (`/opt/ccc-node`, `/root/ccc-node`, `/home/<user>/ccc-node`), so the live checkout is
+  derived from the running process — never from whichever path is found on disk first.
+  A mismatch is `수동필요`: the running bridge looks healthy, so nothing surfaces until a
+  reboot or `systemctl start` serves the stale twin. Observed on yukson 2026-07-27, where
+  an `enabled` unit pointed at a checkout 111 commits behind the live one.
 - Harness version anchor via `scripts/ccc-version.sh`.
 - Selected agent provider. For `CCC_AGENT_PROVIDER=codex`, deterministic CLI, app-server surface, and login readiness without a model turn or Telegram access.
 
