@@ -234,6 +234,12 @@ else
   err "doctor bridge boot-path guard tests failed"
   tail -10 "$TMP/doctor-bootpath-test.out" 2>/dev/null
 fi
+if python3 scripts/ccc_doctor_hookfiles_test.py >"$TMP/doctor-hookfiles-test.out" 2>&1; then
+  say "  ok doctor hook-tree walk tests"
+else
+  err "doctor hook-tree walk tests failed"
+  tail -10 "$TMP/doctor-hookfiles-test.out" 2>/dev/null
+fi
 for t in claude/hooks/observability.test.sh claude/hooks/security-scan.test.sh \
          scripts/validate-harness.test.sh \
          claude/hooks/redact.test.sh claude/hooks/scan-injection.test.sh \
