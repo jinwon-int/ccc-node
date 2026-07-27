@@ -33,6 +33,10 @@ ok "dry-run announces timer write"   'grep -q "would write .*ccc-agent-cron.time
 ok "dry-run emits oneshot service"   'grep -q "Type=oneshot" "$OUT"'
 ok "dry-run ExecStart is scheduler tick" 'grep -q "agent-cron.sh scheduler --execute --json" "$OUT"'
 ok "dry-run emits OnCalendar timer"  'grep -q "OnCalendar=" "$OUT"'
+# A hung tick must not pin Type=oneshot in `activating` forever (systemd defaults
+# TimeoutStartSec=infinity for oneshot), which would stop the timer firing. (#55)
+ok "dry-run emits TimeoutStartSec default" 'grep -q "^TimeoutStartSec=1800$" "$OUT"'
+ok "dry-run never emits infinite start timeout" '! grep -q "^TimeoutStartSec=infinity$" "$OUT"'
 ok "dry-run writes NO files" '[ ! -e "$TMP/sd" ]'
 ok "dry-run calls NO systemctl" '[ ! -f "$CALLS" ]'
 
@@ -88,6 +92,22 @@ run env CCC_SYSTEMD_DIR="$TMP/sd6" CCC_SYSTEMCTL="$STUB" bash "$SC" --apply --ru
 okc "$RC" 2 "invalid runner exits 2"
 run env CCC_SYSTEMD_DIR="$TMP/sd6" CCC_SYSTEMCTL="$STUB" bash "$SC" --apply --runner codex --codex-sandbox nope
 okc "$RC" 2 "invalid Codex sandbox exits 2"
+
+# ---- start-timeout guard: override, opt-out, validation --------------------
+# Dry-run keeps these hermetic (no writes, no systemctl stub exec).
+run env CCC_SYSTEMD_DIR="$TMP/sd7" CCC_SYSTEMCTL="$STUB" bash "$SC" --timeout-start 600
+okc "$RC" 0 "custom --timeout-start exits 0"
+ok "custom TimeoutStartSec honored" 'grep -q "^TimeoutStartSec=600$" "$OUT"'
+
+run env CCC_SYSTEMD_DIR="$TMP/sd8" CCC_SYSTEMCTL="$STUB" bash "$SC" --timeout-start infinity
+okc "$RC" 0 "explicit infinity opt-out exits 0"
+ok "explicit infinity honored" 'grep -q "^TimeoutStartSec=infinity$" "$OUT"'
+
+run env CCC_SYSTEMD_DIR="$TMP/sd9" CCC_SYSTEMCTL="$STUB" bash "$SC" --timeout-start 30min
+okc "$RC" 2 "non-numeric --timeout-start exits 2"
+
+run env CCC_SYSTEMD_DIR="$TMP/sd10" CCC_AGENT_CRON_TIMEOUT_START=900 CCC_SYSTEMCTL="$STUB" bash "$SC"
+ok "env CCC_AGENT_CRON_TIMEOUT_START honored" 'grep -q "^TimeoutStartSec=900$" "$OUT"'
 
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
