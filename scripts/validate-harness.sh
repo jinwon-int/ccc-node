@@ -282,6 +282,18 @@ for t in claude/hooks/observability.test.sh claude/hooks/security-scan.test.sh \
   else err "test failed: $t"; tail -5 "$TMP/htest.out"; fi
 done
 
+# Umask-0002 variant (#770): the ownership contract fail-closes on
+# group/other-writable skill dirs, so the umask-sensitive suites must also
+# pass on nodes whose default umask is 0002. CI runs 0022 — run these twice.
+for t in claude/hooks/skill-review.test.sh \
+         claude/hooks/skill-review/autoinstall.test.sh \
+         claude/hooks/skill-review/autoinstall-incremental.test.sh \
+         claude/hooks/skill-review/codex-autoinstall.test.sh; do
+  [ -f "$t" ] || { err "missing test: $t"; continue; }
+  if ( umask 0002; bash "$t" ) >"$TMP/htest.out" 2>&1; then say "  ok $(grep -E 'PASS=' "$TMP/htest.out" | tail -1) $t (umask 0002)";
+  else err "test failed (umask 0002): $t"; tail -5 "$TMP/htest.out"; fi
+done
+
 # 5) skill + agent frontmatter (must start with --- and carry name: + description:)
 say "== frontmatter =="
 fm_check() { # <file>

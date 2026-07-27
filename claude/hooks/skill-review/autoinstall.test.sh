@@ -16,6 +16,9 @@ SPOOL="$TMP/spool"
 PENDING="$STATE/pending-skills"
 mkdir -p "$STATE" "$SKILLS" "$PENDING"
 chmod 700 "$STATE"
+# The ownership contract fail-closes on group/other-writable skills roots, so
+# fixtures must model a compliant root under any umask (#770).
+chmod 700 "$SKILLS"
 
 run_auto() { # [extra env assignments...] verb [args...]
   CCC_STATE_DIR="$STATE" CLAUDE_SKILLS_DIR="$SKILLS" CCC_PUSH_SPOOL="$SPOOL" \
@@ -180,6 +183,7 @@ ok "similar description blocked" 'jq -e ".reason | startswith(\"dedup descriptio
 CAP_STATE="$TMP/capstate"; CAP_SKILLS="$TMP/capskills"; CAP_SPOOL="$TMP/capspool"
 mkdir -p "$CAP_STATE/pending-skills" "$CAP_SKILLS"
 chmod 700 "$CAP_STATE"
+chmod 700 "$CAP_SKILLS"  # contract-compliant root under any umask (#770)
 PENDING_SAVE="$PENDING"; STATE_SAVE="$STATE"; SKILLS_SAVE="$SKILLS"
 STATE="$CAP_STATE"; SKILLS="$CAP_SKILLS"; PENDING="$CAP_STATE/pending-skills"
 make_draft 20260101-000011-l-cap1 cap-one "Capture the first recurring maintenance procedure for the fleet nodes."
@@ -212,6 +216,9 @@ ok "rollback appends ledger event" 'jq -e "select(.event==\"rollback\") | .name 
 mkdir -p "$SKILLS/hand-made"
 printf -- '---\nname: hand-made\ndescription: Operator-authored skill that autosave must never touch at all.\n---\n\n# Hand\n' \
   > "$SKILLS/hand-made/SKILL.md"
+# Contract-compliant perms regardless of the runner umask (#770).
+chmod 700 "$SKILLS/hand-made"
+chmod 600 "$SKILLS/hand-made/SKILL.md"
 run_auto bash "$AUTO" rollback hand-made >/dev/null 2>&1; rc=$?
 ok "rollback refuses non-autosave skill" '[ "$rc" != 0 ] && [ -f "$SKILLS/hand-made/SKILL.md" ]'
 
@@ -233,6 +240,7 @@ ok "status reports mode and cap" 'grep -q "^mode: approve" <<<"$out" && grep -q 
 A_STATE="$TMP/autonomy-state"; A_SKILLS="$TMP/autonomy-skills"
 mkdir -p "$A_STATE/pending-skills" "$A_SKILLS"
 chmod 700 "$A_STATE"
+chmod 700 "$A_SKILLS"  # contract-compliant root under any umask (#770)
 make_draft_at() { # <store> <skills> <id> <name> <desc>
   local st="$1" sk="$2" id="$3" nm="$4" desc="$5"
   mkdir -p "$st/pending-skills/$id"
@@ -258,6 +266,17 @@ rm -f "$A_STATE/autonomy.dry-run"
 # active (default) still installs.
 out="$(CCC_STATE_DIR="$A_STATE" CLAUDE_SKILLS_DIR="$A_SKILLS" CCC_PUSH_SPOOL="$TMP/aspool" CCC_SKILL_AUTOSAVE_MODE=auto bash "$AUTO" run)"
 ok "default autonomy=active installs" '[ -f "$A_SKILLS/kill-me/SKILL.md" ]'
+
+# --- failed counter (#770): a non-compliant skills root fail-closes the
+# install and is reported as failed, distinct from a silent skip --------------
+F_STATE="$TMP/failstate"; F_SKILLS="$TMP/failskills"
+mkdir -p "$F_STATE/pending-skills" "$F_SKILLS"
+chmod 700 "$F_STATE"
+chmod 777 "$F_SKILLS"  # deliberately non-compliant: contract must fail closed
+make_draft_at "$F_STATE" "$F_SKILLS" f-fail fail-one "Capture the recurring failed-counter verification procedure here."
+out="$(CCC_STATE_DIR="$F_STATE" CLAUDE_SKILLS_DIR="$F_SKILLS" CCC_PUSH_SPOOL="$TMP/fspool" CCC_SKILL_AUTOSAVE_MODE=auto bash "$AUTO" run)"
+ok "non-compliant root reports failed=1, installs nothing" 'jq -e ".failed == 1 and (.installed | length == 0)" >/dev/null <<<"$out" && [ ! -e "$F_SKILLS/fail-one" ]'
+ok "failed install leaves draft pending" '[ -d "$F_STATE/pending-skills/f-fail" ]'
 
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
