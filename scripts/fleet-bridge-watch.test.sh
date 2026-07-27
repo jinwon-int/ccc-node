@@ -83,6 +83,35 @@ reply gamma /opt/ccc-node yes -
 run "alpha beta gamma"
 ok "one line per node" '[ "$(grep -cE "^(OK|DOWN|BOOTPATH|UNREACHABLE) " "$OUT")" = 3 ]'
 
+# ---- doctor sweep (opt-in) ------------------------------------------------
+# Only 3 of 12 nodes have agent-cron, so without this sweep the other 9 have no
+# periodic harness-drift check at all.
+reply_d() { # <node> <runtime> <avail> <unit> <doctor>
+  printf 'RUNTIME=%s\nAVAIL=%s\nUNIT=%s\nDOCTOR=%s\n' "$2" "$3" "$4" "$5" > "$TMP/reply/$1"
+}
+
+reply_d alpha /opt/ccc-node yes /opt/ccc-node 0
+run "alpha"
+okc "$RC" 0 "clean doctor passes"
+ok "clean doctor reports OK" 'grep -q "^OK alpha" "$OUT"'
+
+reply_d beta /opt/ccc-node yes /opt/ccc-node 1
+run "beta"
+okc "$RC" 1 "doctor drift exits nonzero"
+ok "drift names the exit code" 'grep -q "^DRIFT beta doctor_exit=1" "$OUT"'
+ok "drift is not reported as DOWN" '! grep -q "^DOWN beta" "$OUT"'
+
+# A node that cannot run doctor must not be reported as drifted.
+reply_d gamma /opt/ccc-node yes /opt/ccc-node -
+run "gamma"
+okc "$RC" 0 "absent doctor is not a failure"
+ok "absent doctor still reports OK" 'grep -q "^OK gamma" "$OUT"'
+
+# Bridge problems outrank doctor: a node that is down is DOWN, not DRIFT.
+reply_d delta /opt/ccc-node no /opt/ccc-node 1
+run "delta"
+ok "down bridge outranks doctor drift" 'grep -q "^DOWN delta" "$OUT" && ! grep -q "^DRIFT delta" "$OUT"'
+
 # ---- no hardcoded per-node checkout paths in the script -------------------
 # The whole point: paths come from the running process, never a baked table.
 ok "no hardcoded node->path table" \
