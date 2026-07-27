@@ -5,6 +5,8 @@
 # existing docs, commands, and systemd units. New code should target this Python
 # entrypoint directly when possible.
 import os as _os
+import contextlib
+import fcntl
 import shlex as _shlex
 import sys as _sys
 from pathlib import Path as _Path
@@ -127,6 +129,76 @@ extra_args = ''
 
 def load_doc():
     return load_store(store)
+
+
+def store_lock_path():
+    base = store.parent if str(store.parent) != '.' else Path.cwd()
+    return base / 'locks' / 'store.lock'
+
+
+@contextlib.contextmanager
+def store_lock():
+    """Serialize the whole read-modify-write of the task store.
+
+    write_doc replaces the file atomically, so the store is never torn — but
+    every writer previously did load -> mutate -> write with no mutual
+    exclusion, so two writers could interleave and the later write would drop
+    the earlier one's change entirely (a lost update, not corruption). Observed
+    on sogyo: `add` printed OK while a scheduler tick, holding a doc it had read
+    beforehand, wrote it back over the new task.
+
+    flock is used rather than the O_EXCL run locks: the kernel releases it when
+    the process exits, so a crash cannot leave a stale lock that wedges every
+    later mutation.
+    """
+    path = store_lock_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+
+# Fields a run owns. Everything else on the task (schedule, prompt, enabled,
+# payload) belongs to whoever edits it, and must survive a concurrent run.
+RUN_STATE_FIELDS = (
+    'runHistory', 'retryState', 'lastRunAt', 'lastStatus', 'lastRunId', 'runCount',
+)
+
+
+def commit_run_state(task_id, task, disable=False):
+    """Persist one run's outcome without clobbering concurrent edits.
+
+    The scheduler executes headless work between reading the store and writing
+    it back — often for minutes — so it cannot hold the lock across that window.
+    Instead it re-reads under the lock at write time and projects only the run
+    fields onto the fresh task, leaving any edit made meanwhile intact. Returns
+    False when the task was removed while the run was in flight.
+    """
+    with store_lock():
+        fresh, errors = load_doc()
+        if errors or not isinstance(fresh, dict):
+            return False
+        target = task_by_id(fresh, task_id)
+        if target is None:
+            return False
+        for field in RUN_STATE_FIELDS:
+            if field in task:
+                target[field] = task[field]
+            else:
+                target.pop(field, None)
+        # A run may only ever disable a task (one-shot completion, run limit
+        # reached) — never re-enable one — so this cannot revive something an
+        # operator disabled while the run was in flight.
+        if disable:
+            target['enabled'] = False
+        write_store(store, fresh)
+        return True
 
 
 def validate_doc(data):
@@ -1229,7 +1301,12 @@ def run_execute(data, task_id, at_value, as_json):  # noqa: C901 -- #348 baselin
                     one_shot_disabled = True
             except Exception:
                 pass
-        write_doc(data)
+        # Not write_doc(data): `data` was read before the headless work ran and
+        # is stale by now, so writing it whole would silently revert anything
+        # added or edited in the meantime.
+        # `enabled` may also have been cleared by apply_run_limit, not just by
+        # one-shot completion; both are the run's own decision.
+        commit_run_state(task_id, task, disable=task.get('enabled') is False)
     finally:
         release = release_for_run(task_id, run_id)
     result = {
@@ -1505,7 +1582,17 @@ def emit_crud(result, as_json):
 
 def _dispatch(data):
     if cmd in ('add', 'edit', 'remove', 'enable', 'disable'):
-        result, as_json, rc = crud_command(data)
+        # Re-read inside the lock: the copy loaded at startup may already be
+        # stale, and writing a mutation derived from it would drop whatever
+        # landed in between. These commands do no long-running work, so holding
+        # the lock across read+write costs nothing.
+        with store_lock():
+            fresh, errors = load_doc()
+            if errors:
+                for error in errors:
+                    print(f'agent-cron: {error}', file=sys.stderr)
+                return 1
+            result, as_json, rc = crud_command(fresh)
         emit_crud(result, as_json)
         return rc
     if cmd == 'lock':
