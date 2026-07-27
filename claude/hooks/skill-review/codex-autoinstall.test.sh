@@ -184,6 +184,7 @@ CC_STATE="$TMP/cc-state"; CC_CODEX="$TMP/cc-codex/skills"; CC_SPOOL="$TMP/cc-spo
 mkdir -p "$CC_STATE/pending-skills"
 chmod 700 "$CC_STATE"
 mkdir -p "$CC_CODEX"   # pre-create so all racers share one install target
+chmod 700 "$CC_CODEX"  # contract-compliant root under any umask (#770)
 cc_make() {
   mkdir -p "$CC_STATE/pending-skills/race-1"
   printf -- '---\nname: codex-race-one\ndescription: Capture the recurring Codex concurrency-safe install verification procedure.\n---\n\n# Race
@@ -211,6 +212,7 @@ ok "concurrent 10x writes exactly one install ledger row" '[ "$(jq -r "select(.e
 CAP_STATE="$TMP/cap-state"; CAP_CODEX="$TMP/cap-codex/skills"; CAP_SPOOL="$TMP/cap-spool"
 mkdir -p "$CAP_STATE/pending-skills" "$CAP_CODEX"
 chmod 700 "$CAP_STATE"
+chmod 700 "$CAP_CODEX"  # contract-compliant root under any umask (#770)
 mkdir -p "$CAP_STATE/pending-skills/cap-a" "$CAP_STATE/pending-skills/cap-b"
 printf -- '---\nname: codex-cap-a\ndescription: Capture the first recurring Codex maintenance procedure for the fleet nodes.\n---\n\n# A\n\n## Procedure\n1. Step.\n2. Verify.\n3. Record.\n4. Confirm.\n5. Done.\n' > "$CAP_STATE/pending-skills/cap-a/SKILL.md"
 printf -- '---\nname: codex-cap-b\ndescription: Capture the second recurring Codex maintenance procedure for backup checks.\n---\n\n# B\n\n## Procedure\n1. Step.\n2. Verify.\n3. Record.\n4. Confirm.\n5. Done.\n' > "$CAP_STATE/pending-skills/cap-b/SKILL.md"
