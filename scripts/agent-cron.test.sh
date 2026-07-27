@@ -635,5 +635,22 @@ CHAT_SPOOL2="$TMP/chat-spool-blocked"
 out="$(CCC_AGENT_CRON_STORE="$CHAT_STORE" CCC_HEADLESS_CMD="$FAKE_HEADLESS" CCC_PUSH_SPOOL="$CHAT_SPOOL2" bash "$CMD" run chat-run --json --at 2026-01-01T00:02:00Z)"; rc=$?
 ok "non-allowlisted telegram-chat is blocked, nothing spooled" '[ "$rc" = 0 ] && jq -e ".notification.delivery == \"blocked-not-allowlisted\"" <<<"$out" >/dev/null && [ -z "$(ls -A "$CHAT_SPOOL2" 2>/dev/null)" ]'
 
+# ---- unknown task id: reason, not a traceback -----------------------------
+# The failure shapes carry only ok/mode/taskId/error; emit_run read 'at' from
+# them, so a typo'd task id produced KeyError: 'at' instead of the reason, and
+# text mode never printed the reason even when it survived.
+out="$(CCC_AGENT_CRON_STORE="$STORE" bash "$CMD" run no-such-task --at 2026-01-01T00:02:00Z 2>&1)"; rc=$?
+ok "unknown task id exits 1" '[ "$rc" = 1 ]'
+ok "unknown task id reports the reason" 'grep -q "task id not found" <<<"$out"'
+ok "unknown task id does not traceback" '! grep -qE "Traceback|KeyError" <<<"$out"'
+ok "unknown task id still names the task" 'grep -q "no-such-task" <<<"$out"'
+
+out="$(CCC_AGENT_CRON_STORE="$STORE" bash "$CMD" run no-such-task --dry-run --at 2026-01-01T00:02:00Z 2>&1)"; rc=$?
+ok "unknown task id (dry-run) exits 1" '[ "$rc" = 1 ]'
+ok "unknown task id (dry-run) does not traceback" '! grep -qE "Traceback|KeyError" <<<"$out"'
+
+out="$(CCC_AGENT_CRON_STORE="$STORE" bash "$CMD" run no-such-task --json --at 2026-01-01T00:02:00Z 2>&1)"; rc=$?
+ok "unknown task id --json stays machine-readable" '[ "$rc" = 1 ] && jq -e ".ok == false and .error == \"task id not found\"" <<<"$out" >/dev/null'
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

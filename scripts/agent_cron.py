@@ -1261,8 +1261,15 @@ def emit_run(result, as_json):
     else:
         title = '# agent-cron run dry-run plan' if result.get('mode') == 'run-dry-run-read-only' else '# agent-cron run result'
         print(title + '\n')
-        print(f"- task: `{result['taskId']}`")
-        print(f"- at: `{result['at']}`")
+        print(f"- task: `{result.get('taskId')}`")
+        # Failure shapes (unknown task id, not in due plan) carry only
+        # ok/mode/taskId/error. Reading 'at' from them raised KeyError, so an
+        # unknown task id produced a traceback instead of the reason — and the
+        # reason was never printed in text mode even when it survived.
+        if result.get('error'):
+            print(f"- error: `{result['error']}`")
+            return
+        print(f"- at: `{result.get('at')}`")
         print(f"- due: `{str(result.get('due')).lower()}` status=`{result.get('status')}` scheduledAt=`{result.get('scheduledAt') or ''}`")
         if result.get('lock'):
             print(f"- lock: `{result['lock'].get('state')}` `{result['lock'].get('path')}`")
