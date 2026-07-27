@@ -359,6 +359,89 @@ reusable capability. The #751 apply path performs equivalent exact target and
 provenance validation again under the mutation lock; it never treats a prior
 read or inventory snapshot as write authority.
 
+## Usage telemetry and deterministic lifecycle curator (#752)
+
+`skill-review/curator.py` adds a Hermes-style lifecycle on top of the #750
+ownership contract. It manages **only `autosave-managed` skills** — provenance
+is declared by the marker contract, never inferred. Everything else
+(user-owned, managed/bundled, external/repo-installed, unknown) is observed
+for telemetry but can never be transitioned.
+
+**Telemetry (body-free).** `~/.claude/state/skill-autosave-usage.json`
+(0600) records per-skill `view_count`, `use_count`, `patch_count`,
+`last_*_at` timestamps, lifecycle `state` and `archived_at` — counters and
+ISO timestamps only, never content. Sources: a `PostToolUse(Skill)` hook
+(`curator-bump.sh`, fail-open — a non-blocking lock degrades the bump instead
+of ever stalling a foreground skill call), plus patch/install events
+recomputed from the ownership ledger. Pin state stays authoritative in
+`skill-autosave-control.json`; reports merge it live. Lifecycle mutations
+fail closed when telemetry or provenance is unreadable, and every mutating
+command loads the usage store inside the mutation lock so a concurrent bump
+can never be silently overwritten.
+
+**Deterministic lifecycle.** States are `active → stale → archived` with
+reactivation on fresh activity; the anchor is the latest activity timestamp
+or the first-sight seed time (never epoch — a newly seen skill gets a full
+fresh window). `stale` is display-only; `archived` is an atomic same-filesystem
+move into the owner-only `~/.claude/state/skill-autosave-archive/` (the run
+fails closed on a cross-device archive root). There is **no permanent delete**
+anywhere: every archived skill restores with `restore`, and a restored skill
+keeps its old anchor, so pin it if it must stay live. Pinned, non-autosave
+provenance, and never-used skills younger than the stale window are always
+protected. The first `--auto` run only seeds the interval timer; `--auto`
+also skips while any skill activity is newer than `min_idle_hours` (a session
+may be live). Every mutation is a prepared→terminal transaction in the
+ownership ledger, and a crash mid-move is reconciled on the next locked
+command (`prepared` rows are finished `archived`/`restored`/`aborted` or
+fail closed as `conflict`).
+
+**Backup / rollback.** A mutating `run` first snapshots every autosave-managed
+skill plus usage/control metadata into
+`~/.claude/state/skill-autosave-curator-backups/<utc-id>/` (owner-only,
+body-free manifest); a systemic backup failure aborts the run. A single
+unsafe skill (symlink members, oversized file) is **quarantined** instead:
+excluded from the snapshot, never transitioned that run, and reported in the
+run's `quarantined` list — repair the member and the next run proceeds.
+Retention keeps the newest `backup_keep` snapshots (default 5) — pruning
+never touches them. `rollback [--id]` restores a snapshot (usage/control
+metadata, skills archived since the backup move back, drifted live content is
+restored after staging) and takes a safety snapshot of the current state
+first, so a rollback is itself undoable. A rollback that fails mid-plan is
+recorded `conflict` with the applied count (never a silent "aborted"), and a
+crash-interrupted rollback recovers to `conflict` on the next locked command.
+The curator backup is lifecycle insurance and is **separate
+from the install rollback ledger** (`autoinstall.sh rollback` reverts a single
+install; `curator.py rollback` restores a whole pre-run snapshot — they share
+no state and never move each other's files).
+
+**LLM consolidation is not implemented.** The curator never calls a provider;
+setting `CCC_SKILL_CURATOR_CONSOLIDATE=true` makes `run` fail closed
+(`consolidation_not_implemented`) so a future phase-3 cannot activate by
+accident.
+
+```bash
+CUR=~/.claude/hooks/skill-review/curator.py
+python3 "$CUR" status [name]     # per-skill classification + telemetry (JSON)
+python3 "$CUR" report            # aggregate owner-only report
+python3 "$CUR" run --dry-run     # preview transitions, writes nothing
+python3 "$CUR" run               # operator-explicit transitions (backs up first)
+python3 "$CUR" pin <name>        # protect (delegates to the ownership contract)
+python3 "$CUR" archive <name> / restore <name>
+python3 "$CUR" list-archived
+python3 "$CUR" backup --reason manual / list-backups / rollback [--id <id>]
+```
+
+**Sweep integration is opt-in and fleet-gated.** The daily sweep runs the
+curator only when `CCC_SKILL_CURATOR_ENABLED=true` (default off — enabling is
+a rollout decision). Under autonomy `dry-run` the sweep passes `--dry-run`;
+under `kill` the sweep never starts. Tuning (env):
+`CCC_SKILL_CURATOR_STALE_AFTER_DAYS` (30), `CCC_SKILL_CURATOR_ARCHIVE_AFTER_DAYS`
+(90), `CCC_SKILL_CURATOR_MIN_IDLE_HOURS` (2), `CCC_SKILL_CURATOR_INTERVAL_HOURS`
+(24), `CCC_SKILL_CURATOR_BACKUP_KEEP` (5), `CCC_SKILL_CURATOR_NOW` (test-only
+clock pin, UTC). Codex nodes share the same contract (`CCC_SKILL_PROVIDER=codex`);
+only the `PostToolUse` bump is Claude-only, so Codex telemetry is ledger-derived
+(patch/install events) — the lifecycle math is identical.
+
 ## Migration & rollback (Claude ↔ Codex)
 
 Skills are **not** mirrored across providers automatically — the install target

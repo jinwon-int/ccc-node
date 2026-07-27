@@ -5,6 +5,22 @@ All notable changes to the Claude Code node harness. Dates are KST.
 ## [Unreleased]
 
 ### Added
+- Skill autosave now has a usage telemetry and deterministic lifecycle
+  curator (`skill-review/curator.py`, #752). Body-free counters
+  (view/use/patch, timestamps, state) feed `active → stale → archived`
+  transitions that manage only `autosave-managed` skills: stale is
+  display-only, archive is an atomic same-filesystem move into an owner-only
+  archive root, restore is always possible, and nothing is ever permanently
+  deleted. Pinned, non-autosave provenance, recently active, and
+  never-used-young skills are protected; the first auto run only seeds the
+  interval timer. Every mutating run takes a retention-capped owner-only
+  backup first and can be rolled back (rollback itself takes a safety
+  snapshot); prepared→terminal ledger transactions reconcile crash
+  mid-states. A `PostToolUse(Skill)` hook bumps use telemetry fail-open, the
+  daily sweep runs the curator only under the opt-in
+  `CCC_SKILL_CURATOR_ENABLED=true` gate, and LLM consolidation is not
+  implemented — `CCC_SKILL_CURATOR_CONSOLIDATE=true` fails closed and no
+  provider is ever called. (#752)
 - Skill autosave now has a provider-neutral autonomous-mutation ownership
   contract. A shared fail-closed classifier distinguishes autosave-managed,
   user-owned, bundled/managed, external/repo-installed, pinned, and

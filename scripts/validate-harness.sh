@@ -214,6 +214,7 @@ if command -v python3 >/dev/null 2>&1; then
   if python3 -m py_compile claude/hooks/statusline-usage.py 2>/dev/null; then say "  ok claude/hooks/statusline-usage.py compiles"; else err "py_compile: claude/hooks/statusline-usage.py"; fi
   if python3 -m py_compile claude/hooks/lib/memory_render.py 2>/dev/null; then say "  ok claude/hooks/lib/memory_render.py compiles"; else err "py_compile: claude/hooks/lib/memory_render.py"; fi
   if python3 -m py_compile claude/hooks/skill-review/ownership.py 2>/dev/null; then say "  ok claude/hooks/skill-review/ownership.py compiles"; else err "py_compile: claude/hooks/skill-review/ownership.py"; fi
+  if python3 -m py_compile claude/hooks/skill-review/curator.py 2>/dev/null; then say "  ok claude/hooks/skill-review/curator.py compiles"; else err "py_compile: claude/hooks/skill-review/curator.py"; fi
   if python3 -m py_compile scripts/ccc_codex_github_policy.py 2>/dev/null; then say "  ok scripts/ccc_codex_github_policy.py compiles"; else err "py_compile: scripts/ccc_codex_github_policy.py"; fi
 else
   say "  (python3 absent — skipped)"
@@ -246,6 +247,7 @@ for t in claude/hooks/observability.test.sh claude/hooks/security-scan.test.sh \
          claude/hooks/checkpoint.test.sh claude/hooks/distill-scope.test.sh claude/hooks/skill-review.test.sh \
          claude/hooks/skill-review/ownership.test.sh \
          claude/hooks/skill-review/ownership-incremental.test.sh \
+         claude/hooks/skill-review/curator.test.sh \
          claude/hooks/skill-review/autoinstall.test.sh \
          claude/hooks/skill-review/autoinstall-incremental.test.sh \
          claude/hooks/skill-review/codex-autoinstall.test.sh \
