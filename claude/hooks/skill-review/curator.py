@@ -378,6 +378,90 @@ def _list_archive_entries(context) -> list[dict[str, Any]]:
 # ---------------------------------------------------------------------------
 
 
+def _recovery_outcome(event: str, live: bool, archived: bool) -> str:
+    """Map observed FS state to a terminal outcome for a dangling prepared row."""
+    if event == "curator-archive":
+        if archived and not live:
+            return "archived"
+        if live and not archived:
+            return "aborted"
+        return "conflict"
+    if live and not archived:
+        return "restored"
+    if archived and not live:
+        return "aborted"
+    return "conflict"
+
+
+def _apply_recovery_to_record(
+    record: dict[str, Any] | None,
+    event: str,
+    outcome: str,
+    archive_name: str,
+    fields: dict[str, Any],
+) -> None:
+    if record is None or outcome == "conflict":
+        return
+    if event == "curator-archive":
+        if outcome == "archived":
+            record["state"] = "archived"
+            record["archived_at"] = fields.get("archived_at") or record["archived_at"]
+            record["archive_name"] = archive_name
+            return
+        record["state"] = "active"
+        record["archived_at"] = None
+        record["archive_name"] = None
+        return
+    if outcome == "restored":
+        record["state"] = "active"
+        record["archived_at"] = None
+        record["archive_name"] = None
+        return
+    record["state"] = "archived"
+    record["archive_name"] = archive_name
+
+
+def _recover_one_transaction(
+    context, usage: dict[str, Any], tx: str, row: dict[str, Any]
+) -> dict[str, Any]:
+    """Finish one dangling prepared row; appends exactly one terminal row."""
+    event = row["event"]
+    name = row.get("name")
+    archive_name = row.get("archive_name")
+    if (
+        row.get("provider") != context.provider
+        or not isinstance(name, str)
+        or not ownership._NAME_RE.fullmatch(name)
+        or not isinstance(archive_name, str)
+        or _ARCHIVE_NAME_RE.fullmatch(archive_name) is None
+    ):
+        ownership._append_ledger(
+            context,
+            ownership._transaction_record(
+                event, tx, outcome="conflict", fields={"reason": "prepared_row_invalid"}
+            ),
+        )
+        return {"transaction_id": tx, "event": event, "outcome": "conflict"}
+    live = ownership._lstat(context.skills_dir / name) is not None
+    archived = (
+        ownership._lstat(context.state_dir / _ARCHIVE_DIR / archive_name) is not None
+    )
+    outcome = _recovery_outcome(event, live, archived)
+    fields = ownership._transaction_fields_from_record(row)
+    ownership._append_ledger(
+        context,
+        ownership._transaction_record(event, tx, outcome=outcome, fields=fields),
+    )
+    _apply_recovery_to_record(
+        usage["records"].get(_record_key(context, name)),
+        event,
+        outcome,
+        archive_name,
+        fields,
+    )
+    return {"transaction_id": tx, "event": event, "name": name, "outcome": outcome}
+
+
 def _recover_curator_transactions(context, usage: dict[str, Any]) -> list[dict[str, Any]]:
     """Reconcile prepared curator rows without a terminal row.
 
@@ -400,69 +484,7 @@ def _recover_curator_transactions(context, usage: dict[str, Any]) -> list[dict[s
     for tx, row in sorted(prepared.items()):
         if tx in terminated:
             continue
-        event = row["event"]
-        name = row.get("name")
-        archive_name = row.get("archive_name")
-        if (
-            row.get("provider") != context.provider
-            or not isinstance(name, str)
-            or not ownership._NAME_RE.fullmatch(name)
-            or not isinstance(archive_name, str)
-            or _ARCHIVE_NAME_RE.fullmatch(archive_name) is None
-        ):
-            ownership._append_ledger(
-                context,
-                ownership._transaction_record(
-                    event, tx, outcome="conflict", fields={"reason": "prepared_row_invalid"}
-                ),
-            )
-            recoveries.append({"transaction_id": tx, "event": event, "outcome": "conflict"})
-            continue
-        live = ownership._lstat(context.skills_dir / name) is not None
-        archived = (
-            ownership._lstat(context.state_dir / _ARCHIVE_DIR / archive_name) is not None
-        )
-        if event == "curator-archive":
-            if archived and not live:
-                outcome = "archived"
-            elif live and not archived:
-                outcome = "aborted"
-            else:
-                outcome = "conflict"
-        else:
-            if live and not archived:
-                outcome = "restored"
-            elif archived and not live:
-                outcome = "aborted"
-            else:
-                outcome = "conflict"
-        fields = ownership._transaction_fields_from_record(row)
-        ownership._append_ledger(
-            context,
-            ownership._transaction_record(event, tx, outcome=outcome, fields=fields),
-        )
-        record = usage["records"].get(_record_key(context, name))
-        if record is not None and outcome != "conflict":
-            if event == "curator-archive":
-                if outcome == "archived":
-                    record["state"] = "archived"
-                    record["archived_at"] = fields.get("archived_at") or record["archived_at"]
-                    record["archive_name"] = archive_name
-                else:
-                    record["state"] = "active"
-                    record["archived_at"] = None
-                    record["archive_name"] = None
-            else:
-                if outcome == "restored":
-                    record["state"] = "active"
-                    record["archived_at"] = None
-                    record["archive_name"] = None
-                else:
-                    record["state"] = "archived"
-                    record["archive_name"] = archive_name
-        recoveries.append(
-            {"transaction_id": tx, "event": event, "name": name, "outcome": outcome}
-        )
+        recoveries.append(_recover_one_transaction(context, usage, tx, row))
     if recoveries:
         # Recovery owns its usage mutations: persist immediately so a later
         # failure in the calling command cannot drop a reconciled state.
@@ -609,10 +631,12 @@ def _archive_skill(context, usage, name: str, now: datetime, *, manual: bool) ->
     }
 
 
-def _restore_skill(context, usage, name: str, now: datetime) -> dict[str, Any]:
+def _resolve_restore_target(
+    context, usage: dict[str, Any], name: str
+) -> tuple[dict[str, Any], str]:
+    """Fail-closed validation: returns (record, archive_name) to restore."""
     ownership._validate_name(name)
-    key = _record_key(context, name)
-    record = usage["records"].get(key)
+    record = usage["records"].get(_record_key(context, name))
     entries = [
         entry for entry in _list_archive_entries(context) if entry["name"] == name
     ]
@@ -633,6 +657,49 @@ def _restore_skill(context, usage, name: str, now: datetime) -> dict[str, Any]:
     _check_same_filesystem(context)
     if ownership._lstat(context.skills_dir / name) is not None:
         raise ContractError("restore_denied_live_exists")
+    return record, archive_name
+
+
+def _move_restored(context, name: str, archive_name: str) -> bool:
+    """Atomic archive→live move + marker cleanup; returns durability certainty."""
+    skills_fd: int | None = None
+    archive_fd: int | None = None
+    try:
+        skills_fd = _open_dir(context.skills_dir)
+        archive_fd = _open_dir(context.state_dir / _ARCHIVE_DIR)
+        source = os.stat(archive_name, dir_fd=archive_fd, follow_symlinks=False)
+        if not stat.S_ISDIR(source.st_mode) or source.st_uid != context.uid:
+            raise ContractError("restore_source_changed")
+        try:
+            os.stat(name, dir_fd=skills_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            raise ContractError("restore_denied_live_exists")
+        durable = _move_directory(archive_fd, skills_fd, archive_name, name)
+        restored_fd: int | None = None
+        try:
+            restored_fd = _open_dir(context.skills_dir / name)
+            os.unlink(_ARCHIVE_MARKER, dir_fd=restored_fd)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            durable = False
+        finally:
+            if restored_fd is not None:
+                os.close(restored_fd)
+        return durable
+    except OSError:
+        raise ContractError("restore_move_failed") from None
+    finally:
+        if skills_fd is not None:
+            os.close(skills_fd)
+        if archive_fd is not None:
+            os.close(archive_fd)
+
+
+def _restore_skill(context, usage, name: str, now: datetime) -> dict[str, Any]:
+    record, archive_name = _resolve_restore_target(context, usage, name)
     tx = uuid.uuid4().hex
     fields = {
         "provider": context.provider,
@@ -647,52 +714,13 @@ def _restore_skill(context, usage, name: str, now: datetime) -> dict[str, Any]:
             "curator-restore", tx, outcome="prepared", fields=fields
         ),
     )
-    skills_fd: int | None = None
-    archive_fd: int | None = None
-    renamed = False
-    durable = True
     try:
-        skills_fd = _open_dir(context.skills_dir)
-        archive_fd = _open_dir(context.state_dir / _ARCHIVE_DIR)
-        source = os.stat(archive_name, dir_fd=archive_fd, follow_symlinks=False)
-        if not stat.S_ISDIR(source.st_mode) or source.st_uid != context.uid:
-            raise ContractError("restore_source_changed")
-        try:
-            os.stat(name, dir_fd=skills_fd, follow_symlinks=False)
-        except FileNotFoundError:
-            pass
-        else:
-            raise ContractError("restore_denied_live_exists")
-        durable = _move_directory(archive_fd, skills_fd, archive_name, name)
-        renamed = True
-        restored_fd: int | None = None
-        try:
-            restored_fd = _open_dir(context.skills_dir / name)
-            os.unlink(_ARCHIVE_MARKER, dir_fd=restored_fd)
-        except FileNotFoundError:
-            pass
-        except OSError:
-            durable = False
-        finally:
-            if restored_fd is not None:
-                os.close(restored_fd)
+        durable = _move_restored(context, name, archive_name)
     except ContractError:
         ownership._finish_transaction(
             context, "curator-restore", tx, outcome="aborted", fields=fields
         )
         raise
-    except OSError:
-        ownership._finish_transaction(
-            context, "curator-restore", tx, outcome="aborted", fields=fields
-        )
-        raise ContractError("restore_move_failed") from None
-    finally:
-        if skills_fd is not None:
-            os.close(skills_fd)
-        if archive_fd is not None:
-            os.close(archive_fd)
-    if not renamed:
-        raise ContractError("restore_move_failed")
     record["state"] = "active"
     record["archived_at"] = None
     record["archive_name"] = None
@@ -907,6 +935,122 @@ def _list_backups(context) -> list[dict[str, Any]]:
     return backups
 
 
+def _plan_rollback(context, manifest: dict[str, Any]) -> list[dict[str, Any]]:
+    """One plan entry per manifest skill: keep / restore-content / restore-archived."""
+    backup_created = _parse_ts(manifest["created_at"])
+    plans: list[dict[str, Any]] = []
+    for skill in manifest["skills"]:
+        name = skill["name"]
+        live = ownership._lstat(context.skills_dir / name) is not None
+        archived_entries = [
+            entry for entry in _list_archive_entries(context) if entry["name"] == name
+        ]
+        if live:
+            try:
+                current = ownership._read_target(context, name, "SKILL.md")
+                drift = current.sha256 != skill["skill_sha256"]
+            except ContractError:
+                drift = True
+            plans.append(
+                {"name": name, "action": "restore-content" if drift else "keep"}
+            )
+            continue
+        if archived_entries:
+            latest = max(archived_entries, key=lambda entry: entry["archive_name"])
+            if backup_created is None or latest["archived_at"] >= backup_created:
+                plans.append(
+                    {
+                        "name": name,
+                        "action": "restore-archived",
+                        "archive_name": latest["archive_name"],
+                    }
+                )
+            else:
+                plans.append({"name": name, "action": "keep-archived"})
+            continue
+        plans.append({"name": name, "action": "restore-content"})
+    return plans
+
+
+def _rollback_restore_content(
+    context, backup_root: Path, staging: Path, name: str
+) -> None:
+    """Swap a live (or missing) skill dir with its backup copy, staging the old."""
+    source = backup_root / "skills" / name
+    if ownership._lstat(source) is None:
+        raise ContractError("backup_member_missing")
+    staged_new = staging / f"new-{name}"
+    shutil.copytree(source, staged_new, symlinks=False)
+    live = ownership._lstat(context.skills_dir / name) is not None
+    skills_fd = _open_dir(context.skills_dir)
+    staging_fd = _open_dir(staging)
+    try:
+        if live:
+            os.rename(
+                name, f"old-{name}", src_dir_fd=skills_fd, dst_dir_fd=staging_fd
+            )
+        os.rename(
+            f"new-{name}", name, src_dir_fd=staging_fd, dst_dir_fd=skills_fd
+        )
+        os.fsync(skills_fd)
+        os.fsync(staging_fd)
+    except OSError:
+        raise ContractError("rollback_restore_failed") from None
+    finally:
+        os.close(skills_fd)
+        os.close(staging_fd)
+
+
+def _rollback_apply_plan(
+    context, usage, backup_root: Path, staging: Path, plan: dict[str, Any], now: datetime
+) -> None:
+    name = plan["name"]
+    if plan["action"] == "restore-archived":
+        record = usage["records"].get(_record_key(context, name))
+        if record is None:
+            record = _seed_record(context, usage, name, now)
+        record["state"] = "archived"
+        record["archive_name"] = plan["archive_name"]
+        _restore_skill(context, usage, name, now)
+        return
+    _rollback_restore_content(context, backup_root, staging, name)
+
+
+def _rollback_restore_metadata(context, usage, backup_root: Path) -> None:
+    """Restore usage/control metadata, keeping states this rollback just made live."""
+    backup_usage_path = backup_root / "usage.json"
+    if ownership._lstat(backup_usage_path) is not None:
+        restored_usage = _validate_usage(
+            ownership._safe_json_file(
+                backup_usage_path, owner=context.uid, exact_mode=0o600
+            )
+        )
+        for key, record in usage["records"].items():
+            if key not in restored_usage["records"]:
+                restored_usage["records"][key] = record
+            elif (
+                record.get("state") == "active"
+                and restored_usage["records"][key].get("state") == "archived"
+            ):
+                restored_usage["records"][key] = record
+        _save_usage(context, restored_usage)
+        usage["records"] = restored_usage["records"]
+    backup_control_path = backup_root / "control.json"
+    if ownership._lstat(backup_control_path) is None:
+        return
+    control = ownership._safe_json_file(
+        backup_control_path, owner=context.uid, exact_mode=0o600
+    )
+    if (
+        type(control.get("schema_version")) is int
+        and control["schema_version"] == 1
+        and isinstance(control.get("records"), dict)
+    ):
+        ownership._write_private_atomic(
+            context.state_dir / ownership._CONTROL_FILE, control, context
+        )
+
+
 def _rollback_backup(
     context,
     usage: dict[str, Any],
@@ -931,38 +1075,7 @@ def _rollback_backup(
         backup_id = readable[-1]["id"]
     manifest = _read_manifest(context, backup_id)
     backup_root = context.state_dir / _BACKUP_DIR / backup_id
-    backup_created = _parse_ts(manifest["created_at"])
-    plans: list[dict[str, Any]] = []
-    for skill in manifest["skills"]:
-        name = skill["name"]
-        live = ownership._lstat(context.skills_dir / name) is not None
-        archived_entries = [
-            entry for entry in _list_archive_entries(context) if entry["name"] == name
-        ]
-        if live:
-            try:
-                current = ownership._read_target(context, name, "SKILL.md")
-                drift = current.sha256 != skill["skill_sha256"]
-            except ContractError:
-                drift = True
-            if drift:
-                plans.append({"name": name, "action": "restore-content"})
-            else:
-                plans.append({"name": name, "action": "keep"})
-        elif archived_entries:
-            latest = max(archived_entries, key=lambda entry: entry["archive_name"])
-            if backup_created is None or latest["archived_at"] >= backup_created:
-                plans.append(
-                    {
-                        "name": name,
-                        "action": "restore-archived",
-                        "archive_name": latest["archive_name"],
-                    }
-                )
-            else:
-                plans.append({"name": name, "action": "keep-archived"})
-        else:
-            plans.append({"name": name, "action": "restore-content"})
+    plans = _plan_rollback(context, manifest)
     actions = [plan for plan in plans if not plan["action"].startswith("keep")]
     if dry_run:
         return {
@@ -1000,73 +1113,9 @@ def _rollback_backup(
         ownership._ensure_private_dir(context.state_dir / _STAGING_DIR, context)
         os.mkdir(staging, mode=0o700)
         for plan in actions:
-            name = plan["name"]
-            if plan["action"] == "restore-archived":
-                record = usage["records"].get(_record_key(context, name))
-                if record is None:
-                    record = _seed_record(context, usage, name, now)
-                record["state"] = "archived"
-                record["archive_name"] = plan["archive_name"]
-                _restore_skill(context, usage, name, now)
-                results.append({"name": name, "action": "restore-archived", "ok": True})
-            else:
-                source = backup_root / "skills" / name
-                if ownership._lstat(source) is None:
-                    raise ContractError("backup_member_missing")
-                staged_new = staging / f"new-{name}"
-                shutil.copytree(source, staged_new, symlinks=False)
-                live = ownership._lstat(context.skills_dir / name) is not None
-                skills_fd = _open_dir(context.skills_dir)
-                staging_fd = _open_dir(staging)
-                try:
-                    if live:
-                        os.rename(
-                            name,
-                            f"old-{name}",
-                            src_dir_fd=skills_fd,
-                            dst_dir_fd=staging_fd,
-                        )
-                    os.rename(
-                        f"new-{name}",
-                        name,
-                        src_dir_fd=staging_fd,
-                        dst_dir_fd=skills_fd,
-                    )
-                    os.fsync(skills_fd)
-                    os.fsync(staging_fd)
-                except OSError:
-                    raise ContractError("rollback_restore_failed") from None
-                finally:
-                    os.close(skills_fd)
-                    os.close(staging_fd)
-                results.append({"name": name, "action": "restore-content", "ok": True})
-        backup_usage_path = backup_root / "usage.json"
-        if ownership._lstat(backup_usage_path) is not None:
-            restored_usage = _validate_usage(
-                ownership._safe_json_file(
-                    backup_usage_path, owner=context.uid, exact_mode=0o600
-                )
-            )
-            for key, record in usage["records"].items():
-                if key not in restored_usage["records"]:
-                    restored_usage["records"][key] = record
-                elif record.get("state") == "active" and restored_usage["records"][key].get("state") == "archived":
-                    restored_usage["records"][key] = record
-            _save_usage(context, restored_usage)
-            usage["records"] = restored_usage["records"]
-        backup_control_path = backup_root / "control.json"
-        if ownership._lstat(backup_control_path) is not None:
-            control = ownership._safe_json_file(
-                backup_control_path, owner=context.uid, exact_mode=0o600
-            )
-            if (
-                type(control.get("schema_version")) is int
-                and control["schema_version"] == 1
-                and isinstance(control.get("records"), dict)
-            ):
-                ownership._write_private_atomic(
-                    context.state_dir / ownership._CONTROL_FILE, control, context
-                )
+            _rollback_apply_plan(context, usage, backup_root, staging, plan, now)
+            results.append({"name": plan["name"], "action": plan["action"], "ok": True})
+        _rollback_restore_metadata(context, usage, backup_root)
         shutil.rmtree(staging, ignore_errors=True)
     except ContractError:
         ownership._finish_transaction(
@@ -1136,44 +1185,28 @@ def _node_recently_active(usage: dict[str, Any], now: datetime, min_idle_hours: 
     return False
 
 
-def _command_run(context, *, dry_run: bool, auto: bool) -> dict[str, Any]:
-    config = _load_config()
-    if config["consolidate"]:
-        # Phase-3 LLM consolidation is not implemented; never call a provider.
-        raise ContractError("consolidation_not_implemented")
-    now = _now()
-    state = _load_curator_state(context)
-    if auto:
-        if not config["enabled"]:
-            return {
-                "ok": True,
-                "command": "run",
-                "auto": True,
-                "skipped": "curator-disabled",
-                "changed": False,
-            }
-        last_run = _parse_ts(state.get("last_run_at"))
-        if last_run is None:
-            if not dry_run:
-                state["last_run_at"] = _ts(now)
-                _save_curator_state(context, state)
-            return {
-                "ok": True,
-                "command": "run",
-                "auto": True,
-                "skipped": "first-run-deferred",
-                "changed": False,
-            }
-        if now - last_run < timedelta(hours=config["interval_hours"]):
-            return {
-                "ok": True,
-                "command": "run",
-                "auto": True,
-                "skipped": "interval-not-elapsed",
-                "changed": False,
-            }
-    usage = _load_usage(context, strict=True)
-    report: dict[str, Any] = {
+def _run_auto_skip(
+    context, state: dict[str, Any], config: dict[str, Any], now: datetime, dry_run: bool
+) -> dict[str, Any] | None:
+    """Auto-mode gating: returns a skip report, or None when the run proceeds."""
+    base = {"ok": True, "command": "run", "auto": True, "changed": False}
+    if not config["enabled"]:
+        return {**base, "skipped": "curator-disabled"}
+    last_run = _parse_ts(state.get("last_run_at"))
+    if last_run is None:
+        # First auto run only seeds the interval timer — never mutates a
+        # library it has never seen (same safety as Hermes should_run_now).
+        if not dry_run:
+            state["last_run_at"] = _ts(now)
+            _save_curator_state(context, state)
+        return {**base, "skipped": "first-run-deferred"}
+    if now - last_run < timedelta(hours=config["interval_hours"]):
+        return {**base, "skipped": "interval-not-elapsed"}
+    return None
+
+
+def _run_report_skeleton(auto: bool, dry_run: bool, now: datetime, config) -> dict[str, Any]:
+    return {
         "ok": True,
         "command": "run",
         "auto": auto,
@@ -1196,6 +1229,82 @@ def _command_run(context, *, dry_run: bool, auto: bool) -> dict[str, Any]:
         },
         "changed": False,
     }
+
+
+def _classify_run_decision(
+    context, usage, name: str, now: datetime, config, report, dry_run: bool
+) -> None:
+    """Append one skill's transition decision to the run report (no mutation)."""
+    report["counts"]["checked"] += 1
+    classification = ownership._classification(context, name)
+    if classification["base_classification"] != "autosave-managed":
+        report["counts"]["protected"] += 1
+        report["decisions"].append(
+            {
+                "name": name,
+                "action": "protect",
+                "reason": classification["base_classification"],
+            }
+        )
+        return
+    if classification["pinned"]:
+        report["counts"]["protected"] += 1
+        report["decisions"].append({"name": name, "action": "protect", "reason": "pinned"})
+        return
+    record = usage["records"].get(_record_key(context, name))
+    if record is None:
+        if not dry_run:
+            _seed_record(context, usage, name, now)
+        report["counts"]["seeded"] += 1
+        report["decisions"].append({"name": name, "action": "seed", "reason": "first-sight"})
+        return
+    action, reason = _decide(record, now, config)
+    report["decisions"].append({"name": name, "action": action, "reason": reason})
+    count_keys = {
+        "keep": "kept",
+        "mark-stale": "marked_stale",
+        "reactivate": "reactivated",
+        "archive": "archived",
+    }
+    report["counts"][count_keys[action]] += 1
+
+
+def _apply_run_decisions(context, usage, report, now: datetime, config) -> None:
+    """Backup first, then apply every planned transition (lock already held)."""
+    backup = _snapshot(
+        context, usage, reason="pre-curator-run", now=now, keep=config["backup_keep"]
+    )
+    report["backup"] = backup
+    for decision in report["decisions"]:
+        action = decision["action"]
+        if action not in {"mark-stale", "reactivate", "archive"}:
+            continue
+        record = usage["records"][_record_key(context, decision["name"])]
+        if action == "mark-stale":
+            record["state"] = "stale"
+        elif action == "reactivate":
+            record["state"] = "active"
+        elif action == "archive" and record["state"] != "archived":
+            result = _archive_skill(context, usage, decision["name"], now, manual=False)
+            decision["archive_name"] = result.get("archive_name")
+            decision["durable"] = result.get("durable")
+    report["changed"] = True
+    _save_usage(context, usage)
+
+
+def _command_run(context, *, dry_run: bool, auto: bool) -> dict[str, Any]:
+    config = _load_config()
+    if config["consolidate"]:
+        # Phase-3 LLM consolidation is not implemented; never call a provider.
+        raise ContractError("consolidation_not_implemented")
+    now = _now()
+    state = _load_curator_state(context)
+    if auto:
+        skip = _run_auto_skip(context, state, config, now, dry_run)
+        if skip is not None:
+            return skip
+    usage = _load_usage(context, strict=True)
+    report = _run_report_skeleton(auto, dry_run, now, config)
     with ownership._MutationLock(context):
         recoveries = _recover_curator_transactions(context, usage)
         if recoveries:
@@ -1205,77 +1314,14 @@ def _command_run(context, *, dry_run: bool, auto: bool) -> dict[str, Any]:
             _save_usage(context, usage)
             report["skipped"] = "node-active-within-min-idle"
             return report
-        names = ownership._skill_names(context)
-        planned = False
-        for name in names:
-            report["counts"]["checked"] += 1
-            classification = ownership._classification(context, name)
-            key = _record_key(context, name)
-            if classification["base_classification"] != "autosave-managed":
-                report["counts"]["protected"] += 1
-                report["decisions"].append(
-                    {
-                        "name": name,
-                        "action": "protect",
-                        "reason": classification["base_classification"],
-                    }
-                )
-                continue
-            if classification["pinned"]:
-                report["counts"]["protected"] += 1
-                report["decisions"].append(
-                    {"name": name, "action": "protect", "reason": "pinned"}
-                )
-                continue
-            record = usage["records"].get(key)
-            if record is None:
-                if not dry_run:
-                    record = _seed_record(context, usage, name, now)
-                report["counts"]["seeded"] += 1
-                report["decisions"].append(
-                    {"name": name, "action": "seed", "reason": "first-sight"}
-                )
-                continue
-            action, reason = _decide(record, now, config)
-            decision: dict[str, Any] = {"name": name, "action": action, "reason": reason}
-            report["decisions"].append(decision)
-            if action == "keep":
-                report["counts"]["kept"] += 1
-                continue
-            planned = True
-            if action == "mark-stale":
-                report["counts"]["marked_stale"] += 1
-            elif action == "reactivate":
-                report["counts"]["reactivated"] += 1
-            elif action == "archive":
-                report["counts"]["archived"] += 1
-        mutating = not dry_run and planned
-        if mutating:
-            # Backup BEFORE any mutation so rollback restores the pre-run state.
-            backup = _snapshot(
-                context,
-                usage,
-                reason="pre-curator-run",
-                now=now,
-                keep=config["backup_keep"],
-            )
-            report["backup"] = backup
-            for decision in report["decisions"]:
-                action = decision["action"]
-                if action not in {"mark-stale", "reactivate", "archive"}:
-                    continue
-                name = decision["name"]
-                record = usage["records"][_record_key(context, name)]
-                if action == "mark-stale":
-                    record["state"] = "stale"
-                elif action == "reactivate":
-                    record["state"] = "active"
-                elif action == "archive" and record["state"] != "archived":
-                    result = _archive_skill(context, usage, name, now, manual=False)
-                    decision["archive_name"] = result.get("archive_name")
-                    decision["durable"] = result.get("durable")
-            report["changed"] = True
-            _save_usage(context, usage)
+        for name in ownership._skill_names(context):
+            _classify_run_decision(context, usage, name, now, config, report, dry_run)
+        planned = any(
+            decision["action"] in {"mark-stale", "reactivate", "archive"}
+            for decision in report["decisions"]
+        )
+        if not dry_run and planned:
+            _apply_run_decisions(context, usage, report, now, config)
         elif not dry_run:
             _save_usage(context, usage)
         if not dry_run:
