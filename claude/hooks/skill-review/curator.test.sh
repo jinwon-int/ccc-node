@@ -230,5 +230,84 @@ ok "report is body-free" '! grep -q -E "sufficiently detailed" <<<"$out"'
 out="$(at 7 pin eta --dry-run)"
 ok "curator exposes pin via the ownership contract" 'jq -e ".command == \"pin\" and .dry_run == true" >/dev/null <<<"$out"'
 
+# --- 11. review-fix regressions ----------------------------------------------
+# 11a. directory-symlink member → quarantined, never copied, run proceeds
+make_managed theta
+tool run >/dev/null
+mkdir "$TMP/outside-data" && printf 'x' > "$TMP/outside-data/blob.bin"
+ln -s "$TMP/outside-data" "$SKILLS/theta/linked-dir"
+out="$(at 800 run)"
+ok "dir-symlink skill is quarantined, not archived" 'jq -e "[.decisions[] | select(.name == \"theta\" and .action == \"quarantine\")] | length == 1" >/dev/null <<<"$out" && [ -d "$SKILLS/theta" ]'
+ok "quarantine is reported at the top level" 'jq -e ".quarantined == [\"theta\"]" >/dev/null <<<"$out"'
+backup_dir="$(jq -r '.backup.backup_id' <<<"$out")"
+ok "quarantined skill is absent from the snapshot" '[ ! -e "$STATE/skill-autosave-curator-backups/$backup_dir/skills/theta" ]'
+ok "outside data never enters the backup" '[ ! -e "$STATE/skill-autosave-curator-backups/$backup_dir/skills/theta/linked-dir/blob.bin" ]'
+rm "$SKILLS/theta/linked-dir"
+out="$(at 800 run)"
+ok "after repair the skill transitions again" 'jq -e "[.decisions[] | select(.name == \"theta\" and .action == \"archive\")] | length == 1" >/dev/null <<<"$out"'
+
+# 11b. rollback partial failure records conflict, not a clean abort
+make_managed iota
+make_managed kappa
+tool run >/dev/null
+out="$(tool backup --reason partial-test)"
+partial_backup="$(jq -r '.backup_id' <<<"$out")"
+printf -- '---\nname: iota\ndescription: Drifted content for the rollback honesty test case here.\n---\n\n# iota drifted\n' > "$SKILLS/iota/SKILL.md"
+printf -- '---\nname: kappa\ndescription: Drifted content for the rollback honesty test case here.\n---\n\n# kappa drifted\n' > "$SKILLS/kappa/SKILL.md"
+rm -rf "$STATE/skill-autosave-curator-backups/$partial_backup/skills/kappa"
+out="$(tool rollback --id "$partial_backup")"; rc=$?
+ok "rollback with a missing member fails closed" '[ "$rc" -eq 2 ] && jq -e ".code == \"backup_member_missing\"" >/dev/null <<<"$out"'
+tail_row="$(grep '"curator-rollback"' "$STATE/skill-autosave-ownership.jsonl" | tail -1)"
+ok "partial rollback records conflict with the applied count" 'jq -e ".outcome == \"conflict\" and .applied == 1" >/dev/null <<<"$tail_row"'
+ok "the applied skill kept its restored content" 'grep -q "curator lifecycle tests" "$SKILLS/iota/SKILL.md"'
+
+# 11c. dangling curator-rollback prepared row recovers as conflict
+printf '{"schema_version":1,"event":"curator-rollback","transaction_id":"cafecafecafecafecafecafecafecafe","ts":"2099-01-01T00:00:00Z","outcome":"prepared","provider":"claude","backup_id":"2099-01-01T00-00-00Z","safety_backup_id":"2099-01-01T00-00-01Z","planned":1}\n' >> "$STATE/skill-autosave-ownership.jsonl"
+out="$(tool run)"
+ok "dangling rollback recovers as conflict" 'jq -e "[.recoveries[] | select(.transaction_id == \"cafecafecafecafecafecafecafecafe\" and .outcome == \"conflict\")] | length == 1" >/dev/null <<<"$out"'
+out="$(tool run)"
+ok "rollback recovery is idempotent" 'jq -e "[(.recoveries // [])[] | select(.transaction_id == \"cafecafecafecafecafecafecafecafe\")] | length == 0" >/dev/null <<<"$out"'
+
+# 11d. dangling curator-restore prepared row recovers from FS state
+out="$(tool list-archived)"
+arch_name="$(jq -r '.archived[0].archive_name' <<<"$out")"
+arch_skill="$(jq -r '.archived[0].name' <<<"$out")"
+printf '{"schema_version":1,"event":"curator-restore","transaction_id":"beefbeefbeefbeefbeefbeefbeefbeef","ts":"2099-01-02T00:00:00Z","outcome":"prepared","provider":"claude","name":"%s","target_id":"00","archive_name":"%s","restored_at":"2099-01-02T00:00:00Z"}\n' "$arch_skill" "$arch_name" >> "$STATE/skill-autosave-ownership.jsonl"
+out="$(tool run)"
+ok "dangling restore with skill still archived recovers as aborted" 'jq -e "[.recoveries[] | select(.transaction_id == \"beefbeefbeefbeefbeefbeefbeefbeef\" and .outcome == \"aborted\")] | length == 1" >/dev/null <<<"$out"'
+out="$(tool status "$arch_skill")"
+ok "record stays archived after aborted restore recovery" 'jq -e ".skills[0].telemetry.state == \"archived\"" >/dev/null <<<"$out"'
+
+# 11e. bump degrades instead of blocking behind a held mutation lock
+python3 - "$STATE" <<'PY' &
+import fcntl, os, sys, time
+fd = os.open(os.path.join(sys.argv[1], ".skill-autosave-ownership.lock"), os.O_RDWR | os.O_CREAT, 0o600)
+fcntl.flock(fd, fcntl.LOCK_EX)
+time.sleep(8)
+PY
+lock_pid=$!
+sleep 1
+start="$(date +%s)"
+out="$(tool bump --event use --name iota)"; rc=$?
+elapsed=$(( $(date +%s) - start ))
+ok "bump behind a held lock returns fast and degraded" '[ "$rc" -eq 0 ] && [ "$elapsed" -lt 5 ] && jq -e ".recorded == false and .degraded == true" >/dev/null <<<"$out"'
+wait "$lock_pid" 2>/dev/null
+out="$(tool bump --event use --name iota)"
+ok "bump records again once the lock is free" 'jq -e ".recorded == true" >/dev/null <<<"$out"'
+
+# 11f. group/world-readable usage store fails mutations closed
+chmod 644 "$STATE/skill-autosave-usage.json"
+out="$(tool run)"; rc=$?
+ok "0644 usage store fails the run closed" '[ "$rc" -eq 2 ] && jq -e ".code == \"unsafe_metadata\"" >/dev/null <<<"$out"'
+chmod 600 "$STATE/skill-autosave-usage.json"
+out="$(tool run)"
+ok "restored 0600 unblocks the run" 'jq -e ".ok == true" >/dev/null <<<"$out"'
+
+# 11g. bump between runs survives (load-inside-lock ordering)
+tool bump --event use --name iota >/dev/null
+tool run >/dev/null
+out="$(tool status iota)"
+ok "inter-run bump is never overwritten by a run" 'jq -e ".skills[0].telemetry.use_count == 2" >/dev/null <<<"$out"'
+
 echo "pass=$pass fail=$fail"
 [ "$fail" -eq 0 ]

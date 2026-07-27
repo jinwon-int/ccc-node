@@ -371,11 +371,13 @@ for telemetry but can never be transitioned.
 (0600) records per-skill `view_count`, `use_count`, `patch_count`,
 `last_*_at` timestamps, lifecycle `state` and `archived_at` — counters and
 ISO timestamps only, never content. Sources: a `PostToolUse(Skill)` hook
-(`curator-bump.sh`, fail-open — telemetry failure never blocks a foreground
-skill call), plus patch/install events recomputed from the ownership ledger.
-Pin state stays authoritative in `skill-autosave-control.json`; reports merge
-it live. Lifecycle mutations fail closed when telemetry or provenance is
-unreadable.
+(`curator-bump.sh`, fail-open — a non-blocking lock degrades the bump instead
+of ever stalling a foreground skill call), plus patch/install events
+recomputed from the ownership ledger. Pin state stays authoritative in
+`skill-autosave-control.json`; reports merge it live. Lifecycle mutations
+fail closed when telemetry or provenance is unreadable, and every mutating
+command loads the usage store inside the mutation lock so a concurrent bump
+can never be silently overwritten.
 
 **Deterministic lifecycle.** States are `active → stale → archived` with
 reactivation on fresh activity; the anchor is the latest activity timestamp
@@ -396,12 +398,18 @@ fail closed as `conflict`).
 **Backup / rollback.** A mutating `run` first snapshots every autosave-managed
 skill plus usage/control metadata into
 `~/.claude/state/skill-autosave-curator-backups/<utc-id>/` (owner-only,
-body-free manifest); backup failure aborts the run. Retention keeps the
-newest `backup_keep` snapshots (default 5) — pruning never touches them.
-`rollback [--id]` restores a snapshot (usage/control metadata, skills archived
-since the backup move back, drifted live content is restored after staging)
-and takes a safety snapshot of the current state first, so a rollback is
-itself undoable. The curator backup is lifecycle insurance and is **separate
+body-free manifest); a systemic backup failure aborts the run. A single
+unsafe skill (symlink members, oversized file) is **quarantined** instead:
+excluded from the snapshot, never transitioned that run, and reported in the
+run's `quarantined` list — repair the member and the next run proceeds.
+Retention keeps the newest `backup_keep` snapshots (default 5) — pruning
+never touches them. `rollback [--id]` restores a snapshot (usage/control
+metadata, skills archived since the backup move back, drifted live content is
+restored after staging) and takes a safety snapshot of the current state
+first, so a rollback is itself undoable. A rollback that fails mid-plan is
+recorded `conflict` with the applied count (never a silent "aborted"), and a
+crash-interrupted rollback recovers to `conflict` on the next locked command.
+The curator backup is lifecycle insurance and is **separate
 from the install rollback ledger** (`autoinstall.sh rollback` reverts a single
 install; `curator.py rollback` restores a whole pre-run snapshot — they share
 no state and never move each other's files).

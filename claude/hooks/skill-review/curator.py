@@ -22,6 +22,7 @@ Scope and safety contract:
 from __future__ import annotations
 
 import argparse
+import fcntl
 import importlib.util
 import json
 import os
@@ -64,13 +65,14 @@ _BACKUP_ID_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}Z(?:-\d{2})?$")
 _ARCHIVE_MARKER = ".curator-archive.json"
 _EVENTS = {"view", "use"}
 _STATES = {"active", "stale", "archived"}
-_CURATOR_TX_EVENTS = {"curator-archive", "curator-restore"}
+_CURATOR_TX_EVENTS = {"curator-archive", "curator-restore", "curator-rollback"}
 _TERMINAL_OUTCOMES = {
     "archived",
     "archived-durability-uncertain",
     "restored",
     "restored-durability-uncertain",
     "aborted",
+    "completed",
     "conflict",
 }
 
@@ -206,7 +208,10 @@ def _load_usage(context, *, strict: bool) -> dict[str, Any]:
     path = context.state_dir / _USAGE_FILE
     try:
         data = ownership._safe_json_file(
-            path, owner=context.uid, max_bytes=_MAX_USAGE_BYTES
+            path,
+            owner=context.uid,
+            exact_mode=0o600 if strict else None,
+            max_bytes=_MAX_USAGE_BYTES,
         )
     except FileNotFoundError:
         return {"schema_version": 1, "records": {}}
@@ -426,6 +431,17 @@ def _recover_one_transaction(
 ) -> dict[str, Any]:
     """Finish one dangling prepared row; appends exactly one terminal row."""
     event = row["event"]
+    if event == "curator-rollback":
+        # A rollback spans many skills plus metadata, so its mid-state cannot
+        # be classified from the filesystem. Fail closed: mark it conflict so
+        # the audit trail shows the interruption instead of a silent gap.
+        fields = ownership._transaction_fields_from_record(row)
+        fields["reason"] = "rollback_interrupted"
+        ownership._append_ledger(
+            context,
+            ownership._transaction_record(event, tx, outcome="conflict", fields=fields),
+        )
+        return {"transaction_id": tx, "event": event, "outcome": "conflict"}
     name = row.get("name")
     archive_name = row.get("archive_name")
     if (
@@ -748,7 +764,14 @@ def _copy_skill_into_backup(context, name: str, dest_root: Path) -> dict[str, An
     source = context.skills_dir / name
     total = 0
     file_count = 0
-    for root, _dirs, files in os.walk(source, followlinks=False):
+    for root, dirs, files in os.walk(source, followlinks=False):
+        for dirname in dirs:
+            dir_meta = ownership._lstat(Path(root) / dirname)
+            if dir_meta is None or stat.S_ISLNK(dir_meta.st_mode):
+                # os.walk(followlinks=False) skips these, but copytree
+                # (symlinks=False) would follow them — reject so the safety
+                # walk and the copy can never disagree.
+                raise ContractError("backup_unsafe_member")
         for filename in files:
             path = Path(root) / filename
             metadata = ownership._lstat(path)
@@ -807,7 +830,10 @@ def _snapshot(
 ) -> dict[str, Any]:
     """Owner-only backup of autosave-managed skills + curator metadata.
 
-    Required before any mutating run/rollback: failure aborts the caller.
+    Required before any mutating run/rollback: a systemic failure aborts the
+    caller. A single unsafe/oversized skill is quarantined instead — excluded
+    from the snapshot and reported in ``skipped_unsafe`` so the caller can
+    refuse to transition exactly that skill while the rest proceed.
     """
     ownership._ensure_private_dir(context.state_dir / _BACKUP_DIR, context)
     _check_same_filesystem(context)
@@ -823,6 +849,7 @@ def _snapshot(
     backup_id = candidate
     dest = root / backup_id
     skills_meta: list[dict[str, Any]] = []
+    skipped_unsafe: list[str] = []
     try:
         os.mkdir(dest, mode=0o700)
         os.chmod(dest, 0o700)
@@ -835,7 +862,14 @@ def _snapshot(
                 continue
             if classification["base_classification"] != "autosave-managed":
                 continue
-            info = _copy_skill_into_backup(context, name, dest / "skills")
+            try:
+                info = _copy_skill_into_backup(context, name, dest / "skills")
+            except ContractError as error:
+                if error.code in {"backup_unsafe_member", "backup_member_too_large"}:
+                    shutil.rmtree(dest / "skills" / name, ignore_errors=True)
+                    skipped_unsafe.append(name)
+                    continue
+                raise
             total_bytes += info["bytes"]
             if total_bytes > _MAX_BACKUP_TOTAL_BYTES:
                 raise ContractError("backup_total_too_large")
@@ -862,6 +896,7 @@ def _snapshot(
             "total_bytes": total_bytes,
             "usage_sha256": usage_sha,
             "control_sha256": control_sha,
+            "skipped_unsafe": skipped_unsafe,
         }
         ownership._write_private_atomic(dest / "manifest.json", manifest, context)
     except (ContractError, OSError):
@@ -870,6 +905,7 @@ def _snapshot(
     pruned = _prune_backups(context, keep, protect_ids={backup_id} | set(protect_ids or ()))
     return {
         "backup_id": backup_id,
+        "skipped_unsafe": skipped_unsafe,
         "skill_count": len(skills_meta),
         "total_bytes": total_bytes,
         "pruned": pruned,
@@ -980,11 +1016,16 @@ def _rollback_restore_content(
     if ownership._lstat(source) is None:
         raise ContractError("backup_member_missing")
     staged_new = staging / f"new-{name}"
-    shutil.copytree(source, staged_new, symlinks=False)
-    live = ownership._lstat(context.skills_dir / name) is not None
-    skills_fd = _open_dir(context.skills_dir)
-    staging_fd = _open_dir(staging)
     try:
+        shutil.copytree(source, staged_new, symlinks=False)
+    except OSError:
+        raise ContractError("rollback_restore_failed") from None
+    live = ownership._lstat(context.skills_dir / name) is not None
+    skills_fd: int | None = None
+    staging_fd: int | None = None
+    try:
+        skills_fd = _open_dir(context.skills_dir)
+        staging_fd = _open_dir(staging)
         if live:
             os.rename(
                 name, f"old-{name}", src_dir_fd=skills_fd, dst_dir_fd=staging_fd
@@ -997,8 +1038,10 @@ def _rollback_restore_content(
     except OSError:
         raise ContractError("rollback_restore_failed") from None
     finally:
-        os.close(skills_fd)
-        os.close(staging_fd)
+        if skills_fd is not None:
+            os.close(skills_fd)
+        if staging_fd is not None:
+            os.close(staging_fd)
 
 
 def _rollback_apply_plan(
@@ -1118,10 +1161,27 @@ def _rollback_backup(
         _rollback_restore_metadata(context, usage, backup_root)
         shutil.rmtree(staging, ignore_errors=True)
     except ContractError:
+        # Honest terminal state: "aborted" only when nothing was applied;
+        # a partially applied rollback is a conflict the operator must see.
+        outcome = "aborted" if not results else "conflict"
         ownership._finish_transaction(
-            context, "curator-rollback", tx, outcome="aborted", fields=fields
+            context,
+            "curator-rollback",
+            tx,
+            outcome=outcome,
+            fields={**fields, "applied": len(results)},
         )
         raise
+    except OSError:
+        outcome = "aborted" if not results else "conflict"
+        ownership._finish_transaction(
+            context,
+            "curator-rollback",
+            tx,
+            outcome=outcome,
+            fields={**fields, "applied": len(results)},
+        )
+        raise ContractError("rollback_restore_failed") from None
     ownership._finish_transaction(
         context, "curator-rollback", tx, outcome="completed", fields=fields
     )
@@ -1275,6 +1335,11 @@ def _apply_run_decisions(context, usage, report, now: datetime, config) -> None:
         context, usage, reason="pre-curator-run", now=now, keep=config["backup_keep"]
     )
     report["backup"] = backup
+    quarantined = set(backup.get("skipped_unsafe", ()))
+    if quarantined:
+        # A quarantined skill has no backup: never move it this run. Record
+        # mutations (stale/reactivate) stay allowed — usage.json is backed up.
+        report["quarantined"] = sorted(quarantined)
     for decision in report["decisions"]:
         action = decision["action"]
         if action not in {"mark-stale", "reactivate", "archive"}:
@@ -1285,6 +1350,11 @@ def _apply_run_decisions(context, usage, report, now: datetime, config) -> None:
         elif action == "reactivate":
             record["state"] = "active"
         elif action == "archive" and record["state"] != "archived":
+            if decision["name"] in quarantined:
+                decision["action"] = "quarantine"
+                decision["reason"] = "backup-unsafe-member"
+                report["counts"]["archived"] -= 1
+                continue
             result = _archive_skill(context, usage, decision["name"], now, manual=False)
             decision["archive_name"] = result.get("archive_name")
             decision["durable"] = result.get("durable")
@@ -1298,14 +1368,17 @@ def _command_run(context, *, dry_run: bool, auto: bool) -> dict[str, Any]:
         # Phase-3 LLM consolidation is not implemented; never call a provider.
         raise ContractError("consolidation_not_implemented")
     now = _now()
-    state = _load_curator_state(context)
-    if auto:
-        skip = _run_auto_skip(context, state, config, now, dry_run)
-        if skip is not None:
-            return skip
-    usage = _load_usage(context, strict=True)
-    report = _run_report_skeleton(auto, dry_run, now, config)
     with ownership._MutationLock(context):
+        # Usage and curator state load INSIDE the lock: a bump landing between
+        # an unlocked load and the locked save would be silently overwritten
+        # (lost update), also defeating the recently-active protection.
+        state = _load_curator_state(context)
+        if auto:
+            skip = _run_auto_skip(context, state, config, now, dry_run)
+            if skip is not None:
+                return skip
+        usage = _load_usage(context, strict=True)
+        report = _run_report_skeleton(auto, dry_run, now, config)
         recoveries = _recover_curator_transactions(context, usage)
         if recoveries:
             report["recoveries"] = recoveries
@@ -1469,6 +1542,61 @@ def _command_list_archived(context) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
+class _BumpLock:
+    """Non-blocking variant of the ownership mutation lock.
+
+    A bump must never stall a foreground skill call behind curator work
+    (a mutating run holds the lock for the whole backup). If the lock is
+    busy the bump degrades instead of waiting.
+    """
+
+    def __init__(self, context):
+        self.context = context
+        self.descriptor: int | None = None
+
+    def __enter__(self) -> "_BumpLock":
+        ownership._prepare_state(self.context)
+        path = self.context.state_dir / ownership._LOCK_FILE
+        flags = (
+            os.O_RDWR
+            | os.O_CREAT
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        try:
+            self.descriptor = os.open(path, flags, 0o600)
+            metadata = os.fstat(self.descriptor)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != self.context.uid
+                or metadata.st_nlink != 1
+                or stat.S_IMODE(metadata.st_mode) & 0o077
+            ):
+                raise ContractError("unsafe_ownership_lock")
+            os.fchmod(self.descriptor, 0o600)
+            fcntl.flock(self.descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except (OSError, ContractError) as error:
+            if self.descriptor is not None:
+                try:
+                    os.close(self.descriptor)
+                except OSError:
+                    pass
+                self.descriptor = None
+            if isinstance(error, ContractError):
+                raise
+            raise ContractError("bump_lock_busy") from None
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        if self.descriptor is not None:
+            descriptor = self.descriptor
+            self.descriptor = None
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            finally:
+                os.close(descriptor)
+
+
 def _command_bump(context, name: str, event: str) -> dict[str, Any]:
     """Fail-open telemetry increment; never blocks the foreground caller."""
     try:
@@ -1478,7 +1606,7 @@ def _command_bump(context, name: str, event: str) -> dict[str, Any]:
         if ownership._lstat(context.skills_dir / name / "SKILL.md") is None:
             raise ContractError("skill_missing")
         now = _now()
-        with ownership._MutationLock(context):
+        with _BumpLock(context):
             usage = _load_usage(context, strict=False)
             key = _record_key(context, name)
             record = usage["records"].get(key)
@@ -1506,8 +1634,8 @@ def _command_archive(context, name: str, dry_run: bool) -> dict[str, Any]:
             "name": name,
             "target_id": classification["target_id"],
         }
-    usage = _load_usage(context, strict=True)
     with ownership._MutationLock(context):
+        usage = _load_usage(context, strict=True)
         _recover_curator_transactions(context, usage)
         _sync_patches_from_ledger(context, usage)
         if usage["records"].get(_record_key(context, name)) is None:
@@ -1530,8 +1658,8 @@ def _command_restore(context, name: str, dry_run: bool) -> dict[str, Any]:
             "name": name,
             "archive_name": record.get("archive_name"),
         }
-    usage = _load_usage(context, strict=True)
     with ownership._MutationLock(context):
+        usage = _load_usage(context, strict=True)
         _recover_curator_transactions(context, usage)
         result = _restore_skill(context, usage, name, now)
     return {"ok": True, "command": "restore", "dry_run": False, **result}
@@ -1575,8 +1703,8 @@ def _command_rollback(context, backup_id: str | None, dry_run: bool) -> dict[str
         return _rollback_backup(
             context, usage, backup_id, now, keep=config["backup_keep"], dry_run=True
         )
-    usage = _load_usage(context, strict=True)
     with ownership._MutationLock(context):
+        usage = _load_usage(context, strict=True)
         _recover_curator_transactions(context, usage)
         return _rollback_backup(
             context, usage, backup_id, now, keep=config["backup_keep"], dry_run=False
