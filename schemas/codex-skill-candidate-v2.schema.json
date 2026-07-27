@@ -239,7 +239,7 @@
     },
     "proposals": {
       "items": {
-        "oneOf": [
+        "anyOf": [
           {
             "$ref": "#/$defs/CreateProposal"
           },
