@@ -24,7 +24,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-HOOK_FILES = [
+# Fallback only. The live list is walked from the repo (see hook_files) using the
+# same rule as ccc_hook_tree_files in scripts/lib/harness-paths.sh, which setup.sh
+# and validate-harness.sh already share. This list used to be authoritative and
+# silently omitted distill.sh, refresh-memory.sh, scan-injection.sh and
+# skill-review.sh, so doctor reported a clean node while distill.sh sat 42 lines
+# behind and was missing the #386 fleet autonomy kill-switch entirely.
+HOOK_FILES_FALLBACK = [
     "hooks/load-memory.sh",
     "hooks/load-tools.sh",
     "hooks/checkpoint.sh",
@@ -34,6 +40,9 @@ HOOK_FILES = [
     "hooks/notify.sh",
     "hooks/evidence-gate.sh",
 ]
+# Mirrors the exclusions in ccc_hook_tree_files (harness-paths.sh).
+HOOK_TREE_SKIP_NAMES = {"test-stub.sh", "hooks.json", "enforcement-overlay.json"}
+HOOK_TREE_SKIP_SUFFIXES = (".test.sh", ".pyc", ".md")
 OUTPUT_STYLE_FILES = ["output-styles/ccc-report.md"]
 VALID_SCOPES = {"settings", "files", "hooks", "output-styles", "all"}
 CODEX_PROBE_TIMEOUT_SECONDS = 5.0
@@ -65,6 +74,27 @@ class Doctor:
     def add(self, klass: str, item: str, status: str, action: str) -> None:
         self.rows.append(Row(klass, item, status, action))
         self.counts[klass] += 1
+
+    def hook_files(self) -> list[str]:
+        """Deployable hook tree, walked from the repo — never a hand-kept list.
+
+        Same rule as ccc_hook_tree_files (scripts/lib/harness-paths.sh), which
+        setup.sh deploys from: whatever setup installs is what doctor watches, so
+        a new hook cannot land outside doctor's view. Falls back to the historical
+        list when the repo tree is unreadable.
+        """
+        root = self.repo / "claude" / "hooks"
+        if not root.is_dir():
+            return list(HOOK_FILES_FALLBACK)
+        out: list[str] = []
+        for path in root.rglob("*"):
+            if not path.is_file() or "__pycache__" in path.parts:
+                continue
+            name = path.name
+            if name in HOOK_TREE_SKIP_NAMES or name.endswith(HOOK_TREE_SKIP_SUFFIXES):
+                continue
+            out.append(f"hooks/{path.relative_to(root).as_posix()}")
+        return sorted(out) or list(HOOK_FILES_FALLBACK)
 
     def scope_has(self, want: str) -> bool:
         parts = set(self.scope.split(","))
@@ -164,7 +194,7 @@ class Doctor:
             else:
                 self.add("수동필요", "install mode", "could not distinguish standalone vs plugin", "inspect settings.json/plugin ownership to avoid double-firing")
 
-        for rel in HOOK_FILES:
+        for rel in self.hook_files():
             src = self.repo / "claude" / rel
             dst = self.claude_dir / rel
             if not dst.is_file():
@@ -699,7 +729,7 @@ class Doctor:
         out: list[str] = []
         groups: list[str] = []
         if self.scope_has("hooks"):
-            groups += HOOK_FILES
+            groups += self.hook_files()
         if self.scope_has("output-styles"):
             groups += OUTPUT_STYLE_FILES
         for rel in groups:

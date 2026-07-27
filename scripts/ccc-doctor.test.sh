@@ -2,6 +2,9 @@
 # Tests for ccc doctor — diagnostic-only harness drift classification.
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# ccc_hook_tree_files — the canonical deployable-hook walk shared with setup.sh.
+# shellcheck source=scripts/lib/harness-paths.sh
+. "$ROOT/scripts/lib/harness-paths.sh"
 DOCTOR="$ROOT/scripts/ccc-doctor.sh"
 pass=0; fail=0
 # Some hardened runners mount /tmp noexec; the doctor must execute fixture CLIs.
@@ -20,23 +23,17 @@ make_fixture() { # <name> <mode:standalone|plugin>
   cp "$ROOT/claude/settings.local.template.json" "$dir/repo/claude/settings.local.template.json"
   cp "$ROOT/claude/hooks/enforcement-overlay.json" "$dir/repo/claude/hooks/enforcement-overlay.json"
   cp "$ROOT/claude/hooks/hooks.json" "$dir/repo/claude/hooks/hooks.json"
-  cp "$ROOT/claude/hooks/load-memory.sh" "$dir/repo/claude/hooks/load-memory.sh"
-  cp "$ROOT/claude/hooks/load-tools.sh" "$dir/repo/claude/hooks/load-tools.sh"
-  cp "$ROOT/claude/hooks/checkpoint.sh" "$dir/repo/claude/hooks/checkpoint.sh"
-  cp "$ROOT/claude/hooks/statusline.sh" "$dir/repo/claude/hooks/statusline.sh"
-  cp "$ROOT/claude/hooks/audit.sh" "$dir/repo/claude/hooks/audit.sh"
-  cp "$ROOT/claude/hooks/redact.sh" "$dir/repo/claude/hooks/redact.sh"
-  cp "$ROOT/claude/hooks/notify.sh" "$dir/repo/claude/hooks/notify.sh"
-  cp "$ROOT/claude/hooks/evidence-gate.sh" "$dir/repo/claude/hooks/evidence-gate.sh"
+  # Deploy the whole hook tree into both sides the way setup.sh does — via the
+  # shared walk, not a hand-kept list. The list this replaced named the same 8
+  # hooks doctor used to watch, so as hooks were added the fixture drifted with
+  # it and a "healthy node" fixture silently stopped resembling a real install.
+  while IFS= read -r _rel; do
+    [ -n "$_rel" ] || continue
+    mkdir -p "$dir/repo/claude/hooks/$(dirname "$_rel")" "$dir/home/.claude/hooks/$(dirname "$_rel")"
+    cp "$ROOT/claude/hooks/$_rel" "$dir/repo/claude/hooks/$_rel"
+    cp "$ROOT/claude/hooks/$_rel" "$dir/home/.claude/hooks/$_rel"
+  done < <(ccc_hook_tree_files "$ROOT")
   cp "$ROOT/claude/output-styles/ccc-report.md" "$dir/repo/claude/output-styles/ccc-report.md"
-  cp "$ROOT/claude/hooks/load-memory.sh" "$dir/home/.claude/hooks/load-memory.sh"
-  cp "$ROOT/claude/hooks/load-tools.sh" "$dir/home/.claude/hooks/load-tools.sh"
-  cp "$ROOT/claude/hooks/checkpoint.sh" "$dir/home/.claude/hooks/checkpoint.sh"
-  cp "$ROOT/claude/hooks/statusline.sh" "$dir/home/.claude/hooks/statusline.sh"
-  cp "$ROOT/claude/hooks/audit.sh" "$dir/home/.claude/hooks/audit.sh"
-  cp "$ROOT/claude/hooks/redact.sh" "$dir/home/.claude/hooks/redact.sh"
-  cp "$ROOT/claude/hooks/notify.sh" "$dir/home/.claude/hooks/notify.sh"
-  cp "$ROOT/claude/hooks/evidence-gate.sh" "$dir/home/.claude/hooks/evidence-gate.sh"
   cp "$ROOT/claude/output-styles/ccc-report.md" "$dir/home/.claude/output-styles/ccc-report.md"
   printf '#!/usr/bin/env bash\n[ "$1" = "--status" ] || [ "$3" = "--status" ] || true\necho bridge status ok\n' > "$dir/repo/bridge/start.sh"
   chmod +x "$dir/repo/bridge/start.sh"
