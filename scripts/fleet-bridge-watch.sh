@@ -20,6 +20,11 @@
 #   CCC_FLEET_NODES  space-separated node list (default: canonical 12)
 #   CCC_FLEET_SSH    ssh binary (default: ssh)
 #   CCC_FLEET_SELF   node name to probe locally instead of over ssh
+#   CCC_FLEET_DOCTOR set to 1 to also run ccc-doctor on every node and fail on
+#                    drift. Off by default so the bridge check stays fast; the
+#                    sweep is scheduled separately with its own timeout, since
+#                    only 3 of 12 nodes have agent-cron and the rest would
+#                    otherwise never be checked for harness drift.
 set -u
 
 NODES="${CCC_FLEET_NODES:-seoseo dungae sogyo nosuk bangtong yukson soonwook gwakga jingun gongmyoung gongyung daegyo}"
@@ -60,14 +65,34 @@ for u in /etc/systemd/system/ccc-telegram-bridge.service /home/*/.config/systemd
   [ -n "$unit_root" ] && break
 done
 echo "UNIT=${unit_root:--}"
+
+# doctor (opt-in). Runs as the account that owns the bridge, against the claude
+# dir that belongs to it — both derived above, never guessed.
+if [ "${CCC_FLEET_DOCTOR:-0}" = "1" ] && [ -x "$root/scripts/ccc-doctor.sh" ]; then
+  cdir="${bpath:-$HOME}/.claude"
+  if [ "$(id -u)" = "$runuid" ]; then
+    CCC_DOCTOR_CLAUDE_DIR="$cdir" timeout 60 "$root/scripts/ccc-doctor.sh" >/dev/null 2>&1
+  else
+    su - "$runuser" -c "CCC_DOCTOR_CLAUDE_DIR='$cdir' timeout 60 '$root/scripts/ccc-doctor.sh'" >/dev/null 2>&1
+  fi
+  echo "DOCTOR=$?"
+else
+  echo "DOCTOR=-"
+fi
 PROBE_EOF
 
 fail=0
 for node in $NODES; do
+  # The flag is prepended to the piped script rather than passed as an ssh
+  # argument: the remote command stays exactly `sh -s`, so nothing downstream
+  # has to parse a modified argv.
+  payload="CCC_FLEET_DOCTOR=${CCC_FLEET_DOCTOR:-0}
+$PROBE"
+  if [ "${CCC_FLEET_DOCTOR:-0}" = "1" ]; then node_budget=90; else node_budget=30; fi
   if [ "$node" = "$SELF" ]; then
-    out=$(printf '%s' "$PROBE" | sh -s 2>/dev/null)
+    out=$(printf '%s' "$payload" | sh -s 2>/dev/null)
   else
-    out=$(printf '%s' "$PROBE" | timeout 30 "$SSH_BIN" -o BatchMode=yes -o ConnectTimeout=8 "$node" sh -s 2>/dev/null)
+    out=$(printf '%s' "$payload" | timeout "$node_budget" "$SSH_BIN" -o BatchMode=yes -o ConnectTimeout=8 "$node" sh -s 2>/dev/null)
   fi
 
   if [ -z "$out" ]; then
@@ -86,6 +111,12 @@ for node in $NODES; do
   # serves the stale checkout. Report it even though availability passed.
   if [ -n "$unit" ] && [ "$unit" != "-" ] && [ "$unit" != "$runtime" ]; then
     echo "BOOTPATH $node unit=$unit runtime=$runtime"; fail=1; continue
+  fi
+
+  doctor=$(printf '%s\n' "$out" | sed -n 's/^DOCTOR=//p' | head -1)
+  # doctor exits nonzero on 교정가능/수동필요 findings; 경고 does not count.
+  if [ -n "$doctor" ] && [ "$doctor" != "-" ] && [ "$doctor" != "0" ]; then
+    echo "DRIFT $node doctor_exit=$doctor runtime=$runtime"; fail=1; continue
   fi
 
   echo "OK $node ($runtime)"
