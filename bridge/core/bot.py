@@ -2,6 +2,7 @@
 import asyncio
 import hashlib
 import logging
+import os
 import re
 import time
 from dataclasses import dataclass
@@ -708,11 +709,19 @@ class TelegramBot(
         previous_session_id: Optional[str] = None,
     ) -> str:
         provider_label = "Claude Code" if provider == "claude" else "Codex"
+        # Banner model label: explicit /model choice first, then the operator
+        # display label, then the env-routed model (Claude path only), so the
+        # notice reflects the real backend instead of a bare "default".
+        display_model = model or os.environ.get("CCC_MODEL_LABEL", "").strip()
+        if not display_model and provider == "claude":
+            display_model = os.environ.get("ANTHROPIC_MODEL", "").strip()
+        if not display_model:
+            display_model = "default"
         lines = [
             f"◐ CCC session started ({reason}). Conversation history is on a fresh {provider_label} stream.",
             "Use /resume to browse and restore a previous session.",
             "",
-            f"◆ Model: {model or 'default'}",
+            f"◆ Model: {display_model}",
             f"◆ Provider: {provider_label}",
             "◆ Context: new stream",
         ]
