@@ -19,6 +19,9 @@
 #   CCC_PERMISSION_MODE permission mode baseline (e.g. dontAsk, acceptEdits); optional
 #   CCC_MODEL           model override passed as --model; optional
 #   CCC_CLAUDE_BIN      claude binary (default: claude)
+#   CCC_HEADLESS_TIMEOUT wall-clock cap in seconds (default: 1500; 0 disables).
+#                       Guards against a run that never returns (e.g. an unbounded
+#                       polling loop in generated Bash). Exit 124 on timeout.
 set -uo pipefail
 
 PROMPT="${1:-}"
@@ -38,12 +41,28 @@ args=(-p "$PROMPT" --output-format json --allowedTools "$ALLOWED")
 ERRF="$(mktemp "${TMPDIR:-/tmp}"/ccc-headless.XXXXXX.err)"
 trap 'rm -f "$ERRF"' EXIT
 
+# Wall-clock guard: a generated unbounded loop (e.g. `until <cond>; do sleep 5; done`)
+# otherwise hangs the caller forever. Skipped when coreutils `timeout` is absent.
+TMO="${CCC_HEADLESS_TIMEOUT:-1500}"
+runner=("$BIN")
+case "$TMO" in
+  0|'') ;;
+  *[!0-9]*) echo "ccc-headless: invalid CCC_HEADLESS_TIMEOUT: $TMO" >&2; exit 2 ;;
+  *) command -v timeout >/dev/null 2>&1 && runner=(timeout -k 30 "$TMO" "$BIN") ;;
+esac
+
 if [ ! -t 0 ]; then
-  RESP="$(cat | "$BIN" "${args[@]}" 2>"$ERRF")"
+  RESP="$(cat | "${runner[@]}" "${args[@]}" 2>"$ERRF")"
 else
-  RESP="$("$BIN" "${args[@]}" 2>"$ERRF")"
+  RESP="$("${runner[@]}" "${args[@]}" 2>"$ERRF")"
 fi
 rc=$?
+
+if [ "$rc" -eq 124 ]; then
+  echo "ccc-headless: $BIN exceeded CCC_HEADLESS_TIMEOUT=${TMO}s and was killed" >&2
+  cat "$ERRF" >&2
+  exit 124
+fi
 
 if [ "$rc" -ne 0 ]; then
   echo "ccc-headless: $BIN exited $rc" >&2

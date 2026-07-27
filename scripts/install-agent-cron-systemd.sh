@@ -17,6 +17,10 @@ CODEX_SANDBOX="${CCC_CODEX_SANDBOX:-read-only}"
 SPOOL="${CCC_AGENT_CRON_PUSH_SPOOL:-${CCC_PUSH_SPOOL:-$HOME/.claude/state/telegram-spool}}"
 SYSTEMD_DIR="${CCC_SYSTEMD_DIR:-}"
 SYSTEMCTL="${CCC_SYSTEMCTL:-systemctl}"
+# systemd defaults TimeoutStartSec to `infinity` for Type=oneshot, so a hung tick
+# blocks the unit in `activating` forever and the timer can never fire again.
+# Always emit an explicit cap. (#55)
+TIMEOUT_START="${CCC_AGENT_CRON_TIMEOUT_START:-1800}"
 ENABLE=1
 RESTART=1
 
@@ -25,6 +29,7 @@ usage() {
 Usage: install-agent-cron-systemd.sh [--dry-run|--apply] [--user] [--service-name NAME]
        [--on-calendar SPEC] [--store PATH] [--runner claude|codex]
        [--headless PATH] [--spool PATH] [--codex-sandbox MODE]
+       [--timeout-start SEC|infinity]
 
 Installs ${SERVICE_NAME}.service and ${SERVICE_NAME}.timer for one-shot
 agent-cron scheduler execution. Defaults to dry-run. --apply is required for
@@ -45,6 +50,7 @@ while [ $# -gt 0 ]; do
     --headless) need_val "$1" "${2:-}"; HEADLESS="$2"; shift ;;
     --spool) need_val "$1" "${2:-}"; SPOOL="$2"; shift ;;
     --codex-sandbox) need_val "$1" "${2:-}"; CODEX_SANDBOX="$2"; shift ;;
+    --timeout-start) need_val "$1" "${2:-}"; TIMEOUT_START="$2"; shift ;;
     --no-enable) ENABLE=0 ;;
     --no-restart) RESTART=0 ;;
     -h|--help) usage; exit 0 ;;
@@ -55,6 +61,10 @@ done
 
 case "$SERVICE_NAME" in
   *[!A-Za-z0-9_.@-]*|"" ) echo "invalid service name: $SERVICE_NAME" >&2; exit 2 ;;
+esac
+case "$TIMEOUT_START" in
+  infinity) ;;
+  ''|*[!0-9]*) echo "invalid --timeout-start (want seconds or 'infinity'): $TIMEOUT_START" >&2; exit 2 ;;
 esac
 case "$RUNNER" in
   claude|codex) ;;
@@ -101,6 +111,7 @@ Environment=CCC_CODEX_BIN=$CODEX_BIN
 Environment=CCC_CODEX_SANDBOX=$CODEX_SANDBOX
 Environment=CCC_AGENT_CRON_PUSH_SPOOL=$SPOOL
 ExecStart=$ROOT/scripts/agent-cron.sh scheduler --execute --json
+TimeoutStartSec=$TIMEOUT_START
 Nice=5
 EOF
 )"
