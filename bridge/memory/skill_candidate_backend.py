@@ -62,10 +62,16 @@ _REDACTION_MARKER = "[REDACTED]"
 
 
 class SkillCandidateBackendError(RuntimeError):
-    """Stable body-free failure from the isolated skill-candidate backend."""
+    """Stable body-free failure from the isolated skill-candidate backend.
 
-    def __init__(self, code: str) -> None:
+    ``exit_status`` mirrors CodexDistillBackendError: the provider's exit status
+    on a nonzero exit and nothing else. Kept out of ``code`` so downstream
+    exact-match classification stays intact.
+    """
+
+    def __init__(self, code: str, *, exit_status: int | None = None) -> None:
         self.code = code
+        self.exit_status = exit_status
         super().__init__(code)
 
 
@@ -189,7 +195,8 @@ class CodexExecSkillCandidateBackend:
         except CodexDistillBackendError as exc:
             # Re-label the runner's distill-named code into a skill code.
             raise SkillCandidateBackendError(
-                exc.code.replace("codex_distill_", "skill_candidate_", 1)
+                exc.code.replace("codex_distill_", "skill_candidate_", 1),
+                exit_status=exc.exit_status,
             ) from None
         try:
             result = parse_skill_candidate_output(output_payload)

@@ -73,10 +73,21 @@ _INHERITED_ENV_NAMES: Final = (
 
 
 class CodexDistillBackendError(RuntimeError):
-    """Stable body-free failure from the isolated provider boundary."""
+    """Stable body-free failure from the isolated provider boundary.
 
-    def __init__(self, code: str) -> None:
+    ``exit_status`` carries the provider's own exit status when the failure was a
+    nonzero exit, and nothing else: no stdout, no stderr, no output body. It is a
+    separate attribute rather than part of ``code`` because retry classification
+    (`_RETRYABLE_BACKEND_CODES` in distill_worker) matches ``code`` exactly, so
+    encoding the status there would silently drop the failure out of that set.
+
+    Negative values are POSIX signal semantics (``-9`` is SIGKILL), matching
+    ``subprocess`` conventions.
+    """
+
+    def __init__(self, code: str, *, exit_status: int | None = None) -> None:
         self.code = code
+        self.exit_status = exit_status
         super().__init__(code)
 
 
@@ -302,7 +313,13 @@ async def run_codex_exec(
                 await _stop_process(process)
                 raise CodexDistillBackendError("codex_distill_io_failed") from None
             if process.returncode != 0:
-                raise CodexDistillBackendError("codex_distill_nonzero_exit")
+                # Status only. A schema rejection (400), an auth failure and a
+                # sandbox error all exit nonzero and are otherwise
+                # indistinguishable downstream — #760 had to be reproduced by
+                # hand to find out which. stderr stays discarded.
+                raise CodexDistillBackendError(
+                    "codex_distill_nonzero_exit", exit_status=process.returncode
+                )
             return _read_private_output(output, max_bytes=max_output_bytes)
     except CodexDistillBackendError:
         raise
