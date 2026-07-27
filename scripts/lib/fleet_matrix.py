@@ -39,6 +39,35 @@ _UNREACHABLE = [
 #: Fixed summary key order (shared).
 _SUMMARY_KEYS = ["정상", "경고", "교정가능", "수동필요", "위험"]
 
+#: Severity precedence, worst first. A node is only as healthy as its worst
+#: finding, so classification must consume this order — not source order.
+_SEVERITY_ORDER = ["위험", "수동필요", "교정가능", "경고", "정상"]
+
+#: ccc-doctor prints an authoritative tally above its detail table:
+#:     - 정상: 45
+#:     - 경고: 3
+#: Reading the tally beats substring-matching the body, which cannot tell a
+#: status row from the same word appearing in a guidance column (#770).
+_COUNT_LINE_RE = re.compile(
+    r"^[ \t]*[-*][ \t]*(정상|경고|교정가능|수동필요|위험)[ \t]*:[ \t]*(\d+)[ \t]*$",
+    re.M,
+)
+
+#: Tally status -> outcome id. Reason strings stay identical to the equivalent
+#: JSON-branch outcomes, so no new vocabulary reaches downstream consumers.
+_COUNT_OUTCOME = {
+    "위험": "counts_danger",
+    "수동필요": "counts_manual",
+    "교정가능": "counts_fixable",
+    "경고": "counts_warning",
+    "정상": "counts_ok",
+}
+
+
+def parse_status_counts(body: str) -> Dict[str, int]:
+    """Extract the emitter's own per-status tally, if the body carries one."""
+    return {m.group(1): int(m.group(2)) for m in _COUNT_LINE_RE.finditer(body)}
+
 _SECRET_WORDS = re.compile(
     r"(token|secret|password|passwd|api[_-]?key|authorization|bearer)", re.I
 )
@@ -110,18 +139,30 @@ def classify(body: str, domain: Domain) -> Tuple[str, str]:
         return r["json_ok"]
     except Exception:
         pass
+    # An explicit tally is authoritative: it is the emitter's own count, and it
+    # distinguishes a status row from the same word in prose. Worst non-zero
+    # status wins.
+    counts = parse_status_counts(body)
+    if any(counts.values()):
+        for status in _SEVERITY_ORDER:
+            if counts.get(status):
+                return r[_COUNT_OUTCOME[status]]
     if re.search(r"\bFAIL=([1-9][0-9]*)\b", body) or any(
         s in low for s in domain.text_danger_low_extra
     ) or any(s in body for s in domain.text_danger_body_extra):
         return r["text_fail"]
+    # Severity before health. This pair was previously inverted: every doctor
+    # report contains 정상 rows alongside its 경고 rows, so the 정상 test matched
+    # first and the 경고 test below was unreachable — a warning fleet reported
+    # itself as clean (#770).
+    if "warning" in low or "경고" in body:
+        return r["text_warning"]
     if (
         re.search(r"\bPASS=\d+\s+FAIL=0\b", body)
         or domain.ok_phrase_low in low
         or "정상" in body
     ):
         return r["text_ok"]
-    if "warning" in low or "경고" in body:
-        return r["text_warning"]
     return r["unclassified"]
 
 
@@ -192,6 +233,11 @@ DOMAINS: Dict[str, Domain] = {
             "text_fail": ("위험", "test_failures_present"),
             "text_ok": ("정상", "doctor_ok_text"),
             "text_warning": ("경고", "warnings_present"),
+            "counts_danger": ("위험", "doctor_reported_failure"),
+            "counts_manual": ("수동필요", "manual_action_required"),
+            "counts_fixable": ("교정가능", "fixable_drift"),
+            "counts_warning": ("경고", "warnings_present"),
+            "counts_ok": ("정상", "doctor_ok_text"),
             "unclassified": ("수동필요", "unclassified_output"),
         },
         mutations={
@@ -219,6 +265,11 @@ DOMAINS: Dict[str, Domain] = {
             "text_fail": ("위험", "security_failures_present"),
             "text_ok": ("정상", "security_audit_ok_text"),
             "text_warning": ("경고", "security_warnings_present"),
+            "counts_danger": ("위험", "security_failures_present"),
+            "counts_manual": ("수동필요", "manual_action_required"),
+            "counts_fixable": ("교정가능", "fixable_security_drift"),
+            "counts_warning": ("경고", "security_warnings_present"),
+            "counts_ok": ("정상", "security_audit_ok_text"),
             "unclassified": ("수동필요", "unclassified_output"),
         },
         mutations={

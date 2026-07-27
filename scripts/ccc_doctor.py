@@ -129,11 +129,16 @@ class Doctor:
         version = self.repo / "scripts" / "ccc-version.sh"
         if os.access(version, os.X_OK):
             try:
-                return subprocess.check_output(
-                    [str(version)], env={**os.environ, "CCC_VERSION_REPO_DIR": str(self.repo)}, text=True, stderr=subprocess.DEVNULL
-                ).strip() or "unknown"
+                # Invoked through an explicit bash, not as a bare executable:
+                # the script's `#!/usr/bin/env bash` shebang cannot be resolved
+                # on Termux (no /usr/bin/env), where direct exec raises ENOENT.
+                out = subprocess.check_output(
+                    ["bash", str(version)], env={**os.environ, "CCC_VERSION_REPO_DIR": str(self.repo)}, text=True, stderr=subprocess.DEVNULL
+                ).strip()
+                if out:
+                    return out
             except Exception:
-                return "unknown"
+                pass  # fall through to git describe rather than giving up (#770)
         try:
             return subprocess.check_output(
                 ["git", "-C", str(self.repo), "describe", "--tags", "--dirty", "--always"], text=True, stderr=subprocess.DEVNULL
@@ -475,8 +480,14 @@ class Doctor:
     def check_bridge_status(self) -> None:
         start = self.repo / "bridge/start.sh"
         if os.access(start, os.X_OK):
+            # Probe the home the bridge actually serves, derived from the live
+            # process. This was hardcoded to /root, so every non-root node
+            # (Termux: $HOME=/data/data/com.termux/files/home) probed a home
+            # nobody serves and reported a healthy bridge as "no status
+            # output" (#770).
+            probe_home = self.running_bridge_home() or os.path.expanduser("~")
             try:
-                out = subprocess.run([str(start), "--path", "/root", "--status"], text=True, capture_output=True, timeout=20)
+                out = subprocess.run(["bash", str(start), "--path", probe_home, "--status"], text=True, capture_output=True, timeout=20)
                 tail = "\n".join((out.stdout + out.stderr).splitlines()[-5:])
                 if tail:
                     self.add("정상", "bridge status", "readable", "none")
@@ -501,6 +512,29 @@ class Doctor:
                 return token[:index]
         return None
 
+    def bridge_command_lines(self) -> list[str]:
+        """Live bridge process command lines (the source of truth for paths)."""
+        try:
+            out = subprocess.run(
+                ["ps", "-eo", "command"], text=True, capture_output=True, timeout=10
+            ).stdout
+        except Exception:
+            return []
+        return [
+            line
+            for line in out.splitlines()
+            if "telegram_bot" in line and "--path" in line and "grep" not in line
+        ]
+
+    @staticmethod
+    def bridge_home_of(command: str) -> str | None:
+        """The --path (bridge home) a bridge command line serves."""
+        tokens = command.split()
+        for index, token in enumerate(tokens[:-1]):
+            if token == "--path":
+                return tokens[index + 1]
+        return None
+
     def running_bridge_root(self) -> str | None:
         """The checkout the bridge is ACTUALLY serving from.
 
@@ -508,17 +542,18 @@ class Doctor:
         several checkouts (/opt, /root, /home/<user>) and the first one found on
         disk is not necessarily the live one.
         """
-        try:
-            out = subprocess.run(
-                ["ps", "-eo", "command"], text=True, capture_output=True, timeout=10
-            ).stdout
-        except Exception:
-            return None
-        for line in out.splitlines():
-            if "telegram_bot" in line and "--path" in line and "grep" not in line:
-                root = self.checkout_root_of(line)
-                if root:
-                    return root
+        for line in self.bridge_command_lines():
+            root = self.checkout_root_of(line)
+            if root:
+                return root
+        return None
+
+    def running_bridge_home(self) -> str | None:
+        """The home the bridge serves, for probes that must target it."""
+        for line in self.bridge_command_lines():
+            home = self.bridge_home_of(line)
+            if home:
+                return home
         return None
 
     def unit_bridge_root(self, unit: Path) -> str | None:
@@ -548,6 +583,13 @@ class Doctor:
                 "none",
             )
             return
+        # The property under test is "whatever restarts the bridge points at the
+        # live checkout" — systemd is only how Linux nodes implement it. Termux
+        # nodes boot through Termux:Boot, so asking them for a unit reported a
+        # correctly-booting node as unprotected (#770).
+        if not self.has_systemd():
+            self.check_bridge_boot_path_termux(running)
+            return
         units = [Path("/etc/systemd/system/ccc-telegram-bridge.service")]
         units += sorted(
             Path("/home").glob("*/.config/systemd/user/ccc-telegram-bridge.service")
@@ -575,6 +617,64 @@ class Doctor:
                 "bridge boot path",
                 f"bridge runs from {running} but no unit declares it",
                 "nothing restarts the bridge on reboot; install the systemd unit if this node should self-start",
+            )
+
+    @staticmethod
+    def has_systemd() -> bool:
+        """Whether this node booted with a systemd that could own the unit."""
+        return Path("/run/systemd/system").is_dir()
+
+    def declared_boot_root(self, line: str) -> str | None:
+        """Checkout root a boot-script line starts the bridge from.
+
+        Boot scripts reach the checkout through the shell (`"$HOME/ccc-node/…"`)
+        rather than as a literal path, so quotes and $HOME are resolved before
+        the shared extractor runs.
+        """
+        home = os.path.expanduser("~")
+        cleaned = line.replace('"', " ").replace("'", " ")
+        cleaned = cleaned.replace("${HOME}", home).replace("$HOME", home)
+        return self.checkout_root_of(cleaned)
+
+    def check_bridge_boot_path_termux(self, running: str) -> None:
+        """Termux:Boot equivalent of the unit check — same property, same severity."""
+        boot_dir = Path(os.path.expanduser("~/.termux/boot"))
+        declared: list[tuple[Path, str]] = []
+        if boot_dir.is_dir():
+            for script in sorted(boot_dir.glob("*.sh")):
+                try:
+                    text = script.read_text(errors="replace")
+                except OSError:
+                    continue
+                for line in text.splitlines():
+                    root = self.declared_boot_root(line)
+                    if root:
+                        declared.append((script, root))
+                        break
+        for script, root in declared:
+            if root != running:
+                self.add(
+                    "수동필요",
+                    "bridge boot path",
+                    f"{script} starts {root} but the bridge runs from {running}",
+                    "point the Termux:Boot script at the running checkout, or "
+                    "remove it; a reboot would otherwise serve the stale copy",
+                )
+                return
+        if declared:
+            self.add(
+                "정상",
+                "bridge boot path",
+                f"Termux:Boot script and runtime agree ({running})",
+                "none",
+            )
+        else:
+            self.add(
+                "경고",
+                "bridge boot path",
+                f"bridge runs from {running} but no Termux:Boot script starts it",
+                "nothing restarts the bridge on reboot; add ~/.termux/boot/start-telegram-bridge.sh "
+                "if this node should self-start",
             )
 
     def check_memory_cache(self) -> None:
