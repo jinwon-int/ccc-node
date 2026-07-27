@@ -186,6 +186,7 @@ class Doctor:
 
         self.check_overlay_parity()
         self.check_bridge_status()
+        self.check_bridge_boot_path()
         self.check_memory_cache()
         self.check_provider_readiness()
         # Managed Codex skills are provider-native (#647): diagnose them only on
@@ -455,6 +456,96 @@ class Doctor:
                 self.add("경고", "bridge status", "no status output", "check bridge/start.sh manually if this node owns Telegram bridge")
         else:
             self.add("경고", "bridge status", "bridge/start.sh missing or not executable", "not all nodes run the Telegram bridge; install/check only if needed")
+
+    @staticmethod
+    def checkout_root_of(command: str) -> str | None:
+        """Extract the ccc-node checkout a bridge command line runs from.
+
+        Handles both deployed ExecStart shapes: `/bin/bash <root>/bridge/start.sh …`
+        and `<root>/bridge/venv/bin/python -m telegram_bot …`.
+        """
+        marker = "/bridge/"
+        for token in command.split():
+            index = token.find(marker)
+            if index > 0:
+                return token[:index]
+        return None
+
+    def running_bridge_root(self) -> str | None:
+        """The checkout the bridge is ACTUALLY serving from.
+
+        Derived from the live process, never from a path guess: a node can hold
+        several checkouts (/opt, /root, /home/<user>) and the first one found on
+        disk is not necessarily the live one.
+        """
+        try:
+            out = subprocess.run(
+                ["ps", "-eo", "command"], text=True, capture_output=True, timeout=10
+            ).stdout
+        except Exception:
+            return None
+        for line in out.splitlines():
+            if "telegram_bot" in line and "--path" in line and "grep" not in line:
+                root = self.checkout_root_of(line)
+                if root:
+                    return root
+        return None
+
+    def unit_bridge_root(self, unit: Path) -> str | None:
+        try:
+            text = unit.read_text(errors="replace")
+        except OSError:
+            return None
+        for line in text.splitlines():
+            if line.startswith("ExecStart="):
+                return self.checkout_root_of(line.split("=", 1)[1])
+        return None
+
+    def check_bridge_boot_path(self) -> None:
+        """The unit that starts the bridge must point at the live checkout (#55 follow-up).
+
+        A unit left pointing at a stale twin checkout is silent: the running
+        bridge is healthy, so nothing looks wrong, but the next reboot or
+        `systemctl start` serves whatever that stale copy contains. Observed on
+        yukson 2026-07-27 — an enabled unit aimed at a checkout 111 commits behind.
+        """
+        running = self.running_bridge_root()
+        if running is None:
+            self.add(
+                "정상",
+                "bridge boot path",
+                "no bridge process; nothing to compare",
+                "none",
+            )
+            return
+        units = [Path("/etc/systemd/system/ccc-telegram-bridge.service")]
+        units += sorted(
+            Path("/home").glob("*/.config/systemd/user/ccc-telegram-bridge.service")
+        )
+        checked = 0
+        for unit in units:
+            declared = self.unit_bridge_root(unit)
+            if declared is None:
+                continue
+            checked += 1
+            if declared != running:
+                self.add(
+                    "수동필요",
+                    "bridge boot path",
+                    f"{unit} starts {declared} but the bridge runs from {running}",
+                    "point ExecStart/WorkingDirectory at the running checkout, or "
+                    "disable the unit; a reboot would otherwise serve the stale copy",
+                )
+                return
+        if checked:
+            self.add("정상", "bridge boot path", f"unit and runtime agree ({running})", "none")
+        else:
+            self.add(
+                "경고",
+                "bridge boot path",
+                f"bridge runs from {running} but no unit declares it",
+                "nothing restarts the bridge on reboot; install the systemd unit if this node should self-start",
+            )
 
     def check_memory_cache(self) -> None:
         script = self.repo / "scripts/ccc-memory-check.sh"
