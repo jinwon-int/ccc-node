@@ -37,6 +37,7 @@ def test_turn_state_starts_without_lifecycle_or_io_authority() -> None:
     assert state.admitted is False
     assert state.needs_attempt_recording is True
     assert state.terminal_error is None
+    assert state.terminal_result_text is None
     assert state.active_tools == {}
     assert state.active_tool_ids == set()
     assert state.current_tool_label is None
@@ -226,6 +227,27 @@ def test_result_and_ignored_events_remain_typed_and_body_preserving() -> None:
     assert result_transition.event is result
     assert isinstance(completion_transition, IgnoredTransition)
     assert completion_transition.event is completion
+
+
+def test_result_event_captures_terminal_result_text() -> None:
+    # #775: the Claude adapter payload carries message.result under "result";
+    # the frozen (MappingProxy) payload must still yield the text.
+    state = TurnEventState()
+
+    state.observe(ResultEvent({"subtype": "success", "result": "final text"}))
+
+    assert state.terminal_result_text == "final text"
+
+
+def test_result_event_without_safe_text_leaves_terminal_result_empty() -> None:
+    state = TurnEventState()
+
+    state.observe(ResultEvent({"id": "turn-1", "status": "completed"}))
+    assert state.terminal_result_text is None
+    state.observe(ResultEvent({"result": ""}))
+    assert state.terminal_result_text is None
+    state.observe(ResultEvent({"result": 42}))
+    assert state.terminal_result_text is None
 
 
 def test_unknown_runtime_event_fails_closed() -> None:
