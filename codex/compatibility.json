@@ -57,7 +57,7 @@
       "codex_skill": "ccc-self-update"
     },
     {
-      "pattern": "claude/skills/skill-suggest/**",
+      "pattern": "claude/skills/skillsuggest/**",
       "compatibility": "claude-only",
       "reason": "Claude transcript autosave contract; tracked by issue 643"
     },

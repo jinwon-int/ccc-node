@@ -8,8 +8,8 @@ rollback, Hermes-style. Three layers cooperate:
 | Layer | Trigger | What it does |
 |---|---|---|
 | `claude/hooks/skill-review.sh` | SessionEnd hook (interactive `claude` sessions) | LLM reviews the session transcript and stages `SKILL.md` drafts under `~/.claude/state/pending-skills/`. In auto mode it then hands fresh drafts to `skill-review/autoinstall.sh`. |
-| `scripts/ccc-skill-autosave.sh` | daily cron (this doc) | Covers what hooks cannot: Telegram-bridge / SDK sessions never fire SessionEnd, so the sweep pushes their recent transcripts through the same skill-review pipeline, refreshes the deterministic candidate report (`skill-suggest/scan.sh`), and queues an owner Telegram notification — an approval reminder in approve mode, or the autoinstall install/block notice in auto mode. |
-| `/skill-suggest` skill | operator (terminal or Telegram) | approve mode: reviews pending drafts + ranked candidates and installs approved skills into `~/.claude/skills/`. auto mode: post-hoc review — list, audit and roll back auto-installed skills. |
+| `scripts/ccc-skill-autosave.sh` | daily cron (this doc) | Covers what hooks cannot: Telegram-bridge / SDK sessions never fire SessionEnd, so the sweep pushes their recent transcripts through the same skill-review pipeline, refreshes the deterministic candidate report (`skillsuggest/scan.sh`), and queues an owner Telegram notification — an approval reminder in approve mode, or the autoinstall install/block notice in auto mode. |
+| `/skillsuggest` skill | operator (terminal or Telegram) | approve mode: reviews pending drafts + ranked candidates and installs approved skills into `~/.claude/skills/`. auto mode: post-hoc review — list, audit and roll back auto-installed skills. |
 
 ## Provider support (Claude / Codex)
 
@@ -155,7 +155,7 @@ notification, so a quiet node stays quiet.
 
 ## Review / approve from Telegram
 
-Ask the bot to run `/skill-suggest` (or "스킬 후보 검토해줘"). It lists pending
+Ask the bot to run `/skillsuggest` (or "스킬 후보 검토해줘"). It lists pending
 drafts and ranked candidates. Legacy create-only drafts retain their existing
 review path; v2 proposals are rendered and applied through `autoinstall.sh`
 as shown above. In the default approve mode nothing is installed or mutated

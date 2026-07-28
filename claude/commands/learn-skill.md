@@ -46,4 +46,4 @@ printf '%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "PENDING_SKILL_REVIEW staged=
   >> "$STATE/approval-needed.log"
 ```
 
-Then summarize the staged id and tell the operator to review with `/skill-suggest` before approval.
+Then summarize the staged id and tell the operator to review with `/skillsuggest` before approval.

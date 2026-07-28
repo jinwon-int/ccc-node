@@ -443,7 +443,7 @@ fi
 # Slash commands (quick prompt templates: /node-status, /a2a-claim, /wiki-log) — node-agnostic
 run mkdir -p "$CLAUDE_DIR/commands"
 run cp "$SRC/claude/commands/"*.md "$CLAUDE_DIR/commands/"
-# Custom skills (reusable procedures: wiki-record, mcp-add, skill-suggest, ...) — node-agnostic
+# Custom skills (reusable procedures: wiki-record, mcp-add, skillsuggest, ...) — node-agnostic
 run mkdir -p "$CLAUDE_DIR/skills"
 run cp -r "$SRC/claude/skills/." "$CLAUDE_DIR/skills/"
 skill_sources=("$SRC"/claude/skills/*/*.sh)

@@ -6,7 +6,7 @@
 # persistent streams rarely "end" at all — yet their transcripts land in the
 # same ~/.claude/projects/*.jsonl tree. This sweep closes that gap: run it from
 # cron (see install-skill-autosave-cron.sh) and it
-#   1. refreshes the deterministic skill-candidate report (skill-suggest/scan.sh),
+#   1. refreshes the deterministic skill-candidate report (skillsuggest/scan.sh),
 #   2. pushes recent, not-yet-reviewed transcripts (bridge sessions included)
 #      through the existing skill-review.sh drafting pipeline, and
 #   3. queues an owner-only Telegram notification when skill drafts are waiting
@@ -15,7 +15,7 @@
 # Safety (same contract as the hooks it orchestrates):
 #   - Always exits 0; every step is best-effort and logged.
 #   - approve mode (default): never installs or overwrites ~/.claude/skills —
-#     drafts stay in the human-gated pending-skills queue (/skill-suggest).
+#     drafts stay in the human-gated pending-skills queue (/skillsuggest).
 #   - auto mode (#355, opt-in via CCC_SKILL_AUTOSAVE_MODE=auto or `auto` in
 #     ~/.claude/state/skill-autosave.mode): after drafting, the machine-gated
 #     installer (hooks/skill-review/autoinstall.sh) installs passing drafts and
@@ -37,7 +37,7 @@ NOTIFIED="$STATE_DIR/skill-autosave.notified"
 SPOOL="${CCC_PUSH_SPOOL:-$STATE_DIR/telegram-spool}"
 
 REVIEW="${CCC_SKILL_REVIEW_CMD:-$CLAUDE_DIR/hooks/skill-review.sh}"
-SCAN="${CCC_SKILL_SCAN_CMD:-$CLAUDE_DIR/skills/skill-suggest/scan.sh}"
+SCAN="${CCC_SKILL_SCAN_CMD:-$CLAUDE_DIR/skills/skillsuggest/scan.sh}"
 AUTOINSTALL="${CCC_SKILL_AUTOINSTALL_CMD:-$CLAUDE_DIR/hooks/skill-review/autoinstall.sh}"
 CURATOR="${CCC_SKILL_CURATOR_CMD:-$CLAUDE_DIR/hooks/skill-review/curator.py}"
 
@@ -240,7 +240,7 @@ case "$last_notified" in ''|*[!0-9]*) last_notified=0 ;; esac
 if [ "$EFFECTIVE_MODE" = "approve" ] && [ "$NOTIFY" = "1" ] && [ "$pending" -gt 0 ] && [ "$pending" != "$last_notified" ]; then
   if mkdir -p "$SPOOL" 2>/dev/null; then
     node="${CCC_NODE:-$(hostname -s 2>/dev/null || echo node)}"
-    text="스킬 초안 ${pending}건 승인 대기 중 — '/skill-suggest'로 검토/승인하세요."
+    text="스킬 초안 ${pending}건 승인 대기 중 — '/skillsuggest'로 검토/승인하세요."
     now="$(ts)"
     fname="$SPOOL/$(printf '%s' "$now" | tr ':' '-')-SkillAutosave-$$.json"
     if jq -nc --arg ts "$now" --arg node "$node" --arg text "$text" --arg n "$pending" \
