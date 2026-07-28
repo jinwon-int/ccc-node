@@ -243,6 +243,22 @@ class RuntimeHealthReporterTests(unittest.TestCase):
             self.assertEqual(health["claude"]["state"], "healthy")
             self.assertEqual(health["service"]["state"], "available")
 
+    def test_record_empty_completion_counts_by_outcome(self):
+        # #775: empty normal completions split into the event-loss class
+        # (recovered from the terminal payload) and the truly-empty class.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_root = Path(tmpdir)
+            module = self._load_health_module(project_root)
+            reporter = module.RuntimeHealthReporter(project_root / ".telegram_bot")
+
+            reporter.record_empty_completion(recovered=True)
+            reporter.record_empty_completion(recovered=True)
+            reporter.record_empty_completion(recovered=False)
+
+            health = json.loads(reporter.health_file.read_text(encoding="utf-8"))
+            self.assertEqual(health["requests"]["empty_completion_recovered"], 2)
+            self.assertEqual(health["requests"]["empty_completion_failed"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

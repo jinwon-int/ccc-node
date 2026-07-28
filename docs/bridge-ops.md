@@ -33,3 +33,5 @@ source validation do not authorize a live provider/Telegram canary or restart.
 ## Health evidence
 
 Useful non-secret evidence is service state, PID, restart count, `health.json` state, recent redacted warning/error classes, source commit, and test output.
+
+Empty normal completions (#775) are classified, not disguised as `(No response)` success: when the provider's terminal payload preserved the final answer the turn recovers it once (`requests.empty_completion_recovered` in `health.json`), otherwise the request ledger fails with cause `empty-completion` and the user gets a typed retry prompt (`requests.empty_completion_failed`). Warning logs carry the provider class name and user/chat ids only — never answer bodies.

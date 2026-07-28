@@ -310,6 +310,20 @@ class RuntimeHealthReporter:
             requests["stalled"] = int(requests.get("stalled", 0)) + max(0, int(count))
             self._write_health_locked()
 
+    def record_empty_completion(self, *, recovered: bool, count: int = 1) -> None:
+        """Count empty normal completions by outcome (#775).
+
+        ``recovered=True`` means the provider's terminal result payload held
+        the final user text that no visible event produced (event-loss class);
+        ``recovered=False`` means the turn ended successfully with no
+        user-visible text at all (truly-empty class).
+        """
+        key = "empty_completion_recovered" if recovered else "empty_completion_failed"
+        with self._lock:
+            requests = self._state.setdefault("requests", {"stalled": 0})
+            requests[key] = int(requests.get(key, 0)) + max(0, int(count))
+            self._write_health_locked()
+
     def record_transcript_quarantined(self, count: int = 1) -> None:
         """Count dead-session transcripts newly quarantined as unrecoverable (#411)."""
         with self._lock:

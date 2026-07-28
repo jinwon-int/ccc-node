@@ -726,7 +726,6 @@ class ProjectChatProcessMixin:
                 streamed = final_streamed
                 if not content and output.interim_delivered:
                     streamed = True
-                content = content or "(No response)"
                 terminal_error = turn_state.terminal_error
                 if terminal_error is not None:
                     terminal_won = _claim_request_terminal(
@@ -745,6 +744,53 @@ class ProjectChatProcessMixin:
                         # Always deliver it even when interim text was streamed.
                         streamed=False,
                     )
+                if not content and not streamed:
+                    # #775: a successful terminal result without user-visible
+                    # text must not masquerade as a "(No response)" success.
+                    # When the provider's terminal payload preserved the final
+                    # answer (no visible event carried it), deliver that text
+                    # once; otherwise classify the turn as a typed failure.
+                    recovered = self._clean_response(turn_state.terminal_result_text or "")
+                    provider_label = type(runtime).__name__
+                    if recovered:
+                        logger.warning(
+                            "Empty normal completion for user %s chat %s recovered "
+                            "from the terminal result payload: provider=%s "
+                            "cause=no-visible-text-events",
+                            user_id,
+                            chat_id,
+                            provider_label,
+                        )
+                        try:
+                            health_reporter.record_empty_completion(recovered=True)
+                        except Exception:
+                            pass
+                        content = recovered
+                    else:
+                        _claim_request_terminal(
+                            progress_request,
+                            RequestPhase.FAILED,
+                            cause="empty-completion",
+                        )
+                        logger.warning(
+                            "Empty normal completion for user %s chat %s: "
+                            "provider=%s finished successfully without "
+                            "user-visible text (session kept)",
+                            user_id,
+                            chat_id,
+                            provider_label,
+                        )
+                        try:
+                            health_reporter.record_empty_completion(recovered=False)
+                        except Exception:
+                            pass
+                        message = "Agent finished without a visible answer"
+                        return ChatResponse(
+                            content=f"❌ {message}. Please retry your request.",
+                            success=False,
+                            error=message,
+                            session_id=session.session_id,
+                        )
                 _claim_request_terminal(
                     progress_request,
                     RequestPhase.COMPLETED,
