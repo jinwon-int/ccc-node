@@ -6,6 +6,7 @@ import asyncio
 import logging
 import re
 from collections.abc import Awaitable, Callable, Mapping
+from pathlib import Path
 from typing import Any, Optional
 
 from claude_agent_sdk import RateLimitEvent, ResultMessage
@@ -19,6 +20,7 @@ from telegram_bot.core.agent_runtime import (
 )
 from telegram_bot.core.memory_audience import resolve_memory_audience
 from telegram_bot.core.agent_session_registry import ActiveToken
+from telegram_bot.core.external_wait import clear_active_turn, publish_active_turn
 from telegram_bot.core.project_chat_types import (
     AgentApprovalCallback,
     AgentSessionEntry,
@@ -127,6 +129,13 @@ def _log_user_input(
 
 
 class ProjectChatProcessMixin:
+    def _external_wait_home(self) -> Path:
+        """Durable home for external-wait registry/route files (#740)."""
+        base = getattr(self._config, "bot_data_dir", None) or (
+            self.project_root / ".telegram_bot"
+        )
+        return Path(base) / "external-wait"
+
     async def process_message(
         self,
         user_message: str,
@@ -514,6 +523,15 @@ class ProjectChatProcessMixin:
                         model=model,
                         route_bot=notification_bot or bot,
                     )
+                    # #740: publish which conversation this turn serves so the
+                    # agent-side external-wait CLI can bind CI registrations to
+                    # the correct route (cleared in the turn finally below).
+                    publish_active_turn(
+                        self._external_wait_home(),
+                        user_id=user_id,
+                        chat_id=chat_id,
+                        session_id=session.session_id,
+                    )
                     # Same cadence as the unsolicited route: (re-)register the
                     # /usage observation seam each turn.
                     self._register_agent_frame_observer(
@@ -864,6 +882,12 @@ class ProjectChatProcessMixin:
                         requested_session_id=session_id,
                     )
                 finally:
+                    clear_active_turn(
+                        self._external_wait_home(),
+                        user_id=user_id,
+                        chat_id=chat_id,
+                        session_id=session.session_id if session is not None else None,
+                    )
                     if turn_token is not None:
                         self._agent_session_registry.deactivate_if_same(
                             turn_token,

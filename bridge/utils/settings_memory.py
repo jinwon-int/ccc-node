@@ -192,6 +192,12 @@ class MemorySettingsMixin:
             # hook subprocesses write to the same ledger as live AgentEvents.
             "CCC_LIFECYCLE_AUDIT": "1" if audit_enabled else "0",
             "CCC_LIFECYCLE_AUDIT_DIR": str(audit_base),
+            # #740: the agent-side external-wait CLI resolves its durable
+            # registry/route home through this constant, provider-symmetric.
+            "CCC_EXTERNAL_WAIT_HOME": str(
+                Path(getattr(self, "bot_data_dir", Path.home() / ".telegram_bot"))
+                / "external-wait"
+            ),
         }
 
     @field_validator("memory_user_label", "memory_assistant_label", mode="before")

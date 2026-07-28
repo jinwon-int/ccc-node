@@ -1,0 +1,4 @@
+interface:
+  display_name: "GitHub CI Wait"
+  short_description: "Durable GitHub CI wait registration and auto-resume"
+  default_prompt: "Use $gh-ci-wait to register a durable GitHub CI wait before promising to continue when checks finish."

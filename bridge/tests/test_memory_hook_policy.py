@@ -55,6 +55,7 @@ def test_external_policy_forces_wiki_off_and_exports_only_validated_fields(tmp_p
         "CCC_MEMORY_ASSISTANT_LABEL": "Karellen",
         "CCC_LIFECYCLE_AUDIT": "0",
         "CCC_LIFECYCLE_AUDIT_DIR": str(settings.bot_data_dir / "lifecycle-audit"),
+        "CCC_EXTERNAL_WAIT_HOME": str(settings.bot_data_dir / "external-wait"),
     }
     assert "TELEGRAM_BOT_TOKEN" not in exported
 

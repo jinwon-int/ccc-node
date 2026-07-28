@@ -36,9 +36,16 @@ from telegram_bot.core.dead_session_recovery import (
     run_periodic_dead_session_recovery,
 )
 from telegram_bot.core.dead_session_wakeup import (
+
     recovery_should_defer_to_wakeup,
     run_dead_session_wakeup_scan,
 )
+from telegram_bot.core.external_wait import (
+    ExternalWaitRegistry,
+    default_registry_path as external_wait_registry_path,
+)
+from telegram_bot.core.external_wait_monitor import ExternalWaitMonitor, GhCliTransport
+from telegram_bot.core.usage_meter import MODE_AUTONOMOUS
 from telegram_bot.memory.distill_types import DistillJob
 from telegram_bot.memory.skill_candidate import SkillCandidateStageResult
 from telegram_bot.utils.heartbeat_store import drain_heartbeats, store_path_for
@@ -66,6 +73,8 @@ class _LifecycleSessionManager(Protocol):
 
     def initialize(self) -> None: ...
 
+    async def get_session(self, user_id: int) -> dict[str, Any]: ...
+
 
 class _LifecycleProjectChat(Protocol):
     @property
@@ -73,6 +82,10 @@ class _LifecycleProjectChat(Protocol):
 
     @property
     def usage_meter(self) -> Any | None: ...
+
+    async def process_message(
+        self, user_message: str, user_id: int, chat_id: int, **kwargs: Any
+    ) -> Any: ...
 
     def workload_snapshot(self, now: float) -> tuple[int, float]: ...
 
@@ -678,6 +691,7 @@ class BotLifecycleMixin:
             reaper_task = None
             workload_task = None
             dead_session_recovery_task = None
+            external_wait_task = None
             distill_snapshot_task = None
             distill_extraction_task = None
             distill_local_sink_task = None
@@ -721,6 +735,15 @@ class BotLifecycleMixin:
                 dead_session_recovery_task = asyncio.create_task(
                     self._periodic_dead_session_recovery(stop_event),
                     name="dead-session-recovery",
+                )
+                external_wait_monitor = self._build_external_wait_monitor()
+                external_wait_task = (
+                    asyncio.create_task(
+                        external_wait_monitor.run(stop_event),
+                        name="external-wait-monitor",
+                    )
+                    if external_wait_monitor is not None
+                    else None
                 )
                 health_alerts_task = asyncio.create_task(
                     self._health_alerts_probe(stop_event), name="health-alerts"
@@ -869,6 +892,7 @@ class BotLifecycleMixin:
                     reaper_task,
                     workload_task,
                     dead_session_recovery_task,
+                    external_wait_task,
                     health_alerts_task,
                     session_resource_guard_task,
                     restart_receipt_task,
@@ -1118,6 +1142,82 @@ class BotLifecycleMixin:
             on_stats=self._record_recovery_stats,
             wakeup_tick=self._build_dead_session_wakeup_tick(),
             wakeup_defer=self._build_dead_session_wakeup_defer(),
+        )
+
+    def _build_external_wait_monitor(self):
+        """GitHub CI watch loop for durable external waits (#740); None when off.
+
+        Notifications go straight to the owning conversation; the optional
+        continuation is a bridge-owned turn with an explicit external_event
+        origin (never user-authored), metered as autonomous spend.
+        """
+        if not ExternalWaitMonitor.env_flag("CCC_EXTERNAL_WAIT_ENABLED", default=True):
+            logger.info("External-wait monitor disabled (CCC_EXTERNAL_WAIT_ENABLED=0)")
+            return None
+
+        application = cast(Application, self.application)
+
+        async def notify(chat_id: int, text: str) -> bool:
+            try:
+                await application.bot.send_message(chat_id=chat_id, text=text)
+                return True
+            except Exception as exc:
+                logger.warning("External-wait notify failed: %s", type(exc).__name__)
+                return False
+
+        async def resume(record, prompt: str) -> bool:
+            try:
+                response = await self._project_chat.process_message(
+                    prompt,
+                    int(record["user_id"]),
+                    int(record["chat_id"]),
+                    notification_bot=application.bot,
+                    usage_mode=MODE_AUTONOMOUS,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception(
+                    "External-wait resume turn failed: wait=%s", record.get("wait_id")
+                )
+                return False
+            content = str(getattr(response, "content", "") or "")
+            if getattr(response, "success", False) and content.strip():
+                try:
+                    await application.bot.send_message(
+                        chat_id=int(record["chat_id"]), text=content
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "External-wait resume delivery failed: %s", type(exc).__name__
+                    )
+                    return False
+                return True
+            return False
+
+        async def session_lookup(user_id: int, chat_id: int):
+            try:
+                session = await self._session_manager.get_session(user_id)
+                return (session or {}).get("session_id")
+            except Exception:
+                return None
+
+        data_dir = getattr(self._config, "bot_data_dir", None) or (
+            FilePath(self._config.project_root) / ".telegram_bot"
+        )
+        home = FilePath(data_dir) / "external-wait"
+        return ExternalWaitMonitor(
+            ExternalWaitRegistry(external_wait_registry_path(home)),
+            transport=GhCliTransport(),
+            notifier=notify,
+            resumer=resume,
+            session_lookup=session_lookup,
+            resume_enabled=ExternalWaitMonitor.env_flag(
+                "CCC_EXTERNAL_WAIT_RESUME", default=True
+            ),
+            resume_daily_cap=ExternalWaitMonitor.env_int(
+                "CCC_EXTERNAL_WAIT_RESUME_DAILY_CAP", default=10
+            ),
         )
 
     def _build_dead_session_wakeup_defer(self):
