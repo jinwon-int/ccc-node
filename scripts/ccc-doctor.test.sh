@@ -421,5 +421,61 @@ PY_EOF
 vout="$(DOCTOR_PY="$ROOT/scripts/ccc_doctor.py" VER_REPO="$TMP/verrepo" python3 "$TMP/version.py" 2>"$TMP/version.err")"
 ok "unrunnable version script falls through to git describe, not 'unknown'" '[ -n "$vout" ] && [ "$vout" != "unknown" ]'
 
+# --- #775: repo scripts are invoked through bash, never bare-exec'd -------
+# Class defect, not a one-off: every probe that exec'd a repo `.sh` directly
+# failed on Termux, where `#!/usr/bin/env bash` has no /usr/bin/env to resolve.
+# The failure is silent — the except arm degrades the probe to "unavailable" or
+# "unknown" — so it reads as a real finding rather than a broken probe. This
+# test drives each probe against a script whose shebang cannot be resolved
+# ANYWHERE, so it fails the same way on Linux CI as it did on the phone.
+cat > "$TMP/shebang.py" <<'PY_EOF'
+import json, os, subprocess, sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(os.environ["DOCTOR_PY"]).resolve().parent))
+import ccc_doctor as mod
+
+repo = Path(os.environ["SHEBANG_REPO"])
+claude = repo / ".claude"
+(repo / "scripts").mkdir(parents=True, exist_ok=True)
+claude.mkdir(parents=True, exist_ok=True)
+
+BAD = "#!/nonexistent/interpreter\n"
+
+mem = repo / "scripts/ccc-memory-check.sh"
+mem.write_text(BAD + """printf '%s' '{"wiki":{"status":"ok"},"honcho":{"status":"stale"},"local_index":{"exists":true}}'\n""")
+mem.chmod(0o755)
+
+ver = repo / "scripts/ccc-version.sh"
+ver.write_text(BAD + "echo v9.9.9-from-script\n")
+ver.chmod(0o755)
+
+subprocess.run(["git", "init", "-q", str(repo)], check=True)
+subprocess.run(["git", "-C", str(repo), "config", "user.email", "t@example.com"], check=True)
+subprocess.run(["git", "-C", str(repo), "config", "user.name", "t"], check=True)
+subprocess.run(["git", "-C", str(repo), "commit", "-q", "--allow-empty", "-m", "x"], check=True)
+
+d = mod.Doctor(repo, claude, "settings")
+d.check_memory_cache()
+row = [r for r in d.rows if r.item == "memory cache"][0]
+print(json.dumps({
+    "status": row.status,
+    "klass": row.klass,
+    "version": mod.Doctor(repo, claude, "settings").harness_version(),
+}, ensure_ascii=False))
+PY_EOF
+SHEBANG_REPO="$TMP/shebangrepo"
+sout="$(DOCTOR_PY="$ROOT/scripts/ccc_doctor.py" SHEBANG_REPO="$SHEBANG_REPO" python3 "$TMP/shebang.py" 2>"$TMP/shebang.err")"
+ok "memory probe survives an unresolvable shebang (not 'diagnostic unavailable')" \
+  '[ -n "$sout" ] && jq -e ".status != \"diagnostic unavailable\"" <<<"$sout" >/dev/null'
+ok "memory probe reports the real cache state through bash" \
+  'jq -e ".status | contains(\"honcho=stale\") and contains(\"wiki=ok\")" <<<"$sout" >/dev/null'
+ok "a stale honcho cache is 경고, not a broken-probe 경고" 'jq -e ".klass == \"경고\"" <<<"$sout" >/dev/null'
+ok "version probe survives the same unresolvable shebang" 'jq -e ".version != \"unknown\"" <<<"$sout" >/dev/null'
+
+# Static backstop: a new probe added later must not reintroduce bare-exec.
+ok "no repo script is subprocess-exec'd without an explicit interpreter" \
+  '! grep -nE "subprocess\.(run|check_output|Popen)\(\[str\(" "$ROOT/scripts/ccc_doctor.py"'
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
