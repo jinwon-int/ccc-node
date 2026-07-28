@@ -97,7 +97,10 @@ honcho_cache_is_fresh() { # <query_hash> <config_hash>
   [ -f "$status_file" ] || return 1
   jq -e --arg query_hash "$query_hash" --arg config_hash "$config_hash" \
     --argjson now "$(date -u +%s)" --argjson max_age "$max_age" '
-      ((.status == "ok") or (.status == "empty"))
+      # no-content joins ok/empty deliberately (#781): the server WAS reached and
+      # answered, so re-asking inside the TTL buys nothing and costs a 20-35s LLM
+      # call per node per cycle. It is split from "empty" for reporting only.
+      ((.status == "ok") or (.status == "empty") or (.status == "no-content"))
       and (.query_hash == $query_hash)
       and (.config_hash == $config_hash)
       and ((try (.refreshed_at | fromdateiso8601) catch 0) as $refreshed
@@ -156,7 +159,7 @@ honcho_chat() { # <base> <workspace> <peer> <target> <token> <reasoning> <query>
   # returns jq's status, and jq exits 0 on empty input — so a timeout, a refused
   # connection, and a genuine empty answer were all indistinguishable, and every
   # one of them surfaced as "empty Honcho response". A dead endpoint read exactly
-  # like a quiet one (#777).
+  # like a quiet one (#781).
   local raw="$output.raw" rc=0
   # `|| rc=$?`, not `if ! …; then rc=$?`: inside the then-branch of a negated
   # command, $? is the status of the negation (always 0), so the latter form
@@ -180,10 +183,12 @@ honcho_chat() { # <base> <workspace> <peer> <target> <token> <reasoning> <query>
     rm -f "$raw"
     return 1
   fi
-  # A JSON body with content:null is the server answering "I have nothing" —
-  # a real condition, distinct from not reaching the server at all. Report it
-  # as such instead of letting it share the transport-failure vocabulary.
-  if [ "$(jq -r '.content // "null"' <"$raw")" = "null" ]; then
+  # An explicit `"content": null` is the server answering "I have nothing" — a
+  # real condition, distinct from not reaching the server at all, and the one
+  # the live fleet actually hits. A body that omits the key entirely is a
+  # different shape and keeps the existing `empty` reading (#778's contract):
+  # both are benign, but only one is the server declining to answer.
+  if jq -e 'has("content") and .content == null' >/dev/null 2>&1 <"$raw"; then
     printf 'honcho answered with content:null (workspace=%s peer=%s level=%s)\n' \
       "$workspace" "$peer" "$rl" >>"$error"
     : > "$output"

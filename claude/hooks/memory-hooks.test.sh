@@ -263,7 +263,7 @@ ok "private audience injects private shared and private-only legacy Honcho cache
   '[ "$rc" = 0 ] && grep -q "PRIVATE_HONCHO_ONLY" <<<"$out" && grep -q "SHARED_HONCHO_PUBLIC" <<<"$out" && grep -q "LEGACY_HONCHO_PRIVATE_ONLY" <<<"$out"'
 
 
-# --- #777: a dead endpoint must not read like a quiet one ------------------
+# --- #781: a dead endpoint must not read like a quiet one ------------------
 # honcho_chat used to pipe curl into jq, so the function returned JQ's status.
 # jq exits 0 on empty input, which made a timeout, a refused connection and a
 # genuine empty answer produce one indistinguishable outcome: "empty Honcho
