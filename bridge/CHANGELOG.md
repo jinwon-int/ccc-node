@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Empty normal completion classification (#775).** A provider turn that
+  ends successfully without user-visible text no longer returns
+  `(No response)` as a `success=True` answer. When the terminal result
+  payload preserves the final answer (Claude adapter `message.result`), the
+  turn recovers and delivers it once; otherwise the turn is classified as a
+  typed, retryable failure (`empty-completion` ledger cause, session kept).
+  Turns whose text already reached the user through streaming or interim
+  delivery complete without a placeholder bubble, preserving exactly-once
+  delivery. Body-free observability: per-outcome health counters
+  (`empty_completion_recovered` / `empty_completion_failed`) and
+  provider-labelled warning logs.
+
 ### Changed
 - **Honcho warmer freshness guard (#777).** The 30-minute memory warmer now
   keeps Family Wiki refreshes independent while reusing successful or empty

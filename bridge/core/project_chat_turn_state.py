@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import TypeAlias
 
@@ -83,6 +84,7 @@ class TurnEventState:
     admitted: bool = False
     attempt_recorded: bool = False
     terminal_error: ErrorEvent | None = None
+    terminal_result_text: str | None = None
     active_tools: dict[str, str] = field(default_factory=dict)
     active_tool_ids: set[str] = field(default_factory=set)
 
@@ -134,6 +136,15 @@ class TurnEventState:
             self.terminal_error = event
             return ErrorTransition(event)
         if isinstance(event, ResultEvent):
+            # #775: keep the provider's final result text (when the payload
+            # carries one, e.g. the Claude adapter's `message.result`) so an
+            # empty normal completion can recover it instead of reporting a
+            # placeholder success. Payloads are frozen mappings.
+            payload = event.result
+            if isinstance(payload, Mapping):
+                candidate = payload.get("result")
+                if isinstance(candidate, str) and candidate:
+                    self.terminal_result_text = candidate
             return ResultTransition(event)
         if isinstance(
             event,
