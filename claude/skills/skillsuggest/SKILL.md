@@ -91,6 +91,8 @@ Two autosave modes change what "review" means here (`docs/skill-autosave.md`):
 
 4. **Propose (max ~3).** For each strong candidate, show the user a short proposal: name, one-line description, the steps it would encode, and why it recurs. Ask for approval (numbered options).
 
+4b. **Pending-draft reviews use the full review format.** When presenting blocked/pending drafts for a decision, show per draft: **배경** (origin session id/date + the task that produced it — read the source transcript's opening user messages when available), **제안 이유** (what recurring pain/procedure it encodes), **차단 사유·정당성** (the gate reason and whether the gate was right), **개선사항** (numbered, concrete: what must change before approval — heading format, trigger-style description, node-specific path generalization, session-specific numbers), and a **판정** (approve-after-fix / reject-and-why / hold). Then a single numbered approval request.
+
 5. **Author on approval only.** For each approved deterministic candidate, create `~/.claude/skills/<name>/SKILL.md`:
    - Frontmatter: `name` (kebab-case) + a detailed `description` (it drives auto-matching).
    - Body: numbered steps, exact commands, and safety rules (no raw secrets — read keys from `~/.hermes/.env`; redact in output).
