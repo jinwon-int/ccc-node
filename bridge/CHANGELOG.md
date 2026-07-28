@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **Honcho warmer freshness guard (#777).** The 30-minute memory warmer now
+  keeps Family Wiki refreshes independent while reusing successful or empty
+  Honcho results for the configured six-hour TTL when the task and non-secret
+  config fingerprint are unchanged. Explicit force refresh and successful
+  distill push/replay invalidation preserve material task changes and write/read
+  round trips without paying for unchanged half-hourly recall.
 - **Final Telegram command mypy ratchet (#346).** Removed the last
   `core.bot_commands` `attr-defined` exception after the typed composition
   boundary reached zero package-complete mypy errors.

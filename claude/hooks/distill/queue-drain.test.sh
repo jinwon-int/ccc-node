@@ -50,6 +50,7 @@ QUEUE="$TMP/state/honcho-queue.jsonl"
 WORK="$TMP/state/.honcho-queue.inflight"
 DEAD="$TMP/state/honcho-queue.jsonl.dead"
 LOG="$TMP/state/distill.log"
+INVALIDATE="$TMP/state/honcho-refresh.invalidate"
 
 printf '%s\n' "$PAYLOAD" > "$QUEUE"
 : > "$CURL_STUB_LOG"
@@ -66,15 +67,18 @@ CURL_STUB_HEALTH_HTTP=204 CURL_STUB_MESSAGE_HTTP=201 bash "$DRAIN"; rc=$?
 ok "successful drain exits 0" '[ "$rc" = 0 ]'
 ok "successful drain truncates queue" '[ ! -s "$QUEUE" ]'
 ok "successful drain logs ok=1" 'grep -q "\[drain\] drained ok=1 failed=0 dropped=0 processed=1" "$LOG"'
+ok "successful replay invalidates the next Honcho refresh" '[ -s "$INVALIDATE" ]'
 ok "successful drain posts replay metadata" 'jq -e ".messages[0].metadata.replay == true and .messages[0].metadata.trigger == \"manual\" and (.messages[0].content | contains(\"(replayed)\"))" "$TMP/bodies/message.json" >/dev/null'
 ok "successful drain uses state node.txt metadata node" 'jq -e ".messages[0].metadata.node == \"nosuk\"" "$TMP/bodies/message.json" >/dev/null'
 
 printf '%s\n' "$PAYLOAD" > "$QUEUE"
 : > "$CURL_STUB_LOG"
+rm -f "$INVALIDATE"
 CURL_STUB_HEALTH_HTTP=204 CURL_STUB_MESSAGE_HTTP=503 bash "$DRAIN"; rc=$?
 ok "failed message exits 0" '[ "$rc" = 0 ]'
 ok "failed message increments attempts" '[ "$(wc -l < "$QUEUE")" = 1 ] && jq -e "._attempts == 1" "$QUEUE" >/dev/null'
 ok "failed message logs failed=1" 'grep -q "\[drain\] drained ok=0 failed=1 dropped=0 processed=1" "$LOG"'
+ok "failed replay does not invalidate a successful read cache" '[ ! -e "$INVALIDATE" ]'
 
 jq -c '. + {_attempts:3}' <<<"$PAYLOAD" > "$QUEUE"
 : > "$CURL_STUB_LOG"

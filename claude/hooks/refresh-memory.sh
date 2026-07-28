@@ -14,12 +14,15 @@ HONCHO_CFG="${CCC_HONCHO_CFG:-${CCC_HERMES_DIR:-${HOME:-/root}/.hermes}/honcho.j
 WIKI_TIMEOUT="${CCC_WIKI_TIMEOUT_SEC:-60}"
 HONCHO_TIMEOUT="${CCC_HONCHO_TIMEOUT_SEC:-60}"
 HONCHO_ENABLED="${CCC_HONCHO_MEMORY_ENABLED:-1}"
+HONCHO_FORCE_REFRESH="${CCC_HONCHO_FORCE_REFRESH:-0}"
 WIKI_ENABLED="${CCC_WIKI_MEMORY_ENABLED:-1}"
 ISOLATION_PROFILE="${CCC_NODE_ISOLATION_PROFILE:-fleet}"
 [ "$ISOLATION_PROFILE" = "external" ] && WIKI_ENABLED=0
 PROFILE="${CCC_MEMORY_PROFILE:-honcho}"
 INDEX_DB="${CCC_MEMORY_INDEX_DB:-$STATE_DIR/memory-index.sqlite}"
 FACTS_FILE="${CCC_MEMORY_FACTS_FILE:-$STATE_DIR/memory-facts.jsonl}"
+HONCHO_INVALIDATE_FILE="$STATE_DIR/honcho-refresh.invalidate"
+HONCHO_INVALIDATE_LOCK="$STATE_DIR/.honcho-refresh-invalidate.lock"
 
 REFRESH_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)" || REFRESH_LIB_DIR="$HOOKDIR"
 # shellcheck source=claude/hooks/lib/hook-common.sh
@@ -49,11 +52,14 @@ exec 9>"$CACHE/.refresh.lock"
 flock -n 9 || exit 0
 
 query_from_state() {
+  local include_prompt="${1:-1}"
   if [ -n "${PREFETCH_QUERY:-}" ]; then printf '%s' "$PREFETCH_QUERY"; return 0; fi
   local query_tool node cwd task
   query_tool="$(find_memory_tool ccc-memory-query.sh 2>/dev/null || true)"
   if [ -n "$query_tool" ]; then
-    CCC_WORKTREE="${CCC_WORKTREE:-$(cat "$STATE_DIR/cwd.txt" 2>/dev/null || pwd 2>/dev/null || true)}" "$query_tool" --mode remote 2>/dev/null && return 0
+    CCC_MEMORY_QUERY_INCLUDE_PROMPT="$include_prompt" \
+      CCC_WORKTREE="${CCC_WORKTREE:-$(cat "$STATE_DIR/cwd.txt" 2>/dev/null || pwd 2>/dev/null || true)}" \
+      "$query_tool" --mode remote 2>/dev/null && return 0
   fi
   node="${CCC_NODE:-$(cat "$STATE_DIR/node.txt" 2>/dev/null || hostname -s 2>/dev/null || printf 'ccc-node')}"
   cwd="$(cat "$STATE_DIR/cwd.txt" 2>/dev/null || pwd 2>/dev/null || printf '')"
@@ -61,8 +67,9 @@ query_from_state() {
   printf '%s' "node ${node}; cwd ${cwd}; task ${task}; Seoyoon ops priorities and current node operating memory"
 }
 
-record_status() { # <name> <status> <duration_ms> <bytes> <error> [query]
-  local name="$1" status="$2" duration="$3" bytes="$4" error="$5" query="${6:-}" qhash max_age
+record_status() { # <name> <status> <duration_ms> <bytes> <error> [query] [config_hash]
+  local name="$1" status="$2" duration="$3" bytes="$4" error="$5"
+  local query="${6:-}" config_hash="${7:-}" qhash max_age
   qhash="$(printf '%s' "$query" | sha256sum 2>/dev/null | cut -d' ' -f1)"
   case "$name" in
     wiki) max_age="${CCC_WIKI_CACHE_MAX_AGE_SEC:-${CCC_MEMORY_CACHE_TTL_SEC:-21600}}" ;;
@@ -71,10 +78,43 @@ record_status() { # <name> <status> <duration_ms> <bytes> <error> [query]
   esac
   jq -n --arg source "$name" --arg status "$status" --arg refreshed_at "$(now_iso)" \
     --arg error "$error" --arg query_hash "$qhash" --argjson duration_ms "${duration:-0}" \
-    --argjson bytes "${bytes:-0}" --argjson max_age_sec "${max_age:-0}" \
-    '{source:$source,status:$status,refreshed_at:$refreshed_at,duration_ms:$duration_ms,bytes:$bytes,error:$error,error_class:(if $error=="" then "" else ($status) end),query_hash:$query_hash,max_age_sec:$max_age_sec,stale:false}' \
+    --arg config_hash "$config_hash" --argjson bytes "${bytes:-0}" \
+    --argjson max_age_sec "${max_age:-0}" \
+    '({source:$source,status:$status,refreshed_at:$refreshed_at,duration_ms:$duration_ms,bytes:$bytes,error:$error,error_class:(if $error=="" then "" else ($status) end),query_hash:$query_hash,max_age_sec:$max_age_sec,stale:false}
+      + (if $config_hash == "" then {} else {config_hash:$config_hash} end))' \
     > "$CACHE/.${name}.status.json"
   cp "$CACHE/.${name}.status.json" "$CACHE/${name}.meta.json" 2>/dev/null || true
+}
+
+honcho_cache_is_fresh() { # <query_hash> <config_hash>
+  local query_hash="$1" config_hash="$2"
+  local status_file="$CACHE/.honcho.status.json"
+  local max_age="${CCC_HONCHO_CACHE_MAX_AGE_SEC:-${CCC_MEMORY_CACHE_TTL_SEC:-21600}}"
+  is_disabled "$HONCHO_FORCE_REFRESH" || return 1
+  [ ! -e "$HONCHO_INVALIDATE_FILE" ] || return 1
+  case "$max_age" in ""|*[!0-9]*) return 1 ;; esac
+  [ "$max_age" -gt 0 ] || return 1
+  [ -f "$status_file" ] || return 1
+  jq -e --arg query_hash "$query_hash" --arg config_hash "$config_hash" \
+    --argjson now "$(date -u +%s)" --argjson max_age "$max_age" '
+      ((.status == "ok") or (.status == "empty"))
+      and (.query_hash == $query_hash)
+      and (.config_hash == $config_hash)
+      and ((try (.refreshed_at | fromdateiso8601) catch 0) as $refreshed
+        | $refreshed > 0
+        and $now >= $refreshed
+        and (($now - $refreshed) < $max_age))
+    ' "$status_file" >/dev/null 2>&1
+}
+
+clear_honcho_invalidation() { # <token-observed-before-refresh>
+  local observed="$1" current
+  [ -n "$observed" ] || return 0
+  (
+    flock 8 || exit 0
+    current="$(cat "$HONCHO_INVALIDATE_FILE" 2>/dev/null || true)"
+    [ "$current" = "$observed" ] && rm -f "$HONCHO_INVALIDATE_FILE"
+  ) 8>"$HONCHO_INVALIDATE_LOCK"
 }
 
 refresh_wiki() {
@@ -156,7 +196,8 @@ honcho_chat() { # <base> <workspace> <peer> <target> <token> <reasoning> <query>
 
 refresh_honcho() {
   local start end duration honcho ws peer target token tmp status err query rl
-  local private_tmp shared_tmp legacy_tmp
+  local private_tmp shared_tmp legacy_tmp config_json config_hash query_hash
+  local invalidation_token
   start="$(now_ms)"
   tmp="$CACHE/honcho.txt.tmp.$$"
   status="ok"; err=""; query=""
@@ -168,16 +209,30 @@ refresh_honcho() {
     # Config may use the nested `.hosts.hermes.*` schema (aiPeer/peerName/workspace/
     # apiKey) instead of the legacy top-level keys; read top-level first, fall back to
     # the nested block so both layouts work.
-    honcho="$(jq -r 'def nz(x): x | select(. != null and . != ""); nz(.baseUrl) // nz(.hosts.hermes.baseUrl) // empty' "$HONCHO_CFG" 2>/dev/null)"
-    ws="$(jq -r 'def nz(x): x | select(. != null and . != ""); nz(.workspace) // nz(.hosts.hermes.workspace) // "seoyoon-family"' "$HONCHO_CFG" 2>/dev/null)"
-    peer="$(jq -r 'def nz(x): x | select(. != null and . != ""); nz(.peerName) // nz(.hosts.hermes.peerName) // empty' "$HONCHO_CFG" 2>/dev/null)"
-    target="$(jq -r 'def nz(x): x | select(. != null and . != ""); nz(.target) // nz(.hosts.hermes.peerName) // "seo-jin-on"' "$HONCHO_CFG" 2>/dev/null)"
-    token="$(jq -r 'def nz(x): x | select(. != null and . != ""); nz(.authToken) // nz(.apiKey) // nz(.hosts.hermes.apiKey) // empty' "$HONCHO_CFG" 2>/dev/null)"
-    rl="$(jq -r 'def nz(x): x | select(. != null and . != ""); nz(.reasoningLevel) // nz(.hosts.hermes.dialecticReasoningLevel) // "low"' "$HONCHO_CFG" 2>/dev/null)"
-    query="For the current ccc-node task, summarize only directly relevant user preferences, operating constraints, and current priorities. Avoid repeating generic facts."
+    honcho="$(jq -r 'def nz(x): x | select(. != null and . != ""); nz(.baseUrl) // nz(.hosts|objects|.hermes.baseUrl) // empty' "$HONCHO_CFG" 2>/dev/null)"
+    ws="$(jq -r 'def nz(x): x | select(. != null and . != ""); nz(.workspace) // nz(.hosts|objects|.hermes.workspace) // "seoyoon-family"' "$HONCHO_CFG" 2>/dev/null)"
+    peer="$(jq -r 'def nz(x): x | select(. != null and . != ""); nz(.peerName) // nz(.hosts|objects|.hermes.peerName) // empty' "$HONCHO_CFG" 2>/dev/null)"
+    target="$(jq -r 'def nz(x): x | select(. != null and . != ""); nz(.target) // nz(.hosts|objects|.hermes.peerName) // "seo-jin-on"' "$HONCHO_CFG" 2>/dev/null)"
+    token="$(jq -r 'def nz(x): x | select(. != null and . != ""); nz(.authToken) // nz(.apiKey) // nz(.hosts|objects|.hermes.apiKey) // empty' "$HONCHO_CFG" 2>/dev/null)"
+    rl="$(jq -r 'def nz(x): x | select(. != null and . != ""); nz(.reasoningLevel) // nz(.hosts|objects|.hermes.dialecticReasoningLevel) // "low"' "$HONCHO_CFG" 2>/dev/null)"
+    query="Current ccc-node task context: $(query_from_state 0). Summarize only directly relevant user preferences, operating constraints, and current priorities. Avoid repeating generic facts."
+    query_hash="$(printf '%s' "$query" | sha256sum 2>/dev/null | cut -d' ' -f1)"
+    config_json="$(jq -nc \
+      --arg base_url "$honcho" --arg workspace "$ws" --arg peer "$peer" \
+      --arg target "$target" --arg reasoning_level "$rl" \
+      --arg audience_scoped "$AUDIENCE_SCOPED" --arg audience "$MEMORY_AUDIENCE" \
+      --arg workspace_scope "$HONCHO_WORKSPACE_SCOPE" \
+      --arg shared_workspace_scope "$HONCHO_SHARED_WORKSPACE_SCOPE" \
+      '{base_url:$base_url,workspace:$workspace,peer:$peer,target:$target,reasoning_level:$reasoning_level,audience_scoped:$audience_scoped,audience:$audience,workspace_scope:$workspace_scope,shared_workspace_scope:$shared_workspace_scope}')"
+    config_hash="$(printf '%s' "$config_json" | sha256sum 2>/dev/null | cut -d' ' -f1)"
     if [ -z "$honcho" ] || [ -z "$peer" ]; then
       status="missing"; err="honcho baseUrl or peerName missing"
+    elif honcho_cache_is_fresh "$query_hash" "$config_hash"; then
+      printf 'honcho refresh skipped reason=fresh max_age_sec=%s\n' \
+        "${CCC_HONCHO_CACHE_MAX_AGE_SEC:-${CCC_MEMORY_CACHE_TTL_SEC:-21600}}" >&2
+      return 0
     else
+      invalidation_token="$(cat "$HONCHO_INVALIDATE_FILE" 2>/dev/null || true)"
       if ! is_disabled "$AUDIENCE_SCOPED"; then
         private_tmp="$tmp.private"
         shared_tmp="$tmp.shared"
@@ -233,7 +288,11 @@ refresh_honcho() {
   rm -f "$tmp" "$tmp.err" "$tmp.raw" "$tmp.private" "$tmp.shared" "$tmp.legacy"
   rm -f "$tmp.private.raw" "$tmp.shared.raw" "$tmp.legacy.raw"
   end="$(now_ms)"; duration="$((end - start))"
-  record_status honcho "$status" "$duration" "$(bytes_for "$CACHE/honcho.txt")" "$err" "$query"
+  record_status honcho "$status" "$duration" "$(bytes_for "$CACHE/honcho.txt")" \
+    "$err" "$query" "${config_hash:-}"
+  case "$status" in
+    ok|empty) clear_honcho_invalidation "${invalidation_token:-}" ;;
+  esac
 }
 
 refresh_wiki & wiki_pid=$!

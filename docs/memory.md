@@ -46,6 +46,12 @@ There is no Codex user-session A2A launch path in current ccc-node main. The #47
 - Startup injection is fail-open and no-network.
 - SessionStart local-hot retrieval is read-only and has an inner deadline controlled by `CCC_MEMORY_SEARCH_TIMEOUT_SEC` (default 3 seconds, capped at 10 below the outer 15-second hook limit). A timeout drops only local-hot results; bounded MEMORY/USER/cache/resume blocks still inject.
 - Background refresh uses single-flight locking and should not block the interactive session.
+- The managed warmer may still run every 30 minutes so Family Wiki stays current,
+  but a successful or empty Honcho read is reused for
+  `CCC_HONCHO_CACHE_MAX_AGE_SEC` (default 21600 seconds) while its task query and
+  non-secret configuration fingerprint are unchanged. Fresh skips do not advance
+  `refreshed_at`. `CCC_HONCHO_FORCE_REFRESH=1`, a material task/config change,
+  expiry, or a successful distill push/replay forces the next Honcho read.
 - Diagnostics should report counts, statuses, paths, and cache ages only; do not print memory snippets or secrets in fleet reports.
 - On Termux, use `${TMPDIR:-$HOME/tmp}` for scratch and keep state under the user's writable home/state directory.
 
