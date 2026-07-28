@@ -2,7 +2,7 @@
 # skill-review/autoinstall.sh — Hermes-style unattended skill installation (#355).
 #
 # In approve mode (the default) this script is a no-op: drafts staged under
-# ~/.claude/state/pending-skills/ wait for a human (/skill-suggest). In auto
+# ~/.claude/state/pending-skills/ wait for a human (/skillsuggest). In auto
 # mode (CCC_SKILL_AUTOSAVE_MODE=auto, or `auto` in the skill-autosave.mode
 # state file) it replaces the human gate with deterministic machine gates and
 # installs passing drafts straight into ~/.claude/skills/, Hermes-style:
@@ -579,7 +579,7 @@ notify_summary() { # <summary-json>
   if [ "$n_def" -gt 0 ] 2>/dev/null; then
     parts="$parts · 일일 상한(${DAILY_CAP}건) 도달로 ${n_def}건 보류"
   fi
-  text="$parts — '/skill-suggest'로 사후 검토/롤백하세요."
+  text="$parts — '/skillsuggest'로 사후 검토/롤백하세요."
   mkdir -p "$SPOOL" 2>/dev/null || return 0
   node="${CCC_NODE:-$(hostname -s 2>/dev/null || echo node)}"
   now="$(ts)"

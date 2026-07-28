@@ -1,9 +1,9 @@
 ---
-name: skill-suggest
+name: skillsuggest
 description: Detect repeated procedures and review create, patch, or support-file skill proposals (human-in-the-loop), and audit or roll back autosave auto-mode changes. Use when asked to find automatable routines, improve an existing skill, review skill candidates, or list and roll back autosave-installed skills.
 ---
 
-# skill-suggest — propose skills from repeated work (+ autosave post-hoc review)
+# skillsuggest — propose skills from repeated work (+ autosave post-hoc review)
 
 Approximates "auto-skillification": find procedures you keep repeating and
 either improve the matching skill or create a distinct one. Detection is
@@ -77,7 +77,7 @@ Two autosave modes change what "review" means here (`docs/skill-autosave.md`):
 
 2. **Refresh deterministic candidates** (command-shape scan of transcripts):
    ```bash
-   bash ~/.claude/skills/skill-suggest/scan.sh
+   bash ~/.claude/skills/skillsuggest/scan.sh
    cat ~/.claude/state/skill-candidates.md
    ```
    (The daily skill-autosave sweep also refreshes this file and drafts skills
