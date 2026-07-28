@@ -344,5 +344,82 @@ DOCTOR_PY="$ROOT/scripts/ccc_doctor.py" python3 "$TMP/shortwrite.py" >"$TMP/shor
 ok "short os.write does not truncate --json stdout (#404)" \
   'python3 -c "import json,sys; obj=json.load(open(sys.argv[1])); sys.exit(0 if len(obj[\"rows\"]) == 20 else 1)" "$TMP/short.out"'
 
+# --- #771: boot ownership is node-type specific ---------------------------
+# The check's real property is "whatever restarts the bridge points at the live
+# checkout". systemd is only the Linux implementation of that; Termux nodes
+# implement it with ~/.termux/boot. Asking a Termux node for a systemd unit
+# reported a correctly-booting node as "nothing restarts the bridge on reboot".
+cat > "$TMP/nodetype.py" <<'PY_EOF'
+import os, sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(os.environ["DOCTOR_PY"]).resolve().parent))
+import ccc_doctor as mod
+
+home = Path(os.environ["FAKE_HOME"])
+boot = home / ".termux/boot"
+boot.mkdir(parents=True, exist_ok=True)
+live = f"{home}/ccc-node"
+
+
+def doctor(running, script_body=None):
+    for stale in boot.glob("*.sh"):
+        stale.unlink()
+    if script_body is not None:
+        (boot / "start-telegram-bridge.sh").write_text(script_body)
+    d = mod.Doctor(Path(live), home / ".claude", "settings")
+    d.check_bridge_boot_path_termux(running)
+    return [r for r in d.rows if r.item == "bridge boot path"][0]
+
+
+agree = doctor(live, f'setsid -f bash "$HOME/ccc-node/bridge/start.sh" --path "$HOME" -d\n')
+drift = doctor(live, 'setsid -f bash "/opt/ccc-node/bridge/start.sh" --path "/root" -d\n')
+none_ = doctor(live, None)
+
+results = {
+    "agree": agree.klass,
+    "drift": drift.klass,
+    "none": none_.klass,
+    "drift_detail": drift.status,
+    "none_advice": none_.action,
+    "path_arg": mod.Doctor.bridge_home_of(
+        "/x/ccc-node/bridge/venv/bin/python -m telegram_bot --path /data/data/com.termux/files/home"
+    ),
+}
+import json
+print(json.dumps(results, ensure_ascii=False))
+PY_EOF
+FAKE_HOME="$TMP/nodehome"; mkdir -p "$FAKE_HOME"
+nout="$(DOCTOR_PY="$ROOT/scripts/ccc_doctor.py" FAKE_HOME="$FAKE_HOME" HOME="$FAKE_HOME" python3 "$TMP/nodetype.py" 2>"$TMP/nodetype.err")"
+ok "termux boot script agreeing with runtime is 정상" '[ -n "$nout" ] && jq -e ".agree == \"정상\"" <<<"$nout" >/dev/null'
+ok "termux boot script pointing elsewhere is 수동필요 (same severity as a stale unit)" 'jq -e ".drift == \"수동필요\"" <<<"$nout" >/dev/null'
+ok "termux drift names both checkouts" 'jq -e ".drift_detail | contains(\"/opt/ccc-node\")" <<<"$nout" >/dev/null'
+ok "no boot script is 경고 with Termux advice, not systemd advice" 'jq -e ".none == \"경고\" and (.none_advice | contains(\".termux/boot\")) and (.none_advice | contains(\"systemd\") | not)" <<<"$nout" >/dev/null'
+ok "bridge --path is read from the live process" 'jq -e ".path_arg == \"/data/data/com.termux/files/home\"" <<<"$nout" >/dev/null'
+
+# harness version: a version script that cannot exec must fall through to git
+# describe, not report "unknown". On Termux the `#!/usr/bin/env bash` shebang
+# is unresolvable (no /usr/bin/env), which is exactly this path.
+cat > "$TMP/version.py" <<'PY_EOF'
+import os, subprocess, sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(os.environ["DOCTOR_PY"]).resolve().parent))
+import ccc_doctor as mod
+
+repo = Path(os.environ["VER_REPO"])
+(repo / "scripts").mkdir(parents=True, exist_ok=True)
+script = repo / "scripts/ccc-version.sh"
+script.write_text("#!/nonexistent/interpreter\necho never\n")
+script.chmod(0o755)
+subprocess.run(["git", "init", "-q", str(repo)], check=True)
+subprocess.run(["git", "-C", str(repo), "config", "user.email", "t@example.com"], check=True)
+subprocess.run(["git", "-C", str(repo), "config", "user.name", "t"], check=True)
+subprocess.run(["git", "-C", str(repo), "commit", "-q", "--allow-empty", "-m", "x"], check=True)
+print(mod.Doctor(repo, repo / ".claude", "settings").harness_version())
+PY_EOF
+vout="$(DOCTOR_PY="$ROOT/scripts/ccc_doctor.py" VER_REPO="$TMP/verrepo" python3 "$TMP/version.py" 2>"$TMP/version.err")"
+ok "unrunnable version script falls through to git describe, not 'unknown'" '[ -n "$vout" ] && [ "$vout" != "unknown" ]'
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

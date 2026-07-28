@@ -69,5 +69,74 @@ ok "doctor: JSON body has version field (extractor)" 'jq -e ".nodes[] | select(.
 ok "doctor: no secretWordOnlyMention field (domain-scoped)" 'jq -e "[.nodes[] | has(\"secretWordOnlyMention\")] | any | not" <<<"$dout" >/dev/null'
 ok "doctor: 'critical' is NOT a danger keyword here (domain-scoped)" 'jq -e ".nodes[] | select(.node==\"b\" and .status!=\"위험\")" <<<"$dout" >/dev/null'
 
+# --- #771: severity must beat source order -------------------------------
+# The regression this pins: a real ccc-doctor report is a table whose rows are
+# MOSTLY 정상 even when some are 경고, plus a tally above it. The old text
+# branch tested for 정상 first, matched a 정상 row, and returned before the 경고
+# test could run — so a fleet with warnings on 7 of 12 nodes rolled up as
+# "정상 12 / 경고 0". Fixtures here mirror the real emitted shape, not a
+# minimal one, because the minimal fixture is exactly what missed this.
+cat > "$TMP/real-shape.txt" <<'EOF'
+===== warned =====
+# ccc doctor
+
+- harness version: `v0.5.0-23-gca84de0`
+
+## 진단 요약
+
+- 정상: 45
+- 경고: 3
+- 교정가능: 0
+- 수동필요: 0
+
+| 분류 | 항목 | 상태 | 조치 |
+|---|---|---|---|
+| 정상 | `settings.json` | valid JSON | none |
+| 경고 | `memory cache` | honcho=stale | run scripts/ccc-memory-check.sh |
+===== fixable =====
+## 진단 요약
+
+- 정상: 48
+- 경고: 0
+- 교정가능: 2
+- 수동필요: 0
+
+| 정상 | `settings.json` | valid JSON | none |
+| 교정가능 | `hooks/skill-review/curator.py` | missing | reinstall allowlisted harness files |
+===== clean =====
+## 진단 요약
+
+- 정상: 48
+- 경고: 0
+- 교정가능: 0
+- 수동필요: 0
+
+| 정상 | `settings.json` | valid JSON | none |
+EOF
+
+rout="$(bash "$ROOT/scripts/ccc-doctor-fleet-matrix.sh" --evidence "$TMP/real-shape.txt" --node-list warned,fixable,clean)"
+ok "doctor: 경고 rows are not masked by the 정상 rows beside them" 'jq -e ".nodes[] | select(.node==\"warned\" and .status==\"경고\" and .reason==\"warnings_present\")" <<<"$rout" >/dev/null'
+ok "doctor: tally severity wins over row order (교정가능)" 'jq -e ".nodes[] | select(.node==\"fixable\" and .status==\"교정가능\" and .reason==\"fixable_drift\")" <<<"$rout" >/dev/null'
+ok "doctor: an all-정상 tally still classifies 정상" 'jq -e ".nodes[] | select(.node==\"clean\" and .status==\"정상\" and .reason==\"doctor_ok_text\")" <<<"$rout" >/dev/null'
+ok "doctor: summary counts the warned fleet honestly" 'jq -e ".summary.\"정상\" == 1 and .summary.\"경고\" == 1 and .summary.\"교정가능\" == 1" <<<"$rout" >/dev/null'
+
+# Same inversion without a tally to lean on (older emitters, security domain).
+cat > "$TMP/no-tally.txt" <<'EOF'
+===== mixed =====
+| 정상 | `settings.json` | valid JSON | none |
+| 경고 | `memory cache` | honcho=stale | run the memory check |
+EOF
+nout="$(bash "$ROOT/scripts/ccc-doctor-fleet-matrix.sh" --evidence "$TMP/no-tally.txt" --node-list mixed)"
+ok "doctor: 경고 beats 정상 with no tally present" 'jq -e ".nodes[] | select(.node==\"mixed\" and .status==\"경고\")" <<<"$nout" >/dev/null'
+
+# The tally parser must not fire on prose that merely mentions a status word.
+cat > "$TMP/prose.txt" <<'EOF'
+===== prose =====
+security audit ok
+경고 handling is described in the runbook, see - 경고: section below
+EOF
+pout="$(bash "$ROOT/scripts/ccc-security-audit-fleet-matrix.sh" --evidence "$TMP/prose.txt" --node-list prose)"
+ok "tally parser ignores non-numeric prose mentions" 'jq -e ".nodes[] | select(.node==\"prose\") | .status" <<<"$pout" >/dev/null'
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
