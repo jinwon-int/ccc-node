@@ -55,6 +55,9 @@ def test_secure_fs_exposes_descriptor_relative_atomic_write_primitives() -> None
 def test_owner_only_regular_violation_classifies_each_invariant(tmp_path: Path) -> None:
     target = tmp_path / "state.json"
     target.write_text("{}", encoding="utf-8")
+    # Pin owner-only perms explicitly so the baseline is umask-independent
+    # (#779): the contract fail-closes on group/other-writable files.
+    target.chmod(0o600)
     metadata = target.stat()
 
     assert (

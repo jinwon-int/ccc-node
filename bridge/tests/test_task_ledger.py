@@ -134,6 +134,10 @@ class TaskLedgerTests(unittest.TestCase):
         path = Path(self._td.name) / "sub" / "tasks.json"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("{ not json", encoding="utf-8")
+        # Model contract-compliant perms under any umask (#779): the ledger
+        # fail-closes on group/other-writable parents or ledger files.
+        path.parent.chmod(0o700)
+        path.chmod(0o600)
         self.assertEqual(self.ledger.records(), [])
         task_id = self.ledger.create(1, 2)  # recovers by overwriting
         self.assertEqual(self._only_record()["task_id"], task_id)

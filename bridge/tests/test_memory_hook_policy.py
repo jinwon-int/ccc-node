@@ -17,9 +17,15 @@ def _load(tmp_path: Path, values: dict[str, str]):
     project = tmp_path / "project"
     env_dir = project / ".telegram_bot"
     env_dir.mkdir(parents=True)
+    # Pin contract-compliant perms under any umask (#779): the lifecycle
+    # audit ledger fail-closes (via ensure_private_directory) when the bot
+    # data dir is group/other-writable.
+    project.chmod(0o700)
+    env_dir.chmod(0o700)
     lines = ["TELEGRAM_BOT_TOKEN=123456:test"]
     lines.extend(f"{key}={value}" for key, value in values.items())
     (env_dir / ".env").write_text("\n".join(lines) + "\n")
+    (env_dir / ".env").chmod(0o600)
     module = _fresh_config_module()
     return module.Settings.load(
         project_root=project,

@@ -47,7 +47,11 @@ def _source_fact() -> dict[str, object]:
 def _write_source(root: Path, value: dict[str, object] | None = None) -> Path:
     state_dir = root / PRIVATE_SCOPE / "state"
     state_dir.mkdir(parents=True, mode=0o700)
-    state_dir.chmod(0o700)
+    # mkdir(parents=True) creates intermediate components with the ambient
+    # umask; pin every fixture-created ancestor so session-store path
+    # validation passes under umask 0002 as well (#779).
+    for component in (root, root / PRIVATE_SCOPE, state_dir):
+        component.chmod(0o700)
     path = state_dir / "memory-facts.jsonl"
     path.write_text(
         json.dumps(value or _source_fact(), sort_keys=True, separators=(",", ":"))
@@ -219,6 +223,11 @@ def test_rejects_symlink_or_non_private_state_without_mutating_outside(
     root = tmp_path / "audiences"
     private_state = root / PRIVATE_SCOPE / "state"
     private_state.mkdir(parents=True, mode=0o700)
+    # Pin fixture-created ancestors so the PermissionError comes from the
+    # symlink rejection itself, not from umask-dependent ancestor perms
+    # (#779).
+    for component in (root, root / PRIVATE_SCOPE, private_state):
+        component.chmod(0o700)
     outside = tmp_path / "outside"
     outside.write_text(json.dumps(_source_fact()) + "\n")
     (private_state / "memory-facts.jsonl").symlink_to(outside)
