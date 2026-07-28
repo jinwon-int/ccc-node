@@ -29,6 +29,8 @@ config_module.config = SimpleNamespace(
     draft_update_min_chars=20,
     draft_update_interval=0.1,
     auto_new_session_after_hours=24.0,
+    busy_notice_enabled=True,
+    busy_notice_min_elapsed_seconds=10.0,
 )
 
 
@@ -100,12 +102,17 @@ class _ChatResponse:
 class _ProjectChatHandler:
     def __init__(self):
         self.responses = [_ChatResponse(content="ok")]
+        self.busy_seconds = None
 
     async def process_message(self, **kwargs):
         del kwargs
         if self.responses:
             return self.responses.pop(0)
         return _ChatResponse(content="ok")
+
+    def busy_for_seconds(self, user_id, chat_id, now):
+        del user_id, chat_id, now
+        return self.busy_seconds
 
     async def stop(self, user_id):
         del user_id
@@ -212,6 +219,89 @@ class VoiceReplyModeTests(unittest.IsolatedAsyncioTestCase):
         )
         macos_patcher.start()
         self.addCleanup(macos_patcher.stop)
+
+    async def _run_busy_notice_case(
+        self,
+        busy_seconds,
+        *,
+        enabled=True,
+        reply_error=None,
+    ):
+        project_chat = _ProjectChatHandler()
+        project_chat.busy_seconds = busy_seconds
+        project_chat.process_message = AsyncMock(
+            return_value=_ChatResponse(content="processed")
+        )
+        settings = SimpleNamespace(**vars(config_module.config))
+        settings.busy_notice_enabled = enabled
+        bot = _make_bot(
+            settings=settings,
+            session_manager=session_module.session_manager,
+            project_chat=project_chat,
+        )
+        bot.application = SimpleNamespace(bot=SimpleNamespace())
+        bot._effective_session_id = lambda session_key, session: "session-id"
+        bot._save_session_id = AsyncMock()
+        bot._send_reply_by_mode = AsyncMock()
+        update = _build_text_update(11, "follow-up")
+        update.message.reply_text.side_effect = reply_error
+
+        with patch("telegram_bot.core.bot.log_debug") as log_mock:
+            await bot._process_user_message_text(update, 11, "follow-up")
+
+        return bot, project_chat, update.message, log_mock
+
+    async def test_busy_notice_fires_past_threshold_without_dropping_message(self):
+        bot, project_chat, message, log_mock = await self._run_busy_notice_case(
+            185.9
+        )
+
+        reply = (
+            "⏳ Still working on the previous message (3m 05s elapsed). "
+            "I will handle this message after it finishes."
+        )
+        message.reply_text.assert_awaited_once_with(reply)
+        log_mock.assert_called_once_with(11, "bot", reply)
+        project_chat.process_message.assert_awaited_once()
+        self.assertEqual(
+            project_chat.process_message.await_args.kwargs["user_message"],
+            "follow-up",
+        )
+        bot._send_reply_by_mode.assert_awaited_once()
+
+    async def test_busy_notice_is_suppressed_below_threshold(self):
+        _, project_chat, message, log_mock = await self._run_busy_notice_case(9.9)
+
+        message.reply_text.assert_not_awaited()
+        log_mock.assert_not_called()
+        project_chat.process_message.assert_awaited_once()
+
+    async def test_busy_notice_is_suppressed_when_chat_is_idle(self):
+        _, project_chat, message, log_mock = await self._run_busy_notice_case(None)
+
+        message.reply_text.assert_not_awaited()
+        log_mock.assert_not_called()
+        project_chat.process_message.assert_awaited_once()
+
+    async def test_busy_notice_delivery_failure_does_not_drop_message(self):
+        _, project_chat, message, log_mock = await self._run_busy_notice_case(
+            185.9,
+            reply_error=RuntimeError("telegram unavailable"),
+        )
+
+        message.reply_text.assert_awaited_once()
+        log_mock.assert_not_called()
+        project_chat.process_message.assert_awaited_once()
+
+    async def test_busy_notice_is_suppressed_when_disabled(self):
+        _, project_chat, message, log_mock = await self._run_busy_notice_case(
+            185.9,
+            enabled=False,
+        )
+
+        message.reply_text.assert_not_awaited()
+        log_mock.assert_not_called()
+        project_chat.process_message.assert_awaited_once()
 
     def test_voice_message_switches_to_voice_mode(self):
         bot = _make_bot(

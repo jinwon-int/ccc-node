@@ -38,6 +38,7 @@ def test_active_tokens_separate_cleanup_ownership_from_approval_generation() -> 
 
     first = registry.register_active(key, session, started_at=2.0)
     assert registry.approval_is_active(key, first.generation)
+    assert registry.active_started_at(key) == 2.0
     assert registry.metrics().waiting_for_turn == 1
     assert registry.admit_if_same(first)
     assert registry.metrics().waiting_for_turn == 0
@@ -52,8 +53,10 @@ def test_active_tokens_separate_cleanup_ownership_from_approval_generation() -> 
     assert second.generation == first.generation + 2
     assert not registry.deactivate_if_same(first, touch_at=100.0)
     assert registry.active_handle_if_same(second) is not None
+    assert registry.active_started_at(key) == 4.0
     assert registry.metrics().oldest_started_at == 4.0
     assert registry.deactivate_if_same(second, touch_at=5.0)
+    assert registry.active_started_at(key) is None
     cached = registry.get_cached(key)
     assert cached is not None
     assert cached.entry.last_used_at == 5.0

@@ -100,6 +100,7 @@ class ProjectChatMixinContractTests(unittest.TestCase):
             "cancel_user_streaming",
             "inflight_count",
             "is_user_busy",
+            "busy_for_seconds",
             "clear_user_stream",
             "clear_pending_permissions",
             "list_sessions",

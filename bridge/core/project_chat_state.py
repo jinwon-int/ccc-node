@@ -275,6 +275,19 @@ class ProjectChatStateMixin:
     def is_user_busy(self, user_id: int, chat_id: Optional[int] = None) -> bool:
         return self.inflight_count(user_id, chat_id) > 0
 
+    def busy_for_seconds(
+        self,
+        user_id: int,
+        chat_id: int,
+        now: float,
+    ) -> float | None:
+        started_at = self._agent_session_registry.active_started_at(
+            self._stream_key(user_id, chat_id)
+        )
+        if started_at is None:
+            return None
+        return max(0.0, float(now) - started_at)
+
     async def clear_user_stream(self, user_id: int, chat_id: Optional[int] = None) -> None:
         """Interrupt and evict agent session(s) so the next turn starts fresh
         (used by /revert)."""
