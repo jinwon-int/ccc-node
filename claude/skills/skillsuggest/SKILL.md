@@ -97,6 +97,7 @@ Two autosave modes change what "review" means here (`docs/skill-autosave.md`):
    - Frontmatter: `name` (kebab-case) + a detailed `description` (it drives auto-matching).
    - Body: numbered steps, exact commands, and safety rules (no raw secrets — read keys from `~/.hermes/.env`; redact in output).
    - Offer to also land it in the `jinwon-int/ccc-node` template (`claude/skills/`) via PR, and record it in the Wiki (use the `wiki-record` skill).
+   - When landing a new `claude/skills/<name>/` in the template, also add its classification entry to `codex/compatibility.json` (`adapted` with a codex mirror, or `claude-only` with a reason). The catalog is fail-closed: an unclassified skill fails `validate-harness` (`catalog_unclassified`) and blocks CI (#789).
 
 ## Rules
 - Never author or overwrite a skill without explicit approval. (In auto mode the
