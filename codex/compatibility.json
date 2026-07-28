@@ -37,6 +37,16 @@
       "codex_skill": "ccc-wiki-record"
     },
     {
+      "pattern": "claude/skills/codex-memory-loader-injection/**",
+      "compatibility": "claude-only",
+      "reason": "Operator procedure executed from Claude sessions against codex bridge config"
+    },
+    {
+      "pattern": "claude/skills/debug-long-running-agent-tasks/**",
+      "compatibility": "claude-only",
+      "reason": "Claude Agent tool and TaskStop runtime"
+    },
+    {
       "pattern": "claude/skills/distill/**",
       "compatibility": "claude-only",
       "reason": "Claude hook and transcript pipeline"
