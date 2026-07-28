@@ -31,6 +31,9 @@ node_val="${CCC_NODE:-$(first_line_file "$STATE_DIR/node.txt")}"; [ -n "$node_va
 cwd_val="${CCC_WORKTREE:-$(first_line_file "$STATE_DIR/cwd.txt")}"; [ -n "$cwd_val" ] || cwd_val="$(pwd 2>/dev/null || printf '')"
 task_val="${CCC_MEMORY_QUERY:-$(read_file_trim "$STATE_DIR/current-task.txt")}"; [ -n "$task_val" ] || task_val="current task"
 prompt_val="${CCC_CURRENT_PROMPT:-$(read_file_trim "$STATE_DIR/current-prompt.txt")}" 
+case "${CCC_MEMORY_QUERY_INCLUDE_PROMPT:-1}" in
+  0|false|FALSE|off|OFF|no|NO) prompt_val="" ;;
+esac
 extra_val="${CCC_MEMORY_QUERY_EXTRA:-}"
 issue_val="${CCC_TASK_ISSUE_URL:-${GITHUB_ISSUE_URL:-}}"
 pr_val="${CCC_TASK_PR_URL:-${GITHUB_PR_URL:-}}"

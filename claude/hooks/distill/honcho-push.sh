@@ -15,6 +15,8 @@ CFG="${CCC_HONCHO_CFG:-${HOME:-/root}/.hermes/honcho.json}"
 STATE_DIR="${CCC_STATE_DIR:-${HOME:-/root}/.claude/state}"
 QUEUE="$STATE_DIR/honcho-queue.jsonl"
 QUEUE_LOCK="$STATE_DIR/.honcho-queue.lock"
+HONCHO_INVALIDATE_FILE="$STATE_DIR/honcho-refresh.invalidate"
+HONCHO_INVALIDATE_LOCK="$STATE_DIR/.honcho-refresh-invalidate.lock"
 mkdir -p "$STATE_DIR" 2>/dev/null
 
 case "${CCC_HONCHO_MEMORY_ENABLED:-1}" in
@@ -32,6 +34,17 @@ append_retry_payload() {
     flock 9 || exit 1
     printf '%s\n' "$PAYLOAD" >> "$QUEUE"
   ) 9>"$QUEUE_LOCK"
+}
+
+invalidate_honcho_refresh() {
+  local tmp="$STATE_DIR/.honcho-refresh.invalidate.$$"
+  (
+    flock 9 || exit 1
+    umask 077
+    printf '%s:%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$$" > "$tmp" \
+      && mv "$tmp" "$HONCHO_INVALIDATE_FILE"
+  ) 9>"$HONCHO_INVALIDATE_LOCK"
+  rm -f "$tmp" 2>/dev/null || true
 }
 
 [ -f "$CFG" ] || { echo "no honcho.json"; exit 0; }
@@ -136,6 +149,7 @@ HTTP="$(printf '%s' "$RESP" | sed -n 's/.*__HTTP__\([0-9]*\)__.*/\1/p')"
 BODY="$(printf '%s' "$RESP" | sed 's/__HTTP__[0-9]*__$//')"
 
 if [ "$HTTP" = "200" ] || [ "$HTTP" = "201" ] || [ "$HTTP" = "202" ]; then
+  invalidate_honcho_refresh 2>/dev/null || true
   echo "honcho push ok http=$HTTP session=$SID facts=$N"
 else
   echo "honcho push failed http=$HTTP session=$SID facts=$N"
