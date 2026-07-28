@@ -28,6 +28,7 @@ from telegram_bot.core import session_resume
 from telegram_bot.core.push_notifier import PushNotifier
 from telegram_bot.core.task_queue import UserTaskQueue
 from telegram_bot.core.project_chat import ChatResponse
+from telegram_bot.core.heartbeat import format_duration
 from telegram_bot.core.session_scope import legacy_storage_keys, storage_key
 from telegram_bot.memory.distill_types import DistillJob, DistillTrigger
 from telegram_bot.utils.audio_processor import AudioProcessor
@@ -898,6 +899,35 @@ class TelegramBot(
         chat = self._require_chat(update)
         app = self._require_application()
         conversation_key = self._conversation_key(user_id, chat.id)
+        busy_probe = getattr(self._project_chat, "busy_for_seconds", None)
+        if bool(getattr(self._config, "busy_notice_enabled", True)) and callable(
+            busy_probe
+        ):
+            busy_seconds = busy_probe(
+                user_id,
+                chat.id,
+                asyncio.get_running_loop().time(),
+            )
+            threshold = float(
+                getattr(self._config, "busy_notice_min_elapsed_seconds", 10.0)
+            )
+            if busy_seconds is not None and busy_seconds >= threshold:
+                reply = (
+                    "⏳ Still working on the previous message "
+                    f"({format_duration(busy_seconds)} elapsed). "
+                    "I will handle this message after it finishes."
+                )
+                try:
+                    await message.reply_text(reply)
+                except Exception:
+                    logger.warning(
+                        "Busy notice delivery failed for user %s",
+                        user_id,
+                        exc_info=True,
+                    )
+                else:
+                    log_debug(user_id, "bot", reply)
+
         current_session = await self._session_manager.get_session(conversation_key)
         await self._seed_scoped_session_from_legacy(
             conversation_key, user_id, chat.id, current_session

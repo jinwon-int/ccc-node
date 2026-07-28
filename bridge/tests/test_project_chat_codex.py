@@ -272,6 +272,8 @@ def test_agent_provider_settings_default_and_reject_unknown(tmp_path: Path) -> N
         tmp_path / ".claude" / "hooks" / "ccc_codex_memory.py"
     )
     assert settings.session_guard_enabled is True
+    assert settings.busy_notice_enabled is True
+    assert settings.busy_notice_min_elapsed_seconds == 10.0
     assert settings.session_guard_interval_seconds == 60.0
     assert settings.session_idle_ttl_seconds == 4 * 60 * 60
     assert settings.max_resident_sessions == 2
@@ -286,6 +288,8 @@ def test_agent_provider_settings_default_and_reject_unknown(tmp_path: Path) -> N
             "CCC_CODEX_MEMORY_MATERIALIZER_PATH": "/opt/lib/ccc-materialize",
             "CCC_CODEX_MEMORY_BOOTSTRAP_TIMEOUT_SEC": "4.5",
             "CCC_BRIDGE_SESSION_GUARD_ENABLED": "false",
+            "CCC_BRIDGE_BUSY_NOTICE_ENABLED": "false",
+            "CCC_BRIDGE_BUSY_NOTICE_MIN_ELAPSED_SECONDS": "30",
             "CCC_BRIDGE_SESSION_GUARD_INTERVAL_SECONDS": "120",
             "CCC_BRIDGE_SESSION_IDLE_TTL_SECONDS": "7200",
             "CCC_BRIDGE_MAX_RESIDENT_SESSIONS": "3",
@@ -299,6 +303,8 @@ def test_agent_provider_settings_default_and_reject_unknown(tmp_path: Path) -> N
     assert codex_settings.codex_memory_materializer_path == "/opt/lib/ccc-materialize"
     assert codex_settings.codex_memory_bootstrap_timeout_seconds == 4.5
     assert codex_settings.session_guard_enabled is False
+    assert codex_settings.busy_notice_enabled is False
+    assert codex_settings.busy_notice_min_elapsed_seconds == 30.0
     assert codex_settings.session_guard_interval_seconds == 120.0
     assert codex_settings.session_idle_ttl_seconds == 7200
     assert codex_settings.max_resident_sessions == 3
@@ -536,6 +542,27 @@ async def test_session_guard_closes_expired_idle_session_but_protects_active(
     assert snapshot["resident_sessions"] == 1
     assert snapshot["active_sessions"] == 1
     assert snapshot["evictions"] == 1
+
+
+def test_busy_for_seconds_is_scoped_to_active_chat(tmp_path: Path) -> None:
+    handler = ProjectChatHandler(
+        settings=_settings(tmp_path, provider="claude"),
+        agent_runtime=FakeRuntime(),
+    )
+    key = handler._stream_key(7, 70)
+
+    assert handler.busy_for_seconds(7, 70, 10.0) is None
+    token = handler._agent_session_registry.register_active(
+        key,
+        object(),
+        started_at=3.5,
+    )
+
+    assert handler.busy_for_seconds(7, 70, 10.0) == 6.5
+    assert handler.busy_for_seconds(7, 70, 2.0) == 0.0
+    assert handler.busy_for_seconds(7, 71, 10.0) is None
+    assert handler._agent_session_registry.deactivate_if_same(token)
+    assert handler.busy_for_seconds(7, 70, 10.0) is None
 
 
 @pytest.mark.anyio

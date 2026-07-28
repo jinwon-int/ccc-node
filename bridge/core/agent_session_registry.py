@@ -254,6 +254,13 @@ class AgentSessionRegistry:
             return None
         return ActiveSessionHandle(active.token, active.session)
 
+    def active_started_at(self, key: StreamKey) -> float | None:
+        """Return the monotonic start time for one active conversation turn."""
+
+        record = self._records.get(key)
+        active = record.active if record is not None else None
+        return active.started_at if active is not None else None
+
     def deactivate_if_same(
         self,
         token: ActiveToken,

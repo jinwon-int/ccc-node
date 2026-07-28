@@ -287,6 +287,23 @@ class Config(
             "The guard never interrupts an active request."
         ),
     )
+    busy_notice_enabled: bool = Field(
+        default=True,
+        alias="CCC_BRIDGE_BUSY_NOTICE_ENABLED",
+        description=(
+            "Immediately acknowledge a follow-up Telegram message when its "
+            "conversation already has an active turn."
+        ),
+    )
+    busy_notice_min_elapsed_seconds: float = Field(
+        default=10.0,
+        ge=0.0,
+        le=3600.0,
+        alias="CCC_BRIDGE_BUSY_NOTICE_MIN_ELAPSED_SECONDS",
+        description=(
+            "Minimum active-turn age before sending a busy acknowledgement."
+        ),
+    )
     session_guard_interval_seconds: float = Field(
         default=60.0,
         ge=10.0,
