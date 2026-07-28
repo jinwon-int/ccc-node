@@ -55,6 +55,9 @@ ok "status reports disabled without config contents" \
 
 existing="$TMP/existing"
 mkdir -p "$existing"
+# Fixtures must model contract-compliant perms under any umask (#772): the
+# policy fail-closes on group/other-writable codex homes and config files.
+chmod 700 "$existing"
 printf '%s\n' \
   '# keep-comment' \
   'sentinel = "KEEP-BYTE-FOR-BYTE"' \
@@ -65,6 +68,7 @@ printf '%s\n' \
   '' \
   '[projects."/srv/repo"]' \
   'trust_level = "trusted"' > "$existing/config.toml"
+chmod 600 "$existing/config.toml"
 python3 "$POLICY" apply --codex-home "$existing" --json >/dev/null; rc=$?
 ok "canonical existing config is updated" \
   '[ "$rc" = 0 ] && plugin_disabled "$existing/config.toml"'
@@ -73,7 +77,9 @@ ok "unrelated values and comments are preserved" \
 
 inline="$TMP/inline"
 mkdir -p "$inline"
+chmod 700 "$inline"  # contract-compliant home under any umask (#772)
 printf '%s\n' '[plugins]' '"github@openai-curated-remote" = { enabled = true }' > "$inline/config.toml"
+chmod 600 "$inline/config.toml"  # contract-compliant config under any umask (#772)
 inline_before="$(sha256sum "$inline/config.toml")"
 out="$(python3 "$POLICY" apply --codex-home "$inline" --json)"; rc=$?
 inline_after="$(sha256sum "$inline/config.toml")"
@@ -82,7 +88,9 @@ ok "noncanonical inline plugin config fails closed" \
 
 invalid="$TMP/invalid"
 mkdir -p "$invalid"
+chmod 700 "$invalid"  # contract-compliant home under any umask (#772)
 printf '%s\n' 'not valid = [' > "$invalid/config.toml"
+chmod 600 "$invalid/config.toml"  # contract-compliant config under any umask (#772)
 invalid_before="$(sha256sum "$invalid/config.toml")"
 out="$(python3 "$POLICY" apply --codex-home "$invalid" --json)"; rc=$?
 invalid_after="$(sha256sum "$invalid/config.toml")"
@@ -91,6 +99,7 @@ ok "invalid TOML fails without rewriting the file" \
 
 linked="$TMP/linked"
 mkdir -p "$linked"
+chmod 700 "$linked"  # contract-compliant home under any umask (#772)
 printf '%s\n' 'sentinel = "outside"' > "$TMP/outside.toml"
 ln -s "$TMP/outside.toml" "$linked/config.toml"
 outside_before="$(sha256sum "$TMP/outside.toml")"
