@@ -19,6 +19,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   delivery. Body-free observability: per-outcome health counters
   (`empty_completion_recovered` / `empty_completion_failed`) and
   provider-labelled warning logs.
+- **Bridge test fixtures pin permission-contract perms (#779).** Ten tests
+  across the memory-promotion, memory-hook-policy, secure-fs, and
+  task-ledger suites failed on umask 0002 nodes because fixtures inherited
+  the ambient umask (0775 directories, 0664 files) and tripped the
+  fail-closed filesystem contracts before the intended assertions.
+  Fixtures now pin 0700 directories / 0600 files explicitly, and CI runs
+  the four suites a second time under umask 0002 to hold the line.
 
 ### Changed
 - **Honcho warmer freshness guard (#777).** The 30-minute memory warmer now

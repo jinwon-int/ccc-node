@@ -98,6 +98,21 @@ jobs:
           # non-zero and fails this job. Raising the floor / the ratchet lives in
           # #348; the gate is regression-pinned by tests/test_coverage_floor_gate.py.
           python -m pytest -q --cov=telegram_bot --cov-report=term --cov-report=xml
+      - name: Umask-0002 variant (permission-contract suites)
+        working-directory: bridge
+        env:
+          TMPDIR: ${{ runner.temp }}/ccc-tmp-0002
+          PYTHONPATH: ${{ github.workspace }}/.github/pythonpath
+        run: |
+          mkdir -p "$TMPDIR"
+          # #779: these suites pin fixture permissions against the fail-closed
+          # filesystem contracts; run them under umask 0002 so a fixture that
+          # re-inherits the ambient umask fails in CI (default umask 0022).
+          (umask 0002; python -m pytest -q \
+            tests/test_memory_hook_policy.py \
+            tests/test_memory_promotion.py \
+            tests/test_secure_fs_module.py \
+            tests/test_task_ledger.py)
       - name: Upload bridge coverage artifact
         if: matrix.python-version == '3.12'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
