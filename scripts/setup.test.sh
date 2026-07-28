@@ -277,6 +277,7 @@ printf '%s\n' \
   '' \
   '[plugins."github@openai-curated-remote"]' \
   'enabled = true # connector-first old state' > "$policy_codex/config.toml"
+chmod 600 "$policy_codex/config.toml"  # contract-compliant config under any umask (#772)
 HOME="$policy_home" CODEX_HOME="$policy_codex" CCC_CLAUDE_DIR="$policy_claude" \
   CCC_HERMES_DIR="$policy_hermes" bash "$SETUP" --no-backup >/dev/null 2>&1
 policy_rc=$?
