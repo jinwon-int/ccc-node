@@ -257,6 +257,7 @@ for t in claude/hooks/observability.test.sh claude/hooks/security-scan.test.sh \
          claude/hooks/distill/extract.test.sh claude/hooks/distill/honcho-push.test.sh \
          claude/hooks/distill/queue-drain.test.sh claude/hooks/distill/pending-drain.test.sh claude/hooks/distill/wiki-queue.test.sh \
          claude/hooks/distill/local-facts.test.sh claude/hooks/memory-hooks.test.sh \
+         claude/hooks/refresh-memory-freshness.test.sh \
          scripts/ccc-doctor.test.sh scripts/ccc-memory.test.sh scripts/ccc-codex-memory.test.sh scripts/ccc-codex.test.sh scripts/ccc-codex-github-policy.test.sh scripts/ccc-distill-check.test.sh scripts/ccc-security-audit.test.sh \
          scripts/ccc-fleet-matrix.test.sh scripts/ccc-wiki-triage.test.sh scripts/setup.test.sh \
          scripts/harness-paths.test.sh \

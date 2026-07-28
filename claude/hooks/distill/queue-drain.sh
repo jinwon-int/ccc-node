@@ -27,12 +27,24 @@ DEAD="$STATE_DIR/honcho-queue.jsonl.dead"
 CFG="${CCC_HONCHO_CFG:-${HOME:-/root}/.hermes/honcho.json}"
 QUEUE_LOCK="$STATE_DIR/.honcho-queue.lock"
 DRAIN_LOCK="$STATE_DIR/.honcho-queue-drain.lock"
+HONCHO_INVALIDATE_FILE="$STATE_DIR/honcho-refresh.invalidate"
+HONCHO_INVALIDATE_LOCK="$STATE_DIR/.honcho-refresh-invalidate.lock"
 
 MAX_BATCH="${CCC_DISTILL_DRAIN_BATCH:-20}"
 MAX_ATTEMPTS="${CCC_DISTILL_DRAIN_MAX_ATTEMPTS:-3}"
 
 mkdir -p "$STATE_DIR" 2>/dev/null
 log() { printf '%s [drain] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >> "$LOG" 2>/dev/null; }
+invalidate_honcho_refresh() {
+  local tmp="$STATE_DIR/.honcho-refresh.invalidate.$$"
+  (
+    flock 9 || exit 1
+    umask 077
+    printf '%s:%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$$" > "$tmp" \
+      && mv "$tmp" "$HONCHO_INVALIDATE_FILE"
+  ) 9>"$HONCHO_INVALIDATE_LOCK"
+  rm -f "$tmp" 2>/dev/null || true
+}
 
 # ---- single-flight + early exits ------------------------------------------
 # Keep drain single-flight separate from the short producer/queue mutation
@@ -196,5 +208,6 @@ if [ "$finalize_rc" -ne 0 ]; then
   exit 0
 fi
 
+[ "$DRAINED" -eq 0 ] || invalidate_honcho_refresh 2>/dev/null || true
 log "drained ok=$DRAINED failed=$FAILED dropped=$DROPPED processed=$PROCESSED"
 exit 0
