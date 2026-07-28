@@ -100,6 +100,7 @@ SKILLS_AUTO="$TMP/skills-auto"
 SPOOL_AUTO="$TMP/spool-auto"
 mkdir -p "$STATE_AUTO" "$SKILLS_AUTO"
 chmod 700 "$STATE_AUTO"
+chmod 700 "$SKILLS_AUTO"  # contract-compliant root under any umask (#770)
 out="$(payload sess-auto "$TRANS" "/root/work" | CCC_STATE_DIR="$STATE_AUTO" CLAUDE_SKILLS_DIR="$SKILLS_AUTO" \
   CCC_PUSH_SPOOL="$SPOOL_AUTO" CCC_SKILL_AUTOSAVE_MODE=auto CCC_SKILL_REVIEW_COOLDOWN_SECONDS=0 \
   bash "$REVIEW" sessionend 2>&1)"; rc=$?

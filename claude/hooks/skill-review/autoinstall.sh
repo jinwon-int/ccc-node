@@ -352,7 +352,7 @@ do_run() {
 
   local work dir id f name desc verdict rec sha sid dest proposal_file action apply_json apply_rc validation_json
   local -a installed=() blocked=() newly_blocked=() would_install=()
-  local deferred=0 today_used legacy_used incremental_used incremental_cap
+  local deferred=0 failed=0 today_used legacy_used incremental_used incremental_cap
   work="$(mktemp -d 2>/dev/null)" || work="$STATE_DIR/.autoinstall-work.$$"
   mkdir -p "$work" 2>/dev/null
   trap 'rm -rf "$work" 2>/dev/null; rmdir "$LOCKDIR" 2>/dev/null' RETURN
@@ -491,13 +491,19 @@ do_run() {
     fi
 
     # Install: narrow write surface — only $SKILLS_DIR/<kebab-name>/.
+    # Perms are pinned explicitly (umask-agnostic): the ownership contract
+    # fail-closes on group/other-writable skill dirs or SKILL.md (#770).
     dest="$SKILLS_DIR/$name"
     sid="$(jq -r '.session_id // empty' "$dir/meta.json" 2>/dev/null)"
-    if ! mkdir "$dest" 2>/dev/null; then
+    if ! mkdir -m 700 "$dest" 2>/dev/null; then
+      failed=$((failed + 1))
       log "install failed id=$id name=$name reason=write-error trigger=$TRIGGER"
       continue
     fi
-    if ! cp "$f" "$dest/SKILL.md" 2>/dev/null; then
+    if ! cp "$f" "$dest/SKILL.md" 2>/dev/null \
+      || ! chmod 600 "$dest/SKILL.md" 2>/dev/null; then
+      failed=$((failed + 1))
+      rm -f "$dest/SKILL.md" 2>/dev/null
       rmdir "$dest" 2>/dev/null || true
       log "install failed id=$id name=$name reason=write-error trigger=$TRIGGER"
       continue
@@ -507,6 +513,7 @@ do_run() {
       # This directory was created by this locked install attempt and has not
       # been published as installed yet. Fail closed and leave the draft
       # pending if durable v2 provenance cannot be established.
+      failed=$((failed + 1))
       rm -f "$dest/SKILL.md" "$dest/.autosave-meta.json" 2>/dev/null
       if rmdir "$dest" 2>/dev/null; then
         log "install failed id=$id name=$name reason=provenance-write cleanup=complete trigger=$TRIGGER"
@@ -538,11 +545,12 @@ do_run() {
     --argjson newly_blocked "$(printf '%s\n' "${newly_blocked[@]:-}" | jq -R . | jq -sc 'map(select(length>0))')" \
     --argjson would_install "$(printf '%s\n' "${would_install[@]:-}" | jq -R . | jq -sc 'map(select(length>0))')" \
     --argjson deferred "$deferred" \
+    --argjson failed "$failed" \
     --argjson pending "$(pending_count)" \
     --arg autonomy "$AUTONOMY_STATE" \
     '{mode:"auto", autonomy:$autonomy, installed:$installed, blocked:$blocked,
       newly_blocked:$newly_blocked, would_install:$would_install,
-      dry_run:($autonomy=="dry-run"), deferred:$deferred, pending:$pending}')"
+      dry_run:($autonomy=="dry-run"), deferred:$deferred, failed:$failed, pending:$pending}')"
   printf '%s\n' "$summary"
   log "run done $summary"
   notify_summary "$summary"
@@ -789,12 +797,14 @@ do_apply() {
         }
       fi
       dest="$SKILLS_DIR/$name"
-      mkdir "$dest" 2>/dev/null || {
+      # Pinned perms, same contract as the auto install path (#770).
+      mkdir -m 700 "$dest" 2>/dev/null || {
         rm -f "$f"
         echo '{"ok":false,"code":"create-target-exists"}'
         return 2
       }
       if ! cp "$f" "$dest/SKILL.md" 2>/dev/null \
+        || ! chmod 600 "$dest/SKILL.md" 2>/dev/null \
         || ! ownership_cmd mark-created "$name" >/dev/null; then
         rm -f "$dest/SKILL.md" "$dest/.autosave-meta.json" "$f" 2>/dev/null
         rmdir "$dest" 2>/dev/null || true

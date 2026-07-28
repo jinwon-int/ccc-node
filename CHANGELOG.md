@@ -42,6 +42,17 @@ All notable changes to the Claude Code node harness. Dates are KST.
   durably backs off body-free backend failures and cancellations. Claude
   composition is unchanged. (#749)
 
+### Fixed
+- Skill autosave auto-install no longer fails closed on nodes whose default
+  umask is 0002 (#770). Both install paths (auto and owner-approved create)
+  now pin the skill directory to mode 700 and SKILL.md to 600 instead of
+  inheriting the ambient umask, matching the ownership contract that rejects
+  group/other-writable skill dirs. The auto-mode run summary reports a
+  `failed` counter so an install that fail-closed is distinguishable from a
+  silent skip, and the four umask-sensitive test suites run a second pass
+  under umask 0002 in validate-harness to hold the line. Test fixtures now
+  model contract-compliant skills roots under any umask.
+
 ## [0.5.0] — 2026-07-26
 
 ### Added
