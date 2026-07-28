@@ -47,7 +47,7 @@ _SEVERITY_ORDER = ["위험", "수동필요", "교정가능", "경고", "정상"]
 #:     - 정상: 45
 #:     - 경고: 3
 #: Reading the tally beats substring-matching the body, which cannot tell a
-#: status row from the same word appearing in a guidance column (#770).
+#: status row from the same word appearing in a guidance column (#771).
 _COUNT_LINE_RE = re.compile(
     r"^[ \t]*[-*][ \t]*(정상|경고|교정가능|수동필요|위험)[ \t]*:[ \t]*(\d+)[ \t]*$",
     re.M,
@@ -154,7 +154,7 @@ def classify(body: str, domain: Domain) -> Tuple[str, str]:
     # Severity before health. This pair was previously inverted: every doctor
     # report contains 정상 rows alongside its 경고 rows, so the 정상 test matched
     # first and the 경고 test below was unreachable — a warning fleet reported
-    # itself as clean (#770).
+    # itself as clean (#771).
     if "warning" in low or "경고" in body:
         return r["text_warning"]
     if (

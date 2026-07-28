@@ -69,7 +69,7 @@ ok "doctor: JSON body has version field (extractor)" 'jq -e ".nodes[] | select(.
 ok "doctor: no secretWordOnlyMention field (domain-scoped)" 'jq -e "[.nodes[] | has(\"secretWordOnlyMention\")] | any | not" <<<"$dout" >/dev/null'
 ok "doctor: 'critical' is NOT a danger keyword here (domain-scoped)" 'jq -e ".nodes[] | select(.node==\"b\" and .status!=\"위험\")" <<<"$dout" >/dev/null'
 
-# --- #770: severity must beat source order -------------------------------
+# --- #771: severity must beat source order -------------------------------
 # The regression this pins: a real ccc-doctor report is a table whose rows are
 # MOSTLY 정상 even when some are 경고, plus a tally above it. The old text
 # branch tested for 정상 first, matched a 정상 row, and returned before the 경고

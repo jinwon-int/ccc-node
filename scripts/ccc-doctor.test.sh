@@ -344,7 +344,7 @@ DOCTOR_PY="$ROOT/scripts/ccc_doctor.py" python3 "$TMP/shortwrite.py" >"$TMP/shor
 ok "short os.write does not truncate --json stdout (#404)" \
   'python3 -c "import json,sys; obj=json.load(open(sys.argv[1])); sys.exit(0 if len(obj[\"rows\"]) == 20 else 1)" "$TMP/short.out"'
 
-# --- #770: boot ownership is node-type specific ---------------------------
+# --- #771: boot ownership is node-type specific ---------------------------
 # The check's real property is "whatever restarts the bridge points at the live
 # checkout". systemd is only the Linux implementation of that; Termux nodes
 # implement it with ~/.termux/boot. Asking a Termux node for a systemd unit

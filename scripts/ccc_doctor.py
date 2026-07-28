@@ -138,7 +138,7 @@ class Doctor:
                 if out:
                     return out
             except Exception:
-                pass  # fall through to git describe rather than giving up (#770)
+                pass  # fall through to git describe rather than giving up (#771)
         try:
             return subprocess.check_output(
                 ["git", "-C", str(self.repo), "describe", "--tags", "--dirty", "--always"], text=True, stderr=subprocess.DEVNULL
@@ -484,7 +484,7 @@ class Doctor:
             # process. This was hardcoded to /root, so every non-root node
             # (Termux: $HOME=/data/data/com.termux/files/home) probed a home
             # nobody serves and reported a healthy bridge as "no status
-            # output" (#770).
+            # output" (#771).
             probe_home = self.running_bridge_home() or os.path.expanduser("~")
             try:
                 out = subprocess.run(["bash", str(start), "--path", probe_home, "--status"], text=True, capture_output=True, timeout=20)
@@ -586,7 +586,7 @@ class Doctor:
         # The property under test is "whatever restarts the bridge points at the
         # live checkout" — systemd is only how Linux nodes implement it. Termux
         # nodes boot through Termux:Boot, so asking them for a unit reported a
-        # correctly-booting node as unprotected (#770).
+        # correctly-booting node as unprotected (#771).
         if not self.has_systemd():
             self.check_bridge_boot_path_termux(running)
             return
