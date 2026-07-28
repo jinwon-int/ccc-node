@@ -684,7 +684,11 @@ class Doctor:
             env.setdefault("CCC_STATE_DIR", str(self.claude_dir / "state"))
             env.setdefault("CCC_MEMORY_CACHE_DIR", str(self.claude_dir / "hooks/cache"))
             try:
-                out = subprocess.run([str(script), "--json"], text=True, capture_output=True, env=env, timeout=20).stdout.strip()
+                # Through an explicit bash, never as a bare executable: the
+                # script's `#!/usr/bin/env bash` shebang is unresolvable on
+                # Termux, so direct exec raised ENOENT and the whole memory
+                # diagnostic silently degraded to "unavailable" (#775).
+                out = subprocess.run(["bash", str(script), "--json"], text=True, capture_output=True, env=env, timeout=20).stdout.strip()
                 mem = json.loads(out) if out else None
             except Exception:
                 mem = None
