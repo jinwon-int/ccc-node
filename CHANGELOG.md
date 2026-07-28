@@ -52,6 +52,11 @@ All notable changes to the Claude Code node harness. Dates are KST.
   silent skip, and the four umask-sensitive test suites run a second pass
   under umask 0002 in validate-harness to hold the line. Test fixtures now
   model contract-compliant skills roots under any umask.
+- The `ccc-codex-github-policy` and `setup` test suites no longer fail on
+  umask 0002 nodes (#772): fixtures now pin contract-compliant permissions
+  (700 codex homes, 600 config.toml) instead of inheriting the ambient
+  umask, matching the policy fail-closed contract. Both suites joined the
+  validate-harness umask-0002 second pass, which now covers six suites.
 
 ## [0.5.0] — 2026-07-26
 
