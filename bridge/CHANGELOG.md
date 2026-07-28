@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Durable external waits for GitHub CI (#740).** When an agent promises
+  "I'll continue once CI finishes" it can now register a durable wait
+  (`python -m telegram_bot.core.external_wait_cli register --repo … --pr …
+  --head-sha …`) that binds the current conversation through the
+  bridge-published active-turn route — natural language alone never creates
+  a monitor, and failed registrations cannot be mistaken for kept promises.
+  The bridge monitor polls GitHub checks pinned to the registered exact
+  head SHA (a moved head is `superseded`, never a stale success), journals
+  terminal transitions before waking, notifies the owning conversation, and
+  resumes through a bridge-owned `external_event` turn metered as
+  autonomous spend (session-moved waits are skipped, daily cap 10,
+  kill-switches `CCC_EXTERNAL_WAIT_ENABLED` / `CCC_EXTERNAL_WAIT_RESUME`).
+  Operators inspect with `/waits` and cancel with `/cancelwait <wait_id>`;
+  the `gh-ci-wait` skill teaches agents the registration contract.
+
 ### Fixed
 - **Empty normal completion classification (#775).** A provider turn that
   ends successfully without user-visible text no longer returns

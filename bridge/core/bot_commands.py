@@ -33,6 +33,11 @@ from telegram.ext import (
 )
 from telegram_bot.core import revert as revert_ops
 from telegram_bot.core import restart_handoff
+from telegram_bot.core.external_wait import (
+    STATE_MONITORING,
+    ExternalWaitRegistry,
+    default_registry_path as external_wait_registry_path,
+)
 from telegram_bot.core.agent_runtime import (
     JsonValue as AgentJsonValue,
     ModelInfo,
@@ -364,6 +369,62 @@ class BotCommandMixin:
             except Exception:
                 logger.warning("Local usage meter report failed")
         await message.reply_text(reply)
+        log_debug(user_id, "bot", reply)
+
+    def _external_wait_registry(self) -> ExternalWaitRegistry:
+        """Durable external-wait registry for /waits + /cancelwait (#740)."""
+        return ExternalWaitRegistry(
+            external_wait_registry_path(self._config.bot_data_dir / "external-wait")
+        )
+
+    @staticmethod
+    def _render_waits(records: list) -> str:
+        if not records:
+            return "No external waits registered."
+        lines = []
+        for rec in records:
+            state = rec.get("state")
+            marker = "⏳" if state == STATE_MONITORING else "🏁"
+            lines.append(
+                f"{marker} `{rec.get('wait_id')}` — {rec.get('repo')}#{rec.get('pr_number')}"
+                f" @ {str(rec.get('head_sha') or '')[:8]} · {state}"
+            )
+            summary = str(rec.get("summary") or "").strip()
+            if summary:
+                lines.append(f"   ↳ {summary}")
+        return "External waits (GitHub CI):\n" + "\n".join(lines)
+
+    async def _cmd_waits(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """List active and recent external waits (#740), read-only."""
+        if not await self._check_access(update):
+            return
+        user_id = self._require_user(update).id
+        message = self._require_message(update)
+        log_debug(user_id, "command", "/waits")
+        records = self._external_wait_registry().records()
+        records = [rec for rec in records if rec.get("user_id") in (None, user_id)]
+        reply = self._render_waits(records)
+        await message.reply_text(reply, parse_mode="Markdown")
+        log_debug(user_id, "bot", reply)
+
+    async def _cmd_cancelwait(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Cancel exactly one external wait by wait_id (#740)."""
+        if not await self._check_access(update):
+            return
+        user_id = self._require_user(update).id
+        message = self._require_message(update)
+        log_debug(user_id, "command", "/cancelwait")
+        args = getattr(context, "args", None) or []
+        wait_id = args[0].strip() if args else ""
+        if not wait_id:
+            await message.reply_text("Usage: /cancelwait <wait_id> — see /waits")
+            return
+        cancelled = self._external_wait_registry().cancel(wait_id)
+        if cancelled:
+            reply = f"Cancelled external wait `{wait_id}`."
+        else:
+            reply = f"No active external wait with id `{wait_id}`."
+        await message.reply_text(reply, parse_mode="Markdown")
         log_debug(user_id, "bot", reply)
 
     async def _cmd_skills(self, update: Update, context: ContextTypes.DEFAULT_TYPE):

@@ -322,6 +322,24 @@ CAPABILITY_AXES: tuple[CapabilityAxis, ...] = (
         ),
     ),
     _axis(
+        "external_wait",
+        RUNTIME_GROUP,
+        "External CI wait + resume",
+        "An agent promise to continue after external CI is backed by a durable, "
+        "exact-head wait registry with a journaled terminal-to-conversation wake.",
+        claude=_supported(
+            "Provider-neutral: the agent-side CLI binds registrations through the "
+            "bridge-published active-turn route; the bridge monitor polls GitHub "
+            "checks with exact-head pinning, journals terminal transitions before "
+            "the wake, and resumes through a bridge-owned external_event turn "
+            "(#740)."
+        ),
+        codex=_supported(
+            "Provider-neutral: same registry, monitor, and continuation contract "
+            "as the Claude path (#740)."
+        ),
+    ),
+    _axis(
         "memory_session_resume",
         MEMORY_GROUP,
         "Memory: session resume",
