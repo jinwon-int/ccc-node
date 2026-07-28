@@ -262,5 +262,53 @@ out="$(HOME="$TMP/home" \
 ok "private audience injects private shared and private-only legacy Honcho cache" \
   '[ "$rc" = 0 ] && grep -q "PRIVATE_HONCHO_ONLY" <<<"$out" && grep -q "SHARED_HONCHO_PUBLIC" <<<"$out" && grep -q "LEGACY_HONCHO_PRIVATE_ONLY" <<<"$out"'
 
+
+# --- #777: a dead endpoint must not read like a quiet one ------------------
+# honcho_chat used to pipe curl into jq, so the function returned JQ's status.
+# jq exits 0 on empty input, which made a timeout, a refused connection and a
+# genuine empty answer produce one indistinguishable outcome: "empty Honcho
+# response". Operators chasing a stale cache were handed the least useful of
+# the three readings. Each case now has its own status.
+nc_home="$TMP/nchome"; mkdir -p "$nc_home"
+nc_cache="$TMP/nccache"; nc_state="$TMP/ncstate"
+nc_cfg="$TMP/nc-honcho.json"
+printf '%s\n' '{"baseUrl":"https://honcho.invalid","workspace":"family","peerName":"peer-a"}' > "$nc_cfg"
+chmod 600 "$nc_cfg"
+nc_bin="$TMP/ncbin"; mkdir -p "$nc_bin"
+
+run_honcho() { # <curl-body-script>
+  rm -rf "$nc_cache" "$nc_state"; mkdir -p "$nc_cache" "$nc_state"
+  # /bin/sh, not `#!/usr/bin/env bash`: Termux has no /usr/bin/env, and execvp
+  # treats the resulting ENOENT as "not found here" and keeps walking PATH —
+  # so a stub with that shebang silently hands the call to the real curl and the
+  # test passes against the network instead of the fixture.
+  printf '#!/bin/sh\n%s\n' "$1" > "$nc_bin/curl"
+  chmod +x "$nc_bin/curl"
+  PATH="$nc_bin:$PATH" HOME="$nc_home" \
+    CCC_STATE_DIR="$nc_state" CCC_MEMORY_CACHE_DIR="$nc_cache" \
+    CCC_HOOK_DIR="$ROOT/claude/hooks" \
+    CCC_WIKI_MEMORY_ENABLED=0 CCC_HONCHO_MEMORY_ENABLED=1 \
+    CCC_MEMORY_AUDIENCE_SCOPED=0 CCC_HONCHO_AUDIENCE_SCOPED=0 \
+    CCC_HONCHO_CFG="$nc_cfg" \
+    bash "$ROOT/claude/hooks/refresh-memory.sh" >/dev/null 2>&1
+  jq -r '.sources.honcho.status' "$nc_cache/meta.json" 2>/dev/null
+}
+
+st="$(run_honcho 'printf "{\"content\":null}\n"')"
+ok "content:null is reported as no-content, not as an empty/transport failure" '[ "$st" = "no-content" ]'
+
+st="$(run_honcho 'exit 7')"
+ok "a failing curl is reported as error, not as an empty response" '[ "$st" = "error" ]'
+
+st="$(run_honcho 'exit 124')"
+ok "a timed-out curl is reported as error, not as an empty response" '[ "$st" = "error" ]'
+
+st="$(run_honcho 'printf "not json at all\n"')"
+ok "a non-JSON body is reported as error, not as an empty response" '[ "$st" = "error" ]'
+
+st="$(run_honcho 'printf "{\"content\":\"real recalled memory\"}\n"')"
+ok "a real answer still succeeds" '[ "$st" = "ok" ]'
+ok "a real answer is written to the cache" 'grep -q "real recalled memory" "$nc_cache/honcho.txt"'
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

@@ -112,13 +112,46 @@ honcho_chat() { # <base> <workspace> <peer> <target> <token> <reasoning> <query>
   if [ -n "$token" ]; then
     auth_args=(-H "Authorization: Bearer $token")
   fi
+  # curl and jq are deliberately NOT piped together. In a pipeline the function
+  # returns jq's status, and jq exits 0 on empty input — so a timeout, a refused
+  # connection, and a genuine empty answer were all indistinguishable, and every
+  # one of them surfaced as "empty Honcho response". A dead endpoint read exactly
+  # like a quiet one (#777).
+  local raw="$output.raw" rc=0
+  # `|| rc=$?`, not `if ! …; then rc=$?`: inside the then-branch of a negated
+  # command, $? is the status of the negation (always 0), so the latter form
+  # silently reports every transport failure as success.
   timeout "$HONCHO_TIMEOUT" curl -sS -X POST \
     "$honcho/v3/workspaces/$workspace_path/peers/$peer_path/chat" \
     -H 'Content-Type: application/json' \
     "${auth_args[@]}" \
     -d "$(jq -n --arg query "$query" --arg target "$target" --arg rl "$rl" \
       '{query:$query,target:$target,reasoning_level:$rl}')" \
-    2>"$error" | jq -r '.content // empty' > "$output" 2>>"$error"
+    >"$raw" 2>"$error" || rc=$?
+  if [ "$rc" != 0 ]; then
+    if [ "$rc" = 124 ]; then
+      printf 'honcho request timed out after %ss\n' "$HONCHO_TIMEOUT" >>"$error"
+    fi
+    rm -f "$raw"
+    return "$rc"
+  fi
+  if ! jq -e . >/dev/null 2>>"$error" <"$raw"; then
+    printf 'honcho returned a non-JSON body (%s bytes)\n' "$(bytes_for "$raw")" >>"$error"
+    rm -f "$raw"
+    return 1
+  fi
+  # A JSON body with content:null is the server answering "I have nothing" —
+  # a real condition, distinct from not reaching the server at all. Report it
+  # as such instead of letting it share the transport-failure vocabulary.
+  if [ "$(jq -r '.content // "null"' <"$raw")" = "null" ]; then
+    printf 'honcho answered with content:null (workspace=%s peer=%s level=%s)\n' \
+      "$workspace" "$peer" "$rl" >>"$error"
+    : > "$output"
+    rm -f "$raw"
+    return 3
+  fi
+  jq -r '.content // empty' <"$raw" > "$output" 2>>"$error"
+  rm -f "$raw"
 }
 
 refresh_honcho() {
@@ -178,17 +211,27 @@ refresh_honcho() {
         else
           status="error"; err="$(tr '\n' ' ' < "$tmp.err" | cut -c1-240)"
         fi
-      elif ! honcho_chat "$honcho" "$ws" "$peer" "$target" "$token" "$rl" \
-        "$query" "$tmp" "$tmp.err"; then
-        status="error"; err="$(tr '\n' ' ' < "$tmp.err" | cut -c1-240)"
-      elif [ ! -s "$tmp" ]; then
-        status="empty"; err="empty Honcho response"
       else
-        mv "$tmp" "$CACHE/honcho.txt"
+        honcho_chat "$honcho" "$ws" "$peer" "$target" "$token" "$rl" \
+          "$query" "$tmp" "$tmp.err"; chat_rc=$?
+        if [ "$chat_rc" = 3 ]; then
+          # Server reached and answered, with nothing in it. Named separately
+          # from a transport failure so the operator can tell "Honcho has no
+          # answer for this query" from "Honcho is unreachable" — the two need
+          # opposite responses, and the cache goes stale either way.
+          status="no-content"; err="$(tr '\n' ' ' < "$tmp.err" | cut -c1-240)"
+        elif [ "$chat_rc" != 0 ]; then
+          status="error"; err="$(tr '\n' ' ' < "$tmp.err" | cut -c1-240)"
+        elif [ ! -s "$tmp" ]; then
+          status="empty"; err="empty Honcho response"
+        else
+          mv "$tmp" "$CACHE/honcho.txt"
+        fi
       fi
     fi
   fi
-  rm -f "$tmp" "$tmp.err" "$tmp.private" "$tmp.shared" "$tmp.legacy"
+  rm -f "$tmp" "$tmp.err" "$tmp.raw" "$tmp.private" "$tmp.shared" "$tmp.legacy"
+  rm -f "$tmp.private.raw" "$tmp.shared.raw" "$tmp.legacy.raw"
   end="$(now_ms)"; duration="$((end - start))"
   record_status honcho "$status" "$duration" "$(bytes_for "$CACHE/honcho.txt")" "$err" "$query"
 }
