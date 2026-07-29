@@ -161,6 +161,37 @@ class ProbeLoopHotSpinRegressionTests(unittest.IsolatedAsyncioTestCase):
         )
 
 
+class WorkloadReporterLoopTests(unittest.IsolatedAsyncioTestCase):
+    async def test_reporter_publishes_runtime_admission_wait_count(self):
+        from telegram_bot.core.bot_lifecycle import BotLifecycleMixin
+
+        stop = asyncio.Event()
+
+        def workload_snapshot(now):
+            self.assertGreaterEqual(now, 0)
+            stop.set()
+            return 2, 75.0
+
+        bot = type("Bot", (BotLifecycleMixin,), {})()
+        bot._project_chat = SimpleNamespace(
+            workload_snapshot=workload_snapshot,
+            waiting_for_turn_snapshot=lambda: 1,
+        )
+        bot.application = None
+        bot._WORKLOAD_INTERVAL = 0
+
+        with patch(
+            "telegram_bot.core.bot_lifecycle.health_reporter.record_workload"
+        ) as record_workload:
+            await bot._workload_reporter(stop)
+
+        record_workload.assert_called_once_with(
+            2,
+            75.0,
+            waiting_for_turn=1,
+        )
+
+
 class SessionResourceGuardLoopTests(unittest.IsolatedAsyncioTestCase):
     async def test_guard_loop_runs_enforcement_and_stops_cleanly(self):
         from telegram_bot.core.bot_lifecycle import BotLifecycleMixin
