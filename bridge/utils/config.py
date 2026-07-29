@@ -317,6 +317,17 @@ class Config(
             "when the cap is reached."
         ),
     )
+    followup_failure_notification_cap: int = Field(
+        default=32,
+        ge=1,
+        le=1000,
+        alias="CCC_BRIDGE_FOLLOWUP_FAILURE_NOTIFICATION_CAP",
+        description=(
+            "Maximum retained discard receipts per conversation. At the cap, "
+            "the newest failed item stays queued and processing pauses instead "
+            "of displacing an earlier promised receipt."
+        ),
+    )
     followup_retry_backoff_seconds: Annotated[
         tuple[float, float, float], NoDecode
     ] = Field(

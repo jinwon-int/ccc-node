@@ -31,6 +31,7 @@ from telegram_bot.core.push_notifier import PushNotifier
 from telegram_bot.core.task_queue import UserTaskQueue
 from telegram_bot.core.project_chat import ChatResponse
 from telegram_bot.core.project_chat_state import (
+    FollowupNotificationCapacityError,
     FollowupQueueCorruptionError,
     PersistentFollowupQueue,
     QueuedFollowup,
@@ -148,6 +149,13 @@ class TelegramBot(
         self._followup_queue = PersistentFollowupQueue(
             settings.bot_data_dir / "followup-queue.json",
             per_chat_cap=int(getattr(settings, "followup_queue_cap", 32)),
+            failure_notification_cap=int(
+                getattr(
+                    settings,
+                    "followup_failure_notification_cap",
+                    32,
+                )
+            ),
         )
         self._followup_admission_locks: Dict[str, asyncio.Lock] = {}
         self._followup_idle_events: Dict[str, asyncio.Event] = {}
@@ -155,7 +163,8 @@ class TelegramBot(
         self._followup_workers: Dict[str, asyncio.Task[None]] = {}
         self._followup_worker_items: Dict[str, QueuedFollowup] = {}
         self._followup_worker_disabled: set[str] = set()
-        self._followup_worker_disable_notified: set[str] = set()
+        self._followup_notice_retry_tasks: Dict[str, asyncio.Task[None]] = {}
+        self._followup_disable_notice_tasks: Dict[str, asyncio.Task[None]] = {}
         self._followup_workers_stopping = False
         self._followup_queue_enabled = True
         self._audio_dir = settings.bot_data_dir / "audio"
@@ -589,17 +598,14 @@ class TelegramBot(
 
     async def _notify_followup_worker_disabled(
         self, queue_key: str, item: QueuedFollowup | None
-    ) -> None:
-        if queue_key in self._followup_worker_disable_notified:
-            return
-        self._followup_worker_disable_notified.add(queue_key)
+    ) -> bool:
         if item is None:
             logger.critical(
                 "Cannot notify the sender for disabled durable follow-up "
                 "worker %s because no queued update could be read",
                 queue_key,
             )
-            return
+            return False
         text = (
             "⚠️ Saved follow-up processing is paused for this conversation "
             "after repeated worker or queue-storage failures. Your queued "
@@ -618,6 +624,50 @@ class TelegramBot(
                 queue_key,
                 exc_info=True,
             )
+            return False
+        return True
+
+    def _followup_notice_retry_delay(self) -> float:
+        delays = self._followup_retry_delays()
+        return delays[-1] if delays else 30.0
+
+    def _schedule_followup_worker_disabled_notice_retry(
+        self,
+        queue_key: str,
+        item: QueuedFollowup,
+    ) -> None:
+        """Retry one failed pause notice once, without reviving the worker."""
+
+        current = self._followup_disable_notice_tasks.get(queue_key)
+        if current is not None and not current.done():
+            return
+
+        async def retry() -> None:
+            try:
+                await asyncio.sleep(self._followup_notice_retry_delay())
+                if (
+                    self._followup_workers_stopping
+                    or queue_key not in self._followup_worker_disabled
+                ):
+                    return
+                if not await self._notify_followup_worker_disabled(
+                    queue_key,
+                    item,
+                ):
+                    logger.critical(
+                        "Durable follow-up worker %s pause notification "
+                        "still failed after one paced retry",
+                        queue_key,
+                    )
+            finally:
+                task = asyncio.current_task()
+                if self._followup_disable_notice_tasks.get(queue_key) is task:
+                    self._followup_disable_notice_tasks.pop(queue_key, None)
+
+        self._followup_disable_notice_tasks[queue_key] = asyncio.create_task(
+            retry(),
+            name=f"followup-disable-notice:{queue_key}",
+        )
 
     async def _disable_followup_worker(
         self,
@@ -644,7 +694,15 @@ class TelegramBot(
                     "Failed to read queued update while disabling worker %s",
                     queue_key,
                 )
-        await self._notify_followup_worker_disabled(queue_key, candidate)
+        notified = await self._notify_followup_worker_disabled(
+            queue_key,
+            candidate,
+        )
+        if not notified and candidate is not None:
+            self._schedule_followup_worker_disabled_notice_retry(
+                queue_key,
+                candidate,
+            )
 
     async def _deliver_failed_followup_notification(
         self, item: QueuedFollowup
@@ -709,6 +767,16 @@ class TelegramBot(
                 item.item_id
             )
             acknowledged = self._followup_queue.acknowledge(item.item_id)
+        except FollowupNotificationCapacityError:
+            await self._disable_followup_worker(
+                item.conversation_key,
+                reason=(
+                    "failure-notification cap reached; newest failed item "
+                    "and all earlier promised receipts retained"
+                ),
+                item=item,
+            )
+            return False
         except OSError:
             await self._disable_followup_worker(
                 item.conversation_key,
@@ -814,7 +882,9 @@ class TelegramBot(
                 1.0,
             )
         )
-        restarts = 0
+        same_head_restarts = 0
+        last_failed_head_id: int | None = None
+        next_delay = base_delay
         while not self._followup_workers_stopping:
             try:
                 await self._run_followup_worker(queue_key)
@@ -822,26 +892,81 @@ class TelegramBot(
             except asyncio.CancelledError:
                 raise
             except Exception:
-                if restarts >= restart_cap:
+                failed_item = self._followup_worker_items.get(queue_key)
+                failed_head_id = (
+                    failed_item.item_id if failed_item is not None else None
+                )
+                made_progress = (
+                    last_failed_head_id is not None
+                    and failed_head_id is not None
+                    and failed_head_id != last_failed_head_id
+                )
+                if made_progress:
+                    # Progress is a durable head-ID change between unexpected
+                    # failures. It resets only the disable threshold. Backoff
+                    # remains independent so an error recurring on every item
+                    # cannot oscillate at the base delay forever.
+                    same_head_restarts = 0
+                if same_head_restarts >= restart_cap:
                     await self._disable_followup_worker(
                         queue_key,
                         reason=(
-                            "consecutive worker restart cap "
-                            f"({restart_cap}) exceeded"
+                            "same-head worker restart cap "
+                            f"({restart_cap}) exceeded at item "
+                            f"{failed_head_id}"
                         ),
                     )
                     return
-                delay = min(base_delay * (2**restarts), 300.0)
-                restarts += 1
+                delay = min(next_delay, 300.0)
+                next_delay = min(max(base_delay, delay * 2.0), 300.0)
+                same_head_restarts += 1
+                last_failed_head_id = failed_head_id
                 logger.exception(
-                    "Durable follow-up worker %s failed; restart %s/%s "
-                    "in %.2fs",
+                    "Durable follow-up worker %s failed at item %s; "
+                    "same-head restart %s/%s in %.2fs%s",
                     queue_key,
-                    restarts,
+                    failed_head_id,
+                    same_head_restarts,
                     restart_cap,
                     delay,
+                    " after durable head progress" if made_progress else "",
                 )
                 await asyncio.sleep(delay)
+
+    def _cancel_followup_notice_retry(
+        self, queue_key: str
+    ) -> asyncio.Task[None] | None:
+        task = self._followup_notice_retry_tasks.pop(queue_key, None)
+        if task is not None and task is not asyncio.current_task():
+            task.cancel()
+        return task
+
+    def _schedule_followup_notice_retry(self, queue_key: str) -> None:
+        """Start a notice-only worker after a wall-clock pacing delay."""
+
+        if (
+            self._followup_workers_stopping
+            or queue_key in self._followup_worker_disabled
+        ):
+            return
+        current = self._followup_notice_retry_tasks.get(queue_key)
+        if current is not None and not current.done():
+            return
+
+        async def retry() -> None:
+            try:
+                await asyncio.sleep(self._followup_notice_retry_delay())
+                if not self._followup_workers_stopping:
+                    self._start_followup_worker(queue_key)
+            finally:
+                task = asyncio.current_task()
+                if self._followup_notice_retry_tasks.get(queue_key) is task:
+                    self._followup_notice_retry_tasks.pop(queue_key, None)
+
+        self._followup_notice_retry_tasks[queue_key] = asyncio.create_task(
+            retry(),
+            name=f"followup-notice-retry:{queue_key}",
+        )
 
     def _start_followup_worker(self, queue_key: str) -> None:
         if (
@@ -853,6 +978,7 @@ class TelegramBot(
         current = self._followup_workers.get(queue_key)
         if current is not None and not current.done():
             return
+        self._cancel_followup_notice_retry(queue_key)
         task = asyncio.create_task(
             self._supervise_followup_worker(queue_key),
             name=f"followup-queue:{queue_key}",
@@ -877,43 +1003,76 @@ class TelegramBot(
                 return
             try:
                 pending = self._followup_queue.peek(queue_key) is not None
+                pending_notice = (
+                    self._followup_queue.peek_failure_notification(queue_key)
+                    is not None
+                )
             except Exception:
                 logger.exception("Follow-up queue recheck failed")
                 return
             if pending:
                 self._start_followup_worker(queue_key)
+            elif pending_notice:
+                # Never restart a notice-only worker inline here. A Telegram
+                # outage makes delivery return normally with the receipt still
+                # retained; immediate restart at this trap site creates an
+                # unpaced send storm.
+                self._schedule_followup_notice_retry(queue_key)
 
         task.add_done_callback(done)
 
     async def _stop_followup_workers(self) -> None:
         self._followup_workers_stopping = True
         workers = tuple(self._followup_workers.values())
-        for task in workers:
+        auxiliary_tasks = tuple(self._followup_notice_retry_tasks.values()) + tuple(
+            self._followup_disable_notice_tasks.values()
+        )
+        for task in workers + auxiliary_tasks:
             task.cancel()
-        if workers:
-            await asyncio.gather(*workers, return_exceptions=True)
+        if workers or auxiliary_tasks:
+            await asyncio.gather(
+                *workers,
+                *auxiliary_tasks,
+                return_exceptions=True,
+            )
         self._followup_workers.clear()
         self._followup_worker_items.clear()
+        self._followup_notice_retry_tasks.clear()
+        self._followup_disable_notice_tasks.clear()
 
-    async def _clear_user_queue(self, user_id: Any) -> tuple[int, int]:
-        """Clear both volatile and durable items after an authorized /stop."""
+    async def _clear_user_queue(self, user_id: Any) -> tuple[int, int, int]:
+        """Clear volatile work, durable work, and retained outcome receipts."""
 
         volatile_cleared = self._tasks.clear(user_id)
         queue_key = self._followup_queue_key(user_id)
-        durable_cleared = (
-            self._followup_queue.clear(queue_key)
-            if self._followup_queue_enabled
-            else 0
-        )
+        durable_items_cleared = 0
+        failure_notifications_cleared = 0
+        if self._followup_queue_enabled:
+            result = self._followup_queue.clear(queue_key)
+            durable_items_cleared = result.queued_items
+            failure_notifications_cleared = result.failure_notifications
         worker = self._followup_workers.get(queue_key)
         if worker is not None and not worker.done():
             worker.cancel()
             await asyncio.gather(worker, return_exceptions=True)
+        notice_retry = self._cancel_followup_notice_retry(queue_key)
+        disable_notice_retry = self._followup_disable_notice_tasks.pop(
+            queue_key,
+            None,
+        )
+        if disable_notice_retry is not None:
+            disable_notice_retry.cancel()
+        background = tuple(
+            task
+            for task in (notice_retry, disable_notice_retry)
+            if task is not None
+        )
+        if background:
+            await asyncio.gather(*background, return_exceptions=True)
         if self._followup_workers.get(queue_key) is worker:
             self._followup_workers.pop(queue_key, None)
         self._followup_worker_items.pop(queue_key, None)
         self._followup_worker_disabled.discard(queue_key)
-        self._followup_worker_disable_notified.discard(queue_key)
         if self._followup_queue_enabled:
             try:
                 pending = self._followup_queue.peek(queue_key) is not None
@@ -922,14 +1081,19 @@ class TelegramBot(
             else:
                 if pending:
                     self._start_followup_worker(queue_key)
-        return volatile_cleared, durable_cleared
+        return (
+            volatile_cleared,
+            durable_items_cleared,
+            failure_notifications_cleared,
+        )
 
     async def _on_ready(self, application: Application) -> None:
         await super()._on_ready(application)
         self._followup_workers_stopping = False
         self._followup_worker_disabled.clear()
-        self._followup_worker_disable_notified.clear()
         self._followup_worker_items.clear()
+        self._followup_notice_retry_tasks.clear()
+        self._followup_disable_notice_tasks.clear()
         try:
             self._followup_queue.initialize()
             queue_keys = self._followup_queue.conversation_keys()

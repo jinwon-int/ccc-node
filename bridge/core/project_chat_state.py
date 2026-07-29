@@ -28,6 +28,10 @@ class FollowupQueueCorruptionError(RuntimeError):
     """Raised when the durable follow-up queue cannot be trusted."""
 
 
+class FollowupNotificationCapacityError(RuntimeError):
+    """Raised when retaining another failure receipt would exceed its cap."""
+
+
 @dataclass(frozen=True, slots=True)
 class QueuedFollowup:
     """One durable Telegram update waiting for its conversation turn."""
@@ -38,6 +42,25 @@ class QueuedFollowup:
     update_json: str
     enqueued_at: float
     retry_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class FollowupQueueClearResult:
+    """Counts removed by an explicit conversation-scoped purge."""
+
+    queued_items: int
+    failure_notifications: int
+
+    @property
+    def total(self) -> int:
+        return self.queued_items + self.failure_notifications
+
+
+@dataclass(frozen=True, slots=True)
+class FollowupQueueMetrics:
+    """Body-free process-lifetime counters for queue safety events."""
+
+    failure_notification_evictions: int
 
 
 class PersistentFollowupQueue:
@@ -52,12 +75,24 @@ class PersistentFollowupQueue:
     _VERSION = 1
     _HANDLERS = frozenset({"document", "photo", "sticker", "text", "voice"})
 
-    def __init__(self, path: Path, *, per_chat_cap: int) -> None:
+    _UNSORTED_BACKUP_SUFFIX = ".pre-796-unsorted"
+
+    def __init__(
+        self,
+        path: Path,
+        *,
+        per_chat_cap: int,
+        failure_notification_cap: int = 32,
+    ) -> None:
         if per_chat_cap < 1:
             raise ValueError("follow-up queue cap must be at least 1")
+        if failure_notification_cap < 1:
+            raise ValueError("failure-notification cap must be at least 1")
         self.path = Path(path)
         self.per_chat_cap = int(per_chat_cap)
+        self.failure_notification_cap = int(failure_notification_cap)
         self._lock = threading.Lock()
+        self._failure_notification_evictions = 0
 
     @staticmethod
     def _empty_data() -> dict[str, Any]:
@@ -69,23 +104,84 @@ class PersistentFollowupQueue:
         }
 
     def initialize(self) -> None:
-        """Validate storage without discarding an existing queue."""
+        """Validate storage and narrowly repair pre-#796 notice ordering.
+
+        The old writer could append otherwise-valid failure notifications out
+        of ID order. That one known shape is sorted only after the exact source
+        bytes are preserved in an owner-only sidecar. Every other malformed
+        shape remains fail-closed.
+        """
 
         ensure_private_directory(self.path.parent)
         _secure_existing_state_file(self.path)
+        _secure_existing_state_file(self.migration_backup_path)
         with self._lock:
-            self._read_data()
+            raw = self._read_raw()
+            if raw is None:
+                return
+            try:
+                self._decode_data(raw)
+                return
+            except FollowupQueueCorruptionError as exc:
+                strict_failure = exc
+                try:
+                    parsed = self._decode_data(
+                        raw,
+                        allow_unsorted_failure_notifications=True,
+                    )
+                except FollowupQueueCorruptionError:
+                    raise strict_failure
 
-    def _read_data(self) -> dict[str, Any]:
+            notifications = parsed["failure_notifications"]
+            notification_ids = [item["id"] for item in notifications]
+            if notification_ids == sorted(notification_ids):
+                raise strict_failure
+
+            backup_path = self.migration_backup_path
+            try:
+                preserved = backup_path.read_bytes()
+            except FileNotFoundError:
+                _atomic_write_bytes(backup_path, raw)
+            except OSError as exc:
+                raise FollowupQueueCorruptionError(
+                    "pre-#796 follow-up queue backup cannot be read"
+                ) from exc
+            else:
+                if preserved != raw:
+                    raise FollowupQueueCorruptionError(
+                        "pre-#796 follow-up queue backup already contains "
+                        "different evidence"
+                    )
+
+            notifications.sort(key=lambda item: item["id"])
+            self._write_data(parsed)
+            logger.warning(
+                "Migrated %s out-of-order durable follow-up failure "
+                "notification(s); exact source preserved at %s",
+                len(notifications),
+                backup_path,
+            )
+
+    @property
+    def migration_backup_path(self) -> Path:
+        return self.path.with_name(self.path.name + self._UNSORTED_BACKUP_SUFFIX)
+
+    def _read_raw(self) -> bytes | None:
         try:
-            raw = self.path.read_bytes()
+            return self.path.read_bytes()
         except FileNotFoundError:
-            return self._empty_data()
+            return None
         except OSError as exc:
             raise FollowupQueueCorruptionError(
                 "durable follow-up queue cannot be read"
             ) from exc
 
+    def _decode_data(
+        self,
+        raw: bytes,
+        *,
+        allow_unsorted_failure_notifications: bool = False,
+    ) -> dict[str, Any]:
         try:
             parsed = json.loads(raw.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -107,6 +203,10 @@ class PersistentFollowupQueue:
         failure_notifications = parsed.setdefault("failure_notifications", [])
         all_ids: set[int] = set()
         for collection in (parsed["items"], failure_notifications):
+            allow_unsorted = (
+                allow_unsorted_failure_notifications
+                and collection is failure_notifications
+            )
             previous_id = 0
             collection_ids: set[int] = set()
             for item in collection:
@@ -124,7 +224,7 @@ class PersistentFollowupQueue:
                     not isinstance(item_id, int)
                     or item_id < 1
                     or item_id in collection_ids
-                    or item_id <= previous_id
+                    or (not allow_unsorted and item_id <= previous_id)
                     or not isinstance(conversation_key, str)
                     or not conversation_key
                     or handler not in self._HANDLERS
@@ -156,6 +256,12 @@ class PersistentFollowupQueue:
                 "durable follow-up queue sequence is invalid"
             )
         return parsed
+
+    def _read_data(self) -> dict[str, Any]:
+        raw = self._read_raw()
+        if raw is None:
+            return self._empty_data()
+        return self._decode_data(raw)
 
     def _write_data(self, data: dict[str, Any]) -> None:
         payload = json.dumps(
@@ -241,7 +347,14 @@ class PersistentFollowupQueue:
             return True
 
     def stage_failure_notification(self, item_id: int) -> QueuedFollowup | None:
-        """Durably retain the outcome notice before discarding one item."""
+        """Durably retain the outcome notice before discarding one item.
+
+        At the separate notice cap, the newest staged candidate is the only
+        eviction victim. It is rejected before commit, so the matching queued
+        item remains the durable source of truth and no older promised receipt
+        is displaced. Automatic cap enforcement never destroys a committed
+        promised receipt; only an explicit user purge may do that.
+        """
 
         with self._lock:
             data = self._read_data()
@@ -261,6 +374,25 @@ class PersistentFollowupQueue:
             )
             if failed is None:
                 return None
+            retained_for_conversation = sum(
+                item["conversation_key"] == failed["conversation_key"]
+                for item in data["failure_notifications"]
+            )
+            if retained_for_conversation >= self.failure_notification_cap:
+                self._failure_notification_evictions += 1
+                logger.warning(
+                    "Durable follow-up failure-notification cap reached for "
+                    "%s; evicted newest staged candidate %s before commit "
+                    "(cap=%s, failure_notification_evictions=%s); matching "
+                    "queued item retained",
+                    failed["conversation_key"],
+                    failed["id"],
+                    self.failure_notification_cap,
+                    self._failure_notification_evictions,
+                )
+                raise FollowupNotificationCapacityError(
+                    "failure-notification cap reached; queued item retained"
+                )
             notification = dict(failed)
             # Notices are staged in discard order, but _read_data requires each
             # collection to be strictly id-ascending. Appending would therefore
@@ -359,19 +491,45 @@ class PersistentFollowupQueue:
                 for item in data["failure_notifications"]
             )
 
-    def clear(self, conversation_key: str) -> int:
-        """Remove all queued items for an explicit /stop request."""
+    def metrics(self) -> FollowupQueueMetrics:
+        """Return body-free queue safety counters."""
+
+        with self._lock:
+            return FollowupQueueMetrics(
+                failure_notification_evictions=(
+                    self._failure_notification_evictions
+                )
+            )
+
+    def clear(self, conversation_key: str) -> FollowupQueueClearResult:
+        """Purge queued work and retained outcomes for an explicit /stop.
+
+        A user-authorized stop is the sole path permitted to destroy committed
+        promised receipts, so its return value reports those separately.
+        """
 
         with self._lock:
             data = self._read_data()
-            remaining = [
+            remaining_items = [
                 item
                 for item in data["items"]
                 if item["conversation_key"] != conversation_key
             ]
-            cleared = len(data["items"]) - len(remaining)
-            if cleared:
-                data["items"] = remaining
+            remaining_notifications = [
+                item
+                for item in data["failure_notifications"]
+                if item["conversation_key"] != conversation_key
+            ]
+            cleared = FollowupQueueClearResult(
+                queued_items=len(data["items"]) - len(remaining_items),
+                failure_notifications=(
+                    len(data["failure_notifications"])
+                    - len(remaining_notifications)
+                ),
+            )
+            if cleared.total:
+                data["items"] = remaining_items
+                data["failure_notifications"] = remaining_notifications
                 self._write_data(data)
             return cleared
 
