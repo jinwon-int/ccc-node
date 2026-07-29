@@ -238,8 +238,9 @@ Claude:  ...
 | `CLAUDE_PROCESS_TIMEOUT` | 否 | `600` | SDK 超时时间（秒） |
 | `AUTO_NEW_SESSION_AFTER_HOURS` | 否 | `24` | 空闲 N 小时后自动启动新会话；设为 `0`/`false`/`off` 禁用 |
 | `CCC_BRIDGE_SESSION_GUARD_ENABLED` | 否 | `true` | 限制常驻会话资源，绝不驱逐活动请求 |
-| `CCC_BRIDGE_BUSY_NOTICE_ENABLED` | 否 | `true` | 会话已有活动轮次时立即确认后续消息；消息仍会在轮次结束后处理 |
+| `CCC_BRIDGE_BUSY_NOTICE_ENABLED` | 否 | `true` | 活动轮次期间显示含耗时的忙碌确认；即使禁用，持久队列的接受/拒绝回执仍会显示 |
 | `CCC_BRIDGE_BUSY_NOTICE_MIN_ELAPSED_SECONDS` | 否 | `10` | 发送忙碌确认前，活动轮次必须达到的最短持续时间 |
+| `CCC_BRIDGE_FOLLOWUP_QUEUE_CAP` | 否 | `32` | 每个会话可持久化、重启安全的 FIFO 后续消息上限；超限消息会被明确拒绝，绝不静默丢弃 |
 | `CCC_BRIDGE_SESSION_GUARD_INTERVAL_SECONDS` | 否 | `60` | 空闲资源守卫扫描间隔（10–3600 秒） |
 | `CCC_BRIDGE_SESSION_IDLE_TTL_SECONDS` | 否 | `14400` | 达到空闲时限后关闭本地运行时；持久会话 ID 仍可恢复 |
 | `CCC_BRIDGE_MAX_RESIDENT_SESSIONS` | 否 | `2` | 常驻会话 LRU 上限；活动会话受保护 |

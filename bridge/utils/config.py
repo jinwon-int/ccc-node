@@ -292,7 +292,8 @@ class Config(
         alias="CCC_BRIDGE_BUSY_NOTICE_ENABLED",
         description=(
             "Immediately acknowledge a follow-up Telegram message when its "
-            "conversation already has an active turn."
+            "conversation already has an active turn. Durable queue acceptance "
+            "and rejection receipts remain user-visible when this is disabled."
         ),
     )
     busy_notice_min_elapsed_seconds: float = Field(
@@ -302,6 +303,17 @@ class Config(
         alias="CCC_BRIDGE_BUSY_NOTICE_MIN_ELAPSED_SECONDS",
         description=(
             "Minimum active-turn age before sending a busy acknowledgement."
+        ),
+    )
+    followup_queue_cap: int = Field(
+        default=32,
+        ge=1,
+        le=1000,
+        alias="CCC_BRIDGE_FOLLOWUP_QUEUE_CAP",
+        description=(
+            "Maximum number of durably queued follow-up messages per "
+            "conversation. New arrivals fail closed with an explicit reply "
+            "when the cap is reached."
         ),
     )
     session_guard_interval_seconds: float = Field(
