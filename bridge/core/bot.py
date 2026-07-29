@@ -592,7 +592,6 @@ class TelegramBot(
     ) -> None:
         if queue_key in self._followup_worker_disable_notified:
             return
-        self._followup_worker_disable_notified.add(queue_key)
         if item is None:
             logger.critical(
                 "Cannot notify the sender for disabled durable follow-up "
@@ -612,12 +611,17 @@ class TelegramBot(
         except asyncio.CancelledError:
             raise
         except Exception:
+            # Do not mark the conversation as notified: the most common cause
+            # of a disabled worker is the same outage that just failed this
+            # send, so a later attempt must be allowed to inform the user.
             logger.error(
                 "Failed to notify sender that durable follow-up worker %s "
                 "was disabled",
                 queue_key,
                 exc_info=True,
             )
+        else:
+            self._followup_worker_disable_notified.add(queue_key)
 
     async def _disable_followup_worker(
         self,
@@ -815,6 +819,12 @@ class TelegramBot(
             )
         )
         restarts = 0
+        # The cap must mean "this worker cannot make progress", not "this
+        # conversation has seen N unrelated transient faults over its
+        # lifetime". Reset the counter whenever the head item advanced since
+        # the previous failure, so only repeated failures on the SAME item
+        # count toward disabling the worker.
+        last_failed_head: int | None = None
         while not self._followup_workers_stopping:
             try:
                 await self._run_followup_worker(queue_key)
@@ -822,6 +832,11 @@ class TelegramBot(
             except asyncio.CancelledError:
                 raise
             except Exception:
+                current_head = self._followup_worker_items.get(queue_key)
+                head_id = getattr(current_head, "item_id", None)
+                if head_id is not None and head_id != last_failed_head:
+                    restarts = 0
+                last_failed_head = head_id
                 if restarts >= restart_cap:
                     await self._disable_followup_worker(
                         queue_key,
@@ -876,6 +891,13 @@ class TelegramBot(
             if self._followup_workers_stopping:
                 return
             try:
+                # Deliberately re-arm only on a queued ITEM, never on a
+                # retained discard notice. Re-arming on a notice turns a
+                # Telegram outage into a tight restart loop, because the send
+                # that failed is retried immediately with nothing to pace it.
+                # A stranded notice is instead delivered on the conversation's
+                # next follow-up or after a restart — bounded, and it stays
+                # durable until then.
                 pending = self._followup_queue.peek(queue_key) is not None
             except Exception:
                 logger.exception("Follow-up queue recheck failed")

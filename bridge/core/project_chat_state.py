@@ -1,6 +1,7 @@
 """Stream state/control mixin for ProjectChatHandler."""
 
 import asyncio
+import bisect
 import json
 import logging
 import threading
@@ -261,7 +262,30 @@ class PersistentFollowupQueue:
             if failed is None:
                 return None
             notification = dict(failed)
-            data["failure_notifications"].append(notification)
+            # Notices are staged in discard order, but _read_data requires each
+            # collection to be strictly id-ascending. Appending would therefore
+            # write a file that fails our own validator as soon as two
+            # conversations discard out of enqueue order, corrupting the shared
+            # queue for every chat. Insert in id order instead.
+            retained = data["failure_notifications"]
+            position = bisect.bisect_left(
+                [item["id"] for item in retained], notification["id"]
+            )
+            retained.insert(position, notification)
+            # Bound retention per conversation: an undeliverable notice holds a
+            # full copy of the message body, so an outage must not grow the
+            # file without limit. Oldest notices for this chat are evicted.
+            same_chat = [
+                item
+                for item in retained
+                if item["conversation_key"] == notification["conversation_key"]
+            ]
+            overflow = len(same_chat) - self.per_chat_cap
+            if overflow > 0:
+                evicted = {id(item) for item in same_chat[:overflow]}
+                data["failure_notifications"] = [
+                    item for item in retained if id(item) not in evicted
+                ]
             self._write_data(data)
             return self._item_from_data(notification)
 
@@ -350,7 +374,13 @@ class PersistentFollowupQueue:
             )
 
     def clear(self, conversation_key: str) -> int:
-        """Remove all queued items for an explicit /stop request."""
+        """Remove all queued items for an explicit /stop request.
+
+        Retained discard notices for the same conversation are dropped too:
+        they hold a full copy of a message body the user has just asked us to
+        forget, and leaving them behind would keep the conversation key alive
+        forever.
+        """
 
         with self._lock:
             data = self._read_data()
@@ -360,8 +390,15 @@ class PersistentFollowupQueue:
                 if item["conversation_key"] != conversation_key
             ]
             cleared = len(data["items"]) - len(remaining)
-            if cleared:
+            retained = [
+                item
+                for item in data["failure_notifications"]
+                if item["conversation_key"] != conversation_key
+            ]
+            purged = len(data["failure_notifications"]) - len(retained)
+            if cleared or purged:
                 data["items"] = remaining
+                data["failure_notifications"] = retained
                 self._write_data(data)
             return cleared
 

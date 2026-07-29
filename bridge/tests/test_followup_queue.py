@@ -740,3 +740,134 @@ async def test_live_approval_reply_bypasses_followup_queue(tmp_path: Path) -> No
     telegram_bot.send_message.assert_awaited_once()
     assert "Approved" in telegram_bot.send_message.await_args.kwargs["text"]
     assert bot._followup_queue.conversation_keys() == ()
+
+
+def _stage_across_two_conversations(queue: PersistentFollowupQueue) -> tuple[int, int]:
+    """Enqueue B before A, then discard A first so notices invert id order."""
+
+    key_b = '["str","8:80"]'
+    key_a = '["str","7:70"]'
+    older, _ = queue.enqueue(
+        conversation_key=key_b,
+        handler="text",
+        update_json=json.dumps(_update_payload("b-first", update_id=1)),
+        enqueued_at=1.0,
+    )
+    newer, _ = queue.enqueue(
+        conversation_key=key_a,
+        handler="text",
+        update_json=json.dumps(_update_payload("a-second", update_id=2)),
+        enqueued_at=2.0,
+    )
+    assert older is not None and newer is not None
+    assert older.item_id < newer.item_id
+    # Chat A discards first (newer id), then chat B (older id).
+    assert queue.stage_failure_notification(newer.item_id) is not None
+    assert queue.acknowledge(newer.item_id) is True
+    assert queue.stage_failure_notification(older.item_id) is not None
+    assert queue.acknowledge(older.item_id) is True
+    return older.item_id, newer.item_id
+
+
+def test_cross_conversation_discards_do_not_corrupt_the_shared_queue(
+    tmp_path: Path,
+) -> None:
+    """Notices staged out of enqueue order must still pass _read_data.
+
+    Regression: notices were appended in discard order while the reader
+    required each collection to be strictly id-ascending, so two chats
+    discarding out of order wrote a file that failed our own validator and
+    took down message processing for EVERY conversation until an operator
+    deleted the file by hand.
+    """
+
+    path = tmp_path / "followup-queue.json"
+    queue = _queue(path)
+    older_id, newer_id = _stage_across_two_conversations(queue)
+
+    # Every read path must still work on the freshly written file.
+    assert queue.peek('["str","7:70"]') is None
+    assert queue.depth('["str","8:80"]') == 0
+    assert set(queue.conversation_keys()) == {'["str","7:70"]', '["str","8:80"]'}
+    assert queue.failure_notification_depth('["str","7:70"]') == 1
+    assert queue.failure_notification_depth('["str","8:80"]') == 1
+
+    # And a cold start on that same file must not fail closed.
+    reopened = PersistentFollowupQueue(path, per_chat_cap=32)
+    reopened.initialize()
+    assert reopened.peek_failure_notification('["str","7:70"]') is not None
+    assert reopened.peek_failure_notification('["str","8:80"]') is not None
+
+    stored = json.loads(path.read_text(encoding="utf-8"))
+    ids = [item["id"] for item in stored["failure_notifications"]]
+    assert ids == sorted(ids) == [older_id, newer_id]
+
+
+def test_retained_failure_notifications_are_bounded_per_conversation(
+    tmp_path: Path,
+) -> None:
+    """An outage must not grow the queue file without limit."""
+
+    path = tmp_path / "followup-queue.json"
+    queue = _queue(path, cap=2)
+    key = '["str","7:70"]'
+
+    for index in range(1, 8):
+        item, _ = queue.enqueue(
+            conversation_key=key,
+            handler="text",
+            update_json=json.dumps(_update_payload(f"m{index}", update_id=index)),
+            enqueued_at=float(index),
+        )
+        if item is None:  # cap reached; drain one and retry
+            head = queue.peek(key)
+            assert head is not None
+            assert queue.stage_failure_notification(head.item_id) is not None
+            assert queue.acknowledge(head.item_id) is True
+            item, _ = queue.enqueue(
+                conversation_key=key,
+                handler="text",
+                update_json=json.dumps(
+                    _update_payload(f"m{index}", update_id=index)
+                ),
+                enqueued_at=float(index),
+            )
+        assert item is not None
+
+    assert queue.failure_notification_depth(key) <= 2
+    stored = json.loads(path.read_text(encoding="utf-8"))
+    ids = [entry["id"] for entry in stored["failure_notifications"]]
+    assert ids == sorted(ids)
+
+
+def test_stop_purges_retained_failure_notifications(tmp_path: Path) -> None:
+    """/stop must forget message bodies the user asked us to drop."""
+
+    path = tmp_path / "followup-queue.json"
+    queue = _queue(path)
+    key = '["str","7:70"]'
+    other = '["str","8:80"]'
+
+    mine, _ = queue.enqueue(
+        conversation_key=key,
+        handler="text",
+        update_json=json.dumps(_update_payload("mine", update_id=1)),
+        enqueued_at=1.0,
+    )
+    theirs, _ = queue.enqueue(
+        conversation_key=other,
+        handler="text",
+        update_json=json.dumps(_update_payload("theirs", update_id=2)),
+        enqueued_at=2.0,
+    )
+    assert mine is not None and theirs is not None
+    for item in (mine, theirs):
+        assert queue.stage_failure_notification(item.item_id) is not None
+        assert queue.acknowledge(item.item_id) is True
+
+    queue.clear(key)
+
+    assert queue.failure_notification_depth(key) == 0
+    assert queue.failure_notification_depth(other) == 1
+    assert queue.conversation_keys() == (other,)
+    assert "mine" not in path.read_text(encoding="utf-8")
