@@ -576,6 +576,13 @@ render_status_from_health() {
     python3 "$SCRIPT_DIR/utils/health_render.py" "$1" "$2" "$3" "$4"
 }
 
+render_turn_occupancy_from_health() {
+    # Reuse the canonical renderer while selecting only the occupancy line for
+    # the alive-but-unmanaged status branch.
+    render_status_from_health "$1" "$2" "$3" "$4" \
+        | sed -n '/^   Turn occupancy:/p'
+}
+
 # ── Action handlers ──
 
 # MainPID of the active systemd service that manages THIS bridge, if any (empty
@@ -615,6 +622,9 @@ report_unmanaged_or_dead() {
         echo "🟡 Bot status: degraded"
         print_component_status "Process" "alive" "unmanaged PID(s): $live_pids ($reason)"
         print_component_status "Service" "degraded" "running without pid file; not recoverable by --status/--stop bookkeeping"
+        render_turn_occupancy_from_health \
+            "$HEALTH_FILE" "$live_pids" "$HEALTH_STALE_SECONDS" \
+            "$(configured_agent_provider)"
         echo "💡 Recover: $0 --path \"$PROJECT_ROOT\" --stop && $0 --path \"$PROJECT_ROOT\" --daemon"
         return 0
     fi

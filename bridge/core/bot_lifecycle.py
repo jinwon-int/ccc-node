@@ -89,6 +89,8 @@ class _LifecycleProjectChat(Protocol):
 
     def workload_snapshot(self, now: float) -> tuple[int, float]: ...
 
+    def waiting_for_turn_snapshot(self) -> int: ...
+
     async def enforce_session_resource_limits(
         self, *, now: float | None = None
     ) -> dict[str, int | float]: ...
@@ -1640,7 +1642,12 @@ class BotLifecycleMixin:
             try:
                 now = asyncio.get_event_loop().time()
                 count, oldest_age = self._project_chat.workload_snapshot(now)
-                health_reporter.record_workload(count, oldest_age)
+                waiting_for_turn = self._project_chat.waiting_for_turn_snapshot()
+                health_reporter.record_workload(
+                    count,
+                    oldest_age,
+                    waiting_for_turn=waiting_for_turn,
+                )
             except Exception as exc:
                 logger.debug("Workload reporter tick failed: %s", type(exc).__name__)
             # Retry any terminal cleanups that failed at transition time (the

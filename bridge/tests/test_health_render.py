@@ -45,7 +45,14 @@ class HealthRenderTests(unittest.TestCase):
             "agent": {"state": "healthy", "provider": "claude", "last_error": ""},
             "workload": {
                 "active_requests": 0,
-                "turn_occupancy": {"state": "idle"},
+                "oldest_request_age_seconds": 0,
+                "waiting_for_turn": 0,
+                "turn_occupancy": {
+                    "state": "idle",
+                    "observed_at": (
+                        self.now - timedelta(seconds=5)
+                    ).isoformat().replace("+00:00", "Z"),
+                },
             },
         }
         d.update(over)
@@ -59,6 +66,10 @@ class HealthRenderTests(unittest.TestCase):
         self.assertEqual(lines[0], "🟡 Bot status: degraded")
         self.assertIn("   Process: alive (PID: 12345)", lines)
         self.assertIn("   Service: degraded (health missing)", lines)
+        self.assertIn(
+            "   Turn occupancy: unknown (health missing)",
+            lines,
+        )
         self.assertIn("   Codex: degraded (health missing)", lines)
 
     def test_unreadable_file_reports_invalid(self):
@@ -67,13 +78,20 @@ class HealthRenderTests(unittest.TestCase):
         lines = self._render(p)
         self.assertEqual(lines[0], "🟡 Bot status: degraded")
         self.assertTrue(any("invalid health file:" in ln for ln in lines))
+        self.assertIn(
+            "   Turn occupancy: unknown (health unreadable)",
+            lines,
+        )
         self.assertIn("   Telegram: degraded (health unreadable)", lines)
 
     def test_fresh_available_maps_icon_and_suppresses_healthy_reasons(self):
         lines = self._render(self._write(self._fresh()))
         self.assertEqual(lines[0], "🟢 Bot status: available")
         self.assertIn("   Service: available", lines)
-        self.assertIn("   Turn occupancy: idle", lines)
+        self.assertIn(
+            "   Turn occupancy: idle (0 waiting for runtime admission)",
+            lines,
+        )
         self.assertIn("   Telegram: healthy", lines)  # reason suppressed when healthy
         self.assertIn("   Claude: healthy", lines)
 
@@ -82,9 +100,11 @@ class HealthRenderTests(unittest.TestCase):
             workload={
                 "active_requests": 1,
                 "oldest_request_age_seconds": 2880,
+                "waiting_for_turn": 1,
                 "turn_occupancy": {
                     "state": "occupied",
-                    "occupied_since": "2026-07-15T11:12:00Z",
+                    "observed_at": "2026-07-15T11:59:55Z",
+                    "oldest_turn_started_at": "2026-07-15T11:12:00Z",
                     "elapsed_seconds": 2880,
                 },
             }
@@ -94,17 +114,228 @@ class HealthRenderTests(unittest.TestCase):
 
         self.assertIn(
             "   Turn occupancy: occupied "
-            "(1 active turn; since 2026-07-15T11:12:00Z; elapsed 48m)",
+            "(1 active turn; 1 waiting for runtime admission; "
+            "oldest active turn started at 2026-07-15T11:12:00Z; elapsed 48m)",
             lines,
         )
-        self.assertTrue(all(isinstance(line, str) and line for line in lines))
+        self.assertEqual(len(lines), 6)
 
     def test_idle_turn_renders_without_zero_elapsed(self):
         lines = self._render(self._write(self._fresh()))
 
-        self.assertIn("   Turn occupancy: idle", lines)
+        self.assertIn(
+            "   Turn occupancy: idle (0 waiting for runtime admission)",
+            lines,
+        )
         self.assertFalse(any("Turn occupancy" in line and "0s" in line for line in lines))
-        self.assertTrue(all(isinstance(line, str) and line for line in lines))
+        self.assertEqual(lines.count("   Telegram: healthy"), 1)
+
+    def test_fresh_health_without_workload_reports_occupancy_unknown(self):
+        data = self._fresh()
+        del data["workload"]
+
+        lines = self._render(self._write(data))
+
+        self.assertEqual(lines[0], "🟢 Bot status: available")
+        self.assertIn(
+            "   Turn occupancy: unknown (not reported)",
+            lines,
+        )
+
+    def test_workload_without_occupancy_reports_not_reported(self):
+        data = self._fresh(
+            workload={
+                "active_requests": 0,
+                "oldest_request_age_seconds": 0,
+                "waiting_for_turn": 0,
+            }
+        )
+
+        lines = self._render(self._write(data))
+
+        self.assertIn(
+            "   Turn occupancy: unknown (not reported)",
+            lines,
+        )
+
+    def test_invalid_occupancy_state_reports_unknown(self):
+        data = self._fresh(
+            workload={
+                "active_requests": 0,
+                "oldest_request_age_seconds": 0,
+                "waiting_for_turn": 0,
+                "turn_occupancy": {
+                    "state": "wedged",
+                    "observed_at": "2026-07-15T11:59:55Z",
+                },
+            }
+        )
+
+        lines = self._render(self._write(data))
+
+        self.assertIn(
+            "   Turn occupancy: unknown (invalid state)",
+            lines,
+        )
+
+    def test_occupied_turn_without_start_time_reports_unavailable(self):
+        data = self._fresh(
+            workload={
+                "active_requests": 1,
+                "oldest_request_age_seconds": 10,
+                "waiting_for_turn": 0,
+                "turn_occupancy": {
+                    "state": "occupied",
+                    "observed_at": "2026-07-15T11:59:55Z",
+                    "elapsed_seconds": 10,
+                },
+            }
+        )
+
+        lines = self._render(self._write(data))
+
+        self.assertTrue(
+            any(
+                "Turn occupancy: occupied" in line
+                and "start time unavailable" in line
+                for line in lines
+            )
+        )
+
+    def test_occupied_turn_without_elapsed_reports_unavailable(self):
+        data = self._fresh(
+            workload={
+                "active_requests": 1,
+                "oldest_request_age_seconds": 10,
+                "waiting_for_turn": 0,
+                "turn_occupancy": {
+                    "state": "occupied",
+                    "observed_at": "2026-07-15T11:59:55Z",
+                    "oldest_turn_started_at": "2026-07-15T11:59:50Z",
+                },
+            }
+        )
+
+        lines = self._render(self._write(data))
+
+        self.assertTrue(
+            any(
+                "Turn occupancy: occupied" in line
+                and "elapsed unavailable" in line
+                for line in lines
+            )
+        )
+
+    def test_non_finite_elapsed_does_not_abort_status_rendering(self):
+        for elapsed in (float("inf"), float("-inf"), float("nan")):
+            with self.subTest(elapsed=elapsed):
+                data = self._fresh(
+                    workload={
+                        "active_requests": 1,
+                        "oldest_request_age_seconds": 10,
+                        "waiting_for_turn": 0,
+                        "turn_occupancy": {
+                            "state": "occupied",
+                            "observed_at": "2026-07-15T11:59:55Z",
+                            "oldest_turn_started_at": "2026-07-15T11:59:50Z",
+                            "elapsed_seconds": elapsed,
+                        },
+                    }
+                )
+
+                lines = self._render(self._write(data))
+
+                self.assertEqual(len(lines), 6)
+                self.assertTrue(
+                    any(
+                        "Turn occupancy: occupied" in line
+                        and "elapsed unavailable" in line
+                        for line in lines
+                    )
+                )
+                self.assertIn("   Telegram: healthy", lines)
+
+    def test_stale_occupancy_degrades_independently_of_fresh_health(self):
+        data = self._fresh(
+            workload={
+                "active_requests": 0,
+                "oldest_request_age_seconds": 0,
+                "waiting_for_turn": 0,
+                "turn_occupancy": {
+                    "state": "idle",
+                    "observed_at": "2026-07-15T11:54:59Z",
+                },
+            }
+        )
+
+        lines = self._render(self._write(data), stale=300)
+
+        self.assertEqual(lines[0], "🟢 Bot status: available")
+        self.assertIn(
+            "   Turn occupancy: unknown "
+            "(workload stale: last observation 5m ago)",
+            lines,
+        )
+
+    def test_occupancy_without_observation_time_degrades_to_unknown(self):
+        data = self._fresh(
+            workload={
+                "active_requests": 0,
+                "oldest_request_age_seconds": 0,
+                "waiting_for_turn": 0,
+                "turn_occupancy": {"state": "idle"},
+            }
+        )
+
+        lines = self._render(self._write(data))
+
+        self.assertIn(
+            "   Turn occupancy: unknown (observation time unavailable)",
+            lines,
+        )
+
+    def test_occupied_zero_active_turns_degrades_instead_of_contradicting(self):
+        data = self._fresh(
+            workload={
+                "active_requests": 0,
+                "oldest_request_age_seconds": 60,
+                "waiting_for_turn": 0,
+                "turn_occupancy": {
+                    "state": "occupied",
+                    "observed_at": "2026-07-15T11:59:55Z",
+                    "oldest_turn_started_at": "2026-07-15T11:59:00Z",
+                    "elapsed_seconds": 60,
+                },
+            }
+        )
+
+        lines = self._render(self._write(data))
+
+        self.assertIn(
+            "   Turn occupancy: unknown (inconsistent active turn count)",
+            lines,
+        )
+        self.assertFalse(any("occupied (0 active turns" in line for line in lines))
+
+    def test_missing_oldest_request_age_is_backward_compatible(self):
+        data = self._fresh(
+            workload={
+                "active_requests": 1,
+                "waiting_for_turn": 0,
+                "turn_occupancy": {
+                    "state": "occupied",
+                    "observed_at": "2026-07-15T11:59:55Z",
+                    "oldest_turn_started_at": "2026-07-15T11:59:50Z",
+                    "elapsed_seconds": 10,
+                },
+            }
+        )
+
+        lines = self._render(self._write(data))
+
+        self.assertTrue(
+            any("Turn occupancy: occupied" in line for line in lines)
+        )
 
     def test_degraded_shows_reasons_and_provider_label(self):
         data = self._fresh(
@@ -131,6 +362,10 @@ class HealthRenderTests(unittest.TestCase):
         lines = self._render(self._write(data))
         self.assertEqual(lines[0], "🟡 Bot status: degraded")
         self.assertIn("   Service: degraded (health stale)", lines)
+        self.assertIn(
+            "   Turn occupancy: unknown (health stale)",
+            lines,
+        )
 
     def test_stale_with_timestamp_formats_age(self):
         for delta, expected in [
@@ -145,6 +380,12 @@ class HealthRenderTests(unittest.TestCase):
             self.assertEqual(lines[0], "🟡 Bot status: degraded")
             self.assertIn(
                 f"   Service: degraded (health stale: last update {expected} ago)",
+                lines,
+                f"delta={delta}",
+            )
+            self.assertIn(
+                "   Turn occupancy: unknown "
+                f"(health stale: last update {expected} ago)",
                 lines,
                 f"delta={delta}",
             )

@@ -92,6 +92,7 @@ class StartStatusTests(unittest.TestCase):
         claude_state: str = "healthy",
         claude_error: str = "",
         agent_provider: str | None = None,
+        workload: dict | None = None,
     ) -> Path:
         now = updated_at or datetime.now(timezone.utc)
         health = {
@@ -133,6 +134,8 @@ class StartStatusTests(unittest.TestCase):
                 "provider": agent_provider,
                 **health["claude"],
             }
+        if workload is not None:
+            health["workload"] = workload
         health_file = project_root / ".telegram_bot" / "health.json"
         health_file.write_text(
             json.dumps(health, ensure_ascii=True, indent=2) + "\n",
@@ -290,7 +293,46 @@ class StartStatusTests(unittest.TestCase):
             self.assertIn("Bot status: degraded", result.stdout)
             self.assertIn(f"unmanaged PID(s): {decoy.pid}", result.stdout)
             self.assertIn("no PID file", result.stdout)
+            self.assertIn(
+                "Turn occupancy: unknown (health missing)",
+                result.stdout,
+            )
             # The decoy must survive a status probe.
+            self.assertIsNone(decoy.poll())
+
+    def test_status_unmanaged_surfaces_occupied_turn(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_root = self._prepare_project(tmpdir)
+            decoy = self._spawn_unmanaged_decoy(project_root)
+            now = datetime.now(timezone.utc)
+            self._write_health(
+                project_root,
+                pid=decoy.pid,
+                workload={
+                    "active_requests": 1,
+                    "oldest_request_age_seconds": 48 * 60,
+                    "waiting_for_turn": 1,
+                    "turn_occupancy": {
+                        "state": "occupied",
+                        "observed_at": _iso_utc(now),
+                        "oldest_turn_started_at": _iso_utc(
+                            now - timedelta(minutes=48)
+                        ),
+                        "elapsed_seconds": 48 * 60,
+                    },
+                },
+            )
+
+            result = self._run_status(project_root)
+
+            self.assertEqual(result.returncode, 0)
+            self.assertIn("Bot status: degraded", result.stdout)
+            self.assertIn(f"unmanaged PID(s): {decoy.pid}", result.stdout)
+            self.assertIn(
+                "Turn occupancy: occupied "
+                "(1 active turn; 1 waiting for runtime admission;",
+                result.stdout,
+            )
             self.assertIsNone(decoy.poll())
 
     def _make_fake_systemctl(self, bin_dir: Path, main_pid: int) -> Path:

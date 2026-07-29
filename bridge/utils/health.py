@@ -1,7 +1,6 @@
 import json
 import os
 import threading
-import time
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -59,9 +58,6 @@ class RuntimeHealthReporter:
         self._process_mode = "foreground"
         self._token_lock_file = ""
         self._owns_token_lock = False
-        self._occupied_since: str | None = None
-        self._occupancy_last_observed_at: float | None = None
-        self._occupancy_last_elapsed: float | None = None
         configured_provider = agent_provider or getattr(config, "agent_provider", "claude")
         self._agent_provider = (
             "codex" if str(configured_provider).strip().lower() == "codex" else "claude"
@@ -100,6 +96,8 @@ class RuntimeHealthReporter:
             "claude": dict(initial_agent_state),
             "workload": {
                 "active_requests": 0,
+                "oldest_request_age_seconds": 0,
+                "waiting_for_turn": 0,
                 "turn_occupancy": {"state": "idle"},
             },
             "transport": {
@@ -353,8 +351,8 @@ class RuntimeHealthReporter:
         self,
         active_requests: int,
         oldest_request_age_seconds: float,
+        waiting_for_turn: int = 0,
         *,
-        observed_at: float | None = None,
         utc_now: datetime | None = None,
     ) -> None:
         """Publish the current in-flight request count for idle-gated restarts.
@@ -363,58 +361,52 @@ class RuntimeHealthReporter:
         ``health.json`` and defer a restart while the bridge is busy, so an
         in-flight ``claude`` child is not SIGTERM-killed mid-task.
 
-        The caller's count and elapsed age come from the agent-session registry's
-        active-turn metrics. Elapsed time therefore remains monotonic. The UTC
-        ``occupied_since`` value is a presentation projection captured once for
-        the same oldest turn; it is never used for elapsed-time arithmetic.
+        The caller's count, waiting count, and elapsed age come from the
+        agent-session registry's active-turn metrics. Elapsed time therefore
+        remains monotonic. ``oldest_turn_started_at`` is the wall-clock
+        projection of the oldest *currently active* turn, not the beginning of
+        an uninterrupted period of occupancy. It is recomputed every tick from
+        the monotonic elapsed value so it remains self-consistent after a wall
+        clock correction.
         """
         with self._lock:
             active_count = max(0, int(active_requests))
+            waiting_count = min(active_count, max(0, int(waiting_for_turn)))
+            wall_now = utc_now or datetime.now(timezone.utc)
+            if wall_now.tzinfo is None:
+                wall_now = wall_now.replace(tzinfo=timezone.utc)
+            wall_now = wall_now.astimezone(timezone.utc)
+            observation_time = wall_now.isoformat().replace("+00:00", "Z")
             if active_count == 0:
-                self._occupied_since = None
-                self._occupancy_last_observed_at = None
-                self._occupancy_last_elapsed = None
                 self._state["workload"] = {
                     "active_requests": 0,
-                    "turn_occupancy": {"state": "idle"},
+                    "oldest_request_age_seconds": 0,
+                    "waiting_for_turn": 0,
+                    "turn_occupancy": {
+                        "state": "idle",
+                        "observed_at": observation_time,
+                    },
                 }
                 self._write_health_locked()
                 return
 
             elapsed = max(0.0, float(oldest_request_age_seconds))
-            observed = time.monotonic() if observed_at is None else float(observed_at)
-            same_oldest_turn = False
-            if (
-                self._occupied_since is not None
-                and self._occupancy_last_observed_at is not None
-                and self._occupancy_last_elapsed is not None
-            ):
-                observation_delta = max(
-                    0.0, observed - self._occupancy_last_observed_at
-                )
-                expected_elapsed = self._occupancy_last_elapsed + observation_delta
-                same_oldest_turn = abs(elapsed - expected_elapsed) <= 1.0
-
-            if not same_oldest_turn:
-                wall_now = utc_now or datetime.now(timezone.utc)
-                if wall_now.tzinfo is None:
-                    wall_now = wall_now.replace(tzinfo=timezone.utc)
-                occupied_since = wall_now.astimezone(timezone.utc) - timedelta(
-                    seconds=elapsed
-                )
-                self._occupied_since = occupied_since.isoformat(
-                    timespec="seconds"
-                ).replace("+00:00", "Z")
-
-            self._occupancy_last_observed_at = observed
-            self._occupancy_last_elapsed = elapsed
+            oldest_turn_started = wall_now - timedelta(seconds=elapsed)
+            oldest_turn_started_at = oldest_turn_started.isoformat(
+                timespec="seconds"
+            ).replace("+00:00", "Z")
             elapsed_seconds = int(elapsed)
             self._state["workload"] = {
                 "active_requests": active_count,
                 "oldest_request_age_seconds": elapsed_seconds,
+                "waiting_for_turn": waiting_count,
                 "turn_occupancy": {
                     "state": "occupied",
-                    "occupied_since": self._occupied_since,
+                    "observed_at": observation_time,
+                    "oldest_turn_started_at": oldest_turn_started_at,
+                    # Schema-v1 compatibility alias for the field introduced
+                    # by #793. New consumers should use the explicit name.
+                    "occupied_since": oldest_turn_started_at,
                     "elapsed_seconds": elapsed_seconds,
                 },
             }
