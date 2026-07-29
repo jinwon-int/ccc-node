@@ -49,7 +49,12 @@ def _pid_is_alive(pid_text: Optional[str]) -> bool:
 class RuntimeHealthReporter:
     SCHEMA_VERSION = 1
 
-    def __init__(self, bot_data_dir: Path, agent_provider: str | None = None):
+    def __init__(
+        self,
+        bot_data_dir: Path,
+        agent_provider: str | None = None,
+        dead_session_wakeup: bool = False,
+    ):
         self._lock = threading.Lock()
         self._bot_data_dir = bot_data_dir
         self._pid_file = bot_data_dir / "bot.pid"
@@ -108,6 +113,19 @@ class RuntimeHealthReporter:
                 "quarantined_transcripts": 0,
                 "hard_quarantined_transcripts": 0,
             },
+            "dead_session_wakeup": (
+                {
+                    "enabled": True,
+                    "scans": 0,
+                    "scanned": 0,
+                    "triggered": 0,
+                    "delivered": 0,
+                    "failed": 0,
+                    "last_scan_at": None,
+                }
+                if dead_session_wakeup
+                else {"enabled": False}
+            ),
             "requests": {
                 "stalled": 0,
             },
@@ -347,6 +365,36 @@ class RuntimeHealthReporter:
             ) + max(0, int(count))
             self._write_health_locked()
 
+    def record_dead_session_wakeup_scan(
+        self,
+        *,
+        scanned: int,
+        triggered: int,
+        delivered: int,
+        failed: int,
+    ) -> None:
+        """Publish one enabled dead-session wakeup scan tick (#801).
+
+        The counters are process-lifetime cumulative values. ``last_scan_at`` is
+        deliberately section-local: unrelated health writes must never make a
+        stale wakeup observation look fresh. Disabled reporters retain only
+        ``enabled: false`` even if a caller invokes this method unexpectedly.
+        """
+        with self._lock:
+            section = self._state.get("dead_session_wakeup")
+            if not isinstance(section, dict) or section.get("enabled") is not True:
+                return
+            section["scans"] = int(section.get("scans", 0)) + 1
+            for key, count in (
+                ("scanned", scanned),
+                ("triggered", triggered),
+                ("delivered", delivered),
+                ("failed", failed),
+            ):
+                section[key] = int(section.get(key, 0)) + max(0, int(count))
+            section["last_scan_at"] = _utc_now_iso()
+            self._write_health_locked()
+
     def record_workload(
         self,
         active_requests: int,
@@ -460,14 +508,27 @@ class DeferredHealthReporter:
         self._reporter: RuntimeHealthReporter | None = None
         self._lock = threading.RLock()
 
-    def bind(self, bot_data_dir: Path, agent_provider: str | None = None) -> None:
+    def bind(
+        self,
+        bot_data_dir: Path,
+        agent_provider: str | None = None,
+        dead_session_wakeup: bool = False,
+    ) -> None:
         with self._lock:
-            self._reporter = RuntimeHealthReporter(Path(bot_data_dir), agent_provider)
+            self._reporter = RuntimeHealthReporter(
+                Path(bot_data_dir),
+                agent_provider,
+                dead_session_wakeup,
+            )
 
     def _get(self) -> RuntimeHealthReporter:
         with self._lock:
             if self._reporter is None:
-                self._reporter = RuntimeHealthReporter(Path(config.bot_data_dir))
+                self._reporter = RuntimeHealthReporter(
+                    Path(config.bot_data_dir),
+                    getattr(config, "agent_provider", None),
+                    bool(getattr(config, "dead_session_wakeup", False)),
+                )
             return self._reporter
 
     def __getattr__(self, name: str) -> Any:

@@ -138,7 +138,11 @@ def build_context(
     telegram_port = telegram_port or Application.builder
     clock = clock or time
     bind_logs_dir(settings.logs_dir)
-    health_reporter.bind(settings.bot_data_dir, settings.agent_provider)
+    health_reporter.bind(
+        settings.bot_data_dir,
+        settings.agent_provider,
+        settings.dead_session_wakeup,
+    )
     store = SessionStore(settings.session_store_path)
     session_manager = SessionManager(store=store, settings=settings)
     distill_journal = DistillJournal(settings.bot_data_dir / "distill-journal")

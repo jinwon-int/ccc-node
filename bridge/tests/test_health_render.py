@@ -70,6 +70,10 @@ class HealthRenderTests(unittest.TestCase):
             "   Turn occupancy: unknown (health missing)",
             lines,
         )
+        self.assertIn(
+            "   Dead-session wakeup: unknown (health missing)",
+            lines,
+        )
         self.assertIn("   Codex: degraded (health missing)", lines)
 
     def test_unreadable_file_reports_invalid(self):
@@ -80,6 +84,10 @@ class HealthRenderTests(unittest.TestCase):
         self.assertTrue(any("invalid health file:" in ln for ln in lines))
         self.assertIn(
             "   Turn occupancy: unknown (health unreadable)",
+            lines,
+        )
+        self.assertIn(
+            "   Dead-session wakeup: unknown (health unreadable)",
             lines,
         )
         self.assertIn("   Telegram: degraded (health unreadable)", lines)
@@ -94,6 +102,169 @@ class HealthRenderTests(unittest.TestCase):
         )
         self.assertIn("   Telegram: healthy", lines)  # reason suppressed when healthy
         self.assertIn("   Claude: healthy", lines)
+
+    def test_health_without_dead_session_wakeup_section_is_backward_compatible(self):
+        lines = self._render(self._write(self._fresh()))
+
+        self.assertEqual(lines[0], "🟢 Bot status: available")
+        self.assertIn(
+            "   Dead-session wakeup: unknown (not reported)",
+            lines,
+        )
+
+    def test_disabled_dead_session_wakeup_renders_without_activity(self):
+        data = self._fresh(dead_session_wakeup={"enabled": False})
+
+        lines = self._render(self._write(data))
+
+        self.assertIn("   Dead-session wakeup: disabled", lines)
+        wakeup_line = next(line for line in lines if "Dead-session wakeup:" in line)
+        self.assertNotIn("scans=", wakeup_line)
+        self.assertNotIn("delivered=", wakeup_line)
+
+    def test_enabled_all_zero_wakeup_scan_is_observable(self):
+        data = self._fresh(
+            dead_session_wakeup={
+                "enabled": True,
+                "scans": 1,
+                "scanned": 0,
+                "triggered": 0,
+                "delivered": 0,
+                "failed": 0,
+                "last_scan_at": "2026-07-15T11:59:55Z",
+            }
+        )
+
+        lines = self._render(self._write(data))
+
+        self.assertIn(
+            "   Dead-session wakeup: enabled "
+            "(scans=1 scanned=0 triggered=0 delivered=0 failed=0; "
+            "last scan 5s ago)",
+            lines,
+        )
+
+    def test_stale_wakeup_scan_degrades_independently_of_fresh_health(self):
+        data = self._fresh(
+            dead_session_wakeup={
+                "enabled": True,
+                "scans": 4,
+                "scanned": 12,
+                "triggered": 1,
+                "delivered": 1,
+                "failed": 0,
+                "last_scan_at": "2026-07-15T11:54:59Z",
+            }
+        )
+
+        lines = self._render(self._write(data), stale=300)
+
+        self.assertEqual(lines[0], "🟢 Bot status: available")
+        self.assertIn(
+            "   Dead-session wakeup: unknown "
+            "(scan stale: last observation 5m ago)",
+            lines,
+        )
+        self.assertFalse(
+            any("Dead-session wakeup: enabled" in line for line in lines)
+        )
+
+    def test_disabled_wakeup_with_activity_degrades_instead_of_contradicting(self):
+        data = self._fresh(
+            dead_session_wakeup={
+                "enabled": False,
+                "scans": 3,
+                "scanned": 8,
+                "triggered": 3,
+                "delivered": 3,
+                "failed": 0,
+                "last_scan_at": "2026-07-15T11:59:55Z",
+            }
+        )
+
+        lines = self._render(self._write(data))
+
+        self.assertIn(
+            "   Dead-session wakeup: unknown "
+            "(inconsistent disabled activity)",
+            lines,
+        )
+        self.assertNotIn("   Dead-session wakeup: disabled", lines)
+
+    def test_enabled_wakeup_without_scan_time_degrades_to_unknown(self):
+        data = self._fresh(
+            dead_session_wakeup={
+                "enabled": True,
+                "scans": 0,
+                "scanned": 0,
+                "triggered": 0,
+                "delivered": 0,
+                "failed": 0,
+                "last_scan_at": None,
+            }
+        )
+
+        lines = self._render(self._write(data))
+
+        self.assertIn(
+            "   Dead-session wakeup: unknown (scan time unavailable)",
+            lines,
+        )
+
+    def test_invalid_wakeup_sections_degrade_to_unknown(self):
+        valid_counters = {
+            "scans": 1,
+            "scanned": 0,
+            "triggered": 0,
+            "delivered": 0,
+            "failed": 0,
+        }
+        cases = [
+            (
+                "disabled timestamp",
+                {
+                    "enabled": False,
+                    "last_scan_at": "2026-07-15T11:59:55Z",
+                },
+                "inconsistent disabled activity",
+            ),
+            (
+                "invalid enabled state",
+                {"enabled": "false"},
+                "invalid enabled state",
+            ),
+            (
+                "invalid counter",
+                {
+                    "enabled": True,
+                    **valid_counters,
+                    "failed": None,
+                    "last_scan_at": "2026-07-15T11:59:55Z",
+                },
+                "invalid counters",
+            ),
+            (
+                "timestamp with no scans",
+                {
+                    "enabled": True,
+                    **valid_counters,
+                    "scans": 0,
+                    "last_scan_at": "2026-07-15T11:59:55Z",
+                },
+                "inconsistent scan count",
+            ),
+        ]
+
+        for label, section, expected in cases:
+            with self.subTest(label=label):
+                lines = self._render(
+                    self._write(self._fresh(dead_session_wakeup=section))
+                )
+
+                self.assertIn(
+                    f"   Dead-session wakeup: unknown ({expected})",
+                    lines,
+                )
 
     def test_occupied_turn_renders_stable_start_and_monotonic_elapsed(self):
         data = self._fresh(
@@ -118,7 +289,7 @@ class HealthRenderTests(unittest.TestCase):
             "oldest active turn started at 2026-07-15T11:12:00Z; elapsed 48m)",
             lines,
         )
-        self.assertEqual(len(lines), 6)
+        self.assertEqual(len(lines), 7)
 
     def test_idle_turn_renders_without_zero_elapsed(self):
         lines = self._render(self._write(self._fresh()))
@@ -245,7 +416,7 @@ class HealthRenderTests(unittest.TestCase):
 
                 lines = self._render(self._write(data))
 
-                self.assertEqual(len(lines), 6)
+                self.assertEqual(len(lines), 7)
                 self.assertTrue(
                     any(
                         "Turn occupancy: occupied" in line
@@ -364,6 +535,10 @@ class HealthRenderTests(unittest.TestCase):
         self.assertIn("   Service: degraded (health stale)", lines)
         self.assertIn(
             "   Turn occupancy: unknown (health stale)",
+            lines,
+        )
+        self.assertIn(
+            "   Dead-session wakeup: unknown (health stale)",
             lines,
         )
 
