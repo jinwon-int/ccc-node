@@ -36,6 +36,7 @@ class QueuedFollowup:
     handler: str
     update_json: str
     enqueued_at: float
+    retry_count: int
 
 
 class PersistentFollowupQueue:
@@ -108,6 +109,7 @@ class PersistentFollowupQueue:
             handler = item.get("handler")
             update_json = item.get("update_json")
             enqueued_at = item.get("enqueued_at")
+            retry_count = item.get("retry_count", 0)
             if (
                 not isinstance(item_id, int)
                 or item_id < 1
@@ -119,6 +121,9 @@ class PersistentFollowupQueue:
                 or not isinstance(update_json, str)
                 or not update_json
                 or not isinstance(enqueued_at, (int, float))
+                or not isinstance(retry_count, int)
+                or isinstance(retry_count, bool)
+                or retry_count < 0
             ):
                 raise FollowupQueueCorruptionError(
                     "durable follow-up queue item is invalid"
@@ -158,6 +163,7 @@ class PersistentFollowupQueue:
             handler=str(item["handler"]),
             update_json=str(item["update_json"]),
             enqueued_at=float(item["enqueued_at"]),
+            retry_count=int(item.get("retry_count", 0)),
         )
 
     def enqueue(
@@ -195,6 +201,7 @@ class PersistentFollowupQueue:
                 "handler": handler,
                 "update_json": update_json,
                 "enqueued_at": float(enqueued_at),
+                "retry_count": 0,
             }
             data["next_id"] += 1
             data["items"].append(item_data)
@@ -222,6 +229,21 @@ class PersistentFollowupQueue:
             data["items"] = remaining
             self._write_data(data)
             return True
+
+    def record_failure(self, item_id: int) -> QueuedFollowup | None:
+        """Durably increment one item's retry counter."""
+
+        with self._lock:
+            data = self._read_data()
+            failed = next(
+                (item for item in data["items"] if item["id"] == item_id),
+                None,
+            )
+            if failed is None:
+                return None
+            failed["retry_count"] = int(failed.get("retry_count", 0)) + 1
+            self._write_data(data)
+            return self._item_from_data(failed)
 
     def depth(self, conversation_key: str) -> int:
         with self._lock:
