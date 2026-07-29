@@ -308,8 +308,12 @@ a provider turn or reads transcript/credential files.
 | `CCC_MAX_DOCUMENT_SIZE_MB` | No | `10` | Maximum inbound Telegram document size in decimal MB (1–20) |
 | `AUTO_NEW_SESSION_AFTER_HOURS` | No | `24` | Auto-start new session after N hours of inactivity; set to `0`/`false`/`off` to disable |
 | `CCC_BRIDGE_SESSION_GUARD_ENABLED` | No | `true` | Bound resident provider sessions without interrupting active requests |
-| `CCC_BRIDGE_BUSY_NOTICE_ENABLED` | No | `true` | Immediately acknowledge follow-ups while the conversation has an active turn; the message is still processed afterward |
+| `CCC_BRIDGE_BUSY_NOTICE_ENABLED` | No | `true` | Include the elapsed-time busy acknowledgement while a turn is active; durable queue acceptance/rejection receipts remain visible when disabled |
 | `CCC_BRIDGE_BUSY_NOTICE_MIN_ELAPSED_SECONDS` | No | `10` | Minimum active-turn age before sending the acknowledgement |
+| `CCC_BRIDGE_FOLLOWUP_QUEUE_CAP` | No | `32` | Maximum restart-safe FIFO follow-ups per conversation; excess messages are explicitly rejected and never silently dropped |
+| `CCC_BRIDGE_FOLLOWUP_RETRY_BACKOFF_SECONDS` | No | `1,5,30` | Increasing wall-clock delays for durable follow-up dispatch and discard-notification retries |
+| `CCC_BRIDGE_FOLLOWUP_WORKER_RESTART_CAP` | No | `3` | Consecutive supervised worker restarts allowed per conversation before that worker is disabled |
+| `CCC_BRIDGE_FOLLOWUP_WORKER_RESTART_BACKOFF_SECONDS` | No | `1` | Initial delay for exponential worker-restart backoff |
 | `CCC_BRIDGE_SESSION_GUARD_INTERVAL_SECONDS` | No | `60` | Idle resource-guard sweep interval (10–3600s) |
 | `CCC_BRIDGE_SESSION_IDLE_TTL_SECONDS` | No | `14400` | Close a local provider runtime after this idle period; durable session IDs remain resumable |
 | `CCC_BRIDGE_MAX_RESIDENT_SESSIONS` | No | `2` | LRU cap for cached sessions; active sessions are protected |

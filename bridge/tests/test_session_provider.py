@@ -1616,8 +1616,8 @@ def test_document_handlers_match_pdf_once_without_overlapping_images(tmp_path: P
     pdf = _telegram_document_update(mime_type="application/pdf", file_name="report.pdf")
     image = _telegram_document_update(mime_type="image/png", file_name="image.png")
 
-    assert matching_callbacks(pdf) == ["_handle_document_message"]
-    assert matching_callbacks(image) == ["_handle_photo_message"]
+    assert matching_callbacks(pdf) == ["_handle_followup_document_update"]
+    assert matching_callbacks(image) == ["_handle_followup_photo_update"]
 
 
 def _telegram_sticker_update() -> Update:
@@ -1657,7 +1657,7 @@ def test_sticker_routes_only_to_the_sticker_handler(tmp_path: Path) -> None:
     sticker = _telegram_sticker_update()
     matched = [h.callback.__name__ for h in handlers if h.check_update(sticker)]
     # A sticker must route to the sticker handler only — not photo/text/document.
-    assert matched == ["_handle_sticker_message"]
+    assert matched == ["_handle_followup_sticker_update"]
 
 
 @pytest.mark.anyio

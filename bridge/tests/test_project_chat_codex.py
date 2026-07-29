@@ -274,6 +274,10 @@ def test_agent_provider_settings_default_and_reject_unknown(tmp_path: Path) -> N
     assert settings.session_guard_enabled is True
     assert settings.busy_notice_enabled is True
     assert settings.busy_notice_min_elapsed_seconds == 10.0
+    assert settings.followup_queue_cap == 32
+    assert settings.followup_retry_backoff_seconds == (1.0, 5.0, 30.0)
+    assert settings.followup_worker_restart_cap == 3
+    assert settings.followup_worker_restart_backoff_seconds == 1.0
     assert settings.session_guard_interval_seconds == 60.0
     assert settings.session_idle_ttl_seconds == 4 * 60 * 60
     assert settings.max_resident_sessions == 2
@@ -290,6 +294,10 @@ def test_agent_provider_settings_default_and_reject_unknown(tmp_path: Path) -> N
             "CCC_BRIDGE_SESSION_GUARD_ENABLED": "false",
             "CCC_BRIDGE_BUSY_NOTICE_ENABLED": "false",
             "CCC_BRIDGE_BUSY_NOTICE_MIN_ELAPSED_SECONDS": "30",
+            "CCC_BRIDGE_FOLLOWUP_QUEUE_CAP": "48",
+            "CCC_BRIDGE_FOLLOWUP_RETRY_BACKOFF_SECONDS": "0.5,2,9",
+            "CCC_BRIDGE_FOLLOWUP_WORKER_RESTART_CAP": "5",
+            "CCC_BRIDGE_FOLLOWUP_WORKER_RESTART_BACKOFF_SECONDS": "2.5",
             "CCC_BRIDGE_SESSION_GUARD_INTERVAL_SECONDS": "120",
             "CCC_BRIDGE_SESSION_IDLE_TTL_SECONDS": "7200",
             "CCC_BRIDGE_MAX_RESIDENT_SESSIONS": "3",
@@ -305,6 +313,10 @@ def test_agent_provider_settings_default_and_reject_unknown(tmp_path: Path) -> N
     assert codex_settings.session_guard_enabled is False
     assert codex_settings.busy_notice_enabled is False
     assert codex_settings.busy_notice_min_elapsed_seconds == 30.0
+    assert codex_settings.followup_queue_cap == 48
+    assert codex_settings.followup_retry_backoff_seconds == (0.5, 2.0, 9.0)
+    assert codex_settings.followup_worker_restart_cap == 5
+    assert codex_settings.followup_worker_restart_backoff_seconds == 2.5
     assert codex_settings.session_guard_interval_seconds == 120.0
     assert codex_settings.session_idle_ttl_seconds == 7200
     assert codex_settings.max_resident_sessions == 3

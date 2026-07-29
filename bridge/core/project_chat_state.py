@@ -1,7 +1,12 @@
 """Stream state/control mixin for ProjectChatHandler."""
 
 import asyncio
+import bisect
+import json
 import logging
+import threading
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Optional
 
 from telegram_bot.core.agent_session_registry import (
@@ -9,9 +14,366 @@ from telegram_bot.core.agent_session_registry import (
     IdleSessionCandidate,
     StreamKey,
 )
+from telegram_bot.utils.secure_fs import (
+    _atomic_write_bytes,
+    _secure_existing_state_file,
+    ensure_private_directory,
+)
 from telegram_bot.utils.session_resource_guard import process_tree_rss_mb
 
 logger = logging.getLogger(__name__)
+
+
+class FollowupQueueCorruptionError(RuntimeError):
+    """Raised when the durable follow-up queue cannot be trusted."""
+
+
+@dataclass(frozen=True, slots=True)
+class QueuedFollowup:
+    """One durable Telegram update waiting for its conversation turn."""
+
+    item_id: int
+    conversation_key: str
+    handler: str
+    update_json: str
+    enqueued_at: float
+    retry_count: int
+
+
+class PersistentFollowupQueue:
+    """Small owner-only, atomically-written FIFO for follow-up updates.
+
+    The cap is enforced independently for every normalized conversation key.
+    Mutations reload the file while holding a process-local lock, then replace
+    it atomically. A malformed file is never overwritten: callers must fail
+    closed so an operator can recover the original evidence.
+    """
+
+    _VERSION = 1
+    _HANDLERS = frozenset({"document", "photo", "sticker", "text", "voice"})
+
+    def __init__(self, path: Path, *, per_chat_cap: int) -> None:
+        if per_chat_cap < 1:
+            raise ValueError("follow-up queue cap must be at least 1")
+        self.path = Path(path)
+        self.per_chat_cap = int(per_chat_cap)
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def _empty_data() -> dict[str, Any]:
+        return {
+            "version": PersistentFollowupQueue._VERSION,
+            "next_id": 1,
+            "items": [],
+            "failure_notifications": [],
+        }
+
+    def initialize(self) -> None:
+        """Validate storage without discarding an existing queue."""
+
+        ensure_private_directory(self.path.parent)
+        _secure_existing_state_file(self.path)
+        with self._lock:
+            self._read_data()
+
+    def _read_data(self) -> dict[str, Any]:
+        try:
+            raw = self.path.read_bytes()
+        except FileNotFoundError:
+            return self._empty_data()
+        except OSError as exc:
+            raise FollowupQueueCorruptionError(
+                "durable follow-up queue cannot be read"
+            ) from exc
+
+        try:
+            parsed = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise FollowupQueueCorruptionError(
+                "durable follow-up queue is not valid JSON"
+            ) from exc
+        if (
+            not isinstance(parsed, dict)
+            or parsed.get("version") != self._VERSION
+            or not isinstance(parsed.get("next_id"), int)
+            or parsed["next_id"] < 1
+            or not isinstance(parsed.get("items"), list)
+            or not isinstance(parsed.get("failure_notifications", []), list)
+        ):
+            raise FollowupQueueCorruptionError(
+                "durable follow-up queue has an invalid schema"
+            )
+
+        failure_notifications = parsed.setdefault("failure_notifications", [])
+        all_ids: set[int] = set()
+        for collection in (parsed["items"], failure_notifications):
+            previous_id = 0
+            collection_ids: set[int] = set()
+            for item in collection:
+                if not isinstance(item, dict):
+                    raise FollowupQueueCorruptionError(
+                        "durable follow-up queue item is invalid"
+                    )
+                item_id = item.get("id")
+                conversation_key = item.get("conversation_key")
+                handler = item.get("handler")
+                update_json = item.get("update_json")
+                enqueued_at = item.get("enqueued_at")
+                retry_count = item.get("retry_count", 0)
+                if (
+                    not isinstance(item_id, int)
+                    or item_id < 1
+                    or item_id in collection_ids
+                    or item_id <= previous_id
+                    or not isinstance(conversation_key, str)
+                    or not conversation_key
+                    or handler not in self._HANDLERS
+                    or not isinstance(update_json, str)
+                    or not update_json
+                    or not isinstance(enqueued_at, (int, float))
+                    or not isinstance(retry_count, int)
+                    or isinstance(retry_count, bool)
+                    or retry_count < 0
+                ):
+                    raise FollowupQueueCorruptionError(
+                        "durable follow-up queue item is invalid"
+                    )
+                try:
+                    decoded_update = json.loads(update_json)
+                except json.JSONDecodeError as exc:
+                    raise FollowupQueueCorruptionError(
+                        "durable follow-up queue update is invalid"
+                    ) from exc
+                if not isinstance(decoded_update, dict):
+                    raise FollowupQueueCorruptionError(
+                        "durable follow-up queue update is invalid"
+                    )
+                collection_ids.add(item_id)
+                all_ids.add(item_id)
+                previous_id = item_id
+        if all_ids and parsed["next_id"] <= max(all_ids):
+            raise FollowupQueueCorruptionError(
+                "durable follow-up queue sequence is invalid"
+            )
+        return parsed
+
+    def _write_data(self, data: dict[str, Any]) -> None:
+        payload = json.dumps(
+            data,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        _atomic_write_bytes(self.path, payload)
+
+    @staticmethod
+    def _item_from_data(item: dict[str, Any]) -> QueuedFollowup:
+        return QueuedFollowup(
+            item_id=int(item["id"]),
+            conversation_key=str(item["conversation_key"]),
+            handler=str(item["handler"]),
+            update_json=str(item["update_json"]),
+            enqueued_at=float(item["enqueued_at"]),
+            retry_count=int(item.get("retry_count", 0)),
+        )
+
+    def enqueue(
+        self,
+        *,
+        conversation_key: str,
+        handler: str,
+        update_json: str,
+        enqueued_at: float,
+    ) -> tuple[QueuedFollowup | None, int]:
+        """Persist one item and return ``(item, position)``.
+
+        ``item`` is ``None`` when the per-chat cap is already reached; no file
+        mutation occurs in that case.
+        """
+
+        if handler not in self._HANDLERS:
+            raise ValueError(f"unsupported follow-up handler: {handler}")
+        decoded_update = json.loads(update_json)
+        if not isinstance(decoded_update, dict):
+            raise ValueError("serialized Telegram update must be a JSON object")
+
+        with self._lock:
+            data = self._read_data()
+            matching = [
+                item
+                for item in data["items"]
+                if item["conversation_key"] == conversation_key
+            ]
+            if len(matching) >= self.per_chat_cap:
+                return None, len(matching)
+            item_data = {
+                "id": data["next_id"],
+                "conversation_key": conversation_key,
+                "handler": handler,
+                "update_json": update_json,
+                "enqueued_at": float(enqueued_at),
+                "retry_count": 0,
+            }
+            data["next_id"] += 1
+            data["items"].append(item_data)
+            self._write_data(data)
+            return self._item_from_data(item_data), len(matching) + 1
+
+    def peek(self, conversation_key: str) -> QueuedFollowup | None:
+        """Return the oldest queued item for one conversation."""
+
+        with self._lock:
+            data = self._read_data()
+            for item in data["items"]:
+                if item["conversation_key"] == conversation_key:
+                    return self._item_from_data(item)
+        return None
+
+    def acknowledge(self, item_id: int) -> bool:
+        """Remove exactly one successfully processed item."""
+
+        with self._lock:
+            data = self._read_data()
+            remaining = [item for item in data["items"] if item["id"] != item_id]
+            if len(remaining) == len(data["items"]):
+                return False
+            data["items"] = remaining
+            self._write_data(data)
+            return True
+
+    def stage_failure_notification(self, item_id: int) -> QueuedFollowup | None:
+        """Durably retain the outcome notice before discarding one item."""
+
+        with self._lock:
+            data = self._read_data()
+            existing = next(
+                (
+                    item
+                    for item in data["failure_notifications"]
+                    if item["id"] == item_id
+                ),
+                None,
+            )
+            if existing is not None:
+                return self._item_from_data(existing)
+            failed = next(
+                (item for item in data["items"] if item["id"] == item_id),
+                None,
+            )
+            if failed is None:
+                return None
+            notification = dict(failed)
+            # Notices are staged in discard order, but _read_data requires each
+            # collection to be strictly id-ascending. Appending would therefore
+            # write a file that fails our own validator as soon as two
+            # conversations discard out of enqueue order, corrupting the shared
+            # queue for every chat. Insert in id order instead.
+            retained = data["failure_notifications"]
+            position = bisect.bisect_left(
+                [item["id"] for item in retained], notification["id"]
+            )
+            retained.insert(position, notification)
+            self._write_data(data)
+            return self._item_from_data(notification)
+
+    def peek_failure_notification(
+        self, conversation_key: str
+    ) -> QueuedFollowup | None:
+        """Return the oldest deliverable discard notice for one conversation.
+
+        A notice staged before a crash is not deliverable until its matching
+        queue item has actually been removed.
+        """
+
+        with self._lock:
+            data = self._read_data()
+            queued_ids = {item["id"] for item in data["items"]}
+            for item in data["failure_notifications"]:
+                if (
+                    item["conversation_key"] == conversation_key
+                    and item["id"] not in queued_ids
+                ):
+                    return self._item_from_data(item)
+        return None
+
+    def acknowledge_failure_notification(self, item_id: int) -> bool:
+        """Remove one outcome notice after Telegram accepted it."""
+
+        with self._lock:
+            data = self._read_data()
+            remaining = [
+                item
+                for item in data["failure_notifications"]
+                if item["id"] != item_id
+            ]
+            if len(remaining) == len(data["failure_notifications"]):
+                return False
+            data["failure_notifications"] = remaining
+            self._write_data(data)
+            return True
+
+    def record_failure(self, item_id: int) -> QueuedFollowup | None:
+        """Durably increment one item's retry counter."""
+
+        with self._lock:
+            data = self._read_data()
+            failed = next(
+                (item for item in data["items"] if item["id"] == item_id),
+                None,
+            )
+            if failed is None:
+                return None
+            failed["retry_count"] = int(failed.get("retry_count", 0)) + 1
+            self._write_data(data)
+            return self._item_from_data(failed)
+
+    def depth(self, conversation_key: str) -> int:
+        with self._lock:
+            data = self._read_data()
+            return sum(
+                item["conversation_key"] == conversation_key
+                for item in data["items"]
+            )
+
+    def conversation_keys(self) -> tuple[str, ...]:
+        """Return keys in first-arrival order."""
+
+        with self._lock:
+            data = self._read_data()
+            return tuple(
+                dict.fromkeys(
+                    item["conversation_key"]
+                    for item in sorted(
+                        data["items"] + data["failure_notifications"],
+                        key=lambda candidate: candidate["id"],
+                    )
+                )
+            )
+
+    def failure_notification_depth(self, conversation_key: str) -> int:
+        """Count retained outcome notices for one conversation."""
+
+        with self._lock:
+            data = self._read_data()
+            return sum(
+                item["conversation_key"] == conversation_key
+                for item in data["failure_notifications"]
+            )
+
+    def clear(self, conversation_key: str) -> int:
+        """Remove all queued items for an explicit /stop request."""
+
+        with self._lock:
+            data = self._read_data()
+            remaining = [
+                item
+                for item in data["items"]
+                if item["conversation_key"] != conversation_key
+            ]
+            cleared = len(data["items"]) - len(remaining)
+            if cleared:
+                data["items"] = remaining
+                self._write_data(data)
+            return cleared
 
 
 class ProjectChatStateMixin:
