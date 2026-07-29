@@ -275,6 +275,7 @@ def test_agent_provider_settings_default_and_reject_unknown(tmp_path: Path) -> N
     assert settings.busy_notice_enabled is True
     assert settings.busy_notice_min_elapsed_seconds == 10.0
     assert settings.followup_queue_cap == 32
+    assert settings.followup_failure_notification_cap == 32
     assert settings.followup_retry_backoff_seconds == (1.0, 5.0, 30.0)
     assert settings.followup_worker_restart_cap == 3
     assert settings.followup_worker_restart_backoff_seconds == 1.0
@@ -295,6 +296,7 @@ def test_agent_provider_settings_default_and_reject_unknown(tmp_path: Path) -> N
             "CCC_BRIDGE_BUSY_NOTICE_ENABLED": "false",
             "CCC_BRIDGE_BUSY_NOTICE_MIN_ELAPSED_SECONDS": "30",
             "CCC_BRIDGE_FOLLOWUP_QUEUE_CAP": "48",
+            "CCC_BRIDGE_FOLLOWUP_FAILURE_NOTIFICATION_CAP": "24",
             "CCC_BRIDGE_FOLLOWUP_RETRY_BACKOFF_SECONDS": "0.5,2,9",
             "CCC_BRIDGE_FOLLOWUP_WORKER_RESTART_CAP": "5",
             "CCC_BRIDGE_FOLLOWUP_WORKER_RESTART_BACKOFF_SECONDS": "2.5",
@@ -314,6 +316,7 @@ def test_agent_provider_settings_default_and_reject_unknown(tmp_path: Path) -> N
     assert codex_settings.busy_notice_enabled is False
     assert codex_settings.busy_notice_min_elapsed_seconds == 30.0
     assert codex_settings.followup_queue_cap == 48
+    assert codex_settings.followup_failure_notification_cap == 24
     assert codex_settings.followup_retry_backoff_seconds == (0.5, 2.0, 9.0)
     assert codex_settings.followup_worker_restart_cap == 5
     assert codex_settings.followup_worker_restart_backoff_seconds == 2.5
