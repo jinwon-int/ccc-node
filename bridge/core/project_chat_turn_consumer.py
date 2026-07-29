@@ -42,6 +42,7 @@ class TurnStreamOutcome(str, Enum):
 
     COMPLETED = "completed"
     ADMISSION_TIMEOUT = "admission-timeout"
+    APPROVAL_STALL = "approval-stall"
     TERMINAL_STALL = "terminal-stall"
 
 
@@ -65,13 +66,22 @@ def _select_timeout(
     *,
     state: TurnEventState,
     has_text: bool,
+    now: float,
     admission_timeout_seconds: float,
+    approval_stall_seconds: float,
     terminal_stall_seconds: float,
 ) -> _TimeoutSelection | None:
     if not state.admitted and admission_timeout_seconds > 0:
         return _TimeoutSelection(
             admission_timeout_seconds,
             TurnStreamOutcome.ADMISSION_TIMEOUT,
+        )
+    if state.approval_pending and approval_stall_seconds > 0:
+        pending_since = state.approval_pending_since
+        elapsed = max(0.0, now - pending_since) if pending_since is not None else 0.0
+        return _TimeoutSelection(
+            max(0.0, approval_stall_seconds - elapsed),
+            TurnStreamOutcome.APPROVAL_STALL,
         )
     if (
         terminal_stall_seconds > 0
@@ -139,6 +149,7 @@ async def consume_turn_stream(
     interrupt: AsyncAction,
     abort_stalled_turn: AsyncAction | None,
     admission_timeout_seconds: float,
+    approval_stall_seconds: float,
     terminal_stall_seconds: float,
     interrupt_timeout_seconds: float,
 ) -> TurnStreamOutcome:
@@ -156,7 +167,9 @@ async def consume_turn_stream(
             timeout = _select_timeout(
                 state=state,
                 has_text=has_text(),
+                now=asyncio.get_running_loop().time(),
                 admission_timeout_seconds=admission_timeout_seconds,
+                approval_stall_seconds=approval_stall_seconds,
                 terminal_stall_seconds=terminal_stall_seconds,
             )
             try:

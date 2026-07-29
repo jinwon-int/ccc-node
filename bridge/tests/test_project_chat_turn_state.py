@@ -34,6 +34,7 @@ def test_turn_state_starts_without_lifecycle_or_io_authority() -> None:
 
     assert state.busy_depth == 0
     assert state.approval_pending is False
+    assert state.approval_pending_since is None
     assert state.admitted is False
     assert state.needs_attempt_recording is True
     assert state.terminal_error is None
@@ -78,11 +79,16 @@ def test_approval_pending_tracks_only_the_latest_observed_event() -> None:
         "run a command",
     )
 
-    transition = state.observe(approval)
+    transition = state.observe(approval, observed_at=12.5)
 
     assert isinstance(transition, IgnoredTransition)
     assert transition.event is approval
     assert state.approval_pending is True
+    assert state.approval_pending_since == 12.5
+
+    state.observe(approval, observed_at=99.0)
+
+    assert state.approval_pending_since == 12.5
 
     reasoning = ReasoningDeltaEvent("private")
     transition = state.observe(reasoning)
@@ -90,6 +96,7 @@ def test_approval_pending_tracks_only_the_latest_observed_event() -> None:
     assert isinstance(transition, IgnoredTransition)
     assert transition.event is reasoning
     assert state.approval_pending is False
+    assert state.approval_pending_since is None
 
 
 def test_nested_tools_keep_balance_and_restore_previous_label() -> None:

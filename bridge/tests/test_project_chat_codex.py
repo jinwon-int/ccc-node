@@ -278,6 +278,7 @@ def test_agent_provider_settings_default_and_reject_unknown(tmp_path: Path) -> N
     assert settings.followup_retry_backoff_seconds == (1.0, 5.0, 30.0)
     assert settings.followup_worker_restart_cap == 3
     assert settings.followup_worker_restart_backoff_seconds == 1.0
+    assert settings.approval_stall_seconds == 120.0
     assert settings.session_guard_interval_seconds == 60.0
     assert settings.session_idle_ttl_seconds == 4 * 60 * 60
     assert settings.max_resident_sessions == 2
@@ -298,6 +299,7 @@ def test_agent_provider_settings_default_and_reject_unknown(tmp_path: Path) -> N
             "CCC_BRIDGE_FOLLOWUP_RETRY_BACKOFF_SECONDS": "0.5,2,9",
             "CCC_BRIDGE_FOLLOWUP_WORKER_RESTART_CAP": "5",
             "CCC_BRIDGE_FOLLOWUP_WORKER_RESTART_BACKOFF_SECONDS": "2.5",
+            "CCC_APPROVAL_STALL_SECONDS": "45",
             "CCC_BRIDGE_SESSION_GUARD_INTERVAL_SECONDS": "120",
             "CCC_BRIDGE_SESSION_IDLE_TTL_SECONDS": "7200",
             "CCC_BRIDGE_MAX_RESIDENT_SESSIONS": "3",
@@ -317,6 +319,7 @@ def test_agent_provider_settings_default_and_reject_unknown(tmp_path: Path) -> N
     assert codex_settings.followup_retry_backoff_seconds == (0.5, 2.0, 9.0)
     assert codex_settings.followup_worker_restart_cap == 5
     assert codex_settings.followup_worker_restart_backoff_seconds == 2.5
+    assert codex_settings.approval_stall_seconds == 45.0
     assert codex_settings.session_guard_interval_seconds == 120.0
     assert codex_settings.session_idle_ttl_seconds == 7200
     assert codex_settings.max_resident_sessions == 3
@@ -1721,6 +1724,54 @@ class StallSession(FakeSession):
         return stream()
 
 
+class ApprovalStallSession(FakeSession):
+    """Expose a provider approval callback on its own task, like Claude SDK."""
+
+    def __init__(self, session_id: str) -> None:
+        super().__init__(session_id)
+        self.approval_task: asyncio.Task[ApprovalDecision] | None = None
+        self.abort_calls = 0
+        self.close_calls = 0
+        self.closed = False
+        self.turn_lock = object()
+        self.original_turn_lock = self.turn_lock
+
+    def send_turn(
+        self,
+        message: str,
+        *,
+        approval_handler: ApprovalHandler = deny_approval,
+    ) -> AsyncIterator[AgentEvent]:
+        async def stream() -> AsyncIterator[AgentEvent]:
+            self.messages.append(message)
+            approval = ApprovalRequestEvent(
+                "approval-1",
+                "item/commandExecution/requestApproval",
+                {"command": "true"},
+                "run a command",
+            )
+            try:
+                yield TextDeltaEvent("partial answer")
+                self.approval_task = asyncio.create_task(approval_handler(approval))
+                yield approval
+                await asyncio.shield(self.approval_task)
+                await asyncio.Event().wait()
+            finally:
+                self.closed = True
+
+        return stream()
+
+    async def interrupt(self) -> None:
+        self.interrupt_calls += 1
+
+    async def abort_stalled_turn(self) -> None:
+        self.abort_calls += 1
+        self.turn_lock = object()
+
+    async def close(self) -> None:
+        self.close_calls += 1
+
+
 class OrderedStallIterator(AsyncIterator[AgentEvent]):
     """A closeable iterator that records timeout cleanup ordering."""
 
@@ -1982,6 +2033,80 @@ async def test_turn_admission_timeout_releases_pre_event_waiter_and_fifo(
 
 
 @pytest.mark.anyio
+async def test_approval_stall_cleans_ui_rotates_lock_and_accepts_next_turn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    stalled = ApprovalStallSession("thread-1")
+    recovered = FakeSession("thread-1")
+    runtime = FakeRuntime([stalled, recovered])
+    handler, stalled_metrics = _stall_handler(tmp_path, runtime, monkeypatch)
+    handler._config.approval_stall_seconds = 0.05
+    handler._process_timeout_seconds = 5.0
+    callback_started = asyncio.Event()
+    callback_cleaned = asyncio.Event()
+    pending_approvals: set[str] = set()
+    live_buttons: set[str] = set()
+
+    async def approval_callback(
+        chat_id: int,
+        user_id: int,
+        event: ApprovalRequestEvent,
+        generation: int,
+    ) -> ApprovalDecision:
+        assert (chat_id, user_id, generation) == (70, 7, 1)
+        pending_approvals.add(event.request_id)
+        live_buttons.add(event.request_id)
+        callback_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            pending_approvals.discard(event.request_id)
+            live_buttons.discard(event.request_id)
+            callback_cleaned.set()
+        return ApprovalDecision.DENY
+
+    first_task = asyncio.create_task(
+        handler.process_message(
+            "needs approval",
+            7,
+            70,
+            approval_callback=approval_callback,
+        )
+    )
+    await asyncio.wait_for(callback_started.wait(), timeout=1)
+    queued_task = asyncio.create_task(handler.process_message("next", 7, 70))
+
+    first, queued = await asyncio.wait_for(
+        asyncio.gather(first_task, queued_task),
+        timeout=2,
+    )
+
+    assert first.success is False
+    assert first.error == "Approval was not resolved within 0.05s"
+    assert "Approval" in first.content
+    assert "stalled turn was stopped" in first.content
+    assert "Timed out after 5" not in first.content
+    assert callback_cleaned.is_set()
+    assert pending_approvals == set()
+    assert live_buttons == set()
+    assert stalled.approval_task is not None and stalled.approval_task.cancelled()
+    assert stalled.interrupt_calls == 1
+    assert stalled.abort_calls == 1
+    assert stalled.turn_lock is not stalled.original_turn_lock
+    assert stalled.closed is True
+    assert stalled.close_calls == 1
+    assert stalled_metrics == [1]
+
+    # Dropping the abandoned session plus the request-finally deactivation
+    # prevents register_active from wedging this conversation. The queued turn
+    # attaches to a clean session and completes normally.
+    assert queued.success is True and queued.content == "ok"
+    assert recovered.messages == ["next"]
+    assert len(runtime.requests) == 2
+    assert handler.session_resource_snapshot()["active_sessions"] == 0
+
+
+@pytest.mark.anyio
 async def test_task_ledger_marks_pre_event_request_waiting_for_turn(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2033,17 +2158,18 @@ async def test_codex_no_stall_release_while_tool_is_running(
         ],
     )
     handler, stalled = _stall_handler(tmp_path, FakeRuntime([stall]), monkeypatch)
+    handler._config.approval_stall_seconds = 0.05
     handler._process_timeout_seconds = 0.2
 
     response = await asyncio.wait_for(handler.process_message("hang", 7, 70), timeout=5)
 
     assert response.success is False
-    assert response.error is not None and "Timed out" in response.error
+    assert response.error == "Timed out after 0.2s"
     assert stalled == []
 
 
 @pytest.mark.anyio
-async def test_codex_no_stall_release_while_approval_pending(
+async def test_codex_approval_pending_uses_distinct_stall_bound(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     stall = StallSession(
@@ -2054,13 +2180,17 @@ async def test_codex_no_stall_release_while_approval_pending(
         ],
     )
     handler, stalled = _stall_handler(tmp_path, FakeRuntime([stall]), monkeypatch)
-    handler._process_timeout_seconds = 0.2
+    handler._config.approval_stall_seconds = 0.05
+    handler._process_timeout_seconds = 5.0
 
-    response = await asyncio.wait_for(handler.process_message("hang", 7, 70), timeout=5)
+    response = await asyncio.wait_for(handler.process_message("hang", 7, 70), timeout=1)
 
     assert response.success is False
-    assert response.error is not None and "Timed out" in response.error
-    assert stalled == []
+    assert response.error == "Approval was not resolved within 0.05s"
+    assert "stalled turn was stopped" in response.content
+    assert stall.interrupt_calls == 1
+    assert stall.closed is True
+    assert stalled == [1]
 
 
 @pytest.mark.anyio
