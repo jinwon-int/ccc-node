@@ -241,6 +241,9 @@ Claude:  ...
 | `CCC_BRIDGE_BUSY_NOTICE_ENABLED` | 否 | `true` | 活动轮次期间显示含耗时的忙碌确认；即使禁用，持久队列的接受/拒绝回执仍会显示 |
 | `CCC_BRIDGE_BUSY_NOTICE_MIN_ELAPSED_SECONDS` | 否 | `10` | 发送忙碌确认前，活动轮次必须达到的最短持续时间 |
 | `CCC_BRIDGE_FOLLOWUP_QUEUE_CAP` | 否 | `32` | 每个会话可持久化、重启安全的 FIFO 后续消息上限；超限消息会被明确拒绝，绝不静默丢弃 |
+| `CCC_BRIDGE_FOLLOWUP_RETRY_BACKOFF_SECONDS` | 否 | `1,5,30` | 持久化后续消息分发和丢弃通知重试所用的递增实际等待时间 |
+| `CCC_BRIDGE_FOLLOWUP_WORKER_RESTART_CAP` | 否 | `3` | 每个会话在工作器被禁用前允许的连续受监督重启次数 |
+| `CCC_BRIDGE_FOLLOWUP_WORKER_RESTART_BACKOFF_SECONDS` | 否 | `1` | 工作器指数重启退避的初始等待秒数 |
 | `CCC_BRIDGE_SESSION_GUARD_INTERVAL_SECONDS` | 否 | `60` | 空闲资源守卫扫描间隔（10–3600 秒） |
 | `CCC_BRIDGE_SESSION_IDLE_TTL_SECONDS` | 否 | `14400` | 达到空闲时限后关闭本地运行时；持久会话 ID 仍可恢复 |
 | `CCC_BRIDGE_MAX_RESIDENT_SESSIONS` | 否 | `2` | 常驻会话 LRU 上限；活动会话受保护 |

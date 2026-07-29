@@ -60,7 +60,12 @@ class PersistentFollowupQueue:
 
     @staticmethod
     def _empty_data() -> dict[str, Any]:
-        return {"version": PersistentFollowupQueue._VERSION, "next_id": 1, "items": []}
+        return {
+            "version": PersistentFollowupQueue._VERSION,
+            "next_id": 1,
+            "items": [],
+            "failure_notifications": [],
+        }
 
     def initialize(self) -> None:
         """Validate storage without discarding an existing queue."""
@@ -92,56 +97,60 @@ class PersistentFollowupQueue:
             or not isinstance(parsed.get("next_id"), int)
             or parsed["next_id"] < 1
             or not isinstance(parsed.get("items"), list)
+            or not isinstance(parsed.get("failure_notifications", []), list)
         ):
             raise FollowupQueueCorruptionError(
                 "durable follow-up queue has an invalid schema"
             )
 
-        seen_ids: set[int] = set()
-        previous_id = 0
-        for item in parsed["items"]:
-            if not isinstance(item, dict):
-                raise FollowupQueueCorruptionError(
-                    "durable follow-up queue item is invalid"
-                )
-            item_id = item.get("id")
-            conversation_key = item.get("conversation_key")
-            handler = item.get("handler")
-            update_json = item.get("update_json")
-            enqueued_at = item.get("enqueued_at")
-            retry_count = item.get("retry_count", 0)
-            if (
-                not isinstance(item_id, int)
-                or item_id < 1
-                or item_id in seen_ids
-                or item_id <= previous_id
-                or not isinstance(conversation_key, str)
-                or not conversation_key
-                or handler not in self._HANDLERS
-                or not isinstance(update_json, str)
-                or not update_json
-                or not isinstance(enqueued_at, (int, float))
-                or not isinstance(retry_count, int)
-                or isinstance(retry_count, bool)
-                or retry_count < 0
-            ):
-                raise FollowupQueueCorruptionError(
-                    "durable follow-up queue item is invalid"
-                )
-            try:
-                decoded_update = json.loads(update_json)
-            except json.JSONDecodeError as exc:
-                raise FollowupQueueCorruptionError(
-                    "durable follow-up queue update is invalid"
-                ) from exc
-            if not isinstance(decoded_update, dict):
-                raise FollowupQueueCorruptionError(
-                    "durable follow-up queue update is invalid"
-                )
-            seen_ids.add(item_id)
-            previous_id = item_id
-
-        if seen_ids and parsed["next_id"] <= max(seen_ids):
+        failure_notifications = parsed.setdefault("failure_notifications", [])
+        all_ids: set[int] = set()
+        for collection in (parsed["items"], failure_notifications):
+            previous_id = 0
+            collection_ids: set[int] = set()
+            for item in collection:
+                if not isinstance(item, dict):
+                    raise FollowupQueueCorruptionError(
+                        "durable follow-up queue item is invalid"
+                    )
+                item_id = item.get("id")
+                conversation_key = item.get("conversation_key")
+                handler = item.get("handler")
+                update_json = item.get("update_json")
+                enqueued_at = item.get("enqueued_at")
+                retry_count = item.get("retry_count", 0)
+                if (
+                    not isinstance(item_id, int)
+                    or item_id < 1
+                    or item_id in collection_ids
+                    or item_id <= previous_id
+                    or not isinstance(conversation_key, str)
+                    or not conversation_key
+                    or handler not in self._HANDLERS
+                    or not isinstance(update_json, str)
+                    or not update_json
+                    or not isinstance(enqueued_at, (int, float))
+                    or not isinstance(retry_count, int)
+                    or isinstance(retry_count, bool)
+                    or retry_count < 0
+                ):
+                    raise FollowupQueueCorruptionError(
+                        "durable follow-up queue item is invalid"
+                    )
+                try:
+                    decoded_update = json.loads(update_json)
+                except json.JSONDecodeError as exc:
+                    raise FollowupQueueCorruptionError(
+                        "durable follow-up queue update is invalid"
+                    ) from exc
+                if not isinstance(decoded_update, dict):
+                    raise FollowupQueueCorruptionError(
+                        "durable follow-up queue update is invalid"
+                    )
+                collection_ids.add(item_id)
+                all_ids.add(item_id)
+                previous_id = item_id
+        if all_ids and parsed["next_id"] <= max(all_ids):
             raise FollowupQueueCorruptionError(
                 "durable follow-up queue sequence is invalid"
             )
@@ -230,6 +239,68 @@ class PersistentFollowupQueue:
             self._write_data(data)
             return True
 
+    def stage_failure_notification(self, item_id: int) -> QueuedFollowup | None:
+        """Durably retain the outcome notice before discarding one item."""
+
+        with self._lock:
+            data = self._read_data()
+            existing = next(
+                (
+                    item
+                    for item in data["failure_notifications"]
+                    if item["id"] == item_id
+                ),
+                None,
+            )
+            if existing is not None:
+                return self._item_from_data(existing)
+            failed = next(
+                (item for item in data["items"] if item["id"] == item_id),
+                None,
+            )
+            if failed is None:
+                return None
+            notification = dict(failed)
+            data["failure_notifications"].append(notification)
+            self._write_data(data)
+            return self._item_from_data(notification)
+
+    def peek_failure_notification(
+        self, conversation_key: str
+    ) -> QueuedFollowup | None:
+        """Return the oldest deliverable discard notice for one conversation.
+
+        A notice staged before a crash is not deliverable until its matching
+        queue item has actually been removed.
+        """
+
+        with self._lock:
+            data = self._read_data()
+            queued_ids = {item["id"] for item in data["items"]}
+            for item in data["failure_notifications"]:
+                if (
+                    item["conversation_key"] == conversation_key
+                    and item["id"] not in queued_ids
+                ):
+                    return self._item_from_data(item)
+        return None
+
+    def acknowledge_failure_notification(self, item_id: int) -> bool:
+        """Remove one outcome notice after Telegram accepted it."""
+
+        with self._lock:
+            data = self._read_data()
+            remaining = [
+                item
+                for item in data["failure_notifications"]
+                if item["id"] != item_id
+            ]
+            if len(remaining) == len(data["failure_notifications"]):
+                return False
+            data["failure_notifications"] = remaining
+            self._write_data(data)
+            return True
+
     def record_failure(self, item_id: int) -> QueuedFollowup | None:
         """Durably increment one item's retry counter."""
 
@@ -259,7 +330,23 @@ class PersistentFollowupQueue:
         with self._lock:
             data = self._read_data()
             return tuple(
-                dict.fromkeys(item["conversation_key"] for item in data["items"])
+                dict.fromkeys(
+                    item["conversation_key"]
+                    for item in sorted(
+                        data["items"] + data["failure_notifications"],
+                        key=lambda candidate: candidate["id"],
+                    )
+                )
+            )
+
+    def failure_notification_depth(self, conversation_key: str) -> int:
+        """Count retained outcome notices for one conversation."""
+
+        with self._lock:
+            data = self._read_data()
+            return sum(
+                item["conversation_key"] == conversation_key
+                for item in data["failure_notifications"]
             )
 
     def clear(self, conversation_key: str) -> int:

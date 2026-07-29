@@ -57,6 +57,9 @@ def _bot_harness(path: Path, *, cap: int = 32) -> TelegramBot:
     bot._config = SimpleNamespace(
         busy_notice_enabled=True,
         busy_notice_min_elapsed_seconds=10.0,
+        followup_retry_backoff_seconds=(0.01, 0.02, 0.03),
+        followup_worker_restart_cap=2,
+        followup_worker_restart_backoff_seconds=0.01,
     )
     bot._project_chat = SimpleNamespace(
         busy_for_seconds=lambda user_id, chat_id, now: 120.0
@@ -66,6 +69,9 @@ def _bot_harness(path: Path, *, cap: int = 32) -> TelegramBot:
     bot._followup_idle_events = {}
     bot._followup_live_counts = {}
     bot._followup_workers = {}
+    bot._followup_worker_items = {}
+    bot._followup_worker_disabled = set()
+    bot._followup_worker_disable_notified = set()
     bot._followup_workers_stopping = False
     bot._followup_queue_enabled = True
     bot._tasks = UserTaskQueue(3)
@@ -197,6 +203,162 @@ async def test_failed_head_retries_are_persisted_then_tail_drains(
 
 
 @pytest.mark.anyio
+async def test_failed_head_retries_have_real_wall_clock_backoff(
+    tmp_path: Path,
+) -> None:
+    bot = _bot_harness(tmp_path / "queue.json")
+    bot._config.followup_retry_backoff_seconds = (0.05, 0.1, 0.2)
+    queue_key = bot._followup_queue_key("7:70")
+    attempt_times: list[float] = []
+
+    async def dispatch(_item) -> None:
+        attempt_times.append(asyncio.get_running_loop().time())
+        raise RuntimeError("transient failure")
+
+    bot._dispatch_queued_followup = dispatch
+    item, _ = bot._followup_queue.enqueue(
+        conversation_key=queue_key,
+        handler="text",
+        update_json=json.dumps(_update_payload("retry me")),
+        enqueued_at=1.0,
+    )
+    assert item is not None
+
+    bot._start_followup_worker(queue_key)
+    await _wait_until(lambda: bot._followup_queue.depth(queue_key) == 0)
+
+    assert len(attempt_times) == bot._FOLLOWUP_MAX_ATTEMPTS
+    gaps = [
+        later - earlier
+        for earlier, later in zip(attempt_times, attempt_times[1:])
+    ]
+    assert gaps[0] >= 0.045
+    assert gaps[1] >= 0.09
+    await bot._stop_followup_workers()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("write_site", ["acknowledge", "record_failure"])
+async def test_queue_write_failure_pauses_worker_without_redispatch_storm(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_site: str,
+) -> None:
+    bot = _bot_harness(tmp_path / f"{write_site}.json")
+    queue_key = bot._followup_queue_key("7:70")
+    dispatches = 0
+
+    async def dispatch(_item) -> None:
+        nonlocal dispatches
+        dispatches += 1
+        if write_site == "record_failure":
+            raise RuntimeError("dispatch failed")
+
+    bot._dispatch_queued_followup = dispatch
+    disabled_notice = AsyncMock()
+    bot._notify_followup_worker_disabled = disabled_notice
+    monkeypatch.setattr(
+        bot._followup_queue,
+        write_site,
+        Mock(side_effect=OSError(28, "No space left on device")),
+    )
+    item, _ = bot._followup_queue.enqueue(
+        conversation_key=queue_key,
+        handler="text",
+        update_json=json.dumps(_update_payload("write failure")),
+        enqueued_at=1.0,
+    )
+    assert item is not None
+
+    bot._start_followup_worker(queue_key)
+    await _wait_until(lambda: queue_key in bot._followup_worker_disabled)
+    await _wait_until(lambda: queue_key not in bot._followup_workers)
+    await asyncio.sleep(0.05)
+
+    assert dispatches == 1
+    disabled_notice.assert_awaited_once()
+    assert bot._followup_queue.depth(queue_key) == 1
+    await bot._stop_followup_workers()
+
+
+@pytest.mark.anyio
+async def test_discard_acknowledges_before_notification_and_never_storms(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bot = _bot_harness(tmp_path / "queue.json")
+    queue_key = bot._followup_queue_key("7:70")
+    item, _ = bot._followup_queue.enqueue(
+        conversation_key=queue_key,
+        handler="text",
+        update_json=json.dumps(_update_payload("poison")),
+        enqueued_at=1.0,
+    )
+    assert item is not None
+    for _ in range(bot._FOLLOWUP_MAX_ATTEMPTS):
+        item = bot._followup_queue.record_failure(item.item_id)
+        assert item is not None
+
+    failed_notice = AsyncMock(return_value=True)
+    disabled_notice = AsyncMock()
+    bot._notify_failed_followup = failed_notice
+    bot._notify_followup_worker_disabled = disabled_notice
+    monkeypatch.setattr(
+        bot._followup_queue,
+        "acknowledge",
+        Mock(side_effect=OSError(30, "Read-only file system")),
+    )
+
+    bot._start_followup_worker(queue_key)
+    await _wait_until(lambda: queue_key in bot._followup_worker_disabled)
+    await _wait_until(lambda: queue_key not in bot._followup_workers)
+    await asyncio.sleep(0.05)
+
+    failed_notice.assert_not_awaited()
+    disabled_notice.assert_awaited_once()
+    assert bot._followup_queue.depth(queue_key) == 1
+    assert bot._followup_queue.failure_notification_depth(queue_key) == 1
+    await bot._stop_followup_workers()
+
+
+@pytest.mark.anyio
+async def test_unexpected_worker_failures_restart_with_backoff_then_disable(
+    tmp_path: Path,
+) -> None:
+    bot = _bot_harness(tmp_path / "queue.json")
+    bot._config.followup_worker_restart_cap = 2
+    bot._config.followup_worker_restart_backoff_seconds = 0.03
+    queue_key = bot._followup_queue_key("7:70")
+    item, _ = bot._followup_queue.enqueue(
+        conversation_key=queue_key,
+        handler="text",
+        update_json=json.dumps(_update_payload("retained")),
+        enqueued_at=1.0,
+    )
+    assert item is not None
+    starts: list[float] = []
+
+    async def crash(_queue_key: str) -> None:
+        starts.append(asyncio.get_running_loop().time())
+        raise RuntimeError("unexpected worker crash")
+
+    bot._run_followup_worker = crash
+    disabled_notice = AsyncMock()
+    bot._notify_followup_worker_disabled = disabled_notice
+
+    bot._start_followup_worker(queue_key)
+    await _wait_until(lambda: queue_key in bot._followup_worker_disabled)
+    await _wait_until(lambda: queue_key not in bot._followup_workers)
+
+    assert len(starts) == 3
+    assert starts[1] - starts[0] >= 0.025
+    assert starts[2] - starts[1] >= 0.055
+    disabled_notice.assert_awaited_once()
+    assert bot._followup_queue.depth(queue_key) == 1
+    await bot._stop_followup_workers()
+
+
+@pytest.mark.anyio
 async def test_cap_exceeded_is_explicit_and_never_silent(tmp_path: Path) -> None:
     bot = _bot_harness(tmp_path / "queue.json", cap=1)
     queue_key = bot._followup_queue_key("7:70")
@@ -281,6 +443,15 @@ async def test_stop_then_immediate_followup_rearms_worker(tmp_path: Path) -> Non
     )
     assert queue_key in bot._followup_workers
     assert not bot._followup_workers[queue_key].done()
+    worker = bot._followup_workers[queue_key]
+    bot._start_followup_worker(queue_key)
+    bot._start_followup_worker(queue_key)
+    assert bot._followup_workers[queue_key] is worker
+    assert sum(
+        task.get_name() == f"followup-queue:{queue_key}"
+        and not task.done()
+        for task in asyncio.all_tasks()
+    ) == 1
 
     bot._unmark_followup_live(queue_key)
     await _wait_until(lambda: bot._followup_queue.depth(queue_key) == 0)
@@ -336,6 +507,31 @@ async def test_corrupt_queue_degrades_without_stopping_bridge(
     lifecycle_ready.assert_awaited_once()
     assert bot._followup_queue_enabled is False
     assert bot._followup_workers == {}
+    assert path.read_bytes() == original
+
+    update = _SerializableUpdate("legacy fallback")
+    run_task = AsyncMock()
+    on_overflow = AsyncMock()
+    accepted = False
+
+    async def enqueue_followup(_update, _context) -> None:
+        nonlocal accepted
+        accepted = await bot._enqueue_user_task(
+            "7:70",
+            run_task,
+            on_overflow,
+        )
+
+    await bot._with_followup_update(
+        handler="text",
+        update=update,
+        context=None,
+        callback=enqueue_followup,
+    )
+    await _wait_until(lambda: run_task.await_count == 1)
+
+    assert accepted is True
+    on_overflow.assert_not_awaited()
     assert path.read_bytes() == original
 
 
@@ -407,6 +603,52 @@ async def test_de_json_none_is_retried_discarded_and_does_not_stall_tail(
 
 
 @pytest.mark.anyio
+async def test_failed_discard_notification_is_durable_and_surfaces_later(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "queue.json"
+    bot = _bot_harness(path)
+    queue_key = bot._followup_queue_key("7:70")
+
+    async def dispatch(_item) -> None:
+        raise RuntimeError("dispatch outage")
+
+    bot._dispatch_queued_followup = dispatch
+    bot.application.bot.send_message = AsyncMock(
+        side_effect=RuntimeError("Telegram outage")
+    )
+    item, _ = bot._followup_queue.enqueue(
+        conversation_key=queue_key,
+        handler="text",
+        update_json=json.dumps(_update_payload("tell me the outcome")),
+        enqueued_at=1.0,
+    )
+    assert item is not None
+
+    bot._start_followup_worker(queue_key)
+    await _wait_until(lambda: bot._followup_queue.depth(queue_key) == 0)
+    await _wait_until(lambda: queue_key not in bot._followup_workers)
+
+    assert bot.application.bot.send_message.await_count == 4
+    restarted_queue = _queue(path)
+    assert restarted_queue.failure_notification_depth(queue_key) == 1
+
+    delivered = AsyncMock()
+    bot._followup_queue = restarted_queue
+    bot.application.bot.send_message = delivered
+    bot._start_followup_worker(queue_key)
+    await _wait_until(
+        lambda: bot._followup_queue.failure_notification_depth(queue_key) == 0
+    )
+
+    delivered.assert_awaited_once()
+    assert "could not be processed after 3 attempts" in (
+        delivered.await_args.kwargs["text"]
+    )
+    await bot._stop_followup_workers()
+
+
+@pytest.mark.anyio
 async def test_voice_update_round_trips_and_replays_through_voice_handler(
     tmp_path: Path,
 ) -> None:
@@ -451,6 +693,7 @@ async def test_voice_update_round_trips_and_replays_through_voice_handler(
 async def test_stop_reply_reports_discarded_durable_count(tmp_path: Path) -> None:
     bot = _bot_harness(tmp_path / "queue.json")
     queue_key = bot._followup_queue_key("7:70")
+    other_queue_key = bot._followup_queue_key("8:80")
     for index in (1, 2):
         item, _ = bot._followup_queue.enqueue(
             conversation_key=queue_key,
@@ -459,6 +702,13 @@ async def test_stop_reply_reports_discarded_durable_count(tmp_path: Path) -> Non
             enqueued_at=float(index),
         )
         assert item is not None
+    other_item, _ = bot._followup_queue.enqueue(
+        conversation_key=other_queue_key,
+        handler="text",
+        update_json=json.dumps(_update_payload("other", update_id=3)),
+        enqueued_at=3.0,
+    )
+    assert other_item is not None
     bot._check_access = AsyncMock(return_value=True)
     bot._deny_codex_approvals = Mock()
     bot._invalidate_codex_approvals = Mock()
@@ -470,6 +720,7 @@ async def test_stop_reply_reports_discarded_durable_count(tmp_path: Path) -> Non
     await bot._cmd_stop(update, None)
 
     assert bot._followup_queue.depth(queue_key) == 0
+    assert bot._followup_queue.depth(other_queue_key) == 1
     reply = update.message.reply_text.await_args.args[0]
     assert "Paused" in reply
     assert "Discarded 2 durably queued follow-ups" in reply

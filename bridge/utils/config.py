@@ -1,4 +1,5 @@
 import json
+import math
 import re
 import os
 from collections.abc import Mapping
@@ -316,6 +317,65 @@ class Config(
             "when the cap is reached."
         ),
     )
+    followup_retry_backoff_seconds: Annotated[
+        tuple[float, float, float], NoDecode
+    ] = Field(
+        default=(1.0, 5.0, 30.0),
+        alias="CCC_BRIDGE_FOLLOWUP_RETRY_BACKOFF_SECONDS",
+        description=(
+            "Three wall-clock delays used by durable follow-up dispatch and "
+            "outcome-notification retries."
+        ),
+    )
+    followup_worker_restart_cap: int = Field(
+        default=3,
+        ge=1,
+        le=20,
+        alias="CCC_BRIDGE_FOLLOWUP_WORKER_RESTART_CAP",
+        description=(
+            "Maximum consecutive supervised restarts for one conversation's "
+            "durable follow-up worker."
+        ),
+    )
+    followup_worker_restart_backoff_seconds: float = Field(
+        default=1.0,
+        ge=0.01,
+        le=300.0,
+        alias="CCC_BRIDGE_FOLLOWUP_WORKER_RESTART_BACKOFF_SECONDS",
+        description=(
+            "Initial wall-clock delay for exponential durable follow-up worker "
+            "restart backoff."
+        ),
+    )
+
+    @field_validator("followup_retry_backoff_seconds", mode="before")
+    @classmethod
+    def validate_followup_retry_backoff_seconds(
+        cls, value: Any
+    ) -> tuple[float, float, float]:
+        if isinstance(value, str):
+            value = tuple(
+                part for part in re.split(r"[,\s]+", value.strip()) if part
+            )
+        try:
+            delays = tuple(float(part) for part in value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "follow-up retry backoff must contain three numbers"
+            ) from exc
+        if (
+            len(delays) != 3
+            or any(
+                not math.isfinite(delay) or delay <= 0.0 or delay > 3600.0
+                for delay in delays
+            )
+            or tuple(sorted(delays)) != delays
+        ):
+            raise ValueError(
+                "follow-up retry backoff must be three increasing delays "
+                "between 0 and 3600 seconds"
+            )
+        return delays  # type: ignore[return-value]
     session_guard_interval_seconds: float = Field(
         default=60.0,
         ge=10.0,
