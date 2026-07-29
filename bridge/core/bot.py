@@ -154,6 +154,7 @@ class TelegramBot(
         self._followup_live_counts: Dict[str, int] = {}
         self._followup_workers: Dict[str, asyncio.Task[None]] = {}
         self._followup_workers_stopping = False
+        self._followup_queue_enabled = True
         self._audio_dir = settings.bot_data_dir / "audio"
         self._image_dir = settings.bot_data_dir / "images"
         self._document_dir = settings.bot_data_dir / "uploads"
@@ -179,6 +180,7 @@ class TelegramBot(
     _NETWORK_FAILURE_THRESHOLD = 300  # 5 min of consecutive failures → force exit
     _SHUTDOWN_DISTILL_MAX_SESSIONS = 128
     _SHUTDOWN_DISTILL_TIMEOUT_SECONDS = 2.0
+    _FOLLOWUP_MAX_ATTEMPTS = 3
 
 
 
@@ -323,6 +325,14 @@ class TelegramBot(
     ) -> bool:
         user = envelope.update.effective_user
         user_id = user.id if user is not None else None
+        if not self._followup_queue_enabled:
+            await self._reply_followup_status(
+                envelope.update,
+                "❌ The saved follow-up queue is unavailable, so this message "
+                "was not queued. Please contact the operator.",
+                user_id=user_id,
+            )
+            return False
         cap = self._followup_queue.per_chat_cap
         try:
             update_json = self._serialize_followup_update(envelope.update)
@@ -427,7 +437,11 @@ class TelegramBot(
                 else None
             )
             try:
-                durable_depth = self._followup_queue.depth(queue_key)
+                durable_depth = (
+                    self._followup_queue.depth(queue_key)
+                    if self._followup_queue_enabled
+                    else 0
+                )
             except FollowupQueueCorruptionError:
                 if envelope is None:
                     raise
@@ -483,6 +497,10 @@ class TelegramBot(
             message_payload["date"] = int(time.time())
         app = self._require_application()
         update = Update.de_json(payload, app.bot)
+        if update is None:
+            raise FollowupQueueCorruptionError(
+                "Telegram deserializer returned no durable follow-up update"
+            )
         handlers = {
             "document": self._handle_document_message,
             "photo": self._handle_photo_message,
@@ -503,20 +521,92 @@ class TelegramBot(
         finally:
             _FOLLOWUP_REPLAY.reset(replay_token)
 
+    async def _notify_failed_followup(self, item: QueuedFollowup) -> None:
+        """Tell the sender that one accepted durable item was discarded."""
+
+        text = (
+            f"❌ This saved {item.handler} follow-up could not be processed "
+            f"after {self._FOLLOWUP_MAX_ATTEMPTS} attempts and was removed "
+            "from the queue. Later follow-ups will continue."
+        )
+        try:
+            payload = json.loads(item.update_json)
+            message_payload = payload.get("message")
+            if not isinstance(message_payload, dict):
+                raise ValueError("queued update has no message")
+            chat_payload = message_payload.get("chat")
+            if not isinstance(chat_payload, dict) or "id" not in chat_payload:
+                raise ValueError("queued update has no chat")
+            send_kwargs: dict[str, Any] = {
+                "chat_id": chat_payload["id"],
+                "text": text,
+            }
+            message_id = message_payload.get("message_id")
+            if isinstance(message_id, int):
+                send_kwargs["reply_to_message_id"] = message_id
+            await self._require_application().bot.send_message(**send_kwargs)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.error(
+                "Failed to notify sender about discarded durable follow-up %s",
+                item.item_id,
+                exc_info=True,
+            )
+
+    async def _discard_failed_followup(self, item: QueuedFollowup) -> None:
+        logger.error(
+            "Discarding durable follow-up %s after %s failed attempts",
+            item.item_id,
+            item.retry_count,
+        )
+        await self._notify_failed_followup(item)
+        if not self._followup_queue.acknowledge(item.item_id):
+            logger.error(
+                "Failed durable follow-up %s disappeared before discard",
+                item.item_id,
+            )
+
     async def _run_followup_worker(self, queue_key: str) -> None:
         while not self._followup_workers_stopping:
             await self._followup_idle_event(queue_key).wait()
             item = self._followup_queue.peek(queue_key)
             if item is None:
                 return
-            await self._dispatch_queued_followup(item)
+            if item.retry_count >= self._FOLLOWUP_MAX_ATTEMPTS:
+                await self._discard_failed_followup(item)
+                continue
+            try:
+                await self._dispatch_queued_followup(item)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                failed = self._followup_queue.record_failure(item.item_id)
+                if failed is None:
+                    logger.error(
+                        "Failed durable follow-up %s disappeared before retry",
+                        item.item_id,
+                        exc_info=True,
+                    )
+                    continue
+                logger.warning(
+                    "Durable follow-up %s failed attempt %s/%s",
+                    failed.item_id,
+                    failed.retry_count,
+                    self._FOLLOWUP_MAX_ATTEMPTS,
+                    exc_info=True,
+                )
+                if failed.retry_count >= self._FOLLOWUP_MAX_ATTEMPTS:
+                    await self._discard_failed_followup(failed)
+                await asyncio.sleep(0)
+                continue
             if not self._followup_queue.acknowledge(item.item_id):
                 raise FollowupQueueCorruptionError(
                     "processed follow-up disappeared before acknowledgement"
                 )
 
     def _start_followup_worker(self, queue_key: str) -> None:
-        if self._followup_workers_stopping:
+        if self._followup_workers_stopping or not self._followup_queue_enabled:
             return
         current = self._followup_workers.get(queue_key)
         if current is not None and not current.done():
@@ -538,7 +628,6 @@ class TelegramBot(
                 logger.exception(
                     "Durable follow-up worker stopped; queued item retained"
                 )
-                return
             if self._followup_workers_stopping:
                 return
             try:
@@ -560,21 +649,50 @@ class TelegramBot(
             await asyncio.gather(*workers, return_exceptions=True)
         self._followup_workers.clear()
 
-    def _clear_user_queue(self, user_id: Any) -> int:
+    async def _clear_user_queue(self, user_id: Any) -> tuple[int, int]:
         """Clear both volatile and durable items after an authorized /stop."""
 
-        cleared = self._tasks.clear(user_id)
+        volatile_cleared = self._tasks.clear(user_id)
         queue_key = self._followup_queue_key(user_id)
+        durable_cleared = (
+            self._followup_queue.clear(queue_key)
+            if self._followup_queue_enabled
+            else 0
+        )
         worker = self._followup_workers.get(queue_key)
         if worker is not None and not worker.done():
             worker.cancel()
-        return cleared + self._followup_queue.clear(queue_key)
+            await asyncio.gather(worker, return_exceptions=True)
+        if self._followup_workers.get(queue_key) is worker:
+            self._followup_workers.pop(queue_key, None)
+        if self._followup_queue_enabled:
+            try:
+                pending = self._followup_queue.peek(queue_key) is not None
+            except Exception:
+                logger.exception("Follow-up queue recheck after /stop failed")
+            else:
+                if pending:
+                    self._start_followup_worker(queue_key)
+        return volatile_cleared, durable_cleared
 
     async def _on_ready(self, application: Application) -> None:
         await super()._on_ready(application)
-        self._followup_queue.initialize()
         self._followup_workers_stopping = False
-        for queue_key in self._followup_queue.conversation_keys():
+        try:
+            self._followup_queue.initialize()
+            queue_keys = self._followup_queue.conversation_keys()
+        except Exception:
+            self._followup_queue_enabled = False
+            logger.critical(
+                "DURABLE FOLLOW-UP QUEUE DISABLED: startup validation failed; "
+                "the original queue file is preserved at %s and the bridge "
+                "will continue without durable follow-up queuing",
+                self._followup_queue.path,
+                exc_info=True,
+            )
+            return
+        self._followup_queue_enabled = True
+        for queue_key in queue_keys:
             self._start_followup_worker(queue_key)
 
     async def _do_graceful_stop(self) -> None:
