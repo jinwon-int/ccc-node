@@ -1161,13 +1161,21 @@ class BotCommandMixin:
         except TypeError:
             # Some tests/older adapters expose stop(user_id) only.
             killed = await self._project_chat.stop(user_id)
-        cleared = self._clear_user_queue(conversation_key)
+        volatile_cleared, durable_cleared = await self._clear_user_queue(
+            conversation_key
+        )
+        cleared = volatile_cleared + durable_cleared
 
         # Build response message - simple and friendly
         if task_cancelled or killed or cleared:
             reply = "⏸️ Paused"
         else:
             reply = "ℹ️ Nothing running"
+        if durable_cleared:
+            noun = "follow-up" if durable_cleared == 1 else "follow-ups"
+            reply += (
+                f"\n🗑️ Discarded {durable_cleared} durably queued {noun}."
+            )
         await message.reply_text(reply)
         log_debug(user_id, "bot", reply)
 
@@ -1604,8 +1612,8 @@ class BotCommandMixin:
             logger.error(f"Failed to cancel streaming for user {user_id}: {e}")
             return False
 
-    def _clear_user_queue(self, user_id: int) -> int:
-        return self._tasks.clear(user_id)
+    async def _clear_user_queue(self, user_id: int) -> tuple[int, int]:
+        return self._tasks.clear(user_id), 0
 
     async def _enqueue_user_task(
         self,

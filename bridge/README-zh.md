@@ -238,13 +238,23 @@ Claude:  ...
 | `CLAUDE_PROCESS_TIMEOUT` | 否 | `600` | SDK 超时时间（秒） |
 | `AUTO_NEW_SESSION_AFTER_HOURS` | 否 | `24` | 空闲 N 小时后自动启动新会话；设为 `0`/`false`/`off` 禁用 |
 | `CCC_BRIDGE_SESSION_GUARD_ENABLED` | 否 | `true` | 限制常驻会话资源，绝不驱逐活动请求 |
-| `CCC_BRIDGE_BUSY_NOTICE_ENABLED` | 否 | `true` | 会话已有活动轮次时立即确认后续消息；消息仍会在轮次结束后处理 |
+| `CCC_BRIDGE_BUSY_NOTICE_ENABLED` | 否 | `true` | 活动轮次期间显示含耗时的忙碌确认；即使禁用，持久队列的接受/拒绝回执仍会显示 |
 | `CCC_BRIDGE_BUSY_NOTICE_MIN_ELAPSED_SECONDS` | 否 | `10` | 发送忙碌确认前，活动轮次必须达到的最短持续时间 |
+| `CCC_BRIDGE_FOLLOWUP_QUEUE_CAP` | 否 | `32` | 每个会话可持久化、重启安全的 FIFO 后续消息上限；超限消息会被明确拒绝，绝不静默丢弃 |
+| `CCC_BRIDGE_FOLLOWUP_RETRY_BACKOFF_SECONDS` | 否 | `1,5,30` | 持久化后续消息分发和丢弃通知重试所用的递增实际等待时间 |
+| `CCC_BRIDGE_FOLLOWUP_WORKER_RESTART_CAP` | 否 | `3` | 每个会话在工作器被禁用前允许的连续受监督重启次数 |
+| `CCC_BRIDGE_FOLLOWUP_WORKER_RESTART_BACKOFF_SECONDS` | 否 | `1` | 工作器指数重启退避的初始等待秒数 |
 | `CCC_BRIDGE_SESSION_GUARD_INTERVAL_SECONDS` | 否 | `60` | 空闲资源守卫扫描间隔（10–3600 秒） |
 | `CCC_BRIDGE_SESSION_IDLE_TTL_SECONDS` | 否 | `14400` | 达到空闲时限后关闭本地运行时；持久会话 ID 仍可恢复 |
 | `CCC_BRIDGE_MAX_RESIDENT_SESSIONS` | 否 | `2` | 常驻会话 LRU 上限；活动会话受保护 |
 | `CCC_BRIDGE_SESSION_TREE_RSS_LIMIT_MB` | 否 | `1024` | 空闲桥接进程树 RSS 上限；`0` 禁用 |
 | `CCC_BRIDGE_CODEX_MAX_ATTACHMENTS` | 仅 Codex | `2` | 第三次会话附加前回收空闲 app-server；`0` 禁用 |
+| `CCC_RESUME_PERSISTED_SESSIONS` | 仅 Claude | `true` | SDK transcript 仍存在时，在重启后恢复持久化会话；dead-session wakeup 的前置条件 |
+| `CCC_DEAD_SESSION_WAKEUP` | 仅 Claude | `false` | 唤醒已退出的会话并交付待处理的后台任务通知，避免通知一直孤立在 transcript 中直到下一条手动消息。启用后会发起消耗 token 的自主轮次，在 `usage-meter.json` 中记为 `autonomous`，并受 Claude 每日预算门控；要求 `CCC_RESUME_PERSISTED_SESSIONS=true` |
+| `CCC_USAGE_METER_ENABLED` | 否 | `true` | 按提供商及 interactive/autonomous 模式将无正文的用量计数写入 `.telegram_bot/usage-meter.json` |
+| `CCC_USAGE_BUDGET_TOKENS_CLAUDE` | 仅 Claude | `0` | Claude 每日输入+输出 token 预算；`0` 表示禁用预算，强制门控只阻止自主用量 |
+| `CCC_USAGE_BUDGET_TOKENS_CODEX` | 仅 Codex | `0` | Codex 每日输入+输出 token 预算；`0` 表示禁用预算，强制门控只阻止自主用量 |
+| `CCC_USAGE_BUDGET_WARN_PERCENT` | 否 | `80` | 已配置每日 token 预算的预警百分比 |
 | `DRAFT_UPDATE_MIN_CHARS` | 否 | `150` | 流式响应草稿更新的最小字符数 |
 | `DRAFT_UPDATE_INTERVAL` | 否 | `1.0` | 流式响应草稿更新的最小间隔（秒） |
 | `ENABLE_STREAMING_TOOL_CALLS` | 否 | `false` | 在 Telegram 流式消息中显示 Claude 工具调用 |

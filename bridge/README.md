@@ -302,14 +302,24 @@ a provider turn or reads transcript/credential files.
 | `CCC_CODEX_DISTILL_MODEL` | Codex only | `provider-default` | Isolated write-back extractor model; a safe non-default ID is passed explicitly with `--model` |
 | `CCC_CODEX_DISTILL_TIMEOUT_SEC` | Codex only | `120` | Per-attempt extraction timeout, bounded to 1–600 seconds |
 | `CCC_CODEX_AUDIENCE_AUTH_MODE` | Scoped Codex only | `disabled` | Set to `keyring` only after Codex credentials are provisioned in the OS keyring; file credentials are never copied |
+| `CCC_RESUME_PERSISTED_SESSIONS` | Claude only | `true` | Resume a persisted session after restart when its SDK transcript still exists; required by dead-session wakeup |
+| `CCC_DEAD_SESSION_WAKEUP` | Claude only | `false` | Wake an exited session to deliver pending background-task notifications instead of leaving them orphaned until the next manual message. Enabling starts token-consuming autonomous turns, metered as `autonomous` in `usage-meter.json` and gated by the daily Claude budget; requires `CCC_RESUME_PERSISTED_SESSIONS=true` |
+| `CCC_USAGE_METER_ENABLED` | No | `true` | Write body-free usage counters by provider and interactive/autonomous mode to `.telegram_bot/usage-meter.json` |
+| `CCC_USAGE_BUDGET_TOKENS_CLAUDE` | Claude only | `0` | Daily Claude input+output token budget; `0` disables the budget, and enforcement blocks autonomous spend only |
+| `CCC_USAGE_BUDGET_TOKENS_CODEX` | Codex only | `0` | Daily Codex input+output token budget; `0` disables the budget, and enforcement blocks autonomous spend only |
+| `CCC_USAGE_BUDGET_WARN_PERCENT` | No | `80` | Early-alarm percentage for a configured daily token budget |
 | `CLAUDE_CLI_PATH` | No | *(auto-detect)* | Absolute path to Claude CLI binary |
 | `CLAUDE_SETTINGS_PATH` | No | `~/.claude/settings.json` | Path to Claude Code settings file |
 | `CLAUDE_PROCESS_TIMEOUT` | No | `600` | SDK timeout in seconds |
 | `CCC_MAX_DOCUMENT_SIZE_MB` | No | `10` | Maximum inbound Telegram document size in decimal MB (1–20) |
 | `AUTO_NEW_SESSION_AFTER_HOURS` | No | `24` | Auto-start new session after N hours of inactivity; set to `0`/`false`/`off` to disable |
 | `CCC_BRIDGE_SESSION_GUARD_ENABLED` | No | `true` | Bound resident provider sessions without interrupting active requests |
-| `CCC_BRIDGE_BUSY_NOTICE_ENABLED` | No | `true` | Immediately acknowledge follow-ups while the conversation has an active turn; the message is still processed afterward |
+| `CCC_BRIDGE_BUSY_NOTICE_ENABLED` | No | `true` | Include the elapsed-time busy acknowledgement while a turn is active; durable queue acceptance/rejection receipts remain visible when disabled |
 | `CCC_BRIDGE_BUSY_NOTICE_MIN_ELAPSED_SECONDS` | No | `10` | Minimum active-turn age before sending the acknowledgement |
+| `CCC_BRIDGE_FOLLOWUP_QUEUE_CAP` | No | `32` | Maximum restart-safe FIFO follow-ups per conversation; excess messages are explicitly rejected and never silently dropped |
+| `CCC_BRIDGE_FOLLOWUP_RETRY_BACKOFF_SECONDS` | No | `1,5,30` | Increasing wall-clock delays for durable follow-up dispatch and discard-notification retries |
+| `CCC_BRIDGE_FOLLOWUP_WORKER_RESTART_CAP` | No | `3` | Consecutive supervised worker restarts allowed per conversation before that worker is disabled |
+| `CCC_BRIDGE_FOLLOWUP_WORKER_RESTART_BACKOFF_SECONDS` | No | `1` | Initial delay for exponential worker-restart backoff |
 | `CCC_BRIDGE_SESSION_GUARD_INTERVAL_SECONDS` | No | `60` | Idle resource-guard sweep interval (10–3600s) |
 | `CCC_BRIDGE_SESSION_IDLE_TTL_SECONDS` | No | `14400` | Close a local provider runtime after this idle period; durable session IDs remain resumable |
 | `CCC_BRIDGE_MAX_RESIDENT_SESSIONS` | No | `2` | LRU cap for cached sessions; active sessions are protected |
