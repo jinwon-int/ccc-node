@@ -545,6 +545,8 @@ class ProjectChatProcessMixin:
                 generation = turn_token.generation
                 output = TurnOutputBuffer()
                 turn_state = TurnEventState()
+                active_approval_callbacks: set[asyncio.Task[Any]] = set()
+                approval_stall_won = False
 
                 async def handle_approval(
                     event: ApprovalRequestEvent,
@@ -563,6 +565,9 @@ class ProjectChatProcessMixin:
                     approval_lease = progress_request.lifecycle.begin_approval()
                     if approval_lease is None:
                         return ApprovalDecision.DENY
+                    callback_task = asyncio.current_task()
+                    if callback_task is not None:
+                        active_approval_callbacks.add(callback_task)
                     self._project_request_phase(progress_request)
                     try:
                         try:
@@ -575,6 +580,8 @@ class ProjectChatProcessMixin:
                     finally:
                         if progress_request.lifecycle.end_approval(approval_lease):
                             self._project_request_phase(progress_request)
+                        if callback_task is not None:
+                            active_approval_callbacks.discard(callback_task)
                     if decision is ApprovalDecision.ALLOW and self.is_agent_approval_active(
                         user_id, chat_id, generation
                     ):
@@ -584,6 +591,9 @@ class ProjectChatProcessMixin:
                 stall_grace = float(getattr(self._config, "terminal_stall_seconds", 0.0) or 0.0)
                 admission_grace = float(
                     getattr(self._config, "turn_admission_timeout_seconds", 0.0) or 0.0
+                )
+                approval_grace = float(
+                    getattr(self._config, "approval_stall_seconds", 0.0) or 0.0
                 )
 
                 async def deliver_pending_interim() -> None:
@@ -642,7 +652,7 @@ class ProjectChatProcessMixin:
                     _observer = getattr(self, "_lifecycle_observer", None)
                     if _observer is not None:
                         _observer.observe(event, session_id=session.session_id)
-                    transition = turn_state.observe(event)
+                    transition = turn_state.observe(event, observed_at=now)
                     await self._apply_turn_event_transition(
                         transition,
                         now=now,
@@ -655,6 +665,27 @@ class ProjectChatProcessMixin:
                     return TurnEventDirective.CONTINUE
 
                 async def interrupt_turn() -> None:
+                    nonlocal approval_stall_won
+                    if turn_state.approval_pending:
+                        approval_stall_won = _claim_request_terminal(
+                            progress_request,
+                            RequestPhase.TIMEOUT,
+                            cause="approval-stall",
+                        )
+                        if not approval_stall_won:
+                            # A concurrent /stop (or another terminal owner)
+                            # already won. Let that path own the session/UI
+                            # side effects and keep this request silent.
+                            raise asyncio.CancelledError
+                        self.invalidate_agent_approvals(user_id, chat_id)
+                        callbacks = tuple(active_approval_callbacks)
+                        for callback in callbacks:
+                            callback.cancel()
+                        if callbacks:
+                            await asyncio.gather(
+                                *(asyncio.shield(callback) for callback in callbacks),
+                                return_exceptions=True,
+                            )
                     await self._interrupt_agent_session(session)
 
                 abort_stalled_turn = getattr(session, "abort_stalled_turn", None)
@@ -672,6 +703,7 @@ class ProjectChatProcessMixin:
                         interrupt=interrupt_turn,
                         abort_stalled_turn=abort_stalled_turn,
                         admission_timeout_seconds=admission_grace,
+                        approval_stall_seconds=approval_grace,
                         terminal_stall_seconds=stall_grace,
                         interrupt_timeout_seconds=self._agent_interrupt_timeout_seconds,
                     ),
@@ -699,6 +731,38 @@ class ProjectChatProcessMixin:
                     message = f"Agent turn did not start within {admission_grace:g}s"
                     return ChatResponse(
                         content=f"⏰ {message}. Please retry your request.",
+                        success=False,
+                        error=message,
+                        session_id=session.session_id,
+                    )
+
+                if turn_outcome is TurnStreamOutcome.APPROVAL_STALL:
+                    if not approval_stall_won:
+                        # Defensive: the approval timeout claims lifecycle
+                        # authority in interrupt_turn before any abort effects.
+                        raise asyncio.CancelledError
+                    await self._drop_agent_session(key, session)
+                    await self._cancel_agent_streaming(
+                        streaming_handler,
+                        context="handling an approval-stall timeout",
+                    )
+                    logger.warning(
+                        "Approval stall released agent turn for user %s chat %s "
+                        "after %.1fs without a decision",
+                        user_id,
+                        chat_id,
+                        approval_grace,
+                    )
+                    try:
+                        health_reporter.record_stalled_request()
+                    except Exception:
+                        pass
+                    message = f"Approval was not resolved within {approval_grace:g}s"
+                    return ChatResponse(
+                        content=(
+                            f"⏰ {message}. The stalled turn was stopped; "
+                            "please retry your request."
+                        ),
                         success=False,
                         error=message,
                         session_id=session.session_id,
