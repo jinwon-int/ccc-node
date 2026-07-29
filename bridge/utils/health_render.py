@@ -155,6 +155,85 @@ def _turn_occupancy_line(
     return _line("Turn occupancy", "occupied", "; ".join(details))
 
 
+def _dead_session_wakeup_line(
+    data: dict,
+    *,
+    reference: datetime,
+    stale_seconds: int,
+) -> str:
+    section = data.get("dead_session_wakeup")
+    if not isinstance(section, dict):
+        return _line("Dead-session wakeup", "unknown", "not reported")
+
+    counter_names = ("scans", "scanned", "triggered", "delivered", "failed")
+    enabled = section.get("enabled")
+    if enabled is False:
+        for name in counter_names:
+            if name not in section:
+                continue
+            value = section[name]
+            if (
+                not isinstance(value, int)
+                or isinstance(value, bool)
+                or value != 0
+            ):
+                return _line(
+                    "Dead-session wakeup",
+                    "unknown",
+                    "inconsistent disabled activity",
+                )
+        if section.get("last_scan_at") not in (None, ""):
+            return _line(
+                "Dead-session wakeup",
+                "unknown",
+                "inconsistent disabled activity",
+            )
+        return _line("Dead-session wakeup", "disabled")
+    if enabled is not True:
+        return _line("Dead-session wakeup", "unknown", "invalid enabled state")
+
+    last_scan_at = _parse_iso(section.get("last_scan_at"))
+    if last_scan_at is None or last_scan_at.tzinfo is None:
+        return _line("Dead-session wakeup", "unknown", "scan time unavailable")
+    scan_age = max(
+        0,
+        int(
+            (
+                reference - last_scan_at.astimezone(timezone.utc)
+            ).total_seconds()
+        ),
+    )
+    if scan_age > stale_seconds:
+        return _line(
+            "Dead-session wakeup",
+            "unknown",
+            f"scan stale: last observation {_format_age(scan_age)} ago",
+        )
+
+    counters: dict[str, int] = {}
+    for name in counter_names:
+        value = section.get(name)
+        if (
+            not isinstance(value, int)
+            or isinstance(value, bool)
+            or value < 0
+        ):
+            return _line("Dead-session wakeup", "unknown", "invalid counters")
+        counters[name] = value
+    if counters["scans"] == 0:
+        return _line("Dead-session wakeup", "unknown", "inconsistent scan count")
+
+    return _line(
+        "Dead-session wakeup",
+        "enabled",
+        (
+            f"scans={counters['scans']} scanned={counters['scanned']} "
+            f"triggered={counters['triggered']} delivered={counters['delivered']} "
+            f"failed={counters['failed']}; last scan {_format_age(scan_age)} ago"
+        ),
+    )
+
+
 def render_status_lines(
     health_path: Path,
     pid: str,
@@ -174,6 +253,7 @@ def render_status_lines(
             _line("Process", "alive", f"PID: {pid}"),
             _line("Service", "degraded", "health missing"),
             _line("Turn occupancy", "unknown", "health missing"),
+            _line("Dead-session wakeup", "unknown", "health missing"),
             _line("Telegram", "degraded", "health missing"),
             _line(configured_label, "degraded", "health missing"),
         ]
@@ -186,6 +266,7 @@ def render_status_lines(
             _line("Process", "alive", f"PID: {pid}"),
             _line("Service", "degraded", f"invalid health file: {exc}"),
             _line("Turn occupancy", "unknown", "health unreadable"),
+            _line("Dead-session wakeup", "unknown", "health unreadable"),
             _line("Telegram", "degraded", "health unreadable"),
             _line(configured_label, "degraded", "health unreadable"),
         ]
@@ -210,6 +291,7 @@ def render_status_lines(
             _line("Process", "alive", f"PID: {pid}"),
             _line("Service", "degraded", detail),
             _line("Turn occupancy", "unknown", detail),
+            _line("Dead-session wakeup", "unknown", detail),
             _line("Telegram", "degraded", detail),
             _line(agent_label, "degraded", detail),
         ]
@@ -226,6 +308,11 @@ def render_status_lines(
         _line("Process", "alive", f"PID: {pid}"),
         _line("Service", service_state, service_reason),
         _turn_occupancy_line(
+            data,
+            reference=reference,
+            stale_seconds=stale_seconds,
+        ),
+        _dead_session_wakeup_line(
             data,
             reference=reference,
             stale_seconds=stale_seconds,

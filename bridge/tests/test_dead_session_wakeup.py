@@ -27,8 +27,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Optional
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
+from telegram_bot.core import bot_lifecycle
 from telegram_bot.core.agent_runtime import (
     AgentEvent,
     ApprovalHandler,
@@ -794,6 +795,66 @@ class AutonomousMeteringTests(unittest.TestCase):
         handler._agent_runtime = SimpleNamespace()
         handler.record_claude_adapter_attempt()
         self.assertEqual(meter.records, [("claude", "interactive", {"requests": 1})])
+
+
+class WakeupLifecycleHealthTests(unittest.TestCase):
+    def test_enabled_info_logs_once_and_every_all_zero_tick_records_health(self) -> None:
+        lifecycle = bot_lifecycle.BotLifecycleMixin()
+        lifecycle._config = SimpleNamespace(dead_session_wakeup=True)  # type: ignore[assignment]
+        lifecycle._session_manager = object()  # type: ignore[assignment]
+        lifecycle._project_chat = SimpleNamespace(  # type: ignore[assignment]
+            conversations_dir=Path("/unused"),
+            usage_meter=None,
+        )
+        lifecycle.application = SimpleNamespace(bot=object())
+        stats = SimpleNamespace(
+            scanned=0,
+            triggered=0,
+            delivered=0,
+            failed=0,
+            rejected=0,
+        )
+        record_scan = Mock()
+        fake_health_reporter = SimpleNamespace(
+            record_dead_session_wakeup_scan=record_scan
+        )
+
+        async def scenario() -> None:
+            with (
+                patch.object(
+                    bot_lifecycle,
+                    "run_dead_session_wakeup_scan",
+                    new=AsyncMock(return_value=stats),
+                ) as run_scan,
+                patch.object(
+                    bot_lifecycle,
+                    "health_reporter",
+                    fake_health_reporter,
+                ),
+                patch.object(bot_lifecycle.logger, "info") as info,
+            ):
+                tick = lifecycle._build_dead_session_wakeup_tick()
+                self.assertIsNotNone(tick)
+                assert tick is not None
+                await tick()
+                await tick()
+
+            self.assertEqual(run_scan.await_count, 2)
+            self.assertEqual(record_scan.call_count, 2)
+            record_scan.assert_called_with(
+                scanned=0,
+                triggered=0,
+                delivered=0,
+                failed=0,
+            )
+            enabled_logs = [
+                entry
+                for entry in info.call_args_list
+                if entry.args == ("Dead-session wakeup enabled",)
+            ]
+            self.assertEqual(len(enabled_logs), 1)
+
+        asyncio.run(scenario())
 
 
 class _WiringFakeSession:

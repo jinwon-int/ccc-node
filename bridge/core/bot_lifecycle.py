@@ -1270,6 +1270,12 @@ class BotLifecycleMixin:
                 enabled=True,
                 usage_meter=getattr(self._project_chat, "usage_meter", None),
             )
+            health_reporter.record_dead_session_wakeup_scan(
+                scanned=stats.scanned,
+                triggered=stats.triggered,
+                delivered=stats.delivered,
+                failed=stats.failed,
+            )
             if stats.triggered or stats.failed or stats.rejected:
                 logger.info(
                     "Dead-session wakeup: scanned=%d triggered=%d delivered=%d "
@@ -1288,6 +1294,7 @@ class BotLifecycleMixin:
                     stats.skipped_locked,
                 )
 
+        logger.info("Dead-session wakeup enabled")
         return wakeup_tick
 
     async def _distill_extraction_loop(self, stop_event: asyncio.Event) -> None:

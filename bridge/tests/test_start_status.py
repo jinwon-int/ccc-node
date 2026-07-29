@@ -93,6 +93,7 @@ class StartStatusTests(unittest.TestCase):
         claude_error: str = "",
         agent_provider: str | None = None,
         workload: dict | None = None,
+        dead_session_wakeup: dict | None = None,
     ) -> Path:
         now = updated_at or datetime.now(timezone.utc)
         health = {
@@ -136,6 +137,8 @@ class StartStatusTests(unittest.TestCase):
             }
         if workload is not None:
             health["workload"] = workload
+        if dead_session_wakeup is not None:
+            health["dead_session_wakeup"] = dead_session_wakeup
         health_file = project_root / ".telegram_bot" / "health.json"
         health_file.write_text(
             json.dumps(health, ensure_ascii=True, indent=2) + "\n",
@@ -505,13 +508,20 @@ class StartStatusTests(unittest.TestCase):
                 "old error: Telegram API unreachable",
                 "old error: Failed to authenticate",
             )
-            self._write_health(project_root, pid=os.getpid(), service_state="available")
+            self._write_health(
+                project_root,
+                pid=os.getpid(),
+                service_state="available",
+                dead_session_wakeup={"enabled": False},
+            )
 
             result = self._run_status(project_root)
 
             self.assertEqual(result.returncode, 0)
             self.assertIn("Bot status: available", result.stdout)
             self.assertIn("Service: available", result.stdout)
+            self.assertIn("Dead-session wakeup: disabled", result.stdout)
+            self.assertNotIn("Dead-session wakeup: enabled", result.stdout)
             self.assertIn("Telegram: healthy", result.stdout)
             self.assertIn("Claude: healthy", result.stdout)
             self.assertNotIn("old error", result.stdout)

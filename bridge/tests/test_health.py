@@ -260,6 +260,120 @@ class RuntimeHealthReporterTests(unittest.TestCase):
             self.assertEqual(health["requests"]["empty_completion_recovered"], 2)
             self.assertEqual(health["requests"]["empty_completion_failed"], 1)
 
+    def test_enabled_dead_session_wakeup_records_all_zero_scan_and_accumulates(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_root = Path(tmpdir)
+            module = self._load_health_module(project_root)
+            reporter = module.RuntimeHealthReporter(
+                project_root / ".telegram_bot",
+                dead_session_wakeup=True,
+            )
+
+            self.assertEqual(
+                reporter.snapshot()["dead_session_wakeup"],
+                {
+                    "enabled": True,
+                    "scans": 0,
+                    "scanned": 0,
+                    "triggered": 0,
+                    "delivered": 0,
+                    "failed": 0,
+                    "last_scan_at": None,
+                },
+            )
+
+            with patch.object(
+                module,
+                "_utc_now_iso",
+                return_value="2026-07-29T12:00:00Z",
+            ):
+                reporter.record_dead_session_wakeup_scan(
+                    scanned=0,
+                    triggered=0,
+                    delivered=0,
+                    failed=0,
+                )
+
+            first = json.loads(reporter.health_file.read_text(encoding="utf-8"))
+            self.assertEqual(
+                first["dead_session_wakeup"],
+                {
+                    "enabled": True,
+                    "scans": 1,
+                    "scanned": 0,
+                    "triggered": 0,
+                    "delivered": 0,
+                    "failed": 0,
+                    "last_scan_at": "2026-07-29T12:00:00Z",
+                },
+            )
+
+            with patch.object(
+                module,
+                "_utc_now_iso",
+                return_value="2026-07-29T12:01:00Z",
+            ):
+                reporter.record_dead_session_wakeup_scan(
+                    scanned=4,
+                    triggered=2,
+                    delivered=1,
+                    failed=1,
+                )
+
+            second = reporter.snapshot()["dead_session_wakeup"]
+            self.assertEqual(
+                second,
+                {
+                    "enabled": True,
+                    "scans": 2,
+                    "scanned": 4,
+                    "triggered": 2,
+                    "delivered": 1,
+                    "failed": 1,
+                    "last_scan_at": "2026-07-29T12:01:00Z",
+                },
+            )
+
+    def test_disabled_dead_session_wakeup_never_fabricates_activity(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_root = Path(tmpdir)
+            module = self._load_health_module(project_root)
+            reporter = module.RuntimeHealthReporter(
+                project_root / ".telegram_bot",
+                dead_session_wakeup=False,
+            )
+            reporter.initialize_process()
+
+            reporter.record_dead_session_wakeup_scan(
+                scanned=3,
+                triggered=2,
+                delivered=1,
+                failed=1,
+            )
+
+            self.assertEqual(
+                reporter.snapshot()["dead_session_wakeup"],
+                {"enabled": False},
+            )
+            on_disk = json.loads(reporter.health_file.read_text(encoding="utf-8"))
+            self.assertEqual(on_disk["dead_session_wakeup"], {"enabled": False})
+
+    def test_deferred_health_reporter_bind_carries_wakeup_configuration(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_root = Path(tmpdir)
+            module = self._load_health_module(project_root)
+            reporter = module.DeferredHealthReporter()
+
+            reporter.bind(
+                project_root / ".telegram_bot",
+                "codex",
+                True,
+            )
+
+            snapshot = reporter.snapshot()
+            self.assertEqual(snapshot["agent"]["provider"], "codex")
+            self.assertTrue(snapshot["dead_session_wakeup"]["enabled"])
+
     def test_record_workload_recomputes_oldest_turn_start_after_clock_step(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             project_root = Path(tmpdir)
