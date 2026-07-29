@@ -302,6 +302,12 @@ a provider turn or reads transcript/credential files.
 | `CCC_CODEX_DISTILL_MODEL` | Codex only | `provider-default` | Isolated write-back extractor model; a safe non-default ID is passed explicitly with `--model` |
 | `CCC_CODEX_DISTILL_TIMEOUT_SEC` | Codex only | `120` | Per-attempt extraction timeout, bounded to 1–600 seconds |
 | `CCC_CODEX_AUDIENCE_AUTH_MODE` | Scoped Codex only | `disabled` | Set to `keyring` only after Codex credentials are provisioned in the OS keyring; file credentials are never copied |
+| `CCC_RESUME_PERSISTED_SESSIONS` | Claude only | `true` | Resume a persisted session after restart when its SDK transcript still exists; required by dead-session wakeup |
+| `CCC_DEAD_SESSION_WAKEUP` | Claude only | `false` | Wake an exited session to deliver pending background-task notifications instead of leaving them orphaned until the next manual message. Enabling starts token-consuming autonomous turns, metered as `autonomous` in `usage-meter.json` and gated by the daily Claude budget; requires `CCC_RESUME_PERSISTED_SESSIONS=true` |
+| `CCC_USAGE_METER_ENABLED` | No | `true` | Write body-free usage counters by provider and interactive/autonomous mode to `.telegram_bot/usage-meter.json` |
+| `CCC_USAGE_BUDGET_TOKENS_CLAUDE` | Claude only | `0` | Daily Claude input+output token budget; `0` disables the budget, and enforcement blocks autonomous spend only |
+| `CCC_USAGE_BUDGET_TOKENS_CODEX` | Codex only | `0` | Daily Codex input+output token budget; `0` disables the budget, and enforcement blocks autonomous spend only |
+| `CCC_USAGE_BUDGET_WARN_PERCENT` | No | `80` | Early-alarm percentage for a configured daily token budget |
 | `CLAUDE_CLI_PATH` | No | *(auto-detect)* | Absolute path to Claude CLI binary |
 | `CLAUDE_SETTINGS_PATH` | No | `~/.claude/settings.json` | Path to Claude Code settings file |
 | `CLAUDE_PROCESS_TIMEOUT` | No | `600` | SDK timeout in seconds |
