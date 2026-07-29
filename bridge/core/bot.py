@@ -1,6 +1,8 @@
 # ruff: noqa: E402
 import asyncio
+import contextvars
 import hashlib
+import json
 import logging
 import os
 import re
@@ -28,6 +30,11 @@ from telegram_bot.core import session_resume
 from telegram_bot.core.push_notifier import PushNotifier
 from telegram_bot.core.task_queue import UserTaskQueue
 from telegram_bot.core.project_chat import ChatResponse
+from telegram_bot.core.project_chat_state import (
+    FollowupQueueCorruptionError,
+    PersistentFollowupQueue,
+    QueuedFollowup,
+)
 from telegram_bot.core.heartbeat import format_duration
 from telegram_bot.core.session_scope import legacy_storage_keys, storage_key
 from telegram_bot.memory.distill_types import DistillJob, DistillTrigger
@@ -51,6 +58,21 @@ class _DistillCheckpointProgress:
     byte_count: int = 0
     last_turn_marker: str | None = None
     pending_discriminator: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _FollowupUpdateEnvelope:
+    handler: str
+    update: Update
+
+
+_FOLLOWUP_UPDATE: contextvars.ContextVar[_FollowupUpdateEnvelope | None] = (
+    contextvars.ContextVar("ccc_bridge_followup_update", default=None)
+)
+_FOLLOWUP_REPLAY: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "ccc_bridge_followup_replay",
+    default=False,
+)
 
 
 from telegram_bot.core.bot_shared import _PollingRestart, enforce_access_control  # noqa: F401
@@ -123,6 +145,15 @@ class TelegramBot(
         self._user_voice_tasks: Dict[Any, set[asyncio.Task]] = {}
         # Per-user bounded run queue + active-task tracking (priority stop/revert).
         self._tasks = UserTaskQueue(self._MAX_INFLIGHT_MESSAGES)
+        self._followup_queue = PersistentFollowupQueue(
+            settings.bot_data_dir / "followup-queue.json",
+            per_chat_cap=int(getattr(settings, "followup_queue_cap", 32)),
+        )
+        self._followup_admission_locks: Dict[str, asyncio.Lock] = {}
+        self._followup_idle_events: Dict[str, asyncio.Event] = {}
+        self._followup_live_counts: Dict[str, int] = {}
+        self._followup_workers: Dict[str, asyncio.Task[None]] = {}
+        self._followup_workers_stopping = False
         self._audio_dir = settings.bot_data_dir / "audio"
         self._image_dir = settings.bot_data_dir / "images"
         self._document_dir = settings.bot_data_dir / "uploads"
@@ -161,6 +192,394 @@ class TelegramBot(
         cfg = getattr(self, "_config", None)
         scope = getattr(cfg, "telegram_session_scope", "per-user-chat")
         return storage_key(scope, user_id, chat_id)
+
+    @staticmethod
+    def _followup_queue_key(conversation_key: Any) -> str:
+        """Type-tag a SessionStore key for stable durable queue lookup."""
+
+        if not isinstance(conversation_key, (int, str)):
+            raise TypeError("unsupported conversation queue key")
+        return json.dumps(
+            [type(conversation_key).__name__, conversation_key],
+            ensure_ascii=True,
+            separators=(",", ":"),
+        )
+
+    def _followup_idle_event(self, queue_key: str) -> asyncio.Event:
+        event = self._followup_idle_events.get(queue_key)
+        if event is None:
+            event = asyncio.Event()
+            if self._followup_live_counts.get(queue_key, 0) == 0:
+                event.set()
+            self._followup_idle_events[queue_key] = event
+        return event
+
+    async def _with_followup_update(
+        self,
+        *,
+        handler: str,
+        update: Update,
+        context: Any,
+        callback: Any,
+    ) -> None:
+        token = _FOLLOWUP_UPDATE.set(_FollowupUpdateEnvelope(handler, update))
+        try:
+            await callback(update, context)
+        finally:
+            _FOLLOWUP_UPDATE.reset(token)
+
+    async def _handle_followup_text_update(self, update: Update, context: Any) -> None:
+        await self._with_followup_update(
+            handler="text",
+            update=update,
+            context=context,
+            callback=self._handle_text_message,
+        )
+
+    async def _handle_followup_voice_update(self, update: Update, context: Any) -> None:
+        await self._with_followup_update(
+            handler="voice",
+            update=update,
+            context=context,
+            callback=self._handle_voice_message,
+        )
+
+    async def _handle_followup_photo_update(self, update: Update, context: Any) -> None:
+        await self._with_followup_update(
+            handler="photo",
+            update=update,
+            context=context,
+            callback=self._handle_photo_message,
+        )
+
+    async def _handle_followup_sticker_update(self, update: Update, context: Any) -> None:
+        await self._with_followup_update(
+            handler="sticker",
+            update=update,
+            context=context,
+            callback=self._handle_sticker_message,
+        )
+
+    async def _handle_followup_document_update(
+        self, update: Update, context: Any
+    ) -> None:
+        await self._with_followup_update(
+            handler="document",
+            update=update,
+            context=context,
+            callback=self._handle_document_message,
+        )
+
+    @staticmethod
+    def _serialize_followup_update(update: Update) -> str:
+        serialized = update.to_json()
+        decoded = json.loads(serialized)
+        if not isinstance(decoded, dict):
+            raise ValueError("Telegram update serialization is not an object")
+        return json.dumps(decoded, ensure_ascii=False, separators=(",", ":"))
+
+    async def _reply_followup_status(
+        self,
+        update: Update,
+        text: str,
+        *,
+        user_id: int | None = None,
+    ) -> None:
+        message = self._require_message(update)
+        try:
+            await message.reply_text(text)
+        except Exception:
+            logger.warning(
+                "Follow-up queue status delivery failed for user %s",
+                user_id if user_id is not None else "unknown",
+                exc_info=True,
+            )
+        else:
+            if user_id is not None:
+                log_debug(user_id, "bot", text)
+
+    def _followup_busy_seconds(self, update: Update) -> float | None:
+        user = update.effective_user
+        chat = update.effective_chat
+        probe = getattr(self._project_chat, "busy_for_seconds", None)
+        if user is None or chat is None or not callable(probe):
+            return None
+        try:
+            return probe(
+                user.id,
+                chat.id,
+                asyncio.get_running_loop().time(),
+            )
+        except Exception:
+            logger.warning("Follow-up busy probe failed", exc_info=True)
+            return None
+
+    async def _persist_followup(
+        self,
+        *,
+        queue_key: str,
+        envelope: _FollowupUpdateEnvelope,
+        busy_seconds: float | None,
+    ) -> bool:
+        user = envelope.update.effective_user
+        user_id = user.id if user is not None else None
+        cap = self._followup_queue.per_chat_cap
+        try:
+            update_json = self._serialize_followup_update(envelope.update)
+            queued, position = self._followup_queue.enqueue(
+                conversation_key=queue_key,
+                handler=envelope.handler,
+                update_json=update_json,
+                enqueued_at=time.time(),
+            )
+        except Exception:
+            logger.exception("Follow-up update could not be persisted")
+            reply = (
+                "❌ I could not save this follow-up, so it was not queued. "
+                "Please retry after the current work finishes."
+            )
+            await self._reply_followup_status(
+                envelope.update,
+                reply,
+                user_id=user_id,
+            )
+            return False
+
+        if queued is None:
+            reply = (
+                f"⚠️ Follow-up queue is full ({cap} messages). "
+                "This message was not queued; please retry after earlier work "
+                "finishes or send /stop to clear the queue."
+            )
+            await self._reply_followup_status(
+                envelope.update,
+                reply,
+                user_id=user_id,
+            )
+            return False
+
+        self._start_followup_worker(queue_key)
+        threshold = float(
+            getattr(self._config, "busy_notice_min_elapsed_seconds", 10.0)
+        )
+        notice_enabled = bool(
+            getattr(self._config, "busy_notice_enabled", True)
+        )
+        if (
+            notice_enabled
+            and busy_seconds is not None
+            and busy_seconds >= threshold
+        ):
+            reply = (
+                "⏳ Still working on the previous message "
+                f"({format_duration(busy_seconds)} elapsed). "
+                f"This message is saved in queue position {position} and will "
+                "be handled in arrival order."
+            )
+        else:
+            reply = (
+                f"⏳ This message is saved in queue position {position} and "
+                "will be handled in arrival order."
+            )
+        await self._reply_followup_status(
+            envelope.update,
+            reply,
+            user_id=user_id,
+        )
+        return True
+
+    def _mark_followup_live(self, queue_key: str) -> None:
+        self._followup_live_counts[queue_key] = (
+            self._followup_live_counts.get(queue_key, 0) + 1
+        )
+        self._followup_idle_event(queue_key).clear()
+
+    def _unmark_followup_live(self, queue_key: str) -> None:
+        remaining = self._followup_live_counts.get(queue_key, 0) - 1
+        if remaining > 0:
+            self._followup_live_counts[queue_key] = remaining
+            return
+        self._followup_live_counts.pop(queue_key, None)
+        self._followup_idle_event(queue_key).set()
+        self._start_followup_worker(queue_key)
+
+    async def _enqueue_user_task(
+        self,
+        user_id: Any,
+        run_task: Any,
+        on_overflow: Any,
+    ) -> bool:
+        """Persist ordinary follow-ups before the legacy in-memory run queue."""
+
+        if _FOLLOWUP_REPLAY.get():
+            await run_task()
+            return True
+
+        queue_key = self._followup_queue_key(user_id)
+        admission_lock = self._followup_admission_locks.setdefault(
+            queue_key, asyncio.Lock()
+        )
+        envelope = _FOLLOWUP_UPDATE.get()
+        async with admission_lock:
+            busy_seconds = (
+                self._followup_busy_seconds(envelope.update)
+                if envelope is not None
+                else None
+            )
+            try:
+                durable_depth = self._followup_queue.depth(queue_key)
+            except FollowupQueueCorruptionError:
+                if envelope is None:
+                    raise
+                logger.exception("Follow-up queue validation failed")
+                await self._reply_followup_status(
+                    envelope.update,
+                    "❌ I could not verify the saved follow-up queue, so this "
+                    "message was not queued. Please contact the operator.",
+                    user_id=(
+                        envelope.update.effective_user.id
+                        if envelope.update.effective_user is not None
+                        else None
+                    ),
+                )
+                return False
+
+            occupied = (
+                self._followup_live_counts.get(queue_key, 0) > 0
+                or durable_depth > 0
+                or busy_seconds is not None
+            )
+            if envelope is not None and occupied:
+                return await self._persist_followup(
+                    queue_key=queue_key,
+                    envelope=envelope,
+                    busy_seconds=busy_seconds,
+                )
+
+            self._mark_followup_live(queue_key)
+
+            async def tracked_run_task() -> None:
+                try:
+                    await run_task()
+                finally:
+                    self._unmark_followup_live(queue_key)
+
+            accepted = await self._tasks.enqueue(
+                user_id,
+                tracked_run_task,
+                on_overflow,
+            )
+            if not accepted:
+                self._unmark_followup_live(queue_key)
+            return accepted
+
+    async def _dispatch_queued_followup(self, item: QueuedFollowup) -> None:
+        payload = json.loads(item.update_json)
+        message_payload = payload.get("message")
+        if isinstance(message_payload, dict):
+            # The stale-update check protects the polling boundary. This update
+            # was already accepted and durably owned by the bridge, so refresh
+            # only its transport timestamp before running every live gate again.
+            message_payload["date"] = int(time.time())
+        app = self._require_application()
+        update = Update.de_json(payload, app.bot)
+        handlers = {
+            "document": self._handle_document_message,
+            "photo": self._handle_photo_message,
+            "sticker": self._handle_sticker_message,
+            "text": self._handle_text_message,
+            "voice": self._handle_voice_message,
+        }
+        callback = handlers.get(item.handler)
+        if callback is None:
+            raise FollowupQueueCorruptionError(
+                "durable follow-up queue handler is invalid"
+            )
+        replay_token = _FOLLOWUP_REPLAY.set(True)
+        try:
+            # Re-enter the original handler: access, approval, pending-question,
+            # and owner gates are evaluated against current state.
+            await callback(update, None)
+        finally:
+            _FOLLOWUP_REPLAY.reset(replay_token)
+
+    async def _run_followup_worker(self, queue_key: str) -> None:
+        while not self._followup_workers_stopping:
+            await self._followup_idle_event(queue_key).wait()
+            item = self._followup_queue.peek(queue_key)
+            if item is None:
+                return
+            await self._dispatch_queued_followup(item)
+            if not self._followup_queue.acknowledge(item.item_id):
+                raise FollowupQueueCorruptionError(
+                    "processed follow-up disappeared before acknowledgement"
+                )
+
+    def _start_followup_worker(self, queue_key: str) -> None:
+        if self._followup_workers_stopping:
+            return
+        current = self._followup_workers.get(queue_key)
+        if current is not None and not current.done():
+            return
+        task = asyncio.create_task(
+            self._run_followup_worker(queue_key),
+            name=f"followup-queue:{queue_key}",
+        )
+        self._followup_workers[queue_key] = task
+
+        def done(completed: asyncio.Task[None]) -> None:
+            if self._followup_workers.get(queue_key) is completed:
+                self._followup_workers.pop(queue_key, None)
+            try:
+                completed.result()
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                logger.exception(
+                    "Durable follow-up worker stopped; queued item retained"
+                )
+                return
+            if self._followup_workers_stopping:
+                return
+            try:
+                pending = self._followup_queue.peek(queue_key) is not None
+            except Exception:
+                logger.exception("Follow-up queue recheck failed")
+                return
+            if pending:
+                self._start_followup_worker(queue_key)
+
+        task.add_done_callback(done)
+
+    async def _stop_followup_workers(self) -> None:
+        self._followup_workers_stopping = True
+        workers = tuple(self._followup_workers.values())
+        for task in workers:
+            task.cancel()
+        if workers:
+            await asyncio.gather(*workers, return_exceptions=True)
+        self._followup_workers.clear()
+
+    def _clear_user_queue(self, user_id: Any) -> int:
+        """Clear both volatile and durable items after an authorized /stop."""
+
+        cleared = self._tasks.clear(user_id)
+        queue_key = self._followup_queue_key(user_id)
+        worker = self._followup_workers.get(queue_key)
+        if worker is not None and not worker.done():
+            worker.cancel()
+        return cleared + self._followup_queue.clear(queue_key)
+
+    async def _on_ready(self, application: Application) -> None:
+        await super()._on_ready(application)
+        self._followup_queue.initialize()
+        self._followup_workers_stopping = False
+        for queue_key in self._followup_queue.conversation_keys():
+            self._start_followup_worker(queue_key)
+
+    async def _do_graceful_stop(self) -> None:
+        await self._stop_followup_workers()
+        await super()._do_graceful_stop()
 
     async def _seed_scoped_session_from_legacy(
         self,
@@ -783,28 +1202,35 @@ class TelegramBot(
 
         # Text/message handlers - for answers to questions
         self.application.add_handler(
-            MessageHandler(filters.VOICE, self._handle_voice_message), group=2
+            MessageHandler(filters.VOICE, self._handle_followup_voice_update),
+            group=2,
         )
         self.application.add_handler(
             MessageHandler(
                 filters.PHOTO | filters.Document.IMAGE,
-                self._handle_photo_message,
+                self._handle_followup_photo_update,
             ),
             group=2,
         )
         self.application.add_handler(
-            MessageHandler(filters.Sticker.ALL, self._handle_sticker_message),
+            MessageHandler(
+                filters.Sticker.ALL,
+                self._handle_followup_sticker_update,
+            ),
             group=2,
         )
         self.application.add_handler(
             MessageHandler(
                 filters.Document.ALL & ~filters.Document.IMAGE,
-                self._handle_document_message,
+                self._handle_followup_document_update,
             ),
             group=2,
         )
         self.application.add_handler(
-            MessageHandler(filters.TEXT & ~filters.COMMAND, self._handle_text_message),
+            MessageHandler(
+                filters.TEXT & ~filters.COMMAND,
+                self._handle_followup_text_update,
+            ),
             group=2,
         )
 
