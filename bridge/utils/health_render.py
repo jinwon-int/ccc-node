@@ -39,7 +39,7 @@ def _parse_iso(value: Optional[str]) -> Optional[datetime]:
         return None
     try:
         return datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
+    except (AttributeError, TypeError, ValueError):
         return None
 
 
@@ -55,6 +55,49 @@ def _line(component: str, state: str, detail: str = "") -> str:
     if detail:
         return f"   {component}: {state} ({detail})"
     return f"   {component}: {state}"
+
+
+def _turn_occupancy_line(data: dict) -> str:
+    workload = data.get("workload")
+    if not isinstance(workload, dict):
+        return _line("Turn occupancy", "unknown", "not reported")
+
+    occupancy = workload.get("turn_occupancy")
+    if not isinstance(occupancy, dict):
+        return _line("Turn occupancy", "unknown", "not reported")
+
+    state = occupancy.get("state")
+    if state == "idle":
+        return _line("Turn occupancy", "idle")
+    if state != "occupied":
+        return _line("Turn occupancy", "unknown", "invalid state")
+
+    details: List[str] = []
+    active_requests = workload.get("active_requests")
+    if isinstance(active_requests, int) and not isinstance(active_requests, bool):
+        noun = "turn" if active_requests == 1 else "turns"
+        details.append(f"{active_requests} active {noun}")
+
+    occupied_since = _parse_iso(occupancy.get("occupied_since"))
+    if occupied_since is not None and occupied_since.tzinfo is not None:
+        stable_start = occupied_since.astimezone(timezone.utc).isoformat(
+            timespec="seconds"
+        ).replace("+00:00", "Z")
+        details.append(f"since {stable_start}")
+    else:
+        details.append("start time unavailable")
+
+    elapsed = occupancy.get("elapsed_seconds")
+    if (
+        isinstance(elapsed, (int, float))
+        and not isinstance(elapsed, bool)
+        and elapsed >= 0
+    ):
+        details.append(f"elapsed {_format_age(int(elapsed))}")
+    else:
+        details.append("elapsed unavailable")
+
+    return _line("Turn occupancy", "occupied", "; ".join(details))
 
 
 def render_status_lines(
@@ -74,6 +117,7 @@ def render_status_lines(
             "🟡 Bot status: degraded",
             _line("Process", "alive", f"PID: {pid}"),
             _line("Service", "degraded", "health missing"),
+            _line("Turn occupancy", "unknown", "health missing"),
             _line("Telegram", "degraded", "health missing"),
             _line(configured_label, "degraded", "health missing"),
         ]
@@ -85,6 +129,7 @@ def render_status_lines(
             "🟡 Bot status: degraded",
             _line("Process", "alive", f"PID: {pid}"),
             _line("Service", "degraded", f"invalid health file: {exc}"),
+            _line("Turn occupancy", "unknown", "health unreadable"),
             _line("Telegram", "degraded", "health unreadable"),
             _line(configured_label, "degraded", "health unreadable"),
         ]
@@ -109,6 +154,7 @@ def render_status_lines(
             "🟡 Bot status: degraded",
             _line("Process", "alive", f"PID: {pid}"),
             _line("Service", "degraded", detail),
+            _line("Turn occupancy", "unknown", detail),
             _line("Telegram", "degraded", detail),
             _line(agent_label, "degraded", detail),
         ]
@@ -124,6 +170,7 @@ def render_status_lines(
         f"{_ICONS.get(service_state, '🟡')} Bot status: {service_state}",
         _line("Process", "alive", f"PID: {pid}"),
         _line("Service", service_state, service_reason),
+        _turn_occupancy_line(data),
         _line(
             "Telegram",
             telegram_state,

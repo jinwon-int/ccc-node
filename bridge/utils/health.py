@@ -1,8 +1,9 @@
 import json
 import os
 import threading
+import time
 from copy import deepcopy
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
 
@@ -58,6 +59,9 @@ class RuntimeHealthReporter:
         self._process_mode = "foreground"
         self._token_lock_file = ""
         self._owns_token_lock = False
+        self._occupied_since: str | None = None
+        self._occupancy_last_observed_at: float | None = None
+        self._occupancy_last_elapsed: float | None = None
         configured_provider = agent_provider or getattr(config, "agent_provider", "claude")
         self._agent_provider = (
             "codex" if str(configured_provider).strip().lower() == "codex" else "claude"
@@ -96,7 +100,7 @@ class RuntimeHealthReporter:
             "claude": dict(initial_agent_state),
             "workload": {
                 "active_requests": 0,
-                "oldest_request_age_seconds": 0,
+                "turn_occupancy": {"state": "idle"},
             },
             "transport": {
                 "reconnects": 0,
@@ -346,20 +350,73 @@ class RuntimeHealthReporter:
             self._write_health_locked()
 
     def record_workload(
-        self, active_requests: int, oldest_request_age_seconds: float
+        self,
+        active_requests: int,
+        oldest_request_age_seconds: float,
+        *,
+        observed_at: float | None = None,
+        utc_now: datetime | None = None,
     ) -> None:
         """Publish the current in-flight request count for idle-gated restarts.
 
         External supervisors (e.g. the self-update procedure) read this from
         ``health.json`` and defer a restart while the bridge is busy, so an
         in-flight ``claude`` child is not SIGTERM-killed mid-task.
+
+        The caller's count and elapsed age come from the agent-session registry's
+        active-turn metrics. Elapsed time therefore remains monotonic. The UTC
+        ``occupied_since`` value is a presentation projection captured once for
+        the same oldest turn; it is never used for elapsed-time arithmetic.
         """
         with self._lock:
+            active_count = max(0, int(active_requests))
+            if active_count == 0:
+                self._occupied_since = None
+                self._occupancy_last_observed_at = None
+                self._occupancy_last_elapsed = None
+                self._state["workload"] = {
+                    "active_requests": 0,
+                    "turn_occupancy": {"state": "idle"},
+                }
+                self._write_health_locked()
+                return
+
+            elapsed = max(0.0, float(oldest_request_age_seconds))
+            observed = time.monotonic() if observed_at is None else float(observed_at)
+            same_oldest_turn = False
+            if (
+                self._occupied_since is not None
+                and self._occupancy_last_observed_at is not None
+                and self._occupancy_last_elapsed is not None
+            ):
+                observation_delta = max(
+                    0.0, observed - self._occupancy_last_observed_at
+                )
+                expected_elapsed = self._occupancy_last_elapsed + observation_delta
+                same_oldest_turn = abs(elapsed - expected_elapsed) <= 1.0
+
+            if not same_oldest_turn:
+                wall_now = utc_now or datetime.now(timezone.utc)
+                if wall_now.tzinfo is None:
+                    wall_now = wall_now.replace(tzinfo=timezone.utc)
+                occupied_since = wall_now.astimezone(timezone.utc) - timedelta(
+                    seconds=elapsed
+                )
+                self._occupied_since = occupied_since.isoformat(
+                    timespec="seconds"
+                ).replace("+00:00", "Z")
+
+            self._occupancy_last_observed_at = observed
+            self._occupancy_last_elapsed = elapsed
+            elapsed_seconds = int(elapsed)
             self._state["workload"] = {
-                "active_requests": max(0, int(active_requests)),
-                "oldest_request_age_seconds": max(
-                    0, int(oldest_request_age_seconds)
-                ),
+                "active_requests": active_count,
+                "oldest_request_age_seconds": elapsed_seconds,
+                "turn_occupancy": {
+                    "state": "occupied",
+                    "occupied_since": self._occupied_since,
+                    "elapsed_seconds": elapsed_seconds,
+                },
             }
             self._write_health_locked()
 

@@ -4,6 +4,7 @@ import os
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -258,6 +259,68 @@ class RuntimeHealthReporterTests(unittest.TestCase):
             health = json.loads(reporter.health_file.read_text(encoding="utf-8"))
             self.assertEqual(health["requests"]["empty_completion_recovered"], 2)
             self.assertEqual(health["requests"]["empty_completion_failed"], 1)
+
+    def test_record_workload_projects_stable_occupied_turn(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_root = Path(tmpdir)
+            module = self._load_health_module(project_root)
+            reporter = module.RuntimeHealthReporter(project_root / ".telegram_bot")
+            first_observed = datetime(2026, 7, 15, 12, 0, 0, tzinfo=timezone.utc)
+
+            reporter.record_workload(
+                1,
+                48 * 60,
+                observed_at=100.0,
+                utc_now=first_observed,
+            )
+            first = json.loads(reporter.health_file.read_text(encoding="utf-8"))
+            reporter.record_workload(
+                1,
+                48 * 60 + 10,
+                observed_at=110.0,
+                utc_now=first_observed + timedelta(seconds=10),
+            )
+            second = json.loads(reporter.health_file.read_text(encoding="utf-8"))
+
+            self.assertEqual(first["workload"]["active_requests"], 1)
+            self.assertEqual(
+                first["workload"]["turn_occupancy"],
+                {
+                    "state": "occupied",
+                    "occupied_since": "2026-07-15T11:12:00Z",
+                    "elapsed_seconds": 2880,
+                },
+            )
+            self.assertEqual(
+                second["workload"]["turn_occupancy"]["occupied_since"],
+                "2026-07-15T11:12:00Z",
+            )
+            self.assertEqual(
+                second["workload"]["turn_occupancy"]["elapsed_seconds"], 2890
+            )
+
+    def test_record_workload_idle_has_no_fabricated_elapsed(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_root = Path(tmpdir)
+            module = self._load_health_module(project_root)
+            reporter = module.RuntimeHealthReporter(project_root / ".telegram_bot")
+
+            reporter.record_workload(
+                1,
+                90,
+                observed_at=100.0,
+                utc_now=datetime(2026, 7, 15, 12, 0, 0, tzinfo=timezone.utc),
+            )
+            reporter.record_workload(0, 0, observed_at=101.0)
+
+            health = json.loads(reporter.health_file.read_text(encoding="utf-8"))
+            self.assertEqual(
+                health["workload"],
+                {
+                    "active_requests": 0,
+                    "turn_occupancy": {"state": "idle"},
+                },
+            )
 
 
 if __name__ == "__main__":
