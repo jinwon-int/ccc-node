@@ -43,6 +43,10 @@ class HealthRenderTests(unittest.TestCase):
             "service": {"state": "available", "reason": ""},
             "telegram": {"state": "healthy", "last_error": ""},
             "agent": {"state": "healthy", "provider": "claude", "last_error": ""},
+            "workload": {
+                "active_requests": 0,
+                "turn_occupancy": {"state": "idle"},
+            },
         }
         d.update(over)
         return d
@@ -69,8 +73,38 @@ class HealthRenderTests(unittest.TestCase):
         lines = self._render(self._write(self._fresh()))
         self.assertEqual(lines[0], "🟢 Bot status: available")
         self.assertIn("   Service: available", lines)
+        self.assertIn("   Turn occupancy: idle", lines)
         self.assertIn("   Telegram: healthy", lines)  # reason suppressed when healthy
         self.assertIn("   Claude: healthy", lines)
+
+    def test_occupied_turn_renders_stable_start_and_monotonic_elapsed(self):
+        data = self._fresh(
+            workload={
+                "active_requests": 1,
+                "oldest_request_age_seconds": 2880,
+                "turn_occupancy": {
+                    "state": "occupied",
+                    "occupied_since": "2026-07-15T11:12:00Z",
+                    "elapsed_seconds": 2880,
+                },
+            }
+        )
+
+        lines = self._render(self._write(data))
+
+        self.assertIn(
+            "   Turn occupancy: occupied "
+            "(1 active turn; since 2026-07-15T11:12:00Z; elapsed 48m)",
+            lines,
+        )
+        self.assertTrue(all(isinstance(line, str) and line for line in lines))
+
+    def test_idle_turn_renders_without_zero_elapsed(self):
+        lines = self._render(self._write(self._fresh()))
+
+        self.assertIn("   Turn occupancy: idle", lines)
+        self.assertFalse(any("Turn occupancy" in line and "0s" in line for line in lines))
+        self.assertTrue(all(isinstance(line, str) and line for line in lines))
 
     def test_degraded_shows_reasons_and_provider_label(self):
         data = self._fresh(
