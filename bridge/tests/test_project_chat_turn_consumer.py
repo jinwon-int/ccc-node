@@ -114,7 +114,7 @@ def _observer(
         assert now >= 0
         if not state.admitted:
             state.mark_admitted()
-        state.observe(event)
+        state.observe(event, observed_at=now)
         if seen is not None:
             seen.append(event)
         return TurnEventDirective.CONTINUE
@@ -138,6 +138,7 @@ async def test_normal_eof_serializes_event_effects_and_closes() -> None:
         interrupt=_no_action,
         abort_stalled_turn=None,
         admission_timeout_seconds=1.0,
+        approval_stall_seconds=1.0,
         terminal_stall_seconds=1.0,
         interrupt_timeout_seconds=1.0,
     )
@@ -168,6 +169,7 @@ async def test_completed_read_wins_before_admission_timeout_sample() -> None:
         interrupt=interrupt,
         abort_stalled_turn=None,
         admission_timeout_seconds=0.001,
+        approval_stall_seconds=0.001,
         terminal_stall_seconds=0.001,
         interrupt_timeout_seconds=0.001,
     )
@@ -191,6 +193,7 @@ async def test_admission_timeout_preserves_interrupt_drain_abort_close_order() -
         interrupt=_record_action(order, "interrupt"),
         abort_stalled_turn=_record_action(order, "abort"),
         admission_timeout_seconds=0.001,
+        approval_stall_seconds=0.001,
         terminal_stall_seconds=0.001,
         interrupt_timeout_seconds=1.0,
     )
@@ -214,6 +217,7 @@ async def test_terminal_stall_uses_the_same_order_after_admission() -> None:
         interrupt=_record_action(order, "interrupt"),
         abort_stalled_turn=_record_action(order, "abort"),
         admission_timeout_seconds=0.001,
+        approval_stall_seconds=0.001,
         terminal_stall_seconds=0.001,
         interrupt_timeout_seconds=1.0,
     )
@@ -228,7 +232,7 @@ async def test_busy_or_approval_state_suppresses_terminal_stall(
     suppression: str,
 ) -> None:
     order: list[str] = []
-    stream = ScriptedStream([_END], order=order)
+    stream = ScriptedStream([], order=order)
     state = TurnEventState()
     state.mark_admitted()
     if suppression == "tool":
@@ -240,23 +244,39 @@ async def test_busy_or_approval_state_suppresses_terminal_stall(
                 "Bash",
                 {"command": "true"},
                 "run command",
-            )
+            ),
+            observed_at=asyncio.get_running_loop().time(),
         )
 
-    outcome = await consume_turn_stream(
-        stream,
-        state=state,
-        has_text=lambda: True,
-        on_event=_observer(state),
-        interrupt=_record_action(order, "interrupt"),
-        abort_stalled_turn=_record_action(order, "abort"),
-        admission_timeout_seconds=0.001,
-        terminal_stall_seconds=0.001,
-        interrupt_timeout_seconds=1.0,
+    consumer = asyncio.create_task(
+        consume_turn_stream(
+            stream,
+            state=state,
+            has_text=lambda: True,
+            on_event=_observer(state),
+            interrupt=_record_action(order, "interrupt"),
+            abort_stalled_turn=_record_action(order, "abort"),
+            admission_timeout_seconds=0.001,
+            approval_stall_seconds=0.005,
+            terminal_stall_seconds=0.001,
+            interrupt_timeout_seconds=1.0,
+        )
     )
 
-    assert outcome is TurnStreamOutcome.COMPLETED
-    assert order == ["aclose"]
+    if suppression == "approval":
+        assert await consumer is TurnStreamOutcome.APPROVAL_STALL
+        assert order == ["interrupt", "pending-cancel", "abort", "aclose"]
+        return
+
+    # A running tool still suppresses the short terminal-text guard and is not
+    # subject to the approval deadline. It remains owned by the outer process
+    # timeout (or /stop), which is deliberately a separate, longer contract.
+    await asyncio.sleep(0.01)
+    assert not consumer.done()
+    consumer.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await consumer
+    assert order == ["pending-cancel", "aclose"]
 
 
 @pytest.mark.anyio
@@ -278,6 +298,7 @@ async def test_stall_arms_after_active_tool_is_released() -> None:
         interrupt=_record_action(order, "interrupt"),
         abort_stalled_turn=_record_action(order, "abort"),
         admission_timeout_seconds=0.001,
+        approval_stall_seconds=0.001,
         terminal_stall_seconds=0.001,
         interrupt_timeout_seconds=1.0,
     )
@@ -303,6 +324,7 @@ async def test_event_effect_exception_is_not_converted_to_an_outcome() -> None:
             interrupt=_no_action,
             abort_stalled_turn=None,
             admission_timeout_seconds=1.0,
+            approval_stall_seconds=1.0,
             terminal_stall_seconds=1.0,
             interrupt_timeout_seconds=1.0,
         )
@@ -327,6 +349,7 @@ async def test_event_effect_cancellation_propagates_and_closes() -> None:
             interrupt=_no_action,
             abort_stalled_turn=None,
             admission_timeout_seconds=1.0,
+            approval_stall_seconds=1.0,
             terminal_stall_seconds=1.0,
             interrupt_timeout_seconds=1.0,
         )
@@ -350,6 +373,7 @@ async def test_stop_directive_completes_and_closes_without_reading_again() -> No
         interrupt=_no_action,
         abort_stalled_turn=None,
         admission_timeout_seconds=1.0,
+        approval_stall_seconds=1.0,
         terminal_stall_seconds=1.0,
         interrupt_timeout_seconds=1.0,
     )
@@ -377,6 +401,7 @@ async def test_abort_failure_is_logged_and_iterator_still_closes() -> None:
         interrupt=_record_action(order, "interrupt"),
         abort_stalled_turn=abort,
         admission_timeout_seconds=0.001,
+        approval_stall_seconds=0.001,
         terminal_stall_seconds=0.001,
         interrupt_timeout_seconds=1.0,
     )
@@ -399,6 +424,7 @@ async def test_repeated_consumer_cancellation_reaps_read_before_close() -> None:
             interrupt=_record_action(order, "interrupt"),
             abort_stalled_turn=_record_action(order, "abort"),
             admission_timeout_seconds=60.0,
+            approval_stall_seconds=60.0,
             terminal_stall_seconds=60.0,
             interrupt_timeout_seconds=1.0,
         )

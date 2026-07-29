@@ -158,6 +158,21 @@ class HeartbeatSettingsMixin:
             "timeout only."
         ),
     )
+    approval_stall_seconds: float = Field(
+        default=120.0,
+        alias="CCC_APPROVAL_STALL_SECONDS",
+        ge=0,
+        allow_inf_nan=False,
+        description=(
+            "Fail and release an admitted turn when a provider approval request "
+            "remains pending for this many wall-clock seconds. The stalled "
+            "session and approval UI are closed before the conversation FIFO is "
+            "released, so a late button cannot resume an abandoned turn. This "
+            "deadline is separate from the terminal-text stall guard and does "
+            "not bound a tool that is genuinely running. Set 0 to disable and "
+            "fall back to the full process timeout."
+        ),
+    )
     turn_admission_timeout_seconds: float = Field(
         default=300.0,
         alias="CCC_TURN_ADMISSION_TIMEOUT_SECONDS",

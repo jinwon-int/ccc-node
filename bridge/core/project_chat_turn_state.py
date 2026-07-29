@@ -81,6 +81,7 @@ class TurnEventState:
     """
 
     approval_pending: bool = False
+    approval_pending_since: float | None = None
     admitted: bool = False
     attempt_recorded: bool = False
     terminal_error: ErrorEvent | None = None
@@ -112,10 +113,22 @@ class TurnEventState:
 
         self.attempt_recorded = True
 
-    def observe(self, event: AgentEvent) -> TurnEventTransition:
+    def observe(
+        self,
+        event: AgentEvent,
+        *,
+        observed_at: float | None = None,
+    ) -> TurnEventTransition:
         """Apply one normalized event and return its typed routing transition."""
 
-        self.approval_pending = isinstance(event, ApprovalRequestEvent)
+        was_approval_pending = self.approval_pending
+        approval_pending = isinstance(event, ApprovalRequestEvent)
+        self.approval_pending = approval_pending
+        if approval_pending:
+            if not was_approval_pending:
+                self.approval_pending_since = observed_at
+        else:
+            self.approval_pending_since = None
 
         if isinstance(event, TextDeltaEvent):
             return TextDeltaTransition(event)
