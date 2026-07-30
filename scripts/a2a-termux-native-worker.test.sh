@@ -473,5 +473,45 @@ ok "kill_tree removes parent + child" 'grep -q "^OK$" "$SUP_TMP/kill_tree.marker
 out=$(A2A_TEST_CURL_OK=1 bash "$TOOL" status 2>&1)
 ok "status reports tunnel UP when curl returns 0" 'grep -q "tunnel: UP" <<<"$out"'
 
+# ---- unit-level: sanitize_termux_env scrubs a poisoned LD_LIBRARY_PATH ----
+# Regression guard for Wiki ND-1236: a leaked glibc LD_LIBRARY_PATH crashed the
+# Termux tunnel ssh (rc=139) and worker node (rc=103) in a retry loop.
+# supervise/run now scrub it defensively (preserving the Termux exec preload)
+# instead of relying on the boot/cron launcher.
+(
+    export A2A_SUPERVISOR_LOCK_DIR="$SUP_TMP"
+    export A2A_SUPERVISOR_LOG_DIR="$SUP_TMP"
+    # shellcheck disable=SC1090
+    source "$TOOL"
+
+    fake_prefix="$SUP_TMP/tx-prefix"
+    mkdir -p "$fake_prefix/lib"
+    : > "$fake_prefix/lib/libtermux-exec-ld-preload.so"
+
+    # Termux runtime + poisoned LD_LIBRARY_PATH → cleared, preload asserted.
+    export PREFIX="$fake_prefix"
+    export TERMUX_VERSION="test"
+    export LD_LIBRARY_PATH="/leaked/glibc/lib"
+    unset LD_PRELOAD
+    sanitize_termux_env
+    if [[ -z "${LD_LIBRARY_PATH:-}" && "${LD_PRELOAD:-}" == *"libtermux-exec-ld-preload.so"* ]]; then
+        echo OK > "$SUP_TMP/sanitize.termux.marker"
+    else
+        echo "BAD ld=[${LD_LIBRARY_PATH:-}] preload=[${LD_PRELOAD:-}]" > "$SUP_TMP/sanitize.termux.marker"
+    fi
+
+    # Off Termux → no-op: an inherited LD_LIBRARY_PATH is left untouched.
+    unset PREFIX TERMUX_VERSION LD_PRELOAD
+    export LD_LIBRARY_PATH="/host/glibc/lib"
+    sanitize_termux_env
+    if [[ "${LD_LIBRARY_PATH:-}" == "/host/glibc/lib" ]]; then
+        echo OK > "$SUP_TMP/sanitize.nontermux.marker"
+    else
+        echo "BAD ld=[${LD_LIBRARY_PATH:-}]" > "$SUP_TMP/sanitize.nontermux.marker"
+    fi
+) || true
+ok "sanitize_termux_env clears poisoned LD_LIBRARY_PATH, keeps Termux preload" 'grep -q "^OK$" "$SUP_TMP/sanitize.termux.marker" 2>/dev/null'
+ok "sanitize_termux_env is a no-op off Termux" 'grep -q "^OK$" "$SUP_TMP/sanitize.nontermux.marker" 2>/dev/null'
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
