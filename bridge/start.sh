@@ -1087,6 +1087,16 @@ do_restart() {
     local stop_timeout="${CCC_BRIDGE_RESTART_STOP_TIMEOUT:-15}"
     local ready_timeout="${CCC_BRIDGE_RESTART_READY_TIMEOUT:-45}"
     local spawn_cmd="${CCC_BRIDGE_RESTART_SPAWN:-$SCRIPT_DIR/start.sh}"
+    # The spawn target is executed directly, so it depends on its shebang
+    # resolving. `start.sh` declares `#!/bin/bash`, and Termux has neither
+    # /bin/bash nor /usr/bin/env — exec fails with 126 "bad interpreter", so
+    # --restart stops the bridge and never starts it back up (observed on
+    # gongyung 2026-07-30: "Bot stopped" followed by start-failed). Changing
+    # the shebang does not help there; the fix has to be at the call site.
+    # Run the default target through the bash resolved from PATH. An explicit
+    # CCC_BRIDGE_RESTART_SPAWN override is left to exec on its own terms.
+    local -a spawn_launcher=()
+    [ -z "${CCC_BRIDGE_RESTART_SPAWN:-}" ] && spawn_launcher=(bash)
     local waited live ready new_pid spawn_pid="" restart_log="" unit scope_flag
     local caller_ancestor="" daemon_hint=""
 
@@ -1168,7 +1178,7 @@ do_restart() {
     [ -n "$BOT_DEBUG" ] && spawn_args+=("--debug")
     if [ "$DAEMON_MODE" -eq 1 ]; then
         # Same path as `start.sh --path <p> --daemon`.
-        if ! "$spawn_cmd" "${spawn_args[@]}" --daemon; then
+        if ! "${spawn_launcher[@]}" "$spawn_cmd" "${spawn_args[@]}" --daemon; then
             echo "❌ Restart failed: start-failed (daemon start exited nonzero)"
             exit 2
         fi
@@ -1178,7 +1188,7 @@ do_restart() {
         # from this terminal so the verified bridge survives the restart
         # command exiting; output goes to the restart log.
         restart_log="$LOGS_DIR/restart.log"
-        nohup "$spawn_cmd" "${spawn_args[@]}" >> "$restart_log" 2>&1 &
+        nohup "${spawn_launcher[@]}" "$spawn_cmd" "${spawn_args[@]}" >> "$restart_log" 2>&1 &
         spawn_pid=$!
         echo "🚀 Starting bridge (spawn PID: $spawn_pid, log: $restart_log)"
     fi
