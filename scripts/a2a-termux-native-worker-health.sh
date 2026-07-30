@@ -10,15 +10,21 @@
 #
 # By default this script self-heals: if no supervisor is holding the lock and
 # the supervisor-count-cap is not violated, it detaches a fresh supervisor via
-# `setsid -f` and returns rc=0.  Pass --no-self-heal to keep it strictly
-# read-only (safe from any cron entry).
+# `setsid -f` and returns rc=0.  It also recovers the ND-1236 "stuck" state — a
+# live supervisor whose tunnel has died and whose worker is therefore crash-
+# looping — by restarting the supervisor, but only under strict guards (N
+# consecutive down cycles, a reachable ssh target, and a restart cooldown; see
+# the tuning block below).  Pass --no-self-heal to keep it strictly read-only
+# (safe from any cron entry), or --no-tunnel-recovery to keep only the spawn
+# behavior and leave a DOWN tunnel flagged for a human.
 #
 # Exit codes (fail-closed with distinct rc so cron logs are self-explanatory):
-#   0   healthy, or spawned a fresh supervisor
+#   0   healthy, spawned a fresh supervisor, or recovered a dead tunnel
 #   2   env validation failure, or missing --env-file
-#   3   supervisor is running but tunnel is DOWN and self-heal cannot fix that
+#   3   supervisor up but tunnel DOWN and this cycle could not recover it
+#       (still debouncing, in cooldown, target unreachable, or recovery off)
 #   4   supervisor-count-cap exceeded — MANUAL SWEEP REQUIRED (ND-1236 replay)
-#   5   self-heal was requested but spawning setsid failed
+#   5   self-heal/recovery was requested but spawning setsid failed
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -35,6 +41,18 @@ LOCK="${A2A_SUPERVISOR_LOCK:-$LOCK_DIR/a2a-native-worker-supervisor.lock}"
 PIDFILE="$LOCK.pid"
 
 MAX_SUPERVISORS_DEFAULT=1
+
+# Tunnel-down controlled-recovery tuning (#810).  A supervisor that holds the
+# lock but has a dead tunnel is the ND-1236 "stuck" state: the worker then
+# crash-loops (it can't reach the broker) and plain self-heal can't help because
+# the lock is held.  We restart it — but only after TUNNEL_DOWN_RESTART_AFTER
+# consecutive down cycles, only when the ssh tunnel target is reachable, and
+# never more often than TUNNEL_RESTART_COOLDOWN seconds, so an unreachable broker
+# or a flapping tunnel can never turn recovery into a restart storm.
+TUNNEL_DOWN_RESTART_AFTER_DEFAULT=3
+TUNNEL_RESTART_COOLDOWN_DEFAULT=1800
+STREAK_FILE="${A2A_TUNNEL_DOWN_STREAK_FILE:-$LOCK.tunnel_down_streak}"
+RESTART_TS_FILE="${A2A_TUNNEL_RESTART_TS_FILE:-$LOCK.tunnel_restart_ts}"
 
 # Regex fragments used by pgrep -f.  We match BOTH the canonical script (the
 # one this file lives beside) AND the legacy hand-rolled script name that
@@ -145,6 +163,41 @@ tunnel_status() {
     fi
 }
 
+# ---- tunnel-down controlled-recovery helpers (#810) ----
+# Read a small non-negative integer from a state file (0 if absent/garbage).
+_read_int() {
+    local f="$1" v
+    v=$(head -n1 "$f" 2>/dev/null | tr -dc '0-9')
+    printf '%s' "${v:-0}"
+}
+# Increment the consecutive-tunnel-down streak and echo the new value.
+bump_tunnel_down_streak() {
+    local n
+    n=$(_read_int "$STREAK_FILE"); n=$((n + 1))
+    printf '%s\n' "$n" > "$STREAK_FILE" 2>/dev/null || true
+    printf '%s' "$n"
+}
+reset_tunnel_down_streak() { rm -f "$STREAK_FILE" 2>/dev/null || true; }
+record_restart_ts()        { date +%s > "$RESTART_TS_FILE" 2>/dev/null || true; }
+# True while we are still inside the post-restart cooldown window.
+in_restart_cooldown() {
+    local last now
+    last=$(_read_int "$RESTART_TS_FILE")
+    [[ "$last" -gt 0 ]] || return 1
+    now=$(date +%s)
+    (( now - last < TUNNEL_RESTART_COOLDOWN ))
+}
+# True when the ssh tunnel target actually accepts a connection.  Gates the
+# restart so a genuinely unreachable broker stays a flagged (rc=3) condition for
+# a human, rather than triggering pointless supervisor churn.
+ssh_target_reachable() {
+    local env_file="$1" target
+    target=$(extract_env_value A2A_TUNNEL_SSH_TARGET "$env_file")
+    [[ -n "$target" ]] || return 1
+    timeout 10 ssh -o BatchMode=yes -o ConnectTimeout=6 \
+        -o StrictHostKeyChecking=accept-new "$target" true >/dev/null 2>&1
+}
+
 # Print a single-line JSON summary.  Deliberately hand-rolled (no jq) so the
 # health check works on minimal Termux profiles and can be piped straight into
 # a fleet log ingester.
@@ -169,6 +222,15 @@ Options:
   --max-supervisors N     Hard cap on distinct supervisor-looking processes
                           (canonical + legacy).  Default: $MAX_SUPERVISORS_DEFAULT.
                           rc=4 if exceeded; no self-heal in that case.
+  --tunnel-down-restart-after N
+                          Consecutive tunnel-DOWN cycles (with a live
+                          supervisor) before a controlled restart is attempted.
+                          Default: $TUNNEL_DOWN_RESTART_AFTER_DEFAULT.  Requires --self-heal + reachable target.
+  --tunnel-restart-cooldown SEC
+                          Minimum seconds between controlled restarts.
+                          Default: $TUNNEL_RESTART_COOLDOWN_DEFAULT.
+  --no-tunnel-recovery    Disable the controlled restart; keep the legacy
+                          flag-only rc=3 behavior for a DOWN tunnel.
   --json                  Emit a single-line JSON summary in addition to
                           human-readable output.
   --quiet                 Suppress human-readable output on rc=0 (still prints
@@ -196,7 +258,10 @@ main() {
     local self_heal=1
     local emit_json_flag=0
     local quiet=0
+    local tunnel_recovery=1
     MAX_SUPERVISORS="$MAX_SUPERVISORS_DEFAULT"
+    TUNNEL_DOWN_RESTART_AFTER="$TUNNEL_DOWN_RESTART_AFTER_DEFAULT"
+    TUNNEL_RESTART_COOLDOWN="$TUNNEL_RESTART_COOLDOWN_DEFAULT"
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -204,6 +269,9 @@ main() {
             --self-heal)        self_heal=1; shift ;;
             --no-self-heal)     self_heal=0; shift ;;
             --max-supervisors)  MAX_SUPERVISORS="${2:-1}"; shift 2 ;;
+            --no-tunnel-recovery)        tunnel_recovery=0; shift ;;
+            --tunnel-down-restart-after) TUNNEL_DOWN_RESTART_AFTER="${2:-3}"; shift 2 ;;
+            --tunnel-restart-cooldown)   TUNNEL_RESTART_COOLDOWN="${2:-1800}"; shift 2 ;;
             --json)             emit_json_flag=1; shift ;;
             --quiet)            quiet=1; shift ;;
             -h|--help)          usage; return 2 ;;
@@ -249,6 +317,47 @@ main() {
     # ---- supervisor already up ----
     if [[ -n "$sup_pid" ]]; then
         if [[ "$tunnel" == DOWN ]]; then
+            # ND-1236 "stuck" state: a supervisor holds the lock but has no
+            # tunnel, so the worker crash-loops and plain self-heal can't help.
+            # Attempt a *controlled* restart under strict guards (see the tuning
+            # block at the top).  Never in read-only (--no-self-heal) mode or
+            # when recovery is disabled.
+            if (( self_heal && tunnel_recovery )); then
+                local streak
+                streak=$(bump_tunnel_down_streak)
+                if (( streak >= TUNNEL_DOWN_RESTART_AFTER )) \
+                   && ! in_restart_cooldown \
+                   && ssh_target_reachable "$env_file"; then
+                    log "tunnel-down recovery: sup=$sup_pid streak=$streak reachable — controlled restart"
+                    record_restart_ts
+                    reset_tunnel_down_streak
+                    "$HARNESS" stop >/dev/null 2>&1 || true
+                    if setsid -f bash "$HARNESS" supervise --env-file "$env_file" \
+                            </dev/null >>"$LOG" 2>&1; then
+                        local msg="tunnel-down recovery: restarted supervisor (was pid=$sup_pid after $streak down cycles)"
+                        log "$msg"
+                        (( quiet )) || echo "$msg"
+                        (( emit_json_flag )) && emit_json "$sup_pid" "$sup_count" "$sup_pids_csv" \
+                            "$workers" "$tunnel" tunnel-recovered 0
+                        return 0
+                    fi
+                    log "tunnel-down recovery: setsid respawn failed"
+                    echo "tunnel-down recovery: setsid respawn failed" >&2
+                    (( emit_json_flag )) && emit_json "$sup_pid" "$sup_count" "$sup_pids_csv" \
+                        "$workers" "$tunnel" self-heal-failed 5
+                    return 5
+                fi
+                # Guards not met this cycle — flag and wait for the next one.
+                local why="streak=$streak/$TUNNEL_DOWN_RESTART_AFTER"
+                in_restart_cooldown && why="$why cooldown"
+                local msg="supervisor pid=$sup_pid up but tunnel DOWN — $why; deferring restart (investigate ssh target if persistent)"
+                log "$msg"
+                echo "$msg" >&2
+                (( emit_json_flag )) && emit_json "$sup_pid" "$sup_count" "$sup_pids_csv" \
+                    "$workers" "$tunnel" tunnel-down 3
+                return 3
+            fi
+            # Read-only / recovery-disabled: original flag-only behavior.
             local msg="supervisor pid=$sup_pid up but tunnel DOWN — self-heal cannot fix; investigate ssh target"
             log "$msg"
             echo "$msg" >&2
@@ -256,6 +365,9 @@ main() {
                 "$workers" "$tunnel" tunnel-down 3
             return 3
         fi
+        # Tunnel UP — clear any pending down-streak so the next down episode
+        # starts its debounce from zero.
+        (( self_heal && tunnel_recovery )) && reset_tunnel_down_streak
         (( quiet )) || printf 'OK sup=%s workers=%s tunnel=%s (cap=%s/%s)\n' \
             "$sup_pid" "$workers" "$tunnel" "$sup_count" "$MAX_SUPERVISORS"
         (( emit_json_flag )) && emit_json "$sup_pid" "$sup_count" "$sup_pids_csv" \
