@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import contextlib
 import filecmp
+import importlib.util
 import json
 import os
 import re
@@ -48,6 +49,33 @@ VALID_SCOPES = {"settings", "files", "hooks", "output-styles", "all"}
 CODEX_PROBE_TIMEOUT_SECONDS = 5.0
 CODEX_PROBE_TIMEOUT_MAX_SECONDS = 10.0
 
+_CANONICAL_PATHS: Any = None
+_CANONICAL_PATHS_TRIED = False
+
+
+def canonical_paths_module() -> Any:
+    """setup.sh's canonical-path rewrite, loaded from scripts/lib.
+
+    Loaded by file path rather than import: scripts/lib is not a package, and
+    mutating sys.path in a diagnostic tool risks shadowing later imports.
+    Returns None when the checkout is incomplete, so callers fall back to a
+    byte-exact comparison instead of guessing at the transform.
+    """
+    global _CANONICAL_PATHS, _CANONICAL_PATHS_TRIED
+    if _CANONICAL_PATHS_TRIED:
+        return _CANONICAL_PATHS
+    _CANONICAL_PATHS_TRIED = True
+    source = Path(__file__).resolve().parent / "lib" / "canonical_paths.py"
+    try:
+        spec = importlib.util.spec_from_file_location("_ccc_canonical_paths", source)
+        if spec is not None and spec.loader is not None:
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            _CANONICAL_PATHS = module
+    except Exception:
+        _CANONICAL_PATHS = None
+    return _CANONICAL_PATHS
+
 
 @dataclass
 class Row:
@@ -70,10 +98,79 @@ class Doctor:
         self.readiness = "not-applicable"
         self.settings_valid = False
         self.current_settings: dict[str, Any] | None = None
+        self._rewrite_pairs: dict[str, str] | None = None
 
     def add(self, klass: str, item: str, status: str, action: str) -> None:
         self.rows.append(Row(klass, item, status, action))
         self.counts[klass] += 1
+
+    def rewrite_pairs(self) -> dict[str, str]:
+        """Canonical -> actual path substitutions setup.sh applied on this node."""
+        if self._rewrite_pairs is None:
+            module = canonical_paths_module()
+            self._rewrite_pairs = (
+                {} if module is None else module.rewrite_pairs(self.repo, self.claude_dir)
+            )
+        return self._rewrite_pairs
+
+    def expected_installed_text(self, src: Path) -> str | None:
+        """Template content as setup.sh would have installed it on this node.
+
+        None means "no transform applies" — either the node uses the canonical
+        paths, or the template is not decodable text — and the caller must fall
+        back to a byte-exact comparison.
+        """
+        pairs = self.rewrite_pairs()
+        if not pairs:
+            return None
+        module = canonical_paths_module()
+        if module is None:
+            return None
+        try:
+            return str(module.rewrite_text(src.read_text(encoding="utf-8"), pairs))
+        except (OSError, UnicodeDecodeError):
+            return None
+
+    def installed_matches_source(self, src: Path, dst: Path) -> bool:
+        """True when the installed file is what setup.sh would install here.
+
+        Byte-exact for canonical installs; for every other install the template
+        is compared through setup.sh's canonical-path rewrite, so a correctly
+        installed /root/ccc-node or Termux node is not reported as drifted.
+        """
+        expected = self.expected_installed_text(src)
+        if expected is None:
+            return filecmp.cmp(src, dst, shallow=False)
+        try:
+            return dst.read_text(encoding="utf-8") == expected
+        except (OSError, UnicodeDecodeError):
+            return False
+
+    def install_source_file(self, src: Path, dst: Path) -> None:
+        """Install a template the same way setup.sh does, rewrite included."""
+        expected = self.expected_installed_text(src)
+        if expected is None:
+            shutil.copyfile(src, dst)
+        else:
+            dst.write_text(expected, encoding="utf-8")
+        try:
+            shutil.copymode(src, dst)
+        except Exception:
+            pass
+
+    def check_canonical_rewrite(self) -> None:
+        if canonical_paths_module() is None:
+            self.add(
+                "수동필요", "canonical path rewrite", "shared transform unreadable",
+                "restore scripts/lib/canonical_paths.py in this checkout, then rerun",
+            )
+            return
+        pairs = self.rewrite_pairs()
+        if not pairs:
+            self.add("정상", "canonical path rewrite", "not needed (canonical install paths)", "none")
+            return
+        detail = "; ".join(f"{old} -> {new}" for old, new in pairs.items())
+        self.add("정상", "canonical path rewrite", f"installed copies rewritten ({detail})", "none")
 
     def hook_files(self) -> list[str]:
         """Deployable hook tree, walked from the repo — never a hand-kept list.
@@ -199,12 +296,14 @@ class Doctor:
             else:
                 self.add("수동필요", "install mode", "could not distinguish standalone vs plugin", "inspect settings.json/plugin ownership to avoid double-firing")
 
+        self.check_canonical_rewrite()
+
         for rel in self.hook_files():
             src = self.repo / "claude" / rel
             dst = self.claude_dir / rel
             if not dst.is_file():
                 self.add("교정가능", rel, "missing", "run ccc-doctor --fix --apply --scope=files after backup to reinstall allowlisted harness files")
-            elif src.is_file() and not filecmp.cmp(src, dst, shallow=False):
+            elif src.is_file() and not self.installed_matches_source(src, dst):
                 self.add("교정가능", rel, "drifted", "run ccc-doctor --fix --apply --scope=files after backup to reinstall allowlisted harness files")
             else:
                 self.add("정상", rel, "installed", "none")
@@ -214,7 +313,7 @@ class Doctor:
             dst = self.claude_dir / rel
             if not dst.is_file():
                 self.add("교정가능", rel, "missing", "run ccc-doctor --fix --apply --scope=files after backup to reinstall output styles")
-            elif src.is_file() and not filecmp.cmp(src, dst, shallow=False):
+            elif src.is_file() and not self.installed_matches_source(src, dst):
                 self.add("교정가능", rel, "drifted", "run ccc-doctor --fix --apply --scope=files after backup to reinstall output styles")
             else:
                 self.add("정상", rel, "installed", "none")
@@ -839,7 +938,7 @@ class Doctor:
         for rel in groups:
             src = self.repo / "claude" / rel
             dst = self.claude_dir / rel
-            if not dst.is_file() or (src.is_file() and not filecmp.cmp(src, dst, shallow=False)):
+            if not dst.is_file() or (src.is_file() and not self.installed_matches_source(src, dst)):
                 out.append(rel)
         return out
 
@@ -909,11 +1008,10 @@ class Doctor:
             src = self.repo / "claude" / rel
             dst = self.claude_dir / rel
             dst.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(src, dst)
-            try:
-                shutil.copymode(src, dst)
-            except Exception:
-                pass
+            # Reinstall the way setup.sh installs — a plain copy would drop the
+            # canonical-path rewrite and point the repaired file at a checkout
+            # that does not exist on a non-canonical node.
+            self.install_source_file(src, dst)
         print(f"applied scoped file repair; backup={archive}; repaired={','.join(rels)}")
         return True
 
