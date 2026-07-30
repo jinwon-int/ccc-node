@@ -255,6 +255,83 @@ ok "legacy supervisor pile-up trips cap (ND-1236)" \
     '[ "$rc" = 4 ] && grep -q "MANUAL SWEEP" <<<"$out"'
 kill -KILL "$LEG1" "$LEG2" 2>/dev/null || true
 
+# ---- 11. tunnel-down controlled recovery (#810) ----------------------------
+# A supervisor up + tunnel DOWN is the ND-1236 stuck state.  Under --self-heal
+# the checker restarts it, but only after N down cycles, when the ssh target is
+# reachable, and outside the restart cooldown.  We mock ssh (reachability) and
+# point PIDFILE at a killable throwaway so the recovery's `$HARNESS stop` never
+# targets the test process.  setsid is already mocked (records invocations).
+cat > "$TMP/bin/ssh" <<'EOF'
+#!/usr/bin/env bash
+[[ "${A2A_TEST_SSH_OK:-0}" == "1" ]] && exit 0
+exit 255
+EOF
+chmod +x "$TMP/bin/ssh"
+
+STREAK_FILE="$A2A_SUPERVISOR_LOCK.tunnel_down_streak"
+TS_FILE="$A2A_SUPERVISOR_LOCK.tunnel_restart_ts"
+
+fresh_fake_sup() {          # spawn a killable sleep and register it as the supervisor
+    # Redirect the background sleep's fds off the command-substitution pipe, or
+    # $(fresh_fake_sup) would block until the sleep's stdout closes (3600s).
+    sleep 3600 </dev/null >/dev/null 2>&1 &
+    echo "$!" > "$PIDFILE"
+    printf '%s' "$!"
+}
+
+export A2A_TEST_CURL_OK=0   # tunnel DOWN for 11a–11e
+
+# 11a. streak below threshold → defer (rc=3), no respawn.
+rm -f "$STREAK_FILE" "$TS_FILE"; : > "$TMP/setsid-invocations.log"
+fake=$(fresh_fake_sup); export A2A_TEST_SSH_OK=1
+out="$(bash "$HEALTH" --env-file "$ENVF" --self-heal --tunnel-down-restart-after 3 $BIG_CAP 2>&1)"; rc=$?
+ok "tunnel-down below threshold defers (rc=3)" '[ "$rc" = 3 ] && grep -q "deferring restart" <<<"$out"'
+ok "deferral does not respawn (no setsid)" '[ ! -s "$TMP/setsid-invocations.log" ]'
+ok "deferral records streak=1" '[ "$(cat "$STREAK_FILE" 2>/dev/null)" = 1 ]'
+kill -KILL "$fake" 2>/dev/null || true
+
+# 11b. streak at threshold + reachable → controlled restart (rc=0, setsid).
+rm -f "$TS_FILE"; printf '2\n' > "$STREAK_FILE"; : > "$TMP/setsid-invocations.log"
+fake=$(fresh_fake_sup); export A2A_TEST_SSH_OK=1
+out="$(bash "$HEALTH" --env-file "$ENVF" --self-heal --tunnel-down-restart-after 3 $BIG_CAP 2>&1)"; rc=$?
+ok "tunnel-down at threshold + reachable restarts (rc=0)" '[ "$rc" = 0 ] && grep -q "restarted supervisor" <<<"$out"'
+ok "recovery respawns via setsid supervise" 'grep -q "setsid.*supervise" "$TMP/setsid-invocations.log"'
+ok "recovery clears the streak" '[ ! -f "$STREAK_FILE" ]'
+ok "recovery records a restart timestamp" '[ -s "$TS_FILE" ]'
+kill -KILL "$fake" 2>/dev/null || true
+
+# 11c. ssh target unreachable → never restart (rc=3), even past threshold.
+rm -f "$TS_FILE"; printf '5\n' > "$STREAK_FILE"; : > "$TMP/setsid-invocations.log"
+fake=$(fresh_fake_sup); export A2A_TEST_SSH_OK=0
+out="$(bash "$HEALTH" --env-file "$ENVF" --self-heal --tunnel-down-restart-after 3 $BIG_CAP 2>&1)"; rc=$?
+ok "unreachable target does not restart (rc=3)" '[ "$rc" = 3 ]'
+ok "unreachable → no setsid respawn" '[ ! -s "$TMP/setsid-invocations.log" ]'
+kill -KILL "$fake" 2>/dev/null || true
+
+# 11d. cooldown active → defer even past threshold + reachable.
+printf '9\n' > "$STREAK_FILE"; date +%s > "$TS_FILE"; : > "$TMP/setsid-invocations.log"
+fake=$(fresh_fake_sup); export A2A_TEST_SSH_OK=1
+out="$(bash "$HEALTH" --env-file "$ENVF" --self-heal --tunnel-down-restart-after 3 --tunnel-restart-cooldown 3600 $BIG_CAP 2>&1)"; rc=$?
+ok "restart cooldown defers restart (rc=3)" '[ "$rc" = 3 ] && grep -q "cooldown" <<<"$out"'
+ok "cooldown → no setsid respawn" '[ ! -s "$TMP/setsid-invocations.log" ]'
+kill -KILL "$fake" 2>/dev/null || true
+
+# 11e. --no-tunnel-recovery keeps the legacy rc=3 flag and writes no state.
+rm -f "$STREAK_FILE" "$TS_FILE"; : > "$TMP/setsid-invocations.log"
+fake=$(fresh_fake_sup); export A2A_TEST_SSH_OK=1
+out="$(bash "$HEALTH" --env-file "$ENVF" --self-heal --no-tunnel-recovery $BIG_CAP 2>&1)"; rc=$?
+ok "--no-tunnel-recovery flags rc=3 (legacy behavior)" '[ "$rc" = 3 ] && grep -q "self-heal cannot fix" <<<"$out"'
+ok "--no-tunnel-recovery writes no streak file" '[ ! -f "$STREAK_FILE" ]'
+kill -KILL "$fake" 2>/dev/null || true
+
+# 11f. tunnel UP clears a pending streak.
+printf '2\n' > "$STREAK_FILE"
+fake=$(fresh_fake_sup); export A2A_TEST_CURL_OK=1
+out="$(bash "$HEALTH" --env-file "$ENVF" --self-heal $BIG_CAP 2>&1)"; rc=$?
+ok "tunnel UP returns rc=0 and clears the streak" '[ "$rc" = 0 ] && [ ! -f "$STREAK_FILE" ]'
+kill -KILL "$fake" 2>/dev/null || true
+export A2A_TEST_CURL_OK=0
+
 echo "----"
 echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
