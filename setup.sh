@@ -502,29 +502,15 @@ if [ "$CLAUDE_DIR" != "/root/.claude" ] || [ "$SRC" != "/opt/ccc-node" ]; then
         rewrite_targets+=("$CLAUDE_DIR/$source_tree/${source_file#"$SRC/claude/$source_tree/"}")
       done < <(find "$SRC/claude/$source_tree" -type f -print0)
     done
+    # The transform itself lives in scripts/lib/canonical_paths.py because
+    # ccc-doctor must apply the IDENTICAL rewrite before comparing installed
+    # files against these templates. While this was an inline heredoc, doctor
+    # compared byte-exact and reported permanent phantom drift on every
+    # non-canonical node (2026-07-30 fleet sweep).
     for rewrite_file in "${rewrite_targets[@]}"; do
       [ -f "$rewrite_file" ] || continue
-      python3 - "$rewrite_file" "/opt/ccc-node" "$SRC" "/root/.claude" "$CLAUDE_DIR" <<'PY'
-import re
-import sys
-
-path = sys.argv[1]
-args = sys.argv[2:]
-pairs = {old: new for old, new in zip(args[0::2], args[1::2]) if old != new}
-if pairs:
-    # Single non-cascading pass: every occurrence in the ORIGINAL text is
-    # replaced exactly once and replacement values are never rescanned, so one
-    # pair's output cannot be corrupted by the other pair. Longest token first
-    # for deterministic behavior on overlapping prefixes.
-    pattern = re.compile(
-        "|".join(re.escape(tok) for tok in sorted(pairs, key=len, reverse=True))
-    )
-    with open(path, encoding="utf-8") as fh:
-        content = fh.read()
-    content = pattern.sub(lambda m: pairs[m.group(0)], content)
-    with open(path, "w", encoding="utf-8") as fh:
-        fh.write(content)
-PY
+      python3 "$SRC/scripts/lib/canonical_paths.py" "$rewrite_file" \
+        "/opt/ccc-node" "$SRC" "/root/.claude" "$CLAUDE_DIR"
     done
   fi
 fi
