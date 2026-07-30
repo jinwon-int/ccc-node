@@ -426,6 +426,7 @@ python3 - "$ROOT" <<'PY'
 import importlib.util
 import json
 from pathlib import Path
+import re
 import sys
 
 root = Path(sys.argv[1])
@@ -477,6 +478,44 @@ bounded = module.redact_for_owner(boundary, 900)
 assert bounded is not None and private_key not in bounded
 assert module._canonical_redaction.REDACTION_MARKER in bounded
 json.loads(json.dumps({"text": module.redact_for_owner("safe\0text")}))
+
+# Filesystem paths must survive the long-run catch-all. Masking them cost the
+# 2026-07-30 fleet-doctor sweep its only diagnostic field: the notification read
+# `DRIFT gongmyoung doctor_exit=1 [REDACTED_CREDENTIAL]`, where the marker had
+# eaten `runtime=/home/gongmyoung/ccc-node`.
+kept = (
+    "DRIFT gongmyoung doctor_exit=1 runtime=/home/gongmyoung/ccc-node",
+    "DRIFT gongyung doctor_exit=1 runtime=/data/data/com.termux/files/home/ccc-node",
+    "DRIFT yukson doctor_exit=1 runtime=/root/ccc-node",
+    "drifted: /root/.claude/hooks/lifecycle-feed.sh",
+    "OK seoseo (/opt/ccc-node)",
+)
+for raw in kept:
+    assert module.redact_for_owner(raw) == raw, raw
+
+# ...without turning the path exemption into a smuggling channel. The invariant:
+# no run of _OWNER_LONG_RUN_MIN+ token characters survives, and every preserved
+# path segment is shorter than that threshold on its own.
+threshold = module._OWNER_LONG_RUN_MIN
+masked = (
+    "K" * 30,                                   # plain long run
+    "/AbCdEfGhIjKlMnOpQrStUvWxYz012/x",         # slashes, but no allowlisted root
+    "https://api.example.com/v1/" + "T" * 30,   # URL path is not a filesystem root
+    "K" * 30 + "/root/ccc-node",                # blob adjacent to a real path
+    "/tmp/ghp_" + "A" * 22,                     # credential inside a path segment
+    "secret=/root/" + "C" * 20,                 # assignment wrapping a path
+    "/root/" + "D" * 20 + "==",                 # base64 padding breaks the segment
+    "/root/" + "E" * 30,                        # over-long leaf segment
+    "/root/" + "F" * 30 + "/x",                 # over-long segment mid-path
+    "backup=/root/.claude/backups/ccc-doctor-files-20260730-145600.tar.gz",
+)
+for raw in masked:
+    out = module.redact_for_owner(raw)
+    assert module._canonical_redaction.REDACTION_MARKER in out, raw
+    residue = out.replace(module._canonical_redaction.REDACTION_MARKER, " ")
+    longest = max((len(s) for s in re.findall(r"[A-Za-z0-9_.-]+", residue)), default=0)
+    assert longest < threshold, (raw, out, longest)
+    assert module.redact_for_owner(out) == out, raw
 PY
 rc=$?
 ok "owner redaction uses exact canonical source and preserves broader hardening" '[ "$rc" = 0 ]'

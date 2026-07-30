@@ -1078,8 +1078,65 @@ _OWNER_REDACTION_HARDENING = (
         r'(?i)\b(?:ghp|gho|ghu|ghs|github_pat|sk|xox[baprs])'
         r'-?[A-Za-z0-9_./+=-]{8,}'
     ),
-    re.compile(r'[A-Za-z0-9_./+=-]{24,}'),
 )
+
+# The catch-all: any long run of token-alphabet characters is masked. It stays a
+# fail-safe backstop for credential shapes nobody enumerated yet, but it is
+# applied through _mask_long_token_run so that filesystem paths inside the run
+# survive. Masking paths costs real diagnostics: the 2026-07-30 fleet-doctor
+# sweep reported `DRIFT gongmyoung doctor_exit=1 [REDACTED_CREDENTIAL]`, where
+# the marker had eaten `runtime=/home/gongmyoung/ccc-node` — the one field that
+# identified why those nodes differed. `runtime=/root/ccc-node` (22 chars)
+# survived only because it fell under the threshold, so the notification hid
+# exactly the non-canonical nodes it was reporting on.
+_OWNER_LONG_RUN_MIN = 24
+_OWNER_LONG_TOKEN_RUN = re.compile(r'[A-Za-z0-9_./+=-]{%d,}' % _OWNER_LONG_RUN_MIN)
+
+# Absolute paths anchored at a real filesystem root. Three constraints keep this
+# from becoming a smuggling channel:
+#   * the root allowlist — a base64/hex secret would have to begin with exactly
+#     `/root/`, `/home/`, `/data/` … to be preserved, rather than merely happening
+#     to contain slashes. A URL path (`/v1/<token>`) matches no root either.
+#   * `+` and `=` are excluded from segments: they are base64 alphabet/padding
+#     characters and never appear in these paths.
+#   * every segment must itself stay under the run threshold, and the lookahead
+#     forces the match to end on a separator so an over-long segment cannot be
+#     partially consumed to sneak under the bound. An over-long leaf therefore
+#     falls into the leftover stretch and is masked, keeping the directory
+#     structure (the diagnostic part) while masking the high-entropy leaf.
+# This yields the invariant worth reviewing against: no stretch of
+# _OWNER_LONG_RUN_MIN or more token-alphabet characters survives unmasked, and
+# every preserved path segment is shorter than that threshold on its own — so
+# nothing survives here that would not already survive as a standalone run.
+# If the root list goes stale the path is masked, not leaked; the failure
+# direction is safe. Add a root only when a node actually serves from one.
+_OWNER_SAFE_PATH = re.compile(
+    r'/(?:root|home|opt|data|usr|var|etc|tmp|srv|mnt|run|sbin|bin|lib64|lib'
+    r'|proc|sys|dev|media|boot)'
+    r'(?:/[A-Za-z0-9_.-]{1,%d}(?=/|$))+' % (_OWNER_LONG_RUN_MIN - 1)
+)
+
+
+def _mask_long_token_run(match, marker):
+    """Mask a long token run, preserving the filesystem paths it contains.
+
+    Every stretch that is not an allowlisted path is still masked whenever it
+    reaches the same length threshold the whole run had to reach, so this is no
+    weaker than masking the run outright except for the paths themselves. Short
+    leftovers (a `runtime=` key, a `dir=` prefix) pass through because a run that
+    short would never have been masked on its own.
+    """
+    run = match.group(0)
+    pieces = []
+    cursor = 0
+    for path in _OWNER_SAFE_PATH.finditer(run):
+        head = run[cursor:path.start()]
+        pieces.append(marker if len(head) >= _OWNER_LONG_RUN_MIN else head)
+        pieces.append(path.group(0))
+        cursor = path.end()
+    tail = run[cursor:]
+    pieces.append(marker if len(tail) >= _OWNER_LONG_RUN_MIN else tail)
+    return ''.join(pieces)
 
 
 def redact_for_owner(text, limit=1200):
@@ -1098,6 +1155,9 @@ def redact_for_owner(text, limit=1200):
         marker = _canonical_redaction.REDACTION_MARKER
         for pattern in _OWNER_REDACTION_HARDENING:
             redacted = pattern.sub(marker, redacted)
+        redacted = _OWNER_LONG_TOKEN_RUN.sub(
+            lambda m: _mask_long_token_run(m, marker), redacted
+        )
         # Defense in depth: canonical matches must never survive into a spool.
         if _canonical_redaction.contains_credential(redacted):
             redacted = marker
