@@ -160,6 +160,34 @@ current_supervisor_pid() {
     kill -0 "$pid" 2>/dev/null && printf '%s' "$pid" || return 0
 }
 
+# True on a Termux runtime.  Used to gate env sanitization so Linux CI and any
+# non-Termux fleet path are untouched.
+is_termux() { [[ -n "${TERMUX_VERSION:-}" || "${PREFIX:-}" == *com.termux* ]]; }
+
+# Scrub a poisoned environment before spawning glibc children (the tunnel ssh
+# and the worker node).  Some launch paths — a Claude/glibc session, a foreign
+# trigger, a bare manual invocation — leak an LD_LIBRARY_PATH pointing at glibc
+# libraries incompatible with Termux's bionic binaries.  Inheriting it crashes
+# the tunnel ssh (rc=139) and the worker node (rc=103) in a tight retry loop,
+# the recurring root cause behind Wiki ND-1236 (2026-07-04 / -07-17 / -07-30).
+# Historically this was scrubbed only in the Termux:Boot launcher and the health
+# cron, so every other launch path reintroduced the crash loop; scrub here so
+# supervise/run are robust regardless of caller env.  The Termux exec preload
+# MUST survive — dropping LD_PRELOAD entirely broke exec (rc=2) during the
+# 2026-07-17 remediation — so we re-assert it rather than clear it.  No-op off
+# Termux.
+sanitize_termux_env() {
+    is_termux || return 0
+    if [[ -n "${LD_LIBRARY_PATH:-}" ]]; then
+        log "sanitize env: clearing inherited LD_LIBRARY_PATH"
+        unset LD_LIBRARY_PATH
+    fi
+    local preload="${PREFIX:-}/lib/libtermux-exec-ld-preload.so"
+    if [[ -f "$preload" && ":${LD_PRELOAD:-}:" != *":$preload:"* ]]; then
+        export LD_PRELOAD="${LD_PRELOAD:+$LD_PRELOAD:}$preload"
+    fi
+}
+
 # ---- subcommands ----
 
 # The env-validation subcommands are pure delegations to the Python harness.
@@ -168,7 +196,7 @@ current_supervisor_pid() {
 # tests can substitute a bash mock via A2A_PYTHON_HARNESS.
 cmd_check()         { exec "$PYTHON_HARNESS" check         --env-file "$1"; }
 cmd_print_command() { exec "$PYTHON_HARNESS" print-command --env-file "$1"; }
-cmd_run()           { exec "$PYTHON_HARNESS" run           --env-file "$1"; }
+cmd_run()           { sanitize_termux_env; exec "$PYTHON_HARNESS" run --env-file "$1"; }
 
 # Internal helper for supervise: validate without exec-replacing our shell.
 validate_env() {
@@ -180,6 +208,10 @@ validate_env() {
 
 cmd_supervise() {
     local env_file="$1"
+    # Scrub a poisoned LD_LIBRARY_PATH before the Python validation and before
+    # spawning the tunnel ssh / worker node, both of which inherit this env
+    # (Wiki ND-1236 crash-loop root cause).
+    sanitize_termux_env
     validate_env "$env_file" || return 2
     local ssh_target
     ssh_target=$(extract_env_value A2A_TUNNEL_SSH_TARGET "$env_file")
