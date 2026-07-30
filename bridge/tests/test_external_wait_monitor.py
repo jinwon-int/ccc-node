@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -276,6 +277,54 @@ async def test_resume_is_skipped_when_session_moved_on(tmp_path: Path) -> None:
     assert recorder.resumes == []
     assert len(recorder.notifications) == 1
     assert "Continuing automatically." not in recorder.notifications[0][1]
+    # The skip must say so. The only previous signal was the absence of the
+    # "Continuing automatically." line, which reads like a wake that continued.
+    assert "NOT continued" in recorder.notifications[0][1]
+    assert "another session" in recorder.notifications[0][1]
+    # ...and it must be distinguishable in the ledger from a kept promise:
+    # wake.state is "done" either way because the notification was delivered.
+    record = registry.records()[0]
+    assert record["wake"]["state"] == "done"
+    assert record["wake"]["resumed"] is False
+    assert record["wake"]["skip_reason"] == "session_moved"
+    assert [rec["wait_id"] for rec in registry.dropped_promises()] == [record["wait_id"]]
+
+
+@pytest.mark.anyio
+async def test_resumed_promise_is_not_reported_as_dropped(tmp_path: Path) -> None:
+    """The same-session path is the control for the test above."""
+    clock = Clock()
+    registry = _registry(tmp_path, clock)
+    transport = FakeTransport([PrState("abc1234", "success")])
+    recorder = Recorder()
+    monitor = _monitor(registry, transport, recorder, clock)
+
+    await monitor._tick()
+    await monitor._tick()
+
+    assert len(recorder.resumes) == 1
+    record = registry.records()[0]
+    assert record["wake"]["state"] == "done"
+    assert record["wake"]["resumed"] is True
+    assert "skip_reason" not in record["wake"]
+    assert registry.dropped_promises() == []
+    assert "Continuing automatically." in recorder.notifications[0][1]
+
+
+@pytest.mark.anyio
+async def test_skip_reasons_are_named_per_path(tmp_path: Path) -> None:
+    clock = Clock()
+    registry = _registry(tmp_path, clock)
+    transport = FakeTransport([PrState("abc1234", "success")])
+    recorder = Recorder()
+    monitor = _monitor(registry, transport, recorder, clock, resume_daily_cap=0)
+
+    await monitor._tick()
+    await monitor._tick()
+
+    record = registry.records()[0]
+    assert record["wake"]["skip_reason"] == "daily_cap"
+    assert [rec["wait_id"] for rec in registry.dropped_promises()] == [record["wait_id"]]
 
 
 @pytest.mark.anyio
@@ -337,3 +386,76 @@ def test_notification_and_prompt_texts_are_body_free() -> None:
     assert "CI failed" in text and "abc1234d" in text
     prompt = resume_prompt_text(record)
     assert prompt.startswith("[external_event: github_pr_checks terminal=failure")
+
+
+@pytest.mark.anyio
+async def test_resume_turn_binds_the_canonical_conversation_session(tmp_path: Path) -> None:
+    """Regression (2026-07-30): the resume turn ran detached from the conversation.
+
+    bot.py's user-message path passes ``session_id`` from the session manager,
+    but the external-wait resume closure omitted it. The continuation therefore
+    ran under a fresh project-chat session, and ``publish_active_turn`` exported
+    that detached id — so any wait the resumed turn registered was bound to a
+    session the guard never sees, and its wake was skipped as "session moved
+    on" while the ledger still marked the wake done. Chained CI waits were
+    dropped structurally: PR #813 sat green and approved for ~3 hours.
+    """
+    from telegram_bot.core import bot_lifecycle
+
+    calls: list[dict] = []
+
+    class FakeProjectChat:
+        async def process_message(self, prompt, user_id, chat_id, **kwargs):
+            calls.append({"prompt": prompt, "user_id": user_id, **kwargs})
+            return type("R", (), {"success": True, "content": "done"})()
+
+    class FakeBot:
+        async def send_message(self, chat_id: int, text: str) -> None:
+            return None
+
+    lifecycle = bot_lifecycle.BotLifecycleMixin()
+    lifecycle._config = SimpleNamespace(  # type: ignore[assignment]
+        bot_data_dir=tmp_path, project_root=str(tmp_path)
+    )
+    lifecycle._session_manager = SimpleNamespace(  # type: ignore[assignment]
+        get_session=lambda user_id: _session_of({"session_id": "canonical-session"})
+    )
+    lifecycle._project_chat = FakeProjectChat()  # type: ignore[assignment]
+    lifecycle.application = SimpleNamespace(bot=FakeBot())
+
+    monitor = lifecycle._build_external_wait_monitor()
+    assert monitor is not None
+
+    record = {
+        "wait_id": "w1",
+        "user_id": 7,
+        "chat_id": 70,
+        "session_id": "canonical-session",
+        "repo": "jinwon-int/ccc-node",
+        "pr_number": 813,
+        "head_sha": "abc1234",
+        "terminal_status": TERMINAL_SUCCESS,
+        "summary": "squash-merge when green",
+    }
+    resumed, skip_reason = await monitor._maybe_resume(record)
+
+    assert resumed is True and skip_reason is None
+    assert len(calls) == 1
+    # The whole point: the continuation is bound to the conversation, so a wait
+    # registered inside it records an id the guard will still recognize.
+    assert calls[0]["session_id"] == "canonical-session"
+
+
+def test_skipped_notification_names_the_reason() -> None:
+    record = {
+        "terminal_status": TERMINAL_SUCCESS,
+        "repo": "jinwon-int/ccc-node",
+        "pr_number": 813,
+        "head_sha": "abc1234def",
+        "summary": "squash-merge when green",
+    }
+    text = wake_notification_text(record, resumed=False, skip_reason="session_moved")
+    assert "NOT continued" in text and "another session" in text
+    assert "Continuing automatically." not in text
+    unknown = wake_notification_text(record, resumed=False, skip_reason="something-new")
+    assert "NOT continued" in unknown

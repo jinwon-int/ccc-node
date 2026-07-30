@@ -1168,11 +1168,30 @@ class BotLifecycleMixin:
                 return False
 
         async def resume(record, prompt: str) -> bool:
+            # Bind the continuation to the conversation's canonical session, the
+            # way the user-message path does (bot.py passes session_id from the
+            # session manager). Omitting it ran the resume under a detached
+            # project-chat session, and #740's own session guard then discarded
+            # anything that turn promised: a wait registered inside a resumed
+            # turn recorded the detached id, so its wake was skipped as "session
+            # moved on" and the ledger still marked the wake done. Chained CI
+            # waits were therefore dropped structurally, not occasionally
+            # (2026-07-30, PR #813 sat green and approved for ~3h).
+            session_id = record.get("session_id")
+            try:
+                current = await self._session_manager.get_session(int(record["user_id"]))
+                session_id = (current or {}).get("session_id") or session_id
+            except Exception:
+                logger.warning(
+                    "External-wait resume session lookup failed; using registered id: wait=%s",
+                    record.get("wait_id"),
+                )
             try:
                 response = await self._project_chat.process_message(
                     prompt,
                     int(record["user_id"]),
                     int(record["chat_id"]),
+                    session_id=session_id,
                     notification_bot=application.bot,
                     usage_mode=MODE_AUTONOMOUS,
                 )

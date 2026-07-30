@@ -14,6 +14,18 @@ trap 'rm -rf "$TMP"' EXIT
 
 ok() { if eval "$2"; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $1"; fi; }
 
+# Apply setup.sh's canonical-path rewrite to a fixture's installed hook and
+# output-style trees, through the same module setup.sh and doctor both use.
+# Scoped to the trees doctor compares file-for-file; settings.json has its own
+# JSON-semantic checks and is left as the templates produced it.
+rewrite_installed() { # <fixture-dir>
+  local dir="$1" f
+  while IFS= read -r -d '' f; do
+    python3 "$ROOT/scripts/lib/canonical_paths.py" "$f" \
+      "/opt/ccc-node" "$dir/repo" "/root/.claude" "$dir/home/.claude"
+  done < <(find "$dir/home/.claude/hooks" "$dir/home/.claude/output-styles" -type f -print0)
+}
+
 make_fixture() { # <name> <mode:standalone|plugin>
   local name="$1" mode="$2" dir
   dir="$TMP/$name"
@@ -35,6 +47,14 @@ make_fixture() { # <name> <mode:standalone|plugin>
   done < <(ccc_hook_tree_files "$ROOT")
   cp "$ROOT/claude/output-styles/ccc-report.md" "$dir/repo/claude/output-styles/ccc-report.md"
   cp "$ROOT/claude/output-styles/ccc-report.md" "$dir/home/.claude/output-styles/ccc-report.md"
+  # Mirror setup.sh's canonical-path rewrite on the INSTALLED side. Every fixture
+  # is a non-canonical install (repo and harness dir live under $TMP), so without
+  # this the fixture models an install no node actually has: templates carrying
+  # /opt/ccc-node copied in verbatim. Doctor treats such a file as drifted, which
+  # is exactly right — the phantom-drift fleet sweep (2026-07-30) came from doctor
+  # NOT knowing about this rewrite, and the fixture must exercise the rewritten
+  # comparison path rather than only the byte-exact one.
+  rewrite_installed "$dir"
   printf '#!/usr/bin/env bash\n[ "$1" = "--status" ] || [ "$3" = "--status" ] || true\necho bridge status ok\n' > "$dir/repo/bridge/start.sh"
   chmod +x "$dir/repo/bridge/start.sh"
   if [ "$mode" = standalone ]; then
@@ -105,6 +125,28 @@ ok "clean standalone exits 0" '[ "$rc" = 0 ]'
 ok "clean output reports 정상" 'grep -q "정상" <<<"$out"'
 ok "clean output reports standalone mode" 'grep -q "mode.*standalone" <<<"$out"'
 ok "clean output reports harness version" 'grep -q "harness version" <<<"$out"'
+
+# Phantom-drift regression (2026-07-30 fleet sweep). Five correctly installed
+# nodes — yukson, gwakga, gongmyoung, gongyung, daegyo — reported 교정가능 for
+# hooks/distill.sh and hooks/lifecycle-feed.sh purely because their checkout is
+# not /opt/ccc-node, so the installed copies legitimately differ from the
+# templates. Doctor must compare through setup.sh's rewrite, and must say that it
+# did rather than applying it invisibly.
+canon="$(make_fixture canonical standalone)"
+out="$(run_doctor "$canon")"; rc=$?
+ok "non-canonical install reports no drift for templates carrying canonical paths" \
+  '[ "$rc" = 0 ] && ! grep -qE "교정가능.*(lifecycle-feed|distill)\.sh" <<<"$out"'
+ok "report names the canonical path rewrite it compared through" \
+  'grep -q "canonical path rewrite" <<<"$out" && grep -Fq "/opt/ccc-node -> $canon/repo" <<<"$out"'
+ok "installed hook keeps this node's real checkout path" \
+  'grep -Fq "$canon/repo/bridge/venv/bin/python" "$canon/home/.claude/hooks/lifecycle-feed.sh"'
+
+# ...and the rewrite must not blind doctor to real drift in the same files.
+real_drift="$(make_fixture real-drift standalone)"
+printf '# unreviewed local edit\n' >> "$real_drift/home/.claude/hooks/lifecycle-feed.sh"
+out="$(run_doctor "$real_drift")"; rc=$?
+ok "real drift in a rewritten hook is still caught" \
+  '[ "$rc" = 1 ] && grep -q "교정가능.*lifecycle-feed.sh" <<<"$out"'
 
 plugin="$(make_fixture plugin plugin)"
 out="$(run_doctor "$plugin")"; rc=$?
@@ -191,6 +233,21 @@ backup_count_before="$(find "$files/home/.claude/backups" -name "ccc-doctor-file
 out="$(run_doctor "$files" --fix --apply --scope=files 2>&1)"; rc=$?
 backup_count_after="$(find "$files/home/.claude/backups" -name "ccc-doctor-files-*.tar.gz" | wc -l)"
 ok "file repair is idempotent" '[ "$rc" = 0 ] && [ "$backup_count_before" = "$backup_count_after" ] && grep -q "no repairs needed" <<<"$out"'
+
+# Repair must reinstall the way setup.sh installs. A plain copyfile restores the
+# canonical template, pointing the hook at /opt/ccc-node — a path that does not
+# exist on a /root/ccc-node or Termux node — so doctor's own printed action would
+# break the node it just diagnosed.
+rewrite_repair="$(make_fixture rewrite-repair standalone)"
+printf 'clobbered\n' > "$rewrite_repair/home/.claude/hooks/lifecycle-feed.sh"
+out="$(run_doctor "$rewrite_repair" --fix --apply --scope=files 2>&1)"; rc=$?
+ok "file repair reinstalls with the canonical-path rewrite applied" \
+  '[ "$rc" = 0 ] && grep -Fq "$rewrite_repair/repo/bridge/venv/bin/python" "$rewrite_repair/home/.claude/hooks/lifecycle-feed.sh"'
+ok "repaired hook carries no unrewritten canonical checkout path" \
+  '! grep -Fq "/opt/ccc-node/bridge/venv/bin/python" "$rewrite_repair/home/.claude/hooks/lifecycle-feed.sh"'
+out="$(run_doctor "$rewrite_repair")"; rc=$?
+ok "repaired rewritten hook is clean on the next run" \
+  '[ "$rc" = 0 ] && grep -q "교정가능: 0" <<<"$out"'
 
 symlink="$(make_fixture symlink standalone)"
 rm -f "$symlink/home/.claude/hooks/statusline.sh"
