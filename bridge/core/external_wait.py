@@ -334,15 +334,39 @@ class ExternalWaitRegistry:
             if isinstance(rec.get("wake"), dict) and rec["wake"].get("state") == "pending"
         ]
 
-    def mark_wake(self, wait_id: str, *, delivered: bool) -> None:
-        """Record one wake outcome; retry-bounded, purges only the journal."""
+    def mark_wake(
+        self,
+        wait_id: str,
+        *,
+        delivered: bool,
+        resumed: Optional[bool] = None,
+        skip_reason: Optional[str] = None,
+    ) -> None:
+        """Record one wake outcome; retry-bounded, purges only the journal.
+
+        ``delivered`` is about the notification. ``resumed``/``skip_reason`` are
+        about the promise: a wake whose notification landed but whose
+        continuation was skipped used to be indistinguishable from a fulfilled
+        one (both ``wake.state == "done"``), so a dropped promise left no trace
+        for the owner or for a later drain. Recording them separately is what
+        makes ``dropped_promises`` possible.
+        """
 
         def _do(records):
             rec = records.get(wait_id)
             if rec is None or not isinstance(rec.get("wake"), dict):
                 return
+            outcome: Dict[str, Any] = {}
+            if resumed is not None:
+                outcome["resumed"] = bool(resumed)
+            if skip_reason:
+                outcome["skip_reason"] = str(skip_reason)[:64]
             if delivered:
-                rec["wake"] = {"state": "done", "attempts": int(rec["wake"].get("attempts") or 0)}
+                rec["wake"] = {
+                    "state": "done",
+                    "attempts": int(rec["wake"].get("attempts") or 0),
+                    **outcome,
+                }
             else:
                 attempts = int(rec["wake"].get("attempts") or 0) + 1
                 if attempts >= MAX_WAKE_ATTEMPTS:
@@ -351,12 +375,31 @@ class ExternalWaitRegistry:
                         attempts,
                         wait_id,
                     )
-                    rec["wake"] = {"state": "failed", "attempts": attempts}
+                    rec["wake"] = {"state": "failed", "attempts": attempts, **outcome}
                 else:
-                    rec["wake"] = {"state": "pending", "attempts": attempts}
+                    rec["wake"] = {"state": "pending", "attempts": attempts, **outcome}
             rec["updated_at"] = _utc_now_iso()
 
         self._mutate(_do)
+
+    def dropped_promises(self) -> List[Dict[str, Any]]:
+        """Terminal records whose wake landed but whose promise never continued.
+
+        A promise is dropped when the notification was delivered (``wake.state``
+        is ``done``) while the continuation did not run. These are the ones an
+        owner still has to act on by hand, so they must be enumerable rather
+        than merely inferable from a missing notification line.
+        """
+        with self._lock:
+            records = self._read()
+        out = []
+        for rec in records.values():
+            wake = rec.get("wake")
+            if not isinstance(wake, dict) or wake.get("state") != "done":
+                continue
+            if wake.get("resumed") is False:
+                out.append(rec)
+        return out
 
     # --- startup / introspection ---------------------------------------------------
     def reconcile_on_start(self, *, now: Optional[float] = None) -> int:
