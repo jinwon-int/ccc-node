@@ -148,6 +148,11 @@ def _cmd_list(home: Path) -> int:
                     "head_sha": str(rec.get("head_sha") or "")[:8],
                     "state": rec.get("state"),
                     "summary": rec.get("summary") or "",
+                    # Whether the promise actually continued, not just whether
+                    # the notification landed: a terminal wait with
+                    # resumed=false is still owed an action by the owner.
+                    "resumed": (rec.get("wake") or {}).get("resumed"),
+                    "skip_reason": (rec.get("wake") or {}).get("skip_reason"),
                 }
                 for rec in sorted(records, key=lambda r: str(r.get("created_at") or ""))
             ],

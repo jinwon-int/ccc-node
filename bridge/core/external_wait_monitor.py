@@ -157,8 +157,25 @@ _WAKE_HEADLINE = {
 }
 
 
-def wake_notification_text(record: Dict[str, Any], *, resumed: bool) -> str:
-    """Bounded, body-free owner notification for one terminal wait."""
+_SKIP_REASON_TEXT = {
+    "session_moved": "the conversation moved to another session",
+    "daily_cap": "the daily auto-resume cap is used up",
+    "resume_disabled": "auto-resume is switched off",
+    "non_terminal_rollup": "the result says nothing about the watched CI",
+    "no_promise_recorded": "no next step was recorded",
+    "resume_failed": "the continuation turn did not run",
+}
+
+
+def wake_notification_text(
+    record: Dict[str, Any], *, resumed: bool, skip_reason: Optional[str] = None
+) -> str:
+    """Bounded, body-free owner notification for one terminal wait.
+
+    A skipped continuation states itself. Previously the only signal was the
+    *absence* of "Continuing automatically.", which reads exactly like a wake
+    that did continue — so a dropped promise looked like a kept one.
+    """
     headline = _WAKE_HEADLINE.get(record.get("terminal_status"), "ℹ️ CI watch ended")
     ref = f"{record.get('repo')}#{record.get('pr_number')} @ {str(record.get('head_sha') or '')[:8]}"
     lines = [f"{headline} — {ref}"]
@@ -167,6 +184,9 @@ def wake_notification_text(record: Dict[str, Any], *, resumed: bool) -> str:
         lines.append(f"Next: {summary}")
     if resumed:
         lines.append("Continuing automatically.")
+    else:
+        why = _SKIP_REASON_TEXT.get(skip_reason or "", "auto-resume did not run")
+        lines.append(f"NOT continued — {why}. Reply to continue.")
     return "\n".join(lines)
 
 
@@ -305,20 +325,31 @@ class ExternalWaitMonitor:
     # -- wake delivery -------------------------------------------------------------
     async def _deliver_wake(self, record: Dict[str, Any]) -> None:
         wait_id = record["wait_id"]
-        resumed = await self._maybe_resume(record)
+        resumed, skip_reason = await self._maybe_resume(record)
         try:
             delivered = await self._notifier(
                 int(record["chat_id"]),
-                wake_notification_text(record, resumed=resumed),
+                wake_notification_text(record, resumed=resumed, skip_reason=skip_reason),
             )
         except Exception:
             logger.warning("External-wait notifier raised: wait=%s", wait_id)
             delivered = False
-        self._registry.mark_wake(wait_id, delivered=bool(delivered))
+        self._registry.mark_wake(
+            wait_id,
+            delivered=bool(delivered),
+            resumed=bool(resumed),
+            skip_reason=skip_reason,
+        )
 
-    async def _maybe_resume(self, record: Dict[str, Any]) -> bool:
+    async def _maybe_resume(self, record: Dict[str, Any]) -> tuple[bool, Optional[str]]:
+        """(resumed, skip_reason). The reason is what the owner has to act on.
+
+        Every non-resuming path names itself: a silently-False return made a
+        dropped promise look the same as a fulfilled one in both the ledger and
+        the notification (#740 follow-up, 2026-07-30).
+        """
         if not self._resume_enabled or self._resumer is None:
-            return False
+            return False, "resume_disabled"
         # Only a genuine terminal rollup continues the promised next step:
         # a superseded head, an expired watch, or a GitHub read failure says
         # nothing about the watched CI, so the owner decides instead (#740).
@@ -327,14 +358,14 @@ class ExternalWaitMonitor:
             TERMINAL_FAILURE,
             TERMINAL_CANCELLED,
         }:
-            return False
+            return False, "non_terminal_rollup"
         summary = str(record.get("summary") or "").strip()
         if not summary:
-            return False  # no promised next step was recorded
+            return False, "no_promise_recorded"  # nothing was promised
         day = time.strftime("%Y-%m-%d", time.gmtime(self._clock()))
         if not self._resume_budget_ok(day):
             logger.warning("External-wait resume daily cap reached; notification only")
-            return False
+            return False, "daily_cap"
         registered_session = record.get("session_id")
         if registered_session and self._session_lookup is not None:
             try:
@@ -348,7 +379,7 @@ class ExternalWaitMonitor:
                     "External-wait resume skipped (session moved on): wait=%s",
                     record["wait_id"],
                 )
-                return False
+                return False, "session_moved"
         try:
             resumed = await self._resumer(record, resume_prompt_text(record))
         except Exception:
@@ -356,7 +387,8 @@ class ExternalWaitMonitor:
             resumed = False
         if resumed:
             self._resume_count += 1
-        return bool(resumed)
+            return True, None
+        return False, "resume_failed"
 
 
 __all__ = [
