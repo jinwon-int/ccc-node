@@ -308,11 +308,38 @@ installed_render_inputs() {
     RECONCILE_PROXY_URL="$http_proxy"
 }
 
+is_canonical_unit_topology() {
+    if [ -L "$SYSTEMD_UNIT_FILE" ]; then
+        echo "⚠️  Existing unit path is a symlink and is treated as noncanonical/bespoke; left untouched: $SYSTEMD_UNIT_FILE" >&2
+        echo "    Normalize the main-unit path explicitly and keep node-local overrides in $SYSTEMD_UNIT_FILE.d/*.conf drop-ins." >&2
+        return 1
+    fi
+
+    local link_count
+    if ! link_count="$(stat -c '%h' -- "$SYSTEMD_UNIT_FILE" 2>/dev/null)" \
+       || ! [[ "$link_count" =~ ^[1-9][0-9]*$ ]]; then
+        echo "❌ Cannot trust link-count metadata for the existing unit; left untouched: $SYSTEMD_UNIT_FILE" >&2
+        return 2
+    fi
+    if [ "$link_count" != "1" ]; then
+        echo "⚠️  Existing unit has $link_count hard links and is treated as noncanonical/bespoke; left untouched: $SYSTEMD_UNIT_FILE" >&2
+        echo "    Normalize the main-unit path explicitly and keep node-local overrides in $SYSTEMD_UNIT_FILE.d/*.conf drop-ins." >&2
+        return 1
+    fi
+}
+
 do_reconcile_systemd() {
     systemd_paths
     if [ ! -f "$SYSTEMD_UNIT_FILE" ]; then
         echo "⚪ systemd unit not installed; reconciliation skipped: $SYSTEMD_UNIT_FILE"
         exit 0
+    fi
+    is_canonical_unit_topology
+    local topology_status=$?
+    if [ "$topology_status" = "1" ]; then
+        exit 0
+    elif [ "$topology_status" != "0" ]; then
+        exit 1
     fi
     if ! is_supported_generated_unit || ! installed_render_inputs; then
         echo "⚠️  Existing unit is not a recognized ccc-generated main unit; left untouched: $SYSTEMD_UNIT_FILE" >&2
