@@ -167,6 +167,50 @@ ok "bespoke skip does not contact systemctl" '[ ! -s "$SC_CALLS" ]'
 sed -i '/^Environment=CCC_TELEGRAM_READABLE_RENDERER=true$/d' "$UNIT"
 sed -i 's/^Restart=on-failure$/Restart=always/' "$UNIT"
 
+# Noncanonical filesystem topology is never normalized implicitly. A symlinked
+# main unit keeps both its directory entry and target intact.
+SYMLINK_SD="$TMP/symlink-sd"
+SYMLINK_TARGET="$TMP/symlink-target.service"
+mkdir -p "$SYMLINK_SD"
+cp "$UNIT" "$SYMLINK_TARGET"
+sed -i 's/^Restart=always$/Restart=on-failure/' "$SYMLINK_TARGET"
+SYMLINK_UNIT="$SYMLINK_SD/ccc-telegram-bridge.service"
+ln -s "$SYMLINK_TARGET" "$SYMLINK_UNIT"
+symlink_inode_before="$(stat -c %i "$SYMLINK_UNIT")"
+symlink_target_before="$(readlink "$SYMLINK_UNIT")"
+symlink_bytes_before="$(sha256sum "$SYMLINK_TARGET")"
+: > "$SC_CALLS"
+run env HOME="$FH" CCC_SYSTEMD_DIR="$SYMLINK_SD" CCC_SYSTEMCTL="$SC_STUB" \
+    bash "$SSD" reconcile
+okc "$RC" 0 "symlinked systemd main unit is a bounded skip"
+ok "symlink reconcile preserves link identity and target bytes" \
+   '[ -L "$SYMLINK_UNIT" ] && [ "$(stat -c %i "$SYMLINK_UNIT")" = "$symlink_inode_before" ] && [ "$(readlink "$SYMLINK_UNIT")" = "$symlink_target_before" ] && [ "$(sha256sum "$SYMLINK_TARGET")" = "$symlink_bytes_before" ]'
+ok "symlink skip directs explicit normalization and drop-ins" \
+   'grep -q "Normalize the main-unit path explicitly" "$OUT" && grep -q "drop-ins" "$OUT"'
+ok "symlink skip does not contact systemctl" '[ ! -s "$SC_CALLS" ]'
+
+# A multiply hard-linked main unit likewise keeps all names, bytes, and link
+# metadata intact instead of severing the topology with an atomic replacement.
+HARDLINK_SD="$TMP/hardlink-sd"
+HARDLINK_PEER="$TMP/hardlink-peer.service"
+mkdir -p "$HARDLINK_SD"
+cp "$UNIT" "$HARDLINK_PEER"
+sed -i 's/^Restart=always$/Restart=on-failure/' "$HARDLINK_PEER"
+HARDLINK_UNIT="$HARDLINK_SD/ccc-telegram-bridge.service"
+ln "$HARDLINK_PEER" "$HARDLINK_UNIT"
+hardlink_inode_before="$(stat -c %i "$HARDLINK_UNIT")"
+hardlink_count_before="$(stat -c %h "$HARDLINK_UNIT")"
+hardlink_bytes_before="$(sha256sum "$HARDLINK_UNIT" | cut -d' ' -f1)"
+: > "$SC_CALLS"
+run env HOME="$FH" CCC_SYSTEMD_DIR="$HARDLINK_SD" CCC_SYSTEMCTL="$SC_STUB" \
+    bash "$SSD" reconcile
+okc "$RC" 0 "multiply hard-linked systemd main unit is a bounded skip"
+ok "hard-link reconcile preserves bytes, identity, and link count" \
+   '[ "$(sha256sum "$HARDLINK_UNIT" | cut -d" " -f1)" = "$hardlink_bytes_before" ] && [ "$(sha256sum "$HARDLINK_PEER" | cut -d" " -f1)" = "$hardlink_bytes_before" ] && [ "$(stat -c %i "$HARDLINK_UNIT")" = "$hardlink_inode_before" ] && [ "$(stat -c %i "$HARDLINK_PEER")" = "$hardlink_inode_before" ] && [ "$(stat -c %h "$HARDLINK_UNIT")" = "$hardlink_count_before" ]'
+ok "hard-link skip directs explicit normalization and drop-ins" \
+   'grep -q "Normalize the main-unit path explicitly" "$OUT" && grep -q "drop-ins" "$OUT"'
+ok "hard-link skip does not contact systemctl" '[ ! -s "$SC_CALLS" ]'
+
 # User scope uses the user target and --user daemon-reload, while retaining the
 # same state-preserving reconciliation behavior. The scope override is accepted
 # only alongside the hermetic directory seam.
