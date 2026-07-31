@@ -895,6 +895,86 @@ async def test_claude_adapter_approvals_use_the_generation_gated_callback(
 
 
 @pytest.mark.anyio
+async def test_repeated_approvals_fail_closed_on_generation_change_then_recover(
+    tmp_path: Path,
+) -> None:
+    """#804: generation revocation is exact to one conversation and one turn."""
+
+    first_request = ApprovalRequestEvent(
+        "approval-early", "Bash", {"command": "same-command"}, "run command"
+    )
+    late_request = ApprovalRequestEvent(
+        "approval-late", "Bash", {"command": "same-command"}, "run command"
+    )
+
+    class RevokingSession(FakeSession):
+        def __init__(self) -> None:
+            super().__init__("claude-first")
+            self.revoke = lambda: None
+
+        def send_turn(
+            self,
+            message: str,
+            *,
+            approval_handler: ApprovalHandler = deny_approval,
+        ) -> AsyncIterator[AgentEvent]:
+            async def stream() -> AsyncIterator[AgentEvent]:
+                self.messages.append(message)
+                self.approvals.append(await approval_handler(first_request))
+                yield first_request
+                self.revoke()
+                self.approvals.append(await approval_handler(late_request))
+                yield late_request
+                yield TextDeltaEvent("first done")
+                yield CompletionEvent("end_turn")
+
+            return stream()
+
+    first = RevokingSession()
+    recovered_request = ApprovalRequestEvent(
+        "approval-recovered", "Bash", {"command": "same-command"}, "run command"
+    )
+    recovered = FakeSession(
+        "claude-second",
+        [recovered_request, TextDeltaEvent("second done"), CompletionEvent("end_turn")],
+    )
+    handler = ProjectChatHandler(
+        settings=_settings(tmp_path, provider="claude"),
+        agent_runtime=FakeRuntime([first, recovered]),
+    )
+    handler._task_ledger_cache = False
+    generations: list[int] = []
+
+    async def approve(chat_id, user_id, event, generation):
+        assert (chat_id, user_id) == (70, 7)
+        assert not handler.is_agent_approval_active(7, 71, generation)
+        generations.append(generation)
+        return ApprovalDecision.ALLOW
+
+    first.revoke = lambda: handler.invalidate_agent_approvals(7, 70)
+    first_response = await handler.process_message(
+        "first", 7, 70, approval_callback=approve
+    )
+    second_response = await handler.process_message(
+        "second",
+        7,
+        70,
+        new_session=True,
+        approval_callback=approve,
+    )
+
+    assert first_response.success is True
+    assert first.approvals == [ApprovalDecision.ALLOW, ApprovalDecision.DENY]
+    assert second_response.success is True
+    assert recovered.approvals == [ApprovalDecision.ALLOW]
+    # The rejected callback never reaches the owner callback, and the next
+    # turn receives a fresh generation above the invalidation high-water mark.
+    assert len(generations) == 2
+    assert generations[1] > generations[0]
+    assert not handler.is_agent_approval_active(7, 70, generations[0])
+
+
+@pytest.mark.anyio
 async def test_claude_adapter_meters_request_and_result_tokens(tmp_path: Path) -> None:
     session = FakeSession(
         "claude-usage",

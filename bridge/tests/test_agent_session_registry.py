@@ -144,3 +144,20 @@ def test_idle_clear_preserves_generation_and_refuses_active_owner() -> None:
     assert len(registry.clear_cached_if_idle() or ()) == 1
     assert registry.get_cached(key) is None
     assert registry.generation_high_water(key) == token.generation
+
+
+def test_terminal_drain_snapshot_revokes_approval_without_rebinding_owner() -> None:
+    registry = AgentSessionRegistry()
+    key = (7, 70)
+    session = object()
+    token = registry.register_active(key, session, started_at=1.0)
+
+    handles = registry.prepare_close()
+
+    assert len(handles) == 1
+    assert handles[0].token == token
+    assert handles[0].session is session
+    assert not registry.approval_is_active(key, token.generation)
+    # Teardown still owns the exact active handle; a future turn cannot acquire
+    # this generation or inherit its revoked approval route.
+    assert registry.active_handle_if_same(token) == handles[0]

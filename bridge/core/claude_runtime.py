@@ -110,6 +110,15 @@ _BACKGROUND_TASK_FINISHED = re.compile(
     r"</task-notification>",
     re.IGNORECASE | re.DOTALL,
 )
+# The locked Agent SDK uses the same narrow set to distinguish a result that
+# ends one model turn from a result that ends the whole delegated run.  Shells,
+# monitors, teammates, and remote agents may be intentionally long-lived and
+# must not keep an interactive request open forever.
+_RESULT_DEFERRING_TASK_TYPES = frozenset({"local_agent", "local_workflow"})
+_TERMINAL_TASK_STATUSES = frozenset({"completed", "failed", "stopped", "killed"})
+_NO_ACTIVE_APPROVAL_ROUTE = (
+    "No active turn accepts approval requests; start a new user turn and retry"
+)
 
 # The Claude CLI resolves these aliases itself; the bridge's /model surface is
 # the same static curated set (model_discovery stays a curated list until the
@@ -160,6 +169,7 @@ def _default_sdk_client_factory(options: ClaudeAgentOptions) -> SdkClient:
 class _ActiveTurn:
     queue: asyncio.Queue[AgentEvent]
     approval_handler: ApprovalHandler
+    generation: int
     finished: bool = False
     interrupt_requested: bool = False
     # Whether assistant text has been emitted since the last message boundary,
@@ -171,6 +181,11 @@ class _ActiveTurn:
     # tool_call_id -> tool_name for started-but-not-completed tools, so the
     # completion event can carry the same name the start event declared.
     open_tools: dict[str, str] = field(default_factory=dict)
+    # The Claude SDK can emit an intermediate ResultMessage while delegated
+    # local work is still running.  Keep the exact turn/generation alive until
+    # those tasks settle and their continuation emits the run-ending result.
+    result_deferring_tasks: set[str] = field(default_factory=set)
+    completion_deferral_observed: bool = False
 
 
 class ClaudeSession:
@@ -185,6 +200,7 @@ class ClaudeSession:
         self._close_task: asyncio.Task[None] | None = None
         self._turn_lock: asyncio.Lock | None = None
         self._active_turn: _ActiveTurn | None = None
+        self._turn_generation = 0
         self._approval_counter = 0
         self._closed = False
         # Between-turns ("unsolicited") frame state (inherited from the
@@ -389,7 +405,12 @@ class ClaudeSession:
                 if self._closed:
                     raise RuntimeError("Claude session is closed")
                 self._runtime._turn_owners[self.session_id] = self
-                active = _ActiveTurn(asyncio.Queue(), approval_handler)
+                self._turn_generation += 1
+                active = _ActiveTurn(
+                    asyncio.Queue(),
+                    approval_handler,
+                    self._turn_generation,
+                )
                 self._active_turn = active
                 queried = False
                 try:
@@ -503,6 +524,8 @@ class ClaudeSession:
         self._observe_session_id(message)
         self._observe_background_task_notifications(message)
         active = self._active_turn
+        if active is not None and not active.finished:
+            self._observe_result_deferring_task(active, message)
         if self._unsolicited_inflight or active is None or active.finished:
             # Same ownership rule as the direct reader loop
             # (``unsolicited_inflight or not state.pending``): a turn-bearing
@@ -520,7 +543,41 @@ class ClaudeSession:
             if message.parent_tool_use_id is None:
                 self._route_tool_results(active, message)
         elif isinstance(message, ResultMessage):
-            self._complete_turn(active, message)
+            if active.result_deferring_tasks:
+                # Body-free observability: task count is enough to explain why
+                # the apparent terminal frame did not revoke approval routing;
+                # emit at most once for the whole run.
+                if not active.completion_deferral_observed:
+                    active.completion_deferral_observed = True
+                    logger.info(
+                        "Deferring Claude run completion while %d delegated task(s) remain",
+                        len(active.result_deferring_tasks),
+                    )
+            else:
+                self._complete_turn(active, message)
+
+    @staticmethod
+    def _observe_result_deferring_task(active: _ActiveTurn, message: Message) -> None:
+        """Mirror the Agent SDK's run-boundary task ledger without task bodies."""
+
+        if not isinstance(message, SystemMessage):
+            return
+        data = message.data
+        task_id = data.get("task_id")
+        if not isinstance(task_id, str) or not task_id:
+            return
+        if message.subtype == "task_started":
+            if data.get("task_type") in _RESULT_DEFERRING_TASK_TYPES:
+                active.result_deferring_tasks.add(task_id)
+            return
+        if message.subtype == "task_notification":
+            active.result_deferring_tasks.discard(task_id)
+            return
+        if message.subtype == "task_updated":
+            patch = data.get("patch")
+            status = patch.get("status") if isinstance(patch, Mapping) else None
+            if status in _TERMINAL_TASK_STATUSES:
+                active.result_deferring_tasks.discard(task_id)
 
     def _observe_session_id(self, message: Message) -> None:
         if self._session_id is not None:
@@ -742,7 +799,8 @@ class ClaudeSession:
 
         active = self._active_turn
         if active is None or active.finished:
-            return PermissionResultDeny(message="No active turn accepts approval requests")
+            return PermissionResultDeny(message=_NO_ACTIVE_APPROVAL_ROUTE)
+        generation = active.generation
         self._approval_counter += 1
         request_id = context.tool_use_id or f"approval-{self._approval_counter}"
         request = ApprovalRequestEvent(
@@ -758,7 +816,11 @@ class ClaudeSession:
             raise
         except Exception:
             decision = ApprovalDecision.DENY
-        if active.finished or self._active_turn is not active:
+        if (
+            active.finished
+            or self._turn_generation != generation
+            or self._active_turn is not active
+        ):
             decision = ApprovalDecision.DENY
         if decision is ApprovalDecision.ALLOW:
             return PermissionResultAllow()

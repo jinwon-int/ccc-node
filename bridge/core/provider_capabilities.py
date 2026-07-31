@@ -209,7 +209,10 @@ CAPABILITY_AXES: tuple[CapabilityAxis, ...] = (
         "Privileged actions pause for an explicit allow/deny decision; an "
         "omitted or failing handler is fail-closed deny.",
         claude=_supported(
-            "SDK permission callbacks gate tool use through Telegram inline approval."
+            "SDK permission callbacks gate tool use through Telegram inline approval. "
+            "The exact run generation remains bound across intermediate result "
+            "frames while bounded local agent/workflow tasks continue; terminal, "
+            "replaced, or stale generations deny."
         ),
         codex=_supported(
             "Approval server requests normalize to ApprovalRequestEvent; a missing "
@@ -329,14 +332,16 @@ CAPABILITY_AXES: tuple[CapabilityAxis, ...] = (
         "exact-head wait registry with a journaled terminal-to-conversation wake.",
         claude=_supported(
             "Provider-neutral: the agent-side CLI binds registrations through the "
-            "bridge-published active-turn route; the bridge monitor polls GitHub "
-            "checks with exact-head pinning, journals terminal transitions before "
-            "the wake, and resumes through a bridge-owned external_event turn "
-            "(#740)."
+            "bridge-published file-backed active-turn route; the bridge monitor "
+            "polls GitHub checks with exact-head pinning, journals terminal "
+            "transitions before the wake, and resumes through a bridge-owned "
+            "external_event turn (#740). This route is independent of in-memory "
+            "approval-generation leases."
         ),
         codex=_supported(
             "Provider-neutral: same registry, monitor, and continuation contract "
-            "as the Claude path (#740)."
+            "as the Claude path (#740); it remains independent of approval-generation "
+            "leases."
         ),
     ),
     _axis(

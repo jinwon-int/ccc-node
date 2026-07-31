@@ -51,12 +51,15 @@ from claude_agent_sdk import (  # noqa: E402 -- must follow the stub purge above
     AssistantMessage,
     ClaudeAgentOptions,
     Message,
+    PermissionResultAllow,
+    PermissionResultDeny,
     RateLimitEvent,
     RateLimitInfo,
     ResultMessage,
     StreamEvent,
     SystemMessage,
     TextBlock,
+    ToolPermissionContext,
     ToolResultBlock,
     ToolUseBlock,
     UserMessage,
@@ -64,6 +67,7 @@ from claude_agent_sdk import (  # noqa: E402 -- must follow the stub purge above
 
 from telegram_bot.core.agent_runtime import (  # noqa: E402
     AgentEvent,
+    ApprovalDecision,
     CompletionEvent,
     ErrorEvent,
     SessionRequest,
@@ -373,6 +377,228 @@ class ClaudeRuntimeUnsolicitedTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(texts, ["turn answer"])
         await self._drain(client)
         self.assertEqual(self.delivered, [])
+
+    async def test_delegated_run_keeps_exact_approval_route_across_intermediate_result(
+        self,
+    ) -> None:
+        """#804: one result may end a model turn while delegated work keeps the run live.
+
+        The locked Agent SDK deliberately keeps its control channel open when
+        a local agent/workflow outlives that result.  Reproduce the production
+        ordering with many intervening tool cycles, then ask for the identical
+        permission again during the delegated continuation.
+        """
+
+        session, client = await self._start_session()
+        client.turn_scripts.append("hang")
+        approvals: list[str] = []
+
+        async def allow(request) -> ApprovalDecision:
+            approvals.append(request.request_id)
+            return ApprovalDecision.ALLOW
+
+        events_task = asyncio.create_task(
+            _collect(session.send_turn("long orchestration", approval_handler=allow))
+        )
+        await _wait_until(lambda: client.queries == ["long orchestration"])
+        client.emit(
+            SystemMessage(
+                subtype="task_started",
+                data={
+                    "task_id": "delegated-1",
+                    "task_type": "local_agent",
+                    "session_id": client.session_id,
+                },
+            )
+        )
+        client.emit(
+            SystemMessage(
+                subtype="task_started",
+                data={
+                    "task_id": "workflow-1",
+                    "task_type": "local_workflow",
+                    "session_id": client.session_id,
+                },
+            )
+        )
+        await self._drain(client)
+
+        can_use_tool = client.options.can_use_tool
+        self.assertIsNotNone(can_use_tool)
+        assert can_use_tool is not None
+        early = await can_use_tool(
+            "Bash",
+            {"command": "same-command"},
+            ToolPermissionContext(tool_use_id="approval-early", title="run command"),
+        )
+        self.assertIsInstance(early, PermissionResultAllow)
+
+        # Tool count and payload size are not route lifetimes.  These frames
+        # intentionally add pressure without changing the live run owner.
+        for index in range(64):
+            tool_id = f"toolu-pressure-{index}"
+            client.emit(
+                AssistantMessage(
+                    content=[
+                        ToolUseBlock(
+                            id=tool_id,
+                            name="Read",
+                            input={"file_path": f"fixture-{index}"},
+                        )
+                    ],
+                    model="claude-test-model",
+                    session_id=client.session_id,
+                )
+            )
+            client.emit(
+                UserMessage(
+                    content=[
+                        ToolResultBlock(
+                            tool_use_id=tool_id,
+                            content="ok",
+                            is_error=False,
+                        )
+                    ]
+                )
+            )
+
+        # This result ends the current model turn, not the SDK run: the local
+        # agent is still in flight and will wake a continuation turn.
+        client.emit_result(result="delegated work still running")
+        await self._drain(client)
+        late = await can_use_tool(
+            "Bash",
+            {"command": "same-command"},
+            ToolPermissionContext(tool_use_id="approval-late", title="run command"),
+        )
+
+        self.assertIsInstance(late, PermissionResultAllow)
+        self.assertFalse(events_task.done())
+        self.assertEqual(approvals, ["approval-early", "approval-late"])
+
+        client.emit(
+            SystemMessage(
+                subtype="task_notification",
+                data={
+                    "task_id": "delegated-1",
+                    "status": "completed",
+                    "session_id": client.session_id,
+                },
+            )
+        )
+        client.emit(
+            SystemMessage(
+                subtype="task_updated",
+                data={
+                    "task_id": "workflow-1",
+                    "patch": {"status": "completed"},
+                    "session_id": client.session_id,
+                },
+            )
+        )
+        client.emit_assistant("all delegated work finished")
+        client.emit_result(result="all delegated work finished")
+        events = await asyncio.wait_for(events_task, timeout=2.0)
+
+        self.assertEqual(
+            [event.text for event in events if isinstance(event, TextDeltaEvent)],
+            ["all delegated work finished"],
+        )
+        self.assertIsInstance(events[-1], CompletionEvent)
+
+    async def test_permission_callback_is_not_rebound_across_turn_generation(self) -> None:
+        """A callback admitted by turn A must fail closed after turn B takes over."""
+
+        session, client = await self._start_session()
+        client.turn_scripts.extend(("hang", "hang"))
+        first_started = asyncio.Event()
+        release_first = asyncio.Event()
+
+        async def delayed_allow(_request) -> ApprovalDecision:
+            first_started.set()
+            await release_first.wait()
+            return ApprovalDecision.ALLOW
+
+        first_turn = asyncio.create_task(
+            _collect(session.send_turn("turn-a", approval_handler=delayed_allow))
+        )
+        await _wait_until(lambda: client.queries == ["turn-a"])
+        can_use_tool = client.options.can_use_tool
+        self.assertIsNotNone(can_use_tool)
+        assert can_use_tool is not None
+        stale_callback = asyncio.create_task(
+            can_use_tool(
+                "Bash",
+                {"command": "turn-a-command"},
+                ToolPermissionContext(tool_use_id="turn-a-approval"),
+            )
+        )
+        await asyncio.wait_for(first_started.wait(), timeout=2.0)
+
+        client.emit_result(result="turn a complete")
+        await asyncio.wait_for(first_turn, timeout=2.0)
+
+        async def current_allow(_request) -> ApprovalDecision:
+            return ApprovalDecision.ALLOW
+
+        second_turn = asyncio.create_task(
+            _collect(session.send_turn("turn-b", approval_handler=current_allow))
+        )
+        await _wait_until(lambda: client.queries == ["turn-a", "turn-b"])
+        release_first.set()
+        stale = await asyncio.wait_for(stale_callback, timeout=2.0)
+        current = await can_use_tool(
+            "Bash",
+            {"command": "turn-b-command"},
+            ToolPermissionContext(tool_use_id="turn-b-approval"),
+        )
+
+        self.assertIsInstance(stale, PermissionResultDeny)
+        self.assertIsInstance(current, PermissionResultAllow)
+        client.emit_result(result="turn b complete")
+        await asyncio.wait_for(second_turn, timeout=2.0)
+
+        after_completion = await can_use_tool(
+            "Bash",
+            {"command": "late-command"},
+            ToolPermissionContext(tool_use_id="after-completion"),
+        )
+        self.assertIsInstance(after_completion, PermissionResultDeny)
+        self.assertEqual(
+            after_completion.message,
+            "No active turn accepts approval requests; start a new user turn and retry",
+        )
+
+    async def test_long_lived_task_types_do_not_hold_approval_route_open(self) -> None:
+        """Teammates/monitors are not bounded run-completion evidence."""
+
+        session, client = await self._start_session()
+        client.turn_scripts.append("hang")
+        turn = asyncio.create_task(_collect(session.send_turn("team orchestration")))
+        await _wait_until(lambda: client.queries == ["team orchestration"])
+        client.emit(
+            SystemMessage(
+                subtype="task_started",
+                data={
+                    "task_id": "teammate-1",
+                    "task_type": "teammate",
+                    "session_id": client.session_id,
+                },
+            )
+        )
+        client.emit_result(result="interactive run complete")
+        events = await asyncio.wait_for(turn, timeout=2.0)
+
+        self.assertIsInstance(events[-1], CompletionEvent)
+        can_use_tool = client.options.can_use_tool
+        self.assertIsNotNone(can_use_tool)
+        assert can_use_tool is not None
+        late = await can_use_tool(
+            "Bash",
+            {"command": "late-command"},
+            ToolPermissionContext(tool_use_id="after-teammate-result"),
+        )
+        self.assertIsInstance(late, PermissionResultDeny)
 
     async def test_without_handler_frames_are_dropped_and_turns_unaffected(self) -> None:
         session, client = await self._start_session()

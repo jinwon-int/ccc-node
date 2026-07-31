@@ -24,6 +24,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the `gh-ci-wait` skill teaches agents the registration contract.
 
 ### Fixed
+- **Long Claude delegated-run approval routing (#804).** ClaudeRuntime no longer
+  treats an intermediate SDK `ResultMessage` as the end of a run while a
+  `local_agent` or `local_workflow` is still in flight. The exact turn and its
+  generation-scoped, owner-only approval callback remain live through the
+  delegated continuation, regardless of tool count or context pressure, and
+  are revoked on the run-ending result, interruption, session replacement, or
+  teardown. Stale callbacks cannot bind to the next turn. A body-free log
+  records only the count of delegated tasks delaying completion; rejected late
+  callbacks now tell the agent to start a new user turn and retry. External-wait
+  publication remains a separate active-turn file contract and is not coupled
+  to approval-generation revocation.
 - **Bounded service-restart drain (#822).** SIGTERM/SIGINT now closes new-turn
   admission and waits up to 45 seconds for active provider work, accepted
   Telegram run tasks, and tracked Claude run-in-background Bash IDs. Canonical
