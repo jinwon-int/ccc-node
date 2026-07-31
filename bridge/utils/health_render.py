@@ -155,6 +155,35 @@ def _turn_occupancy_line(
     return _line("Turn occupancy", "occupied", "; ".join(details))
 
 
+_WAKEUP_SKIP_COUNTER_NAMES = (
+    "skipped_active",
+    "skipped_locked",
+    "skipped_quarantine",
+    "skipped_cooldown",
+    "skipped_attempts",
+    "skipped_budget",
+)
+
+
+def _wakeup_skip_counters(
+    section: dict,
+) -> tuple[dict[str, int] | None, str | None]:
+    """Read additive skip counters while accepting snapshots from before #798."""
+
+    present = [name for name in _WAKEUP_SKIP_COUNTER_NAMES if name in section]
+    if not present:
+        return {}, None
+    if len(present) != len(_WAKEUP_SKIP_COUNTER_NAMES):
+        return None, "invalid skip counters"
+    counters: dict[str, int] = {}
+    for name in present:
+        value = section.get(name)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            return None, "invalid skip counters"
+        counters[name] = value
+    return counters, None
+
+
 def _dead_session_wakeup_line(
     data: dict,
     *,
@@ -168,7 +197,7 @@ def _dead_session_wakeup_line(
     counter_names = ("scans", "scanned", "triggered", "delivered", "failed")
     enabled = section.get("enabled")
     if enabled is False:
-        for name in counter_names:
+        for name in counter_names + _WAKEUP_SKIP_COUNTER_NAMES:
             if name not in section:
                 continue
             value = section[name]
@@ -223,13 +252,29 @@ def _dead_session_wakeup_line(
     if counters["scans"] == 0:
         return _line("Dead-session wakeup", "unknown", "inconsistent scan count")
 
+    skip_counters, skip_error = _wakeup_skip_counters(section)
+    if skip_error is not None or skip_counters is None:
+        return _line("Dead-session wakeup", "unknown", "invalid skip counters")
+
+    skipped_detail = ""
+    if any(skip_counters.values()):
+        skipped_detail = (
+            f"; skipped active={skip_counters['skipped_active']} "
+            f"locked={skip_counters['skipped_locked']} "
+            f"quarantine={skip_counters['skipped_quarantine']} "
+            f"cooldown={skip_counters['skipped_cooldown']} "
+            f"attempts={skip_counters['skipped_attempts']} "
+            f"budget={skip_counters['skipped_budget']}"
+        )
+
     return _line(
         "Dead-session wakeup",
         "enabled",
         (
             f"scans={counters['scans']} scanned={counters['scanned']} "
             f"triggered={counters['triggered']} delivered={counters['delivered']} "
-            f"failed={counters['failed']}; last scan {_format_age(scan_age)} ago"
+            f"failed={counters['failed']}{skipped_detail}; "
+            f"last scan {_format_age(scan_age)} ago"
         ),
     )
 

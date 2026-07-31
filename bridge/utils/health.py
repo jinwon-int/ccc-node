@@ -121,6 +121,12 @@ class RuntimeHealthReporter:
                     "triggered": 0,
                     "delivered": 0,
                     "failed": 0,
+                    "skipped_active": 0,
+                    "skipped_locked": 0,
+                    "skipped_quarantine": 0,
+                    "skipped_cooldown": 0,
+                    "skipped_attempts": 0,
+                    "skipped_budget": 0,
                     "last_scan_at": None,
                 }
                 if dead_session_wakeup
@@ -372,13 +378,20 @@ class RuntimeHealthReporter:
         triggered: int,
         delivered: int,
         failed: int,
+        skipped_active: int = 0,
+        skipped_locked: int = 0,
+        skipped_quarantine: int = 0,
+        skipped_cooldown: int = 0,
+        skipped_attempts: int = 0,
+        skipped_budget: int = 0,
     ) -> None:
         """Publish one enabled dead-session wakeup scan tick (#801).
 
-        The counters are process-lifetime cumulative values. ``last_scan_at`` is
-        deliberately section-local: unrelated health writes must never make a
-        stale wakeup observation look fresh. Disabled reporters retain only
-        ``enabled: false`` even if a caller invokes this method unexpectedly.
+        The outcome and bounded skip counters are process-lifetime cumulative
+        values. ``last_scan_at`` is deliberately section-local: unrelated health
+        writes must never make a stale wakeup observation look fresh. Disabled
+        reporters retain only ``enabled: false`` even if a caller invokes this
+        method unexpectedly.
         """
         with self._lock:
             section = self._state.get("dead_session_wakeup")
@@ -390,6 +403,12 @@ class RuntimeHealthReporter:
                 ("triggered", triggered),
                 ("delivered", delivered),
                 ("failed", failed),
+                ("skipped_active", skipped_active),
+                ("skipped_locked", skipped_locked),
+                ("skipped_quarantine", skipped_quarantine),
+                ("skipped_cooldown", skipped_cooldown),
+                ("skipped_attempts", skipped_attempts),
+                ("skipped_budget", skipped_budget),
             ):
                 section[key] = int(section.get(key, 0)) + max(0, int(count))
             section["last_scan_at"] = _utc_now_iso()

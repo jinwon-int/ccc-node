@@ -278,6 +278,12 @@ class RuntimeHealthReporterTests(unittest.TestCase):
                     "triggered": 0,
                     "delivered": 0,
                     "failed": 0,
+                    "skipped_active": 0,
+                    "skipped_locked": 0,
+                    "skipped_quarantine": 0,
+                    "skipped_cooldown": 0,
+                    "skipped_attempts": 0,
+                    "skipped_budget": 0,
                     "last_scan_at": None,
                 },
             )
@@ -292,6 +298,12 @@ class RuntimeHealthReporterTests(unittest.TestCase):
                     triggered=0,
                     delivered=0,
                     failed=0,
+                    skipped_active=0,
+                    skipped_locked=0,
+                    skipped_quarantine=0,
+                    skipped_cooldown=0,
+                    skipped_attempts=0,
+                    skipped_budget=1,
                 )
 
             first = json.loads(reporter.health_file.read_text(encoding="utf-8"))
@@ -304,6 +316,12 @@ class RuntimeHealthReporterTests(unittest.TestCase):
                     "triggered": 0,
                     "delivered": 0,
                     "failed": 0,
+                    "skipped_active": 0,
+                    "skipped_locked": 0,
+                    "skipped_quarantine": 0,
+                    "skipped_cooldown": 0,
+                    "skipped_attempts": 0,
+                    "skipped_budget": 1,
                     "last_scan_at": "2026-07-29T12:00:00Z",
                 },
             )
@@ -318,6 +336,12 @@ class RuntimeHealthReporterTests(unittest.TestCase):
                     triggered=2,
                     delivered=1,
                     failed=1,
+                    skipped_active=3,
+                    skipped_locked=4,
+                    skipped_quarantine=5,
+                    skipped_cooldown=6,
+                    skipped_attempts=7,
+                    skipped_budget=2,
                 )
 
             second = reporter.snapshot()["dead_session_wakeup"]
@@ -330,6 +354,12 @@ class RuntimeHealthReporterTests(unittest.TestCase):
                     "triggered": 2,
                     "delivered": 1,
                     "failed": 1,
+                    "skipped_active": 3,
+                    "skipped_locked": 4,
+                    "skipped_quarantine": 5,
+                    "skipped_cooldown": 6,
+                    "skipped_attempts": 7,
+                    "skipped_budget": 3,
                     "last_scan_at": "2026-07-29T12:01:00Z",
                 },
             )

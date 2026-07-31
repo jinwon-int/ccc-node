@@ -6,8 +6,10 @@ import json
 from pathlib import Path
 import stat
 import tempfile
+import threading
 from typing import TYPE_CHECKING
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 
 if TYPE_CHECKING:
     from core.usage import UsageSnapshot
@@ -202,10 +204,13 @@ class BudgetTests(UsageMeterTestCase):
 
     def test_warn_and_enforce_alerts_fire_exactly_once_per_day(self) -> None:
         meter = self.make_budgeted()
-        self.assertEqual(meter.record("codex", MODE_INTERACTIVE, input_tokens=799), ())
-        warn = meter.record("codex", MODE_INTERACTIVE, input_tokens=1)
+        self.assertEqual(
+            meter.record("codex", MODE_INTERACTIVE, input_tokens=20_000), ()
+        )
+        self.assertEqual(meter.record("codex", MODE_AUTONOMOUS, input_tokens=799), ())
+        warn = meter.record("codex", MODE_AUTONOMOUS, input_tokens=1)
         self.assertEqual([alert.kind for alert in warn], ["warn"])
-        self.assertEqual(meter.record("codex", MODE_INTERACTIVE, input_tokens=50), ())
+        self.assertEqual(meter.record("codex", MODE_AUTONOMOUS, input_tokens=50), ())
         enforce = meter.record("codex", MODE_AUTONOMOUS, input_tokens=200)
         self.assertEqual([alert.kind for alert in enforce], ["enforce"])
         self.assertEqual(meter.record("codex", MODE_INTERACTIVE, input_tokens=10), ())
@@ -213,24 +218,25 @@ class BudgetTests(UsageMeterTestCase):
 
         # A new day re-arms both alerts.
         self.now += 86400
-        crossing = meter.record("codex", MODE_INTERACTIVE, input_tokens=2000)
+        crossing = meter.record("codex", MODE_AUTONOMOUS, input_tokens=2000)
         self.assertEqual([alert.kind for alert in crossing], ["warn", "enforce"])
 
     def test_alert_state_survives_reload_without_refiring(self) -> None:
         meter = self.make_budgeted()
-        meter.record("codex", MODE_INTERACTIVE, input_tokens=1200)
+        meter.record("codex", MODE_AUTONOMOUS, input_tokens=1200)
         self.assertEqual(len(self.alerts), 2)
         reloaded = self.make_budgeted()
-        self.assertEqual(reloaded.record("codex", MODE_INTERACTIVE, input_tokens=5), ())
+        self.assertEqual(reloaded.record("codex", MODE_AUTONOMOUS, input_tokens=5), ())
         self.assertEqual(len(self.alerts), 2)
 
     def test_alert_text_is_body_free(self) -> None:
         meter = self.make_budgeted()
-        meter.record("codex", MODE_INTERACTIVE, input_tokens=1200)
+        meter.record("codex", MODE_AUTONOMOUS, input_tokens=1200)
         for message in self.alerts:
             self.assertRegex(
                 message,
-                r"^(⚠️ warn|🛑 enforce): codex used \d+ of \d+ daily budget tokens",
+                r"^(⚠️ warn|🛑 enforce): codex autonomous used \d+ of \d+ "
+                r"daily autonomous budget tokens",
             )
 
     def test_alert_sink_failure_does_not_break_recording(self) -> None:
@@ -239,27 +245,29 @@ class BudgetTests(UsageMeterTestCase):
 
         meter = self.make_meter(budgets={"codex": 100}, alert_sink=broken)
         with self.assertLogs("telegram_bot.core.usage_meter", level="ERROR"):
-            meter.record("codex", MODE_INTERACTIVE, input_tokens=100)
+            meter.record("codex", MODE_AUTONOMOUS, input_tokens=100)
         self.assertEqual(meter.used_tokens("codex"), 100)
 
     def test_autonomous_spend_is_blocked_at_the_cap_but_interactive_is_not(self) -> None:
         meter = self.make_budgeted()
         self.assertEqual(meter.check_autonomous_spend("codex").state, "ok")
-        meter.record("codex", MODE_INTERACTIVE, input_tokens=850)
+        meter.record("codex", MODE_INTERACTIVE, input_tokens=10_000)
+        self.assertEqual(meter.check_autonomous_spend("codex").state, "ok")
+        meter.record("codex", MODE_AUTONOMOUS, input_tokens=850)
         warn_decision = meter.check_autonomous_spend("codex")
         self.assertEqual(warn_decision.state, "warn")
         self.assertTrue(warn_decision.allowed)
-        meter.record("codex", MODE_INTERACTIVE, input_tokens=200)
+        meter.record("codex", MODE_AUTONOMOUS, input_tokens=150)
 
         blocked = meter.check_autonomous_spend("codex")
         self.assertEqual(blocked.state, "blocked")
         self.assertFalse(blocked.allowed)
-        self.assertIn("codex used", blocked.reason())
+        self.assertIn("codex autonomous used", blocked.reason())
 
         # Interactive recording keeps flowing after the enforce threshold —
         # only autonomous spend consults the gate.
         meter.record("codex", MODE_INTERACTIVE, input_tokens=25, requests=1)
-        self.assertEqual(meter.used_tokens("codex"), 1075)
+        self.assertEqual(meter.used_tokens("codex"), 11_025)
 
     def test_no_budget_means_always_allowed(self) -> None:
         meter = self.make_meter()
@@ -267,6 +275,84 @@ class BudgetTests(UsageMeterTestCase):
         self.assertTrue(decision.allowed)
         self.assertEqual(decision.state, "ok")
         self.assertIn("disabled", decision.reason())
+
+    def test_interactive_usage_does_not_consume_autonomous_allowance(self) -> None:
+        meter = self.make_meter(budgets={"codex": 1000})
+        meter.record(
+            "codex",
+            MODE_INTERACTIVE,
+            input_tokens=100_000,
+            output_tokens=25_000,
+            requests=20,
+        )
+
+        decision = meter.check_autonomous_spend("codex")
+        self.assertTrue(decision.allowed)
+        self.assertEqual(decision.state, "ok")
+        self.assertEqual(decision.used_tokens, 0)
+        self.assertIn("autonomous", decision.reason())
+        reservation = meter.reserve_autonomous_spend(
+            "codex", input_tokens=1000, requests=1
+        )
+        self.assertTrue(reservation.allowed)
+        self.assertEqual(meter.used_tokens("codex"), 126_000)
+
+    def test_autonomous_records_and_reservations_share_the_allowance(self) -> None:
+        meter = self.make_meter(budgets={"codex": 1000}, warn_percent=80)
+        meter.record("codex", MODE_AUTONOMOUS, input_tokens=400, requests=1)
+        reservation = meter.reserve_autonomous_spend(
+            "codex", input_tokens=500, requests=1
+        )
+
+        self.assertTrue(reservation.allowed)
+        decision = meter.check_autonomous_spend("codex")
+        self.assertEqual(decision.used_tokens, 900)
+        self.assertEqual(decision.state, "warn")
+        blocked = meter.reserve_autonomous_spend("codex", input_tokens=101)
+        self.assertFalse(blocked.allowed)
+        self.assertEqual(blocked.decision.used_tokens, 900)
+
+    def test_old_per_mode_ledger_remains_readable_for_autonomous_budget(self) -> None:
+        self.path.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "days": {
+                        FIXED_DAY: {
+                            "codex": {
+                                MODE_INTERACTIVE: {
+                                    "input_tokens": 50_000,
+                                    "output_tokens": 1000,
+                                    "requests": 8,
+                                },
+                                MODE_AUTONOMOUS: {
+                                    "input_tokens": 150,
+                                    "output_tokens": 50,
+                                    "requests": 1,
+                                },
+                            }
+                        }
+                    },
+                    # Legacy provider-wide crossings must not suppress the
+                    # first autonomous-threshold alerts after upgrade.
+                    "alerted": {FIXED_DAY: {"codex": ["warn", "enforce"]}},
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        meter = self.make_meter(budgets={"codex": 1000})
+        self.assertEqual(meter.used_tokens("codex"), 51_200)
+        decision = meter.check_autonomous_spend("codex")
+        self.assertTrue(decision.allowed)
+        self.assertEqual(decision.used_tokens, 200)
+        self.assertTrue(
+            meter.reserve_autonomous_spend("codex", input_tokens=800).allowed
+        )
+        self.assertEqual(len(self.alerts), 2)
+        reloaded = self.make_meter(budgets={"codex": 1000})
+        self.assertEqual(reloaded.record("codex", MODE_AUTONOMOUS, requests=1), ())
+        self.assertEqual(len(self.alerts), 2)
 
 
 class ReportTests(UsageMeterTestCase):
@@ -277,7 +363,11 @@ class ReportTests(UsageMeterTestCase):
         report = meter.render_report(days=7)
         self.assertIn("claude · today 150 tok · 7d interactive 150 tok/2 req", report)
         self.assertIn("autonomous 500 tok/1 req", report)
-        self.assertIn("budget 500/1000 tok (50%, ok; enforce blocks autonomous only)", report)
+        self.assertIn(
+            "autonomous budget 500/1000 tok "
+            "(50%, ok; enforce blocks autonomous only)",
+            report,
+        )
         self.assertNotIn("message", report.lower())
 
     def test_report_without_usage_or_budgets_says_so(self) -> None:
@@ -391,6 +481,24 @@ class ReserveTests(UsageMeterTestCase):
         decision = gated.reserve_autonomous_spend("codex", input_tokens=150)
         self.assertFalse(decision.allowed)
 
+    def test_concurrent_meter_instances_cannot_cross_autonomous_cap(self) -> None:
+        ready = threading.Barrier(2)
+
+        def reserve() -> bool:
+            meter = self.make_meter(budgets={"codex": 1000})
+            ready.wait(timeout=5)
+            return meter.reserve_autonomous_spend(
+                "codex", input_tokens=600, requests=1
+            ).allowed
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            allowed = list(pool.map(lambda _index: reserve(), range(2)))
+
+        self.assertEqual(sorted(allowed), [False, True])
+        reloaded = self.make_meter(budgets={"codex": 1000})
+        self.assertEqual(reloaded.check_autonomous_spend("codex").used_tokens, 600)
+        self.assertEqual(reloaded.used_tokens("codex"), 600)
+
     def test_reserve_without_budget_admits_and_charges(self) -> None:
         meter = self.make_meter()
         decision = meter.reserve_autonomous_spend("codex", input_tokens=100, requests=1)
@@ -436,9 +544,7 @@ class PersistenceFailureTests(UsageMeterTestCase):
         with self.assertLogs("telegram_bot.core.usage_meter", level="WARNING"):
             meter.record("codex", MODE_INTERACTIVE, input_tokens=9)
         self.assertEqual(meter.used_tokens("codex"), 18)
-        self.assertFalse(
-            meter.reserve_autonomous_spend("codex", input_tokens=1).allowed
-        )
+        self.assertTrue(meter.reserve_autonomous_spend("codex", input_tokens=1).allowed)
 
 
 class TransientSaveRecoveryTests(UsageMeterTestCase):
@@ -450,15 +556,15 @@ class TransientSaveRecoveryTests(UsageMeterTestCase):
         meter_b = self.make_meter()
         self.path.mkdir()  # os.replace onto a directory fails on POSIX
         with self.assertLogs("telegram_bot.core.usage_meter", level="WARNING"):
-            meter_a.record("codex", MODE_INTERACTIVE, input_tokens=100)
+            meter_a.record("codex", MODE_AUTONOMOUS, input_tokens=100)
         self.path.rmdir()
-        meter_b.record("codex", MODE_INTERACTIVE, input_tokens=200)
+        meter_b.record("codex", MODE_AUTONOMOUS, input_tokens=200)
 
-        meter_a.record("codex", MODE_INTERACTIVE, input_tokens=50)
+        meter_a.record("codex", MODE_AUTONOMOUS, input_tokens=50)
 
         raw = json.loads(self.path.read_text(encoding="utf-8"))
         self.assertEqual(
-            raw["days"][FIXED_DAY]["codex"][MODE_INTERACTIVE]["input_tokens"], 350
+            raw["days"][FIXED_DAY]["codex"][MODE_AUTONOMOUS]["input_tokens"], 350
         )
         gated = self.make_meter(budgets={"codex": 250})
         self.assertFalse(

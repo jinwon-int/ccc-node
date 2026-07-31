@@ -5,8 +5,8 @@ responses, or credentials) per KST day × provider × mode, where mode is
 ``interactive`` (a user-visible Telegram turn) or ``autonomous`` (background
 spend such as distill extraction). A configurable per-provider daily token
 budget adds a warn threshold (early alarm) and an enforce threshold that
-blocks **autonomous** spend only — interactive user requests are never
-blocked by design.
+is evaluated against and blocks **autonomous** spend only — interactive user
+requests remain recorded but never consume that allowance or get blocked.
 
 The meter itself must never take down the conversation path: persistence
 failures degrade to in-memory counting with a logged warning, and alert-sink
@@ -58,6 +58,10 @@ DEFAULT_ROLLING_WINDOW_SECONDS = 5 * 3600
 
 BudgetState = Literal["ok", "warn", "blocked"]
 AlertKind = Literal["warn", "enforce"]
+_AUTONOMOUS_ALERT_MARKERS = {
+    "warn": "autonomous_warn",
+    "enforce": "autonomous_enforce",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,10 +77,10 @@ class BudgetDecision:
 
     def reason(self) -> str:
         if self.budget_tokens <= 0:
-            return f"{self.provider} daily token budget disabled"
+            return f"{self.provider} daily autonomous token budget disabled"
         return (
-            f"{self.provider} used {self.used_tokens} of {self.budget_tokens} "
-            f"budget tokens on {self.day} ({self.state})"
+            f"{self.provider} autonomous used {self.used_tokens} of "
+            f"{self.budget_tokens} budget tokens on {self.day} ({self.state})"
         )
 
 
@@ -131,9 +135,9 @@ class UsageAlert:
             else "approaching the daily cap"
         )
         return (
-            f"{marker}: {self.provider} used {self.used_tokens} of "
-            f"{self.budget_tokens} daily budget tokens ({percent}%) on "
-            f"{self.day} — {detail}"
+            f"{marker}: {self.provider} autonomous used {self.used_tokens} of "
+            f"{self.budget_tokens} daily autonomous budget tokens ({percent}%) "
+            f"on {self.day} — {detail}"
         )
 
 
@@ -300,7 +304,17 @@ class UsageMeter:
                     continue
                 if not isinstance(kinds, list):
                     continue
-                safe_kinds = [kind for kind in kinds if kind in ("warn", "enforce")]
+                safe_kinds = [
+                    kind
+                    for kind in kinds
+                    if kind
+                    in (
+                        "warn",
+                        "enforce",
+                        "autonomous_warn",
+                        "autonomous_enforce",
+                    )
+                ]
                 if safe_kinds:
                     self._alerted.setdefault(day, {})[provider] = safe_kinds
 
@@ -462,6 +476,16 @@ class UsageMeter:
             for counters in modes.values()
         )
 
+    def _autonomous_used_tokens(self, provider: str, day: str) -> int:
+        """Input+output tokens charged to one provider's autonomous allowance."""
+
+        counters = (
+            self._days.get(day, {}).get(provider, {}).get(MODE_AUTONOMOUS, {})
+        )
+        return _clamped_count(counters.get("input_tokens")) + _clamped_count(
+            counters.get("output_tokens")
+        )
+
     def period_usage(self, *, days: int = 7) -> dict[str, dict[str, int]]:
         """Body-free per-provider totals across the trailing ``days`` buckets.
 
@@ -558,7 +582,11 @@ class UsageMeter:
         for key, value in added.items():
             bucket[key] = min(bucket[key] + value, _MAX_COUNT)
         self._note_pending_delta(day, provider, mode, added, 1)
-        alerts = self._collect_alerts(provider, day)
+        alerts = (
+            self._collect_alerts(provider, day)
+            if mode == MODE_AUTONOMOUS
+            else ()
+        )
         self._prune(day)
         return alerts
 
@@ -594,7 +622,7 @@ class UsageMeter:
         with self._locked_state():
             day = self.current_day()
             budget = self._budgets.get(provider, 0)
-            used = self.used_tokens(provider, day)
+            used = self._autonomous_used_tokens(provider, day)
             if budget > 0 and used + reserved_tokens > budget:
                 decision = BudgetDecision(provider, day, "blocked", False, used, budget)
                 return UsageReservation(
@@ -706,15 +734,17 @@ class UsageMeter:
         budget = self._budgets.get(provider, 0)
         if budget <= 0:
             return ()
-        used = self.used_tokens(provider, day)
+        used = self._autonomous_used_tokens(provider, day)
         fired = self._alerted.setdefault(day, {}).setdefault(provider, [])
         alerts: list[UsageAlert] = []
         warn_at = self._warn_threshold(budget)
-        if used >= warn_at and "warn" not in fired:
-            fired.append("warn")
+        warn_marker = _AUTONOMOUS_ALERT_MARKERS["warn"]
+        enforce_marker = _AUTONOMOUS_ALERT_MARKERS["enforce"]
+        if used >= warn_at and warn_marker not in fired:
+            fired.append(warn_marker)
             alerts.append(UsageAlert(provider, day, "warn", used, budget))
-        if used >= budget and "enforce" not in fired:
-            fired.append("enforce")
+        if used >= budget and enforce_marker not in fired:
+            fired.append(enforce_marker)
             alerts.append(UsageAlert(provider, day, "enforce", used, budget))
         return tuple(alerts)
 
@@ -735,7 +765,7 @@ class UsageMeter:
         with self._locked_state(save=False):
             day = self.current_day()
             budget = self._budgets.get(provider, 0)
-            used = self.used_tokens(provider, day)
+            used = self._autonomous_used_tokens(provider, day)
         if budget <= 0:
             return BudgetDecision(provider, day, "ok", True, used, budget)
         if used >= budget:
@@ -804,7 +834,8 @@ class UsageMeter:
                     999, round(decision.used_tokens * 100 / decision.budget_tokens)
                 )
                 lines.append(
-                    f"  budget {decision.used_tokens}/{decision.budget_tokens} tok "
+                    f"  autonomous budget "
+                    f"{decision.used_tokens}/{decision.budget_tokens} tok "
                     f"({percent}%, {decision.state}; enforce blocks autonomous only)"
                 )
         return "\n".join(lines)
