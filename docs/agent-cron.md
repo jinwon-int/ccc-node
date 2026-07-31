@@ -99,6 +99,16 @@ canonical module cannot be loaded, task execution and history remain intact but
 notification delivery reports `blocked-redaction-unavailable` and writes no
 captured output to the spool.
 
+For a non-success run, the already-redacted, bounded stdout/stderr are also
+checked for the exact line-start fleet diagnostic tokens `DOWN`, `UNREACHABLE`,
+`DRIFT`, and `BOOTPATH`. If any are present, the first line identifies a fleet
+alert and includes only the validated task id plus deterministic token counts;
+node names, paths, credentials, and the rest of each diagnostic row remain out
+of the title. Failures with no recognized signal keep the generic status first
+line, and successful notifications keep their existing text. This shared
+formatting applies to existing command tasks such as `adapter-fleet-watch` and
+`fleet-doctor-sweep` without a task-store field or migration.
+
 ## Safety boundaries
 
 Read-only/status modes never acquire locks, execute prompts, write bridge spools, install timers, edit crontab/systemd, send Telegram, call providers, or touch remotes. Execution mode may write task history and owner-only redacted spool entries, but still does not install timers or call Telegram/provider APIs directly. `add`/`remove`/`enable`/`disable` mutate only the validated task store via the same atomic private write path.

@@ -1176,15 +1176,55 @@ def notification_base(task):
     }
 
 
+# Fleet command payloads emit one diagnostic row per affected node.  Only these
+# exact line-start tokens are safe to promote into a notification title: the
+# rest of each row contains untrusted node names, paths, and free-form details.
+# Keep the order fixed and counts capped so the title shape and length are
+# deterministic even if a future output cap is raised.
+_FLEET_DIAGNOSTIC_TOKENS = ('DOWN', 'UNREACHABLE', 'DRIFT', 'BOOTPATH')
+_FLEET_DIAGNOSTIC_LINE = re.compile(
+    r'^(DOWN|UNREACHABLE|DRIFT|BOOTPATH)(?=[ \t]|$)', re.MULTILINE
+)
+_FLEET_DIAGNOSTIC_COUNT_MAX = 999
+_VALID_TASK_ID = re.compile(r'^[A-Za-z0-9_.-]{1,96}$')
+
+
+def fleet_diagnostic_title(task_id, status, stdout, stderr):
+    """Return an allowlist-only fleet alert title for a non-success run.
+
+    ``stdout`` and ``stderr`` must already have passed through
+    ``redact_for_owner``.  No matched line content is copied: only fixed token
+    names and bounded occurrence counts leave this classifier.
+    """
+    if status == 'success' or _VALID_TASK_ID.fullmatch(str(task_id or '')) is None:
+        return None
+    counts = {token: 0 for token in _FLEET_DIAGNOSTIC_TOKENS}
+    for output in (stdout, stderr):
+        for match in _FLEET_DIAGNOSTIC_LINE.finditer(output or ''):
+            token = match.group(1)
+            counts[token] = min(
+                counts[token] + 1, _FLEET_DIAGNOSTIC_COUNT_MAX
+            )
+    signals = [
+        f'{token}={counts[token]}'
+        for token in _FLEET_DIAGNOSTIC_TOKENS
+        if counts[token]
+    ]
+    if not signals:
+        return None
+    return f"agent-cron fleet alert for task {task_id}: {' '.join(signals)}"
+
+
 def build_owner_text(task_id, run_id, scheduled_at, status, headless):
     stdout = redact_for_owner((headless or {}).get('stdout', ''), 900)
     stderr = redact_for_owner((headless or {}).get('stderr', ''), 900)
     if stdout is None or stderr is None:
         return None
+    title = fleet_diagnostic_title(task_id, status, stdout, stderr)
     stdout = stdout.strip()
     stderr = stderr.strip()
     lines = [
-        f"agent-cron task {task_id} finished with status={status}",
+        title or f"agent-cron task {task_id} finished with status={status}",
         f"scheduledAt={scheduled_at or ''}",
         f"runId={run_id}",
         f"exitCode={(headless or {}).get('exitCode', '')}",
