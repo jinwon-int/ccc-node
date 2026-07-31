@@ -40,12 +40,15 @@ if [ "$1 $2" = "api user" ]; then
   printf '%s\n' "${MOCK_ACTOR:-seoseo-ai}"
 elif [ "$1" = "api" ] && [[ "$2" == repos/* ]] && [[ " $* " == *" .permissions.push "* ]]; then
   printf '%s\n' "${MOCK_PUSH:-true}"
+elif [ "$1" = "api" ] && [[ "$2" == repos/* ]] && [[ " $* " == *" .default_branch "* ]]; then
+  printf '%s\n' "${MOCK_DEFAULT_BRANCH:-main}"
 elif [ "$1 $2" = "pr view" ] && [[ " $* " == *" author,baseRefName,state,isDraft,headRefOid,mergeable,reviewRequests,statusCheckRollup "* ]]; then
   jq -n \
     --arg author "${MOCK_AUTHOR:-jinon86}" \
+    --arg base "${MOCK_BASE:-main}" \
     --arg head "${MOCK_HEAD:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}" \
     --arg reviewer "${MOCK_REVIEWER:-seoseo-ai}" \
-    '{author:{login:$author},baseRefName:"main",state:"OPEN",isDraft:false,
+    '{author:{login:$author},baseRefName:$base,state:"OPEN",isDraft:false,
       headRefOid:$head,mergeable:"MERGEABLE",
       reviewRequests:[{login:$reviewer}],
       statusCheckRollup:[{status:"COMPLETED",conclusion:"SUCCESS"}]}'
@@ -128,6 +131,27 @@ if run_helper --dry-run >"$TMP/dry-run.out" \
   ok
 else
   bad "valid dry-run failed or submitted a review"
+fi
+
+rm -f "$MOCK_REVIEW_MARKER"
+if MOCK_DEFAULT_BRANCH=master MOCK_BASE=master \
+   run_helper --dry-run >"$TMP/master-default.out" \
+   && jq -e '.ok == true and .dry_run == true and .base == "master"' \
+     "$TMP/master-default.out" >/dev/null \
+   && [ ! -e "$MOCK_REVIEW_MARKER" ]; then
+  ok
+else
+  bad "helper rejected a PR against the repository default branch master"
+fi
+
+rm -f "$MOCK_REVIEW_MARKER"
+if MOCK_DEFAULT_BRANCH=master MOCK_BASE=main \
+   run_helper --dry-run >"$TMP/non-default-base.out" 2>&1; then
+  bad "helper accepted a PR against a non-default base branch"
+elif [ -e "$MOCK_REVIEW_MARKER" ]; then
+  bad "helper submitted a review before refusing a non-default base branch"
+else
+  ok
 fi
 
 rm -f "$MOCK_REVIEW_MARKER"

@@ -90,14 +90,17 @@ actor="$(review_gh api user --jq .login)"
   || { echo "ERROR: expected review actor seoseo-ai" >&2; exit 65; }
 [ "$(review_gh api "repos/$repo" --jq .permissions.push)" = "true" ] \
   || { echo "ERROR: seoseo-ai lacks repository write permission" >&2; exit 65; }
+default_branch="$(review_gh api "repos/$repo" --jq .default_branch)"
+[[ "$default_branch" =~ ^[A-Za-z0-9._/-]+$ ]] \
+  || { echo "ERROR: repository default branch is invalid" >&2; exit 65; }
 
 pr_json="$(review_gh pr view "$pr" --repo "$repo" \
   --json author,baseRefName,state,isDraft,headRefOid,mergeable,reviewRequests,statusCheckRollup)"
 
 [ "$(jq -r '.author.login' <<<"$pr_json")" = "jinon86" ] \
   || { echo "ERROR: expected PR author jinon86" >&2; exit 65; }
-[ "$(jq -r '.baseRefName' <<<"$pr_json")" = "main" ] \
-  || { echo "ERROR: review target base is not main" >&2; exit 65; }
+[ "$(jq -r '.baseRefName' <<<"$pr_json")" = "$default_branch" ] \
+  || { echo "ERROR: review target base is not the repository default branch" >&2; exit 65; }
 [ "$(jq -r '.state' <<<"$pr_json")" = "OPEN" ] \
   || { echo "ERROR: review target is not open" >&2; exit 65; }
 [ "$(jq -r '.isDraft' <<<"$pr_json")" = "false" ] \
@@ -126,8 +129,9 @@ bad_checks="$(jq '[.statusCheckRollup[]? | select(
 
 if [ "$dry_run" -eq 1 ]; then
   jq -n --arg repo "$repo" --argjson pr "$pr" --arg actor "$actor" \
-    --arg head "$expected_head" --argjson checks "$check_count" \
-    '{ok:true,dry_run:true,repo:$repo,pr:$pr,actor:$actor,head:$head,check_count:$checks}'
+    --arg head "$expected_head" --arg base "$default_branch" \
+    --argjson checks "$check_count" \
+    '{ok:true,dry_run:true,repo:$repo,pr:$pr,actor:$actor,head:$head,base:$base,check_count:$checks}'
   exit 0
 fi
 
@@ -145,6 +149,7 @@ after="$(review_gh pr view "$pr" --repo "$repo" \
   || { echo "ERROR: GitHub did not record an approving review" >&2; exit 65; }
 
 jq -n --arg repo "$repo" --argjson pr "$pr" --arg actor "$actor" \
-  --arg head "$expected_head" --argjson checks "$check_count" \
-  '{ok:true,approved:true,repo:$repo,pr:$pr,actor:$actor,head:$head,check_count:$checks}'
+  --arg head "$expected_head" --arg base "$default_branch" \
+  --argjson checks "$check_count" \
+  '{ok:true,approved:true,repo:$repo,pr:$pr,actor:$actor,head:$head,base:$base,check_count:$checks}'
 REMOTE
