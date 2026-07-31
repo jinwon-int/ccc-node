@@ -54,6 +54,10 @@ ok "unit ExecStart runs start.sh with project path" \
    'grep -Fxq "ExecStart=/bin/bash $HERE/start.sh --path $PROJECT" "$UNIT"'
 ok "unit restart policy is always"      'grep -Fxq "Restart=always" "$UNIT"'
 ok "unit restart delay is 3s"           'grep -Fxq "RestartSec=3" "$UNIT"'
+ok "unit gives TERM only to the bridge during drain" \
+   'grep -Fxq "KillMode=mixed" "$UNIT"'
+ok "unit keeps bounded whole-cgroup force cleanup" \
+   'grep -Fxq "SendSIGKILL=yes" "$UNIT" && grep -Fxq "TimeoutStopSec=70" "$UNIT"'
 ok "unit WorkingDirectory is repo root" 'grep -Fxq "WorkingDirectory=$REPO" "$UNIT"'
 ok "unit WantedBy matches scope"        'grep -Fxq "WantedBy=$WANTED" "$UNIT"'
 ok "unit has no proxy env when unset"   '! grep -q "http_proxy" "$UNIT"'
@@ -93,6 +97,18 @@ ok "reconcile performs only daemon-reload (no session disruption)" \
    '[ "$(cat "$SC_CALLS")" = "$DAEMON_RELOAD" ]'
 ok "reconcile preserves node-local drop-ins" \
    '[ "$(sha256sum "$UNIT.d/override.conf")" = "$dropin_before" ]'
+
+# Units rendered before the drain contract have neither KillMode nor an
+# explicit SendSIGKILL. They are still recognized and upgraded in place.
+sed -i '/^KillMode=mixed$/d; /^SendSIGKILL=yes$/d; s/^TimeoutStopSec=70$/TimeoutStopSec=20/' "$UNIT"
+: > "$SC_CALLS"
+run env HOME="$FH" CCC_SYSTEMD_DIR="$SD" CCC_SYSTEMCTL="$SC_STUB" \
+    bash "$SSD" reconcile
+okc "$RC" 0 "pre-drain generated unit reconciles"
+ok "pre-drain unit gains bounded mixed cgroup lifecycle" \
+   'grep -Fxq "KillMode=mixed" "$UNIT" && grep -Fxq "SendSIGKILL=yes" "$UNIT" && grep -Fxq "TimeoutStopSec=70" "$UNIT"'
+ok "pre-drain reconciliation only daemon-reloads" \
+   '[ "$(cat "$SC_CALLS")" = "$DAEMON_RELOAD" ]'
 
 # Dry-run compares the same renderer but cannot mutate the main unit/drop-in or
 # contact systemctl.

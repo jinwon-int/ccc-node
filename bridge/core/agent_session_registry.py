@@ -314,6 +314,20 @@ class AgentSessionRegistry:
     def active_handles_snapshot(self) -> tuple[ActiveSessionHandle, ...]:
         return self.active_handles_for_keys(tuple(self._records))
 
+    def resident_entries_snapshot(self) -> tuple[AgentSessionEntry, ...]:
+        """Return cached sessions for optional provider workload projection.
+
+        The registry remains the sole owner of the cache.  Callers receive only
+        the session entries and may inspect provider-neutral optional seams;
+        they cannot mutate registry topology through this snapshot.
+        """
+
+        return tuple(
+            record.cached.entry
+            for record in self._records.values()
+            if record.cached is not None
+        )
+
     def prepare_close(self) -> tuple[ActiveSessionHandle, ...]:
         """Deny approvals/waiting projections and snapshot active handles."""
 

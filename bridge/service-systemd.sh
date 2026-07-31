@@ -185,7 +185,12 @@ ExecStart=/bin/bash ${SCRIPT_DIR}/start.sh --path ${project_root}
 # systemctl stop still suppresses restart, preserving operator stop semantics.
 Restart=always
 RestartSec=3
-TimeoutStopSec=20
+# SIGTERM only the bridge main process while it closes turn admission and drains
+# tracked provider/background work. At the bounded timeout systemd SIGKILLs the
+# entire cgroup, so descendants cannot escape and accumulate as orphans (#303).
+KillMode=mixed
+SendSIGKILL=yes
+TimeoutStopSec=70
 [Install]
 WantedBy=${wanted_by}
 UNIT
@@ -251,7 +256,7 @@ is_supported_generated_unit() {
             "Environment=http_proxy="*|"Environment=https_proxy="*) ;;
             "Environment=all_proxy="*|"Environment=no_proxy="*) ;;
             "ExecStart=/bin/bash "*"start.sh --path "*) ;;
-            "Restart="*|"RestartSec="*|"TimeoutStopSec="*) ;;
+            "Restart="*|"RestartSec="*|"KillMode="*|"SendSIGKILL="*|"TimeoutStopSec="*) ;;
             "WantedBy=multi-user.target"|"WantedBy=default.target") ;;
             *) return 1 ;;
         esac
@@ -274,6 +279,8 @@ is_supported_generated_unit() {
         && [ "$(grep -c '^ExecStart=' "$SYSTEMD_UNIT_FILE")" = "1" ] \
         && [ "$(grep -c '^Restart=' "$SYSTEMD_UNIT_FILE")" = "1" ] \
         && [ "$(grep -c '^RestartSec=' "$SYSTEMD_UNIT_FILE")" = "1" ] \
+        && [ "$(grep -c '^KillMode=' "$SYSTEMD_UNIT_FILE")" -le "1" ] \
+        && [ "$(grep -c '^SendSIGKILL=' "$SYSTEMD_UNIT_FILE")" -le "1" ] \
         && [ "$(grep -c '^TimeoutStopSec=' "$SYSTEMD_UNIT_FILE")" = "1" ] \
         && [ "$(grep -Ec '^WantedBy=(multi-user|default)\.target$' "$SYSTEMD_UNIT_FILE")" = "1" ]
 }

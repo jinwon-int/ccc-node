@@ -100,6 +100,16 @@ _PERMISSION_MODES = frozenset(
 )
 _EFFORT_LEVELS = frozenset({"low", "medium", "high", "xhigh", "max"})
 _PREVIEW_SCAN_LIMIT = 50
+_BACKGROUND_TASK_STARTED = re.compile(
+    r"\bbackground\s+(?:task\s+)?with\s+id\s*:\s*([A-Za-z0-9][A-Za-z0-9_.-]{0,255})",
+    re.IGNORECASE,
+)
+_BACKGROUND_TASK_FINISHED = re.compile(
+    r"<task-notification>.*?<task-id>([^<]{1,256})</task-id>.*?"
+    r"<status>(completed|failed|canceled|cancelled|timed_out|timeout)</status>.*?"
+    r"</task-notification>",
+    re.IGNORECASE | re.DOTALL,
+)
 
 # The Claude CLI resolves these aliases itself; the bridge's /model surface is
 # the same static curated set (model_discovery stays a curated list until the
@@ -196,6 +206,11 @@ class ClaudeSession:
         self._unsolicited_inflight = False
         self._unsolicited_texts: list[str] = []
         self._unsolicited_discard = False
+        # Claude Code reports run-in-background Bash ownership in the tool
+        # result and later closes it with a terminal <task-notification>.  Keep
+        # only validated opaque ids and monotonic start times; no command or
+        # output body enters health.json.
+        self._background_tasks: dict[str, float] = {}
         self._sdk_frame_observer: SdkFrameObserver | None = None
 
     # -- lifecycle ---------------------------------------------------------
@@ -305,6 +320,45 @@ class ClaudeSession:
         """
 
         self._sdk_frame_observer = observer
+
+    def background_workload_snapshot(self, now: float) -> tuple[int, float]:
+        """Return body-free tracked Claude background-task workload."""
+
+        if not self._background_tasks:
+            return 0, 0.0
+        oldest_started = min(self._background_tasks.values())
+        return len(self._background_tasks), max(0.0, float(now) - oldest_started)
+
+    @staticmethod
+    def _content_texts(value: Any) -> list[str]:
+        if isinstance(value, str):
+            return [value]
+        if isinstance(value, Mapping):
+            texts: list[str] = []
+            for item in value.values():
+                texts.extend(ClaudeSession._content_texts(item))
+            return texts
+        if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+            texts = []
+            for item in value:
+                texts.extend(ClaudeSession._content_texts(item))
+            return texts
+        return []
+
+    def _observe_background_task_result(self, result: JsonValue) -> None:
+        for text in self._content_texts(result):
+            match = _BACKGROUND_TASK_STARTED.search(text)
+            if match is not None:
+                self._background_tasks.setdefault(
+                    match.group(1), asyncio.get_running_loop().time()
+                )
+
+    def _observe_background_task_notifications(self, message: Message) -> None:
+        if not isinstance(message, UserMessage):
+            return
+        for text in self._content_texts(message.content):
+            for match in _BACKGROUND_TASK_FINISHED.finditer(text):
+                self._background_tasks.pop(match.group(1).strip(), None)
 
     def _observe_sdk_frame(self, message: Message) -> None:
         observer = self._sdk_frame_observer
@@ -447,6 +501,7 @@ class ClaudeSession:
     async def _route_message(self, message: Message) -> None:
         self._observe_sdk_frame(message)
         self._observe_session_id(message)
+        self._observe_background_task_notifications(message)
         active = self._active_turn
         if self._unsolicited_inflight or active is None or active.finished:
             # Same ownership rule as the direct reader loop
@@ -596,8 +651,8 @@ class ClaudeSession:
                     success=block.is_error is not True,
                 )
 
-    @staticmethod
     def _emit_tool_completed(
+        self,
         active: _ActiveTurn,
         tool_call_id: str,
         result: JsonValue,
@@ -609,6 +664,8 @@ class ClaudeSession:
         tool_name = active.open_tools.pop(tool_call_id, None)
         if tool_name is None:
             return
+        if tool_name == "Bash" and success:
+            self._observe_background_task_result(result)
         active.queue.put_nowait(
             ToolCompletedEvent(tool_call_id, tool_name, result, success)
         )

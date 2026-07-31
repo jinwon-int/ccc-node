@@ -24,6 +24,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the `gh-ci-wait` skill teaches agents the registration contract.
 
 ### Fixed
+- **Bounded service-restart drain (#822).** SIGTERM/SIGINT now closes new-turn
+  admission and waits up to 45 seconds for active provider work, accepted
+  Telegram run tasks, and tracked Claude run-in-background Bash IDs. Canonical
+  systemd units use `KillMode=mixed` during the grace period and an explicit
+  70-second whole-cgroup SIGKILL fallback, so ordinary/fleet restart preserves
+  work when it finishes in-window without detaching process trees or regressing
+  #303. Idle restarts remain immediate, a repeated signal is explicit force,
+  operator stop remains stopped, and transport reconnects are unchanged.
 - **Empty normal completion classification (#775).** A provider turn that
   ends successfully without user-visible text no longer returns
   `(No response)` as a `success=True` answer. When the terminal result

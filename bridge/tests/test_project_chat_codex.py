@@ -168,6 +168,37 @@ def _handler(tmp_path: Path, runtime: FakeRuntime) -> ProjectChatHandler:
     return handler
 
 
+@pytest.mark.anyio
+async def test_shutdown_drain_rejects_new_turn_before_provider_admission(
+    tmp_path: Path,
+) -> None:
+    runtime = FakeRuntime()
+    handler = _handler(tmp_path, runtime)
+
+    assert handler.begin_drain() is True
+    assert handler.begin_drain() is False
+    response = await handler.process_message("too late", user_id=7, chat_id=70)
+
+    assert response.success is False
+    assert response.error == "bridge_draining"
+    assert runtime.requests == []
+
+
+def test_workload_snapshot_includes_optional_provider_background_work(
+    tmp_path: Path,
+) -> None:
+    handler = _handler(tmp_path, FakeRuntime())
+    session = SimpleNamespace(
+        background_workload_snapshot=lambda now: (1, 23.0),
+    )
+    handler._agent_session_registry.put_cached(
+        (7, 70),
+        AgentSessionEntry(session=session, last_used_at=1.0),
+    )
+
+    assert handler.workload_snapshot(100.0) == (1, 23.0)
+
+
 async def _wait_until(predicate, *, timeout: float = 1.0) -> None:
     async with asyncio.timeout(timeout):
         while not predicate():

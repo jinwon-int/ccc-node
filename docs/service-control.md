@@ -93,6 +93,38 @@ The wildcard does not grant arbitrary service control: the immutable wrapper
 accepts only `restart <exact-unit.service>` and rechecks the root-owned
 allowlist before invoking `/usr/bin/systemctl`.
 
+### Bridge restart drain
+
+Canonical Linux bridge units use a bounded graceful-restart contract. On the
+first `SIGTERM`/`SIGINT`, the bridge closes provider admission before sampling
+workload. Requests that reached the gate first may finish; later requests get a
+typed `bridge_draining` response and must be retried against the replacement.
+The workload snapshot covers active provider turns, accepted Telegram run
+tasks, and Claude Bash tasks whose run-in-background ID has not yet received a
+terminal task notification. Idle bridges stop immediately.
+
+The in-process drain window is 45 seconds. The unit uses `KillMode=mixed`, so
+the first stop signal reaches only the bridge main process rather than killing
+its provider/Bash children concurrently. `TimeoutStopSec=70` and
+`SendSIGKILL=yes` are the fail-safe: after the drain and bounded application /
+runtime cleanup budget, systemd kills any remaining process in the cgroup.
+Nothing is moved to a detached scope, so the orphan-tree protection from #303
+is preserved. A second termination signal explicitly skips the remaining drain;
+an operator who needs an immediate hard stop can use systemd's `SIGKILL`
+facility, accepting loss of in-flight work.
+
+`systemctl stop` uses the same bounded drain and still leaves the service
+stopped; `Restart=always` does not override an explicit systemd stop. A normal
+restart—including one issued through `ccc-service-control`—drains and then
+starts the replacement. Transport-only Telegram reconnects do not enter this
+process-shutdown path. The wrapper's exact allowlist, ownership checks, and
+accepted command shape are unchanged.
+
+Existing ccc-generated main units gain this policy through the normal
+setup/self-update reconciliation (daemon-reload only; the current service is
+not restarted by reconciliation). Bespoke units remain untouched and are not
+covered until an operator deliberately normalizes their main-unit policy.
+
 ### Broker Compose reconcile wrapper
 
 Same trust model (never grant to a mutable checkout copy):

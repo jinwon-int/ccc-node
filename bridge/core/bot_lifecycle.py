@@ -89,6 +89,8 @@ class _LifecycleProjectChat(Protocol):
 
     def workload_snapshot(self, now: float) -> tuple[int, float]: ...
 
+    def begin_drain(self) -> bool: ...
+
     def waiting_for_turn_snapshot(self) -> int: ...
 
     async def enforce_session_resource_limits(
@@ -481,6 +483,11 @@ class BotLifecycleMixin:
     _MIN_UPTIME = crash_policy.INPROCESS_MIN_UPTIME_SECONDS  # polling exits faster → count as crash
     _MAX_RAPID_CRASHES = crash_policy.MAX_RAPID_CRASHES
     _WORKLOAD_INTERVAL = 10  # seconds between in-flight workload snapshots
+    # systemd's canonical unit allows 70 seconds total.  Leave 25 seconds for
+    # Application/session cleanup before KillMode=mixed applies the final
+    # cgroup SIGKILL, so no provider or Bash tree can escape (#303).
+    _SHUTDOWN_DRAIN_SECONDS = 45.0
+    _SHUTDOWN_DRAIN_POLL_SECONDS = 0.25
     # Transport-only reconnect policy (issue #411): a transient Telegram
     # NetworkError/TimedOut must not tear down the Application — that would
     # couple the polling transport to in-flight agent turns. Retry the
@@ -628,9 +635,15 @@ class BotLifecycleMixin:
         apply_subprocess_session_isolation()
         loop = asyncio.get_running_loop()
         stop_event = asyncio.Event()
+        self._shutdown_drain_task: asyncio.Task[None] | None = None
 
         for sig in (signal.SIGINT, signal.SIGTERM):
-            loop.add_signal_handler(sig, stop_event.set)
+            loop.add_signal_handler(
+                sig,
+                lambda received=sig: self._request_shutdown_drain(
+                    stop_event, received
+                ),
+            )
 
         rapid_crash_count = 0
 
@@ -1667,7 +1680,7 @@ class BotLifecycleMixin:
         while not stop_event.is_set():
             try:
                 now = asyncio.get_event_loop().time()
-                count, oldest_age = self._project_chat.workload_snapshot(now)
+                count, oldest_age = self._bridge_workload_snapshot(now)
                 waiting_for_turn = self._project_chat.waiting_for_turn_snapshot()
                 health_reporter.record_workload(
                     count,
@@ -1684,6 +1697,66 @@ class BotLifecycleMixin:
             except Exception as exc:
                 logger.debug("Terminal op drain failed: %s", type(exc).__name__)
             await asyncio.sleep(self._WORKLOAD_INTERVAL)
+
+    def _bridge_workload_snapshot(self, now: float) -> tuple[int, float]:
+        """Combine provider and accepted Telegram-task workload without bodies."""
+
+        provider_count, provider_oldest = self._project_chat.workload_snapshot(now)
+        task_snapshot = getattr(getattr(self, "_tasks", None), "workload_snapshot", None)
+        if not callable(task_snapshot):
+            return provider_count, provider_oldest
+        tracked_count, tracked_oldest = task_snapshot(now)
+        # Provider turns normally live inside a tracked Telegram task, so max
+        # avoids double-counting while still projecting pre-provider file work
+        # and provider-owned background work as busy.
+        return max(provider_count, tracked_count), max(provider_oldest, tracked_oldest)
+
+    def _request_shutdown_drain(
+        self, stop_event: asyncio.Event, received_signal: signal.Signals
+    ) -> None:
+        """Start a bounded drain; a repeated signal is an explicit force."""
+
+        task = getattr(self, "_shutdown_drain_task", None)
+        if task is not None and not task.done():
+            logger.warning(
+                "Repeated %s during shutdown drain; forcing bridge teardown",
+                received_signal.name,
+            )
+            stop_event.set()
+            return
+
+        self._project_chat.begin_drain()
+        logger.info(
+            "Shutdown drain started: signal=%s window=%.1fs",
+            received_signal.name,
+            self._SHUTDOWN_DRAIN_SECONDS,
+        )
+        self._shutdown_drain_task = asyncio.create_task(
+            self._drain_before_shutdown(stop_event), name="shutdown-drain"
+        )
+
+    async def _drain_before_shutdown(self, stop_event: asyncio.Event) -> None:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + max(0.0, self._SHUTDOWN_DRAIN_SECONDS)
+        while not stop_event.is_set():
+            now = loop.time()
+            count, oldest_age = self._bridge_workload_snapshot(now)
+            if count <= 0:
+                logger.info("Shutdown drain complete: bridge idle")
+                stop_event.set()
+                return
+            remaining = deadline - now
+            if remaining <= 0:
+                logger.warning(
+                    "Shutdown drain timed out with %d tracked workload item(s) "
+                    "after %.1fs; forcing bounded teardown (oldest=%.1fs)",
+                    count,
+                    self._SHUTDOWN_DRAIN_SECONDS,
+                    oldest_age,
+                )
+                stop_event.set()
+                return
+            await asyncio.sleep(min(self._SHUTDOWN_DRAIN_POLL_SECONDS, remaining))
 
     def _polling_task_failure(self) -> Optional[BaseException]:
         """Return the exception that killed PTB's polling task, if it died.

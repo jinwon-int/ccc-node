@@ -30,6 +30,30 @@ class UserTaskQueueTest(unittest.IsolatedAsyncioTestCase):
         await asyncio.wait_for(started.wait(), 1)
         release.set()
 
+    async def test_workload_snapshot_tracks_until_background_task_finishes(self):
+        q = UserTaskQueue(max_inflight=1)
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def run():
+            started.set()
+            await release.wait()
+
+        async def overflow():
+            raise AssertionError("should not overflow")
+
+        before = asyncio.get_running_loop().time()
+        self.assertTrue(await q.enqueue("u", run, overflow))
+        await asyncio.wait_for(started.wait(), 1)
+        count, oldest = q.workload_snapshot(before + 5)
+        self.assertEqual(count, 1)
+        self.assertGreaterEqual(oldest, 0)
+
+        release.set()
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        self.assertEqual(q.workload_snapshot(before + 6), (0, 0.0))
+
     async def test_overflow_rejected_and_callback_runs(self):
         q = UserTaskQueue(max_inflight=2)
         release = asyncio.Event()
