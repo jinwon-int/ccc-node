@@ -32,7 +32,13 @@ FH="$TMP/home"
 mkdir -p "$FH"
 
 # Unit scope follows the euid running the test (root => system scope).
-if [ "$(id -u)" = "0" ]; then WANTED="multi-user.target"; else WANTED="default.target"; fi
+if [ "$(id -u)" = "0" ]; then
+    WANTED="multi-user.target"
+    DAEMON_RELOAD="daemon-reload"
+else
+    WANTED="default.target"
+    DAEMON_RELOAD="--user daemon-reload"
+fi
 
 OUT="$TMP/out"; RC=0
 run() { RC=0; "$@" >"$OUT" 2>&1 || RC=$?; }
@@ -84,7 +90,7 @@ okc "$RC" 0 "drifted systemd reconcile exits 0"
 ok "drifted unit is restored to canonical Restart policy" \
    'grep -Fxq "Restart=always" "$UNIT" && ! grep -q "Restart=on-failure" "$UNIT"'
 ok "reconcile performs only daemon-reload (no session disruption)" \
-   '[ "$(cat "$SC_CALLS")" = "daemon-reload" ]'
+   '[ "$(cat "$SC_CALLS")" = "$DAEMON_RELOAD" ]'
 ok "reconcile preserves node-local drop-ins" \
    '[ "$(sha256sum "$UNIT.d/override.conf")" = "$dropin_before" ]'
 
@@ -123,7 +129,7 @@ okc "$RC" 1 "reload failure makes reconcile fail closed"
 ok "reload failure restores exact previous main-unit bytes" \
    '[ "$(sha256sum "$UNIT")" = "$unit_before" ]'
 ok "rollback reloads the restored definition without restart" \
-   '[ "$(grep -c "^daemon-reload$" "$ROLLBACK_CALLS")" = 2 ] && ! grep -Eq "restart|start|stop|enable" "$ROLLBACK_CALLS"'
+   '[ "$(grep -Fxc -- "$DAEMON_RELOAD" "$ROLLBACK_CALLS")" = 2 ] && ! grep -Eq "restart|start|stop|enable" "$ROLLBACK_CALLS"'
 ok "successful rollback leaves no staging artifacts" \
    '! compgen -G "$SD/.ccc-telegram-bridge.service.*" >/dev/null'
 
@@ -145,7 +151,7 @@ okc "$RC" 1 "rollback reload failure remains fail closed"
 ok "rollback reload failure still restores exact previous bytes" \
    '[ "$(sha256sum "$UNIT")" = "$unit_before" ]'
 ok "rollback reload failure is explicit and never restarts" \
-   '[ "$(grep -c "^daemon-reload$" "$ALWAYS_FAIL_CALLS")" = 2 ] && grep -q "rollback daemon-reload also failed" "$OUT" && ! grep -Eq "restart|start|stop|enable" "$ALWAYS_FAIL_CALLS"'
+   '[ "$(grep -Fxc -- "$DAEMON_RELOAD" "$ALWAYS_FAIL_CALLS")" = 2 ] && grep -q "rollback daemon-reload also failed" "$OUT" && ! grep -Eq "restart|start|stop|enable" "$ALWAYS_FAIL_CALLS"'
 
 # Arbitrary legacy directives are not smuggled into the canonical main unit.
 # The bespoke unit is left for #831's explicit renderer-flag disposition.
