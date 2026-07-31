@@ -85,6 +85,12 @@ case "${1:-}" in
     else
       echo "mempalace CLI or transcript dir missing — verbatim sweep cron skipped"
     fi
+    # #827 Phase 2: weekly parity bench (Mon 08:07) — feeds the gate-3
+    # retirement criteria (two weeks of zero Honcho-only answers, zero
+    # hallucination). bench.sh is itself mode-gated, so this line is safe
+    # even if the node opts out later without --remove.
+    ( crontab -l 2>/dev/null; echo "7 8 * * 1 bash $HOOKS/bench.sh >> $HOME/.nunchi/bench.cron.log 2>&1 $MARK" ) | crontab -
+    echo "weekly bench cron added (Mon 08:07)"
     add_sessionstart_hook
     python3 "$HOOKS/nunchi.py" init
     echo "nunchi enabled (mode=on, feed=$(basename "$feed"))"; status
