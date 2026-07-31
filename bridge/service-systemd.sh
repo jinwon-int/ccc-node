@@ -20,6 +20,7 @@
 #
 # Usage:
 #   service-systemd.sh install   --project-root <dir> [--proxy-url <url>] [--caller <name>]
+#   service-systemd.sh reconcile [--dry-run]
 #   service-systemd.sh uninstall [--caller <name>]
 #
 # Inputs (resolved by start.sh when dispatched from there):
@@ -31,8 +32,10 @@
 #
 # Test seams (same pattern as scripts/install-agent-cron-systemd.sh; defaults
 # preserve production behavior):
-#   CCC_SYSTEMD_DIR  unit directory override (default: scope-derived)
-#   CCC_SYSTEMCTL    systemctl command override (default: systemctl)
+#   CCC_SYSTEMD_DIR    unit directory override (default: scope-derived)
+#   CCC_SYSTEMCTL      systemctl command override (default: systemctl)
+#   CCC_SYSTEMD_SCOPE  scope override accepted only with CCC_SYSTEMD_DIR
+#                      (system|user; tests only)
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -40,10 +43,13 @@ SYSTEMCTL_BIN="${CCC_SYSTEMCTL:-systemctl}"
 
 usage() {
     cat <<EOF
-Usage: $0 <install|uninstall> [options]
+Usage: $0 <install|reconcile|uninstall|is-managed|main-pid> [options]
 
 Subcommands:
   install     Generate the systemd unit and enable --now it
+  reconcile   If an existing ccc-generated unit has drifted, atomically replace
+              its canonical main unit and daemon-reload without changing its
+              enabled/active state or restarting the bridge
   uninstall   Disable the service and remove the unit
   is-managed  Exit 0 iff the bridge unit file exists and systemctl reports it
               active (used by start.sh --restart to avoid supervisor fights)
@@ -56,6 +62,7 @@ Options:
   --project-root <dir>  Project root directory (required for install)
   --proxy-url <url>     Proxy URL to embed in the unit environment
   --caller <name>       Script name shown in usage hints
+  --dry-run             Report reconcile actions without writing or systemctl
   -h, --help            Show this help message and exit
 EOF
 }
@@ -64,10 +71,11 @@ SUBCOMMAND=""
 PROJECT_ROOT_ARG=""
 PROXY_URL_ARG=""
 CALLER=""
+DRY_RUN=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        install|uninstall|is-managed|main-pid)
+        install|reconcile|uninstall|is-managed|main-pid)
             SUBCOMMAND="$1"
             shift
             ;;
@@ -83,6 +91,10 @@ while [ $# -gt 0 ]; do
             CALLER="$2"
             shift 2
             ;;
+        --dry-run)
+            DRY_RUN=1
+            shift
+            ;;
         -h|--help)
             usage
             exit 0
@@ -97,6 +109,10 @@ done
 
 if [ -z "$SUBCOMMAND" ]; then
     usage >&2
+    exit 1
+fi
+if [ "$DRY_RUN" = "1" ] && [ "$SUBCOMMAND" != "reconcile" ]; then
+    echo "❌ Error: --dry-run is supported only with reconcile" >&2
     exit 1
 fi
 CALLER="${CALLER:-$SCRIPT_DIR/start.sh}"
@@ -116,8 +132,71 @@ systemd_paths() {
     # Test seam: never changes production paths unless explicitly exported.
     if [ -n "${CCC_SYSTEMD_DIR:-}" ]; then
         SYSTEMD_UNIT_DIR="$CCC_SYSTEMD_DIR"
+        case "${CCC_SYSTEMD_SCOPE:-}" in
+            system)
+                SYSTEMD_SCOPE="system"
+                SYSTEMCTL=("$SYSTEMCTL_BIN")
+                ;;
+            user)
+                SYSTEMD_SCOPE="user"
+                SYSTEMCTL=("$SYSTEMCTL_BIN" --user)
+                ;;
+            "") ;;
+            *)
+                echo "❌ Error: CCC_SYSTEMD_SCOPE must be system or user" >&2
+                exit 1
+                ;;
+        esac
     fi
     SYSTEMD_UNIT_FILE="$SYSTEMD_UNIT_DIR/$SYSTEMD_SERVICE"
+}
+
+render_systemd_unit() {
+    local project_root="$1" proxy_url="$2"
+    local project_slug svc_path proxy_env="" wanted_by="default.target"
+    project_slug="$(basename "$project_root" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '-' | sed 's/-*$//')"
+
+    # Build PATH so the claude CLI (often in ~/.local/bin) is reachable from the unit.
+    svc_path="$PATH"
+    if [ -d "$HOME/.local/bin" ] && ! echo "$svc_path" | grep -q "$HOME/.local/bin"; then
+        svc_path="$HOME/.local/bin:$svc_path"
+    fi
+    if [ -n "$proxy_url" ]; then
+        proxy_env="Environment=http_proxy=${proxy_url}
+Environment=https_proxy=${proxy_url}
+Environment=all_proxy=${proxy_url}
+Environment=no_proxy=localhost,127.0.0.1,192.168.0.0/16,10.0.0.0/8,172.16.0.0/12"
+    fi
+    [ "$SYSTEMD_SCOPE" = "system" ] && wanted_by="multi-user.target"
+
+    cat <<UNIT | sed '/^$/d'
+[Unit]
+Description=ccc-node Telegram bridge (${project_slug})
+After=network-online.target
+Wants=network-online.target
+[Service]
+Type=simple
+WorkingDirectory=${REPO_ROOT}
+Environment=HOME=${HOME}
+Environment=PATH=${svc_path}
+${proxy_env}
+ExecStart=/bin/bash ${SCRIPT_DIR}/start.sh --path ${project_root}
+# Recover when the bridge handles a direct SIGTERM as a clean exit. An explicit
+# systemctl stop still suppresses restart, preserving operator stop semantics.
+Restart=always
+RestartSec=3
+TimeoutStopSec=20
+[Install]
+WantedBy=${wanted_by}
+UNIT
+}
+
+rendered_unit_value() {
+    # Command substitution strips trailing newlines. A sentinel preserves the
+    # renderer's exact bytes so dry-run comparison needs no temporary file.
+    local rendered
+    rendered="$(render_systemd_unit "$1" "$2"; printf x)"
+    printf '%s' "${rendered%x}"
 }
 
 do_install_systemd() {
@@ -129,59 +208,16 @@ do_install_systemd() {
         echo "❌ Error: --project-root is required"
         exit 1
     fi
-    local PROJECT_ROOT PROJECT_SLUG
+    local PROJECT_ROOT
     PROJECT_ROOT="$(cd "$PROJECT_ROOT_ARG" 2>/dev/null && pwd)" || {
         echo "❌ Error: Project path does not exist: $PROJECT_ROOT_ARG"
         exit 1
     }
-    PROJECT_SLUG="$(basename "$PROJECT_ROOT" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '-' | sed 's/-*$//')"
     systemd_paths
-
-    # Build PATH so the claude CLI (often in ~/.local/bin) is reachable from the unit.
-    local svc_path="$PATH"
-    if [ -d "$HOME/.local/bin" ] && ! echo "$svc_path" | grep -q "$HOME/.local/bin"; then
-        svc_path="$HOME/.local/bin:$svc_path"
-    fi
-    # Optional proxy, mirrored from the launchd installer (resolved by the
-    # caller from PROXY_URL in the project/bot .env files).
-    local proxy_url proxy_env=""
-    proxy_url="$PROXY_URL_ARG"
-    if [ -n "$proxy_url" ]; then
-        proxy_env="Environment=http_proxy=${proxy_url}
-Environment=https_proxy=${proxy_url}
-Environment=all_proxy=${proxy_url}
-Environment=no_proxy=localhost,127.0.0.1,192.168.0.0/16,10.0.0.0/8,172.16.0.0/12"
-    fi
-
-    local wanted_by="default.target"
-    [ "$SYSTEMD_SCOPE" = "system" ] && wanted_by="multi-user.target"
 
     echo "📝 Generating systemd unit: $SYSTEMD_UNIT_FILE"
     mkdir -p "$SYSTEMD_UNIT_DIR"
-    cat > "$SYSTEMD_UNIT_FILE" <<UNIT
-[Unit]
-Description=ccc-node Telegram bridge (${PROJECT_SLUG})
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-WorkingDirectory=${REPO_ROOT}
-Environment=HOME=${HOME}
-Environment=PATH=${svc_path}
-${proxy_env}
-ExecStart=/bin/bash ${SCRIPT_DIR}/start.sh --path ${PROJECT_ROOT}
-# Recover when the bridge handles a direct SIGTERM as a clean exit. An explicit
-# systemctl stop still suppresses restart, preserving operator stop semantics.
-Restart=always
-RestartSec=3
-TimeoutStopSec=20
-
-[Install]
-WantedBy=${wanted_by}
-UNIT
-    # Collapse the blank line left when there is no proxy block.
-    sed -i '/^$/d' "$SYSTEMD_UNIT_FILE" 2>/dev/null || true
+    render_systemd_unit "$PROJECT_ROOT" "$PROXY_URL_ARG" > "$SYSTEMD_UNIT_FILE"
 
     "${SYSTEMCTL[@]}" daemon-reload
     if "${SYSTEMCTL[@]}" enable --now "$SYSTEMD_SERVICE"; then
@@ -195,6 +231,177 @@ UNIT
     echo "💡 Status: ${SYSTEMCTL[*]} status $SYSTEMD_SERVICE"
     echo "💡 Logs:   journalctl ${journal_scope}-u $SYSTEMD_SERVICE -f"
     echo "💡 Remove: $CALLER --path \"$PROJECT_ROOT\" --uninstall-systemd"
+    exit 0
+}
+
+is_supported_generated_unit() {
+    # Reconciliation is intentionally bounded to the schema historically
+    # emitted by this script. Unknown directives and node-local Environment=
+    # entries are not copied into the canonical main unit: operators should
+    # keep those in <unit>.d/*.conf drop-ins. This leaves bespoke units such as
+    # #831 untouched pending an explicit normalization decision.
+    local line
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in
+            ""|"#"*|"[Unit]"|"[Service]"|"[Install]") ;;
+            "Description=ccc-node Telegram bridge ("*")") ;;
+            "After=network-online.target"|"Wants=network-online.target") ;;
+            "Type=simple"|"WorkingDirectory="*) ;;
+            "Environment=HOME="*|"Environment=PATH="*) ;;
+            "Environment=http_proxy="*|"Environment=https_proxy="*) ;;
+            "Environment=all_proxy="*|"Environment=no_proxy="*) ;;
+            "ExecStart=/bin/bash "*"start.sh --path "*) ;;
+            "Restart="*|"RestartSec="*|"TimeoutStopSec="*) ;;
+            "WantedBy=multi-user.target"|"WantedBy=default.target") ;;
+            *) return 1 ;;
+        esac
+    done < "$SYSTEMD_UNIT_FILE"
+
+    # Require the complete generated-unit skeleton exactly once. The directive
+    # allowlist above prevents unknown policy from being copied; these counts
+    # prevent a coincidentally similar hand-written fragment from being
+    # mistaken for an old generated unit.
+    [ "$(grep -Fxc '[Unit]' "$SYSTEMD_UNIT_FILE")" = "1" ] \
+        && [ "$(grep -Fxc '[Service]' "$SYSTEMD_UNIT_FILE")" = "1" ] \
+        && [ "$(grep -Fxc '[Install]' "$SYSTEMD_UNIT_FILE")" = "1" ] \
+        && [ "$(grep -c '^Description=ccc-node Telegram bridge (' "$SYSTEMD_UNIT_FILE")" = "1" ] \
+        && [ "$(grep -Fxc 'After=network-online.target' "$SYSTEMD_UNIT_FILE")" = "1" ] \
+        && [ "$(grep -Fxc 'Wants=network-online.target' "$SYSTEMD_UNIT_FILE")" = "1" ] \
+        && [ "$(grep -Fxc 'Type=simple' "$SYSTEMD_UNIT_FILE")" = "1" ] \
+        && [ "$(grep -c '^WorkingDirectory=' "$SYSTEMD_UNIT_FILE")" = "1" ] \
+        && [ "$(grep -c '^Environment=HOME=' "$SYSTEMD_UNIT_FILE")" = "1" ] \
+        && [ "$(grep -c '^Environment=PATH=' "$SYSTEMD_UNIT_FILE")" = "1" ] \
+        && [ "$(grep -c '^ExecStart=' "$SYSTEMD_UNIT_FILE")" = "1" ] \
+        && [ "$(grep -c '^Restart=' "$SYSTEMD_UNIT_FILE")" = "1" ] \
+        && [ "$(grep -c '^RestartSec=' "$SYSTEMD_UNIT_FILE")" = "1" ] \
+        && [ "$(grep -c '^TimeoutStopSec=' "$SYSTEMD_UNIT_FILE")" = "1" ] \
+        && [ "$(grep -Ec '^WantedBy=(multi-user|default)\.target$' "$SYSTEMD_UNIT_FILE")" = "1" ]
+}
+
+installed_render_inputs() {
+    local exec_line project_root
+    local http_proxy="" https_proxy="" all_proxy="" no_proxy=""
+    local exec_count proxy_count
+
+    exec_count="$(grep -c '^ExecStart=' "$SYSTEMD_UNIT_FILE" 2>/dev/null || true)"
+    [ "$exec_count" = "1" ] || return 1
+    exec_line="$(grep '^ExecStart=' "$SYSTEMD_UNIT_FILE")"
+    project_root="$(printf '%s\n' "$exec_line" \
+        | sed -n 's|^ExecStart=/bin/bash /.*/start\.sh --path \(/.*\)$|\1|p')"
+    [ -n "$project_root" ] || return 1
+    project_root="$(cd "$project_root" 2>/dev/null && pwd)" || return 1
+
+    proxy_count="$(grep -Ec '^Environment=(http_proxy|https_proxy|all_proxy|no_proxy)=' \
+        "$SYSTEMD_UNIT_FILE" 2>/dev/null || true)"
+    if [ "$proxy_count" != "0" ]; then
+        [ "$proxy_count" = "4" ] || return 1
+        http_proxy="$(sed -n 's/^Environment=http_proxy=//p' "$SYSTEMD_UNIT_FILE")"
+        https_proxy="$(sed -n 's/^Environment=https_proxy=//p' "$SYSTEMD_UNIT_FILE")"
+        all_proxy="$(sed -n 's/^Environment=all_proxy=//p' "$SYSTEMD_UNIT_FILE")"
+        no_proxy="$(sed -n 's/^Environment=no_proxy=//p' "$SYSTEMD_UNIT_FILE")"
+        [ -n "$http_proxy" ] || return 1
+        [ "$http_proxy" = "$https_proxy" ] && [ "$http_proxy" = "$all_proxy" ] || return 1
+        [ "$no_proxy" = "localhost,127.0.0.1,192.168.0.0/16,10.0.0.0/8,172.16.0.0/12" ] || return 1
+    fi
+
+    RECONCILE_PROJECT_ROOT="$project_root"
+    RECONCILE_PROXY_URL="$http_proxy"
+}
+
+is_canonical_unit_topology() {
+    if [ -L "$SYSTEMD_UNIT_FILE" ]; then
+        echo "⚠️  Existing unit path is a symlink and is treated as noncanonical/bespoke; left untouched: $SYSTEMD_UNIT_FILE" >&2
+        echo "    Normalize the main-unit path explicitly and keep node-local overrides in $SYSTEMD_UNIT_FILE.d/*.conf drop-ins." >&2
+        return 1
+    fi
+
+    local link_count
+    if ! link_count="$(stat -c '%h' -- "$SYSTEMD_UNIT_FILE" 2>/dev/null)" \
+       || ! [[ "$link_count" =~ ^[1-9][0-9]*$ ]]; then
+        echo "❌ Cannot trust link-count metadata for the existing unit; left untouched: $SYSTEMD_UNIT_FILE" >&2
+        return 2
+    fi
+    if [ "$link_count" != "1" ]; then
+        echo "⚠️  Existing unit has $link_count hard links and is treated as noncanonical/bespoke; left untouched: $SYSTEMD_UNIT_FILE" >&2
+        echo "    Normalize the main-unit path explicitly and keep node-local overrides in $SYSTEMD_UNIT_FILE.d/*.conf drop-ins." >&2
+        return 1
+    fi
+}
+
+do_reconcile_systemd() {
+    systemd_paths
+    if [ ! -f "$SYSTEMD_UNIT_FILE" ]; then
+        echo "⚪ systemd unit not installed; reconciliation skipped: $SYSTEMD_UNIT_FILE"
+        exit 0
+    fi
+    is_canonical_unit_topology
+    local topology_status=$?
+    if [ "$topology_status" = "1" ]; then
+        exit 0
+    elif [ "$topology_status" != "0" ]; then
+        exit 1
+    fi
+    if ! is_supported_generated_unit || ! installed_render_inputs; then
+        echo "⚠️  Existing unit is not a recognized ccc-generated main unit; left untouched: $SYSTEMD_UNIT_FILE" >&2
+        echo "    Normalize it explicitly and keep node-local overrides in $SYSTEMD_UNIT_FILE.d/*.conf drop-ins." >&2
+        exit 0
+    fi
+
+    local candidate
+    candidate="$(rendered_unit_value "$RECONCILE_PROJECT_ROOT" "$RECONCILE_PROXY_URL")"
+    if cmp -s "$SYSTEMD_UNIT_FILE" <(printf '%s\n' "$candidate"); then
+        echo "✅ systemd unit already canonical; left untouched: $SYSTEMD_UNIT_FILE"
+        exit 0
+    fi
+    if [ "$DRY_RUN" = "1" ]; then
+        echo "[dry-run] systemd unit drift detected: $SYSTEMD_UNIT_FILE"
+        echo "[dry-run] would atomically replace the canonical main unit and run: ${SYSTEMCTL[*]} daemon-reload"
+        echo "[dry-run] service enabled/active state would be preserved; no stop, start, enable, or restart"
+        exit 0
+    fi
+    if ! command -v "$SYSTEMCTL_BIN" >/dev/null 2>&1; then
+        echo "❌ systemctl not found; existing unit left untouched: $SYSTEMD_UNIT_FILE" >&2
+        exit 1
+    fi
+
+    local staged backup
+    staged="$(mktemp "$SYSTEMD_UNIT_DIR/.${SYSTEMD_SERVICE}.new.XXXXXX")" || {
+        echo "❌ Failed to stage canonical systemd unit; existing unit left untouched" >&2
+        exit 1
+    }
+    backup="$(mktemp "$SYSTEMD_UNIT_DIR/.${SYSTEMD_SERVICE}.rollback.XXXXXX")" || {
+        rm -f -- "$staged"
+        echo "❌ Failed to stage systemd rollback copy; existing unit left untouched" >&2
+        exit 1
+    }
+    if ! printf '%s\n' "$candidate" > "$staged" \
+       || ! chmod 0644 "$staged" \
+       || ! cp -p -- "$SYSTEMD_UNIT_FILE" "$backup" \
+       || ! cmp -s "$SYSTEMD_UNIT_FILE" "$backup"; then
+        rm -f -- "$staged" "$backup"
+        echo "❌ Failed to stage systemd reconciliation; existing unit left untouched" >&2
+        exit 1
+    fi
+    if ! mv -f -- "$staged" "$SYSTEMD_UNIT_FILE"; then
+        rm -f -- "$staged" "$backup"
+        echo "❌ Atomic systemd unit replacement failed; existing unit left untouched" >&2
+        exit 1
+    fi
+    if ! "${SYSTEMCTL[@]}" daemon-reload; then
+        echo "❌ systemctl daemon-reload failed; restoring the previous unit" >&2
+        if ! mv -f -- "$backup" "$SYSTEMD_UNIT_FILE"; then
+            echo "❌ Fail-closed rollback degraded; recovery copy retained at: $backup" >&2
+            exit 1
+        fi
+        if ! "${SYSTEMCTL[@]}" daemon-reload; then
+            echo "❌ Previous unit restored, but rollback daemon-reload also failed; service was not restarted" >&2
+            exit 1
+        fi
+        echo "❌ Previous unit restored and reloaded; service was not restarted" >&2
+        exit 1
+    fi
+    rm -f -- "$backup"
+    echo "✅ Reconciled canonical $SYSTEMD_SCOPE unit without restarting or changing service state: $SYSTEMD_UNIT_FILE"
     exit 0
 }
 
@@ -252,6 +459,7 @@ do_main_pid() {
 
 case "$SUBCOMMAND" in
     install)    do_install_systemd ;;
+    reconcile)  do_reconcile_systemd ;;
     uninstall)  do_uninstall_systemd ;;
     is-managed) do_is_managed ;;
     main-pid)   do_main_pid ;;

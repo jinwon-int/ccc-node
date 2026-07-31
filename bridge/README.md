@@ -112,6 +112,12 @@ reviewed `scripts/ccc-self-update.sh` path. See
 > `Restart=always`, so a direct signal that the bridge handles as a clean exit is recovered; an
 > explicit `systemctl stop` remains stopped. Do not combine systemd with `-d`. Override the unit
 > name with `BRIDGE_SERVICE_NAME=...` to run multiple bridges on one host.
+> Subsequent top-level `setup.sh`/self-update runs compare an existing ccc-generated main unit
+> with this canonical renderer and atomically reconcile drift followed by `daemon-reload`; they
+> do not restart the bridge or change its enabled/active state. Put node-local systemd settings
+> in `/etc/systemd/system/ccc-telegram-bridge.service.d/*.conf` (or the corresponding
+> `~/.config/systemd/user/...service.d/` directory), because bespoke main units are deliberately
+> left untouched for explicit operator normalization.
 
 > **Restart ownership.** Run `--restart` from a shell outside the serving
 > bridge process tree. An agent turn that tries to restart its own bridge is
