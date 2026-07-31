@@ -43,6 +43,14 @@ All notable changes to the Claude Code node harness. Dates are KST.
   composition is unchanged. (#749)
 
 ### Fixed
+- Claude delegated runs now retain the exact active-turn approval route across
+  intermediate SDK result frames while bounded local agent/workflow tasks are
+  still running. Later identical approval requests in the same live run no
+  longer fail with `No active turn accepts approval requests`; terminal,
+  interrupted, replaced, drained, generation-mismatched, and cross-conversation
+  callbacks remain fail-closed, and stale callbacks never rebind to a later
+  turn. External-wait publication remains an independent active-turn contract.
+  (#804)
 - Linux bridge restarts now enter a bounded graceful drain instead of sending
   SIGTERM to the whole service cgroup at once. The bridge closes new-turn
   admission, waits up to 45 seconds for active provider turns, accepted run

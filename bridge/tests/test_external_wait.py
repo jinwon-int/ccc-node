@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 import pytest
@@ -249,6 +250,28 @@ class _FakeSession:
         return None
 
 
+class _BlockingRouteSession(_FakeSession):
+    def __init__(self, session_id: str, home: Path) -> None:
+        super().__init__(session_id, home)
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    def send_turn(
+        self,
+        message: str,
+        *,
+        approval_handler: ApprovalHandler = deny_approval,
+    ) -> AsyncIterator[AgentEvent]:
+        async def stream() -> AsyncIterator[AgentEvent]:
+            self.route_during_turn = resolve_active_route(self._home)
+            self.started.set()
+            await self.release.wait()
+            yield TextDeltaEvent("ok")
+            yield CompletionEvent("end_turn")
+
+        return stream()
+
+
 class _FakeRuntime:
     supports_session_browsing = False
 
@@ -296,4 +319,47 @@ async def test_turn_publishes_route_and_clears_it_on_exit(tmp_path: Path) -> Non
     assert session.route_during_turn["chat_id"] == 70
     assert session.route_during_turn["session_id"] == "sess-1"
     # After the turn the route is gone (fail-closed for late registrations).
+    assert resolve_active_route(home) is None
+
+
+@pytest.mark.anyio
+async def test_external_wait_route_is_independent_of_approval_generation(
+    tmp_path: Path,
+) -> None:
+    """#804: external-wait publication and approval leases are distinct contracts."""
+
+    home = tmp_path / ".telegram_bot" / "external-wait"
+    session = _BlockingRouteSession("sess-1", home)
+    settings = SimpleNamespace(
+        agent_provider="claude",
+        project_root=tmp_path,
+        execution_profile="strict-project",
+        bash_policy="disabled",
+        allowed_user_ids=[7],
+        require_allowlist=True,
+        claude_cli_path=None,
+        claude_settings_path=tmp_path / "claude" / "settings.json",
+        enable_streaming=False,
+        enable_partial_streaming=False,
+        bot_data_dir=None,
+        task_ledger_path=None,
+        session_guard_enabled=False,
+    )
+    handler = ProjectChatHandler(settings=settings, agent_runtime=_FakeRuntime(session))
+    handler._task_ledger_cache = False
+
+    turn = asyncio.create_task(handler.process_message("hello", 7, 70))
+    await asyncio.wait_for(session.started.wait(), timeout=2.0)
+    assert handler.is_agent_approval_active(7, 70, 1)
+    assert resolve_active_route(home) is not None
+
+    # Approval revocation (/stop, /new, provider switch, or terminal teardown)
+    # does not silently rewrite external-wait's file-backed route contract.
+    handler.invalidate_agent_approvals(7, 70)
+    assert not handler.is_agent_approval_active(7, 70, 1)
+    assert resolve_active_route(home) is not None
+
+    session.release.set()
+    response = await asyncio.wait_for(turn, timeout=2.0)
+    assert response.success is True
     assert resolve_active_route(home) is None
