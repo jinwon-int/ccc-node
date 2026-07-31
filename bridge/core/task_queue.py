@@ -32,6 +32,7 @@ class UserTaskQueue:
         self._run_tasks: Dict[Any, Set[asyncio.Task]] = {}
         # Currently executing task per key, for the priority stop/revert paths.
         self._active: Dict[Any, asyncio.Task] = {}
+        self._started_at: Dict[asyncio.Task, float] = {}
 
     def _lock(self, key: Any) -> asyncio.Lock:
         lock = self._locks.get(key)
@@ -53,11 +54,13 @@ class UserTaskQueue:
     def _track(self, key: Any, task: asyncio.Task) -> None:
         tasks = self._prune(key)
         tasks.add(task)
+        self._started_at[task] = asyncio.get_running_loop().time()
 
         def _on_done(t: asyncio.Task):
             current = self._run_tasks.get(key)
             if current is not None:
                 current.discard(t)
+            self._started_at.pop(t, None)
             try:
                 t.result()
             except asyncio.CancelledError:
@@ -70,6 +73,15 @@ class UserTaskQueue:
     def active(self, key: Any) -> Optional[asyncio.Task]:
         """The currently executing task for *key*, if any."""
         return self._active.get(key)
+
+    def workload_snapshot(self, now: float) -> tuple[int, float]:
+        """Return body-free workload for every unfinished accepted run task."""
+
+        live = [task for task in self._started_at if not task.done()]
+        if not live:
+            return 0, 0.0
+        oldest = min(self._started_at[task] for task in live)
+        return len(live), max(0.0, float(now) - oldest)
 
     def clear(self, key: Any) -> int:
         """Cancel and drop all in-flight tasks for *key*; return how many."""

@@ -63,6 +63,8 @@ from telegram_bot.utils.health import health_reporter
 
 logger = logging.getLogger(__name__)
 
+_DRAIN_RESPONSE = "Bridge restart is draining existing work; please retry shortly."
+
 
 def _claim_request_terminal(request: _PendingRequest, phase: RequestPhase, *, cause: str) -> bool:
     """Claim a terminal result without turning normal races into exceptions."""
@@ -164,6 +166,13 @@ class ProjectChatProcessMixin:
         # direct SDK path; the runtime path's approval boundary is
         # approval_callback. Accepted and ignored for caller compatibility.
         del permission_callback
+        if getattr(self, "_shutdown_draining", False):
+            return ChatResponse(
+                content=f"⏳ {_DRAIN_RESPONSE}",
+                success=False,
+                error="bridge_draining",
+                session_id=session_id,
+            )
         self._require_runtime()
         if getattr(self._config, "agent_provider", "claude") == "claude":
             # Claude adapter path (#584): the bot layer's approval/sandbox
@@ -443,6 +452,22 @@ class ProjectChatProcessMixin:
                 # recycle from landing between start_or_resume() and active
                 # registration, while turns remain parallel after admission.
                 async with self._session_guard_lock:
+                    # The signal callback and this check run on the same event
+                    # loop.  A request already past this point owns admission;
+                    # one waiting on the guard when drain begins must not start
+                    # a provider process or turn.
+                    if getattr(self, "_shutdown_draining", False):
+                        _claim_request_terminal(
+                            progress_request,
+                            RequestPhase.FAILED,
+                            cause="bridge-draining",
+                        )
+                        return ChatResponse(
+                            content=f"⏳ {_DRAIN_RESPONSE}",
+                            success=False,
+                            error="bridge_draining",
+                            session_id=session_id,
+                        )
                     runtime = self._require_runtime()
                     cached = self._agent_session_registry.get_cached(key)
                     entry = cached.entry if cached is not None else None

@@ -43,6 +43,13 @@ All notable changes to the Claude Code node harness. Dates are KST.
   composition is unchanged. (#749)
 
 ### Fixed
+- Linux bridge restarts now enter a bounded graceful drain instead of sending
+  SIGTERM to the whole service cgroup at once. The bridge closes new-turn
+  admission, waits up to 45 seconds for active provider turns, accepted run
+  tasks, and tracked Claude background Bash tasks, then performs bounded
+  runtime cleanup. Canonical root and user systemd units use `KillMode=mixed`
+  with a 70-second whole-cgroup SIGKILL fail-safe, preserving explicit stop,
+  `Restart=always`, transport-only reconnects, and #303 orphan cleanup. (#822)
 - Agent-cron owner/chat failure notifications now distinguish fleet domain
   alerts from generic task failures by promoting only bounded counts of the
   redacted line-start tokens `DOWN`, `UNREACHABLE`, `DRIFT`, and `BOOTPATH`.

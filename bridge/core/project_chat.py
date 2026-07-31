@@ -200,6 +200,7 @@ class ProjectChatHandler(
         self._agent_runtime = agent_runtime
         self._agent_session_registry = AgentSessionRegistry()
         self._agent_runtime_closed = False
+        self._shutdown_draining = False
         self._agent_interrupt_timeout_seconds = 10.0
         self._session_guard_lock = asyncio.Lock()
         self._session_guard_evictions = 0
@@ -517,7 +518,44 @@ class ProjectChatHandler(
         count = metrics.active_sessions
         oldest_started = metrics.oldest_started_at
         oldest_age = (now - oldest_started) if oldest_started is not None else 0.0
-        return count, max(0.0, oldest_age)
+        oldest_age = max(0.0, oldest_age)
+
+        # A provider may own tracked work after the interactive turn has
+        # returned (Claude's run-in-background Bash tasks are the motivating
+        # case).  Keep this optional so Codex and future runtimes retain the
+        # same provider-neutral session contract.
+        for entry in self._agent_session_registry.resident_entries_snapshot():
+            snapshot = getattr(entry.session, "background_workload_snapshot", None)
+            if not callable(snapshot):
+                continue
+            try:
+                background_count, background_oldest_age = snapshot(now)
+            except Exception:
+                logger.debug(
+                    "Provider background workload snapshot failed: provider=%s",
+                    type(entry.session).__name__,
+                )
+                continue
+            count += max(0, int(background_count))
+            oldest_age = max(oldest_age, max(0.0, float(background_oldest_age)))
+        return count, oldest_age
+
+    def begin_drain(self) -> bool:
+        """Atomically close admission for new provider turns.
+
+        Returns true only for the transition into drain.  Existing turns and
+        tracked provider background work remain visible to
+        :meth:`workload_snapshot` until they finish or the supervisor's bounded
+        shutdown window expires.
+        """
+
+        first = not self._shutdown_draining
+        self._shutdown_draining = True
+        return first
+
+    @property
+    def is_draining(self) -> bool:
+        return self._shutdown_draining
 
     def waiting_for_turn_snapshot(self) -> int:
         """Requests registered by the bridge but not admitted by a runtime."""

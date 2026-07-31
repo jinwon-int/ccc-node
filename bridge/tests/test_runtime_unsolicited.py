@@ -57,6 +57,9 @@ from claude_agent_sdk import (  # noqa: E402 -- must follow the stub purge above
     StreamEvent,
     SystemMessage,
     TextBlock,
+    ToolResultBlock,
+    ToolUseBlock,
+    UserMessage,
 )
 
 from telegram_bot.core.agent_runtime import (  # noqa: E402
@@ -179,6 +182,39 @@ class ManualClaudeSdkClient:
             self.emit_result(result="turn answer")
         elif script == "hang":
             pass  # the test emits this turn's frames (if any) by hand
+        elif script == "background":
+            tool_id = "toolu-background"
+            self.emit(
+                AssistantMessage(
+                    content=[
+                        ToolUseBlock(
+                            id=tool_id,
+                            name="Bash",
+                            input={"command": "validate", "run_in_background": True},
+                        )
+                    ],
+                    model="claude-test-model",
+                    session_id=self.session_id,
+                )
+            )
+            self.emit(
+                UserMessage(
+                    content=[
+                        ToolResultBlock(
+                            tool_use_id=tool_id,
+                            content=[
+                                {
+                                    "type": "text",
+                                    "text": "Command running in background with ID: bg-42",
+                                }
+                            ],
+                            is_error=False,
+                        )
+                    ]
+                )
+            )
+            self.emit_assistant("validation started")
+            self.emit_result(result="validation started")
 
     async def receive_messages(self) -> AsyncIterator[Message]:
         while True:
@@ -280,6 +316,37 @@ class ClaudeRuntimeUnsolicitedTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(texts, ["turn answer"])
         self.assertIsInstance(events[-1], CompletionEvent)
         self.assertEqual(len(self.delivered), 1)
+
+    async def test_background_bash_is_tracked_until_terminal_notification(self) -> None:
+        session, client = await self._start_session()
+        client.turn_scripts.append("background")
+
+        await _collect(session.send_turn("run validation"))
+        count, oldest = session.background_workload_snapshot(
+            asyncio.get_running_loop().time()
+        )
+        self.assertEqual(count, 1)
+        self.assertGreaterEqual(oldest, 0.0)
+
+        client.emit(
+            UserMessage(
+                content=(
+                    "<task-notification><task-id>bg-42</task-id>"
+                    "<status>completed</status><summary>green</summary>"
+                    "</task-notification>"
+                )
+            )
+        )
+        await _wait_until(
+            lambda: session.background_workload_snapshot(
+                asyncio.get_running_loop().time()
+            )[0]
+            == 0
+        )
+        self.assertEqual(
+            session.background_workload_snapshot(asyncio.get_running_loop().time()),
+            (0, 0.0),
+        )
 
     async def test_result_text_wins_over_buffered_assistant_text(self) -> None:
         session, client = await self._start_session()
