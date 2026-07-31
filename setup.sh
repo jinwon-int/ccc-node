@@ -615,6 +615,20 @@ else
 fi
 note "Codex managed skills reconciled from compatibility catalog"
 
+# Reconcile only an already-installed, recognizably ccc-generated bridge unit.
+# service-systemd.sh renders the canonical bytes, leaves an identical file
+# untouched, and on drift performs only an atomic main-unit replacement plus
+# daemon-reload. It never restarts/enables/starts/stops the bridge, so an active
+# request is not interrupted and an operator-stopped unit remains stopped.
+# Bespoke units are left for explicit normalization; node-local systemd policy
+# belongs in <unit>.d/*.conf drop-ins, not copied legacy main-unit lines.
+if [ "$DRY" = 1 ]; then
+  "$SRC/bridge/service-systemd.sh" reconcile --dry-run
+else
+  "$SRC/bridge/service-systemd.sh" reconcile
+fi
+note "Existing ccc-telegram-bridge systemd unit checked against the canonical renderer"
+
 cat <<'EOF'
 
 ==> Done. Follow-up checklist (do these manually):

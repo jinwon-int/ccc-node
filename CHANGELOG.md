@@ -43,6 +43,15 @@ All notable changes to the Claude Code node harness. Dates are KST.
   composition is unchanged. (#749)
 
 ### Fixed
+- Top-level setup/self-update now reconciles an already-installed, ccc-generated
+  Telegram bridge systemd main unit against the canonical
+  `bridge/service-systemd.sh` renderer. Identical units are untouched; drift is
+  replaced atomically and followed only by `daemon-reload`, preserving active
+  sessions and operator-stopped state. Dry-run is mutation-free and explicit,
+  systemctl failures restore the previous unit fail-closed, user scope follows
+  the invoking user, and bespoke/node-local policy remains in systemd drop-ins
+  instead of being copied from arbitrary legacy main-unit lines. (#830; #831
+  remains a separate live normalization decision.)
 - Skill autosave auto-install no longer fails closed on nodes whose default
   umask is 0002 (#770). Both install paths (auto and owner-approved create)
   now pin the skill directory to mode 700 and SKILL.md to 600 instead of

@@ -45,12 +45,12 @@ class StartScriptStaticTests(unittest.TestCase):
 
     def test_systemd_service_recovers_from_clean_process_exit(self):
         text = SERVICE_SYSTEMD_SH.read_text(encoding="utf-8")
-        install_start = text.index("do_install_systemd()")
-        install_end = text.index("do_uninstall_systemd()", install_start)
-        installer = text[install_start:install_end]
+        render_start = text.index("render_systemd_unit()")
+        render_end = text.index("rendered_unit_value()", render_start)
+        renderer = text[render_start:render_end]
 
-        self.assertIn("Restart=always", installer)
-        self.assertNotIn("Restart=on-failure", installer)
+        self.assertIn("Restart=always", renderer)
+        self.assertNotIn("Restart=on-failure", renderer)
 
     def test_start_sh_dispatches_install_actions_to_subcommand_scripts(self):
         # The --install/--uninstall(-systemd) machinery lives in the extracted

@@ -55,6 +55,31 @@ ok "setup dry-run does not create Codex plugin policy state" '[ ! -e "$nonroot_h
 ok "setup dry-run reports Codex managed skills without creating CODEX_HOME" \
   '[ "$rc" = 0 ] && grep -Fq "ccc-doctor" <<<"$out" && grep -Fq "create" <<<"$out" && [ ! -e "$nonroot_home/.codex" ]'
 
+# setup/self-update wiring must reach the canonical bridge renderer while
+# remaining mutation-free in dry-run. Use only fixture paths and fake systemctl.
+setup_sd="$TMP/setup-systemd"
+setup_project="$TMP/setup-project"
+setup_systemctl="$TMP/setup-systemctl"
+setup_systemctl_calls="$TMP/setup-systemctl.calls"
+mkdir -p "$setup_project"
+printf '#!/usr/bin/env bash\necho "$*" >> "%s"\n' "$setup_systemctl_calls" > "$setup_systemctl"
+chmod +x "$setup_systemctl"
+HOME="$nonroot_home" CCC_SYSTEMD_DIR="$setup_sd" CCC_SYSTEMD_SCOPE=user \
+  CCC_SYSTEMCTL="$setup_systemctl" bash "$ROOT/bridge/service-systemd.sh" \
+  install --project-root "$setup_project" >/dev/null 2>&1
+setup_unit="$setup_sd/ccc-telegram-bridge.service"
+sed -i 's/^Restart=always$/Restart=on-failure/' "$setup_unit"
+setup_unit_before="$(sha256sum "$setup_unit")"
+: > "$setup_systemctl_calls"
+out="$(HOME="$nonroot_home" CCC_CLAUDE_DIR="$nonroot_claude" \
+  CCC_HERMES_DIR="$nonroot_hermes" CCC_WIKI_AGENT_BIN="$nonroot_wiki" \
+  CCC_SYSTEMD_DIR="$setup_sd" CCC_SYSTEMD_SCOPE=user \
+  CCC_SYSTEMCTL="$setup_systemctl" bash "$SETUP" --dry-run 2>&1)"; rc=$?
+ok "setup dry-run explicitly detects existing systemd unit drift" \
+  '[ "$rc" = 0 ] && grep -q "systemd unit drift detected" <<<"$out"'
+ok "setup dry-run leaves systemd unit and daemon untouched" \
+  '[ "$(sha256sum "$setup_unit")" = "$setup_unit_before" ] && [ ! -s "$setup_systemctl_calls" ]'
+
 out="$(HOME="$TMP/root-guard-home" CCC_CLAUDE_DIR=/ CCC_HERMES_DIR="$TMP/root-guard-hermes" bash "$SETUP" --dry-run 2>&1)"; rc=$?
 ok "setup refuses filesystem-root Claude install target" '[ "$rc" = 2 ] && grep -q "filesystem-root" <<<"$out"'
 out="$(HOME="$TMP/root-guard-home" CCC_CLAUDE_DIR="$TMP/root-guard-claude" CCC_HERMES_DIR=/ bash "$SETUP" --dry-run 2>&1)"; rc=$?
