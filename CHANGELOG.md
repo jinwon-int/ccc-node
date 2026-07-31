@@ -43,6 +43,11 @@ All notable changes to the Claude Code node harness. Dates are KST.
   composition is unchanged. (#749)
 
 ### Fixed
+- Agent-cron owner/chat failure notifications now distinguish fleet domain
+  alerts from generic task failures by promoting only bounded counts of the
+  redacted line-start tokens `DOWN`, `UNREACHABLE`, `DRIFT`, and `BOOTPATH`.
+  Existing fleet-watch tasks gain the alert title without a store migration;
+  arbitrary diagnostic details remain confined to the redacted body. (#829)
 - Top-level setup/self-update now reconciles an already-installed, ccc-generated
   Telegram bridge systemd main unit against the canonical
   `bridge/service-systemd.sh` renderer. Identical units are untouched; drift is

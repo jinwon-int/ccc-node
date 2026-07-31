@@ -520,6 +520,138 @@ PY
 rc=$?
 ok "owner redaction uses exact canonical source and preserves broader hardening" '[ "$rc" = 0 ]'
 
+# --- #829: fleet diagnostics are domain alerts, not generic cron failures ---
+out="$(python3 - "$ROOT" "$TMP/fleet-alert-spool" <<'PY'
+import importlib.util
+import json
+import os
+from pathlib import Path
+import sys
+
+root = Path(sys.argv[1])
+spool = Path(sys.argv[2])
+sys.path.insert(0, str(root / "scripts"))
+spec = importlib.util.spec_from_file_location(
+    "agent_cron_fleet_alert_test", root / "scripts" / "agent_cron.py"
+)
+assert spec and spec.loader
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+
+task_id = "adapter-fleet-watch"
+headless = {
+    "exitCode": 1,
+    "stdout": (
+        "OK healthy-node (/safe/path)\n"
+        "DOWN private-node free-form detail\n"
+        "UNREACHABLE secret-node credentials=should-not-title\n"
+        "DOWN duplicate-node /private/path\n"
+        "prefix DRIFT ignored\n"
+        " DOWN ignored-leading-space\n"
+        "DOWNSTREAM ignored-prefix\n"
+    ),
+    "stderr": (
+        "DRIFT hidden-node doctor_exit=1 runtime=/home/hidden/ccc-node\n"
+        "BOOTPATH hidden-node unit=/secret/unit runtime=/secret/runtime\n"
+        "DRIFT second-hidden-node api_key=SECRET_LOOKING_VALUE\n"
+    ),
+}
+expected_title = (
+    "agent-cron fleet alert for task adapter-fleet-watch: "
+    "DOWN=2 UNREACHABLE=1 DRIFT=2 BOOTPATH=1"
+)
+
+failed = module.build_owner_text(
+    task_id, "run-failed", "2026-01-01T00:00:00Z", "failed", headless
+)
+assert failed is not None
+failed_lines = failed.splitlines()
+assert failed_lines[0] == expected_title, failed_lines[0]
+assert "private-node" not in failed_lines[0]
+assert "/private/path" not in failed_lines[0]
+assert "SECRET_LOOKING_VALUE" not in failed_lines[0]
+assert "ignored" not in failed_lines[0]
+assert "SECRET_LOOKING_VALUE" not in failed
+
+# All non-success states use the same alert classification, including timeout.
+timed_out = module.build_owner_text(
+    "fleet-doctor-sweep", "run-timeout", "2026-01-01T00:00:00Z", "timeout",
+    {"exitCode": 124, "stdout": "", "stderr": "UNREACHABLE private-node\n"},
+)
+assert timed_out is not None
+assert timed_out.splitlines()[0] == (
+    "agent-cron fleet alert for task fleet-doctor-sweep: UNREACHABLE=1"
+)
+
+# A failure without a recognized line-start token retains the existing fallback.
+generic = module.build_owner_text(
+    "ordinary-task", "run-generic", "2026-01-01T00:00:00Z", "failed",
+    {"exitCode": 1, "stdout": "OK node\nprefix DOWN node", "stderr": "ordinary error"},
+)
+assert generic is not None
+assert generic.splitlines()[0] == (
+    "agent-cron task ordinary-task finished with status=failed"
+)
+leading_space = module.build_owner_text(
+    "ordinary-task", "run-leading", "2026-01-01T00:00:00Z", "failed",
+    {"exitCode": 1, "stdout": " DOWN hidden-node\nDRIFTED hidden-node", "stderr": ""},
+)
+assert leading_space is not None
+assert leading_space.splitlines()[0] == (
+    "agent-cron task ordinary-task finished with status=failed"
+)
+
+# Success text is unchanged even if successful output happens to contain a token.
+success = module.build_owner_text(
+    task_id, "run-success", "2026-01-01T00:00:00Z", "success",
+    {"exitCode": 0, "stdout": "DOWN diagnostic-only", "stderr": ""},
+)
+assert success is not None
+assert success.splitlines()[0] == (
+    "agent-cron task adapter-fleet-watch finished with status=success"
+)
+
+# Invalid ids cannot be promoted into the structured domain-alert title.
+invalid = module.build_owner_text(
+    "bad id\nINJECTED", "run-invalid", "2026-01-01T00:00:00Z", "failed",
+    {"exitCode": 1, "stdout": "DOWN hidden-node", "stderr": ""},
+)
+assert invalid is not None
+assert "fleet alert" not in invalid.splitlines()[0]
+
+os.environ["CCC_PUSH_SPOOL"] = str(spool)
+owner = module.write_owner_spool(
+    {"notify": "telegram-owner-on-failure"}, task_id, "run-owner",
+    "2026-01-01T00:00:00Z", "failed", headless, None,
+)
+assert owner["delivery"] == "spooled"
+
+chat_id = "-1001234567890"
+os.environ["CCC_AGENT_CRON_NOTIFY_ALLOWED_CHATS"] = chat_id
+chat = module.write_owner_spool(
+    {"notify": "telegram-chat-on-failure", "notifyChatId": chat_id},
+    task_id, "run-chat", "2026-01-01T00:00:00Z", "failed", headless, None,
+)
+assert chat["delivery"] == "spooled"
+
+payloads = [
+    json.loads(path.read_text(encoding="utf-8"))
+    for path in spool.glob("*.json")
+]
+assert len(payloads) == 2
+assert {payload["recipient"] for payload in payloads} == {"owner", "chat"}
+for payload in payloads:
+    assert payload["text"].splitlines()[0] == expected_title
+    assert "SECRET_LOOKING_VALUE" not in payload["text"]
+    assert payload["dedup"] == f"agent-cron:{task_id}:{payload['runId']}:failed"
+    assert payload["version"] == 1
+
+print(json.dumps({"title": expected_title, "payloads": len(payloads)}, sort_keys=True))
+PY
+)"; rc=$?
+ok "non-success fleet signals produce bounded allowlist-only owner/chat alert titles" \
+  '[ "$rc" = 0 ] && jq -e ".payloads == 2 and (.title | contains(\"DOWN=2 UNREACHABLE=1 DRIFT=2 BOOTPATH=1\"))" <<<"$out" >/dev/null'
+
 ISOLATED="$TMP/redaction-unavailable"
 mkdir -p "$ISOLATED/scripts"
 cp "$ROOT/scripts"/agent_cron*.py "$ISOLATED/scripts/"
@@ -541,12 +673,12 @@ assert module._canonical_redaction is None
 os.environ["CCC_PUSH_SPOOL"] = str(spool)
 secret = "ghp_" + "Z" * 24
 result = module.write_owner_spool(
-    {"notify": "telegram-owner"},
+    {"notify": "telegram-owner-on-failure"},
     "task",
     "run",
     "2026-01-01T00:00:00Z",
-    "success",
-    {"exitCode": 0, "stdout": secret, "stderr": ""},
+    "failed",
+    {"exitCode": 1, "stdout": "DOWN hidden-node " + secret, "stderr": ""},
     None,
 )
 assert result["delivery"] == "blocked-redaction-unavailable"
@@ -621,7 +753,7 @@ ok "run writes owner-only redacted spool for successful notify task" '[ "$rc" = 
 ok "spool payload is owner-only, canonically redacted, and bridge-compatible" 'f="$(find "$SPOOL" -maxdepth 1 -type f -name "*.json" | head -1)"; jq -e ".event == \"AgentCronRun\" and .recipient == \"owner\" and .taskId == \"exec-notify\" and .status == \"success\" and (.text | contains(\"abcdefghijklmnopqrstuvwxyz1234567890\") | not) and (.text | contains(\"[REDACTED_CREDENTIAL]\") )" "$f" >/dev/null'
 
 out="$(CCC_AGENT_CRON_STORE="$EXEC_STORE" CCC_HEADLESS_CMD="$FAKE_HEADLESS" CCC_PUSH_SPOOL="$SPOOL" bash "$CMD" run exec-notify-fail --json --at 2026-01-01T00:03:00Z 2>&1)"; rc=$?
-ok "run writes owner-only spool for failed notify task" '[ "$rc" = 1 ] && jq -e ".ok == false and .status == \"failed\" and .notification.delivery == \"spooled\" and .mutations.pushSpoolWrite == true" <<<"$out" >/dev/null && find "$SPOOL" -maxdepth 1 -type f -name "*.json" -print0 | xargs -0 jq -e "select(.taskId == \"exec-notify-fail\" and .status == \"failed\" and .recipient == \"owner\")" >/dev/null && [ ! -e "$TMP/exec-store/locks/exec-notify-fail.lock" ]'
+ok "run writes owner-only spool for failed notify task" '[ "$rc" = 1 ] && jq -e ".ok == false and .status == \"failed\" and .notification.delivery == \"spooled\" and .mutations.pushSpoolWrite == true" <<<"$out" >/dev/null && find "$SPOOL" -maxdepth 1 -type f -name "*.json" -print0 | xargs -0 jq -s -e "any(.[]; .taskId == \"exec-notify-fail\" and .status == \"failed\" and .recipient == \"owner\")" >/dev/null && [ ! -e "$TMP/exec-store/locks/exec-notify-fail.lock" ]'
 
 BAD_SPOOL="$TMP/not-a-dir-spool"
 printf 'not a directory' > "$BAD_SPOOL"
