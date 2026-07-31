@@ -25,7 +25,12 @@ Usage:
   nunchi.py snapshot [--limit N]             # SessionStart-ready summary
   nunchi.py stats
 """
-import json, os, sqlite3, subprocess, sys, hashlib
+import hashlib
+import json
+import os
+import sqlite3
+import subprocess
+import sys
 from datetime import datetime, timezone
 
 DB = os.environ.get("NUNCHI_DB", os.path.expanduser("~/.nunchi/facts.db"))
@@ -252,7 +257,7 @@ def llm_synthesize(prompt):
     text = out.stdout.strip()
     if shutil.which("codex") and not shutil.which("claude"):
         # codex exec prints session log lines; the answer is the final block
-        lines = [l for l in text.splitlines() if l.strip()]
+        lines = [ln for ln in text.splitlines() if ln.strip()]
         text = lines[-1] if lines else ""
     return text or out.stderr.strip()
 
@@ -343,9 +348,12 @@ def stats():
 if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else "stats"
     args = sys.argv[2:]
-    flag = lambda name, default=None: (args[args.index(name) + 1] if name in args else default)
+    def flag(name, default=None):
+        return args[args.index(name) + 1] if name in args else default
+
     if cmd == "init":
-        db(); print(f"db ready: {DB}")
+        db()
+        print(f"db ready: {DB}")
     elif cmd == "ingest":
         ingest(args[0])
     elif cmd == "recall":
