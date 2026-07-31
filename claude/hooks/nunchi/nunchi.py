@@ -28,6 +28,7 @@ Usage:
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -262,8 +263,58 @@ def llm_synthesize(prompt):
     return text or out.stderr.strip()
 
 
+_KW_STOP = {
+    "the", "a", "an", "of", "to", "in", "and", "or", "is", "are", "was", "were",
+    "what", "which", "how", "when", "where", "who", "why", "did", "do", "does",
+    "무엇", "어떻게", "어디", "어느", "언제", "누가", "왜", "그리고", "또는",
+    "있다", "없다", "한다", "했다", "된다", "됐다", "기억나", "알려줘", "말해줘",
+}
+_KW_PARTICLE = re.compile(
+    r"(에서는|에서|으로|이라|이란|인가|인지|한다|했다|합니까|입니까"
+    r"|은|는|이|가|을|를|의|에|로|와|과|도|만)$")
+
+
+def _keywords(query, max_terms=6):
+    """Project a natural-language query onto its content words (#824 Phase 1).
+
+    Strips common Korean particles/aux endings and stopwords so an exact-word
+    MemPalace query can be formed from a paraphrased question.
+    """
+    out = []
+    for tok in re.findall(r"[A-Za-z0-9_.\-/]+|[가-힣]+", query):
+        base = _KW_PARTICLE.sub("", tok) if re.fullmatch(r"[가-힣]+", tok) else tok
+        if len(base) >= 2 and base.lower() not in _KW_STOP and base not in _KW_STOP \
+           and base not in out:
+            out.append(base)
+    return out[:max_terms]
+
+
+def _mp_search(mp, query, n):
+    """One MemPalace CLI search, cleaned to excerpt lines. [] on any failure."""
+    try:
+        out = subprocess.run([mp, "search", query, "--results", str(n)],
+                             capture_output=True, text=True, timeout=30)
+    except Exception:
+        return []
+    if out.returncode != 0:
+        return []
+    keep = []
+    for ln in out.stdout.splitlines():
+        s = ln.strip()
+        if not s or s.startswith("=") or s.startswith("─") or s.startswith("Results for") \
+           or s.startswith("Source:") or s.startswith("Match:") or s.startswith("MemPalace"):
+            continue
+        keep.append(s)
+    return keep
+
+
 def mempalace_verbatim(query, n=3):
     """Decision §3 verbatim layer — pull transcript excerpts via MemPalace CLI.
+
+    Hybrid retrieval (#824 Phase 1): the embedding search is paraphrase-
+    sensitive (TM-1332 Q4 — a natural-language query missed excerpts an
+    exact-word query recovered), so we search twice — the raw query plus its
+    keyword projection — and merge order-preserving, de-duplicated.
 
     Silent empty string on any failure (no CLI, no palace, timeout) so
     dialectic degrades to peer_facts-only. MemPalace is an external uv tool,
@@ -273,21 +324,13 @@ def mempalace_verbatim(query, n=3):
     mp = shutil.which("mempalace") or os.path.expanduser("~/.local/bin/mempalace")
     if not os.path.exists(mp):
         return ""
-    try:
-        out = subprocess.run([mp, "search", query, "--results", str(n)],
-                             capture_output=True, text=True, timeout=30)
-    except Exception:
-        return ""
-    if out.returncode != 0:
-        return ""
-    keep = []
-    for ln in out.stdout.splitlines():
-        s = ln.strip()
-        if not s or s.startswith("=") or s.startswith("─") or s.startswith("Results for") \
-           or s.startswith("Source:") or s.startswith("Match:") or s.startswith("MemPalace"):
-            continue
-        keep.append(s)
-    return "\n".join(keep[:40])
+    lines = _mp_search(mp, query, n)
+    kw = " ".join(_keywords(query))
+    if kw and kw.strip().lower() != query.strip().lower():
+        for s in _mp_search(mp, kw, n):
+            if s not in lines:
+                lines.append(s)
+    return "\n".join(lines[:40])
 
 
 def dialectic(query, target):
@@ -325,7 +368,7 @@ def snapshot(limit):
     rows = c.execute(
         "SELECT observed,kind,fact FROM peer_facts WHERE valid_to IS NULL"
         " ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
-    lines = ["## nunchi working memory (shadow)"]
+    lines = ["## nunchi working memory (primary — gate-3 transition, #824)"]
     lines += [f"- ({o}/{k}) {f}" for o, k, f in rows]
     text = "\n".join(lines)
     os.makedirs(os.path.dirname(SNAPSHOT), exist_ok=True)

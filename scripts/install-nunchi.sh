@@ -73,6 +73,18 @@ case "${1:-}" in
     feed="$HOOKS/ingest-cron.sh"
     [ "${2:-}" = "--codex" ] && feed="$HOOKS/codex-feed.sh"
     ( crontab -l 2>/dev/null; echo "*/10 * * * * bash $feed >> $HOME/.nunchi/cron.log 2>&1 $MARK" ) | crontab -
+    # #824 Phase 1: hourly incremental MemPalace sweep keeps the verbatim
+    # layer fresh (sweep is idempotent). Only when the external CLI and the
+    # transcript dir exist; skipped silently otherwise (peer_facts-only).
+    mp="$(command -v mempalace || true)"
+    [ -z "$mp" ] && [ -x "$HOME/.local/bin/mempalace" ] && mp="$HOME/.local/bin/mempalace"
+    sweep_dir="${NUNCHI_SWEEP_DIR:-$HOME/.claude/projects}"
+    if [ -n "$mp" ] && [ -d "$sweep_dir" ]; then
+      ( crontab -l 2>/dev/null; echo "17 * * * * $mp sweep $sweep_dir >> $HOME/.nunchi/mempalace-sweep.cron.log 2>&1 $MARK" ) | crontab -
+      echo "mempalace hourly sweep cron added ($sweep_dir)"
+    else
+      echo "mempalace CLI or transcript dir missing — verbatim sweep cron skipped"
+    fi
     add_sessionstart_hook
     python3 "$HOOKS/nunchi.py" init
     echo "nunchi enabled (mode=on, feed=$(basename "$feed"))"; status

@@ -138,5 +138,39 @@ chmod +x "$TMP/bin/claude"
 out="$(PATH="$TMP/bin:/usr/bin:/bin" HOME="$TMP/home" python3 "$NP" dialectic "모델" 2>&1)"
 ok "dialectic synthesizes via stub backend" 'grep -q "STUB-ANSWER" <<<"$out"'
 
+# ---- 11. #824 Phase 1: keyword projection + hybrid verbatim -----------------
+out="$(python3 -c "
+import sys; sys.path.insert(0, '$HERE')
+from nunchi import _keywords
+print(' '.join(_keywords('퀴즈 API가 어느 주소에서 돌고 있었는지 기억나?')))")"
+ok "keywords strip particles and stopwords" 'grep -q "퀴즈" <<<"$out" && grep -q "API" <<<"$out" && grep -q "주소" <<<"$out" && ! grep -q "기억나" <<<"$out"'
+cat > "$TMP/bin/mempalace" <<'EOF'
+#!/usr/bin/env bash
+q="$2"
+echo "      SHARED-LINE common excerpt"
+case "$q" in
+  *기억나*) echo "      NATURAL-ONLY excerpt" ;;
+  *)        echo "      KEYWORD-ONLY excerpt" ;;
+esac
+EOF
+chmod +x "$TMP/bin/mempalace"
+out="$(PATH="$TMP/bin:/usr/bin:/bin" python3 -c "
+import sys; sys.path.insert(0, '$HERE')
+from nunchi import mempalace_verbatim
+print(mempalace_verbatim('퀴즈 API가 어느 주소에서 돌고 있었는지 기억나?'))")"
+ok "hybrid merges natural + keyword search results" 'grep -q "NATURAL-ONLY" <<<"$out" && grep -q "KEYWORD-ONLY" <<<"$out"'
+ok "hybrid de-duplicates shared excerpts" '[ "$(grep -c "SHARED-LINE" <<<"$out")" = 1 ]'
+
+# ---- 12. #824 Phase 1: snapshot header promoted + bench runner --------------
+python3 "$NP" snapshot --limit 5 >/dev/null 2>&1
+ok "snapshot header marks nunchi primary" 'grep -q "nunchi working memory (primary" "$NUNCHI_SNAPSHOT"'
+printf 'off' > "$CCC_STATE_DIR/nunchi.mode"
+out="$(bash "$HERE/bench.sh" 2>&1)"; rc=$?
+ok "bench no-op when mode=off" '[ "$rc" = 0 ] && [ -z "$out" ]'
+rows="$(tail -n +2 "$HERE/bench-qset.tsv" | grep -c .)"
+badcols="$(awk -F'\t' 'NF!=4' "$HERE/bench-qset.tsv" | grep -c . || true)"
+ok "bench qset has 5 rows of 4 tab-separated columns" '[ "$rows" = 5 ] && [ "$badcols" = 0 ]'
+printf 'on' > "$CCC_STATE_DIR/nunchi.mode"
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

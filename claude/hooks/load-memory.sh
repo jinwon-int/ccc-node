@@ -293,6 +293,16 @@ if ! is_disabled "$HONCHO_ENABLED" && [ "$PROFILE" != "max-perf" ]; then
   honcho_note="$(stale_note 'Honcho' "$CACHE/honcho.txt")"
 fi
 
+# Gate-3 transition (#824 Phase 1): on nunchi-enabled nodes the nunchi
+# snapshot hook is the primary working memory; label Honcho secondary so the
+# model weighs sources accordingly. Honcho stays injected for verification
+# until Phase 3 (freeze/retire).
+honcho_role=""
+nunchi_mode="${CCC_NUNCHI_MODE:-$(cat "$STATE_DIR/nunchi.mode" 2>/dev/null || printf 'off')}"
+if [ "$nunchi_mode" = "on" ]; then
+  honcho_role=" (secondary — nunchi snapshot is primary during the gate-3 transition)"
+fi
+
 resume_block=""
 if [ -n "${resume:-}" ]; then
   resume_block="▶ 직전 세션에서 이어서:
@@ -330,7 +340,7 @@ ${mem:-(memory files unavailable)}
 ## Local hot memory (task-conditioned cache search)
 ${local_hot:-(local hot memory disabled or no hits)}
 ${wiki_block}
-## Honcho working memory — ${USER_LABEL}
+## Honcho working memory — ${USER_LABEL}${honcho_role}
 ${honcho:-(Honcho disabled or no Honcho cache yet)}"
 
 ctx="$(printf '%s' "$ctx" | limit_bytes "$MAX_TOTAL")"

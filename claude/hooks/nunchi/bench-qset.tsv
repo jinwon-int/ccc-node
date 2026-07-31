@@ -1,0 +1,6 @@
+id	category	query	expect_hint
+q1	relational-preference	사용자가 Claude 모델 설정 변경을 어떻게 검증하길 원하나	실측(로그·grep) 기반 검증 + 정정 즉시 기록 선호
+q2	relational-aggregate	nunchi 파일럿 노드별 fact 수는 어떻게 되나	노드별 수치를 근거와 함께 (DB 최신값 허용)
+q3	verbatim-keyword	quiz2-api 서비스 포트와 경로	seoseo /opt/seoseo-services/quiz2 계열 원문 상세
+q4	verbatim-paraphrase	퀴즈 API가 어느 주소에서 돌고 있었는지 기억나?	q3과 동일 사실 — 자연어 패러프레이즈 회수 검증(TM-1332 Q4 약점)
+q5	supersede-time	이 노드의 현재 ccc-node HEAD 커밋은	최신 fact가 과거 fact를 대체해야 함 (B2/시간축 검증)
