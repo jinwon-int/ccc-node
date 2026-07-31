@@ -24,6 +24,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the `gh-ci-wait` skill teaches agents the registration contract.
 
 ### Fixed
+- **Autonomous budget isolation and dead-session skip visibility (#798).** The
+  existing per-provider daily token settings now gate the already-persisted
+  autonomous-mode ledger only, so interactive traffic remains recorded without
+  consuming autonomous allowance or being rejected. Budget decisions, alerts,
+  and reports name that denominator explicitly while atomic reservations,
+  refunds, warning thresholds, and version-1 per-mode ledgers remain compatible.
+  Dead-session wakeup health/status now accumulates every bounded `skipped_*`
+  category, and skip-only scans emit the existing count-only lifecycle summary.
 - **Long Claude delegated-run approval routing (#804).** ClaudeRuntime no longer
   treats an intermediate SDK `ResultMessage` as the end of a run while a
   `local_agent` or `local_workflow` is still in flight. The exact turn and its

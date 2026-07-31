@@ -194,9 +194,11 @@ class Config(
         ge=0,
         alias="CCC_USAGE_BUDGET_TOKENS_CLAUDE",
         description=(
-            "Daily Claude token budget (input+output) for the usage meter. "
-            "0 disables the budget. Crossing warn/enforce thresholds raises "
-            "one alert each per day; enforce blocks autonomous spend only."
+            "Daily Claude autonomous token budget (input+output) for the usage "
+            "meter. 0 disables the budget. Interactive usage remains metered "
+            "but does not consume this allowance. Crossing warn/enforce "
+            "thresholds raises one alert each per day; enforce blocks "
+            "autonomous spend only."
         ),
     )
     usage_budget_tokens_codex: int = Field(
@@ -204,9 +206,11 @@ class Config(
         ge=0,
         alias="CCC_USAGE_BUDGET_TOKENS_CODEX",
         description=(
-            "Daily Codex token budget (input+output) for the usage meter. "
-            "0 disables the budget. Crossing warn/enforce thresholds raises "
-            "one alert each per day; enforce blocks autonomous spend only."
+            "Daily Codex autonomous token budget (input+output) for the usage "
+            "meter. 0 disables the budget. Interactive usage remains metered "
+            "but does not consume this allowance. Crossing warn/enforce "
+            "thresholds raises one alert each per day; enforce blocks "
+            "autonomous spend only."
         ),
     )
     usage_budget_warn_percent: int = Field(

@@ -280,11 +280,15 @@ CAPABILITY_AXES: tuple[CapabilityAxis, ...] = (
         "Account/session usage normalizes into provider-tagged UsageSnapshot values.",
         claude=_supported(
             "Rate-limit events and result usage parse via parse_claude_rate_limit_event "
-            "and parse_claude_result."
+            "and parse_claude_result; provider budgets use the body-free "
+            "autonomous-mode ledger only, while interactive usage remains recorded "
+            "and ungated."
         ),
         codex=_supported(
             "Account rate limits, account usage, and thread token usage parse and "
-            "merge into UsageSnapshot."
+            "merge into UsageSnapshot; provider budgets use the body-free "
+            "autonomous-mode ledger only, while interactive usage remains recorded "
+            "and ungated."
         ),
     ),
     _axis(

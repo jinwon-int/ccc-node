@@ -144,6 +144,57 @@ class HealthRenderTests(unittest.TestCase):
             lines,
         )
 
+    def test_budget_only_skipped_wakeup_scan_is_observable(self):
+        data = self._fresh(
+            dead_session_wakeup={
+                "enabled": True,
+                "scans": 2,
+                "scanned": 1,
+                "triggered": 0,
+                "delivered": 0,
+                "failed": 0,
+                "skipped_active": 0,
+                "skipped_locked": 0,
+                "skipped_quarantine": 0,
+                "skipped_cooldown": 0,
+                "skipped_attempts": 0,
+                "skipped_budget": 2,
+                "last_scan_at": "2026-07-15T11:59:55Z",
+            }
+        )
+
+        lines = self._render(self._write(data))
+
+        self.assertIn(
+            "   Dead-session wakeup: enabled "
+            "(scans=2 scanned=1 triggered=0 delivered=0 failed=0; "
+            "skipped active=0 locked=0 quarantine=0 cooldown=0 attempts=0 "
+            "budget=2; last scan 5s ago)",
+            lines,
+        )
+
+    def test_old_wakeup_health_without_skip_counters_still_renders(self):
+        data = self._fresh(
+            dead_session_wakeup={
+                "enabled": True,
+                "scans": 1,
+                "scanned": 0,
+                "triggered": 0,
+                "delivered": 0,
+                "failed": 0,
+                "last_scan_at": "2026-07-15T11:59:55Z",
+            }
+        )
+
+        lines = self._render(self._write(data))
+
+        self.assertIn(
+            "   Dead-session wakeup: enabled "
+            "(scans=1 scanned=0 triggered=0 delivered=0 failed=0; "
+            "last scan 5s ago)",
+            lines,
+        )
+
     def test_stale_wakeup_scan_degrades_independently_of_fresh_health(self):
         data = self._fresh(
             dead_session_wakeup={
@@ -252,6 +303,16 @@ class HealthRenderTests(unittest.TestCase):
                     "last_scan_at": "2026-07-15T11:59:55Z",
                 },
                 "inconsistent scan count",
+            ),
+            (
+                "partial skip counters",
+                {
+                    "enabled": True,
+                    **valid_counters,
+                    "skipped_budget": 1,
+                    "last_scan_at": "2026-07-15T11:59:55Z",
+                },
+                "invalid skip counters",
             ),
         ]
 

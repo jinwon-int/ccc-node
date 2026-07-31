@@ -526,6 +526,42 @@ class StartStatusTests(unittest.TestCase):
             self.assertIn("Claude: healthy", result.stdout)
             self.assertNotIn("old error", result.stdout)
 
+    def test_status_renders_dead_session_wakeup_skip_counters(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_root = self._prepare_project(tmpdir)
+            pid_file = project_root / ".telegram_bot" / "bot.pid"
+            pid_file.write_text(f"{os.getpid()}\n", encoding="utf-8")
+            now = datetime.now(timezone.utc)
+            self._write_health(
+                project_root,
+                pid=os.getpid(),
+                updated_at=now,
+                dead_session_wakeup={
+                    "enabled": True,
+                    "scans": 3,
+                    "scanned": 2,
+                    "triggered": 0,
+                    "delivered": 0,
+                    "failed": 0,
+                    "skipped_active": 0,
+                    "skipped_locked": 0,
+                    "skipped_quarantine": 0,
+                    "skipped_cooldown": 0,
+                    "skipped_attempts": 0,
+                    "skipped_budget": 3,
+                    "last_scan_at": _iso_utc(now),
+                },
+            )
+
+            result = self._run_status(project_root)
+
+            self.assertEqual(result.returncode, 0)
+            self.assertIn(
+                "skipped active=0 locked=0 quarantine=0 cooldown=0 "
+                "attempts=0 budget=3",
+                result.stdout,
+            )
+
     def test_status_degraded_reports_component_reasons(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             project_root = self._prepare_project(tmpdir)

@@ -43,6 +43,12 @@ All notable changes to the Claude Code node harness. Dates are KST.
   composition is unchanged. (#749)
 
 ### Fixed
+- Bridge autonomous budgets now evaluate only the durable autonomous-mode token
+  ledger, so interactive provider traffic remains metered but cannot exhaust or
+  block autonomous work. Budget decisions/reports expose that denominator, and
+  dead-session wakeup health/status accumulates count-only active, locked,
+  quarantine, cooldown, attempts-cap, and budget skip totals; skip-only scans
+  also produce the lifecycle summary. Refs #798.
 - Claude delegated runs now retain the exact active-turn approval route across
   intermediate SDK result frames while bounded local agent/workflow tasks are
   still running. Later identical approval requests in the same live run no

@@ -256,7 +256,7 @@ class ProductionCompositionTests(unittest.IsolatedAsyncioTestCase):
         meter = handler.usage_meter
         assert meter is not None
 
-        meter.record("codex", "interactive", input_tokens=1200)
+        meter.record("codex", "autonomous", input_tokens=1200)
 
         spooled = sorted((self.root / "spool").glob("*.json"))
         self.assertEqual(len(spooled), 2, "warn and enforce alerts must both spool")
@@ -267,7 +267,8 @@ class ProductionCompositionTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(payload["event"], "usage-budget")
             self.assertRegex(
                 payload["text"],
-                r"^(⚠️ warn|🛑 enforce): codex used \d+ of \d+ daily budget tokens",
+                r"^(⚠️ warn|🛑 enforce): codex autonomous used \d+ of \d+ "
+                r"daily autonomous budget tokens",
             )
             self.assertTrue(payload["dedup"].startswith("usage-budget:"))
         self.assertEqual(events, ["usage-budget", "usage-budget"])
@@ -279,7 +280,7 @@ class ProductionCompositionTests(unittest.IsolatedAsyncioTestCase):
         meter = handler.usage_meter
         assert meter is not None
 
-        meter.record("codex", "interactive", input_tokens=1200)
+        meter.record("codex", "autonomous", input_tokens=1200)
 
         self.assertFalse((self.root / "spool").exists())
         self.assertEqual(meter.used_tokens("codex"), 1200)
@@ -292,7 +293,7 @@ class ProductionCompositionTests(unittest.IsolatedAsyncioTestCase):
         )
         meter = handler.usage_meter
         assert meter is not None
-        meter.record("codex", "interactive", input_tokens=1000)
+        meter.record("codex", "autonomous", input_tokens=1000)
 
         journal = _RecordingJournal()
         backend = _CountingBackend()

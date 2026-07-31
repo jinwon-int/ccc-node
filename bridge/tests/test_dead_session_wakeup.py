@@ -813,6 +813,12 @@ class WakeupLifecycleHealthTests(unittest.TestCase):
             delivered=0,
             failed=0,
             rejected=0,
+            skipped_active=0,
+            skipped_locked=0,
+            skipped_quarantine=0,
+            skipped_cooldown=0,
+            skipped_attempts=0,
+            skipped_budget=0,
         )
         record_scan = Mock()
         fake_health_reporter = SimpleNamespace(
@@ -846,6 +852,12 @@ class WakeupLifecycleHealthTests(unittest.TestCase):
                 triggered=0,
                 delivered=0,
                 failed=0,
+                skipped_active=0,
+                skipped_locked=0,
+                skipped_quarantine=0,
+                skipped_cooldown=0,
+                skipped_attempts=0,
+                skipped_budget=0,
             )
             enabled_logs = [
                 entry
@@ -853,6 +865,68 @@ class WakeupLifecycleHealthTests(unittest.TestCase):
                 if entry.args == ("Dead-session wakeup enabled",)
             ]
             self.assertEqual(len(enabled_logs), 1)
+
+        asyncio.run(scenario())
+
+    def test_budget_only_skip_records_health_and_emits_summary(self) -> None:
+        lifecycle = bot_lifecycle.BotLifecycleMixin()
+        lifecycle._config = SimpleNamespace(dead_session_wakeup=True)  # type: ignore[assignment]
+        lifecycle._session_manager = object()  # type: ignore[assignment]
+        lifecycle._project_chat = SimpleNamespace(  # type: ignore[assignment]
+            conversations_dir=Path("/unused"),
+            usage_meter=None,
+        )
+        lifecycle.application = SimpleNamespace(bot=object())
+        stats = SimpleNamespace(
+            scanned=1,
+            triggered=0,
+            delivered=0,
+            failed=0,
+            rejected=0,
+            skipped_active=0,
+            skipped_locked=0,
+            skipped_quarantine=0,
+            skipped_cooldown=0,
+            skipped_attempts=0,
+            skipped_budget=1,
+        )
+        record_scan = Mock()
+        fake_health_reporter = SimpleNamespace(
+            record_dead_session_wakeup_scan=record_scan
+        )
+
+        async def scenario() -> None:
+            with (
+                patch.object(
+                    bot_lifecycle,
+                    "run_dead_session_wakeup_scan",
+                    new=AsyncMock(return_value=stats),
+                ),
+                patch.object(bot_lifecycle, "health_reporter", fake_health_reporter),
+                patch.object(bot_lifecycle.logger, "info") as info,
+            ):
+                tick = lifecycle._build_dead_session_wakeup_tick()
+                assert tick is not None
+                await tick()
+
+            record_scan.assert_called_once_with(
+                scanned=1,
+                triggered=0,
+                delivered=0,
+                failed=0,
+                skipped_active=0,
+                skipped_locked=0,
+                skipped_quarantine=0,
+                skipped_cooldown=0,
+                skipped_attempts=0,
+                skipped_budget=1,
+            )
+            summaries = [
+                call
+                for call in info.call_args_list
+                if call.args and call.args[0].startswith("Dead-session wakeup: scanned=")
+            ]
+            self.assertEqual(len(summaries), 1)
 
         asyncio.run(scenario())
 

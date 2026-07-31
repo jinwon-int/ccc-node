@@ -1307,8 +1307,22 @@ class BotLifecycleMixin:
                 triggered=stats.triggered,
                 delivered=stats.delivered,
                 failed=stats.failed,
+                skipped_active=stats.skipped_active,
+                skipped_locked=stats.skipped_locked,
+                skipped_quarantine=stats.skipped_quarantine,
+                skipped_cooldown=stats.skipped_cooldown,
+                skipped_attempts=stats.skipped_attempts,
+                skipped_budget=stats.skipped_budget,
             )
-            if stats.triggered or stats.failed or stats.rejected:
+            skipped = (
+                stats.skipped_active
+                + stats.skipped_locked
+                + stats.skipped_quarantine
+                + stats.skipped_cooldown
+                + stats.skipped_attempts
+                + stats.skipped_budget
+            )
+            if stats.triggered or stats.failed or stats.rejected or skipped:
                 logger.info(
                     "Dead-session wakeup: scanned=%d triggered=%d delivered=%d "
                     "failed=%d rejected=%d budget=%d cooldown=%d attempts=%d "
