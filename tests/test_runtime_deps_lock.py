@@ -19,6 +19,7 @@ UNLOCKED_FALLBACK = REPO_ROOT / "bridge" / "requirements.txt"
 CI_LOCK = REPO_ROOT / ".github" / "requirements" / "bridge-ci.txt"
 PYPROJECT = REPO_ROOT / "bridge" / "pyproject.toml"
 START_SH = REPO_ROOT / "bridge" / "start.sh"
+DEPENDENCY_BOOTSTRAP = REPO_ROOT / "bridge" / "dependency_bootstrap.py"
 CI_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ci.yml"
 LOCK_SCRIPT = REPO_ROOT / "scripts" / "ccc-deps-lock.sh"
 
@@ -114,29 +115,34 @@ def test_runtime_lock_excludes_dev_and_ci_tooling():
 
 def test_start_sh_installs_hash_locked_by_default():
     script = START_SH.read_text(encoding="utf-8")
-    assert 'LOCK_FILE="$SCRIPT_DIR/requirements.lock.txt"' in script
-    assert '--require-hashes -r "$LOCK_FILE"' in script
+    bootstrap = DEPENDENCY_BOOTSTRAP.read_text(encoding="utf-8")
+    assert '"$SCRIPT_DIR/dependency_bootstrap.py"' in script
+    assert '"--require-hashes", "-r", str(paths.lock)' in bootstrap
     # The editable first-party install must not pull unhashed transitives.
-    assert '--no-deps -e "$SCRIPT_DIR"' in script
+    assert '"--no-deps", "-e", str(paths.bridge_dir)' in bootstrap
     # The escape hatch exists, is explicit, and defaults to locked. It must
     # honor the project/global .env path, not just the process environment
     # (PR #431 review finding).
-    assert "CCC_DEPS_UNLOCKED:-" in script
-    assert 'read_env_with_fallback "CCC_DEPS_UNLOCKED"' in script
+    assert 'DEPS_UNLOCKED_PROCESS="${CCC_DEPS_UNLOCKED:-}"' in script
+    assert "resolve_install_mode" in bootstrap
+    assert "project_env" in bootstrap and "bridge_env" in bootstrap
 
 
 def test_start_sh_locked_path_has_no_unpinned_pip_upgrade():
-    script = START_SH.read_text(encoding="utf-8")
-    locked_branch = script.split('deps_install_mode)" = "locked"', 1)[1].split("else", 1)[0]
-    assert "--upgrade pip" not in locked_branch
+    bootstrap = DEPENDENCY_BOOTSTRAP.read_text(encoding="utf-8")
+    mode_block = bootstrap.split("if mode is InstallMode.LOCKED:", 1)[1]
+    locked_branch = mode_block.split("return (", 1)[1].split("\n    return (", 1)[0]
+    assert '"--upgrade"' not in locked_branch
 
 
 def test_start_sh_dependency_fingerprint_covers_lock_and_mode():
-    script = START_SH.read_text(encoding="utf-8")
-    fingerprint = script.split("get_requirements_hash()", 1)[1].split("}", 1)[0]
-    assert '"$LOCK_FILE"' in fingerprint
-    assert '"$PYPROJECT_FILE"' in fingerprint
-    assert "deps_install_mode" in fingerprint
+    bootstrap = DEPENDENCY_BOOTSTRAP.read_text(encoding="utf-8")
+    fingerprint = bootstrap.split("def dependency_fingerprint(", 1)[1].split(
+        "def install_commands(", 1
+    )[0]
+    assert "paths.lock" in fingerprint
+    assert "paths.pyproject" in fingerprint
+    assert "mode.value.encode()" in fingerprint
 
 
 def test_ci_wheel_smoke_job_builds_installs_and_audits():
