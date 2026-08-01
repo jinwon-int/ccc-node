@@ -8,7 +8,6 @@ import os
 import shutil
 import sqlite3
 import subprocess
-import sys
 import time
 from pathlib import Path
 
@@ -60,15 +59,9 @@ def standalone_hook_count(settings: Path) -> int:
     )
 
 
-def main() -> int:
-    home = Path(os.environ.get("HOME") or "/root")
-    state = Path(os.environ.get("CCC_STATE_DIR") or home / ".claude/state")
-    claude = Path(os.environ.get("CCC_CLAUDE_DIR") or home / ".claude")
-    nunchi_home = Path(os.environ.get("NUNCHI_HOME") or home / ".nunchi")
-    ttl = int(os.environ.get("CCC_MEMORY_CACHE_TTL_SEC") or "21600")
-    now_raw = os.environ.get("CCC_MEMORY_CHECK_NOW_EPOCH") or ""
-    now = int(now_raw) if now_raw.isdigit() else int(time.time())
-
+def probe_nunchi(
+    state: Path, claude: Path, nunchi_home: Path, ttl: int, now: int
+) -> tuple[dict[str, object], str, int]:
     mode_file = state / "nunchi.mode"
     try:
         mode = mode_file.read_text(encoding="utf-8").strip()
@@ -117,6 +110,36 @@ def main() -> int:
     else:
         nunchi_status = "off"
 
+    payload: dict[str, object] = {
+        "status": nunchi_status,
+        "mode": mode,
+        "reasons": nunchi_reasons,
+        "hook_installed": hook_installed,
+        "standalone_sessionstart_hooks": standalone,
+        "db": {
+            "exists": db_path.is_file(),
+            "integrity": db_integrity,
+            "facts": facts,
+            "bytes": db_path.stat().st_size if db_path.is_file() else 0,
+            "age_seconds": age_seconds(db_path, now),
+        },
+        "snapshot": {
+            "exists": snapshot.is_file(),
+            "primary_header": snapshot_primary,
+            "bytes": snapshot_bytes,
+            "age_seconds": age_seconds(snapshot, now),
+        },
+        "cron": {
+            "feed": feed_kind,
+            "feed_count": feed_count,
+            "sweep_count": sweep_count,
+            "bench_count": bench_count,
+        },
+    }
+    return payload, mode, sweep_count
+
+
+def probe_mempalace(home: Path, mode: str, sweep_count: int, now: int) -> dict[str, object]:
     prefix = os.environ.get("PREFIX") or ""
     default_required = "/com.termux/" not in prefix and not str(home).startswith("/data/data/")
     required_raw = (os.environ.get("CCC_NUNCHI_MEMPALACE_REQUIRED") or "").lower()
@@ -145,43 +168,30 @@ def main() -> int:
             mp_reasons.append("sweep-count")
         mp_status = "ok" if not mp_reasons else "degraded"
 
+    return {
+        "status": mp_status,
+        "required": required,
+        "reasons": mp_reasons,
+        "cli_installed": mp_cli.is_file(),
+        "palace_exists": palace.is_file(),
+        "integrity": mp_integrity,
+        "embeddings": embeddings,
+        "age_seconds": age_seconds(palace, now),
+    }
+
+
+def main() -> int:
+    home = Path(os.environ.get("HOME") or "/root")
+    state = Path(os.environ.get("CCC_STATE_DIR") or home / ".claude/state")
+    claude = Path(os.environ.get("CCC_CLAUDE_DIR") or home / ".claude")
+    nunchi_home = Path(os.environ.get("NUNCHI_HOME") or home / ".nunchi")
+    ttl = int(os.environ.get("CCC_MEMORY_CACHE_TTL_SEC") or "21600")
+    now_raw = os.environ.get("CCC_MEMORY_CHECK_NOW_EPOCH") or ""
+    now = int(now_raw) if now_raw.isdigit() else int(time.time())
+    nunchi, mode, sweep_count = probe_nunchi(state, claude, nunchi_home, ttl, now)
     payload = {
-        "nunchi": {
-            "status": nunchi_status,
-            "mode": mode,
-            "reasons": nunchi_reasons,
-            "hook_installed": hook_installed,
-            "standalone_sessionstart_hooks": standalone,
-            "db": {
-                "exists": db_path.is_file(),
-                "integrity": db_integrity,
-                "facts": facts,
-                "bytes": db_path.stat().st_size if db_path.is_file() else 0,
-                "age_seconds": age_seconds(db_path, now),
-            },
-            "snapshot": {
-                "exists": snapshot.is_file(),
-                "primary_header": snapshot_primary,
-                "bytes": snapshot_bytes,
-                "age_seconds": age_seconds(snapshot, now),
-            },
-            "cron": {
-                "feed": feed_kind,
-                "feed_count": feed_count,
-                "sweep_count": sweep_count,
-                "bench_count": bench_count,
-            },
-        },
-        "mempalace": {
-            "status": mp_status,
-            "required": required,
-            "reasons": mp_reasons,
-            "cli_installed": mp_cli.is_file(),
-            "palace_exists": palace.is_file(),
-            "integrity": mp_integrity,
-            "embeddings": embeddings,
-            "age_seconds": age_seconds(palace, now),
-        },
+        "nunchi": nunchi,
+        "mempalace": probe_mempalace(home, mode, sweep_count, now),
     }
     print(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
     return 0
