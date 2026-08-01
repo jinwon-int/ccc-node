@@ -56,6 +56,11 @@ class ChatResponse:
     session_id: Optional[str] = None
     has_options: bool = False
     streamed: bool = False  # Whether message was already sent via streaming
+    # Machine-readable cause, set only where a caller may act on it.
+    # `admission-timeout/<stderr class>` drives the bounded retry in
+    # process_message; matching on `error` text instead would make a log
+    # string load-bearing (#846).
+    failure_class: Optional[str] = None
 
 
 @dataclass
