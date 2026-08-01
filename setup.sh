@@ -356,6 +356,11 @@ run chmod 644 "$CLAUDE_DIR/hooks/ccc_secure_fs.py"
 # existing standalone secure-fs copy instead of forking provider logic.
 run cp "$SRC/bridge/memory/local_memory_transaction.py" "$CLAUDE_DIR/hooks/ccc_local_memory_transaction.py"
 run chmod 644 "$CLAUDE_DIR/hooks/ccc_local_memory_transaction.py"
+# The Claude pending-job CLI is a thin hook-tree entry point.  Install its
+# canonical typed journal beside the shared secure-fs module, just like the
+# local-memory transaction above.
+run cp "$SRC/bridge/memory/distill_pending_journal.py" "$CLAUDE_DIR/hooks/ccc_distill_pending_journal.py"
+run chmod 644 "$CLAUDE_DIR/hooks/ccc_distill_pending_journal.py"
 # Memory helper tools used by load-memory.sh / refresh-memory.sh in standalone installs.
 run cp "$SRC/scripts/ccc-memory-index.sh" "$CLAUDE_DIR/hooks/ccc-memory-index.sh"
 run cp "$SRC/scripts/ccc_memory_index.py" "$CLAUDE_DIR/hooks/ccc_memory_index.py"

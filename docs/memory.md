@@ -94,6 +94,31 @@ Audience-scoped memory uses a separate state directory and rollback head for
 each opaque private/shared scope. The operation affects local memory only; it
 does not undo Honcho delivery or a Wiki candidate.
 
+## Claude pending distill journal
+
+Claude SessionEnd/PreCompact hooks persist recovery metadata below
+`${CCC_STATE_DIR}/distill-pending` before detached extraction starts. Queue
+serialization, deterministic deduplication, discovery, claim locking,
+success-only removal, and failed/killed-worker retention are owned by the typed
+`PendingDistillJournal` Python boundary. The shell still owns transcript
+discovery and gates, extraction, local-memory commit, Honcho/Wiki dispatch,
+dry-run/autonomy policy, and detached scheduling.
+
+The disk schema remains `ccc.distill.pending.v1`. Its content ID deliberately
+keeps the historical discriminator and byte layout:
+`SHA256(session_id + NUL + transcript_sha256 + NUL + "v1")`. Jobs written by
+the former bash serializer are therefore discovered and drained in place; no
+queue migration or sink replay is performed. Records and locks must be
+owner-only, regular, single-link `0600` files inside an owner-only `0700`
+directory. Unsafe or corrupt jobs are reported with body-free reason tokens and
+retained for operator repair rather than discarded.
+
+Rollback is source-only: restore the prior hook and setup sources before a
+fleet install. Do not copy live queue files during rollback. The stable v1
+format lets the previous bash drain consume any jobs enqueued by this boundary;
+stop active drain workers before changing installed source so only one queue
+implementation is running.
+
 ## Codex distill extraction backend
 
 The Codex write-back path is intentionally staged. The provider-neutral boundary

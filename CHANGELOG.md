@@ -33,6 +33,11 @@ All notable changes to the Claude Code node harness. Dates are KST.
   provenance. (#750)
 
 ### Changed
+- Claude's durable pending-distill queue now uses a typed Python journal for
+  legacy-v1-compatible enqueue/dedup, secure discovery, held claims,
+  success-only completion, and crash/retry retention. Transcript gates and the
+  existing local/Honcho/Wiki pipeline remain in shell, and queued
+  `ccc.distill.pending.v1` jobs keep their stable IDs and drain in place. (#584)
 - Codex nodes now compose the skill-candidate collector by default, with
   `CCC_CODEX_SKILL_COLLECTOR=false` as an explicit node-local opt-out. Candidate
   collection remains separate from installation (`approve` is still the

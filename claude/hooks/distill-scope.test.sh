@@ -128,9 +128,10 @@ TRANS_A="$TMP/projects/-root--openclaw-workspace/sess-autonomy.jsonl"
 make_transcript "$TRANS_A" 6 "user"
 run_a() { # $1 = extra env assignment(s) as a single string; reads stdin payload
   : > "$STATE_A/distill.log"
-  payload_other sess-autonomy "$TRANS_A" "/root/.openclaw/workspace" \
-    | env CCC_STATE_DIR="$STATE_A" CCC_DISTILL_SCOPE_CWDS="/root/.openclaw/workspace" $1 \
-      bash "$DISTILL" sessionend >/dev/null 2>&1
+  local hook_payload
+  hook_payload="$(payload_other sess-autonomy "$TRANS_A" "/root/.openclaw/workspace")"
+  env CCC_STATE_DIR="$STATE_A" CCC_DISTILL_SCOPE_CWDS="/root/.openclaw/workspace" $1 \
+    bash "$DISTILL" sessionend <<<"$hook_payload" >/dev/null 2>&1
 }
 
 # 7a) kill via env var — skip before any gate, no bg spawn

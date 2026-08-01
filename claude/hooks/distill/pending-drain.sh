@@ -61,7 +61,9 @@ run_pending_job() {
 }
 
 started=0
-while IFS= read -r job; do
+PENDING_CLI="$HOOKDIR/distill/pending-job.py"
+[ -r "$PENDING_CLI" ] || { log "skip reason=missing-python-boundary"; exit 0; }
+while IFS= read -r -d '' job; do
   [ "$started" -lt "$MAX_BATCH" ] || break
   [ -f "$job" ] && [ ! -L "$job" ] || continue
   export CLAUDE_DISTILL_JOB="$job"
@@ -71,7 +73,7 @@ while IFS= read -r job; do
   else
     log "spawn failed job=$(basename "$job" .json)"
   fi
-done < <(find "$PENDING_DIR" -maxdepth 1 -type f -name '*.json' -print 2>/dev/null | sort)
+done < <(python3 "$PENDING_CLI" scan --queue-dir "$PENDING_DIR" --limit "$MAX_BATCH" 2>>"$LOG")
 
 [ "$started" -eq 0 ] || log "started=$started"
 exit 0

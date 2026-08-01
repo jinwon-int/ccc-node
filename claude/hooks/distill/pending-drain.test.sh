@@ -46,7 +46,9 @@ mode="$(cat "${CLAUDE_STUB_MODE_FILE:?}" 2>/dev/null || printf success)"
 cat >/dev/null
 case "$mode" in
   sleep)
-    ps -o pgid= -p "$$" | tr -d '[:space:]' > "${CLAUDE_STUB_PGID_FILE:?}"
+    # procps is absent on minimal Linux images and is not guaranteed on
+    # Termux; Python is part of the pending-journal runtime contract.
+    python3 -c 'import os; print(os.getpgrp())' > "${CLAUDE_STUB_PGID_FILE:?}"
     sleep 30
     ;;
   fail) exit 9 ;;
