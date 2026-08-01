@@ -367,6 +367,8 @@ run cp "$SRC/scripts/ccc_memory_search.py" "$CLAUDE_DIR/hooks/ccc_memory_search.
 run cp "$SRC/scripts/ccc-memory-consolidate.sh" "$CLAUDE_DIR/hooks/ccc-memory-consolidate.sh"
 run cp "$SRC/scripts/ccc-memory-query.sh" "$CLAUDE_DIR/hooks/ccc-memory-query.sh"
 run cp "$SRC/scripts/ccc-memory-check.sh" "$CLAUDE_DIR/hooks/ccc-memory-check.sh"
+run cp "$SRC/scripts/ccc_memory_probe.py" "$CLAUDE_DIR/hooks/ccc_memory_probe.py"
+run chmod 644 "$CLAUDE_DIR/hooks/ccc_memory_probe.py"
 run cp "$SRC/scripts/ccc-memory-explain.sh" "$CLAUDE_DIR/hooks/ccc-memory-explain.sh"
 run cp "$SRC/scripts/ccc-wiki-triage.sh" "$CLAUDE_DIR/hooks/ccc-wiki-triage.sh"
 run cp "$SRC/scripts/ccc-memory-eval.sh" "$CLAUDE_DIR/hooks/ccc-memory-eval.sh"

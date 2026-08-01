@@ -9,12 +9,10 @@ STATE="${CCC_STATE_DIR:-$HOME/.claude/state}"
 MODE="${CCC_NUNCHI_MODE:-$(cat "$STATE/nunchi.mode" 2>/dev/null || echo off)}"
 [ "$MODE" = "on" ] || exit 0
 
-# Compatibility entry point only: load-memory.sh is the canonical injector.
-# Keep the same audience boundary if an older node still has this standalone
-# hook registered during rollout — node-global nunchi is private legacy input,
-# never shared-surface context.
-case "${CCC_MEMORY_AUDIENCE_SCOPED:-0}:${CCC_MEMORY_AUDIENCE:-private}" in
-  1:shared|true:shared|TRUE:shared|on:shared|ON:shared|yes:shared|YES:shared) exit 0 ;;
+# Node-global nunchi has no scope-local provenance yet. Match the managed Codex
+# loader's fail-closed boundary and disable it for every audience-scoped runtime.
+case "${CCC_MEMORY_AUDIENCE_SCOPED:-0}" in
+  1|true|TRUE|on|ON|yes|YES) exit 0 ;;
 esac
 
 HERE="$(cd "$(dirname "$0")" && pwd)"

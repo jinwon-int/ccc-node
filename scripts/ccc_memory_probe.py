@@ -23,13 +23,18 @@ def sqlite_probe(path: Path, count_sql: str) -> tuple[str, int]:
     if not path.is_file():
         return "missing", 0
     try:
-        db = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        # Readiness runs on every memory check, including large Chroma stores.
+        # A full PRAGMA quick_check can scan hundreds of MB and stall the bridge;
+        # a bounded read-only connection plus the required schema query proves
+        # that the store is readable without turning status into an audit.
+        db = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=0.2)
         try:
-            integrity = str(db.execute("PRAGMA quick_check").fetchone()[0])
+            db.execute("PRAGMA query_only=ON")
+            db.execute("PRAGMA busy_timeout=200")
             count = int(db.execute(count_sql).fetchone()[0])
         finally:
             db.close()
-        return integrity, count
+        return "ok", count
     except (OSError, sqlite3.Error, TypeError, ValueError):
         return "error", 0
 
@@ -39,7 +44,7 @@ def crontab_text() -> str:
         return os.environ["CCC_NUNCHI_CRONTAB_TEXT"]
     try:
         result = subprocess.run(
-            ["crontab", "-l"], capture_output=True, text=True, timeout=3, check=False
+            ["crontab", "-l"], capture_output=True, text=True, timeout=0.5, check=False
         )
     except (OSError, subprocess.SubprocessError):
         return ""
@@ -69,17 +74,25 @@ def probe_nunchi(
         mode = "off"
 
     db_path = nunchi_home / "facts.db"
-    db_integrity, facts = sqlite_probe(db_path, "SELECT COUNT(*) FROM peer_facts")
+    db_integrity, facts = (
+        sqlite_probe(db_path, "SELECT COUNT(*) FROM peer_facts")
+        if mode == "on"
+        else ("skipped", 0)
+    )
     snapshot = nunchi_home / "snapshot.md"
     snapshot_bytes = snapshot.stat().st_size if snapshot.is_file() else 0
-    try:
-        snapshot_primary = "nunchi working memory" in snapshot.read_text(
-            encoding="utf-8", errors="replace"
-        )[:512]
-    except OSError:
-        snapshot_primary = False
+    snapshot_primary = False
+    if mode == "on":
+        try:
+            with snapshot.open("rb") as handle:
+                snapshot_head = handle.read(512)
+            snapshot_primary = "nunchi working memory" in snapshot_head.decode(
+                "utf-8", errors="replace"
+            )
+        except OSError:
+            pass
 
-    cron = crontab_text()
+    cron = crontab_text() if mode == "on" else ""
     marker_lines = [line for line in cron.splitlines() if "nunchi:#816" in line]
     codex_feeds = sum("codex-feed.sh" in line for line in marker_lines)
     claude_feeds = sum("ingest-cron.sh" in line for line in marker_lines)
@@ -87,7 +100,7 @@ def probe_nunchi(
     feed_kind = "codex" if codex_feeds else ("claude" if claude_feeds else "missing")
     sweep_count = sum("mempalace" in line and " sweep " in line for line in marker_lines)
     bench_count = sum("bench.sh" in line for line in marker_lines)
-    standalone = standalone_hook_count(claude / "settings.local.json")
+    standalone = standalone_hook_count(claude / "settings.local.json") if mode == "on" else 0
     hook_installed = (claude / "hooks/nunchi/nunchi.py").is_file()
 
     nunchi_reasons: list[str] = []
@@ -104,8 +117,10 @@ def probe_nunchi(
             nunchi_reasons.append("feed-count")
         if bench_count != 1:
             nunchi_reasons.append("bench-count")
-        if standalone:
+        if feed_kind == "codex" and standalone:
             nunchi_reasons.append("standalone-sessionstart")
+        if feed_kind == "claude" and standalone != 1:
+            nunchi_reasons.append("sessionstart-count")
         nunchi_status = "ok" if not nunchi_reasons else "degraded"
     else:
         nunchi_status = "off"
@@ -151,7 +166,11 @@ def probe_mempalace(home: Path, mode: str, sweep_count: int, now: int) -> dict[s
         found = shutil.which("mempalace")
         mp_cli = Path(found) if found else mp_cli
     palace = home / ".mempalace/palace/chroma.sqlite3"
-    mp_integrity, embeddings = sqlite_probe(palace, "SELECT COUNT(*) FROM embeddings")
+    mp_integrity, embeddings = (
+        sqlite_probe(palace, "SELECT COUNT(*) FROM embeddings")
+        if mode == "on"
+        else ("skipped", 0)
+    )
     mp_reasons: list[str] = []
     if mode != "on":
         mp_status = "off"

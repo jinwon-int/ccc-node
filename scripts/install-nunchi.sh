@@ -7,11 +7,12 @@
 #   install-nunchi.sh --apply --codex      # explicit Codex override
 #   install-nunchi.sh --apply --claude     # explicit Claude override
 #   install-nunchi.sh --apply --target-user gongmyoung
-#   install-nunchi.sh --remove          # mode off + cron lines removed (code/DB kept)
-#   install-nunchi.sh                   # status
+#   install-nunchi.sh --remove             # mode off + managed cron/hook removal
+#   install-nunchi.sh                      # status
 #
-# Also retires a pre-#816 hand-deployed pilot ($HOME/nunchi) if present:
-# renames it and strips its old crontab lines so only the canonical copy runs.
+# Codex uses the managed post-processing loader added by #856. Claude retains
+# the standalone SessionStart hook. Provider changes remove the other path so
+# one runtime never injects the same node-global snapshot twice.
 set -euo pipefail
 
 ACTION="status"
@@ -28,27 +29,36 @@ while [ $# -gt 0 ]; do
       [ $# -ge 2 ] || { echo "--target-user requires a user" >&2; exit 2; }
       TARGET_USER="$2"; shift ;;
     --help|-h)
-      sed -n '2,13p' "$0"; exit 0 ;;
+      sed -n '2,14p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
   shift
 done
-case "$PROVIDER" in codex|claude|auto) ;; *) echo "invalid provider: $PROVIDER" >&2; exit 2;; esac
+case "$PROVIDER" in
+  codex|claude|auto) ;;
+  *) echo "invalid provider: $PROVIDER" >&2; exit 2 ;;
+esac
 
 # A bridge may run as a non-root service user even when the operator connects
-# as root. Re-exec as that user so HOME, crontab ownership, DB ownership and the
-# actual runtime's hook tree stay in one scope (#827 gongmyoung finding).
+# as root. Re-exec with a minimal environment as that user so HOME, crontab,
+# DB ownership and the actual runtime's hook tree stay in one scope.
 if [ -n "$TARGET_USER" ] && [ "$TARGET_USER" != "$(id -un)" ]; then
   [ "$(id -u)" = 0 ] || { echo "--target-user requires root when switching users" >&2; exit 2; }
+  case "$TARGET_USER" in
+    -*|*[!A-Za-z0-9_.-]*) echo "invalid target user" >&2; exit 2 ;;
+  esac
   command -v getent >/dev/null 2>&1 || { echo "getent required for --target-user" >&2; exit 2; }
   command -v runuser >/dev/null 2>&1 || { echo "runuser required for --target-user" >&2; exit 2; }
-  target_home="${CCC_NUNCHI_TARGET_HOME:-$(getent passwd "$TARGET_USER" | awk -F: '{print $6}')}"
+  passwd_row="$(getent passwd "$TARGET_USER" || true)"
+  target_uid="$(awk -F: 'NR == 1 {print $3}' <<<"$passwd_row")"
+  target_home="${CCC_NUNCHI_TARGET_HOME:-$(awk -F: 'NR == 1 {print $6}' <<<"$passwd_row")}"
   [ -n "$target_home" ] && [ "$target_home" != "/" ] && [ -d "$target_home" ] \
+    && [ -n "$target_uid" ] && [ "$(stat -c %u -- "$target_home")" = "$target_uid" ] \
     || { echo "safe target home not found for $TARGET_USER" >&2; exit 2; }
-  exec runuser -u "$TARGET_USER" -- env \
-    -u CCC_CLAUDE_DIR -u CCC_STATE_DIR -u NUNCHI_HOME -u NUNCHI_DB -u NUNCHI_SNAPSHOT \
-    HOME="$target_home" CCC_NUNCHI_TARGET_USER="$TARGET_USER" \
-    CCC_NUNCHI_TARGET_HOME="$target_home" CCC_NUNCHI_PROVIDER="$PROVIDER" \
+  exec runuser -u "$TARGET_USER" -- env -i \
+    HOME="$target_home" USER="$TARGET_USER" LOGNAME="$TARGET_USER" \
+    PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+    CCC_NUNCHI_TARGET_USER="$TARGET_USER" CCC_NUNCHI_PROVIDER="$PROVIDER" \
     bash "$0" "${ORIGINAL_ARGS[@]}"
 fi
 
@@ -58,32 +68,71 @@ HOOKS="$CLAUDE_DIR/hooks/nunchi"
 MODE_FILE="$STATE/nunchi.mode"
 MARK="# nunchi:#816"
 TS="$(date +%Y%m%dT%H%M%S)"
+CRONTAB="${CCC_CRONTAB_CMD:-crontab}"
+
+validate_codex_loader() {
+  python3 - "$HOOKS/codex-loader.py" <<'PY'
+import os
+from pathlib import Path
+import stat
+import sys
+
+path = Path(sys.argv[1])
+try:
+    meta = path.lstat()
+except OSError:
+    raise SystemExit(1)
+safe = (
+    stat.S_ISREG(meta.st_mode)
+    and meta.st_nlink == 1
+    and meta.st_uid in {0, os.geteuid()}
+    and not stat.S_IMODE(meta.st_mode) & 0o022
+    and 0 < meta.st_size <= 1024 * 1024
+)
+raise SystemExit(0 if safe else 1)
+PY
+}
 
 status() {
-  local cron provider
-  cron="$(crontab -l 2>/dev/null || true)"
-  provider="missing"
+  local codex_loader_status="MISSING/UNSAFE" cron provider="missing"
+  if validate_codex_loader; then codex_loader_status="present"; fi
+  cron="$("$CRONTAB" -l 2>/dev/null || true)"
   grep -q 'codex-feed.sh' <<<"$cron" && provider="codex"
   grep -q 'ingest-cron.sh' <<<"$cron" && provider="claude"
   echo "runtime: user=$(id -un) home=$HOME provider=$provider"
   echo "mode: $(cat "$MODE_FILE" 2>/dev/null || echo off)"
   echo "hooks: $([ -f "$HOOKS/nunchi.py" ] && echo present || echo MISSING) ($HOOKS)"
+  echo "codex loader: $codex_loader_status"
   echo "cron: $(grep -cF "$MARK" <<<"$cron" || true) line(s)"
   echo "db: $(ls -la "$HOME/.nunchi/facts.db" 2>/dev/null | awk '{print $5" bytes"}' || echo none)"
 }
 
-strip_cron() {  # remove our marker lines + any legacy hand-deploy nunchi lines
-  local tmp; tmp="$(mktemp)"
-  crontab -l 2>/dev/null | grep -vF "$MARK" | grep -v "nunchi/ingest-cron.sh\|nunchi/codex-feed.sh\|/nunchi/ingest-cron\|nunchi:distill-mirror\|nunchi:codex-feed" > "$tmp" || true
-  crontab "$tmp"; rm -f "$tmp"
+write_mode() {  # atomic owner-local marker; replacing a stale link never follows it
+  local value="$1" tmp
+  mkdir -p "$STATE"
+  tmp="$(mktemp "$STATE/.nunchi.mode.XXXXXX")"
+  chmod 600 "$tmp"
+  printf '%s' "$value" > "$tmp"
+  mv -f -- "$tmp" "$MODE_FILE"
 }
 
-append_cron_line() { # <literal cron line>
+strip_cron() {  # remove managed and legacy hand-deploy nunchi lines
+  local tmp
+  tmp="$(mktemp)"
+  "$CRONTAB" -l 2>/dev/null \
+    | grep -vF "$MARK" \
+    | grep -v "nunchi/ingest-cron.sh\|nunchi/codex-feed.sh\|/nunchi/ingest-cron\|nunchi:distill-mirror\|nunchi:codex-feed" \
+    > "$tmp" || true
+  "$CRONTAB" "$tmp"
+  rm -f "$tmp"
+}
+
+append_cron_line() {  # <literal cron line>
   local line="$1" tmp
   tmp="$(mktemp)"
-  crontab -l > "$tmp" 2>/dev/null || true
+  "$CRONTAB" -l > "$tmp" 2>/dev/null || true
   printf '%s\n' "$line" >> "$tmp"
-  crontab "$tmp"
+  "$CRONTAB" "$tmp"
   rm -f "$tmp"
 }
 
@@ -95,37 +144,53 @@ retire_legacy() {
   fi
 }
 
-remove_standalone_sessionstart_hooks() {
-  # load-memory.sh now injects nunchi for both Claude and Codex. Remove both
-  # the canonical pilot hook and retired /root/nunchi hook so Claude does not
-  # inject the same snapshot twice and broken legacy paths stop firing.
-  python3 - "$CLAUDE_DIR/settings.local.json" <<'PY'
-import json, os, sys
-path = sys.argv[1]
-if not os.path.exists(path):
+set_sessionstart_hook() {  # add|remove the standalone Claude-only hook
+  python3 - "$CLAUDE_DIR/settings.local.json" "$HOOKS/sessionstart.sh" "$1" <<'PY'
+import json
+import os
+from pathlib import Path
+import stat
+import sys
+import tempfile
+
+path = Path(sys.argv[1])
+script = sys.argv[2]
+action = sys.argv[3]
+if action == "remove" and not path.exists():
     raise SystemExit(0)
-with open(path) as f:
-    data = json.load(f)
-groups = data.get("hooks", {}).get("SessionStart", [])
-removed = 0
+data = {}
+mode = 0o600
+if path.exists():
+    mode = stat.S_IMODE(path.stat().st_mode)
+    with path.open() as handle:
+        data = json.load(handle)
+session = data.setdefault("hooks", {}).setdefault("SessionStart", [])
 kept = []
-for group in groups:
+for group in session:
     hooks = []
     for hook in group.get("hooks", []):
-        command = str(hook.get("command") or "")
-        if "nunchi/sessionstart.sh" in command:
-            removed += 1
-        else:
+        if "nunchi/sessionstart.sh" not in str(hook.get("command") or ""):
             hooks.append(hook)
     if hooks:
         copy = dict(group)
         copy["hooks"] = hooks
         kept.append(copy)
-if removed:
-    data["hooks"]["SessionStart"] = kept
-    with open(path, "w") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-print(f"standalone nunchi SessionStart hooks removed: {removed}")
+if action == "add":
+    kept.append({"hooks": [{"type": "command", "command": f"bash {script}", "timeout": 5}]})
+data["hooks"]["SessionStart"] = kept
+path.parent.mkdir(parents=True, exist_ok=True)
+fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+try:
+    with os.fdopen(fd, "w") as handle:
+        json.dump(data, handle, ensure_ascii=False, indent=2)
+        handle.write("\n")
+    os.chmod(tmp_name, mode)
+    os.replace(tmp_name, path)
+finally:
+    try:
+        os.unlink(tmp_name)
+    except FileNotFoundError:
+        pass
 PY
 }
 
@@ -148,17 +213,17 @@ detect_provider() {
 case "$ACTION" in
   apply)
     [ -f "$HOOKS/nunchi.py" ] || { echo "hooks missing at $HOOKS — run setup.sh first" >&2; exit 2; }
-    mkdir -p "$STATE"
+    resolved_provider="$(detect_provider)"
+    if [ "$resolved_provider" = "codex" ] && ! validate_codex_loader; then
+      echo "Codex nunchi loader missing or unsafe at $HOOKS/codex-loader.py — run setup.sh first" >&2
+      exit 2
+    fi
     retire_legacy
     strip_cron
-    printf 'on' > "$MODE_FILE"
-    resolved_provider="$(detect_provider)"
+    write_mode on
     feed="$HOOKS/ingest-cron.sh"
     [ "$resolved_provider" = "codex" ] && feed="$HOOKS/codex-feed.sh"
     append_cron_line "*/10 * * * * bash $feed >> $HOME/.nunchi/cron.log 2>&1 $MARK"
-    # #824 Phase 1: hourly incremental MemPalace sweep keeps the verbatim
-    # layer fresh (sweep is idempotent). Only when the external CLI and the
-    # transcript dir exist; skipped silently otherwise (peer_facts-only).
     mp="$(command -v mempalace || true)"
     [ -z "$mp" ] && [ -x "$HOME/.local/bin/mempalace" ] && mp="$HOME/.local/bin/mempalace"
     default_sweep="$HOME/.claude/projects"
@@ -170,21 +235,23 @@ case "$ACTION" in
     else
       echo "mempalace CLI or transcript dir missing — verbatim sweep cron skipped"
     fi
-    # #827 Phase 2: weekly parity bench (Mon 08:07) — feeds the gate-3
-    # retirement criteria (two weeks of zero Honcho-only answers, zero
-    # hallucination). bench.sh is itself mode-gated, so this line is safe
-    # even if the node opts out later without --remove.
     append_cron_line "7 8 * * 1 bash $HOOKS/bench.sh >> $HOME/.nunchi/bench.cron.log 2>&1 $MARK"
     echo "weekly bench cron added (Mon 08:07)"
-    remove_standalone_sessionstart_hooks
+    if [ "$resolved_provider" = "claude" ]; then
+      set_sessionstart_hook add
+    else
+      set_sessionstart_hook remove
+    fi
     python3 "$HOOKS/nunchi.py" init
-    echo "nunchi enabled (mode=on, provider=$resolved_provider, feed=$(basename "$feed"))"; status
+    echo "nunchi enabled (mode=on, provider=$resolved_provider, feed=$(basename "$feed"))"
+    status
     ;;
   remove)
-    printf 'off' > "$MODE_FILE"
+    write_mode off
     strip_cron
-    remove_standalone_sessionstart_hooks
-    echo "nunchi disabled (code and ~/.nunchi DB kept)"; status
+    set_sessionstart_hook remove
+    echo "nunchi disabled (code and ~/.nunchi DB kept)"
+    status
     ;;
   *) status ;;
 esac

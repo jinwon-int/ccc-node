@@ -242,6 +242,10 @@ ok "setup deploys the mtime-prune library the pruning hooks source" \
   '[ -x "$rewrite_claude/hooks/lib/mtime-prune.sh" ] && cmp -s "$ROOT/claude/hooks/lib/mtime-prune.sh" "$rewrite_claude/hooks/lib/mtime-prune.sh"'
 ok "setup installs the Codex launcher and materializer as executable managed hooks" \
   '[ -x "$rewrite_claude/hooks/ccc-codex" ] && [ -x "$rewrite_claude/hooks/ccc_codex_memory.py" ] && cmp -s "$ROOT/scripts/ccc-codex" "$rewrite_claude/hooks/ccc-codex" && cmp -s "$ROOT/scripts/ccc_codex_memory.py" "$rewrite_claude/hooks/ccc_codex_memory.py"'
+ok "setup installs the managed nunchi Codex loader" \
+  '[ -x "$rewrite_claude/hooks/nunchi/codex-loader.py" ] && cmp -s "$ROOT/claude/hooks/nunchi/codex-loader.py" "$rewrite_claude/hooks/nunchi/codex-loader.py"'
+ok "setup installs the body-free memory readiness probe beside memory-check" \
+  '[ -f "$rewrite_claude/hooks/ccc_memory_probe.py" ] && [ ! -x "$rewrite_claude/hooks/ccc_memory_probe.py" ] && cmp -s "$ROOT/scripts/ccc_memory_probe.py" "$rewrite_claude/hooks/ccc_memory_probe.py"'
 ok "setup installs the canonical secure-fs helper beside the Codex materializer" \
   '[ -f "$rewrite_claude/hooks/ccc_secure_fs.py" ] && [ ! -x "$rewrite_claude/hooks/ccc_secure_fs.py" ] && cmp -s "$ROOT/bridge/utils/secure_fs.py" "$rewrite_claude/hooks/ccc_secure_fs.py"'
 ok "setup installs the canonical journal core for the pending-v1 adapter" \

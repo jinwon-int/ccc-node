@@ -21,7 +21,6 @@ MAX_MEM="${CCC_BUILTIN_MEMORY_MAX_BYTES:-4000}"
 MAX_WIKI="${CCC_WIKI_MAX_BYTES:-5000}"
 MAX_HONCHO="${CCC_HONCHO_MAX_BYTES:-4000}"
 MAX_LOCAL="${CCC_LOCAL_MEMORY_MAX_BYTES:-3000}"
-MAX_NUNCHI="${CCC_NUNCHI_MAX_BYTES:-3000}"
 MAX_RESUME="${CCC_RESUME_MAX_BYTES:-2000}"
 HONCHO_ENABLED="${CCC_HONCHO_MEMORY_ENABLED:-1}"
 WIKI_ENABLED="${CCC_WIKI_MEMORY_ENABLED:-1}"
@@ -205,21 +204,6 @@ if ! is_disabled "$WIKI_ENABLED"; then
 fi
 honcho="$(scan_injection_block honcho-cache "$honcho" | limit_bytes "$MAX_HONCHO")"
 
-# nunchi is node-global today, so treat it like other unscoped legacy memory:
-# allowed in the base/private owner context, forbidden on shared surfaces. The
-# standalone pilot hook bypassed that boundary; the canonical loader is now the
-# single injection path for both Claude and Codex. A missing snapshot leaves
-# Honcho primary instead of labelling nunchi primary with no body (#827).
-nunchi=""
-nunchi_mode="${CCC_NUNCHI_MODE:-$(cat "$STATE_DIR/nunchi.mode" 2>/dev/null || printf 'off')}"
-if [ "$nunchi_mode" = "on" ] \
-  && { is_disabled "$AUDIENCE_SCOPED" || [ "$MEMORY_AUDIENCE" = "private" ]; }; then
-  nunchi_home="${NUNCHI_HOME:-${HOME:-/root}/.nunchi}"
-  nunchi_snapshot="${NUNCHI_SNAPSHOT:-$nunchi_home/snapshot.md}"
-  nunchi="$(cat "$nunchi_snapshot" 2>/dev/null)"
-  nunchi="$(scan_injection_block nunchi-snapshot "$nunchi" | limit_bytes "$MAX_NUNCHI")"
-fi
-
 # Relevance-aware budget. The per-block caps sum to more than CCC_MEMORY_MAX_BYTES,
 # so today the tail (Honcho) is simply truncated and any budget a small/empty block
 # leaves unused (no wiki/honcho cache, or max-perf which drops Honcho) is wasted —
@@ -235,14 +219,12 @@ if ! is_disabled "${CCC_MEMORY_DYNAMIC_BUDGET:-1}"; then
   msize="$(printf '%s' "$mem" | wc -c)"
   wsize="$(printf '%s' "$wiki" | wc -c)"
   hsize="$(printf '%s' "$honcho" | wc -c)"
-  nsize="$(printf '%s' "$nunchi" | wc -c)"
   rsize="$(printf '%s' "$resume" | wc -c)"
-  budget_total=$(( MAX_TOTAL > nsize ? MAX_TOTAL - nsize : 0 ))
   # alloc = byte budget for local (>= MAX_LOCAL, reclaiming slack up to the total
   # minus a ~1000B scaffold reserve); dyn_limit = results to fetch to fill it
   # (~180B/result, clamped to [5,25]). The final limit_bytes is the hard bound.
   budget_out="$(python3 "$MEMORY_RENDER_PY" dynamic-budget \
-    "$budget_total" 1000 "$MAX_LOCAL" 180 5 25 "$msize" "$rsize" "$wsize" "$hsize" 2>/dev/null || true)"
+    "$MAX_TOTAL" 1000 "$MAX_LOCAL" 180 5 25 "$msize" "$rsize" "$wsize" "$hsize" 2>/dev/null || true)"
   alloc_candidate="${budget_out%% *}"
   limit_candidate="${budget_out##* }"
   case "$alloc_candidate" in ''|*[!0-9]*) ;; *) alloc_local="$alloc_candidate" ;; esac
@@ -293,7 +275,6 @@ local_hot="$(filter_disabled_wiki_hits "$local_hot")"
 # post-truncation) before rendering it — so it surfaces index-only content
 # (distilled facts) instead of echoing the canonical blocks.
 local_hot="$(dedup_local_hot "$mem
-$nunchi
 $wiki
 $honcho" "$local_hot")"
 # Render the search JSON to compact readable lines, then apply the (possibly
@@ -312,19 +293,14 @@ if ! is_disabled "$HONCHO_ENABLED" && [ "$PROFILE" != "max-perf" ]; then
   honcho_note="$(stale_note 'Honcho' "$CACHE/honcho.txt")"
 fi
 
-# Gate-3 transition (#824 Phase 1): label Honcho secondary only when a real,
-# bounded nunchi snapshot is present in this exact context. Honcho stays
-# injected for verification until Phase 3 (freeze/retire).
+# Gate-3 transition (#824 Phase 1): on nunchi-enabled nodes the nunchi
+# snapshot hook is the primary working memory; label Honcho secondary so the
+# model weighs sources accordingly. Honcho stays injected for verification
+# until Phase 3 (freeze/retire).
 honcho_role=""
-if [ -n "$nunchi" ]; then
+nunchi_mode="${CCC_NUNCHI_MODE:-$(cat "$STATE_DIR/nunchi.mode" 2>/dev/null || printf 'off')}"
+if [ "$nunchi_mode" = "on" ]; then
   honcho_role=" (secondary — nunchi snapshot is primary during the gate-3 transition)"
-fi
-
-nunchi_block=""
-if [ -n "$nunchi" ]; then
-  nunchi_block="
-${nunchi}
-"
 fi
 
 resume_block=""
@@ -360,7 +336,6 @@ Memory profile: ${PROFILE}; last refresh: ${stamp:-never}; ${wiki_note}; ${honch
 
 ## Built-in MEMORY + USER
 ${mem:-(memory files unavailable)}
-${nunchi_block}
 
 ## Local hot memory (task-conditioned cache search)
 ${local_hot:-(local hot memory disabled or no hits)}

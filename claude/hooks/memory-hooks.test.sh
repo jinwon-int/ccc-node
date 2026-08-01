@@ -11,8 +11,7 @@ trap 'rm -rf "$TMP"' EXIT
 ok() { if eval "$2"; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $1"; fi; }
 
 state="$TMP/state"; cache="$TMP/cache"; mem="$TMP/mem"; tools="$TMP/tools"
-export NUNCHI_HOME="$TMP/nunchi-home"
-mkdir -p "$state" "$cache" "$mem" "$tools" "$NUNCHI_HOME"
+mkdir -p "$state" "$cache" "$mem" "$tools"
 printf 'Node memory: safe fact\n' > "$mem/MEMORY.md"
 printf 'User memory: Korean concise\n' > "$mem/USER.md"
 printf 'Cached wiki fact\n' > "$cache/wiki.txt"
@@ -53,13 +52,8 @@ ok "wiki-disabled load-memory keeps non-Wiki sources and custom identity" '[ "$r
 ok "wiki-disabled load-memory drops direct and stale-index Wiki content" '! grep -q "Cached wiki fact\|Stale wiki index hit\|## Family Wiki\|verify Wiki source" <<<"$out"'
 ok "nunchi-off leaves Honcho title unchanged" '! grep -q "secondary — nunchi" <<<"$out"'
 printf 'on' > "$state/nunchi.mode"
-printf '## nunchi working memory (primary)\nNUNCHI_INJECTED_MARKER\n' > "$NUNCHI_HOME/snapshot.md"
 out="$(HOME="$TMP/home" CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CCC_HOOK_DIR="$ROOT/claude/hooks" CCC_MEMORY_TOOLS_DIR="$tools" CCC_HONCHO_MEMORY_ENABLED=0 CCC_MEMORY_NO_REFRESH=1 bash "$ROOT/claude/hooks/load-memory.sh" SessionStart 2>&1)"; rc=$?
-ok "nunchi-on injects the snapshot and labels Honcho secondary (#827)" '[ "$rc" = 0 ] && grep -q "NUNCHI_INJECTED_MARKER" <<<"$out" && grep -q "secondary — nunchi snapshot is primary" <<<"$out"'
-mv "$NUNCHI_HOME/snapshot.md" "$NUNCHI_HOME/snapshot.saved"
-out="$(HOME="$TMP/home" CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CCC_HOOK_DIR="$ROOT/claude/hooks" CCC_MEMORY_TOOLS_DIR="$tools" CCC_HONCHO_MEMORY_ENABLED=0 CCC_MEMORY_NO_REFRESH=1 bash "$ROOT/claude/hooks/load-memory.sh" SessionStart 2>&1)"; rc=$?
-ok "nunchi-on with no snapshot does not mislabel Honcho secondary" '[ "$rc" = 0 ] && ! grep -q "secondary — nunchi" <<<"$out"'
-mv "$NUNCHI_HOME/snapshot.saved" "$NUNCHI_HOME/snapshot.md"
+ok "nunchi-on labels Honcho secondary (#824)" '[ "$rc" = 0 ] && grep -q "secondary — nunchi snapshot is primary" <<<"$out"'
 rm -f "$state/nunchi.mode"
 out="$(HOME="$TMP/home" CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CCC_HOOK_DIR="$ROOT/claude/hooks" CCC_MEMORY_TOOLS_DIR="$tools" CCC_WIKI_MEMORY_ENABLED=0 CCC_HONCHO_MEMORY_ENABLED=0 CCC_FAKE_MALFORMED=1 CCC_MEMORY_NO_REFRESH=1 bash "$ROOT/claude/hooks/load-memory.sh" SessionStart 2>&1)"; rc=$?
 ok "wiki-disabled malformed local search fails closed without raw payload" '[ "$rc" = 0 ] && ! grep -q "MALFORMED_STALE_WIKI_PAYLOAD" <<<"$out"'
@@ -98,7 +92,6 @@ mkdir -p "$legacy_mem" "$shared_mem" "$private_mem" \
 printf 'LEGACY_PRIVATE_ONLY marker\n' > "$legacy_mem/MEMORY.md"
 printf 'SHARED_PUBLIC marker\n' > "$shared_mem/MEMORY.md"
 printf 'DM_PRIVATE_ONLY marker\n' > "$private_mem/MEMORY.md"
-printf 'on' > "$audroot/shared/state/nunchi.mode"
 
 out="$(HOME="$TMP/home" \
   CCC_MEMORY_AUDIENCE_SCOPED=1 CCC_MEMORY_AUDIENCE=shared CCC_MEMORY_SCOPE=shared \
@@ -113,10 +106,7 @@ out="$(HOME="$TMP/home" \
   CCC_MEMORY_NO_REFRESH=1 bash "$ROOT/claude/hooks/load-memory.sh" SessionStart 2>&1)"; rc=$?
 ok "shared audience injects only public memory" '[ "$rc" = 0 ] && grep -q "SHARED_PUBLIC marker" <<<"$out" && ! grep -q "LEGACY_PRIVATE_ONLY\|DM_PRIVATE_ONLY" <<<"$out"'
 ok "shared audience force-disables unscoped remote sources" '! grep -q "Cached wiki fact\|Cached honcho fact" <<<"$out" && grep -q "shared public facts only" <<<"$out"'
-ok "shared audience never receives node-global nunchi" '! grep -q "NUNCHI_INJECTED_MARKER\|secondary — nunchi" <<<"$out"'
-rm -f "$audroot/shared/state/nunchi.mode"
 
-printf 'on' > "$audroot/$private_scope/state/nunchi.mode"
 out="$(HOME="$TMP/home" \
   CCC_MEMORY_AUDIENCE_SCOPED=1 CCC_MEMORY_AUDIENCE=private CCC_MEMORY_SCOPE="$private_scope" \
   CCC_MEMORY_AUDIENCE_ROOT="$audroot" \
@@ -130,8 +120,6 @@ out="$(HOME="$TMP/home" \
   CCC_MEMORY_NO_REFRESH=1 bash "$ROOT/claude/hooks/load-memory.sh" SessionStart 2>&1)"; rc=$?
 ok "private audience injects private legacy, private scoped, and shared memory" '[ "$rc" = 0 ] && grep -q "LEGACY_PRIVATE_ONLY marker" <<<"$out" && grep -q "DM_PRIVATE_ONLY marker" <<<"$out" && grep -q "SHARED_PUBLIC marker" <<<"$out"'
 ok "private audience still force-disables unscoped Honcho" 'grep -q "Honcho disabled" <<<"$out" && grep -q "private DM plus explicitly shared" <<<"$out"'
-ok "private owner audience receives node-global nunchi as private legacy" 'grep -q "NUNCHI_INJECTED_MARKER\|secondary — nunchi" <<<"$out"'
-rm -f "$audroot/$private_scope/state/nunchi.mode"
 
 out="$(HOME="$TMP/home" \
   CCC_MEMORY_AUDIENCE_SCOPED=1 CCC_MEMORY_AUDIENCE=shared CCC_MEMORY_SCOPE=shared \

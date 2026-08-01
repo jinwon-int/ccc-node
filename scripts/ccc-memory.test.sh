@@ -67,6 +67,15 @@ ok "memory check reports healthy nunchi and MemPalace scalars" '[ "$rc" = 0 ] &&
   and .mempalace.status == "ok" and .mempalace.integrity == "ok" and .mempalace.embeddings == 1
 '\'' >/dev/null <<<"$out"'
 ok "memory readiness JSON never exposes snapshot or fact bodies" '! grep -q "PROBE_SECRET_BODY\|PROBE_SECRET_FACT" <<<"$out"'
+claude_probe_cron=$'*/10 * * * * bash /tmp/ingest-cron.sh # nunchi:#816\n17 * * * * mempalace sweep /tmp/projects # nunchi:#816\n7 8 * * 1 bash /tmp/bench.sh # nunchi:#816'
+printf '%s\n' '{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"bash /tmp/hooks/nunchi/sessionstart.sh"}]}]}}' > "$probe_claude/settings.local.json"
+out="$(HOME="$probe_home" CCC_CLAUDE_DIR="$probe_claude" CCC_STATE_DIR="$probe_state" \
+  CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" \
+  CCC_NUNCHI_CRONTAB_TEXT="$claude_probe_cron" bash "$ROOT/scripts/ccc-memory-check.sh" --json 2>&1)"; rc=$?
+ok "memory check accepts exactly one standalone hook for a Claude feed" '[ "$rc" = 0 ] && jq -e '\''
+  .nunchi.status == "ok" and .nunchi.cron.feed == "claude"
+  and .nunchi.standalone_sessionstart_hooks == 1
+'\'' >/dev/null <<<"$out"'
 python3 - "$probe_palace/chroma.sqlite3" <<'PY'
 import sqlite3, sys
 db = sqlite3.connect(sys.argv[1]); db.execute("DELETE FROM embeddings"); db.commit(); db.close()
