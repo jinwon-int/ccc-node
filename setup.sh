@@ -622,6 +622,14 @@ note "Codex managed skills reconciled from compatibility catalog"
 # request is not interrupted and an operator-stopped unit remains stopped.
 # Bespoke units are left for explicit normalization; node-local systemd policy
 # belongs in <unit>.d/*.conf drop-ins, not copied legacy main-unit lines.
+#
+# It also refuses to RELOCATE: if the installed unit boots from a different
+# checkout than this one, it warns and leaves the unit alone (#842). Without
+# that, running setup.sh inside a PR/issue work tree would silently repoint the
+# node's live bridge at unreviewed code — which is how seoseo came to serve from
+# /work/agent-codebench/ccc-node-pr833 on 2026-08-01. Reclaiming a unit that has
+# already been taken over is deliberate and stays a separate, explicit step:
+#   <canonical checkout>/bridge/service-systemd.sh reconcile --allow-relocate
 if [ "$DRY" = 1 ]; then
   "$SRC/bridge/service-systemd.sh" reconcile --dry-run
 else

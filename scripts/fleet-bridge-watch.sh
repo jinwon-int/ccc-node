@@ -4,10 +4,19 @@
 # Intended as an agent-cron command payload: exits nonzero when any node fails,
 # which drives telegram-owner-on-failure notification.
 #
-# Two checks per node:
+# Three checks per node:
 #   1. availability — the bridge answers "Bot status: available"
-#   2. boot path    — the systemd unit that would restart the bridge points at
+#   2. canonical    — the checkout it serves from is one the fleet installs at,
+#                     not a PR/issue work tree
+#   3. boot path    — the systemd unit that would restart the bridge points at
 #                     the checkout the bridge is ACTUALLY serving from
+#
+# Check 2 exists because check 3 is a comparison, and a comparison is silent
+# when both sides are wrong together. On 2026-08-01 seoseo served its bridge
+# from /work/agent-codebench/ccc-node-pr833 — a PR head that never reached main,
+# five commits behind it — with the unit pointing at that same worktree, and the
+# boot-path check called it healthy. It surfaced only through incidental doctor
+# drift. Judge the runtime root on its own before comparing it to anything.
 #
 # Every path is derived from the running process. Nodes hold several ccc-node
 # checkouts (/opt, /root, /home/<user>) and which one is live differs per node
@@ -30,6 +39,32 @@ set -u
 NODES="${CCC_FLEET_NODES:-seoseo dungae sogyo nosuk bangtong yukson soonwook gwakga jingun gongmyoung gongyung daegyo}"
 SSH_BIN="${CCC_FLEET_SSH:-ssh}"
 SELF="${CCC_FLEET_SELF:-$(hostname -s 2>/dev/null || echo _none_)}"
+
+# Checkout roots a node may legitimately serve from. Several are in use at once
+# across the fleet (/opt on most, /root on yukson and gwakga, the Termux home on
+# the phones), so this is a glob list rather than one path.
+CANON_ROOTS="${CCC_FLEET_CANONICAL_ROOTS:-/opt/ccc-node /root/ccc-node /home/*/ccc-node /data/data/com.termux/files/home/ccc-node}"
+
+# The basename has to match exactly. Work trees are created as siblings of the
+# real checkout with a suffix — /root/ccc-node-840-terminal-stall, or
+# /work/agent-codebench/ccc-node-pr833 — so a prefix or substring test would
+# wave through the exact shape this check exists to catch.
+# `set -f` is not incidental. Splitting the list without it makes the shell
+# expand /home/*/ccc-node against THIS host's filesystem: on a watcher that has
+# /home/ccc/ccc-node the pattern collapses to that one literal, and every other
+# node's /home/<user>/ccc-node is then reported non-canonical. The paths being
+# judged are remote, so no local filesystem may influence the verdict — these
+# are patterns to match with, never paths to resolve.
+is_canonical_root() {
+  _root=$1 _hit=1
+  set -f
+  for _pat in $CANON_ROOTS; do
+    # shellcheck disable=SC2254  # $_pat is a glob on purpose (/home/*/ccc-node)
+    case "$_root" in $_pat) _hit=0; break ;; esac
+  done
+  set +f
+  return $_hit
+}
 
 # POSIX sh, runs on every node including Termux. Emits KEY=VALUE lines only.
 read -r -d '' PROBE <<'PROBE_EOF' || true
@@ -105,6 +140,14 @@ $PROBE"
 
   if [ "$avail" != "yes" ]; then
     echo "DOWN $node"; fail=1; continue
+  fi
+
+  # Reported before the boot-path comparison and separately from it: a node
+  # serving from a work tree is already running unreviewed code, whether or not
+  # its unit agrees. Agreement on a wrong path is the worse state, not the
+  # better one, because it is the state that survives a restart.
+  if ! is_canonical_root "$runtime"; then
+    echo "NONCANONICAL $node runtime=$runtime"; fail=1; continue
   fi
 
   # A unit pointing elsewhere is silent while the bridge is up: the next reboot

@@ -63,6 +63,9 @@ Options:
   --proxy-url <url>     Proxy URL to embed in the unit environment
   --caller <name>       Script name shown in usage hints
   --dry-run             Report reconcile actions without writing or systemctl
+  --allow-relocate      Let reconcile move the unit onto THIS checkout even when
+                        the installed unit points at a different one. Off by
+                        default: relocation is a deliberate act, not drift.
   -h, --help            Show this help message and exit
 EOF
 }
@@ -72,6 +75,7 @@ PROJECT_ROOT_ARG=""
 PROXY_URL_ARG=""
 CALLER=""
 DRY_RUN=0
+ALLOW_RELOCATE=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -95,6 +99,10 @@ while [ $# -gt 0 ]; do
             DRY_RUN=1
             shift
             ;;
+        --allow-relocate)
+            ALLOW_RELOCATE=1
+            shift
+            ;;
         -h|--help)
             usage
             exit 0
@@ -113,6 +121,10 @@ if [ -z "$SUBCOMMAND" ]; then
 fi
 if [ "$DRY_RUN" = "1" ] && [ "$SUBCOMMAND" != "reconcile" ]; then
     echo "❌ Error: --dry-run is supported only with reconcile" >&2
+    exit 1
+fi
+if [ "$ALLOW_RELOCATE" = "1" ] && [ "$SUBCOMMAND" != "reconcile" ]; then
+    echo "❌ Error: --allow-relocate is supported only with reconcile" >&2
     exit 1
 fi
 CALLER="${CALLER:-$SCRIPT_DIR/start.sh}"
@@ -286,7 +298,7 @@ is_supported_generated_unit() {
 }
 
 installed_render_inputs() {
-    local exec_line project_root
+    local exec_line project_root installed_repo
     local http_proxy="" https_proxy="" all_proxy="" no_proxy=""
     local exec_count proxy_count
 
@@ -297,6 +309,15 @@ installed_render_inputs() {
         | sed -n 's|^ExecStart=/bin/bash /.*/start\.sh --path \(/.*\)$|\1|p')"
     [ -n "$project_root" ] || return 1
     project_root="$(cd "$project_root" 2>/dev/null && pwd)" || return 1
+
+    # The checkout the installed unit boots from, kept as the literal recorded in
+    # the unit. It is deliberately NOT resolved through `cd`: a unit pointing at
+    # a deleted work tree must still compare unequal to this checkout so the
+    # relocation guard fires, rather than failing the whole recognition step and
+    # reporting the unit as unrecognized.
+    installed_repo="$(printf '%s\n' "$exec_line" \
+        | sed -n 's|^ExecStart=/bin/bash \(/.*\)/bridge/start\.sh --path /.*$|\1|p')"
+    [ -n "$installed_repo" ] || return 1
 
     proxy_count="$(grep -Ec '^Environment=(http_proxy|https_proxy|all_proxy|no_proxy)=' \
         "$SYSTEMD_UNIT_FILE" 2>/dev/null || true)"
@@ -313,6 +334,7 @@ installed_render_inputs() {
 
     RECONCILE_PROJECT_ROOT="$project_root"
     RECONCILE_PROXY_URL="$http_proxy"
+    RECONCILE_INSTALLED_REPO="$installed_repo"
 }
 
 is_canonical_unit_topology() {
@@ -351,6 +373,30 @@ do_reconcile_systemd() {
     if ! is_supported_generated_unit || ! installed_render_inputs; then
         echo "⚠️  Existing unit is not a recognized ccc-generated main unit; left untouched: $SYSTEMD_UNIT_FILE" >&2
         echo "    Normalize it explicitly and keep node-local overrides in $SYSTEMD_UNIT_FILE.d/*.conf drop-ins." >&2
+        exit 0
+    fi
+
+    # The renderer builds ExecStart/WorkingDirectory from THIS checkout's own
+    # location, so reconciling from a work tree does not repair the unit — it
+    # moves the service onto whatever branch that tree happens to hold. setup.sh
+    # calls reconcile unconditionally, which makes every `./setup.sh` run inside
+    # a scratch checkout a silent takeover of the node's live bridge.
+    #
+    # Both halves of that were observed on 2026-08-01: seoseo had been serving
+    # from /work/agent-codebench/ccc-node-pr833 (a PR head that never reached
+    # main, five commits behind it) since a 06:50 restart, and bangtong's unit
+    # had been repointed at /root/ccc-node-840-terminal-stall while its bridge
+    # still ran from /opt — one restart away from the same fate. See issue #842.
+    #
+    # Reconciling drift in place is in scope. Relocating to a different checkout
+    # is a deliberate act and has to say so.
+    if [ "$RECONCILE_INSTALLED_REPO" != "$REPO_ROOT" ] && [ "$ALLOW_RELOCATE" != "1" ]; then
+        echo "⚠️  Installed unit boots from a different checkout; left untouched: $SYSTEMD_UNIT_FILE" >&2
+        echo "    installed unit: $RECONCILE_INSTALLED_REPO" >&2
+        echo "    this checkout:  $REPO_ROOT" >&2
+        echo "    Reconcile repairs drift; it does not relocate the service. If moving the" >&2
+        echo "    bridge onto this checkout is intended, say so explicitly:" >&2
+        echo "      $0 reconcile --allow-relocate" >&2
         exit 0
     fi
 

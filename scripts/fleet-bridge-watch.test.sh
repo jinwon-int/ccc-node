@@ -112,6 +112,73 @@ reply_d delta /opt/ccc-node no /opt/ccc-node 1
 run "delta"
 ok "down bridge outranks doctor drift" 'grep -q "^DOWN delta" "$OUT" && ! grep -q "^DRIFT delta" "$OUT"'
 
+# ---- non-canonical runtime root (#842) ------------------------------------
+# The seoseo 2026-08-01 shape, and the reason this check is separate from the
+# boot-path comparison: unit and runtime AGREE, on a PR worktree. Every
+# comparison-based check passes and the node reports healthy while serving code
+# that never reached main.
+reply beta /work/agent-codebench/ccc-node-pr833 yes /work/agent-codebench/ccc-node-pr833
+run "beta"
+okc "$RC" 1 "agreeing-but-noncanonical runtime exits nonzero"
+ok "noncanonical runtime is named" \
+  'grep -q "^NONCANONICAL beta runtime=/work/agent-codebench/ccc-node-pr833" "$OUT"'
+ok "noncanonical is not reported as OK" '! grep -q "^OK beta" "$OUT"'
+ok "noncanonical is not reported as BOOTPATH" '! grep -q "^BOOTPATH beta" "$OUT"'
+
+# A work tree is created as a SIBLING of the real checkout, so it sits under a
+# canonical parent and shares its prefix. A prefix or substring test would wave
+# through exactly the shape this check exists to catch (bangtong, same day).
+reply beta /root/ccc-node-840-terminal-stall yes /root/ccc-node-840-terminal-stall
+run "beta"
+okc "$RC" 1 "work tree under a canonical parent exits nonzero"
+ok "sibling work tree is flagged, not prefix-matched" \
+  'grep -q "^NONCANONICAL beta runtime=/root/ccc-node-840-terminal-stall" "$OUT"'
+
+# Availability outranks it: a node that is down is DOWN, not NONCANONICAL.
+reply beta /root/ccc-node-840-terminal-stall no /root/ccc-node-840-terminal-stall
+run "beta"
+ok "down bridge outranks noncanonical" \
+  'grep -q "^DOWN beta" "$OUT" && ! grep -q "^NONCANONICAL beta" "$OUT"'
+
+# The roots actually in use across the fleet must all stay clean.
+reply alpha /opt/ccc-node yes /opt/ccc-node
+reply beta  /root/ccc-node yes /root/ccc-node
+reply gamma /home/gongmyoung/ccc-node yes /home/gongmyoung/ccc-node
+reply delta /data/data/com.termux/files/home/ccc-node yes /data/data/com.termux/files/home/ccc-node
+run "alpha beta gamma delta"
+okc "$RC" 0 "every canonical fleet root passes"
+ok "no canonical root is flagged" '! grep -q "^NONCANONICAL" "$OUT"'
+
+# A node whose bridge is not running reports RUNTIME=-; that is DOWN's business,
+# and it must not also be miscast as a non-canonical checkout.
+reply beta - no -
+run "beta"
+ok "absent runtime is DOWN, not NONCANONICAL" \
+  'grep -q "^DOWN beta" "$OUT" && ! grep -q "^NONCANONICAL beta" "$OUT"'
+
+# The list is patterns, not paths: nothing on the WATCHER's filesystem may
+# decide how a REMOTE node's checkout is classified. Without `set -f` the glob
+# below collapses to the one sibling that happens to exist here, and every other
+# node under the same pattern is reported non-canonical.
+mkdir -p "$TMP/homes/ccc/ccc-node"
+reply beta "$TMP/homes/gongmyoung/ccc-node" yes "$TMP/homes/gongmyoung/ccc-node"
+OUT="$TMP/out"; RC=0
+CCC_FLEET_NODES="beta" CCC_FLEET_SSH="$STUB" CCC_FLEET_SELF=_never_ \
+  CCC_FLEET_CANONICAL_ROOTS="$TMP/homes/*/ccc-node" bash "$SC" >"$OUT" 2>&1 || RC=$?
+okc "$RC" 0 "glob root is not expanded against the watcher's filesystem"
+ok "unmaterialized sibling still matches the pattern" \
+  'grep -q "^OK beta" "$OUT" && ! grep -q "^NONCANONICAL beta" "$OUT"'
+
+# Operators can widen the list without editing the script.
+reply beta /srv/ccc-node yes /srv/ccc-node
+run "beta"
+ok "unknown root flagged by default" 'grep -q "^NONCANONICAL beta" "$OUT"'
+OUT="$TMP/out"; RC=0
+CCC_FLEET_NODES="beta" CCC_FLEET_SSH="$STUB" CCC_FLEET_SELF=_never_ \
+  CCC_FLEET_CANONICAL_ROOTS="/srv/ccc-node" bash "$SC" >"$OUT" 2>&1 || RC=$?
+okc "$RC" 0 "CCC_FLEET_CANONICAL_ROOTS override accepted"
+ok "overridden root reports OK" 'grep -q "^OK beta (/srv/ccc-node)" "$OUT"'
+
 # ---- no hardcoded per-node checkout paths in the script -------------------
 # The whole point: paths come from the running process, never a baked table.
 ok "no hardcoded node->path table" \
