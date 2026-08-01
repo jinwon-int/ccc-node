@@ -35,6 +35,7 @@ Configuration:
 - `CCC_CODEX_MEMORY_LOADER` — explicit trusted loader path. This always wins over automatic nunchi selection.
 - `CCC_CODEX_NUNCHI_MAX_BYTES` — nunchi-only contribution cap (default 3072; hard max 8192).
 - `CCC_CODEX_NUNCHI_REGEN_TIMEOUT_SEC` — stale nunchi snapshot regeneration deadline (default 2 seconds; hard max 3).
+- `CCC_CODEX_NUNCHI_SNAPSHOT_MAX_AGE_SEC` — maximum accepted nunchi snapshot age before bounded regeneration (default 900 seconds; hard max 86400).
 
 `materialize --json` and `status --json` emit only status, hashes, byte counts, active kind, and durability/metadata state; they never emit memory bodies. `setup.sh` installs the materializer and `scripts/ccc-codex` beside `load-memory.sh` under `${CCC_CLAUDE_DIR:-$HOME/.claude}/hooks`.
 
@@ -44,9 +45,12 @@ Configuration:
 node, `scripts/install-nunchi.sh --apply --codex` writes the owner-local
 `${CCC_STATE_DIR:-${CCC_CLAUDE_DIR:-$HOME/.claude}/state}/nunchi.mode` marker as
 `on`; the materializer then safely selects the installed nunchi loader without
-adding or printing bridge environment variables. The loader first runs the
-canonical `load-memory.sh SessionStart` contract and strictly parses its JSON.
-It can only append a bounded, valid UTF-8 local nunchi snapshot to
+adding or printing bridge environment variables. The materializer first runs
+the canonical `load-memory.sh SessionStart` contract with its full configured
+deadline and strictly parses its JSON. Only time left from that deadline may be
+used by the managed nunchi post-processor, so slow canonical loads are never
+rejected to make room for optional regeneration. The helper can only append a
+bounded, valid UTF-8 local nunchi snapshot to
 `additionalContext`; it never replaces the canonical context.
 
 Missing, corrupt, or unsafe snapshots fail open to the unmodified canonical
@@ -56,7 +60,15 @@ Loader, mode-marker, and snapshot symlinks, hardlinks, non-regular files, unsafe
 owners, and writable modes are not trusted. The path defaults derive from
 `HOME`, `CCC_CLAUDE_DIR`, and `CCC_STATE_DIR`, so the same contract applies on
 Linux and Termux. Existing materializer snapshot and whole-file caps still apply
-after the nunchi merge.
+after the nunchi merge. The optional snapshot is passed through the managed
+memory-injection scanner before use; scanner failure drops nunchi and preserves
+the canonical snapshot.
+
+Nunchi snapshots are node-global in this phase and are therefore disabled for
+every `audience-scoped` Codex runtime, including private routes. A scope-local
+snapshot and provenance contract must be introduced before that boundary may be
+relaxed; a scoped state directory alone does not authorize a global
+`NUNCHI_HOME` or `NUNCHI_SNAPSHOT`.
 
 Rollback is immediate and does not require an environment edit:
 

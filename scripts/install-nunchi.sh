@@ -20,10 +20,35 @@ MARK="# nunchi:#816"
 TS="$(date +%Y%m%dT%H%M%S)"
 CRONTAB="${CCC_CRONTAB_CMD:-crontab}"
 
+validate_codex_loader() {
+  python3 - "$HOOKS/codex-loader.py" <<'PY'
+import os
+from pathlib import Path
+import stat
+import sys
+
+path = Path(sys.argv[1])
+try:
+    meta = path.lstat()
+except OSError:
+    raise SystemExit(1)
+safe = (
+    stat.S_ISREG(meta.st_mode)
+    and meta.st_nlink == 1
+    and meta.st_uid in {0, os.geteuid()}
+    and not stat.S_IMODE(meta.st_mode) & 0o022
+    and 0 < meta.st_size <= 1024 * 1024
+)
+raise SystemExit(0 if safe else 1)
+PY
+}
+
 status() {
+  local codex_loader_status="MISSING/UNSAFE"
+  if validate_codex_loader; then codex_loader_status="present"; fi
   echo "mode: $(cat "$MODE_FILE" 2>/dev/null || echo off)"
   echo "hooks: $([ -f "$HOOKS/nunchi.py" ] && echo present || echo MISSING) ($HOOKS)"
-  echo "codex loader: $([ -f "$HOOKS/codex-loader.py" ] && [ ! -L "$HOOKS/codex-loader.py" ] && echo present || echo MISSING)"
+  echo "codex loader: $codex_loader_status"
   echo "cron: $("$CRONTAB" -l 2>/dev/null | grep -cF "$MARK" || true) line(s)"
   echo "db: $(ls -la "$HOME/.nunchi/facts.db" 2>/dev/null | awk '{print $5" bytes"}' || echo none)"
 }
@@ -77,7 +102,7 @@ PY
 case "${1:-}" in
   --apply)
     [ -f "$HOOKS/nunchi.py" ] || { echo "hooks missing at $HOOKS — run setup.sh first" >&2; exit 2; }
-    if [ "${2:-}" = "--codex" ] && { [ ! -f "$HOOKS/codex-loader.py" ] || [ -L "$HOOKS/codex-loader.py" ]; }; then
+    if [ "${2:-}" = "--codex" ] && ! validate_codex_loader; then
       echo "Codex nunchi loader missing or unsafe at $HOOKS/codex-loader.py — run setup.sh first" >&2
       exit 2
     fi

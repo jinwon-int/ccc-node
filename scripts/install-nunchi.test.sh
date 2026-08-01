@@ -20,7 +20,9 @@ fake_bin="$TMP/bin"
 mkdir -p "$hooks/nunchi" "$state" "$codex_home" "$nunchi_home" "$fake_bin"
 cp "$ROOT/claude/hooks/nunchi/codex-loader.py" "$hooks/nunchi/codex-loader.py"
 cp "$ROOT/claude/hooks/nunchi/nunchi.py" "$hooks/nunchi/nunchi.py"
+cp "$ROOT/claude/hooks/scan-injection.sh" "$hooks/scan-injection.sh"
 chmod 700 "$hooks/nunchi/codex-loader.py" "$hooks/nunchi/nunchi.py"
+chmod 700 "$hooks/scan-injection.sh"
 
 cat > "$hooks/load-memory.sh" <<'EOF'
 #!/usr/bin/env bash
@@ -79,6 +81,37 @@ rm -f "$hooks/nunchi/codex-loader.py"
 out="$(env "${common_env[@]}" bash "$ROOT/scripts/install-nunchi.sh" --apply --codex 2>&1)"; rc=$?
 ok "Codex opt-in refuses a missing managed loader before enabling mode" \
   '[ "$rc" = 2 ] && [ "$(cat "$state/nunchi.mode")" = off ] && grep -q "loader missing or unsafe" <<<"$out"'
+
+printf '%s\n' 'KEEP_EXISTING_CRON' > "$TMP/crontab"
+cp "$ROOT/claude/hooks/nunchi/codex-loader.py" "$hooks/nunchi/codex-loader.py"
+chmod 722 "$hooks/nunchi/codex-loader.py"
+out="$(env "${common_env[@]}" bash "$ROOT/scripts/install-nunchi.sh" --apply --codex 2>&1)"; rc=$?
+ok "Codex opt-in rejects a writable loader before state or cron mutation" \
+  '[ "$rc" = 2 ] && [ "$(cat "$state/nunchi.mode")" = off ] && [ "$(cat "$TMP/crontab")" = KEEP_EXISTING_CRON ]'
+
+rm -f "$hooks/nunchi/codex-loader.py"
+cp "$ROOT/claude/hooks/nunchi/codex-loader.py" "$hooks/nunchi/loader-source.py"
+ln "$hooks/nunchi/loader-source.py" "$hooks/nunchi/codex-loader.py"
+out="$(env "${common_env[@]}" bash "$ROOT/scripts/install-nunchi.sh" --apply --codex 2>&1)"; rc=$?
+ok "Codex opt-in rejects a hardlinked loader before state or cron mutation" \
+  '[ "$rc" = 2 ] && [ "$(cat "$state/nunchi.mode")" = off ] && [ "$(cat "$TMP/crontab")" = KEEP_EXISTING_CRON ]'
+
+rm -f "$hooks/nunchi/codex-loader.py" "$hooks/nunchi/loader-source.py"
+: > "$hooks/nunchi/codex-loader.py"
+chmod 700 "$hooks/nunchi/codex-loader.py"
+out="$(env "${common_env[@]}" bash "$ROOT/scripts/install-nunchi.sh" --apply --codex 2>&1)"; rc=$?
+ok "Codex opt-in rejects an empty loader before state or cron mutation" \
+  '[ "$rc" = 2 ] && [ "$(cat "$state/nunchi.mode")" = off ] && [ "$(cat "$TMP/crontab")" = KEEP_EXISTING_CRON ]'
+
+python3 - "$hooks/nunchi/codex-loader.py" <<'PY'
+from pathlib import Path
+import sys
+Path(sys.argv[1]).write_bytes(b"x" * (1024 * 1024 + 1))
+PY
+chmod 700 "$hooks/nunchi/codex-loader.py"
+out="$(env "${common_env[@]}" bash "$ROOT/scripts/install-nunchi.sh" --apply --codex 2>&1)"; rc=$?
+ok "Codex opt-in rejects an oversized loader before state or cron mutation" \
+  '[ "$rc" = 2 ] && [ "$(cat "$state/nunchi.mode")" = off ] && [ "$(cat "$TMP/crontab")" = KEEP_EXISTING_CRON ]'
 
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

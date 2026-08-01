@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Merge the local nunchi snapshot into the canonical Codex memory hook JSON.
+"""Optionally append safe local nunchi context to canonical hook JSON on stdin.
 
-This loader is deliberately local-only.  The canonical ``load-memory.sh``
-remains authoritative; every nunchi error returns its unmodified JSON document.
+The Codex materializer runs ``load-memory.sh`` itself with the full configured
+deadline, then invokes this managed helper only with the time left over. Every
+nunchi failure returns a non-zero status so the parent can retain the canonical
+snapshot unchanged. No memory body is written to stderr or diagnostics.
 """
 
 from __future__ import annotations
@@ -11,9 +13,12 @@ import json
 import math
 import os
 from pathlib import Path
+import selectors
+import signal
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 from typing import Mapping
 
@@ -44,6 +49,10 @@ def _bounded_float(
     if not math.isfinite(value):
         value = default
     return min(max(value, minimum), maximum)
+
+
+def _truthy(raw: str | None) -> bool:
+    return (raw or "").strip().lower() not in ("", "0", "false", "off", "no")
 
 
 def _owner_safe_regular(metadata: os.stat_result, *, local_only: bool) -> bool:
@@ -101,6 +110,13 @@ def _safe_read(
         os.close(descriptor)
 
 
+def _read_stdin_bounded() -> bytes | None:
+    raw = sys.stdin.buffer.read(MAX_MANAGED_FILE_BYTES + 1)
+    if not raw or len(raw) > MAX_MANAGED_FILE_BYTES:
+        return None
+    return raw
+
+
 def _validate_managed_script(path: Path) -> Path | None:
     try:
         metadata = path.lstat()
@@ -115,13 +131,15 @@ def _validate_managed_script(path: Path) -> Path | None:
     return path
 
 
-def _state_dir(environ: Mapping[str, str], home: Path, claude_dir: Path) -> Path:
+def _state_dir(environ: Mapping[str, str], claude_dir: Path) -> Path:
     return Path(environ.get("CCC_STATE_DIR") or claude_dir / "state").expanduser().absolute()
 
 
-def _mode_is_on(environ: Mapping[str, str], home: Path, claude_dir: Path) -> bool:
+def _mode_is_on(environ: Mapping[str, str], claude_dir: Path) -> bool:
+    if _truthy(environ.get("CCC_MEMORY_AUDIENCE_SCOPED")):
+        return False
     mode = _safe_read(
-        _state_dir(environ, home, claude_dir) / "nunchi.mode",
+        _state_dir(environ, claude_dir) / "nunchi.mode",
         max_bytes=16,
         local_only=True,
     )
@@ -149,44 +167,159 @@ def _strict_base_document(raw: bytes) -> tuple[dict[str, object], str] | None:
     return document, context
 
 
-def _run_base(loader: Path, environ: Mapping[str, str]) -> bytes | None:
+def _terminate(process: subprocess.Popen[bytes]) -> None:
+    if process.poll() is not None:
+        return
     try:
-        completed = subprocess.run(
-            ["bash", str(loader), "SessionStart"],
+        os.killpg(process.pid, signal.SIGTERM)
+    except OSError:
+        try:
+            process.terminate()
+        except OSError:
+            pass
+    try:
+        process.wait(timeout=0.2)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except OSError:
+        try:
+            process.kill()
+        except OSError:
+            pass
+    try:
+        process.wait(timeout=0.5)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+def _start_process(
+    command: list[str],
+    *,
+    environ: Mapping[str, str],
+    stdin_data: bytes | None = None,
+    capture: bool,
+) -> subprocess.Popen[bytes] | None:
+    stdin_file = None
+    try:
+        if stdin_data is not None:
+            stdin_file = tempfile.TemporaryFile()
+            stdin_file.write(stdin_data)
+            stdin_file.seek(0)
+        return subprocess.Popen(
+            command,
             env=dict(environ),
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
+            stdin=stdin_file if stdin_file is not None else subprocess.DEVNULL,
+            stdout=subprocess.PIPE if capture else subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            timeout=11.5,
-            check=False,
+            start_new_session=True,
+            bufsize=0,
         )
-    except (OSError, subprocess.TimeoutExpired):
+    except OSError:
         return None
-    if completed.returncode != 0 or len(completed.stdout) > MAX_MANAGED_FILE_BYTES:
-        return None
-    return completed.stdout
+    finally:
+        if stdin_file is not None:
+            stdin_file.close()
 
 
-def _regenerate_snapshot(script: Path, environ: Mapping[str, str]) -> bool:
-    timeout = _bounded_float(
+def _capture_bounded(
+    process: subprocess.Popen[bytes], *, timeout: float
+) -> tuple[int, bytes] | None:
+    if process.stdout is None:
+        _terminate(process)
+        return None
+    deadline = time.monotonic() + timeout
+    descriptor = process.stdout.fileno()
+    os.set_blocking(descriptor, False)
+    selector = selectors.DefaultSelector()
+    selector.register(descriptor, selectors.EVENT_READ)
+    output = bytearray()
+    eof = False
+    try:
+        while not eof:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                _terminate(process)
+                return None
+            events = selector.select(remaining)
+            if not events:
+                _terminate(process)
+                return None
+            for _key, _mask in events:
+                try:
+                    chunk = os.read(descriptor, 65536)
+                except BlockingIOError:
+                    continue
+                if not chunk:
+                    eof = True
+                    break
+                output.extend(chunk)
+                if len(output) > MAX_MANAGED_FILE_BYTES:
+                    _terminate(process)
+                    return None
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            _terminate(process)
+            return None
+        try:
+            returncode = process.wait(timeout=remaining)
+        except subprocess.TimeoutExpired:
+            _terminate(process)
+            return None
+        return returncode, bytes(output)
+    finally:
+        selector.close()
+        process.stdout.close()
+
+
+def _run_bounded(
+    command: list[str],
+    *,
+    environ: Mapping[str, str],
+    timeout: float,
+    stdin_data: bytes | None = None,
+    capture: bool,
+) -> tuple[int, bytes] | None:
+    if timeout <= 0:
+        return None
+    process = _start_process(
+        command,
+        environ=environ,
+        stdin_data=stdin_data,
+        capture=capture,
+    )
+    if process is None:
+        return None
+    if capture:
+        return _capture_bounded(process, timeout=timeout)
+    try:
+        return process.wait(timeout=timeout), b""
+    except subprocess.TimeoutExpired:
+        _terminate(process)
+        return None
+
+
+def _regenerate_snapshot(
+    script: Path, environ: Mapping[str, str], *, deadline: float
+) -> bool:
+    configured = _bounded_float(
         environ.get("CCC_CODEX_NUNCHI_REGEN_TIMEOUT_SEC"),
         2.0,
         minimum=0.1,
         maximum=3.0,
     )
-    try:
-        completed = subprocess.run(
-            [sys.executable, str(script), "snapshot", "--limit", "25"],
-            env=dict(environ),
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=timeout,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired):
+    remaining = deadline - time.monotonic() - 0.05
+    if remaining <= 0:
         return False
-    return completed.returncode == 0
+    result = _run_bounded(
+        [sys.executable, str(script), "snapshot", "--limit", "25"],
+        environ=environ,
+        timeout=min(configured, remaining),
+        capture=False,
+    )
+    return result is not None and result[0] == 0
 
 
 def _truncate_utf8(text: str, limit: int) -> str:
@@ -196,10 +329,37 @@ def _truncate_utf8(text: str, limit: int) -> str:
     return encoded[:limit].decode("utf-8", errors="ignore")
 
 
-def _nunchi_context(
-    environ: Mapping[str, str], *, home: Path, claude_dir: Path, hook_dir: Path
+def _scan_snapshot(
+    raw: bytes, *, hook_dir: Path, environ: Mapping[str, str], deadline: float
 ) -> str | None:
-    if not _mode_is_on(environ, home, claude_dir):
+    scanner = _validate_managed_script(hook_dir.parent / "scan-injection.sh")
+    remaining = deadline - time.monotonic() - 0.05
+    if scanner is None or remaining <= 0:
+        return None
+    result = _run_bounded(
+        ["bash", str(scanner), "nunchi-snapshot"],
+        environ=environ,
+        timeout=remaining,
+        stdin_data=raw,
+        capture=True,
+    )
+    if result is None or result[0] != 0:
+        return None
+    try:
+        return result[1].decode("utf-8").strip()
+    except UnicodeDecodeError:
+        return None
+
+
+def _nunchi_context(
+    environ: Mapping[str, str],
+    *,
+    home: Path,
+    claude_dir: Path,
+    hook_dir: Path,
+    deadline: float,
+) -> str | None:
+    if not _mode_is_on(environ, claude_dir):
         return None
     nunchi_home = Path(environ.get("NUNCHI_HOME") or home / ".nunchi").expanduser().absolute()
     snapshot_path = Path(
@@ -221,7 +381,7 @@ def _nunchi_context(
     )
     if time.time() - snapshot[1].st_mtime > max_age:
         script = _validate_managed_script(hook_dir / "nunchi.py")
-        if script is None or not _regenerate_snapshot(script, environ):
+        if script is None or not _regenerate_snapshot(script, environ, deadline=deadline):
             return None
         snapshot = _safe_read(
             snapshot_path,
@@ -232,9 +392,10 @@ def _nunchi_context(
             return None
 
     try:
-        text = snapshot[0].decode("utf-8").strip()
+        snapshot[0].decode("utf-8")
     except UnicodeDecodeError:
         return None
+    text = _scan_snapshot(snapshot[0], hook_dir=hook_dir, environ=environ, deadline=deadline)
     if not text:
         return None
     limit = _bounded_int(
@@ -247,23 +408,31 @@ def _nunchi_context(
 
 
 def main() -> int:
-    environ = os.environ
-    home = Path(environ.get("HOME") or str(Path.home())).expanduser().absolute()
-    claude_dir = Path(environ.get("CCC_CLAUDE_DIR") or home / ".claude").expanduser().absolute()
-    hook_dir = Path(__file__).absolute().parent
-    base_loader = _validate_managed_script(hook_dir.parent / "load-memory.sh")
-    if base_loader is None:
+    raw = _read_stdin_bounded()
+    if raw is None:
         return 1
-    base_raw = _run_base(base_loader, environ)
-    if base_raw is None:
-        return 1
-    parsed = _strict_base_document(base_raw)
+    parsed = _strict_base_document(raw)
     if parsed is None:
         return 1
     document, base_context = parsed
 
+    environ = os.environ
+    remaining = _bounded_float(
+        environ.get("CCC_CODEX_NUNCHI_REMAINING_SEC"),
+        3.0,
+        minimum=0.05,
+        maximum=14.0,
+    )
+    deadline = time.monotonic() + remaining
+    home = Path(environ.get("HOME") or str(Path.home())).expanduser().absolute()
+    claude_dir = Path(environ.get("CCC_CLAUDE_DIR") or home / ".claude").expanduser().absolute()
+    hook_dir = Path(__file__).absolute().parent
     addition = _nunchi_context(
-        environ, home=home, claude_dir=claude_dir, hook_dir=hook_dir
+        environ,
+        home=home,
+        claude_dir=claude_dir,
+        hook_dir=hook_dir,
+        deadline=deadline,
     )
     if addition:
         hook_output = document["hookSpecificOutput"]
