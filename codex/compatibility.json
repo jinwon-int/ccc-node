@@ -37,6 +37,11 @@
       "codex_skill": "ccc-wiki-record"
     },
     {
+      "pattern": "claude/skills/bridge-safe-detached-run/**",
+      "compatibility": "claude-only",
+      "reason": "Claude bridge background-task lifecycle workaround (#822); systemd transient-unit procedure driven from Claude sessions"
+    },
+    {
       "pattern": "claude/skills/codex-memory-loader-injection/**",
       "compatibility": "claude-only",
       "reason": "Operator procedure executed from Claude sessions against codex bridge config"
@@ -50,6 +55,11 @@
       "pattern": "claude/skills/distill/**",
       "compatibility": "claude-only",
       "reason": "Claude hook and transcript pipeline"
+    },
+    {
+      "pattern": "claude/skills/fleet-disk-constraint-triage/**",
+      "compatibility": "adapted",
+      "codex_skill": "fleet-disk-constraint-triage"
     },
     {
       "pattern": "claude/skills/gh-ci-wait/**",
@@ -116,6 +126,10 @@
     {
       "name": "ccc-wiki-record",
       "source": "codex/skills/ccc-wiki-record"
+    },
+    {
+      "name": "fleet-disk-constraint-triage",
+      "source": "codex/skills/fleet-disk-constraint-triage"
     },
     {
       "name": "gh-ci-wait",

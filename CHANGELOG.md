@@ -5,6 +5,17 @@ All notable changes to the Claude Code node harness. Dates are KST.
 ## [Unreleased]
 
 ### Added
+- New skill `fleet-disk-constraint-triage`: platform-aware fleet disk audit
+  (Android/Termux nodes must be judged by `df $HOME`, never `df /`), severity
+  classification, root-cause investigation, and node-local cleanup delegation
+  via durable Wiki tickets — no centralized remote deletes; destructive steps
+  (e.g. `docker system prune`) are owner-approval gated. Shipped as `adapted`
+  with a codex mirror (`codex/skills/fleet-disk-constraint-triage`).
+- New skill `bridge-safe-detached-run`: run long-running commands as detached
+  systemd transient units (`--collect`, mandatory `HOME`/`PATH` env injection,
+  persistent log + `EXIT=` marker, polling watcher) so they survive
+  bridge/session restarts — formalizes the #822 workaround. Classified
+  `claude-only` (Claude bridge background-task lifecycle).
 - Skill autosave now has a usage telemetry and deterministic lifecycle
   curator (`skill-review/curator.py`, #752). Body-free counters
   (view/use/patch, timestamps, state) feed `active → stale → archived`
