@@ -24,6 +24,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the `gh-ci-wait` skill teaches agents the registration contract.
 
 ### Fixed
+- **Termux isolated Codex execution (#844).** The distill and skill-candidate
+  subprocess environment now prepends an owner-controlled, non-writable
+  `PREFIX/bin` when present, so Termux `env sh` wrappers can resolve both
+  `sh` and `node` instead of exiting 127. Relative, symlinked, or
+  group/world-writable prefix paths remain fail-closed, while `PREFIX` and
+  ambient secrets are still excluded from the child environment.
 - **Terminal-stall outcome integrity (#840).** A turn that emits partial text
   but never produces its provider terminal event is now recorded as
   `interrupted` with `success=False`, instead of being projected as a

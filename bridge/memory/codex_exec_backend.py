@@ -162,13 +162,54 @@ def _resolve_executable(value: str, environment: Mapping[str, str]) -> str:
     return str(resolved)
 
 
+def _trusted_prefix_bin(source: Mapping[str, str]) -> str | None:
+    """Return an owner-controlled ``PREFIX/bin`` for Termux-like runtimes.
+
+    Termux installs the Codex wrapper, ``sh``, and ``node`` below
+    ``$PREFIX/bin``.  The isolated child deliberately drops the ambient PATH,
+    but a Linux-only replacement makes ``#!/usr/bin/env sh`` wrappers exit 127
+    before Codex starts.  Use PREFIX only to derive one tightly validated PATH
+    entry; never copy PREFIX itself into the child environment.
+    """
+
+    raw_prefix = source.get("PREFIX")
+    if not isinstance(raw_prefix, str) or not raw_prefix or "\x00" in raw_prefix:
+        return None
+    prefix = Path(raw_prefix)
+    if not prefix.is_absolute():
+        return None
+    try:
+        canonical_prefix = prefix.resolve(strict=True)
+        prefix_metadata = prefix.lstat()
+        bin_path = prefix / "bin"
+        canonical_bin = bin_path.resolve(strict=True)
+        bin_metadata = bin_path.lstat()
+    except OSError:
+        return None
+    if canonical_prefix != prefix or canonical_bin != bin_path:
+        return None
+    for metadata in (prefix_metadata, bin_metadata):
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or stat.S_IMODE(metadata.st_mode) & 0o022
+        ):
+            return None
+    return str(bin_path)
+
+
 def _minimal_environment(source: Mapping[str, str], *, temp_root: Path) -> dict[str, str]:
     environment = {
         name: value
         for name in _INHERITED_ENV_NAMES
         if (value := source.get(name)) is not None and "\x00" not in value
     }
-    environment["PATH"] = _DEFAULT_PATH
+    trusted_prefix_bin = _trusted_prefix_bin(source)
+    environment["PATH"] = (
+        f"{trusted_prefix_bin}:{_DEFAULT_PATH}"
+        if trusted_prefix_bin is not None
+        else _DEFAULT_PATH
+    )
     environment["TMPDIR"] = str(temp_root)
     environment["TERM"] = "dumb"
     environment["NO_COLOR"] = "1"
