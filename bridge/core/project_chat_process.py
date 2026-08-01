@@ -130,6 +130,31 @@ def _admission_diagnostics(
     return details
 
 
+
+def _stall_ages(loop: Any, request: _PendingRequest) -> dict[str, str]:
+    """Seconds since the turn's last signs of life, as strings for the log.
+
+    The pair that matters is silence vs last_tool: text arriving AFTER the last
+    tool event (last_text_age < last_tool_age) says the model finished speaking
+    and the missing piece is the terminal frame — the provider's side. Text
+    arriving before a newer tool event would say the turn died mid-work. The
+    admission log cannot make this distinction; this one exists to.
+    """
+    ages: dict[str, str] = {}
+    try:
+        now = loop.time()
+        for key, attr in (
+            ("silence", "last_event_at"),
+            ("last_text_age", "last_text_at"),
+            ("last_tool_age", "last_tool_at"),
+        ):
+            stamp = float(getattr(request, attr, 0.0) or 0.0)
+            ages[key] = f"{now - stamp:.1f}" if stamp > 0 else "never"
+    except Exception:  # pragma: no cover - defensive
+        ages = {"silence": "?", "last_text_age": "?", "last_tool_age": "?"}
+    return ages
+
+
 # Admission failures worth a second attempt: the provider said nothing at all
 # (the shape seen on gongmyoung), or it named a transient transport fault.
 # `auth`, `rate-limit`, `tls` and `oom` are deliberately absent — retrying a
@@ -965,6 +990,17 @@ class ProjectChatProcessMixin:
                     )
 
                 if turn_outcome is TurnStreamOutcome.TERMINAL_STALL:
+                    # Diagnostics are read before the session is dropped —
+                    # closing the client clears the SDK transport and the exit
+                    # code with it (same ordering as ADMISSION_TIMEOUT, #846).
+                    stall_diagnostics = _admission_diagnostics(
+                        session,
+                        provider=getattr(self._config, "agent_provider", "claude"),
+                        model=model,
+                        elapsed=_elapsed_since(loop, progress_request),
+                        grace=stall_grace,
+                    )
+                    stall_ages = _stall_ages(loop, progress_request)
                     terminal_won = _claim_request_terminal(
                         progress_request,
                         RequestPhase.INTERRUPTED,
@@ -977,9 +1013,23 @@ class ProjectChatProcessMixin:
                         final_streamed = await streaming_handler.finalize_all()
                     logger.warning(
                         "Terminal-event stall released agent turn for user %s chat %s "
-                        "after silence following answer text",
+                        "after silence following answer text "
+                        "(provider=%s model=%s endpoint=%s elapsed=%ss grace=%gs "
+                        "silence=%ss last_text_age=%ss last_tool_age=%ss "
+                        "exit_code=%s stderr_class=%s stderr_lines=%s)",
                         user_id,
                         chat_id,
+                        stall_diagnostics["provider"],
+                        stall_diagnostics["model"],
+                        stall_diagnostics["endpoint"],
+                        stall_diagnostics["elapsed"],
+                        stall_grace,
+                        stall_ages["silence"],
+                        stall_ages["last_text_age"],
+                        stall_ages["last_tool_age"],
+                        stall_diagnostics["exit_code"],
+                        stall_diagnostics["stderr_class"],
+                        stall_diagnostics["stderr_lines"],
                     )
                     try:
                         health_reporter.record_stalled_request()
