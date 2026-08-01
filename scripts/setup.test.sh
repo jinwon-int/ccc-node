@@ -55,6 +55,17 @@ ok "setup dry-run does not create Codex plugin policy state" '[ ! -e "$nonroot_h
 ok "setup dry-run reports Codex managed skills without creating CODEX_HOME" \
   '[ "$rc" = 0 ] && grep -Fq "ccc-doctor" <<<"$out" && grep -Fq "create" <<<"$out" && [ ! -e "$nonroot_home/.codex" ]'
 
+# systemd transient units / timers do not export HOME (only User= services get
+# it), and ccc-self-update runs setup.sh headless from exactly such contexts —
+# with NO CCC_* overrides, so the `${CCC_*:-$HOME/...}` defaults dereference
+# $HOME. Overrides must stay absent here: `${VAR:-word}` never evaluates the
+# default when VAR is set, which would mask the bug this test pins.
+# Regression: gwakga 2026-08-02 — `set -u` aborted at the first $HOME default
+# ("setup.sh: line 87: HOME: unbound variable") and self-update rolled back.
+out="$(env -u HOME bash "$SETUP" --dry-run 2>&1)"; rc=$?
+ok "setup dry-run survives unset HOME (systemd/cron context)" \
+  '[ "$rc" = 0 ] && ! grep -q "HOME: unbound variable" <<<"$out"'
+
 # setup/self-update wiring must reach the canonical bridge renderer while
 # remaining mutation-free in dry-run. Use only fixture paths and fake systemctl.
 setup_sd="$TMP/setup-systemd"
