@@ -796,7 +796,7 @@ class ProjectChatProcessMixin:
                 if turn_outcome is TurnStreamOutcome.TERMINAL_STALL:
                     terminal_won = _claim_request_terminal(
                         progress_request,
-                        RequestPhase.COMPLETED,
+                        RequestPhase.INTERRUPTED,
                         cause="terminal-stall",
                     )
                     if terminal_won:
@@ -819,9 +819,11 @@ class ProjectChatProcessMixin:
                     if not content and output.interim_delivered:
                         streamed = True
                     content = content or "(No response)"
+                    message = "Agent stopped before terminal completion"
                     return ChatResponse(
                         content=f"{content}\n\n{TERMINAL_STALL_NOTICE}",
-                        success=True,
+                        success=False,
+                        error=message,
                         session_id=session.session_id,
                         streamed=streamed,
                     )

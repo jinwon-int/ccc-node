@@ -48,8 +48,8 @@ RESTART_INTERRUPT_NOTICE = (
 # arrived and the bounded stall grace released it (#411 C). The buffered text
 # above this notice is delivered exactly once; the turn itself is interrupted.
 TERMINAL_STALL_NOTICE = (
-    "⚠️ The agent stopped responding after producing this answer (no completion "
-    "signal arrived). The turn was closed automatically — reply to continue, and "
+    "⚠️ The agent stream stopped after producing partial output (no completion "
+    "signal arrived). The turn was interrupted automatically — reply to continue, and "
     "re-send your request if anything seems missing."
 )
 
