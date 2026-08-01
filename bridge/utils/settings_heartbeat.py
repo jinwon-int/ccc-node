@@ -173,6 +173,33 @@ class HeartbeatSettingsMixin:
             "fall back to the full process timeout."
         ),
     )
+    turn_admission_retries: int = Field(
+        default=1,
+        alias="CCC_TURN_ADMISSION_RETRIES",
+        ge=0,
+        le=3,
+        description=(
+            "Extra attempts for a turn the provider never admitted, when the "
+            "failure looks transient (no stderr at all, or a network/timeout "
+            "class). Auth, rate-limit, TLS and OOM classes are never retried. "
+            "Each retry runs on turn_admission_retry_timeout_seconds, not the "
+            "full admission grace, so the worst case stays bounded. Set 0 to "
+            "fail on the first stall."
+        ),
+    )
+    turn_admission_retry_timeout_seconds: float = Field(
+        default=60.0,
+        alias="CCC_TURN_ADMISSION_RETRY_TIMEOUT_SECONDS",
+        ge=0,
+        allow_inf_nan=False,
+        description=(
+            "First-event deadline for a retried turn. Deliberately far below "
+            "the initial grace: a provider that already went silent once has "
+            "to prove it is back quickly, and spending the full grace twice is "
+            "what made a 300s deadline feel like a 600s hang. 0 disables the "
+            "retry regardless of turn_admission_retries."
+        ),
+    )
     turn_admission_timeout_seconds: float = Field(
         default=300.0,
         alias="CCC_TURN_ADMISSION_TIMEOUT_SECONDS",

@@ -130,6 +130,22 @@ def _admission_diagnostics(
     return details
 
 
+# Admission failures worth a second attempt: the provider said nothing at all
+# (the shape seen on gongmyoung), or it named a transient transport fault.
+# `auth`, `rate-limit`, `tls` and `oom` are deliberately absent — retrying a
+# rejected key changes nothing and retrying a throttle makes it worse.
+_RETRYABLE_ADMISSION_CLASSES = frozenset({"silent", "network", "timeout"})
+
+
+def _admission_retry_class(response: ChatResponse) -> str | None:
+    """The stderr class of a retryable admission failure, else ``None``."""
+    marker = getattr(response, "failure_class", None) or ""
+    prefix, _, cls = marker.partition("/")
+    if prefix != "admission-timeout":
+        return None
+    return cls if cls in _RETRYABLE_ADMISSION_CLASSES else None
+
+
 def _claim_request_terminal(request: _PendingRequest, phase: RequestPhase, *, cause: str) -> bool:
     """Claim a terminal result without turning normal races into exceptions."""
 
@@ -256,7 +272,7 @@ class ProjectChatProcessMixin:
                 model=model,
                 sensitive_log_event=sensitive_log_event,
             )
-        return await self._process_agent_message(
+        response = await self._process_agent_message(
             user_message=user_message,
             user_id=user_id,
             chat_id=chat_id,
@@ -275,6 +291,64 @@ class ProjectChatProcessMixin:
             interim_message_callback=interim_message_callback,
             usage_mode=usage_mode,
         )
+
+        # One bounded second attempt when the provider never spoke. Retrying is
+        # worth it because the failures cluster in short windows — gongmyoung's
+        # uplink drops for ~60s at a time — but the retry runs on its own small
+        # budget, never the full grace again: 300s + 300s is the 600s dead wait
+        # that made raising the deadline the wrong fix in the first place.
+        #
+        # This does not hide the cause. The #846 warning is emitted for each
+        # admission timeout, so a retried failure still leaves the first
+        # attempt's provider, endpoint, exit code and stderr class in the log.
+        retry_class = _admission_retry_class(response)
+        if retry_class is None:
+            return response
+        attempts = int(getattr(self._config, "turn_admission_retries", 0) or 0)
+        if attempts <= 0:
+            return response
+        retry_grace = float(
+            getattr(self._config, "turn_admission_retry_timeout_seconds", 0.0) or 0.0
+        )
+        if retry_grace <= 0:
+            return response
+
+        logger.warning(
+            "Retrying a turn the provider never admitted for user %s chat %s "
+            "(class=%s retry_grace=%gs)",
+            user_id,
+            chat_id,
+            retry_class,
+            retry_grace,
+        )
+        retried = await self._process_agent_message(
+            user_message=user_message,
+            user_id=user_id,
+            chat_id=chat_id,
+            session_id=session_id,
+            model=model,
+            effort=effort,
+            approval_policy=approval_policy,
+            approvals_reviewer=approvals_reviewer,
+            sandbox_policy=sandbox_policy,
+            new_session=new_session,
+            approval_callback=approval_callback,
+            typing_callback=typing_callback,
+            status_callback=status_callback,
+            bot=bot,
+            notification_bot=notification_bot,
+            interim_message_callback=interim_message_callback,
+            usage_mode=usage_mode,
+            admission_timeout_override=retry_grace,
+        )
+        if retried.success:
+            logger.info(
+                "Retry admitted the turn for user %s chat %s after a %s stall",
+                user_id,
+                chat_id,
+                retry_class,
+            )
+        return retried
 
     async def _cancel_agent_streaming(
         self, streaming_handler: Optional[Any], *, context: str
@@ -477,8 +551,15 @@ class ProjectChatProcessMixin:
         interim_message_callback: Optional[InterimMessageCallback],
         notification_bot: Optional[Any] = None,
         usage_mode: str = MODE_INTERACTIVE,
+        admission_timeout_override: Optional[float] = None,
     ) -> ChatResponse:
-        """Run one provider-neutral turn without changing the Claude SDK path."""
+        """Run one provider-neutral turn without changing the Claude SDK path.
+
+        ``admission_timeout_override`` exists for the retry in
+        ``process_message`` and nothing else. The retry must not spend the full
+        admission grace a second time — that is how a 300s deadline became a
+        600s wait on gongmyoung — so it re-runs on a short budget instead.
+        """
         key = self._stream_key(user_id, chat_id)
         streaming_handler = None
         if bot and getattr(self._config, "enable_streaming", False):
@@ -679,7 +760,9 @@ class ProjectChatProcessMixin:
 
                 stall_grace = float(getattr(self._config, "terminal_stall_seconds", 0.0) or 0.0)
                 admission_grace = float(
-                    getattr(self._config, "turn_admission_timeout_seconds", 0.0) or 0.0
+                    admission_timeout_override
+                    if admission_timeout_override is not None
+                    else (getattr(self._config, "turn_admission_timeout_seconds", 0.0) or 0.0)
                 )
                 approval_grace = float(
                     getattr(self._config, "approval_stall_seconds", 0.0) or 0.0
@@ -842,6 +925,10 @@ class ProjectChatProcessMixin:
                         content=f"⏰ {message}. Please retry your request.",
                         success=False,
                         error=message,
+                        failure_class=(
+                            "admission-timeout/"
+                            f"{diagnostics['stderr_class'] or 'silent'}"
+                        ),
                         session_id=session.session_id,
                     )
 

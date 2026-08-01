@@ -2592,3 +2592,145 @@ async def test_admission_timeout_survives_a_session_without_diagnostics(
     assert result.success is False
     assert result.error == "Agent turn did not start within 0.05s"
     assert stalled == [1]
+
+
+# ---- bounded admission retry (#846 follow-up) -----------------------------
+# The failures cluster in short windows (gongmyoung's uplink drops for ~60s),
+# so a second attempt usually lands. The constraint is that it must not spend
+# the admission grace twice — that is the 600s dead wait raising the deadline
+# already produced.
+
+
+def _retry_handler(tmp_path, runtime, monkeypatch, *, retries=1, retry_grace=0.05):
+    handler, stalled = _stall_handler(tmp_path, runtime, monkeypatch)
+    handler._config.turn_admission_timeout_seconds = 0.05
+    handler._config.turn_admission_retries = retries
+    handler._config.turn_admission_retry_timeout_seconds = retry_grace
+    handler._process_timeout_seconds = 5.0
+    return handler, stalled
+
+
+def _silent(session_id="thread-1"):
+    blocked = StallSession(session_id, pre_events=[])
+    blocked.transport_diagnostics = lambda: {
+        "exit_code": None,
+        "stderr_class": None,
+        "stderr_lines": 0,
+    }
+    return blocked
+
+
+@pytest.mark.anyio
+async def test_silent_admission_failure_is_retried_and_can_succeed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime = FakeRuntime([_silent(), FakeSession("thread-1")])
+    handler, _ = _retry_handler(tmp_path, runtime, monkeypatch)
+
+    result = await asyncio.wait_for(handler.process_message("hi", 7, 70), timeout=5)
+
+    assert result.success is True and result.content == "ok"
+    assert len(runtime.requests) == 2  # the retry ran on a fresh session
+
+
+@pytest.mark.anyio
+async def test_retry_uses_the_short_budget_not_the_full_grace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Both attempts stall. The reported deadline of the SECOND failure is the
+    # retry budget, which is what keeps the worst case bounded.
+    runtime = FakeRuntime([_silent(), _silent("thread-2")])
+    handler, _ = _retry_handler(tmp_path, runtime, monkeypatch, retry_grace=0.02)
+
+    result = await asyncio.wait_for(handler.process_message("hi", 7, 70), timeout=5)
+
+    assert result.success is False
+    assert result.error == "Agent turn did not start within 0.02s"
+    assert len(runtime.requests) == 2
+
+
+@pytest.mark.anyio
+async def test_only_one_retry_is_attempted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime = FakeRuntime([_silent(), _silent("thread-2"), FakeSession("thread-3")])
+    handler, _ = _retry_handler(tmp_path, runtime, monkeypatch)
+
+    result = await asyncio.wait_for(handler.process_message("hi", 7, 70), timeout=5)
+
+    assert result.success is False
+    assert len(runtime.requests) == 2  # not 3: the retry is not a loop
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("stderr_class", ["auth", "rate-limit", "tls", "oom"])
+async def test_non_transient_admission_failures_are_not_retried(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stderr_class: str
+) -> None:
+    # Retrying a rejected key changes nothing; retrying a throttle makes it
+    # worse. These fail on the first attempt, immediately.
+    blocked = StallSession("thread-1", pre_events=[])
+    blocked.transport_diagnostics = lambda: {
+        "exit_code": 1,
+        "stderr_class": stderr_class,
+        "stderr_lines": 2,
+    }
+    runtime = FakeRuntime([blocked, FakeSession("thread-1")])
+    handler, _ = _retry_handler(tmp_path, runtime, monkeypatch)
+
+    result = await asyncio.wait_for(handler.process_message("hi", 7, 70), timeout=5)
+
+    assert result.success is False
+    assert result.failure_class == f"admission-timeout/{stderr_class}"
+    assert len(runtime.requests) == 1
+
+
+@pytest.mark.anyio
+async def test_network_class_is_retried(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    blocked = StallSession("thread-1", pre_events=[])
+    blocked.transport_diagnostics = lambda: {
+        "exit_code": 143,
+        "stderr_class": "network",
+        "stderr_lines": 1,
+    }
+    runtime = FakeRuntime([blocked, FakeSession("thread-1")])
+    handler, _ = _retry_handler(tmp_path, runtime, monkeypatch)
+
+    result = await asyncio.wait_for(handler.process_message("hi", 7, 70), timeout=5)
+
+    assert result.success is True
+    assert len(runtime.requests) == 2
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("retries,grace", [(0, 0.05), (1, 0.0)])
+async def test_retry_is_fully_disableable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, retries: int, grace: float
+) -> None:
+    runtime = FakeRuntime([_silent(), FakeSession("thread-1")])
+    handler, _ = _retry_handler(
+        tmp_path, runtime, monkeypatch, retries=retries, retry_grace=grace
+    )
+
+    result = await asyncio.wait_for(handler.process_message("hi", 7, 70), timeout=5)
+
+    assert result.success is False
+    assert len(runtime.requests) == 1
+
+
+@pytest.mark.anyio
+async def test_a_normal_failure_is_never_mistaken_for_a_retryable_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # failure_class is set only on the admission path; everything else must be
+    # left alone by the retry seam.
+    runtime = FakeRuntime([FakeSession("thread-1")])
+    handler, _ = _retry_handler(tmp_path, runtime, monkeypatch)
+
+    result = await asyncio.wait_for(handler.process_message("hi", 7, 70), timeout=5)
+
+    assert result.success is True
+    assert result.failure_class is None
+    assert len(runtime.requests) == 1
