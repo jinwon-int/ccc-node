@@ -388,5 +388,66 @@ ok "dispatch generated the plist" '[ -f "$DPLIST" ]'
 ok "dispatched plist carries project path" 'grep -Fq "<string>$DPROJ</string>" "$DPLIST"'
 ok "dispatch hint names start.sh (caller passthrough)" 'grep -q -- "--uninstall to remove startup service" "$OUT" && grep -q "start.sh" "$OUT"'
 
+# ---- systemd: reconcile must not relocate the service (#842) ---------------
+# The renderer builds ExecStart from the INVOKING checkout, so `./setup.sh` run
+# inside a scratch tree would otherwise repoint the live unit at it. seoseo
+# 2026-08-01 served from /work/agent-codebench/ccc-node-pr833 that way.
+RSD="$TMP/sd-relocate"
+RUNIT="$RSD/ccc-telegram-bridge.service"
+mkdir -p "$RSD"
+run env HOME="$FH" CCC_SYSTEMD_DIR="$RSD" CCC_SYSTEMCTL="$SC_STUB" \
+    bash "$SSD" install --project-root "$PROJECT"
+okc "$RC" 0 "relocate fixture installs"
+
+# Point the installed unit at a DIFFERENT checkout, as a work-tree setup run
+# would have left it. The path need not exist: a unit whose tree was deleted
+# must still be recognized and guarded, not silently taken over.
+OTHER="$TMP/other-checkout"
+sed -i "s|^ExecStart=/bin/bash $HERE/start\.sh |ExecStart=/bin/bash $OTHER/bridge/start.sh |" "$RUNIT"
+sed -i "s|^WorkingDirectory=$REPO\$|WorkingDirectory=$OTHER|" "$RUNIT"
+relocate_before="$(sha256sum < "$RUNIT")"
+relocate_inode_before="$(stat -c %i "$RUNIT")"
+: > "$SC_CALLS"
+run env HOME="$FH" CCC_SYSTEMD_DIR="$RSD" CCC_SYSTEMCTL="$SC_STUB" \
+    bash "$SSD" reconcile
+okc "$RC" 0 "reconcile from a foreign checkout exits 0 (setup must not abort)"
+ok "foreign-checkout reconcile leaves the unit byte-identical" \
+   '[ "$(sha256sum < "$RUNIT")" = "$relocate_before" ]'
+ok "foreign-checkout reconcile preserves the inode" \
+   '[ "$(stat -c %i "$RUNIT")" = "$relocate_inode_before" ]'
+ok "foreign-checkout reconcile does not contact systemctl" '[ ! -s "$SC_CALLS" ]'
+ok "refusal names both checkouts" \
+   'grep -q "boots from a different checkout" "$OUT" && grep -Fq "$OTHER" "$OUT" && grep -Fq "$REPO" "$OUT"'
+ok "refusal points at the explicit escape hatch" 'grep -q -- "--allow-relocate" "$OUT"'
+ok "refusal is not mistaken for an unrecognized unit" \
+   '! grep -q "not a recognized ccc-generated main unit" "$OUT"'
+
+# Deliberate relocation still works when it says so.
+: > "$SC_CALLS"
+run env HOME="$FH" CCC_SYSTEMD_DIR="$RSD" CCC_SYSTEMCTL="$SC_STUB" \
+    bash "$SSD" reconcile --allow-relocate
+okc "$RC" 0 "explicit relocation exits 0"
+ok "explicit relocation repoints ExecStart at this checkout" \
+   'grep -Fxq "ExecStart=/bin/bash $HERE/start.sh --path $PROJECT" "$RUNIT"'
+ok "explicit relocation repoints WorkingDirectory too" \
+   'grep -Fxq "WorkingDirectory=$REPO" "$RUNIT"'
+ok "explicit relocation still only daemon-reloads" \
+   '[ "$(cat "$SC_CALLS")" = "$DAEMON_RELOAD" ]'
+
+# Reconciling in place is untouched by the guard: same checkout, real drift.
+sed -i 's/^Restart=always$/Restart=on-failure/' "$RUNIT"
+: > "$SC_CALLS"
+run env HOME="$FH" CCC_SYSTEMD_DIR="$RSD" CCC_SYSTEMCTL="$SC_STUB" \
+    bash "$SSD" reconcile
+okc "$RC" 0 "same-checkout drift still reconciles"
+ok "same-checkout drift is repaired" \
+   'grep -Fxq "Restart=always" "$RUNIT" && ! grep -q "Restart=on-failure" "$RUNIT"'
+
+# The flag is reconcile-only, like --dry-run.
+run env HOME="$FH" CCC_SYSTEMD_DIR="$RSD" CCC_SYSTEMCTL="$SC_STUB" \
+    bash "$SSD" install --project-root "$PROJECT" --allow-relocate
+okc "$RC" 1 "--allow-relocate is rejected outside reconcile"
+ok "reconcile-only rejection is explained" 'grep -q "only with reconcile" "$OUT"'
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
