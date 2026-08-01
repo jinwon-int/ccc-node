@@ -11,6 +11,7 @@ if TYPE_CHECKING:
         AgentEvent,
         AgentRuntime,
         AgentSession,
+        AsyncCompletionCapability,
         ApprovalDecision,
         ApprovalHandler,
         ApprovalRequestEvent,
@@ -31,6 +32,7 @@ else:
         AgentEvent,
         AgentRuntime,
         AgentSession,
+        AsyncCompletionCapability,
         ApprovalDecision,
         ApprovalHandler,
         ApprovalRequestEvent,
@@ -164,6 +166,66 @@ class AgentRuntimeContractTests(unittest.IsolatedAsyncioTestCase):
             lambda: ModelInfo(id="fake", display_name=""),
         )
 
+        for factory in invalid_factories:
+            with self.subTest(factory=factory), self.assertRaises(ValueError):
+                factory()
+
+    async def test_async_completion_capability_fails_closed(self) -> None:
+        degraded = AsyncCompletionCapability(
+            provider="codex",
+            state="degraded",
+            protocol_version=None,
+            notification_method="turn/completed",
+            recovery_method="thread/read",
+            ownership_scope="exact_active_turn",
+            supports_durable_delivery=False,
+            reason_code="detached_ownership_unavailable",
+        )
+
+        self.assertEqual(degraded.state, "degraded")
+        self.assertIsNone(degraded.protocol_version)
+        invalid_factories: tuple[Callable[[], object], ...] = (
+            lambda: AsyncCompletionCapability(
+                provider="codex",
+                state=cast(Any, "unknown"),
+                protocol_version=None,
+                notification_method=None,
+                recovery_method=None,
+                ownership_scope="exact_active_turn",
+                supports_durable_delivery=False,
+                reason_code="unknown_version",
+            ),
+            lambda: AsyncCompletionCapability(
+                provider="",
+                state="degraded",
+                protocol_version=None,
+                notification_method="turn/completed",
+                recovery_method="thread/read",
+                ownership_scope="exact_active_turn",
+                supports_durable_delivery=False,
+                reason_code="unavailable",
+            ),
+            lambda: AsyncCompletionCapability(
+                provider="codex",
+                state="degraded",
+                protocol_version=None,
+                notification_method="turn/completed",
+                recovery_method="thread/read",
+                ownership_scope="exact_active_turn",
+                supports_durable_delivery=True,
+                reason_code="unavailable",
+            ),
+            lambda: AsyncCompletionCapability(
+                provider="codex",
+                state="supported",
+                protocol_version=None,
+                notification_method="turn/completed",
+                recovery_method="thread/read",
+                ownership_scope="exact_active_turn",
+                supports_durable_delivery=True,
+                reason_code="supported",
+            ),
+        )
         for factory in invalid_factories:
             with self.subTest(factory=factory), self.assertRaises(ValueError):
                 factory()
