@@ -8,6 +8,7 @@ ccc-node memory starts from a no-network SessionStart snapshot and refreshes cac
 - Local hot-memory SQLite FTS/fuzzy index.
 - Cached Family Wiki prefetch.
 - Cached Honcho working memory.
+- Optional local nunchi snapshot on nodes that explicitly enable nunchi mode.
 - Distilled local facts from the Session Distiller pipeline.
 
 ## Source isolation
@@ -31,9 +32,42 @@ Configuration:
 - `CCC_CODEX_AGENTS_BUDGET_BYTES` — whole active global file budget after preserving user content (default 24576; hard max 32768).
 - `CCC_CODEX_LOCK_TIMEOUT_SEC` — local materializer lock deadline (default 3 seconds; hard max 10).
 - `CCC_CODEX_LOADER_TIMEOUT_SEC` — `load-memory.sh` deadline (default/hard max 14 seconds).
-- `CCC_CODEX_MEMORY_LOADER` — explicit trusted loader path when the installed/repository loader cannot be discovered.
+- `CCC_CODEX_MEMORY_LOADER` — explicit trusted loader path. This always wins over automatic nunchi selection.
+- `CCC_CODEX_NUNCHI_MAX_BYTES` — nunchi-only contribution cap (default 3072; hard max 8192).
+- `CCC_CODEX_NUNCHI_REGEN_TIMEOUT_SEC` — stale nunchi snapshot regeneration deadline (default 2 seconds; hard max 3).
 
 `materialize --json` and `status --json` emit only status, hashes, byte counts, active kind, and durability/metadata state; they never emit memory bodies. `setup.sh` installs the materializer and `scripts/ccc-codex` beside `load-memory.sh` under `${CCC_CLAUDE_DIR:-$HOME/.claude}/hooks`.
+
+### Codex nunchi opt-in and rollback
+
+`setup.sh` also installs the managed `hooks/nunchi/codex-loader.py`. On a Codex
+node, `scripts/install-nunchi.sh --apply --codex` writes the owner-local
+`${CCC_STATE_DIR:-${CCC_CLAUDE_DIR:-$HOME/.claude}/state}/nunchi.mode` marker as
+`on`; the materializer then safely selects the installed nunchi loader without
+adding or printing bridge environment variables. The loader first runs the
+canonical `load-memory.sh SessionStart` contract and strictly parses its JSON.
+It can only append a bounded, valid UTF-8 local nunchi snapshot to
+`additionalContext`; it never replaces the canonical context.
+
+Missing, corrupt, or unsafe snapshots fail open to the unmodified canonical
+snapshot. A stale snapshot is regenerated within a bounded deadline; a failed
+regeneration or a result that remains stale also falls back to canonical memory.
+Loader, mode-marker, and snapshot symlinks, hardlinks, non-regular files, unsafe
+owners, and writable modes are not trusted. The path defaults derive from
+`HOME`, `CCC_CLAUDE_DIR`, and `CCC_STATE_DIR`, so the same contract applies on
+Linux and Termux. Existing materializer snapshot and whole-file caps still apply
+after the nunchi merge.
+
+Rollback is immediate and does not require an environment edit:
+
+```bash
+scripts/install-nunchi.sh --remove
+```
+
+This atomically changes the mode marker to `off` and removes the managed nunchi
+cron entries. The nunchi code and local database remain in place, while the next
+Codex materialization falls back to canonical `load-memory.sh`. This wiring does
+not claim completion of pilot or gate-3 observation.
 
 The launcher runs `materialize` before the real Codex CLI and finishes with `exec`, preserving argv, cwd, stdio, exit status, and signals. A refresh error may use a structurally valid private last snapshot; if `status` is not ready, launch fails closed with exit 78. Configure the underlying binary with `CCC_CODEX_REAL_CLI_PATH` (default `codex`), while `CCC_CODEX_CLI_PATH` points to the installed `ccc-codex` wrapper.
 

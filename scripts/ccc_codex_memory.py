@@ -88,6 +88,7 @@ class MaterializeOptions:
     loader_timeout_seconds: float
     loader_path: Path | None
     claude_dir: Path
+    state_dir: Path
     environ: Mapping[str, str]
 
     @classmethod
@@ -119,6 +120,9 @@ class MaterializeOptions:
             ),
             loader_path=Path(loader_raw).expanduser().absolute() if loader_raw else None,
             claude_dir=claude_dir,
+            state_dir=Path(env.get("CCC_STATE_DIR") or claude_dir / "state")
+            .expanduser()
+            .absolute(),
             environ=env,
         )
 
@@ -716,13 +720,58 @@ def _validate_loader(path: Path) -> Path:
     return path
 
 
+def _nunchi_mode_enabled(options: MaterializeOptions) -> bool:
+    path = options.state_dir / "nunchi.mode"
+    flags = os.O_RDONLY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except OSError:
+        return False
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            _secure_fs.owner_only_regular_violation(metadata, owner_id=os.geteuid())
+            or metadata.st_size <= 0
+            or metadata.st_size > 16
+        ):
+            return False
+        raw = os.read(descriptor, 17)
+        after = os.fstat(descriptor)
+        if (
+            metadata.st_dev,
+            metadata.st_ino,
+            metadata.st_size,
+            metadata.st_mtime_ns,
+        ) != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns):
+            return False
+        return raw.strip() == b"on"
+    except OSError:
+        return False
+    finally:
+        os.close(descriptor)
+
+
 def _resolve_loader(options: MaterializeOptions) -> Path:
     if options.loader_path is not None:
         return _validate_loader(options.loader_path)
+    if _nunchi_mode_enabled(options):
+        nunchi_candidates = (
+            Path(__file__).resolve().parent / "nunchi" / "codex-loader.py",
+            options.claude_dir / "hooks" / "nunchi" / "codex-loader.py",
+        )
+        for candidate in nunchi_candidates:
+            try:
+                return _validate_loader(candidate)
+            except MaterializeError:
+                continue
     candidates = (
         Path(__file__).resolve().parent / "load-memory.sh",
-        Path(__file__).resolve().parents[1] / "claude" / "hooks" / "load-memory.sh",
         options.claude_dir / "hooks" / "load-memory.sh",
+        Path(__file__).resolve().parents[1] / "claude" / "hooks" / "load-memory.sh",
     )
     for candidate in candidates:
         try:
@@ -823,8 +872,13 @@ def _run_loader_bounded(
 
 def load_snapshot(options: MaterializeOptions) -> str:
     loader = _resolve_loader(options)
+    command = (
+        [sys.executable, str(loader), "SessionStart"]
+        if loader.suffix == ".py"
+        else ["bash", str(loader), "SessionStart"]
+    )
     returncode, stdout = _run_loader_bounded(
-        ["bash", str(loader), "SessionStart"],
+        command,
         environ=options.environ,
         timeout_seconds=options.loader_timeout_seconds,
     )

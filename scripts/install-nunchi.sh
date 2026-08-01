@@ -4,7 +4,7 @@
 # node by setup.sh but is a no-op until state/nunchi.mode is "on".
 #
 #   install-nunchi.sh --apply           # Claude node: mode on + ingest cron + SessionStart hook
-#   install-nunchi.sh --apply --codex   # Codex node:  mode on + codex-feed cron + SessionStart hook
+#   install-nunchi.sh --apply --codex   # Codex node: mode on + codex-feed + managed loader (#786)
 #   install-nunchi.sh --remove          # mode off + cron lines removed (code/DB kept)
 #   install-nunchi.sh                   # status
 #
@@ -18,18 +18,29 @@ HOOKS="$CLAUDE_DIR/hooks/nunchi"
 MODE_FILE="$STATE/nunchi.mode"
 MARK="# nunchi:#816"
 TS="$(date +%Y%m%dT%H%M%S)"
+CRONTAB="${CCC_CRONTAB_CMD:-crontab}"
 
 status() {
   echo "mode: $(cat "$MODE_FILE" 2>/dev/null || echo off)"
   echo "hooks: $([ -f "$HOOKS/nunchi.py" ] && echo present || echo MISSING) ($HOOKS)"
-  echo "cron: $(crontab -l 2>/dev/null | grep -cF "$MARK" || true) line(s)"
+  echo "codex loader: $([ -f "$HOOKS/codex-loader.py" ] && [ ! -L "$HOOKS/codex-loader.py" ] && echo present || echo MISSING)"
+  echo "cron: $("$CRONTAB" -l 2>/dev/null | grep -cF "$MARK" || true) line(s)"
   echo "db: $(ls -la "$HOME/.nunchi/facts.db" 2>/dev/null | awk '{print $5" bytes"}' || echo none)"
+}
+
+write_mode() {  # atomic owner-local marker; replacing a stale link never follows it
+  local value="$1" tmp
+  mkdir -p "$STATE"
+  tmp="$(mktemp "$STATE/.nunchi.mode.XXXXXX")"
+  chmod 600 "$tmp"
+  printf '%s' "$value" > "$tmp"
+  mv -f -- "$tmp" "$MODE_FILE"
 }
 
 strip_cron() {  # remove our marker lines + any legacy hand-deploy nunchi lines
   local tmp; tmp="$(mktemp)"
-  crontab -l 2>/dev/null | grep -vF "$MARK" | grep -v "nunchi/ingest-cron.sh\|nunchi/codex-feed.sh\|/nunchi/ingest-cron\|nunchi:distill-mirror\|nunchi:codex-feed" > "$tmp" || true
-  crontab "$tmp"; rm -f "$tmp"
+  "$CRONTAB" -l 2>/dev/null | grep -vF "$MARK" | grep -v "nunchi/ingest-cron.sh\|nunchi/codex-feed.sh\|/nunchi/ingest-cron\|nunchi:distill-mirror\|nunchi:codex-feed" > "$tmp" || true
+  "$CRONTAB" "$tmp"; rm -f "$tmp"
 }
 
 retire_legacy() {
@@ -66,13 +77,17 @@ PY
 case "${1:-}" in
   --apply)
     [ -f "$HOOKS/nunchi.py" ] || { echo "hooks missing at $HOOKS — run setup.sh first" >&2; exit 2; }
+    if [ "${2:-}" = "--codex" ] && { [ ! -f "$HOOKS/codex-loader.py" ] || [ -L "$HOOKS/codex-loader.py" ]; }; then
+      echo "Codex nunchi loader missing or unsafe at $HOOKS/codex-loader.py — run setup.sh first" >&2
+      exit 2
+    fi
     mkdir -p "$STATE"
     retire_legacy
     strip_cron
-    printf 'on' > "$MODE_FILE"
+    write_mode on
     feed="$HOOKS/ingest-cron.sh"
     [ "${2:-}" = "--codex" ] && feed="$HOOKS/codex-feed.sh"
-    ( crontab -l 2>/dev/null; echo "*/10 * * * * bash $feed >> $HOME/.nunchi/cron.log 2>&1 $MARK" ) | crontab -
+    ( "$CRONTAB" -l 2>/dev/null; echo "*/10 * * * * bash $feed >> $HOME/.nunchi/cron.log 2>&1 $MARK" ) | "$CRONTAB" -
     # #824 Phase 1: hourly incremental MemPalace sweep keeps the verbatim
     # layer fresh (sweep is idempotent). Only when the external CLI and the
     # transcript dir exist; skipped silently otherwise (peer_facts-only).
@@ -80,7 +95,7 @@ case "${1:-}" in
     [ -z "$mp" ] && [ -x "$HOME/.local/bin/mempalace" ] && mp="$HOME/.local/bin/mempalace"
     sweep_dir="${NUNCHI_SWEEP_DIR:-$HOME/.claude/projects}"
     if [ -n "$mp" ] && [ -d "$sweep_dir" ]; then
-      ( crontab -l 2>/dev/null; echo "17 * * * * $mp sweep $sweep_dir >> $HOME/.nunchi/mempalace-sweep.cron.log 2>&1 $MARK" ) | crontab -
+      ( "$CRONTAB" -l 2>/dev/null; echo "17 * * * * $mp sweep $sweep_dir >> $HOME/.nunchi/mempalace-sweep.cron.log 2>&1 $MARK" ) | "$CRONTAB" -
       echo "mempalace hourly sweep cron added ($sweep_dir)"
     else
       echo "mempalace CLI or transcript dir missing — verbatim sweep cron skipped"
@@ -89,14 +104,14 @@ case "${1:-}" in
     # retirement criteria (two weeks of zero Honcho-only answers, zero
     # hallucination). bench.sh is itself mode-gated, so this line is safe
     # even if the node opts out later without --remove.
-    ( crontab -l 2>/dev/null; echo "7 8 * * 1 bash $HOOKS/bench.sh >> $HOME/.nunchi/bench.cron.log 2>&1 $MARK" ) | crontab -
+    ( "$CRONTAB" -l 2>/dev/null; echo "7 8 * * 1 bash $HOOKS/bench.sh >> $HOME/.nunchi/bench.cron.log 2>&1 $MARK" ) | "$CRONTAB" -
     echo "weekly bench cron added (Mon 08:07)"
     add_sessionstart_hook
     python3 "$HOOKS/nunchi.py" init
     echo "nunchi enabled (mode=on, feed=$(basename "$feed"))"; status
     ;;
   --remove)
-    printf 'off' > "$MODE_FILE"
+    write_mode off
     strip_cron
     echo "nunchi disabled (code and ~/.nunchi DB kept)"; status
     ;;

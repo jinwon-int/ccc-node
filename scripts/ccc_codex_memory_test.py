@@ -9,6 +9,7 @@ import json
 import multiprocessing
 import os
 from pathlib import Path
+import shutil
 import stat
 import subprocess
 import sys
@@ -19,6 +20,7 @@ from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 MODULE_PATH = ROOT / "scripts" / "ccc_codex_memory.py"
+NUNCHI_LOADER_PATH = ROOT / "claude" / "hooks" / "nunchi" / "codex-loader.py"
 
 
 def load_module():
@@ -599,6 +601,70 @@ class CodexMemoryMaterializerTest(unittest.TestCase):
         self.assertEqual(caught.exception.code, "codex_loader_unavailable")
         self.assertNotIn(str(self.root), str(caught.exception))
 
+    def test_nunchi_mode_selection_and_explicit_loader_precedence(self) -> None:
+        claude_dir = self.root / "managed-claude"
+        hooks = claude_dir / "hooks"
+        nunchi_dir = hooks / "nunchi"
+        state = claude_dir / "state"
+        nunchi_dir.mkdir(parents=True)
+        state.mkdir()
+        canonical = hooks / "load-memory.sh"
+        canonical.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        canonical.chmod(0o700)
+        installed_nunchi = nunchi_dir / "codex-loader.py"
+        shutil.copy2(NUNCHI_LOADER_PATH, installed_nunchi)
+        installed_nunchi.chmod(0o700)
+        custom = self.root / "custom-loader.sh"
+        custom.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        custom.chmod(0o700)
+        mode = state / "nunchi.mode"
+
+        mode.write_text("off", encoding="ascii")
+        mode.chmod(0o600)
+        options = self.options(
+            CCC_CLAUDE_DIR=str(claude_dir), CCC_STATE_DIR=str(state)
+        )
+        self.assertEqual(self.module._resolve_loader(options).name, "load-memory.sh")
+
+        mode.write_text("on\n", encoding="ascii")
+        self.assertEqual(self.module._resolve_loader(options), installed_nunchi)
+        explicit = self.options(
+            CCC_CLAUDE_DIR=str(claude_dir),
+            CCC_STATE_DIR=str(state),
+            CCC_CODEX_MEMORY_LOADER=str(custom),
+        )
+        self.assertEqual(self.module._resolve_loader(explicit), custom)
+
+        installed_nunchi.unlink()
+        installed_nunchi.symlink_to(custom)
+        self.assertEqual(self.module._resolve_loader(options).name, "load-memory.sh")
+        with self.assertRaises(self.module.MaterializeError):
+            self.module._resolve_loader(
+                self.options(CCC_CODEX_MEMORY_LOADER=str(installed_nunchi))
+            )
+
+    def test_nunchi_mode_rejects_unsafe_path_owner_and_mode(self) -> None:
+        state = self.root / "state"
+        state.mkdir()
+        mode = state / "nunchi.mode"
+        mode.write_text("on", encoding="ascii")
+        mode.chmod(0o600)
+        options = self.options(CCC_STATE_DIR=str(state))
+        self.assertTrue(self.module._nunchi_mode_enabled(options))
+
+        mode.chmod(0o620)
+        self.assertFalse(self.module._nunchi_mode_enabled(options))
+        mode.unlink()
+        outside = self.root / "outside-mode"
+        outside.write_text("on", encoding="ascii")
+        mode.symlink_to(outside)
+        self.assertFalse(self.module._nunchi_mode_enabled(options))
+        mode.unlink()
+        mode.write_text("on", encoding="ascii")
+        mode.chmod(0o600)
+        with mock.patch.object(self.module.os, "geteuid", return_value=os.geteuid() + 1):
+            self.assertFalse(self.module._nunchi_mode_enabled(options))
+
     def test_loader_output_cap_terminates_before_long_loader_deadline(self) -> None:
         loader = self.root / "oversize-loader.sh"
         loader.write_text(
@@ -620,6 +686,167 @@ class CodexMemoryMaterializerTest(unittest.TestCase):
         self.assertEqual(caught.exception.code, "codex_loader_failed")
         self.assertLess(elapsed, 1.5)
         self.assertFalse((self.codex_home / "AGENTS.md").exists())
+
+    def _prepare_nunchi_loader(
+        self, *, snapshot: str | None = None
+    ) -> tuple[Path, dict[str, str], dict[str, object]]:
+        claude_dir = self.root / "nunchi-managed"
+        hook_dir = claude_dir / "hooks"
+        nunchi_dir = hook_dir / "nunchi"
+        state = claude_dir / "state"
+        nunchi_home = self.home / ".nunchi"
+        nunchi_dir.mkdir(parents=True)
+        state.mkdir()
+        nunchi_home.mkdir()
+        loader = nunchi_dir / "codex-loader.py"
+        shutil.copy2(NUNCHI_LOADER_PATH, loader)
+        loader.chmod(0o700)
+        base_loader = hook_dir / "load-memory.sh"
+        base_loader.write_text(
+            '#!/usr/bin/env bash\nprintf \'%s\' "$CCC_TEST_BASE_JSON"\n',
+            encoding="utf-8",
+        )
+        base_loader.chmod(0o700)
+        (state / "nunchi.mode").write_text("on", encoding="ascii")
+        (state / "nunchi.mode").chmod(0o600)
+        snapshot_path = nunchi_home / "snapshot.md"
+        if snapshot is not None:
+            snapshot_path.write_text(snapshot, encoding="utf-8")
+            snapshot_path.chmod(0o600)
+        base_document: dict[str, object] = {
+            "continue": True,
+            "hookSpecificOutput": {
+                "hookEventName": "SessionStart",
+                "additionalContext": "CANONICAL_BASE_SENTINEL",
+            },
+        }
+        env = os.environ.copy()
+        env.update(
+            {
+                "HOME": str(self.home),
+                "CCC_CLAUDE_DIR": str(claude_dir),
+                "CCC_STATE_DIR": str(state),
+                "NUNCHI_HOME": str(nunchi_home),
+                "NUNCHI_SNAPSHOT": str(snapshot_path),
+                "CCC_TEST_BASE_JSON": json.dumps(base_document, ensure_ascii=False),
+            }
+        )
+        return loader, env, base_document
+
+    def _run_nunchi_loader(
+        self, loader: Path, env: dict[str, str], *, timeout: float = 5
+    ) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, str(loader), "SessionStart"],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+
+    def test_nunchi_loader_mode_off_and_fresh_snapshot_merge(self) -> None:
+        snapshot = '## nunchi\n- quote " slash \\ and 눈치'
+        loader, env, base_document = self._prepare_nunchi_loader(snapshot=snapshot)
+        completed = self._run_nunchi_loader(loader, env)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.stderr, "")
+        document = json.loads(completed.stdout)
+        self.assertEqual(document["continue"], True)
+        context = document["hookSpecificOutput"]["additionalContext"]
+        self.assertTrue(context.startswith("CANONICAL_BASE_SENTINEL\n\n"))
+        self.assertTrue(context.endswith(snapshot))
+
+        Path(env["CCC_STATE_DIR"], "nunchi.mode").write_text("off", encoding="ascii")
+        completed = self._run_nunchi_loader(loader, env)
+        self.assertEqual(json.loads(completed.stdout), base_document)
+
+        env["CCC_TEST_BASE_JSON"] = '{"hookSpecificOutput": invalid}'
+        completed = self._run_nunchi_loader(loader, env)
+        self.assertEqual(completed.returncode, 1)
+        self.assertEqual(completed.stdout, "")
+        self.assertEqual(completed.stderr, "")
+
+    def test_nunchi_loader_stale_snapshot_regeneration_is_bounded(self) -> None:
+        loader, env, base_document = self._prepare_nunchi_loader(snapshot="STALE")
+        snapshot_path = Path(env["NUNCHI_SNAPSHOT"])
+        old = time.time() - 3600
+        os.utime(snapshot_path, (old, old))
+        marker = self.root / "regen-marker"
+        env["CCC_TEST_REGEN_MARKER"] = str(marker)
+        script = loader.parent / "nunchi.py"
+        script.write_text(
+            "from pathlib import Path\n"
+            "import os\n"
+            "Path(os.environ['NUNCHI_SNAPSHOT']).write_text('REGENERATED_눈치', encoding='utf-8')\n"
+            "Path(os.environ['CCC_TEST_REGEN_MARKER']).write_text('called')\n",
+            encoding="utf-8",
+        )
+        script.chmod(0o600)
+        completed = self._run_nunchi_loader(loader, env)
+        context = json.loads(completed.stdout)["hookSpecificOutput"]["additionalContext"]
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertTrue(marker.is_file())
+        self.assertIn("REGENERATED_눈치", context)
+        self.assertNotIn("STALE", context)
+
+        snapshot_path.write_text("STALE_AGAIN", encoding="utf-8")
+        os.utime(snapshot_path, (old, old))
+        script.write_text("import time\ntime.sleep(5)\n", encoding="utf-8")
+        env["CCC_CODEX_NUNCHI_REGEN_TIMEOUT_SEC"] = "0.1"
+        started = time.monotonic()
+        completed = self._run_nunchi_loader(loader, env, timeout=2)
+        self.assertLess(time.monotonic() - started, 1.0)
+        self.assertEqual(json.loads(completed.stdout), base_document)
+
+    def test_nunchi_loader_missing_corrupt_and_unsafe_snapshot_fail_open(self) -> None:
+        loader, env, base_document = self._prepare_nunchi_loader()
+        snapshot_path = Path(env["NUNCHI_SNAPSHOT"])
+        for case in ("missing", "corrupt", "symlink", "writable"):
+            with self.subTest(case=case):
+                if snapshot_path.exists() or snapshot_path.is_symlink():
+                    snapshot_path.unlink()
+                if case == "corrupt":
+                    snapshot_path.write_bytes(b"\xff\xfe")
+                    snapshot_path.chmod(0o600)
+                elif case == "symlink":
+                    outside = self.root / "outside-snapshot"
+                    outside.write_text("UNSAFE_SENTINEL", encoding="utf-8")
+                    snapshot_path.symlink_to(outside)
+                elif case == "writable":
+                    snapshot_path.write_text("UNSAFE_SENTINEL", encoding="utf-8")
+                    snapshot_path.chmod(0o622)
+                completed = self._run_nunchi_loader(loader, env)
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                self.assertEqual(completed.stderr, "")
+                self.assertEqual(json.loads(completed.stdout), base_document)
+
+    def test_nunchi_loader_unicode_byte_cap_and_json_escaping(self) -> None:
+        loader, env, _base_document = self._prepare_nunchi_loader(snapshot="🙂" * 100)
+        env["CCC_CODEX_NUNCHI_MAX_BYTES"] = "128"
+        completed = self._run_nunchi_loader(loader, env)
+        context = json.loads(completed.stdout)["hookSpecificOutput"]["additionalContext"]
+        base, addition = context.split("\n\n", 1)
+        self.assertEqual(base, "CANONICAL_BASE_SENTINEL")
+        self.assertLessEqual(len(addition.encode("utf-8")), 128)
+        self.assertTrue(addition)
+        self.assertTrue(all(character == "🙂" for character in addition))
+
+        Path(env["NUNCHI_SNAPSHOT"]).write_text("🙂" * 3000, encoding="utf-8")
+        env["CCC_CODEX_NUNCHI_MAX_BYTES"] = "999999"
+        completed = self._run_nunchi_loader(loader, env)
+        hard_bounded = json.loads(completed.stdout)["hookSpecificOutput"][
+            "additionalContext"
+        ].split("\n\n", 1)[1]
+        self.assertLessEqual(len(hard_bounded.encode("utf-8")), 8192)
+
+        Path(env["NUNCHI_SNAPSHOT"]).write_text(
+            'line "quoted" \\ escaped\nsecond 눈치', encoding="utf-8"
+        )
+        completed = self._run_nunchi_loader(loader, env)
+        escaped = json.loads(completed.stdout)["hookSpecificOutput"]["additionalContext"]
+        self.assertIn('line "quoted" \\ escaped\nsecond 눈치', escaped)
 
 
 if __name__ == "__main__":
