@@ -279,7 +279,12 @@ def test_build_options_registers_the_supplied_stderr_sink(tmp_path: Path) -> Non
     assert seen == ["boom"]
 
 
-@pytest.mark.asyncio
+@pytest.fixture
+def anyio_backend() -> str:
+    return "asyncio"
+
+
+@pytest.mark.anyio
 async def test_start_or_resume_pipes_cli_stderr_into_the_session(tmp_path: Path) -> None:
     # End-to-end wiring: whatever the transport reports on stderr has to reach
     # the session that will later be asked why the turn never started.
