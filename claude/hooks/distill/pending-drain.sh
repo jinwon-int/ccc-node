@@ -27,8 +27,12 @@ log() { printf '%s [pending-drain] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >
 
 HOOKDIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.." 2>/dev/null && pwd)" || HOOKDIR="${HOME:-/root}/.claude/hooks"
 DISTILL="$HOOKDIR/distill.sh"
+PENDING_WORKER="$HOOKDIR/distill/pending-worker.sh"
+PENDING_ADAPTER="$HOOKDIR/distill/pending_journal.py"
 SPAWN_HELPER="$HOOKDIR/lib/spawn-detached.sh"
-[ -f "$DISTILL" ] && [ -r "$SPAWN_HELPER" ] || { log "skip reason=missing-runtime"; exit 0; }
+[ -f "$DISTILL" ] && [ -r "$PENDING_WORKER" ] \
+  && [ -r "$PENDING_ADAPTER" ] && [ -r "$SPAWN_HELPER" ] \
+  || { log "skip reason=missing-runtime"; exit 0; }
 
 # shellcheck source=claude/hooks/lib/spawn-detached.sh
 . "$SPAWN_HELPER"
@@ -52,26 +56,21 @@ if declare -f ccc_autonomy_state >/dev/null 2>&1 \
 fi
 
 run_pending_job() {
-  # SessionStart's Honcho drain uses CLAUDE_DISTILL_INFLIGHT, but this recovery
-  # launcher must re-enter distill.sh before that guard. Remove any inherited
-  # value defensively; run_bg_pipeline sets it again before invoking Claude.
-  env -u CLAUDE_DISTILL_INFLIGHT \
-    CLAUDE_DISTILL_BG=1 CLAUDE_DISTILL_JOB="${CLAUDE_DISTILL_JOB:?}" \
-    bash "$DISTILL" recovery
+  bash "$PENDING_WORKER" "${1:?}" "${2:?}" "${3:?}"
 }
 
 started=0
 while IFS= read -r job; do
   [ "$started" -lt "$MAX_BATCH" ] || break
   [ -f "$job" ] && [ ! -L "$job" ] || continue
-  export CLAUDE_DISTILL_JOB="$job"
-  if spawn_detached "$DISTILL" CLAUDE_DISTILL_BG run_pending_job recovery; then
+  if spawn_detached "$PENDING_WORKER" "" run_pending_job \
+    "$PENDING_DIR" "$job" "$DISTILL"; then
     log "spawned job=$(basename "$job" .json) pid=$SPAWN_DETACHED_PID mode=$SPAWN_DETACHED_MODE"
     started=$((started + 1))
   else
     log "spawn failed job=$(basename "$job" .json)"
   fi
-done < <(find "$PENDING_DIR" -maxdepth 1 -type f -name '*.json' -print 2>/dev/null | sort)
+done < <(python3 "$PENDING_ADAPTER" discover "$PENDING_DIR" --limit "$MAX_BATCH" 2>>"$LOG")
 
 [ "$started" -eq 0 ] || log "started=$started"
 exit 0

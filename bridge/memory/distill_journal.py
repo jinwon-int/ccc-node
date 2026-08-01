@@ -2,25 +2,16 @@
 
 from __future__ import annotations
 
-from contextlib import contextmanager
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
-import fcntl
 import hashlib
 import json
 import os
 from pathlib import Path
 import re
-import stat
-import threading
-from typing import Any, Iterator
+from typing import Any
 
-from telegram_bot.utils.secure_fs import (
-    _atomic_write_bytes,
-    _fsync_directory,
-    _validate_storage_directory,
-    ensure_private_directory,
-)
+import telegram_bot.utils.secure_fs as secure_fs
 
 from .distill_types import (
     DISTILL_SCHEMA_VERSION,
@@ -38,11 +29,16 @@ from .distill_extraction import (
     DistillExtractionOutput,
     parse_extraction_output,
 )
+from .journal_core import JsonJournalCore
 
-_JOB_ID_RE = re.compile(r"^[0-9a-f]{64}$")
 _SAFE_ERROR_CODE_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
-_MAX_JOB_BYTES = 1024 * 1024
 _DEFAULT_DISCRIMINATOR = "session-close-v1"
+# Keep the historical direct secure-fs consumer seam visible to packaging and
+# ownership tests while JsonJournalCore remains the single implementation.
+_SECURE_FS_COMPAT = secure_fs
+# Preserve the historical monkeypatch seam. journal_core uses this same module
+# object, so patching distill_journal.os.getuid still exercises owner rejection.
+_OS_PATCH_SEAM = os
 
 
 def _utc_now() -> datetime:
@@ -63,108 +59,8 @@ def _parse_timestamp(value: str) -> datetime:
     return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(timezone.utc)
 
 
-class DistillJournal:
+class DistillJournal(JsonJournalCore):
     """One process-safe and cross-process-locked directory of JSON job records."""
-
-    def __init__(self, root: Path) -> None:
-        self.root = Path(os.path.abspath(os.fspath(root)))
-        self._thread_lock = threading.RLock()
-        self._lock_path = self.root / ".journal.lock"
-        self._initialized = False
-
-    def validate_path(self) -> None:
-        _validate_storage_directory(self.root)
-        if self.root.exists():
-            self._validate_root()
-        if self._lock_path.exists() or self._lock_path.is_symlink():
-            self._validate_regular_file(self._lock_path)
-        for path in self.root.glob("*.json") if self.root.exists() else ():
-            self._validate_job_name(path)
-            self._validate_regular_file(path)
-
-    def initialize(self) -> None:
-        if self._initialized:
-            return
-        ensure_private_directory(self.root)
-        self._validate_root()
-        lock_existed = self._lock_path.exists() or self._lock_path.is_symlink()
-        if lock_existed:
-            self._validate_regular_file(self._lock_path)
-        flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
-        flags |= getattr(os, "O_NOFOLLOW", 0)
-        fd = os.open(self._lock_path, flags, 0o600)
-        try:
-            if not lock_existed:
-                os.fchmod(fd, 0o600)
-            self._validate_fd(fd, self._lock_path)
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-        _fsync_directory(self.root)
-        self._initialized = True
-
-    def _require_initialized(self) -> None:
-        if not self._initialized:
-            raise RuntimeError("DistillJournal is not initialized")
-
-    def _validate_root(self) -> None:
-        metadata = self.root.lstat()
-        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
-            raise PermissionError(f"distill journal root must be a directory: {self.root}")
-        if hasattr(os, "getuid") and metadata.st_uid != os.getuid():
-            raise PermissionError("distill journal root is not owned by this process")
-        mode = stat.S_IMODE(metadata.st_mode)
-        if mode != 0o700:
-            raise PermissionError(
-                f"distill journal root must have mode 0700, got {mode:04o}"
-            )
-
-    @staticmethod
-    def _validate_fd(fd: int, path: Path) -> None:
-        metadata = os.fstat(fd)
-        if not stat.S_ISREG(metadata.st_mode):
-            raise PermissionError(f"distill journal state must be a regular file: {path}")
-        if metadata.st_nlink != 1:
-            raise PermissionError(f"distill journal state must not have hard links: {path}")
-        if hasattr(os, "getuid") and metadata.st_uid != os.getuid():
-            raise PermissionError("distill journal state is not owned by this process")
-        if stat.S_IMODE(metadata.st_mode) != 0o600:
-            raise PermissionError(f"distill journal state must have mode 0600: {path}")
-
-    def _validate_regular_file(self, path: Path) -> None:
-        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
-        flags |= getattr(os, "O_NOFOLLOW", 0)
-        try:
-            fd = os.open(path, flags)
-        except OSError as error:
-            raise PermissionError(f"unsafe distill journal state: {path}") from error
-        try:
-            self._validate_fd(fd, path)
-        finally:
-            os.close(fd)
-
-    @staticmethod
-    def _validate_job_name(path: Path) -> None:
-        if path.suffix != ".json" or not _JOB_ID_RE.fullmatch(path.stem):
-            raise PermissionError(f"invalid distill journal job path: {path.name}")
-
-    @contextmanager
-    def _exclusive(self) -> Iterator[None]:
-        self._require_initialized()
-        with self._thread_lock:
-            self._validate_root()
-            flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0)
-            flags |= getattr(os, "O_NOFOLLOW", 0)
-            fd = os.open(self._lock_path, flags)
-            try:
-                self._validate_fd(fd, self._lock_path)
-                fcntl.flock(fd, fcntl.LOCK_EX)
-                yield
-            finally:
-                try:
-                    fcntl.flock(fd, fcntl.LOCK_UN)
-                finally:
-                    os.close(fd)
 
     @staticmethod
     def _job_id(
@@ -181,19 +77,15 @@ class DistillJournal:
         return hashlib.sha256(material).hexdigest()
 
     def job_path(self, job_id: str) -> Path:
-        if not _JOB_ID_RE.fullmatch(job_id):
-            raise ValueError("invalid distill job id")
-        return self.root / f"{job_id}.json"
+        return self.record_path(job_id)
+
+    @classmethod
+    def _validate_job_name(cls, path: Path) -> None:
+        """Preserve the DistillJournal-specific validation seam."""
+        cls._validate_record_name(path)
 
     def _read_unlocked(self, job_id: str) -> DistillJob:
-        path = self.job_path(job_id)
-        self._validate_regular_file(path)
-        payload = path.read_bytes()
-        if len(payload) > _MAX_JOB_BYTES:
-            raise ValueError("distill job exceeds maximum journal record size")
-        value = json.loads(payload.decode("utf-8"))
-        if not isinstance(value, dict):
-            raise ValueError("distill job record must be an object")
+        value = self._read_json_unlocked(job_id)
         job = DistillJob.from_dict(value)
         if job.job_id != job_id:
             raise ValueError("distill job id does not match its path")
@@ -240,16 +132,7 @@ class DistillJournal:
         return job
 
     def _write_unlocked(self, job: DistillJob) -> None:
-        payload = json.dumps(
-            job.to_dict(), ensure_ascii=False, sort_keys=True, separators=(",", ":")
-        ).encode("utf-8")
-        if len(payload) > _MAX_JOB_BYTES:
-            raise ValueError("distill job exceeds maximum journal record size")
-        path = self.job_path(job.job_id)
-        if path.exists() or path.is_symlink():
-            self._validate_regular_file(path)
-        _atomic_write_bytes(path, payload)
-        self._validate_regular_file(path)
+        self._write_json_unlocked(job.job_id, job.to_dict())
 
     def enqueue_once(
         self,
