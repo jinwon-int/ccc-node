@@ -16,6 +16,7 @@ from telegram_bot.memory.codex_exec_backend import (
     DISTILL_EXTRACTION_PROMPT,
     CodexDistillBackendError,
     CodexExecDistillBackend,
+    _minimal_environment,
 )
 from telegram_bot.memory.distill_extraction import (
     DISTILL_EXTRACTION_SCHEMA_VERSION,
@@ -88,6 +89,56 @@ def valid_output() -> dict[str, Any]:
             "evidence": ["issue #478"],
         },
     }
+
+
+def test_minimal_environment_prepends_trusted_prefix_bin_without_inheriting_prefix(
+    tmp_path: Path,
+) -> None:
+    prefix = tmp_path / "termux-prefix"
+    prefix.mkdir(mode=0o700)
+    (prefix / "bin").mkdir(mode=0o700)
+
+    child = _minimal_environment(
+        {
+            "HOME": "/home/operator",
+            "PREFIX": str(prefix),
+            "TELEGRAM_BOT_TOKEN": "must-not-pass",
+        },
+        temp_root=tmp_path,
+    )
+
+    assert child["PATH"] == f"{prefix}/bin:/usr/local/bin:/usr/bin:/bin"
+    assert "PREFIX" not in child
+    assert "TELEGRAM_BOT_TOKEN" not in child
+
+
+@pytest.mark.parametrize("unsafe_kind", ("relative", "symlink", "writable"))
+def test_minimal_environment_rejects_unsafe_prefix_bin(
+    tmp_path: Path, unsafe_kind: str
+) -> None:
+    prefix = tmp_path / "termux-prefix"
+    if unsafe_kind == "relative":
+        raw_prefix = "relative-prefix"
+    elif unsafe_kind == "symlink":
+        target = tmp_path / "target"
+        target.mkdir(mode=0o700)
+        (target / "bin").mkdir(mode=0o700)
+        prefix.symlink_to(target, target_is_directory=True)
+        raw_prefix = str(prefix)
+    else:
+        prefix.mkdir(mode=0o700)
+        bin_path = prefix / "bin"
+        bin_path.mkdir(mode=0o700)
+        bin_path.chmod(0o770)
+        raw_prefix = str(prefix)
+
+    child = _minimal_environment(
+        {"HOME": "/home/operator", "PREFIX": raw_prefix},
+        temp_root=tmp_path,
+    )
+
+    assert child["PATH"] == "/usr/local/bin:/usr/bin:/bin"
+    assert "PREFIX" not in child
 
 
 class FakeProcess:

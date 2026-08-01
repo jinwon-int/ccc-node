@@ -43,6 +43,10 @@ All notable changes to the Claude Code node harness. Dates are KST.
   composition is unchanged. (#749)
 
 ### Fixed
+- Isolated Codex subprocesses now support Termux's owner-controlled
+  `PREFIX/bin` without inheriting `PREFIX` or ambient secrets. Unsafe prefix
+  paths remain excluded, preventing distill and skill-candidate jobs from
+  failing with exit 127 on Android nodes. (#844)
 - Bridge autonomous budgets now evaluate only the durable autonomous-mode token
   ledger, so interactive provider traffic remains metered but cannot exhaust or
   block autonomous work. Budget decisions/reports expose that denominator, and
