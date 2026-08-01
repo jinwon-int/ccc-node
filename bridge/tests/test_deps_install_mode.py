@@ -76,7 +76,6 @@ class DependencyPolicyTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             requirements = root / "requirements.txt"
-            lock = root / "requirements.lock.txt"
             pyproject = root / "pyproject.toml"
             requirements.write_bytes(b"runtime\n")
             pyproject.write_bytes(b"project\n")
