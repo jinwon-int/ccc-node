@@ -306,6 +306,13 @@ if [ ! -e "$CLAUDE_DIR/settings.local.json" ]; then
 else
   note "settings.local.json already present — left untouched (node-local approvals)"
 fi
+# Install standalone imports before their hook-tree callers. Old hooks ignore
+# them; once the new adapter is copied below, both modules are already present.
+# The setup transaction restores the previous hooks tree on any later failure.
+run cp "$SRC/bridge/utils/secure_fs.py" "$CLAUDE_DIR/hooks/ccc_secure_fs.py"
+run chmod 644 "$CLAUDE_DIR/hooks/ccc_secure_fs.py"
+run cp "$SRC/bridge/memory/journal_core.py" "$CLAUDE_DIR/hooks/ccc_journal_core.py"
+run chmod 644 "$CLAUDE_DIR/hooks/ccc_journal_core.py"
 # Hook tree deployment (#569): every deployable file under claude/hooks/ is
 # discovered by the shared walk (ccc_hook_tree_files in scripts/lib/harness-paths.sh)
 # instead of a hand-maintained list — the same convention validate-harness.sh
@@ -347,10 +354,6 @@ run cp "$SRC/scripts/lib/harness_paths.py" "$CLAUDE_DIR/hooks/lib/harness_paths.
 # load-memory.sh so every direct/app-server run reuses the same snapshot policy.
 run cp "$SRC/scripts/ccc-codex" "$CLAUDE_DIR/hooks/ccc-codex"
 run cp "$SRC/scripts/ccc_codex_memory.py" "$CLAUDE_DIR/hooks/ccc_codex_memory.py"
-# The materializer runs outside the bridge package after installation. Deploy
-# the canonical secure-fs module beside it instead of maintaining a second copy.
-run cp "$SRC/bridge/utils/secure_fs.py" "$CLAUDE_DIR/hooks/ccc_secure_fs.py"
-run chmod 644 "$CLAUDE_DIR/hooks/ccc_secure_fs.py"
 # Claude's distill committer imports the same crash-recoverable transaction
 # implementation as the Codex bridge.  Install the canonical module beside the
 # existing standalone secure-fs copy instead of forking provider logic.

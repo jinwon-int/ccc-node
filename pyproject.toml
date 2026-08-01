@@ -35,6 +35,7 @@ files = [
   "bridge/dependency_bootstrap.py",
   "bridge/core",
   "bridge/memory/codex_exec_backend.py",
+  "bridge/memory/journal_core.py",
   "bridge/memory/distill_journal.py",
   "bridge/memory/distill_types.py",
   "bridge/memory/distill_worker.py",

@@ -10,8 +10,20 @@ DRAIN="$HERE/pending-drain.sh"
 . "$HERE/../lib/test-stub.sh"
 
 pass=0; fail=0
-TMP="$(ccc_test_tmpdir)" || exit 1
-trap 'pgid="$(cat "$TMP/claude.pgid" 2>/dev/null || true)"; [ -z "$pgid" ] || kill -KILL -- "-$pgid" 2>/dev/null || true; rm -rf "$TMP"' EXIT
+# The operator runner mounts /tmp noexec. This suite must execute its provider
+# stub, so keep the private, auto-cleaned fixture on the executable checkout FS.
+TMP="$(ccc_test_tmpdir "$ROOT/.pending-drain-test.XXXXXX")" || exit 1
+cleanup() {
+  local pgid
+  pgid="$(cat "$TMP/claude.pgid" 2>/dev/null || true)"
+  [ -z "$pgid" ] || kill -KILL -- "-$pgid" 2>/dev/null || true
+  if [ "$fail" -ne 0 ]; then
+    echo "---- body-free distill diagnostics ----"
+    tail -40 "$STATE/distill.log" 2>/dev/null || true
+  fi
+  rm -rf "$TMP"
+}
+trap cleanup EXIT
 
 ok() { if eval "$2"; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $1"; fi; }
 wait_for() {
@@ -44,9 +56,14 @@ payload() {
 write_exec_stub "$TMP/bin/claude" <<'SH'
 mode="$(cat "${CLAUDE_STUB_MODE_FILE:?}" 2>/dev/null || printf success)"
 cat >/dev/null
+printf '%s|%s|%s\n' "${CCC_MEMORY_AUDIENCE_SCOPED-unset}" \
+  "${CCC_MEMORY_AUDIENCE-unset}" "${CCC_MEMORY_SCOPE-unset}" \
+  > "${CLAUDE_STUB_ENV_FILE:?}"
 case "$mode" in
   sleep)
-    ps -o pgid= -p "$$" | tr -d '[:space:]' > "${CLAUDE_STUB_PGID_FILE:?}"
+    # procps is absent in the Docker runner; Python is already a runtime
+    # requirement of the journal adapter and exposes the process group portably.
+    python3 -c 'import os; print(os.getpgrp())' > "${CLAUDE_STUB_PGID_FILE:?}"
     sleep 30
     ;;
   fail) exit 9 ;;
@@ -59,6 +76,7 @@ chmod +x "$TMP/bin/claude"
 export PATH="$TMP/bin:$PATH"
 export CLAUDE_STUB_MODE_FILE="$TMP/claude.mode"
 export CLAUDE_STUB_PGID_FILE="$TMP/claude.pgid"
+export CLAUDE_STUB_ENV_FILE="$TMP/claude.env"
 
 TRANSCRIPT="$PROJECT/sess-durable.jsonl"
 make_transcript "$TRANSCRIPT" durable
@@ -71,9 +89,10 @@ payload sess-durable "$TRANSCRIPT" | \
 
 wait_for '[ "$(find "$STATE/distill-pending" -maxdepth 1 -type f -name "*.json" | wc -l)" = 1 ]'
 job="$(find "$STATE/distill-pending" -maxdepth 1 -type f -name '*.json' | head -1)"
-wait_for '[ -s "$CLAUDE_STUB_PGID_FILE" ]'
+wait_for '[ -s "$CLAUDE_STUB_PGID_FILE" ]' || tail -20 "$STATE/distill.log" 2>/dev/null
 ok "SessionEnd writes one durable job before provider completion" '[ -f "$job" ] && grep -q "enqueued job=" "$STATE/distill.log"'
 ok "pending directory and job are owner-only" '[ "$(stat -c %a "$STATE/distill-pending")" = 700 ] && [ "$(stat -c %a "$job")" = 600 ]'
+ok "pending claim lock is owner-only" '[ "$(stat -c %a "$job.lock")" = 600 ]'
 ok "job captures external isolation for recovery" 'jq -e '\''.schema == "ccc.distill.pending.v1" and .isolation_profile == "external" and .wiki_memory_enabled == "1"'\'' "$job" >/dev/null'
 
 # A repeated trigger for the same transcript hash must not create another job.
@@ -81,13 +100,14 @@ payload sess-durable "$TRANSCRIPT" | \
   HOME="$TMP/home" CCC_STATE_DIR="$STATE" CCC_DISTILL_SCOPE_CWDS="/root/workspace" \
   CCC_NODE_ISOLATION_PROFILE=external CCC_WIKI_MEMORY_ENABLED=1 \
   bash "$DISTILL" sessionend >/dev/null 2>&1
-sleep 0.1
+wait_for 'grep -q "pending skipped reason=job-lock-held job=$(basename "$job" .json)" "$STATE/distill.log"'
 ok "same transcript snapshot deduplicates to one job" \
   '[ "$(find "$STATE/distill-pending" -maxdepth 1 -type f -name "*.json" | wc -l)" = 1 ] && grep -q "enqueue dedup job=" "$STATE/distill.log"'
 
 # Simulate teardown during extraction. The job must survive after the killed
 # provider subprocess causes its worker to fail.
 kill -KILL -- "-$(cat "$CLAUDE_STUB_PGID_FILE")" 2>/dev/null || true
+rm -f "$CLAUDE_STUB_PGID_FILE"
 wait_for 'flock -n "$job.lock" true 2>/dev/null'
 ok "killed extraction retains the durable job" '[ -f "$job" ]'
 
@@ -101,10 +121,15 @@ recovered_job_complete() {
 }
 
 printf '%s\n' success > "$CLAUDE_STUB_MODE_FILE"
-HOME="$TMP/home" CCC_STATE_DIR="$STATE" bash "$DRAIN" >/dev/null 2>&1
-wait_for 'recovered_job_complete'
+HOME="$TMP/home" CCC_STATE_DIR="$STATE" \
+  CCC_MEMORY_AUDIENCE_SCOPED=1 CCC_MEMORY_AUDIENCE=private \
+  CCC_MEMORY_SCOPE="private-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" \
+  bash "$DRAIN" >/dev/null 2>&1
+wait_for 'recovered_job_complete' || tail -20 "$STATE/distill.log" 2>/dev/null
 ok "SessionStart drain completes and removes a recovered job" \
   'recovered_job_complete'
+ok "legacy recovery removes inherited audience routing" \
+  '[ "$(cat "$CLAUDE_STUB_ENV_FILE")" = "unset|unset|unset" ]'
 
 # A genuine extraction failure remains retryable rather than being consumed.
 TRANSCRIPT_FAIL="$PROJECT/sess-fail.jsonl"
@@ -113,9 +138,12 @@ printf '%s\n' fail > "$CLAUDE_STUB_MODE_FILE"
 payload sess-fail "$TRANSCRIPT_FAIL" | \
   HOME="$TMP/home" CCC_STATE_DIR="$STATE" CCC_DISTILL_SCOPE_CWDS="/root/workspace" \
   bash "$DISTILL" sessionend >/dev/null 2>&1
-wait_for 'grep -q "pending retained reason=pipeline-failed" "$STATE/distill.log" && [ "$(find "$STATE/distill-pending" -maxdepth 1 -type f -name "*.json" | wc -l)" = 1 ]'
+wait_for '[ "$(find "$STATE/distill-pending" -maxdepth 1 -type f -name "*.json" | wc -l)" = 1 ]'
+failed_job="$(find "$STATE/distill-pending" -maxdepth 1 -type f -name '*.json' | head -1)"
+failed_id="$(basename "$failed_job" .json)"
+wait_for 'grep -q "pending retained reason=pipeline-failed job=$failed_id" "$STATE/distill.log" && flock -n "$failed_job.lock" true 2>/dev/null'
 ok "failed extraction keeps one retryable pending job" \
-  '[ "$(find "$STATE/distill-pending" -maxdepth 1 -type f -name "*.json" | wc -l)" = 1 ]'
+  '[ -f "$failed_job" ]'
 
 # setup.sh deploys (and chmods) the whole claude/hooks tree via the shared
 # hook-tree walk (#569) — assert the launcher is in the walk's deployable set.
@@ -141,6 +169,9 @@ printf '%s\n' success > "$CLAUDE_STUB_MODE_FILE"
 HOME="$TMP/home" CCC_STATE_DIR="$STATE" CCC_AUTONOMY=dry-run bash "$DRAIN" >/dev/null 2>&1
 ok "autonomy=dry-run drain is not halted (reaches spawn)" \
   'wait_for '\''grep -q "\[pending-drain\] spawned job=" "$STATE/distill.log"'\'' && ! grep -q "skip reason=autonomy-kill" "$STATE/distill.log"'
+wait_for '[ ! -f "$failed_job" ] && grep -q "pending completed job=$failed_id" "$STATE/distill.log"'
+ok "autonomy=dry-run worker completes before fixture cleanup" \
+  '[ ! -f "$failed_job" ] && grep -q "pending completed job=$failed_id" "$STATE/distill.log"'
 
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
