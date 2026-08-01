@@ -23,6 +23,7 @@ import signal
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 from typing import Mapping
 
@@ -88,6 +89,7 @@ class MaterializeOptions:
     loader_timeout_seconds: float
     loader_path: Path | None
     claude_dir: Path
+    state_dir: Path
     environ: Mapping[str, str]
 
     @classmethod
@@ -119,6 +121,9 @@ class MaterializeOptions:
             ),
             loader_path=Path(loader_raw).expanduser().absolute() if loader_raw else None,
             claude_dir=claude_dir,
+            state_dir=Path(env.get("CCC_STATE_DIR") or claude_dir / "state")
+            .expanduser()
+            .absolute(),
             environ=env,
         )
 
@@ -716,13 +721,54 @@ def _validate_loader(path: Path) -> Path:
     return path
 
 
+def _nunchi_mode_enabled(options: MaterializeOptions) -> bool:
+    # Nunchi is node-global today. Never select it for a private or shared
+    # audience-scoped runtime until a scope-local snapshot/provenance contract
+    # exists; accepting a scoped CCC_STATE_DIR is not sufficient proof that a
+    # caller-supplied NUNCHI_HOME belongs to that scope.
+    if _environment_truthy(options.environ.get("CCC_MEMORY_AUDIENCE_SCOPED")):
+        return False
+    path = options.state_dir / "nunchi.mode"
+    flags = os.O_RDONLY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except OSError:
+        return False
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            _secure_fs.owner_only_regular_violation(metadata, owner_id=os.geteuid())
+            or metadata.st_size <= 0
+            or metadata.st_size > 16
+        ):
+            return False
+        raw = os.read(descriptor, 17)
+        after = os.fstat(descriptor)
+        if (
+            metadata.st_dev,
+            metadata.st_ino,
+            metadata.st_size,
+            metadata.st_mtime_ns,
+        ) != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns):
+            return False
+        return raw.strip() == b"on"
+    except OSError:
+        return False
+    finally:
+        os.close(descriptor)
+
+
 def _resolve_loader(options: MaterializeOptions) -> Path:
     if options.loader_path is not None:
         return _validate_loader(options.loader_path)
     candidates = (
         Path(__file__).resolve().parent / "load-memory.sh",
-        Path(__file__).resolve().parents[1] / "claude" / "hooks" / "load-memory.sh",
         options.claude_dir / "hooks" / "load-memory.sh",
+        Path(__file__).resolve().parents[1] / "claude" / "hooks" / "load-memory.sh",
     )
     for candidate in candidates:
         try:
@@ -730,6 +776,27 @@ def _resolve_loader(options: MaterializeOptions) -> Path:
         except MaterializeError:
             continue
     raise MaterializeError("codex_loader_unavailable")
+
+
+def _environment_truthy(raw: str | None) -> bool:
+    return (raw or "").strip().lower() not in ("", "0", "false", "off", "no")
+
+
+def _resolve_nunchi_loader(options: MaterializeOptions) -> Path | None:
+    """Return the optional post-processor without replacing the base loader."""
+
+    if options.loader_path is not None or not _nunchi_mode_enabled(options):
+        return None
+    candidates = (
+        Path(__file__).resolve().parent / "nunchi" / "codex-loader.py",
+        options.claude_dir / "hooks" / "nunchi" / "codex-loader.py",
+    )
+    for candidate in candidates:
+        try:
+            return _validate_loader(candidate)
+        except MaterializeError:
+            continue
+    return None
 
 
 def _terminate_loader(process: subprocess.Popen[bytes]) -> None:
@@ -761,13 +828,22 @@ def _terminate_loader(process: subprocess.Popen[bytes]) -> None:
 
 
 def _run_loader_bounded(
-    command: list[str], *, environ: Mapping[str, str], timeout_seconds: float
+    command: list[str],
+    *,
+    environ: Mapping[str, str],
+    timeout_seconds: float,
+    stdin_data: bytes | None = None,
 ) -> tuple[int, bytes]:
+    stdin_file = None
     try:
+        if stdin_data is not None:
+            stdin_file = tempfile.TemporaryFile()
+            stdin_file.write(stdin_data)
+            stdin_file.seek(0)
         process = subprocess.Popen(
             command,
             env=dict(environ),
-            stdin=subprocess.DEVNULL,
+            stdin=stdin_file if stdin_file is not None else subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             start_new_session=True,
@@ -775,6 +851,9 @@ def _run_loader_bounded(
         )
     except OSError:
         raise MaterializeError("codex_loader_failed") from None
+    finally:
+        if stdin_file is not None:
+            stdin_file.close()
     if process.stdout is None:
         _terminate_loader(process)
         raise MaterializeError("codex_loader_failed")
@@ -822,9 +901,15 @@ def _run_loader_bounded(
 
 
 def load_snapshot(options: MaterializeOptions) -> str:
+    started = time.monotonic()
     loader = _resolve_loader(options)
+    command = (
+        [sys.executable, str(loader), "SessionStart"]
+        if loader.suffix == ".py"
+        else ["bash", str(loader), "SessionStart"]
+    )
     returncode, stdout = _run_loader_bounded(
-        ["bash", str(loader), "SessionStart"],
+        command,
         environ=options.environ,
         timeout_seconds=options.loader_timeout_seconds,
     )
@@ -837,7 +922,32 @@ def load_snapshot(options: MaterializeOptions) -> str:
         raise MaterializeError("codex_loader_invalid") from None
     if not isinstance(snapshot, str) or not snapshot.strip():
         raise MaterializeError("codex_loader_invalid")
-    return snapshot
+
+    # The canonical loader always receives its historical full timeout. Nunchi
+    # is an optional post-process and may use only time that loader left behind;
+    # failure, invalid output, or an exhausted remainder returns canonical memory.
+    nunchi_loader = _resolve_nunchi_loader(options)
+    remaining = options.loader_timeout_seconds - (time.monotonic() - started)
+    if nunchi_loader is None or remaining <= 0.05:
+        return snapshot
+    nunchi_environ = dict(options.environ)
+    nunchi_environ["CCC_CODEX_NUNCHI_REMAINING_SEC"] = f"{remaining:.6f}"
+    try:
+        nunchi_returncode, nunchi_stdout = _run_loader_bounded(
+            [sys.executable, str(nunchi_loader), "SessionStart"],
+            environ=nunchi_environ,
+            timeout_seconds=remaining,
+            stdin_data=stdout,
+        )
+        if nunchi_returncode != 0:
+            return snapshot
+        nunchi_document = json.loads(nunchi_stdout.decode("utf-8"))
+        merged = nunchi_document["hookSpecificOutput"]["additionalContext"]
+    except (MaterializeError, UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError):
+        return snapshot
+    if not isinstance(merged, str) or not merged.strip():
+        return snapshot
+    return merged
 
 
 def _parser() -> argparse.ArgumentParser:
