@@ -2734,3 +2734,84 @@ async def test_a_normal_failure_is_never_mistaken_for_a_retryable_one(
     assert result.success is True
     assert result.failure_class is None
     assert len(runtime.requests) == 1
+
+
+# ---- terminal stall diagnostics (#846 follow-up) --------------------------
+# The admission log answers "why did the turn never start"; this answers "why
+# did a turn that WAS answering never finish". On gongmyoung 5 of 7 turns on
+# 2026-08-01 ended this way with the link measurably healthy, and the log said
+# nothing but the user id. The load-bearing field is last_text_age vs
+# last_tool_age: text after the last tool event means the model finished
+# speaking and only the terminal frame is missing — the provider's side.
+
+
+@pytest.mark.anyio
+async def test_terminal_stall_logs_activity_ages_and_transport_verdict(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    stall = StallSession("thread-1")  # default pre_events: one text delta, then hang
+    stall.transport_diagnostics = lambda: {
+        "exit_code": None,
+        "stderr_class": None,
+        "stderr_lines": 0,
+    }
+    runtime = FakeRuntime([stall, FakeSession("thread-1")])
+    handler, _ = _stall_handler(tmp_path, runtime, monkeypatch)
+    handler._process_timeout_seconds = 5.0
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://user:s3cr3t@api.kimi.com/v1")
+
+    warnings: list[tuple] = []
+    process_globals = ProjectChatHandler._process_agent_message.__globals__
+    monkeypatch.setitem(
+        process_globals,
+        "logger",
+        SimpleNamespace(
+            warning=lambda *args, **kwargs: warnings.append(args),
+            info=lambda *a, **k: None,
+            debug=lambda *a, **k: None,
+            error=lambda *a, **k: None,
+            exception=lambda *a, **k: None,
+        ),
+    )
+
+    result = await asyncio.wait_for(handler.process_message("hi", 7, 70), timeout=5)
+
+    # The user-facing contract is unchanged: partial text + the stall notice.
+    assert result.success is False
+    assert result.error == "Agent stopped before terminal completion"
+    assert "partial answer" in result.content
+
+    stall_logs = [w for w in warnings if "Terminal-event stall" in str(w[0])]
+    assert len(stall_logs) == 1
+    rendered = stall_logs[0][0] % tuple(stall_logs[0][1:])
+    assert "endpoint=api.kimi.com" in rendered
+    assert "stderr_class=None" in rendered  # silence, distinguishable from a loud crash
+    assert "silence=" in rendered and "last_text_age=" in rendered
+    # A turn that produced text but never ran a tool must say so, not report 0.
+    assert "last_tool_age=never" in rendered
+    # Userinfo from the base URL must not ride along into the log.
+    assert "s3cr3t" not in rendered
+
+
+@pytest.mark.anyio
+async def test_terminal_stall_survives_a_session_without_diagnostics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The stall path is already failing; a probe that raises must not turn a
+    partial answer into a traceback."""
+
+    stall = StallSession("thread-1")
+
+    def _explode():
+        raise RuntimeError("transport gone")
+
+    stall.transport_diagnostics = _explode
+    runtime = FakeRuntime([stall, FakeSession("thread-1")])
+    handler, stalled = _stall_handler(tmp_path, runtime, monkeypatch)
+    handler._process_timeout_seconds = 5.0
+
+    result = await asyncio.wait_for(handler.process_message("hi", 7, 70), timeout=5)
+
+    assert result.success is False
+    assert "partial answer" in result.content
+    assert stalled == [1]
