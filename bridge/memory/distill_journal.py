@@ -11,6 +11,8 @@ from pathlib import Path
 import re
 from typing import Any
 
+import telegram_bot.utils.secure_fs as secure_fs
+
 from .distill_types import (
     DISTILL_SCHEMA_VERSION,
     CodexTranscriptSnapshot,
@@ -31,6 +33,9 @@ from .journal_core import JsonJournalCore
 
 _SAFE_ERROR_CODE_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _DEFAULT_DISCRIMINATOR = "session-close-v1"
+# Keep the historical direct secure-fs consumer seam visible to packaging and
+# ownership tests while JsonJournalCore remains the single implementation.
+_SECURE_FS_COMPAT = secure_fs
 # Preserve the historical monkeypatch seam. journal_core uses this same module
 # object, so patching distill_journal.os.getuid still exercises owner rejection.
 _OS_PATCH_SEAM = os
@@ -73,6 +78,11 @@ class DistillJournal(JsonJournalCore):
 
     def job_path(self, job_id: str) -> Path:
         return self.record_path(job_id)
+
+    @classmethod
+    def _validate_job_name(cls, path: Path) -> None:
+        """Preserve the DistillJournal-specific validation seam."""
+        cls._validate_record_name(path)
 
     def _read_unlocked(self, job_id: str) -> DistillJob:
         value = self._read_json_unlocked(job_id)
@@ -189,7 +199,7 @@ class DistillJournal(JsonJournalCore):
         with self._exclusive():
             paths = sorted(self.root.glob("*.json"))
             for path in paths:
-                self._validate_record_name(path)
+                self._validate_job_name(path)
             return tuple(self._read_unlocked(path.stem) for path in paths)
 
     def claim(

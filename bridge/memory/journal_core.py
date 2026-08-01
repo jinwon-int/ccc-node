@@ -20,7 +20,7 @@ try:
         ensure_private_directory,
     )
 except ModuleNotFoundError:  # Standalone hook install beside ccc_secure_fs.py.
-    from ccc_secure_fs import (  # type: ignore[no-redef]
+    from ccc_secure_fs import (
         _atomic_write_bytes,
         _fsync_directory,
         _validate_storage_directory,

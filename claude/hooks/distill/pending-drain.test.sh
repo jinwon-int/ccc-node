@@ -89,7 +89,8 @@ payload sess-durable "$TRANSCRIPT" | \
 
 wait_for '[ "$(find "$STATE/distill-pending" -maxdepth 1 -type f -name "*.json" | wc -l)" = 1 ]'
 job="$(find "$STATE/distill-pending" -maxdepth 1 -type f -name '*.json' | head -1)"
-wait_for '[ -s "$CLAUDE_STUB_PGID_FILE" ]' || tail -20 "$STATE/distill.log" 2>/dev/null
+wait_for '[ -s "$CLAUDE_STUB_PGID_FILE" ] && [ -e "$job.lock" ]' || \
+  tail -20 "$STATE/distill.log" 2>/dev/null
 ok "SessionEnd writes one durable job before provider completion" '[ -f "$job" ] && grep -q "enqueued job=" "$STATE/distill.log"'
 ok "pending directory and job are owner-only" '[ "$(stat -c %a "$STATE/distill-pending")" = 700 ] && [ "$(stat -c %a "$job")" = 600 ]'
 ok "pending claim lock is owner-only" '[ "$(stat -c %a "$job.lock")" = 600 ]'
@@ -108,7 +109,9 @@ ok "same transcript snapshot deduplicates to one job" \
 # provider subprocess causes its worker to fail.
 kill -KILL -- "-$(cat "$CLAUDE_STUB_PGID_FILE")" 2>/dev/null || true
 rm -f "$CLAUDE_STUB_PGID_FILE"
-wait_for 'flock -n "$job.lock" true 2>/dev/null'
+# Never let the test's flock probe create a missing 0644 lock file. A missing
+# claim remains a worker-start failure; it must not poison the recovery case.
+wait_for '[ -e "$job.lock" ] && flock -n "$job.lock" true 2>/dev/null'
 ok "killed extraction retains the durable job" '[ -f "$job" ]'
 
 # The next SessionStart recovery pass launches the retained job and removes it
@@ -141,7 +144,7 @@ payload sess-fail "$TRANSCRIPT_FAIL" | \
 wait_for '[ "$(find "$STATE/distill-pending" -maxdepth 1 -type f -name "*.json" | wc -l)" = 1 ]'
 failed_job="$(find "$STATE/distill-pending" -maxdepth 1 -type f -name '*.json' | head -1)"
 failed_id="$(basename "$failed_job" .json)"
-wait_for 'grep -q "pending retained reason=pipeline-failed job=$failed_id" "$STATE/distill.log" && flock -n "$failed_job.lock" true 2>/dev/null'
+wait_for 'grep -q "pending retained reason=pipeline-failed job=$failed_id" "$STATE/distill.log" && [ -e "$failed_job.lock" ] && flock -n "$failed_job.lock" true 2>/dev/null'
 ok "failed extraction keeps one retryable pending job" \
   '[ -f "$failed_job" ]'
 

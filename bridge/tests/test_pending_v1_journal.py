@@ -10,8 +10,6 @@ import sys
 
 import pytest
 
-from telegram_bot.memory.journal_core import JsonJournalCore
-
 
 ADAPTER_PATH = Path(__file__).parents[2] / "claude/hooks/distill/pending_journal.py"
 SPEC = importlib.util.spec_from_file_location("ccc_pending_journal_test", ADAPTER_PATH)
@@ -19,6 +17,7 @@ assert SPEC is not None and SPEC.loader is not None
 pending = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = pending
 SPEC.loader.exec_module(pending)
+JsonJournalCore = pending.JsonJournalCore
 
 
 def record(transcript: Path, *, session: str = "session-584") -> dict[str, object]:
@@ -51,6 +50,9 @@ def test_legacy_id_is_byte_compatible_and_adapter_uses_shared_core(tmp_path: Pat
         "8cb22e36319eaa54d0d35edf6c1f85b10b7b2e16a33a25124a2d1c3c3c5c60b8"
     )
     assert issubclass(pending.PendingV1Journal, JsonJournalCore)
+    assert Path(sys.modules[JsonJournalCore.__module__].__file__).resolve() == (
+        Path(__file__).parents[1] / "memory/journal_core.py"
+    ).resolve()
 
     transcript = tmp_path / "transcript.jsonl"
     transcript.write_text("body", encoding="utf-8")
