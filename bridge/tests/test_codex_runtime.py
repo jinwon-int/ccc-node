@@ -999,6 +999,28 @@ class CodexRuntimeTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(FrozenInstanceError):
             setattr(diagnostics, "unowned_completed", 2)
 
+    async def test_async_completion_capability_pins_official_protocol_boundary(self) -> None:
+        await self.runtime.start_or_resume(
+            SessionRequest(working_directory="/workspace", session_id="thread-known")
+        )
+
+        capability = self.runtime.async_completion_capability()
+
+        self.assertEqual(capability.provider, "codex")
+        self.assertEqual(capability.state, "degraded")
+        self.assertIsNone(capability.protocol_version)
+        self.assertEqual(capability.notification_method, "turn/completed")
+        self.assertEqual(capability.recovery_method, "thread/read")
+        self.assertEqual(capability.ownership_scope, "exact_active_turn")
+        self.assertFalse(capability.supports_durable_delivery)
+        self.assertEqual(
+            capability.reason_code,
+            "detached_ownership_unavailable",
+        )
+        self.assertNotIn("thread-known", repr(capability))
+        with self.assertRaises(FrozenInstanceError):
+            setattr(capability, "state", "supported")
+
     async def test_unowned_completion_diagnostics_fail_closed_on_invalid_shapes(
         self,
     ) -> None:

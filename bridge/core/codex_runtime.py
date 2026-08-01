@@ -17,6 +17,7 @@ from typing import Literal, Protocol, cast
 
 from .agent_runtime import (
     AgentEvent,
+    AsyncCompletionCapability,
     ApprovalDecision,
     ApprovalHandler,
     ApprovalRequestEvent,
@@ -435,7 +436,29 @@ class CodexRuntime:
     def supports_async_completion_delivery(self) -> bool:
         """Whether detached Codex completion delivery has a safe provider seam."""
 
-        return False
+        return self.async_completion_capability().supports_durable_delivery
+
+    @staticmethod
+    def async_completion_capability() -> AsyncCompletionCapability:
+        """Pin the official surfaces without claiming detached-turn ownership.
+
+        App-server documents ``turn/completed`` and ``thread/read``, but its
+        initialize response does not negotiate a protocol version or an event
+        field tying an unowned turn to a bridge-started detached task.  Treat
+        that unknown version/ownership combination as degraded even when both
+        method names happen to work for ordinary interactive turns.
+        """
+
+        return AsyncCompletionCapability(
+            provider="codex",
+            state="degraded",
+            protocol_version=None,
+            notification_method="turn/completed",
+            recovery_method="thread/read",
+            ownership_scope="exact_active_turn",
+            supports_durable_delivery=False,
+            reason_code="detached_ownership_unavailable",
+        )
 
     def async_completion_diagnostics(self) -> AsyncCompletionDiagnostics:
         """Return only bounded counters; never expose provider payload content."""

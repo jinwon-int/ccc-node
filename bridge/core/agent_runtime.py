@@ -198,6 +198,59 @@ async def deny_approval(_request: ApprovalRequestEvent) -> ApprovalDecision:
 
 
 @dataclass(frozen=True, slots=True)
+class AsyncCompletionCapability:
+    """Body-free protocol boundary for out-of-turn completion delivery.
+
+    This describes only provider surfaces the running adapter can safely use.
+    It is not an event and carries no provider, thread, task, or message payload.
+    ``protocol_version=None`` means the server did not negotiate a version that
+    can be pinned to a supported async-delivery contract.
+    """
+
+    provider: str
+    state: Literal["supported", "degraded"]
+    protocol_version: str | None
+    notification_method: str | None
+    recovery_method: str | None
+    ownership_scope: Literal["exact_active_turn", "detached_task"]
+    supports_durable_delivery: bool
+    reason_code: str
+
+    def __post_init__(self) -> None:
+        if self.state not in {"supported", "degraded"}:
+            raise ValueError("async completion state is invalid")
+        if self.ownership_scope not in {"exact_active_turn", "detached_task"}:
+            raise ValueError("async completion ownership scope is invalid")
+        for name in ("provider", "reason_code"):
+            value = getattr(self, name)
+            if not value or value.strip() != value or len(value) > 128:
+                raise ValueError(f"async completion {name} is invalid")
+        for name in ("protocol_version", "notification_method", "recovery_method"):
+            value = getattr(self, name)
+            if value is not None and (
+                not value or value.strip() != value or len(value) > 128
+            ):
+                raise ValueError(f"async completion {name} is invalid")
+        if self.state == "supported":
+            if (
+                not self.supports_durable_delivery
+                or self.protocol_version is None
+                or self.notification_method is None
+                or self.recovery_method is None
+                or self.ownership_scope != "detached_task"
+            ):
+                raise ValueError("supported async completion capability is incomplete")
+        elif self.supports_durable_delivery:
+            raise ValueError("degraded async completion cannot enable durable delivery")
+
+
+class AsyncCompletionRuntime(Protocol):
+    """Optional provider-neutral async-completion capability seam."""
+
+    def async_completion_capability(self) -> AsyncCompletionCapability: ...
+
+
+@dataclass(frozen=True, slots=True)
 class SessionRequest:
     """Provider-neutral inputs for starting or resuming an agent session."""
 

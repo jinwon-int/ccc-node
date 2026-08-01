@@ -225,7 +225,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   completions without retaining provider ids, items, text, errors, or raw
   payloads. Such events remain deliberately undelivered: no Telegram send,
   journal, `thread/read` replay, or Claude transcript inference occurs until
-  Codex provides a documented detached-ownership signal.
+  Codex provides a documented detached-ownership signal. The provider-neutral
+  runtime contract now also exposes the executable capability decision,
+  including the official `turn/completed` and `thread/read` surfaces, the
+  exact-active-turn ownership limit, and the absence of a negotiated protocol
+  version; unknown versions remain explicitly degraded.
 - **Owner-only external bridge restart handoff (#708).** Linux systemd nodes
   can opt in with `CCC_BRIDGE_RESTART_HANDOFF=systemd` to expose `/restart` in
   private chats. The bridge durably prepares a body-free receipt, asks

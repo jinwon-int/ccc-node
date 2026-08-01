@@ -286,8 +286,9 @@ class CapabilityRuntimeDriftTests(unittest.TestCase):
         self.assertEqual(status.dependencies, ("#646",))
         for boundary in (
             "exact bridge-owned active turn",
-            "no detached ownership signal",
+            "no detached ownership signal or negotiated protocol version",
             "body-free bounded diagnostics",
+            "machine-readable degraded boundary",
             "no Telegram send",
             "journal",
             "thread/read replay",
