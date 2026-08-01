@@ -4,6 +4,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 START_SH = ROOT / "start.sh"
+DEPENDENCY_BOOTSTRAP = ROOT / "dependency_bootstrap.py"
 # Service-install machinery extracted from start.sh (#584 P3-2).
 SERVICE_SYSTEMD_SH = ROOT / "service-systemd.sh"
 SERVICE_LAUNCHD_SH = ROOT / "service-launchd.sh"
@@ -14,24 +15,22 @@ def _start_text() -> str:
 
 
 class StartScriptStaticTests(unittest.TestCase):
-    def test_start_sh_auto_detects_android_api_level_before_pip_install(self):
+    def test_start_sh_delegates_dependency_policy_to_python(self):
         text = _start_text()
-        self.assertIn("ensure_android_api_level()", text)
-        self.assertIn("getprop ro.build.version.sdk", text)
-        self.assertIn("export ANDROID_API_LEVEL", text)
-
-        install = text.index("📦 Installing Python dependencies")
-        detect = text.index("ensure_android_api_level", install)
-        upgrade = text.index("install -q --upgrade pip", install)
-        self.assertLess(detect, upgrade)
-
-    def test_start_sh_preserves_operator_provided_android_api_level(self):
-        text = _start_text()
-        function_start = text.index("ensure_android_api_level()")
-        function_end = text.index("sync_dependencies()", function_start)
+        function_start = text.index("sync_dependencies()")
+        function_end = text.index("get_checkout_version()", function_start)
         function_body = text[function_start:function_end]
-        self.assertIn('if [ -n "${ANDROID_API_LEVEL:-}" ]; then', function_body)
-        self.assertIn("return 0", function_body)
+
+        self.assertIn('"$SCRIPT_DIR/dependency_bootstrap.py"', function_body)
+        self.assertIn('"--process-unlocked=$DEPS_UNLOCKED_PROCESS"', function_body)
+        self.assertNotIn("pip install", function_body)
+        self.assertNotIn("requirements.lock.txt", function_body)
+
+    def test_dependency_bootstrap_owns_android_api_detection(self):
+        text = DEPENDENCY_BOOTSTRAP.read_text(encoding="utf-8")
+        self.assertIn("def ensure_android_api_level(", text)
+        self.assertIn('"ro.build.version.sdk"', text)
+        self.assertIn('if env.get("ANDROID_API_LEVEL")', text)
 
     def test_start_sh_never_logs_proxy_values(self):
         for script in (START_SH, SERVICE_SYSTEMD_SH, SERVICE_LAUNCHD_SH):

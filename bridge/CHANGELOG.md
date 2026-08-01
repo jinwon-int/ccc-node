@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Python-owned dependency bootstrap (#584 P3-2).** `start.sh` now delegates
+  dependency mode resolution, requirements fingerprint/cache handling,
+  hash-lock enforcement, pip argv/execution, and Termux Android API detection
+  to a typed standard-library Python CLI. The shell remains responsible for
+  creating the virtualenv and preserves process > project `.env` > bridge
+  `.env` precedence; only literal `CCC_DEPS_UNLOCKED=1` enables the legacy
+  unlocked path. Execution tests use fake local tools only and cover cache and
+  failure propagation plus paths containing spaces and shell metacharacters.
+
 ### Added
 - **Durable external waits for GitHub CI (#740).** When an agent promises
   "I'll continue once CI finishes" it can now register a durable wait

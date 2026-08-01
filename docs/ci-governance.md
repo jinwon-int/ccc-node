@@ -44,10 +44,12 @@ regenerated together by `scripts/ccc-deps-lock.sh`:
    uses `--require-hashes` against it.
 2. `bridge/requirements.lock.txt` — the runtime set, compiled with the CI lock
    as a pip constraint so runtime nodes install exactly the versions CI
-   tested. `bridge/start.sh` installs it with `--require-hashes` by default
-   and adds the first-party package with `--no-deps`, so no unhashed
-   transitive dependency can enter a node. `CCC_DEPS_UNLOCKED=1` is the
-   documented escape hatch for hosts that cannot build a locked artifact.
+   tested. `bridge/start.sh` delegates to the standard-library-only
+   `bridge/dependency_bootstrap.py`, which installs the lock with
+   `--require-hashes` by default and adds the first-party package with
+   `--no-deps`, so no unhashed transitive dependency can enter a node.
+   `CCC_DEPS_UNLOCKED=1` is the documented escape hatch for hosts that cannot
+   build a locked artifact.
 
 `tests/test_runtime_deps_lock.py` enforces that the runtime lock stays a
 version-consistent subset of the CI lock, that every pin carries hashes, and

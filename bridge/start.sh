@@ -6,10 +6,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 VENV_DIR="$SCRIPT_DIR/venv"
 REQ_FILE="$SCRIPT_DIR/requirements.txt"
-LOCK_FILE="$SCRIPT_DIR/requirements.lock.txt"
-PYPROJECT_FILE="$SCRIPT_DIR/pyproject.toml"
 ENV_FILE="$SCRIPT_DIR/.env"
-REQ_HASH_FILE="$VENV_DIR/.req_hash"
 
 # Colors for output
 RED='\033[0;31m'
@@ -17,45 +14,6 @@ GREEN='\033[0;32m'
 BLUE='\033[0;34m'
 BOLD='\033[1m'
 NC='\033[0m'
-
-deps_install_mode() {
-    # Locked (default): install third-party dependencies exclusively from the
-    # hash-locked requirements.lock.txt so every node at the same checkout
-    # resolves identical versions and pip rejects any unhashed transitive
-    # dependency. CCC_DEPS_UNLOCKED=1 is the documented escape hatch for hosts
-    # where a locked artifact cannot build; it restores the legacy
-    # lower-bound requirements.txt flow and therefore loses reproducibility.
-    #
-    # Resolution order matches the rest of the bridge config: an explicitly
-    # set process environment value wins, then the project .env
-    # ($PROJECT_ROOT/.telegram_bot/.env), then the bot source dir .env —
-    # merge_env_files() never exports project .env keys into the shell, so
-    # this must go through read_env_with_fallback. Only the literal "1"
-    # selects the unlocked flow; anything else stays locked (fail closed to
-    # the reproducible default).
-    local configured="${CCC_DEPS_UNLOCKED:-}"
-    if [ -z "$configured" ]; then
-        configured="$(read_env_with_fallback "CCC_DEPS_UNLOCKED")"
-    fi
-    if [ "$configured" = "1" ]; then
-        echo "unlocked"
-    else
-        echo "locked"
-    fi
-}
-
-get_requirements_hash() {
-    "$VENV_DIR/bin/python" - "$REQ_FILE" "$LOCK_FILE" "$PYPROJECT_FILE" "$(deps_install_mode)" <<'PY'
-import hashlib, pathlib, sys
-h = hashlib.sha256()
-for name in sys.argv[1:-1]:
-    path = pathlib.Path(name)
-    h.update(path.read_bytes() if path.exists() else b"<absent>")
-    h.update(b"\0")
-h.update(sys.argv[-1].encode())
-print(h.hexdigest())
-PY
-}
 
 ensure_venv() {
     if [ ! -d "$VENV_DIR" ]; then
@@ -65,91 +23,14 @@ ensure_venv() {
             exit 1
         fi
     fi
-    cleanup_package_link
-}
-
-cleanup_package_link() {
-    # Older installs exposed bridge/ as telegram_bot through a site-packages
-    # symlink. Remove that stale link before editable installation so import
-    # resolution is owned by packaging metadata instead of filesystem state.
-    local sp
-    sp="$("$VENV_DIR/bin/python" -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])' 2>/dev/null)"
-    if [ -n "$sp" ] && [ -L "$sp/telegram_bot" ]; then
-        rm -f "$sp/telegram_bot"
-    fi
-}
-
-ensure_android_api_level() {
-    # Some Rust-backed Python dependencies (for example pyromark via maturin/pyo3)
-    # need ANDROID_API_LEVEL when building on Termux. Auto-detect it so mobile
-    # installs do not fail before the bridge can start.
-    if [ -n "${ANDROID_API_LEVEL:-}" ]; then
-        return 0
-    fi
-    if { [ -n "${TERMUX_VERSION:-}" ] || printf '%s' "${PREFIX:-}" | grep -q '/com.termux/'; } \
-        && command -v getprop >/dev/null 2>&1; then
-        local sdk
-        sdk="$(getprop ro.build.version.sdk 2>/dev/null | tr -dc '0-9')"
-        if [ -n "$sdk" ]; then
-            export ANDROID_API_LEVEL="$sdk"
-            echo -e "\033[90m✓ Android API level auto-detected: $ANDROID_API_LEVEL\033[0m"
-        fi
-    fi
 }
 
 sync_dependencies() {
-    local force_install="$1"
-    local current_hash saved_hash
-
-    current_hash="$(get_requirements_hash)"
-    [ -f "$REQ_HASH_FILE" ] && saved_hash="$(cat "$REQ_HASH_FILE")"
-
-    if [ "$force_install" = "1" ] || [ -z "$saved_hash" ] || [ "$saved_hash" != "$current_hash" ]; then
-        echo "📦 Installing Python dependencies..."
-        ensure_android_api_level
-        if [ "$(deps_install_mode)" = "locked" ]; then
-            if [ ! -f "$LOCK_FILE" ]; then
-                echo "❌ Hash lock not found: $LOCK_FILE"
-                echo "   Regenerate it with scripts/ccc-deps-lock.sh, or set"
-                echo "   CCC_DEPS_UNLOCKED=1 to use the legacy unlocked install."
-                exit 1
-            fi
-            # Every third-party package (including transitives) must match a
-            # recorded hash; the venv's bundled pip (>=22.3 on Python 3.11+)
-            # already supports --require-hashes, so no unpinned pip
-            # self-upgrade is performed on this path.
-            if ! "$VENV_DIR/bin/pip" install -q --require-hashes -r "$LOCK_FILE"; then
-                echo "❌ Hash-locked dependency installation failed"
-                echo "   If this host cannot install a locked artifact, retry with"
-                echo "   CCC_DEPS_UNLOCKED=1 and report the platform gap."
-                exit 1
-            fi
-            # --no-deps keeps the editable first-party install from pulling
-            # any unhashed transitive dependency outside the lock.
-            if ! "$VENV_DIR/bin/pip" install -q --no-deps -e "$SCRIPT_DIR"; then
-                echo "❌ Editable bridge package installation failed"
-                exit 1
-            fi
-        else
-            echo "⚠️  CCC_DEPS_UNLOCKED=1 — legacy unlocked install (no hash verification)"
-            if ! "$VENV_DIR/bin/pip" install -q --upgrade pip; then
-                echo "❌ Failed to upgrade pip"
-                exit 1
-            fi
-            if ! "$VENV_DIR/bin/pip" install -q -r "$REQ_FILE"; then
-                echo "❌ Dependency installation failed"
-                exit 1
-            fi
-            if ! "$VENV_DIR/bin/pip" install -q -e "$SCRIPT_DIR"; then
-                echo "❌ Editable bridge package installation failed"
-                exit 1
-            fi
-        fi
-        echo "$current_hash" > "$REQ_HASH_FILE"
-        echo "✅ Dependencies are up to date"
-    else
-        echo -e "\033[90m✓ Dependencies unchanged (requirements hash match)\033[0m"
-    fi
+    "$VENV_DIR/bin/python" "$SCRIPT_DIR/dependency_bootstrap.py" \
+        --bridge-dir "$SCRIPT_DIR" \
+        --venv-dir "$VENV_DIR" \
+        --project-env "$ENV_FILE" \
+        "--process-unlocked=$DEPS_UNLOCKED_PROCESS" || exit $?
 }
 
 get_checkout_version() {
@@ -353,6 +234,10 @@ SUPERVISOR_PID_FILE="$BOT_DATA_DIR/supervisor.pid"
 HEALTH_FILE="$BOT_DATA_DIR/health.json"
 HEALTH_STALE_SECONDS=$((WATCHDOG_INTERVAL * 2 + 30))
 ENV_FILE="$BOT_DATA_DIR/.env"
+# Capture the inherited setting before merge_env_files exports bridge .env
+# fallbacks. The Python dependency bootstrap owns the actual precedence and
+# policy resolution; this value only preserves the original process boundary.
+DEPS_UNLOCKED_PROCESS="${CCC_DEPS_UNLOCKED:-}"
 ENV_EXAMPLE_FILE="$SCRIPT_DIR/.env.example"
 PROJECT_SLUG="$(basename "$PROJECT_ROOT" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '-' | sed 's/-*$//')"
 PLIST_LABEL="com.telegram-skill-bot.${PROJECT_SLUG}"
@@ -1314,7 +1199,7 @@ prepare_runtime() {
     fi
 
     ensure_venv
-    sync_dependencies 0
+    sync_dependencies
 
     echo "✅ Activating virtual environment"
     . "$VENV_DIR/bin/activate"
