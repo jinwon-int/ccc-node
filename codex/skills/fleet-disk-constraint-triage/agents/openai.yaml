@@ -1,0 +1,4 @@
+interface:
+  display_name: "Fleet Disk Constraint Triage"
+  short_description: "Platform-aware fleet disk audit, severity triage, and node-local cleanup delegation"
+  default_prompt: "Use $fleet-disk-constraint-triage to audit fleet disk usage (df $HOME on Android/Termux), classify severity, and delegate cleanup to node-local agents via durable tickets."
