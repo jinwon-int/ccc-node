@@ -15,6 +15,8 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 from urllib.parse import urlsplit
 
+from telegram_bot.utils.redaction import contains_credential
+
 MAX_WINDOWS = 16
 MAX_MODELS = 16
 MAX_DAILY_BUCKETS = 14
@@ -119,6 +121,40 @@ _KNOWN_CLAUDE_SERVICES: tuple[tuple[str, str], ...] = (
     ("kimi.com", "Kimi Code"),
 )
 
+_HOST_CHARS_RE = re.compile(r"[a-z0-9._:-]+")
+_IPV4_RE = re.compile(r"(?:\d{1,3}\.){3}\d{1,3}")
+_TLD_RE = re.compile(r"[a-z]{2,63}|xn--[a-z0-9-]{1,59}")
+
+
+def _looks_like_host(host: str) -> bool:
+    """Whether a parsed host is safe to put in a log line.
+
+    ``urlsplit`` reports whatever sat where a host belongs, so a misconfigured
+    ``ANTHROPIC_BASE_URL`` holding a bare token parses as a perfectly good
+    "hostname". Three gates, cheapest first:
+
+    * DNS shape — charset, total length, and per-label 63 bytes.
+    * The repo's credential detector, given the host **as parsed**: its patterns
+      are case-sensitive (``eyJ`` for a JWT, ``AKIA`` for AWS), so casefolding
+      first would quietly disarm it. It does not cover every shape — a JWT slips
+      through ``contains_credential`` today — so it is a gate, not the gate.
+    * A real public suffix. This is what actually stops token-shaped values: a
+      dotted token like ``eyJhbGciOi....abcdef012345`` is charset-legal and
+      label-legal, but its rightmost label carries digits and no TLD does.
+      IPv4/IPv6 literals and ``localhost`` are allowed explicitly instead.
+    """
+    if not host or contains_credential(host):
+        return False
+    folded = host.casefold()
+    if len(folded) > 253 or not _HOST_CHARS_RE.fullmatch(folded):
+        return False
+    if any(len(label) > 63 for label in folded.split(".")):
+        return False
+    if ":" in folded or folded == "localhost" or _IPV4_RE.fullmatch(folded):
+        return True
+    labels = folded.split(".")
+    return len(labels) >= 2 and bool(_TLD_RE.fullmatch(labels[-1]))
+
 
 def detect_claude_service(base_url: object = None) -> str | None:
     """Return a display name for a known third-party Claude-compatible service.
@@ -142,6 +178,31 @@ def detect_claude_service(base_url: object = None) -> str | None:
         if host == marker or host.endswith(f".{marker}"):
             return name
     return None
+
+
+def claude_endpoint_host(base_url: object = None) -> str:
+    """Host of the configured Claude-compatible endpoint, for diagnostics.
+
+    ``detect_claude_service`` answers "which known vendor is this" and returns
+    ``None`` for anything unrecognized — precisely the case a stall report most
+    needs to name. This answers "which host did we actually talk to".
+
+    Host only, via ``hostname`` rather than ``netloc``: a base URL may carry
+    ``user:pass@`` userinfo and ``netloc`` would keep it, so nothing this
+    returns can hold a credential.
+    """
+    raw = base_url if base_url is not None else os.environ.get("ANTHROPIC_BASE_URL")
+    text = _text(raw, maximum=200)
+    if not text:
+        return "anthropic-default"
+    candidate = text if "://" in text else f"https://{text}"
+    try:
+        host = urlsplit(candidate).hostname or ""
+    except ValueError:
+        return "unparsable"
+    # A malformed value must not become a log line verbatim — the same reason
+    # the raw URL is never logged.
+    return host.casefold() if _looks_like_host(host) else "unparsable"
 
 
 def _env_int(name: str, *, maximum: int = 10**9) -> int | None:

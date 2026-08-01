@@ -2512,3 +2512,83 @@ async def test_sessions_without_unsolicited_seam_stay_untouched(tmp_path: Path) 
 
     assert response.success is True
     assert not hasattr(session, "unsolicited_handler")
+
+
+# ---- admission timeout diagnostics (#846) ---------------------------------
+# The failure itself was already reported; what was missing was any way to tell
+# WHY. Before this, ten minutes of provider silence produced one line naming
+# only the user and chat.
+
+
+@pytest.mark.anyio
+async def test_admission_timeout_logs_provider_endpoint_and_cli_verdict(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    blocked = StallSession("thread-1", pre_events=[])
+    # Codex sessions and doubles have no transport probe; a session that does
+    # gets asked, and the answer has to survive into the log line.
+    blocked.transport_diagnostics = lambda: {
+        "exit_code": 143,
+        "stderr_class": "network",
+        "stderr_lines": 3,
+    }
+    runtime = FakeRuntime([blocked, FakeSession("thread-1")])
+    handler, _ = _stall_handler(tmp_path, runtime, monkeypatch)
+    handler._config.turn_admission_timeout_seconds = 0.05
+    handler._process_timeout_seconds = 5.0
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://user:s3cr3t@api.kimi.com/v1")
+
+    warnings: list[tuple] = []
+    process_globals = ProjectChatHandler._process_agent_message.__globals__
+    monkeypatch.setitem(
+        process_globals,
+        "logger",
+        SimpleNamespace(
+            warning=lambda *args, **kwargs: warnings.append(args),
+            info=lambda *a, **k: None,
+            debug=lambda *a, **k: None,
+            error=lambda *a, **k: None,
+            exception=lambda *a, **k: None,
+        ),
+    )
+
+    result = await asyncio.wait_for(handler.process_message("blocked", 7, 70), timeout=5)
+
+    # The user-facing contract is unchanged.
+    assert result.success is False
+    assert result.error == "Agent turn did not start within 0.05s"
+
+    admission = [w for w in warnings if "admission timed out" in str(w[0])]
+    assert len(admission) == 1
+    rendered = admission[0][0] % tuple(admission[0][1:])
+    assert "endpoint=api.kimi.com" in rendered
+    assert "exit_code=143" in rendered
+    assert "stderr_class=network" in rendered
+    assert "stderr_lines=3" in rendered
+    assert "grace=0.05s" in rendered
+    # Userinfo from the base URL must not ride along into the log.
+    assert "s3cr3t" not in rendered
+
+
+@pytest.mark.anyio
+async def test_admission_timeout_survives_a_session_without_diagnostics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A diagnostic that raises on the failure path is worse than none."""
+
+    blocked = StallSession("thread-1", pre_events=[])
+
+    def _explode():
+        raise RuntimeError("transport gone")
+
+    blocked.transport_diagnostics = _explode
+    runtime = FakeRuntime([blocked, FakeSession("thread-1")])
+    handler, stalled = _stall_handler(tmp_path, runtime, monkeypatch)
+    handler._config.turn_admission_timeout_seconds = 0.05
+    handler._process_timeout_seconds = 5.0
+
+    result = await asyncio.wait_for(handler.process_message("blocked", 7, 70), timeout=5)
+
+    assert result.success is False
+    assert result.error == "Agent turn did not start within 0.05s"
+    assert stalled == [1]

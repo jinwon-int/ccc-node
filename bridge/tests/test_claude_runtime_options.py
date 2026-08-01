@@ -17,7 +17,11 @@ from pydantic import SecretStr
 
 from telegram_bot.core import claude_runtime
 from telegram_bot.core.agent_runtime import SessionRequest
-from telegram_bot.core.claude_runtime import ClaudeRuntime
+from telegram_bot.core.claude_runtime import (
+    ClaudeRuntime,
+    ClaudeSession,
+    _classify_cli_stderr,
+)
 from telegram_bot.core.memory_audience import MemoryAudience
 from telegram_bot.core.web_mcp import FIRECRAWL_SCRAPE_TOOL, SEARXNG_SEARCH_TOOL
 
@@ -247,3 +251,106 @@ def test_curated_web_mcp_replaces_native_web_tools(tmp_path: Path) -> None:
     assert set(options.mcp_servers) == {"searxng", "firecrawl"}
     assert options.env == {"FIRECRAWL_API_KEY": "fc-test-secret"}
     assert "Curated web routing" in options.system_prompt
+
+
+# ---- CLI stderr capture (#846) --------------------------------------------
+# The SDK transport pipes stderr ONLY when a callback is registered
+# (`stderr_dest = PIPE if self._options.stderr is not None else None`), so
+# without this wiring the CLI's dying words are discarded by the kernel and an
+# admission timeout has nothing to report.
+
+
+def test_build_options_leaves_stderr_unset_when_no_sink_given(tmp_path: Path) -> None:
+    # The default keeps the pre-#846 transport behaviour for callers that do
+    # not want a pipe (unit tests, conformance harness).
+    assert _build(ClaudeRuntime(), tmp_path).stderr is None
+
+
+def test_build_options_registers_the_supplied_stderr_sink(tmp_path: Path) -> None:
+    seen: list[str] = []
+
+    def sink(line: str) -> None:
+        seen.append(line)
+
+    request = SessionRequest(working_directory=str(tmp_path))
+    options = ClaudeRuntime()._build_options(request, _reject, stderr=sink)
+    assert options.stderr is sink
+    options.stderr("boom")
+    assert seen == ["boom"]
+
+
+@pytest.mark.asyncio
+async def test_start_or_resume_pipes_cli_stderr_into_the_session(tmp_path: Path) -> None:
+    # End-to-end wiring: whatever the transport reports on stderr has to reach
+    # the session that will later be asked why the turn never started.
+    captured: dict[str, object] = {}
+
+    class _Client:
+        def __init__(self, options):
+            captured["options"] = options
+
+        async def connect(self):
+            return None
+
+        async def query(self, *_args, **_kwargs):
+            return None
+
+        async def receive_messages(self):
+            if False:  # pragma: no cover - never yields
+                yield None
+
+        async def interrupt(self):
+            return None
+
+        async def disconnect(self):
+            return None
+
+    runtime = ClaudeRuntime(sdk_client_factory=_Client)
+    session = await runtime.start_or_resume(
+        SessionRequest(working_directory=str(tmp_path))
+    )
+
+    sink = captured["options"].stderr
+    assert callable(sink)
+    sink("Error: connect ECONNRESET")
+
+    details = session.transport_diagnostics()
+    assert details["stderr_lines"] == 1
+    assert details["stderr_class"] == "network"
+
+
+def test_transport_diagnostics_reports_silence_as_no_class(tmp_path: Path) -> None:
+    # A process that said nothing is the most common admission-timeout shape and
+    # must be distinguishable from one that failed loudly.
+    session = ClaudeSession(ClaudeRuntime(), "sid")
+    details = session.transport_diagnostics()
+    assert details == {"exit_code": None, "stderr_class": None, "stderr_lines": 0}
+
+
+def test_stderr_sink_is_bounded_and_ignores_blank_lines() -> None:
+    session = ClaudeSession(ClaudeRuntime(), "sid")
+    for index in range(200):
+        session._record_stderr(f"line {index}")
+    session._record_stderr("   ")
+    session._record_stderr("")
+    assert session.transport_diagnostics()["stderr_lines"] == 20
+
+
+def test_stderr_sink_never_raises_on_hostile_input() -> None:
+    # Runs on the SDK reader task: raising here would disturb a live turn.
+    class _Explodes:
+        def __str__(self):
+            raise RuntimeError("boom")
+
+    session = ClaudeSession(ClaudeRuntime(), "sid")
+    session._record_stderr(_Explodes())
+    assert session.transport_diagnostics()["stderr_lines"] == 0
+
+
+def test_stderr_classes_cover_the_shapes_worth_telling_apart() -> None:
+    assert _classify_cli_stderr(["Error: rate limit exceeded"]) == "rate-limit"
+    assert _classify_cli_stderr(["Not logged in · Please run /login"]) == "auth"
+    assert _classify_cli_stderr(["request timed out"]) == "timeout"
+    assert _classify_cli_stderr(["certificate verify failed"]) == "tls"
+    assert _classify_cli_stderr(["something nobody enumerated"]) == "other"
+    assert _classify_cli_stderr([]) is None

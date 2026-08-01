@@ -12,6 +12,7 @@ runtime conformance suite pins.
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 import logging
@@ -100,6 +101,48 @@ _PERMISSION_MODES = frozenset(
 )
 _EFFORT_LEVELS = frozenset({"low", "medium", "high", "xhigh", "max"})
 _PREVIEW_SCAN_LIMIT = 50
+_STDERR_TAIL_LINES = 20
+_STDERR_LINE_CHARS = 400
+
+
+def _classify_cli_stderr(lines: Sequence[str]) -> str | None:
+    """Body-free error class for CLI stderr — never leak the payload.
+
+    Mirrors ``external_wait_monitor._classify_gh_error``: a stall report needs
+    the SHAPE of the failure, not its text. Provider stderr can echo prompts,
+    filesystem paths, or a credential the CLI was handed, and a log line is the
+    one place none of that may land.
+
+    ``None`` means the process said nothing at all — itself the most telling
+    answer when a turn produced no first event.
+    """
+    if not lines:
+        return None
+    text = " ".join(lines)[-_STDERR_LINE_CHARS:].casefold()
+    if "rate limit" in text or "ratelimit" in text or "too many requests" in text:
+        return "rate-limit"
+    if (
+        "not logged in" in text
+        or "unauthorized" in text
+        or "authentication" in text
+        or "invalid api key" in text
+    ):
+        return "auth"
+    if "certificate" in text or "ssl" in text or "tls handshake" in text:
+        return "tls"
+    if (
+        "econnreset" in text
+        or "econnrefused" in text
+        or "enotfound" in text
+        or "etimedout" in text
+        or "socket hang up" in text
+    ):
+        return "network"
+    if "timed out" in text or "timeout" in text:
+        return "timeout"
+    if "out of memory" in text or "enomem" in text or "heap" in text:
+        return "oom"
+    return "other"
 _BACKGROUND_TASK_STARTED = re.compile(
     r"\bbackground\s+(?:task\s+)?with\s+id\s*:\s*([A-Za-z0-9][A-Za-z0-9_.-]{0,255})",
     re.IGNORECASE,
@@ -196,6 +239,9 @@ class ClaudeSession:
         self._session_id: str | None = requested_session_id
         self._session_ready = asyncio.Event()
         self._client: SdkClient | None = None
+        # Bounded: a looping CLI must not grow the session. Only the tail is
+        # wanted anyway — the last thing the process said before going quiet.
+        self._stderr_tail: deque[str] = deque(maxlen=_STDERR_TAIL_LINES)
         self._reader_task: asyncio.Task[None] | None = None
         self._close_task: asyncio.Task[None] | None = None
         self._turn_lock: asyncio.Lock | None = None
@@ -301,6 +347,54 @@ class ClaudeSession:
                 if self._client is client:
                     self._client = None
                 self._runtime._forget_session(self)
+
+    # -- transport diagnostics ---------------------------------------------
+
+    def _record_stderr(self, line: object) -> None:
+        """Sink for the CLI's stderr.
+
+        Registering this is what makes the stderr exist at all: the SDK
+        transport pipes stderr only when a callback is set
+        (``stderr_dest = PIPE if self._options.stderr is not None else None``),
+        so without it the kernel discards whatever the process said on its way
+        out — the exact evidence an admission timeout needs (#846).
+
+        Runs on the SDK's reader task, so it must never disturb the turn. The
+        SDK already swallows callback exceptions; this does not rely on that.
+        """
+        try:
+            text = str(line).strip()
+        except Exception:  # pragma: no cover - defensive
+            return
+        if text:
+            self._stderr_tail.append(text[:_STDERR_LINE_CHARS])
+
+    def transport_diagnostics(self) -> dict[str, object]:
+        """Why the runtime went quiet, in body-free form.
+
+        Read this BEFORE the session is dropped: closing the client clears the
+        SDK transport, and the process exit code goes with it.
+
+        The exit code comes through private SDK attributes because the public
+        surface exposes it only by raising ``ProcessError`` on a call we are not
+        making here. Every hop is guarded — a diagnostic that raises while
+        reporting a failure is worse than no diagnostic.
+        """
+        lines = tuple(self._stderr_tail)
+        exit_code: object = None
+        try:
+            transport = getattr(self._client, "_transport", None)
+            exit_code = getattr(getattr(transport, "_process", None), "returncode", None)
+            if exit_code is None:
+                exit_error = getattr(transport, "_exit_error", None)
+                exit_code = getattr(exit_error, "exit_code", None)
+        except Exception:  # pragma: no cover - defensive
+            exit_code = None
+        return {
+            "exit_code": exit_code,
+            "stderr_class": _classify_cli_stderr(lines),
+            "stderr_lines": len(lines),
+        }
 
     # -- AgentSession protocol ---------------------------------------------
 
@@ -895,7 +989,11 @@ class ClaudeRuntime:
         # waiting for a frame that cannot arrive yet.
         session_id = request.session_id or str(uuid.uuid4())
         session = ClaudeSession(self, session_id)
-        options = self._build_options(request, session._handle_permission_request)
+        options = self._build_options(
+            request,
+            session._handle_permission_request,
+            stderr=session._record_stderr,
+        )
         if request.session_id is None:
             options.session_id = session_id
         client = self._sdk_client_factory(options)
@@ -916,7 +1014,11 @@ class ClaudeRuntime:
             await session.close()
 
     def _build_options(
-        self, request: SessionRequest, can_use_tool: CanUseTool
+        self,
+        request: SessionRequest,
+        can_use_tool: CanUseTool,
+        *,
+        stderr: Callable[[str], None] | None = None,
     ) -> ClaudeAgentOptions:
         # Fail closed on request fields this adapter cannot express through
         # the SDK: silently dropping a policy would weaken the boundary the
@@ -945,6 +1047,7 @@ class ClaudeRuntime:
             effort=effort,
             can_use_tool=can_use_tool,
             include_partial_messages=True,
+            stderr=stderr,
         )
         if self._settings is not None:
             self._apply_execution_profile(options, request)
