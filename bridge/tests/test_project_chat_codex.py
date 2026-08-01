@@ -2042,7 +2042,8 @@ async def test_terminal_stall_preserves_interrupt_cancel_abort_close_order(
         timeout=5,
     )
 
-    assert response.success is True
+    assert response.success is False
+    assert response.error == "Agent stopped before terminal completion"
     assert session.order == ["interrupt", "pending-cancel", "abort", "aclose"]
     assert session.iterator.close_calls == 1
 
@@ -2078,13 +2079,23 @@ async def test_cancellation_during_interrupt_reaps_read_before_iterator_close(
 async def test_codex_terminal_stall_releases_turn_and_queued_request_proceeds(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """RED for #411 C: text arrives, the completion event vanishes; the turn
-    must terminalize within the bounded grace and free the conversation."""
+    """Regression for #411 C/#840: text arrives, the completion event
+    vanishes; the partial turn is interrupted and frees the conversation."""
 
     stall = StallSession("thread-1")
     follow = FakeSession("thread-1")
     runtime = FakeRuntime([stall, follow])
     handler, stalled = _stall_handler(tmp_path, runtime, monkeypatch)
+    terminal_states: list[tuple[str, bool]] = []
+    duration_success: list[bool] = []
+    handler._ledger_finish = lambda _req, state, *, cleanup_done: terminal_states.append(
+        (state, cleanup_done)
+    )
+    handler._append_duration_log = (
+        lambda _req, *, session_id, duration_ms, success: duration_success.append(
+            success
+        )
+    )
 
     first_task = asyncio.create_task(handler.process_message("hang", 7, 70))
     await _wait_until(lambda: stall.messages == ["hang"])
@@ -2094,9 +2105,13 @@ async def test_codex_terminal_stall_releases_turn_and_queued_request_proceeds(
         asyncio.gather(first_task, queued_task), timeout=5
     )
 
-    assert first.success is True
+    assert first.success is False
+    assert first.error == "Agent stopped before terminal completion"
     assert "partial answer" in first.content
-    assert "closed automatically" in first.content
+    assert "partial output" in first.content
+    assert "interrupted automatically" in first.content
+    assert terminal_states == [("interrupted", True), ("completed", True)]
+    assert duration_success == [False, True]
     # The turn is interrupted and its abandoned generator is closed, so a late
     # completion event has no consumer left — the answer cannot deliver twice.
     assert stall.interrupt_calls == 1

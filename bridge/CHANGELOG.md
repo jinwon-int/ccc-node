@@ -24,6 +24,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the `gh-ci-wait` skill teaches agents the registration contract.
 
 ### Fixed
+- **Terminal-stall outcome integrity (#840).** A turn that emits partial text
+  but never produces its provider terminal event is now recorded as
+  `interrupted` with `success=False`, instead of being projected as a
+  successful completion. The partial output and explicit retry notice still
+  deliver exactly once, while session teardown, conversation FIFO release,
+  stalled-request health accounting, and queued follow-up progress retain
+  their existing bounded behavior.
 - **Autonomous budget isolation and dead-session skip visibility (#798).** The
   existing per-provider daily token settings now gate the already-persisted
   autonomous-mode ledger only, so interactive traffic remains recorded without
