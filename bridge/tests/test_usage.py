@@ -20,6 +20,7 @@ from telegram_bot.core.usage import (
     ModelUsage,
     UsageSnapshot,
     UsageWindow,
+    claude_endpoint_host,
     detect_claude_service,
     load_claude_status_snapshot,
     local_claude_environment_snapshot,
@@ -1218,3 +1219,73 @@ async def test_get_usage_synthesizes_weekly_window_from_meter(
     result = await handler.get_usage(1, 2, "claude-x")
     assert [w.label for w in result.windows] == ["Kimi 5-hour", "Kimi weekly"]
     assert result.windows[1].count_limit == 222908592
+
+
+# ---- endpoint host for stall diagnostics (#846) ---------------------------
+# `detect_claude_service` answers "which known vendor"; this answers "which host
+# did we actually talk to", which is the one a stall report needs. Everything it
+# returns lands in a log line, so the bar is: nothing that could be a secret.
+
+
+def test_claude_endpoint_host_reports_the_configured_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_service_env(monkeypatch)
+    assert claude_endpoint_host() == "anthropic-default"
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://API.Kimi.com/coding/")
+    assert claude_endpoint_host() == "api.kimi.com"
+    assert claude_endpoint_host("api.anthropic.com") == "api.anthropic.com"
+
+
+def test_claude_endpoint_host_drops_userinfo_and_port(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # `netloc` would keep `user:secret@` verbatim; `hostname` is why this uses
+    # the latter. A base URL is a plausible place for an operator to park
+    # credentials, and this value goes straight into a log.
+    _clear_service_env(monkeypatch)
+    resolved = claude_endpoint_host("https://user:s3cr3t@proxy.internal:8443/v1")
+    assert resolved == "proxy.internal"
+    assert "s3cr3t" not in resolved and "8443" not in resolved
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "not a url",
+        "sk-ant-api03-SOMETHINGSECRETSOMETHINGSECRET",
+        "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ012345.example.com",
+        "AKIAIOSFODNN7EXAMPLE",
+        "xoxb-123456789012.abcdefghij0123",
+        # A JWT is charset-legal and label-legal and `contains_credential` does
+        # not match it, so the public-suffix rule is what has to stop it.
+        "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.abcdefghijklmnopqrstuvwxyz012345",
+    ],
+)
+def test_claude_endpoint_host_refuses_token_shaped_values(
+    monkeypatch: pytest.MonkeyPatch, raw: str
+) -> None:
+    _clear_service_env(monkeypatch)
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", raw)
+    resolved = claude_endpoint_host()
+    assert resolved == "unparsable"
+    assert raw.casefold() not in resolved
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        ("http://localhost:8080", "localhost"),
+        ("http://10.0.0.5:8080", "10.0.0.5"),
+        ("https://[2001:db8::1]:443/v1", "2001:db8::1"),
+        ("https://xn--80ak6aa92e.com", "xn--80ak6aa92e.com"),
+    ],
+)
+def test_claude_endpoint_host_keeps_legitimate_non_dns_targets(
+    monkeypatch: pytest.MonkeyPatch, raw: str, expected: str
+) -> None:
+    # Self-hosted proxies are a real deployment; the token guard must not eat
+    # them just because they are not dotted public names.
+    _clear_service_env(monkeypatch)
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", raw)
+    assert claude_endpoint_host() == expected

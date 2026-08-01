@@ -56,6 +56,7 @@ from telegram_bot.core.request_lifecycle import (
     RequestPhase,
     TerminalAttemptKind,
 )
+from telegram_bot.core.usage import claude_endpoint_host
 from telegram_bot.core.usage_meter import MODE_INTERACTIVE
 from telegram_bot.core.sdk_text import TERMINAL_STALL_NOTICE
 from telegram_bot.utils.chat_logger import log_chat
@@ -64,6 +65,69 @@ from telegram_bot.utils.health import health_reporter
 logger = logging.getLogger(__name__)
 
 _DRAIN_RESPONSE = "Bridge restart is draining existing work; please retry shortly."
+
+
+def _elapsed_since(loop: Any, request: _PendingRequest) -> str:
+    """Seconds since the request was registered, or ``"?"`` if unknowable.
+
+    Deliberately wider than the admission deadline: ``started_at`` includes
+    session start and turn-lock wait, so a value far above the grace says the
+    turn was queued behind something, while a value at the grace says the
+    provider itself went quiet. Reporting only the grace hides that difference.
+    """
+    try:
+        started_at = getattr(request, "started_at", None)
+        if started_at is None:
+            return "?"
+        return f"{loop.time() - float(started_at):.1f}"
+    except Exception:  # pragma: no cover - defensive
+        return "?"
+
+
+def _admission_diagnostics(
+    session: Any,
+    *,
+    provider: object,
+    model: object,
+    elapsed: str,
+    grace: float,
+) -> dict[str, object]:
+    """Body-free account of a turn that never produced a first event.
+
+    Every field is either a bounded label or a number. The endpoint is a host,
+    never the raw ``ANTHROPIC_BASE_URL`` (which may carry userinfo), and the
+    CLI's stderr is reduced to a class by the runtime rather than quoted.
+
+    Fail-open by construction: this runs only on a path that is already
+    failing, so a diagnostic that raises would replace a useful warning with a
+    traceback. ``transport_diagnostics`` is optional — Codex sessions do not
+    have it, and neither do the test doubles.
+    """
+    details: dict[str, object] = {
+        "provider": provider or "unknown",
+        "model": model or "default",
+        "endpoint": "unknown",
+        "elapsed": elapsed,
+        "grace": grace,
+        "exit_code": None,
+        "stderr_class": None,
+        "stderr_lines": 0,
+    }
+    try:
+        details["endpoint"] = claude_endpoint_host()
+    except Exception:  # pragma: no cover - defensive
+        pass
+    try:
+        probe = getattr(session, "transport_diagnostics", None)
+        if callable(probe):
+            reported = probe()
+            if isinstance(reported, Mapping):
+                for field in ("exit_code", "stderr_class", "stderr_lines"):
+                    if field in reported:
+                        details[field] = reported[field]
+    except Exception:  # pragma: no cover - defensive
+        pass
+    return details
 
 
 def _claim_request_terminal(request: _PendingRequest, phase: RequestPhase, *, cause: str) -> bool:
@@ -736,6 +800,16 @@ class ProjectChatProcessMixin:
                 )
 
                 if turn_outcome is TurnStreamOutcome.ADMISSION_TIMEOUT:
+                    # Collected before the session is dropped: closing the
+                    # client tears down the SDK transport and takes the exit
+                    # code with it.
+                    diagnostics = _admission_diagnostics(
+                        session,
+                        provider=getattr(self._config, "agent_provider", "claude"),
+                        model=model,
+                        elapsed=_elapsed_since(loop, progress_request),
+                        grace=admission_grace,
+                    )
                     terminal_won = _claim_request_terminal(
                         progress_request,
                         RequestPhase.TIMEOUT,
@@ -745,9 +819,19 @@ class ProjectChatProcessMixin:
                         await self._drop_agent_session(key, session)
                     logger.warning(
                         "Turn admission timed out for user %s chat %s before the "
-                        "runtime produced its first event",
+                        "runtime produced its first event "
+                        "(provider=%s model=%s endpoint=%s elapsed=%ss grace=%gs "
+                        "exit_code=%s stderr_class=%s stderr_lines=%s)",
                         user_id,
                         chat_id,
+                        diagnostics["provider"],
+                        diagnostics["model"],
+                        diagnostics["endpoint"],
+                        diagnostics["elapsed"],
+                        admission_grace,
+                        diagnostics["exit_code"],
+                        diagnostics["stderr_class"],
+                        diagnostics["stderr_lines"],
                     )
                     try:
                         health_reporter.record_stalled_request()
