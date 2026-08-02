@@ -197,6 +197,14 @@ for cron_case in legacy wrong missing decoy; do
     '[ "$rc" = 0 ] && jq -e --arg reason "'"$reason"'" '\'' .nunchi.status == "degraded" and (.nunchi.reasons | index($reason)) != null '\'' >/dev/null <<<"$out"'
 done
 
+operator_cron="$probe_cron"$'\n43 4 * * * /opt/operator/mempalace sweep /srv/operator-archive'
+out="$(HOME="$probe_home" CCC_CLAUDE_DIR="$probe_claude" CCC_STATE_DIR="$probe_state" \
+  CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CCC_MEMORY_CHECK_NOW_EPOCH=200 \
+  CCC_NUNCHI_MEMPALACE_REPAIR_STATUS_TEXT="$repair_ok" \
+  CCC_NUNCHI_CRONTAB_TEXT="$operator_cron" bash "$ROOT/scripts/ccc-memory-check.sh" --json 2>&1)"; rc=$?
+ok "memory check ignores unrelated operator MemPalace sweep jobs" \
+  '[ "$rc" = 0 ] && jq -e '\'' .nunchi.status == "ok" and .mempalace.status == "ok" '\'' >/dev/null <<<"$out"'
+
 rm -f "$probe_nunchi/mempalace-refresh.status.json"
 out="$(HOME="$probe_home" CCC_CLAUDE_DIR="$probe_claude" CCC_STATE_DIR="$probe_state" \
   CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CCC_MEMORY_CHECK_NOW_EPOCH=200 \

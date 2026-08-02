@@ -67,6 +67,9 @@ if [ -n "$TARGET_USER" ] && [ "$TARGET_USER" != "$(id -un)" ]; then
     NUNCHI_HOME="$target_nunchi_home" NUNCHI_DB="${NUNCHI_DB:-$target_nunchi_home/facts.db}" \
     NUNCHI_SNAPSHOT="${NUNCHI_SNAPSHOT:-$target_nunchi_home/snapshot.md}" \
     CCC_NUNCHI_MEMPALACE_STATUS="$target_status" \
+    CCC_NUNCHI_MEMPALACE_CLI="${CCC_NUNCHI_MEMPALACE_CLI:-}" \
+    CCC_NUNCHI_TIMEOUT_CLI="${CCC_NUNCHI_TIMEOUT_CLI:-}" \
+    CCC_NUNCHI_FLOCK_CLI="${CCC_NUNCHI_FLOCK_CLI:-}" \
     CCC_NUNCHI_MEMPALACE_REFRESH_TIMEOUT_SEC="${CCC_NUNCHI_MEMPALACE_REFRESH_TIMEOUT_SEC:-3300}" \
     NUNCHI_SWEEP_DIR="${NUNCHI_SWEEP_DIR:-}" \
     bash "$0" "${ORIGINAL_ARGS[@]}"
@@ -76,6 +79,8 @@ CLAUDE_DIR="${CCC_CLAUDE_DIR:-$HOME/.claude}"
 STATE="${CCC_STATE_DIR:-$CLAUDE_DIR/state}"
 HOOKS="$CLAUDE_DIR/hooks/nunchi"
 NUNCHI_DIR="${NUNCHI_HOME:-$HOME/.nunchi}"
+NUNCHI_DB_PATH="${NUNCHI_DB:-$NUNCHI_DIR/facts.db}"
+NUNCHI_SNAPSHOT_PATH="${NUNCHI_SNAPSHOT:-$NUNCHI_DIR/snapshot.md}"
 MEMPALACE_STATUS="${CCC_NUNCHI_MEMPALACE_STATUS:-$NUNCHI_DIR/mempalace-refresh.status.json}"
 MEMPALACE_TIMEOUT="${CCC_NUNCHI_MEMPALACE_REFRESH_TIMEOUT_SEC:-3300}"
 MODE_FILE="$STATE/nunchi.mode"
@@ -241,26 +246,37 @@ case "$ACTION" in
       echo "Codex nunchi loader missing or unsafe at $HOOKS/codex-loader.py — run setup.sh first" >&2
       exit 2
     fi
-    retire_legacy
-    strip_cron
-    write_mode on
     feed="$HOOKS/ingest-cron.sh"
     [ "$resolved_provider" = "codex" ] && feed="$HOOKS/codex-feed.sh"
     bash_bin="$(command -v bash)"
-    append_cron_line "*/10 * * * * $(cron_quote "$bash_bin") $(cron_quote "$feed") >> $(cron_quote "$NUNCHI_DIR/cron.log") 2>&1 $MARK"
-    mp="$(command -v mempalace || true)"
+    mp="${CCC_NUNCHI_MEMPALACE_CLI:-}"
+    [ -n "$mp" ] || mp="$(command -v mempalace || true)"
     [ -z "$mp" ] && [ -x "$HOME/.local/bin/mempalace" ] && mp="$HOME/.local/bin/mempalace"
     default_sweep="$HOME/.claude/projects"
     [ "$resolved_provider" = "codex" ] && default_sweep="$HOME/.codex/sessions"
     sweep_dir="${NUNCHI_SWEEP_DIR:-$default_sweep}"
     refresh="$HOOKS/mempalace-refresh.sh"
+    refresh_ready=0
     if [ -n "$mp" ] && [ -f "$mp" ] && [ -x "$mp" ] && [ -d "$sweep_dir" ] && [ -x "$refresh" ]; then
-      append_cron_line "17 * * * * CCC_STATE_DIR=$(cron_quote "$STATE") NUNCHI_HOME=$(cron_quote "$NUNCHI_DIR") CCC_NUNCHI_MEMPALACE_STATUS=$(cron_quote "$MEMPALACE_STATUS") CCC_NUNCHI_MEMPALACE_REFRESH_TIMEOUT_SEC=$(cron_quote "$MEMPALACE_TIMEOUT") CCC_NUNCHI_MEMPALACE_CLI=$(cron_quote "$mp") $(cron_quote "$bash_bin") $(cron_quote "$refresh") $resolved_provider $(cron_quote "$sweep_dir") >> $(cron_quote "$NUNCHI_DIR/mempalace-sweep.cron.log") 2>&1 $MARK"
+      timeout_bin="${CCC_NUNCHI_TIMEOUT_CLI:-$(command -v timeout || true)}"
+      flock_bin="${CCC_NUNCHI_FLOCK_CLI:-$(command -v flock || true)}"
+      [ -n "$timeout_bin" ] && [ -f "$timeout_bin" ] && [ -x "$timeout_bin" ] \
+        || { echo "timeout command missing or unsafe — nunchi not enabled" >&2; exit 2; }
+      [ -n "$flock_bin" ] && [ -f "$flock_bin" ] && [ -x "$flock_bin" ] \
+        || { echo "flock command missing or unsafe — nunchi not enabled" >&2; exit 2; }
+      refresh_ready=1
+    fi
+    retire_legacy
+    strip_cron
+    write_mode on
+    append_cron_line "*/10 * * * * CCC_STATE_DIR=$(cron_quote "$STATE") NUNCHI_HOME=$(cron_quote "$NUNCHI_DIR") NUNCHI_DB=$(cron_quote "$NUNCHI_DB_PATH") NUNCHI_SNAPSHOT=$(cron_quote "$NUNCHI_SNAPSHOT_PATH") $(cron_quote "$bash_bin") $(cron_quote "$feed") >> $(cron_quote "$NUNCHI_DIR/cron.log") 2>&1 $MARK"
+    if [ "$refresh_ready" = 1 ]; then
+      append_cron_line "17 * * * * CCC_STATE_DIR=$(cron_quote "$STATE") NUNCHI_HOME=$(cron_quote "$NUNCHI_DIR") CCC_NUNCHI_MEMPALACE_STATUS=$(cron_quote "$MEMPALACE_STATUS") CCC_NUNCHI_MEMPALACE_REFRESH_TIMEOUT_SEC=$(cron_quote "$MEMPALACE_TIMEOUT") CCC_NUNCHI_MEMPALACE_CLI=$(cron_quote "$mp") CCC_NUNCHI_TIMEOUT_CLI=$(cron_quote "$timeout_bin") CCC_NUNCHI_FLOCK_CLI=$(cron_quote "$flock_bin") $(cron_quote "$bash_bin") $(cron_quote "$refresh") $resolved_provider $(cron_quote "$sweep_dir") >> $(cron_quote "$NUNCHI_DIR/mempalace-sweep.cron.log") 2>&1 $MARK"
       echo "mempalace hourly refresh cron added ($resolved_provider: $sweep_dir)"
     else
       echo "mempalace CLI, refresh hook or transcript dir missing — verbatim refresh cron skipped"
     fi
-    append_cron_line "7 8 * * 1 $(cron_quote "$bash_bin") $(cron_quote "$HOOKS/bench.sh") >> $(cron_quote "$NUNCHI_DIR/bench.cron.log") 2>&1 $MARK"
+    append_cron_line "7 8 * * 1 CCC_STATE_DIR=$(cron_quote "$STATE") NUNCHI_HOME=$(cron_quote "$NUNCHI_DIR") NUNCHI_DB=$(cron_quote "$NUNCHI_DB_PATH") NUNCHI_SNAPSHOT=$(cron_quote "$NUNCHI_SNAPSHOT_PATH") $(cron_quote "$bash_bin") $(cron_quote "$HOOKS/bench.sh") >> $(cron_quote "$NUNCHI_DIR/bench.cron.log") 2>&1 $MARK"
     echo "weekly bench cron added (Mon 08:07)"
     if [ "$resolved_provider" = "claude" ]; then
       set_sessionstart_hook add

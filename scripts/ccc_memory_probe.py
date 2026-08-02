@@ -284,7 +284,6 @@ def inspect_managed_cron(
     cron: str,
 ) -> tuple[str, int, list[tuple[str, str, dict[str, str]]], int, int]:
     commands = cron_commands(cron, managed_only=True)
-    all_commands = cron_commands(cron, managed_only=False)
     invocations = [command_invocation(command) for command in commands]
     codex_feeds = sum(is_bash_script(command, "codex-feed.sh") for command in invocations)
     claude_feeds = sum(is_bash_script(command, "ingest-cron.sh") for command in invocations)
@@ -300,7 +299,7 @@ def inspect_managed_cron(
     )
     legacy_sweep_count = sum(
         1
-        for command in all_commands
+        for command in commands
         for index, token in enumerate(command)
         if token_basename(token) == "mempalace"
         and index + 1 < len(command)

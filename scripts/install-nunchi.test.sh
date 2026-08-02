@@ -120,12 +120,12 @@ write_exec_stub "$fake_bin/flock" <<'SH'
 exit "${CCC_TEST_FLOCK_RC:-0}"
 SH
 printf '%s\n' '{"schema":"ccc.nunchi.mempalace-refresh.v1","provider":"codex","state":"running","exit_code":-1,"started_at":10,"finished_at":0}' > "$edge_status"
-run_edge_refresh CCC_TEST_FLOCK_RC=75 >/dev/null 2>&1; rc=$?
-ok "real lock contention is a no-op owned by the active process" \
+run_edge_refresh CCC_TEST_FLOCK_RC=75 CCC_NUNCHI_MEMPALACE_CLI="$TMP/missing-mempalace" >/dev/null 2>&1; rc=$?
+ok "real lock contention is a no-op before provider preflight" \
   '[ "$rc" = 0 ] && jq -e '\'' .state == "running" and .started_at == 10 '\'' "$edge_status" >/dev/null'
 run_edge_refresh CCC_TEST_FLOCK_RC=64 >/dev/null 2>&1; rc=$?
-ok "flock errors replace stale state with an error" \
-  '[ "$rc" = 2 ] && jq -e '\'' .state == "error" and .exit_code == 2 '\'' "$edge_status" >/dev/null'
+ok "flock errors cannot overwrite the active lock owner's state" \
+  '[ "$rc" = 2 ] && jq -e '\'' .state == "running" and .started_at == 10 '\'' "$edge_status" >/dev/null'
 rm -f "$fake_bin/flock"
 
 noflock_bin="$TMP/no-flock-bin"
@@ -138,8 +138,8 @@ HOME="$home" PATH="$noflock_bin" CCC_STATE_DIR="$state" NUNCHI_HOME="$nunchi_hom
   CCC_NUNCHI_MEMPALACE_STATUS="$edge_status" \
   CCC_NUNCHI_MEMPALACE_CLI="$home/.local/bin/mempalace" \
   /bin/bash "$hooks/nunchi/mempalace-refresh.sh" codex "$codex_home/sessions" >/dev/null 2>&1; rc=$?
-ok "missing flock fails closed and replaces a stale success" \
-  '[ "$rc" = 2 ] && jq -e '\'' .state == "error" and .exit_code == 2 '\'' "$edge_status" >/dev/null'
+ok "missing flock fails closed without writing unlocked status" \
+  '[ "$rc" = 2 ] && jq -e '\'' .state == "ok" and .started_at == 1 and .finished_at == 2 '\'' "$edge_status" >/dev/null'
 
 printf '%s\n' '{"schema":"ccc.nunchi.mempalace-refresh.v1","provider":"codex","state":"ok","exit_code":0,"started_at":1,"finished_at":2}' > "$edge_status"
 run_edge_refresh CCC_NUNCHI_MEMPALACE_CLI="$TMP/missing-mempalace" >/dev/null 2>&1; rc=$?
@@ -185,6 +185,8 @@ out="$(env "${common_env[@]}" PATH="$weird_mp_dir:/usr/bin:/bin" \
   CCC_NUNCHI_MEMPALACE_STATUS="$weird_status" NUNCHI_SWEEP_DIR="$weird_sweep" \
   bash "$ROOT/scripts/install-nunchi.sh" --apply --codex 2>&1)"; rc=$?
 refresh_line="$(grep 'mempalace-refresh.sh' "$cron_store")"
+feed_line="$(grep 'codex-feed.sh' "$cron_store")"
+bench_line="$(grep 'bench.sh' "$cron_store")"
 runtime_cmd="$(cut -d ' ' -f 6- <<<"$refresh_line")"
 runtime_cmd="${runtime_cmd% \# nunchi:#816}"
 # crond removes the escape that protects each literal percent before /bin/sh.
@@ -195,6 +197,8 @@ ok "generated refresh cron preserves restricted-PATH custom and Termux-style pat
   '[ "$rc" = 0 ] && [ "$cron_rc" = 0 ] && grep -q "CCC_NUNCHI_MEMPALACE_CLI=" <<<"$refresh_line" && grep -qx "mine $weird_sweep --mode convos" "$weird_capture" && jq -e '\'' .provider == "codex" and .state == "ok" '\'' "$weird_status" >/dev/null && [ "$(stat -c %a "$weird_status")" = 600 ]'
 ok "generated cron protects quotes, percent and semicolon from splitting or injection" \
   'grep -q '\''\\%'\'' <<<"$refresh_line" && [ "$(grep -c "mempalace-refresh.sh" "$cron_store")" = 1 ]'
+ok "generated feed and bench cron retain the installed state and nunchi paths" \
+  'for line in "$feed_line" "$bench_line"; do grep -q "CCC_STATE_DIR=" <<<"$line" && grep -q "NUNCHI_HOME=" <<<"$line" && grep -q "NUNCHI_DB=" <<<"$line" && grep -q "NUNCHI_SNAPSHOT=" <<<"$line" || exit 1; done'
 
 # Restore the ordinary fixture before provider-switch assertions.
 out="$(run_install --apply --codex 2>&1)"; rc=$?
@@ -227,6 +231,12 @@ ok "--remove immediately rolls Codex back to canonical memory" \
   '[ "$rc" = 0 ] && [ "$materialize_rc" = 0 ] && [ "$(cat "$state/nunchi.mode")" = off ] && grep -q "INSTALLER_BASE_SENTINEL" "$codex_home/AGENTS.md" && ! grep -q "INSTALLER_NUNCHI_SENTINEL" "$codex_home/AGENTS.md"'
 ok "--remove strips managed cron and standalone hook state while retaining the DB" \
   '[ "$(grep -c "nunchi:#816" "$cron_store" || true)" = 0 ] && grep -qxF "$unrelated_sweep" "$cron_store" && ! grep -q "nunchi/sessionstart.sh" "$claude_dir/settings.local.json" && [ -s "$nunchi_home/facts.db" ]'
+
+cron_before_dependency_failure="$(cat "$cron_store")"
+out="$(env "${common_env[@]}" CCC_NUNCHI_TIMEOUT_CLI="$TMP/missing-timeout" \
+  bash "$ROOT/scripts/install-nunchi.sh" --apply --codex 2>&1)"; rc=$?
+ok "refresh dependency failure leaves mode and existing cron untouched" \
+  '[ "$rc" = 2 ] && [ "$(cat "$state/nunchi.mode")" = off ] && [ "$(cat "$cron_store")" = "$cron_before_dependency_failure" ]'
 
 rm -f "$hooks/nunchi/codex-loader.py"
 out="$(run_install --apply --codex 2>&1)"; rc=$?
@@ -278,10 +288,17 @@ write_exec_stub "$fake_bin/runuser" <<'SH'
 printf '%s\n' "$@" > "${CCC_TEST_RUNUSER_CAPTURE:?}"
 SH
 capture="$TMP/runuser.args"
+target_mp="$TMP/target-tools/mempalace"
+target_timeout="$TMP/target-tools/timeout"
+target_flock="$TMP/target-tools/flock"
 out="$(HOME="$home" PATH="$fake_bin:/usr/bin:/bin" CCC_TEST_RUNUSER_CAPTURE="$capture" \
-  GH_TOKEN=DO_NOT_FORWARD bash "$ROOT/scripts/install-nunchi.sh" --apply --target-user worker --codex 2>&1)"; rc=$?
+  CCC_NUNCHI_MEMPALACE_CLI="$target_mp" CCC_NUNCHI_TIMEOUT_CLI="$target_timeout" \
+  CCC_NUNCHI_FLOCK_CLI="$target_flock" GH_TOKEN=DO_NOT_FORWARD \
+  bash "$ROOT/scripts/install-nunchi.sh" --apply --target-user worker --codex 2>&1)"; rc=$?
 ok "target-user re-exec uses a minimal environment and never forwards ambient credentials" \
   '[ "$rc" = 0 ] && grep -qx -- "-i" "$capture" && grep -q "HOME=$target_home" "$capture" && ! grep -q "DO_NOT_FORWARD\|GH_TOKEN" "$capture"'
+ok "target-user re-exec preserves explicit refresh tool paths" \
+  'grep -qx "CCC_NUNCHI_MEMPALACE_CLI=$target_mp" "$capture" && grep -qx "CCC_NUNCHI_TIMEOUT_CLI=$target_timeout" "$capture" && grep -qx "CCC_NUNCHI_FLOCK_CLI=$target_flock" "$capture"'
 
 out="$(HOME="$home" PATH="$fake_bin:/usr/bin:/bin" bash "$ROOT/scripts/install-nunchi.sh" --apply --target-user bad/user 2>&1)"; rc=$?
 ok "target-user rejects unsafe account names before re-exec" \

@@ -61,6 +61,30 @@ finally:
 PY
 }
 
+# Never write provider status until this process owns the single-writer lock.
+flock_cli="${CCC_NUNCHI_FLOCK_CLI:-$(command -v flock || true)}"
+if [ -z "$flock_cli" ] || [ ! -f "$flock_cli" ] || [ ! -x "$flock_cli" ]; then
+  echo "flock command missing" >&2
+  exit 2
+fi
+if ! exec 9>"$lock_file"; then
+  echo "mempalace lock unavailable" >&2
+  exit 2
+fi
+
+set +e
+"$flock_cli" -n -E 75 9
+lock_rc=$?
+set -e
+if [ "$lock_rc" = 75 ]; then
+  # The lock owner is responsible for the current running/final status.
+  exit 0
+fi
+if [ "$lock_rc" != 0 ]; then
+  echo "mempalace lock error" >&2
+  exit 2
+fi
+
 started="$(date +%s)"
 preflight_error() {
   local rc="${1:-2}"
@@ -68,7 +92,7 @@ preflight_error() {
   return "$rc"
 }
 
-# Every failure after mode-on replaces a stale success with a bounded error.
+# Every preflight failure owned by this lock replaces stale success.
 if [ -z "$target" ] || [ ! -d "$target" ]; then
   echo "transcript directory missing" >&2
   preflight_error 2
@@ -85,32 +109,9 @@ if [ -z "$mp" ] || [ ! -f "$mp" ] || [ ! -x "$mp" ]; then
   preflight_error 2
   exit $?
 fi
-if ! command -v timeout >/dev/null 2>&1; then
+timeout_cli="${CCC_NUNCHI_TIMEOUT_CLI:-$(command -v timeout || true)}"
+if [ -z "$timeout_cli" ] || [ ! -f "$timeout_cli" ] || [ ! -x "$timeout_cli" ]; then
   echo "timeout command missing" >&2
-  preflight_error 2
-  exit $?
-fi
-if ! command -v flock >/dev/null 2>&1; then
-  echo "flock command missing" >&2
-  preflight_error 2
-  exit $?
-fi
-if ! exec 9>"$lock_file"; then
-  echo "mempalace lock unavailable" >&2
-  preflight_error 2
-  exit $?
-fi
-
-set +e
-flock -n -E 75 9
-lock_rc=$?
-set -e
-if [ "$lock_rc" = 75 ]; then
-  # The lock owner is responsible for the current running/final status.
-  exit 0
-fi
-if [ "$lock_rc" != 0 ]; then
-  echo "mempalace lock error" >&2
   preflight_error 2
   exit $?
 fi
@@ -119,9 +120,9 @@ write_status running -1 "$started" 0
 cd "$HOME"
 set +e
 if [ "$provider" = codex ]; then
-  timeout -k 30s "$timeout_sec" "$mp" mine "$target" --mode convos
+  "$timeout_cli" -k 30s "$timeout_sec" "$mp" mine "$target" --mode convos
 else
-  timeout -k 30s "$timeout_sec" "$mp" sweep "$target"
+  "$timeout_cli" -k 30s "$timeout_sec" "$mp" sweep "$target"
 fi
 rc=$?
 set -e
