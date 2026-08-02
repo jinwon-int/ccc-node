@@ -1349,6 +1349,7 @@ def run_execute(data, task_id, at_value, as_json):  # noqa: C901 -- #348 baselin
     ok = False
     rc = 1
     one_shot_disabled = False
+    persist_error = None
     try:
         try:
             headless = run_headless(task)
@@ -1406,7 +1407,19 @@ def run_execute(data, task_id, at_value, as_json):  # noqa: C901 -- #348 baselin
         # added or edited in the meantime.
         # `enabled` may also have been cleared by apply_run_limit, not just by
         # one-shot completion; both are the run's own decision.
-        commit_run_state(task_id, task, disable=task.get('enabled') is False)
+        #
+        # A throw here must NOT escape run_execute. The headless work and the
+        # owner notification have already happened; letting the exception reach
+        # run_dry_plan's blanket handler reported the whole call as
+        # {'mode': 'run-dry-run-read-only', 'taskId': None} -- an executed,
+        # notified run recorded as a read-only dry run. Worse, lastRunAt/
+        # runCount stay unwritten, so the next scheduler tick sees the same
+        # occurrence as never-run and executes (and notifies) it again.
+        # Report the persist failure against the real mode instead.
+        try:
+            commit_run_state(task_id, task, disable=task.get('enabled') is False)
+        except Exception as e:
+            persist_error = short_text(str(e))
     finally:
         release = release_for_run(task_id, run_id)
     result = {
@@ -1422,6 +1435,14 @@ def run_execute(data, task_id, at_value, as_json):  # noqa: C901 -- #348 baselin
         'runLimit': run_limit,
         'mutations': mutation_flags(True, headless is not None, headless is not None, notification.get('delivery') == 'spooled', True),
     }
+    if persist_error is not None:
+        # The run really happened; only its durable record failed. Surface it
+        # loudly (non-zero rc) so the operator repairs the store instead of
+        # letting the next tick re-execute this occurrence.
+        result['ok'] = False
+        result['persistError'] = persist_error
+        result['status'] = 'persist-failed'
+        rc = 1
     if not release.get('ok'):
         result['ok'] = False
         result['releaseError'] = release

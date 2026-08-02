@@ -114,6 +114,16 @@ ok "restart failure exits non-zero" '[ "$rc" = 7 ] && grep -q "failed to restart
 ok "restart failure audit is explicit and names the degraded service" \
   'grep -q "\"result\":\"restart-failures\"" "$STATE/self-update.log" && grep -q "\"name\":\"bad-unit\",\"ok\":false" "$STATE/self-update.log"'
 ok "failure notification queued" 'jq -r .text "$TMP/spool"/*SelfUpdate*.json 2>/dev/null | grep -q "재시작 실패"'
+# A restart failure is a half-apply (harness on NEW_SHA, service down), so the
+# recovery snapshot must SURVIVE for the operator to roll back from. Before
+# #869 it was deleted before the restarts even ran, leaving nothing to recover
+# with. Retention is deliberate here and only here; drop it afterwards so the
+# later "no residue" invariant still means what it says.
+ok "restart failure retains the recovery snapshot for rollback" \
+  'compgen -G "$STATE/self-update-install-rollback.*" >/dev/null'
+ok "restart failure names the retained snapshot to the operator" \
+  'grep -q "recovery snapshot" <<<"$out"'
+rm -rf "$STATE"/self-update-install-rollback.*
 
 # --- 4) setup.sh failure rolls back --------------------------------------------
 OLD_HEAD="$(git -C "$REPO" rev-parse HEAD)"
