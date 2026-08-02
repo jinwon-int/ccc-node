@@ -187,7 +187,13 @@ class ManualClaudeSdkClient:
             )
         )
 
-    def emit_task_updated(self, task_id: str, status: str) -> None:
+    def emit_task_updated(
+        self,
+        task_id: str,
+        status: str,
+        *,
+        expose_status: bool = True,
+    ) -> None:
         patch = {"status": status}
         data = {
             "type": "system",
@@ -202,7 +208,7 @@ class ManualClaudeSdkClient:
                 data=data,
                 task_id=task_id,
                 patch=patch,
-                status=status,  # type: ignore[arg-type]
+                status=status if expose_status else None,  # type: ignore[arg-type]
                 session_id=self.session_id,
             )
         )
@@ -449,12 +455,105 @@ class ClaudeRuntimeUnsolicitedTests(unittest.IsolatedAsyncioTestCase):
             (0, 0.0),
         )
 
+    async def test_patch_only_terminal_update_releases_background_work(self) -> None:
+        session, client = await self._start_session()
+        client.emit_task_started("patch-only", "local_bash")
+        client.emit_task_updated("patch-only", "completed", expose_status=False)
+        await self._drain(client)
+
+        self.assertEqual(
+            session.background_workload_snapshot(asyncio.get_running_loop().time()),
+            (0, 0.0),
+        )
+
+    async def test_terminal_and_roster_levels_block_delayed_start_resurrection(
+        self,
+    ) -> None:
+        session, client = await self._start_session()
+
+        # A terminal edge can overtake a buffered start after reconnect/replay.
+        client.emit_task_notification("terminal-first")
+        client.emit_task_started("terminal-first", "local_bash")
+        client.emit(
+            SystemMessage(
+                subtype="background_tasks_changed",
+                data={
+                    "tasks": [
+                        {"task_id": "terminal-first", "task_type": "local_bash"}
+                    ]
+                },
+            )
+        )
+        await self._drain(client)
+        self.assertEqual(
+            session.background_workload_snapshot(asyncio.get_running_loop().time()),
+            (0, 0.0),
+        )
+
+        # A level-triggered empty roster is also terminal evidence for an id it
+        # removed; a delayed duplicate start must not re-add it.
+        client.emit_task_started("roster-removed", "local_bash")
+        await self._drain(client)
+        self.assertEqual(
+            session.background_workload_snapshot(asyncio.get_running_loop().time())[0],
+            1,
+        )
+        client.emit(SystemMessage(subtype="background_tasks_changed", data={"tasks": []}))
+        client.emit_task_started("roster-removed", "local_bash")
+        await self._drain(client)
+        self.assertEqual(
+            session.background_workload_snapshot(asyncio.get_running_loop().time()),
+            (0, 0.0),
+        )
+
+    async def test_generic_system_task_frames_remain_a_compatibility_fallback(
+        self,
+    ) -> None:
+        session, client = await self._start_session()
+        client.emit(
+            SystemMessage(
+                subtype="task_started",
+                data={"task_id": "generic-task", "task_type": "local_bash"},
+            )
+        )
+        client.emit(
+            SystemMessage(
+                subtype="task_updated",
+                data={
+                    "task_id": "generic-task",
+                    "patch": {"status": "completed"},
+                },
+            )
+        )
+        await self._drain(client)
+
+        self.assertEqual(
+            session.background_workload_snapshot(asyncio.get_running_loop().time()),
+            (0, 0.0),
+        )
+
+    async def test_background_task_ids_use_one_bounded_normalization_rule(self) -> None:
+        session, client = await self._start_session()
+        for task_id in ("   ", "bad/id", "x" * 257):
+            client.emit_task_started(task_id, "local_bash")
+        client.emit_task_started("  valid-id  ", "local_bash")
+        await self._drain(client)
+        self.assertEqual(set(session._background_tasks), {"valid-id"})
+
+        client.emit_task_notification("valid-id")
+        await self._drain(client)
+        self.assertEqual(
+            session.background_workload_snapshot(asyncio.get_running_loop().time()),
+            (0, 0.0),
+        )
+
     async def test_background_roster_preserves_retained_and_adopts_unseen_shells(
         self,
     ) -> None:
         session, client = await self._start_session()
-        retained_started = asyncio.get_running_loop().time() - 30.0
-        session._background_tasks["retained"] = retained_started
+        client.emit_task_started("retained", "local_bash")
+        await self._drain(client)
+        retained_started = session._background_tasks["retained"]
 
         client.emit(
             SystemMessage(
@@ -513,6 +612,22 @@ class ClaudeRuntimeUnsolicitedTests(unittest.IsolatedAsyncioTestCase):
             SystemMessage(
                 subtype="background_tasks_changed",
                 data={"tasks": [{"task_id": "missing-type"}]},
+            )
+        )
+        client.emit(
+            SystemMessage(
+                subtype="background_tasks_changed",
+                data={"tasks": [{"task_id": "   ", "task_type": "local_bash"}]},
+            )
+        )
+        client.emit(
+            SystemMessage(
+                subtype="background_tasks_changed",
+                data={
+                    "tasks": [
+                        {"task_id": "x" * 257, "task_type": "local_bash"}
+                    ]
+                },
             )
         )
         await self._drain(client)
