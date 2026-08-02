@@ -280,6 +280,44 @@ def is_bash_script(command: list[str], script: str) -> bool:
     )
 
 
+_MANAGED_ENV_KEYS = (
+    "CCC_STATE_DIR",
+    "NUNCHI_HOME",
+    "NUNCHI_DB",
+    "NUNCHI_SNAPSHOT",
+    "CCC_NUNCHI_MEMPALACE_STATUS",
+    "CCC_NUNCHI_MEMPALACE_CLI",
+)
+
+
+def managed_cron_environment(cron: str) -> tuple[dict[str, str], list[str]]:
+    """Recover path configuration shared by recognized managed commands."""
+
+    commands = cron_commands(cron, managed_only=True)
+    environments = [
+        command_environment(tokens)
+        for tokens in commands
+        if any(
+            is_bash_script(command_invocation(tokens), script)
+            for script in (
+                "codex-feed.sh",
+                "ingest-cron.sh",
+                "mempalace-refresh.sh",
+                "bench.sh",
+            )
+        )
+    ]
+    recovered: dict[str, str] = {}
+    conflicts: list[str] = []
+    for key in _MANAGED_ENV_KEYS:
+        values = {environment[key] for environment in environments if environment.get(key)}
+        if len(values) == 1:
+            recovered[key] = values.pop()
+        elif len(values) > 1:
+            conflicts.append(key)
+    return recovered, conflicts
+
+
 def inspect_managed_cron(
     cron: str,
 ) -> tuple[str, int, list[tuple[str, str, dict[str, str]]], int, int]:
@@ -333,6 +371,8 @@ def nunchi_readiness_reasons(
     bench_count: int,
     standalone: int,
     ttl: int,
+    refresh_contract_required: bool,
+    configuration_conflicts: list[str],
 ) -> list[str]:
     reasons: list[str] = []
     if not hook_installed:
@@ -345,14 +385,17 @@ def nunchi_readiness_reasons(
         reasons.append("facts-empty-stale")
     if feed_count != 1:
         reasons.append("feed-count")
-    if len(refreshes) != 1:
-        reasons.append("refresh-count")
-    if legacy_sweep_count != 0:
-        reasons.append("legacy-sweep")
-    if len(refreshes) == 1 and refreshes[0][0] != feed_kind:
-        reasons.append("refresh-provider-arg")
-    if len(refreshes) == 1 and not refreshes[0][1]:
-        reasons.append("refresh-target-arg")
+    if refresh_contract_required:
+        if len(refreshes) != 1:
+            reasons.append("refresh-count")
+        if legacy_sweep_count != 0:
+            reasons.append("legacy-sweep")
+        if len(refreshes) == 1 and refreshes[0][0] != feed_kind:
+            reasons.append("refresh-provider-arg")
+        if len(refreshes) == 1 and not refreshes[0][1]:
+            reasons.append("refresh-target-arg")
+    if configuration_conflicts:
+        reasons.append("cron-env-conflict")
     if bench_count != 1:
         reasons.append("bench-count")
     if feed_kind == "codex" and standalone:
@@ -363,7 +406,18 @@ def nunchi_readiness_reasons(
 
 
 def probe_nunchi(
-    state: Path, claude: Path, nunchi_home: Path, ttl: int, now: int
+    state: Path,
+    claude: Path,
+    nunchi_home: Path,
+    db_path: Path,
+    snapshot: Path,
+    cron: str,
+    ttl: int,
+    now: int,
+    *,
+    mempalace_required: bool,
+    mempalace_cli_installed: bool,
+    configuration_conflicts: list[str],
 ) -> tuple[dict[str, object], str, str, int, int, dict[str, str]]:
     mode_file = state / "nunchi.mode"
     try:
@@ -371,13 +425,11 @@ def probe_nunchi(
     except OSError:
         mode = "off"
 
-    db_path = nunchi_home / "facts.db"
     db_integrity, facts = (
         sqlite_probe(db_path, "SELECT COUNT(*) FROM peer_facts")
         if mode == "on"
         else ("skipped", 0)
     )
-    snapshot = nunchi_home / "snapshot.md"
     snapshot_bytes = snapshot.stat().st_size if snapshot.is_file() else 0
     snapshot_primary = False
     if mode == "on":
@@ -390,11 +442,17 @@ def probe_nunchi(
         except OSError:
             pass
 
-    cron = crontab_text() if mode == "on" else ""
+    cron = cron if mode == "on" else ""
     feed_kind, feed_count, refreshes, legacy_sweep_count, bench_count = (
         inspect_managed_cron(cron)
     )
     managed_refresh_count = len(refreshes)
+    refresh_contract_required = (
+        mempalace_required
+        or mempalace_cli_installed
+        or managed_refresh_count != 0
+        or legacy_sweep_count != 0
+    )
     standalone = standalone_hook_count(claude / "settings.local.json") if mode == "on" else 0
     hook_installed = (claude / "hooks/nunchi/nunchi.py").is_file()
 
@@ -413,6 +471,8 @@ def probe_nunchi(
             bench_count=bench_count,
             standalone=standalone,
             ttl=ttl,
+            refresh_contract_required=refresh_contract_required,
+            configuration_conflicts=configuration_conflicts,
         )
         nunchi_status = "ok" if not nunchi_reasons else "degraded"
     else:
@@ -458,6 +518,31 @@ def probe_nunchi(
     )
 
 
+def is_mempalace_required(home: Path) -> bool:
+    prefix = os.environ.get("PREFIX") or ""
+    default_required = "/com.termux/" not in prefix and not str(home).startswith(
+        "/data/data/"
+    )
+    required_raw = (os.environ.get("CCC_NUNCHI_MEMPALACE_REQUIRED") or "").lower()
+    return default_required if not required_raw else required_raw not in {
+        "0",
+        "false",
+        "off",
+        "no",
+    }
+
+
+def resolve_mempalace_cli(home: Path, environment: dict[str, str]) -> Path:
+    configured_cli = os.environ.get("CCC_NUNCHI_MEMPALACE_CLI") or environment.get(
+        "CCC_NUNCHI_MEMPALACE_CLI"
+    )
+    mp_cli = Path(configured_cli) if configured_cli else home / ".local/bin/mempalace"
+    if not configured_cli and not mp_cli.is_file():
+        found = shutil.which("mempalace")
+        mp_cli = Path(found) if found else mp_cli
+    return mp_cli
+
+
 def probe_mempalace(
     home: Path,
     nunchi_home: Path,
@@ -469,20 +554,8 @@ def probe_mempalace(
     ttl: int,
     now: int,
 ) -> dict[str, object]:
-    prefix = os.environ.get("PREFIX") or ""
-    default_required = "/com.termux/" not in prefix and not str(home).startswith("/data/data/")
-    required_raw = (os.environ.get("CCC_NUNCHI_MEMPALACE_REQUIRED") or "").lower()
-    required = default_required if not required_raw else required_raw not in {
-        "0", "false", "off", "no"
-    }
-    configured_cli = (
-        os.environ.get("CCC_NUNCHI_MEMPALACE_CLI")
-        or refresh_environment.get("CCC_NUNCHI_MEMPALACE_CLI")
-    )
-    mp_cli = Path(configured_cli) if configured_cli else home / ".local/bin/mempalace"
-    if not configured_cli and not mp_cli.is_file():
-        found = shutil.which("mempalace")
-        mp_cli = Path(found) if found else mp_cli
+    required = is_mempalace_required(home)
+    mp_cli = resolve_mempalace_cli(home, refresh_environment)
     palace = home / ".mempalace/palace/chroma.sqlite3"
     mp_integrity, embeddings = (
         sqlite_probe(palace, "SELECT COUNT(*) FROM embeddings")
@@ -526,7 +599,12 @@ def probe_mempalace(
             if legacy_sweep_count != 0:
                 mp_reasons.append("legacy-sweep")
         refresh_status = str(refresh["status"])
-        refresh_age = int(refresh["age_seconds"])
+        refresh_age_raw = refresh["age_seconds"]
+        refresh_age = (
+            refresh_age_raw
+            if isinstance(refresh_age_raw, int) and not isinstance(refresh_age_raw, bool)
+            else -1
+        )
         if refresh_status in {"error", "invalid", "missing"}:
             mp_reasons.append("refresh-" + refresh_status)
         elif refresh_status in {"running", "ok"} and refresh_age > ttl:
@@ -551,12 +629,34 @@ def probe_mempalace(
 
 def main() -> int:
     home = Path(os.environ.get("HOME") or "/root")
-    state = Path(os.environ.get("CCC_STATE_DIR") or home / ".claude/state")
+    cron = crontab_text()
+    managed_environment, configuration_conflicts = managed_cron_environment(cron)
+    state = Path(
+        os.environ.get("CCC_STATE_DIR")
+        or managed_environment.get("CCC_STATE_DIR")
+        or home / ".claude/state"
+    )
     claude = Path(os.environ.get("CCC_CLAUDE_DIR") or home / ".claude")
-    nunchi_home = Path(os.environ.get("NUNCHI_HOME") or home / ".nunchi")
+    nunchi_home = Path(
+        os.environ.get("NUNCHI_HOME")
+        or managed_environment.get("NUNCHI_HOME")
+        or home / ".nunchi"
+    )
+    db_path = Path(
+        os.environ.get("NUNCHI_DB")
+        or managed_environment.get("NUNCHI_DB")
+        or nunchi_home / "facts.db"
+    )
+    snapshot = Path(
+        os.environ.get("NUNCHI_SNAPSHOT")
+        or managed_environment.get("NUNCHI_SNAPSHOT")
+        or nunchi_home / "snapshot.md"
+    )
     ttl = int(os.environ.get("CCC_MEMORY_CACHE_TTL_SEC") or "21600")
     now_raw = os.environ.get("CCC_MEMORY_CHECK_NOW_EPOCH") or ""
     now = int(now_raw) if now_raw.isdigit() else int(time.time())
+    required = is_mempalace_required(home)
+    mp_cli = resolve_mempalace_cli(home, managed_environment)
     (
         nunchi,
         mode,
@@ -564,7 +664,20 @@ def main() -> int:
         managed_refresh_count,
         legacy_sweep_count,
         refresh_environment,
-    ) = probe_nunchi(state, claude, nunchi_home, ttl, now)
+    ) = probe_nunchi(
+        state,
+        claude,
+        nunchi_home,
+        db_path,
+        snapshot,
+        cron,
+        ttl,
+        now,
+        mempalace_required=required,
+        mempalace_cli_installed=mp_cli.is_file(),
+        configuration_conflicts=configuration_conflicts,
+    )
+    mempalace_environment = {**managed_environment, **refresh_environment}
     payload = {
         "nunchi": nunchi,
         "mempalace": probe_mempalace(
@@ -574,7 +687,7 @@ def main() -> int:
             provider,
             managed_refresh_count,
             legacy_sweep_count,
-            refresh_environment,
+            mempalace_environment,
             ttl,
             now,
         ),

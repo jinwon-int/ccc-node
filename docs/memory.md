@@ -101,6 +101,15 @@ repair-status` drawer comparison. Missing, failed, stale, malformed, or
 provider-mismatched refreshes and any unknown or divergent index state degrade
 readiness even when SQLite is readable and recently touched.
 
+The readiness probe resolves `CCC_STATE_DIR`, `NUNCHI_HOME`, `NUNCHI_DB`, and
+`NUNCHI_SNAPSHOT` from the current process first, then from the recognized
+managed cron entries. Conflicting managed values fail closed instead of
+silently checking a stale default file. On Termux, MemPalace remains optional:
+when no CLI and no managed refresh or legacy sweep is present, feed and bench
+readiness is evaluated without requiring a refresh. Linux nodes require the
+refresh contract by default; `CCC_NUNCHI_MEMPALACE_REQUIRED` remains the
+explicit policy override.
+
 The launcher runs `materialize` before the real Codex CLI and finishes with `exec`, preserving argv, cwd, stdio, exit status, and signals. A refresh error may use a structurally valid private last snapshot; if `status` is not ready, launch fails closed with exit 78. Configure the underlying binary with `CCC_CODEX_REAL_CLI_PATH` (default `codex`), while `CCC_CODEX_CLI_PATH` points to the installed `ccc-codex` wrapper.
 
 The Telegram Codex runtime invokes the same materializer before every `thread/start` or `thread/resume`. In `audience-scoped` mode, the bridge resolves the Telegram route to an opaque scope and owns a separate app-server with `CODEX_HOME` and `CODEX_SQLITE_HOME` fixed at `CCC_MEMORY_AUDIENCE_ROOT/<scope>/codex`. The materializer accepts scoped mode only when those paths, the private/shared scope label, and `CCC_CODEX_AUDIENCE_AUTH_MODE=keyring` all match exactly. Codex credentials must be provisioned in the operating-system keyring; ccc-node never copies `auth.json` or injects an access token. Session browsing remains disabled on the pooled runtime until browsing commands carry a route audience. `CCC_CODEX_MEMORY_MATERIALIZER_PATH` and `CCC_CODEX_MEMORY_BOOTSTRAP_TIMEOUT_SEC` control the thread-boundary bootstrap. `ccc-memory-check.sh --json` exposes the body-free result under `.codex`.

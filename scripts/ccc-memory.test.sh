@@ -74,6 +74,62 @@ ok "memory check reports healthy nunchi and MemPalace scalars" '[ "$rc" = 0 ] &&
 '\'' >/dev/null <<<"$out"'
 ok "memory readiness JSON never exposes snapshot, fact or refresh bodies" '! grep -q "PROBE_SECRET_BODY\|PROBE_SECRET_FACT\|PROBE_SECRET_REFRESH" <<<"$out"'
 
+custom_nunchi_store="$TMP/custom-nunchi-store"
+mkdir -p "$custom_nunchi_store"
+cp "$probe_nunchi/facts.db" "$custom_nunchi_store/facts.db"
+cp "$probe_nunchi/snapshot.md" "$custom_nunchi_store/snapshot.md"
+custom_path_cron="*/10 * * * * NUNCHI_DB=$custom_nunchi_store/facts.db NUNCHI_SNAPSHOT=$custom_nunchi_store/snapshot.md bash /tmp/codex-feed.sh # nunchi:#816"
+custom_path_cron+=$'\n17 * * * * bash /tmp/mempalace-refresh.sh codex /tmp/sessions # nunchi:#816'
+custom_path_cron+=$'\n'"7 8 * * 1 NUNCHI_DB=$custom_nunchi_store/facts.db NUNCHI_SNAPSHOT=$custom_nunchi_store/snapshot.md bash /tmp/bench.sh # nunchi:#816"
+mv "$probe_nunchi/facts.db" "$probe_nunchi/facts.db.default"
+mv "$probe_nunchi/snapshot.md" "$probe_nunchi/snapshot.md.default"
+out="$(HOME="$probe_home" CCC_CLAUDE_DIR="$probe_claude" CCC_STATE_DIR="$probe_state" \
+  CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" \
+  CCC_MEMORY_CHECK_NOW_EPOCH=200 CCC_NUNCHI_MEMPALACE_REPAIR_STATUS_TEXT="$repair_ok" \
+  CCC_NUNCHI_CRONTAB_TEXT="$custom_path_cron" bash "$ROOT/scripts/ccc-memory-check.sh" --json 2>&1)"; rc=$?
+ok "memory check recovers custom DB and snapshot paths from managed cron" '[ "$rc" = 0 ] && jq -e '\''
+  .nunchi.status == "ok" and .nunchi.db.integrity == "ok" and .nunchi.db.facts == 1
+  and .nunchi.snapshot.primary_header == true
+'\'' >/dev/null <<<"$out"'
+mv "$probe_nunchi/facts.db.default" "$probe_nunchi/facts.db"
+mv "$probe_nunchi/snapshot.md.default" "$probe_nunchi/snapshot.md"
+
+conflicting_path_cron="*/10 * * * * NUNCHI_DB=$custom_nunchi_store/facts.db bash /tmp/codex-feed.sh # nunchi:#816"
+conflicting_path_cron+=$'\n17 * * * * bash /tmp/mempalace-refresh.sh codex /tmp/sessions # nunchi:#816'
+conflicting_path_cron+=$'\n'"7 8 * * 1 NUNCHI_DB=$probe_nunchi/facts.db bash /tmp/bench.sh # nunchi:#816"
+out="$(HOME="$probe_home" CCC_CLAUDE_DIR="$probe_claude" CCC_STATE_DIR="$probe_state" \
+  CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" \
+  CCC_MEMORY_CHECK_NOW_EPOCH=200 CCC_NUNCHI_MEMPALACE_REPAIR_STATUS_TEXT="$repair_ok" \
+  CCC_NUNCHI_CRONTAB_TEXT="$conflicting_path_cron" bash "$ROOT/scripts/ccc-memory-check.sh" --json 2>&1)"; rc=$?
+ok "conflicting managed cron paths fail readiness closed" \
+  '[ "$rc" = 0 ] && jq -e '\'' .nunchi.status == "degraded" and (.nunchi.reasons | index("cron-env-conflict")) != null '\'' >/dev/null <<<"$out"'
+
+printf 'not-a-sqlite-database\n' > "$custom_nunchi_store/broken.db"
+out="$(HOME="$probe_home" CCC_CLAUDE_DIR="$probe_claude" CCC_STATE_DIR="$probe_state" \
+  NUNCHI_DB="$custom_nunchi_store/broken.db" NUNCHI_SNAPSHOT="$custom_nunchi_store/snapshot.md" \
+  CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" \
+  CCC_MEMORY_CHECK_NOW_EPOCH=200 CCC_NUNCHI_MEMPALACE_REPAIR_STATUS_TEXT="$repair_ok" \
+  CCC_NUNCHI_CRONTAB_TEXT="$probe_cron" bash "$ROOT/scripts/ccc-memory-check.sh" --json 2>&1)"; rc=$?
+ok "custom DB failure cannot be masked by a healthy default database" \
+  '[ "$rc" = 0 ] && jq -e '\'' .nunchi.status == "degraded" and .nunchi.db.integrity == "error" and (.nunchi.reasons | index("db-error")) != null '\'' >/dev/null <<<"$out"'
+
+optional_cron=$'*/10 * * * * bash /tmp/codex-feed.sh # nunchi:#816\n7 8 * * 1 bash /tmp/bench.sh # nunchi:#816'
+out="$(HOME="$probe_home" PREFIX="/data/data/com.termux/files/usr" \
+  CCC_NUNCHI_MEMPALACE_CLI="$TMP/missing-mempalace" \
+  CCC_CLAUDE_DIR="$probe_claude" CCC_STATE_DIR="$probe_state" \
+  CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" \
+  CCC_MEMORY_CHECK_NOW_EPOCH=200 CCC_NUNCHI_CRONTAB_TEXT="$optional_cron" \
+  bash "$ROOT/scripts/ccc-memory-check.sh" --json 2>&1)"; rc=$?
+ok "Termux without optional MemPalace accepts feed and bench only" \
+  '[ "$rc" = 0 ] && jq -e '\'' .nunchi.status == "ok" and .nunchi.cron.managed_refresh_count == 0 and .mempalace.status == "optional" and .mempalace.required == false '\'' >/dev/null <<<"$out"'
+out="$(HOME="$probe_home" CCC_NUNCHI_MEMPALACE_CLI="$TMP/missing-mempalace" \
+  CCC_CLAUDE_DIR="$probe_claude" CCC_STATE_DIR="$probe_state" \
+  CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" \
+  CCC_MEMORY_CHECK_NOW_EPOCH=200 CCC_NUNCHI_CRONTAB_TEXT="$optional_cron" \
+  bash "$ROOT/scripts/ccc-memory-check.sh" --json 2>&1)"; rc=$?
+ok "Linux still requires the managed MemPalace refresh contract" \
+  '[ "$rc" = 0 ] && jq -e '\'' .nunchi.status == "degraded" and (.nunchi.reasons | index("refresh-count")) != null and .mempalace.status == "degraded" and .mempalace.required == true '\'' >/dev/null <<<"$out"'
+
 printf '%s\n' '{"schema":"ccc.nunchi.mempalace-refresh.v1","provider":"codex","state":"error","exit_code":17,"started_at":180,"finished_at":190,"detail":"PROBE_SECRET_REFRESH_ERROR"}' > "$probe_nunchi/mempalace-refresh.status.json"
 out="$(HOME="$probe_home" CCC_CLAUDE_DIR="$probe_claude" CCC_STATE_DIR="$probe_state" \
   CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CCC_MEMORY_CHECK_NOW_EPOCH=200 \
