@@ -21,7 +21,7 @@ fake_bin="$TMP/bin"
 cron_store="$TMP/crontab"
 mkdir -p "$hooks/nunchi" "$state" "$codex_home/sessions" \
   "$home/.claude/projects" "$home/.local/bin" "$nunchi_home" "$fake_bin"
-cp "$ROOT"/claude/hooks/nunchi/{codex-loader.py,nunchi.py,codex-feed.sh,ingest-cron.sh,bench.sh,bench-qset.tsv,sessionstart.sh} "$hooks/nunchi/"
+cp "$ROOT"/claude/hooks/nunchi/{codex-loader.py,nunchi.py,codex-feed.sh,ingest-cron.sh,bench.sh,bench-qset.tsv,sessionstart.sh,mempalace-refresh.sh} "$hooks/nunchi/"
 cp "$ROOT/claude/hooks/scan-injection.sh" "$hooks/scan-injection.sh"
 chmod 700 "$hooks/nunchi/codex-loader.py" "$hooks/nunchi/nunchi.py" "$hooks/scan-injection.sh"
 chmod 755 "$hooks/nunchi"/*.sh
@@ -41,6 +41,7 @@ cat > "$claude_dir/settings.local.json" <<JSON
 JSON
 
 write_exec_stub "$home/.local/bin/mempalace" <<'SH'
+[ -z "${CCC_TEST_MEMPALACE_CAPTURE:-}" ] || printf '%s\n' "$*" > "$CCC_TEST_MEMPALACE_CAPTURE"
 exit 0
 SH
 write_exec_stub "$fake_bin/crontab" <<'SH'
@@ -77,9 +78,15 @@ out="$(run_install --apply --codex 2>&1)"; rc=$?
 ok "--apply --codex enables an owner-only mode marker" \
   '[ "$rc" = 0 ] && [ "$(cat "$state/nunchi.mode")" = on ] && [ "$(stat -c %a "$state/nunchi.mode")" = 600 ]'
 ok "Codex apply writes one feed, sweep and bench cron" \
-  '[ "$(grep -c "nunchi:#816" "$cron_store")" = 3 ] && grep -q "codex-feed.sh" "$cron_store" && grep -q "$codex_home/sessions" "$cron_store"'
+  '[ "$(grep -c "nunchi:#816" "$cron_store")" = 3 ] && grep -q "codex-feed.sh" "$cron_store" && grep -q "mempalace-refresh.sh codex $codex_home/sessions" "$cron_store"'
 ok "Codex apply removes standalone nunchi hooks but preserves the canonical loader" \
   '! grep -q "nunchi/sessionstart.sh" "$claude_dir/settings.local.json" && grep -q "load-memory.sh" "$claude_dir/settings.local.json"'
+refresh_capture="$TMP/codex-refresh.args"
+CCC_TEST_MEMPALACE_CAPTURE="$refresh_capture" HOME="$home" \
+  PATH="/usr/bin:/bin" CCC_STATE_DIR="$state" NUNCHI_HOME="$nunchi_home" \
+  bash "$hooks/nunchi/mempalace-refresh.sh" codex "$codex_home/sessions" >/dev/null 2>&1; rc=$?
+ok "Codex refresh uses the native incremental conversation miner" \
+  '[ "$rc" = 0 ] && grep -qx "mine $codex_home/sessions --mode convos" "$refresh_capture" && jq -e '\''.provider == "codex" and .state == "ok" and .exit_code == 0'\'' "$nunchi_home/mempalace-refresh.status.json" >/dev/null'
 
 printf '%s' 'INSTALLER_NUNCHI_SENTINEL' > "$nunchi_home/snapshot.md"
 chmod 600 "$nunchi_home/snapshot.md"
@@ -94,9 +101,15 @@ ok "Codex reapply is cron-idempotent" \
 
 out="$(run_install --apply --claude 2>&1)"; rc=$?
 ok "provider change atomically rewires feed and sweep to Claude" \
-  '[ "$rc" = 0 ] && grep -q "ingest-cron.sh" "$cron_store" && grep -q "$home/.claude/projects" "$cron_store" && ! grep -q "codex-feed.sh" "$cron_store"'
+  '[ "$rc" = 0 ] && grep -q "ingest-cron.sh" "$cron_store" && grep -q "mempalace-refresh.sh claude $home/.claude/projects" "$cron_store" && ! grep -q "codex-feed.sh" "$cron_store"'
 ok "Claude apply owns exactly one standalone nunchi hook" \
   '[ "$(grep -c "$hooks/nunchi/sessionstart.sh" "$claude_dir/settings.local.json")" = 1 ] && grep -q "load-memory.sh" "$claude_dir/settings.local.json"'
+refresh_capture="$TMP/claude-refresh.args"
+CCC_TEST_MEMPALACE_CAPTURE="$refresh_capture" HOME="$home" \
+  PATH="/usr/bin:/bin" CCC_STATE_DIR="$state" NUNCHI_HOME="$nunchi_home" \
+  bash "$hooks/nunchi/mempalace-refresh.sh" claude "$home/.claude/projects" >/dev/null 2>&1; rc=$?
+ok "Claude refresh retains message-granular sweep" \
+  '[ "$rc" = 0 ] && grep -qx "sweep $home/.claude/projects" "$refresh_capture" && jq -e '\''.provider == "claude" and .state == "ok" and .exit_code == 0'\'' "$nunchi_home/mempalace-refresh.status.json" >/dev/null'
 
 rm -rf "$home/.claude/projects"
 out="$(run_install --apply 2>&1)"; rc=$?

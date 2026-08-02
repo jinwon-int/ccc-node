@@ -229,11 +229,12 @@ case "$ACTION" in
     default_sweep="$HOME/.claude/projects"
     [ "$resolved_provider" = "codex" ] && default_sweep="$HOME/.codex/sessions"
     sweep_dir="${NUNCHI_SWEEP_DIR:-$default_sweep}"
-    if [ -n "$mp" ] && [ -d "$sweep_dir" ]; then
-      append_cron_line "17 * * * * $mp sweep $sweep_dir >> $HOME/.nunchi/mempalace-sweep.cron.log 2>&1 $MARK"
-      echo "mempalace hourly sweep cron added ($sweep_dir)"
+    refresh="$HOOKS/mempalace-refresh.sh"
+    if [ -n "$mp" ] && [ -d "$sweep_dir" ] && [ -x "$refresh" ]; then
+      append_cron_line "17 * * * * bash $refresh $resolved_provider $sweep_dir >> $HOME/.nunchi/mempalace-sweep.cron.log 2>&1 $MARK"
+      echo "mempalace hourly refresh cron added ($resolved_provider: $sweep_dir)"
     else
-      echo "mempalace CLI or transcript dir missing — verbatim sweep cron skipped"
+      echo "mempalace CLI, refresh hook or transcript dir missing — verbatim refresh cron skipped"
     fi
     append_cron_line "7 8 * * 1 bash $HOOKS/bench.sh >> $HOME/.nunchi/bench.cron.log 2>&1 $MARK"
     echo "weekly bench cron added (Mon 08:07)"

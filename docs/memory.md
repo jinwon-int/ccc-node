@@ -81,6 +81,20 @@ cron entries. The nunchi code and local database remain in place, while the next
 Codex materialization falls back to canonical `load-memory.sh`. This wiring does
 not claim completion of pilot or gate-3 observation.
 
+### Managed MemPalace refresh
+
+The nunchi installer schedules `hooks/nunchi/mempalace-refresh.sh` once per
+hour. Claude nodes retain MemPalace's message-level `sweep`; Codex nodes use
+incremental `mine --mode convos`, the MemPalace 3.6 path that understands
+Codex `event_msg` JSONL. The wrapper runs from the runtime user's home, prevents
+overlap with `flock`, bounds each refresh to 55 minutes, and writes only a
+body-free result to `~/.nunchi/mempalace-refresh.status.json`.
+
+`ccc-memory-check.sh --json` reports that result and the read-only
+`mempalace repair-status` drawer index comparison. A failed or stale refresh,
+or a SQLite/HNSW divergence, degrades MemPalace readiness even when the SQLite
+row count and database mtime still look healthy.
+
 The launcher runs `materialize` before the real Codex CLI and finishes with `exec`, preserving argv, cwd, stdio, exit status, and signals. A refresh error may use a structurally valid private last snapshot; if `status` is not ready, launch fails closed with exit 78. Configure the underlying binary with `CCC_CODEX_REAL_CLI_PATH` (default `codex`), while `CCC_CODEX_CLI_PATH` points to the installed `ccc-codex` wrapper.
 
 The Telegram Codex runtime invokes the same materializer before every `thread/start` or `thread/resume`. In `audience-scoped` mode, the bridge resolves the Telegram route to an opaque scope and owns a separate app-server with `CODEX_HOME` and `CODEX_SQLITE_HOME` fixed at `CCC_MEMORY_AUDIENCE_ROOT/<scope>/codex`. The materializer accepts scoped mode only when those paths, the private/shared scope label, and `CCC_CODEX_AUDIENCE_AUTH_MODE=keyring` all match exactly. Codex credentials must be provisioned in the operating-system keyring; ccc-node never copies `auth.json` or injects an access token. Session browsing remains disabled on the pooled runtime until browsing commands carry a route audience. `CCC_CODEX_MEMORY_MATERIALIZER_PATH` and `CCC_CODEX_MEMORY_BOOTSTRAP_TIMEOUT_SEC` control the thread-boundary bootstrap. `ccc-memory-check.sh --json` exposes the body-free result under `.codex`.

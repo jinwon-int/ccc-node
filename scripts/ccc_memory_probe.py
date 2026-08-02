@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -64,9 +65,109 @@ def standalone_hook_count(settings: Path) -> int:
     )
 
 
+def parse_repair_status(text: str) -> dict[str, object]:
+    result: dict[str, object] = {
+        "status": "unknown",
+        "sqlite_count": -1,
+        "hnsw_count": -1,
+        "divergence": -1,
+    }
+    if "Palace is initialized but empty" in text:
+        result["status"] = "empty"
+        return result
+    in_drawers = False
+    for raw in text.splitlines():
+        line = raw.strip()
+        if line == "[drawers]":
+            in_drawers = True
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            in_drawers = False
+        if not in_drawers:
+            continue
+        match = re.fullmatch(r"sqlite count:\s*([0-9,]+)", line)
+        if match:
+            result["sqlite_count"] = int(match.group(1).replace(",", ""))
+            continue
+        match = re.fullmatch(r"hnsw count:\s*([0-9,]+)", line)
+        if match:
+            result["hnsw_count"] = int(match.group(1).replace(",", ""))
+            continue
+        match = re.fullmatch(r"divergence:\s*([0-9,]+)", line)
+        if match:
+            result["divergence"] = int(match.group(1).replace(",", ""))
+            continue
+        match = re.fullmatch(r"status:\s*([A-Z]+)", line)
+        if match:
+            result["status"] = match.group(1).lower()
+    return result
+
+
+def mempalace_index_probe(mp_cli: Path, home: Path) -> dict[str, object]:
+    override = os.environ.get("CCC_NUNCHI_MEMPALACE_REPAIR_STATUS_TEXT")
+    if override is not None:
+        return parse_repair_status(override)
+    try:
+        result = subprocess.run(
+            [str(mp_cli), "repair-status"],
+            cwd=home,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return {"status": "timeout", "sqlite_count": -1, "hnsw_count": -1, "divergence": -1}
+    except OSError:
+        return {"status": "error", "sqlite_count": -1, "hnsw_count": -1, "divergence": -1}
+    if result.returncode != 0:
+        return {"status": "error", "sqlite_count": -1, "hnsw_count": -1, "divergence": -1}
+    return parse_repair_status(result.stdout + "\n" + result.stderr)
+
+
+def mempalace_refresh_probe(path: Path, now: int) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "status": "missing",
+        "provider": "unknown",
+        "exit_code": -1,
+        "age_seconds": -1,
+    }
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return payload
+    except (OSError, json.JSONDecodeError):
+        payload["status"] = "invalid"
+        return payload
+    if not isinstance(doc, dict) or doc.get("schema") != "ccc.nunchi.mempalace-refresh.v1":
+        payload["status"] = "invalid"
+        return payload
+    state = doc.get("state")
+    provider = doc.get("provider")
+    exit_code = doc.get("exit_code")
+    started = doc.get("started_at")
+    finished = doc.get("finished_at")
+    if (
+        state not in {"running", "ok", "error"}
+        or provider not in {"claude", "codex"}
+        or not isinstance(exit_code, int)
+        or not isinstance(started, int)
+        or not isinstance(finished, int)
+    ):
+        payload["status"] = "invalid"
+        return payload
+    reference = finished if finished > 0 else started
+    return {
+        "status": state,
+        "provider": provider,
+        "exit_code": exit_code,
+        "age_seconds": max(0, now - reference) if reference > 0 else -1,
+    }
+
+
 def probe_nunchi(
     state: Path, claude: Path, nunchi_home: Path, ttl: int, now: int
-) -> tuple[dict[str, object], str, int]:
+) -> tuple[dict[str, object], str, int, str]:
     mode_file = state / "nunchi.mode"
     try:
         mode = mode_file.read_text(encoding="utf-8").strip()
@@ -98,7 +199,12 @@ def probe_nunchi(
     claude_feeds = sum("ingest-cron.sh" in line for line in marker_lines)
     feed_count = codex_feeds + claude_feeds
     feed_kind = "codex" if codex_feeds else ("claude" if claude_feeds else "missing")
-    sweep_count = sum("mempalace" in line and " sweep " in line for line in marker_lines)
+    managed_refresh_count = sum("mempalace-refresh.sh" in line for line in marker_lines)
+    legacy_sweep_count = sum(
+        "mempalace-refresh.sh" not in line and "mempalace" in line and " sweep " in line
+        for line in marker_lines
+    )
+    sweep_count = managed_refresh_count + legacy_sweep_count
     bench_count = sum("bench.sh" in line for line in marker_lines)
     standalone = standalone_hook_count(claude / "settings.local.json") if mode == "on" else 0
     hook_installed = (claude / "hooks/nunchi/nunchi.py").is_file()
@@ -148,13 +254,23 @@ def probe_nunchi(
             "feed": feed_kind,
             "feed_count": feed_count,
             "sweep_count": sweep_count,
+            "managed_refresh_count": managed_refresh_count,
+            "legacy_sweep_count": legacy_sweep_count,
             "bench_count": bench_count,
         },
     }
-    return payload, mode, sweep_count
+    return payload, mode, sweep_count, feed_kind
 
 
-def probe_mempalace(home: Path, mode: str, sweep_count: int, now: int) -> dict[str, object]:
+def probe_mempalace(
+    home: Path,
+    nunchi_home: Path,
+    mode: str,
+    provider: str,
+    sweep_count: int,
+    ttl: int,
+    now: int,
+) -> dict[str, object]:
     prefix = os.environ.get("PREFIX") or ""
     default_required = "/com.termux/" not in prefix and not str(home).startswith("/data/data/")
     required_raw = (os.environ.get("CCC_NUNCHI_MEMPALACE_REQUIRED") or "").lower()
@@ -171,6 +287,12 @@ def probe_mempalace(home: Path, mode: str, sweep_count: int, now: int) -> dict[s
         if mode == "on"
         else ("skipped", 0)
     )
+    index = (
+        mempalace_index_probe(mp_cli, home)
+        if mode == "on" and mp_cli.is_file() and palace.is_file()
+        else {"status": "skipped", "sqlite_count": -1, "hnsw_count": -1, "divergence": -1}
+    )
+    refresh = mempalace_refresh_probe(nunchi_home / "mempalace-refresh.status.json", now)
     mp_reasons: list[str] = []
     if mode != "on":
         mp_status = "off"
@@ -183,8 +305,22 @@ def probe_mempalace(home: Path, mode: str, sweep_count: int, now: int) -> dict[s
             mp_reasons.append("palace-" + mp_integrity)
         elif embeddings == 0:
             mp_reasons.append("embeddings-empty")
+        if index["status"] == "diverged":
+            mp_reasons.append("index-diverged")
+        elif index["status"] in {"error", "timeout"}:
+            mp_reasons.append("index-" + str(index["status"]))
         if required and mp_cli.is_file() and sweep_count != 1:
             mp_reasons.append("sweep-count")
+        refresh_status = str(refresh["status"])
+        refresh_age = int(refresh["age_seconds"])
+        if refresh_status in {"error", "invalid"}:
+            mp_reasons.append("refresh-" + refresh_status)
+        elif refresh_status in {"running", "ok"} and refresh_age > ttl:
+            mp_reasons.append("refresh-stale")
+        elif refresh_status == "missing" and age_seconds(palace, now) > ttl:
+            mp_reasons.append("refresh-missing")
+        if refresh_status != "missing" and refresh["provider"] != provider:
+            mp_reasons.append("refresh-provider")
         mp_status = "ok" if not mp_reasons else "degraded"
 
     return {
@@ -196,6 +332,8 @@ def probe_mempalace(home: Path, mode: str, sweep_count: int, now: int) -> dict[s
         "integrity": mp_integrity,
         "embeddings": embeddings,
         "age_seconds": age_seconds(palace, now),
+        "index": index,
+        "refresh": refresh,
     }
 
 
@@ -207,10 +345,12 @@ def main() -> int:
     ttl = int(os.environ.get("CCC_MEMORY_CACHE_TTL_SEC") or "21600")
     now_raw = os.environ.get("CCC_MEMORY_CHECK_NOW_EPOCH") or ""
     now = int(now_raw) if now_raw.isdigit() else int(time.time())
-    nunchi, mode, sweep_count = probe_nunchi(state, claude, nunchi_home, ttl, now)
+    nunchi, mode, sweep_count, provider = probe_nunchi(state, claude, nunchi_home, ttl, now)
     payload = {
         "nunchi": nunchi,
-        "mempalace": probe_mempalace(home, mode, sweep_count, now),
+        "mempalace": probe_mempalace(
+            home, nunchi_home, mode, provider, sweep_count, ttl, now
+        ),
     }
     print(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
     return 0
