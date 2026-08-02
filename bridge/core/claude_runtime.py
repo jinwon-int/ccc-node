@@ -517,6 +517,26 @@ class ClaudeSession:
             return message.patch.get("status")
         return None
 
+    def _observe_background_task_system_message(self, message: SystemMessage) -> None:
+        if message.subtype == "background_tasks_changed":
+            self._reconcile_background_task_roster(message.data)
+            return
+        # Compatibility fallback for SDK parsers/stubs that preserve the raw
+        # SystemMessage instead of constructing a typed subclass.
+        data = message.data
+        if message.subtype == "task_started":
+            if data.get("task_type") == "local_bash":
+                self._track_background_task_start(data.get("task_id"))
+            return
+        if message.subtype == "task_notification":
+            self._finish_background_task(data.get("task_id"))
+            return
+        if message.subtype == "task_updated":
+            patch = data.get("patch")
+            status = patch.get("status") if isinstance(patch, Mapping) else None
+            if status in SDK_TERMINAL_TASK_STATUSES:
+                self._finish_background_task(data.get("task_id"))
+
     def _observe_background_task_notifications(self, message: Message) -> None:
         if isinstance(message, TaskStartedMessage):
             if message.task_type == "local_bash":
@@ -531,24 +551,7 @@ class ClaudeSession:
                 self._finish_background_task(message.task_id)
             return
         if isinstance(message, SystemMessage):
-            if message.subtype == "background_tasks_changed":
-                self._reconcile_background_task_roster(message.data)
-                return
-            # Compatibility fallback for SDK parsers/stubs that preserve the
-            # raw SystemMessage instead of constructing a typed subclass.
-            data = message.data
-            if message.subtype == "task_started":
-                if data.get("task_type") == "local_bash":
-                    self._track_background_task_start(data.get("task_id"))
-                return
-            if message.subtype == "task_notification":
-                self._finish_background_task(data.get("task_id"))
-                return
-            if message.subtype == "task_updated":
-                patch = data.get("patch")
-                status = patch.get("status") if isinstance(patch, Mapping) else None
-                if status in SDK_TERMINAL_TASK_STATUSES:
-                    self._finish_background_task(data.get("task_id"))
+            self._observe_background_task_system_message(message)
             return
         if not isinstance(message, UserMessage):
             return
