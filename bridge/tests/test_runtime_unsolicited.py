@@ -506,6 +506,22 @@ class ClaudeRuntimeUnsolicitedTests(unittest.IsolatedAsyncioTestCase):
             (0, 0.0),
         )
 
+    async def test_terminal_ids_survive_more_than_1024_replayed_completions(
+        self,
+    ) -> None:
+        session, client = await self._start_session()
+
+        client.emit_task_notification("old-terminal")
+        for index in range(1025):
+            client.emit_task_notification(f"newer-terminal-{index}")
+        client.emit_task_started("old-terminal", "local_bash")
+        await self._drain(client)
+
+        self.assertEqual(
+            session.background_workload_snapshot(asyncio.get_running_loop().time()),
+            (0, 0.0),
+        )
+
     async def test_generic_system_task_frames_remain_a_compatibility_fallback(
         self,
     ) -> None:
@@ -764,6 +780,56 @@ class ClaudeRuntimeUnsolicitedTests(unittest.IsolatedAsyncioTestCase):
             [event.text for event in events if isinstance(event, TextDeltaEvent)],
             ["all delegated work finished"],
         )
+        self.assertIsInstance(events[-1], CompletionEvent)
+
+    async def test_terminal_before_start_does_not_reopen_delegated_work(self) -> None:
+        session, client = await self._start_session()
+        client.turn_scripts.append("hang")
+        events_task = asyncio.create_task(
+            _collect(session.send_turn("terminal frames were replayed first"))
+        )
+        await _wait_until(
+            lambda: client.queries == ["terminal frames were replayed first"]
+        )
+
+        client.emit_task_notification("typed-agent")
+        client.emit_task_updated("typed-workflow", "completed")
+        client.emit(
+            SystemMessage(
+                subtype="task_notification",
+                data={"task_id": "generic-agent", "status": "completed"},
+            )
+        )
+        client.emit(
+            SystemMessage(
+                subtype="task_updated",
+                data={
+                    "task_id": "generic-workflow",
+                    "patch": {"status": "killed"},
+                },
+            )
+        )
+
+        client.emit_task_started("typed-agent", "local_agent")
+        client.emit_task_started("typed-workflow", "local_workflow")
+        client.emit(
+            SystemMessage(
+                subtype="task_started",
+                data={"task_id": "generic-agent", "task_type": "local_agent"},
+            )
+        )
+        client.emit(
+            SystemMessage(
+                subtype="task_started",
+                data={
+                    "task_id": "generic-workflow",
+                    "task_type": "local_workflow",
+                },
+            )
+        )
+        client.emit_result(result="replayed delegated work is already terminal")
+
+        events = await asyncio.wait_for(events_task, timeout=2.0)
         self.assertIsInstance(events[-1], CompletionEvent)
 
     async def test_permission_callback_is_not_rebound_across_turn_generation(self) -> None:

@@ -152,7 +152,6 @@ _BACKGROUND_TASK_STARTED = re.compile(
     re.IGNORECASE,
 )
 _SAFE_TASK_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,255}$")
-_BACKGROUND_TASK_TERMINAL_TOMBSTONE_LIMIT = 1024
 _BACKGROUND_TASK_FINISHED = re.compile(
     r"<task-notification>.*?<task-id>([^<]{1,256})</task-id>.*?"
     r"<status>(completed|failed|stopped|killed|canceled|cancelled|timed_out|timeout)"
@@ -248,6 +247,10 @@ class _ActiveTurn:
     # local work is still running.  Keep the exact turn/generation alive until
     # those tasks settle and their continuation emits the run-ending result.
     result_deferring_tasks: set[str] = field(default_factory=set)
+    # Terminal lifecycle frames can overtake a buffered start.  This ledger is
+    # scoped to one turn, so retaining every validated id until completion is
+    # both finite and necessary to prevent a late start from re-opening it.
+    result_deferring_terminal_tasks: set[str] = field(default_factory=set)
     completion_deferral_observed: bool = False
 
 
@@ -295,10 +298,11 @@ class ClaudeSession:
         # output body enters health.json.
         self._background_tasks: dict[str, float] = {}
         # Terminal frames and level-triggered rosters may overtake a buffered
-        # start.  Remember a bounded set of finished ids so a late edge cannot
-        # resurrect completed provider work and poison workload health again.
+        # start.  Remember finished ids for this provider session so an
+        # arbitrary replay window cannot resurrect completed provider work.
+        # The session lifecycle, plus the validated 256-byte id bound, owns the
+        # storage boundary; correctness must not depend on an eviction count.
         self._background_task_terminal_ids: set[str] = set()
-        self._background_task_terminal_order: deque[str] = deque()
         self._sdk_frame_observer: SdkFrameObserver | None = None
 
     # -- lifecycle ---------------------------------------------------------
@@ -501,13 +505,6 @@ class ClaudeSession:
         if task_id in self._background_task_terminal_ids:
             return
         self._background_task_terminal_ids.add(task_id)
-        self._background_task_terminal_order.append(task_id)
-        while (
-            len(self._background_task_terminal_order)
-            > _BACKGROUND_TASK_TERMINAL_TOMBSTONE_LIMIT
-        ):
-            evicted = self._background_task_terminal_order.popleft()
-            self._background_task_terminal_ids.discard(evicted)
 
     @staticmethod
     def _task_update_status(message: TaskUpdatedMessage) -> object:
@@ -779,7 +776,11 @@ class ClaudeSession:
 
         if isinstance(message, TaskStartedMessage):
             task_id = _normalize_task_id(message.task_id)
-            if task_id is not None and message.task_type in _RESULT_DEFERRING_TASK_TYPES:
+            if (
+                task_id is not None
+                and task_id not in active.result_deferring_terminal_tasks
+                and message.task_type in _RESULT_DEFERRING_TASK_TYPES
+            ):
                 active.result_deferring_tasks.add(task_id)
             return
         if isinstance(message, TaskNotificationMessage):
@@ -787,6 +788,7 @@ class ClaudeSession:
             # of which terminal spelling the SDK carries.
             task_id = _normalize_task_id(message.task_id)
             if task_id is not None:
+                active.result_deferring_terminal_tasks.add(task_id)
                 active.result_deferring_tasks.discard(task_id)
             return
         if isinstance(message, TaskUpdatedMessage):
@@ -796,6 +798,7 @@ class ClaudeSession:
                 and ClaudeSession._task_update_status(message)
                 in SDK_TERMINAL_TASK_STATUSES
             ):
+                active.result_deferring_terminal_tasks.add(task_id)
                 active.result_deferring_tasks.discard(task_id)
             return
         if not isinstance(message, SystemMessage):
@@ -805,16 +808,21 @@ class ClaudeSession:
         if task_id is None:
             return
         if message.subtype == "task_started":
-            if data.get("task_type") in _RESULT_DEFERRING_TASK_TYPES:
+            if (
+                task_id not in active.result_deferring_terminal_tasks
+                and data.get("task_type") in _RESULT_DEFERRING_TASK_TYPES
+            ):
                 active.result_deferring_tasks.add(task_id)
             return
         if message.subtype == "task_notification":
+            active.result_deferring_terminal_tasks.add(task_id)
             active.result_deferring_tasks.discard(task_id)
             return
         if message.subtype == "task_updated":
             patch = data.get("patch")
             status = patch.get("status") if isinstance(patch, Mapping) else None
             if status in SDK_TERMINAL_TASK_STATUSES:
+                active.result_deferring_terminal_tasks.add(task_id)
                 active.result_deferring_tasks.discard(task_id)
 
     def _observe_session_id(self, message: Message) -> None:
