@@ -150,12 +150,13 @@ ok "Codex opt-in rejects an oversized loader before state or cron mutation" \
 
 target_home="$TMP/target-home"
 mkdir -p "$target_home"
+target_uid="$(stat -c %u "$target_home")"
 write_exec_stub "$fake_bin/id" <<'SH'
 case "${1:-}" in -un) echo root ;; -u) echo 0 ;; *) exit 2 ;; esac
 SH
 write_exec_stub "$fake_bin/getent" <<SH
 [ "\${1:-}" = passwd ] && [ "\${2:-}" = worker ] || exit 2
-echo 'worker:x:0:0::${target_home}:/bin/bash'
+echo 'worker:x:${target_uid}:0::${target_home}:/bin/bash'
 SH
 write_exec_stub "$fake_bin/runuser" <<'SH'
 printf '%s\n' "$@" > "${CCC_TEST_RUNUSER_CAPTURE:?}"
