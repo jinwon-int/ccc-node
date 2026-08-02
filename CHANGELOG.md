@@ -54,6 +54,11 @@ All notable changes to the Claude Code node harness. Dates are KST.
   composition is unchanged. (#749)
 
 ### Fixed
+- Nunchi installation now follows the live provider and runtime user while
+  preserving the managed Codex loader and the single Claude SessionStart hook.
+  Audience-scoped runtimes fail closed until scope-local provenance exists,
+  and `ccc-memory-check`/`ccc-doctor` expose body-free nunchi and MemPalace
+  health.
 - Isolated Codex subprocesses now support Termux's owner-controlled
   `PREFIX/bin` without inheriting `PREFIX` or ambient secrets. Unsafe prefix
   paths remain excluded, preventing distill and skill-candidate jobs from

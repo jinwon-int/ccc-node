@@ -31,6 +31,63 @@ printf 'honcho cache contains practical evidence reports\n' > "$cache/honcho.txt
 
 out="$(CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" bash "$ROOT/scripts/ccc-memory-check.sh" --json 2>&1)"; rc=$?
 ok "memory check json succeeds" '[ "$rc" = 0 ] && jq -e ".wiki.status == \"ok\" and .honcho.status == \"ok\"" >/dev/null <<<"$out"'
+ok "memory check reports inactive new stack without reading bodies" 'jq -e ".nunchi.status == \"off\" and .mempalace.status == \"off\"" >/dev/null <<<"$out"'
+
+# Body-free nunchi + MemPalace readiness projection (#827).
+probe_home="$TMP/probe-home"
+probe_claude="$probe_home/.claude"
+probe_state="$probe_claude/state"
+probe_nunchi="$probe_home/.nunchi"
+probe_palace="$probe_home/.mempalace/palace"
+mkdir -p "$probe_state" "$probe_claude/hooks/nunchi" "$probe_nunchi" \
+  "$probe_palace" "$probe_home/.local/bin"
+printf 'on' > "$probe_state/nunchi.mode"
+printf '#!/usr/bin/env python3\n' > "$probe_claude/hooks/nunchi/nunchi.py"
+printf '## nunchi working memory (primary)\nPROBE_SECRET_BODY\n' > "$probe_nunchi/snapshot.md"
+printf '#!/usr/bin/env bash\n' > "$probe_home/.local/bin/mempalace"
+chmod +x "$probe_home/.local/bin/mempalace"
+python3 - "$probe_nunchi/facts.db" "$probe_palace/chroma.sqlite3" <<'PY'
+import sqlite3, sys
+facts = sqlite3.connect(sys.argv[1])
+facts.execute("CREATE TABLE peer_facts(id INTEGER PRIMARY KEY, fact TEXT)")
+facts.execute("INSERT INTO peer_facts(fact) VALUES ('PROBE_SECRET_FACT')")
+facts.commit(); facts.close()
+palace = sqlite3.connect(sys.argv[2])
+palace.execute("CREATE TABLE embeddings(id INTEGER PRIMARY KEY)")
+palace.execute("INSERT INTO embeddings DEFAULT VALUES")
+palace.commit(); palace.close()
+PY
+probe_cron=$'*/10 * * * * bash /tmp/codex-feed.sh # nunchi:#816\n17 * * * * mempalace sweep /tmp/sessions # nunchi:#816\n7 8 * * 1 bash /tmp/bench.sh # nunchi:#816'
+out="$(HOME="$probe_home" CCC_CLAUDE_DIR="$probe_claude" CCC_STATE_DIR="$probe_state" \
+  CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" \
+  CCC_NUNCHI_CRONTAB_TEXT="$probe_cron" bash "$ROOT/scripts/ccc-memory-check.sh" --json 2>&1)"; rc=$?
+ok "memory check reports healthy nunchi and MemPalace scalars" '[ "$rc" = 0 ] && jq -e '\''
+  .nunchi.status == "ok" and .nunchi.db.integrity == "ok" and .nunchi.db.facts == 1
+  and .nunchi.snapshot.primary_header == true and .nunchi.cron.feed == "codex"
+  and .mempalace.status == "ok" and .mempalace.integrity == "ok" and .mempalace.embeddings == 1
+'\'' >/dev/null <<<"$out"'
+ok "memory readiness JSON never exposes snapshot or fact bodies" '! grep -q "PROBE_SECRET_BODY\|PROBE_SECRET_FACT" <<<"$out"'
+claude_probe_cron=$'*/10 * * * * bash /tmp/ingest-cron.sh # nunchi:#816\n17 * * * * mempalace sweep /tmp/projects # nunchi:#816\n7 8 * * 1 bash /tmp/bench.sh # nunchi:#816'
+printf '%s\n' '{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"bash /tmp/hooks/nunchi/sessionstart.sh"}]}]}}' > "$probe_claude/settings.local.json"
+out="$(HOME="$probe_home" CCC_CLAUDE_DIR="$probe_claude" CCC_STATE_DIR="$probe_state" \
+  CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" \
+  CCC_NUNCHI_CRONTAB_TEXT="$claude_probe_cron" bash "$ROOT/scripts/ccc-memory-check.sh" --json 2>&1)"; rc=$?
+ok "memory check accepts exactly one standalone hook for a Claude feed" '[ "$rc" = 0 ] && jq -e '\''
+  .nunchi.status == "ok" and .nunchi.cron.feed == "claude"
+  and .nunchi.standalone_sessionstart_hooks == 1
+'\'' >/dev/null <<<"$out"'
+python3 - "$probe_palace/chroma.sqlite3" <<'PY'
+import sqlite3, sys
+db = sqlite3.connect(sys.argv[1]); db.execute("DELETE FROM embeddings"); db.commit(); db.close()
+PY
+printf '%s\n' '{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"bash /root/nunchi/sessionstart.sh"}]}]}}' > "$probe_claude/settings.local.json"
+out="$(HOME="$probe_home" CCC_CLAUDE_DIR="$probe_claude" CCC_STATE_DIR="$probe_state" \
+  CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" \
+  CCC_NUNCHI_CRONTAB_TEXT="$probe_cron" bash "$ROOT/scripts/ccc-memory-check.sh" --json 2>&1)"; rc=$?
+ok "memory check flags legacy injection and an empty palace" '[ "$rc" = 0 ] && jq -e '\''
+  .nunchi.status == "degraded" and (.nunchi.reasons | index("standalone-sessionstart")) != null
+  and .mempalace.status == "degraded" and (.mempalace.reasons | index("embeddings-empty")) != null
+'\'' >/dev/null <<<"$out"'
 
 missing_journal="$TMP/missing-distill-journal"
 out="$(CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CCC_DISTILL_JOURNAL_DIR="$missing_journal" bash "$ROOT/scripts/ccc-memory-check.sh" --json 2>&1)"; rc=$?

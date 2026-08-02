@@ -795,11 +795,26 @@ class Doctor:
                 wiki = (mem.get("wiki") or {}).get("status", "unknown")
                 honcho = (mem.get("honcho") or {}).get("status", "unknown")
                 idx = (mem.get("local_index") or {}).get("exists", False)
-                status = f"wiki={wiki}; honcho={honcho}; local_index={str(idx).lower()}"
-                if wiki in {"ok", "disabled"} and honcho in {"ok", "disabled"}:
+                nunchi = (mem.get("nunchi") or {}).get("status", "unknown")
+                mempalace = (mem.get("mempalace") or {}).get("status", "unknown")
+                status = (
+                    f"wiki={wiki}; honcho={honcho}; local_index={str(idx).lower()}; "
+                    f"nunchi={nunchi}; mempalace={mempalace}"
+                )
+                if (
+                    wiki in {"ok", "disabled"}
+                    and honcho in {"ok", "disabled"}
+                    and nunchi in {"ok", "off"}
+                    and mempalace in {"ok", "off", "optional"}
+                ):
                     self.add("정상", "memory cache", status, "none")
                 else:
-                    self.add("경고", "memory cache", status, "run scripts/ccc-memory-check.sh --json and inspect stale/missing cache metadata")
+                    self.add(
+                        "경고",
+                        "memory cache",
+                        status,
+                        "run scripts/ccc-memory-check.sh --json and inspect body-free cache/nunchi/mempalace diagnostics",
+                    )
             else:
                 self.add("경고", "memory cache", "diagnostic unavailable", "run scripts/ccc-memory-check.sh manually")
         else:

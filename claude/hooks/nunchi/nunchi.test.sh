@@ -97,6 +97,10 @@ ok "sessionstart no-op when mode=off" '[ "$rc" = 0 ] && [ -z "$out" ]'
 printf 'on' > "$CCC_STATE_DIR/nunchi.mode"
 out="$(bash "$HERE/sessionstart.sh" 2>&1)"
 ok "sessionstart prints snapshot when mode=on" 'grep -q "nunchi working memory" <<<"$out"'
+out="$(CCC_MEMORY_AUDIENCE_SCOPED=1 CCC_MEMORY_AUDIENCE=shared bash "$HERE/sessionstart.sh" 2>&1)"
+ok "legacy sessionstart fails closed on scoped shared audiences" '[ -z "$out" ]'
+out="$(CCC_MEMORY_AUDIENCE_SCOPED=1 CCC_MEMORY_AUDIENCE=private bash "$HERE/sessionstart.sh" 2>&1)"
+ok "legacy sessionstart also fails closed on scoped private audiences" '[ -z "$out" ]'
 out="$(CCC_NUNCHI_MODE=off bash "$HERE/sessionstart.sh" 2>&1)"
 ok "env CCC_NUNCHI_MODE overrides mode file" '[ -z "$out" ]'
 

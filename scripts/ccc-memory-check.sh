@@ -258,6 +258,7 @@ honcho_meta_file="$CACHE/honcho.meta.json"
 index_db="$STATE_DIR/memory-index.sqlite"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CODEX_MATERIALIZER="${CCC_CODEX_MEMORY_MATERIALIZER_PATH:-$SCRIPT_DIR/ccc_codex_memory.py}"
+MEMORY_PROBE="${CCC_MEMORY_PROBE_PATH:-$SCRIPT_DIR/ccc_memory_probe.py}"
 BOT_DATA_DIR="${BOT_DATA_DIR:-${PROJECT_ROOT:-$PWD}/.telegram_bot}"
 DISTILL_JOURNAL_DIR="${CCC_DISTILL_JOURNAL_DIR:-$BOT_DATA_DIR/distill-journal}"
 codex_json='{"status":"unavailable","active_kind":null,"snapshot_sha256":null,"snapshot_bytes":0,"file_bytes":0,"metadata_status":"missing"}'
@@ -265,6 +266,14 @@ if [ -x "$CODEX_MATERIALIZER" ] && [ -f "$CODEX_MATERIALIZER" ]; then
   candidate="$("$CODEX_MATERIALIZER" status --json 2>/dev/null || true)"
   if jq -e 'type == "object" and (.status | type == "string")' >/dev/null 2>&1 <<<"$candidate"; then
     codex_json="$candidate"
+  fi
+fi
+memory_probe_json='{"nunchi":{"status":"unavailable","mode":"unknown","reasons":["probe-unavailable"]},"mempalace":{"status":"unavailable","required":false,"reasons":["probe-unavailable"]}}'
+if [ -f "$MEMORY_PROBE" ]; then
+  candidate="$(CCC_STATE_DIR="$STATE_DIR" CCC_CLAUDE_DIR="${CCC_CLAUDE_DIR:-${HOME:-/root}/.claude}" \
+    python3 "$MEMORY_PROBE" 2>/dev/null || true)"
+  if jq -e '.nunchi.status and .mempalace.status' >/dev/null 2>&1 <<<"$candidate"; then
+    memory_probe_json="$candidate"
   fi
 fi
 writeback_json="$(writeback_queue_json "$DISTILL_JOURNAL_DIR")"
@@ -304,6 +313,8 @@ if [ "$OUTPUT" = "--json" ] || [ "$OUTPUT" = "json" ]; then
     --argjson wiki_meta "$(meta_json_for "$wiki_meta_file" "$WIKI_TTL")" \
     --argjson honcho_meta "$(meta_json_for "$honcho_meta_file" "$HONCHO_TTL")" \
     --argjson codex "$codex_json" \
+    --argjson nunchi "$(jq -c '.nunchi' <<<"$memory_probe_json")" \
+    --argjson mempalace "$(jq -c '.mempalace' <<<"$memory_probe_json")" \
     --argjson writeback "$writeback_json" \
     --arg index_db "$index_db" \
     --argjson ttl "$TTL" \
@@ -317,6 +328,8 @@ if [ "$OUTPUT" = "--json" ] || [ "$OUTPUT" = "json" ]; then
       honcho:{status:$honcho_status, age_seconds:$honcho_age, bytes:$honcho_bytes, cfg:$honcho_cfg, base:$honcho_base, meta:$honcho_meta},
       local_index:{db:$index_db, exists:$index_exists},
       codex:$codex,
+      nunchi:$nunchi,
+      mempalace:$mempalace,
       writeback_queue:$writeback}'
   exit 0
 fi
@@ -332,6 +345,18 @@ printf -- '- codex:   %s kind=%s hash=%s metadata=%s\n' \
   "$(jq -r '.active_kind // "none"' <<<"$codex_json")" \
   "$(jq -r '.snapshot_sha256 // "none"' <<<"$codex_json")" \
   "$(jq -r '.metadata_status // "missing"' <<<"$codex_json")"
+printf -- '- nunchi: %s mode=%s facts=%s snapshot_bytes=%s feed=%s reasons=%s\n' \
+  "$(jq -r '.nunchi.status' <<<"$memory_probe_json")" \
+  "$(jq -r '.nunchi.mode' <<<"$memory_probe_json")" \
+  "$(jq -r '.nunchi.db.facts // 0' <<<"$memory_probe_json")" \
+  "$(jq -r '.nunchi.snapshot.bytes // 0' <<<"$memory_probe_json")" \
+  "$(jq -r '.nunchi.cron.feed // "missing"' <<<"$memory_probe_json")" \
+  "$(jq -r '.nunchi.reasons | join(",")' <<<"$memory_probe_json")"
+printf -- '- mempalace: %s required=%s embeddings=%s reasons=%s\n' \
+  "$(jq -r '.mempalace.status' <<<"$memory_probe_json")" \
+  "$(jq -r '.mempalace.required' <<<"$memory_probe_json")" \
+  "$(jq -r '.mempalace.embeddings // 0' <<<"$memory_probe_json")" \
+  "$(jq -r '.mempalace.reasons | join(",")' <<<"$memory_probe_json")"
 printf -- '- writeback: status=%s jobs=%s pending=%s invalid=%s bytes=%s snapshot_bytes=%s oldest=%ss retries=%s accounted=%s estimated_max_tokens=%s duration_ms=%s\n' \
   "$(jq -r '.status' <<<"$writeback_json")" \
   "$(jq -r '.jobs' <<<"$writeback_json")" \

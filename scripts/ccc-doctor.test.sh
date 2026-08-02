@@ -530,6 +530,42 @@ ok "memory probe reports the real cache state through bash" \
 ok "a stale honcho cache is 경고, not a broken-probe 경고" 'jq -e ".klass == \"경고\"" <<<"$sout" >/dev/null'
 ok "version probe survives the same unresolvable shebang" 'jq -e ".version != \"unknown\"" <<<"$sout" >/dev/null'
 
+# #827: doctor must not call an enabled nunchi/Palace stack healthy merely
+# because the legacy Wiki/Honcho cache is healthy.
+cat > "$TMP/nunchi-memory.py" <<'PY_EOF'
+import json, os, sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(os.environ["DOCTOR_PY"]).resolve().parent))
+import ccc_doctor as mod
+
+repo = Path(os.environ["NUNCHI_REPO"])
+claude = repo / ".claude"
+(repo / "scripts").mkdir(parents=True, exist_ok=True)
+claude.mkdir(parents=True, exist_ok=True)
+script = repo / "scripts/ccc-memory-check.sh"
+script.touch()
+script.chmod(0o755)
+
+def classify(nunchi, mempalace):
+    payload = {
+        "wiki": {"status": "ok"}, "honcho": {"status": "ok"},
+        "local_index": {"exists": True},
+        "nunchi": {"status": nunchi}, "mempalace": {"status": mempalace},
+    }
+    script.write_text("#!/usr/bin/env bash\nprintf '%s' '" + json.dumps(payload) + "'\n")
+    d = mod.Doctor(repo, claude, "settings")
+    d.check_memory_cache()
+    row = d.rows[0]
+    return {"klass": row.klass, "status": row.status}
+
+print(json.dumps({"healthy": classify("ok", "ok"), "degraded": classify("degraded", "ok")}, ensure_ascii=False))
+PY_EOF
+nout="$(DOCTOR_PY="$ROOT/scripts/ccc_doctor.py" NUNCHI_REPO="$TMP/nunchi-repo" python3 "$TMP/nunchi-memory.py")"
+ok "doctor accepts a healthy new memory stack" 'jq -e '\''.healthy.klass == "정상"'\'' <<<"$nout" >/dev/null'
+ok "doctor warns when nunchi is degraded despite healthy Honcho" \
+  'jq -e '\''.degraded.klass == "경고" and (.degraded.status | contains("nunchi=degraded"))'\'' <<<"$nout" >/dev/null'
+
 # Static backstop: a new probe added later must not reintroduce bare-exec.
 ok "no repo script is subprocess-exec'd without an explicit interpreter" \
   '! grep -nE "subprocess\.(run|check_output|Popen)\(\[str\(" "$ROOT/scripts/ccc_doctor.py"'
