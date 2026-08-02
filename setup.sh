@@ -27,6 +27,19 @@
 #   --user-context <text>                       -> <USER_CONTEXT>
 set -euo pipefail
 
+# Non-login execution contexts may leave HOME unset (systemd exports HOME only
+# when User= is explicit, so transient units and timers running root get none).
+# ccc-self-update runs this script headless, and `set -u` would abort at the
+# first $HOME default below — seen live on gwakga 2026-08-02
+# ("setup.sh: line 87: HOME: unbound variable" → fail-closed rollback).
+# Derive the invoking user's home instead of dying.
+if [ -z "${HOME:-}" ]; then
+  HOME="$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6 || true)"
+  # Last resort mirrors ccc-self-update's own `${HOME:-/root}` convention.
+  [ -n "$HOME" ] || HOME=/root
+  export HOME
+fi
+
 DRY=0; WITH_PLUGIN=0; BACKUP=1
 OPT_NODE=""; OPT_DISPLAY=""; OPT_SLOT=""; OPT_FLEET_ROLE=""; OPT_LANG=""
 OPT_USER_NAME=""; OPT_USER_GH=""; OPT_USER_TZ=""; OPT_USER_CONTEXT=""
