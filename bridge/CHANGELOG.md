@@ -1,5 +1,13 @@
 # Changelog
 
+- **Bound approval snapshots and decision audit (#870).** Claude and Codex
+  `approve-each` requests now show the sole owner a bounded, redacted target
+  summary instead of a generic action label. Keyed request fingerprints and an
+  exact-display SHA-256 bind each one-shot token; argument drift, stale turns,
+  expiry, timeout, and late replay fail closed. A separate strict owner-only,
+  bounded JSONL ledger records body-free asked/terminal decisions exactly once
+  and exposes action/decision/reason/latency aggregates without raw payloads.
+
 - **Delegated-task-aware terminal stall guard (#874).** Claude
   `local_agent`/`local_workflow` lifecycle now crosses the provider-neutral
   event seam only as body-free active-count/oldest-age/activity snapshots.

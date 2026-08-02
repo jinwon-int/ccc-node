@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -19,10 +21,19 @@ class FakeTelegramBot:
         self.sent: list[dict[str, object]] = []
         self.edits: list[dict[str, object]] = []
 
-    async def send_message(self, chat_id: int, text: str, reply_markup=None):
+    async def send_message(
+        self, chat_id: int, text: str, reply_markup=None, parse_mode=None
+    ):
         if self.send_error:
             raise self.send_error
-        self.sent.append({"chat_id": chat_id, "text": text, "reply_markup": reply_markup})
+        self.sent.append(
+            {
+                "chat_id": chat_id,
+                "text": text,
+                "reply_markup": reply_markup,
+                "parse_mode": parse_mode,
+            }
+        )
         return SimpleNamespace(message_id=len(self.sent))
 
     async def edit_message_reply_markup(self, **kwargs):
@@ -54,7 +65,12 @@ def approval_event() -> ApprovalRequestEvent:
 
 
 def _subject(
-    *, timeout: float = 0.2, send_error=None, edit_error=None, bash_policy: str = "approve-each"
+    *,
+    timeout: float = 0.2,
+    send_error=None,
+    edit_error=None,
+    bash_policy: str = "approve-each",
+    bot_data_dir: Path | None = None,
 ):
     subject = TelegramBot.__new__(TelegramBot)
     subject._config = SimpleNamespace(
@@ -62,6 +78,7 @@ def _subject(
         bash_policy=bash_policy,
         execution_profile="owner-operator",
         require_allowlist=True,
+        bot_data_dir=bot_data_dir,
     )
     subject._project_chat = FakeProjectChat()
     subject._codex_approval_timeout_seconds = timeout
@@ -107,9 +124,13 @@ async def test_owner_can_resolve_once_with_opaque_bounded_token(
     ):
         assert sensitive not in data
     assert telegram.sent[0]["text"] == (
-        "Codex requests approval to run a command.\n"
+        "Codex approval request\n"
+        "Action: command execution\n"
+        "Target: command\n"
+        "Summary: cat /private/secret\n"
         "Reply with 승인 or 거절, or use the buttons."
     )
+    assert telegram.sent[0]["parse_mode"] is None
 
     assert await subject._resolve_codex_approval(7, 70, data) is True
     assert await task is expected
@@ -277,3 +298,104 @@ async def test_stop_new_shutdown_and_concurrent_chats_deny_only_selected_pending
     await subject._graceful_shutdown()
     assert await second is ApprovalDecision.DENY
     assert subject._pending_codex_approvals == {}
+
+
+@pytest.mark.anyio
+async def test_changed_arguments_invalidate_old_token_and_require_new_approval(
+    tmp_path: Path,
+) -> None:
+    subject, telegram = _subject(bot_data_dir=tmp_path)
+    subject._codex_approval_max_pending = 1
+    subject._project_chat.active.add((7, 70, 3))
+    first_event = ApprovalRequestEvent(
+        "same-request",
+        "item/commandExecution/requestApproval",
+        {"command": "echo first"},
+        "first",
+    )
+    second_event = ApprovalRequestEvent(
+        "same-request",
+        "item/commandExecution/requestApproval",
+        {"command": "echo second"},
+        "second",
+    )
+    first = asyncio.create_task(subject._codex_approval_callback(70, 7, first_event, 3))
+    await _wait_pending(subject)
+    old_data = _callback_data(telegram, 0)
+
+    second = asyncio.create_task(subject._codex_approval_callback(70, 7, second_event, 3))
+    async with asyncio.timeout(1):
+        while len(telegram.sent) != 2:
+            await asyncio.sleep(0)
+    assert await first is ApprovalDecision.DENY
+    assert await subject._resolve_codex_approval(7, 70, old_data) is False
+    assert await subject._resolve_codex_approval(7, 70, _callback_data(telegram, 0)) is True
+    assert await second is ApprovalDecision.ALLOW
+
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "approval-audit" / "approval-audit.jsonl")
+        .read_text()
+        .splitlines()
+    ]
+    assert [record["event"] for record in records] == [
+        "asked",
+        "answered",
+        "asked",
+        "answered",
+    ]
+    assert [record.get("reason") for record in records] == [
+        None,
+        "fingerprint_mismatch",
+        None,
+        "owner_allow",
+    ]
+    assert records[0]["request_fingerprint"] != records[2]["request_fingerprint"]
+    assert "echo first" not in json.dumps(records)
+    assert "echo second" not in json.dumps(records)
+
+
+@pytest.mark.anyio
+async def test_timeout_and_late_replay_have_one_terminal_audit_record(
+    approval_event: ApprovalRequestEvent,
+    tmp_path: Path,
+) -> None:
+    subject, telegram = _subject(timeout=0.01, bot_data_dir=tmp_path)
+    subject._project_chat.active.add((7, 70, 1))
+
+    assert await subject._codex_approval_callback(70, 7, approval_event, 1) is ApprovalDecision.DENY
+    callback_data = _callback_data(telegram, 0)
+    assert await subject._resolve_codex_approval(7, 70, callback_data) is False
+    assert await subject._resolve_codex_approval_text(7, 70, "승인") is None
+
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "approval-audit" / "approval-audit.jsonl")
+        .read_text()
+        .splitlines()
+    ]
+    assert len(records) == 2
+    assert records[0]["event"] == "asked"
+    assert records[1]["event"] == "answered"
+    assert records[1]["decision"] == "timeout"
+    assert records[1]["reason"] == "timeout"
+
+
+@pytest.mark.anyio
+async def test_claude_approve_each_uses_provider_neutral_owner_prompt() -> None:
+    subject, telegram = _subject()
+    subject._project_chat.active.add((7, 70, 2))
+    event = ApprovalRequestEvent(
+        "claude-request",
+        "Bash",
+        {"command": "pytest -q"},
+        "run tests",
+    )
+    task = asyncio.create_task(subject._codex_approval_callback(70, 7, event, 2))
+    await _wait_pending(subject)
+
+    assert telegram.sent[0]["text"].startswith(
+        "Claude approval request\nAction: command execution\n"
+    )
+    assert await subject._resolve_codex_approval(7, 70, _callback_data(telegram, 0)) is True
+    assert await task is ApprovalDecision.ALLOW
