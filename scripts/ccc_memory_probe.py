@@ -66,6 +66,32 @@ def standalone_hook_count(settings: Path) -> int:
     )
 
 
+_REPAIR_PATTERNS = {
+    "sqlite_count": re.compile(r"sqlite count:\s*([0-9]+(?:,[0-9]{3})*)"),
+    "hnsw_count": re.compile(r"hnsw count:\s*([0-9]+(?:,[0-9]{3})*)"),
+    "divergence": re.compile(r"divergence:\s*([0-9]+(?:,[0-9]{3})*)"),
+    "reported_status": re.compile(r"status:\s*([A-Z]+)"),
+}
+_REPAIR_LABELS = ("sqlite count:", "hnsw count:", "divergence:", "status:")
+
+
+def _record_repair_value(line: str, values: dict[str, int | str]) -> bool:
+    """Record one drawer scalar; return False for duplicate/malformed labels."""
+
+    for key, pattern in _REPAIR_PATTERNS.items():
+        match = pattern.fullmatch(line)
+        if not match:
+            continue
+        if key in values:
+            return False
+        raw_value = match.group(1)
+        values[key] = (
+            raw_value if key == "reported_status" else int(raw_value.replace(",", ""))
+        )
+        return True
+    return not line.startswith(_REPAIR_LABELS)
+
+
 def parse_repair_status(text: str) -> dict[str, object]:
     """Project MemPalace 3.6 drawer counts, failing closed on ambiguity."""
     unknown: dict[str, object] = {
@@ -81,13 +107,6 @@ def parse_repair_status(text: str) -> dict[str, object]:
     saw_drawers = False
     malformed = False
     values: dict[str, int | str] = {}
-    patterns = {
-        "sqlite_count": re.compile(r"sqlite count:\s*([0-9]+(?:,[0-9]{3})*)"),
-        "hnsw_count": re.compile(r"hnsw count:\s*([0-9]+(?:,[0-9]{3})*)"),
-        "divergence": re.compile(r"divergence:\s*([0-9]+(?:,[0-9]{3})*)"),
-        "reported_status": re.compile(r"status:\s*([A-Z]+)"),
-    }
-    labels = ("sqlite count:", "hnsw count:", "divergence:", "status:")
     for raw in text.splitlines():
         line = raw.strip()
         if line == "[drawers]":
@@ -100,21 +119,7 @@ def parse_repair_status(text: str) -> dict[str, object]:
             in_drawers = False
         if not in_drawers:
             continue
-        matched = False
-        for key, pattern in patterns.items():
-            match = pattern.fullmatch(line)
-            if not match:
-                continue
-            matched = True
-            if key in values:
-                malformed = True
-                break
-            raw_value = match.group(1)
-            values[key] = (
-                raw_value if key == "reported_status" else int(raw_value.replace(",", ""))
-            )
-            break
-        if not matched and line.startswith(labels):
+        if not _record_repair_value(line, values):
             malformed = True
 
     counts = {
@@ -256,9 +261,111 @@ def command_invocation(tokens: list[str]) -> list[str]:
     return tokens[index:]
 
 
+def command_environment(tokens: list[str]) -> dict[str, str]:
+    environment: dict[str, str] = {}
+    for token in tokens:
+        if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", token):
+            break
+        key, value = token.split("=", 1)
+        # crond removes this escape before invoking the shell.
+        environment[key] = value.replace(r"\%", "%")
+    return environment
+
+
+def is_bash_script(command: list[str], script: str) -> bool:
+    return (
+        len(command) >= 2
+        and token_basename(command[0]) == "bash"
+        and token_basename(command[1]) == script
+    )
+
+
+def inspect_managed_cron(
+    cron: str,
+) -> tuple[str, int, list[tuple[str, str, dict[str, str]]], int, int]:
+    commands = cron_commands(cron, managed_only=True)
+    all_commands = cron_commands(cron, managed_only=False)
+    invocations = [command_invocation(command) for command in commands]
+    codex_feeds = sum(is_bash_script(command, "codex-feed.sh") for command in invocations)
+    claude_feeds = sum(is_bash_script(command, "ingest-cron.sh") for command in invocations)
+    feed_count = codex_feeds + claude_feeds
+    feed_kind = (
+        "codex"
+        if codex_feeds == 1 and claude_feeds == 0
+        else "claude"
+        if claude_feeds == 1 and codex_feeds == 0
+        else "missing"
+        if feed_count == 0
+        else "mixed"
+    )
+    legacy_sweep_count = sum(
+        1
+        for command in all_commands
+        for index, token in enumerate(command)
+        if token_basename(token) == "mempalace"
+        and index + 1 < len(command)
+        and command[index + 1] == "sweep"
+    )
+    refreshes = [
+        (
+            invocation[2] if len(invocation) >= 3 else "",
+            invocation[3] if len(invocation) >= 4 else "",
+            command_environment(tokens),
+        )
+        for tokens, invocation in zip(commands, invocations, strict=True)
+        if is_bash_script(invocation, "mempalace-refresh.sh")
+    ]
+    bench_count = sum(is_bash_script(command, "bench.sh") for command in invocations)
+    return feed_kind, feed_count, refreshes, legacy_sweep_count, bench_count
+
+
+def nunchi_readiness_reasons(
+    *,
+    hook_installed: bool,
+    db_integrity: str,
+    facts: int,
+    facts_age: int,
+    snapshot_primary: bool,
+    snapshot_bytes: int,
+    feed_kind: str,
+    feed_count: int,
+    refreshes: list[tuple[str, str, dict[str, str]]],
+    legacy_sweep_count: int,
+    bench_count: int,
+    standalone: int,
+    ttl: int,
+) -> list[str]:
+    reasons: list[str] = []
+    if not hook_installed:
+        reasons.append("hook-missing")
+    if db_integrity != "ok":
+        reasons.append("db-" + db_integrity)
+    if not snapshot_primary or snapshot_bytes == 0:
+        reasons.append("snapshot-missing")
+    if facts == 0 and facts_age > ttl:
+        reasons.append("facts-empty-stale")
+    if feed_count != 1:
+        reasons.append("feed-count")
+    if len(refreshes) != 1:
+        reasons.append("refresh-count")
+    if legacy_sweep_count != 0:
+        reasons.append("legacy-sweep")
+    if len(refreshes) == 1 and refreshes[0][0] != feed_kind:
+        reasons.append("refresh-provider-arg")
+    if len(refreshes) == 1 and not refreshes[0][1]:
+        reasons.append("refresh-target-arg")
+    if bench_count != 1:
+        reasons.append("bench-count")
+    if feed_kind == "codex" and standalone:
+        reasons.append("standalone-sessionstart")
+    if feed_kind == "claude" and standalone != 1:
+        reasons.append("sessionstart-count")
+    return reasons
+
+
 def probe_nunchi(
     state: Path, claude: Path, nunchi_home: Path, ttl: int, now: int
-) -> tuple[dict[str, object], str, str, int, int]:
+) -> tuple[dict[str, object], str, str, int, int, dict[str, str]]:
     mode_file = state / "nunchi.mode"
     try:
         mode = mode_file.read_text(encoding="utf-8").strip()
@@ -285,84 +392,32 @@ def probe_nunchi(
             pass
 
     cron = crontab_text() if mode == "on" else ""
-    commands = cron_commands(cron, managed_only=True)
-    all_commands = cron_commands(cron, managed_only=False)
-    invocations = [command_invocation(command) for command in commands]
-    codex_feeds = sum(
-        len(command) >= 2
-        and token_basename(command[0]) == "bash"
-        and token_basename(command[1]) == "codex-feed.sh"
-        for command in invocations
+    feed_kind, feed_count, refreshes, legacy_sweep_count, bench_count = (
+        inspect_managed_cron(cron)
     )
-    claude_feeds = sum(
-        len(command) >= 2
-        and token_basename(command[0]) == "bash"
-        and token_basename(command[1]) == "ingest-cron.sh"
-        for command in invocations
-    )
-    feed_count = codex_feeds + claude_feeds
-    feed_kind = (
-        "codex"
-        if codex_feeds == 1 and claude_feeds == 0
-        else "claude"
-        if claude_feeds == 1 and codex_feeds == 0
-        else "missing"
-        if feed_count == 0
-        else "mixed"
-    )
-    refresh_providers: list[str] = []
-    legacy_sweep_count = sum(
-        1
-        for command in all_commands
-        for index, token in enumerate(command)
-        if token_basename(token) == "mempalace"
-        and index + 1 < len(command)
-        and command[index + 1] == "sweep"
-    )
-    bench_count = 0
-    for command in invocations:
-        if (
-            len(command) >= 2
-            and token_basename(command[0]) == "bash"
-            and token_basename(command[1]) == "mempalace-refresh.sh"
-        ):
-            refresh_providers.append(command[2] if len(command) >= 3 else "")
-        if (
-            len(command) >= 2
-            and token_basename(command[0]) == "bash"
-            and token_basename(command[1]) == "bench.sh"
-        ):
-            bench_count += 1
-    managed_refresh_count = len(refresh_providers)
+    managed_refresh_count = len(refreshes)
     standalone = standalone_hook_count(claude / "settings.local.json") if mode == "on" else 0
     hook_installed = (claude / "hooks/nunchi/nunchi.py").is_file()
 
-    nunchi_reasons: list[str] = []
     if mode == "on":
-        if not hook_installed:
-            nunchi_reasons.append("hook-missing")
-        if db_integrity != "ok":
-            nunchi_reasons.append("db-" + db_integrity)
-        if not snapshot_primary or snapshot_bytes == 0:
-            nunchi_reasons.append("snapshot-missing")
-        if facts == 0 and age_seconds(db_path, now) > ttl:
-            nunchi_reasons.append("facts-empty-stale")
-        if feed_count != 1:
-            nunchi_reasons.append("feed-count")
-        if managed_refresh_count != 1:
-            nunchi_reasons.append("refresh-count")
-        if legacy_sweep_count != 0:
-            nunchi_reasons.append("legacy-sweep")
-        if managed_refresh_count == 1 and refresh_providers[0] != feed_kind:
-            nunchi_reasons.append("refresh-provider-arg")
-        if bench_count != 1:
-            nunchi_reasons.append("bench-count")
-        if feed_kind == "codex" and standalone:
-            nunchi_reasons.append("standalone-sessionstart")
-        if feed_kind == "claude" and standalone != 1:
-            nunchi_reasons.append("sessionstart-count")
+        nunchi_reasons = nunchi_readiness_reasons(
+            hook_installed=hook_installed,
+            db_integrity=db_integrity,
+            facts=facts,
+            facts_age=age_seconds(db_path, now),
+            snapshot_primary=snapshot_primary,
+            snapshot_bytes=snapshot_bytes,
+            feed_kind=feed_kind,
+            feed_count=feed_count,
+            refreshes=refreshes,
+            legacy_sweep_count=legacy_sweep_count,
+            bench_count=bench_count,
+            standalone=standalone,
+            ttl=ttl,
+        )
         nunchi_status = "ok" if not nunchi_reasons else "degraded"
     else:
+        nunchi_reasons = []
         nunchi_status = "off"
 
     payload: dict[str, object] = {
@@ -393,7 +448,15 @@ def probe_nunchi(
             "bench_count": bench_count,
         },
     }
-    return payload, mode, feed_kind, managed_refresh_count, legacy_sweep_count
+    refresh_environment = refreshes[0][2] if managed_refresh_count == 1 else {}
+    return (
+        payload,
+        mode,
+        feed_kind,
+        managed_refresh_count,
+        legacy_sweep_count,
+        refresh_environment,
+    )
 
 
 def probe_mempalace(
@@ -403,6 +466,7 @@ def probe_mempalace(
     provider: str,
     managed_refresh_count: int,
     legacy_sweep_count: int,
+    refresh_environment: dict[str, str],
     ttl: int,
     now: int,
 ) -> dict[str, object]:
@@ -412,8 +476,12 @@ def probe_mempalace(
     required = default_required if not required_raw else required_raw not in {
         "0", "false", "off", "no"
     }
-    mp_cli = home / ".local/bin/mempalace"
-    if not mp_cli.is_file():
+    configured_cli = (
+        os.environ.get("CCC_NUNCHI_MEMPALACE_CLI")
+        or refresh_environment.get("CCC_NUNCHI_MEMPALACE_CLI")
+    )
+    mp_cli = Path(configured_cli) if configured_cli else home / ".local/bin/mempalace"
+    if not configured_cli and not mp_cli.is_file():
         found = shutil.which("mempalace")
         mp_cli = Path(found) if found else mp_cli
     palace = home / ".mempalace/palace/chroma.sqlite3"
@@ -434,6 +502,7 @@ def probe_mempalace(
     )
     status_path = Path(
         os.environ.get("CCC_NUNCHI_MEMPALACE_STATUS")
+        or refresh_environment.get("CCC_NUNCHI_MEMPALACE_STATUS")
         or nunchi_home / "mempalace-refresh.status.json"
     )
     refresh = mempalace_refresh_probe(status_path, now)
@@ -489,9 +558,14 @@ def main() -> int:
     ttl = int(os.environ.get("CCC_MEMORY_CACHE_TTL_SEC") or "21600")
     now_raw = os.environ.get("CCC_MEMORY_CHECK_NOW_EPOCH") or ""
     now = int(now_raw) if now_raw.isdigit() else int(time.time())
-    nunchi, mode, provider, managed_refresh_count, legacy_sweep_count = probe_nunchi(
-        state, claude, nunchi_home, ttl, now
-    )
+    (
+        nunchi,
+        mode,
+        provider,
+        managed_refresh_count,
+        legacy_sweep_count,
+        refresh_environment,
+    ) = probe_nunchi(state, claude, nunchi_home, ttl, now)
     payload = {
         "nunchi": nunchi,
         "mempalace": probe_mempalace(
@@ -501,6 +575,7 @@ def main() -> int:
             provider,
             managed_refresh_count,
             legacy_sweep_count,
+            refresh_environment,
             ttl,
             now,
         ),

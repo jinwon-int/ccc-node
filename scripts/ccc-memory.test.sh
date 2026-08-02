@@ -215,6 +215,16 @@ out="$(HOME="$probe_home" CCC_CLAUDE_DIR="$probe_claude" CCC_STATE_DIR="$probe_s
 ok "memory probe honors the custom refresh status path" \
   '[ "$rc" = 0 ] && jq -e '\'' .mempalace.status == "ok" and .mempalace.refresh.age_seconds == 10 '\'' >/dev/null <<<"$out"'
 
+cron_refresh_status="$TMP/cron-config-refresh.status.json"
+printf '%s\n' '{"schema":"ccc.nunchi.mempalace-refresh.v1","provider":"codex","state":"ok","exit_code":0,"started_at":180,"finished_at":190}' > "$cron_refresh_status"
+cron_configured_refresh=$'*/10 * * * * bash /tmp/codex-feed.sh # nunchi:#816\n17 * * * * CCC_NUNCHI_MEMPALACE_STATUS='"$cron_refresh_status"' CCC_NUNCHI_MEMPALACE_CLI='"$probe_home/.local/bin/mempalace"' bash /tmp/mempalace-refresh.sh codex /tmp/sessions # nunchi:#816\n7 8 * * 1 bash /tmp/bench.sh # nunchi:#816'
+out="$(HOME="$probe_home" CCC_CLAUDE_DIR="$probe_claude" CCC_STATE_DIR="$probe_state" \
+  CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CCC_MEMORY_CHECK_NOW_EPOCH=200 \
+  CCC_NUNCHI_MEMPALACE_REPAIR_STATUS_TEXT="$repair_ok" \
+  CCC_NUNCHI_CRONTAB_TEXT="$cron_configured_refresh" bash "$ROOT/scripts/ccc-memory-check.sh" --json 2>&1)"; rc=$?
+ok "memory probe reuses CLI and status paths persisted in the managed cron" \
+  '[ "$rc" = 0 ] && jq -e '\'' .mempalace.status == "ok" and .mempalace.refresh.age_seconds == 10 '\'' >/dev/null <<<"$out"'
+
 claude_probe_cron=$'*/10 * * * * bash /tmp/ingest-cron.sh # nunchi:#816\n17 * * * * bash /tmp/mempalace-refresh.sh claude /tmp/projects # nunchi:#816\n7 8 * * 1 bash /tmp/bench.sh # nunchi:#816'
 printf '%s\n' '{"schema":"ccc.nunchi.mempalace-refresh.v1","provider":"claude","state":"ok","exit_code":0,"started_at":180,"finished_at":190}' > "$probe_nunchi/mempalace-refresh.status.json"
 printf '%s\n' '{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"bash /tmp/hooks/nunchi/sessionstart.sh"}]}]}}' > "$probe_claude/settings.local.json"

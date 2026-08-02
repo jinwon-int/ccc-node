@@ -160,9 +160,13 @@ env "${common_env[@]}" python3 "$ROOT/scripts/ccc_codex_memory.py" materialize -
 ok "Codex materializer auto-selects the installed managed nunchi loader" \
   '[ "$rc" = 0 ] && grep -q "INSTALLER_BASE_SENTINEL" "$codex_home/AGENTS.md" && grep -q "INSTALLER_NUNCHI_SENTINEL" "$codex_home/AGENTS.md" && ! grep -q "INSTALLER_NUNCHI_SENTINEL" "$TMP/materialize-on.json" "$TMP/materialize-on.err"'
 
+unrelated_sweep='43 4 * * * /opt/operator/mempalace sweep /srv/operator-archive'
+printf '%s\n' "$unrelated_sweep" >> "$cron_store"
 out="$(run_install --apply --codex 2>&1)"; rc=$?
 ok "Codex reapply is cron-idempotent" \
   '[ "$rc" = 0 ] && [ "$(grep -c "nunchi:#816" "$cron_store")" = 3 ]'
+ok "managed cron rewrites preserve unrelated operator MemPalace jobs" \
+  'grep -qxF "$unrelated_sweep" "$cron_store"'
 
 termux_root="$TMP/data/data/com.termux/files/home/space 'quote %;false"
 weird_state="$termux_root/state dir"
@@ -222,7 +226,7 @@ env "${common_env[@]}" python3 "$ROOT/scripts/ccc_codex_memory.py" materialize -
 ok "--remove immediately rolls Codex back to canonical memory" \
   '[ "$rc" = 0 ] && [ "$materialize_rc" = 0 ] && [ "$(cat "$state/nunchi.mode")" = off ] && grep -q "INSTALLER_BASE_SENTINEL" "$codex_home/AGENTS.md" && ! grep -q "INSTALLER_NUNCHI_SENTINEL" "$codex_home/AGENTS.md"'
 ok "--remove strips managed cron and standalone hook state while retaining the DB" \
-  '[ ! -s "$cron_store" ] && ! grep -q "nunchi/sessionstart.sh" "$claude_dir/settings.local.json" && [ -s "$nunchi_home/facts.db" ]'
+  '[ "$(grep -c "nunchi:#816" "$cron_store" || true)" = 0 ] && grep -qxF "$unrelated_sweep" "$cron_store" && ! grep -q "nunchi/sessionstart.sh" "$claude_dir/settings.local.json" && [ -s "$nunchi_home/facts.db" ]'
 
 rm -f "$hooks/nunchi/codex-loader.py"
 out="$(run_install --apply --codex 2>&1)"; rc=$?

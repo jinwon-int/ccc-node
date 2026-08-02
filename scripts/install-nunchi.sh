@@ -135,7 +135,6 @@ strip_cron() {  # remove managed and legacy hand-deploy nunchi lines
   "$CRONTAB" -l 2>/dev/null \
     | grep -vF "$MARK" \
     | grep -v "nunchi/ingest-cron.sh\|nunchi/codex-feed.sh\|/nunchi/ingest-cron\|nunchi:distill-mirror\|nunchi:codex-feed" \
-    | grep -vE '(^|[[:space:]/])mempalace[[:space:]]+sweep[[:space:]]' \
     > "$tmp" || true
   "$CRONTAB" "$tmp"
   rm -f "$tmp"
