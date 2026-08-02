@@ -16,6 +16,7 @@ if TYPE_CHECKING:
         ApprovalHandler,
         ApprovalRequestEvent,
         CompletionEvent,
+        DelegatedTaskLifecycleEvent,
         ErrorEvent,
         JsonValue,
         ModelInfo,
@@ -37,6 +38,7 @@ else:
         ApprovalHandler,
         ApprovalRequestEvent,
         CompletionEvent,
+        DelegatedTaskLifecycleEvent,
         ErrorEvent,
         JsonValue,
         ModelInfo,
@@ -154,6 +156,11 @@ class AgentRuntimeContractTests(unittest.IsolatedAsyncioTestCase):
                 request_id="approval", action="write_file", arguments={}, description=""
             ),
             lambda: CompletionEvent(stop_reason=""),
+            lambda: DelegatedTaskLifecycleEvent(0, 0.0, "terminal"),
+            lambda: DelegatedTaskLifecycleEvent(1, None, "started"),
+            lambda: DelegatedTaskLifecycleEvent(-1, None, "terminal"),
+            lambda: DelegatedTaskLifecycleEvent(1, float("inf"), "updated"),
+            lambda: DelegatedTaskLifecycleEvent(1, float("nan"), "updated"),
             lambda: ErrorEvent(code="", message="failed"),
             lambda: ErrorEvent(code="failed", message=""),
             lambda: SessionRequest(working_directory=""),
@@ -169,6 +176,15 @@ class AgentRuntimeContractTests(unittest.IsolatedAsyncioTestCase):
         for factory in invalid_factories:
             with self.subTest(factory=factory), self.assertRaises(ValueError):
                 factory()
+
+    async def test_delegated_task_lifecycle_event_is_body_free(self) -> None:
+        event = DelegatedTaskLifecycleEvent(4, 301.5, "updated")
+
+        self.assertEqual(event.kind, "delegated_task_lifecycle")
+        self.assertEqual(event.active_count, 4)
+        self.assertEqual(event.oldest_age_seconds, 301.5)
+        self.assertNotIn("task_id", repr(event))
+        self.assertNotIn("session", repr(event))
 
     async def test_async_completion_capability_fails_closed(self) -> None:
         degraded = AsyncCompletionCapability(

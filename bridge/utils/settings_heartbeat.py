@@ -158,6 +158,20 @@ class HeartbeatSettingsMixin:
             "timeout only."
         ),
     )
+    delegated_task_stall_seconds: float = Field(
+        default=7200.0,
+        alias="CCC_DELEGATED_TASK_STALL_SECONDS",
+        gt=0,
+        allow_inf_nan=False,
+        description=(
+            "Hard upper bound for one provider turn's oldest active delegated "
+            "local-agent/workflow task. This is distinct from the short "
+            "CCC_TERMINAL_STALL_SECONDS guard: delegated lifecycle activity "
+            "suppresses that ordinary missing-terminal timer, but never extends "
+            "this oldest-task deadline. The value must remain below "
+            "CLAUDE_PROCESS_TIMEOUT."
+        ),
+    )
     approval_stall_seconds: float = Field(
         default=120.0,
         alias="CCC_APPROVAL_STALL_SECONDS",

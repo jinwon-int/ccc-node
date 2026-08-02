@@ -10,6 +10,7 @@ import pytest
 from telegram_bot.core.agent_runtime import (
     AgentEvent,
     ApprovalRequestEvent,
+    DelegatedTaskLifecycleEvent,
     TextDeltaEvent,
     ToolCompletedEvent,
     ToolStartedEvent,
@@ -55,6 +56,7 @@ class ScriptedStream:
                 item,
                 (
                     ApprovalRequestEvent,
+                    DelegatedTaskLifecycleEvent,
                     TextDeltaEvent,
                     ToolCompletedEvent,
                     ToolStartedEvent,
@@ -92,15 +94,18 @@ class DelayedCancellationStream(ScriptedStream):
         raise AssertionError("unreachable")
 
 
-def _no_action() -> Awaitable[None]:
+def _no_action(_outcome: TurnStreamOutcome) -> Awaitable[None]:
     async def run() -> None:
         return None
 
     return run()
 
 
-def _record_action(order: list[str], name: str) -> Callable[[], Awaitable[None]]:
-    async def run() -> None:
+def _record_action(
+    order: list[str],
+    name: str,
+) -> Callable[..., Awaitable[None]]:
+    async def run(_outcome: TurnStreamOutcome | None = None) -> None:
         order.append(name)
 
     return run
@@ -305,6 +310,100 @@ async def test_stall_arms_after_active_tool_is_released() -> None:
 
     assert outcome is TurnStreamOutcome.TERMINAL_STALL
     assert order == ["interrupt", "pending-cancel", "abort", "aclose"]
+
+
+@pytest.mark.anyio
+async def test_delegated_work_suppresses_short_terminal_guard_until_hard_limit() -> None:
+    order: list[str] = []
+    stream = ScriptedStream(
+        [DelegatedTaskLifecycleEvent(4, 0.0, "started")],
+        order=order,
+    )
+    state = TurnEventState()
+    state.mark_admitted()
+
+    outcome = await consume_turn_stream(
+        stream,
+        state=state,
+        has_text=lambda: True,
+        on_event=_observer(state),
+        interrupt=_record_action(order, "interrupt"),
+        abort_stalled_turn=_record_action(order, "abort"),
+        admission_timeout_seconds=1.0,
+        approval_stall_seconds=1.0,
+        terminal_stall_seconds=0.001,
+        delegated_task_stall_seconds=0.02,
+        interrupt_timeout_seconds=1.0,
+    )
+
+    assert outcome is TurnStreamOutcome.DELEGATED_TASK_STALL
+    assert state.delegated_tasks_active == 4
+    assert order == ["interrupt", "pending-cancel", "abort", "aclose"]
+
+
+@pytest.mark.anyio
+async def test_last_delegated_terminal_event_starts_a_fresh_terminal_grace() -> None:
+    order: list[str] = []
+    stream = ScriptedStream(
+        [
+            DelegatedTaskLifecycleEvent(1, 15.0, "started"),
+            DelegatedTaskLifecycleEvent(0, None, "terminal"),
+        ],
+        order=order,
+    )
+    state = TurnEventState()
+    state.mark_admitted()
+
+    outcome = await consume_turn_stream(
+        stream,
+        state=state,
+        has_text=lambda: True,
+        on_event=_observer(state),
+        interrupt=_record_action(order, "interrupt"),
+        abort_stalled_turn=_record_action(order, "abort"),
+        admission_timeout_seconds=1.0,
+        approval_stall_seconds=1.0,
+        terminal_stall_seconds=0.005,
+        delegated_task_stall_seconds=60.0,
+        interrupt_timeout_seconds=1.0,
+    )
+
+    assert outcome is TurnStreamOutcome.TERMINAL_STALL
+    assert state.delegated_tasks_active == 0
+    assert order == ["interrupt", "pending-cancel", "abort", "aclose"]
+
+
+@pytest.mark.anyio
+async def test_earlier_delegated_deadline_wins_over_pending_approval() -> None:
+    order: list[str] = []
+    stream = ScriptedStream([], order=order)
+    state = TurnEventState()
+    state.mark_admitted()
+    now = asyncio.get_running_loop().time()
+    state.observe(
+        DelegatedTaskLifecycleEvent(1, 10.0, "started"),
+        observed_at=now,
+    )
+    state.observe(
+        ApprovalRequestEvent("approval-1", "Bash", {"command": "true"}, "run"),
+        observed_at=now,
+    )
+
+    outcome = await consume_turn_stream(
+        stream,
+        state=state,
+        has_text=lambda: True,
+        on_event=_observer(state),
+        interrupt=_record_action(order, "interrupt"),
+        abort_stalled_turn=_record_action(order, "abort"),
+        admission_timeout_seconds=1.0,
+        approval_stall_seconds=60.0,
+        terminal_stall_seconds=0.001,
+        delegated_task_stall_seconds=10.001,
+        interrupt_timeout_seconds=1.0,
+    )
+
+    assert outcome is TurnStreamOutcome.DELEGATED_TASK_STALL
 
 
 @pytest.mark.anyio

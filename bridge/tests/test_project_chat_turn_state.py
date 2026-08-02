@@ -9,6 +9,7 @@ from telegram_bot.core.agent_runtime import (
     AgentEvent,
     ApprovalRequestEvent,
     CompletionEvent,
+    DelegatedTaskLifecycleEvent,
     ErrorEvent,
     MessageCompletedEvent,
     ReasoningDeltaEvent,
@@ -18,6 +19,7 @@ from telegram_bot.core.agent_runtime import (
     ToolStartedEvent,
 )
 from telegram_bot.core.project_chat_turn_state import (
+    DelegatedTaskLifecycleTransition,
     ErrorTransition,
     IgnoredTransition,
     MessageCompletedTransition,
@@ -54,6 +56,56 @@ def test_admission_and_attempt_observations_are_idempotent() -> None:
 
     assert state.admitted is True
     assert state.needs_attempt_recording is False
+
+
+def test_delegated_lifecycle_tracks_oldest_clock_and_rearms_terminal_grace() -> None:
+    state = TurnEventState()
+
+    started = state.observe(
+        DelegatedTaskLifecycleEvent(4, 25.0, "started"),
+        observed_at=100.0,
+    )
+
+    assert isinstance(started, DelegatedTaskLifecycleTransition)
+    assert state.delegated_tasks_active == 4
+    assert state.delegated_tasks_oldest_started_at == 75.0
+    assert state.delegated_tasks_last_activity_at == 100.0
+    assert state.terminal_stall_started_at is None
+
+    state.observe(
+        DelegatedTaskLifecycleEvent(3, 40.0, "updated"),
+        observed_at=115.0,
+    )
+    assert state.delegated_tasks_oldest_started_at == 75.0
+
+    settled = state.observe(
+        DelegatedTaskLifecycleEvent(0, None, "terminal"),
+        observed_at=130.0,
+    )
+
+    assert isinstance(settled, DelegatedTaskLifecycleTransition)
+    assert state.delegated_tasks_active == 0
+    assert state.delegated_tasks_oldest_started_at is None
+    assert state.terminal_stall_started_at == 130.0
+
+
+def test_delegated_lifecycle_does_not_clear_pending_approval_route() -> None:
+    state = TurnEventState()
+    approval = ApprovalRequestEvent(
+        "approval-1",
+        "Bash",
+        {"command": "true"},
+        "run a command",
+    )
+    state.observe(approval, observed_at=10.0)
+
+    state.observe(
+        DelegatedTaskLifecycleEvent(1, 5.0, "updated"),
+        observed_at=12.0,
+    )
+
+    assert state.approval_pending is True
+    assert state.approval_pending_since == 10.0
 
 
 def test_text_and_message_transitions_preserve_event_identity() -> None:

@@ -299,7 +299,9 @@ CAPABILITY_AXES: tuple[CapabilityAxis, ...] = (
         "grace with exactly-once buffered answer delivery.",
         claude=_supported(
             "The Claude reader applies CCC_TERMINAL_STALL_SECONDS with exactly-once "
-            "buffered delivery (#411)."
+            "buffered delivery, while body-free delegated-task lifecycle events "
+            "defer that short guard and remain bounded by "
+            "CCC_DELEGATED_TASK_STALL_SECONDS (#411, #874)."
         ),
         codex=_supported(
             "The provider-neutral consumer shares the same stall guard and closes "

@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 import logging
 from pathlib import Path
 import re
-from typing import Any, Protocol, cast
+from typing import Any, Literal, Protocol, cast
 import uuid
 
 from claude_agent_sdk import (
@@ -58,6 +58,7 @@ from .agent_runtime import (
     ApprovalHandler,
     ApprovalRequestEvent,
     CompletionEvent,
+    DelegatedTaskLifecycleEvent,
     ErrorEvent,
     JsonValue,
     MessageCompletedEvent,
@@ -246,7 +247,7 @@ class _ActiveTurn:
     # The Claude SDK can emit an intermediate ResultMessage while delegated
     # local work is still running.  Keep the exact turn/generation alive until
     # those tasks settle and their continuation emits the run-ending result.
-    result_deferring_tasks: set[str] = field(default_factory=set)
+    result_deferring_tasks: dict[str, float] = field(default_factory=dict)
     # Terminal lifecycle frames can overtake a buffered start.  This ledger is
     # scoped to one turn, so retaining every validated id until completion is
     # both finite and necessary to prevent a late start from re-opening it.
@@ -739,7 +740,9 @@ class ClaudeSession:
         self._observe_background_task_notifications(message)
         active = self._active_turn
         if active is not None and not active.finished:
-            self._observe_result_deferring_task(active, message)
+            delegated_event = self._observe_result_deferring_task(active, message)
+            if delegated_event is not None:
+                active.queue.put_nowait(delegated_event)
         if self._unsolicited_inflight or active is None or active.finished:
             # Same ownership rule as the direct reader loop
             # (``unsolicited_inflight or not state.pending``): a turn-bearing
@@ -771,59 +774,89 @@ class ClaudeSession:
                 self._complete_turn(active, message)
 
     @staticmethod
-    def _observe_result_deferring_task(active: _ActiveTurn, message: Message) -> None:
-        """Mirror the Agent SDK's run-boundary task ledger without task bodies."""
+    def _delegated_task_event(
+        active: _ActiveTurn,
+        *,
+        activity: Literal["started", "updated", "terminal"],
+        now: float,
+    ) -> DelegatedTaskLifecycleEvent:
+        oldest_age = None
+        if active.result_deferring_tasks:
+            oldest_age = max(0.0, now - min(active.result_deferring_tasks.values()))
+        return DelegatedTaskLifecycleEvent(
+            active_count=len(active.result_deferring_tasks),
+            oldest_age_seconds=oldest_age,
+            activity=activity,
+        )
 
+    @staticmethod
+    def _delegated_task_change(
+        message: Message,
+    ) -> tuple[Literal["started", "updated", "terminal"], str, object | None] | None:
+        """Normalize one SDK task frame without retaining any task body."""
         if isinstance(message, TaskStartedMessage):
             task_id = _normalize_task_id(message.task_id)
-            if (
-                task_id is not None
-                and task_id not in active.result_deferring_terminal_tasks
-                and message.task_type in _RESULT_DEFERRING_TASK_TYPES
-            ):
-                active.result_deferring_tasks.add(task_id)
-            return
+            return ("started", task_id, message.task_type) if task_id is not None else None
         if isinstance(message, TaskNotificationMessage):
-            # TaskNotificationStatus is terminal-only, so release regardless
-            # of which terminal spelling the SDK carries.
             task_id = _normalize_task_id(message.task_id)
-            if task_id is not None:
-                active.result_deferring_terminal_tasks.add(task_id)
-                active.result_deferring_tasks.discard(task_id)
-            return
+            return ("terminal", task_id, None) if task_id is not None else None
         if isinstance(message, TaskUpdatedMessage):
             task_id = _normalize_task_id(message.task_id)
-            if (
-                task_id is not None
-                and ClaudeSession._task_update_status(message)
-                in SDK_TERMINAL_TASK_STATUSES
-            ):
-                active.result_deferring_terminal_tasks.add(task_id)
-                active.result_deferring_tasks.discard(task_id)
-            return
+            if task_id is None:
+                return None
+            status = ClaudeSession._task_update_status(message)
+            typed_action: Literal["updated", "terminal"] = (
+                "terminal" if status in SDK_TERMINAL_TASK_STATUSES else "updated"
+            )
+            return (typed_action, task_id, None)
         if not isinstance(message, SystemMessage):
-            return
+            return None
         data = message.data
         task_id = _normalize_task_id(data.get("task_id"))
         if task_id is None:
-            return
+            return None
         if message.subtype == "task_started":
-            if (
-                task_id not in active.result_deferring_terminal_tasks
-                and data.get("task_type") in _RESULT_DEFERRING_TASK_TYPES
-            ):
-                active.result_deferring_tasks.add(task_id)
-            return
+            return ("started", task_id, data.get("task_type"))
         if message.subtype == "task_notification":
-            active.result_deferring_terminal_tasks.add(task_id)
-            active.result_deferring_tasks.discard(task_id)
-            return
+            return ("terminal", task_id, None)
         if message.subtype == "task_updated":
             patch = data.get("patch")
             status = patch.get("status") if isinstance(patch, Mapping) else None
-            if status in SDK_TERMINAL_TASK_STATUSES:
-                active.result_deferring_terminal_tasks.add(task_id)
-                active.result_deferring_tasks.discard(task_id)
+            system_action: Literal["updated", "terminal"] = (
+                "terminal" if status in SDK_TERMINAL_TASK_STATUSES else "updated"
+            )
+            return (system_action, task_id, None)
+        return None
+
+    @staticmethod
+    def _observe_result_deferring_task(
+        active: _ActiveTurn,
+        message: Message,
+    ) -> DelegatedTaskLifecycleEvent | None:
+        """Mirror the Agent SDK's run-boundary task ledger without task bodies."""
+
+        change = ClaudeSession._delegated_task_change(message)
+        if change is None:
+            return None
+        action, task_id, task_type = change
+        now = asyncio.get_running_loop().time()
+        if action == "started":
+            if (
+                task_type not in _RESULT_DEFERRING_TASK_TYPES
+                or task_id in active.result_deferring_terminal_tasks
+                or task_id in active.result_deferring_tasks
+            ):
+                return None
+            active.result_deferring_tasks[task_id] = now
+            return ClaudeSession._delegated_task_event(active, activity="started", now=now)
+        if action == "terminal":
+            active.result_deferring_terminal_tasks.add(task_id)
+            if active.result_deferring_tasks.pop(task_id, None) is None:
+                return None
+            return ClaudeSession._delegated_task_event(active, activity="terminal", now=now)
+        if task_id not in active.result_deferring_tasks:
+            return None
+        return ClaudeSession._delegated_task_event(active, activity="updated", now=now)
 
     def _observe_session_id(self, message: Message) -> None:
         if self._session_id is not None:

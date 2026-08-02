@@ -10,6 +10,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
+import math
 from types import MappingProxyType
 from typing import Literal, Protocol, TypeAlias
 
@@ -139,6 +140,44 @@ class ApprovalRequestEvent:
 
 
 @dataclass(frozen=True, slots=True)
+class DelegatedTaskLifecycleEvent:
+    """Body-free snapshot of delegated work owned by the active provider turn.
+
+    Provider task identifiers, descriptions, prompts, and results deliberately
+    stop at the adapter.  The orchestrator needs only this aggregate lifecycle
+    state to distinguish a healthy delegated run from a vanished terminal
+    frame.  ``oldest_age_seconds`` is measured by the adapter's monotonic clock
+    and is absent exactly when no delegated task remains active.
+    """
+
+    active_count: int
+    oldest_age_seconds: float | None
+    activity: Literal["started", "updated", "terminal"]
+    kind: Literal["delegated_task_lifecycle"] = "delegated_task_lifecycle"
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.active_count, bool)
+            or not isinstance(self.active_count, int)
+            or self.active_count < 0
+        ):
+            raise ValueError("delegated task active count must be non-negative")
+        if self.active_count == 0:
+            if self.oldest_age_seconds is not None:
+                raise ValueError("idle delegated task state cannot carry an oldest age")
+            return
+        age = self.oldest_age_seconds
+        if (
+            age is None
+            or isinstance(age, bool)
+            or not isinstance(age, (int, float))
+            or not math.isfinite(age)
+            or age < 0
+        ):
+            raise ValueError("active delegated task state requires a non-negative age")
+
+
+@dataclass(frozen=True, slots=True)
 class CompletionEvent:
     """The provider has finished generating the current turn."""
 
@@ -184,6 +223,7 @@ AgentEvent: TypeAlias = (
     | ToolStartedEvent
     | ToolCompletedEvent
     | ApprovalRequestEvent
+    | DelegatedTaskLifecycleEvent
     | CompletionEvent
     | ResultEvent
     | ErrorEvent

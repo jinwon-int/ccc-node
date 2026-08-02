@@ -63,6 +63,10 @@ class RuntimeHealthReporter:
         self._process_mode = "foreground"
         self._token_lock_file = ""
         self._owns_token_lock = False
+        # Ephemeral request refs never leave this process. They let concurrent
+        # turns contribute to one body-free delegated-task gauge without
+        # exposing chat/session/task identifiers in health.json.
+        self._delegated_tasks_by_request: dict[int, int] = {}
         configured_provider = agent_provider or getattr(config, "agent_provider", "claude")
         self._agent_provider = (
             "codex" if str(configured_provider).strip().lower() == "codex" else "claude"
@@ -134,6 +138,9 @@ class RuntimeHealthReporter:
             ),
             "requests": {
                 "stalled": 0,
+                "delegated_tasks_active": 0,
+                "terminal_stall_deferred_for_tasks": 0,
+                "delegated_task_stalls": 0,
             },
         }
 
@@ -334,6 +341,40 @@ class RuntimeHealthReporter:
         with self._lock:
             requests = self._state.setdefault("requests", {"stalled": 0})
             requests["stalled"] = int(requests.get("stalled", 0)) + max(0, int(count))
+            self._write_health_locked()
+
+    def record_delegated_task_activity(self, request_ref: int, active_count: int) -> None:
+        """Project the aggregate active delegated-task gauge for live turns."""
+
+        ref = int(request_ref)
+        count = max(0, int(active_count))
+        with self._lock:
+            if count:
+                self._delegated_tasks_by_request[ref] = count
+            else:
+                self._delegated_tasks_by_request.pop(ref, None)
+            requests = self._state.setdefault("requests", {"stalled": 0})
+            requests["delegated_tasks_active"] = sum(
+                self._delegated_tasks_by_request.values()
+            )
+            self._write_health_locked()
+
+    def record_terminal_stall_deferred_for_tasks(self, count: int = 1) -> None:
+        """Count turns whose ordinary terminal guard yielded to delegated work."""
+
+        with self._lock:
+            requests = self._state.setdefault("requests", {"stalled": 0})
+            key = "terminal_stall_deferred_for_tasks"
+            requests[key] = int(requests.get(key, 0)) + max(0, int(count))
+            self._write_health_locked()
+
+    def record_delegated_task_stall(self, count: int = 1) -> None:
+        """Count turns released by the distinct delegated-task hard limit."""
+
+        with self._lock:
+            requests = self._state.setdefault("requests", {"stalled": 0})
+            key = "delegated_task_stalls"
+            requests[key] = int(requests.get(key, 0)) + max(0, int(count))
             self._write_health_locked()
 
     def record_empty_completion(self, *, recovered: bool, count: int = 1) -> None:

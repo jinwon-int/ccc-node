@@ -212,6 +212,14 @@ class ProjectChatHandler(
         # Opt-in lifecycle audit observer (#645); None on a default node.
         self._lifecycle_observer = build_lifecycle_observer(self._config)
         self._process_timeout_seconds = PROCESS_TIMEOUT
+        delegated_task_stall_seconds = float(
+            getattr(self._config, "delegated_task_stall_seconds", 7200.0)
+        )
+        if delegated_task_stall_seconds >= self._process_timeout_seconds:
+            raise ValueError(
+                "CCC_DELEGATED_TASK_STALL_SECONDS must be lower than "
+                "CLAUDE_PROCESS_TIMEOUT"
+            )
         self._typing_interval_seconds = TYPING_INTERVAL
         self._conversation_locks: Dict[Tuple[int, int], asyncio.Lock] = {}
         self._claude_usage: Dict[Tuple[int, int, str], UsageSnapshot] = {}
