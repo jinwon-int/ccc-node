@@ -24,10 +24,11 @@ from telegram_bot.utils.redaction import REDACTION_MARKER, redact_credentials
 
 _FINGERPRINT_KEY = secrets.token_bytes(32)
 _ANSI_ESCAPE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
-_AUTHORIZATION = re.compile(
-    r"\bauthorization\s*[:=]\s*(?:basic|bearer)?\s*[^\s,;]+",
+_QUOTED_AUTHORIZATION = re.compile(
+    r'''(?P<quote>["'])\s*authorization\s*[:=][^\r\n]*?(?P=quote)''',
     re.IGNORECASE,
 )
+_AUTHORIZATION = re.compile(r"\bauthorization\s*[:=][^\r\n;]*", re.IGNORECASE)
 _ENV_ASSIGNMENT = re.compile(
     r'''(?<![\w])([A-Za-z_][A-Za-z0-9_]{0,63})=("[^"\r\n]*"|'[^'\r\n]*'|[^\s]+)'''
 )
@@ -61,18 +62,18 @@ _SENSITIVE_KEYS = frozenset(
     }
 )
 _COMMAND_ACTIONS = frozenset(
-    {"item/commandExecution/requestApproval", "bash", "shell", "command"}
+    {"item/commandexecution/requestapproval", "bash", "shell", "command"}
 )
 _FILE_ACTIONS = frozenset(
     {
-        "item/fileChange/requestApproval",
+        "item/filechange/requestapproval",
         "edit",
         "multiedit",
         "notebookedit",
         "write",
     }
 )
-_PERMISSION_ACTIONS = frozenset({"item/permissions/requestApproval"})
+_PERMISSION_ACTIONS = frozenset({"item/permissions/requestapproval"})
 _PATH_KEYS = ("path", "file_path", "filePath", "paths", "target", "targets")
 _CWD_KEYS = ("cwd", "working_directory", "workingDirectory")
 _COMMAND_KEYS = ("command", "cmd", "script")
@@ -148,11 +149,17 @@ def _safe_text(
     if first_line_only and ("\n" in text or "\r" in text):
         text = text.splitlines()[0] + " …"
         flags.add("body_omitted")
-    authorization_present = bool(_AUTHORIZATION.search(text))
+    authorization_present = bool(
+        _QUOTED_AUTHORIZATION.search(text) or _AUTHORIZATION.search(text)
+    )
     redacted = redact_credentials(text)
     if redacted != text:
         flags.add("credential_redacted")
-    text = _AUTHORIZATION.sub(f"Authorization: {REDACTION_MARKER}", redacted)
+    text = _QUOTED_AUTHORIZATION.sub(
+        lambda match: f"{match.group('quote')}{REDACTION_MARKER}{match.group('quote')}",
+        redacted,
+    )
+    text = _AUTHORIZATION.sub(f"Authorization: {REDACTION_MARKER}", text)
     if authorization_present:
         flags.add("authorization_redacted")
 
@@ -184,12 +191,12 @@ def _argument(arguments: Mapping[str, object], keys: Sequence[str]) -> object | 
 
 def _provider_and_shape(action: str) -> tuple[str, str, str]:
     normalized = action.casefold()
-    provider = "codex" if action.startswith("item/") else "claude"
-    if action in _COMMAND_ACTIONS or normalized in _COMMAND_ACTIONS:
+    provider = "codex" if normalized.startswith("item/") else "claude"
+    if normalized in _COMMAND_ACTIONS:
         return provider, "command_execution", "command"
-    if action in _FILE_ACTIONS or normalized in _FILE_ACTIONS:
+    if normalized in _FILE_ACTIONS:
         return provider, "file_change", "file"
-    if action in _PERMISSION_ACTIONS:
+    if normalized in _PERMISSION_ACTIONS:
         return provider, "permissions", "permission-set"
     return provider, "tool_use", "tool"
 

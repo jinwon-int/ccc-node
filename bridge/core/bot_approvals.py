@@ -178,24 +178,30 @@ class BotApprovalMixin:
         if ledger is None:
             return
         snapshot = pending.snapshot
-        ledger.record(
-            ApprovalAuditRecord(
-                event="asked",
-                approval_ref=pending.approval_ref,
-                provider=snapshot.provider,
-                action=snapshot.action,
-                target_shape=snapshot.target_shape,
-                session_ref=pending.session_ref,
-                turn_ref=pending.turn_ref,
-                request_ref=pending.request_ref,
-                actor_ref=None,
-                request_fingerprint=snapshot.request_fingerprint,
-                display_fingerprint=snapshot.display_fingerprint,
-                asked_at=pending.asked_at,
-                redaction_flags=snapshot.redaction_flags,
-                displayed_fields=snapshot.displayed_fields,
+        try:
+            ledger.record(
+                ApprovalAuditRecord(
+                    event="asked",
+                    approval_ref=pending.approval_ref,
+                    provider=snapshot.provider,
+                    action=snapshot.action,
+                    target_shape=snapshot.target_shape,
+                    session_ref=pending.session_ref,
+                    turn_ref=pending.turn_ref,
+                    request_ref=pending.request_ref,
+                    actor_ref=None,
+                    request_fingerprint=snapshot.request_fingerprint,
+                    display_fingerprint=snapshot.display_fingerprint,
+                    asked_at=pending.asked_at,
+                    redaction_flags=snapshot.redaction_flags,
+                    displayed_fields=snapshot.displayed_fields,
+                )
             )
-        )
+        except Exception as error:
+            logger.warning(
+                "approval audit asked record failed (continuing): %s",
+                type(error).__name__,
+            )
 
     def _record_approval_terminal(
         self,
@@ -221,32 +227,41 @@ class BotApprovalMixin:
             decision = "invalidated"
         loop = asyncio.get_running_loop()
         snapshot = pending.snapshot
-        ledger.record(
-            ApprovalAuditRecord(
-                event="answered",
-                approval_ref=pending.approval_ref,
-                provider=snapshot.provider,
-                action=snapshot.action,
-                target_shape=snapshot.target_shape,
-                session_ref=pending.session_ref,
-                turn_ref=pending.turn_ref,
-                request_ref=pending.request_ref,
-                actor_ref=(
-                    opaque_ref("approval-actor", actor_user_id)
-                    if actor_user_id is not None
-                    else None
-                ),
-                request_fingerprint=snapshot.request_fingerprint,
-                display_fingerprint=snapshot.display_fingerprint,
-                asked_at=pending.asked_at,
-                answered_at=self._utc_now(),
-                decision=decision,
-                reason=reason,
-                latency_ms=max(0, round((loop.time() - pending.asked_monotonic) * 1000)),
-                redaction_flags=snapshot.redaction_flags,
-                displayed_fields=snapshot.displayed_fields,
+        try:
+            ledger.record(
+                ApprovalAuditRecord(
+                    event="answered",
+                    approval_ref=pending.approval_ref,
+                    provider=snapshot.provider,
+                    action=snapshot.action,
+                    target_shape=snapshot.target_shape,
+                    session_ref=pending.session_ref,
+                    turn_ref=pending.turn_ref,
+                    request_ref=pending.request_ref,
+                    actor_ref=(
+                        opaque_ref("approval-actor", actor_user_id)
+                        if actor_user_id is not None
+                        else None
+                    ),
+                    request_fingerprint=snapshot.request_fingerprint,
+                    display_fingerprint=snapshot.display_fingerprint,
+                    asked_at=pending.asked_at,
+                    answered_at=self._utc_now(),
+                    decision=decision,
+                    reason=reason,
+                    latency_ms=max(
+                        0,
+                        round((loop.time() - pending.asked_monotonic) * 1000),
+                    ),
+                    redaction_flags=snapshot.redaction_flags,
+                    displayed_fields=snapshot.displayed_fields,
+                )
             )
-        )
+        except Exception as error:
+            logger.warning(
+                "approval audit terminal record failed (continuing): %s",
+                type(error).__name__,
+            )
 
     def _invalidate_codex_approvals(self, user_id: int, chat_id: int) -> None:
         invalidate = getattr(self._project_chat, "invalidate_agent_approvals", None)

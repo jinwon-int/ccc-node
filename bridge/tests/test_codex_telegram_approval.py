@@ -399,3 +399,31 @@ async def test_claude_approve_each_uses_provider_neutral_owner_prompt() -> None:
     )
     assert await subject._resolve_codex_approval(7, 70, _callback_data(telegram, 0)) is True
     assert await task is ApprovalDecision.ALLOW
+
+
+@pytest.mark.anyio
+async def test_audit_record_construction_failure_does_not_block_owner_decision(
+    approval_event: ApprovalRequestEvent,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class BrokenAuditRecord:
+        def __init__(self, **_kwargs) -> None:
+            raise ValueError("synthetic schema failure")
+
+    monkeypatch.setattr(
+        "telegram_bot.core.bot_approvals.ApprovalAuditRecord",
+        BrokenAuditRecord,
+    )
+    subject, telegram = _subject(bot_data_dir=tmp_path)
+    subject._project_chat.active.add((7, 70, 4))
+
+    task = asyncio.create_task(subject._codex_approval_callback(70, 7, approval_event, 4))
+    await _wait_pending(subject)
+
+    assert await subject._resolve_codex_approval(
+        7,
+        70,
+        _callback_data(telegram, 0),
+    ) is True
+    assert await task is ApprovalDecision.ALLOW

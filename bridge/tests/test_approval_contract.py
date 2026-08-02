@@ -104,6 +104,30 @@ def test_service_prefixed_sensitive_options_are_fully_redacted() -> None:
     assert snapshot.summary.count("[REDACTED_CREDENTIAL]") == 5
 
 
+def test_custom_authorization_schemes_never_leave_credentials() -> None:
+    event = ApprovalRequestEvent(
+        "custom-authorization",
+        "ITEM/CommandExecution/RequestApproval",
+        {
+            "command": (
+                'curl -H "Authorization: Token quoted-secret" '
+                "https://example.invalid; printf Authorization: Custom "
+                "unquoted-secret second-secret"
+            )
+        },
+        "custom authorization headers",
+    )
+
+    snapshot = build_approval_snapshot(event)
+
+    assert snapshot.provider == "codex"
+    assert snapshot.action == "command_execution"
+    assert "https://example.invalid" in snapshot.summary
+    for forbidden in ("Token", "quoted-secret", "Custom", "unquoted-secret", "second-secret"):
+        assert forbidden not in snapshot.prompt_text
+    assert "authorization_redacted" in snapshot.redaction_flags
+
+
 def test_file_snapshot_shows_only_bounded_target_not_body() -> None:
     event = ApprovalRequestEvent(
         "request-file",
