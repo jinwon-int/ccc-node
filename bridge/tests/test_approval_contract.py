@@ -122,7 +122,10 @@ def test_custom_authorization_schemes_never_leave_credentials() -> None:
 
     assert snapshot.provider == "codex"
     assert snapshot.action == "command_execution"
-    assert "https://example.invalid" in snapshot.summary
+    assert snapshot.summary == (
+        'curl -H "[REDACTED_CREDENTIAL]" https://example.invalid; '
+        "printf Authorization: [REDACTED_CREDENTIAL]"
+    )
     for forbidden in ("Token", "quoted-secret", "Custom", "unquoted-secret", "second-secret"):
         assert forbidden not in snapshot.prompt_text
     assert "authorization_redacted" in snapshot.redaction_flags
