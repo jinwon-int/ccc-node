@@ -10,7 +10,8 @@
 #
 # By default this script self-heals: if no supervisor is holding the lock and
 # the supervisor-count-cap is not violated, it detaches a fresh supervisor via
-# `setsid -f` and returns rc=0.  It also recovers the ND-1236 "stuck" state — a
+# `setsid -f`, verifies a new canonical PID identity, and returns rc=0.  It also
+# recovers the ND-1236 "stuck" state — a
 # live supervisor whose tunnel has died and whose worker is therefore crash-
 # looping — by restarting the supervisor, but only under strict guards (N
 # consecutive down cycles, a reachable ssh target, and a restart cooldown; see
@@ -21,14 +22,16 @@
 # Exit codes (fail-closed with distinct rc so cron logs are self-explanatory):
 #   0   healthy, spawned a fresh supervisor, or recovered a dead tunnel
 #   2   env validation failure, or missing --env-file
-#   3   supervisor up but tunnel DOWN and this cycle could not recover it
-#       (still debouncing, in cooldown, target unreachable, or recovery off)
+#   3   unhealthy: no supervisor in read-only mode, or supervisor up but the
+#       tunnel is DOWN and this cycle could not recover it
 #   4   supervisor-count-cap exceeded — MANUAL SWEEP REQUIRED (ND-1236 replay)
-#   5   self-heal/recovery was requested but spawning setsid failed
+#   5   self-heal/recovery was requested but no canonical supervisor appeared
 set -uo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HARNESS="$SCRIPT_DIR/a2a-termux-native-worker.sh"
+# shellcheck source=scripts/lib/a2a-supervisor-identity.sh
+. "$SCRIPT_DIR/lib/a2a-supervisor-identity.sh"
 
 LOCAL_PORT=18790
 
@@ -98,13 +101,17 @@ except FileNotFoundError:
 PY
 }
 
-# Return the running supervisor's PID, or empty.  Same logic as the harness.
+# Return the running canonical supervisor's verified identity, or empty.
+current_supervisor_record() {
+    a2a_current_supervisor_record "$PIDFILE" "$HARNESS" "$LOCK"
+}
+
 current_supervisor_pid() {
-    [[ -f "$PIDFILE" ]] || return 0
-    local pid
-    pid=$(head -n1 "$PIDFILE" 2>/dev/null | tr -d '[:space:]')
-    [[ -n "$pid" && "$pid" =~ ^[0-9]+$ ]] || return 0
-    kill -0 "$pid" 2>/dev/null && printf '%s' "$pid" || return 0
+    local record pid _token
+    record=$(current_supervisor_record)
+    [[ -n "$record" ]] || return 0
+    read -r pid _token <<<"$record"
+    printf '%s' "$pid"
 }
 
 # Count distinct supervisor-looking processes.  Emits space-separated PIDs on
@@ -119,11 +126,11 @@ current_supervisor_pid() {
 # shape.  Tunnel-loop / worker-loop subshells inherit the supervisor's session
 # and process group but are not leaders, so they are still filtered out.
 is_detached_supervisor_root() {
-    local pid="$1" stat rest state ppid pgrp session
+    local pid="$1" stat rest ppid pgrp session
     [[ -n "$pid" && -r "/proc/$pid/stat" ]] || return 1
     stat=$(cat "/proc/$pid/stat" 2>/dev/null) || return 1
     rest=${stat##*) }
-    read -r state ppid pgrp session _ <<<"$rest"
+    read -r _ ppid pgrp session _ <<<"$rest"
     [[ -n "$ppid" && -n "$pgrp" && -n "$session" ]] || return 1
     [[ "$ppid" == "1" || "$pid" == "$pgrp" || "$pid" == "$session" ]]
 }
@@ -145,18 +152,30 @@ count_workers_under() {
         printf '%s\n' "${n:-0}"
         return
     fi
-    # Skip regex-escape entirely: pgrep's `.` in worker.js is technically
-    # "any char", but for our purpose (counting live worker.js processes
-    # under a specific root) that's a harmless over-match — no real command
-    # line will match "$root/dist/worker[not-a-dot]js".  This avoids brittle
-    # portability of `sed` character-class parsing (Termux's sed rejects some
-    # bracket patterns that GNU sed accepts).
-    n=$(pgrep -c -f "$root/dist/worker.js" 2>/dev/null || true)
-    printf '%s\n' "${n:-0}"
+    # Compare NUL-delimited argv exactly.  Treating an operator-controlled root
+    # as a pgrep regex lets '.', '[', or '\\' change which processes match.
+    python3 - "$root/dist/worker.js" <<'PY'
+import glob
+import os
+import sys
+
+expected = os.path.realpath(sys.argv[1])
+count = 0
+for path in glob.glob("/proc/[0-9]*/cmdline"):
+    if path == f"/proc/{os.getpid()}/cmdline":
+        continue
+    try:
+        argv = [os.fsdecode(arg) for arg in open(path, "rb").read().split(b"\0") if arg]
+    except OSError:
+        continue
+    if any(os.path.realpath(arg) == expected for arg in argv[1:]):
+        count += 1
+print(count)
+PY
 }
 
 tunnel_status() {
-    if timeout 3 curl -sS -o /dev/null "http://127.0.0.1:${LOCAL_PORT}/livez" 2>/dev/null; then
+    if timeout 3 curl -fsS -o /dev/null "http://127.0.0.1:${LOCAL_PORT}/livez" 2>/dev/null; then
         echo UP
     else
         echo DOWN
@@ -198,16 +217,65 @@ ssh_target_reachable() {
         -o StrictHostKeyChecking=accept-new "$target" true >/dev/null 2>&1
 }
 
-# Print a single-line JSON summary.  Deliberately hand-rolled (no jq) so the
-# health check works on minimal Termux profiles and can be piped straight into
-# a fleet log ingester.
+# Print a single-line JSON summary.  Python is already a hard dependency of the
+# native harness; json.dumps safely quotes paths and control characters without
+# adding jq to minimal Termux profiles.
 emit_json() {
     local sup_pid="$1" sup_count="$2" sup_pids_csv="$3" \
           workers="$4" tunnel="$5" action="$6" rc="$7"
-    printf '{"schema":"a2a-native-worker-health.v1","supervisor_pid":%s,"supervisor_count":%s,"supervisor_pids":[%s],"workers":%s,"tunnel":"%s","action":"%s","rc":%s,"max_supervisors":%s,"lock":"%s","ts":"%s"}\n' \
-        "${sup_pid:-null}" "$sup_count" "$sup_pids_csv" \
-        "$workers" "$tunnel" "$action" "$rc" "$MAX_SUPERVISORS" \
-        "$LOCK" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    python3 - "$sup_pid" "$sup_count" "$sup_pids_csv" "$workers" \
+        "$tunnel" "$action" "$rc" "$MAX_SUPERVISORS" "$LOCK" <<'PY'
+import datetime
+import json
+import sys
+
+sup_pid, sup_count, sup_pids, workers, tunnel, action, rc, maximum, lock = sys.argv[1:]
+payload = {
+    "schema": "a2a-native-worker-health.v1",
+    "supervisor_pid": int(sup_pid) if sup_pid else None,
+    "supervisor_count": int(sup_count),
+    "supervisor_pids": [int(pid) for pid in sup_pids.split(",") if pid],
+    "workers": int(workers),
+    "tunnel": tunnel,
+    "action": action,
+    "rc": int(rc),
+    "max_supervisors": int(maximum),
+    "lock": lock,
+    "ts": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+}
+print(json.dumps(payload, separators=(",", ":"), ensure_ascii=False))
+PY
+}
+
+valid_bounded_uint() {
+    local name="$1" value="$2" maximum="$3" numeric
+    if [[ ! "$value" =~ ^[0-9]{1,6}$ ]]; then
+        printf '%s must be an integer in 1..%s (got %q)\n' \
+            "$name" "$maximum" "$value" >&2
+        return 1
+    fi
+    numeric=$((10#$value))
+    if (( numeric < 1 || numeric > maximum )); then
+        printf '%s must be an integer in 1..%s (got %q)\n' \
+            "$name" "$maximum" "$value" >&2
+        return 1
+    fi
+}
+
+# `setsid -f` returning zero proves only that its fork request was accepted.
+# Require a new canonical PID/start-token record before claiming recovery.
+spawn_supervisor_and_verify() {
+    local env_file="$1" old_record="${2:-}" record attempt
+    setsid -f bash "$HARNESS" supervise --env-file "$env_file" \
+        </dev/null >>"$LOG" 2>&1 || return 1
+    for ((attempt = 0; attempt < 50; attempt++)); do
+        record=$(current_supervisor_record)
+        if [[ -n "$record" && "$record" != "$old_record" ]]; then
+            return 0
+        fi
+        sleep 0.1
+    done
+    return 1
 }
 
 usage() {
@@ -240,9 +308,9 @@ Options:
 Exit codes:
   0  healthy or spawned a fresh supervisor
   2  env validation failure / missing --env-file
-  3  supervisor is running but tunnel is DOWN (self-heal cannot help)
+  3  no supervisor in read-only mode, or supervisor tunnel is DOWN
   4  supervisor-count-cap exceeded — MANUAL SWEEP REQUIRED (Wiki ND-1236)
-  5  self-heal was requested but spawning setsid failed
+  5  self-heal was requested but no canonical supervisor appeared
 
 Environment overrides (shared with the harness):
   A2A_SUPERVISOR_LOCK_DIR       Default \$HOME/.a2a
@@ -265,13 +333,21 @@ main() {
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --env-file)         env_file="${2:-}"; shift 2 ;;
+            --env-file)
+                [[ $# -ge 2 ]] || { echo "--env-file requires a value" >&2; return 2; }
+                env_file="$2"; shift 2 ;;
             --self-heal)        self_heal=1; shift ;;
             --no-self-heal)     self_heal=0; shift ;;
-            --max-supervisors)  MAX_SUPERVISORS="${2:-1}"; shift 2 ;;
+            --max-supervisors)
+                [[ $# -ge 2 ]] || { echo "--max-supervisors requires a value" >&2; return 2; }
+                MAX_SUPERVISORS="$2"; shift 2 ;;
             --no-tunnel-recovery)        tunnel_recovery=0; shift ;;
-            --tunnel-down-restart-after) TUNNEL_DOWN_RESTART_AFTER="${2:-3}"; shift 2 ;;
-            --tunnel-restart-cooldown)   TUNNEL_RESTART_COOLDOWN="${2:-1800}"; shift 2 ;;
+            --tunnel-down-restart-after)
+                [[ $# -ge 2 ]] || { echo "--tunnel-down-restart-after requires a value" >&2; return 2; }
+                TUNNEL_DOWN_RESTART_AFTER="$2"; shift 2 ;;
+            --tunnel-restart-cooldown)
+                [[ $# -ge 2 ]] || { echo "--tunnel-restart-cooldown requires a value" >&2; return 2; }
+                TUNNEL_RESTART_COOLDOWN="$2"; shift 2 ;;
             --json)             emit_json_flag=1; shift ;;
             --quiet)            quiet=1; shift ;;
             -h|--help)          usage; return 2 ;;
@@ -281,6 +357,9 @@ main() {
 
     [[ -n "$env_file" ]] || { echo "--env-file required" >&2; usage; return 2; }
     [[ -f "$env_file" ]] || { echo "env file not found: $env_file" >&2; return 2; }
+    valid_bounded_uint --max-supervisors "$MAX_SUPERVISORS" 100 || return 2
+    valid_bounded_uint --tunnel-down-restart-after "$TUNNEL_DOWN_RESTART_AFTER" 1000 || return 2
+    valid_bounded_uint --tunnel-restart-cooldown "$TUNNEL_RESTART_COOLDOWN" 604800 || return 2
 
     # Validate the env via the canonical harness before doing anything else.
     if ! "$HARNESS" check --env-file "$env_file" >/dev/null 2>&1; then
@@ -289,8 +368,10 @@ main() {
         return 2
     fi
 
-    local sup_pid worker_root workers tunnel sup_pids sup_count sup_pids_csv
-    sup_pid=$(current_supervisor_pid)
+    local sup_record sup_pid _sup_token worker_root workers tunnel sup_count sup_pids_csv
+    sup_record=$(current_supervisor_record)
+    sup_pid=""
+    [[ -n "$sup_record" ]] && read -r sup_pid _sup_token <<<"$sup_record"
     worker_root=$(extract_env_value A2A_WORKER_ROOT "$env_file")
     workers=$(count_workers_under "$worker_root")
     tunnel=$(tunnel_status)
@@ -332,8 +413,7 @@ main() {
                     record_restart_ts
                     reset_tunnel_down_streak
                     "$HARNESS" stop >/dev/null 2>&1 || true
-                    if setsid -f bash "$HARNESS" supervise --env-file "$env_file" \
-                            </dev/null >>"$LOG" 2>&1; then
+                    if spawn_supervisor_and_verify "$env_file" "$sup_record"; then
                         local msg="tunnel-down recovery: restarted supervisor (was pid=$sup_pid after $streak down cycles)"
                         log "$msg"
                         (( quiet )) || echo "$msg"
@@ -341,8 +421,8 @@ main() {
                             "$workers" "$tunnel" tunnel-recovered 0
                         return 0
                     fi
-                    log "tunnel-down recovery: setsid respawn failed"
-                    echo "tunnel-down recovery: setsid respawn failed" >&2
+                    log "tunnel-down recovery: no canonical supervisor appeared after setsid"
+                    echo "tunnel-down recovery: no canonical supervisor appeared after setsid" >&2
                     (( emit_json_flag )) && emit_json "$sup_pid" "$sup_count" "$sup_pids_csv" \
                         "$workers" "$tunnel" self-heal-failed 5
                     return 5
@@ -377,23 +457,22 @@ main() {
 
     # ---- no supervisor: optionally self-heal ----
     if (( self_heal == 0 )); then
-        (( quiet )) || printf 'DOWN no supervisor holding %s (self-heal disabled)\n' "$LOCK"
+        printf 'DOWN no supervisor holding %s (self-heal disabled)\n' "$LOCK" >&2
         (( emit_json_flag )) && emit_json "" "$sup_count" "$sup_pids_csv" \
-            "$workers" "$tunnel" no-supervisor 0
-        return 0
+            "$workers" "$tunnel" no-supervisor 3
+        return 3
     fi
 
     log "self-heal: spawning supervisor via setsid"
-    if setsid -f bash "$HARNESS" supervise --env-file "$env_file" \
-            </dev/null >>"$LOG" 2>&1; then
+    if spawn_supervisor_and_verify "$env_file"; then
         (( quiet )) || printf 'STARTED workers=%s tunnel=%s\n' "$workers" "$tunnel"
         (( emit_json_flag )) && emit_json "" "$sup_count" "$sup_pids_csv" \
             "$workers" "$tunnel" spawned 0
         return 0
     fi
 
-    log "self-heal FAILED: setsid returned nonzero"
-    echo "self-heal FAILED: setsid returned nonzero" >&2
+    log "self-heal FAILED: no canonical supervisor appeared after setsid"
+    echo "self-heal FAILED: no canonical supervisor appeared after setsid" >&2
     (( emit_json_flag )) && emit_json "" "$sup_count" "$sup_pids_csv" \
         "$workers" "$tunnel" self-heal-failed 5
     return 5
