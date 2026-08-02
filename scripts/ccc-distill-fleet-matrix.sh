@@ -145,8 +145,17 @@ ingest() {
     [ -z "$name" ] && continue
     [ -n "$host" ] && HOST["$name"]="$host"
     # Parse extras. First https://... line wins for URL; first 7-40 hex line for commit.
+    # `for field in $extra` relied on word splitting, but the record separator
+    # is \x1f (Unit Separator) which is NOT in the default IFS -- so $extra
+    # stayed one token, `CANDIDATE=*` swallowed the URL/commit/status fields
+    # with it, and every other field arrived empty (misreported as
+    # no_evidence). Split on the actual separator instead.
     local field
-    for field in $extra; do
+    local -a _fields=()
+    if [ -n "$extra" ]; then
+      IFS=$'\x1f' read -r -d '' -a _fields < <(printf '%s\0' "$extra")
+    fi
+    for field in "${_fields[@]}"; do
       case "$field" in
         CANDIDATE=*) CAND["$name"]="${field#CANDIDATE=}" ;;
         NO_CHECKER_FOUND) STATUS["$name"]="NO_CHECKER_FOUND" ;;
@@ -234,9 +243,24 @@ for node in "${NODE_ARR[@]}"; do
         {checker_available: true, mode: "unknown", verification: "pending",
          blocker_reason: null}
       end;
+    # The checker reported (no status marker), so resolve by the commit
+    # comparison the header documents. Without this, nothing ever assigned
+    # "verified" -- the four state_for branches only produce blocked or
+    # pending -- so summary.verified was structurally pinned at 0 even with a
+    # fully converged fleet, and the matrix could never report success.
+    def resolve($state; $cmp):
+      if $state.checker_available != true then $state
+      elif $cmp == "equal" then
+        {checker_available: true, mode: "reported", verification: "verified",
+         blocker_reason: null}
+      elif $cmp == "behind" then
+        {checker_available: true, mode: "reported", verification: "blocked",
+         blocker_reason: "probe_commit_behind_target"}
+      else $state
+      end;
     detect_short_c as $c
     | ($c | cmp_to($target_short)) as $cmp
-    | state_for($status) as $state
+    | resolve(state_for($status); $cmp) as $state
     | {
         name: $name,
         host: (if $host == "" then null else $host end),

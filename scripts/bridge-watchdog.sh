@@ -21,6 +21,14 @@
 # since the next tick (GRACE_SECONDS later) will still see it if the new
 # instance also failed to come up.
 set -uo pipefail
+# cron and systemd do not always export HOME, and every default below
+# dereferences it under `set -u` -- an unguarded expansion killed the watchdog
+# before it could even create its log directory, silently disabling the very
+# supervision this script exists to provide. The sibling scripts in this batch
+# (ccc-bridge-locate.sh, ccc-distill-check.sh) already use `${HOME:-/root}`;
+# this one was the outlier. Same class as the setup.sh failure fixed in #857.
+# The inner override is a test seam only; production resolves to /root.
+HOME="${HOME:-${CCC_WATCHDOG_HOME_FALLBACK:-/root}}"
 # Paths and tunables are overridable for testing / non-standard installs; the
 # defaults reproduce the production layout exactly (behavior-neutral).
 LOG="${BRIDGE_WATCHDOG_LOG:-$HOME/.hermes/logs/bridge-watchdog.log}"
