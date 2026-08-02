@@ -37,6 +37,8 @@ from claude_agent_sdk import (
     ServerToolUseBlock,
     StreamEvent,
     SystemMessage,
+    TaskNotificationMessage,
+    TaskUpdatedMessage,
     TextBlock,
     ThinkingBlock,
     ToolPermissionContext,
@@ -152,6 +154,21 @@ _BACKGROUND_TASK_FINISHED = re.compile(
     r"<status>(completed|failed|canceled|cancelled|timed_out|timeout)</status>.*?"
     r"</task-notification>",
     re.IGNORECASE | re.DOTALL,
+)
+# Terminal states across both typed lifecycle frames: TaskNotificationMessage
+# (completed/failed/stopped) and TaskUpdatedMessage (completed/failed/killed),
+# plus the transcript-XML vocabulary so the sets can never drift apart.
+_TERMINAL_TASK_STATUSES = frozenset(
+    {
+        "completed",
+        "failed",
+        "stopped",
+        "killed",
+        "canceled",
+        "cancelled",
+        "timed_out",
+        "timeout",
+    }
 )
 # The locked Agent SDK uses the same narrow set to distinguish a result that
 # ends one model turn from a result that ends the whole delegated run.  Shells,
@@ -470,6 +487,54 @@ class ClaudeSession:
             for match in _BACKGROUND_TASK_FINISHED.finditer(text):
                 self._background_tasks.pop(match.group(1).strip(), None)
 
+    def _observe_background_task_frames(self, message: Message) -> None:
+        """Release tracked background tasks from the CLI's typed frames.
+
+        The CLI reports harness background-task lifecycle as typed system
+        frames on the SDK stream: ``task_notification`` / ``task_updated``
+        plus an authoritative ``background_tasks_changed`` roster. The
+        transcript-XML ``<task-notification>`` UserMessage that
+        :meth:`_observe_background_task_notifications` waits for is a
+        transcript artifact — it never appears on the live stream (verified
+        by frame capture, #860) — so tracked tasks were never released and
+        ``workload_snapshot`` counted them forever (#307-class leak; the
+        supervisor's request-lifetime alert was the symptom).
+
+        The roster reconcile is the self-healing path: whatever individual
+        event is missed, the next ``background_tasks_changed`` snapshot
+        replaces the registry wholesale (adds unseen tasks, drops finished
+        ones) while preserving the recorded start time of retained ids.
+        """
+
+        if isinstance(message, TaskNotificationMessage):
+            # Every notification status in the SDK contract is terminal.
+            self._background_tasks.pop(str(message.task_id).strip(), None)
+            return
+        if isinstance(message, TaskUpdatedMessage):
+            status = message.status
+            if status is None and isinstance(message.patch, Mapping):
+                status = message.patch.get("status")
+            if str(status).lower() in _TERMINAL_TASK_STATUSES:
+                self._background_tasks.pop(str(message.task_id).strip(), None)
+            return
+        if (
+            isinstance(message, SystemMessage)
+            and message.subtype == "background_tasks_changed"
+        ):
+            data = message.data if isinstance(message.data, Mapping) else {}
+            tasks = data.get("tasks")
+            if not isinstance(tasks, Sequence) or isinstance(tasks, (str, bytes)):
+                return
+            ids = {
+                str(task["task_id"]).strip()
+                for task in tasks
+                if isinstance(task, Mapping) and task.get("task_id")
+            }
+            now = asyncio.get_running_loop().time()
+            self._background_tasks = {
+                task_id: self._background_tasks.get(task_id, now) for task_id in ids
+            }
+
     def _observe_sdk_frame(self, message: Message) -> None:
         observer = self._sdk_frame_observer
         if observer is None:
@@ -617,6 +682,7 @@ class ClaudeSession:
         self._observe_sdk_frame(message)
         self._observe_session_id(message)
         self._observe_background_task_notifications(message)
+        self._observe_background_task_frames(message)
         active = self._active_turn
         if active is not None and not active.finished:
             self._observe_result_deferring_task(active, message)

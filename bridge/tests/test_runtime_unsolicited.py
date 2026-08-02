@@ -58,6 +58,8 @@ from claude_agent_sdk import (  # noqa: E402 -- must follow the stub purge above
     ResultMessage,
     StreamEvent,
     SystemMessage,
+    TaskNotificationMessage,
+    TaskUpdatedMessage,
     TextBlock,
     ToolPermissionContext,
     ToolResultBlock,
@@ -350,6 +352,111 @@ class ClaudeRuntimeUnsolicitedTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             session.background_workload_snapshot(asyncio.get_running_loop().time()),
             (0, 0.0),
+        )
+
+    async def test_background_bash_released_by_typed_task_notification(self) -> None:
+        # The live CLI never emits the transcript-XML UserMessage the sibling
+        # test exercises — it reports completion as a typed
+        # TaskNotificationMessage frame (frame capture, #860). Regression: the
+        # tracker must release on that frame or workload_snapshot leaks.
+        session, client = await self._start_session()
+        client.turn_scripts.append("background")
+
+        await _collect(session.send_turn("run validation"))
+        self.assertEqual(
+            session.background_workload_snapshot(
+                asyncio.get_running_loop().time()
+            )[0],
+            1,
+        )
+
+        client.emit(
+            TaskNotificationMessage(
+                subtype="task_notification",
+                data={"task_id": "bg-42", "status": "completed"},
+                task_id="bg-42",
+                status="completed",
+                output_file="/tmp/bg-42.output",
+                summary="green",
+                uuid="uuid-bg-42",
+                session_id=client.session_id,
+            )
+        )
+        await _wait_until(
+            lambda: session.background_workload_snapshot(
+                asyncio.get_running_loop().time()
+            )[0]
+            == 0
+        )
+
+    async def test_background_bash_released_by_terminal_task_update(self) -> None:
+        session, client = await self._start_session()
+        client.turn_scripts.append("background")
+
+        await _collect(session.send_turn("run validation"))
+
+        # A non-terminal update must NOT release the task.
+        client.emit(
+            TaskUpdatedMessage(
+                subtype="task_updated",
+                data={"task_id": "bg-42", "patch": {"status": "running"}},
+                task_id="bg-42",
+                patch={"status": "running"},
+            )
+        )
+        await asyncio.sleep(0)
+        self.assertEqual(
+            session.background_workload_snapshot(
+                asyncio.get_running_loop().time()
+            )[0],
+            1,
+        )
+
+        client.emit(
+            TaskUpdatedMessage(
+                subtype="task_updated",
+                data={"task_id": "bg-42", "patch": {"status": "killed"}},
+                task_id="bg-42",
+                patch={"status": "killed"},
+            )
+        )
+        await _wait_until(
+            lambda: session.background_workload_snapshot(
+                asyncio.get_running_loop().time()
+            )[0]
+            == 0
+        )
+
+    async def test_background_roster_reconciles_missed_events(self) -> None:
+        # background_tasks_changed carries the authoritative roster: whatever
+        # individual frame was missed, the snapshot must self-heal — drop
+        # finished ids and adopt unseen ones.
+        session, client = await self._start_session()
+        client.turn_scripts.append("background")
+
+        await _collect(session.send_turn("run validation"))
+
+        client.emit(
+            SystemMessage(
+                subtype="background_tasks_changed",
+                data={"tasks": [{"task_id": "bg-99", "task_type": "local_bash"}]},
+            )
+        )
+        await _wait_until(
+            lambda: session.background_workload_snapshot(
+                asyncio.get_running_loop().time()
+            )[0]
+            == 1
+        )
+
+        client.emit(
+            SystemMessage(subtype="background_tasks_changed", data={"tasks": []})
+        )
+        await _wait_until(
+            lambda: session.background_workload_snapshot(
+                asyncio.get_running_loop().time()
+            )[0]
+            == 0
         )
 
     async def test_result_text_wins_over_buffered_assistant_text(self) -> None:
