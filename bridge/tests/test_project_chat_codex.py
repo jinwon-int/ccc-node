@@ -1708,6 +1708,142 @@ class BlockingSession(FakeSession):
         return stream()
 
 
+class FinalizationRaceSession(FakeSession):
+    """Finish one turn, then hold genuine provider work on its replacement."""
+
+    def __init__(self, session_id: str) -> None:
+        super().__init__(session_id)
+        self.replacement_admitted = asyncio.Event()
+        self.release_replacement = asyncio.Event()
+
+    def send_turn(
+        self,
+        message: str,
+        *,
+        approval_handler: ApprovalHandler = deny_approval,
+    ) -> AsyncIterator[AgentEvent]:
+        del approval_handler
+
+        async def stream() -> AsyncIterator[AgentEvent]:
+            self.messages.append(message)
+            yield TextDeltaEvent(message)
+            if message == "user replacement":
+                self.replacement_admitted.set()
+                await self.release_replacement.wait()
+            yield CompletionEvent("end_turn")
+
+        return stream()
+
+
+@pytest.mark.anyio
+async def test_notification_followup_user_race_releases_owner_before_finalization(
+    tmp_path: Path,
+) -> None:
+    session = FinalizationRaceSession("thread-a")
+    handler = _handler(tmp_path, FakeRuntime([session]))
+    cleanup_started = asyncio.Event()
+    release_cleanup = asyncio.Event()
+    cleanup_calls = 0
+
+    async def blocking_cleanup(_request) -> bool:
+        nonlocal cleanup_calls
+        cleanup_calls += 1
+        if cleanup_calls == 1:
+            cleanup_started.set()
+            await release_cleanup.wait()
+        return True
+
+    handler._cleanup_heartbeat = blocking_cleanup
+    notification = asyncio.create_task(
+        handler.process_message(
+            "notification follow-up",
+            7,
+            70,
+            usage_mode="autonomous",
+        )
+    )
+    await cleanup_started.wait()
+    user = asyncio.create_task(handler.process_message("user replacement", 7, 70))
+    await asyncio.sleep(0)
+
+    # Provider ownership ended before ancillary heartbeat/duration/ledger
+    # finalization. The queued user turn cannot register until the conversation
+    # lock advances, and the completed notification must not remain projected
+    # as active while finalization is blocked without a deadline.
+    assert handler.session_resource_snapshot()["active_sessions"] == 0
+    assert handler.workload_snapshot(asyncio.get_running_loop().time())[0] == 0
+    assert session.messages == ["notification follow-up"]
+
+    release_cleanup.set()
+    await session.replacement_admitted.wait()
+
+    # Once admitted, genuine replacement provider work remains visible and is
+    # no longer projected as waiting for its first event.
+    assert handler.session_resource_snapshot()["active_sessions"] == 1
+    assert handler.workload_snapshot(asyncio.get_running_loop().time())[0] == 1
+    assert handler.waiting_for_turn_snapshot() == 0
+
+    session.release_replacement.set()
+    first, second = await asyncio.gather(notification, user)
+    assert first.success is True
+    assert second.success is True
+    assert handler.session_resource_snapshot()["active_sessions"] == 0
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("failing_effect", ["cleanup", "duration", "ledger"])
+async def test_finalization_failures_release_owner_and_allow_replacement(
+    tmp_path: Path,
+    failing_effect: str,
+) -> None:
+    session = FakeSession("thread-a")
+    handler = _handler(tmp_path, FakeRuntime([session]))
+    failed = False
+
+    if failing_effect == "cleanup":
+        original_cleanup = handler._cleanup_heartbeat
+
+        async def fail_cleanup(request) -> bool:
+            nonlocal failed
+            if not failed:
+                failed = True
+                raise OSError("cleanup unavailable")
+            return await original_cleanup(request)
+
+        handler._cleanup_heartbeat = fail_cleanup
+    elif failing_effect == "duration":
+        original_duration = handler._append_duration_log
+
+        def fail_duration(*args, **kwargs) -> None:
+            nonlocal failed
+            if not failed:
+                failed = True
+                raise OSError("duration unavailable")
+            original_duration(*args, **kwargs)
+
+        handler._append_duration_log = fail_duration
+    else:
+        original_ledger = handler._ledger_finish
+
+        def fail_ledger(*args, **kwargs) -> None:
+            nonlocal failed
+            if not failed:
+                failed = True
+                raise OSError("ledger unavailable")
+            original_ledger(*args, **kwargs)
+
+        handler._ledger_finish = fail_ledger
+
+    with pytest.raises(OSError, match="unavailable"):
+        await handler.process_message("terminal turn", 7, 70)
+
+    assert handler.session_resource_snapshot()["active_sessions"] == 0
+    replacement = await handler.process_message("replacement", 7, 70)
+    assert replacement.success is True
+    assert session.messages == ["terminal turn", "replacement"]
+    assert handler.session_resource_snapshot()["active_sessions"] == 0
+
+
 @pytest.mark.anyio
 async def test_codex_serializes_same_conversation_but_isolates_other_chats(tmp_path: Path) -> None:
     first = BlockingSession("thread-a")
@@ -1766,6 +1902,7 @@ async def test_codex_error_cleans_session_and_next_turn_restarts(tmp_path: Path)
     assert response.error == "provider failed"
     assert retry.success is True
     assert len(runtime.requests) == 2
+    assert handler.session_resource_snapshot()["active_sessions"] == 0
 
 
 @pytest.mark.anyio
@@ -2073,6 +2210,7 @@ async def test_cancellation_during_interrupt_reaps_read_before_iterator_close(
         "interrupt-cancel",
     ]
     assert session.iterator.close_calls == 1
+    assert handler.session_resource_snapshot()["active_sessions"] == 0
 
 
 @pytest.mark.anyio
@@ -2362,6 +2500,7 @@ async def test_codex_turn_timeout_interrupts_and_cleans_session(tmp_path: Path) 
     assert hung.interrupt_calls == 1
     assert retry.success is True
     assert len(runtime.requests) == 2
+    assert handler.session_resource_snapshot()["active_sessions"] == 0
 
 
 class HangingInterruptSession(BlockingSession):

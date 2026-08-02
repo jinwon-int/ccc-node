@@ -1186,6 +1186,18 @@ class ProjectChatProcessMixin:
                     session_id=session.session_id if session is not None else session_id,
                 )
             finally:
+                # Provider ownership ends when the turn consumer leaves the
+                # try above. Progress finalization includes Telegram and
+                # filesystem effects that may block independently of provider
+                # work, so retaining the active token across those awaits
+                # turns a stuck cleanup into a false active-request owner.
+                # Compare-and-clear before awaiting: an old token can never
+                # remove a replacement registered by another lifecycle path.
+                if turn_token is not None:
+                    self._agent_session_registry.deactivate_if_same(
+                        turn_token,
+                        touch_at=loop.time(),
+                    )
                 try:
                     await _finalize_request_progress(
                         coordinator=progress_coordinator,
@@ -1200,8 +1212,3 @@ class ProjectChatProcessMixin:
                         chat_id=chat_id,
                         session_id=session.session_id if session is not None else None,
                     )
-                    if turn_token is not None:
-                        self._agent_session_registry.deactivate_if_same(
-                            turn_token,
-                            touch_at=loop.time(),
-                        )
