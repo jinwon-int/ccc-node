@@ -23,6 +23,13 @@ CREDENTIAL_PATTERNS: Final = (
         r"(?:\bauthorization\s*:\s*)?\bbearer\s+[A-Za-z0-9._~+/=-]{16,}",
         re.IGNORECASE,
     ),
+    # Bare JWT / JWS compact serialization. The bearer pattern above only
+    # fires when the literal "bearer" (or an Authorization header) precedes
+    # the token, so a raw `eyJ...` copied out of a log, an env dump, or an
+    # error body reached the transcript unredacted. Anchored on the base64url
+    # encoding of `{"` that every JOSE header starts with, and requires all
+    # three dot-separated segments so ordinary dotted words cannot match.
+    re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"),
     re.compile(r"\b[0-9]{6,12}:[A-Za-z0-9_-]{20,}\b"),  # telegram bot token
     re.compile(r"\bgh(?:p|o|u|s|r)_[A-Za-z0-9]{20,}\b"),
     re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}\b"),

@@ -163,6 +163,28 @@ def test_provider_must_be_valid() -> None:
 # Shared redaction module.
 # --------------------------------------------------------------------------- #
 
+def test_shared_redaction_catches_bare_jwt() -> None:
+    """A raw JWT with no "bearer" prefix must still redact.
+
+    Regression (#869 sweep): the bearer pattern required the literal word,
+    so a token copied out of a log line, an env dump, or a provider error
+    body reached the transcript in full.
+    """
+
+    jwt = (
+        "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"
+        ".eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4ifQ"
+        ".dBjftJeZ4CVPmB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+    )
+    assert contains_credential(jwt)
+    redacted = redact_credentials("token=" + jwt + " end")
+    assert jwt not in redacted
+    assert "[REDACTED_CREDENTIAL]" in redacted
+    # Ordinary dotted text must not be swallowed by the new pattern.
+    assert not contains_credential("module.submodule.attribute")
+    assert not contains_credential("eyJshort.a.b")
+
+
 def test_shared_redaction_covers_token_shapes() -> None:
     assert contains_credential(GH_TOKEN)
     assert contains_credential(BOT_TOKEN)

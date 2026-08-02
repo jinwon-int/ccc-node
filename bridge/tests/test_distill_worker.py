@@ -6,6 +6,7 @@ import asyncio
 from datetime import datetime, timezone
 import hashlib
 import json
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -707,6 +708,55 @@ async def test_oversized_attempt_is_rejected_before_the_provider_call(
     assert result.status is DistillJobStatus.SNAPSHOT_DONE
     assert result.extraction_attempts == 0
     assert meter.used_tokens("codex") == 0
+
+
+@pytest.mark.anyio
+async def test_prevalidation_failure_refunds_its_reservation(tmp_path: Path) -> None:
+    """A pre-provider validation failure must not keep the reserved budget.
+
+    Regression (#869 sweep): only the unclaimed path refunded. A job whose
+    snapshot fails the thread-hash check exits before ``backend.extract``
+    runs, so the provider was never called — yet the prospective reservation
+    stayed charged, letting one malformed job drain the daily autonomous cap
+    one tick at a time.
+    """
+
+    journal = DistillJournal(tmp_path / "journal")
+    journal.initialize()
+    job = snapshot_done_job(journal)
+    backend = SuccessfulBackend()
+    meter = _FakeUsageMeter(allowed=True)
+    worker = CodexDistillExtractionWorker(
+        journal,
+        backend,
+        owner_token="extract-worker",
+        usage_meter=meter,
+    )
+
+    # Force the pre-provider validation to fail. DistillJob validates its own
+    # thread identity, so mismatch the SNAPSHOT side instead — which is
+    # exactly what the production guard compares
+    # (`snapshot.thread_hash != claimed.thread_hash`).
+    original_claim = journal.claim_extraction
+
+    def _claim_with_mismatched_snapshot(*args: Any, **kwargs: Any) -> Any:
+        claimed = original_claim(*args, **kwargs)
+        if claimed is None or claimed.snapshot is None:
+            return claimed
+        return replace(
+            claimed,
+            snapshot=replace(claimed.snapshot, thread_hash="f" * 64),
+        )
+
+    journal.claim_extraction = _claim_with_mismatched_snapshot  # type: ignore[method-assign]
+
+    result = await worker.extract_once(job_id=job.job_id)
+
+    assert backend.calls == []
+    assert len(meter.reserves) == 1
+    # The reservation for work the provider never did is returned.
+    assert len(meter.refunds) == 1
+    assert result.error_code == "snapshot_thread_mismatch"
 
 
 @pytest.mark.anyio
