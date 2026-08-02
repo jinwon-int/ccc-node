@@ -42,6 +42,7 @@ from telegram_bot.core.project_chat_turn_consumer import (
     consume_turn_stream,
 )
 from telegram_bot.core.project_chat_turn_state import (
+    DelegatedTaskLifecycleTransition,
     ErrorTransition,
     IgnoredTransition,
     MessageCompletedTransition,
@@ -551,6 +552,10 @@ class ProjectChatProcessMixin:
             # here; Codex meters via the runtime's usage-recorder seam.
             self.record_claude_adapter_result(transition.event, mode=usage_mode)
             return
+        if isinstance(transition, DelegatedTaskLifecycleTransition):
+            # Aggregate lifecycle state is consumed by the timeout selector and
+            # health projection only. It is never rendered as assistant text.
+            return
         if isinstance(transition, (ErrorTransition, IgnoredTransition)):
             # Error payload is retained by TurnEventState for the outer response.
             # Reasoning remains private; approval/completion are already consumed.
@@ -784,6 +789,9 @@ class ProjectChatProcessMixin:
                     return ApprovalDecision.DENY
 
                 stall_grace = float(getattr(self._config, "terminal_stall_seconds", 0.0) or 0.0)
+                delegated_stall_grace = float(
+                    getattr(self._config, "delegated_task_stall_seconds", 7200.0)
+                )
                 admission_grace = float(
                     admission_timeout_override
                     if admission_timeout_override is not None
@@ -850,6 +858,14 @@ class ProjectChatProcessMixin:
                     if _observer is not None:
                         _observer.observe(event, session_id=session.session_id)
                     transition = turn_state.observe(event, observed_at=now)
+                    if isinstance(transition, DelegatedTaskLifecycleTransition):
+                        try:
+                            health_reporter.record_delegated_task_activity(
+                                id(progress_request),
+                                turn_state.delegated_tasks_active,
+                            )
+                        except Exception:
+                            pass
                     await self._apply_turn_event_transition(
                         transition,
                         now=now,
@@ -859,21 +875,32 @@ class ProjectChatProcessMixin:
                         deliver_pending_interim=deliver_pending_interim,
                         usage_mode=usage_mode,
                     )
+                    if (
+                        turn_state.delegated_tasks_active > 0
+                        and output.has_text
+                        and not turn_state.terminal_stall_deferral_recorded
+                    ):
+                        turn_state.terminal_stall_deferral_recorded = True
+                        try:
+                            health_reporter.record_terminal_stall_deferred_for_tasks()
+                        except Exception:
+                            pass
                     return TurnEventDirective.CONTINUE
 
-                async def interrupt_turn() -> None:
+                async def interrupt_turn(outcome: TurnStreamOutcome) -> None:
                     nonlocal approval_stall_won
                     if turn_state.approval_pending:
-                        approval_stall_won = _claim_request_terminal(
-                            progress_request,
-                            RequestPhase.TIMEOUT,
-                            cause="approval-stall",
-                        )
-                        if not approval_stall_won:
-                            # A concurrent /stop (or another terminal owner)
-                            # already won. Let that path own the session/UI
-                            # side effects and keep this request silent.
-                            raise asyncio.CancelledError
+                        if outcome is TurnStreamOutcome.APPROVAL_STALL:
+                            approval_stall_won = _claim_request_terminal(
+                                progress_request,
+                                RequestPhase.TIMEOUT,
+                                cause="approval-stall",
+                            )
+                            if not approval_stall_won:
+                                # A concurrent /stop (or another terminal owner)
+                                # already won. Let that path own the session/UI
+                                # side effects and keep this request silent.
+                                raise asyncio.CancelledError
                         self.invalidate_agent_approvals(user_id, chat_id)
                         callbacks = tuple(active_approval_callbacks)
                         for callback in callbacks:
@@ -902,6 +929,7 @@ class ProjectChatProcessMixin:
                         admission_timeout_seconds=admission_grace,
                         approval_stall_seconds=approval_grace,
                         terminal_stall_seconds=stall_grace,
+                        delegated_task_stall_seconds=delegated_stall_grace,
                         interrupt_timeout_seconds=self._agent_interrupt_timeout_seconds,
                     ),
                     timeout=self._process_timeout_seconds,
@@ -1049,6 +1077,42 @@ class ProjectChatProcessMixin:
                         streamed=streamed,
                     )
 
+                if turn_outcome is TurnStreamOutcome.DELEGATED_TASK_STALL:
+                    terminal_won = _claim_request_terminal(
+                        progress_request,
+                        RequestPhase.INTERRUPTED,
+                        cause="delegated-task-stall",
+                    )
+                    if terminal_won:
+                        await self._drop_agent_session(key, session)
+                    await self._cancel_agent_streaming(
+                        streaming_handler,
+                        context="handling a delegated-task stall",
+                    )
+                    logger.warning(
+                        "Delegated-task stall released agent turn for user %s chat %s "
+                        "after oldest task exceeded %gs (active_count=%d)",
+                        user_id,
+                        chat_id,
+                        delegated_stall_grace,
+                        turn_state.delegated_tasks_active,
+                    )
+                    try:
+                        health_reporter.record_delegated_task_stall()
+                    except Exception:
+                        pass
+                    content = output.render(self._clean_response) or "(No response)"
+                    message = "Delegated work exceeded its maximum runtime"
+                    return ChatResponse(
+                        content=(
+                            f"{content}\n\n⏰ {message}; the turn was stopped "
+                            "and the conversation queue was released."
+                        ),
+                        success=False,
+                        error=message,
+                        session_id=session.session_id,
+                    )
+
                 final_streamed = False
                 if streaming_handler:
                     final_streamed = await streaming_handler.finalize_all()
@@ -1186,6 +1250,13 @@ class ProjectChatProcessMixin:
                     session_id=session.session_id if session is not None else session_id,
                 )
             finally:
+                try:
+                    health_reporter.record_delegated_task_activity(
+                        id(progress_request),
+                        0,
+                    )
+                except Exception:
+                    pass
                 try:
                     await _finalize_request_progress(
                         coordinator=progress_coordinator,

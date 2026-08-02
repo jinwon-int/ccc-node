@@ -44,10 +44,12 @@ class TurnStreamOutcome(str, Enum):
     ADMISSION_TIMEOUT = "admission-timeout"
     APPROVAL_STALL = "approval-stall"
     TERMINAL_STALL = "terminal-stall"
+    DELEGATED_TASK_STALL = "delegated-task-stall"
 
 
 TurnEventEffect = Callable[[AgentEvent, float], Awaitable[TurnEventDirective]]
 AsyncAction = Callable[[], Awaitable[None]]
+TimeoutAction = Callable[[TurnStreamOutcome], Awaitable[None]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,30 +72,50 @@ def _select_timeout(
     admission_timeout_seconds: float,
     approval_stall_seconds: float,
     terminal_stall_seconds: float,
+    delegated_task_stall_seconds: float,
 ) -> _TimeoutSelection | None:
     if not state.admitted and admission_timeout_seconds > 0:
         return _TimeoutSelection(
             admission_timeout_seconds,
             TurnStreamOutcome.ADMISSION_TIMEOUT,
         )
+    candidates: list[_TimeoutSelection] = []
     if state.approval_pending and approval_stall_seconds > 0:
         pending_since = state.approval_pending_since
         elapsed = max(0.0, now - pending_since) if pending_since is not None else 0.0
-        return _TimeoutSelection(
-            max(0.0, approval_stall_seconds - elapsed),
-            TurnStreamOutcome.APPROVAL_STALL,
+        candidates.append(
+            _TimeoutSelection(
+                max(0.0, approval_stall_seconds - elapsed),
+                TurnStreamOutcome.APPROVAL_STALL,
+            )
+        )
+    if state.delegated_tasks_active > 0 and delegated_task_stall_seconds > 0:
+        oldest_started_at = state.delegated_tasks_oldest_started_at
+        elapsed = max(0.0, now - oldest_started_at) if oldest_started_at is not None else 0.0
+        candidates.append(
+            _TimeoutSelection(
+                max(0.0, delegated_task_stall_seconds - elapsed),
+                TurnStreamOutcome.DELEGATED_TASK_STALL,
+            )
         )
     if (
         terminal_stall_seconds > 0
         and has_text
         and state.busy_depth <= 0
         and not state.approval_pending
+        and state.delegated_tasks_active <= 0
     ):
-        return _TimeoutSelection(
-            terminal_stall_seconds,
-            TurnStreamOutcome.TERMINAL_STALL,
+        started_at = state.terminal_stall_started_at
+        elapsed = max(0.0, now - started_at) if started_at is not None else 0.0
+        candidates.append(
+            _TimeoutSelection(
+                max(0.0, terminal_stall_seconds - elapsed),
+                TurnStreamOutcome.TERMINAL_STALL,
+            )
         )
-    return None
+    if not candidates:
+        return None
+    return min(candidates, key=lambda candidate: candidate.seconds)
 
 
 async def _abort_stalled_owner(
@@ -121,7 +143,8 @@ async def _read_bounded_event(
     reader: TimeoutPreservingEventReader[AgentEvent],
     *,
     timeout_seconds: float,
-    interrupt: AsyncAction,
+    timeout_outcome: TurnStreamOutcome,
+    interrupt: TimeoutAction,
     abort_stalled_turn: AsyncAction | None,
     interrupt_timeout_seconds: float,
 ) -> _BoundedRead:
@@ -130,7 +153,7 @@ async def _read_bounded_event(
     except EventWaitTimeout:
         # The provider owns the blocked turn. Interrupt it before cancelling
         # the retained read that may be holding the provider's shared lock.
-        await interrupt()
+        await interrupt(timeout_outcome)
         await reader.cancel_pending()
         await _abort_stalled_owner(
             abort_stalled_turn,
@@ -146,12 +169,13 @@ async def consume_turn_stream(
     state: TurnEventState,
     has_text: Callable[[], bool],
     on_event: TurnEventEffect,
-    interrupt: AsyncAction,
+    interrupt: TimeoutAction,
     abort_stalled_turn: AsyncAction | None,
     admission_timeout_seconds: float,
     approval_stall_seconds: float,
     terminal_stall_seconds: float,
     interrupt_timeout_seconds: float,
+    delegated_task_stall_seconds: float = 7200.0,
 ) -> TurnStreamOutcome:
     """Consume a turn without acquiring lifecycle, ledger, or delivery authority.
 
@@ -171,6 +195,7 @@ async def consume_turn_stream(
                 admission_timeout_seconds=admission_timeout_seconds,
                 approval_stall_seconds=approval_stall_seconds,
                 terminal_stall_seconds=terminal_stall_seconds,
+                delegated_task_stall_seconds=delegated_task_stall_seconds,
             )
             try:
                 if timeout is None:
@@ -179,6 +204,7 @@ async def consume_turn_stream(
                     read = await _read_bounded_event(
                         reader,
                         timeout_seconds=timeout.seconds,
+                        timeout_outcome=timeout.outcome,
                         interrupt=interrupt,
                         abort_stalled_turn=abort_stalled_turn,
                         interrupt_timeout_seconds=interrupt_timeout_seconds,
@@ -209,6 +235,7 @@ __all__ = [
     "ClosableAgentEventStream",
     "TurnEventDirective",
     "TurnEventEffect",
+    "TimeoutAction",
     "TurnStreamOutcome",
     "consume_turn_stream",
 ]

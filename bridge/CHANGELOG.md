@@ -1,5 +1,14 @@
 # Changelog
 
+- **Delegated-task-aware terminal stall guard (#874).** Claude
+  `local_agent`/`local_workflow` lifecycle now crosses the provider-neutral
+  event seam only as body-free active-count/oldest-age/activity snapshots.
+  Healthy delegated work no longer trips the ordinary 300-second missing-
+  terminal guard; the final task terminal update starts a fresh ordinary
+  grace, while `CCC_DELEGATED_TASK_STALL_SECONDS` (default 7200, positive and
+  lower than the process timeout) bounds genuinely stuck delegated work.
+  Health output exposes only aggregate active/deferred/stall counters.
+
 All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),

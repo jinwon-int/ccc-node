@@ -72,6 +72,7 @@ from telegram_bot.core.agent_runtime import (  # noqa: E402
     AgentEvent,
     ApprovalDecision,
     CompletionEvent,
+    DelegatedTaskLifecycleEvent,
     ErrorEvent,
     SessionRequest,
     TextDeltaEvent,
@@ -780,6 +781,38 @@ class ClaudeRuntimeUnsolicitedTests(unittest.IsolatedAsyncioTestCase):
             [event.text for event in events if isinstance(event, TextDeltaEvent)],
             ["all delegated work finished"],
         )
+        self.assertIsInstance(events[-1], CompletionEvent)
+
+    async def test_delegated_lifecycle_events_expose_only_aggregate_state(self) -> None:
+        session, client = await self._start_session()
+        client.turn_scripts.append("hang")
+        events_task = asyncio.create_task(
+            _collect(session.send_turn("body-free delegated lifecycle"))
+        )
+        await _wait_until(lambda: client.queries == ["body-free delegated lifecycle"])
+
+        secret_task_id = "private-task-identifier"
+        client.emit_task_started(secret_task_id, "local_agent")
+        client.emit_task_updated(secret_task_id, "running")
+        client.emit_result(result="intermediate result")
+        await self._drain(client)
+        self.assertFalse(events_task.done())
+
+        client.emit_task_notification(secret_task_id)
+        client.emit_assistant("delegated answer")
+        client.emit_result(result="delegated answer")
+        events = await asyncio.wait_for(events_task, timeout=2.0)
+
+        lifecycle = [
+            event for event in events if isinstance(event, DelegatedTaskLifecycleEvent)
+        ]
+        self.assertEqual(
+            [(event.active_count, event.activity) for event in lifecycle],
+            [(1, "started"), (1, "updated"), (0, "terminal")],
+        )
+        self.assertGreaterEqual(lifecycle[0].oldest_age_seconds or 0.0, 0.0)
+        self.assertIsNone(lifecycle[-1].oldest_age_seconds)
+        self.assertNotIn(secret_task_id, " ".join(map(repr, lifecycle)))
         self.assertIsInstance(events[-1], CompletionEvent)
 
     async def test_terminal_before_start_does_not_reopen_delegated_work(self) -> None:

@@ -64,6 +64,37 @@ class RuntimeHealthReporterTests(unittest.TestCase):
             self.assertEqual(health["service"]["state"], "starting")
             self.assertTrue(reporter.pid_file.exists())
 
+    def test_delegated_task_metrics_aggregate_without_persisting_request_refs(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_root = Path(tmpdir)
+            module = self._load_health_module(project_root)
+            reporter = module.RuntimeHealthReporter(project_root / ".telegram_bot")
+            reporter.initialize_process()
+
+            reporter.record_delegated_task_activity(101, 4)
+            reporter.record_delegated_task_activity(202, 2)
+            reporter.record_terminal_stall_deferred_for_tasks()
+            reporter.record_delegated_task_stall()
+            reporter.record_delegated_task_activity(101, 0)
+
+            health_text = reporter.health_file.read_text(encoding="utf-8")
+            health = json.loads(health_text)
+            self.assertEqual(health["requests"]["delegated_tasks_active"], 2)
+            self.assertEqual(
+                health["requests"]["terminal_stall_deferred_for_tasks"], 1
+            )
+            self.assertEqual(health["requests"]["delegated_task_stalls"], 1)
+            self.assertNotIn("request_ref", health_text)
+            self.assertEqual(
+                set(health["requests"]),
+                {
+                    "stalled",
+                    "delegated_tasks_active",
+                    "terminal_stall_deferred_for_tasks",
+                    "delegated_task_stalls",
+                },
+            )
+
     def test_health_transitions_and_cleanup_preserve_health_file(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             project_root = Path(tmpdir)

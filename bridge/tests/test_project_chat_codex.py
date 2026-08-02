@@ -26,6 +26,7 @@ from telegram_bot.core.agent_runtime import (
     ApprovalHandler,
     ApprovalRequestEvent,
     CompletionEvent,
+    DelegatedTaskLifecycleEvent,
     ErrorEvent,
     MessageCompletedEvent,
     ModelInfo,
@@ -40,6 +41,7 @@ from telegram_bot.core.agent_runtime import (
     ToolStartedEvent,
     deny_approval,
 )
+from telegram_bot.core import project_chat as project_chat_module
 from telegram_bot.core.project_chat import ProjectChatHandler
 from telegram_bot.core.project_chat_types import AgentSessionEntry
 from telegram_bot.core.task_ledger import TaskLedger
@@ -166,6 +168,17 @@ def _handler(tmp_path: Path, runtime: FakeRuntime) -> ProjectChatHandler:
     handler = ProjectChatHandler(settings=_settings(tmp_path), agent_runtime=runtime)
     handler._task_ledger_cache = False
     return handler
+
+
+def test_delegated_task_limit_must_be_lower_than_process_timeout(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    settings.delegated_task_stall_seconds = float(project_chat_module.PROCESS_TIMEOUT)
+
+    with pytest.raises(
+        ValueError,
+        match="CCC_DELEGATED_TASK_STALL_SECONDS must be lower",
+    ):
+        ProjectChatHandler(settings=settings, agent_runtime=FakeRuntime())
 
 
 @pytest.mark.anyio
@@ -1841,8 +1854,9 @@ class StallSession(FakeSession):
 class ApprovalStallSession(FakeSession):
     """Expose a provider approval callback on its own task, like Claude SDK."""
 
-    def __init__(self, session_id: str) -> None:
+    def __init__(self, session_id: str, *, delegated: bool = False) -> None:
         super().__init__(session_id)
+        self.delegated = delegated
         self.approval_task: asyncio.Task[ApprovalDecision] | None = None
         self.abort_calls = 0
         self.close_calls = 0
@@ -1866,6 +1880,8 @@ class ApprovalStallSession(FakeSession):
             )
             try:
                 yield TextDeltaEvent("partial answer")
+                if self.delegated:
+                    yield DelegatedTaskLifecycleEvent(1, 0.0, "started")
                 self.approval_task = asyncio.create_task(approval_handler(approval))
                 yield approval
                 await asyncio.shield(self.approval_task)
@@ -2121,6 +2137,96 @@ async def test_codex_terminal_stall_releases_turn_and_queued_request_proceeds(
     assert queued.success is True and queued.content == "ok"
     assert follow.messages == ["queued"]
     assert len(runtime.requests) == 2
+
+
+@pytest.mark.anyio
+async def test_delegated_lifecycle_defers_terminal_guard_until_distinct_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    stall = StallSession(
+        "thread-1",
+        pre_events=[
+            TextDeltaEvent("delegated work is running"),
+            DelegatedTaskLifecycleEvent(4, 0.0, "started"),
+        ],
+    )
+    handler, stalled = _stall_handler(tmp_path, FakeRuntime([stall]), monkeypatch)
+    handler._config.terminal_stall_seconds = 0.005
+    handler._config.delegated_task_stall_seconds = 0.05
+    handler._process_timeout_seconds = 5.0
+
+    response = await asyncio.wait_for(
+        handler.process_message("deep research", 7, 70),
+        timeout=5,
+    )
+
+    assert response.success is False
+    assert response.error == "Delegated work exceeded its maximum runtime"
+    assert "delegated work is running" in response.content
+    assert stall.interrupt_calls == 1
+    assert stall.closed is True
+    # The ordinary terminal-stall counter remains distinct.
+    assert stalled == []
+
+
+@pytest.mark.anyio
+async def test_missing_result_uses_fresh_terminal_grace_after_last_delegated_task(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    stall = StallSession(
+        "thread-1",
+        pre_events=[
+            TextDeltaEvent("delegated work finished"),
+            DelegatedTaskLifecycleEvent(1, 30.0, "started"),
+            DelegatedTaskLifecycleEvent(0, None, "terminal"),
+        ],
+    )
+    handler, stalled = _stall_handler(tmp_path, FakeRuntime([stall]), monkeypatch)
+    handler._config.terminal_stall_seconds = 0.02
+    handler._config.delegated_task_stall_seconds = 60.0
+    handler._process_timeout_seconds = 5.0
+
+    response = await asyncio.wait_for(
+        handler.process_message("finish without result", 7, 70),
+        timeout=5,
+    )
+
+    assert response.success is False
+    assert response.error == "Agent stopped before terminal completion"
+    assert "delegated work finished" in response.content
+    assert stalled == [1]
+
+
+@pytest.mark.anyio
+async def test_delegated_limit_wins_without_misclassifying_pending_approval(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    stall = ApprovalStallSession("thread-1", delegated=True)
+    handler, stalled = _stall_handler(tmp_path, FakeRuntime([stall]), monkeypatch)
+    handler._config.approval_stall_seconds = 60.0
+    handler._config.terminal_stall_seconds = 0.005
+    handler._config.delegated_task_stall_seconds = 0.02
+    handler._process_timeout_seconds = 5.0
+
+    async def pending_approval(*_args) -> ApprovalDecision:
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    response = await asyncio.wait_for(
+        handler.process_message(
+            "delegated with approval",
+            7,
+            70,
+            approval_callback=pending_approval,
+        ),
+        timeout=5,
+    )
+
+    assert response.success is False
+    assert response.error == "Delegated work exceeded its maximum runtime"
+    assert stall.interrupt_calls == 1
+    assert stall.abort_calls == 1
+    assert stalled == []
 
 
 @pytest.mark.anyio

@@ -10,6 +10,7 @@ from telegram_bot.core.agent_runtime import (
     AgentEvent,
     ApprovalRequestEvent,
     CompletionEvent,
+    DelegatedTaskLifecycleEvent,
     ErrorEvent,
     MessageCompletedEvent,
     ReasoningDeltaEvent,
@@ -53,6 +54,11 @@ class ResultTransition:
     event: ResultEvent
 
 
+@dataclass(frozen=True, slots=True)
+class DelegatedTaskLifecycleTransition:
+    event: DelegatedTaskLifecycleEvent
+
+
 IgnoredEvent: TypeAlias = ReasoningDeltaEvent | ApprovalRequestEvent | CompletionEvent
 
 
@@ -68,6 +74,7 @@ TurnEventTransition: TypeAlias = (
     | ToolCompletedTransition
     | ErrorTransition
     | ResultTransition
+    | DelegatedTaskLifecycleTransition
     | IgnoredTransition
 )
 
@@ -88,6 +95,11 @@ class TurnEventState:
     terminal_result_text: str | None = None
     active_tools: dict[str, str] = field(default_factory=dict)
     active_tool_ids: set[str] = field(default_factory=set)
+    delegated_tasks_active: int = 0
+    delegated_tasks_oldest_started_at: float | None = None
+    delegated_tasks_last_activity_at: float | None = None
+    terminal_stall_started_at: float | None = None
+    terminal_stall_deferral_recorded: bool = False
 
     @property
     def busy_depth(self) -> int:
@@ -113,14 +125,16 @@ class TurnEventState:
 
         self.attempt_recorded = True
 
-    def observe(
+    def _observe_approval_state(
         self,
         event: AgentEvent,
         *,
-        observed_at: float | None = None,
-    ) -> TurnEventTransition:
-        """Apply one normalized event and return its typed routing transition."""
+        observed_at: float | None,
+    ) -> None:
+        """Update approval state unless the event is observation-only."""
 
+        if isinstance(event, DelegatedTaskLifecycleEvent):
+            return
         was_approval_pending = self.approval_pending
         approval_pending = isinstance(event, ApprovalRequestEvent)
         self.approval_pending = approval_pending
@@ -129,6 +143,53 @@ class TurnEventState:
                 self.approval_pending_since = observed_at
         else:
             self.approval_pending_since = None
+
+    def _observe_delegated_lifecycle(
+        self,
+        event: DelegatedTaskLifecycleEvent,
+        *,
+        observed_at: float | None,
+    ) -> DelegatedTaskLifecycleTransition:
+        was_delegated = self.delegated_tasks_active > 0
+        self.delegated_tasks_active = event.active_count
+        self.delegated_tasks_last_activity_at = observed_at
+        if event.active_count <= 0:
+            self.delegated_tasks_oldest_started_at = None
+            if was_delegated:
+                # A full fresh ordinary grace begins only after the last
+                # delegated task settles. Time spent delegated never consumes
+                # the missing-terminal budget.
+                self.terminal_stall_started_at = observed_at
+            return DelegatedTaskLifecycleTransition(event)
+        self.terminal_stall_started_at = None
+        if observed_at is not None and event.oldest_age_seconds is not None:
+            self.delegated_tasks_oldest_started_at = max(
+                0.0,
+                observed_at - event.oldest_age_seconds,
+            )
+        else:
+            self.delegated_tasks_oldest_started_at = observed_at
+        return DelegatedTaskLifecycleTransition(event)
+
+    def observe(
+        self,
+        event: AgentEvent,
+        *,
+        observed_at: float | None = None,
+    ) -> TurnEventTransition:
+        """Apply one normalized event and return its typed routing transition."""
+
+        # Delegated lifecycle frames are observation-only and can arrive while
+        # a provider approval callback remains outstanding. They must not clear
+        # that approval lease or replace its deadline.
+        self._observe_approval_state(event, observed_at=observed_at)
+
+        if not isinstance(event, DelegatedTaskLifecycleEvent):
+            if self.delegated_tasks_active <= 0:
+                # Preserve the existing stream-silence contract explicitly:
+                # every accepted non-delegated event re-arms the ordinary
+                # missing-terminal grace from this observation.
+                self.terminal_stall_started_at = observed_at
 
         if isinstance(event, TextDeltaEvent):
             return TextDeltaTransition(event)
@@ -159,6 +220,8 @@ class TurnEventState:
                 if isinstance(candidate, str) and candidate:
                     self.terminal_result_text = candidate
             return ResultTransition(event)
+        if isinstance(event, DelegatedTaskLifecycleEvent):
+            return self._observe_delegated_lifecycle(event, observed_at=observed_at)
         if isinstance(
             event,
             (ReasoningDeltaEvent, ApprovalRequestEvent, CompletionEvent),
