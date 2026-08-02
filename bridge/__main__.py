@@ -354,8 +354,14 @@ def main() -> None:
     try:
         bot.run()
     except SystemExit as exc:
-        if exc.code and str(exc.code) != "0":
-            logger.error(str(exc.code))
+        # A clean exit must stay clean. Rewriting every SystemExit to 1 told
+        # systemd that an orderly shutdown had failed, so a Restart=on-failure
+        # unit would bounce a bridge that meant to stop (and the operator saw a
+        # failed unit for a successful stop). Only a genuinely non-zero /
+        # message-bearing exit is an error.
+        if exc.code is None or str(exc.code) == "0":
+            raise
+        logger.error(str(exc.code))
         raise SystemExit(1) from exc
     except Exception as exc:
         logger.error("Fatal error: %s", exc, exc_info=True)
