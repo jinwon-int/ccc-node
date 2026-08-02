@@ -83,5 +83,28 @@ HOME="$TMP" BRIDGE_WATCHDOG_LOG="$LOG" BRIDGE_WATCHDOG_PID_FILE="$PID_FILE" \
 okc "$missing_rc" "missing start.sh: exits 0 (no crash)"
 ok  "missing start.sh: logs not-found" 'grep -q "not found/executable" "$LOG"'
 
+# ---- unset HOME (cron/systemd context) -> still runs -------------------------
+# Regression (#869 sweep): every default below `set -u` dereferenced $HOME, so
+# a watchdog started by cron/systemd without HOME died on "unbound variable"
+# before it could create its log dir -- silently disabling supervision.
+#
+# The $HOME-defaulted overrides MUST NOT be set here: `${VAR:-word}` never
+# evaluates its default when VAR is set, so passing BRIDGE_WATCHDOG_LOG /
+# PID_FILE / START (as the fixtures above do) hides the very bug this pins.
+# Point HOME's fallback at a scratch dir instead, so the HOME-less run cannot
+# touch this host's real bridge state or the fixtures asserted above. Runs
+# last for the same reason.
+NOHOME_ROOT="$TMP/nohome-root"; mkdir -p "$NOHOME_ROOT"
+# shellcheck disable=SC2034  # consumed inside the quoted ok() assertions below
+nohome_out="$(env -u HOME \
+  CCC_WATCHDOG_HOME_FALLBACK="$NOHOME_ROOT" \
+  BRIDGE_WATCHDOG_PROCESS_MATCH="__ccc_wd_no_such_process_zzz__" \
+  bash "$WD" 2>&1)"
+# shellcheck disable=SC2034  # consumed inside the quoted ok() assertions below
+nohome_rc=$?
+ok "unset HOME: no unbound-variable abort" '! grep -q "unbound variable" <<<"$nohome_out"'
+ok "unset HOME: reached the watchdog body" '[ "$nohome_rc" = 0 ]'
+ok "unset HOME: used the fallback root, not the real home" '[ -d "$NOHOME_ROOT/.hermes/logs" ]'
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
