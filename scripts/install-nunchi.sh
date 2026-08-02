@@ -55,16 +55,29 @@ if [ -n "$TARGET_USER" ] && [ "$TARGET_USER" != "$(id -un)" ]; then
   [ -n "$target_home" ] && [ "$target_home" != "/" ] && [ -d "$target_home" ] \
     && [ -n "$target_uid" ] && [ "$(stat -c %u -- "$target_home")" = "$target_uid" ] \
     || { echo "safe target home not found for $TARGET_USER" >&2; exit 2; }
+  target_claude_dir="${CCC_CLAUDE_DIR:-$target_home/.claude}"
+  target_state_dir="${CCC_STATE_DIR:-$target_claude_dir/state}"
+  target_nunchi_home="${NUNCHI_HOME:-$target_home/.nunchi}"
+  target_status="${CCC_NUNCHI_MEMPALACE_STATUS:-$target_nunchi_home/mempalace-refresh.status.json}"
   exec runuser -u "$TARGET_USER" -- env -i \
     HOME="$target_home" USER="$TARGET_USER" LOGNAME="$TARGET_USER" \
     PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
     CCC_NUNCHI_TARGET_USER="$TARGET_USER" CCC_NUNCHI_PROVIDER="$PROVIDER" \
+    CCC_CLAUDE_DIR="$target_claude_dir" CCC_STATE_DIR="$target_state_dir" \
+    NUNCHI_HOME="$target_nunchi_home" NUNCHI_DB="${NUNCHI_DB:-$target_nunchi_home/facts.db}" \
+    NUNCHI_SNAPSHOT="${NUNCHI_SNAPSHOT:-$target_nunchi_home/snapshot.md}" \
+    CCC_NUNCHI_MEMPALACE_STATUS="$target_status" \
+    CCC_NUNCHI_MEMPALACE_REFRESH_TIMEOUT_SEC="${CCC_NUNCHI_MEMPALACE_REFRESH_TIMEOUT_SEC:-3300}" \
+    NUNCHI_SWEEP_DIR="${NUNCHI_SWEEP_DIR:-}" \
     bash "$0" "${ORIGINAL_ARGS[@]}"
 fi
 
 CLAUDE_DIR="${CCC_CLAUDE_DIR:-$HOME/.claude}"
 STATE="${CCC_STATE_DIR:-$CLAUDE_DIR/state}"
 HOOKS="$CLAUDE_DIR/hooks/nunchi"
+NUNCHI_DIR="${NUNCHI_HOME:-$HOME/.nunchi}"
+MEMPALACE_STATUS="${CCC_NUNCHI_MEMPALACE_STATUS:-$NUNCHI_DIR/mempalace-refresh.status.json}"
+MEMPALACE_TIMEOUT="${CCC_NUNCHI_MEMPALACE_REFRESH_TIMEOUT_SEC:-3300}"
 MODE_FILE="$STATE/nunchi.mode"
 MARK="# nunchi:#816"
 TS="$(date +%Y%m%dT%H%M%S)"
@@ -104,7 +117,7 @@ status() {
   echo "hooks: $([ -f "$HOOKS/nunchi.py" ] && echo present || echo MISSING) ($HOOKS)"
   echo "codex loader: $codex_loader_status"
   echo "cron: $(grep -cF "$MARK" <<<"$cron" || true) line(s)"
-  echo "db: $(ls -la "$HOME/.nunchi/facts.db" 2>/dev/null | awk '{print $5" bytes"}' || echo none)"
+  echo "db: $(ls -la "$NUNCHI_DIR/facts.db" 2>/dev/null | awk '{print $5" bytes"}' || echo none)"
 }
 
 write_mode() {  # atomic owner-local marker; replacing a stale link never follows it
@@ -122,9 +135,19 @@ strip_cron() {  # remove managed and legacy hand-deploy nunchi lines
   "$CRONTAB" -l 2>/dev/null \
     | grep -vF "$MARK" \
     | grep -v "nunchi/ingest-cron.sh\|nunchi/codex-feed.sh\|/nunchi/ingest-cron\|nunchi:distill-mirror\|nunchi:codex-feed" \
+    | grep -vE '(^|[[:space:]/])mempalace[[:space:]]+sweep[[:space:]]' \
     > "$tmp" || true
   "$CRONTAB" "$tmp"
   rm -f "$tmp"
+}
+
+cron_quote() {  # shell quote one argv value, then protect cron's special '%'
+  python3 - "$1" <<'PY'
+import shlex
+import sys
+
+print(shlex.quote(sys.argv[1]).replace("%", r"\%"))
+PY
 }
 
 append_cron_line() {  # <literal cron line>
@@ -149,6 +172,7 @@ set_sessionstart_hook() {  # add|remove the standalone Claude-only hook
 import json
 import os
 from pathlib import Path
+import shlex
 import stat
 import sys
 import tempfile
@@ -176,7 +200,7 @@ for group in session:
         copy["hooks"] = hooks
         kept.append(copy)
 if action == "add":
-    kept.append({"hooks": [{"type": "command", "command": f"bash {script}", "timeout": 5}]})
+    kept.append({"hooks": [{"type": "command", "command": f"bash {shlex.quote(script)}", "timeout": 5}]})
 data["hooks"]["SessionStart"] = kept
 path.parent.mkdir(parents=True, exist_ok=True)
 fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
@@ -223,19 +247,21 @@ case "$ACTION" in
     write_mode on
     feed="$HOOKS/ingest-cron.sh"
     [ "$resolved_provider" = "codex" ] && feed="$HOOKS/codex-feed.sh"
-    append_cron_line "*/10 * * * * bash $feed >> $HOME/.nunchi/cron.log 2>&1 $MARK"
+    bash_bin="$(command -v bash)"
+    append_cron_line "*/10 * * * * $(cron_quote "$bash_bin") $(cron_quote "$feed") >> $(cron_quote "$NUNCHI_DIR/cron.log") 2>&1 $MARK"
     mp="$(command -v mempalace || true)"
     [ -z "$mp" ] && [ -x "$HOME/.local/bin/mempalace" ] && mp="$HOME/.local/bin/mempalace"
     default_sweep="$HOME/.claude/projects"
     [ "$resolved_provider" = "codex" ] && default_sweep="$HOME/.codex/sessions"
     sweep_dir="${NUNCHI_SWEEP_DIR:-$default_sweep}"
-    if [ -n "$mp" ] && [ -d "$sweep_dir" ]; then
-      append_cron_line "17 * * * * $mp sweep $sweep_dir >> $HOME/.nunchi/mempalace-sweep.cron.log 2>&1 $MARK"
-      echo "mempalace hourly sweep cron added ($sweep_dir)"
+    refresh="$HOOKS/mempalace-refresh.sh"
+    if [ -n "$mp" ] && [ -f "$mp" ] && [ -x "$mp" ] && [ -d "$sweep_dir" ] && [ -x "$refresh" ]; then
+      append_cron_line "17 * * * * CCC_STATE_DIR=$(cron_quote "$STATE") NUNCHI_HOME=$(cron_quote "$NUNCHI_DIR") CCC_NUNCHI_MEMPALACE_STATUS=$(cron_quote "$MEMPALACE_STATUS") CCC_NUNCHI_MEMPALACE_REFRESH_TIMEOUT_SEC=$(cron_quote "$MEMPALACE_TIMEOUT") CCC_NUNCHI_MEMPALACE_CLI=$(cron_quote "$mp") $(cron_quote "$bash_bin") $(cron_quote "$refresh") $resolved_provider $(cron_quote "$sweep_dir") >> $(cron_quote "$NUNCHI_DIR/mempalace-sweep.cron.log") 2>&1 $MARK"
+      echo "mempalace hourly refresh cron added ($resolved_provider: $sweep_dir)"
     else
-      echo "mempalace CLI or transcript dir missing — verbatim sweep cron skipped"
+      echo "mempalace CLI, refresh hook or transcript dir missing — verbatim refresh cron skipped"
     fi
-    append_cron_line "7 8 * * 1 bash $HOOKS/bench.sh >> $HOME/.nunchi/bench.cron.log 2>&1 $MARK"
+    append_cron_line "7 8 * * 1 $(cron_quote "$bash_bin") $(cron_quote "$HOOKS/bench.sh") >> $(cron_quote "$NUNCHI_DIR/bench.cron.log") 2>&1 $MARK"
     echo "weekly bench cron added (Mon 08:07)"
     if [ "$resolved_provider" = "claude" ]; then
       set_sessionstart_hook add

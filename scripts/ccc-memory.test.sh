@@ -57,20 +57,170 @@ palace.execute("CREATE TABLE embeddings(id INTEGER PRIMARY KEY)")
 palace.execute("INSERT INTO embeddings DEFAULT VALUES")
 palace.commit(); palace.close()
 PY
-probe_cron=$'*/10 * * * * bash /tmp/codex-feed.sh # nunchi:#816\n17 * * * * mempalace sweep /tmp/sessions # nunchi:#816\n7 8 * * 1 bash /tmp/bench.sh # nunchi:#816'
+probe_cron=$'*/10 * * * * bash /tmp/codex-feed.sh # nunchi:#816\n17 * * * * bash /tmp/mempalace-refresh.sh codex /tmp/sessions # nunchi:#816\n7 8 * * 1 bash /tmp/bench.sh # nunchi:#816'
+repair_ok=$'  [drawers]\n    sqlite count:   1\n    hnsw count:     1\n    divergence:     0\n    status:         OK\n\n  [closets]'
+repair_diverged=$'  [drawers]\n    sqlite count:   100\n    hnsw count:     10\n    divergence:     90\n    status:         DIVERGED\n\n  [closets]'
+printf '%s\n' '{"schema":"ccc.nunchi.mempalace-refresh.v1","provider":"codex","state":"ok","exit_code":0,"started_at":180,"finished_at":190,"ignored":"PROBE_SECRET_REFRESH"}' > "$probe_nunchi/mempalace-refresh.status.json"
 out="$(HOME="$probe_home" CCC_CLAUDE_DIR="$probe_claude" CCC_STATE_DIR="$probe_state" \
   CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" \
+  CCC_MEMORY_CHECK_NOW_EPOCH=200 CCC_NUNCHI_MEMPALACE_REPAIR_STATUS_TEXT="$repair_ok" \
   CCC_NUNCHI_CRONTAB_TEXT="$probe_cron" bash "$ROOT/scripts/ccc-memory-check.sh" --json 2>&1)"; rc=$?
 ok "memory check reports healthy nunchi and MemPalace scalars" '[ "$rc" = 0 ] && jq -e '\''
   .nunchi.status == "ok" and .nunchi.db.integrity == "ok" and .nunchi.db.facts == 1
   and .nunchi.snapshot.primary_header == true and .nunchi.cron.feed == "codex"
   and .mempalace.status == "ok" and .mempalace.integrity == "ok" and .mempalace.embeddings == 1
+  and .mempalace.index == {status:"ok", sqlite_count:1, hnsw_count:1, divergence:0}
+  and .mempalace.refresh.status == "ok" and .mempalace.refresh.age_seconds == 10
 '\'' >/dev/null <<<"$out"'
-ok "memory readiness JSON never exposes snapshot or fact bodies" '! grep -q "PROBE_SECRET_BODY\|PROBE_SECRET_FACT" <<<"$out"'
-claude_probe_cron=$'*/10 * * * * bash /tmp/ingest-cron.sh # nunchi:#816\n17 * * * * mempalace sweep /tmp/projects # nunchi:#816\n7 8 * * 1 bash /tmp/bench.sh # nunchi:#816'
+ok "memory readiness JSON never exposes snapshot, fact or refresh bodies" '! grep -q "PROBE_SECRET_BODY\|PROBE_SECRET_FACT\|PROBE_SECRET_REFRESH" <<<"$out"'
+
+printf '%s\n' '{"schema":"ccc.nunchi.mempalace-refresh.v1","provider":"codex","state":"error","exit_code":17,"started_at":180,"finished_at":190,"detail":"PROBE_SECRET_REFRESH_ERROR"}' > "$probe_nunchi/mempalace-refresh.status.json"
+out="$(HOME="$probe_home" CCC_CLAUDE_DIR="$probe_claude" CCC_STATE_DIR="$probe_state" \
+  CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CCC_MEMORY_CHECK_NOW_EPOCH=200 \
+  CCC_NUNCHI_MEMPALACE_REPAIR_STATUS_TEXT="$repair_ok" \
+  CCC_NUNCHI_CRONTAB_TEXT="$probe_cron" bash "$ROOT/scripts/ccc-memory-check.sh" --json 2>&1)"; rc=$?
+ok "failed refresh diagnostics stay bounded and body-free" '[ "$rc" = 0 ] && jq -e '\''
+  .mempalace.status == "degraded" and (.mempalace.reasons | index("refresh-error")) != null
+  and .mempalace.refresh == {status:"error", provider:"codex", exit_code:17, age_seconds:10}
+'\'' >/dev/null <<<"$out" && ! grep -q "PROBE_SECRET_REFRESH_ERROR" <<<"$out"'
+printf '%s\n' '{"schema":"ccc.nunchi.mempalace-refresh.v1","provider":"codex","state":"ok","exit_code":0,"started_at":180,"finished_at":190}' > "$probe_nunchi/mempalace-refresh.status.json"
+
+out="$(HOME="$probe_home" CCC_CLAUDE_DIR="$probe_claude" CCC_STATE_DIR="$probe_state" \
+  CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CCC_MEMORY_CHECK_NOW_EPOCH=200 \
+  CCC_NUNCHI_MEMPALACE_REPAIR_STATUS_TEXT="$repair_diverged" \
+  CCC_NUNCHI_CRONTAB_TEXT="$probe_cron" bash "$ROOT/scripts/ccc-memory-check.sh" --json 2>&1)"; rc=$?
+ok "memory check detects a readable SQLite palace with a diverged HNSW index" '[ "$rc" = 0 ] && jq -e '\''
+  .mempalace.status == "degraded" and (.mempalace.reasons | index("index-diverged")) != null
+  and .mempalace.index == {status:"diverged", sqlite_count:100, hnsw_count:10, divergence:90}
+'\'' >/dev/null <<<"$out"'
+
+PROBE_PY="$ROOT/scripts/ccc_memory_probe.py" python3 - <<'PY'
+import importlib.util
+import json
+import os
+from pathlib import Path
+import subprocess
+import tempfile
+from unittest import mock
+
+spec = importlib.util.spec_from_file_location("ccc_memory_probe", os.environ["PROBE_PY"])
+assert spec and spec.loader
+probe = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(probe)
+
+def repair(text, expected):
+    assert probe.parse_repair_status(text)["status"] == expected, (text, expected)
+
+repair("", "unknown")
+repair("Palace is initialized but empty", "empty")
+repair("[drawers]\nsqlite count: 1\nstatus: OK", "partial")
+repair("[drawers]\nsqlite count: 1\nhnsw count: 2\ndivergence: 1\nstatus: OK", "malformed")
+repair("[drawers]\nsqlite count: -1\nhnsw count: 1\ndivergence: 0\nstatus: OK", "malformed")
+repair("[drawers]\nsqlite count: 1\nsqlite count: 1\nhnsw count: 1\ndivergence: 0\nstatus: OK", "malformed")
+repair("[drawers]\nsqlite count: 1,000\nhnsw count: 1,000\ndivergence: 0\nstatus: OK\n[closets]", "ok")
+with mock.patch.object(probe.subprocess, "run", side_effect=subprocess.TimeoutExpired("mp", 5)):
+    assert probe.mempalace_index_probe(Path("/mp"), Path("/"))["status"] == "timeout"
+with mock.patch.object(probe.subprocess, "run", return_value=subprocess.CompletedProcess([], 9, "secret", "secret")):
+    assert probe.mempalace_index_probe(Path("/mp"), Path("/"))["status"] == "error"
+
+valid = {
+    "schema": "ccc.nunchi.mempalace-refresh.v1", "provider": "codex",
+    "state": "ok", "exit_code": 0, "started_at": 90, "finished_at": 100,
+}
+invalid = [
+    {**valid, "state": "bogus"},
+    {**valid, "provider": "bogus"},
+    {**valid, "exit_code": True},
+    {**valid, "started_at": True},
+    {**valid, "finished_at": True},
+    {**valid, "state": "running", "started_at": 0, "finished_at": 0, "exit_code": -1},
+    {**valid, "state": "running", "finished_at": 100, "exit_code": -1},
+    {**valid, "state": "running", "finished_at": 0, "exit_code": 0},
+    {**valid, "started_at": 0},
+    {**valid, "started_at": 101, "finished_at": 100},
+    {**valid, "exit_code": 1},
+    {**valid, "state": "error", "started_at": 0, "exit_code": 1},
+    {**valid, "state": "error", "started_at": 101, "exit_code": 1},
+    {**valid, "state": "error", "exit_code": 0},
+    {**valid, "state": "error", "exit_code": 256},
+    {**valid, "started_at": 501, "finished_at": 501},
+]
+with tempfile.TemporaryDirectory() as root:
+    path = Path(root) / "status.json"
+    for record in invalid:
+        path.write_text(json.dumps(record), encoding="utf-8")
+        assert probe.mempalace_refresh_probe(path, 200)["status"] == "invalid", record
+    for record in (
+        valid,
+        {**valid, "state": "running", "finished_at": 0, "exit_code": -1},
+        {**valid, "state": "error", "exit_code": 124},
+        {**valid, "started_at": 500, "finished_at": 500},
+    ):
+        path.write_text(json.dumps(record), encoding="utf-8")
+        assert probe.mempalace_refresh_probe(path, 200)["status"] == record["state"]
+PY
+rc=$?
+ok "repair and refresh parsers reject every malformed state invariant" '[ "$rc" = 0 ]'
+
+printf '%s\n' '{"schema":"ccc.nunchi.mempalace-refresh.v1","provider":"codex","state":"ok","exit_code":0,"started_at":180,"finished_at":190}' > "$probe_nunchi/mempalace-refresh.status.json"
+for index_case in unknown empty partial malformed; do
+  case "$index_case" in
+    unknown) repair_case="" ;;
+    empty) repair_case="Palace is initialized but empty" ;;
+    partial) repair_case=$'[drawers]\nsqlite count: 1\nstatus: OK' ;;
+    malformed) repair_case=$'[drawers]\nsqlite count: 1\nhnsw count: 2\ndivergence: 1\nstatus: OK' ;;
+  esac
+  out="$(HOME="$probe_home" CCC_CLAUDE_DIR="$probe_claude" CCC_STATE_DIR="$probe_state" \
+    CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CCC_MEMORY_CHECK_NOW_EPOCH=200 \
+    CCC_NUNCHI_MEMPALACE_REPAIR_STATUS_TEXT="$repair_case" \
+    CCC_NUNCHI_CRONTAB_TEXT="$probe_cron" bash "$ROOT/scripts/ccc-memory-check.sh" --json 2>&1)"; rc=$?
+  ok "memory check fails closed for $index_case drawer readiness" \
+    '[ "$rc" = 0 ] && jq -e --arg reason "index-'"$index_case"'" '\'' .mempalace.status == "degraded" and (.mempalace.reasons | index($reason)) != null '\'' >/dev/null <<<"$out"'
+done
+
+legacy_cron=$'*/10 * * * * bash /tmp/codex-feed.sh # nunchi:#816\n17 * * * * mempalace sweep /tmp/sessions # nunchi:#816\n7 8 * * 1 bash /tmp/bench.sh # nunchi:#816'
+wrong_provider_cron=$'*/10 * * * * bash /tmp/codex-feed.sh # nunchi:#816\n17 * * * * bash /tmp/mempalace-refresh.sh claude /tmp/sessions # nunchi:#816\n7 8 * * 1 bash /tmp/bench.sh # nunchi:#816'
+missing_arg_cron=$'*/10 * * * * bash /tmp/codex-feed.sh # nunchi:#816\n17 * * * * bash /tmp/mempalace-refresh.sh # nunchi:#816\n7 8 * * 1 bash /tmp/bench.sh # nunchi:#816'
+decoy_cron=$'*/10 * * * * bash /tmp/codex-feed.sh # nunchi:#816\n17 * * * * bash /tmp/mempalace-refresh.sh codex /tmp/sessions # nunchi:#816-decoy\n7 8 * * 1 bash /tmp/bench.sh # nunchi:#816'
+for cron_case in legacy wrong missing decoy; do
+  case "$cron_case" in
+    legacy) bad_cron="$legacy_cron"; reason="legacy-sweep" ;;
+    wrong) bad_cron="$wrong_provider_cron"; reason="refresh-provider-arg" ;;
+    missing) bad_cron="$missing_arg_cron"; reason="refresh-provider-arg" ;;
+    decoy) bad_cron="$decoy_cron"; reason="refresh-count" ;;
+  esac
+  out="$(HOME="$probe_home" CCC_CLAUDE_DIR="$probe_claude" CCC_STATE_DIR="$probe_state" \
+    CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CCC_MEMORY_CHECK_NOW_EPOCH=200 \
+    CCC_NUNCHI_MEMPALACE_REPAIR_STATUS_TEXT="$repair_ok" \
+    CCC_NUNCHI_CRONTAB_TEXT="$bad_cron" bash "$ROOT/scripts/ccc-memory-check.sh" --json 2>&1)"; rc=$?
+  ok "memory check rejects $cron_case managed refresh cron" \
+    '[ "$rc" = 0 ] && jq -e --arg reason "'"$reason"'" '\'' .nunchi.status == "degraded" and (.nunchi.reasons | index($reason)) != null '\'' >/dev/null <<<"$out"'
+done
+
+rm -f "$probe_nunchi/mempalace-refresh.status.json"
+out="$(HOME="$probe_home" CCC_CLAUDE_DIR="$probe_claude" CCC_STATE_DIR="$probe_state" \
+  CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CCC_MEMORY_CHECK_NOW_EPOCH=200 \
+  CCC_NUNCHI_MEMPALACE_REPAIR_STATUS_TEXT="$repair_ok" \
+  CCC_NUNCHI_CRONTAB_TEXT="$probe_cron" bash "$ROOT/scripts/ccc-memory-check.sh" --json 2>&1)"; rc=$?
+ok "a recently touched palace cannot mask a missing managed Codex refresh" \
+  '[ "$rc" = 0 ] && jq -e '\'' .mempalace.status == "degraded" and (.mempalace.reasons | index("refresh-missing")) != null '\'' >/dev/null <<<"$out"'
+
+custom_refresh_status="$TMP/custom-refresh.status.json"
+printf '%s\n' '{"schema":"ccc.nunchi.mempalace-refresh.v1","provider":"codex","state":"ok","exit_code":0,"started_at":180,"finished_at":190}' > "$custom_refresh_status"
+out="$(HOME="$probe_home" CCC_CLAUDE_DIR="$probe_claude" CCC_STATE_DIR="$probe_state" \
+  CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CCC_MEMORY_CHECK_NOW_EPOCH=200 \
+  CCC_NUNCHI_MEMPALACE_STATUS="$custom_refresh_status" \
+  CCC_NUNCHI_MEMPALACE_REPAIR_STATUS_TEXT="$repair_ok" \
+  CCC_NUNCHI_CRONTAB_TEXT="$probe_cron" bash "$ROOT/scripts/ccc-memory-check.sh" --json 2>&1)"; rc=$?
+ok "memory probe honors the custom refresh status path" \
+  '[ "$rc" = 0 ] && jq -e '\'' .mempalace.status == "ok" and .mempalace.refresh.age_seconds == 10 '\'' >/dev/null <<<"$out"'
+
+claude_probe_cron=$'*/10 * * * * bash /tmp/ingest-cron.sh # nunchi:#816\n17 * * * * bash /tmp/mempalace-refresh.sh claude /tmp/projects # nunchi:#816\n7 8 * * 1 bash /tmp/bench.sh # nunchi:#816'
+printf '%s\n' '{"schema":"ccc.nunchi.mempalace-refresh.v1","provider":"claude","state":"ok","exit_code":0,"started_at":180,"finished_at":190}' > "$probe_nunchi/mempalace-refresh.status.json"
 printf '%s\n' '{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"bash /tmp/hooks/nunchi/sessionstart.sh"}]}]}}' > "$probe_claude/settings.local.json"
 out="$(HOME="$probe_home" CCC_CLAUDE_DIR="$probe_claude" CCC_STATE_DIR="$probe_state" \
   CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" \
+  CCC_MEMORY_CHECK_NOW_EPOCH=200 CCC_NUNCHI_MEMPALACE_REPAIR_STATUS_TEXT="$repair_ok" \
   CCC_NUNCHI_CRONTAB_TEXT="$claude_probe_cron" bash "$ROOT/scripts/ccc-memory-check.sh" --json 2>&1)"; rc=$?
 ok "memory check accepts exactly one standalone hook for a Claude feed" '[ "$rc" = 0 ] && jq -e '\''
   .nunchi.status == "ok" and .nunchi.cron.feed == "claude"
@@ -83,6 +233,7 @@ PY
 printf '%s\n' '{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"bash /root/nunchi/sessionstart.sh"}]}]}}' > "$probe_claude/settings.local.json"
 out="$(HOME="$probe_home" CCC_CLAUDE_DIR="$probe_claude" CCC_STATE_DIR="$probe_state" \
   CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" \
+  CCC_MEMORY_CHECK_NOW_EPOCH=200 CCC_NUNCHI_MEMPALACE_REPAIR_STATUS_TEXT="$repair_ok" \
   CCC_NUNCHI_CRONTAB_TEXT="$probe_cron" bash "$ROOT/scripts/ccc-memory-check.sh" --json 2>&1)"; rc=$?
 ok "memory check flags legacy injection and an empty palace" '[ "$rc" = 0 ] && jq -e '\''
   .nunchi.status == "degraded" and (.nunchi.reasons | index("standalone-sessionstart")) != null
