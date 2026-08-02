@@ -581,7 +581,12 @@ def probe_mempalace(
     mp_reasons: list[str] = []
     if mode != "on":
         mp_status = "off"
-    elif not required and not mp_cli.is_file():
+    elif (
+        not required
+        and not mp_cli.is_file()
+        and managed_refresh_count == 0
+        and legacy_sweep_count == 0
+    ):
         mp_status = "optional"
     else:
         if not mp_cli.is_file():

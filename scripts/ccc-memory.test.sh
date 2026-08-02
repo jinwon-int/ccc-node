@@ -122,6 +122,36 @@ out="$(HOME="$probe_home" PREFIX="/data/data/com.termux/files/usr" \
   bash "$ROOT/scripts/ccc-memory-check.sh" --json 2>&1)"; rc=$?
 ok "Termux without optional MemPalace accepts feed and bench only" \
   '[ "$rc" = 0 ] && jq -e '\'' .nunchi.status == "ok" and .nunchi.cron.managed_refresh_count == 0 and .mempalace.status == "optional" and .mempalace.required == false '\'' >/dev/null <<<"$out"'
+
+optional_refresh_status="$TMP/optional-refresh.status.json"
+for refresh_case in missing error stale provider; do
+  rm -f "$optional_refresh_status"
+  case "$refresh_case" in
+    missing) expected_reason="refresh-missing"; case_ttl=21600 ;;
+    error)
+      expected_reason="refresh-error"; case_ttl=21600
+      printf '%s\n' '{"schema":"ccc.nunchi.mempalace-refresh.v1","provider":"codex","state":"error","exit_code":17,"started_at":180,"finished_at":190}' > "$optional_refresh_status"
+      ;;
+    stale)
+      expected_reason="refresh-stale"; case_ttl=10
+      printf '%s\n' '{"schema":"ccc.nunchi.mempalace-refresh.v1","provider":"codex","state":"ok","exit_code":0,"started_at":1,"finished_at":2}' > "$optional_refresh_status"
+      ;;
+    provider)
+      expected_reason="refresh-provider"; case_ttl=21600
+      printf '%s\n' '{"schema":"ccc.nunchi.mempalace-refresh.v1","provider":"claude","state":"ok","exit_code":0,"started_at":180,"finished_at":190}' > "$optional_refresh_status"
+      ;;
+  esac
+  out="$(HOME="$probe_home" PREFIX="/data/data/com.termux/files/usr" \
+    CCC_NUNCHI_MEMPALACE_CLI="$TMP/missing-mempalace" \
+    CCC_NUNCHI_MEMPALACE_STATUS="$optional_refresh_status" \
+    CCC_CLAUDE_DIR="$probe_claude" CCC_STATE_DIR="$probe_state" \
+    CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" \
+    CCC_MEMORY_CACHE_TTL_SEC="$case_ttl" CCC_MEMORY_CHECK_NOW_EPOCH=200 \
+    CCC_NUNCHI_CRONTAB_TEXT="$probe_cron" bash "$ROOT/scripts/ccc-memory-check.sh" --json 2>&1)"; rc=$?
+  ok "Termux configured refresh fails closed for $refresh_case state without its CLI" \
+    '[ "$rc" = 0 ] && jq -e --arg reason "$expected_reason" '\'' .mempalace.status == "degraded" and (.mempalace.reasons | index($reason)) != null '\'' >/dev/null <<<"$out"'
+done
+
 out="$(HOME="$probe_home" CCC_NUNCHI_MEMPALACE_CLI="$TMP/missing-mempalace" \
   CCC_CLAUDE_DIR="$probe_claude" CCC_STATE_DIR="$probe_state" \
   CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" \
