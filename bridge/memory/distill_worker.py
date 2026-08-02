@@ -177,6 +177,24 @@ class CodexDistillExtractionWorker:
             accounting=accounting,
         )
 
+    def _refund_unused_reservation(self, reservation: _ReservationLike | None) -> None:
+        """Return budget reserved for an attempt the provider never ran.
+
+        Every pre-provider exit from :meth:`extract_once` must route through
+        here. The reservation is prospective (#388): it is charged before the
+        backend can run, so any path that returns before ``self._backend
+        .extract`` leaves recorded autonomous spend for work that never
+        happened. Fail-open by design — a refund that raises keeps the charge
+        (conservative) rather than breaking the extraction path.
+        """
+
+        if self._usage_meter is None or reservation is None:
+            return
+        try:
+            self._usage_meter.refund_reservation(reservation)
+        except Exception:
+            logger.exception("Usage reservation refund failed; keeping charge")
+
     async def extract_once(self, *, job_id: str) -> DistillJob:
         reservation: _ReservationLike | None = None
         preview = await asyncio.to_thread(self._journal.get, job_id)
@@ -218,19 +236,21 @@ class CodexDistillExtractionWorker:
             max_attempts=self._max_attempts,
         )
         if claimed is None:
-            if self._usage_meter is not None and reservation is not None:
-                # The reserved attempt never started (already done, leased
-                # elsewhere, or exhausted): return the exact reservation —
-                # the handle pins its accounting day and dimensions — so
-                # no-op invocations cannot drain the budget. A crash before
-                # this refund leaves the charge in place — conservative.
-                try:
-                    self._usage_meter.refund_reservation(reservation)
-                except Exception:
-                    logger.exception("Usage reservation refund failed; keeping charge")
+            # The reserved attempt never started (already done, leased
+            # elsewhere, or exhausted): return the exact reservation —
+            # the handle pins its accounting day and dimensions — so
+            # no-op invocations cannot drain the budget. A crash before
+            # this refund leaves the charge in place — conservative.
+            self._refund_unused_reservation(reservation)
             return await asyncio.to_thread(self._journal.get, job_id)
         snapshot = claimed.snapshot
         if snapshot is None or snapshot.thread_hash != claimed.thread_hash:
+            # Same rule as the unclaimed path: these validations fail BEFORE
+            # `self._backend.extract` runs, so the provider was never invoked
+            # and the reserved budget must go back. Without this the daily
+            # autonomous cap is consumed by work that never happened, and a
+            # persistently malformed job drains the budget once per tick.
+            self._refund_unused_reservation(reservation)
             return await self._fail(
                 claimed,
                 error_code="snapshot_thread_mismatch",
@@ -239,6 +259,7 @@ class CodexDistillExtractionWorker:
         try:
             extraction_input = build_extraction_input(snapshot, trigger=claimed.trigger)
         except (TypeError, ValueError):
+            self._refund_unused_reservation(reservation)
             return await self._fail(
                 claimed,
                 error_code="distill_input_invalid",
