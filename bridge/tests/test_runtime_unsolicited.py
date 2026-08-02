@@ -58,6 +58,9 @@ from claude_agent_sdk import (  # noqa: E402 -- must follow the stub purge above
     ResultMessage,
     StreamEvent,
     SystemMessage,
+    TaskNotificationMessage,
+    TaskStartedMessage,
+    TaskUpdatedMessage,
     TextBlock,
     ToolPermissionContext,
     ToolResultBlock,
@@ -158,6 +161,72 @@ class ManualClaudeSdkClient:
                     utilization=utilization,
                 ),
                 uuid=str(uuid.uuid4()),
+                session_id=self.session_id,
+            )
+        )
+
+    def emit_task_started(self, task_id: str, task_type: str) -> None:
+        data = {
+            "type": "system",
+            "subtype": "task_started",
+            "task_id": task_id,
+            "task_type": task_type,
+            "description": task_id,
+            "uuid": str(uuid.uuid4()),
+            "session_id": self.session_id,
+        }
+        self.emit(
+            TaskStartedMessage(
+                subtype="task_started",
+                data=data,
+                task_id=task_id,
+                task_type=task_type,
+                description=task_id,
+                uuid=data["uuid"],
+                session_id=self.session_id,
+            )
+        )
+
+    def emit_task_updated(self, task_id: str, status: str) -> None:
+        patch = {"status": status}
+        data = {
+            "type": "system",
+            "subtype": "task_updated",
+            "task_id": task_id,
+            "patch": patch,
+            "session_id": self.session_id,
+        }
+        self.emit(
+            TaskUpdatedMessage(
+                subtype="task_updated",
+                data=data,
+                task_id=task_id,
+                patch=patch,
+                status=status,  # type: ignore[arg-type]
+                session_id=self.session_id,
+            )
+        )
+
+    def emit_task_notification(self, task_id: str) -> None:
+        data = {
+            "type": "system",
+            "subtype": "task_notification",
+            "task_id": task_id,
+            "status": "completed",
+            "output_file": "",
+            "summary": "done",
+            "uuid": str(uuid.uuid4()),
+            "session_id": self.session_id,
+        }
+        self.emit(
+            TaskNotificationMessage(
+                subtype="task_notification",
+                data=data,
+                task_id=task_id,
+                status="completed",
+                output_file="",
+                summary="done",
+                uuid=data["uuid"],
                 session_id=self.session_id,
             )
         )
@@ -352,6 +421,106 @@ class ClaudeRuntimeUnsolicitedTests(unittest.IsolatedAsyncioTestCase):
             (0, 0.0),
         )
 
+    async def test_typed_task_updates_release_only_terminal_background_work(self) -> None:
+        session, client = await self._start_session()
+        for task_id in ("completed", "killed", "running"):
+            client.emit_task_started(task_id, "local_bash")
+        await self._drain(client)
+        self.assertEqual(
+            session.background_workload_snapshot(asyncio.get_running_loop().time())[0],
+            3,
+        )
+
+        client.emit_task_updated("completed", "completed")
+        client.emit_task_updated("killed", "killed")
+        client.emit_task_updated("running", "running")
+        await self._drain(client)
+        self.assertEqual(
+            session.background_workload_snapshot(asyncio.get_running_loop().time())[0],
+            1,
+        )
+
+        # TaskNotificationMessage.status is terminal-only, so notification
+        # release does not need a second status allowlist.
+        client.emit_task_notification("running")
+        await self._drain(client)
+        self.assertEqual(
+            session.background_workload_snapshot(asyncio.get_running_loop().time()),
+            (0, 0.0),
+        )
+
+    async def test_background_roster_preserves_retained_and_adopts_unseen_shells(
+        self,
+    ) -> None:
+        session, client = await self._start_session()
+        retained_started = asyncio.get_running_loop().time() - 30.0
+        session._background_tasks["retained"] = retained_started
+
+        client.emit(
+            SystemMessage(
+                subtype="background_tasks_changed",
+                data={
+                    "tasks": [
+                        {
+                            "task_id": "retained",
+                            "task_type": "local_bash",
+                            "description": "retained shell",
+                        },
+                        {
+                            "task_id": "adopted",
+                            "task_type": "local_bash",
+                            "description": "unseen shell",
+                        },
+                        {
+                            "task_id": "delegated",
+                            "task_type": "local_agent",
+                            "description": "delegated run",
+                        },
+                    ]
+                },
+            )
+        )
+        await self._drain(client)
+
+        self.assertEqual(set(session._background_tasks), {"retained", "adopted"})
+        self.assertEqual(session._background_tasks["retained"], retained_started)
+        self.assertGreater(session._background_tasks["adopted"], retained_started)
+
+        client.emit(
+            SystemMessage(
+                subtype="background_tasks_changed",
+                data={"tasks": []},
+            )
+        )
+        await self._drain(client)
+        self.assertEqual(
+            session.background_workload_snapshot(asyncio.get_running_loop().time()),
+            (0, 0.0),
+        )
+
+    async def test_malformed_background_roster_does_not_clear_tracked_work(self) -> None:
+        session, client = await self._start_session()
+        client.emit_task_started("genuine-shell", "local_bash")
+        await self._drain(client)
+
+        client.emit(
+            SystemMessage(
+                subtype="background_tasks_changed",
+                data={"task_ids": []},
+            )
+        )
+        client.emit(
+            SystemMessage(
+                subtype="background_tasks_changed",
+                data={"tasks": [{"task_id": "missing-type"}]},
+            )
+        )
+        await self._drain(client)
+        self.assertEqual(
+            session.background_workload_snapshot(asyncio.get_running_loop().time())[0],
+            1,
+        )
+
     async def test_result_text_wins_over_buffered_assistant_text(self) -> None:
         session, client = await self._start_session()
         session.set_unsolicited_handler(self._handler)
@@ -401,24 +570,17 @@ class ClaudeRuntimeUnsolicitedTests(unittest.IsolatedAsyncioTestCase):
             _collect(session.send_turn("long orchestration", approval_handler=allow))
         )
         await _wait_until(lambda: client.queries == ["long orchestration"])
+        client.emit_task_started("delegated-1", "local_agent")
+        client.emit_task_started("workflow-completed", "local_workflow")
+        client.emit_task_started("workflow-killed", "local_workflow")
+        client.emit_task_updated("workflow-completed", "running")
+        client.emit_task_updated("workflow-killed", "running")
+        # A background shell roster is a separate level-triggered stream. Its
+        # empty set must not release delegated-run completion deferral.
         client.emit(
             SystemMessage(
-                subtype="task_started",
-                data={
-                    "task_id": "delegated-1",
-                    "task_type": "local_agent",
-                    "session_id": client.session_id,
-                },
-            )
-        )
-        client.emit(
-            SystemMessage(
-                subtype="task_started",
-                data={
-                    "task_id": "workflow-1",
-                    "task_type": "local_workflow",
-                    "session_id": client.session_id,
-                },
+                subtype="background_tasks_changed",
+                data={"tasks": []},
             )
         )
         await self._drain(client)
@@ -476,26 +638,9 @@ class ClaudeRuntimeUnsolicitedTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(events_task.done())
         self.assertEqual(approvals, ["approval-early", "approval-late"])
 
-        client.emit(
-            SystemMessage(
-                subtype="task_notification",
-                data={
-                    "task_id": "delegated-1",
-                    "status": "completed",
-                    "session_id": client.session_id,
-                },
-            )
-        )
-        client.emit(
-            SystemMessage(
-                subtype="task_updated",
-                data={
-                    "task_id": "workflow-1",
-                    "patch": {"status": "completed"},
-                    "session_id": client.session_id,
-                },
-            )
-        )
+        client.emit_task_notification("delegated-1")
+        client.emit_task_updated("workflow-completed", "completed")
+        client.emit_task_updated("workflow-killed", "killed")
         client.emit_assistant("all delegated work finished")
         client.emit_result(result="all delegated work finished")
         events = await asyncio.wait_for(events_task, timeout=2.0)
@@ -576,16 +721,7 @@ class ClaudeRuntimeUnsolicitedTests(unittest.IsolatedAsyncioTestCase):
         client.turn_scripts.append("hang")
         turn = asyncio.create_task(_collect(session.send_turn("team orchestration")))
         await _wait_until(lambda: client.queries == ["team orchestration"])
-        client.emit(
-            SystemMessage(
-                subtype="task_started",
-                data={
-                    "task_id": "teammate-1",
-                    "task_type": "teammate",
-                    "session_id": client.session_id,
-                },
-            )
-        )
+        client.emit_task_started("teammate-1", "teammate")
         client.emit_result(result="interactive run complete")
         events = await asyncio.wait_for(turn, timeout=2.0)
 

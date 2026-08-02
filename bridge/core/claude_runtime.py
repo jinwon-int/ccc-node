@@ -22,6 +22,7 @@ from typing import Any, Protocol, cast
 import uuid
 
 from claude_agent_sdk import (
+    TERMINAL_TASK_STATUSES as SDK_TERMINAL_TASK_STATUSES,
     AssistantMessage,
     CanUseTool,
     ClaudeAgentOptions,
@@ -37,6 +38,9 @@ from claude_agent_sdk import (
     ServerToolUseBlock,
     StreamEvent,
     SystemMessage,
+    TaskNotificationMessage,
+    TaskStartedMessage,
+    TaskUpdatedMessage,
     TextBlock,
     ThinkingBlock,
     ToolPermissionContext,
@@ -149,16 +153,21 @@ _BACKGROUND_TASK_STARTED = re.compile(
 )
 _BACKGROUND_TASK_FINISHED = re.compile(
     r"<task-notification>.*?<task-id>([^<]{1,256})</task-id>.*?"
-    r"<status>(completed|failed|canceled|cancelled|timed_out|timeout)</status>.*?"
+    r"<status>(completed|failed|stopped|killed|canceled|cancelled|timed_out|timeout)"
+    r"</status>.*?"
     r"</task-notification>",
     re.IGNORECASE | re.DOTALL,
 )
-# The locked Agent SDK uses the same narrow set to distinguish a result that
-# ends one model turn from a result that ends the whole delegated run.  Shells,
-# monitors, teammates, and remote agents may be intentionally long-lived and
-# must not keep an interactive request open forever.
+# Transcript XML predates the SDK's typed task frames and retains broader legacy
+# terminal spellings (``canceled``, ``timed_out``, and aliases). Keep that
+# compatibility vocabulary in the regex above; it is intentionally independent
+# of the SDK-owned typed-frame statuses and may evolve separately.
+#
+# Only bounded delegated task types distinguish a result that ends one model
+# turn from a result that ends the whole run. Shells, monitors, teammates, and
+# remote agents may be intentionally long-lived and must not keep an interactive
+# request open forever.
 _RESULT_DEFERRING_TASK_TYPES = frozenset({"local_agent", "local_workflow"})
-_TERMINAL_TASK_STATUSES = frozenset({"completed", "failed", "stopped", "killed"})
 _NO_ACTIVE_APPROVAL_ROUTE = (
     "No active turn accepts approval requests; start a new user turn and retry"
 )
@@ -464,11 +473,59 @@ class ClaudeSession:
                 )
 
     def _observe_background_task_notifications(self, message: Message) -> None:
+        if isinstance(message, TaskStartedMessage):
+            if message.task_id and message.task_type == "local_bash":
+                self._background_tasks.setdefault(
+                    message.task_id, asyncio.get_running_loop().time()
+                )
+            return
+        if isinstance(message, TaskNotificationMessage):
+            # The SDK's TaskNotificationStatus Literal is terminal-only.
+            self._background_tasks.pop(message.task_id, None)
+            return
+        if isinstance(message, TaskUpdatedMessage):
+            if message.status in SDK_TERMINAL_TASK_STATUSES:
+                self._background_tasks.pop(message.task_id, None)
+            return
+        if isinstance(message, SystemMessage):
+            if message.subtype != "background_tasks_changed":
+                return
+            self._reconcile_background_task_roster(message.data)
+            return
         if not isinstance(message, UserMessage):
             return
         for text in self._content_texts(message.content):
             for match in _BACKGROUND_TASK_FINISHED.finditer(text):
                 self._background_tasks.pop(match.group(1).strip(), None)
+
+    def _reconcile_background_task_roster(self, data: Mapping[str, Any]) -> None:
+        """Replace the live shell roster, preserving known start timestamps."""
+
+        tasks = data.get("tasks")
+        if not isinstance(tasks, list):
+            # A roster is a full replacement set. Fail closed if the payload is
+            # not one, rather than erasing genuine tracked work.
+            return
+        local_bash_ids: set[str] = set()
+        for task in tasks:
+            if not isinstance(task, Mapping):
+                return
+            task_id = task.get("task_id")
+            task_type = task.get("task_type")
+            if (
+                not isinstance(task_id, str)
+                or not task_id
+                or not isinstance(task_type, str)
+                or not task_type
+            ):
+                return
+            if task_type == "local_bash":
+                local_bash_ids.add(task_id)
+        now = asyncio.get_running_loop().time()
+        self._background_tasks = {
+            task_id: self._background_tasks.get(task_id, now)
+            for task_id in local_bash_ids
+        }
 
     def _observe_sdk_frame(self, message: Message) -> None:
         observer = self._sdk_frame_observer
@@ -654,24 +711,20 @@ class ClaudeSession:
     def _observe_result_deferring_task(active: _ActiveTurn, message: Message) -> None:
         """Mirror the Agent SDK's run-boundary task ledger without task bodies."""
 
-        if not isinstance(message, SystemMessage):
+        if isinstance(message, TaskStartedMessage):
+            if message.task_id and message.task_type in _RESULT_DEFERRING_TASK_TYPES:
+                active.result_deferring_tasks.add(message.task_id)
             return
-        data = message.data
-        task_id = data.get("task_id")
-        if not isinstance(task_id, str) or not task_id:
+        if isinstance(message, TaskNotificationMessage):
+            # TaskNotificationStatus is terminal-only, so release regardless
+            # of which terminal spelling the SDK carries.
+            active.result_deferring_tasks.discard(message.task_id)
             return
-        if message.subtype == "task_started":
-            if data.get("task_type") in _RESULT_DEFERRING_TASK_TYPES:
-                active.result_deferring_tasks.add(task_id)
-            return
-        if message.subtype == "task_notification":
-            active.result_deferring_tasks.discard(task_id)
-            return
-        if message.subtype == "task_updated":
-            patch = data.get("patch")
-            status = patch.get("status") if isinstance(patch, Mapping) else None
-            if status in _TERMINAL_TASK_STATUSES:
-                active.result_deferring_tasks.discard(task_id)
+        if (
+            isinstance(message, TaskUpdatedMessage)
+            and message.status in SDK_TERMINAL_TASK_STATUSES
+        ):
+            active.result_deferring_tasks.discard(message.task_id)
 
     def _observe_session_id(self, message: Message) -> None:
         if self._session_id is not None:
