@@ -180,6 +180,26 @@ _NO_ACTIVE_APPROVAL_ROUTE = (
 )
 
 
+_APPROVAL_PATH_KEYS = ("path", "file_path", "filePath", "paths", "target", "targets")
+
+
+def _approval_target_kind(tool_input: object) -> str:
+    """Body-free shape hint for an approval request (#889 observability).
+
+    Returns only a kind label (``path``/``command``/empty) — never the value —
+    so the log can say *what category* of target was asked about without
+    exposing raw arguments, env, or file contents.
+    """
+
+    if not isinstance(tool_input, dict):
+        return ""
+    if any(isinstance(tool_input.get(k), str) and tool_input.get(k) for k in _APPROVAL_PATH_KEYS):
+        return "path"
+    if isinstance(tool_input.get("command"), str) and tool_input.get("command"):
+        return "command"
+    return ""
+
+
 def _normalize_task_id(value: object) -> str | None:
     """Return one bounded opaque lifecycle key, never a task body."""
 
@@ -1119,6 +1139,13 @@ class ClaudeSession:
 
         active = self._active_turn
         if active is None or active.finished:
+            logger.info(
+                "Approval request denied (no active route) provider=claude "
+                "tool=%s target_kind=%s request_id=%s turn=none outcome=denied-no-route",
+                tool_name,
+                _approval_target_kind(tool_input),
+                getattr(context, "tool_use_id", None),
+            )
             return PermissionResultDeny(message=_NO_ACTIVE_APPROVAL_ROUTE)
         generation = active.generation
         self._approval_counter += 1
@@ -1142,6 +1169,15 @@ class ClaudeSession:
             or self._active_turn is not active
         ):
             decision = ApprovalDecision.DENY
+        outcome = "allowed" if decision is ApprovalDecision.ALLOW else "denied"
+        logger.info(
+            "Approval request provider=claude tool=%s target_kind=%s "
+            "request_id=%s turn=active outcome=%s",
+            tool_name,
+            _approval_target_kind(tool_input),
+            request_id,
+            outcome,
+        )
         if decision is ApprovalDecision.ALLOW:
             return PermissionResultAllow()
         return PermissionResultDeny(message="Denied by the bridge approval handler")

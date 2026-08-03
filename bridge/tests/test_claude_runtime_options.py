@@ -20,6 +20,7 @@ from telegram_bot.core.agent_runtime import SessionRequest
 from telegram_bot.core.claude_runtime import (
     ClaudeRuntime,
     ClaudeSession,
+    _approval_target_kind,
     _classify_cli_stderr,
 )
 from telegram_bot.core.memory_audience import MemoryAudience
@@ -359,3 +360,18 @@ def test_stderr_classes_cover_the_shapes_worth_telling_apart() -> None:
     assert _classify_cli_stderr(["certificate verify failed"]) == "tls"
     assert _classify_cli_stderr(["something nobody enumerated"]) == "other"
     assert _classify_cli_stderr([]) is None
+
+
+def test_approval_target_kind_is_body_free() -> None:
+    # Per #889: returns only a kind label (path/command/empty), never the value,
+    # so the approval-request log can name the target category without exposing
+    # raw arguments, env, or file contents.
+    assert _approval_target_kind({"path": "/very/secret/path"}) == "path"
+    assert _approval_target_kind({"file_path": "x"}) == "path"
+    assert _approval_target_kind({"filePath": "x"}) == "path"
+    assert _approval_target_kind({"target": "t"}) == "path"
+    assert _approval_target_kind({"command": "rm -rf /"}) == "command"
+    assert _approval_target_kind({}) == ""
+    assert _approval_target_kind({"unrelated": "x"}) == ""
+    assert _approval_target_kind(None) == ""
+    assert _approval_target_kind({"path": ""}) == ""
