@@ -210,6 +210,27 @@ def lock_path(task_id):
     return base / 'locks' / f'{task_id}.lock'
 
 
+def lock_guard_path(task_id):
+    return lock_path(task_id).with_suffix('.guard')
+
+
+@contextlib.contextmanager
+def task_lock_guard(task_id):
+    """Serialize ownership checks and mutations for one task lock."""
+    path = lock_guard_path(task_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+
 def boot_id():
     try:
         return Path('/proc/sys/kernel/random/boot_id').read_text(encoding='utf-8').strip()
@@ -339,6 +360,60 @@ def emit_lock(result, as_json):
         print(f"agent-cron lock {result.get('taskId')}: {result.get('lockState')} ok={str(result.get('ok')).lower()}")
 
 
+def lock_command_guarded(task_id, action, run_id, scheduled_at, at, as_json, task):
+    """Apply one CLI lock operation while task_lock_guard is held."""
+    path = lock_path(task_id)
+    status = lock_status(task_id, task, at)
+    result = {'ok': True, 'taskId': task_id, 'action': action, **status}
+    if action == 'probe':
+        return result, as_json, 0
+    if action == 'release':
+        holder = status.get('holder') or {}
+        if status['lockState'] == 'free':
+            result.update({'lockState': 'free', 'ok': True})
+            return result, as_json, 0
+        if holder.get('runId') != run_id:
+            result.update({'ok': False, 'lockState': 'release-mismatch', 'runId': run_id})
+            return result, as_json, 1
+        path.unlink()
+        result.update({'ok': True, 'lockState': 'released', 'runId': run_id})
+        return result, as_json, 0
+    # acquire
+    reclaimed = False
+    if status['lockState'] in {'held', 'persist-failed'}:
+        result.update({'ok': False, 'lockState': status['lockState'], 'runId': run_id})
+        return result, as_json, 1
+    if status['lockState'] == 'stale':
+        stale_path = path.with_name(f'{path.name}.stale.{int(at.timestamp())}.{os.getpid()}')
+        path.rename(stale_path)
+        reclaimed = True
+    payload = {
+        'taskId': task_id,
+        'runId': run_id,
+        'pid': os.getpid(),
+        'host': socket.gethostname(),
+        'bootId': boot_id(),
+        'acquiredAt': fmt_dt(at),
+        'scheduledAt': scheduled_at or fmt_dt(at),
+    }
+    try:
+        write_lock(path, payload)
+    except FileExistsError:
+        after = lock_status(task_id, task, at)
+        return {'ok': False, 'taskId': task_id, 'action': action, **after, 'runId': run_id}, as_json, 1
+    result = {
+        'ok': True,
+        'taskId': task_id,
+        'action': action,
+        'lockPath': str(path),
+        'lockState': 'acquired',
+        'runId': run_id,
+        'reclaimedStale': reclaimed,
+        'holder': payload,
+    }
+    return result, as_json, 0
+
+
 def lock_command(data):
     try:
         task_id, action, run_id, scheduled_at, at_value, as_json = parse_lock_args()
@@ -346,47 +421,8 @@ def lock_command(data):
         task = task_by_id(data, task_id)
         if not task:
             return {'ok': False, 'taskId': task_id, 'lockState': 'unknown-task', 'error': 'task id not found'}, as_json, 1
-        path = lock_path(task_id)
-        status = lock_status(task_id, task, at)
-        result = {'ok': True, 'taskId': task_id, 'action': action, **status}
-        if action == 'probe':
-            return result, as_json, 0
-        if action == 'release':
-            holder = status.get('holder') or {}
-            if status['lockState'] == 'free':
-                result.update({'lockState': 'free', 'ok': True})
-                return result, as_json, 0
-            if holder.get('runId') != run_id:
-                result.update({'ok': False, 'lockState': 'release-mismatch', 'runId': run_id})
-                return result, as_json, 1
-            path.unlink()
-            result.update({'ok': True, 'lockState': 'released', 'runId': run_id})
-            return result, as_json, 0
-        # acquire
-        reclaimed = False
-        if status['lockState'] in {'held', 'persist-failed'}:
-            result.update({'ok': False, 'lockState': status['lockState'], 'runId': run_id})
-            return result, as_json, 1
-        if status['lockState'] == 'stale':
-            stale_path = path.with_name(f'{path.name}.stale.{int(at.timestamp())}.{os.getpid()}')
-            path.rename(stale_path)
-            reclaimed = True
-        payload = {
-            'taskId': task_id,
-            'runId': run_id,
-            'pid': os.getpid(),
-            'host': socket.gethostname(),
-            'bootId': boot_id(),
-            'acquiredAt': fmt_dt(at),
-            'scheduledAt': scheduled_at or fmt_dt(at),
-        }
-        try:
-            write_lock(path, payload)
-        except FileExistsError:
-            after = lock_status(task_id, task, at)
-            return {'ok': False, 'taskId': task_id, 'action': action, **after, 'runId': run_id}, as_json, 1
-        result = {'ok': True, 'taskId': task_id, 'action': action, 'lockPath': str(path), 'lockState': 'acquired', 'runId': run_id, 'reclaimedStale': reclaimed, 'holder': payload}
-        return result, as_json, 0
+        with task_lock_guard(task_id):
+            return lock_command_guarded(task_id, action, run_id, scheduled_at, at, as_json, task)
     except Exception as e:
         return {'ok': False, 'taskId': None, 'lockState': 'error', 'error': str(e)}, json_out, 1
 
@@ -970,7 +1006,8 @@ def apply_run_limit(task):
     return limit
 
 
-def acquire_for_run(task_id, task, run_id, scheduled_at, at):
+def acquire_for_run_guarded(task_id, task, run_id, scheduled_at, at):
+    """Acquire a run lock while task_lock_guard is held."""
     path = lock_path(task_id)
     status = lock_status(task_id, task, at)
     if status['lockState'] in {'held', 'persist-failed'}:
@@ -1001,14 +1038,20 @@ def acquire_for_run(task_id, task, run_id, scheduled_at, at):
     return True, {'state': 'acquired', 'path': str(path), 'holder': payload}
 
 
+def acquire_for_run(task_id, task, run_id, scheduled_at, at):
+    with task_lock_guard(task_id):
+        return acquire_for_run_guarded(task_id, task, run_id, scheduled_at, at)
+
+
 def release_for_run(task_id, run_id):
-    path, lock = read_lock(task_id)
-    if lock is None:
-        return {'ok': True, 'state': 'free'}
-    if lock.get('runId') != run_id:
-        return {'ok': False, 'state': 'release-mismatch', 'holder': lock}
-    path.unlink()
-    return {'ok': True, 'state': 'released'}
+    with task_lock_guard(task_id):
+        path, lock = read_lock(task_id)
+        if lock is None:
+            return {'ok': True, 'state': 'free'}
+        if lock.get('runId') != run_id:
+            return {'ok': False, 'state': 'release-mismatch', 'holder': lock}
+        path.unlink()
+        return {'ok': True, 'state': 'released'}
 
 
 def quarantine_persist_failure(task_id, run_id, at):
@@ -1020,26 +1063,27 @@ def quarantine_persist_failure(task_id, run_id, at):
     retained lock.  Mark this exact run as persist-failed so only an explicit
     matching `agent-cron lock ... --action release --run-id ...` can unblock it.
     """
-    path, lock = read_lock(task_id)
-    if lock is None:
-        return {'ok': False, 'state': 'persist-quarantine-missing', 'path': str(lock_path(task_id))}
-    if lock.get('runId') != run_id:
-        return {'ok': False, 'state': 'persist-quarantine-mismatch', 'path': str(path), 'holder': lock}
-    quarantined = {
-        **lock,
-        'state': 'persist-failed',
-        'persistFailedAt': fmt_dt(at),
-    }
-    try:
-        replace_lock(path, quarantined)
-    except Exception as error:
-        return {
-            'ok': False,
-            'state': 'persist-quarantine-error',
-            'path': str(path),
-            'error': short_text(str(error)),
+    with task_lock_guard(task_id):
+        path, lock = read_lock(task_id)
+        if lock is None:
+            return {'ok': False, 'state': 'persist-quarantine-missing', 'path': str(lock_path(task_id))}
+        if lock.get('runId') != run_id:
+            return {'ok': False, 'state': 'persist-quarantine-mismatch', 'path': str(path), 'holder': lock}
+        quarantined = {
+            **lock,
+            'state': 'persist-failed',
+            'persistFailedAt': fmt_dt(at),
         }
-    return {'ok': True, 'state': 'persist-failed', 'path': str(path), 'holder': quarantined}
+        try:
+            replace_lock(path, quarantined)
+        except Exception as error:
+            return {
+                'ok': False,
+                'state': 'persist-quarantine-error',
+                'path': str(path),
+                'error': short_text(str(error)),
+            }
+        return {'ok': True, 'state': 'persist-failed', 'path': str(path), 'holder': quarantined}
 
 
 def short_text(text, limit=4000):

@@ -19,6 +19,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import sys
 import tempfile
+import threading
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -146,6 +147,87 @@ class PersistQuarantineLockTest(unittest.TestCase):
         released = agent_cron.release_for_run("probe", lock["holder"]["runId"])
         self.assertEqual(released["state"], "released")
         self.assertEqual(agent_cron.lock_status("probe", task, later)["lockState"], "free")
+
+    def test_wrong_run_release_cannot_clear_quarantine(self) -> None:
+        at = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        task = {"id": "probe", "lockTimeoutSec": 1}
+        acquired, _lock = agent_cron.acquire_for_run(
+            "probe", task, "run-1", "2026-01-01T00:00:00Z", at
+        )
+        self.assertTrue(acquired)
+        self.assertTrue(
+            agent_cron.quarantine_persist_failure("probe", "run-1", at)["ok"]
+        )
+
+        released = agent_cron.release_for_run("probe", "run-2")
+        self.assertFalse(released["ok"])
+        self.assertEqual(released["state"], "release-mismatch")
+        status = agent_cron.lock_status("probe", task, at)
+        self.assertEqual(status["lockState"], "persist-failed")
+        self.assertEqual(status["holder"]["runId"], "run-1")
+
+    def test_quarantine_cannot_overwrite_a_new_owner_during_release(self) -> None:
+        at = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        task = {"id": "probe", "lockTimeoutSec": 60}
+        acquired, _lock = agent_cron.acquire_for_run(
+            "probe", task, "run-1", "2026-01-01T00:00:00Z", at
+        )
+        self.assertTrue(acquired)
+
+        replace_entered = threading.Event()
+        allow_replace = threading.Event()
+        rotation_done = threading.Event()
+        quarantine_result = []
+        rotation_result = []
+        original_replace = agent_cron.replace_lock
+
+        def paused_replace(path, payload):
+            replace_entered.set()
+            if not allow_replace.wait(timeout=2):
+                raise TimeoutError("test did not release paused quarantine")
+            return original_replace(path, payload)
+
+        def quarantine():
+            quarantine_result.append(
+                agent_cron.quarantine_persist_failure("probe", "run-1", at)
+            )
+
+        def rotate_owner():
+            rotation_result.append(agent_cron.release_for_run("probe", "run-1"))
+            rotation_result.append(
+                agent_cron.acquire_for_run(
+                    "probe", task, "run-2", "2026-01-01T00:01:00Z", at
+                )
+            )
+            rotation_done.set()
+
+        agent_cron.replace_lock = paused_replace
+        quarantine_thread = threading.Thread(target=quarantine)
+        rotation_thread = threading.Thread(target=rotate_owner)
+        try:
+            quarantine_thread.start()
+            self.assertTrue(replace_entered.wait(timeout=2))
+            rotation_thread.start()
+            # release/acquire must wait for the quarantine ownership check and
+            # replacement to complete under the same task guard.
+            self.assertFalse(rotation_done.wait(timeout=0.1))
+            allow_replace.set()
+            quarantine_thread.join(timeout=2)
+            rotation_thread.join(timeout=2)
+            self.assertFalse(quarantine_thread.is_alive())
+            self.assertFalse(rotation_thread.is_alive())
+        finally:
+            allow_replace.set()
+            quarantine_thread.join(timeout=2)
+            rotation_thread.join(timeout=2)
+            agent_cron.replace_lock = original_replace
+
+        self.assertTrue(quarantine_result[0]["ok"])
+        self.assertEqual(rotation_result[0]["state"], "released")
+        self.assertTrue(rotation_result[1][0])
+        status = agent_cron.lock_status("probe", task, at)
+        self.assertEqual(status["lockState"], "held")
+        self.assertEqual(status["holder"]["runId"], "run-2")
 
 
 if __name__ == "__main__":
