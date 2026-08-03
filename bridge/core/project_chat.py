@@ -42,6 +42,7 @@ from telegram_bot.core.usage import (
     parse_claude_result,
     synthesize_service_windows,
 )
+from telegram_bot.core.usage_cost_ledger import CostLedger
 from telegram_bot.core.usage_meter import MODE_INTERACTIVE, UsageMeter
 from telegram_bot.memory.distill_worker import CodexDistillExtractionWorker
 from telegram_bot.core.conversation_paths import claude_project_dir_name
@@ -226,6 +227,7 @@ class ProjectChatHandler(
         # chat's stream happens to be open when the CLI emits them.
         self._claude_rate_limit: Optional[UsageSnapshot] = None
         self._usage_meter: Optional[UsageMeter] = None
+        self._cost_ledger: Optional[CostLedger] = None
         if getattr(self._config, "usage_meter_enabled", True):
             try:
                 self._usage_meter = UsageMeter(
@@ -239,6 +241,13 @@ class ProjectChatHandler(
                 )
             except Exception:
                 logger.exception("Usage meter unavailable; continuing without local metering")
+            try:
+                self._cost_ledger = CostLedger(
+                    self.project_root / ".telegram_bot" / "usage-cost-ledger.jsonl",
+                    clock=self._clock.time,
+                )
+            except Exception:
+                logger.exception("Cost ledger unavailable; continuing without spend tracking")
         if self._usage_meter is not None and self._agent_runtime is not None:
             set_usage_recorder = getattr(self._agent_runtime, "set_usage_recorder", None)
             if callable(set_usage_recorder):
@@ -258,6 +267,21 @@ class ProjectChatHandler(
         """Node-local durable usage meter, when enabled (#388)."""
 
         return self._usage_meter
+
+    def render_cost_report(self, *, days: int = 7) -> str:
+        """Render the additive per-model spend block for ``/usage``.
+
+        Backed by :class:`CostLedger`; returns an empty string when the ledger
+        is disabled or has no cost data for the window. Never raises.
+        """
+
+        if self._cost_ledger is None:
+            return ""
+        try:
+            return self._cost_ledger.render_report(days=days)
+        except Exception:
+            logger.debug("Cost ledger report failed", exc_info=True)
+            return ""
 
     def _write_usage_alert_spool(self, message: str) -> None:
         """Queue one budget alert for owner push delivery (#388).
@@ -418,6 +442,9 @@ class ProjectChatHandler(
             return
         key = (user_id, chat_id, session_id)
         snapshot = parse_claude_result(msg, observed_at=self._clock.time())
+        cost_ledger = getattr(self, "_cost_ledger", None)
+        if cost_ledger is not None:
+            cost_ledger.record_snapshot(snapshot, provider="claude")
         self._claude_usage[key] = snapshot
         self._claude_usage = dict(tuple(self._claude_usage.items())[-128:])
 

@@ -119,6 +119,7 @@ def _mapping(value: object) -> Mapping[str, Any]:
 
 _KNOWN_CLAUDE_SERVICES: tuple[tuple[str, str], ...] = (
     ("kimi.com", "Kimi Code"),
+    ("z.ai", "Z.AI"),
 )
 
 _HOST_CHARS_RE = re.compile(r"[a-z0-9._:-]+")
@@ -253,6 +254,15 @@ _SERVICE_WINDOW_SPECS: dict[str, tuple[tuple[str, str, str, str], ...]] = {
     "Kimi Code": (
         ("Kimi 5-hour", "CCC_USAGE_KIMI_5H_REQUEST_LIMIT", "rolling", "req"),
         ("Kimi weekly", "CCC_USAGE_KIMI_WEEKLY_TOKEN_LIMIT", "weekly", "tok"),
+    ),
+    # Z.AI (GLM Coding Plan) publishes no per-tier limits over its API, so
+    # limits come from operator-configured env (read from the Z.AI billing
+    # console once). Mirrors the Kimi Code shape: a 5-hour request window that
+    # degrades to count-only without a limit, and a weekly token window that is
+    # percent-only and skipped without one.
+    "Z.AI": (
+        ("Z.AI 5-hour", "CCC_USAGE_ZAI_5H_REQUEST_LIMIT", "rolling", "req"),
+        ("Z.AI weekly", "CCC_USAGE_ZAI_WEEKLY_TOKEN_LIMIT", "weekly", "tok"),
     ),
 }
 

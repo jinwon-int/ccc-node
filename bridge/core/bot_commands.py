@@ -368,6 +368,11 @@ class BotCommandMixin:
                 reply = f"{reply}\n\n{usage_meter.render_report(days=7)}"
             except Exception:
                 logger.warning("Local usage meter report failed")
+        cost_report = getattr(self._project_chat, "render_cost_report", None)
+        if callable(cost_report):
+            cost_text = cost_report(days=7)
+            if cost_text:
+                reply = f"{reply}\n\n{cost_text}"
         await message.reply_text(reply)
         log_debug(user_id, "bot", reply)
 
