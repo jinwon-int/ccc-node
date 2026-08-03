@@ -326,3 +326,22 @@ else:
 
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "bool-rejected"
+
+
+def test_timeout_invariant_is_rejected_during_settings_load(tmp_path: Path):
+    from pydantic import ValidationError
+    from telegram_bot.utils.config import Settings
+
+    with pytest.raises(
+        ValidationError,
+        match="CCC_DELEGATED_TASK_STALL_SECONDS must be lower than CLAUDE_PROCESS_TIMEOUT",
+    ):
+        Settings.load(
+            project_root=tmp_path / "project",
+            environ={
+                "HOME": str(tmp_path / "home"),
+                "TELEGRAM_BOT_TOKEN": "123456:test",
+                "CLAUDE_PROCESS_TIMEOUT": "3600",
+            },
+            bot_env_file=tmp_path / "missing-package.env",
+        )

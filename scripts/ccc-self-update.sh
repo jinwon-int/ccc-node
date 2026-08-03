@@ -17,7 +17,8 @@
 #   2. preconditions: .git present, clean working tree, on the expected branch
 #   3. git fetch + merge --ff-only (never rewrites local history)
 #   4. if HEAD changed (or --force): snapshot Claude + Hermes managed artifacts,
-#      run ./setup.sh, then verify both repo SHA and artifact rollback on failure
+#      run ./setup.sh, validate bridge runtime config when its service is
+#      allowlisted, then verify repo SHA and artifact rollback on failure
 #   5. restart each allowlisted service and verify it is active again
 #   6. append a JSONL audit record and queue an owner Telegram notification
 #      (spool only — this script never touches the bot token)
@@ -164,6 +165,36 @@ reset_repo_to_old_sha() {
   git -C "$REPO" reset --hard "$OLD_SHA" >/dev/null 2>&1 || return 1
   [ "$(git -C "$REPO" rev-parse HEAD 2>/dev/null)" = "$OLD_SHA" ] || return 1
   [ -z "$(git -C "$REPO" status --porcelain 2>/dev/null)" ]
+}
+
+bridge_service_allowlisted() {
+  local svc
+  [ -f "$SERVICES_FILE" ] || return 1
+  while IFS= read -r svc; do
+    svc="${svc%%#*}"
+    svc="$(printf '%s' "$svc" | tr -d '[:space:]')"
+    case "$svc" in
+      ccc-telegram-bridge|ccc-telegram-bridge.service) return 0 ;;
+    esac
+  done < "$SERVICES_FILE"
+  return 1
+}
+
+bridge_runtime_config_preflight() {
+  local checker project_root
+  checker="$REPO/bridge/runtime_config_check.py"
+  project_root="${CCC_SELF_UPDATE_BRIDGE_PROJECT_ROOT:-${HOME:-/root}}"
+  [ -f "$checker" ] || {
+    log "bridge-config-preflight result=missing-checker"
+    return 1
+  }
+  if python3 "$checker" --project-root "$project_root" \
+      --bridge-env "$REPO/bridge/.env" --json >>"$LOG" 2>&1; then
+    log "bridge-config-preflight result=ok"
+    return 0
+  fi
+  log "bridge-config-preflight result=invalid"
+  return 1
 }
 
 MODE="${1:-run}"
@@ -337,6 +368,25 @@ if ! (cd "$REPO" && bash setup.sh >>"$LOG" 2>&1); then
   log "recovery snapshot=$INSTALL_SNAPSHOT_DIR repoRollback=$REPO_ROLLBACK_OK artifactRollback=$ARTIFACT_ROLLBACK_OK"
   notify "self-update 중대 실패: setup.sh 오류 뒤 rollback이 불완전합니다. 로그를 즉시 확인하세요." "rollback-degraded-$NEW_SHA"
   say "self-update: setup failed and rollback was degraded; recovery snapshot retained at $INSTALL_SNAPSHOT_DIR" >&2
+  exit 9
+fi
+if bridge_service_allowlisted && ! bridge_runtime_config_preflight; then
+  SETUP_OK=false
+  REPO_ROLLBACK_OK=true
+  ARTIFACT_ROLLBACK_OK=true
+  reset_repo_to_old_sha || REPO_ROLLBACK_OK=false
+  restore_installed_artifacts || ARTIFACT_ROLLBACK_OK=false
+  if [ "$REPO_ROLLBACK_OK" = true ] && [ "$ARTIFACT_ROLLBACK_OK" = true ]; then
+    audit "bridge-config-preflight-failed-rolled-back" "$OLD_SHA" "$NEW_SHA" "$CHANGED" false '[]'
+    notify "self-update 실패: bridge runtime config preflight 오류 — repo와 설치본을 ${OLD_SHA:0:7} 상태로 롤백했습니다. 로그: ~/.claude/state/self-update.log" "bridge-config-fail-$NEW_SHA"
+    say "self-update: bridge runtime config preflight failed; rolled back before service restart" >&2
+    exit 6
+  fi
+  audit "bridge-config-preflight-failed-rollback-degraded" "$OLD_SHA" "$NEW_SHA" "$CHANGED" false '[]'
+  KEEP_INSTALL_SNAPSHOT=1
+  log "recovery snapshot=$INSTALL_SNAPSHOT_DIR repoRollback=$REPO_ROLLBACK_OK artifactRollback=$ARTIFACT_ROLLBACK_OK"
+  notify "self-update 중대 실패: bridge runtime config 오류 뒤 rollback이 불완전합니다. 로그를 즉시 확인하세요." "bridge-config-rollback-degraded-$NEW_SHA"
+  say "self-update: bridge runtime config preflight failed and rollback was degraded" >&2
   exit 9
 fi
 rm -rf -- "$INSTALL_SNAPSHOT_DIR"

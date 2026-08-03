@@ -41,7 +41,6 @@ from telegram_bot.core.agent_runtime import (
     ToolStartedEvent,
     deny_approval,
 )
-from telegram_bot.core import project_chat as project_chat_module
 from telegram_bot.core.project_chat import ProjectChatHandler
 from telegram_bot.core.project_chat_types import AgentSessionEntry
 from telegram_bot.core.task_ledger import TaskLedger
@@ -170,15 +169,14 @@ def _handler(tmp_path: Path, runtime: FakeRuntime) -> ProjectChatHandler:
     return handler
 
 
-def test_delegated_task_limit_must_be_lower_than_process_timeout(tmp_path: Path) -> None:
+def test_handler_uses_validated_process_timeout(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
-    settings.delegated_task_stall_seconds = float(project_chat_module.PROCESS_TIMEOUT)
+    settings.process_timeout_seconds = 3600
+    settings.delegated_task_stall_seconds = 1800
 
-    with pytest.raises(
-        ValueError,
-        match="CCC_DELEGATED_TASK_STALL_SECONDS must be lower",
-    ):
-        ProjectChatHandler(settings=settings, agent_runtime=FakeRuntime())
+    handler = ProjectChatHandler(settings=settings, agent_runtime=FakeRuntime())
+
+    assert handler._process_timeout_seconds == 3600
 
 
 @pytest.mark.anyio

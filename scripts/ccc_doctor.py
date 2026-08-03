@@ -319,6 +319,7 @@ class Doctor:
                 self.add("정상", rel, "installed", "none")
 
         self.check_overlay_parity()
+        self.check_bridge_runtime_config()
         self.check_bridge_status()
         self.check_bridge_boot_path()
         self.check_memory_cache()
@@ -576,6 +577,72 @@ class Doctor:
         else:
             self.add("경고", "overlay/plugin parity", "repo hook manifests unavailable", "run from a complete ccc-node checkout")
 
+    def check_bridge_runtime_config(self) -> None:
+        """Validate body-free runtime invariants before app construction."""
+
+        checker = self.repo / "bridge/runtime_config_check.py"
+        if not checker.is_file():
+            self.add(
+                "경고",
+                "bridge runtime config",
+                "preflight unavailable",
+                "restore bridge/runtime_config_check.py, then rerun ccc-doctor",
+            )
+            return
+        project_root = Path(
+            os.environ.get(
+                "CCC_DOCTOR_BRIDGE_PROJECT_ROOT",
+                self.running_bridge_home() or os.path.expanduser("~"),
+            )
+        ).expanduser()
+        try:
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(checker),
+                    "--project-root",
+                    str(project_root),
+                    "--bridge-env",
+                    str(self.repo / "bridge/.env"),
+                    "--json",
+                ],
+                text=True,
+                capture_output=True,
+                timeout=10,
+            )
+            payload = json.loads(completed.stdout)
+        except Exception:
+            self.add(
+                "경고",
+                "bridge runtime config",
+                "preflight unreadable",
+                "run bridge/runtime_config_check.py manually",
+            )
+            return
+        code = str(payload.get("code", "invalid-runtime-settings"))
+        if completed.returncode == 0 and payload.get("ok") is True:
+            self.add("정상", "bridge runtime config", "valid", "none")
+            return
+        action = (
+            "set CCC_DELEGATED_TASK_STALL_SECONDS below CLAUDE_PROCESS_TIMEOUT "
+            "or restore the documented process-timeout default, then rerun"
+            if code == "delegated-task-stall-not-lower-than-process-timeout"
+            else "correct the named timeout setting, then rerun"
+        )
+        self.add("수동필요", "bridge runtime config", code, action)
+
+    @staticmethod
+    def bridge_status_verdict(returncode: int, output: str) -> tuple[str, str]:
+        if returncode != 0:
+            return "경고", f"probe-exit-{returncode}"
+        if "Bot status: available" in output:
+            return "정상", "available"
+        if "Bot status: degraded" in output:
+            return "경고", "degraded"
+        if "Bot status: unavailable" in output:
+            return "경고", "unavailable"
+        return "경고", "unrecognized status output" if output.strip() else "no status output"
+
     def check_bridge_status(self) -> None:
         start = self.repo / "bridge/start.sh"
         if os.access(start, os.X_OK):
@@ -587,11 +654,10 @@ class Doctor:
             probe_home = self.running_bridge_home() or os.path.expanduser("~")
             try:
                 out = subprocess.run(["bash", str(start), "--path", probe_home, "--status"], text=True, capture_output=True, timeout=20)
-                tail = "\n".join((out.stdout + out.stderr).splitlines()[-5:])
-                if tail:
-                    self.add("정상", "bridge status", "readable", "none")
-                else:
-                    self.add("경고", "bridge status", "no status output", "check bridge/start.sh manually if this node owns Telegram bridge")
+                output = out.stdout + out.stderr
+                klass, status = self.bridge_status_verdict(out.returncode, output)
+                action = "none" if klass == "정상" else "inspect bridge service and body-free health diagnostics"
+                self.add(klass, "bridge status", status, action)
             except Exception:
                 self.add("경고", "bridge status", "no status output", "check bridge/start.sh manually if this node owns Telegram bridge")
         else:
