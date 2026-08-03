@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import logging
 from dataclasses import fields
 from typing import Any
@@ -171,14 +170,13 @@ def test_terminal_drain_snapshot_revokes_approval_without_rebinding_owner() -> N
 
 def test_register_active_race_condition_logs_warning(caplog: Any) -> None:
     """Per #860: race condition between turns emits WARN with diagnostics."""
-    import logging
 
     registry = AgentSessionRegistry()
     key = (7, 70)  # user_id, chat_id
     session = object()
 
     # Register first turn
-    first_token = registry.register_active(key, session, started_at=1.0)
+    registry.register_active(key, session, started_at=1.0)
 
     # Attempt to register second turn while first is still active
     import pytest
@@ -226,7 +224,6 @@ def test_deactivate_token_mismatch_logs_warning(caplog: Any) -> None:
 
 def test_force_cleanup_stale_turns_removes_zombies() -> None:
     """Per #860: emergency cleanup removes turns older than threshold."""
-    import asyncio
 
     registry = AgentSessionRegistry()
     key = (7, 70)
