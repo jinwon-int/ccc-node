@@ -91,6 +91,15 @@ All notable changes to the Claude Code node harness. Dates are KST.
   composition is unchanged. (#749)
 
 ### Fixed
+- provider approval requests on auto-approve profiles now leave a body-free
+  trace. Previously a `can_use_tool` request (or a #838 no-active-turn deny)
+  emitted no record of *what* was asked, so post-hoc diagnosis was impossible
+  — the stall WARNING carried only user/chat/elapsed, the transcript had not
+  flushed the pending tool_use, and the #879 audit ledger is approve-each
+  only. `_handle_permission_request` now logs one INFO line per request:
+  provider · tool name · `target_kind` (path/command/empty — never the value)
+  · request id · turn state · outcome (`allowed`/`denied`/`denied-no-route`).
+  Approval semantics are unchanged; this is pure observability (#889).
 - self-update is now registered as an agent-cron task by `setup.sh` so the
   harness can actually auto-update. Previously no `self-update` task was ever
   registered, so a deferred run (bridge busy) had no scheduled tick to retry
