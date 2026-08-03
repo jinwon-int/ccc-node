@@ -9,6 +9,7 @@ import re
 import shlex
 import shutil
 import sqlite3
+import stat
 import subprocess
 import time
 from pathlib import Path
@@ -39,6 +40,155 @@ def sqlite_probe(path: Path, count_sql: str) -> tuple[str, int]:
         return "ok", count
     except (OSError, sqlite3.Error, TypeError, ValueError):
         return "error", 0
+
+
+def _termux_palace_error() -> dict[str, object]:
+    return {
+        "backend": "sqlite_exact",
+        "palace_exists": False,
+        "integrity": "error",
+        "embeddings": 0,
+        "age_seconds": -1,
+        "index": {
+            "status": "error",
+            "sqlite_count": -1,
+            "hnsw_count": -1,
+            "divergence": -1,
+        },
+    }
+
+
+def _safe_owned_file(path: Path, mode: int | None = None) -> bool:
+    try:
+        info = path.lstat()
+    except OSError:
+        return False
+    return (
+        stat.S_ISREG(info.st_mode)
+        and info.st_uid == os.getuid()
+        and info.st_nlink == 1
+        and (mode is None or stat.S_IMODE(info.st_mode) == mode)
+    )
+
+
+def _safe_owned_directory(path: Path, mode: int) -> bool:
+    try:
+        info = path.lstat()
+    except OSError:
+        return False
+    return (
+        stat.S_ISDIR(info.st_mode)
+        and info.st_uid == os.getuid()
+        and stat.S_IMODE(info.st_mode) == mode
+    )
+
+
+def _termux_metadata_state(metadata: Path) -> tuple[str, str | None]:
+    if not metadata.exists() and not metadata.is_symlink():
+        return "absent", None
+    if not _safe_owned_directory(metadata.parent, 0o700) or not _safe_owned_file(
+        metadata, 0o600
+    ):
+        return "invalid", None
+    try:
+        if metadata.stat().st_size > 4096:
+            return "invalid", None
+        doc = json.loads(metadata.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return "invalid", None
+    if not isinstance(doc, dict) or doc.get("schema") != "ccc.termux-mempalace.install.v1":
+        return "invalid", None
+    if doc.get("enabled") is False:
+        return "disabled", None
+    container = doc.get("container")
+    if (
+        doc.get("enabled") is not True
+        or doc.get("version") != "3.6.0"
+        or doc.get("state") != "ready"
+        or doc.get("provider") not in {"codex", "claude"}
+        or type(doc.get("updated_at")) is not int
+        or int(doc["updated_at"]) <= 0
+        or not isinstance(container, str)
+        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", container) is None
+    ):
+        return "invalid", None
+    return "enabled", container
+
+
+def _termux_container_base(prefix: Path, container: str) -> Path | None:
+    roots = (
+        prefix / "var/lib/proot-distro/containers" / container / "rootfs",
+        prefix / "var/lib/proot-distro/installed-rootfs" / container,
+    )
+    root = next(
+        (
+            candidate
+            for candidate in roots
+            if candidate.is_dir() and not candidate.is_symlink()
+        ),
+        None,
+    )
+    return None if root is None else root / "opt/ccc-mempalace"
+
+
+def _safe_termux_container_base(base: Path) -> bool:
+    marker = base / ".ccc-node-managed"
+    if not _safe_owned_directory(base, 0o700) or not _safe_owned_file(marker, 0o600):
+        return False
+    try:
+        return (
+            marker.stat().st_size <= 64
+            and marker.read_text(encoding="utf-8").strip()
+            == "ccc-node #867 managed container"
+        )
+    except (OSError, UnicodeError):
+        return False
+
+
+def termux_sqlite_exact_probe(
+    nunchi_home: Path, now: int
+) -> dict[str, object] | None:
+    """Read the managed PRoot palace without exposing transcript bodies.
+
+    None means that the optional Termux topology is not enabled. Once its
+    owner-only metadata says enabled, malformed metadata, an unsafe marker,
+    or an unreadable DB fails readiness closed instead of falling back to the
+    unrelated native Chroma path.
+    """
+
+    state, container = _termux_metadata_state(
+        nunchi_home / "termux-mempalace/status.json"
+    )
+    if state in {"absent", "disabled"}:
+        return None
+    error = _termux_palace_error()
+    if state != "enabled" or container is None:
+        return error
+    base = _termux_container_base(Path(os.environ.get("PREFIX") or ""), container)
+    if base is None or not _safe_termux_container_base(base):
+        return error
+
+    palace = base / "palace/sqlite_exact.sqlite3"
+    if not _safe_owned_file(palace):
+        return {**error, "integrity": "missing" if not palace.exists() else "error"}
+    integrity, drawers = sqlite_probe(palace, "SELECT COUNT(*) FROM documents")
+    index_status = "ok" if integrity == "ok" else "error"
+    index_count = drawers if integrity == "ok" else -1
+    return {
+        "backend": "sqlite_exact",
+        "palace_exists": True,
+        "integrity": integrity,
+        "embeddings": drawers,
+        "age_seconds": age_seconds(palace, now),
+        # sqlite_exact has no separate ANN/HNSW copy. Project its single
+        # authoritative drawer count into the existing index health shape.
+        "index": {
+            "status": index_status,
+            "sqlite_count": index_count,
+            "hnsw_count": index_count,
+            "divergence": 0 if integrity == "ok" else -1,
+        },
+    }
 
 
 def crontab_text() -> str:
@@ -557,21 +707,33 @@ def probe_mempalace(
     required = is_mempalace_required(home)
     mp_cli = resolve_mempalace_cli(home, refresh_environment)
     palace = home / ".mempalace/palace/chroma.sqlite3"
-    mp_integrity, embeddings = (
-        sqlite_probe(palace, "SELECT COUNT(*) FROM embeddings")
-        if mode == "on"
-        else ("skipped", 0)
-    )
-    index = (
-        mempalace_index_probe(mp_cli, home)
-        if mode == "on" and mp_cli.is_file() and palace.is_file()
-        else {
-            "status": "skipped",
-            "sqlite_count": -1,
-            "hnsw_count": -1,
-            "divergence": -1,
-        }
-    )
+    termux_palace = termux_sqlite_exact_probe(nunchi_home, now) if mode == "on" else None
+    if termux_palace is not None:
+        backend = str(termux_palace["backend"])
+        palace_exists = bool(termux_palace["palace_exists"])
+        mp_integrity = str(termux_palace["integrity"])
+        embeddings = int(termux_palace["embeddings"])
+        palace_age = int(termux_palace["age_seconds"])
+        index = dict(termux_palace["index"])
+    else:
+        backend = "chroma"
+        palace_exists = palace.is_file()
+        mp_integrity, embeddings = (
+            sqlite_probe(palace, "SELECT COUNT(*) FROM embeddings")
+            if mode == "on"
+            else ("skipped", 0)
+        )
+        index = (
+            mempalace_index_probe(mp_cli, home)
+            if mode == "on" and mp_cli.is_file() and palace_exists
+            else {
+                "status": "skipped",
+                "sqlite_count": -1,
+                "hnsw_count": -1,
+                "divergence": -1,
+            }
+        )
+        palace_age = age_seconds(palace, now)
     status_path = Path(
         os.environ.get("CCC_NUNCHI_MEMPALACE_STATUS")
         or refresh_environment.get("CCC_NUNCHI_MEMPALACE_STATUS")
@@ -623,10 +785,11 @@ def probe_mempalace(
         "required": required,
         "reasons": mp_reasons,
         "cli_installed": mp_cli.is_file(),
-        "palace_exists": palace.is_file(),
+        "backend": backend,
+        "palace_exists": palace_exists,
         "integrity": mp_integrity,
         "embeddings": embeddings,
-        "age_seconds": age_seconds(palace, now),
+        "age_seconds": palace_age,
         "index": index,
         "refresh": refresh,
     }
