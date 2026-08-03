@@ -327,6 +327,10 @@ chmod +x "$SUP_TMP/bin/ssh"
 # Mock curl so `status`'s tunnel probe is deterministic.
 cat > "$SUP_TMP/bin/curl" <<'CURL_EOF'
 #!/usr/bin/env bash
+if [[ "${A2A_TEST_CURL_HTTP_ERROR:-0}" == "1" ]]; then
+    [[ " $* " == *" -f"* ]] && exit 22
+    exit 0
+fi
 if [[ "${A2A_TEST_CURL_OK:-0}" == "1" ]]; then
     exit 0
 fi
@@ -376,6 +380,57 @@ out="$(bash "$TOOL" status 2>&1)"; rc=$?
 ok "status with no supervisor reports none" '[ "$rc" = 0 ] && grep -q "supervisor: none" <<<"$out"'
 ok "status reports tunnel DOWN when curl fails" 'grep -q "tunnel: DOWN" <<<"$out"'
 
+out="$(A2A_TEST_CURL_HTTP_ERROR=1 bash "$TOOL" status 2>&1)"
+ok "status treats an HTTP error response as tunnel DOWN" \
+    'grep -q "tunnel: DOWN" <<<"$out"'
+
+# A live, unrelated process with a correct numeric PID/start token is still not
+# a canonical supervisor and must never be signaled by stop.
+sleep 3600 >/dev/null 2>&1 &
+STALE_PID=$!
+STALE_TOKEN=$(bash -c 'source "$1"; a2a_process_start_token "$2"' _ \
+    "$ROOT/scripts/lib/a2a-supervisor-identity.sh" "$STALE_PID")
+printf '%s %s\n' "$STALE_PID" "$STALE_TOKEN" > "$SUP_PIDFILE"
+out="$(bash "$TOOL" stop 2>&1)"; rc=$?
+ok "stop ignores a reused PID owned by an unrelated live process" \
+    '[ "$rc" = 0 ] && kill -0 "$STALE_PID" 2>/dev/null && grep -q "no supervisor" <<<"$out"'
+kill -KILL "$STALE_PID" 2>/dev/null || true
+wait "$STALE_PID" 2>/dev/null || true
+rm -f "$SUP_PIDFILE"
+
+# A bash process can also place the canonical path and `supervise` later in
+# argv without using the supervisor grammar.  A legacy one-field PID record
+# must not turn that argv spoof into a kill target.
+bash -c 'while :; do :; done' "$TOOL" supervise >/dev/null 2>&1 &
+SPOOF_PID=$!
+printf '%s\n' "$SPOOF_PID" > "$SUP_PIDFILE"
+out="$(bash "$TOOL" stop 2>&1)"; rc=$?
+ok "stop rejects misplaced supervisor argv from a legacy PID file" \
+    '[ "$rc" = 0 ] && kill -0 "$SPOOF_PID" 2>/dev/null && grep -q "no supervisor" <<<"$out"'
+kill -KILL "$SPOOF_PID" 2>/dev/null || true
+wait "$SPOOF_PID" 2>/dev/null || true
+rm -f "$SUP_PIDFILE"
+
+# Even canonical-looking argv plus the real exclusive flock is not enough when
+# the executable is not the verifier's Bash (or its exact dpkg-deleted path).
+# Acquire the configured lock with a different binary named `bash` and verify
+# the process still survives.
+mkdir -p "$SUP_TMP/fake-bin"
+cp "$(command -v yes)" "$SUP_TMP/fake-bin/bash"
+(
+    exec 200>"$A2A_SUPERVISOR_LOCK"
+    flock -n 200
+    exec "$SUP_TMP/fake-bin/bash" "$TOOL" supervise
+) >/dev/null 2>&1 &
+FAKE_BASH_PID=$!
+printf '%s\n' "$FAKE_BASH_PID" > "$SUP_PIDFILE"
+out="$(bash "$TOOL" stop 2>&1)"; rc=$?
+ok "stop rejects a fake Bash holding the canonical fd 200 flock" \
+    '[ "$rc" = 0 ] && kill -0 "$FAKE_BASH_PID" 2>/dev/null && grep -q "no supervisor" <<<"$out"'
+kill -KILL "$FAKE_BASH_PID" 2>/dev/null || true
+wait "$FAKE_BASH_PID" 2>/dev/null || true
+rm -f "$SUP_PIDFILE"
+
 # Missing tunnel SSH target: supervise refuses even if validation would pass.
 ENV_NOSSH="$SUP_TMP/nossh.env"
 grep -v '^A2A_TUNNEL_SSH_TARGET=' "$ENVF" > "$ENV_NOSSH"
@@ -406,6 +461,8 @@ done
 
 ok "supervisor #1 started (mock ssh launched)" '[ -f "$A2A_TEST_SSH_MARKER" ]'
 ok "supervisor #1 wrote PID file" '[ -s "$SUP_PIDFILE" ]'
+ok "PID file records PID + start token owner-only" \
+    '[ "$(wc -w < "$SUP_PIDFILE")" = 2 ] && [ "$(stat -c %a "$SUP_PIDFILE")" = 600 ]'
 
 # Second supervise call must fail fast with rc=3 (flock -n contention).
 out="$(bash "$TOOL" supervise --env-file "$ENVF" 2>&1)"; rc=$?
@@ -416,7 +473,9 @@ out="$(bash "$TOOL" status 2>&1)"
 ok "status shows running supervisor pid" 'grep -qE "supervisor: [0-9]+" <<<"$out"'
 
 # stop cleanly tears the supervisor down.
-out="$(bash "$TOOL" stop 2>&1)"; rc=$?
+out="$(bash "$TOOL" stop 2>&1)"
+# shellcheck disable=SC2034  # rc is consumed by the eval-based ok() assertion.
+rc=$?
 ok "stop terminates the running supervisor" '[ "$rc" = 0 ] && grep -qE "(stopped|killed) sup=" <<<"$out"'
 
 # Give the wait / kill_tree cleanup a beat, then confirm supervisor #1 exit.
@@ -469,7 +528,28 @@ wait "$SUP2_PID" 2>/dev/null || true
 ) || true
 ok "kill_tree removes parent + child" 'grep -q "^OK$" "$SUP_TMP/kill_tree.marker" 2>/dev/null'
 
+# Exact tunnel ownership: a same-port forward to another target must survive a
+# sweep of the canonical target.
+bash -c 'exec -a ssh python3 -c "import time; time.sleep(3600)" -N -L "$1" "$2"' \
+    _ '127.0.0.1:18790:127.0.0.1:8787' target-owned &
+OWNED_TUNNEL_PID=$!
+bash -c 'exec -a ssh python3 -c "import time; time.sleep(3600)" -N -L "$1" "$2"' \
+    _ '127.0.0.1:18790:127.0.0.1:8787' target-other &
+OTHER_TUNNEL_PID=$!
+sleep 0.2
+(
+    # shellcheck disable=SC1090
+    source "$TOOL"
+    sweep_lingering_ssh 18790 127.0.0.1:8787 target-owned
+)
+wait "$OWNED_TUNNEL_PID" 2>/dev/null || true
+ok "tunnel sweep kills only the exact owned target" \
+    '! kill -0 "$OWNED_TUNNEL_PID" 2>/dev/null && kill -0 "$OTHER_TUNNEL_PID" 2>/dev/null'
+kill -KILL "$OTHER_TUNNEL_PID" 2>/dev/null || true
+wait "$OTHER_TUNNEL_PID" 2>/dev/null || true
+
 # ---- curl UP path in status ----
+# shellcheck disable=SC2034  # out is consumed by the eval-based ok() assertion.
 out=$(A2A_TEST_CURL_OK=1 bash "$TOOL" status 2>&1)
 ok "status reports tunnel UP when curl returns 0" 'grep -q "tunnel: UP" <<<"$out"'
 

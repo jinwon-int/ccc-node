@@ -209,14 +209,16 @@ CAPABILITY_AXES: tuple[CapabilityAxis, ...] = (
         "Privileged actions pause for an explicit allow/deny decision; an "
         "omitted or failing handler is fail-closed deny.",
         claude=_supported(
-            "SDK permission callbacks gate tool use through Telegram inline approval. "
-            "The exact run generation remains bound across intermediate result "
-            "frames while bounded local agent/workflow tasks continue; terminal, "
-            "replaced, or stale generations deny."
+            "SDK permission callbacks gate tool use through the provider-neutral "
+            "bounded/redacted Telegram snapshot. One-shot tokens bind request and "
+            "exact-display fingerprints; changed arguments, expiry, terminal/replaced "
+            "generations, and late replies deny. Body-free asked/terminal decisions "
+            "use the strict owner-only approval ledger."
         ),
         codex=_supported(
-            "Approval server requests normalize to ApprovalRequestEvent; a missing "
-            "or failing handler denies."
+            "Approval server requests normalize to the same snapshot, fingerprint "
+            "binding, exact-once decision audit, and fail-closed generation/expiry "
+            "checks; a missing or failing handler denies."
         ),
     ),
     _axis(

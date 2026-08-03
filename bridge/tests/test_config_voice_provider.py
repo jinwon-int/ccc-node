@@ -179,6 +179,7 @@ class VoiceProviderConfigTests(unittest.TestCase):
         source_memory = source_utils / "settings_memory.py"
         source_voice = source_utils / "settings_voice.py"
         source_heartbeat = source_utils / "settings_heartbeat.py"
+        source_runtime_check = Path(__file__).resolve().parents[1] / "runtime_config_check.py"
         with TemporaryDirectory() as td:
             root = Path(td)
             package_root = root / "package"
@@ -192,6 +193,7 @@ class VoiceProviderConfigTests(unittest.TestCase):
             shutil.copy2(source_memory, utils / "settings_memory.py")
             shutil.copy2(source_voice, utils / "settings_voice.py")
             shutil.copy2(source_heartbeat, utils / "settings_heartbeat.py")
+            shutil.copy2(source_runtime_check, package / "runtime_config_check.py")
 
             project_root = root / "project"
             project_env = project_root / ".telegram_bot" / ".env"
