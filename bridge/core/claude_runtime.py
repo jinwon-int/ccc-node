@@ -1048,7 +1048,18 @@ class ClaudeSession:
                 ErrorEvent(INTERRUPTED_ERROR_CODE, "Claude turn was interrupted")
             )
         elif message.is_error:
-            text = (message.result or "").strip() or "Claude turn failed"
+            # Include diagnostic fields (subtype/api_error_status/terminal_reason)
+            # in the user-facing message when result is empty, per #901.
+            text = (message.result or "").strip()
+            if not text:
+                parts = ["Claude turn failed"]
+                if message.subtype and message.subtype != "success":
+                    parts.append(f"(subtype: {message.subtype})")
+                if message.api_error_status:
+                    parts.append(f"(HTTP status: {message.api_error_status})")
+                if message.terminal_reason:
+                    parts.append(f"(reason: {message.terminal_reason})")
+                text = " ".join(parts)
             active.queue.put_nowait(
                 ErrorEvent(
                     self._error_code(message.subtype),

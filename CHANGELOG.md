@@ -5,6 +5,11 @@ All notable changes to the Claude Code node harness. Dates are KST.
 ## [Unreleased]
 
 ### Added
+- Error message diagnostics (#901): When `is_error=True` and `result` is empty,
+  the bridge now includes `subtype`, `api_error_status`, and `terminal_reason`
+  fields in the user-facing error message instead of the generic "Claude turn failed".
+  This helps operators diagnose rate limits, API errors, and other failures without
+  digging into logs.
 - nunchi write gate (#890, graph-engineering review): G1 progress→done
   update detection auto-closes stale in-flight facts (reversible, `supersedes`
   link kept) with a `review-stale` retro CLI; G2 verified source rank

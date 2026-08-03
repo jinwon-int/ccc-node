@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from typing import TYPE_CHECKING, Any, cast
 import unittest
@@ -28,6 +29,7 @@ if TYPE_CHECKING:
         ToolStartedEvent,
         deny_approval,
     )
+    from core.claude_runtime import ClaudeRuntime, _ActiveTurn
 else:
     from telegram_bot.core.agent_runtime import (
         AgentEvent,
@@ -50,6 +52,7 @@ else:
         ToolStartedEvent,
         deny_approval,
     )
+    from telegram_bot.core.claude_runtime import ClaudeRuntime, _ActiveTurn
 
 
 from telegram_bot.core.agent_runtime import (
@@ -359,6 +362,88 @@ class AgentRuntimeContractTests(unittest.IsolatedAsyncioTestCase):
             SessionHistoryMessage(role="tool", content="hidden")
         with self.assertRaises(ValueError):
             SessionHistory(session_id="", messages=())
+
+
+    async def test_error_message_includes_diagnostic_fields_when_result_empty(self) -> None:
+        """Per #901: is_error=True with empty result should show subtype/api_error_status/terminal_reason."""
+        from claude_agent_sdk import ResultMessage
+
+        # Build a minimal runtime to invoke _complete_turn.
+        runtime = ClaudeRuntime()
+        session = await runtime.start_or_resume(
+            SessionRequest(working_directory="/tmp", model="sonnet")
+        )
+        active = _ActiveTurn(
+            queue=asyncio.Queue(),
+            approval_handler=deny_approval,
+            generation=1,
+        )
+
+        def assert_error_message(
+            *,
+            subtype: str | None = None,
+            api_error_status: int | None = None,
+            terminal_reason: str | None = None,
+            expected_snippet: str,
+        ) -> None:
+            msg = ResultMessage(
+                subtype=subtype or "",
+                result="",  # Empty result triggers diagnostic inclusion
+                api_error_status=api_error_status,
+                terminal_reason=terminal_reason,
+                stop_reason="end_turn",
+                duration_ms=0,
+                duration_api_ms=0,
+                is_error=True,
+                num_turns=1,
+                session_id="test-session",
+            )
+            session._complete_turn(active, msg)
+            error = active.queue.get_nowait()
+            self.assertIsInstance(error, ErrorEvent)
+            text = cast(ErrorEvent, error).message
+            self.assertIn(expected_snippet, text)
+
+        # subtype only
+        assert_error_message(
+            subtype="rate_limit_error", expected_snippet="(subtype: rate_limit_error)"
+        )
+
+        # api_error_status only
+        assert_error_message(api_error_status=429, expected_snippet="(HTTP status: 429)")
+
+        # terminal_reason only
+        assert_error_message(
+            terminal_reason="max_tokens_reached", expected_snippet="(reason: max_tokens_reached)"
+        )
+
+        # All three fields
+        assert_error_message(
+            subtype="rate_limit_error",
+            api_error_status=429,
+            terminal_reason="quota_exceeded",
+            expected_snippet="(subtype: rate_limit_error)",  # First field present
+        )
+
+        # Non-empty result uses the result text (legacy behavior)
+        msg = ResultMessage(
+            subtype="rate_limit_error",
+            result="Custom error text",  # Non-empty
+            api_error_status=429,
+            terminal_reason="quota_exceeded",
+            stop_reason="end_turn",
+            duration_ms=0,
+            duration_api_ms=0,
+            is_error=True,
+            num_turns=1,
+            session_id="test-session",
+        )
+        session._complete_turn(active, msg)
+        error = active.queue.get_nowait()
+        self.assertIsInstance(error, ErrorEvent)
+        self.assertEqual(cast(ErrorEvent, error).message, "Custom error text")
+
+        await runtime.close()
 
 
 if __name__ == "__main__":
