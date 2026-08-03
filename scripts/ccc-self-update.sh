@@ -389,8 +389,11 @@ if bridge_service_allowlisted && ! bridge_runtime_config_preflight; then
   say "self-update: bridge runtime config preflight failed and rollback was degraded" >&2
   exit 9
 fi
-rm -rf -- "$INSTALL_SNAPSHOT_DIR"
-INSTALL_SNAPSHOT_DIR=""
+# The recovery snapshot deliberately outlives setup and the runtime-config
+# preflight: a service that fails to come back is exactly when rollback
+# material is needed, and deleting it here left that path with nothing to
+# restore from. It is removed once the restarts have succeeded (below), so the
+# success path keeps its no-residue behavior.
 
 # --- restart allowlisted services ----------------------------------------------
 SERVICES_JSON='[]'
@@ -404,16 +407,21 @@ if [ -f "$SERVICES_FILE" ]; then
       log "service skipped reason=invalid-name name=$svc"
       continue
     fi
-    ok=true
-    if "$SYSTEMCTL" restart "$svc" >>"$LOG" 2>&1; then
-      i=0
-      until "$SYSTEMCTL" is-active --quiet "$svc" 2>/dev/null; do
-        i=$((i + 1)); [ "$i" -ge 10 ] && { ok=false; break; }
-        sleep 1
-      done
-    else
-      ok=false
-    fi
+    ok=false
+    attempt=0
+    while [ "$attempt" -lt 2 ]; do
+      attempt=$((attempt + 1))
+      if "$SYSTEMCTL" restart "$svc" >>"$LOG" 2>&1; then
+        ok=true
+        i=0
+        until "$SYSTEMCTL" is-active --quiet "$svc" 2>/dev/null; do
+          i=$((i + 1)); [ "$i" -ge 10 ] && { ok=false; break; }
+          sleep 1
+        done
+      fi
+      [ "$ok" = "true" ] && break
+      [ "$attempt" -lt 2 ] && log "service retry name=$svc attempt=$attempt"
+    done
     [ "$ok" = "true" ] && RESTARTED=$((RESTARTED + 1)) || FAILED=$((FAILED + 1))
     SERVICES_JSON="$(printf '%s' "$SERVICES_JSON" | jq -c --arg n "$svc" --argjson ok "$ok" '. + [{name:$n, ok:$ok}]')"
     log "service name=$svc ok=$ok"
@@ -424,11 +432,20 @@ fi
 
 SHORT_NEW="$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null)"
 if [ "$FAILED" -gt 0 ]; then
+  # Half-apply: the harness is on NEW_SHA but a service did not come back.
+  # Rolling the fleet back automatically is an operator policy decision, not
+  # this script's to make, so keep the recovery snapshot and name it — the
+  # previous code deleted it before the restarts ran, leaving nothing to
+  # recover from.
+  KEEP_INSTALL_SNAPSHOT=1
   audit "restart-failures" "$OLD_SHA" "$NEW_SHA" "$CHANGED" "$SETUP_OK" "$SERVICES_JSON"
-  notify "self-update ${SHORT_NEW}: 서비스 ${FAILED}개 재시작 실패 (${RESTARTED}개 성공). ~/.claude/state/self-update.log 확인 필요." "fail-$NEW_SHA"
-  say "self-update: updated to $SHORT_NEW but $FAILED service(s) failed to restart" >&2
+  log "recovery snapshot=$INSTALL_SNAPSHOT_DIR oldSha=$OLD_SHA reason=restart-failure"
+  notify "self-update ${SHORT_NEW}: 서비스 ${FAILED}개 재시작 실패 (${RESTARTED}개 성공, 재시도 후). 롤백 자료 보존: ${INSTALL_SNAPSHOT_DIR}. ~/.claude/state/self-update.log 확인 필요." "fail-$NEW_SHA"
+  say "self-update: updated to $SHORT_NEW but $FAILED service(s) failed to restart; recovery snapshot retained at $INSTALL_SNAPSHOT_DIR" >&2
   exit 7
 fi
+rm -rf -- "$INSTALL_SNAPSHOT_DIR"
+INSTALL_SNAPSHOT_DIR=""
 
 audit "ok" "$OLD_SHA" "$NEW_SHA" "$CHANGED" "$SETUP_OK" "$SERVICES_JSON"
 if [ "$CHANGED" = "true" ]; then
