@@ -35,7 +35,7 @@ class PersistFailureTest(unittest.TestCase):
             "run_headless", "write_owner_spool", "history_attempt",
             "append_run_history", "apply_retry_transition", "apply_run_limit",
             "commit_run_state", "release_for_run", "quarantine_persist_failure",
-            "notification_base", "headless_metadata", "parse_schedule",
+            "notification_base", "headless_metadata", "parse_schedule", "load_doc",
         ):
             self._saved[name] = getattr(agent_cron, name)
 
@@ -93,6 +93,27 @@ class PersistFailureTest(unittest.TestCase):
 
     def test_lock_is_quarantined_instead_of_released(self) -> None:
         agent_cron.run_execute({}, "probe", None, True)
+        self.assertEqual(self.released, [])
+        self.assertEqual(len(self.quarantined), 1)
+
+    def test_store_load_error_is_not_treated_as_safe_task_removal(self) -> None:
+        # commit_run_state returning False is reserved for a task that an
+        # operator removed while the run was in flight. A malformed/unreadable
+        # store must raise so run_execute quarantines the already-executed run.
+        agent_cron.commit_run_state = self._saved["commit_run_state"]
+        agent_cron.load_doc = lambda: ({}, ["invalid task store"])
+        with tempfile.TemporaryDirectory() as tempdir:
+            old_store = agent_cron.store
+            agent_cron.store = Path(tempdir) / "tasks.json"
+            try:
+                result, _as_json, rc = agent_cron.run_execute({}, "probe", None, True)
+            finally:
+                agent_cron.store = old_store
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["status"], "persist-failed")
+        self.assertIn("task store load failed", result["persistError"])
+        self.assertNotEqual(rc, 0)
         self.assertEqual(self.released, [])
         self.assertEqual(len(self.quarantined), 1)
 

@@ -444,7 +444,17 @@ if [ "$FAILED" -gt 0 ]; then
   say "self-update: updated to $SHORT_NEW but $FAILED service(s) failed to restart; recovery snapshot retained at $INSTALL_SNAPSHOT_DIR" >&2
   exit 7
 fi
-rm -rf -- "$INSTALL_SNAPSHOT_DIR"
+if ! rm -rf -- "$INSTALL_SNAPSHOT_DIR"; then
+  # Do not turn a failed private-snapshot cleanup into a reported success.
+  # Keep the path available to the operator (and prevent the EXIT trap from
+  # hiding the original failure with an unobserved second attempt).
+  KEEP_INSTALL_SNAPSHOT=1
+  audit "snapshot-cleanup-failed" "$OLD_SHA" "$NEW_SHA" "$CHANGED" "$SETUP_OK" "$SERVICES_JSON"
+  log "recovery snapshot=$INSTALL_SNAPSHOT_DIR oldSha=$OLD_SHA reason=cleanup-failure"
+  notify "self-update ${SHORT_NEW}: 서비스 재시작은 완료됐으나 복구 스냅샷 정리에 실패했습니다. 잔존 경로: ${INSTALL_SNAPSHOT_DIR}. ~/.claude/state/self-update.log 확인 필요." "snapshot-cleanup-fail-$NEW_SHA"
+  say "self-update: recovery snapshot cleanup failed; retained path: $INSTALL_SNAPSHOT_DIR" >&2
+  exit 10
+fi
 INSTALL_SNAPSHOT_DIR=""
 
 audit "ok" "$OLD_SHA" "$NEW_SHA" "$CHANGED" "$SETUP_OK" "$SERVICES_JSON"

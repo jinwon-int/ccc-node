@@ -97,12 +97,13 @@ Exit codes: 0 ok/up-to-date · 3 lock held · 4 precondition failed · 5 fetch/f
 failed · 6 setup/snapshot failed (repo and managed artifacts were verified
 rolled back, or setup never started) · 7 service restart failure · 8 deferred
 (bridge busy — retry next tick) · 9 repository or installed-artifact rollback
-was degraded.
+was degraded · 10 successful-update recovery snapshot cleanup failed.
 On exit 9, the validated private recovery snapshot is retained under
 `~/.claude/state/self-update-install-rollback.*/` (`0700` directory containing
 `0600` Claude and Hermes archives) for local operator
 recovery only; do not share it because it may contain settings and memory
-files. Normal success and successful rollback remove it automatically.
+files. Exit 10 likewise reports and retains the path rather than recording a
+false success. Normal success and successful rollback remove it automatically.
 
 `setup.sh` independently exits `70` when its own local artifact rollback is
 degraded and prints the retained private transaction directory. The outer
