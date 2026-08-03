@@ -37,10 +37,6 @@ jobs:
         with:
           python-version: "3.12"
           cache: "pip"
-          cache-dependency-path: |
-            .github/requirements/bridge-ci.txt
-            bridge/requirements.lock.txt
-          cache: "pip"
           cache-dependency-path: .github/requirements/bridge-ci.txt
       - name: Install lint tools
         run: |
@@ -141,6 +137,10 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: |
+            .github/requirements/bridge-ci.txt
+            bridge/requirements.lock.txt
       - name: Install verification tools (hash-locked)
         run: |
           python -m pip install --require-hashes -r .github/requirements/bridge-ci.txt
