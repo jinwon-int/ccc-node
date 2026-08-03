@@ -11,6 +11,20 @@ trap 'rm -rf "$TMP"' EXIT
 
 ok() { if eval "$2"; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $1"; fi; }
 
+# Route every setup-run systemd interaction away from the live tree (#885).
+# A full (non-dry-run) $SETUP run reaches bridge/service-systemd.sh reconcile;
+# without this suite-wide seam a root test run rewrites the real
+# /etc/systemd/system/ccc-telegram-bridge.service with the case's scratch
+# $HOME — observed live on dungae 2026-08-03, where a leaked $TMP/wk-home
+# HOME poisoned the node's session storage. Cases that exercise the seam
+# explicitly still override these per invocation.
+export CCC_SYSTEMD_DIR="$TMP/systemd-seam"
+export CCC_SYSTEMD_SCOPE=user
+mkdir -p "$CCC_SYSTEMD_DIR"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$TMP/systemctl-stub"
+chmod +x "$TMP/systemctl-stub"
+export CCC_SYSTEMCTL="$TMP/systemctl-stub"
+
 home="$TMP/home"
 mkdir -p "$home/.claude" "$TMP/bin"
 printf '{"existing":true}\n' > "$home/.claude/settings.json"

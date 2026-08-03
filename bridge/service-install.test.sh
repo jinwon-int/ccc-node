@@ -449,5 +449,33 @@ run env HOME="$FH" CCC_SYSTEMD_DIR="$RSD" CCC_SYSTEMCTL="$SC_STUB" \
 okc "$RC" 1 "--allow-relocate is rejected outside reconcile"
 ok "reconcile-only rejection is explained" 'grep -q "only with reconcile" "$OUT"'
 
+# ---- systemd: ephemeral-HOME refusal (#885) --------------------------------
+# Without the CCC_SYSTEMD_DIR seam, a HOME under the tmp tree must never be
+# rendered into the unit: a leaked test-suite HOME rewrote a live node's unit
+# with HOME=$TMP/wk-home. The guard fires before any path or systemctl touch.
+EPH_HOME="$TMP/eph-home"; mkdir -p "$EPH_HOME"
+: > "$SC_CALLS"
+run env -u CCC_SYSTEMD_DIR -u CCC_SYSTEMD_SCOPE HOME="$EPH_HOME" \
+    CCC_SYSTEMCTL="$SC_STUB" bash "$SSD" reconcile --dry-run
+okc "$RC" 1 "reconcile refuses an ephemeral tmp HOME without the test seam"
+ok "ephemeral-HOME refusal names the incident guard" 'grep -q "#885" "$OUT"'
+ok "ephemeral-HOME refusal precedes any systemctl contact" '[ ! -s "$SC_CALLS" ]'
+
+run env -u CCC_SYSTEMD_DIR -u CCC_SYSTEMD_SCOPE HOME="$EPH_HOME" \
+    CCC_SYSTEMCTL="$SC_STUB" bash "$SSD" install --project-root "$PROJECT"
+okc "$RC" 1 "install refuses an ephemeral tmp HOME without the test seam"
+
+run env -u CCC_SYSTEMD_DIR -u CCC_SYSTEMD_SCOPE HOME="/nonexistent-ccc-885" \
+    CCC_SYSTEMCTL="$SC_STUB" bash "$SSD" reconcile --dry-run
+okc "$RC" 1 "reconcile refuses a missing HOME directory"
+ok "missing-HOME refusal is explained" 'grep -q "does not exist" "$OUT"'
+
+SEAM_FRESH="$TMP/sd-eph-seam"; mkdir -p "$SEAM_FRESH"
+run env HOME="$EPH_HOME" CCC_SYSTEMD_DIR="$SEAM_FRESH" CCC_SYSTEMCTL="$SC_STUB" \
+    bash "$SSD" reconcile --dry-run
+okc "$RC" 0 "the CCC_SYSTEMD_DIR seam still accepts a scratch HOME"
+ok "seam-scoped run reports the seam path, not the live tree" \
+   'grep -q "reconciliation skipped: $SEAM_FRESH/" "$OUT"'
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

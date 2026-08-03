@@ -54,6 +54,17 @@ All notable changes to the Claude Code node harness. Dates are KST.
   composition is unchanged. (#749)
 
 ### Fixed
+- `bridge/service-systemd.sh` install/reconcile now fail closed when the
+  caller's HOME is missing or under the tmp tree (`$TMPDIR`, `/tmp`,
+  `/var/tmp`, `/dev/shm`) and the `CCC_SYSTEMD_DIR` test seam is not set;
+  an unset HOME is derived from the passwd database (setup.sh convention).
+  A root `setup.test.sh` full-setup case had leaked its scratch
+  `HOME=$TMP/wk-home` into the live
+  `/etc/systemd/system/ccc-telegram-bridge.service`, sending session
+  transcripts and memory hooks to `/tmp` (dungae 2026-08-03, #885).
+  `setup.test.sh` now also exports a suite-wide
+  `CCC_SYSTEMD_DIR`/`CCC_SYSTEMCTL` stub so no test-run `setup.sh` can reach
+  the live systemd tree.
 - Nunchi installation now follows the live provider and runtime user while
   preserving the managed Codex loader and the single Claude SessionStart hook.
   Audience-scoped runtimes fail closed until scope-local provenance exists,

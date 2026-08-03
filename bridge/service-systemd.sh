@@ -163,6 +163,37 @@ systemd_paths() {
     SYSTEMD_UNIT_FILE="$SYSTEMD_UNIT_DIR/$SYSTEMD_SERVICE"
 }
 
+validate_render_home() {
+    # Environment=HOME baked into the unit must be a durable login home. A
+    # scratch HOME leaked from a root test run rewrote a live unit with
+    # HOME=$TMP/wk-home and sent that node's session transcripts and memory
+    # hooks to /tmp (#885), so the unit-writing subcommands fail closed here.
+    # Hermetic tests route through the CCC_SYSTEMD_DIR seam and are exempt.
+    [ -n "${CCC_SYSTEMD_DIR:-}" ] && return 0
+    local service_name="${BRIDGE_SERVICE_NAME:-ccc-telegram-bridge}.service"
+    if [ -z "${HOME:-}" ]; then
+        # Headless contexts (transient units, timers) legitimately lack HOME;
+        # mirror setup.sh and derive it from the passwd database.
+        HOME="$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6 || true)"
+        [ -n "$HOME" ] || HOME=/root
+        export HOME
+        echo "⚠️  HOME was unset; derived HOME=$HOME from the passwd database"
+    fi
+    local tmp_root="${TMPDIR:-/tmp}"
+    case "$HOME" in
+        "$tmp_root"|"$tmp_root"/*|/tmp|/tmp/*|/var/tmp|/var/tmp/*|/dev/shm|/dev/shm/*)
+            echo "❌ Error: refusing to bake ephemeral HOME=$HOME into $service_name (#885)" >&2
+            echo "   Unit Environment=HOME must be a durable login home. Test runs must set" >&2
+            echo "   CCC_SYSTEMD_DIR to route away from the live systemd tree." >&2
+            exit 1
+            ;;
+    esac
+    if [ ! -d "$HOME" ]; then
+        echo "❌ Error: HOME=$HOME does not exist; refusing to render $service_name (#885)" >&2
+        exit 1
+    fi
+}
+
 render_systemd_unit() {
     local project_root="$1" proxy_url="$2"
     local project_slug svc_path proxy_env="" wanted_by="default.target"
@@ -230,6 +261,7 @@ do_install_systemd() {
         echo "❌ Error: Project path does not exist: $PROJECT_ROOT_ARG"
         exit 1
     }
+    validate_render_home
     systemd_paths
 
     echo "📝 Generating systemd unit: $SYSTEMD_UNIT_FILE"
@@ -358,6 +390,7 @@ is_canonical_unit_topology() {
 }
 
 do_reconcile_systemd() {
+    validate_render_home
     systemd_paths
     if [ ! -f "$SYSTEMD_UNIT_FILE" ]; then
         echo "⚪ systemd unit not installed; reconciliation skipped: $SYSTEMD_UNIT_FILE"
