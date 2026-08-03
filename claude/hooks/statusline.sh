@@ -10,7 +10,11 @@ set -uo pipefail
 
 input="$(cat)"
 
+# Default values for all fields (used if jq fails or input is empty).
+MODEL="?"; PCT=0; COST=0; OVER=false; STYLE=""; CWD=""
+
 # Single jq call to extract all fields at once (was 6 separate calls).
+# If jq fails (empty input, malformed JSON), defaults above are used.
 eval "$(jq -r '
   @sh "MODEL=\(.model.display_name // "?")",
   @sh "PCT=\(.context_window.used_percentage // 0)",
@@ -18,7 +22,7 @@ eval "$(jq -r '
   @sh "OVER=\(.exceeds_200k_tokens // false)",
   @sh "STYLE=\(.output_style.name // "")",
   @sh "CWD=\(.workspace.current_dir // .cwd // "")"
-' <<<"$input" 2>/dev/null || true)"
+' <<<"$input" 2>/dev/null)" || true
 
 # Sanitize PCT to integer
 PCT="${PCT%%.*}"
