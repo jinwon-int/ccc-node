@@ -29,7 +29,7 @@ if TYPE_CHECKING:
         ToolStartedEvent,
         deny_approval,
     )
-    from core.claude_runtime import ClaudeRuntime, ClaudeSession, _ActiveTurn
+    from core.claude_runtime import ClaudeRuntime, _ActiveTurn
 else:
     from telegram_bot.core.agent_runtime import (
         AgentEvent,
@@ -52,7 +52,7 @@ else:
         ToolStartedEvent,
         deny_approval,
     )
-    from telegram_bot.core.claude_runtime import ClaudeRuntime, ClaudeSession, _ActiveTurn
+    from telegram_bot.core.claude_runtime import ClaudeRuntime, _ActiveTurn
 
 
 from telegram_bot.core.agent_runtime import (
