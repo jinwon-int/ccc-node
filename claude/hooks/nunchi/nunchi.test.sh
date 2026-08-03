@@ -173,8 +173,110 @@ out="$(bash "$HERE/bench.sh" 2>&1)"; rc=$?
 ok "bench no-op when mode=off" '[ "$rc" = 0 ] && [ -z "$out" ]'
 rows="$(tail -n +2 "$HERE/bench-qset.tsv" | grep -c .)"
 badcols="$(awk -F'\t' 'NF!=4' "$HERE/bench-qset.tsv" | grep -c . || true)"
-ok "bench qset has 5 rows of 4 tab-separated columns" '[ "$rows" = 5 ] && [ "$badcols" = 0 ]'
+ok "bench qset has 7 rows of 4 tab-separated columns" '[ "$rows" = 7 ] && [ "$badcols" = 0 ]'
 printf 'on' > "$CCC_STATE_DIR/nunchi.mode"
+
+# ---- 13. #890 write gate ----------------------------------------------------
+GDB="$TMP/nunchi-home/gate.db"
+gq() { NUNCHI_DB="$GDB" python3 -c "
+import sqlite3, sys
+print(sqlite3.connect('$GDB').execute(sys.argv[1]).fetchall())" "$1"; }
+gpayload() {  # gpayload <sid> <kind> <subject> <text> [source] [quote] [tpath]
+  python3 - "$@" <<'PY'
+import json, sys
+sid, kind, subject, text = sys.argv[1:5]
+item = {"kind": kind, "subject": subject, "text": text}
+if len(sys.argv) > 5 and sys.argv[5]: item["source"] = sys.argv[5]
+if len(sys.argv) > 6 and sys.argv[6]: item["quote"] = sys.argv[6]
+p = {"session_id": sid, "distilled_at": "2026-08-03T00:00:00+00:00", "honcho": [item]}
+if len(sys.argv) > 7 and sys.argv[7]: p["transcript_path"] = sys.argv[7]
+print(json.dumps(p, ensure_ascii=False))
+PY
+}
+
+# G1: progress→done update auto-closes the in-flight fact, link preserved
+gpayload s90 context session "PR #9 리뷰 진행 중, CI 대기" | NUNCHI_DB="$GDB" python3 "$NP" ingest - >/dev/null
+gpayload s90 observation session "PR #9 머지 완료" | NUNCHI_DB="$GDB" python3 "$NP" ingest - >/dev/null
+ok "G1 closes the stale in-flight fact" \
+  '[ "$(gq "SELECT COUNT(*) FROM peer_facts WHERE valid_to IS NOT NULL" | tr -dc 0-9)" = 1 ]'
+ok "G1 keeps the supersedes link on the newcomer" \
+  'gq "SELECT supersedes FROM peer_facts WHERE fact LIKE \"%머지 완료%\"" | grep -q "(1,)"'
+
+# G2: verified quote earns the claimed rank; unverifiable claim demotes + review
+TR="$TMP/gate-transcript.jsonl"
+printf '{"type":"user","message":{"content":"등애는 절대 원격 삭제 금지라고 했다"}}\n' > "$TR"
+gpayload s91 preference user "원격 삭제 금지 선호" user-stated "절대 원격 삭제 금지" "$TR" \
+  | NUNCHI_DB="$GDB" python3 "$NP" ingest - >/dev/null
+ok "G2 verified user-stated quote earns rank 3, no review" \
+  'gq "SELECT source_rank, review FROM peer_facts WHERE fact LIKE \"%삭제 금지 선호%\"" | grep -q "(3, 0)"'
+gpayload s91 observation user "사용자가 X를 승인했다고 함" user-stated "이 인용은 원문에 없다" "$TR" \
+  | NUNCHI_DB="$GDB" python3 "$NP" ingest - >/dev/null
+ok "G2 unverifiable claim demotes to rank 1 and flags review" \
+  'gq "SELECT source_rank, review FROM peer_facts WHERE fact LIKE \"%승인했다고%\"" | grep -q "(1, 1)"'
+
+# G2 guard: an inferred completion cannot close a verified user-stated fact
+printf '{"type":"user","message":{"content":"배포 승인 대기 원칙 유지 진행 중이라고 했다"}}\n' > "$TMP/tr2.jsonl"
+gpayload s92 preference user "배포 승인 대기 원칙 유지 진행 중" user-stated "배포 승인 대기 원칙 유지 진행 중" "$TMP/tr2.jsonl" \
+  | NUNCHI_DB="$GDB" python3 "$NP" ingest - >/dev/null
+gpayload s92 observation user "배포 승인 대기 원칙 폐기 완료" inferred "" "$TMP/tr2.jsonl" \
+  | NUNCHI_DB="$GDB" python3 "$NP" ingest - >/dev/null
+ok "G2 rank guard: inferred done cannot close user-stated fact" \
+  'gq "SELECT valid_to FROM peer_facts WHERE fact LIKE \"%원칙 유지 진행 중%\"" | grep -q "(None,)"'
+
+# G3: high-overlap non-update conflict flags review, never auto-resolves
+gpayload s93 context node "기본 모델 값은 fable-5 이다" | NUNCHI_DB="$GDB" python3 "$NP" ingest - >/dev/null
+gpayload s93 context node "기본 모델 값은 opus 이다" | NUNCHI_DB="$GDB" python3 "$NP" ingest - >/dev/null
+ok "G3 conflicting sibling stays open and is flagged" \
+  'gq "SELECT valid_to, review FROM peer_facts WHERE fact LIKE \"%opus 이다%\"" | grep -q "(None, 1)"'
+
+# G4: constraints always injected into the snapshot, ahead of the limit
+gpayload s94 constraint user "절대 main 브랜치에 직접 푸시 금지" | NUNCHI_DB="$GDB" python3 "$NP" ingest - >/dev/null
+snap="$(NUNCHI_DB="$GDB" NUNCHI_SNAPSHOT="$TMP/gate-snap.md" python3 "$NP" snapshot --limit 1)"
+ok "G4 constraint survives a limit-1 snapshot" 'grep -q "\[제약/seo-jin-on\] 절대 main" <<<"$snap"'
+ok "snapshot surfaces the review queue count" 'grep -q "검토대기" <<<"$snap"'
+
+# review CLI: list + clear
+out="$(NUNCHI_DB="$GDB" python3 "$NP" review)"
+ok "review lists flagged facts" 'grep -q "opus 이다" <<<"$out"'
+rid="$(gq "SELECT id FROM peer_facts WHERE fact LIKE \"%opus 이다%\"" | tr -dc 0-9)"
+NUNCHI_DB="$GDB" python3 "$NP" review "$rid" --clear >/dev/null
+ok "review --clear drops the flag" \
+  'gq "SELECT review FROM peer_facts WHERE id=$rid" | grep -q "(0,)"'
+
+# review-stale: retro G1 lists then closes only on --close
+gpayload s95 context session "이슈 #7 분석 실행 중" | NUNCHI_NO_AUTO_SUPERSEDE=1 NUNCHI_DB="$GDB" python3 "$NP" ingest - >/dev/null
+gpayload s95 observation session "이슈 #7 분석 종결" | NUNCHI_NO_AUTO_SUPERSEDE=1 NUNCHI_DB="$GDB" python3 "$NP" ingest - >/dev/null
+out="$(NUNCHI_DB="$GDB" python3 "$NP" review-stale)"
+ok "review-stale lists the retro candidate without closing" \
+  'grep -q "1 candidates" <<<"$out" && gq "SELECT valid_to FROM peer_facts WHERE fact LIKE \"%분석 실행 중%\"" | grep -q "(None,)"'
+NUNCHI_DB="$GDB" python3 "$NP" review-stale --close >/dev/null
+ok "review-stale --close closes the stale fact" \
+  'gq "SELECT valid_to FROM peer_facts WHERE fact LIKE \"%분석 실행 중%\"" | grep -qv "(None,)"'
+
+# metrics: body-free counters present
+out="$(NUNCHI_DB="$GDB" python3 "$NP" metrics)"
+ok "metrics emits gate counters" \
+  'grep -q "facts_open=" <<<"$out" && grep -q "stale_suspect_ratio=" <<<"$out" && grep -q "review_pending=" <<<"$out" && grep -q "constraints_open=" <<<"$out"'
+
+# migration: a pre-gate DB gains the columns losslessly
+MDB="$TMP/pre-gate.db"
+python3 - "$MDB" <<'PY'
+import sqlite3, sys
+c = sqlite3.connect(sys.argv[1])
+c.execute("""CREATE TABLE peer_facts (id INTEGER PRIMARY KEY, observer TEXT NOT NULL,
+  observed TEXT NOT NULL, kind TEXT NOT NULL, fact TEXT NOT NULL, evidence TEXT,
+  confidence REAL DEFAULT 0.7, valid_from TEXT NOT NULL, valid_to TEXT,
+  supersedes INTEGER, dedup TEXT UNIQUE, created_at TEXT NOT NULL)""")
+c.execute("INSERT INTO peer_facts(observer,observed,kind,fact,valid_from,created_at)"
+          " VALUES ('o','p','context','기존 사실','2026-07-01','2026-07-01')")
+c.commit()
+PY
+NUNCHI_DB="$MDB" python3 "$NP" init >/dev/null
+cols="$(python3 -c "import sqlite3;print([r[1] for r in sqlite3.connect('$MDB').execute('PRAGMA table_info(peer_facts)')])")"
+ok "pre-gate DB gains source_rank/review in place" \
+  'grep -q "source_rank" <<<"$cols" && grep -q "review" <<<"$cols"'
+mrows="$(python3 -c "import sqlite3;print(sqlite3.connect('$MDB').execute('SELECT COUNT(*) FROM peer_facts').fetchone()[0])")"
+ok "pre-gate rows survive migration" '[ "$mrows" = 1 ]'
 
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

@@ -48,8 +48,9 @@ out="$(find "$nunchi_home" -maxdepth 1 -name 'bench-*.md' -type f -print -quit)"
 ok "bench exits successfully" '[ "$rc" = 0 ] && [ ! -s "$TMP/stderr" ]'
 ok "all five Q-set rows run even when the backend drains stdin" \
   '[ -n "$out" ] && [ "$(grep -c "^## q[1-5] " "$out")" = 5 ]'
-ok "every answer came from an stdin-isolated child" \
-  '[ "$(grep -c "BENCH_STDIN_ISOLATED" "$out")" = 5 ]'
+ok "every child (5 queries + metrics) is stdin-isolated" \
+  '[ "$(grep -c "BENCH_STDIN_ISOLATED" "$out")" = 6 ]'
+ok "bench records the #890 metrics section" 'grep -q "^## metrics " "$out"'
 ok "the final Q-set row is preserved" \
   'grep -q "^- Q: query five$" "$out" && grep -q "^- expect: expect five$" "$out"'
 

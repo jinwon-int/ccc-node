@@ -25,6 +25,14 @@ mkdir -p "$NUNCHI_HOME"
   echo
 } >> "$OUT"
 
+# #890 P5 — body-free DB health counters land in the same weekly file so the
+# reviewing agent sees retrieval quality AND write-gate hygiene side by side.
+{
+  echo "## metrics ($(date -Is))"
+  python3 "$HERE/nunchi.py" metrics </dev/null 2>&1 | sed 's/^/- /'
+  echo
+} >> "$OUT"
+
 tail -n +2 "$QSET" | while IFS=$'\t' read -r qid category query expect; do
   [ -n "$qid" ] || continue
   start="$(date +%s)"

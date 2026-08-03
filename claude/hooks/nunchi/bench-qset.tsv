@@ -4,3 +4,5 @@ q2	relational-aggregate	nunchi 파일럿 노드별 fact 수는 어떻게 되나	
 q3	verbatim-keyword	quiz2-api 서비스 포트와 경로	seoseo /opt/seoseo-services/quiz2 계열 원문 상세
 q4	verbatim-paraphrase	퀴즈 API가 어느 주소에서 돌고 있었는지 기억나?	q3과 동일 사실 — 자연어 패러프레이즈 회수 검증(TM-1332 Q4 약점)
 q5	supersede-time	이 노드의 현재 ccc-node HEAD 커밋은	최신 fact가 과거 fact를 대체해야 함 (B2/시간축 검증)
+q6	reason-preservation	Termux 노드를 peer_facts-only로 확정한 이유는	결정과 함께 근거(chromadb aarch64 빌드 불가 등)가 답에 남아야 함 (#890 드리프트 축)
+q7	reason-preservation	Honcho를 유지하지 않고 폐기 경로로 정한 이유는	결정+이유(원문형 무능·서버 영구화 등) 동반 회수 — 이유 소실 시 드리프트 실측
