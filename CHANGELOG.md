@@ -69,6 +69,18 @@ All notable changes to the Claude Code node harness. Dates are KST.
   composition is unchanged. (#749)
 
 ### Fixed
+- Telegram bridge turns no longer die on image-bearing tool results. The
+  Claude adapter never set `ClaudeAgentOptions.max_buffer_size`, so the SDK
+  used its own 1 MiB stdout NDJSON limit and one oversized line raised
+  `SDKJSONDecodeError` inside the message reader task, which has no recovery
+  path — the whole turn failed with "JSON message exceeded maximum buffer
+  size of 1048576 bytes" (measured 2026-08-03 18:19:14 KST, line of
+  1,056,854 bytes: a 510 KB PNG resized to 682x2000 / 528,000 base64 chars
+  and emitted twice in one message, as `message.content[].source.data` and
+  again as `toolUseResult.file.base64`, so a single image over ~524 KB of
+  base64 was fatal). Every construction path — including bare, settings-free
+  `ClaudeRuntime()` — now passes an explicit bound, configurable through the
+  new `CCC_CLAUDE_MAX_BUFFER_SIZE` (default 16 MiB, range 1 MiB–256 MiB).
 - `bridge/service-systemd.sh` install/reconcile now fail closed when the
   caller's HOME is missing or under the tmp tree (`$TMPDIR`, `/tmp`,
   `/var/tmp`, `/dev/shm`) and the `CCC_SYSTEMD_DIR` test seam is not set;

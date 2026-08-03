@@ -1,5 +1,16 @@
 # Changelog
 
+- **Explicit Claude SDK stdout buffer bound.** The adapter now always passes
+  `ClaudeAgentOptions.max_buffer_size` (new `CCC_CLAUDE_MAX_BUFFER_SIZE`,
+  default 16 MiB, accepted range 1 MiB–256 MiB), including on the bare
+  settings-free construction path. Previously the option was never set, so the
+  SDK applied its own 1 MiB default and a single oversized NDJSON line raised
+  `SDKJSONDecodeError` inside the message reader — an unrecoverable whole-turn
+  failure. Measured 2026-08-03: a 510 KB PNG read through the Read tool was
+  re-encoded to 528,000 base64 chars and shipped twice in one message
+  (`message.content[].source.data` and `toolUseResult.file.base64`), producing
+  a 1,056,854-byte line, so one image above ~524 KB of base64 was enough.
+
 - **Bridge timeout configuration preflight.** Runtime settings, `ccc-doctor`,
   and self-update now share a body-free guard requiring delegated-task stall
   time to remain below the whole-turn process timeout. Doctor no longer calls

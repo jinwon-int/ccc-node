@@ -22,6 +22,40 @@ from pathlib import Path
 
 DEFAULT_PROCESS_TIMEOUT_SECONDS = 21600
 DEFAULT_DELEGATED_TASK_STALL_SECONDS = 7200.0
+
+# Claude Agent SDK stdout NDJSON reader buffer (bytes).
+#
+# The SDK reads the CLI's stdout as newline-delimited JSON and refuses any
+# single line longer than ``ClaudeAgentOptions.max_buffer_size``; when that
+# option is left None it falls back to the SDK's own
+# ``_DEFAULT_MAX_BUFFER_SIZE`` of 1 MiB
+# (claude_agent_sdk/_internal/transport/subprocess_cli.py). Exceeding it raises
+# ``SDKJSONDecodeError`` inside the message reader task, which kills the reader
+# with no recovery path — the whole turn dies with
+# "JSON message exceeded maximum buffer size of 1048576 bytes".
+#
+# Measured incident (2026-08-03 18:19:14 KST, this node): a single line of
+# 1,056,854 bytes — only 8,278 bytes over the 1 MiB limit — killed the bridge
+# turn. A 510 KB PNG screenshot went through Read; Claude Code resized and
+# re-encoded it to 682x2000 (528,000 base64 chars) and then shipped that same
+# base64 TWICE in one message: once as
+# ``message.content[0].content[0].source.data`` and again as
+# ``toolUseResult.file.base64``. The duplication is what doubles the payload,
+# so the effective failure threshold is only ~524 KB of base64 for a SINGLE
+# image — routinely reached by ordinary screenshot work.
+#
+# 16 MiB leaves ~16x headroom over that measured line (and ~8 images' worth of
+# the duplicated encoding) at no steady-state cost: this bounds a buffer, it
+# does not preallocate one. The bridge must always pass an explicit value so a
+# turn can never silently fall back to the 1 MiB SDK default again.
+#
+# Single-sourced here (this module is stdlib-only and imports nothing from the
+# bridge package) so utils/config.py and core/claude_runtime.py cannot drift.
+DEFAULT_CLAUDE_MAX_BUFFER_SIZE = 16 * 1024 * 1024  # 16 MiB
+# Floor: the SDK's own 1 MiB default. Configuring anything lower is strictly
+# worse than the behaviour this fix replaces, so it is rejected.
+MIN_CLAUDE_MAX_BUFFER_SIZE = 1024 * 1024
+MAX_CLAUDE_MAX_BUFFER_SIZE = 256 * 1024 * 1024
 TIMEOUT_ORDER_ERROR = "delegated-task-stall-not-lower-than-process-timeout"
 TIMEOUT_ORDER_MESSAGE = (
     "CCC_DELEGATED_TASK_STALL_SECONDS must be lower than CLAUDE_PROCESS_TIMEOUT"

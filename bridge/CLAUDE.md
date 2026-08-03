@@ -127,6 +127,7 @@ utils/chat_logger.py Per-session debug chat logging
 | `CCC_MODEL_LABEL` | No | Display label for the session-start banner's `◆ Model:` line. Precedence: session `/model` choice → `CCC_MODEL_LABEL` → `ANTHROPIC_MODEL` (Claude provider only) → `default` |
 | `CLAUDE_CLI_PATH` | No | Absolute path to Claude CLI binary |
 | `CLAUDE_PROCESS_TIMEOUT` | No | Whole-turn SDK timeout in seconds (default: 21600 / 6 hours; read at process start) |
+| `CCC_CLAUDE_MAX_BUFFER_SIZE` | No | Max bytes for one Claude Agent SDK stdout NDJSON line (default: 16777216 / 16 MiB, range 1 MiB–256 MiB). Always sent explicitly: the SDK's own 1 MiB fallback kills the whole turn with `SDKJSONDecodeError` when a tool result carries a large image |
 | `CCC_APPROVAL_STALL_SECONDS` | No | Wall-clock deadline for a pending provider approval (default: 120; 0 disables) |
 | `PROXY_URL` | No | HTTP proxy; start.sh auto-configures env vars |
 | `PROJECT_ROOT` | Set by start.sh | Base path for all file access validation |
