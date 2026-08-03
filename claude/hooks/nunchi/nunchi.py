@@ -244,13 +244,29 @@ def _verify_rank(item, transcript_key):
     return 1, 1
 
 
+def _g1_pool(c, observed):
+    """G1 candidate pool. session:* peers are one actor's in-flight log split
+    by session id — a completion routinely lands in a later session than the
+    fact it closes (measured retro on dungae: same-observed matching found 1
+    of ~20 stale facts). Cross-match all session peers; user/node peers stay
+    strictly scoped."""
+    if str(observed).startswith("session:"):
+        return c.execute(
+            "SELECT id, fact, source_rank FROM peer_facts"
+            " WHERE (observed=? OR observed LIKE 'session:%') AND valid_to IS NULL",
+            (observed,)).fetchall()
+    return c.execute(
+        "SELECT id, fact, source_rank FROM peer_facts"
+        " WHERE observed=? AND valid_to IS NULL", (observed,)).fetchall()
+
+
 def _update_supersede(c, observed, text, new_rank):
     """G1 — close the in-flight fact this completion most plausibly updates.
 
-    Same observed peer, old fact carries a progress marker, the new text a
-    completion marker, token overlap >= 0.4, and the newcomer's source rank
-    is not lower than the old fact's (G2 guard). One fact at most, reversible
-    exactly like B2 (clear valid_to; `supersedes` keeps the link).
+    Old fact carries a progress marker, the new text a completion marker,
+    token overlap >= 0.4, and the newcomer's source rank is not lower than
+    the old fact's (G2 guard). One fact at most, reversible exactly like B2
+    (clear valid_to; `supersedes` keeps the link).
     """
     if not _DONE.search(text):
         return None
@@ -258,9 +274,7 @@ def _update_supersede(c, observed, text, new_rank):
     if not new:
         return None
     best, best_ratio = None, 0.0
-    rows = c.execute(
-        "SELECT id, fact, source_rank FROM peer_facts"
-        " WHERE observed=? AND valid_to IS NULL", (observed,)).fetchall()
+    rows = _g1_pool(c, observed)
     for fid, fact, old_rank in rows:
         if not _PROGRESS.search(fact) or (old_rank or 1) > new_rank:
             continue
@@ -582,9 +596,12 @@ def review_stale(do_close):
     rows = c.execute(
         "SELECT id, observed, fact, source_rank FROM peer_facts"
         " WHERE valid_to IS NULL ORDER BY id").fetchall()
+    # Mirror _g1_pool: all session:* peers form one retro pool; user/node
+    # peers stay scoped to themselves.
     by_obs = {}
     for r in rows:
-        by_obs.setdefault(r[1], []).append(r)
+        key = "session:*" if r[1].startswith("session:") else r[1]
+        by_obs.setdefault(key, []).append(r)
     cands = []
     for facts in by_obs.values():
         for i, (fid, _o, fact, rank) in enumerate(facts):

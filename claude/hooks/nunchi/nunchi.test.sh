@@ -202,6 +202,13 @@ ok "G1 closes the stale in-flight fact" \
 ok "G1 keeps the supersedes link on the newcomer" \
   'gq "SELECT supersedes FROM peer_facts WHERE fact LIKE \"%머지 완료%\"" | grep -q "(1,)"'
 
+# G1 cross-session: a later session's completion closes an earlier session's
+# in-flight fact (session:* peers are one actor's log split by session id)
+gpayload s90b context session "PR #12 배포 승인 대기" | NUNCHI_DB="$GDB" python3 "$NP" ingest - >/dev/null
+gpayload s90c observation session "PR #12 배포 완료" | NUNCHI_DB="$GDB" python3 "$NP" ingest - >/dev/null
+ok "G1 matches across session peers" \
+  'gq "SELECT valid_to IS NOT NULL FROM peer_facts WHERE fact LIKE \"%배포 승인 대기%\"" | grep -q "(1,)"'
+
 # G2: verified quote earns the claimed rank; unverifiable claim demotes + review
 TR="$TMP/gate-transcript.jsonl"
 printf '{"type":"user","message":{"content":"등애는 절대 원격 삭제 금지라고 했다"}}\n' > "$TR"
