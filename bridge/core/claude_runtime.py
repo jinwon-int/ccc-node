@@ -1224,6 +1224,15 @@ class ClaudeRuntime:
             if request.effort not in _EFFORT_LEVELS:
                 raise ValueError(f"unsupported Claude effort: {request.effort!r}")
             effort = cast(EffortLevel, request.effort)
+        # SDK default stdout-message buffer is 1MB (subprocess_cli.py); a
+        # single oversized MCP tool result can exceed that and abort the
+        # whole message reader ("JSON message exceeded maximum buffer
+        # size"), which then cascades into "Cannot write to terminated
+        # process" on the next write to that now-dead subprocess (#901
+        # follow-up, live incident: gwakga 2026-08-03 18:19 KST). getattr
+        # keeps bare construction (unit tests / conformance harness without
+        # bound settings) on the SDK's own default.
+        max_buffer_size = getattr(self._settings, "max_buffer_size", None)
         options = ClaudeAgentOptions(
             cwd=request.working_directory,
             model=request.model,
@@ -1233,6 +1242,7 @@ class ClaudeRuntime:
             can_use_tool=can_use_tool,
             include_partial_messages=True,
             stderr=stderr,
+            max_buffer_size=max_buffer_size,
         )
         if self._settings is not None:
             self._apply_execution_profile(options, request)

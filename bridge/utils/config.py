@@ -23,6 +23,18 @@ from telegram_bot.utils.settings_heartbeat import HeartbeatSettingsMixin
 from telegram_bot.utils.settings_memory import MemorySettingsMixin
 from telegram_bot.utils.settings_voice import VoiceSettingsMixin
 
+# claude-agent-sdk's own subprocess transport hard-codes a 1MB stdout-message
+# buffer (_DEFAULT_MAX_BUFFER_SIZE in transport/subprocess_cli.py) unless the
+# caller passes ClaudeAgentOptions(max_buffer_size=...). A single oversized
+# MCP tool result (e.g. a large web search/scrape payload) exceeds 1MB and
+# the SDK aborts the whole message reader with "JSON message exceeded
+# maximum buffer size" — which then cascades into "Cannot write to
+# terminated process" on the next write to that now-dead subprocess. Live
+# incident: gwakga, 2026-08-03 18:19 KST (see #901 follow-up comment).
+# 10MB gives generous headroom over any known single-tool-result payload
+# while still bounding worst-case memory for a single message.
+DEFAULT_MAX_BUFFER_SIZE = 10 * 1024 * 1024
+
 BOT_PACKAGE_DIR = Path(__file__).resolve().parent.parent
 
 # Compatibility defaults for direct ``Config(...)`` construction. Runtime
@@ -241,6 +253,17 @@ class Config(
         alias="CLAUDE_PROCESS_TIMEOUT",
         gt=0,
         description="Whole-turn provider process timeout in seconds.",
+    )
+    max_buffer_size: int = Field(
+        default=DEFAULT_MAX_BUFFER_SIZE,
+        alias="CLAUDE_MAX_BUFFER_SIZE",
+        gt=0,
+        description=(
+            "Max bytes for a single stdout JSON message from the Claude CLI "
+            "subprocess (claude-agent-sdk ClaudeAgentOptions.max_buffer_size). "
+            "SDK default is 1MB; a single oversized MCP tool result can "
+            "exceed that and kill the turn (#901 follow-up)."
+        ),
     )
     claude_cli_path: Optional[Path] = Field(
         default=None,
