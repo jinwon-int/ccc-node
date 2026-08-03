@@ -91,6 +91,13 @@ All notable changes to the Claude Code node harness. Dates are KST.
   composition is unchanged. (#749)
 
 ### Fixed
+- self-update no longer reports `result:"ok"` / "services restarted: 0" when
+  the code changed but no service was restarted because the services allowlist
+  file (`self-update.services`) was missing or empty. That silent code/runtime
+  drift (checkout on NEW code, running processes on OLD) previously read as
+  success; it now exits `11` with `result:"degraded-no-services"` and a
+  notification warning the runtime may be stale (#910, measured on gwakga:
+  persisted 4 runs / ~3 days as false-positive `ok`).
 - agent-cron no longer mislabels a watch-type task that exits non-zero to
   signal findings as `failed` → `retry-exhausted`. A task-definition
   `successExitCodes` (CLI `--success-exit-codes 0,1`, default `[0]`) now

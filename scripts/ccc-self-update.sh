@@ -35,8 +35,9 @@
 #      (1800 — never defer a task older than this), CCC_SELF_UPDATE_MAX_DEFER_SECONDS
 #      (3600 — cap total deferral so continuous load can't starve updates).
 #      Fail-open (missing/unreadable/stale health → proceed); --force bypasses.
-# Exit: 0 = up-to-date or updated cleanly; 8 = deferred (bridge busy); other
-#      non-zero = aborted (reason logged).
+# Exit: 0 = up-to-date or updated cleanly; 8 = deferred (bridge busy); 11 =
+#      degraded (code updated but no service restarted — allowlist missing/empty,
+#      runtime may be stale); other non-zero = aborted (reason logged).
 set -uo pipefail
 
 CLAUDE_DIR="${CCC_CLAUDE_DIR:-${HOME:-/root}/.claude}"
@@ -456,6 +457,19 @@ if ! rm -rf -- "$INSTALL_SNAPSHOT_DIR"; then
   exit 10
 fi
 INSTALL_SNAPSHOT_DIR=""
+
+# Per #910: code changed but NO service was restarted (services allowlist file
+# missing or empty). Running processes still hold OLD code — silent code/runtime
+# drift that previously reported result:"ok" / "services restarted: 0". Report
+# it as degraded (not ok) and exit non-zero so it cannot read as success.
+# (FAILED==0 is guaranteed here — the FAILED>0 path exited 7 above — so a zero
+# restart count with a change means nothing was even attempted.)
+if [ "$CHANGED" = "true" ] && [ "$RESTARTED" -eq 0 ]; then
+  audit "degraded-no-services" "$OLD_SHA" "$NEW_SHA" "$CHANGED" "$SETUP_OK" "$SERVICES_JSON"
+  notify "self-update ${SHORT_NEW}: 코드 갱신됐으나 재시작된 서비스 없음 (허용목록 누락/비어있음 의심). 실행 중 프로세스가 옛 코드일 수 있음 — self-update.services 확인 필요. ~/.claude/state/self-update.log" "degraded-$NEW_SHA"
+  say "self-update: degraded — ${OLD_SHA:0:7} → ${SHORT_NEW}, services restarted: 0 (no allowlisted services; runtime may be stale)" >&2
+  exit 11
+fi
 
 audit "ok" "$OLD_SHA" "$NEW_SHA" "$CHANGED" "$SETUP_OK" "$SERVICES_JSON"
 if [ "$CHANGED" = "true" ]; then

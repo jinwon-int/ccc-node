@@ -93,6 +93,18 @@ ok "owner notification queued" 'ls "$TMP/spool"/*SelfUpdate*.json >/dev/null 2>&
 ok "successful update removes private recovery snapshot" \
   '! compgen -G "$STATE/self-update-install-rollback.*" >/dev/null'
 
+# --- #910: code changed but NO services allowlist -> degraded (silent drift) --
+echo drift > "$TMP/seed/file.txt"
+git -C "$TMP/seed" add -A && git -C "$TMP/seed" commit -qm three && git -C "$TMP/seed" push -q origin main
+rm -f "$CLAUDE/self-update.services"   # allowlist missing -> nothing restarted
+out="$(run_selfup run 2>&1)"; rc=$?
+ok "no-services-file on change exits 11 (degraded)" '[ "$rc" = 11 ]'
+ok "no-services-file reported as degraded, not ok" 'grep -q "\"result\":\"degraded-no-services\"" "$STATE/self-update.log"'
+ok "degraded run still fast-forwards the repo" '[ "$(git -C "$REPO" rev-parse HEAD)" = "$(git -C "$TMP/seed" rev-parse HEAD)" ]'
+ok "degraded notification warns of stale runtime" 'grep -rh "재시작된 서비스 없음" "$TMP/spool" >/dev/null 2>&1'
+# restore the allowlist so later sections restart normally
+printf '%s\n' 'hermes-broker' 'a2a-worker' > "$CLAUDE/self-update.services"
+
 # A target commit must not restart into existing invalid node-local bridge
 # timeout settings; it rolls back before systemctl touches the allowlisted unit.
 mkdir -p "$TMP/seed/bridge"
