@@ -16,7 +16,10 @@ from pydantic_settings import (
 )
 
 from telegram_bot.runtime_config_check import (
+    DEFAULT_CLAUDE_MAX_BUFFER_SIZE,
     DEFAULT_PROCESS_TIMEOUT_SECONDS,
+    MAX_CLAUDE_MAX_BUFFER_SIZE,
+    MIN_CLAUDE_MAX_BUFFER_SIZE,
     validate_timeout_invariant,
 )
 from telegram_bot.utils.settings_heartbeat import HeartbeatSettingsMixin
@@ -248,6 +251,22 @@ class Config(
     )
     claude_settings_path: Path = Field(
         default=CLAUDE_SETTINGS_PATH, description="Path to Claude Code settings.json"
+    )
+    # Explicit SDK stdout NDJSON buffer bound. Left unset, the SDK falls back to
+    # its 1 MiB default and one oversized line kills the message reader — see
+    # DEFAULT_CLAUDE_MAX_BUFFER_SIZE in runtime_config_check.py for the measured
+    # incident (1,056,854-byte line from a single duplicated base64 image).
+    claude_max_buffer_size: int = Field(
+        default=DEFAULT_CLAUDE_MAX_BUFFER_SIZE,
+        alias="CCC_CLAUDE_MAX_BUFFER_SIZE",
+        ge=MIN_CLAUDE_MAX_BUFFER_SIZE,
+        le=MAX_CLAUDE_MAX_BUFFER_SIZE,
+        description=(
+            "Maximum bytes for a single Claude Agent SDK stdout NDJSON line. "
+            "Raise it if image-heavy turns still overflow; below the 1 MiB "
+            "floor is rejected because that is the SDK default this bound "
+            "exists to replace."
+        ),
     )
 
     # Telegram Bot

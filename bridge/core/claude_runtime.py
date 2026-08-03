@@ -50,6 +50,11 @@ from claude_agent_sdk import (
 )
 from claude_agent_sdk.types import SandboxSettings
 
+from telegram_bot.runtime_config_check import (
+    DEFAULT_CLAUDE_MAX_BUFFER_SIZE,
+    MAX_CLAUDE_MAX_BUFFER_SIZE,
+    MIN_CLAUDE_MAX_BUFFER_SIZE,
+)
 from telegram_bot.utils.memory_policy import MEMORY_MODE_AUDIENCE_SCOPED, MEMORY_MODE_OFF
 
 from .agent_runtime import (
@@ -226,6 +231,31 @@ SdkFrameObserver = Callable[[Message], None]
 
 def _default_sdk_client_factory(options: ClaudeAgentOptions) -> SdkClient:
     return ClaudeSDKClient(options=options)
+
+
+def _resolve_max_buffer_size(settings: Any) -> int:
+    """Bytes for ``ClaudeAgentOptions.max_buffer_size``, never ``None``.
+
+    Leaving the option unset hands the SDK its 1 MiB
+    ``_DEFAULT_MAX_BUFFER_SIZE``, and one NDJSON line above that raises
+    ``SDKJSONDecodeError`` inside the message reader — an unrecoverable
+    whole-turn failure (measured 2026-08-03: a 1,056,854-byte line from a
+    single screenshot whose base64 the CLI ships in two fields at once). So
+    every construction path resolves to a real number here, including bare
+    ``ClaudeRuntime()`` without bound settings (unit tests, the conformance
+    harness), which would otherwise be the one route back to 1 MiB.
+
+    Out-of-range or non-integer settings degrade to the default rather than
+    failing session start: a mistyped buffer bound must not take the bridge
+    down, and ``Config`` already validates the operator-facing value.
+    """
+
+    raw = getattr(settings, "claude_max_buffer_size", None)
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        return DEFAULT_CLAUDE_MAX_BUFFER_SIZE
+    if raw < MIN_CLAUDE_MAX_BUFFER_SIZE or raw > MAX_CLAUDE_MAX_BUFFER_SIZE:
+        return DEFAULT_CLAUDE_MAX_BUFFER_SIZE
+    return raw
 
 
 @dataclass(slots=True)
@@ -1128,6 +1158,10 @@ class ClaudeRuntime:
         # construction in unit tests and the conformance harness) options
         # carry only the request-derived fields, as before.
         self._settings = settings
+        # Resolved once here (not inside the settings-bound branch below) so
+        # the bare, settings-free adapter also gets an explicit bound instead
+        # of the SDK's 1 MiB fallback.
+        self._max_buffer_size = _resolve_max_buffer_size(settings)
         self._execution_profile: str | None = None
         self._bash_policy: str | None = None
         self._claude_unrestricted = False
@@ -1233,6 +1267,10 @@ class ClaudeRuntime:
             can_use_tool=can_use_tool,
             include_partial_messages=True,
             stderr=stderr,
+            # Always explicit: None here means the SDK's 1 MiB NDJSON line
+            # limit, which an image-bearing tool result overflows and kills
+            # the reader task for the rest of the turn (incident 2026-08-03).
+            max_buffer_size=self._max_buffer_size,
         )
         if self._settings is not None:
             self._apply_execution_profile(options, request)
