@@ -123,6 +123,41 @@ out="$(HOME="$probe_home" PREFIX="/data/data/com.termux/files/usr" \
 ok "Termux without optional MemPalace accepts feed and bench only" \
   '[ "$rc" = 0 ] && jq -e '\'' .nunchi.status == "ok" and .nunchi.cron.managed_refresh_count == 0 and .mempalace.status == "optional" and .mempalace.required == false '\'' >/dev/null <<<"$out"'
 
+# Managed Termux PRoot topology: ccc-memory must inspect sqlite_exact instead
+# of falsely requiring the native ~/.mempalace Chroma path (#867).
+termux_prefix="$TMP/data/data/com.termux/files/usr"
+termux_base="$termux_prefix/var/lib/proot-distro/containers/ccc-mempalace/rootfs/opt/ccc-mempalace"
+termux_meta="$probe_nunchi/termux-mempalace/status.json"
+termux_db="$termux_base/palace/sqlite_exact.sqlite3"
+mkdir -p "$termux_base/palace" "$(dirname "$termux_meta")"
+chmod 700 "$termux_base" "$(dirname "$termux_meta")"
+printf '%s\n' 'ccc-node #867 managed container' > "$termux_base/.ccc-node-managed"
+printf '%s\n' '{"schema":"ccc.termux-mempalace.install.v1","enabled":true,"provider":"codex","source":"/redacted","state":"ready","container":"ccc-mempalace","version":"3.6.0","updated_at":190}' > "$termux_meta"
+chmod 600 "$termux_base/.ccc-node-managed" "$termux_meta"
+python3 - "$termux_db" <<'PY'
+import sqlite3, sys
+db=sqlite3.connect(sys.argv[1])
+db.execute("CREATE TABLE documents(id TEXT PRIMARY KEY, document TEXT NOT NULL)")
+db.executemany("INSERT INTO documents VALUES (?, ?)", [("one", "PROBE_TERMUX_SECRET"), ("two", "hidden")])
+db.commit(); db.close()
+PY
+out="$(HOME="$probe_home" PREFIX="$termux_prefix" \
+  CCC_CLAUDE_DIR="$probe_claude" CCC_STATE_DIR="$probe_state" \
+  CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" \
+  CCC_MEMORY_CHECK_NOW_EPOCH=200 CCC_NUNCHI_CRONTAB_TEXT="$probe_cron" \
+  bash "$ROOT/scripts/ccc-memory-check.sh" --json 2>&1)"; rc=$?
+ok "memory check recognizes the managed Termux sqlite_exact palace" \
+  '[ "$rc" = 0 ] && jq -e '\'' .nunchi.status == "ok" and .mempalace.status == "ok" and .mempalace.backend == "sqlite_exact" and .mempalace.integrity == "ok" and .mempalace.embeddings == 2 and .mempalace.index == {status:"ok",sqlite_count:2,hnsw_count:2,divergence:0} '\'' >/dev/null <<<"$out" && ! grep -q "PROBE_TERMUX_SECRET" <<<"$out"'
+printf '%s\n' 'not the managed marker' > "$termux_base/.ccc-node-managed"
+out="$(HOME="$probe_home" PREFIX="$termux_prefix" \
+  CCC_CLAUDE_DIR="$probe_claude" CCC_STATE_DIR="$probe_state" \
+  CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" \
+  CCC_MEMORY_CHECK_NOW_EPOCH=200 CCC_NUNCHI_CRONTAB_TEXT="$probe_cron" \
+  bash "$ROOT/scripts/ccc-memory-check.sh" --json 2>&1)"; rc=$?
+ok "an unsafe Termux palace marker fails readiness closed" \
+  '[ "$rc" = 0 ] && jq -e '\'' .mempalace.status == "degraded" and (.mempalace.reasons | index("palace-error")) != null and .mempalace.backend == "sqlite_exact" '\'' >/dev/null <<<"$out"'
+rm -rf "$probe_nunchi/termux-mempalace"
+
 optional_refresh_status="$TMP/optional-refresh.status.json"
 for refresh_case in missing error stale provider; do
   rm -f "$optional_refresh_status"

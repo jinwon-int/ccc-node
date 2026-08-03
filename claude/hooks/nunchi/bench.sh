@@ -28,7 +28,11 @@ mkdir -p "$NUNCHI_HOME"
 tail -n +2 "$QSET" | while IFS=$'\t' read -r qid category query expect; do
   [ -n "$qid" ] || continue
   start="$(date +%s)"
-  ans="$(python3 "$HERE/nunchi.py" dialectic "$query" --target "$TARGET" 2>&1)"
+  # The loop itself reads the Q-set from stdin. Provider CLIs launched by
+  # nunchi may probe or drain inherited stdin even when the prompt is passed
+  # as argv, which used to consume q2..q5 after the first query. Bench inputs
+  # are fully specified by argv, so isolate every child from the Q-set pipe.
+  ans="$(python3 "$HERE/nunchi.py" dialectic "$query" --target "$TARGET" </dev/null 2>&1)"
   rc=$?
   dur=$(( $(date +%s) - start ))
   {

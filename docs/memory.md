@@ -110,6 +110,28 @@ readiness is evaluated without requiring a refresh. Linux nodes require the
 refresh contract by default; `CCC_NUNCHI_MEMPALACE_REQUIRED` remains the
 explicit policy override.
 
+Termux nodes can opt into the verbatim layer through a dedicated Linux ARM64
+PRoot container instead of attempting unsupported native Android wheels:
+
+```bash
+scripts/install-termux-mempalace.sh --preview --codex
+scripts/install-termux-mempalace.sh --apply --codex
+scripts/install-termux-mempalace.sh --status --json
+```
+
+The installer creates `ccc-mempalace` from Debian 12, pins MemPalace 3.6.0,
+uses `sqlite_exact` with CPU MiniLM and one embedding thread, and installs an
+argv-preserving `~/.local/bin/mempalace` wrapper. It refuses an empty or
+ambiguous transcript source and performs an initial provider-aware refresh
+before declaring the installation ready. A failed refresh rolls live wiring
+back to Termux's `peer_facts-only` behavior while preserving the container for
+diagnosis. `--disable` removes only the managed refresh path and wrapper entry;
+the nunchi facts DB, container, palace, and dependency lock are retained. This
+script intentionally has no destructive container/palace removal mode. The
+standard `ccc-memory-check.sh --json` probe recognizes the owner-only Termux
+metadata and reports the `sqlite_exact` drawer count and integrity without
+reading or returning transcript bodies.
+
 The launcher runs `materialize` before the real Codex CLI and finishes with `exec`, preserving argv, cwd, stdio, exit status, and signals. A refresh error may use a structurally valid private last snapshot; if `status` is not ready, launch fails closed with exit 78. Configure the underlying binary with `CCC_CODEX_REAL_CLI_PATH` (default `codex`), while `CCC_CODEX_CLI_PATH` points to the installed `ccc-codex` wrapper.
 
 The Telegram Codex runtime invokes the same materializer before every `thread/start` or `thread/resume`. In `audience-scoped` mode, the bridge resolves the Telegram route to an opaque scope and owns a separate app-server with `CODEX_HOME` and `CODEX_SQLITE_HOME` fixed at `CCC_MEMORY_AUDIENCE_ROOT/<scope>/codex`. The materializer accepts scoped mode only when those paths, the private/shared scope label, and `CCC_CODEX_AUDIENCE_AUTH_MODE=keyring` all match exactly. Codex credentials must be provisioned in the operating-system keyring; ccc-node never copies `auth.json` or injects an access token. Session browsing remains disabled on the pooled runtime until browsing commands carry a route audience. `CCC_CODEX_MEMORY_MATERIALIZER_PATH` and `CCC_CODEX_MEMORY_BOOTSTRAP_TIMEOUT_SEC` control the thread-boundary bootstrap. `ccc-memory-check.sh --json` exposes the body-free result under `.codex`.
