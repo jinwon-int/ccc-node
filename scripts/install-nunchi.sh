@@ -56,6 +56,7 @@ if [ -n "$TARGET_USER" ] && [ "$TARGET_USER" != "$(id -un)" ]; then
     && [ -n "$target_uid" ] && [ "$(stat -c %u -- "$target_home")" = "$target_uid" ] \
     || { echo "safe target home not found for $TARGET_USER" >&2; exit 2; }
   target_claude_dir="${CCC_CLAUDE_DIR:-$target_home/.claude}"
+  target_codex_home="${CODEX_HOME:-$target_home/.codex}"
   target_state_dir="${CCC_STATE_DIR:-$target_claude_dir/state}"
   target_nunchi_home="${NUNCHI_HOME:-$target_home/.nunchi}"
   target_status="${CCC_NUNCHI_MEMPALACE_STATUS:-$target_nunchi_home/mempalace-refresh.status.json}"
@@ -63,7 +64,7 @@ if [ -n "$TARGET_USER" ] && [ "$TARGET_USER" != "$(id -un)" ]; then
     HOME="$target_home" USER="$TARGET_USER" LOGNAME="$TARGET_USER" \
     PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
     CCC_NUNCHI_TARGET_USER="$TARGET_USER" CCC_NUNCHI_PROVIDER="$PROVIDER" \
-    CCC_CLAUDE_DIR="$target_claude_dir" CCC_STATE_DIR="$target_state_dir" \
+    CCC_CLAUDE_DIR="$target_claude_dir" CODEX_HOME="$target_codex_home" CCC_STATE_DIR="$target_state_dir" \
     NUNCHI_HOME="$target_nunchi_home" NUNCHI_DB="${NUNCHI_DB:-$target_nunchi_home/facts.db}" \
     NUNCHI_SNAPSHOT="${NUNCHI_SNAPSHOT:-$target_nunchi_home/snapshot.md}" \
     CCC_NUNCHI_MEMPALACE_STATUS="$target_status" \
@@ -76,6 +77,7 @@ if [ -n "$TARGET_USER" ] && [ "$TARGET_USER" != "$(id -un)" ]; then
 fi
 
 CLAUDE_DIR="${CCC_CLAUDE_DIR:-$HOME/.claude}"
+CODEX_HOME_DIR="${CODEX_HOME:-$HOME/.codex}"
 STATE="${CCC_STATE_DIR:-$CLAUDE_DIR/state}"
 HOOKS="$CLAUDE_DIR/hooks/nunchi"
 NUNCHI_DIR="${NUNCHI_HOME:-$HOME/.nunchi}"
@@ -111,16 +113,66 @@ raise SystemExit(0 if safe else 1)
 PY
 }
 
+# Body-free status renderers for the enriched nunchi status (#865). These
+# report provider wiring, source, binary, and the last collection result
+# without ever printing transcript body, excerpts, session ids or credentials.
+_status_provider_match() {  # <configured> <runtime>
+  local configured="$1" runtime="$2"
+  [ "$configured" = none ] && { printf 'n/a'; return; }
+  [ "$runtime" = auto ] && { printf 'auto'; return; }
+  [ "$configured" = "$runtime" ] && printf 'ok' || printf 'DRIFT'
+}
+
+_status_source() {  # <cron-text> -> "kind=<mine|sweep> path=<dir>" or "none"
+  python3 - "$1" <<'PY'
+import re, sys
+cron = sys.argv[1]
+m = re.search(r'mempalace-refresh\.sh\s+(\w+)\s+(.+?)\s*>>', cron)
+if not m:
+    print("none")
+else:
+    provider, path = m.group(1), m.group(2).strip()
+    kind = "mine" if provider == "codex" else "sweep"
+    if len(path) >= 2 and path[0] in "\"'" and path[-1] == path[0]:
+        path = path[1:-1]  # strip a single layer of cron shell-quoting (path only)
+    print(f"kind={kind} path={path}")
+PY
+}
+
+_status_collection() {  # <status-file> -> "state=<s> exit_code=<n> finished_at=<ts>" or "none"
+  python3 - "$1" <<'PY'
+import json, sys
+try:
+    with open(sys.argv[1]) as handle:
+        d = json.load(handle)
+    print(f"state={d.get('state', '?')} exit_code={d.get('exit_code', '?')} "
+          f"finished_at={d.get('finished_at', d.get('started_at', '?'))}")
+except Exception:
+    print("none")
+PY
+}
+
 status() {
-  local codex_loader_status="MISSING/UNSAFE" cron provider="missing"
-  if validate_codex_loader; then codex_loader_status="present"; fi
+  local cron configured="none" runtime_provider mp_path mp_ver
   cron="$("$CRONTAB" -l 2>/dev/null || true)"
-  grep -q 'codex-feed.sh' <<<"$cron" && provider="codex"
-  grep -q 'ingest-cron.sh' <<<"$cron" && provider="claude"
-  echo "runtime: user=$(id -un) home=$HOME provider=$provider"
+  runtime_provider="${CCC_AGENT_PROVIDER:-auto}"
+  grep -q 'codex-feed.sh'  <<<"$cron" && configured="codex"
+  grep -q 'ingest-cron.sh' <<<"$cron" && configured="claude"
+  mp_path="${CCC_NUNCHI_MEMPALACE_CLI:-$(command -v mempalace || true)}"
+  [ -z "$mp_path" ] && [ -x "$HOME/.local/bin/mempalace" ] && mp_path="$HOME/.local/bin/mempalace"
+  mp_ver="none"
+  if [ -n "$mp_path" ] && [ -x "$mp_path" ]; then
+    mp_ver="$("$mp_path" --version 2>/dev/null | tail -1 | tr -d '\r' || true)"
+    [ -n "$mp_ver" ] || mp_ver="unknown"
+  fi
+  echo "runtime: user=$(id -un) home=$HOME"
+  echo "provider: configured=$configured runtime=$runtime_provider match=$(_status_provider_match "$configured" "$runtime_provider")"
+  echo "source: $(_status_source "$cron")"
+  echo "mempalace: binary=${mp_path:-missing} version=$mp_ver"
+  echo "collection: $(_status_collection "$MEMPALACE_STATUS")"
   echo "mode: $(cat "$MODE_FILE" 2>/dev/null || echo off)"
   echo "hooks: $([ -f "$HOOKS/nunchi.py" ] && echo present || echo MISSING) ($HOOKS)"
-  echo "codex loader: $codex_loader_status"
+  echo "codex_loader: $(if validate_codex_loader; then echo present; else echo MISSING/UNSAFE; fi)"
   echo "cron: $(grep -cF "$MARK" <<<"$cron" || true) line(s)"
   echo "db: $(ls -la "$NUNCHI_DIR/facts.db" 2>/dev/null | awk '{print $5" bytes"}' || echo none)"
 }
@@ -231,7 +283,7 @@ detect_provider() {
   fi
   if grep -q 'Codex: healthy' <<<"$bridge_status"; then printf 'codex'; return; fi
   if grep -q 'Claude: healthy' <<<"$bridge_status"; then printf 'claude'; return; fi
-  if [ -d "$HOME/.codex/sessions" ] && [ ! -d "$HOME/.claude/projects" ]; then
+  if [ -d "$CODEX_HOME_DIR/sessions" ] && [ ! -d "$CLAUDE_DIR/projects" ]; then
     printf 'codex'
   else
     printf 'claude'
@@ -241,6 +293,7 @@ detect_provider() {
 case "$ACTION" in
   apply)
     [ -f "$HOOKS/nunchi.py" ] || { echo "hooks missing at $HOOKS — run setup.sh first" >&2; exit 2; }
+    mkdir -p "$NUNCHI_DIR"; chmod 700 "$NUNCHI_DIR"  # owner-only: logs/state stay private (#865)
     resolved_provider="$(detect_provider)"
     if [ "$resolved_provider" = "codex" ] && ! validate_codex_loader; then
       echo "Codex nunchi loader missing or unsafe at $HOOKS/codex-loader.py — run setup.sh first" >&2
@@ -252,8 +305,8 @@ case "$ACTION" in
     mp="${CCC_NUNCHI_MEMPALACE_CLI:-}"
     [ -n "$mp" ] || mp="$(command -v mempalace || true)"
     [ -z "$mp" ] && [ -x "$HOME/.local/bin/mempalace" ] && mp="$HOME/.local/bin/mempalace"
-    default_sweep="$HOME/.claude/projects"
-    [ "$resolved_provider" = "codex" ] && default_sweep="$HOME/.codex/sessions"
+    default_sweep="$CLAUDE_DIR/projects"
+    [ "$resolved_provider" = "codex" ] && default_sweep="$CODEX_HOME_DIR/sessions"
     sweep_dir="${NUNCHI_SWEEP_DIR:-$default_sweep}"
     refresh="$HOOKS/mempalace-refresh.sh"
     refresh_ready=0
