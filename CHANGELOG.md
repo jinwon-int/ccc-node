@@ -91,6 +91,18 @@ All notable changes to the Claude Code node harness. Dates are KST.
   composition is unchanged. (#749)
 
 ### Fixed
+- self-update is now registered as an agent-cron task by `setup.sh` so the
+  harness can actually auto-update. Previously no `self-update` task was ever
+  registered, so a deferred run (bridge busy) had no scheduled tick to retry
+  on, and a node could go days without receiving merged fixes — gwakga had
+  the timer active but the task absent, so #908 (1 MiB NDJSON limit) never
+  applied. `setup.sh` now idempotently adds a `self-update` task (opt out
+  with `CCC_SELF_UPDATE_REGISTER_CRON=false`; schedule via
+  `CCC_SELF_UPDATE_CRON`, default four times daily) using `--success-exit-codes
+  0,8,11` so a clean update, a bridge-busy defer, and a no-allowlist degraded
+  run do not raise on-failure alerts. The agent-cron timer is still installed
+  separately. docs/self-update.md no longer claims "the next scheduled tick
+  retries" without that precondition (#909).
 - self-update no longer reports `result:"ok"` / "services restarted: 0" when
   the code changed but no service was restarted because the services allowlist
   file (`self-update.services`) was missing or empty. That silent code/runtime

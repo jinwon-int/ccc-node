@@ -415,6 +415,22 @@ installed_hook_scripts=(
   "$CLAUDE_DIR/hooks/ccc-self-update.sh"
 )
 run chmod +x "${installed_hook_scripts[@]}" "${hook_tree_targets[@]}"
+# #909: register a self-update agent-cron task so the harness auto-updates on
+# nodes that run the agent-cron timer. `add` rejects a duplicate id, so this is
+# idempotent (a re-run is a no-op once the task exists). Opt out with
+# CCC_SELF_UPDATE_REGISTER_CRON=false. successExitCodes 0,8,11 treats a clean
+# update, a bridge-busy defer (8), and a no-services-allowlist degraded run
+# (11) as non-failures so on-failure alerts fire only for real aborts.
+if [ "${CCC_SELF_UPDATE_REGISTER_CRON:-true}" != "false" ] && [ "$DRY" != 1 ] && [ -x "$SRC/scripts/agent-cron.sh" ]; then
+  if CCC_AGENT_CRON_STORE="$CLAUDE_DIR/state/agent-cron/tasks.json" \
+       "$SRC/scripts/agent-cron.sh" add self-update \
+         --schedule "${CCC_SELF_UPDATE_CRON:-17 4,10,16,22 * * *}" \
+         --notify telegram-owner-on-failure \
+         --success-exit-codes 0,8,11 \
+         --argv "$CLAUDE_DIR/hooks/ccc-self-update.sh" run >/dev/null 2>&1; then
+    note "registered self-update agent-cron task (id=self-update; timer must be installed separately)"
+  fi
+fi
 # Tier 3: status line (node·model·git·context·cost·A2A) wired via settings.json statusLine.
 # Output style (한국어 구조화 보고) — node-agnostic; settings.json activates it as outputStyle.
 run mkdir -p "$CLAUDE_DIR/output-styles"
