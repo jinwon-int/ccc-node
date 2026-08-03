@@ -377,6 +377,23 @@ out="$(CCC_AGENT_CRON_STORE="$PAYLOAD_STORE" bash "$CMD" run cmd-slow --json --a
 ok "command payload times out with distinct status" '[ "$rc" = 1 ] && jq -e ".status == \"timeout\" and .headless.exitCode == 124 and .headless.timedOut == true" <<<"$out" >/dev/null'
 out="$(CCC_AGENT_CRON_STORE="$PAYLOAD_STORE" CCC_HEADLESS_CMD="$FAKE_HEADLESS" bash "$CMD" run model-task --json --at 2026-01-01T00:01:00Z)"; rc=$?
 ok "prompt payload model override reaches headless env" '[ "$rc" = 0 ] && grep -q "model=claude-test-model" "$FAKE_HEADLESS_LOG"'
+
+# --- #911: successExitCodes (watch-type exit 1 = findings, not failure) + lastExitCode ---
+SUCCESS_EXIT_STORE="$TMP/success-exit-store/tasks.json"
+mkdir -p "$(dirname "$SUCCESS_EXIT_STORE")"
+cat > "$SUCCESS_EXIT_STORE" <<'JSON'
+{"version":1,"tasks":[
+{"id":"watch-findings","schedule":"* * * * *","prompt":"fleet watch","enabled":true,"notify":"none","payload":{"kind":"command","argv":["sh","-c","echo DOWN=1; exit 1"]},"successExitCodes":[0,1]},
+{"id":"real-fail","schedule":"* * * * *","prompt":"real failure","enabled":true,"notify":"none","payload":{"kind":"command","argv":["sh","-c","echo boom; exit 2"]}}
+]}
+JSON
+out="$(CCC_AGENT_CRON_STORE="$SUCCESS_EXIT_STORE" bash "$CMD" run watch-findings --json --at 2026-01-01T00:01:00Z)"; rc=$?
+ok "watch task exit 1 with successExitCodes[0,1] is success-with-findings" '[ "$rc" = 0 ] && jq -e ".ok == true and .status == \"success\" and .headless.exitCode == 1" <<<"$out" >/dev/null'
+ok "watch success records lastStatus success and no retryState" 'jq -e ".tasks[] | select(.id == \"watch-findings\" and .lastStatus == \"success\" and ((has(\"retryState\") | not) or .retryState == null))" "$SUCCESS_EXIT_STORE" >/dev/null'
+out="$(CCC_AGENT_CRON_STORE="$SUCCESS_EXIT_STORE" bash "$CMD" run real-fail --json --at 2026-01-01T00:01:00Z 2>&1)"; rc=$?
+ok "real fail exit 2 with default codes is failed and records no retryState" '[ "$rc" = 1 ] && jq -e ".ok == false and .status == \"failed\" and .headless.exitCode == 2" <<<"$out" >/dev/null && jq -e ".tasks[] | select(.id == \"real-fail\" and .lastStatus == \"failed\" and ((has(\"retryState\") | not) or .retryState == null))" "$SUCCESS_EXIT_STORE" >/dev/null'
+out="$(CCC_AGENT_CRON_STORE="$SUCCESS_EXIT_STORE" bash "$CMD" status --json --at 2026-01-01T00:02:00Z)"; rc=$?
+ok "status exposes lastExitCode derived from runHistory" '[ "$rc" = 0 ] && jq -e ".tasks[] | select(.id == \"watch-findings\" and .lastExitCode == 1)" <<<"$out" >/dev/null && jq -e ".tasks[] | select(.id == \"real-fail\" and .lastExitCode == 2)" <<<"$out" >/dev/null'
 out="$(CCC_AGENT_CRON_STORE="$PAYLOAD_STORE" bash "$CMD" run cmd-ok --dry-run --json --at 2026-01-01T00:02:00Z)"; rc=$?
 ok "dry-run previews command payload metadata" '[ "$rc" = 0 ] && jq -e ".headless.payloadKind == \"command\" and .headless.argvLen == 3" <<<"$out" >/dev/null'
 

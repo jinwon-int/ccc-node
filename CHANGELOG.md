@@ -91,6 +91,17 @@ All notable changes to the Claude Code node harness. Dates are KST.
   composition is unchanged. (#749)
 
 ### Fixed
+- agent-cron no longer mislabels a watch-type task that exits non-zero to
+  signal findings as `failed` → `retry-exhausted`. A task-definition
+  `successExitCodes` (CLI `--success-exit-codes 0,1`, default `[0]`) now
+  classifies those exits as successful runs-with-findings; only codes outside
+  the set (2+, 127 command-missing, 124 timeout) count as `failed`. A task
+  that declared **no** `retryPolicy` has no retry concept and is never
+  labelled `retry-exhausted` (its failures stay plain `failed`). `status`
+  exposes `lastExitCode` so an operator can tell `1` (findings) from `127`
+  (command missing) without digging into logs (#911, measured on gwakga
+  2026-08-03: `adapter-fleet-watch`/`fleet-doctor-sweep` showed
+  `retry-exhausted` while actually reporting 11/12 nodes OK).
 - Telegram bridge turns no longer die on image-bearing tool results. The
   Claude adapter never set `ClaudeAgentOptions.max_buffer_size`, so the SDK
   used its own 1 MiB stdout NDJSON limit and one oversized line raised

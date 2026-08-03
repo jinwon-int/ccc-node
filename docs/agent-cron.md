@@ -6,7 +6,7 @@
 
 - `scripts/agent-cron.sh add <task-id> --schedule EXPR --prompt TEXT [flags] [--json]` —
   create a task (validated, atomic write; no execution). See `--help` for flags
-  (timezone, notify, allowed-tools, payload `--argv/--cwd/--model/--timeout-sec`,
+  (timezone, notify, allowed-tools, `--success-exit-codes 0,1`, payload `--argv/--cwd/--model/--timeout-sec`,
   `--not-before`, `--max-runs`, `--keep-after-run`, `--disabled`, ...).
 - `scripts/agent-cron.sh edit <task-id> [same flags as add] [--json]` — set-only
   partial update (schedule/timezone re-validated; payload flags merge, `--argv`
@@ -79,6 +79,15 @@ A timed-out run records status `timeout` (exit code 124) and consumes the
 normal retry policy. Cross-field payload rules (argv required for command,
 argv/cwd rejected for prompt) are enforced fail-closed by `validate` and on
 load.
+
+By default only exit code `0` counts as success. A watch-type task that
+**exits non-zero to signal findings** (e.g. a fleet node is DOWN) would be
+mislabeled `failed` → `retry-exhausted`. Set `--success-exit-codes 0,1` so
+exit 1 is recorded as a successful run-with-findings; only codes outside the
+set (2+, 127, 124-timeout) count as `failed`. `status` shows `lastExitCode`
+so an operator can tell `1` (findings) from `127` (command missing) at a
+glance. A task that declared **no** `retryPolicy` has no retry concept and is
+never labelled `retry-exhausted` — its failures stay plain `failed`.
 
 ## Notify modes
 
