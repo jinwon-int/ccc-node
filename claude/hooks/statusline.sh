@@ -18,7 +18,7 @@ eval "$(jq -r '
   @sh "OVER=\(.exceeds_200k_tokens // false)",
   @sh "STYLE=\(.output_style.name // "")",
   @sh "CWD=\(.workspace.current_dir // .cwd // "")"
-' <<<"$input" 2>/dev/null)"
+' <<<"$input" 2>/dev/null || true)"
 
 # Sanitize PCT to integer
 PCT="${PCT%%.*}"
