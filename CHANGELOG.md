@@ -5,6 +5,23 @@ All notable changes to the Claude Code node harness. Dates are KST.
 ## [Unreleased]
 
 ### Added
+- Request lifecycle leak diagnostics (#860): Three-layer defense against zombie
+  requests that cause `active_requests` to exceed actual turn count:
+  1. WARN-level race condition logging in `register_active()` — emits
+     diagnostic details (user/chat IDs, existing token, age, turn kind) when a
+     turn registration is refused due to an already-active turn, helping identify
+     background-task notification vs user turn races.
+  2. WARN-level token mismatch logging in `deactivate_if_same()` — logs when
+     deactivate fails due to token mismatch, exposing abandoned turns that fail to
+     clean up and become zombies.
+  3. Emergency cleanup: `force_cleanup_stale_turns(max_age_seconds)` — last-resort
+     cleanup mechanism for zombie turns older than a threshold, callable from health
+     monitor when `active_requests` grows unexpectedly. Returns count of cleaned-up
+     zombies for observability.
+
+  This addresses the gwakga incident where `active_requests=4` but only 1 turn was
+  executing, with the oldest zombie lasting 22401s (6.2 hours) beyond the
+  21600s `CLAUDE_PROCESS_TIMEOUT` deadline.
 - Error message diagnostics (#901): When `is_error=True` and `result` is empty,
   the bridge now includes `subtype`, `api_error_status`, and `terminal_reason`
   fields in the user-facing error message instead of the generic "Claude turn failed".

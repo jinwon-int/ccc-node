@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import fields
+from typing import Any
 
 from telegram_bot.core.agent_session_registry import AgentSessionRegistry
 from telegram_bot.core.project_chat_types import AgentSessionEntry
+
+# For type annotation support in tests
+logging.getLogger(__name__)  # Silence unused import warning
 
 
 def test_cached_slots_use_exact_tokens_and_monotonic_touch() -> None:
@@ -161,3 +166,105 @@ def test_terminal_drain_snapshot_revokes_approval_without_rebinding_owner() -> N
     # Teardown still owns the exact active handle; a future turn cannot acquire
     # this generation or inherit its revoked approval route.
     assert registry.active_handle_if_same(token) == handles[0]
+
+
+def test_register_active_race_condition_logs_warning(caplog: Any) -> None:
+    """Per #860: race condition between turns emits WARN with diagnostics."""
+
+    registry = AgentSessionRegistry()
+    key = (7, 70)  # user_id, chat_id
+    session = object()
+
+    # Register first turn
+    registry.register_active(key, session, started_at=1.0)
+
+    # Attempt to register second turn while first is still active
+    import pytest
+    with pytest.raises(RuntimeError, match="already active"):
+        registry.register_active(key, object(), started_at=2.0)
+
+    # Verify warning was logged with diagnostic details
+    assert len(caplog.records) == 1
+    log_message = caplog.records[0].message
+    assert "Request lifecycle race detected" in log_message
+    assert "user=7" in log_message
+    assert "chat=70" in log_message
+    assert "existing_token=" in log_message
+    assert "started_at=" in log_message
+
+
+def test_deactivate_token_mismatch_logs_warning(caplog: Any) -> None:
+    """Per #860: deactivate with wrong token logs warning."""
+    import logging
+
+    # Enable caplog for WARNING level
+    caplog.set_level(logging.WARNING)
+
+    registry = AgentSessionRegistry()
+    key = (7, 70)
+    session = object()
+
+    token = registry.register_active(key, session, started_at=1.0)
+
+    # Create wrong token by using different generation
+    from telegram_bot.core.agent_session_registry import ActiveToken
+    wrong_token = ActiveToken(key, token.generation + 1)
+
+    result = registry.deactivate_if_same(wrong_token)
+
+    # Verify deactivate failed
+    assert result is False
+
+    # Verify warning was logged
+    assert len(caplog.records) >= 1
+    log_message = caplog.records[-1].message
+    assert "Deactivate failed: token mismatch" in log_message
+    assert "user=7" in log_message
+
+
+def test_force_cleanup_stale_turns_removes_zombies() -> None:
+    """Per #860: emergency cleanup removes turns older than threshold."""
+
+    registry = AgentSessionRegistry()
+    key = (7, 70)
+    session = object()
+
+    # Register a turn and abandon it (simulate zombie)
+    registry.register_active(key, session, started_at=1.0)
+
+    # Verify it's counted as active
+    metrics = registry.metrics()
+    assert metrics.active_sessions == 1
+
+    # Force cleanup turns older than 0 seconds (removes everything)
+    cleaned = registry.force_cleanup_stale_turns(max_age_seconds=0.0)
+
+    # Verify zombie was removed
+    assert cleaned == 1
+    metrics_after = registry.metrics()
+    assert metrics_after.active_sessions == 0
+
+
+def test_force_cleanup_respects_age_threshold() -> None:
+    """Per #860: cleanup only removes turns exceeding threshold."""
+    import time
+
+    registry = AgentSessionRegistry()
+    key = (7, 70)
+    session = object()
+
+    # Register a fresh turn
+    registry.register_active(key, session, started_at=time.time())
+
+    # Force cleanup with generous threshold
+    cleaned = registry.force_cleanup_stale_turns(max_age_seconds=3600.0)
+
+    # Verify fresh turn was preserved
+    assert cleaned == 0
+    metrics = registry.metrics()
+    assert metrics.active_sessions == 1
+
+
+if __name__ == "__main__":
+    import pytest
+    raise SystemExit(pytest.main([__file__]))

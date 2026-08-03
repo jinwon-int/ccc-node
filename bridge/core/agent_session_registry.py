@@ -7,10 +7,14 @@ remain the responsibility of ``ProjectChatHandler``.
 
 from __future__ import annotations
 
+import logging
+import time
 from dataclasses import dataclass
 from typing import Any, TypeAlias
 
 from telegram_bot.core.project_chat_types import AgentSessionEntry
+
+logger = logging.getLogger(__name__)
 
 
 StreamKey: TypeAlias = tuple[int, int]
@@ -207,6 +211,22 @@ class AgentSessionRegistry:
     ) -> ActiveToken:
         record = self._record(key)
         if record.active is not None:
+            # Per #860: log race condition with diagnostic details.
+            # This helps identify when background-task notification turns race
+            # with user turns, causing zombie requests.
+            user_id = key[0]
+            chat_id = key[1] if len(key) > 1 else None
+            age = started_at - record.active.started_at
+            logger.warning(
+                "Request lifecycle race detected: refusing to register new turn "
+                "while one is already active (user=%s, chat=%s, existing_token=%s, "
+                "started_at=%.2fs ago, kind=%s)",
+                user_id,
+                chat_id,
+                record.active.token,
+                age,
+                "background-task" if record.active.waiting_for_turn else "user",
+            )
             raise RuntimeError("agent turn is already active for this conversation")
         generation = self._generation_high_water.get(key, 0) + 1
         self._generation_high_water[key] = generation
@@ -270,6 +290,23 @@ class AgentSessionRegistry:
         record = self._records.get(token.key)
         active = record.active if record is not None else None
         if record is None or active is None or active.token != token:
+            # Per #860: log deactivate failure with diagnostic details.
+            # This helps identify zombie requests that fail to clean up.
+            user_id = token.key[0]
+            chat_id = token.key[1] if len(token.key) > 1 else None
+            actual_token = active.token if active else None
+            age = (time.time() - active.started_at) if active else 0
+            logger.warning(
+                "Deactivate failed: token mismatch indicates abandoned turn "
+                "(user=%s, chat=%s, expected_token=%s, actual_token=%s, "
+                "active_age=%.2fs, waiting=%s)",
+                user_id,
+                chat_id,
+                token,
+                actual_token,
+                age,
+                active.waiting_for_turn if active else False,
+            )
             return False
         if (
             touch_at is not None
@@ -347,6 +384,46 @@ class AgentSessionRegistry:
             record is not None
             and (record.cached is not None or record.active is not None)
         )
+
+    def force_cleanup_stale_turns(self, *, max_age_seconds: float) -> int:
+        """Emergency cleanup of zombie turns older than threshold.
+
+        Per #860: called from health monitor when active_requests grows
+        unexpectedly. This is a last-resort cleanup mechanism when normal
+        request lifecycle fails due to race conditions or abandons.
+
+        Returns the count of cleaned-up zombie turns.
+
+        Args:
+            max_age_seconds: Age threshold in seconds; turns older than this
+                are considered abandoned and will be force-removed.
+
+        Returns:
+            Number of zombie turns cleaned up.
+        """
+        cleaned = 0
+        now = time.time()
+        for key, record in tuple(self._records.items()):
+            active = record.active
+            if active is None:
+                continue
+            age = now - active.started_at
+            if age > max_age_seconds:
+                user_id = key[0]
+                chat_id = key[1] if len(key) > 1 else None
+                logger.error(
+                    "FORCE CLEANUP: removing zombie turn older than threshold "
+                    "(user=%s, chat=%s, age=%.2fs, token=%s, waiting=%s)",
+                    user_id,
+                    chat_id,
+                    age,
+                    active.token,
+                    active.waiting_for_turn,
+                )
+                record.active = None
+                self._prune(key)
+                cleaned += 1
+        return cleaned
 
     def metrics(self) -> AgentSessionMetrics:
         resident = 0
