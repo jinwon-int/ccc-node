@@ -970,7 +970,9 @@ ok "memory eval does not overwrite external memory/cache dirs by default" 'grep 
 install_home="$TMP/install-home"
 install_claude="$TMP/install-claude"
 install_hermes="$TMP/install-hermes"
-out="$(HOME="$install_home" CCC_CLAUDE_DIR="$install_claude" CCC_HERMES_DIR="$install_hermes" bash "$ROOT/setup.sh" --no-backup >/dev/null 2>&1; echo rc=$?)"
+# Route the full-setup systemd reconcile away from the live tree (#885): the
+# renderer refuses a scratch tmp HOME unless the CCC_SYSTEMD_DIR seam is set.
+out="$(HOME="$install_home" CCC_CLAUDE_DIR="$install_claude" CCC_HERMES_DIR="$install_hermes" CCC_SYSTEMD_DIR="$TMP/install-systemd-seam" CCC_SYSTEMCTL=/bin/true bash "$ROOT/setup.sh" --no-backup >/dev/null 2>&1; echo rc=$?)"
 ok "setup installs memory helper tools beside hooks" 'grep -q "rc=0" <<<"$out" && [ -x "$install_claude/hooks/ccc-memory-index.sh" ] && [ -x "$install_claude/hooks/ccc-memory-search.sh" ] && [ -x "$install_claude/hooks/ccc-memory-query.sh" ] && [ -x "$install_claude/hooks/ccc-memory-explain.sh" ] && [ -x "$install_claude/hooks/ccc-wiki-triage.sh" ] && [ -x "$install_claude/hooks/ccc-memory-benchmark-export.sh" ]'
 ok "setup installs the shared detached-spawn helper" '[ -x "$install_claude/hooks/lib/spawn-detached.sh" ]'
 out="$(CCC_STATE_DIR="$TMP/install-eval-state" bash "$install_claude/hooks/ccc-memory-eval.sh" Honcho 2>&1)"; rc=$?
