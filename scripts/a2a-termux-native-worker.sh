@@ -41,12 +41,14 @@
 # `exec` and never return, so their rc propagates naturally.
 set -uo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 # The env-validation subcommands (check / run / print-command) delegate to
 # this executable.  Overridable via A2A_PYTHON_HARNESS so unit tests can
 # substitute a bash mock without needing a real Python worker.
 PYTHON_HARNESS="${A2A_PYTHON_HARNESS:-$ROOT/scripts/a2a_termux_native_worker.py}"
+# shellcheck source=scripts/lib/a2a-supervisor-identity.sh
+. "$SCRIPT_DIR/lib/a2a-supervisor-identity.sh"
 
 # Fixed by BROKER_URL validation in a2a_termux_native_worker.py: the local
 # tunnel port must be 18790.  Remote endpoint is overridable in case a future
@@ -103,61 +105,119 @@ except FileNotFoundError:
 PY
 }
 
-# Kill orphan SSH tunnels bound to our local port (parent=1 == orphaned).
+# Print SSH PIDs whose argv exactly matches this supervisor's forward, remote
+# endpoint, and target.  Never use a same-port pgrep as a kill selector: another
+# service may legitimately own a different forward on the same local port in a
+# separate network namespace.
+owned_tunnel_records() {
+    local port="$1" remote="$2" target="$3"
+    python3 - "$port" "$remote" "$target" <<'PY'
+import glob
+import os
+import sys
+
+forward = f"127.0.0.1:{sys.argv[1]}:{sys.argv[2]}"
+target = sys.argv[3]
+for path in glob.glob("/proc/[0-9]*/cmdline"):
+    try:
+        argv = [os.fsdecode(arg) for arg in open(path, "rb").read().split(b"\0") if arg]
+    except OSError:
+        continue
+    if not argv or os.path.basename(argv[0]) != "ssh" or "-N" not in argv:
+        continue
+    owns_forward = any(
+        (arg == "-L" and index + 1 < len(argv) and argv[index + 1] == forward)
+        or arg == "-L" + forward
+        for index, arg in enumerate(argv)
+    )
+    if owns_forward and argv[-1] == target:
+        try:
+            fields = open(path.replace("cmdline", "stat"), encoding="ascii").read().rsplit(") ", 1)[1].split()
+            start_token = fields[19]
+        except (OSError, IndexError):
+            continue
+        print(path.split("/")[2], start_token)
+PY
+}
+
+tunnel_identity_matches() {
+    local expected_pid="$1" expected_token="$2" port="$3" remote="$4" target="$5" pid token
+    a2a_process_identity_matches "$expected_pid" "$expected_token" || return 1
+    while read -r pid token; do
+        [[ "$pid" == "$expected_pid" && "$token" == "$expected_token" ]] && return 0
+    done < <(owned_tunnel_records "$port" "$remote" "$target")
+    return 1
+}
+
+# Kill orphan SSH tunnels owned by this exact supervisor configuration
+# (parent=1 == orphaned).
 # Called at `supervise` start so a stuck ssh from a previous cycle can't
 # hold the port and starve the fresh tunnel.
 cleanup_orphans() {
-    local port="$1" pid ppid
-    while IFS= read -r pid; do
+    local port="$1" remote="$2" target="$3" pid token ppid
+    while read -r pid token; do
         [[ -z "$pid" ]] && continue
-        ppid=$(awk '/^PPid:/ {print $2}' "/proc/$pid/status" 2>/dev/null || echo "")
-        if [[ "$ppid" == "1" ]]; then
+        ppid=$(a2a_process_parent_pid "$pid" 2>/dev/null || true)
+        if [[ "$ppid" == "1" ]] && \
+                tunnel_identity_matches "$pid" "$token" "$port" "$remote" "$target"; then
             log "cleanup orphan ssh pid=$pid"
             kill -TERM "$pid" 2>/dev/null || true
             sleep 1
-            kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null || true
+            tunnel_identity_matches "$pid" "$token" "$port" "$remote" "$target" && \
+                kill -KILL "$pid" 2>/dev/null || true
         fi
-    done < <(pgrep -f "ssh -N.*-L 127\.0\.0\.1:${port}:" 2>/dev/null || true)
+    done < <(owned_tunnel_records "$port" "$remote" "$target")
 }
 
 # Walk pgrep -P recursively and kill each descendant, then the root.  The
 # `pkill -f` approach used to fail here because a supervisor's SIGTERM only
 # hit its immediate subshell, leaving the ssh grandchild orphaned.
 kill_tree() {
-    local root="$1"
+    local root="$1" expected_parent="${2:-}" token current_parent
     [[ -z "$root" || "$root" -le 1 ]] && return 0
+    token=$(a2a_process_start_token "$root" 2>/dev/null) || return 0
+    if [[ -n "$expected_parent" ]]; then
+        current_parent=$(a2a_process_parent_pid "$root" 2>/dev/null || true)
+        [[ "$current_parent" == "$expected_parent" ]] || return 0
+    fi
     local child
     for child in $(pgrep -P "$root" 2>/dev/null || true); do
-        kill_tree "$child"
+        kill_tree "$child" "$root"
     done
+    a2a_process_identity_matches "$root" "$token" || return 0
     kill -TERM "$root" 2>/dev/null || true
     local i
     for i in 1 2 3 4; do
-        kill -0 "$root" 2>/dev/null || return 0
+        a2a_process_identity_matches "$root" "$token" || return 0
         sleep 1
     done
-    kill -KILL "$root" 2>/dev/null || true
+    a2a_process_identity_matches "$root" "$token" && kill -KILL "$root" 2>/dev/null || true
 }
 
-# Best-effort final sweep for any remaining ssh -N forwarding our local port.
-# Runs after kill_tree in the EXIT trap as belt-and-suspenders.
+# Best-effort final sweep for any remaining ssh -N forwarding our exact owned
+# endpoint.  Runs after kill_tree in the EXIT trap as belt-and-suspenders.
 sweep_lingering_ssh() {
-    local port="$1" pid
-    while IFS= read -r pid; do
+    local port="$1" remote="$2" target="$3" pid token
+    while read -r pid token; do
         [[ -z "$pid" ]] && continue
-        kill -KILL "$pid" 2>/dev/null || true
-    done < <(pgrep -f "ssh -N.*-L 127\.0\.0\.1:${port}:" 2>/dev/null || true)
+        tunnel_identity_matches "$pid" "$token" "$port" "$remote" "$target" && \
+            kill -KILL "$pid" 2>/dev/null || true
+    done < <(owned_tunnel_records "$port" "$remote" "$target")
 }
 
-# Read the PID stashed by cmd_supervise.  Empty if no supervisor is running
-# or the PID file is stale.  Avoids `fuser`, whose output format is not
-# portable across Termux/Linux and BSDs.
+# Read the PID identity stashed by cmd_supervise.  Empty if no canonical
+# supervisor is running or the PID/start-token record is stale.
+current_supervisor_record() {
+    a2a_current_supervisor_record "$PIDFILE" \
+        "$SCRIPT_DIR/a2a-termux-native-worker.sh" "$LOCK"
+}
+
 current_supervisor_pid() {
-    [[ -f "$PIDFILE" ]] || return 0
-    local pid
-    pid=$(head -n1 "$PIDFILE" 2>/dev/null | tr -d '[:space:]')
-    [[ -n "$pid" && "$pid" =~ ^[0-9]+$ ]] || return 0
-    kill -0 "$pid" 2>/dev/null && printf '%s' "$pid" || return 0
+    local record pid _token
+    record=$(current_supervisor_record)
+    [[ -n "$record" ]] || return 0
+    read -r pid _token <<<"$record"
+    printf '%s' "$pid"
 }
 
 # True on a Termux runtime.  Used to gate env sanitization so Linux CI and any
@@ -226,13 +286,17 @@ cmd_supervise() {
         log "supervise: another instance holds $LOCK; exiting"
         return 3
     fi
-    # Stash our PID in a sibling file (separate from the flock fd) so tests,
-    # `stop`, `status`, and the health checker can identify us reliably.  A
-    # normal shell redirect here flushes on close.
-    printf '%d\n' "$$" > "$PIDFILE"
+    # Stash PID + kernel start token in a sibling file so a recycled numeric
+    # PID can never make stop/status target an unrelated process.
+    if ! a2a_write_supervisor_record "$PIDFILE" "$$"; then
+        log "supervise: failed to publish PID identity in $PIDFILE"
+        return 2
+    fi
+    local supervisor_token
+    supervisor_token=$(a2a_process_start_token "$$") || return 2
 
     log "supervise START env=$env_file ssh_target=$ssh_target"
-    cleanup_orphans "$LOCAL_PORT"
+    cleanup_orphans "$LOCAL_PORT" "$REMOTE_ENDPOINT" "$ssh_target"
 
     (
         # Close the inherited flock fd so a lingering ssh child can't hold
@@ -260,12 +324,14 @@ cmd_supervise() {
         log "supervise EXIT — tearing down tunnel_pid=$tunnel_pid worker_pid=$worker_pid"
         [[ "$worker_pid" -ne 0 ]] && kill_tree "$worker_pid"
         kill_tree "$tunnel_pid"
-        sweep_lingering_ssh "$LOCAL_PORT"
+        sweep_lingering_ssh "$LOCAL_PORT" "$REMOTE_ENDPOINT" "$ssh_target"
         # Releasing fd 200 releases the flock.  The lock file may linger on
         # disk (harmless: next flock -n on the same file succeeds because the
         # old holder is gone).  Remove the PID file so `status`/`stop` don't
         # chase a dead PID.
-        rm -f "$PIDFILE"
+        local live_record
+        live_record=$(current_supervisor_record)
+        [[ "$live_record" == "$$ $supervisor_token" ]] && rm -f "$PIDFILE"
         exec 200>&-
     }
     trap _cleanup EXIT
@@ -290,25 +356,42 @@ cmd_supervise() {
 }
 
 cmd_stop() {
-    local sup_pid
-    sup_pid=$(current_supervisor_pid)
-    if [[ -z "$sup_pid" ]]; then
+    local record sup_pid sup_token env_file ssh_target
+    record=$(current_supervisor_record)
+    if [[ -z "$record" ]]; then
         echo "no supervisor holding $LOCK"
+        return 0
+    fi
+    read -r sup_pid sup_token <<<"$record"
+    env_file=$(a2a_supervisor_env_file "$sup_pid" 2>/dev/null || true)
+    ssh_target=""
+    [[ -n "$env_file" ]] && ssh_target=$(extract_env_value A2A_TUNNEL_SSH_TARGET "$env_file")
+
+    # Re-check immediately before signaling to close the read/signal race.
+    if ! a2a_validate_supervisor_identity "$sup_pid" "$sup_token" \
+            "$SCRIPT_DIR/a2a-termux-native-worker.sh" "$LOCK" >/dev/null; then
+        echo "no canonical supervisor holding $LOCK"
         return 0
     fi
     log "stop: sending SIGTERM to sup=$sup_pid"
     kill -TERM "$sup_pid" 2>/dev/null || true
     local i
-    for i in $(seq 1 20); do
-        kill -0 "$sup_pid" 2>/dev/null || {
+    for ((i = 0; i < 20; i++)); do
+        if ! a2a_validate_supervisor_identity "$sup_pid" "$sup_token" \
+                "$SCRIPT_DIR/a2a-termux-native-worker.sh" "$LOCK" >/dev/null; then
             echo "stopped sup=$sup_pid"
             return 0
-        }
+        fi
         sleep 1
     done
-    log "stop: SIGKILL fallback for sup=$sup_pid"
-    kill -KILL "$sup_pid" 2>/dev/null || true
-    sweep_lingering_ssh "$LOCAL_PORT"
+    # Signal only if this is still the same process instance and command.
+    if a2a_validate_supervisor_identity "$sup_pid" "$sup_token" \
+            "$SCRIPT_DIR/a2a-termux-native-worker.sh" "$LOCK" >/dev/null; then
+        log "stop: SIGKILL fallback for sup=$sup_pid"
+        kill -KILL "$sup_pid" 2>/dev/null || true
+    fi
+    [[ -n "$ssh_target" ]] && \
+        sweep_lingering_ssh "$LOCAL_PORT" "$REMOTE_ENDPOINT" "$ssh_target"
     echo "killed sup=$sup_pid"
 }
 
@@ -319,7 +402,7 @@ cmd_status() {
     printf 'lock: %s\n' "$LOCK"
     printf 'log: %s\n' "$LOG"
     printf 'tunnel: '
-    if timeout 3 curl -sS -o /dev/null "http://127.0.0.1:${LOCAL_PORT}/livez" 2>/dev/null; then
+    if timeout 3 curl -fsS -o /dev/null "http://127.0.0.1:${LOCAL_PORT}/livez" 2>/dev/null; then
         printf 'UP (127.0.0.1:%s -> %s)\n' "$LOCAL_PORT" "$REMOTE_ENDPOINT"
     else
         printf 'DOWN\n'

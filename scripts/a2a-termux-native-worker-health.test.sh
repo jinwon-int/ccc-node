@@ -23,12 +23,21 @@ TMP="$(ccc_test_tmpdir)" || exit 1
 # so the fake-supervisor helpers can detach properly (ppid=1) while the
 # health check under test still sees the mock.
 REAL_SETSID="$(command -v setsid || echo /data/data/com.termux/files/usr/bin/setsid)"
-trap 'trap - EXIT; jobs -p | xargs -r kill -KILL 2>/dev/null; rm -rf "$TMP"' EXIT
-
-# Pre-flight: kill any leftover fake-supervisor processes from previous test
-# runs so the cap-detector tests below aren't polluted by orphaned sleeps.
-pkill -KILL -f 'exec -a "bash .*a2a-termux-native-worker\.sh supervise' 2>/dev/null || true
-pkill -KILL -f 'exec -a "bash .*native-worker-supervisor\.sh' 2>/dev/null || true
+OWNED_PIDS=()
+cleanup_test() {
+    trap - EXIT
+    bash "$HARNESS" stop >/dev/null 2>&1 || true
+    local pid
+    for pid in "${OWNED_PIDS[@]}"; do
+        [[ -n "$pid" ]] && kill -KILL "$pid" 2>/dev/null || true
+    done
+    for pid in "${OWNED_PIDS[@]}"; do
+        [[ -n "$pid" ]] && wait "$pid" 2>/dev/null || true
+    done
+    jobs -p | xargs -r kill -KILL 2>/dev/null || true
+    rm -rf "$TMP"
+}
+trap cleanup_test EXIT
 
 ok() {
     if eval "$2"; then
@@ -59,21 +68,40 @@ exit 2
 EOF
 chmod +x "$TMP/mock-python-harness-fail.sh"
 
-# Mock curl — flips based on A2A_TEST_CURL_OK.
+# Mock curl — includes an HTTP-error mode that succeeds unless callers use -f.
 mkdir -p "$TMP/bin"
 cat > "$TMP/bin/curl" <<'EOF'
 #!/usr/bin/env bash
-[[ "${A2A_TEST_CURL_OK:-0}" == "1" ]] && exit 0
-exit 7
+case "${A2A_TEST_CURL_MODE:-down}" in
+    up) exit 0 ;;
+    http-error)
+        [[ " $* " == *" -f"* || " $* " == *" -fs"* ]] && exit 22
+        exit 0
+        ;;
+    *) exit 7 ;;
+esac
 EOF
 chmod +x "$TMP/bin/curl"
 
-# Mock setsid so --self-heal spawns are inspectable and don't leak processes.
+# Tunnel invocations block like a live ssh process; reachability probes return
+# the requested deterministic result.
+cat > "$TMP/bin/ssh" <<'EOF'
+#!/usr/bin/env bash
+if [[ " $* " == *" -N "* ]]; then
+    exec sleep 3600
+fi
+[[ "${A2A_TEST_SSH_OK:-0}" == "1" ]] && exit 0
+exit 255
+EOF
+chmod +x "$TMP/bin/ssh"
+
+# Mock setsid records every invocation.  In spawn mode it delegates to the real
+# binary; in noop mode it reproduces the corrupt 227-byte test stub incident by
+# returning rc=0 without starting anything.
 cat > "$TMP/bin/setsid" <<EOF
 #!/usr/bin/env bash
-# Record the invocation and return immediately.  We just want to prove the
-# health script tried to spawn a supervisor; we don't need to run it.
 printf 'setsid %s\n' "\$*" >> "$TMP/setsid-invocations.log"
+[[ "\${A2A_TEST_SETSID_MODE:-noop}" == "spawn" ]] && exec "$REAL_SETSID" "\$@"
 exit 0
 EOF
 chmod +x "$TMP/bin/setsid"
@@ -89,13 +117,39 @@ mkdir -p "$TMP/worker-root/dist"
 # Wire everything to test-local dirs.
 export A2A_SUPERVISOR_LOCK_DIR="$TMP"
 export A2A_SUPERVISOR_LOG_DIR="$TMP"
-export A2A_SUPERVISOR_LOCK="$TMP/sup.lock"
+export A2A_SUPERVISOR_LOCK="$TMP/sup-\"quoted\\path.lock"
 export A2A_SUPERVISOR_LOG="$TMP/sup.log"
 export A2A_SUPERVISOR_HEALTH_LOG="$TMP/health.log"
 export A2A_PYTHON_HARNESS="$TMP/mock-python-harness.sh"
-export A2A_TEST_CURL_OK=0
+export A2A_TEST_CURL_MODE=down
+export A2A_TEST_SETSID_MODE=noop
 export PATH="$TMP/bin:$PATH"
 PIDFILE="$A2A_SUPERVISOR_LOCK.pid"
+
+start_owned_supervisor() {
+    rm -f "$PIDFILE"
+    bash "$HARNESS" supervise --env-file "$ENVF" </dev/null >/dev/null 2>&1 &
+    local pid=$!
+    OWNED_PIDS+=("$pid")
+    for _ in $(seq 1 50); do
+        [[ -s "$PIDFILE" ]] && break
+        sleep 0.1
+    done
+    [[ -s "$PIDFILE" ]] || return 1
+    printf '%s' "$pid"
+}
+
+remember_pidfile_owner() {
+    local pid
+    read -r pid _ < "$PIDFILE" || return 1
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+    OWNED_PIDS+=("$pid")
+}
+
+stop_owned_supervisor() {
+    bash "$HARNESS" stop >/dev/null 2>&1 || true
+    rm -f "$PIDFILE"
+}
 
 # ---- 1. Usage / arg-parsing paths ------------------------------------------
 
@@ -110,6 +164,17 @@ ok "missing env file fails rc=2" '[ "$rc" = 2 ] && grep -q "env file not found" 
 
 out="$(bash "$HEALTH" --env-file "$ENVF" --bogus 2>&1)"; rc=$?
 ok "unknown arg fails rc=2" '[ "$rc" = 2 ] && grep -q "unknown arg" <<<"$out"'
+
+for bad_opt in \
+    "--max-supervisors nope" \
+    "--max-supervisors 0" \
+    "--tunnel-down-restart-after -1" \
+    "--tunnel-restart-cooldown 999999999"; do
+    # shellcheck disable=SC2086  # deliberate option/value pair expansion
+    out="$(bash "$HEALTH" --env-file "$ENVF" $bad_opt 2>&1)"; rc=$?
+    ok "invalid numeric option '$bad_opt' fails rc=2" \
+        '[ "$rc" = 2 ] && grep -q "must be an integer" <<<"$out"'
+done
 
 # ---- 2. Env validation surfaces from the harness ---------------------------
 
@@ -129,48 +194,70 @@ BIG_CAP="--max-supervisors 99"
 
 rm -f "$PIDFILE"
 out="$(bash "$HEALTH" --env-file "$ENVF" --no-self-heal $BIG_CAP 2>&1)"; rc=$?
-ok "no supervisor + --no-self-heal rc=0" '[ "$rc" = 0 ] && grep -q "DOWN no supervisor" <<<"$out"'
+ok "no supervisor + --no-self-heal fails closed rc=3" \
+    '[ "$rc" = 3 ] && grep -q "DOWN no supervisor" <<<"$out"'
+
+# A stale PID record naming an unrelated live process must be ignored, and
+# `stop` must never signal that process.
+sleep 3600 >/dev/null 2>&1 &
+STALE_PID=$!
+OWNED_PIDS+=("$STALE_PID")
+printf '%s 1\n' "$STALE_PID" > "$PIDFILE"
+out="$(bash "$HARNESS" stop 2>&1)"; rc=$?
+ok "stale/reused PID record is not signaled" \
+    '[ "$rc" = 0 ] && kill -0 "$STALE_PID" 2>/dev/null && grep -q "no supervisor" <<<"$out"'
+rm -f "$PIDFILE"
 
 # ---- 4. No supervisor, --self-heal spawns via setsid -----------------------
 
 : > "$TMP/setsid-invocations.log"
 rm -f "$PIDFILE"
 out="$(bash "$HEALTH" --env-file "$ENVF" --self-heal $BIG_CAP 2>&1)"; rc=$?
-ok "no supervisor + --self-heal returns rc=0" '[ "$rc" = 0 ] && grep -q "STARTED" <<<"$out"'
+ok "no-op setsid cannot claim a successful self-heal" \
+    '[ "$rc" = 5 ] && grep -q "no canonical supervisor" <<<"$out"'
 ok "self-heal invoked setsid on the harness" \
     'grep -q "setsid.*-f bash .*a2a-termux-native-worker\.sh supervise" "$TMP/setsid-invocations.log"'
 
+export A2A_TEST_SETSID_MODE=spawn
+out="$(bash "$HEALTH" --env-file "$ENVF" --self-heal $BIG_CAP 2>&1)"; rc=$?
+ok "real setsid + canonical PID identity self-heals" \
+    '[ "$rc" = 0 ] && grep -q "STARTED" <<<"$out" && [ "$(wc -w < "$PIDFILE")" = 2 ]'
+remember_pidfile_owner || true
+
 # ---- 5. Supervisor running, tunnel DOWN -> rc=3 ----------------------------
 
-# Fake a running supervisor by writing our own PID to the PID file.  We're
-# alive so kill -0 succeeds, current_supervisor_pid returns our PID.
-echo "$$" > "$PIDFILE"
-export A2A_TEST_CURL_OK=0
+export A2A_TEST_CURL_MODE=down
 out="$(bash "$HEALTH" --env-file "$ENVF" --no-self-heal $BIG_CAP 2>&1)"; rc=$?
 ok "supervisor up + tunnel DOWN returns rc=3" '[ "$rc" = 3 ] && grep -q "tunnel DOWN" <<<"$out"'
 
+export A2A_TEST_CURL_MODE=http-error
+out="$(bash "$HEALTH" --env-file "$ENVF" --no-self-heal $BIG_CAP 2>&1)"; rc=$?
+ok "HTTP 5xx-style curl response is DOWN because -f is required" \
+    '[ "$rc" = 3 ] && grep -q "tunnel DOWN" <<<"$out"'
+
 # ---- 6. Supervisor running, tunnel UP -> rc=0 OK ---------------------------
 
-export A2A_TEST_CURL_OK=1
+export A2A_TEST_CURL_MODE=up
 out="$(bash "$HEALTH" --env-file "$ENVF" --no-self-heal $BIG_CAP 2>&1)"; rc=$?
 ok "supervisor up + tunnel UP returns rc=0" '[ "$rc" = 0 ] && grep -qE "^OK sup=[0-9]+" <<<"$out"'
 ok "OK line reports cap=N/99" 'grep -qE "cap=[0-9]+/99" <<<"$out"'
 
 # ---- 7. --json emits one-line JSON summary ---------------------------------
 
-export A2A_TEST_CURL_OK=1
-echo "$$" > "$PIDFILE"
+export A2A_TEST_CURL_MODE=up
 out="$(bash "$HEALTH" --env-file "$ENVF" --no-self-heal --json --quiet $BIG_CAP 2>&1)"; rc=$?
 ok "json output is one line" '[ "$rc" = 0 ] && [ "$(printf %s "$out" | wc -l)" -le 1 ]'
 ok "json carries schema + action=ok" \
     'grep -q "\"schema\":\"a2a-native-worker-health.v1\"" <<<"$out" && grep -q "\"action\":\"ok\"" <<<"$out"'
+ok "json safely round-trips quoted/backslash lock path" \
+    'python3 -c '\''import json,sys; assert json.loads(sys.stdin.read())["lock"] == sys.argv[1]'\'' "$A2A_SUPERVISOR_LOCK" <<<"$out"'
 
 # ---- 8. --quiet suppresses OK output but keeps rc=0 ------------------------
 
-echo "$$" > "$PIDFILE"
-export A2A_TEST_CURL_OK=1
+export A2A_TEST_CURL_MODE=up
 out="$(bash "$HEALTH" --env-file "$ENVF" --no-self-heal --quiet $BIG_CAP 2>&1)"; rc=$?
 ok "--quiet suppresses OK output" '[ "$rc" = 0 ] && [ -z "$out" ]'
+stop_owned_supervisor
 
 # ---- 9. Supervisor-count cap violation -> rc=4 (ND-1236) -------------------
 
@@ -202,6 +289,7 @@ start_fake_supervisor() {
 }
 FAKE1=$(start_fake_supervisor)
 FAKE2=$(start_fake_supervisor)
+OWNED_PIDS+=("$FAKE1" "$FAKE2")
 
 # Give the shells a moment to actually exec sleep.
 for _ in $(seq 1 20); do
@@ -223,7 +311,7 @@ ok "cap violation blocks self-heal (setsid not invoked)" \
 # Raising the cap defuses the check.
 out="$(bash "$HEALTH" --env-file "$ENVF" --no-self-heal --max-supervisors 5 2>&1)"; rc=$?
 ok "raising --max-supervisors clears cap violation" \
-    '[ "$rc" = 0 ] && ! grep -q "MANUAL SWEEP" <<<"$out"'
+    '[ "$rc" = 3 ] && ! grep -q "MANUAL SWEEP" <<<"$out"'
 
 kill -KILL "$FAKE1" "$FAKE2" 2>/dev/null || true
 
@@ -245,6 +333,7 @@ start_fake_legacy() {
 }
 LEG1=$(start_fake_legacy)
 LEG2=$(start_fake_legacy)
+OWNED_PIDS+=("$LEG1" "$LEG2")
 for _ in $(seq 1 20); do
     n=$(pgrep -f 'native-worker-supervisor\.sh' 2>/dev/null | wc -l)
     [[ "$n" -ge 2 ]] && break
@@ -258,79 +347,91 @@ kill -KILL "$LEG1" "$LEG2" 2>/dev/null || true
 # ---- 11. tunnel-down controlled recovery (#810) ----------------------------
 # A supervisor up + tunnel DOWN is the ND-1236 stuck state.  Under --self-heal
 # the checker restarts it, but only after N down cycles, when the ssh target is
-# reachable, and outside the restart cooldown.  We mock ssh (reachability) and
-# point PIDFILE at a killable throwaway so the recovery's `$HARNESS stop` never
-# targets the test process.  setsid is already mocked (records invocations).
-cat > "$TMP/bin/ssh" <<'EOF'
-#!/usr/bin/env bash
-[[ "${A2A_TEST_SSH_OK:-0}" == "1" ]] && exit 0
-exit 255
-EOF
-chmod +x "$TMP/bin/ssh"
+# reachable, and outside the restart cooldown.  The ssh/setsid mocks above let
+# us run real canonical supervisors while keeping every child test-owned.
 
 STREAK_FILE="$A2A_SUPERVISOR_LOCK.tunnel_down_streak"
 TS_FILE="$A2A_SUPERVISOR_LOCK.tunnel_restart_ts"
 
-fresh_fake_sup() {          # spawn a killable sleep and register it as the supervisor
-    # Redirect the background sleep's fds off the command-substitution pipe, or
-    # $(fresh_fake_sup) would block until the sleep's stdout closes (3600s).
-    sleep 3600 </dev/null >/dev/null 2>&1 &
-    echo "$!" > "$PIDFILE"
-    printf '%s' "$!"
-}
+fresh_fake_sup() { start_owned_supervisor; }
 
-export A2A_TEST_CURL_OK=0   # tunnel DOWN for 11a–11e
+export A2A_TEST_CURL_MODE=down   # tunnel DOWN for 11a–11e
 
 # 11a. streak below threshold → defer (rc=3), no respawn.
 rm -f "$STREAK_FILE" "$TS_FILE"; : > "$TMP/setsid-invocations.log"
 fake=$(fresh_fake_sup); export A2A_TEST_SSH_OK=1
+OWNED_PIDS+=("$fake")
 out="$(bash "$HEALTH" --env-file "$ENVF" --self-heal --tunnel-down-restart-after 3 $BIG_CAP 2>&1)"; rc=$?
 ok "tunnel-down below threshold defers (rc=3)" '[ "$rc" = 3 ] && grep -q "deferring restart" <<<"$out"'
 ok "deferral does not respawn (no setsid)" '[ ! -s "$TMP/setsid-invocations.log" ]'
 ok "deferral records streak=1" '[ "$(cat "$STREAK_FILE" 2>/dev/null)" = 1 ]'
-kill -KILL "$fake" 2>/dev/null || true
+stop_owned_supervisor
 
 # 11b. streak at threshold + reachable → controlled restart (rc=0, setsid).
 rm -f "$TS_FILE"; printf '2\n' > "$STREAK_FILE"; : > "$TMP/setsid-invocations.log"
 fake=$(fresh_fake_sup); export A2A_TEST_SSH_OK=1
+OWNED_PIDS+=("$fake")
 out="$(bash "$HEALTH" --env-file "$ENVF" --self-heal --tunnel-down-restart-after 3 $BIG_CAP 2>&1)"; rc=$?
 ok "tunnel-down at threshold + reachable restarts (rc=0)" '[ "$rc" = 0 ] && grep -q "restarted supervisor" <<<"$out"'
 ok "recovery respawns via setsid supervise" 'grep -q "setsid.*supervise" "$TMP/setsid-invocations.log"'
 ok "recovery clears the streak" '[ ! -f "$STREAK_FILE" ]'
 ok "recovery records a restart timestamp" '[ -s "$TS_FILE" ]'
-kill -KILL "$fake" 2>/dev/null || true
+remember_pidfile_owner || true
+stop_owned_supervisor
 
 # 11c. ssh target unreachable → never restart (rc=3), even past threshold.
 rm -f "$TS_FILE"; printf '5\n' > "$STREAK_FILE"; : > "$TMP/setsid-invocations.log"
 fake=$(fresh_fake_sup); export A2A_TEST_SSH_OK=0
+OWNED_PIDS+=("$fake")
 out="$(bash "$HEALTH" --env-file "$ENVF" --self-heal --tunnel-down-restart-after 3 $BIG_CAP 2>&1)"; rc=$?
 ok "unreachable target does not restart (rc=3)" '[ "$rc" = 3 ]'
 ok "unreachable → no setsid respawn" '[ ! -s "$TMP/setsid-invocations.log" ]'
-kill -KILL "$fake" 2>/dev/null || true
+stop_owned_supervisor
 
 # 11d. cooldown active → defer even past threshold + reachable.
 printf '9\n' > "$STREAK_FILE"; date +%s > "$TS_FILE"; : > "$TMP/setsid-invocations.log"
 fake=$(fresh_fake_sup); export A2A_TEST_SSH_OK=1
+OWNED_PIDS+=("$fake")
 out="$(bash "$HEALTH" --env-file "$ENVF" --self-heal --tunnel-down-restart-after 3 --tunnel-restart-cooldown 3600 $BIG_CAP 2>&1)"; rc=$?
 ok "restart cooldown defers restart (rc=3)" '[ "$rc" = 3 ] && grep -q "cooldown" <<<"$out"'
 ok "cooldown → no setsid respawn" '[ ! -s "$TMP/setsid-invocations.log" ]'
-kill -KILL "$fake" 2>/dev/null || true
+stop_owned_supervisor
 
 # 11e. --no-tunnel-recovery keeps the legacy rc=3 flag and writes no state.
 rm -f "$STREAK_FILE" "$TS_FILE"; : > "$TMP/setsid-invocations.log"
 fake=$(fresh_fake_sup); export A2A_TEST_SSH_OK=1
+OWNED_PIDS+=("$fake")
 out="$(bash "$HEALTH" --env-file "$ENVF" --self-heal --no-tunnel-recovery $BIG_CAP 2>&1)"; rc=$?
 ok "--no-tunnel-recovery flags rc=3 (legacy behavior)" '[ "$rc" = 3 ] && grep -q "self-heal cannot fix" <<<"$out"'
 ok "--no-tunnel-recovery writes no streak file" '[ ! -f "$STREAK_FILE" ]'
-kill -KILL "$fake" 2>/dev/null || true
+stop_owned_supervisor
 
 # 11f. tunnel UP clears a pending streak.
 printf '2\n' > "$STREAK_FILE"
-fake=$(fresh_fake_sup); export A2A_TEST_CURL_OK=1
-out="$(bash "$HEALTH" --env-file "$ENVF" --self-heal $BIG_CAP 2>&1)"; rc=$?
+fake=$(fresh_fake_sup); export A2A_TEST_CURL_MODE=up
+OWNED_PIDS+=("$fake")
+# shellcheck disable=SC2034  # out is consumed by the eval-based ok() assertion.
+out="$(bash "$HEALTH" --env-file "$ENVF" --self-heal $BIG_CAP 2>&1)"
+# shellcheck disable=SC2034  # rc is consumed by the eval-based ok() assertion.
+rc=$?
 ok "tunnel UP returns rc=0 and clears the streak" '[ "$rc" = 0 ] && [ ! -f "$STREAK_FILE" ]'
-kill -KILL "$fake" 2>/dev/null || true
-export A2A_TEST_CURL_OK=0
+stop_owned_supervisor
+export A2A_TEST_CURL_MODE=down
+
+# ---- 12. Worker-root matching treats paths as data, never regex ------------
+SPECIAL_ROOT="$TMP/worker.[x]\\literal"
+mkdir -p "$SPECIAL_ROOT/dist" "$TMP/worker.x\\literal/dist"
+python3 -c 'import time; time.sleep(3600)' "$SPECIAL_ROOT/dist/worker.js" &
+EXACT_WORKER_PID=$!
+python3 -c 'import time; time.sleep(3600)' "$TMP/worker.x\\literal/dist/workerXjs" &
+DECOY_WORKER_PID=$!
+OWNED_PIDS+=("$EXACT_WORKER_PID" "$DECOY_WORKER_PID")
+sleep 0.2
+# shellcheck disable=SC2034  # count is consumed by the eval-based ok() assertion.
+count=$(bash -c 'source "$1"; count_workers_under "$2"' _ "$HEALTH" "$SPECIAL_ROOT")
+ok "special-character worker root counts exact argv only" '[ "$count" = 1 ]'
+kill -KILL "$EXACT_WORKER_PID" "$DECOY_WORKER_PID" 2>/dev/null || true
+wait "$EXACT_WORKER_PID" "$DECOY_WORKER_PID" 2>/dev/null || true
 
 echo "----"
 echo "PASS=$pass FAIL=$fail"
