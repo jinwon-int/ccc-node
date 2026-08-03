@@ -849,6 +849,30 @@ def test_detect_claude_service_matches_kimi_hosts(monkeypatch: pytest.MonkeyPatc
     assert detect_claude_service("https://KIMI.COM/coding/") == "Kimi Code"
 
 
+def test_detect_claude_service_matches_zai_hosts(monkeypatch: pytest.MonkeyPatch) -> None:
+    _clear_service_env(monkeypatch)
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://api.z.ai/api/anthropic")
+    assert detect_claude_service() == "Z.AI"
+    assert detect_claude_service("https://api.z.ai/api/anthropic") == "Z.AI"
+    assert detect_claude_service("api.z.ai/api/anthropic") == "Z.AI"
+    # Look-alike hosts must not match (suffix guard).
+    assert detect_claude_service("https://z.ai.evil.example") is None
+
+
+def test_local_claude_environment_snapshot_reads_zai_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_service_env(monkeypatch)
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://api.z.ai/api/anthropic")
+    monkeypatch.setenv("ANTHROPIC_MODEL", "sonnet")
+    monkeypatch.setenv("CLAUDE_CODE_EFFORT_LEVEL", "high")
+    monkeypatch.setenv("CLAUDE_CODE_MAX_CONTEXT_TOKENS", "1000000")
+    snapshot = local_claude_environment_snapshot()
+    assert snapshot.provider == "claude"
+    assert snapshot.service == "Z.AI"
+    assert snapshot.context_window == 1000000
+
+
 def test_detect_claude_service_ignores_anthropic_and_lookalikes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -965,6 +989,34 @@ def test_synthesize_service_windows_builds_count_only_kimi_window() -> None:
     assert window.used_percent is None
     assert window.used_count == 47
     assert window.count_unit == "req"
+
+
+def test_synthesize_service_windows_builds_count_only_zai_window() -> None:
+    windows = synthesize_service_windows(
+        "Z.AI", {"requests": 12, "tokens": 1_500_000}, {"requests": 80, "tokens": 9_000_000}
+    )
+    # Without a configured limit the weekly (percent-only) window is skipped;
+    # the 5-hour window degrades to count-only.
+    assert len(windows) == 1
+    window = windows[0]
+    assert window.label == "Z.AI 5-hour"
+    assert window.used_percent is None
+    assert window.used_count == 12
+    assert window.count_unit == "req"
+
+
+def test_synthesize_service_windows_reads_zai_configured_limits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CCC_USAGE_ZAI_5H_REQUEST_LIMIT", "500")
+    monkeypatch.setenv("CCC_USAGE_ZAI_WEEKLY_TOKEN_LIMIT", "50000000")
+    windows = synthesize_service_windows(
+        "Z.AI", {"requests": 100, "tokens": 1}, {"requests": 9, "tokens": 25_000_000}
+    )
+    assert len(windows) == 2
+    by_label = {w.label: w for w in windows}
+    assert by_label["Z.AI 5-hour"].count_limit == 500
+    assert by_label["Z.AI weekly"].count_limit == 50_000_000
 
 
 def test_synthesize_service_windows_rejects_missing_or_bad_inputs() -> None:
