@@ -170,8 +170,12 @@ PY
 
 latest_source_mtime() {
   [ -d "$1" ] || { printf 0; return; }
-  find "$1" -type f -name '*.jsonl' -printf '%T@\n' 2>/dev/null \
-    | sort -nr | head -n 1 | cut -d. -f1 | grep -E '^[0-9]+$' || printf 0
+  # Consume the entire find stream. With pipefail, `sort | head` can make
+  # sort exit on SIGPIPE for a large transcript tree even after head printed
+  # the right timestamp; the fallback then appends a second `0` line and
+  # corrupts status JSON. awk computes the maximum in one body-free pass.
+  { find "$1" -type f -name '*.jsonl' -printf '%T@\n' 2>/dev/null || true; } \
+    | awk 'BEGIN { latest=0 } { stamp=int($1); if (stamp > latest) latest=stamp } END { print latest }'
 }
 
 palace_state() {
