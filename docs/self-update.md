@@ -73,12 +73,34 @@ the bridge is serving a request:
 - the bridge publishes an in-flight `workload` snapshot to its `health.json`;
 - if that snapshot is fresh and shows `active_requests > 0`, the run logs a
   `deferred reason=bridge-busy` audit line and exits `8` — nothing is fetched or
-  restarted, and the next scheduled tick retries;
+  restarted, and the next scheduled tick retries. **A tick only exists if a
+  `self-update` agent-cron task is registered** (see *Scheduling* below);
+  otherwise a deferred run is never retried automatically. Note also that
+  requesting an update from inside a live bridge conversation marks that very
+  conversation busy, so such a request almost always self-defers — let the
+  scheduled task apply it, or use `--force`;
 - bounded so it can't starve updates: a single task older than
   `CCC_SELF_UPDATE_BUSY_MAX_SECONDS` no longer blocks, and total deferral is
   capped at `CCC_SELF_UPDATE_MAX_DEFER_SECONDS`;
 - fail-open (missing / unreadable / stale `health.json` → proceed) and
   `--force` bypasses the gate entirely.
+
+## Scheduling
+
+Self-update does **not** schedule itself. It runs only when invoked — either
+manually (`ccc-self-update.sh run`) or by an agent-cron task. `setup.sh`
+registers a `self-update` agent-cron task idempotently (opt out with
+`CCC_SELF_UPDATE_REGISTER_CRON=false`), but the **agent-cron timer must be
+installed separately** (`scripts/install-agent-cron-systemd.sh`); without it
+the registered task never fires. (Before #909 the task was never registered,
+so a deferred run had no tick to retry on.)
+
+The default schedule is `17 4,10,16,22 * * *` (four times daily, off-zero
+minute); override with `CCC_SELF_UPDATE_CRON`. The task uses
+`--success-exit-codes 0,8,11`, so a clean update (0), a bridge-busy defer (8),
+and a no-services-allowlist degraded run (11) do not raise on-failure alerts —
+only real aborts do. To verify registration: `agent-cron.sh list | grep
+self-update`.
 
 ## Knobs
 
