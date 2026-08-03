@@ -91,6 +91,24 @@ out="$(run_install --preview --codex 2>&1)"; rc=$?
 ok "preview is read-only and discovers the Codex transcript" \
   '[ "$rc" = 0 ] && grep -q "source_files=1" <<<"$out" && [ ! -e "$container_root" ] && [ ! -e "$home/.local/bin/mempalace" ] && [ ! -e "$proot_log" ]'
 
+# Regression: a large mtime stream made `sort | head` trip pipefail after
+# printing the correct value, appending a second zero and corrupting JSON.
+pipefail_bin="$TMP/pipefail-bin"
+mkdir -p "$pipefail_bin"
+cat > "$pipefail_bin/find" <<'SH'
+#!/usr/bin/env bash
+case "$*" in
+  *%T@*) awk 'BEGIN { for (i=0; i<50000; i++) print "1785724620.5" }'; exit 0 ;;
+esac
+exec "${CCC_TEST_REAL_FIND:?}" "$@"
+SH
+chmod 700 "$pipefail_bin/find"
+real_find="$(command -v find)"
+out="$(PATH="$pipefail_bin:$PATH" CCC_TEST_REAL_FIND="$real_find" \
+  run_install --status --json --codex 2>&1)"; rc=$?
+ok "large transcript mtime streams produce one valid JSON scalar under pipefail" \
+  '[ "$rc" = 0 ] && jq -e '\'' .source_latest_mtime == 1785724620 and .source_files == 1 '\'' <<<"$out" >/dev/null'
+
 custom_sessions="$TMP/custom-codex-sessions"
 mkdir -p "$custom_sessions"
 printf '{}\n' > "$custom_sessions/custom.jsonl"

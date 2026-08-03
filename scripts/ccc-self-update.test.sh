@@ -47,7 +47,15 @@ FAKEBIN="$TMP/bin"; mkdir -p "$FAKEBIN"
 cat > "$FAKEBIN/fakesystemctl" <<SH
 #!/usr/bin/env bash
 echo "\$*" >> "$TMP/systemctl.calls"
-case "\$*" in *bad*) exit 1 ;; esac
+case "\$*" in
+  *flaky*)
+    if [ ! -e "$TMP/flaky.failed" ]; then
+      : > "$TMP/flaky.failed"
+      exit 1
+    fi
+    ;;
+  *bad*) exit 1 ;;
+esac
 exit 0
 SH
 chmod +x "$FAKEBIN/fakesystemctl"
@@ -110,6 +118,39 @@ out="$(run_selfup run 2>&1)"; rc=$?
 ok "valid bridge runtime config permits allowlisted restart" \
   '[ "$rc" = 0 ] && grep -q "restart ccc-telegram-bridge.service" "$TMP/systemctl.calls"'
 
+# A transient restart failure gets exactly one retry. If the retry succeeds,
+# the update is successful and its recovery snapshot must not become residue.
+printf '%s\n' 'flaky-unit' > "$CLAUDE/self-update.services"
+rm -f "$TMP/flaky.failed"
+: > "$TMP/systemctl.calls"
+out="$(run_selfup run --force 2>&1)"; rc=$?
+ok "transient restart failure succeeds on one bounded retry" \
+  '[ "$rc" = 0 ] && [ "$(grep -c "^restart flaky-unit$" "$TMP/systemctl.calls")" = 2 ]'
+ok "successful retry is recorded" \
+  'grep -q "service retry name=flaky-unit attempt=1" "$STATE/self-update.log"'
+ok "successful retry removes the recovery snapshot" \
+  '! compgen -G "$STATE/self-update-install-rollback.*" >/dev/null'
+
+# A success-path cleanup failure must not be hidden by clearing the snapshot
+# variable and continuing to an `ok` audit. Inject an rm that fails only for
+# the private recovery directory; all earlier setup/deploy work remains real.
+cat > "$FAKEBIN/rm" <<'SH'
+#!/usr/bin/env bash
+case "$*" in *self-update-install-rollback.*) exit 97 ;; esac
+exec /bin/rm "$@"
+SH
+chmod +x "$FAKEBIN/rm"
+rm -f "$TMP/spool"/*.json
+out="$(PATH="$FAKEBIN:$PATH" run_selfup run --force 2>&1)"; rc=$?
+ok "snapshot cleanup failure exits fail-closed" \
+  '[ "$rc" = 10 ] && grep -q "snapshot cleanup failed" <<<"$out"'
+ok "snapshot cleanup failure is audited without a false success" \
+  'grep -q "\"result\":\"snapshot-cleanup-failed\"" "$STATE/self-update.log" && [ "$(grep "\"result\":" "$STATE/self-update.log" | tail -1 | jq -r .result)" = "snapshot-cleanup-failed" ]'
+ok "snapshot cleanup failure retains and reports the recovery path" \
+  'compgen -G "$STATE/self-update-install-rollback.*" >/dev/null && grep -q "retained path" <<<"$out" && jq -r .text "$TMP/spool"/*SelfUpdate*.json | grep -q "잔존 경로"'
+rm -f "$FAKEBIN/rm"
+rm -rf "$STATE"/self-update-install-rollback.*
+
 # Snapshot permission failures must be fail-closed even though the snapshot
 # helper is called in an `if ! ...` conditional (where Bash suppresses errexit
 # inside the function body).
@@ -142,6 +183,16 @@ ok "restart failure exits non-zero" '[ "$rc" = 7 ] && grep -q "failed to restart
 ok "restart failure audit is explicit and names the degraded service" \
   'grep -q "\"result\":\"restart-failures\"" "$STATE/self-update.log" && grep -q "\"name\":\"bad-unit\",\"ok\":false" "$STATE/self-update.log"'
 ok "failure notification queued" 'jq -r .text "$TMP/spool"/*SelfUpdate*.json 2>/dev/null | grep -q "재시작 실패"'
+# A restart failure is a half-apply (harness on NEW_SHA, service down), so the
+# recovery snapshot must SURVIVE for the operator to roll back from. Before
+# #869 it was deleted before the restarts even ran, leaving nothing to recover
+# with. Retention is deliberate here and only here; drop it afterwards so the
+# later "no residue" invariant still means what it says.
+ok "restart failure retains the recovery snapshot for rollback" \
+  'compgen -G "$STATE/self-update-install-rollback.*" >/dev/null'
+ok "restart failure names the retained snapshot to the operator" \
+  'grep -q "recovery snapshot" <<<"$out"'
+rm -rf "$STATE"/self-update-install-rollback.*
 
 # --- 4) setup.sh failure rolls back --------------------------------------------
 OLD_HEAD="$(git -C "$REPO" rev-parse HEAD)"
