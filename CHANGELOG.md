@@ -5,6 +5,21 @@ All notable changes to the Claude Code node harness. Dates are KST.
 ## [Unreleased]
 
 ### Added
+- nunchi write gate (#890, graph-engineering review): G1 progress→done
+  update detection auto-closes stale in-flight facts (reversible, `supersedes`
+  link kept) with a `review-stale` retro CLI; G2 verified source rank
+  (user-stated 3 / measured 2 / inferred 1 — the claimed rank counts only
+  when its transcript quote verifies, and a lower rank can never close a
+  higher one); G3 ambiguous high-overlap conflicts are flagged `review=1`
+  and surfaced in the snapshot instead of auto-resolved (`review` CLI to
+  list/clear); G4 new `kind=constraint` stored near-verbatim and always
+  injected by `snapshot` regardless of the recency limit. Distill extraction
+  now preserves numbers/ids/paths verbatim, requires the reason inside every
+  `decision`, and grounds user-stated/measured facts with a verbatim quote.
+  Weekly bench gains a body-free `metrics` section (stale-suspect ratio,
+  review queue, constraint count) and two reason-preservation queries
+  (q6/q7). Measured motivation on dungae: 75 facts, ~30% stale, 0 supersedes
+  used, confidence constant 0.7.
 - New skill `fleet-disk-constraint-triage`: platform-aware fleet disk audit
   (Android/Termux nodes must be judged by `df $HOME`, never `df /`), severity
   classification, root-cause investigation, and node-local cleanup delegation

@@ -91,9 +91,11 @@ Schema:
 {
   "honcho": [
     {
-      "kind": "preference" | "decision" | "observation" | "context",
+      "kind": "preference" | "decision" | "observation" | "context" | "constraint",
       "text": "<one-sentence Korean fact about the user, relationship, or in-flight work>",
-      "subject": "user" | "session" | "node"
+      "subject": "user" | "session" | "node",
+      "source": "user-stated" | "measured" | "inferred",
+      "quote": "<<= 120 chars verbatim quote from the transcript grounding this fact, or empty string>"
     }
   ],
   "wiki_candidates": [
@@ -118,6 +120,20 @@ honcho criteria (working/relational memory; volatile OK):
   - new user preference, communication style, in-flight context that next session needs
   - relationship-level observations about the user
   - DO NOT include node operational facts here — those go to wiki_candidates.
+  - PRESERVE VERBATIM inside `text`: numbers, issue/PR ids (#NNN), commit SHAs,
+    file paths, and model/version strings — copy them exactly, never round or
+    paraphrase (summary drift kills specifics first).
+  - kind=decision MUST carry its reason in the same sentence ("...때문에 X로
+    결정" / "근거: ..."). A decision without its why gets blindly re-litigated
+    or blindly obeyed later — both are failure modes.
+  - kind=constraint is for standing prohibitions/musts the user stated
+    ("절대 X 금지", "반드시 Y 먼저"). Keep near-verbatim; never summarize,
+    merge, or soften. Constraints outlive ordinary context.
+  - `source`: "user-stated" ONLY for facts the user personally said (quote a
+    user turn); "measured" for facts read from command output/logs shown in
+    the transcript; otherwise "inferred". For user-stated/measured, `quote`
+    MUST be a verbatim transcript excerpt grounding the fact — ingest
+    verifies it and demotes unverifiable claims to inferred.
 
 wiki_candidates criteria (durable, public-safe wiki page material):
   - design / architecture / policy decisions for this node

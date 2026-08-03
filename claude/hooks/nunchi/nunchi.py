@@ -16,6 +16,21 @@ Canonicalized from the 3-node hand-deployed pilot with the TM-1332 backlog:
   B3  node persona aliases (카렐렌→yukson, 등애→dungae, …) normalized at
       ingest and expanded at query time.
 
+Write gate (#890 — graph-engineering review):
+  G1  progress→done update detection auto-closes the stale in-flight fact
+      (same observed, token overlap, old has a progress marker, new has a
+      completion marker). Reversible: clear valid_to; `supersedes` keeps the
+      link. Measured before G1: 75 facts, ~30% stale, 0 supersedes used.
+  G2  source_rank (3 user-stated / 2 measured / 1 inferred), verified against
+      the transcript quote — never self-reported alone. A claimed rank without
+      a verifiable quote is demoted to 1 and flagged for review. A lower-rank
+      fact never closes a higher-rank fact (an agent inference must not bury
+      a user statement).
+  G3  ambiguous high-overlap conflicts are NEVER auto-resolved — both stay
+      open, the newcomer is flagged review=1 and surfaced in the snapshot.
+  G4  kind=constraint (금지/필수 rules) is stored near-verbatim and always
+      injected by `snapshot` regardless of the recency limit.
+
 Usage:
   nunchi.py init
   nunchi.py ingest <distill.json | ->     # mirror distill honcho[] items
@@ -23,6 +38,8 @@ Usage:
   nunchi.py dialectic <query> [--target T]   # facts + MemPalace + Haiku
   nunchi.py supersede <fact_id> <new text>   # close old, insert new
   nunchi.py snapshot [--limit N]             # SessionStart-ready summary
+  nunchi.py review-stale [--close]           # G1 retro pass over old facts
+  nunchi.py metrics                          # body-free counters for bench
   nunchi.py stats
 """
 import hashlib
@@ -71,7 +88,9 @@ CREATE TABLE IF NOT EXISTS peer_facts (
   valid_to TEXT,
   supersedes INTEGER REFERENCES peer_facts(id),
   dedup TEXT UNIQUE,
-  created_at TEXT NOT NULL
+  created_at TEXT NOT NULL,
+  source_rank INTEGER DEFAULT 1,
+  review INTEGER DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_peer ON peer_facts(observer, observed, valid_to);
 CREATE VIRTUAL TABLE IF NOT EXISTS facts_fts USING fts5(
@@ -105,11 +124,25 @@ def _migrate_fts(c):
         pass
 
 
+def _migrate_gate_cols(c):
+    """#890 — add write-gate columns to a pre-gate DB, lossless in place."""
+    cols = [r[1] for r in c.execute("PRAGMA table_info(peer_facts)")]
+    for name, ddl in (("source_rank", "source_rank INTEGER DEFAULT 1"),
+                      ("review", "review INTEGER DEFAULT 0")):
+        if name not in cols:
+            try:
+                c.execute(f"ALTER TABLE peer_facts ADD COLUMN {ddl}")
+                c.commit()
+            except sqlite3.Error:
+                pass
+
+
 def db():
     os.makedirs(os.path.dirname(DB), exist_ok=True)
     c = sqlite3.connect(DB)
     c.executescript(SCHEMA)
     _migrate_fts(c)
+    _migrate_gate_cols(c)
     return c
 
 
@@ -173,30 +206,170 @@ def _auto_supersede(c, observed, correction_text, sid):
     return None
 
 
+# ---- #890 write gate --------------------------------------------------------
+# G1 markers. Deliberately short lists: a marker miss only means the stale
+# fact waits for the retro pass / review queue instead of auto-closing.
+_PROGRESS = re.compile(
+    r"진행\s?중|진행중|대기\s?중|대기|실행\s?중|예정|보류|승인\s대기|미설치|미완료|착수|작업\s?중")
+_DONE = re.compile(
+    r"완료|완결|종결|머지|MERGED|병합|해소|확정|성공|폐기|설치됨|닫힘|CLOSED|배포됨", re.IGNORECASE)
+
+_SOURCE_RANK = {"user-stated": 3, "measured": 2, "inferred": 1}
+
+
+def _quote_key(text):
+    """Skeleton for quote matching: drop whitespace and backslashes so a
+    verbatim quote still matches its JSON-escaped form (\\n, \\") inside a
+    transcript .jsonl."""
+    return re.sub(r"[\s\\]+", "", str(text))
+
+
+def _verify_rank(item, transcript_key):
+    """G2 — a self-reported source label counts only with a verifiable quote.
+
+    Returns (rank, review). user-stated/measured claims need their quote to
+    actually appear in the transcript (skeleton substring); otherwise the
+    fact is demoted to inferred(1) and flagged for review. Legacy payloads
+    without a source field stay rank 1, no review noise.
+    """
+    source = (item.get("source") or "").strip()
+    if source not in _SOURCE_RANK:
+        return 1, 0
+    rank = _SOURCE_RANK[source]
+    if rank == 1:
+        return 1, 0
+    quote = _quote_key(item.get("quote") or "")
+    if len(quote) >= 8 and transcript_key and quote in transcript_key:
+        return rank, 0
+    return 1, 1
+
+
+def _g1_pool(c, observed):
+    """G1 candidate pool. session:* peers are one actor's in-flight log split
+    by session id — a completion routinely lands in a later session than the
+    fact it closes (measured retro on dungae: same-observed matching found 1
+    of ~20 stale facts). Cross-match all session peers; user/node peers stay
+    strictly scoped."""
+    if str(observed).startswith("session:"):
+        return c.execute(
+            "SELECT id, fact, source_rank FROM peer_facts"
+            " WHERE (observed=? OR observed LIKE 'session:%') AND valid_to IS NULL",
+            (observed,)).fetchall()
+    return c.execute(
+        "SELECT id, fact, source_rank FROM peer_facts"
+        " WHERE observed=? AND valid_to IS NULL", (observed,)).fetchall()
+
+
+def _update_supersede(c, observed, text, new_rank):
+    """G1 — close the in-flight fact this completion most plausibly updates.
+
+    Old fact carries a progress marker, the new text a completion marker,
+    token overlap >= 0.4, and the newcomer's source rank is not lower than
+    the old fact's (G2 guard). One fact at most, reversible exactly like B2
+    (clear valid_to; `supersedes` keeps the link).
+    """
+    if not _DONE.search(text):
+        return None
+    new = _tokens(text)
+    if not new:
+        return None
+    best, best_ratio = None, 0.0
+    rows = _g1_pool(c, observed)
+    for fid, fact, old_rank in rows:
+        if not _PROGRESS.search(fact) or (old_rank or 1) > new_rank:
+            continue
+        old = _tokens(fact)
+        if not old:
+            continue
+        ratio = len(new & old) / min(len(new), len(old))
+        if ratio > best_ratio:
+            best, best_ratio = fid, ratio
+    if best is not None and best_ratio >= 0.4:
+        c.execute("UPDATE peer_facts SET valid_to=? WHERE id=?", (now(), best))
+        return best
+    return None
+
+
+def _conflict_review(c, observed, text):
+    """G3 — flag (never resolve) a suspicious high-overlap open sibling.
+
+    A newcomer overlapping an open same-peer fact >= 0.6 without matching the
+    G1 update pattern is a potential contradiction or drifted duplicate: both
+    stay open and the newcomer is flagged review=1 for the owner queue.
+    """
+    new = _tokens(text)
+    if not new:
+        return 0
+    for _fid, fact, _r in c.execute(
+            "SELECT id, fact, source_rank FROM peer_facts"
+            " WHERE observed=? AND valid_to IS NULL", (observed,)).fetchall():
+        old = _tokens(fact)
+        if old and len(new & old) / min(len(new), len(old)) >= 0.6:
+            return 1
+    return 0
+
+
+def _transcript_text(payload):
+    """Skeleton transcript body for G2 quote checks, '' when unavailable.
+
+    History payloads carry no transcript_path, so fall back to deriving the
+    SDK transcript location from (source_cwd, session_id) the same way the
+    CLI encodes project dirs (path separators and dots become dashes).
+    """
+    path = payload.get("transcript_path") or ""
+    if not path:
+        sid = str(payload.get("session_id") or "")
+        cwd = str(payload.get("source_cwd") or "")
+        if re.fullmatch(r"[0-9a-f-]{8,64}", sid) and cwd.startswith("/"):
+            enc = re.sub(r"[/.]", "-", cwd)
+            path = os.path.expanduser(f"~/.claude/projects/{enc}/{sid}.jsonl")
+    try:
+        if path and os.path.exists(path) and os.path.getsize(path) < 64 * 1024 * 1024:
+            return _quote_key(open(path, encoding="utf-8", errors="replace").read())
+    except OSError:
+        pass
+    return ""
+
+
 def ingest(path):
     payload = json.load(sys.stdin if path == "-" else open(path))
     sid = payload.get("session_id", "unknown")
     items = payload.get("honcho", [])
     auto_supersede = os.environ.get("NUNCHI_NO_AUTO_SUPERSEDE") != "1"
+    transcript = _transcript_text(payload)
     c = db()
     n = 0
     for it in items:
+        # Gate order matters (#890): normalize → rank-verify → update/close →
+        # conflict-review → dedup. Normalizing first is what lets the same
+        # fact spelled through an alias land on one observed peer before the
+        # duplicate check runs.
         text = (it.get("text") or "").strip()
         if not text:
             continue
         observed = map_observed(it.get("subject"), sid)
         kind = it.get("kind", "fact")
+        rank, review = _verify_rank(it, transcript)
         superseded = None
-        if kind == "correction" and auto_supersede:
-            superseded = _auto_supersede(c, observed, text, sid)
+        if auto_supersede:
+            if kind == "correction":
+                superseded = _auto_supersede(c, observed, text, sid)
+            else:
+                superseded = _update_supersede(c, observed, text, rank)
+        if superseded is None and kind not in ("correction", "constraint"):
+            review = review or _conflict_review(c, observed, text)
         dedup = hashlib.sha1(f"{OBSERVER}|{it.get('subject')}|{text}".encode()).hexdigest()
+        evidence = (f"auto:correction:{sid}" if kind == "correction" and superseded is not None
+                    else f"auto:update:{sid}" if superseded is not None
+                    else f"distill:{sid}")
         try:
             c.execute(
-                "INSERT INTO peer_facts(observer,observed,kind,fact,evidence,valid_from,supersedes,dedup,created_at)"
-                " VALUES (?,?,?,?,?,?,?,?,?)",
-                (OBSERVER, observed, kind, text,
-                 (f"auto:correction:{sid}" if superseded is not None else f"distill:{sid}"),
-                 payload.get("distilled_at") or now(), superseded, dedup, now()))
+                "INSERT INTO peer_facts(observer,observed,kind,fact,evidence,valid_from,"
+                "supersedes,dedup,created_at,source_rank,review)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (OBSERVER, observed, kind, text, evidence,
+                 payload.get("distilled_at") or now(), superseded, dedup, now(),
+                 rank, review))
             n += 1
         except sqlite3.IntegrityError:
             pass  # duplicate fact already stored
@@ -367,13 +540,117 @@ def snapshot(limit):
     c = db()
     rows = c.execute(
         "SELECT observed,kind,fact FROM peer_facts WHERE valid_to IS NULL"
-        " ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+        " AND kind != 'constraint' ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+    # G4 — constraints are never crowded out by recency: a rule you must not
+    # break is exactly the fact whose miss is an incident, not a staleness.
+    cons = c.execute(
+        "SELECT observed,fact FROM peer_facts WHERE valid_to IS NULL"
+        " AND kind = 'constraint' ORDER BY id DESC").fetchall()
+    pending = c.execute(
+        "SELECT COUNT(*) FROM peer_facts WHERE valid_to IS NULL AND review=1"
+    ).fetchone()[0]
     lines = ["## nunchi working memory (primary — gate-3 transition, #824)"]
+    if pending:
+        lines.append(
+            f"- ⚠ 검토대기 {pending}건 (충돌/미검증 출처) — `nunchi.py review`로 확인")
+    for o, f in cons:
+        lines.append(f"- [제약/{o}] {f}")
     lines += [f"- ({o}/{k}) {f}" for o, k, f in rows]
     text = "\n".join(lines)
     os.makedirs(os.path.dirname(SNAPSHOT), exist_ok=True)
     open(SNAPSHOT, "w").write(text)
     print(text)
+
+
+def review(fact_id=None, clear=False):
+    """Owner queue for G2/G3 flags — list open review facts, or clear one.
+
+    A queue nobody can read is how audit data rots (the lineage lesson):
+    the snapshot points here, and clearing is explicit and per-fact.
+    """
+    c = db()
+    if fact_id is not None:
+        if clear:
+            c.execute("UPDATE peer_facts SET review=0 WHERE id=?", (fact_id,))
+            c.commit()
+            print(f"#{fact_id} review flag cleared")
+        return
+    rows = c.execute(
+        "SELECT id,observed,kind,fact,source_rank FROM peer_facts"
+        " WHERE valid_to IS NULL AND review=1 ORDER BY id").fetchall()
+    for fid, o, k, f, r in rows:
+        print(f"#{fid} rank={r} {o} ({k}) {f}")
+    print(f"{len(rows)} pending — clear: nunchi.py review <id> --clear;"
+          " replace: nunchi.py supersede <id> <new text>")
+
+
+def review_stale(do_close):
+    """G1 applied retroactively (#890 P3) — list, then close on approval.
+
+    Pairs each open progress-marker fact with a NEWER open same-peer fact
+    carrying a completion marker and >= 0.4 overlap. Print-only by default;
+    --close (after owner approval) sets valid_to. supersedes on the newer
+    fact is left untouched — retro-linking would rewrite ingest history.
+    """
+    c = db()
+    rows = c.execute(
+        "SELECT id, observed, fact, source_rank FROM peer_facts"
+        " WHERE valid_to IS NULL ORDER BY id").fetchall()
+    # Mirror _g1_pool: all session:* peers form one retro pool; user/node
+    # peers stay scoped to themselves.
+    by_obs = {}
+    for r in rows:
+        key = "session:*" if r[1].startswith("session:") else r[1]
+        by_obs.setdefault(key, []).append(r)
+    cands = []
+    for facts in by_obs.values():
+        for i, (fid, _o, fact, rank) in enumerate(facts):
+            if not _PROGRESS.search(fact):
+                continue
+            old = _tokens(fact)
+            for nfid, _o2, nfact, nrank in facts[i + 1:]:
+                if not _DONE.search(nfact) or (nrank or 1) < (rank or 1):
+                    continue
+                newt = _tokens(nfact)
+                if old and newt and len(old & newt) / min(len(old), len(newt)) >= 0.4:
+                    cands.append((fid, nfid, fact))
+                    break
+    for fid, nfid, fact in cands:
+        print(f"#{fid} stale (superseded by #{nfid}): {fact[:90]}")
+    if do_close:
+        for fid, _nfid, _f in cands:
+            c.execute("UPDATE peer_facts SET valid_to=? WHERE id=?", (now(), fid))
+        c.commit()
+        print(f"closed {len(cands)} facts (reversible: clear valid_to)")
+    else:
+        print(f"{len(cands)} candidates — apply with: nunchi.py review-stale --close")
+
+
+def metrics():
+    """Body-free counters for the weekly bench (#890 P5) — key=value lines."""
+    from datetime import timedelta
+    c = db()
+    total, open_ = c.execute(
+        "SELECT COUNT(*), COALESCE(SUM(valid_to IS NULL),0) FROM peer_facts").fetchone()
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat(timespec="seconds")
+    stale_suspect = sum(
+        1 for (fact, vfrom) in c.execute(
+            "SELECT fact, valid_from FROM peer_facts WHERE valid_to IS NULL")
+        if _PROGRESS.search(fact) and vfrom < cutoff)
+    pending = c.execute(
+        "SELECT COUNT(*) FROM peer_facts WHERE valid_to IS NULL AND review=1").fetchone()[0]
+    cons = c.execute(
+        "SELECT COUNT(*) FROM peer_facts WHERE valid_to IS NULL AND kind='constraint'"
+    ).fetchone()[0]
+    closed = total - open_
+    ratio = (stale_suspect / open_) if open_ else 0.0
+    print(f"facts_total={total}")
+    print(f"facts_open={open_}")
+    print(f"facts_closed={closed}")
+    print(f"stale_suspect_open={stale_suspect}")
+    print(f"stale_suspect_ratio={ratio:.2f}")
+    print(f"review_pending={pending}")
+    print(f"constraints_open={cons}")
 
 
 def stats():
@@ -407,6 +684,13 @@ if __name__ == "__main__":
         supersede(int(args[0]), args[1])
     elif cmd == "snapshot":
         snapshot(int(flag("--limit", 25)))
+    elif cmd == "review":
+        pos = [a for a in args if not a.startswith("--")]
+        review(int(pos[0]) if pos else None, clear="--clear" in args)
+    elif cmd == "review-stale":
+        review_stale("--close" in args)
+    elif cmd == "metrics":
+        metrics()
     elif cmd == "stats":
         stats()
     else:
