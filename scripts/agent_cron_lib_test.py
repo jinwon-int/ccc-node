@@ -150,6 +150,22 @@ class RetryPolicyTest(unittest.TestCase):
         self.assertEqual(p['backoffMultiplier'], 3)
 
 
+class SuccessExitCodesTest(unittest.TestCase):
+    def test_default_is_zero(self):
+        self.assertEqual(lib.success_exit_codes({}), {0})
+        self.assertEqual(lib.success_exit_codes({'successExitCodes': None}), {0})
+        self.assertEqual(lib.success_exit_codes({'successExitCodes': []}), {0})
+
+    def test_honors_declared_codes(self):
+        self.assertEqual(lib.success_exit_codes({'successExitCodes': [0, 1]}), {0, 1})
+
+    def test_ignores_invalid_entries(self):
+        self.assertEqual(lib.success_exit_codes({'successExitCodes': [0, 1, 300, -1, 'x']}), {0, 1})
+
+    def test_all_invalid_falls_back_to_zero(self):
+        self.assertEqual(lib.success_exit_codes({'successExitCodes': [300, -1]}), {0})
+
+
 class RetryDelayTest(unittest.TestCase):
     def test_exponential_backoff(self):
         policy = {'backoffSec': 60, 'backoffMultiplier': 2, 'maxBackoffSec': 3600}
@@ -180,6 +196,28 @@ class ApplyRetryTransitionTest(unittest.TestCase):
         res = lib.apply_retry_transition(task, '2026-06-28T00:00:00Z', 2, 'run1', 'failure', _dt(2026, 6, 28, 0, 0))
         self.assertTrue(res['exhausted'])
         self.assertIsNone(task['retryState']['retryEligibleAt'])
+        self.assertEqual(task['retryState']['lastStatus'], 'exhausted')
+
+    def test_no_policy_failure_does_not_record_retry_state(self):
+        # Per #911: a task that declared no retryPolicy has no retry concept,
+        # so failure must never be labelled retry-exhausted.
+        task = {}
+        res = lib.apply_retry_transition(task, '2026-06-28T00:00:00Z', 1, 'run1', 'failed', _dt(2026, 6, 28, 0, 0))
+        self.assertFalse(res['exhausted'])
+        self.assertNotIn('retryState', task)
+
+    def test_no_policy_failure_clears_stale_retry_state(self):
+        task = {'retryState': {'attempt': 5, 'lastStatus': 'exhausted'}}
+        res = lib.apply_retry_transition(task, '2026-06-28T00:00:00Z', 1, 'run1', 'failed', _dt(2026, 6, 28, 0, 0))
+        self.assertFalse(res['exhausted'])
+        self.assertNotIn('retryState', task)
+
+    def test_explicit_policy_still_records_retry_state(self):
+        # A task that explicitly declared retryPolicy (even maxAttempts: 1) opted
+        # into the retry framework and exhaustion remains valid.
+        task = {'retryPolicy': {'maxAttempts': 1}}
+        res = lib.apply_retry_transition(task, '2026-06-28T00:00:00Z', 1, 'run1', 'failed', _dt(2026, 6, 28, 0, 0))
+        self.assertTrue(res['exhausted'])
         self.assertEqual(task['retryState']['lastStatus'], 'exhausted')
 
 

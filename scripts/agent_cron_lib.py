@@ -145,6 +145,21 @@ def parse_schedule(expr, tz_name='UTC'):
     }
 
 
+def success_exit_codes(task):
+    """Exit codes considered success for a task (default ``{0}``).
+
+    Per #911: watch-type tasks may exit non-zero to *signal* findings (e.g. a
+    fleet node is DOWN). Such a run is a success-with-findings, not a failure.
+    Only codes outside this set (e.g. 2+, 127 command-missing, 124 timeout)
+    count as ``failed``.
+    """
+    raw = task.get('successExitCodes') if isinstance(task, dict) else None
+    if not isinstance(raw, list) or not raw:
+        return {0}
+    codes = {c for c in raw if isinstance(c, int) and 0 <= c <= 255}
+    return codes or {0}
+
+
 def retry_policy(task):
     raw = task.get('retryPolicy') if isinstance(task, dict) else None
     if not isinstance(raw, dict):
@@ -204,6 +219,17 @@ def apply_retry_transition(task, scheduled_at, attempt, run_id, status, at):
         existed = 'retryState' in task
         task.pop('retryState', None)
         return {'cleared': existed, 'attempt': attempt, 'retryEligibleAt': None, 'exhausted': False}
+    # Per #911: a task that declared no retryPolicy has no retry concept, so it
+    # must never be labelled retry-exhausted. Clear any stale retryState and
+    # return without recording one. retry_view() yields None without a
+    # retryState, so the "retry-exhausted" status and health label disappear for
+    # no-policy tasks. (A task that explicitly declares retryPolicy, even
+    # {maxAttempts: 1}, opted into the retry framework and is unaffected.)
+    declared = isinstance(task, dict) and isinstance(task.get('retryPolicy'), dict) and bool(task['retryPolicy'])
+    if not declared:
+        existed = 'retryState' in task
+        task.pop('retryState', None)
+        return {'cleared': existed, 'attempt': attempt, 'retryEligibleAt': None, 'exhausted': False, 'noPolicy': True}
     policy = retry_policy(task)
     if attempt >= policy['maxAttempts']:
         task['retryState'] = {

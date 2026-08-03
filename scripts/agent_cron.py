@@ -11,7 +11,7 @@ import shlex as _shlex
 import sys as _sys
 from pathlib import Path as _Path
 
-_USAGE = "Usage: agent-cron.sh [list|validate|status] [--store PATH] [--json]\n       agent-cron.sh add <task-id> --schedule EXPR --prompt TEXT [--name N] [--timezone IANA] [--notify none|telegram-owner|telegram-owner-on-failure|telegram-chat|telegram-chat-on-failure] [--notify-chat-id ID] [--allowed-tools a,b] [--permission-mode M] [--catch-up-policy P] [--max-catchup N] [--lock-timeout-sec N] [--anchor-at ISO] [--not-before ISO] [--max-runs N] [--keep-after-run] [--disabled] [--argv WORD ...] [--cwd DIR] [--model M] [--timeout-sec N] [--output-max-bytes N] [--json]\n       agent-cron.sh edit <task-id> [same flags as add; set-only partial update] [--json]\n       agent-cron.sh remove|enable|disable <task-id> [--json]\n       agent-cron.sh due [--store PATH] [--at ISO8601] [--json]\n       agent-cron.sh lock <task-id> --action acquire|release|probe --run-id ID [--scheduled-at ISO8601] [--at ISO8601] [--json]\n       agent-cron.sh run <task-id> --dry-run [--at ISO8601] [--json]\n       agent-cron.sh scheduler --dry-run|--execute [--at ISO8601] [--max-runs N] [--json]\n\nImplemented slices:\n- list/validate: inspect and validate the task definition store.\n- due: read-only dry-run schedule resolver. It reports due tasks, missed windows,\n  catch-up policy, retryEligibleAt state, and lock paths, but never executes\n  prompts or writes state.\n- lock: local atomic task-lock acquire/release/probe primitives only. It writes\n  lock files under the task store's sibling locks/ directory, but never executes\n  prompts, sends notifications, installs schedulers, or updates task history.\n- run --dry-run: read-only execution-plan preview. It combines due, lock probe,\n  task policy, and headless command metadata, but never acquires locks, executes\n  prompts, sends notifications, installs schedulers, or updates task history.\n- scheduler --dry-run: read-only single-tick scheduler plan. It reports which\n  tasks would run or skip, including retry-due tasks, but never installs timers,\n  acquires locks, executes prompts, writes task state, or sends notifications.\n- scheduler --execute: explicit one-shot scheduler executor for approved live/systemd\n  use. It runs at most --max-runs due/retry-due tasks through the existing run path;\n  it never installs timers or edits crontab/systemd.\n- run: explicit manual execution for due enabled tasks. It acquires the task lock,\n  invokes ccc-headless, records lastRunAt/lastStatus/lastRunId, writes a\n  redacted owner-only bridge spool entry when notify=telegram-owner, appends a\n  bounded runHistory entry, records retryState/retryEligibleAt on failure, clears\n  retryState on success, and releases the lock in all normal failure/success\n  paths. It still does not call Telegram\n  or provider APIs, install schedulers, mutate crontab/systemd, or touch remotes.\n\nNo direct Telegram/API send, scheduler bootstrap, systemd/crontab writes,\nprovider sends, or remote-node actions are performed by agent-cron itself.\n"
+_USAGE = "Usage: agent-cron.sh [list|validate|status] [--store PATH] [--json]\n       agent-cron.sh add <task-id> --schedule EXPR --prompt TEXT [--name N] [--timezone IANA] [--notify none|telegram-owner|telegram-owner-on-failure|telegram-chat|telegram-chat-on-failure] [--notify-chat-id ID] [--allowed-tools a,b] [--success-exit-codes 0,1] [--permission-mode M] [--catch-up-policy P] [--max-catchup N] [--lock-timeout-sec N] [--anchor-at ISO] [--not-before ISO] [--max-runs N] [--keep-after-run] [--disabled] [--argv WORD ...] [--cwd DIR] [--model M] [--timeout-sec N] [--output-max-bytes N] [--json]\n       agent-cron.sh edit <task-id> [same flags as add; set-only partial update] [--json]\n       agent-cron.sh remove|enable|disable <task-id> [--json]\n       agent-cron.sh due [--store PATH] [--at ISO8601] [--json]\n       agent-cron.sh lock <task-id> --action acquire|release|probe --run-id ID [--scheduled-at ISO8601] [--at ISO8601] [--json]\n       agent-cron.sh run <task-id> --dry-run [--at ISO8601] [--json]\n       agent-cron.sh scheduler --dry-run|--execute [--at ISO8601] [--max-runs N] [--json]\n\nImplemented slices:\n- list/validate: inspect and validate the task definition store.\n- due: read-only dry-run schedule resolver. It reports due tasks, missed windows,\n  catch-up policy, retryEligibleAt state, and lock paths, but never executes\n  prompts or writes state.\n- lock: local atomic task-lock acquire/release/probe primitives only. It writes\n  lock files under the task store's sibling locks/ directory, but never executes\n  prompts, sends notifications, installs schedulers, or updates task history.\n- run --dry-run: read-only execution-plan preview. It combines due, lock probe,\n  task policy, and headless command metadata, but never acquires locks, executes\n  prompts, sends notifications, installs schedulers, or updates task history.\n- scheduler --dry-run: read-only single-tick scheduler plan. It reports which\n  tasks would run or skip, including retry-due tasks, but never installs timers,\n  acquires locks, executes prompts, writes task state, or sends notifications.\n- scheduler --execute: explicit one-shot scheduler executor for approved live/systemd\n  use. It runs at most --max-runs due/retry-due tasks through the existing run path;\n  it never installs timers or edits crontab/systemd.\n- run: explicit manual execution for due enabled tasks. It acquires the task lock,\n  invokes ccc-headless, records lastRunAt/lastStatus/lastRunId, writes a\n  redacted owner-only bridge spool entry when notify=telegram-owner, appends a\n  bounded runHistory entry, records retryState/retryEligibleAt on failure, clears\n  retryState on success, and releases the lock in all normal failure/success\n  paths. It still does not call Telegram\n  or provider APIs, install schedulers, mutate crontab/systemd, or touch remotes.\n\nNo direct Telegram/API send, scheduler bootstrap, systemd/crontab writes,\nprovider sends, or remote-node actions are performed by agent-cron itself.\n"
 
 
 def _die(message, code=2):
@@ -87,6 +87,7 @@ from agent_cron_lib import (  # noqa: E402
     parse_schedule,
     retry_view,
     apply_retry_transition,
+    success_exit_codes,
     schedule_occurrences,
     next_after,
     fmt_dt,
@@ -611,6 +612,11 @@ def agent_cron_status(data):
         task_id = row.get('id')
         task = task_by_id(data, task_id) if task_id else None
         last_status = task.get('lastStatus') if isinstance(task, dict) else None
+        last_exit = None
+        if isinstance(task, dict):
+            history = task.get('runHistory')
+            if isinstance(history, list) and history and isinstance(history[-1], dict):
+                last_exit = history[-1].get('exitCode')
         health = 'healthy'
         if status == 'disabled':
             health = 'disabled'
@@ -644,6 +650,7 @@ def agent_cron_status(data):
             'status': status,
             'enabled': row.get('enabled'),
             'lastStatus': last_status,
+            'lastExitCode': last_exit,
             'lastRunAt': task.get('lastRunAt') if isinstance(task, dict) else None,
             'lastRunId': task.get('lastRunId') if isinstance(task, dict) else None,
             'scheduledAt': row.get('scheduledAt'),
@@ -675,11 +682,13 @@ def emit_status(result, as_json):
     print(f"- store: `{result.get('store')}`")
     print(f"- at: `{result.get('at') or ''}`")
     print('- mode: read-only; no task execution, lock acquire, spool write, scheduler install, or state writes\n')
-    print('| id | health | last status | retry | next due | lock |')
-    print('|---|---|---|---|---|---|')
+    print('| id | health | last status | exit | retry | next due | lock |')
+    print('|---|---|---|---|---|---|---|')
     for t in result.get('tasks', []):
         retry = t.get('retryEligibleAt') or ('exhausted' if t.get('retryExhausted') else '')
-        print(f"| `{t.get('id')}` | `{t.get('health')}` | `{t.get('lastStatus') or ''}` | `{retry}` | `{t.get('nextDueAt') or ''}` | `{t.get('lockState')}` |")
+        exit_code = t.get('lastExitCode')
+        exit_str = '' if exit_code is None else str(exit_code)
+        print(f"| `{t.get('id')}` | `{t.get('health')}` | `{t.get('lastStatus') or ''}` | `{exit_str}` | `{retry}` | `{t.get('nextDueAt') or ''}` | `{t.get('lockState')}` |")
 
 
 def scheduler_actions(plan):
@@ -1461,7 +1470,11 @@ def run_execute(data, task_id, at_value, as_json):  # noqa: C901 -- #348 baselin
     try:
         try:
             headless = run_headless(task)
-            ok = headless.get('exitCode') == 0
+            exit_code = headless.get('exitCode')
+            ok = exit_code in success_exit_codes(task)
+            # A timed-out run is never a success even if 124 were listed.
+            if ok and headless.get('timedOut'):
+                ok = False
             if ok:
                 status = 'success'
             elif headless.get('timedOut'):
@@ -1647,6 +1660,21 @@ def _crud_csv(value, flag):
     return [item for item in value.split(',') if item]
 
 
+def _crud_int_csv(value, flag):
+    out = []
+    for item in value.split(','):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            out.append(int(item))
+        except ValueError:
+            raise ValueError(f'{flag} requires a comma-separated integer list') from None
+    if not out:
+        raise ValueError(f'{flag} requires at least one value') from None
+    return out
+
+
 # flag -> (bucket, field key, cast). bucket 'argv' appends command words.
 CRUD_VALUE_FLAGS = {
     '--schedule': ('fields', 'schedule', _crud_str),
@@ -1661,6 +1689,7 @@ CRUD_VALUE_FLAGS = {
     '--not-before': ('fields', 'notBefore', _crud_str),
     '--redact-profile': ('fields', 'redactProfile', _crud_str),
     '--allowed-tools': ('fields', 'allowedTools', _crud_csv),
+    '--success-exit-codes': ('fields', 'successExitCodes', _crud_int_csv),
     '--max-catchup': ('fields', 'maxCatchup', _crud_int),
     '--lock-timeout-sec': ('fields', 'lockTimeoutSec', _crud_int),
     '--max-run-history': ('fields', 'maxRunHistory', _crud_int),
