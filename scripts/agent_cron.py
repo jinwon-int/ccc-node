@@ -248,12 +248,13 @@ def lock_status(task_id, task, at):
     timeout = task.get('lockTimeoutSec', 0) if isinstance(task, dict) else 0
     age = lock_age(lock, at)
     current_boot = boot_id()
+    quarantined = lock.get('state') == 'persist-failed'
     stale = bool(lock.get('error'))
-    if not stale and lock.get('bootId') and current_boot and lock.get('bootId') != current_boot:
+    if not stale and not quarantined and lock.get('bootId') and current_boot and lock.get('bootId') != current_boot:
         stale = True
-    if not stale and timeout and age is not None and age > timeout:
+    if not stale and not quarantined and timeout and age is not None and age > timeout:
         stale = True
-    state = 'stale' if stale else 'held'
+    state = 'stale' if stale else ('persist-failed' if quarantined else 'held')
     base.update({'lockState': state, 'holder': lock, 'lockAgeSec': age, 'lockTimeoutSec': timeout})
     return base
 
@@ -266,6 +267,24 @@ def write_lock(path, payload):
         os.write(fd, (json.dumps(payload, ensure_ascii=False, sort_keys=True) + '\n').encode('utf-8'))
     finally:
         os.close(fd)
+
+
+def replace_lock(path, payload):
+    """Atomically replace an owned lock record without a torn JSON window."""
+    temporary = path.with_name(f'.{path.name}.tmp.{os.getpid()}')
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    try:
+        fd = os.open(str(temporary), flags, 0o600)
+        try:
+            os.write(fd, (json.dumps(payload, ensure_ascii=False, sort_keys=True) + '\n').encode('utf-8'))
+        finally:
+            os.close(fd)
+        temporary.replace(path)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def parse_lock_args():
@@ -345,8 +364,8 @@ def lock_command(data):
             return result, as_json, 0
         # acquire
         reclaimed = False
-        if status['lockState'] == 'held':
-            result.update({'ok': False, 'lockState': 'held', 'runId': run_id})
+        if status['lockState'] in {'held', 'persist-failed'}:
+            result.update({'ok': False, 'lockState': status['lockState'], 'runId': run_id})
             return result, as_json, 1
         if status['lockState'] == 'stale':
             stale_path = path.with_name(f'{path.name}.stale.{int(at.timestamp())}.{os.getpid()}')
@@ -454,7 +473,9 @@ def due_plan(data):  # noqa: C901 -- #348 baseline hotspot
                 else:
                     row['dueCount'] = 1
                 row['missedRuns'] = max(0, raw_missed - row['dueCount'])
-                if row['lockState'] == 'held':
+                if row['lockState'] == 'persist-failed':
+                    row['status'] = 'persist-failed'
+                elif row['lockState'] == 'held':
                     row['status'] = 'locked'
                 elif row['lockState'] == 'stale':
                     row['status'] = 'stale-lock'
@@ -472,7 +493,9 @@ def due_plan(data):  # noqa: C901 -- #348 baseline hotspot
                         row['dueCount'] = 1
                         row['scheduledAt'] = retry['state'].get('scheduledAt')
                         row['status'] = 'retry-due'
-                        if row['lockState'] == 'held':
+                        if row['lockState'] == 'persist-failed':
+                            row['status'] = 'persist-failed'
+                        elif row['lockState'] == 'held':
                             row['status'] = 'locked'
                         elif row['lockState'] == 'stale':
                             row['status'] = 'stale-lock'
@@ -554,6 +577,8 @@ def agent_cron_status(data):
             health = 'completed'
         elif status in {'locked', 'stale-lock'}:
             health = 'locked'
+        elif status == 'persist-failed':
+            health = 'failed'
         elif status == 'retry-exhausted':
             health = 'retry-exhausted'
         elif status == 'retry-wait':
@@ -625,8 +650,8 @@ def scheduler_actions(plan):
         reason = status or 'unknown'
         if not row.get('enabled'):
             reason = 'run-limit-reached' if status == 'run-limit-reached' else 'disabled'
-        elif row.get('due') and lock_state == 'held':
-            reason = 'locked'
+        elif row.get('due') and lock_state in {'held', 'persist-failed'}:
+            reason = 'persist-failed' if lock_state == 'persist-failed' else 'locked'
         elif row.get('due'):
             action = 'would-run'
             reason = status or 'due'
@@ -701,6 +726,7 @@ def scheduler_execute(data, plan, actions, at_value, as_json, max_runs):
     any_spool = False
     any_history = False
     any_lock = False
+    any_task_write = False
     for action in selected:
         result, _json, _rc = run_execute(data, action['taskId'], at_value or plan.get('at'), True)
         results.append(result)
@@ -709,6 +735,7 @@ def scheduler_execute(data, plan, actions, at_value, as_json, max_runs):
         any_spool = any_spool or bool(m.get('pushSpoolWrite'))
         any_history = any_history or bool(m.get('historyAppend'))
         any_lock = any_lock or bool(m.get('lockAcquire'))
+        any_task_write = any_task_write or bool(m.get('taskStoreWrite'))
     return {
         'ok': True,
         'mode': 'scheduler-execute-one-shot',
@@ -721,7 +748,7 @@ def scheduler_execute(data, plan, actions, at_value, as_json, max_runs):
         'truncated': len(runnable) > len(selected),
         'results': results,
         'errors': plan.get('errors', []),
-        'mutations': mutation_flags(any_lock, bool(results), any_headless, any_spool, any_history),
+        'mutations': mutation_flags(any_lock, any_task_write, any_headless, any_spool, any_history),
     }, as_json, 0
 
 
@@ -946,8 +973,8 @@ def apply_run_limit(task):
 def acquire_for_run(task_id, task, run_id, scheduled_at, at):
     path = lock_path(task_id)
     status = lock_status(task_id, task, at)
-    if status['lockState'] == 'held':
-        return False, {'state': 'held', 'path': str(path), 'holder': status.get('holder')}
+    if status['lockState'] in {'held', 'persist-failed'}:
+        return False, {'state': status['lockState'], 'path': str(path), 'holder': status.get('holder')}
     if status['lockState'] == 'stale':
         stale_path = path.with_name(f'{path.name}.stale.{int(at.timestamp())}.{os.getpid()}')
         try:
@@ -982,6 +1009,37 @@ def release_for_run(task_id, run_id):
         return {'ok': False, 'state': 'release-mismatch', 'holder': lock}
     path.unlink()
     return {'ok': True, 'state': 'released'}
+
+
+def quarantine_persist_failure(task_id, run_id, at):
+    """Retain a non-expiring lock after a run-state write failure.
+
+    The headless work and notification have already happened.  Releasing the
+    ordinary run lock would let the next scheduler tick execute the same
+    occurrence again, while its timeout would eventually reclaim a merely
+    retained lock.  Mark this exact run as persist-failed so only an explicit
+    matching `agent-cron lock ... --action release --run-id ...` can unblock it.
+    """
+    path, lock = read_lock(task_id)
+    if lock is None:
+        return {'ok': False, 'state': 'persist-quarantine-missing', 'path': str(lock_path(task_id))}
+    if lock.get('runId') != run_id:
+        return {'ok': False, 'state': 'persist-quarantine-mismatch', 'path': str(path), 'holder': lock}
+    quarantined = {
+        **lock,
+        'state': 'persist-failed',
+        'persistFailedAt': fmt_dt(at),
+    }
+    try:
+        replace_lock(path, quarantined)
+    except Exception as error:
+        return {
+            'ok': False,
+            'state': 'persist-quarantine-error',
+            'path': str(path),
+            'error': short_text(str(error)),
+        }
+    return {'ok': True, 'state': 'persist-failed', 'path': str(path), 'holder': quarantined}
 
 
 def short_text(text, limit=4000):
@@ -1350,6 +1408,7 @@ def run_execute(data, task_id, at_value, as_json):  # noqa: C901 -- #348 baselin
     rc = 1
     one_shot_disabled = False
     persist_error = None
+    persisted = False
     try:
         try:
             headless = run_headless(task)
@@ -1417,11 +1476,14 @@ def run_execute(data, task_id, at_value, as_json):  # noqa: C901 -- #348 baselin
         # occurrence as never-run and executes (and notifies) it again.
         # Report the persist failure against the real mode instead.
         try:
-            commit_run_state(task_id, task, disable=task.get('enabled') is False)
+            persisted = bool(commit_run_state(task_id, task, disable=task.get('enabled') is False))
         except Exception as e:
             persist_error = short_text(str(e))
     finally:
-        release = release_for_run(task_id, run_id)
+        if persist_error is None:
+            release = release_for_run(task_id, run_id)
+        else:
+            release = quarantine_persist_failure(task_id, run_id, at)
     result = {
         **base,
         'ok': ok,
@@ -1433,7 +1495,13 @@ def run_execute(data, task_id, at_value, as_json):  # noqa: C901 -- #348 baselin
         'oneShotDisabled': one_shot_disabled,
         'retry': retry,
         'runLimit': run_limit,
-        'mutations': mutation_flags(True, headless is not None, headless is not None, notification.get('delivery') == 'spooled', True),
+        'mutations': mutation_flags(
+            True,
+            persisted,
+            headless is not None,
+            notification.get('delivery') == 'spooled',
+            persisted,
+        ),
     }
     if persist_error is not None:
         # The run really happened; only its durable record failed. Surface it

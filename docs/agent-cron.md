@@ -20,6 +20,13 @@
 - `scripts/agent-cron.sh scheduler --dry-run` — one scheduler tick preview.
 - `scripts/agent-cron.sh scheduler --execute` — explicit one-shot execution path for an already-approved scheduler unit.
 
+If headless work completes but its run-state commit fails, agent-cron reports
+`status=persist-failed` and converts that run's lock into a non-expiring
+quarantine. This prevents the next scheduler tick from executing and notifying
+the same occurrence again. After repairing the task store, inspect the holder
+with `lock <task-id> --action probe --json`, then explicitly clear it with the
+matching run id: `lock <task-id> --action release --run-id <run-id> --json`.
+
 ## Headless runners
 
 The installer defaults to the existing Claude runner. Use `--runner codex` to
