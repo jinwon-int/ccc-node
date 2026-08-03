@@ -178,12 +178,17 @@ def commit_run_state(task_id, task, disable=False):
     it back — often for minutes — so it cannot hold the lock across that window.
     Instead it re-reads under the lock at write time and projects only the run
     fields onto the fresh task, leaving any edit made meanwhile intact. Returns
-    False when the task was removed while the run was in flight.
+    False only when the task was removed while the run was in flight. Store
+    load failures raise so run_execute quarantines the completed occurrence
+    instead of releasing it for duplicate execution.
     """
     with store_lock():
         fresh, errors = load_doc()
-        if errors or not isinstance(fresh, dict):
-            return False
+        if errors:
+            detail = '; '.join(str(error) for error in errors)
+            raise RuntimeError(f'task store load failed during run-state commit: {detail[:2000]}')
+        if not isinstance(fresh, dict):
+            raise RuntimeError('task store load failed during run-state commit: root is not an object')
         target = task_by_id(fresh, task_id)
         if target is None:
             return False

@@ -131,6 +131,26 @@ ok "successful retry is recorded" \
 ok "successful retry removes the recovery snapshot" \
   '! compgen -G "$STATE/self-update-install-rollback.*" >/dev/null'
 
+# A success-path cleanup failure must not be hidden by clearing the snapshot
+# variable and continuing to an `ok` audit. Inject an rm that fails only for
+# the private recovery directory; all earlier setup/deploy work remains real.
+cat > "$FAKEBIN/rm" <<'SH'
+#!/usr/bin/env bash
+case "$*" in *self-update-install-rollback.*) exit 97 ;; esac
+exec /bin/rm "$@"
+SH
+chmod +x "$FAKEBIN/rm"
+rm -f "$TMP/spool"/*.json
+out="$(PATH="$FAKEBIN:$PATH" run_selfup run --force 2>&1)"; rc=$?
+ok "snapshot cleanup failure exits fail-closed" \
+  '[ "$rc" = 10 ] && grep -q "snapshot cleanup failed" <<<"$out"'
+ok "snapshot cleanup failure is audited without a false success" \
+  'grep -q "\"result\":\"snapshot-cleanup-failed\"" "$STATE/self-update.log" && [ "$(grep "\"result\":" "$STATE/self-update.log" | tail -1 | jq -r .result)" = "snapshot-cleanup-failed" ]'
+ok "snapshot cleanup failure retains and reports the recovery path" \
+  'compgen -G "$STATE/self-update-install-rollback.*" >/dev/null && grep -q "retained path" <<<"$out" && jq -r .text "$TMP/spool"/*SelfUpdate*.json | grep -q "잔존 경로"'
+rm -f "$FAKEBIN/rm"
+rm -rf "$STATE"/self-update-install-rollback.*
+
 # Snapshot permission failures must be fail-closed even though the snapshot
 # helper is called in an `if ! ...` conditional (where Bash suppresses errexit
 # inside the function body).
