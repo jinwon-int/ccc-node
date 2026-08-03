@@ -7,6 +7,10 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 . "$ROOT/scripts/lib/harness-paths.sh"
 DOCTOR="$ROOT/scripts/ccc-doctor.sh"
 pass=0; fail=0
+# Hermetic default: provider-specific cases below opt in per invocation. A live
+# bridge shell may export these and must not turn every generic fixture into a
+# Codex-readiness probe.
+unset CCC_AGENT_PROVIDER CCC_CODEX_CLI_PATH CCC_CODEX_READINESS_TIMEOUT
 # Some hardened runners mount /tmp noexec; the doctor must execute fixture CLIs.
 TMP_BASE="${TMPDIR:-$(dirname "$ROOT")}"; mkdir -p "$TMP_BASE"
 TMP="$(mktemp -d "$TMP_BASE/ccc-doctor-test.XXXXXX")"
@@ -35,6 +39,7 @@ make_fixture() { # <name> <mode:standalone|plugin>
   cp "$ROOT/claude/settings.local.template.json" "$dir/repo/claude/settings.local.template.json"
   cp "$ROOT/claude/hooks/enforcement-overlay.json" "$dir/repo/claude/hooks/enforcement-overlay.json"
   cp "$ROOT/claude/hooks/hooks.json" "$dir/repo/claude/hooks/hooks.json"
+  cp "$ROOT/bridge/runtime_config_check.py" "$dir/repo/bridge/runtime_config_check.py"
   # Deploy the whole hook tree into both sides the way setup.sh does — via the
   # shared walk, not a hand-kept list. The list this replaced named the same 8
   # hooks doctor used to watch, so as hooks were added the fixture drifted with
@@ -55,7 +60,7 @@ make_fixture() { # <name> <mode:standalone|plugin>
   # NOT knowing about this rewrite, and the fixture must exercise the rewritten
   # comparison path rather than only the byte-exact one.
   rewrite_installed "$dir"
-  printf '#!/usr/bin/env bash\n[ "$1" = "--status" ] || [ "$3" = "--status" ] || true\necho bridge status ok\n' > "$dir/repo/bridge/start.sh"
+  printf '#!/usr/bin/env bash\n[ "$1" = "--status" ] || [ "$3" = "--status" ] || true\necho "🟢 Bot status: available"\n' > "$dir/repo/bridge/start.sh"
   chmod +x "$dir/repo/bridge/start.sh"
   if [ "$mode" = standalone ]; then
     jq -s '.[0] as $b | .[1] as $o | $b | .hooks = ($b.hooks + $o.hooks)' \
@@ -70,8 +75,11 @@ make_fixture() { # <name> <mode:standalone|plugin>
 
 run_doctor() { # <fixture-dir> [args...]
   local dir="$1"; shift
-  CCC_DOCTOR_REPO_DIR="$dir/repo" CCC_DOCTOR_CLAUDE_DIR="$dir/home/.claude" \
-    bash "$DOCTOR" "$@"
+  (
+    unset CLAUDE_PROCESS_TIMEOUT CCC_DELEGATED_TASK_STALL_SECONDS
+    CCC_DOCTOR_REPO_DIR="$dir/repo" CCC_DOCTOR_CLAUDE_DIR="$dir/home/.claude" \
+      CCC_DOCTOR_BRIDGE_PROJECT_ROOT="$dir/home" bash "$DOCTOR" "$@"
+  )
 }
 
 make_fake_codex() { # <fixture-dir>
@@ -125,6 +133,19 @@ ok "clean standalone exits 0" '[ "$rc" = 0 ]'
 ok "clean output reports 정상" 'grep -q "정상" <<<"$out"'
 ok "clean output reports standalone mode" 'grep -q "mode.*standalone" <<<"$out"'
 ok "clean output reports harness version" 'grep -q "harness version" <<<"$out"'
+
+# 2026-08-03 dungae regression: a legacy one-hour process timeout combined
+# with the new two-hour delegated-task default crash-looped the bridge, while
+# doctor called the status merely "readable" and offered no repair boundary.
+legacy_timeout="$(make_fixture legacy-timeout standalone)"
+printf '%s\n' 'CLAUDE_PROCESS_TIMEOUT=3600' > "$legacy_timeout/repo/bridge/.env"
+out="$(run_doctor "$legacy_timeout" 2>&1)"; rc=$?
+ok "timeout invariant makes doctor fail closed" '[ "$rc" = 1 ]'
+ok "timeout invariant is classified manual without values" \
+  'grep -q "bridge runtime config.*delegated-task-stall-not-lower-than-process-timeout" <<<"$out" && grep -q "수동필요" <<<"$out"'
+out="$(run_doctor "$legacy_timeout" --fix 2>&1)"; rc=$?
+ok "doctor refuses to auto-edit operator bridge env" \
+  '[ "$rc" = 1 ] && grep -q "manual items present" <<<"$out"'
 
 # Phantom-drift regression (2026-07-30 fleet sweep). Five correctly installed
 # nodes — yukson, gwakga, gongmyoung, gongyung, daegyo — reported 교정가능 for

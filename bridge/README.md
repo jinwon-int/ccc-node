@@ -317,6 +317,7 @@ a provider turn or reads transcript/credential files.
 | `CLAUDE_CLI_PATH` | No | *(auto-detect)* | Absolute path to Claude CLI binary |
 | `CLAUDE_SETTINGS_PATH` | No | `~/.claude/settings.json` | Path to Claude Code settings file |
 | `CLAUDE_PROCESS_TIMEOUT` | No | `21600` | Whole-turn SDK timeout in seconds (6 hours; snapshotted at process start) |
+| `CCC_DELEGATED_TASK_STALL_SECONDS` | No | `7200` | Hard limit for the oldest delegated task; must be lower than `CLAUDE_PROCESS_TIMEOUT` |
 | `CCC_APPROVAL_STALL_SECONDS` | No | `120` | Fail an admitted turn whose provider approval remains pending for this many wall-clock seconds; `0` disables this guard |
 | `CCC_MAX_DOCUMENT_SIZE_MB` | No | `10` | Maximum inbound Telegram document size in decimal MB (1–20) |
 | `AUTO_NEW_SESSION_AFTER_HOURS` | No | `24` | Auto-start new session after N hours of inactivity; set to `0`/`false`/`off` to disable |

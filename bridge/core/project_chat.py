@@ -60,8 +60,6 @@ from telegram_bot.core.tool_policy import (  # noqa: E402
     running_as_root,
 )
 
-PROCESS_TIMEOUT = int(os.getenv("CLAUDE_PROCESS_TIMEOUT", "21600"))
-
 # Compatibility knobs for legacy direct-construction tests. Production always
 # injects Settings and therefore never reads these module values.
 EXECUTION_PROFILE = EXECUTION_STRICT_PROJECT
@@ -211,15 +209,11 @@ class ProjectChatHandler(
         self._clock = clock or time
         # Opt-in lifecycle audit observer (#645); None on a default node.
         self._lifecycle_observer = build_lifecycle_observer(self._config)
-        self._process_timeout_seconds = PROCESS_TIMEOUT
-        delegated_task_stall_seconds = float(
-            getattr(self._config, "delegated_task_stall_seconds", 7200.0)
+        # Production always injects validated Settings. The fallback preserves
+        # legacy lightweight test adapters that pass a partial namespace.
+        self._process_timeout_seconds = int(
+            getattr(self._config, "process_timeout_seconds", 21600)
         )
-        if delegated_task_stall_seconds >= self._process_timeout_seconds:
-            raise ValueError(
-                "CCC_DELEGATED_TASK_STALL_SECONDS must be lower than "
-                "CLAUDE_PROCESS_TIMEOUT"
-            )
         self._typing_interval_seconds = TYPING_INTERVAL
         self._conversation_locks: Dict[Tuple[int, int], asyncio.Lock] = {}
         self._claude_usage: Dict[Tuple[int, int, str], UsageSnapshot] = {}

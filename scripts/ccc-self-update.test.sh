@@ -2,6 +2,7 @@
 # Tests for ccc-self-update.sh — hermetic: fixture git repos + fake systemctl.
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
+ROOT="$(cd "$HERE/.." && pwd)"
 SELFUP="$HERE/ccc-self-update.sh"
 # shellcheck source=claude/hooks/lib/test-stub.sh
 . "$HERE/../claude/hooks/lib/test-stub.sh"
@@ -34,6 +35,7 @@ cat > "$TMP/seed/setup.sh" <<'SH'
 #!/usr/bin/env bash
 echo "setup ran at $(git rev-parse --short HEAD)" >> "${SETUP_MARKER:?}"
 SH
+printf '%s\n' 'bridge/.env' > "$TMP/seed/.gitignore"
 git -C "$TMP/seed" add -A && git -C "$TMP/seed" commit -qm one
 git -C "$TMP/seed" remote add origin "$ORIGIN" && git -C "$TMP/seed" push -q origin main
 git -C "$ORIGIN" symbolic-ref HEAD refs/heads/main
@@ -59,6 +61,7 @@ export SETUP_MARKER="$TMP/setup.marker"
 run_selfup() {
   CCC_CLAUDE_DIR="$CLAUDE" CCC_STATE_DIR="$STATE" CCC_PUSH_SPOOL="$TMP/spool" \
   CCC_HERMES_DIR="$HERMES" \
+  CCC_SELF_UPDATE_BRIDGE_PROJECT_ROOT="$TMP/project" \
   CCC_SELF_UPDATE_REPO="$REPO" CCC_SELF_UPDATE_SYSTEMCTL="$FAKEBIN/fakesystemctl" \
   CCC_NODE=testnode bash "$SELFUP" "$@"
 }
@@ -81,6 +84,31 @@ ok "audit record written" 'grep -q "\"result\":\"ok\"" "$STATE/self-update.log"'
 ok "owner notification queued" 'ls "$TMP/spool"/*SelfUpdate*.json >/dev/null 2>&1 && jq -r .text "$TMP/spool"/*SelfUpdate*.json | grep -q "self-update 완료"'
 ok "successful update removes private recovery snapshot" \
   '! compgen -G "$STATE/self-update-install-rollback.*" >/dev/null'
+
+# A target commit must not restart into existing invalid node-local bridge
+# timeout settings; it rolls back before systemctl touches the allowlisted unit.
+mkdir -p "$TMP/seed/bridge"
+cp "$ROOT/bridge/runtime_config_check.py" "$TMP/seed/bridge/runtime_config_check.py"
+git -C "$TMP/seed" add bridge/runtime_config_check.py
+git -C "$TMP/seed" commit -qm add-bridge-runtime-preflight
+git -C "$TMP/seed" push -q origin main
+mkdir -p "$REPO/bridge"
+printf '%s\n' 'CLAUDE_PROCESS_TIMEOUT=3600' > "$REPO/bridge/.env"
+printf '%s\n' 'ccc-telegram-bridge.service' > "$CLAUDE/self-update.services"
+OLD_HEAD="$(git -C "$REPO" rev-parse HEAD)"
+: > "$TMP/systemctl.calls"
+out="$(run_selfup run 2>&1)"; rc=$?
+ok "invalid bridge runtime config aborts before restart" \
+  '[ "$rc" = 6 ] && grep -q "preflight failed" <<<"$out" && [ ! -s "$TMP/systemctl.calls" ]'
+ok "invalid bridge runtime config rolls repository back" \
+  '[ "$(git -C "$REPO" rev-parse HEAD)" = "$OLD_HEAD" ] && grep -q "bridge-config-preflight-failed-rolled-back" "$STATE/self-update.log"'
+
+# Repair the node-local setting; the same target commit must now pass the gate.
+printf '%s\n' 'CLAUDE_PROCESS_TIMEOUT=3600' \
+  'CCC_DELEGATED_TASK_STALL_SECONDS=1800' > "$REPO/bridge/.env"
+out="$(run_selfup run 2>&1)"; rc=$?
+ok "valid bridge runtime config permits allowlisted restart" \
+  '[ "$rc" = 0 ] && grep -q "restart ccc-telegram-bridge.service" "$TMP/systemctl.calls"'
 
 # Snapshot permission failures must be fail-closed even though the snapshot
 # helper is called in an `if ! ...` conditional (where Bash suppresses errexit

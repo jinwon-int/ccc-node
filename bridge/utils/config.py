@@ -15,6 +15,10 @@ from pydantic_settings import (
     SettingsConfigDict,
 )
 
+from telegram_bot.runtime_config_check import (
+    DEFAULT_PROCESS_TIMEOUT_SECONDS,
+    validate_timeout_invariant,
+)
 from telegram_bot.utils.settings_heartbeat import HeartbeatSettingsMixin
 from telegram_bot.utils.settings_memory import MemorySettingsMixin
 from telegram_bot.utils.settings_voice import VoiceSettingsMixin
@@ -231,6 +235,12 @@ class Config(
             "autonomous spend and gated by the daily budget; default off = "
             "no behavior change. Claude provider only."
         ),
+    )
+    process_timeout_seconds: int = Field(
+        default=DEFAULT_PROCESS_TIMEOUT_SECONDS,
+        alias="CLAUDE_PROCESS_TIMEOUT",
+        gt=0,
+        description="Whole-turn provider process timeout in seconds.",
     )
     claude_cli_path: Optional[Path] = Field(
         default=None,
@@ -861,6 +871,14 @@ class Config(
         alias="CCC_MAX_DOCUMENT_SIZE_MB",
         description="Maximum inbound Telegram document size in decimal megabytes",
     )
+
+    @model_validator(mode="after")
+    def validate_runtime_timeout_order(self):
+        validate_timeout_invariant(
+            self.process_timeout_seconds,
+            self.delegated_task_stall_seconds,
+        )
+        return self
 
     @model_validator(mode="after")
     def validate_bridge_web_mcp_config(self):

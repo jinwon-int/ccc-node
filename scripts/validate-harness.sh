@@ -218,6 +218,7 @@ if command -v python3 >/dev/null 2>&1; then
   if python3 -m py_compile claude/hooks/skill-review/curator.py 2>/dev/null; then say "  ok claude/hooks/skill-review/curator.py compiles"; else err "py_compile: claude/hooks/skill-review/curator.py"; fi
   if python3 -m py_compile scripts/ccc_codex_github_policy.py 2>/dev/null; then say "  ok scripts/ccc_codex_github_policy.py compiles"; else err "py_compile: scripts/ccc_codex_github_policy.py"; fi
   if python3 -m py_compile scripts/ccc_memory_probe.py 2>/dev/null; then say "  ok scripts/ccc_memory_probe.py compiles"; else err "py_compile: scripts/ccc_memory_probe.py"; fi
+  if python3 -m py_compile bridge/runtime_config_check.py 2>/dev/null; then say "  ok bridge/runtime_config_check.py compiles"; else err "py_compile: bridge/runtime_config_check.py"; fi
 else
   say "  (python3 absent — skipped)"
 fi
@@ -236,6 +237,12 @@ if python3 scripts/ccc_doctor_bootpath_test.py >"$TMP/doctor-bootpath-test.out" 
 else
   err "doctor bridge boot-path guard tests failed"
   tail -10 "$TMP/doctor-bootpath-test.out" 2>/dev/null
+fi
+if python3 scripts/ccc_doctor_bridge_status_test.py >"$TMP/doctor-bridge-status-test.out" 2>&1; then
+  say "  ok doctor bridge status verdict tests"
+else
+  err "doctor bridge status verdict tests failed"
+  tail -10 "$TMP/doctor-bridge-status-test.out" 2>/dev/null
 fi
 if python3 scripts/ccc_doctor_hookfiles_test.py >"$TMP/doctor-hookfiles-test.out" 2>&1; then
   say "  ok doctor hook-tree walk tests"

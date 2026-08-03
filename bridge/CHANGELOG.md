@@ -1,5 +1,10 @@
 # Changelog
 
+- **Bridge timeout configuration preflight.** Runtime settings, `ccc-doctor`,
+  and self-update now share a body-free guard requiring delegated-task stall
+  time to remain below the whole-turn process timeout. Doctor no longer calls
+  degraded/unavailable status output healthy merely because it was readable.
+
 - **Bound approval snapshots and decision audit (#870).** Claude and Codex
   `approve-each` requests now show the sole owner a bounded, redacted target
   summary instead of a generic action label. Keyed request fingerprints and an
