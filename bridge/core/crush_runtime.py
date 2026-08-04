@@ -67,9 +67,30 @@ _CRUSH_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
 _INHERITED_ENV_BLOCKLIST = frozenset({"ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"})
 
 
+# Tools pre-approved when the operator's bash policy is auto-approve. crush
+# asks for some of these and not others — measured on dungae (2026-08-04),
+# `bash` ran without a prompt while `write` raised one. Naming them explicitly
+# removes the round-trip for the whole set instead of leaving it tool-dependent.
+# `question` is deliberately absent: crushrc.bridge denies it outright.
+_PREAPPROVED_TOOLS = (
+    "bash edit write multiedit download fetch agentic_fetch view ls grep glob "
+    "sourcegraph todos agent job_kill job_output crush_info crush_logs "
+    "lsp_call_hierarchy lsp_definition lsp_diagnostics lsp_references "
+    "lsp_rename lsp_replace_symbol lsp_restart lsp_symbols"
+)
+
+
 def _default_crush_config() -> Path:
-    """Fleet-managed crushrc shipped next to the headless runner (#938)."""
-    return Path(__file__).resolve().parents[2] / "crush" / "crushrc.readonly"
+    """Fleet-managed crushrc for the bridge lane (#938).
+
+    Not `crushrc.readonly` — that one is the agent-cron runner's config and
+    denies bash/edit/write. Staging it here left the owner-facing bot unable
+    to run a shell, which is the opposite of this lane's policy
+    (owner-operator / bash_policy=auto-approve). See crush/crushrc.bridge.
+    """
+    return Path(__file__).resolve().parents[2] / "crush" / "crushrc.bridge"
+
+
 _SESSION_READ_LIMIT = 50
 _SESSION_LIST_LIMIT = 100
 _TEXT_BOUND = 2000
@@ -173,6 +194,7 @@ class CrushServerClient:
         executable: str = "crush",
         process_environment: Mapping[str, str] | None = None,
         config_path: str | os.PathLike[str] | None = None,
+        preapprove_tools: bool = False,
         host: str = "127.0.0.1",
         port: int = 0,
         readiness_timeout_seconds: float = 15.0,
@@ -199,7 +221,14 @@ class CrushServerClient:
                     self._config_dir = tempfile.TemporaryDirectory(
                         prefix="ccc-crush-cfg."
                     )
-                    shutil.copyfile(source, Path(self._config_dir.name) / "crushrc")
+                    staged = Path(self._config_dir.name) / "crushrc"
+                    shutil.copyfile(source, staged)
+                    if preapprove_tools:
+                        # Codex gets approval=never under the same operator
+                        # policy; give crush the equivalent so it does not
+                        # round-trip an approval the bridge would allow anyway.
+                        with staged.open("a", encoding="utf-8") as fh:
+                            fh.write(f"\npermissions allow {_PREAPPROVED_TOOLS}\n")
                     self._env["CRUSH_GLOBAL_CONFIG"] = self._config_dir.name
         self._host = host
         self._port = port
@@ -535,6 +564,7 @@ class CrushRuntime:
         executable: str = "crush",
         process_environment: Mapping[str, str] | None = None,
         config_path: str | os.PathLike[str] | None = None,
+        preapprove_tools: bool = False,
     ) -> None:
         if client_factory is not None:
             self._client_factory = client_factory
@@ -544,6 +574,7 @@ class CrushRuntime:
                     executable=executable,
                     process_environment=process_environment,
                     config_path=config_path,
+                    preapprove_tools=preapprove_tools,
                 )
 
             self._client_factory = default_factory

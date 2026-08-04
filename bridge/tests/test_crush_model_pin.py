@@ -379,5 +379,100 @@ def test_unknown_finish_reason_still_fails_the_turn() -> None:
     assert errors and errors[0].message == "content_filter"
 
 
+# -- 6. Lane configs: same providers, different permissions --------------------
+
+_CRUSH_DIR = Path(__file__).resolve().parents[2] / "crush"
+
+
+def _provider_block(text: str) -> list[str]:
+    """The provider/model definition lines, before any permissions/option."""
+    out, started = [], False
+    for line in text.splitlines():
+        if line.startswith(("permissions ", "option ")):
+            break
+        if line.startswith(("provider add", "model ")):
+            started = True
+        if started and line.strip() and not line.lstrip().startswith("#"):
+            out.append(line.rstrip())
+    return out
+
+
+def test_bridge_lane_keeps_the_shell_tools() -> None:
+    # #940 staged crushrc.readonly (the agent-cron config) into the bridge, so
+    # the owner-facing bot reported "bash 도구가 비활성화되어 있어" — the exact
+    # opposite of this lane's policy (owner-operator / bash_policy=auto-approve,
+    # where Codex gets approval=never + sandbox=dangerFullAccess).
+    bridge = (_CRUSH_DIR / "crushrc.bridge").read_text(encoding="utf-8")
+    denied = [
+        line for line in bridge.splitlines() if line.startswith("permissions deny")
+    ]
+    joined = " ".join(denied)
+    for tool in ("bash", "edit", "write", "download"):
+        assert tool not in joined, f"bridge lane must not deny {tool}"
+    # question has no answer path in the bridge — a model that calls it fails
+    # the whole turn (#934).
+    assert "question" in joined, "bridge lane must still deny question"
+
+
+def test_headless_lane_stays_read_only() -> None:
+    readonly = (_CRUSH_DIR / "crushrc.readonly").read_text(encoding="utf-8")
+    denied = " ".join(
+        line
+        for line in readonly.splitlines()
+        if line.startswith("permissions deny")
+    )
+    for tool in ("bash", "edit", "write", "download", "question"):
+        assert tool in denied, f"headless lane must keep denying {tool}"
+
+
+def test_both_lanes_define_the_same_providers() -> None:
+    # The two configs differ only in permissions. Provider/model definitions
+    # live in both files, so a drift here would give one lane a model the
+    # other cannot reach — with no error, just a different answer.
+    bridge = _provider_block((_CRUSH_DIR / "crushrc.bridge").read_text(encoding="utf-8"))
+    readonly = _provider_block(
+        (_CRUSH_DIR / "crushrc.readonly").read_text(encoding="utf-8")
+    )
+    assert bridge, "bridge config must define providers"
+    assert bridge == readonly, (
+        "provider/model definitions drifted between the lanes:\n"
+        "bridge:\n  " + "\n  ".join(bridge) + "\nreadonly:\n  " + "\n  ".join(readonly)
+    )
+
+
+def test_bridge_lane_is_the_runtime_default() -> None:
+    from telegram_bot.core.crush_runtime import _default_crush_config
+
+    assert _default_crush_config().name == "crushrc.bridge"
+
+
+# -- 7. Pre-approval derives from the operator's bash policy -------------------
+
+
+def test_preapproved_tools_are_appended_only_when_asked(tmp_path: Path) -> None:
+    # crush asks for some tools and not others — measured on dungae
+    # (2026-08-04): `bash` ran unprompted, `write` raised an approval that a
+    # denying handler turned into a silent empty turn (no file, no error).
+    # Under auto-approve the bridge would allow it anyway, so skip the
+    # round-trip; under any tighter policy crush must keep asking.
+    source = tmp_path / "crushrc.bridge"
+    source.write_text("permissions deny question\n", encoding="utf-8")
+
+    plain = CrushServerClient(config_path=source)
+    staged = Path(plain._env["CRUSH_GLOBAL_CONFIG"]) / "crushrc"
+    assert "permissions allow" not in staged.read_text(encoding="utf-8")
+
+    eager = CrushServerClient(config_path=source, preapprove_tools=True)
+    staged = Path(eager._env["CRUSH_GLOBAL_CONFIG"]) / "crushrc"
+    body = staged.read_text(encoding="utf-8")
+    assert "permissions allow" in body
+    for tool in ("bash", "write", "edit", "multiedit"):
+        assert tool in body, f"{tool} must be pre-approved"
+    assert "permissions deny question" in body
+    from telegram_bot.core.crush_runtime import _PREAPPROVED_TOOLS
+
+    assert "question" not in _PREAPPROVED_TOOLS.split()
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))

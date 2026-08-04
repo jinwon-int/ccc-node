@@ -1,0 +1,71 @@
+# ccc-node crush bridge — owner-facing 대화형 레인 설정
+#
+# crushrc.readonly 는 agent-cron 비대화형 러너용이고 bash/edit/write 를 막는다.
+# 그 파일을 bridge 에 물렸더니(#940) owner 봇이 셸을 못 쓰게 됐다. bridge 는
+# 반대로 **넓은** 레인이다 — 실측(dungae, 2026-08-04):
+#
+#   execution_profile=owner-operator  bash_policy=auto-approve  host_scope=true
+#
+# Codex 레인은 같은 정책에서 approval=never + sandbox=dangerFullAccess 를
+# 받는다(bot_access.py `_codex_approval_policy` / `_codex_sandbox_policy`).
+# crush 레인도 같은 자리에 두려면 도구를 막지 않아야 한다.
+#
+# 안전장치는 없어지지 않는다: crush 의 permission 요청은 여전히
+# `_decide_permission` -> bridge approval handler 로 가고, 거기서 운영자의
+# bash_policy 가 판단한다(auto-approve=허용, approve-each=매번 확인,
+# 그 외=거부). 즉 이 파일은 **무엇을 제안할 수 있는가**를 정하고, 실행 여부는
+# bridge 정책이 정한다.
+#
+# 키 규칙: raw secret 금지. 키는 로드 시점 $() 확장으로만 읽는다.
+#   K3  : ${CCC_KIMI_KEY_FILE:-$HOME/.hermes/kimi-api-key}
+#   GLM : ${CCC_ZAI_KEY_FILE:-$HOME/.hermes/zai-api-key}
+
+provider add kimi --type anthropic \
+  --base-url "https://api.kimi.com/coding" \
+  --api-key "$(tr -d '[:space:]' < "${CCC_KIMI_KEY_FILE:-$HOME/.hermes/kimi-api-key}")" \
+  --extra-header anthropic-version 2023-06-01
+model add kimi/k3 --name "Kimi K3" \
+  --context-window 1000000 --default-max-tokens 8192 --can-reason true
+
+# 소형 모델 슬롯도 명시 고정한다. 미지정 시 crush가 첫 활성 프로바이더의
+# 기본 소형 모델로 라우팅하므로, 상속된 외부 키가 보이는 환경에서는 의도
+# 밖의 백엔드(anthropic 기본값)로 타이틀 생성이 나간다(canary4 401 노이즈).
+#
+# 주의: 이 줄만으로는 부족하다. 프로바이더가 카탈로그(catwalk)에 등록돼 있으면
+# 그 프로바이더의 기본 소형 모델이 이 설정을 이긴다. dungae 실측(2026-08-04):
+# 이 줄이 있는데도 타이틀 턴이 model=glm-5-turbo / host=api.z.ai 로 나갔다.
+# 실제 고정은 headless.sh 의 `--small-model` 이 한다(#936).
+model small kimi/k3
+
+provider add zai --type openai-compat \
+  --base-url "https://api.z.ai/api/coding/paas/v4" \
+  --api-key "$(tr -d '[:space:]' < "${CCC_ZAI_KEY_FILE:-$HOME/.hermes/zai-api-key}")"
+model add zai/glm-5.2 --name "GLM 5.2" \
+  --context-window 1000000 --default-max-tokens 8192 --can-reason true
+
+# 읽기 전용: 쓰기·실행 도구는 에이전트에게 숨긴다(프롬프트 불가 → fail-closed).
+# question도 숨긴다 — 비대화형 러너·브릿지에는 대화형 질문의 응답 경로가 없어
+# 모델이 이 도구를 쓰면 턴 전체가 실패한다(방통 브릿지 "Processing failed: tool_use").
+
+# question 만 막는다. bridge 에는 대화형 질문의 응답 경로가 없어 모델이 이
+# 도구를 쓰면 턴 전체가 실패한다(#926 후속 #934). 나머지 도구는 crush 기본값
+# 그대로 열어 둔다 — permissions 를 지정하지 않으면 26개 전체가 노출된다.
+permissions deny question
+
+# 실행 승인은 여기서 정하지 않는다. crush_runtime 이 운영자의 bash_policy 를
+# 보고 auto-approve 일 때만 `permissions allow ...` 줄을 덧붙인다. Codex 가
+# 같은 정책에서 approval=never 를 받는 것과 같은 파생이다.
+#
+# 왜 파일에 박지 않는가: 여기에 allow 를 적으면 crush 가 아예 묻지 않게 되어
+# approve-each 로 조여도 가로챌 수 없다. 정책은 한 곳(bash_policy)에서만
+# 나와야 한다.
+#
+# 실측(dungae, 2026-08-04) — 도구마다 다르다:
+#   bash(echo)  crush 가 묻지 않고 실행
+#   write       crush 가 승인을 요청 -> 거부되면 파일도 안 생기고 출력도 비는데
+#               에러는 없다(조용한 실패). 그래서 auto-approve 노드에서는
+#               미리 허용해 왕복 자체를 없앤다.
+
+# 운영 기본값: 외부 카탈로그 자동 갱신과 익명 메트릭은 끈다.
+option provider-auto-update false
+option notifications disabled
