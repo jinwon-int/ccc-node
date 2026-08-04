@@ -92,6 +92,16 @@ All notable changes to the Claude Code node harness. Dates are KST.
   provenance. (#750)
 
 ### Changed
+- CI bridge coverage leg now runs under `pytest-xdist` (`-n auto`) (#925). Measured
+  ~2.2× on the full suite (303 s → 139 s locally on 4 cores, both passing 2187
+  tests; the CI runner's sequential ~120 s leg should drop proportionally).
+  `pytest-cov` aggregates coverage across workers, so the `fail_under` branch-
+  coverage gate is unchanged and `coverage.xml` is still produced. The suite is
+  isolation-safe (no `os.chdir`, no session-scoped fixtures; module/function
+  autouse guards confine `sys.modules` fakes and reset the bridge environment).
+  `pytest-xdist` was added to the `dev` extra so it lands in the CI lock only
+  (`.github/requirements/bridge-ci.txt`), not the runtime lock. The umask-0002
+  variant step is unchanged (0.5 s, not worth parallelising).
 - Codex nodes now compose the skill-candidate collector by default, with
   `CCC_CODEX_SKILL_COLLECTOR=false` as an explicit node-local opt-out. Candidate
   collection remains separate from installation (`approve` is still the

@@ -23,7 +23,7 @@ dependencies = [
 # Mirrors requirements-voice.txt. Keep the extra small because the TOS uploader
 # imports this optional native dependency lazily and many nodes do not need it.
 voice = ["tos"]
-dev = ["pytest", "pytest-cov"]
+dev = ["pytest", "pytest-cov", "pytest-xdist"]
 
 [tool.setuptools]
 package-dir = {"telegram_bot" = "."}
