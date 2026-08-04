@@ -322,15 +322,10 @@ async def test_terminal_error_is_logged_not_only_shown_to_the_user(
 
 
 @pytest.mark.parametrize(
-    "reason",
-    ["end_turn", "stop", "stop_sequence", "length", "max_tokens", "tool_calls", "tool_use"],
+    "reason", ["end_turn", "stop", "stop_sequence", "length", "max_tokens"]
 )
-def test_normal_finish_reasons_complete_the_turn(reason: str) -> None:
-    # dungae (2026-08-04): a GLM-5.2 turn that called a tool finished with
-    # `tool_use` and surfaced as "Processing failed: tool_use". crush passes
-    # each provider family's own spelling through, so the OpenAI and Anthropic
-    # names for one concept must be treated alike:
-    #   tool_calls / tool_use      length / max_tokens
+def test_terminal_finish_reasons_complete_the_turn(reason: str) -> None:
+    # length/max_tokens are the same concept under the two provider spellings.
     from telegram_bot.core.agent_runtime import CompletionEvent as _Completion
     from telegram_bot.core.crush_runtime import CrushRuntime, _ActiveTurn
 
@@ -342,12 +337,31 @@ def test_normal_finish_reasons_complete_the_turn(reason: str) -> None:
     while not active.queue.empty():
         drained.append(active.queue.get_nowait())
 
-    assert any(isinstance(e, _Completion) for e in drained), (
-        f"{reason!r} must end the turn normally, not as an error"
-    )
-    assert not any(isinstance(e, ErrorEvent) for e in drained), (
-        f"{reason!r} was reported as a failure"
-    )
+    assert any(isinstance(e, _Completion) for e in drained), f"{reason!r} must end the turn"
+    assert not any(isinstance(e, ErrorEvent) for e in drained)
+    assert active.finished is True
+
+
+@pytest.mark.parametrize("reason", ["tool_use", "tool_calls"])
+def test_tool_call_finish_keeps_the_turn_open(reason: str) -> None:
+    # dungae (2026-08-04), GLM-5.2 asked to read a file:
+    #   finish reasons in order: ['tool_use', 'end_turn']
+    # A tool-call finish ends the assistant message, not the turn. Closing on
+    # it returned an empty answer; failing on it surfaced
+    # "Processing failed: tool_use". The turn must stay open.
+    from telegram_bot.core.crush_runtime import CrushRuntime, _ActiveTurn
+
+    runtime = CrushRuntime(client_factory=lambda: None)
+    active = _ActiveTurn(queue=asyncio.Queue(), approval_handler=None)
+    runtime._complete_turn(active, {"reason": reason})
+
+    assert active.queue.empty(), f"{reason!r} must not emit a terminal event"
+    assert active.finished is False, f"{reason!r} must not close the turn"
+
+    # the real terminal finish still completes it
+    runtime._complete_turn(active, {"reason": "end_turn"})
+    assert active.finished is True
+    assert not active.queue.empty()
 
 
 def test_unknown_finish_reason_still_fails_the_turn() -> None:
