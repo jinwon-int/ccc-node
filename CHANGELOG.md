@@ -91,6 +91,14 @@ All notable changes to the Claude Code node harness. Dates are KST.
   composition is unchanged. (#749)
 
 ### Fixed
+- bumped `cryptography` 49.0.0 → 50.0.0 in both hash-locked dependency files
+  (`bridge/requirements.lock.txt` and `.github/requirements/bridge-ci.txt`) to
+  clear CVE-2026-69247, which `pip-audit` (the wheel-smoke gate) began failing
+  on once the advisory propagated. 50.0.0 has the same dependency set as 49.0.0,
+  so this is a single-package bump (no other pins changed); locks were
+  regenerated via `scripts/ccc-deps-lock.sh` with `--upgrade-package cryptography`.
+  This was breaking CI repo-wide (every new run failed wheel-smoke) independent
+  of any code change.
 - provider approval requests on auto-approve profiles now leave a body-free
   trace. Previously a `can_use_tool` request (or a #838 no-active-turn deny)
   emitted no record of *what* was asked, so post-hoc diagnosis was impossible
