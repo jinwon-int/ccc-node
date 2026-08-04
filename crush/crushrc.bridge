@@ -52,6 +52,20 @@ model add zai/glm-5.2 --name "GLM 5.2" \
 # 그대로 열어 둔다 — permissions 를 지정하지 않으면 26개 전체가 노출된다.
 permissions deny question
 
+# 실행 승인은 여기서 정하지 않는다. crush_runtime 이 운영자의 bash_policy 를
+# 보고 auto-approve 일 때만 `permissions allow ...` 줄을 덧붙인다. Codex 가
+# 같은 정책에서 approval=never 를 받는 것과 같은 파생이다.
+#
+# 왜 파일에 박지 않는가: 여기에 allow 를 적으면 crush 가 아예 묻지 않게 되어
+# approve-each 로 조여도 가로챌 수 없다. 정책은 한 곳(bash_policy)에서만
+# 나와야 한다.
+#
+# 실측(dungae, 2026-08-04) — 도구마다 다르다:
+#   bash(echo)  crush 가 묻지 않고 실행
+#   write       crush 가 승인을 요청 -> 거부되면 파일도 안 생기고 출력도 비는데
+#               에러는 없다(조용한 실패). 그래서 auto-approve 노드에서는
+#               미리 허용해 왕복 자체를 없앤다.
+
 # 운영 기본값: 외부 카탈로그 자동 갱신과 익명 메트릭은 끈다.
 option provider-auto-update false
 option notifications disabled

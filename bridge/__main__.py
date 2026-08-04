@@ -72,9 +72,23 @@ def build_context(
     if settings.agent_provider == "crush" and agent_runtime is None:
         from telegram_bot.core.crush_runtime import CrushRuntime
 
+        from telegram_bot.core import tool_policy
+
+        # Mirror the Codex mapping: the same operator policy that gives Codex
+        # approval=never pre-approves crush's tools, so crush does not
+        # round-trip an approval the bridge would allow anyway (#940 follow-up).
+        _profile = tool_policy.resolve_execution_profile(
+            settings.execution_profile,
+            allowed_user_ids=settings.allowed_user_ids,
+            require_allowlist=settings.require_allowlist,
+        )
+        _bash = tool_policy.effective_bash_policy(
+            tool_policy.resolve_bash_policy(settings.bash_policy), _profile
+        )
         agent_runtime = CrushRuntime(
             executable=settings.crush_cli_path,
             config_path=settings.crush_config_path,
+            preapprove_tools=_bash == tool_policy.BASH_AUTO_APPROVE,
         )
     elif settings.agent_provider == "codex" and agent_runtime is None:
         from telegram_bot.core.codex_runtime import CodexRuntime

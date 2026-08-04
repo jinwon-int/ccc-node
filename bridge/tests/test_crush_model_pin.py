@@ -442,5 +442,33 @@ def test_bridge_lane_is_the_runtime_default() -> None:
     assert _default_crush_config().name == "crushrc.bridge"
 
 
+# -- 7. Pre-approval derives from the operator's bash policy -------------------
+
+
+def test_preapproved_tools_are_appended_only_when_asked(tmp_path: Path) -> None:
+    # crush asks for some tools and not others — measured on dungae
+    # (2026-08-04): `bash` ran unprompted, `write` raised an approval that a
+    # denying handler turned into a silent empty turn (no file, no error).
+    # Under auto-approve the bridge would allow it anyway, so skip the
+    # round-trip; under any tighter policy crush must keep asking.
+    source = tmp_path / "crushrc.bridge"
+    source.write_text("permissions deny question\n", encoding="utf-8")
+
+    plain = CrushServerClient(config_path=source)
+    staged = Path(plain._env["CRUSH_GLOBAL_CONFIG"]) / "crushrc"
+    assert "permissions allow" not in staged.read_text(encoding="utf-8")
+
+    eager = CrushServerClient(config_path=source, preapprove_tools=True)
+    staged = Path(eager._env["CRUSH_GLOBAL_CONFIG"]) / "crushrc"
+    body = staged.read_text(encoding="utf-8")
+    assert "permissions allow" in body
+    for tool in ("bash", "write", "edit", "multiedit"):
+        assert tool in body, f"{tool} must be pre-approved"
+    assert "permissions deny question" in body
+    from telegram_bot.core.crush_runtime import _PREAPPROVED_TOOLS
+
+    assert "question" not in _PREAPPROVED_TOOLS.split()
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))
