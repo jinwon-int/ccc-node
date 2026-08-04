@@ -23,6 +23,11 @@ fi
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN="${CCC_CRUSH_BIN:-crush}"
 MODEL="${CCC_CRUSH_MODEL:-${CCC_MODEL:-}}"
+# crushrc's `model small` loses to the provider's own catalog default, so it
+# has to be named on the command line. Default to the main model: a node
+# usually holds the key for exactly one provider, and reaching for another
+# provider's default small model is what breaks (see below).
+SMALL_MODEL="${CCC_CRUSH_SMALL_MODEL:-$MODEL}"
 WORKDIR="${CCC_CRUSH_WORKDIR:-$PWD}"
 CONFIG="${CCC_CRUSH_CONFIG:-$HERE/crushrc.readonly}"
 # Wall-clock cap in seconds (0 disables). Guards against a run that never returns.
@@ -79,7 +84,14 @@ if [ "$TMO" -gt 0 ]; then
   command -v timeout >/dev/null 2>&1 && runner=(timeout -k 30 "$TMO" "$BIN")
 fi
 
-"${runner[@]}" run -q --cwd "$WORKDIR" -m "$MODEL" "$PROMPT" 2>"$ERR"
+# `--small-model` is not redundant with crushrc's `model small`. Crush's own
+# help says the flag falls back to "the default small model for the provider",
+# and that provider default wins: measured on dungae (2026-08-04) with
+# `model small kimi/k3` present in crushrc, the title turn still went out as
+#   model=glm-5-turbo  host=api.z.ai
+# — a model the node's coding-plan key does not serve. Naming the flag makes
+# both turns use $SMALL_MODEL. See #936.
+"${runner[@]}" run -q --cwd "$WORKDIR" -m "$MODEL" --small-model "$SMALL_MODEL" "$PROMPT" 2>"$ERR"
 rc=$?
 if [ "$rc" -eq 124 ]; then
   echo "ccc-crush-headless: crush exceeded CCC_HEADLESS_TIMEOUT=${TMO}s and was killed" >&2
