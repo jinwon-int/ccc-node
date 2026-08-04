@@ -192,6 +192,16 @@ class Config(
         alias="CCC_CRUSH_CLI_PATH",
         description="crush executable used to spawn the crush server (#926).",
     )
+    crush_model: Optional[str] = Field(
+        default=None,
+        alias="CCC_CRUSH_MODEL",
+        description=(
+            "Default crush workspace model in provider/model form (e.g. "
+            "kimi/k3), applied when a turn does not choose a model explicitly. "
+            "Without it crush falls back to its built-in provider default, "
+            "which can silently route to an unintended backend (#926)."
+        ),
+    )
     usage_meter_enabled: bool = Field(
         default=True,
         alias="CCC_USAGE_METER_ENABLED",

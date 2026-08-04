@@ -1662,13 +1662,17 @@ class TelegramBot(
         provider: str = "claude",
         previous_session_id: Optional[str] = None,
     ) -> str:
-        provider_label = "Claude Code" if provider == "claude" else "Codex"
+        provider_label = {"claude": "Claude Code", "codex": "Codex", "crush": "Crush"}.get(
+            provider, provider
+        )
         # Banner model label: explicit /model choice first, then the operator
         # display label, then the env-routed model (Claude path only), so the
         # notice reflects the real backend instead of a bare "default".
         display_model = model or os.environ.get("CCC_MODEL_LABEL", "").strip()
         if not display_model and provider == "claude":
             display_model = os.environ.get("ANTHROPIC_MODEL", "").strip()
+        if not display_model and provider == "crush":
+            display_model = os.environ.get("CCC_CRUSH_MODEL", "").strip()
         if not display_model:
             display_model = "default"
         lines = [

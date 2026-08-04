@@ -4,7 +4,9 @@ The banner previously rendered "◆ Model: default" whenever the session store
 had no explicit /model choice, even when the runtime was routed to a specific
 backend model via env (e.g. ANTHROPIC_MODEL on Kimi-routed nodes). The label
 now falls back: session model → CCC_MODEL_LABEL → ANTHROPIC_MODEL (Claude
-path only) → "default".
+path only) → CCC_CRUSH_MODEL (crush path only) → "default". The provider
+label maps claude/codex/crush instead of rendering every non-Claude
+provider as "Codex".
 """
 
 import os
@@ -55,6 +57,27 @@ class SessionStartNoticeModelTest(unittest.TestCase):
         env = {"CCC_MODEL_LABEL": "", "ANTHROPIC_MODEL": ""}
         with mock.patch.dict(os.environ, env):
             text = _notice()
+        self.assertIn("◆ Model: default", text)
+
+    def test_crush_provider_label(self):
+        text = _notice(provider="crush")
+        self.assertIn("fresh Crush stream", text)
+        self.assertIn("◆ Provider: Crush", text)
+
+    def test_codex_provider_label(self):
+        text = _notice(provider="codex")
+        self.assertIn("◆ Provider: Codex", text)
+
+    def test_crush_model_env_used_for_crush_provider(self):
+        env = {"CCC_MODEL_LABEL": "", "ANTHROPIC_MODEL": "k3", "CCC_CRUSH_MODEL": "kimi/k3"}
+        with mock.patch.dict(os.environ, env):
+            text = _notice(provider="crush")
+        self.assertIn("◆ Model: kimi/k3", text)
+
+    def test_anthropic_model_ignored_for_crush_provider(self):
+        env = {"CCC_MODEL_LABEL": "", "ANTHROPIC_MODEL": "k3", "CCC_CRUSH_MODEL": ""}
+        with mock.patch.dict(os.environ, env):
+            text = _notice(provider="crush")
         self.assertIn("◆ Model: default", text)
 
 
