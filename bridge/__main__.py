@@ -69,7 +69,11 @@ def build_context(
     from telegram_bot.utils.chat_logger import bind_logs_dir
     from telegram_bot.utils.health import health_reporter
 
-    if settings.agent_provider == "codex" and agent_runtime is None:
+    if settings.agent_provider == "crush" and agent_runtime is None:
+        from telegram_bot.core.crush_runtime import CrushRuntime
+
+        agent_runtime = CrushRuntime(executable=settings.crush_cli_path)
+    elif settings.agent_provider == "codex" and agent_runtime is None:
         from telegram_bot.core.codex_runtime import CodexRuntime
         from telegram_bot.utils.memory_policy import MEMORY_MODE_AUDIENCE_SCOPED
 

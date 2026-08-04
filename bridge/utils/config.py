@@ -177,7 +177,7 @@ class Config(
         finally:
             _LOAD_EXPLICIT_VALUES_ONLY.reset(token)
 
-    agent_provider: Literal["claude", "codex"] = Field(
+    agent_provider: Literal["claude", "codex", "crush"] = Field(
         default="claude",
         alias="CCC_AGENT_PROVIDER",
         description="Agent provider used by ProjectChat.",
@@ -186,6 +186,11 @@ class Config(
         default_factory=lambda: str(Path.home() / ".claude" / "hooks" / "ccc-codex"),
         alias="CCC_CODEX_CLI_PATH",
         description="ccc-node Codex launcher path.",
+    )
+    crush_cli_path: str = Field(
+        default="crush",
+        alias="CCC_CRUSH_CLI_PATH",
+        description="crush executable used to spawn the crush server (#926).",
     )
     usage_meter_enabled: bool = Field(
         default=True,

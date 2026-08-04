@@ -23,7 +23,7 @@ from types import MappingProxyType
 # Must stay equal to session.manager.SessionManager.VALID_PROVIDERS; the
 # capability tests pin the equality so a new provider cannot land without a
 # declared capability row.
-SUPPORTED_PROVIDERS: tuple[str, ...] = ("claude", "codex")
+SUPPORTED_PROVIDERS: tuple[str, ...] = ("claude", "codex", "crush")
 
 _DEPENDENCY_PATTERN = re.compile(r"^#\d+$")
 
@@ -94,7 +94,13 @@ def _axis(
     claude: CapabilityStatus,
     codex: CapabilityStatus,
 ) -> CapabilityAxis:
-    return CapabilityAxis(key, group, title, description, {"claude": claude, "codex": codex})
+    return CapabilityAxis(
+        key,
+        group,
+        title,
+        description,
+        {"claude": claude, "codex": codex, "crush": _CRUSH_STATUSES[key]},
+    )
 
 
 def _supported(reason: str) -> CapabilityStatus:
@@ -111,6 +117,113 @@ def _unsupported(reason: str, *dependencies: str) -> CapabilityStatus:
 
 def _unknown(reason: str, *dependencies: str) -> CapabilityStatus:
     return CapabilityStatus(CapabilityState.UNKNOWN, reason, tuple(dependencies))
+
+# crush (issue #926) — the third provider column, kept as one explicit map so
+# every per-axis decision stays visible in one place. Conformance-covered axes
+# are exercised by the suite binding in tests/test_runtime_conformance.py.
+_CRUSH_STATUSES: Mapping[str, CapabilityStatus] = {
+    "runtime_adapter": _supported(
+        "CrushRuntime adapts the crush server HTTP+SSE API to AgentRuntime and "
+        "passes the runtime conformance suite over a scripted fake transport."
+    ),
+    "session_resume": _supported(
+        "Sessions resume by id after the adapter verifies existence through the "
+        "workspace session read; the requested id is preserved."
+    ),
+    "text_streaming": _supported(
+        "SSE message/updated text-part growth is diffed into TextDeltaEvent "
+        "increments."
+    ),
+    "reasoning_stream": _supported(
+        "reasoning parts normalize to private ReasoningDeltaEvent increments and "
+        "are never user-delivered."
+    ),
+    "message_boundaries": _supported(
+        "A new assistant message id after emitted text normalizes to "
+        "MessageCompletedEvent, so multi-message turns delimit cleanly."
+    ),
+    "tool_event_stream": _supported(
+        "tool_call and tool_result parts normalize to ToolStartedEvent/"
+        "ToolCompletedEvent pairs keyed by tool_call_id."
+    ),
+    "interactive_approvals": _supported(
+        "permission_request envelopes route through the fail-closed approval "
+        "chain and resolve via permissions/grant; an omitted, failing, or late "
+        "handler denies."
+    ),
+    "turn_interrupt": _supported(
+        "interrupt posts the agent session cancel; the canceled finish reason "
+        "normalizes to ErrorEvent(interrupted)."
+    ),
+    "turn_serialization": _supported(
+        "A per-session asyncio lock serializes turns on one crush session."
+    ),
+    "session_browsing": _supported(
+        "Bounded list/read over the workspace sessions and messages endpoints."
+    ),
+    "model_discovery": _supported(
+        "Models enumerate from the workspace providers endpoint, which reflects "
+        "the crush-configured providers and models."
+    ),
+    "usage_metering": _degraded(
+        "Session-level prompt/completion tokens and cost parse from the "
+        "workspace session read; account windows and UsageRecorder plumbing are "
+        "not wired yet.",
+        "#926",
+    ),
+    "terminal_stall_release": _supported(
+        "The provider-neutral consumer shares the same stall guard and closes "
+        "abandoned iterators (#411)."
+    ),
+    "async_completion_delivery": _degraded(
+        "Only exact-active-turn completions are handled; crush exposes no "
+        "detached-ownership signal or negotiated protocol version, so unowned "
+        "completions are not delivered.",
+        "#926",
+    ),
+    "external_wait": _supported(
+        "Provider-neutral: same registry, monitor, and continuation contract as "
+        "the claude path (#740)."
+    ),
+    "memory_session_resume": _supported(
+        "Sessions resume by id with provider-side context; the crush server "
+        "persists session history in its data dir."
+    ),
+    "memory_read_bootstrap": _unsupported(
+        "No startup-snapshot materializer is wired for crush sessions.",
+        "#926",
+    ),
+    "memory_postcompact_reinject": _degraded(
+        "crush exposes no compaction lifecycle event to hook.",
+        "#926",
+    ),
+    "memory_writeback_distill": _unsupported(
+        "No distill snapshotter is wired for crush sessions.",
+        "#926",
+    ),
+    "memory_sink_local": _unsupported(
+        "Local memory sink is not wired for crush.",
+        "#926",
+    ),
+    "memory_sink_honcho": _unsupported(
+        "Honcho sink is not wired for crush.",
+        "#926",
+    ),
+    "memory_sink_wiki_candidate": _unsupported(
+        "Wiki-candidate sink is not wired for crush.",
+        "#926",
+    ),
+    "memory_roundtrip": _unsupported(
+        "Depends on the distill/writeback chain, which crush does not wire yet.",
+        "#926",
+    ),
+    "lifecycle_observability": _supported(
+        "With CCC_LIFECYCLE_AUDIT opt-in, crush SSE envelopes normalize via "
+        "normalize_crush_event into the same body-free records; the ledger is "
+        "bounded, owner-only, and fail-open. Final Telegram delivery is outside "
+        "this capability."
+    ),
+}
 
 
 RUNTIME_GROUP = "Runtime behavior"
