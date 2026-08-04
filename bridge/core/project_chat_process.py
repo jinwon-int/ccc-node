@@ -280,7 +280,8 @@ class ProjectChatProcessMixin:
                 session_id=session_id,
             )
         self._require_runtime()
-        if getattr(self._config, "agent_provider", "claude") == "claude":
+        provider = getattr(self._config, "agent_provider", "claude")
+        if provider == "claude":
             # Claude adapter path (#584): the bot layer's approval/sandbox
             # knobs are Codex app-server policies (bot_access._codex_*) that
             # ClaudeRuntime rejects fail-closed. On this path the approval
@@ -290,6 +291,14 @@ class ProjectChatProcessMixin:
             approval_policy = None
             approvals_reviewer = None
             sandbox_policy = None
+        elif provider == "piri":
+            # PiriRuntime is deliberately unrestricted: built-in tools execute
+            # with the bridge user's OS permissions and never pause for a
+            # provider approval. Pin the only policies the adapter accepts so
+            # stricter Codex UX settings cannot accidentally break Piri turns.
+            approval_policy = "never"
+            approvals_reviewer = None
+            sandbox_policy = {"type": "dangerFullAccess"}
         if sensitive_log_event is not None:
             _log_user_input(
                 user_message=user_message,
@@ -683,7 +692,7 @@ class ProjectChatProcessMixin:
                                 memory_environment = audience.codex_environment(
                                     self._config
                                 )
-                            else:
+                            elif provider == "claude":
                                 memory_environment = audience.claude_environment(
                                     self._config
                                 )

@@ -177,7 +177,7 @@ class Config(
         finally:
             _LOAD_EXPLICIT_VALUES_ONLY.reset(token)
 
-    agent_provider: Literal["claude", "codex", "crush"] = Field(
+    agent_provider: Literal["claude", "codex", "crush", "piri"] = Field(
         default="claude",
         alias="CCC_AGENT_PROVIDER",
         description="Agent provider used by ProjectChat.",
@@ -213,6 +213,11 @@ class Config(
             "which can silently route to an unintended backend (#926)."
         ),
     )
+    piri_cli_path: str = Field(
+        default="piri",
+        alias="CCC_PIRI_CLI_PATH",
+        description="Piri launcher path used for headless RPC sessions.",
+    )
     usage_meter_enabled: bool = Field(
         default=True,
         alias="CCC_USAGE_METER_ENABLED",
@@ -244,6 +249,16 @@ class Config(
             "but does not consume this allowance. Crossing warn/enforce "
             "thresholds raises one alert each per day; enforce blocks "
             "autonomous spend only."
+        ),
+    )
+    usage_budget_tokens_piri: int = Field(
+        default=0,
+        ge=0,
+        alias="CCC_USAGE_BUDGET_TOKENS_PIRI",
+        description=(
+            "Daily Piri autonomous token budget for the local usage meter. "
+            "Piri currently reports request counts but not normalized token usage; "
+            "0 disables the budget."
         ),
     )
     usage_budget_warn_percent: int = Field(
@@ -315,12 +330,12 @@ class Config(
             )
         return v.strip()
 
-    @field_validator("codex_cli_path", mode="before")
+    @field_validator("codex_cli_path", "piri_cli_path", mode="before")
     @classmethod
-    def validate_codex_runtime_path(cls, v):
+    def validate_agent_runtime_path(cls, v):
         value = str(v).strip()
         if not value:
-            raise ValueError("Codex runtime paths must be non-empty")
+            raise ValueError("Agent runtime paths must be non-empty")
         return value
 
     # Runtime data

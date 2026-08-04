@@ -18,7 +18,7 @@ ASYNC_COMPLETION_EVENT_VERSION = 1
 MAX_ASYNC_COMPLETION_IDENTIFIER_BYTES = 128
 MAX_SESSION_GENERATION = (1 << 63) - 1
 
-AsyncCompletionProvider = Literal["claude", "codex", "crush"]
+AsyncCompletionProvider = Literal["claude", "codex", "crush", "piri"]
 
 _IDENTIFIER_PUNCTUATION = frozenset("-._:@/")
 _IDENTITY_DOMAIN = b"ccc-node:normalized-async-completion:v1\x00"

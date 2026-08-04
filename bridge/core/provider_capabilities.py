@@ -23,7 +23,7 @@ from types import MappingProxyType
 # Must stay equal to session.manager.SessionManager.VALID_PROVIDERS; the
 # capability tests pin the equality so a new provider cannot land without a
 # declared capability row.
-SUPPORTED_PROVIDERS: tuple[str, ...] = ("claude", "codex", "crush")
+SUPPORTED_PROVIDERS: tuple[str, ...] = ("claude", "codex", "crush", "piri")
 
 _DEPENDENCY_PATTERN = re.compile(r"^#\d+$")
 
@@ -93,13 +93,19 @@ def _axis(
     *,
     claude: CapabilityStatus,
     codex: CapabilityStatus,
+    piri: CapabilityStatus,
 ) -> CapabilityAxis:
     return CapabilityAxis(
         key,
         group,
         title,
         description,
-        {"claude": claude, "codex": codex, "crush": _CRUSH_STATUSES[key]},
+        {
+            "claude": claude,
+            "codex": codex,
+            "crush": _CRUSH_STATUSES[key],
+            "piri": piri,
+        },
     )
 
 
@@ -246,6 +252,10 @@ CAPABILITY_AXES: tuple[CapabilityAxis, ...] = (
             "CodexRuntime adapts the app-server protocol to AgentRuntime and passes "
             "the runtime conformance suite."
         ),
+        piri=_supported(
+            "PiriRuntime adapts Piri's headless JSONL RPC protocol to AgentRuntime "
+            "and passes the runtime conformance suite."
+        ),
     ),
     _axis(
         "session_resume",
@@ -260,6 +270,10 @@ CAPABILITY_AXES: tuple[CapabilityAxis, ...] = (
             "thread/resume re-attaches by thread id and rejects a mismatched "
             "returned thread."
         ),
+        piri=_supported(
+            "--session-id re-attaches by exact Piri session id and the adapter "
+            "rejects a mismatched sessionId returned by get_state."
+        ),
     ),
     _axis(
         "text_streaming",
@@ -272,6 +286,9 @@ CAPABILITY_AXES: tuple[CapabilityAxis, ...] = (
         ),
         codex=_supported(
             "item/agentMessage/delta notifications normalize to TextDeltaEvent."
+        ),
+        piri=_supported(
+            "RPC message_update text_delta events normalize to TextDeltaEvent."
         ),
     ),
     _axis(
@@ -288,6 +305,10 @@ CAPABILITY_AXES: tuple[CapabilityAxis, ...] = (
             "item/reasoning textDelta and summaryTextDelta normalize to "
             "ReasoningDeltaEvent and stay private."
         ),
+        piri=_supported(
+            "RPC message_update thinking_delta events normalize to "
+            "ReasoningDeltaEvent and stay private."
+        ),
     ),
     _axis(
         "message_boundaries",
@@ -301,6 +322,10 @@ CAPABILITY_AXES: tuple[CapabilityAxis, ...] = (
         codex=_supported(
             "item/completed for agentMessage items normalizes to MessageCompletedEvent."
         ),
+        piri=_supported(
+            "Assistant message_end events normalize to MessageCompletedEvent before "
+            "the terminal agent_settled sequence."
+        ),
     ),
     _axis(
         "tool_event_stream",
@@ -313,6 +338,10 @@ CAPABILITY_AXES: tuple[CapabilityAxis, ...] = (
         codex=_supported(
             "item/started and item/completed normalize to "
             "ToolStartedEvent/ToolCompletedEvent pairs."
+        ),
+        piri=_supported(
+            "tool_execution_start/tool_execution_end normalize to paired "
+            "ToolStartedEvent/ToolCompletedEvent values."
         ),
     ),
     _axis(
@@ -333,6 +362,10 @@ CAPABILITY_AXES: tuple[CapabilityAxis, ...] = (
             "binding, exact-once decision audit, and fail-closed generation/expiry "
             "checks; a missing or failing handler denies."
         ),
+        piri=_unsupported(
+            "Deliberately unrestricted: built-in tools execute directly under the "
+            "bridge OS account and optional extension confirm dialogs are auto-approved."
+        ),
     ),
     _axis(
         "turn_interrupt",
@@ -347,6 +380,10 @@ CAPABILITY_AXES: tuple[CapabilityAxis, ...] = (
             "turn/interrupt targets the exact active turn id; interrupted turns "
             "end with error code 'interrupted'."
         ),
+        piri=_supported(
+            "RPC abort interrupts the active turn, drains through agent_settled, "
+            "and idle interrupt is a safe no-op."
+        ),
     ),
     _axis(
         "turn_serialization",
@@ -359,6 +396,9 @@ CAPABILITY_AXES: tuple[CapabilityAxis, ...] = (
         ),
         codex=_supported(
             "A per-thread turn lock serializes send_turn calls on the same thread."
+        ),
+        piri=_supported(
+            "A per-session turn lock serializes prompts on the persistent RPC process."
         ),
     ),
     _axis(
@@ -373,6 +413,10 @@ CAPABILITY_AXES: tuple[CapabilityAxis, ...] = (
             "SessionBrowser is implemented over thread/list and thread/read with "
             "bounded output."
         ),
+        piri=_unsupported(
+            "Piri RPC 0.83 has exact-id resume but no bounded stored-session list/read API; "
+            "/resume therefore accepts an explicit Piri session id only."
+        ),
     ),
     _axis(
         "model_discovery",
@@ -386,6 +430,10 @@ CAPABILITY_AXES: tuple[CapabilityAxis, ...] = (
         codex=_supported(
             "model/list responses normalize to ModelInfo including "
             "reasoning-effort metadata."
+        ),
+        piri=_supported(
+            "get_available_models responses normalize to ModelInfo including "
+            "thinking-level metadata."
         ),
     ),
     _axis(
@@ -405,6 +453,10 @@ CAPABILITY_AXES: tuple[CapabilityAxis, ...] = (
             "autonomous-mode ledger only, while interactive usage remains recorded "
             "and ungated."
         ),
+        piri=_degraded(
+            "The body-free ledger records Piri request attempts, but RPC 0.83 does "
+            "not expose normalized token totals, account quota, or reset windows."
+        ),
     ),
     _axis(
         "terminal_stall_release",
@@ -421,6 +473,10 @@ CAPABILITY_AXES: tuple[CapabilityAxis, ...] = (
         codex=_supported(
             "The provider-neutral consumer shares the same stall guard and closes "
             "abandoned iterators (#411)."
+        ),
+        piri=_supported(
+            "The provider-neutral consumer shares the bounded stall guard and the "
+            "adapter aborts and drains abandoned RPC turns."
         ),
     ),
     _axis(
@@ -446,6 +502,10 @@ CAPABILITY_AXES: tuple[CapabilityAxis, ...] = (
             "supports_async_completion_delivery=false.",
             "#646",
         ),
+        piri=_unsupported(
+            "Piri RPC output is owned only while the bridge's exact prompt is active; "
+            "there is no detached completion ownership or replay contract."
+        ),
     ),
     _axis(
         "external_wait",
@@ -466,6 +526,10 @@ CAPABILITY_AXES: tuple[CapabilityAxis, ...] = (
             "as the Claude path (#740); it remains independent of approval-generation "
             "leases."
         ),
+        piri=_supported(
+            "Provider-neutral: the same active-turn route, exact-head registry, "
+            "monitor, journal, and external_event continuation contract apply."
+        ),
     ),
     _axis(
         "memory_session_resume",
@@ -478,6 +542,10 @@ CAPABILITY_AXES: tuple[CapabilityAxis, ...] = (
         codex=_supported(
             "Thread ids persist per conversation and resume through thread/resume; "
             "live cold resume verified 2026-07-15."
+        ),
+        piri=_supported(
+            "Piri session ids persist per Telegram conversation and resume through "
+            "--session-id with exact get_state verification."
         ),
     ),
     _axis(
@@ -494,6 +562,10 @@ CAPABILITY_AXES: tuple[CapabilityAxis, ...] = (
             "The AGENTS.override.md materializer runs before thread start/resume; "
             "promoted after the 2026-07-15 live gate (#419)."
         ),
+        piri=_degraded(
+            "Piri starts in the project directory and can consume project context, "
+            "but the ccc audience-scoped memory materializer is intentionally disabled."
+        ),
     ),
     _axis(
         "memory_postcompact_reinject",
@@ -509,6 +581,10 @@ CAPABILITY_AXES: tuple[CapabilityAxis, ...] = (
             "exposes no official PreCompact/PostCompact event and turn/completed is "
             "not treated as compaction. Provider compaction checkpoint/reinjection "
             "therefore remains unverified."
+        ),
+        piri=_unsupported(
+            "ccc-node has no Piri compaction checkpoint or post-compaction memory "
+            "reinjection hook."
         ),
     ),
     _axis(
@@ -527,6 +603,10 @@ CAPABILITY_AXES: tuple[CapabilityAxis, ...] = (
             "cost gates are body-free; Wiki candidates enter a local human-review "
             "queue and Honcho facts use an owner-only retrying outbox.",
         ),
+        piri=_unsupported(
+            "Piri sessions are not read by the Codex/Claude distill journal and no "
+            "provider-neutral Piri transcript extractor exists."
+        ),
     ),
     _axis(
         "memory_sink_local",
@@ -540,6 +620,9 @@ CAPABILITY_AXES: tuple[CapabilityAxis, ...] = (
         codex=_supported(
             "Supported session-reset triggers bind an opaque audience route, and "
             "an independently leased worker writes replay-safe local facts/resume."
+        ),
+        piri=_unsupported(
+            "No Piri write-back extractor feeds the replay-safe local memory sink."
         ),
     ),
     _axis(
@@ -558,6 +641,9 @@ CAPABILITY_AXES: tuple[CapabilityAxis, ...] = (
             "physically distinct Honcho workspaces; unscoped jobs fail closed in "
             "that mode."
         ),
+        piri=_unsupported(
+            "No Piri write-back extractor feeds the Honcho outbox."
+        ),
     ),
     _axis(
         "memory_sink_wiki_candidate",
@@ -571,6 +657,9 @@ CAPABILITY_AXES: tuple[CapabilityAxis, ...] = (
         codex=_supported(
             "Validated candidates are atomically queued in owner-only per-job records; "
             "the sink performs no Wiki write, branch, PR, or merge."
+        ),
+        piri=_unsupported(
+            "No Piri write-back extractor feeds the human-gated Wiki candidate queue."
         ),
     ),
     _axis(
@@ -588,6 +677,10 @@ CAPABILITY_AXES: tuple[CapabilityAxis, ...] = (
             "provider A→distill→local index→B run on 2026-07-23 both recalled "
             "one durable fact exactly once; local, Wiki-candidate, and Honcho "
             "sink states remain independently replayable (#465)."
+        ),
+        piri=_unsupported(
+            "A Piri session A to durable write-back to isolated session B round-trip "
+            "does not exist because Piri write-back is not implemented."
         ),
     ),
     _axis(
@@ -612,6 +705,11 @@ CAPABILITY_AXES: tuple[CapabilityAxis, ...] = (
             "bounded, owner-only, and fail-open; evidence warnings may enqueue optional "
             "body-free owner spool records. Final Telegram delivery and compaction "
             "semantics are outside this capability."
+        ),
+        piri=_supported(
+            "With CCC_LIFECYCLE_AUDIT opt-in, normalized Piri prompt/tool/turn/session "
+            "events enter the same bounded, owner-only, body-free, fail-open observation "
+            "ledger. Final Telegram delivery is outside this capability."
         ),
     ),
 )
@@ -688,8 +786,9 @@ def render_capability_matrix_markdown() -> str:
         "The behavioral runtime axes are executable: "
         "`bridge/tests/test_runtime_conformance.py`",
         "runs the shared `AgentRuntime` conformance suite against every adapter",
-        "(currently `CodexRuntime` over a scripted fake app-server, plus the",
-        "normative in-memory reference runtime) with no live provider calls, and a",
+        "(currently `CodexRuntime` over a scripted fake app-server, `PiriRuntime`",
+        "over a scripted fake RPC process, plus the normative in-memory reference",
+        "runtime) with no live provider calls, and a",
         "negative harness proves that contract-violating runtimes fail the suite.",
         "New provider adapters (#354 successors) must pass this suite and add a",
         "column here before landing.",

@@ -1148,7 +1148,7 @@ load_optional_env() {
 }
 
 maybe_setup_agent_cli() {
-    local provider codex_cli
+    local provider codex_cli piri_cli
     provider="$(read_env_with_fallback "CCC_AGENT_PROVIDER")"
     provider="${provider:-claude}"
 
@@ -1166,6 +1166,21 @@ maybe_setup_agent_cli() {
                 exit 1
             fi
             echo "✅ Codex provider CLI is available"
+            return
+            ;;
+        piri)
+            piri_cli="$(read_env_with_fallback "CCC_PIRI_CLI_PATH")"
+            piri_cli="${piri_cli:-piri}"
+            if [[ "$piri_cli" == */* ]]; then
+                if [ ! -f "$piri_cli" ] || [ ! -x "$piri_cli" ]; then
+                    echo "❌ Error: configured Piri CLI is not executable"
+                    exit 1
+                fi
+            elif ! command -v "$piri_cli" >/dev/null 2>&1; then
+                echo "❌ Error: Piri CLI not found. Install Piri or set CCC_PIRI_CLI_PATH in .env"
+                exit 1
+            fi
+            echo "✅ Piri provider CLI is available"
             return
             ;;
         claude)
@@ -1186,7 +1201,7 @@ maybe_setup_agent_cli() {
             return
             ;;
         *)
-            echo "❌ Error: unsupported CCC_AGENT_PROVIDER (expected claude, codex, or crush)"
+            echo "❌ Error: unsupported CCC_AGENT_PROVIDER (expected claude, codex, crush, or piri)"
             exit 1
             ;;
     esac

@@ -9,7 +9,7 @@ if TYPE_CHECKING:
 
 class SessionManager:
     VALID_REPLY_MODES = {"text", "voice"}
-    VALID_PROVIDERS = {"claude", "codex", "crush"}
+    VALID_PROVIDERS = {"claude", "codex", "crush", "piri"}
     DEFAULT_REPLY_MODE = "text"
     LAST_USER_MESSAGE_AT_KEY = "last_user_message_at"
 

@@ -43,6 +43,7 @@ setattr(
         ffmpeg_path=None,
         claude_cli_path=None,
         codex_cli_path="codex",
+        piri_cli_path="piri",
         agent_provider="claude",
         claude_settings_path=_Path.home() / ".claude" / "settings.json",
     ),
@@ -164,6 +165,50 @@ class TestConnectionResilience(unittest.TestCase):
             timeout=15.0,
             check=False,
         )
+
+    @patch("telegram_bot.core.bot_lifecycle.shutil.which", return_value="/usr/bin/piri")
+    @patch("telegram_bot.core.bot_lifecycle.subprocess.run")
+    def test_piri_readiness_uses_version_probe(self, mock_run, _mock_which):
+        mock_run.return_value = types.SimpleNamespace(
+            returncode=0,
+            stdout="0.83.0\n",
+            stderr="",
+        )
+        self.bot._config.agent_provider = "piri"
+        self.addCleanup(setattr, self.bot._config, "agent_provider", "claude")
+        self.bot._probe_piri_model_readiness = Mock(return_value=(True, ""))
+
+        ready, reason = self.bot._probe_agent_readiness()
+
+        self.assertTrue(ready)
+        self.assertEqual(reason, "")
+        mock_run.assert_called_once_with(
+            ["/usr/bin/piri", "--version"],
+            text=True,
+            capture_output=True,
+            timeout=15.0,
+            check=False,
+        )
+
+    def test_piri_readiness_rejects_an_empty_model_catalog(self):
+        class EmptyPiriRuntime:
+            def __init__(self, **_kwargs):
+                pass
+
+            async def list_models(self):
+                return ()
+
+            async def close(self):
+                return None
+
+        with patch(
+            "telegram_bot.core.piri_runtime.PiriRuntime",
+            EmptyPiriRuntime,
+        ):
+            ready, reason = self.bot._probe_piri_model_readiness("/usr/bin/piri")
+
+        self.assertFalse(ready)
+        self.assertEqual(reason, "piri has no available authenticated models")
 
     def test_invalid_token_raises_system_exit(self):
         """Test that InvalidToken during initialize raises SystemExit."""

@@ -285,6 +285,9 @@ def test_agent_read_only_tool_skipped() -> None:
 
 def test_agent_completion_and_approval() -> None:
     assert _norm_agent(_CompletionEvent("end_turn")).event is LifecycleEventType.TURN_COMPLETED
+    assert _norm_agent(
+        _CompletionEvent("end_turn"), provider="piri"
+    ).provider == "piri"
     assert _norm_agent(_CompletionEvent("error")).tool_status == "failure"
     assert _norm_agent(_ApprovalRequestEvent()).event is LifecycleEventType.PROVIDER_NOTIFICATION
 

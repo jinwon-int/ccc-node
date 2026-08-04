@@ -1,13 +1,17 @@
 """Bind the AgentRuntime conformance suite to real adapters (#387).
 
-Four bindings run here:
+Six bindings run here:
 
 * ``ReferenceRuntimeConformanceTests`` — the normative in-memory runtime,
   proving the suite itself is satisfiable exactly as specified.
 * ``CodexRuntimeConformanceTests`` — the real ``CodexRuntime`` adapter over a
   scripted fake app-server (no live provider, no subprocess).
+* ``CrushRuntimeConformanceTests`` — the real ``CrushRuntime`` adapter over a
+  scripted fake Crush transport (no live provider, no subprocess).
 * ``ClaudeRuntimeConformanceTests`` — the real ``ClaudeRuntime`` adapter over
   a scripted fake Claude SDK client (no live provider, no subprocess).
+* ``PiriRuntimeConformanceTests`` — the real ``PiriRuntime`` adapter over a
+  scripted fake Piri RPC client (no live provider, no subprocess).
 * ``NonConformantRuntimeRejectionTests`` — negative proof: a runtime that
   violates any single contract clause fails the corresponding suite test.
 """
@@ -21,7 +25,7 @@ import json
 from pathlib import Path
 import sys
 import tempfile
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 import unittest
 import uuid
 
@@ -78,6 +82,7 @@ if TYPE_CHECKING:
     )
     from core.codex_runtime import CodexRuntime
     from core.crush_runtime import CrushEvent, CrushRuntime
+    from core.piri_runtime import PiriLaunchConfig, PiriRuntime
     from core.provider_capabilities import (
         PROVIDER_CAPABILITY_MATRIX,
         CapabilityState,
@@ -99,6 +104,7 @@ else:
     )
     from telegram_bot.core.codex_runtime import CodexRuntime
     from telegram_bot.core.crush_runtime import CrushEvent, CrushRuntime
+    from telegram_bot.core.piri_runtime import PiriLaunchConfig, PiriRuntime
     from telegram_bot.core.provider_capabilities import (
         PROVIDER_CAPABILITY_MATRIX,
         CapabilityState,
@@ -759,6 +765,243 @@ class CrushRuntimeConformanceTests(conformance.AgentRuntimeConformanceSuite):
 
     def make_harness(self) -> conformance.ConformanceHarness:
         return CrushConformanceHarness()
+
+
+class _PiriScriptState:
+    """Shared deterministic state for scripted Piri RPC clients."""
+
+    def __init__(self) -> None:
+        self.turn_starts: list[tuple[str, str]] = []
+        self.gate = asyncio.Event()
+        self.scripts: dict[str, deque[str]] = {}
+        self.session_counter = 0
+        self.clients: list[ScriptedPiriRpcClient] = []
+
+    def queue_script(self, session_id: str, kind: str) -> None:
+        self.scripts.setdefault(session_id, deque()).append(kind)
+
+
+class ScriptedPiriRpcClient:
+    """Subset of PiriClient used by the real PiriRuntime adapter."""
+
+    def __init__(self, config: PiriLaunchConfig, state: _PiriScriptState) -> None:
+        self._config = config
+        self._state = state
+        if "--session-id" in config.command:
+            index = config.command.index("--session-id")
+            self.session_id = config.command[index + 1]
+        elif "--no-session" in config.command:
+            self.session_id = "piri-model-catalog"
+        else:
+            state.session_counter += 1
+            self.session_id = f"piri-session-{state.session_counter}"
+        self._events: asyncio.Queue[Mapping[str, Any]] = asyncio.Queue()
+        self._tasks: list[asyncio.Task[None]] = []
+        self._active = False
+        self._closed = False
+        state.clients.append(self)
+
+    async def start(self) -> None:
+        return None
+
+    async def get_state(self) -> Mapping[str, Any]:
+        return {
+            "sessionId": self.session_id,
+            "model": {"provider": "test", "id": "piri-model"},
+        }
+
+    async def get_available_models(self) -> Sequence[Mapping[str, Any]]:
+        return (
+            {
+                "provider": "test",
+                "id": "piri-model",
+                "name": "Piri conformance model",
+                "reasoning": True,
+                "thinkingLevelMap": {"low": {}, "medium": {}, "high": {}},
+            },
+        )
+
+    def _emit(self, event: Mapping[str, Any]) -> None:
+        self._events.put_nowait(event)
+
+    def _emit_text(self, text: str) -> None:
+        self._emit(
+            {
+                "type": "message_update",
+                "assistantMessageEvent": {"type": "text_delta", "delta": text},
+            }
+        )
+
+    def _emit_message_end(self, stop_reason: str = "stop") -> None:
+        self._emit(
+            {
+                "type": "message_end",
+                "message": {"role": "assistant", "stopReason": stop_reason},
+            }
+        )
+
+    def _settle(self) -> None:
+        self._active = False
+        self._emit({"type": "agent_settled"})
+
+    def _simple(self) -> None:
+        self._emit(
+            {
+                "type": "message_update",
+                "assistantMessageEvent": {
+                    "type": "thinking_delta",
+                    "delta": "planning the reply",
+                },
+            }
+        )
+        self._emit_text("Hello, ")
+        self._emit_text("world")
+        self._emit_message_end()
+        self._settle()
+
+    def _two_messages(self) -> None:
+        for text in conformance.TWO_MESSAGE_TEXTS:
+            self._emit_text(text)
+            self._emit_message_end()
+        self._settle()
+
+    def _tool(self) -> None:
+        self._emit(
+            {
+                "type": "tool_execution_start",
+                "toolCallId": "piri-tool-1",
+                "toolName": "bash",
+                "args": {"command": "pwd"},
+            }
+        )
+        self._emit(
+            {
+                "type": "tool_execution_end",
+                "toolCallId": "piri-tool-1",
+                "toolName": "bash",
+                "result": {"exitCode": 0},
+                "isError": False,
+            }
+        )
+        self._emit_text(conformance.TOOL_TURN_TEXT)
+        self._emit_message_end()
+        self._settle()
+
+    def _failure(self) -> None:
+        self._emit_message_end("error")
+        self._settle()
+
+    def _gated(self) -> None:
+        self._emit_text(conformance.GATED_FIRST_TEXT)
+
+        async def finish_after_gate() -> None:
+            await self._state.gate.wait()
+            self._emit_message_end()
+            self._settle()
+
+        self._tasks.append(asyncio.create_task(finish_after_gate()))
+
+    async def prompt(self, message: str) -> None:
+        self._state.turn_starts.append((self.session_id, message))
+        self._active = True
+        queued = self._state.scripts.get(self.session_id)
+        script = queued.popleft() if queued else "simple"
+        if script == "two_messages":
+            self._two_messages()
+        elif script == "tool":
+            self._tool()
+        elif script == "failure":
+            self._failure()
+        elif script == "gated":
+            self._gated()
+        elif script == "hang":
+            pass
+        else:
+            self._simple()
+
+    async def abort(self) -> None:
+        if not self._active:
+            return
+        self._emit_message_end("aborted")
+        self._settle()
+
+    async def next_event(self) -> Mapping[str, Any]:
+        return await self._events.get()
+
+    async def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        for task in self._tasks:
+            task.cancel()
+        await asyncio.gather(*self._tasks, return_exceptions=True)
+        self._tasks.clear()
+
+
+class PiriConformanceHarness(conformance.ConformanceHarness):
+    """Drive PiriRuntime over the scripted headless RPC boundary."""
+
+    provider = "piri"
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._state: _PiriScriptState | None = None
+        self._runtime: PiriRuntime | None = None
+
+    async def start(self) -> None:
+        state = _PiriScriptState()
+        self._state = state
+        self._runtime = PiriRuntime(
+            client_factory=lambda config: ScriptedPiriRpcClient(config, state),
+            process_environment={"PATH": "/bin"},
+            model_catalog_directory="/workspace",
+        )
+
+    async def close(self) -> None:
+        if self._runtime is not None:
+            await self._runtime.close()
+        self._runtime = None
+        self._state = None
+
+    @property
+    def runtime(self) -> AgentRuntime:
+        assert self._runtime is not None, "harness not started"
+        return self._runtime
+
+    @property
+    def state(self) -> _PiriScriptState:
+        assert self._state is not None, "harness not started"
+        return self._state
+
+    def capability_state(self, axis_key: str) -> CapabilityState:
+        return PROVIDER_CAPABILITY_MATRIX["piri"][axis_key].state
+
+    def arrange_turn(
+        self, session: AgentSession, kind: conformance.TurnScriptKind
+    ) -> None:
+        self.state.queue_script(session.session_id, kind)
+
+    def release_gated_turn(self) -> None:
+        self.state.gate.set()
+
+    def provider_turn_starts(self) -> Sequence[tuple[str, str]]:
+        return tuple(self.state.turn_starts)
+
+    def provider_approval_decisions(self) -> Sequence[str]:
+        return ()
+
+    def session_browser(self) -> SessionBrowser:
+        return cast(SessionBrowser, self.runtime)
+
+    def arrange_stored_sessions(self) -> str:
+        raise AssertionError("Piri does not declare session browsing support")
+
+
+class PiriRuntimeConformanceTests(conformance.AgentRuntimeConformanceSuite):
+    """The real Piri adapter must satisfy its declared shared axes."""
+
+    def make_harness(self) -> conformance.ConformanceHarness:
+        return PiriConformanceHarness()
 
 
 class _ClaudeScriptState:

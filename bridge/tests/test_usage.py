@@ -955,6 +955,13 @@ def test_render_usage_without_service_is_unchanged() -> None:
     assert "Kimi quota" not in rendered
 
 
+def test_render_piri_usage_states_provider_telemetry_boundary() -> None:
+    rendered = render_usage(UsageSnapshot(provider="piri"))
+    assert rendered.splitlines()[0] == "📊 Usage · Piri"
+    assert "Provider token/quota telemetry: unavailable" in rendered
+    assert "Session cost" not in rendered
+
+
 @pytest.mark.anyio
 async def test_get_usage_bases_snapshot_on_kimi_environment(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch

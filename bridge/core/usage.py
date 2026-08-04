@@ -859,6 +859,8 @@ def _tokens(value: int | None) -> str:
 def _usage_title(snapshot: UsageSnapshot) -> str:
     if snapshot.provider == "codex":
         return "Codex"
+    if snapshot.provider == "piri":
+        return "Piri"
     return snapshot.service or "Claude Code"
 
 
@@ -902,11 +904,8 @@ def _render_window_line(window: UsageWindow) -> str:
     )
 
 
-def render_usage(snapshot: UsageSnapshot) -> str:
-    """Render a deterministic, bounded, Telegram-safe plain-text response."""
-
-    lines = [f"📊 Usage · {_usage_title(snapshot)}", f"Plan: {snapshot.plan_type or 'unavailable'}"]
-    visible_windows = tuple(
+def _visible_usage_windows(snapshot: UsageSnapshot) -> tuple[UsageWindow, ...]:
+    return tuple(
         window
         for window in snapshot.windows
         if snapshot.provider != "codex"
@@ -915,6 +914,20 @@ def render_usage(snapshot: UsageSnapshot) -> str:
             for marker in HIDDEN_CODEX_RATE_LIMIT_MARKERS
         )
     )
+
+
+def _bounded_usage(lines: list[str]) -> str:
+    rendered = "\n".join(lines)
+    if len(rendered) <= MAX_TELEGRAM_USAGE_LENGTH:
+        return rendered
+    return rendered[: MAX_TELEGRAM_USAGE_LENGTH - 2].rstrip() + "…"
+
+
+def render_usage(snapshot: UsageSnapshot) -> str:
+    """Render a deterministic, bounded, Telegram-safe plain-text response."""
+
+    lines = [f"📊 Usage · {_usage_title(snapshot)}", f"Plan: {snapshot.plan_type or 'unavailable'}"]
+    visible_windows = _visible_usage_windows(snapshot)
     if visible_windows:
         lines.append("Rate limits:")
         for window in visible_windows[:MAX_WINDOWS]:
@@ -928,6 +941,10 @@ def render_usage(snapshot: UsageSnapshot) -> str:
     quota_note = _service_quota_note(snapshot.service)
     if quota_note is not None:
         lines.append(quota_note)
+
+    if snapshot.provider == "piri":
+        lines.append("Provider token/quota telemetry: unavailable")
+        return _bounded_usage(lines)
 
     if snapshot.context_used is not None and snapshot.context_window:
         percent = min(100.0, snapshot.context_used * 100 / snapshot.context_window)
@@ -969,7 +986,4 @@ def render_usage(snapshot: UsageSnapshot) -> str:
             else "unavailable"
         )
         lines.append(f"Session cost: {cost}")
-    rendered = "\n".join(lines)
-    if len(rendered) <= MAX_TELEGRAM_USAGE_LENGTH:
-        return rendered
-    return rendered[: MAX_TELEGRAM_USAGE_LENGTH - 2].rstrip() + "…"
+    return _bounded_usage(lines)

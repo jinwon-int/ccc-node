@@ -166,7 +166,12 @@ def _uses_claude_transcript(session: Mapping[str, Any]) -> bool:
     provider = session.get("provider")
     if provider is None:
         return True
-    if not isinstance(provider, str) or provider not in {"claude", "codex", "crush"}:
+    if not isinstance(provider, str) or provider not in {
+        "claude",
+        "codex",
+        "crush",
+        "piri",
+    }:
         raise ValueError("invalid session provider")
     return provider == "claude"
 
