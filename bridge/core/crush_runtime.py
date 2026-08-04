@@ -68,8 +68,14 @@ _INHERITED_ENV_BLOCKLIST = frozenset({"ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN
 
 
 def _default_crush_config() -> Path:
-    """Fleet-managed crushrc shipped next to the headless runner (#938)."""
-    return Path(__file__).resolve().parents[2] / "crush" / "crushrc.readonly"
+    """Fleet-managed crushrc for the bridge lane (#938).
+
+    Not `crushrc.readonly` — that one is the agent-cron runner's config and
+    denies bash/edit/write. Staging it here left the owner-facing bot unable
+    to run a shell, which is the opposite of this lane's policy
+    (owner-operator / bash_policy=auto-approve). See crush/crushrc.bridge.
+    """
+    return Path(__file__).resolve().parents[2] / "crush" / "crushrc.bridge"
 _SESSION_READ_LIMIT = 50
 _SESSION_LIST_LIMIT = 100
 _TEXT_BOUND = 2000

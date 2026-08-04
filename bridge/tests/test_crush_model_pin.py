@@ -379,5 +379,68 @@ def test_unknown_finish_reason_still_fails_the_turn() -> None:
     assert errors and errors[0].message == "content_filter"
 
 
+# -- 6. Lane configs: same providers, different permissions --------------------
+
+_CRUSH_DIR = Path(__file__).resolve().parents[2] / "crush"
+
+
+def _provider_block(text: str) -> list[str]:
+    """The provider/model definition lines, before any permissions/option."""
+    out, started = [], False
+    for line in text.splitlines():
+        if line.startswith(("permissions ", "option ")):
+            break
+        if line.startswith(("provider add", "model ")):
+            started = True
+        if started and line.strip() and not line.lstrip().startswith("#"):
+            out.append(line.rstrip())
+    return out
+
+
+def test_bridge_lane_keeps_the_shell_tools() -> None:
+    # #940 staged crushrc.readonly (the agent-cron config) into the bridge, so
+    # the owner-facing bot reported "bash 도구가 비활성화되어 있어" — the exact
+    # opposite of this lane's policy (owner-operator / bash_policy=auto-approve,
+    # where Codex gets approval=never + sandbox=dangerFullAccess).
+    bridge = (_CRUSH_DIR / "crushrc.bridge").read_text(encoding="utf-8")
+    denied = [l for l in bridge.splitlines() if l.startswith("permissions deny")]
+    joined = " ".join(denied)
+    for tool in ("bash", "edit", "write", "download"):
+        assert tool not in joined, f"bridge lane must not deny {tool}"
+    # question has no answer path in the bridge — a model that calls it fails
+    # the whole turn (#934).
+    assert "question" in joined, "bridge lane must still deny question"
+
+
+def test_headless_lane_stays_read_only() -> None:
+    readonly = (_CRUSH_DIR / "crushrc.readonly").read_text(encoding="utf-8")
+    denied = " ".join(
+        l for l in readonly.splitlines() if l.startswith("permissions deny")
+    )
+    for tool in ("bash", "edit", "write", "download", "question"):
+        assert tool in denied, f"headless lane must keep denying {tool}"
+
+
+def test_both_lanes_define_the_same_providers() -> None:
+    # The two configs differ only in permissions. Provider/model definitions
+    # live in both files, so a drift here would give one lane a model the
+    # other cannot reach — with no error, just a different answer.
+    bridge = _provider_block((_CRUSH_DIR / "crushrc.bridge").read_text(encoding="utf-8"))
+    readonly = _provider_block(
+        (_CRUSH_DIR / "crushrc.readonly").read_text(encoding="utf-8")
+    )
+    assert bridge, "bridge config must define providers"
+    assert bridge == readonly, (
+        "provider/model definitions drifted between the lanes:\n"
+        f"bridge:\n  " + "\n  ".join(bridge) + "\nreadonly:\n  " + "\n  ".join(readonly)
+    )
+
+
+def test_bridge_lane_is_the_runtime_default() -> None:
+    from telegram_bot.core.crush_runtime import _default_crush_config
+
+    assert _default_crush_config().name == "crushrc.bridge"
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))
