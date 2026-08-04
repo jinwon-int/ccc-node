@@ -323,6 +323,7 @@ class Doctor:
         self.check_bridge_status()
         self.check_bridge_boot_path()
         self.check_memory_cache()
+        self.check_nunchi_collection()
         self.check_provider_readiness()
         # Managed Codex skills are provider-native (#647): diagnose them only on
         # a Codex node. Claude-only asset findings above stay non-readiness
@@ -885,6 +886,100 @@ class Doctor:
                 self.add("경고", "memory cache", "diagnostic unavailable", "run scripts/ccc-memory-check.sh manually")
         else:
             self.add("경고", "memory cache", "ccc-memory-check.sh missing", "complete checkout or reinstall scripts")
+
+    def check_nunchi_collection(self) -> None:
+        """Surface the nunchi MemPalace collection lane for the live provider.
+
+        Reports (body-free — paths/versions/state only, never transcript body,
+        excerpts, session ids or credentials): the configured collection lane
+        (from the managed cron) vs the runtime ``CCC_AGENT_PROVIDER`` (DRIFT),
+        the source kind/path, the MemPalace binary/version (or peer-facts-only
+        degrade), and the last collection state/exit/timestamp. The parsing
+        mirrors ``install-nunchi.sh`` ``status`` (``_status_source`` /
+        ``_status_collection`` / ``_status_provider_match``) so the doctor and
+        the installer cannot diverge in semantics (#920). Severity is 정상 when
+        the lane matches the runtime and the last run did not end in error;
+        otherwise 경고 (warning, non-fatal — never flips the exit code)."""
+        crontab_cmd = os.environ.get("CCC_CRONTAB_CMD", "crontab")
+        try:
+            cron = subprocess.run(
+                [crontab_cmd, "-l"], text=True, capture_output=True, timeout=10
+            ).stdout
+        except Exception:
+            cron = ""
+
+        configured = "none"
+        if re.search(r"codex-feed\.sh", cron):
+            configured = "codex"
+        elif re.search(r"ingest-cron\.sh", cron):
+            configured = "claude"
+
+        # Opt-in: no managed cron means nunchi collection is not wired — healthy.
+        if configured == "none":
+            self.add("정상", "nunchi collection", "not enabled (no managed cron)", "none")
+            return
+
+        # Source kind/path from the refresh cron line (mirrors _status_source).
+        kind = "?"
+        path = "(none)"
+        m = re.search(r"mempalace-refresh\.sh\s+(\w+)\s+(.+?)\s*>>", cron)
+        if m:
+            kind = "mine" if m.group(1) == "codex" else "sweep"
+            path = m.group(2).strip()
+            if len(path) >= 2 and path[0] in "\"'" and path[-1] == path[0]:
+                path = path[1:-1]
+
+        # Provider drift: configured cron lane vs the live runtime provider.
+        match = "ok" if self.provider == configured else "DRIFT"
+
+        # MemPalace binary + version (or peer-facts-only degrade).
+        mp = os.environ.get("CCC_NUNCHI_MEMPALACE_CLI") or shutil.which("mempalace")
+        if not mp and (Path.home() / ".local" / "bin" / "mempalace").exists():
+            mp = str(Path.home() / ".local" / "bin" / "mempalace")
+        mp_ok = bool(mp) and Path(mp).is_file() and os.access(mp, os.X_OK)
+        version = "none"
+        if mp_ok:
+            with contextlib.suppress(Exception):
+                out = subprocess.run(
+                    [mp, "--version"], text=True, capture_output=True, timeout=10
+                ).stdout
+                version = (out.splitlines() or ["unknown"])[-1].strip() or "unknown"
+
+        # Last body-free collection state (mirrors _status_collection).
+        nunchi_home = Path(os.environ.get("NUNCHI_HOME", Path.home() / ".nunchi"))
+        status_file = Path(
+            os.environ.get(
+                "CCC_NUNCHI_MEMPALACE_STATUS", nunchi_home / "mempalace-refresh.status.json"
+            )
+        )
+        collection = "none"
+        coll_state = ""
+        try:
+            data = json.loads(status_file.read_text())
+            coll_state = str(data.get("state", ""))
+            collection = "state={} exit_code={} finished_at={}".format(
+                data.get("state", "?"),
+                data.get("exit_code", "?"),
+                data.get("finished_at", data.get("started_at", "?")),
+            )
+        except Exception:
+            collection = "none"
+
+        status = (
+            "configured={}; runtime={}; match={}; source={} {}; "
+            "mempalace={} version={}; collection={}"
+        ).format(configured, self.provider, match, kind, path, mp or "missing", version, collection)
+
+        healthy = match == "ok" and mp_ok and coll_state in {"ok", "running", ""}
+        self.add(
+            "정상" if healthy else "경고",
+            "nunchi collection",
+            status,
+            "none"
+            if healthy
+            else "run scripts/install-nunchi.sh and align provider/source; "
+            "install MemPalace for verbatim collection",
+        )
 
     def print_report(self) -> None:
         print("# ccc doctor\n")

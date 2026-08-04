@@ -5,6 +5,17 @@ All notable changes to the Claude Code node harness. Dates are KST.
 ## [Unreleased]
 
 ### Added
+- `ccc-doctor` now surfaces the nunchi MemPalace collection lane (#920, completes
+  the doctor half of #865). A new `nunchi collection` finding (text + `--json`,
+  body-free — paths/versions/state only, never transcript body/excerpts/ids/
+  credentials) reports the configured collection lane (from the managed cron) vs
+  the runtime `CCC_AGENT_PROVIDER` with a `match=ok|DRIFT` flag, the source
+  kind/path, the MemPalace binary/version (or peer-facts-only degrade), and the
+  last collection state/exit/timestamp from `mempalace-refresh.status.json`.
+  Severity is 정상 when the lane matches the runtime and the last run did not
+  end in error; otherwise 경고 (warning, non-fatal — never flips the exit code).
+  The parsing mirrors `install-nunchi.sh status` so the two reports cannot
+  diverge.
 - Request lifecycle leak diagnostics (#860): Three-layer defense against zombie
   requests that cause `active_requests` to exceed actual turn count:
   1. WARN-level race condition logging in `register_active()` — emits
