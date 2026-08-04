@@ -98,6 +98,11 @@ def test_provider_validation_rejects_non_string_json_values(provider) -> None:
         _validate_session_data({"telegram_session:1": {"provider": provider}})
 
 
+@pytest.mark.parametrize("provider", ["claude", "codex", "crush"])
+def test_provider_validation_accepts_registered_providers(provider) -> None:
+    _validate_session_data({"telegram_session:1": {"provider": provider}})
+
+
 @pytest.mark.parametrize("effort", ["", [], {}, 1, True])
 def test_effort_validation_rejects_non_string_or_empty_values(effort) -> None:
     with pytest.raises(SessionStoreValidationError, match="invalid effort"):

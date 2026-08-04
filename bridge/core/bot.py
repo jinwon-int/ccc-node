@@ -1181,7 +1181,7 @@ class TelegramBot(
 
     def _active_provider(self) -> str:
         provider = str(getattr(self._config, "agent_provider", "claude")).strip().lower()
-        if provider not in {"claude", "codex"}:
+        if provider not in {"claude", "codex", "crush"}:
             raise ValueError(f"Unsupported agent provider: {provider!r}")
         return provider
 
