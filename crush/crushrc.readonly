@@ -1,0 +1,30 @@
+# ccc-node crush headless — 읽기 전용 기본 설정 (issue #923)
+# crush/headless.sh 가 CRUSH_GLOBAL_CONFIG 로 이 파일을 고정한다.
+# 더 넓은 권한은 CCC_CRUSH_CONFIG 가 검토된 설정을 가리킬 때만 허용된다.
+#
+# 키 규칙: 이 파일에 raw secret 을 쓰지 않는다. 키는 항상 키 파일에서
+# 로드 시점 $() 확장으로만 읽는다. 기본 경로는 fleet 관례다:
+#   K3  : ${CCC_KIMI_KEY_FILE:-$HOME/.hermes/kimi-api-key}
+#   GLM : ${CCC_ZAI_KEY_FILE:-$HOME/.hermes/zai-api-key}
+# 노드에 키 파일이 없으면 로드가 실패하고 실행은 fail-closed 로 멈춘다.
+
+provider add kimi --type anthropic \
+  --base-url "https://api.kimi.com/coding" \
+  --api-key "$(tr -d '[:space:]' < "${CCC_KIMI_KEY_FILE:-$HOME/.hermes/kimi-api-key}")" \
+  --extra-header anthropic-version 2023-06-01
+model add kimi/k3 --name "Kimi K3" \
+  --context-window 1000000 --default-max-tokens 8192 --can-reason true
+
+provider add zai --type openai-compat \
+  --base-url "https://api.z.ai/api/coding/paas/v4" \
+  --api-key "$(tr -d '[:space:]' < "${CCC_ZAI_KEY_FILE:-$HOME/.hermes/zai-api-key}")"
+model add zai/glm-5.2 --name "GLM 5.2" \
+  --context-window 1000000 --default-max-tokens 8192 --can-reason true
+
+# 읽기 전용: 쓰기·실행 도구는 에이전트에게 숨긴다(프롬프트 불가 → fail-closed).
+permissions deny bash edit write download
+permissions allow view ls grep glob
+
+# 운영 기본값: 외부 카탈로그 자동 갱신과 익명 메트릭은 끈다.
+option provider-auto-update false
+option notifications disabled
