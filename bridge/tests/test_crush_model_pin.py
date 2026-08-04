@@ -18,6 +18,7 @@ Unauthorized". Three guards now prevent that silent fallback:
 
 from __future__ import annotations
 
+import asyncio
 import importlib
 import os
 import sys
@@ -208,6 +209,68 @@ def test_explicit_process_environment_passes_through_untouched() -> None:
     env = {"ANTHROPIC_API_KEY": "sk-explicit-choice", "FOO": "1"}
     client = CrushServerClient(process_environment=env)
     assert client._env == env
+
+
+# #938: the crush server reads providers and the read-only permission set only
+# from CRUSH_GLOBAL_CONFIG. Measured on dungae (2026-08-04), a server started
+# without it died with "No providers configured" — the bridge lane never
+# carried the fleet crushrc that the headless runner stages.
+def test_config_is_staged_into_a_directory_for_the_server(tmp_path: Path) -> None:
+    source = tmp_path / "crushrc.readonly"
+    source.write_text("provider add zai --type openai-compat\n", encoding="utf-8")
+
+    client = CrushServerClient(config_path=source)
+
+    staged = client._env.get("CRUSH_GLOBAL_CONFIG")
+    assert staged, "server must be told where the fleet config lives"
+    # crush treats the value as a directory and reads <dir>/crushrc from it.
+    assert Path(staged).is_dir()
+    assert (Path(staged) / "crushrc").read_text(encoding="utf-8") == source.read_text(
+        encoding="utf-8"
+    )
+
+
+def test_staged_config_is_removed_on_close(tmp_path: Path) -> None:
+    source = tmp_path / "crushrc.readonly"
+    source.write_text("provider add zai --type openai-compat\n", encoding="utf-8")
+
+    client = CrushServerClient(config_path=source)
+    staged = Path(client._env["CRUSH_GLOBAL_CONFIG"])
+    assert staged.is_dir()
+
+    asyncio.run(client.close())
+
+    # The config expands key files at load time, so it must not outlive the run.
+    assert not staged.exists()
+
+
+def test_explicit_process_environment_opts_out_of_staging(tmp_path: Path) -> None:
+    source = tmp_path / "crushrc.readonly"
+    source.write_text("provider add zai --type openai-compat\n", encoding="utf-8")
+    chosen = tmp_path / "operator-dir"
+    chosen.mkdir()
+
+    client = CrushServerClient(
+        process_environment={"CRUSH_GLOBAL_CONFIG": str(chosen)},
+        config_path=source,
+    )
+
+    # A caller that hands over the whole environment keeps ownership of it.
+    assert client._env == {"CRUSH_GLOBAL_CONFIG": str(chosen)}
+    assert client._config_dir is None
+
+
+def test_inherited_global_config_is_not_overridden(monkeypatch, tmp_path: Path) -> None:
+    chosen = tmp_path / "node-dir"
+    chosen.mkdir()
+    monkeypatch.setenv("CRUSH_GLOBAL_CONFIG", str(chosen))
+    source = tmp_path / "crushrc.readonly"
+    source.write_text("provider add zai --type openai-compat\n", encoding="utf-8")
+
+    client = CrushServerClient(config_path=source)
+
+    assert client._env["CRUSH_GLOBAL_CONFIG"] == str(chosen)
+    assert client._config_dir is None
 
 
 if __name__ == "__main__":

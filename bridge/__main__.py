@@ -72,7 +72,10 @@ def build_context(
     if settings.agent_provider == "crush" and agent_runtime is None:
         from telegram_bot.core.crush_runtime import CrushRuntime
 
-        agent_runtime = CrushRuntime(executable=settings.crush_cli_path)
+        agent_runtime = CrushRuntime(
+            executable=settings.crush_cli_path,
+            config_path=settings.crush_config_path,
+        )
     elif settings.agent_provider == "codex" and agent_runtime is None:
         from telegram_bot.core.codex_runtime import CodexRuntime
         from telegram_bot.utils.memory_policy import MEMORY_MODE_AUDIENCE_SCOPED
