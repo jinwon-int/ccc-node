@@ -587,6 +587,89 @@ ok "doctor accepts a healthy new memory stack" 'jq -e '\''.healthy.klass == "정
 ok "doctor warns when nunchi is degraded despite healthy Honcho" \
   'jq -e '\''.degraded.klass == "경고" and (.degraded.status | contains("nunchi=degraded"))'\'' <<<"$nout" >/dev/null'
 
+# #920: doctor surfaces the nunchi MemPalace collection lane (configured provider
+# vs runtime CCC_AGENT_PROVIDER DRIFT, source kind/path, MemPalace binary/version,
+# last body-free collection state) — non-fatal (경고). Parsing mirrors
+# install-nunchi.sh status. Driven through a Python helper that constructs the
+# Doctor and calls check_nunchi_collection() directly (same pattern as the
+# memory-cache cases above) against fake crontab/mempalace/status fixtures.
+nbin="$TMP/nunchi-coll-fakebin"; mkdir -p "$nbin"
+cat > "$nbin/crontab" <<'SH'
+#!/usr/bin/env bash
+[ "${1:-}" = "-l" ] && { [ -f "${CCC_TEST_CRONTAB_STORE:-}" ] && cat "${CCC_TEST_CRONTAB_STORE:-}"; exit 0; }
+exit 0
+SH
+chmod +x "$nbin/crontab"
+cat > "$nbin/mempalace" <<'SH'
+#!/usr/bin/env bash
+[ "${1:-}" = "--version" ] && { printf 'MemPalace 9.9-test\n'; exit 0; }
+exit 0
+SH
+chmod +x "$nbin/mempalace"
+nrepo="$TMP/nunchi-coll-repo"
+cat > "$TMP/nunchi-collection.py" <<'PY_EOF'
+import json, os, sys
+from pathlib import Path
+sys.path.insert(0, str(Path(os.environ["DOCTOR_PY"]).resolve().parent))
+import ccc_doctor as mod
+repo = Path(os.environ["NUNCHI_COLL_REPO"])
+(repo / "scripts").mkdir(parents=True, exist_ok=True)
+(repo / ".claude").mkdir(parents=True, exist_ok=True)
+os.environ["HOME"] = os.environ["ND_HOME"]
+os.environ["PATH"] = os.environ["ND_PATH"]
+os.environ["CCC_AGENT_PROVIDER"] = os.environ["ND_PROVIDER"]
+os.environ["CCC_CRONTAB_CMD"] = os.environ["ND_CRONTAB"]
+os.environ["CCC_TEST_CRONTAB_STORE"] = os.environ["ND_CRON_STORE"]
+store = Path(os.environ["ND_CRON_STORE"]); store.parent.mkdir(parents=True, exist_ok=True)
+store.write_text(os.environ.get("ND_CRON", ""))
+sfile = Path(os.environ["ND_STATUS"]); sfile.parent.mkdir(parents=True, exist_ok=True)
+sj = os.environ.get("ND_STATUS_JSON", "")
+if sj:
+    sfile.write_text(sj)
+elif sfile.exists():
+    sfile.unlink()
+os.environ["CCC_NUNCHI_MEMPALACE_STATUS"] = str(sfile)
+os.environ["NUNCHI_HOME"] = str(sfile.parent)
+mp = os.environ.get("ND_MP", "")
+if mp:
+    os.environ["CCC_NUNCHI_MEMPALACE_CLI"] = mp
+else:
+    os.environ.pop("CCC_NUNCHI_MEMPALACE_CLI", None)
+d = mod.Doctor(repo, repo / ".claude", "settings")
+d.check_nunchi_collection()
+r = d.rows[0] if d.rows else None
+print(json.dumps({"klass": r.klass, "status": r.status} if r else {"klass": "none", "status": "none"}, ensure_ascii=False))
+PY_EOF
+run_nc() {  # <provider> <cron-text> <status-json> <mp-path|empty> [path]
+  ND_PROVIDER="$1" ND_CRON="$2" ND_STATUS_JSON="$3" ND_MP="$4" \
+  ND_HOME="$TMP/nc-home" ND_PATH="${5:-$nbin:/usr/bin:/bin}" \
+  ND_CRONTAB="$nbin/crontab" ND_CRON_STORE="$TMP/nc-cron" ND_STATUS="$TMP/nc-status.json" \
+  NUNCHI_COLL_REPO="$nrepo" DOCTOR_PY="$ROOT/scripts/ccc_doctor.py" \
+  python3 "$TMP/nunchi-collection.py" 2>/dev/null
+}
+codex_cron='*/10 * * * * bash /h/.claude/hooks/nunchi/codex-feed.sh >> /log 2>&1 # nunchi:#816
+17 * * * * bash /h/.claude/hooks/nunchi/mempalace-refresh.sh codex /h/.codex/sessions >> /log 2>&1 # nunchi:#816'
+claude_cron='*/10 * * * * bash /h/.claude/hooks/nunchi/ingest-cron.sh >> /log 2>&1 # nunchi:#816
+17 * * * * bash /h/.claude/hooks/nunchi/mempalace-refresh.sh claude /h/.claude/projects >> /log 2>&1 # nunchi:#816'
+ok_json='{"schema":"ccc.nunchi.mempalace-refresh.v1","provider":"codex","state":"ok","exit_code":0,"started_at":1,"finished_at":2}'
+deg_json='{"schema":"ccc.nunchi.mempalace-refresh.v1","provider":"codex","state":"degraded","exit_code":0,"started_at":1,"finished_at":2}'
+
+nc="$(run_nc claude "" "" "")"
+ok "no managed cron reports nunchi collection not enabled (정상, body-free)" \
+  'jq -e ".klass == \"정상\" and (.status | contains(\"not enabled\"))" <<<"$nc" >/dev/null'
+nc="$(run_nc codex "$codex_cron" "$ok_json" "$nbin/mempalace")"
+ok "codex lane with matching provider and present MemPalace is 정상" \
+  'jq -e ".klass == \"정상\" and (.status | contains(\"configured=codex\") and contains(\"runtime=codex\") and contains(\"match=ok\") and contains(\"source=mine\") and contains(\"/h/.codex/sessions\") and contains(\"version=MemPalace 9.9-test\"))" <<<"$nc" >/dev/null'
+nc="$(run_nc claude "$claude_cron" "$ok_json" "$nbin/mempalace")"
+ok "claude lane uses sweep source and stays 정상" \
+  'jq -e ".klass == \"정상\" and (.status | contains(\"match=ok\") and contains(\"source=sweep\") and contains(\"/h/.claude/projects\"))" <<<"$nc" >/dev/null'
+nc="$(run_nc claude "$codex_cron" "$ok_json" "$nbin/mempalace")"
+ok "provider drift (configured codex, runtime claude) is a non-fatal 경고" \
+  'jq -e ".klass == \"경고\" and (.status | contains(\"match=DRIFT\"))" <<<"$nc" >/dev/null'
+nc="$(run_nc codex "$codex_cron" "$deg_json" "" "/usr/bin:/bin")"
+ok "missing MemPalace CLI is a 경고 (peer-facts-only degrade), body-free" \
+  'jq -e ".klass == \"경고\" and (.status | contains(\"mempalace=missing\"))" <<<"$nc" >/dev/null'
+
 # Static backstop: a new probe added later must not reintroduce bare-exec.
 ok "no repo script is subprocess-exec'd without an explicit interpreter" \
   '! grep -nE "subprocess\.(run|check_output|Popen)\(\[str\(" "$ROOT/scripts/ccc_doctor.py"'
