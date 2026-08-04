@@ -36,6 +36,24 @@ out="$(CCC_CRUSH_BIN="$FAKE" CCC_CRUSH_MODEL=kimi/k3 CCC_CRUSH_WORKDIR="$TMP" \
 ok "runner exits zero and passes output through" '[ "$rc" = 0 ] && [ "$out" = "bounded final result" ]'
 ok "runner forces non-interactive quiet run" 'grep -qx "run" "$FAKE_CRUSH_ARGS" && grep -qx -- "-q" "$FAKE_CRUSH_ARGS"'
 ok "runner forwards provider/model" 'grep -qx "kimi/k3" "$FAKE_CRUSH_ARGS"'
+
+# crushrc 의 `model small` 은 프로바이더 카탈로그 기본값에 진다(#936). 그래서
+# 소형 모델은 명령줄로 이름을 대야 한다. 기본값은 주 모델 — 노드는 보통 한
+# 프로바이더의 키만 갖고 있어서, 다른 프로바이더의 기본 소형 모델로 새는 것이
+# 정확히 실패 지점이었다.
+ok "runner names the small model on the command line" 'grep -qx -- "--small-model" "$FAKE_CRUSH_ARGS"'
+ok "small model defaults to the main model" \
+  '[ "$(grep -A1 -x -- "--small-model" "$FAKE_CRUSH_ARGS" | tail -1)" = "kimi/k3" ]'
+
+# shellcheck disable=SC2034 # consumed through eval in ok()
+out="$(CCC_CRUSH_BIN="$FAKE" CCC_CRUSH_MODEL=zai/glm-5.2 CCC_CRUSH_SMALL_MODEL=zai/glm-5-turbo \
+  CCC_CRUSH_WORKDIR="$TMP" CCC_CRUSH_CONFIG="$TMP/crushrc.fake" bash "$RUNNER" 'x')"
+ok "operator can override the small model" \
+  '[ "$(grep -A1 -x -- "--small-model" "$FAKE_CRUSH_ARGS" | tail -1)" = "zai/glm-5-turbo" ]'
+
+# 뒤 검증들이 첫 호출의 인자 캡처를 기대하므로 원래 상태로 되돌린다.
+CCC_CRUSH_BIN="$FAKE" CCC_CRUSH_MODEL=kimi/k3 CCC_CRUSH_WORKDIR="$TMP" \
+  CCC_CRUSH_CONFIG="$TMP/crushrc.fake" bash "$RUNNER" 'inspect safely' >/dev/null
 ok "runner forwards workdir" 'grep -qx "$TMP" "$FAKE_CRUSH_ARGS"'
 ok "runner forwards prompt last" '[ "$(tail -1 "$FAKE_CRUSH_ARGS")" = "inspect safely" ]'
 ok "runner pins metrics opt-out" 'grep -qx "CRUSH_DISABLE_METRICS=1" "$FAKE_CRUSH_ENV"'

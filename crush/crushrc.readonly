@@ -19,6 +19,11 @@ model add kimi/k3 --name "Kimi K3" \
 # 소형 모델 슬롯도 명시 고정한다. 미지정 시 crush가 첫 활성 프로바이더의
 # 기본 소형 모델로 라우팅하므로, 상속된 외부 키가 보이는 환경에서는 의도
 # 밖의 백엔드(anthropic 기본값)로 타이틀 생성이 나간다(canary4 401 노이즈).
+#
+# 주의: 이 줄만으로는 부족하다. 프로바이더가 카탈로그(catwalk)에 등록돼 있으면
+# 그 프로바이더의 기본 소형 모델이 이 설정을 이긴다. dungae 실측(2026-08-04):
+# 이 줄이 있는데도 타이틀 턴이 model=glm-5-turbo / host=api.z.ai 로 나갔다.
+# 실제 고정은 headless.sh 의 `--small-model` 이 한다(#936).
 model small kimi/k3
 
 provider add zai --type openai-compat \
