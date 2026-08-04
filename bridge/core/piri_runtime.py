@@ -422,11 +422,11 @@ def _normalized_events(
         state.assistant_message_open = state.assistant_message_open or saw_text
         return translated
     if event_type == "tool_execution_start":
-        translated_tool = _tool_started(event)
-        return (translated_tool,) if translated_tool is not None else ()
+        started_tool = _tool_started(event)
+        return (started_tool,) if started_tool is not None else ()
     if event_type == "tool_execution_end":
-        translated_tool = _tool_completed(event)
-        return (translated_tool,) if translated_tool is not None else ()
+        completed_tool = _tool_completed(event)
+        return (completed_tool,) if completed_tool is not None else ()
     if event_type != "message_end":
         return ()
     message_result = _message_end_result(
