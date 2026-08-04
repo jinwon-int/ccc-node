@@ -15,6 +15,11 @@ provider add kimi --type anthropic \
 model add kimi/k3 --name "Kimi K3" \
   --context-window 1000000 --default-max-tokens 8192 --can-reason true
 
+# 소형 모델 슬롯도 명시 고정한다. 미지정 시 crush가 첫 활성 프로바이더의
+# 기본 소형 모델로 라우팅하므로, 상속된 외부 키가 보이는 환경에서는 의도
+# 밖의 백엔드(anthropic 기본값)로 타이틀 생성이 나간다(canary4 401 노이즈).
+model small kimi/k3
+
 provider add zai --type openai-compat \
   --base-url "https://api.z.ai/api/coding/paas/v4" \
   --api-key "$(tr -d '[:space:]' < "${CCC_ZAI_KEY_FILE:-$HOME/.hermes/zai-api-key}")"
