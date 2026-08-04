@@ -1128,6 +1128,22 @@ class ProjectChatProcessMixin:
                     streamed = True
                 terminal_error = turn_state.terminal_error
                 if terminal_error is not None:
+                    # The user sees "❌ Processing failed: ..." but nothing
+                    # reached the log, so a provider-terminal failure left no
+                    # server-side trace at all. Measured on dungae
+                    # (2026-08-04): a crush turn died with `tool_use` and
+                    # bot.log / error_*.log were both silent, which cost a
+                    # full diagnosis round. Log the normalized fields —
+                    # ErrorEvent carries `code` and `retryable`, neither of
+                    # which the user-facing string shows. Body-free: the
+                    # message is provider-normalized, no chat content.
+                    logger.error(
+                        "Turn failed: provider=%s code=%s retryable=%s message=%s",
+                        getattr(self._config, "agent_provider", "claude"),
+                        terminal_error.code,
+                        terminal_error.retryable,
+                        terminal_error.message,
+                    )
                     terminal_won = _claim_request_terminal(
                         progress_request,
                         RequestPhase.FAILED,

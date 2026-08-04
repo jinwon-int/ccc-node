@@ -31,6 +31,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from telegram_bot.core.agent_runtime import (
     CompletionEvent,
+    ErrorEvent,
     SessionRequest,
     TextDeltaEvent,
 )
@@ -271,6 +272,97 @@ def test_inherited_global_config_is_not_overridden(monkeypatch, tmp_path: Path) 
 
     assert client._env["CRUSH_GLOBAL_CONFIG"] == str(chosen)
     assert client._config_dir is None
+
+
+# -- 4. Terminal failures must leave a server-side trace -----------------------
+
+
+class _FailingSession(_FakeSession):
+    """A provider turn that ends in a normalized terminal error."""
+
+    def send_turn(self, message, *, approval_handler=None):
+        async def stream():
+            yield ErrorEvent(code="tool_use", message="tool_use", retryable=False)
+
+        return stream()
+
+
+class _FailingRuntime(_FakeRuntime):
+    async def start_or_resume(self, request: SessionRequest) -> _FailingSession:
+        self.requests.append(request)
+        return _FailingSession(request.session_id or f"new-{len(self.requests)}")
+
+
+@pytest.mark.anyio
+async def test_terminal_error_is_logged_not_only_shown_to_the_user(
+    tmp_path: Path, caplog
+) -> None:
+    # dungae (2026-08-04): a crush turn died with `tool_use`; the user saw
+    # "Processing failed: tool_use" but bot.log and error_*.log were both
+    # silent, so the failure left no server-side trace to diagnose from.
+    runtime = _FailingRuntime()
+    handler = _handler(tmp_path, runtime)
+
+    with caplog.at_level("ERROR"):
+        response = await handler.process_message("hi", user_id=7, chat_id=70)
+
+    assert response.success is False
+    assert "tool_use" in (response.error or "")
+
+    logged = "\n".join(r.getMessage() for r in caplog.records if r.levelname == "ERROR")
+    assert "Turn failed" in logged, "terminal failure must be logged"
+    # The user-facing string carries only `message`; the log must add the
+    # normalized fields an operator needs to triage.
+    assert "code=tool_use" in logged
+    assert "retryable=False" in logged
+    assert "provider=crush" in logged
+
+
+# -- 5. Finish reasons: both provider spellings mean the same thing -------------
+
+
+@pytest.mark.parametrize(
+    "reason",
+    ["end_turn", "stop", "stop_sequence", "length", "max_tokens", "tool_calls", "tool_use"],
+)
+def test_normal_finish_reasons_complete_the_turn(reason: str) -> None:
+    # dungae (2026-08-04): a GLM-5.2 turn that called a tool finished with
+    # `tool_use` and surfaced as "Processing failed: tool_use". crush passes
+    # each provider family's own spelling through, so the OpenAI and Anthropic
+    # names for one concept must be treated alike:
+    #   tool_calls / tool_use      length / max_tokens
+    from telegram_bot.core.agent_runtime import CompletionEvent as _Completion
+    from telegram_bot.core.crush_runtime import CrushRuntime, _ActiveTurn
+
+    runtime = CrushRuntime(client_factory=lambda: None)
+    active = _ActiveTurn(queue=asyncio.Queue(), approval_handler=None)
+    runtime._complete_turn(active, {"reason": reason})
+
+    drained = []
+    while not active.queue.empty():
+        drained.append(active.queue.get_nowait())
+
+    assert any(isinstance(e, _Completion) for e in drained), (
+        f"{reason!r} must end the turn normally, not as an error"
+    )
+    assert not any(isinstance(e, ErrorEvent) for e in drained), (
+        f"{reason!r} was reported as a failure"
+    )
+
+
+def test_unknown_finish_reason_still_fails_the_turn() -> None:
+    from telegram_bot.core.crush_runtime import CrushRuntime, _ActiveTurn
+
+    runtime = CrushRuntime(client_factory=lambda: None)
+    active = _ActiveTurn(queue=asyncio.Queue(), approval_handler=None)
+    runtime._complete_turn(active, {"reason": "content_filter"})
+
+    drained = []
+    while not active.queue.empty():
+        drained.append(active.queue.get_nowait())
+
+    errors = [e for e in drained if isinstance(e, ErrorEvent)]
+    assert errors and errors[0].message == "content_filter"
 
 
 if __name__ == "__main__":

@@ -74,8 +74,28 @@ _SESSION_READ_LIMIT = 50
 _SESSION_LIST_LIMIT = 100
 _TEXT_BOUND = 2000
 
-# finish reasons observed from crush (proto Finish.Reason values)
-_FINISH_OK = {"end_turn", "stop", "stop_sequence", "length", "tool_calls"}
+# Finish reasons that mean "the turn ended normally" (proto Finish.Reason).
+#
+# crush normalizes across provider families but passes the family's own
+# spelling through, so each concept arrives under two names: OpenAI says
+# `tool_calls` / `length`, Anthropic says `tool_use` / `max_tokens`. The set
+# was built from reasons *observed* during the kimi pilot and carried only the
+# OpenAI spellings, so an Anthropic-shaped finish fell to the else branch and
+# was reported as a failed turn.
+#
+# Measured on dungae (2026-08-04): a GLM-5.2 turn that called a tool finished
+# with reason `tool_use` and the user got "❌ Processing failed: tool_use"
+# even though nothing had gone wrong. A tool-call finish is already treated as
+# a normal completion here (`tool_calls`); the two spellings must agree.
+_FINISH_OK = {
+    "end_turn",
+    "stop",
+    "stop_sequence",
+    "length",
+    "max_tokens",
+    "tool_calls",
+    "tool_use",
+}
 _FINISH_CANCELED = {"canceled", "cancelled"}
 
 
