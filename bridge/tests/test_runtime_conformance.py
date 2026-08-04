@@ -77,6 +77,7 @@ if TYPE_CHECKING:
         CodexThreadSummary,
     )
     from core.codex_runtime import CodexRuntime
+    from core.crush_runtime import CrushEvent, CrushRuntime
     from core.provider_capabilities import (
         PROVIDER_CAPABILITY_MATRIX,
         CapabilityState,
@@ -97,6 +98,7 @@ else:
         CodexThreadSummary,
     )
     from telegram_bot.core.codex_runtime import CodexRuntime
+    from telegram_bot.core.crush_runtime import CrushEvent, CrushRuntime
     from telegram_bot.core.provider_capabilities import (
         PROVIDER_CAPABILITY_MATRIX,
         CapabilityState,
@@ -468,6 +470,295 @@ class CodexRuntimeConformanceTests(conformance.AgentRuntimeConformanceSuite):
 
     def make_harness(self) -> conformance.ConformanceHarness:
         return CodexConformanceHarness()
+
+
+class ScriptedCrushClient:
+    """Deterministic fake crush transport driven by canonical turn scripts.
+
+    Implements the ``CrushClient`` protocol: ``prompt_send`` pops the next
+    queued script for the session and emits the matching SSE-shaped events.
+    Permission replies are recorded so the suite can assert the provider
+    observed the normalized allow/deny decision.
+    """
+
+    def __init__(self) -> None:
+        self.turn_starts: list[tuple[str, str]] = []
+        self.approval_decisions: list[str] = []
+        self.gate = asyncio.Event()
+        self._scripts: dict[str, deque[str]] = {}
+        self._events: asyncio.Queue[CrushEvent] = asyncio.Queue()
+        self._tasks: list[asyncio.Task[Any]] = []
+        self._session_counter = 0
+        self._created_sessions: list[str] = []
+        self._current_message: dict[str, str] = {}
+        self._approval_message: tuple[str, str] | None = None
+        self.stored_sessions: list[Mapping[str, Any]] = []
+        self.stored_messages: dict[str, list[Mapping[str, Any]]] = {}
+
+    # -- scripting -------------------------------------------------------
+
+    def queue_script(self, session_id: str, kind: str) -> None:
+        self._scripts.setdefault(session_id, deque()).append(kind)
+
+    def _emit(
+        self, kind: str, change: str, session_id: str, payload: Mapping[str, Any]
+    ) -> None:
+        self._events.put_nowait(
+            CrushEvent(kind, change, "ws-fake", session_id, payload)
+        )
+
+    def _created(self, session_id: str, message_id: str) -> None:
+        self._current_message[session_id] = message_id
+        self._emit("message", "created", session_id, {
+            "id": message_id, "session_id": session_id,
+            "role": "assistant", "parts": [],
+        })
+
+    def _update(
+        self, session_id: str, message_id: str, parts: Sequence[Mapping[str, Any]]
+    ) -> None:
+        self._emit("message", "updated", session_id, {
+            "id": message_id, "session_id": session_id,
+            "role": "assistant", "parts": list(parts),
+        })
+
+    @staticmethod
+    def _text(text: str) -> Mapping[str, Any]:
+        return {"type": "text", "data": {"text": text}}
+
+    @staticmethod
+    def _finish(reason: str, message: str = "") -> Mapping[str, Any]:
+        return {"type": "finish", "data": {"reason": reason, "time": 1, "message": message}}
+
+    def _spawn(self, coro: Any) -> None:
+        self._tasks.append(asyncio.create_task(coro))
+
+    async def _run_script(self, session_id: str, kind: str, message_id: str) -> None:
+        if kind == "simple":
+            self._created(session_id, message_id)
+            reasoning = {"type": "reasoning", "data": {"text": "planning the reply"}}
+            self._update(session_id, message_id, [reasoning])
+            self._update(session_id, message_id, [reasoning, self._text("Hello, ")])
+            self._update(session_id, message_id, [
+                reasoning, self._text(conformance.SIMPLE_TURN_TEXT),
+            ])
+            self._update(session_id, message_id, [
+                reasoning, self._text(conformance.SIMPLE_TURN_TEXT), self._finish("end_turn"),
+            ])
+        elif kind == "two_messages":
+            first, second = conformance.TWO_MESSAGE_TEXTS
+            self._created(session_id, message_id)
+            self._update(session_id, message_id, [self._text(first)])
+            other = message_id + "-b"
+            self._created(session_id, other)
+            self._update(session_id, other, [self._text(second)])
+            self._update(session_id, other, [self._text(second), self._finish("end_turn")])
+        elif kind == "tool":
+            call = {"type": "tool_call", "data": {
+                "id": "call-1", "name": "bash", "input": "pwd", "finished": False,
+            }}
+            result = {"type": "tool_result", "data": {
+                "tool_call_id": "call-1", "name": "bash",
+                "content": "/workspace", "is_error": False,
+            }}
+            self._created(session_id, message_id)
+            self._update(session_id, message_id, [call])
+            self._update(session_id, message_id, [call, result])
+            self._update(session_id, message_id, [
+                call, result, self._text(conformance.TOOL_TURN_TEXT),
+            ])
+            self._update(session_id, message_id, [
+                call, result, self._text(conformance.TOOL_TURN_TEXT),
+                self._finish("end_turn"),
+            ])
+        elif kind == "approval":
+            self._approval_message = (session_id, message_id)
+            self._created(session_id, message_id)
+            self._emit("permission_request", "created", session_id, {
+                "id": "perm-1", "session_id": session_id,
+                "tool_call_id": "call-1", "tool_name": "bash",
+                "action": "bash", "description": "run pwd",
+                "params": {"command": "pwd"},
+            })
+            # the turn completes when permission_reply records the decision
+        elif kind == "failure":
+            self._created(session_id, message_id)
+            self._update(session_id, message_id, [
+                self._finish("error", "scripted provider failure"),
+            ])
+        elif kind == "hang":
+            self._created(session_id, message_id)
+            self._update(session_id, message_id, [self._text("hanging")])
+            # never finishes until turn_cancel emits the canceled finish
+        elif kind == "gated":
+            self._created(session_id, message_id)
+            self._update(session_id, message_id, [
+                self._text(conformance.GATED_FIRST_TEXT),
+            ])
+            await self.gate.wait()
+            self._update(session_id, message_id, [
+                self._text(conformance.GATED_FIRST_TEXT), self._finish("end_turn"),
+            ])
+        else:
+            raise AssertionError(f"unknown script: {kind}")
+
+    # -- CrushClient protocol --------------------------------------------
+
+    async def start(self) -> None:
+        return None
+
+    async def workspace_ensure(self, *, cwd: str, model: str | None) -> str:
+        return "ws-fake"
+
+    async def session_create(self, workspace_id: str) -> str:
+        self._session_counter += 1
+        session_id = f"sid-{self._session_counter}"
+        self._created_sessions.append(session_id)
+        return session_id
+
+    async def session_exists(self, workspace_id: str, session_id: str) -> bool:
+        return session_id in self._created_sessions or session_id in self.stored_messages
+
+    async def prompt_send(
+        self, workspace_id: str, session_id: str, text: str, *, run_id: str
+    ) -> None:
+        self.turn_starts.append((session_id, text))
+        queue = self._scripts.get(session_id)
+        kind = queue.popleft() if queue else "simple"
+        message_id = f"msg-{len(self.turn_starts)}"
+        self._spawn(self._run_script(session_id, kind, message_id))
+
+    async def turn_cancel(self, workspace_id: str, session_id: str) -> None:
+        message_id = self._current_message.get(session_id)
+        if message_id is not None:
+            self._update(session_id, message_id, [self._finish("canceled")])
+
+    async def permission_reply(
+        self, workspace_id: str, request: Mapping[str, Any], decision: str
+    ) -> None:
+        self.approval_decisions.append(decision)
+        if self._approval_message is not None:
+            session_id, message_id = self._approval_message
+            self._update(session_id, message_id, [
+                self._text(conformance.APPROVAL_TURN_TEXT),
+            ])
+            self._update(session_id, message_id, [
+                self._text(conformance.APPROVAL_TURN_TEXT), self._finish("end_turn"),
+            ])
+
+    async def list_models(self, workspace_id: str) -> Sequence[Mapping[str, Any]]:
+        return [{"provider": "kimi", "models": [{"id": "k3", "name": "Kimi K3"}]}]
+
+    async def session_list(
+        self, workspace_id: str, *, limit: int
+    ) -> Sequence[Mapping[str, Any]]:
+        return self.stored_sessions[:limit]
+
+    async def session_messages(
+        self, workspace_id: str, session_id: str
+    ) -> Sequence[Mapping[str, Any]]:
+        return self.stored_messages.get(session_id, [])
+
+    async def session_usage(
+        self, workspace_id: str, session_id: str
+    ) -> Mapping[str, Any]:
+        return {"prompt_tokens": 10, "completion_tokens": 5, "cost": 0.0}
+
+    async def next_event(self) -> CrushEvent:
+        return await self._events.get()
+
+    async def close(self) -> None:
+        for task in self._tasks:
+            task.cancel()
+
+
+class CrushConformanceHarness(conformance.ConformanceHarness):
+    """Drive the real CrushRuntime adapter over the scripted fake client."""
+
+    provider = "crush"
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._client: ScriptedCrushClient | None = None
+        self._runtime: CrushRuntime | None = None
+
+    async def start(self) -> None:
+        def factory() -> ScriptedCrushClient:
+            self._client = ScriptedCrushClient()
+            return self._client
+
+        self._runtime = CrushRuntime(client_factory=factory)
+
+    async def close(self) -> None:
+        if self._runtime is not None:
+            await self._runtime.close()
+        self._runtime = None
+        self._client = None
+
+    @property
+    def runtime(self) -> AgentRuntime:
+        assert self._runtime is not None, "harness not started"
+        return self._runtime
+
+    @property
+    def client(self) -> ScriptedCrushClient:
+        assert self._client is not None, "the runtime has not started its client"
+        return self._client
+
+    def capability_state(self, axis_key: str) -> CapabilityState:
+        return PROVIDER_CAPABILITY_MATRIX["crush"][axis_key].state
+
+    def arrange_turn(
+        self, session: AgentSession, kind: conformance.TurnScriptKind
+    ) -> None:
+        self.client.queue_script(session.session_id, kind)
+
+    def release_gated_turn(self) -> None:
+        self.client.gate.set()
+
+    def provider_turn_starts(self) -> Sequence[tuple[str, str]]:
+        return tuple(self.client.turn_starts)
+
+    def provider_approval_decisions(self) -> Sequence[str]:
+        return tuple(self.client.approval_decisions)
+
+    def session_browser(self) -> SessionBrowser:
+        assert self._runtime is not None, "harness not started"
+        return self._runtime
+
+    def arrange_stored_sessions(self) -> str:
+        stored_id = "sid-stored-1"
+        self.client.stored_sessions = [
+            {"id": stored_id, "title": "Stored session", "updated_at": 42.0},
+        ]
+        self.client.stored_messages[stored_id] = [
+            {"role": "user", "parts": [{"type": "text", "data": {"text": "hello"}}]},
+            {"role": "assistant", "parts": [{"type": "text", "data": {"text": "hi"}}]},
+        ]
+        return stored_id
+
+    async def wait_until_interruptible(self, session: AgentSession) -> None:
+        # CrushSession.interrupt() is a no-op until the adapter has marked the
+        # turn ready (right after prompt_send returns), so poll the adapter's
+        # active-turn registry directly.
+        assert self._runtime is not None, "harness not started"
+        runtime = self._runtime
+
+        async def poll() -> None:
+            while True:
+                active = runtime._active_turns.get(session.session_id)
+                if active is not None and active.turn_ready.is_set():
+                    return
+                await asyncio.sleep(0.005)
+
+        await asyncio.wait_for(poll(), timeout=self.liveness_timeout)
+
+
+class CrushRuntimeConformanceTests(conformance.AgentRuntimeConformanceSuite):
+    """The real Crush adapter must satisfy the shared behavior contract."""
+
+    def make_harness(self) -> conformance.ConformanceHarness:
+        return CrushConformanceHarness()
 
 
 class _ClaudeScriptState:
