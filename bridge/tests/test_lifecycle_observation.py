@@ -9,6 +9,7 @@ from telegram_bot.core.lifecycle_observation import (
     LifecycleObservation,
     normalize_claude_hook,
     normalize_codex_app_server,
+    normalize_crush_event,
 )
 from telegram_bot.utils.redaction import contains_credential, redact_credentials
 
@@ -42,6 +43,56 @@ def test_claude_and_codex_tool_events_share_the_schema() -> None:
     assert claude.session_ref and "s1" not in claude.session_ref
     assert codex.session_ref and "t1" not in codex.session_ref
     assert codex.turn_ref and "u1" not in codex.turn_ref
+
+
+def _crush_envelope(parts, *, role="assistant", change="updated", kind="message"):
+    return {
+        "type": kind,
+        "payload": {
+            "type": change,
+            "payload": {
+                "id": "m1", "session_id": "s9", "role": role, "parts": parts,
+            },
+        },
+    }
+
+
+def test_crush_events_share_the_schema() -> None:
+    obs = normalize_crush_event(_crush_envelope([
+        {"type": "tool_call", "data": {"id": "c1", "name": "bash", "input": "pytest -q"}},
+        {"type": "tool_result", "data": {
+            "tool_call_id": "c1", "name": "bash", "content": "ok", "is_error": False,
+        }},
+    ]))
+    assert obs is not None
+    assert obs.event is LifecycleEventType.TOOL_COMPLETED
+    assert obs.provider == "crush" and obs.schema_version == 1
+    assert obs.tool_status == "success"
+    assert obs.verification is True  # pytest in the sibling tool_call input
+    assert obs.session_ref and "s9" not in obs.session_ref
+
+    finish = normalize_crush_event(_crush_envelope([
+        {"type": "finish", "data": {"reason": "end_turn", "time": 1}},
+    ]))
+    assert finish is not None and finish.event is LifecycleEventType.TURN_COMPLETED
+
+    approval = normalize_crush_event({
+        "type": "permission_request",
+        "payload": {"type": "created", "payload": {
+            "id": "p1", "session_id": "s9", "tool_name": "bash",
+            "action": "bash", "description": "run pwd",
+        }},
+    })
+    assert approval is not None
+    assert approval.event is LifecycleEventType.PROVIDER_NOTIFICATION
+    assert approval.flag == "approval"
+
+    prompt = normalize_crush_event(_crush_envelope([], role="user", change="created"))
+    assert prompt is not None and prompt.event is LifecycleEventType.PROMPT_SUBMITTED
+
+    # nothing else carries lifecycle signal
+    assert normalize_crush_event({"type": "session", "payload": {"type": "created", "payload": {}}}) is None
+
 
 
 def test_event_type_coverage() -> None:

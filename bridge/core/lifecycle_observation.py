@@ -23,7 +23,7 @@ from typing import Any, Final, Iterable, Mapping
 from telegram_bot.utils.redaction import contains_credential
 
 SCHEMA_VERSION: Final = 1
-_PROVIDERS: Final = ("claude", "codex")
+_PROVIDERS: Final = ("claude", "codex", "crush")
 
 # Tools whose completion is worth auditing are everything except clearly
 # read-only tools — mirrors audit.sh's mutating filter while defaulting an
@@ -302,6 +302,87 @@ def normalize_codex_app_server(
     return None
 
 
+def normalize_crush_event(
+    envelope: Mapping[str, Any]
+) -> LifecycleObservation | None:
+    """Normalize a raw crush server SSE envelope (``{type, payload:{type, payload}}``).
+
+    Only turn/tool/approval/prompt signals map; everything else returns None.
+    Tool inputs are read only to compute the boolean ``verification`` flag and
+    are never retained, mirroring the codex normalizer's body-free contract.
+    """
+
+    if not isinstance(envelope, Mapping):
+        return None
+    kind = str(envelope.get("type") or "")
+    inner = envelope.get("payload")
+    if not isinstance(inner, Mapping):
+        return None
+    change = str(inner.get("type") or "")
+    payload = inner.get("payload")
+    if not isinstance(payload, Mapping):
+        return None
+    session_ref = _ref(payload.get("session_id"))
+
+    if kind == "permission_request":
+        return LifecycleObservation(
+            event=LifecycleEventType.PROVIDER_NOTIFICATION, provider="crush",
+            session_ref=session_ref,
+            turn_ref=_ref(payload.get("tool_call_id")),
+            flag="approval",
+            correlation=_ref(payload.get("id")),
+        )
+    if kind != "message":
+        return None
+    role = str(payload.get("role") or "")
+    message_id = _ref(payload.get("id"))
+    if change == "created" and role == "user":
+        return LifecycleObservation(
+            event=LifecycleEventType.PROMPT_SUBMITTED, provider="crush",
+            session_ref=session_ref, correlation=message_id,
+        )
+    if change != "updated" or role != "assistant":
+        return None
+    parts = payload.get("parts")
+    if not isinstance(parts, list):
+        return None
+    tool_inputs = [
+        str(part.get("data", {}).get("input") or "")
+        for part in parts
+        if isinstance(part, Mapping) and part.get("type") == "tool_call"
+        and isinstance(part.get("data"), Mapping)
+    ]
+    for part in parts:
+        if not isinstance(part, Mapping):
+            continue
+        data = part.get("data")
+        if not isinstance(data, Mapping):
+            continue
+        if part.get("type") == "tool_result":
+            name = str(data.get("name") or "")
+            if not is_auditable_tool(name):
+                return None
+            return LifecycleObservation(
+                event=LifecycleEventType.TOOL_COMPLETED, provider="crush",
+                session_ref=session_ref,
+                turn_ref=_ref(data.get("tool_call_id")),
+                tool=name,
+                tool_status="failure" if data.get("is_error") else "success",
+                file_change=is_file_change_tool(name),
+                verification=any(_EVIDENCE_RE.search(text) for text in tool_inputs),
+                correlation=_ref(data.get("tool_call_id")) or message_id,
+            )
+        if part.get("type") == "finish":
+            reason = str(data.get("reason") or "")
+            return LifecycleObservation(
+                event=LifecycleEventType.TURN_COMPLETED, provider="crush",
+                session_ref=session_ref,
+                tool_status="success" if reason in ("end_turn", "stop") else "failure",
+                correlation=message_id,
+            )
+    return None
+
+
 # --------------------------------------------------------------------------- #
 # Evidence gate (body-free, provider-neutral)
 # --------------------------------------------------------------------------- #
@@ -402,5 +483,6 @@ __all__ = [
     "evidence_gate",
     "normalize_claude_hook",
     "normalize_codex_app_server",
+    "normalize_crush_event",
     "normalize_agent_event",
 ]
