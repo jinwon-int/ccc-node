@@ -77,6 +77,10 @@ crush는 익명 사용 메트릭(PostHog)이 기본 활성이다. `headless.sh`�
   값**(`disable_provider_auto_update`, 반전 적용 후)을 찍으므로
   `"value":true`가 자동 갱신 ON을 뜻하는 것이 **아니다**(OFF가 맞다).
   로그만 보고 오독하지 않도록 주의
+- 대화형 `question` 도구는 비대화형 경로(헤드리스·텔레그램 브릿지)에서 반드시
+  `permissions deny question`으로 숨긴다. 응답 경로가 없어 모델이 이 도구를
+  부르면 턴이 실패한다 — 방통 브릿지에서 k3가 2개 질문 배치를 보낸 뒤
+  `"Processing failed: tool_use"`로 종료된 사례(2026-08-04)
 
 ## 한계
 

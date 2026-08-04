@@ -27,7 +27,9 @@ model add zai/glm-5.2 --name "GLM 5.2" \
   --context-window 1000000 --default-max-tokens 8192 --can-reason true
 
 # 읽기 전용: 쓰기·실행 도구는 에이전트에게 숨긴다(프롬프트 불가 → fail-closed).
-permissions deny bash edit write download
+# question도 숨긴다 — 비대화형 러너·브릿지에는 대화형 질문의 응답 경로가 없어
+# 모델이 이 도구를 쓰면 턴 전체가 실패한다(방통 브릿지 "Processing failed: tool_use").
+permissions deny bash edit write download question
 permissions allow view ls grep glob
 
 # 운영 기본값: 외부 카탈로그 자동 갱신과 익명 메트릭은 끈다.
