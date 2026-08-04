@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
 import subprocess
 import threading
@@ -53,6 +54,14 @@ from .agent_runtime import (
 )
 
 _CRUSH_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
+
+# Credential env keys that auto-activate crush's bundled Anthropic provider.
+# The bridge process env carries these for the Claude lane; when they leak
+# into the crush subprocess, crush's built-in model fallback silently targets
+# api.anthropic.com with a key that is not valid there (canary4 401, #926).
+# crushrc-defined providers are unaffected — only inherited credentials are
+# stripped. Pass process_environment explicitly to opt out.
+_INHERITED_ENV_BLOCKLIST = frozenset({"ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"})
 _SESSION_READ_LIMIT = 50
 _SESSION_LIST_LIMIT = 100
 _TEXT_BOUND = 2000
@@ -140,7 +149,12 @@ class CrushServerClient:
         readiness_timeout_seconds: float = 15.0,
     ) -> None:
         self._executable = executable
-        self._env = dict(process_environment) if process_environment is not None else None
+        if process_environment is not None:
+            self._env = dict(process_environment)
+        else:
+            self._env = {
+                k: v for k, v in os.environ.items() if k not in _INHERITED_ENV_BLOCKLIST
+            }
         self._host = host
         self._port = port
         self._readiness_timeout = readiness_timeout_seconds

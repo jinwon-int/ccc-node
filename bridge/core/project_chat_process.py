@@ -591,6 +591,12 @@ class ProjectChatProcessMixin:
         600s wait on gongmyoung — so it re-runs on a short budget instead.
         """
         key = self._stream_key(user_id, chat_id)
+        if model is None and getattr(self._config, "agent_provider", "claude") == "crush":
+            # crush has no built-in safe default: without an explicit model it
+            # activates its bundled provider default and can route the turn to
+            # an unintended backend (canary4 401, #926). Pin the configured
+            # default (CCC_CRUSH_MODEL) unless the turn chose a model itself.
+            model = getattr(self._config, "crush_model", None) or None
         streaming_handler = None
         if bot and getattr(self._config, "enable_streaming", False):
             from telegram_bot.core.streaming import StreamingMessageHandler
