@@ -367,13 +367,13 @@ def _parse_envelope(envelope: Any, workspace_id: str) -> CrushEvent | None:
     inner = envelope.get("payload")
     if not isinstance(kind, str) or not isinstance(inner, Mapping):
         return None
-    change = inner.get("type") if isinstance(inner.get("type"), str) else ""
+    raw_change = inner.get("type")
+    change = raw_change if isinstance(raw_change, str) else ""
     payload = inner.get("payload")
     if not isinstance(payload, Mapping):
         payload = {}
-    session_id = payload.get("session_id") or payload.get("id") or ""
-    if not isinstance(session_id, str):
-        session_id = ""
+    raw_id = payload.get("session_id") or payload.get("id") or ""
+    session_id = raw_id if isinstance(raw_id, str) else ""
     return CrushEvent(kind, change, workspace_id, session_id, payload)
 
 
@@ -425,7 +425,8 @@ class CrushSession:
                 try:
                     run_id = str(uuid.uuid4())
                     active.run_id = run_id
-                    await self._runtime._client.prompt_send(
+                    client = await self._runtime._ensure_started()
+                    await client.prompt_send(
                         self._workspace_id, self._session_id, message, run_id=run_id,
                     )
                     active.turn_ready.set()
@@ -451,9 +452,12 @@ class CrushSession:
 
     async def interrupt(self) -> None:
         active = self._runtime._active_turns.get(self._session_id)
+        client = self._runtime._client
         if active is None or active.finished or not active.turn_ready.is_set():
             return
-        await self._runtime._client.turn_cancel(self._workspace_id, self._session_id)
+        if client is None:
+            return
+        await client.turn_cancel(self._workspace_id, self._session_id)
 
 
 class CrushRuntime:
