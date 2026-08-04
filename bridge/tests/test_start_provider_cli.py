@@ -23,11 +23,17 @@ def _function_source(name: str) -> str:
     return "\n".join(selected)
 
 
-def _run(tmp_path: Path, *, provider: str, codex_cli: str = "codex") -> subprocess.CompletedProcess[str]:
+def _run(
+    tmp_path: Path,
+    *,
+    provider: str,
+    codex_cli: str = "codex",
+    crush_cli: str = "crush",
+) -> subprocess.CompletedProcess[str]:
     program = "\n".join(
         [
             "set -eu",
-            'read_env_with_fallback() { case "$1" in CCC_AGENT_PROVIDER) printf "%s" "$TEST_PROVIDER" ;; CCC_CODEX_CLI_PATH) printf "%s" "$TEST_CODEX_CLI" ;; esac; }',
+            'read_env_with_fallback() { case "$1" in CCC_AGENT_PROVIDER) printf "%s" "$TEST_PROVIDER" ;; CCC_CODEX_CLI_PATH) printf "%s" "$TEST_CODEX_CLI" ;; CCC_CRUSH_CLI_PATH) printf "%s" "$TEST_CRUSH_CLI" ;; esac; }',
             _function_source("maybe_setup_agent_cli"),
             "maybe_setup_agent_cli",
         ]
@@ -36,6 +42,7 @@ def _run(tmp_path: Path, *, provider: str, codex_cli: str = "codex") -> subproce
         **os.environ,
         "TEST_PROVIDER": provider,
         "TEST_CODEX_CLI": codex_cli,
+        "TEST_CRUSH_CLI": crush_cli,
         "CLAUDE_CLI_PATH": "",
         "PATH": f"{tmp_path}:/usr/bin:/bin",
     }
@@ -59,6 +66,25 @@ def test_codex_provider_fails_closed_when_cli_is_missing(tmp_path: Path) -> None
 
     assert result.returncode == 1
     assert "configured Codex CLI is not executable" in result.stdout
+    assert str(tmp_path) not in result.stdout
+
+
+def test_crush_provider_uses_crush_cli(tmp_path: Path) -> None:
+    crush = tmp_path / "crush"
+    crush.write_text("#!/bin/sh\nexit 0\n")
+    crush.chmod(0o700)
+
+    result = _run(tmp_path, provider="crush", crush_cli=str(crush))
+
+    assert result.returncode == 0
+    assert "crush provider CLI is available" in result.stdout
+
+
+def test_crush_provider_fails_closed_when_cli_is_missing(tmp_path: Path) -> None:
+    result = _run(tmp_path, provider="crush", crush_cli=str(tmp_path / "missing"))
+
+    assert result.returncode == 1
+    assert "configured crush CLI is not executable" in result.stdout
     assert str(tmp_path) not in result.stdout
 
 
