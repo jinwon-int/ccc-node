@@ -8,7 +8,8 @@
 #
 # Permission model: Crush takes tool permissions from crushrc, not from CLI
 # flags, so this runner pins the global config to a fleet-managed file
-# (default: crush/crushrc.readonly in this repo) via CRUSH_GLOBAL_CONFIG.
+# (default: crush/crushrc.readonly in this repo), staged into a private
+# directory because CRUSH_GLOBAL_CONFIG names a directory (see below).
 # Operators opt into broader access by pointing CCC_CRUSH_CONFIG at a
 # reviewed config. There is deliberately no yolo path here.
 set -uo pipefail
@@ -52,12 +53,25 @@ case "$TMO" in
 esac
 
 ERR="$(mktemp "${TMPDIR:-/tmp}/ccc-crush-headless.XXXXXX.err")"
-trap 'rm -f "$ERR"' EXIT
+# mktemp -d gives mode 700, so the copied config is not world-readable.
+CFGDIR="$(mktemp -d "${TMPDIR:-/tmp}/ccc-crush-cfg.XXXXXX")"
+trap 'rm -f "$ERR"; rm -rf "$CFGDIR"' EXIT
 
-# Crush reads CRUSH_GLOBAL_CONFIG for the global config path and honours
-# CRUSH_DISABLE_METRICS for the anonymous-usage opt-out. Both are pinned
-# here so a caller environment cannot silently widen either.
-export CRUSH_GLOBAL_CONFIG="$CONFIG"
+# CRUSH_GLOBAL_CONFIG is a *directory*, not a file. Crush searches it for
+# `crush.json` and `crushrc`, alongside /etc/crush and the user data dir:
+#
+#   Failed to load config from paths [/etc/crush/crush.json
+#     <CRUSH_GLOBAL_CONFIG>/crush.json <CRUSH_GLOBAL_CONFIG>/crushrc
+#     ~/.local/share/crush/crush.json]
+#
+# Pointing it at a file made every run fail closed on crush v0.88.0 with
+# `failed to open config file <file>/crush.json: not a directory` (#936).
+# Operators still name a config *file* through CCC_CRUSH_CONFIG, so keep
+# that contract and wrap the file in a private directory at run time.
+cp "$CONFIG" "$CFGDIR/crushrc"
+
+# Both are pinned here so a caller environment cannot silently widen either.
+export CRUSH_GLOBAL_CONFIG="$CFGDIR"
 export CRUSH_DISABLE_METRICS="${CCC_CRUSH_METRICS_OPTOUT:-1}"
 
 runner=("$BIN")
