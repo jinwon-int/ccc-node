@@ -1081,6 +1081,61 @@ class BotCommandMixin:
         await message.reply_text(reply)
         log_debug(user_id, "bot", reply)
 
+    async def _handle_piri_resume(
+        self,
+        *,
+        conversation_key,
+        user_id: int,
+        message,
+        args: list[str],
+    ) -> None:
+        """Select or report the exact Piri RPC session id."""
+
+        if len(args) > 1:
+            reply = "Usage: /resume <piri-session-id>"
+            await message.reply_text(reply)
+            log_debug(user_id, "bot", reply)
+            return
+        if args:
+            requested_id = args[0].strip()
+            if (
+                len(requested_id) > 128
+                or re.fullmatch(
+                    r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?",
+                    requested_id,
+                )
+                is None
+            ):
+                reply = "❌ Invalid Piri session id."
+                await message.reply_text(reply)
+                log_debug(user_id, "bot", reply)
+                return
+            await self._session_manager.patch_session(
+                conversation_key,
+                updates={
+                    "provider": "piri",
+                    "session_id": requested_id,
+                    "new_session": False,
+                },
+                remove_fields={"resume_list"},
+            )
+            self._runtime_active_sessions.add(conversation_key)
+            reply = f"✅ Piri session selected: {requested_id}"
+            await message.reply_text(reply)
+            log_debug(user_id, "bot", reply)
+            return
+        session = await self._session_manager.get_session(conversation_key)
+        current_id = session.get("session_id")
+        if isinstance(current_id, str) and current_id:
+            reply = (
+                f"ℹ️ Current Piri session auto-resumes: {current_id}\n"
+                "To select another session, use /resume <piri-session-id>."
+            )
+        else:
+            reply = "Usage: /resume <piri-session-id>"
+        await message.reply_text(reply)
+        log_debug(user_id, "bot", reply)
+
     async def _cmd_resume(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_access(update):
             return
@@ -1115,51 +1170,12 @@ class BotCommandMixin:
             )
             return
         if active_provider == "piri":
-            args = context.args or []
-            if len(args) > 1:
-                reply = "Usage: /resume <piri-session-id>"
-                await message.reply_text(reply)
-                log_debug(user_id, "bot", reply)
-                return
-            if args:
-                requested_id = args[0].strip()
-                if (
-                    len(requested_id) > 128
-                    or re.fullmatch(
-                        r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?",
-                        requested_id,
-                    )
-                    is None
-                ):
-                    reply = "❌ Invalid Piri session id."
-                    await message.reply_text(reply)
-                    log_debug(user_id, "bot", reply)
-                    return
-                await self._session_manager.patch_session(
-                    conversation_key,
-                    updates={
-                        "provider": "piri",
-                        "session_id": requested_id,
-                        "new_session": False,
-                    },
-                    remove_fields={"resume_list"},
-                )
-                self._runtime_active_sessions.add(conversation_key)
-                reply = f"✅ Piri session selected: {requested_id}"
-                await message.reply_text(reply)
-                log_debug(user_id, "bot", reply)
-                return
-            session = await self._session_manager.get_session(conversation_key)
-            current_id = session.get("session_id")
-            if isinstance(current_id, str) and current_id:
-                reply = (
-                    f"ℹ️ Current Piri session auto-resumes: {current_id}\n"
-                    "To select another session, use /resume <piri-session-id>."
-                )
-            else:
-                reply = "Usage: /resume <piri-session-id>"
-            await message.reply_text(reply)
-            log_debug(user_id, "bot", reply)
+            await self._handle_piri_resume(
+                conversation_key=conversation_key,
+                user_id=user_id,
+                message=message,
+                args=context.args or [],
+            )
             return
         sessions = self._project_chat.list_sessions(limit=10)
         if not sessions:
