@@ -68,6 +68,15 @@ crush는 익명 사용 메트릭(PostHog)이 기본 활성이다. `headless.sh`�
 - `glm-5.2` 컨텍스트 1,000,000 (z.ai 문서 기준)
 - GLM Coding Plan 키는 **공식 지원 도구에서만** 쓰는 약관이 있다 — crush는 지원
   목록에 포함된다. 지원外 도구(예: codex)로는 종량제 키만 사용
+- 소형 모델 슬롯은 `model small <provider>/<id>`로 명시 고정한다. 미지정 시
+  crush가 첫 활성 프로바이더의 기본 소형 모델을 고르므로, 상속된 외부 키가
+  보이는 환경에서는 타이틀 생성 같은 보조 호출이 의도 밖의 백엔드로 나간다
+  (canary4에서 anthropic 기본값으로 라우팅돼 401 노이즈가 난 사례)
+- `option provider-auto-update false`는 정상 문법이다. 다만 crush의
+  `"Option set in shell config"` 로그는 사용자가 입력한 값이 아니라 **저장된
+  값**(`disable_provider_auto_update`, 반전 적용 후)을 찍으므로
+  `"value":true`가 자동 갱신 ON을 뜻하는 것이 **아니다**(OFF가 맞다).
+  로그만 보고 오독하지 않도록 주의
 
 ## 한계
 

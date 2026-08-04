@@ -32,7 +32,8 @@ ok "runner forwards workdir" 'grep -qx "$TMP" "$FAKE_CRUSH_ARGS"'
 ok "runner forwards prompt last" '[ "$(tail -1 "$FAKE_CRUSH_ARGS")" = "inspect safely" ]'
 ok "runner pins global config and metrics opt-out" 'grep -qx "CRUSH_GLOBAL_CONFIG=$TMP/crushrc.fake" "$FAKE_CRUSH_ENV" && grep -qx "CRUSH_DISABLE_METRICS=1" "$FAKE_CRUSH_ENV"'
 
-out="$(CCC_CRUSH_BIN="$FAKE" CCC_CRUSH_WORKDIR="$TMP" CCC_CRUSH_CONFIG="$TMP/crushrc.fake" bash "$RUNNER" nope 2>&1)"; rc=$?
+# ambient 환경의 CCC_CRUSH_MODEL이 새어 들어와도 "missing model"이 성립하도록 밀폐
+out="$(env -u CCC_CRUSH_MODEL CCC_CRUSH_BIN="$FAKE" CCC_CRUSH_WORKDIR="$TMP" CCC_CRUSH_CONFIG="$TMP/crushrc.fake" bash "$RUNNER" nope 2>&1)"; rc=$?
 ok "missing model fails closed before invocation" '[ "$rc" = 2 ] && grep -q "no model set" <<<"$out"'
 
 out="$(CCC_CRUSH_BIN="$FAKE" CCC_CRUSH_MODEL=bare-model CCC_CRUSH_WORKDIR="$TMP" CCC_CRUSH_CONFIG="$TMP/crushrc.fake" bash "$RUNNER" nope 2>&1)"; rc=$?
