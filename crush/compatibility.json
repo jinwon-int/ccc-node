@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "notes": [
+    "crush scans ~/.claude/skills natively, so claude skills need no port. compatibility=native means the stock skill directory is picked up as-is.",
+    "claude/commands/*.md are Claude Code command-runtime files; crush has no equivalent runtime, so those stay claude-only unless a crush agent profile is authored later."
+  ],
+  "classifications": [
+    {
+      "pattern": "claude/skills/**",
+      "compatibility": "native",
+      "reason": "crush discovers ~/.claude/skills and project .claude/skills without configuration; our 33 skills use only name+description frontmatter, which the Agent Skills standard parses"
+    },
+    {
+      "pattern": "claude/commands/**",
+      "compatibility": "claude-only",
+      "reason": "Claude command runtime (slash-command files); crush invokes skills via its command palette, not claude command files"
+    },
+    {
+      "pattern": "claude/agents/**",
+      "compatibility": "claude-only",
+      "reason": "Claude sub-agent roster; crush has no sub-agent registry equivalent (kimi CLI has agent profiles if a port is ever needed)"
+    },
+    {
+      "pattern": "claude/hooks/**",
+      "compatibility": "claude-only",
+      "reason": "Guard/approval hooks are settings.json PreToolUse-based; crush hooks are preliminary and need a dedicated port with its own review"
+    },
+    {
+      "pattern": "claude/CLAUDE.md.template",
+      "compatibility": "partial",
+      "reason": "crush reads ~/.config/AGENTS.md and project AGENTS.md; a symlink or generated copy covers it, but that materialization is a setup step, not automatic"
+    }
+  ],
+  "managed_skills": []
+}
