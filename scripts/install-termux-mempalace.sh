@@ -24,13 +24,14 @@ while [ $# -gt 0 ]; do
     --disable|--remove) ACTION=disable ;;
     --codex) PROVIDER=codex ;;
     --claude) PROVIDER=claude ;;
+    --piri) PROVIDER=piri ;;
     --json) JSON=1 ;;
     --help|-h) sed -n '2,12p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
   shift
 done
-case "$PROVIDER" in auto|codex|claude) ;; *) echo "invalid provider" >&2; exit 2 ;; esac
+case "$PROVIDER" in auto|codex|claude|piri) ;; *) echo "invalid provider" >&2; exit 2 ;; esac
 
 prefix="${CCC_TERMUX_MEMPALACE_PREFIX:-${PREFIX:-}}"
 is_termux=0
@@ -77,13 +78,16 @@ detect_provider() {
   local cron=""
   cron="$("$crontab_cli" -l 2>/dev/null || true)"
   if grep -q 'codex-feed.sh' <<<"$cron"; then printf codex; return; fi
+  if grep -q 'piri-feed.sh' <<<"$cron"; then printf piri; return; fi
   if grep -q 'ingest-cron.sh' <<<"$cron"; then printf claude; return; fi
-  if [ -d "$HOME/.codex/sessions" ] && [ ! -d "$HOME/.claude/projects" ]; then
+  if [ -d "$HOME/.piri/agent/sessions" ] && [ ! -d "$HOME/.codex/sessions" ] && [ ! -d "$HOME/.claude/projects" ]; then
+    printf piri
+  elif [ -d "$HOME/.codex/sessions" ] && [ ! -d "$HOME/.claude/projects" ]; then
     printf codex
   elif [ -d "$HOME/.claude/projects" ] && [ ! -d "$HOME/.codex/sessions" ]; then
     printf claude
   else
-    echo "cannot auto-detect provider; pass --codex or --claude" >&2
+    echo "cannot auto-detect provider; pass --codex, --claude or --piri" >&2
     return 2
   fi
 }
@@ -93,6 +97,8 @@ transcript_source() {
   if [ "$1" = codex ] && [ -n "${CODEX_SESSIONS_DIR:-}" ]; then
     printf '%s' "$CODEX_SESSIONS_DIR"
   elif [ "$1" = codex ]; then printf '%s' "$HOME/.codex/sessions"
+  elif [ "$1" = piri ] && [ -n "${PIR_SESSIONS_DIR:-}" ]; then printf '%s' "$PIR_SESSIONS_DIR"
+  elif [ "$1" = piri ]; then printf '%s' "$HOME/.piri/agent/sessions"
   else printf '%s' "$HOME/.claude/projects"; fi
 }
 
@@ -208,7 +214,7 @@ status_values() {
   local provider source root installed=0 wrapper_state=missing refresh refresh_finished_at=0 cron_count=0
   local cli_version=missing palace_integrity=missing drawer_count=0 palace_bytes=0 source_mtime=0 source_age=0 now
   provider="$(detect_provider 2>/dev/null || printf unknown)"
-  if [ "$provider" = codex ] || [ "$provider" = claude ]; then source="$(transcript_source "$provider")"; else source=unknown; fi
+  if [ "$provider" = codex ] || [ "$provider" = claude ] || [ "$provider" = piri ]; then source="$(transcript_source "$provider")"; else source=unknown; fi
   root="$(container_root)"
   safe_managed_container "$root" \
     && [ -x "$root/opt/ccc-mempalace/venv/bin/mempalace" ] && installed=1
@@ -291,7 +297,7 @@ provider=unknown
 if ! provider="$(detect_provider)"; then
   [ "$ACTION" = status ] || exit 2
 fi
-if [ "$provider" = codex ] || [ "$provider" = claude ]; then
+if [ "$provider" = codex ] || [ "$provider" = claude ] || [ "$provider" = piri ]; then
   source="$(transcript_source "$provider")"
 else
   source=unknown

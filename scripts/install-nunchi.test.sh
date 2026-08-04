@@ -19,9 +19,10 @@ codex_home="$home/.codex"
 nunchi_home="$home/.nunchi"
 fake_bin="$TMP/bin"
 cron_store="$TMP/crontab"
-mkdir -p "$hooks/nunchi" "$state" "$codex_home/sessions" \
+piri_sessions="$home/.piri/agent/sessions"
+mkdir -p "$hooks/nunchi" "$state" "$codex_home/sessions" "$piri_sessions" \
   "$home/.claude/projects" "$home/.local/bin" "$nunchi_home" "$fake_bin"
-cp "$ROOT"/claude/hooks/nunchi/{codex-loader.py,nunchi.py,codex-feed.sh,ingest-cron.sh,bench.sh,bench-qset.tsv,sessionstart.sh,mempalace-refresh.sh} "$hooks/nunchi/"
+cp "$ROOT"/claude/hooks/nunchi/{codex-loader.py,nunchi.py,codex-feed.sh,piri-feed.sh,ingest-cron.sh,bench.sh,bench-qset.tsv,sessionstart.sh,mempalace-refresh.sh} "$hooks/nunchi/"
 cp "$ROOT/claude/hooks/scan-injection.sh" "$hooks/scan-injection.sh"
 chmod 700 "$hooks/nunchi/codex-loader.py" "$hooks/nunchi/nunchi.py" "$hooks/scan-injection.sh"
 chmod 755 "$hooks/nunchi"/*.sh
@@ -88,6 +89,24 @@ CCC_TEST_MEMPALACE_CAPTURE="$refresh_capture" HOME="$home" \
   bash "$hooks/nunchi/mempalace-refresh.sh" codex "$codex_home/sessions" >/dev/null 2>&1; rc=$?
 ok "Codex refresh uses the native incremental conversation miner with --wing codex" \
   '[ "$rc" = 0 ] && grep -qx "mine $codex_home/sessions --mode convos --wing codex" "$refresh_capture" && jq -e '\'' .provider == "codex" and .state == "ok" and .exit_code == 0 '\'' "$nunchi_home/mempalace-refresh.status.json" >/dev/null'
+
+# --- Piri lane: Piri has no distill feed, so its lane runs a per-session
+# extractor (piri-feed.sh) and mines transcripts with the conversation miner
+# attributed to the piri wing (--wing piri), mirroring the Codex lane.
+out="$(run_install --apply --piri 2>&1)"; rc=$?
+ok "--apply --piri enables an owner-only mode marker" \
+  '[ "$rc" = 0 ] && [ "$(cat "$state/nunchi.mode")" = on ] && [ "$(stat -c %a "$state/nunchi.mode")" = 600 ]'
+ok "Piri apply writes feed, refresh and bench cron and atomically drops the codex lane" \
+  '[ "$(grep -c "nunchi:#816" "$cron_store")" = 3 ] && grep -q "piri-feed.sh" "$cron_store" && grep -q "mempalace-refresh.sh piri $piri_sessions" "$cron_store" && ! grep -q "codex-feed.sh" "$cron_store"'
+ok "Piri apply keeps the standalone nunchi hook removed (no Claude SessionStart path)" \
+  '! grep -q "nunchi/sessionstart.sh" "$claude_dir/settings.local.json"'
+piri_refresh_capture="$TMP/piri-refresh.args"
+CCC_TEST_MEMPALACE_CAPTURE="$piri_refresh_capture" HOME="$home" \
+  PATH="/usr/bin:/bin" CCC_STATE_DIR="$state" NUNCHI_HOME="$nunchi_home" \
+  CCC_NUNCHI_MEMPALACE_CLI="$home/.local/bin/mempalace" \
+  bash "$hooks/nunchi/mempalace-refresh.sh" piri "$piri_sessions" >/dev/null 2>&1; rc=$?
+ok "Piri refresh uses the conversation miner attributed to the piri wing" \
+  '[ "$rc" = 0 ] && grep -qx "mine $piri_sessions --mode convos --wing piri" "$piri_refresh_capture" && jq -e '\''.provider == "piri" and .state == "ok" and .exit_code == 0 '\'' "$nunchi_home/mempalace-refresh.status.json" >/dev/null'
 
 edge_status="$TMP/edge-refresh.status.json"
 timeout_capture="$TMP/timeout.args"

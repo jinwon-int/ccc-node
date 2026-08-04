@@ -651,6 +651,8 @@ codex_cron='*/10 * * * * bash /h/.claude/hooks/nunchi/codex-feed.sh >> /log 2>&1
 17 * * * * bash /h/.claude/hooks/nunchi/mempalace-refresh.sh codex /h/.codex/sessions >> /log 2>&1 # nunchi:#816'
 claude_cron='*/10 * * * * bash /h/.claude/hooks/nunchi/ingest-cron.sh >> /log 2>&1 # nunchi:#816
 17 * * * * bash /h/.claude/hooks/nunchi/mempalace-refresh.sh claude /h/.claude/projects >> /log 2>&1 # nunchi:#816'
+piri_cron='*/10 * * * * bash /h/.claude/hooks/nunchi/piri-feed.sh >> /log 2>&1 # nunchi:#816
+17 * * * * bash /h/.claude/hooks/nunchi/mempalace-refresh.sh piri /h/.piri/agent/sessions >> /log 2>&1 # nunchi:#816'
 ok_json='{"schema":"ccc.nunchi.mempalace-refresh.v1","provider":"codex","state":"ok","exit_code":0,"started_at":1,"finished_at":2}'
 deg_json='{"schema":"ccc.nunchi.mempalace-refresh.v1","provider":"codex","state":"degraded","exit_code":0,"started_at":1,"finished_at":2}'
 
@@ -663,6 +665,9 @@ ok "codex lane with matching provider and present MemPalace is 정상" \
 nc="$(run_nc claude "$claude_cron" "$ok_json" "$nbin/mempalace")"
 ok "claude lane uses sweep source and stays 정상" \
   'jq -e ".klass == \"정상\" and (.status | contains(\"match=ok\") and contains(\"source=sweep\") and contains(\"/h/.claude/projects\"))" <<<"$nc" >/dev/null'
+nc="$(run_nc piri "$piri_cron" "$ok_json" "$nbin/mempalace")"
+ok "piri lane uses the conversation miner (mine) source and stays 정상" \
+  'jq -e ".klass == \"정상\" and (.status | contains(\"configured=piri\") and contains(\"runtime=piri\") and contains(\"match=ok\") and contains(\"source=mine\") and contains(\"/h/.piri/agent/sessions\"))" <<<"$nc" >/dev/null'
 nc="$(run_nc claude "$codex_cron" "$ok_json" "$nbin/mempalace")"
 ok "provider drift (configured codex, runtime claude) is a non-fatal 경고" \
   'jq -e ".klass == \"경고\" and (.status | contains(\"match=DRIFT\"))" <<<"$nc" >/dev/null'

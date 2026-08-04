@@ -6,13 +6,16 @@
 #   install-nunchi.sh --apply              # auto-detect live provider
 #   install-nunchi.sh --apply --codex      # explicit Codex override
 #   install-nunchi.sh --apply --claude     # explicit Claude override
+#   install-nunchi.sh --apply --piri       # explicit Piri override
 #   install-nunchi.sh --apply --target-user gongmyoung
 #   install-nunchi.sh --remove             # mode off + managed cron/hook removal
 #   install-nunchi.sh                      # status
 #
-# Codex uses the managed post-processing loader added by #856. Claude retains
-# the standalone SessionStart hook. Provider changes remove the other path so
-# one runtime never injects the same node-global snapshot twice.
+# Claude retains the standalone SessionStart hook and reuses the Session
+# Distiller output (zero LLM cost). Codex and Piri have no distill feed, so
+# their lanes run a per-new-session extractor (codex exec / Piri print mode).
+# Provider changes remove the other path so one runtime never injects the same
+# node-global snapshot twice.
 set -euo pipefail
 
 ACTION="status"
@@ -25,6 +28,7 @@ while [ $# -gt 0 ]; do
     --remove) ACTION="remove" ;;
     --codex) PROVIDER="codex" ;;
     --claude) PROVIDER="claude" ;;
+    --piri) PROVIDER="piri" ;;
     --target-user)
       [ $# -ge 2 ] || { echo "--target-user requires a user" >&2; exit 2; }
       TARGET_USER="$2"; shift ;;
@@ -35,7 +39,7 @@ while [ $# -gt 0 ]; do
   shift
 done
 case "$PROVIDER" in
-  codex|claude|auto) ;;
+  codex|claude|piri|auto) ;;
   *) echo "invalid provider: $PROVIDER" >&2; exit 2 ;;
 esac
 
@@ -132,7 +136,7 @@ if not m:
     print("none")
 else:
     provider, path = m.group(1), m.group(2).strip()
-    kind = "mine" if provider == "codex" else "sweep"
+    kind = "mine" if provider in ("codex", "piri") else "sweep"
     if len(path) >= 2 and path[0] in "\"'" and path[-1] == path[0]:
         path = path[1:-1]  # strip a single layer of cron shell-quoting (path only)
     print(f"kind={kind} path={path}")
@@ -158,6 +162,7 @@ status() {
   runtime_provider="${CCC_AGENT_PROVIDER:-auto}"
   grep -q 'codex-feed.sh'  <<<"$cron" && configured="codex"
   grep -q 'ingest-cron.sh' <<<"$cron" && configured="claude"
+  grep -q 'piri-feed.sh'   <<<"$cron" && configured="piri"
   mp_path="${CCC_NUNCHI_MEMPALACE_CLI:-$(command -v mempalace || true)}"
   [ -z "$mp_path" ] && [ -x "$HOME/.local/bin/mempalace" ] && mp_path="$HOME/.local/bin/mempalace"
   mp_ver="none"
@@ -281,6 +286,7 @@ detect_provider() {
   if [ -f "$root/bridge/start.sh" ]; then
     bridge_status="$(HOME="$HOME" bash "$root/bridge/start.sh" --path "$HOME" --status 2>/dev/null || true)"
   fi
+  if grep -q 'Piri: healthy' <<<"$bridge_status"; then printf 'piri'; return; fi
   if grep -q 'Codex: healthy' <<<"$bridge_status"; then printf 'codex'; return; fi
   if grep -q 'Claude: healthy' <<<"$bridge_status"; then printf 'claude'; return; fi
   if [ -d "$CODEX_HOME_DIR/sessions" ] && [ ! -d "$CLAUDE_DIR/projects" ]; then
@@ -301,12 +307,14 @@ case "$ACTION" in
     fi
     feed="$HOOKS/ingest-cron.sh"
     [ "$resolved_provider" = "codex" ] && feed="$HOOKS/codex-feed.sh"
+    [ "$resolved_provider" = "piri" ]  && feed="$HOOKS/piri-feed.sh"
     bash_bin="$(command -v bash)"
     mp="${CCC_NUNCHI_MEMPALACE_CLI:-}"
     [ -n "$mp" ] || mp="$(command -v mempalace || true)"
     [ -z "$mp" ] && [ -x "$HOME/.local/bin/mempalace" ] && mp="$HOME/.local/bin/mempalace"
     default_sweep="$CLAUDE_DIR/projects"
     [ "$resolved_provider" = "codex" ] && default_sweep="$CODEX_HOME_DIR/sessions"
+    [ "$resolved_provider" = "piri" ]  && default_sweep="$HOME/.piri/agent/sessions"
     sweep_dir="${NUNCHI_SWEEP_DIR:-$default_sweep}"
     refresh="$HOOKS/mempalace-refresh.sh"
     refresh_ready=0

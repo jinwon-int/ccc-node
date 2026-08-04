@@ -5,6 +5,19 @@ All notable changes to the Claude Code node harness. Dates are KST.
 ## [Unreleased]
 
 ### Added
+- nunchi/MemPalace collection lane for the Piri provider. Piri nodes had no
+  nunchi lane (Piri sessions are not read by the Claude/Codex distill journal),
+  so `ccc-doctor` always reported `nunchi collection` DRIFT and `memory cache`
+  degraded on a Piri node. `install-nunchi.sh --apply --piri` now wires a
+  `hooks/nunchi/piri-feed.sh` extractor (scans new
+  `~/.piri/agent/sessions/**/*.jsonl`, asks the configured Piri CLI for
+  distill-style facts, ingests them into the nunchi DB; the extractor's own
+  session is isolated under `NUNCHI_HOME/.piri-feed-extractor-sessions` via
+  `PIRI_CODING_AGENT_SESSION_DIR` so it never re-enters the scanned tree), a
+  `mempalace mine --mode convos --wing piri` refresh, and the weekly bench
+  cron. `mempalace-refresh.sh`, `ccc-doctor`, `ccc_memory_probe`, and
+  `install-termux-mempalace.sh` recognize the piri lane (configured=piri
+  matches runtime=piri).
 - `ccc-doctor` now surfaces the nunchi MemPalace collection lane (#920, completes
   the doctor half of #865). A new `nunchi collection` finding (text + `--json`,
   body-free — paths/versions/state only, never transcript body/excerpts/ids/
