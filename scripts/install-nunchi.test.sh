@@ -86,8 +86,8 @@ CCC_TEST_MEMPALACE_CAPTURE="$refresh_capture" HOME="$home" \
   PATH="/usr/bin:/bin" CCC_STATE_DIR="$state" NUNCHI_HOME="$nunchi_home" \
   CCC_NUNCHI_MEMPALACE_CLI="$home/.local/bin/mempalace" \
   bash "$hooks/nunchi/mempalace-refresh.sh" codex "$codex_home/sessions" >/dev/null 2>&1; rc=$?
-ok "Codex refresh uses the native incremental conversation miner" \
-  '[ "$rc" = 0 ] && grep -qx "mine $codex_home/sessions --mode convos" "$refresh_capture" && jq -e '\'' .provider == "codex" and .state == "ok" and .exit_code == 0 '\'' "$nunchi_home/mempalace-refresh.status.json" >/dev/null'
+ok "Codex refresh uses the native incremental conversation miner with --wing codex" \
+  '[ "$rc" = 0 ] && grep -qx "mine $codex_home/sessions --mode convos --wing codex" "$refresh_capture" && jq -e '\'' .provider == "codex" and .state == "ok" and .exit_code == 0 '\'' "$nunchi_home/mempalace-refresh.status.json" >/dev/null'
 
 edge_status="$TMP/edge-refresh.status.json"
 timeout_capture="$TMP/timeout.args"
@@ -143,8 +143,8 @@ ok "missing flock fails closed without writing unlocked status" \
 
 printf '%s\n' '{"schema":"ccc.nunchi.mempalace-refresh.v1","provider":"codex","state":"ok","exit_code":0,"started_at":1,"finished_at":2}' > "$edge_status"
 run_edge_refresh CCC_NUNCHI_MEMPALACE_CLI="$TMP/missing-mempalace" >/dev/null 2>&1; rc=$?
-ok "missing CLI after mode-on replaces a stale success" \
-  '[ "$rc" = 2 ] && jq -e '\'' .state == "error" and .exit_code == 2 '\'' "$edge_status" >/dev/null'
+ok "missing CLI after mode-on degrades to peer-facts-only silently" \
+  '[ "$rc" = 0 ] && jq -e '\'' .state == "degraded" and .exit_code == 0 '\'' "$edge_status" >/dev/null'
 printf '%s\n' '{"schema":"ccc.nunchi.mempalace-refresh.v1","provider":"codex","state":"ok","exit_code":0,"started_at":1,"finished_at":2}' > "$edge_status"
 env HOME="$home" PATH="$fake_bin:/usr/bin:/bin" CCC_STATE_DIR="$state" \
   NUNCHI_HOME="$nunchi_home" CCC_NUNCHI_MEMPALACE_STATUS="$edge_status" \
@@ -194,7 +194,7 @@ runtime_cmd="${runtime_cmd//\\%/%}"
 env -i HOME="$home" PATH="/usr/bin:/bin" CCC_TEST_MEMPALACE_CAPTURE="$weird_capture" \
   /bin/sh -c "$runtime_cmd" >/dev/null 2>&1; cron_rc=$?
 ok "generated refresh cron preserves restricted-PATH custom and Termux-style paths" \
-  '[ "$rc" = 0 ] && [ "$cron_rc" = 0 ] && grep -q "CCC_NUNCHI_MEMPALACE_CLI=" <<<"$refresh_line" && grep -qx "mine $weird_sweep --mode convos" "$weird_capture" && jq -e '\'' .provider == "codex" and .state == "ok" '\'' "$weird_status" >/dev/null && [ "$(stat -c %a "$weird_status")" = 600 ]'
+  '[ "$rc" = 0 ] && [ "$cron_rc" = 0 ] && grep -q "CCC_NUNCHI_MEMPALACE_CLI=" <<<"$refresh_line" && grep -qx "mine $weird_sweep --mode convos --wing codex" "$weird_capture" && jq -e '\'' .provider == "codex" and .state == "ok" '\'' "$weird_status" >/dev/null && [ "$(stat -c %a "$weird_status")" = 600 ]'
 ok "generated cron protects quotes, percent and semicolon from splitting or injection" \
   'grep -q '\''\\%'\'' <<<"$refresh_line" && [ "$(grep -c "mempalace-refresh.sh" "$cron_store")" = 1 ]'
 ok "generated feed and bench cron retain the installed state and nunchi paths" \
@@ -303,6 +303,32 @@ ok "target-user re-exec preserves explicit refresh tool paths" \
 out="$(HOME="$home" PATH="$fake_bin:/usr/bin:/bin" bash "$ROOT/scripts/install-nunchi.sh" --apply --target-user bad/user 2>&1)"; rc=$?
 ok "target-user rejects unsafe account names before re-exec" \
   '[ "$rc" = 2 ] && grep -q "invalid target user" <<<"$out"'
+
+# ---- #865: provider-aware collection hardening (env paths, umask, status, drift) ----
+# Restore a valid managed loader: the safety cases above leave it removed/oversized.
+cp "$ROOT/claude/hooks/nunchi/codex-loader.py" "$hooks/nunchi/codex-loader.py"
+chmod 700 "$hooks/nunchi/codex-loader.py"
+custom_codex="$TMP/custom-codex-home"; mkdir -p "$custom_codex/sessions"
+out="$(env "${common_env[@]}" CODEX_HOME="$custom_codex" bash "$ROOT/scripts/install-nunchi.sh" --apply --codex 2>&1)"; rc=$?
+ok "apply routes codex collection source through a custom CODEX_HOME" \
+  '[ "$rc" = 0 ] && grep -q "mempalace-refresh.sh codex $custom_codex/sessions" "$cron_store" && grep -q "source: kind=mine path=$custom_codex/sessions" <<<"$out"'
+ok "apply makes the nunchi home owner-only (0700)" \
+  '[ "$(stat -c %a "$nunchi_home")" = 700 ]'
+
+out="$(env "${common_env[@]}" CCC_AGENT_PROVIDER=codex bash "$ROOT/scripts/install-nunchi.sh" 2>&1)"; rc=$?
+ok "status reports provider match=ok, source, mempalace and collection (body-free)" \
+  '[ "$rc" = 0 ] && grep -q "provider: configured=codex runtime=codex match=ok" <<<"$out" && grep -q "source: kind=mine path=$custom_codex/sessions" <<<"$out" && grep -q "mempalace: binary=" <<<"$out" && grep -q "^collection: " <<<"$out"'
+
+out="$(env "${common_env[@]}" CCC_AGENT_PROVIDER=claude bash "$ROOT/scripts/install-nunchi.sh" 2>&1)"; rc=$?
+ok "status flags provider drift when runtime CCC_AGENT_PROVIDER differs" \
+  '[ "$rc" = 0 ] && grep -q "provider: configured=codex runtime=claude match=DRIFT" <<<"$out"'
+
+n865_status="$TMP/n865.status.json"
+HOME="$home" PATH="/usr/bin:/bin" CCC_STATE_DIR="$state" NUNCHI_HOME="$nunchi_home" \
+  CCC_NUNCHI_MEMPALACE_STATUS="$n865_status" CCC_NUNCHI_MEMPALACE_CLI="$home/.local/bin/mempalace" \
+  bash "$hooks/nunchi/mempalace-refresh.sh" codex "$custom_codex/sessions" >/dev/null 2>&1; rc=$?
+ok "refresh wrapper umask 077 keeps lock and status owner-only" \
+  '[ "$rc" = 0 ] && [ "$(stat -c %a "$nunchi_home/mempalace-refresh.lock")" = 600 ] && [ "$(stat -c %a "$n865_status")" = 600 ]'
 
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

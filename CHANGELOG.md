@@ -91,6 +91,23 @@ All notable changes to the Claude Code node harness. Dates are KST.
   composition is unchanged. (#749)
 
 ### Fixed
+- nunchi MemPalace collection is now provider-aware for Codex (#865). The Codex
+  refresh ran `mempalace mine <sessions> --mode convos` without `--wing`, so
+  `mine` attributed the ingested facts to the default wing name (`sessions`,
+  the directory basename) instead of the `codex` provider — Codex transcripts
+  were collected but mislabelled. The codex path now uses
+  `mine <sessions> --mode convos --wing codex`. Related hardening in the same
+  pass: the collection source honours `CODEX_HOME` (Codex) and `CCC_CLAUDE_DIR`
+  (Claude) instead of hardcoded `$HOME/.codex` / `$HOME/.claude`; the refresh
+  wrapper sets `umask 077` and `install-nunchi.sh --apply` makes `~/.nunchi`
+  owner-only (0700); a missing or unsupported MemPalace CLI now degrades
+  silently to the peer-facts-only path (state=`degraded`, exit 0) instead of
+  failing every cron tick; and `install-nunchi.sh` status reports a body-free
+  provider wiring block — `configured` vs runtime `CCC_AGENT_PROVIDER` with a
+  `match=ok|DRIFT|n/a` flag, source kind/path, MemPalace binary+version, and the
+  last collection state/exit/timestamp — without ever printing transcript body,
+  excerpts, session ids or credentials. (ccc-doctor surfacing of this state is
+  tracked separately.)
 - bumped `cryptography` 49.0.0 → 50.0.0 in both hash-locked dependency files
   (`bridge/requirements.lock.txt` and `.github/requirements/bridge-ci.txt`) to
   clear CVE-2026-69247, which `pip-audit` (the wheel-smoke gate) began failing

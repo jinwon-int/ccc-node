@@ -2,9 +2,14 @@
 # Provider-aware, bounded MemPalace refresh for the managed nunchi cron.
 #
 # MemPalace 3.6.x `sweep` parses Claude JSONL only. Codex JSONL is supported by
-# the conversation miner, so Codex nodes use incremental `mine --mode convos`.
+# the conversation miner, so Codex nodes use incremental `mine --mode convos
+# --wing codex` so mined facts are attributed to the codex provider (mine's
+# `--wing` otherwise defaults to the directory name, e.g. "sessions").
 # The wrapper records only body-free state and holds a single-flight lock.
+# umask 077 keeps the lock, status and any MemPalace-created artefacts
+# owner-only (#865).
 set -euo pipefail
+umask 077
 
 provider="${1:-}"
 target="${2:-}"
@@ -105,9 +110,12 @@ if [ -z "$mp" ]; then
   [ -n "$mp" ] || { [ ! -x "$HOME/.local/bin/mempalace" ] || mp="$HOME/.local/bin/mempalace"; }
 fi
 if [ -z "$mp" ] || [ ! -f "$mp" ] || [ ! -x "$mp" ]; then
-  echo "mempalace CLI missing" >&2
-  preflight_error 2
-  exit $?
+  # MemPalace is absent on this node or unsupported on this platform
+  # (e.g. Termux without a native chromadb build). Degrade to the
+  # peer-facts-only path silently instead of failing every cron tick —
+  # the feed cron keeps peer facts current without MemPalace (#865).
+  write_status degraded 0 "$started" "$(date +%s)"
+  exit 0
 fi
 timeout_cli="${CCC_NUNCHI_TIMEOUT_CLI:-$(command -v timeout || true)}"
 if [ -z "$timeout_cli" ] || [ ! -f "$timeout_cli" ] || [ ! -x "$timeout_cli" ]; then
@@ -120,7 +128,7 @@ write_status running -1 "$started" 0
 cd "$HOME"
 set +e
 if [ "$provider" = codex ]; then
-  "$timeout_cli" -k 30s "$timeout_sec" "$mp" mine "$target" --mode convos
+  "$timeout_cli" -k 30s "$timeout_sec" "$mp" mine "$target" --mode convos --wing codex
 else
   "$timeout_cli" -k 30s "$timeout_sec" "$mp" sweep "$target"
 fi
