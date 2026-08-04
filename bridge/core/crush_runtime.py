@@ -69,6 +69,16 @@ _TEXT_BOUND = 2000
 # finish reasons observed from crush (proto Finish.Reason values)
 _FINISH_OK = {"end_turn", "stop", "stop_sequence", "length", "tool_calls"}
 _FINISH_CANCELED = {"canceled", "cancelled"}
+# crush maps the provider's tool_calls finish to reason="tool_use" on every
+# assistant message that ends with tool calls (crush internal/agent: the step
+# finish becomes FinishReasonToolUse unless a tool result stops the turn).
+# That finish is INTERMEDIATE — the agent loop runs the tools and calls the
+# model again; the turn only completes on end_turn/stop (or an error). It must
+# neither complete the turn early nor fail it: message/details arrive empty, so
+# falling through to the error branch surfaces exactly "tool_use" to the user
+# (bangtong 2026-08-04: every tool-using turn died as "Processing failed:
+# tool_use").
+_FINISH_INTERMEDIATE = {"tool_use"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -767,6 +777,9 @@ class CrushRuntime:
 
     def _complete_turn(self, active: _ActiveTurn, data: Mapping[str, Any]) -> None:
         reason = str(data.get("reason") or "")
+        if reason in _FINISH_INTERMEDIATE:
+            # tool-call step boundary, not a turn boundary — keep collecting.
+            return
         if reason in _FINISH_CANCELED:
             active.queue.put_nowait(ErrorEvent(
                 code="interrupted", message="turn interrupted", retryable=False,
