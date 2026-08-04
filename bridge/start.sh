@@ -1170,8 +1170,23 @@ maybe_setup_agent_cli() {
             ;;
         claude)
             ;;
+        crush)
+            crush_cli="$(read_env_with_fallback "CCC_CRUSH_CLI_PATH")"
+            crush_cli="${crush_cli:-crush}"
+            if [[ "$crush_cli" == */* ]]; then
+                if [ ! -f "$crush_cli" ] || [ ! -x "$crush_cli" ]; then
+                    echo "❌ Error: configured crush CLI is not executable"
+                    exit 1
+                fi
+            elif ! command -v "$crush_cli" >/dev/null 2>&1; then
+                echo "❌ Error: crush CLI not found. Install crush or set CCC_CRUSH_CLI_PATH in .env"
+                exit 1
+            fi
+            echo "✅ crush provider CLI is available"
+            return
+            ;;
         *)
-            echo "❌ Error: unsupported CCC_AGENT_PROVIDER (expected claude or codex)"
+            echo "❌ Error: unsupported CCC_AGENT_PROVIDER (expected claude, codex, or crush)"
             exit 1
             ;;
     esac
