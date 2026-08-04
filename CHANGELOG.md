@@ -98,7 +98,10 @@ All notable changes to the Claude Code node harness. Dates are KST.
   `pytest-cov` aggregates coverage across workers, so the `fail_under` branch-
   coverage gate is unchanged and `coverage.xml` is still produced. The suite is
   isolation-safe (no `os.chdir`, no session-scoped fixtures; module/function
-  autouse guards confine `sys.modules` fakes and reset the bridge environment).
+  autouse guards confine `sys.modules` fakes and reset the bridge environment);
+  one latent timing race it exposed — `test_codex_keeps_typing_alive_and_shows_tool_heartbeat`
+  asserted on a heartbeat status that fires after the wait condition — was made
+  deterministic by waiting for that specific heartbeat condition.
   `pytest-xdist` was added to the `dev` extra so it lands in the CI lock only
   (`.github/requirements/bridge-ci.txt`), not the runtime lock. The umask-0002
   variant step is unchanged (0.5 s, not worth parallelising).

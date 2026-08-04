@@ -1525,6 +1525,11 @@ async def test_codex_keeps_typing_alive_and_shows_tool_heartbeat(
     typing_calls: list[str] = []
     status_calls: list[tuple[str | None, int | None]] = []
     status_visible = asyncio.Event()
+    # The heartbeat "⏳ Working" status is emitted on a timer *after* the tool
+    # starts; the first status is not necessarily it. Wait for that specific
+    # heartbeat condition (not just the first status) so the assertion below is
+    # deterministic under parallel/CI load instead of racing the timer (#925).
+    heartbeat_visible = asyncio.Event()
 
     async def typing_callback() -> None:
         typing_calls.append("typing")
@@ -1536,6 +1541,8 @@ async def test_codex_keeps_typing_alive_and_shows_tool_heartbeat(
         if text is None:
             return None
         status_visible.set()
+        if "⏳ Working" in text and "Command: pwd" in text:
+            heartbeat_visible.set()
         return message_id or 1234
 
     task = asyncio.create_task(
@@ -1548,7 +1555,7 @@ async def test_codex_keeps_typing_alive_and_shows_tool_heartbeat(
         )
     )
     await asyncio.wait_for(session.tool_started.wait(), timeout=1)
-    await asyncio.wait_for(status_visible.wait(), timeout=1)
+    await asyncio.wait_for(heartbeat_visible.wait(), timeout=2)
 
     assert typing_calls
     assert any(
