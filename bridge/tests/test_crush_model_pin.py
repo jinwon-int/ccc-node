@@ -403,7 +403,9 @@ def test_bridge_lane_keeps_the_shell_tools() -> None:
     # opposite of this lane's policy (owner-operator / bash_policy=auto-approve,
     # where Codex gets approval=never + sandbox=dangerFullAccess).
     bridge = (_CRUSH_DIR / "crushrc.bridge").read_text(encoding="utf-8")
-    denied = [l for l in bridge.splitlines() if l.startswith("permissions deny")]
+    denied = [
+        line for line in bridge.splitlines() if line.startswith("permissions deny")
+    ]
     joined = " ".join(denied)
     for tool in ("bash", "edit", "write", "download"):
         assert tool not in joined, f"bridge lane must not deny {tool}"
@@ -415,7 +417,9 @@ def test_bridge_lane_keeps_the_shell_tools() -> None:
 def test_headless_lane_stays_read_only() -> None:
     readonly = (_CRUSH_DIR / "crushrc.readonly").read_text(encoding="utf-8")
     denied = " ".join(
-        l for l in readonly.splitlines() if l.startswith("permissions deny")
+        line
+        for line in readonly.splitlines()
+        if line.startswith("permissions deny")
     )
     for tool in ("bash", "edit", "write", "download", "question"):
         assert tool in denied, f"headless lane must keep denying {tool}"
@@ -432,7 +436,7 @@ def test_both_lanes_define_the_same_providers() -> None:
     assert bridge, "bridge config must define providers"
     assert bridge == readonly, (
         "provider/model definitions drifted between the lanes:\n"
-        f"bridge:\n  " + "\n  ".join(bridge) + "\nreadonly:\n  " + "\n  ".join(readonly)
+        "bridge:\n  " + "\n  ".join(bridge) + "\nreadonly:\n  " + "\n  ".join(readonly)
     )
 
 
