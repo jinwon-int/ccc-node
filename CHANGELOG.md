@@ -102,6 +102,13 @@ All notable changes to the Claude Code node harness. Dates are KST.
   composition is unchanged. (#749)
 
 ### Fixed
+- `test_codex_keeps_typing_alive_and_shows_tool_heartbeat` no longer races on
+  the heartbeat status. It waited only for the first `status_callback` then
+  immediately asserted that the heartbeat "⏳ Working … Command: pwd" status had
+  been emitted — but that heartbeat fires on a timer *after* the first status,
+  so under load the assertion could run before the heartbeat arrived (intermittent
+  `AssertionError`). The test now waits for that specific heartbeat condition
+  (a dedicated event set only when it arrives), making the assertion deterministic.
 - nunchi MemPalace collection is now provider-aware for Codex (#865). The Codex
   refresh ran `mempalace mine <sessions> --mode convos` without `--wing`, so
   `mine` attributed the ingested facts to the default wing name (`sessions`,
