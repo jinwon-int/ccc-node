@@ -275,6 +275,40 @@ class RuntimeHealthReporterTests(unittest.TestCase):
             self.assertEqual(health["claude"]["state"], "healthy")
             self.assertEqual(health["service"]["state"], "available")
 
+    def test_crush_provider_is_reported_as_itself(self):
+        # #926 added the crush lane but health kept a two-way codex/claude
+        # test, so a crush node reported provider=claude and an operator could
+        # not tell the lanes apart (measured on dungae, 2026-08-04).
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_root = Path(tmpdir)
+            module = self._load_health_module(project_root)
+            reporter = module.RuntimeHealthReporter(
+                project_root / ".telegram_bot", agent_provider="crush"
+            )
+
+            reporter.initialize_process()
+            reporter.record_telegram_ok()
+            reporter.record_agent_error("crush server did not become ready")
+
+            health = json.loads(reporter.health_file.read_text(encoding="utf-8"))
+            self.assertEqual(health["agent"]["provider"], "crush")
+            self.assertEqual(
+                health["service"]["reason"],
+                "Crush: crush server did not become ready",
+            )
+
+    def test_unknown_provider_falls_back_to_claude(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_root = Path(tmpdir)
+            module = self._load_health_module(project_root)
+            reporter = module.RuntimeHealthReporter(
+                project_root / ".telegram_bot", agent_provider="not-a-provider"
+            )
+
+            reporter.initialize_process()
+            health = json.loads(reporter.health_file.read_text(encoding="utf-8"))
+            self.assertEqual(health["agent"]["provider"], "claude")
+
     def test_record_empty_completion_counts_by_outcome(self):
         # #775: empty normal completions split into the event-loss class
         # (recovered from the terminal payload) and the truly-empty class.

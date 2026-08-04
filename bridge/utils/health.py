@@ -8,6 +8,12 @@ from typing import Any, Optional
 
 from telegram_bot.utils.config import config
 
+# Agent providers this node can run. Keep in step with
+# Settings.agent_provider (utils/config.py) — health.json is how an operator
+# tells one lane from another.
+_AGENT_PROVIDER_LABELS = {"claude": "Claude", "codex": "Codex", "crush": "Crush"}
+_KNOWN_AGENT_PROVIDERS = frozenset(_AGENT_PROVIDER_LABELS)
+
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
@@ -68,8 +74,14 @@ class RuntimeHealthReporter:
         # exposing chat/session/task identifiers in health.json.
         self._delegated_tasks_by_request: dict[int, int] = {}
         configured_provider = agent_provider or getattr(config, "agent_provider", "claude")
+        # Report the provider the node actually runs. The old two-way test
+        # ("codex" or else "claude") predates the crush lane (#926), so a crush
+        # node reported itself as claude and health.json could not distinguish
+        # them — measured on dungae after the 2026-08-04 switch. Unknown values
+        # still fall back to claude, which is the settings default.
+        normalized = str(configured_provider).strip().lower()
         self._agent_provider = (
-            "codex" if str(configured_provider).strip().lower() == "codex" else "claude"
+            normalized if normalized in _KNOWN_AGENT_PROVIDERS else "claude"
         )
         initial_agent_state = {
             "state": "degraded",
@@ -208,7 +220,7 @@ class RuntimeHealthReporter:
             reasons.append(f"Telegram: {detail}")
         if agent_state != "healthy":
             provider = str(agent.get("provider") or self._agent_provider).lower()
-            label = "Codex" if provider == "codex" else "Claude"
+            label = _AGENT_PROVIDER_LABELS.get(provider, "Claude")
             detail = agent.get("last_error") or f"{provider} unavailable"
             reasons.append(f"{label}: {detail}")
 
