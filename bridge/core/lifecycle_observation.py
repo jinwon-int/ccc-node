@@ -23,7 +23,7 @@ from typing import Any, Final, Iterable, Mapping
 from telegram_bot.utils.redaction import contains_credential
 
 SCHEMA_VERSION: Final = 1
-_PROVIDERS: Final = ("claude", "codex", "crush")
+_PROVIDERS: Final = ("claude", "codex", "crush", "piri")
 
 # Tools whose completion is worth auditing are everything except clearly
 # read-only tools — mirrors audit.sh's mutating filter while defaulting an

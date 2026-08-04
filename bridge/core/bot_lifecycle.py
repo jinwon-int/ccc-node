@@ -67,6 +67,9 @@ class _LifecycleConfig(Protocol):
     @property
     def claude_cli_path(self) -> Optional[FilePath]: ...
 
+    @property
+    def piri_cli_path(self) -> str: ...
+
 
 class _LifecycleSessionManager(Protocol):
     def validate_storage_path(self) -> None: ...
@@ -621,10 +624,65 @@ class BotLifecycleMixin:
             return True, ""
         return False, "codex authentication unavailable"
 
+    def _probe_piri_readiness(self) -> tuple[bool, str]:
+        configured_path = str(getattr(self._config, "piri_cli_path", "piri")).strip()
+        cli_path = shutil.which(configured_path) or ""
+        if not cli_path:
+            return False, "piri command not found"
+
+        try:
+            proc = subprocess.run(
+                [cli_path, "--version"],
+                text=True,
+                capture_output=True,
+                timeout=float(os.getenv("PIRI_VERSION_TIMEOUT", "15")),
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            return False, "piri version check timed out"
+        except Exception as exc:
+            return False, f"piri version check failed: {exc}"
+
+        if proc.returncode != 0:
+            return False, "piri command unavailable"
+        return self._probe_piri_model_readiness(cli_path)
+
+    def _probe_piri_model_readiness(self, cli_path: str) -> tuple[bool, str]:
+        """Verify the configured Piri identity exposes at least one model."""
+
+        from telegram_bot.core.piri_runtime import PiriRuntime
+
+        async def probe() -> int:
+            runtime = PiriRuntime(
+                executable=cli_path,
+                process_environment=os.environ,
+                model_catalog_directory=str(
+                    getattr(self._config, "project_root", os.getcwd())
+                ),
+            )
+            try:
+                models = await asyncio.wait_for(
+                    runtime.list_models(),
+                    timeout=float(os.getenv("PIRI_RPC_READINESS_TIMEOUT", "15")),
+                )
+                return len(models)
+            finally:
+                await runtime.close()
+
+        try:
+            model_count = asyncio.run(probe())
+        except Exception:
+            return False, "piri RPC model discovery failed"
+        if model_count < 1:
+            return False, "piri has no available authenticated models"
+        return True, ""
+
     def _probe_agent_readiness(self) -> tuple[bool, str]:
         provider = str(getattr(self._config, "agent_provider", "claude")).lower()
         if provider == "codex":
             return self._probe_codex_readiness()
+        if provider == "piri":
+            return self._probe_piri_readiness()
         return self._probe_claude_readiness()
 
     async def _run_async(self):  # noqa: C901 -- #348 baseline hotspot

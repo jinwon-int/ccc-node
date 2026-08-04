@@ -180,29 +180,40 @@ class BotCallbackMixin:
             callback_provider = parts[1] if len(parts) == 3 else ""
             requested = parts[2] if len(parts) == 3 else ""
             active_provider = self._active_provider()
-            if callback_provider != active_provider or active_provider != "codex":
+            if (
+                callback_provider != active_provider
+                or active_provider not in {"codex", "piri"}
+            ):
                 await query.edit_message_text(
                     f"❌ Provider mismatch: selected effort is {callback_provider or 'unknown'}, "
                     f"but the active provider is {active_provider}."
                 )
                 return
             session_key = self._conversation_key(user_id, chat.id)
-            session, provider_switched = await self._switch_provider_if_needed(
+            session, _provider_switched = await self._switch_provider_if_needed(
                 session_key, user_id, chat.id
             )
+            provider_label = "Codex" if active_provider == "codex" else "Piri"
             try:
                 models = tuple(await self._project_chat.list_runtime_models())
             except Exception:
-                logger.warning("Codex effort callback browsing failed", exc_info=True)
-                await query.edit_message_text("⚠️ Codex effort options are unavailable.")
-                return
-            model = self._selected_codex_model(models, session)
-            if model is None or not model.supported_reasoning_efforts:
+                logger.warning(
+                    "%s effort callback browsing failed",
+                    provider_label,
+                    exc_info=True,
+                )
                 await query.edit_message_text(
-                    "📭 The selected Codex model does not advertise reasoning effort options."
+                    f"⚠️ {provider_label} effort options are unavailable."
                 )
                 return
-            reply = await self._apply_codex_effort_selection(
+            model = self._selected_runtime_model(models, session)
+            if model is None or not model.supported_reasoning_efforts:
+                await query.edit_message_text(
+                    f"📭 The selected {provider_label} model does not advertise "
+                    "reasoning effort options."
+                )
+                return
+            reply = await self._apply_runtime_effort_selection(
                 session_key, model, requested
             )
             await query.edit_message_text(reply)
@@ -223,6 +234,9 @@ class BotCallbackMixin:
                     f"but the active provider is {active_provider}."
                 )
                 return
+            if active_provider == "piri" and not self._valid_piri_model_id(model_name):
+                await query.edit_message_text("❌ Invalid Piri model id.")
+                return
             stored_provider = await self._session_provider(
                 session_key
             )
@@ -239,8 +253,10 @@ class BotCallbackMixin:
                 )
                 updates.update(session_id=None, new_session=True)
                 remove_fields.add("effort")
-            elif active_provider == "codex":
-                reset_note = await self._codex_model_effort_reset_note(session, model_name)
+            elif active_provider in {"codex", "piri"}:
+                reset_note = await self._runtime_model_effort_reset_note(
+                    session, model_name
+                )
                 if reset_note:
                     remove_fields.add("effort")
             await self._session_manager.patch_session(

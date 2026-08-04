@@ -76,6 +76,10 @@ class HealthRenderTests(unittest.TestCase):
         )
         self.assertIn("   Codex: degraded (health missing)", lines)
 
+    def test_piri_provider_uses_piri_label(self):
+        lines = self._render(self.dir / "nope.json", provider="piri")
+        self.assertIn("   Piri: degraded (health missing)", lines)
+
     def test_unreadable_file_reports_invalid(self):
         p = self.dir / "health.json"
         p.write_text("not json{{{", encoding="utf-8")

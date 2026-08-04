@@ -156,6 +156,15 @@ def build_context(
             / "projects"
             / claude_project_dir_name(Path(settings.project_root).resolve()),
         )
+    elif settings.agent_provider == "piri" and agent_runtime is None:
+        from telegram_bot.core.piri_runtime import PiriRuntime
+
+        logger.info("Piri provider routed through unrestricted PiriRuntime RPC adapter")
+        agent_runtime = PiriRuntime(
+            executable=settings.piri_cli_path,
+            process_environment=os.environ,
+            model_catalog_directory=str(Path(settings.project_root).resolve()),
+        )
     telegram_port = telegram_port or Application.builder
     clock = clock or time
     bind_logs_dir(settings.logs_dir)

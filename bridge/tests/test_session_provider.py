@@ -219,6 +219,54 @@ async def test_resume_provider_mismatch_rejects_without_mutation(tmp_path: Path)
 
 
 @pytest.mark.anyio
+async def test_piri_resume_selects_an_explicit_exact_session_id(tmp_path: Path) -> None:
+    manager = make_manager(tmp_path, "piri")
+    await manager.store.set(
+        "7:9", {"provider": "piri", "session_id": "piri-current"}
+    )
+    bot = bare_bot(manager, provider="piri")
+    update = make_update()
+
+    await bot._cmd_resume(update, SimpleNamespace(args=["piri.other-2"]))
+
+    session = await manager.get_session("7:9")
+    assert session["provider"] == "piri"
+    assert session["session_id"] == "piri.other-2"
+    assert session["new_session"] is False
+    assert "7:9" in bot._runtime_active_sessions
+    assert update.message.replies[0][0] == "✅ Piri session selected: piri.other-2"
+
+
+@pytest.mark.anyio
+async def test_piri_resume_rejects_unsafe_session_id_without_mutation(
+    tmp_path: Path,
+) -> None:
+    manager = make_manager(tmp_path, "piri")
+    original = {"provider": "piri", "session_id": "piri-current"}
+    await manager.store.set("7:9", original)
+    bot = bare_bot(manager, provider="piri")
+    update = make_update()
+
+    await bot._cmd_resume(update, SimpleNamespace(args=["../not-safe"]))
+
+    assert await manager.store.get("7:9") == original
+    assert update.message.replies[0][0] == "❌ Invalid Piri session id."
+
+
+@pytest.mark.anyio
+async def test_piri_persisted_session_auto_resumes_after_bridge_restart(
+    tmp_path: Path,
+) -> None:
+    bot = bare_bot(make_manager(tmp_path, "piri"), provider="piri")
+    session = {"provider": "piri", "session_id": "piri-persisted"}
+
+    selected = bot._effective_session_id("7:9", session)
+
+    assert selected == "piri-persisted"
+    assert "7:9" in bot._runtime_active_sessions
+
+
+@pytest.mark.anyio
 async def test_claude_audience_scoped_resume_browser_is_disabled(
     tmp_path: Path,
 ) -> None:
@@ -1024,6 +1072,50 @@ async def test_codex_model_command_does_not_read_claude_settings_and_persists_ra
     assert session["session_id"] is None
     assert session["new_session"] is True
     assert explicit.message.replies[0][0] == "✅ Switched to o3/custom:raw"
+
+
+@pytest.mark.anyio
+async def test_piri_model_and_effort_commands_use_runtime_catalog(tmp_path: Path) -> None:
+    manager = make_manager(tmp_path, "piri")
+    await manager.store.set(
+        "7:9",
+        {
+            "provider": "piri",
+            "session_id": "piri-session",
+            "model": "openai-codex/gpt-5.5",
+        },
+    )
+    models = (
+        ModelInfo(
+            "openai-codex/gpt-5.5",
+            "GPT 5.5",
+            default_reasoning_effort="medium",
+            supported_reasoning_efforts=("low", "medium", "high"),
+            is_default=True,
+        ),
+    )
+    project_chat = SimpleNamespace(
+        list_runtime_models=AsyncMock(return_value=models)
+    )
+    bot = bare_bot(manager, provider="piri", project_chat=project_chat)
+
+    model_update = make_update()
+    await bot._cmd_model(model_update, SimpleNamespace(args=[]))
+    assert model_update.message.replies[0][0] == "🤖 Select Piri model:"
+    model_button = model_update.message.replies[0][1][
+        "reply_markup"
+    ].inline_keyboard[0][0]
+    assert model_button.text == "GPT 5.5"
+    assert model_button.callback_data == "model:piri:openai-codex/gpt-5.5"
+
+    effort_update = make_update()
+    await bot._cmd_effort(effort_update, SimpleNamespace(args=["high"]))
+    session = await manager.get_session("7:9")
+    assert session["provider"] == "piri"
+    assert session["effort"] == "high"
+    assert effort_update.message.replies[0][0] == (
+        "✅ Reasoning effort set to high for GPT 5.5"
+    )
 
 
 @pytest.mark.anyio

@@ -189,8 +189,8 @@ class ProjectChatHandler(
                 "non-root user to enable unrestricted execution."
             )
         provider = getattr(self._config, "agent_provider", "claude")
-        if provider == "codex" and agent_runtime is None:
-            raise ValueError("Codex ProjectChat requires an injected AgentRuntime")
+        if provider in {"codex", "piri"} and agent_runtime is None:
+            raise ValueError(f"{provider.title()} ProjectChat requires an injected AgentRuntime")
         # Every provider runs through the provider-neutral AgentRuntime seam
         # (#584 slice C-2 removed the legacy direct Claude SDK path). The
         # composition root always injects a runtime; direct construction
@@ -235,6 +235,7 @@ class ProjectChatHandler(
                     budgets={
                         "claude": int(getattr(self._config, "usage_budget_tokens_claude", 0) or 0),
                         "codex": int(getattr(self._config, "usage_budget_tokens_codex", 0) or 0),
+                        "piri": int(getattr(self._config, "usage_budget_tokens_piri", 0) or 0),
                     },
                     warn_percent=int(getattr(self._config, "usage_budget_warn_percent", 80) or 80),
                     alert_sink=self._write_usage_alert_spool,
@@ -384,14 +385,15 @@ class ProjectChatHandler(
 
         if self._usage_meter is None:
             return
-        if getattr(self._config, "agent_provider", "claude") != "claude":
+        provider = getattr(self._config, "agent_provider", "claude")
+        if provider not in {"claude", "piri"}:
             return
         if callable(getattr(self._agent_runtime, "set_turn_attempt_recorder", None)):
             return
         try:
-            self._usage_meter.record("claude", mode, requests=1)
+            self._usage_meter.record(provider, mode, requests=1)
         except Exception:
-            logger.exception("Claude request metering failed; turn continues")
+            logger.exception("Runtime request metering failed; turn continues")
 
     def record_claude_adapter_result(self, event: Any, mode: str = MODE_INTERACTIVE) -> None:
         """Meter Claude adapter-path tokens from the terminal ResultEvent (#388).
@@ -468,8 +470,9 @@ class ProjectChatHandler(
             get_usage = getattr(runtime, "get_usage", None)
             if get_usage is not None:
                 return await asyncio.wait_for(get_usage(session_id), timeout=7.0)
-            if getattr(self._config, "agent_provider", "claude") != "claude":
-                return UsageSnapshot(provider="codex")
+            provider = str(getattr(self._config, "agent_provider", "claude"))
+            if provider != "claude":
+                return UsageSnapshot(provider=provider)
             # Claude adapter path (#584): ClaudeRuntime exposes no usage
             # endpoint, so fall through to the local aggregation below
             # (status-file snapshots and observed rate-limit windows).

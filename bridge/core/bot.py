@@ -1181,7 +1181,7 @@ class TelegramBot(
 
     def _active_provider(self) -> str:
         provider = str(getattr(self._config, "agent_provider", "claude")).strip().lower()
-        if provider not in {"claude", "codex", "crush"}:
+        if provider not in {"claude", "codex", "crush", "piri"}:
             raise ValueError(f"Unsupported agent provider: {provider!r}")
         return provider
 
@@ -1634,7 +1634,7 @@ class TelegramBot(
             return None
         if session_key in self._runtime_active_sessions:
             return session_id
-        if self._active_provider() == "codex":
+        if self._active_provider() in {"codex", "piri"}:
             self._runtime_active_sessions.add(session_key)
             return session_id
         if session_resume.resume_persisted_enabled() and session_resume.persisted_transcript_exists(
@@ -1662,9 +1662,12 @@ class TelegramBot(
         provider: str = "claude",
         previous_session_id: Optional[str] = None,
     ) -> str:
-        provider_label = {"claude": "Claude Code", "codex": "Codex", "crush": "Crush"}.get(
-            provider, provider
-        )
+        provider_label = {
+            "claude": "Claude Code",
+            "codex": "Codex",
+            "crush": "Crush",
+            "piri": "Piri",
+        }.get(provider, provider.title())
         # Banner model label: explicit /model choice first, then the operator
         # display label, then the env-routed model (Claude path only), so the
         # notice reflects the real backend instead of a bare "default".

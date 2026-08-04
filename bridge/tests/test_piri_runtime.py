@@ -1,0 +1,478 @@
+"""Contract tests for the unrestricted Piri runtime adapter."""
+
+from __future__ import annotations
+
+import asyncio
+from collections.abc import Mapping, Sequence
+from pathlib import Path
+import sys
+import tempfile
+from typing import TYPE_CHECKING, Any
+import unittest
+
+if TYPE_CHECKING:
+    from core.agent_runtime import AgentEvent
+    from core.piri_runtime import PiriLaunchConfig
+else:
+    from telegram_bot.core.agent_runtime import (
+        ApprovalRequestEvent,
+        CompletionEvent,
+        ErrorEvent,
+        MessageCompletedEvent,
+        ReasoningDeltaEvent,
+        ResultEvent,
+        SessionRequest,
+        TextDeltaEvent,
+        ToolCompletedEvent,
+        ToolStartedEvent,
+    )
+    from telegram_bot.core.piri_rpc import PiriRpcProcessClient
+    from telegram_bot.core.piri_runtime import PiriLaunchConfig, PiriRuntime
+
+
+class FakePiriClient:
+    def __init__(self, config: PiriLaunchConfig, *, session_id: str) -> None:
+        self.config = config
+        self.state: Mapping[str, Any] = {"sessionId": session_id, "model": None}
+        self.models: Sequence[Mapping[str, Any]] = ()
+        self.events: asyncio.Queue[Mapping[str, Any] | BaseException] = asyncio.Queue()
+        self.start_calls = 0
+        self.close_calls = 0
+        self.abort_calls = 0
+        self.prompt_calls: list[str] = []
+        self.prompted = asyncio.Event()
+
+    async def start(self) -> None:
+        self.start_calls += 1
+
+    async def prompt(self, message: str) -> None:
+        self.prompt_calls.append(message)
+        self.prompted.set()
+
+    async def abort(self) -> None:
+        self.abort_calls += 1
+        await self.events.put(
+            {
+                "type": "message_end",
+                "message": {"role": "assistant", "stopReason": "aborted"},
+            }
+        )
+        await self.events.put({"type": "agent_settled"})
+
+    async def get_state(self) -> Mapping[str, Any]:
+        return self.state
+
+    async def get_available_models(self) -> Sequence[Mapping[str, Any]]:
+        return self.models
+
+    async def next_event(self) -> Mapping[str, Any]:
+        event = await self.events.get()
+        if isinstance(event, BaseException):
+            raise event
+        return event
+
+    async def close(self) -> None:
+        self.close_calls += 1
+
+
+class FakePiriFactory:
+    def __init__(self) -> None:
+        self.clients: list[FakePiriClient] = []
+        self.next_session_id = "piri-new"
+
+    def __call__(self, config: PiriLaunchConfig) -> FakePiriClient:
+        session_id = self.next_session_id
+        if "--session-id" in config.command:
+            index = config.command.index("--session-id")
+            session_id = config.command[index + 1]
+        client = FakePiriClient(config, session_id=session_id)
+        self.clients.append(client)
+        return client
+
+
+async def collect(stream: Any) -> list[AgentEvent]:
+    return [event async for event in stream]
+
+
+class PiriRuntimeTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self) -> None:
+        self.factory = FakePiriFactory()
+        self.runtime = PiriRuntime(
+            executable="/opt/piri/bin/piri",
+            client_factory=self.factory,
+            process_environment={"BASE": "one"},
+        )
+
+    async def asyncTearDown(self) -> None:
+        await self.runtime.close()
+
+    async def test_new_session_uses_unrestricted_process_contract(self) -> None:
+        session = await self.runtime.start_or_resume(
+            SessionRequest(
+                working_directory="/workspace/project",
+                model="openai-codex/gpt-5.5",
+                effort="high",
+                approval_policy="never",
+                sandbox_policy={"type": "dangerFullAccess"},
+                memory_environment={"MEMORY": "two"},
+            )
+        )
+
+        self.assertEqual(session.session_id, "piri-new")
+        config = self.factory.clients[0].config
+        self.assertEqual(config.working_directory, "/workspace/project")
+        self.assertEqual(
+            config.command,
+            (
+                "/opt/piri/bin/piri",
+                "--mode",
+                "rpc",
+                "--approve",
+                "--model",
+                "openai-codex/gpt-5.5",
+                "--thinking",
+                "high",
+            ),
+        )
+        self.assertNotIn("--no-tools", config.command)
+        self.assertNotIn("--tools", config.command)
+        self.assertEqual(config.environment["BASE"], "one")
+        self.assertEqual(config.environment["MEMORY"], "two")
+        self.assertTrue(config.auto_confirm_extensions)
+
+    async def test_resume_uses_and_verifies_exact_session_id(self) -> None:
+        session = await self.runtime.start_or_resume(
+            SessionRequest(working_directory="/workspace", session_id="piri-existing")
+        )
+
+        self.assertEqual(session.session_id, "piri-existing")
+        self.assertIn("--session-id", self.factory.clients[0].config.command)
+        self.assertIn("piri-existing", self.factory.clients[0].config.command)
+
+    async def test_resume_rejects_a_different_returned_session(self) -> None:
+        class WrongSessionFactory(FakePiriFactory):
+            def __call__(self, config: PiriLaunchConfig) -> FakePiriClient:
+                client = FakePiriClient(config, session_id="wrong-session")
+                self.clients.append(client)
+                return client
+
+        factory = WrongSessionFactory()
+        runtime = PiriRuntime(client_factory=factory, process_environment={"A": "b"})
+        with self.assertRaisesRegex(RuntimeError, "different session"):
+            await runtime.start_or_resume(
+                SessionRequest(working_directory="/workspace", session_id="expected")
+            )
+        self.assertEqual(factory.clients[0].close_calls, 1)
+
+    async def test_startup_transport_details_are_not_exposed(self) -> None:
+        class FailingClient(FakePiriClient):
+            async def get_state(self) -> Mapping[str, Any]:
+                raise RuntimeError("Authorization: Bearer raw-secret")
+
+        class FailingFactory(FakePiriFactory):
+            def __call__(self, config: PiriLaunchConfig) -> FakePiriClient:
+                client = FailingClient(config, session_id="unused")
+                self.clients.append(client)
+                return client
+
+        factory = FailingFactory()
+        runtime = PiriRuntime(client_factory=factory, process_environment={"A": "b"})
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "^Piri runtime failed to start$",
+        ) as caught:
+            await runtime.start_or_resume(SessionRequest(working_directory="/workspace"))
+
+        self.assertNotIn("raw-secret", str(caught.exception))
+        self.assertEqual(factory.clients[0].close_calls, 1)
+
+    async def test_session_close_unregisters_it_from_runtime(self) -> None:
+        session = await self.runtime.start_or_resume(
+            SessionRequest(working_directory="/workspace")
+        )
+        client = self.factory.clients[0]
+
+        self.assertIn(session, self.runtime._sessions)
+        await session.close()
+        await session.close()
+
+        self.assertNotIn(session, self.runtime._sessions)
+        self.assertEqual(client.close_calls, 1)
+
+    async def test_restrictive_policies_are_rejected_instead_of_ignored(self) -> None:
+        requests = (
+            SessionRequest(working_directory="/workspace", approval_policy="on-request"),
+            SessionRequest(working_directory="/workspace", approvals_reviewer="user"),
+            SessionRequest(
+                working_directory="/workspace",
+                sandbox_policy={"type": "workspaceWrite"},
+            ),
+        )
+        for request in requests:
+            with self.subTest(request=request), self.assertRaises(ValueError):
+                await self.runtime.start_or_resume(request)
+        self.assertEqual(self.factory.clients, [])
+
+    async def test_cli_selectors_are_bounded_and_cannot_become_flags(self) -> None:
+        requests = (
+            SessionRequest(working_directory="/workspace", session_id="../session"),
+            SessionRequest(working_directory="/workspace", model="--no-tools"),
+            SessionRequest(working_directory="/workspace", effort="turbo"),
+        )
+        for request in requests:
+            with self.subTest(request=request), self.assertRaises(ValueError):
+                await self.runtime.start_or_resume(request)
+        self.assertEqual(self.factory.clients, [])
+
+    async def test_streams_text_reasoning_tools_and_terminal_pair(self) -> None:
+        session = await self.runtime.start_or_resume(
+            SessionRequest(working_directory="/workspace")
+        )
+        client = self.factory.clients[0]
+        events = (
+            {
+                "type": "message_update",
+                "assistantMessageEvent": {"type": "thinking_delta", "delta": "plan"},
+            },
+            {
+                "type": "message_update",
+                "assistantMessageEvent": {"type": "text_delta", "delta": "hello"},
+            },
+            {
+                "type": "tool_execution_start",
+                "toolCallId": "call-1",
+                "toolName": "bash",
+                "args": {"command": "pwd"},
+            },
+            {
+                "type": "tool_execution_end",
+                "toolCallId": "call-1",
+                "toolName": "bash",
+                "result": {"content": [{"type": "text", "text": "/workspace"}]},
+                "isError": False,
+            },
+            {
+                "type": "message_end",
+                "message": {"role": "assistant", "stopReason": "stop"},
+            },
+            {"type": "agent_settled"},
+        )
+        for event in events:
+            await client.events.put(event)
+
+        approval_called = False
+
+        async def approval_handler(_request: ApprovalRequestEvent) -> Any:
+            nonlocal approval_called
+            approval_called = True
+            raise AssertionError("Piri must not request command approval")
+
+        result = await collect(session.send_turn("work", approval_handler=approval_handler))
+
+        self.assertEqual(client.prompt_calls, ["work"])
+        self.assertFalse(approval_called)
+        self.assertIsInstance(result[0], ReasoningDeltaEvent)
+        self.assertEqual(result[0].text, "plan")
+        self.assertIsInstance(result[1], TextDeltaEvent)
+        self.assertEqual(result[1].text, "hello")
+        self.assertIsInstance(result[2], ToolStartedEvent)
+        self.assertEqual(result[2].arguments["command"], "pwd")
+        self.assertIsInstance(result[3], ToolCompletedEvent)
+        self.assertTrue(result[3].success)
+        self.assertIsInstance(result[4], MessageCompletedEvent)
+        self.assertIsInstance(result[-2], ResultEvent)
+        self.assertIsInstance(result[-1], CompletionEvent)
+        self.assertFalse(any(isinstance(event, ApprovalRequestEvent) for event in result))
+
+    async def test_failed_turn_has_one_terminal_error_and_no_result(self) -> None:
+        session = await self.runtime.start_or_resume(
+            SessionRequest(working_directory="/workspace")
+        )
+        client = self.factory.clients[0]
+        await client.events.put(
+            {
+                "type": "message_end",
+                "message": {
+                    "role": "assistant",
+                    "stopReason": "error",
+                    "errorMessage": "provider failed",
+                },
+            }
+        )
+        await client.events.put({"type": "agent_settled"})
+
+        result = await collect(session.send_turn("work"))
+
+        self.assertEqual(len(result), 1)
+        self.assertIsInstance(result[0], ErrorEvent)
+        self.assertEqual(result[0].code, "piri_turn_failed")
+        self.assertEqual(result[0].message, "Piri provider turn failed")
+        self.assertFalse(any(isinstance(event, ResultEvent) for event in result))
+
+    async def test_successful_auto_retry_clears_an_earlier_provider_error(self) -> None:
+        session = await self.runtime.start_or_resume(
+            SessionRequest(working_directory="/workspace")
+        )
+        client = self.factory.clients[0]
+        for event in (
+            {
+                "type": "message_end",
+                "message": {"role": "assistant", "stopReason": "error"},
+            },
+            {
+                "type": "message_update",
+                "assistantMessageEvent": {"type": "text_delta", "delta": "recovered"},
+            },
+            {
+                "type": "message_end",
+                "message": {"role": "assistant", "stopReason": "stop"},
+            },
+            {"type": "agent_settled"},
+        ):
+            await client.events.put(event)
+
+        result = await collect(session.send_turn("retry"))
+
+        self.assertIsInstance(result[-2], ResultEvent)
+        self.assertIsInstance(result[-1], CompletionEvent)
+        self.assertFalse(any(isinstance(event, ErrorEvent) for event in result))
+
+    async def test_interrupt_aborts_only_an_active_turn(self) -> None:
+        session = await self.runtime.start_or_resume(
+            SessionRequest(working_directory="/workspace")
+        )
+        client = self.factory.clients[0]
+        await session.interrupt()
+        self.assertEqual(client.abort_calls, 0)
+
+        turn = asyncio.create_task(collect(session.send_turn("long task")))
+        await client.prompted.wait()
+        await session.interrupt()
+        result = await turn
+
+        self.assertEqual(client.abort_calls, 1)
+        self.assertEqual(len(result), 1)
+        self.assertIsInstance(result[0], ErrorEvent)
+        self.assertEqual(result[0].code, "interrupted")
+
+    async def test_early_stream_close_aborts_and_drains_before_reuse(self) -> None:
+        session = await self.runtime.start_or_resume(
+            SessionRequest(working_directory="/workspace")
+        )
+        client = self.factory.clients[0]
+        stream = session.send_turn("first")
+        await client.events.put(
+            {
+                "type": "message_update",
+                "assistantMessageEvent": {"type": "text_delta", "delta": "partial"},
+            }
+        )
+        first_event = await anext(stream)
+        self.assertIsInstance(first_event, TextDeltaEvent)
+        await stream.aclose()
+        self.assertEqual(client.abort_calls, 1)
+
+        await client.events.put({"type": "agent_settled"})
+        result = await collect(session.send_turn("second"))
+
+        self.assertEqual(client.prompt_calls, ["first", "second"])
+        self.assertIsInstance(result[-2], ResultEvent)
+        self.assertIsInstance(result[-1], CompletionEvent)
+
+    async def test_turns_are_serialized_per_session(self) -> None:
+        session = await self.runtime.start_or_resume(
+            SessionRequest(working_directory="/workspace")
+        )
+        client = self.factory.clients[0]
+        first = asyncio.create_task(collect(session.send_turn("first")))
+        await client.prompted.wait()
+        client.prompted.clear()
+        second = asyncio.create_task(collect(session.send_turn("second")))
+        await asyncio.sleep(0)
+        self.assertEqual(client.prompt_calls, ["first"])
+
+        await client.events.put({"type": "agent_settled"})
+        await first
+        await client.prompted.wait()
+        self.assertEqual(client.prompt_calls, ["first", "second"])
+        await client.events.put({"type": "agent_settled"})
+        await second
+
+    async def test_model_discovery_uses_provider_qualified_ids(self) -> None:
+        def factory(config: PiriLaunchConfig) -> FakePiriClient:
+            client = FakePiriClient(config, session_id="catalog")
+            client.state = {
+                "sessionId": "catalog",
+                "model": {"provider": "openai-codex", "id": "gpt-5.5"},
+            }
+            client.models = (
+                {
+                    "provider": "openai-codex",
+                    "id": "gpt-5.5",
+                    "name": "GPT 5.5",
+                    "reasoning": True,
+                    "thinkingLevelMap": {"minimal": None, "max": "xhigh"},
+                },
+                {
+                    "provider": "kimi-coding",
+                    "id": "k3",
+                    "name": "Kimi K3",
+                    "reasoning": False,
+                },
+            )
+            self.catalog_client = client
+            return client
+
+        runtime = PiriRuntime(client_factory=factory, process_environment={"A": "b"})
+        models = await runtime.list_models()
+
+        self.assertEqual([model.id for model in models], ["openai-codex/gpt-5.5", "kimi-coding/k3"])
+        self.assertTrue(models[0].is_default)
+        self.assertNotIn("minimal", models[0].supported_reasoning_efforts)
+        self.assertEqual(models[1].supported_reasoning_efforts, ())
+        self.assertEqual(self.catalog_client.close_calls, 1)
+
+
+class PiriRpcProcessClientTests(unittest.IsolatedAsyncioTestCase):
+    async def test_auto_confirms_extension_yes_no_dialog(self) -> None:
+        child = """
+import json
+import sys
+command = json.loads(sys.stdin.readline())
+request = {
+    "type": "extension_ui_request",
+    "id": "confirm-1",
+    "method": "confirm",
+    "title": "Run",
+    "message": "Proceed?",
+}
+print(json.dumps(request), flush=True)
+answer = json.loads(sys.stdin.readline())
+if answer != {"type":"extension_ui_response","id":"confirm-1","confirmed":True}:
+    raise SystemExit(2)
+response = {
+    "id": command["id"],
+    "type": "response",
+    "command": "get_state",
+    "success": True,
+    "data": {"sessionId": "rpc-session"},
+}
+print(json.dumps(response), flush=True)
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            client = PiriRpcProcessClient(
+                (sys.executable, "-u", "-c", child),
+                working_directory=str(Path(directory)),
+                auto_confirm=True,
+            )
+            try:
+                await client.start()
+                state = await client.get_state()
+                self.assertEqual(state["sessionId"], "rpc-session")
+            finally:
+                await client.close()
+
+
+if __name__ == "__main__":
+    unittest.main()

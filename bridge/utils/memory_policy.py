@@ -46,6 +46,12 @@ _CODEX_AUDIENCE_ERROR = (
     "audience homes."
 )
 
+_PIRI_AUDIENCE_ERROR = (
+    "audience-scoped memory cannot run with the Piri provider: PiriRuntime "
+    "does not yet isolate configuration, credentials, and session storage per "
+    "memory audience. Use CCC_BRIDGE_MEMORY_MODE=off or curated."
+)
+
 
 def assert_memory_provider_safe(
     mode: str,
@@ -65,3 +71,8 @@ def assert_memory_provider_safe(
         and str(codex_audience_auth_mode or "").strip().lower() != "keyring"
     ):
         raise ValueError(_CODEX_AUDIENCE_ERROR)
+    if (
+        mode == MEMORY_MODE_AUDIENCE_SCOPED
+        and str(provider or "").strip().lower() == "piri"
+    ):
+        raise ValueError(_PIRI_AUDIENCE_ERROR)

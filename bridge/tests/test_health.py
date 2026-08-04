@@ -309,6 +309,25 @@ class RuntimeHealthReporterTests(unittest.TestCase):
             health = json.loads(reporter.health_file.read_text(encoding="utf-8"))
             self.assertEqual(health["agent"]["provider"], "claude")
 
+    def test_piri_provider_reports_provider_specific_health_reason(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_root = Path(tmpdir)
+            module = self._load_health_module(project_root)
+            reporter = module.RuntimeHealthReporter(
+                project_root / ".telegram_bot", agent_provider="piri"
+            )
+
+            reporter.initialize_process()
+            reporter.record_telegram_ok()
+            reporter.record_agent_error("piri command unavailable")
+
+            health = json.loads(reporter.health_file.read_text(encoding="utf-8"))
+            self.assertEqual(health["agent"]["provider"], "piri")
+            self.assertEqual(
+                health["service"]["reason"],
+                "Piri: piri command unavailable",
+            )
+
     def test_record_empty_completion_counts_by_outcome(self):
         # #775: empty normal completions split into the event-loss class
         # (recovered from the terminal payload) and the truly-empty class.

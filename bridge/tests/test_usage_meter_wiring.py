@@ -36,6 +36,7 @@ def _settings(project_root: Path, provider: str = "claude") -> SimpleNamespace:
         usage_meter_enabled=True,
         usage_budget_tokens_claude=0,
         usage_budget_tokens_codex=0,
+        usage_budget_tokens_piri=0,
         usage_budget_warn_percent=80,
         push_enabled=False,
         push_spool_dir=str(project_root / "spool"),
@@ -124,6 +125,20 @@ class ProjectChatMeterWiringTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             day_buckets["claude"]["interactive"],
             {"input_tokens": 100, "output_tokens": 20, "requests": 1},
+        )
+
+    async def test_piri_attempt_meters_request_without_claiming_tokens(self) -> None:
+        handler = ProjectChatHandler(
+            settings=_settings(self.root, provider="piri"),
+            agent_runtime=SimpleNamespace(),
+        )
+
+        handler.record_claude_adapter_attempt()
+
+        day_buckets = next(iter(_meter_state(self.root)["days"].values()))
+        self.assertEqual(
+            day_buckets["piri"]["interactive"],
+            {"input_tokens": 0, "output_tokens": 0, "requests": 1},
         )
 
     async def test_metering_failure_never_breaks_the_result_path(self) -> None:

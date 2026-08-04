@@ -11,7 +11,12 @@ from telegram_bot.utils.config import config
 # Agent providers this node can run. Keep in step with
 # Settings.agent_provider (utils/config.py) — health.json is how an operator
 # tells one lane from another.
-_AGENT_PROVIDER_LABELS = {"claude": "Claude", "codex": "Codex", "crush": "Crush"}
+_AGENT_PROVIDER_LABELS = {
+    "claude": "Claude",
+    "codex": "Codex",
+    "crush": "Crush",
+    "piri": "Piri",
+}
 _KNOWN_AGENT_PROVIDERS = frozenset(_AGENT_PROVIDER_LABELS)
 
 

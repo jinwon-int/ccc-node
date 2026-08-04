@@ -32,7 +32,10 @@ _ICONS = {
 
 
 def _agent_label(provider: str) -> str:
-    return "Codex" if str(provider).strip().lower() == "codex" else "Claude"
+    return {
+        "codex": "Codex",
+        "piri": "Piri",
+    }.get(str(provider).strip().lower(), "Claude")
 
 
 def _parse_iso(value: Optional[str]) -> Optional[datetime]:
@@ -325,7 +328,7 @@ def render_status_lines(
     telegram = data.get("telegram") or {}
     agent = data.get("agent") or data.get("claude") or {}
     provider = str(agent.get("provider") or configured_provider).strip().lower()
-    agent_label = "Codex" if provider == "codex" else "Claude"
+    agent_label = _agent_label(provider)
 
     if age_seconds is None or age_seconds > stale_seconds:
         detail = "health stale"

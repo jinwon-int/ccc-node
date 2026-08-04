@@ -310,6 +310,7 @@ def test_agent_provider_settings_default_and_reject_unknown(tmp_path: Path) -> N
 
     assert settings.agent_provider == "claude"
     assert settings.codex_cli_path == str(tmp_path / ".claude" / "hooks" / "ccc-codex")
+    assert settings.piri_cli_path == "piri"
     assert settings.codex_memory_materializer_path == str(
         tmp_path / ".claude" / "hooks" / "ccc_codex_memory.py"
     )
@@ -370,6 +371,19 @@ def test_agent_provider_settings_default_and_reject_unknown(tmp_path: Path) -> N
     assert codex_settings.max_resident_sessions == 3
     assert codex_settings.session_tree_rss_limit_mb == 2048
     assert codex_settings.codex_max_session_attachments == 4
+    piri_settings = settings_class.load(
+        project_root=tmp_path / "project",
+        environ={
+            **environ,
+            "CCC_AGENT_PROVIDER": "piri",
+            "CCC_PIRI_CLI_PATH": "/opt/bin/piri-test",
+            "CCC_USAGE_BUDGET_TOKENS_PIRI": "1234",
+        },
+        bot_env_file=tmp_path / "missing.env",
+    )
+    assert piri_settings.agent_provider == "piri"
+    assert piri_settings.piri_cli_path == "/opt/bin/piri-test"
+    assert piri_settings.usage_budget_tokens_piri == 1234
     custom_harness = tmp_path / "custom-claude"
     custom_settings = settings_class.load(
         project_root=tmp_path / "project",
@@ -501,6 +515,31 @@ def test_claude_default_build_context_injects_claude_runtime(tmp_path: Path) -> 
     assert override.project_chat._agent_runtime is injected
 
 
+def test_piri_build_context_injects_unrestricted_runtime(tmp_path: Path) -> None:
+    settings_class = _real_settings_class()
+    _reload_real_module("telegram_bot.utils.chat_logger")
+    _reload_real_module("telegram_bot.utils.health")
+    from telegram_bot.__main__ import build_context
+    from telegram_bot.core.piri_runtime import PiriRuntime
+
+    settings = settings_class.load(
+        project_root=tmp_path / "project",
+        environ={
+            "HOME": str(tmp_path),
+            "TELEGRAM_BOT_TOKEN": "123456:test",
+            "CCC_AGENT_PROVIDER": "piri",
+            "CCC_PIRI_CLI_PATH": "/opt/bin/piri-test",
+        },
+        bot_env_file=tmp_path / "missing.env",
+    )
+
+    context = build_context(settings, telegram_port=lambda: None)
+
+    assert isinstance(context.agent_runtime, PiriRuntime)
+    assert context.agent_runtime._executable == "/opt/bin/piri-test"
+    assert context.project_chat._agent_runtime is context.agent_runtime
+
+
 @pytest.mark.anyio
 async def test_claude_adapter_routes_turns_and_drops_codex_only_policy_knobs(
     tmp_path: Path,
@@ -533,6 +572,33 @@ async def test_claude_adapter_routes_turns_and_drops_codex_only_policy_knobs(
     assert request.approval_policy is None
     assert request.approvals_reviewer is None
     assert request.sandbox_policy is None
+
+
+@pytest.mark.anyio
+async def test_piri_adapter_forces_unrestricted_policy_knobs(tmp_path: Path) -> None:
+    session = FakeSession("piri-session")
+    runtime = FakeRuntime([session])
+    handler = ProjectChatHandler(
+        settings=_settings(tmp_path, provider="piri"), agent_runtime=runtime
+    )
+    handler._task_ledger_cache = False
+
+    response = await handler.process_message(
+        "hello",
+        user_id=7,
+        chat_id=70,
+        approval_policy="on-request",
+        approvals_reviewer="user",
+        sandbox_policy={"type": "workspaceWrite"},
+    )
+
+    assert response.success is True
+    assert response.session_id == "piri-session"
+    request = runtime.requests[0]
+    assert request.approval_policy == "never"
+    assert request.approvals_reviewer is None
+    assert request.sandbox_policy == {"type": "dangerFullAccess"}
+    assert request.memory_environment is None
 
 
 @pytest.mark.anyio

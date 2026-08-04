@@ -230,7 +230,7 @@ def build_lifecycle_observer(config: object) -> "LifecycleObserver | None":
     if not getattr(config, "lifecycle_audit_enabled", False):
         return None
     provider = str(getattr(config, "agent_provider", "claude") or "claude")
-    if provider not in ("claude", "codex", "crush"):
+    if provider not in ("claude", "codex", "crush", "piri"):
         return None
     base = getattr(config, "bot_data_dir", None) or (Path.home() / ".claude" / "state")
     ledger = LifecycleAuditLedger(Path(base) / "lifecycle-audit")

@@ -138,6 +138,24 @@ class VoiceProviderConfigTests(unittest.TestCase):
                 _env_file=None,
             )
             self.assertEqual(codex_curated.agent_provider, "codex")
+            with self.assertRaisesRegex(
+                ValidationError,
+                "audience-scoped memory cannot run with the Piri provider",
+            ):
+                module.Config(
+                    telegram_bot_token="123456:abc",
+                    CCC_TELEGRAM_SESSION_SCOPE="shared-groups",
+                    CCC_BRIDGE_MEMORY_MODE="audience-scoped",
+                    CCC_AGENT_PROVIDER="piri",
+                    _env_file=None,
+                )
+            piri_curated = module.Config(
+                telegram_bot_token="123456:abc",
+                CCC_BRIDGE_MEMORY_MODE="curated",
+                CCC_AGENT_PROVIDER="piri",
+                _env_file=None,
+            )
+            self.assertEqual(piri_curated.agent_provider, "piri")
 
     def test_curated_web_mcp_is_explicit_complete_and_secret_safe(self):
         with TemporaryDirectory() as td:

@@ -859,6 +859,8 @@ def _tokens(value: int | None) -> str:
 def _usage_title(snapshot: UsageSnapshot) -> str:
     if snapshot.provider == "codex":
         return "Codex"
+    if snapshot.provider == "piri":
+        return "Piri"
     return snapshot.service or "Claude Code"
 
 
@@ -928,6 +930,13 @@ def render_usage(snapshot: UsageSnapshot) -> str:
     quota_note = _service_quota_note(snapshot.service)
     if quota_note is not None:
         lines.append(quota_note)
+
+    if snapshot.provider == "piri":
+        lines.append("Provider token/quota telemetry: unavailable")
+        rendered = "\n".join(lines)
+        if len(rendered) <= MAX_TELEGRAM_USAGE_LENGTH:
+            return rendered
+        return rendered[: MAX_TELEGRAM_USAGE_LENGTH - 2].rstrip() + "…"
 
     if snapshot.context_used is not None and snapshot.context_window:
         percent = min(100.0, snapshot.context_used * 100 / snapshot.context_window)

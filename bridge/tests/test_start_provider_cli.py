@@ -29,11 +29,16 @@ def _run(
     provider: str,
     codex_cli: str = "codex",
     crush_cli: str = "crush",
+    piri_cli: str = "piri",
 ) -> subprocess.CompletedProcess[str]:
     program = "\n".join(
         [
             "set -eu",
-            'read_env_with_fallback() { case "$1" in CCC_AGENT_PROVIDER) printf "%s" "$TEST_PROVIDER" ;; CCC_CODEX_CLI_PATH) printf "%s" "$TEST_CODEX_CLI" ;; CCC_CRUSH_CLI_PATH) printf "%s" "$TEST_CRUSH_CLI" ;; esac; }',
+            'read_env_with_fallback() { case "$1" in '
+            'CCC_AGENT_PROVIDER) printf "%s" "$TEST_PROVIDER" ;; '
+            'CCC_CODEX_CLI_PATH) printf "%s" "$TEST_CODEX_CLI" ;; '
+            'CCC_CRUSH_CLI_PATH) printf "%s" "$TEST_CRUSH_CLI" ;; '
+            'CCC_PIRI_CLI_PATH) printf "%s" "$TEST_PIRI_CLI" ;; esac; }',
             _function_source("maybe_setup_agent_cli"),
             "maybe_setup_agent_cli",
         ]
@@ -43,6 +48,7 @@ def _run(
         "TEST_PROVIDER": provider,
         "TEST_CODEX_CLI": codex_cli,
         "TEST_CRUSH_CLI": crush_cli,
+        "TEST_PIRI_CLI": piri_cli,
         "CLAUDE_CLI_PATH": "",
         "PATH": f"{tmp_path}:/usr/bin:/bin",
     }
@@ -85,6 +91,26 @@ def test_crush_provider_fails_closed_when_cli_is_missing(tmp_path: Path) -> None
 
     assert result.returncode == 1
     assert "configured crush CLI is not executable" in result.stdout
+    assert str(tmp_path) not in result.stdout
+
+
+def test_piri_provider_does_not_require_claude(tmp_path: Path) -> None:
+    piri = tmp_path / "piri"
+    piri.write_text("#!/bin/sh\nexit 0\n")
+    piri.chmod(0o700)
+
+    result = _run(tmp_path, provider="piri", piri_cli=str(piri))
+
+    assert result.returncode == 0
+    assert "Piri provider CLI is available" in result.stdout
+    assert "claude command not found" not in result.stdout
+
+
+def test_piri_provider_fails_closed_when_cli_is_missing(tmp_path: Path) -> None:
+    result = _run(tmp_path, provider="piri", piri_cli=str(tmp_path / "missing"))
+
+    assert result.returncode == 1
+    assert "configured Piri CLI is not executable" in result.stdout
     assert str(tmp_path) not in result.stdout
 
 

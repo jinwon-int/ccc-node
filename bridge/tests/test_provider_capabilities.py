@@ -153,6 +153,27 @@ class CapabilityRuntimeDriftTests(unittest.TestCase):
         for member in ("list_sessions", "read_session", "supports_session_browsing"):
             self.assertTrue(hasattr(CodexRuntime, member))
 
+    def test_piri_runtime_claims_match_the_adapter_and_deliberate_boundaries(self) -> None:
+        from telegram_bot.core.piri_runtime import PiriRuntime
+
+        self.assertTrue(hasattr(PiriRuntime, "start_or_resume"))
+        self.assertTrue(hasattr(PiriRuntime, "list_models"))
+        for axis_key in conformance.CONFORMANCE_COVERED_AXES:
+            expected = (
+                CapabilityState.UNSUPPORTED
+                if axis_key in {"interactive_approvals", "session_browsing"}
+                else CapabilityState.SUPPORTED
+            )
+            with self.subTest(axis=axis_key):
+                self.assertIs(
+                    capability_status("piri", axis_key).state,
+                    expected,
+                )
+        self.assertIs(
+            capability_status("piri", "usage_metering").state,
+            CapabilityState.DEGRADED,
+        )
+
     def test_usage_metering_claims_match_the_parser_surface(self) -> None:
         from telegram_bot.core import usage
 

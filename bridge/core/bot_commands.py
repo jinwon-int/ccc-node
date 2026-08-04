@@ -560,8 +560,15 @@ class BotCommandMixin:
             remove_fields={"effort"} if provider_changed else (),
         )
         self._runtime_active_sessions.discard(conversation_key)
-        provider_label = "Claude Code" if active_provider == "claude" else "Codex"
-        reply = f"🆕 Switched to new session mode. Your next message will start a new {provider_label} session."
+        provider_label = {
+            "claude": "Claude Code",
+            "codex": "Codex",
+            "piri": "Piri",
+        }.get(active_provider, active_provider)
+        reply = (
+            "🆕 Switched to new session mode. Your next message will start a new "
+            f"{provider_label} session."
+        )
         await message.reply_text(reply)
         log_debug(user_id, "bot", reply)
 
@@ -750,6 +757,11 @@ class BotCommandMixin:
 
         if context.args:
             name = context.args[0]
+            if active_provider == "piri" and not self._valid_piri_model_id(name):
+                reply = "❌ Invalid Piri model id. Use a provider-qualified model id."
+                await message.reply_text(reply)
+                log_debug(user_id, "bot", reply)
+                return
             updates: dict[str, Any] = {"provider": active_provider, "model": name}
             remove_fields = set()
             reset_note = None
@@ -762,8 +774,8 @@ class BotCommandMixin:
                 )
                 updates.update(session_id=None, new_session=True)
                 remove_fields.add("effort")
-            elif active_provider == "codex":
-                reset_note = await self._codex_model_effort_reset_note(session, name)
+            elif active_provider in {"codex", "piri"}:
+                reset_note = await self._runtime_model_effort_reset_note(session, name)
                 if reset_note:
                     remove_fields.add("effort")
             await self._session_manager.patch_session(
@@ -780,29 +792,37 @@ class BotCommandMixin:
             log_debug(user_id, "bot", reply)
             return
 
-        if active_provider == "codex":
+        if active_provider in {"codex", "piri"}:
+            provider_label = "Codex" if active_provider == "codex" else "Piri"
+            model_hint = "<codex-model>" if active_provider == "codex" else "<provider/model>"
             try:
                 models = await self._project_chat.list_runtime_models()
             except Exception:
-                logger.warning("Codex model browsing failed")
-                reply = "⚠️ Codex model list is unavailable. Use /model <codex-model>."
+                logger.warning("%s model browsing failed", provider_label)
+                reply = (
+                    f"⚠️ {provider_label} model list is unavailable. "
+                    f"Use /model {model_hint}."
+                )
                 await message.reply_text(reply)
                 log_debug(user_id, "bot", reply)
                 return
             buttons = [
                 [InlineKeyboardButton(
                     model.display_name[:64],
-                    callback_data=f"model:codex:{model.id}",
+                    callback_data=f"model:{active_provider}:{model.id}",
                 )]
                 for model in models
-                if len(f"model:codex:{model.id}".encode("utf-8")) <= 64
+                if len(f"model:{active_provider}:{model.id}".encode("utf-8")) <= 64
             ]
             if not buttons:
-                reply = "📭 No Codex models are available. Use /model <codex-model>."
+                reply = (
+                    f"📭 No {provider_label} models are available. "
+                    f"Use /model {model_hint}."
+                )
                 await message.reply_text(reply)
                 log_debug(user_id, "bot", reply)
                 return
-            reply = "🤖 Select Codex model:"
+            reply = f"🤖 Select {provider_label} model:"
             await message.reply_text(reply, reply_markup=InlineKeyboardMarkup(buttons))
             log_debug(user_id, "bot", reply)
             return
@@ -825,20 +845,28 @@ class BotCommandMixin:
         log_debug(user_id, "bot", reply)
 
     @staticmethod
-    def _selected_codex_model(models, session: dict):
+    def _valid_piri_model_id(model_id: str) -> bool:
+        return (
+            len(model_id) <= 256
+            and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/@+-]*", model_id)
+            is not None
+        )
+
+    @staticmethod
+    def _selected_runtime_model(models, session: dict):
         selected_id = session.get("model")
         if selected_id:
             return next((model for model in models if model.id == selected_id), None)
         return next((model for model in models if model.is_default), models[0] if models else None)
 
-    async def _codex_model_effort_reset_note(self, session: dict, model_id: str):
+    async def _runtime_model_effort_reset_note(self, session: dict, model_id: str):
         current_effort = session.get("effort")
         if not current_effort:
             return None
         try:
             models = tuple(await self._project_chat.list_runtime_models())
         except Exception:
-            logger.warning("Codex model effort compatibility lookup failed", exc_info=True)
+            logger.warning("Runtime model effort compatibility lookup failed", exc_info=True)
             return (
                 f"ℹ️ Reasoning effort {current_effort} could not be validated; "
                 "reset to model default."
@@ -856,13 +884,14 @@ class BotCommandMixin:
             f"reset to model default ({default_label})."
         )
 
-    async def _apply_codex_effort_selection(
+    async def _apply_runtime_effort_selection(
         self, conversation_key, model, requested: str
     ) -> str:
+        provider = self._active_provider()
         if requested == "default":
             await self._session_manager.patch_session(
                 conversation_key,
-                updates={"provider": "codex"},
+                updates={"provider": provider},
                 remove_fields={"effort"},
             )
             default_label = model.default_reasoning_effort or "provider default"
@@ -878,7 +907,7 @@ class BotCommandMixin:
             )
         await self._session_manager.patch_session(
             conversation_key,
-            updates={"provider": "codex", "effort": requested},
+            updates={"provider": provider, "effort": requested},
         )
         return f"✅ Reasoning effort set to {requested} for {model.display_name}"
 
@@ -889,50 +918,55 @@ class BotCommandMixin:
         message = self._require_message(update)
         chat = self._require_chat(update)
         log_debug(user_id, "command", "/effort")
-        if self._active_provider() != "codex":
-            reply = "⚠️ /effort is available only when the Codex provider is active."
+        active_provider = self._active_provider()
+        if active_provider not in {"codex", "piri"}:
+            reply = "⚠️ /effort is available only for Codex or Piri."
             await message.reply_text(reply)
             log_debug(user_id, "bot", reply)
             return
 
         conversation_key = self._conversation_key(user_id, chat.id)
-        session, provider_switched = await self._switch_provider_if_needed(
+        session, _provider_switched = await self._switch_provider_if_needed(
             conversation_key, user_id, chat.id
         )
+        provider_label = "Codex" if active_provider == "codex" else "Piri"
         try:
             models = tuple(await self._project_chat.list_runtime_models())
         except Exception:
-            logger.warning("Codex effort browsing failed", exc_info=True)
-            reply = "⚠️ Codex effort options are unavailable."
+            logger.warning("%s effort browsing failed", provider_label, exc_info=True)
+            reply = f"⚠️ {provider_label} effort options are unavailable."
             await message.reply_text(reply)
             log_debug(user_id, "bot", reply)
             return
-        model = self._selected_codex_model(models, session)
+        model = self._selected_runtime_model(models, session)
         requested = context.args[0] if context.args else None
         if model is None:
             if requested == "default":
                 await self._session_manager.patch_session(
                     conversation_key,
-                    updates={"provider": "codex"},
+                    updates={"provider": active_provider},
                     remove_fields={"effort"},
                 )
                 reply = "✅ Reasoning effort reset to provider default"
             else:
                 reply = (
-                    "📭 The selected Codex model does not advertise reasoning "
+                    f"📭 The selected {provider_label} model does not advertise reasoning "
                     "effort options."
                 )
             await message.reply_text(reply)
             log_debug(user_id, "bot", reply)
             return
         if not model.supported_reasoning_efforts and requested != "default":
-            reply = "📭 The selected Codex model does not advertise reasoning effort options."
+            reply = (
+                f"📭 The selected {provider_label} model does not advertise "
+                "reasoning effort options."
+            )
             await message.reply_text(reply)
             log_debug(user_id, "bot", reply)
             return
 
         if requested is not None:
-            reply = await self._apply_codex_effort_selection(
+            reply = await self._apply_runtime_effort_selection(
                 conversation_key, model, requested
             )
             await message.reply_text(reply)
@@ -942,7 +976,7 @@ class BotCommandMixin:
         current = session.get("effort")
         buttons = []
         for effort in model.supported_reasoning_efforts:
-            callback_data = f"effort:codex:{effort}"
+            callback_data = f"effort:{active_provider}:{effort}"
             if len(callback_data.encode("utf-8")) > 64:
                 continue
             suffixes = []
@@ -955,7 +989,10 @@ class BotCommandMixin:
                 InlineKeyboardButton(label, callback_data=callback_data)
             ])
         buttons.append([
-            InlineKeyboardButton("Use model default", callback_data="effort:codex:default")
+            InlineKeyboardButton(
+                "Use model default",
+                callback_data=f"effort:{active_provider}:default",
+            )
         ])
         current_label = current or "model default"
         default_label = model.default_reasoning_effort or "provider default"
@@ -1076,6 +1113,53 @@ class BotCommandMixin:
                 user_id=user_id,
                 message=message,
             )
+            return
+        if active_provider == "piri":
+            args = context.args or []
+            if len(args) > 1:
+                reply = "Usage: /resume <piri-session-id>"
+                await message.reply_text(reply)
+                log_debug(user_id, "bot", reply)
+                return
+            if args:
+                requested_id = args[0].strip()
+                if (
+                    len(requested_id) > 128
+                    or re.fullmatch(
+                        r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?",
+                        requested_id,
+                    )
+                    is None
+                ):
+                    reply = "❌ Invalid Piri session id."
+                    await message.reply_text(reply)
+                    log_debug(user_id, "bot", reply)
+                    return
+                await self._session_manager.patch_session(
+                    conversation_key,
+                    updates={
+                        "provider": "piri",
+                        "session_id": requested_id,
+                        "new_session": False,
+                    },
+                    remove_fields={"resume_list"},
+                )
+                self._runtime_active_sessions.add(conversation_key)
+                reply = f"✅ Piri session selected: {requested_id}"
+                await message.reply_text(reply)
+                log_debug(user_id, "bot", reply)
+                return
+            session = await self._session_manager.get_session(conversation_key)
+            current_id = session.get("session_id")
+            if isinstance(current_id, str) and current_id:
+                reply = (
+                    f"ℹ️ Current Piri session auto-resumes: {current_id}\n"
+                    "To select another session, use /resume <piri-session-id>."
+                )
+            else:
+                reply = "Usage: /resume <piri-session-id>"
+            await message.reply_text(reply)
+            log_debug(user_id, "bot", reply)
             return
         sessions = self._project_chat.list_sessions(limit=10)
         if not sessions:
@@ -1225,6 +1309,15 @@ class BotCommandMixin:
             log_debug(user_id, "bot", reply)
             return
 
+        if session["provider"] == "piri":
+            reply = (
+                "ℹ️ Piri RPC does not expose bounded transcript history. "
+                "The current session still resumes by its exact id."
+            )
+            await message.reply_text(reply)
+            log_debug(user_id, "bot", reply)
+            return
+
         if session["provider"] == "codex":
             try:
                 history = await self._project_chat.read_runtime_session(session_id, limit=5)
@@ -1298,6 +1391,12 @@ class BotCommandMixin:
         message = self._require_message(update)
         log_debug(user_id, "command", "/revert")
 
+        if self._active_provider() == "piri":
+            reply = "ℹ️ /revert is unavailable for Piri RPC sessions."
+            await message.reply_text(reply)
+            log_debug(user_id, "bot", reply)
+            return
+
         if self._claude_scoped_transcript_controls_disabled():
             reply = (
                 "🔒 Claude transcript revert is disabled while private memory "
@@ -1341,6 +1440,12 @@ class BotCommandMixin:
         query = self._require_callback_query(update)
         user_id = self._require_user(update).id
         chat_id = update.effective_chat.id if update.effective_chat else None
+
+        if self._active_provider() == "piri":
+            await query.edit_message_text(
+                "ℹ️ This transcript control is unavailable for Piri RPC sessions."
+            )
+            return
 
         if self._claude_scoped_transcript_controls_disabled():
             await query.edit_message_text(
