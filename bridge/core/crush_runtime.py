@@ -21,7 +21,9 @@ import asyncio
 import json
 import os
 import re
+import shutil
 import subprocess
+import tempfile
 import threading
 import time
 import urllib.request
@@ -29,6 +31,7 @@ import urllib.error
 import uuid
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Protocol
 
 from .agent_runtime import (
@@ -62,6 +65,11 @@ _CRUSH_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
 # crushrc-defined providers are unaffected — only inherited credentials are
 # stripped. Pass process_environment explicitly to opt out.
 _INHERITED_ENV_BLOCKLIST = frozenset({"ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"})
+
+
+def _default_crush_config() -> Path:
+    """Fleet-managed crushrc shipped next to the headless runner (#938)."""
+    return Path(__file__).resolve().parents[2] / "crush" / "crushrc.readonly"
 _SESSION_READ_LIMIT = 50
 _SESSION_LIST_LIMIT = 100
 _TEXT_BOUND = 2000
@@ -144,17 +152,35 @@ class CrushServerClient:
         *,
         executable: str = "crush",
         process_environment: Mapping[str, str] | None = None,
+        config_path: str | os.PathLike[str] | None = None,
         host: str = "127.0.0.1",
         port: int = 0,
         readiness_timeout_seconds: float = 15.0,
     ) -> None:
         self._executable = executable
+        self._config_dir: tempfile.TemporaryDirectory[str] | None = None
         if process_environment is not None:
+            # The caller owns the whole environment, staging included.
             self._env = dict(process_environment)
         else:
             self._env = {
                 k: v for k, v in os.environ.items() if k not in _INHERITED_ENV_BLOCKLIST
             }
+            # The crush server learns the fleet providers and the read-only
+            # permission set only from CRUSH_GLOBAL_CONFIG. Without it crush
+            # falls back to /etc/crush and the user data dir, which on a fresh
+            # node hold nothing: measured on dungae (2026-08-04) an
+            # unconfigured server died with "No providers configured" (#938).
+            # Stage the same crushrc the headless runner uses.
+            if "CRUSH_GLOBAL_CONFIG" not in self._env:
+                source = Path(config_path) if config_path else _default_crush_config()
+                if source.is_file():
+                    # mode 700 — the config expands key files at load time.
+                    self._config_dir = tempfile.TemporaryDirectory(
+                        prefix="ccc-crush-cfg."
+                    )
+                    shutil.copyfile(source, Path(self._config_dir.name) / "crushrc")
+                    self._env["CRUSH_GLOBAL_CONFIG"] = self._config_dir.name
         self._host = host
         self._port = port
         self._readiness_timeout = readiness_timeout_seconds
@@ -203,6 +229,11 @@ class CrushServerClient:
                 await asyncio.to_thread(proc.wait, 10)
             except subprocess.TimeoutExpired:
                 proc.kill()
+        # Remove the staged config only after the server is gone, and never
+        # let cleanup failure mask a shutdown error.
+        cfg, self._config_dir = self._config_dir, None
+        if cfg is not None:
+            cfg.cleanup()
 
     # -- HTTP helpers ------------------------------------------------------
 
@@ -483,13 +514,16 @@ class CrushRuntime:
         client_factory: ClientFactory | None = None,
         executable: str = "crush",
         process_environment: Mapping[str, str] | None = None,
+        config_path: str | os.PathLike[str] | None = None,
     ) -> None:
         if client_factory is not None:
             self._client_factory = client_factory
         else:
             def default_factory() -> CrushClient:
                 return CrushServerClient(
-                    executable=executable, process_environment=process_environment,
+                    executable=executable,
+                    process_environment=process_environment,
+                    config_path=config_path,
                 )
 
             self._client_factory = default_factory

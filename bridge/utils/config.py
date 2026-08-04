@@ -192,6 +192,17 @@ class Config(
         alias="CCC_CRUSH_CLI_PATH",
         description="crush executable used to spawn the crush server (#926).",
     )
+    crush_config_path: Optional[str] = Field(
+        default=None,
+        alias="CCC_CRUSH_CONFIG",
+        description=(
+            "Fleet-managed crushrc staged into the crush server's config "
+            "directory (#938). Defaults to crush/crushrc.readonly in this "
+            "repo. Without it the crush server starts with no providers at "
+            "all — CRUSH_GLOBAL_CONFIG is the only path that carries the "
+            "provider definitions and the read-only permission set."
+        ),
+    )
     crush_model: Optional[str] = Field(
         default=None,
         alias="CCC_CRUSH_MODEL",
