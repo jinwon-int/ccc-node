@@ -74,28 +74,28 @@ _SESSION_READ_LIMIT = 50
 _SESSION_LIST_LIMIT = 100
 _TEXT_BOUND = 2000
 
-# Finish reasons that mean "the turn ended normally" (proto Finish.Reason).
+# Finish reasons (proto Finish.Reason). crush normalizes across provider
+# families but passes each family's own spelling through, so one concept
+# arrives under two names: OpenAI says `tool_calls` / `length`, Anthropic says
+# `tool_use` / `max_tokens`.
 #
-# crush normalizes across provider families but passes the family's own
-# spelling through, so each concept arrives under two names: OpenAI says
-# `tool_calls` / `length`, Anthropic says `tool_use` / `max_tokens`. The set
-# was built from reasons *observed* during the kimi pilot and carried only the
-# OpenAI spellings, so an Anthropic-shaped finish fell to the else branch and
-# was reported as a failed turn.
+# A tool-call finish ends the *assistant message*, not the turn: crush runs
+# the tool and the model keeps going. Measured on dungae (2026-08-04) with
+# GLM-5.2 asked to read a file:
 #
-# Measured on dungae (2026-08-04): a GLM-5.2 turn that called a tool finished
-# with reason `tool_use` and the user got "❌ Processing failed: tool_use"
-# even though nothing had gone wrong. A tool-call finish is already treated as
-# a normal completion here (`tool_calls`); the two spellings must agree.
-_FINISH_OK = {
-    "end_turn",
-    "stop",
-    "stop_sequence",
-    "length",
-    "max_tokens",
-    "tool_calls",
-    "tool_use",
-}
+#   finish reasons in order: ['tool_use', 'end_turn']
+#
+# Treating the first one as the end of the turn closes the stream before the
+# answer exists — the turn returned empty. Treating it as a failure (the
+# original behaviour, since only the OpenAI spelling was listed) surfaced
+# "❌ Processing failed: tool_use". Neither is right: wait for the real
+# terminal reason.
+#
+# `tool_calls` is the same signal under OpenAI naming. The kimi pilot only
+# ever produced the Anthropic spelling, so its presence in the terminal set
+# was never exercised — it would have truncated turns the same way.
+_FINISH_CONTINUE = {"tool_calls", "tool_use"}
+_FINISH_OK = {"end_turn", "stop", "stop_sequence", "length", "max_tokens"}
 _FINISH_CANCELED = {"canceled", "cancelled"}
 
 
@@ -821,6 +821,11 @@ class CrushRuntime:
 
     def _complete_turn(self, active: _ActiveTurn, data: Mapping[str, Any]) -> None:
         reason = str(data.get("reason") or "")
+        if reason in _FINISH_CONTINUE:
+            # The assistant message ended so crush can run the tool; the turn
+            # is still open. Emitting nothing here keeps the stream alive for
+            # the follow-up message and its real terminal finish.
+            return
         if reason in _FINISH_CANCELED:
             active.queue.put_nowait(ErrorEvent(
                 code="interrupted", message="turn interrupted", retryable=False,
