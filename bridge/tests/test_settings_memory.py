@@ -27,6 +27,12 @@ MEMORY_FIELDS = {
     "codex_distill_checkpoint_age_seconds": "CCC_CODEX_DISTILL_CHECKPOINT_AGE_SECONDS",
     "codex_distill_model": "CCC_CODEX_DISTILL_MODEL",
     "codex_distill_timeout_seconds": "CCC_CODEX_DISTILL_TIMEOUT_SEC",
+    "memory_distill_provider": "CCC_MEMORY_DISTILL_PROVIDER",
+    "memory_distill_model": "CCC_MEMORY_DISTILL_MODEL",
+    "memory_distill_timeout_seconds": "CCC_MEMORY_DISTILL_TIMEOUT_SEC",
+    "memory_distill_checkpoint_turns": "CCC_MEMORY_DISTILL_CHECKPOINT_TURNS",
+    "memory_distill_checkpoint_bytes": "CCC_MEMORY_DISTILL_CHECKPOINT_BYTES",
+    "memory_distill_checkpoint_age_seconds": "CCC_MEMORY_DISTILL_CHECKPOINT_AGE_SECONDS",
     "codex_skill_collector_enabled": "CCC_CODEX_SKILL_COLLECTOR",
     "codex_skill_collector_max_jobs_per_sweep": "CCC_CODEX_SKILL_COLLECTOR_MAX_JOBS_PER_SWEEP",
     "codex_skill_pending_dir": "CCC_SKILL_REVIEW_PENDING_DIR",
@@ -86,6 +92,49 @@ def test_codex_distill_provider_cost_settings_are_explicit_and_bounded() -> None
                 telegram_bot_token="123456:abc",
                 _env_file=None,
                 CCC_CODEX_DISTILL_TIMEOUT_SEC=timeout,
+            )
+
+
+def test_provider_neutral_distill_defaults_follow_main_runtime_and_are_bounded() -> None:
+    assert Config.model_fields["memory_distill_provider"].default == "auto"
+    assert Config.model_fields["memory_distill_model"].default == "provider-default"
+    assert Config.model_fields["memory_distill_timeout_seconds"].default == 120.0
+    assert Config.model_fields["memory_distill_checkpoint_turns"].default == 0
+    assert Config.model_fields["memory_distill_checkpoint_bytes"].default == 0
+    assert Config.model_fields["memory_distill_checkpoint_age_seconds"].default == 0
+
+    configured = Config(
+        telegram_bot_token="123456:abc",
+        _env_file=None,
+        CCC_MEMORY_DISTILL_PROVIDER="piri",
+        CCC_MEMORY_DISTILL_MODEL="kimi-coding/k3",
+        CCC_MEMORY_DISTILL_TIMEOUT_SEC=75,
+        CCC_MEMORY_DISTILL_CHECKPOINT_TURNS=10,
+    )
+    assert configured.memory_distill_provider == "piri"
+    assert configured.memory_distill_model == "kimi-coding/k3"
+    assert configured.memory_distill_timeout_seconds == 75.0
+    assert configured.memory_distill_checkpoint_turns == 10
+
+    with pytest.raises(ValidationError, match="CCC_MEMORY_DISTILL_PROVIDER"):
+        Config(
+            telegram_bot_token="123456:abc",
+            _env_file=None,
+            CCC_MEMORY_DISTILL_PROVIDER="crush",
+        )
+    with pytest.raises(ValidationError, match="Codex-safe"):
+        Config(
+            telegram_bot_token="123456:abc",
+            _env_file=None,
+            CCC_AGENT_PROVIDER="codex",
+            CCC_MEMORY_DISTILL_MODEL="kimi-coding/k3",
+        )
+    for timeout in (0, 601):
+        with pytest.raises(ValidationError, match="CCC_MEMORY_DISTILL_TIMEOUT_SEC"):
+            Config(
+                telegram_bot_token="123456:abc",
+                _env_file=None,
+                CCC_MEMORY_DISTILL_TIMEOUT_SEC=timeout,
             )
 
 

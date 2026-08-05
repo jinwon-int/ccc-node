@@ -41,6 +41,7 @@ def _settings(tmp_path: Path, **overrides) -> SimpleNamespace:
         claude_cli_path=None,
         telegram_session_scope="per-user-chat",
         bridge_memory_mode="off",
+        memory_distill_provider="auto",
         bridge_unsafe_shared_all_memory=False,
         bot_data_dir=tmp_path / ".telegram_bot",
         bridge_memory_audience_root=None,
@@ -80,6 +81,14 @@ def test_bare_runtime_keeps_request_only_options(tmp_path: Path) -> None:
     assert options.setting_sources is None
     assert options.settings is None
     assert options.sandbox is None
+
+
+def test_distill_off_does_not_suppress_legacy_claude_hooks(tmp_path: Path) -> None:
+    runtime = ClaudeRuntime(
+        settings=_settings(tmp_path, memory_distill_provider="off")
+    )
+    options = _build(runtime, tmp_path)
+    assert not options.env or "CCC_BRIDGE_DISTILL_MANAGED" not in options.env
 
 
 def test_strict_project_applies_permission_bundle_and_sandbox(tmp_path: Path) -> None:
@@ -250,7 +259,10 @@ def test_curated_web_mcp_replaces_native_web_tools(tmp_path: Path) -> None:
     assert "WebFetch" not in options.allowed_tools
     assert "WebSearch" in options.disallowed_tools
     assert set(options.mcp_servers) == {"searxng", "firecrawl"}
-    assert options.env == {"FIRECRAWL_API_KEY": "fc-test-secret"}
+    assert options.env == {
+        "FIRECRAWL_API_KEY": "fc-test-secret",
+        "CCC_BRIDGE_DISTILL_MANAGED": "1",
+    }
     assert "Curated web routing" in options.system_prompt
 
 

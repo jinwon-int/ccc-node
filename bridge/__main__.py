@@ -97,11 +97,14 @@ def _build_piri_runtime(settings: Settings) -> Any:
     )
 
 
-def _build_distill_environment(settings: Settings) -> dict[str, str] | None:
+def _build_distill_environment(
+    settings: Settings,
+    provider: str,
+) -> dict[str, str] | None:
     """Return the private Codex extraction environment when one is required."""
 
     if not (
-        settings.agent_provider == "codex"
+        provider == "codex"
         and settings.bridge_memory_mode == "audience-scoped"
     ):
         return None
@@ -243,7 +246,11 @@ def build_context(
     # Production distill extraction composition (#465 scheduling consumes
     # this): the worker is built only through the handler factory so its
     # autonomous spend is always gated by the shared usage meter (#388).
-    from telegram_bot.memory.codex_exec_backend import CodexExecDistillBackend
+    from telegram_bot.memory.distill_backend_factory import (
+        build_distill_backend,
+        resolve_distill_model_timeout,
+        resolve_distill_provider,
+    )
 
     audience_scoped = settings.bridge_memory_mode == "audience-scoped"
     wiki_enabled = (
@@ -253,21 +260,34 @@ def build_context(
     honcho_enabled = (
         settings.honcho_memory_enabled
     )
-    distill_environment = _build_distill_environment(settings)
-    distill_extraction_worker = project_chat.build_distill_extraction_worker(
-        distill_journal,
-        CodexExecDistillBackend(
-            wiki_enabled=wiki_enabled,
-            environment=distill_environment,
-            model=settings.codex_distill_model,
-            timeout_seconds=settings.codex_distill_timeout_seconds,
-        ),
-        wiki_enabled=wiki_enabled,
-        honcho_enabled=honcho_enabled,
-        model=settings.codex_distill_model,
+    distill_provider = resolve_distill_provider(
+        settings.agent_provider,
+        settings.memory_distill_provider,
     )
+    distill_extraction_worker = None
+    if distill_provider is not None:
+        distill_environment = _build_distill_environment(settings, distill_provider)
+        distill_model, _distill_timeout = resolve_distill_model_timeout(
+            settings, distill_provider
+        )
+        distill_extraction_worker = project_chat.build_distill_extraction_worker(
+            distill_journal,
+            build_distill_backend(
+                settings,
+                provider=distill_provider,
+                wiki_enabled=wiki_enabled,
+                codex_environment=distill_environment,
+            ),
+            wiki_enabled=wiki_enabled,
+            honcho_enabled=honcho_enabled,
+            extractor_provider=distill_provider,
+            model=distill_model,
+        )
     distill_snapshot_worker = None
-    if settings.agent_provider in {"codex", "piri"}:
+    if (
+        distill_provider is not None
+        and settings.agent_provider in {"claude", "codex", "piri"}
+    ):
         from telegram_bot.memory.codex_snapshot import CodexThreadSnapshotter
 
         distill_snapshot_worker = CodexThreadSnapshotter(
@@ -296,7 +316,11 @@ def build_context(
             shared_memory_audience(settings).root,
         )
     distill_wiki_sink_worker = None
-    if settings.agent_provider in {"codex", "piri"} and wiki_enabled:
+    if (
+        distill_provider is not None
+        and settings.agent_provider in {"claude", "codex", "piri"}
+        and wiki_enabled
+    ):
         from telegram_bot.memory.distill_wiki_worker import (
             CodexDistillWikiSinkWorker,
         )
@@ -307,7 +331,11 @@ def build_context(
             require_memory_route=audience_scoped,
         )
     distill_honcho_sink_worker = None
-    if settings.agent_provider in {"codex", "piri"} and honcho_enabled:
+    if (
+        distill_provider is not None
+        and settings.agent_provider in {"claude", "codex", "piri"}
+        and honcho_enabled
+    ):
         from telegram_bot.memory.distill_honcho_worker import (
             CodexDistillHonchoSinkWorker,
             HonchoHttpSender,

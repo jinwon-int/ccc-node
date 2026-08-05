@@ -1,4 +1,4 @@
-"""Strict provider-neutral input/output boundary for Codex memory extraction.
+"""Strict provider-neutral input/output boundary for memory extraction.
 
 This module is deliberately side-effect free. It normalizes and redacts an already
 bounded Codex transcript snapshot, validates future provider output, and exposes a
@@ -124,7 +124,7 @@ class ExtractionMessage(_StrictModel):
 
 class DistillExtractionInput(_StrictModel):
     schema_version: Literal[1]
-    provider: Literal["codex", "piri"]
+    provider: Literal["claude", "codex", "piri"]
     content_trust: Literal["untrusted"]
     source_thread_hash: str = Field(pattern=_SHA256_RE.pattern)
     trigger: DistillTrigger
@@ -163,7 +163,7 @@ class DistillExtractionInput(_StrictModel):
 
 
 class DistillProvenance(_StrictModel):
-    provider: Literal["codex", "piri"]
+    provider: Literal["claude", "codex", "piri"]
     source_thread_hash: str = Field(pattern=_SHA256_RE.pattern)
     trigger: DistillTrigger
     distilled_at: str = Field(json_schema_extra={"format": "date-time"})
@@ -340,7 +340,7 @@ def build_extraction_input(
     snapshot: CodexTranscriptSnapshot,
     *,
     trigger: DistillTrigger,
-    provider: Literal["codex", "piri"] = "codex",
+    provider: Literal["claude", "codex", "piri"] = "codex",
 ) -> DistillExtractionInput:
     """Normalize a bounded snapshot and redact credentials before provider use."""
     if not isinstance(snapshot, CodexTranscriptSnapshot):

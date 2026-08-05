@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from unittest.mock import patch
 import sys
 import unittest
 
@@ -55,6 +56,30 @@ class BridgeStatusVerdictTest(unittest.TestCase):
         self.assertEqual(doctor.readiness, "ready")
         self.assertEqual(doctor.rows[-1].item, "Piri runtime")
         self.assertEqual(doctor.rows[-1].klass, "정상")
+
+    def test_distill_auto_follows_live_piri_runtime(self) -> None:
+        doctor = Doctor(Path.cwd(), Path.cwd() / ".claude", "settings")
+        doctor.provider = "piri"
+        doctor._bridge_provider_state = ("piri", "healthy")
+        with patch.dict("os.environ", {"CCC_MEMORY_DISTILL_PROVIDER": "auto"}), patch(
+            "ccc_doctor.shutil.which", return_value="/bin/true"
+        ):
+            doctor.check_distill_readiness()
+
+        self.assertEqual(doctor.distill_readiness, "ready")
+        self.assertIn("effective=piri", doctor.rows[-1].status)
+
+    def test_cross_runtime_override_requires_separate_live_auth_proof(self) -> None:
+        doctor = Doctor(Path.cwd(), Path.cwd() / ".claude", "settings")
+        doctor.provider = "claude"
+        doctor._bridge_provider_state = ("claude", "healthy")
+        with patch.dict(
+            "os.environ", {"CCC_MEMORY_DISTILL_PROVIDER": "piri"}
+        ), patch("ccc_doctor.shutil.which", return_value="/bin/true"):
+            doctor.check_distill_readiness()
+
+        self.assertEqual(doctor.distill_readiness, "static-ready")
+        self.assertIn("live auth unproven", doctor.rows[-1].status)
 
 
 if __name__ == "__main__":

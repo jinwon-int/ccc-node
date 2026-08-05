@@ -297,7 +297,7 @@ a provider turn or reads transcript/credential files.
 | `CCC_BRIDGE_RESTART_DELAY_SECONDS` | No | `5` | Delay (5–30s) before the external worker restarts the bridge |
 | `CCC_BRIDGE_EXECUTION_PROFILE` | No | `strict-project` | Execution boundary: `strict-project`, `owner-operator`, or `disabled` |
 | `CCC_BRIDGE_BASH_POLICY` | No | `auto-approve` | Bash approval UX; Codex default is unrestricted `never + dangerFullAccess` |
-| `CCC_AGENT_PROVIDER` | No | `claude` | Agent provider: `claude` or `codex` |
+| `CCC_AGENT_PROVIDER` | No | `claude` | Main runtime provider: `claude`, `codex`, `piri`, or `crush` |
 | `CCC_CODEX_CLI_PATH` | Codex only | `~/.claude/hooks/ccc-codex` | Installed memory-bootstrap launcher used for direct/app-server runs |
 | `CCC_CODEX_REAL_CLI_PATH` | Codex only | `codex` | Underlying Codex binary invoked by the launcher |
 | `CCC_CODEX_MEMORY_MATERIALIZER_PATH` | Codex only | `~/.claude/hooks/ccc_codex_memory.py` | Body-free materialize/status command run at thread boundaries |
@@ -305,6 +305,12 @@ a provider turn or reads transcript/credential files.
 | `CCC_CODEX_DISTILL_CHECKPOINT_TURNS` | Codex only | `0` | Completed-turn checkpoint gate; 0 disables |
 | `CCC_CODEX_DISTILL_CHECKPOINT_BYTES` | Codex only | `0` | UTF-8 user + assistant byte checkpoint gate; 0 disables |
 | `CCC_CODEX_DISTILL_CHECKPOINT_AGE_SECONDS` | Codex only | `0` | Runtime-age checkpoint gate, evaluated after a completed turn; 0 disables |
+| `CCC_MEMORY_DISTILL_PROVIDER` | Claude/Codex/Piri | `auto` | Extractor backend: `auto` follows `CCC_AGENT_PROVIDER`; explicit `claude`/`codex`/`piri` overrides; `off` disables shared distill workers |
+| `CCC_MEMORY_DISTILL_MODEL` | Claude/Codex/Piri | `provider-default` | Isolated extractor model; provider-default follows the selected runtime configuration and accepts provider-qualified Piri model IDs |
+| `CCC_MEMORY_DISTILL_TIMEOUT_SEC` | Claude/Codex/Piri | `120` | Per-attempt provider-neutral extraction timeout, bounded to 1–600 seconds |
+| `CCC_MEMORY_DISTILL_CHECKPOINT_TURNS` | Claude/Codex/Piri | `0` | Completed-turn checkpoint gate for the shared journal; 0 disables |
+| `CCC_MEMORY_DISTILL_CHECKPOINT_BYTES` | Claude/Codex/Piri | `0` | UTF-8 checkpoint byte gate for the shared journal; 0 disables |
+| `CCC_MEMORY_DISTILL_CHECKPOINT_AGE_SECONDS` | Claude/Codex/Piri | `0` | Runtime-age checkpoint gate for the shared journal; 0 disables |
 | `CCC_CODEX_DISTILL_MODEL` | Codex only | `provider-default` | Isolated write-back extractor model; a safe non-default ID is passed explicitly with `--model` |
 | `CCC_CODEX_DISTILL_TIMEOUT_SEC` | Codex only | `120` | Per-attempt extraction timeout, bounded to 1–600 seconds |
 | `CCC_CODEX_AUDIENCE_AUTH_MODE` | Scoped Codex only | `disabled` | Set to `keyring` only after Codex credentials are provisioned in the OS keyring; file credentials are never copied |

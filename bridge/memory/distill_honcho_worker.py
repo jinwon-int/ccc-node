@@ -146,7 +146,7 @@ class HonchoHttpSender:
         ):
             raise HonchoDeliveryError("honcho_record_invalid", terminal=True)
         source_provider = provenance.get("provider")
-        if source_provider not in {"codex", "piri"}:
+        if source_provider not in {"claude", "codex", "piri"}:
             raise HonchoDeliveryError("honcho_record_invalid", terminal=True)
         source = f"{source_provider}-distill"
         try:

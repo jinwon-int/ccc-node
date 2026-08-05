@@ -171,6 +171,50 @@ class MemorySettingsMixin:
         alias="CCC_CODEX_DISTILL_TIMEOUT_SEC",
         description="Bounded timeout for one isolated Codex distill provider call.",
     )
+    memory_distill_provider: Literal["auto", "off", "claude", "codex", "piri"] = Field(
+        default="auto",
+        alias="CCC_MEMORY_DISTILL_PROVIDER",
+        description=(
+            "Extractor backend. auto follows the main Claude/Codex/Piri runtime; "
+            "off disables the provider-neutral distill workers."
+        ),
+    )
+    memory_distill_model: str = Field(
+        default="provider-default",
+        alias="CCC_MEMORY_DISTILL_MODEL",
+        description=(
+            "Provider-neutral extractor model. provider-default lets the selected "
+            "runtime use its configured default model."
+        ),
+    )
+    memory_distill_timeout_seconds: float = Field(
+        default=120.0,
+        ge=1.0,
+        le=600.0,
+        alias="CCC_MEMORY_DISTILL_TIMEOUT_SEC",
+        description="Bounded timeout for one isolated provider-neutral distill call.",
+    )
+    memory_distill_checkpoint_turns: int = Field(
+        default=0,
+        ge=0,
+        le=1_000,
+        alias="CCC_MEMORY_DISTILL_CHECKPOINT_TURNS",
+        description="Provider-neutral completed-turn checkpoint gate; 0 disables.",
+    )
+    memory_distill_checkpoint_bytes: int = Field(
+        default=0,
+        ge=0,
+        le=16 * 1024 * 1024,
+        alias="CCC_MEMORY_DISTILL_CHECKPOINT_BYTES",
+        description="Provider-neutral UTF-8 checkpoint byte gate; 0 disables.",
+    )
+    memory_distill_checkpoint_age_seconds: int = Field(
+        default=0,
+        ge=0,
+        le=7 * 24 * 60 * 60,
+        alias="CCC_MEMORY_DISTILL_CHECKPOINT_AGE_SECONDS",
+        description="Provider-neutral checkpoint age gate; 0 disables.",
+    )
 
     def hook_policy_environment(self) -> dict[str, str]:
         """Return validated, non-secret policy fields inherited by Claude hooks."""
@@ -226,6 +270,16 @@ class MemorySettingsMixin:
             raise ValueError("CCC_CODEX_DISTILL_MODEL must be a safe model identifier")
         return value
 
+    @field_validator("memory_distill_model", mode="before")
+    @classmethod
+    def validate_memory_distill_model(cls, v):
+        if not isinstance(v, str):
+            raise ValueError("CCC_MEMORY_DISTILL_MODEL must be a safe model identifier")
+        value = v.strip()
+        if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,127}", value) is None:
+            raise ValueError("CCC_MEMORY_DISTILL_MODEL must be a safe model identifier")
+        return value
+
     @model_validator(mode="after")
     def validate_bridge_memory_scope(self):
         assert_memory_scope_safe(
@@ -238,4 +292,27 @@ class MemorySettingsMixin:
             self.agent_provider,
             self.codex_audience_auth_mode,
         )
+        distill_provider = (
+            self.agent_provider
+            if self.memory_distill_provider == "auto"
+            else self.memory_distill_provider
+        )
+        if distill_provider != "off":
+            assert_memory_provider_safe(
+                self.bridge_memory_mode,
+                distill_provider,
+                self.codex_audience_auth_mode,
+            )
+        if (
+            distill_provider == "codex"
+            and re.fullmatch(
+                r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}",
+                self.memory_distill_model,
+            )
+            is None
+        ):
+            raise ValueError(
+                "CCC_MEMORY_DISTILL_MODEL must be a Codex-safe model identifier "
+                "when the effective extractor is codex"
+            )
         return self
