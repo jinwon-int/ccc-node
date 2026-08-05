@@ -16,7 +16,7 @@ cat > "$mat" <<'SH'
 case "${1:-}" in
   materialize)
     printf 'materialize\n' >> "${ORDER_FILE:?}"
-    printf 'CODEX_HOME=%s\nPROVIDER=%s\n' "${CODEX_HOME:-}" "${CCC_MEMORY_MATERIALIZER_PROVIDER:-}" >> "${ENV_FILE:?}"
+    printf 'CODEX_HOME=%s\nPROVIDER=%s\nMAX_BYTES=%s\n' "${CODEX_HOME:-}" "${CCC_MEMORY_MATERIALIZER_PROVIDER:-}" "${CCC_CODEX_MEMORY_MAX_BYTES:-}" >> "${ENV_FILE:?}"
     printf 'MATERIALIZER_BODY_SENTINEL\n'
     printf 'MATERIALIZER_ERROR_SENTINEL\n' >&2
     exit "${MAT_RC:-0}"
@@ -59,6 +59,16 @@ raise SystemExit(0 if json.load(open(sys.argv[1])) == ["--mode", "rpc", "--appro
 PY'
 ok "launcher points the materializer at the Piri agent dir with the piri provider" \
   'grep -Fx "CODEX_HOME='"$piri_home"'" "$env_file" >/dev/null && grep -Fx "PROVIDER=piri" "$env_file" >/dev/null'
+ok "launcher defaults the snapshot cap to 16KiB so the nunchi block is not starved" \
+  'grep -Fx "MAX_BYTES=16384" "$env_file" >/dev/null'
+
+: > "$order"; : > "$env_file"; rm -f "$argv"
+set +e
+out="$(cd "$work" && printf '' | ORDER_FILE="$order" ARGV_FILE="$argv" CWD_FILE="$cwd_file" ENV_FILE="$env_file" MAT_RC=0 STATUS_RC=1 REAL_RC=0 CCC_CODEX_MEMORY_MAX_BYTES=24576 CCC_PIRI_MEMORY_HOME="$piri_home" CCC_PIRI_MEMORY_MATERIALIZER_PATH="$mat" CCC_PIRI_REAL_CLI_PATH="$real" "$LAUNCHER" 2>"$err")"
+rc=$?
+set -e
+ok "an explicit CCC_CODEX_MEMORY_MAX_BYTES always wins over the launcher default" \
+  '[ "$rc" = 0 ] && grep -Fx "MAX_BYTES=24576" "$env_file" >/dev/null && ! grep -q "MAX_BYTES=16384" "$env_file"'
 
 : > "$order"; rm -f "$argv"
 set +e

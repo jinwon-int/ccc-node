@@ -28,7 +28,12 @@ if [ "$skip" != "1" ]; then
     printf "%s\n" "ccc-piri: memory bootstrap unavailable" >&2
     exit 78
   fi
+  # Piri nodes inject the nunchi-primary snapshot through this path only, and
+  # the canonical loader output alone exceeds the 8192 default on fleet nodes,
+  # which silently truncated the nunchi block. Default to 16KiB (hard max
+  # 24576); an explicit CCC_CODEX_MEMORY_MAX_BYTES always wins.
   if ! env CODEX_HOME="$memory_home" CCC_MEMORY_MATERIALIZER_PROVIDER="${CCC_MEMORY_MATERIALIZER_PROVIDER:-piri}" \
+      CCC_CODEX_MEMORY_MAX_BYTES="${CCC_CODEX_MEMORY_MAX_BYTES:-16384}" \
       "$materializer" materialize --json >/dev/null 2>&1; then
     # A refresh failure may proceed only when a previously materialized block
     # is still structurally valid and private. status is read-only/body-free.
