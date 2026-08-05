@@ -115,6 +115,11 @@ All notable changes to the Claude Code node harness. Dates are KST.
   composition is unchanged. (#749)
 
 ### Fixed
+- `ccc_memory_probe` rejected a valid Piri MemPalace refresh status as
+  `refresh-invalid` (and flagged `refresh-provider`): the refresh probe and the
+  Termux install-metadata validator only accepted `provider` in `{claude,
+  codex}`. Both now accept `piri`, so a Piri node with nunchi+MemPalace enabled
+  reports a clean `memory cache` instead of a perpetual 경고. Follow-up to #946.
 - `test_codex_keeps_typing_alive_and_shows_tool_heartbeat` no longer races on
   the heartbeat status. It waited only for the first `status_callback` then
   immediately asserted that the heartbeat "⏳ Working … Command: pwd" status had

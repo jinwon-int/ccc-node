@@ -274,6 +274,7 @@ with tempfile.TemporaryDirectory() as root:
     for record in (
         valid,
         {**valid, "state": "running", "finished_at": 0, "exit_code": -1},
+        {**valid, "provider": "piri"},
         {**valid, "state": "error", "exit_code": 124},
         {**valid, "started_at": 500, "finished_at": 500},
     ):

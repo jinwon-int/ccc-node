@@ -105,7 +105,7 @@ def _termux_metadata_state(metadata: Path) -> tuple[str, str | None]:
         doc.get("enabled") is not True
         or doc.get("version") != "3.6.0"
         or doc.get("state") != "ready"
-        or doc.get("provider") not in {"codex", "claude"}
+        or doc.get("provider") not in {"codex", "claude", "piri"}
         or type(doc.get("updated_at")) is not int
         or int(doc["updated_at"]) <= 0
         or not isinstance(container, str)
@@ -348,7 +348,7 @@ def mempalace_refresh_probe(path: Path, now: int) -> dict[str, object]:
     # bool is a subclass of int in Python; readiness accepts exact integers only.
     if (
         state not in {"running", "ok", "error"}
-        or provider not in {"claude", "codex"}
+        or provider not in {"claude", "codex", "piri"}
         or type(exit_code) is not int
         or type(started) is not int
         or type(finished) is not int
