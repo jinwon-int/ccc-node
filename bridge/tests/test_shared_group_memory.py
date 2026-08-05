@@ -212,6 +212,32 @@ def test_audience_codex_environment_is_opaque_and_physically_separate(
     assert "-100456" not in serialized
 
 
+def test_audience_piri_environment_is_opaque_and_physically_separate(
+    tmp_path: Path,
+) -> None:
+    settings = _audience_settings(tmp_path)
+    private = resolve_memory_audience(settings, user_id=934719283, chat_id=934719283)
+    public = resolve_memory_audience(settings, user_id=934719283, chat_id=-100456)
+    assert private is not None and public is not None
+
+    private_env = private.piri_environment(settings)
+    public_env = public.piri_environment(settings)
+
+    assert private_env["PIRI_CODING_AGENT_SESSION_DIR"] == str(
+        private.scope_root / "piri" / "sessions"
+    )
+    assert private_env["CCC_PIRI_BOOTSTRAP_CONTEXT_FILE"].endswith(
+        "/piri/bootstrap/AGENTS.md"
+    )
+    assert (
+        private_env["PIRI_CODING_AGENT_SESSION_DIR"]
+        != public_env["PIRI_CODING_AGENT_SESSION_DIR"]
+    )
+    serialized = json.dumps((private_env, public_env), sort_keys=True)
+    assert "934719283" not in serialized
+    assert "-100456" not in serialized
+
+
 def test_bridge_memory_rejects_shared_all_without_unsafe_legacy_override(
     tmp_path: Path,
 ) -> None:

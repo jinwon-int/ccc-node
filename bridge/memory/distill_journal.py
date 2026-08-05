@@ -23,6 +23,7 @@ from .distill_types import (
     DistillLocalSinkStatus,
     DistillTrigger,
     DistillWikiSinkStatus,
+    DISTILL_PROVIDERS,
     validate_memory_route,
 )
 from .distill_extraction import (
@@ -146,8 +147,8 @@ class DistillJournal(JsonJournalCore):
         memory_scope: str | None = None,
         now: datetime | None = None,
     ) -> DistillJob:
-        if provider != "codex":
-            raise ValueError("distill journal accepts Codex jobs only")
+        if provider not in DISTILL_PROVIDERS:
+            raise ValueError("distill journal provider is unsupported")
         if not isinstance(thread_id, str) or not thread_id:
             raise ValueError("thread_id must not be empty")
         if not discriminator:

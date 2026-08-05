@@ -84,6 +84,11 @@ class PiriRpcProcessClient:
                 raise self._connection_error
             if self._process is not None:
                 return
+            process_options: dict[str, Any] = {}
+            if os.name == "posix":
+                # Piri session JSONL and extension state must stay owner-only
+                # even when the bridge service inherited a permissive umask.
+                process_options["umask"] = 0o077
             process = await asyncio.create_subprocess_exec(
                 *self._command,
                 cwd=self._working_directory,
@@ -93,6 +98,7 @@ class PiriRpcProcessClient:
                 stderr=asyncio.subprocess.PIPE,
                 start_new_session=True,
                 limit=STDOUT_BUFFER_LIMIT,
+                **process_options,
             )
             if process.stdin is None or process.stdout is None or process.stderr is None:
                 process.kill()

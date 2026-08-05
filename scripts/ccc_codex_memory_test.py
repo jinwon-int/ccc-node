@@ -592,6 +592,29 @@ class CodexMemoryMaterializerTest(unittest.TestCase):
                 {**shared, "CCC_MEMORY_SCOPE": "../private-leak"}
             )
         )
+        piri_scope = "private-" + "b" * 32
+        piri_root = self.root / "piri-audiences"
+        piri_home = piri_root / piri_scope / "piri"
+        piri = {
+            "CCC_MEMORY_AUDIENCE_SCOPED": "1",
+            "CCC_MEMORY_AUDIENCE": "private",
+            "CCC_MEMORY_AUDIENCE_ROOT": str(piri_root),
+            "CCC_MEMORY_SCOPE": piri_scope,
+            "CCC_MEMORY_MATERIALIZER_PROVIDER": "piri",
+            "CCC_PIRI_BOOTSTRAP_HOME": str(piri_home / "bootstrap"),
+            "PIRI_CODING_AGENT_SESSION_DIR": str(piri_home / "sessions"),
+            "CCC_PIRI_BOOTSTRAP_CONTEXT_FILE": str(
+                piri_home / "bootstrap" / "AGENTS.md"
+            ),
+            "CODEX_HOME": str(piri_home / "bootstrap"),
+            "CODEX_SQLITE_HOME": str(piri_home / "bootstrap"),
+        }
+        self.assertFalse(self.module._audience_scoped_blocked(piri))
+        self.assertTrue(
+            self.module._audience_scoped_blocked(
+                {**piri, "PIRI_CODING_AGENT_SESSION_DIR": str(self.root / "leak")}
+            )
+        )
 
     def test_loader_and_errors_are_bounded_body_free_codes(self) -> None:
         with self.assertRaises(self.module.MaterializeError) as caught:

@@ -12,8 +12,9 @@
 #   install-nunchi.sh                      # status
 #
 # Claude retains the standalone SessionStart hook and reuses the Session
-# Distiller output (zero LLM cost). Codex and Piri have no distill feed, so
-# their lanes run a per-new-session extractor (codex exec / Piri print mode).
+# Distiller output (zero LLM cost). Codex and Piri keep supplementary nunchi
+# per-new-session extractors (codex exec / Piri print mode); the main bridge
+# distill journal separately owns replay-safe memory sinks.
 # Provider changes remove the other path so one runtime never injects the same
 # node-global snapshot twice.
 set -euo pipefail

@@ -696,6 +696,10 @@ class ProjectChatProcessMixin:
                                 memory_environment = audience.claude_environment(
                                     self._config
                                 )
+                            elif provider == "piri":
+                                memory_environment = audience.piri_environment(
+                                    self._config
+                                )
                         session = await runtime.start_or_resume(
                             SessionRequest(
                                 working_directory=str(self.project_root),

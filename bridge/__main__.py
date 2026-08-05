@@ -2,7 +2,7 @@ import argparse
 import logging
 import os
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -49,6 +49,72 @@ class AppContext:
     sdk_factory: Any
     telegram_port: Any
     clock: Any
+
+
+def _build_piri_runtime(settings: Settings) -> Any:
+    """Compose the Piri adapter and its fail-closed audience memory route."""
+
+    from telegram_bot.core.memory_audience import (
+        MemoryAudience,
+        audience_from_piri_environment,
+        shared_memory_audience,
+    )
+    from telegram_bot.core.piri_runtime import PiriRuntime
+    from telegram_bot.memory.distill_types import validate_memory_route
+
+    route_environment_factory: (
+        Callable[[str, str], Mapping[str, str]] | None
+    ) = None
+    memory_environment_validator: (
+        Callable[[Mapping[str, str]], object] | None
+    ) = None
+    if settings.bridge_memory_mode == "audience-scoped":
+        shared = shared_memory_audience(settings)
+
+        def build_piri_route_environment(audience: str, scope: str):
+            validate_memory_route(audience, scope)
+            return MemoryAudience(audience, scope, shared.root).piri_environment(
+                settings
+            )
+
+        def validate_piri_memory_environment(environment: Mapping[str, str]):
+            return audience_from_piri_environment(settings, environment)
+
+        route_environment_factory = build_piri_route_environment
+        memory_environment_validator = validate_piri_memory_environment
+
+    logger.info("Piri provider routed through unrestricted PiriRuntime RPC adapter")
+    return PiriRuntime(
+        executable=settings.piri_cli_path,
+        process_environment=os.environ,
+        model_catalog_directory=str(Path(settings.project_root).resolve()),
+        memory_materializer_path=settings.codex_memory_materializer_path,
+        memory_bootstrap_timeout_seconds=(
+            settings.codex_memory_bootstrap_timeout_seconds
+        ),
+        memory_environment_validator=memory_environment_validator,
+        route_environment_factory=route_environment_factory,
+    )
+
+
+def _build_distill_environment(settings: Settings) -> dict[str, str] | None:
+    """Return the private Codex extraction environment when one is required."""
+
+    if not (
+        settings.agent_provider == "codex"
+        and settings.bridge_memory_mode == "audience-scoped"
+    ):
+        return None
+    from telegram_bot.core.memory_audience import shared_memory_audience
+    from telegram_bot.utils.secure_fs import ensure_private_directory
+
+    environment = dict(os.environ)
+    environment.update(
+        shared_memory_audience(settings).codex_environment(settings)
+    )
+    ensure_private_directory(Path(environment["CODEX_HOME"]))
+    ensure_private_directory(Path(environment["CODEX_SQLITE_HOME"]))
+    return environment
 
 
 def build_context(
@@ -157,14 +223,7 @@ def build_context(
             / claude_project_dir_name(Path(settings.project_root).resolve()),
         )
     elif settings.agent_provider == "piri" and agent_runtime is None:
-        from telegram_bot.core.piri_runtime import PiriRuntime
-
-        logger.info("Piri provider routed through unrestricted PiriRuntime RPC adapter")
-        agent_runtime = PiriRuntime(
-            executable=settings.piri_cli_path,
-            process_environment=os.environ,
-            model_catalog_directory=str(Path(settings.project_root).resolve()),
-        )
+        agent_runtime = _build_piri_runtime(settings)
     telegram_port = telegram_port or Application.builder
     clock = clock or time
     bind_logs_dir(settings.logs_dir)
@@ -194,21 +253,7 @@ def build_context(
     honcho_enabled = (
         settings.honcho_memory_enabled
     )
-    distill_environment = None
-    if (
-        settings.agent_provider == "codex"
-        and settings.bridge_memory_mode == "audience-scoped"
-    ):
-        from telegram_bot.core.memory_audience import shared_memory_audience
-
-        distill_environment = dict(os.environ)
-        distill_environment.update(
-            shared_memory_audience(settings).codex_environment(settings)
-        )
-        from telegram_bot.utils.secure_fs import ensure_private_directory
-
-        ensure_private_directory(Path(distill_environment["CODEX_HOME"]))
-        ensure_private_directory(Path(distill_environment["CODEX_SQLITE_HOME"]))
+    distill_environment = _build_distill_environment(settings)
     distill_extraction_worker = project_chat.build_distill_extraction_worker(
         distill_journal,
         CodexExecDistillBackend(
@@ -222,7 +267,7 @@ def build_context(
         model=settings.codex_distill_model,
     )
     distill_snapshot_worker = None
-    if settings.agent_provider == "codex":
+    if settings.agent_provider in {"codex", "piri"}:
         from telegram_bot.memory.codex_snapshot import CodexThreadSnapshotter
 
         distill_snapshot_worker = CodexThreadSnapshotter(
@@ -251,7 +296,7 @@ def build_context(
             shared_memory_audience(settings).root,
         )
     distill_wiki_sink_worker = None
-    if settings.agent_provider == "codex" and wiki_enabled:
+    if settings.agent_provider in {"codex", "piri"} and wiki_enabled:
         from telegram_bot.memory.distill_wiki_worker import (
             CodexDistillWikiSinkWorker,
         )
@@ -262,7 +307,7 @@ def build_context(
             require_memory_route=audience_scoped,
         )
     distill_honcho_sink_worker = None
-    if settings.agent_provider == "codex" and honcho_enabled:
+    if settings.agent_provider in {"codex", "piri"} and honcho_enabled:
         from telegram_bot.memory.distill_honcho_worker import (
             CodexDistillHonchoSinkWorker,
             HonchoHttpSender,

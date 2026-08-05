@@ -145,6 +145,10 @@ class HonchoHttpSender:
             or not isinstance(provenance, dict)
         ):
             raise HonchoDeliveryError("honcho_record_invalid", terminal=True)
+        source_provider = provenance.get("provider")
+        if source_provider not in {"codex", "piri"}:
+            raise HonchoDeliveryError("honcho_record_invalid", terminal=True)
+        source = f"{source_provider}-distill"
         try:
             validate_memory_route(memory_audience, memory_scope)
         except ValueError:
@@ -164,7 +168,7 @@ class HonchoHttpSender:
             payload={
                 "id": session_id,
                 "metadata": {
-                    "source": "codex-distill",
+                    "source": source,
                     "node": self._node_label,
                     **route_metadata,
                 },
@@ -182,9 +186,9 @@ class HonchoHttpSender:
             payload={
                 "messages": [{
                     "peer_id": peer,
-                    "content": "[codex distill]\n" + content,
+                    "content": f"[{source.replace('-', ' ')}]\n" + content,
                     "metadata": {
-                        "source": "codex-distill", "node": self._node_label,
+                        "source": source, "node": self._node_label,
                         "idempotency_key": key, "provenance": provenance,
                         "facts": facts, **route_metadata,
                     },
@@ -256,7 +260,7 @@ class CodexHonchoOutbox:
         record: dict[str, object] = {
             "schema_version": output.schema_version,
             "idempotency_key": f"ccc-distill-{job_id}",
-            "session_id": f"codex-distill-{job_id[:24]}",
+            "session_id": f"{provenance.provider}-distill-{job_id[:24]}",
             "provenance": {
                 "provider": provenance.provider,
                 "source_thread_hash": provenance.source_thread_hash,

@@ -664,6 +664,32 @@ async def test_distill_command_records_current_codex_thread_without_reset(
 
 
 @pytest.mark.anyio
+async def test_distill_command_records_current_piri_thread_without_reset(
+    tmp_path: Path,
+) -> None:
+    manager = make_manager(tmp_path, "piri")
+    await manager.store.set(
+        "7:9",
+        {
+            "provider": "piri",
+            "session_id": "piri-current",
+            "last_user_message_at": "2026-08-05T02:00:00+00:00",
+        },
+    )
+    journal = RecordingDistillJournal()
+    bot = bare_bot(manager, provider="piri")
+    bot._distill_journal = journal
+    update = make_update(text="/distill")
+
+    await bot._cmd_distill(update, SimpleNamespace(args=[]))
+
+    assert journal.calls[0]["provider"] == "piri"
+    assert journal.calls[0]["thread_id"] == "piri-current"
+    assert "Piri memory distill request recorded" in update.message.replies[0][0]
+    assert (await manager.get_session("7:9"))["session_id"] == "piri-current"
+
+
+@pytest.mark.anyio
 async def test_distill_command_deduplicates_same_turn_and_allows_new_turn(
     tmp_path: Path,
 ) -> None:
@@ -990,7 +1016,7 @@ async def test_auto_new_enqueues_old_codex_thread_before_reset(tmp_path: Path) -
 
 
 @pytest.mark.anyio
-async def test_distill_trigger_is_noop_for_non_codex_or_missing_thread(tmp_path: Path) -> None:
+async def test_distill_trigger_is_noop_for_unsupported_or_missing_thread(tmp_path: Path) -> None:
     manager = make_manager(tmp_path, "codex")
     bot = bare_bot(manager, provider="codex")
     journal = RecordingDistillJournal()
@@ -1345,6 +1371,31 @@ async def test_checkpoint_turn_gate_enqueues_without_resetting_session(
     assert str(call["discriminator"]).startswith("checkpoint-turn-v1-")
     assert "message-2" not in str(call["discriminator"])
     assert (await manager.get_session("7:9"))["session_id"] == "thread"
+
+
+@pytest.mark.anyio
+async def test_piri_checkpoint_turn_gate_enqueues_source_provider(
+    tmp_path: Path,
+) -> None:
+    from telegram_bot.memory.distill_types import DistillTrigger
+
+    manager = make_manager(tmp_path, "piri")
+    bot = bare_bot(manager, provider="piri")
+    journal = RecordingDistillJournal()
+    bot._distill_journal = journal
+    enable_checkpoint(bot, turns=1)
+
+    await bot._save_session_id(
+        "7:9",
+        ChatResponse("assistant", session_id="piri-thread"),
+        user_id=7,
+        chat_id=9,
+        request_text="user",
+        turn_marker="message-1",
+    )
+
+    assert journal.calls[0]["provider"] == "piri"
+    assert journal.calls[0]["trigger"] is DistillTrigger.CHECKPOINT
 
 
 @pytest.mark.anyio

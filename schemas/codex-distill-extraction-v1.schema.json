@@ -9,7 +9,10 @@
           "type": "string"
         },
         "provider": {
-          "const": "codex",
+          "enum": [
+            "codex",
+            "piri"
+          ],
           "title": "Provider",
           "type": "string"
         },

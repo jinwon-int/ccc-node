@@ -263,7 +263,7 @@ class CodexLocalMemorySink:
 
             LocalMemoryTransaction(self.state_dir).commit(
                 transform,
-                provider="codex",
+                provider=output.provenance.provider,
                 actor="distill",
                 tool="local-memory-sink",
                 session=job_id,

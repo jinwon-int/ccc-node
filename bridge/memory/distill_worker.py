@@ -9,7 +9,7 @@ import math
 import re
 import secrets
 import time
-from typing import Protocol
+from typing import Literal, Protocol, cast
 
 from .distill_extraction import (
     DistillBackend,
@@ -257,7 +257,11 @@ class CodexDistillExtractionWorker:
                 terminal=True,
             )
         try:
-            extraction_input = build_extraction_input(snapshot, trigger=claimed.trigger)
+            extraction_input = build_extraction_input(
+                snapshot,
+                trigger=claimed.trigger,
+                provider=cast(Literal["codex", "piri"], claimed.provider),
+            )
         except (TypeError, ValueError):
             self._refund_unused_reservation(reservation)
             return await self._fail(

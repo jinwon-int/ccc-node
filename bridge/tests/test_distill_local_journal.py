@@ -29,9 +29,10 @@ async def extracted_job(
     memory_scope: str | None = PRIVATE_SCOPE,
     wiki_enabled: bool = True,
     honcho_enabled: bool = True,
+    provider: str = "codex",
 ) -> DistillJob:
     queued = journal.enqueue_once(
-        provider="codex",
+        provider=provider,
         thread_id="thread-local-journal",
         trigger=DistillTrigger.NEW_COMMAND,
         memory_audience=memory_audience,

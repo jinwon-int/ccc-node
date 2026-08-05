@@ -7,7 +7,9 @@ from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 import os
+from pathlib import Path
 import re
+import stat
 from types import MappingProxyType
 from typing import Any, Protocol, cast
 
@@ -27,6 +29,13 @@ from .agent_runtime import (
     deny_approval,
 )
 from .piri_rpc import PiriRpcProcessClient
+from .codex_runtime import _run_codex_memory_bootstrap
+from telegram_bot.memory.distill_types import (
+    CodexTranscriptSnapshot,
+    TranscriptBounds,
+)
+from telegram_bot.memory.piri_snapshot import read_piri_snapshot
+from telegram_bot.utils.secure_fs import ensure_private_directory
 
 
 _REASONING_LEVELS = ("minimal", "low", "medium", "high", "xhigh", "max")
@@ -68,6 +77,8 @@ class PiriLaunchConfig:
 
 
 PiriClientFactory = Callable[[PiriLaunchConfig], PiriClient]
+PiriMemoryEnvironmentValidator = Callable[[Mapping[str, str]], object]
+PiriRouteEnvironmentFactory = Callable[[str, str], Mapping[str, str]]
 
 
 class PiriSession:
@@ -218,11 +229,19 @@ class PiriRuntime:
         process_environment: Mapping[str, str] | None = None,
         model_catalog_directory: str | None = None,
         auto_confirm_extensions: bool = True,
+        memory_materializer_path: str | None = None,
+        memory_bootstrap_timeout_seconds: float = 14.0,
+        memory_environment_validator: PiriMemoryEnvironmentValidator | None = None,
+        route_environment_factory: PiriRouteEnvironmentFactory | None = None,
     ) -> None:
         if not executable.strip():
             raise ValueError("Piri executable must not be empty")
         if model_catalog_directory is not None and not model_catalog_directory:
             raise ValueError("Piri model catalog directory must not be empty")
+        if memory_materializer_path is not None and not memory_materializer_path.strip():
+            raise ValueError("Piri memory materializer path must not be empty")
+        if memory_bootstrap_timeout_seconds <= 0 or memory_bootstrap_timeout_seconds > 30:
+            raise ValueError("Piri memory bootstrap timeout is invalid")
         if process_environment is not None:
             for name, value in process_environment.items():
                 if not isinstance(name, str) or not name or "\x00" in name:
@@ -237,11 +256,32 @@ class PiriRuntime:
         self._auto_confirm_extensions = auto_confirm_extensions
         self._client_factory = client_factory or self._default_client_factory
         self._sessions: set[PiriSession] = set()
+        self._memory_materializer_path = memory_materializer_path
+        self._memory_bootstrap_timeout_seconds = memory_bootstrap_timeout_seconds
+        self._memory_environment_validator = memory_environment_validator
+        self._route_environment_factory = route_environment_factory
+        self._session_directories: dict[str, Path] = {}
 
     async def start_or_resume(self, request: SessionRequest) -> PiriSession:
         _validate_full_access_request(request)
         _validate_cli_selection(request)
         command = [self._executable, "--mode", "rpc", "--approve"]
+        environment = dict(self._process_environment)
+        session_directory: Path | None = None
+        if request.memory_environment is not None:
+            if (
+                self._memory_materializer_path is not None
+                and self._memory_environment_validator is None
+            ):
+                raise ValueError("Piri memory materializer requires a route validator")
+            if self._memory_environment_validator is not None:
+                self._memory_environment_validator(request.memory_environment)
+            environment.update(request.memory_environment)
+            if self._memory_materializer_path is not None:
+                session_directory = await self._prepare_memory_bootstrap(
+                    command,
+                    environment,
+                )
         if request.session_id is not None:
             command.extend(("--session-id", request.session_id))
         if request.model is not None:
@@ -249,9 +289,6 @@ class PiriRuntime:
         if request.effort is not None:
             command.extend(("--thinking", request.effort))
 
-        environment = dict(self._process_environment)
-        if request.memory_environment is not None:
-            environment.update(request.memory_environment)
         config = PiriLaunchConfig(
             command=tuple(command),
             working_directory=request.working_directory,
@@ -278,6 +315,8 @@ class PiriRuntime:
         if request.session_id is not None and session_id != request.session_id:
             await client.close()
             raise RuntimeError("Piri resumed a different session id")
+        if session_directory is not None:
+            self._session_directories[session_id] = session_directory
 
         session = PiriSession(
             session_id,
@@ -286,6 +325,88 @@ class PiriRuntime:
         )
         self._sessions.add(session)
         return session
+
+    async def _prepare_memory_bootstrap(
+        self,
+        command: list[str],
+        environment: dict[str, str],
+    ) -> Path:
+        session_value = environment.get("PIRI_CODING_AGENT_SESSION_DIR")
+        bootstrap_value = environment.get("CCC_PIRI_BOOTSTRAP_HOME")
+        context_value = environment.get("CCC_PIRI_BOOTSTRAP_CONTEXT_FILE")
+        if not session_value or not bootstrap_value or not context_value:
+            raise ValueError("Piri memory route is incomplete")
+        session_directory = Path(session_value)
+        bootstrap_home = Path(bootstrap_value)
+        context_file = Path(context_value)
+        if context_file != bootstrap_home / "AGENTS.md":
+            raise ValueError("Piri memory context path is invalid")
+        ensure_private_directory(session_directory)
+        ensure_private_directory(bootstrap_home)
+        bootstrap_environment = dict(environment)
+        bootstrap_environment["CODEX_HOME"] = str(bootstrap_home)
+        bootstrap_environment["CODEX_SQLITE_HOME"] = str(bootstrap_home)
+        bootstrap_environment["CCC_MEMORY_MATERIALIZER_PROVIDER"] = "piri"
+        await _run_codex_memory_bootstrap(
+            self._memory_materializer_path or "",
+            timeout_seconds=self._memory_bootstrap_timeout_seconds,
+            environment=bootstrap_environment,
+        )
+        self._validate_memory_context(context_file)
+        command.extend(("--no-context-files", "--append-system-prompt", str(context_file)))
+        return session_directory
+
+    @staticmethod
+    def _validate_memory_context(path: Path) -> None:
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(path, flags)
+        except OSError:
+            raise RuntimeError("Piri memory bootstrap unavailable") from None
+        try:
+            metadata = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_nlink != 1
+                or (hasattr(os, "geteuid") and metadata.st_uid != os.geteuid())
+                or stat.S_IMODE(metadata.st_mode) != 0o600
+                or metadata.st_size > 1024 * 1024
+            ):
+                raise RuntimeError("Piri memory bootstrap unavailable")
+        finally:
+            os.close(descriptor)
+
+    async def read_session_snapshot(
+        self,
+        session_id: str,
+        *,
+        bounds: TranscriptBounds,
+        memory_audience: str | None = None,
+        memory_scope: str | None = None,
+    ) -> CodexTranscriptSnapshot:
+        session_directory: Path | None = None
+        if memory_audience is not None or memory_scope is not None:
+            if (
+                not isinstance(memory_audience, str)
+                or not isinstance(memory_scope, str)
+                or self._route_environment_factory is None
+            ):
+                raise ValueError("Piri snapshot memory route is invalid")
+            route = self._route_environment_factory(memory_audience, memory_scope)
+            value = route.get("PIRI_CODING_AGENT_SESSION_DIR")
+            if not isinstance(value, str) or not value:
+                raise ValueError("Piri snapshot memory route is incomplete")
+            session_directory = Path(value)
+        else:
+            session_directory = self._session_directories.get(session_id)
+        if session_directory is None:
+            raise ValueError("Piri snapshot session route is unavailable")
+        return await asyncio.to_thread(
+            read_piri_snapshot,
+            session_directory,
+            session_id,
+            bounds=bounds,
+        )
 
     async def list_models(self) -> Sequence[ModelInfo]:
         config = PiriLaunchConfig(

@@ -29,12 +29,14 @@ async def wiki_job(
     *,
     memory_audience: str | None = None,
     memory_scope: str | None = None,
+    provider: str = "codex",
 ):  # type: ignore[no-untyped-def]
     snapshot_done = fixtures.snapshot_done_job(
         journal,
         thread_id="thread-wiki-worker",
         memory_audience=memory_audience,
         memory_scope=memory_scope,
+        provider=provider,
     )
     return await CodexDistillExtractionWorker(
         journal,
@@ -61,6 +63,25 @@ async def test_worker_queues_validated_candidate_for_human_review(tmp_path: Path
     record = json.loads((queue / f"{job.job_id}.json").read_text())
     assert record["review_status"] == "pending"
     assert record["candidates"][0]["suggested_path"].startswith("pages/nodes/")
+
+
+@pytest.mark.anyio
+async def test_worker_preserves_piri_provenance_in_wiki_candidate(
+    tmp_path: Path,
+) -> None:
+    journal = DistillJournal(tmp_path / "journal")
+    journal.initialize()
+    job = await wiki_job(journal, provider="piri")
+    queue = tmp_path / "wiki-candidates"
+    worker = CodexDistillWikiSinkWorker(
+        journal, queue_dir=queue, owner_token="piri-wiki-worker"
+    )
+
+    result = await worker.write_once(job_id=job.job_id)
+
+    assert result.wiki_sink_status is DistillWikiSinkStatus.DONE
+    record = json.loads((queue / f"{job.job_id}.json").read_text())
+    assert record["provenance"]["provider"] == "piri"
 
 
 @pytest.mark.anyio

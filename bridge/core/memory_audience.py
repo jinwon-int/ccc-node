@@ -64,6 +64,18 @@ class MemoryAudience:
 
         return self.scope_root / "codex"
 
+    @property
+    def piri_session_dir(self) -> Path:
+        """Return the Piri transcript directory dedicated to this audience."""
+
+        return self.scope_root / "piri" / "sessions"
+
+    @property
+    def piri_bootstrap_home(self) -> Path:
+        """Return the private materializer home used only for Piri context."""
+
+        return self.scope_root / "piri" / "bootstrap"
+
     def hook_environment(self, settings: Any) -> dict[str, str]:
         """Return body-free paths/policy for the existing memory hook stack."""
 
@@ -148,6 +160,28 @@ class MemoryAudience:
 
         return self.hook_environment(settings)
 
+    def piri_environment(self, settings: Any) -> dict[str, str]:
+        """Return the audience overlay for one Piri RPC process.
+
+        Piri keeps provider credentials and static configuration in the
+        operator-owned global store, but transcripts and generated memory
+        context are isolated per opaque audience. The runtime disables Piri's
+        automatic AGENTS/CLAUDE discovery and appends only the context file
+        declared here.
+        """
+
+        env = self.hook_environment(settings)
+        env.update(
+            {
+                "PIRI_CODING_AGENT_SESSION_DIR": str(self.piri_session_dir),
+                "CCC_PIRI_BOOTSTRAP_HOME": str(self.piri_bootstrap_home),
+                "CCC_PIRI_BOOTSTRAP_CONTEXT_FILE": str(
+                    self.piri_bootstrap_home / "AGENTS.md"
+                ),
+            }
+        )
+        return env
+
 
 def _audience_root(settings: Any) -> Path:
     configured = getattr(settings, "bridge_memory_audience_root", None)
@@ -203,6 +237,38 @@ def audience_from_claude_environment(
     expected = audience.claude_environment(settings)
     if dict(environment) != expected:
         raise ValueError("Claude audience environment does not match the resolved route")
+    return audience
+
+
+def audience_from_piri_environment(
+    settings: Any, environment: Mapping[str, str] | None
+) -> MemoryAudience:
+    """Reconstruct and byte-validate one audience-scoped Piri route."""
+
+    if environment is None:
+        raise ValueError("Piri audience-scoped memory requires a route environment")
+    kind = environment.get("CCC_MEMORY_AUDIENCE")
+    scope = environment.get("CCC_MEMORY_SCOPE")
+    if kind == AUDIENCE_SHARED:
+        if scope != AUDIENCE_SHARED:
+            raise ValueError("Piri shared memory route is invalid")
+    elif kind == AUDIENCE_PRIVATE:
+        suffix = (scope or "").removeprefix("private-")
+        if (
+            not isinstance(scope, str)
+            or not scope.startswith("private-")
+            or len(suffix) != 32
+            or any(char not in "0123456789abcdef" for char in suffix)
+        ):
+            raise ValueError("Piri private memory route is invalid")
+    else:
+        raise ValueError("Piri memory audience is invalid")
+
+    assert isinstance(kind, str) and isinstance(scope, str)
+    audience = MemoryAudience(kind, scope, _audience_root(settings))
+    expected = audience.piri_environment(settings)
+    if dict(environment) != expected:
+        raise ValueError("Piri audience environment does not match the resolved route")
     return audience
 
 

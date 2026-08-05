@@ -1,12 +1,11 @@
 #!/usr/bin/env bash
 # nunchi piri-feed extractor (#816) — Piri-provider nodes.
 #
-# Piri sessions are not read by the Claude/Codex distill journal (the Piri RPC
-# runtime exposes no distill/write-back extractor), so — like codex-feed.sh on a
-# Codex node — this lane extracts user/agent messages from NEW Piri session
-# jsonl files, asks the configured Piri CLI for distill-style facts in one
-# non-interactive print-mode run, and ingests them into the nunchi peer_facts
-# DB. Idempotent via a seen-file; bounded per run. Runs from cron.
+# This supplementary nunchi lane extracts user/agent messages from NEW Piri
+# session JSONL files, asks the configured Piri CLI for peer facts in one
+# non-interactive print-mode run, and ingests them into the nunchi DB. The main
+# ccc distill journal independently owns local/Honcho/Wiki write-back.
+# Idempotent via a seen-file; bounded per run. Runs from cron.
 # NOTE: unlike ingest-cron.sh this costs one Piri run per new file.
 # No-op unless nunchi is enabled (state/nunchi.mode=on or CCC_NUNCHI_MODE=on).
 set -uo pipefail
@@ -20,8 +19,15 @@ FM="$HERE/nunchi.py"
 NUNCHI_HOME="${NUNCHI_HOME:-$HOME/.nunchi}"
 SEEN="$NUNCHI_HOME/piri-seen"
 LOCK="$NUNCHI_HOME/.piri-feed.lock"
-# Piri stores sessions under <state-dir>/sessions/<cwd-slug>/<id>.jsonl.
-PIR_SESSIONS_DIR="${PIR_SESSIONS_DIR:-${PIRI_CODING_AGENT_SESSION_DIR:-$HOME/.piri/agent}/sessions}"
+# PIRI_CODING_AGENT_SESSION_DIR is already the direct session directory. The
+# global default is <agent-dir>/sessions and may contain cwd subdirectories.
+if [ -z "${PIR_SESSIONS_DIR:-}" ]; then
+  if [ -n "${PIRI_CODING_AGENT_SESSION_DIR:-}" ]; then
+    PIR_SESSIONS_DIR="$PIRI_CODING_AGENT_SESSION_DIR"
+  else
+    PIR_SESSIONS_DIR="${PIRI_CODING_AGENT_DIR:-$HOME/.piri/agent}/sessions"
+  fi
+fi
 # The Piri CLI the bridge runs (ccc-node PiriRuntime). Falls back to `piri` on PATH.
 PIR_CLI="${CCC_PIRI_CLI_PATH:-piri}"
 # Isolate extractor runs so their own sessions never land under PIR_SESSIONS_DIR

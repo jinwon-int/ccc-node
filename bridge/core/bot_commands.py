@@ -583,7 +583,7 @@ class BotCommandMixin:
     async def _cmd_distill(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
-        """Durably request write-back for the current Codex thread without reset."""
+        """Durably request write-back for the current supported thread without reset."""
 
         del context
         if not await self._check_access(update):
@@ -593,11 +593,13 @@ class BotCommandMixin:
         chat = self._require_chat(update)
         log_debug(user_id, "command", "/distill")
 
-        if self._active_provider() != "codex":
-            reply = "ℹ️ /distill is available only for active Codex sessions."
+        active_provider = self._active_provider()
+        if active_provider not in {"codex", "piri"}:
+            reply = "ℹ️ /distill is available only for active Codex or Piri sessions."
             await message.reply_text(reply)
             log_debug(user_id, "bot", reply)
             return
+        provider_label = active_provider.title()
 
         conversation_key = self._conversation_key(user_id, chat.id)
         tasks = getattr(self, "_tasks", None)
@@ -608,7 +610,7 @@ class BotCommandMixin:
         )
         if active_task is not None and not active_task.done():
             reply = (
-                "⏳ The current Codex turn is still running. "
+                f"⏳ The current {provider_label} turn is still running. "
                 "Run /distill again after it finishes."
             )
             await message.reply_text(reply)
@@ -617,11 +619,11 @@ class BotCommandMixin:
         session = await self._session_manager.get_session(conversation_key)
         thread_id = session.get("session_id")
         if (
-            str(session.get("provider", "")).strip().lower() != "codex"
+            str(session.get("provider", "")).strip().lower() != active_provider
             or not isinstance(thread_id, str)
             or not thread_id
         ):
-            reply = "ℹ️ There is no active Codex session to distill."
+            reply = f"ℹ️ There is no active {provider_label} session to distill."
             await message.reply_text(reply)
             log_debug(user_id, "bot", reply)
             return
@@ -635,17 +637,20 @@ class BotCommandMixin:
                 discriminator=self._explicit_distill_discriminator(session),
             )
         except Exception:
-            logger.warning("Explicit Codex distill request could not be recorded")
-            reply = "⚠️ Codex memory distill request could not be recorded."
+            logger.warning(
+                "Explicit %s distill request could not be recorded",
+                provider_label,
+            )
+            reply = f"⚠️ {provider_label} memory distill request could not be recorded."
             await message.reply_text(reply)
             log_debug(user_id, "bot", reply)
             return
 
         if job is None:
-            reply = "⚠️ Codex memory distill is unavailable on this bridge."
+            reply = f"⚠️ {provider_label} memory distill is unavailable on this bridge."
         else:
             reply = (
-                "✅ Codex memory distill request recorded. "
+                f"✅ {provider_label} memory distill request recorded. "
                 "The current session remains active."
             )
         await message.reply_text(reply)
