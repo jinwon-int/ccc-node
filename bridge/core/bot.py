@@ -1196,7 +1196,7 @@ class TelegramBot(
     ) -> DistillJob | None:
         provider = str(session.get("provider", "claude")).strip().lower()
         thread_id = session.get("session_id")
-        if provider != "codex" or not isinstance(thread_id, str) or not thread_id:
+        if provider not in {"codex", "piri"} or not isinstance(thread_id, str) or not thread_id:
             return None
         journal = getattr(self, "_distill_journal", None)
         if journal is None:
@@ -1221,7 +1221,7 @@ class TelegramBot(
                 memory_audience = stored_audience
                 memory_scope = stored_scope
         enqueue_kwargs = {
-            "provider": "codex",
+            "provider": provider,
             "thread_id": thread_id,
             "trigger": trigger,
             "memory_audience": memory_audience,
@@ -1242,7 +1242,7 @@ class TelegramBot(
         user_id: int | None = None,
         chat_id: int | None = None,
     ):
-        """Durably capture a departing Codex thread before provider state resets."""
+        """Durably capture a departing writeback-capable thread before reset."""
         if session is None:
             session = await self._session_manager.get_session(session_key)
         provider = str(session.get("provider", "claude")).strip().lower()
@@ -1411,7 +1411,8 @@ class TelegramBot(
                 raise
             except Exception as error:
                 logger.warning(
-                    "Codex checkpoint accounting failed error=%s",
+                    "%s checkpoint accounting failed error=%s",
+                    self._active_provider().title(),
                     type(error).__name__,
                 )
 
@@ -1471,7 +1472,8 @@ class TelegramBot(
         chat_id: int | None,
     ) -> None:
         """Count completed turns and durably enqueue the first reached gate."""
-        if self._active_provider() != "codex":
+        active_provider = self._active_provider()
+        if active_provider not in {"codex", "piri"}:
             return
         if getattr(self, "_distill_journal", None) is None:
             return
@@ -1530,7 +1532,7 @@ class TelegramBot(
             try:
                 session = await self._session_manager.get_session(session_key)
                 if (
-                    session.get("provider") != "codex"
+                    session.get("provider") != active_provider
                     or session.get("session_id") != thread_id
                 ):
                     progress_by_key.pop(session_key, None)
@@ -1546,7 +1548,8 @@ class TelegramBot(
                 raise
             except Exception as error:
                 logger.warning(
-                    "Codex checkpoint journal enqueue failed error=%s",
+                    "%s checkpoint journal enqueue failed error=%s",
+                    active_provider.title(),
                     type(error).__name__,
                 )
                 return
@@ -1584,7 +1587,7 @@ class TelegramBot(
         selected_keys = active_keys[:limit]
         if len(active_keys) > limit:
             logger.warning(
-                "Codex shutdown distill queue capped at %d active sessions",
+                "Memory shutdown distill queue capped at %d active sessions",
                 limit,
             )
 
@@ -1601,7 +1604,7 @@ class TelegramBot(
                     raise
                 except Exception as error:
                     logger.warning(
-                        "Codex shutdown distill queue entry failed error=%s",
+                        "Memory shutdown distill queue entry failed error=%s",
                         type(error).__name__,
                     )
 
@@ -1614,7 +1617,7 @@ class TelegramBot(
             await asyncio.wait_for(enqueue_selected(), timeout=timeout)
         except asyncio.TimeoutError:
             logger.warning(
-                "Codex shutdown distill queue timed out after %.2fs",
+                "Memory shutdown distill queue timed out after %.2fs",
                 timeout,
             )
 

@@ -58,6 +58,23 @@ def test_enqueue_once_is_concurrency_safe_idempotent_and_private(tmp_path: Path)
     assert stat.S_IMODE(journal.job_path(jobs[0].job_id).stat().st_mode) == 0o600
 
 
+def test_piri_provider_jobs_are_first_class_and_separate_from_codex(tmp_path: Path) -> None:
+    journal = DistillJournal(tmp_path / "journal")
+    journal.initialize()
+    piri = journal.enqueue_once(
+        provider="piri",
+        thread_id="same-session",
+        trigger=DistillTrigger.EXPLICIT,
+    )
+    codex = journal.enqueue_once(
+        provider="codex",
+        thread_id="same-session",
+        trigger=DistillTrigger.EXPLICIT,
+    )
+    assert piri.provider == "piri"
+    assert piri.job_id != codex.job_id
+
+
 def test_job_key_is_cross_trigger_idempotent_and_binds_discriminator_and_schema(
     tmp_path: Path,
 ) -> None:

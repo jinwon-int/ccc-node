@@ -967,8 +967,6 @@ def _audience_scoped_blocked(environ: Mapping[str, str] | None = None) -> bool:
     raw = (env.get("CCC_MEMORY_AUDIENCE_SCOPED") or "").strip().lower()
     if raw in ("", "0", "false", "off", "no"):
         return False
-    if (env.get("CCC_CODEX_AUDIENCE_AUTH_MODE") or "").strip().lower() != "keyring":
-        return True
     audience = (env.get("CCC_MEMORY_AUDIENCE") or "").strip().lower()
     scope = (env.get("CCC_MEMORY_SCOPE") or "").strip()
     if audience == "shared":
@@ -980,6 +978,7 @@ def _audience_scoped_blocked(environ: Mapping[str, str] | None = None) -> bool:
     else:
         return True
     root_raw = (env.get("CCC_MEMORY_AUDIENCE_ROOT") or "").strip()
+    provider = (env.get("CCC_MEMORY_MATERIALIZER_PROVIDER") or "codex").strip().lower()
     codex_raw = (env.get("CODEX_HOME") or "").strip()
     sqlite_raw = (env.get("CODEX_SQLITE_HOME") or "").strip()
     if not root_raw or not codex_raw or not sqlite_raw:
@@ -988,6 +987,35 @@ def _audience_scoped_blocked(environ: Mapping[str, str] | None = None) -> bool:
     codex_home = Path(codex_raw).expanduser()
     sqlite_home = Path(sqlite_raw).expanduser()
     if not root.is_absolute() or not codex_home.is_absolute() or not sqlite_home.is_absolute():
+        return True
+    if provider == "piri":
+        bootstrap_raw = (env.get("CCC_PIRI_BOOTSTRAP_HOME") or "").strip()
+        session_raw = (env.get("PIRI_CODING_AGENT_SESSION_DIR") or "").strip()
+        context_raw = (env.get("CCC_PIRI_BOOTSTRAP_CONTEXT_FILE") or "").strip()
+        if not bootstrap_raw or not session_raw or not context_raw:
+            return True
+        bootstrap_home = Path(bootstrap_raw).expanduser()
+        session_dir = Path(session_raw).expanduser()
+        context_file = Path(context_raw).expanduser()
+        if (
+            not bootstrap_home.is_absolute()
+            or not session_dir.is_absolute()
+            or not context_file.is_absolute()
+        ):
+            return True
+        expected = Path(os.path.abspath(root / scope / "piri" / "bootstrap"))
+        expected_session = Path(os.path.abspath(root / scope / "piri" / "sessions"))
+        expected_context = expected / "AGENTS.md"
+        return (
+            Path(os.path.abspath(codex_home)) != expected
+            or Path(os.path.abspath(sqlite_home)) != expected
+            or Path(os.path.abspath(bootstrap_home)) != expected
+            or Path(os.path.abspath(session_dir)) != expected_session
+            or Path(os.path.abspath(context_file)) != expected_context
+        )
+    if provider != "codex":
+        return True
+    if (env.get("CCC_CODEX_AUDIENCE_AUTH_MODE") or "").strip().lower() != "keyring":
         return True
     expected = Path(os.path.abspath(root / scope / "codex"))
     return (

@@ -298,6 +298,38 @@ async def test_project_chat_binds_opaque_claude_audiences_at_request_time(
     assert "-100456" not in serialized
 
 
+@pytest.mark.anyio
+async def test_project_chat_binds_opaque_piri_audiences_at_request_time(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path, provider="piri")
+    settings.bridge_memory_mode = "audience-scoped"
+    settings.telegram_session_scope = "shared-groups"
+    settings.bot_data_dir = tmp_path / ".telegram_bot"
+    settings.bridge_memory_audience_root = None
+    settings.bridge_memory_audience_key_path = None
+    settings.bridge_unsafe_shared_all_memory = False
+    settings.honcho_memory_enabled = True
+    settings.honcho_config_path = tmp_path / ".hermes" / "honcho.json"
+    runtime = FakeRuntime()
+    handler = ProjectChatHandler(settings=settings, agent_runtime=runtime)
+    handler._task_ledger_cache = False
+
+    await handler.process_message("private", 934719283, 934719283, new_session=True)
+    await handler.process_message("shared", 934719283, -100456, new_session=True)
+
+    private_env = runtime.requests[0].memory_environment
+    shared_env = runtime.requests[1].memory_environment
+    assert private_env is not None and shared_env is not None
+    assert private_env["CCC_MEMORY_AUDIENCE"] == "private"
+    assert shared_env["CCC_MEMORY_AUDIENCE"] == "shared"
+    assert (
+        private_env["PIRI_CODING_AGENT_SESSION_DIR"]
+        != shared_env["PIRI_CODING_AGENT_SESSION_DIR"]
+    )
+    assert "CODEX_HOME" not in private_env
+
+
 def test_agent_provider_settings_default_and_reject_unknown(tmp_path: Path) -> None:
     settings_class = _real_settings_class()
     environ = {"HOME": str(tmp_path), "TELEGRAM_BOT_TOKEN": "123456:test"}

@@ -562,9 +562,10 @@ CAPABILITY_AXES: tuple[CapabilityAxis, ...] = (
             "The AGENTS.override.md materializer runs before thread start/resume; "
             "promoted after the 2026-07-15 live gate (#419)."
         ),
-        piri=_degraded(
-            "Piri starts in the project directory and can consume project context, "
-            "but the ccc audience-scoped memory materializer is intentionally disabled."
+        piri=_supported(
+            "Audience-scoped Piri sessions use isolated transcript directories, disable "
+            "automatic AGENTS/CLAUDE discovery, run the bounded ccc materializer, and "
+            "append only the generated scope-local AGENTS.md context."
         ),
     ),
     _axis(
@@ -582,9 +583,10 @@ CAPABILITY_AXES: tuple[CapabilityAxis, ...] = (
             "not treated as compaction. Provider compaction checkpoint/reinjection "
             "therefore remains unverified."
         ),
-        piri=_unsupported(
-            "ccc-node has no Piri compaction checkpoint or post-compaction memory "
-            "reinjection hook."
+        piri=_degraded(
+            "Cold start/resume refreshes and re-appends the scoped snapshot, but Piri "
+            "exposes no ccc compaction lifecycle hook for an explicit mid-session "
+            "checkpoint or reinjection proof."
         ),
     ),
     _axis(
@@ -603,12 +605,10 @@ CAPABILITY_AXES: tuple[CapabilityAxis, ...] = (
             "cost gates are body-free; Wiki candidates enter a local human-review "
             "queue and Honcho facts use an owner-only retrying outbox.",
         ),
-        piri=_unsupported(
-            "Piri sessions are not read by the Codex/Claude distill journal, "
-            "so the local/Honcho/Wiki distill sinks stay unwired. (A "
-            "provider-neutral nunchi peer-facts extractor, "
-            "`hooks/nunchi/piri-feed.sh` via `install-nunchi.sh --piri`, does "
-            "feed the nunchi DB from Piri sessions.)"
+        piri=_supported(
+            "Session-reset, explicit, checkpoint, and shutdown triggers enter the "
+            "provider-neutral journal. A secure bounded Piri JSONL snapshot preserves "
+            "source provider provenance through the isolated extractor and all sinks."
         ),
     ),
     _axis(
@@ -624,8 +624,9 @@ CAPABILITY_AXES: tuple[CapabilityAxis, ...] = (
             "Supported session-reset triggers bind an opaque audience route, and "
             "an independently leased worker writes replay-safe local facts/resume."
         ),
-        piri=_unsupported(
-            "No Piri write-back extractor feeds the replay-safe local memory sink."
+        piri=_supported(
+            "Audience-routed Piri jobs use the same independently leased replay-safe "
+            "local facts/resume sink while retaining provider=piri provenance."
         ),
     ),
     _axis(
@@ -644,8 +645,9 @@ CAPABILITY_AXES: tuple[CapabilityAxis, ...] = (
             "physically distinct Honcho workspaces; unscoped jobs fail closed in "
             "that mode."
         ),
-        piri=_unsupported(
-            "No Piri write-back extractor feeds the Honcho outbox."
+        piri=_supported(
+            "Validated Piri facts use the same owner-only scope-partitioned Honcho "
+            "outbox, idempotency keys, retry leases, and distinct workspaces."
         ),
     ),
     _axis(
@@ -661,8 +663,9 @@ CAPABILITY_AXES: tuple[CapabilityAxis, ...] = (
             "Validated candidates are atomically queued in owner-only per-job records; "
             "the sink performs no Wiki write, branch, PR, or merge."
         ),
-        piri=_unsupported(
-            "No Piri write-back extractor feeds the human-gated Wiki candidate queue."
+        piri=_supported(
+            "Validated Piri candidates enter the same owner-only human-review queue; "
+            "the sink still performs no Wiki write, branch, PR, or merge."
         ),
     ),
     _axis(
@@ -681,9 +684,9 @@ CAPABILITY_AXES: tuple[CapabilityAxis, ...] = (
             "one durable fact exactly once; local, Wiki-candidate, and Honcho "
             "sink states remain independently replayable (#465)."
         ),
-        piri=_unsupported(
-            "A Piri session A to durable write-back to isolated session B round-trip "
-            "does not exist because Piri write-back is not implemented."
+        piri=_supported(
+            "The hermetic audience-scoped Piri A→snapshot→distill→local index→B "
+            "bootstrap test recalls one durable fact with provider=piri provenance."
         ),
     ),
     _axis(

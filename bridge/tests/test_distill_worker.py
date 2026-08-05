@@ -88,9 +88,10 @@ def snapshot_done_job(
     text: str = "harmless durable fact",
     memory_audience: str | None = None,
     memory_scope: str | None = None,
+    provider: str = "codex",
 ) -> DistillJob:
     queued = journal.enqueue_once(
-        provider="codex",
+        provider=provider,
         thread_id=thread_id,
         trigger=DistillTrigger.NEW_COMMAND,
         memory_audience=memory_audience,
@@ -121,6 +122,29 @@ class SuccessfulBackend:
         self.calls.append(extraction_input)
         await asyncio.sleep(0.01)
         return output_for(extraction_input)
+
+
+@pytest.mark.anyio
+async def test_piri_job_preserves_source_provider_through_extraction(
+    tmp_path: Path,
+) -> None:
+    journal = DistillJournal(tmp_path / "journal")
+    journal.initialize()
+    job = snapshot_done_job(journal, provider="piri")
+    backend = SuccessfulBackend()
+
+    result = await CodexDistillExtractionWorker(
+        journal,
+        backend,
+        owner_token="piri-extract-worker",
+        usage_meter=None,
+    ).extract_once(job_id=job.job_id)
+
+    assert result.status is DistillJobStatus.EXTRACTION_DONE
+    assert backend.calls[0].provider == "piri"
+    output = journal.get_extraction_output(job.job_id)
+    assert output is not None
+    assert output.provenance.provider == "piri"
 
 
 def wiki_output_for(

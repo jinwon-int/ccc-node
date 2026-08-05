@@ -23,12 +23,13 @@ def extraction_output(
     *,
     fact_text: str = "The user prefers focused pull requests.",
     last_activity: str = "Implemented a bounded local sink.",
+    provider: str = "codex",
 ) -> DistillExtractionOutput:
     return DistillExtractionOutput.model_validate(
         {
             "schema_version": 1,
             "provenance": {
-                "provider": "codex",
+                "provider": provider,
                 "source_thread_hash": THREAD_HASH,
                 "trigger": "new_command",
                 "distilled_at": "2026-07-22T08:00:00Z",
@@ -95,6 +96,24 @@ def test_writes_bounded_private_facts_and_resume_with_hashed_provenance(
     assert stat.S_IMODE(state_dir.stat().st_mode) == 0o700
     assert stat.S_IMODE(facts_path.stat().st_mode) == 0o600
     assert stat.S_IMODE(resume_path.stat().st_mode) == 0o600
+
+
+def test_piri_provenance_reaches_facts_resume_and_rollback_ledger(
+    tmp_path: Path,
+) -> None:
+    state_dir = tmp_path / "state"
+    sink = CodexLocalMemorySink(state_dir, audience="private")
+
+    sink.write(extraction_output(provider="piri"), job_id=JOB_ID)
+
+    facts = read_facts(state_dir / "memory-facts.jsonl")
+    assert facts[0]["source"]["provider"] == "piri"
+    assert "provider=piri" in (state_dir / "resume.md").read_text()
+    action_id = (state_dir / "memory-rollback" / "HEAD").read_text().strip()
+    manifest = json.loads(
+        (state_dir / "memory-rollback" / "actions" / action_id / "manifest.json").read_text()
+    )
+    assert manifest["provider"] == "piri"
 
 
 @pytest.mark.anyio

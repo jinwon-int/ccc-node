@@ -136,6 +136,15 @@ def test_same_snapshot_and_trigger_produce_byte_identical_redacted_input() -> No
     assert first.byte_count == len(first.messages[0].text.encode("utf-8"))
 
 
+def test_piri_snapshot_keeps_source_provider_in_extraction_contract() -> None:
+    extraction = build_extraction_input(
+        snapshot(),
+        trigger=DistillTrigger.EXPLICIT,
+        provider="piri",
+    )
+    assert extraction.provider == "piri"
+
+
 @pytest.mark.parametrize(
     ("mutation", "match"),
     [

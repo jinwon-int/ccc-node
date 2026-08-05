@@ -45,6 +45,25 @@ user that runs ccc-node.
   not expose a bounded stored-session browser, so `/resume` cannot list or
   preview arbitrary Piri sessions.
 
+## Memory contract
+
+- Audience-scoped memory gives every audience private Piri transcript and
+  generated-bootstrap directories. Piri's global provider configuration and
+  credential store remain shared and are not copied into those directories.
+- ccc-node disables Piri's automatic project context discovery with
+  `--no-context-files` and passes only the audience-scoped generated
+  `AGENTS.md` as an appended system prompt.
+- The stored-session reader accepts only bounded, owner-only, non-symlink
+  Piri JSONL transcripts whose header contains the exact requested session id.
+- Session-end, provider-switch, `/new`, shutdown, and `/distill` checkpoints
+  enter the same local, Honcho, and Family Wiki writeback pipeline used by
+  Codex. The source provenance remains `piri`.
+- Writeback extraction currently uses the isolated Codex extraction backend,
+  so a working Codex CLI and authentication are required for Piri distillation;
+  the interactive Piri turn still runs on its configured Kimi or GLM model.
+- Piri RPC 0.83 has no post-compaction hook. Read bootstrap and session-end
+  writeback are supported, while post-compaction refresh remains degraded.
+
 ## Telegram surface
 
 - `/model` uses Piri's live `get_available_models` catalog.
@@ -56,9 +75,9 @@ user that runs ccc-node.
   expose normalized tokens, account quota, or reset windows.
 - Startup readiness requires both a working Piri CLI and at least one model
   returned by RPC discovery for the configured Piri auth store.
-- Audience-scoped ccc memory is rejected for Piri until configuration,
-  credentials, and session storage can be isolated per audience. `off` and
-  `curated` memory modes remain available.
+- Audience-scoped ccc memory is supported when the exact generated-bootstrap
+  and session-storage routes pass fail-closed validation. `off` and `curated`
+  memory modes remain available.
 
 ## Event contract
 

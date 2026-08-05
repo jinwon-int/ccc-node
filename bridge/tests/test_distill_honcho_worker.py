@@ -70,6 +70,28 @@ async def test_worker_delivers_stable_body_safe_record_and_acks_outbox(
 
 
 @pytest.mark.anyio
+async def test_worker_preserves_piri_provenance_in_honcho_record(
+    tmp_path: Path,
+) -> None:
+    journal = DistillJournal(tmp_path / "journal")
+    journal.initialize()
+    job = await extracted_job(journal, provider="piri")
+    sender = RecordingSender()
+    worker = CodexDistillHonchoSinkWorker(
+        journal,
+        outbox_dir=tmp_path / "honcho-outbox",
+        sender=sender,
+        owner_token="piri-honcho-worker",
+    )
+
+    result = await worker.write_once(job_id=job.job_id)
+
+    assert result.honcho_sink_status is DistillHonchoSinkStatus.DONE
+    assert sender.records[0]["session_id"] == f"piri-distill-{job.job_id[:24]}"
+    assert sender.records[0]["provenance"]["provider"] == "piri"
+
+
+@pytest.mark.anyio
 async def test_delivery_failure_preserves_one_outbox_and_retries_without_extraction(
     tmp_path: Path,
 ) -> None:

@@ -99,6 +99,7 @@ class Doctor:
         self.settings_valid = False
         self.current_settings: dict[str, Any] | None = None
         self._rewrite_pairs: dict[str, str] | None = None
+        self._bridge_provider_state: tuple[str, str] | None = None
 
     def add(self, klass: str, item: str, status: str, action: str) -> None:
         self.rows.append(Row(klass, item, status, action))
@@ -457,13 +458,26 @@ class Doctor:
     def check_provider_readiness(self) -> None:
         if self.provider == "claude":
             return
+        if self.provider == "piri":
+            if self._bridge_provider_state == ("piri", "healthy"):
+                self.readiness = "ready"
+                self.add("정상", "Piri runtime", "healthy", "none")
+            else:
+                self.readiness = "failed"
+                self.add(
+                    "수동필요",
+                    "Piri runtime",
+                    "live readiness not proven",
+                    "inspect bridge status and Piri provider authentication",
+                )
+            return
         if self.provider != "codex":
             self.readiness = "failed"
             self.add(
                 "수동필요",
                 "agent provider",
                 "unsupported provider",
-                "set CCC_AGENT_PROVIDER to claude or codex",
+                "set CCC_AGENT_PROVIDER to claude, codex, or piri",
             )
             return
 
@@ -644,6 +658,26 @@ class Doctor:
             return "경고", "unavailable"
         return "경고", "unrecognized status output" if output.strip() else "no status output"
 
+    @staticmethod
+    def bridge_status_provider(output: str) -> tuple[str, str] | None:
+        """Return the single body-free provider label rendered by start.sh."""
+
+        labels = {
+            "Claude": "claude",
+            "Codex": "codex",
+            "Piri": "piri",
+        }
+        found: list[tuple[str, str]] = []
+        for label, provider in labels.items():
+            match = re.search(
+                rf"^\s*{label}:\s+(healthy|degraded|unavailable)\b",
+                output,
+                re.MULTILINE,
+            )
+            if match:
+                found.append((provider, match.group(1)))
+        return found[0] if len(found) == 1 else None
+
     def check_bridge_status(self) -> None:
         start = self.repo / "bridge/start.sh"
         if os.access(start, os.X_OK):
@@ -656,6 +690,10 @@ class Doctor:
             try:
                 out = subprocess.run(["bash", str(start), "--path", probe_home, "--status"], text=True, capture_output=True, timeout=20)
                 output = out.stdout + out.stderr
+                detected_provider = self.bridge_status_provider(output)
+                if detected_provider is not None:
+                    self._bridge_provider_state = detected_provider
+                    self.provider = detected_provider[0]
                 klass, status = self.bridge_status_verdict(out.returncode, output)
                 action = "none" if klass == "정상" else "inspect bridge service and body-free health diagnostics"
                 self.add(klass, "bridge status", status, action)

@@ -1139,3 +1139,43 @@ print("COMPOSED-ROUTED-SNAPSHOT-WORKER-OK")
     )
     assert result.returncode == 0, result.stderr
     assert "COMPOSED-ROUTED-SNAPSHOT-WORKER-OK" in result.stdout
+
+
+def test_build_context_composes_audience_scoped_piri_memory_pipeline(tmp_path):
+    result = _run_probe(
+        """
+import os
+from pathlib import Path
+
+root = Path(os.environ["PROBE_ROOT"])
+(root / "project").mkdir(parents=True, exist_ok=True)
+os.environ.update({
+    "PROJECT_ROOT": str(root / "project"),
+    "TELEGRAM_BOT_TOKEN": "123456:test",
+    "ALLOWED_USER_IDS": "1",
+    "CCC_AGENT_PROVIDER": "piri",
+    "CCC_BRIDGE_MEMORY_MODE": "audience-scoped",
+    "CCC_BRIDGE_MEMORY_AUDIENCE_ROOT": str(root / "audiences"),
+    "CCC_HONCHO_MEMORY_ENABLED": "1",
+    "CCC_HONCHO_CFG": str(root / "honcho.json"),
+})
+
+from telegram_bot.__main__ import build_context, load_runtime_settings
+from telegram_bot.core.piri_runtime import PiriRuntime
+from telegram_bot.memory.codex_snapshot import CodexThreadSnapshotter
+
+context = build_context(load_runtime_settings())
+assert isinstance(context.agent_runtime, PiriRuntime)
+assert context.agent_runtime._route_environment_factory is not None
+assert context.agent_runtime._memory_environment_validator is not None
+assert isinstance(context.distill_snapshot_worker, CodexThreadSnapshotter)
+assert context.distill_snapshot_worker._runtime is context.agent_runtime
+assert context.distill_local_sink_worker is not None
+assert context.distill_wiki_sink_worker is not None
+assert context.distill_honcho_sink_worker is not None
+print("COMPOSED-PIRI-MEMORY-PIPELINE-OK")
+""",
+        probe_root=tmp_path,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "COMPOSED-PIRI-MEMORY-PIPELINE-OK" in result.stdout

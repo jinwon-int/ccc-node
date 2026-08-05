@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Mapping, Sequence
+import os
 from pathlib import Path
+import stat
 import sys
 import tempfile
 from typing import TYPE_CHECKING, Any
 import unittest
+from unittest.mock import patch
 
 if TYPE_CHECKING:
     from core.agent_runtime import AgentEvent
@@ -139,6 +142,96 @@ class PiriRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(config.environment["BASE"], "one")
         self.assertEqual(config.environment["MEMORY"], "two")
         self.assertTrue(config.auto_confirm_extensions)
+
+    async def test_audience_memory_is_materialized_and_isolated_from_context_discovery(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            session_dir = root / "sessions"
+            bootstrap_home = root / "bootstrap"
+            context_file = bootstrap_home / "AGENTS.md"
+            memory_environment = {
+                "PIRI_CODING_AGENT_SESSION_DIR": str(session_dir),
+                "CCC_PIRI_BOOTSTRAP_HOME": str(bootstrap_home),
+                "CCC_PIRI_BOOTSTRAP_CONTEXT_FILE": str(context_file),
+            }
+
+            async def materialize(
+                _path: str, *, timeout_seconds: float, environment: Mapping[str, str]
+            ) -> None:
+                self.assertEqual(timeout_seconds, 3.0)
+                self.assertEqual(environment["CODEX_HOME"], str(bootstrap_home))
+                self.assertEqual(environment["CCC_MEMORY_MATERIALIZER_PROVIDER"], "piri")
+                context_file.write_text("scoped memory", encoding="utf-8")
+                context_file.chmod(0o600)
+
+            runtime = PiriRuntime(
+                executable="/opt/piri/bin/piri",
+                client_factory=self.factory,
+                process_environment={"BASE": "one"},
+                memory_materializer_path="/materializer",
+                memory_bootstrap_timeout_seconds=3.0,
+                memory_environment_validator=lambda value: self.assertEqual(
+                    dict(value), memory_environment
+                ),
+            )
+            with patch(
+                "telegram_bot.core.piri_runtime._run_codex_memory_bootstrap",
+                side_effect=materialize,
+            ):
+                session = await runtime.start_or_resume(
+                    SessionRequest(
+                        working_directory="/workspace/project",
+                        memory_environment=memory_environment,
+                    )
+                )
+
+            config = self.factory.clients[-1].config
+            self.assertIn("--no-context-files", config.command)
+            self.assertEqual(
+                config.command[-2:],
+                ("--append-system-prompt", str(context_file)),
+            )
+            self.assertEqual(
+                config.environment["PIRI_CODING_AGENT_SESSION_DIR"],
+                str(session_dir),
+            )
+            self.assertEqual(runtime._session_directories[session.session_id], session_dir)
+            await runtime.close()
+
+    async def test_audience_memory_rejects_a_tampered_route_before_launch(self) -> None:
+        runtime = PiriRuntime(
+            client_factory=self.factory,
+            process_environment={"BASE": "one"},
+            memory_materializer_path="/materializer",
+            memory_environment_validator=lambda _value: (_ for _ in ()).throw(
+                ValueError("invalid route")
+            ),
+        )
+        with self.assertRaisesRegex(ValueError, "invalid route"):
+            await runtime.start_or_resume(
+                SessionRequest(
+                    working_directory="/workspace",
+                    memory_environment={"UNTRUSTED": "path"},
+                )
+            )
+        self.assertEqual(self.factory.clients, [])
+
+    async def test_memory_materializer_without_route_validator_fails_closed(self) -> None:
+        runtime = PiriRuntime(
+            client_factory=self.factory,
+            process_environment={"BASE": "one"},
+            memory_materializer_path="/materializer",
+        )
+        with self.assertRaisesRegex(ValueError, "route validator"):
+            await runtime.start_or_resume(
+                SessionRequest(
+                    working_directory="/workspace",
+                    memory_environment={"UNTRUSTED": "path"},
+                )
+            )
+        self.assertEqual(self.factory.clients, [])
 
     async def test_resume_uses_and_verifies_exact_session_id(self) -> None:
         session = await self.runtime.start_or_resume(
@@ -439,6 +532,8 @@ class PiriRpcProcessClientTests(unittest.IsolatedAsyncioTestCase):
         child = """
 import json
 import sys
+from pathlib import Path
+Path("piri-child-state").write_text("private")
 command = json.loads(sys.stdin.readline())
 request = {
     "type": "extension_ui_request",
@@ -470,6 +565,13 @@ print(json.dumps(response), flush=True)
                 await client.start()
                 state = await client.get_state()
                 self.assertEqual(state["sessionId"], "rpc-session")
+                if os.name == "posix":
+                    self.assertEqual(
+                        stat.S_IMODE(
+                            (Path(directory) / "piri-child-state").stat().st_mode
+                        ),
+                        0o600,
+                    )
             finally:
                 await client.close()
 

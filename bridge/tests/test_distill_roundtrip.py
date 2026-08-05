@@ -83,3 +83,64 @@ async def test_thread_a_fact_appears_once_in_isolated_thread_b_snapshot(
     assert snapshot.count(FACT) == 1
     assert "Honcho disabled" in snapshot
     assert "Family Wiki disabled" in snapshot
+
+
+@pytest.mark.anyio
+async def test_piri_thread_a_fact_appears_in_next_audience_bootstrap(
+    tmp_path: Path,
+) -> None:
+    journal = DistillJournal(tmp_path / "journal")
+    journal.initialize()
+    job = await extracted_job(journal, provider="piri")
+    audience_root = tmp_path / "audiences"
+    worker = CodexDistillLocalSinkWorker(
+        journal,
+        audience_root=audience_root,
+        owner_token="piri-roundtrip-local-worker",
+        indexer_path=ROOT / "scripts" / "ccc-memory-index.sh",
+    )
+
+    written = await worker.write_once(job_id=job.job_id)
+
+    assert written.local_sink_status is DistillLocalSinkStatus.DONE
+    scope = str(job.memory_scope)
+    audience = MemoryAudience("private", scope, audience_root)
+    local_facts = (audience.state_dir / "memory-facts.jsonl").read_text()
+    assert '"provider":"piri"' in local_facts
+    settings = SimpleNamespace(
+        claude_settings_path=tmp_path / "legacy" / ".claude" / "settings.json",
+        honcho_memory_enabled=False,
+        honcho_config_path=tmp_path / ".hermes" / "honcho.json",
+    )
+    environment = os.environ.copy()
+    environment.update(audience.piri_environment(settings))
+    environment.update(
+        {
+            "HOME": str(tmp_path / "home"),
+            "PROJECT_ROOT": str(ROOT),
+            "CODEX_HOME": str(audience.piri_bootstrap_home),
+            "CODEX_SQLITE_HOME": str(audience.piri_bootstrap_home),
+            "CCC_MEMORY_MATERIALIZER_PROVIDER": "piri",
+            "CCC_CODEX_MEMORY_LOADER": str(ROOT / "claude" / "hooks" / "load-memory.sh"),
+            "CCC_HOOK_DIR": str(ROOT / "claude" / "hooks"),
+            "CCC_MEMORY_TOOLS_DIR": str(ROOT / "scripts"),
+            "CCC_MEMORY_NO_REFRESH": "1",
+            "CCC_LOCAL_MEMORY_ENABLED": "1",
+            "CCC_CODEX_MEMORY_MAX_BYTES": "8192",
+            "CCC_CODEX_AGENTS_BUDGET_BYTES": "16384",
+        }
+    )
+
+    completed = subprocess.run(
+        [sys.executable, str(ROOT / "scripts" / "ccc_codex_memory.py"), "materialize", "--json"],
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=20,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    context = (audience.piri_bootstrap_home / "AGENTS.md").read_text()
+    assert context.count(FACT) == 1

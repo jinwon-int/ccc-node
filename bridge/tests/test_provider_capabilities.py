@@ -251,6 +251,34 @@ class CapabilityRuntimeDriftTests(unittest.TestCase):
             (REPO_ROOT / "bridge/memory/distill_honcho_worker.py").is_file()
         )
 
+    def test_piri_memory_parity_is_grounded_in_runtime_and_roundtrip_tests(self) -> None:
+        from telegram_bot.core.piri_runtime import PiriRuntime
+
+        for axis in (
+            "memory_read_bootstrap",
+            "memory_writeback_distill",
+            "memory_sink_local",
+            "memory_sink_honcho",
+            "memory_sink_wiki_candidate",
+            "memory_roundtrip",
+        ):
+            with self.subTest(axis=axis):
+                self.assertIs(
+                    capability_status("piri", axis).state,
+                    CapabilityState.SUPPORTED,
+                )
+        self.assertIs(
+            capability_status("piri", "memory_postcompact_reinject").state,
+            CapabilityState.DEGRADED,
+        )
+        self.assertTrue(hasattr(PiriRuntime, "read_session_snapshot"))
+        self.assertTrue(
+            (REPO_ROOT / "bridge/memory/piri_snapshot.py").is_file()
+        )
+        self.assertTrue(
+            (REPO_ROOT / "bridge/tests/test_distill_roundtrip.py").is_file()
+        )
+
     def test_lifecycle_observability_claim_matches_the_opt_in_surfaces(self) -> None:
         from telegram_bot.core import (
             lifecycle_audit,

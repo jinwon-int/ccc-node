@@ -257,7 +257,11 @@ class CodexDistillExtractionWorker:
                 terminal=True,
             )
         try:
-            extraction_input = build_extraction_input(snapshot, trigger=claimed.trigger)
+            extraction_input = build_extraction_input(
+                snapshot,
+                trigger=claimed.trigger,
+                provider=claimed.provider,
+            )
         except (TypeError, ValueError):
             self._refund_unused_reservation(reservation)
             return await self._fail(
