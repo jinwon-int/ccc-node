@@ -970,17 +970,37 @@ class Doctor:
                 wiki = (mem.get("wiki") or {}).get("status", "unknown")
                 honcho = (mem.get("honcho") or {}).get("status", "unknown")
                 idx = (mem.get("local_index") or {}).get("exists", False)
-                nunchi = (mem.get("nunchi") or {}).get("status", "unknown")
+                nunchi_payload = mem.get("nunchi") or {}
+                nunchi = nunchi_payload.get("status", "unknown")
                 mempalace = (mem.get("mempalace") or {}).get("status", "unknown")
+                audiences = nunchi_payload.get("audience_scoped") or {}
+                scoped_enabled = audiences.get("enabled") is True
+                scoped_root = str(audiences.get("root_status", "disabled"))
+                scoped_invalid = int(audiences.get("invalid_entries", 0) or 0)
+                scoped_summary = ""
+                if scoped_enabled:
+                    scoped_summary = (
+                        "; audiences={}/{}/{} root={} invalid={}".format(
+                            int(audiences.get("scope_count", 0) or 0),
+                            int(audiences.get("private_count", 0) or 0),
+                            int(audiences.get("shared_count", 0) or 0),
+                            scoped_root,
+                            scoped_invalid,
+                        )
+                    )
                 status = (
                     f"wiki={wiki}; honcho={honcho}; local_index={str(idx).lower()}; "
-                    f"nunchi={nunchi}; mempalace={mempalace}"
+                    f"nunchi={nunchi}; mempalace={mempalace}{scoped_summary}"
                 )
                 if (
                     wiki in {"ok", "disabled"}
                     and honcho in {"ok", "disabled"}
                     and nunchi in {"ok", "off"}
                     and mempalace in {"ok", "off", "optional"}
+                    and (
+                        not scoped_enabled
+                        or (scoped_root == "ok" and scoped_invalid == 0)
+                    )
                 ):
                     self.add("정상", "memory cache", status, "none")
                 else:

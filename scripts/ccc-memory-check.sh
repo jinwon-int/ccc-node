@@ -352,6 +352,17 @@ printf -- '- nunchi: %s mode=%s facts=%s snapshot_bytes=%s feed=%s reasons=%s\n'
   "$(jq -r '.nunchi.snapshot.bytes // 0' <<<"$memory_probe_json")" \
   "$(jq -r '.nunchi.cron.feed // "missing"' <<<"$memory_probe_json")" \
   "$(jq -r '.nunchi.reasons | join(",")' <<<"$memory_probe_json")"
+printf -- '- nunchi_audiences: enabled=%s root=%s scopes=%s private=%s shared=%s sessions=%s dbs=%s snapshots=%s mempalace_indexes=%s invalid=%s\n' \
+  "$(jq -r '.nunchi.audience_scoped.enabled // false' <<<"$memory_probe_json")" \
+  "$(jq -r '.nunchi.audience_scoped.root_status // "disabled"' <<<"$memory_probe_json")" \
+  "$(jq -r '.nunchi.audience_scoped.scope_count // 0' <<<"$memory_probe_json")" \
+  "$(jq -r '.nunchi.audience_scoped.private_count // 0' <<<"$memory_probe_json")" \
+  "$(jq -r '.nunchi.audience_scoped.shared_count // 0' <<<"$memory_probe_json")" \
+  "$(jq -r '.nunchi.audience_scoped.session_roots // 0' <<<"$memory_probe_json")" \
+  "$(jq -r '.nunchi.audience_scoped.nunchi_db_partitions // 0' <<<"$memory_probe_json")" \
+  "$(jq -r '.nunchi.audience_scoped.snapshot_partitions // 0' <<<"$memory_probe_json")" \
+  "$(jq -r '.nunchi.audience_scoped.mempalace_index_partitions // 0' <<<"$memory_probe_json")" \
+  "$(jq -r '.nunchi.audience_scoped.invalid_entries // 0' <<<"$memory_probe_json")"
 printf -- '- mempalace: %s required=%s embeddings=%s reasons=%s\n' \
   "$(jq -r '.mempalace.status' <<<"$memory_probe_json")" \
   "$(jq -r '.mempalace.required' <<<"$memory_probe_json")" \

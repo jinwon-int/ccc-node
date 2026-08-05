@@ -725,24 +725,45 @@ def _nunchi_mode_enabled(options: MaterializeOptions) -> bool:
     scoped = _environment_truthy(options.environ.get("CCC_MEMORY_AUDIENCE_SCOPED"))
     state_dir = options.state_dir
     if scoped:
-        # Unscoped nunchi is private legacy input. Accept it only for the exact
-        # bridge-owned private compatibility route; a shared or malformed
-        # environment never receives a node-global snapshot.
+        # Scoped Nunchi must match the canonical opaque audience tree exactly.
+        # The mode switch remains node-global; only a private route may add the
+        # pre-scope node-global Nunchi store as compatibility input.
         env = options.environ
         home = Path(env.get("HOME") or str(Path.home())).expanduser().absolute()
+        kind = env.get("CCC_MEMORY_AUDIENCE") or ""
+        scope = env.get("CCC_MEMORY_SCOPE") or ""
+        root = Path(env.get("CCC_MEMORY_AUDIENCE_ROOT") or "").expanduser()
+        nunchi_root = Path(env.get("CCC_NUNCHI_AUDIENCE_ROOT") or "").expanduser()
+        nunchi_home = Path(env.get("NUNCHI_HOME") or "").expanduser()
+        nunchi_db = Path(env.get("NUNCHI_DB") or "").expanduser()
+        shared_home = Path(env.get("CCC_NUNCHI_SHARED_HOME") or "").expanduser()
         legacy_state = Path(env.get("CCC_MEMORY_LEGACY_STATE_DIR") or "").expanduser()
         legacy_nunchi = Path(
             env.get("CCC_MEMORY_LEGACY_NUNCHI_HOME") or ""
         ).expanduser()
+        valid_scope = scope == "shared" if kind == "shared" else bool(
+            kind == "private" and re.fullmatch(r"private-[0-9a-f]{32}", scope)
+        )
         if not (
-            env.get("CCC_MEMORY_AUDIENCE") == "private"
-            and re.fullmatch(r"private-[0-9a-f]{32}", env.get("CCC_MEMORY_SCOPE") or "")
-            and _environment_truthy(env.get("CCC_MEMORY_LEGACY_PRIVATE_READS"))
+            _environment_truthy(env.get("CCC_NUNCHI_AUDIENCE_SCOPED"))
+            and valid_scope
+            and root.is_absolute()
+            and nunchi_root == root
+            and nunchi_home == root / scope / "nunchi"
+            and nunchi_db == nunchi_home / "facts.db"
+            and shared_home == root / "shared" / "nunchi"
             and legacy_state.is_absolute()
             and legacy_state == options.claude_dir / "state"
-            and legacy_nunchi.is_absolute()
-            and legacy_nunchi == home / ".nunchi"
         ):
+            return False
+        if kind == "private":
+            if not (
+                _environment_truthy(env.get("CCC_MEMORY_LEGACY_PRIVATE_READS"))
+                and legacy_nunchi.is_absolute()
+                and legacy_nunchi == home / ".nunchi"
+            ):
+                return False
+        elif _environment_truthy(env.get("CCC_MEMORY_LEGACY_PRIVATE_READS")):
             return False
         state_dir = legacy_state
     path = state_dir / "nunchi.mode"

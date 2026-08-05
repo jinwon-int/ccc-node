@@ -570,11 +570,14 @@ script = repo / "scripts/ccc-memory-check.sh"
 script.touch()
 script.chmod(0o755)
 
-def classify(nunchi, mempalace):
+def classify(nunchi, mempalace, audiences=None):
+    nunchi_payload = {"status": nunchi}
+    if audiences is not None:
+        nunchi_payload["audience_scoped"] = audiences
     payload = {
         "wiki": {"status": "ok"}, "honcho": {"status": "ok"},
         "local_index": {"exists": True},
-        "nunchi": {"status": nunchi}, "mempalace": {"status": mempalace},
+        "nunchi": nunchi_payload, "mempalace": {"status": mempalace},
     }
     script.write_text("#!/usr/bin/env bash\nprintf '%s' '" + json.dumps(payload) + "'\n")
     d = mod.Doctor(repo, claude, "settings")
@@ -582,12 +585,21 @@ def classify(nunchi, mempalace):
     row = d.rows[0]
     return {"klass": row.klass, "status": row.status}
 
-print(json.dumps({"healthy": classify("ok", "ok"), "degraded": classify("degraded", "ok")}, ensure_ascii=False))
+print(json.dumps({
+    "healthy": classify("ok", "ok"),
+    "degraded": classify("degraded", "ok"),
+    "scoped": classify("ok", "ok", {"enabled": True, "root_status": "ok", "invalid_entries": 0, "scope_count": 4, "private_count": 3, "shared_count": 1}),
+    "unsafe": classify("ok", "ok", {"enabled": True, "root_status": "unsafe", "invalid_entries": 1, "scope_count": 0, "private_count": 0, "shared_count": 0}),
+}, ensure_ascii=False))
 PY_EOF
 nout="$(DOCTOR_PY="$ROOT/scripts/ccc_doctor.py" NUNCHI_REPO="$TMP/nunchi-repo" python3 "$TMP/nunchi-memory.py")"
 ok "doctor accepts a healthy new memory stack" 'jq -e '\''.healthy.klass == "정상"'\'' <<<"$nout" >/dev/null'
 ok "doctor warns when nunchi is degraded despite healthy Honcho" \
   'jq -e '\''.degraded.klass == "경고" and (.degraded.status | contains("nunchi=degraded"))'\'' <<<"$nout" >/dev/null'
+ok "doctor reports body-free scoped audience counts and accepts a safe root" \
+  'jq -e '\''.scoped.klass == "정상" and (.scoped.status | contains("audiences=4/3/1 root=ok invalid=0"))'\'' <<<"$nout" >/dev/null'
+ok "doctor warns for an unsafe scoped audience root" \
+  'jq -e '\''.unsafe.klass == "경고" and (.unsafe.status | contains("root=unsafe invalid=1"))'\'' <<<"$nout" >/dev/null'
 
 # #920: doctor surfaces the nunchi MemPalace collection lane (configured provider
 # vs runtime CCC_AGENT_PROVIDER DRIFT, source kind/path, MemPalace binary/version,
