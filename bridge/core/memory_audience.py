@@ -80,6 +80,11 @@ class MemoryAudience:
         """Return body-free paths/policy for the existing memory hook stack."""
 
         claude_root = Path(settings.claude_settings_path).expanduser().parent
+        home_root = claude_root.parent
+        policy_factory = getattr(settings, "hook_policy_environment", None)
+        policy = policy_factory() if callable(policy_factory) else {}
+        private_legacy = self.kind == AUDIENCE_PRIVATE
+        private_wiki = private_legacy and policy.get("CCC_WIKI_MEMORY_ENABLED") == "1"
         env = {
             "CCC_MEMORY_AUDIENCE_SCOPED": "1",
             "CCC_MEMORY_AUDIENCE": self.kind,
@@ -102,7 +107,13 @@ class MemoryAudience:
             "CCC_MEMORY_LEGACY_STATE_DIR": str(claude_root / "state"),
             "CCC_MEMORY_LEGACY_CACHE_DIR": str(claude_root / "hooks" / "cache"),
             "CCC_MEMORY_LEGACY_DIR": str(claude_root / "memories"),
+            "CCC_MEMORY_LEGACY_HERMES_DIR": str(home_root / ".hermes" / "memories"),
             "CCC_MEMORY_LEGACY_RESUME_FILE": str(claude_root / "state" / "resume.md"),
+            # These paths are accepted only for an exact private audience
+            # mapping. They let a newly scoped DM read the node's pre-scope
+            # working-memory snapshot without copying it into a public store.
+            "CCC_MEMORY_LEGACY_PRIVATE_READS": "1" if private_legacy else "0",
+            "CCC_MEMORY_LEGACY_NUNCHI_HOME": str(home_root / ".nunchi"),
             # Honcho derives a distinct server-side workspace from this opaque
             # scope. Private recall may additionally read the shared workspace
             # and the private-only legacy workspace; public routes never do.
@@ -121,11 +132,20 @@ class MemoryAudience:
                     )
                 ).expanduser()
             ),
-            # Family Wiki reads still use one global cache. Candidate writes
-            # are separately routed by the bridge worker, but hook reads stay
-            # disabled until they have an audience filter.
-            "CCC_WIKI_MEMORY_ENABLED": "0",
+            # The pre-scope Wiki cache is private legacy input. A private DM may
+            # read it and refresh a route-local cache; public routes remain off.
+            "CCC_WIKI_MEMORY_ENABLED": "1" if private_wiki else "0",
         }
+        if private_legacy:
+            # The canonical blocks are individually bounded. This larger
+            # private-only aggregate cap prevents the second legacy MEMORY set
+            # from crowding out local hot recall before Piri materialization.
+            env.update(
+                {
+                    "CCC_MEMORY_MAX_BYTES": "18000",
+                    "CCC_BUILTIN_MEMORY_MAX_BYTES": "8000",
+                }
+            )
         return env
 
     def codex_environment(self, settings: Any) -> dict[str, str]:
@@ -180,6 +200,16 @@ class MemoryAudience:
                 ),
             }
         )
+        if self.kind == AUDIENCE_PRIVATE:
+            # A private compatibility snapshot can contain the bounded
+            # canonical, legacy, remote-cache and nunchi blocks. Keep the
+            # materializer's cap above load-memory.sh's own hard bound.
+            env.update(
+                {
+                    "CCC_CODEX_MEMORY_MAX_BYTES": "24576",
+                    "CCC_CODEX_AGENTS_BUDGET_BYTES": "32768",
+                }
+            )
         return env
 
 

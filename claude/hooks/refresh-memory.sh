@@ -35,7 +35,7 @@ if ! is_disabled "$AUDIENCE_SCOPED"; then
     && [ "$FACTS_FILE" = "$AUDIENCE_ROOT/$MEMORY_SCOPE/state/memory-facts.jsonl" ] \
     && [ "$SHARED_FACTS_FILE" = "$AUDIENCE_ROOT/shared/state/memory-facts.jsonl" ] \
     || exit 0
-  WIKI_ENABLED=0
+  [ "$MEMORY_AUDIENCE" = "private" ] || WIKI_ENABLED=0
   if ! honcho_scope_valid; then
     HONCHO_ENABLED=0
   fi

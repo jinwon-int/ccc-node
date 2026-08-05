@@ -84,12 +84,18 @@ ok "legacy Hermes fallback quotes HOME paths containing spaces" '[ "$rc" = 0 ] &
 audroot="$TMP/audiences"
 private_scope="private-00000000000000000000000000000000"
 legacy_mem="$TMP/legacy-private/memories"
+legacy_hermes_mem="$TMP/legacy-private/hermes-memories"
+legacy_cache="$TMP/legacy-private/cache"
 shared_mem="$audroot/shared/memories"
 private_mem="$audroot/$private_scope/memories"
-mkdir -p "$legacy_mem" "$shared_mem" "$private_mem" \
+mkdir -p "$legacy_mem" "$legacy_hermes_mem" "$legacy_cache" \
+  "$shared_mem" "$private_mem" \
   "$audroot/shared/state" "$audroot/shared/cache" \
   "$audroot/$private_scope/state" "$audroot/$private_scope/cache"
 printf 'LEGACY_PRIVATE_ONLY marker\n' > "$legacy_mem/MEMORY.md"
+printf 'LEGACY_HERMES_PRIVATE_ONLY marker\n' > "$legacy_hermes_mem/MEMORY.md"
+printf 'LEGACY_WIKI_PRIVATE_ONLY marker\n' > "$legacy_cache/wiki.txt"
+printf 'LEGACY_HONCHO_PRIVATE_ONLY marker\n' > "$legacy_cache/honcho.txt"
 printf 'SHARED_PUBLIC marker\n' > "$shared_mem/MEMORY.md"
 printf 'DM_PRIVATE_ONLY marker\n' > "$private_mem/MEMORY.md"
 
@@ -101,10 +107,12 @@ out="$(HOME="$TMP/home" \
   CCC_MEMORY_DIR="$shared_mem" CCC_MEMORY_SHARED_STATE_DIR="$audroot/shared/state" \
   CCC_MEMORY_SHARED_CACHE_DIR="$audroot/shared/cache" \
   CCC_MEMORY_SHARED_DIR="$shared_mem" CCC_MEMORY_LEGACY_DIR="$legacy_mem" \
+  CCC_MEMORY_LEGACY_HERMES_DIR="$legacy_hermes_mem" \
+  CCC_MEMORY_LEGACY_CACHE_DIR="$legacy_cache" \
   CCC_HOOK_DIR="$ROOT/claude/hooks" CCC_MEMORY_TOOLS_DIR="$tools" \
   CCC_LOCAL_MEMORY_ENABLED=0 CCC_WIKI_MEMORY_ENABLED=1 CCC_HONCHO_MEMORY_ENABLED=1 \
   CCC_MEMORY_NO_REFRESH=1 bash "$ROOT/claude/hooks/load-memory.sh" SessionStart 2>&1)"; rc=$?
-ok "shared audience injects only public memory" '[ "$rc" = 0 ] && grep -q "SHARED_PUBLIC marker" <<<"$out" && ! grep -q "LEGACY_PRIVATE_ONLY\|DM_PRIVATE_ONLY" <<<"$out"'
+ok "shared audience injects only public memory" '[ "$rc" = 0 ] && grep -q "SHARED_PUBLIC marker" <<<"$out" && ! grep -q "LEGACY_PRIVATE_ONLY\|LEGACY_HERMES_PRIVATE_ONLY\|LEGACY_WIKI_PRIVATE_ONLY\|LEGACY_HONCHO_PRIVATE_ONLY\|DM_PRIVATE_ONLY" <<<"$out"'
 ok "shared audience force-disables unscoped remote sources" '! grep -q "Cached wiki fact\|Cached honcho fact" <<<"$out" && grep -q "shared public facts only" <<<"$out"'
 
 out="$(HOME="$TMP/home" \
@@ -115,11 +123,33 @@ out="$(HOME="$TMP/home" \
   CCC_MEMORY_DIR="$private_mem" CCC_MEMORY_SHARED_STATE_DIR="$audroot/shared/state" \
   CCC_MEMORY_SHARED_CACHE_DIR="$audroot/shared/cache" \
   CCC_MEMORY_SHARED_DIR="$shared_mem" CCC_MEMORY_LEGACY_DIR="$legacy_mem" \
+  CCC_MEMORY_LEGACY_HERMES_DIR="$legacy_hermes_mem" \
+  CCC_MEMORY_LEGACY_CACHE_DIR="$legacy_cache" \
   CCC_HOOK_DIR="$ROOT/claude/hooks" CCC_MEMORY_TOOLS_DIR="$tools" \
   CCC_LOCAL_MEMORY_ENABLED=0 CCC_WIKI_MEMORY_ENABLED=0 CCC_HONCHO_MEMORY_ENABLED=1 \
   CCC_MEMORY_NO_REFRESH=1 bash "$ROOT/claude/hooks/load-memory.sh" SessionStart 2>&1)"; rc=$?
 ok "private audience injects private legacy, private scoped, and shared memory" '[ "$rc" = 0 ] && grep -q "LEGACY_PRIVATE_ONLY marker" <<<"$out" && grep -q "DM_PRIVATE_ONLY marker" <<<"$out" && grep -q "SHARED_PUBLIC marker" <<<"$out"'
 ok "private audience still force-disables unscoped Honcho" 'grep -q "Honcho disabled" <<<"$out" && grep -q "private DM plus explicitly shared" <<<"$out"'
+
+out="$(HOME="$TMP/home" \
+  CCC_MEMORY_AUDIENCE_SCOPED=1 CCC_MEMORY_AUDIENCE=private CCC_MEMORY_SCOPE="$private_scope" \
+  CCC_MEMORY_AUDIENCE_ROOT="$audroot" \
+  CCC_STATE_DIR="$audroot/$private_scope/state" CCC_MEMORY_CACHE_DIR="$audroot/$private_scope/cache" \
+  CCC_RESUME_FILE="$audroot/$private_scope/state/resume.md" \
+  CCC_MEMORY_DIR="$private_mem" CCC_MEMORY_SHARED_STATE_DIR="$audroot/shared/state" \
+  CCC_MEMORY_SHARED_CACHE_DIR="$audroot/shared/cache" \
+  CCC_MEMORY_SHARED_DIR="$shared_mem" CCC_MEMORY_LEGACY_DIR="$legacy_mem" \
+  CCC_MEMORY_LEGACY_HERMES_DIR="$legacy_hermes_mem" \
+  CCC_MEMORY_LEGACY_CACHE_DIR="$legacy_cache" \
+  CCC_HOOK_DIR="$ROOT/claude/hooks" CCC_MEMORY_TOOLS_DIR="$tools" \
+  CCC_LOCAL_MEMORY_ENABLED=0 CCC_WIKI_MEMORY_ENABLED=1 CCC_HONCHO_MEMORY_ENABLED=1 \
+  CCC_HONCHO_AUDIENCE_SCOPED=1 CCC_HONCHO_WORKSPACE_SCOPE="$private_scope" \
+  CCC_HONCHO_SHARED_WORKSPACE_SCOPE=shared CCC_MEMORY_NO_REFRESH=1 \
+  bash "$ROOT/claude/hooks/load-memory.sh" SessionStart 2>&1)"; rc=$?
+ok "private compatibility route inherits both Claude and Hermes built-ins" \
+  '[ "$rc" = 0 ] && grep -q "LEGACY_PRIVATE_ONLY marker" <<<"$out" && grep -q "LEGACY_HERMES_PRIVATE_ONLY marker" <<<"$out"'
+ok "private compatibility route falls back to pre-scope Wiki and Honcho caches" \
+  'grep -q "LEGACY_WIKI_PRIVATE_ONLY marker" <<<"$out" && grep -q "LEGACY_HONCHO_PRIVATE_ONLY marker" <<<"$out"'
 
 out="$(HOME="$TMP/home" \
   CCC_MEMORY_AUDIENCE_SCOPED=1 CCC_MEMORY_AUDIENCE=shared CCC_MEMORY_SCOPE=shared \
