@@ -395,6 +395,11 @@ run cp "$SRC/scripts/ccc-skill-autosave.sh" "$CLAUDE_DIR/hooks/ccc-skill-autosav
 # Self-update — the pre-approved node maintenance procedure (pull + setup +
 # restart of operator-allowlisted services only; see docs/self-update.md).
 run cp "$SRC/scripts/ccc-self-update.sh" "$CLAUDE_DIR/hooks/ccc-self-update.sh"
+# PR/issue status poll (ccc-node#962) — notices when a PR this node's bridge
+# identity opened changes state (CI done, closed, merged); scheduled
+# separately via scripts/install-pr-status-poll-cron.sh, tracks only the
+# repos an operator lists in ~/.claude/pr-status-poll.repos.
+run cp "$SRC/scripts/ccc-pr-status-poll.sh" "$CLAUDE_DIR/hooks/ccc-pr-status-poll.sh"
 # Executable files copied into hooks/ from OUTSIDE the claude/hooks/ tree.
 # (ccc_memory_index.py / ccc_memory_search.py are deliberately NOT here: they
 # are python modules invoked via their .sh wrappers and are installed 644.)
@@ -417,6 +422,7 @@ installed_hook_scripts=(
   "$CLAUDE_DIR/hooks/ccc-memory-benchmark-export.sh"
   "$CLAUDE_DIR/hooks/ccc-skill-autosave.sh"
   "$CLAUDE_DIR/hooks/ccc-self-update.sh"
+  "$CLAUDE_DIR/hooks/ccc-pr-status-poll.sh"
 )
 run chmod +x "${installed_hook_scripts[@]}" "${hook_tree_targets[@]}"
 # #909: register a self-update agent-cron task so the harness auto-updates on
