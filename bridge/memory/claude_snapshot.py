@@ -95,6 +95,41 @@ def _read_private_tail(
         os.close(descriptor)
 
 
+def _message_from_line(
+    raw_line: bytes,
+    *,
+    fallback: datetime,
+    captured: datetime,
+    max_age_seconds: int,
+    max_message_bytes: int,
+) -> tuple[TranscriptMessage | None, str | None, bool]:
+    """Parse one untrusted JSONL row without exposing its body on failure."""
+
+    try:
+        entry: Any = json.loads(raw_line)
+    except (UnicodeError, ValueError):
+        return None, None, True
+    if not isinstance(entry, Mapping):
+        return None, None, False
+    raw_role = entry.get("type")
+    message = entry.get("message")
+    if raw_role not in {"user", "assistant"} or not isinstance(message, Mapping):
+        return None, None, False
+    if message.get("role") != raw_role:
+        return None, None, False
+    text = _text_content(message.get("content"))
+    if not text:
+        return None, None, False
+    timestamp, parsed_time = _timestamp(entry.get("timestamp"), fallback)
+    if (captured - parsed_time).total_seconds() > max_age_seconds:
+        return None, None, True
+    text, shortened = _bounded_text(text, max_message_bytes)
+    role: Literal["user", "assistant"] = raw_role
+    raw_id = entry.get("uuid")
+    item_id = raw_id if isinstance(raw_id, str) and raw_id else None
+    return TranscriptMessage(role, text, timestamp), item_id, shortened
+
+
 def read_claude_snapshot(
     transcripts_dir: Path,
     session_id: str,
@@ -133,30 +168,17 @@ def read_claude_snapshot(
             truncated = True
             break
         items_seen += 1
-        try:
-            entry: Any = json.loads(raw_line)
-        except (UnicodeError, ValueError):
-            truncated = True
+        message, item_id, item_truncated = _message_from_line(
+            raw_line,
+            fallback=fallback,
+            captured=captured,
+            max_age_seconds=bounds.max_age_seconds,
+            max_message_bytes=bounds.max_message_bytes,
+        )
+        truncated = truncated or item_truncated
+        if message is None:
             continue
-        if not isinstance(entry, Mapping):
-            continue
-        raw_role = entry.get("type")
-        message = entry.get("message")
-        if raw_role not in {"user", "assistant"} or not isinstance(message, Mapping):
-            continue
-        if message.get("role") != raw_role:
-            continue
-        role: Literal["user", "assistant"] = raw_role
-        text = _text_content(message.get("content"))
-        if not text:
-            continue
-        timestamp, parsed_time = _timestamp(entry.get("timestamp"), fallback)
-        if (captured - parsed_time).total_seconds() > bounds.max_age_seconds:
-            truncated = True
-            continue
-        text, shortened = _bounded_text(text, bounds.max_message_bytes)
-        truncated = truncated or shortened
-        if role == "user":
+        if message.role == "user":
             user_turns += 1
             if user_turns > bounds.max_turns:
                 truncated = True
@@ -165,15 +187,14 @@ def read_claude_snapshot(
         if remaining <= 0:
             truncated = True
             break
-        text, shortened = _bounded_text(text, remaining)
+        text, shortened = _bounded_text(message.text, remaining)
         truncated = truncated or shortened
         if not text:
             break
-        newest.append(TranscriptMessage(role, text, timestamp))
+        newest.append(TranscriptMessage(message.role, text, message.timestamp))
         byte_count += len(text.encode("utf-8"))
-        raw_id = entry.get("uuid")
-        if last_turn_id is None and isinstance(raw_id, str) and raw_id:
-            last_turn_id = raw_id
+        if last_turn_id is None and item_id is not None:
+            last_turn_id = item_id
         if len(newest) >= bounds.max_messages:
             truncated = True
             break
