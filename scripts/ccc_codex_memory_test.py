@@ -955,6 +955,55 @@ class CodexMemoryMaterializerTest(unittest.TestCase):
         self.assertIn("CANONICAL_BASE_SENTINEL", snapshot)
         self.assertNotIn("GLOBAL_NUNCHI_MUST_NOT_LEAK", snapshot)
 
+    def test_private_compatibility_route_inherits_legacy_nunchi_only(self) -> None:
+        loader, env, _base_document = self._prepare_nunchi_loader(
+            snapshot="LEGACY_NUNCHI_PRIVATE_ONLY"
+        )
+        del loader
+        scope = "private-" + "c" * 32
+        audience_root = self.root / "audiences"
+        private_home = audience_root / scope / "codex"
+        private_env = {
+            **env,
+            "CODEX_HOME": str(private_home),
+            "CODEX_SQLITE_HOME": str(private_home),
+            "CCC_MEMORY_AUDIENCE_SCOPED": "1",
+            "CCC_MEMORY_AUDIENCE": "private",
+            "CCC_MEMORY_SCOPE": scope,
+            "CCC_MEMORY_AUDIENCE_ROOT": str(audience_root),
+            "CCC_CODEX_AUDIENCE_AUTH_MODE": "keyring",
+            "CCC_STATE_DIR": str(audience_root / scope / "state"),
+            "CCC_MEMORY_LEGACY_STATE_DIR": env["CCC_STATE_DIR"],
+            "CCC_MEMORY_LEGACY_NUNCHI_HOME": env["NUNCHI_HOME"],
+            "CCC_MEMORY_LEGACY_PRIVATE_READS": "1",
+        }
+        snapshot = self.module.load_snapshot(
+            self.module.MaterializeOptions.from_environ(private_env)
+        )
+        self.assertIn("LEGACY_NUNCHI_PRIVATE_ONLY", snapshot)
+
+        for changed in (
+            {"CCC_MEMORY_AUDIENCE": "shared", "CCC_MEMORY_SCOPE": "shared"},
+            {"CCC_MEMORY_LEGACY_PRIVATE_READS": "0"},
+            {"CCC_MEMORY_LEGACY_NUNCHI_HOME": str(self.root / "other")},
+        ):
+            blocked = self.module.load_snapshot(
+                self.module.MaterializeOptions.from_environ(
+                    {**private_env, **changed}
+                )
+            )
+            self.assertNotIn("LEGACY_NUNCHI_PRIVATE_ONLY", blocked)
+
+        outside = self.root / "outside-nunchi.md"
+        outside.write_text("OUTSIDE_NUNCHI_MUST_NOT_OVERRIDE", encoding="utf-8")
+        exact = self.module.load_snapshot(
+            self.module.MaterializeOptions.from_environ(
+                {**private_env, "NUNCHI_SNAPSHOT": str(outside)}
+            )
+        )
+        self.assertIn("LEGACY_NUNCHI_PRIVATE_ONLY", exact)
+        self.assertNotIn("OUTSIDE_NUNCHI_MUST_NOT_OVERRIDE", exact)
+
     def test_slow_base_keeps_canonical_budget_and_skips_slow_stale_regen(self) -> None:
         loader, env, base_document = self._prepare_nunchi_loader(snapshot="STALE")
         base_loader = loader.parent.parent / "load-memory.sh"

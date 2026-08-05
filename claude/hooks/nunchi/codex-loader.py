@@ -13,6 +13,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import selectors
 import signal
 import stat
@@ -135,11 +136,36 @@ def _state_dir(environ: Mapping[str, str], claude_dir: Path) -> Path:
     return Path(environ.get("CCC_STATE_DIR") or claude_dir / "state").expanduser().absolute()
 
 
-def _mode_is_on(environ: Mapping[str, str], claude_dir: Path) -> bool:
+def _private_legacy_route(
+    environ: Mapping[str, str], *, home: Path, claude_dir: Path
+) -> tuple[Path, Path] | None:
+    if not _truthy(environ.get("CCC_MEMORY_AUDIENCE_SCOPED")):
+        return None
+    scope = environ.get("CCC_MEMORY_SCOPE") or ""
+    state = Path(environ.get("CCC_MEMORY_LEGACY_STATE_DIR") or "").expanduser()
+    nunchi = Path(environ.get("CCC_MEMORY_LEGACY_NUNCHI_HOME") or "").expanduser()
+    if not (
+        environ.get("CCC_MEMORY_AUDIENCE") == "private"
+        and re.fullmatch(r"private-[0-9a-f]{32}", scope)
+        and _truthy(environ.get("CCC_MEMORY_LEGACY_PRIVATE_READS"))
+        and state.is_absolute()
+        and state == claude_dir / "state"
+        and nunchi.is_absolute()
+        and nunchi == home / ".nunchi"
+    ):
+        return None
+    return state, nunchi
+
+
+def _mode_is_on(environ: Mapping[str, str], claude_dir: Path, home: Path) -> bool:
+    state_dir = _state_dir(environ, claude_dir)
     if _truthy(environ.get("CCC_MEMORY_AUDIENCE_SCOPED")):
-        return False
+        legacy = _private_legacy_route(environ, home=home, claude_dir=claude_dir)
+        if legacy is None:
+            return False
+        state_dir = legacy[0]
     mode = _safe_read(
-        _state_dir(environ, claude_dir) / "nunchi.mode",
+        state_dir / "nunchi.mode",
         max_bytes=16,
         local_only=True,
     )
@@ -359,12 +385,28 @@ def _nunchi_context(
     hook_dir: Path,
     deadline: float,
 ) -> str | None:
-    if not _mode_is_on(environ, claude_dir):
+    if not _mode_is_on(environ, claude_dir, home):
         return None
-    nunchi_home = Path(environ.get("NUNCHI_HOME") or home / ".nunchi").expanduser().absolute()
-    snapshot_path = Path(
-        environ.get("NUNCHI_SNAPSHOT") or nunchi_home / "snapshot.md"
-    ).expanduser().absolute()
+    legacy = _private_legacy_route(environ, home=home, claude_dir=claude_dir)
+    if legacy is not None:
+        nunchi_home = legacy[1]
+        snapshot_path = nunchi_home / "snapshot.md"
+        nunchi_environ = dict(environ)
+        nunchi_environ.update(
+            {
+                "NUNCHI_HOME": str(nunchi_home),
+                "NUNCHI_DB": str(nunchi_home / "facts.db"),
+                "NUNCHI_SNAPSHOT": str(snapshot_path),
+            }
+        )
+    else:
+        nunchi_home = Path(
+            environ.get("NUNCHI_HOME") or home / ".nunchi"
+        ).expanduser().absolute()
+        snapshot_path = Path(
+            environ.get("NUNCHI_SNAPSHOT") or nunchi_home / "snapshot.md"
+        ).expanduser().absolute()
+        nunchi_environ = environ
     snapshot = _safe_read(
         snapshot_path,
         max_bytes=MAX_MANAGED_FILE_BYTES,
@@ -381,7 +423,9 @@ def _nunchi_context(
     )
     if time.time() - snapshot[1].st_mtime > max_age:
         script = _validate_managed_script(hook_dir / "nunchi.py")
-        if script is None or not _regenerate_snapshot(script, environ, deadline=deadline):
+        if script is None or not _regenerate_snapshot(
+            script, nunchi_environ, deadline=deadline
+        ):
             return None
         snapshot = _safe_read(
             snapshot_path,
@@ -395,7 +439,9 @@ def _nunchi_context(
         snapshot[0].decode("utf-8")
     except UnicodeDecodeError:
         return None
-    text = _scan_snapshot(snapshot[0], hook_dir=hook_dir, environ=environ, deadline=deadline)
+    text = _scan_snapshot(
+        snapshot[0], hook_dir=hook_dir, environ=nunchi_environ, deadline=deadline
+    )
     if not text:
         return None
     limit = _bounded_int(

@@ -182,8 +182,29 @@ def test_audience_settings_keep_public_and_private_sources_separate(tmp_path: Pa
     assert private_env["CCC_HONCHO_CFG"] == str(settings.honcho_config_path)
     assert private_env["CCC_WIKI_MEMORY_ENABLED"] == "0"
     assert public_env["CCC_WIKI_MEMORY_ENABLED"] == "0"
+    assert private_env["CCC_MEMORY_LEGACY_PRIVATE_READS"] == "1"
+    assert public_env["CCC_MEMORY_LEGACY_PRIVATE_READS"] == "0"
+    assert private_env["CCC_MEMORY_MAX_BYTES"] == "18000"
+    assert "CCC_MEMORY_MAX_BYTES" not in public_env
     assert "934719283" not in private_raw
     assert "-100456" not in public_raw
+
+
+def test_private_audience_alone_can_enable_legacy_wiki_reads(tmp_path: Path) -> None:
+    settings = _audience_settings(tmp_path)
+    settings.hook_policy_environment = lambda: {
+        "CCC_NODE_ISOLATION_PROFILE": "fleet",
+        "CCC_WIKI_MEMORY_ENABLED": "1",
+    }
+    private = resolve_memory_audience(settings, user_id=7, chat_id=7)
+    public = resolve_memory_audience(settings, user_id=7, chat_id=-100)
+    assert private is not None and public is not None
+
+    private_env = private.hook_environment(settings)
+    public_env = public.hook_environment(settings)
+
+    assert private_env["CCC_WIKI_MEMORY_ENABLED"] == "1"
+    assert public_env["CCC_WIKI_MEMORY_ENABLED"] == "0"
 
 
 def test_audience_codex_environment_is_opaque_and_physically_separate(
@@ -233,6 +254,9 @@ def test_audience_piri_environment_is_opaque_and_physically_separate(
         private_env["PIRI_CODING_AGENT_SESSION_DIR"]
         != public_env["PIRI_CODING_AGENT_SESSION_DIR"]
     )
+    assert private_env["CCC_CODEX_MEMORY_MAX_BYTES"] == "24576"
+    assert private_env["CCC_CODEX_AGENTS_BUDGET_BYTES"] == "32768"
+    assert "CCC_CODEX_MEMORY_MAX_BYTES" not in public_env
     serialized = json.dumps((private_env, public_env), sort_keys=True)
     assert "934719283" not in serialized
     assert "-100456" not in serialized
