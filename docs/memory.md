@@ -53,6 +53,21 @@ rejected to make room for optional regeneration. The helper can only append a
 bounded, valid UTF-8 local nunchi snapshot to
 `additionalContext`; it never replaces the canonical context.
 
+### Piri nunchi opt-in
+
+Piri (the ccc-node PiriRuntime) has no Session Distiller feed, so a Piri node
+runs `hooks/nunchi/piri-feed.sh` instead: it scans new
+`~/.piri/agent/sessions/**/*.jsonl` files, asks the configured Piri CLI
+(`CCC_PIRI_CLI_PATH`) for distill-style facts in one non-interactive `--print`
+run, and ingests them into the nunchi peer_facts DB. The extractor's own
+session is isolated under `NUNCHI_HOME/.piri-feed-extractor-sessions` (via
+`PIRI_CODING_AGENT_SESSION_DIR`) so it never re-enters the scanned tree.
+`scripts/install-nunchi.sh --apply --piri` wires the feed cron, a
+`mempalace mine --mode convos --wing piri` refresh over the Piri session tree,
+and the weekly bench cron; `--remove` rolls back. Like the Codex lane this
+costs one Piri run per new session file (the Claude lane reuses Session
+Distiller output at zero LLM cost).
+
 Missing, corrupt, or unsafe snapshots fail open to the unmodified canonical
 snapshot. A stale snapshot is regenerated within a bounded deadline; a failed
 regeneration or a result that remains stale also falls back to canonical memory.

@@ -451,6 +451,7 @@ def managed_cron_environment(cron: str) -> tuple[dict[str, str], list[str]]:
             is_bash_script(command_invocation(tokens), script)
             for script in (
                 "codex-feed.sh",
+                "piri-feed.sh",
                 "ingest-cron.sh",
                 "mempalace-refresh.sh",
                 "bench.sh",
@@ -475,12 +476,15 @@ def inspect_managed_cron(
     invocations = [command_invocation(command) for command in commands]
     codex_feeds = sum(is_bash_script(command, "codex-feed.sh") for command in invocations)
     claude_feeds = sum(is_bash_script(command, "ingest-cron.sh") for command in invocations)
-    feed_count = codex_feeds + claude_feeds
+    piri_feeds = sum(is_bash_script(command, "piri-feed.sh") for command in invocations)
+    feed_count = codex_feeds + claude_feeds + piri_feeds
     feed_kind = (
         "codex"
-        if codex_feeds == 1 and claude_feeds == 0
+        if codex_feeds == 1 and claude_feeds == 0 and piri_feeds == 0
         else "claude"
-        if claude_feeds == 1 and codex_feeds == 0
+        if claude_feeds == 1 and codex_feeds == 0 and piri_feeds == 0
+        else "piri"
+        if piri_feeds == 1 and codex_feeds == 0 and claude_feeds == 0
         else "missing"
         if feed_count == 0
         else "mixed"
@@ -548,7 +552,7 @@ def nunchi_readiness_reasons(
         reasons.append("cron-env-conflict")
     if bench_count != 1:
         reasons.append("bench-count")
-    if feed_kind == "codex" and standalone:
+    if feed_kind in ("codex", "piri") and standalone:
         reasons.append("standalone-sessionstart")
     if feed_kind == "claude" and standalone != 1:
         reasons.append("sessionstart-count")

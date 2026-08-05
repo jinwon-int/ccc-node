@@ -911,6 +911,8 @@ class Doctor:
         configured = "none"
         if re.search(r"codex-feed\.sh", cron):
             configured = "codex"
+        elif re.search(r"piri-feed\.sh", cron):
+            configured = "piri"
         elif re.search(r"ingest-cron\.sh", cron):
             configured = "claude"
 
@@ -924,7 +926,7 @@ class Doctor:
         path = "(none)"
         m = re.search(r"mempalace-refresh\.sh\s+(\w+)\s+(.+?)\s*>>", cron)
         if m:
-            kind = "mine" if m.group(1) == "codex" else "sweep"
+            kind = "mine" if m.group(1) in ("codex", "piri") else "sweep"
             path = m.group(2).strip()
             if len(path) >= 2 and path[0] in "\"'" and path[-1] == path[0]:
                 path = path[1:-1]

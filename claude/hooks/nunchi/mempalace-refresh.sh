@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # Provider-aware, bounded MemPalace refresh for the managed nunchi cron.
 #
-# MemPalace 3.6.x `sweep` parses Claude JSONL only. Codex JSONL is supported by
-# the conversation miner, so Codex nodes use incremental `mine --mode convos
-# --wing codex` so mined facts are attributed to the codex provider (mine's
-# `--wing` otherwise defaults to the directory name, e.g. "sessions").
+# MemPalace 3.6.x `sweep` parses Claude JSONL only. Codex and Piri JSONL are
+# supported by the conversation miner, so those nodes use incremental
+# `mine --mode convos --wing <codex|piri>` so mined facts are attributed to
+# the provider (mine's `--wing` otherwise defaults to the directory name,
+# e.g. "sessions").
 # The wrapper records only body-free state and holds a single-flight lock.
 # umask 077 keeps the lock, status and any MemPalace-created artefacts
 # owner-only (#865).
@@ -14,8 +15,8 @@ umask 077
 provider="${1:-}"
 target="${2:-}"
 case "$provider" in
-  claude|codex) ;;
-  *) echo "usage: mempalace-refresh.sh <claude|codex> <transcript-dir>" >&2; exit 2 ;;
+  claude|codex|piri) ;;
+  *) echo "usage: mempalace-refresh.sh <claude|codex|piri> <transcript-dir>" >&2; exit 2 ;;
 esac
 
 state_dir="${CCC_STATE_DIR:-$HOME/.claude/state}"
@@ -129,6 +130,8 @@ cd "$HOME"
 set +e
 if [ "$provider" = codex ]; then
   "$timeout_cli" -k 30s "$timeout_sec" "$mp" mine "$target" --mode convos --wing codex
+elif [ "$provider" = piri ]; then
+  "$timeout_cli" -k 30s "$timeout_sec" "$mp" mine "$target" --mode convos --wing piri
 else
   "$timeout_cli" -k 30s "$timeout_sec" "$mp" sweep "$target"
 fi
