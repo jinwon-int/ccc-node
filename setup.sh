@@ -492,6 +492,23 @@ for skill_source in "${skill_sources[@]}"; do
 done
 if [ "${#skill_targets[@]}" -gt 0 ]; then run chmod +x "${skill_targets[@]}"; fi
 
+# Piri skills (web search/fetch helpers) — only on nodes that already have a
+# Piri agent dir, so non-Piri nodes stay untouched.
+PIRI_AGENT_DIR="${PIRI_CODING_AGENT_DIR:-$HOME/.piri/agent}"
+if [ -d "$PIRI_AGENT_DIR" ]; then
+  run mkdir -p "$PIRI_AGENT_DIR/skills"
+  run cp -r "$SRC/piri/skills/." "$PIRI_AGENT_DIR/skills/"
+  piri_skill_sources=()
+  while IFS= read -r piri_skill_source; do
+    piri_skill_sources+=("$piri_skill_source")
+  done < <(find "$SRC/piri/skills" -name '*.py' -type f 2>/dev/null)
+  piri_skill_targets=()
+  for piri_skill_source in "${piri_skill_sources[@]}"; do
+    piri_skill_targets+=("$PIRI_AGENT_DIR/skills/${piri_skill_source#"$SRC/piri/skills/"}")
+  done
+  if [ "${#piri_skill_targets[@]}" -gt 0 ]; then run chmod +x "${piri_skill_targets[@]}"; fi
+fi
+
 # 2) Per-node files — only seed templates if a real one is NOT already present.
 SEEDED=()  # files freshly created from a template this run (safe to placeholder-substitute)
 seed() { # seed <template> <dest>
