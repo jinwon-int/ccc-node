@@ -367,6 +367,9 @@ run cp "$SRC/scripts/lib/harness_paths.py" "$CLAUDE_DIR/hooks/lib/harness_paths.
 # load-memory.sh so every direct/app-server run reuses the same snapshot policy.
 run cp "$SRC/scripts/ccc-codex" "$CLAUDE_DIR/hooks/ccc-codex"
 run cp "$SRC/scripts/ccc_codex_memory.py" "$CLAUDE_DIR/hooks/ccc_codex_memory.py"
+# Piri launch boundary: node-global counterpart of ccc-codex — materializes the
+# same snapshot into the Piri global context file (<piri-agent-dir>/AGENTS.md).
+run cp "$SRC/scripts/ccc-piri" "$CLAUDE_DIR/hooks/ccc-piri"
 # Claude's distill committer imports the same crash-recoverable transaction
 # implementation as the Codex bridge.  Install the canonical module beside the
 # existing standalone secure-fs copy instead of forking provider logic.
@@ -402,6 +405,7 @@ installed_hook_scripts=(
   "$CLAUDE_DIR/hooks/lib/harness_paths.py"
   "$CLAUDE_DIR/hooks/ccc-codex"
   "$CLAUDE_DIR/hooks/ccc_codex_memory.py"
+  "$CLAUDE_DIR/hooks/ccc-piri"
   "$CLAUDE_DIR/hooks/ccc-memory-index.sh"
   "$CLAUDE_DIR/hooks/ccc-memory-search.sh"
   "$CLAUDE_DIR/hooks/ccc-memory-consolidate.sh"
@@ -693,6 +697,10 @@ cat <<'EOF'
   11. (Optional Codex) Keep CCC_CODEX_CLI_PATH on ~/.claude/hooks/ccc-codex,
       set CCC_CODEX_REAL_CLI_PATH only for a non-PATH binary, and require
       `ccc-memory-check.sh --json` to report `.codex.status == "ready"`.
+  12. (Optional Piri) Point CCC_PIRI_CLI_PATH at ~/.claude/hooks/ccc-piri and
+      CCC_PIRI_REAL_CLI_PATH at the real Piri CLI so every node-global Piri
+      launch materializes the same memory snapshot into the Piri global
+      context file first.
 
 Secrets that are intentionally NOT installed by this script:
   - ~/.claude/.credentials.json   (Claude OAuth — created on `claude` login)
@@ -709,6 +717,7 @@ printf '  - CCC_WIKI_AGENT_BIN=%s\n' "$WIKI_AGENT_BIN"
 printf '  - CCC_BRIDGE_DEFAULT_PATH=%s\n' "$BRIDGE_DEFAULT_PATH"
 printf '  - CCC_CODEX_CLI_PATH=%s/hooks/ccc-codex\n' "$CLAUDE_DIR"
 printf '  - CCC_CODEX_MEMORY_MATERIALIZER_PATH=%s/hooks/ccc_codex_memory.py\n' "$CLAUDE_DIR"
+printf '  - CCC_PIRI_CLI_PATH=%s/hooks/ccc-piri\n' "$CLAUDE_DIR"
 printf '  - CODEX_HOME=%s (GitHub plugin disabled; gh CLI-first)\n' "$CODEX_DIR"
 printf '  - Codex managed skills=%s/skills (catalog: codex/compatibility.json)\n' "$CODEX_DIR"
 printf '  - bridge command=./start.sh --path %s -d\n' "$BRIDGE_DEFAULT_PATH"
