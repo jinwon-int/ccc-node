@@ -49,9 +49,11 @@ adding or printing bridge environment variables. The materializer first runs
 the canonical `load-memory.sh SessionStart` contract with its full configured
 deadline and strictly parses its JSON. Only time left from that deadline may be
 used by the managed nunchi post-processor, so slow canonical loads are never
-rejected to make room for optional regeneration. The helper can only append a
-bounded, valid UTF-8 local nunchi snapshot to
-`additionalContext`; it never replaces the canonical context.
+rejected to make room for optional regeneration. The helper can only prepend a bounded, valid UTF-8 local nunchi snapshot to
+`additionalContext`; it never replaces the canonical context. Nunchi is the
+primary working memory during the gate-3 transition, so the nunchi block
+leads: when the whole-snapshot byte cap truncates the merged output, the
+canonical tail is sacrificed first instead of silently dropping nunchi.
 
 ### Piri nunchi opt-in
 
@@ -112,7 +114,11 @@ the Codex global block, including the managed nunchi merge when nunchi mode is
 Point `CCC_PIRI_CLI_PATH` at the installed `~/.claude/hooks/ccc-piri` and
 `CCC_PIRI_REAL_CLI_PATH` at the real Piri CLI (e.g. a model-selecting shim).
 `CCC_PIRI_MEMORY_MATERIALIZER_PATH` and `CCC_PIRI_MEMORY_HOME` override the
-materializer and target agent dir. The launcher preserves argv, cwd, stdio,
+materializer and target agent dir. Because the canonical loader output alone
+exceeds the 8192-byte materializer default on fleet nodes — which silently
+truncated the nunchi block — the launcher defaults
+`CCC_CODEX_MEMORY_MAX_BYTES` to `16384` (16 KiB; hard max 24576); an explicit
+operator value always wins. The launcher preserves argv, cwd, stdio,
 exit status, and signals via a final `exec`, and shares the ccc-codex
 fail-closed contract: a refresh failure may proceed on a structurally valid
 private last snapshot; otherwise launch exits 78.
