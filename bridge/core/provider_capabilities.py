@@ -604,8 +604,11 @@ CAPABILITY_AXES: tuple[CapabilityAxis, ...] = (
             "queue and Honcho facts use an owner-only retrying outbox.",
         ),
         piri=_unsupported(
-            "Piri sessions are not read by the Codex/Claude distill journal and no "
-            "provider-neutral Piri transcript extractor exists."
+            "Piri sessions are not read by the Codex/Claude distill journal, "
+            "so the local/Honcho/Wiki distill sinks stay unwired. (A "
+            "provider-neutral nunchi peer-facts extractor, "
+            "`hooks/nunchi/piri-feed.sh` via `install-nunchi.sh --piri`, does "
+            "feed the nunchi DB from Piri sessions.)"
         ),
     ),
     _axis(
