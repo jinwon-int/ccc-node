@@ -727,6 +727,11 @@ class CodexMemoryMaterializerTest(unittest.TestCase):
         document = {
             "hookSpecificOutput": {"additionalContext": "CANONICAL_FULL_BUDGET"}
         }
+        loader_dir = self.home / ".claude" / "hooks"
+        loader_dir.mkdir(parents=True)
+        loader = loader_dir / "load-memory.sh"
+        shutil.copy2(ROOT / "claude" / "hooks" / "load-memory.sh", loader)
+        loader.chmod(0o700)
         with mock.patch.object(
             self.module,
             "_run_loader_bounded",

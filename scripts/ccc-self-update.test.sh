@@ -88,6 +88,8 @@ ok "update exits 0" '[ "$rc" = 0 ] && grep -q "services restarted: 2" <<<"$out"'
 ok "repo fast-forwarded" '[ "$(git -C "$REPO" rev-parse HEAD)" = "$(git -C "$TMP/seed" rev-parse HEAD)" ]'
 ok "setup.sh ran" '[ -f "$SETUP_MARKER" ]'
 ok "only allowlisted services restarted" 'grep -q "restart hermes-broker" "$TMP/systemctl.calls" && grep -q "restart a2a-worker" "$TMP/systemctl.calls" && [ "$(grep -c "^restart " "$TMP/systemctl.calls")" = 2 ]'
+ok "system services retain the default system scope in the audit" \
+  'grep '"'"'"name":"hermes-broker","ok":true,"scope":"system"'"'"' "$STATE/self-update.log" >/dev/null'
 ok "audit record written" 'grep -q "\"result\":\"ok\"" "$STATE/self-update.log"'
 ok "owner notification queued" 'ls "$TMP/spool"/*SelfUpdate*.json >/dev/null 2>&1 && jq -r .text "$TMP/spool"/*SelfUpdate*.json | grep -q "self-update 완료"'
 ok "successful update removes private recovery snapshot" \
@@ -129,6 +131,18 @@ printf '%s\n' 'CLAUDE_PROCESS_TIMEOUT=3600' \
 out="$(run_selfup run 2>&1)"; rc=$?
 ok "valid bridge runtime config permits allowlisted restart" \
   '[ "$rc" = 0 ] && grep -q "restart ccc-telegram-bridge.service" "$TMP/systemctl.calls"'
+
+# A user-scoped bridge stays inside the same updater transaction: systemctl
+# receives --user for both restart and is-active, and the audit names the scope.
+printf '%s\n' 'user:ccc-telegram-bridge.service' > "$CLAUDE/self-update.services"
+: > "$TMP/systemctl.calls"
+out="$(run_selfup run --force 2>&1)"; rc=$?
+ok "user-scoped bridge restart succeeds inside self-update" \
+  '[ "$rc" = 0 ] && grep -q "^--user restart ccc-telegram-bridge.service$" "$TMP/systemctl.calls" && grep -q "^--user is-active --quiet ccc-telegram-bridge.service$" "$TMP/systemctl.calls"'
+ok "user-scoped bridge restart is audited with its effective unit and scope" \
+  'grep '"'"'"name":"ccc-telegram-bridge.service","ok":true,"scope":"user"'"'"' "$STATE/self-update.log" >/dev/null'
+ok "user-scoped bridge success removes the recovery snapshot" \
+  '! compgen -G "$STATE/self-update-install-rollback.*" >/dev/null'
 
 # A transient restart failure gets exactly one retry. If the retry succeeds,
 # the update is successful and its recovery snapshot must not become residue.

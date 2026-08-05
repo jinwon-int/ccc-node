@@ -115,6 +115,13 @@ All notable changes to the Claude Code node harness. Dates are KST.
   composition is unchanged. (#749)
 
 ### Fixed
+- Self-update allowlists now support `user:` and `system:` service scopes, so
+  user units restart and pass active verification inside the transactional
+  updater instead of through an unaudited post-update wrapper.
+- Setup now satisfies the agent-cron command-task contract when registering
+  self-update and surfaces registration failures. Umask-sensitive distill,
+  nunchi, and Codex memory fixtures no longer depend on the operator shell or
+  checkout mode.
 - `ccc_memory_probe` rejected a valid Piri MemPalace refresh status as
   `refresh-invalid` (and flagged `refresh-provider`): the refresh probe and the
   Termux install-metadata validator only accepted `provider` in `{claude,

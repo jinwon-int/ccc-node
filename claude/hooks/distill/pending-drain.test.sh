@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # Durable distill enqueue/recovery tests. Provider and network are stubbed.
 set -uo pipefail
+# The secure pending journal requires private fixture ancestors regardless of
+# the invoking operator's umask.
+umask 077
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/../../.." && pwd)"
