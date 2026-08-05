@@ -145,10 +145,19 @@ def test_piri_snapshot_keeps_source_provider_in_extraction_contract() -> None:
     assert extraction.provider == "piri"
 
 
+def test_claude_snapshot_keeps_source_provider_in_extraction_contract() -> None:
+    extraction = build_extraction_input(
+        snapshot(),
+        trigger=DistillTrigger.EXPLICIT,
+        provider="claude",
+    )
+    assert extraction.provider == "claude"
+
+
 @pytest.mark.parametrize(
     ("mutation", "match"),
     [
-        (lambda value: value.update(provider="claude"), "provider"),
+        (lambda value: value.update(provider="crush"), "provider"),
         (lambda value: value.update(source_thread_hash="short"), "source_thread_hash"),
         (lambda value: value.update(trigger="manual"), "trigger"),
         (lambda value: value.update(content_trust="instructions"), "content_trust"),
@@ -264,7 +273,7 @@ def test_output_rejects_unknown_fields_at_every_object_boundary(path: tuple[obje
 @pytest.mark.parametrize(
     ("field", "value"),
     [
-        ("provider", "claude"),
+        ("provider", "crush"),
         ("source_thread_hash", "0" * 63),
         ("trigger", "manual"),
         ("distilled_at", "not-a-time"),

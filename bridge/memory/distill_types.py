@@ -12,8 +12,8 @@ DISTILL_SCHEMA_VERSION = 1
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _SAFE_ERROR_CODE_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _PRIVATE_MEMORY_SCOPE_RE = re.compile(r"^private-[0-9a-f]{32}$")
-_DISTILL_MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
-DISTILL_PROVIDERS = frozenset({"codex", "piri"})
+_DISTILL_MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,127}$")
+DISTILL_PROVIDERS = frozenset({"claude", "codex", "piri"})
 
 
 class DistillTrigger(str, Enum):

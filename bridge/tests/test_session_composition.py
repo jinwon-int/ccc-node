@@ -874,6 +874,7 @@ root = Path(os.environ["PROBE_ROOT"])
 os.environ["PROJECT_ROOT"] = str(root / "project")
 os.environ["TELEGRAM_BOT_TOKEN"] = "123456:test"
 os.environ["ALLOWED_USER_IDS"] = "1"
+os.environ["CCC_AGENT_PROVIDER"] = "codex"
 os.environ["CCC_CODEX_DISTILL_MODEL"] = "gpt-5-mini"
 os.environ["CCC_CODEX_DISTILL_TIMEOUT_SEC"] = "45"
 
@@ -1173,9 +1174,42 @@ assert context.distill_snapshot_worker._runtime is context.agent_runtime
 assert context.distill_local_sink_worker is not None
 assert context.distill_wiki_sink_worker is not None
 assert context.distill_honcho_sink_worker is not None
+assert context.distill_extraction_worker._extractor_provider == "piri"
+assert context.distill_extraction_worker._backend.provider == "piri"
 print("COMPOSED-PIRI-MEMORY-PIPELINE-OK")
 """,
         probe_root=tmp_path,
     )
     assert result.returncode == 0, result.stderr
     assert "COMPOSED-PIRI-MEMORY-PIPELINE-OK" in result.stdout
+
+
+def test_build_context_distill_off_disables_shared_workers(tmp_path):
+    result = _run_probe(
+        """
+import os
+from pathlib import Path
+
+root = Path(os.environ["PROBE_ROOT"])
+(root / "project").mkdir(parents=True, exist_ok=True)
+os.environ.update({
+    "PROJECT_ROOT": str(root / "project"),
+    "TELEGRAM_BOT_TOKEN": "123456:test",
+    "ALLOWED_USER_IDS": "1",
+    "CCC_AGENT_PROVIDER": "piri",
+    "CCC_MEMORY_DISTILL_PROVIDER": "off",
+})
+
+from telegram_bot.__main__ import build_context, load_runtime_settings
+
+context = build_context(load_runtime_settings())
+assert context.distill_snapshot_worker is None
+assert context.distill_extraction_worker is None
+assert context.distill_wiki_sink_worker is None
+assert context.distill_honcho_sink_worker is None
+print("DISTILL-OFF-OK")
+""",
+        probe_root=tmp_path,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "DISTILL-OFF-OK" in result.stdout

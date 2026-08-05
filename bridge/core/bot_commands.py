@@ -594,8 +594,8 @@ class BotCommandMixin:
         log_debug(user_id, "command", "/distill")
 
         active_provider = self._active_provider()
-        if active_provider not in {"codex", "piri"}:
-            reply = "ℹ️ /distill is available only for active Codex or Piri sessions."
+        if active_provider not in {"claude", "codex", "piri"}:
+            reply = "ℹ️ /distill is available only for active Claude, Codex, or Piri sessions."
             await message.reply_text(reply)
             log_debug(user_id, "bot", reply)
             return

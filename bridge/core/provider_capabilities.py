@@ -595,20 +595,23 @@ CAPABILITY_AXES: tuple[CapabilityAxis, ...] = (
         "Memory: write-back distill",
         "Durable facts are extracted from provider threads for the memory sinks.",
         claude=_supported(
-            "PreCompact/SessionEnd distill transcripts into resume/local facts and "
-            "sink candidates via claude/hooks/distill.sh."
+            "Session-reset, explicit, checkpoint, and shutdown triggers enter the "
+            "same provider-neutral journal and strict v1 contract. Managed bridge "
+            "sessions suppress the legacy hook distiller to prevent duplicate writes."
         ),
         codex=_supported(
             "Session-reset, explicit, opt-in bounded checkpoint, and bounded "
             "shutdown-queue triggers, extraction, and the local sink are scheduled. "
             "Provider/model/turn-byte/duration accounting and shared warn/enforce "
             "cost gates are body-free; Wiki candidates enter a local human-review "
-            "queue and Honcho facts use an owner-only retrying outbox.",
+            "queue and Honcho facts use an owner-only retrying outbox. The extractor "
+            "factory defaults to the main Codex runtime and supports explicit override.",
         ),
         piri=_supported(
             "Session-reset, explicit, checkpoint, and shutdown triggers enter the "
             "provider-neutral journal. A secure bounded Piri JSONL snapshot preserves "
-            "source provider provenance through the isolated extractor and all sinks."
+            "source provider provenance through the isolated tool-free Piri extractor "
+            "and all sinks; provider-default follows the node's Kimi/GLM configuration."
         ),
     ),
     _axis(

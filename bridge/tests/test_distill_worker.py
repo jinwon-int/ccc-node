@@ -243,6 +243,9 @@ async def test_extraction_records_body_free_model_bytes_duration_and_cost_estima
 @pytest.mark.parametrize(
     ("code", "expected_status"),
     [
+        ("distill_spawn_failed", DistillJobStatus.EXTRACTION_RETRYABLE_FAILED),
+        ("distill_timeout", DistillJobStatus.EXTRACTION_RETRYABLE_FAILED),
+        ("distill_output_invalid", DistillJobStatus.EXTRACTION_TERMINAL_FAILED),
         ("codex_distill_spawn_failed", DistillJobStatus.EXTRACTION_RETRYABLE_FAILED),
         ("codex_distill_timeout", DistillJobStatus.EXTRACTION_RETRYABLE_FAILED),
         ("codex_distill_io_failed", DistillJobStatus.EXTRACTION_RETRYABLE_FAILED),
@@ -610,6 +613,28 @@ async def test_budget_allowed_extraction_meters_one_autonomous_request(
     # consumed even though the backend cannot report actual usage yet.
     assert meter.reserves == [("codex", 73854, 1)]
     assert meter.refunds == []
+
+
+@pytest.mark.anyio
+async def test_extractor_backend_is_charged_independently_from_source_provider(
+    tmp_path: Path,
+) -> None:
+    journal = DistillJournal(tmp_path / "journal")
+    journal.initialize()
+    job = snapshot_done_job(journal, provider="claude")
+    meter = _FakeUsageMeter(allowed=True)
+
+    result = await CodexDistillExtractionWorker(
+        journal,
+        SuccessfulBackend(),
+        owner_token="piri-extractor-worker",
+        usage_meter=meter,
+        extractor_provider="piri",
+    ).extract_once(job_id=job.job_id)
+
+    assert result.status is DistillJobStatus.EXTRACTION_DONE
+    assert meter.reserves == [("piri", 73854, 1)]
+    assert result.provider == "claude"
 
 
 @pytest.mark.anyio

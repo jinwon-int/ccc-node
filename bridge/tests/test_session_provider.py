@@ -690,6 +690,32 @@ async def test_distill_command_records_current_piri_thread_without_reset(
 
 
 @pytest.mark.anyio
+async def test_distill_command_records_current_claude_thread_without_reset(
+    tmp_path: Path,
+) -> None:
+    manager = make_manager(tmp_path, "claude")
+    await manager.store.set(
+        "7:9",
+        {
+            "provider": "claude",
+            "session_id": "claude-current",
+            "last_user_message_at": "2026-08-05T02:00:00+00:00",
+        },
+    )
+    journal = RecordingDistillJournal()
+    bot = bare_bot(manager, provider="claude")
+    bot._distill_journal = journal
+    update = make_update(text="/distill")
+
+    await bot._cmd_distill(update, SimpleNamespace(args=[]))
+
+    assert journal.calls[0]["provider"] == "claude"
+    assert journal.calls[0]["thread_id"] == "claude-current"
+    assert "Claude memory distill request recorded" in update.message.replies[0][0]
+    assert (await manager.get_session("7:9"))["session_id"] == "claude-current"
+
+
+@pytest.mark.anyio
 async def test_distill_command_deduplicates_same_turn_and_allows_new_turn(
     tmp_path: Path,
 ) -> None:
@@ -733,7 +759,6 @@ async def test_distill_command_deduplicates_same_turn_and_allows_new_turn(
 @pytest.mark.parametrize(
     ("active_provider", "stored_provider", "thread_id", "expected"),
     [
-        ("claude", "claude", "claude-session", "only for active Codex"),
         ("codex", "codex", None, "no active Codex session"),
     ],
 )
@@ -1024,13 +1049,33 @@ async def test_distill_trigger_is_noop_for_unsupported_or_missing_thread(tmp_pat
     from telegram_bot.memory.distill_types import DistillTrigger
 
     assert await bot._enqueue_previous_codex_session(
-        {"provider": "claude", "session_id": "claude-1"},
+        {"provider": "crush", "session_id": "crush-1"},
         DistillTrigger.NEW_COMMAND,
     ) is None
     assert await bot._enqueue_previous_codex_session(
         {"provider": "codex", "session_id": None},
         DistillTrigger.NEW_COMMAND,
     ) is None
+    assert journal.calls == []
+
+
+@pytest.mark.anyio
+async def test_distill_trigger_is_noop_when_shared_pipeline_is_off(
+    tmp_path: Path,
+) -> None:
+    manager = make_manager(tmp_path, "piri")
+    bot = bare_bot(manager, provider="piri")
+    journal = RecordingDistillJournal()
+    bot._distill_journal = journal
+    bot._config.memory_distill_provider = "off"
+    from telegram_bot.memory.distill_types import DistillTrigger
+
+    result = await bot._enqueue_previous_codex_session(
+        {"provider": "piri", "session_id": "piri-1"},
+        DistillTrigger.EXPLICIT,
+    )
+
+    assert result is None
     assert journal.calls == []
 
 
@@ -1395,6 +1440,33 @@ async def test_piri_checkpoint_turn_gate_enqueues_source_provider(
     )
 
     assert journal.calls[0]["provider"] == "piri"
+    assert journal.calls[0]["trigger"] is DistillTrigger.CHECKPOINT
+
+
+@pytest.mark.anyio
+async def test_claude_generic_checkpoint_gate_uses_shared_journal(
+    tmp_path: Path,
+) -> None:
+    from telegram_bot.memory.distill_types import DistillTrigger
+
+    manager = make_manager(tmp_path, "claude")
+    bot = bare_bot(manager, provider="claude")
+    journal = RecordingDistillJournal()
+    bot._distill_journal = journal
+    bot._config.memory_distill_checkpoint_turns = 1
+    bot._config.memory_distill_checkpoint_bytes = 0
+    bot._config.memory_distill_checkpoint_age_seconds = 0
+
+    await bot._save_session_id(
+        "7:9",
+        ChatResponse("assistant", session_id="claude-thread"),
+        user_id=7,
+        chat_id=9,
+        request_text="user",
+        turn_marker="message-1",
+    )
+
+    assert journal.calls[0]["provider"] == "claude"
     assert journal.calls[0]["trigger"] is DistillTrigger.CHECKPOINT
 
 

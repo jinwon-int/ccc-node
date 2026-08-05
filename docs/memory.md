@@ -206,23 +206,39 @@ Audience-scoped memory uses a separate state directory and rollback head for
 each opaque private/shared scope. The operation affects local memory only; it
 does not undo Honcho delivery or a Wiki candidate.
 
-## Codex distill extraction backend
+## Provider-neutral distill contract and extractor backends
 
-The Codex write-back path is intentionally staged. The provider-neutral boundary
+The write-back path is intentionally staged. The provider-neutral boundary
 accepts an already bounded `CodexTranscriptSnapshot`, redacts credential-like text,
 serializes deterministic input, and validates a strict versioned result.
+The `CodexTranscriptSnapshot` class and `codex-distill-extraction-v1.schema.json`
+filename are retained as compatibility names; their accepted source-provider enum
+and runtime composition are provider-neutral.
 
-`CCC_CODEX_DISTILL_CHECKPOINT_TURNS`,
-`CCC_CODEX_DISTILL_CHECKPOINT_BYTES`, and
-`CCC_CODEX_DISTILL_CHECKPOINT_AGE_SECONDS` configure opt-in write-back
+`CCC_MEMORY_DISTILL_PROVIDER` defaults to `auto`: Claude, Codex, and Piri use
+the same runtime family as the main bridge session. Set it to `claude`, `codex`,
+or `piri` for an explicit extractor override, or `off` to disable the shared
+snapshot/extraction workers. The source runtime remains recorded separately in
+provenance; swapping the extractor never rewrites the conversation provider.
+Claude and Piri extractors run as ephemeral tool-free CLI processes with session,
+extension/skill, prompt-template, and project-context discovery disabled where
+the CLI supports those controls. They receive only canonical bounded/redacted JSON
+on stdin and must return the same strictly parsed v1 result.
+
+`CCC_MEMORY_DISTILL_CHECKPOINT_TURNS`,
+`CCC_MEMORY_DISTILL_CHECKPOINT_BYTES`, and
+`CCC_MEMORY_DISTILL_CHECKPOINT_AGE_SECONDS` configure opt-in write-back
 checkpoint gates; all default to `0` (disabled). When multiple gates are
 enabled, the first boundary reached after a completed turn records a durable
-journal job. Snapshot and extraction work remain asynchronous.
+journal job. Snapshot and extraction work remain asynchronous. The older
+`CCC_CODEX_DISTILL_CHECKPOINT_*` names remain compatibility fallbacks.
 
-`CCC_CODEX_DISTILL_MODEL` (default `provider-default`) identifies the isolated
-extractor model; another safe model ID is passed explicitly to `codex exec`.
-`CCC_CODEX_DISTILL_TIMEOUT_SEC` defaults to 120 seconds and is hard-bounded to
-1–600. Each completed provider attempt appends body-free accounting to its
+`CCC_MEMORY_DISTILL_MODEL` (default `provider-default`) identifies the isolated
+extractor model; for Piri this preserves the node's configured Kimi/GLM default.
+`CCC_MEMORY_DISTILL_TIMEOUT_SEC` defaults to 120 seconds and is hard-bounded to
+1–600. The older `CCC_CODEX_DISTILL_MODEL` and
+`CCC_CODEX_DISTILL_TIMEOUT_SEC` values remain compatibility fallbacks when the
+effective extractor is Codex. Each completed provider attempt appends body-free accounting to its
 journal record: model, bounded snapshot bytes, duration in milliseconds, and
 the conservative maximum-token estimate reserved by the shared #388 usage
 meter. This estimate is not actual provider token usage. The existing
@@ -248,6 +264,10 @@ before claim/provider execution without blocking interactive turns.
   redacted stdin, a minimal allowlisted environment, bounded timeout/cancellation,
   process-group termination, and an owner-only output file. Provider stdout/stderr and
   output bodies are never exposed through errors.
+- `bridge/memory/runtime_cli_backend.py` implements equivalent ephemeral,
+  tool-free Claude and Piri adapters, while
+  `bridge/memory/distill_backend_factory.py` resolves `auto` and explicit
+  overrides without changing the contract or sinks.
 - `bridge/memory/distill_worker.py` claims only completed snapshots, invokes the
   provider-neutral backend behind a fenced extraction lease, and atomically persists
   one strictly validated result or a body-free retryable/terminal failure. Concurrent
