@@ -285,6 +285,7 @@ for t in claude/hooks/observability.test.sh claude/hooks/security-scan.test.sh \
          codex/headless.test.sh crush/headless.test.sh \
          scripts/install-skill-autosave-cron.test.sh \
          scripts/gh-pr-flow-seoseo-review.test.sh \
+         scripts/gh-pr-flow-jinon86.test.sh \
          scripts/gh-pr-flow-seoseo-ai.test.sh \
          scripts/ccc-service-control.test.sh \
          scripts/ccc-broker-reconcile.test.sh; do

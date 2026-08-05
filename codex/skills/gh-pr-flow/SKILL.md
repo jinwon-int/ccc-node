@@ -1,6 +1,6 @@
 ---
 name: gh-pr-flow
-description: Validate, independently review, and normally squash-merge protected GitHub pull requests. Use when a PR must pass exact-head, green-check, author/reviewer separation, or required-review gates; when a jinon86-authored PR needs approval from the owner-only seoseo-ai gh config held on Seoseo; or when landing changes without weakening branch protection.
+description: Validate, independently review, and normally squash-merge protected GitHub pull requests. Use when a PR must pass exact-head, green-check, author/reviewer separation, or required-review gates; when a jinon86- or seoseo-ai-authored PR needs approval from the other Seoseo-held account; or when landing changes without weakening branch protection.
 ---
 
 # GitHub PR Flow
@@ -25,30 +25,42 @@ protection, or move a credential between nodes.
 4. Verify the merged commit and remote branch deletion before removing a local
    squash-merged branch.
 
-## Seoseo-held seoseo-ai review
+## Seoseo-held cross-account review
 
-Use this only for a `jinon86`-authored PR in `jinwon-int/*` after the user
-explicitly approves use of the Seoseo-held `seoseo-ai` credential for that
-exact repository, PR, and head:
+Use the allowlisted review profile matching the PR author. Both directions
+require fresh explicit approval for the exact repository, PR, and head:
+
+| PR author | Review profile | Expected reviewer | Remote gh config |
+| --- | --- | --- | --- |
+| `jinon86` | `seoseo-ai` | `seoseo-ai` | `/root/.config/gh-seoseo-ai` |
+| `seoseo-ai` | `jinon86` | `jinon86` | `/root/.config/gh` |
 
 ```bash
 CCC_EXPLICIT_USER_APPROVAL=1 \
-  bash "${CODEX_HOME:-$HOME/.codex}/skills/gh-pr-flow/scripts/approve-via-seoseo-ai.sh" \
+  bash "${CODEX_HOME:-$HOME/.codex}/skills/gh-pr-flow/scripts/approve-via-seoseo.sh" \
+    --review-profile seoseo-ai \
+    --repo jinwon-int/REPO --pr NUMBER --expected-head FULL_40_CHAR_SHA \
+    --ssh-target seoseo --operator-approved
+
+CCC_EXPLICIT_USER_APPROVAL=1 \
+  bash "${CODEX_HOME:-$HOME/.codex}/skills/gh-pr-flow/scripts/approve-via-seoseo.sh" \
+    --review-profile jinon86 \
     --repo jinwon-int/REPO --pr NUMBER --expected-head FULL_40_CHAR_SHA \
     --ssh-target seoseo --operator-approved
 ```
 
-The helper uses only Seoseo's owner-only
-`/root/.config/gh-seoseo-ai/hosts.yml`, beneath a root-owned config directory
-that is not writable by group or other, without switching the default account.
-It verifies actor `seoseo-ai`, repository write permission, author separation,
-requested-reviewer state, exact head, mergeability, and green checks before
-submitting a commit-bound approval.
+The helper maps each profile to a fixed actor, opposite author, and gh config.
+It verifies the root-owned credential boundary, repository write permission,
+author separation, requested-reviewer state, exact head, mergeability, and
+green checks before submitting a commit-bound approval. Compatibility wrappers
+`approve-via-seoseo-ai.sh` and `approve-via-jinon86.sh` select their named
+profiles but cannot override them.
 
 ## Security boundary
 
-- Require fresh explicit approval for every helper invocation. Approval does
-  not carry to another repository, PR, or changed head.
+- Require fresh explicit approval for every helper invocation and review
+  profile. Approval does not carry to another repository, PR, changed head, or
+  opposite credential.
 - Never read, print, copy, export, re-login, or place the token in arguments.
 - Keep shell tracing disabled. Return only body-free gate results.
 - Stop on credential owner/mode drift, wrong actor, self-review, head drift,

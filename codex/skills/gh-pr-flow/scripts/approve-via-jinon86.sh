@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Backward-compatible seoseo-ai profile wrapper.
+# Convenience wrapper for seoseo-ai-authored PRs reviewed by jinon86.
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 exec bash "$script_dir/approve-via-seoseo.sh" \
-  --review-profile seoseo-ai "$@"
+  --review-profile jinon86 "$@"
