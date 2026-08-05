@@ -65,6 +65,10 @@ _RESERVED_TOKENS_PER_BYTE = 6
 _RESERVED_OUTPUT_TOKENS = MAX_EXTRACTION_JSON_BYTES
 _RETRYABLE_BACKEND_CODES = frozenset(
     {
+        "distill_spawn_failed",
+        "distill_timeout",
+        "distill_io_failed",
+        "distill_nonzero_exit",
         "codex_distill_spawn_failed",
         "codex_distill_timeout",
         "codex_distill_io_failed",
@@ -73,6 +77,13 @@ _RETRYABLE_BACKEND_CODES = frozenset(
 )
 _TERMINAL_BACKEND_CODES = frozenset(
     {
+        "distill_config_invalid",
+        "distill_input_invalid",
+        "distill_executable_unsafe",
+        "distill_output_missing",
+        "distill_output_unsafe",
+        "distill_output_too_large",
+        "distill_output_invalid",
         "codex_distill_config_invalid",
         "codex_distill_input_invalid",
         "codex_distill_schema_unsafe",
@@ -110,6 +121,7 @@ class CodexDistillExtractionWorker:
         max_attempts: int = 5,
         wiki_enabled: bool = True,
         honcho_enabled: bool = True,
+        extractor_provider: Literal["claude", "codex", "piri"] = "codex",
         model: str = "provider-default",
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
@@ -118,6 +130,7 @@ class CodexDistillExtractionWorker:
             or max_attempts <= 0
             or type(wiki_enabled) is not bool
             or type(honcho_enabled) is not bool
+            or extractor_provider not in {"claude", "codex", "piri"}
         ):
             raise ValueError("invalid distill extraction worker configuration")
         self._journal = journal
@@ -127,6 +140,7 @@ class CodexDistillExtractionWorker:
         self._max_attempts = max_attempts
         self._wiki_enabled = wiki_enabled
         self._honcho_enabled = honcho_enabled
+        self._extractor_provider = extractor_provider
         self._usage_meter = usage_meter
         try:
             DistillExtractionAccounting(model, 0, 0, 0)
@@ -218,7 +232,7 @@ class CodexDistillExtractionWorker:
             # A blocked decision leaves the job unclaimed, so no attempt is
             # burned and it replays once the daily window resets.
             reservation = self._usage_meter.reserve_autonomous_spend(
-                "codex",
+                self._extractor_provider,
                 input_tokens=estimated_max_tokens,
                 requests=1,
             )
@@ -260,7 +274,9 @@ class CodexDistillExtractionWorker:
             extraction_input = build_extraction_input(
                 snapshot,
                 trigger=claimed.trigger,
-                provider=cast(Literal["codex", "piri"], claimed.provider),
+                provider=cast(
+                    Literal["claude", "codex", "piri"], claimed.provider
+                ),
             )
         except (TypeError, ValueError):
             self._refund_unused_reservation(reservation)

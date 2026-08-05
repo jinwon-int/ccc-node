@@ -9,8 +9,10 @@ DOCTOR="$ROOT/scripts/ccc-doctor.sh"
 pass=0; fail=0
 # Hermetic default: provider-specific cases below opt in per invocation. A live
 # bridge shell may export these and must not turn every generic fixture into a
-# Codex-readiness probe.
+# provider or extractor-readiness probe. The standalone doctor fixtures model
+# harness drift only; extractor readiness has isolated Python verdict tests.
 unset CCC_AGENT_PROVIDER CCC_CODEX_CLI_PATH CCC_CODEX_READINESS_TIMEOUT
+export CCC_MEMORY_DISTILL_PROVIDER=off
 # Some hardened runners mount /tmp noexec; the doctor must execute fixture CLIs.
 TMP_BASE="${TMPDIR:-$(dirname "$ROOT")}"; mkdir -p "$TMP_BASE"
 TMP="$(mktemp -d "$TMP_BASE/ccc-doctor-test.XXXXXX")"

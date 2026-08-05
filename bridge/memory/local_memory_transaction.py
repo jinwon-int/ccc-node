@@ -36,8 +36,24 @@ except ModuleNotFoundError:  # Standalone hook-tree copy installed by setup.sh.
             _fsync_directory,
             ensure_private_directory,
         )
-    except ModuleNotFoundError:  # Direct execution from a source checkout.
-        secure_fs_source = Path(__file__).resolve().parents[1] / "utils/secure_fs.py"
+    except ModuleNotFoundError:
+        # Two layouts reach this point:
+        #   * installed hook tree - setup.sh copies this module and
+        #     ccc_secure_fs.py side by side into ~/.claude/hooks/, but that
+        #     directory is not on sys.path when the distill committer loads us
+        #     via spec_from_file_location.  The `ccc_secure_fs` import above
+        #     therefore only resolves on nodes that also expose telegram_bot.
+        #   * source checkout - bridge/memory/ next to bridge/utils/.
+        # Probe the sibling copy first so standalone installs stop falling
+        # through to a path that does not exist.
+        secure_fs_candidates = (
+            Path(__file__).resolve().parent / "ccc_secure_fs.py",
+            Path(__file__).resolve().parents[1] / "utils/secure_fs.py",
+        )
+        secure_fs_source = next(
+            (path for path in secure_fs_candidates if path.is_file()),
+            secure_fs_candidates[-1],
+        )
         secure_fs_spec = importlib.util.spec_from_file_location(
             "ccc_secure_fs",
             secure_fs_source,

@@ -22,6 +22,13 @@ make_transcript() {
 
 STATE="$TMP/state"
 mkdir -p "$STATE"
+managed_out="$TMP/managed.out"
+CCC_STATE_DIR="$STATE" CCC_BRIDGE_DISTILL_MANAGED=1 \
+  bash "$DISTILL" sessionend >"$managed_out" 2>&1; rc=$?
+ok "bridge-managed distill exits 0" '[ "$rc" = 0 ]'
+ok "bridge-managed distill does not enter the legacy pipeline" \
+  '[ ! -s "$managed_out" ] && [ ! -e "$STATE/distill.log" ]'
+
 TRANS_OTHER="$TMP/projects/-root--openclaw-workspace/sess-other.jsonl"
 make_transcript "$TRANS_OTHER" 6
 

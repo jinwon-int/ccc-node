@@ -56,6 +56,12 @@ from telegram_bot.runtime_config_check import (
     MIN_CLAUDE_MAX_BUFFER_SIZE,
 )
 from telegram_bot.utils.memory_policy import MEMORY_MODE_AUDIENCE_SCOPED, MEMORY_MODE_OFF
+from telegram_bot.memory.claude_snapshot import read_claude_snapshot
+from telegram_bot.memory.distill_types import (
+    CodexTranscriptSnapshot,
+    TranscriptBounds,
+    validate_memory_route,
+)
 
 from .agent_runtime import (
     AgentEvent,
@@ -1321,6 +1327,11 @@ class ClaudeRuntime:
         )
         if self._settings is not None:
             self._apply_execution_profile(options, request)
+            if getattr(self._settings, "memory_distill_provider", "auto") != "off":
+                options.env = {
+                    **(dict(options.env) if options.env is not None else {}),
+                    "CCC_BRIDGE_DISTILL_MANAGED": "1",
+                }
         return options
 
     def _apply_execution_profile(
@@ -1469,6 +1480,26 @@ class ClaudeRuntime:
             elif role == "assistant":
                 messages.append(SessionHistoryMessage("assistant", text, timestamp or None))
         return SessionHistory(session_id, tuple(messages[-min(limit, 50):]))
+
+    async def read_session_snapshot(
+        self,
+        session_id: str,
+        *,
+        bounds: TranscriptBounds,
+        memory_audience: str | None = None,
+        memory_scope: str | None = None,
+    ) -> CodexTranscriptSnapshot:
+        """Read one Claude transcript through the shared distill snapshot seam."""
+
+        validate_memory_route(memory_audience, memory_scope)
+        if self._transcripts_dir is None or not _SAFE_SESSION_ID.fullmatch(session_id):
+            raise ValueError("Claude snapshot session route is unavailable")
+        return await asyncio.to_thread(
+            read_claude_snapshot,
+            self._transcripts_dir,
+            session_id,
+            bounds=bounds,
+        )
 
     @staticmethod
     def _first_user_preview(path: Path) -> str | None:

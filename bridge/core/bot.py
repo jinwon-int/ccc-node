@@ -1194,9 +1194,11 @@ class TelegramBot(
         chat_id: int | None = None,
         discriminator: str | None = None,
     ) -> DistillJob | None:
+        if getattr(self._config, "memory_distill_provider", "auto") == "off":
+            return None
         provider = str(session.get("provider", "claude")).strip().lower()
         thread_id = session.get("session_id")
-        if provider not in {"codex", "piri"} or not isinstance(thread_id, str) or not thread_id:
+        if provider not in {"claude", "codex", "piri"} or not isinstance(thread_id, str) or not thread_id:
             return None
         journal = getattr(self, "_distill_journal", None)
         if journal is None:
@@ -1417,13 +1419,17 @@ class TelegramBot(
                 )
 
     def _distill_checkpoint_gates(self) -> tuple[int, int, int]:
+        generic = (
+            int(getattr(self._config, "memory_distill_checkpoint_turns", 0) or 0),
+            int(getattr(self._config, "memory_distill_checkpoint_bytes", 0) or 0),
+            int(getattr(self._config, "memory_distill_checkpoint_age_seconds", 0) or 0),
+        )
+        if any(generic):
+            return generic
         return (
             int(getattr(self._config, "codex_distill_checkpoint_turns", 0) or 0),
             int(getattr(self._config, "codex_distill_checkpoint_bytes", 0) or 0),
-            int(
-                getattr(self._config, "codex_distill_checkpoint_age_seconds", 0)
-                or 0
-            ),
+            int(getattr(self._config, "codex_distill_checkpoint_age_seconds", 0) or 0),
         )
 
     @staticmethod
@@ -1473,7 +1479,7 @@ class TelegramBot(
     ) -> None:
         """Count completed turns and durably enqueue the first reached gate."""
         active_provider = self._active_provider()
-        if active_provider not in {"codex", "piri"}:
+        if active_provider not in {"claude", "codex", "piri"}:
             return
         if getattr(self, "_distill_journal", None) is None:
             return
@@ -1595,6 +1601,8 @@ class TelegramBot(
             for session_key in selected_keys:
                 try:
                     session = await self._session_manager.get_session(session_key)
+                    if session.get("provider") != self._active_provider():
+                        continue
                     await self._enqueue_previous_codex_session(
                         session,
                         DistillTrigger.SHUTDOWN,

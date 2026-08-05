@@ -36,6 +36,7 @@ QUERY="${CCC_MEMORY_QUERY:-}"
 LEGACY_STATE_DIR="${CCC_MEMORY_LEGACY_STATE_DIR:-${HOME:-/root}/.claude/state}"
 LEGACY_CACHE_DIR="${CCC_MEMORY_LEGACY_CACHE_DIR:-${HOME:-/root}/.claude/hooks/cache}"
 LEGACY_MEMDIR="${CCC_MEMORY_LEGACY_DIR:-${HOME:-/root}/.claude/memories}"
+LEGACY_HERMES_MEMDIR="${CCC_MEMORY_LEGACY_HERMES_DIR:-${HOME:-/root}/.hermes/memories}"
 LEGACY_RESUME_FILE="${CCC_MEMORY_LEGACY_RESUME_FILE:-$LEGACY_STATE_DIR/resume.md}"
 RESUME_FILE="${CCC_RESUME_FILE:-$STATE_DIR/resume.md}"
 
@@ -56,9 +57,9 @@ scoped_paths_valid() {
 }
 
 if ! is_disabled "$AUDIENCE_SCOPED"; then
-  # Family Wiki reads remain global. Honcho is allowed only through a
-  # server-side workspace suffix bound to this validated opaque route.
-  WIKI_ENABLED=0
+  # A private audience can read pre-scope Wiki material as private legacy and
+  # refresh its own route-local cache. Public audiences always fail closed.
+  [ "$MEMORY_AUDIENCE" = "private" ] || WIKI_ENABLED=0
   if ! scoped_paths_valid; then
       # Fail closed: an incomplete/malformed scoped environment must never fall
       # back to global MEMORY/USER or cache paths.
@@ -171,8 +172,9 @@ if ! is_disabled "$AUDIENCE_SCOPED"; then
   shared_mem=""
   [ -n "$SHARED_MEMDIR" ] && shared_mem="$(cat "$SHARED_MEMDIR/MEMORY.md" "$SHARED_MEMDIR/USER.md" 2>/dev/null)"
   if [ "$MEMORY_AUDIENCE" = "private" ]; then
-    legacy_mem="$(cat "$LEGACY_MEMDIR/MEMORY.md" "$LEGACY_MEMDIR/USER.md" 2>/dev/null)"
-    [ -z "$legacy_mem" ] && legacy_mem="$(cat "${HOME:-/root}/.hermes/memories/MEMORY.md" "${HOME:-/root}/.hermes/memories/USER.md" 2>/dev/null)"
+    legacy_claude_mem="$(cat "$LEGACY_MEMDIR/MEMORY.md" "$LEGACY_MEMDIR/USER.md" 2>/dev/null)"
+    legacy_hermes_mem="$(cat "$LEGACY_HERMES_MEMDIR/MEMORY.md" "$LEGACY_HERMES_MEMDIR/USER.md" 2>/dev/null)"
+    legacy_mem="$(printf '%s\n%s' "$legacy_claude_mem" "$legacy_hermes_mem")"
     mem="$(printf '%s\n%s\n%s' "$legacy_mem" "$shared_mem" "$scoped_mem")"
   else
     mem="$scoped_mem"
@@ -184,10 +186,20 @@ fi
 wiki=""
 if ! is_disabled "$WIKI_ENABLED"; then
   wiki="$(cat "$CACHE/wiki.txt" 2>/dev/null)"
+  if ! is_disabled "$AUDIENCE_SCOPED" \
+    && [ "$MEMORY_AUDIENCE" = "private" ] \
+    && [ -z "$wiki" ]; then
+    wiki="$(cat "$LEGACY_CACHE_DIR/wiki.txt" 2>/dev/null)"
+  fi
 fi
 honcho=""
 if ! is_disabled "$HONCHO_ENABLED" && [ "$PROFILE" != "max-perf" ]; then
   honcho="$(cat "$CACHE/honcho.txt" 2>/dev/null)"
+  if ! is_disabled "$AUDIENCE_SCOPED" \
+    && [ "$MEMORY_AUDIENCE" = "private" ] \
+    && [ -z "$honcho" ]; then
+    honcho="$(cat "$LEGACY_CACHE_DIR/honcho.txt" 2>/dev/null)"
+  fi
 fi
 resume="$(cat "$RESUME_FILE" 2>/dev/null)"
 if ! is_disabled "$AUDIENCE_SCOPED" && [ "$MEMORY_AUDIENCE" = "private" ]; then

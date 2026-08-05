@@ -34,6 +34,9 @@ honcho_memory_disabled() { is_disabled "${CCC_HONCHO_MEMORY_ENABLED:-1}"; }
 if [ -n "${CLAUDE_DISTILL_INFLIGHT:-}" ]; then
   exit 0
 fi
+case "${CCC_BRIDGE_DISTILL_MANAGED:-0}" in
+  1|true|TRUE|yes|YES|on|ON) exit 0 ;;
+esac
 
 # ---- off-switch ------------------------------------------------------------
 # State dir is overridable for testing / non-root installs (#73).

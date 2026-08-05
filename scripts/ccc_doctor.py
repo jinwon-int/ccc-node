@@ -96,6 +96,7 @@ class Doctor:
         self.mode = "unknown"
         self.provider = os.environ.get("CCC_AGENT_PROVIDER", "claude").strip().lower()
         self.readiness = "not-applicable"
+        self.distill_readiness = "not-applicable"
         self.settings_valid = False
         self.current_settings: dict[str, Any] | None = None
         self._rewrite_pairs: dict[str, str] | None = None
@@ -326,6 +327,7 @@ class Doctor:
         self.check_memory_cache()
         self.check_nunchi_collection()
         self.check_provider_readiness()
+        self.check_distill_readiness()
         # Managed Codex skills are provider-native (#647): diagnose them only on
         # a Codex node. Claude-only asset findings above stay non-readiness
         # (교정가능/정상), so they never block a Codex node's readiness.
@@ -562,6 +564,74 @@ class Doctor:
             return
         self.add("정상", "Codex login", "authenticated", "none")
         self.readiness = "ready"
+
+    def check_distill_readiness(self) -> None:
+        """Report extractor readiness separately without making a provider call."""
+
+        configured = os.environ.get("CCC_MEMORY_DISTILL_PROVIDER", "auto").strip().lower()
+        if configured == "off":
+            self.distill_readiness = "disabled"
+            self.add("정상", "distill extractor", "disabled", "none")
+            return
+        effective = self.provider if configured == "auto" else configured
+        if effective not in {"claude", "codex", "piri"}:
+            self.distill_readiness = "disabled" if configured == "auto" else "failed"
+            self.add(
+                "정상" if configured == "auto" else "수동필요",
+                "distill extractor",
+                f"configured={configured}; effective=off",
+                (
+                    "none"
+                    if configured == "auto"
+                    else "set CCC_MEMORY_DISTILL_PROVIDER to auto, off, claude, codex, or piri"
+                ),
+            )
+            return
+        configured_paths = {
+            "claude": os.environ.get("CLAUDE_CLI_PATH", "claude"),
+            "codex": os.environ.get("CCC_CODEX_CLI_PATH", "codex"),
+            "piri": os.environ.get("CCC_PIRI_CLI_PATH", "piri"),
+        }
+        raw = configured_paths[effective].strip()
+        executable = None
+        if raw:
+            candidate = Path(raw).expanduser() if "/" in raw else None
+            executable = (
+                str(candidate)
+                if candidate and candidate.is_file()
+                else shutil.which(raw)
+            )
+        if not executable or not os.access(executable, os.X_OK):
+            self.distill_readiness = "failed"
+            self.add(
+                "수동필요",
+                "distill extractor",
+                f"configured={configured}; effective={effective}; executable=missing",
+                f"install/configure the {effective} CLI; no live authentication probe was attempted",
+            )
+            return
+        same_live_runtime = self._bridge_provider_state == (effective, "healthy")
+        codex_ready = (
+            effective == "codex"
+            and self.provider == "codex"
+            and self.readiness == "ready"
+        )
+        if same_live_runtime or codex_ready:
+            self.distill_readiness = "ready"
+            self.add(
+                "정상",
+                "distill extractor",
+                f"configured={configured}; effective={effective}; executable=available; shared runtime auth proven",
+                "none",
+            )
+            return
+        self.distill_readiness = "static-ready"
+        self.add(
+            "경고",
+            "distill extractor",
+            f"configured={configured}; effective={effective}; executable=available; live auth unproven",
+            "run one explicitly approved body-free distill canary before production activation",
+        )
 
     def normalize_hook_manifest(self, path: Path) -> list[dict[str, Any]]:
         data = self.load_json(path)
@@ -1028,7 +1098,8 @@ class Doctor:
         print(f"- claude dir: `{self.claude_dir}`")
         print(f"- mode: `{self.mode}`")
         print(f"- provider: `{self.provider}`")
-        print(f"- readiness: `{self.readiness}`\n")
+        print(f"- readiness: `{self.readiness}`")
+        print(f"- distill readiness: `{self.distill_readiness}`\n")
         print("## 진단 요약\n")
         print(f"- 정상: {self.counts['정상']}")
         print(f"- 경고: {self.counts['경고']}")
@@ -1051,6 +1122,7 @@ class Doctor:
             "mode": self.mode,
             "provider": self.provider,
             "readiness": self.readiness,
+            "distillReadiness": self.distill_readiness,
             "counts": self.counts,
             "rows": [
                 {
