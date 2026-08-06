@@ -165,6 +165,118 @@ def _is_termux_env(env: Mapping[str, str]) -> bool:
     return bool(env.get("TERMUX_VERSION")) or "/com.termux/" in env.get("PREFIX", "")
 
 
+# #969: "install ok" is not "usable". On Android/Termux a wheel can install
+# cleanly yet fail to load: cryptography's _rust.abi3.so is not linked against
+# libpython, and Android's loader does not resolve symbols from the
+# interpreter executable the way glibc does. The artifact sits inert for
+# months and only detonates when some future code path (pyjwt RS256/ES256 —
+# service-account JWTs, signed webhooks, OIDC) touches it. Smoke-import the
+# binary extensions after every reconcile so the break surfaces at the
+# bootstrap boundary with its real name instead of as a "JWT bug".
+SMOKE_IMPORTS_ENV = "CCC_DEPS_SMOKE_IMPORTS"
+SMOKE_STRICT_ENV = "CCC_DEPS_SMOKE_STRICT"
+DEFAULT_SMOKE_IMPORTS = ("cryptography",)
+
+
+def _smoke_import_modules(environ: Mapping[str, str]) -> tuple[str, ...]:
+    raw = environ.get(SMOKE_IMPORTS_ENV)
+    if raw is None:
+        return DEFAULT_SMOKE_IMPORTS
+    return tuple(module for module in re.split(r"[,\s]+", raw.strip()) if module)
+
+
+def smoke_import_binary_extensions(
+    paths: DependencyPaths,
+    *,
+    environ: Mapping[str, str] | None = None,
+    stdout: TextIO = sys.stdout,
+) -> int:
+    """Import-check binary extensions in the venv interpreter (#969).
+
+    Warn-only by default: both Termux bridges run healthy today precisely
+    because nothing imports cryptography there, so a hard failure would turn
+    a latent break into a self-inflicted outage. Returns 1 on failure only
+    when CCC_DEPS_SMOKE_STRICT=1 opts into the closed gate.
+    """
+    env = dict(os.environ if environ is None else environ)
+    modules = _smoke_import_modules(env)
+    if not modules:
+        return 0
+    python = paths.pip.with_name("python")
+    probe = (
+        "import importlib, sys\n"
+        "broken = []\n"
+        f"for name in {list(modules)!r}:\n"
+        "    try:\n"
+        "        importlib.import_module(name)\n"
+        "    except Exception as exc:\n"
+        "        broken.append((name, f'{type(exc).__name__}: {exc}'))\n"
+        "for name, detail in broken:\n"
+        "    print(f'{name}: {detail}')\n"
+        "sys.exit(1 if broken else 0)\n"
+    )
+    try:
+        result = subprocess.run(
+            [str(python), "-c", probe],
+            check=False,
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+    except OSError as exc:
+        print(f"⚠️  Binary-extension smoke probe could not run: {exc}", file=stdout, flush=True)
+        return 1 if env.get(SMOKE_STRICT_ENV) == "1" else 0
+    if result.returncode == 0:
+        return 0
+    strict = env.get(SMOKE_STRICT_ENV) == "1"
+    detail = result.stdout.strip() or result.stderr.strip() or "unknown import failure"
+    print(
+        "⚠️  Binary-extension import smoke failed — install ok is not usable (#969)",
+        file=stdout,
+        flush=True,
+    )
+    for line in detail.splitlines()[:8]:
+        print(f"   {line}", file=stdout, flush=True)
+    if _is_termux_env(env):
+        print(
+            "   On Android/Termux this is usually the unlinked-extension gap: the .so is",
+            file=stdout,
+            flush=True,
+        )
+        print(
+            "   not linked against libpython and Android's loader cannot resolve symbols",
+            file=stdout,
+            flush=True,
+        )
+        print(
+            "   from the interpreter executable the way glibc does.",
+            file=stdout,
+            flush=True,
+        )
+    print(
+        "   The bridge does not import these modules on any current code path, so this is",
+        file=stdout,
+        flush=True,
+    )
+    print(
+        "   LATENT today — the first pyjwt RS256/ES256 path (service-account JWT, signed",
+        file=stdout,
+        flush=True,
+    )
+    print(
+        "   webhook, OIDC) fails at runtime on this host instead of at install time.",
+        file=stdout,
+        flush=True,
+    )
+    if not strict:
+        print(
+            f"   Continuing (warn-only); set {SMOKE_STRICT_ENV}=1 to fail closed.",
+            file=stdout,
+            flush=True,
+        )
+    return 1 if strict else 0
+
+
 def _cargo_available(env: Mapping[str, str]) -> bool:
     return shutil.which("cargo", path=env.get("PATH")) is not None
 
@@ -220,7 +332,9 @@ def sync_dependencies(
             file=stdout,
             flush=True,
         )
-        return 0
+        # Hash match only says the inputs did not change; the artifact on disk
+        # may still be unloadable (#969 — Termux's inert cryptography wheel).
+        return smoke_import_binary_extensions(paths, environ=environ, stdout=stdout)
 
     print("📦 Installing Python dependencies...", file=stdout, flush=True)
     child_env = dict(os.environ if environ is None else environ)
@@ -265,7 +379,7 @@ def sync_dependencies(
         # launch but does not turn an otherwise successful install into fail.
         pass
     print("✅ Dependencies are up to date", file=stdout, flush=True)
-    return 0
+    return smoke_import_binary_extensions(paths, environ=environ, stdout=stdout)
 
 
 def _parser() -> argparse.ArgumentParser:
