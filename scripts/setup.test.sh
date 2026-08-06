@@ -444,7 +444,7 @@ mkdir -p "$tm_bin"
 printf '#!/usr/bin/env bash\necho "$@" >> "%s"\nexit 0\n' "$TMP/tm-pkg.calls" > "$tm_bin/pkg"
 chmod +x "$tm_bin/pkg"
 out="$(HOME="$tm_home" CCC_CLAUDE_DIR="$tm_claude" CCC_HERMES_DIR="$tm_hermes" \
-  TERMUX_VERSION=0.118 PATH="$tm_bin:$PATH" bash "$SETUP" --no-backup 2>&1)"; rc=$?
+  TERMUX_VERSION=0.118 PATH="$tm_bin:/usr/local/bin:/usr/bin:/bin" bash "$SETUP" --no-backup 2>&1)"; rc=$?
 ok "Termux without cargo installs the Rust toolchain via pkg" \
   '[ "$rc" = 0 ] && grep -q "rust rust-std-aarch64-linux-android" "$TMP/tm-pkg.calls"'
 
@@ -452,14 +452,14 @@ printf '#!/usr/bin/env bash\necho "cargo 1.97.1"\nexit 0\n' > "$tm_bin/cargo"
 chmod +x "$tm_bin/cargo"
 : > "$TMP/tm-pkg.calls"
 out="$(HOME="$tm_home" CCC_CLAUDE_DIR="$tm_claude" CCC_HERMES_DIR="$tm_hermes" \
-  TERMUX_VERSION=0.118 PATH="$tm_bin:$PATH" bash "$SETUP" --no-backup 2>&1)"; rc=$?
+  TERMUX_VERSION=0.118 PATH="$tm_bin:/usr/local/bin:/usr/bin:/bin" bash "$SETUP" --no-backup 2>&1)"; rc=$?
 ok "Termux with cargo skips pkg install" \
   '[ "$rc" = 0 ] && [ ! -s "$TMP/tm-pkg.calls" ] && grep -q "Rust toolchain present" <<<"$out"'
 
 rm -f "$tm_bin/cargo"
 : > "$TMP/tm-pkg.calls"
 out="$(HOME="$tm_home" CCC_CLAUDE_DIR="$tm_claude" CCC_HERMES_DIR="$tm_hermes" \
-  TERMUX_VERSION=0.118 PATH="$tm_bin:$PATH" bash "$SETUP" --dry-run 2>&1)"; rc=$?
+  TERMUX_VERSION=0.118 PATH="$tm_bin:/usr/local/bin:/usr/bin:/bin" bash "$SETUP" --dry-run 2>&1)"; rc=$?
 ok "Termux dry-run prints but does not run pkg install" \
   'grep -q "dry-run. pkg install -y rust rust-std-aarch64-linux-android" <<<"$out" && [ ! -s "$TMP/tm-pkg.calls" ]'
 
