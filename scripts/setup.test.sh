@@ -432,5 +432,12 @@ dry_claude="$TMP/dry-claude-958"
 out="$(HOME="$TMP/dry-home-958" CCC_CLAUDE_DIR="$dry_claude" CCC_HERMES_DIR="$TMP/dry-hermes-958" bash "$SETUP" --dry-run 2>&1)"; rc=$?
 ok "setup dry-run does not write self-update.repo" '[ ! -e "$dry_claude/self-update.repo" ]'
 
+# #973: setup installs the versioned live-backups rotate script.
+lb_home="$TMP/lb-home-973"; lb_claude="$TMP/lb-claude-973"; lb_hermes="$TMP/lb-hermes-973"
+HOME="$lb_home" CCC_CLAUDE_DIR="$lb_claude" CCC_HERMES_DIR="$lb_hermes" \
+  bash "$SETUP" --no-backup >/dev/null 2>&1
+ok "setup installs the versioned live-backups rotate script" \
+  '[ -x "$lb_home/.ccc-node/scripts/ccc-live-backups-rotate.sh" ] && grep -q "CCC_LIVE_BACKUPS_ROOTS" "$lb_home/.ccc-node/scripts/ccc-live-backups-rotate.sh"'
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
