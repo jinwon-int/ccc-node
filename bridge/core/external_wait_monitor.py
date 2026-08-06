@@ -301,10 +301,18 @@ class ExternalWaitMonitor:
                 self._reschedule(record)
             return
         self._transport_errors.pop(wait_id, None)
-        if state.head_sha != record.get("head_sha"):
-            # The PR moved on: never report the stale run as the watched one.
-            self._registry.finish(wait_id, TERMINAL_SUPERSEDED, now=now)
-            return
+        recorded = str(record.get("head_sha") or "")
+        if state.head_sha != recorded:
+            if recorded and len(recorded) < 40 and state.head_sha.startswith(recorded):
+                # Legacy short-SHA registration watching the same head: heal
+                # the record to the full SHA instead of dropping the promise
+                # as superseded (#961). A genuinely moved head still ends the
+                # wait below.
+                self._registry.correct_head_sha(wait_id, state.head_sha)
+            else:
+                # The PR moved on: never report the stale run as the watched one.
+                self._registry.finish(wait_id, TERMINAL_SUPERSEDED, now=now)
+                return
         terminal = _TERMINAL_BY_ROLLUP.get(state.rollup)
         if terminal is not None:
             self._registry.finish(wait_id, terminal, now=now)

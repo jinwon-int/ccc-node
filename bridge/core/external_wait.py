@@ -301,6 +301,33 @@ class ExternalWaitRegistry:
 
         self._mutate(_do)
 
+    def correct_head_sha(self, wait_id: str, full_sha: str) -> bool:
+        """Heal a legacy short-SHA registration to the full 40-char head.
+
+        Registration now normalizes short SHAs to the full head via ``gh``
+        (#961), but records written before that fix may hold 7-39 hex chars
+        that can never equal GitHub's 40-char ``headRefOid``. The monitor
+        calls this when the live head *starts with* the recorded short form;
+        a genuine head change still supersedes. Returns True only when the
+        record was monitoring and actually healed.
+        """
+        full_sha = validate_head_sha(full_sha)
+        if len(full_sha) != 40:
+            return False
+
+        def _do(records):
+            rec = records.get(wait_id)
+            if rec is None or rec.get("state") != STATE_MONITORING:
+                return False
+            recorded = str(rec.get("head_sha") or "")
+            if not recorded or len(recorded) >= 40 or not full_sha.startswith(recorded):
+                return False
+            rec["head_sha"] = full_sha
+            rec["updated_at"] = _utc_now_iso()
+            return True
+
+        return bool(self._mutate(_do))
+
     def finish(self, wait_id: str, terminal_status: str, *, now: Optional[float] = None) -> bool:
         """Terminal transition, journaled before any wake. First write wins.
 
