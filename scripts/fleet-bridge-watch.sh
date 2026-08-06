@@ -118,6 +118,65 @@ if [ "${CCC_FLEET_DOCTOR:-0}" = "1" ] && [ -x "$root/scripts/ccc-doctor.sh" ]; t
 else
   echo "DOCTOR=-"
 fi
+
+# gongmyoung dual-domain coherence (#980) — doctor-sweep only. gongmyoung is
+# the fleet's only dual-domain node (gongmyoung user = bridge/runtime, root =
+# A2A/system), and the "one node = one domain" assumption failing there caused
+# repeat incidents (self-update cron lost wholesale, root-owned /opt checkout,
+# decoy ccc-node dirs trapping resolve_repo heuristics). These checks are
+# read-only; remediation is an operator decision. Single-domain nodes have no
+# gongmyoung account, so they emit DUALDOMAIN=- and cost nothing.
+if [ "${CCC_FLEET_DOCTOR:-0}" = "1" ] && id gongmyoung >/dev/null 2>&1 && [ -d /home/gongmyoung ]; then
+  if [ "$(id -u)" != 0 ]; then
+    # crontab/loginctl inspection needs root; say so instead of guessing.
+    echo "DUALDOMAIN=skip(non-root)"
+  else
+    dd_fail=""
+    dd_add() { dd_fail="${dd_fail:+${dd_fail},}$1"; }
+
+    # 1. the gongmyoung crontab still carries self-update, wired to the user bus
+    gcron=$(crontab -u gongmyoung -l 2>/dev/null || true)
+    printf '%s\n' "$gcron" | grep -q 'ccc-self-update' || dd_add 'cron-self-update-missing'
+    printf '%s\n' "$gcron" | grep -q 'XDG_RUNTIME_DIR' \
+      && printf '%s\n' "$gcron" | grep -q 'DBUS_SESSION_BUS_ADDRESS' \
+      || dd_add 'cron-bus-env-missing'
+
+    # 2. /opt/ccc-node is gongmyoung-owned, clean, on main, with no root-owned
+    #    git objects (a root-owned object is what flipped the 2026-08-05
+    #    self-update registration to the non-serving repo)
+    repo=/opt/ccc-node
+    [ -d "$repo/.git" ] || dd_add 'repo-missing'
+    [ "$(stat -c %U "$repo" 2>/dev/null || echo ?)" = "gongmyoung" ] || dd_add 'repo-not-gongmyoung-owned'
+    [ -z "$(su - gongmyoung -c "git -C $repo status --porcelain" 2>/dev/null | head -1)" ] || dd_add 'repo-dirty'
+    dd_branch=$(su - gongmyoung -c "git -C $repo rev-parse --abbrev-ref HEAD" 2>/dev/null || echo ?)
+    [ "$dd_branch" = "main" ] || dd_add "repo-branch=$dd_branch"
+    [ -z "$(find "$repo/.git" -user root -print -quit 2>/dev/null)" ] || dd_add 'git-root-owned-objects'
+
+    # 3. the user unit and its manager are actually alive, and linger keeps
+    #    them that way across logout
+    uid_g=$(id -u gongmyoung 2>/dev/null || echo 1000)
+    dd_bus="XDG_RUNTIME_DIR=/run/user/$uid_g DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$uid_g/bus"
+    dd_unit=$(su - gongmyoung -c "env $dd_bus systemctl --user is-active ccc-telegram-bridge" 2>/dev/null || true)
+    [ "$dd_unit" = "active" ] || dd_add "user-unit=${dd_unit:-unknown}"
+    dd_mgr=$(systemctl is-active "user@$uid_g" 2>/dev/null || true)
+    [ "$dd_mgr" = "active" ] || dd_add "user-manager=${dd_mgr:-unknown}"
+    dd_linger=$(loginctl show-user gongmyoung 2>/dev/null | sed -n 's/^Linger=//p' | head -1)
+    [ "$dd_linger" = "yes" ] || dd_add "linger=${dd_linger:-unknown}"
+
+    # 4. no decoy ccc-node checkouts under the gongmyoung home (real dirs only;
+    #    symlinks/tarballs/docs are not serving candidates)
+    dd_decoys=0
+    for d in /home/gongmyoung/ccc-node-*; do
+      [ -d "$d" ] && [ ! -L "$d" ] || continue
+      dd_decoys=$((dd_decoys + 1))
+    done
+    [ "$dd_decoys" = 0 ] || dd_add "decoy-dirs=$dd_decoys"
+
+    if [ -z "$dd_fail" ]; then echo "DUALDOMAIN=ok"; else echo "DUALDOMAIN=fail $dd_fail"; fi
+  fi
+else
+  echo "DUALDOMAIN=-"
+fi
 PROBE_EOF
 
 # One unanswered probe is a transport blip, not a health signal: on 2026-07-31
@@ -186,6 +245,13 @@ $PROBE"
   if [ -n "$doctor" ] && [ "$doctor" != "-" ] && [ "$doctor" != "0" ]; then
     echo "DRIFT $node doctor_exit=$doctor runtime=$runtime"; fail=1; continue
   fi
+
+  # gongmyoung dual-domain coherence (#980). Emitted only by the doctor sweep;
+  # "-" (single-domain node) and "skip" (probe lacked root) are not failures.
+  dual=$(printf '%s\n' "$out" | sed -n 's/^DUALDOMAIN=//p' | head -1)
+  case "$dual" in
+    fail\ *) echo "DUALDOMAIN $node ${dual#fail }"; fail=1; continue ;;
+  esac
 
   echo "OK $node ($runtime)"
 done
