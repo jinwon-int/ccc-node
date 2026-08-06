@@ -39,6 +39,7 @@ reply() { # <node> <runtime> <avail> <unit>
 run() { # <nodes>
   OUT="$TMP/out"; RC=0
   CCC_FLEET_NODES="$1" CCC_FLEET_SSH="$STUB" CCC_FLEET_SELF=_never_ \
+    CCC_FLEET_RETRY_DELAY=0 \
     bash "$SC" >"$OUT" 2>&1 || RC=$?
 }
 
@@ -183,6 +184,66 @@ ok "overridden root reports OK" 'grep -q "^OK beta (/srv/ccc-node)" "$OUT"'
 # The whole point: paths come from the running process, never a baked table.
 ok "no hardcoded node->path table" \
   '! grep -nE "^(check|[a-z]+) +(seoseo|yukson|sogyo|nosuk|dungae) +.*(/opt/ccc-node|/root/ccc-node)" "$SC"'
+
+# ---- transport retry (#972) ------------------------------------------------
+# Flaky stub: fails while $TMP/flaky/<node> holds a positive counter, then
+# answers from reply/<node>. Every invocation is logged to $TMP/calls so the
+# tests can count attempts per node.
+FLAKY="$TMP/ssh-flaky"
+cat > "$FLAKY" <<FLAKYEOF
+#!$(command -v bash)
+cat >/dev/null
+node=""
+for a in "\$@"; do case "\$a" in -o|-*) ;; sh|-s) ;; *) node="\$a" ;; esac; done
+printf '%s\n' "\$node" >> "$TMP/calls"
+budget="$TMP/flaky/\$node"
+left=0; [ -f "\$budget" ] && left=\$(cat "\$budget")
+if [ "\$left" -gt 0 ] 2>/dev/null; then printf '%s\n' \$((left - 1)) > "\$budget"; exit 255; fi
+f="$TMP/reply/\$node"
+[ -f "\$f" ] || exit 255
+cat "\$f"
+FLAKYEOF
+chmod +x "$FLAKY"
+mkdir -p "$TMP/flaky"
+: > "$TMP/calls"
+
+run_flaky() { # <nodes> <retries>
+  OUT="$TMP/out"; RC=0
+  CCC_FLEET_NODES="$1" CCC_FLEET_SSH="$FLAKY" CCC_FLEET_SELF=_never_ \
+    CCC_FLEET_RETRIES="$2" CCC_FLEET_RETRY_DELAY=0 \
+    bash "$SC" >"$OUT" 2>&1 || RC=$?
+}
+
+# One blip, then healthy: the retry absorbs it and the node reports OK.
+reply blip /opt/ccc-node yes /opt/ccc-node
+printf '1\n' > "$TMP/flaky/blip"
+run_flaky "blip" 2
+okc "$RC" 0 "single blip recovered by retry exits 0"
+ok "blip node reports OK, never UNREACHABLE" 'grep -q "^OK blip" "$OUT" && ! grep -q "^UNREACHABLE blip" "$OUT"'
+ok "blip took exactly two attempts" '[ "$(grep -c "^blip$" "$TMP/calls")" = 2 ]'
+
+# Persistent transport failure: still UNREACHABLE, reported once, after
+# retries+1 attempts.
+: > "$TMP/calls"
+run_flaky "ghost2" 2
+okc "$RC" 1 "persistent failure exits nonzero"
+ok "persistent failure reported once" '[ "$(grep -c "^UNREACHABLE ghost2" "$OUT")" = 1 ]'
+ok "persistent failure used every attempt" '[ "$(grep -c "^ghost2$" "$TMP/calls")" = 3 ]'
+
+# DOWN is a real answer, not a transport failure: never retried.
+: > "$TMP/calls"
+reply sick /opt/ccc-node no /opt/ccc-node
+run_flaky "sick" 2
+okc "$RC" 1 "down node exits nonzero"
+ok "down node reported, never retried" 'grep -q "^DOWN sick" "$OUT" && [ "$(grep -c "^sick$" "$TMP/calls")" = 1 ]'
+
+# CCC_FLEET_RETRIES=0 keeps the single-attempt contract.
+: > "$TMP/calls"
+printf '1\n' > "$TMP/flaky/blip0"
+reply blip0 /opt/ccc-node yes /opt/ccc-node
+run_flaky "blip0" 0
+okc "$RC" 1 "retries disabled still fails on one blip"
+ok "retries disabled means exactly one attempt" '[ "$(grep -c "^blip0$" "$TMP/calls")" = 1 ] && grep -q "^UNREACHABLE blip0" "$OUT"'
 
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

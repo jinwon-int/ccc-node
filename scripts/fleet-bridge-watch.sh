@@ -34,6 +34,10 @@
 #                    sweep is scheduled separately with its own timeout, since
 #                    only 3 of 12 nodes have agent-cron and the rest would
 #                    otherwise never be checked for harness drift.
+#   CCC_FLEET_RETRIES extra attempts per node on transport failure (default 2,
+#                    capped at 5; only UNREACHABLE is retried — a node that
+#                    answers, even DOWN, is judged on its single answer)
+#   CCC_FLEET_RETRY_DELAY seconds between attempts (default 10, capped at 120)
 set -u
 
 NODES="${CCC_FLEET_NODES:-seoseo dungae sogyo nosuk bangtong yukson soonwook gwakga jingun gongmyoung gongyung daegyo}"
@@ -116,6 +120,20 @@ else
 fi
 PROBE_EOF
 
+# One unanswered probe is a transport blip, not a health signal: on 2026-07-31
+# and 2026-08-01 single SSH failures paged UNREACHABLE for nodes that were fine
+# minutes later, and a 42% failure rate taught the fleet to ignore the watch —
+# the one real outage (daegyo 2026-08-06, #968) looked identical to the noise
+# (#972). Retry transport failures with a delay so a blip never reaches the
+# notification path; a persistent failure still ends UNREACHABLE after the
+# retries, and a node that answers is never re-asked.
+RETRIES="${CCC_FLEET_RETRIES:-2}"
+case "$RETRIES" in ''|*[!0-9]*) RETRIES=2 ;; esac
+[ "$RETRIES" -le 5 ] || RETRIES=5
+RETRY_DELAY="${CCC_FLEET_RETRY_DELAY:-10}"
+case "$RETRY_DELAY" in ''|*[!0-9]*) RETRY_DELAY=10 ;; esac
+[ "$RETRY_DELAY" -le 120 ] || RETRY_DELAY=120
+
 fail=0
 for node in $NODES; do
   # The flag is prepended to the piped script rather than passed as an ssh
@@ -124,11 +142,18 @@ for node in $NODES; do
   payload="CCC_FLEET_DOCTOR=${CCC_FLEET_DOCTOR:-0}
 $PROBE"
   if [ "${CCC_FLEET_DOCTOR:-0}" = "1" ]; then node_budget=90; else node_budget=30; fi
-  if [ "$node" = "$SELF" ]; then
-    out=$(printf '%s' "$payload" | sh -s 2>/dev/null)
-  else
-    out=$(printf '%s' "$payload" | timeout "$node_budget" "$SSH_BIN" -o BatchMode=yes -o ConnectTimeout=8 "$node" sh -s 2>/dev/null)
-  fi
+  attempt=0
+  while :; do
+    if [ "$node" = "$SELF" ]; then
+      out=$(printf '%s' "$payload" | sh -s 2>/dev/null)
+    else
+      out=$(printf '%s' "$payload" | timeout "$node_budget" "$SSH_BIN" -o BatchMode=yes -o ConnectTimeout=8 "$node" sh -s 2>/dev/null)
+    fi
+    [ -n "$out" ] && break
+    attempt=$((attempt + 1))
+    [ "$attempt" -gt "$RETRIES" ] && break
+    [ "$RETRY_DELAY" -gt 0 ] && sleep "$RETRY_DELAY"
+  done
 
   if [ -z "$out" ]; then
     echo "UNREACHABLE $node"; fail=1; continue
