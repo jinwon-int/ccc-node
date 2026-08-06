@@ -73,6 +73,31 @@ rm -f "$PID_FILE"
 okc "$(run_wd)" "missing pid file: exits 0"
 ok  "missing pid file: restarts via start.sh" '[ -f "$MARKER" ]'
 
+# ---- start lock (#970): another start in flight -> skip, no pile-on ----------
+rm -f "$PID_FILE" "$MARKER"
+LOCKF="$TMP/wd.lock"
+run_wd_locked() {
+  rm -f "$MARKER"
+  local rc=0
+  HOME="$TMP" \
+  BRIDGE_WATCHDOG_LOG="$LOG" \
+  BRIDGE_WATCHDOG_PID_FILE="$PID_FILE" \
+  BRIDGE_WATCHDOG_START="$STARTSTUB" \
+  BRIDGE_WATCHDOG_LOCK="$LOCKF" \
+  BRIDGE_WATCHDOG_PROCESS_MATCH="__ccc_wd_no_such_process_zzz__" \
+  bash "$WD" || rc=$?
+  printf '%s' "$rc"
+}
+exec 9>"$LOCKF"
+flock 9   # simulate a concurrent tick mid-start (dependency build in flight)
+okc "$(run_wd_locked)" "lock held: exits 0"
+ok  "lock held: does NOT start another start.sh" '[ ! -f "$MARKER" ]'
+ok  "lock held: logs the lock skip" 'grep -q "lock held" "$LOG"'
+flock -u 9
+exec 9>&-
+okc "$(run_wd_locked)" "lock released: next tick proceeds"
+ok  "lock released: restarts normally" '[ -f "$MARKER" ]'
+
 # ---- start.sh absent -> logs, does not crash --------------------------------
 rm -f "$PID_FILE" "$MARKER"
 missing_rc=0

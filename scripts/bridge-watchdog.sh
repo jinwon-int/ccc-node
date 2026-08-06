@@ -54,6 +54,20 @@ if pgrep -f "$PROCESS_MATCH" >/dev/null 2>&1; then
   exit 0
 fi
 
+# Start lock (#970): the debounce below covers restart racing restart, but
+# during a dependency build there is no bot.pid at all, so every tick used to
+# launch another start.sh whose dependency_bootstrap raced the first (cargo
+# "Text file busy" during the daegyo recovery, 2026-08-06). Serialize the
+# whole down-detect -> start critical section on an exclusive lock: a tick
+# that finds a start already in flight skips cleanly instead of piling on.
+LOCK="${BRIDGE_WATCHDOG_LOCK:-$HOME/.telegram_bot/bridge-watchdog.lock}"
+mkdir -p "$(dirname "$LOCK")" 2>/dev/null || LOCK="$LOG.lock"
+exec 9>"$LOCK"
+if ! flock -n 9; then
+  echo "[$(ts)] bridge watchdog: another start is in flight (lock held) -- skipping this tick" >> "$LOG"
+  exit 0
+fi
+
 # Debounce: if bot.pid was touched very recently, a restart (manual or
 # supervisor-driven) is very likely already in flight -- skip this tick
 # instead of racing it with another `start.sh --daemon`.
