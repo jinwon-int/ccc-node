@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Mapping, Sequence
+from datetime import datetime, timezone
+import json
 import os
 from pathlib import Path
 import stat
@@ -31,6 +33,7 @@ else:
     )
     from telegram_bot.core.piri_rpc import PiriRpcProcessClient
     from telegram_bot.core.piri_runtime import PiriLaunchConfig, PiriRuntime
+    from telegram_bot.memory.distill_types import TranscriptBounds
 
 
 class FakePiriClient:
@@ -198,6 +201,68 @@ class PiriRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 str(session_dir),
             )
             self.assertEqual(runtime._session_directories[session.session_id], session_dir)
+            await runtime.close()
+
+    async def test_unscoped_snapshot_falls_back_to_default_sessions_root(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            agent_dir = root / "agent"
+            agent_dir.mkdir(mode=0o700)
+            sessions_root = agent_dir / "sessions"
+            sessions_root.mkdir(mode=0o700)
+            session_dir = sessions_root / "--root--"
+            session_dir.mkdir(mode=0o700)
+            session_id = "019fd178-8590-7a99-92ed-962d0982495f"
+            timestamp = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+            payload = [
+                {
+                    "type": "session",
+                    "version": 3,
+                    "id": session_id,
+                    "timestamp": timestamp,
+                    "cwd": "/root",
+                },
+                {
+                    "type": "message",
+                    "id": "m1",
+                    "timestamp": timestamp,
+                    "message": {"role": "user", "content": "fallback works"},
+                },
+            ]
+            path = session_dir / f"2026-08-05T00-00-00-000Z_{session_id}.jsonl"
+            path.write_text(
+                "".join(json.dumps(value) + "\n" for value in payload),
+                encoding="utf-8",
+            )
+            path.chmod(0o600)
+
+            runtime = PiriRuntime(
+                executable="/opt/piri/bin/piri",
+                client_factory=self.factory,
+                process_environment={"PIRI_CODING_AGENT_DIR": str(agent_dir)},
+            )
+            snapshot = await runtime.read_session_snapshot(
+                session_id,
+                bounds=TranscriptBounds(),
+            )
+            self.assertEqual(
+                [message.text for message in snapshot.messages],
+                ["fallback works"],
+            )
+            await runtime.close()
+
+    async def test_unscoped_snapshot_without_a_transcript_still_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = PiriRuntime(
+                executable="/opt/piri/bin/piri",
+                client_factory=self.factory,
+                process_environment={"PIRI_CODING_AGENT_DIR": directory},
+            )
+            with self.assertRaisesRegex(ValueError, "Piri snapshot session route is unavailable"):
+                await runtime.read_session_snapshot(
+                    "019fd490-a780-7b0d-bf4e-4baf0e6a1762",
+                    bounds=TranscriptBounds(),
+                )
             await runtime.close()
 
     async def test_audience_memory_rejects_a_tampered_route_before_launch(self) -> None:

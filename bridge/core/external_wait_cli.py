@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any, Optional, Sequence
@@ -59,6 +60,47 @@ def _emit(payload: dict[str, Any]) -> None:
     print(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
 
 
+def resolve_full_head_sha(repo: str, head_sha: str) -> str:
+    """Normalize a 7-39 char short SHA to the full 40-char head (#961).
+
+    The monitor compares the recorded SHA against GitHub's 40-char
+    ``headRefOid`` with exact equality, so a short SHA that passes format
+    validation can never match — registration would return ``ok`` for a wait
+    that supersedes on the first poll (the #949 silent promise loss). Resolve
+    through ``gh`` at registration; when the short SHA does not resolve to a
+    commit in the repo, registration fails closed instead of promising a
+    watch that can never fire. Full 40-char SHAs pass through untouched.
+    """
+    if len(head_sha) == 40:
+        return head_sha
+    try:
+        proc = subprocess.run(
+            ["gh", "api", f"repos/{repo}/commits/{head_sha}", "--jq", ".sha"],
+            capture_output=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        raise ExternalWaitValidationError(
+            "short head SHA could not be resolved via gh (unavailable or timeout); "
+            "pass the full 40-char SHA"
+        )
+    if proc.returncode != 0:
+        raise ExternalWaitValidationError(
+            "short head SHA does not resolve to a commit in the repo; "
+            "pass the full 40-char SHA from the PR head"
+        )
+    full = proc.stdout.decode("utf-8", "replace").strip().lower()
+    try:
+        full = validate_head_sha(full)
+    except ExternalWaitValidationError:
+        full = ""
+    if len(full) != 40 or not full.startswith(head_sha):
+        raise ExternalWaitValidationError(
+            "head SHA resolution returned an unexpected value; registration refused"
+        )
+    return full
+
+
 def _parse_args(argv: Sequence[str]) -> dict[str, Any]:
     """Tiny flag parser (no argparse dependency games in hook contexts)."""
     args: dict[str, Any] = {"_": []}
@@ -92,7 +134,7 @@ def _cmd_register(home: Path, args: dict[str, Any]) -> int:
     try:
         repo = validate_repo(str(args.get("repo", "")))
         pr_number = validate_pr_number(args.get("pr"))
-        head_sha = validate_head_sha(str(args.get("head_sha", "")))
+        head_sha = resolve_full_head_sha(repo, validate_head_sha(str(args.get("head_sha", ""))))
         summary = validate_summary(args.get("summary"))
         timeout = float(args.get("timeout_seconds", DEFAULT_TIMEOUT_SECONDS))
     except ExternalWaitValidationError as exc:
