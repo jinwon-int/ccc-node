@@ -132,7 +132,7 @@ plain `ccc-self-update.sh run` with no shell chaining.
 
 | Env | Default | Meaning |
 |---|---|---|
-| `CCC_SELF_UPDATE_REPO` | auto | repo path override (or `~/.claude/self-update.repo`, operator-owned) |
+| `CCC_SELF_UPDATE_REPO` | auto | repo path override (or `~/.claude/self-update.repo`, operator-owned; recorded automatically by setup.sh since #958, existing different values are preserved) |
 | `CCC_SELF_UPDATE_BRANCH` | `main` | branch the node must be on |
 | `CCC_SELF_UPDATE_SERVICES` | `~/.claude/self-update.services` | allowlist path |
 | `CCC_SELF_UPDATE_SYSTEMCTL` | `systemctl` | service manager command (tests inject a fake) |
