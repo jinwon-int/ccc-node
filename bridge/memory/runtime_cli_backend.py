@@ -55,6 +55,11 @@ _CLAUDE_ENV_NAMES: Final = (
 _PIRI_ENV_NAMES: Final = (
     "PI_CODING_AGENT_DIR",
     "PIRI_CODING_AGENT_DIR",
+    # ccc-piri wrapper launches (CCC_PIRI_CLI_PATH pointing at the wrapper)
+    # resolve the real CLI only through this variable; without it the
+    # minimal extractor environment falls back to a bare `piri` PATH lookup
+    # that fails on nodes where the wrapper fronts a non-PATH real CLI.
+    "CCC_PIRI_REAL_CLI_PATH",
     "ANTHROPIC_AUTH_TOKEN",
     "ANTHROPIC_OAUTH_TOKEN",
     "ANTHROPIC_API_KEY",
