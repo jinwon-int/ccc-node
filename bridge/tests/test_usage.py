@@ -22,8 +22,10 @@ from telegram_bot.core.usage import (
     UsageWindow,
     claude_endpoint_host,
     detect_claude_service,
+    detect_piri_service,
     load_claude_status_snapshot,
     local_claude_environment_snapshot,
+    local_piri_environment_snapshot,
     merge_usage,
     parse_claude_rate_limit_event,
     parse_claude_result,
@@ -832,6 +834,7 @@ _SERVICE_ENV_VARS = (
     "ANTHROPIC_MODEL",
     "CLAUDE_CODE_EFFORT_LEVEL",
     "CLAUDE_CODE_MAX_CONTEXT_TOKENS",
+    "CCC_USAGE_PIRI_SERVICE",
 )
 
 
@@ -962,6 +965,79 @@ def test_render_piri_usage_states_provider_telemetry_boundary() -> None:
     assert "Session cost" not in rendered
 
 
+def test_detect_piri_service_accepts_only_known_services(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_service_env(monkeypatch)
+    # Unset stays None so Piri rendering is unchanged for unconfigured nodes.
+    assert detect_piri_service() is None
+    monkeypatch.setenv("CCC_USAGE_PIRI_SERVICE", "Kimi Code")
+    assert detect_piri_service() == "Kimi Code"
+    # Case-insensitive, and the canonical spelling is what comes back so the
+    # value can key _SERVICE_WINDOW_SPECS directly.
+    assert detect_piri_service("kimi code") == "Kimi Code"
+    assert detect_piri_service("Z.AI") == "Z.AI"
+    assert detect_piri_service("  z.ai  ") == "Z.AI"
+    # Anything not in the window spec table is rejected rather than trusted,
+    # so a typo cannot silently select the wrong quota limits.
+    assert detect_piri_service("Kimi") is None
+    assert detect_piri_service("Anthropic") is None
+    assert detect_piri_service("") is None
+    assert detect_piri_service(123) is None
+
+
+def test_local_piri_environment_snapshot_is_inert_when_unconfigured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_service_env(monkeypatch)
+    snapshot = local_piri_environment_snapshot()
+    assert snapshot == UsageSnapshot(provider="piri")
+    assert snapshot.service is None
+    # Byte-identical rendering to the pre-feature Piri output.
+    assert render_usage(snapshot) == render_usage(UsageSnapshot(provider="piri"))
+
+
+def test_local_piri_environment_snapshot_names_configured_service(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_service_env(monkeypatch)
+    monkeypatch.setenv("CCC_USAGE_PIRI_SERVICE", "Kimi Code")
+    snapshot = local_piri_environment_snapshot()
+    assert snapshot.provider == "piri"
+    assert snapshot.service == "Kimi Code"
+    assert snapshot.plan_type == "Kimi Code"
+
+
+def test_render_piri_usage_shows_synthesized_kimi_windows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The operator's Kimi limits must reach the Piri lane's /usage output.
+
+    Before the service was named, CCC_USAGE_KIMI_* was silently dead on Piri
+    nodes: synthesis is keyed by service and the Piri snapshot carried none.
+    """
+    monkeypatch.setenv("CCC_USAGE_KIMI_5H_REQUEST_LIMIT", "359")
+    monkeypatch.setenv("CCC_USAGE_KIMI_WEEKLY_TOKEN_LIMIT", "292008127")
+    windows = synthesize_service_windows(
+        "Kimi Code",
+        {"requests": 173, "tokens": 2_847_600},
+        {"requests": 371, "tokens": 40_000_000},
+    )
+    rendered = render_usage(
+        UsageSnapshot(
+            provider="piri", service="Kimi Code", plan_type="Kimi Code", windows=windows
+        )
+    )
+    assert rendered.splitlines()[0] == "📊 Usage · Piri"
+    assert "Kimi 5-hour" in rendered
+    assert "Kimi weekly" in rendered
+    assert "173" in rendered
+    # The provider-telemetry boundary is still stated: Piri reports no tokens,
+    # and these windows are local estimates, not provider-reported quota.
+    assert "Provider token/quota telemetry: unavailable" in rendered
+    assert "Kimi quota" in rendered
+
+
 @pytest.mark.anyio
 async def test_get_usage_bases_snapshot_on_kimi_environment(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -984,6 +1060,78 @@ async def test_get_usage_bases_snapshot_on_kimi_environment(
     assert result.plan_type == "Kimi Code · k3[1m] · effort max"
     assert result.context_window == 1048576
     assert result.windows == ()
+
+
+@pytest.mark.anyio
+async def test_get_usage_piri_lane_synthesizes_windows_from_meter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """End-to-end: configured Piri service + local meter -> rendered windows.
+
+    PiriRuntime exposes no get_usage, so this exercises the runtime branch
+    that previously returned a bare snapshot and dropped the meter entirely.
+    """
+    _clear_service_env(monkeypatch)
+    monkeypatch.setenv("CCC_USAGE_PIRI_SERVICE", "Kimi Code")
+    monkeypatch.setenv("CCC_USAGE_KIMI_5H_REQUEST_LIMIT", "359")
+    monkeypatch.setenv("CCC_USAGE_KIMI_WEEKLY_TOKEN_LIMIT", "292008127")
+    handler = ProjectChatHandler.__new__(ProjectChatHandler)
+    # A runtime without get_usage — exactly PiriRuntime's shape.
+    handler._agent_runtime = SimpleNamespace()
+    handler._require_runtime = lambda: handler._agent_runtime
+    handler._config = SimpleNamespace(agent_provider="piri")
+    handler._usage_meter = SimpleNamespace(
+        rolling_usage=lambda: {"piri": {"requests": 173, "tokens": 2_847_600}},
+        period_usage=lambda days: {"piri": {"requests": 371, "tokens": 40_000_000}},
+    )
+
+    result = await handler.get_usage(1, 2, None)
+    assert result.provider == "piri"
+    assert result.service == "Kimi Code"
+    assert [w.label for w in result.windows] == ["Kimi 5-hour", "Kimi weekly"]
+    assert (result.windows[0].used_count, result.windows[0].count_limit) == (173, 359)
+    rendered = render_usage(result)
+    assert "Kimi 5-hour" in rendered
+
+
+@pytest.mark.anyio
+async def test_get_usage_piri_lane_unconfigured_stays_bare(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without CCC_USAGE_PIRI_SERVICE the Piri lane behaves exactly as before."""
+    _clear_service_env(monkeypatch)
+    handler = ProjectChatHandler.__new__(ProjectChatHandler)
+    handler._agent_runtime = SimpleNamespace()
+    handler._require_runtime = lambda: handler._agent_runtime
+    handler._config = SimpleNamespace(agent_provider="piri")
+    handler._usage_meter = SimpleNamespace(
+        rolling_usage=lambda: {"piri": {"requests": 173, "tokens": 2_847_600}},
+        period_usage=lambda days: {"piri": {"requests": 371, "tokens": 40_000_000}},
+    )
+
+    result = await handler.get_usage(1, 2, None)
+    assert result == UsageSnapshot(provider="piri")
+    assert result.windows == ()
+
+
+@pytest.mark.anyio
+async def test_get_usage_non_piri_runtime_provider_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Crush/other runtime-backed providers keep returning a bare snapshot."""
+    _clear_service_env(monkeypatch)
+    monkeypatch.setenv("CCC_USAGE_PIRI_SERVICE", "Kimi Code")
+    handler = ProjectChatHandler.__new__(ProjectChatHandler)
+    handler._agent_runtime = SimpleNamespace()
+    handler._require_runtime = lambda: handler._agent_runtime
+    handler._config = SimpleNamespace(agent_provider="crush")
+    handler._usage_meter = SimpleNamespace(
+        rolling_usage=lambda: {"crush": {"requests": 5, "tokens": 10}},
+        period_usage=lambda days: {"crush": {"requests": 9, "tokens": 20}},
+    )
+
+    result = await handler.get_usage(1, 2, None)
+    assert result == UsageSnapshot(provider="crush")
 
 
 def test_synthesize_service_windows_builds_count_only_kimi_window() -> None:

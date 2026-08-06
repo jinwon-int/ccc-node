@@ -267,6 +267,48 @@ _SERVICE_WINDOW_SPECS: dict[str, tuple[tuple[str, str, str, str], ...]] = {
 }
 
 
+def detect_piri_service(value: object = None) -> str | None:
+    """Return the backing service for the Piri lane, or ``None`` if unset.
+
+    The Claude lane infers its service from the ``ANTHROPIC_BASE_URL`` host,
+    but Piri talks to its provider directly and exposes no such URL to the
+    bridge: the backend is pinned by the per-node launcher's ``--model``
+    argument, which the bridge never sees. So the operator names it via
+    ``CCC_USAGE_PIRI_SERVICE``, deliberately co-located with the
+    ``CCC_USAGE_*_LIMIT`` values it selects — the two are edited together and
+    assert the same fact, which keeps them from drifting apart.
+
+    Only a name already known to ``_SERVICE_WINDOW_SPECS`` is accepted, and
+    matching is case-insensitive. Unset, unknown, or malformed values return
+    ``None`` so Piri rendering stays byte-identical to before this feature.
+    """
+    raw = value if value is not None else os.environ.get("CCC_USAGE_PIRI_SERVICE")
+    text = _text(raw, maximum=40)
+    if not text:
+        return None
+    folded = text.casefold()
+    for service in _SERVICE_WINDOW_SPECS:
+        if service.casefold() == folded:
+            return service
+    return None
+
+
+def local_piri_environment_snapshot() -> UsageSnapshot:
+    """Base snapshot naming the Piri lane's backing service, when configured.
+
+    Piri reports no token or quota telemetry, so without this the operator's
+    ``CCC_USAGE_KIMI_*``/``CCC_USAGE_ZAI_*`` limits are silently dead on Piri
+    nodes: the window synthesis in ``synthesize_service_windows`` is keyed by
+    service, and the Piri snapshot never carried one. Naming the service lets
+    the existing local-estimate windows render. Returns an empty Piri snapshot
+    when unconfigured, preserving current behavior exactly.
+    """
+    service = detect_piri_service()
+    if service is None:
+        return UsageSnapshot(provider="piri")
+    return UsageSnapshot(provider="piri", service=service, plan_type=service)
+
+
 def synthesize_service_windows(
     service: str | None,
     rolling: Mapping[str, int] | None,
