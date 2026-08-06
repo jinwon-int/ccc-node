@@ -80,6 +80,7 @@ _TERMINAL_BACKEND_CODES = frozenset(
         "distill_config_invalid",
         "distill_input_invalid",
         "distill_executable_unsafe",
+        "distill_schema_unsafe",
         "distill_output_missing",
         "distill_output_unsafe",
         "distill_output_too_large",
