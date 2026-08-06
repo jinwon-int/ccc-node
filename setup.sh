@@ -420,6 +420,12 @@ if [ "$DRY" != 1 ]; then
 else
   note "would record install-source repo for self-update: $SRC"
 fi
+# #973: version the daily live-backups rotate script — presence becomes a
+# setup-managed property instead of an out-of-band deployment artifact (the
+# fleet cron calls $HOME/.ccc-node/scripts/ccc-live-backups-rotate.sh).
+run mkdir -p "$HOME/.ccc-node/scripts"
+run cp "$SRC/scripts/ccc-live-backups-rotate.sh" "$HOME/.ccc-node/scripts/ccc-live-backups-rotate.sh"
+run chmod 700 "$HOME/.ccc-node/scripts/ccc-live-backups-rotate.sh"
 # Executable files copied into hooks/ from OUTSIDE the claude/hooks/ tree.
 # (ccc_memory_index.py / ccc_memory_search.py are deliberately NOT here: they
 # are python modules invoked via their .sh wrappers and are installed 644.)
