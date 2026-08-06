@@ -99,18 +99,20 @@ def _open_session(path: Path) -> tuple[int, os.stat_result]:
     return descriptor, metadata
 
 
+def _matches_session_name(name: str, session_id: str) -> bool:
+    return name == f"{session_id}.jsonl" or name.endswith(f"_{session_id}.jsonl")
+
+
 def _session_path(session_dir: Path, session_id: str) -> Path | None:
     if not session_dir.exists():
         return None
     _validate_directory(session_dir)
-    suffix = f"_{session_id}.jsonl"
-    exact = f"{session_id}.jsonl"
     candidates: list[Path] = []
     with os.scandir(session_dir) as entries:
         for index, entry in enumerate(entries, start=1):
             if index > _MAX_DIRECTORY_ENTRIES:
                 raise ValueError("Piri session directory exceeds its safe bound")
-            if entry.name != exact and not entry.name.endswith(suffix):
+            if not _matches_session_name(entry.name, session_id):
                 continue
             if not entry.is_file(follow_symlinks=False):
                 raise ValueError("Piri session entry is unsafe")
@@ -281,4 +283,63 @@ def read_piri_snapshot(
     )
 
 
-__all__ = ["read_piri_snapshot"]
+def _scan_session_matches(
+    directory: Path,
+    session_id: str,
+    scanned: list[int],
+    *,
+    collect_subdirs: bool,
+) -> tuple[list[Path], list[Path]]:
+    """Return (matching dirs, child dirs) within the shared entry budget."""
+
+    matches: list[Path] = []
+    children: list[Path] = []
+    with os.scandir(directory) as entries:
+        for entry in entries:
+            scanned[0] += 1
+            if scanned[0] > _MAX_DIRECTORY_ENTRIES:
+                raise ValueError("Piri session directory exceeds its safe bound")
+            if _matches_session_name(entry.name, session_id):
+                if not entry.is_file(follow_symlinks=False):
+                    raise ValueError("Piri session entry is unsafe")
+                matches.append(directory)
+            elif collect_subdirs and entry.is_dir(follow_symlinks=False):
+                children.append(directory / entry.name)
+    return matches, children
+
+
+def find_piri_session_directory(root: Path, session_id: str) -> Path | None:
+    """Locate the directory holding ``session_id`` under a sessions root.
+
+    Unscoped Piri stores transcripts either directly under the sessions root
+    or inside per-cwd slug subdirectories one level deep. The scan never
+    follows symlinks, skips subdirectories that fail the same ownership and
+    permission checks applied to session directories, and stays within the
+    same entry budget as single-directory reads. The returned directory is
+    meant for ``read_piri_snapshot``, which re-validates it before reading.
+    """
+
+    if not session_id:
+        raise ValueError("Piri session id must not be empty")
+    root = Path(root)
+    if not root.exists():
+        return None
+    _validate_directory(root)
+    scanned = [0]
+    matches, directories = _scan_session_matches(root, session_id, scanned, collect_subdirs=True)
+    for directory in directories:
+        try:
+            _validate_directory(directory)
+        except (OSError, ValueError):
+            continue
+        found, _ = _scan_session_matches(directory, session_id, scanned, collect_subdirs=False)
+        matches.extend(found)
+    unique = set(matches)
+    if not unique:
+        return None
+    if len(unique) != 1:
+        raise ValueError("Piri session id is ambiguous")
+    return unique.pop()
+
+
+__all__ = ["find_piri_session_directory", "read_piri_snapshot"]
