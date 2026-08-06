@@ -400,6 +400,26 @@ run cp "$SRC/scripts/ccc-self-update.sh" "$CLAUDE_DIR/hooks/ccc-self-update.sh"
 # separately via scripts/install-pr-status-poll-cron.sh, tracks only the
 # repos an operator lists in ~/.claude/pr-status-poll.repos.
 run cp "$SRC/scripts/ccc-pr-status-poll.sh" "$CLAUDE_DIR/hooks/ccc-pr-status-poll.sh"
+# #958: record the install-source repo path so ccc-self-update's resolve_repo()
+# (env > this file > script-location inference > ~/ccc-node) never falls back
+# to a nonexistent ~/ccc-node on /opt installs — 8 nodes aborted no-repo until
+# hand-written overrides were dropped in (LOG-20260805-gwakga-13). The file is
+# operator-owned state: an identical entry is a no-op, a DIFFERENT entry is
+# preserved with a warning — setup never silently rewrites operator state.
+SELF_UPDATE_REPO_FILE="$CLAUDE_DIR/self-update.repo"
+if [ "$DRY" != 1 ]; then
+  if [ ! -f "$SELF_UPDATE_REPO_FILE" ]; then
+    printf '%s\n' "$SRC" > "$SELF_UPDATE_REPO_FILE"
+    chmod 600 "$SELF_UPDATE_REPO_FILE"
+    note "recorded install-source repo for self-update: $SRC"
+  elif [ "$(head -1 "$SELF_UPDATE_REPO_FILE" 2>/dev/null | tr -d '[:space:]')" = "$SRC" ]; then
+    note "self-update.repo already records this repo ($SRC)"
+  else
+    note "WARNING: self-update.repo points at $(head -1 "$SELF_UPDATE_REPO_FILE" 2>/dev/null) but setup ran from $SRC — preserving the operator override"
+  fi
+else
+  note "would record install-source repo for self-update: $SRC"
+fi
 # Executable files copied into hooks/ from OUTSIDE the claude/hooks/ tree.
 # (ccc_memory_index.py / ccc_memory_search.py are deliberately NOT here: they
 # are python modules invoked via their .sh wrappers and are installed 644.)

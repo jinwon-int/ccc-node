@@ -412,5 +412,25 @@ HOME="$wk_home" CCC_CLAUDE_DIR="$wk_claude" CCC_HERMES_DIR="$wk_hermes" \
 ok "env-less re-run keeps the roster via the persisted marker" \
   '[ -f "$wk_claude/agents/a2a-implementer.md" ]'
 
+# #958: setup records the install-source repo path for ccc-self-update.
+ok "setup records install-source repo for self-update" \
+  '[ "$(cat "$wk_claude/self-update.repo" 2>/dev/null)" = "$ROOT" ]'
+
+# An operator-owned override is never silently rewritten by a later setup run
+# from a different checkout. (Copy the WORKING TREE, not a git clone — a clone
+# would miss uncommitted changes under test.)
+other_checkout="$TMP/other-checkout"
+mkdir -p "$other_checkout"
+(cd "$ROOT" && tar cf - --exclude=.git .) | (cd "$other_checkout" && tar xf -)
+printf '%s\n' '/operator/custom/repo' > "$wk_claude/self-update.repo"
+out="$(cd "$other_checkout" && HOME="$wk_home" CCC_CLAUDE_DIR="$wk_claude" CCC_HERMES_DIR="$wk_hermes" bash ./setup.sh --no-backup 2>&1)"; rc=$?
+ok "setup preserves a differing operator override with a warning" \
+  '[ "$(cat "$wk_claude/self-update.repo")" = "/operator/custom/repo" ] && grep -q "preserving the operator override" <<<"$out"'
+
+# Dry-run records nothing.
+dry_claude="$TMP/dry-claude-958"
+out="$(HOME="$TMP/dry-home-958" CCC_CLAUDE_DIR="$dry_claude" CCC_HERMES_DIR="$TMP/dry-hermes-958" bash "$SETUP" --dry-run 2>&1)"; rc=$?
+ok "setup dry-run does not write self-update.repo" '[ ! -e "$dry_claude/self-update.repo" ]'
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
