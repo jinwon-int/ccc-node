@@ -165,6 +165,77 @@ except Exception:
 PY
 }
 
+# Audience-scoped collection (#985): in scoped mode the dispatcher writes one
+# status file per scope (<root>/<scope>/nunchi/mempalace-refresh.status.json)
+# and the node-global file goes stale, so status must aggregate per-scope.
+# Scope boundary rules mirror the dispatcher walk in mempalace-refresh.sh
+# (opaque canonical names, owner-only dirs, symlink rejection, 64 scope cap).
+# Scope labels stay body-free: "shared" in full, private scopes truncated to
+# the same "private-a9d7…" shape the issue report uses.
+_status_collection_scoped() {  # <audience-root> -> worst-first per-scope rows or "none"
+  python3 - "$1" <<'PY'
+import json
+import os
+from pathlib import Path
+import re
+import stat
+import sys
+
+root = Path(sys.argv[1])
+try:
+    limit = int(os.environ.get("CCC_NUNCHI_MAX_SCOPES_PER_RUN", "64"))
+except ValueError:
+    limit = 64
+if limit < 1 or limit > 64:
+    limit = 64
+
+def safe_dir(path):
+    try:
+        meta = path.lstat()
+    except OSError:
+        return False
+    return (
+        stat.S_ISDIR(meta.st_mode)
+        and meta.st_uid == os.geteuid()
+        and not stat.S_IMODE(meta.st_mode) & 0o077
+    )
+
+entries = []
+if root.is_absolute() and safe_dir(root):
+    count = 0
+    for child in sorted(root.iterdir(), key=lambda item: item.name):
+        if count >= limit:
+            break
+        if child.name != "shared" and not re.fullmatch(r"private-[0-9a-f]{32}", child.name):
+            continue
+        if not safe_dir(child):
+            continue
+        count += 1
+        try:
+            with (child / "nunchi" / "mempalace-refresh.status.json").open() as handle:
+                data = json.load(handle)
+        except Exception:
+            continue
+        label = child.name if child.name == "shared" else f"{child.name[:12]}\u2026"
+        try:
+            ts = float(data.get("finished_at") or data.get("started_at") or 0)
+        except (TypeError, ValueError):
+            ts = 0.0
+        body = (f"state={data.get('state', '?')} exit_code={data.get('exit_code', '?')} "
+                f"finished_at={data.get('finished_at', data.get('started_at', '?'))}")
+        entries.append((0 if data.get("state") != "ok" else 1, ts, label, body))
+
+if not entries:
+    print("none")
+else:
+    entries.sort(key=lambda item: (item[0], item[1]))
+    shown = [f"{label}({body})" for _rank, _ts, label, body in entries[:8]]
+    if len(entries) > 8:
+        shown.append(f"(+{len(entries) - 8} more)")
+    print(" ".join(shown))
+PY
+}
+
 _status_audience() {  # <cron-text> -> body-free "enabled=<0|1> root=<path|none>"
   python3 - "$1" "$AUDIENCE_SCOPED" "$AUDIENCE_ROOT" <<'PY'
 import shlex
@@ -211,12 +282,19 @@ status() {
     mp_ver="$("$mp_path" --version 2>/dev/null | tail -1 | tr -d '\r' || true)"
     [ -n "$mp_ver" ] || mp_ver="unknown"
   fi
+  audience_line="$(_status_audience "$cron")"
+  collection_line="$(_status_collection "$MEMPALACE_STATUS")"
+  case "$audience_line" in
+    enabled=1\ root=/*)
+      # Scoped cron records one status per audience; the global file is stale (#985).
+      collection_line="$(_status_collection_scoped "${audience_line#enabled=1 root=}")" ;;
+  esac
   echo "runtime: user=$(id -un) home=$HOME"
   echo "provider: configured=$configured runtime=$runtime_provider match=$(_status_provider_match "$configured" "$runtime_provider")"
   echo "source: $(_status_source "$cron")"
   echo "mempalace: binary=${mp_path:-missing} version=$mp_ver"
-  echo "collection: $(_status_collection "$MEMPALACE_STATUS")"
-  echo "audience_scoped: $(_status_audience "$cron")"
+  echo "collection: $collection_line"
+  echo "audience_scoped: $audience_line"
   echo "mode: $(cat "$MODE_FILE" 2>/dev/null || echo off)"
   echo "hooks: $([ -f "$HOOKS/nunchi.py" ] && echo present || echo MISSING) ($HOOKS)"
   echo "codex_loader: $(if validate_codex_loader; then echo present; else echo MISSING/UNSAFE; fi)"

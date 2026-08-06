@@ -110,6 +110,9 @@ CCC_TEST_MEMPALACE_CAPTURE="$piri_refresh_capture" HOME="$home" \
   bash "$hooks/nunchi/mempalace-refresh.sh" piri "$piri_sessions" >/dev/null 2>&1; rc=$?
 ok "Piri refresh uses the conversation miner attributed to the piri wing" \
   '[ "$rc" = 0 ] && grep -qx "mine $piri_sessions --mode convos --wing piri" "$piri_refresh_capture" && jq -e '\''.provider == "piri" and .state == "ok" and .exit_code == 0 '\'' "$nunchi_home/mempalace-refresh.status.json" >/dev/null'
+out="$(run_install 2>&1)"; rc=$?
+ok "non-scoped status keeps reading the node-global collection status file" \
+  '[ "$rc" = 0 ] && grep -q "^collection: state=ok exit_code=0 finished_at=" <<<"$out"'
 
 # Audience-scoped Piri collection: canonical opaque direct children only,
 # with one Nunchi store and one MemPalace HOME per audience.
@@ -171,6 +174,20 @@ ok "scoped MemPalace refresh uses a distinct HOME and target for each audience" 
   '[ "$rc" = 0 ] && [ "$(wc -l < "$scoped_mp_capture")" = 3 ] && grep -q "^$first_scope/mempalace-home|mine $first_scope/piri/sessions --mode convos --wing piri$" "$scoped_mp_capture" && grep -q "^$second_scope/mempalace-home|mine $second_scope/piri/sessions --mode convos --wing piri$" "$scoped_mp_capture" && grep -q "^$shared_scope/mempalace-home|mine $shared_scope/piri/sessions --mode convos --wing piri$" "$scoped_mp_capture"'
 ok "scoped MemPalace refresh never creates state for an invalid audience" \
   '[ ! -e "$invalid_scope/mempalace-home" ] && [ -f "$first_scope/nunchi/mempalace-refresh.status.json" ] && [ -f "$shared_scope/nunchi/mempalace-refresh.status.json" ]'
+
+# #985: scoped status must aggregate per-scope refresh results — the global
+# status file goes stale once the audience dispatcher owns collection.
+out="$(run_install 2>&1)"; rc=$?
+ok "scoped status collection row aggregates per-scope results instead of the stale global file" \
+  '[ "$rc" = 0 ] && grep -q "^collection: .*shared(state=ok exit_code=0 finished_at=" <<<"$out" && grep -q "private-1111…(state=ok" <<<"$out" && grep -q "private-2222…(state=ok" <<<"$out" && ! grep -q "^collection: state=" <<<"$out"'
+ok "scoped collection row never lists non-canonical audience names" \
+  '! grep -q "private-raw" <<<"$out"'
+printf '%s\n' '{"provider":"piri","schema":1,"state":"error","exit_code":124,"started_at":1786000000,"finished_at":1786000001}' \
+  > "$second_scope/nunchi/mempalace-refresh.status.json"
+chmod 600 "$second_scope/nunchi/mempalace-refresh.status.json"
+out="$(run_install 2>&1)"; rc=$?
+ok "scoped collection row sorts the worst state first" \
+  '[ "$rc" = 0 ] && grep -q "^collection: private-2222…(state=error exit_code=124 finished_at=1786000001) " <<<"$out"'
 
 edge_status="$TMP/edge-refresh.status.json"
 timeout_capture="$TMP/timeout.args"
