@@ -1240,3 +1240,8 @@ First versioned/packaged release. Installable as a Claude Code **plugin** (`/plu
   section on an exclusive flock (#970). A dependency build longer than one
   tick no longer accumulates concurrent `start.sh`/`dependency_bootstrap`
   runs (cargo "Text file busy"); a tick that finds a start in flight skips.
+- Termux/Android Rust toolchain is now a setup-managed prerequisite (#968):
+  `setup.sh` installs `rust` + `rust-std-aarch64-linux-android` via `pkg` (or
+  fails loudly with the exact line), and `dependency_bootstrap.py` warns
+  upfront when cargo is absent and names it as the likely cause of a
+  hash-locked build failure instead of a maturin backtrace.

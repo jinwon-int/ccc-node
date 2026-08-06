@@ -23,6 +23,21 @@ it from scratch.
   This repo (ccc-node) only needs the bridge-side tweaks noted below.
 - Avoid proot for the runtime: it works but is ~9x slower.
 
+## Bridge dependency builds: Rust toolchain is a hard prerequisite (#968)
+
+Hash-locked installs (`bridge/requirements.lock.txt`) may contain packages
+with **no Android wheel** — e.g. `cryptography` 50, which builds via maturin
+and therefore needs **Rust**. A missing toolchain killed the `daegyo` bridge
+on 2026-08-06 (restart -> lock reconcile -> maturin failure -> 4h15m outage);
+`gongyung` survived only because Rust was already present.
+
+- `setup.sh` now installs `rust` + `rust-std-aarch64-linux-android` via `pkg`
+  on Termux (or prints the exact install line when it cannot).
+- `dependency_bootstrap.py` warns upfront when an Android/Termux host lacks
+  cargo, and its install-failure message names the toolchain as the likely
+  cause. `CCC_DEPS_UNLOCKED=1` does **not** bypass a missing toolchain.
+- Manual fix: `pkg install rust rust-std-aarch64-linux-android`.
+
 ## Root cause — why glibc-native fails
 
 Symptom when launching the native node/claude binary:
