@@ -17,13 +17,18 @@ from pathlib import Path
 from typing import ClassVar
 
 from telegram_bot.dependency_bootstrap import (
+    SMOKE_IMPORTS_ENV,
+    SMOKE_STRICT_ENV,
     DependencyPaths,
     InstallMode,
     dependency_fingerprint,
     install_commands,
     resolve_install_mode,
+    smoke_import_binary_extensions,
+    sync_dependencies,
 )
 
+import io
 
 VALID_TOKEN = "123456789:ABCdefGHIjklMNOpqrsTUVwxyz"
 
@@ -436,6 +441,154 @@ class RustToolchainPreflightTests(unittest.TestCase):
             rc, out = self._run(paths, pip_exit=0, cargo=False)
             self.assertEqual(rc, 0)
             self.assertIn("without a Rust toolchain", out)
+
+
+class BinaryExtensionSmokeTests(unittest.TestCase):
+    """#969: install ok is not usable — smoke-import binary extensions (#969)."""
+
+    def _make_paths(self, root: Path) -> DependencyPaths:
+        bin_dir = root / "venv" / "bin"
+        bin_dir.mkdir(parents=True, exist_ok=True)
+        (bin_dir / "python").symlink_to(sys.executable)
+        (bin_dir / "pip").symlink_to(sys.executable)
+        return DependencyPaths.from_roots(root, root / "venv", root / "project.env")
+
+    def _hash_matched_paths(self, root: Path) -> DependencyPaths:
+        for name, payload in (
+            ("requirements.txt", "req\n"),
+            ("requirements.lock.txt", "lock\n"),
+            ("pyproject.toml", "proj\n"),
+        ):
+            (root / name).write_text(payload, encoding="utf-8")
+        paths = self._make_paths(root)
+        paths.hash_cache.write_text(
+            f"{dependency_fingerprint(paths, InstallMode.LOCKED)}\n", encoding="utf-8"
+        )
+        return paths
+
+    def test_smoke_passes_quietly_with_importable_modules(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            paths = self._make_paths(Path(tmpdir))
+            out = io.StringIO()
+            rc = smoke_import_binary_extensions(
+                paths, environ={SMOKE_IMPORTS_ENV: "json"}, stdout=out
+            )
+            self.assertEqual(rc, 0)
+            self.assertEqual(out.getvalue(), "")
+
+    def test_smoke_failure_warns_without_failing_by_default(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            paths = self._make_paths(Path(tmpdir))
+            out = io.StringIO()
+            rc = smoke_import_binary_extensions(
+                paths, environ={SMOKE_IMPORTS_ENV: "ccc_missing_mod_9f8e7d"}, stdout=out
+            )
+            self.assertEqual(rc, 0)
+            text = out.getvalue()
+            self.assertIn("install ok is not usable", text)
+            self.assertIn("ccc_missing_mod_9f8e7d", text)
+            self.assertIn("LATENT", text)
+            self.assertIn("warn-only", text)
+
+    def test_smoke_failure_fails_closed_when_strict(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            paths = self._make_paths(Path(tmpdir))
+            out = io.StringIO()
+            rc = smoke_import_binary_extensions(
+                paths,
+                environ={
+                    SMOKE_IMPORTS_ENV: "ccc_missing_mod_9f8e7d",
+                    SMOKE_STRICT_ENV: "1",
+                },
+                stdout=out,
+            )
+            self.assertEqual(rc, 1)
+            self.assertIn("ccc_missing_mod_9f8e7d", out.getvalue())
+
+    def test_termux_smoke_failure_names_unlinked_extension_gap(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            paths = self._make_paths(Path(tmpdir))
+            out = io.StringIO()
+            rc = smoke_import_binary_extensions(
+                paths,
+                environ={
+                    SMOKE_IMPORTS_ENV: "ccc_missing_mod_9f8e7d",
+                    "TERMUX_VERSION": "0.118.0",
+                },
+                stdout=out,
+            )
+            self.assertEqual(rc, 0)
+            text = out.getvalue()
+            self.assertIn("unlinked-extension gap", text)
+            self.assertIn("libpython", text)
+
+    def test_smoke_reports_only_broken_modules(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            paths = self._make_paths(Path(tmpdir))
+            out = io.StringIO()
+            rc = smoke_import_binary_extensions(
+                paths,
+                environ={SMOKE_IMPORTS_ENV: "json,ccc_missing_mod_9f8e7d os"},
+                stdout=out,
+            )
+            self.assertEqual(rc, 0)
+            text = out.getvalue()
+            self.assertIn("ccc_missing_mod_9f8e7d", text)
+            self.assertNotIn("json:", text)
+            self.assertNotIn("os:", text)
+
+    def test_empty_module_list_skips_probe(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            paths = self._make_paths(Path(tmpdir))
+            out = io.StringIO()
+            rc = smoke_import_binary_extensions(
+                paths, environ={SMOKE_IMPORTS_ENV: " , "}, stdout=out
+            )
+            self.assertEqual(rc, 0)
+            self.assertEqual(out.getvalue(), "")
+
+    def test_hash_match_fast_path_still_runs_smoke(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            paths = self._hash_matched_paths(Path(tmpdir))
+            out = io.StringIO()
+            rc = sync_dependencies(
+                paths,
+                InstallMode.LOCKED,
+                environ={SMOKE_IMPORTS_ENV: "ccc_missing_mod_9f8e7d"},
+                stdout=out,
+            )
+            self.assertEqual(rc, 0)
+            text = out.getvalue()
+            self.assertIn("Dependencies unchanged (requirements hash match)", text)
+            self.assertIn("install ok is not usable", text)
+
+    def test_hash_match_fast_path_smoke_can_fail_closed(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            paths = self._hash_matched_paths(Path(tmpdir))
+            out = io.StringIO()
+            rc = sync_dependencies(
+                paths,
+                InstallMode.LOCKED,
+                environ={
+                    SMOKE_IMPORTS_ENV: "ccc_missing_mod_9f8e7d",
+                    SMOKE_STRICT_ENV: "1",
+                },
+                stdout=out,
+            )
+            self.assertEqual(rc, 1)
+
+    def test_hash_match_fast_path_smoke_pass_returns_zero(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            paths = self._hash_matched_paths(Path(tmpdir))
+            out = io.StringIO()
+            rc = sync_dependencies(
+                paths,
+                InstallMode.LOCKED,
+                environ={SMOKE_IMPORTS_ENV: "json"},
+                stdout=out,
+            )
+            self.assertEqual(rc, 0)
+            self.assertIn("Dependencies unchanged (requirements hash match)", out.getvalue())
 
 
 if __name__ == "__main__":
