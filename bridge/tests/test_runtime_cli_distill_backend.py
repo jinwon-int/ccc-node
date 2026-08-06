@@ -124,6 +124,15 @@ def test_minimal_environment_drops_unrelated_secrets(tmp_path: Path) -> None:
     assert "TELEGRAM_BOT_TOKEN" not in environment
 
 
+def test_minimal_environment_keeps_ccc_piri_real_cli_path(tmp_path: Path) -> None:
+    source = {
+        "HOME": str(tmp_path),
+        "CCC_PIRI_REAL_CLI_PATH": "/opt/piri/piri-ccc.sh",
+    }
+    environment = _minimal_environment(source, provider="piri", temp_root=tmp_path)
+    assert environment["CCC_PIRI_REAL_CLI_PATH"] == "/opt/piri/piri-ccc.sh"
+
+
 @pytest.mark.anyio
 async def test_runtime_backend_failures_are_body_free(tmp_path: Path) -> None:
     extraction_input = build_extraction_input(
