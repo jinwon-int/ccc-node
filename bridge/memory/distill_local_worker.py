@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Mapping
+from contextlib import suppress
 import math
 import os
 from pathlib import Path
@@ -26,7 +27,14 @@ _INDEX_ENV_ALLOWLIST = (
     "LC_ALL",
     "LC_CTYPE",
 )
+# Passthrough for the session-close nunchi kick: the feed prefers the bridge's
+# Piri wrapper (which itself skips memory bootstrap for extractor sessions).
+_NUNCHI_FEED_ENV_PASSTHROUGH = (
+    "CCC_PIRI_CLI_PATH",
+    "CCC_PIRI_REAL_CLI_PATH",
+)
 _MAX_INDEXER_BYTES = 1024 * 1024
+_MAX_NUNCHI_FEED_BYTES = 256 * 1024
 
 
 class _LocalIndexError(RuntimeError):
@@ -80,6 +88,8 @@ class CodexDistillLocalSinkWorker:
         max_resume_bytes: int = 4000,
         indexer_path: str | Path | None = None,
         index_timeout_seconds: float = 30.0,
+        nunchi_feed_path: str | Path | None = None,
+        nunchi_feed_timeout_seconds: float = 900.0,
         environment: Mapping[str, str] | None = None,
     ) -> None:
         if lease_seconds <= 0 or max_attempts <= 0:
@@ -94,6 +104,14 @@ class CodexDistillLocalSinkWorker:
             or index_timeout_seconds > 60
         ):
             raise ValueError("invalid local sink index timeout")
+        if (
+            not isinstance(nunchi_feed_timeout_seconds, (int, float))
+            or isinstance(nunchi_feed_timeout_seconds, bool)
+            or not math.isfinite(nunchi_feed_timeout_seconds)
+            or nunchi_feed_timeout_seconds <= 0
+            or nunchi_feed_timeout_seconds > 3600
+        ):
+            raise ValueError("invalid nunchi feed kick timeout")
         self._journal = journal
         self._audience_root = Path(os.path.abspath(os.fspath(audience_root)))
         self._owner_token = owner_token or secrets.token_hex(16)
@@ -103,6 +121,11 @@ class CodexDistillLocalSinkWorker:
         self._max_resume_bytes = max_resume_bytes
         self._indexer_path = Path(indexer_path) if indexer_path is not None else None
         self._index_timeout_seconds = float(index_timeout_seconds)
+        self._nunchi_feed_path = (
+            Path(nunchi_feed_path) if nunchi_feed_path is not None else None
+        )
+        self._nunchi_feed_timeout_seconds = float(nunchi_feed_timeout_seconds)
+        self._nunchi_tasks: set[asyncio.Task[None]] = set()
         self._environment = dict(os.environ if environment is None else environment)
 
     async def _fail(
@@ -164,6 +187,118 @@ class CodexDistillLocalSinkWorker:
         ):
             raise _LocalIndexError(terminal=True)
         return candidate
+
+    def _validated_nunchi_feed(self) -> Path | None:
+        """Best-effort nunchi feed path: any doubt means skip (cron is the fallback)."""
+
+        if self._nunchi_feed_path is None:
+            return None
+        candidate = Path(os.path.abspath(os.fspath(self._nunchi_feed_path)))
+        try:
+            metadata = candidate.lstat()
+        except OSError:
+            return None
+        if (
+            stat.S_ISLNK(metadata.st_mode)
+            or not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or metadata.st_uid not in {0, os.geteuid()}
+            or stat.S_IMODE(metadata.st_mode) & 0o022
+            or metadata.st_size <= 0
+            or metadata.st_size > _MAX_NUNCHI_FEED_BYTES
+            or not os.access(candidate, os.X_OK)
+        ):
+            return None
+        return candidate
+
+    def _nunchi_feed_environment(
+        self,
+        *,
+        audience: str,
+        scope: str,
+    ) -> dict[str, str]:
+        try:
+            validate_memory_route(audience, scope)
+        except ValueError:
+            raise _LocalIndexError(terminal=True)
+        scope_root = self._audience_root / scope
+        nunchi_home = scope_root / "nunchi"
+        sessions_dir = scope_root / "piri" / "sessions"
+        environment = {
+            name: value
+            for name in _INDEX_ENV_ALLOWLIST + _NUNCHI_FEED_ENV_PASSTHROUGH
+            if isinstance((value := self._environment.get(name)), str)
+            and "\x00" not in value
+        }
+        environment.setdefault("PATH", "/usr/local/bin:/usr/bin:/bin")
+        environment.update(
+            {
+                # Same shape the cron dispatcher uses for one scoped child run.
+                "CCC_NUNCHI_SCOPED_CHILD": "1",
+                "CCC_NUNCHI_AUDIENCE_SCOPE": scope,
+                "CCC_NUNCHI_AUDIENCE_KIND": audience,
+                "PIRI_CODING_AGENT_SESSION_DIR": str(sessions_dir),
+                "PIR_SESSIONS_DIR": str(sessions_dir),
+                "NUNCHI_HOME": str(nunchi_home),
+                "NUNCHI_DB": str(nunchi_home / "facts.db"),
+                "NUNCHI_SNAPSHOT": str(nunchi_home / "snapshot.md"),
+                "PYTHONDONTWRITEBYTECODE": "1",
+            }
+        )
+        return environment
+
+    async def _drain_nunchi_feed(self, process: asyncio.subprocess.Process) -> None:
+        """Reap one detached kick; failures never reach the job (cron catches up)."""
+
+        try:
+            await asyncio.wait_for(
+                process.wait(),
+                timeout=self._nunchi_feed_timeout_seconds,
+            )
+        except TimeoutError:
+            with suppress(ProcessLookupError):
+                process.kill()
+            with suppress(Exception):
+                await asyncio.wait_for(process.wait(), timeout=5)
+        except Exception:
+            pass
+
+    def kick_nunchi_feed(self, *, audience: str, scope: str) -> None:
+        """Fire the session-close nunchi ingest for one route (detached, body-free).
+
+        The 10-minute cron dispatcher remains the owner of record; this kick only
+        removes the wait so the NEXT session's snapshot already includes the one
+        that just closed. Feed-side flock + seen-file keep cron overlap idempotent.
+        """
+
+        feed = self._validated_nunchi_feed()
+        if feed is None:
+            return
+        try:
+            environment = self._nunchi_feed_environment(audience=audience, scope=scope)
+        except _LocalIndexError:
+            return
+
+        async def _run() -> None:
+            try:
+                spawned = await asyncio.create_subprocess_exec(
+                    str(feed),
+                    stdin=asyncio.subprocess.DEVNULL,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                    env=environment,
+                    start_new_session=True,
+                )
+            except (OSError, ValueError):
+                return
+            await self._drain_nunchi_feed(spawned)
+
+        try:
+            task = asyncio.get_running_loop().create_task(_run())
+        except RuntimeError:
+            return
+        self._nunchi_tasks.add(task)
+        task.add_done_callback(self._nunchi_tasks.discard)
 
     def _index_environment(
         self,
@@ -270,6 +405,7 @@ class CodexDistillLocalSinkWorker:
             if audience is None or scope is None:
                 raise ValueError("local sink job has no safe audience route")
             await self.refresh_route(audience=audience, scope=scope)
+            self.kick_nunchi_feed(audience=audience, scope=scope)
         except asyncio.CancelledError:
             await self._fail(
                 claimed,

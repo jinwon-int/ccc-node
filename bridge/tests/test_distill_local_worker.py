@@ -245,3 +245,133 @@ async def test_lifecycle_loop_drives_pending_local_work(tmp_path: Path) -> None:
         await asyncio.wait_for(task, timeout=2)
 
     assert journal.get(job.job_id).local_sink_status is DistillLocalSinkStatus.DONE
+
+
+@pytest.mark.anyio
+async def test_successful_sink_kicks_scoped_nunchi_feed(tmp_path: Path) -> None:
+    journal = DistillJournal(tmp_path / "journal")
+    journal.initialize()
+    job = await extracted_job(journal)
+    marker = tmp_path / "kick-env"
+    feed = tmp_path / "piri-feed.sh"
+    feed.write_text(
+        "#!/bin/sh\n"
+        "{\n"
+        "echo \"child=${CCC_NUNCHI_SCOPED_CHILD:-}\"\n"
+        "echo \"scope=${CCC_NUNCHI_AUDIENCE_SCOPE:-}\"\n"
+        "echo \"kind=${CCC_NUNCHI_AUDIENCE_KIND:-}\"\n"
+        "echo \"db=${NUNCHI_DB:-}\"\n"
+        "echo \"sessions=${PIR_SESSIONS_DIR:-}\"\n"
+        "echo \"token=${TELEGRAM_BOT_TOKEN:-}\"\n"
+        f"}} > {marker}\n",
+    )
+    feed.chmod(0o700)
+    audience_root = tmp_path / "audiences"
+    worker = CodexDistillLocalSinkWorker(
+        journal,
+        audience_root=audience_root,
+        owner_token="local-worker",
+        nunchi_feed_path=feed,
+        environment={
+            "HOME": str(tmp_path / "home"),
+            "PATH": "/usr/local/bin:/usr/bin:/bin",
+            "TELEGRAM_BOT_TOKEN": "RAW_TELEGRAM_TOKEN_MUST_NOT_CROSS",
+        },
+    )
+
+    result = await worker.write_once(job_id=job.job_id)
+
+    assert result.local_sink_status is DistillLocalSinkStatus.DONE
+    if worker._nunchi_tasks:
+        await asyncio.gather(*worker._nunchi_tasks)
+    env = dict(
+        line.split("=", 1) for line in marker.read_text().splitlines()
+    )
+    assert env["child"] == "1"
+    assert env["scope"] == "private-0123456789abcdef0123456789abcdef"
+    assert env["kind"] == "private"
+    assert env["db"] == str(
+        audience_root
+        / "private-0123456789abcdef0123456789abcdef"
+        / "nunchi"
+        / "facts.db"
+    )
+    assert env["sessions"] == str(
+        audience_root
+        / "private-0123456789abcdef0123456789abcdef"
+        / "piri"
+        / "sessions"
+    )
+    assert env["token"] == ""
+
+
+@pytest.mark.anyio
+async def test_missing_nunchi_feed_skips_kick_and_sink_still_done(
+    tmp_path: Path,
+) -> None:
+    journal = DistillJournal(tmp_path / "journal")
+    journal.initialize()
+    job = await extracted_job(journal)
+    worker = CodexDistillLocalSinkWorker(
+        journal,
+        audience_root=tmp_path / "audiences",
+        owner_token="local-worker",
+        nunchi_feed_path=tmp_path / "absent" / "piri-feed.sh",
+    )
+
+    result = await worker.write_once(job_id=job.job_id)
+
+    assert result.local_sink_status is DistillLocalSinkStatus.DONE
+    if worker._nunchi_tasks:
+        await asyncio.gather(*worker._nunchi_tasks)
+    assert not (tmp_path / "absent").exists()
+
+
+@pytest.mark.anyio
+async def test_unsafe_nunchi_feed_is_never_executed(tmp_path: Path) -> None:
+    journal = DistillJournal(tmp_path / "journal")
+    journal.initialize()
+    job = await extracted_job(journal)
+    marker = tmp_path / "must-not-exist"
+    target = tmp_path / "unsafe-target.sh"
+    target.write_text(f"#!/bin/sh\ntouch {marker}\n")
+    target.chmod(0o700)
+    feed = tmp_path / "piri-feed.sh"
+    feed.symlink_to(target)
+    worker = CodexDistillLocalSinkWorker(
+        journal,
+        audience_root=tmp_path / "audiences",
+        owner_token="local-worker",
+        nunchi_feed_path=feed,
+    )
+
+    result = await worker.write_once(job_id=job.job_id)
+
+    assert result.local_sink_status is DistillLocalSinkStatus.DONE
+    if worker._nunchi_tasks:
+        await asyncio.gather(*worker._nunchi_tasks)
+    assert not marker.exists()
+
+
+@pytest.mark.anyio
+async def test_failing_nunchi_feed_never_affects_the_sink_job(
+    tmp_path: Path,
+) -> None:
+    journal = DistillJournal(tmp_path / "journal")
+    journal.initialize()
+    job = await extracted_job(journal)
+    feed = tmp_path / "piri-feed.sh"
+    feed.write_text("#!/bin/sh\nexit 9\n")
+    feed.chmod(0o700)
+    worker = CodexDistillLocalSinkWorker(
+        journal,
+        audience_root=tmp_path / "audiences",
+        owner_token="local-worker",
+        nunchi_feed_path=feed,
+    )
+
+    result = await worker.write_once(job_id=job.job_id)
+
+    assert result.local_sink_status is DistillLocalSinkStatus.DONE
+    if worker._nunchi_tasks:
+        await asyncio.gather(*worker._nunchi_tasks)
