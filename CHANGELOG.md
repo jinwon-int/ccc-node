@@ -5,6 +5,13 @@ All notable changes to the Claude Code node harness. Dates are KST.
 ## [Unreleased]
 
 ### Added
+- SessionStart stage timing instrumentation (#897 step 1). `load-memory.sh`
+  now appends one body-free JSON line per run (fixed stage names + integer
+  milliseconds + total) to `$CCC_STATE_DIR/memory-timing.jsonl`, so the
+  static latency hypotheses (serial local/recent/shared/legacy search chain,
+  over-split render pipeline) can be verified against real fleet data before
+  any optimization lands. Default on, `CCC_MEMORY_TIMING=0` opts out; the log
+  is self-bounding (~256KiB) and timing never touches stdout or job state.
 - Session-close nunchi kick for audience-scoped Piri nodes. When a distill
   local-sink job lands, the bridge now fires one detached, body-free scoped
   `piri-feed.sh` run for that route, so the just-closed session reaches the

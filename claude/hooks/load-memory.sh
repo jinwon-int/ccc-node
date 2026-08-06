@@ -50,6 +50,56 @@ LOAD_MEMORY_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pw
 # `||` fallback, so a missing module degrades exactly like a heredoc failure.
 MEMORY_RENDER_PY="$LOAD_MEMORY_LIB_DIR/lib/memory_render.py"
 
+# Stage timing instrumentation (#897 step 1): EPOCHREALTIME marks around the
+# expensive stages, appended as ONE body-free JSON line per run to
+# $STATE_DIR/memory-timing.jsonl so the static latency hypotheses (serial
+# search chain etc.) can be verified against real fleet data before any
+# optimization lands. Default on; CCC_MEMORY_TIMING=0 opts out. Values are
+# integer milliseconds under fixed stage names only — never memory content.
+TIMING_ENABLED=0
+if ! is_disabled "${CCC_MEMORY_TIMING:-1}" && [ -n "${EPOCHREALTIME:-}" ]; then
+  TIMING_ENABLED=1
+fi
+_TIMING_START=0
+_TIMING_PREV=0
+_timing_marks=""
+_now_us() { # EPOCHREALTIME -> integer microseconds (locale-safe dot/comma strip)
+  local t="${EPOCHREALTIME//[.,]/}"
+  printf '%s' "${t:-0}"
+}
+_mark() { # <stage> — record ms elapsed since the previous mark
+  [ "$TIMING_ENABLED" = 1 ] || return 0
+  local now prev
+  now="$(_now_us)"
+  prev="$_TIMING_PREV"
+  [ "$prev" -gt 0 ] || prev="$now"
+  [ -n "$_timing_marks" ] && _timing_marks+=" "
+  _timing_marks+="$1=$(( (now - prev) / 1000 ))"
+  _TIMING_PREV="$now"
+}
+_timing_flush() { # append one bounded JSON line; best-effort, never fails the hook
+  [ "$TIMING_ENABLED" = 1 ] || return 0
+  [ "$_TIMING_START" -gt 0 ] || return 0
+  local file="$STATE_DIR/memory-timing.jsonl" now total m stages="" size
+  now="$(_now_us)"
+  total=$(( (now - _TIMING_START) / 1000 ))
+  for m in $_timing_marks; do
+    [ -n "$stages" ] && stages+=","
+    stages+="\"${m%%=*}\":${m##*=}"
+  done
+  printf '%s\n' "{\"ts\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"event\":\"$EVENT\",\"total_ms\":$total,\"stages\":{$stages}}" >> "$file" 2>/dev/null || return 0
+  size="$(wc -c < "$file" 2>/dev/null || printf '0')"
+  if [ "${size:-0}" -gt 262144 ]; then
+    tail -c 131072 "$file" > "$file.tmp" 2>/dev/null \
+      && mv -f "$file.tmp" "$file" 2>/dev/null || rm -f "$file.tmp"
+  fi
+}
+_timing_begin() {
+  [ "$TIMING_ENABLED" = 1 ] || return 0
+  _TIMING_START="$(_now_us)"
+  _TIMING_PREV="$_TIMING_START"
+}
+
 scoped_paths_valid() {
   memory_scope_core_valid \
     && [ "$MEMDIR" = "$AUDIENCE_ROOT/$MEMORY_SCOPE/memories" ] \
@@ -166,6 +216,7 @@ stale_note() { # <label> <file>
 }
 
 # Built-in node memory lives under ~/.claude/memories; legacy Hermes memory is fallback only.
+_timing_begin
 # Audience-scoped mode treats every unscoped source as private legacy input.
 if ! is_disabled "$AUDIENCE_SCOPED"; then
   scoped_mem="$(cat "$MEMDIR/MEMORY.md" "$MEMDIR/USER.md" 2>/dev/null)"
@@ -208,6 +259,7 @@ if ! is_disabled "$AUDIENCE_SCOPED" && [ "$MEMORY_AUDIENCE" = "private" ]; then
 fi
 
 # Limit the canonical blocks first (static caps) so we can measure their slack
+_mark sources
 # before sizing the local hot block.
 mem="$(scan_injection_block built-in-memory "$mem" | limit_bytes "$MAX_MEM")"
 resume="$(scan_injection_block resume-pointer "$resume" | limit_bytes "$MAX_RESUME")"
@@ -246,6 +298,7 @@ if ! is_disabled "${CCC_MEMORY_DYNAMIC_BUDGET:-1}"; then
 fi
 
 local_hot=""
+_mark dynamic_budget
 recent_hot=""
 shared_hot=""
 legacy_hot=""
@@ -260,28 +313,34 @@ if [ "$PROFILE" = "hybrid" ] || [ "$PROFILE" = "max-perf" ] || ! is_disabled "$L
     # MEMORY/USER/cache/resume blocks assembled above still inject. The helper
     # uses Python rather than GNU timeout so the same contract works on Termux.
     local_hot="$(run_memory_search_bounded "$search_tool" "$QUERY" "$search_limit" "${CCC_MEMORY_SEARCH_TIMEOUT_SEC:-3}" "$STATE_DIR")"
+    _mark search_local
     if ! is_disabled "$AUDIENCE_SCOPED"; then
       # A just-committed Codex fact may not match the checkout-derived startup
       # query yet. The write-back indexer tags these rows `distilled`; merge one
       # small recent-fact lane so the immediately following isolated thread sees
       # the durable fact without waiting for another turn or background refresh.
       recent_hot="$(run_memory_search_bounded "$search_tool" "distilled text" "$search_limit" "${CCC_MEMORY_RECENT_SEARCH_TIMEOUT_SEC:-1}" "$STATE_DIR")"
+      _mark search_recent
       if [ "$MEMORY_AUDIENCE" = "private" ] \
         && [ -n "$SHARED_STATE_DIR" ] \
         && [ "$SHARED_STATE_DIR" != "$STATE_DIR" ]; then
         shared_hot="$(run_memory_search_bounded "$search_tool" "$QUERY" "$search_limit" "${CCC_MEMORY_SEARCH_TIMEOUT_SEC:-3}" "$SHARED_STATE_DIR")"
+        _mark search_shared
         if [ -n "$LEGACY_STATE_DIR" ] \
           && [ "$LEGACY_STATE_DIR" != "$STATE_DIR" ] \
           && [ "$LEGACY_STATE_DIR" != "$SHARED_STATE_DIR" ]; then
           legacy_hot="$(run_memory_search_bounded "$search_tool" "$QUERY" "$search_limit" "${CCC_MEMORY_LEGACY_SEARCH_TIMEOUT_SEC:-2}" "$LEGACY_STATE_DIR")"
+          _mark search_legacy
         fi
       fi
       local_hot="$(merge_local_hot "$local_hot" "$recent_hot" "$shared_hot" "$legacy_hot")"
+      _mark merge
     fi
   fi
 fi
 
 local_hot="$(filter_disabled_wiki_hits "$local_hot")"
+_mark filter_wiki
 
 # Dedup the local hot block against what we ACTUALLY inject above (post-redaction,
 # post-truncation) before rendering it — so it surfaces index-only content
@@ -289,10 +348,12 @@ local_hot="$(filter_disabled_wiki_hits "$local_hot")"
 local_hot="$(dedup_local_hot "$mem
 $wiki
 $honcho" "$local_hot")"
+_mark dedup
 # Render the search JSON to compact readable lines, then apply the (possibly
 # enlarged) local byte budget.
 local_hot="$(render_local_hot "$local_hot")"
 local_hot="$(scan_injection_block local-hot-memory "$local_hot" | limit_bytes "$alloc_local")"
+_mark render
 
 node_label="${CCC_NODE:-$(cat "$STATE_DIR/node.txt" 2>/dev/null || hostname -s 2>/dev/null || printf 'ccc-node')}"
 stamp="$(cat "$CACHE/.last-refresh" 2>/dev/null)"
@@ -359,6 +420,7 @@ ctx="$(printf '%s' "$ctx" | limit_bytes "$MAX_TOTAL")"
 
 jq -n --arg ctx "$ctx" --arg event "$EVENT" \
   '{hookSpecificOutput:{hookEventName:$event,additionalContext:$ctx}}'
+_timing_flush
 
 # Fire-and-forget: refresh caches for the NEXT session, fully detached so startup never waits.
 # CCC_MEMORY_NO_REFRESH=1 suppresses it — for hermetic tests (the detached refresh

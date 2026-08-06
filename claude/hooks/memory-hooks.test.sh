@@ -345,5 +345,19 @@ st="$(run_honcho 'printf "{\"content\":\"real recalled memory\"}\n"')"
 ok "a real answer still succeeds" '[ "$st" = "ok" ]'
 ok "a real answer is written to the cache" 'grep -q "real recalled memory" "$nc_cache/honcho.txt"'
 
+# --- #897 step 1: SessionStart stage timing instrumentation ---
+tstate="$TMP/timing-state"; mkdir -p "$tstate"
+out="$(HOME="$TMP/home" CCC_STATE_DIR="$tstate" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CCC_HOOK_DIR="$ROOT/claude/hooks" CCC_MEMORY_TOOLS_DIR="$tools" CCC_HONCHO_MEMORY_ENABLED=0 CCC_MEMORY_NO_REFRESH=1 bash "$ROOT/claude/hooks/load-memory.sh" SessionStart 2>&1)"; rc=$?
+ok "timing: hook still exits 0" '[ "$rc" = 0 ]'
+ok "timing: exactly one JSON line per run" '[ "$(wc -l < "$tstate/memory-timing.jsonl")" = 1 ]'
+ok "timing: line has total and stage marks" 'jq -e ".total_ms >= 0 and (.stages | has(\"sources\")) and (.stages | has(\"search_local\")) and (.stages | has(\"render\"))" "$tstate/memory-timing.jsonl" >/dev/null'
+ok "timing: line is body-free (no memory content)" '! grep -q "safe fact\|Cached wiki\|Local hot memory result" "$tstate/memory-timing.jsonl"'
+out="$(HOME="$TMP/home" CCC_STATE_DIR="$tstate" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CCC_HOOK_DIR="$ROOT/claude/hooks" CCC_MEMORY_TOOLS_DIR="$tools" CCC_HONCHO_MEMORY_ENABLED=0 CCC_MEMORY_NO_REFRESH=1 bash "$ROOT/claude/hooks/load-memory.sh" SessionStart 2>&1)"
+ok "timing: appends one line per run" '[ "$(wc -l < "$tstate/memory-timing.jsonl")" = 2 ]'
+tstate2="$TMP/timing-off-state"; mkdir -p "$tstate2"
+out="$(HOME="$TMP/home" CCC_STATE_DIR="$tstate2" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CCC_HOOK_DIR="$ROOT/claude/hooks" CCC_MEMORY_TOOLS_DIR="$tools" CCC_HONCHO_MEMORY_ENABLED=0 CCC_MEMORY_NO_REFRESH=1 CCC_MEMORY_TIMING=0 bash "$ROOT/claude/hooks/load-memory.sh" SessionStart 2>&1)"; rc=$?
+ok "timing: opt-out keeps hook healthy" '[ "$rc" = 0 ]'
+ok "timing: CCC_MEMORY_TIMING=0 writes nothing" '[ ! -e "$tstate2/memory-timing.jsonl" ]'
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
