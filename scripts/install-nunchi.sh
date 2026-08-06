@@ -7,6 +7,7 @@
 #   install-nunchi.sh --apply --codex      # explicit Codex override
 #   install-nunchi.sh --apply --claude     # explicit Claude override
 #   install-nunchi.sh --apply --piri       # explicit Piri override
+#   install-nunchi.sh --apply --piri --audience-scoped /absolute/audience/root
 #   install-nunchi.sh --apply --target-user gongmyoung
 #   install-nunchi.sh --remove             # mode off + managed cron/hook removal
 #   install-nunchi.sh                      # status
@@ -22,6 +23,8 @@ set -euo pipefail
 ACTION="status"
 PROVIDER="${CCC_NUNCHI_PROVIDER:-auto}"
 TARGET_USER="${CCC_NUNCHI_TARGET_USER:-}"
+AUDIENCE_SCOPED="${CCC_NUNCHI_AUDIENCE_SCOPED:-0}"
+AUDIENCE_ROOT="${CCC_NUNCHI_AUDIENCE_ROOT:-}"
 ORIGINAL_ARGS=("$@")
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -30,6 +33,9 @@ while [ $# -gt 0 ]; do
     --codex) PROVIDER="codex" ;;
     --claude) PROVIDER="claude" ;;
     --piri) PROVIDER="piri" ;;
+    --audience-scoped)
+      [ $# -ge 2 ] || { echo "--audience-scoped requires an absolute root" >&2; exit 2; }
+      AUDIENCE_SCOPED=1; AUDIENCE_ROOT="$2"; shift ;;
     --target-user)
       [ $# -ge 2 ] || { echo "--target-user requires a user" >&2; exit 2; }
       TARGET_USER="$2"; shift ;;
@@ -69,6 +75,8 @@ if [ -n "$TARGET_USER" ] && [ "$TARGET_USER" != "$(id -un)" ]; then
     HOME="$target_home" USER="$TARGET_USER" LOGNAME="$TARGET_USER" \
     PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
     CCC_NUNCHI_TARGET_USER="$TARGET_USER" CCC_NUNCHI_PROVIDER="$PROVIDER" \
+    CCC_NUNCHI_AUDIENCE_SCOPED="$AUDIENCE_SCOPED" \
+    CCC_NUNCHI_AUDIENCE_ROOT="$AUDIENCE_ROOT" \
     CCC_CLAUDE_DIR="$target_claude_dir" CODEX_HOME="$target_codex_home" CCC_STATE_DIR="$target_state_dir" \
     NUNCHI_HOME="$target_nunchi_home" NUNCHI_DB="${NUNCHI_DB:-$target_nunchi_home/facts.db}" \
     NUNCHI_SNAPSHOT="${NUNCHI_SNAPSHOT:-$target_nunchi_home/snapshot.md}" \
@@ -157,6 +165,38 @@ except Exception:
 PY
 }
 
+_status_audience() {  # <cron-text> -> body-free "enabled=<0|1> root=<path|none>"
+  python3 - "$1" "$AUDIENCE_SCOPED" "$AUDIENCE_ROOT" <<'PY'
+import shlex
+import sys
+
+cron, explicit, explicit_root = sys.argv[1:]
+if explicit == "1" and explicit_root:
+    print(f"enabled=1 root={explicit_root}")
+    raise SystemExit(0)
+for line in cron.splitlines():
+    if "# nunchi:#816" not in line:
+        continue
+    fields = line.split(maxsplit=5)
+    if len(fields) != 6:
+        continue
+    try:
+        tokens = shlex.split(fields[5].split("# nunchi:#816", 1)[0])
+    except ValueError:
+        continue
+    env = {}
+    for token in tokens:
+        if "=" not in token:
+            break
+        key, value = token.split("=", 1)
+        env[key] = value.replace(r"\%", "%")
+    if env.get("CCC_NUNCHI_AUDIENCE_SCOPED") == "1":
+        print(f"enabled=1 root={env.get('CCC_NUNCHI_AUDIENCE_ROOT') or 'missing'}")
+        raise SystemExit(0)
+print("enabled=0 root=none")
+PY
+}
+
 status() {
   local cron configured="none" runtime_provider mp_path mp_ver
   cron="$("$CRONTAB" -l 2>/dev/null || true)"
@@ -176,6 +216,7 @@ status() {
   echo "source: $(_status_source "$cron")"
   echo "mempalace: binary=${mp_path:-missing} version=$mp_ver"
   echo "collection: $(_status_collection "$MEMPALACE_STATUS")"
+  echo "audience_scoped: $(_status_audience "$cron")"
   echo "mode: $(cat "$MODE_FILE" 2>/dev/null || echo off)"
   echo "hooks: $([ -f "$HOOKS/nunchi.py" ] && echo present || echo MISSING) ($HOOKS)"
   echo "codex_loader: $(if validate_codex_loader; then echo present; else echo MISSING/UNSAFE; fi)"
@@ -302,6 +343,20 @@ case "$ACTION" in
     [ -f "$HOOKS/nunchi.py" ] || { echo "hooks missing at $HOOKS — run setup.sh first" >&2; exit 2; }
     mkdir -p "$NUNCHI_DIR"; chmod 700 "$NUNCHI_DIR"  # owner-only: logs/state stay private (#865)
     resolved_provider="$(detect_provider)"
+    if [ "$AUDIENCE_SCOPED" = 1 ]; then
+      [ "$resolved_provider" = piri ] || { echo "audience-scoped collection currently requires Piri" >&2; exit 2; }
+      case "$AUDIENCE_ROOT" in
+        /*) ;;
+        *) echo "audience-scoped collection requires an absolute root" >&2; exit 2 ;;
+      esac
+      if [ -L "$AUDIENCE_ROOT" ] || { [ -e "$AUDIENCE_ROOT" ] && [ ! -d "$AUDIENCE_ROOT" ]; }; then
+        echo "audience-scoped root is unsafe" >&2; exit 2
+      fi
+      mkdir -p "$AUDIENCE_ROOT"
+      [ "$(stat -c %u -- "$AUDIENCE_ROOT")" = "$(id -u)" ] \
+        || { echo "audience-scoped root owner is unsafe" >&2; exit 2; }
+      chmod 700 "$AUDIENCE_ROOT"
+    fi
     if [ "$resolved_provider" = "codex" ] && ! validate_codex_loader; then
       echo "Codex nunchi loader missing or unsafe at $HOOKS/codex-loader.py — run setup.sh first" >&2
       exit 2
@@ -316,6 +371,8 @@ case "$ACTION" in
     default_sweep="$CLAUDE_DIR/projects"
     [ "$resolved_provider" = "codex" ] && default_sweep="$CODEX_HOME_DIR/sessions"
     [ "$resolved_provider" = "piri" ]  && default_sweep="$HOME/.piri/agent/sessions"
+    [ "$resolved_provider" = "piri" ] && [ "$AUDIENCE_SCOPED" = 1 ] \
+      && default_sweep="$AUDIENCE_ROOT"
     sweep_dir="${NUNCHI_SWEEP_DIR:-$default_sweep}"
     refresh="$HOOKS/mempalace-refresh.sh"
     refresh_ready=0
@@ -331,9 +388,13 @@ case "$ACTION" in
     retire_legacy
     strip_cron
     write_mode on
-    append_cron_line "*/10 * * * * CCC_STATE_DIR=$(cron_quote "$STATE") NUNCHI_HOME=$(cron_quote "$NUNCHI_DIR") NUNCHI_DB=$(cron_quote "$NUNCHI_DB_PATH") NUNCHI_SNAPSHOT=$(cron_quote "$NUNCHI_SNAPSHOT_PATH") $(cron_quote "$bash_bin") $(cron_quote "$feed") >> $(cron_quote "$NUNCHI_DIR/cron.log") 2>&1 $MARK"
+    scoped_env=""
+    if [ "$AUDIENCE_SCOPED" = 1 ]; then
+      scoped_env="CCC_NUNCHI_AUDIENCE_SCOPED=1 CCC_NUNCHI_AUDIENCE_ROOT=$(cron_quote "$AUDIENCE_ROOT") "
+    fi
+    append_cron_line "*/10 * * * * CCC_STATE_DIR=$(cron_quote "$STATE") ${scoped_env}NUNCHI_HOME=$(cron_quote "$NUNCHI_DIR") NUNCHI_DB=$(cron_quote "$NUNCHI_DB_PATH") NUNCHI_SNAPSHOT=$(cron_quote "$NUNCHI_SNAPSHOT_PATH") $(cron_quote "$bash_bin") $(cron_quote "$feed") >> $(cron_quote "$NUNCHI_DIR/cron.log") 2>&1 $MARK"
     if [ "$refresh_ready" = 1 ]; then
-      append_cron_line "17 * * * * CCC_STATE_DIR=$(cron_quote "$STATE") NUNCHI_HOME=$(cron_quote "$NUNCHI_DIR") CCC_NUNCHI_MEMPALACE_STATUS=$(cron_quote "$MEMPALACE_STATUS") CCC_NUNCHI_MEMPALACE_REFRESH_TIMEOUT_SEC=$(cron_quote "$MEMPALACE_TIMEOUT") CCC_NUNCHI_MEMPALACE_CLI=$(cron_quote "$mp") CCC_NUNCHI_TIMEOUT_CLI=$(cron_quote "$timeout_bin") CCC_NUNCHI_FLOCK_CLI=$(cron_quote "$flock_bin") $(cron_quote "$bash_bin") $(cron_quote "$refresh") $resolved_provider $(cron_quote "$sweep_dir") >> $(cron_quote "$NUNCHI_DIR/mempalace-sweep.cron.log") 2>&1 $MARK"
+      append_cron_line "17 * * * * CCC_STATE_DIR=$(cron_quote "$STATE") ${scoped_env}NUNCHI_HOME=$(cron_quote "$NUNCHI_DIR") CCC_NUNCHI_MEMPALACE_STATUS=$(cron_quote "$MEMPALACE_STATUS") CCC_NUNCHI_MEMPALACE_REFRESH_TIMEOUT_SEC=$(cron_quote "$MEMPALACE_TIMEOUT") CCC_NUNCHI_MEMPALACE_CLI=$(cron_quote "$mp") CCC_NUNCHI_TIMEOUT_CLI=$(cron_quote "$timeout_bin") CCC_NUNCHI_FLOCK_CLI=$(cron_quote "$flock_bin") $(cron_quote "$bash_bin") $(cron_quote "$refresh") $resolved_provider $(cron_quote "$sweep_dir") >> $(cron_quote "$NUNCHI_DIR/mempalace-sweep.cron.log") 2>&1 $MARK"
       echo "mempalace hourly refresh cron added ($resolved_provider: $sweep_dir)"
     else
       echo "mempalace CLI, refresh hook or transcript dir missing — verbatim refresh cron skipped"

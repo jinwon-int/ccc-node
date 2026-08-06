@@ -111,6 +111,67 @@ CCC_TEST_MEMPALACE_CAPTURE="$piri_refresh_capture" HOME="$home" \
 ok "Piri refresh uses the conversation miner attributed to the piri wing" \
   '[ "$rc" = 0 ] && grep -qx "mine $piri_sessions --mode convos --wing piri" "$piri_refresh_capture" && jq -e '\''.provider == "piri" and .state == "ok" and .exit_code == 0 '\'' "$nunchi_home/mempalace-refresh.status.json" >/dev/null'
 
+# Audience-scoped Piri collection: canonical opaque direct children only,
+# with one Nunchi store and one MemPalace HOME per audience.
+audience_root="$TMP/audiences"
+first_scope="$audience_root/private-11111111111111111111111111111111"
+second_scope="$audience_root/private-22222222222222222222222222222222"
+shared_scope="$audience_root/shared"
+invalid_scope="$audience_root/private-raw-934719283"
+mkdir -p "$first_scope/piri/sessions" "$second_scope/piri/sessions" \
+  "$shared_scope/piri/sessions" "$invalid_scope/piri/sessions"
+chmod 700 "$audience_root" "$first_scope" "$second_scope" "$shared_scope" "$invalid_scope"
+chmod 700 "$first_scope/piri/sessions" "$second_scope/piri/sessions" \
+  "$shared_scope/piri/sessions" "$invalid_scope/piri/sessions"
+for scope_dir in "$first_scope" "$second_scope" "$shared_scope" "$invalid_scope"; do
+  printf '%s\n' '{"type":"message","message":{"role":"user","content":"short"}}' \
+    > "$scope_dir/piri/sessions/1_test.jsonl"
+  chmod 600 "$scope_dir/piri/sessions/1_test.jsonl"
+done
+long_text="$(printf 'x%.0s' {1..260})"
+printf '%s\n' "{\"type\":\"message\",\"message\":{\"role\":\"user\",\"content\":\"$long_text\"}}" \
+  > "$first_scope/piri/sessions/1_test.jsonl"
+chmod 600 "$first_scope/piri/sessions/1_test.jsonl"
+out="$(env "${common_env[@]}" bash "$ROOT/scripts/install-nunchi.sh" \
+  --apply --piri --audience-scoped "$audience_root" 2>&1)"; rc=$?
+ok "scoped Piri install persists the exact audience dispatcher root in managed cron" \
+  '[ "$rc" = 0 ] && [ "$(grep -c "CCC_NUNCHI_AUDIENCE_SCOPED=1" "$cron_store")" = 2 ] && [ "$(grep -c "CCC_NUNCHI_AUDIENCE_ROOT=$audience_root" "$cron_store")" = 2 ] && grep -q "audience_scoped: enabled=1 root=$audience_root" <<<"$out"'
+out="$(run_install 2>&1)"; rc=$?
+ok "later installer status recovers scoped mode and root from managed cron" \
+  '[ "$rc" = 0 ] && grep -q "audience_scoped: enabled=1 root=$audience_root" <<<"$out"'
+write_exec_stub "$fake_bin/piri" <<'SH'
+printf '%s\n' '{"honcho":[{"kind":"fact","text":"SCOPED_PROVIDER_PROVENANCE","subject":"session"}]}'
+SH
+HOME="$home" PATH="$fake_bin:/usr/bin:/bin" CCC_STATE_DIR="$state" \
+  CCC_PIRI_CLI_PATH="$fake_bin/piri" CCC_NUNCHI_AUDIENCE_SCOPED=1 \
+  CCC_NUNCHI_AUDIENCE_ROOT="$audience_root" \
+  bash "$hooks/nunchi/piri-feed.sh" >/dev/null 2>&1; rc=$?
+ok "scoped Piri feed creates independent seen/snapshot state for canonical audiences" \
+  '[ "$rc" = 0 ] && [ -f "$first_scope/nunchi/piri-seen" ] && [ -f "$second_scope/nunchi/piri-seen" ] && [ -f "$shared_scope/nunchi/piri-seen" ]'
+ok "scoped Piri feed ignores non-opaque audience names" \
+  '[ ! -e "$invalid_scope/nunchi" ]'
+ok "scoped Piri facts retain Piri provider provenance in their session evidence" \
+  'python3 - "$first_scope/nunchi/facts.db" <<'"'"'PY'"'"'
+import sqlite3, sys
+db = sqlite3.connect(sys.argv[1])
+assert db.execute("SELECT COUNT(*) FROM peer_facts WHERE fact=? AND evidence LIKE ?", ("SCOPED_PROVIDER_PROVENANCE", "distill:piri:%")).fetchone()[0] == 1
+PY'
+
+scoped_mp_capture="$TMP/scoped-mempalace.args"
+write_exec_stub "$fake_bin/scoped-mempalace" <<'SH'
+printf '%s|%s\n' "$HOME" "$*" >> "${CCC_TEST_MEMPALACE_CAPTURE:?}"
+exit 0
+SH
+HOME="$home" PATH="$fake_bin:/usr/bin:/bin" CCC_STATE_DIR="$state" \
+  CCC_NUNCHI_AUDIENCE_SCOPED=1 CCC_NUNCHI_AUDIENCE_ROOT="$audience_root" \
+  CCC_NUNCHI_MEMPALACE_CLI="$fake_bin/scoped-mempalace" \
+  CCC_TEST_MEMPALACE_CAPTURE="$scoped_mp_capture" \
+  bash "$hooks/nunchi/mempalace-refresh.sh" piri "$audience_root" >/dev/null 2>&1; rc=$?
+ok "scoped MemPalace refresh uses a distinct HOME and target for each audience" \
+  '[ "$rc" = 0 ] && [ "$(wc -l < "$scoped_mp_capture")" = 3 ] && grep -q "^$first_scope/mempalace-home|mine $first_scope/piri/sessions --mode convos --wing piri$" "$scoped_mp_capture" && grep -q "^$second_scope/mempalace-home|mine $second_scope/piri/sessions --mode convos --wing piri$" "$scoped_mp_capture" && grep -q "^$shared_scope/mempalace-home|mine $shared_scope/piri/sessions --mode convos --wing piri$" "$scoped_mp_capture"'
+ok "scoped MemPalace refresh never creates state for an invalid audience" \
+  '[ ! -e "$invalid_scope/mempalace-home" ] && [ -f "$first_scope/nunchi/mempalace-refresh.status.json" ] && [ -f "$shared_scope/nunchi/mempalace-refresh.status.json" ]'
+
 edge_status="$TMP/edge-refresh.status.json"
 timeout_capture="$TMP/timeout.args"
 write_exec_stub "$fake_bin/timeout" <<'SH'

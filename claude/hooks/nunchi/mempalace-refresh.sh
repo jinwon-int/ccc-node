@@ -32,6 +32,76 @@ case "$timeout_sec" in
 esac
 
 [ "$(cat "$mode_file" 2>/dev/null || true)" = on ] || exit 0
+
+# Audience-scoped cron dispatches only canonical opaque direct children. Each
+# child runs with an isolated HOME, which is where MemPalace keeps its index;
+# status and locks remain beside that scope's Nunchi DB. Global behavior is
+# unchanged when the flag is absent.
+if [ "${CCC_NUNCHI_AUDIENCE_SCOPED:-0}" = 1 ] \
+    && [ "${CCC_NUNCHI_SCOPED_CHILD:-0}" != 1 ]; then
+  [ "$provider" = piri ] || { echo "audience-scoped refresh requires piri" >&2; exit 2; }
+  audience_root="${CCC_NUNCHI_AUDIENCE_ROOT:-}"
+  max_scopes="${CCC_NUNCHI_MAX_SCOPES_PER_RUN:-64}"
+  case "$max_scopes" in
+    ''|*[!0-9]*) max_scopes=64 ;;
+    *) [ "$max_scopes" -ge 1 ] && [ "$max_scopes" -le 64 ] || max_scopes=64 ;;
+  esac
+  dispatcher_mp="${CCC_NUNCHI_MEMPALACE_CLI:-$(command -v mempalace || true)}"
+  [ -n "$dispatcher_mp" ] || { [ ! -x "$HOME/.local/bin/mempalace" ] || dispatcher_mp="$HOME/.local/bin/mempalace"; }
+  rc=0
+  while IFS= read -r scope_root; do
+    [ -d "$scope_root/piri/sessions" ] || continue
+    mkdir -p "$scope_root/nunchi" "$scope_root/mempalace-home"
+    chmod 700 "$scope_root/nunchi" "$scope_root/mempalace-home"
+    CCC_NUNCHI_SCOPED_CHILD=1 \
+      CCC_NUNCHI_AUDIENCE_SCOPE="${scope_root##*/}" \
+      HOME="$scope_root/mempalace-home" \
+      NUNCHI_HOME="$scope_root/nunchi" \
+      CCC_NUNCHI_MEMPALACE_STATUS="$scope_root/nunchi/mempalace-refresh.status.json" \
+      CCC_NUNCHI_MEMPALACE_CLI="$dispatcher_mp" \
+      bash "$0" piri "$scope_root/piri/sessions" || rc=1
+  done < <(python3 - "$audience_root" "$max_scopes" <<'PY'
+import os
+from pathlib import Path
+import re
+import stat
+import sys
+
+root = Path(sys.argv[1])
+limit = int(sys.argv[2])
+try:
+    meta = root.lstat()
+except OSError:
+    raise SystemExit(0)
+if not (
+    root.is_absolute()
+    and stat.S_ISDIR(meta.st_mode)
+    and meta.st_uid == os.geteuid()
+    and not stat.S_IMODE(meta.st_mode) & 0o077
+):
+    raise SystemExit(0)
+count = 0
+for child in sorted(root.iterdir(), key=lambda item: item.name):
+    if count >= limit:
+        break
+    if child.name != "shared" and not re.fullmatch(r"private-[0-9a-f]{32}", child.name):
+        continue
+    try:
+        item = child.lstat()
+    except OSError:
+        continue
+    if not (
+        stat.S_ISDIR(item.st_mode)
+        and item.st_uid == os.geteuid()
+        and not stat.S_IMODE(item.st_mode) & 0o077
+    ):
+        continue
+    print(child)
+    count += 1
+PY
+  )
+  exit "$rc"
+fi
 mkdir -p "$nunchi_home"
 
 write_status() {
@@ -103,6 +173,35 @@ if [ -z "$target" ] || [ ! -d "$target" ]; then
   echo "transcript directory missing" >&2
   preflight_error 2
   exit $?
+fi
+if [ "${CCC_NUNCHI_SCOPED_CHILD:-0}" = 1 ]; then
+  # Do not let an audience transcript tree redirect the external miner across
+  # the physical boundary through a symlink or permissive/foreign entry.
+  python3 - "$target" <<'PY' || { preflight_error 2; exit $?; }
+import os
+from pathlib import Path
+import stat
+import sys
+
+root = Path(sys.argv[1])
+seen = 0
+for directory, names, files in os.walk(root, followlinks=False):
+    for raw in (directory, *(str(Path(directory) / name) for name in names + files)):
+        seen += 1
+        if seen > 100000:
+            raise SystemExit(1)
+        try:
+            item = Path(raw).lstat()
+        except OSError:
+            raise SystemExit(1)
+        if (
+            stat.S_ISLNK(item.st_mode)
+            or item.st_uid != os.geteuid()
+            or stat.S_IMODE(item.st_mode) & 0o077
+            or not (stat.S_ISDIR(item.st_mode) or stat.S_ISREG(item.st_mode))
+        ):
+            raise SystemExit(1)
+PY
 fi
 
 mp="${CCC_NUNCHI_MEMPALACE_CLI:-}"

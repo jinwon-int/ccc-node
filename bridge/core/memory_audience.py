@@ -76,6 +76,18 @@ class MemoryAudience:
 
         return self.scope_root / "piri" / "bootstrap"
 
+    @property
+    def nunchi_home(self) -> Path:
+        """Return the peer-fact store dedicated to this audience."""
+
+        return self.scope_root / "nunchi"
+
+    @property
+    def mempalace_home(self) -> Path:
+        """Return the isolated HOME used by MemPalace for this audience."""
+
+        return self.scope_root / "mempalace-home"
+
     def hook_environment(self, settings: Any) -> dict[str, str]:
         """Return body-free paths/policy for the existing memory hook stack."""
 
@@ -114,6 +126,16 @@ class MemoryAudience:
             # working-memory snapshot without copying it into a public store.
             "CCC_MEMORY_LEGACY_PRIVATE_READS": "1" if private_legacy else "0",
             "CCC_MEMORY_LEGACY_NUNCHI_HOME": str(home_root / ".nunchi"),
+            # Nunchi and MemPalace follow the same opaque route as the provider
+            # transcript.  Private recall may combine its exact store with the
+            # shared store and private-only legacy input; shared recall cannot.
+            "CCC_NUNCHI_AUDIENCE_SCOPED": "1",
+            "CCC_NUNCHI_AUDIENCE_ROOT": str(self.root),
+            "NUNCHI_HOME": str(self.nunchi_home),
+            "NUNCHI_DB": str(self.nunchi_home / "facts.db"),
+            "NUNCHI_SNAPSHOT": str(self.nunchi_home / "snapshot.md"),
+            "CCC_NUNCHI_SHARED_HOME": str(self.shared_root / "nunchi"),
+            "CCC_NUNCHI_MEMPALACE_HOME": str(self.mempalace_home),
             # Honcho derives a distinct server-side workspace from this opaque
             # scope. Private recall may additionally read the shared workspace
             # and the private-only legacy workspace; public routes never do.
@@ -144,6 +166,7 @@ class MemoryAudience:
                 {
                     "CCC_MEMORY_MAX_BYTES": "18000",
                     "CCC_BUILTIN_MEMORY_MAX_BYTES": "8000",
+                    "CCC_CODEX_NUNCHI_MAX_BYTES": "8192",
                 }
             )
         return env

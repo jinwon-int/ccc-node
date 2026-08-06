@@ -5,6 +5,14 @@ All notable changes to the Claude Code node harness. Dates are KST.
 ## [Unreleased]
 
 ### Added
+- Audience-scoped Piri/Nunchi/MemPalace collection and recall (#950). The
+  bridge now supplies one canonical Nunchi DB/snapshot and isolated MemPalace
+  HOME per opaque memory audience. Private recall is private + shared +
+  private-only pre-scope legacy; shared recall is shared-only. The Piri feed
+  and MemPalace cron wrappers provide bounded, owner-only scope dispatch while
+  rejecting symlinks, unsafe entries and non-canonical scope names. Body-free
+  readiness reports partition counts without scope names or memory bodies;
+  unscoped collection remains unchanged.
 - nunchi/MemPalace collection lane for the Piri provider. Piri nodes had no
   nunchi lane (Piri sessions are not read by the Claude/Codex distill journal),
   so `ccc-doctor` always reported `nunchi collection` DRIFT and `memory cache`

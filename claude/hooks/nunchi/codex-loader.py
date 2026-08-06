@@ -162,13 +162,62 @@ def _private_legacy_route(
     return state, nunchi
 
 
+def _scoped_nunchi_route(
+    environ: Mapping[str, str], *, home: Path, claude_dir: Path
+) -> tuple[str, Path, Path, Path | None] | None:
+    """Validate canonical audience paths and return exact readable stores.
+
+    The tuple is ``(kind, private_or_shared_home, shared_home, legacy_home)``.
+    Shared routes receive no legacy home.  No caller-selected snapshot path is
+    accepted in scoped mode.
+    """
+
+    if not _truthy(environ.get("CCC_MEMORY_AUDIENCE_SCOPED")):
+        return None
+    kind = environ.get("CCC_MEMORY_AUDIENCE") or ""
+    scope = environ.get("CCC_MEMORY_SCOPE") or ""
+    root = Path(environ.get("CCC_MEMORY_AUDIENCE_ROOT") or "").expanduser()
+    configured_root = Path(
+        environ.get("CCC_NUNCHI_AUDIENCE_ROOT") or ""
+    ).expanduser()
+    nunchi_home = Path(environ.get("NUNCHI_HOME") or "").expanduser()
+    nunchi_db = Path(environ.get("NUNCHI_DB") or "").expanduser()
+    shared_home = Path(environ.get("CCC_NUNCHI_SHARED_HOME") or "").expanduser()
+    legacy_state = Path(
+        environ.get("CCC_MEMORY_LEGACY_STATE_DIR") or ""
+    ).expanduser()
+    valid_scope = scope == "shared" if kind == "shared" else bool(
+        kind == "private" and re.fullmatch(r"private-[0-9a-f]{32}", scope)
+    )
+    if not (
+        _truthy(environ.get("CCC_NUNCHI_AUDIENCE_SCOPED"))
+        and valid_scope
+        and root.is_absolute()
+        and configured_root == root
+        and nunchi_home == root / scope / "nunchi"
+        and nunchi_db == nunchi_home / "facts.db"
+        and shared_home == root / "shared" / "nunchi"
+        and legacy_state == claude_dir / "state"
+    ):
+        return None
+    legacy_home: Path | None = None
+    if kind == "private":
+        legacy = _private_legacy_route(environ, home=home, claude_dir=claude_dir)
+        if legacy is None:
+            return None
+        legacy_home = legacy[1]
+    elif _truthy(environ.get("CCC_MEMORY_LEGACY_PRIVATE_READS")):
+        return None
+    return kind, nunchi_home, shared_home, legacy_home
+
+
 def _mode_is_on(environ: Mapping[str, str], claude_dir: Path, home: Path) -> bool:
     state_dir = _state_dir(environ, claude_dir)
     if _truthy(environ.get("CCC_MEMORY_AUDIENCE_SCOPED")):
-        legacy = _private_legacy_route(environ, home=home, claude_dir=claude_dir)
-        if legacy is None:
+        route = _scoped_nunchi_route(environ, home=home, claude_dir=claude_dir)
+        if route is None:
             return False
-        state_dir = legacy[0]
+        state_dir = claude_dir / "state"
     mode = _safe_read(
         state_dir / "nunchi.mode",
         max_bytes=16,
@@ -382,36 +431,24 @@ def _scan_snapshot(
         return None
 
 
-def _nunchi_context(
-    environ: Mapping[str, str],
+def _one_nunchi_context(
+    snapshot_path: Path,
     *,
-    home: Path,
-    claude_dir: Path,
+    nunchi_environ: Mapping[str, str],
     hook_dir: Path,
     deadline: float,
 ) -> str | None:
-    if not _mode_is_on(environ, claude_dir, home):
-        return None
-    legacy = _private_legacy_route(environ, home=home, claude_dir=claude_dir)
-    if legacy is not None:
-        nunchi_home = legacy[1]
-        snapshot_path = nunchi_home / "snapshot.md"
-        nunchi_environ = dict(environ)
-        nunchi_environ.update(
-            {
-                "NUNCHI_HOME": str(nunchi_home),
-                "NUNCHI_DB": str(nunchi_home / "facts.db"),
-                "NUNCHI_SNAPSHOT": str(snapshot_path),
-            }
-        )
-    else:
-        nunchi_home = Path(
-            environ.get("NUNCHI_HOME") or home / ".nunchi"
-        ).expanduser().absolute()
-        snapshot_path = Path(
-            environ.get("NUNCHI_SNAPSHOT") or nunchi_home / "snapshot.md"
-        ).expanduser().absolute()
-        nunchi_environ = environ
+    """Read, refresh and scan one already-authorized snapshot."""
+
+    nunchi_home = snapshot_path.parent
+    effective_environ = dict(nunchi_environ)
+    effective_environ.update(
+        {
+            "NUNCHI_HOME": str(nunchi_home),
+            "NUNCHI_DB": str(nunchi_home / "facts.db"),
+            "NUNCHI_SNAPSHOT": str(snapshot_path),
+        }
+    )
     snapshot = _safe_read(
         snapshot_path,
         max_bytes=MAX_MANAGED_FILE_BYTES,
@@ -421,7 +458,7 @@ def _nunchi_context(
         return None
 
     max_age = _bounded_int(
-        environ.get("CCC_CODEX_NUNCHI_SNAPSHOT_MAX_AGE_SEC"),
+        nunchi_environ.get("CCC_CODEX_NUNCHI_SNAPSHOT_MAX_AGE_SEC"),
         DEFAULT_SNAPSHOT_MAX_AGE_SECONDS,
         minimum=0,
         maximum=24 * 60 * 60,
@@ -429,7 +466,7 @@ def _nunchi_context(
     if time.time() - snapshot[1].st_mtime > max_age:
         script = _validate_managed_script(hook_dir / "nunchi.py")
         if script is None or not _regenerate_snapshot(
-            script, nunchi_environ, deadline=deadline
+            script, effective_environ, deadline=deadline
         ):
             return None
         snapshot = _safe_read(
@@ -444,10 +481,20 @@ def _nunchi_context(
         snapshot[0].decode("utf-8")
     except UnicodeDecodeError:
         return None
-    text = _scan_snapshot(
-        snapshot[0], hook_dir=hook_dir, environ=nunchi_environ, deadline=deadline
+    return _scan_snapshot(
+        snapshot[0], hook_dir=hook_dir, environ=effective_environ, deadline=deadline
     )
-    if not text:
+
+
+def _nunchi_context(
+    environ: Mapping[str, str],
+    *,
+    home: Path,
+    claude_dir: Path,
+    hook_dir: Path,
+    deadline: float,
+) -> str | None:
+    if not _mode_is_on(environ, claude_dir, home):
         return None
     limit = _bounded_int(
         environ.get("CCC_CODEX_NUNCHI_MAX_BYTES"),
@@ -455,7 +502,43 @@ def _nunchi_context(
         minimum=128,
         maximum=MAX_NUNCHI_BYTES,
     )
-    return _truncate_utf8(text, limit).rstrip()
+    route = _scoped_nunchi_route(environ, home=home, claude_dir=claude_dir)
+    if route is None:
+        nunchi_home = Path(
+            environ.get("NUNCHI_HOME") or home / ".nunchi"
+        ).expanduser().absolute()
+        snapshot_path = Path(
+            environ.get("NUNCHI_SNAPSHOT") or nunchi_home / "snapshot.md"
+        ).expanduser().absolute()
+        text = _one_nunchi_context(
+            snapshot_path,
+            nunchi_environ=environ,
+            hook_dir=hook_dir,
+            deadline=deadline,
+        )
+        return _truncate_utf8(text, limit).rstrip() if text else None
+
+    kind, own_home, shared_home, legacy_home = route
+    candidates: list[tuple[str, Path]] = [(kind, own_home)]
+    if kind == "private":
+        candidates.append(("shared", shared_home))
+        assert legacy_home is not None
+        candidates.append(("private-legacy", legacy_home))
+    blocks: list[str] = []
+    seen: set[str] = set()
+    for label, store in candidates:
+        text = _one_nunchi_context(
+            store / "snapshot.md",
+            nunchi_environ=environ,
+            hook_dir=hook_dir,
+            deadline=deadline,
+        )
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        blocks.append(f"## Nunchi memory ({label})\n{text}")
+    merged = "\n\n".join(blocks)
+    return _truncate_utf8(merged, limit).rstrip() if merged else None
 
 
 def main() -> int:

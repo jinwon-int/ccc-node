@@ -992,6 +992,12 @@ class CodexMemoryMaterializerTest(unittest.TestCase):
             "CCC_MEMORY_LEGACY_STATE_DIR": env["CCC_STATE_DIR"],
             "CCC_MEMORY_LEGACY_NUNCHI_HOME": env["NUNCHI_HOME"],
             "CCC_MEMORY_LEGACY_PRIVATE_READS": "1",
+            "CCC_NUNCHI_AUDIENCE_SCOPED": "1",
+            "CCC_NUNCHI_AUDIENCE_ROOT": str(audience_root),
+            "NUNCHI_HOME": str(audience_root / scope / "nunchi"),
+            "NUNCHI_DB": str(audience_root / scope / "nunchi/facts.db"),
+            "NUNCHI_SNAPSHOT": str(audience_root / scope / "nunchi/snapshot.md"),
+            "CCC_NUNCHI_SHARED_HOME": str(audience_root / "shared/nunchi"),
         }
         snapshot = self.module.load_snapshot(
             self.module.MaterializeOptions.from_environ(private_env)
@@ -1019,6 +1025,65 @@ class CodexMemoryMaterializerTest(unittest.TestCase):
         )
         self.assertIn("LEGACY_NUNCHI_PRIVATE_ONLY", exact)
         self.assertNotIn("OUTSIDE_NUNCHI_MUST_NOT_OVERRIDE", exact)
+
+    def test_scoped_nunchi_recall_is_private_plus_shared_and_never_cross_private(self) -> None:
+        _loader, env, _base_document = self._prepare_nunchi_loader(
+            snapshot="LEGACY_PRIVATE_MARKER"
+        )
+        audience_root = self.root / "audiences"
+        first_scope = "private-" + "1" * 32
+        second_scope = "private-" + "2" * 32
+        for scope, marker in (
+            (first_scope, "FIRST_PRIVATE_MARKER"),
+            (second_scope, "SECOND_PRIVATE_MUST_NOT_LEAK"),
+            ("shared", "SHARED_MARKER"),
+        ):
+            store = audience_root / scope / "nunchi"
+            store.mkdir(parents=True)
+            snapshot = store / "snapshot.md"
+            snapshot.write_text(marker, encoding="utf-8")
+            snapshot.chmod(0o600)
+
+        def route(kind: str, scope: str) -> dict[str, str]:
+            store = audience_root / scope / "nunchi"
+            payload = {
+                **env,
+                "CODEX_HOME": str(audience_root / scope / "codex"),
+                "CODEX_SQLITE_HOME": str(audience_root / scope / "codex"),
+                "CCC_MEMORY_AUDIENCE_SCOPED": "1",
+                "CCC_MEMORY_AUDIENCE": kind,
+                "CCC_MEMORY_SCOPE": scope,
+                "CCC_MEMORY_AUDIENCE_ROOT": str(audience_root),
+                "CCC_CODEX_AUDIENCE_AUTH_MODE": "keyring",
+                "CCC_STATE_DIR": str(audience_root / scope / "state"),
+                "CCC_MEMORY_LEGACY_STATE_DIR": env["CCC_STATE_DIR"],
+                "CCC_MEMORY_LEGACY_NUNCHI_HOME": env["NUNCHI_HOME"],
+                "CCC_MEMORY_LEGACY_PRIVATE_READS": "1" if kind == "private" else "0",
+                "CCC_NUNCHI_AUDIENCE_SCOPED": "1",
+                "CCC_NUNCHI_AUDIENCE_ROOT": str(audience_root),
+                "NUNCHI_HOME": str(store),
+                "NUNCHI_DB": str(store / "facts.db"),
+                "NUNCHI_SNAPSHOT": str(store / "snapshot.md"),
+                "CCC_NUNCHI_SHARED_HOME": str(audience_root / "shared/nunchi"),
+                "CCC_CODEX_NUNCHI_MAX_BYTES": "8192",
+            }
+            return payload
+
+        private = self.module.load_snapshot(
+            self.module.MaterializeOptions.from_environ(route("private", first_scope))
+        )
+        self.assertIn("FIRST_PRIVATE_MARKER", private)
+        self.assertIn("SHARED_MARKER", private)
+        self.assertIn("LEGACY_PRIVATE_MARKER", private)
+        self.assertNotIn("SECOND_PRIVATE_MUST_NOT_LEAK", private)
+
+        shared = self.module.load_snapshot(
+            self.module.MaterializeOptions.from_environ(route("shared", "shared"))
+        )
+        self.assertIn("SHARED_MARKER", shared)
+        self.assertNotIn("FIRST_PRIVATE_MARKER", shared)
+        self.assertNotIn("SECOND_PRIVATE_MUST_NOT_LEAK", shared)
+        self.assertNotIn("LEGACY_PRIVATE_MARKER", shared)
 
     def test_slow_base_keeps_canonical_budget_and_skips_slow_stale_regen(self) -> None:
         loader, env, base_document = self._prepare_nunchi_loader(snapshot="STALE")

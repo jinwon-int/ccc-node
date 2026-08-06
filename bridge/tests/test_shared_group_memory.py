@@ -256,6 +256,22 @@ def test_audience_piri_environment_is_opaque_and_physically_separate(
     )
     assert private_env["CCC_CODEX_MEMORY_MAX_BYTES"] == "24576"
     assert private_env["CCC_CODEX_AGENTS_BUDGET_BYTES"] == "32768"
+    assert private_env["CCC_NUNCHI_AUDIENCE_SCOPED"] == "1"
+    assert private_env["NUNCHI_HOME"] == str(private.scope_root / "nunchi")
+    assert private_env["NUNCHI_DB"] == str(private.scope_root / "nunchi/facts.db")
+    assert private_env["NUNCHI_SNAPSHOT"] == str(
+        private.scope_root / "nunchi/snapshot.md"
+    )
+    assert private_env["CCC_NUNCHI_SHARED_HOME"] == str(
+        public.scope_root / "nunchi"
+    )
+    assert private_env["CCC_NUNCHI_MEMPALACE_HOME"] == str(
+        private.scope_root / "mempalace-home"
+    )
+    assert public_env["CCC_NUNCHI_MEMPALACE_HOME"] == str(
+        public.scope_root / "mempalace-home"
+    )
+    assert private_env["CCC_CODEX_NUNCHI_MAX_BYTES"] == "8192"
     assert "CCC_CODEX_MEMORY_MAX_BYTES" not in public_env
     serialized = json.dumps((private_env, public_env), sort_keys=True)
     assert "934719283" not in serialized

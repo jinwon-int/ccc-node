@@ -465,8 +465,13 @@ def _keywords(query, max_terms=6):
 def _mp_search(mp, query, n):
     """One MemPalace CLI search, cleaned to excerpt lines. [] on any failure."""
     try:
+        child_env = os.environ.copy()
+        palace_home = os.environ.get("CCC_NUNCHI_MEMPALACE_HOME")
+        if palace_home:
+            child_env["HOME"] = palace_home
         out = subprocess.run([mp, "search", query, "--results", str(n)],
-                             capture_output=True, text=True, timeout=30)
+                             capture_output=True, text=True, timeout=30,
+                             env=child_env)
     except Exception:
         return []
     if out.returncode != 0:

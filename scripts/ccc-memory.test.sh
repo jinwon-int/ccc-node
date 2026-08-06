@@ -74,6 +74,43 @@ ok "memory check reports healthy nunchi and MemPalace scalars" '[ "$rc" = 0 ] &&
 '\'' >/dev/null <<<"$out"'
 ok "memory readiness JSON never exposes snapshot, fact or refresh bodies" '! grep -q "PROBE_SECRET_BODY\|PROBE_SECRET_FACT\|PROBE_SECRET_REFRESH" <<<"$out"'
 
+audience_probe_root="$TMP/audience-probe"
+audience_private="$audience_probe_root/private-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+audience_shared="$audience_probe_root/shared"
+audience_invalid="$audience_probe_root/private-raw-12345"
+mkdir -p "$audience_private/piri/sessions" "$audience_private/nunchi" \
+  "$audience_private/mempalace-home/.mempalace/palace" \
+  "$audience_shared/piri/sessions" "$audience_shared/nunchi" "$audience_invalid"
+chmod 700 "$audience_probe_root" "$audience_private" "$audience_shared" "$audience_invalid"
+chmod 700 "$audience_private/piri/sessions" "$audience_shared/piri/sessions"
+printf 'PRIVATE_BODY_MUST_NOT_RENDER\n' > "$audience_private/nunchi/snapshot.md"
+printf 'x' > "$audience_private/nunchi/facts.db"
+printf 'x' > "$audience_private/mempalace-home/.mempalace/palace/chroma.sqlite3"
+printf '{}' > "$audience_shared/nunchi/mempalace-refresh.status.json"
+chmod 600 "$audience_private/nunchi/snapshot.md" "$audience_private/nunchi/facts.db" \
+  "$audience_private/mempalace-home/.mempalace/palace/chroma.sqlite3" \
+  "$audience_shared/nunchi/mempalace-refresh.status.json"
+scoped_probe_cron="*/10 * * * * CCC_NUNCHI_AUDIENCE_SCOPED=1 CCC_NUNCHI_AUDIENCE_ROOT=$audience_probe_root bash /tmp/codex-feed.sh # nunchi:#816"
+scoped_probe_cron+=$'\n'"17 * * * * CCC_NUNCHI_AUDIENCE_SCOPED=1 CCC_NUNCHI_AUDIENCE_ROOT=$audience_probe_root bash /tmp/mempalace-refresh.sh codex /tmp/sessions # nunchi:#816"
+scoped_probe_cron+=$'\n7 8 * * 1 bash /tmp/bench.sh # nunchi:#816'
+out="$(HOME="$probe_home" CCC_CLAUDE_DIR="$probe_claude" CCC_STATE_DIR="$probe_state" \
+  CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" \
+  CCC_MEMORY_CHECK_NOW_EPOCH=200 CCC_NUNCHI_MEMPALACE_REPAIR_STATUS_TEXT="$repair_ok" \
+  CCC_NUNCHI_CRONTAB_TEXT="$scoped_probe_cron" bash "$ROOT/scripts/ccc-memory-check.sh" --json 2>&1)"; rc=$?
+ok "memory check reports body-free scoped partition counts and invalid entries" '[ "$rc" = 0 ] && jq -e '\''
+  .nunchi.audience_scoped.enabled == true
+  and .nunchi.audience_scoped.root_status == "ok"
+  and .nunchi.audience_scoped.scope_count == 2
+  and .nunchi.audience_scoped.private_count == 1
+  and .nunchi.audience_scoped.shared_count == 1
+  and .nunchi.audience_scoped.session_roots == 2
+  and .nunchi.audience_scoped.nunchi_db_partitions == 1
+  and .nunchi.audience_scoped.snapshot_partitions == 1
+  and .nunchi.audience_scoped.mempalace_index_partitions == 1
+  and .nunchi.audience_scoped.mempalace_status_partitions == 1
+  and .nunchi.audience_scoped.invalid_entries == 1
+'\'' >/dev/null <<<"$out" && ! grep -q "PRIVATE_BODY_MUST_NOT_RENDER\|private-aaaaaaaa" <<<"$out"'
+
 custom_nunchi_store="$TMP/custom-nunchi-store"
 mkdir -p "$custom_nunchi_store"
 cp "$probe_nunchi/facts.db" "$custom_nunchi_store/facts.db"

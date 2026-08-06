@@ -70,6 +70,22 @@ and the weekly bench cron; `--remove` rolls back. Like the Codex lane this
 costs one Piri run per new session file (the Claude lane reuses Session
 Distiller output at zero LLM cost).
 
+When the bridge runs `CCC_BRIDGE_MEMORY_MODE=audience-scoped`, enable the
+collector with `scripts/install-nunchi.sh --apply --piri --audience-scoped
+<absolute-memory-audience-root>`. The feed and MemPalace jobs become bounded
+dispatchers over canonical direct children named `shared` or
+`private-<32 lowercase hex>`. Every audience gets separate Piri transcripts,
+`nunchi/facts.db`, `nunchi/snapshot.md`, seen/lock/status files, and an isolated
+`mempalace-home`. Unsafe owners/modes, symlinks, non-canonical names, and
+out-of-root transcript inputs fail closed. Provider provenance remains `piri`.
+
+Recall follows one rule across Piri, Claude, and Codex materialization: a
+private route may read its own scoped Nunchi snapshot, the shared snapshot, and
+the original node-global snapshot as private-only migration input; a shared
+route reads only the shared snapshot. It never enumerates or reads another
+private scope, and caller-supplied snapshot overrides cannot redirect the
+canonical paths. The global, non-scoped installer behavior is unchanged.
+
 Missing, corrupt, or unsafe snapshots fail open to the unmodified canonical
 snapshot. A stale snapshot is regenerated within a bounded deadline; a failed
 regeneration or a result that remains stale also falls back to canonical memory.
@@ -81,11 +97,9 @@ after the nunchi merge. The optional snapshot is passed through the managed
 memory-injection scanner before use; scanner failure drops nunchi and preserves
 the canonical snapshot.
 
-Nunchi snapshots are node-global in this phase and are therefore disabled for
-every `audience-scoped` Codex runtime, including private routes. A scope-local
-snapshot and provenance contract must be introduced before that boundary may be
-relaxed; a scoped state directory alone does not authorize a global
-`NUNCHI_HOME` or `NUNCHI_SNAPSHOT`.
+`ccc-memory-check.sh --json` reports body-free audience partition counts and
+root safety under `nunchi.audience_scoped`; it never reports opaque scope names,
+session ids, transcript excerpts, facts, or credentials.
 
 Rollback is immediate and does not require an environment edit:
 

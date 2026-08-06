@@ -437,7 +437,140 @@ _MANAGED_ENV_KEYS = (
     "NUNCHI_SNAPSHOT",
     "CCC_NUNCHI_MEMPALACE_STATUS",
     "CCC_NUNCHI_MEMPALACE_CLI",
+    "CCC_NUNCHI_AUDIENCE_SCOPED",
+    "CCC_NUNCHI_AUDIENCE_ROOT",
 )
+
+
+_AUDIENCE_COUNT_FIELDS = (
+    "scope_count",
+    "private_count",
+    "shared_count",
+    "session_roots",
+    "nunchi_db_partitions",
+    "snapshot_partitions",
+    "mempalace_index_partitions",
+    "mempalace_status_partitions",
+    "refresh_ok",
+    "refresh_running",
+    "refresh_degraded",
+    "refresh_error",
+    "refresh_invalid",
+    "refresh_stale",
+    "invalid_entries",
+)
+
+
+def _safe_audience_item(path: Path, *, directory: bool) -> bool:
+    try:
+        item = path.lstat()
+    except OSError:
+        return False
+    expected = stat.S_ISDIR(item.st_mode) if directory else stat.S_ISREG(item.st_mode)
+    return bool(
+        expected
+        and item.st_uid == os.geteuid()
+        and not stat.S_IMODE(item.st_mode) & 0o077
+        and (directory or item.st_nlink == 1)
+    )
+
+
+def _audience_refresh_state(path: Path, *, ttl: int, now: int) -> tuple[str, bool]:
+    try:
+        if path.stat().st_size > 8192:
+            raise ValueError
+        record = json.loads(path.read_text(encoding="utf-8"))
+        state = record.get("state")
+        timestamp = record.get("started_at") if state == "running" else record.get("finished_at")
+        if (
+            record.get("schema") != "ccc.nunchi.mempalace-refresh.v1"
+            or record.get("provider") != "piri"
+            or state not in {"ok", "running", "degraded", "error"}
+            or not isinstance(timestamp, int)
+            or isinstance(timestamp, bool)
+            or timestamp < 0
+        ):
+            raise ValueError
+    except (OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError):
+        return "invalid", False
+    return str(state), state in {"ok", "running"} and now - timestamp > ttl
+
+
+def _audience_child_counts(
+    child: Path, *, ttl: int, now: int
+) -> dict[str, int] | None:
+    private = re.fullmatch(r"private-[0-9a-f]{32}", child.name) is not None
+    if child.name != "shared" and not private:
+        return None
+    if not _safe_audience_item(child, directory=True):
+        return None
+    counts = {field: 0 for field in _AUDIENCE_COUNT_FIELDS}
+    counts["scope_count"] = 1
+    counts["private_count" if private else "shared_count"] = 1
+    session_root = child / "piri/sessions"
+    if session_root.exists() or session_root.is_symlink():
+        field = "session_roots" if _safe_audience_item(session_root, directory=True) else "invalid_entries"
+        counts[field] += 1
+    for path, field in (
+        (child / "nunchi/facts.db", "nunchi_db_partitions"),
+        (child / "nunchi/snapshot.md", "snapshot_partitions"),
+        (child / "nunchi/mempalace-refresh.status.json", "mempalace_status_partitions"),
+    ):
+        if not path.exists() and not path.is_symlink():
+            continue
+        if not _safe_audience_item(path, directory=False):
+            counts["invalid_entries"] += 1
+            continue
+        counts[field] += 1
+        if field == "mempalace_status_partitions":
+            state, stale = _audience_refresh_state(path, ttl=ttl, now=now)
+            counts[f"refresh_{state}"] += 1
+            counts["refresh_stale"] += int(stale)
+    palace = child / "mempalace-home/.mempalace/palace"
+    indexes = [palace / name for name in ("chroma.sqlite3", "memory.db")]
+    existing = [path for path in indexes if path.exists() or path.is_symlink()]
+    if existing:
+        field = (
+            "mempalace_index_partitions"
+            if any(_safe_audience_item(path, directory=False) for path in existing)
+            else "invalid_entries"
+        )
+        counts[field] += 1
+    return counts
+
+
+def probe_audience_scopes(
+    root: Path, enabled: bool, *, ttl: int, now: int
+) -> dict[str, object]:
+    """Return body-free counts for canonical owner-only audience partitions."""
+
+    result: dict[str, object] = {
+        "enabled": enabled,
+        "root_status": "disabled" if not enabled else "missing",
+        **{field: 0 for field in _AUDIENCE_COUNT_FIELDS},
+    }
+    if not enabled:
+        return result
+    if not root.is_absolute() or not _safe_audience_item(root, directory=True):
+        result["root_status"] = "unsafe" if root.exists() else "missing"
+        return result
+    result["root_status"] = "ok"
+    try:
+        children = list(root.iterdir())[:257]
+    except OSError:
+        result["root_status"] = "unreadable"
+        return result
+    if len(children) > 256:
+        result["invalid_entries"] = 1
+        children = children[:256]
+    for child in children:
+        counts = _audience_child_counts(child, ttl=ttl, now=now)
+        if counts is None:
+            result["invalid_entries"] = int(result["invalid_entries"]) + 1
+            continue
+        for field, value in counts.items():
+            result[field] = int(result[field]) + value
+    return result
 
 
 def managed_cron_environment(cron: str) -> tuple[dict[str, str], list[str]]:
@@ -803,6 +936,17 @@ def main() -> int:
     home = Path(os.environ.get("HOME") or "/root")
     cron = crontab_text()
     managed_environment, configuration_conflicts = managed_cron_environment(cron)
+    scoped_raw = (
+        os.environ.get("CCC_NUNCHI_AUDIENCE_SCOPED")
+        or managed_environment.get("CCC_NUNCHI_AUDIENCE_SCOPED")
+        or "0"
+    )
+    audience_scoped = scoped_raw.strip().lower() not in {"", "0", "false", "off", "no"}
+    audience_root = Path(
+        os.environ.get("CCC_NUNCHI_AUDIENCE_ROOT")
+        or managed_environment.get("CCC_NUNCHI_AUDIENCE_ROOT")
+        or "/nonexistent"
+    )
     state = Path(
         os.environ.get("CCC_STATE_DIR")
         or managed_environment.get("CCC_STATE_DIR")
@@ -827,6 +971,9 @@ def main() -> int:
     ttl = int(os.environ.get("CCC_MEMORY_CACHE_TTL_SEC") or "21600")
     now_raw = os.environ.get("CCC_MEMORY_CHECK_NOW_EPOCH") or ""
     now = int(now_raw) if now_raw.isdigit() else int(time.time())
+    audience_probe = probe_audience_scopes(
+        audience_root, audience_scoped, ttl=ttl, now=now
+    )
     required = is_mempalace_required(home)
     mp_cli = resolve_mempalace_cli(home, managed_environment)
     (
@@ -849,20 +996,56 @@ def main() -> int:
         mempalace_cli_installed=mp_cli.is_file(),
         configuration_conflicts=configuration_conflicts,
     )
+    nunchi["audience_scoped"] = audience_probe
     mempalace_environment = {**managed_environment, **refresh_environment}
+    mempalace = probe_mempalace(
+        home,
+        nunchi_home,
+        mode,
+        provider,
+        managed_refresh_count,
+        legacy_sweep_count,
+        mempalace_environment,
+        ttl,
+        now,
+    )
+    if audience_scoped and mode == "on":
+        scoped_reasons: list[str] = []
+        if audience_probe["root_status"] != "ok":
+            scoped_reasons.append("audience-root-" + str(audience_probe["root_status"]))
+        if int(audience_probe["invalid_entries"]):
+            scoped_reasons.append("audience-invalid")
+        expected = int(audience_probe["session_roots"])
+        status_count = int(audience_probe["mempalace_status_partitions"])
+        if bool(mempalace["cli_installed"]) or bool(mempalace["required"]):
+            if expected != status_count:
+                scoped_reasons.append("refresh-count")
+            if int(audience_probe["refresh_error"]):
+                scoped_reasons.append("refresh-error")
+            if int(audience_probe["refresh_invalid"]):
+                scoped_reasons.append("refresh-invalid")
+            if int(audience_probe["refresh_stale"]):
+                scoped_reasons.append("refresh-stale")
+            if int(audience_probe["refresh_degraded"]):
+                scoped_reasons.append("refresh-degraded")
+            scoped_status = "ok" if not scoped_reasons else "degraded"
+        else:
+            scoped_status = "optional"
+        mempalace.update(
+            {
+                "status": scoped_status,
+                "reasons": scoped_reasons,
+                "backend": "audience-partitioned",
+                "palace_exists": int(
+                    audience_probe["mempalace_index_partitions"]
+                )
+                > 0,
+                "audience_scoped": audience_probe,
+            }
+        )
     payload = {
         "nunchi": nunchi,
-        "mempalace": probe_mempalace(
-            home,
-            nunchi_home,
-            mode,
-            provider,
-            managed_refresh_count,
-            legacy_sweep_count,
-            mempalace_environment,
-            ttl,
-            now,
-        ),
+        "mempalace": mempalace,
     }
     print(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
     return 0
