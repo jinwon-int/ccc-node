@@ -49,9 +49,11 @@ adding or printing bridge environment variables. The materializer first runs
 the canonical `load-memory.sh SessionStart` contract with its full configured
 deadline and strictly parses its JSON. Only time left from that deadline may be
 used by the managed nunchi post-processor, so slow canonical loads are never
-rejected to make room for optional regeneration. The helper can only append a
-bounded, valid UTF-8 local nunchi snapshot to
-`additionalContext`; it never replaces the canonical context.
+rejected to make room for optional regeneration. The helper can only prepend a bounded, valid UTF-8 local nunchi snapshot to
+`additionalContext`; it never replaces the canonical context. Nunchi is the
+primary working memory during the gate-3 transition, so the nunchi block
+leads: when the whole-snapshot byte cap truncates the merged output, the
+canonical tail is sacrificed first instead of silently dropping nunchi.
 
 ### Piri nunchi opt-in
 
@@ -109,6 +111,45 @@ This atomically changes the mode marker to `off` and removes the managed nunchi
 cron entries. The nunchi code and local database remain in place, while the next
 Codex materialization falls back to canonical `load-memory.sh`. This wiring does
 not claim completion of pilot or gate-3 observation.
+
+### Piri global snapshot materializer (ccc-piri)
+
+`scripts/ccc-piri` is the node-global Piri counterpart of `scripts/ccc-codex`.
+Piri auto-loads `<piri-agent-dir>/AGENTS.md` (`${PIRI_CODING_AGENT_DIR:-~/.piri/agent}`)
+as its global context file, and the shared materializer resolves its output as
+`<CODEX_HOME>/AGENTS.md`, so the launcher runs the materializer with
+`CODEX_HOME` pointed at the Piri agent dir and
+`CCC_MEMORY_MATERIALIZER_PROVIDER=piri` before exec'ing the real CLI. Every
+node-global Piri launch — interactive, print-mode, or the bridge RPC runtime —
+then starts from the same bounded snapshot policy as Claude SessionStart and
+the Codex global block, including the managed nunchi merge when nunchi mode is
+`on`.
+
+Point `CCC_PIRI_CLI_PATH` at the installed `~/.claude/hooks/ccc-piri` and
+`CCC_PIRI_REAL_CLI_PATH` at the real Piri CLI (e.g. a model-selecting shim).
+`CCC_PIRI_MEMORY_MATERIALIZER_PATH` and `CCC_PIRI_MEMORY_HOME` override the
+materializer and target agent dir. Because the canonical loader output alone
+exceeds the 8192-byte materializer default on fleet nodes — which silently
+truncated the nunchi block — the launcher defaults
+`CCC_CODEX_MEMORY_MAX_BYTES` to `16384` (16 KiB; hard max 24576); an explicit
+operator value always wins. The launcher preserves argv, cwd, stdio,
+exit status, and signals via a final `exec`, and shares the ccc-codex
+fail-closed contract: a refresh failure may proceed on a structurally valid
+private last snapshot; otherwise launch exits 78.
+
+Three bypass guards keep non-user runs memory-free:
+
+- `PIRI_CODING_AGENT_SESSION_DIR` under `.piri-feed-extractor-sessions`
+  (the nunchi piri-feed extractor) routes straight to the real CLI, so the
+  tool-free extractor never receives user memory.
+- `CCC_MEMORY_AUDIENCE_SCOPED` truthy skips the node-global bootstrap;
+  audience-scoped sessions are bootstrapped by the bridge runtime itself via
+  `--no-context-files --append-system-prompt` and must not touch global memory.
+- `CCC_PIRI_MEMORY_SKIP=1` is the explicit operator kill-switch.
+
+`setup.sh` installs the launcher beside `ccc-codex` under
+`${CCC_CLAUDE_DIR:-$HOME/.claude}/hooks`, and `scripts/ccc-piri.test.sh`
+covers the launch surface and all three guards hermetically.
 
 ### Managed MemPalace refresh
 

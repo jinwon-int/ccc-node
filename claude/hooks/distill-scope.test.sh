@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # Tests for distill.sh cwd scoping — no provider/network calls.
 set -uo pipefail
+# The production hook creates private state under umask 077. Keep fixtures on
+# that same contract even when an operator shell (notably gongmyoung) uses 0002.
+umask 077
 HERE="$(cd "$(dirname "$0")" && pwd)"
 DISTILL="$HERE/distill.sh"
 # shellcheck source=claude/hooks/lib/test-stub.sh

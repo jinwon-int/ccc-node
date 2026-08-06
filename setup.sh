@@ -367,6 +367,9 @@ run cp "$SRC/scripts/lib/harness_paths.py" "$CLAUDE_DIR/hooks/lib/harness_paths.
 # load-memory.sh so every direct/app-server run reuses the same snapshot policy.
 run cp "$SRC/scripts/ccc-codex" "$CLAUDE_DIR/hooks/ccc-codex"
 run cp "$SRC/scripts/ccc_codex_memory.py" "$CLAUDE_DIR/hooks/ccc_codex_memory.py"
+# Piri launch boundary: node-global counterpart of ccc-codex — materializes the
+# same snapshot into the Piri global context file (<piri-agent-dir>/AGENTS.md).
+run cp "$SRC/scripts/ccc-piri" "$CLAUDE_DIR/hooks/ccc-piri"
 # Claude's distill committer imports the same crash-recoverable transaction
 # implementation as the Codex bridge.  Install the canonical module beside the
 # existing standalone secure-fs copy instead of forking provider logic.
@@ -392,6 +395,31 @@ run cp "$SRC/scripts/ccc-skill-autosave.sh" "$CLAUDE_DIR/hooks/ccc-skill-autosav
 # Self-update — the pre-approved node maintenance procedure (pull + setup +
 # restart of operator-allowlisted services only; see docs/self-update.md).
 run cp "$SRC/scripts/ccc-self-update.sh" "$CLAUDE_DIR/hooks/ccc-self-update.sh"
+# PR/issue status poll (ccc-node#962) — notices when a PR this node's bridge
+# identity opened changes state (CI done, closed, merged); scheduled
+# separately via scripts/install-pr-status-poll-cron.sh, tracks only the
+# repos an operator lists in ~/.claude/pr-status-poll.repos.
+run cp "$SRC/scripts/ccc-pr-status-poll.sh" "$CLAUDE_DIR/hooks/ccc-pr-status-poll.sh"
+# #958: record the install-source repo path so ccc-self-update's resolve_repo()
+# (env > this file > script-location inference > ~/ccc-node) never falls back
+# to a nonexistent ~/ccc-node on /opt installs — 8 nodes aborted no-repo until
+# hand-written overrides were dropped in (LOG-20260805-gwakga-13). The file is
+# operator-owned state: an identical entry is a no-op, a DIFFERENT entry is
+# preserved with a warning — setup never silently rewrites operator state.
+SELF_UPDATE_REPO_FILE="$CLAUDE_DIR/self-update.repo"
+if [ "$DRY" != 1 ]; then
+  if [ ! -f "$SELF_UPDATE_REPO_FILE" ]; then
+    printf '%s\n' "$SRC" > "$SELF_UPDATE_REPO_FILE"
+    chmod 600 "$SELF_UPDATE_REPO_FILE"
+    note "recorded install-source repo for self-update: $SRC"
+  elif [ "$(head -1 "$SELF_UPDATE_REPO_FILE" 2>/dev/null | tr -d '[:space:]')" = "$SRC" ]; then
+    note "self-update.repo already records this repo ($SRC)"
+  else
+    note "WARNING: self-update.repo points at $(head -1 "$SELF_UPDATE_REPO_FILE" 2>/dev/null) but setup ran from $SRC — preserving the operator override"
+  fi
+else
+  note "would record install-source repo for self-update: $SRC"
+fi
 # Executable files copied into hooks/ from OUTSIDE the claude/hooks/ tree.
 # (ccc_memory_index.py / ccc_memory_search.py are deliberately NOT here: they
 # are python modules invoked via their .sh wrappers and are installed 644.)
@@ -402,6 +430,7 @@ installed_hook_scripts=(
   "$CLAUDE_DIR/hooks/lib/harness_paths.py"
   "$CLAUDE_DIR/hooks/ccc-codex"
   "$CLAUDE_DIR/hooks/ccc_codex_memory.py"
+  "$CLAUDE_DIR/hooks/ccc-piri"
   "$CLAUDE_DIR/hooks/ccc-memory-index.sh"
   "$CLAUDE_DIR/hooks/ccc-memory-search.sh"
   "$CLAUDE_DIR/hooks/ccc-memory-consolidate.sh"
@@ -413,6 +442,7 @@ installed_hook_scripts=(
   "$CLAUDE_DIR/hooks/ccc-memory-benchmark-export.sh"
   "$CLAUDE_DIR/hooks/ccc-skill-autosave.sh"
   "$CLAUDE_DIR/hooks/ccc-self-update.sh"
+  "$CLAUDE_DIR/hooks/ccc-pr-status-poll.sh"
 )
 run chmod +x "${installed_hook_scripts[@]}" "${hook_tree_targets[@]}"
 # #909: register a self-update agent-cron task so the harness auto-updates on
@@ -422,13 +452,21 @@ run chmod +x "${installed_hook_scripts[@]}" "${hook_tree_targets[@]}"
 # update, a bridge-busy defer (8), and a no-services-allowlist degraded run
 # (11) as non-failures so on-failure alerts fire only for real aborts.
 if [ "${CCC_SELF_UPDATE_REGISTER_CRON:-true}" != "false" ] && [ "$DRY" != 1 ] && [ -x "$SRC/scripts/agent-cron.sh" ]; then
-  if CCC_AGENT_CRON_STORE="$CLAUDE_DIR/state/agent-cron/tasks.json" \
+  agent_cron_store="$CLAUDE_DIR/state/agent-cron/tasks.json"
+  if CCC_AGENT_CRON_STORE="$agent_cron_store" \
+       "$SRC/scripts/agent-cron.sh" list --json 2>/dev/null \
+       | jq -e 'any(.tasks[]?; .id == "self-update")' >/dev/null; then
+    note "self-update agent-cron task already registered (id=self-update)"
+  elif CCC_AGENT_CRON_STORE="$agent_cron_store" \
        "$SRC/scripts/agent-cron.sh" add self-update \
          --schedule "${CCC_SELF_UPDATE_CRON:-17 4,10,16,22 * * *}" \
+         --prompt "Update the local ccc-node harness and restart only operator-allowlisted services." \
          --notify telegram-owner-on-failure \
          --success-exit-codes 0,8,11 \
-         --argv "$CLAUDE_DIR/hooks/ccc-self-update.sh" run >/dev/null 2>&1; then
+         --argv "$CLAUDE_DIR/hooks/ccc-self-update.sh" --argv run >/dev/null 2>&1; then
     note "registered self-update agent-cron task (id=self-update; timer must be installed separately)"
+  else
+    note "WARNING: failed to register self-update agent-cron task (id=self-update)"
   fi
 fi
 # Tier 3: status line (node·model·git·context·cost·A2A) wired via settings.json statusLine.
@@ -487,6 +525,23 @@ for skill_source in "${skill_sources[@]}"; do
   skill_targets+=("$CLAUDE_DIR/skills/${skill_source#"$SRC/claude/skills/"}")
 done
 if [ "${#skill_targets[@]}" -gt 0 ]; then run chmod +x "${skill_targets[@]}"; fi
+
+# Piri skills (web search/fetch helpers) — only on nodes that already have a
+# Piri agent dir, so non-Piri nodes stay untouched.
+PIRI_AGENT_DIR="${PIRI_CODING_AGENT_DIR:-$HOME/.piri/agent}"
+if [ -d "$PIRI_AGENT_DIR" ]; then
+  run mkdir -p "$PIRI_AGENT_DIR/skills"
+  run cp -r "$SRC/piri/skills/." "$PIRI_AGENT_DIR/skills/"
+  piri_skill_sources=()
+  while IFS= read -r piri_skill_source; do
+    piri_skill_sources+=("$piri_skill_source")
+  done < <(find "$SRC/piri/skills" -name '*.py' -type f 2>/dev/null)
+  piri_skill_targets=()
+  for piri_skill_source in "${piri_skill_sources[@]}"; do
+    piri_skill_targets+=("$PIRI_AGENT_DIR/skills/${piri_skill_source#"$SRC/piri/skills/"}")
+  done
+  if [ "${#piri_skill_targets[@]}" -gt 0 ]; then run chmod +x "${piri_skill_targets[@]}"; fi
+fi
 
 # 2) Per-node files — only seed templates if a real one is NOT already present.
 SEEDED=()  # files freshly created from a template this run (safe to placeholder-substitute)
@@ -693,6 +748,10 @@ cat <<'EOF'
   11. (Optional Codex) Keep CCC_CODEX_CLI_PATH on ~/.claude/hooks/ccc-codex,
       set CCC_CODEX_REAL_CLI_PATH only for a non-PATH binary, and require
       `ccc-memory-check.sh --json` to report `.codex.status == "ready"`.
+  12. (Optional Piri) Point CCC_PIRI_CLI_PATH at ~/.claude/hooks/ccc-piri and
+      CCC_PIRI_REAL_CLI_PATH at the real Piri CLI so every node-global Piri
+      launch materializes the same memory snapshot into the Piri global
+      context file first.
 
 Secrets that are intentionally NOT installed by this script:
   - ~/.claude/.credentials.json   (Claude OAuth — created on `claude` login)
@@ -709,6 +768,7 @@ printf '  - CCC_WIKI_AGENT_BIN=%s\n' "$WIKI_AGENT_BIN"
 printf '  - CCC_BRIDGE_DEFAULT_PATH=%s\n' "$BRIDGE_DEFAULT_PATH"
 printf '  - CCC_CODEX_CLI_PATH=%s/hooks/ccc-codex\n' "$CLAUDE_DIR"
 printf '  - CCC_CODEX_MEMORY_MATERIALIZER_PATH=%s/hooks/ccc_codex_memory.py\n' "$CLAUDE_DIR"
+printf '  - CCC_PIRI_CLI_PATH=%s/hooks/ccc-piri\n' "$CLAUDE_DIR"
 printf '  - CODEX_HOME=%s (GitHub plugin disabled; gh CLI-first)\n' "$CODEX_DIR"
 printf '  - Codex managed skills=%s/skills (catalog: codex/compatibility.json)\n' "$CODEX_DIR"
 printf '  - bridge command=./start.sh --path %s -d\n' "$BRIDGE_DEFAULT_PATH"

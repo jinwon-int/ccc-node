@@ -38,7 +38,8 @@ rather than composing the steps ad hoc.
   pressure at 2am. An agent can trigger the whole audited pipeline but cannot
   compose its steps differently.
 - The **blast radius** is bounded by `~/.claude/self-update.services` (one
-  systemd unit per line, `#` comments). This file is operator-owned — the agent
+  `[user:|system:]unit` per line, `#` comments; omitted scope means `system`).
+  This file is operator-owned — the agent
   must not edit it — so only the operator decides which units the procedure may
   ever restart.
 - Direct `systemctl restart|start|reload|stop|kill <broker|gateway|worker|…>` is
@@ -51,9 +52,9 @@ rather than composing the steps ad hoc.
 ```bash
 # after git pull && ./setup.sh — write the allowlist YOURSELF (agents cannot):
 cat > ~/.claude/self-update.services <<'EOF'
-hermes-broker
-a2a-worker
-ccc-telegram-bridge
+system:hermes-broker
+system:a2a-worker
+user:ccc-telegram-bridge.service
 EOF
 ```
 
@@ -102,14 +103,42 @@ and a no-services-allowlist degraded run (11) do not raise on-failure alerts —
 only real aborts do. To verify registration: `agent-cron.sh list | grep
 self-update`.
 
+### External restart command (#971)
+
+Hosts where systemd cannot restart the bridge (Termux `start.sh`, user-scoped
+units) previously chained `start.sh --restart` off the cron line with a
+trailing `exit 0` — a failed restart was detected, reported to a log file,
+and then thrown away (daegyo 2026-08-06: 4h15m silent outage). The supported
+replacement is two operator-owned files:
+
+```sh
+cat > ~/.claude/self-update.restart-cmd <<'EOF'
+$HOME/ccc-node/bridge/start.sh --path "$HOME" --restart -d
+EOF
+cat > ~/.claude/self-update.health-cmd <<'EOF'
+pgrep -f telegram_bot >/dev/null
+EOF
+```
+
+With a restart command configured, the degraded path (code changed, no
+allowlisted service) runs it inside the script: the outcome is audited,
+notified, and a failure exits `7` with the recovery snapshot retained. With a
+health probe also configured, every up-to-date tick verifies runtime health
+and attempts one recovery restart when the runtime is down — the second daily
+slot can therefore recover an updated-but-down node. The cron line becomes a
+plain `ccc-self-update.sh run` with no shell chaining.
+
 ## Knobs
 
 | Env | Default | Meaning |
 |---|---|---|
-| `CCC_SELF_UPDATE_REPO` | auto | repo path override (or `~/.claude/self-update.repo`, operator-owned) |
+| `CCC_SELF_UPDATE_REPO` | auto | repo path override (or `~/.claude/self-update.repo`, operator-owned; recorded automatically by setup.sh since #958, existing different values are preserved) |
 | `CCC_SELF_UPDATE_BRANCH` | `main` | branch the node must be on |
 | `CCC_SELF_UPDATE_SERVICES` | `~/.claude/self-update.services` | allowlist path |
 | `CCC_SELF_UPDATE_SYSTEMCTL` | `systemctl` | service manager command (tests inject a fake) |
+| `CCC_SELF_UPDATE_RESTART_CMD` | `~/.claude/self-update.restart-cmd` | external restart command for hosts where systemd cannot reach the bridge (Termux, user-scoped). Runs inside the audit/notify boundary (#971) |
+| `CCC_SELF_UPDATE_HEALTH_CMD` | `~/.claude/self-update.health-cmd` | runtime health probe (exit 0 = healthy); with a restart command configured, an up-to-date tick that finds the runtime down attempts one recovery restart |
+| `CCC_SELF_UPDATE_RESTART_WAIT_SECONDS` | `60` | health-poll budget after an external restart |
 | `CCC_SELF_UPDATE_HEALTH_FILE` | `~/.telegram_bot/health.json` | bridge health file the idle gate reads |
 | `CCC_SELF_UPDATE_HEALTH_FRESH_SECONDS` | `90` | max age of `health.json` for its workload to count |
 | `CCC_SELF_UPDATE_BUSY_MAX_SECONDS` | `1800` | never defer for a task older than this |
@@ -117,7 +146,8 @@ self-update`.
 
 Exit codes: 0 ok/up-to-date · 3 lock held · 4 precondition failed · 5 fetch/ff
 failed · 6 setup/snapshot failed (repo and managed artifacts were verified
-rolled back, or setup never started) · 7 service restart failure · 8 deferred
+rolled back, or setup never started) · 7 service restart failure, external
+restart-cmd failure, or failed runtime recovery · 8 deferred
 (bridge busy — retry next tick) · 9 repository or installed-artifact rollback
 was degraded · 10 successful-update recovery snapshot cleanup failed ·
 11 degraded — code updated but no allowlisted service restarted (services

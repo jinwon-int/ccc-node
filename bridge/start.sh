@@ -949,7 +949,7 @@ cleanup_token_lock_if_safe() {
 #
 # Test seams (defaults preserve production behavior):
 #   CCC_BRIDGE_RESTART_STOP_TIMEOUT   seconds to wait for old-process exit (15)
-#   CCC_BRIDGE_RESTART_READY_TIMEOUT  seconds to wait for "available" (45)
+#   CCC_BRIDGE_RESTART_READY_TIMEOUT  seconds to wait for "available" (90)
 #   CCC_BRIDGE_RESTART_SPAWN          start command override (this start.sh)
 
 RESTART_OLD_PID=""
@@ -970,7 +970,13 @@ restart_live_old_pids() {
 
 do_restart() {
     local stop_timeout="${CCC_BRIDGE_RESTART_STOP_TIMEOUT:-15}"
-    local ready_timeout="${CCC_BRIDGE_RESTART_READY_TIMEOUT:-45}"
+    # Was 45s; bumped to 90 after gongyung 2026-08-05: a self-update-triggered
+    # restart logged "not-available-within-timeout" at 45s while the node was
+    # busy with a concurrent Claude worker, even though the supervisor's own
+    # respawn brought the bot up healthy ~2min later on its own. The restart
+    # call had already reported failure by then, so it read as a stale-code
+    # incident until a live check showed the process was fine.
+    local ready_timeout="${CCC_BRIDGE_RESTART_READY_TIMEOUT:-90}"
     local spawn_cmd="${CCC_BRIDGE_RESTART_SPAWN:-$SCRIPT_DIR/start.sh}"
     # The spawn target is executed directly, so it depends on its shebang
     # resolving. `start.sh` declares `#!/bin/bash`, and Termux has neither

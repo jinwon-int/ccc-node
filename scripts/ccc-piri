@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# ccc-piri — materialize the ccc-node snapshot into the Piri global context
+# file before every Piri run. Node-global counterpart of ccc-codex: the
+# materializer writes <CODEX_HOME>/AGENTS.md, so CODEX_HOME is pointed at the
+# Piri agent dir, whose AGENTS.md Piri auto-loads as its global context file.
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+materializer="${CCC_PIRI_MEMORY_MATERIALIZER_PATH:-$SCRIPT_DIR/ccc_codex_memory.py}"
+real_candidate="${CCC_PIRI_REAL_CLI_PATH:-piri}"
+memory_home="${CCC_PIRI_MEMORY_HOME:-$HOME/.piri/agent}"
+
+skip=0
+# Isolated tool-free extractor runs (nunchi piri-feed) must not receive user
+# memory; route them straight to the real CLI.
+case "${PIRI_CODING_AGENT_SESSION_DIR:-}" in
+  */.piri-feed-extractor-sessions|*/.piri-feed-extractor-sessions/*) skip=1 ;;
+esac
+# Audience-scoped sessions are bootstrapped by the bridge runtime itself
+# (--no-context-files --append-system-prompt); never touch global memory here.
+case "${CCC_MEMORY_AUDIENCE_SCOPED:-0}" in
+  1|true|TRUE|on|ON|yes|YES) skip=1 ;;
+esac
+[ "${CCC_PIRI_MEMORY_SKIP:-0}" = "1" ] && skip=1
+
+if [ "$skip" != "1" ]; then
+  if [ ! -f "$materializer" ] || [ ! -x "$materializer" ] || [ -L "$materializer" ]; then
+    printf "%s\n" "ccc-piri: memory bootstrap unavailable" >&2
+    exit 78
+  fi
+  # Piri nodes inject the nunchi-primary snapshot through this path only, and
+  # the canonical loader output alone exceeds the 8192 default on fleet nodes,
+  # which silently truncated the nunchi block. Default to 16KiB (hard max
+  # 24576); an explicit CCC_CODEX_MEMORY_MAX_BYTES always wins.
+  if ! env CODEX_HOME="$memory_home" CCC_MEMORY_MATERIALIZER_PROVIDER="${CCC_MEMORY_MATERIALIZER_PROVIDER:-piri}" \
+      CCC_CODEX_MEMORY_MAX_BYTES="${CCC_CODEX_MEMORY_MAX_BYTES:-16384}" \
+      "$materializer" materialize --json >/dev/null 2>&1; then
+    # A refresh failure may proceed only when a previously materialized block
+    # is still structurally valid and private. status is read-only/body-free.
+    if ! env CODEX_HOME="$memory_home" "$materializer" status --json >/dev/null 2>&1; then
+      printf "%s\n" "ccc-piri: memory bootstrap unavailable" >&2
+      exit 78
+    fi
+  fi
+fi
+
+case "$real_candidate" in
+  ""|-*)
+    printf "%s\n" "ccc-piri: real CLI unavailable" >&2
+    exit 127
+    ;;
+  */*) real_cli="$real_candidate" ;;
+  *) real_cli="$(command -v "$real_candidate" 2>/dev/null || true)" ;;
+esac
+
+if [ -z "${real_cli:-}" ] || [ ! -x "$real_cli" ] || [ ! -f "$real_cli" ]; then
+  printf "%s\n" "ccc-piri: real CLI unavailable" >&2
+  exit 127
+fi
+if [ "$real_cli" -ef "$0" ]; then
+  printf "%s\n" "ccc-piri: recursive real CLI configuration" >&2
+  exit 127
+fi
+
+exec "$real_cli" "$@"

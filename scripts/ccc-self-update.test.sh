@@ -22,6 +22,8 @@ export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER
 # actively serving a session every fixture update defers (rc=8) and the suite
 # mass-fails. Point it at a nonexistent fixture path instead (fail-open).
 unset CCC_SELF_UPDATE_BRANCH CCC_SELF_UPDATE_SERVICES
+unset CCC_SELF_UPDATE_RESTART_CMD CCC_SELF_UPDATE_HEALTH_CMD
+unset CCC_SELF_UPDATE_RESTART_CMD_FILE CCC_SELF_UPDATE_HEALTH_CMD_FILE
 unset CCC_SELF_UPDATE_HEALTH_FRESH_SECONDS
 unset CCC_SELF_UPDATE_BUSY_MAX_SECONDS CCC_SELF_UPDATE_MAX_DEFER_SECONDS
 export CCC_SELF_UPDATE_HEALTH_FILE="$TMP/no-such-health.json"
@@ -71,6 +73,7 @@ run_selfup() {
   CCC_HERMES_DIR="$HERMES" \
   CCC_SELF_UPDATE_BRIDGE_PROJECT_ROOT="$TMP/project" \
   CCC_SELF_UPDATE_REPO="$REPO" CCC_SELF_UPDATE_SYSTEMCTL="$FAKEBIN/fakesystemctl" \
+  CCC_SELF_UPDATE_RESTART_WAIT_SECONDS=3 \
   CCC_NODE=testnode bash "$SELFUP" "$@"
 }
 
@@ -88,6 +91,8 @@ ok "update exits 0" '[ "$rc" = 0 ] && grep -q "services restarted: 2" <<<"$out"'
 ok "repo fast-forwarded" '[ "$(git -C "$REPO" rev-parse HEAD)" = "$(git -C "$TMP/seed" rev-parse HEAD)" ]'
 ok "setup.sh ran" '[ -f "$SETUP_MARKER" ]'
 ok "only allowlisted services restarted" 'grep -q "restart hermes-broker" "$TMP/systemctl.calls" && grep -q "restart a2a-worker" "$TMP/systemctl.calls" && [ "$(grep -c "^restart " "$TMP/systemctl.calls")" = 2 ]'
+ok "system services retain the default system scope in the audit" \
+  'grep '"'"'"name":"hermes-broker","ok":true,"scope":"system"'"'"' "$STATE/self-update.log" >/dev/null'
 ok "audit record written" 'grep -q "\"result\":\"ok\"" "$STATE/self-update.log"'
 ok "owner notification queued" 'ls "$TMP/spool"/*SelfUpdate*.json >/dev/null 2>&1 && jq -r .text "$TMP/spool"/*SelfUpdate*.json | grep -q "self-update 완료"'
 ok "successful update removes private recovery snapshot" \
@@ -103,6 +108,59 @@ ok "no-services-file reported as degraded, not ok" 'grep -q "\"result\":\"degrad
 ok "degraded run still fast-forwards the repo" '[ "$(git -C "$REPO" rev-parse HEAD)" = "$(git -C "$TMP/seed" rev-parse HEAD)" ]'
 ok "degraded notification warns of stale runtime" 'grep -rh "재시작된 서비스 없음" "$TMP/spool" >/dev/null 2>&1'
 # restore the allowlist so later sections restart normally
+printf '%s\n' 'hermes-broker' 'a2a-worker' > "$CLAUDE/self-update.services"
+
+# --- #971: external restart-cmd runs INSIDE the audit/notify boundary ---------
+# (1) changed + no allowlist + restart-cmd succeeds -> ok, not degraded.
+echo drift2 > "$TMP/seed/file2.txt"
+git -C "$TMP/seed" add -A && git -C "$TMP/seed" commit -qm four && git -C "$TMP/seed" push -q origin main
+rm -f "$CLAUDE/self-update.services"
+printf 'touch %s\n' "$TMP/external-restarted.marker" > "$CLAUDE/self-update.restart-cmd"
+out="$(run_selfup run 2>&1)"; rc=$?
+ok "external restart-cmd on change exits 0 (not degraded 11)" '[ "$rc" = 0 ]'
+ok "external restart-cmd actually ran" '[ -f "$TMP/external-restarted.marker" ]'
+ok "external restart audited as ok with external scope" \
+  'grep -q "\"result\":\"ok\"" "$STATE/self-update.log" && grep -q "\"name\":\"external-restart\",\"ok\":true" "$STATE/self-update.log"'
+
+# (2) changed + no allowlist + restart-cmd FAILS -> rc 7 + failure notified,
+#     never silently discarded (the daegyo cron `exit 0` bug).
+echo drift3 > "$TMP/seed/file3.txt"
+git -C "$TMP/seed" add -A && git -C "$TMP/seed" commit -qm five && git -C "$TMP/seed" push -q origin main
+printf '%s\n' 'exit 1' > "$CLAUDE/self-update.restart-cmd"
+out="$(run_selfup run 2>&1)"; rc=$?
+ok "failing external restart-cmd exits 7" '[ "$rc" = 7 ]'
+ok "failing external restart audited as restart-failures" \
+  'grep -q "\"result\":\"restart-failures\"" "$STATE/self-update.log" && grep -q "\"name\":\"external-restart\",\"ok\":false" "$STATE/self-update.log"'
+ok "failing external restart notifies immediately" 'grep -rh "외부 재시작 명령이 실패" "$TMP/spool" >/dev/null 2>&1'
+ok "external restart failure retains recovery snapshot" 'compgen -G "$STATE/self-update-install-rollback.*" >/dev/null'
+rm -rf "$STATE"/self-update-install-rollback.*
+
+# (3) up-to-date but runtime DOWN + health/restart-cmd -> recovery restart.
+printf '[ -f %s ]\n' "$TMP/runtime-healthy" > "$CLAUDE/self-update.health-cmd"
+printf 'touch %s\n' "$TMP/runtime-healthy" > "$CLAUDE/self-update.restart-cmd"
+out="$(run_selfup run 2>&1)"; rc=$?
+ok "up-to-date with down runtime recovers (rc 0)" '[ "$rc" = 0 ]'
+ok "recovery restart ran and runtime is healthy" '[ -f "$TMP/runtime-healthy" ]'
+ok "recovery audited as runtime-recovered" 'grep -q "\"result\":\"runtime-recovered\"" "$STATE/self-update.log"'
+ok "recovery notified" 'grep -rh "런타임 다운 감지" "$TMP/spool" >/dev/null 2>&1'
+
+# (4) up-to-date and runtime healthy -> no recovery attempt at all.
+printf 'touch %s\n' "$TMP/restart-should-not-run" > "$CLAUDE/self-update.restart-cmd"
+out="$(run_selfup run 2>&1)"; rc=$?
+ok "healthy up-to-date tick exits 0 without recovery" '[ "$rc" = 0 ] && [ ! -e "$TMP/restart-should-not-run" ]'
+ok "healthy tick does not audit a second recovery" '[ "$(grep -c "runtime-recovered" "$STATE/self-update.log")" = 1 ]'
+
+# (5) up-to-date, runtime down, recovery FAILS -> rc 7 + notified.
+rm -f "$TMP/runtime-healthy"
+printf '[ -f %s ]\n' "$TMP/never-healthy" > "$CLAUDE/self-update.health-cmd"
+printf '%s\n' 'exit 1' > "$CLAUDE/self-update.restart-cmd"
+out="$(run_selfup run 2>&1)"; rc=$?
+ok "failed recovery exits 7" '[ "$rc" = 7 ]'
+ok "failed recovery audited as runtime-down" 'grep -q "\"result\":\"runtime-down\"" "$STATE/self-update.log"'
+ok "failed recovery notifies" 'grep -rh "복구 재시작도 실패" "$TMP/spool" >/dev/null 2>&1'
+
+# cleanup: restore the allowlist and drop the external-cmd fixtures.
+rm -f "$CLAUDE/self-update.restart-cmd" "$CLAUDE/self-update.health-cmd"
 printf '%s\n' 'hermes-broker' 'a2a-worker' > "$CLAUDE/self-update.services"
 
 # A target commit must not restart into existing invalid node-local bridge
@@ -129,6 +187,18 @@ printf '%s\n' 'CLAUDE_PROCESS_TIMEOUT=3600' \
 out="$(run_selfup run 2>&1)"; rc=$?
 ok "valid bridge runtime config permits allowlisted restart" \
   '[ "$rc" = 0 ] && grep -q "restart ccc-telegram-bridge.service" "$TMP/systemctl.calls"'
+
+# A user-scoped bridge stays inside the same updater transaction: systemctl
+# receives --user for both restart and is-active, and the audit names the scope.
+printf '%s\n' 'user:ccc-telegram-bridge.service' > "$CLAUDE/self-update.services"
+: > "$TMP/systemctl.calls"
+out="$(run_selfup run --force 2>&1)"; rc=$?
+ok "user-scoped bridge restart succeeds inside self-update" \
+  '[ "$rc" = 0 ] && grep -q "^--user restart ccc-telegram-bridge.service$" "$TMP/systemctl.calls" && grep -q "^--user is-active --quiet ccc-telegram-bridge.service$" "$TMP/systemctl.calls"'
+ok "user-scoped bridge restart is audited with its effective unit and scope" \
+  'grep '"'"'"name":"ccc-telegram-bridge.service","ok":true,"scope":"user"'"'"' "$STATE/self-update.log" >/dev/null'
+ok "user-scoped bridge success removes the recovery snapshot" \
+  '! compgen -G "$STATE/self-update-install-rollback.*" >/dev/null'
 
 # A transient restart failure gets exactly one retry. If the retry succeeds,
 # the update is successful and its recovery snapshot must not become residue.

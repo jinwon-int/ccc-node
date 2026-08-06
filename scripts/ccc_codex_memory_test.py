@@ -370,6 +370,16 @@ class CodexMemoryMaterializerTest(unittest.TestCase):
         self.assertEqual(caught.exception.code, "codex_budget_exhausted")
         self.assertEqual(target.read_bytes(), before)
 
+    def test_nunchi_primary_order_survives_whole_snapshot_cap(self) -> None:
+        merged = "NUNCHI_PRIMARY_SENTINEL\n\n" + ("c" * 11200) + "CANONICAL_END_MARKER"
+        result = self.module.materialize_snapshot(
+            merged, self.options(CCC_CODEX_MEMORY_MAX_BYTES="8192")
+        )
+        text = (self.codex_home / "AGENTS.md").read_text(encoding="utf-8")
+        self.assertTrue(result.truncated)
+        self.assertIn("NUNCHI_PRIMARY_SENTINEL", text)
+        self.assertNotIn("CANONICAL_END_MARKER", text)
+
     def test_unchanged_snapshot_is_noop_without_content_or_mtime_change(self) -> None:
         first = self.module.materialize_snapshot("same", self.options())
         target = self.codex_home / "AGENTS.md"
@@ -717,6 +727,11 @@ class CodexMemoryMaterializerTest(unittest.TestCase):
         document = {
             "hookSpecificOutput": {"additionalContext": "CANONICAL_FULL_BUDGET"}
         }
+        loader_dir = self.home / ".claude" / "hooks"
+        loader_dir.mkdir(parents=True)
+        loader = loader_dir / "load-memory.sh"
+        shutil.copy2(ROOT / "claude" / "hooks" / "load-memory.sh", loader)
+        loader.chmod(0o700)
         with mock.patch.object(
             self.module,
             "_run_loader_bounded",
@@ -800,8 +815,9 @@ class CodexMemoryMaterializerTest(unittest.TestCase):
         document = json.loads(completed.stdout)
         self.assertEqual(document["continue"], True)
         context = document["hookSpecificOutput"]["additionalContext"]
-        self.assertTrue(context.startswith("CANONICAL_BASE_SENTINEL\n\n"))
-        self.assertTrue(context.endswith(snapshot))
+        # Nunchi-primary ordering: the bounded nunchi block leads, canonical follows.
+        self.assertTrue(context.startswith(snapshot + "\n\n"))
+        self.assertTrue(context.endswith("CANONICAL_BASE_SENTINEL"))
 
         Path(env["CCC_STATE_DIR"], "nunchi.mode").write_text("off", encoding="ascii")
         completed = self._run_nunchi_loader(loader, env)
@@ -872,7 +888,7 @@ class CodexMemoryMaterializerTest(unittest.TestCase):
         env["CCC_CODEX_NUNCHI_MAX_BYTES"] = "128"
         completed = self._run_nunchi_loader(loader, env)
         context = json.loads(completed.stdout)["hookSpecificOutput"]["additionalContext"]
-        base, addition = context.split("\n\n", 1)
+        addition, base = context.split("\n\n", 1)
         self.assertEqual(base, "CANONICAL_BASE_SENTINEL")
         self.assertLessEqual(len(addition.encode("utf-8")), 128)
         self.assertTrue(addition)
@@ -883,7 +899,7 @@ class CodexMemoryMaterializerTest(unittest.TestCase):
         completed = self._run_nunchi_loader(loader, env)
         hard_bounded = json.loads(completed.stdout)["hookSpecificOutput"][
             "additionalContext"
-        ].split("\n\n", 1)[1]
+        ].split("\n\n", 1)[0]
         self.assertLessEqual(len(hard_bounded.encode("utf-8")), 8192)
 
         Path(env["NUNCHI_SNAPSHOT"]).write_text(

@@ -218,6 +218,7 @@ ok "setup uses the tracked collision-safe settings merge filter" \
 rewrite_claude="$TMP/rewrite-claude"
 rewrite_hermes="$TMP/rewrite-hermes"
 mkdir -p "$rewrite_claude"
+mkdir -p "$TMP/rewrite-home/.piri/agent"
 printf '%s\n' 'credential-note=/root/.claude/private' > "$rewrite_claude/.credentials.json"
 credential_before="$(sha256sum "$rewrite_claude/.credentials.json")"
 out="$(HOME="$TMP/rewrite-home" CCC_CLAUDE_DIR="$rewrite_claude" CCC_HERMES_DIR="$rewrite_hermes" bash "$SETUP" --no-backup 2>&1)"; rc=$?
@@ -225,6 +226,15 @@ ok "custom-path rewrite leaves node-local credentials untouched" \
   '[ "$rc" = 0 ] && [ "$(sha256sum "$rewrite_claude/.credentials.json")" = "$credential_before" ]'
 ok "setup installs the Codex common managed skill set with provenance" \
   '[ -f "$TMP/rewrite-home/.codex/skills/ccc-doctor/SKILL.md" ] && [ -f "$TMP/rewrite-home/.codex/skills/ccc-node-status/SKILL.md" ] && [ -f "$TMP/rewrite-home/.codex/skills/ccc-security-audit/SKILL.md" ] && [ -f "$TMP/rewrite-home/.codex/skills/ccc-agent-cron/SKILL.md" ] && [ -f "$TMP/rewrite-home/.codex/skills/ccc-self-update/SKILL.md" ] && [ -f "$TMP/rewrite-home/.codex/skills/ccc-wiki-record/SKILL.md" ] && jq -e ".manager == \"ccc-node\"" "$TMP/rewrite-home/.codex/skills/ccc-doctor/.ccc-node-managed.json" >/dev/null'
+rewrite_agent_cron="$rewrite_claude/state/agent-cron/tasks.json"
+ok "setup registers the self-update command task against the real agent-cron contract" \
+  'jq -e --arg hook "$rewrite_claude/hooks/ccc-self-update.sh" '\''[.tasks[] | select(.id == "self-update" and .enabled == true and .notify == "telegram-owner-on-failure" and .successExitCodes == [0,8,11] and .payload.kind == "command" and .payload.argv == [$hook,"run"] and (.prompt | length > 0))] | length == 1'\'' "$rewrite_agent_cron" >/dev/null'
+HOME="$TMP/rewrite-home" CCC_CLAUDE_DIR="$rewrite_claude" CCC_HERMES_DIR="$rewrite_hermes" \
+  bash "$SETUP" --no-backup >/dev/null 2>&1
+ok "setup self-update task registration is idempotent" \
+  '[ "$(jq '\''[.tasks[] | select(.id == "self-update")] | length'\'' "$rewrite_agent_cron")" = 1 ]'
+ok "setup installs the Piri web skill when a Piri agent dir exists" \
+  '[ -f "$TMP/rewrite-home/.piri/agent/skills/web/SKILL.md" ] && [ -x "$TMP/rewrite-home/.piri/agent/skills/web/web_search.py" ] && [ -x "$TMP/rewrite-home/.piri/agent/skills/web/web_fetch.py" ] && cmp -s "$ROOT/piri/skills/web/web_search.py" "$TMP/rewrite-home/.piri/agent/skills/web/web_search.py"'
 # Slash commands invoke repo scripts verbatim; installed copies must point at
 # THIS checkout, not the canonical /opt/ccc-node (broken on e.g. /root/ccc-node
 # nodes). Repo templates stay canonical — only installed copies are rewritten.
@@ -267,6 +277,8 @@ ok "setup deploys the mtime-prune library the pruning hooks source" \
   '[ -x "$rewrite_claude/hooks/lib/mtime-prune.sh" ] && cmp -s "$ROOT/claude/hooks/lib/mtime-prune.sh" "$rewrite_claude/hooks/lib/mtime-prune.sh"'
 ok "setup installs the Codex launcher and materializer as executable managed hooks" \
   '[ -x "$rewrite_claude/hooks/ccc-codex" ] && [ -x "$rewrite_claude/hooks/ccc_codex_memory.py" ] && cmp -s "$ROOT/scripts/ccc-codex" "$rewrite_claude/hooks/ccc-codex" && cmp -s "$ROOT/scripts/ccc_codex_memory.py" "$rewrite_claude/hooks/ccc_codex_memory.py"'
+ok "setup installs the Piri launcher as an executable managed hook" \
+  '[ -x "$rewrite_claude/hooks/ccc-piri" ] && cmp -s "$ROOT/scripts/ccc-piri" "$rewrite_claude/hooks/ccc-piri"'
 ok "setup installs the managed nunchi Codex loader" \
   '[ -x "$rewrite_claude/hooks/nunchi/codex-loader.py" ] && cmp -s "$ROOT/claude/hooks/nunchi/codex-loader.py" "$rewrite_claude/hooks/nunchi/codex-loader.py"'
 ok "setup installs the body-free memory readiness probe beside memory-check" \
@@ -285,7 +297,7 @@ ok "source-checkout local-memory transaction imports canonical secure-fs directl
   'PYTHONDONTWRITEBYTECODE=1 PYTHONPATH= python3 -S "$ROOT/bridge/memory/local_memory_transaction.py" --help >/dev/null 2>&1'
 codex_dry_out="$(HOME="$nonroot_home" CCC_CLAUDE_DIR="$nonroot_claude" CCC_HERMES_DIR="$nonroot_hermes" CCC_WIKI_AGENT_BIN="$nonroot_wiki" CCC_BRIDGE_DEFAULT_PATH="$nonroot_bridge" bash "$SETUP" --dry-run 2>&1)"; codex_dry_rc=$?
 ok "setup non-root dry-run includes all Codex managed launch artifacts" \
-  '[ "$codex_dry_rc" = 0 ] && grep -Fq "$nonroot_claude/hooks/ccc-codex" <<<"$codex_dry_out" && grep -Fq "$nonroot_claude/hooks/ccc_codex_memory.py" <<<"$codex_dry_out" && grep -Fq "$nonroot_claude/hooks/ccc_secure_fs.py" <<<"$codex_dry_out" && grep -Fq "$nonroot_claude/hooks/ccc_local_memory_transaction.py" <<<"$codex_dry_out"'
+  '[ "$codex_dry_rc" = 0 ] && grep -Fq "$nonroot_claude/hooks/ccc-codex" <<<"$codex_dry_out" && grep -Fq "$nonroot_claude/hooks/ccc-piri" <<<"$codex_dry_out" && grep -Fq "$nonroot_claude/hooks/ccc_codex_memory.py" <<<"$codex_dry_out" && grep -Fq "$nonroot_claude/hooks/ccc_secure_fs.py" <<<"$codex_dry_out" && grep -Fq "$nonroot_claude/hooks/ccc_local_memory_transaction.py" <<<"$codex_dry_out"'
 
 # --- #569: hook-tree walk — deploys recursively, excludes tests/bytecode/wiring,
 # and dry-run only RENDERS the walk (no copies). rewrite_claude is a real install.
@@ -399,6 +411,26 @@ HOME="$wk_home" CCC_CLAUDE_DIR="$wk_claude" CCC_HERMES_DIR="$wk_hermes" \
   bash "$SETUP" --no-backup >/dev/null 2>&1
 ok "env-less re-run keeps the roster via the persisted marker" \
   '[ -f "$wk_claude/agents/a2a-implementer.md" ]'
+
+# #958: setup records the install-source repo path for ccc-self-update.
+ok "setup records install-source repo for self-update" \
+  '[ "$(cat "$wk_claude/self-update.repo" 2>/dev/null)" = "$ROOT" ]'
+
+# An operator-owned override is never silently rewritten by a later setup run
+# from a different checkout. (Copy the WORKING TREE, not a git clone — a clone
+# would miss uncommitted changes under test.)
+other_checkout="$TMP/other-checkout"
+mkdir -p "$other_checkout"
+(cd "$ROOT" && tar cf - --exclude=.git .) | (cd "$other_checkout" && tar xf -)
+printf '%s\n' '/operator/custom/repo' > "$wk_claude/self-update.repo"
+out="$(cd "$other_checkout" && HOME="$wk_home" CCC_CLAUDE_DIR="$wk_claude" CCC_HERMES_DIR="$wk_hermes" bash ./setup.sh --no-backup 2>&1)"; rc=$?
+ok "setup preserves a differing operator override with a warning" \
+  '[ "$(cat "$wk_claude/self-update.repo")" = "/operator/custom/repo" ] && grep -q "preserving the operator override" <<<"$out"'
+
+# Dry-run records nothing.
+dry_claude="$TMP/dry-claude-958"
+out="$(HOME="$TMP/dry-home-958" CCC_CLAUDE_DIR="$dry_claude" CCC_HERMES_DIR="$TMP/dry-hermes-958" bash "$SETUP" --dry-run 2>&1)"; rc=$?
+ok "setup dry-run does not write self-update.repo" '[ ! -e "$dry_claude/self-update.repo" ]'
 
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

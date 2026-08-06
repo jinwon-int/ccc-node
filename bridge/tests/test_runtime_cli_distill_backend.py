@@ -94,12 +94,13 @@ async def test_runtime_backends_return_the_same_validated_contract(
 
 
 def test_commands_disable_session_tools_and_context() -> None:
-    claude = _command("claude", "/safe/claude", "provider-default")
+    claude = _command("claude", "/safe/claude", "provider-default", '{"type": "object"}')
     assert "--no-session-persistence" in claude
     assert claude[claude.index("--tools") + 1] == ""
     assert "mcp__*" in claude
+    assert '{"type": "object"}' in claude[claude.index("--append-system-prompt") + 1]
 
-    piri = _command("piri", "/safe/piri", "kimi-coding/k3")
+    piri = _command("piri", "/safe/piri", "kimi-coding/k3", '{"type": "object"}')
     for flag in (
         "--no-session",
         "--no-tools",
@@ -122,6 +123,65 @@ def test_minimal_environment_drops_unrelated_secrets(tmp_path: Path) -> None:
     environment = _minimal_environment(source, provider="piri", temp_root=tmp_path)
     assert environment["KIMI_API_KEY"] == "synthetic-kimi-key"
     assert "TELEGRAM_BOT_TOKEN" not in environment
+
+
+def _fenced_stub(tmp_path: Path) -> Path:
+    return _script(
+        tmp_path,
+        "extractor-fenced-stub",
+        """import json
+import sys
+value = json.load(sys.stdin)
+body = json.dumps({
+    "schema_version": 1,
+    "provenance": {
+        "provider": value["provider"],
+        "source_thread_hash": value["source_thread_hash"],
+        "trigger": value["trigger"],
+        "distilled_at": "2026-08-05T00:00:01Z"
+    },
+    "honcho": [],
+    "wiki_candidates": [],
+    "resume": {
+        "last_activity": "",
+        "pending_action": "",
+        "awaiting_user": False,
+        "open_question": "",
+        "next_step": "",
+        "evidence": []
+    }
+})
+sys.stdout.write("```json\\n" + body + "\\n```\\n")
+""",
+    )
+
+
+@pytest.mark.anyio
+async def test_runtime_backend_unwraps_a_single_markdown_fence(tmp_path: Path) -> None:
+    backend = RuntimeCliDistillBackend(
+        "piri",
+        executable=str(_fenced_stub(tmp_path)),
+        environment={"PATH": str(Path(sys.executable).parent)},
+        temp_root=tmp_path,
+    )
+    extraction_input = build_extraction_input(
+        _snapshot(),
+        trigger=DistillTrigger.EXPLICIT,
+        provider="piri",
+    )
+
+    result = await backend.extract(extraction_input)
+
+    assert result.provenance.provider == "piri"
+
+
+def test_minimal_environment_keeps_ccc_piri_real_cli_path(tmp_path: Path) -> None:
+    source = {
+        "HOME": str(tmp_path),
+        "CCC_PIRI_REAL_CLI_PATH": "/opt/piri/piri-ccc.sh",
+    }
+    environment = _minimal_environment(source, provider="piri", temp_root=tmp_path)
+    assert environment["CCC_PIRI_REAL_CLI_PATH"] == "/opt/piri/piri-ccc.sh"
 
 
 @pytest.mark.anyio

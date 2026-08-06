@@ -2,6 +2,9 @@
 # Hermetic installer coverage: provider routing, managed Codex loader safety,
 # cron idempotence, Claude hook ownership, rollback and target-user isolation.
 set -uo pipefail
+# Managed loader fixtures are owner-only by contract; do not inherit a 0002
+# operator umask and accidentally create executable fixtures as 0775.
+umask 077
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 # shellcheck source=claude/hooks/lib/test-stub.sh
 . "$ROOT/claude/hooks/lib/test-stub.sh"

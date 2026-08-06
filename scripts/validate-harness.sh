@@ -268,7 +268,7 @@ for t in claude/hooks/observability.test.sh claude/hooks/security-scan.test.sh \
          claude/hooks/distill/local-facts.test.sh claude/hooks/memory-hooks.test.sh \
          claude/hooks/refresh-memory-freshness.test.sh \
          claude/hooks/nunchi/nunchi.test.sh claude/hooks/nunchi/bench.test.sh \
-         scripts/ccc-doctor.test.sh scripts/ccc-memory.test.sh scripts/ccc-codex-memory.test.sh scripts/ccc-codex.test.sh scripts/ccc-codex-github-policy.test.sh scripts/ccc-distill-check.test.sh scripts/ccc-security-audit.test.sh \
+         scripts/ccc-doctor.test.sh scripts/ccc-memory.test.sh scripts/ccc-codex-memory.test.sh scripts/ccc-codex.test.sh scripts/ccc-piri.test.sh piri/skills/web/web_tools.test.sh scripts/ccc-codex-github-policy.test.sh scripts/ccc-distill-check.test.sh scripts/ccc-security-audit.test.sh \
          scripts/ccc-fleet-matrix.test.sh scripts/ccc-wiki-triage.test.sh scripts/setup.test.sh \
          scripts/harness-paths.test.sh scripts/canonical-paths.test.sh \
          scripts/agent-cron.test.sh scripts/agent-cron-lib.test.sh scripts/a2a-termux-native-worker.test.sh \
@@ -285,6 +285,7 @@ for t in claude/hooks/observability.test.sh claude/hooks/security-scan.test.sh \
          codex/headless.test.sh crush/headless.test.sh \
          scripts/install-skill-autosave-cron.test.sh \
          scripts/gh-pr-flow-seoseo-review.test.sh \
+         scripts/gh-pr-flow-jinon86.test.sh \
          scripts/gh-pr-flow-seoseo-ai.test.sh \
          scripts/ccc-service-control.test.sh \
          scripts/ccc-broker-reconcile.test.sh; do
@@ -297,10 +298,14 @@ done
 # group/other-writable skill dirs, so the umask-sensitive suites must also
 # pass on nodes whose default umask is 0002. CI runs 0022 — run these twice.
 for t in claude/hooks/skill-review.test.sh \
+         claude/hooks/distill-scope.test.sh \
+         claude/hooks/distill/pending-drain.test.sh \
          claude/hooks/skill-review/autoinstall.test.sh \
          claude/hooks/skill-review/autoinstall-incremental.test.sh \
          claude/hooks/skill-review/codex-autoinstall.test.sh \
          scripts/ccc-codex-github-policy.test.sh \
+         scripts/ccc-codex-memory.test.sh \
+         scripts/install-nunchi.test.sh \
          scripts/setup.test.sh; do
   [ -f "$t" ] || { err "missing test: $t"; continue; }
   if ( umask 0002; bash "$t" ) >"$TMP/htest.out" 2>&1; then say "  ok $(grep -E 'PASS=' "$TMP/htest.out" | tail -1) $t (umask 0002)";

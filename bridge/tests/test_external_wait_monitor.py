@@ -179,6 +179,47 @@ async def test_failure_and_cancelled_are_terminal_results(tmp_path: Path) -> Non
 
 
 @pytest.mark.anyio
+async def test_legacy_short_sha_heals_instead_of_superseding(tmp_path: Path) -> None:
+    # Regression (#961): a record written with a 7-char SHA watches the same
+    # head whose headRefOid merely *extends* it — that is not a moved head.
+    clock = Clock()
+    registry = _registry(tmp_path, clock)  # seeds head_sha "abc1234" (7 chars)
+    full = "abc1234" + "f" * 33
+    transport = FakeTransport([PrState(full, "pending"), PrState(full, "success")])
+    recorder = Recorder()
+    monitor = _monitor(registry, transport, recorder, clock)
+
+    await monitor._tick()
+
+    record = registry.records()[0]
+    assert record["state"] == "monitoring"
+    assert record["head_sha"] == full
+
+    clock.advance(120)
+    await monitor._tick()
+
+    record = registry.records()[0]
+    assert record["terminal_status"] == TERMINAL_SUCCESS
+    assert len(recorder.notifications) == 1
+
+
+@pytest.mark.anyio
+async def test_short_sha_prefix_of_a_different_head_still_supersedes(tmp_path: Path) -> None:
+    # Same length, different content: not the watched head, so the wait ends.
+    clock = Clock()
+    registry = _registry(tmp_path, clock)
+    transport = FakeTransport([PrState("abc9999" + "f" * 33, "success")])
+    recorder = Recorder()
+    monitor = _monitor(registry, transport, recorder, clock)
+
+    await monitor._tick()
+
+    record = registry.records()[0]
+    assert record["terminal_status"] == TERMINAL_SUPERSEDED
+    assert recorder.resumes == []
+
+
+@pytest.mark.anyio
 async def test_head_sha_mismatch_is_superseded_never_success(tmp_path: Path) -> None:
     clock = Clock()
     registry = _registry(tmp_path, clock)

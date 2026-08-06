@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Optionally append safe local nunchi context to canonical hook JSON on stdin.
+"""Optionally prepend safe local nunchi context to canonical hook JSON on stdin.
+
+Nunchi is the primary working memory during the gate-3 transition (#824), so
+the bounded nunchi block is placed BEFORE the canonical context: when the
+materializer's whole-snapshot byte cap truncates the merged output, the
+canonical tail is sacrificed first instead of silently dropping nunchi.
 
 The Codex materializer runs ``load-memory.sh`` itself with the full configured
 deadline, then invokes this managed helper only with the time left over. Every
@@ -566,7 +571,9 @@ def main() -> int:
     if addition:
         hook_output = document["hookSpecificOutput"]
         assert isinstance(hook_output, dict)
-        hook_output["additionalContext"] = f"{base_context}\n\n{addition}"
+        # Nunchi-primary ordering (#824): the bounded nunchi block leads so a
+        # later whole-snapshot truncation cuts the canonical tail, not nunchi.
+        hook_output["additionalContext"] = f"{addition}\n\n{base_context}"
     sys.stdout.write(json.dumps(document, ensure_ascii=False, separators=(",", ":")))
     sys.stdout.write("\n")
     return 0

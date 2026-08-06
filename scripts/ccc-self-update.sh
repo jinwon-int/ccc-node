@@ -9,8 +9,17 @@
 # radius stays operator-controlled because the ONLY services it will ever touch
 # are the ones listed in an operator-owned allowlist file the agent must not
 # write:
-#   ~/.claude/self-update.services   (one systemd unit name per line, # comments)
+#   ~/.claude/self-update.services   ([user:|system:]unit per line, # comments)
 #   ~/.claude/self-update.repo       (optional: absolute repo path override)
+#   ~/.claude/self-update.restart-cmd (optional: one external restart command
+#      for hosts where systemd cannot reach the bridge, e.g. Termux
+#      `bridge/start.sh --path "$HOME" --restart -d`. Runs INSIDE this script's
+#      audit/notify boundary so its failure can never be discarded the way the
+#      hand-chained cron `... ; exit 0` discarded it on daegyo (#971).)
+#   ~/.claude/self-update.health-cmd  (optional: one runtime health probe, exit
+#      0 = healthy. With both files present, an up-to-date tick that finds the
+#      runtime DOWN attempts one recovery restart — so the second daily slot
+#      can recover an updated-but-down node (#971).)
 #
 # Procedure (run):
 #   1. take a lock; resolve the repo (env > repo file > script location > ~/ccc-node)
@@ -35,9 +44,10 @@
 #      (1800 — never defer a task older than this), CCC_SELF_UPDATE_MAX_DEFER_SECONDS
 #      (3600 — cap total deferral so continuous load can't starve updates).
 #      Fail-open (missing/unreadable/stale health → proceed); --force bypasses.
-# Exit: 0 = up-to-date or updated cleanly; 8 = deferred (bridge busy); 11 =
-#      degraded (code updated but no service restarted — allowlist missing/empty,
-#      runtime may be stale); other non-zero = aborted (reason logged).
+# Exit: 0 = up-to-date or updated cleanly; 7 = a restart (allowlisted service
+#      or external restart-cmd) or a recovery attempt failed; 8 = deferred
+#      (bridge busy); 11 = degraded (code updated but nothing restarted and no
+#      restart-cmd configured); other non-zero = aborted (reason logged).
 set -uo pipefail
 
 CLAUDE_DIR="${CCC_CLAUDE_DIR:-${HOME:-/root}/.claude}"
@@ -48,6 +58,9 @@ LOCK="$STATE_DIR/self-update.lock"
 SPOOL="${CCC_PUSH_SPOOL:-$STATE_DIR/telegram-spool}"
 SERVICES_FILE="${CCC_SELF_UPDATE_SERVICES:-$CLAUDE_DIR/self-update.services}"
 REPO_FILE="$CLAUDE_DIR/self-update.repo"
+RESTART_CMD_FILE="${CCC_SELF_UPDATE_RESTART_CMD_FILE:-$CLAUDE_DIR/self-update.restart-cmd}"
+HEALTH_CMD_FILE="${CCC_SELF_UPDATE_HEALTH_CMD_FILE:-$CLAUDE_DIR/self-update.health-cmd}"
+RESTART_WAIT_SECONDS="${CCC_SELF_UPDATE_RESTART_WAIT_SECONDS:-60}"
 BRANCH="${CCC_SELF_UPDATE_BRANCH:-main}"
 SYSTEMCTL="${CCC_SELF_UPDATE_SYSTEMCTL:-systemctl}"
 
@@ -98,6 +111,55 @@ audit() { # <result> <old> <new> <changed> <setup_ok> <services-json>
     --argjson changed "$4" --argjson setup_ok "$5" --argjson services "$6" \
     '{ts:$ts, result:$result, old:$old, new:$new, changed:$changed, setup_ok:$setup_ok, services:$services}' \
     >> "$LOG" 2>/dev/null
+}
+
+read_operator_cmd() { # <file> — first non-comment, non-blank line (operator-owned)
+  [ -f "$1" ] || return 1
+  local line
+  while IFS= read -r line; do
+    line="${line%%#*}"
+    line="$(printf '%s' "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    [ -n "$line" ] && { printf '%s' "$line"; return 0; }
+  done < "$1"
+  return 1
+}
+
+resolve_restart_cmd() {
+  if [ -n "${CCC_SELF_UPDATE_RESTART_CMD:-}" ]; then printf '%s' "$CCC_SELF_UPDATE_RESTART_CMD"; return 0; fi
+  read_operator_cmd "$RESTART_CMD_FILE"
+}
+
+resolve_health_cmd() {
+  if [ -n "${CCC_SELF_UPDATE_HEALTH_CMD:-}" ]; then printf '%s' "$CCC_SELF_UPDATE_HEALTH_CMD"; return 0; fi
+  read_operator_cmd "$HEALTH_CMD_FILE"
+}
+
+# Run the operator's external restart command INSIDE the audit/notify boundary.
+# Outcome: health-cmd poll (when configured, up to RESTART_WAIT_SECONDS), else
+# the command's own exit code. Returns 0 = runtime back, 1 = still down.
+run_external_restart() {
+  local rcmd hcmd rc waited
+  rcmd="$(resolve_restart_cmd)" || return 1
+  hcmd="$(resolve_health_cmd || true)"
+  log "external-restart begin"
+  if command -v timeout >/dev/null 2>&1; then
+    timeout 180 bash -c "$rcmd" >>"$LOG" 2>&1
+  else
+    bash -c "$rcmd" >>"$LOG" 2>&1
+  fi
+  rc=$?
+  log "external-restart exit=$rc"
+  if [ -n "$hcmd" ]; then
+    waited=0
+    until bash -c "$hcmd" >>"$LOG" 2>&1; do
+      waited=$((waited + 3))
+      [ "$waited" -ge "$RESTART_WAIT_SECONDS" ] && { log "external-restart health-timeout waited=${waited}s"; return 1; }
+      sleep 3
+    done
+    log "external-restart healthy waited=${waited}s"
+    return 0
+  fi
+  return "$rc"
 }
 
 snapshot_installed_artifacts() {
@@ -174,6 +236,10 @@ bridge_service_allowlisted() {
   while IFS= read -r svc; do
     svc="${svc%%#*}"
     svc="$(printf '%s' "$svc" | tr -d '[:space:]')"
+    case "$svc" in
+      user:*) svc="${svc#user:}" ;;
+      system:*) svc="${svc#system:}" ;;
+    esac
     case "$svc" in
       ccc-telegram-bridge|ccc-telegram-bridge.service) return 0 ;;
     esac
@@ -333,6 +399,30 @@ CHANGED=false
 [ "$OLD_SHA" != "$NEW_SHA" ] && CHANGED=true
 
 if [ "$CHANGED" = "false" ] && [ "$FORCE" != "1" ]; then
+  # Second-slot runtime recovery (#971): code is current, but an earlier
+  # chained restart may have failed and left the runtime down. When the
+  # operator configured both a health probe and an external restart command,
+  # verify runtime health and attempt ONE recovery restart — with the outcome
+  # audited and notified, never discarded.
+  if hcmd="$(resolve_health_cmd)" && resolve_restart_cmd >/dev/null 2>&1; then
+    if bash -c "$hcmd" >>"$LOG" 2>&1; then
+      log "done result=up-to-date sha=$NEW_SHA runtime=healthy"
+      say "self-update: already up to date ($(git -C "$REPO" rev-parse --short HEAD))"
+      exit 0
+    fi
+    SHORT_CUR="$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null)"
+    log "runtime unhealthy at up-to-date tick; attempting recovery restart"
+    if run_external_restart; then
+      audit "runtime-recovered" "$OLD_SHA" "$NEW_SHA" "$CHANGED" true '[{"name":"external-restart","ok":true,"scope":"external"}]'
+      notify "self-update ${SHORT_CUR}: 코드는 최신이나 런타임 다운 감지 — 외부 재시작으로 복구 완료. ~/.claude/state/self-update.log" "recovered-$NEW_SHA"
+      say "self-update: code up to date but runtime was down; recovered via external restart"
+      exit 0
+    fi
+    audit "runtime-down" "$OLD_SHA" "$NEW_SHA" "$CHANGED" true '[{"name":"external-restart","ok":false,"scope":"external"}]'
+    notify "self-update ${SHORT_CUR} 경고: 코드는 최신이나 런타임이 다운 상태이며 복구 재시작도 실패했습니다. 브리지가 남아있는지 즉시 확인 필요. ~/.claude/state/self-update.log" "runtime-down-$NEW_SHA"
+    say "self-update: code up to date but runtime is DOWN and the recovery restart failed" >&2
+    exit 7
+  fi
   log "done result=up-to-date sha=$NEW_SHA"
   say "self-update: already up to date ($(git -C "$REPO" rev-parse --short HEAD))"
   exit 0
@@ -404,7 +494,12 @@ if [ -f "$SERVICES_FILE" ]; then
   while IFS= read -r svc; do
     svc="${svc%%#*}"; svc="$(printf '%s' "$svc" | tr -d '[:space:]')"
     [ -n "$svc" ] || continue
-    if ! printf '%s' "$svc" | grep -Eq '^[A-Za-z0-9@._:-]+$'; then
+    scope=system
+    case "$svc" in
+      user:*) scope=user; svc="${svc#user:}" ;;
+      system:*) svc="${svc#system:}" ;;
+    esac
+    if [ -z "$svc" ] || ! printf '%s' "$svc" | grep -Eq '^[A-Za-z0-9@._:-]+$'; then
       log "service skipped reason=invalid-name name=$svc"
       continue
     fi
@@ -412,20 +507,22 @@ if [ -f "$SERVICES_FILE" ]; then
     attempt=0
     while [ "$attempt" -lt 2 ]; do
       attempt=$((attempt + 1))
-      if "$SYSTEMCTL" restart "$svc" >>"$LOG" 2>&1; then
+      systemctl_scope_args=()
+      [ "$scope" = user ] && systemctl_scope_args+=(--user)
+      if "$SYSTEMCTL" "${systemctl_scope_args[@]}" restart "$svc" >>"$LOG" 2>&1; then
         ok=true
         i=0
-        until "$SYSTEMCTL" is-active --quiet "$svc" 2>/dev/null; do
+        until "$SYSTEMCTL" "${systemctl_scope_args[@]}" is-active --quiet "$svc" 2>/dev/null; do
           i=$((i + 1)); [ "$i" -ge 10 ] && { ok=false; break; }
           sleep 1
         done
       fi
       [ "$ok" = "true" ] && break
-      [ "$attempt" -lt 2 ] && log "service retry name=$svc attempt=$attempt"
+      [ "$attempt" -lt 2 ] && log "service retry name=$svc attempt=$attempt scope=$scope"
     done
     [ "$ok" = "true" ] && RESTARTED=$((RESTARTED + 1)) || FAILED=$((FAILED + 1))
-    SERVICES_JSON="$(printf '%s' "$SERVICES_JSON" | jq -c --arg n "$svc" --argjson ok "$ok" '. + [{name:$n, ok:$ok}]')"
-    log "service name=$svc ok=$ok"
+    SERVICES_JSON="$(printf '%s' "$SERVICES_JSON" | jq -c --arg n "$svc" --arg s "$scope" --argjson ok "$ok" '. + [{name:$n, ok:$ok, scope:$s}]')"
+    log "service name=$svc ok=$ok scope=$scope"
   done < "$SERVICES_FILE"
 else
   log "restart skipped reason=no-services-file path=$SERVICES_FILE"
@@ -445,6 +542,37 @@ if [ "$FAILED" -gt 0 ]; then
   say "self-update: updated to $SHORT_NEW but $FAILED service(s) failed to restart; recovery snapshot retained at $INSTALL_SNAPSHOT_DIR" >&2
   exit 7
 fi
+# Per #910: code changed but NO service was restarted (services allowlist file
+# missing or empty). With an operator-configured external restart command
+# (#971, e.g. Termux start.sh), run it HERE — inside the audit/notify boundary
+# — instead of letting a hand-chained cron line discard its failure. Success
+# falls through to the shared snapshot-cleanup/ok path; failure keeps the
+# recovery snapshot, notifies, and exits non-zero. Without a configured
+# command, report degraded (not ok) and exit non-zero so it cannot read as
+# success.
+if [ "$CHANGED" = "true" ] && [ "$RESTARTED" -eq 0 ]; then
+  if resolve_restart_cmd >/dev/null 2>&1; then
+    if run_external_restart; then
+      RESTARTED=1
+      SERVICES_JSON="$(printf '%s' "$SERVICES_JSON" | jq -c '. + [{"name":"external-restart","ok":true,"scope":"external"}]')"
+      log "external-restart ok; proceeding to cleanup"
+    else
+      KEEP_INSTALL_SNAPSHOT=1
+      SERVICES_JSON="$(printf '%s' "$SERVICES_JSON" | jq -c '. + [{"name":"external-restart","ok":false,"scope":"external"}]')"
+      audit "restart-failures" "$OLD_SHA" "$NEW_SHA" "$CHANGED" "$SETUP_OK" "$SERVICES_JSON"
+      log "recovery snapshot=$INSTALL_SNAPSHOT_DIR oldSha=$OLD_SHA reason=external-restart-failure"
+      notify "self-update ${SHORT_NEW}: 코드 갱신 후 외부 재시작 명령이 실패했습니다 — 브리지가 남아있는지 즉시 확인 필요. 롤백 자료 보존: ${INSTALL_SNAPSHOT_DIR}. ~/.claude/state/self-update.log" "fail-$NEW_SHA"
+      say "self-update: updated to $SHORT_NEW but the external restart command failed; recovery snapshot retained at $INSTALL_SNAPSHOT_DIR" >&2
+      exit 7
+    fi
+  else
+    audit "degraded-no-services" "$OLD_SHA" "$NEW_SHA" "$CHANGED" "$SETUP_OK" "$SERVICES_JSON"
+    notify "self-update ${SHORT_NEW}: 코드 갱신됐으나 재시작된 서비스 없음 (허용목록 누락/비어있음 의심). 실행 중 프로세스가 옛 코드일 수 있음 — self-update.services 확인 필요. ~/.claude/state/self-update.log" "degraded-$NEW_SHA"
+    say "self-update: degraded — ${OLD_SHA:0:7} → ${SHORT_NEW}, services restarted: 0 (no allowlisted services; runtime may be stale)" >&2
+    exit 11
+  fi
+fi
+
 if ! rm -rf -- "$INSTALL_SNAPSHOT_DIR"; then
   # Do not turn a failed private-snapshot cleanup into a reported success.
   # Keep the path available to the operator (and prevent the EXIT trap from
@@ -457,19 +585,6 @@ if ! rm -rf -- "$INSTALL_SNAPSHOT_DIR"; then
   exit 10
 fi
 INSTALL_SNAPSHOT_DIR=""
-
-# Per #910: code changed but NO service was restarted (services allowlist file
-# missing or empty). Running processes still hold OLD code — silent code/runtime
-# drift that previously reported result:"ok" / "services restarted: 0". Report
-# it as degraded (not ok) and exit non-zero so it cannot read as success.
-# (FAILED==0 is guaranteed here — the FAILED>0 path exited 7 above — so a zero
-# restart count with a change means nothing was even attempted.)
-if [ "$CHANGED" = "true" ] && [ "$RESTARTED" -eq 0 ]; then
-  audit "degraded-no-services" "$OLD_SHA" "$NEW_SHA" "$CHANGED" "$SETUP_OK" "$SERVICES_JSON"
-  notify "self-update ${SHORT_NEW}: 코드 갱신됐으나 재시작된 서비스 없음 (허용목록 누락/비어있음 의심). 실행 중 프로세스가 옛 코드일 수 있음 — self-update.services 확인 필요. ~/.claude/state/self-update.log" "degraded-$NEW_SHA"
-  say "self-update: degraded — ${OLD_SHA:0:7} → ${SHORT_NEW}, services restarted: 0 (no allowlisted services; runtime may be stale)" >&2
-  exit 11
-fi
 
 audit "ok" "$OLD_SHA" "$NEW_SHA" "$CHANGED" "$SETUP_OK" "$SERVICES_JSON"
 if [ "$CHANGED" = "true" ]; then
