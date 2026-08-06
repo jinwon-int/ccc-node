@@ -113,6 +113,38 @@ reply_d delta /opt/ccc-node no /opt/ccc-node 1
 run "delta"
 ok "down bridge outranks doctor drift" 'grep -q "^DOWN delta" "$OUT" && ! grep -q "^DRIFT delta" "$OUT"'
 
+# ---- gongmyoung dual-domain coherence (#980) -------------------------------
+reply_dd() { # <node> <runtime> <avail> <unit> <doctor> <dualdomain>
+  printf 'RUNTIME=%s\nAVAIL=%s\nUNIT=%s\nDOCTOR=%s\nDUALDOMAIN=%s\n' "$2" "$3" "$4" "$5" "$6" > "$TMP/reply/$1"
+}
+
+reply_dd gm /opt/ccc-node yes /opt/ccc-node 0 ok
+run "gm"
+okc "$RC" 0 "coherent dual-domain passes"
+ok "coherent dual-domain reports OK" 'grep -q "^OK gm" "$OUT"'
+
+reply_dd gm /opt/ccc-node yes /opt/ccc-node 0 "fail cron-bus-env-missing,linger=no"
+run "gm"
+okc "$RC" 1 "dual-domain incoherence exits nonzero"
+ok "incoherence names the failing checks" 'grep -q "^DUALDOMAIN gm cron-bus-env-missing,linger=no" "$OUT"'
+ok "incoherence is not reported as DOWN or OK" '! grep -q "^DOWN gm" "$OUT" && ! grep -q "^OK gm" "$OUT"'
+
+# A single-domain node (DUALDOMAIN=-) and a root-less probe (skip) are not failures.
+reply_dd plain /opt/ccc-node yes /opt/ccc-node 0 -
+run "plain"
+okc "$RC" 0 "single-domain node unaffected"
+ok "single-domain node reports OK" 'grep -q "^OK plain" "$OUT"'
+reply_dd noroot /opt/ccc-node yes /opt/ccc-node 0 "skip(non-root)"
+run "noroot"
+okc "$RC" 0 "root-less probe skip is not a failure"
+ok "skipped dual-domain still reports OK" 'grep -q "^OK noroot" "$OUT"'
+
+# The remote probe is a quoted heredoc — invisible to bash -n on the script
+# itself. Extract and parse it as POSIX sh so a probe typo cannot ship.
+probe_body="$TMP/probe-body.sh"
+sed -n '/PROBE <<.PROBE_EOF.$/,/^PROBE_EOF$/p' "$SC" | sed '1d;$d' > "$probe_body"
+ok "remote probe parses as POSIX sh" 'bash -n "$probe_body" && { ! command -v dash >/dev/null || dash -n "$probe_body"; }'
+
 # ---- non-canonical runtime root (#842) ------------------------------------
 # The seoseo 2026-08-01 shape, and the reason this check is separate from the
 # boot-path comparison: unit and runtime AGREE, on a PR worktree. Every
