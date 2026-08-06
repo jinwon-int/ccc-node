@@ -362,5 +362,81 @@ class DepsInstallExecutionTests(unittest.TestCase):
             self.assertIn("ANDROID_API_LEVEL=34", (Path(tmpdir) / "pip-calls.log").read_text())
 
 
+class RustToolchainPreflightTests(unittest.TestCase):
+    """#968: Android/Termux hash-locked installs need a Rust toolchain."""
+
+    def _make_paths(self, root: Path, pip_exit: int) -> DependencyPaths:
+        bridge = root / "bridge"
+        bin_dir = bridge / "venv" / "bin"
+        bin_dir.mkdir(parents=True, exist_ok=True)
+        requirements = bridge / "requirements.txt"
+        requirements.write_text("demo==1.0\n", encoding="utf-8")
+        lock = bridge / "requirements.lock.txt"
+        lock.write_text("demo==1.0 --hash=sha256:abc\n", encoding="utf-8")
+        pyproject = bridge / "pyproject.toml"
+        pyproject.write_text("[project]\nname = 'demo'\n", encoding="utf-8")
+        pip = bin_dir / "pip"
+        pip.write_text(f"#!/bin/bash\nexit {pip_exit}\n", encoding="utf-8")
+        pip.chmod(0o755)
+        return DependencyPaths(
+            bridge_dir=bridge,
+            venv_dir=bridge / "venv",
+            project_env=root / "project.env",
+            bridge_env=root / "bridge.env",
+            requirements=requirements,
+            lock=lock,
+            pyproject=pyproject,
+            hash_cache=bridge / ".req_hash",
+            pip=pip,
+        )
+
+    def _run(self, paths: DependencyPaths, *, pip_exit: int, cargo: bool):
+        import io
+
+        from telegram_bot.dependency_bootstrap import sync_dependencies
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fake_bin = Path(tmpdir) / "bin"
+            fake_bin.mkdir()
+            if cargo:
+                cargo_bin = fake_bin / "cargo"
+                cargo_bin.write_text("#!/bin/bash\nexit 0\n", encoding="utf-8")
+                cargo_bin.chmod(0o755)
+            environ = {
+                "TERMUX_VERSION": "0.118",
+                "PATH": f"{fake_bin}{os.pathsep}/usr/bin{os.pathsep}/bin",
+            }
+            buf = io.StringIO()
+            rc = sync_dependencies(
+                paths, InstallMode.LOCKED, force_install=True, environ=environ, stdout=buf
+            )
+            return rc, buf.getvalue()
+
+    def test_termux_without_cargo_warns_upfront_and_diagnoses_failure(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            paths = self._make_paths(Path(tmpdir), pip_exit=1)
+            rc, out = self._run(paths, pip_exit=1, cargo=False)
+            self.assertEqual(rc, 1)
+            self.assertIn("without a Rust toolchain", out)
+            self.assertIn("pkg install rust rust-std-aarch64-linux-android", out)
+            self.assertIn("does NOT bypass a missing toolchain", out)
+            self.assertNotIn("report the platform gap", out)
+
+    def test_termux_with_cargo_keeps_legacy_hint_and_skips_warning(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            paths = self._make_paths(Path(tmpdir), pip_exit=1)
+            rc, out = self._run(paths, pip_exit=1, cargo=True)
+            self.assertEqual(rc, 1)
+            self.assertNotIn("without a Rust toolchain", out)
+            self.assertIn("CCC_DEPS_UNLOCKED=1 and report the platform gap.", out)
+
+    def test_termux_without_cargo_warns_but_does_not_block_success(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            paths = self._make_paths(Path(tmpdir), pip_exit=0)
+            rc, out = self._run(paths, pip_exit=0, cargo=False)
+            self.assertEqual(rc, 0)
+            self.assertIn("without a Rust toolchain", out)
+
+
 if __name__ == "__main__":
     unittest.main()

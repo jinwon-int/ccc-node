@@ -161,6 +161,14 @@ def ensure_android_api_level(
         print(f"\033[90m✓ Android API level auto-detected: {sdk}\033[0m", file=stdout, flush=True)
 
 
+def _is_termux_env(env: Mapping[str, str]) -> bool:
+    return bool(env.get("TERMUX_VERSION")) or "/com.termux/" in env.get("PREFIX", "")
+
+
+def _cargo_available(env: Mapping[str, str]) -> bool:
+    return shutil.which("cargo", path=env.get("PATH")) is not None
+
+
 def _saved_fingerprint(path: Path) -> str:
     if not path.is_file():
         return ""
@@ -170,11 +178,22 @@ def _saved_fingerprint(path: Path) -> str:
         return ""
 
 
-def _print_install_failure(mode: InstallMode, command_index: int, stdout: TextIO) -> None:
+def _print_install_failure(
+    mode: InstallMode, command_index: int, stdout: TextIO, *, rust_missing: bool = False
+) -> None:
     if mode is InstallMode.LOCKED and command_index == 0:
         print("❌ Hash-locked dependency installation failed", file=stdout, flush=True)
-        print("   If this host cannot install a locked artifact, retry with", file=stdout)
-        print("   CCC_DEPS_UNLOCKED=1 and report the platform gap.", file=stdout)
+        if rust_missing:
+            # #968: on Android/Termux a missing toolchain, not the lock, is the
+            # usual killer — name it instead of a maturin/rustup backtrace.
+            print("   Likely cause: this Android/Termux host has no Rust toolchain,", file=stdout)
+            print("   so packages without an Android-compatible wheel cannot build", file=stdout)
+            print("   (maturin needs cargo). Fix and retry:", file=stdout)
+            print("   pkg install rust rust-std-aarch64-linux-android", file=stdout)
+            print("   CCC_DEPS_UNLOCKED=1 does NOT bypass a missing toolchain.", file=stdout)
+        else:
+            print("   If this host cannot install a locked artifact, retry with", file=stdout)
+            print("   CCC_DEPS_UNLOCKED=1 and report the platform gap.", file=stdout)
     elif mode is InstallMode.UNLOCKED and command_index == 0:
         print("❌ Failed to upgrade pip", file=stdout, flush=True)
     elif mode is InstallMode.UNLOCKED and command_index == 1:
@@ -206,6 +225,15 @@ def sync_dependencies(
     print("📦 Installing Python dependencies...", file=stdout, flush=True)
     child_env = dict(os.environ if environ is None else environ)
     ensure_android_api_level(child_env, stdout=stdout)
+    rust_missing = _is_termux_env(child_env) and not _cargo_available(child_env)
+    if rust_missing:
+        print(
+            "⚠️  Android/Termux host without a Rust toolchain — packages without "
+            "an Android-compatible wheel (e.g. cryptography via maturin) will fail "
+            "to build. Install it with: pkg install rust rust-std-aarch64-linux-android",
+            file=stdout,
+            flush=True,
+        )
     if mode is InstallMode.LOCKED and not paths.lock.is_file():
         print(f"❌ Hash lock not found: {paths.lock}", file=stdout)
         print("   Regenerate it with scripts/ccc-deps-lock.sh, or set", file=stdout)
@@ -226,7 +254,7 @@ def sync_dependencies(
             _print_install_failure(mode, index, stdout)
             return 1
         if result.returncode != 0:
-            _print_install_failure(mode, index, stdout)
+            _print_install_failure(mode, index, stdout, rust_missing=rust_missing)
             return 1
 
     try:

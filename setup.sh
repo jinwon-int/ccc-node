@@ -732,6 +732,30 @@ else
 fi
 note "Existing ccc-telegram-bridge systemd unit checked against the canonical renderer"
 
+# #968: Termux/Android hash-locked installs may need to build packages from
+# source (cryptography 50 has no Android wheel -> maturin -> Rust). A missing
+# toolchain killed the daegyo bridge on 2026-08-06 and the prerequisite lived
+# only in prose. Ensure it here so it is a setup-managed property; when the
+# install cannot run, say so loudly with the exact pkg line.
+IS_TERMUX=0
+[ -n "${TERMUX_VERSION:-}" ] && IS_TERMUX=1
+case "${PREFIX:-}" in */com.termux/*) IS_TERMUX=1 ;; esac
+if [ "$IS_TERMUX" = 1 ]; then
+  if command -v cargo >/dev/null 2>&1; then
+    note "Termux Rust toolchain present ($(cargo --version 2>/dev/null | head -1))"
+  elif [ "$DRY" = 1 ]; then
+    echo "[dry-run] pkg install -y rust rust-std-aarch64-linux-android"
+  elif command -v pkg >/dev/null 2>&1; then
+    if pkg install -y rust rust-std-aarch64-linux-android; then
+      note "installed Termux Rust toolchain (rust + rust-std-aarch64-linux-android)"
+    else
+      note "WARNING: Rust toolchain install failed — hash-locked dependency builds (e.g. cryptography via maturin) will fail. Run: pkg install -y rust rust-std-aarch64-linux-android"
+    fi
+  else
+    note "WARNING: pkg not found — install the Rust toolchain manually: pkg install -y rust rust-std-aarch64-linux-android"
+  fi
+fi
+
 cat <<'EOF'
 
 ==> Done. Follow-up checklist (do these manually):
