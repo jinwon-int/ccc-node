@@ -37,6 +37,7 @@ from telegram_bot.core.usage import (
     UsageSnapshot,
     load_claude_status_snapshot,
     local_claude_environment_snapshot,
+    local_piri_environment_snapshot,
     merge_usage,
     parse_claude_rate_limit_event,
     parse_claude_result,
@@ -471,6 +472,14 @@ class ProjectChatHandler(
             if get_usage is not None:
                 return await asyncio.wait_for(get_usage(session_id), timeout=7.0)
             provider = str(getattr(self._config, "agent_provider", "claude"))
+            if provider == "piri":
+                # PiriRuntime exposes no usage endpoint and Piri reports no
+                # token/quota telemetry, so the only usable signal is the
+                # local meter — but synthesis is keyed by service, which the
+                # bare snapshot lacks. Name it, then fill from the meter.
+                return self._fill_local_service_windows(
+                    local_piri_environment_snapshot()
+                )
             if provider != "claude":
                 return UsageSnapshot(provider=provider)
             # Claude adapter path (#584): ClaudeRuntime exposes no usage
@@ -507,26 +516,35 @@ class ProjectChatHandler(
         rate_limit = getattr(self, "_claude_rate_limit", None)
         if rate_limit is not None:
             result = merge_usage(result, rate_limit)
-        # Third-party services (e.g. Kimi Code) publish no quota data, so no
-        # observed window ever arrives; fall back to the meter's local
-        # rolling-window estimate so /usage is not stuck on "unavailable".
-        # Real observed windows always win — synthesis only fills an empty set.
-        if result.service is not None and not result.windows:
-            meter = getattr(self, "_usage_meter", None)
-            if meter is not None:
-                try:
-                    rolling = meter.rolling_usage().get(result.provider)
-                    period = getattr(meter, "period_usage", None)
-                    weekly = period(days=7).get(result.provider) if period is not None else None
-                    windows = synthesize_service_windows(result.service, rolling, weekly)
-                except Exception:
-                    logger.debug("Local service window synthesis failed")
-                    windows = ()
-                if windows:
-                    result = merge_usage(
-                        result,
-                        UsageSnapshot(provider=result.provider, windows=windows),
-                    )
+        return self._fill_local_service_windows(result)
+
+    def _fill_local_service_windows(self, result: UsageSnapshot) -> UsageSnapshot:
+        """Fill empty rate-limit windows from the local meter estimate.
+
+        Third-party services (e.g. Kimi Code) publish no quota data, so no
+        observed window ever arrives; fall back to the meter's local
+        rolling-window estimate so /usage is not stuck on "unavailable".
+        Real observed windows always win — synthesis only fills an empty set,
+        and a snapshot without a service is returned untouched.
+        """
+        if result.service is None or result.windows:
+            return result
+        meter = getattr(self, "_usage_meter", None)
+        if meter is None:
+            return result
+        try:
+            rolling = meter.rolling_usage().get(result.provider)
+            period = getattr(meter, "period_usage", None)
+            weekly = period(days=7).get(result.provider) if period is not None else None
+            windows = synthesize_service_windows(result.service, rolling, weekly)
+        except Exception:
+            logger.debug("Local service window synthesis failed")
+            windows = ()
+        if windows:
+            result = merge_usage(
+                result,
+                UsageSnapshot(provider=result.provider, windows=windows),
+            )
         return result
 
     def _get_conversation_lock(self, user_id: int, chat_id: int) -> asyncio.Lock:
