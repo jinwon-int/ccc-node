@@ -10,7 +10,10 @@ from pathlib import Path
 import pytest
 
 from telegram_bot.memory.distill_types import TranscriptBounds
-from telegram_bot.memory.piri_snapshot import read_piri_snapshot
+from telegram_bot.memory.piri_snapshot import (
+    find_piri_session_directory,
+    read_piri_snapshot,
+)
 
 
 def _write_session(directory: Path, session_id: str, entries: list[dict]) -> Path:
@@ -32,6 +35,54 @@ def _write_session(directory: Path, session_id: str, entries: list[dict]) -> Pat
     )
     path.chmod(0o600)
     return path
+
+
+def test_finder_locates_session_at_root(tmp_path: Path) -> None:
+    session_dir = tmp_path / "sessions"
+    _write_session(session_dir, "root-session", [])
+
+    assert find_piri_session_directory(session_dir, "root-session") == session_dir
+
+
+def test_finder_locates_session_in_cwd_slug_subdir(tmp_path: Path) -> None:
+    root = tmp_path / "sessions"
+    root.mkdir(mode=0o700)
+    slug = root / "--workspace--"
+    _write_session(slug, "nested-session", [])
+
+    assert find_piri_session_directory(root, "nested-session") == slug
+
+
+def test_finder_returns_none_when_missing(tmp_path: Path) -> None:
+    root = tmp_path / "sessions"
+    root.mkdir(mode=0o700)
+    _write_session(root / "--a--", "other-session", [])
+
+    assert find_piri_session_directory(root, "absent-session") is None
+    assert find_piri_session_directory(tmp_path / "no-such-root", "x") is None
+
+
+def test_finder_rejects_ambiguity_across_subdirs(tmp_path: Path) -> None:
+    root = tmp_path / "sessions"
+    root.mkdir(mode=0o700)
+    _write_session(root / "--a--", "dup-session", [])
+    _write_session(root / "--b--", "dup-session", [])
+
+    with pytest.raises(ValueError, match="ambiguous"):
+        find_piri_session_directory(root, "dup-session")
+
+
+def test_finder_skips_symlinked_and_unsafe_subdirs(tmp_path: Path) -> None:
+    root = tmp_path / "sessions"
+    root.mkdir(mode=0o700)
+    outside = tmp_path / "outside"
+    _write_session(outside, "hidden-session", [])
+    (root / "link").symlink_to(outside, target_is_directory=True)
+    world = root / "world"
+    _write_session(world, "hidden-session", [])
+    world.chmod(0o755)
+
+    assert find_piri_session_directory(root, "hidden-session") is None
 
 
 def test_reads_only_bounded_user_and_assistant_text(tmp_path: Path) -> None:
