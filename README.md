@@ -34,7 +34,7 @@ After setup:
 
 | Area | One-line summary | Details |
 |---|---|---|
-| Memory hooks | SessionStart/PostCompact memory snapshot + background refresh; startup is no-network/fail-open. | [`docs/memory.md`](docs/memory.md) |
+| Memory hooks | SessionStart/PostCompact memory snapshot + background refresh; startup is no-network/fail-open. Per-provider feature status (incl. degraded lanes) is owned by [`docs/provider-capability-matrix.md`](docs/provider-capability-matrix.md). | [`docs/memory.md`](docs/memory.md) |
 | Telegram bridge | Telegram ↔ Claude Code bridge with daemon/supervisor, streaming UI, push notifier, voice/media helpers. | [`bridge/README.md`](bridge/README.md), [`docs/bridge-ops.md`](docs/bridge-ops.md) |
 | Harness settings | Claude settings, status line, Korean output style, plugin/standalone hook modes. | [`docs/harness.md`](docs/harness.md) |
 | Doctor diagnostics | Read-only drift report plus conservative dry-run/apply repairs for settings and allowlisted files. | [`docs/doctor.md`](docs/doctor.md) |
@@ -73,9 +73,11 @@ setup.sh                   Idempotent bootstrap; refuses to overwrite real node 
 | `CCC_STATE_DIR` | `$CCC_CLAUDE_DIR/state` | Local node state and memory index |
 | `CCC_MEMORY_PROFILE` | `honcho` | Memory profile: `honcho`, `hybrid`, or `max-perf` |
 | `CCC_MEMORY_CACHE_DIR` | `$CCC_CLAUDE_DIR/hooks/cache` | Wiki/Honcho cache metadata |
-| `CCC_NODE_ISOLATION_PROFILE` | `fleet` | Set `external` for a non-bypassable external-node Family-resource guard |
+| `CCC_NODE_ISOLATION_PROFILE` | `fleet` | `external` forces Family Wiki memory off (injection/refresh/index/distill queue). This is a memory-source gate, not an execution boundary — the node has no PreToolUse policy hook (removed, TM-1306); see [`docs/service-control.md`](docs/service-control.md) for the real enforcement split |
 | `CCC_WIKI_MEMORY_ENABLED` | `1` | Set `0` to disable Wiki injection, refresh, indexing, and distill queue writes |
 | `CCC_MEMORY_USER_LABEL` / `CCC_MEMORY_ASSISTANT_LABEL` | fleet-compatible labels | Node-local relationship labels for injection/distill |
+| `CCC_CODEX_MEMORY_LOADER` | auto | Codex: explicit trusted memory-loader path (always wins over automatic selection); see [`docs/memory.md`](docs/memory.md) |
+| `CCC_CODEX_SKILL_COLLECTOR` | `1` | Codex-only skill-candidate collection; set `false` to opt out. See [`docs/skill-autosave.md`](docs/skill-autosave.md) |
 
 More memory-specific variables live in [`docs/memory.md`](docs/memory.md).
 
