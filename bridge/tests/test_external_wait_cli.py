@@ -16,9 +16,23 @@ import pytest
 from telegram_bot.core import external_wait_cli
 from telegram_bot.core.external_wait import (
     ExternalWaitRegistry,
+    ExternalWaitValidationError,
     default_registry_path,
     publish_active_turn,
 )
+
+
+_REAL_RESOLVE = external_wait_cli.resolve_full_head_sha
+
+
+@pytest.fixture(autouse=True)
+def _stub_sha_resolution(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep ``gh`` out of unit tests: expand short SHAs deterministically."""
+
+    def _fake(repo: str, head_sha: str) -> str:
+        return head_sha if len(head_sha) == 40 else head_sha.ljust(40, "0")
+
+    monkeypatch.setattr(external_wait_cli, "resolve_full_head_sha", _fake)
 
 
 @pytest.fixture
@@ -79,6 +93,55 @@ def test_register_is_idempotent_for_the_same_natural_key(
         (lambda rc: capsys.readouterr().out.strip())(external_wait_cli.main(_register_args()))
     )
     assert first["wait_id"] == second["wait_id"]
+
+
+def test_register_normalizes_a_short_sha_to_the_full_head(
+    home: Path, capsys: pytest.CaptureFixture
+) -> None:
+    _publish(home)
+
+    rc = external_wait_cli.main(_register_args(head_sha="a8ac2475"))
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out.strip())
+    # Regression (#961/#949): a short SHA must never be stored as-is — the
+    # monitor compares against GitHub's 40-char headRefOid with exact
+    # equality, so a raw short SHA supersedes on the first poll and the
+    # "CI finishes -> auto-resume" promise is silently dropped.
+    assert len(payload["head_sha"]) == 40
+    record = ExternalWaitRegistry(default_registry_path(home)).get(payload["wait_id"])
+    assert record["head_sha"] == payload["head_sha"]
+    assert record["head_sha"].startswith("a8ac2475")
+
+
+def test_register_fails_closed_when_the_short_sha_does_not_resolve(
+    home: Path, capsys: pytest.CaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _publish(home)
+
+    def _unresolvable(repo: str, head_sha: str) -> str:
+        raise ExternalWaitValidationError("short head SHA does not resolve to a commit")
+
+    monkeypatch.setattr(external_wait_cli, "resolve_full_head_sha", _unresolvable)
+
+    rc = external_wait_cli.main(_register_args(head_sha="deadbeef"))
+
+    assert rc == 2
+    payload = json.loads(capsys.readouterr().out.strip())
+    assert payload["ok"] is False
+    assert payload["code"] == "validation"
+    # The honest failure must not leave a watch that can never fire.
+    assert ExternalWaitRegistry(default_registry_path(home)).records() == []
+
+
+def test_full_sha_passes_through_without_gh(monkeypatch: pytest.MonkeyPatch) -> None:
+    full = "a8ac2475" * 5
+
+    def _boom(*args, **kwargs):
+        raise AssertionError("gh must not run for an already-full SHA")
+
+    monkeypatch.setattr(external_wait_cli.subprocess, "run", _boom)
+    assert _REAL_RESOLVE("jinwon-int/ccc-node", full) == full
 
 
 def test_register_fails_closed_without_an_active_route(
