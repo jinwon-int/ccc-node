@@ -14,7 +14,7 @@ import stat
 import tempfile
 from typing import Final, Literal
 
-from .codex_exec_backend import DISTILL_EXTRACTION_PROMPT
+from .codex_exec_backend import _DEFAULT_SCHEMA, DISTILL_EXTRACTION_PROMPT
 from .distill_extraction import (
     MAX_EXTRACTION_JSON_BYTES,
     DistillExtractionInput,
@@ -25,6 +25,7 @@ from .distill_extraction import (
 
 _DEFAULT_PATH = "/usr/local/bin:/usr/bin:/bin"
 _MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,127}$")
+_MAX_SCHEMA_BYTES = 256 * 1024
 _MAX_TIMEOUT_SECONDS = 10 * 60.0
 _PROVIDER_DEFAULT_MODEL = "provider-default"
 
@@ -153,11 +154,62 @@ def _minimal_environment(
     return environment
 
 
+def _load_schema_text(path: Path) -> str:
+    """Read the output schema with the same safety bar as the Codex path."""
+
+    try:
+        candidate = path.expanduser().absolute()
+        metadata = candidate.lstat()
+    except OSError:
+        raise RuntimeDistillBackendError("distill_schema_unsafe") from None
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_nlink != 1
+        or metadata.st_uid not in {0, os.geteuid()}
+        or stat.S_IMODE(metadata.st_mode) & 0o022
+        or metadata.st_size <= 0
+        or metadata.st_size > _MAX_SCHEMA_BYTES
+    ):
+        raise RuntimeDistillBackendError("distill_schema_unsafe")
+    try:
+        return candidate.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        raise RuntimeDistillBackendError("distill_schema_unsafe") from None
+
+
+def _strip_markdown_fence(payload: bytes) -> bytes:
+    """Unwrap one ```json fence; anything else stays strict-parse bound.
+
+    Real CLI extractors intermittently wrap valid contract JSON in markdown
+    fences despite the prompt contract. The legacy hook distiller stripped
+    them as a safety net; only a single, well-formed fence around an object
+    literal is removed here — every other byte pattern still reaches the
+    strict parser unchanged.
+    """
+
+    try:
+        text = payload.decode("utf-8")
+    except UnicodeDecodeError:
+        return payload
+    stripped = text.strip()
+    if not stripped.startswith("```"):
+        return payload
+    lines = stripped.splitlines()
+    if len(lines) < 3 or lines[-1].strip() != "```":
+        return payload
+    inner = "\n".join(lines[1:-1]).strip()
+    if not inner.startswith("{"):
+        return payload
+    return inner.encode("utf-8")
+
+
 def _command(
     provider: Literal["claude", "piri"],
     executable: str,
     model: str,
+    schema_text: str,
 ) -> tuple[str, ...]:
+    prompt = DISTILL_EXTRACTION_PROMPT + " The output JSON schema is:\n" + schema_text
     if provider == "claude":
         arguments = [
             executable,
@@ -173,7 +225,7 @@ def _command(
             "--output-format",
             "text",
             "--append-system-prompt",
-            DISTILL_EXTRACTION_PROMPT,
+            prompt,
         ]
     else:
         arguments = [
@@ -189,7 +241,7 @@ def _command(
             "--no-context-files",
             "--no-approve",
             "--system-prompt",
-            DISTILL_EXTRACTION_PROMPT,
+            prompt,
         ]
     if model != _PROVIDER_DEFAULT_MODEL:
         arguments.extend(("--model", model))
@@ -280,6 +332,7 @@ class RuntimeCliDistillBackend:
         max_output_bytes: int = MAX_EXTRACTION_JSON_BYTES,
         environment: Mapping[str, str] | None = None,
         temp_root: str | Path | None = None,
+        schema_path: str | Path = _DEFAULT_SCHEMA,
     ) -> None:
         if (
             provider not in {"claude", "piri"}
@@ -304,13 +357,13 @@ class RuntimeCliDistillBackend:
         self._max_output_bytes = max_output_bytes
         self._environment = dict(os.environ if environment is None else environment)
         self._temp_root = Path(temp_root) if temp_root is not None else None
+        self._schema_path = Path(schema_path)
 
-    async def extract(
-        self, extraction_input: DistillExtractionInput
-    ) -> DistillExtractionOutput:
+    async def extract(self, extraction_input: DistillExtractionInput) -> DistillExtractionOutput:
         if not isinstance(extraction_input, DistillExtractionInput):
             raise RuntimeDistillBackendError("distill_input_invalid")
         executable = _resolve_executable(self._executable, self._environment)
+        schema_text = _load_schema_text(self._schema_path)
         stdin_bytes = canonical_extraction_input_bytes(extraction_input)
         try:
             with tempfile.TemporaryDirectory(
@@ -327,7 +380,7 @@ class RuntimeCliDistillBackend:
                 )
                 try:
                     process = await asyncio.create_subprocess_exec(
-                        *_command(self.provider, executable, self._model),
+                        *_command(self.provider, executable, self._model, schema_text),
                         stdin=asyncio.subprocess.PIPE,
                         stdout=descriptor,
                         stderr=asyncio.subprocess.DEVNULL,
@@ -362,7 +415,9 @@ class RuntimeCliDistillBackend:
                     raise RuntimeDistillBackendError(
                         "distill_nonzero_exit", exit_status=process.returncode
                     )
-                payload = _read_output(output, self._max_output_bytes)
+                payload = _strip_markdown_fence(
+                    _read_output(output, self._max_output_bytes)
+                )
         except RuntimeDistillBackendError:
             raise
         except OSError:
