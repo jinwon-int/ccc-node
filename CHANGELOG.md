@@ -1236,3 +1236,7 @@ First versioned/packaged release. Installable as a Claude Code **plugin** (`/plu
 ### Notes
 - **Node-local memory bootstrap** (SessionStart/PostCompact memory injection, working-state checkpoint) stays in `setup.sh` — it is inherently node-specific and not part of the portable plugin.
 - Two install paths coexist: plugin (portable surface) + `setup.sh` (memory bootstrap + node templates).
+- `scripts/bridge-watchdog.sh` serializes its down-detect → start critical
+  section on an exclusive flock (#970). A dependency build longer than one
+  tick no longer accumulates concurrent `start.sh`/`dependency_bootstrap`
+  runs (cargo "Text file busy"); a tick that finds a start in flight skips.
