@@ -5,6 +5,13 @@ All notable changes to the Claude Code node harness. Dates are KST.
 ## [Unreleased]
 
 ### Added
+- Session-close nunchi kick for audience-scoped Piri nodes. When a distill
+  local-sink job lands, the bridge now fires one detached, body-free scoped
+  `piri-feed.sh` run for that route, so the just-closed session reaches the
+  scope's nunchi DB/snapshot before the next session starts instead of
+  waiting for the 10-minute cron. The cron dispatcher stays the owner of
+  record; feed-side flock and seen-file keep overlap idempotent, the kick
+  never changes job state, and an absent/unsafe feed path skips silently.
 - Audience-scoped Piri/Nunchi/MemPalace collection and recall (#950). The
   bridge now supplies one canonical Nunchi DB/snapshot and isolated MemPalace
   HOME per opaque memory audience. Private recall is private + shared +

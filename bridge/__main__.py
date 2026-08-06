@@ -309,6 +309,13 @@ def build_context(
                 Path(settings.codex_memory_materializer_path).expanduser().parent
                 / "ccc-memory-index.sh"
             ),
+            nunchi_feed_path=(
+                Path(settings.codex_memory_materializer_path).expanduser().parent
+                / "nunchi"
+                / "piri-feed.sh"
+                if settings.agent_provider == "piri"
+                else None
+            ),
         )
         from telegram_bot.memory.promotion import CodexMemoryPromoter
 
