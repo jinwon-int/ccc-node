@@ -38,7 +38,8 @@ rather than composing the steps ad hoc.
   pressure at 2am. An agent can trigger the whole audited pipeline but cannot
   compose its steps differently.
 - The **blast radius** is bounded by `~/.claude/self-update.services` (one
-  systemd unit per line, `#` comments). This file is operator-owned — the agent
+  `[user:|system:]unit` per line, `#` comments; omitted scope means `system`).
+  This file is operator-owned — the agent
   must not edit it — so only the operator decides which units the procedure may
   ever restart.
 - Direct `systemctl restart|start|reload|stop|kill <broker|gateway|worker|…>` is
@@ -51,9 +52,9 @@ rather than composing the steps ad hoc.
 ```bash
 # after git pull && ./setup.sh — write the allowlist YOURSELF (agents cannot):
 cat > ~/.claude/self-update.services <<'EOF'
-hermes-broker
-a2a-worker
-ccc-telegram-bridge
+system:hermes-broker
+system:a2a-worker
+user:ccc-telegram-bridge.service
 EOF
 ```
 

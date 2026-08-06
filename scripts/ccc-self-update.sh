@@ -9,7 +9,7 @@
 # radius stays operator-controlled because the ONLY services it will ever touch
 # are the ones listed in an operator-owned allowlist file the agent must not
 # write:
-#   ~/.claude/self-update.services   (one systemd unit name per line, # comments)
+#   ~/.claude/self-update.services   ([user:|system:]unit per line, # comments)
 #   ~/.claude/self-update.repo       (optional: absolute repo path override)
 #
 # Procedure (run):
@@ -174,6 +174,10 @@ bridge_service_allowlisted() {
   while IFS= read -r svc; do
     svc="${svc%%#*}"
     svc="$(printf '%s' "$svc" | tr -d '[:space:]')"
+    case "$svc" in
+      user:*) svc="${svc#user:}" ;;
+      system:*) svc="${svc#system:}" ;;
+    esac
     case "$svc" in
       ccc-telegram-bridge|ccc-telegram-bridge.service) return 0 ;;
     esac
@@ -404,7 +408,12 @@ if [ -f "$SERVICES_FILE" ]; then
   while IFS= read -r svc; do
     svc="${svc%%#*}"; svc="$(printf '%s' "$svc" | tr -d '[:space:]')"
     [ -n "$svc" ] || continue
-    if ! printf '%s' "$svc" | grep -Eq '^[A-Za-z0-9@._:-]+$'; then
+    scope=system
+    case "$svc" in
+      user:*) scope=user; svc="${svc#user:}" ;;
+      system:*) svc="${svc#system:}" ;;
+    esac
+    if [ -z "$svc" ] || ! printf '%s' "$svc" | grep -Eq '^[A-Za-z0-9@._:-]+$'; then
       log "service skipped reason=invalid-name name=$svc"
       continue
     fi
@@ -412,20 +421,22 @@ if [ -f "$SERVICES_FILE" ]; then
     attempt=0
     while [ "$attempt" -lt 2 ]; do
       attempt=$((attempt + 1))
-      if "$SYSTEMCTL" restart "$svc" >>"$LOG" 2>&1; then
+      systemctl_scope_args=()
+      [ "$scope" = user ] && systemctl_scope_args+=(--user)
+      if "$SYSTEMCTL" "${systemctl_scope_args[@]}" restart "$svc" >>"$LOG" 2>&1; then
         ok=true
         i=0
-        until "$SYSTEMCTL" is-active --quiet "$svc" 2>/dev/null; do
+        until "$SYSTEMCTL" "${systemctl_scope_args[@]}" is-active --quiet "$svc" 2>/dev/null; do
           i=$((i + 1)); [ "$i" -ge 10 ] && { ok=false; break; }
           sleep 1
         done
       fi
       [ "$ok" = "true" ] && break
-      [ "$attempt" -lt 2 ] && log "service retry name=$svc attempt=$attempt"
+      [ "$attempt" -lt 2 ] && log "service retry name=$svc attempt=$attempt scope=$scope"
     done
     [ "$ok" = "true" ] && RESTARTED=$((RESTARTED + 1)) || FAILED=$((FAILED + 1))
-    SERVICES_JSON="$(printf '%s' "$SERVICES_JSON" | jq -c --arg n "$svc" --argjson ok "$ok" '. + [{name:$n, ok:$ok}]')"
-    log "service name=$svc ok=$ok"
+    SERVICES_JSON="$(printf '%s' "$SERVICES_JSON" | jq -c --arg n "$svc" --arg s "$scope" --argjson ok "$ok" '. + [{name:$n, ok:$ok, scope:$s}]')"
+    log "service name=$svc ok=$ok scope=$scope"
   done < "$SERVICES_FILE"
 else
   log "restart skipped reason=no-services-file path=$SERVICES_FILE"
