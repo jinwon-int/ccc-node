@@ -34,7 +34,10 @@ from telegram_bot.memory.distill_types import (
     CodexTranscriptSnapshot,
     TranscriptBounds,
 )
-from telegram_bot.memory.piri_snapshot import read_piri_snapshot
+from telegram_bot.memory.piri_snapshot import (
+    find_piri_session_directory,
+    read_piri_snapshot,
+)
 from telegram_bot.utils.secure_fs import ensure_private_directory
 
 
@@ -400,6 +403,12 @@ class PiriRuntime:
         else:
             session_directory = self._session_directories.get(session_id)
         if session_directory is None:
+            # Unscoped fallback: sessions launched without a memory route (or
+            # before a bridge restart dropped the in-memory map) still store
+            # transcripts under the default Piri sessions root. Locate the
+            # holding directory read-only instead of failing the distill job.
+            session_directory = await asyncio.to_thread(self._default_session_directory, session_id)
+        if session_directory is None:
             raise ValueError("Piri snapshot session route is unavailable")
         return await asyncio.to_thread(
             read_piri_snapshot,
@@ -407,6 +416,26 @@ class PiriRuntime:
             session_id,
             bounds=bounds,
         )
+
+    def _default_session_directory(self, session_id: str) -> Path | None:
+        """Resolve the default unscoped sessions root and scan it read-only."""
+
+        environment = self._process_environment
+        session_root = environment.get("PIRI_CODING_AGENT_SESSION_DIR")
+        if isinstance(session_root, str) and session_root:
+            root = Path(session_root)
+        else:
+            agent_dir = environment.get("PIRI_CODING_AGENT_DIR")
+            if isinstance(agent_dir, str) and agent_dir:
+                root = Path(agent_dir) / "sessions"
+            else:
+                home = environment.get("HOME")
+                base = Path(home) if isinstance(home, str) and home else Path.home()
+                root = base / ".piri" / "agent" / "sessions"
+        try:
+            return find_piri_session_directory(root, session_id)
+        except OSError:
+            return None
 
     async def list_models(self) -> Sequence[ModelInfo]:
         config = PiriLaunchConfig(
