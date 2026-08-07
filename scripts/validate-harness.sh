@@ -105,7 +105,7 @@ fi
 # 1b-1) Wiki log IDs are node/date scoped. The old global max+1 guidance caused
 # concurrent fleet writers to allocate duplicate LOG-NNNN identifiers.
 say "== Wiki LOG namespace policy =="
-WIKI_RULE_FILES=(claude/skills/wiki-record/SKILL.md claude/commands/wiki-log.md \
+WIKI_RULE_FILES=(skills/shared/wiki-record/SKILL.md claude/commands/wiki-log.md \
                  claude/hooks/tools-cheatsheet.md hermes/memories/MEMORY.template.md)
 for f in "${WIKI_RULE_FILES[@]}"; do
   grep -q 'LOG-YYYYMMDD-<node>-' "$f" \
@@ -135,7 +135,7 @@ if [ -f claude/.claude-plugin/plugin.json ]; then
   [ "$src" = "./claude" ] && say "  ok marketplace source -> ./claude" \
     || err "marketplace plugin source must be \"./claude\" (got: ${src:-<unset>})"
   # default-discovery dirs must exist under the plugin root
-  for d in claude/agents claude/commands claude/skills; do
+  for d in claude/agents claude/commands claude/skills skills/shared; do
     [ -d "$d" ] && say "  ok component dir $d" || err "missing component dir: $d"
   done
 fi
@@ -165,7 +165,7 @@ fi
 
 # 2) shell syntax (bash -n) on hooks, skill helpers, and top-level scripts
 say "== bash -n =="
-mapfile -t SH < <(find claude/hooks claude/skills scripts codex crush -name '*.sh' 2>/dev/null; echo setup.sh; echo claude/mcp-setup.sh; echo claude/headless.sh)
+mapfile -t SH < <(find claude/hooks claude/skills skills/shared scripts codex crush -name '*.sh' 2>/dev/null; echo setup.sh; echo claude/mcp-setup.sh; echo claude/headless.sh)
 for f in "${SH[@]}"; do
   [ -f "$f" ] || continue
   if bash -n "$f" 2>/dev/null; then say "  ok $f"; else err "bash -n: $f"; fi
@@ -269,6 +269,7 @@ for t in claude/hooks/observability.test.sh claude/hooks/security-scan.test.sh \
          claude/hooks/distill/local-facts.test.sh claude/hooks/memory-hooks.test.sh \
          claude/hooks/refresh-memory-freshness.test.sh \
          claude/hooks/nunchi/nunchi.test.sh claude/hooks/nunchi/bench.test.sh \
+         claude/hooks/nunchi/bridge-journal.test.sh \
          scripts/ccc-doctor.test.sh scripts/ccc-memory.test.sh scripts/ccc-codex-memory.test.sh scripts/ccc-codex.test.sh scripts/ccc-piri.test.sh piri/skills/web/web_tools.test.sh scripts/ccc-codex-github-policy.test.sh scripts/ccc-distill-check.test.sh scripts/ccc-security-audit.test.sh \
          scripts/ccc-fleet-matrix.test.sh scripts/ccc-wiki-triage.test.sh scripts/setup.test.sh \
          scripts/harness-paths.test.sh scripts/canonical-paths.test.sh \
@@ -322,7 +323,7 @@ fm_check() { # <file>
   awk 'NR>1 && /^---/{exit} {print}' "$f" | grep -q '^name:'        || err "no name: in $f"
   awk 'NR>1 && /^---/{exit} {print}' "$f" | grep -q '^description:' || err "no description: in $f"
 }
-for f in claude/skills/*/SKILL.md; do [ -f "$f" ] && fm_check "$f" && say "  ok $f"; done
+for f in claude/skills/*/SKILL.md skills/shared/*/SKILL.md; do [ -f "$f" ] && fm_check "$f" && say "  ok $f"; done
 for f in codex/skills/*/SKILL.md; do [ -f "$f" ] && fm_check "$f" && say "  ok $f"; done
 for f in claude/agents/*.md;      do [ -f "$f" ] && fm_check "$f" && say "  ok $f"; done
 # A2A subagent cost-tier metadata (#54): advisory only; no hard-coded model routing.

@@ -35,6 +35,7 @@ _FORBIDDEN_CODEX_REFERENCES = (
 _ASSET_ROOTS = (
     "claude/commands",
     "claude/skills",
+    "skills/shared",
     "claude/agents",
     "claude/hooks",
 )
@@ -178,7 +179,7 @@ def _classification_rules(raw_rules: object) -> list[dict[str, str]]:
         compatibility = value.get("compatibility")
         if (
             not isinstance(pattern, str)
-            or not pattern.startswith("claude/")
+            or not pattern.startswith(("claude/", "skills/shared/"))
             or compatibility
             not in {"shared", "adapted", "claude-only", "codex-only", "unsupported"}
         ):
@@ -216,7 +217,7 @@ def _managed_skill_entries(
             or not _NAME_RE.fullmatch(name)
             or name in seen
             or not isinstance(source_raw, str)
-            or source_raw != f"codex/skills/{name}"
+            or source_raw not in (f"codex/skills/{name}", f"skills/shared/{name}")
         ):
             raise ContractError("catalog_invalid")
         source = repo / source_raw

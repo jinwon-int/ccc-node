@@ -235,6 +235,31 @@ ok "setup self-update task registration is idempotent" \
   '[ "$(jq '\''[.tasks[] | select(.id == "self-update")] | length'\'' "$rewrite_agent_cron")" = 1 ]'
 ok "setup installs the Piri web skill when a Piri agent dir exists" \
   '[ -f "$TMP/rewrite-home/.piri/agent/skills/web/SKILL.md" ] && [ -x "$TMP/rewrite-home/.piri/agent/skills/web/web_search.py" ] && [ -x "$TMP/rewrite-home/.piri/agent/skills/web/web_fetch.py" ] && cmp -s "$ROOT/piri/skills/web/web_search.py" "$TMP/rewrite-home/.piri/agent/skills/web/web_search.py"'
+# Repo skills install as refreshed copies from the claude + shared trees, with
+# a manifest-driven prune for skills the repo no longer ships. Real dirs only
+# — the managed-artifact guard refuses symlinks by design (harness_paths.py).
+legacy_home="$TMP/legacy-home"
+legacy_claude="$legacy_home/.claude"
+mkdir -p "$legacy_claude/skills/wiki-record" "$legacy_claude/skills/node-local-only" \
+  "$legacy_claude/skills/ghost-skill" "$legacy_claude/skills/edited-skill" "$legacy_claude/state"
+printf 'stale copy\n' > "$legacy_claude/skills/wiki-record/SKILL.md"
+printf 'node-local\n' > "$legacy_claude/skills/node-local-only/SKILL.md"
+printf 'ghost\n' > "$legacy_claude/skills/ghost-skill/SKILL.md"
+printf 'edited\n' > "$legacy_claude/skills/edited-skill/SKILL.md"
+ghost_hash="$(cd "$legacy_claude/skills/ghost-skill" && find . -type f -exec sha256sum {} + | sort -k2 | sha256sum | awk '{print $1}')"
+printf 'ghost-skill %s\nedited-skill %s\n' "$ghost_hash" "deadbeef" > "$legacy_claude/state/repo-skills.manifest"
+HOME="$legacy_home" CCC_CLAUDE_DIR="$legacy_claude" CCC_HERMES_DIR="$legacy_home/.hermes" \
+  bash "$SETUP" --no-backup >/dev/null 2>&1
+ok "setup refreshes repo skill copies from the claude + shared trees" \
+  'cmp -s "$legacy_claude/skills/wiki-record/SKILL.md" "$ROOT/skills/shared/wiki-record/SKILL.md" && [ ! -L "$legacy_claude/skills/wiki-record" ] && [ -f "$legacy_claude/skills/gh-pr-flow/SKILL.md" ] && ! grep -q "stale copy" "$legacy_claude/skills/wiki-record/SKILL.md"'
+ok "setup prunes repo-removed skills when the copy is unmodified" \
+  '[ ! -e "$legacy_claude/skills/ghost-skill" ]'
+ok "setup keeps repo-removed skills the node edited locally" \
+  '[ -f "$legacy_claude/skills/edited-skill/SKILL.md" ]'
+ok "setup leaves node-local skills untouched" \
+  'grep -q "node-local" "$legacy_claude/skills/node-local-only/SKILL.md"'
+ok "setup records the installed skill set in the manifest" \
+  'grep -q "^wiki-record " "$legacy_claude/state/repo-skills.manifest" && grep -q "^gh-pr-flow " "$legacy_claude/state/repo-skills.manifest"'
 # Slash commands invoke repo scripts verbatim; installed copies must point at
 # THIS checkout, not the canonical /opt/ccc-node (broken on e.g. /root/ccc-node
 # nodes). Repo templates stay canonical — only installed copies are rewritten.

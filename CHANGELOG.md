@@ -4,6 +4,20 @@ All notable changes to the Claude Code node harness. Dates are KST.
 
 ## [Unreleased]
 
+### Changed
+- Codex skill dedup and gh-pr-flow path cleanup (TM-2331 follow-ups). The
+  zero/low-drift Codex ports `gh-ci-wait` and `fleet-disk-constraint-triage`
+  are deleted from `codex/skills/` and now provision straight from
+  `skills/shared/` — the collector's managed-skill contract accepts
+  `skills/shared/<name>` sources, and the shared skills carry the Codex
+  `agents/openai.yaml` interface recovered from the deleted ports. The
+  shared fleet-disk text no longer names a runtime-specific Wiki skill.
+  `ccc-wiki-record` stays a genuine adapted port (distinct name and prose),
+  documented in docs/codex-managed-skills.md. `gh-pr-flow` helper paths
+  resolve via `GH_PR_FLOW_DIR` (installed copy → template checkout
+  fallback) instead of a hardcoded `~/.claude` path, so the skill text is
+  correct under `CCC_CLAUDE_DIR` overrides and stale installs.
+
 ### Fixed
 - Memory distill: `CCC_MEMORY_ASSISTANT_LABEL`'s built-in default was
   hardcoded to `"dungae, a Hermes Team2 worker"` in three places
@@ -18,6 +32,19 @@ All notable changes to the Claude Code node harness. Dates are KST.
   silently misattribute to another node when it's unset.
 
 ### Changed
+- Repo skills now live in two trees and install as refreshed, near-atomic
+  copies. `skills/shared/` holds runtime-agnostic skills (wiki-record,
+  gh-ci-wait, fleet-disk-constraint-triage, debug-long-running-agent-tasks,
+  moved out of `claude/skills/`, which keeps harness-coupled ones); the codex
+  compatibility catalog and the collector's asset roots follow the move.
+  setup.sh replaces the overlay `cp -r` with a per-skill stage+rename refresh
+  plus a manifest (`state/repo-skills.manifest`): skills the repo no longer
+  ships are pruned when the installed copy is unmodified, kept with a warning
+  when the node edited it, and node-local skills are never touched. Copies
+  stay real dirs — the managed-artifact guard refuses symlinks in managed
+  paths by design, so freshness comes from self-update running setup.sh
+  (2026-08-07 gongmyoung's stale gh-pr-flow was a dead-updater drift, not a
+  copy-format flaw). Supersedes the fleet-skills repo plan (Wiki TM-2331).
 - SessionStart audience search is parallel under one global budget (#897 step
   2). The local/recent/shared/legacy lanes used to run serially (3+1+3+2s,
   up to ~9s of the 15s hook budget); they now run concurrently with a global
