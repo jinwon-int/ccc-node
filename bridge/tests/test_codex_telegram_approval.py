@@ -64,9 +64,17 @@ def approval_event() -> ApprovalRequestEvent:
     )
 
 
+# Only the expiry tests care about the approval deadline, and they pass
+# `timeout=` explicitly. Everything else just needs a deadline that cannot fire
+# mid-test: the old 0.2s default was shorter than CI scheduling jitter, so a
+# loaded runner expired a still-valid approval and the assertion read as a
+# DENY/ALLOW logic failure (#1032). Keep this far above any plausible pause.
+_NON_EXPIRY_APPROVAL_TIMEOUT = 30.0
+
+
 def _subject(
     *,
-    timeout: float = 0.2,
+    timeout: float = _NON_EXPIRY_APPROVAL_TIMEOUT,
     send_error=None,
     edit_error=None,
     bash_policy: str = "approve-each",
