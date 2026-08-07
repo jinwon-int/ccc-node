@@ -22,6 +22,12 @@ All notable changes to the Claude Code node harness. Dates are KST.
   `sonnet`.
 
 ### Fixed
+- Dependabot pip updates now cover the CI lock directory too. The pip entry
+  scanned only `/bridge`, so each bump edited `bridge/requirements.lock.txt`
+  without its pair `.github/requirements/bridge-ci.txt` and failed the #349
+  drift test (the tqdm/openai/cffi PRs each needed a manual sync commit).
+  The update config now lists both directories so one bump PR carries the
+  pair, and the drift assertion message names the remediation.
 - Docs: `CCC_NODE_ISOLATION_PROFILE=external` is now described as what it is
   — a memory-source gate that forces Family Wiki paths off — not a
   "non-bypassable PreToolUse guard" (that hook was removed, TM-1306), with

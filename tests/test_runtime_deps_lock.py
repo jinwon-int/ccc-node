@@ -96,7 +96,12 @@ def test_runtime_lock_is_version_consistent_subset_of_ci_lock():
         for name, version in runtime.items()
         if ci.get(name) != version
     }
-    assert not drift, f"runtime lock drifted from CI lock: {drift}"
+    assert not drift, (
+        f"runtime lock drifted from CI lock: {drift}; the two locks are one "
+        f"pair (#349) — regenerate both with scripts/ccc-deps-lock.sh, or sync "
+        f"the pin+hash block into .github/requirements/bridge-ci.txt "
+        f"(Dependabot covers both via the multi-directory pip config)"
+    )
 
 
 def test_runtime_lock_covers_all_pyproject_runtime_dependencies():
