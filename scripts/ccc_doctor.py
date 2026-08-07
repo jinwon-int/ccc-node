@@ -45,6 +45,22 @@ HOOK_FILES_FALLBACK = [
 HOOK_TREE_SKIP_NAMES = {"test-stub.sh", "hooks.json", "enforcement-overlay.json"}
 HOOK_TREE_SKIP_SUFFIXES = (".test.sh", ".pyc", ".md")
 OUTPUT_STYLE_FILES = ["output-styles/ccc-report.md"]
+# setup.sh installs four trees; doctor used to watch two, so a stale skill,
+# agent or slash command was invisible to both /doctor and self-update's
+# check.sh (#1037). These three are detection-only: the --fix repair path
+# refuses anything outside hooks/output-styles, and repairing them correctly
+# needs setup.sh's per-skill staging and manifest prune.
+#
+# Each tree is installed differently, and the rules are mirrored here rather
+# than guessed:
+#   commands/  plain `cp claude/commands/*.md` — top level only.
+#   agents/    top-level *.md; the a2a-* worker roster is role-gated, so it is
+#              only expected when this node opted in (CCC_A2A_ROLE=worker or
+#              the persisted ~/.claude/a2a-role marker).
+#   skills/    per-skill directory trees from TWO repo roots. Skills whose name
+#              is not in the repo set (node-local, autosave) are never touched
+#              by setup.sh and must never be reported here.
+SKILL_SOURCE_ROOTS = ("claude/skills", "skills/shared")
 VALID_SCOPES = {"settings", "files", "hooks", "output-styles", "all"}
 CODEX_PROBE_TIMEOUT_SECONDS = 5.0
 CODEX_PROBE_TIMEOUT_MAX_SECONDS = 10.0
@@ -195,6 +211,66 @@ class Doctor:
             out.append(f"hooks/{path.relative_to(root).as_posix()}")
         return sorted(out) or list(HOOK_FILES_FALLBACK)
 
+    def a2a_role(self) -> str:
+        """This node's opted-in A2A role, as setup.sh resolves it."""
+        env = os.environ.get("CCC_A2A_ROLE", "").strip()
+        if env:
+            return env
+        marker = self.claude_dir / "a2a-role"
+        try:
+            return marker.read_text(encoding="utf-8").strip()
+        except (OSError, UnicodeDecodeError):
+            return ""
+
+    def managed_tree_files(self) -> list[tuple[Path, str]]:
+        """(repo source, installed relative path) for commands/agents/skills.
+
+        Mirrors setup.sh's install rules so that what setup deploys is what
+        doctor watches. Returns pairs rather than relative strings because the
+        skills tree is sourced from two repo roots, only one of which lives
+        under claude/.
+        """
+        out: list[tuple[Path, str]] = []
+
+        # Plain `cp` into the harness root. settings.json is deliberately absent:
+        # setup composes it from base + overlay, so it has its own JSON-semantic
+        # checks above rather than a file comparison, and settings.local.json is
+        # node-local (seeded only when missing).
+        headless = self.repo / "claude" / "headless.sh"
+        if headless.is_file():
+            out.append((headless, "headless.sh"))
+
+        commands_root = self.repo / "claude" / "commands"
+        if commands_root.is_dir():
+            for path in sorted(commands_root.glob("*.md")):
+                if path.is_file():
+                    out.append((path, f"commands/{path.name}"))
+
+        agents_root = self.repo / "claude" / "agents"
+        if agents_root.is_dir():
+            worker = self.a2a_role() == "worker"
+            for path in sorted(agents_root.glob("*.md")):
+                if not path.is_file():
+                    continue
+                # The roster is deliberately absent on broker/unconfigured
+                # nodes; reporting it missing there would be a false alarm.
+                if path.name.startswith("a2a-") and not worker:
+                    continue
+                out.append((path, f"agents/{path.name}"))
+
+        for root_rel in SKILL_SOURCE_ROOTS:
+            root = self.repo / root_rel
+            if not root.is_dir():
+                continue
+            for skill_dir in sorted(p for p in root.iterdir() if p.is_dir()):
+                for path in sorted(skill_dir.rglob("*")):
+                    if not path.is_file() or "__pycache__" in path.parts:
+                        continue
+                    rel_in_skill = path.relative_to(skill_dir).as_posix()
+                    out.append((path, f"skills/{skill_dir.name}/{rel_in_skill}"))
+
+        return out
+
     def scope_has(self, want: str) -> bool:
         parts = set(self.scope.split(","))
         if want == "settings":
@@ -317,6 +393,17 @@ class Doctor:
                 self.add("교정가능", rel, "missing", "run ccc-doctor --fix --apply --scope=files after backup to reinstall output styles")
             elif src.is_file() and not self.installed_matches_source(src, dst):
                 self.add("교정가능", rel, "drifted", "run ccc-doctor --fix --apply --scope=files after backup to reinstall output styles")
+            else:
+                self.add("정상", rel, "installed", "none")
+
+        # Detection only: --fix --apply --scope=files refuses these paths, and
+        # a correct reinstall needs setup.sh's staging/manifest handling.
+        for src, rel in self.managed_tree_files():
+            dst = self.claude_dir / rel
+            if not dst.is_file():
+                self.add("교정가능", rel, "missing", "run setup.sh to install managed skills/agents/commands")
+            elif not self.installed_matches_source(src, dst):
+                self.add("교정가능", rel, "drifted", "run setup.sh to reinstall managed skills/agents/commands")
             else:
                 self.add("정상", rel, "installed", "none")
 
