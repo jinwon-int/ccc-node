@@ -530,32 +530,78 @@ fi
 # Slash commands (quick prompt templates: /node-status, /a2a-claim, /wiki-log) — node-agnostic
 run mkdir -p "$CLAUDE_DIR/commands"
 run cp "$SRC/claude/commands/"*.md "$CLAUDE_DIR/commands/"
-# Custom skills (reusable procedures: wiki-record, mcp-add, skillsuggest, ...) — node-agnostic
-run mkdir -p "$CLAUDE_DIR/skills"
-run cp -r "$SRC/claude/skills/." "$CLAUDE_DIR/skills/"
-skill_sources=("$SRC"/claude/skills/*/*.sh)
-skill_targets=()
-for skill_source in "${skill_sources[@]}"; do
-  [ -e "$skill_source" ] || continue
-  skill_targets+=("$CLAUDE_DIR/skills/${skill_source#"$SRC/claude/skills/"}")
-done
-if [ "${#skill_targets[@]}" -gt 0 ]; then run chmod +x "${skill_targets[@]}"; fi
+# Custom skills (reusable procedures) — refreshed as near-atomic per-skill
+# copies on every setup run (stage + single rename), from two trees:
+# claude/skills (harness-coupled) and skills/shared (runtime-agnostic, Wiki
+# TM-2331 superseded note). Real dirs only by design: the managed-artifact
+# guard (scripts/lib/harness_paths.py) refuses symlinks in managed paths, so
+# skills are never symlinked from the checkout. Freshness comes from
+# self-update running setup.sh — 2026-08-07 gongmyoung drift was a dead
+# updater, not a copy-format flaw. A manifest ($state/repo-skills.manifest)
+# records what we installed: repo-removed skills are pruned when the copy is
+# unmodified, kept with a warning when the node edited it; skills whose names
+# are not in the repo set (node-local/autosave) are never touched.
+skill_tree_hash() { # <dir> — deterministic content hash over file contents
+  (cd "$1" && find . -type f -exec sha256sum {} + | sort -k2 | sha256sum | awk '{print $1}')
+}
+install_repo_skills_into() { # install_repo_skills_into <dest-root> <manifest> <source-root>...
+  local dest_root="$1" manifest="$2"; shift 2
+  local root source name target stage retired current_hash recorded_hash
+  local -a current=()
+  if [ "$DRY" = 1 ]; then
+    note "repo skills: would refresh copies in $dest_root (atomic copy + manifest prune)"
+    return 0
+  fi
+  for root in "$@"; do
+    [ -d "$root" ] || continue
+    for source in "$root"/*/; do
+      [ -d "$source" ] || continue
+      name="$(basename "$source")"
+      target="$dest_root/$name"
+      stage="$dest_root/.stage-$name"
+      run rm -rf "$stage"
+      run cp -r "$source" "$stage"
+      if [ -d "$target" ]; then
+        run rm -rf "$target.prev"
+        run mv "$target" "$target.prev"
+      fi
+      run mv "$stage" "$target"
+      run rm -rf "$target.prev"
+      current+=("$name")
+    done
+  done
+  # Prune repo-removed skills recorded in the manifest; keep node-edited ones.
+  if [ -f "$manifest" ]; then
+    while read -r retired recorded_hash; do
+      [ -n "$retired" ] || continue
+      case " ${current[*]} " in *" $retired "*) continue;; esac
+      [ -d "$dest_root/$retired" ] || continue
+      current_hash="$(skill_tree_hash "$dest_root/$retired")"
+      if [ "$current_hash" = "$recorded_hash" ]; then
+        run rm -rf "$dest_root/$retired"
+        note "pruned repo-removed skill $retired (copy was unmodified)"
+      else
+        note "kept $retired: repo removed it but the installed copy was modified locally"
+      fi
+    done < "$manifest"
+  fi
+  if [ "${#current[@]}" -gt 0 ]; then
+    : > "$manifest.tmp"
+    for name in "${current[@]}"; do
+      printf '%s %s\n' "$name" "$(skill_tree_hash "$dest_root/$name")" >> "$manifest.tmp"
+    done
+    run mv "$manifest.tmp" "$manifest"
+  fi
+}
+run mkdir -p "$CLAUDE_DIR/skills" "$CLAUDE_DIR/state"
+install_repo_skills_into "$CLAUDE_DIR/skills" "$CLAUDE_DIR/state/repo-skills.manifest" "$SRC/claude/skills" "$SRC/skills/shared"
 
 # Piri skills (web search/fetch helpers) — only on nodes that already have a
 # Piri agent dir, so non-Piri nodes stay untouched.
 PIRI_AGENT_DIR="${PIRI_CODING_AGENT_DIR:-$HOME/.piri/agent}"
 if [ -d "$PIRI_AGENT_DIR" ]; then
-  run mkdir -p "$PIRI_AGENT_DIR/skills"
-  run cp -r "$SRC/piri/skills/." "$PIRI_AGENT_DIR/skills/"
-  piri_skill_sources=()
-  while IFS= read -r piri_skill_source; do
-    piri_skill_sources+=("$piri_skill_source")
-  done < <(find "$SRC/piri/skills" -name '*.py' -type f 2>/dev/null)
-  piri_skill_targets=()
-  for piri_skill_source in "${piri_skill_sources[@]}"; do
-    piri_skill_targets+=("$PIRI_AGENT_DIR/skills/${piri_skill_source#"$SRC/piri/skills/"}")
-  done
-  if [ "${#piri_skill_targets[@]}" -gt 0 ]; then run chmod +x "${piri_skill_targets[@]}"; fi
+  run mkdir -p "$PIRI_AGENT_DIR/skills" "$PIRI_AGENT_DIR/state"
+  install_repo_skills_into "$PIRI_AGENT_DIR/skills" "$PIRI_AGENT_DIR/state/repo-skills.manifest" "$SRC/piri/skills"
 fi
 
 # 2) Per-node files — only seed templates if a real one is NOT already present.

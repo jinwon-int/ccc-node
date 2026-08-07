@@ -68,7 +68,7 @@ class CodexManagedSkillsTest(unittest.TestCase):
 
     def copy_repo_surface(self) -> Path:
         repo = self.base / "repo"
-        for relative in ("claude/commands", "claude/skills", "claude/agents", "claude/hooks"):
+        for relative in ("claude/commands", "claude/skills", "skills/shared", "claude/agents", "claude/hooks"):
             source = ROOT / relative
             shutil.copytree(source, repo / relative)
         shutil.copytree(ROOT / "codex", repo / "codex")
