@@ -75,6 +75,34 @@ out="$(payload s10 fact node "20260807 롤아웃을 완료했다" | python3 "$NP
 ok "bare date stamp not misclassified as SHA" 'grep -q "ingested 1/1" <<<"$out"'
 out="$(python3 "$NP" recall "카렐렌" 2>&1)"
 ok "skipped state fact absent from recall" '! grep -q "NRestarts" <<<"$out"'
+# ---- 3c. observation TTL class + review-queue alert (#1010 proposals 2/3) ---
+out="$(payload s11 observation node "TEMP-OBS-7749" | python3 "$NP" ingest - 2>&1)"
+ok "observation kind ingested" 'grep -q "ingested 1/1" <<<"$out"'
+python3 "$NP" snapshot --limit 25 >/dev/null
+ok "observation excluded from snapshot" '! grep -q "TEMP-OBS-7749" "$NUNCHI_SNAPSHOT"'
+out="$(python3 "$NP" recall "TEMP-OBS" 2>&1)"
+ok "observation still searchable via recall" 'grep -q "TEMP-OBS-7749" <<<"$out"'
+python3 - "$NUNCHI_DB" <<'PY'
+import sqlite3, sys
+c = sqlite3.connect(sys.argv[1])
+c.execute("INSERT INTO peer_facts(observer,observed,kind,fact,valid_from,dedup,created_at,source_rank,review)"
+          " VALUES('family-assistant','yukson','observation','OLD-OBS-8861','2020-01-01','obs-old-8861','2020-01-01T00:00:00+00:00',2,0)")
+c.commit()
+PY
+python3 "$NP" snapshot --limit 25 >/dev/null
+closed="$(python3 -c "import sqlite3;print(sqlite3.connect('$NUNCHI_DB').execute(\"SELECT COUNT(*) FROM peer_facts WHERE fact='OLD-OBS-8861' AND valid_to IS NOT NULL\").fetchone()[0])")"
+ok "expired observation auto-closed on snapshot sweep" '[ "$closed" = 1 ]'
+python3 - "$NUNCHI_DB" <<'PY'
+import sqlite3, sys
+c = sqlite3.connect(sys.argv[1])
+c.execute("INSERT INTO peer_facts(observer,observed,kind,fact,valid_from,dedup,created_at,source_rank,review)"
+          " VALUES('family-assistant','yukson','fact','REVIEW-PENDING-5591','2026-08-07','rev-5591','2026-08-07T00:00:00+00:00',1,1)")
+c.commit()
+PY
+out="$(NUNCHI_REVIEW_QUEUE_ALERT=1 python3 "$NP" snapshot --limit 25 2>&1)"
+ok "review queue at threshold escalates wording" 'grep -q "임계치" <<<"$out"'
+out="$(NUNCHI_REVIEW_QUEUE_ALERT=99 python3 "$NP" snapshot --limit 25 2>&1)"
+ok "below threshold keeps plain warning" 'grep -q "⚠ 검토대기" <<<"$out" && ! grep -q "⚠⚠" <<<"$out"'
 
 # ---- 4. recall: observed match + Korean alias query expansion (B3) ---------
 out="$(python3 "$NP" recall "yukson" 2>&1)"

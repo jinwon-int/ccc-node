@@ -49,7 +49,7 @@ import re
 import sqlite3
 import subprocess
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 DB = os.environ.get("NUNCHI_DB", os.path.expanduser("~/.nunchi/facts.db"))
 SNAPSHOT = os.environ.get("NUNCHI_SNAPSHOT", os.path.expanduser("~/.nunchi/snapshot.md"))
@@ -199,6 +199,25 @@ _MUTABLE_OPS = re.compile(
 
 def _is_mutable_ops_fact(text):
     return bool(_MUTABLE_OPS.search(text))
+
+
+# #1010 proposal 2 — volatile `observation` class: searchable via recall but
+# never injected into the snapshot, never G3-flagged, and auto-closed once
+# older than NUNCHI_OBSERVATION_TTL_DAYS (default 7; <=0 disables the sweep).
+_OBSERVATION_TTL_DAYS = float(os.environ.get("NUNCHI_OBSERVATION_TTL_DAYS", "7"))
+
+
+def _close_expired_observations(c):
+    """Sweep: close volatile observations past their TTL. Returns closed count."""
+    if _OBSERVATION_TTL_DAYS <= 0:
+        return 0
+    cutoff = (datetime.now(timezone.utc)
+              - timedelta(days=_OBSERVATION_TTL_DAYS)).isoformat(timespec="seconds")
+    cur = c.execute(
+        "UPDATE peer_facts SET valid_to=?"
+        " WHERE kind='observation' AND valid_to IS NULL AND created_at < ?",
+        (now(), cutoff))
+    return cur.rowcount
 
 
 def _auto_supersede(c, observed, correction_text, sid):
@@ -382,7 +401,7 @@ def ingest(path):
                 superseded = _auto_supersede(c, observed, text, sid)
             else:
                 superseded = _update_supersede(c, observed, text, rank)
-        if superseded is None and kind not in ("correction", "constraint"):
+        if superseded is None and kind not in ("correction", "constraint", "observation"):
             review = review or _conflict_review(c, observed, text)
         dedup = hashlib.sha1(f"{OBSERVER}|{it.get('subject')}|{text}".encode()).hexdigest()
         evidence = (f"auto:correction:{sid}" if kind == "correction" and superseded is not None
@@ -569,9 +588,11 @@ def supersede(fid, new_text):
 
 def snapshot(limit):
     c = db()
+    _close_expired_observations(c)
+    c.commit()
     rows = c.execute(
         "SELECT observed,kind,fact FROM peer_facts WHERE valid_to IS NULL"
-        " AND kind != 'constraint' ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+        " AND kind NOT IN ('constraint','observation') ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
     # G4 — constraints are never crowded out by recency: a rule you must not
     # break is exactly the fact whose miss is an incident, not a staleness.
     cons = c.execute(
@@ -580,10 +601,19 @@ def snapshot(limit):
     pending = c.execute(
         "SELECT COUNT(*) FROM peer_facts WHERE valid_to IS NULL AND review=1"
     ).fetchone()[0]
+    # #1010 proposal 3 — escalate the wording once the queue crosses the
+    # alert threshold (default 10; NUNCHI_REVIEW_QUEUE_ALERT) so a silently
+    # growing review backlog becomes visible in the SessionStart snapshot.
+    alert_at = int(os.environ.get("NUNCHI_REVIEW_QUEUE_ALERT", "10"))
     lines = ["## nunchi working memory (primary — gate-3 transition, #824)"]
     if pending:
-        lines.append(
-            f"- ⚠ 검토대기 {pending}건 (충돌/미검증 출처) — `nunchi.py review`로 확인")
+        if pending >= alert_at:
+            lines.append(
+                f"- ⚠⚠ 검토대기 {pending}건 — 임계치({alert_at}) 초과, 충돌 검토가 밀려 있습니다."
+                " `nunchi.py review`로 확인")
+        else:
+            lines.append(
+                f"- ⚠ 검토대기 {pending}건 (충돌/미검증 출처) — `nunchi.py review`로 확인")
     for o, f in cons:
         lines.append(f"- [제약/{o}] {f}")
     lines += [f"- ({o}/{k}) {f}" for o, k, f in rows]
