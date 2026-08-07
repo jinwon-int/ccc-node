@@ -46,7 +46,7 @@ tickets** — never bulk-delete remotely from the central node.
 
 ## Step 4 — Create a durable ticket per constrained node
 
-- Use the Wiki ticket flow (TM-ID; `wiki-record` skill)
+- Use the Wiki ticket flow (TM-ID; the node's Wiki-recording skill — `wiki-record` on Claude, `ccc-wiki-record` on Codex)
 - Record: hostname, disk snapshot (mount measured + free bytes), root causes, suggested cleanup steps
 - Mark as **opt-in** (node owner decides timing and method)
 - Link to the responsible node agent
