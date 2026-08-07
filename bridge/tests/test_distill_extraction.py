@@ -382,16 +382,48 @@ def test_wiki_disabled_requires_empty_candidates() -> None:
     assert parse_extraction_output(json.dumps(payload), wiki_enabled=False).wiki_candidates == ()
 
 
-def test_utf8_byte_limits_are_enforced_independently_of_character_limits() -> None:
-    payload = valid_output()
-    payload["wiki_candidates"][0]["evidence_excerpt"] = "가" * 100  # type: ignore[index]
+def test_multibyte_text_within_the_advertised_character_limit_is_accepted() -> None:
+    """The schema publishes character limits, so CJK output must not be rejected.
 
+    Regression for the defect where the character limit doubled as a UTF-8 byte
+    cap: a Korean answer that honoured every advertised ``maxLength`` still
+    failed as ``distill_output_invalid``, discarding the session's memory.
+    """
+    payload = valid_output()
+    # 100 Korean characters: within evidence_excerpt's 200-character limit, but
+    # 300 UTF-8 bytes — over the 200 that used to be enforced as a byte cap.
+    excerpt = "가" * 100
+    payload["wiki_candidates"][0]["evidence_excerpt"] = excerpt  # type: ignore[index]
+    # 100 Korean characters against last_activity's 160-character limit.
+    last_activity = "나" * 100
+    payload["resume"]["last_activity"] = last_activity  # type: ignore[index]
+    # 230 Korean characters against next_step's 400-character limit — the exact
+    # shape observed in production.
+    next_step = "다" * 230
+    payload["resume"]["next_step"] = next_step  # type: ignore[index]
+
+    parsed = parse_extraction_output(json.dumps(payload), wiki_enabled=True)
+
+    assert parsed.wiki_candidates[0].evidence_excerpt == excerpt
+    assert parsed.resume.last_activity == last_activity
+    assert parsed.resume.next_step == next_step
+    assert len(next_step.encode("utf-8")) > 400
+
+
+def test_character_limits_still_reject_overlong_multibyte_text() -> None:
+    payload = valid_output()
+    payload["wiki_candidates"][0]["evidence_excerpt"] = "가" * 201  # type: ignore[index]
     with pytest.raises(ValueError, match="evidence_excerpt"):
         parse_extraction_output(json.dumps(payload), wiki_enabled=True)
 
     payload = valid_output()
-    payload["resume"]["last_activity"] = "가" * 100  # type: ignore[index]
+    payload["resume"]["last_activity"] = "나" * 161  # type: ignore[index]
     with pytest.raises(ValueError, match="last_activity"):
+        parse_extraction_output(json.dumps(payload), wiki_enabled=True)
+
+    payload = valid_output()
+    payload["resume"]["next_step"] = "다" * 401  # type: ignore[index]
+    with pytest.raises(ValueError, match="next_step"):
         parse_extraction_output(json.dumps(payload), wiki_enabled=True)
 
 

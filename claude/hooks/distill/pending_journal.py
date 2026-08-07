@@ -78,7 +78,7 @@ _LEGACY_DEFAULTS: dict[str, object] = {
     "memory_scope": "",
     "honcho_memory_enabled": "1",
     "memory_user_label": "Seo Jin On / 서진원",
-    "memory_assistant_label": "dungae, a Hermes Team2 worker",
+    "memory_assistant_label": "ccc-node assistant",
 }
 
 
@@ -219,7 +219,7 @@ def _record_from_environment() -> dict[str, Any]:
             "CCC_MEMORY_USER_LABEL", "Seo Jin On / 서진원"
         ),
         "memory_assistant_label": os.environ.get(
-            "CCC_MEMORY_ASSISTANT_LABEL", "dungae, a Hermes Team2 worker"
+            "CCC_MEMORY_ASSISTANT_LABEL", "ccc-node assistant"
         ),
     }
 

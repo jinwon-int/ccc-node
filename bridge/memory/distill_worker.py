@@ -63,16 +63,23 @@ _SAFE_ERROR_CODE_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _RESERVED_OVERHEAD_TOKENS = 8192
 _RESERVED_TOKENS_PER_BYTE = 6
 _RESERVED_OUTPUT_TOKENS = MAX_EXTRACTION_JSON_BYTES
+# ``*_output_invalid`` is a property of one sampled provider answer, not of the
+# job: the same snapshot re-extracted usually parses. Treating it as terminal
+# discarded a whole session's memory on a single malformed response, with no
+# second chance. It is retryable and therefore bounded by ``max_attempts`` and
+# the usage budget like every other transient failure.
 _RETRYABLE_BACKEND_CODES = frozenset(
     {
         "distill_spawn_failed",
         "distill_timeout",
         "distill_io_failed",
         "distill_nonzero_exit",
+        "distill_output_invalid",
         "codex_distill_spawn_failed",
         "codex_distill_timeout",
         "codex_distill_io_failed",
         "codex_distill_nonzero_exit",
+        "codex_distill_output_invalid",
     }
 )
 _TERMINAL_BACKEND_CODES = frozenset(
@@ -84,7 +91,6 @@ _TERMINAL_BACKEND_CODES = frozenset(
         "distill_output_missing",
         "distill_output_unsafe",
         "distill_output_too_large",
-        "distill_output_invalid",
         "codex_distill_config_invalid",
         "codex_distill_input_invalid",
         "codex_distill_schema_unsafe",
@@ -92,7 +98,6 @@ _TERMINAL_BACKEND_CODES = frozenset(
         "codex_distill_output_missing",
         "codex_distill_output_unsafe",
         "codex_distill_output_too_large",
-        "codex_distill_output_invalid",
     }
 )
 

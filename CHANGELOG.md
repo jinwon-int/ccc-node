@@ -4,6 +4,19 @@ All notable changes to the Claude Code node harness. Dates are KST.
 
 ## [Unreleased]
 
+### Fixed
+- Memory distill: `CCC_MEMORY_ASSISTANT_LABEL`'s built-in default was
+  hardcoded to `"dungae, a Hermes Team2 worker"` in three places
+  (`bridge/utils/settings_memory.py`, `claude/hooks/distill/extract.sh`,
+  `claude/hooks/distill/pending_journal.py`), diverging from the documented
+  `.env.example` default of `"ccc-node assistant"`. Any node that never set
+  this explicitly — confirmed live on gongyung, nosuk, and soonwook — was
+  telling the memory distill model (and therefore Honcho/Wiki-bound extracts)
+  that it was dungae, regardless of which node actually ran the turn. All
+  three defaults now match `.env.example`. Nodes should still set an explicit
+  per-node `CCC_MEMORY_ASSISTANT_LABEL` for accurate identity, but no longer
+  silently misattribute to another node when it's unset.
+
 ### Changed
 - Repo skills now live in two trees and install as refreshed, near-atomic
   copies. `skills/shared/` holds runtime-agnostic skills (wiki-record,

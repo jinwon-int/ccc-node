@@ -75,7 +75,7 @@ class MemorySettingsMixin:
         description="Prompt-only user identity label for memory injection/distill.",
     )
     memory_assistant_label: str = Field(
-        default="dungae, a Hermes Team2 worker",
+        default="ccc-node assistant",
         alias="CCC_MEMORY_ASSISTANT_LABEL",
         description="Prompt-only assistant identity label for memory distill.",
     )
