@@ -115,9 +115,10 @@ provision_codex_skills() { # <fixture-dir>
   mkdir -p "$dir/repo/scripts"
   # CODEX_HOME must be owner-only 0700 (managed-skill safety contract).
   mkdir -p "$dir/home/.codex"; chmod 700 "$dir/home/.codex"
-  # The compatibility catalog classifies the full claude/ + codex/ asset roots,
+  # The compatibility catalog classifies the full claude/ + skills/ + codex/ asset roots,
   # so the provisioner needs them present to validate; overlay the real trees.
   cp -r "$ROOT/claude/." "$dir/repo/claude/"
+  cp -r "$ROOT/skills" "$dir/repo/skills"
   cp -r "$ROOT/codex" "$dir/repo/codex"
   cp "$ROOT/scripts/ccc_codex_skills.py" "$dir/repo/scripts/ccc_codex_skills.py"
   python3 "$dir/repo/scripts/ccc_codex_skills.py" apply \
