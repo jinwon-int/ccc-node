@@ -218,7 +218,8 @@ def _normalize_task_id(value: object) -> str | None:
 # the same static curated set (model_discovery stays a curated list until the
 # SDK exposes provider-side enumeration).
 CURATED_CLAUDE_MODELS: tuple[ModelInfo, ...] = (
-    ModelInfo(id="sonnet", display_name="Claude Sonnet", is_default=True),
+    ModelInfo(id="fable", display_name="Claude Fable", is_default=True),
+    ModelInfo(id="sonnet", display_name="Claude Sonnet"),
     ModelInfo(id="opus", display_name="Claude Opus"),
     ModelInfo(id="haiku", display_name="Claude Haiku"),
 )
