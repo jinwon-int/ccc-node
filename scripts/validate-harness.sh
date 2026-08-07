@@ -278,7 +278,7 @@ for t in claude/hooks/observability.test.sh claude/hooks/security-scan.test.sh \
          scripts/resource-pressure-guard.test.sh \
          scripts/install-memory-refresh-cron.test.sh scripts/install-nunchi.test.sh scripts/install-termux-mempalace.test.sh scripts/ccc-skill-autosave.test.sh \
          scripts/gh-pr-flow-seoseo-merge.test.sh \
-         scripts/ccc-self-update.test.sh scripts/ccc-provenance.test.sh \
+         scripts/ccc-self-update.test.sh scripts/self-update-check.test.sh scripts/ccc-provenance.test.sh \
          scripts/bridge-watchdog.test.sh \
          scripts/ccc-bridge-locate.test.sh \
          bridge/service-install.test.sh \
