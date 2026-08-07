@@ -110,6 +110,44 @@ EOF
 
 # Provision the repo-shipped managed Codex skills into a fixture (#647) so the
 # doctor's managed-skill diagnostics see a fully set-up Codex node.
+# Install the commands/skills trees the way setup.sh does, then apply the same
+# canonical-path rewrite. Doctor compares these file-for-file (#1037), so a
+# fixture whose repo carries them but whose ~/.claude does not is genuinely
+# drifted — same reasoning as the hook-tree walk above: the fixture must
+# resemble a real install, not a partial one.
+#
+# The agents tree needs no counterpart: every repo agent is a2a-*, which is
+# role-gated, and a fixture has neither CCC_A2A_ROLE nor an a2a-role marker, so
+# doctor correctly expects none.
+install_managed_trees() { # <fixture-dir>
+  local dir="$1" skill_root skill f
+  if [ -f "$dir/repo/claude/headless.sh" ]; then
+    cp "$dir/repo/claude/headless.sh" "$dir/home/.claude/headless.sh"
+    python3 "$ROOT/scripts/lib/canonical_paths.py" "$dir/home/.claude/headless.sh" \
+      "/opt/ccc-node" "$dir/repo" "/root/.claude" "$dir/home/.claude"
+  fi
+  if [ -d "$dir/repo/claude/commands" ]; then
+    mkdir -p "$dir/home/.claude/commands"
+    cp "$dir/repo/claude/commands/"*.md "$dir/home/.claude/commands/" 2>/dev/null || true
+  fi
+  for skill_root in "$dir/repo/claude/skills" "$dir/repo/skills/shared"; do
+    [ -d "$skill_root" ] || continue
+    mkdir -p "$dir/home/.claude/skills"
+    for skill in "$skill_root"/*/; do
+      [ -d "$skill" ] || continue
+      rm -rf "$dir/home/.claude/skills/$(basename "$skill")"
+      cp -r "$skill" "$dir/home/.claude/skills/$(basename "$skill")"
+    done
+  done
+  for f in "$dir/home/.claude/commands" "$dir/home/.claude/skills"; do
+    [ -d "$f" ] || continue
+    while IFS= read -r -d '' _target; do
+      python3 "$ROOT/scripts/lib/canonical_paths.py" "$_target" \
+        "/opt/ccc-node" "$dir/repo" "/root/.claude" "$dir/home/.claude"
+    done < <(find "$f" -type f -print0)
+  done
+}
+
 provision_codex_skills() { # <fixture-dir>
   local dir="$1"
   mkdir -p "$dir/repo/scripts"
@@ -123,6 +161,9 @@ provision_codex_skills() { # <fixture-dir>
   cp "$ROOT/scripts/ccc_codex_skills.py" "$dir/repo/scripts/ccc_codex_skills.py"
   python3 "$dir/repo/scripts/ccc_codex_skills.py" apply \
     --repo-root "$dir/repo" --codex-home "$dir/home/.codex" >/dev/null
+  # The overlay above gave this fixture's repo the full claude/ + skills/ trees,
+  # so the installed side must carry them too or doctor reports real drift.
+  install_managed_trees "$dir"
 }
 
 # Hermetic empty CODEX_HOME default so Codex managed-skill diagnostics never
@@ -693,6 +734,63 @@ ok "missing MemPalace CLI is a 경고 (peer-facts-only degrade), body-free" \
 # Static backstop: a new probe added later must not reintroduce bare-exec.
 ok "no repo script is subprocess-exec'd without an explicit interpreter" \
   '! grep -nE "subprocess\.(run|check_output|Popen)\(\[str\(" "$ROOT/scripts/ccc_doctor.py"'
+
+# --- managed skills/agents/commands drift (#1037) ----------------------------
+# setup.sh installs four trees; doctor watched two, so a stale skill, agent or
+# slash command was invisible to /doctor AND to self-update's check.sh, which
+# delegates to doctor. These fixtures pin the extended watch and, just as
+# importantly, the cases that must NOT fire.
+mt="$(make_fixture managed-trees standalone)"
+mkdir -p "$mt/repo/claude/commands" "$mt/repo/claude/skills/demo" "$mt/repo/skills/shared/shared-demo" \
+         "$mt/repo/claude/agents"
+printf '# demo command\n' > "$mt/repo/claude/commands/demo.md"
+printf '# demo skill\n'   > "$mt/repo/claude/skills/demo/SKILL.md"
+printf '# shared skill\n' > "$mt/repo/skills/shared/shared-demo/SKILL.md"
+install_managed_trees "$mt"
+
+out="$(run_doctor "$mt")"; rc=$?
+ok "fully installed managed trees are 정상" \
+  '[ "$rc" = 0 ] && grep -q "정상.*commands/demo.md" <<<"$out" && grep -q "정상.*skills/demo/SKILL.md" <<<"$out"'
+ok "the second skill source root (skills/shared) is watched too" \
+  'grep -q "skills/shared-demo/SKILL.md" <<<"$out"'
+
+# A node-local skill setup.sh never installs must never be reported.
+mkdir -p "$mt/home/.claude/skills/node-local-only"
+printf '# local\n' > "$mt/home/.claude/skills/node-local-only/SKILL.md"
+out="$(run_doctor "$mt")"
+ok "node-local skills are not reported" '! grep -q "node-local-only" <<<"$out"'
+
+printf '# demo skill drifted\n' > "$mt/home/.claude/skills/demo/SKILL.md"
+out="$(run_doctor "$mt")"; rc=$?
+ok "a drifted managed skill is caught" \
+  '[ "$rc" != 0 ] && grep -q "교정가능.*skills/demo/SKILL.md.*drifted" <<<"$out"'
+# Repair must stay with setup.sh: doctor's --fix path refuses these paths, so
+# pointing at it would hand the operator a command that cannot work.
+ok "drifted managed files are told to run setup.sh, not doctor --fix" \
+  'grep -q "skills/demo/SKILL.md" <<<"$out" && grep -qE "skills/demo/SKILL.md.*setup\.sh" <<<"$out"'
+ok "doctor --fix does not claim it can repair managed trees" \
+  '! run_doctor "$mt" --fix --scope=files | grep -q "skills/demo"'
+
+rm -f "$mt/home/.claude/commands/demo.md"
+out="$(run_doctor "$mt")"
+ok "a missing managed command is caught" \
+  'grep -q "교정가능.*commands/demo.md.*missing" <<<"$out"'
+
+# The a2a-* roster is a worker-role capability; a broker/unconfigured node
+# deliberately has none, and reporting them missing there is a false alarm.
+printf '# worker agent\n' > "$mt/repo/claude/agents/a2a-demo.md"
+printf '# plain agent\n'  > "$mt/repo/claude/agents/plain-demo.md"
+out="$(run_doctor "$mt")"
+ok "role-gated a2a agents are not expected on a non-worker node" \
+  '! grep -q "a2a-demo.md" <<<"$out"'
+ok "node-agnostic agents are still watched" \
+  'grep -q "agents/plain-demo.md.*missing" <<<"$out"'
+
+mkdir -p "$mt/home/.claude/agents"
+printf '%s\n' worker > "$mt/home/.claude/a2a-role"
+out="$(run_doctor "$mt")"
+ok "the persisted worker marker opts the roster back in" \
+  'grep -q "agents/a2a-demo.md.*missing" <<<"$out"'
 
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
