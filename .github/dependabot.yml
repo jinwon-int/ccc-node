@@ -20,3 +20,14 @@ updates:
       - /.github
     schedule:
       interval: weekly
+    ignore:
+      # pydantic-core is not a direct dependency of bridge/pyproject.toml; it is
+      # transitive and pydantic pins it exactly (pydantic 2.13.4 requires
+      # pydantic-core==2.46.4). Dependabot sees it only because it appears in the
+      # lock files, so a standalone bump can never resolve — not on a rebase, and
+      # not with a companion pydantic bump, because no released pydantic accepts a
+      # newer core (#1015). The right core version arrives automatically when
+      # pydantic bumps and scripts/ccc-deps-lock.sh regenerates the lock pair.
+      # Nothing is lost security-wise: pydantic's exact pin means a pydantic-core
+      # CVE cannot be taken independently either.
+      - dependency-name: "pydantic-core"
