@@ -426,6 +426,15 @@ fi
 run mkdir -p "$HOME/.ccc-node/scripts"
 run cp "$SRC/scripts/ccc-live-backups-rotate.sh" "$HOME/.ccc-node/scripts/ccc-live-backups-rotate.sh"
 run chmod 700 "$HOME/.ccc-node/scripts/ccc-live-backups-rotate.sh"
+# gongyung 2026-08-07: this Android resource-pressure guard was a node-local,
+# untracked file (self-update couldn't reach it, so a stale-provider bug that
+# killed healthy long-running turns sat unfixed). Same versioning pattern as
+# ccc-live-backups-rotate.sh above — it just keeps the file current wherever
+# it's already cron'd. Not wired into any cron by setup.sh: this is a
+# resource-constrained-device tool, not a fleet default. Enable it per node
+# only where the same low-RAM/thermal constraints apply.
+run cp "$SRC/scripts/resource-pressure-guard.sh" "$HOME/.ccc-node/scripts/resource-pressure-guard.sh"
+run chmod 700 "$HOME/.ccc-node/scripts/resource-pressure-guard.sh"
 # Executable files copied into hooks/ from OUTSIDE the claude/hooks/ tree.
 # (ccc_memory_index.py / ccc_memory_search.py are deliberately NOT here: they
 # are python modules invoked via their .sh wrappers and are installed 644.)
