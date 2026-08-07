@@ -67,6 +67,41 @@ _ccc_test_nlink() {
   stat -c '%h' -- "$1" 2>/dev/null || stat -f '%l' "$1" 2>/dev/null
 }
 
+# Drop harness environment inherited from the caller so a suite sees only the
+# variables its own fixtures set (#1023).
+#
+# The hook suites control `CCC_STATE_DIR`, `CCC_CLAUDE_DIR`, etc. per command,
+# but never neutralised the rest of the namespace. Inside a bridge-managed
+# Claude session `CCC_BRIDGE_DISTILL_MANAGED=1` is exported into the shell, so
+# `distill.sh` took its no-op guard and 15 side-effect assertions failed —
+# flipping all of `validate-harness.sh` to FAIL on a node with no real defect.
+# CI never exports the variable, so it only reproduced where operators actually
+# run validation.
+#
+# Unsets every exported `CCC_*` / `NUNCHI_*` name except `CCC_TEST_*` (fixture
+# plumbing such as `CCC_TEST_STUB_ROOT`) and any extra names passed as
+# arguments. Call it immediately after sourcing this file, before the suite
+# assigns its own fixture variables.
+ccc_test_reset_hook_env() {
+  local name keep preserved=" "
+
+  for keep in "$@"; do
+    preserved="${preserved}${keep} "
+  done
+
+  for name in $(compgen -e 2>/dev/null); do
+    case "$name" in
+      CCC_TEST_*) continue ;;
+      CCC_*|NUNCHI_*) ;;
+      *) continue ;;
+    esac
+    case "$preserved" in
+      *" $name "*) continue ;;
+    esac
+    unset "$name"
+  done
+}
+
 # Stub BODY is read from stdin (typically a quoted heredoc). The destination
 # must be below the validated TMP/CCC_TEST_STUB_ROOT. Writes go to a fresh file
 # in the same directory and are renamed into place, so an existing symlink or

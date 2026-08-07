@@ -5,6 +5,8 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 PUSH="$HERE/honcho-push.sh"
 # shellcheck source=claude/hooks/lib/test-stub.sh
 . "$HERE/../lib/test-stub.sh"
+# Fixtures own every distill input; ambient harness env must not reach the hooks (#1023).
+ccc_test_reset_hook_env
 pass=0; fail=0
 TMP="$(ccc_test_tmpdir)" || exit 1
 trap 'rm -rf "$TMP"' EXIT
