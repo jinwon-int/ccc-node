@@ -312,25 +312,76 @@ if [ "$PROFILE" = "hybrid" ] || [ "$PROFILE" = "max-perf" ] || ! is_disabled "$L
     # deadline. A short inner deadline drops only local-hot results; canonical
     # MEMORY/USER/cache/resume blocks assembled above still inject. The helper
     # uses Python rather than GNU timeout so the same contract works on Termux.
-    local_hot="$(run_memory_search_bounded "$search_tool" "$QUERY" "$search_limit" "${CCC_MEMORY_SEARCH_TIMEOUT_SEC:-3}" "$STATE_DIR")"
-    _mark search_local
-    if ! is_disabled "$AUDIENCE_SCOPED"; then
-      # A just-committed Codex fact may not match the checkout-derived startup
-      # query yet. The write-back indexer tags these rows `distilled`; merge one
-      # small recent-fact lane so the immediately following isolated thread sees
-      # the durable fact without waiting for another turn or background refresh.
-      recent_hot="$(run_memory_search_bounded "$search_tool" "distilled text" "$search_limit" "${CCC_MEMORY_RECENT_SEARCH_TIMEOUT_SEC:-1}" "$STATE_DIR")"
-      _mark search_recent
+    # #897 step 2: in audience mode the local/recent/shared/legacy lanes are
+    # independent DB queries — run them concurrently under ONE global budget
+    # (default 3s) instead of the serial 3+1+3+2s chain. Each lane keeps its
+    # own inner timeout so a killed wait never orphans an unbounded search;
+    # CCC_MEMORY_SEARCH_PARALLEL=0 restores the serial path. Needs EPOCHREALTIME
+    # (bash 5) for the deadline; without it the serial path is used.
+    search_dir=""
+    if ! is_disabled "$AUDIENCE_SCOPED" \
+      && ! is_disabled "${CCC_MEMORY_SEARCH_PARALLEL:-1}" \
+      && [ -n "${EPOCHREALTIME:-}" ]; then
+      search_dir="$(mktemp -d "${TMPDIR:-/tmp}/ccc-mem-search.XXXXXX" 2>/dev/null || true)"
+    fi
+    if ! is_disabled "$AUDIENCE_SCOPED" && [ -n "$search_dir" ]; then
+      ( run_memory_search_bounded "$search_tool" "$QUERY" "$search_limit" "${CCC_MEMORY_SEARCH_TIMEOUT_SEC:-3}" "$STATE_DIR" > "$search_dir/local" 2>/dev/null ) &
+      ( run_memory_search_bounded "$search_tool" "distilled text" "$search_limit" "${CCC_MEMORY_RECENT_SEARCH_TIMEOUT_SEC:-1}" "$STATE_DIR" > "$search_dir/recent" 2>/dev/null ) &
       if [ "$MEMORY_AUDIENCE" = "private" ] \
         && [ -n "$SHARED_STATE_DIR" ] \
         && [ "$SHARED_STATE_DIR" != "$STATE_DIR" ]; then
-        shared_hot="$(run_memory_search_bounded "$search_tool" "$QUERY" "$search_limit" "${CCC_MEMORY_SEARCH_TIMEOUT_SEC:-3}" "$SHARED_STATE_DIR")"
-        _mark search_shared
+        ( run_memory_search_bounded "$search_tool" "$QUERY" "$search_limit" "${CCC_MEMORY_SEARCH_TIMEOUT_SEC:-3}" "$SHARED_STATE_DIR" > "$search_dir/shared" 2>/dev/null ) &
         if [ -n "$LEGACY_STATE_DIR" ] \
           && [ "$LEGACY_STATE_DIR" != "$STATE_DIR" ] \
           && [ "$LEGACY_STATE_DIR" != "$SHARED_STATE_DIR" ]; then
-          legacy_hot="$(run_memory_search_bounded "$search_tool" "$QUERY" "$search_limit" "${CCC_MEMORY_LEGACY_SEARCH_TIMEOUT_SEC:-2}" "$LEGACY_STATE_DIR")"
-          _mark search_legacy
+          ( run_memory_search_bounded "$search_tool" "$QUERY" "$search_limit" "${CCC_MEMORY_LEGACY_SEARCH_TIMEOUT_SEC:-2}" "$LEGACY_STATE_DIR" > "$search_dir/legacy" 2>/dev/null ) &
+        fi
+      fi
+      search_budget="${CCC_MEMORY_SEARCH_GLOBAL_TIMEOUT_SEC:-3}"
+      case "$search_budget" in ''|*[!0-9]*) search_budget=3 ;; esac
+      deadline_us=$(( $(_now_us) + search_budget * 1000000 ))
+      while :; do
+        alive=0
+        for search_pid in $(jobs -p); do
+          kill -0 "$search_pid" 2>/dev/null && alive=1
+        done
+        [ "$alive" = 0 ] && break
+        [ "$(_now_us)" -ge "$deadline_us" ] && break
+        sleep 0.05
+      done
+      for search_pid in $(jobs -p); do
+        kill "$search_pid" 2>/dev/null
+      done
+      wait 2>/dev/null
+      local_hot="$(cat "$search_dir/local" 2>/dev/null)"
+      recent_hot="$(cat "$search_dir/recent" 2>/dev/null)"
+      shared_hot="$(cat "$search_dir/shared" 2>/dev/null)"
+      legacy_hot="$(cat "$search_dir/legacy" 2>/dev/null)"
+      rm -rf "$search_dir"
+      _mark search_parallel
+    else
+      local_hot="$(run_memory_search_bounded "$search_tool" "$QUERY" "$search_limit" "${CCC_MEMORY_SEARCH_TIMEOUT_SEC:-3}" "$STATE_DIR")"
+      _mark search_local
+    fi
+    if ! is_disabled "$AUDIENCE_SCOPED"; then
+      if [ -z "$search_dir" ]; then
+        # A just-committed Codex fact may not match the checkout-derived startup
+        # query yet. The write-back indexer tags these rows `distilled`; merge one
+        # small recent-fact lane so the immediately following isolated thread sees
+        # the durable fact without waiting for another turn or background refresh.
+        recent_hot="$(run_memory_search_bounded "$search_tool" "distilled text" "$search_limit" "${CCC_MEMORY_RECENT_SEARCH_TIMEOUT_SEC:-1}" "$STATE_DIR")"
+        _mark search_recent
+        if [ "$MEMORY_AUDIENCE" = "private" ] \
+          && [ -n "$SHARED_STATE_DIR" ] \
+          && [ "$SHARED_STATE_DIR" != "$STATE_DIR" ]; then
+          shared_hot="$(run_memory_search_bounded "$search_tool" "$QUERY" "$search_limit" "${CCC_MEMORY_SEARCH_TIMEOUT_SEC:-3}" "$SHARED_STATE_DIR")"
+          _mark search_shared
+          if [ -n "$LEGACY_STATE_DIR" ] \
+            && [ "$LEGACY_STATE_DIR" != "$STATE_DIR" ] \
+            && [ "$LEGACY_STATE_DIR" != "$SHARED_STATE_DIR" ]; then
+            legacy_hot="$(run_memory_search_bounded "$search_tool" "$QUERY" "$search_limit" "${CCC_MEMORY_LEGACY_SEARCH_TIMEOUT_SEC:-2}" "$LEGACY_STATE_DIR")"
+            _mark search_legacy
+          fi
         fi
       fi
       local_hot="$(merge_local_hot "$local_hot" "$recent_hot" "$shared_hot" "$legacy_hot")"

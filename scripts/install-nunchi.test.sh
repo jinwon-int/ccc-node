@@ -103,6 +103,30 @@ ok "Piri apply writes feed, refresh and bench cron and atomically drops the code
   '[ "$(grep -c "nunchi:#816" "$cron_store")" = 3 ] && grep -q "piri-feed.sh" "$cron_store" && grep -q "mempalace-refresh.sh piri $piri_sessions" "$cron_store" && ! grep -q "codex-feed.sh" "$cron_store"'
 ok "Piri apply keeps the standalone nunchi hook removed (no Claude SessionStart path)" \
   '! grep -q "nunchi/sessionstart.sh" "$claude_dir/settings.local.json"'
+
+# --- Piri feed extractor CLI wiring: cron's bare PATH has no piri entry, so
+# an unpinned feed cron was a silent no-op on real nodes. The installer must
+# resolve a runnable CLI and pin CCC_PIRI_CLI_PATH into the cron line.
+write_exec_stub "$fake_bin/piri-real.sh" <<'SH'
+exit 0
+SH
+out="$(CCC_PIRI_REAL_CLI_PATH="$fake_bin/piri-real.sh" run_install --apply --piri 2>&1)"; rc=$?
+ok "Piri apply pins the resolved extractor CLI into the feed cron" \
+  '[ "$rc" = 0 ] && grep -q "CCC_PIRI_CLI_PATH=$fake_bin/piri-real.sh" "$cron_store"'
+ok "Piri apply with a resolvable CLI does not warn" \
+  '! grep -q "no runnable Piri CLI" <<<"$out"'
+out="$(CCC_PIRI_REAL_CLI_PATH= CCC_PIRI_CLI_PATH= CCC_PIRI_DEFAULT_CLI_PATH="$fake_bin/absent.sh" PATH="$fake_bin:/usr/bin:/bin" run_install --apply --piri 2>&1)"; rc=$?
+ok "Piri apply without any runnable CLI warns loudly instead of installing a dead cron" \
+  '[ "$rc" = 0 ] && grep -q "no runnable Piri CLI" <<<"$out"'
+ok "Piri apply without a CLI leaves the feed cron unpinned" \
+  '! grep -q "CCC_PIRI_CLI_PATH" "$cron_store"'
+out="$(env -i HOME="$home" PATH="/usr/bin:/bin" CCC_STATE_DIR="$state" NUNCHI_HOME="$nunchi_home" NUNCHI_DB="$nunchi_home/facts.db" NUNCHI_SNAPSHOT="$nunchi_home/snapshot.md" bash "$hooks/nunchi/piri-feed.sh" 2>&1)"; rc=$?
+ok "piri-feed without a runnable CLI still exits 0 but now says so" \
+  '[ "$rc" = 0 ] && grep -q "Piri CLI not runnable" <<<"$out"'
+mkdir -p "$TMP/piri-dir-cwd/piri"
+out="$(cd "$TMP/piri-dir-cwd" && env -i HOME="$home" PATH="/usr/bin:/bin" CCC_STATE_DIR="$state" NUNCHI_HOME="$nunchi_home" NUNCHI_DB="$nunchi_home/facts.db" NUNCHI_SNAPSHOT="$nunchi_home/snapshot.md" bash "$hooks/nunchi/piri-feed.sh" 2>&1)"; rc=$?
+ok "piri-feed guard rejects an executable ./piri directory (checkout-root false positive)" \
+  '[ "$rc" = 0 ] && grep -q "Piri CLI not runnable" <<<"$out"'
 piri_refresh_capture="$TMP/piri-refresh.args"
 CCC_TEST_MEMPALACE_CAPTURE="$piri_refresh_capture" HOME="$home" \
   PATH="/usr/bin:/bin" CCC_STATE_DIR="$state" NUNCHI_HOME="$nunchi_home" \
