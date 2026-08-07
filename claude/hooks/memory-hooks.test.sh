@@ -359,5 +359,60 @@ out="$(HOME="$TMP/home" CCC_STATE_DIR="$tstate2" CCC_MEMORY_CACHE_DIR="$cache" C
 ok "timing: opt-out keeps hook healthy" '[ "$rc" = 0 ]'
 ok "timing: CCC_MEMORY_TIMING=0 writes nothing" '[ ! -e "$tstate2/memory-timing.jsonl" ]'
 
+# --- #897 step 2: parallel audience search under one global budget ---
+lane_tools="$TMP/lane-tools"; mkdir -p "$lane_tools"
+cat > "$lane_tools/ccc-memory-query.sh" <<'SH'
+#!/usr/bin/env bash
+printf 'lane query'
+SH
+cat > "$lane_tools/ccc-memory-search.sh" <<SH
+#!/usr/bin/env bash
+case "\${CCC_STATE_DIR:-}" in
+  */shared/state)
+    [ "\${CCC_FAKE_STALL:-0}" = 1 ] && sleep 5
+    printf '{"results":[{"source":"cache","path":"/shared/facts.jsonl","snippet":"SHARED_LANE_HIT"}]}' ;;
+  */$private_scope/state)
+    printf '{"results":[{"source":"cache","path":"/private/facts.jsonl","snippet":"PRIVATE_LANE_HIT"}]}' ;;
+  *)
+    printf '{"results":[{"source":"cache","path":"/legacy/facts.jsonl","snippet":"LEGACY_LANE_HIT"}]}' ;;
+esac
+SH
+chmod +x "$lane_tools/"*.sh
+
+pstate="$audroot/$private_scope/state"
+run_parallel_case() { # <stalldummy-flag> <budget> <parallel-flag> <timing-state>
+  HOME="$TMP/home" \
+    CCC_MEMORY_AUDIENCE_SCOPED=1 CCC_MEMORY_AUDIENCE=private CCC_MEMORY_SCOPE="$private_scope" \
+    CCC_MEMORY_AUDIENCE_ROOT="$audroot" \
+    CCC_STATE_DIR="$pstate" CCC_MEMORY_CACHE_DIR="$audroot/$private_scope/cache" \
+    CCC_RESUME_FILE="$pstate/resume.md" \
+    CCC_MEMORY_DIR="$private_mem" CCC_MEMORY_SHARED_STATE_DIR="$audroot/shared/state" \
+    CCC_MEMORY_SHARED_CACHE_DIR="$audroot/shared/cache" \
+    CCC_MEMORY_SHARED_DIR="$shared_mem" CCC_MEMORY_LEGACY_DIR="$legacy_mem" \
+    CCC_MEMORY_LEGACY_HERMES_DIR="$legacy_hermes_mem" \
+    CCC_MEMORY_LEGACY_CACHE_DIR="$legacy_cache" \
+    CCC_MEMORY_LEGACY_STATE_DIR="$TMP/legacy-state" \
+    CCC_HOOK_DIR="$ROOT/claude/hooks" CCC_MEMORY_TOOLS_DIR="$lane_tools" \
+    CCC_LOCAL_MEMORY_ENABLED=1 CCC_WIKI_MEMORY_ENABLED=0 CCC_HONCHO_MEMORY_ENABLED=0 \
+    CCC_MEMORY_NO_REFRESH=1 CCC_FAKE_STALL="$1" \
+    CCC_MEMORY_SEARCH_GLOBAL_TIMEOUT_SEC="$2" CCC_MEMORY_SEARCH_PARALLEL="$3" \
+    bash "$ROOT/claude/hooks/load-memory.sh" SessionStart 2>&1
+}
+
+mkdir -p "$audroot/shared/state" "$TMP/legacy-state"
+out="$(run_parallel_case 0 3 1)"; rc=$?
+ok "parallel: all audience lanes merge under the global budget" \
+  '[ "$rc" = 0 ] && grep -q "PRIVATE_LANE_HIT" <<<"$out" && grep -q "SHARED_LANE_HIT" <<<"$out" && grep -q "LEGACY_LANE_HIT" <<<"$out"'
+ok "parallel: timing marks the consolidated stage" \
+  'jq -e ".stages | has(\"search_parallel\")" "$pstate/memory-timing.jsonl" >/dev/null 2>&1'
+
+out="$(run_parallel_case 1 1 1)"; rc=$?
+ok "parallel: global budget cuts the stalled lane but the hook still completes" \
+  '[ "$rc" = 0 ] && ! grep -q "SHARED_LANE_HIT" <<<"$out" && grep -q "PRIVATE_LANE_HIT" <<<"$out"'
+
+out="$(run_parallel_case 0 3 0)"; rc=$?
+ok "parallel: CCC_MEMORY_SEARCH_PARALLEL=0 restores the serial lane marks" \
+  '[ "$rc" = 0 ] && grep -q "SHARED_LANE_HIT" <<<"$out" && jq -e ".stages | has(\"search_shared\") and (has(\"search_parallel\") | not)" "$pstate/memory-timing.jsonl" >/dev/null 2>&1'
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

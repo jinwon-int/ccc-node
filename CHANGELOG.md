@@ -4,6 +4,15 @@ All notable changes to the Claude Code node harness. Dates are KST.
 
 ## [Unreleased]
 
+### Changed
+- SessionStart audience search is parallel under one global budget (#897 step
+  2). The local/recent/shared/legacy lanes used to run serially (3+1+3+2s,
+  up to ~9s of the 15s hook budget); they now run concurrently with a global
+  3s wait budget (`CCC_MEMORY_SEARCH_GLOBAL_TIMEOUT_SEC`), each lane keeping
+  its own inner timeout so a cut wait never orphans an unbounded search.
+  Measured on a 2s-per-lane fixture: 8.1s → 3.0s. `CCC_MEMORY_SEARCH_PARALLEL=0`
+  restores the serial path; non-audience mode is unchanged.
+
 ### Fixed
 - Docs: `CCC_NODE_ISOLATION_PROFILE=external` is now described as what it is
   — a memory-source gate that forces Family Wiki paths off — not a
@@ -13,6 +22,15 @@ All notable changes to the Claude Code node harness. Dates are KST.
   provider-capability-matrix.md (README links instead of generalizing), and
   the README env table now exposes `CCC_CODEX_MEMORY_LOADER` and the
   default-on `CCC_CODEX_SKILL_COLLECTOR` opt-out.
+- Piri nunchi extraction was silently dead on real nodes: `piri-feed.sh`
+  resolves its extractor CLI from `CCC_PIRI_CLI_PATH`/`PATH`, cron's bare
+  PATH has no `piri` entry, and the guard failed silently — no Piri session
+  had ever been ingested since the lane shipped. `install-nunchi.sh
+  --apply --piri` now resolves a runnable CLI (env-first: `CCC_PIRI_REAL_CLI_PATH`,
+  `/opt/piri/piri-ccc.sh`, `CCC_PIRI_CLI_PATH`, then `piri` on PATH) and pins
+  `CCC_PIRI_CLI_PATH` into the feed cron line, warning loudly when none is
+  found; the feed's CLI guard now logs the skip and no longer passes on
+  searchable directories named `piri` (checkout-root false positive).
 
 ### Added
 - SessionStart stage timing instrumentation (#897 step 1). `load-memory.sh`

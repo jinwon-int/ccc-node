@@ -125,9 +125,15 @@ JSON 객체 하나만 출력. 설명/마크다운 금지.
 
 (
   flock -n 9 || exit 0
-  # Piri absent → nothing to extract this tick; stay quiet and idempotent.
+  # Piri absent → nothing to extract this tick; exit 0 (idempotent) but say
+  # so — a CLI that is never on PATH must not fail silent for weeks. The
+  # filesystem fallback requires a regular file: -x alone matches searchable
+  # directories (a checkout root ships ./piri), which used to pass the guard.
   command -v "$PIR_CLI" >/dev/null 2>&1 || {
-    [ -x "$PIR_CLI" ] || exit 0
+    { [ -f "$PIR_CLI" ] && [ -x "$PIR_CLI" ]; } || {
+      echo "piri-feed: Piri CLI not runnable (CCC_PIRI_CLI_PATH unset and piri not on PATH) — extraction skipped" >&2
+      exit 0
+    }
   }
   n=0
   visited=0

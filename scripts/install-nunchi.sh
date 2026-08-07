@@ -442,6 +442,30 @@ case "$ACTION" in
     feed="$HOOKS/ingest-cron.sh"
     [ "$resolved_provider" = "codex" ] && feed="$HOOKS/codex-feed.sh"
     [ "$resolved_provider" = "piri" ]  && feed="$HOOKS/piri-feed.sh"
+    # The Piri feed resolves its extractor CLI at RUNTIME from
+    # CCC_PIRI_CLI_PATH/PATH; cron's bare PATH has no piri entry, which made
+    # every feed tick a silent no-op on real nodes. Resolve a runnable CLI at
+    # install time and pin it into the cron line (env-first so tests stay
+    # hermetic; the wrapper is bypassed in favour of its real CLI).
+    piri_env=""
+    if [ "$resolved_provider" = "piri" ]; then
+      piri_cli=""
+      for _piri_cand in "${CCC_PIRI_REAL_CLI_PATH:-}" \
+        "${CCC_PIRI_DEFAULT_CLI_PATH:-/opt/piri/piri-ccc.sh}" \
+        "${CCC_PIRI_CLI_PATH:-}"; do
+        [ -n "$_piri_cand" ] || continue
+        case "$_piri_cand" in /*) ;; *) continue ;; esac
+        if [ -f "$_piri_cand" ] && [ -x "$_piri_cand" ] && [ ! -L "$_piri_cand" ]; then
+          piri_cli="$_piri_cand"; break
+        fi
+      done
+      [ -n "$piri_cli" ] || piri_cli="$(command -v piri 2>/dev/null || true)"
+      if [ -n "$piri_cli" ]; then
+        piri_env="CCC_PIRI_CLI_PATH=$(cron_quote "$piri_cli") "
+      else
+        echo "WARNING: no runnable Piri CLI found (CCC_PIRI_REAL_CLI_PATH / /opt/piri/piri-ccc.sh / piri on PATH) — the piri-feed cron would skip extraction; install Piri or set CCC_PIRI_REAL_CLI_PATH, then re-apply" >&2
+      fi
+    fi
     bash_bin="$(command -v bash)"
     mp="${CCC_NUNCHI_MEMPALACE_CLI:-}"
     [ -n "$mp" ] || mp="$(command -v mempalace || true)"
@@ -470,7 +494,7 @@ case "$ACTION" in
     if [ "$AUDIENCE_SCOPED" = 1 ]; then
       scoped_env="CCC_NUNCHI_AUDIENCE_SCOPED=1 CCC_NUNCHI_AUDIENCE_ROOT=$(cron_quote "$AUDIENCE_ROOT") "
     fi
-    append_cron_line "*/10 * * * * CCC_STATE_DIR=$(cron_quote "$STATE") ${scoped_env}NUNCHI_HOME=$(cron_quote "$NUNCHI_DIR") NUNCHI_DB=$(cron_quote "$NUNCHI_DB_PATH") NUNCHI_SNAPSHOT=$(cron_quote "$NUNCHI_SNAPSHOT_PATH") $(cron_quote "$bash_bin") $(cron_quote "$feed") >> $(cron_quote "$NUNCHI_DIR/cron.log") 2>&1 $MARK"
+    append_cron_line "*/10 * * * * CCC_STATE_DIR=$(cron_quote "$STATE") ${scoped_env}${piri_env}NUNCHI_HOME=$(cron_quote "$NUNCHI_DIR") NUNCHI_DB=$(cron_quote "$NUNCHI_DB_PATH") NUNCHI_SNAPSHOT=$(cron_quote "$NUNCHI_SNAPSHOT_PATH") $(cron_quote "$bash_bin") $(cron_quote "$feed") >> $(cron_quote "$NUNCHI_DIR/cron.log") 2>&1 $MARK"
     if [ "$refresh_ready" = 1 ]; then
       append_cron_line "17 * * * * CCC_STATE_DIR=$(cron_quote "$STATE") ${scoped_env}NUNCHI_HOME=$(cron_quote "$NUNCHI_DIR") CCC_NUNCHI_MEMPALACE_STATUS=$(cron_quote "$MEMPALACE_STATUS") CCC_NUNCHI_MEMPALACE_REFRESH_TIMEOUT_SEC=$(cron_quote "$MEMPALACE_TIMEOUT") CCC_NUNCHI_MEMPALACE_CLI=$(cron_quote "$mp") CCC_NUNCHI_TIMEOUT_CLI=$(cron_quote "$timeout_bin") CCC_NUNCHI_FLOCK_CLI=$(cron_quote "$flock_bin") $(cron_quote "$bash_bin") $(cron_quote "$refresh") $resolved_provider $(cron_quote "$sweep_dir") >> $(cron_quote "$NUNCHI_DIR/mempalace-sweep.cron.log") 2>&1 $MARK"
       echo "mempalace hourly refresh cron added ($resolved_provider: $sweep_dir)"
