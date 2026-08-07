@@ -139,13 +139,13 @@ cffi==2.1.1 \
     # via
     #   -c .github/requirements/bridge-ci.txt
     #   cryptography
-claude-agent-sdk==0.2.128 \
-    --hash=sha256:2ac7b2b3bc56ae9037fd284c8690d3dafab9493ecd28d8974bba79a418e1b800 \
-    --hash=sha256:2e47ee95be68cb07612fd5288a40f3307763da5a5adf66d6e03ea49dc0495c9c \
-    --hash=sha256:37b87c8e75daa2a6dc74da6d788e0981a2e5e3a6be80cfa4c287abce2bf70e0b \
-    --hash=sha256:55e8fa28918af5620f391692efe80527ad9f2294cec14dadeea93c5161dbefc4 \
-    --hash=sha256:6c10cc1c5403b2b0b3d8deb79ad5271a8e49b9db6460193599b91f49f16b4cf7 \
-    --hash=sha256:cc4a0f20337e227fe16f00edf7cbe109349707adb440fe51ca6c44f9f8d7d21a
+claude-agent-sdk==0.2.132 \
+    --hash=sha256:1465ca52437921be79dfe1a4e5e1d35a2f850d5dbe5025256729de9befa7a62b \
+    --hash=sha256:4860d059b89d0394acce8a7e767ea1b2da4fa73c07cf5c0ccdd86aa7ad5173ba \
+    --hash=sha256:9162fd2675f366d376529b017fdff6dc522658f88c5f3c49afdd45d77228a4ef \
+    --hash=sha256:a1085b8be7fcda441cfb1c86966e008ba72d4d2f6e20da5466bebb15c4765b55 \
+    --hash=sha256:cd13af6ee4240b48fb01831a41248f57f3c83d235f218704f9a14e8c29af8a61 \
+    --hash=sha256:efc54a6fac96232105a40b6aed870a482dea221151a3b3356c5c514a5844cf7f
     # via
     #   -c .github/requirements/bridge-ci.txt
     #   ccc-telegram-bridge (bridge/pyproject.toml)
@@ -366,9 +366,9 @@ jsonschema-specifications==2025.9.1 \
     # via
     #   -c .github/requirements/bridge-ci.txt
     #   jsonschema
-mcp==1.28.1 \
-    --hash=sha256:2726bca5e7193f61c5dde8b12500a6de2d9acf6d1a1c0be9e8c2e706437991df \
-    --hash=sha256:d51e36a5f5644faea4f85ea649bfffa6bc6c26770d42798ad6a3de3d2ba69683
+mcp==1.29.0 \
+    --hash=sha256:52d01f334de1868cc3bb2d6604931126a67631f99a6c5d3b82ba47290315ec36 \
+    --hash=sha256:f5a075bb611f23d6f4d080c6a1699fa62772eebc562ba9e66b306ddde1c755f7
     # via
     #   -c .github/requirements/bridge-ci.txt
     #   claude-agent-sdk
