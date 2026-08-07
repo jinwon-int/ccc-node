@@ -34,10 +34,11 @@ Use this when work produces reusable operating knowledge (a decision, runbook, n
    seq=$(( ${last_seq:-0} + 1 ))
    ```
    - New section heading: `## [TM-<max+1>] <title>` (or `ND-` for node RUNBOOK pages).
-   - New log entry: `- [LOG-YYYYMMDD-<node>-<seq>] YYYY-MM-DD KST — <title>`.
-   - `<node>` is the lowercase executing-node slug: `seoseo`, `dungae`, `sogyo`, `nosuk`, `bangtong`, `yukson`, `soonwook`, `gwakga`, `jingun`, `gongyung`, `daegyo`, or `gongmyoung`.
-   - `<seq>` starts at `1` and is `max(seq)+1` among entries for the same KST date and node.
-   - Prepend the entry inside `pages/log.md` immediately after the `[LOG-00]` rule block and before the newest existing log entry. Do not put it above `[LOG-00]`.
+   - New log entry: `## [LOG-YYYYMMDD-<node>-<seq>] YYYY-MM-DD KST — <title>` — a level-2 heading.
+   - `<node>` is the lowercase executing-node slug: `seoseo`, `dungae`, `sogyo`, `nosuk`, `bangtong`, `yukson`, `soonwook`, `gwakga`, `jingun`, `gongyung`, `daegyo`, or `gongmyoung`. Some historical slugs carry digits/hyphens (`vps4`, `racknerd-167be94`); `<seq>` is always the trailing `-N`.
+   - `<seq>` starts at `1` and is `max(seq)+1` among entries for the same KST date and node — counting **both** regions below, which share one id space.
+   - Prepend the entry at the **top of `pages/log.md`**, directly above the newest existing `## [LOG-...]` heading entry. The `- [LOG-...]` bullet region below the `[LOG-00]` block is the older form: still valid and still auto-merged, but new entries go at the top.
+   - Never edit the `[LOG-00]` rule block itself — it is the merge anchor, and changing it makes a concurrent-edit rebase fail closed. Rule changes belong in their own PR.
    - Never assign a new numeric `LOG-NNNN` ID or renumber an old one. When citing an old numeric entry, include its date and title.
 
 4. **Edit in the worktree** with Read/Edit (Read the file first). Keep it public-safe:
@@ -51,5 +52,6 @@ Use this when work produces reusable operating knowledge (a decision, runbook, n
 
 ## Notes
 - `log.md` may be edited by other nodes between your read and write — re-Read the top before prepending if the Edit fails.
-- After a rebase conflict, update from the latest default branch, recompute this node's same-day sequence, and re-prepend the entry under `[LOG-00]`; never fall back to a global numeric ID.
+- `wiki-agent` auto-resolves concurrent `pages/log.md` rebases for both regions and recomputes a taken same-node/same-day `<seq>` for you (wiki-agent [#183](https://github.com/jinwon-int/wiki-agent/pull/183); a node picks this up on its next `wiki-agent self-update`).
+- If a rebase still falls back to manual, update from the latest default branch, recompute this node's same-day sequence across both regions, and re-prepend at the top; never fall back to a global numeric ID.
 - One logical change per PR; include the IDs you added in your report back to the user.

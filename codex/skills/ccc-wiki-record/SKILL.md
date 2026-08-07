@@ -19,8 +19,12 @@ description: Record durable operating knowledge in the Seoyoon Family Wiki throu
    the matching runbook/decision page.
 
 3. For new operating-log entries, use
-   `LOG-YYYYMMDD-<node>-<same-day-sequence>` and prepend below the log rule
-   block. Never allocate or renumber a global numeric `LOG-NNNN`.
+   `## [LOG-YYYYMMDD-<node>-<same-day-sequence>] YYYY-MM-DD KST — <title>` as a
+   level-2 heading and prepend it at the top of the log page, above the newest
+   existing heading entry. The bullet region below the `[LOG-00]` block is the
+   older form; both are auto-merged and share one id space, so count either when
+   picking the sequence. Never edit the `[LOG-00]` block itself, and never
+   allocate or renumber a global numeric `LOG-NNNN`.
 
 4. Record secret locations and handling rules only. Exclude tokens, cookies,
    private keys, message bodies, credential values, and private endpoints.
