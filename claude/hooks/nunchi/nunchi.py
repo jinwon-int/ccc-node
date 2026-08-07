@@ -180,6 +180,27 @@ def _tokens(text):
     return {w for w in str(text).split() if len(w) > 1}
 
 
+# Mutable operational-state patterns (#1010). Commit SHAs, systemd status
+# counters/phrases, and "back to normal" claims are live-check targets
+# (CLAUDE.md), not durable memory: they age into wrong values and re-fire
+# the G3 review gate on every re-extraction, polluting the review queue.
+# Applied to kind=fact only — corrections/constraints carry durable intent
+# and are never filtered here. The SHA-ish token requires at least one a-f
+# letter so bare date stamps (e.g. 20260807) are not misclassified.
+_MUTABLE_OPS = re.compile(
+    r"\b(?=[0-9a-f]*[a-f])[0-9a-f]{7,40}\b"   # commit SHA / digest fragment
+    r"|\bNRestarts=\d+"                        # systemd restart counter
+    r"|\bMain\s?PID=\d+"                       # systemd main pid
+    r"|\bactive\s*\((?:running|exited|failed|waiting|deactivating)\)"
+    r"|\b(?:active|enabled|disabled|inactive)\s*/\s*(?:active|enabled|disabled|inactive)\b"
+    r"|정상\s*(?:상태|화|으로\s*(?:기록|동작|복구|작동))",
+    re.IGNORECASE)
+
+
+def _is_mutable_ops_fact(text):
+    return bool(_MUTABLE_OPS.search(text))
+
+
 def _auto_supersede(c, observed, correction_text, sid):
     """B2 — close the open fact this correction most plausibly replaces.
 
@@ -339,6 +360,7 @@ def ingest(path):
     transcript = _transcript_text(payload)
     c = db()
     n = 0
+    skipped_mutable = 0
     for it in items:
         # Gate order matters (#890): normalize → rank-verify → update/close →
         # conflict-review → dedup. Normalizing first is what lets the same
@@ -349,6 +371,10 @@ def ingest(path):
             continue
         observed = map_observed(it.get("subject"), sid)
         kind = it.get("kind", "fact")
+        # #1010: transient operational-state facts never enter the store.
+        if kind == "fact" and _is_mutable_ops_fact(text):
+            skipped_mutable += 1
+            continue
         rank, review = _verify_rank(it, transcript)
         superseded = None
         if auto_supersede:
@@ -374,7 +400,7 @@ def ingest(path):
         except sqlite3.IntegrityError:
             pass  # duplicate fact already stored
     c.commit()
-    print(f"ingested {n}/{len(items)} facts (session={sid})")
+    print(f"ingested {n}/{len(items)} facts (session={sid}, skipped_mutable_ops={skipped_mutable})")
 
 
 def _expand_query(query):
