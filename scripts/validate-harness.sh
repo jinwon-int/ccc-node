@@ -180,7 +180,8 @@ SC_SCOPE=(claude/hooks/audit.sh claude/hooks/redact.sh claude/hooks/lifecycle-fe
           scripts/ccc-service-control.test.sh \
           scripts/ccc-broker-reconcile.sh scripts/ccc-broker-reconcile.test.sh \
           claude/hooks/observability.test.sh scripts/validate-harness.sh \
-          scripts/bridge-watchdog.sh scripts/bridge-watchdog.test.sh)
+          scripts/bridge-watchdog.sh scripts/bridge-watchdog.test.sh \
+          scripts/resource-pressure-guard.sh scripts/resource-pressure-guard.test.sh)
 if command -v shellcheck >/dev/null 2>&1; then
   for f in "${SC_SCOPE[@]}"; do
     [ -f "$f" ] || continue
@@ -273,6 +274,7 @@ for t in claude/hooks/observability.test.sh claude/hooks/security-scan.test.sh \
          scripts/harness-paths.test.sh scripts/canonical-paths.test.sh \
          scripts/agent-cron.test.sh scripts/agent-cron-lib.test.sh scripts/a2a-termux-native-worker.test.sh \
          scripts/a2a-termux-native-worker-health.test.sh \
+         scripts/resource-pressure-guard.test.sh \
          scripts/install-memory-refresh-cron.test.sh scripts/install-nunchi.test.sh scripts/install-termux-mempalace.test.sh scripts/ccc-skill-autosave.test.sh \
          scripts/gh-pr-flow-seoseo-merge.test.sh \
          scripts/ccc-self-update.test.sh scripts/ccc-provenance.test.sh \
