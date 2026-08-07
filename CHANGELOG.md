@@ -5,6 +5,14 @@ All notable changes to the Claude Code node harness. Dates are KST.
 ## [Unreleased]
 
 ### Fixed
+- Docs: `CCC_NODE_ISOLATION_PROFILE=external` is now described as what it is
+  — a memory-source gate that forces Family Wiki paths off — not a
+  "non-bypassable PreToolUse guard" (that hook was removed, TM-1306), with
+  README/memory.md pointing at service-control.md for the real enforcement
+  split (#900). Per-provider feature status is owned by
+  provider-capability-matrix.md (README links instead of generalizing), and
+  the README env table now exposes `CCC_CODEX_MEMORY_LOADER` and the
+  default-on `CCC_CODEX_SKILL_COLLECTOR` opt-out.
 - Piri nunchi extraction was silently dead on real nodes: `piri-feed.sh`
   resolves its extractor CLI from `CCC_PIRI_CLI_PATH`/`PATH`, cron's bare
   PATH has no `piri` entry, and the guard failed silently — no Piri session

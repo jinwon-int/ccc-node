@@ -13,7 +13,7 @@ ccc-node memory starts from a no-network SessionStart snapshot and refreshes cac
 
 ## Source isolation
 
-- `CCC_NODE_ISOLATION_PROFILE=external` is the higher-priority external-node placement policy. The bridge validates and exports it to Claude hooks; it forces Family Wiki off and the PreToolUse guard rejects Family/internal paths, URLs, commands, and MCP calls before the ordinary approval escape hatch.
+- `CCC_NODE_ISOLATION_PROFILE=external` is the higher-priority external-node placement policy. The bridge validates and exports it to Claude hooks; it forces Family Wiki off (injection, refresh, local indexing, and distill queue writes). It is a **memory-source gate, not an execution boundary**: the node has no PreToolUse policy hook (removed, TM-1306), so path/URL/command/MCP execution is governed by behavioral policy plus the OS-level wrappers documented in [`docs/service-control.md`](service-control.md).
 - `CCC_WIKI_MEMORY_ENABLED=0` disables the Family Wiki read and write path: no cache injection, refresh, local indexing, distill candidate generation, or Wiki queue writes. Existing cache files are ignored and removed from the local index on its next update/rebuild. An external isolation profile overrides an attempted `=1`.
 - `CCC_MEMORY_USER_LABEL` and `CCC_MEMORY_ASSISTANT_LABEL` set the node-local relationship labels used by memory injection and distill. Defaults preserve the existing Seoyoon fleet behavior.
 - `CCC_HONCHO_MEMORY_ENABLED=0` disables the Honcho read and Codex write-back path. A node may therefore run built-in/local memory only, Honcho without Wiki, or the default combined profile. `CCC_HONCHO_CFG` selects the owner-only endpoint/credential config (default `~/.hermes/honcho.json`).
