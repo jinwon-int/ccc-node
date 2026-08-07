@@ -643,6 +643,53 @@ def inspect_managed_cron(
     return feed_kind, feed_count, refreshes, legacy_sweep_count, bench_count
 
 
+def nunchi_ingest_probe(path: Path, now: int) -> dict[str, object]:
+    """Read the mirror ingester's per-tick receipt (`ccc.nunchi.ingest.v1`).
+
+    #1018 stayed invisible for weeks because the ingester's only observable
+    output was the fact count, and a node carrying facts from a previous
+    provider looked healthy while mirroring nothing. The receipt records what a
+    tick actually saw, so "ran but had no input" stops reading as success.
+    """
+    payload: dict[str, object] = {
+        "status": "missing",
+        "sources": -1,
+        "ingested": -1,
+        "age_seconds": -1,
+    }
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return payload
+    except (OSError, json.JSONDecodeError):
+        return {**payload, "status": "invalid"}
+    if not isinstance(doc, dict) or doc.get("schema") != "ccc.nunchi.ingest.v1":
+        return {**payload, "status": "invalid"}
+    finished = doc.get("finished_at")
+    sources = doc.get("sources")
+    ingested = doc.get("ingested")
+    # bool is a subclass of int in Python; readiness accepts exact integers only.
+    if (
+        type(finished) is not int
+        or type(sources) is not int
+        or type(ingested) is not int
+        or finished <= 0
+        or not 0 <= sources <= 2
+        or ingested < 0
+    ):
+        return {**payload, "status": "invalid"}
+    # Cron and the probe may straddle a clock correction. Permit five minutes,
+    # but reject farther-future records instead of making them look fresh.
+    if finished > now + 300:
+        return {**payload, "status": "invalid"}
+    return {
+        "status": "ok",
+        "sources": sources,
+        "ingested": ingested,
+        "age_seconds": max(0, now - finished),
+    }
+
+
 def nunchi_readiness_reasons(
     *,
     hook_installed: bool,
@@ -660,6 +707,7 @@ def nunchi_readiness_reasons(
     ttl: int,
     refresh_contract_required: bool,
     configuration_conflicts: list[str],
+    ingest: dict[str, object],
 ) -> list[str]:
     reasons: list[str] = []
     if not hook_installed:
@@ -689,7 +737,42 @@ def nunchi_readiness_reasons(
         reasons.append("standalone-sessionstart")
     if feed_kind == "claude" and standalone != 1:
         reasons.append("sessionstart-count")
+    reasons.extend(
+        nunchi_ingest_reasons(
+            ingest=ingest, feed_kind=feed_kind, facts_age=facts_age, ttl=ttl
+        )
+    )
     return reasons
+
+
+def nunchi_ingest_reasons(
+    *,
+    ingest: dict[str, object],
+    feed_kind: str,
+    facts_age: int,
+    ttl: int,
+) -> list[str]:
+    """Judge the mirror ingester's receipt.
+
+    Only the claude feed writes one; codex and piri feeds have their own
+    producers and must not be judged against a file they never create.
+    """
+    if feed_kind != "claude":
+        return []
+    status = ingest.get("status")
+    if status == "ok":
+        if ingest.get("sources") == 0:
+            # The exact #1018 shape: the ingester runs, finds no producer at
+            # all, and every other signal still reads healthy.
+            return ["ingest-sourceless"]
+        if int(ingest.get("age_seconds") or 0) > ttl:
+            return ["ingest-stale"]
+        return []
+    if status == "invalid":
+        return ["ingest-invalid"]
+    # A receipt-less node is only suspect once its facts also stopped
+    # advancing; a node that simply predates the receipt keeps working.
+    return ["ingest-unobserved"] if facts_age > ttl else []
 
 
 def probe_nunchi(
@@ -743,6 +826,12 @@ def probe_nunchi(
     standalone = standalone_hook_count(claude / "settings.local.json") if mode == "on" else 0
     hook_installed = (claude / "hooks/nunchi/nunchi.py").is_file()
 
+    ingest_status_path = Path(
+        os.environ.get("CCC_NUNCHI_INGEST_STATUS")
+        or (nunchi_home / "ingest.status.json")
+    )
+    ingest = nunchi_ingest_probe(ingest_status_path, now)
+
     if mode == "on":
         nunchi_reasons = nunchi_readiness_reasons(
             hook_installed=hook_installed,
@@ -760,6 +849,7 @@ def probe_nunchi(
             ttl=ttl,
             refresh_contract_required=refresh_contract_required,
             configuration_conflicts=configuration_conflicts,
+            ingest=ingest,
         )
         nunchi_status = "ok" if not nunchi_reasons else "degraded"
     else:
@@ -785,6 +875,7 @@ def probe_nunchi(
             "bytes": snapshot_bytes,
             "age_seconds": age_seconds(snapshot, now),
         },
+        "ingest": ingest,
         "cron": {
             "feed": feed_kind,
             "feed_count": feed_count,

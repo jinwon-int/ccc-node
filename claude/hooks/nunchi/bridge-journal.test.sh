@@ -146,6 +146,38 @@ HOME="$empty_home" CCC_STATE_DIR="$empty_home/.claude/state" \
 ok "warns when neither input source exists" "grep -q 'no input source' '$TMP/empty.err'"
 ok "normal run stays quiet" "! grep -q 'no input source' '$TMP/cron.err'"
 
+# ------------------------------------------------------- ingest receipt (#1018) --
+# The receipt is what lets readiness tell "ran with no input" from "ran fine".
+receipt="$home/.nunchi/ingest.status.json"
+ok "a tick leaves a receipt" "[ -f '$receipt' ]"
+ok "receipt carries the versioned schema" \
+  "grep -q '\"schema\":\"ccc.nunchi.ingest.v1\"' '$receipt'"
+ok "receipt counts the present input sources" \
+  "python3 -c 'import json,sys; sys.exit(0 if json.load(open(\"$receipt\"))[\"sources\"]==1 else 1)'"
+ok "receipt counts what was ingested" \
+  "python3 -c 'import json,sys; sys.exit(0 if json.load(open(\"$receipt\"))[\"ingested\"]>=1 else 1)'"
+ok "receipt timestamp is a positive integer" \
+  "python3 -c 'import json,sys; d=json.load(open(\"$receipt\")); sys.exit(0 if type(d[\"finished_at\"]) is int and d[\"finished_at\"]>0 else 1)'"
+
+empty_receipt="$empty_home/.nunchi/ingest.status.json"
+ok "sourceless tick still leaves a receipt" "[ -f '$empty_receipt' ]"
+ok "sourceless receipt records zero sources" \
+  "python3 -c 'import json,sys; sys.exit(0 if json.load(open(\"$empty_receipt\"))[\"sources\"]==0 else 1)'"
+
+# A tick that ingests something says so; a tick with nothing new stays quiet so
+# a 10-minute cron does not write 144 no-op lines a day.
+tick_stdout() {
+  env HOME="$home" CCC_STATE_DIR="$state" NUNCHI_HOME="$home/.nunchi" \
+    CCC_BRIDGE_DISTILL_JOURNAL="$TMP/journal" \
+    bash "$hooks/ingest-cron.sh" 2>/dev/null
+}
+job extraction_done '[{"kind":"fact","subject":"node","text":"로그 검증용 신규 사실"}]' \
+  > "$TMP/journal/logged.json"
+tick_stdout > "$TMP/loud.out"
+ok "a working tick logs its counts" "grep -q 'nunchi ingest: ingested=1' '$TMP/loud.out'"
+tick_stdout > "$TMP/quiet.out"
+ok "a tick with nothing new stays silent" "[ ! -s '$TMP/quiet.out' ]"
+
 # nunchi disabled must stay a no-op regardless of journal contents
 printf 'off' > "$state/nunchi.mode"
 before="$(wc -l < "$TMP/ingested.log")"
