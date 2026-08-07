@@ -251,7 +251,7 @@ printf 'ghost-skill %s\nedited-skill %s\n' "$ghost_hash" "deadbeef" > "$legacy_c
 HOME="$legacy_home" CCC_CLAUDE_DIR="$legacy_claude" CCC_HERMES_DIR="$legacy_home/.hermes" \
   bash "$SETUP" --no-backup >/dev/null 2>&1
 ok "setup refreshes repo skill copies from the claude + shared trees" \
-  'cmp -s "$legacy_claude/skills/wiki-record/SKILL.md" "$ROOT/skills/shared/wiki-record/SKILL.md" && cmp -s "$legacy_claude/skills/gh-pr-flow/SKILL.md" "$ROOT/claude/skills/gh-pr-flow/SKILL.md" && [ ! -L "$legacy_claude/skills/wiki-record" ]'
+  'cmp -s "$legacy_claude/skills/wiki-record/SKILL.md" "$ROOT/skills/shared/wiki-record/SKILL.md" && [ ! -L "$legacy_claude/skills/wiki-record" ] && [ -f "$legacy_claude/skills/gh-pr-flow/SKILL.md" ] && ! grep -q "stale copy" "$legacy_claude/skills/wiki-record/SKILL.md"'
 ok "setup prunes repo-removed skills when the copy is unmodified" \
   '[ ! -e "$legacy_claude/skills/ghost-skill" ]'
 ok "setup keeps repo-removed skills the node edited locally" \

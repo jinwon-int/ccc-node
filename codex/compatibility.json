@@ -129,11 +129,11 @@
     },
     {
       "name": "fleet-disk-constraint-triage",
-      "source": "codex/skills/fleet-disk-constraint-triage"
+      "source": "skills/shared/fleet-disk-constraint-triage"
     },
     {
       "name": "gh-ci-wait",
-      "source": "codex/skills/gh-ci-wait"
+      "source": "skills/shared/gh-ci-wait"
     },
     {
       "name": "gh-pr-flow",

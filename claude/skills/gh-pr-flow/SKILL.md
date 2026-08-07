@@ -79,11 +79,20 @@ fresh explicit user approval in the current conversation, in both directions.
      not count. If approval is absent or ambiguous, stop and ask.
    - After approval, set the approval flag only on the one approved command.
 
+   Helper scripts live next to this SKILL.md. Resolve the directory once —
+   the installed copy first, the template checkout as fallback (e.g. when an
+   installed copy is stale, as on gongmyoung 2026-08-07):
+
+   ```bash
+   GH_PR_FLOW_DIR="${CCC_CLAUDE_DIR:-$HOME/.claude}/skills/gh-pr-flow"
+   [ -d "$GH_PR_FLOW_DIR" ] || GH_PR_FLOW_DIR=/opt/ccc-node/claude/skills/gh-pr-flow
+   ```
+
    **Direction A — `jinon86`-authored PR, `seoseo-ai` reviews (local):**
 
    ```bash
    CCC_EXPLICIT_USER_APPROVAL=1 \
-     ~/.claude/skills/gh-pr-flow/approve-as-seoseo-ai.sh <owner/repo> <pr-number>
+     "$GH_PR_FLOW_DIR/approve-as-seoseo-ai.sh" <owner/repo> <pr-number>
    ```
 
    The helper accepts only `jinwon-int/*`, requires an open `main` PR authored
@@ -98,7 +107,7 @@ fresh explicit user approval in the current conversation, in both directions.
 
    ```bash
    CCC_EXPLICIT_USER_APPROVAL=1 \
-     ~/.claude/skills/gh-pr-flow/approve-via-seoseo.sh <owner/repo> <pr-number>
+     "$GH_PR_FLOW_DIR/approve-via-seoseo.sh" <owner/repo> <pr-number>
    ```
 
    The helper accepts only `jinwon-int/*`, verifies the remote actor is
@@ -146,7 +155,7 @@ Capture the exact head locally, then call the fail-closed helper:
 
 ```bash
 head_sha="$(gh pr view <n> --repo <owner/repo> --json headRefOid --jq .headRefOid)"
-bash ~/.claude/skills/gh-pr-flow/merge-via-seoseo.sh \
+bash "$GH_PR_FLOW_DIR/merge-via-seoseo.sh" \
   --repo <owner/repo> --pr <n> --expected-head "$head_sha" \
   --operator-approved
 ```

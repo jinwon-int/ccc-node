@@ -217,7 +217,7 @@ def _managed_skill_entries(
             or not _NAME_RE.fullmatch(name)
             or name in seen
             or not isinstance(source_raw, str)
-            or source_raw != f"codex/skills/{name}"
+            or source_raw not in (f"codex/skills/{name}", f"skills/shared/{name}")
         ):
             raise ContractError("catalog_invalid")
         source = repo / source_raw

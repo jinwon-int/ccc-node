@@ -4,6 +4,20 @@ All notable changes to the Claude Code node harness. Dates are KST.
 
 ## [Unreleased]
 
+### Changed
+- Codex skill dedup and gh-pr-flow path cleanup (TM-2331 follow-ups). The
+  zero/low-drift Codex ports `gh-ci-wait` and `fleet-disk-constraint-triage`
+  are deleted from `codex/skills/` and now provision straight from
+  `skills/shared/` — the collector's managed-skill contract accepts
+  `skills/shared/<name>` sources, and the shared skills carry the Codex
+  `agents/openai.yaml` interface recovered from the deleted ports. The
+  shared fleet-disk text no longer names a runtime-specific Wiki skill.
+  `ccc-wiki-record` stays a genuine adapted port (distinct name and prose),
+  documented in docs/codex-managed-skills.md. `gh-pr-flow` helper paths
+  resolve via `GH_PR_FLOW_DIR` (installed copy → template checkout
+  fallback) instead of a hardcoded `~/.claude` path, so the skill text is
+  correct under `CCC_CLAUDE_DIR` overrides and stale installs.
+
 ### Fixed
 - Memory distill: `CCC_MEMORY_ASSISTANT_LABEL`'s built-in default was
   hardcoded to `"dungae, a Hermes Team2 worker"` in three places

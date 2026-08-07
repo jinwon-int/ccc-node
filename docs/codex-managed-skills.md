@@ -10,6 +10,7 @@ provisioning, not the learned-skill pipeline tracked by issue #643.
 
 - `claude/commands`
 - `claude/skills`
+- `skills/shared`
 - `claude/agents`
 - `claude/hooks`
 
@@ -28,7 +29,14 @@ The managed set is:
 | `ccc-agent-cron` | Scheduled-task inspection and explicit execution boundary |
 | `ccc-self-update` | Drift check and approval-gated transactional update |
 | `ccc-wiki-record` | Family Wiki PR-first durable recording |
+| `gh-ci-wait` | Durable GitHub CI wait registration (sourced from `skills/shared/`) |
+| `fleet-disk-constraint-triage` | Fleet disk audit and node-local cleanup delegation (sourced from `skills/shared/`) |
 | `gh-pr-flow` | Exact-head protected PR review and normal squash merge |
+
+Managed skills are sourced from `codex/skills/` (Codex-adapted ports) or, when
+the shared text is already runtime-clean, directly from `skills/shared/` — the
+catalog's `managed_skills[].source` records which, and the installed
+`.ccc-node-managed.json` carries that provenance.
 
 Claude-native lifecycle hooks, sub-agent definitions, MCP registration, and
 transcript skill-autosave assets are not copied or presented as Codex features.
