@@ -22,6 +22,15 @@ All notable changes to the Claude Code node harness. Dates are KST.
   provider-capability-matrix.md (README links instead of generalizing), and
   the README env table now exposes `CCC_CODEX_MEMORY_LOADER` and the
   default-on `CCC_CODEX_SKILL_COLLECTOR` opt-out.
+- Piri nunchi extraction was silently dead on real nodes: `piri-feed.sh`
+  resolves its extractor CLI from `CCC_PIRI_CLI_PATH`/`PATH`, cron's bare
+  PATH has no `piri` entry, and the guard failed silently — no Piri session
+  had ever been ingested since the lane shipped. `install-nunchi.sh
+  --apply --piri` now resolves a runnable CLI (env-first: `CCC_PIRI_REAL_CLI_PATH`,
+  `/opt/piri/piri-ccc.sh`, `CCC_PIRI_CLI_PATH`, then `piri` on PATH) and pins
+  `CCC_PIRI_CLI_PATH` into the feed cron line, warning loudly when none is
+  found; the feed's CLI guard now logs the skip and no longer passes on
+  searchable directories named `piri` (checkout-root false positive).
 
 ### Added
 - SessionStart stage timing instrumentation (#897 step 1). `load-memory.sh`
