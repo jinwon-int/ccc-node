@@ -11,6 +11,10 @@ DISTILL="$HERE/../distill.sh"
 DRAIN="$HERE/pending-drain.sh"
 # shellcheck source=claude/hooks/lib/test-stub.sh
 . "$HERE/../lib/test-stub.sh"
+# Same leak as distill-scope: a bridge-managed session exports
+# CCC_BRIDGE_DISTILL_MANAGED=1, distill.sh no-ops by design, and 13 assertions
+# fail on a node with no defect (#1023).
+ccc_test_reset_hook_env
 
 pass=0; fail=0
 # The operator runner mounts /tmp noexec. This suite must execute its provider

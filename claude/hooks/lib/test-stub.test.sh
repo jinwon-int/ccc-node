@@ -161,9 +161,19 @@ ok "reset preserves explicitly named variables" \
 ok "reset leaves unrelated environment untouched" \
   '[[ "$reset_out" == *"home=[set]"* ]]'
 
-# The leak is only fixed where the helper is actually called.
-ok "distill-scope.test.sh resets inherited hook environment" \
-  'grep -q "^ccc_test_reset_hook_env" "$HOOKS/distill-scope.test.sh"'
+# The helper only fixes suites that actually call it, so audit the distill
+# suites -- these drive hooks guarded by CCC_BRIDGE_DISTILL_MANAGED, which a
+# bridge-managed session exports. Catches a new suite reintroducing the leak.
+reset_audit_fail=0
+while IFS= read -r test_file; do
+  grep -q 'lib/test-stub.sh' "$test_file" || continue
+  if ! grep -q '^ccc_test_reset_hook_env' "$test_file"; then
+    echo "distill suite does not reset inherited hook env: $test_file"
+    reset_audit_fail=1
+  fi
+done < <(find "$HOOKS" -name 'distill-*.test.sh' -o -path "$HOOKS/distill/*.test.sh")
+# shellcheck disable=SC2034  # $reset_audit_fail is consumed via eval in ok()
+ok "all distill suites reset inherited hook environment" '[ "$reset_audit_fail" = 0 ]'
 
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
