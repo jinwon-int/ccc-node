@@ -10,6 +10,13 @@ updates:
         patterns:
           - github/codeql-action/*
   - package-ecosystem: pip
-    directory: /bridge
+    # #349: bridge/requirements.lock.txt (runtime) and
+    # .github/requirements/bridge-ci.txt (CI) are one logical lock pair —
+    # tests/test_runtime_deps_lock.py fails CI when their shared pins drift.
+    # Listing both directories keeps every bump in a single PR that updates
+    # the pair together (single-directory bumps broke this in #999-#1001).
+    directories:
+      - /bridge
+      - /.github
     schedule:
       interval: weekly
