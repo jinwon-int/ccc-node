@@ -30,7 +30,60 @@
 # validate the refreshed resolution before merge. Dependabot bumps to
 # bridge/requirements.txt lower bounds follow the same rule: regenerate here
 # and ship one verified PR unit.
+#
+# Targeted upgrades: by default pip-compile PRESERVES every pin that still
+# satisfies the inputs, so a plain run only re-derives a consistent lock pair and
+# never raises a version. To raise one, name it explicitly:
+#
+#   scripts/ccc-deps-lock.sh --upgrade-package mypy --upgrade-package librt
+#
+# Only the named packages may move; everything else stays pinned, keeping the
+# diff reviewable. Name the transitive dependencies that gate the bump too — a
+# package pinned at an older version silently caps its dependents (mypy 2.3.0
+# needs librt>=0.13.0, so upgrading mypy alone stops at 2.2.0). Dependabot
+# remains the normal path for routine bumps; this flag is for versions it cannot
+# propose, such as one whose PR was closed and its branch deleted (#1012).
 set -euo pipefail
+
+usage() {
+    cat >&2 <<'USAGE'
+usage: scripts/ccc-deps-lock.sh [--upgrade-package NAME]...
+
+Regenerates both hash locks from bridge/pyproject.toml. Without arguments every
+existing pin that still satisfies the inputs is preserved. Each
+--upgrade-package NAME allows that one package to move to the newest version the
+inputs permit.
+USAGE
+}
+
+UPGRADE_ARGS=()
+UPGRADE_NAMES=()
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --upgrade-package)
+            [ "$#" -ge 2 ] || { echo "❌ --upgrade-package requires a package name" >&2; exit 2; }
+            UPGRADE_ARGS+=(--upgrade-package "$2")
+            UPGRADE_NAMES+=("$2")
+            shift 2
+            ;;
+        --upgrade-package=*)
+            value="${1#*=}"
+            [ -n "$value" ] || { echo "❌ --upgrade-package requires a package name" >&2; exit 2; }
+            UPGRADE_ARGS+=(--upgrade-package "$value")
+            UPGRADE_NAMES+=("$value")
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            echo "❌ unknown argument: $1" >&2
+            usage
+            exit 2
+            ;;
+    esac
+done
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PYTHON_BIN="${CCC_DEPS_LOCK_PYTHON:-python3.11}"
@@ -51,13 +104,21 @@ echo "== creating lock toolchain venv ($PYTHON_BIN, $PIP_TOOLS_SPEC) =="
 "$PYTHON_BIN" -m venv "$WORKDIR/venv"
 "$WORKDIR/venv/bin/pip" install -q "$PIP_TOOLS_SPEC"
 
+if [ "${#UPGRADE_NAMES[@]}" -gt 0 ]; then
+    echo "== targeted upgrades: ${UPGRADE_NAMES[*]} =="
+else
+    echo "== no targeted upgrades: every satisfiable pin is preserved =="
+fi
+
 echo "== compiling .github/requirements/bridge-ci.txt =="
 "$WORKDIR/venv/bin/pip-compile" --quiet --allow-unsafe --extra=dev --generate-hashes \
+    ${UPGRADE_ARGS[@]+"${UPGRADE_ARGS[@]}"} \
     --output-file=.github/requirements/bridge-ci.txt \
     .github/requirements/bridge-ci.in bridge/pyproject.toml
 
 echo "== compiling bridge/requirements.lock.txt (constrained to the CI lock) =="
 "$WORKDIR/venv/bin/pip-compile" --quiet --allow-unsafe --generate-hashes \
+    ${UPGRADE_ARGS[@]+"${UPGRADE_ARGS[@]}"} \
     --constraint=.github/requirements/bridge-ci.txt \
     --output-file=bridge/requirements.lock.txt \
     bridge/pyproject.toml
