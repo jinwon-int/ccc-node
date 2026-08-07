@@ -132,5 +132,38 @@ while IFS= read -r test_file; do
 done < <(grep -RIl '\$TMP/bin' --include='*.test.sh' "$ROOT/claude" "$ROOT/scripts")
 ok "all TMP/bin fixture writers use checked temp roots" '[ "$audit_fail" = 0 ]'
 
+# ccc_test_reset_hook_env — ambient harness variables must not reach fixtures (#1023).
+reset_probe() {
+  # Run in a child so the assertions below observe a known starting env.
+  env CCC_BRIDGE_DISTILL_MANAGED=1 CCC_STATE_DIR=/ambient NUNCHI_HOME=/ambient \
+    CCC_TEST_STUB_ROOT=/keep CCC_KEEP_ME=/keep PATH="$PATH" HOME="$HOME" \
+    bash -c '
+      . "$1/test-stub.sh"
+      ccc_test_reset_hook_env CCC_KEEP_ME
+      printf "managed=[%s] state=[%s] nunchi=[%s] stubroot=[%s] keep=[%s] home=[%s]\n" \
+        "${CCC_BRIDGE_DISTILL_MANAGED:-}" "${CCC_STATE_DIR:-}" "${NUNCHI_HOME:-}" \
+        "${CCC_TEST_STUB_ROOT:-}" "${CCC_KEEP_ME:-}" "${HOME:+set}"
+    ' _ "$HERE"
+}
+# shellcheck disable=SC2034  # $reset_out is consumed via eval in ok()
+reset_out="$(reset_probe)"
+
+ok "reset clears the bridge-managed distill flag" \
+  '[[ "$reset_out" == *"managed=[]"* ]]'
+ok "reset clears ambient CCC_* fixture overrides" \
+  '[[ "$reset_out" == *"state=[]"* ]]'
+ok "reset clears ambient NUNCHI_* overrides" \
+  '[[ "$reset_out" == *"nunchi=[]"* ]]'
+ok "reset preserves CCC_TEST_* fixture plumbing" \
+  '[[ "$reset_out" == *"stubroot=[/keep]"* ]]'
+ok "reset preserves explicitly named variables" \
+  '[[ "$reset_out" == *"keep=[/keep]"* ]]'
+ok "reset leaves unrelated environment untouched" \
+  '[[ "$reset_out" == *"home=[set]"* ]]'
+
+# The leak is only fixed where the helper is actually called.
+ok "distill-scope.test.sh resets inherited hook environment" \
+  'grep -q "^ccc_test_reset_hook_env" "$HOOKS/distill-scope.test.sh"'
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

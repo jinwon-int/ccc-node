@@ -8,6 +8,10 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 DISTILL="$HERE/distill.sh"
 # shellcheck source=claude/hooks/lib/test-stub.sh
 . "$HERE/lib/test-stub.sh"
+# Every distill input below comes from a fixture. Ambient harness variables --
+# notably CCC_BRIDGE_DISTILL_MANAGED=1 inside a bridge-managed session, which
+# makes distill.sh a deliberate no-op -- must not reach the hook (#1023).
+ccc_test_reset_hook_env
 pass=0; fail=0
 TMP="$(ccc_test_tmpdir)" || exit 1
 trap 'rm -rf "$TMP"' EXIT
@@ -25,6 +29,9 @@ make_transcript() {
 
 STATE="$TMP/state"
 mkdir -p "$STATE"
+# Fail loudly on the leak itself rather than as 15 opaque side-effect misses.
+ok "caller's bridge-managed flag does not reach the fixtures" \
+  '[ -z "${CCC_BRIDGE_DISTILL_MANAGED:-}" ]'
 managed_out="$TMP/managed.out"
 CCC_STATE_DIR="$STATE" CCC_BRIDGE_DISTILL_MANAGED=1 \
   bash "$DISTILL" sessionend >"$managed_out" 2>&1; rc=$?
