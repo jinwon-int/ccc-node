@@ -26,6 +26,13 @@ MAX_INPUT_BYTES = 64 * 1024
 MAX_HONCHO_FACTS = 12
 MAX_WIKI_CANDIDATES = 3
 MAX_EVIDENCE_IDS = 16
+# The provider output schema advertises every extracted-text limit as a JSON
+# Schema ``maxLength``, which counts CHARACTERS. Reusing that same number as a
+# UTF-8 BYTE cap silently shrinks the real budget to a third for Korean,
+# Japanese, and Chinese text, so a fully schema-compliant answer is rejected as
+# ``distill_output_invalid``. Derive the byte cap from the widest UTF-8
+# encoding instead, keeping the advertised character limit the actual contract.
+_UTF8_MAX_BYTES_PER_CHAR = 4
 _REDACTION_MARKER = "[REDACTED_CREDENTIAL]"
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _EVIDENCE_ID_RE = re.compile(
@@ -79,16 +86,27 @@ def _validate_text(
     *,
     field: str,
     max_chars: int,
-    max_bytes: int,
+    max_bytes: int | None = None,
     allow_empty: bool = False,
     reject_directive: bool = False,
 ) -> str:
+    """Validate extracted text against its character limit and a UTF-8 byte cap.
+
+    ``max_bytes`` defaults to the widest UTF-8 encoding of ``max_chars`` so the
+    byte cap only guards against pathological input size and never contradicts
+    the character limit published in the provider output schema. Pass it
+    explicitly only where the limit is genuinely byte-denominated.
+    """
+    if max_bytes is None:
+        max_bytes = max_chars * _UTF8_MAX_BYTES_PER_CHAR
     if not isinstance(value, str):
         raise ValueError(f"{field} must be text")
     if not allow_empty and not value:
         raise ValueError(f"{field} must not be empty")
-    if len(value) > max_chars or len(value.encode("utf-8")) > max_bytes:
-        raise ValueError(f"{field} exceeds its character or UTF-8 byte limit")
+    if len(value) > max_chars:
+        raise ValueError(f"{field} exceeds its character limit")
+    if len(value.encode("utf-8")) > max_bytes:
+        raise ValueError(f"{field} exceeds its UTF-8 byte limit")
     if _contains_credential(value):
         raise ValueError(f"{field} contains credential-like text")
     if reject_directive and _DIRECTIVE_RE.search(value):
@@ -193,7 +211,6 @@ class HonchoFact(_StrictModel):
             value,
             field="honcho.text",
             max_chars=4096,
-            max_bytes=4096,
             reject_directive=True,
         )
 
@@ -211,7 +228,6 @@ class WikiCandidate(_StrictModel):
             value,
             field="wiki_candidates.title",
             max_chars=160,
-            max_bytes=160,
             reject_directive=True,
         )
 
@@ -243,7 +259,6 @@ class WikiCandidate(_StrictModel):
             value,
             field="wiki_candidates.summary",
             max_chars=600,
-            max_bytes=600,
             reject_directive=True,
         )
 
@@ -254,7 +269,6 @@ class WikiCandidate(_StrictModel):
             value,
             field="wiki_candidates.evidence_excerpt",
             max_chars=200,
-            max_bytes=200,
             reject_directive=True,
         )
 
@@ -274,7 +288,6 @@ class ResumeState(_StrictModel):
             value,
             field="resume.last_activity",
             max_chars=160,
-            max_bytes=160,
             allow_empty=True,
         )
 
@@ -285,7 +298,6 @@ class ResumeState(_StrictModel):
             value,
             field=f"resume.{info.field_name}",
             max_chars=400,
-            max_bytes=400,
             allow_empty=True,
         )
 
