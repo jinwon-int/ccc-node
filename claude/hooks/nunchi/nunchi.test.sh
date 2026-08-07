@@ -62,6 +62,20 @@ CCC_NODE="카렐렌" payload s2 fact node "이 노드는 코덱스 러너다" | 
 row="$(python3 -c "import sqlite3;print(sqlite3.connect('$NUNCHI_DB').execute(\"SELECT observed FROM peer_facts WHERE fact LIKE '%코덱스 러너%'\").fetchone()[0])")"
 ok "persona node subject canonicalized to slug (B3)" '[ "$row" = "yukson" ]'
 
+# ---- 3b. ingest: mutable-ops facts filtered (#1010) ------------------------
+out="$(payload s6 fact node "카렐렌 ccc-node 커밋 efe088b, Bridge active/enabled, NRestarts=0" | python3 "$NP" ingest - 2>&1)"
+ok "mutable-ops state fact skipped at ingest" 'grep -q "ingested 0/1" <<<"$out" && grep -q "skipped_mutable_ops=1" <<<"$out"'
+out="$(payload s7 fact node "서서 systemd HOME 교정 후 정상화" | python3 "$NP" ingest - 2>&1)"
+ok "'정상화' claim skipped" 'grep -q "ingested 0/1" <<<"$out" && grep -q "skipped_mutable_ops=1" <<<"$out"'
+out="$(payload s8 fact user "사용자는 한국어 보고를 선호한다" | python3 "$NP" ingest - 2>&1)"
+ok "durable preference fact still ingested" 'grep -q "ingested 1/1" <<<"$out"'
+out="$(payload s9 correction node "카렐렌 러너 이미지는 74f11bc9가 아니라 638e5a1 이다" | python3 "$NP" ingest - 2>&1)"
+ok "correction carrying SHAs is never filtered" 'grep -q "ingested 1/1" <<<"$out"'
+out="$(payload s10 fact node "20260807 롤아웃을 완료했다" | python3 "$NP" ingest - 2>&1)"
+ok "bare date stamp not misclassified as SHA" 'grep -q "ingested 1/1" <<<"$out"'
+out="$(python3 "$NP" recall "카렐렌" 2>&1)"
+ok "skipped state fact absent from recall" '! grep -q "NRestarts" <<<"$out"'
+
 # ---- 4. recall: observed match + Korean alias query expansion (B3) ---------
 out="$(python3 "$NP" recall "yukson" 2>&1)"
 ok "recall by node slug hits node fact" 'grep -q "코덱스 러너" <<<"$out"'
