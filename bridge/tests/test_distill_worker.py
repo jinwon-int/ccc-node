@@ -245,14 +245,14 @@ async def test_extraction_records_body_free_model_bytes_duration_and_cost_estima
     [
         ("distill_spawn_failed", DistillJobStatus.EXTRACTION_RETRYABLE_FAILED),
         ("distill_timeout", DistillJobStatus.EXTRACTION_RETRYABLE_FAILED),
-        ("distill_output_invalid", DistillJobStatus.EXTRACTION_TERMINAL_FAILED),
+        ("distill_output_invalid", DistillJobStatus.EXTRACTION_RETRYABLE_FAILED),
         ("codex_distill_spawn_failed", DistillJobStatus.EXTRACTION_RETRYABLE_FAILED),
         ("codex_distill_timeout", DistillJobStatus.EXTRACTION_RETRYABLE_FAILED),
         ("codex_distill_io_failed", DistillJobStatus.EXTRACTION_RETRYABLE_FAILED),
         ("codex_distill_nonzero_exit", DistillJobStatus.EXTRACTION_RETRYABLE_FAILED),
         ("codex_distill_schema_unsafe", DistillJobStatus.EXTRACTION_TERMINAL_FAILED),
         ("codex_distill_executable_unsafe", DistillJobStatus.EXTRACTION_TERMINAL_FAILED),
-        ("codex_distill_output_invalid", DistillJobStatus.EXTRACTION_TERMINAL_FAILED),
+        ("codex_distill_output_invalid", DistillJobStatus.EXTRACTION_RETRYABLE_FAILED),
     ],
 )
 @pytest.mark.anyio
