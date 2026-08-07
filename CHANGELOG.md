@@ -4,6 +4,15 @@ All notable changes to the Claude Code node harness. Dates are KST.
 
 ## [Unreleased]
 
+### Changed
+- SessionStart audience search is parallel under one global budget (#897 step
+  2). The local/recent/shared/legacy lanes used to run serially (3+1+3+2s,
+  up to ~9s of the 15s hook budget); they now run concurrently with a global
+  3s wait budget (`CCC_MEMORY_SEARCH_GLOBAL_TIMEOUT_SEC`), each lane keeping
+  its own inner timeout so a cut wait never orphans an unbounded search.
+  Measured on a 2s-per-lane fixture: 8.1s → 3.0s. `CCC_MEMORY_SEARCH_PARALLEL=0`
+  restores the serial path; non-audience mode is unchanged.
+
 ### Fixed
 - Docs: `CCC_NODE_ISOLATION_PROFILE=external` is now described as what it is
   — a memory-source gate that forces Family Wiki paths off — not a
