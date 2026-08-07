@@ -13,6 +13,14 @@ All notable changes to the Claude Code node harness. Dates are KST.
   Measured on a 2s-per-lane fixture: 8.1s → 3.0s. `CCC_MEMORY_SEARCH_PARALLEL=0`
   restores the serial path; non-audience mode is unchanged.
 
+### Added
+- Claude runtime: registered the `fable` model alias (`claude-fable-5`) in
+  `CURATED_CLAUDE_MODELS` and made it the new default, ahead of `sonnet`,
+  `opus`, and `haiku`. The Claude CLI already resolved this alias
+  (`claude --model fable`); the bridge's static curated set was the only
+  place it was missing, so `/model` and new sessions still defaulted to
+  `sonnet`.
+
 ### Fixed
 - Docs: `CCC_NODE_ISOLATION_PROFILE=external` is now described as what it is
   — a memory-source gate that forces Family Wiki paths off — not a
