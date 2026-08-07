@@ -85,8 +85,17 @@ fresh explicit user approval in the current conversation, in both directions.
 
    ```bash
    GH_PR_FLOW_DIR="${CCC_CLAUDE_DIR:-$HOME/.claude}/skills/gh-pr-flow"
-   [ -d "$GH_PR_FLOW_DIR" ] || GH_PR_FLOW_DIR=/opt/ccc-node/claude/skills/gh-pr-flow
+   if [ ! -d "$GH_PR_FLOW_DIR" ]; then
+     for _cand in /opt/ccc-node "$HOME/ccc-node" /root/ccc-node; do
+       [ -d "$_cand/claude/skills/gh-pr-flow" ] || continue
+       GH_PR_FLOW_DIR="$_cand/claude/skills/gh-pr-flow"; break
+     done
+   fi
    ```
+
+   (The fallback tries the fleet's checkout locations in order — `/opt/ccc-node`,
+   `$HOME/ccc-node`, `/root/ccc-node` — instead of hardcoding one; nodes install
+   the repo in different places, which previously forked this snippet per node.)
 
    **Direction A — `jinon86`-authored PR, `seoseo-ai` reviews (local):**
 
