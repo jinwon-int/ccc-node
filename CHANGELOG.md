@@ -4,6 +4,17 @@ All notable changes to the Claude Code node harness. Dates are KST.
 
 ## [Unreleased]
 
+### Added
+- Opt-in fleet skill promotion now connects node-local autosave output to the
+  central ccc-node repository without bypassing review. The daily autosave
+  sweep can reclassify and rescan rollback-eligible `autosave-managed` skills,
+  snapshot only a bounded support-file allowlist, and open content-addressed
+  draft PRs under `skills/shared/`; secret-shaped data, node facts, runtime
+  coupling, unsafe paths, adopted/pinned skills, and central name/description
+  collisions fail closed. The helper never merges or writes `main`, is disabled until an
+  owner-only opt-in is present, honors fleet autonomy kill/dry-run, and records
+  body-free local receipts.
+
 ### Changed
 - Codex skill dedup and gh-pr-flow path cleanup (TM-2331 follow-ups). The
   zero/low-drift Codex ports `gh-ci-wait` and `fleet-disk-constraint-triage`

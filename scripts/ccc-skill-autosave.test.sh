@@ -44,6 +44,18 @@ SCAN="$TMP/scan.sh"
 printf '#!/usr/bin/env bash\necho scanned > "$SCAN_TOUCH"\n' > "$SCAN"
 chmod +x "$SCAN"
 
+PROMOTER="$TMP/promoter.py"
+cat > "$PROMOTER" <<'PY'
+#!/usr/bin/env python3
+import os
+from pathlib import Path
+import sys
+with Path(os.environ["PROMOTION_TOUCH"]).open("a", encoding="utf-8") as handle:
+    handle.write(" ".join(sys.argv[1:]) + "\n")
+print('{"ok":true}')
+PY
+chmod +x "$PROMOTER"
+
 STATE="$TMP/state"
 PROJECTS="$TMP/projects"
 SPOOL="$TMP/spool"
@@ -54,6 +66,7 @@ mkdir -p "$STATE"
 run_autosave() {
   CCC_STATE_DIR="$STATE" CLAUDE_PROJECTS_DIR="$PROJECTS" CCC_PUSH_SPOOL="$SPOOL" \
   CCC_SKILL_REVIEW_CMD="$REVIEW" CCC_SKILL_SCAN_CMD="$SCAN" SCAN_TOUCH="$TMP/scan.touched" \
+  CCC_SKILL_PROMOTION_CMD="$PROMOTER" PROMOTION_TOUCH="$TMP/promotion.touched" \
   CLAUDE_SKILLS_DIR="$TMP/skills" CCC_SKILL_AUTOSAVE_SETTLE_SECONDS=15 \
   CCC_NODE=testnode bash "$AUTOSAVE" run
 }
@@ -62,6 +75,7 @@ run_autosave() {
 run_autosave; rc=$?
 ok "autosave exits 0" '[ "$rc" = 0 ]'
 ok "scanner invoked" '[ -f "$TMP/scan.touched" ]'
+ok "active sweep invokes central promoter in live mode" 'grep -qx "run" "$TMP/promotion.touched"'
 for _ in $(seq 1 40); do
   find "$STATE/pending-skills" -name SKILL.md 2>/dev/null | grep -q . && break
   sleep 0.25
@@ -150,15 +164,18 @@ mkdir -p "$STATE3"
 run_autosave3() {
   CCC_STATE_DIR="$STATE3" CLAUDE_PROJECTS_DIR="$PROJECTS3" CCC_PUSH_SPOOL="$SPOOL3" \
   CCC_SKILL_REVIEW_CMD="$REVIEW" CCC_SKILL_SCAN_CMD="$SCAN" SCAN_TOUCH="$TMP/scan3.touched" \
+  CCC_SKILL_PROMOTION_CMD="$PROMOTER" PROMOTION_TOUCH="$TMP/promotion3.touched" \
   CLAUDE_SKILLS_DIR="$TMP/skills3" CCC_SKILL_AUTOSAVE_SETTLE_SECONDS=15 \
   CCC_NODE=testnode "$@" bash "$AUTOSAVE" run
 }
 
 # 7a) kill via env var
 rm -f "$TMP/scan3.touched"
+rm -f "$TMP/promotion3.touched"
 run_autosave3 env CCC_AUTONOMY=kill; rc=$?
 ok "autonomy=kill exits 0" '[ "$rc" = 0 ]'
 ok "autonomy=kill skips scan" '[ ! -f "$TMP/scan3.touched" ]'
+ok "autonomy=kill skips central promoter" '[ ! -f "$TMP/promotion3.touched" ]'
 ok "autonomy=kill stages no draft" '! find "$STATE3/pending-skills" -name SKILL.md 2>/dev/null | grep -q .'
 ok "autonomy=kill logs reason" 'grep -q "reason=autonomy-kill" "$STATE3/skill-autosave.log"'
 ok "autonomy=kill records to shared fleet ledger" 'grep -q "\"layer\":\"skill-autosave\"" "$STATE3/autonomy-ledger.jsonl" && grep -q "\"state\":\"kill\"" "$STATE3/autonomy-ledger.jsonl"'
@@ -172,8 +189,10 @@ rm -f "$STATE3/autonomy.kill"
 
 # 7c) dry-run does NOT halt the sweep (drafting/human-gate path still runs)
 rm -f "$TMP/scan3.touched"
+rm -f "$TMP/promotion3.touched"
 run_autosave3 env CCC_AUTONOMY=dry-run
 ok "autonomy=dry-run still runs the sweep (scan invoked)" '[ -f "$TMP/scan3.touched" ]'
+ok "autonomy=dry-run previews central promotion" 'grep -qx "run --dry-run" "$TMP/promotion3.touched"'
 
 # 7d) status surfaces the autonomy state
 out="$(CCC_STATE_DIR="$STATE3" CCC_AUTONOMY=kill bash "$AUTOSAVE" status 2>&1)"
