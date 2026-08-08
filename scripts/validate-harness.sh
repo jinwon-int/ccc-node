@@ -218,6 +218,7 @@ if command -v python3 >/dev/null 2>&1; then
   if python3 -m py_compile claude/hooks/skill-review/ownership.py 2>/dev/null; then say "  ok claude/hooks/skill-review/ownership.py compiles"; else err "py_compile: claude/hooks/skill-review/ownership.py"; fi
   if python3 -m py_compile claude/hooks/skill-review/curator.py 2>/dev/null; then say "  ok claude/hooks/skill-review/curator.py compiles"; else err "py_compile: claude/hooks/skill-review/curator.py"; fi
   if python3 -m py_compile scripts/ccc_codex_github_policy.py 2>/dev/null; then say "  ok scripts/ccc_codex_github_policy.py compiles"; else err "py_compile: scripts/ccc_codex_github_policy.py"; fi
+  if python3 -m py_compile scripts/ccc-skill-promotion.py 2>/dev/null; then say "  ok scripts/ccc-skill-promotion.py compiles"; else err "py_compile: scripts/ccc-skill-promotion.py"; fi
   if python3 -m py_compile scripts/ccc_memory_probe.py 2>/dev/null; then say "  ok scripts/ccc_memory_probe.py compiles"; else err "py_compile: scripts/ccc_memory_probe.py"; fi
   if python3 -m py_compile bridge/runtime_config_check.py 2>/dev/null; then say "  ok bridge/runtime_config_check.py compiles"; else err "py_compile: bridge/runtime_config_check.py"; fi
 else
@@ -278,6 +279,7 @@ for t in claude/hooks/observability.test.sh claude/hooks/security-scan.test.sh \
          scripts/a2a-termux-native-worker-health.test.sh \
          scripts/resource-pressure-guard.test.sh \
          scripts/install-memory-refresh-cron.test.sh scripts/install-nunchi.test.sh scripts/install-termux-mempalace.test.sh scripts/ccc-skill-autosave.test.sh \
+         scripts/ccc-skill-promotion.test.sh \
          scripts/gh-pr-flow-seoseo-merge.test.sh \
          scripts/ccc-self-update.test.sh scripts/self-update-check.test.sh scripts/ccc-provenance.test.sh \
          scripts/bridge-watchdog.test.sh \
