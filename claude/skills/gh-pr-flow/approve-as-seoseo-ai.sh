@@ -41,6 +41,11 @@ if [ "$actor" != "seoseo-ai" ]; then
   die "expected local review actor seoseo-ai; refusing review" 65
 fi
 
+# Guard on the repository's own default branch, not the literal name "main" —
+# a master-based repo would otherwise be refused as if the credential were wrong.
+default_branch="$(GH_TOKEN="$token" gh api "repos/$repo" --jq .default_branch)"
+[[ "$default_branch" =~ ^[A-Za-z0-9._/-]+$ ]] || die "repository default branch is invalid" 65
+
 metadata="$(GH_TOKEN="$token" gh pr view "$pr" --repo "$repo" \
   --json author,baseRefName,state \
   --jq '[.author.login, .baseRefName, .state] | @tsv')"
@@ -52,8 +57,11 @@ fi
 if [ "$author" != "$expected_author" ]; then
   die "expected PR author $expected_author; refusing review for $author" 65
 fi
-if [ "$base" != "main" ] || [ "$state" != "OPEN" ]; then
-  die "review target must be an open PR against main" 65
+if [ "$base" != "$default_branch" ]; then
+  die "review target base is not the repository default branch" 65
+fi
+if [ "$state" != "OPEN" ]; then
+  die "review target is not open" 65
 fi
 
 GH_TOKEN="$token" gh pr review "$pr" --repo "$repo" --approve \

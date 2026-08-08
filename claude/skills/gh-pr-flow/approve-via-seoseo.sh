@@ -33,6 +33,17 @@ if [ "$actor" != "jinon86" ]; then
   exit 65
 fi
 
+# The guard is "the PR targets the repository's own default branch", not "the
+# branch is literally named main". Hardcoding main silently refused every PR in
+# a master-based repo (e.g. seoyoon-family-wiki), which reads as a credential or
+# permission problem rather than a naming mismatch. Resolve it instead, the way
+# codex/skills/gh-pr-flow/scripts/approve-via-seoseo.sh already does.
+default_branch="$(gh api "repos/$repo" --jq .default_branch)"
+if ! [[ "$default_branch" =~ ^[A-Za-z0-9._/-]+$ ]]; then
+  echo "ERROR: repository default branch is invalid" >&2
+  exit 65
+fi
+
 metadata="$(gh pr view "$pr" --repo "$repo" \
   --json author,baseRefName,state,reviewRequests \
   --jq '[.author.login, .baseRefName, .state, (([.reviewRequests[].login] | index("jinon86")) != null)] | @tsv')"
@@ -46,8 +57,12 @@ if [ "$author" != "seoseo-ai" ]; then
   echo "ERROR: expected PR author seoseo-ai; refusing review for $author" >&2
   exit 65
 fi
-if [ "$base" != "main" ] || [ "$state" != "OPEN" ]; then
-  echo "ERROR: review target must be an open PR against main" >&2
+if [ "$base" != "$default_branch" ]; then
+  echo "ERROR: review target base is not the repository default branch" >&2
+  exit 65
+fi
+if [ "$state" != "OPEN" ]; then
+  echo "ERROR: review target is not open" >&2
   exit 65
 fi
 if [ "$requested" != "true" ]; then

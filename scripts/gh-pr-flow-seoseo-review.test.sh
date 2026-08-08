@@ -35,8 +35,11 @@ set -euo pipefail
 printf '%s\n' "$*" >>"$MOCK_GH_LOG"
 if [ "$1 $2" = "api user" ]; then
   printf '%s\n' "${MOCK_ACTOR:-jinon86}"
+elif [ "$1" = "api" ] && [[ "$2" == repos/* ]]; then
+  printf '%s\n' "${MOCK_DEFAULT_BRANCH:-main}"
 elif [ "$1 $2" = "pr view" ] && [[ " $* " == *" author,baseRefName,state,reviewRequests "* ]]; then
-  printf '%s\tmain\tOPEN\t%s\n' "${MOCK_AUTHOR:-seoseo-ai}" "${MOCK_REQUESTED:-true}"
+  printf '%s\t%s\tOPEN\t%s\n' \
+    "${MOCK_AUTHOR:-seoseo-ai}" "${MOCK_BASE:-main}" "${MOCK_REQUESTED:-true}"
 elif [ "$1 $2" = "pr review" ]; then
   : >"$MOCK_REVIEW_MARKER"
 elif [ "$1 $2" = "pr view" ] && [[ " $* " == *" reviewDecision,reviews "* ]]; then
@@ -109,6 +112,29 @@ if MOCK_REQUESTED=false CCC_EXPLICIT_USER_APPROVAL=1 \
   bad "helper approved without a jinon86 review request"
 elif [ -e "$MOCK_REVIEW_MARKER" ]; then
   bad "helper submitted an unrequested review before refusing"
+else
+  ok
+fi
+
+# The guard is "PR targets the repository's own default branch", not "the branch
+# is named main". Hardcoding main refused every PR in a master-based repo
+# (seoyoon-family-wiki#3304) with a message that read like a credential fault.
+# These two cases are what the earlier suite was missing.
+rm -f "$MOCK_REVIEW_MARKER"
+if MOCK_DEFAULT_BRANCH=master MOCK_BASE=master CCC_EXPLICIT_USER_APPROVAL=1 \
+   "$HELPER" jinwon-int/seoyoon-family-wiki 3304 >"$TMP/master-repo.out" 2>&1 \
+   && [ -e "$MOCK_REVIEW_MARKER" ]; then
+  ok
+else
+  bad "helper refused a PR against a master-based repository's default branch"
+fi
+
+rm -f "$MOCK_REVIEW_MARKER"
+if MOCK_DEFAULT_BRANCH=main MOCK_BASE=release/2026-08 CCC_EXPLICIT_USER_APPROVAL=1 \
+   "$HELPER" jinwon-int/ccc-node 535 >"$TMP/wrong-base.out" 2>&1; then
+  bad "helper approved a PR whose base is not the default branch"
+elif [ -e "$MOCK_REVIEW_MARKER" ]; then
+  bad "helper submitted a review before refusing a non-default base"
 else
   ok
 fi
