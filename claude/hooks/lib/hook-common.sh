@@ -15,7 +15,14 @@ is_disabled() { case "${1:-}" in 0|false|FALSE|off|OFF|no|NO) return 0;; *) retu
 ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 
 # log <msg...> — best-effort append to $LOG (evaluated at call time).
-log() { printf '%s %s\n' "$(ts)" "$*" >> "${LOG:-/dev/null}" 2>/dev/null; }
+#
+# `2>/dev/null` precedes the append: redirections are applied left to right, so
+# with `>> "$LOG" 2>/dev/null` the shell's "No such file or directory" for an
+# unwritable destination was emitted before stderr was silenced and leaked to
+# the hook's own stderr. `|| :` keeps the documented best-effort contract --
+# hooks call this fire-and-forget, several as the last statement of a function,
+# where a failed append would otherwise become that function's exit status.
+log() { printf '%s %s\n' "$(ts)" "$*" 2>/dev/null >> "${LOG:-/dev/null}" || :; }
 
 # find_memory_tool <tool-name> — locate a memory CLI next to the hooks or in
 # the repo scripts/ dir. Requires $HOOKDIR to be set by the caller.
