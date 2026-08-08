@@ -283,6 +283,7 @@ for t in claude/hooks/observability.test.sh claude/hooks/security-scan.test.sh \
          scripts/ccc-bridge-locate.test.sh \
          bridge/service-install.test.sh \
          bridge/restart.test.sh \
+         bridge/start-lib.test.sh \
          scripts/converge-distill-peer.test.sh \
          scripts/install-agent-cron-systemd.test.sh \
          codex/headless.test.sh crush/headless.test.sh \
