@@ -229,6 +229,8 @@ ok "custom-path rewrite leaves node-local credentials untouched" \
   '[ "$rc" = 0 ] && [ "$(sha256sum "$rewrite_claude/.credentials.json")" = "$credential_before" ]'
 ok "setup installs the Codex common managed skill set with provenance" \
   '[ -f "$TMP/rewrite-home/.codex/skills/ccc-doctor/SKILL.md" ] && [ -f "$TMP/rewrite-home/.codex/skills/ccc-node-status/SKILL.md" ] && [ -f "$TMP/rewrite-home/.codex/skills/ccc-security-audit/SKILL.md" ] && [ -f "$TMP/rewrite-home/.codex/skills/ccc-agent-cron/SKILL.md" ] && [ -f "$TMP/rewrite-home/.codex/skills/ccc-self-update/SKILL.md" ] && [ -f "$TMP/rewrite-home/.codex/skills/ccc-wiki-record/SKILL.md" ] && jq -e ".manager == \"ccc-node\"" "$TMP/rewrite-home/.codex/skills/ccc-doctor/.ccc-node-managed.json" >/dev/null'
+ok "setup installs the opt-in central skill promoter executable" \
+  '[ -x "$rewrite_claude/hooks/ccc-skill-promotion.py" ] && cmp -s "$ROOT/scripts/ccc-skill-promotion.py" "$rewrite_claude/hooks/ccc-skill-promotion.py"'
 rewrite_agent_cron="$rewrite_claude/state/agent-cron/tasks.json"
 ok "setup registers the self-update command task against the real agent-cron contract" \
   'jq -e --arg hook "$rewrite_claude/hooks/ccc-self-update.sh" '\''[.tasks[] | select(.id == "self-update" and .enabled == true and .notify == "telegram-owner-on-failure" and .successExitCodes == [0,8,11] and .payload.kind == "command" and .payload.argv == [$hook,"run"] and (.prompt | length > 0))] | length == 1'\'' "$rewrite_agent_cron" >/dev/null'
