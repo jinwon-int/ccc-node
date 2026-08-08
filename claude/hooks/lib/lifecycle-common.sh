@@ -89,7 +89,7 @@ ccc_lifecycle_append_line() { # <file> <already-body-free-line>
     [ -f "$path" ] && [ ! -L "$path" ] && [ -O "$path" ] || return 1
   fi
   chmod 600 "$path" 2>/dev/null || return 1
-  printf '%s\n' "$line" >> "$path" 2>/dev/null
+  printf '%s\n' "$line" 2>/dev/null >> "$path"
 }
 
 ccc_lifecycle_append_unique_line() { # <file> <body-free-line> <opaque-dedup>
@@ -105,5 +105,5 @@ ccc_lifecycle_append_unique_line() { # <file> <body-free-line> <opaque-dedup>
   fi
   chmod 600 "$path" 2>/dev/null || return 1
   grep -Fq -- "$dedup" "$path" 2>/dev/null && return 0
-  printf '%s\n' "$line" >> "$path" 2>/dev/null
+  printf '%s\n' "$line" 2>/dev/null >> "$path"
 }

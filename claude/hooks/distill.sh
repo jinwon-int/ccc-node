@@ -48,7 +48,7 @@ mkdir -p "$STATE_DIR" 2>/dev/null
 
 if [ -f "$STATE_DIR/distill.disabled" ]; then
   printf '%s skipped reason=disabled trigger=%s\n' \
-    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${1:-unknown}" >> "$LOG" 2>/dev/null
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${1:-unknown}" 2>/dev/null >> "$LOG" || :
   exit 0
 fi
 
@@ -70,7 +70,7 @@ if declare -f ccc_autonomy_state >/dev/null 2>&1; then
 fi
 if [ "$AUTONOMY_STATE" = "kill" ]; then
   printf '%s skipped reason=autonomy-kill trigger=%s\n' \
-    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${1:-unknown}" >> "$LOG" 2>/dev/null
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${1:-unknown}" 2>/dev/null >> "$LOG" || :
   # Record once per real trigger (foreground only) into the shared fleet ledger;
   # bg re-exec / pending-drain re-hit the same guard and must not double-log.
   if [ -z "${CLAUDE_DISTILL_BG:-}" ] && declare -f ccc_autonomy_record >/dev/null 2>&1; then

@@ -110,7 +110,7 @@ audit() { # <result> <old> <new> <changed> <setup_ok> <services-json>
   jq -nc --arg ts "$(ts)" --arg result "$1" --arg old "$2" --arg new "$3" \
     --argjson changed "$4" --argjson setup_ok "$5" --argjson services "$6" \
     '{ts:$ts, result:$result, old:$old, new:$new, changed:$changed, setup_ok:$setup_ok, services:$services}' \
-    >> "$LOG" 2>/dev/null
+    2>/dev/null >> "$LOG" || :
 }
 
 read_operator_cmd() { # <file> — first non-comment, non-blank line (operator-owned)
