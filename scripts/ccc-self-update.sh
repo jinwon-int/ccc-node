@@ -81,7 +81,7 @@ HERMES_SNAPSHOT=""
 KEEP_INSTALL_SNAPSHOT=0
 
 ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
-log() { printf '%s %s\n' "$(ts)" "$*" >> "$LOG" 2>/dev/null; }
+log() { printf '%s %s\n' "$(ts)" "$*" 2>/dev/null >> "$LOG" || :; }
 say() { printf '%s\n' "$*"; }
 
 resolve_repo() {

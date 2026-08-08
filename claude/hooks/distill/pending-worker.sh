@@ -12,7 +12,7 @@ STATE_DIR="${CCC_STATE_DIR:-${HOME:-/root}/.claude/state}"
 LOG="$STATE_DIR/distill.log"
 job_id="$(basename "$PENDING_JOB" .json)"
 
-log() { printf '%s [pending-worker] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >> "$LOG" 2>/dev/null; }
+log() { printf '%s [pending-worker] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" 2>/dev/null >> "$LOG" || :; }
 
 python3 "$ADAPTER" run "$PENDING_DIR" "$PENDING_JOB" "$DISTILL"
 rc=$?

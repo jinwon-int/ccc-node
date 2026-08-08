@@ -19,7 +19,7 @@ case "$MAX_BATCH" in ''|*[!0-9]*) MAX_BATCH=3 ;; esac
 [ "$MAX_BATCH" -gt 0 ] || exit 0
 mkdir -p "$STATE_DIR" 2>/dev/null || exit 0
 
-log() { printf '%s [pending-drain] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >> "$LOG" 2>/dev/null; }
+log() { printf '%s [pending-drain] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" 2>/dev/null >> "$LOG" || :; }
 
 [ -d "$PENDING_DIR" ] || exit 0
 [ ! -L "$PENDING_DIR" ] || { log "skip reason=pending-dir-symlink"; exit 0; }

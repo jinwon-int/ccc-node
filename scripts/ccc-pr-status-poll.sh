@@ -45,7 +45,7 @@ GH="${CCC_PR_STATUS_POLL_GH:-gh}"
 mkdir -p "$STATE_DIR" 2>/dev/null
 
 ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
-log() { printf '%s %s\n' "$(ts)" "$*" >> "$LOG" 2>/dev/null; }
+log() { printf '%s %s\n' "$(ts)" "$*" 2>/dev/null >> "$LOG" || :; }
 say() { printf '%s\n' "$*"; }
 
 notify() { # <text> <dedup-suffix>

@@ -34,7 +34,7 @@ MAX_BATCH="${CCC_DISTILL_DRAIN_BATCH:-20}"
 MAX_ATTEMPTS="${CCC_DISTILL_DRAIN_MAX_ATTEMPTS:-3}"
 
 mkdir -p "$STATE_DIR" 2>/dev/null
-log() { printf '%s [drain] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >> "$LOG" 2>/dev/null; }
+log() { printf '%s [drain] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" 2>/dev/null >> "$LOG" || :; }
 invalidate_honcho_refresh() {
   local tmp="$STATE_DIR/.honcho-refresh.invalidate.$$"
   (
