@@ -2,7 +2,11 @@
 
 # Telegram Skill Bot startup script
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# ${BASH_SOURCE[0]} so the path resolves when this file is sourced for its
+# helper definitions too (see the CCC_START_SH_LIB_ONLY seam below); when the
+# script is executed normally BASH_SOURCE[0] is exactly $0, so the resolved
+# directory -- and everything derived from it -- is unchanged.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 VENV_DIR="$SCRIPT_DIR/venv"
 REQ_FILE="$SCRIPT_DIR/requirements.txt"
@@ -278,7 +282,12 @@ cleanup_pid() {
 _cmdline_is_project_bot() {
     local file="$1" arg has_module=0 path_match=0
     local -a argv=()
-    while IFS= read -r -d '' arg; do argv+=("$arg"); done < "$file" 2>/dev/null
+    # `2>/dev/null` precedes the input redirection: redirections are applied
+    # left to right, so with `< "$file" 2>/dev/null` the shell's "No such file"
+    # for an unreadable cmdline is emitted before stderr is silenced and leaks
+    # to the caller. A racing process can exit between pgrep and this read, so
+    # the miss is expected and must stay quiet. Return value is unchanged.
+    while IFS= read -r -d '' arg; do argv+=("$arg"); done 2>/dev/null < "$file"
     local i
     for ((i = 0; i < ${#argv[@]}; i++)); do
         [ "${argv[i]}" = "telegram_bot" ] && has_module=1
@@ -1115,6 +1124,20 @@ do_restart() {
     restart_status_snapshot
     exit 0
 }
+
+# ── Unit-test seam (#584 P3-2) ──
+#
+# Sourcing this file with CCC_START_SH_LIB_ONLY=1 yields the helper definitions
+# without dispatching an action, so the process-identification predicates below
+# can be unit-tested against fixtures instead of live processes. Everything
+# above this point is definitions plus argument parsing; the first side effect
+# of a real run is the dispatch immediately below, so no real invocation
+# reaches here with the variable set and behaviour is unchanged for all of
+# them. `return` succeeds only when sourced; the `exit` keeps a direct
+# execution with the variable set from silently falling through to dispatch.
+if [ -n "${CCC_START_SH_LIB_ONLY:-}" ]; then
+    return 0 2>/dev/null || exit 0
+fi
 
 # ── Dispatch action ──
 
