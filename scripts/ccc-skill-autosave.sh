@@ -69,7 +69,7 @@ case "$REGROWTH_BYTES" in ''|*[!0-9]*) REGROWTH_BYTES=16384 ;; esac
 
 mkdir -p "$STATE_DIR" "$PENDING_DIR" 2>/dev/null
 ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
-log() { printf '%s %s\n' "$(ts)" "$*" >> "$LOG" 2>/dev/null; }
+log() { printf '%s %s\n' "$(ts)" "$*" 2>/dev/null >> "$LOG" || :; }
 
 pending_count() {
   find "$PENDING_DIR" -mindepth 1 -maxdepth 1 -type d 2>/dev/null \

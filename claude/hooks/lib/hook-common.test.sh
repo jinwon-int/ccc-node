@@ -142,5 +142,32 @@ done < <(grep -rl '^is_disabled()' "$ROOT/claude" "$ROOT/scripts" 2>/dev/null)
 # shellcheck disable=SC2034  # $drift is consumed via eval in ok()
 ok "every remaining is_disabled copy is byte-identical to the canonical one" '[ "$drift" = 0 ]'
 
+# --- redirect-order audit over every log() in the repo -----------------------
+# `printf ... >> "$LOG" 2>/dev/null` does not do what it looks like: shells
+# apply redirections left to right, so a destination that cannot be opened is
+# reported to the real stderr before it is silenced, and the failure becomes
+# the function's exit status -- several callers invoke log as the last
+# statement of a function. The same ordering bug appeared independently in
+# start.sh (#1054) and hook-common.sh (#1055), then in six more log() copies,
+# so pin the shape rather than wait for the next one.
+#
+# A log() that never redirects stderr at all is out of scope: it makes no
+# silence promise, and this audit only holds the ones that do to it.
+log_order=0
+while IFS= read -r f; do
+  while IFS= read -r line; do
+    case "$line" in *2\>/dev/null*) ;; *) continue ;; esac
+    # Defective when the append/truncate appears before the silencing.
+    case "$line" in
+      *'>>'*2\>/dev/null*|*'> "$LOG"'*2\>/dev/null*)
+        echo "log() silences stderr after opening the file (order defeats it): $f"
+        # shellcheck disable=SC2034  # consumed via eval in ok()
+        log_order=1 ;;
+    esac
+  done < <(grep -h '^log() {.*}$' "$f")
+done < <(grep -rl '^log() {' "$ROOT/claude" "$ROOT/scripts" 2>/dev/null)
+# shellcheck disable=SC2034  # $log_order is consumed via eval in ok()
+ok "no single-line log() silences stderr after opening its destination" '[ "$log_order" = 0 ]'
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
