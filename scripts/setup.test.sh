@@ -229,10 +229,25 @@ ok "setup installs the Codex common managed skill set with provenance" \
 rewrite_agent_cron="$rewrite_claude/state/agent-cron/tasks.json"
 ok "setup registers the self-update command task against the real agent-cron contract" \
   'jq -e --arg hook "$rewrite_claude/hooks/ccc-self-update.sh" '\''[.tasks[] | select(.id == "self-update" and .enabled == true and .notify == "telegram-owner-on-failure" and .successExitCodes == [0,8,11] and .payload.kind == "command" and .payload.argv == [$hook,"run"] and (.prompt | length > 0))] | length == 1'\'' "$rewrite_agent_cron" >/dev/null'
+# --- #1042: reinstall must REPLACE managed files via rename, never truncate the
+# installed inode in place. bash reads a running script incrementally by inode,
+# so an in-place cp made the cron-run installed self-update hook (which invokes
+# setup.sh) crash mid-run with a spurious syntax error — after the repo update
+# but before service restart / audit record (silent half-apply, 9/12 fleet
+# nodes on 2026-08-07). The staged temp is created while the old inode is still
+# linked, so a rename-based install ALWAYS changes the destination inode.
+selfupdate_ino_before="$(stat -c '%i' "$rewrite_claude/hooks/ccc-self-update.sh")"
+hooktree_ino_before="$(stat -c '%i' "$rewrite_claude/hooks/checkpoint.sh")"
 HOME="$TMP/rewrite-home" CCC_CLAUDE_DIR="$rewrite_claude" CCC_HERMES_DIR="$rewrite_hermes" \
   bash "$SETUP" --no-backup >/dev/null 2>&1
 ok "setup self-update task registration is idempotent" \
   '[ "$(jq '\''[.tasks[] | select(.id == "self-update")] | length'\'' "$rewrite_agent_cron")" = 1 ]'
+ok "reinstall replaces the self-update hook inode (rename, never in-place truncate)" \
+  '[ "$(stat -c "%i" "$rewrite_claude/hooks/ccc-self-update.sh")" != "$selfupdate_ino_before" ] && [ -x "$rewrite_claude/hooks/ccc-self-update.sh" ] && grep -Fq "lib/harness-paths.sh" "$rewrite_claude/hooks/ccc-self-update.sh"'
+ok "reinstall replaces hook-tree inodes and keeps them executable" \
+  '[ "$(stat -c "%i" "$rewrite_claude/hooks/checkpoint.sh")" != "$hooktree_ino_before" ] && [ -x "$rewrite_claude/hooks/checkpoint.sh" ]'
+ok "atomic staging leaves no hidden temp files behind" \
+  '[ -z "$(find "$rewrite_claude" -name ".*.??????" 2>/dev/null)" ]'
 ok "setup installs the Piri web skill when a Piri agent dir exists" \
   '[ -f "$TMP/rewrite-home/.piri/agent/skills/web/SKILL.md" ] && [ -x "$TMP/rewrite-home/.piri/agent/skills/web/web_search.py" ] && [ -x "$TMP/rewrite-home/.piri/agent/skills/web/web_fetch.py" ] && cmp -s "$ROOT/piri/skills/web/web_search.py" "$TMP/rewrite-home/.piri/agent/skills/web/web_search.py"'
 # Repo skills install as refreshed copies from the claude + shared trees, with
