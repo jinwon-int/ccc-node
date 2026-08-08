@@ -4,11 +4,20 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 # shellcheck source=claude/hooks/lib/test-stub.sh
 . "$ROOT/claude/hooks/lib/test-stub.sh"
+# A live node exports CCC_MEMORY_AUDIENCE_SCOPED=1, so load-memory.sh fails
+# closed on the caller's audience metadata and 12 assertions miss here (#1023).
+ccc_test_reset_hook_env
 pass=0; fail=0
 BASE_TMP="${TMPDIR:-/tmp}"; mkdir -p "$BASE_TMP"
 TMP="$(ccc_test_tmpdir "$BASE_TMP/ccc-memory-hooks-test.XXXXXX")" || exit 1
 trap 'rm -rf "$TMP"' EXIT
 ok() { if eval "$2"; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $1"; fi; }
+
+# Fail on the leak itself rather than as 12 opaque misses further down: an
+# inherited audience scope makes load-memory.sh fail closed before it reads any
+# fixture, which reads like a dozen unrelated regressions.
+ok "caller's audience scope does not reach the fixtures" \
+  '[ -z "${CCC_MEMORY_AUDIENCE_SCOPED:-}" ] && [ -z "${CCC_MEMORY_SCOPE:-}" ]'
 
 state="$TMP/state"; cache="$TMP/cache"; mem="$TMP/mem"; tools="$TMP/tools"
 mkdir -p "$state" "$cache" "$mem" "$tools"

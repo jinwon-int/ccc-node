@@ -10,6 +10,9 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 SUT="$HERE/mcp-setup.sh"
 # shellcheck source=claude/hooks/lib/test-stub.sh
 . "$HERE/hooks/lib/test-stub.sh"
+# Fixtures supply every CCC_* input this suite needs; ambient harness variables
+# from a live node must not reach them (#1023).
+ccc_test_reset_hook_env
 pass=0; fail=0
 ok() { if eval "$2"; then pass=$((pass + 1)); else fail=$((fail + 1)); echo "FAIL: $1"; fi; }
 

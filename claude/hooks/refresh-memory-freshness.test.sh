@@ -6,6 +6,9 @@ ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 REFRESH="$ROOT/claude/hooks/refresh-memory.sh"
 # shellcheck source=claude/hooks/lib/test-stub.sh
 . "$ROOT/claude/hooks/lib/test-stub.sh"
+# Inherited CCC_MEMORY_* paths point refresh-memory.sh at the real node state
+# instead of the fixture: 14 of 15 assertions miss on a live node (#1023).
+ccc_test_reset_hook_env
 
 pass=0
 fail=0

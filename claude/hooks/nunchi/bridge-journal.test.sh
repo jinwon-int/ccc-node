@@ -6,6 +6,9 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 # shellcheck source=claude/hooks/lib/test-stub.sh
 . "$ROOT/claude/hooks/lib/test-stub.sh"
+# Fixtures supply every CCC_* input this suite needs; ambient harness variables
+# from a live node must not reach them (#1023).
+ccc_test_reset_hook_env
 
 pass=0; fail=0
 TMP="$(ccc_test_tmpdir)" || exit 1
