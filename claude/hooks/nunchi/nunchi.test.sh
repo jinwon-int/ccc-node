@@ -7,6 +7,8 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 NP="$HERE/nunchi.py"
 # shellcheck source=claude/hooks/lib/test-stub.sh
 . "$HERE/../lib/test-stub.sh"
+# Inherited CCC_/NUNCHI_ state reaches nunchi.py and costs one assertion (#1023).
+ccc_test_reset_hook_env
 
 pass=0; fail=0
 TMP="$(ccc_test_tmpdir)" || exit 1

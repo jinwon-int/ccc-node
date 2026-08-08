@@ -5,6 +5,9 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/../../.." && pwd)"
 # shellcheck source=claude/hooks/lib/test-stub.sh
 . "$HERE/test-stub.sh"
+# Fixtures supply every CCC_* input this suite needs; ambient harness variables
+# from a live node must not reach them (#1023).
+ccc_test_reset_hook_env
 pass=0; fail=0
 ok() { if eval "$2"; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $1"; fi; }
 
@@ -161,19 +164,23 @@ ok "reset preserves explicitly named variables" \
 ok "reset leaves unrelated environment untouched" \
   '[[ "$reset_out" == *"home=[set]"* ]]'
 
-# The helper only fixes suites that actually call it, so audit the distill
-# suites -- these drive hooks guarded by CCC_BRIDGE_DISTILL_MANAGED, which a
-# bridge-managed session exports. Catches a new suite reintroducing the leak.
+# The helper only fixes suites that actually call it, so audit every suite that
+# sources the stub -- not just the distill lane it was introduced for. The leak
+# is invisible in CI (which exports no CCC_*) and only bites operators running
+# validation on a real node, so a missing call has to fail as an assertion here
+# rather than as scattered misses somewhere else. Surveyed on nosuk/vps2: six
+# suites were losing ~165 assertions to inherited state, and every suite in this
+# audit passes with no CCC_* set at all, so resetting is safe for all of them.
 reset_audit_fail=0
 while IFS= read -r test_file; do
   grep -q 'lib/test-stub.sh' "$test_file" || continue
   if ! grep -q '^ccc_test_reset_hook_env' "$test_file"; then
-    echo "distill suite does not reset inherited hook env: $test_file"
+    echo "suite does not reset inherited hook env: $test_file"
     reset_audit_fail=1
   fi
-done < <(find "$HOOKS" -name 'distill-*.test.sh' -o -path "$HOOKS/distill/*.test.sh")
+done < <(find "$ROOT/claude" "$ROOT/scripts" -name '*.test.sh')
 # shellcheck disable=SC2034  # $reset_audit_fail is consumed via eval in ok()
-ok "all distill suites reset inherited hook environment" '[ "$reset_audit_fail" = 0 ]'
+ok "every stub-sourcing suite resets inherited hook environment" '[ "$reset_audit_fail" = 0 ]'
 
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

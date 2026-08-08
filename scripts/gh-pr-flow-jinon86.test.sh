@@ -6,6 +6,9 @@ HELPER="$ROOT/codex/skills/gh-pr-flow/scripts/approve-via-seoseo.sh"
 WRAPPER="$ROOT/codex/skills/gh-pr-flow/scripts/approve-via-jinon86.sh"
 # shellcheck source=claude/hooks/lib/test-stub.sh
 . "$ROOT/claude/hooks/lib/test-stub.sh"
+# Fixtures supply every CCC_* input this suite needs; ambient harness variables
+# from a live node must not reach them (#1023).
+ccc_test_reset_hook_env
 TMP="$(ccc_test_tmpdir)" || exit 1
 trap 'rm -rf "$TMP"' EXIT
 PASS=0

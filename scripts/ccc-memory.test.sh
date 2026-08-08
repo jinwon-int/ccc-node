@@ -4,6 +4,9 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 # shellcheck source=claude/hooks/lib/test-stub.sh
 . "$ROOT/claude/hooks/lib/test-stub.sh"
+# The largest instance of this leak: inherited CCC_MEMORY_* redirects the tool
+# at real node stores and 74 assertions miss on a live node (#1023).
+ccc_test_reset_hook_env
 pass=0; fail=0
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT

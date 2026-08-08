@@ -8,6 +8,9 @@ umask 077
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 # shellcheck source=claude/hooks/lib/test-stub.sh
 . "$ROOT/claude/hooks/lib/test-stub.sh"
+# Inherited installer env aborts this suite outright on a live node -- it never
+# reaches its summary, so all 60 assertions are lost (#1023).
+ccc_test_reset_hook_env
 
 pass=0; fail=0
 TMP="$(ccc_test_tmpdir)" || exit 1
