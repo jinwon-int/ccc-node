@@ -57,11 +57,15 @@ fresh explicit user approval in the current conversation, in both directions.
    EOF
    ```
 
-3. Push and open a PR against `main`:
+3. Push and open a PR against the repository's default branch. It is `main` in
+   most `jinwon-int` repos but **`master` in `seoyoon-family-wiki`** — the review
+   and merge helpers verify the base against `gh api repos/<owner>/<repo> --jq
+   .default_branch`, so a PR opened against the wrong branch is refused:
 
    ```bash
    git push -u origin <branch>
-   gh pr create --repo <owner/repo> --base main --head <branch> \
+   base="$(gh api repos/<owner>/<repo> --jq .default_branch)"
+   gh pr create --repo <owner/repo> --base "$base" --head <branch> \
      --title "<type>(<scope>): <summary>" --body "<what / why / evidence>"
    ```
 

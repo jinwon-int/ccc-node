@@ -34,6 +34,8 @@ cat > "$TMP/bin/gh" <<'SH'
 set -euo pipefail
 if [ "${1:-}" = api ] && [ "${2:-}" = user ]; then
   printf '%s\n' "${FAKE_ACTOR:-jinon86}"
+elif [ "${1:-}" = api ] && [[ "${2:-}" == repos/* ]]; then
+  printf '%s\n' "${FAKE_DEFAULT_BRANCH:-main}"
 elif [ "${1:-}" = pr ] && [ "${2:-}" = view ]; then
   jq -n \
     --arg head "${FAKE_HEAD:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}" \
@@ -113,6 +115,25 @@ if "$SCRIPT" --repo jinwon-int/ccc-node --pr 1 --expected-head "$HEAD_SHA" \
     || fail "merge output or API invocation invalid"
 else
   fail "valid merge failed"
+fi
+
+# Base guard is the repository's own default branch, not the literal "main".
+rm -f "$FAKE_MERGE_MARKER"
+if FAKE_DEFAULT_BRANCH=master FAKE_BASE=master \
+  "$SCRIPT" --repo jinwon-int/seoyoon-family-wiki --pr 3304 --expected-head "$HEAD_SHA" \
+  --operator-approved --dry-run >"$TMP/out" 2>"$TMP/err"; then
+  pass
+else
+  fail "master-based repository default branch was rejected"
+fi
+
+FAKE_DEFAULT_BRANCH=main FAKE_BASE=release/2026-08 \
+  "$SCRIPT" --repo jinwon-int/ccc-node --pr 1 --expected-head "$HEAD_SHA" \
+  --operator-approved --dry-run >"$TMP/out" 2>"$TMP/err" && rc=0 || rc=$?
+if [ "$rc" -ne 0 ] && grep -q 'base branch is not the repository default branch' "$TMP/err"; then
+  pass
+else
+  fail "non-default base branch was not rejected"
 fi
 
 echo "PASS=$PASS FAIL=$FAIL"

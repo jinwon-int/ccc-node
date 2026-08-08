@@ -77,6 +77,13 @@ actor="$(gh api user --jq .login)"
   exit 3
 }
 
+# Guard on the repository's own default branch, not the literal name "main".
+default_branch="$(gh api "repos/$repo" --jq .default_branch)"
+[[ "$default_branch" =~ ^[A-Za-z0-9._/-]+$ ]] || {
+  echo "refusing merge: repository default branch is invalid" >&2
+  exit 4
+}
+
 pr_json="$(gh pr view "$pr" --repo "$repo" \
   --json state,isDraft,baseRefName,headRefOid,mergeable,mergeStateStatus,statusCheckRollup)"
 
@@ -88,8 +95,8 @@ pr_json="$(gh pr view "$pr" --repo "$repo" \
   echo "refusing merge: PR is still draft" >&2
   exit 4
 }
-[ "$(jq -r '.baseRefName' <<<"$pr_json")" = "main" ] || {
-  echo "refusing merge: base branch is not main" >&2
+[ "$(jq -r '.baseRefName' <<<"$pr_json")" = "$default_branch" ] || {
+  echo "refusing merge: base branch is not the repository default branch" >&2
   exit 4
 }
 actual_head="$(jq -r '.headRefOid | ascii_downcase' <<<"$pr_json")"
