@@ -53,5 +53,5 @@ for lb in $ROOTS; do
   done < <(ls -1dt "$lb"/*/ 2>/dev/null | tail -n +$((KEEP + 1)))
 done
 
-printf '%s pruned=%d failed=%d keep=%d\n' "$(ts)" "$pruned" "$failed" "$KEEP" >> "$LOG" 2>/dev/null
+printf '%s pruned=%d failed=%d keep=%d\n' "$(ts)" "$pruned" "$failed" "$KEEP" 2>/dev/null >> "$LOG" || :
 [ "$failed" -eq 0 ]

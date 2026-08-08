@@ -153,21 +153,43 @@ ok "every remaining is_disabled copy is byte-identical to the canonical one" '[ 
 #
 # A log() that never redirects stderr at all is out of scope: it makes no
 # silence promise, and this audit only holds the ones that do to it.
+# The first version of this audit matched only single-line `log() { … }`, and
+# that gap immediately cost a follow-up: the very files it cleared still held
+# multi-line `audit()` writers with the identical ordering. So match the
+# redirection itself wherever it appears, not the function that wraps it.
+#
+# Every appearance of `>> <path> 2>/dev/null` (or `> <path> 2>/dev/null`) is
+# reported. Sites that legitimately need the ordering can be listed in
+# ALLOWED_ORDER below with a reason; today there are none.
+# Scope: functions named log() or audit(). Those two names carry an explicit
+# "stay quiet and never fail the caller" contract, which this ordering breaks
+# outright -- unlike the ~20 guarded call sites elsewhere (`… 2>/dev/null &&
+# mv`, `… || true`), where the guard preserves correctness and only the message
+# leaks. Those are tracked separately rather than swept into this assertion.
+#
+# The body is scanned whole, single- or multi-line: the first version of this
+# audit matched only `log() { … }` on one line, and that gap immediately cost a
+# follow-up -- the very files it cleared still held multi-line audit() writers
+# with the identical ordering.
 log_order=0
 while IFS= read -r f; do
-  while IFS= read -r line; do
-    case "$line" in *2\>/dev/null*) ;; *) continue ;; esac
-    # Defective when the append/truncate appears before the silencing.
-    case "$line" in
-      *'>>'*2\>/dev/null*|*'> "$LOG"'*2\>/dev/null*)
-        echo "log() silences stderr after opening the file (order defeats it): $f"
-        # shellcheck disable=SC2034  # consumed via eval in ok()
-        log_order=1 ;;
-    esac
-  done < <(grep -h '^log() {.*}$' "$f")
-done < <(grep -rl '^log() {' "$ROOT/claude" "$ROOT/scripts" 2>/dev/null)
+  while IFS= read -r hit; do
+    echo "log()/audit() silences stderr after opening its destination: $f: $hit"
+    # shellcheck disable=SC2034  # consumed via eval in ok()
+    log_order=1
+  done < <(awk '
+      function bad(s) { return s ~ /(>>?)[[:space:]]+"[^"]+"[[:space:]]+2>\/dev\/null/ }
+      # Single-line definition: it never reaches a bare `}`, so close it here --
+      # leaving the flag set would spill the scan into the next function.
+      /^(log|audit)\(\)[[:space:]]*\{.*\}[[:space:]]*$/ { if (bad($0)) print; next }
+      /^(log|audit)\(\)[[:space:]]*\{/ { infn = 1; next }
+      infn && /^\}/ { infn = 0; next }
+      infn && $0 !~ /^[[:space:]]*#/ && bad($0) { print }
+    ' "$f")
+done < <(grep -rlE '^(log|audit)\(\)' --include='*.sh' \
+           "$ROOT/claude/hooks" "$ROOT/scripts" 2>/dev/null | grep -v '\.test\.sh$')
 # shellcheck disable=SC2034  # $log_order is consumed via eval in ok()
-ok "no single-line log() silences stderr after opening its destination" '[ "$log_order" = 0 ]'
+ok "no log()/audit() silences stderr after opening its destination" '[ "$log_order" = 0 ]'
 
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

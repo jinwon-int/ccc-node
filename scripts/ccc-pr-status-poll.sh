@@ -63,7 +63,7 @@ audit() { # <result> <repos> <transitions> <closed>
   jq -nc --arg ts "$(ts)" --arg result "$1" --argjson repos "$2" \
     --argjson transitions "$3" --argjson closed "$4" \
     '{ts:$ts, result:$result, repos:$repos, transitions:$transitions, closed:$closed}' \
-    >> "$LOG" 2>/dev/null
+    2>/dev/null >> "$LOG" || :
 }
 
 # jq filter fragment: derives one overall checkStatus from a PR's
