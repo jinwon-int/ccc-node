@@ -423,5 +423,79 @@ out="$(run_parallel_case 0 3 0)"; rc=$?
 ok "parallel: CCC_MEMORY_SEARCH_PARALLEL=0 restores the serial lane marks" \
   '[ "$rc" = 0 ] && grep -q "SHARED_LANE_HIT" <<<"$out" && jq -e ".stages | has(\"search_shared\") and (has(\"search_parallel\") | not)" "$pstate/memory-timing.jsonl" >/dev/null 2>&1'
 
+# --- #1040: canonical-block scan lanes run in parallel only where cores allow ---
+# The four scan+limit lanes are CPU-bound, so parallelizing them is a win only on
+# a node with spare cores and a measured regression on a 1-core node. The gate is
+# core-count based; these cases pin the tri-state contract (auto / forced on /
+# forced off) and, above all, that the injected bytes never depend on which path
+# ran. `sed` normalizes the cache-age string, which moves with wall-clock.
+scan_state_n=0
+scan_out=""   # set by run_scan_case; it must not run in a subshell, or the
+scan_state="" # per-case state dir below would not reach took_parallel.
+run_scan_case() { # <hook-dir> [extra-env...]
+  local hookdir="$1"; shift
+  scan_state_n=$((scan_state_n + 1))
+  scan_state="$TMP/scan-state-$scan_state_n"; mkdir -p "$scan_state"
+  printf 'Resume pointer fact\n' > "$scan_state/resume.md"
+  # `env` (not a bare "$@") because bash parses assignment prefixes before
+  # expansion: an expanded VAR=VALUE word would become the command name.
+  scan_out="$(HOME="$TMP/home" CCC_STATE_DIR="$scan_state" CCC_MEMORY_CACHE_DIR="$cache" \
+    CCC_MEMORY_DIR="$mem" CCC_HOOK_DIR="$hookdir" CCC_MEMORY_TOOLS_DIR="$tools" \
+    CCC_MEMORY_NO_REFRESH=1 env "$@" \
+    bash "$ROOT/claude/hooks/load-memory.sh" SessionStart 2>/dev/null \
+    | jq -r .hookSpecificOutput.additionalContext 2>/dev/null \
+    | sed -E 's/\([0-9]+s old\)/(Ns old)/g')"
+}
+took_parallel() { jq -e '.stages | has("scan_parallel")' "$scan_state/memory-timing.jsonl" >/dev/null 2>&1; }
+
+HK="$ROOT/claude/hooks"
+run_scan_case "$HK" CCC_MEMORY_SCAN_PARALLEL=0
+# shellcheck disable=SC2034  # consumed via eval in ok()
+serial_out="$scan_out"
+ok "scan: forced-serial path marks no parallel stage" '! took_parallel'
+run_scan_case "$HK" CCC_MEMORY_SCAN_PARALLEL=1
+# shellcheck disable=SC2034  # consumed via eval in ok()
+parallel_out="$scan_out"
+ok "scan: forced-parallel path marks the parallel stage" 'took_parallel'
+ok "scan: parallel injection is byte-identical to serial" \
+  '[ -n "$serial_out" ] && [ "$serial_out" = "$parallel_out" ]'
+
+# The gate reads real cores, so drive it from both sides of the threshold rather
+# than assuming what this machine has.
+run_scan_case "$HK" CCC_MEMORY_SCAN_MIN_CORES=1
+# shellcheck disable=SC2034  # consumed via eval in ok()
+low_out="$scan_out"
+ok "scan: min-cores=1 opts this node into the parallel path" 'took_parallel'
+run_scan_case "$HK" CCC_MEMORY_SCAN_MIN_CORES=99
+# shellcheck disable=SC2034  # consumed via eval in ok()
+high_out="$scan_out"
+ok "scan: an unreachable min-cores keeps the serial path" '! took_parallel'
+ok "scan: both gate outcomes inject identical bytes" '[ "$low_out" = "$high_out" ] && [ "$low_out" = "$serial_out" ]'
+
+run_scan_case "$HK" CCC_MEMORY_SCAN_PARALLEL=0 CCC_MEMORY_SCAN_MIN_CORES=1
+# shellcheck disable=SC2034  # consumed via eval in ok()
+off_out="$scan_out"
+ok "scan: explicit =0 overrides a permissive min-cores" '! took_parallel && [ "$off_out" = "$serial_out" ]'
+run_scan_case "$HK" CCC_MEMORY_SCAN_MIN_CORES=abc
+# shellcheck disable=SC2034  # consumed via eval in ok()
+junk_out="$scan_out"
+ok "scan: non-numeric min-cores fails safe to serial" '! took_parallel && [ "$junk_out" = "$serial_out" ]'
+
+# Fail-open: an absent scanner must leave the original text in place on BOTH
+# paths. CCC_HOOK_DIR only resolves scan-injection.sh; the libs load from the
+# script's own directory, so an empty hook dir isolates exactly the scanner.
+noscan="$TMP/no-scanner"; mkdir -p "$noscan"
+run_scan_case "$noscan" CCC_MEMORY_SCAN_PARALLEL=0
+# shellcheck disable=SC2034  # consumed via eval in ok()
+fo_serial="$scan_out"
+run_scan_case "$noscan" CCC_MEMORY_SCAN_PARALLEL=1
+# shellcheck disable=SC2034  # consumed via eval in ok()
+fo_parallel="$scan_out"
+ok "scan: missing scanner still injects memory (fail-open) on both paths" \
+  '[ -n "$fo_serial" ] && grep -q "Node memory: safe fact" <<<"$fo_serial" && grep -q "Node memory: safe fact" <<<"$fo_parallel"'
+ok "scan: fail-open output does not depend on the path" '[ "$fo_serial" = "$fo_parallel" ]'
+ok "scan: parallel lanes leave no scratch directory behind" \
+  '[ "$(find "${TMPDIR:-/tmp}" -maxdepth 1 -name "ccc-mem-scan.*" 2>/dev/null | wc -l)" = 0 ]'
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

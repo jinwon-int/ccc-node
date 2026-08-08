@@ -261,12 +261,74 @@ fi
 # Limit the canonical blocks first (static caps) so we can measure their slack
 _mark sources
 # before sizing the local hot block.
-mem="$(scan_injection_block built-in-memory "$mem" | limit_bytes "$MAX_MEM")"
-resume="$(scan_injection_block resume-pointer "$resume" | limit_bytes "$MAX_RESUME")"
-if ! is_disabled "$WIKI_ENABLED"; then
-  wiki="$(scan_injection_block family-wiki-cache "$wiki" | limit_bytes "$MAX_WIKI")"
+# #897 step 2 leftover (#1040): the four canonical blocks are independent — each
+# pays its own scan-injection.sh startup (~43ms) plus a limit_bytes pass and has
+# no ordering dependency on the others, so run them concurrently instead of
+# serially. scan-injection.sh itself is unchanged; only the call pattern moves.
+# Each lane owns one file and only flags `.done` when its whole pipeline
+# succeeded, so a lane that dies (spawn failure, OOM, killed subshell) leaves no
+# flag and is simply recomputed serially below — the fail-open contract (scanner
+# missing/erroring => original text) and the per-block byte caps then hold
+# byte-for-byte, and one lane's failure cannot contaminate another's block.
+#
+# Gated on spare cores. The lanes are CPU-bound (a scanner process plus a Python
+# limit_bytes pass each), so the win needs idle cores to land and inverts without
+# them. Measured on nosuk/vps2, paired interleaved runs, n=31 each:
+#   12 cores (yukson, #1040 report) : 229ms -> 90ms   (-139ms)
+#    2 cores                        : 370ms -> 383ms  (median paired delta -3ms,
+#                                     mean +1.1ms — indistinguishable from zero)
+#    1 core (pinned, Termux-class)  : 543ms -> 605ms  (+75ms — a REGRESSION)
+# So parallelize only where there is headroom; small nodes keep the serial path
+# they are already fastest on. CCC_MEMORY_SCAN_PARALLEL=1 forces parallel and =0
+# forces serial regardless of core count (both for tests and node-local tuning).
+CCC_MEMORY_SCAN_MIN_CORES="${CCC_MEMORY_SCAN_MIN_CORES:-4}"
+scan_parallel_worthwhile() {
+  local cores
+  case "$CCC_MEMORY_SCAN_MIN_CORES" in ''|*[!0-9]*) return 1 ;; esac
+  cores="$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || printf '1')"
+  case "$cores" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$cores" -ge "$CCC_MEMORY_SCAN_MIN_CORES" ]
+}
+scan_dir=""
+scan_lane() { # <name> <label> <max> <text>
+  { scan_injection_block "$2" "$4" | limit_bytes "$3"; } > "$scan_dir/$1" 2>/dev/null \
+    && : > "$scan_dir/$1.done"
+}
+scanned_block() { # <name> <label> <max> <text>
+  if [ -n "$scan_dir" ] && [ -f "$scan_dir/$1.done" ]; then
+    cat "$scan_dir/$1" 2>/dev/null
+  else
+    scan_injection_block "$2" "$4" | limit_bytes "$3"
+  fi
+}
+scan_parallel_pref="${CCC_MEMORY_SCAN_PARALLEL:-auto}"
+if [ "$scan_parallel_pref" = auto ]; then
+  scan_parallel_worthwhile && scan_parallel_want=1 || scan_parallel_want=0
+elif is_disabled "$scan_parallel_pref"; then
+  scan_parallel_want=0
+else
+  scan_parallel_want=1
 fi
-honcho="$(scan_injection_block honcho-cache "$honcho" | limit_bytes "$MAX_HONCHO")"
+if [ "$scan_parallel_want" = 1 ]; then
+  scan_dir="$(mktemp -d "${TMPDIR:-/tmp}/ccc-mem-scan.XXXXXX" 2>/dev/null || true)"
+fi
+if [ -n "$scan_dir" ]; then
+  scan_lane mem built-in-memory "$MAX_MEM" "$mem" &
+  scan_lane resume resume-pointer "$MAX_RESUME" "$resume" &
+  if ! is_disabled "$WIKI_ENABLED"; then
+    scan_lane wiki family-wiki-cache "$MAX_WIKI" "$wiki" &
+  fi
+  scan_lane honcho honcho-cache "$MAX_HONCHO" "$honcho" &
+  wait
+  _mark scan_parallel
+fi
+mem="$(scanned_block mem built-in-memory "$MAX_MEM" "$mem")"
+resume="$(scanned_block resume resume-pointer "$MAX_RESUME" "$resume")"
+if ! is_disabled "$WIKI_ENABLED"; then
+  wiki="$(scanned_block wiki family-wiki-cache "$MAX_WIKI" "$wiki")"
+fi
+honcho="$(scanned_block honcho honcho-cache "$MAX_HONCHO" "$honcho")"
+if [ -n "$scan_dir" ]; then rm -rf "$scan_dir"; fi
 
 # Relevance-aware budget. The per-block caps sum to more than CCC_MEMORY_MAX_BYTES,
 # so today the tail (Honcho) is simply truncated and any budget a small/empty block
