@@ -139,6 +139,32 @@ run() {
 }
 note() { printf '  - %s\n' "$*"; }
 
+# Atomic single-file install (#1042). A plain `cp` truncates and rewrites the
+# DESTINATION INODE in place; bash reads scripts incrementally, so a process
+# currently executing that file keeps reading the new bytes at a stale offset
+# and dies mid-run with a spurious syntax error. Proven live 2026-08-07 04:45
+# KST: the cron-run installed ccc-self-update.sh invoked setup.sh, which
+# overwrote the hook mid-execution — 9/12 fleet nodes crashed after the repo
+# update but BEFORE service restart / audit record / owner notify (silent
+# half-apply). Stage into a hidden temp in the destination directory, then
+# rename(2) over the target: the running reader keeps its old inode for the
+# rest of its life while new opens see the new file. Mode: an existing
+# destination keeps its mode (matches cp-over-existing, so a reinstalled hook
+# is never momentarily non-executable before the later chmod pass); a fresh
+# install takes the repo source's mode (matches cp-to-new).
+atomic_install() { # <src> <dest>
+  local src="$1" dest="$2" tmp mode
+  if [ -e "$dest" ]; then mode="$(stat -c '%a' "$dest")"; else mode="$(stat -c '%a' "$src")"; fi
+  tmp="$(mktemp "${dest%/*}/.${dest##*/}.XXXXXX")" \
+    || { echo "ERROR: mktemp failed for $dest" >&2; return 1; }
+  if cp "$src" "$tmp" && chmod "$mode" "$tmp" && mv -f "$tmp" "$dest"; then
+    return 0
+  fi
+  rm -f "$tmp"
+  echo "ERROR: atomic install failed: $src -> $dest" >&2
+  return 1
+}
+
 # setup is transactional even with --no-backup. The operator backup is a
 # durable restore point; this private snapshot exists only long enough to undo
 # a failed install. Exact managed paths are archived so credentials, projects,
@@ -306,7 +332,7 @@ run mkdir -p "$CLAUDE_DIR/hooks" "$CLAUDE_DIR/hooks/lib"
 # --with-plugin: base only → the ccc-node plugin's hooks/hooks.json owns the portable hooks.
 if [ "$WITH_PLUGIN" = 1 ]; then
   note "plugin mode: lean settings (portable hooks come from the ccc-node plugin)"
-  run cp "$SRC/claude/settings.base.json" "$CLAUDE_DIR/settings.json"
+  run atomic_install "$SRC/claude/settings.base.json" "$CLAUDE_DIR/settings.json"
 else
   merge_settings_json "$SRC/claude/settings.base.json" "$SRC/claude/hooks/enforcement-overlay.json" "$CLAUDE_DIR/settings.json"
 fi
@@ -315,16 +341,16 @@ neutralize_bypass_if_root "$CLAUDE_DIR/settings.json"
 # template ONLY when absent so a node's accumulated/hand-added approvals are
 # never clobbered by setup or self-update (#454). It is not a managed artifact.
 if [ ! -e "$CLAUDE_DIR/settings.local.json" ]; then
-  run cp "$SRC/claude/settings.local.template.json" "$CLAUDE_DIR/settings.local.json"
+  run atomic_install "$SRC/claude/settings.local.template.json" "$CLAUDE_DIR/settings.local.json"
 else
   note "settings.local.json already present — left untouched (node-local approvals)"
 fi
 # Install standalone imports before their hook-tree callers. Old hooks ignore
 # them; once the new adapter is copied below, both modules are already present.
 # The setup transaction restores the previous hooks tree on any later failure.
-run cp "$SRC/bridge/utils/secure_fs.py" "$CLAUDE_DIR/hooks/ccc_secure_fs.py"
+run atomic_install "$SRC/bridge/utils/secure_fs.py" "$CLAUDE_DIR/hooks/ccc_secure_fs.py"
 run chmod 644 "$CLAUDE_DIR/hooks/ccc_secure_fs.py"
-run cp "$SRC/bridge/memory/journal_core.py" "$CLAUDE_DIR/hooks/ccc_journal_core.py"
+run atomic_install "$SRC/bridge/memory/journal_core.py" "$CLAUDE_DIR/hooks/ccc_journal_core.py"
 run chmod 644 "$CLAUDE_DIR/hooks/ccc_journal_core.py"
 # Hook tree deployment (#569): every deployable file under claude/hooks/ is
 # discovered by the shared walk (ccc_hook_tree_files in scripts/lib/harness-paths.sh)
@@ -356,50 +382,50 @@ fi
 run mkdir -p "${hook_tree_dirs[@]}"
 hook_tree_targets=()
 for _hook_rel in "${hook_tree_files[@]}"; do
-  run cp "$SRC/claude/hooks/$_hook_rel" "$CLAUDE_DIR/hooks/$_hook_rel"
+  run atomic_install "$SRC/claude/hooks/$_hook_rel" "$CLAUDE_DIR/hooks/$_hook_rel"
   hook_tree_targets+=("$CLAUDE_DIR/hooks/$_hook_rel")
 done
 # Files deployed INTO hooks/ from OUTSIDE claude/hooks/ keep explicit cp lines —
 # the walk covers only the claude/hooks/ tree.
-run cp "$SRC/scripts/lib/harness-paths.sh" "$CLAUDE_DIR/hooks/lib/harness-paths.sh"
-run cp "$SRC/scripts/lib/harness_paths.py" "$CLAUDE_DIR/hooks/lib/harness_paths.py"
+run atomic_install "$SRC/scripts/lib/harness-paths.sh" "$CLAUDE_DIR/hooks/lib/harness-paths.sh"
+run atomic_install "$SRC/scripts/lib/harness_paths.py" "$CLAUDE_DIR/hooks/lib/harness_paths.py"
 # Codex launch boundary: the launcher and materializer are installed beside
 # load-memory.sh so every direct/app-server run reuses the same snapshot policy.
-run cp "$SRC/scripts/ccc-codex" "$CLAUDE_DIR/hooks/ccc-codex"
-run cp "$SRC/scripts/ccc_codex_memory.py" "$CLAUDE_DIR/hooks/ccc_codex_memory.py"
+run atomic_install "$SRC/scripts/ccc-codex" "$CLAUDE_DIR/hooks/ccc-codex"
+run atomic_install "$SRC/scripts/ccc_codex_memory.py" "$CLAUDE_DIR/hooks/ccc_codex_memory.py"
 # Piri launch boundary: node-global counterpart of ccc-codex — materializes the
 # same snapshot into the Piri global context file (<piri-agent-dir>/AGENTS.md).
-run cp "$SRC/scripts/ccc-piri" "$CLAUDE_DIR/hooks/ccc-piri"
+run atomic_install "$SRC/scripts/ccc-piri" "$CLAUDE_DIR/hooks/ccc-piri"
 # Claude's distill committer imports the same crash-recoverable transaction
 # implementation as the Codex bridge.  Install the canonical module beside the
 # existing standalone secure-fs copy instead of forking provider logic.
-run cp "$SRC/bridge/memory/local_memory_transaction.py" "$CLAUDE_DIR/hooks/ccc_local_memory_transaction.py"
+run atomic_install "$SRC/bridge/memory/local_memory_transaction.py" "$CLAUDE_DIR/hooks/ccc_local_memory_transaction.py"
 run chmod 644 "$CLAUDE_DIR/hooks/ccc_local_memory_transaction.py"
 # Memory helper tools used by load-memory.sh / refresh-memory.sh in standalone installs.
-run cp "$SRC/scripts/ccc-memory-index.sh" "$CLAUDE_DIR/hooks/ccc-memory-index.sh"
-run cp "$SRC/scripts/ccc_memory_index.py" "$CLAUDE_DIR/hooks/ccc_memory_index.py"
-run cp "$SRC/scripts/ccc-memory-search.sh" "$CLAUDE_DIR/hooks/ccc-memory-search.sh"
-run cp "$SRC/scripts/ccc_memory_search.py" "$CLAUDE_DIR/hooks/ccc_memory_search.py"
-run cp "$SRC/scripts/ccc-memory-consolidate.sh" "$CLAUDE_DIR/hooks/ccc-memory-consolidate.sh"
-run cp "$SRC/scripts/ccc-memory-query.sh" "$CLAUDE_DIR/hooks/ccc-memory-query.sh"
-run cp "$SRC/scripts/ccc-memory-check.sh" "$CLAUDE_DIR/hooks/ccc-memory-check.sh"
-run cp "$SRC/scripts/ccc_memory_probe.py" "$CLAUDE_DIR/hooks/ccc_memory_probe.py"
+run atomic_install "$SRC/scripts/ccc-memory-index.sh" "$CLAUDE_DIR/hooks/ccc-memory-index.sh"
+run atomic_install "$SRC/scripts/ccc_memory_index.py" "$CLAUDE_DIR/hooks/ccc_memory_index.py"
+run atomic_install "$SRC/scripts/ccc-memory-search.sh" "$CLAUDE_DIR/hooks/ccc-memory-search.sh"
+run atomic_install "$SRC/scripts/ccc_memory_search.py" "$CLAUDE_DIR/hooks/ccc_memory_search.py"
+run atomic_install "$SRC/scripts/ccc-memory-consolidate.sh" "$CLAUDE_DIR/hooks/ccc-memory-consolidate.sh"
+run atomic_install "$SRC/scripts/ccc-memory-query.sh" "$CLAUDE_DIR/hooks/ccc-memory-query.sh"
+run atomic_install "$SRC/scripts/ccc-memory-check.sh" "$CLAUDE_DIR/hooks/ccc-memory-check.sh"
+run atomic_install "$SRC/scripts/ccc_memory_probe.py" "$CLAUDE_DIR/hooks/ccc_memory_probe.py"
 run chmod 644 "$CLAUDE_DIR/hooks/ccc_memory_probe.py"
-run cp "$SRC/scripts/ccc-memory-explain.sh" "$CLAUDE_DIR/hooks/ccc-memory-explain.sh"
-run cp "$SRC/scripts/ccc-wiki-triage.sh" "$CLAUDE_DIR/hooks/ccc-wiki-triage.sh"
-run cp "$SRC/scripts/ccc-memory-eval.sh" "$CLAUDE_DIR/hooks/ccc-memory-eval.sh"
-run cp "$SRC/scripts/ccc-memory-benchmark-export.sh" "$CLAUDE_DIR/hooks/ccc-memory-benchmark-export.sh"
+run atomic_install "$SRC/scripts/ccc-memory-explain.sh" "$CLAUDE_DIR/hooks/ccc-memory-explain.sh"
+run atomic_install "$SRC/scripts/ccc-wiki-triage.sh" "$CLAUDE_DIR/hooks/ccc-wiki-triage.sh"
+run atomic_install "$SRC/scripts/ccc-memory-eval.sh" "$CLAUDE_DIR/hooks/ccc-memory-eval.sh"
+run atomic_install "$SRC/scripts/ccc-memory-benchmark-export.sh" "$CLAUDE_DIR/hooks/ccc-memory-benchmark-export.sh"
 # Skill autosave sweep — covers bridge/SDK sessions that never fire SessionEnd
 # hooks; scheduled separately via scripts/install-skill-autosave-cron.sh.
-run cp "$SRC/scripts/ccc-skill-autosave.sh" "$CLAUDE_DIR/hooks/ccc-skill-autosave.sh"
+run atomic_install "$SRC/scripts/ccc-skill-autosave.sh" "$CLAUDE_DIR/hooks/ccc-skill-autosave.sh"
 # Self-update — the pre-approved node maintenance procedure (pull + setup +
 # restart of operator-allowlisted services only; see docs/self-update.md).
-run cp "$SRC/scripts/ccc-self-update.sh" "$CLAUDE_DIR/hooks/ccc-self-update.sh"
+run atomic_install "$SRC/scripts/ccc-self-update.sh" "$CLAUDE_DIR/hooks/ccc-self-update.sh"
 # PR/issue status poll (ccc-node#962) — notices when a PR this node's bridge
 # identity opened changes state (CI done, closed, merged); scheduled
 # separately via scripts/install-pr-status-poll-cron.sh, tracks only the
 # repos an operator lists in ~/.claude/pr-status-poll.repos.
-run cp "$SRC/scripts/ccc-pr-status-poll.sh" "$CLAUDE_DIR/hooks/ccc-pr-status-poll.sh"
+run atomic_install "$SRC/scripts/ccc-pr-status-poll.sh" "$CLAUDE_DIR/hooks/ccc-pr-status-poll.sh"
 # #958: record the install-source repo path so ccc-self-update's resolve_repo()
 # (env > this file > script-location inference > ~/ccc-node) never falls back
 # to a nonexistent ~/ccc-node on /opt installs — 8 nodes aborted no-repo until
@@ -424,7 +450,7 @@ fi
 # setup-managed property instead of an out-of-band deployment artifact (the
 # fleet cron calls $HOME/.ccc-node/scripts/ccc-live-backups-rotate.sh).
 run mkdir -p "$HOME/.ccc-node/scripts"
-run cp "$SRC/scripts/ccc-live-backups-rotate.sh" "$HOME/.ccc-node/scripts/ccc-live-backups-rotate.sh"
+run atomic_install "$SRC/scripts/ccc-live-backups-rotate.sh" "$HOME/.ccc-node/scripts/ccc-live-backups-rotate.sh"
 run chmod 700 "$HOME/.ccc-node/scripts/ccc-live-backups-rotate.sh"
 # gongyung 2026-08-07: this Android resource-pressure guard was a node-local,
 # untracked file (self-update couldn't reach it, so a stale-provider bug that
@@ -433,7 +459,7 @@ run chmod 700 "$HOME/.ccc-node/scripts/ccc-live-backups-rotate.sh"
 # it's already cron'd. Not wired into any cron by setup.sh: this is a
 # resource-constrained-device tool, not a fleet default. Enable it per node
 # only where the same low-RAM/thermal constraints apply.
-run cp "$SRC/scripts/resource-pressure-guard.sh" "$HOME/.ccc-node/scripts/resource-pressure-guard.sh"
+run atomic_install "$SRC/scripts/resource-pressure-guard.sh" "$HOME/.ccc-node/scripts/resource-pressure-guard.sh"
 run chmod 700 "$HOME/.ccc-node/scripts/resource-pressure-guard.sh"
 # Executable files copied into hooks/ from OUTSIDE the claude/hooks/ tree.
 # (ccc_memory_index.py / ccc_memory_search.py are deliberately NOT here: they
@@ -489,7 +515,7 @@ fi
 run mkdir -p "$CLAUDE_DIR/output-styles"
 run cp "$SRC/claude/output-styles/"*.md "$CLAUDE_DIR/output-styles/"
 # Headless runner for cron/A2A/CI (`claude -p` wrapper).
-run cp "$SRC/claude/headless.sh" "$CLAUDE_DIR/headless.sh"
+run atomic_install "$SRC/claude/headless.sh" "$CLAUDE_DIR/headless.sh"
 run chmod +x "$CLAUDE_DIR/headless.sh"
 # checkpoint.sh creates its runtime state directory on demand. setup.sh must not
 # mutate state/checkpoints because runtime state is outside the install transaction.
@@ -503,7 +529,7 @@ for _agent_src in "$SRC/claude/agents/"*.md; do
   [ -e "$_agent_src" ] || continue
   case "$(basename "$_agent_src")" in
     a2a-*) : ;;  # worker roster — installed only by the role gate below
-    *) run cp "$_agent_src" "$CLAUDE_DIR/agents/$(basename "$_agent_src")" ;;
+    *) run atomic_install "$_agent_src" "$CLAUDE_DIR/agents/$(basename "$_agent_src")" ;;
   esac
 done
 # Persist an explicit role choice to a node-local (unmanaged) marker so an
@@ -518,7 +544,7 @@ fi
 if [ "$_a2a_role" = worker ]; then
   for _agent_src in "$SRC/claude/agents/"a2a-*.md; do
     [ -e "$_agent_src" ] || continue
-    run cp "$_agent_src" "$CLAUDE_DIR/agents/$(basename "$_agent_src")"
+    run atomic_install "$_agent_src" "$CLAUDE_DIR/agents/$(basename "$_agent_src")"
   done
   note "A2A worker sub-agent roster installed (CCC_A2A_ROLE=worker)"
 else
