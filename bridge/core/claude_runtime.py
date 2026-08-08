@@ -1164,30 +1164,52 @@ class ClaudeSession:
             description=context.title or f"Claude requests permission to use {tool_name}",
         )
         active.queue.put_nowait(request)
+        # #1045: a fail-closed deny used to be indistinguishable from an
+        # explicit handler deny — one generic message, one log shape. Headless
+        # (external_event) turns hit exactly these branches, so every deny now
+        # carries its decision point as a body-free reason code, in both the
+        # agent-visible message and the INFO trace. Never the request content.
+        deny_reason: str | None = None
         try:
             decision = await active.approval_handler(request)
         except asyncio.CancelledError:
             raise
-        except Exception:
+        except Exception as exc:
             decision = ApprovalDecision.DENY
+            deny_reason = "handler-exception"
+            logger.warning(
+                "Claude approval handler raised %s; denying (fail-closed) "
+                "request_id=%s",
+                type(exc).__name__,
+                request_id,
+            )
         if (
             active.finished
             or self._turn_generation != generation
             or self._active_turn is not active
         ):
             decision = ApprovalDecision.DENY
+            deny_reason = deny_reason or "turn-superseded"
         outcome = "allowed" if decision is ApprovalDecision.ALLOW else "denied"
+        if decision is not ApprovalDecision.ALLOW:
+            deny_reason = deny_reason or "handler-deny"
         logger.info(
             "Approval request provider=claude tool=%s target_kind=%s "
-            "request_id=%s turn=active outcome=%s",
+            "request_id=%s turn=active outcome=%s reason=%s",
             tool_name,
             _approval_target_kind(tool_input),
             request_id,
             outcome,
+            deny_reason or "-",
         )
         if decision is ApprovalDecision.ALLOW:
             return PermissionResultAllow()
-        return PermissionResultDeny(message="Denied by the bridge approval handler")
+        return PermissionResultDeny(
+            message=(
+                "Denied by the bridge approval handler "
+                f"(reason={deny_reason}; deny trace is in the bridge log)"
+            )
+        )
 
 
 class ClaudeRuntime:

@@ -236,6 +236,36 @@ def _log_user_input(
     log_chat(user_id, session_id, "user", user_message, model=model)
 
 
+def _log_approval_route_deny(
+    *,
+    reason: str,
+    event: Optional[ApprovalRequestEvent],
+    user_id: int,
+    chat_id: int,
+    generation: int,
+) -> None:
+    """Body-free deny trace for the provider-neutral approval route (#1045).
+
+    Every fail-closed deny in ``handle_approval`` used to return a bare
+    ``DENY`` with no journal line, so a headless (external_event) turn's
+    denied write was unattributable — the agent saw one generic runtime
+    message and the log showed nothing. Each decision point now logs its
+    reason code. Only the action name and routing identifiers are logged,
+    never the request arguments.
+    """
+
+    logger.info(
+        "Approval route denied reason=%s action=%s request_id=%s "
+        "user_id=%s chat_id=%s generation=%s",
+        reason,
+        getattr(event, "action", None),
+        getattr(event, "request_id", None),
+        user_id,
+        chat_id,
+        generation,
+    )
+
+
 class ProjectChatProcessMixin:
     def _external_wait_home(self) -> Path:
         """Durable home for external-wait registry/route files (#740)."""
@@ -770,10 +800,21 @@ class ProjectChatProcessMixin:
                 async def handle_approval(
                     event: ApprovalRequestEvent,
                 ) -> ApprovalDecision:
+                    # #1045: every deny names its decision point (body-free).
+                    def _deny(reason: str) -> ApprovalDecision:
+                        _log_approval_route_deny(
+                            reason=reason,
+                            event=event,
+                            user_id=user_id,
+                            chat_id=chat_id,
+                            generation=generation,
+                        )
+                        return ApprovalDecision.DENY
+
                     if approval_callback is None:
-                        return ApprovalDecision.DENY
+                        return _deny("no-approval-callback")
                     if not self.is_agent_approval_active(user_id, chat_id, generation):
-                        return ApprovalDecision.DENY
+                        return _deny("approval-inactive")
                     # Some runtimes resolve the approval before yielding its
                     # normalized event. The request is provider-admitted at
                     # that boundary even though consume_agent_events has not
@@ -783,7 +824,7 @@ class ProjectChatProcessMixin:
                         self._project_request_phase(progress_request)
                     approval_lease = progress_request.lifecycle.begin_approval()
                     if approval_lease is None:
-                        return ApprovalDecision.DENY
+                        return _deny("lifecycle-refused")
                     callback_task = asyncio.current_task()
                     if callback_task is not None:
                         active_approval_callbacks.add(callback_task)
@@ -795,17 +836,17 @@ class ProjectChatProcessMixin:
                             raise
                         except Exception:
                             logger.exception("Provider-neutral approval callback failed")
-                            return ApprovalDecision.DENY
+                            return _deny("callback-exception")
                     finally:
                         if progress_request.lifecycle.end_approval(approval_lease):
                             self._project_request_phase(progress_request)
                         if callback_task is not None:
                             active_approval_callbacks.discard(callback_task)
-                    if decision is ApprovalDecision.ALLOW and self.is_agent_approval_active(
-                        user_id, chat_id, generation
-                    ):
-                        return ApprovalDecision.ALLOW
-                    return ApprovalDecision.DENY
+                    if decision is ApprovalDecision.ALLOW:
+                        if self.is_agent_approval_active(user_id, chat_id, generation):
+                            return ApprovalDecision.ALLOW
+                        return _deny("approval-inactive-after-allow")
+                    return _deny("callback-deny")
 
                 stall_grace = float(getattr(self._config, "terminal_stall_seconds", 0.0) or 0.0)
                 delegated_stall_grace = float(
