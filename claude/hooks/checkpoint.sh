@@ -43,6 +43,25 @@ fi
 
 # PostCompact (or anything else): re-inject the working state.
 state="$(cat "$STATE_FILE" 2>/dev/null)"
+# #1045: working-state.md is agent-written and re-enters model context here.
+# Every other injection route (load-memory.sh) runs its blocks through
+# scan-injection.sh; this was the one unscanned gap. Same fail-open contract
+# as load-memory.sh's scan_injection_block: fall back to the raw text when the
+# scanner is missing or fails — on a degraded node, losing the checkpoint
+# would hurt more than one unscanned re-injection. CCC_SCAN_INJECTION_BIN is
+# the test seam / operator override.
+# An explicit override is honored exactly (no fallback): the operator/test
+# named the scanner, and silently substituting another would defeat the seam.
+if [ -n "${CCC_SCAN_INJECTION_BIN:-}" ]; then
+  scan_bin="$CCC_SCAN_INJECTION_BIN"
+else
+  scan_bin="$CKPT_SELF_DIR/scan-injection.sh"
+  [ -x "$scan_bin" ] || scan_bin="${HOME:-/root}/.claude/hooks/scan-injection.sh"
+fi
+if [ -x "$scan_bin" ] \
+  && scanned="$(printf '%s' "$state" | "$scan_bin" working-state-checkpoint 2>/dev/null)"; then
+  state="$scanned"
+fi
 latest="$(newest_file "$CKPT_DIR" 'working-state-*.md')"
 bytes="$(printf '%s' "$state" | wc -c | tr -d ' ')"
 echo "[$ts] PostCompact: re-injected working-state (${bytes} bytes)" >> "$LOG"
