@@ -62,6 +62,15 @@ canonical updater then:
 A fork-only commit on `origin/main` is therefore detected even when no release
 tag changed. An upstream-only release cannot trigger an update.
 
+Step 2 has an operational consequence worth stating outright: **the managed
+checkout must not double as a development checkout.** Branching there, or
+leaving an uncommitted edit, trips a fail-closed precondition and the node stops
+updating until a human restores it — this is terminal, not a deferral that
+clears on the next tick. Use `git worktree` for development and leave the
+managed checkout on `main`; see CONTRIBUTING.md. Since #1060 these aborts
+notify the owner rather than failing silently, but the alert is a safety net,
+not a substitute for the separation.
+
 `ccc-self-update.sh` exit codes remain authoritative. In particular, exit `8`
 means the update was deferred because the bridge is serving work; the bridge
 compatibility entry point preserves that code and does not claim completion.

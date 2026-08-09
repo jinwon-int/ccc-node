@@ -2,6 +2,38 @@
 
 Contributions should be small, reviewable, and safe to discuss publicly.
 
+## Where to work: never in a node's managed checkout
+
+A fleet node keeps a checkout that `ccc-self-update.sh` updates on a schedule —
+the path recorded in `~/.claude/self-update.repo`, typically `/opt/ccc-node`,
+`$HOME/ccc-node`, or `/root/ccc-node`. **Keep it on `main`. Do not develop in
+it.**
+
+The updater is fail-closed: it refuses to run unless the checkout is on `main`
+with a clean tree. So the moment you branch or leave an edit there, that node
+stops updating — not until the next tick, but until a human puts it back. Before
+the alerting added in #1060 nothing announced this, and a node sat 23h behind
+`main` because a feature branch was left checked out (#1039).
+
+Develop in a separate worktree instead:
+
+```bash
+git -C /opt/ccc-node worktree add ~/dev/<slug> -b <type>/<slug> origin/main
+```
+
+The managed checkout stays on `main` and keeps updating; git also refuses to
+check out the same branch twice, which enforces part of this for you. Two
+things a worktree does **not** solve:
+
+- `setup.sh` installs from its own location, so running it from a dev worktree
+  installs unmerged code as the node's harness. Run it only from the managed
+  checkout.
+- Reverting a stray branch is itself a repo mutation. Check the bridge's idle
+  gate (`~/.telegram_bot/health.json`, `workload.active_requests`) first — the
+  updater defers while the bridge is busy precisely because swapping the tree
+  under a running session destroys in-flight work, and a manual `git checkout`
+  bypasses that protection.
+
 ## Operator decisions and review scope
 
 Explicit operator-approved behavior and acceptance criteria are requirements,
