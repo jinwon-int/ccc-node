@@ -146,11 +146,11 @@ def _safe_node(raw: str) -> str:
     return re.sub(r"-+", "-", value)[:32].rstrip("-")
 
 
-def _read_enabled_file(path: Path) -> bool:
+def _read_enabled_file(path: Path, *, trust_root: Path | None = None) -> bool:
     try:
         metadata = path.lstat()
         if (
-            not _path_components_safe(path, final_kind="file")
+            not _path_components_safe(path, final_kind="file", trust_root=trust_root)
             or
             not stat.S_ISREG(metadata.st_mode)
             or stat.S_ISLNK(metadata.st_mode)
@@ -165,11 +165,11 @@ def _read_enabled_file(path: Path) -> bool:
         return False
 
 
-def _private_lines(path: Path, *, max_bytes: int = 4096) -> tuple[str, ...]:
+def _private_lines(path: Path, *, max_bytes: int = 4096, trust_root: Path | None = None) -> tuple[str, ...]:
     try:
         metadata = path.lstat()
         if (
-            not _path_components_safe(path, final_kind="file")
+            not _path_components_safe(path, final_kind="file", trust_root=trust_root)
             or not stat.S_ISREG(metadata.st_mode)
             or stat.S_ISLNK(metadata.st_mode)
             or metadata.st_uid != os.geteuid()
@@ -188,7 +188,7 @@ def _private_lines(path: Path, *, max_bytes: int = 4096) -> tuple[str, ...]:
         raise PromotionError("collector_config_unsafe") from None
 
 
-def _autonomy_state(env: dict[str, str], state_dir: Path) -> str:
+def _autonomy_state(env: dict[str, str], state_dir: Path, *, trust_root: Path | None = None) -> str:
     value = env.get("CCC_AUTONOMY", "")
     if value in {"kill", "killed", "off", "OFF"}:
         return "kill"
@@ -203,7 +203,7 @@ def _autonomy_state(env: dict[str, str], state_dir: Path) -> str:
         except OSError:
             return "kill"
         if (
-            not _path_components_safe(path, final_kind="file")
+            not _path_components_safe(path, final_kind="file", trust_root=trust_root)
             or
             not stat.S_ISREG(metadata.st_mode)
             or stat.S_ISLNK(metadata.st_mode)
@@ -236,7 +236,7 @@ def _config(environment: dict[str, str] | None = None) -> Config:
         raise PromotionError("providers_invalid")
     enabled_raw = env.get("CCC_SKILL_PROMOTION_ENABLED")
     if enabled_raw is None:
-        enabled = _read_enabled_file(state_dir / "skill-promotion.enabled")
+        enabled = _read_enabled_file(state_dir / "skill-promotion.enabled", trust_root=home)
     elif enabled_raw.lower() in {"1", "true", "yes"}:
         enabled = True
     elif enabled_raw.lower() in {"0", "false", "no"}:
@@ -245,7 +245,7 @@ def _config(environment: dict[str, str] | None = None) -> Config:
         raise PromotionError("enabled_invalid")
     publisher_raw = env.get("CCC_SKILL_PROMOTION_PUBLISHER")
     if publisher_raw is None:
-        publisher_enabled = _read_enabled_file(state_dir / "skill-promotion.publisher")
+        publisher_enabled = _read_enabled_file(state_dir / "skill-promotion.publisher", trust_root=home)
     elif publisher_raw.lower() in {"1", "true", "yes"}:
         publisher_enabled = True
     elif publisher_raw.lower() in {"0", "false", "no"}:
@@ -256,7 +256,7 @@ def _config(environment: dict[str, str] | None = None) -> Config:
     collect_nodes = (
         tuple(part.strip() for part in collect_raw.split(",") if part.strip())
         if collect_raw is not None
-        else _private_lines(state_dir / "skill-promotion.collect-nodes")
+        else _private_lines(state_dir / "skill-promotion.collect-nodes", trust_root=home)
     )
     collect_nodes = tuple(dict.fromkeys(collect_nodes))
     if len(collect_nodes) > 32 or any(
@@ -289,7 +289,7 @@ def _config(environment: dict[str, str] | None = None) -> Config:
         enabled=enabled,
         publisher_enabled=publisher_enabled,
         collect_nodes=collect_nodes,
-        autonomy=_autonomy_state(env, state_dir),
+        autonomy=_autonomy_state(env, state_dir, trust_root=home),
     )
 
 
@@ -314,25 +314,92 @@ def _private_state_dir(path: Path) -> None:
             raise PromotionError("state_path_unsafe")
 
 
-def _path_components_safe(path: Path, *, final_kind: str) -> bool:
-    absolute = path.absolute()
-    current = Path(absolute.anchor)
+def _component_safe(metadata: os.stat_result) -> bool:
+    """One path component: owned by root or us, and not group/other writable.
+
+    The sticky exception covers root-owned shared dirs like /tmp, where the
+    sticky bit is what actually prevents a co-tenant from replacing our entry.
+    """
+    mode = stat.S_IMODE(metadata.st_mode)
+    writable = bool(mode & 0o022)
+    trusted_sticky = metadata.st_uid == 0 and bool(mode & stat.S_ISVTX)
+    return metadata.st_uid in {0, os.geteuid()} and not (writable and not trusted_sticky)
+
+
+def _anchored_walk(absolute: Path, trust_root: Path) -> tuple[Path, tuple[str, ...]] | None:
+    """(start, components) to walk from ``trust_root``, or None to walk from /.
+
+    None means "this anchor does not apply" — the path is not inside the root,
+    or the root itself is a symlink, not a directory, or fails the component
+    rules. Callers then fall back to the unanchored walk, so a bad or
+    inapplicable root can only ever be stricter, never weaker.
+    """
+    start = trust_root.absolute()
     try:
-        for index, component in enumerate(absolute.parts[1:], start=1):
+        components = absolute.relative_to(start).parts
+        root_metadata = start.lstat()
+    except (ValueError, OSError):
+        return None
+    if stat.S_ISLNK(root_metadata.st_mode) or not stat.S_ISDIR(root_metadata.st_mode):
+        return None
+    if not _component_safe(root_metadata):
+        return None
+    return start, components
+
+
+def _path_components_safe(
+    path: Path, *, final_kind: str, trust_root: Path | None = None
+) -> bool:
+    """Refuse a path that any untrusted directory on the way to it could swap.
+
+    With no ``trust_root`` every component from the filesystem root is checked.
+    That is correct on a normal Linux node and stays the default.
+
+    ``trust_root`` anchors the walk instead: the root itself is checked with the
+    same rules, then only the components BELOW it (#1069). Android/Termux needs
+    this — ``/data`` and ``/data/data`` are ``771 system(1000)``, platform-owned
+    and unchangeable, so a walk from ``/`` rejects every correctly-provisioned
+    Termux path. daegyo and gongyung could not even read their own enabled flag:
+    ``_read_enabled_file`` runs the same check, so the node reported
+    ``enabled:false`` with nothing anywhere saying why, and 20 intake candidates
+    were structurally excluded.
+
+    Anchoring is sound there because ``/data/data/<pkg>`` IS the OS-enforced
+    per-app uid boundary: components above it are not a hole another app can
+    reach through, so examining them adds no protection. It is only sound for a
+    root the operator controls — pass the harness home, never a caller-supplied
+    or world-writable directory.
+
+    The anchor only ever RELAXES, and only for paths inside a root that itself
+    passed the same checks. A path outside the root, or a root that fails them,
+    falls back to the full walk from ``/`` — i.e. exactly today's behaviour.
+    That matters because ``CCC_STATE_DIR`` may legitimately point outside
+    ``$HOME``; refusing those would silently break a valid configuration, which
+    is the same failure this fix exists to remove.
+    """
+    absolute = path.absolute()
+    try:
+        start = Path(absolute.anchor)
+        components = absolute.parts[1:]
+        if trust_root is not None:
+            anchored = _anchored_walk(absolute, trust_root)
+            if anchored is not None:
+                start, components = anchored
+                if not components:
+                    return final_kind == "dir"
+        current = start
+        for index, component in enumerate(components, start=1):
             current /= component
             metadata = current.lstat()
             if stat.S_ISLNK(metadata.st_mode):
                 return False
-            is_final = index == len(absolute.parts) - 1
+            is_final = index == len(components)
             if is_final and final_kind == "file":
                 if not stat.S_ISREG(metadata.st_mode):
                     return False
             elif not stat.S_ISDIR(metadata.st_mode):
                 return False
-            mode = stat.S_IMODE(metadata.st_mode)
-            writable = bool(mode & 0o022)
-            trusted_sticky = metadata.st_uid == 0 and bool(mode & stat.S_ISVTX)
-            if metadata.st_uid not in {0, os.geteuid()} or (writable and not trusted_sticky):
+            if not _component_safe(metadata):
                 return False
         return True
     except OSError:
@@ -387,7 +454,7 @@ def _ownership_rows(config: Config, provider: str) -> list[dict[str, Any]]:
     root = config.provider_roots[provider]
     if not root.is_dir():
         return []
-    if not _path_components_safe(root, final_kind="dir"):
+    if not _path_components_safe(root, final_kind="dir", trust_root=config.home):
         raise PromotionError("skills_root_unsafe")
     completed = _run(
         [
@@ -530,7 +597,7 @@ def _snapshot(config: Config, provider: str, row: dict[str, Any]) -> Candidate: 
     except OSError:
         raise PromotionError("source_directory_unsafe") from None
     if (
-        not _path_components_safe(skill_dir, final_kind="dir")
+        not _path_components_safe(skill_dir, final_kind="dir", trust_root=config.home)
         or
         stat.S_ISLNK(directory.st_mode)
         or not stat.S_ISDIR(directory.st_mode)
@@ -1100,8 +1167,8 @@ def _candidate_from_envelope(  # noqa: C901
     )
 
 
-def _state_payload(path: Path) -> dict[str, object]:
-    if not _path_components_safe(path, final_kind="file"):
+def _state_payload(path: Path, *, trust_root: Path | None = None) -> dict[str, object]:
+    if not _path_components_safe(path, final_kind="file", trust_root=trust_root):
         raise PromotionError("outbox_file_unsafe")
     payload, _ = _safe_read(path, max_bytes=_MAX_TOTAL_BYTES * 2, exact_mode=0o600)
     try:
@@ -1122,10 +1189,10 @@ def _stage_candidate(config: Config, candidate: Candidate) -> dict[str, str]:
     destination = outbox / f"{transport_id}.json"
     sent_path = sent / destination.name
     if sent_path.exists():
-        _candidate_from_envelope(_state_payload(sent_path))
+        _candidate_from_envelope(_state_payload(sent_path, trust_root=config.home))
         return {"outcome": "already-published", "transport_id": transport_id}
     if destination.exists():
-        existing, _, existing_id = _candidate_from_envelope(_state_payload(destination))
+        existing, _, existing_id = _candidate_from_envelope(_state_payload(destination, trust_root=config.home))
         if existing.tree_sha256 != candidate.tree_sha256 or existing_id != transport_id:
             raise PromotionError("outbox_collision")
         return {"outcome": "already-staged", "transport_id": transport_id}
@@ -1168,7 +1235,7 @@ def _pending_envelopes(config: Config, *, limit: int) -> list[dict[str, object]]
     sent = config.promotion_state_dir / "sent"
     if not outbox.exists():
         return []
-    if not _path_components_safe(outbox, final_kind="dir"):
+    if not _path_components_safe(outbox, final_kind="dir", trust_root=config.home):
         raise PromotionError("outbox_path_unsafe")
     rows: list[dict[str, object]] = []
     for path in sorted(outbox.glob("*.json")):
@@ -1176,7 +1243,7 @@ def _pending_envelopes(config: Config, *, limit: int) -> list[dict[str, object]]
             break
         if (sent / path.name).exists():
             continue
-        value = _state_payload(path)
+        value = _state_payload(path, trust_root=config.home)
         _, _, transport_id = _candidate_from_envelope(value)
         if path.name != f"{transport_id}.json":
             raise PromotionError("outbox_filename_mismatch")
@@ -1194,11 +1261,11 @@ def _ack_local(config: Config, transport_id: str) -> bool:
     source = outbox / f"{transport_id}.json"
     destination = sent / source.name
     if destination.exists():
-        _candidate_from_envelope(_state_payload(destination))
+        _candidate_from_envelope(_state_payload(destination, trust_root=config.home))
         return True
     if not source.exists():
         return False
-    _, _, actual_id = _candidate_from_envelope(_state_payload(source))
+    _, _, actual_id = _candidate_from_envelope(_state_payload(source, trust_root=config.home))
     if actual_id != transport_id:
         raise PromotionError("ack_id_mismatch")
     os.replace(source, destination)
