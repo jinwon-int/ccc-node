@@ -14,6 +14,14 @@ trap 'rm -rf "$TMP"' EXIT
 # Keep default-schedule assertions deterministic regardless of the test host.
 export CCC_SKILL_AUTOSAVE_LOCAL_UTC_OFFSET=+0000
 export CCC_SKILL_AUTOSAVE_LOCAL_TIMEZONE=Etc/UTC
+# The installer resolves a fleet identity from $CCC_NODE / $STATE_DIR/node.txt
+# (#1067). Point STATE_DIR at a fixture and clear CCC_NODE so no case reads the
+# live node's identity: otherwise this suite passes on a provisioned node and
+# behaves differently in CI, where neither exists.
+export CCC_STATE_DIR="$TMP/state"
+mkdir -p "$CCC_STATE_DIR"
+printf 'fixture-node\n' > "$CCC_STATE_DIR/node.txt"
+unset CCC_NODE
 
 # Stubbed crontab backed by a temp file (CRON_STORE, read from env).
 export CRON_STORE="$TMP/crontab.store"
@@ -103,6 +111,42 @@ ok "corrupt managed block is reported" 'grep -q "corrupt managed schedule block"
 rm -f "$CRON_STORE"
 run bash "$SC" --apply --schedule "30 6 * * 1"
 ok "custom schedule honored" 'grep -qF "30 6 * * 1" "$CRON_STORE"'
+
+# ---- fleet identity is baked into the entry (#1067) ------------------------
+# Without CCC_NODE in the cron line, `bash -lc` gives ccc-skill-promotion.py no
+# identity and scheduled staging refuses with node_identity_unresolved — the
+# publisher-side symptom that hid this on 11 of 12 nodes.
+rm -f "$CRON_STORE"
+run bash "$SC" --apply
+ok "installed line carries the fleet identity from node.txt" \
+  'grep -qF "CCC_NODE=\"fixture-node\"" "$CRON_STORE"'
+ok "identity precedes the autosave command" \
+  'grep -qE "CCC_NODE=\"fixture-node\" CCC_CLAUDE_DIR=" "$CRON_STORE"'
+
+rm -f "$CRON_STORE"
+run env CCC_NODE=env-node bash "$SC" --apply
+ok "CCC_NODE overrides node.txt" 'grep -qF "CCC_NODE=\"env-node\"" "$CRON_STORE"'
+
+rm -f "$CRON_STORE"
+run env CCC_NODE=env-node bash "$SC" --apply --node flag-node
+ok "--node wins over CCC_NODE" \
+  'grep -qF "CCC_NODE=\"flag-node\"" "$CRON_STORE" && ! grep -qF "env-node" "$CRON_STORE"'
+
+# Sanitization mirrors _safe_node() so the installer cannot bake a value the
+# Python side would rewrite or reject.
+rm -f "$CRON_STORE"
+run bash "$SC" --apply --node "  Yuk_Son!! "
+ok "identity is sanitized like _safe_node" 'grep -qF "CCC_NODE=\"yuk-son\"" "$CRON_STORE"'
+
+# Unresolvable identity must not guess: hostname is a machine name, not the
+# fleet alias the publisher matches (yukson vs vps5). Install, but say so.
+rm -f "$CRON_STORE"
+run env CCC_STATE_DIR="$TMP/no-identity" bash "$SC" --apply
+okc "$RC" 0 "unresolved identity still installs cron"
+ok "unresolved identity omits CCC_NODE" '! grep -qF "CCC_NODE=" "$CRON_STORE"'
+ok "unresolved identity is reported" 'grep -q "no fleet identity resolved" "$OUT"'
+ok "unresolved identity never guesses the hostname" \
+  '! grep -qF "$(hostname -s 2>/dev/null || echo __no_hostname__)" "$CRON_STORE"'
 
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
