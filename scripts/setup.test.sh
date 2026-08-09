@@ -308,7 +308,41 @@ ok "setup rewrites the canonical repo path into installed slash commands" \
 if [ "$ROOT" != "/opt/ccc-node" ]; then
   ok "setup leaves no stale /opt/ccc-node reference in installed commands" \
     '! grep -rq "/opt/ccc-node" "$rewrite_claude/commands"'
+  # Skills are rewritten too, and this fixture has a Piri agent dir — which is
+  # what makes the case load bearing (#1072). install_repo_skills_into runs a
+  # second time for Piri, so the rewrite must read a snapshot of the CLAUDE
+  # install, not whatever the function last left behind. Without the snapshot
+  # the skill rewrite silently targets the Piri set and every canonical path in
+  # an installed Claude skill survives, unrewritten, on a non-canonical node.
+  ok "setup rewrites the canonical repo path inside installed skills" \
+    'grep -Fq "$ROOT" "$rewrite_claude/skills/self-update/check.sh" && ! grep -Fq "/opt/ccc-node" "$rewrite_claude/skills/self-update/check.sh"'
+  ok "setup leaves no stale /opt/ccc-node reference in installed skills" \
+    '! grep -rq "/opt/ccc-node" "$rewrite_claude/skills"'
 fi
+# ccc_doctor diagnoses skills from SKILL_SOURCE_ROOTS and applies the SAME
+# canonical rewrite before comparing. A root that setup installs from but the
+# rewrite never covers therefore reads as permanent phantom drift on every
+# non-canonical node — and --fix refuses skill paths, so doctor cannot clear its
+# own report. Pin the two lists together the way canonical-paths.test.sh already
+# pins the canonical constants across files (#1072).
+skill_roots_agree() {
+  local declared doctor
+  declared="$(grep -oE '"\$SRC/(claude/skills|skills/shared)"' "$SETUP" | tr -d '"' | sed "s|\$SRC/||" | sort -u | tr '\n' ' ')"
+  doctor="$(python3 - "$ROOT/scripts/ccc_doctor.py" <<'PY'
+import ast, sys
+tree = ast.parse(open(sys.argv[1], encoding="utf-8").read())
+for node in tree.body:
+    if isinstance(node, ast.Assign) and any(
+        getattr(t, "id", "") == "SKILL_SOURCE_ROOTS" for t in node.targets
+    ):
+        print(" ".join(sorted(ast.literal_eval(node.value))) + " ")
+        break
+PY
+)"
+  [ -n "$declared" ] && [ "$declared" = "$doctor" ]
+}
+ok "setup installs skills from exactly the roots ccc_doctor diagnoses" \
+  'skill_roots_agree'
 # Non-cascading regression (PR #563 review): a checkout under a path containing
 # /root/.claude must keep its freshly inserted $SRC intact — the harness-dir
 # pair must not rescan and corrupt the repo-path pair's output.
