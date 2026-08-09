@@ -582,6 +582,7 @@ install_repo_skills_into() { # install_repo_skills_into <dest-root> <manifest> <
   local dest_root="$1" manifest="$2"; shift 2
   local root source name target stage retired current_hash recorded_hash
   local -a current=()
+  INSTALLED_REPO_SKILLS=()
   if [ "$DRY" = 1 ]; then
     note "repo skills: would refresh copies in $dest_root (atomic copy + manifest prune)"
     return 0
@@ -626,6 +627,14 @@ install_repo_skills_into() { # install_repo_skills_into <dest-root> <manifest> <
     done
     run mv "$manifest.tmp" "$manifest"
   fi
+  # Publish what was actually installed so the canonical-path rewrite (step 2b)
+  # can target exactly these directories (#1072). Deriving the rewrite set from
+  # the install result — rather than re-enumerating source trees beside it — is
+  # what keeps the two from drifting apart: ccc_doctor applies the same rewrite
+  # to everything in SKILL_SOURCE_ROOTS before comparing, so any tree this
+  # installs but the rewrite skips reads as permanent phantom drift on every
+  # non-canonical node, and --fix refuses skill paths so doctor cannot clear it.
+  INSTALLED_REPO_SKILLS=(${current[@]+"${current[@]}"})
 }
 # The canonical-path rewrite (step 2b) edits installed skill files AFTER the
 # copy above hashed them, so on a non-canonical node the manifest describes
@@ -653,6 +662,11 @@ refresh_skill_manifest_hashes() { # refresh_skill_manifest_hashes <dest-root> <m
 }
 run mkdir -p "$CLAUDE_DIR/skills" "$CLAUDE_DIR/state"
 install_repo_skills_into "$CLAUDE_DIR/skills" "$CLAUDE_DIR/state/repo-skills.manifest" "$SRC/claude/skills" "$SRC/skills/shared"
+# Snapshot immediately: the Piri install below reuses the function and would
+# otherwise leave its own set in INSTALLED_REPO_SKILLS by the time the
+# canonical-path rewrite reads it. Piri skills install outside $CLAUDE_DIR and
+# are not rewrite targets.
+CLAUDE_REPO_SKILLS=(${INSTALLED_REPO_SKILLS[@]+"${INSTALLED_REPO_SKILLS[@]}"})
 
 # Piri skills (web search/fetch helpers) — only on nodes that already have a
 # Piri agent dir, so non-Piri nodes stay untouched.
@@ -705,10 +719,20 @@ if [ "$CLAUDE_DIR" != "/root/.claude" ] || [ "$SRC" != "/opt/ccc-node" ]; then
       "$CLAUDE_DIR/hooks/ccc_memory_search.py"
       "${installed_hook_scripts[@]}" "${hook_tree_targets[@]}" "${SEEDED[@]}"
     )
-    for source_tree in output-styles agents commands skills; do
+    for source_tree in output-styles agents commands; do
       while IFS= read -r -d '' source_file; do
         rewrite_targets+=("$CLAUDE_DIR/$source_tree/${source_file#"$SRC/claude/$source_tree/"}")
       done < <(find "$SRC/claude/$source_tree" -type f -print0)
+    done
+    # Skills come from more than one repo root (claude/skills + skills/shared)
+    # and land flat in $CLAUDE_DIR/skills, so walk what install_repo_skills_into
+    # actually installed instead of re-listing the roots here (#1072). Node-local
+    # and autosave skills are absent from that list and stay untouched.
+    for skill_name in ${CLAUDE_REPO_SKILLS[@]+"${CLAUDE_REPO_SKILLS[@]}"}; do
+      [ -d "$CLAUDE_DIR/skills/$skill_name" ] || continue
+      while IFS= read -r -d '' source_file; do
+        rewrite_targets+=("$source_file")
+      done < <(find "$CLAUDE_DIR/skills/$skill_name" -type f -print0)
     done
     # The transform itself lives in scripts/lib/canonical_paths.py because
     # ccc-doctor must apply the IDENTICAL rewrite before comparing installed
