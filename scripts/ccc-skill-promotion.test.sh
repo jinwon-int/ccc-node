@@ -266,5 +266,33 @@ out="$(env "${base_env[@]}" CCC_SKILL_PROMOTION_ENABLED=true python3 "$PROMOTER"
 ok "symlinked support content fails closed" \
   '[ "$rc" = 0 ] && jq -e ".blocked[0].code == \"source_symlink\"" >/dev/null <<<"$out"'
 
+# --- #1067: an unresolvable fleet identity must fail closed -------------------
+# `bash -lc`, which the autosave cron uses, exports neither CCC_NODE nor
+# HOSTNAME. Staging under a placeholder name produced envelopes that every
+# publisher rejected as remote_node_mismatch, while the node reported success.
+no_node_env=()
+for entry in "${base_env[@]}"; do
+  case "$entry" in CCC_NODE=*) continue;; esac
+  no_node_env+=("$entry")
+done
+
+write_skill identity-guard ""
+write_status identity-guard
+out="$(env -u CCC_NODE -u HOSTNAME "${no_node_env[@]}" CCC_SKILL_PROMOTION_ENABLED=true python3 "$PROMOTER" run)"; rc=$?
+ok "no CCC_NODE/HOSTNAME: run fails closed instead of staging a placeholder" \
+  '[ "$rc" != 0 ] && jq -e ".ok == false and .code == \"node_identity_unresolved\"" >/dev/null <<<"$out"'
+ok "no CCC_NODE/HOSTNAME: nothing is written to the outbox" \
+  '[ ! -e "$STATE/skill-promotion/outbox" ] || [ -z "$(ls -A "$STATE/skill-promotion/outbox")" ]'
+
+# The guard must reject a name that sanitizes away, not just an unset variable.
+out="$(env "${no_node_env[@]}" CCC_NODE=' /// ' CCC_SKILL_PROMOTION_ENABLED=true python3 "$PROMOTER" run)"; rc=$?
+ok "CCC_NODE that sanitizes to empty also fails closed" \
+  '[ "$rc" != 0 ] && jq -e ".code == \"node_identity_unresolved\"" >/dev/null <<<"$out"'
+
+# HOSTNAME alone still resolves — the guard rejects absence, not the fallback.
+out="$(env "${no_node_env[@]}" HOSTNAME=fallbacknode CCC_SKILL_PROMOTION_ENABLED=true python3 "$PROMOTER" run --dry-run)"; rc=$?
+ok "HOSTNAME alone still resolves an identity" \
+  '[ "$rc" = 0 ] && jq -e ".staged[0].transport_id | startswith(\"fallbacknode-\")" >/dev/null <<<"$out"'
+
 echo "skill-promotion tests: pass=$pass fail=$fail"
 [ "$fail" -eq 0 ]
