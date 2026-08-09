@@ -627,6 +627,30 @@ install_repo_skills_into() { # install_repo_skills_into <dest-root> <manifest> <
     run mv "$manifest.tmp" "$manifest"
   fi
 }
+# The canonical-path rewrite (step 2b) edits installed skill files AFTER the
+# copy above hashed them, so on a non-canonical node the manifest describes
+# pre-rewrite bytes and every rewritten skill reads as "modified locally"
+# forever — it can never be pruned when the repo drops it. Re-record hashes
+# once the rewrite has run. Entries whose directory is gone keep their recorded
+# hash, so a later prune can still tell an edited copy from a pristine one.
+refresh_skill_manifest_hashes() { # refresh_skill_manifest_hashes <dest-root> <manifest>
+  local dest_root="$1" manifest="$2" name recorded
+  if [ "$DRY" = 1 ]; then
+    note "repo skills: would re-record $manifest hashes after the canonical-path rewrite"
+    return 0
+  fi
+  [ -f "$manifest" ] || return 0
+  : > "$manifest.tmp"
+  while read -r name recorded; do
+    [ -n "$name" ] || continue
+    if [ -d "$dest_root/$name" ]; then
+      printf '%s %s\n' "$name" "$(skill_tree_hash "$dest_root/$name")" >> "$manifest.tmp"
+    else
+      printf '%s %s\n' "$name" "$recorded" >> "$manifest.tmp"
+    fi
+  done < "$manifest"
+  mv "$manifest.tmp" "$manifest"
+}
 run mkdir -p "$CLAUDE_DIR/skills" "$CLAUDE_DIR/state"
 install_repo_skills_into "$CLAUDE_DIR/skills" "$CLAUDE_DIR/state/repo-skills.manifest" "$SRC/claude/skills" "$SRC/skills/shared"
 
@@ -696,6 +720,10 @@ if [ "$CLAUDE_DIR" != "/root/.claude" ] || [ "$SRC" != "/opt/ccc-node" ]; then
       python3 "$SRC/scripts/lib/canonical_paths.py" "$rewrite_file" \
         "/opt/ccc-node" "$SRC" "/root/.claude" "$CLAUDE_DIR"
     done
+    # Skill copies were hashed before this rewrite touched them — re-record so
+    # the manifest matches the bytes on disk. Only the Claude tree needs it:
+    # $PIRI_AGENT_DIR/skills is not in rewrite_targets, so those hashes stand.
+    refresh_skill_manifest_hashes "$CLAUDE_DIR/skills" "$CLAUDE_DIR/state/repo-skills.manifest"
   fi
 fi
 

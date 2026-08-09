@@ -282,6 +282,24 @@ ok "setup leaves node-local skills untouched" \
   'grep -q "node-local" "$legacy_claude/skills/node-local-only/SKILL.md"'
 ok "setup records the installed skill set in the manifest" \
   'grep -q "^wiki-record " "$legacy_claude/state/repo-skills.manifest" && grep -q "^gh-pr-flow " "$legacy_claude/state/repo-skills.manifest"'
+# Recording the name is not enough: the canonical-path rewrite edits installed
+# skill files after they were hashed, so without a re-record every rewritten
+# skill (gh-pr-flow, mcp-add, self-update all embed /opt/ccc-node) carries a
+# stale hash and the prune above can never fire for it. This case runs on a
+# non-canonical CLAUDE_DIR *and* checkout, so the rewrite really does fire.
+manifest_hashes_match() { # manifest_hashes_match <claude-dir>
+  local root="$1" sname shash actual
+  [ -f "$root/state/repo-skills.manifest" ] || return 1
+  while read -r sname shash; do
+    [ -n "$sname" ] || continue
+    [ -d "$root/skills/$sname" ] || continue
+    actual="$(cd "$root/skills/$sname" && find . -type f -exec sha256sum {} + | sort -k2 | sha256sum | awk '{print $1}')"
+    [ "$actual" = "$shash" ] || { echo "  manifest hash drift: $sname" >&2; return 1; }
+  done < "$root/state/repo-skills.manifest"
+  return 0
+}
+ok "setup records manifest hashes matching the installed bytes after the rewrite" \
+  'manifest_hashes_match "$legacy_claude"'
 # Slash commands invoke repo scripts verbatim; installed copies must point at
 # THIS checkout, not the canonical /opt/ccc-node (broken on e.g. /root/ccc-node
 # nodes). Repo templates stay canonical — only installed copies are rewritten.
