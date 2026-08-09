@@ -134,9 +134,16 @@ def _bounded_int(raw: str | None, default: int, minimum: int, maximum: int) -> i
 
 
 def _safe_node(raw: str) -> str:
+    """Sanitize a fleet node identity, or return "" when there is none.
+
+    Returning "" rather than a placeholder is deliberate (#1067). The node name
+    is a fleet identity that the collecting publisher matches against the SSH
+    alias it dialled, not a machine hostname: guessing one produces envelopes
+    that stage cleanly and are then rejected as `remote_node_mismatch`, with the
+    failure visible only on the publisher. Callers must refuse to stage instead.
+    """
     value = re.sub(r"[^a-z0-9-]+", "-", raw.lower()).strip("-")
-    value = re.sub(r"-+", "-", value)[:32].rstrip("-")
-    return value or "node"
+    return re.sub(r"-+", "-", value)[:32].rstrip("-")
 
 
 def _read_enabled_file(path: Path) -> bool:
@@ -265,7 +272,7 @@ def _config(environment: dict[str, str] | None = None) -> Config:
         repo=repo,
         remote=env.get("CCC_SKILL_PROMOTION_REMOTE", f"https://github.com/{repo}.git"),
         base=base,
-        node=_safe_node(env.get("CCC_NODE", env.get("HOSTNAME", "node"))),
+        node=_safe_node(env.get("CCC_NODE") or env.get("HOSTNAME") or ""),
         providers=providers,
         provider_roots={
             "claude": Path(
@@ -1300,6 +1307,13 @@ def _execute(config: Config, *, dry_run: bool) -> dict[str, object]:
             "blocked": [],
             "errors": [],
         }
+    # Refuse to stage without a fleet identity (#1067). `bash -lc`, which is what
+    # the autosave cron uses, exports neither CCC_NODE nor HOSTNAME, so this used
+    # to fall back to a placeholder: every envelope staged "successfully" and the
+    # publisher then rejected all of them as `remote_node_mismatch`. The node saw
+    # ok/staged; only the publisher saw the error. Fail here, where it shows.
+    if not config.node:
+        raise PromotionError("node_identity_unresolved")
     dry_run = dry_run or config.autonomy == "dry-run"
     _private_state_dir(config.promotion_state_dir)
     lock_path = config.promotion_state_dir / "promotion.lock"
