@@ -26,6 +26,36 @@ BLOCK_BEGIN="# ccc-node:autosave-schedule:begin"
 BLOCK_END="# ccc-node:autosave-schedule:end"
 APPLY=0
 REMOVE=0
+OPT_NODE=""
+
+# Fleet identity for the scheduled run (#1067). `bash -lc` — what this cron line
+# uses — exports neither CCC_NODE nor HOSTNAME, so ccc-skill-promotion.py saw no
+# identity and (before #1068) stamped every envelope with a placeholder that the
+# collecting publisher rejected as remote_node_mismatch; the node reported
+# ok/staged while nothing was ever published. #1068 made that fail closed, so the
+# scheduled path now refuses to stage at all. Carrying the identity in the cron
+# line is the other half: resolve it here, where the operator's environment is
+# still rich, and bake it into the entry.
+#
+# Deliberately NO hostname fallback. The node name is a fleet identity the
+# publisher matches against the SSH alias it dialled, not a machine name — on
+# yukson `hostname -s` is vps5 while the fleet identity is yukson, so guessing
+# reproduces exactly the mismatch #1068 fails closed on. Resolve it or leave it
+# out and say so.
+sanitize_node() { # <raw> — mirrors _safe_node() in scripts/ccc-skill-promotion.py
+  printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]' \
+    | sed -E 's/[^a-z0-9-]+/-/g; s/-+/-/g; s/^-+//; s/-+$//' \
+    | cut -c1-32 | sed -E 's/-+$//'
+}
+resolve_fleet_node() { # --node > CCC_NODE > $STATE_DIR/node.txt (the file
+                       # load-memory.sh / refresh-memory.sh / statusline.sh read)
+  local raw=""
+  if [ -n "$OPT_NODE" ]; then raw="$OPT_NODE"
+  elif [ -n "${CCC_NODE:-}" ]; then raw="${CCC_NODE:-}"
+  elif [ -r "$STATE_DIR/node.txt" ]; then raw="$(head -1 "$STATE_DIR/node.txt" 2>/dev/null || true)"
+  fi
+  sanitize_node "$raw"
+}
 
 # User crontabs are evaluated in the cron daemon's local timezone. Resolve the
 # default 20:45 UTC target into a host-local expression at install time instead
@@ -99,6 +129,13 @@ Options:
   --remove         Remove the managed entry (with --apply) instead of adding it.
   --schedule SPEC  Host-local cron schedule (5 fields). Default resolves the
                    20:45 UTC target for this host: "$SCHEDULE".
+  --node NAME      Fleet identity to bake into the entry as CCC_NODE, so the
+                   scheduled skill-promotion staging can resolve it. Defaults to
+                   \$CCC_NODE, then the first line of \$STATE_DIR/node.txt. Never
+                   guessed from the hostname: the publisher matches this against
+                   the SSH alias it dialled, not the machine name. When it cannot
+                   be resolved the entry installs without it and promotion stays
+                   fail-closed (#1067).
 
 Env overrides: CCC_CLAUDE_DIR, CCC_STATE_DIR, CCC_SKILL_AUTOSAVE_CMD,
 CCC_SKILL_AUTOSAVE_CRON, CCC_SKILL_AUTOSAVE_CRON_LOG, CCC_CRONTAB_CMD.
@@ -115,6 +152,7 @@ while [ $# -gt 0 ]; do
     --apply) APPLY=1 ;;
     --remove) REMOVE=1 ;;
     --schedule) need_val "$1" "${2:-}"; SCHEDULE="$2"; shift ;;
+    --node) need_val "$1" "${2:-}"; OPT_NODE="$2"; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown arg: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -130,7 +168,19 @@ if [ ! -f "$AUTOSAVE" ] && [ -f "$ROOT/scripts/ccc-skill-autosave.sh" ]; then
   AUTOSAVE="$ROOT/scripts/ccc-skill-autosave.sh"
 fi
 
-CRON_LINE="$SCHEDULE bash -lc 'CCC_CLAUDE_DIR=\"$CLAUDE_DIR\" \"$AUTOSAVE\" run' >> \"$LOG\" 2>&1  $MARKER"
+FLEET_NODE="$(resolve_fleet_node)"
+if [ -n "$FLEET_NODE" ]; then
+  CRON_LINE="$SCHEDULE bash -lc 'CCC_NODE=\"$FLEET_NODE\" CCC_CLAUDE_DIR=\"$CLAUDE_DIR\" \"$AUTOSAVE\" run' >> \"$LOG\" 2>&1  $MARKER"
+else
+  # Install anyway: the entry also refreshes candidates, drafts skills and
+  # queues owner notifications, and those work without a fleet identity. Only
+  # skill-promotion staging needs it, and that is opt-in and already fail-closed
+  # (#1068) — so warn where the operator can see it instead of blocking cron.
+  CRON_LINE="$SCHEDULE bash -lc 'CCC_CLAUDE_DIR=\"$CLAUDE_DIR\" \"$AUTOSAVE\" run' >> \"$LOG\" 2>&1  $MARKER"
+  echo "WARNING: no fleet identity resolved (--node, \$CCC_NODE, $STATE_DIR/node.txt)." >&2
+  echo "         Installing without CCC_NODE; scheduled skill-promotion staging will" >&2
+  echo "         refuse with node_identity_unresolved until one is provided (#1067)." >&2
+fi
 
 current="$("$CRONTAB" -l 2>/dev/null || true)"
 if ! without_marker="$(printf '%s\n' "$current" | awk \
