@@ -40,6 +40,7 @@ REVIEW="${CCC_SKILL_REVIEW_CMD:-$CLAUDE_DIR/hooks/skill-review.sh}"
 SCAN="${CCC_SKILL_SCAN_CMD:-$CLAUDE_DIR/skills/skillsuggest/scan.sh}"
 AUTOINSTALL="${CCC_SKILL_AUTOINSTALL_CMD:-$CLAUDE_DIR/hooks/skill-review/autoinstall.sh}"
 CURATOR="${CCC_SKILL_CURATOR_CMD:-$CLAUDE_DIR/hooks/skill-review/curator.py}"
+PROMOTER="${CCC_SKILL_PROMOTION_CMD:-$CLAUDE_DIR/hooks/ccc-skill-promotion.py}"
 
 # Fleet-wide autonomy guard (#386): a single kill-switch/dry-run above every
 # no-approval write. The installed layout keeps the lib under the claude tree;
@@ -227,6 +228,26 @@ if [ "${CCC_SKILL_CURATOR_ENABLED:-false}" = "true" ]; then
       && log "curator $(printf '%s' "$summary" | head -c 500)" \
       || log "curator failed (non-fatal)"
   fi
+fi
+
+# --- 2d) private skill intake (explicit opt-in) ------------------------------
+# Every enabled node only stages owner-only local envelopes. A separately
+# enabled central publisher may then collect local/SSH outboxes and open bounded
+# draft PRs after verifying that fleet-skills is PRIVATE. Non-publisher nodes
+# perform no GitHub operation. Fleet autonomy dry-run covers both boundaries.
+if [ -f "$PROMOTER" ] && command -v python3 >/dev/null 2>&1; then
+  promotion_args="run"
+  [ "$AUTONOMY_STATE" = "dry-run" ] && promotion_args="run --dry-run"
+  summary="$(python3 "$PROMOTER" $promotion_args 2>>"$LOG")" \
+    && log "promotion-stage $(printf '%s' "$summary" | head -c 500)" \
+    || log "promotion-stage failed (non-fatal)"
+  collect_args="collect"
+  [ "$AUTONOMY_STATE" = "dry-run" ] && collect_args="collect --dry-run"
+  summary="$(python3 "$PROMOTER" $collect_args 2>>"$LOG")" \
+    && log "promotion-collect $(printf '%s' "$summary" | head -c 500)" \
+    || log "promotion-collect failed (non-fatal)"
+else
+  log "promotion skipped reason=missing-runtime"
 fi
 
 # --- 3) owner-only Telegram notification via the bridge spool ----------------

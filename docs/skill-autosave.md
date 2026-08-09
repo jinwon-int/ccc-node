@@ -10,6 +10,7 @@ rollback, Hermes-style. Three layers cooperate:
 | `claude/hooks/skill-review.sh` | SessionEnd hook (interactive `claude` sessions) | LLM reviews the session transcript and stages `SKILL.md` drafts under `~/.claude/state/pending-skills/`. In auto mode it then hands fresh drafts to `skill-review/autoinstall.sh`. |
 | `scripts/ccc-skill-autosave.sh` | daily cron (this doc) | Covers what hooks cannot: Telegram-bridge / SDK sessions never fire SessionEnd, so the sweep pushes their recent transcripts through the same skill-review pipeline, refreshes the deterministic candidate report (`skillsuggest/scan.sh`), and queues an owner Telegram notification — an approval reminder in approve mode, or the autoinstall install/block notice in auto mode. |
 | `/skillsuggest` skill | operator (terminal or Telegram) | approve mode: reviews pending drafts + ranked candidates and installs approved skills into `~/.claude/skills/`. auto mode: post-hoc review — list, audit and roll back auto-installed skills. |
+| `scripts/ccc-skill-promotion.py` | daily sweep, explicit opt-in | Every node rescans and stages owner-only local envelopes; only the central publisher collects over SSH and opens bounded **draft intake PRs** in private `jinwon-int/fleet-skills`. It never merges or publishes generated content to ccc-node. |
 
 ## Provider support (Claude / Codex)
 
@@ -237,11 +238,94 @@ Safety rails:
   ~/.claude/hooks/skill-review/autoinstall.sh status
   ```
 
-- **Node-local only**: auto mode never touches the ccc-node template repo —
-  promoting a skill into `claude/skills/` remains PR-first.
+- **Node-local by default**: auto mode itself never touches the ccc-node
+  template repo. The separate promotion boundary below is explicit opt-in and
+  PR-first; without that opt-in every generated skill remains local.
 - **Concurrency-safe**: an atomic single-runner lock means the same checkpoint
   processed many times at once installs exactly once — no duplicate
   candidate/ledger/install rows.
+
+## Private central intake through draft PRs
+
+The intake helper closes the fleet-sharing gap without granting generated
+content or every node direct GitHub authority. Enable local staging per node
+with an owner-only state file:
+
+```bash
+printf 'true\n' > ~/.claude/state/skill-promotion.enabled
+chmod 600 ~/.claude/state/skill-promotion.enabled
+python3 ~/.claude/hooks/ccc-skill-promotion.py status
+python3 ~/.claude/hooks/ccc-skill-promotion.py run --dry-run
+```
+
+`run` never calls GitHub or SSH. It writes a `0600` content-addressed envelope
+under `~/.claude/state/skill-promotion/outbox/`; `export` is a read-only SSH
+transport command, and a successful central publication moves the retained
+envelope to the owner-only `sent/` directory.
+
+Exactly one central node is separately enabled as publisher. Its collector
+file contains canonical SSH aliases, one per line:
+
+```bash
+printf 'true\n' > ~/.claude/state/skill-promotion.publisher
+printf '%s\n' dungae nosuk soonwook > ~/.claude/state/skill-promotion.collect-nodes
+chmod 600 ~/.claude/state/skill-promotion.publisher \
+  ~/.claude/state/skill-promotion.collect-nodes
+python3 ~/.claude/hooks/ccc-skill-promotion.py collect --dry-run
+```
+
+The existing daily skill-autosave cron runs both local staging and collection.
+On ordinary nodes `collect` reports `publisher_enabled=false` without GitHub or
+SSH access. The central live collector authenticates with `gh`, checks that
+`jinwon-int/fleet-skills` is `PRIVATE`, pulls at most a bounded number of
+envelopes with batch SSH, and opens at most one draft PR by default
+(`CCC_SKILL_PROMOTION_MAX_PRS_PER_RUN`, range 1–3). A public or internal target
+fails before any remote export, clone, push, or PR operation.
+
+Only unpinned, rollback-eligible schema-v2 skills with
+`created_by=ccc-node`, an exact current ownership hash, safe owner-only paths,
+and a bounded UTF-8 file tree are eligible. The envelope includes `SKILL.md` and
+only `references/`, `scripts/`, and `templates/`; local provenance markers are
+not published. A fresh scan rejects credential-shaped data, node-specific
+paths/addresses/accounts, redaction markers, and Claude/Codex runtime coupling.
+Runtime-coupled skills stay local for manual adaptation rather than being
+misclassified as fleet-shared. The private approved snapshot is also checked
+for normalized-name and description-similarity duplicates before a branch is
+published.
+
+Each proposal writes exactly one candidate under
+`intake/<node>/<provider>/<candidate-id>/` on a content-addressed branch. Raw
+intake PRs are private and intentionally non-mergeable. An independent reviewer
+must generalize and sanitize the candidate, then create a clean PR from current
+private `main` under `approved/shared`, `approved/claude`, or `approved/codex`.
+No path automatically copies generated content into public ccc-node. If the
+same branch and PR already exist, the next sweep reuses it and acknowledges the
+local envelope. `CCC_AUTONOMY=dry-run` previews staging/collection and
+`CCC_AUTONOMY=kill` stops both with the rest of the autosave sweep.
+
+### Installing approved private skills
+
+Setup installs the consumer beside the autosave hooks, but does not run it.
+After an `approved/*` PR has passed independent review and merged, choose its
+exact 40-character commit SHA and preview the node-local transaction:
+
+```bash
+SYNC=~/.claude/hooks/ccc-fleet-skills-sync.py
+python3 "$SYNC" plan --ref <exact-commit-sha>
+python3 "$SYNC" apply --ref <exact-commit-sha>
+```
+
+The consumer authenticates read-only, rechecks that `jinwon-int/fleet-skills`
+is private, checks out exactly that commit, and independently validates the
+approved tree without executing repository-provided code. `shared` installs to
+both Claude and Codex; provider-specific audiences install only to that target.
+Floating `main`/tags, symlinks, body limits, scanner failures, duplicate names,
+invalid approvals, and existing user-owned targets fail closed before any
+installation. Managed updates use an atomic replacement with retained local
+backup and exact-commit marker. Automatic pruning is intentionally absent.
+
+Applying or changing a fleet pin is a foreground rollout action. The intake
+cron never installs a candidate or advances an approved commit on its own.
 
 ## Autonomous mutation ownership contract (#750)
 

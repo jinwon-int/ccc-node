@@ -4,6 +4,28 @@ All notable changes to the Claude Code node harness. Dates are KST.
 
 ## [Unreleased]
 
+### Added
+- Opt-in fleet skill intake now connects node-local autosave output to the
+  private `jinwon-int/fleet-skills` review boundary without giving every node a
+  GitHub write credential. Each daily node sweep reclassifies and rescans
+  rollback-eligible `autosave-managed` skills, then writes only owner-only,
+  content-addressed local outbox envelopes. An independently enabled central
+  publisher collects them over batch SSH and opens bounded private draft PRs
+  under `intake/` only after verifying repository visibility is `PRIVATE`.
+  Raw intake is never merged, installed, or written to public ccc-node;
+  approved content must be rebuilt from `main` under `approved/*` after human
+  semantic review. Secret-shaped data, node facts, runtime coupling, unsafe
+  paths, adopted/pinned skills, and approved name/description collisions fail
+  closed. Fleet autonomy kill/dry-run and body-free local receipts remain in
+  force.
+- Approved private skills can be consumed with
+  `ccc-fleet-skills-sync.py plan|apply --ref <exact-commit>`. The consumer
+  re-verifies private visibility and the complete approved tree, refuses
+  floating refs, symlinks, sensitive/node-specific content, and user-owned
+  target conflicts, installs shared/provider-scoped copies atomically with
+  exact-commit provenance, and retains rollback backups plus a body-free local
+  receipt. It is installed by setup but never applied automatically.
+
 ### Changed
 - Codex skill dedup and gh-pr-flow path cleanup (TM-2331 follow-ups). The
   zero/low-drift Codex ports `gh-ci-wait` and `fleet-disk-constraint-triage`
