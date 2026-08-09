@@ -294,5 +294,68 @@ out="$(env "${no_node_env[@]}" HOSTNAME=fallbacknode CCC_SKILL_PROMOTION_ENABLED
 ok "HOSTNAME alone still resolves an identity" \
   '[ "$rc" = 0 ] && jq -e ".staged[0].transport_id | startswith(\"fallbacknode-\")" >/dev/null <<<"$out"'
 
+# ---- Termux-shaped ancestors above the trust root (#1069) ------------------
+# On Android /data and /data/data are 771 system(1000): platform-owned and not
+# changeable by the app. Walking to / rejected every correctly-provisioned
+# Termux path, and because _read_enabled_file runs the same check the node just
+# reported enabled:false with nothing anywhere saying why — daegyo and gongyung
+# were structurally excluded from intake. The fixture reproduces the mode half
+# of that (group/other-writable ancestors); the uid half needs root to build and
+# is rejected by the same branch.
+droid_root="$TMP/droid"
+droid_home="$droid_root/data/data/com.termux/files/home"
+droid_state="$droid_home/.claude/state"
+mkdir -p "$droid_state" "$droid_home/.claude/skills" "$droid_home/.codex/skills"
+chmod 700 "$droid_home" "$droid_home/.claude" "$droid_state" \
+  "$droid_home/.claude/skills" "$droid_home/.codex" "$droid_home/.codex/skills"
+chmod 0777 "$droid_root/data" "$droid_root/data/data"
+printf 'true\n' > "$droid_state/skill-promotion.enabled"
+chmod 600 "$droid_state/skill-promotion.enabled"
+printf '{"skills":[]}\n' > "$STATUS_JSON"
+droid_env=(
+  "HOME=$droid_home"
+  "CCC_CLAUDE_DIR=$droid_home/.claude"
+  "CCC_STATE_DIR=$droid_state"
+  "CCC_SKILL_PROMOTION_OWNERSHIP_TOOL=$OWNERSHIP"
+  "CCC_SKILL_PROMOTION_CLAUDE_SKILLS_DIR=$droid_home/.claude/skills"
+  "CCC_SKILL_PROMOTION_CODEX_SKILLS_DIR=$droid_home/.codex/skills"
+  "CCC_SKILL_PROMOTION_PROVIDERS=claude"
+  "CCC_SKILL_PROMOTION_REPO=test/repo"
+  "CCC_NODE=droidnode"
+  "PROMOTION_TEST_STATUS=$STATUS_JSON"
+)
+out="$(env "${droid_env[@]}" python3 "$PROMOTER" status)"; rc=$?
+ok "writable ancestors above the trust root no longer hide the enabled flag" \
+  '[ "$rc" = 0 ] && jq -e ".enabled == true" >/dev/null <<<"$out"'
+
+# The anchor relaxes ABOVE the root only. Everything from the root down is
+# checked exactly as before, or this would be a hole rather than a fix.
+chmod 0777 "$droid_state"
+out="$(env "${droid_env[@]}" python3 "$PROMOTER" status)"; rc=$?
+ok "a writable directory BELOW the trust root is still refused" \
+  '[ "$rc" = 0 ] && jq -e ".enabled == false" >/dev/null <<<"$out"'
+chmod 700 "$droid_state"
+
+# A trust root that fails the rules is not a trust root: fall back to the walk
+# from /, which then rejects the writable ancestors again.
+chmod 0777 "$droid_home"
+out="$(env "${droid_env[@]}" python3 "$PROMOTER" status)"; rc=$?
+ok "a writable trust root grants nothing" \
+  '[ "$rc" = 0 ] && jq -e ".enabled == false" >/dev/null <<<"$out"'
+chmod 700 "$droid_home"
+
+# A state dir outside $HOME is a legitimate configuration (CCC_STATE_DIR is a
+# documented override). The anchor must not apply there, and must not refuse it
+# either — that would silently break a valid node, the same class of failure
+# this fix removes.
+outside_state="$TMP/outside-state"
+mkdir -p "$outside_state"
+chmod 700 "$outside_state"
+printf 'true\n' > "$outside_state/skill-promotion.enabled"
+chmod 600 "$outside_state/skill-promotion.enabled"
+out="$(env "${base_env[@]}" CCC_STATE_DIR="$outside_state" python3 "$PROMOTER" status)"; rc=$?
+ok "a state dir outside HOME still resolves through the unanchored walk" \
+  '[ "$rc" = 0 ] && jq -e ".enabled == true" >/dev/null <<<"$out"'
+
 echo "skill-promotion tests: pass=$pass fail=$fail"
 [ "$fail" -eq 0 ]
