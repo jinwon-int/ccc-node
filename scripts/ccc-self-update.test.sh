@@ -75,7 +75,7 @@ run_selfup() {
   CCC_CLAUDE_DIR="$CLAUDE" CCC_STATE_DIR="$STATE" CCC_PUSH_SPOOL="$TMP/spool" \
   CCC_HERMES_DIR="$HERMES" \
   CCC_SELF_UPDATE_BRIDGE_PROJECT_ROOT="$TMP/project" \
-  CCC_SELF_UPDATE_REPO="$REPO" CCC_SELF_UPDATE_SYSTEMCTL="$FAKEBIN/fakesystemctl" \
+  CCC_SELF_UPDATE_REPO="${REPO_OVERRIDE:-$REPO}" CCC_SELF_UPDATE_SYSTEMCTL="$FAKEBIN/fakesystemctl" \
   CCC_SELF_UPDATE_RESTART_WAIT_SECONDS=3 \
   CCC_NODE=testnode bash "$SELFUP" "$@"
 }
@@ -398,6 +398,56 @@ ok "deferral cap exceeded proceeds despite busy" '[ "$rc" = 0 ]'
 ok "deferral marker cleared after proceeding" '[ ! -f "$STATE/self-update.deferred-since" ]'
 
 # Back to the hermetic nonexistent health file (never the node's real one).
+rm -f "$HFILE"; export CCC_SELF_UPDATE_HEALTH_FILE="$TMP/no-such-health.json"
+
+# --- 8) #1060: terminal precondition aborts notify the owner ------------------
+# A stalled node is invisible without these: the log is local, so before #1060
+# the only detector was a human running a fleet-wide probe by hand.
+spool_text() { cat "$TMP/spool"/*SelfUpdate*.json 2>/dev/null | jq -r .text 2>/dev/null; }
+spool_dedup() { cat "$TMP/spool"/*SelfUpdate*.json 2>/dev/null | jq -r .dedup 2>/dev/null; }
+
+rm -f "$TMP/spool"/*.json
+git -C "$REPO" checkout -q -b sidetrack
+out="$(run_selfup run 2>&1)"; rc=$?
+ok "wrong-branch exits 4" '[ "$rc" = 4 ]'
+ok "wrong-branch notifies" 'spool_text | grep -q "self-update 정지" && spool_text | grep -q "sidetrack"'
+ok "wrong-branch dedup keys on reason, not SHA" 'spool_dedup | grep -qx "SelfUpdate:stalled-wrong-branch"'
+git -C "$REPO" checkout -q main
+git -C "$REPO" branch -qD sidetrack
+
+rm -f "$TMP/spool"/*.json
+echo dirt > "$REPO/dirt.txt"
+out="$(run_selfup run 2>&1)"; rc=$?
+ok "dirty-tree exits 4" '[ "$rc" = 4 ]'
+ok "dirty-tree notifies" 'spool_dedup | grep -qx "SelfUpdate:stalled-dirty-tree"'
+rm -f "$REPO/dirt.txt"
+
+rm -f "$TMP/spool"/*.json
+out="$(REPO_OVERRIDE="$TMP/not-a-repo" run_selfup run 2>&1)"; rc=$?
+ok "no-repo exits 4" '[ "$rc" = 4 ]'
+ok "no-repo notifies" 'spool_dedup | grep -qx "SelfUpdate:stalled-no-repo"'
+
+# fetch failure is transient: it must stay quiet until it has burned consecutive
+# scheduled ticks, then alert.
+rm -f "$TMP/spool"/*.json "$STATE/self-update.fetch-failures"
+git -C "$REPO" remote set-url origin "$TMP/gone.git"
+out="$(run_selfup run 2>&1)"; rc=$?
+ok "fetch-failed exits 5" '[ "$rc" = 5 ]'
+ok "first fetch failure stays quiet" '[ -z "$(spool_text)" ]'
+ok "first fetch failure counted" '[ "$(cat "$STATE/self-update.fetch-failures")" = 1 ]'
+out="$(run_selfup run 2>&1)"; rc=$?
+ok "second consecutive fetch failure notifies" 'spool_dedup | grep -qx "SelfUpdate:stalled-fetch-failed"'
+git -C "$REPO" remote set-url origin "$ORIGIN"
+rm -f "$TMP/spool"/*.json
+out="$(run_selfup run 2>&1)"; rc=$?
+ok "successful fetch clears the failure counter" '[ ! -f "$STATE/self-update.fetch-failures" ]'
+
+# The deferral path is NOT terminal — it self-heals next tick and must stay quiet.
+rm -f "$TMP/spool"/*.json
+export CCC_SELF_UPDATE_HEALTH_FILE="$HFILE"; clr_defer; mk_health "$(now_iso)" 2 45
+out="$(run_selfup run 2>&1)"; rc=$?
+ok "busy deferral still exits 8" '[ "$rc" = 8 ]'
+ok "busy deferral does not notify" '[ -z "$(spool_text)" ]'
 rm -f "$HFILE"; export CCC_SELF_UPDATE_HEALTH_FILE="$TMP/no-such-health.json"
 
 echo "----"; echo "PASS=$pass FAIL=$fail"

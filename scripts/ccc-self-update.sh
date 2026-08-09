@@ -363,19 +363,31 @@ REPO="$(resolve_repo)"
 ccc_validate_self_update_repo "$REPO" "$CLAUDE_DIR" "$HERMES_ROOT" || exit 4
 
 # --- preconditions ------------------------------------------------------------
+# A precondition abort is TERMINAL: nothing about it self-heals on the next tick,
+# so the node stops updating until a human intervenes. Before #1060 these paths
+# only wrote to the local log — the operator learned about the stall by manually
+# probing the fleet, and seoseo sat 23h behind main with no alert. Every terminal
+# abort therefore notifies. The dedup key is the reason, not a SHA: the SHA not
+# moving IS the failure, so a SHA-keyed alert would describe a different incident
+# each time it fired. push_notifier drops repeats inside a 300s window, so the
+# scheduled 04:45/05:45 ticks yield at most one alert apiece.
+notify_stalled() { # <reason> <text>
+  log "abort reason=$1 repo=$REPO"
+  notify "$2 ~/.claude/state/self-update.log" "stalled-$1"
+}
 if [ ! -d "$REPO/.git" ]; then
-  log "abort reason=no-repo repo=$REPO"
+  notify_stalled no-repo "self-update 정지: $REPO 에 git 저장소가 없습니다. 이 노드는 복구 전까지 갱신되지 않습니다."
   say "self-update: no git repo at $REPO (set CCC_SELF_UPDATE_REPO or $REPO_FILE)" >&2
   exit 4
 fi
 CUR_BRANCH="$(git -C "$REPO" symbolic-ref --short HEAD 2>/dev/null || echo '?')"
 if [ "$CUR_BRANCH" != "$BRANCH" ]; then
-  log "abort reason=wrong-branch branch=$CUR_BRANCH expected=$BRANCH"
+  notify_stalled wrong-branch "self-update 정지: 레포가 '$CUR_BRANCH' 브랜치에 있습니다 (기대: '$BRANCH'). 이 노드는 복구 전까지 갱신되지 않습니다 — 관리 체크아웃은 '$BRANCH' 고정, 개발은 git worktree로 분리하세요."
   say "self-update: repo is on '$CUR_BRANCH', expected '$BRANCH'; aborting (fail-closed)" >&2
   exit 4
 fi
 if [ -n "$(git -C "$REPO" status --porcelain 2>/dev/null)" ]; then
-  log "abort reason=dirty-tree repo=$REPO"
+  notify_stalled dirty-tree "self-update 정지: $REPO 작업 트리에 미커밋 변경이 있습니다. 이 노드는 복구 전까지 갱신되지 않습니다."
   say "self-update: working tree not clean; aborting (fail-closed)" >&2
   exit 4
 fi
@@ -383,13 +395,25 @@ fi
 OLD_SHA="$(git -C "$REPO" rev-parse HEAD 2>/dev/null)"
 
 # --- fetch + ff-only merge ----------------------------------------------------
+# fetch failure is the one precondition that DOES self-heal (transient network),
+# so it alerts only once it has burned consecutive scheduled ticks.
+FETCH_FAIL_FILE="$STATE_DIR/self-update.fetch-failures"
+FETCH_FAIL_ALERT_AFTER="${CCC_SELF_UPDATE_FETCH_FAIL_ALERT_AFTER:-2}"
 if ! git -C "$REPO" fetch origin "$BRANCH" >/dev/null 2>&1; then
-  log "abort reason=fetch-failed repo=$REPO"
+  fetch_fails="$(cat "$FETCH_FAIL_FILE" 2>/dev/null)"
+  case "$fetch_fails" in ''|*[!0-9]*) fetch_fails=0 ;; esac
+  fetch_fails=$(( fetch_fails + 1 ))
+  printf '%s' "$fetch_fails" > "$FETCH_FAIL_FILE" 2>/dev/null || :
+  log "abort reason=fetch-failed repo=$REPO consecutive=$fetch_fails"
+  if [ "$fetch_fails" -ge "$FETCH_FAIL_ALERT_AFTER" ]; then
+    notify "self-update 정지: git fetch가 ${fetch_fails}회 연속 실패했습니다. 이 노드는 복구 전까지 갱신되지 않습니다. ~/.claude/state/self-update.log" "stalled-fetch-failed"
+  fi
   say "self-update: git fetch failed" >&2
   exit 5
 fi
+rm -f "$FETCH_FAIL_FILE" 2>/dev/null || :
 if ! git -C "$REPO" merge --ff-only "origin/$BRANCH" >/dev/null 2>&1; then
-  log "abort reason=non-ff repo=$REPO"
+  notify_stalled non-ff "self-update 정지: 로컬 브랜치가 origin/$BRANCH 와 분기했습니다 (non-ff). 이 노드는 복구 전까지 갱신되지 않습니다."
   say "self-update: local branch diverged from origin/$BRANCH (non-ff); aborting (fail-closed)" >&2
   exit 5
 fi
