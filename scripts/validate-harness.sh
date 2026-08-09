@@ -253,6 +253,24 @@ else
   err "doctor hook-tree walk tests failed"
   tail -10 "$TMP/doctor-hookfiles-test.out" 2>/dev/null
 fi
+# A suite must not inherit the harness environment of the node it runs on
+# (#1064). The per-suite guard `ccc_test_reset_hook_env` (#1023) only reaches
+# suites that source test-stub.sh, so Python-driven suites fell outside it and
+# three of them failed on EVERY live node while CI — which has no CCC_*/NUNCHI_*
+# set — stayed green. That is the wrong way round for a gate whose whole job is
+# to be trustworthy on a node. Scrub at the runner instead of relying on each
+# suite to remember: it covers the suites that exist and the ones added later.
+# Only CCC_*/NUNCHI_* are removed, so TMPDIR (deliberately exported above) and
+# the rest of the environment still reach the child.
+run_suite() { # <suite-path>
+  local v
+  local -a scrub=()
+  while IFS= read -r v; do
+    [ -n "$v" ] && scrub+=(-u "$v")
+  done < <(env | sed -n 's/^\(CCC_[A-Za-z0-9_]*\|NUNCHI_[A-Za-z0-9_]*\)=.*/\1/p' | sort -u)
+  env ${scrub[@]+"${scrub[@]}"} bash "$1"
+}
+
 for t in claude/hooks/observability.test.sh claude/hooks/security-scan.test.sh \
          scripts/validate-harness.test.sh \
          claude/hooks/redact.test.sh claude/hooks/scan-injection.test.sh \
@@ -300,7 +318,7 @@ for t in claude/hooks/observability.test.sh claude/hooks/security-scan.test.sh \
          scripts/ccc-service-control.test.sh \
          scripts/ccc-broker-reconcile.test.sh; do
   [ -f "$t" ] || { err "missing test: $t"; continue; }
-  if bash "$t" >"$TMP/htest.out" 2>&1; then say "  ok $(grep -E 'PASS=' "$TMP/htest.out" | tail -1) $t";
+  if run_suite "$t" >"$TMP/htest.out" 2>&1; then say "  ok $(grep -E 'PASS=' "$TMP/htest.out" | tail -1) $t";
   else err "test failed: $t"; tail -5 "$TMP/htest.out"; fi
 done
 
@@ -318,7 +336,7 @@ for t in claude/hooks/skill-review.test.sh \
          scripts/install-nunchi.test.sh \
          scripts/setup.test.sh; do
   [ -f "$t" ] || { err "missing test: $t"; continue; }
-  if ( umask 0002; bash "$t" ) >"$TMP/htest.out" 2>&1; then say "  ok $(grep -E 'PASS=' "$TMP/htest.out" | tail -1) $t (umask 0002)";
+  if ( umask 0002; run_suite "$t" ) >"$TMP/htest.out" 2>&1; then say "  ok $(grep -E 'PASS=' "$TMP/htest.out" | tail -1) $t (umask 0002)";
   else err "test failed (umask 0002): $t"; tail -5 "$TMP/htest.out"; fi
 done
 

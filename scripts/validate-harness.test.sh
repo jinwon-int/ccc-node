@@ -46,6 +46,50 @@ ok "whitespace scratch root: private dir resolved, not the caller dir itself" \
 ok "whitespace scratch root: TMPDIR exported and parsed intact" \
   '[ "$tmpdir_ws" = "$tmp_ws" ]'
 
+# --- #1064: the runner scrubs the node's harness env before each suite --------
+# Three suites failed on every live node while CI stayed green, because the
+# per-suite guard (#1023) only reaches suites that source test-stub.sh. The
+# isolation now lives in the runner, so assert it there.
+RUN_SUITE_SRC="$(sed -n '/^run_suite() {/,/^}/p' "$VALIDATE")"
+# If run_suite is renamed or removed, fail loudly instead of silently passing an
+# empty extraction.
+ok "run_suite helper is present in validate-harness.sh" \
+  '[ -n "$RUN_SUITE_SRC" ] && grep -q "env \${scrub\[@\]" <<<"$RUN_SUITE_SRC"'
+
+PROBE="$HOSTILE/probe.sh"
+cat > "$PROBE" <<'PROBE_EOF'
+printf 'CCC=[%s] NUNCHI=[%s] KEEP=[%s] TMPDIR=[%s]\n' \
+  "${CCC_PROBE_LEAK:-unset}" "${NUNCHI_PROBE_LEAK:-unset}" \
+  "${UNRELATED_PROBE_KEEP:-unset}" "${TMPDIR:-unset}"
+PROBE_EOF
+
+# shellcheck disable=SC2034  # referenced inside eval'd ok() assertions
+probe_out="$(
+  export CCC_PROBE_LEAK=leaked NUNCHI_PROBE_LEAK=leaked \
+         UNRELATED_PROBE_KEEP=kept TMPDIR="$HOSTILE"
+  eval "$RUN_SUITE_SRC"
+  run_suite "$PROBE"
+)"
+ok "CCC_* from the live node does not reach the suite" \
+  '[[ "$probe_out" == *"CCC=[unset]"* ]]'
+ok "NUNCHI_* from the live node does not reach the suite" \
+  '[[ "$probe_out" == *"NUNCHI=[unset]"* ]]'
+ok "unrelated environment is left alone" \
+  '[[ "$probe_out" == *"KEEP=[kept]"* ]]'
+# The runner deliberately exports its private scratch as TMPDIR (#565); the
+# scrub must not take it out along with the harness vars.
+ok "TMPDIR still reaches the suite" \
+  '[[ "$probe_out" == *"TMPDIR=[$HOSTILE]"* ]]'
+
+# With nothing to scrub the helper must still run the suite (empty-array
+# expansion under `set -u`).
+# shellcheck disable=SC2034  # referenced inside eval'd ok() assertions
+probe_clean="$(
+  eval "$RUN_SUITE_SRC"
+  env -u CCC_PROBE_LEAK -u NUNCHI_PROBE_LEAK bash -c "$(declare -f run_suite); run_suite '$PROBE'"
+)"
+ok "no harness vars set: suite still runs" '[[ "$probe_clean" == *"CCC=[unset]"* ]]'
+
 echo "----"
 echo "PASS=$pass FAIL=$fail"
 [ "$fail" = "0" ]
