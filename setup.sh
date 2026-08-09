@@ -418,10 +418,12 @@ run atomic_install "$SRC/scripts/ccc-memory-benchmark-export.sh" "$CLAUDE_DIR/ho
 # Skill autosave sweep — covers bridge/SDK sessions that never fire SessionEnd
 # hooks; scheduled separately via scripts/install-skill-autosave-cron.sh.
 run atomic_install "$SRC/scripts/ccc-skill-autosave.sh" "$CLAUDE_DIR/hooks/ccc-skill-autosave.sh"
-# Opt-in autosave skill publication boundary. The daily sweep invokes it, but
-# it stays read-only/disabled until owner state explicitly enables draft-PR
-# creation; it never merges or writes the default branch.
+# Opt-in autosave skill intake boundary. Nodes stage owner-only outboxes; only
+# the separately enabled central publisher may open private draft intake PRs.
 run atomic_install "$SRC/scripts/ccc-skill-promotion.py" "$CLAUDE_DIR/hooks/ccc-skill-promotion.py"
+# Exact-commit private approved-skill consumer. It refuses floating refs,
+# non-private repositories, user-owned target conflicts, and unverified trees.
+run atomic_install "$SRC/scripts/ccc-fleet-skills-sync.py" "$CLAUDE_DIR/hooks/ccc-fleet-skills-sync.py"
 # Self-update — the pre-approved node maintenance procedure (pull + setup +
 # restart of operator-allowlisted services only; see docs/self-update.md).
 run atomic_install "$SRC/scripts/ccc-self-update.sh" "$CLAUDE_DIR/hooks/ccc-self-update.sh"
@@ -487,6 +489,7 @@ installed_hook_scripts=(
   "$CLAUDE_DIR/hooks/ccc-memory-benchmark-export.sh"
   "$CLAUDE_DIR/hooks/ccc-skill-autosave.sh"
   "$CLAUDE_DIR/hooks/ccc-skill-promotion.py"
+  "$CLAUDE_DIR/hooks/ccc-fleet-skills-sync.py"
   "$CLAUDE_DIR/hooks/ccc-self-update.sh"
   "$CLAUDE_DIR/hooks/ccc-pr-status-poll.sh"
 )

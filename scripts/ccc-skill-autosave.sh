@@ -230,17 +230,22 @@ if [ "${CCC_SKILL_CURATOR_ENABLED:-false}" = "true" ]; then
   fi
 fi
 
-# --- 2d) central draft-PR promotion (explicit opt-in) ------------------------
-# The promoter reclassifies and rescans autosave-managed skills, then creates
-# at most a bounded number of draft PRs. It is disabled unless
-# CCC_SKILL_PROMOTION_ENABLED=true or the owner-only state file contains true.
-# The fleet autonomy dry-run boundary must also cover this external write.
+# --- 2d) private skill intake (explicit opt-in) ------------------------------
+# Every enabled node only stages owner-only local envelopes. A separately
+# enabled central publisher may then collect local/SSH outboxes and open bounded
+# draft PRs after verifying that fleet-skills is PRIVATE. Non-publisher nodes
+# perform no GitHub operation. Fleet autonomy dry-run covers both boundaries.
 if [ -f "$PROMOTER" ] && command -v python3 >/dev/null 2>&1; then
   promotion_args="run"
   [ "$AUTONOMY_STATE" = "dry-run" ] && promotion_args="run --dry-run"
   summary="$(python3 "$PROMOTER" $promotion_args 2>>"$LOG")" \
-    && log "promotion $(printf '%s' "$summary" | head -c 500)" \
-    || log "promotion failed (non-fatal)"
+    && log "promotion-stage $(printf '%s' "$summary" | head -c 500)" \
+    || log "promotion-stage failed (non-fatal)"
+  collect_args="collect"
+  [ "$AUTONOMY_STATE" = "dry-run" ] && collect_args="collect --dry-run"
+  summary="$(python3 "$PROMOTER" $collect_args 2>>"$LOG")" \
+    && log "promotion-collect $(printf '%s' "$summary" | head -c 500)" \
+    || log "promotion-collect failed (non-fatal)"
 else
   log "promotion skipped reason=missing-runtime"
 fi

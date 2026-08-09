@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
-"""Promote safe autosave-managed skills through draft GitHub pull requests.
+"""Stage generated skills locally and publish private intake draft PRs centrally.
 
-The local autosave pipeline is intentionally node-local.  This helper adds the
-separate, opt-in publication boundary: it reclassifies and rescans an installed
-skill, snapshots only a bounded allowlist of files, and opens a draft PR against
-the ccc-node repository.  It never merges a PR or pushes to the default branch.
+Every node may create an owner-only, content-addressed outbox envelope. Only an
+explicitly configured central publisher may collect envelopes over SSH and open
+draft PRs in a repository whose GitHub visibility is verified as PRIVATE. Raw
+intake is never written to ccc-node, merged, approved, or installed by this tool.
 """
 
 from __future__ import annotations
 
 import argparse
+import base64
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import fcntl
@@ -18,7 +19,6 @@ import json
 import os
 from pathlib import Path
 import re
-import shutil
 import stat
 import subprocess
 import sys
@@ -93,6 +93,8 @@ class Config:
     provider_roots: dict[str, Path]
     max_prs: int
     enabled: bool
+    publisher_enabled: bool
+    collect_nodes: tuple[str, ...]
     autonomy: str
 
 
@@ -105,6 +107,7 @@ class SnapshotFile:
 
 @dataclass(frozen=True)
 class Candidate:
+    node: str
     provider: str
     name: str
     skill_sha256: str
@@ -155,6 +158,29 @@ def _read_enabled_file(path: Path) -> bool:
         return False
 
 
+def _private_lines(path: Path, *, max_bytes: int = 4096) -> tuple[str, ...]:
+    try:
+        metadata = path.lstat()
+        if (
+            not _path_components_safe(path, final_kind="file")
+            or not stat.S_ISREG(metadata.st_mode)
+            or stat.S_ISLNK(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_nlink != 1
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or metadata.st_size > max_bytes
+        ):
+            raise PromotionError("collector_config_unsafe")
+        return tuple(
+            line.strip() for line in path.read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        )
+    except FileNotFoundError:
+        return ()
+    except (OSError, UnicodeDecodeError):
+        raise PromotionError("collector_config_unsafe") from None
+
+
 def _autonomy_state(env: dict[str, str], state_dir: Path) -> str:
     value = env.get("CCC_AUTONOMY", "")
     if value in {"kill", "killed", "off", "OFF"}:
@@ -191,7 +217,7 @@ def _config(environment: dict[str, str] | None = None) -> Config:
     promotion_state_dir = Path(
         env.get("CCC_SKILL_PROMOTION_STATE_DIR", state_dir / "skill-promotion")
     ).absolute()
-    repo = env.get("CCC_SKILL_PROMOTION_REPO", "jinwon-int/ccc-node")
+    repo = env.get("CCC_SKILL_PROMOTION_REPO", "jinwon-int/fleet-skills")
     if not _REPO_RE.fullmatch(repo):
         raise PromotionError("repo_invalid")
     base = env.get("CCC_SKILL_PROMOTION_BASE", "main")
@@ -210,6 +236,26 @@ def _config(environment: dict[str, str] | None = None) -> Config:
         enabled = False
     else:
         raise PromotionError("enabled_invalid")
+    publisher_raw = env.get("CCC_SKILL_PROMOTION_PUBLISHER")
+    if publisher_raw is None:
+        publisher_enabled = _read_enabled_file(state_dir / "skill-promotion.publisher")
+    elif publisher_raw.lower() in {"1", "true", "yes"}:
+        publisher_enabled = True
+    elif publisher_raw.lower() in {"0", "false", "no"}:
+        publisher_enabled = False
+    else:
+        raise PromotionError("publisher_invalid")
+    collect_raw = env.get("CCC_SKILL_PROMOTION_COLLECT_NODES")
+    collect_nodes = (
+        tuple(part.strip() for part in collect_raw.split(",") if part.strip())
+        if collect_raw is not None
+        else _private_lines(state_dir / "skill-promotion.collect-nodes")
+    )
+    collect_nodes = tuple(dict.fromkeys(collect_nodes))
+    if len(collect_nodes) > 32 or any(
+        not _NAME_RE.fullmatch(node) or len(node) > 32 for node in collect_nodes
+    ):
+        raise PromotionError("collector_nodes_invalid")
     tool_default = claude_dir / "hooks" / "skill-review" / "ownership.py"
     return Config(
         home=home,
@@ -234,6 +280,8 @@ def _config(environment: dict[str, str] | None = None) -> Config:
         },
         max_prs=_bounded_int(env.get("CCC_SKILL_PROMOTION_MAX_PRS_PER_RUN"), 1, 1, 3),
         enabled=enabled,
+        publisher_enabled=publisher_enabled,
+        collect_nodes=collect_nodes,
         autonomy=_autonomy_state(env, state_dir),
     )
 
@@ -456,7 +504,8 @@ def _scan_text(payload: bytes) -> None:
         raise PromotionError("runtime_specific_codex")
 
 
-def _snapshot(config: Config, provider: str, row: dict[str, Any]) -> Candidate:
+# Security gates remain linear so each rejection precedes content export.
+def _snapshot(config: Config, provider: str, row: dict[str, Any]) -> Candidate:  # noqa: C901
     name = row.get("name")
     skill_sha = row.get("skill_sha256")
     if not isinstance(name, str) or not _NAME_RE.fullmatch(name) or not isinstance(skill_sha, str):
@@ -559,6 +608,7 @@ def _snapshot(config: Config, provider: str, row: dict[str, Any]) -> Candidate:
     ):
         raise PromotionError("source_changed")
     return Candidate(
+        node=config.node,
         provider=provider,
         name=name,
         skill_sha256=skill_sha,
@@ -637,7 +687,7 @@ def _central_frontmatter(path: Path) -> tuple[str, str] | None:
 def _central_dedup(root: Path, candidate: Candidate) -> None:
     wanted_name = re.sub(r"[^a-z0-9]", "", candidate.name.lower())
     wanted_tokens = _description_tokens(candidate.description)
-    for prefix in ("skills/shared", "claude/skills", "codex/skills"):
+    for prefix in ("approved/shared", "approved/claude", "approved/codex"):
         tree = root / prefix
         if not tree.is_dir():
             continue
@@ -677,28 +727,62 @@ def _update_catalog(root: Path, candidate: Candidate) -> None:
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
-def _write_candidate(root: Path, candidate: Candidate) -> None:
-    for prefix in ("skills/shared", "claude/skills", "codex/skills"):
+def _candidate_id(candidate: Candidate) -> str:
+    return f"{candidate.name}-{candidate.tree_sha256[:12]}"
+
+
+def _manifest(candidate: Candidate, *, created_at: str) -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "candidate_id": _candidate_id(candidate),
+        "node": candidate.node,
+        "provider": candidate.provider,
+        "name": candidate.name,
+        "skill_sha256": candidate.skill_sha256,
+        "tree_sha256": candidate.tree_sha256,
+        "created_at": created_at,
+        "files": [
+            {
+                "path": item.relative,
+                "sha256": hashlib.sha256(item.content).hexdigest(),
+                "size": len(item.content),
+                "executable": item.executable,
+            }
+            for item in candidate.files
+        ],
+    }
+
+
+def _write_candidate(root: Path, candidate: Candidate, *, created_at: str) -> Path:
+    for prefix in ("approved/shared", "approved/claude", "approved/codex"):
         if (root / prefix / candidate.name).exists():
             raise PromotionError("central_name_exists")
     _central_dedup(root, candidate)
-    target = root / "skills" / "shared" / candidate.name
-    target.mkdir(parents=True, mode=0o755)
+    target = (
+        root / "intake" / candidate.node / candidate.provider / _candidate_id(candidate)
+    )
+    if target.exists():
+        raise PromotionError("intake_path_exists")
+    skill_target = target / "skill"
+    skill_target.mkdir(parents=True, mode=0o755)
+    manifest = target / "manifest.json"
+    manifest.write_text(
+        json.dumps(_manifest(candidate, created_at=created_at), ensure_ascii=False, indent=2)
+        + "\n",
+        encoding="utf-8",
+    )
+    manifest.chmod(0o644)
     for item in candidate.files:
-        destination = target / item.relative
+        destination = skill_target / item.relative
         destination.parent.mkdir(parents=True, exist_ok=True, mode=0o755)
         destination.write_bytes(item.content)
         destination.chmod(0o755 if item.executable else 0o644)
-    agent = target / "agents" / "openai.yaml"
-    agent.parent.mkdir(parents=True, exist_ok=True, mode=0o755)
-    agent.write_bytes(_yaml_interface(candidate))
-    agent.chmod(0o644)
-    _update_catalog(root, candidate)
+    return target
 
 
 def _branch(config: Config, candidate: Candidate) -> str:
     return (
-        f"skill-promotion/{config.node}/{candidate.name}-"
+        f"skill-intake/{candidate.node}/{candidate.name}-"
         f"{candidate.provider}-{candidate.tree_sha256[:12]}"
     )
 
@@ -754,9 +838,26 @@ def _remote_branch_oid(config: Config, branch: str) -> str | None:
     raise PromotionError("git_remote_probe_failed")
 
 
-def _publish(config: Config, candidate: Candidate) -> dict[str, str]:
+def _require_private_repo(config: Config) -> None:
+    completed = _run(
+        ["gh", "repo", "view", config.repo, "--json", "isPrivate,visibility"]
+    )
+    try:
+        value = json.loads(completed.stdout)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise PromotionError("github_output_invalid") from None
+    if not isinstance(value, dict) or value.get("isPrivate") is not True:
+        raise PromotionError("target_repo_not_private")
+    if str(value.get("visibility", "")).upper() != "PRIVATE":
+        raise PromotionError("target_repo_not_private")
+
+
+def _publish(
+    config: Config, candidate: Candidate, *, created_at: str
+) -> dict[str, str]:
     branch = _branch(config, candidate)
     _run(["gh", "auth", "status", "--hostname", "github.com"])
+    _require_private_repo(config)
     remote_oid = _remote_branch_oid(config, branch)
     existing = _existing_pr(config, branch) if remote_oid is not None else None
     if existing is not None:
@@ -777,11 +878,8 @@ def _publish(config: Config, candidate: Candidate) -> dict[str, str]:
             ]
         )
         _run(["git", "checkout", "-b", branch], cwd=work)
-        _write_candidate(work, candidate)
-        _run(
-            ["git", "add", f"skills/shared/{candidate.name}", "codex/compatibility.json"],
-            cwd=work,
-        )
+        target = _write_candidate(work, candidate, created_at=created_at)
+        _run(["git", "add", str(target.relative_to(work))], cwd=work)
         _run(
             [
                 "git",
@@ -792,9 +890,9 @@ def _publish(config: Config, candidate: Candidate) -> dict[str, str]:
                 "commit",
                 "--quiet",
                 "-m",
-                f"feat(skills): promote {candidate.name} from {config.node}",
+                f"intake: stage {candidate.name} from {candidate.node}",
                 "-m",
-                f"CCC-Skill-Promotion: {candidate.tree_sha256}",
+                f"CCC-Skill-Intake: {candidate.tree_sha256}",
             ],
             cwd=work,
         )
@@ -804,13 +902,14 @@ def _publish(config: Config, candidate: Candidate) -> dict[str, str]:
         _run(push_args, cwd=work)
     body = "\n".join(
         [
-            "Automated draft promotion of a locally generated autosave-managed skill.",
+            "Automated private intake of a locally generated autosave-managed skill.",
             "",
-            f"- source node: `{config.node}`",
+            f"- source node: `{candidate.node}`",
             f"- source provider: `{candidate.provider}`",
             f"- source tree SHA-256: `{candidate.tree_sha256}`",
             "- local gates: ownership, rollback eligibility, bounded files, secret scan, node-fact scan, runtime-neutral scan",
-            "- merge policy: human/independent review required; this automation never merges",
+            "- merge policy: **DO NOT MERGE this intake PR**; rebuild a sanitized `approved/*` PR from current `main`",
+            "- publication policy: private review only; public release requires a separate explicit decision",
         ]
     )
     completed = _run(
@@ -826,7 +925,7 @@ def _publish(config: Config, candidate: Candidate) -> dict[str, str]:
             branch,
             "--draft",
             "--title",
-            f"feat(skills): promote {candidate.name} from {config.node}",
+            f"intake: {candidate.name} from {candidate.node}/{candidate.provider}",
             "--body",
             body,
         ]
@@ -837,7 +936,13 @@ def _publish(config: Config, candidate: Candidate) -> dict[str, str]:
         raise PromotionError("github_output_invalid") from None
     if not url.startswith("https://github.com/"):
         raise PromotionError("github_output_invalid")
-    return {"outcome": "pr-opened", "branch": branch, "url": url, "state": "OPEN", "draft": "true"}
+    return {
+        "outcome": "pr-opened",
+        "branch": branch,
+        "url": url,
+        "state": "OPEN",
+        "draft": "true",
+    }
 
 
 def _append_ledger(config: Config, record: dict[str, object]) -> None:
@@ -854,12 +959,297 @@ def _append_ledger(config: Config, record: dict[str, object]) -> None:
         os.close(descriptor)
 
 
+def _transport_id(candidate: Candidate) -> str:
+    return f"{candidate.node}-{candidate.provider}-{_candidate_id(candidate)}"
+
+
+def _envelope(candidate: Candidate, *, created_at: str) -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "transport_id": _transport_id(candidate),
+        "created_at": created_at,
+        "node": candidate.node,
+        "provider": candidate.provider,
+        "name": candidate.name,
+        "description": candidate.description,
+        "skill_sha256": candidate.skill_sha256,
+        "tree_sha256": candidate.tree_sha256,
+        "files": [
+            {
+                "path": item.relative,
+                "content_b64": base64.b64encode(item.content).decode("ascii"),
+                "executable": item.executable,
+            }
+            for item in candidate.files
+        ],
+    }
+
+
+# Keep the complete wire-schema and content verification in one fail-closed path.
+def _candidate_from_envelope(  # noqa: C901
+    value: object,
+) -> tuple[Candidate, str, str]:
+    if not isinstance(value, dict) or set(value) != {
+        "schema_version",
+        "transport_id",
+        "created_at",
+        "node",
+        "provider",
+        "name",
+        "description",
+        "skill_sha256",
+        "tree_sha256",
+        "files",
+    }:
+        raise PromotionError("envelope_schema_invalid")
+    node = value.get("node")
+    provider = value.get("provider")
+    name = value.get("name")
+    description = value.get("description")
+    skill_sha = value.get("skill_sha256")
+    tree_sha = value.get("tree_sha256")
+    created_at = value.get("created_at")
+    transport_id = value.get("transport_id")
+    if not isinstance(node, str) or not _NAME_RE.fullmatch(node) or len(node) > 32:
+        raise PromotionError("envelope_node_invalid")
+    if provider not in {"claude", "codex"}:
+        raise PromotionError("envelope_provider_invalid")
+    if not isinstance(name, str) or not _NAME_RE.fullmatch(name) or len(name) > 80:
+        raise PromotionError("envelope_name_invalid")
+    if not isinstance(description, str) or not 20 <= len(description) <= 1024:
+        raise PromotionError("envelope_description_invalid")
+    if not isinstance(skill_sha, str) or not re.fullmatch(r"[0-9a-f]{64}", skill_sha):
+        raise PromotionError("envelope_hash_invalid")
+    if not isinstance(tree_sha, str) or not re.fullmatch(r"[0-9a-f]{64}", tree_sha):
+        raise PromotionError("envelope_hash_invalid")
+    if not isinstance(created_at, str) or not re.fullmatch(
+        r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", created_at
+    ):
+        raise PromotionError("envelope_time_invalid")
+    expected_transport = f"{node}-{provider}-{name}-{tree_sha[:12]}"
+    if transport_id != expected_transport or not _SAFE_COMPONENT_RE.fullmatch(expected_transport):
+        raise PromotionError("envelope_transport_invalid")
+    raw_files = value.get("files")
+    if not isinstance(raw_files, list) or not 1 <= len(raw_files) <= _MAX_FILES:
+        raise PromotionError("envelope_files_invalid")
+    files: list[SnapshotFile] = []
+    total = 0
+    seen: set[str] = set()
+    for raw in raw_files:
+        if not isinstance(raw, dict) or set(raw) != {"path", "content_b64", "executable"}:
+            raise PromotionError("envelope_files_invalid")
+        relative = raw.get("path")
+        encoded = raw.get("content_b64")
+        executable = raw.get("executable")
+        if not isinstance(relative, str) or relative in seen:
+            raise PromotionError("envelope_path_invalid")
+        parts = relative.split("/")
+        if relative != "SKILL.md" and (
+            parts[0] not in _ALLOWED_SUPPORT_DIRS
+            or any(part in {"", ".", ".."} or not _SAFE_COMPONENT_RE.fullmatch(part) for part in parts)
+        ):
+            raise PromotionError("envelope_path_invalid")
+        if not isinstance(encoded, str) or not isinstance(executable, bool):
+            raise PromotionError("envelope_files_invalid")
+        try:
+            content = base64.b64decode(encoded, validate=True)
+        except (ValueError, TypeError):
+            raise PromotionError("envelope_base64_invalid") from None
+        if len(content) > _MAX_FILE_BYTES:
+            raise PromotionError("envelope_tree_too_large")
+        total += len(content)
+        if total > _MAX_TOTAL_BYTES:
+            raise PromotionError("envelope_tree_too_large")
+        _scan_text(content)
+        seen.add(relative)
+        files.append(SnapshotFile(relative=relative, content=content, executable=executable))
+    files.sort(key=lambda item: item.relative)
+    if not files or files[0].relative != "SKILL.md":
+        raise PromotionError("envelope_skill_missing")
+    actual_description = _frontmatter(files[0].content, name)
+    if actual_description != description or hashlib.sha256(files[0].content).hexdigest() != skill_sha:
+        raise PromotionError("envelope_skill_mismatch")
+    digest = hashlib.sha256()
+    for item in files:
+        digest.update(item.relative.encode())
+        digest.update(b"\0")
+        digest.update(hashlib.sha256(item.content).hexdigest().encode())
+        digest.update(b"\0")
+    if digest.hexdigest() != tree_sha:
+        raise PromotionError("envelope_tree_mismatch")
+    return (
+        Candidate(
+            node=node,
+            provider=provider,
+            name=name,
+            skill_sha256=skill_sha,
+            tree_sha256=tree_sha,
+            source_dir=Path("/private-intake-envelope"),
+            files=tuple(files),
+            description=description,
+        ),
+        created_at,
+        expected_transport,
+    )
+
+
+def _state_payload(path: Path) -> dict[str, object]:
+    if not _path_components_safe(path, final_kind="file"):
+        raise PromotionError("outbox_file_unsafe")
+    payload, _ = _safe_read(path, max_bytes=_MAX_TOTAL_BYTES * 2, exact_mode=0o600)
+    try:
+        value = json.loads(payload)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise PromotionError("envelope_json_invalid") from None
+    if not isinstance(value, dict):
+        raise PromotionError("envelope_json_invalid")
+    return value
+
+
+def _stage_candidate(config: Config, candidate: Candidate) -> dict[str, str]:
+    outbox = config.promotion_state_dir / "outbox"
+    sent = config.promotion_state_dir / "sent"
+    _private_state_dir(outbox)
+    _private_state_dir(sent)
+    transport_id = _transport_id(candidate)
+    destination = outbox / f"{transport_id}.json"
+    sent_path = sent / destination.name
+    if sent_path.exists():
+        _candidate_from_envelope(_state_payload(sent_path))
+        return {"outcome": "already-published", "transport_id": transport_id}
+    if destination.exists():
+        existing, _, existing_id = _candidate_from_envelope(_state_payload(destination))
+        if existing.tree_sha256 != candidate.tree_sha256 or existing_id != transport_id:
+            raise PromotionError("outbox_collision")
+        return {"outcome": "already-staged", "transport_id": transport_id}
+    value = _envelope(candidate, created_at=_utc_now())
+    descriptor, raw = tempfile.mkstemp(prefix=".candidate-", dir=outbox)
+    temporary = Path(raw)
+    try:
+        os.fchmod(descriptor, 0o600)
+        os.write(descriptor, (_json_line(value) + "\n").encode())
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    try:
+        os.replace(temporary, destination)
+        directory_fd = os.open(outbox, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+    _append_ledger(
+        config,
+        {
+            "ts": _utc_now(),
+            "outcome": "staged",
+            "transport_id": transport_id,
+            "node": candidate.node,
+            "provider": candidate.provider,
+            "name": candidate.name,
+            "tree_sha256": candidate.tree_sha256,
+        },
+    )
+    return {"outcome": "staged", "transport_id": transport_id}
+
+
+def _pending_envelopes(config: Config, *, limit: int) -> list[dict[str, object]]:
+    outbox = config.promotion_state_dir / "outbox"
+    sent = config.promotion_state_dir / "sent"
+    if not outbox.exists():
+        return []
+    if not _path_components_safe(outbox, final_kind="dir"):
+        raise PromotionError("outbox_path_unsafe")
+    rows: list[dict[str, object]] = []
+    for path in sorted(outbox.glob("*.json")):
+        if len(rows) >= limit:
+            break
+        if (sent / path.name).exists():
+            continue
+        value = _state_payload(path)
+        _, _, transport_id = _candidate_from_envelope(value)
+        if path.name != f"{transport_id}.json":
+            raise PromotionError("outbox_filename_mismatch")
+        rows.append(value)
+    return rows
+
+
+def _ack_local(config: Config, transport_id: str) -> bool:
+    if not _SAFE_COMPONENT_RE.fullmatch(transport_id):
+        raise PromotionError("ack_id_invalid")
+    outbox = config.promotion_state_dir / "outbox"
+    sent = config.promotion_state_dir / "sent"
+    _private_state_dir(outbox)
+    _private_state_dir(sent)
+    source = outbox / f"{transport_id}.json"
+    destination = sent / source.name
+    if destination.exists():
+        _candidate_from_envelope(_state_payload(destination))
+        return True
+    if not source.exists():
+        return False
+    _, _, actual_id = _candidate_from_envelope(_state_payload(source))
+    if actual_id != transport_id:
+        raise PromotionError("ack_id_mismatch")
+    os.replace(source, destination)
+    directory_fd = os.open(sent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+    return True
+
+
+def _remote_command(node: str, arguments: list[str]) -> subprocess.CompletedProcess[bytes]:
+    return _run(
+        [
+            "ssh",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=15",
+            node,
+            "python3",
+            "~/.claude/hooks/ccc-skill-promotion.py",
+            *arguments,
+        ]
+    )
+
+
+def _remote_envelopes(node: str, *, limit: int) -> list[dict[str, object]]:
+    completed = _remote_command(node, ["export", "--limit", str(limit)])
+    try:
+        value = json.loads(completed.stdout)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise PromotionError("remote_output_invalid") from None
+    if not isinstance(value, dict) or value.get("ok") is not True:
+        raise PromotionError("remote_export_failed")
+    rows = value.get("envelopes")
+    if not isinstance(rows, list) or len(rows) > limit:
+        raise PromotionError("remote_output_invalid")
+    return rows
+
+
+def _remote_ack(node: str, transport_id: str) -> None:
+    completed = _remote_command(node, ["ack", transport_id])
+    try:
+        value = json.loads(completed.stdout)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise PromotionError("remote_output_invalid") from None
+    if not isinstance(value, dict) or value.get("ok") is not True or value.get("acked") is not True:
+        raise PromotionError("remote_ack_failed")
+
+
 def _status(config: Config) -> dict[str, object]:
     if not config.enabled:
         return {
             "ok": True,
             "mode": "status-read-only",
             "enabled": False,
+            "publisher_enabled": config.publisher_enabled,
             "autonomy": config.autonomy,
             "candidates": [],
             "blocked": [],
@@ -869,15 +1259,18 @@ def _status(config: Config) -> dict[str, object]:
         "ok": True,
         "mode": "status-read-only",
         "enabled": True,
+        "publisher_enabled": config.publisher_enabled,
         "autonomy": config.autonomy,
         "repo": config.repo,
         "max_prs_per_run": config.max_prs,
+        "collect_nodes": list(config.collect_nodes),
         "candidates": [
             {
+                "node": item.node,
                 "provider": item.provider,
                 "name": item.name,
                 "tree_sha256": item.tree_sha256,
-                "target": f"skills/shared/{item.name}",
+                "target": f"local-outbox/{_transport_id(item)}.json",
             }
             for item in candidates
         ],
@@ -892,7 +1285,7 @@ def _execute(config: Config, *, dry_run: bool) -> dict[str, object]:
             "mode": "run",
             "enabled": False,
             "autonomy": config.autonomy,
-            "published": [],
+            "staged": [],
             "blocked": [],
             "errors": [],
         }
@@ -903,7 +1296,7 @@ def _execute(config: Config, *, dry_run: bool) -> dict[str, object]:
             "enabled": True,
             "autonomy": "kill",
             "status": "autonomy-kill",
-            "published": [],
+            "staged": [],
             "blocked": [],
             "errors": [],
         }
@@ -924,22 +1317,19 @@ def _execute(config: Config, *, dry_run: bool) -> dict[str, object]:
                 "enabled": True,
                 "autonomy": config.autonomy,
                 "status": "locked",
-                "published": [],
+                "staged": [],
                 "blocked": [],
                 "errors": [],
             }
         candidates, blocked = _discover(config)
-        published: list[dict[str, str]] = []
+        staged: list[dict[str, str]] = []
         errors: list[dict[str, str]] = []
-        opened = 0
-        selected = candidates[: config.max_prs] if dry_run else candidates[:_MAX_CANDIDATES_PER_RUN]
+        selected = candidates[:_MAX_CANDIDATES_PER_RUN]
         for candidate in selected:
-            if not dry_run and opened >= config.max_prs:
-                break
             if dry_run:
                 outcome = {
-                    "outcome": "would-open-draft-pr",
-                    "branch": _branch(config, candidate),
+                    "outcome": "would-stage-private-outbox",
+                    "transport_id": _transport_id(candidate),
                     "provider": candidate.provider,
                     "name": candidate.name,
                     "tree_sha256": candidate.tree_sha256,
@@ -947,7 +1337,7 @@ def _execute(config: Config, *, dry_run: bool) -> dict[str, object]:
             else:
                 try:
                     outcome = {
-                        **_publish(config, candidate),
+                        **_stage_candidate(config, candidate),
                         "provider": candidate.provider,
                         "name": candidate.name,
                         "tree_sha256": candidate.tree_sha256,
@@ -955,22 +1345,141 @@ def _execute(config: Config, *, dry_run: bool) -> dict[str, object]:
                 except PromotionError as error:
                     errors.append({"provider": candidate.provider, "name": candidate.name, "code": error.code})
                     continue
-            published.append(outcome)
-            if outcome["outcome"] == "pr-opened":
-                opened += 1
-            if not dry_run and outcome["outcome"] == "pr-opened":
-                _append_ledger(config, {"ts": _utc_now(), **outcome})
+            staged.append(outcome)
         return {
             "ok": not errors,
             "mode": "dry-run" if dry_run else "run",
             "enabled": True,
             "autonomy": config.autonomy,
-            "published": published,
+            "staged": staged,
             "blocked": blocked,
             "errors": errors,
         }
     finally:
         os.close(lock_fd)
+
+
+def _export_result(config: Config, *, limit: int) -> dict[str, object]:
+    _private_state_dir(config.promotion_state_dir)
+    rows = _pending_envelopes(config, limit=limit)
+    return {
+        "ok": True,
+        "mode": "export-read-only",
+        "node": config.node,
+        "envelopes": rows,
+    }
+
+
+def _ack_result(config: Config, transport_id: str) -> dict[str, object]:
+    return {
+        "ok": True,
+        "mode": "ack",
+        "transport_id": transport_id,
+        "acked": _ack_local(config, transport_id),
+    }
+
+
+# Collection deliberately sequences visibility, remote reads, publication, and ack.
+def _collect(config: Config, *, dry_run: bool) -> dict[str, object]:  # noqa: C901
+    if not config.publisher_enabled:
+        return {
+            "ok": True,
+            "mode": "collect",
+            "publisher_enabled": False,
+            "autonomy": config.autonomy,
+            "published": [],
+            "errors": [],
+        }
+    if config.autonomy == "kill":
+        return {
+            "ok": True,
+            "mode": "collect",
+            "publisher_enabled": True,
+            "autonomy": "kill",
+            "status": "autonomy-kill",
+            "published": [],
+            "errors": [],
+        }
+    dry_run = dry_run or config.autonomy == "dry-run"
+    _private_state_dir(config.promotion_state_dir)
+    _run(["gh", "auth", "status", "--hostname", "github.com"])
+    _require_private_repo(config)
+    errors: list[dict[str, str]] = []
+    collected: list[tuple[Candidate, str, str, str]] = []
+    seen: set[str] = set()
+
+    def accept(value: object, source: str, expected_node: str | None) -> None:
+        candidate, created_at, transport_id = _candidate_from_envelope(value)
+        if expected_node is not None and candidate.node != expected_node:
+            raise PromotionError("remote_node_mismatch")
+        if transport_id in seen:
+            return
+        seen.add(transport_id)
+        collected.append((candidate, created_at, transport_id, source))
+
+    for value in _pending_envelopes(config, limit=_MAX_CANDIDATES_PER_RUN):
+        accept(value, "local", config.node)
+    for node in config.collect_nodes:
+        if node == config.node or len(collected) >= _MAX_CANDIDATES_PER_RUN:
+            continue
+        try:
+            remaining = min(config.max_prs, _MAX_CANDIDATES_PER_RUN - len(collected))
+            for value in _remote_envelopes(node, limit=remaining):
+                accept(value, node, node)
+        except PromotionError as error:
+            errors.append({"source": node, "code": error.code})
+
+    published: list[dict[str, str]] = []
+    opened = 0
+    for candidate, created_at, transport_id, source in collected:
+        if opened >= config.max_prs:
+            break
+        if dry_run:
+            outcome = {
+                "outcome": "would-open-private-intake-pr",
+                "branch": _branch(config, candidate),
+            }
+        else:
+            try:
+                outcome = _publish(config, candidate, created_at=created_at)
+            except PromotionError as error:
+                errors.append(
+                    {"source": source, "name": candidate.name, "code": error.code}
+                )
+                continue
+        row = {
+            **outcome,
+            "source": source,
+            "node": candidate.node,
+            "provider": candidate.provider,
+            "name": candidate.name,
+            "tree_sha256": candidate.tree_sha256,
+            "transport_id": transport_id,
+        }
+        published.append(row)
+        if outcome["outcome"] == "pr-opened":
+            opened += 1
+        if not dry_run and outcome["outcome"] in {"pr-opened", "existing-pr"}:
+            try:
+                if source == "local":
+                    if not _ack_local(config, transport_id):
+                        raise PromotionError("local_ack_failed")
+                else:
+                    _remote_ack(source, transport_id)
+                _append_ledger(config, {"ts": _utc_now(), **row})
+            except PromotionError as error:
+                errors.append(
+                    {"source": source, "name": candidate.name, "code": error.code}
+                )
+    return {
+        "ok": not errors,
+        "mode": "collect-dry-run" if dry_run else "collect",
+        "publisher_enabled": True,
+        "autonomy": config.autonomy,
+        "repo": config.repo,
+        "published": published,
+        "errors": errors,
+    }
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -979,6 +1488,12 @@ def _parser() -> argparse.ArgumentParser:
     subparsers.add_parser("status")
     run_parser = subparsers.add_parser("run")
     run_parser.add_argument("--dry-run", action="store_true")
+    export_parser = subparsers.add_parser("export")
+    export_parser.add_argument("--limit", type=int, default=3, choices=range(1, 4))
+    ack_parser = subparsers.add_parser("ack")
+    ack_parser.add_argument("transport_id")
+    collect_parser = subparsers.add_parser("collect")
+    collect_parser.add_argument("--dry-run", action="store_true")
     return parser
 
 
@@ -986,7 +1501,16 @@ def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
         config = _config()
-        result = _status(config) if args.command == "status" else _execute(config, dry_run=args.dry_run)
+        if args.command == "status":
+            result = _status(config)
+        elif args.command == "run":
+            result = _execute(config, dry_run=args.dry_run)
+        elif args.command == "export":
+            result = _export_result(config, limit=args.limit)
+        elif args.command == "ack":
+            result = _ack_result(config, args.transport_id)
+        else:
+            result = _collect(config, dry_run=args.dry_run)
     except PromotionError as error:
         result = {"ok": False, "code": error.code}
     except (OSError, TypeError, ValueError, RecursionError):
