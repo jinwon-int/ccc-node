@@ -396,5 +396,55 @@ sh_re="$(sed -n 's/^INVALID_RE="\${NUNCHI_BENCH_INVALID_RE:-\(.*\)}"$/\1/p' "$HE
 ok "bench.sh and nunchi.py share one unavailable-backend pattern" \
   '[ -n "$sh_re" ] && [ "$py_re" = "$sh_re" ]'
 
+# ---- #827 / TM-2339: synthesize reads evidence from stdin -------------------
+# The bench Wiki layer needs a synthesis entry point that is NOT dialectic, so
+# live recall behaviour stays put while the gate gains the layer TM-2029 made
+# responsible for cross-node knowledge. It must reuse llm_synthesize so the
+# #1082 backend-selection fix is not duplicated in a second place.
+syn_bin="$TMP/bin-syn"; mkdir -p "$syn_bin"
+cat > "$syn_bin/claude" <<'EOF'
+#!/usr/bin/env bash
+# Echo the prompt back so the test can assert the evidence reached the backend.
+echo "SYN-OK:$(grep -c . <<<"$2")"
+EOF
+chmod +x "$syn_bin/claude"
+out="$(printf 'pages/decisions/x.md — Termux는 chromadb 빌드 불가\n' \
+  | PATH="$syn_bin:/usr/bin:/bin" HOME="$TMP/home" python3 "$NP" synthesize "왜 peer_facts-only인가" 2>&1)"
+ok "synthesize answers from stdin evidence via the shared backend" \
+  'grep -q "SYN-OK" <<<"$out"'
+
+out="$(printf '' | PATH="$syn_bin:/usr/bin:/bin" HOME="$TMP/home" python3 "$NP" synthesize "질문" 2>&1)"
+ok "synthesize with no evidence reports 기록 없음 without calling a backend" \
+  '[ "$out" = "기록 없음" ]'
+
+# dialectic must be untouched — this change is a measurement surface, and a
+# session-path regression here would move live recall behaviour.
+cat > "$syn_bin/claude" <<'EOF'
+#!/usr/bin/env bash
+echo "DIALECTIC-STUB"
+EOF
+chmod +x "$syn_bin/claude"
+out="$(PATH="$syn_bin:/usr/bin:/bin" HOME="$TMP/home" python3 "$NP" dialectic "모델" 2>&1)"
+ok "dialectic still synthesizes from peer facts, unchanged" \
+  'grep -q "DIALECTIC-STUB" <<<"$out"'
+
+# Cross-file constant check, same precedent as SYNTH_UNAVAILABLE_RE (#1072):
+# a no-record phrasing known to one file and not the other silently rescores
+# retrieval quality — that is exactly how gwakga's q6 paraphrase was counted
+# as a success.
+py_nr="$(python3 -c "
+import sys; sys.path.insert(0, '$HERE')
+from nunchi import NO_RECORD_RE
+print(NO_RECORD_RE.pattern)")"
+sh_nr="$(sed -n 's/^NO_RECORD_RE="\${NUNCHI_BENCH_NO_RECORD_RE:-\(.*\)}"$/\1/p' "$HERE/bench.sh")"
+ok "bench.sh and nunchi.py share one no-record pattern" \
+  '[ -n "$sh_nr" ] && [ "$py_nr" = "$sh_nr" ]'
+ok "the no-record pattern covers the paraphrase that was scored as success" \
+  'python3 -c "
+import sys; sys.path.insert(0, \"$HERE\")
+from nunchi import NO_RECORD_RE
+import sys as s
+s.exit(0 if NO_RECORD_RE.search(\"질문한 내용에 대한 근거 기록이 없습니다.\") else 1)"'
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

@@ -36,6 +36,7 @@ Usage:
   nunchi.py ingest <distill.json | ->     # mirror distill honcho[] items
   nunchi.py recall <query> [--target T] [--limit N]
   nunchi.py dialectic <query> [--target T]   # facts + MemPalace + Haiku
+  nunchi.py synthesize <query>               # answer from stdin evidence (bench Wiki layer)
   nunchi.py supersede <fact_id> <new text>   # close old, insert new
   nunchi.py snapshot [--limit N]             # SessionStart-ready summary
   nunchi.py review-stale [--close]           # G1 retro pass over old facts
@@ -611,6 +612,42 @@ def mempalace_verbatim(query, n=3):
     return "\n".join(lines[:40])
 
 
+# Ways a synthesis answer says "the evidence does not contain this". The
+# dialectic prompt asks for the literal "기록 없음", but backends paraphrase it
+# (gwakga answered "질문한 내용에 대한 근거 기록이 없습니다" for q6, which a
+# literal match scored as a SUCCESS). Counting only the literal form makes
+# retrieval look better than it is, so the gate matches the family. Kept
+# byte-identical to bench.sh's NUNCHI_BENCH_NO_RECORD_RE default; nunchi.test.sh
+# asserts the two stay in sync.
+NO_RECORD_RE = re.compile(
+    "기록 없음|기록이 없|근거가 없|근거 기록이 없|찾을 수 없|확인할 수 없|정보가 없",
+    re.IGNORECASE,
+)
+
+
+def synthesize_stdin(query):
+    """Answer `query` from evidence supplied on stdin (#827 gate — Wiki layer).
+
+    TM-2029 assigns durable cross-node knowledge to the Family Wiki, but the
+    parity bench only ever queried peer_facts + MemPalace. Measuring nunchi
+    alone against a shared Honcho therefore asks the per-node store questions
+    the design gave to the Wiki, which no amount of accumulation can pass.
+
+    This is a measurement surface, not a session path: `dialectic` is unchanged,
+    so live recall behaviour does not move. Synthesis reuses llm_synthesize so
+    the backend-selection fix (#1082) is not duplicated here.
+    """
+    evidence = sys.stdin.read().strip()
+    if not evidence:
+        print("기록 없음")
+        return
+    prompt = (
+        "아래는 Family Wiki에서 검색한 근거다. 질문에 한국어로 간결·정확히 답하라.\n"
+        "근거에 없는 내용은 지어내지 말고 '기록 없음'이라 하라.\n\n"
+        f"질문: {query}\n\n[Wiki 근거]\n{evidence}")
+    print(llm_synthesize(prompt))
+
+
 def dialectic(query, target):
     c = db()
     facts = search(c, query, target, limit=12, include_history=True)
@@ -796,6 +833,8 @@ if __name__ == "__main__":
         recall(args[0], flag("--target"), int(flag("--limit", 10)))
     elif cmd == "dialectic":
         dialectic(args[0], flag("--target"))
+    elif cmd == "synthesize":
+        synthesize_stdin(args[0])
     elif cmd == "supersede":
         supersede(int(args[0]), args[1])
     elif cmd == "snapshot":
