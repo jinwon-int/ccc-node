@@ -329,5 +329,72 @@ ok "pre-gate DB gains source_rank/review in place" \
 mrows="$(python3 -c "import sqlite3;print(sqlite3.connect('$MDB').execute('SELECT COUNT(*) FROM peer_facts').fetchone()[0])")"
 ok "pre-gate rows survive migration" '[ "$mrows" = 1 ]'
 
+# ---- #1082: synthesis backend must be chosen by "can answer", not "exists" ---
+# A codex/piri node ships the claude binary without credentials. Presence-only
+# selection locked synthesis onto it and returned the login notice as an answer,
+# while an authenticated codex sat unused on the same host.
+synth_bin="$TMP/bin-synth"; mkdir -p "$synth_bin"
+cat > "$synth_bin/claude" <<'EOF'
+#!/usr/bin/env bash
+echo "Not logged in · Please run /login"
+EOF
+cat > "$synth_bin/codex" <<'EOF'
+#!/usr/bin/env bash
+echo "session log line"
+echo "CODEX-ANSWER"
+EOF
+chmod +x "$synth_bin/claude" "$synth_bin/codex"
+out="$(PATH="$synth_bin:/usr/bin:/bin" HOME="$TMP/home" python3 "$NP" dialectic "모델" 2>&1)"
+ok "logged-out claude falls back to an authenticated codex" \
+  'grep -q "CODEX-ANSWER" <<<"$out" && ! grep -q "Not logged in" <<<"$out"'
+ok "codex fallback still takes the final block, not a session log line" \
+  '! grep -q "session log line" <<<"$out"'
+
+# A healthy claude must still win — the fallback must not reorder the default.
+cat > "$synth_bin/claude" <<'EOF'
+#!/usr/bin/env bash
+echo "CLAUDE-ANSWER"
+EOF
+chmod +x "$synth_bin/claude"
+out="$(PATH="$synth_bin:/usr/bin:/bin" HOME="$TMP/home" python3 "$NP" dialectic "모델" 2>&1)"
+ok "a healthy claude is still preferred over codex" \
+  'grep -q "CLAUDE-ANSWER" <<<"$out" && ! grep -q "CODEX-ANSWER" <<<"$out"'
+
+# A non-zero exit is a distinct failure mode from a login notice.
+cat > "$synth_bin/claude" <<'EOF'
+#!/usr/bin/env bash
+echo "boom"; exit 3
+EOF
+chmod +x "$synth_bin/claude"
+out="$(PATH="$synth_bin:/usr/bin:/bin" HOME="$TMP/home" python3 "$NP" dialectic "모델" 2>&1)"
+ok "a crashing backend also falls through to the next candidate" \
+  'grep -q "CODEX-ANSWER" <<<"$out"'
+
+# When every present backend is unusable, say so instead of passing a notice off
+# as an answer — that masking is what corrupted the #827 parity sample.
+cat > "$synth_bin/codex" <<'EOF'
+#!/usr/bin/env bash
+echo "Not logged in · Please run /login"
+EOF
+cat > "$synth_bin/claude" <<'EOF'
+#!/usr/bin/env bash
+echo "Not logged in · Please run /login"
+EOF
+chmod +x "$synth_bin/claude" "$synth_bin/codex"
+out="$(PATH="$synth_bin:/usr/bin:/bin" HOME="$TMP/home" python3 "$NP" dialectic "모델" 2>&1)"
+ok "all-unusable reports each backend and its reason" \
+  'grep -q "합성 백엔드 사용 불가" <<<"$out" && grep -q "claude:unavailable" <<<"$out" && grep -q "codex:unavailable" <<<"$out"'
+
+# Cross-file constant check (#1072 precedent): the Python matcher and bench.sh's
+# shell default must not drift — a pattern known to one and not the other
+# reintroduces exactly the silent failure both exist to catch.
+py_re="$(python3 -c "
+import sys; sys.path.insert(0, '$HERE')
+from nunchi import SYNTH_UNAVAILABLE_RE
+print(SYNTH_UNAVAILABLE_RE.pattern)")"
+sh_re="$(sed -n 's/^INVALID_RE="\${NUNCHI_BENCH_INVALID_RE:-\(.*\)}"$/\1/p' "$HERE/bench.sh")"
+ok "bench.sh and nunchi.py share one unavailable-backend pattern" \
+  '[ -n "$sh_re" ] && [ "$py_re" = "$sh_re" ]'
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
