@@ -38,6 +38,19 @@ command -v "$BIN" >/dev/null 2>&1 || {
   exit 2
 }
 
+runner=("$BIN")
+case "$TMO" in
+  0|'') ;;
+  *[!0-9]*) echo "ccc-codex-headless: invalid CCC_HEADLESS_TIMEOUT: $TMO" >&2; exit 2 ;;
+  *)
+    command -v timeout >/dev/null 2>&1 || {
+      echo "ccc-codex-headless: timeout command is required when CCC_HEADLESS_TIMEOUT is enabled" >&2
+      exit 127
+    }
+    runner=(timeout -k 30 "$TMO" "$BIN")
+    ;;
+esac
+
 OUT="$(mktemp "${TMPDIR:-/tmp}/ccc-codex-headless.XXXXXX.out")"
 EVENTS="$(mktemp "${TMPDIR:-/tmp}/ccc-codex-headless.XXXXXX.jsonl")"
 ERR="$(mktemp "${TMPDIR:-/tmp}/ccc-codex-headless.XXXXXX.err")"
@@ -56,13 +69,6 @@ args=(
 [ -n "$PROFILE" ] && args+=(-p "$PROFILE")
 [ -n "$MODEL" ] && args+=(-m "$MODEL")
 [ -n "$REASONING" ] && args+=(-c "model_reasoning_effort=\"$REASONING\"")
-
-runner=("$BIN")
-case "$TMO" in
-  0|'') ;;
-  *[!0-9]*) echo "ccc-codex-headless: invalid CCC_HEADLESS_TIMEOUT: $TMO" >&2; exit 2 ;;
-  *) command -v timeout >/dev/null 2>&1 && runner=(timeout -k 30 "$TMO" "$BIN") ;;
-esac
 
 "${runner[@]}" "${args[@]}" "$PROMPT" >"$EVENTS" 2>"$ERR"
 rc=$?
@@ -85,13 +91,19 @@ fi
 # Older Codex builds may not populate --output-last-message. Keep a bounded,
 # structured fallback instead of returning the whole JSONL event stream.
 if command -v jq >/dev/null 2>&1; then
-  jq -r -s '
+  fallback="$(jq -r -s '
     [ .[]
       | select(.type == "item.completed")
       | select(.item.type == "agent_message")
       | .item.text
     ] | last // empty
-  ' "$EVENTS"
+  ' "$EVENTS")"
+  if [ -z "$fallback" ]; then
+    echo "ccc-codex-headless: codex exited successfully without a final message" >&2
+    [ ! -s "$ERR" ] || cat "$ERR" >&2
+    exit 1
+  fi
+  printf '%s\n' "$fallback"
 else
   echo "ccc-codex-headless: no final message and jq is unavailable" >&2
   exit 1
