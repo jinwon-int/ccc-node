@@ -29,6 +29,17 @@ OUT="$NUNCHI_HOME/bench-$(date +%Y%m%d).md"
 # Provider notices that mean "no answer was produced". Extended-regex,
 # case-insensitive, overridable per node for providers not covered here.
 INVALID_RE="${NUNCHI_BENCH_INVALID_RE:-Not logged in|Please run /login|Invalid API key|authentication_error|insufficient_quota|rate_limit_exceeded}"
+# Ways an answer says "the evidence does not contain this". The dialectic prompt
+# asks for the literal "기록 없음", but backends paraphrase it, and a literal
+# match scored those paraphrases as successes. Kept byte-identical to
+# nunchi.py's NO_RECORD_RE; nunchi.test.sh asserts the two stay in sync.
+NO_RECORD_RE="${NUNCHI_BENCH_NO_RECORD_RE:-기록 없음|기록이 없|근거가 없|근거 기록이 없|찾을 수 없|확인할 수 없|정보가 없}"
+# #827 — TM-2029 assigns durable cross-node knowledge to the Family Wiki, so the
+# parity gate must ask "nunchi + Wiki", not "nunchi alone". A per-node store can
+# never answer a cross-node question, which made the old gate unpassable by
+# design rather than by defect. Only consulted when nunchi found nothing.
+WIKI_CLI="${NUNCHI_BENCH_WIKI_CLI:-$(command -v wiki-agent 2>/dev/null || echo "$HOME/.wiki-agent/bin/wiki-agent")}"
+WIKI_TIMEOUT="${NUNCHI_BENCH_WIKI_TIMEOUT_SEC:-40}"
 [ -f "$QSET" ] || { echo "qset missing: $QSET" >&2; exit 2; }
 
 mkdir -p "$NUNCHI_HOME"
@@ -71,27 +82,64 @@ tail -n +2 "$QSET" | while IFS=$'\t' read -r qid category query expect; do
   elif printf '%s' "$ans" | grep -qiE "$INVALID_RE"; then
     status=INVALID; reason=provider-failure
   fi
-  printf '%s\t%s\n' "$qid" "$status" >> "$LEDGER"
+  # Which layer answered. Only meaningful for a usable sample: an INVALID row
+  # says nothing about retrieval, so it is never attributed to a layer.
+  source=none
+  wiki_ans=
+  if [ "$status" = OK ]; then
+    if printf '%s' "$ans" | grep -qE "$NO_RECORD_RE"; then
+      # nunchi found nothing — consult the layer TM-2029 made responsible for
+      # durable cross-node knowledge before counting this against the gate.
+      if [ -n "$WIKI_CLI" ] && [ -x "$WIKI_CLI" ]; then
+        wiki_ctx="$(timeout "$WIKI_TIMEOUT" "$WIKI_CLI" find "$query" </dev/null 2>/dev/null | head -c 4000)"
+        if [ -n "${wiki_ctx//[[:space:]]/}" ]; then
+          wiki_ans="$(printf '%s' "$wiki_ctx" \
+            | timeout "$WIKI_TIMEOUT" python3 "$HERE/nunchi.py" synthesize "$query" 2>&1)"
+          if [ -n "${wiki_ans//[[:space:]]/}" ] \
+             && ! printf '%s' "$wiki_ans" | grep -qE "$NO_RECORD_RE" \
+             && ! printf '%s' "$wiki_ans" | grep -qiE "$INVALID_RE"; then
+            source=wiki
+          fi
+        fi
+      fi
+    else
+      source=nunchi
+    fi
+  fi
+  printf '%s\t%s\t%s\n' "$qid" "$status" "$source" >> "$LEDGER"
   {
     if [ -n "$reason" ]; then
-      echo "## $qid ($category) — ${dur}s rc=$rc status=$status reason=$reason"
+      echo "## $qid ($category) — ${dur}s rc=$rc status=$status reason=$reason source=$source"
     else
-      echo "## $qid ($category) — ${dur}s rc=$rc status=$status"
+      echo "## $qid ($category) — ${dur}s rc=$rc status=$status source=$source"
     fi
     echo "- Q: $query"
     echo "- expect: $expect"
     printf '%s\n\n' "$ans" | sed 's/^/  > /'
+    if [ "$source" = wiki ]; then
+      echo "- Wiki 계층 답변:"
+      printf '%s\n\n' "$wiki_ans" | sed 's/^/  w> /'
+    fi
   } >> "$OUT"
 done
 
 total="$(wc -l < "$LEDGER" | tr -d ' ')"
-invalid="$(grep -c $'\tINVALID$' "$LEDGER" || true)"
+invalid="$(grep -c $'\tINVALID\t' "$LEDGER" || true)"
 valid=$(( total - invalid ))
+by_nunchi="$(grep -c $'\tnunchi$' "$LEDGER" || true)"
+by_wiki="$(grep -c $'\twiki$' "$LEDGER" || true)"
+unanswered=$(( valid - by_nunchi - by_wiki ))
 {
   echo "## bench-summary ($(date -Is))"
   echo "- queries: $total"
   echo "- valid: $valid"
   echo "- invalid: $invalid"
+  # #827 / TM-2339 — the Phase 2 gate counts "queries only Honcho answered".
+  # TM-2029 gave durable cross-node knowledge to the Wiki, so the honest
+  # denominator is "neither nunchi nor Wiki answered", not "nunchi alone".
+  echo "- answered by nunchi: $by_nunchi"
+  echo "- answered by wiki: $by_wiki"
+  echo "- unanswered (gate candidates): $unanswered"
   if [ "$invalid" -gt 0 ]; then
     # The parity gate counts "기록 없음" answers. An INVALID row has none, so
     # leaving it in the sample makes a dead backend look like a perfect score.

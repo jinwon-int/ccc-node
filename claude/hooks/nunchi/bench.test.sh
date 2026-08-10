@@ -59,7 +59,7 @@ ok "the final Q-set row is preserved" \
 
 # #1078 — a healthy backend must be scored as a usable parity sample.
 ok "a healthy answer is marked status=OK" \
-  '[ "$(grep -c "^## q[1-5] .*status=OK$" "$out")" = 5 ]'
+  '[ "$(grep -c "^## q[1-5] .*status=OK source=nunchi$" "$out")" = 5 ]'
 ok "a healthy run reports a fully valid summary" \
   'grep -q "^## bench-summary " "$out" && grep -q "^- valid: 5$" "$out" && grep -q "^- invalid: 0$" "$out"'
 ok "a healthy run carries no contamination warning" \
@@ -96,7 +96,7 @@ out2="$(find "$nunchi_home2" -maxdepth 1 -name 'bench-*.md' -type f -print -quit
 ok "a logged-out backend still exits 0 (bench is not the failing unit)" \
   '[ "$rc2" = 0 ] && [ ! -s "$TMP/stderr2" ]'
 ok "logged-out rows keep the true rc=0 but are marked status=INVALID" \
-  '[ -n "$out2" ] && [ "$(grep -c "^## q[1-5] .*rc=0 status=INVALID reason=provider-failure$" "$out2")" = 5 ]'
+  '[ -n "$out2" ] && [ "$(grep -c "^## q[1-5] .*rc=0 status=INVALID reason=provider-failure source=none$" "$out2")" = 5 ]'
 ok "the summary reports zero valid samples" \
   'grep -q "^- valid: 0$" "$out2" && grep -q "^- invalid: 5$" "$out2"'
 ok "the summary warns that the sample is contaminated" \
@@ -129,7 +129,122 @@ HOME="$home2" CCC_STATE_DIR="$state2" NUNCHI_HOME="$nunchi_home2" \
   bash "$hooks2/bench.sh" > "$TMP/stdout4" 2>&1
 out4="$(find "$nunchi_home2" -maxdepth 1 -name 'bench-*.md' -type f -print -quit)"
 ok "a non-zero backend exit is marked INVALID with the exit code as reason" \
-  '[ -n "$out4" ] && [ "$(grep -c "rc=3 status=INVALID reason=exit-3$" "$out4")" = 5 ]'
+  '[ -n "$out4" ] && [ "$(grep -c "rc=3 status=INVALID reason=exit-3 source=none$" "$out4")" = 5 ]'
+
+# ---- #827 / TM-2339: the gate is "nunchi + Wiki", not "nunchi alone" --------
+# TM-2029 assigned durable cross-node knowledge to the Family Wiki. A per-node
+# store can never answer a cross-node question, so measuring nunchi alone made
+# the gate unpassable by design. The Wiki layer is consulted ONLY when nunchi
+# found nothing, and never for a contaminated (INVALID) row.
+wiki_home="$TMP/home-wiki"
+wiki_hooks="$wiki_home/.claude/hooks/nunchi"
+wiki_state="$wiki_home/.claude/state"
+wiki_nh="$wiki_home/.nunchi"
+wbin="$TMP/bin-wiki"
+mkdir -p "$wiki_hooks" "$wiki_state" "$wiki_nh" "$wbin"
+cp "$ROOT/claude/hooks/nunchi/bench.sh" "$wiki_hooks/bench.sh"
+chmod 700 "$wiki_hooks/bench.sh"
+printf 'on' > "$wiki_state/nunchi.mode"
+cp "$hooks/bench-qset.tsv" "$wiki_hooks/bench-qset.tsv"
+
+# nunchi finds nothing, and paraphrases it the way gwakga's q6 answer did —
+# a literal "기록 없음" match scored that paraphrase as a SUCCESS.
+cat > "$wiki_hooks/nunchi.py" <<'PY'
+#!/usr/bin/env python3
+import sys
+sys.stdin.read()
+if sys.argv[1] == "synthesize":
+    print("WIKI-ANSWER: " + sys.stdin.name)
+else:
+    print("질문한 내용에 대한 근거 기록이 없습니다.")
+PY
+cat > "$wbin/wiki-agent" <<'EOF'
+#!/usr/bin/env bash
+echo "pages/decisions/x.md:1-3  Termux는 chromadb 빌드 불가로 peer_facts-only로 확정"
+EOF
+chmod +x "$wbin/wiki-agent"
+
+run_wiki_bench() {
+  rm -f "$wiki_nh"/bench-*.md
+  env HOME="$wiki_home" CCC_STATE_DIR="$wiki_state" NUNCHI_HOME="$wiki_nh" \
+    NUNCHI_BENCH_QSET="$wiki_hooks/bench-qset.tsv" CCC_NODE=test-node \
+    NUNCHI_BENCH_WIKI_CLI="$wbin/wiki-agent" \
+    bash "$wiki_hooks/bench.sh" > "$TMP/wout" 2>&1
+  wout="$(find "$wiki_nh" -maxdepth 1 -name 'bench-*.md' -type f -print -quit)"
+}
+
+# The synthesize stub must answer for the Wiki layer to count. Rewrite it so the
+# stub distinguishes the two nunchi.py subcommands by argv, not by stdin.
+cat > "$wiki_hooks/nunchi.py" <<'PY'
+#!/usr/bin/env python3
+import sys
+cmd = sys.argv[1]
+data = sys.stdin.read()
+if cmd == "synthesize":
+    print("WIKI-ANSWER " + ("(with-evidence)" if data.strip() else "(empty)"))
+elif cmd == "metrics":
+    print("stub metrics")
+else:
+    print("질문한 내용에 대한 근거 기록이 없습니다.")
+PY
+run_wiki_bench
+ok "a paraphrased no-record is detected, not scored as an answer" \
+  '[ -n "$wout" ] && [ "$(grep -c "^## q[1-5] .*source=nunchi" "$wout")" = 0 ]'
+ok "the Wiki layer answers what the per-node store cannot" \
+  '[ "$(grep -c "^## q[1-5] .*source=wiki$" "$wout")" = 5 ]'
+ok "the Wiki answer is recorded alongside the nunchi one" \
+  'grep -q "^- Wiki 계층 답변:" "$wout" && grep -q "WIKI-ANSWER" "$wout"'
+ok "the summary attributes answers per layer" \
+  'grep -q "^- answered by nunchi: 0$" "$wout" && grep -q "^- answered by wiki: 5$" "$wout" && grep -q "^- unanswered (gate candidates): 0$" "$wout"'
+
+# Termux measured 2026-08-10: wiki-agent find did not finish within 12s on
+# daegyo. A slow or missing Wiki must degrade to source=none, never hang or
+# fail the run — the bench is a cron job on every node.
+cat > "$wbin/wiki-agent-slow" <<'EOF'
+#!/usr/bin/env bash
+sleep 30
+EOF
+chmod +x "$wbin/wiki-agent-slow"
+rm -f "$wiki_nh"/bench-*.md
+HOME="$wiki_home" CCC_STATE_DIR="$wiki_state" NUNCHI_HOME="$wiki_nh" \
+  NUNCHI_BENCH_QSET="$wiki_hooks/bench-qset.tsv" CCC_NODE=test-node \
+  NUNCHI_BENCH_WIKI_CLI="$wbin/wiki-agent-slow" NUNCHI_BENCH_WIKI_TIMEOUT_SEC=1 \
+  bash "$wiki_hooks/bench.sh" > "$TMP/wout-slow" 2>&1
+rc_slow=$?
+wout_slow="$(find "$wiki_nh" -maxdepth 1 -name 'bench-*.md' -type f -print -quit)"
+ok "a Wiki lookup that times out degrades to source=none and still exits 0" \
+  '[ "$rc_slow" = 0 ] && [ -n "$wout_slow" ] && [ "$(grep -c "source=none" "$wout_slow")" = 5 ]'
+ok "a timed-out Wiki leaves the queries counted as gate candidates" \
+  'grep -q "^- unanswered (gate candidates): 5$" "$wout_slow"'
+
+rm -f "$wiki_nh"/bench-*.md
+HOME="$wiki_home" CCC_STATE_DIR="$wiki_state" NUNCHI_HOME="$wiki_nh" \
+  NUNCHI_BENCH_QSET="$wiki_hooks/bench-qset.tsv" CCC_NODE=test-node \
+  NUNCHI_BENCH_WIKI_CLI="$TMP/absent-wiki-agent" \
+  bash "$wiki_hooks/bench.sh" > "$TMP/wout-abs" 2>&1
+rc_abs=$?
+wout_abs="$(find "$wiki_nh" -maxdepth 1 -name 'bench-*.md' -type f -print -quit)"
+ok "a node without wiki-agent still completes the bench" \
+  '[ "$rc_abs" = 0 ] && [ -n "$wout_abs" ] && [ "$(grep -c "source=none" "$wout_abs")" = 5 ]'
+
+# A contaminated row must never be attributed to a layer: an INVALID answer
+# says nothing about retrieval, and consulting the Wiki for it would inflate
+# the Wiki's apparent coverage with rows the backend never even answered.
+cat > "$wiki_hooks/nunchi.py" <<'PY'
+#!/usr/bin/env python3
+import sys
+cmd = sys.argv[1]
+sys.stdin.read()
+if cmd == "synthesize":
+    print("WIKI-ANSWER (should not be reached)")
+elif cmd == "metrics":
+    print("stub metrics")
+else:
+    print("Not logged in · Please run /login")
+PY
+run_wiki_bench
+ok "an INVALID row is never attributed to the Wiki layer" \
+  '[ "$(grep -c "status=INVALID reason=provider-failure source=none$" "$wout")" = 5 ] && ! grep -q "WIKI-ANSWER" "$wout"'
 
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
