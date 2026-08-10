@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -155,6 +156,75 @@ async def test_pending_to_success_wakes_once_and_resumes(tmp_path: Path) -> None
     assert record["terminal_status"] == TERMINAL_SUCCESS
     assert prompt.startswith("[external_event: github_pr_checks terminal=success")
     assert "squash-merge the PR" in prompt
+
+
+@pytest.mark.anyio
+async def test_terminal_notification_precedes_a_blocked_resume(tmp_path: Path) -> None:
+    """A slow Codex admission must not hide a promptly detected CI result."""
+    clock = Clock()
+    registry = _registry(tmp_path, clock)
+    recorder = Recorder()
+    resume_started = asyncio.Event()
+    release_resume = asyncio.Event()
+
+    async def blocking_resume(record: dict, prompt: str) -> bool:
+        recorder.resumes.append((record, prompt))
+        resume_started.set()
+        await release_resume.wait()
+        return True
+
+    monitor = _monitor(
+        registry,
+        FakeTransport([PrState("abc1234", "success")]),
+        recorder,
+        clock,
+        resumer=blocking_resume,
+    )
+
+    tick = asyncio.create_task(monitor._tick())
+    await asyncio.wait_for(resume_started.wait(), timeout=1)
+
+    assert len(recorder.notifications) == 1
+    assert "CI green" in recorder.notifications[0][1]
+    assert "Continuing automatically." in recorder.notifications[0][1]
+    assert not tick.done()
+
+    release_resume.set()
+    await tick
+    assert registry.records()[0]["wake"]["resumed"] is True
+
+
+@pytest.mark.anyio
+async def test_resume_failure_sends_correction_and_records_dropped_promise(
+    tmp_path: Path,
+) -> None:
+    clock = Clock()
+    registry = _registry(tmp_path, clock)
+    recorder = Recorder()
+
+    async def failed_resume(record: dict, prompt: str) -> bool:
+        recorder.resumes.append((record, prompt))
+        return False
+
+    monitor = _monitor(
+        registry,
+        FakeTransport([PrState("abc1234", "success")]),
+        recorder,
+        clock,
+        resumer=failed_resume,
+    )
+
+    await monitor._tick()
+
+    assert len(recorder.resumes) == 1
+    assert len(recorder.notifications) == 2
+    assert "Continuing automatically." in recorder.notifications[0][1]
+    assert "NOT continued" in recorder.notifications[1][1]
+    record = registry.records()[0]
+    assert record["wake"]["state"] == "done"
+    assert record["wake"]["resumed"] is False
+    assert record["wake"]["skip_reason"] == "resume_failed"
+    assert [item["wait_id"] for item in registry.dropped_promises()] == [record["wait_id"]]
 
 
 @pytest.mark.anyio
@@ -408,10 +478,12 @@ async def test_notifier_failure_retries_until_delivered(tmp_path: Path) -> None:
     await monitor._tick()  # terminal journaled; wake attempted, notifier raises
     await monitor._tick()
     assert registry.pending_wakes()  # still pending, will retry
+    assert recorder.resumes == []
 
     recorder.fail_notify = False
     await monitor._tick()
     assert len(recorder.notifications) == 1
+    assert len(recorder.resumes) == 1
     assert registry.pending_wakes() == []
 
 

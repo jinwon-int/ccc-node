@@ -30,6 +30,10 @@ python -m telegram_bot.core.external_wait_cli register \
 - Pin the **exact head SHA** you mean (`git rev-parse HEAD`, or
   `gh pr view <n> --json headRefOid`). A newer push supersedes the wait —
   it will never report stale CI as your result.
+- After **every push or PR head update**, re-read `headRefOid` and register a
+  new wait for that SHA before promising another continuation. A wait is
+  one-shot and exact-head-bound: the old `wait_id` never follows the new head,
+  even when the PR number and promised next step are unchanged.
 - `--summary` is the one-line, body-free next step (no secrets, no logs).
   It becomes the continuation prompt: write it so future-you can act on it
   (e.g. "squash-merge PR #123 when green" or "inspect failing checks and fix").

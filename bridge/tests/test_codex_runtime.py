@@ -953,6 +953,57 @@ class CodexRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(diagnostics.unowned_completed, 0)
         self.assertEqual(diagnostics.late_active_duplicates, 0)
 
+    async def test_steered_user_message_reconciles_provisional_turn_start_id(self) -> None:
+        """Regression for openai/codex#36866 seen on Seoseo with 0.146.0.
+
+        When a native Goal continuation already owns turn A, app-server steers
+        our new user input into A but returns a fresh submission id S from
+        turn/start.  Notifications and interrupt keep using A.  The adapter
+        must adopt A from the user-message acknowledgement instead of dropping
+        every event until the admission watchdog expires.
+        """
+
+        session = await self.runtime.start_or_resume(
+            SessionRequest(working_directory="/workspace")
+        )
+        client = self.clients[0]
+        active_turn_id = "9a25ed7f-d69e-4d46-b3bc-4f91b5049058"
+        client.before_turn_response = [
+            CodexNotification(
+                "item/started",
+                {
+                    "threadId": "thread-new",
+                    "turnId": active_turn_id,
+                    "item": {"id": "message-steered", "type": "userMessage"},
+                },
+            ),
+            CodexNotification(
+                "item/agentMessage/delta",
+                {
+                    "threadId": "thread-new",
+                    "turnId": active_turn_id,
+                    "delta": "continued",
+                },
+            ),
+            CodexNotification(
+                "turn/completed",
+                {
+                    "threadId": "thread-new",
+                    "turn": {"id": active_turn_id, "status": "completed"},
+                },
+            ),
+        ]
+
+        events = [event async for event in session.send_turn("continue after CI")]
+
+        self.assertEqual(
+            [event.kind for event in events],
+            ["text_delta", "result", "completion"],
+        )
+        self.assertEqual(cast(TextDeltaEvent, events[0]).text, "continued")
+        self.assertIn(active_turn_id, self.runtime._started_turn_ids)
+        self.assertNotIn("turn-1", self.runtime._started_turn_ids)
+
     async def test_unowned_completion_stays_degraded_and_body_free(self) -> None:
         await self.runtime.start_or_resume(
             SessionRequest(working_directory="/workspace", session_id="thread-known")

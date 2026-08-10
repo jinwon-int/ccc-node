@@ -95,6 +95,27 @@ def test_register_is_idempotent_for_the_same_natural_key(
     assert first["wait_id"] == second["wait_id"]
 
 
+def test_new_pr_head_requires_and_creates_a_new_exact_head_wait(
+    home: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """A completed wait is one-shot and never follows a later pushed head."""
+    _publish(home)
+    first = json.loads(
+        (lambda rc: capsys.readouterr().out.strip())(
+            external_wait_cli.main(_register_args(head_sha="a" * 40))
+        )
+    )
+    second = json.loads(
+        (lambda rc: capsys.readouterr().out.strip())(
+            external_wait_cli.main(_register_args(head_sha="b" * 40))
+        )
+    )
+
+    assert first["wait_id"] != second["wait_id"]
+    records = ExternalWaitRegistry(default_registry_path(home)).records()
+    assert {record["head_sha"] for record in records} == {"a" * 40, "b" * 40}
+
+
 def test_register_normalizes_a_short_sha_to_the_full_head(
     home: Path, capsys: pytest.CaptureFixture
 ) -> None:
