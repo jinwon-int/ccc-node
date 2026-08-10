@@ -66,6 +66,20 @@ class FakeWriter:
         self.reader.feed_data(data + b"\n")
 
 
+class _SilentWriter(FakeWriter):
+    """A ``FakeWriter`` that never auto-answers "initialize".
+
+    ``FakeWriter.write`` immediately feeds a fake response the moment it sees
+    an outgoing "initialize" request, which is convenient for the happy-path
+    tests above but makes it impossible to control exactly when (or whether)
+    a response arrives. Tests that need to simulate a cancelled/timed-out
+    handshake use this variant and feed responses manually.
+    """
+
+    def write(self, data: bytes) -> None:
+        self.messages.append(json.loads(data.decode()))
+
+
 class FakeProcess:
     def __init__(self, *, ignore_terminate: bool = False) -> None:
         self.stdout = asyncio.StreamReader()
@@ -136,6 +150,75 @@ class CodexAppServerTests(unittest.IsolatedAsyncioTestCase):
         assert [message.get("method") for message in writer.messages] == ["initialize", "initialized"]
         await client.close()
 
+    async def test_start_discards_transport_after_a_cancelled_initialize(self) -> None:
+        """Regression for the "Already initialized" -32600 failure.
+
+        If start() is cancelled while awaiting the "initialize" response
+        (e.g. an outer asyncio.wait_for(..., timeout=7.0) during a slow cold
+        start), the write may already have reached the app-server even
+        though the client never saw the response. Leaving the old
+        process/reader/writer installed would make the next start() call
+        skip spawning a fresh process and resend "initialize" on that
+        already-initialized connection, which the real app-server rejects
+        with {"code": -32600, "message": "Already initialized"}. start() must
+        discard the half-initialized transport so a retry always begins from
+        a brand new process.
+        """
+
+        processes: list[FakeProcess] = []
+
+        async def factory() -> FakeProcess:
+            process = FakeProcess()
+            process.stdin = _SilentWriter(process.stdout)
+            processes.append(process)
+            return process
+
+        client = CodexAppServerClient(process_factory=factory)
+
+        first_attempt = asyncio.create_task(client.start())
+        for _ in range(2000):
+            if processes and processes[0].stdin.messages:
+                break
+            await asyncio.sleep(0)
+        else:
+            self.fail("first start() never wrote an initialize request")
+        assert [m.get("method") for m in processes[0].stdin.messages] == ["initialize"]
+
+        first_attempt.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await asyncio.wait_for(asyncio.shield(first_attempt), timeout=1)
+
+        # The failed attempt must not leave a half-initialized transport
+        # behind: no reader/writer/process installed, and the abandoned
+        # process's stdin was actually closed (not merely forgotten).
+        assert client._reader is None
+        assert client._writer is None
+        assert client._process is None
+        assert client._started is False
+        assert processes[0].stdin.close_calls == 1
+        assert processes[0].terminate_calls == 1
+
+        second_attempt = asyncio.create_task(client.start())
+        for _ in range(2000):
+            if len(processes) >= 2 and processes[1].stdin.messages:
+                break
+            await asyncio.sleep(0)
+        else:
+            detail = f", second start() failed with {second_attempt.exception()!r}" if second_attempt.done() else ""
+            self.fail(f"retry never spawned a fresh process{detail}")
+        first_message = processes[1].stdin.messages[0]
+        assert first_message["method"] == "initialize"
+        processes[1].stdin.feed({"id": first_message["id"], "result": {"userAgent": "fake"}})
+
+        second_result = await asyncio.wait_for(second_attempt, timeout=1)
+
+        # The retry must spawn a genuinely new process rather than resending
+        # "initialize" on the abandoned one.
+        assert len(processes) == 2
+        assert second_result == {"userAgent": "fake"}
+        assert [m.get("method") for m in processes[1].stdin.messages] == ["initialize", "initialized"]
+
+        await client.close()
 
     async def test_concurrent_requests_correlate_out_of_order_responses_and_serialize_writes(self) -> None:
         reader = asyncio.StreamReader()
