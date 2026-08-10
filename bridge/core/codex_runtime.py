@@ -1012,7 +1012,7 @@ class CodexRuntime:
             active.pending_notifications.append(notification)
             return
         turn_id = self._notification_turn_id(params)
-        if active.turn_id is not None and turn_id is not None and active.turn_id != turn_id:
+        if not self._notification_matches_active_turn(active, notification, turn_id):
             return
 
         event: AgentEvent | None = None
@@ -1046,6 +1046,67 @@ class CodexRuntime:
             return
         if event is not None:
             active.queue.put_nowait(event)
+
+    def _notification_matches_active_turn(
+        self,
+        active: _ActiveTurn,
+        notification: CodexNotification,
+        observed_turn_id: str | None,
+    ) -> bool:
+        """Accept this turn's event or reconcile a steered submission id."""
+        if (
+            active.turn_id is None
+            or observed_turn_id is None
+            or active.turn_id == observed_turn_id
+        ):
+            return True
+        return self._reconcile_steered_turn_id(
+            active,
+            notification,
+            observed_turn_id,
+        )
+
+    def _reconcile_steered_turn_id(
+        self,
+        active: _ActiveTurn,
+        notification: CodexNotification,
+        observed_turn_id: str,
+    ) -> bool:
+        """Adopt the canonical active turn after app-server steers our input.
+
+        Codex app-server currently returns a provisional submission UUID from
+        ``turn/start`` when the thread already has an active turn, even though
+        Core steers the submitted user message into that existing turn.  All
+        lifecycle notifications then carry the existing turn id.  Treat only
+        the provider's ``item/started`` acknowledgement for the submitted user
+        message as strong enough evidence to reconcile the ids; arbitrary late
+        deltas or terminal notifications from another turn remain ignored.
+
+        This is a client-side compatibility guard for openai/codex#36866.  It
+        can stay harmless after the provider fix because matching ids never
+        enter this branch.
+        """
+
+        if notification.method != "item/started":
+            return False
+        item = notification.params.get("item")
+        if not isinstance(item, Mapping) or item.get("type") != "userMessage":
+            return False
+        if _CODEX_OPAQUE_ID_RE.fullmatch(observed_turn_id) is None:
+            return False
+
+        provisional_turn_id = active.turn_id
+        if provisional_turn_id is None or provisional_turn_id == observed_turn_id:
+            return False
+        active.turn_id = observed_turn_id
+        self._started_turn_ids.pop(provisional_turn_id, None)
+        self._started_turn_ids[observed_turn_id] = None
+        self._started_turn_ids = dict(tuple(self._started_turn_ids.items())[-512:])
+        logger.warning(
+            "Reconciled Codex turn/start submission id to the active turn "
+            "after a steered user-message acknowledgement"
+        )
+        return True
 
     def _routable_active_turn(
         self,

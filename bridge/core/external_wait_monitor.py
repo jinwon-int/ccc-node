@@ -333,21 +333,67 @@ class ExternalWaitMonitor:
     # -- wake delivery -------------------------------------------------------------
     async def _deliver_wake(self, record: Dict[str, Any]) -> None:
         wait_id = record["wait_id"]
-        resumed, skip_reason = await self._maybe_resume(record)
-        try:
-            delivered = await self._notifier(
-                int(record["chat_id"]),
-                wake_notification_text(record, resumed=resumed, skip_reason=skip_reason),
+        skip_reason = await self._resume_skip_reason(record)
+        if skip_reason is not None:
+            delivered = await self._notify_wake(
+                record,
+                resumed=False,
+                skip_reason=skip_reason,
             )
-        except Exception:
-            logger.warning("External-wait notifier raised: wait=%s", wait_id)
-            delivered = False
+            self._registry.mark_wake(
+                wait_id,
+                delivered=delivered,
+                resumed=False,
+                skip_reason=skip_reason,
+            )
+            return
+
+        # Notify the owner as soon as the terminal result is known.  A Codex
+        # continuation can be admitted into an already-running native Goal
+        # turn and then block for minutes; putting the resumer first made a
+        # prompt CI poll look like a missing GitHub event (#740 follow-up).
+        delivered = await self._notify_wake(record, resumed=True)
+        if not delivered:
+            # Do not run a continuation whose terminal notification did not
+            # land.  Leave the wake pending so the next drain retries the
+            # notification, then resumes exactly once after delivery.
+            self._registry.mark_wake(wait_id, delivered=False)
+            return
+
+        resumed = await self._run_resume(record)
+        if resumed:
+            self._registry.mark_wake(wait_id, delivered=True, resumed=True)
+            return
+
+        # The first notification truthfully announced an attempt, not its
+        # outcome.  Correct it promptly when the continuation could not run;
+        # the durable ledger remains authoritative even if this best-effort
+        # follow-up notification itself fails.
+        await self._notify_wake(record, resumed=False, skip_reason="resume_failed")
         self._registry.mark_wake(
             wait_id,
-            delivered=bool(delivered),
-            resumed=bool(resumed),
-            skip_reason=skip_reason,
+            delivered=True,
+            resumed=False,
+            skip_reason="resume_failed",
         )
+
+    async def _notify_wake(
+        self,
+        record: Dict[str, Any],
+        *,
+        resumed: bool,
+        skip_reason: Optional[str] = None,
+    ) -> bool:
+        try:
+            return bool(
+                await self._notifier(
+                    int(record["chat_id"]),
+                    wake_notification_text(record, resumed=resumed, skip_reason=skip_reason),
+                )
+            )
+        except Exception:
+            logger.warning("External-wait notifier raised: wait=%s", record["wait_id"])
+            return False
 
     async def _maybe_resume(self, record: Dict[str, Any]) -> tuple[bool, Optional[str]]:
         """(resumed, skip_reason). The reason is what the owner has to act on.
@@ -356,8 +402,17 @@ class ExternalWaitMonitor:
         dropped promise look the same as a fulfilled one in both the ledger and
         the notification (#740 follow-up, 2026-07-30).
         """
+        skip_reason = await self._resume_skip_reason(record)
+        if skip_reason is not None:
+            return False, skip_reason
+        if await self._run_resume(record):
+            return True, None
+        return False, "resume_failed"
+
+    async def _resume_skip_reason(self, record: Dict[str, Any]) -> Optional[str]:
+        """Return why auto-resume must not run, or ``None`` when eligible."""
         if not self._resume_enabled or self._resumer is None:
-            return False, "resume_disabled"
+            return "resume_disabled"
         # Only a genuine terminal rollup continues the promised next step:
         # a superseded head, an expired watch, or a GitHub read failure says
         # nothing about the watched CI, so the owner decides instead (#740).
@@ -366,14 +421,14 @@ class ExternalWaitMonitor:
             TERMINAL_FAILURE,
             TERMINAL_CANCELLED,
         }:
-            return False, "non_terminal_rollup"
+            return "non_terminal_rollup"
         summary = str(record.get("summary") or "").strip()
         if not summary:
-            return False, "no_promise_recorded"  # nothing was promised
+            return "no_promise_recorded"  # nothing was promised
         day = time.strftime("%Y-%m-%d", time.gmtime(self._clock()))
         if not self._resume_budget_ok(day):
             logger.warning("External-wait resume daily cap reached; notification only")
-            return False, "daily_cap"
+            return "daily_cap"
         registered_session = record.get("session_id")
         if registered_session and self._session_lookup is not None:
             try:
@@ -387,7 +442,12 @@ class ExternalWaitMonitor:
                     "External-wait resume skipped (session moved on): wait=%s",
                     record["wait_id"],
                 )
-                return False, "session_moved"
+                return "session_moved"
+        return None
+
+    async def _run_resume(self, record: Dict[str, Any]) -> bool:
+        """Attempt one eligible continuation and account for a success."""
+        assert self._resumer is not None
         try:
             resumed = await self._resumer(record, resume_prompt_text(record))
         except Exception:
@@ -395,8 +455,8 @@ class ExternalWaitMonitor:
             resumed = False
         if resumed:
             self._resume_count += 1
-            return True, None
-        return False, "resume_failed"
+            return True
+        return False
 
 
 __all__ = [
