@@ -6,6 +6,15 @@
 # Honcho-side answers are collected separately (read-only chat) and compared
 # by the reviewing agent; this script never calls Honcho.
 # No-op unless nunchi is enabled. Costs one Haiku call per query.
+#
+# #1078 — a provider CLI that is logged out prints its notice to stdout and
+# exits 0, so rc alone cannot tell "the backend answered" from "the backend
+# never ran". Such a row also contains no "기록 없음", which made contaminated
+# nodes score as the BEST performers on the Phase 2 parity gate. Every row now
+# carries an explicit status= field and the run ends with a validity summary,
+# so the reviewing agent sees sample contamination before reading any answer.
+# Rows are marked, never dropped: the answer text stays on disk so a human can
+# overrule a false positive.
 set -uo pipefail
 
 STATE="${CCC_STATE_DIR:-$HOME/.claude/state}"
@@ -17,6 +26,9 @@ QSET="${NUNCHI_BENCH_QSET:-$HERE/bench-qset.tsv}"
 NUNCHI_HOME="${NUNCHI_HOME:-$HOME/.nunchi}"
 TARGET="${NUNCHI_BENCH_TARGET:-seo-jin-on}"
 OUT="$NUNCHI_HOME/bench-$(date +%Y%m%d).md"
+# Provider notices that mean "no answer was produced". Extended-regex,
+# case-insensitive, overridable per node for providers not covered here.
+INVALID_RE="${NUNCHI_BENCH_INVALID_RE:-Not logged in|Please run /login|Invalid API key|authentication_error|insufficient_quota|rate_limit_exceeded}"
 [ -f "$QSET" ] || { echo "qset missing: $QSET" >&2; exit 2; }
 
 mkdir -p "$NUNCHI_HOME"
@@ -33,6 +45,11 @@ mkdir -p "$NUNCHI_HOME"
   echo
 } >> "$OUT"
 
+# Per-run status ledger. $OUT is append-mode and may already hold an earlier
+# run from the same day, so the summary must count THIS run only.
+LEDGER="$(mktemp "${TMPDIR:-/tmp}/nunchi-bench-XXXXXX")" || exit 2
+trap 'rm -f "$LEDGER"' EXIT
+
 tail -n +2 "$QSET" | while IFS=$'\t' read -r qid category query expect; do
   [ -n "$qid" ] || continue
   start="$(date +%s)"
@@ -43,11 +60,46 @@ tail -n +2 "$QSET" | while IFS=$'\t' read -r qid category query expect; do
   ans="$(python3 "$HERE/nunchi.py" dialectic "$query" --target "$TARGET" </dev/null 2>&1)"
   rc=$?
   dur=$(( $(date +%s) - start ))
+  # rc is reported unchanged — it is a true fact about the child. status is a
+  # separate judgement about whether the row is usable as a parity sample.
+  status=OK
+  reason=
+  if [ "$rc" != 0 ]; then
+    status=INVALID; reason="exit-$rc"
+  elif [ -z "${ans//[[:space:]]/}" ]; then
+    status=INVALID; reason=empty
+  elif printf '%s' "$ans" | grep -qiE "$INVALID_RE"; then
+    status=INVALID; reason=provider-failure
+  fi
+  printf '%s\t%s\n' "$qid" "$status" >> "$LEDGER"
   {
-    echo "## $qid ($category) — ${dur}s rc=$rc"
+    if [ -n "$reason" ]; then
+      echo "## $qid ($category) — ${dur}s rc=$rc status=$status reason=$reason"
+    else
+      echo "## $qid ($category) — ${dur}s rc=$rc status=$status"
+    fi
     echo "- Q: $query"
     echo "- expect: $expect"
     printf '%s\n\n' "$ans" | sed 's/^/  > /'
   } >> "$OUT"
 done
-echo "bench written: $OUT"
+
+total="$(wc -l < "$LEDGER" | tr -d ' ')"
+invalid="$(grep -c $'\tINVALID$' "$LEDGER" || true)"
+valid=$(( total - invalid ))
+{
+  echo "## bench-summary ($(date -Is))"
+  echo "- queries: $total"
+  echo "- valid: $valid"
+  echo "- invalid: $invalid"
+  if [ "$invalid" -gt 0 ]; then
+    # The parity gate counts "기록 없음" answers. An INVALID row has none, so
+    # leaving it in the sample makes a dead backend look like a perfect score.
+    echo "- ⚠️ SAMPLE CONTAMINATED — exclude this node's run from the Phase 2"
+    echo "  parity gate (#827) until the backend is healthy. Invalid rows"
+    echo "  produce no \"기록 없음\" and would otherwise score as best-in-fleet."
+  fi
+  echo
+} >> "$OUT"
+
+echo "bench written: $OUT (valid=$valid invalid=$invalid)"
