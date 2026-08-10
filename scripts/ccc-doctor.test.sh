@@ -277,6 +277,25 @@ ok "--rollback --apply restores previous statusLine drift" 'jq -e ".statusLine.c
 ok "--rollback --apply restores missing PostCompact" 'jq -e "has(\"hooks\") and (.hooks | has(\"PostCompact\") | not)" "$repair/home/.claude/settings.json" >/dev/null'
 ok "--rollback --apply creates pre-rollback backup" 'find "$repair/home/.claude/backups" -name "ccc-doctor-pre-rollback-*.tar.gz" | grep -q .'
 
+rollback_backup_fail="$(make_fixture rollback-backup-fail standalone)"
+jq '.outputStyle="plain"' "$rollback_backup_fail/home/.claude/settings.json" > "$rollback_backup_fail/home/.claude/settings.json.tmp"
+mv "$rollback_backup_fail/home/.claude/settings.json.tmp" "$rollback_backup_fail/home/.claude/settings.json"
+out="$(run_doctor "$rollback_backup_fail" --fix --apply 2>&1)"; rc=$?
+mkdir -p "$rollback_backup_fail/bin"
+cat > "$rollback_backup_fail/bin/tar" <<'EOF'
+#!/usr/bin/env bash
+case "$1:$2" in
+  -czf:*ccc-doctor-pre-rollback-*) exit 1 ;;
+esac
+exec /usr/bin/tar "$@"
+EOF
+chmod +x "$rollback_backup_fail/bin/tar"
+settings_before="$(cat "$rollback_backup_fail/home/.claude/settings.json")"
+out="$(PATH="$rollback_backup_fail/bin:$PATH" CCC_DOCTOR_REPO_DIR="$rollback_backup_fail/repo" CCC_DOCTOR_CLAUDE_DIR="$rollback_backup_fail/home/.claude" bash "$DOCTOR" --rollback --apply 2>&1)"; rc=$?
+settings_after="$(cat "$rollback_backup_fail/home/.claude/settings.json")"
+ok "--rollback --apply refuses to overwrite settings when its recovery backup fails" \
+  '[ "$rc" = 1 ] && grep -q "failed to create valid pre-rollback settings backup" <<<"$out" && [ "$settings_before" = "$settings_after" ]'
+
 nobackup="$(make_fixture nobackup standalone)"
 out="$(run_doctor "$nobackup" --rollback --apply 2>&1)"; rc=$?
 ok "--rollback --apply fails closed without backup" '[ "$rc" = 1 ] && grep -q "no rollback backup found" <<<"$out"'
@@ -298,6 +317,24 @@ backup_count_before="$(find "$files/home/.claude/backups" -name "ccc-doctor-file
 out="$(run_doctor "$files" --fix --apply --scope=files 2>&1)"; rc=$?
 backup_count_after="$(find "$files/home/.claude/backups" -name "ccc-doctor-files-*.tar.gz" | wc -l)"
 ok "file repair is idempotent" '[ "$rc" = 0 ] && [ "$backup_count_before" = "$backup_count_after" ] && grep -q "no repairs needed" <<<"$out"'
+
+file_backup_fail="$(make_fixture file-backup-fail standalone)"
+printf 'drifted output style\n' > "$file_backup_fail/home/.claude/output-styles/ccc-report.md"
+mkdir -p "$file_backup_fail/bin"
+cat > "$file_backup_fail/bin/tar" <<'EOF'
+#!/usr/bin/env bash
+case "$1" in
+  -czf) printf 'not a tar archive\n' > "$2"; exit 0 ;;
+  -tzf) exit 1 ;;
+esac
+exec /usr/bin/tar "$@"
+EOF
+chmod +x "$file_backup_fail/bin/tar"
+file_before="$(cat "$file_backup_fail/home/.claude/output-styles/ccc-report.md")"
+out="$(PATH="$file_backup_fail/bin:$PATH" CCC_DOCTOR_REPO_DIR="$file_backup_fail/repo" CCC_DOCTOR_CLAUDE_DIR="$file_backup_fail/home/.claude" bash "$DOCTOR" --fix --apply --scope=files 2>&1)"; rc=$?
+file_after="$(cat "$file_backup_fail/home/.claude/output-styles/ccc-report.md")"
+ok "file repair fails closed when its backup tar is invalid" \
+  '[ "$rc" = 1 ] && grep -q "failed to create valid scoped file-repair backup" <<<"$out" && [ "$file_before" = "$file_after" ]'
 
 # Repair must reinstall the way setup.sh installs. A plain copyfile restores the
 # canonical template, pointing the hook at /opt/ccc-node — a path that does not

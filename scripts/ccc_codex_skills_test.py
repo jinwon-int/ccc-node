@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -12,10 +13,15 @@ import stat
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
 TOOL = ROOT / "scripts" / "ccc_codex_skills.py"
+MODULE_SPEC = importlib.util.spec_from_file_location("ccc_codex_skills_under_test", TOOL)
+assert MODULE_SPEC is not None and MODULE_SPEC.loader is not None
+CODEX_SKILLS = importlib.util.module_from_spec(MODULE_SPEC)
+MODULE_SPEC.loader.exec_module(CODEX_SKILLS)
 
 
 def run_tool(
@@ -229,6 +235,29 @@ class CodexManagedSkillsTest(unittest.TestCase):
         self.assertEqual(result.returncode, 70)
         self.assertIn("transaction_rolled_back", result.stderr)
         self.assertEqual(tree_digest(self.home), before)
+
+    def test_stage_promotion_failure_restores_the_just_backed_up_skill(self) -> None:
+        repo = self.copy_repo_surface()
+        self.assertEqual(self.apply(repo=repo).returncode, 0)
+        before = tree_digest(self.home)
+        source = repo / "codex" / "skills" / "ccc-doctor" / "SKILL.md"
+        source.write_text(source.read_text() + "\n<!-- interrupted update -->\n")
+        real_replace = os.replace
+
+        def fail_between_backup_and_promotion(source_path: os.PathLike[str], target_path: os.PathLike[str]) -> None:
+            source_path = Path(source_path)
+            target_path = Path(target_path)
+            if source_path.parent.name.startswith(".ccc-node-stage-") and target_path.name == "ccc-doctor":
+                raise OSError("injected stage promotion failure")
+            real_replace(source_path, target_path)
+
+        with mock.patch.object(CODEX_SKILLS.os, "replace", side_effect=fail_between_backup_and_promotion):
+            with self.assertRaises(CODEX_SKILLS.ContractError) as raised:
+                CODEX_SKILLS._apply(repo, self.home)
+
+        self.assertEqual(str(raised.exception), "transaction_rolled_back")
+        self.assertEqual(tree_digest(self.home), before)
+        self.assertEqual(list((self.home / "skills").glob(".ccc-node-backup-*")), [])
 
     def test_new_unclassified_command_fails_catalog_validation(self) -> None:
         repo = self.copy_repo_surface()

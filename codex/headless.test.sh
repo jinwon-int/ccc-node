@@ -21,7 +21,9 @@ done
 if [ -n "$out" ] && [ "${FAKE_CODEX_NO_OUT:-0}" != 1 ]; then
   printf 'bounded final result\n' > "$out"
 fi
-printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"fallback result"}}'
+if [ "${FAKE_CODEX_EMPTY_EVENTS:-0}" != 1 ]; then
+  printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"fallback result"}}'
+fi
 SH
 chmod +x "$FAKE"
 export FAKE_CODEX_ARGS="$TMP/args"
@@ -38,6 +40,17 @@ ok "runner forwards prompt" 'grep -qx -- "inspect safely" "$FAKE_CODEX_ARGS"'
 
 out="$(FAKE_CODEX_NO_OUT=1 CCC_CODEX_BIN="$FAKE" CCC_CODEX_WORKDIR="$TMP" bash "$RUNNER" fallback)"; rc=$?
 ok "runner extracts a raw final message from JSONL fallback" '[ "$rc" = 0 ] && [ "$out" = "fallback result" ]'
+
+out="$(FAKE_CODEX_NO_OUT=1 FAKE_CODEX_EMPTY_EVENTS=1 CCC_CODEX_BIN="$FAKE" CCC_CODEX_WORKDIR="$TMP" bash "$RUNNER" empty 2>&1)"; rc=$?
+ok "runner fails closed when Codex exits zero without a final message" \
+  '[ "$rc" = 1 ] && grep -q "exited successfully without a final message" <<<"$out"'
+
+mkdir -p "$TMP/no-timeout-bin"
+before="$(stat -c %Y "$FAKE_CODEX_ARGS")"
+out="$(PATH="$TMP/no-timeout-bin" CCC_HEADLESS_TIMEOUT=1 CCC_CODEX_BIN="$FAKE" CCC_CODEX_WORKDIR="$TMP" /bin/bash "$RUNNER" timeout-required 2>&1)"; rc=$?
+after="$(stat -c %Y "$FAKE_CODEX_ARGS")"
+ok "runner fails closed before invocation when timeout enforcement is unavailable" \
+  '[ "$rc" = 127 ] && grep -q "timeout command is required" <<<"$out" && [ "$before" = "$after" ]'
 
 # shellcheck disable=SC2034 # consumed through eval in ok()
 before="$(stat -c %Y "$FAKE_CODEX_ARGS")"

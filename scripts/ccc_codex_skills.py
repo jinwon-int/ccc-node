@@ -502,8 +502,13 @@ def _commit_transaction(
             backup = backup_root / item["name"]
             if item["status"] == "update":
                 os.replace(target, backup)
+                # Record the move before promoting the staged replacement.  If
+                # that second rename fails, rollback must still know where the
+                # only intact copy of the original skill lives.
+                installed.append({**item, "backup": backup})
             os.replace(stage_root / item["name"], target)
-            installed.append({**item, "backup": backup})
+            if item["status"] != "update":
+                installed.append({**item, "backup": backup})
             if fail_after and len(installed) >= fail_after:
                 raise OSError("injected managed-skill transaction failure")
     except BaseException:
@@ -515,10 +520,15 @@ def _commit_transaction(
                     os.replace(item["backup"], item["target"])
             except (OSError, ContractError):
                 rollback_failed = True
-        _remove_owned_tree(stage_root)
-        _remove_owned_tree(backup_root)
+        try:
+            _remove_owned_tree(stage_root)
+        except (OSError, ContractError):
+            rollback_failed = True
         if rollback_failed:
+            # Never delete rollback material after an incomplete restore.  The
+            # owner can recover the remaining originals from backup_root.
             raise ContractError("transaction_rollback_failed") from None
+        _remove_owned_tree(backup_root)
         raise ContractError("transaction_rolled_back") from None
 
     _remove_owned_tree(stage_root)

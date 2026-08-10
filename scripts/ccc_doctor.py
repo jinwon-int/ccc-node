@@ -1318,8 +1318,21 @@ class Doctor:
         backup_dir.mkdir(parents=True, exist_ok=True)
         pre_archive = backup_dir / f"ccc-doctor-pre-rollback-{ts}.tar.gz"
         if self.settings.is_file():
-            subprocess.run(["tar", "-czf", str(pre_archive), "-C", str(self.claude_dir), "settings.json"], check=False)
-        subprocess.run(["tar", "-xzf", str(archive), "-C", str(self.claude_dir), "settings.json"], check=True)
+            created = subprocess.run(
+                ["tar", "-czf", str(pre_archive), "-C", str(self.claude_dir), "settings.json"],
+                check=False,
+            ).returncode == 0
+            if not created or not self.validate_settings_backup(pre_archive):
+                pre_archive.unlink(missing_ok=True)
+                print("failed to create valid pre-rollback settings backup; refusing rollback.", file=sys.stderr)
+                return False
+        restored = subprocess.run(
+            ["tar", "-xzf", str(archive), "-C", str(self.claude_dir), "settings.json"],
+            check=False,
+        ).returncode == 0
+        if not restored:
+            print(f"failed to restore settings.json; recovery backup preserved at {pre_archive}", file=sys.stderr)
+            return False
         print(f"applied settings.json rollback; restored={archive}; preRollbackBackup={pre_archive}")
         return True
 
@@ -1368,11 +1381,26 @@ class Doctor:
             return False
         return True
 
-    def backup_file_repairs(self, rels: list[str]) -> Path:
+    def validate_file_repair_backup(self, archive: Path, expected: list[str]) -> bool:
+        if not archive.is_file():
+            return False
+        listing = subprocess.run(
+            ["tar", "-tzf", str(archive)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if listing.returncode != 0:
+            return False
+        archived = {line.rstrip("/") for line in listing.stdout.splitlines() if line}
+        return set(expected).issubset(archived)
+
+    def backup_file_repairs(self, rels: list[str]) -> Path | None:
         ts = self.timestamp()
         backup_dir = self.claude_dir / "backups"
         backup_dir.mkdir(parents=True, exist_ok=True)
         archive = backup_dir / f"ccc-doctor-files-{ts}.tar.gz"
+        manifest = backup_dir / f"ccc-doctor-files-{ts}.manifest.txt"
         existing = [rel for rel in rels if (self.claude_dir / rel).exists()]
         if existing:
             with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as fh:
@@ -1380,12 +1408,26 @@ class Doctor:
                     fh.write(rel + "\n")
                 list_path = fh.name
             try:
-                subprocess.run(["tar", "-czf", str(archive), "-C", str(self.claude_dir), "-T", list_path], check=False)
+                created = subprocess.run(
+                    ["tar", "-czf", str(archive), "-C", str(self.claude_dir), "-T", list_path],
+                    check=False,
+                ).returncode == 0
             finally:
                 Path(list_path).unlink(missing_ok=True)
         else:
-            subprocess.run(["tar", "-czf", str(archive), "-C", str(self.claude_dir), "--files-from", "/dev/null", "--warning=no-file-changed"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
-            (backup_dir / f"ccc-doctor-files-{ts}.manifest.txt").write_text("no pre-existing files for scoped repair\n", encoding="utf-8")
+            created = subprocess.run(
+                ["tar", "-czf", str(archive), "-C", str(self.claude_dir), "--files-from", "/dev/null", "--warning=no-file-changed"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            ).returncode == 0
+        if not created or not self.validate_file_repair_backup(archive, existing):
+            archive.unlink(missing_ok=True)
+            manifest.unlink(missing_ok=True)
+            print("failed to create valid scoped file-repair backup; refusing repair.", file=sys.stderr)
+            return None
+        if not existing:
+            manifest.write_text("no pre-existing files for scoped repair\n", encoding="utf-8")
         return archive
 
     def apply_file_repairs(self) -> bool:
@@ -1399,6 +1441,8 @@ class Doctor:
             if not self.validate_file_repair_target(rel):
                 return False
         archive = self.backup_file_repairs(rels)
+        if archive is None:
+            return False
         for rel in rels:
             src = self.repo / "claude" / rel
             dst = self.claude_dir / rel
