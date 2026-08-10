@@ -462,23 +462,78 @@ def recall(query, target, limit):
         print(f"[#{r[0]} {r[1]} ({r[2]}) {r[4][:10]}{closed} {r[3]}")
 
 
-def llm_synthesize(prompt):
-    """Query-time synthesis backend: claude -p haiku if present, else codex exec."""
-    import shutil
-    env = {**os.environ, "CLAUDE_DISTILL_INFLIGHT": "1"}
-    if shutil.which("claude"):
-        cmd = ["claude", "-p", prompt, "--model", "haiku"]
-    elif shutil.which("codex"):
-        cmd = ["codex", "exec", "--skip-git-repo-check", prompt]
-    else:
-        return "(합성 백엔드 없음: claude/codex CLI 부재)"
-    out = subprocess.run(cmd, capture_output=True, text=True, timeout=180, env=env)
+# Provider notices that mean "this backend produced no answer". Kept byte-identical
+# to bench.sh's NUNCHI_BENCH_INVALID_RE default; nunchi.test.sh asserts the two
+# stay in sync, because a pattern known to one and not the other reintroduces the
+# silent failure this guards against.
+SYNTH_UNAVAILABLE_RE = re.compile(
+    "Not logged in|Please run /login|Invalid API key|authentication_error"
+    "|insufficient_quota|rate_limit_exceeded",
+    re.IGNORECASE,
+)
+
+
+def _synth_candidates():
+    """Backends to try, in order. claude stays first for backward compatibility."""
+    return (
+        ("claude", ["claude", "-p", "{prompt}", "--model", "haiku"]),
+        ("codex", ["codex", "exec", "--skip-git-repo-check", "{prompt}"]),
+    )
+
+
+def _run_synth_backend(name, argv, env):
+    """Run one backend. Returns (text, reason) — reason is None when usable.
+
+    #1082: presence of a CLI never implied it was authenticated. On a codex or
+    piri node the claude binary ships but has no credentials, so the old
+    presence-only choice locked synthesis onto a backend that could only answer
+    "Not logged in" — while an authenticated codex sat unused on the same host.
+    """
+    try:
+        out = subprocess.run(
+            argv, capture_output=True, text=True, timeout=180, env=env)
+    except subprocess.TimeoutExpired:
+        return "", "timeout"
     text = out.stdout.strip()
-    if shutil.which("codex") and not shutil.which("claude"):
-        # codex exec prints session log lines; the answer is the final block
+    if name == "codex":
+        # codex exec prints session log lines; the answer is the final block.
+        # Tied to the backend that actually ran, not to which CLIs exist —
+        # otherwise a fallback to codex would skip this and return a log line.
         lines = [ln for ln in text.splitlines() if ln.strip()]
         text = lines[-1] if lines else ""
-    return text or out.stderr.strip()
+    text = text or out.stderr.strip()
+    if out.returncode != 0:
+        return text, f"exit-{out.returncode}"
+    if not text:
+        return text, "empty"
+    if SYNTH_UNAVAILABLE_RE.search(text):
+        return text, "unavailable"
+    return text, None
+
+
+def llm_synthesize(prompt):
+    """Query-time synthesis backend: first candidate that can actually answer.
+
+    Falls back when a backend is present but unusable (logged out, quota, empty),
+    so one unauthenticated CLI cannot mask a working one on the same node.
+    """
+    import shutil
+    env = {**os.environ, "CLAUDE_DISTILL_INFLIGHT": "1"}
+    attempts, last_text = [], ""
+    for name, template in _synth_candidates():
+        if not shutil.which(name):
+            continue
+        argv = [prompt if part == "{prompt}" else part for part in template]
+        text, reason = _run_synth_backend(name, argv, env)
+        if reason is None:
+            return text
+        attempts.append(f"{name}:{reason}")
+        last_text = text or last_text
+    if not attempts:
+        return "(합성 백엔드 없음: claude/codex CLI 부재)"
+    # Every present backend failed. Name them so the failure is diagnosable
+    # instead of surfacing one CLI's notice as if it were an answer.
+    return f"(합성 백엔드 사용 불가: {', '.join(attempts)}) {last_text}".strip()
 
 
 _KW_STOP = {
