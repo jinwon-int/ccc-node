@@ -174,6 +174,14 @@ class CodexAppServerClient:
         self._connection_error: CodexConnectionClosedError | None = None
         self._initialize_result: JsonValue = None
         self._started = False
+        # True for the duration of a _teardown_transport() call. _watch_process
+        # observes the same process exit that _teardown_transport just caused
+        # (via terminate()/kill()) and must not mistake that self-inflicted
+        # exit for an unexpected crash — self._closed alone does not cover
+        # this, because a failed start() tears down a half-initialized
+        # transport WITHOUT closing the client, so a retry can spawn a fresh
+        # process.
+        self._discarding_transport = False
 
     async def start(self) -> JsonValue:
         """Open the transport and complete the required initialization handshake."""
@@ -194,17 +202,36 @@ class CodexAppServerClient:
                 self._process_task = asyncio.create_task(self._watch_process())
             if self._reader_task is None:
                 self._reader_task = asyncio.create_task(self._read_stdout())
-            result = await self.request(
-                "initialize",
-                {
-                    "clientInfo": {
-                        "name": "ccc_node",
-                        "title": "CCC Node",
-                        "version": "0.1.0",
-                    }
-                },
-            )
-            await self.notify("initialized")
+            try:
+                result = await self.request(
+                    "initialize",
+                    {
+                        "clientInfo": {
+                            "name": "ccc_node",
+                            "title": "CCC Node",
+                            "version": "0.1.0",
+                        }
+                    },
+                )
+                await self.notify("initialized")
+            except BaseException:
+                # The "initialize" write can already have reached the
+                # app-server even though we failed to observe its response
+                # (e.g. an outer asyncio.wait_for timeout during a slow cold
+                # start cancels this coroutine after _write() returns).
+                # Leaving self._reader/_writer/_reader_task installed with
+                # self._started still False would make the *next* start()
+                # call skip re-spawning a process and resend "initialize" on
+                # this already-initialized connection, which the app-server
+                # rejects with {"code": -32600, "message": "Already
+                # initialized"}. Discard the half-initialized transport so a
+                # retry always begins from a fresh process.
+                await self._teardown_transport(
+                    CodexConnectionClosedError(
+                        "app-server transport discarded after a failed start()"
+                    )
+                )
+                raise
             self._initialize_result = result
             self._started = True
             return result
@@ -446,8 +473,24 @@ class CodexAppServerClient:
         if self._closed:
             return
         self._closed = True
-        error = CodexConnectionClosedError("client closed")
-        self._fail_pending(error)
+        await self._teardown_transport(CodexConnectionClosedError("client closed"))
+
+    async def _teardown_transport(self, pending_error: BaseException) -> None:
+        """Cancel in-flight work and release the process/transport.
+
+        Fails every pending request future with ``pending_error``, stops the
+        reader/server-request tasks, and terminates the app-server process if
+        it is still running. Resets the transport attributes to ``None`` so a
+        subsequent ``start()`` call spawns a brand new process instead of
+        reusing (and re-``initialize``-ing) a stale one.
+
+        Does not touch ``self._closed`` — ``close()`` sets that itself before
+        calling this; a failed ``start()`` calls this to discard a
+        half-initialized transport while leaving the client usable for a
+        retry.
+        """
+
+        self._fail_pending(pending_error)
 
         for task in tuple(self._server_request_tasks):
             task.cancel()
@@ -457,6 +500,7 @@ class CodexAppServerClient:
         if self._reader_task is not None:
             self._reader_task.cancel()
             await asyncio.gather(self._reader_task, return_exceptions=True)
+            self._reader_task = None
 
         if self._writer is not None:
             self._writer.close()
@@ -467,19 +511,30 @@ class CodexAppServerClient:
                 )
             except TimeoutError:
                 pass
+        self._writer = None
+        self._reader = None
 
-        if self._process is not None and self._process.returncode is None:
-            self._process.terminate()
-        if self._process_task is not None:
-            try:
-                await asyncio.wait_for(
-                    asyncio.shield(self._process_task),
-                    timeout=self._process_shutdown_timeout,
-                )
-            except TimeoutError:
-                if self._process is not None and self._process.returncode is None:
-                    self._process.kill()
-                await asyncio.gather(self._process_task, return_exceptions=True)
+        # _watch_process must not record the process exit that terminate()/
+        # kill() below is about to cause as an unexpected connection error —
+        # see the flag's docstring in __init__.
+        self._discarding_transport = True
+        try:
+            if self._process is not None and self._process.returncode is None:
+                self._process.terminate()
+            if self._process_task is not None:
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(self._process_task),
+                        timeout=self._process_shutdown_timeout,
+                    )
+                except TimeoutError:
+                    if self._process is not None and self._process.returncode is None:
+                        self._process.kill()
+                    await asyncio.gather(self._process_task, return_exceptions=True)
+        finally:
+            self._discarding_transport = False
+        self._process = None
+        self._process_task = None
 
     async def _spawn_default_process(self) -> AppServerProcess:
         arguments = [self._executable]
@@ -512,12 +567,12 @@ class CodexAppServerClient:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            if not self._closed:
+            if not self._closed and not self._discarding_transport:
                 self._record_connection_error(
                     CodexConnectionClosedError(f"app-server process wait failed: {exc}")
                 )
             return
-        if not self._closed:
+        if not self._closed and not self._discarding_transport:
             self._record_connection_error(
                 CodexConnectionClosedError(
                     f"app-server process exited with status {returncode}"
