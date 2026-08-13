@@ -188,7 +188,7 @@ gate_secrets() { # <skill.md> — reuses the redaction scanner pattern family
   local f="$1" p label rx
   local patterns=(
     'gh-token::(ghp|gho|ghs|ghr|github_pat)_[A-Za-z0-9_]{20,}'
-    'api-key::sk-[A-Za-z0-9_-]{20,}'
+    'api-key::(^|[^A-Za-z0-9_-])sk-[A-Za-z0-9_-]{20,}'
     'aws-key::AKIA[A-Z0-9]{16}'
     'private-key::-----BEGIN [A-Z ]*PRIVATE KEY-----'
     'bearer::Bearer [A-Za-z0-9._~+/=-]{20,}'
