@@ -274,6 +274,52 @@ gpayload s92 observation user "배포 승인 대기 원칙 폐기 완료" inferr
 ok "G2 rank guard: inferred done cannot close user-stated fact" \
   'gq "SELECT valid_to FROM peer_facts WHERE fact LIKE \"%원칙 유지 진행 중%\"" | grep -q "(None,)"'
 
+# G2 quote-gate defects (#1099). Measured on 20 archived payloads, the gate
+# demoted 29 of 34 verifiable claims (85%) — burying real user statements as
+# agent inferences, the exact inversion G2 exists to prevent. Every case below
+# is a quote that IS in the transcript and was rejected anyway.
+
+# (a) transcript located by session id when source_cwd points elsewhere. The
+# agent cd'ing mid-session made the cwd-derived path miss 9 of 12 payloads.
+PROJ="$TMP/home/.claude/projects/-root-elsewhere"
+mkdir -p "$PROJ"
+sid_a="aaaaaaaa-1111-2222-3333-444444444444"
+printf '{"type":"user","message":{"content":"야간에는 알림을 보내지 마라"}}\n' > "$PROJ/$sid_a.jsonl"
+python3 - "$sid_a" <<'PY' | HOME="$TMP/home" NUNCHI_DB="$GDB" python3 "$NP" ingest - >/dev/null
+import json, sys
+print(json.dumps({"session_id": sys.argv[1], "source_cwd": "/root/some/deep/subdir",
+  "distilled_at": "2026-08-03T00:00:00+00:00",
+  "honcho": [{"kind": "preference", "subject": "user", "text": "야간 알림 비활성화 선호",
+              "source": "user-stated", "quote": "야간에는 알림을 보내지 마라"}]}, ensure_ascii=False))
+PY
+ok "G2 finds the transcript by session id when source_cwd misleads" \
+  'gq "SELECT source_rank, review FROM peer_facts WHERE fact LIKE \"%야간 알림 비활성화%\"" | grep -q "(3, 0)"'
+
+# (b) quote spanning a newline. Skeletonizing raw jsonl bytes left the escape
+# letter behind (\n -> literal "n"), so these could never match.
+TRN="$TMP/g2-newline.jsonl"
+printf '{"type":"user","message":{"content":"브로커를 재시작하려면\\n반드시 사전 승인을 받아라"}}\n' > "$TRN"
+gpayload s95 preference user "브로커 재시작 사전승인" user-stated "브로커를 재시작하려면 반드시 사전 승인을 받아라" "$TRN" \
+  | NUNCHI_DB="$GDB" python3 "$NP" ingest - >/dev/null
+ok "G2 verifies a quote spanning a transcript newline" \
+  'gq "SELECT source_rank, review FROM peer_facts WHERE fact LIKE \"%브로커 재시작 사전승인%\"" | grep -q "(3, 0)"'
+
+# (c) markdown emphasis: the model quotes rendered prose, the transcript holds
+# the source. Same words, rejected on formatting alone.
+TRM="$TMP/g2-markdown.jsonl"
+printf '{"type":"user","message":{"content":"재전환은 **서두르지 않는 게** 좋겠습니다"}}\n' > "$TRM"
+gpayload s96 preference user "재전환 신중 진행 선호" user-stated "재전환은 서두르지 않는 게 좋겠습니다" "$TRM" \
+  | NUNCHI_DB="$GDB" python3 "$NP" ingest - >/dev/null
+ok "G2 verifies a quote across markdown emphasis" \
+  'gq "SELECT source_rank, review FROM peer_facts WHERE fact LIKE \"%재전환 신중%\"" | grep -q "(3, 0)"'
+
+# (d) the gate must still reject a quote that is genuinely absent — the
+# normalization above widens matching, so pin the security property.
+gpayload s96 observation user "사용자가 롤백을 승인했다" user-stated "롤백을 승인한다" "$TRM" \
+  | NUNCHI_DB="$GDB" python3 "$NP" ingest - >/dev/null
+ok "G2 still demotes a quote absent from the transcript" \
+  'gq "SELECT source_rank, review FROM peer_facts WHERE fact LIKE \"%롤백을 승인했다%\"" | grep -q "(1, 1)"'
+
 # G3: high-overlap non-update conflict flags review, never auto-resolves
 gpayload s93 context node "기본 모델 값은 fable-5 이다" | NUNCHI_DB="$GDB" python3 "$NP" ingest - >/dev/null
 gpayload s93 context node "기본 모델 값은 opus 이다" | NUNCHI_DB="$GDB" python3 "$NP" ingest - >/dev/null

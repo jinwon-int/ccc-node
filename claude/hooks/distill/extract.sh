@@ -272,12 +272,17 @@ if ! printf '%s' "$CLEAN" | jq -e '.honcho and .wiki_candidates and (.resume | t
 fi
 
 # Tag with metadata for downstream consumers.
+# transcript_path is the one reliable pointer we hold (validated at the top of
+# this script). Without it nunchi's G2 gate has to guess the location from
+# source_cwd — the distill-time cwd, not the session's project root — and
+# wrongly demotes verifiable user-stated facts to inferred (#1099).
 printf '%s' "$CLEAN" | jq -c \
   --arg sid "$SESSION_ID" \
   --arg trg "$TRIGGER" \
   --arg ts  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
   --arg source_cwd "$SOURCE_CWD" \
   --arg source_project "$SOURCE_PROJECT" \
+  --arg transcript_path "$TRANSCRIPT" \
   --argjson wiki_enabled "$WIKI_ENABLED_JSON" \
   '(if $wiki_enabled then . else .wiki_candidates = [] end)
-   | . + {session_id:$sid, trigger:$trg, distilled_at:$ts, source_cwd:$source_cwd, source_project:$source_project}'
+   | . + {session_id:$sid, trigger:$trg, distilled_at:$ts, source_cwd:$source_cwd, source_project:$source_project, transcript_path:$transcript_path}'

@@ -43,6 +43,7 @@ Usage:
   nunchi.py metrics                          # body-free counters for bench
   nunchi.py stats
 """
+import glob
 import hashlib
 import json
 import os
@@ -259,10 +260,16 @@ _SOURCE_RANK = {"user-stated": 3, "measured": 2, "inferred": 1}
 
 
 def _quote_key(text):
-    """Skeleton for quote matching: drop whitespace and backslashes so a
-    verbatim quote still matches its JSON-escaped form (\\n, \\") inside a
-    transcript .jsonl."""
-    return re.sub(r"[\s\\]+", "", str(text))
+    """Skeleton for quote matching: drop whitespace, backslashes and markdown
+    emphasis so a verbatim quote matches regardless of formatting.
+
+    Applied symmetrically to both the quote and the transcript body, so this
+    only widens what counts as "the same text" — the quote must still appear.
+    Markdown matters because the model quotes rendered prose while the
+    transcript stores the source (`좋겠습니다**` vs `좋겠습니다`), which
+    rejected verbatim quotes outright (#1099).
+    """
+    return re.sub(r"[\s\\*_`~]+", "", str(text))
 
 
 def _verify_rank(item, transcript_key):
@@ -350,26 +357,69 @@ def _conflict_review(c, observed, text):
     return 0
 
 
+def _transcript_path(payload):
+    """Locate the session transcript. Explicit path wins; otherwise search.
+
+    source_cwd is the cwd at distill time, not the session's project root, so
+    deriving the project dir from it breaks the moment the agent cd'd during
+    the session (measured: 9 of 12 archived payloads). Session ids are uuids,
+    so a `projects/*/<sid>.jsonl` search is unambiguous and cwd-independent —
+    it is the fallback that actually holds. (#1099)
+    """
+    path = payload.get("transcript_path") or ""
+    if path:
+        return path
+    sid = str(payload.get("session_id") or "")
+    if not re.fullmatch(r"[0-9a-f-]{8,64}", sid):
+        return ""
+    cwd = str(payload.get("source_cwd") or "")
+    if cwd.startswith("/"):
+        enc = re.sub(r"[/.]", "-", cwd)
+        cand = os.path.expanduser(f"~/.claude/projects/{enc}/{sid}.jsonl")
+        if os.path.exists(cand):
+            return cand
+    hits = glob.glob(os.path.expanduser(f"~/.claude/projects/*/{sid}.jsonl"))
+    return hits[0] if len(hits) == 1 else ""
+
+
 def _transcript_text(payload):
     """Skeleton transcript body for G2 quote checks, '' when unavailable.
 
-    History payloads carry no transcript_path, so fall back to deriving the
-    SDK transcript location from (source_cwd, session_id) the same way the
-    CLI encodes project dirs (path separators and dots become dashes).
+    Decodes the .jsonl instead of skeletonizing its raw bytes: `_quote_key`
+    strips the backslash but leaves the escape letter, so a raw-byte skeleton
+    turns `\\n` into a literal `n` and no quote spanning a line break could
+    ever match. Parsing first removes that whole class of false demotion.
     """
-    path = payload.get("transcript_path") or ""
-    if not path:
-        sid = str(payload.get("session_id") or "")
-        cwd = str(payload.get("source_cwd") or "")
-        if re.fullmatch(r"[0-9a-f-]{8,64}", sid) and cwd.startswith("/"):
-            enc = re.sub(r"[/.]", "-", cwd)
-            path = os.path.expanduser(f"~/.claude/projects/{enc}/{sid}.jsonl")
+    path = _transcript_path(payload)
     try:
-        if path and os.path.exists(path) and os.path.getsize(path) < 64 * 1024 * 1024:
-            return _quote_key(open(path, encoding="utf-8", errors="replace").read())
+        if not (path and os.path.exists(path)
+                and os.path.getsize(path) < 64 * 1024 * 1024):
+            return ""
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            lines = fh.read().splitlines()
     except OSError:
-        pass
-    return ""
+        return ""
+    out = []
+
+    def walk(o):
+        if isinstance(o, str):
+            out.append(o)
+        elif isinstance(o, dict):
+            for v in o.values():
+                walk(v)
+        elif isinstance(o, list):
+            for v in o:
+                walk(v)
+
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            walk(json.loads(line))
+        except (ValueError, RecursionError):
+            out.append(line)  # not json — keep the raw line rather than drop it
+    return _quote_key("\n".join(out))
 
 
 def ingest(path):
