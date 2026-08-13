@@ -72,7 +72,7 @@ _DIRECTIVE_RE = re.compile(
     re.IGNORECASE,
 )
 _CREDENTIAL_RE = re.compile(
-    r"(?:gh[pousr]_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{20,}|"
+    r"(?:gh[pousr]_[A-Za-z0-9_]{20,}|(?<![A-Za-z0-9_-])sk-[A-Za-z0-9_-]{20,}|"
     r"AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY-----|"
     r"\b[0-9]{6,12}:[A-Za-z0-9_-]{20,}\b|"
     r"\bbearer\s+[A-Za-z0-9._~+/=-]{20,}|"

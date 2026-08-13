@@ -116,6 +116,39 @@ spool_after="$(ls "$SPOOL" | wc -l | tr -d '[:space:]')"
 ok "still-blocked draft is not re-notified" '[ "$spool_before" = "$spool_after" ]'
 ok "still-blocked draft reported but not newly" 'jq -e "(.blocked | length == 1) and (.newly_blocked | length == 0)" >/dev/null <<<"$out"'
 
+# --- 3b) the api-key pattern must not match "sk-" inside an ordinary word ------
+# Measured on a live node: the unanchored pattern matched 2 drafts and both were
+# false positives, each on its own name — "di|sk-usage-diagnosis-and-planning"
+# and "ri|sk-driven-lane-composition". A 100% false-positive rate on that
+# corpus, and the block is terminal: the draft never installs, and one of the
+# two had already been judged worth keeping.
+make_draft 20260101-000009-a-riskword disk-usage-diagnosis-and-planning \
+  "Diagnose the recurring disk-usage growth and rank risk-driven cleanup options."
+out="$(run_auto env CCC_SKILL_AUTOSAVE_MODE=auto bash "$AUTO" run)"
+ok "word containing sk- is not blocked as an api key" \
+  '[ ! -f "$PENDING/20260101-000009-a-riskword/autosave-block.json" ]'
+ok "draft named with sk- inside a word installs" \
+  '[ -e "$SKILLS/disk-usage-diagnosis-and-planning" ]'
+
+# ...while a real key in the same position is still caught. Widening a secret
+# pattern is a loosening, so pin the detection it must keep.
+make_draft 20260101-000010-a-realkey real-key-skill \
+  "Automate the recurring provider key rotation procedure for the pipeline." \
+"# Real key
+
+## Procedure
+1. export OPENAI_API_KEY=sk-abcdefghijklmnopqrstuvwxyz012345
+2. Run the job.
+3. Check output.
+4. Confirm.
+5. Done."
+out="$(run_auto env CCC_SKILL_AUTOSAVE_MODE=auto bash "$AUTO" run)"
+ok "real api key is still blocked" \
+  'jq -e ".reason == \"secret api-key\"" "$PENDING/20260101-000010-a-realkey/autosave-block.json" >/dev/null'
+ok "real api key draft not installed" '[ ! -e "$SKILLS/real-key-skill" ]'
+ok "api-key block marker never quotes the secret" \
+  '! grep -q "sk-abcdefghij" "$PENDING/20260101-000010-a-realkey/autosave-block.json"'
+
 # --- 4) node-specific facts are blocked -----------------------------------------
 make_draft 20260101-000003-d-nodefact node-fact-skill "Capture the recurring log inspection procedure used across sessions." \
 "# Node fact

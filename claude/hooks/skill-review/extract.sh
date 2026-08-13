@@ -41,7 +41,7 @@ build_redacted() {
   [ -z "$raw" ] && return 1
   redacted="$(printf '%s' "$raw" | sed -E \
     -e 's/(ghp|gho|ghs|ghr|github_pat)_[A-Za-z0-9_]{20,}/[REDACTED:gh-token]/g' \
-    -e 's/sk-[A-Za-z0-9_-]{20,}/[REDACTED:api-key]/g' \
+    -e 's/(^|[^A-Za-z0-9_-])sk-[A-Za-z0-9_-]{20,}/\1[REDACTED:api-key]/g' \
     -e 's/AKIA[A-Z0-9]{16}/[REDACTED:aws-key]/g' \
     -e 's/-----BEGIN [A-Z ]*PRIVATE KEY-----/[REDACTED:pem-begin]/g' \
     -e 's/Bearer [A-Za-z0-9._-]{20,}/Bearer [REDACTED]/g' \
