@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import patch
 import sys
 import unittest
@@ -68,6 +69,61 @@ class BridgeStatusVerdictTest(unittest.TestCase):
 
         self.assertEqual(doctor.distill_readiness, "ready")
         self.assertIn("effective=piri", doctor.rows[-1].status)
+
+    def test_piri_distill_path_falls_back_to_matching_bridge_unit(self) -> None:
+        with TemporaryDirectory() as temp:
+            root = Path(temp) / "ccc-node"
+            root.mkdir()
+            executable = Path(temp) / "ccc-piri"
+            executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            executable.chmod(0o700)
+            unit = Path(temp) / "ccc-telegram-bridge.service"
+            unit.write_text(
+                "[Service]\n"
+                f'Environment="CCC_PIRI_CLI_PATH={executable}"\n'
+                f"ExecStart=/bin/bash {root}/bridge/start.sh --path {temp}\n",
+                encoding="utf-8",
+            )
+            stale_unit = Path(temp) / "stale-bridge.service"
+            stale_unit.write_text(
+                "[Service]\n"
+                "Environment=CCC_PIRI_CLI_PATH=/missing/stale/ccc-piri\n"
+                f"ExecStart=/bin/bash {temp}/stale/bridge/start.sh --path {temp}\n",
+                encoding="utf-8",
+            )
+            doctor = Doctor(root, Path(temp) / ".claude", "settings")
+            doctor.provider = "piri"
+            doctor._bridge_provider_state = ("piri", "healthy")
+            with patch.dict(
+                "os.environ", {"CCC_MEMORY_DISTILL_PROVIDER": "auto"}, clear=True
+            ), patch.object(
+                doctor, "bridge_systemd_units", return_value=[stale_unit, unit]
+            ), patch.object(
+                doctor, "running_bridge_root", return_value=str(root)
+            ):
+                doctor.check_distill_readiness()
+
+        self.assertEqual(doctor.distill_readiness, "ready")
+        self.assertIn("executable=available", doctor.rows[-1].status)
+        self.assertNotIn(str(executable), doctor.rows[-1].status)
+
+    def test_codex_distill_check_does_not_read_bridge_unit_environment(self) -> None:
+        doctor = Doctor(Path.cwd(), Path.cwd() / ".claude", "settings")
+        doctor.provider = "codex"
+        doctor._bridge_provider_state = ("codex", "healthy")
+        with patch.dict(
+            "os.environ", {"CCC_MEMORY_DISTILL_PROVIDER": "auto"}, clear=True
+        ), patch(
+            "ccc_doctor.shutil.which", return_value=None
+        ), patch.object(
+            doctor,
+            "bridge_unit_environment_value",
+            side_effect=AssertionError("Codex path must not come from the bridge unit"),
+        ):
+            doctor.check_distill_readiness()
+
+        self.assertEqual(doctor.distill_readiness, "failed")
+        self.assertIn("effective=codex", doctor.rows[-1].status)
 
     def test_cross_runtime_override_requires_separate_live_auth_proof(self) -> None:
         doctor = Doctor(Path.cwd(), Path.cwd() / ".claude", "settings")
