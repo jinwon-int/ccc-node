@@ -17,6 +17,7 @@ import importlib.util
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -674,10 +675,22 @@ class Doctor:
                 ),
             )
             return
+        piri_path = os.environ.get("CCC_PIRI_CLI_PATH", "").strip()
+        if (
+            effective == "piri"
+            and not piri_path
+            and self._bridge_provider_state == ("piri", "healthy")
+        ):
+            # The fleet sweep runs doctor from a clean login shell, while the
+            # live bridge can receive its launcher path from systemd. Resolve
+            # that path only for this static existence check. In particular,
+            # do not import CCC_CODEX_CLI_PATH: the Codex readiness check runs
+            # live probes and its service wrapper is not a probe-safe binary.
+            piri_path = self.bridge_unit_environment_value("CCC_PIRI_CLI_PATH") or ""
         configured_paths = {
             "claude": os.environ.get("CLAUDE_CLI_PATH", "claude"),
             "codex": os.environ.get("CCC_CODEX_CLI_PATH", "codex"),
-            "piri": os.environ.get("CCC_PIRI_CLI_PATH", "piri"),
+            "piri": piri_path or "piri",
         }
         raw = configured_paths[effective].strip()
         executable = None
@@ -925,6 +938,90 @@ class Doctor:
         for line in text.splitlines():
             if line.startswith("ExecStart="):
                 return self.checkout_root_of(line.split("=", 1)[1])
+        return None
+
+    @staticmethod
+    def apply_systemd_environment(
+        text: str, key: str, current: str | None = None
+    ) -> str | None:
+        """Apply one unit fragment's bounded Environment= semantics for key.
+
+        Only the named key is retained; neighboring environment values (which
+        may contain credentials) are never returned or rendered. ``shlex`` is
+        sufficient for the quoted assignment forms used by generated units and
+        node-local drop-ins. Malformed lines fail closed and are ignored.
+        """
+
+        value = current
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            if line.startswith("Environment="):
+                payload = line.split("=", 1)[1]
+                if not payload:
+                    value = None
+                    continue
+                try:
+                    assignments = shlex.split(payload, posix=True)
+                except ValueError:
+                    continue
+                for assignment in assignments:
+                    name, separator, assigned = assignment.partition("=")
+                    if separator and name == key:
+                        value = assigned
+            elif line.startswith("UnsetEnvironment="):
+                payload = line.split("=", 1)[1]
+                try:
+                    names = shlex.split(payload, posix=True)
+                except ValueError:
+                    continue
+                if any(name.partition("=")[0] == key for name in names):
+                    value = None
+        return value
+
+    def bridge_systemd_units(self) -> list[Path]:
+        """Known system and per-user unit paths, without invoking systemctl."""
+
+        units = [Path("/etc/systemd/system/ccc-telegram-bridge.service")]
+        units.append(
+            Path.home() / ".config/systemd/user/ccc-telegram-bridge.service"
+        )
+        units.extend(
+            sorted(
+                Path("/home").glob(
+                    "*/.config/systemd/user/ccc-telegram-bridge.service"
+                )
+            )
+        )
+        return list(dict.fromkeys(units))
+
+    def bridge_unit_environment_value(self, key: str) -> str | None:
+        """Read one value from the unit that owns this checkout's bridge.
+
+        A stale twin checkout may have its own unit, so an Environment= value
+        is trusted only when that unit's ExecStart matches the running bridge
+        root (or this doctor checkout when the process path is unavailable).
+        Main-unit and lexically ordered drop-in assignments are applied without
+        exposing any other environment values.
+        """
+
+        expected_root = self.running_bridge_root() or str(self.repo.resolve())
+        for unit in self.bridge_systemd_units():
+            declared_root = self.unit_bridge_root(unit)
+            if declared_root is None:
+                continue
+            if Path(declared_root).resolve() != Path(expected_root).resolve():
+                continue
+            value: str | None = None
+            fragments = [unit]
+            fragments.extend(sorted(unit.parent.glob(f"{unit.name}.d/*.conf")))
+            for fragment in fragments:
+                try:
+                    text = fragment.read_text(encoding="utf-8")
+                except (OSError, UnicodeError):
+                    continue
+                value = self.apply_systemd_environment(text, key, value)
+            if value:
+                return value
         return None
 
     def check_bridge_boot_path(self) -> None:
