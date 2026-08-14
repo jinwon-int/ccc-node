@@ -363,3 +363,21 @@ async def test_external_wait_route_is_independent_of_approval_generation(
     response = await asyncio.wait_for(turn, timeout=2.0)
     assert response.success is True
     assert resolve_active_route(home) is None
+
+
+def test_mark_delivery_failed_stamps_reason_and_ignores_unknown_wait(
+    tmp_path: Path,
+) -> None:
+    """Delivery-failure journal (#1109): durable reason on the wait record."""
+    registry = ExternalWaitRegistry(default_registry_path(tmp_path))
+    assert registry.mark_delivery_failed("missing", "BadRequest") is False
+
+    wait_id = _register(registry)
+    assert registry.mark_delivery_failed(wait_id, "BadRequest") is True
+
+    stored = registry._read()[wait_id]
+    assert stored["delivery_failed"]["reason"] == "BadRequest"
+    assert stored["delivery_failed"]["at"]
+    # The monitoring contract is untouched: the stamp is an audit side-record.
+    assert stored["state"] == "monitoring"
+    assert stored["wake"] is None

@@ -190,6 +190,22 @@ class _ErrorHandler(Protocol):
     ) -> None: ...
 
 
+class _DeliverMarkdown(Protocol):
+    """Bound ``BotDeliveryMixin._deliver_markdown`` on the composed bot.
+
+    Declared here so the lifecycle mixin can route its own outbound sends
+    (external-wait notify/resume) through the same chunked delivery path as
+    user-facing replies instead of re-implementing splitting/fallback.
+    """
+
+    async def __call__(
+        self,
+        content: str,
+        op: Callable[..., Any],
+        base_parse_mode: str = "Markdown",
+    ) -> None: ...
+
+
 class BotLifecycleMixin:
     _config: _LifecycleConfig
     _session_manager: _LifecycleSessionManager
@@ -217,6 +233,7 @@ class BotLifecycleMixin:
     _enqueue_shutdown_distills: _EnqueueShutdownDistills
     _setup_handlers: _SetupHandlers
     _error_handler: _ErrorHandler
+    _deliver_markdown: _DeliverMarkdown
 
     async def _restart_receipt_loop(self, stop_event: asyncio.Event) -> None:
         """Deliver a terminal restart receipt after the replacement is healthy."""
@@ -1230,13 +1247,46 @@ class BotLifecycleMixin:
 
         application = cast(Application, self.application)
 
+        data_dir = getattr(self._config, "bot_data_dir", None) or (
+            FilePath(self._config.project_root) / ".telegram_bot"
+        )
+        home = FilePath(data_dir) / "external-wait"
+        registry = ExternalWaitRegistry(external_wait_registry_path(home))
+
+        async def send_chunked(chat_id: int, text: str) -> tuple[bool, Optional[str]]:
+            """One logical send through the shared chunked path, retried once.
+
+            Raw ``bot.send_message`` drops an oversized or unparsable message
+            wholesale — 2026-08-14 seoseo journal: ``External-wait resume
+            delivery failed: BadRequest``, and the owner never saw the turn's
+            output. The normal delivery path splits to the bubble limit and
+            falls back to plain text per chunk; a final failure is reported
+            with its reason so the caller can journal it on the wait record.
+            """
+
+            async def _once() -> tuple[bool, Optional[str]]:
+                try:
+                    await self._deliver_markdown(
+                        text,
+                        lambda t, pm=None, ents=None: application.bot.send_message(
+                            chat_id=chat_id, text=t, parse_mode=pm, entities=ents
+                        ),
+                    )
+                    return True, None
+                except Exception as exc:
+                    logger.warning(
+                        "External-wait send attempt failed: %s", type(exc).__name__
+                    )
+                    return False, type(exc).__name__
+
+            delivered, _reason = await _once()
+            if delivered:
+                return True, None
+            return await _once()
+
         async def notify(chat_id: int, text: str) -> bool:
-            try:
-                await application.bot.send_message(chat_id=chat_id, text=text)
-                return True
-            except Exception as exc:
-                logger.warning("External-wait notify failed: %s", type(exc).__name__)
-                return False
+            delivered, _reason = await send_chunked(chat_id, text)
+            return delivered
 
         async def resume(record, prompt: str) -> bool:
             # Bind the continuation to the conversation's canonical session, the
@@ -1275,13 +1325,16 @@ class BotLifecycleMixin:
                 return False
             content = str(getattr(response, "content", "") or "")
             if getattr(response, "success", False) and content.strip():
-                try:
-                    await application.bot.send_message(
-                        chat_id=int(record["chat_id"]), text=content
+                delivered, reason = await send_chunked(int(record["chat_id"]), content)
+                if not delivered:
+                    registry.mark_delivery_failed(
+                        str(record.get("wait_id") or ""), reason or "unknown"
                     )
-                except Exception as exc:
                     logger.warning(
-                        "External-wait resume delivery failed: %s", type(exc).__name__
+                        "External-wait resume delivery failed after retry: "
+                        "wait=%s reason=%s",
+                        record.get("wait_id"),
+                        reason,
                     )
                     return False
                 return True
@@ -1294,12 +1347,8 @@ class BotLifecycleMixin:
             except Exception:
                 return None
 
-        data_dir = getattr(self._config, "bot_data_dir", None) or (
-            FilePath(self._config.project_root) / ".telegram_bot"
-        )
-        home = FilePath(data_dir) / "external-wait"
         return ExternalWaitMonitor(
-            ExternalWaitRegistry(external_wait_registry_path(home)),
+            registry,
             transport=GhCliTransport(),
             notifier=notify,
             resumer=resume,

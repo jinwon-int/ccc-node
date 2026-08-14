@@ -328,6 +328,30 @@ class ExternalWaitRegistry:
 
         return bool(self._mutate(_do))
 
+    def mark_delivery_failed(self, wait_id: str, reason: str) -> bool:
+        """Record that an outbound send for this wait ultimately failed.
+
+        The wake journal tracks the terminal *notification*; the continuation
+        content is sent separately, and a raw-send failure there used to leave
+        no durable trace — the owner simply never saw the message (2026-08-14:
+        ``External-wait resume delivery failed: BadRequest``). Stamp the record
+        so the silent-chat risk stays auditable and a later drain can see the
+        send did not land.
+        """
+
+        def _do(records):
+            rec = records.get(wait_id)
+            if rec is None:
+                return False
+            rec["delivery_failed"] = {
+                "at": _utc_now_iso(),
+                "reason": str(reason)[:64],
+            }
+            rec["updated_at"] = _utc_now_iso()
+            return True
+
+        return bool(self._mutate(_do))
+
     def finish(self, wait_id: str, terminal_status: str, *, now: Optional[float] = None) -> bool:
         """Terminal transition, journaled before any wake. First write wins.
 
