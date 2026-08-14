@@ -1292,39 +1292,8 @@ class BotLifecycleMixin:
         home = FilePath(data_dir) / "external-wait"
         registry = ExternalWaitRegistry(external_wait_registry_path(home))
 
-        async def send_chunked(chat_id: int, text: str) -> tuple[bool, Optional[str]]:
-            """One logical send through the shared chunked path, retried once.
-
-            Raw ``bot.send_message`` drops an oversized or unparsable message
-            wholesale — 2026-08-14 seoseo journal: ``External-wait resume
-            delivery failed: BadRequest``, and the owner never saw the turn's
-            output. The normal delivery path splits to the bubble limit and
-            falls back to plain text per chunk; a final failure is reported
-            with its reason so the caller can journal it on the wait record.
-            """
-
-            async def _once() -> tuple[bool, Optional[str]]:
-                try:
-                    await self._deliver_markdown(
-                        text,
-                        lambda t, pm=None, ents=None: application.bot.send_message(
-                            chat_id=chat_id, text=t, parse_mode=pm, entities=ents
-                        ),
-                    )
-                    return True, None
-                except Exception as exc:
-                    logger.warning(
-                        "External-wait send attempt failed: %s", type(exc).__name__
-                    )
-                    return False, type(exc).__name__
-
-            delivered, _reason = await _once()
-            if delivered:
-                return True, None
-            return await _once()
-
         async def notify(chat_id: int, text: str) -> bool:
-            delivered, _reason = await send_chunked(chat_id, text)
+            delivered, _reason = await self._send_external_chunked(chat_id, text)
             return delivered
 
         async def resume(record, prompt: str) -> bool:
@@ -1364,7 +1333,9 @@ class BotLifecycleMixin:
                 return False
             content = str(getattr(response, "content", "") or "")
             if getattr(response, "success", False) and content.strip():
-                delivered, reason = await send_chunked(int(record["chat_id"]), content)
+                delivered, reason = await self._send_external_chunked(
+                    int(record["chat_id"]), content
+                )
                 if not delivered:
                     registry.mark_delivery_failed(
                         str(record.get("wait_id") or ""), reason or "unknown"
