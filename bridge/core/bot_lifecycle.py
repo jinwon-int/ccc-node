@@ -42,8 +42,11 @@ from telegram_bot.core.dead_session_wakeup import (
 )
 from telegram_bot.core.external_wait import (
     ExternalWaitRegistry,
+    default_active_turns_path as external_wait_active_turns_path,
     default_registry_path as external_wait_registry_path,
 )
+from telegram_bot.core.continuation import ContinuationQueue, default_queue_path
+from telegram_bot.core.continuation_monitor import ContinuationMonitor
 from telegram_bot.core.external_wait_monitor import ExternalWaitMonitor, GhCliTransport
 from telegram_bot.core.usage_meter import MODE_AUTONOMOUS
 from telegram_bot.memory.distill_types import DistillJob
@@ -782,6 +785,7 @@ class BotLifecycleMixin:
             workload_task = None
             dead_session_recovery_task = None
             external_wait_task = None
+            continuation_task = None
             distill_snapshot_task = None
             distill_extraction_task = None
             distill_local_sink_task = None
@@ -833,6 +837,15 @@ class BotLifecycleMixin:
                         name="external-wait-monitor",
                     )
                     if external_wait_monitor is not None
+                    else None
+                )
+                continuation_monitor = self._build_continuation_monitor()
+                continuation_task = (
+                    asyncio.create_task(
+                        continuation_monitor.run(stop_event),
+                        name="continuation-monitor",
+                    )
+                    if continuation_monitor is not None
                     else None
                 )
                 health_alerts_task = asyncio.create_task(
@@ -983,6 +996,7 @@ class BotLifecycleMixin:
                     workload_task,
                     dead_session_recovery_task,
                     external_wait_task,
+                    continuation_task,
                     health_alerts_task,
                     session_resource_guard_task,
                     restart_receipt_task,
@@ -1358,6 +1372,115 @@ class BotLifecycleMixin:
             ),
             resume_daily_cap=ExternalWaitMonitor.env_int(
                 "CCC_EXTERNAL_WAIT_RESUME_DAILY_CAP", default=10
+            ),
+        )
+
+    async def _send_external_chunked(self, chat_id: int, text: str) -> tuple[bool, Optional[str]]:
+        """One logical send through the shared chunked path, retried once.
+
+        Raw ``bot.send_message`` drops an oversized or unparsable message
+        wholesale (#1109); the shared delivery path splits to the bubble
+        limit and falls back to plain text per chunk. Returns ``(delivered,
+        failure-reason)`` so the caller can journal a final failure.
+        """
+        application = cast(Application, self.application)
+
+        async def _once() -> tuple[bool, Optional[str]]:
+            try:
+                await self._deliver_markdown(
+                    text,
+                    lambda t, pm=None, ents=None: application.bot.send_message(
+                        chat_id=chat_id, text=t, parse_mode=pm, entities=ents
+                    ),
+                )
+                return True, None
+            except Exception as exc:
+                logger.warning(
+                    "External chunked send attempt failed: %s", type(exc).__name__
+                )
+                return False, type(exc).__name__
+
+        delivered, _reason = await _once()
+        if delivered:
+            return True, None
+        return await _once()
+
+    def _build_continuation_monitor(self):
+        """Yield-and-continue loop for registered next bundles (#1113); None when off.
+
+        The agent registers the next work bundle and ends its turn; this loop
+        starts it as a fresh bridge-owned turn with an explicit external_event
+        origin (never user-authored), metered as autonomous spend — the
+        marathon continues as a baton pass, and the result is delivered
+        through the shared chunked path.
+        """
+        if not ExternalWaitMonitor.env_flag("CCC_CONTINUATION_ENABLED", default=False):
+            logger.info("Continuation monitor disabled (CCC_CONTINUATION_ENABLED=0)")
+            return None
+
+        application = cast(Application, self.application)
+        data_dir = getattr(self._config, "bot_data_dir", None) or (
+            FilePath(self._config.project_root) / ".telegram_bot"
+        )
+        home = FilePath(data_dir) / "continuation"
+        queue = ContinuationQueue(default_queue_path(home))
+
+        async def notify(chat_id: int, text: str) -> bool:
+            delivered, _reason = await self._send_external_chunked(chat_id, text)
+            return delivered
+
+        async def runner(record, prompt: str) -> bool:
+            # Bind the turn to the conversation's canonical session, the way
+            # the user-message path does (#740 resume precedent).
+            user_id = int(record["user_id"])
+            chat_id = int(record["chat_id"])
+            session_id = record.get("session_id")
+            try:
+                current = await self._session_manager.get_session(user_id)
+                session_id = (current or {}).get("session_id") or session_id
+            except Exception:
+                logger.warning(
+                    "Continuation session lookup failed; using registered id: %s",
+                    record.get("continuation_id"),
+                )
+            try:
+                response = await self._project_chat.process_message(
+                    prompt,
+                    user_id,
+                    chat_id,
+                    session_id=session_id,
+                    notification_bot=application.bot,
+                    usage_mode=MODE_AUTONOMOUS,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception(
+                    "Continuation turn failed: %s", record.get("continuation_id")
+                )
+                return False
+            content = str(getattr(response, "content", "") or "")
+            if getattr(response, "success", False) and content.strip():
+                delivered, reason = await self._send_external_chunked(chat_id, content)
+                if not delivered:
+                    logger.warning(
+                        "Continuation delivery failed after retry: %s reason=%s",
+                        record.get("continuation_id"),
+                        reason,
+                    )
+                    return False
+                return True
+            return False
+
+        return ContinuationMonitor(
+            queue,
+            runner=runner,
+            notifier=notify,
+            active_turns_path=external_wait_active_turns_path(
+                FilePath(data_dir) / "external-wait"
+            ),
+            daily_cap=ExternalWaitMonitor.env_int(
+                "CCC_CONTINUATION_DAILY_CAP", default=20
             ),
         )
 

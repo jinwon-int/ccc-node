@@ -587,6 +587,7 @@ class BotDeliveryMixin:
             BotCommand("new", "New session"),
             BotCommand("distill", "Save Codex memory"),
             BotCommand("stop", "Stop execution"),
+            BotCommand("continue", "Resume auto-continue after daily cap"),
             BotCommand("model", "Switch model"),
             BotCommand("usage", "View provider usage"),
             BotCommand("effort", "Set Codex reasoning effort"),
