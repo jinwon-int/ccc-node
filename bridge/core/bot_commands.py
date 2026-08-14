@@ -38,6 +38,10 @@ from telegram_bot.core.external_wait import (
     ExternalWaitRegistry,
     default_registry_path as external_wait_registry_path,
 )
+from telegram_bot.core.continuation import (
+    ContinuationQueue,
+    default_queue_path as continuation_queue_path,
+)
 from telegram_bot.core.agent_runtime import (
     JsonValue as AgentJsonValue,
     ModelInfo,
@@ -381,6 +385,31 @@ class BotCommandMixin:
         return ExternalWaitRegistry(
             external_wait_registry_path(self._config.bot_data_dir / "external-wait")
         )
+
+    def _continuation_queue(self) -> ContinuationQueue:
+        """Durable continuation queue for /stop + /continue (#1113)."""
+        return ContinuationQueue(
+            continuation_queue_path(self._config.bot_data_dir / "continuation")
+        )
+
+    async def _cmd_continue(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Owner confirmation to keep auto-continuing past the daily tripwire."""
+        if not await self._check_access(update):
+            return
+        user_id = self._require_user(update).id
+        message = self._require_message(update)
+        chat = self._require_chat(update)
+        log_debug(user_id, "command", "/continue")
+        repended = self._continuation_queue().repend_cap_holds(user_id, chat.id)
+        if repended:
+            reply = (
+                f"▶️ Resumed {len(repended)} queued continuation(s) — "
+                "auto-continue re-armed for today."
+            )
+        else:
+            reply = "ℹ️ No continuations waiting on the daily cap."
+        await message.reply_text(reply)
+        log_debug(user_id, "bot", reply)
 
     @staticmethod
     def _render_waits(records: list) -> str:
@@ -1254,6 +1283,23 @@ class BotCommandMixin:
 
         # Cancel any ongoing streaming in this Telegram conversation
         await self._cancel_user_streaming(user_id, chat.id)
+
+        # User intent wins over queued autonomous continuations (#1113): /stop
+        # drops the pending bundle too, and marks the in-flight one cancelled
+        # so the monitor never miscounts a user stop as a turn failure.
+        try:
+            continuations_cancelled = self._continuation_queue().cancel_for(
+                user_id, chat.id, include_running=True
+            )
+        except Exception:
+            continuations_cancelled = []
+            logger.warning("Continuation cancel on /stop failed", exc_info=True)
+        if continuations_cancelled:
+            logger.info(
+                "Cancelled %s queued continuation(s) for user %s on /stop",
+                len(continuations_cancelled),
+                user_id,
+            )
 
         # Cancel the currently executing task (priority stop)
         active_task = self._tasks.active(conversation_key) or self._tasks.active(user_id)
