@@ -63,6 +63,34 @@ def test_register_binds_the_route_and_prints_continuation_id(
     assert record["state"] == "pending"
 
 
+def test_queue_home_defaults_to_external_wait_sibling(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    external_wait_home = tmp_path / "private-data" / "external-wait"
+    monkeypatch.delenv("CCC_CONTINUATION_HOME", raising=False)
+    monkeypatch.setenv("CCC_EXTERNAL_WAIT_HOME", str(external_wait_home))
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    monkeypatch.chdir(checkout)
+    publish_active_turn(
+        external_wait_home,
+        user_id=7,
+        chat_id=70,
+        session_id="sess-1",
+    )
+
+    assert continuation_cli.main(_register_args()) == 0
+
+    payload = json.loads(capsys.readouterr().out.strip())
+    queue = ContinuationQueue(
+        default_queue_path(external_wait_home.parent / "continuation")
+    )
+    assert queue.get(payload["continuation_id"])["state"] == "pending"
+    assert not (checkout / ".telegram_bot").exists()
+
+
 def test_second_registration_replaces_the_pending_one(
     home: Path, capsys: pytest.CaptureFixture
 ) -> None:

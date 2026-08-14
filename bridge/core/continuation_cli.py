@@ -45,6 +45,9 @@ def _home() -> Path:
     override = os.environ.get("CCC_CONTINUATION_HOME", "").strip()
     if override:
         return Path(override)
+    external_wait_home = os.environ.get("CCC_EXTERNAL_WAIT_HOME", "").strip()
+    if external_wait_home:
+        return Path(external_wait_home).parent / "continuation"
     return Path.cwd() / ".telegram_bot" / "continuation"
 
 
