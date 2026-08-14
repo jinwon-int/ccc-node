@@ -513,8 +513,6 @@ async def test_resume_turn_binds_the_canonical_conversation_session(tmp_path: Pa
     on" while the ledger still marked the wake done. Chained CI waits were
     dropped structurally: PR #813 sat green and approved for ~3 hours.
     """
-    from telegram_bot.core import bot_lifecycle
-
     calls: list[dict] = []
 
     class FakeProjectChat:
@@ -523,18 +521,16 @@ async def test_resume_turn_binds_the_canonical_conversation_session(tmp_path: Pa
             return type("R", (), {"success": True, "content": "done"})()
 
     class FakeBot:
-        async def send_message(self, chat_id: int, text: str) -> None:
+        async def send_message(self, chat_id: int, text: str, **kwargs) -> None:
             return None
 
-    lifecycle = bot_lifecycle.BotLifecycleMixin()
-    lifecycle._config = SimpleNamespace(  # type: ignore[assignment]
-        bot_data_dir=tmp_path, project_root=str(tmp_path)
-    )
-    lifecycle._session_manager = SimpleNamespace(  # type: ignore[assignment]
+    # The production bot composes lifecycle + delivery; the resume path sends
+    # through the chunked delivery helper (#1109), so the test bot needs both.
+    lifecycle = _lifecycle_for_delivery(tmp_path, FakeBot())
+    lifecycle._project_chat = FakeProjectChat()  # type: ignore[attr-defined]
+    lifecycle._session_manager = SimpleNamespace(  # type: ignore[attr-defined]
         get_session=lambda user_id: _session_of({"session_id": "canonical-session"})
     )
-    lifecycle._project_chat = FakeProjectChat()  # type: ignore[assignment]
-    lifecycle.application = SimpleNamespace(bot=FakeBot())
 
     monitor = lifecycle._build_external_wait_monitor()
     assert monitor is not None
@@ -572,3 +568,135 @@ def test_skipped_notification_names_the_reason() -> None:
     assert "Continuing automatically." not in text
     unknown = wake_notification_text(record, resumed=False, skip_reason="something-new")
     assert "NOT continued" in unknown
+
+
+# ---------------------------------------------------------------------------
+# Lifecycle-built callbacks: chunked delivery + failure journal (#1109)
+# ---------------------------------------------------------------------------
+
+
+def _lifecycle_for_delivery(tmp_path: Path, bot) -> object:
+    """Lifecycle mixin wired like the composed bot, with a fake Telegram bot."""
+    from telegram_bot.core import bot_delivery, bot_lifecycle
+
+    class _LifecycleWithDelivery(
+        bot_lifecycle.BotLifecycleMixin, bot_delivery.BotDeliveryMixin
+    ):
+        pass
+
+    lifecycle = _LifecycleWithDelivery()
+    lifecycle._config = SimpleNamespace(  # type: ignore[assignment]
+        bot_data_dir=tmp_path, project_root=str(tmp_path)
+    )
+    lifecycle._session_manager = SimpleNamespace(  # type: ignore[assignment]
+        get_session=lambda user_id: _session_of({"session_id": "sess-1"})
+    )
+    lifecycle._project_chat = SimpleNamespace()  # type: ignore[assignment]
+    lifecycle.application = SimpleNamespace(bot=bot)
+    return lifecycle
+
+
+@pytest.mark.anyio
+async def test_lifecycle_notify_splits_long_text_into_chunks(tmp_path: Path) -> None:
+    """A 5,000-char wake notification is delivered as 2+ chunks (#1109).
+
+    The raw ``bot.send_message`` path dropped the whole notification past the
+    Telegram size limit; the shared chunked path splits it instead.
+    """
+    sent: list[dict] = []
+
+    class FakeBot:
+        async def send_message(self, chat_id: int, text: str, **kwargs) -> None:
+            sent.append({"chat_id": chat_id, "text": text})
+
+    lifecycle = _lifecycle_for_delivery(tmp_path, FakeBot())
+    monitor = lifecycle._build_external_wait_monitor()  # type: ignore[attr-defined]
+    assert monitor is not None
+
+    delivered = await monitor._notifier(70, "x" * 5000)
+
+    assert delivered is True
+    assert len(sent) >= 2
+    assert all(len(chunk["text"]) <= 4096 for chunk in sent)
+    assert sum(len(chunk["text"]) for chunk in sent) >= 5000
+
+
+@pytest.mark.anyio
+async def test_lifecycle_notify_retries_once_then_reports_failure(
+    tmp_path: Path,
+) -> None:
+    import telegram.error
+
+    attempts: list[int] = []
+
+    class FailingBot:
+        async def send_message(self, chat_id: int, text: str, **kwargs) -> None:
+            attempts.append(chat_id)
+            raise telegram.error.BadRequest("can't parse entities")
+
+    lifecycle = _lifecycle_for_delivery(tmp_path, FailingBot())
+    monitor = lifecycle._build_external_wait_monitor()  # type: ignore[attr-defined]
+    assert monitor is not None
+
+    delivered = await monitor._notifier(70, "wake up")
+
+    assert delivered is False
+    # One retry after the first failure: at least two send attempts.
+    assert len(attempts) >= 2
+
+
+@pytest.mark.anyio
+async def test_lifecycle_resume_delivery_failure_is_journaled_on_the_record(
+    tmp_path: Path,
+) -> None:
+    """Final resume-delivery failure stamps delivery_failed on the wait (#1109).
+
+    Regression: 2026-08-14 10:29 KST seoseo journal — ``External-wait resume
+    delivery failed: BadRequest`` left the owner with no message and no durable
+    trace of why.
+    """
+    import telegram.error
+
+    attempts: list[int] = []
+
+    class FailingBot:
+        async def send_message(self, chat_id: int, text: str, **kwargs) -> None:
+            attempts.append(chat_id)
+            raise telegram.error.BadRequest("message is too long")
+
+    class FakeProjectChat:
+        async def process_message(self, prompt, user_id, chat_id, **kwargs):
+            return SimpleNamespace(success=True, content="turn output")
+
+    lifecycle = _lifecycle_for_delivery(tmp_path, FailingBot())
+    lifecycle._project_chat = FakeProjectChat()  # type: ignore[attr-defined]
+    monitor = lifecycle._build_external_wait_monitor()  # type: ignore[attr-defined]
+    assert monitor is not None
+
+    # The lifecycle closure's registry resolves under bot_data_dir/external-wait.
+    registry = ExternalWaitRegistry(default_registry_path(tmp_path / "external-wait"))
+    wait_id = registry.register(
+        repo="jinwon-int/ccc-node",
+        pr_number=259,
+        head_sha="abc1234",
+        user_id=7,
+        chat_id=70,
+        session_id="sess-1",
+        summary="watch CI",
+        timeout_seconds=100_000,
+        poll_interval_seconds=30,
+    )
+
+    record = {
+        "wait_id": wait_id,
+        "user_id": 7,
+        "chat_id": 70,
+        "session_id": "sess-1",
+    }
+    ok = await monitor._resumer(record, "resume prompt")
+
+    assert ok is False
+    assert len(attempts) >= 2  # retried once before giving up
+    stored = registry._read()[wait_id]
+    assert stored["delivery_failed"]["reason"] == "BadRequest"
+    assert stored["delivery_failed"]["at"]
