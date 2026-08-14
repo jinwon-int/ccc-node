@@ -99,6 +99,7 @@ class HealthSignals:
     session_guard_evictions: int = 0
     runtime_recycles: int = 0
     codex_attachments: int = 0
+    orphan_tool_loop_recent: int = 0
 
     def as_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -113,6 +114,7 @@ class AlertThresholds:
     heartbeat_age_factor: float = 1.0
     max_pending_notifications: int = 10
     max_orphan_children: int = 1
+    max_orphan_tool_loop: int = 10
 
 
 @dataclass(frozen=True)
@@ -161,6 +163,17 @@ def evaluate_alerts(signals: HealthSignals, thresholds: AlertThresholds) -> list
                 message=(
                     f"{signals.dropped_notifications} background notification(s) "
                     "were quarantined as unrecoverable."
+                ),
+            )
+        )
+    if signals.orphan_tool_loop_recent >= max(1, thresholds.max_orphan_tool_loop):
+        alerts.append(
+            Alert(
+                code="orphan_tool_loop",
+                message=(
+                    f"{signals.orphan_tool_loop_recent} 'Custom tool call output "
+                    "is missing' stderr lines in 5 min — the engine is stuck "
+                    "in an orphan tool-call loop."
                 ),
             )
         )
@@ -292,6 +305,14 @@ class HealthProbe:
         except Exception:
             resources = {}
 
+        orphan_tool_loop_recent = 0
+        try:
+            from telegram_bot.core.turn_stall import orphan_tool_loop_tracker
+
+            orphan_tool_loop_recent = orphan_tool_loop_tracker.recent_count(now=now)
+        except Exception:
+            orphan_tool_loop_recent = 0
+
         return HealthSignals(
             active_requests=int(active_requests),
             waiting_for_turn=max(0, waiting_for_turn),
@@ -306,4 +327,5 @@ class HealthProbe:
             session_guard_evictions=max(0, int(resources.get("evictions", 0))),
             runtime_recycles=max(0, int(resources.get("runtime_recycles", 0))),
             codex_attachments=max(0, int(resources.get("codex_attachments", 0))),
+            orphan_tool_loop_recent=max(0, int(orphan_tool_loop_recent)),
         )
