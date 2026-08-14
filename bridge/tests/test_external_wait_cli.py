@@ -216,3 +216,121 @@ def test_register_fails_closed_with_ambiguous_routes(
 
     assert rc == 3
     assert json.loads(capsys.readouterr().out.strip())["ok"] is False
+
+
+# ---------------------------------------------------------------------------
+# Stale-head supersede on registration (#1110)
+# ---------------------------------------------------------------------------
+
+
+def _wait_ids(home: Path) -> dict[str, dict]:
+    registry = ExternalWaitRegistry(default_registry_path(home))
+    return {rec["wait_id"]: rec for rec in registry.records()}
+
+
+def test_register_supersedes_this_conversations_other_head_waits(
+    home: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """A pushed head must not leave the old watch alive to fire stale results."""
+    _publish(home)
+    first = json.loads(
+        (lambda rc: capsys.readouterr().out.strip())(
+            external_wait_cli.main(_register_args(head_sha="a" * 40))
+        )
+    )
+
+    second = json.loads(
+        (lambda rc: capsys.readouterr().out.strip())(
+            external_wait_cli.main(_register_args(head_sha="b" * 40))
+        )
+    )
+
+    assert second["ok"] is True
+    assert second["superseded"] == [first["wait_id"]]
+    records = _wait_ids(home)
+    old = records[first["wait_id"]]
+    assert old["state"] == "superseded"
+    # The journal is preserved (audit), but the wait leaves the poll set and
+    # its wake can never resume the conversation (non-terminal rollup).
+    assert old["wake"] is not None
+    assert old["head_sha"] == "a" * 40
+    new = records[second["wait_id"]]
+    assert new["state"] == "monitoring"
+    due_ids = {
+        rec["wait_id"]
+        for rec in ExternalWaitRegistry(default_registry_path(home)).due(now=10**12)
+    }
+    assert first["wait_id"] not in due_ids
+    assert second["wait_id"] in due_ids
+
+
+def test_register_keep_previous_leaves_other_head_waits_monitoring(
+    home: Path, capsys: pytest.CaptureFixture
+) -> None:
+    _publish(home)
+    first = json.loads(
+        (lambda rc: capsys.readouterr().out.strip())(
+            external_wait_cli.main(_register_args(head_sha="a" * 40))
+        )
+    )
+
+    second = json.loads(
+        (lambda rc: capsys.readouterr().out.strip())(
+            external_wait_cli.main(_register_args(head_sha="b" * 40, keep_previous="1"))
+        )
+    )
+
+    assert second["superseded"] == []
+    records = _wait_ids(home)
+    assert records[first["wait_id"]]["state"] == "monitoring"
+    assert records[second["wait_id"]]["state"] == "monitoring"
+
+
+def test_reregistering_the_same_head_supersedes_nothing(
+    home: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """Idempotent re-registration must never supersede itself (#1110 guard)."""
+    _publish(home)
+    first = json.loads(
+        (lambda rc: capsys.readouterr().out.strip())(
+            external_wait_cli.main(_register_args(head_sha="a" * 40))
+        )
+    )
+    second = json.loads(
+        (lambda rc: capsys.readouterr().out.strip())(
+            external_wait_cli.main(_register_args(head_sha="a" * 40))
+        )
+    )
+
+    assert first["wait_id"] == second["wait_id"]
+    assert second["superseded"] == []
+    assert _wait_ids(home)[first["wait_id"]]["state"] == "monitoring"
+
+
+def test_register_never_supersedes_another_conversations_wait(
+    home: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """Supersede is scoped to the registering conversation (#1110 guard)."""
+    _publish(home)  # user 7 / chat 70
+    registry = ExternalWaitRegistry(default_registry_path(home))
+    other_id = registry.register(
+        repo="jinwon-int/ccc-node",
+        pr_number=123,
+        head_sha="c" * 40,
+        user_id=9,
+        chat_id=90,
+        session_id="sess-other",
+        summary="another conversation's watch",
+        timeout_seconds=600,
+        poll_interval_seconds=30,
+    )
+
+    payload = json.loads(
+        (lambda rc: capsys.readouterr().out.strip())(
+            external_wait_cli.main(_register_args(head_sha="b" * 40))
+        )
+    )
+
+    assert payload["ok"] is True
+    assert payload["superseded"] == []
+    assert _wait_ids(home)[other_id]["state"] == "monitoring"

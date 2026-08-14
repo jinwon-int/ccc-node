@@ -12,8 +12,16 @@ Usage (inside an agent turn)::
     python -m telegram_bot.core.external_wait_cli register \
         --repo owner/name --pr 123 --head-sha abc1234 \
         --summary "merge when green"
+    python -m telegram_bot.core.external_wait_cli register \
+        --repo owner/name --pr 123 --head-sha def5678 \
+        --summary "merge when green" --keep-previous 1
     python -m telegram_bot.core.external_wait_cli list
     python -m telegram_bot.core.external_wait_cli cancel <wait_id>
+
+A new registration for the same PR at a different head supersedes this
+conversation's older pending waits for that PR (#1110): a stale head must
+never wake the session with an outdated rollup. ``--keep-previous`` keeps
+the older watches when watching two heads is genuinely intended.
 
 Exit codes: 0 ok · 2 validation/usage · 3 route unavailable · 4 registry error.
 Output is one compact JSON object per line, body-free by contract.
@@ -29,6 +37,8 @@ from pathlib import Path
 from typing import Any, Optional, Sequence
 
 from telegram_bot.core.external_wait import (
+    STATE_MONITORING,
+    TERMINAL_SUPERSEDED,
     ExternalWaitRegistry,
     ExternalWaitValidationError,
     default_registry_path,
@@ -117,6 +127,55 @@ def _parse_args(argv: Sequence[str]) -> dict[str, Any]:
     return args
 
 
+def _truthy(value: Any) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _supersede_stale_waits(
+    registry: ExternalWaitRegistry,
+    *,
+    repo: str,
+    pr_number: int,
+    user_id: int,
+    chat_id: int,
+    head_sha: str,
+) -> list[str]:
+    """Terminal-supersede this conversation's other-head waits for the PR.
+
+    Every push moves the PR head, but registering the new watch used to leave
+    the old ones monitoring: each later fired its *stale* terminal rollup and
+    resumed the conversation with an outdated head (2026-08-14: five stacked
+    waits v3~v6 for one PR). Superseding mirrors the monitor's own moved-head
+    terminal path — record and wake journal are preserved, the wait just
+    stops polling and never resumes.
+
+    Scoped to the same conversation and PR: another conversation's watch is
+    never touched. A record already watching the new head (including a legacy
+    short-SHA prefix of it) is left alone, so an idempotent re-registration
+    never supersedes itself.
+    """
+    superseded: list[str] = []
+    for rec in registry.records():
+        if rec.get("state") != STATE_MONITORING:
+            continue
+        if str(rec.get("repo") or "") != repo:
+            continue
+        if int(rec.get("pr_number") or 0) != pr_number:
+            continue
+        if (
+            int(rec.get("user_id") or 0) != user_id
+            or int(rec.get("chat_id") or 0) != chat_id
+        ):
+            continue
+        recorded = str(rec.get("head_sha") or "")
+        if recorded == head_sha or (recorded and head_sha.startswith(recorded)):
+            continue
+        wait_id = str(rec.get("wait_id") or "")
+        if registry.finish(wait_id, TERMINAL_SUPERSEDED):
+            superseded.append(wait_id)
+    return superseded
+
+
 def _cmd_register(home: Path, args: dict[str, Any]) -> int:
     route = resolve_active_route(home)
     if route is None:
@@ -159,6 +218,16 @@ def _cmd_register(home: Path, args: dict[str, Any]) -> int:
     if not wait_id:
         _emit({"ok": False, "code": "registry-error"})
         return RC_REGISTRY_ERROR
+    superseded: list[str] = []
+    if not _truthy(args.get("keep_previous")):
+        superseded = _supersede_stale_waits(
+            registry,
+            repo=repo,
+            pr_number=pr_number,
+            user_id=int(route["user_id"]),
+            chat_id=int(route["chat_id"]),
+            head_sha=head_sha,
+        )
     _emit(
         {
             "ok": True,
@@ -167,6 +236,7 @@ def _cmd_register(home: Path, args: dict[str, Any]) -> int:
             "pr": pr_number,
             "head_sha": head_sha,
             "timeout_seconds": int(timeout),
+            "superseded": superseded,
             "message": (
                 f"watching GitHub checks; conversation resumes on terminal "
                 f"state (wait_id={wait_id})"
