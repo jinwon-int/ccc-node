@@ -252,15 +252,37 @@ sanitize_termux_env() {
 
 # The env-validation subcommands are pure delegations to the Python harness.
 # We `exec` so the caller sees the harness's own rc + output; no set-flag
-# surprises.  We call PYTHON_HARNESS directly (relying on its shebang) so
-# tests can substitute a bash mock via A2A_PYTHON_HARNESS.
-cmd_check()         { exec "$PYTHON_HARNESS" check         --env-file "$1"; }
-cmd_print_command() { exec "$PYTHON_HARNESS" print-command --env-file "$1"; }
-cmd_run()           { sanitize_termux_env; exec "$PYTHON_HARNESS" run --env-file "$1"; }
+# surprises.
+#
+# harness_exec dispatches on whether A2A_PYTHON_HARNESS was overridden:
+#   - unset (canonical production path): PYTHON_HARNESS is the checked-in
+#     a2a_termux_native_worker.py.  We invoke it via an explicit `python3`
+#     rather than relying on its shebang, because an absolute `env` shebang
+#     path is not portable across OSes — Termux's real filesystem root has
+#     no /usr, so `#!/usr/bin/env python3` fails there (exit 126, "bad
+#     interpreter"), while a Termux-prefixed shebang fails the same way on
+#     every non-Termux box (standard Linux/CI/macOS). `python3` resolved
+#     via PATH works on both.
+#   - set (unit tests substituting a bash mock via A2A_PYTHON_HARNESS): exec
+#     it directly so the mock's own shebang picks its interpreter.
+harness_exec() {
+    if [[ -n "${A2A_PYTHON_HARNESS:-}" ]]; then
+        exec "$PYTHON_HARNESS" "$@"
+    else
+        exec python3 "$PYTHON_HARNESS" "$@"
+    fi
+}
+cmd_check()         { harness_exec check         --env-file "$1"; }
+cmd_print_command() { harness_exec print-command --env-file "$1"; }
+cmd_run()           { sanitize_termux_env; harness_exec run --env-file "$1"; }
 
 # Internal helper for supervise: validate without exec-replacing our shell.
 validate_env() {
-    "$PYTHON_HARNESS" check --env-file "$1" >/dev/null || {
+    if [[ -n "${A2A_PYTHON_HARNESS:-}" ]]; then
+        "$PYTHON_HARNESS" check --env-file "$1" >/dev/null
+    else
+        python3 "$PYTHON_HARNESS" check --env-file "$1" >/dev/null
+    fi || {
         log "env validation failed for $1"
         return 2
     }
@@ -345,7 +367,7 @@ cmd_supervise() {
         # worker.js can't extend the singleton lock beyond the supervisor.
         # We call the Python harness directly here (not `cmd_run`) so we can
         # background it — `cmd_run`'s exec would replace this shell.
-        ( exec 200>&-; exec "$PYTHON_HARNESS" run --env-file "$env_file" ) &
+        ( exec 200>&-; harness_exec run --env-file "$env_file" ) &
         worker_pid=$!
         wait "$worker_pid"
         local rc=$?

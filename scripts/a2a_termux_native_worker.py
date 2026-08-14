@@ -1,4 +1,4 @@
-#!/data/data/com.termux/files/usr/bin/env python3
+#!/usr/bin/env python3
 """Safe launcher/checker for the Termux native A2A worker slice.
 
 The mobile worker should run a2a-broker-worker/dist/worker.js under the
