@@ -110,6 +110,21 @@
       "pattern": "claude/skills/nclex-multi-pr-pre-flight-gate-validation/**",
       "compatibility": "claude-only",
       "reason": "Claude-side pre-flight triage for jinwon-int/nclex PRs; feeds the Claude-only nclex-a2a-content-pipeline lane and relies on Claude skill auto-matching"
+    },
+    {
+      "pattern": "claude/skills/bilingual-terminology-review-gate/**",
+      "compatibility": "claude-only",
+      "reason": "Claude A2A worker review lane procedure (metadata type claude); codex bridge runs its own lane prompts"
+    },
+    {
+      "pattern": "claude/skills/ghost-process-cleanup-and-verification/**",
+      "compatibility": "claude-only",
+      "reason": "generic shell procedure authored for Claude skill matching; codex mirror candidate, none exists yet"
+    },
+    {
+      "pattern": "claude/skills/nclex-a2a-content-pipeline/**",
+      "compatibility": "claude-only",
+      "reason": "Claude session A2A dispatch orchestration (a2a-dispatch-round manifests, receipt projection); no codex mirror yet"
     }
   ],
   "managed_skills": [
