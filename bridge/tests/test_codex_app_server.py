@@ -83,6 +83,7 @@ class _SilentWriter(FakeWriter):
 class FakeProcess:
     def __init__(self, *, ignore_terminate: bool = False) -> None:
         self.stdout = asyncio.StreamReader()
+        self.stderr = asyncio.StreamReader()
         self.stdin = FakeWriter(self.stdout)
         self.returncode: int | None = None
         self.terminate_calls = 0
@@ -95,11 +96,13 @@ class FakeProcess:
         if self.ignore_terminate:
             return
         self.stdout.feed_eof()
+        self.stderr.feed_eof()
         self.exit(0)
 
     def kill(self) -> None:
         self.kill_calls += 1
         self.stdout.feed_eof()
+        self.stderr.feed_eof()
         self.exit(-9)
 
     def exit(self, returncode: int) -> None:
@@ -463,6 +466,7 @@ class CodexAppServerTests(unittest.IsolatedAsyncioTestCase):
             assert spawn_kwargs == {
                 "stdin": asyncio.subprocess.PIPE,
                 "stdout": asyncio.subprocess.PIPE,
+                "stderr": asyncio.subprocess.PIPE,
                 "limit": STDOUT_BUFFER_LIMIT,
             }
             # Regression: the stdout buffer must exceed asyncio's 64 KiB default
@@ -765,4 +769,59 @@ class CodexAppServerTests(unittest.IsolatedAsyncioTestCase):
 
         with pytest.raises(CodexConnectionClosedError, match="status 7"):
             await asyncio.wait_for(pending, timeout=0.2)
+        await client.close()
+
+
+
+class CodexAppServerStderrTests(unittest.IsolatedAsyncioTestCase):
+    """stderr drain: journal forwarding + orphan-loop counting (#1112)."""
+
+    async def test_stderr_lines_feed_the_orphan_loop_tracker(self) -> None:
+        from telegram_bot.core import codex_app_server, turn_stall
+        from telegram_bot.core.turn_stall import OrphanLoopTracker
+
+        # Swap in an isolated tracker so the process-wide one stays untouched.
+        tracker = OrphanLoopTracker()
+        original = turn_stall.orphan_tool_loop_tracker
+        turn_stall.orphan_tool_loop_tracker = tracker
+        # The client module imported the tracker by value; rebind there too.
+        codex_app_server.orphan_tool_loop_tracker = tracker
+        try:
+            process = FakeProcess()
+
+            async def factory() -> FakeProcess:
+                return process
+
+            client = CodexAppServerClient(process_factory=factory)
+            await client.start()
+
+            process.stderr.feed_data(
+                b"ERROR Custom tool call output is missing for call abc\n"
+            )
+            process.stderr.feed_data(b"ordinary warning line\n")
+            for _ in range(20):
+                await asyncio.sleep(0.01)
+                if tracker.recent_count() >= 1:
+                    break
+            assert tracker.recent_count() == 1
+
+            await client.close()
+        finally:
+            turn_stall.orphan_tool_loop_tracker = original
+            codex_app_server.orphan_tool_loop_tracker = original
+
+    async def test_process_exited_reports_confirmed_death_only(self) -> None:
+        process = FakeProcess()
+
+        async def factory() -> FakeProcess:
+            return process
+
+        client = CodexAppServerClient(process_factory=factory)
+        assert client.process_exited() is None  # no process yet: ambiguous
+
+        await client.start()
+        assert client.process_exited() is False  # running
+
+        process.exit(0)
+        assert client.process_exited() is True  # confirmed dead
         await client.close()

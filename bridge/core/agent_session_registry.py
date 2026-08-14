@@ -301,7 +301,19 @@ class AgentSessionRegistry:
     ) -> bool:
         record = self._records.get(token.key)
         active = record.active if record is not None else None
-        if record is None or active is None or active.token != token:
+        if record is None or active is None:
+            # Benign double-deactivate: the turn was already closed — e.g.
+            # /stop deactivates first, then the turn's own finally runs
+            # (#1112). This is NOT the #860 race (a *different* live token),
+            # so it must not spam a scary WARNING on every user stop.
+            logger.debug(
+                "Deactivate skipped: turn already closed (user=%s, chat=%s, token=%s)",
+                token.key[0],
+                token.key[1] if len(token.key) > 1 else None,
+                token,
+            )
+            return False
+        if active.token != token:
             # Per #860: log deactivate failure with diagnostic details.
             # This helps identify zombie requests that fail to clean up.
             user_id = token.key[0]

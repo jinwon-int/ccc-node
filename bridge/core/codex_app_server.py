@@ -4,9 +4,15 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import weakref
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Literal, Protocol, TypeAlias, cast
+
+from telegram_bot.core.turn_stall import orphan_tool_loop_tracker
+
+logger = logging.getLogger(__name__)
 
 JsonValue: TypeAlias = None | bool | int | float | str | list["JsonValue"] | dict[str, "JsonValue"]
 JsonObject: TypeAlias = dict[str, JsonValue]
@@ -19,6 +25,18 @@ JsonRpcId: TypeAlias = int | str
 # ``CodexConnectionClosedError``. Raise the stdout buffer so oversized frames are
 # read whole instead of tearing down the connection.
 STDOUT_BUFFER_LIMIT = 16 * 1024 * 1024  # 16 MiB
+
+
+# Clients with a successfully started transport, for liveness probes (#1112).
+# Weak, so a leaked client reference never pins the object; membership ends on
+# close(). A registered client whose process exited is exactly what the stall
+# probe needs to see.
+_LIVE_CLIENTS: weakref.WeakSet = weakref.WeakSet()
+
+
+def live_app_server_clients() -> list:
+    """Snapshot of started app-server clients (liveness probes, #1112)."""
+    return list(_LIVE_CLIENTS)
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,6 +78,9 @@ class AsyncWriter(Protocol):
 class AppServerProcess(Protocol):
     @property
     def stdout(self) -> AsyncLineReader | None: ...
+
+    @property
+    def stderr(self) -> AsyncLineReader | None: ...
 
     @property
     def stdin(self) -> AsyncWriter | None: ...
@@ -168,6 +189,7 @@ class CodexAppServerClient:
         self._start_lock = asyncio.Lock()
         self._write_lock = asyncio.Lock()
         self._reader_task: asyncio.Task[None] | None = None
+        self._stderr_task: asyncio.Task[None] | None = None
         self._process_task: asyncio.Task[None] | None = None
         self._server_request_tasks: set[asyncio.Task[None]] = set()
         self._closed = False
@@ -200,6 +222,8 @@ class CodexAppServerClient:
                 self._reader = self._process.stdout
                 self._writer = self._process.stdin
                 self._process_task = asyncio.create_task(self._watch_process())
+                if self._process.stderr is not None:
+                    self._stderr_task = asyncio.create_task(self._read_stderr())
             if self._reader_task is None:
                 self._reader_task = asyncio.create_task(self._read_stdout())
             try:
@@ -234,6 +258,7 @@ class CodexAppServerClient:
                 raise
             self._initialize_result = result
             self._started = True
+            _LIVE_CLIENTS.add(self)
             return result
 
     async def request(self, method: str, params: Mapping[str, JsonValue] | None = None) -> JsonValue:
@@ -473,6 +498,7 @@ class CodexAppServerClient:
         if self._closed:
             return
         self._closed = True
+        _LIVE_CLIENTS.discard(self)
         await self._teardown_transport(CodexConnectionClosedError("client closed"))
 
     async def _teardown_transport(self, pending_error: BaseException) -> None:
@@ -501,6 +527,10 @@ class CodexAppServerClient:
             self._reader_task.cancel()
             await asyncio.gather(self._reader_task, return_exceptions=True)
             self._reader_task = None
+        if self._stderr_task is not None:
+            self._stderr_task.cancel()
+            await asyncio.gather(self._stderr_task, return_exceptions=True)
+            self._stderr_task = None
 
         if self._writer is not None:
             self._writer.close()
@@ -548,6 +578,7 @@ class CodexAppServerClient:
                 *arguments,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
                 limit=STDOUT_BUFFER_LIMIT,
             )
         else:
@@ -555,6 +586,7 @@ class CodexAppServerClient:
                 *arguments,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
                 limit=STDOUT_BUFFER_LIMIT,
                 env=dict(self._process_environment),
             )
@@ -578,6 +610,42 @@ class CodexAppServerClient:
                     f"app-server process exited with status {returncode}"
                 )
             )
+
+    async def _read_stderr(self) -> None:
+        """Drain app-server stderr: forward to the journal, count orphan loops.
+
+        The pipe must keep draining — a full stderr pipe would block the
+        engine (the very stall #1112 probes for). Lines are forwarded at INFO
+        so journal visibility is preserved; the orphan tool-call pattern is
+        counted for the health probe.
+        """
+        process = cast(AppServerProcess, self._process)
+        reader = process.stderr
+        if reader is None:
+            return
+        try:
+            while line := await reader.readline():
+                text = line.decode("utf-8", "replace").rstrip()
+                if not text:
+                    continue
+                logger.info("codex app-server stderr: %s", text)
+                orphan_tool_loop_tracker.record_line(text)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("app-server stderr reader stopped: %s", exc)
+
+    def process_exited(self) -> bool | None:
+        """Liveness for the stall probe (#1112).
+
+        True: the spawned process is confirmed exited. False: still running.
+        None: no process right now (not started / transport discarded) —
+        an ambiguous state a probe must not treat as death.
+        """
+        process = self._process
+        if process is None:
+            return None
+        return process.returncode is not None
 
     async def _write(self, message: JsonObject) -> None:
         writer = cast(AsyncWriter, self._writer)

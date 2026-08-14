@@ -353,6 +353,7 @@ class HealthProbeTests(unittest.IsolatedAsyncioTestCase):
             session_guard_evictions=3,
             runtime_recycles=1,
             codex_attachments=2,
+            orphan_tool_loop_recent=0,
         )
         data = signals.as_dict()
         self.assertEqual(data["oldest_request_age_seconds"], 12)
@@ -366,6 +367,7 @@ class HealthProbeTests(unittest.IsolatedAsyncioTestCase):
                 "dropped_notifications",
                 "oldest_request_age_seconds",
                 "orphan_children",
+                "orphan_tool_loop_recent",
                 "pending_notifications",
                 "request_lifetime_seconds",
                 "resident_sessions",

@@ -49,6 +49,8 @@ from telegram_bot.core.continuation import ContinuationQueue, default_queue_path
 from telegram_bot.core.continuation_monitor import ContinuationMonitor
 from telegram_bot.core.external_wait_monitor import ExternalWaitMonitor, GhCliTransport
 from telegram_bot.core.turn_watchdog import TurnAgeWatchdog
+from telegram_bot.core.codex_app_server import live_app_server_clients
+from telegram_bot.core.turn_stall import StallProbeMonitor
 from telegram_bot.core.usage_meter import MODE_AUTONOMOUS
 from telegram_bot.memory.distill_types import DistillJob
 from telegram_bot.memory.skill_candidate import SkillCandidateStageResult
@@ -797,6 +799,7 @@ class BotLifecycleMixin:
             session_resource_guard_task = None
             restart_receipt_task = None
             turn_age_task = None
+            turn_stall_task = None
             try:
                 await self.application.start()
                 await self.application.updater.start_polling(
@@ -832,6 +835,15 @@ class BotLifecycleMixin:
                         name="turn-age-watchdog",
                     )
                     if turn_age_watchdog is not None
+                    else None
+                )
+                turn_stall_probe = self._build_turn_stall_probe()
+                turn_stall_task = (
+                    asyncio.create_task(
+                        turn_stall_probe.run(stop_event),
+                        name="turn-stall-probe",
+                    )
+                    if turn_stall_probe is not None
                     else None
                 )
                 workload_task = asyncio.create_task(
@@ -1012,6 +1024,7 @@ class BotLifecycleMixin:
                     session_resource_guard_task,
                     restart_receipt_task,
                     turn_age_task,
+                    turn_stall_task,
                     distill_snapshot_task,
                     distill_extraction_task,
                     distill_local_sink_task,
@@ -1534,6 +1547,73 @@ class BotLifecycleMixin:
             notifier=notify,
             threshold_seconds=threshold_min * 60.0,
             renotify_seconds=renotify_min * 60.0,
+        )
+
+    def _build_turn_stall_probe(self):
+        """Silent-death stall probe (#1112); None when off (the default).
+
+        Recovers ONLY on a confirmed-dead engine (spawned process exited).
+        A quiet-but-alive turn is never touched; an ambiguous liveness
+        verdict only logs — never recover on a guess (fail-closed).
+        """
+        probe_min = ExternalWaitMonitor.env_int("CCC_TURN_STALL_PROBE_MIN", default=0)
+        if probe_min <= 0:
+            logger.info("Turn-stall probe disabled (CCC_TURN_STALL_PROBE_MIN=0)")
+            return None
+        application = cast(Application, self.application)
+        registry = getattr(self._project_chat, "_agent_session_registry", None)
+        if registry is None:
+            logger.warning(
+                "Turn-stall probe unavailable: no session registry on project chat"
+            )
+            return None
+
+        def turns_provider():
+            turns = []
+            for handle in registry.active_handles_snapshot():
+                key = handle.token.key
+                if len(key) < 2:
+                    continue
+                session = handle.session
+                thread_id = getattr(session, "id", None) or getattr(
+                    session, "session_id", None
+                )
+                turns.append((int(key[0]), int(key[1]), thread_id, 0.0))
+            return turns
+
+        def liveness() -> str:
+            clients = live_app_server_clients()
+            running = sum(1 for client in clients if client.process_exited() is False)
+            exited = sum(1 for client in clients if client.process_exited() is True)
+            if exited and not running:
+                return "dead"
+            if running:
+                return "alive"
+            return "unknown"
+
+        async def recover() -> None:
+            await recover_dead_session_notifications(
+                application.bot,
+                self._session_manager,
+                self._project_chat,
+                self._project_chat.conversations_dir,
+                wakeup_defer=self._build_dead_session_wakeup_defer(),
+            )
+
+        async def notify(chat_id: int, text: str) -> bool:
+            delivered, _reason = await self._send_external_chunked(chat_id, text)
+            return delivered
+
+        codex_home = os.environ.get("CODEX_HOME", "").strip() or str(
+            FilePath.home() / ".codex"
+        )
+        return StallProbeMonitor(
+            turns_provider=turns_provider,
+            liveness_probe=liveness,
+            recover=recover,
+            notifier=notify,
+            sessions_roots=[FilePath(codex_home)],
+            stall_seconds=probe_min * 60.0,
         )
 
     def _build_dead_session_wakeup_defer(self):
