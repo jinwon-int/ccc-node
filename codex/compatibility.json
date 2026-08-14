@@ -100,6 +100,11 @@
       "pattern": "claude/hooks/**",
       "compatibility": "claude-only",
       "reason": "Claude native lifecycle hooks and hook tests"
+    },
+    {
+      "pattern": "claude/skills/nclex-multi-pr-pre-flight-gate-validation/**",
+      "compatibility": "claude-only",
+      "reason": "Claude-side pre-flight triage for jinwon-int/nclex PRs; feeds the Claude-only nclex-a2a-content-pipeline lane and relies on Claude skill auto-matching"
     }
   ],
   "managed_skills": [
