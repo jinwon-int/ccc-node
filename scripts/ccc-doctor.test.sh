@@ -178,6 +178,19 @@ ok "clean output reports 정상" 'grep -q "정상" <<<"$out"'
 ok "clean output reports standalone mode" 'grep -q "mode.*standalone" <<<"$out"'
 ok "clean output reports harness version" 'grep -q "harness version" <<<"$out"'
 
+# --- continuation state and opt-in visibility (#1113 follow-up) ---------------
+ct="$(make_fixture continuation-state standalone)"
+mkdir -p "$ct/home/.telegram_bot/continuation"
+chmod 775 "$ct/home/.telegram_bot/continuation"
+out="$(CCC_CONTINUATION_ENABLED=true run_doctor "$ct")"; rc=$?
+ok "continuation rejects a group-writable state directory under umask 0002" \
+  '[ "$rc" != 0 ] && grep -q "수동필요.*continuation state.*configured=enabled.*unsafe-mode-0775" <<<"$out"'
+
+chmod 700 "$ct/home/.telegram_bot/continuation"
+out="$(CCC_CONTINUATION_ENABLED=true run_doctor "$ct")"; rc=$?
+ok "continuation reports an enabled owner-only state directory" \
+  '[ "$rc" = 0 ] && grep -q "정상.*continuation state.*configured=enabled.*private-0700" <<<"$out"'
+
 # 2026-08-03 dungae regression: a legacy one-hour process timeout combined
 # with the new two-hour delegated-task default crash-looped the bridge, while
 # doctor called the status merely "readable" and offered no repair boundary.

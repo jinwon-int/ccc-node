@@ -19,6 +19,7 @@ import os
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -412,6 +413,7 @@ class Doctor:
         self.check_bridge_runtime_config()
         self.check_bridge_status()
         self.check_bridge_boot_path()
+        self.check_continuation_state()
         self.check_memory_cache()
         self.check_nunchi_collection()
         self.check_provider_readiness()
@@ -1076,6 +1078,83 @@ class Doctor:
                 f"bridge runs from {running} but no unit declares it",
                 "nothing restarts the bridge on reboot; install the systemd unit if this node should self-start",
             )
+
+    def check_continuation_state(self) -> None:
+        """Report the opt-in baton monitor and its owner-only state directory."""
+
+        project_override = os.environ.get("CCC_DOCTOR_BRIDGE_PROJECT_ROOT")
+        running_root = self.running_bridge_root()
+        same_live_checkout = (
+            running_root is not None
+            and Path(running_root).resolve() == self.repo.resolve()
+        )
+        project_root = Path(
+            project_override
+            or (self.running_bridge_home() if same_live_checkout else None)
+            or self.claude_dir.parent
+        ).expanduser()
+        state_dir = project_root / ".telegram_bot" / "continuation"
+        configured = self.bridge_unit_environment_value(
+            "CCC_CONTINUATION_ENABLED"
+        ) or os.environ.get("CCC_CONTINUATION_ENABLED")
+        enabled = configured is not None and configured.strip().lower() not in {
+            "0",
+            "false",
+            "no",
+            "off",
+        }
+        configuration = "enabled" if enabled else "disabled (opt-in)"
+
+        try:
+            metadata = state_dir.lstat()
+        except FileNotFoundError:
+            self.add(
+                "정상",
+                "continuation state",
+                f"configured={configuration}; state=not-created",
+                "none",
+            )
+            return
+        except OSError:
+            self.add(
+                "수동필요",
+                "continuation state",
+                f"configured={configuration}; state=unreadable",
+                "inspect the bridge continuation state path without exposing queue contents",
+            )
+            return
+
+        mode = stat.S_IMODE(metadata.st_mode)
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+            self.add(
+                "수동필요",
+                "continuation state",
+                f"configured={configuration}; state=unsafe-type",
+                "replace the continuation state path with an owner-only real directory",
+            )
+            return
+        if hasattr(os, "getuid") and metadata.st_uid != os.getuid():
+            self.add(
+                "수동필요",
+                "continuation state",
+                f"configured={configuration}; state=wrong-owner",
+                "restore process ownership before registering or cancelling continuations",
+            )
+            return
+        if mode & 0o022:
+            self.add(
+                "수동필요",
+                "continuation state",
+                f"configured={configuration}; state=unsafe-mode-{mode:04o}",
+                f"chmod 700 {state_dir} and inspect the creator before enabling continuation",
+            )
+            return
+        self.add(
+            "정상",
+            "continuation state",
+            f"configured={configuration}; state=private-{mode:04o}",
+            "none",
+        )
 
     @staticmethod
     def has_systemd() -> bool:
