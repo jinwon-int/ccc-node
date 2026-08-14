@@ -48,6 +48,7 @@ from telegram_bot.core.external_wait import (
 from telegram_bot.core.continuation import ContinuationQueue, default_queue_path
 from telegram_bot.core.continuation_monitor import ContinuationMonitor
 from telegram_bot.core.external_wait_monitor import ExternalWaitMonitor, GhCliTransport
+from telegram_bot.core.turn_watchdog import TurnAgeWatchdog
 from telegram_bot.core.usage_meter import MODE_AUTONOMOUS
 from telegram_bot.memory.distill_types import DistillJob
 from telegram_bot.memory.skill_candidate import SkillCandidateStageResult
@@ -795,6 +796,7 @@ class BotLifecycleMixin:
             health_alerts_task = None
             session_resource_guard_task = None
             restart_receipt_task = None
+            turn_age_task = None
             try:
                 await self.application.start()
                 await self.application.updater.start_polling(
@@ -823,6 +825,15 @@ class BotLifecycleMixin:
                     self._push_notifier.run(self.application, stop_event)
                 )
                 reaper_task = asyncio.create_task(run_periodic_reaper(), name="orphan-reaper")
+                turn_age_watchdog = self._build_turn_age_watchdog()
+                turn_age_task = (
+                    asyncio.create_task(
+                        turn_age_watchdog.run(stop_event),
+                        name="turn-age-watchdog",
+                    )
+                    if turn_age_watchdog is not None
+                    else None
+                )
                 workload_task = asyncio.create_task(
                     self._workload_reporter(stop_event), name="workload-reporter"
                 )
@@ -1000,6 +1011,7 @@ class BotLifecycleMixin:
                     health_alerts_task,
                     session_resource_guard_task,
                     restart_receipt_task,
+                    turn_age_task,
                     distill_snapshot_task,
                     distill_extraction_task,
                     distill_local_sink_task,
@@ -1482,6 +1494,46 @@ class BotLifecycleMixin:
             daily_cap=ExternalWaitMonitor.env_int(
                 "CCC_CONTINUATION_DAILY_CAP", default=20
             ),
+        )
+
+    def _build_turn_age_watchdog(self):
+        """Notify-only turn-age dashboard (#1111); None when off (the default).
+
+        Never interrupts, pauses, or reroutes a turn — pure visibility. Ages
+        come from the session registry's monotonic ``started_at`` stamps.
+        """
+        threshold_min = ExternalWaitMonitor.env_int(
+            "CCC_TURN_AGE_NOTIFY_MIN", default=0
+        )
+        if threshold_min <= 0:
+            logger.info("Turn-age watchdog disabled (CCC_TURN_AGE_NOTIFY_MIN=0)")
+            return None
+        registry = getattr(self._project_chat, "_agent_session_registry", None)
+        if registry is None:
+            logger.warning(
+                "Turn-age watchdog unavailable: no session registry on project chat"
+            )
+            return None
+        renotify_min = ExternalWaitMonitor.env_int(
+            "CCC_TURN_AGE_RENOTIFY_MIN", default=30
+        )
+
+        def turns_provider():
+            return [
+                (int(key[0]), int(key[1]), float(started))
+                for key, started in registry.active_turn_ages()
+                if len(key) >= 2
+            ]
+
+        async def notify(chat_id: int, text: str) -> bool:
+            delivered, _reason = await self._send_external_chunked(chat_id, text)
+            return delivered
+
+        return TurnAgeWatchdog(
+            turns_provider=turns_provider,
+            notifier=notify,
+            threshold_seconds=threshold_min * 60.0,
+            renotify_seconds=renotify_min * 60.0,
         )
 
     def _build_dead_session_wakeup_defer(self):

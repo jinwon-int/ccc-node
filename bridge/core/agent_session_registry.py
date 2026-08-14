@@ -281,6 +281,18 @@ class AgentSessionRegistry:
         active = record.active if record is not None else None
         return active.started_at if active is not None else None
 
+    def active_turn_ages(self) -> tuple[tuple[StreamKey, float], ...]:
+        """(key, started_at) for every active turn — read-only snapshot (#1111).
+
+        ``started_at`` is the same monotonic clock the turn registered with
+        (``loop.time()``), so callers compute age against ``time.monotonic()``.
+        """
+        return tuple(
+            (key, record.active.started_at)
+            for key, record in self._records.items()
+            if record.active is not None
+        )
+
     def deactivate_if_same(
         self,
         token: ActiveToken,
