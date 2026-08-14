@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import stat
 from pathlib import Path
 
 import pytest
@@ -51,6 +53,21 @@ def test_prompt_validation_is_bounded() -> None:
     with pytest.raises(ContinuationValidationError):
         validate_prompt("x" * 4001)
     assert validate_prompt("  many\n\nspaces   here ") == "many spaces here"
+
+
+def test_first_write_creates_private_parent_under_umask_0002(
+    tmp_path: Path,
+) -> None:
+    parent = tmp_path / "continuation"
+    queue = ContinuationQueue(default_queue_path(parent), clock=Clock())
+    previous_umask = os.umask(0o002)
+    try:
+        _register(queue)
+    finally:
+        os.umask(previous_umask)
+
+    assert stat.S_IMODE(parent.stat().st_mode) == 0o700
+    assert stat.S_IMODE((parent / "queue.json").stat().st_mode) == 0o600
 
 
 def test_register_replaces_pending_but_never_the_running_turn(

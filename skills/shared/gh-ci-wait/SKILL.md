@@ -48,6 +48,14 @@ On success the CLI prints `{"ok": true, "wait_id": "..."}`.
   terminal state, and continues with your summary as a bridge-owned
   `external_event` turn.
 
+## After the terminal wake
+
+- The wait resumes exactly one CI-result turn; it does not chain unrelated or
+  subsequent work bundles by itself.
+- Handle the exact-head result named in the event. If more already-authorized
+  work remains afterward, use `$bridge-yield-continue` to register the next
+  bundle before ending the wake turn.
+
 ## If registration fails (rc != 0)
 
 Never claim auto-resume anyway. Either:

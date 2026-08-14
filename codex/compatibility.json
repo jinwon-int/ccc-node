@@ -52,6 +52,11 @@
       "reason": "Claude Agent tool and TaskStop runtime"
     },
     {
+      "pattern": "skills/shared/bridge-yield-continue/**",
+      "compatibility": "adapted",
+      "codex_skill": "bridge-yield-continue"
+    },
+    {
       "pattern": "claude/skills/distill/**",
       "compatibility": "claude-only",
       "reason": "Claude hook and transcript pipeline"
@@ -108,6 +113,10 @@
     }
   ],
   "managed_skills": [
+    {
+      "name": "bridge-yield-continue",
+      "source": "skills/shared/bridge-yield-continue"
+    },
     {
       "name": "ccc-agent-cron",
       "source": "codex/skills/ccc-agent-cron"
