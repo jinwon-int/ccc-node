@@ -16,7 +16,8 @@ description: "Identify, back up, and cleanly remove stale background processes (
    - `crontab -l > crontab-backup-$(date +%Y%m%d-%H%M%S).txt` (for user cron)
    - `sudo crontab -l > crontab-root-backup-$(date +%Y%m%d-%H%M%S).txt` (for root cron)
    - For systemd timers: `systemctl list-timers --all > systemd-timers-backup.txt`
-   - Store backups in a durable location (e.g., `/root/.claude/backups/`)
+   - Store backups in a durable location outside the tree you are editing
+     (e.g., `"${CCC_CLAUDE_DIR:-$HOME/.claude}"/backups/`)
 2. Identify the exact lines or entries to remove using grep, diff, or visual inspection. Confirm which lines match the stale process and which are to be kept.
 3. Remove only the targeted entries. Use precise editing:
    - `crontab -e` and delete the lines manually, or
