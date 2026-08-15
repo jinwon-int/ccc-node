@@ -268,6 +268,62 @@ class CodexManagedSkillsTest(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertIn("catalog_unclassified", result.stderr)
 
+    def git_repo_surface(self) -> Path:
+        """A repo surface that is a real git checkout with a .gitignore.
+
+        copy_repo_surface() alone is a plain directory, which exercises the
+        filesystem-walk fallback; these cases need git's view instead.
+        """
+        repo = self.copy_repo_surface()
+        subprocess.run(
+            ["git", "init", "-q", os.fspath(repo)], check=True, capture_output=True
+        )
+        (repo / ".gitignore").write_text("__pycache__/\n*.pyc\n")
+        return repo
+
+    def test_gitignored_build_output_is_not_counted_as_an_asset(self) -> None:
+        # Running the hooks leaves __pycache__/*.pyc under claude/hooks/. Those
+        # are not repo assets, and CI (a fresh clone) never sees them, so they
+        # must not enter the inventory or local validation answers a different
+        # question than CI does.
+        repo = self.git_repo_surface()
+        baseline = run_tool("validate", repo=repo)
+        self.assertEqual(baseline.returncode, 0, baseline.stderr)
+        before = json.loads(baseline.stdout)["classified_assets"]
+
+        cache = repo / "claude" / "hooks" / "__pycache__"
+        cache.mkdir(parents=True, exist_ok=True)
+        (cache / "example.cpython-313.pyc").write_bytes(b"\x00\x01")
+
+        after = run_tool("validate", repo=repo)
+        self.assertEqual(after.returncode, 0, after.stderr)
+        self.assertEqual(json.loads(after.stdout)["classified_assets"], before)
+
+    def test_untracked_unclassified_file_still_fails_in_a_git_checkout(self) -> None:
+        # The guard on the fix above: enumerating via git must NOT hide a new
+        # asset that has not been `git add`ed yet. Tracked-only enumeration
+        # would turn this immediate local failure into a surprise CI failure
+        # once the commit lands.
+        repo = self.git_repo_surface()
+        (repo / "claude" / "commands" / "unclassified.md").write_text("x\n")
+
+        result = run_tool("validate", repo=repo)
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("catalog_unclassified", result.stderr)
+
+    def test_inventory_falls_back_to_a_walk_without_git(self) -> None:
+        # Tarball installs ship no .git; the walk must still enumerate assets.
+        repo = self.copy_repo_surface()
+        self.assertFalse((repo / ".git").exists())
+
+        self.assertIsNone(CODEX_SKILLS._git_listed_assets(repo))
+        inventory = CODEX_SKILLS._repo_file_inventory(repo)
+
+        self.assertTrue(inventory)
+        self.assertEqual(inventory, sorted(inventory))
+        self.assertTrue(all(not entry.startswith("/") for entry in inventory))
+
     def test_codex_skill_with_claude_only_reference_fails_validation(self) -> None:
         repo = self.copy_repo_surface()
         skill = repo / "codex" / "skills" / "ccc-doctor" / "SKILL.md"
