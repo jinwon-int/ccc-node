@@ -12,6 +12,7 @@ from pathlib import Path
 import re
 import shutil
 import stat
+import subprocess
 import sys
 import tempfile
 import uuid
@@ -76,18 +77,80 @@ def _read_json(path: Path, *, max_bytes: int, error: str) -> dict[str, Any]:
     return value
 
 
-def _repo_file_inventory(repo: Path) -> list[str]:
+def _git_listed_assets(repo: Path) -> list[str] | None:
+    """Ask git which files live under the asset roots, honouring .gitignore.
+
+    Returns None when this is not a usable git checkout so the caller can fall
+    back to a plain filesystem walk (tarball installs ship no .git).
+
+    `--cached --others --exclude-standard` is deliberate: tracked files *plus*
+    untracked-but-not-ignored ones. Tracked-only would hide a brand new skill
+    that has not been `git add`ed yet, turning an immediate local
+    catalog_unclassified into a surprise CI failure after the commit lands.
+    """
+    if not (repo / ".git").exists():
+        return None
+    try:
+        completed = subprocess.run(
+            [
+                "git", "-C", os.fspath(repo), "ls-files", "-z",
+                "--cached", "--others", "--exclude-standard", "--", *_ASSET_ROOTS,
+            ],
+            capture_output=True,
+            check=False,
+        )
+    except (OSError, ValueError):
+        return None
+    if completed.returncode != 0:
+        return None
+    decoded = completed.stdout.decode("utf-8", "surrogateescape")
+    return [entry for entry in decoded.split("\0") if entry]
+
+
+def _walked_assets(repo: Path) -> list[str]:
     inventory: list[str] = []
     for relative_root in _ASSET_ROOTS:
-        root = repo / relative_root
-        if not root.is_dir() or root.is_symlink():
-            raise ContractError("catalog_asset_root_invalid")
-        for path in root.rglob("*"):
+        for path in (repo / relative_root).rglob("*"):
             metadata = path.lstat()
             if stat.S_ISLNK(metadata.st_mode):
                 raise ContractError("catalog_asset_symlink")
             if stat.S_ISREG(metadata.st_mode):
                 inventory.append(path.relative_to(repo).as_posix())
+    return inventory
+
+
+def _repo_file_inventory(repo: Path) -> list[str]:
+    # The asset roots themselves are validated the same way regardless of how
+    # their contents are enumerated.
+    for relative_root in _ASSET_ROOTS:
+        root = repo / relative_root
+        if not root.is_dir() or root.is_symlink():
+            raise ContractError("catalog_asset_root_invalid")
+
+    # Prefer git's view. A filesystem walk counts whatever happens to be on
+    # disk, so build output in a long-lived checkout (e.g. __pycache__/*.pyc
+    # left by running the hooks) becomes an "asset" that must be classified.
+    # CI validates a fresh clone and never sees those files, so the walk makes
+    # local validation answer a different question than CI does — and because
+    # the catalog fails closed, an ignored stray file can hard-block a
+    # developer with catalog_unclassified for a path that is not part of the
+    # repo at all.
+    listed = _git_listed_assets(repo)
+    if listed is None:
+        return sorted(_walked_assets(repo))
+
+    inventory: list[str] = []
+    for relative in listed:
+        path = repo / relative
+        try:
+            metadata = path.lstat()
+        except FileNotFoundError:
+            # Tracked but deleted in the worktree: not an asset that exists.
+            continue
+        if stat.S_ISLNK(metadata.st_mode):
+            raise ContractError("catalog_asset_symlink")
+        if stat.S_ISREG(metadata.st_mode):
+            inventory.append(Path(relative).as_posix())
     return sorted(inventory)
 
 
