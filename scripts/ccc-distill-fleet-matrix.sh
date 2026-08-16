@@ -127,6 +127,7 @@ declare -A CAND    # node -> candidate path
 declare -A URL     # node -> git url
 declare -A COMMIT  # node -> short commit
 declare -A STATUS  # node -> raw status string
+declare -A SEEN    # node -> 1 when an evidence block for it was parsed at all
 
 ingest() {
   local file="$1"
@@ -143,6 +144,11 @@ ingest() {
       extra="${tmp}"
     fi
     [ -z "$name" ] && continue
+    # A parsed block is itself evidence: it means the probe reached this node
+    # and the checker answered. Without recording that, a node present in the
+    # evidence is indistinguishable from one absent from it -- see the
+    # status_val default below.
+    SEEN["$name"]=1
     [ -n "$host" ] && HOST["$name"]="$host"
     # Parse extras. First https://... line wins for URL; first 7-40 hex line for commit.
     # `for field in $extra` relied on word splitting, but the record separator
@@ -204,7 +210,18 @@ for node in "${NODE_ARR[@]}"; do
   url_val="${URL[$node]:-}"
   commit_val="${COMMIT[$node]:-}"
   status_val="${STATUS[$node]:-}"
-  [ -z "$status_val" ] && status_val="no_evidence"
+  # STATUS only ever holds NO_CHECKER_FOUND or UNREACHABLE -- those are the
+  # only two markers ingest() recognises. Everything else arrived here as the
+  # empty string and was flattened to "no_evidence", which collapsed two very
+  # different situations into one: a node absent from the evidence, and a node
+  # whose checker answered cleanly. Since "no_evidence" maps to
+  # checker_available:false, the reported branch of state_for() was
+  # unreachable, so resolve() could never fire and summary.verified stayed
+  # pinned at 0 for a fully converged fleet. #877 added resolve() but not this,
+  # so the defect it fixed was only half fixed. Split the two apart.
+  if [ -z "$status_val" ]; then
+    if [ -n "${SEEN[$node]:-}" ]; then status_val="REPORTED"; else status_val="no_evidence"; fi
+  fi
 
   # Determine mode / checker_available / blocker in jq for clarity.
   obj="$(jq -nc \
@@ -256,7 +273,14 @@ for node in "${NODE_ARR[@]}"; do
       elif $cmp == "behind" then
         {checker_available: true, mode: "reported", verification: "blocked",
          blocker_reason: "probe_commit_behind_target"}
-      else $state
+      else
+        # Reported, but no parseable commit, so convergence cannot be
+        # decided. Blocked rather than pending: only blocked nodes get a
+        # recommended subissue, and a node nobody can verify must stay
+        # visible to the finalizer instead of sitting in a bucket that
+        # produces no action.
+        {checker_available: true, mode: "reported", verification: "blocked",
+         blocker_reason: "probe_commit_missing"}
       end;
     detect_short_c as $c
     | ($c | cmp_to($target_short)) as $cmp
