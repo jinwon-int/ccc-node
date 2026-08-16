@@ -51,9 +51,23 @@ case "$TMO" in
     ;;
 esac
 
-OUT="$(mktemp "${TMPDIR:-/tmp}/ccc-codex-headless.XXXXXX.out")"
-EVENTS="$(mktemp "${TMPDIR:-/tmp}/ccc-codex-headless.XXXXXX.jsonl")"
-ERR="$(mktemp "${TMPDIR:-/tmp}/ccc-codex-headless.XXXXXX.err")"
+# Fail closed when a scratch file cannot be created.  This script runs under
+# `set -uo pipefail` with no -e, and a failed command substitution does not
+# abort even under -e, so an unchecked mktemp left the variable empty and the
+# redirections below silently targeted an empty filename.
+make_scratch() {  # $1 = mktemp suffix template
+  local path
+  path="$(mktemp "${TMPDIR:-/tmp}/ccc-codex-headless.XXXXXX.$1" 2>/dev/null)" || path=''
+  if [ -z "$path" ] || [ ! -f "$path" ]; then
+    echo "ccc-codex-headless: cannot create scratch file (TMPDIR=${TMPDIR:-/tmp})" >&2
+    return 1
+  fi
+  printf '%s' "$path"
+}
+
+OUT="$(make_scratch out)" || exit 127
+EVENTS="$(make_scratch jsonl)" || { rm -f "$OUT"; exit 127; }
+ERR="$(make_scratch err)" || { rm -f "$OUT" "$EVENTS"; exit 127; }
 trap 'rm -f "$OUT" "$EVENTS" "$ERR"' EXIT
 
 args=(

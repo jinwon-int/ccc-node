@@ -898,6 +898,34 @@ out="$(CCC_STATE_DIR="$co_state" CCC_MEMORY_FACTS_FILE="$co_facts" bash "$ROOT/s
 ok "consolidate is idempotent (second run changes nothing)" '[ "$rc" = 0 ] && jq -e ".superseded == 0 and .changed == false" >/dev/null <<<"$out"'
 out="$(CCC_STATE_DIR="$co_state" CCC_MEMORY_FACTS_FILE="$co_facts" CCC_MEMORY_CONSOLIDATE=0 bash "$ROOT/scripts/ccc-memory-consolidate.sh" 2>&1)"; rc=$?
 ok "CCC_MEMORY_CONSOLIDATE=0 skips" '[ "$rc" = 0 ] && jq -e ".skipped == \"disabled\"" >/dev/null <<<"$out"'
+# Regression (#869 sweep / #1076): this pass rewrites the WHOLE facts file, so
+# it must hold the same lock the appenders take (.local-memory-sink.lock) or a
+# concurrent append lands inside the read->os.replace window and is lost.
+lk_state="$TMP/consolidate-lock"; rm -rf "$lk_state"; mkdir -p "$lk_state"
+lk_facts="$lk_state/memory-facts.jsonl"
+printf '%s\n' \
+  '{"id":"l-old","kind":"preference","text":"Operator switched current editor to Helix from Neovim","observed_at":"2026-06-01T00:00:00Z","review":"auto-local"}' \
+  '{"id":"l-new","kind":"preference","text":"Operator switched current editor to Helix from Neovim now","observed_at":"2026-06-20T00:00:00Z","review":"auto-local"}' \
+  > "$lk_facts"
+cp "$lk_facts" "$lk_facts.before"
+# Hold the sink lock exactly as an appender would, then run the pass.
+python3 - "$lk_state/.local-memory-sink.lock" <<'PYLOCK' &
+import fcntl, os, sys, time
+fd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT, 0o600)
+os.fchmod(fd, 0o600)
+fcntl.flock(fd, fcntl.LOCK_EX)
+time.sleep(5)
+PYLOCK
+lk_pid=$!
+sleep 1
+out="$(CCC_STATE_DIR="$lk_state" CCC_MEMORY_FACTS_FILE="$lk_facts" bash "$ROOT/scripts/ccc-memory-consolidate.sh" 2>&1)"; rc=$?
+ok "consolidate skips while an appender holds the sink lock" '[ "$rc" = 0 ] && jq -e ".skipped == \"locked\"" >/dev/null <<<"$out"'
+ok "consolidate does not rewrite the facts file it could not lock" 'diff -q "$lk_facts" "$lk_facts.before" >/dev/null'
+kill "$lk_pid" 2>/dev/null; wait "$lk_pid" 2>/dev/null
+# With the lock free the same input consolidates normally.
+out="$(CCC_STATE_DIR="$lk_state" CCC_MEMORY_FACTS_FILE="$lk_facts" bash "$ROOT/scripts/ccc-memory-consolidate.sh" 2>&1)"; rc=$?
+ok "consolidate proceeds once the lock is released" '[ "$rc" = 0 ] && jq -e ".superseded == 1 and .changed == true" >/dev/null <<<"$out"'
+
 CCC_STATE_DIR="$co_state" CCC_MEMORY_CACHE_DIR="$co_cache" CCC_MEMORY_DIR="$co_mem" CCC_MEMORY_FACTS_FILE="$co_facts" bash "$ROOT/scripts/ccc-memory-index.sh" rebuild >/dev/null 2>&1
 out="$(CCC_STATE_DIR="$co_state" CCC_MEMORY_INDEX_DB="$co_state/memory-index.sqlite" bash "$ROOT/scripts/ccc-memory-search.sh" "editor Helix Neovim" 2>/dev/null)"
 ok "index skips superseded facts (c-old not surfaced)" 'jq -e "all(.results[].path; (contains(\"c-old\")|not))" >/dev/null <<<"$out"'

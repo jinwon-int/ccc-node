@@ -90,6 +90,54 @@ class StoreLockTest(unittest.TestCase):
             os.close(fd)
 
 
+class LockCommandStaleRaceTest(unittest.TestCase):
+    """The operator CLI must survive losing a stale-lock reclaim race.
+
+    Regression (#869 sweep / #1076): acquire_for_run_guarded() has always caught
+    FileNotFoundError around its stale-lock rename, but lock_command_guarded()
+    did the same rename bare.  When a scheduler reclaimed the same stale lock
+    first, the CLI raised out to the top-level `except Exception` and printed a
+    bare error with no taskId or lockState.
+    """
+
+    def setUp(self) -> None:
+        self.dir = Path(tempfile.mkdtemp())
+        self.store = self.dir / "tasks.json"
+        seed(self.store, ["t1"])
+        agent_cron.store = self.store
+        self._real_lock_status = agent_cron.lock_status
+
+    def tearDown(self) -> None:
+        agent_cron.lock_status = self._real_lock_status
+
+    def _task(self) -> dict:
+        return json.loads(self.store.read_text())["tasks"][0]
+
+    def test_losing_the_reclaim_race_is_reported_not_raised(self) -> None:
+        import datetime
+
+        # Report the lock as stale while the file is already gone -- exactly the
+        # state another reclaimer leaves behind after winning the rename.
+        agent_cron.lock_status = lambda *a, **k: {"lockState": "stale", "holder": None}
+        self.assertFalse(agent_cron.lock_path("t1").exists())
+
+        result, _as_json, code = agent_cron.lock_command_guarded(
+            "t1",
+            "acquire",
+            "run-1",
+            None,
+            datetime.datetime.now(datetime.timezone.utc),
+            True,
+            self._task(),
+        )
+
+        self.assertEqual(code, 1)
+        self.assertIs(result["ok"], False)
+        self.assertEqual(result["taskId"], "t1")
+        self.assertEqual(result["action"], "acquire")
+        self.assertIn("lockState", result)
+
+
 class RunStateMergeTest(unittest.TestCase):
     """commit_run_state must not write back a stale whole-document snapshot."""
 

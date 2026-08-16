@@ -65,5 +65,17 @@ ok "invalid sandbox fails closed before provider invocation" '[ "$rc" = 2 ] && g
 out="$(CCC_CODEX_BIN="$FAKE" CCC_CODEX_REASONING_EFFORT='high\" approval_policy=\"on-request' bash "$RUNNER" nope 2>&1)"; rc=$?
 ok "invalid reasoning fails closed before config parsing" '[ "$rc" = 2 ] && grep -q "invalid CCC_CODEX_REASONING_EFFORT" <<<"$out"'
 
+# Regression (#869 sweep / #1076): an unchecked mktemp left OUT/EVENTS/ERR empty
+# and the run redirected to empty filenames instead of failing closed.
+# shellcheck disable=SC2034 # consumed through eval in ok()
+before="$(stat -c %Y "$FAKE_CODEX_ARGS")"
+# shellcheck disable=SC2034 # consumed through eval in ok()
+out="$(CCC_CODEX_BIN="$FAKE" TMPDIR="$TMP/definitely-not-a-directory" bash "$RUNNER" nope 2>&1)"
+# shellcheck disable=SC2034 # consumed through eval in ok()
+rc=$?
+# shellcheck disable=SC2034 # consumed through eval in ok()
+after="$(stat -c %Y "$FAKE_CODEX_ARGS")"
+ok "unusable TMPDIR fails closed before provider invocation" '[ "$rc" = 127 ] && grep -q "cannot create scratch file" <<<"$out" && [ "$before" = "$after" ]'
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
