@@ -37,6 +37,36 @@ class WrapMarkdownTablesTest(unittest.TestCase):
         # heading value must not be duplicated as its own bullet
         self.assertNotIn("• Name: alice", out)
 
+    def test_repeated_value_in_other_column_is_kept(self):
+        # Regression (#869 sweep / #1076): the heading bullet used to be
+        # suppressed by VALUE, so any other column repeating the heading text
+        # was silently dropped instead of rendered.
+        text = (
+            "| Owner | Reviewer |\n"
+            "|---|---|\n"
+            "| alice | alice |"
+        )
+        out = wrap_markdown_tables(text)
+        self.assertIn("**alice**", out)
+        # The heading's own column stays suppressed ...
+        self.assertNotIn("• Owner: alice", out)
+        # ... but the second column's datum must survive.
+        self.assertIn("• Reviewer: alice", out)
+
+    def test_leading_blank_cell_suppresses_only_the_heading_column(self):
+        # The heading is the first NON-EMPTY cell, so it is not always column 0.
+        # Suppression must follow that column, not the literal index 0.
+        text = (
+            "| A | B | C |\n"
+            "|---|---|---|\n"
+            "|  | bob | bob |"
+        )
+        out = wrap_markdown_tables(text)
+        self.assertIn("**bob**", out)
+        self.assertIn("• A: ", out)          # empty leading cell still rendered
+        self.assertNotIn("• B: bob", out)    # heading's own column suppressed
+        self.assertIn("• C: bob", out)       # trailing duplicate survives
+
     def test_row_label_column_detected(self):
         # Data rows have one more cell than the header -> first cell is heading.
         text = (

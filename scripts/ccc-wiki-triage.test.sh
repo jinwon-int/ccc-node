@@ -31,5 +31,37 @@ ok "triage mark-held writes only local decision file" '[ "$rc" = 0 ] && jq -e ".
 out="$(CCC_STATE_DIR="$state" bash "$ROOT/scripts/ccc-wiki-triage.sh" show missing 2>&1)"; rc=$?
 ok "triage missing candidate fails closed" '[ "$rc" = 1 ] && jq -e ".ok == false and .error == \"candidate not found\"" <<<"$out" >/dev/null'
 
+# Regression (#869 sweep / #1076): SECRET_LINE only matched `keyword:`/`keyword=`
+# shapes, so an unlabelled token or a PEM body printed verbatim through `show`.
+# The fake credentials below are assembled at runtime on purpose -- keeping the
+# literals out of the file keeps this test off the gitleaks allowlist. Do not
+# "simplify" them back into single strings.
+gh_tok="ghp""_$(printf 'A%.0s' $(seq 1 36))"
+aws_tok="AKIA""$(printf 'B%.0s' $(seq 1 16))"
+state2="$TMP/state2"; mkdir -p "$state2"
+{
+  echo '## CAND-010 Unlabelled token'
+  echo 'Pasted from a terminal without any label:'
+  echo "$gh_tok"
+  echo "$aws_tok"
+  echo
+  echo '## CAND-011 PEM block'
+  echo '-----BEGIN RSA PRIVATE KEY-----'
+  echo 'MIIEowIBAAKCAQEAxfakefakefakefakefakefakefakefakefakefakefakeQIDA'
+  echo '-----END RSA PRIVATE KEY-----'
+  echo
+  echo '## CAND-012 Ordinary prose'
+  echo 'The broker tunnel is documented in the node runbook.'
+} > "$state2/wiki-candidates.md"
+
+out="$(CCC_STATE_DIR="$state2" bash "$ROOT/scripts/ccc-wiki-triage.sh" show CAND-010)"; rc=$?
+ok "triage redacts unlabelled tokens" '[ "$rc" = 0 ] && ! grep -q "$gh_tok" <<<"$out" && ! grep -q "$aws_tok" <<<"$out" && jq -e ".candidate.redaction_applied == true" <<<"$out" >/dev/null'
+
+out="$(CCC_STATE_DIR="$state2" bash "$ROOT/scripts/ccc-wiki-triage.sh" show CAND-011)"; rc=$?
+ok "triage redacts the whole PEM block including its body" '[ "$rc" = 0 ] && ! grep -q "MIIEowIBAAKCAQEA" <<<"$out" && ! grep -q "BEGIN RSA PRIVATE KEY" <<<"$out" && jq -e ".candidate.redaction_applied == true" <<<"$out" >/dev/null'
+
+out="$(CCC_STATE_DIR="$state2" bash "$ROOT/scripts/ccc-wiki-triage.sh" show CAND-012)"; rc=$?
+ok "triage leaves ordinary prose intact" '[ "$rc" = 0 ] && grep -q "broker tunnel is documented" <<<"$out" && jq -e ".candidate.redaction_applied == false" <<<"$out" >/dev/null'
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
