@@ -394,15 +394,31 @@ class RuntimeHealthReporter:
             requests[key] = int(requests.get(key, 0)) + max(0, int(count))
             self._write_health_locked()
 
-    def record_empty_completion(self, *, recovered: bool, count: int = 1) -> None:
-        """Count empty normal completions by outcome (#775).
+    def record_empty_completion(
+        self, *, recovered: bool, count: int = 1, coalesced: bool = False
+    ) -> None:
+        """Count empty normal completions by outcome (#775, #1128).
 
         ``recovered=True`` means the provider's terminal result payload held
         the final user text that no visible event produced (event-loss class);
         ``recovered=False`` means the turn ended successfully with no
         user-visible text at all (truly-empty class).
+
+        ``coalesced=True`` narrows that second class to the explained case: a
+        follower was queued behind the turn, so the provider answered both
+        messages at once and this request was the one left without text
+        (#1128). It is counted apart from ``empty_completion_failed`` on
+        purpose — that counter is the #775 alarm for *unexplained* empties,
+        and folding an explained cause into it would mask a real regression.
+        ``recovered`` wins if both are set, since recovery means text was in
+        fact delivered.
         """
-        key = "empty_completion_recovered" if recovered else "empty_completion_failed"
+        if recovered:
+            key = "empty_completion_recovered"
+        elif coalesced:
+            key = "empty_completion_coalesced"
+        else:
+            key = "empty_completion_failed"
         with self._lock:
             requests = self._state.setdefault("requests", {"stalled": 0})
             requests[key] = int(requests.get(key, 0)) + max(0, int(count))

@@ -644,7 +644,7 @@ class ProjectChatProcessMixin:
                 bot, chat_id, user_id, settings=self._config
             )
 
-        async with self._get_conversation_lock(user_id, chat_id):
+        async with self._conversation_turn(user_id, chat_id):
             loop = asyncio.get_running_loop()
             progress_coordinator = RequestProgressCoordinator(
                 ledger_create=self._ledger_create,
@@ -1237,23 +1237,50 @@ class ProjectChatProcessMixin:
                             pass
                         content = recovered
                     else:
+                        # #1128: two messages sent within about a second reach
+                        # the provider as a single turn, so exactly one request
+                        # carries the answer and the rest end with no visible
+                        # text. A follower queued behind this turn is the only
+                        # in-process evidence of that; the queue lives inside
+                        # the CLI, so the alternative would be parsing its
+                        # transcript and coupling the bridge to that format.
+                        followers = self._conversation_followers(key)
+                        coalesced = followers > 0
+                        cause = "coalesced-turn" if coalesced else "empty-completion"
                         _claim_request_terminal(
                             progress_request,
                             RequestPhase.FAILED,
-                            cause="empty-completion",
+                            cause=cause,
                         )
                         logger.warning(
                             "Empty normal completion for user %s chat %s: "
                             "provider=%s finished successfully without "
-                            "user-visible text (session kept)",
+                            "user-visible text (session kept) cause=%s "
+                            "followers=%s",
                             user_id,
                             chat_id,
                             provider_label,
+                            cause,
+                            followers,
                         )
                         try:
-                            health_reporter.record_empty_completion(recovered=False)
+                            health_reporter.record_empty_completion(
+                                recovered=False, coalesced=coalesced
+                            )
                         except Exception:
                             pass
+                        if coalesced:
+                            # Not a failure: the turn ran, and its answer is
+                            # already on its way under the follower. Telling
+                            # the user to retry would queue yet another
+                            # message and reproduce the same split.
+                            message = "Handled together with your other message"
+                            return ChatResponse(
+                                content=f"⏳ {message}; the answer arrives with that one.",
+                                success=False,
+                                error="coalesced_turn",
+                                session_id=session.session_id,
+                            )
                         message = "Agent finished without a visible answer"
                         return ChatResponse(
                             content=f"❌ {message}. Please retry your request.",
