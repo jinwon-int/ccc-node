@@ -357,5 +357,5 @@ out="$(env "${base_env[@]}" CCC_STATE_DIR="$outside_state" python3 "$PROMOTER" s
 ok "a state dir outside HOME still resolves through the unanchored walk" \
   '[ "$rc" = 0 ] && jq -e ".enabled == true" >/dev/null <<<"$out"'
 
-echo "skill-promotion tests: pass=$pass fail=$fail"
+echo "PASS=$pass FAIL=$fail"
 [ "$fail" -eq 0 ]

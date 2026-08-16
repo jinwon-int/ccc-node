@@ -104,5 +104,5 @@ ok "a too-short body is reported as a lint BLOCK" \
 ok "--json does not leak into autoinstall dispatch" \
   '[[ "$(run_sim --json 2>&1)" != *"incremental_action_invalid"* ]]'
 
-echo "gate-sim.test.sh: pass=$pass fail=$fail"
+echo "PASS=$pass FAIL=$fail"
 [ "$fail" -eq 0 ]

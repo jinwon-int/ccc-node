@@ -198,5 +198,5 @@ ok "autonomy=dry-run previews central promotion" 'grep -qx "run --dry-run" "$TMP
 out="$(CCC_STATE_DIR="$STATE3" CCC_AUTONOMY=kill bash "$AUTOSAVE" status 2>&1)"
 ok "status reflects autonomy=kill" 'printf "%s" "$out" | grep -q "^autonomy: kill"'
 
-echo "pass=$pass fail=$fail"
+echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
