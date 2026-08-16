@@ -309,5 +309,5 @@ tool run >/dev/null
 out="$(tool status iota)"
 ok "inter-run bump is never overwritten by a run" 'jq -e ".skills[0].telemetry.use_count == 2" >/dev/null <<<"$out"'
 
-echo "pass=$pass fail=$fail"
+echo "PASS=$pass FAIL=$fail"
 [ "$fail" -eq 0 ]

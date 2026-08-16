@@ -117,5 +117,5 @@ out="$(env "${base_env[@]}" python3 "$SYNC" plan --ref main)"; rc=$?
 ok "floating main ref is refused" \
   '[ "$rc" = 2 ] && jq -e ".code == \"exact_commit_required\"" >/dev/null <<<"$out"'
 
-echo "fleet-skills sync tests: pass=$pass fail=$fail"
+echo "PASS=$pass FAIL=$fail"
 [ "$fail" -eq 0 ]

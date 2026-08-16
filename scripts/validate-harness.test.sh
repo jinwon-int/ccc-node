@@ -142,6 +142,55 @@ ok "guard stays quiet when every suite is registered" \
      eval "$GUARD_SRC"
    )"'
 
+# --- suite summary-line contract ------------------------------------------
+# The harness echoes each suite's own `PASS=<n> FAIL=<n>` tally. A suite that
+# omits it used to still print "ok" with a blank count, so an empty run looked
+# like a passing one. suite_summary() now demands the line.
+SUMMARY_SRC="$(sed -n '/^suite_summary() {/,/^}$/p' "$VALIDATE")"
+ok "suite_summary is present in validate-harness.sh" \
+  '[ -n "$SUMMARY_SRC" ] && grep -q "PASS=\[0-9\]" <<<"$SUMMARY_SRC"'
+
+summary_probe() { # <suite-output> -> "OK ..." / "ERR ..."
+  (
+    eval "$SUMMARY_SRC"
+    err() { echo "ERR: $*"; }
+    say() { echo "SAY: $*"; }
+    printf '%s\n' "$1" >"$TMPD/probe.out"
+    suite_summary "$TMPD/probe.out" "some/suite.test.sh"
+  )
+}
+TMPD="$(mktemp -d)"; trap 'rm -rf "$TMPD"' EXIT
+
+# shellcheck disable=SC2034  # referenced inside eval'd ok() assertions
+conforming="$(summary_probe 'PASS=12 FAIL=0')"
+ok "a conforming tally is reported next to the suite name" \
+  '[[ "$conforming" == "SAY:   ok PASS=12 FAIL=0 some/suite.test.sh" ]]'
+
+# The exact defect this guard exists for: six suites printed the lowercase
+# variant, which the old `grep -E 'PASS='` missed and rendered as a blank.
+# shellcheck disable=SC2034
+lowercase="$(summary_probe 'pass=12 fail=0')"
+ok "a lowercase pass=/fail= variant is rejected, not silently blank" \
+  '[[ "$lowercase" == ERR:* ]] && grep -q "no .PASS=<n> FAIL=<n>. summary line" <<<"$lowercase"'
+
+# shellcheck disable=SC2034
+missing="$(summary_probe 'some unrelated output')"
+ok "a suite with no summary line at all is rejected" '[[ "$missing" == ERR:* ]]'
+
+# Guard against a partial match resurrecting the blank-count bug — e.g. a
+# suite that mentions PASS= mid-line without a real tally.
+# shellcheck disable=SC2034
+partial="$(summary_probe 'checking PASS= handling')"
+ok "a partial PASS= mention does not count as a summary" '[[ "$partial" == ERR:* ]]'
+
+# Deliberately NOT asserted here: that all 81 registered suites honour the
+# contract. Conformance is a property of a suite's *output*, and the source
+# spellings vary legitimately (`echo "----"; echo "PASS=..."` on one line,
+# `printf 'PASS=%d FAIL=%d\n'`, uppercase `$PASS`). A source grep gets that
+# wrong in both directions. The harness enforces it on output, for every
+# suite, on every run — that is the stronger check, so it is not duplicated
+# with a weaker static approximation here.
+
 echo "----"
 echo "PASS=$pass FAIL=$fail"
 [ "$fail" = "0" ]
