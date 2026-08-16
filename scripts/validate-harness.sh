@@ -271,7 +271,7 @@ run_suite() { # <suite-path>
   env ${scrub[@]+"${scrub[@]}"} bash "$1"
 }
 
-for t in claude/hooks/observability.test.sh claude/hooks/security-scan.test.sh \
+HARNESS_SUITES=(claude/hooks/observability.test.sh claude/hooks/security-scan.test.sh \
          scripts/validate-harness.test.sh \
          claude/hooks/redact.test.sh claude/hooks/scan-injection.test.sh \
          claude/hooks/checkpoint.test.sh claude/hooks/distill-scope.test.sh claude/hooks/skill-review.test.sh \
@@ -316,7 +316,37 @@ for t in claude/hooks/observability.test.sh claude/hooks/security-scan.test.sh \
          scripts/gh-pr-flow-jinon86.test.sh \
          scripts/gh-pr-flow-seoseo-ai.test.sh \
          scripts/ccc-service-control.test.sh \
-         scripts/ccc-broker-reconcile.test.sh; do
+         scripts/ccc-broker-reconcile.test.sh \
+         claude/hooks/lib/autonomy-guard.test.sh \
+         claude/hooks/skill-review/gate-sim.test.sh \
+         claude/mcp-setup.test.sh \
+         scripts/ccc-live-backups-rotate.test.sh \
+         scripts/ccc-pr-status-poll.test.sh \
+         scripts/fleet-bridge-watch.test.sh \
+         scripts/install-pr-status-poll-cron.test.sh)
+
+# Registration guard — a suite that exists but is not listed above never runs,
+# which is worse than having no suite at all: the tree looks covered and CI is
+# green while the assertions are dead. Seven suites (139 assertions) had drifted
+# into exactly that state before this guard existed. Mirrors the repo-wide
+# lint sweep above (the one that stops a new script escaping shellcheck): the
+# explicit list keeps its ordering and grouping, and this pass only ever
+# catches a NEW suite that forgot to join it.
+if command -v git >/dev/null 2>&1 && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  unregistered=0
+  while IFS= read -r suite; do
+    [ -n "$suite" ] || continue
+    case " ${HARNESS_SUITES[*]} " in
+      *" $suite "*) ;;
+      *) err "unregistered test suite (never runs): $suite"; unregistered=$((unregistered+1)) ;;
+    esac
+  done < <(git ls-files '*.test.sh')
+  [ "$unregistered" -eq 0 ] && say "  ok every tracked *.test.sh is registered (${#HARNESS_SUITES[@]} suites)"
+else
+  say "  (git unavailable — test-suite registration guard skipped)"
+fi
+
+for t in "${HARNESS_SUITES[@]}"; do
   [ -f "$t" ] || { err "missing test: $t"; continue; }
   if run_suite "$t" >"$TMP/htest.out" 2>&1; then say "  ok $(grep -E 'PASS=' "$TMP/htest.out" | tail -1) $t";
   else err "test failed: $t"; tail -5 "$TMP/htest.out"; fi

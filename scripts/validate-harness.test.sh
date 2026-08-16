@@ -90,6 +90,58 @@ probe_clean="$(
 )"
 ok "no harness vars set: suite still runs" '[[ "$probe_clean" == *"CCC=[unset]"* ]]'
 
+# --- test-suite registration guard -----------------------------------------
+# A *.test.sh that exists but is not in HARNESS_SUITES never runs, so the tree
+# looks covered while its assertions are dead. Seven suites had drifted into
+# that state; these pin both the list and the guard that protects it.
+SUITES_SRC="$(sed -n '/^HARNESS_SUITES=(/,/)$/p' "$VALIDATE")"
+GUARD_SRC="$(sed -n '/^# Registration guard/,/^fi$/p' "$VALIDATE")"
+# Fail loudly if either extraction breaks, instead of silently passing on empty.
+ok "HARNESS_SUITES array is present in validate-harness.sh" \
+  '[ -n "$SUITES_SRC" ] && grep -q "observability.test.sh" <<<"$SUITES_SRC"'
+ok "registration guard is present in validate-harness.sh" \
+  '[ -n "$GUARD_SRC" ] && grep -q "unregistered test suite" <<<"$GUARD_SRC"'
+
+# Every tracked suite must be registered. This is the property the guard
+# enforces, asserted here directly so it fails in milliseconds rather than
+# only at the end of a full harness run.
+# shellcheck disable=SC2034  # referenced inside eval'd ok() assertions
+missing_suites="$(
+  eval "$SUITES_SRC"
+  cd "$ROOT" || exit 1
+  git ls-files '*.test.sh' | while IFS= read -r s; do
+    case " ${HARNESS_SUITES[*]} " in *" $s "*) ;; *) echo "$s" ;; esac
+  done
+)"
+ok "every tracked *.test.sh is registered in HARNESS_SUITES" '[ -z "$missing_suites" ]'
+
+# The guard itself must actually fire. Run the real extracted block against a
+# stubbed git that reports one suite the list does not contain.
+# shellcheck disable=SC2034  # referenced inside eval'd ok() assertions
+guard_out="$(
+  eval "$SUITES_SRC"
+  err() { echo "ERR: $*"; }
+  say() { echo "SAY: $*"; }
+  git() {
+    case "$1" in
+      rev-parse) return 0 ;;
+      ls-files) printf '%s\n' "${HARNESS_SUITES[0]}" "scripts/never-registered.test.sh" ;;
+      *) return 1 ;;
+    esac
+  }
+  eval "$GUARD_SRC"
+)"
+ok "guard flags an unregistered suite" \
+  '[ -n "$guard_out" ] && grep -q "ERR: unregistered test suite (never runs): scripts/never-registered.test.sh" <<<"$guard_out"'
+ok "guard stays quiet when every suite is registered" \
+  '! grep -q "ERR:" <<<"$(
+     eval "$SUITES_SRC"
+     err() { echo "ERR: $*"; }
+     say() { echo "SAY: $*"; }
+     git() { case "$1" in rev-parse) return 0 ;; ls-files) printf "%s\n" "${HARNESS_SUITES[0]}" ;; *) return 1 ;; esac; }
+     eval "$GUARD_SRC"
+   )"'
+
 echo "----"
 echo "PASS=$pass FAIL=$fail"
 [ "$fail" = "0" ]
