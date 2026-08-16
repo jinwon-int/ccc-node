@@ -344,6 +344,25 @@ class RuntimeHealthReporterTests(unittest.TestCase):
             self.assertEqual(health["requests"]["empty_completion_recovered"], 2)
             self.assertEqual(health["requests"]["empty_completion_failed"], 1)
 
+    def test_record_empty_completion_separates_coalesced_from_failed(self):
+        # #1128: an empty turn explained by a queued follower is counted apart
+        # from the #775 unexplained-empty alarm, so the explained case cannot
+        # mask a real regression. Recovery still wins over both.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_root = Path(tmpdir)
+            module = self._load_health_module(project_root)
+            reporter = module.RuntimeHealthReporter(project_root / ".telegram_bot")
+
+            reporter.record_empty_completion(recovered=False, coalesced=True)
+            reporter.record_empty_completion(recovered=False)
+            reporter.record_empty_completion(recovered=True, coalesced=True)
+
+            health = json.loads(reporter.health_file.read_text(encoding="utf-8"))
+            requests = health["requests"]
+            self.assertEqual(requests["empty_completion_coalesced"], 1)
+            self.assertEqual(requests["empty_completion_failed"], 1)
+            self.assertEqual(requests["empty_completion_recovered"], 1)
+
     def test_enabled_dead_session_wakeup_records_all_zero_scan_and_accumulates(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             project_root = Path(tmpdir)

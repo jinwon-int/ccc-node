@@ -1,4 +1,4 @@
-"""Regression coverage for empty normal completions (#775).
+"""Regression coverage for empty normal completions (#775, #1128).
 
 A provider turn that ends with ResultEvent + CompletionEvent but no
 user-visible text events must not surface "(No response)" as a successful
@@ -6,6 +6,11 @@ answer: the terminal result text is recovered when the payload carries it
 (event-loss class), and otherwise the turn is classified as a typed,
 retryable failure (truly-empty class). Streaming, interim delivery, and the
 terminal-stall/unsolicited paths keep their exactly-once semantics.
+
+#1128 splits that truly-empty class once more. When a follower is queued
+behind the turn, the provider answered both messages at once and this
+request is simply the half without text — an explained outcome that must
+not carry retry guidance, since resending only enqueues another message.
 """
 
 from __future__ import annotations
@@ -232,3 +237,77 @@ async def test_delivered_interim_with_empty_final_is_not_a_placeholder(
     assert response.success is True
     assert response.content == ""
     assert response.streamed is True
+
+
+@pytest.mark.anyio
+async def test_empty_completion_with_follower_is_coalesced_not_a_retry(
+    tmp_path: Path,
+) -> None:
+    # #1128: two messages sent within about a second reach the provider as one
+    # turn, so one request carries the answer and the other ends empty. The
+    # empty half must not tell the user to retry — a resend just enqueues
+    # another message and splits the next turn the same way.
+    session = FakeSession(
+        "claude-coalesced",
+        [
+            _claude_result("", "claude-coalesced"),
+            CompletionEvent("end_turn"),
+        ],
+    )
+    handler = _handler(tmp_path, FakeRuntime(session))
+    # A follower registered before this turn finishes is exactly the state a
+    # second Telegram message produces while the first still holds the lock.
+    handler._enter_conversation_queue(handler._stream_key(7, 70))
+
+    response = await handler.process_message("hello", 7, 70)
+
+    assert response.success is False
+    assert response.error == "coalesced_turn"
+    assert "retry" not in response.content.lower()
+    assert "together" in response.content.lower()
+    assert "(No response)" not in response.content
+
+
+@pytest.mark.anyio
+async def test_empty_completion_without_follower_keeps_the_typed_failure(
+    tmp_path: Path,
+) -> None:
+    # The #1128 branch must stay narrow: with nobody queued behind the turn an
+    # empty answer is still unexplained, so #775's retryable failure stands.
+    session = FakeSession(
+        "claude-lonely",
+        [
+            _claude_result("", "claude-lonely"),
+            CompletionEvent("end_turn"),
+        ],
+    )
+    handler = _handler(tmp_path, FakeRuntime(session))
+
+    response = await handler.process_message("hello", 7, 70)
+
+    assert response.success is False
+    assert response.error == "Agent finished without a visible answer"
+    assert "retry" in response.content.lower()
+
+
+@pytest.mark.anyio
+async def test_conversation_queue_count_is_released_after_a_turn(
+    tmp_path: Path,
+) -> None:
+    # The counter backs a user-visible branch, so a leak would silently turn
+    # every later empty completion on this chat into a "coalesced" claim.
+    session = FakeSession(
+        "claude-clean",
+        [
+            _claude_result("done", "claude-clean"),
+            CompletionEvent("end_turn"),
+        ],
+    )
+    handler = _handler(tmp_path, FakeRuntime(session))
+    key = handler._stream_key(7, 70)
+
+    response = await handler.process_message("hello", 7, 70)
+
+    assert response.success is True
+    assert handler._conversation_followers(key) == 0
+    assert key not in handler._conversation_pending
