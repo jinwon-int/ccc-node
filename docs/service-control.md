@@ -138,14 +138,25 @@ Same trust model (never grant to a mutable checkout copy):
 4. The agent invokes
    `/usr/local/libexec/ccc-broker-reconcile <service> [<service>...]` with exact
    service tokens. The wrapper rechecks itself and both root-owned config files,
-   rejects daemon/Compose environment overrides, `cd`s to the fixed project dir,
+   rejects daemon/Compose environment overrides, serializes the run against any
+   other concurrent reconcile (an exclusive flock on the fixed project
+   directory itself; wait budget `CCC_BROKER_RECONCILE_LOCK_WAIT` seconds,
+   default 120), `cd`s to the fixed project dir,
    exports `A2A_BROKER_REVISION=$(git rev-parse HEAD)`, and runs
-   `/usr/bin/docker compose up -d <allowlisted services>`.
+   `/usr/bin/docker compose up -d <allowlisted services>`. After docker
+   returns, it re-reads HEAD and fails loudly if the checkout moved mid-run,
+   so containers never silently keep an `A2A_BROKER_REVISION` label that does
+   not match the Compose payload docker actually used (#1133).
 
 Scope note: this wrapper performs no `sudo` and no privilege escalation. Its
 purpose is wrapper/config and command-shape **integrity** — keeping the runbook
 as a single reviewed root-owned entrypoint — not privilege reduction or
-integrity of the broker checkout/Compose payload itself. For unattended
+integrity of the broker checkout/Compose payload itself. The serialization and
+the stale-label guard above ARE part of the contract: at most one reconcile
+runs at a time against the fixed project directory, and a run whose label no
+longer matches the checkout is reported as failed (re-run to converge). The
+guard detects drift; it still cannot attest that the checkout content itself
+is the intended one. For unattended
 reconciliation the agent account still needs Docker
 access, which remains a host-root-equivalent grant (see the note above); the
 wrapper does not change that boundary.

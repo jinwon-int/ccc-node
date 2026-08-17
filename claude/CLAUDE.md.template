@@ -81,7 +81,12 @@ Service-control autonomy policy (behavioral — self-enforced, no longer a hook)
   `/usr/local/libexec/ccc-broker-reconcile <service>...` wrapper (root-owned; it
   encapsulates the fixed runbook — project `cd`,
   `A2A_BROKER_REVISION=$(git rev-parse HEAD)`, `docker compose up -d
-  <allowlisted services>`). New runbook needs go into the reviewed wrapper, NOT
+  <allowlisted services>`). Concurrent runs are serialized by the wrapper
+  (flock on the project dir): a busy wrapper waits up to
+  `CCC_BROKER_RECONCILE_LOCK_WAIT` (default 120s) then fails with "still
+  running" — retry after the other run finishes, do not bypass. A "checkout
+  moved during reconcile" failure means containers carry a stale revision
+  label; re-run to converge. New runbook needs go into the reviewed wrapper, NOT
   into ad-hoc inline Compose grammar. Read-only verification (`docker inspect`,
   bounded `sleep`, loopback-only `curl`) is separate. None of this waives the
   fresh in-task approval required for a cross-broker mutation.
