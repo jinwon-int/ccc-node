@@ -677,6 +677,7 @@ class CodexAppServerClient:
                     method = message.get("method")
                     params = message.get("params", {})
                     if not isinstance(method, str) or not isinstance(params, dict):
+                        await self._reject_malformed_request(message)
                         continue
                     if request_id is None:
                         await self._notifications.put(CodexNotification(method, params))
@@ -686,6 +687,12 @@ class CodexAppServerClient:
                         task = asyncio.create_task(self._dispatch_server_request(request))
                         self._server_request_tasks.add(task)
                         task.add_done_callback(self._server_request_tasks.discard)
+                    else:
+                        logger.warning(
+                            "discarding well-formed app-server request with unaddressable "
+                            "id type %s",
+                            type(request_id).__name__,
+                        )
                     continue
 
                 if not isinstance(request_id, int) or isinstance(request_id, bool):
@@ -737,12 +744,41 @@ class CodexAppServerClient:
         except CodexConnectionClosedError:
             return
 
-    def _fail_malformed_response(self, request_id: object, reason: str) -> None:
-        if not isinstance(request_id, int) or isinstance(request_id, bool):
+    async def _reject_malformed_request(self, message: Mapping[str, JsonValue]) -> None:
+        """Handle a peer request frame whose method/params fail shape checks.
+
+        A JSON-RPC response never carries a ``method`` key, so reaching this
+        branch means the peer sent a request — direction is unambiguous and no
+        id-ownership inference is involved. Per JSON-RPC 2.0 a frame carrying
+        an addressable id gets ``-32600 Invalid Request``; a notification (no
+        id) is never answered. Every drop is logged — these frames used to
+        vanish silently, leaving no response, log, or counter (#1132). Only
+        field *types* are logged, never values: params may carry private
+        payloads.
+        """
+        request_id = message.get("id")
+        if not self._is_rpc_id(request_id):
+            logger.warning(
+                "discarding malformed app-server %s (method type %s, params type %s)",
+                "notification" if request_id is None else "request with unaddressable id",
+                type(message.get("method")).__name__,
+                type(message.get("params")).__name__,
+            )
             return
-        future = self._pending.get(request_id)
-        if future is not None and not future.done():
-            future.set_exception(CodexProtocolError(reason))
+        logger.warning(
+            "rejecting malformed app-server request with -32600 "
+            "(method type %s, params type %s)",
+            type(message.get("method")).__name__,
+            type(message.get("params")).__name__,
+        )
+        response: JsonObject = {
+            "id": cast(JsonRpcId, request_id),
+            "error": {"code": -32600, "message": "Invalid Request"},
+        }
+        try:
+            await self._write(response)
+        except CodexConnectionClosedError:
+            return
 
     @staticmethod
     def _validate_server_response_payload(

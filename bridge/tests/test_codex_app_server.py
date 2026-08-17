@@ -736,6 +736,110 @@ class CodexAppServerTests(unittest.IsolatedAsyncioTestCase):
         assert await asyncio.wait_for(pending, timeout=0.2) == {"data": []}
         await client.close()
 
+    async def test_malformed_request_with_id_gets_invalid_request_response(self) -> None:
+        handled: list[CodexServerRequest] = []
+
+        async def handler(request: CodexServerRequest) -> Mapping[str, Any]:
+            handled.append(request)
+            return {"result": {}}
+
+        reader = asyncio.StreamReader()
+        writer = FakeWriter(reader)
+        client = CodexAppServerClient(
+            reader=reader, writer=writer, server_request_handler=handler
+        )
+        await client.start()
+        baseline = len(writer.messages)
+
+        writer.feed({"id": "srv-1", "method": 42, "params": {}})
+        while len(writer.messages) == baseline:
+            await asyncio.sleep(0)
+        assert writer.messages[-1] == {
+            "id": "srv-1",
+            "error": {"code": -32600, "message": "Invalid Request"},
+        }
+        assert handled == []
+
+        # An in-flight client request is unaffected by the rejection.
+        pending = asyncio.create_task(client.request("model/list", {}))
+        while writer.messages[-1].get("method") != "model/list":
+            await asyncio.sleep(0)
+        request_id = writer.messages[-1]["id"]
+        writer.feed({"id": request_id, "result": {"data": []}})
+        assert await asyncio.wait_for(pending, timeout=0.2) == {"data": []}
+        await client.close()
+
+    async def test_malformed_request_with_null_params_gets_invalid_request_response(
+        self,
+    ) -> None:
+        # Concrete trigger shape (#1132): serde emits "params": null for an
+        # Option<T> without skip_serializing_if, and dict.get("params", {})
+        # returns None — not {} — when the key is present with a null value.
+        reader = asyncio.StreamReader()
+        writer = FakeWriter(reader)
+        client = CodexAppServerClient(reader=reader, writer=writer)
+        await client.start()
+        baseline = len(writer.messages)
+
+        writer.feed({"id": 7, "method": "thread/list", "params": None})
+        while len(writer.messages) == baseline:
+            await asyncio.sleep(0)
+        assert writer.messages[-1] == {
+            "id": 7,
+            "error": {"code": -32600, "message": "Invalid Request"},
+        }
+        await client.close()
+
+    async def test_malformed_notification_is_logged_but_never_answered(self) -> None:
+        reader = asyncio.StreamReader()
+        writer = FakeWriter(reader)
+        client = CodexAppServerClient(reader=reader, writer=writer)
+        await client.start()
+        baseline = len(writer.messages)
+
+        with self.assertLogs(
+            "telegram_bot.core.codex_app_server", level="WARNING"
+        ) as captured:
+            writer.feed({"method": 42, "params": {}})
+            # Synchronize on the trailing valid notification: the single
+            # reader loop processes frames in order, so once it is dequeued
+            # the malformed frame has been fully handled.
+            writer.feed({"method": "thread/started", "params": {"threadId": "t-1"}})
+            notification = await asyncio.wait_for(client.next_notification(), timeout=0.2)
+        assert notification.method == "thread/started"
+        assert len(writer.messages) == baseline
+        assert any(
+            "malformed" in line and "notification" in line for line in captured.output
+        )
+        await client.close()
+
+    async def test_well_formed_request_with_non_rpc_id_is_dropped_with_log(self) -> None:
+        handled: list[CodexServerRequest] = []
+
+        async def handler(request: CodexServerRequest) -> Mapping[str, Any]:
+            handled.append(request)
+            return {"result": {}}
+
+        reader = asyncio.StreamReader()
+        writer = FakeWriter(reader)
+        client = CodexAppServerClient(
+            reader=reader, writer=writer, server_request_handler=handler
+        )
+        await client.start()
+        baseline = len(writer.messages)
+
+        with self.assertLogs(
+            "telegram_bot.core.codex_app_server", level="WARNING"
+        ) as captured:
+            writer.feed({"id": 1.5, "method": "thread/list", "params": {}})
+            writer.feed({"id": True, "method": "thread/list", "params": {}})
+            writer.feed({"method": "thread/started", "params": {}})
+            await asyncio.wait_for(client.next_notification(), timeout=0.2)
+        assert handled == []
+        assert len(writer.messages) == baseline
+        assert sum("unaddressable id type" in line for line in captured.output) == 2
+        await client.close()
+
     async def test_malformed_correlated_response_fails_promptly(self) -> None:
         reader = asyncio.StreamReader()
         writer = FakeWriter(reader)
