@@ -84,3 +84,51 @@ ccc_validate_managed_artifacts() {
     "${1:-ERROR:} shared managed-artifact validator is missing" || return 1
   python3 "$_CCC_HARNESS_PATHS_PY" managed-artifacts "$@"
 }
+
+# Codex GitHub-transport policy state (#1131). ccc_codex_github_policy.py
+# CREATES $CODEX_DIR (0700) when absent, leaves a policy lock file behind, and
+# atomically REPLACES config.toml keeping no backup — all inside setup.sh's
+# install-transaction window. Unless the transaction (and self-update's
+# artifact snapshot) capture this state explicitly, a rollback strands the new
+# policy while reporting "restored previous installed artifacts". The
+# managed-skills tree is NOT covered here: ccc_codex_skills.py carries its own
+# fail-closed transaction scoped to $CODEX_DIR/skills.
+CCC_CODEX_CONFIG_NAME="config.toml"
+CCC_CODEX_POLICY_LOCK_NAME=".ccc-github-cli-policy.lock"
+
+# Capture the policy-relevant state of <codex-dir> into <snapshot-dir>:
+#   codex.tar.gz       — config.toml when present, an empty archive otherwise
+#   codex-dir-existed  — marker, written only when <codex-dir> already existed
+ccc_snapshot_codex_policy_state() { # <codex-dir> <snapshot-dir>
+  local codex_dir="$1" snapshot_dir="$2"
+  if [ -d "$codex_dir" ]; then
+    : >"$snapshot_dir/codex-dir-existed" || return 1
+  fi
+  if [ -e "$codex_dir/$CCC_CODEX_CONFIG_NAME" ] || [ -L "$codex_dir/$CCC_CODEX_CONFIG_NAME" ]; then
+    tar -czf "$snapshot_dir/codex.tar.gz" -C "$codex_dir" "$CCC_CODEX_CONFIG_NAME" || return 1
+  else
+    tar -czf "$snapshot_dir/codex.tar.gz" --files-from /dev/null || return 1
+  fi
+  tar -tzf "$snapshot_dir/codex.tar.gz" >/dev/null
+}
+
+# Restore what ccc_snapshot_codex_policy_state captured. config.toml returns
+# byte-for-byte (or vanishes when the snapshot proves it did not exist); a
+# $CODEX_DIR the interrupted run created is removed once empty. The policy
+# lock file is unlinked only in that we-created-it case: unlinking a lock
+# another process may hold open would break future locking, and skills
+# residue from the separate skills transaction rightly keeps the directory.
+ccc_restore_codex_policy_state() { # <codex-dir> <snapshot-dir>
+  local codex_dir="$1" snapshot_dir="$2" failed=0
+  rm -f -- "$codex_dir/$CCC_CODEX_CONFIG_NAME" || failed=1
+  if [ -f "$snapshot_dir/codex-dir-existed" ]; then
+    mkdir -p "$codex_dir" || failed=1
+    tar -xzf "$snapshot_dir/codex.tar.gz" -C "$codex_dir" || failed=1
+  elif [ -d "$codex_dir" ]; then
+    rm -f -- "$codex_dir/$CCC_CODEX_POLICY_LOCK_NAME" || failed=1
+    # A non-empty dir (e.g. managed-skills residue) is kept — that tree
+    # belongs to the skills transaction, not to this rollback.
+    rmdir -- "$codex_dir" 2>/dev/null || true
+  fi
+  [ "$failed" = 0 ]
+}

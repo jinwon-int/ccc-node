@@ -25,9 +25,10 @@
 #   1. take a lock; resolve the repo (env > repo file > script location > ~/ccc-node)
 #   2. preconditions: .git present, clean working tree, on the expected branch
 #   3. git fetch + merge --ff-only (never rewrites local history)
-#   4. if HEAD changed (or --force): snapshot Claude + Hermes managed artifacts,
-#      run ./setup.sh, validate bridge runtime config when its service is
-#      allowlisted, then verify repo SHA and artifact rollback on failure
+#   4. if HEAD changed (or --force): snapshot Claude + Hermes managed artifacts
+#      and the Codex GitHub policy config, run ./setup.sh, validate bridge
+#      runtime config when its service is allowlisted, then verify repo SHA
+#      and artifact rollback on failure
 #   5. restart each allowlisted service and verify it is active again
 #   6. append a JSONL audit record and queue an owner Telegram notification
 #      (spool only — this script never touches the bot token)
@@ -52,6 +53,7 @@ set -uo pipefail
 
 CLAUDE_DIR="${CCC_CLAUDE_DIR:-${HOME:-/root}/.claude}"
 HERMES_ROOT="${CCC_HERMES_DIR:-${HOME:-/root}/.hermes}"
+CODEX_DIR="${CODEX_HOME:-${HOME:-/root}/.codex}"
 STATE_DIR="${CCC_STATE_DIR:-$CLAUDE_DIR/state}"
 LOG="$STATE_DIR/self-update.log"
 LOCK="$STATE_DIR/self-update.lock"
@@ -78,6 +80,7 @@ mkdir -p "$STATE_DIR" 2>/dev/null
 INSTALL_SNAPSHOT_DIR=""
 CLAUDE_SNAPSHOT=""
 HERMES_SNAPSHOT=""
+CODEX_SNAPSHOT=""
 KEEP_INSTALL_SNAPSHOT=0
 
 ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
@@ -169,6 +172,7 @@ snapshot_installed_artifacts() {
   chmod 700 "$INSTALL_SNAPSHOT_DIR" || return 1
   CLAUDE_SNAPSHOT="$INSTALL_SNAPSHOT_DIR/claude.tar.gz"
   HERMES_SNAPSHOT="$INSTALL_SNAPSHOT_DIR/hermes.tar.gz"
+  CODEX_SNAPSHOT="$INSTALL_SNAPSHOT_DIR/codex.tar.gz"
   for item in "${CCC_MANAGED_PATHS[@]}"; do
     { [ -e "$CLAUDE_DIR/$item" ] || [ -L "$CLAUDE_DIR/$item" ]; } && existing+=("$item")
   done
@@ -185,15 +189,21 @@ snapshot_installed_artifacts() {
   chmod 600 "$CLAUDE_SNAPSHOT" "$HERMES_SNAPSHOT" || return 1
   tar -tzf "$CLAUDE_SNAPSHOT" >/dev/null || return 1
   tar -tzf "$HERMES_SNAPSHOT" >/dev/null || return 1
-  python3 - "$CLAUDE_SNAPSHOT" "$HERMES_SNAPSHOT" "${CCC_MANAGED_PATHS[*]}" <<'PY' || return 1
+  # The Codex GitHub policy state lives outside $CLAUDE_DIR and setup.sh
+  # replaces config.toml with no backup of its own (#1131); capture it so a
+  # rollback does not strand the new policy while claiming a full restore.
+  ccc_snapshot_codex_policy_state "$CODEX_DIR" "$INSTALL_SNAPSHOT_DIR" || return 1
+  chmod 600 "$CODEX_SNAPSHOT" || return 1
+  python3 - "$CLAUDE_SNAPSHOT" "$HERMES_SNAPSHOT" "$CODEX_SNAPSHOT" "${CCC_MANAGED_PATHS[*]}" <<'PY' || return 1
 import pathlib
 import sys
 import tarfile
 
-claude_archive, hermes_archive, allowed_text = sys.argv[1:]
+claude_archive, hermes_archive, codex_archive, allowed_text = sys.argv[1:]
 for archive, allowed in (
     (claude_archive, set(allowed_text.split())),
     (hermes_archive, {"honcho.json"}),
+    (codex_archive, {"config.toml"}),
 ):
     with tarfile.open(archive, "r:gz") as tf:
         for member in tf.getmembers():
@@ -214,6 +224,7 @@ restore_installed_artifacts() {
   tar -xzf "$CLAUDE_SNAPSHOT" -C "$CLAUDE_DIR" || failed=1
   rm -f -- "$HERMES_ROOT/honcho.json" || failed=1
   tar -xzf "$HERMES_SNAPSHOT" -C "$HERMES_ROOT" || failed=1
+  ccc_restore_codex_policy_state "$CODEX_DIR" "$INSTALL_SNAPSHOT_DIR" || failed=1
   [ "$failed" = 0 ]
 }
 
@@ -474,8 +485,8 @@ if ! (cd "$REPO" && bash setup.sh >>"$LOG" 2>&1); then
   restore_installed_artifacts || ARTIFACT_ROLLBACK_OK=false
   if [ "$REPO_ROLLBACK_OK" = true ] && [ "$ARTIFACT_ROLLBACK_OK" = true ]; then
     audit "setup-failed-rolled-back" "$OLD_SHA" "$NEW_SHA" "$CHANGED" false '[]'
-    notify "self-update 실패: setup.sh 오류 — repo와 설치본을 ${OLD_SHA:0:7} 상태로 롤백했습니다. 로그: ~/.claude/state/self-update.log" "fail-$NEW_SHA"
-    say "self-update: setup.sh failed; rolled back repo and installed artifacts to ${OLD_SHA:0:7}" >&2
+    notify "self-update 실패: setup.sh 오류 — repo와 설치본(Claude 하네스·honcho.json·Codex GitHub 정책 설정)을 ${OLD_SHA:0:7} 상태로 롤백했습니다. 로그: ~/.claude/state/self-update.log" "fail-$NEW_SHA"
+    say "self-update: setup.sh failed; rolled back repo and installed artifacts (Claude harness, honcho.json, Codex GitHub policy config) to ${OLD_SHA:0:7}" >&2
     exit 6
   fi
   audit "setup-failed-rollback-degraded" "$OLD_SHA" "$NEW_SHA" "$CHANGED" false '[]'
@@ -493,7 +504,7 @@ if bridge_service_allowlisted && ! bridge_runtime_config_preflight; then
   restore_installed_artifacts || ARTIFACT_ROLLBACK_OK=false
   if [ "$REPO_ROLLBACK_OK" = true ] && [ "$ARTIFACT_ROLLBACK_OK" = true ]; then
     audit "bridge-config-preflight-failed-rolled-back" "$OLD_SHA" "$NEW_SHA" "$CHANGED" false '[]'
-    notify "self-update 실패: bridge runtime config preflight 오류 — repo와 설치본을 ${OLD_SHA:0:7} 상태로 롤백했습니다. 로그: ~/.claude/state/self-update.log" "bridge-config-fail-$NEW_SHA"
+    notify "self-update 실패: bridge runtime config preflight 오류 — repo와 설치본(Claude 하네스·honcho.json·Codex GitHub 정책 설정)을 ${OLD_SHA:0:7} 상태로 롤백했습니다. 로그: ~/.claude/state/self-update.log" "bridge-config-fail-$NEW_SHA"
     say "self-update: bridge runtime config preflight failed; rolled back before service restart" >&2
     exit 6
   fi
