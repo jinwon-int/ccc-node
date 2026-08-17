@@ -5,7 +5,9 @@
 # which drives telegram-owner-on-failure notification.
 #
 # Three checks per node:
-#   1. availability — the bridge answers "Bot status: available"
+#   1. availability — the bridge answers "Bot status: available". "degraded"
+#                     (alive, but start.sh has lost the bookkeeping that makes
+#                     it restartable) is reported as DEGRADED, not DOWN.
 #   2. canonical    — the checkout it serves from is one the fleet installs at,
 #                     not a PR/issue work tree
 #   3. boot path    — the systemd unit that would restart the bridge points at
@@ -92,7 +94,18 @@ if [ "$(id -u)" = "$runuid" ]; then
 else
   st=$(su - "$runuser" -c "'$root/bridge/start.sh' --path '${bpath:-~}' --status" 2>/dev/null)
 fi
-printf '%s' "$st" | grep -q 'Bot status: available' && echo "AVAIL=yes" || echo "AVAIL=no"
+# Three states, not two. `degraded` means the process is alive and serving but
+# start.sh has lost its bookkeeping (typically a missing pid file), so --stop
+# and --restart cannot recover it. Collapsing that into AVAIL=no made the sweep
+# page "DOWN gongyung" on 2026-08-11 for a bridge that was answering Telegram
+# normally — the same cry-wolf failure the retry logic below was added to end.
+if printf '%s' "$st" | grep -q 'Bot status: available'; then
+  echo "AVAIL=yes"
+elif printf '%s' "$st" | grep -q 'Bot status: degraded'; then
+  echo "AVAIL=degraded"
+else
+  echo "AVAIL=no"
+fi
 
 # boot path — first unit that declares an ExecStart wins
 unit_root=""
@@ -107,6 +120,18 @@ echo "UNIT=${unit_root:--}"
 
 # doctor (opt-in). Runs as the account that owns the bridge, against the claude
 # dir that belongs to it — both derived above, never guessed.
+#
+# Known false positive, deliberately NOT worked around here: on piri nodes the
+# doctor reports `distill extractor ... executable=missing` for a CLI that is
+# installed and healthy, because CCC_PIRI_CLI_PATH exists only as a systemd
+# `Environment=` line on the bridge unit and a `su -` login shell never sees it.
+# Carrying the bridge's CLI-path variables across looks like the obvious fix and
+# is not: CCC_CODEX_CLI_PATH points at the memory-materializing ccc-codex
+# wrapper, and the doctor's Codex `--version` probe times out through it, so the
+# carry trades four false DRIFTs on piri nodes for a false DRIFT on every codex
+# node (measured on dungae and daegyo, 2026-08-11). The fix belongs in the
+# doctor, which alone knows which of its checks are existence tests and which
+# are live probes.
 if [ "${CCC_FLEET_DOCTOR:-0}" = "1" ] && [ -x "$root/scripts/ccc-doctor.sh" ]; then
   cdir="${bpath:-$HOME}/.claude"
   if [ "$(id -u)" = "$runuid" ]; then
@@ -221,6 +246,15 @@ $PROBE"
   avail=$(printf '%s\n' "$out" | sed -n 's/^AVAIL=//p' | head -1)
   runtime=$(printf '%s\n' "$out" | sed -n 's/^RUNTIME=//p' | head -1)
   unit=$(printf '%s\n' "$out" | sed -n 's/^UNIT=//p' | head -1)
+
+  # DEGRADED is still a failure — an unmanaged bridge cannot be restarted by
+  # start.sh, so the next self-update or recovery attempt on that node has
+  # nothing to act on. It is reported under its own name because the operator
+  # response differs: DOWN means restore service, DEGRADED means restore
+  # bookkeeping for a service that is already answering.
+  if [ "$avail" = "degraded" ]; then
+    echo "DEGRADED $node runtime=$runtime"; fail=1; continue
+  fi
 
   if [ "$avail" != "yes" ]; then
     echo "DOWN $node"; fail=1; continue
