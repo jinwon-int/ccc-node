@@ -200,6 +200,7 @@ begin_install_transaction() {
   fi
   tar -tzf "$SETUP_TXN_DIR/claude.tar.gz" >/dev/null
   tar -tzf "$SETUP_TXN_DIR/hermes.tar.gz" >/dev/null
+  ccc_snapshot_codex_policy_state "$CODEX_DIR" "$SETUP_TXN_DIR"
   SETUP_TXN_ACTIVE=1
 }
 
@@ -211,8 +212,9 @@ rollback_install_transaction() {
   tar -xzf "$SETUP_TXN_DIR/claude.tar.gz" -C "$CLAUDE_DIR" || failed=1
   rm -f -- "$HERMES_ROOT/honcho.json" || failed=1
   tar -xzf "$SETUP_TXN_DIR/hermes.tar.gz" -C "$HERMES_ROOT" || failed=1
+  ccc_restore_codex_policy_state "$CODEX_DIR" "$SETUP_TXN_DIR" || failed=1
   if [ "$failed" = 0 ]; then
-    echo "ERROR: setup failed; restored previous installed artifacts" >&2
+    echo "ERROR: setup failed; restored previous installed artifacts (Claude harness, honcho.json, Codex GitHub policy config)" >&2
   else
     echo "ERROR: setup failed and artifact rollback was degraded; inspect $SETUP_TXN_DIR" >&2
     return 1

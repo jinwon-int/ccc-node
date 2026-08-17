@@ -24,11 +24,15 @@ export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER
 # node's real ~/.telegram_bot/health.json, and on a node whose bridge is
 # actively serving a session every fixture update defers (rc=8) and the suite
 # mass-fails. Point it at a nonexistent fixture path instead (fail-open).
+# CODEX_HOME must likewise never resolve to the operator's real ~/.codex: the
+# artifact snapshot/rollback covers the Codex policy config (#1131), so an
+# unset CODEX_HOME would let a FAILED-fixture restore delete the live file.
 unset CCC_SELF_UPDATE_BRANCH CCC_SELF_UPDATE_SERVICES
 unset CCC_SELF_UPDATE_RESTART_CMD CCC_SELF_UPDATE_HEALTH_CMD
 unset CCC_SELF_UPDATE_RESTART_CMD_FILE CCC_SELF_UPDATE_HEALTH_CMD_FILE
 unset CCC_SELF_UPDATE_HEALTH_FRESH_SECONDS
 unset CCC_SELF_UPDATE_BUSY_MAX_SECONDS CCC_SELF_UPDATE_MAX_DEFER_SECONDS
+unset CODEX_HOME
 export CCC_SELF_UPDATE_HEALTH_FILE="$TMP/no-such-health.json"
 
 # Fixture: origin repo with a stub setup.sh, plus a node-side clone.
@@ -68,12 +72,12 @@ chmod +x "$FAKEBIN/fakesystemctl"
 CLAUDE="$TMP/claude"
 STATE="$CLAUDE/state"
 HERMES="$TMP/hermes"
-mkdir -p "$STATE" "$CLAUDE" "$HERMES"
+mkdir -p "$STATE" "$CLAUDE" "$HERMES" "$TMP/codex"
 export SETUP_MARKER="$TMP/setup.marker"
 
 run_selfup() {
   CCC_CLAUDE_DIR="$CLAUDE" CCC_STATE_DIR="$STATE" CCC_PUSH_SPOOL="$TMP/spool" \
-  CCC_HERMES_DIR="$HERMES" \
+  CCC_HERMES_DIR="$HERMES" CODEX_HOME="${CODEX_HOME:-$TMP/codex}" \
   CCC_SELF_UPDATE_BRIDGE_PROJECT_ROOT="$TMP/project" \
   CCC_SELF_UPDATE_REPO="${REPO_OVERRIDE:-$REPO}" CCC_SELF_UPDATE_SYSTEMCTL="$FAKEBIN/fakesystemctl" \
   CCC_SELF_UPDATE_RESTART_WAIT_SECONDS=3 \
@@ -285,6 +289,11 @@ mkdir -p "$CLAUDE/hooks"
 printf '%s\n' 'old-installed-hook' > "$CLAUDE/hooks/installed-hook.sh"
 printf '%s\n' '{"oldHoncho":true}' > "$HERMES/honcho.json"
 printf '%s\n' '{"oldLocal":true}' > "$CLAUDE/settings.local.json"
+# The broken setup also rewrites the Codex GitHub policy config the way
+# ccc_codex_github_policy.py does (in place, no backup); rollback must put it
+# back byte-for-byte (#1131).
+printf '%s\n' 'sentinel = "KEEP-ME"' '' '[plugins."github@openai-curated-remote"]' 'enabled = true' > "$TMP/codex/config.toml"
+CODEX_CFG_BEFORE="$(sha256sum "$TMP/codex/config.toml")"
 rm -f "$CLAUDE/headless.sh"
 INSTALLED_BEFORE="$(sha256sum "$CLAUDE/hooks/installed-hook.sh")"
 cat > "$TMP/seed/setup.sh" <<'SH'
@@ -292,6 +301,8 @@ cat > "$TMP/seed/setup.sh" <<'SH'
 printf '%s\n' 'partially-updated-hook' > "${CCC_CLAUDE_DIR:?}/hooks/installed-hook.sh"
 printf '%s\n' 'partially-created-headless' > "${CCC_CLAUDE_DIR:?}/headless.sh"
 printf '%s\n' '{"newHoncho":true}' > "${CCC_HERMES_DIR:?}/honcho.json"
+mkdir -p "${CODEX_HOME:?}"
+printf '%s\n' 'enabled = false # rewritten by policy' >> "${CODEX_HOME:?}/config.toml"
 exit 1
 SH
 git -C "$TMP/seed" add -A && git -C "$TMP/seed" commit -qm broken-setup && git -C "$TMP/seed" push -q origin main
@@ -299,6 +310,10 @@ out="$(run_selfup run 2>&1)"; rc=$?
 ok "setup failure exits non-zero and rolls back" '[ "$rc" = 6 ] && [ "$(git -C "$REPO" rev-parse HEAD)" = "$OLD_HEAD" ]'
 ok "setup failure restores installed artifacts" '[ "$(sha256sum "$CLAUDE/hooks/installed-hook.sh")" = "$INSTALLED_BEFORE" ]'
 ok "setup failure restores Hermes honcho artifact" 'grep -q "oldHoncho" "$HERMES/honcho.json"'
+ok "setup failure restores Codex GitHub policy config byte-for-byte (#1131)" \
+  '[ "$(sha256sum "$TMP/codex/config.toml")" = "$CODEX_CFG_BEFORE" ]'
+ok "rollback notification names the restored scope honestly (#1131)" \
+  'jq -r .text "$TMP/spool"/*SelfUpdate*.json | grep -q "Codex GitHub 정책 설정"'
 ok "setup failure keeps managed absent artifact absent" '[ ! -e "$CLAUDE/headless.sh" ]'
 # settings.local.json is node-local (unmanaged): self-update's snapshot/deploy/
 # rollback lifecycle never touches it, so a node's approvals survive intact (#454).
@@ -307,6 +322,14 @@ ok "self-update leaves node-local settings.local.json untouched" \
 ok "rollback audit recorded" 'grep -q "setup-failed-rolled-back" "$STATE/self-update.log"'
 ok "successful artifact rollback removes private recovery snapshot" \
   '! compgen -G "$STATE/self-update-install-rollback.*" >/dev/null'
+
+# Same broken run on a node with NO $CODEX_DIR: the failed run creates the
+# directory through the policy step, and the rollback must remove it whole
+# rather than strand the new policy state (#1131).
+rm -rf "$TMP/codex-fresh"
+out="$(CODEX_HOME="$TMP/codex-fresh" run_selfup run 2>&1)"; rc=$?
+ok "rollback removes a Codex dir the failed run created (#1131)" \
+  '[ "$rc" = 6 ] && [ ! -e "$TMP/codex-fresh" ]'
 
 # A failed repository reset must never be reported as a complete rollback.
 cat > "$FAKEBIN/git" <<'SH'
