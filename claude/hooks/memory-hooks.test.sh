@@ -513,5 +513,28 @@ ok "over-budget index degrades to a complete names-only list, no silent tail-dro
 out="$(HOME="$TMP/home" CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CCC_HOOK_DIR="$ROOT/claude/hooks" CCC_MEMORY_TOOLS_DIR="$tools" CCC_SKILLS_DIR="$skills" CCC_SKILL_INDEX_ENABLED=0 CCC_HONCHO_MEMORY_ENABLED=0 CCC_MEMORY_NO_REFRESH=1 bash "$ROOT/claude/hooks/load-memory.sh" SessionStart 2>&1)"; rc=$?
 ok "skill index can be disabled" '[ "$rc" = 0 ] && ! grep -q "Node skills index" <<<"$out"'
 
+# --- #1157: load-memory runs the scanner through bash, not its shebang -------
+# CCC_HOOK_DIR resolves only scan-injection.sh, so a fake scanner whose shebang
+# cannot resolve stands in for Termux, where /usr/bin/env does not exist.
+# Exec'ing it dies with 126, the command substitution fails, and the fail-open
+# branch injects the block UNSCANNED — every session, with nothing logged. The
+# scanner's own suite could not catch this: it invokes `bash "$SCAN"`, which is
+# exactly the form the callers lacked.
+fake_hookdir="$TMP/fake-hookdir"; mkdir -p "$fake_hookdir"
+cat > "$fake_hookdir/scan-injection.sh" <<EOF
+#!$TMP/no-such-interpreter
+sed 's/SENTINELSECRET/[REDACTED:credential]/'
+EOF
+chmod +x "$fake_hookdir/scan-injection.sh"
+scan_mem="$TMP/scan-mem"; mkdir -p "$scan_mem"
+printf 'Node memory: SENTINELSECRET\n' > "$scan_mem/MEMORY.md"
+printf 'User memory: Korean concise\n' > "$scan_mem/USER.md"
+out="$(HOME="$TMP/home" CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" \
+  CCC_MEMORY_DIR="$scan_mem" CCC_HOOK_DIR="$fake_hookdir" CCC_MEMORY_TOOLS_DIR="$tools" \
+  CCC_HONCHO_MEMORY_ENABLED=0 CCC_MEMORY_NO_REFRESH=1 \
+  bash "$ROOT/claude/hooks/load-memory.sh" SessionStart 2>&1)"
+ok "load-memory scans blocks when the scanner shebang does not resolve" \
+  'grep -q "REDACTED:credential" <<<"$out" && ! grep -q "SENTINELSECRET" <<<"$out"'
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

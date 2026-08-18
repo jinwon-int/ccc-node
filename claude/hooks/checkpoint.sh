@@ -82,12 +82,21 @@ state="$(cat "$STATE_FILE" 2>/dev/null)"
 # named the scanner, and silently substituting another would defeat the seam.
 if [ -n "${CCC_SCAN_INJECTION_BIN:-}" ]; then
   scan_bin="$CCC_SCAN_INJECTION_BIN"
+  ckpt_run_scanner() { "$scan_bin" "$1"; }
 else
   scan_bin="$CKPT_SELF_DIR/scan-injection.sh"
   [ -x "$scan_bin" ] || scan_bin="${HOME:-/root}/.claude/hooks/scan-injection.sh"
+  # Run the resolved scanner through bash instead of exec'ing it. Exec'ing
+  # depends on its `#!/usr/bin/env bash` resolving, and Termux has no /usr, so
+  # the exec dies with 126, the substitution below fails, and the fail-open
+  # branch re-injects the working state UNSCANNED — silently, on every
+  # compaction, on that whole platform (#1157). An explicit override keeps
+  # exec'ing as named: it may not be a bash script at all, and forcing an
+  # interpreter onto it would defeat the seam.
+  ckpt_run_scanner() { bash "$scan_bin" "$1"; }
 fi
 if [ -x "$scan_bin" ] \
-  && scanned="$(printf '%s' "$state" | "$scan_bin" working-state-checkpoint 2>/dev/null)"; then
+  && scanned="$(printf '%s' "$state" | ckpt_run_scanner working-state-checkpoint 2>/dev/null)"; then
   state="$scanned"
 fi
 latest="$(newest_file "$CKPT_DIR" 'working-state-*.md')"
