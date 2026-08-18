@@ -159,6 +159,16 @@ def cmd_run_memory_search_bounded(argv):
     escalates SIGTERM -> SIGKILL against the whole process group. Emits the
     tool's stdout only on exit 0. Uses Python rather than GNU timeout so the
     same contract works on Termux.
+
+    The tool is spawned through an explicit `bash` rather than its shebang:
+    Termux has no /usr/bin/env, so exec'ing the script directly fails with
+    ENOENT against the *interpreter* — and the OSError below used to swallow
+    that silently, leaving hot-memory search permanently empty on that whole
+    platform (#1159; same root as #472/#663/#1151/#1157). A missing *tool* is
+    unchanged behavior-wise: bash starts, fails to open the script, exits 127,
+    and no output is emitted. An OSError now means bash itself could not be
+    spawned, which is genuinely exceptional — so it is noted on stderr (the
+    hook's stderr lands in the session/hook logs) instead of vanishing.
     """
     tool, query, limit, raw_timeout, state_override = argv
     try:
@@ -176,14 +186,18 @@ def cmd_run_memory_search_bounded(argv):
         env["CCC_MEMORY_INDEX_DB"] = os.path.join(state_override, "memory-index.sqlite")
     try:
         proc = subprocess.Popen(
-            [tool, query],
+            ["bash", tool, query],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             env=env,
             start_new_session=True,
         )
-    except OSError:
+    except OSError as exc:
+        sys.stderr.write(
+            "memory_render: run-memory-search-bounded: cannot spawn tool %r: %s\n"
+            % (tool, exc)
+        )
         raise SystemExit(0)
     try:
         stdout, _ = proc.communicate(timeout=timeout)
