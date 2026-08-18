@@ -13,6 +13,9 @@ ok()  { if eval "$2"; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: 
 okc() { if [ "$1" = "$2" ]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $3 (rc=$1 want=$2)"; fi; }
 
 TMP="$(mktemp -d)"
+# Fixture stubs name the build host's resolved bash, not `#!/usr/bin/env bash`
+# which cannot resolve on Termux (#1153; same root as #472/#663).
+. "$HERE/../claude/hooks/lib/test-stub.sh"
 SPAWNED_PIDS="$TMP/spawned.pids"
 : > "$SPAWNED_PIDS"
 SELF_PARENT=""
@@ -44,10 +47,14 @@ run() { RC=0; "$@" >"$OUT" 2>&1 || RC=$?; }
 # systemctl stubs: one where every call (incl. is-active) succeeds, one where
 # is-active reports inactive (rc 3, like real systemctl).
 SC_OK="$TMP/systemctl-ok"
-printf '#!/usr/bin/env bash\nexit 0\n' > "$SC_OK"; chmod +x "$SC_OK"
+write_exec_stub "$SC_OK" <<'SH'
+exit 0
+SH
 SC_INACTIVE="$TMP/systemctl-inactive"
-printf '#!/usr/bin/env bash\ncase " $* " in *" is-active "*) exit 3 ;; esac\nexit 0\n' > "$SC_INACTIVE"
-chmod +x "$SC_INACTIVE"
+write_exec_stub "$SC_INACTIVE" <<'SH'
+case " $* " in *" is-active "*) exit 3 ;; esac
+exit 0
+SH
 
 SD_EMPTY="$TMP/sd-empty"; mkdir -p "$SD_EMPTY"          # no unit => not managed
 SD_MANAGED="$TMP/sd-managed"; mkdir -p "$SD_MANAGED"
@@ -103,11 +110,12 @@ SELF_OUT="$TMP/self.out"
 SELF_RC="$TMP/self.rc"
 SELF_SPAWNED="$TMP/self-spawned"
 FAKE_SELF_SPAWN="$TMP/fake-start-self"
-printf '#!/usr/bin/env bash\ntouch "%s"\nexit 0\n' "$SELF_SPAWNED" > "$FAKE_SELF_SPAWN"
-chmod +x "$FAKE_SELF_SPAWN"
+write_exec_stub "$FAKE_SELF_SPAWN" <<EOF
+touch "$SELF_SPAWNED"
+exit 0
+EOF
 FAKE_SELF_PROVIDER="$TMP/fake-provider-self"
-cat > "$FAKE_SELF_PROVIDER" <<EOF
-#!/usr/bin/env bash
+write_exec_stub "$FAKE_SELF_PROVIDER" <<EOF
 echo "\$\$" > "$BD/bot.pid"
 HOME="$HOMEDIR" CCC_SYSTEMD_DIR="$SD_MANAGED" CCC_SYSTEMCTL="$SC_INACTIVE" \\
     CCC_BRIDGE_RESTART_SPAWN="$FAKE_SELF_SPAWN" \\
@@ -118,7 +126,6 @@ keeper=\$!
 echo "\$keeper" >> "$SPAWNED_PIDS"
 wait "\$keeper"
 EOF
-chmod +x "$FAKE_SELF_PROVIDER"
 bash "$FAKE_SELF_PROVIDER" &
 SELF_PARENT=$!
 for _ in $(seq 1 100); do
@@ -147,8 +154,7 @@ echo "$OLD" >> "$SPAWNED_PIDS"
 echo "$OLD" > "$BD/bot.pid"
 CALLS="$TMP/fg-spawn.calls"
 FAKE_FG="$TMP/fake-start-fg"
-cat > "$FAKE_FG" <<EOF
-#!/usr/bin/env bash
+write_exec_stub "$FAKE_FG" <<EOF
 printf '%s\n' "\$*" >> "$CALLS"
 echo \$\$ > "$BD/bot.pid"
 cat > "$BD/health.json" <<HEOF
@@ -159,7 +165,6 @@ cat > "$BD/health.json" <<HEOF
 HEOF
 exec sleep 300
 EOF
-chmod +x "$FAKE_FG"
 run env HOME="$HOMEDIR" CCC_SYSTEMD_DIR="$SD_EMPTY" CCC_SYSTEMCTL="$SC_OK" \
     CCC_BRIDGE_RESTART_SPAWN="$FAKE_FG" \
     CCC_BRIDGE_RESTART_STOP_TIMEOUT=5 CCC_BRIDGE_RESTART_READY_TIMEOUT=15 \
@@ -182,8 +187,7 @@ kill "$NEW" 2>/dev/null
 new_project dm "123456:TEST-restart-dm"
 DCALLS="$TMP/dm-spawn.calls"
 FAKE_DM="$TMP/fake-start-dm"
-cat > "$FAKE_DM" <<EOF
-#!/usr/bin/env bash
+write_exec_stub "$FAKE_DM" <<EOF
 printf '%s\n' "\$*" >> "$DCALLS"
 sleep 300 &
 child=\$!
@@ -197,7 +201,6 @@ cat > "$BD/health.json" <<HEOF
 HEOF
 exit 0
 EOF
-chmod +x "$FAKE_DM"
 run env HOME="$HOMEDIR" CCC_SYSTEMD_DIR="$SD_EMPTY" CCC_SYSTEMCTL="$SC_OK" \
     CCC_BRIDGE_RESTART_SPAWN="$FAKE_DM" \
     CCC_BRIDGE_RESTART_STOP_TIMEOUT=5 CCC_BRIDGE_RESTART_READY_TIMEOUT=15 \
@@ -213,12 +216,10 @@ kill "$DNEW" 2>/dev/null
 # ---- readiness timeout: nonzero with a clear reason -------------------------
 new_project slow "123456:TEST-restart-slow"
 FAKE_SLOW="$TMP/fake-start-slow"
-cat > "$FAKE_SLOW" <<EOF
-#!/usr/bin/env bash
+write_exec_stub "$FAKE_SLOW" <<EOF
 echo \$\$ > "$BD/bot.pid"
 exec sleep 300
 EOF
-chmod +x "$FAKE_SLOW"
 run env HOME="$HOMEDIR" CCC_SYSTEMD_DIR="$SD_EMPTY" CCC_SYSTEMCTL="$SC_OK" \
     CCC_BRIDGE_RESTART_SPAWN="$FAKE_SLOW" \
     CCC_BRIDGE_RESTART_STOP_TIMEOUT=5 CCC_BRIDGE_RESTART_READY_TIMEOUT=2 \
@@ -253,8 +254,10 @@ sleep() { command sleep 0.05; }
 EOF
 STUCK_CALLS="$TMP/stuck-spawn.calls"
 FAKE_STUCK="$TMP/fake-start-stuck"
-printf '#!/usr/bin/env bash\ntouch "%s"\nexit 0\n' "$STUCK_CALLS" > "$FAKE_STUCK"
-chmod +x "$FAKE_STUCK"
+write_exec_stub "$FAKE_STUCK" <<EOF
+touch "$STUCK_CALLS"
+exit 0
+EOF
 run env HOME="$HOMEDIR" CCC_SYSTEMD_DIR="$SD_EMPTY" CCC_SYSTEMCTL="$SC_OK" \
     BASH_ENV="$STUBENV" CCC_TEST_UNKILLABLE_PID="$UNKILLABLE" \
     CCC_BRIDGE_RESTART_SPAWN="$FAKE_STUCK" \
