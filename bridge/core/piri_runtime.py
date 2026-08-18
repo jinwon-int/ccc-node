@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Callable, Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 import os
@@ -59,6 +59,8 @@ class PiriClient(Protocol):
 
     async def get_state(self) -> Mapping[str, Any]: ...
 
+    async def set_append_system_prompt(self, text: str | None = None) -> None: ...
+
     async def get_available_models(self) -> Sequence[Mapping[str, Any]]: ...
 
     async def next_event(self) -> Mapping[str, Any]: ...
@@ -83,6 +85,19 @@ PiriClientFactory = Callable[[PiriLaunchConfig], PiriClient]
 PiriMemoryEnvironmentValidator = Callable[[Mapping[str, str]], object]
 PiriRouteEnvironmentFactory = Callable[[str, str], Mapping[str, str]]
 
+# Returns the refreshed memory snapshot to inject, or None to skip this round.
+# Implementations must be best-effort: a refresh failure must never fail a turn.
+PiriMemoryRefresher = Callable[[], Awaitable[str | None]]
+
+
+@dataclass(frozen=True, slots=True)
+class _MemoryRoute:
+    """Validated audience memory route captured at session start."""
+
+    session_directory: Path
+    context_file: Path
+    bootstrap_environment: Mapping[str, str]
+
 
 class PiriSession:
     """One serialized ccc-node session backed by one persistent Piri process."""
@@ -93,6 +108,7 @@ class PiriSession:
         client: PiriClient,
         *,
         on_close: Callable[[PiriSession], None] | None = None,
+        memory_refresher: PiriMemoryRefresher | None = None,
     ) -> None:
         if not session_id:
             raise ValueError("Piri session id must not be empty")
@@ -103,6 +119,9 @@ class PiriSession:
         self._interrupt_requested = False
         self._on_close = on_close
         self._closed = False
+        self._memory_refresher = memory_refresher
+        # Bounded idempotency ledger for post-compaction memory refreshes.
+        self._applied_compaction_ids: list[str] = []
 
     @property
     def session_id(self) -> str:
@@ -146,6 +165,11 @@ class PiriSession:
                 cleanup_required = True
                 while True:
                     event = await self._client.next_event()
+                    if event.get("type") == "compaction_end":
+                        # piri#2 lifecycle hook: refresh the injected memory snapshot.
+                        # Never surfaced to consumers and never allowed to fail a turn.
+                        await self._maybe_refresh_memory(event)
+                        continue
                     if event.get("type") == "agent_settled":
                         # Mark settled before yielding either terminal sequence. If the
                         # consumer closes between ResultEvent and CompletionEvent, there
@@ -183,6 +207,39 @@ class PiriSession:
                 finally:
                     self._active = False
                     self._interrupt_requested = False
+
+    async def _maybe_refresh_memory(self, event: Mapping[str, Any]) -> None:
+        """Best-effort post-compaction memory refresh (piri#2 consumer).
+
+        Triggered by `compaction_end` events carrying body-free identifiers.
+        Idempotent per compaction entry: each persisted compaction triggers at
+        most one refresh, regardless of event replays.
+        """
+
+        refresher = self._memory_refresher
+        if refresher is None:
+            return
+        if event.get("sessionId") != self._session_id:
+            return
+        if event.get("aborted"):
+            return
+        entry_id = event.get("compactionEntryId")
+        if not isinstance(entry_id, str) or not entry_id:
+            return
+        if entry_id in self._applied_compaction_ids:
+            return
+        self._applied_compaction_ids.append(entry_id)
+        del self._applied_compaction_ids[:-16]
+        try:
+            content = await refresher()
+        except Exception:
+            return
+        if content is None:
+            return
+        try:
+            await self._client.set_append_system_prompt(content)
+        except Exception:
+            return
 
     def send_turn(
         self,
@@ -270,7 +327,7 @@ class PiriRuntime:
         _validate_cli_selection(request)
         command = [self._executable, "--mode", "rpc", "--approve"]
         environment = dict(self._process_environment)
-        session_directory: Path | None = None
+        memory_route: _MemoryRoute | None = None
         if request.memory_environment is not None:
             if (
                 self._memory_materializer_path is not None
@@ -281,10 +338,10 @@ class PiriRuntime:
                 self._memory_environment_validator(request.memory_environment)
             environment.update(request.memory_environment)
             if self._memory_materializer_path is not None:
-                session_directory = await self._prepare_memory_bootstrap(
-                    command,
-                    environment,
-                )
+                memory_route = await self._prepare_memory_bootstrap(environment)
+                # Audience isolation (no AGENTS/CLAUDE auto-discovery) holds
+                # regardless of the injection mode.
+                command.append("--no-context-files")
         if request.session_id is not None:
             command.extend(("--session-id", request.session_id))
         if request.model is not None:
@@ -292,6 +349,58 @@ class PiriRuntime:
         if request.effort is not None:
             command.extend(("--thinking", request.effort))
 
+        client, state = await self._spawn_and_verify(command, environment, request)
+        session_id = cast(str, state["sessionId"])
+
+        memory_refresher: PiriMemoryRefresher | None = None
+        if memory_route is not None:
+            capabilities = state.get("capabilities")
+            if isinstance(capabilities, (list, tuple)) and "set_append_system_prompt" in capabilities:
+                # piri#2 path: inject over RPC so post-compaction refreshes replace
+                # the segment cleanly instead of duplicating a stale loader append.
+                try:
+                    content = await asyncio.to_thread(
+                        self._read_memory_context,
+                        memory_route.context_file,
+                    )
+                    await client.set_append_system_prompt(content)
+                except Exception:
+                    with suppress(Exception):
+                        await client.close()
+                    raise RuntimeError("Piri memory bootstrap unavailable") from None
+                memory_refresher = self._make_memory_refresher(memory_route)
+            else:
+                # Legacy piri without the runtime-injection capability: close the
+                # probe and respawn with the spawn-time CLI append (pre-piri#2
+                # behavior, no mid-session refresh).
+                with suppress(Exception):
+                    await client.close()
+                legacy_command = [
+                    *command,
+                    "--append-system-prompt",
+                    str(memory_route.context_file),
+                ]
+                client, state = await self._spawn_and_verify(legacy_command, environment, request)
+                session_id = cast(str, state["sessionId"])
+
+        if memory_route is not None:
+            self._session_directories[session_id] = memory_route.session_directory
+
+        session = PiriSession(
+            session_id,
+            client,
+            on_close=self._sessions.discard,
+            memory_refresher=memory_refresher,
+        )
+        self._sessions.add(session)
+        return session
+
+    async def _spawn_and_verify(
+        self,
+        command: list[str],
+        environment: Mapping[str, str],
+        request: SessionRequest,
+    ) -> tuple[PiriClient, Mapping[str, Any]]:
         config = PiriLaunchConfig(
             command=tuple(command),
             working_directory=request.working_directory,
@@ -318,22 +427,12 @@ class PiriRuntime:
         if request.session_id is not None and session_id != request.session_id:
             await client.close()
             raise RuntimeError("Piri resumed a different session id")
-        if session_directory is not None:
-            self._session_directories[session_id] = session_directory
-
-        session = PiriSession(
-            session_id,
-            client,
-            on_close=self._sessions.discard,
-        )
-        self._sessions.add(session)
-        return session
+        return client, state
 
     async def _prepare_memory_bootstrap(
         self,
-        command: list[str],
-        environment: dict[str, str],
-    ) -> Path:
+        environment: Mapping[str, str],
+    ) -> _MemoryRoute:
         session_value = environment.get("PIRI_CODING_AGENT_SESSION_DIR")
         bootstrap_value = environment.get("CCC_PIRI_BOOTSTRAP_HOME")
         context_value = environment.get("CCC_PIRI_BOOTSTRAP_CONTEXT_FILE")
@@ -356,8 +455,41 @@ class PiriRuntime:
             environment=bootstrap_environment,
         )
         self._validate_memory_context(context_file)
-        command.extend(("--no-context-files", "--append-system-prompt", str(context_file)))
-        return session_directory
+        return _MemoryRoute(
+            session_directory=session_directory,
+            context_file=context_file,
+            bootstrap_environment=MappingProxyType(bootstrap_environment),
+        )
+
+    @staticmethod
+    def _read_memory_context(context_file: Path) -> str:
+        """Validated read of the materialized snapshot for RPC injection."""
+
+        PiriRuntime._validate_memory_context(context_file)
+        return context_file.read_text(encoding="utf-8")
+
+    def _make_memory_refresher(self, route: _MemoryRoute) -> PiriMemoryRefresher:
+        """Re-materialize the audience snapshot and return its content.
+
+        Best-effort: a materializer failure falls back to the last successfully
+        materialized file; an unreadable/invalid snapshot skips the round.
+        """
+
+        async def refresh() -> str | None:
+            try:
+                await _run_codex_memory_bootstrap(
+                    self._memory_materializer_path or "",
+                    timeout_seconds=self._memory_bootstrap_timeout_seconds,
+                    environment=dict(route.bootstrap_environment),
+                )
+            except Exception:
+                pass
+            try:
+                return await asyncio.to_thread(self._read_memory_context, route.context_file)
+            except Exception:
+                return None
+
+        return refresh
 
     @staticmethod
     def _validate_memory_context(path: Path) -> None:

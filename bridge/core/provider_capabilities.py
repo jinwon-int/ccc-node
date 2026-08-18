@@ -583,10 +583,11 @@ CAPABILITY_AXES: tuple[CapabilityAxis, ...] = (
             "not treated as compaction. Provider compaction checkpoint/reinjection "
             "therefore remains unverified."
         ),
-        piri=_degraded(
-            "Cold start/resume refreshes and re-appends the scoped snapshot, but Piri "
-            "exposes no ccc compaction lifecycle hook for an explicit mid-session "
-            "checkpoint or reinjection proof."
+        piri=_supported(
+            "Capable Piri builds (RPC protocolVersion 1, set_append_system_prompt) inject "
+            "the scoped snapshot over RPC at session start and re-inject a refreshed "
+            "snapshot on compaction_end, idempotent per (sessionId, compactionEntryId); "
+            "legacy builds keep the cold-start CLI append with no mid-session refresh."
         ),
     ),
     _axis(

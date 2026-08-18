@@ -120,6 +120,19 @@ class PiriRpcProcessClient:
         response = await self._request("get_state")
         return self._response_data(response, command="get_state")
 
+    async def set_append_system_prompt(self, text: str | None = None) -> None:
+        """Set, replace, or clear the runtime-appended system prompt segment.
+
+        piri#2 contract: the segment is part of the base system prompt, so it
+        survives compaction. Passing no text clears the segment. Only call when
+        `get_state` reports the `set_append_system_prompt` capability.
+        """
+
+        params: dict[str, Any] = {}
+        if text is not None:
+            params["text"] = text
+        await self._request("set_append_system_prompt", **params)
+
     async def get_available_models(self) -> Sequence[Mapping[str, Any]]:
         response = await self._request("get_available_models")
         data = self._response_data(response, command="get_available_models")
