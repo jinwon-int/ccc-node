@@ -25,12 +25,54 @@
 #     hash-of-hashes (per-file sha256 hexdigests, one per line, hashed again),
 #     which also avoids concatenation boundary ambiguity.
 
+# ccc_installer_gen_inputs <installer-abspath>
+#   Prints the canonical stamp content inputs, one per line, in a stable
+#   order: the installer itself, then the shared rendering libs it depends on.
+#   The list is owned HERE, once — installers stamp with it, and ccc-doctor /
+#   ccc-self-update recompute with it, so the three never disagree about what
+#   a stamp describes. (A disagreement would surface as permanent false drift
+#   and a re-apply every self-update tick.)
+#
+#   installer-gen-stamp.sh itself is deliberately NOT an input: it is the
+#   measuring instrument, not a rendering input. If the stamp algorithm ever
+#   changes, pre-change stamps legitimately fail comparison and the fleet
+#   re-stamps through self-update re-apply — that is the designed failure
+#   mode, not a bug.
+ccc_installer_gen_inputs() {
+  [ -n "${1:-}" ] || { echo "installer-gen-stamp: gen inputs need an installer path" >&2; return 2; }
+  local self="$1" dir extras lib
+  dir="$(cd "$(dirname "$self")" && pwd)" || return 1
+  # Extra rendering inputs per installer (basename → space-separated lib
+  # basenames under scripts/lib). Adding a shared-lib dependency to an
+  # installer means adding it here too, or a lib-only change renders new
+  # entries while the stamp stays put — the exact blind spot #1081 closed.
+  extras=""
+  case "$(basename "$self")" in
+    # The three crontab installers render through the shared cron lib (#1077).
+    install-memory-refresh-cron.sh|install-pr-status-poll-cron.sh|install-skill-autosave-cron.sh)
+      extras="installer-cron-common.sh" ;;
+  esac
+  printf '%s\n' "$self"
+  for lib in $extras; do
+    printf '%s\n' "$dir/lib/$lib"
+  done
+}
+
+# ccc_installer_gen_stamp_auto <installer-abspath>
+#   Stamp over the canonical inputs of ccc_installer_gen_inputs. This is the
+#   call every stamper and every recomputer should make.
+ccc_installer_gen_stamp_auto() {
+  local inputs=()
+  mapfile -t inputs < <(ccc_installer_gen_inputs "$1") || return 2
+  ccc_installer_gen_stamp "${inputs[@]}"
+}
+
 # ccc_installer_gen_stamp <content-input> [extra-content-input ...]
 #   Prints h_<12 lowercase hex>. Every input must be a readable regular file
 #   (no symlinks — the stamp must describe the bytes the installer actually
 #   read). The first input is conventionally the installer script itself;
-#   when the cron-installer shared lib (#1077) lands, installers that source
-#   it pass it as an extra input so a lib change re-stamps their entries.
+#   shared rendering libs (see ccc_installer_gen_inputs) are passed as extra
+#   inputs so a lib change re-stamps the entries rendered through it.
 ccc_installer_gen_stamp() {
   [ "$#" -ge 1 ] || { echo "installer-gen-stamp: no content input given" >&2; return 2; }
   local f

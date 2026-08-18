@@ -79,10 +79,11 @@ ok "installed line runs the autosave cmd" 'grep -q "ccc-skill-autosave.sh" "$CRO
 ok "managed timezone block installed" \
   '[ "$(grep -cF "# ccc-node:autosave-schedule:begin" "$CRON_STORE")" = 1 ] && grep -qF "CRON_TZ=Etc/UTC" "$CRON_STORE"'
 
-# ---- generation stamp (#1081): content hash of the installer ----------------
+# ---- generation stamp (#1081): content hash of installer + shared libs ------
+# Inputs are owned by ccc_installer_gen_inputs (#1077): installer + cron-common.
 # shellcheck source=/dev/null
 . "$HERE/lib/installer-gen-stamp.sh"
-want_gen="$(ccc_installer_gen_stamp "$SC")"
+want_gen="$(ccc_installer_gen_stamp_auto "$SC")"
 ok "installed line carries gen stamp" 'grep -qE "# ccc-node:skill-autosave gen=h_[0-9a-f]{12}$" "$CRON_STORE"'
 ok "gen stamp matches installer content" 'grep -qF "gen=$want_gen" "$CRON_STORE"'
 ok "BEGIN/END block markers stay unstamped (exact-match parsed)" '! grep -qE "autosave-schedule:(begin|end) gen=" "$CRON_STORE"'

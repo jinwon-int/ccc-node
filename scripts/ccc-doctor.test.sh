@@ -789,15 +789,16 @@ ok "missing MemPalace CLI is a 경고 (peer-facts-only degrade), body-free" \
 cdrepo="$TMP/cron-drift-repo"
 mkdir -p "$cdrepo/scripts/lib" "$cdrepo/.claude"
 cp "$ROOT/scripts/lib/installer-gen-stamp.sh" "$cdrepo/scripts/lib/"
+cp "$ROOT/scripts/lib/installer-cron-common.sh" "$cdrepo/scripts/lib/"
 for s in install-memory-refresh-cron install-pr-status-poll-cron install-skill-autosave-cron install-nunchi; do
   cp "$ROOT/scripts/$s.sh" "$cdrepo/scripts/"
 done
 # shellcheck source=/dev/null
 . "$ROOT/scripts/lib/installer-gen-stamp.sh"
-gen_mr="$(ccc_installer_gen_stamp "$cdrepo/scripts/install-memory-refresh-cron.sh")"
-gen_pp="$(ccc_installer_gen_stamp "$cdrepo/scripts/install-pr-status-poll-cron.sh")"
-gen_sa="$(ccc_installer_gen_stamp "$cdrepo/scripts/install-skill-autosave-cron.sh")"
-gen_nu="$(ccc_installer_gen_stamp "$cdrepo/scripts/install-nunchi.sh")"
+gen_mr="$(ccc_installer_gen_stamp_auto "$cdrepo/scripts/install-memory-refresh-cron.sh")"
+gen_pp="$(ccc_installer_gen_stamp_auto "$cdrepo/scripts/install-pr-status-poll-cron.sh")"
+gen_sa="$(ccc_installer_gen_stamp_auto "$cdrepo/scripts/install-skill-autosave-cron.sh")"
+gen_nu="$(ccc_installer_gen_stamp_auto "$cdrepo/scripts/install-nunchi.sh")"
 cat > "$TMP/cron-drift.py" <<'PY_EOF'
 import json, os, sys
 from pathlib import Path
@@ -828,8 +829,12 @@ ok "empty crontab: four opt-in rows, all 정상" \
 ok "empty crontab: rows are the four known markers" \
   'jq -e "[.rows[].item] == [\"cron gen memory-refresh\", \"cron gen pr-status-poll\", \"cron gen skill-autosave\", \"cron gen nunchi\"]" <<<"$cd_out" >/dev/null'
 
-full_cron="*/30 * * * * bash -lc 'x' >> /l 2>&1  # ccc-node:memory-refresh gen=$gen_mr
+full_cron="# ccc-node:memory-refresh:begin
+*/30 * * * * bash -lc 'x' >> /l 2>&1  # ccc-node:memory-refresh gen=$gen_mr
+# ccc-node:memory-refresh:end
+# ccc-node:pr-status-poll:begin
 */17 * * * * bash -lc 'x' >> /l 2>&1  # ccc-node:pr-status-poll gen=$gen_pp
+# ccc-node:pr-status-poll:end
 # ccc-node:autosave-schedule:begin
 CRON_TZ=Etc/UTC
 45 20 * * * bash -lc 'x' >> /l 2>&1  # ccc-node:skill-autosave gen=$gen_sa
@@ -842,6 +847,8 @@ ok "all-stamped current entries: four 정상 rows" \
   'jq -e "[.rows[] | select(.klass != \"정상\")] | length == 0" <<<"$cd_out" >/dev/null'
 ok "nunchi row reports all three lines current" \
   'jq -e ".rows[] | select(.item == \"cron gen nunchi\") | .status | contains(\"lines=3\")" <<<"$cd_out" >/dev/null'
+ok "block-wrapped lanes count entries only, not BEGIN/END markers" \
+  'jq -e ".rows[] | select(.item == \"cron gen memory-refresh\") | .status | contains(\"lines=1\")" <<<"$cd_out" >/dev/null'
 ok "BEGIN/END block markers are not misread as unmanaged" \
   '! jq -e ".rows[] | select(.item == \"cron unmanaged markers\")" <<<"$cd_out" >/dev/null'
 
