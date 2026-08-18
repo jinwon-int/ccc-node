@@ -3,6 +3,13 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 CHECKPOINT="$HERE/checkpoint.sh"
+# Fixtures supply every input; ambient harness variables must not reach the
+# script under test (#1023). On an audience-scoped node the session exports
+# CCC_MEMORY_AUDIENCE_SCOPED/CCC_MEMORY_AUDIENCE, which silently decided the
+# legacy-fallback branch below until this reset was added (#1155).
+# shellcheck source=claude/hooks/lib/test-stub.sh
+. "$HERE/lib/test-stub.sh"
+ccc_test_reset_hook_env
 pass=0; fail=0
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
@@ -55,6 +62,52 @@ chmod +x "$TMP/failing-scanner"
 out="$(CCC_STATE_DIR="$scan_state" CCC_SCAN_INJECTION_BIN="$TMP/failing-scanner" bash "$CHECKPOINT" PostCompact 2>&1)"; rc=$?
 ok "failing scanner fails open with raw text" \
   '[ "$rc" = 0 ] && jq -e ".hookSpecificOutput.additionalContext | contains(\"progress note\")" <<<"$out" >/dev/null'
+
+# --- #1155: an audience-scoped session still sees pre-scope working-state ----
+# A scoped session points CCC_STATE_DIR at a per-audience tree that starts
+# empty. The node's pre-scope working-state.md has to keep reaching the model,
+# read in place, and only for a private audience.
+legacy_dir="$TMP/legacy-state"; mkdir -p "$legacy_dir"
+printf 'pre-scope task context\n' > "$legacy_dir/working-state.md"
+scoped_dir="$TMP/scoped-state"; mkdir -p "$scoped_dir"
+
+out="$(CCC_STATE_DIR="$scoped_dir" CCC_MEMORY_AUDIENCE_SCOPED=1 CCC_MEMORY_AUDIENCE=private \
+  CCC_MEMORY_LEGACY_STATE_DIR="$legacy_dir" bash "$CHECKPOINT" PostCompact 2>&1)"
+ctx="$(jq -r '.hookSpecificOutput.additionalContext' <<<"$out")"
+ok "scoped private session re-injects pre-scope working-state" \
+  'grep -q "pre-scope task context" <<<"$ctx"'
+
+CCC_STATE_DIR="$scoped_dir" CCC_MEMORY_AUDIENCE_SCOPED=1 CCC_MEMORY_AUDIENCE=private \
+  CCC_MEMORY_LEGACY_STATE_DIR="$legacy_dir" bash "$CHECKPOINT" PreCompact >/dev/null 2>&1
+ok "scoped private session snapshots pre-scope working-state" \
+  '[ "$(find "$scoped_dir/checkpoints" -maxdepth 1 -type f -name "working-state-*.md" | wc -l | tr -d "[:space:]")" = 1 ]'
+
+# The gate is a privacy boundary, not an optimization: a shared audience must
+# never receive the node's private pre-scope working memory.
+shared_dir="$TMP/shared-state"; mkdir -p "$shared_dir"
+out="$(CCC_STATE_DIR="$shared_dir" CCC_MEMORY_AUDIENCE_SCOPED=1 CCC_MEMORY_AUDIENCE=shared \
+  CCC_MEMORY_LEGACY_STATE_DIR="$legacy_dir" bash "$CHECKPOINT" PostCompact 2>&1)"
+ctx="$(jq -r '.hookSpecificOutput.additionalContext' <<<"$out")"
+ok "shared audience does NOT receive pre-scope working-state" \
+  '! grep -q "pre-scope task context" <<<"$ctx"'
+
+# Legacy is a fallback, never a merge: the scoped file wins whenever it exists.
+own_dir="$TMP/own-state"; mkdir -p "$own_dir"
+printf 'scoped current work\n' > "$own_dir/working-state.md"
+out="$(CCC_STATE_DIR="$own_dir" CCC_MEMORY_AUDIENCE_SCOPED=1 CCC_MEMORY_AUDIENCE=private \
+  CCC_MEMORY_LEGACY_STATE_DIR="$legacy_dir" bash "$CHECKPOINT" PostCompact 2>&1)"
+ctx="$(jq -r '.hookSpecificOutput.additionalContext' <<<"$out")"
+ok "scoped working-state wins over legacy" \
+  'grep -q "scoped current work" <<<"$ctx" && ! grep -q "pre-scope task context" <<<"$ctx"'
+
+# An unscoped node must behave exactly as before: no audience vars, so no
+# legacy pull even though CCC_STATE_DIR points somewhere empty.
+plain_dir="$TMP/plain-state"; mkdir -p "$plain_dir"
+out="$(CCC_STATE_DIR="$plain_dir" CCC_MEMORY_LEGACY_STATE_DIR="$legacy_dir" \
+  bash "$CHECKPOINT" PostCompact 2>&1)"
+ctx="$(jq -r '.hookSpecificOutput.additionalContext' <<<"$out")"
+ok "unscoped node does not pull legacy working-state" \
+  '! grep -q "pre-scope task context" <<<"$ctx"'
 
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
