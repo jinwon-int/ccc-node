@@ -103,6 +103,15 @@ if [ "$APPLY" = 1 ]; then
     mkdir -p "$(dirname "$LOG")" 2>/dev/null || true
   fi
   printf '%s\n' "$desired" | "$CRONTAB" -
+  if [ "$REMOVE" = 1 ]; then
+    ccc_installer_record_remove "$STATE_DIR" "$SELF_DIR/install-pr-status-poll-cron.sh" || true
+  else
+    # Install record (#1081 phase 2): lets self-update replay this exact
+    # resolved invocation when the gen stamp drifts. Best-effort.
+    ccc_installer_record_write "$STATE_DIR" "$SELF_DIR/install-pr-status-poll-cron.sh" "$MARKER" "$GEN" -- \
+      --apply --schedule "$SCHEDULE" \
+      || echo "WARNING: install record write failed — self-update re-apply will not track this entry" >&2
+  fi
   echo "pr-status-poll cron: ${action} done (schedule: ${SCHEDULE})"
 else
   echo "[dry-run] would ${action} pr-status-poll cron (schedule: ${SCHEDULE}); pass --apply to write"

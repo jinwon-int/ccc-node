@@ -104,6 +104,18 @@ if [ "$APPLY" = 1 ]; then
     mkdir -p "$(dirname "$LOG")" 2>/dev/null || true
   fi
   printf '%s\n' "$desired" | "$CRONTAB" -
+  if [ "$REMOVE" = 1 ]; then
+    # A deliberate removal must drop the record too, or the next self-update
+    # re-apply would resurrect the entry.
+    ccc_installer_record_remove "$STATE_DIR" "$ROOT/scripts/install-memory-refresh-cron.sh" || true
+  else
+    # Install record (#1081 phase 2): lets self-update replay this exact
+    # resolved invocation when the gen stamp drifts. Best-effort — the cron
+    # change above is already done and must not be reported as failed.
+    ccc_installer_record_write "$STATE_DIR" "$ROOT/scripts/install-memory-refresh-cron.sh" "$MARKER" "$GEN" -- \
+      --apply --schedule "$SCHEDULE" \
+      || echo "WARNING: install record write failed — self-update re-apply will not track this entry" >&2
+  fi
   echo "memory-refresh cron: ${action} done (schedule: ${SCHEDULE})"
 else
   echo "[dry-run] would ${action} memory-refresh cron (schedule: ${SCHEDULE}); pass --apply to write"

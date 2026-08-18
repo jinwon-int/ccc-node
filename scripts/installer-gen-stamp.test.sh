@@ -65,5 +65,21 @@ mkdir "$TMP/adir"
 ccc_installer_gen_stamp "$TMP/adir" >/dev/null 2>&1; rc=$?
 ok "directory input fails" '[ "$rc" != 0 ]'
 
+# --- install records (#1081 phase 2) -----------------------------------------
+rec_state="$TMP/state"; mkdir -p "$rec_state"
+rec_self="$TMP/install-fake-cron.sh"; printf 'echo fake\n' > "$rec_self"
+ccc_installer_record_write "$rec_state" "$rec_self" "# ccc-node:fake" "h_aaaaaaaaaaaa" -- \
+  --apply --schedule "17 * * * *" --node "has space"
+rec="$rec_state/install-fake-cron.json"
+ok "record write creates owner-only file" '[ -f "$rec" ] && [ "$(stat -c %a "$rec")" = 600 ]'
+ok "record path helper matches write destination" \
+  '[ "$(ccc_installer_record_path "$rec_state" "$rec_self")" = "$rec" ]'
+ok "record schema/marker/gen/argv survive a space in an argv value" \
+  'jq -e ".schema==\"ccc.install-record.v1\" and .installer==\"scripts/install-fake-cron.sh\" and .marker==\"# ccc-node:fake\" and .gen==\"h_aaaaaaaaaaaa\" and .argv==[\"--apply\",\"--schedule\",\"17 * * * *\",\"--node\",\"has space\"]" "$rec" >/dev/null'
+ccc_installer_record_remove "$rec_state" "$rec_self"
+ok "record remove deletes the file" '[ ! -f "$rec" ]'
+ccc_installer_record_remove "$rec_state" "$rec_self"
+ok "record remove is idempotent" 'true'
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

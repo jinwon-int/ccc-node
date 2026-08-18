@@ -62,3 +62,73 @@ PY
     return 3
   fi
 }
+
+# --- install records (#1081 phase 2) -----------------------------------------
+# A successful `--apply` leaves an install record in the node's state dir so
+# ccc-self-update can replay the EXACT resolved invocation when the stamp
+# drifts. Records are bookkeeping, never secrets: installer relpath, marker,
+# replay argv (resolved values — e.g. the effective --schedule, not the
+# operator's env), the gen stamped at apply time, and a timestamp.
+#
+# Record writes are best-effort: a failed write must not fail an --apply that
+# already changed the crontab, so helpers return non-zero and callers only
+# warn. File perms are 0600 under the (already owner-only) state dir.
+
+# ccc_installer_record_path <state-dir> <installer-abspath>
+ccc_installer_record_path() {
+  local base
+  base="$(basename "$2")"
+  base="${base%.sh}"
+  printf '%s/%s.json' "$1" "$base"
+}
+
+# ccc_installer_record_write <state-dir> <installer-abspath> <marker> <gen> -- [argv...]
+ccc_installer_record_write() {
+  local state_dir="$1" self="$2" marker="$3" gen="$4"
+  shift 4
+  [ "${1:-}" = "--" ] && shift
+  [ -d "$state_dir" ] || mkdir -p "$state_dir" 2>/dev/null || return 1
+  python3 - "$state_dir" "$self" "$marker" "$gen" "$@" <<'PY'
+import json
+import os
+import sys
+import tempfile
+import time
+
+state_dir, self_path, marker, gen, argv = (
+    sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5:],
+)
+base = os.path.basename(self_path)
+if base.endswith(".sh"):
+    base = base[:-3]
+record = {
+    "schema": "ccc.install-record.v1",
+    "installer": "scripts/" + os.path.basename(self_path),
+    "marker": marker,
+    "gen": gen,
+    "argv": argv,
+    "applied_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+}
+fd, tmp = tempfile.mkstemp(prefix="." + base + ".", dir=state_dir)
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        json.dump(record, fh, ensure_ascii=False, separators=(",", ":"))
+        fh.write("\n")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, os.path.join(state_dir, base + ".json"))
+finally:
+    try:
+        os.unlink(tmp)
+    except OSError:
+        pass
+PY
+}
+
+# ccc_installer_record_remove <state-dir> <installer-abspath>
+# A deliberate --remove must also drop the record, or the next self-update
+# re-apply would resurrect an entry the operator just removed.
+ccc_installer_record_remove() {
+  local path
+  path="$(ccc_installer_record_path "$1" "$2")" || return 1
+  rm -f -- "$path"
+}

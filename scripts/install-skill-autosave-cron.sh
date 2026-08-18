@@ -221,6 +221,18 @@ fi
 
 if [ "$APPLY" = 1 ]; then
   printf '%s\n' "$desired" | "$CRONTAB" -
+  if [ "$REMOVE" = 1 ]; then
+    ccc_installer_record_remove "$STATE_DIR" "$ROOT/scripts/install-skill-autosave-cron.sh" || true
+  else
+    # Install record (#1081 phase 2): replay must reproduce THIS entry, so
+    # the resolved schedule and fleet identity are materialized into argv
+    # rather than re-derived from the operator's environment.
+    record_argv=(--apply --schedule "$SCHEDULE")
+    [ -n "$FLEET_NODE" ] && record_argv+=(--node "$FLEET_NODE")
+    ccc_installer_record_write "$STATE_DIR" "$ROOT/scripts/install-skill-autosave-cron.sh" "$MARKER" "$GEN" -- \
+      "${record_argv[@]}" \
+      || echo "WARNING: install record write failed — self-update re-apply will not track this entry" >&2
+  fi
   echo "skill-autosave cron: ${action} done (schedule: ${SCHEDULE})"
 else
   echo "[dry-run] would ${action} skill-autosave cron (schedule: ${SCHEDULE}); pass --apply to write"

@@ -99,6 +99,13 @@ ok "all three managed cron lines carry the gen stamp" \
   '[ "$(grep -cE "nunchi:#816 gen=h_[0-9a-f]{12}$" "$cron_store")" = 3 ]'
 ok "gen stamp matches installer content" \
   '[ "$(grep -cF "gen=$want_gen" "$cron_store")" = 3 ]'
+
+# --- install record (#1081 phase 2): self-update replay material. The record
+# must materialize the RESOLVED provider, not the ambient env.
+nrec="$state/install-nunchi.json"
+ok "apply writes an install record with resolved provider argv" \
+  'jq -e ".schema==\"ccc.install-record.v1\" and .marker==\"# nunchi:#816\" and .gen==\"$want_gen\" and .argv==[\"--apply\",\"--codex\"]" "$nrec" >/dev/null'
+ok "install record is owner-only" '[ "$(stat -c %a "$nrec")" = 600 ]'
 refresh_capture="$TMP/codex-refresh.args"
 CCC_TEST_MEMPALACE_CAPTURE="$refresh_capture" HOME="$home" \
   PATH="/usr/bin:/bin" CCC_STATE_DIR="$state" NUNCHI_HOME="$nunchi_home" \
@@ -177,6 +184,8 @@ out="$(env "${common_env[@]}" bash "$ROOT/scripts/install-nunchi.sh" \
   --apply --piri --audience-scoped "$audience_root" 2>&1)"; rc=$?
 ok "scoped Piri install persists the exact audience dispatcher root in managed cron" \
   '[ "$rc" = 0 ] && [ "$(grep -c "CCC_NUNCHI_AUDIENCE_SCOPED=1" "$cron_store")" = 2 ] && [ "$(grep -c "CCC_NUNCHI_AUDIENCE_ROOT=$audience_root" "$cron_store")" = 2 ] && grep -q "audience_scoped: enabled=1 root=$audience_root" <<<"$out"'
+ok "scoped apply materializes provider and audience flags into the install record" \
+  'jq -e --arg root "$audience_root" ".argv==[\"--apply\",\"--piri\",\"--audience-scoped\",\$root]" "$nrec" >/dev/null'
 out="$(run_install 2>&1)"; rc=$?
 ok "later installer status recovers scoped mode and root from managed cron" \
   '[ "$rc" = 0 ] && grep -q "audience_scoped: enabled=1 root=$audience_root" <<<"$out"'
@@ -372,6 +381,7 @@ ok "--remove immediately rolls Codex back to canonical memory" \
   '[ "$rc" = 0 ] && [ "$materialize_rc" = 0 ] && [ "$(cat "$state/nunchi.mode")" = off ] && grep -q "INSTALLER_BASE_SENTINEL" "$codex_home/AGENTS.md" && ! grep -q "INSTALLER_NUNCHI_SENTINEL" "$codex_home/AGENTS.md"'
 ok "--remove strips managed cron and standalone hook state while retaining the DB" \
   '[ "$(grep -c "nunchi:#816" "$cron_store" || true)" = 0 ] && grep -qxF "$unrelated_sweep" "$cron_store" && ! grep -q "nunchi/sessionstart.sh" "$claude_dir/settings.local.json" && [ -s "$nunchi_home/facts.db" ]'
+ok "--remove drops the install record (no resurrection via re-apply)" '[ ! -f "$nrec" ]'
 
 cron_before_dependency_failure="$(cat "$cron_store")"
 out="$(env "${common_env[@]}" CCC_NUNCHI_TIMEOUT_CLI="$TMP/missing-timeout" \
