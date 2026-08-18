@@ -7,11 +7,19 @@
 # owner-only Telegram notification when drafts await approval.
 #
 # Consistent with install-memory-refresh-cron.sh: SAFE BY DEFAULT (dry-run
-# unless --apply), idempotent (a single marker-tagged line), never prints
+# unless --apply), idempotent (a single marker-tagged entry), never prints
 # secrets, and the harness setup.sh never installs this itself. The managed
-# line carries a `gen=h_<sha256:12>` stamp of this script's content (#1081)
-# so ccc-doctor can tell when the installed entry was rendered by an older
-# installer.
+# entry carries a `gen=h_<sha256:12>` stamp over this script plus the shared
+# cron-installer lib (#1081, inputs owned by ccc_installer_gen_inputs) so
+# ccc-doctor can tell when the installed entry was rendered by older code.
+# The stamp rides on the entry line only — the BEGIN/END block markers stay
+# exact-matchable by the block parser.
+#
+# The managed unit is a BEGIN/END block (unified removal strategy, #1077 —
+# this installer's block carries an extra CRON_TZ pin line, which is why the
+# fleet strategy converged on blocks): scripts/lib/installer-cron-common.sh
+# owns block parsing and the whole install/remove flow; legacy bare marker
+# lines are migrated into a block on the next apply.
 #
 # The cron entry runs through `bash -lc` so the login profile PATH is loaded;
 # the sweep shells out to jq/find and skill-review.sh shells out to `claude`,
@@ -19,6 +27,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+SELF="$ROOT/scripts/install-skill-autosave-cron.sh"
 CLAUDE_DIR="${CCC_CLAUDE_DIR:-$HOME/.claude}"
 STATE_DIR="${CCC_STATE_DIR:-$CLAUDE_DIR/state}"
 AUTOSAVE="${CCC_SKILL_AUTOSAVE_CMD:-$CLAUDE_DIR/hooks/ccc-skill-autosave.sh}"
@@ -31,18 +40,19 @@ APPLY=0
 REMOVE=0
 OPT_NODE=""
 
-# Generation stamp (#1081): content hash of this script, pinned into the
-# managed cron line (not the BEGIN/END block markers, which are exact-matched
-# by the rebuild parser) so drift between the installed entry and the current
-# installer is detectable.
+# Shared installer libs (#1081, #1077): gen stamps + records, and the common
+# crontab install/remove driver.
 GEN_STAMP_LIB="$ROOT/scripts/lib/installer-gen-stamp.sh"
-if [ ! -r "$GEN_STAMP_LIB" ]; then
-  echo "shared gen-stamp library is missing: $GEN_STAMP_LIB" >&2
-  exit 4
-fi
-# shellcheck source=/dev/null
-. "$GEN_STAMP_LIB"
-GEN="$(ccc_installer_gen_stamp "$ROOT/scripts/install-skill-autosave-cron.sh")"
+CRON_COMMON_LIB="$ROOT/scripts/lib/installer-cron-common.sh"
+for lib in "$GEN_STAMP_LIB" "$CRON_COMMON_LIB"; do
+  if [ ! -r "$lib" ]; then
+    echo "shared installer library is missing: $lib" >&2
+    exit 4
+  fi
+  # shellcheck source=/dev/null
+  . "$lib"
+done
+GEN="$(ccc_installer_gen_stamp_auto "$SELF")"
 
 # Fleet identity for the scheduled run (#1067). `bash -lc` — what this cron line
 # uses — exports neither CCC_NODE nor HOSTNAME, so ccc-skill-promotion.py saw no
@@ -137,7 +147,9 @@ Installs (or removes) a crontab entry that runs ccc-skill-autosave.sh daily:
 refresh skill candidates, draft skills from recent transcripts (Telegram
 bridge sessions included), and queue an owner Telegram notification when
 drafts await approval. Defaults to dry-run; --apply is required to change the
-crontab. Idempotent: re-running replaces the single "$MARKER" line.
+crontab. Idempotent: re-running replaces the managed
+"$BLOCK_BEGIN" .. "$BLOCK_END" block
+(and migrates any legacy bare "$MARKER" line into it).
 
 Options:
   --dry-run        Show the resulting crontab without changing it (default).
@@ -161,24 +173,18 @@ tests; normal installs auto-detect both.
 EOF
 }
 
-need_val() { [ -n "${2:-}" ] || { echo "$1 requires a value" >&2; exit 2; }; }
 while [ $# -gt 0 ]; do
   case "$1" in
     --dry-run) APPLY=0 ;;
     --apply) APPLY=1 ;;
     --remove) REMOVE=1 ;;
-    --schedule) need_val "$1" "${2:-}"; SCHEDULE="$2"; shift ;;
-    --node) need_val "$1" "${2:-}"; OPT_NODE="$2"; shift ;;
+    --schedule) ccc_cron_need_val "$1" "${2:-}"; SCHEDULE="$2"; shift ;;
+    --node) ccc_cron_need_val "$1" "${2:-}"; OPT_NODE="$2"; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown arg: $1" >&2; usage >&2; exit 2 ;;
   esac
   shift
 done
-
-if ! command -v "${CRONTAB%% *}" >/dev/null 2>&1; then
-  echo "crontab command not found ('$CRONTAB'); cannot manage cron on this node" >&2
-  exit 3
-fi
 
 if [ ! -f "$AUTOSAVE" ] && [ -f "$ROOT/scripts/ccc-skill-autosave.sh" ]; then
   AUTOSAVE="$ROOT/scripts/ccc-skill-autosave.sh"
@@ -198,44 +204,19 @@ else
   echo "         refuse with node_identity_unresolved until one is provided (#1067)." >&2
 fi
 
-current="$("$CRONTAB" -l 2>/dev/null || true)"
-if ! without_marker="$(printf '%s\n' "$current" | awk \
-  -v begin="$BLOCK_BEGIN" -v end="$BLOCK_END" -v marker="$MARKER" '
-    $0 == begin { if (skip) bad=1; skip=1; next }
-    $0 == end { if (!skip) bad=1; skip=0; next }
-    !skip && index($0, marker) == 0 { print }
-    END { if (skip || bad) exit 42 }
-  ')"; then
-  echo "skill-autosave cron: corrupt managed schedule block; refusing to edit" >&2
-  exit 4
-fi
+# Install record (#1081 phase 2): replay must reproduce THIS entry, so the
+# resolved schedule and fleet identity are materialized into argv rather than
+# re-derived from the operator's environment.
+record_argv=(--apply --schedule "$SCHEDULE")
+[ -n "$FLEET_NODE" ] && record_argv+=(--node "$FLEET_NODE")
 
-if [ "$REMOVE" = 1 ]; then
-  desired="$without_marker"
-  action="remove"
-else
-  desired="$(printf '%s\n%s\nCRON_TZ=%s\n%s\n%s' \
-    "$without_marker" "$BLOCK_BEGIN" "$LOCAL_TIMEZONE" "$CRON_LINE" "$BLOCK_END" | sed '/^$/d')"
-  action="install"
-fi
-
-if [ "$APPLY" = 1 ]; then
-  printf '%s\n' "$desired" | "$CRONTAB" -
-  if [ "$REMOVE" = 1 ]; then
-    ccc_installer_record_remove "$STATE_DIR" "$ROOT/scripts/install-skill-autosave-cron.sh" || true
-  else
-    # Install record (#1081 phase 2): replay must reproduce THIS entry, so
-    # the resolved schedule and fleet identity are materialized into argv
-    # rather than re-derived from the operator's environment.
-    record_argv=(--apply --schedule "$SCHEDULE")
-    [ -n "$FLEET_NODE" ] && record_argv+=(--node "$FLEET_NODE")
-    ccc_installer_record_write "$STATE_DIR" "$ROOT/scripts/install-skill-autosave-cron.sh" "$MARKER" "$GEN" -- \
-      "${record_argv[@]}" \
-      || echo "WARNING: install record write failed — self-update re-apply will not track this entry" >&2
-  fi
-  echo "skill-autosave cron: ${action} done (schedule: ${SCHEDULE})"
-else
-  echo "[dry-run] would ${action} skill-autosave cron (schedule: ${SCHEDULE}); pass --apply to write"
-  echo "[dry-run] resulting crontab:"
-  printf '%s\n' "$desired" | sed 's/^/  /'
-fi
+# The block body carries the CRON_TZ pin ahead of the entry line (cron has no
+# per-job inline timezone syntax; the pin keeps an unrelated earlier CRON_TZ
+# assignment from rescheduling this job).
+ccc_cron_installer_finish \
+  --label "skill-autosave" \
+  --marker "$MARKER" --begin "$BLOCK_BEGIN" --end "$BLOCK_END" \
+  --crontab "$CRONTAB" --state-dir "$STATE_DIR" --self "$SELF" --gen "$GEN" \
+  --apply "$APPLY" --remove "$REMOVE" --schedule-desc "$SCHEDULE" \
+  --body "$(printf 'CRON_TZ=%s\n%s' "$LOCAL_TIMEZONE" "$CRON_LINE")" -- \
+  "${record_argv[@]}"

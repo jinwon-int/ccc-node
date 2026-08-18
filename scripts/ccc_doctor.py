@@ -82,11 +82,15 @@ CRON_MARKER_INSTALLERS = (
     ("nunchi", "# nunchi:#816", "scripts/install-nunchi.sh",
      "run scripts/install-nunchi.sh --apply with the node's original provider/audience flags"),
 )
-# Managed markers that carry no generation stamp by design: the skill-autosave
-# schedule block guards are exact-match parsed by the installer's rebuild awk.
+# Managed markers that carry no generation stamp by design: the installers'
+# block guards are exact-match parsed by the shared block awk (#1077).
 CRON_AUX_MARKERS = (
     "# ccc-node:autosave-schedule:begin",
     "# ccc-node:autosave-schedule:end",
+    "# ccc-node:memory-refresh:begin",
+    "# ccc-node:memory-refresh:end",
+    "# ccc-node:pr-status-poll:begin",
+    "# ccc-node:pr-status-poll:end",
 )
 # Hand-installed markers the repo documents but no installer renders: the
 # self-update and live-backups schedule lines are operator-placed by design
@@ -100,6 +104,9 @@ CRON_KNOWN_UNMANAGED_MARKERS = (
 CRON_MARKER_RE = re.compile(r"# (?:ccc-node:[A-Za-z0-9:-]+|nunchi:[A-Za-z0-9#:-]+)")
 CRON_GEN_RE = re.compile(r"\bgen=(h_[0-9a-f]{12})\b")
 CRON_GEN_FULL_RE = re.compile(r"h_[0-9a-f]{12}")
+# Managed-unit bookkeeping lines (#1077): `# ccc-node:<lane>:begin` / `:end`.
+# They carry the lane marker as a substring but are not entries.
+CRON_BLOCK_MARKER_RE = re.compile(r"# ccc-node:[A-Za-z0-9-]+:(?:begin|end)\s*$")
 CODEX_PROBE_TIMEOUT_SECONDS = 5.0
 CODEX_PROBE_TIMEOUT_MAX_SECONDS = 10.0
 
@@ -1416,9 +1423,12 @@ class Doctor:
 
         Delegates to scripts/lib/installer-gen-stamp.sh so the stamp algorithm
         (content-only hash-of-hashes) keeps exactly one implementation — the
-        one the installers stamp with. Explicit `bash` because a repo shebang
-        cannot resolve on Termux (no /usr/bin/env). Returns None when the
-        checkout is incomplete or the helper rejects its input.
+        one the installers stamp with — and to ccc_installer_gen_stamp_auto so
+        the stamp INPUTS (installer + shared rendering libs, #1077) come from
+        the single list the installers used at apply time. Explicit `bash`
+        because a repo shebang cannot resolve on Termux (no /usr/bin/env).
+        Returns None when the checkout is incomplete or the helper rejects
+        its input.
         """
         lib = self.repo / "scripts" / "lib" / "installer-gen-stamp.sh"
         script = self.repo / script_rel
@@ -1426,7 +1436,7 @@ class Doctor:
             return None
         try:
             out = subprocess.run(
-                ["bash", "-c", '. "$1"; ccc_installer_gen_stamp "$2"', "_", str(lib), str(script)],
+                ["bash", "-c", '. "$1"; ccc_installer_gen_stamp_auto "$2"', "_", str(lib), str(script)],
                 text=True, capture_output=True, timeout=10,
             )
         except Exception:
@@ -1461,7 +1471,13 @@ class Doctor:
 
         for name, marker, script_rel, apply_hint in CRON_MARKER_INSTALLERS:
             item = f"cron gen {name}"
-            owned = [ln for ln in lines if marker in ln]
+            # Managed-unit bookkeeping lines (# ccc-node:<lane>:begin/end,
+            # #1077) carry the lane marker as a substring but are not entries —
+            # only entry lines bear a gen stamp, so count/stamp entries only.
+            owned = [
+                ln for ln in lines
+                if marker in ln and not CRON_BLOCK_MARKER_RE.search(ln)
+            ]
             if not owned:
                 self.add("정상", item, "not installed (opt-in)", "none")
                 continue

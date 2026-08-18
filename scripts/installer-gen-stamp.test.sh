@@ -81,5 +81,26 @@ ok "record remove deletes the file" '[ ! -f "$rec" ]'
 ccc_installer_record_remove "$rec_state" "$rec_self"
 ok "record remove is idempotent" 'true'
 
+# --- canonical gen inputs (#1077) ---------------------------------------------
+# The input list is owned here so installers, ccc-doctor and ccc-self-update
+# always stamp/recompute over the SAME files. The three crontab installers
+# render through installer-cron-common.sh, so that lib is an input; nunchi
+# renders on its own, so its list is just itself; and the gen-stamp lib is
+# the measuring instrument, never an input.
+inputs="$(ccc_installer_gen_inputs "$ROOT/scripts/install-memory-refresh-cron.sh")"
+ok "cron installer inputs include the installer itself" \
+  '[ "$(head -1 <<<"$inputs")" = "$ROOT/scripts/install-memory-refresh-cron.sh" ]'
+ok "cron installer inputs include the shared cron lib" \
+  'grep -qxF "$ROOT/scripts/lib/installer-cron-common.sh" <<<"$inputs"'
+ok "cron installer inputs exclude the gen-stamp lib (instrument, not input)" \
+  '! grep -qF "installer-gen-stamp.sh" <<<"$inputs"'
+inputs_nu="$(ccc_installer_gen_inputs "$ROOT/scripts/install-nunchi.sh")"
+ok "nunchi inputs are the installer alone (no cron-common dependency)" \
+  '[ "$(wc -l <<<"$inputs_nu" | tr -d " ")" = 1 ]'
+ok "auto stamp matches an explicit stamp over the same inputs" \
+  '[ "$(ccc_installer_gen_stamp_auto "$ROOT/scripts/install-pr-status-poll-cron.sh")" = "$(ccc_installer_gen_stamp "$ROOT/scripts/install-pr-status-poll-cron.sh" "$ROOT/scripts/lib/installer-cron-common.sh")" ]'
+ok "auto stamp differs from an installer-only stamp (lib is really an input)" \
+  '[ "$(ccc_installer_gen_stamp_auto "$ROOT/scripts/install-pr-status-poll-cron.sh")" != "$(ccc_installer_gen_stamp "$ROOT/scripts/install-pr-status-poll-cron.sh")" ]'
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

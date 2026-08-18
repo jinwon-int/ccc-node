@@ -565,7 +565,7 @@ else
       log "reapply skip reason=incomplete-record path=$rec"
       continue
     }
-    current="$(ccc_installer_gen_stamp "$REPO/$installer" 2>/dev/null)" || current=""
+    current="$(ccc_installer_gen_stamp_auto "$REPO/$installer" 2>/dev/null)" || current=""
     [ -n "$current" ] || { log "reapply skip reason=stamp-failed installer=$installer"; continue; }
     if [ "$current" = "$old_gen" ]; then
       log "reapply skip reason=current installer=$installer gen=$current"

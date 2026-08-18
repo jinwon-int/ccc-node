@@ -35,7 +35,10 @@ mkdir -p "$CCC_CLAUDE_DIR/hooks" "$CCC_CLAUDE_DIR/state"
 
 pass=0; fail=0
 ok() { if eval "$2"; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $1"; fi; }
-marker_count() { grep -cF "# ccc-node:pr-status-poll" "$FAKE_CRON" 2>/dev/null | head -1; }
+# Entry lines are the only stamped lines; the #1077 BEGIN/END block markers
+# carry the lane marker as a substring and must not be counted as entries.
+marker_count() { grep -E "# ccc-node:pr-status-poll gen=h_" "$FAKE_CRON" 2>/dev/null | wc -l | tr -d ' '; }
+block_count() { grep -cF "# ccc-node:pr-status-poll:begin" "$FAKE_CRON" 2>/dev/null | head -1; }
 
 # dry-run does not mutate the crontab
 out="$(bash "$INSTALLER" --dry-run 2>&1)"; rc=$?
@@ -43,20 +46,23 @@ ok "dry-run exits 0" '[ "$rc" = 0 ]'
 ok "dry-run announces install" 'printf "%s" "$out" | grep -q "would install"'
 ok "dry-run does not write crontab" '[ "$(marker_count)" = 0 ]'
 
-# apply installs exactly one marker line
+# apply installs exactly one entry line inside one managed block (#1077)
 out="$(bash "$INSTALLER" --apply 2>&1)"; rc=$?
 ok "apply exits 0" '[ "$rc" = 0 ]'
 ok "apply installs one marker line" '[ "$(marker_count)" = 1 ]'
+ok "apply wraps the entry in a managed block" '[ "$(block_count)" = 1 ] && grep -qF "# ccc-node:pr-status-poll:end" "$FAKE_CRON"'
 ok "installed line carries default schedule" 'grep -qF "*/17 * * * *" "$FAKE_CRON"'
 ok "installed line loads login PATH via bash -lc" 'grep -qF "bash -lc" "$FAKE_CRON"'
 ok "installed line invokes run mode" 'grep -qF "ccc-pr-status-poll.sh\" run" "$FAKE_CRON"'
 
-# generation stamp (#1081): content hash of the installer, pinned at end of line
+# generation stamp (#1081): content hash of installer + shared rendering libs,
+# pinned at end of the entry line; inputs owned by ccc_installer_gen_inputs
 # shellcheck source=/dev/null
 . "$ROOT/scripts/lib/installer-gen-stamp.sh"
-want_gen="$(ccc_installer_gen_stamp "$INSTALLER")"
+want_gen="$(ccc_installer_gen_stamp_auto "$INSTALLER")"
 ok "installed line carries gen stamp" 'grep -qE "# ccc-node:pr-status-poll gen=h_[0-9a-f]{12}$" "$FAKE_CRON"'
 ok "gen stamp matches installer content" 'grep -qF "gen=$want_gen" "$FAKE_CRON"'
+ok "BEGIN/END block markers stay unstamped (exact-match parsed)" '! grep -qE "pr-status-poll:(begin|end) gen=" "$FAKE_CRON"'
 
 # idempotent: re-apply keeps a single line
 bash "$INSTALLER" --apply >/dev/null 2>&1
@@ -85,8 +91,22 @@ ok "still one marker line after preserve" '[ "$(marker_count)" = 1 ]'
 # remove takes the marker line out, keeps the unrelated one
 bash "$INSTALLER" --apply --remove >/dev/null 2>&1
 ok "remove deletes marker line" '[ "$(marker_count)" = 0 ]'
+ok "remove deletes the block markers too" '! grep -qF "# ccc-node:pr-status-poll:begin" "$FAKE_CRON"'
 ok "remove keeps unrelated line" 'grep -qF "echo keepme" "$FAKE_CRON"'
 ok "remove drops the install record (no resurrection via re-apply)" '[ ! -f "$REC" ]'
+
+# legacy migration (#1077): a bare stamped pre-#1077 line is folded into a block
+printf '%s\n' '*/17 * * * * bash -lc '"'"'old'"'"'  # ccc-node:pr-status-poll gen=h_000000000000' '0 4 * * * echo keepme2' > "$FAKE_CRON"
+bash "$INSTALLER" --apply >/dev/null 2>&1
+ok "legacy bare marker line is migrated into a block" '[ "$(marker_count)" = 1 ] && [ "$(block_count)" = 1 ]'
+ok "legacy line content replaced (old gen gone)" '! grep -qF "gen=h_000000000000" "$FAKE_CRON"'
+ok "migration preserves unrelated lines" 'grep -qF "echo keepme2" "$FAKE_CRON"'
+
+# corrupt managed block fails closed (#1077: guard now covers this lane too)
+printf '%s\n' '# ccc-node:pr-status-poll:begin' '*/17 * * * * dangling  # ccc-node:pr-status-poll gen=h_000000000000' > "$FAKE_CRON"
+out="$(bash "$INSTALLER" --apply 2>&1)"; rc=$?
+ok "corrupt managed block exits 4" '[ "$rc" = 4 ]'
+ok "corrupt managed block is reported" 'printf "%s" "$out" | grep -q "corrupt managed schedule block"'
 
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
