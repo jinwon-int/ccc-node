@@ -21,6 +21,13 @@ MAX_MEM="${CCC_BUILTIN_MEMORY_MAX_BYTES:-4000}"
 MAX_WIKI="${CCC_WIKI_MAX_BYTES:-5000}"
 MAX_HONCHO="${CCC_HONCHO_MAX_BYTES:-4000}"
 MAX_LOCAL="${CCC_LOCAL_MEMORY_MAX_BYTES:-3000}"
+# Skill index (#1145): node skills are plain files the session cannot see, so
+# name-keyword searches miss them (gh-pr-flow sat undiscovered through three
+# round-trips while its description held the exact answer). Inject a bounded
+# name+description index so discovery starts from descriptions, not filenames.
+MAX_SKILLS="${CCC_SKILL_INDEX_MAX_BYTES:-1500}"
+SKILLS_ENABLED="${CCC_SKILL_INDEX_ENABLED:-1}"
+SKILLS_DIR="${CCC_SKILLS_DIR:-${HOME:-/root}/.claude/skills}"
 MAX_RESUME="${CCC_RESUME_MAX_BYTES:-2000}"
 HONCHO_ENABLED="${CCC_HONCHO_MEMORY_ENABLED:-1}"
 WIKI_ENABLED="${CCC_WIKI_MEMORY_ENABLED:-1}"
@@ -505,6 +512,39 @@ if ! is_disabled "$AUDIENCE_SCOPED"; then
     audience_note="Memory audience: shared public facts only. DM-private and unscoped legacy memory are unavailable."
   fi
 fi
+skills_block=""
+if ! is_disabled "$SKILLS_ENABLED" && [ -d "$SKILLS_DIR" ]; then
+  skills_index="$(
+    for skill_md in "$SKILLS_DIR"/*/SKILL.md; do
+      [ -r "$skill_md" ] || continue
+      awk 'NR==1 && $0!="---" {exit}
+        /^---$/ {fm++; next}
+        fm==1 && /^name:[ ]*/ {sub(/^name:[ ]*/,""); name=$0}
+        fm==1 && /^description:[ ]*/ {sub(/^description:[ ]*/,""); desc=substr($0,1,160)}
+        END {if (name!="") printf "- %s — %s\n", name, desc}' "$skill_md"
+    done | sort
+  )"
+  skills_note="read the SKILL.md before use; search these descriptions, not filenames"
+  if [ -n "$skills_index" ] && [ "$(printf '%s' "$skills_index" | wc -c)" -gt "$MAX_SKILLS" ]; then
+    # No silent tail-drop (#1081 lesson): degrade the WHOLE index to names
+    # rather than truncating away the skills that sort last.
+    skills_note="names only — descriptions exceed the byte budget; read each SKILL.md"
+    skills_index="$(
+      for skill_md in "$SKILLS_DIR"/*/SKILL.md; do
+        [ -r "$skill_md" ] || continue
+        awk 'NR==1 && $0!="---" {exit}
+          /^---$/ {fm++; next}
+          fm==1 && /^name:[ ]*/ {sub(/^name:[ ]*/,""); print "- " $0; exit}' "$skill_md"
+      done | sort
+    )"
+  fi
+  if [ -n "$skills_index" ]; then
+    skills_block="
+## Node skills index (${skills_note})
+$(printf '%s' "$skills_index" | limit_bytes "$MAX_SKILLS")
+"
+  fi
+fi
 wiki_block=""
 if ! is_disabled "$WIKI_ENABLED"; then
   operational_note="Operational facts are mutable — live-check the node and verify Wiki source text before asserting or changing anything."
@@ -525,7 +565,7 @@ ${mem:-(memory files unavailable)}
 
 ## Local hot memory (task-conditioned cache search)
 ${local_hot:-(local hot memory disabled or no hits)}
-${wiki_block}
+${skills_block}${wiki_block}
 ## Honcho working memory — ${USER_LABEL}${honcho_role}
 ${honcho:-(Honcho disabled or no Honcho cache yet)}"
 

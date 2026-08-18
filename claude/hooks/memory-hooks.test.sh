@@ -497,5 +497,21 @@ ok "scan: fail-open output does not depend on the path" '[ "$fo_serial" = "$fo_p
 ok "scan: parallel lanes leave no scratch directory behind" \
   '[ "$(find "${TMPDIR:-/tmp}" -maxdepth 1 -name "ccc-mem-scan.*" 2>/dev/null | wc -l)" = 0 ]'
 
+# --- Skill index injection (#1145) ---
+skills="$TMP/skills"; mkdir -p "$skills/gh-pr-flow" "$skills/no-frontmatter"
+printf -- '---\nname: gh-pr-flow\ndescription: Ship code through the PR-first flow including REVIEW_REQUIRED cross-account review\n---\nbody\n' > "$skills/gh-pr-flow/SKILL.md"
+printf 'no frontmatter here\n' > "$skills/no-frontmatter/SKILL.md"
+out="$(HOME="$TMP/home" CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CCC_HOOK_DIR="$ROOT/claude/hooks" CCC_MEMORY_TOOLS_DIR="$tools" CCC_SKILLS_DIR="$skills" CCC_HONCHO_MEMORY_ENABLED=0 CCC_MEMORY_NO_REFRESH=1 bash "$ROOT/claude/hooks/load-memory.sh" SessionStart 2>&1)"; rc=$?
+ok "skill index injects name and description from frontmatter" \
+  '[ "$rc" = 0 ] && grep -q "Node skills index" <<<"$out" && grep -q "gh-pr-flow — Ship code through the PR-first flow" <<<"$out"'
+ok "skill without frontmatter is skipped, not misparsed" '! grep -q "no-frontmatter" <<<"$out"'
+big="$skills/zz-big"; mkdir -p "$big"
+printf -- '---\nname: zz-big\ndescription: %s\n---\n' "$(printf 'x%.0s' $(seq 1 3000))" > "$big/SKILL.md"
+out="$(HOME="$TMP/home" CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CCC_HOOK_DIR="$ROOT/claude/hooks" CCC_MEMORY_TOOLS_DIR="$tools" CCC_SKILLS_DIR="$skills" CCC_SKILL_INDEX_MAX_BYTES=200 CCC_HONCHO_MEMORY_ENABLED=0 CCC_MEMORY_NO_REFRESH=1 bash "$ROOT/claude/hooks/load-memory.sh" SessionStart 2>&1)"; rc=$?
+ok "over-budget index degrades to a complete names-only list, no silent tail-drop" \
+  '[ "$rc" = 0 ] && grep -q "names only" <<<"$out" && grep -q -- "- zz-big" <<<"$out" && grep -q -- "- gh-pr-flow" <<<"$out" && ! grep -q "$(printf "x%.0s" $(seq 1 500))" <<<"$out"'
+out="$(HOME="$TMP/home" CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CCC_HOOK_DIR="$ROOT/claude/hooks" CCC_MEMORY_TOOLS_DIR="$tools" CCC_SKILLS_DIR="$skills" CCC_SKILL_INDEX_ENABLED=0 CCC_HONCHO_MEMORY_ENABLED=0 CCC_MEMORY_NO_REFRESH=1 bash "$ROOT/claude/hooks/load-memory.sh" SessionStart 2>&1)"; rc=$?
+ok "skill index can be disabled" '[ "$rc" = 0 ] && ! grep -q "Node skills index" <<<"$out"'
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
