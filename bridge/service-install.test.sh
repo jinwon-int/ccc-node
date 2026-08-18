@@ -477,5 +477,23 @@ okc "$RC" 0 "the CCC_SYSTEMD_DIR seam still accepts a scratch HOME"
 ok "seam-scoped run reports the seam path, not the live tree" \
    'grep -q "reconciliation skipped: $SEAM_FRESH/" "$OUT"'
 
+# --- #1161: callers must name the interpreter for the service scripts --------
+# service-{systemd,launchd}.sh declare `#!/bin/bash`, which resolves on neither
+# Termux path (no /bin/bash, and no /usr/bin/env either). Exec'ing them there
+# dies with 126. setup.sh's `reconcile` call is unguarded, so that 126 aborted
+# the whole install and self-update rolled the node back on every run — it sat
+# 21 commits behind until this was found.
+#
+# The scripts already handle a systemd-less host correctly ("systemd unit not
+# installed; reconciliation skipped"). The call form was the only thing keeping
+# them from reaching that answer.
+#
+# A text guard on purpose: every functional case in this file drives them as
+# `bash "$SSD" ...` — precisely the form the callers lacked — so no functional
+# test here can observe a caller exec'ing on the shebang.
+uninterpreted="$(grep -nE '(^|[[:space:]]|\()(exec[[:space:]]+)?"\$\{?(SCRIPT_DIR|SRC)\}?(/bridge)?/service-(systemd|launchd)\.sh"' \
+  "$START" "$REPO/setup.sh" 2>/dev/null | grep -vE '(^|[[:space:]]|\()bash[[:space:]]+"' || true)"
+ok "no caller execs the service scripts on their shebang" '[ -z "$uninterpreted" ]'
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

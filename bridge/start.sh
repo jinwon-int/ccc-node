@@ -485,7 +485,7 @@ render_turn_occupancy_from_health() {
 # so --status agrees with --restart on what "managed" means.
 service_managed_main_pid() {
     local main_pid
-    main_pid="$("$SCRIPT_DIR/service-systemd.sh" main-pid 2>/dev/null)" || return 1
+    main_pid="$(bash "$SCRIPT_DIR/service-systemd.sh" main-pid 2>/dev/null)" || return 1
     [ -n "$main_pid" ] && [ "$main_pid" != "0" ] || return 1
     printf '%s\n' "$main_pid"
 }
@@ -796,7 +796,7 @@ do_install() {
         echo "⚠️  Another instance is already using the same Bot Token (PID: $(cat "$TOKEN_LOCK_FILE")). Stop it first."
         exit 1
     fi
-    exec "$SCRIPT_DIR/service-launchd.sh" install \
+    exec bash "$SCRIPT_DIR/service-launchd.sh" install \
         --project-root "$PROJECT_ROOT" \
         --proxy-url "$(read_env_with_fallback "PROXY_URL")" \
         --caller "$0"
@@ -805,7 +805,7 @@ do_install() {
 do_uninstall() {
     init_token_lock
     export CCC_BRIDGE_TOKEN_LOCK_FILE="$TOKEN_LOCK_FILE"
-    exec "$SCRIPT_DIR/service-launchd.sh" uninstall \
+    exec bash "$SCRIPT_DIR/service-launchd.sh" uninstall \
         --project-root "$PROJECT_ROOT" \
         --caller "$0"
 }
@@ -824,14 +824,14 @@ do_install_systemd() {
         exit 1
     fi
     check_env
-    exec "$SCRIPT_DIR/service-systemd.sh" install \
+    exec bash "$SCRIPT_DIR/service-systemd.sh" install \
         --project-root "$PROJECT_ROOT" \
         --proxy-url "$(read_env_with_fallback "PROXY_URL")" \
         --caller "$0"
 }
 
 do_uninstall_systemd() {
-    exec "$SCRIPT_DIR/service-systemd.sh" uninstall --caller "$0"
+    exec bash "$SCRIPT_DIR/service-systemd.sh" uninstall --caller "$0"
 }
 
 do_version() {
@@ -1028,7 +1028,7 @@ do_restart() {
         echo "💡 Restart via the service manager: launchctl kickstart -k gui/$(id -u)/$PLIST_LABEL"
         exit 3
     fi
-    if "$SCRIPT_DIR/service-systemd.sh" is-managed >/dev/null 2>&1; then
+    if bash "$SCRIPT_DIR/service-systemd.sh" is-managed >/dev/null 2>&1; then
         unit="${BRIDGE_SERVICE_NAME:-ccc-telegram-bridge}.service"
         scope_flag=""
         [ "$(id -u)" = "0" ] || scope_flag=" --user"
