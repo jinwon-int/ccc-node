@@ -810,6 +810,10 @@ class ScriptedPiriRpcClient:
             "model": {"provider": "test", "id": "piri-model"},
         }
 
+    async def set_append_system_prompt(self, text: str | None = None) -> None:
+        del text  # Conformance lane stays on the legacy CLI-append path.
+        return None
+
     async def get_available_models(self) -> Sequence[Mapping[str, Any]]:
         return (
             {

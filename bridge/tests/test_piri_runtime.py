@@ -46,6 +46,7 @@ class FakePiriClient:
         self.close_calls = 0
         self.abort_calls = 0
         self.prompt_calls: list[str] = []
+        self.append_system_prompt_calls: list[str | None] = []
         self.prompted = asyncio.Event()
 
     async def start(self) -> None:
@@ -71,6 +72,9 @@ class FakePiriClient:
     async def get_available_models(self) -> Sequence[Mapping[str, Any]]:
         return self.models
 
+    async def set_append_system_prompt(self, text: str | None = None) -> None:
+        self.append_system_prompt_calls.append(text)
+
     async def next_event(self) -> Mapping[str, Any]:
         event = await self.events.get()
         if isinstance(event, BaseException):
@@ -93,6 +97,20 @@ class FakePiriFactory:
             session_id = config.command[index + 1]
         client = FakePiriClient(config, session_id=session_id)
         self.clients.append(client)
+        return client
+
+
+class CapableFakePiriFactory(FakePiriFactory):
+    """Factory whose clients advertise the piri#2 runtime-injection capability."""
+
+    def __call__(self, config: PiriLaunchConfig) -> FakePiriClient:
+        client = super().__call__(config)
+        client.state = {
+            "sessionId": client.state["sessionId"],
+            "model": None,
+            "protocolVersion": 1,
+            "capabilities": ["compaction_lifecycle_identifiers", "set_append_system_prompt"],
+        }
         return client
 
 
@@ -202,6 +220,313 @@ class PiriRuntimeTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(runtime._session_directories[session.session_id], session_dir)
             await runtime.close()
+
+    def _memory_route(self, root: Path) -> tuple[dict[str, str], Path]:
+        session_dir = root / "sessions"
+        bootstrap_home = root / "bootstrap"
+        context_file = bootstrap_home / "AGENTS.md"
+        return (
+            {
+                "PIRI_CODING_AGENT_SESSION_DIR": str(session_dir),
+                "CCC_PIRI_BOOTSTRAP_HOME": str(bootstrap_home),
+                "CCC_PIRI_BOOTSTRAP_CONTEXT_FILE": str(context_file),
+            },
+            context_file,
+        )
+
+    def _write_memory_context(self, context_file: Path, content: str) -> None:
+        context_file.parent.mkdir(parents=True, exist_ok=True)
+        context_file.write_text(content, encoding="utf-8")
+        context_file.chmod(0o600)
+
+    async def test_capable_piri_injects_memory_over_rpc_without_cli_append(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            memory_environment, context_file = self._memory_route(Path(directory))
+
+            async def materialize(
+                _path: str, *, timeout_seconds: float, environment: Mapping[str, str]
+            ) -> None:
+                del timeout_seconds, environment
+                self._write_memory_context(context_file, "scoped memory v1")
+
+            factory = CapableFakePiriFactory()
+            runtime = PiriRuntime(
+                executable="/opt/piri/bin/piri",
+                client_factory=factory,
+                process_environment={"BASE": "one"},
+                memory_materializer_path="/materializer",
+                memory_bootstrap_timeout_seconds=3.0,
+                memory_environment_validator=lambda value: None,
+            )
+            try:
+                with patch(
+                    "telegram_bot.core.piri_runtime._run_codex_memory_bootstrap",
+                    side_effect=materialize,
+                ):
+                    session = await runtime.start_or_resume(
+                        SessionRequest(
+                            working_directory="/workspace/project",
+                            memory_environment=memory_environment,
+                        )
+                    )
+
+                # One spawn only; no CLI append on the capable path.
+                self.assertEqual(len(factory.clients), 1)
+                config = factory.clients[0].config
+                self.assertIn("--no-context-files", config.command)
+                self.assertNotIn("--append-system-prompt", config.command)
+                self.assertEqual(
+                    factory.clients[0].append_system_prompt_calls,
+                    ["scoped memory v1"],
+                )
+                self.assertEqual(session.session_id, "piri-new")
+            finally:
+                await runtime.close()
+
+    async def test_legacy_piri_respawns_with_cli_append_when_capability_absent(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            memory_environment, context_file = self._memory_route(Path(directory))
+
+            async def materialize(
+                _path: str, *, timeout_seconds: float, environment: Mapping[str, str]
+            ) -> None:
+                del timeout_seconds, environment
+                self._write_memory_context(context_file, "scoped memory v1")
+
+            runtime = PiriRuntime(
+                executable="/opt/piri/bin/piri",
+                client_factory=self.factory,
+                process_environment={"BASE": "one"},
+                memory_materializer_path="/materializer",
+                memory_bootstrap_timeout_seconds=3.0,
+                memory_environment_validator=lambda value: None,
+            )
+            try:
+                with patch(
+                    "telegram_bot.core.piri_runtime._run_codex_memory_bootstrap",
+                    side_effect=materialize,
+                ):
+                    session = await runtime.start_or_resume(
+                        SessionRequest(
+                            working_directory="/workspace/project",
+                            memory_environment=memory_environment,
+                        )
+                    )
+
+                # First spawn (capability probe) is closed; the respawn carries the CLI append.
+                self.assertEqual(len(self.factory.clients), 2)
+                probed, respawned = self.factory.clients
+                self.assertEqual(probed.close_calls, 1)
+                self.assertNotIn("--append-system-prompt", probed.config.command)
+                self.assertEqual(
+                    respawned.config.command[-2:],
+                    ("--append-system-prompt", str(context_file)),
+                )
+                self.assertEqual(respawned.append_system_prompt_calls, [])
+                self.assertEqual(session.session_id, "piri-new")
+            finally:
+                await runtime.close()
+
+    async def _start_capable_memory_session(
+        self,
+        root: Path,
+        contents: list[str],
+    ) -> tuple[PiriRuntime, CapableFakePiriFactory, Any]:
+        memory_environment, context_file = self._memory_route(root)
+        writes = list(contents)
+
+        async def materialize(
+            _path: str, *, timeout_seconds: float, environment: Mapping[str, str]
+        ) -> None:
+            del timeout_seconds, environment
+            content = writes.pop(0) if writes else contents[-1]
+            self._write_memory_context(context_file, content)
+
+        factory = CapableFakePiriFactory()
+        runtime = PiriRuntime(
+            executable="/opt/piri/bin/piri",
+            client_factory=factory,
+            process_environment={"BASE": "one"},
+            memory_materializer_path="/materializer",
+            memory_bootstrap_timeout_seconds=3.0,
+            memory_environment_validator=lambda value: None,
+        )
+        patcher = patch(
+            "telegram_bot.core.piri_runtime._run_codex_memory_bootstrap",
+            side_effect=materialize,
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        session = await runtime.start_or_resume(
+            SessionRequest(
+                working_directory="/workspace/project",
+                memory_environment=memory_environment,
+            )
+        )
+        self.addCleanup(runtime.close)
+        return runtime, factory, session
+
+    @staticmethod
+    def _assistant_end(text: str = "done") -> Mapping[str, Any]:
+        return {
+            "type": "message_end",
+            "message": {
+                "role": "assistant",
+                "stopReason": "stop",
+                "content": [{"type": "text", "text": text}],
+            },
+        }
+
+    async def test_compaction_end_refreshes_memory_once_per_compaction_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            _runtime, factory, session = await self._start_capable_memory_session(
+                Path(directory),
+                ["scoped memory v1", "scoped memory v2", "scoped memory v3"],
+            )
+            client = factory.clients[0]
+            self.assertEqual(client.append_system_prompt_calls, ["scoped memory v1"])
+
+            await client.events.put({"type": "compaction_start", "reason": "threshold", "sessionId": session.session_id})
+            await client.events.put(
+                {
+                    "type": "compaction_end",
+                    "reason": "threshold",
+                    "sessionId": session.session_id,
+                    "compactionEntryId": "comp-1",
+                    "firstKeptEntryId": "entry-9",
+                    "aborted": False,
+                    "willRetry": False,
+                }
+            )
+            await client.events.put(self._assistant_end())
+            await client.events.put({"type": "agent_settled"})
+            result = await collect(session.send_turn("work"))
+            self.assertIsInstance(result[-2], ResultEvent)
+            self.assertEqual(
+                client.append_system_prompt_calls,
+                ["scoped memory v1", "scoped memory v2"],
+            )
+
+            # Same compaction entry id replayed -> no second refresh.
+            await client.events.put(
+                {
+                    "type": "compaction_end",
+                    "reason": "threshold",
+                    "sessionId": session.session_id,
+                    "compactionEntryId": "comp-1",
+                    "firstKeptEntryId": "entry-9",
+                    "aborted": False,
+                    "willRetry": False,
+                }
+            )
+            # A new compaction entry refreshes again.
+            await client.events.put(
+                {
+                    "type": "compaction_end",
+                    "reason": "overflow",
+                    "sessionId": session.session_id,
+                    "compactionEntryId": "comp-2",
+                    "firstKeptEntryId": "entry-10",
+                    "aborted": False,
+                    "willRetry": True,
+                }
+            )
+            await client.events.put(self._assistant_end())
+            await client.events.put({"type": "agent_settled"})
+            await collect(session.send_turn("more"))
+            self.assertEqual(
+                client.append_system_prompt_calls,
+                ["scoped memory v1", "scoped memory v2", "scoped memory v3"],
+            )
+
+    async def test_compaction_end_aborted_or_foreign_session_skips_refresh(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            _runtime, factory, session = await self._start_capable_memory_session(
+                Path(directory),
+                ["scoped memory v1", "scoped memory v2"],
+            )
+            client = factory.clients[0]
+            for event in (
+                {
+                    "type": "compaction_end",
+                    "reason": "threshold",
+                    "sessionId": session.session_id,
+                    "aborted": True,
+                    "willRetry": False,
+                },
+                {
+                    "type": "compaction_end",
+                    "reason": "threshold",
+                    "sessionId": "someone-else",
+                    "compactionEntryId": "comp-x",
+                    "aborted": False,
+                    "willRetry": False,
+                },
+            ):
+                await client.events.put(event)
+            await client.events.put(self._assistant_end())
+            await client.events.put({"type": "agent_settled"})
+            await collect(session.send_turn("work"))
+            self.assertEqual(client.append_system_prompt_calls, ["scoped memory v1"])
+
+    async def test_memory_refresh_failure_does_not_fail_the_turn(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            memory_environment, context_file = self._memory_route(Path(directory))
+
+            calls = {"count": 0}
+
+            async def failing_materialize(
+                _path: str, *, timeout_seconds: float, environment: Mapping[str, str]
+            ) -> None:
+                del timeout_seconds, environment
+                calls["count"] += 1
+                if calls["count"] == 1:
+                    self._write_memory_context(context_file, "scoped memory v1")
+                    return
+                raise RuntimeError("materializer exploded")
+
+            factory = CapableFakePiriFactory()
+            runtime = PiriRuntime(
+                executable="/opt/piri/bin/piri",
+                client_factory=factory,
+                process_environment={"BASE": "one"},
+                memory_materializer_path="/materializer",
+                memory_bootstrap_timeout_seconds=3.0,
+                memory_environment_validator=lambda value: None,
+            )
+            self.addCleanup(runtime.close)
+            with patch(
+                "telegram_bot.core.piri_runtime._run_codex_memory_bootstrap",
+                side_effect=failing_materialize,
+            ):
+                session = await runtime.start_or_resume(
+                    SessionRequest(
+                        working_directory="/workspace/project",
+                        memory_environment=memory_environment,
+                    )
+                )
+                client = factory.clients[0]
+                self.assertEqual(client.append_system_prompt_calls, ["scoped memory v1"])
+
+                # Materializer now fails and the file is removed: refresh degrades to a no-op.
+                context_file.unlink()
+                await client.events.put(
+                    {
+                        "type": "compaction_end",
+                        "reason": "threshold",
+                        "sessionId": session.session_id,
+                        "compactionEntryId": "comp-1",
+                        "aborted": False,
+                        "willRetry": False,
+                    }
+                )
+                await client.events.put(self._assistant_end())
+                await client.events.put({"type": "agent_settled"})
+                result = await collect(session.send_turn("work"))
+
+            self.assertIsInstance(result[-2], ResultEvent)
+            self.assertFalse(any(isinstance(event, ErrorEvent) for event in result))
+            self.assertEqual(client.append_system_prompt_calls, ["scoped memory v1"])
 
     async def test_unscoped_snapshot_falls_back_to_default_sessions_root(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
