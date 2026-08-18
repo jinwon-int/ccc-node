@@ -34,6 +34,31 @@ things a worktree does **not** solve:
   under a running session destroys in-flight work, and a manual `git checkout`
   bypasses that protection.
 
+## Claim an issue before you build it
+
+Multiple workers — human and agent nodes alike — pull from the same issue
+backlog, and nothing else coordinates who implements what. On 2026-08-18 the
+same #1081 piece was independently implemented twice and the PRs opened **46
+seconds apart** (#1141, #1142); the second implementation, hours of work with
+green CI, was closed unmerged (#1143 records the measurements). A design
+comment on an issue is not a reservation: both implementations started from
+the same design comment, each reading it as "ready for anyone."
+
+So make the reservation explicit before you start implementing:
+
+1. **Claim first.** Self-assign the issue (preferred), or leave a start
+   comment stating the scope you are taking and roughly when. Do this before
+   branching, not when opening the PR — the PR is hours too late.
+2. **Respect existing claims.** If an issue has an assignee or a live start
+   comment, do not begin a competing implementation. Reviewing, commenting,
+   and designing stay open to everyone.
+3. **Release what you drop.** Un-assign or comment when you stop. A claim
+   with no linked branch or PR after 7 days can be treated as released.
+
+This covers repository backlog work only. Lane work dispatched through the
+A2A broker already carries its own reservation (task claims), and does not
+need a second one here.
+
 ## Operator decisions and review scope
 
 Explicit operator-approved behavior and acceptance criteria are requirements,
