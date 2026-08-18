@@ -869,9 +869,9 @@ note "Codex managed skills reconciled from compatibility catalog"
 # already been taken over is deliberate and stays a separate, explicit step:
 #   <canonical checkout>/bridge/service-systemd.sh reconcile --allow-relocate
 if [ "$DRY" = 1 ]; then
-  "$SRC/bridge/service-systemd.sh" reconcile --dry-run
+  bash "$SRC/bridge/service-systemd.sh" reconcile --dry-run
 else
-  "$SRC/bridge/service-systemd.sh" reconcile
+  bash "$SRC/bridge/service-systemd.sh" reconcile
 fi
 note "Existing ccc-telegram-bridge systemd unit checked against the canonical renderer"
 

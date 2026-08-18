@@ -54,11 +54,19 @@ class StartScriptStaticTests(unittest.TestCase):
     def test_start_sh_dispatches_install_actions_to_subcommand_scripts(self):
         # The --install/--uninstall(-systemd) machinery lives in the extracted
         # subcommand scripts; start.sh must keep dispatching to them.
+        #
+        # `bash` is part of the pinned form, not incidental (#1161). Both
+        # scripts declare `#!/bin/bash`, which resolves on neither Termux path
+        # -- no /bin/bash, no /usr/bin/env -- so exec'ing them on their shebang
+        # dies with 126. setup.sh's unguarded reconcile call did exactly that
+        # and aborted the install, which rolled self-update back on every run
+        # and pinned the node 21 commits behind main. Dropping the interpreter
+        # here reintroduces that.
         text = _start_text()
-        self.assertIn('exec "$SCRIPT_DIR/service-launchd.sh" install', text)
-        self.assertIn('exec "$SCRIPT_DIR/service-launchd.sh" uninstall', text)
-        self.assertIn('exec "$SCRIPT_DIR/service-systemd.sh" install', text)
-        self.assertIn('exec "$SCRIPT_DIR/service-systemd.sh" uninstall', text)
+        self.assertIn('exec bash "$SCRIPT_DIR/service-launchd.sh" install', text)
+        self.assertIn('exec bash "$SCRIPT_DIR/service-launchd.sh" uninstall', text)
+        self.assertIn('exec bash "$SCRIPT_DIR/service-systemd.sh" install', text)
+        self.assertIn('exec bash "$SCRIPT_DIR/service-systemd.sh" uninstall', text)
 
 
 if __name__ == "__main__":
