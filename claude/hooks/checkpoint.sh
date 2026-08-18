@@ -14,6 +14,34 @@ STATE_DIR="${CCC_STATE_DIR:-${HOME:-/root}/.claude/state}"
 STATE_FILE="$STATE_DIR/working-state.md"
 CKPT_DIR="$STATE_DIR/checkpoints"
 LOG="$STATE_DIR/checkpoint.log"
+
+# An audience-scoped session points CCC_STATE_DIR at a per-audience tree that
+# starts empty, so the node's pre-scope working-state.md stops being seen: the
+# PreCompact snapshot is skipped and PostCompact re-injects an empty block. The
+# failure is silent, and an empty block reads as "no task in progress" rather
+# than as a missing file (#1155). Before scoping, CCC_STATE_DIR was unset and
+# the default WAS the legacy path, so this hook worked by accident.
+#
+# memory_audience.py states the contract for that pre-scope data: it is private
+# legacy input, read in place, never copied into a public store, and only for a
+# private audience. load-memory.sh is the one hook that implements it; mirror
+# its gate here rather than falling back unconditionally — an ungated fallback
+# would re-inject the node's private working memory into a shared audience.
+#
+# Defaults keep unscoped nodes byte-identical: CCC_MEMORY_AUDIENCE_SCOPED
+# defaults to 0 and CCC_MEMORY_AUDIENCE to "legacy", so the branch is dead
+# unless a scoped private session set both — and such a node has CCC_STATE_DIR
+# unset anyway, making the legacy path the primary one.
+ckpt_is_disabled() { case "${1:-}" in 0|false|FALSE|off|OFF|no|NO) return 0;; *) return 1;; esac; }
+LEGACY_STATE_DIR="${CCC_MEMORY_LEGACY_STATE_DIR:-${HOME:-/root}/.claude/state}"
+if [ ! -s "$STATE_FILE" ] \
+  && ! ckpt_is_disabled "${CCC_MEMORY_AUDIENCE_SCOPED:-0}" \
+  && [ "${CCC_MEMORY_AUDIENCE:-legacy}" = "private" ] \
+  && [ -n "$LEGACY_STATE_DIR" ] \
+  && [ "$LEGACY_STATE_DIR" != "$STATE_DIR" ] \
+  && [ -s "$LEGACY_STATE_DIR/working-state.md" ]; then
+  STATE_FILE="$LEGACY_STATE_DIR/working-state.md"
+fi
 ts="$(date +%Y%m%d_%H%M%S)"
 mkdir -p "$CKPT_DIR"
 
