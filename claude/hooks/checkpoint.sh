@@ -99,13 +99,34 @@ if [ -x "$scan_bin" ] \
   && scanned="$(printf '%s' "$state" | ckpt_run_scanner working-state-checkpoint 2>/dev/null)"; then
   state="$scanned"
 fi
+# Stale guard: a working-state last written weeks ago re-enters context here
+# looking current, and a dead objective (e.g. a task that finished a month
+# ago) can steer the post-compaction session backwards. Flag it instead of
+# presenting it as fresh. Age comes from the resolved $STATE_FILE mtime;
+# CCC_CKPT_STALE_DAYS overrides the 14-day threshold, 0 disables. Unknown age
+# (no python3 / helper missing) stays silent — best-effort, same degradation
+# contract as mtime-prune.sh.
+stale_note=""
+stale_log=""
+stale_days="${CCC_CKPT_STALE_DAYS:-14}"
+case "$stale_days" in ''|*[!0-9]*) stale_days=14 ;; esac
+if [ "$stale_days" -gt 0 ] && [ -s "$STATE_FILE" ] \
+  && command -v file_age_days >/dev/null 2>&1; then
+  age="$(file_age_days "$STATE_FILE")"
+  if [ -n "$age" ] && [ "$age" -ge "$stale_days" ]; then
+    stale_note="
+
+⚠ STALE: working-state.md was last modified ${age} days ago — it may describe an already-finished task. Verify against live state before acting on it, and clear it to an idle note when its task closes."
+    stale_log=" (stale ${age}d)"
+  fi
+fi
 latest="$(newest_file "$CKPT_DIR" 'working-state-*.md')"
 bytes="$(printf '%s' "$state" | wc -c | tr -d ' ')"
-echo "[$ts] PostCompact: re-injected working-state (${bytes} bytes)" >> "$LOG"
+echo "[$ts] PostCompact: re-injected working-state (${bytes} bytes)${stale_log}" >> "$LOG"
 
 ctx="# Working-state checkpoint (auto-injected: PostCompact)
 
-This is the pre-compaction task context. Continue from here. (Durable facts: prefer Wiki/memory.)
+This is the pre-compaction task context. Continue from here. (Durable facts: prefer Wiki/memory.)${stale_note}
 
 ## working-state.md
 ${state:-(working-state.md empty — if a task is in progress, keep $STATE_DIR/working-state.md updated as objective / progress / next step)}

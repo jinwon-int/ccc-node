@@ -142,5 +142,37 @@ ctx="$(jq -r '.hookSpecificOutput.additionalContext' <<<"$out")"
 ok "explicit override is still honored exactly" \
   'grep -q "REDACTED:by-override" <<<"$ctx"'
 
+# --- stale guard: an old working-state is flagged at re-injection ------------
+# A dead objective written weeks ago must not re-enter context looking fresh
+# (observed on gongyung 2026-08-18: a July 20 objective would have been
+# re-injected as current). The guard flags it; it never suppresses content.
+stale_dir="$TMP/stale-state"; mkdir -p "$stale_dir"
+printf 'ancient objective\n' > "$stale_dir/working-state.md"
+python3 - "$stale_dir/working-state.md" <<'PY'
+import os, sys, time
+t = time.time() - 20 * 86400
+os.utime(sys.argv[1], (t, t))
+PY
+out="$(CCC_STATE_DIR="$stale_dir" bash "$CHECKPOINT" PostCompact 2>&1)"
+ctx="$(jq -r '.hookSpecificOutput.additionalContext' <<<"$out")"
+ok "stale working-state gets a STALE banner and keeps its content" \
+  'grep -q "STALE" <<<"$ctx" && grep -q "ancient objective" <<<"$ctx"'
+ok "stale banner names the age in days" \
+  'grep -Eq "modified (19|20|21) days ago" <<<"$ctx"'
+
+# A fresh file must NOT be flagged — the banner stays meaningful only if it
+# is absent in the normal case.
+fresh_dir="$TMP/fresh-state"; mkdir -p "$fresh_dir"
+printf 'current objective\n' > "$fresh_dir/working-state.md"
+out="$(CCC_STATE_DIR="$fresh_dir" bash "$CHECKPOINT" PostCompact 2>&1)"
+ctx="$(jq -r '.hookSpecificOutput.additionalContext' <<<"$out")"
+ok "fresh working-state has no STALE banner" '! grep -q "STALE" <<<"$ctx"'
+
+# CCC_CKPT_STALE_DAYS=0 disables the guard without touching the content.
+out="$(CCC_STATE_DIR="$stale_dir" CCC_CKPT_STALE_DAYS=0 bash "$CHECKPOINT" PostCompact 2>&1)"
+ctx="$(jq -r '.hookSpecificOutput.additionalContext' <<<"$out")"
+ok "CCC_CKPT_STALE_DAYS=0 disables the stale banner" \
+  '! grep -q "STALE" <<<"$ctx" && grep -q "ancient objective" <<<"$ctx"'
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
