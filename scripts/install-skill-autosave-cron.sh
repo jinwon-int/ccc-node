@@ -8,7 +8,10 @@
 #
 # Consistent with install-memory-refresh-cron.sh: SAFE BY DEFAULT (dry-run
 # unless --apply), idempotent (a single marker-tagged line), never prints
-# secrets, and the harness setup.sh never installs this itself.
+# secrets, and the harness setup.sh never installs this itself. The managed
+# line carries a `gen=h_<sha256:12>` stamp of this script's content (#1081)
+# so ccc-doctor can tell when the installed entry was rendered by an older
+# installer.
 #
 # The cron entry runs through `bash -lc` so the login profile PATH is loaded;
 # the sweep shells out to jq/find and skill-review.sh shells out to `claude`,
@@ -27,6 +30,19 @@ BLOCK_END="# ccc-node:autosave-schedule:end"
 APPLY=0
 REMOVE=0
 OPT_NODE=""
+
+# Generation stamp (#1081): content hash of this script, pinned into the
+# managed cron line (not the BEGIN/END block markers, which are exact-matched
+# by the rebuild parser) so drift between the installed entry and the current
+# installer is detectable.
+GEN_STAMP_LIB="$ROOT/scripts/lib/installer-gen-stamp.sh"
+if [ ! -r "$GEN_STAMP_LIB" ]; then
+  echo "shared gen-stamp library is missing: $GEN_STAMP_LIB" >&2
+  exit 4
+fi
+# shellcheck source=/dev/null
+. "$GEN_STAMP_LIB"
+GEN="$(ccc_installer_gen_stamp "$ROOT/scripts/install-skill-autosave-cron.sh")"
 
 # Fleet identity for the scheduled run (#1067). `bash -lc` — what this cron line
 # uses — exports neither CCC_NODE nor HOSTNAME, so ccc-skill-promotion.py saw no
@@ -170,13 +186,13 @@ fi
 
 FLEET_NODE="$(resolve_fleet_node)"
 if [ -n "$FLEET_NODE" ]; then
-  CRON_LINE="$SCHEDULE bash -lc 'CCC_NODE=\"$FLEET_NODE\" CCC_CLAUDE_DIR=\"$CLAUDE_DIR\" \"$AUTOSAVE\" run' >> \"$LOG\" 2>&1  $MARKER"
+  CRON_LINE="$SCHEDULE bash -lc 'CCC_NODE=\"$FLEET_NODE\" CCC_CLAUDE_DIR=\"$CLAUDE_DIR\" \"$AUTOSAVE\" run' >> \"$LOG\" 2>&1  $MARKER gen=$GEN"
 else
   # Install anyway: the entry also refreshes candidates, drafts skills and
   # queues owner notifications, and those work without a fleet identity. Only
   # skill-promotion staging needs it, and that is opt-in and already fail-closed
   # (#1068) — so warn where the operator can see it instead of blocking cron.
-  CRON_LINE="$SCHEDULE bash -lc 'CCC_CLAUDE_DIR=\"$CLAUDE_DIR\" \"$AUTOSAVE\" run' >> \"$LOG\" 2>&1  $MARKER"
+  CRON_LINE="$SCHEDULE bash -lc 'CCC_CLAUDE_DIR=\"$CLAUDE_DIR\" \"$AUTOSAVE\" run' >> \"$LOG\" 2>&1  $MARKER gen=$GEN"
   echo "WARNING: no fleet identity resolved (--node, \$CCC_NODE, $STATE_DIR/node.txt)." >&2
   echo "         Installing without CCC_NODE; scheduled skill-promotion staging will" >&2
   echo "         refuse with node_identity_unresolved until one is provided (#1067)." >&2

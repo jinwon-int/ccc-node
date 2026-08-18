@@ -88,6 +88,17 @@ ok "Codex apply writes one feed, managed refresh and bench cron" \
   '[ "$(grep -c "nunchi:#816" "$cron_store")" = 3 ] && grep -q "codex-feed.sh" "$cron_store" && grep -q "mempalace-refresh.sh codex $codex_home/sessions" "$cron_store"'
 ok "Codex apply removes standalone nunchi hooks but preserves the canonical loader" \
   '! grep -q "nunchi/sessionstart.sh" "$claude_dir/settings.local.json" && grep -q "load-memory.sh" "$claude_dir/settings.local.json"'
+
+# --- generation stamp (#1081): every managed line carries the content hash of
+# install-nunchi.sh, so ccc-doctor can detect entries frozen at an older
+# installer. Appended after the marker; strip_cron matches by substring.
+# shellcheck source=/dev/null
+. "$ROOT/scripts/lib/installer-gen-stamp.sh"
+want_gen="$(ccc_installer_gen_stamp "$ROOT/scripts/install-nunchi.sh")"
+ok "all three managed cron lines carry the gen stamp" \
+  '[ "$(grep -cE "nunchi:#816 gen=h_[0-9a-f]{12}$" "$cron_store")" = 3 ]'
+ok "gen stamp matches installer content" \
+  '[ "$(grep -cF "gen=$want_gen" "$cron_store")" = 3 ]'
 refresh_capture="$TMP/codex-refresh.args"
 CCC_TEST_MEMPALACE_CAPTURE="$refresh_capture" HOME="$home" \
   PATH="/usr/bin:/bin" CCC_STATE_DIR="$state" NUNCHI_HOME="$nunchi_home" \
@@ -294,6 +305,8 @@ ok "Codex reapply is cron-idempotent" \
   '[ "$rc" = 0 ] && [ "$(grep -c "nunchi:#816" "$cron_store")" = 3 ]'
 ok "managed cron rewrites preserve unrelated operator MemPalace jobs" \
   'grep -qxF "$unrelated_sweep" "$cron_store"'
+ok "reapply keeps the same gen stamp on all managed lines" \
+  '[ "$(grep -cF "gen=$want_gen" "$cron_store")" = 3 ]'
 
 termux_root="$TMP/data/data/com.termux/files/home/space 'quote %;false"
 weird_state="$termux_root/state dir"
@@ -315,6 +328,7 @@ refresh_line="$(grep 'mempalace-refresh.sh' "$cron_store")"
 feed_line="$(grep 'codex-feed.sh' "$cron_store")"
 bench_line="$(grep 'bench.sh' "$cron_store")"
 runtime_cmd="$(cut -d ' ' -f 6- <<<"$refresh_line")"
+runtime_cmd="${runtime_cmd% \# nunchi:#816 gen=h_*}"
 runtime_cmd="${runtime_cmd% \# nunchi:#816}"
 # crond removes the escape that protects each literal percent before /bin/sh.
 runtime_cmd="${runtime_cmd//\\%/%}"

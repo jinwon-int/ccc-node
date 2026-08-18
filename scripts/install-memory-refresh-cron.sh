@@ -11,7 +11,9 @@
 #
 # Consistent with install-agent-cron-systemd.sh: SAFE BY DEFAULT (dry-run unless
 # --apply), idempotent (a single marker-tagged line), never prints secrets, and
-# the harness setup.sh never installs this itself.
+# the harness setup.sh never installs this itself. The managed line carries a
+# `gen=h_<sha256:12>` stamp of this script's content (#1081) so ccc-doctor can
+# tell when the installed entry was rendered by an older installer.
 #
 # The cron entry runs through `bash -lc` so the login profile PATH is loaded;
 # refresh-memory.sh shells out to python3/jq/curl/wiki-agent, which a bare cron
@@ -28,6 +30,18 @@ CRONTAB="${CCC_CRONTAB_CMD:-crontab}"
 MARKER="# ccc-node:memory-refresh"
 APPLY=0
 REMOVE=0
+
+# Generation stamp (#1081): content hash of this script, pinned into the
+# managed cron line so drift between the installed entry and the current
+# installer is detectable.
+GEN_STAMP_LIB="$ROOT/scripts/lib/installer-gen-stamp.sh"
+if [ ! -r "$GEN_STAMP_LIB" ]; then
+  echo "shared gen-stamp library is missing: $GEN_STAMP_LIB" >&2
+  exit 4
+fi
+# shellcheck source=/dev/null
+. "$GEN_STAMP_LIB"
+GEN="$(ccc_installer_gen_stamp "$ROOT/scripts/install-memory-refresh-cron.sh")"
 
 usage() {
   cat <<EOF
@@ -68,7 +82,7 @@ if ! command -v "${CRONTAB%% *}" >/dev/null 2>&1; then
 fi
 
 # The warming command. bash -lc loads the login PATH so python3/jq/curl/wiki-agent resolve.
-CRON_LINE="$SCHEDULE bash -lc 'CCC_CLAUDE_DIR=\"$CLAUDE_DIR\" \"$REFRESH\"' >> \"$LOG\" 2>&1  $MARKER"
+CRON_LINE="$SCHEDULE bash -lc 'CCC_CLAUDE_DIR=\"$CLAUDE_DIR\" \"$REFRESH\"' >> \"$LOG\" 2>&1  $MARKER gen=$GEN"
 
 current="$("$CRONTAB" -l 2>/dev/null || true)"
 without_marker="$(printf '%s\n' "$current" | grep -vF "$MARKER" || true)"
