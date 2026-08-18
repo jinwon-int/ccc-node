@@ -1,0 +1,9 @@
+[Unit]
+Description=ccc-node A2A Piri shared-audience memory snapshot producer
+Documentation=https://github.com/jinwon-int/ccc-node
+
+[Service]
+Type=oneshot
+UMask=0077
+Environment=PYTHONPATH=/opt/ccc-node/.github/pythonpath
+ExecStart=/opt/ccc-node/bridge/venv/bin/python /opt/ccc-node/scripts/a2a_piri_memory_snapshot.py --json
