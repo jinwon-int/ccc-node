@@ -64,6 +64,42 @@ OUTPUT_STYLE_FILES = ["output-styles/ccc-report.md"]
 #              by setup.sh and must never be reported here.
 SKILL_SOURCE_ROOTS = ("claude/skills", "skills/shared")
 VALID_SCOPES = {"settings", "files", "hooks", "output-styles", "all"}
+# Installer-managed cron markers and the repo script that renders their lines
+# (#1081). Each managed line carries a `gen=h_<sha256:12>` stamp of the
+# installer's content (scripts/lib/installer-gen-stamp.sh); comparing the live
+# stamp against the current checkout's stamp detects entries frozen at an
+# older installer without re-rendering (apply-time flags like
+# --audience-scoped are unknowable at check time, so a re-rendered comparison
+# would false-positive on exactly the #996 emergency configuration).
+# Fields: short name, marker substring, installer path, re-apply hint.
+CRON_MARKER_INSTALLERS = (
+    ("memory-refresh", "# ccc-node:memory-refresh", "scripts/install-memory-refresh-cron.sh",
+     "run scripts/install-memory-refresh-cron.sh --apply"),
+    ("pr-status-poll", "# ccc-node:pr-status-poll", "scripts/install-pr-status-poll-cron.sh",
+     "run scripts/install-pr-status-poll-cron.sh --apply"),
+    ("skill-autosave", "# ccc-node:skill-autosave", "scripts/install-skill-autosave-cron.sh",
+     "run scripts/install-skill-autosave-cron.sh --apply"),
+    ("nunchi", "# nunchi:#816", "scripts/install-nunchi.sh",
+     "run scripts/install-nunchi.sh --apply with the node's original provider/audience flags"),
+)
+# Managed markers that carry no generation stamp by design: the skill-autosave
+# schedule block guards are exact-match parsed by the installer's rebuild awk.
+CRON_AUX_MARKERS = (
+    "# ccc-node:autosave-schedule:begin",
+    "# ccc-node:autosave-schedule:end",
+)
+# Hand-installed markers the repo documents but no installer renders: the
+# self-update and live-backups schedule lines are operator-placed by design
+# (docs/self-update.md, ccc-live-backups-rotate.sh header), so they are
+# surfaced as 정상 with their labels, not flagged — a permanent 경고 on every
+# correctly-configured node would train operators to ignore the class.
+CRON_KNOWN_UNMANAGED_MARKERS = (
+    "# ccc-node:self-update",
+    "# ccc-node:live-backups-rotate",
+)
+CRON_MARKER_RE = re.compile(r"# (?:ccc-node:[A-Za-z0-9:-]+|nunchi:[A-Za-z0-9#:-]+)")
+CRON_GEN_RE = re.compile(r"\bgen=(h_[0-9a-f]{12})\b")
+CRON_GEN_FULL_RE = re.compile(r"h_[0-9a-f]{12}")
 CODEX_PROBE_TIMEOUT_SECONDS = 5.0
 CODEX_PROBE_TIMEOUT_MAX_SECONDS = 10.0
 
@@ -416,6 +452,7 @@ class Doctor:
         self.check_continuation_state()
         self.check_memory_cache()
         self.check_nunchi_collection()
+        self.check_cron_drift()
         self.check_provider_readiness()
         self.check_distill_readiness()
         # Managed Codex skills are provider-native (#647): diagnose them only on
@@ -1373,6 +1410,104 @@ class Doctor:
             else "run scripts/install-nunchi.sh and align provider/source; "
             "install MemPalace for verbatim collection",
         )
+
+    def current_cron_gen_stamp(self, script_rel: str) -> str | None:
+        """Recompute an installer's generation stamp from the current checkout.
+
+        Delegates to scripts/lib/installer-gen-stamp.sh so the stamp algorithm
+        (content-only hash-of-hashes) keeps exactly one implementation — the
+        one the installers stamp with. Explicit `bash` because a repo shebang
+        cannot resolve on Termux (no /usr/bin/env). Returns None when the
+        checkout is incomplete or the helper rejects its input.
+        """
+        lib = self.repo / "scripts" / "lib" / "installer-gen-stamp.sh"
+        script = self.repo / script_rel
+        if not lib.is_file() or not script.is_file():
+            return None
+        try:
+            out = subprocess.run(
+                ["bash", "-c", '. "$1"; ccc_installer_gen_stamp "$2"', "_", str(lib), str(script)],
+                text=True, capture_output=True, timeout=10,
+            )
+        except Exception:
+            return None
+        stamp = out.stdout.strip()
+        if out.returncode != 0 or not CRON_GEN_FULL_RE.fullmatch(stamp):
+            return None
+        return stamp
+
+    def check_cron_drift(self) -> None:
+        """Surface installer-managed cron entries frozen at older code (#1081).
+
+        Nothing re-runs an installer when the repo moves, so a rendered entry
+        stays at its apply-time version until someone notices (#996: 4 days of
+        silent no-op; #1067: manual 10-node re-apply). One row per known
+        marker: 정상 when the lane is absent (opt-in) or every managed line's
+        `gen` stamp matches the current checkout; 경고 (non-fatal — never
+        flips the exit code) when lines are unstamped (pre-#1081) or stamped
+        by older installer content. Marked lines no repo installer renders are
+        surfaced once: documented hand-installed markers
+        (CRON_KNOWN_UNMANAGED_MARKERS) as 정상, unknown ones as 경고 so stale
+        duplicates like the #1079 ghost entries stay visible.
+        """
+        crontab_cmd = os.environ.get("CCC_CRONTAB_CMD", "crontab")
+        try:
+            cron = subprocess.run(
+                [crontab_cmd, "-l"], text=True, capture_output=True, timeout=10
+            ).stdout
+        except Exception:
+            cron = ""
+        lines = cron.splitlines()
+
+        for name, marker, script_rel, apply_hint in CRON_MARKER_INSTALLERS:
+            item = f"cron gen {name}"
+            owned = [ln for ln in lines if marker in ln]
+            if not owned:
+                self.add("정상", item, "not installed (opt-in)", "none")
+                continue
+            gens = [m.group(1) for m in (CRON_GEN_RE.search(ln) for ln in owned) if m]
+            base = f"lines={len(owned)}"
+            current = self.current_cron_gen_stamp(script_rel)
+            if current is None:
+                self.add("경고", item,
+                         f"{base}; cannot recompute current stamp (checkout incomplete)",
+                         "run validate-harness; the checkout is missing the installer or the gen-stamp lib")
+                continue
+            mismatched = [g for g in gens if g != current]
+            if mismatched:
+                self.add("경고", item,
+                         f"{base}; installed gen={mismatched[0]} != current gen={current} — entry frozen at older installer",
+                         apply_hint)
+            elif len(gens) < len(owned):
+                self.add("경고", item,
+                         f"{base}; unstamped pre-#1081 entry (current gen={current})",
+                         apply_hint + " to stamp it")
+            else:
+                self.add("정상", item, f"{base}; gen={current} current", "none")
+
+        known = tuple(m for _, m, _, _ in CRON_MARKER_INSTALLERS) + CRON_AUX_MARKERS
+        documented: list[str] = []
+        unknown: list[str] = []
+        for ln in lines:
+            if "# ccc-node:" not in ln and "# nunchi:" not in ln:
+                continue
+            if any(k in ln for k in known):
+                continue
+            found = CRON_MARKER_RE.search(ln)
+            label = found.group(0) if found else "(unparseable marker)"
+            if any(k in ln for k in CRON_KNOWN_UNMANAGED_MARKERS):
+                if label not in documented:
+                    documented.append(label)
+            elif label not in unknown:
+                unknown.append(label)
+        if documented:
+            self.add("정상", "cron unmanaged markers",
+                     ", ".join(documented) + " — documented hand-installed lines (no installer renders them)",
+                     "none")
+        if unknown:
+            self.add("경고", "cron unmanaged markers",
+                     ", ".join(unknown) + " — no installer in this repo renders these (hand-installed or stale)",
+                     "remove stale entries by hand (#1079); such lines never receive gen stamps")
 
     def print_report(self) -> None:
         print("# ccc doctor\n")

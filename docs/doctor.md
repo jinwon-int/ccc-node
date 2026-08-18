@@ -17,6 +17,10 @@
   reboot or `systemctl start` serves the stale twin. Observed on yukson 2026-07-27, where
   an `enabled` unit pointed at a checkout 111 commits behind the live one.
 - Harness version anchor via `scripts/ccc-version.sh`.
+- **Cron generation drift** (`#1081`): installer-managed cron entries carry a
+  `gen=h_<sha256:12>` stamp of the rendering installer's content. Entries stamped by
+  older code — or unstamped pre-`#1081` lines — are `경고` (non-fatal); re-apply the
+  named installer to re-render. See *Cron generation drift* below.
 - Selected agent provider. For `CCC_AGENT_PROVIDER=codex`, deterministic CLI, app-server surface, and login readiness without a model turn or Telegram access.
 
 The report is Markdown and classifies rows as:
@@ -91,6 +95,38 @@ turn-scoped: Allow or Deny each request; there is no **Allow All**. Stop the old
 bridge before starting the new one because two services must never poll the same
 Telegram bot token concurrently. Roll back by stopping Codex, restoring
 `CCC_AGENT_PROVIDER=claude`, and starting Claude as the sole poller.
+
+## Cron generation drift
+
+Installer-rendered cron entries freeze at apply time: nothing re-runs the
+installer when the repo moves, so a fix like `#996` (piri CLI pin) never reaches
+nodes until someone re-applies by hand. Since `#1081` each managed line carries
+`gen=h_<sha256:12>`, a content-only hash of the installer that rendered it
+(`scripts/lib/installer-gen-stamp.sh`). Doctor recomputes the stamp from the
+current checkout and compares — it never re-renders the line, because apply-time
+flags (e.g. nunchi's `--audience-scoped`) are unknowable at check time and a
+re-rendered comparison would false-positive on exactly those configurations.
+
+One row per known marker (`cron gen memory-refresh`, `cron gen pr-status-poll`,
+`cron gen skill-autosave`, `cron gen nunchi`):
+
+| State | Class | Meaning |
+|---|---|---|
+| absent | `정상` | lane not opted in |
+| all gens match | `정상` | entries rendered by the current checkout |
+| any gen mismatch | `경고` | entry frozen at older installer — re-apply with the printed hint |
+| any line unstamped | `경고` | pre-`#1081` entry — re-apply once to stamp it |
+| stamp not computable | `경고` | checkout missing the installer or the gen-stamp lib |
+
+All rows are non-fatal: they never change the exit code. `install-nunchi.sh`
+re-applies need the node's original provider/audience flags.
+
+Marked lines no repo installer renders are classified separately as
+`cron unmanaged markers`: documented hand-installed lines
+(`# ccc-node:self-update`, `# ccc-node:live-backups-rotate`) are `정상` with
+their labels; unknown markers are `경고` so stale duplicates like the `#1079`
+ghost entries stay visible. The check reads only the crontab of the user
+running doctor.
 
 ## Fleet matrix
 
