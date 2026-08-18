@@ -52,3 +52,21 @@ if paths:
     print(max(paths, key=lambda p: (os.stat(p).st_mtime, p)))
 PY
 }
+
+# file_age_days <path>
+# Print the file's age in whole days (by mtime, floored, never negative).
+# Prints nothing when the file is missing or python3 is unavailable — callers
+# must treat empty output as "unknown", not as zero.
+file_age_days() {
+  local path="${1:-}"
+  [ -f "$path" ] || return 0
+  _MTIME_PRUNE_HAS_PY || return 0
+  python3 - "$path" <<'PY' 2>/dev/null || return 0
+import os, sys, time
+try:
+    age = int((time.time() - os.stat(sys.argv[1]).st_mtime) // 86400)
+except OSError:
+    sys.exit(0)
+print(max(age, 0))
+PY
+}
