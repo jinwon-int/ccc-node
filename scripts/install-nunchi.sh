@@ -525,6 +525,15 @@ case "$ACTION" in
       set_sessionstart_hook remove
     fi
     python3 "$HOOKS/nunchi.py" init
+    # Install record (#1081 phase 2): the replay must reproduce these exact
+    # lines, so the RESOLVED provider and audience flags are materialized —
+    # re-deriving from the ambient env would silently un-scope an
+    # audience-scoped install (the #996 emergency configuration).
+    record_argv=(--apply "--$resolved_provider")
+    if [ "$AUDIENCE_SCOPED" = 1 ]; then record_argv+=(--audience-scoped "$AUDIENCE_ROOT"); fi
+    ccc_installer_record_write "$STATE" "$NUNCHI_SELF_DIR/install-nunchi.sh" "$MARK" "$GEN" -- \
+      "${record_argv[@]}" \
+      || echo "WARNING: install record write failed — self-update re-apply will not track these entries" >&2
     echo "nunchi enabled (mode=on, provider=$resolved_provider, feed=$(basename "$feed"))"
     status
     ;;
@@ -532,6 +541,7 @@ case "$ACTION" in
     write_mode off
     strip_cron
     set_sessionstart_hook remove
+    ccc_installer_record_remove "$STATE" "$NUNCHI_SELF_DIR/install-nunchi.sh" || true
     echo "nunchi disabled (code and ~/.nunchi DB kept)"
     status
     ;;

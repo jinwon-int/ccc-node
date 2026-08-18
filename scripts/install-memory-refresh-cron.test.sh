@@ -26,6 +26,7 @@ STUBEOF
 chmod +x "$STUB"
 export CCC_CRONTAB_CMD="$STUB"
 export CCC_CLAUDE_DIR="$TMP/claude"
+export CCC_STATE_DIR="$CCC_CLAUDE_DIR/state"
 mkdir -p "$CCC_CLAUDE_DIR/hooks" "$CCC_CLAUDE_DIR/state"
 : > "$CCC_CLAUDE_DIR/hooks/refresh-memory.sh"
 
@@ -64,6 +65,13 @@ ok "custom schedule still single line" '[ "$(marker_count)" = 1 ]'
 ok "custom schedule applied" 'grep -qF "17 * * * *" "$FAKE_CRON"'
 ok "old schedule removed" '! grep -qF "*/30 * * * *" "$FAKE_CRON"'
 
+# install record (#1081 phase 2): replay material for self-update
+REC="$CCC_CLAUDE_DIR/state/install-memory-refresh-cron.json"
+ok "apply writes an install record" '[ -f "$REC" ]'
+ok "record carries schema/marker/gen" 'jq -e ".schema==\"ccc.install-record.v1\" and .marker==\"# ccc-node:memory-refresh\" and .gen==\"$want_gen\"" "$REC" >/dev/null'
+ok "record argv materializes the resolved schedule" 'jq -e ".argv == [\"--apply\",\"--schedule\",\"17 * * * *\"]" "$REC" >/dev/null'
+ok "record is owner-only" '[ "$(stat -c %a "$REC")" = 600 ]'
+
 # a pre-existing unrelated cron line is preserved
 printf '0 4 * * * echo keepme\n' >> "$FAKE_CRON"
 bash "$INSTALLER" --apply >/dev/null 2>&1
@@ -74,6 +82,7 @@ ok "still one marker line after preserve" '[ "$(marker_count)" = 1 ]'
 bash "$INSTALLER" --apply --remove >/dev/null 2>&1
 ok "remove deletes marker line" '[ "$(marker_count)" = 0 ]'
 ok "remove keeps unrelated line" 'grep -qF "echo keepme" "$FAKE_CRON"'
+ok "remove drops the install record (no resurrection via re-apply)" '[ ! -f "$REC" ]'
 
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
