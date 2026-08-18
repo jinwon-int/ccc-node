@@ -34,3 +34,6 @@ backups/
 # Python bytecode
 __pycache__/
 *.pyc
+
+# Local virtualenvs (accidentally committed in 1d0078a / #1137)
+.venv/
