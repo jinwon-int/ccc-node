@@ -117,6 +117,27 @@ ok "bounded runner killpg reaps the whole tool process group" '[ -n "$stall_pid"
 out="$(python3 "$MOD" run-memory-search-bounded "$TMP/does-not-exist" q 5 3 "")"; rc=$?
 ok "bounded runner exits 0 quietly when the tool is missing" '[ "$rc" = 0 ] && [ -z "$out" ]'
 
+# #1159: a tool whose shebang does not resolve (Termux has no /usr/bin/env)
+# must still run — the runner names the interpreter instead of exec'ing the
+# script and letting the ENOENT fall into a silent except-OSError.
+cat > "$TMP/badshebang-tool.sh" <<'SH'
+#!/nonexistent/ccc-node-1159/bash
+printf 'via-explicit-interpreter'
+SH
+chmod +x "$TMP/badshebang-tool.sh"
+# the fixture really is unexec'able through its shebang on this host:
+"$TMP/badshebang-tool.sh" >/dev/null 2>&1; badshebang_rc=$?
+out="$(python3 "$MOD" run-memory-search-bounded "$TMP/badshebang-tool.sh" q 5 3 "")"; rc=$?
+ok "bounded runner runs a tool whose shebang does not resolve (#1159)" \
+  '[ "$badshebang_rc" != 0 ] && [ "$rc" = 0 ] && [ "$out" = "via-explicit-interpreter" ]'
+
+# #1159: when the spawn itself fails (no bash on PATH at all), the failure is
+# noted on stderr instead of vanishing into an empty result.
+mkdir -p "$TMP/empty-path"
+out="$(env PATH="$TMP/empty-path" "$(command -v python3)" "$MOD" run-memory-search-bounded "$TMP/fast-tool.sh" q 5 3 "" 2>"$TMP/spawn-err.txt")"; rc=$?
+ok "bounded runner notes an unspawnable interpreter on stderr (#1159)" \
+  '[ "$rc" = 0 ] && [ -z "$out" ] && grep -q "cannot spawn tool" "$TMP/spawn-err.txt"'
+
 # ---- dispatcher -------------------------------------------------------------
 python3 "$MOD" no-such-subcommand </dev/null >/dev/null 2>&1; rc=$?
 ok "dispatcher rejects unknown subcommands (exit 2 -> shell fallback path)" '[ "$rc" = 2 ]'
