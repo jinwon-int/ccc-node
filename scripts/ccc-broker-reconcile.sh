@@ -9,6 +9,16 @@
 # raw `docker compose up` and alternate wrapper invocation shapes stay gated.
 # New runbook needs are added HERE (reviewed), not as new guard grammar.
 #
+# Concurrent invocations are serialized with an exclusive flock taken on the
+# fixed project directory itself (read-only fd — no state file inside the
+# checkout, no caller-writable system path). The lock is held across revision
+# capture and `docker compose up`: two overlapping runs used to be able to
+# label one project's containers with two different A2A_BROKER_REVISION values
+# (#1133). The lock serializes reconcile runs only; the checkout can still be
+# moved by a third party between `git rev-parse HEAD` and docker's read of the
+# Compose file, so after docker returns the HEAD is re-checked and a moved
+# checkout fails loudly (stale-label guard) instead of being trusted silently.
+#
 # See docs/service-control.md. Do not grant to a mutable checkout copy.
 set -uo pipefail
 
@@ -102,15 +112,50 @@ for svc in "$@"; do
   [ "$ok" -eq 1 ] || die "service is not allowlisted: $svc"
 done
 
+# --- serialization: one reconcile at a time against the fixed project dir ---
+# The lock fd is a read-only open OF THE PROJECT DIRECTORY, so every caller
+# shape (root or agent) locks the same object without write access to the
+# checkout or to any shared state directory. Held until process exit, i.e.
+# across revision capture and the whole `docker compose up`.
+[ -d "$broker_dir" ] || die "broker dir does not exist: $broker_dir"
+exec {reconcile_lock}<"$broker_dir" || die "cannot open broker dir for locking: $broker_dir"
+lock_wait="${CCC_BROKER_RECONCILE_LOCK_WAIT:-120}"
+case "$lock_wait" in
+  ''|*[!0-9]*) die 'CCC_BROKER_RECONCILE_LOCK_WAIT must be a non-negative integer' ;;
+esac
+flock --exclusive --wait "$lock_wait" "$reconcile_lock" \
+  || die "another ccc-broker-reconcile is still running against $broker_dir (waited ${lock_wait}s)"
+
 if [ "$dry_run" = 1 ]; then
-  printf 'DRY-RUN: cd %s && export A2A_BROKER_REVISION=$(git rev-parse HEAD) && docker compose up -d' "$broker_dir"
-  printf ' %s' "$@"
-  printf '\n'
-  exit 0
+  docker_bin="${CCC_BROKER_RECONCILE_DOCKER:-}"
+  if [ -z "$docker_bin" ]; then
+    printf 'DRY-RUN: cd %s && export A2A_BROKER_REVISION=$(git rev-parse HEAD) && docker compose up -d' "$broker_dir"
+    printf ' %s' "$@"
+    printf '\n'
+    exit 0
+  fi
+  # Test seam (dry-run only): run the real terminal sequence against a
+  # caller-supplied docker substitute. Dry-run already trusts caller-chosen
+  # config paths, and the substitute runs with no privilege beyond the
+  # caller's own shell — production always uses /usr/bin/docker.
+else
+  docker_bin='/usr/bin/docker'
 fi
 
-[ -d "$broker_dir" ] || die "broker dir does not exist: $broker_dir"
 cd "$broker_dir" || die "cannot cd to broker dir: $broker_dir"
 A2A_BROKER_REVISION="$(/usr/bin/git rev-parse HEAD 2>/dev/null)" || die 'git rev-parse HEAD failed (broker dir not a git repo?)'
 export A2A_BROKER_REVISION
-exec /usr/bin/docker compose up -d "$@"
+"$docker_bin" compose up -d "$@"
+docker_rc=$?
+if [ "$docker_rc" -ne 0 ]; then
+  exit "$docker_rc"
+fi
+# Stale-label guard (#1133): the lock serializes reconcile runs, but the
+# checkout can still move between rev-parse and docker's read of the Compose
+# file (a third-party pull). A moved HEAD means the containers just created
+# carry an A2A_BROKER_REVISION that does not describe the Compose payload
+# docker actually used — fail loudly so the run is retried, not trusted.
+head_after="$(/usr/bin/git rev-parse HEAD 2>/dev/null)" \
+  || die "post-reconcile git rev-parse failed; container label A2A_BROKER_REVISION=$A2A_BROKER_REVISION may not match the checkout"
+[ "$head_after" = "$A2A_BROKER_REVISION" ] \
+  || die "broker checkout moved during reconcile ($A2A_BROKER_REVISION -> $head_after); containers carry a stale A2A_BROKER_REVISION — re-run to converge"

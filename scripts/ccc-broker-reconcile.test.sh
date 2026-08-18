@@ -97,6 +97,69 @@ run_wrapper a2a-broker >/dev/null 2>&1; rc=$?
 ok "non-absolute broker dir is denied" test "$rc" -ne 0
 printf '%s\n' "$BROKER_DIR" > "$DIRF"; chmod 600 "$DIRF"
 
+# --- serialization (#1133) --------------------------------------------------
+# A held project-dir lock makes a concurrent run fail after the wait budget.
+( exec {holder_fd}<"$BROKER_DIR"; flock -x "$holder_fd"; sleep 30 ) &
+holder_pid=$!
+sleep 0.5
+CCC_BROKER_RECONCILE_LOCK_WAIT=1 run_wrapper a2a-broker >"$TMP/out" 2>&1; rc=$?
+ok "concurrent reconcile is refused after the lock wait" test "$rc" -ne 0
+ok "lock refusal names the running reconcile" grep -q 'still running' "$TMP/out"
+ok "lock refusal emits no dry-run execution" sh -c '! grep -q ^DRY-RUN: "$1"' _ "$TMP/out"
+kill "$holder_pid" 2>/dev/null
+wait "$holder_pid" 2>/dev/null
+
+# A run whose wait budget outlives the holder proceeds once the lock frees.
+( exec {holder_fd}<"$BROKER_DIR"; flock -x "$holder_fd"; sleep 2 ) &
+holder_pid=$!
+sleep 0.5
+CCC_BROKER_RECONCILE_LOCK_WAIT=10 run_wrapper a2a-broker >"$TMP/out" 2>&1; rc=$?
+ok "reconcile waits out a held lock and then proceeds" test "$rc" -eq 0
+ok "waited run still emits the dry-run plan" grep -q '^DRY-RUN:' "$TMP/out"
+wait "$holder_pid" 2>/dev/null
+
+CCC_BROKER_RECONCILE_LOCK_WAIT=abc run_wrapper a2a-broker >/dev/null 2>&1; rc=$?
+ok "non-numeric lock wait is denied" test "$rc" -ne 0
+
+# --- stale-label (TOCTOU) guard (#1133) -------------------------------------
+# The dry-run docker substitute lets the real terminal sequence run against a
+# fixture git checkout: revision capture, substitute, post-run HEAD re-check.
+export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t
+BROKER_GIT="$TMP/broker-git"
+mkdir -p "$BROKER_GIT"
+git -C "$BROKER_GIT" init -q -b main
+git -C "$BROKER_GIT" commit -q --allow-empty -m one
+printf '%s\n' "$BROKER_GIT" > "$DIRF"; chmod 600 "$DIRF"
+
+cat > "$TMP/docker-ok" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+chmod +x "$TMP/docker-ok"
+CCC_BROKER_RECONCILE_DOCKER="$TMP/docker-ok" run_wrapper a2a-broker >/dev/null 2>&1; rc=$?
+ok "clean reconcile against the docker substitute succeeds" test "$rc" -eq 0
+
+cat > "$TMP/docker-drift" <<EOF
+#!/usr/bin/env bash
+# A third-party checkout update landing mid-reconcile.
+git -C "$BROKER_GIT" commit -q --allow-empty -m drift >/dev/null
+exit 0
+EOF
+chmod +x "$TMP/docker-drift"
+CCC_BROKER_RECONCILE_DOCKER="$TMP/docker-drift" run_wrapper a2a-broker >"$TMP/out" 2>&1; rc=$?
+ok "checkout drift during reconcile fails loudly" test "$rc" -ne 0
+ok "drift failure names the stale revision label" grep -q 'stale A2A_BROKER_REVISION' "$TMP/out"
+
+cat > "$TMP/docker-fail" <<'EOF'
+#!/usr/bin/env bash
+exit 17
+EOF
+chmod +x "$TMP/docker-fail"
+CCC_BROKER_RECONCILE_DOCKER="$TMP/docker-fail" run_wrapper a2a-broker >/dev/null 2>&1; rc=$?
+ok "docker failure propagates its exact exit status" test "$rc" -eq 17
+
+printf '%s\n' "$BROKER_DIR" > "$DIRF"; chmod 600 "$DIRF"
+
 echo "----"
 echo "PASS=$pass FAIL=$fail"
 [ "$fail" -eq 0 ]
