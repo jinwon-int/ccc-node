@@ -79,12 +79,21 @@ ok "installed line runs the autosave cmd" 'grep -q "ccc-skill-autosave.sh" "$CRO
 ok "managed timezone block installed" \
   '[ "$(grep -cF "# ccc-node:autosave-schedule:begin" "$CRON_STORE")" = 1 ] && grep -qF "CRON_TZ=Etc/UTC" "$CRON_STORE"'
 
+# ---- generation stamp (#1081): content hash of the installer ----------------
+# shellcheck source=/dev/null
+. "$HERE/lib/installer-gen-stamp.sh"
+want_gen="$(ccc_installer_gen_stamp "$SC")"
+ok "installed line carries gen stamp" 'grep -qE "# ccc-node:skill-autosave gen=h_[0-9a-f]{12}$" "$CRON_STORE"'
+ok "gen stamp matches installer content" 'grep -qF "gen=$want_gen" "$CRON_STORE"'
+ok "BEGIN/END block markers stay unstamped (exact-match parsed)" '! grep -qE "autosave-schedule:(begin|end) gen=" "$CRON_STORE"'
+
 # ---- idempotency: re-apply keeps a single marker line ----------------------
 run bash "$SC" --apply
 okc "$RC" 0 "re-apply exits 0"
 ok "re-apply still exactly one marker line" '[ "$(grep -cF "$MARKER" "$CRON_STORE")" = 1 ]'
 ok "re-apply still exactly one timezone block" \
   '[ "$(grep -cF "# ccc-node:autosave-schedule:begin" "$CRON_STORE")" = 1 ]'
+ok "re-apply keeps the same gen stamp" 'grep -qF "gen=$want_gen" "$CRON_STORE"'
 
 # ---- unrelated pre-existing lines are preserved ----------------------------
 printf '%s\n' "CRON_TZ=Asia/Seoul" "0 3 * * * /usr/bin/other-job" > "$CRON_STORE"

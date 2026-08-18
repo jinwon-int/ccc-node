@@ -50,9 +50,17 @@ ok "installed line carries default schedule" 'grep -qF "*/17 * * * *" "$FAKE_CRO
 ok "installed line loads login PATH via bash -lc" 'grep -qF "bash -lc" "$FAKE_CRON"'
 ok "installed line invokes run mode" 'grep -qF "ccc-pr-status-poll.sh\" run" "$FAKE_CRON"'
 
+# generation stamp (#1081): content hash of the installer, pinned at end of line
+# shellcheck source=/dev/null
+. "$ROOT/scripts/lib/installer-gen-stamp.sh"
+want_gen="$(ccc_installer_gen_stamp "$INSTALLER")"
+ok "installed line carries gen stamp" 'grep -qE "# ccc-node:pr-status-poll gen=h_[0-9a-f]{12}$" "$FAKE_CRON"'
+ok "gen stamp matches installer content" 'grep -qF "gen=$want_gen" "$FAKE_CRON"'
+
 # idempotent: re-apply keeps a single line
 bash "$INSTALLER" --apply >/dev/null 2>&1
 ok "re-apply stays idempotent (one line)" '[ "$(marker_count)" = 1 ]'
+ok "re-apply keeps the same gen stamp" 'grep -qF "gen=$want_gen" "$FAKE_CRON"'
 
 # custom schedule replaces, still single line
 bash "$INSTALLER" --apply --schedule "3 * * * *" >/dev/null 2>&1

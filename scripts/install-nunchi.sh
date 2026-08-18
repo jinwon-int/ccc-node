@@ -17,7 +17,9 @@
 # per-new-session extractors (codex exec / Piri print mode); the main bridge
 # distill journal separately owns replay-safe memory sinks.
 # Provider changes remove the other path so one runtime never injects the same
-# node-global snapshot twice.
+# node-global snapshot twice. Managed cron lines carry a `gen=h_<sha256:12>`
+# stamp of this script's content (#1081) so ccc-doctor can tell when the
+# installed entries were rendered by an older installer.
 set -euo pipefail
 
 ACTION="status"
@@ -102,6 +104,20 @@ MODE_FILE="$STATE/nunchi.mode"
 MARK="# nunchi:#816"
 TS="$(date +%Y%m%dT%H%M%S)"
 CRONTAB="${CCC_CRONTAB_CMD:-crontab}"
+
+# Generation stamp (#1081): content hash of this script, pinned into every
+# managed cron line so ccc-doctor can tell when the installed entries were
+# rendered by an older installer (#996 sat frozen for 4 days). Appended after
+# "$MARK", which strip_cron matches by substring, so removal keeps working.
+NUNCHI_SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+GEN_STAMP_LIB="$NUNCHI_SELF_DIR/lib/installer-gen-stamp.sh"
+if [ ! -r "$GEN_STAMP_LIB" ]; then
+  echo "shared gen-stamp library is missing: $GEN_STAMP_LIB" >&2
+  exit 4
+fi
+# shellcheck source=/dev/null
+. "$GEN_STAMP_LIB"
+GEN="$(ccc_installer_gen_stamp "$NUNCHI_SELF_DIR/install-nunchi.sh")"
 
 validate_codex_loader() {
   python3 - "$HOOKS/codex-loader.py" <<'PY'
@@ -494,14 +510,14 @@ case "$ACTION" in
     if [ "$AUDIENCE_SCOPED" = 1 ]; then
       scoped_env="CCC_NUNCHI_AUDIENCE_SCOPED=1 CCC_NUNCHI_AUDIENCE_ROOT=$(cron_quote "$AUDIENCE_ROOT") "
     fi
-    append_cron_line "*/10 * * * * CCC_STATE_DIR=$(cron_quote "$STATE") ${scoped_env}${piri_env}NUNCHI_HOME=$(cron_quote "$NUNCHI_DIR") NUNCHI_DB=$(cron_quote "$NUNCHI_DB_PATH") NUNCHI_SNAPSHOT=$(cron_quote "$NUNCHI_SNAPSHOT_PATH") $(cron_quote "$bash_bin") $(cron_quote "$feed") >> $(cron_quote "$NUNCHI_DIR/cron.log") 2>&1 $MARK"
+    append_cron_line "*/10 * * * * CCC_STATE_DIR=$(cron_quote "$STATE") ${scoped_env}${piri_env}NUNCHI_HOME=$(cron_quote "$NUNCHI_DIR") NUNCHI_DB=$(cron_quote "$NUNCHI_DB_PATH") NUNCHI_SNAPSHOT=$(cron_quote "$NUNCHI_SNAPSHOT_PATH") $(cron_quote "$bash_bin") $(cron_quote "$feed") >> $(cron_quote "$NUNCHI_DIR/cron.log") 2>&1 $MARK gen=$GEN"
     if [ "$refresh_ready" = 1 ]; then
-      append_cron_line "17 * * * * CCC_STATE_DIR=$(cron_quote "$STATE") ${scoped_env}NUNCHI_HOME=$(cron_quote "$NUNCHI_DIR") CCC_NUNCHI_MEMPALACE_STATUS=$(cron_quote "$MEMPALACE_STATUS") CCC_NUNCHI_MEMPALACE_REFRESH_TIMEOUT_SEC=$(cron_quote "$MEMPALACE_TIMEOUT") CCC_NUNCHI_MEMPALACE_CLI=$(cron_quote "$mp") CCC_NUNCHI_TIMEOUT_CLI=$(cron_quote "$timeout_bin") CCC_NUNCHI_FLOCK_CLI=$(cron_quote "$flock_bin") $(cron_quote "$bash_bin") $(cron_quote "$refresh") $resolved_provider $(cron_quote "$sweep_dir") >> $(cron_quote "$NUNCHI_DIR/mempalace-sweep.cron.log") 2>&1 $MARK"
+      append_cron_line "17 * * * * CCC_STATE_DIR=$(cron_quote "$STATE") ${scoped_env}NUNCHI_HOME=$(cron_quote "$NUNCHI_DIR") CCC_NUNCHI_MEMPALACE_STATUS=$(cron_quote "$MEMPALACE_STATUS") CCC_NUNCHI_MEMPALACE_REFRESH_TIMEOUT_SEC=$(cron_quote "$MEMPALACE_TIMEOUT") CCC_NUNCHI_MEMPALACE_CLI=$(cron_quote "$mp") CCC_NUNCHI_TIMEOUT_CLI=$(cron_quote "$timeout_bin") CCC_NUNCHI_FLOCK_CLI=$(cron_quote "$flock_bin") $(cron_quote "$bash_bin") $(cron_quote "$refresh") $resolved_provider $(cron_quote "$sweep_dir") >> $(cron_quote "$NUNCHI_DIR/mempalace-sweep.cron.log") 2>&1 $MARK gen=$GEN"
       echo "mempalace hourly refresh cron added ($resolved_provider: $sweep_dir)"
     else
       echo "mempalace CLI, refresh hook or transcript dir missing — verbatim refresh cron skipped"
     fi
-    append_cron_line "7 8 * * 1 CCC_STATE_DIR=$(cron_quote "$STATE") NUNCHI_HOME=$(cron_quote "$NUNCHI_DIR") NUNCHI_DB=$(cron_quote "$NUNCHI_DB_PATH") NUNCHI_SNAPSHOT=$(cron_quote "$NUNCHI_SNAPSHOT_PATH") $(cron_quote "$bash_bin") $(cron_quote "$HOOKS/bench.sh") >> $(cron_quote "$NUNCHI_DIR/bench.cron.log") 2>&1 $MARK"
+    append_cron_line "7 8 * * 1 CCC_STATE_DIR=$(cron_quote "$STATE") NUNCHI_HOME=$(cron_quote "$NUNCHI_DIR") NUNCHI_DB=$(cron_quote "$NUNCHI_DB_PATH") NUNCHI_SNAPSHOT=$(cron_quote "$NUNCHI_SNAPSHOT_PATH") $(cron_quote "$bash_bin") $(cron_quote "$HOOKS/bench.sh") >> $(cron_quote "$NUNCHI_DIR/bench.cron.log") 2>&1 $MARK gen=$GEN"
     echo "weekly bench cron added (Mon 08:07)"
     if [ "$resolved_provider" = "claude" ]; then
       set_sessionstart_hook add
