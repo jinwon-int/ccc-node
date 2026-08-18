@@ -6,7 +6,6 @@ Run standalone: python3 scripts/a2a_piri_memory_snapshot_test.py
 
 from __future__ import annotations
 
-import json
 import os
 from pathlib import Path
 import stat
