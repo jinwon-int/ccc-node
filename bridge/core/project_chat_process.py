@@ -162,10 +162,29 @@ def _stall_ages(loop: Any, request: _PendingRequest) -> dict[str, str]:
 # rejected key changes nothing and retrying a throttle makes it worse.
 _RETRYABLE_ADMISSION_CLASSES = frozenset({"silent", "network", "timeout"})
 
+# A provider turn that runs to a normal completion yet produces no
+# user-visible text anywhere (#775). Measured on gwakga 2026-08-18 14:44: a
+# follow-up "did the background job finish?" turn ended after ~7s with
+# ResultEvent+CompletionEvent and zero text, and the bridge handed the
+# user "Please retry your request" instead of retrying itself. The turn
+# completed, so this is not an admission stall — but it is the same
+# short-window transient class, and the bounded retry budget below is the
+# right remedy for both.
+_EMPTY_COMPLETION_MARKER = "empty-completion"
+
 
 def _admission_retry_class(response: ChatResponse) -> str | None:
-    """The stderr class of a retryable admission failure, else ``None``."""
+    """The retryable failure class of a turn, else ``None``.
+
+    Two marker shapes are retryable: ``admission-timeout/<stderr class>``
+    where the class looks transient, and a bare ``empty-completion`` turn
+    the provider finished without ever speaking. The ``coalesced-turn``
+    marker is deliberately excluded — the answer is already on its way
+    under the follower turn, so resending only queues a duplicate.
+    """
     marker = getattr(response, "failure_class", None) or ""
+    if marker == _EMPTY_COMPLETION_MARKER:
+        return marker
     prefix, _, cls = marker.partition("/")
     if prefix != "admission-timeout":
         return None
@@ -362,6 +381,10 @@ class ProjectChatProcessMixin:
         # uplink drops for ~60s at a time — but the retry runs on its own small
         # budget, never the full grace again: 300s + 300s is the 600s dead wait
         # that made raising the deadline the wrong fix in the first place.
+        # The same budget covers `empty-completion` turns (#775): the provider
+        # finished without any visible text, which is the same short-window
+        # transient class seen on gwakga 2026-08-18 14:44 — the user was told
+        # to retry by hand for something the bridge could retry itself.
         #
         # This does not hide the cause. The #846 warning is emitted for each
         # admission timeout, so a retried failure still leaves the first
@@ -379,7 +402,7 @@ class ProjectChatProcessMixin:
             return response
 
         logger.warning(
-            "Retrying a turn the provider never admitted for user %s chat %s "
+            "Retrying a turn with no user-visible answer for user %s chat %s "
             "(class=%s retry_grace=%gs)",
             user_id,
             chat_id,
@@ -408,7 +431,8 @@ class ProjectChatProcessMixin:
         )
         if retried.success:
             logger.info(
-                "Retry admitted the turn for user %s chat %s after a %s stall",
+                "Retry recovered the turn for user %s chat %s after a %s "
+                "failure",
                 user_id,
                 chat_id,
                 retry_class,
@@ -1280,6 +1304,11 @@ class ProjectChatProcessMixin:
                                 success=False,
                                 error="coalesced_turn",
                                 session_id=session.session_id,
+                                # Typed for diagnostics; deliberately NOT in
+                                # the retry set — the follower carries the
+                                # answer and a resend would duplicate the
+                                # question (#1128).
+                                failure_class="coalesced-turn",
                             )
                         message = "Agent finished without a visible answer"
                         return ChatResponse(
@@ -1287,6 +1316,10 @@ class ProjectChatProcessMixin:
                             success=False,
                             error=message,
                             session_id=session.session_id,
+                            # Lets process_message's bounded retry take one
+                            # more shot instead of pushing the retry onto
+                            # the user (gwakga 2026-08-18 14:44).
+                            failure_class=_EMPTY_COMPLETION_MARKER,
                         )
                 _claim_request_terminal(
                     progress_request,
