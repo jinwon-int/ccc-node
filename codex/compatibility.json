@@ -125,6 +125,16 @@
       "pattern": "claude/skills/nclex-a2a-content-pipeline/**",
       "compatibility": "claude-only",
       "reason": "Claude session A2A dispatch orchestration (a2a-dispatch-round manifests, receipt projection); no codex mirror yet"
+    },
+    {
+      "pattern": "claude/skills/github-incident-recovery-merge-retry/**",
+      "compatibility": "claude-only",
+      "reason": "generic gh/systemd shell procedure authored for Claude skill matching; codex mirror candidate, none exists yet"
+    },
+    {
+      "pattern": "claude/skills/github-merge-state-conflict-diagnosis/**",
+      "compatibility": "claude-only",
+      "reason": "generic gh diagnostic procedure authored for Claude skill matching; codex mirror candidate, none exists yet"
     }
   ],
   "managed_skills": [
