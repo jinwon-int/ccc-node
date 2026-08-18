@@ -67,6 +67,29 @@ VALID_SCOPES = {"settings", "files", "hooks", "output-styles", "all"}
 CODEX_PROBE_TIMEOUT_SECONDS = 5.0
 CODEX_PROBE_TIMEOUT_MAX_SECONDS = 10.0
 
+# Installer-managed cron markers (#1081). Maps the marker token each installer
+# appends to its rendered line(s) to the repo script whose content hash is the
+# expected `gen=` stamp (#1140 stamps with exactly that one file). Mirrors the
+# render sites: install-memory-refresh-cron.sh, install-pr-status-poll-cron.sh,
+# install-skill-autosave-cron.sh (CRON_LINE only), install-nunchi.sh
+# (feed/refresh/bench). install-termux-mempalace.sh delegates cron rendering to
+# install-nunchi.sh, so its lines are covered by the nunchi entry.
+INSTALLER_CRON_MARKERS = {
+    "# ccc-node:memory-refresh": "install-memory-refresh-cron.sh",
+    "# ccc-node:pr-status-poll": "install-pr-status-poll-cron.sh",
+    "# ccc-node:skill-autosave": "install-skill-autosave-cron.sh",
+    "# nunchi:#816": "install-nunchi.sh",
+}
+# install-skill-autosave-cron.sh manages its schedule-comment block with these
+# exact-match markers; they are deliberately unstamped (#1140) and are neither
+# drift candidates nor ownerless.
+CRON_BLOCK_MARKER_RE = re.compile(r"#\s*ccc-node:autosave-schedule:(?:begin|end)\b")
+# Any other `# ccc-node:*` / `# nunchi:*` token has no installer in this repo
+# (e.g. the hand-installed self-update / live-backups-rotate lines) and is
+# surfaced as informational so residue like #1079's ghost entries is visible.
+CRON_OWNERLESS_MARKER_RE = re.compile(r"#\s*(?:ccc-node|nunchi):\S+")
+CRON_GEN_STAMP_RE = re.compile(r"\bgen=(h_[0-9a-f]{12})\b")
+
 _CANONICAL_PATHS: Any = None
 _CANONICAL_PATHS_TRIED = False
 
@@ -416,6 +439,7 @@ class Doctor:
         self.check_continuation_state()
         self.check_memory_cache()
         self.check_nunchi_collection()
+        self.check_cron_drift()
         self.check_provider_readiness()
         self.check_distill_readiness()
         # Managed Codex skills are provider-native (#647): diagnose them only on
@@ -1373,6 +1397,115 @@ class Doctor:
             else "run scripts/install-nunchi.sh and align provider/source; "
             "install MemPalace for verbatim collection",
         )
+
+    def installer_gen_stamp(self, installer: str) -> str | None:
+        """Expected `gen=` stamp for one installer, via the shared helper.
+
+        Shells out to ``scripts/lib/installer-gen-stamp.sh`` instead of
+        reimplementing the digest, so apply-time stamping and doctor-time
+        comparison share one implementation and cannot diverge (#1081 sibling
+        of the #920 rule). None means the helper or installer is unreadable in
+        this checkout, so the caller must degrade instead of guessing.
+        """
+        lib = self.repo / "scripts" / "lib" / "installer-gen-stamp.sh"
+        script = self.repo / "scripts" / installer
+        if not lib.is_file() or not script.is_file():
+            return None
+        try:
+            proc = subprocess.run(
+                ["bash", "-c", '. "$1" && ccc_installer_gen_stamp "$2"', "_", str(lib), str(script)],
+                text=True,
+                capture_output=True,
+                timeout=10,
+            )
+        except Exception:
+            return None
+        out = proc.stdout.strip()
+        if proc.returncode != 0 or not re.fullmatch(r"h_[0-9a-f]{12}", out):
+            return None
+        return out
+
+    def check_cron_drift(self) -> None:
+        """Surface frozen installer-managed cron entries (#1081 stage 1, PR-B).
+
+        Installer-rendered cron lines are frozen at apply time: nothing re-runs
+        the installer when the repo moves, so a merged fix never reaches the
+        entry (#996 sat 4 days as a silent no-op; #1067 needed a manual
+        10-node rollout). #1140 stamps each managed line with
+        ``gen=h_<sha256:12>`` of the rendering installer; this check recomputes
+        that stamp from the current checkout and compares.
+
+        Stamp comparison only — never a re-render diff: the apply-time flags
+        are unknown at check time, so re-rendering would report a false drift
+        for any flag-customized entry (#996's emergency piri flags are the
+        recorded example). Every finding is 경고 (non-fatal, exit code
+        unchanged): stage 1 is visibility without behavior change. Body-free:
+        marker names, stamp values and line counts only — never the command
+        portion of a cron line.
+        """
+        crontab_cmd = os.environ.get("CCC_CRONTAB_CMD", "crontab")
+        try:
+            cron = subprocess.run(
+                [crontab_cmd, "-l"], text=True, capture_output=True, timeout=10
+            ).stdout
+        except Exception:
+            cron = ""
+
+        managed: dict[str, list[str | None]] = {}
+        ownerless: list[str] = []
+        for raw_line in cron.splitlines():
+            line = raw_line.strip()
+            if not line or CRON_BLOCK_MARKER_RE.search(line):
+                continue
+            marker = next((m for m in INSTALLER_CRON_MARKERS if m in line), None)
+            if marker is not None:
+                stamp = CRON_GEN_STAMP_RE.search(line.split(marker, 1)[1])
+                managed.setdefault(marker, []).append(stamp.group(1) if stamp else None)
+                continue
+            orphan = CRON_OWNERLESS_MARKER_RE.search(line)
+            if orphan and orphan.group(0) not in ownerless:
+                ownerless.append(orphan.group(0))
+
+        # Opt-in: no managed marker at all means nothing was installed here.
+        if not managed and not ownerless:
+            self.add("정상", "installer cron entries", "none installed (opt-in)", "none")
+            return
+
+        for marker, gens in managed.items():
+            installer = INSTALLER_CRON_MARKERS[marker]
+            item = "cron entry {}".format(marker.lstrip("# "))
+            expected = self.installer_gen_stamp(installer)
+            if expected is None:
+                self.add(
+                    "경고", item, "cannot recompute stamp (installer or helper unreadable)",
+                    f"restore scripts/{installer} and scripts/lib/installer-gen-stamp.sh "
+                    "in this checkout, then rerun",
+                )
+                continue
+            unstamped = sum(1 for gen in gens if gen is None)
+            observed = sorted({gen for gen in gens if gen is not None})
+            if unstamped:
+                self.add(
+                    "경고", item,
+                    f"unstamped pre-#1081 entry ({unstamped}/{len(gens)} line(s))",
+                    f"run scripts/{installer} --apply to re-render and stamp",
+                )
+            elif observed == [expected]:
+                self.add("정상", item, f"gen match ({expected}, {len(gens)} line(s))", "none")
+            else:
+                self.add(
+                    "경고", item, f"gen drift ({len(gens)} line(s))",
+                    "run scripts/{} --apply (installed {} ≠ current {})".format(
+                        installer, ",".join(observed), expected
+                    ),
+                )
+        for token in ownerless:
+            self.add(
+                "경고", "cron entry {}".format(token.lstrip("# ")),
+                "no installer in repo for this marker",
+                "hand-installed or legacy entry — verify it is intended, then manage or "
+                "remove it manually",
+            )
 
     def print_report(self) -> None:
         print("# ccc doctor\n")

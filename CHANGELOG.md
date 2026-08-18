@@ -5,6 +5,14 @@ All notable changes to the Claude Code node harness. Dates are KST.
 ## [Unreleased]
 
 ### Added
+- `ccc-doctor` now reports installer-managed cron drift (#1081 stage 1, PR-B):
+  each managed marker's `gen=` stamp is recomputed from the current checkout
+  through the same `installer-gen-stamp.sh` helper apply uses and compared,
+  classifying entries as match (정상), gen drift, unstamped pre-#1081, or
+  ownerless marker (all 경고, non-fatal — visibility only, no exit-code or
+  behavior change). Stamp comparison only, never a re-render diff: apply-time
+  flags are unknown at check time, so re-rendering would misreport
+  flag-customized entries such as #996's emergency piri configuration.
 - Opt-in fleet skill intake now connects node-local autosave output to the
   private `jinwon-int/fleet-skills` review boundary without giving every node a
   GitHub write credential. Each daily node sweep reclassifies and rescans
