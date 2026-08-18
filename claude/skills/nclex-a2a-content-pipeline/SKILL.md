@@ -48,9 +48,12 @@ description: Drive a jinwon-int/nclex content PR through the full narrow-gate A2
    `sourceBundle.files[0].content`에 계약+changedRecords(75쌍)+relevantRules+
    machineGate 내장. `terminalBrief.notificationOwnership` 필수.
 3. dry-run → 디스패치 → 브로커 GET `/tasks/<url-enc-id>`로 감시.
-4. **`review_verdict_failed`이면 소견이 있는데 본문이 폐기된 것** —
-   같은 packet을 `review: {required:false}`로 **결과보존 재생**해 BLOCK 소견 회수
-   → 수정(수정 세대 1회) → 새 head로 정식 레인 재디스패치.
+4. **`review_verdict_failed`이면 먼저 GET `/tasks/:id` 와 `/tasks/:id/diagnostics`를 본다.**
+   `sameSourceRedispatch.action=skip` 이거나 `negativeVerdictEvidence`에
+   소견(findings/note)이 있으면 **같은 소스 diagnostic/결과보존 재생을 하지 않는다**
+   (#1815 item 5, #1878 + redispatch classifier). merge gate는 그대로 fail-closed.
+   증거가 비었거나 generic ack일 때만 `review: {required:false}` 재생으로 회수.
+   회수 후 수정(수정 세대 1회) → 새 head로 정식 레인 재디스패치.
 5. PASS 후 coverage.json에 review 객체 투영(각 레코드 `stage=reviewed` +
    `review{reviewer:"a2a:<node>", reviewed_at, note(태스크 id·resultHash 인용),
    evidence:["kuksiwon-item-writing-2018:…", "kma-terminology-6x:search=<개념>"…]}`)
