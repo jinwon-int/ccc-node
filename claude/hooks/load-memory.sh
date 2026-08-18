@@ -131,8 +131,17 @@ fi
 
 scan_injection_block() { # <label> <text>
   local label="$1" text="$2" scanned
+  # Run the scanner through bash rather than exec'ing it. Exec'ing depends on
+  # its `#!/usr/bin/env bash` resolving, and Termux has no /usr at all, so the
+  # exec dies with 126 and the command substitution below fails. The `-x` test
+  # still passes, so the fail-open branch takes over and the block is injected
+  # UNSCANNED — no credential redaction, no prompt-injection neutralization,
+  # and nothing logged (#1157). Fail-open is the right contract for a missing
+  # scanner; it must not silently become the default on a whole platform.
+  # scan-injection.sh's own suite never caught this because it invokes the
+  # scanner as `bash "$SCAN"`, which is the form the callers lacked.
   if [ -x "$HOOKDIR/scan-injection.sh" ] \
-    && scanned="$(printf '%s' "$text" | "$HOOKDIR/scan-injection.sh" "$label" 2>/dev/null)"; then
+    && scanned="$(printf '%s' "$text" | bash "$HOOKDIR/scan-injection.sh" "$label" 2>/dev/null)"; then
     printf '%s' "$scanned"
   else
     printf '%s' "$text"

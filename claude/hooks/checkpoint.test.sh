@@ -108,6 +108,39 @@ out="$(CCC_STATE_DIR="$plain_dir" CCC_MEMORY_LEGACY_STATE_DIR="$legacy_dir" \
 ctx="$(jq -r '.hookSpecificOutput.additionalContext' <<<"$out")"
 ok "unscoped node does not pull legacy working-state" \
   '! grep -q "pre-scope task context" <<<"$ctx"'
+# --- #1157: the resolved scanner runs through bash, not through its shebang --
+# A scanner whose shebang cannot resolve stands in for Termux, where
+# /usr/bin/env does not exist. Exec'ing it there dies with 126, the command
+# substitution fails, and the fail-open branch re-injects UNSCANNED text
+# silently. It runs at all only if the caller names the interpreter.
+fake_hooks="$TMP/fake-hooks"; mkdir -p "$fake_hooks/lib"
+cp "$CHECKPOINT" "$fake_hooks/checkpoint.sh"
+cp "$HERE/lib/mtime-prune.sh" "$fake_hooks/lib/mtime-prune.sh"
+cat > "$fake_hooks/scan-injection.sh" <<EOF
+#!$TMP/no-such-interpreter
+sed 's/SENTINELSECRET/[REDACTED:credential]/'
+EOF
+chmod +x "$fake_hooks/scan-injection.sh"
+shebang_state="$TMP/shebang-state"; mkdir -p "$shebang_state"
+printf 'progress note SENTINELSECRET tail\n' > "$shebang_state/working-state.md"
+out="$(CCC_STATE_DIR="$shebang_state" bash "$fake_hooks/checkpoint.sh" PostCompact 2>&1)"
+ctx="$(jq -r '.hookSpecificOutput.additionalContext' <<<"$out")"
+ok "resolved scanner runs when its shebang does not resolve" \
+  'grep -q "REDACTED:credential" <<<"$ctx" && ! grep -q "SENTINELSECRET" <<<"$ctx"'
+
+# An explicit override keeps being exec'd as named — it may not be a bash
+# script, so forcing an interpreter onto it would defeat the seam.
+# Resolve the interpreter from PATH: this fixture is exec'd on its shebang by
+# design, so hardcoding /usr/bin/env would only test whether the host happens
+# to have one (Termux does not).
+printf '#!%s\nsed "s/SENTINELSECRET/[REDACTED:by-override]/"\n' "$(command -v bash)" \
+  > "$TMP/override-scanner"
+chmod +x "$TMP/override-scanner"
+out="$(CCC_STATE_DIR="$shebang_state" CCC_SCAN_INJECTION_BIN="$TMP/override-scanner" \
+  bash "$fake_hooks/checkpoint.sh" PostCompact 2>&1)"
+ctx="$(jq -r '.hookSpecificOutput.additionalContext' <<<"$out")"
+ok "explicit override is still honored exactly" \
+  'grep -q "REDACTED:by-override" <<<"$ctx"'
 
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
