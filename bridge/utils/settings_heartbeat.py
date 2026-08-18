@@ -193,12 +193,15 @@ class HeartbeatSettingsMixin:
         ge=0,
         le=3,
         description=(
-            "Extra attempts for a turn the provider never admitted, when the "
-            "failure looks transient (no stderr at all, or a network/timeout "
-            "class). Auth, rate-limit, TLS and OOM classes are never retried. "
-            "Each retry runs on turn_admission_retry_timeout_seconds, not the "
-            "full admission grace, so the worst case stays bounded. Set 0 to "
-            "fail on the first stall."
+            "Extra attempts for a turn the provider never answered, when the "
+            "failure looks transient. Covers two shapes: a turn the provider "
+            "never admitted (no stderr at all, or a network/timeout class) and "
+            "an `empty-completion` turn that finished normally with zero "
+            "user-visible text. Auth, rate-limit, TLS, OOM and coalesced "
+            "classes are never retried. Each retry runs on "
+            "turn_admission_retry_timeout_seconds, not the full admission "
+            "grace, so the worst case stays bounded. Set 0 to fail on the "
+            "first stall."
         ),
     )
     turn_admission_retry_timeout_seconds: float = Field(

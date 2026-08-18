@@ -268,6 +268,111 @@ async def test_empty_completion_with_follower_is_coalesced_not_a_retry(
     assert "(No response)" not in response.content
 
 
+class _SequencedSession(FakeSession):
+    """One event stream per send_turn call, for retry-path tests."""
+
+    def __init__(self, session_id: str, turns: list[list[AgentEvent]]) -> None:
+        super().__init__(session_id, [])
+        self.turns = turns
+        self.calls: list[str] = []
+
+    def send_turn(
+        self,
+        message: str,
+        *,
+        approval_handler: ApprovalHandler = deny_approval,
+    ) -> AsyncIterator[AgentEvent]:
+        self.calls.append(message)
+        events = self.turns.pop(0) if self.turns else []
+
+        async def stream() -> AsyncIterator[AgentEvent]:
+            for event in events:
+                yield event
+
+        return stream()
+
+
+def _enable_retries(handler: ProjectChatHandler) -> None:
+    # Mirror the shipped defaults (settings_heartbeat: retries=1, grace=60s);
+    # the test SimpleNamespace omits both, which is also the retry-off case.
+    handler._config.turn_admission_retries = 1
+    handler._config.turn_admission_retry_timeout_seconds = 60.0
+
+
+@pytest.mark.anyio
+async def test_empty_completion_is_retried_when_budget_allows(tmp_path: Path) -> None:
+    # gwakga 2026-08-18 14:44: the first turn finished normally with zero
+    # visible text and the user was told to retry by hand. With the retry
+    # budget on, the bridge retries itself and the second attempt's answer
+    # becomes the response.
+    session = _SequencedSession(
+        "claude-retry",
+        [
+            [_claude_result("", "claude-retry"), CompletionEvent("end_turn")],
+            [
+                _claude_result("Background check: both canaries passed.", "claude-retry"),
+                CompletionEvent("end_turn"),
+            ],
+        ],
+    )
+    handler = _handler(tmp_path, FakeRuntime(session))
+    _enable_retries(handler)
+
+    response = await handler.process_message("hello", 7, 70)
+
+    assert response.success is True
+    assert response.content == "Background check: both canaries passed."
+    assert session.calls == ["hello", "hello"]
+
+
+@pytest.mark.anyio
+async def test_empty_completion_retry_exhaustion_keeps_typed_failure(
+    tmp_path: Path,
+) -> None:
+    # Both attempts come back empty: the user still sees the typed failure,
+    # the attempt count stays bounded, and the marker remains on the final
+    # response so callers and tests can classify it.
+    session = _SequencedSession(
+        "claude-stuck",
+        [
+            [_claude_result("", "claude-stuck"), CompletionEvent("end_turn")],
+            [_claude_result("", "claude-stuck"), CompletionEvent("end_turn")],
+        ],
+    )
+    handler = _handler(tmp_path, FakeRuntime(session))
+    _enable_retries(handler)
+
+    response = await handler.process_message("hello", 7, 70)
+
+    assert response.success is False
+    assert response.error == "Agent finished without a visible answer"
+    assert response.failure_class == "empty-completion"
+    assert session.calls == ["hello", "hello"]
+
+
+@pytest.mark.anyio
+async def test_coalesced_empty_completion_is_not_retried_even_with_budget(
+    tmp_path: Path,
+) -> None:
+    # #1128 stays narrow under the new budget: a follower queued behind the
+    # empty half means the answer is already coming, so one resend would
+    # duplicate the question and split the next turn identically.
+    session = _SequencedSession(
+        "claude-follower",
+        [[_claude_result("", "claude-follower"), CompletionEvent("end_turn")]],
+    )
+    handler = _handler(tmp_path, FakeRuntime(session))
+    _enable_retries(handler)
+    handler._enter_conversation_queue(handler._stream_key(7, 70))
+
+    response = await handler.process_message("hello", 7, 70)
+
+    assert response.success is False
+    assert response.error == "coalesced_turn"
+    assert response.failure_class == "coalesced-turn"
+    assert session.calls == ["hello"]
+
+
 @pytest.mark.anyio
 async def test_empty_completion_without_follower_keeps_the_typed_failure(
     tmp_path: Path,

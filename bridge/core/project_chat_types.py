@@ -57,9 +57,10 @@ class ChatResponse:
     has_options: bool = False
     streamed: bool = False  # Whether message was already sent via streaming
     # Machine-readable cause, set only where a caller may act on it.
-    # `admission-timeout/<stderr class>` drives the bounded retry in
-    # process_message; matching on `error` text instead would make a log
-    # string load-bearing (#846).
+    # `admission-timeout/<stderr class>` and a bare `empty-completion` drive
+    # the bounded retry in process_message; matching on `error` text instead
+    # would make a log string load-bearing (#846). `coalesced-turn` is typed
+    # for diagnostics but excluded from the retry set (#1128).
     failure_class: Optional[str] = None
 
 
