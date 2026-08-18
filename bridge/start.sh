@@ -1125,6 +1125,28 @@ do_restart() {
     exit 0
 }
 
+# Spawn this checkout's start.sh detached, naming the interpreter explicitly.
+#
+# Same call-site constraint do_restart documents above, on the other spawn
+# path: executing start.sh directly makes the spawn depend on its `#!/bin/bash`
+# shebang resolving, and Termux has neither /bin/bash nor /usr/bin/env. Under
+# `nohup ... &` that failure is close to invisible — it leaves only
+#   nohup: failed to run command '.../start.sh': No such file or directory
+# in the daemon log while the caller prints a PID and exits 0 (#1151, observed
+# on gongyung 2026-08-18). It reproduces only from spawning contexts without
+# termux-exec's LD_PRELOAD, which is what rewrites the shebang when present, so
+# it reads as intermittent. Changing the shebang does not fix it: /usr/bin/env
+# is missing there too, and the declared interpreter has to keep working for
+# the other nodes. The call site is the only place that can name it.
+#
+# Sets SPAWNED_PID. nohup execs, so that is the spawned process itself and
+# stays a valid liveness handle for the caller.
+spawn_start_sh_detached() { # <log> <args...>
+    local log="$1"; shift
+    nohup bash "$SCRIPT_DIR/start.sh" "$@" >> "$log" 2>&1 &
+    SPAWNED_PID=$!
+}
+
 # ── Unit-test seam (#584 P3-2) ──
 #
 # Sourcing this file with CCC_START_SH_LIB_ONLY=1 yields the helper definitions
@@ -1444,8 +1466,20 @@ if [ "$DAEMON_MODE" -eq 1 ] && [ "$RUN_AS_DAEMON_SUPERVISOR" -eq 0 ]; then
     DAEMON_LOG="$LOGS_DIR/supervisor.log"
     SUPERVISOR_ARGS=("--path" "$PROJECT_ROOT" "--_daemon_supervisor")
     [ -n "$BOT_DEBUG" ] && SUPERVISOR_ARGS+=("--debug")
-    nohup "$SCRIPT_DIR/start.sh" "${SUPERVISOR_ARGS[@]}" >> "$DAEMON_LOG" 2>&1 &
-    SUPERVISOR_PID=$!
+    spawn_start_sh_detached "$DAEMON_LOG" "${SUPERVISOR_ARGS[@]}"
+    SUPERVISOR_PID="$SPAWNED_PID"
+    # A spawn that cannot exec dies immediately, so confirm the supervisor is
+    # still there before announcing it. Reporting a PID for a process that
+    # never ran sent a caller looking for a stale-code or Telegram fault while
+    # the bridge had simply not started (#1151). Same belt-and-braces as the
+    # restart path's readiness poll: a pid-file check backs up the signal probe
+    # in case the spawn has already handed off.
+    sleep 1
+    if ! kill -0 "$SUPERVISOR_PID" 2>/dev/null && ! is_supervisor_running; then
+        echo "❌ Daemon start failed: the spawned supervisor exited immediately"
+        echo "📄 Log: $DAEMON_LOG"
+        exit 1
+    fi
     echo "✅ Bot started in background (PID: $SUPERVISOR_PID)"
     echo "📄 Log: $DAEMON_LOG"
     echo "💡 Use $0 --path \"$PROJECT_ROOT\" --status to check status"
