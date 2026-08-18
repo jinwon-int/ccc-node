@@ -125,5 +125,34 @@ f="$(mk_cmdline meta_glob python3 -m telegram_bot --path "$TMP/a.bc_d")"
 ok "does NOT match a path the metacharacters would have globbed to" \
   '! _cmdline_is_project_bot "$f"'
 
+# --- detached spawn names the interpreter (#1151) ---------------------------
+# The daemon path spawns this checkout's start.sh. Executing it directly made
+# the spawn depend on the shebang resolving, which it does not on Termux, and
+# nohup swallowed the failure into one log line while the caller reported a
+# PID. A target whose shebang cannot resolve stands in for that node: it runs
+# only if the call site names the interpreter itself.
+source_seam "$proj"
+fake_dir="$TMP/fake-checkout"; mkdir -p "$fake_dir"
+spawn_marker="$TMP/spawned.args"
+cat > "$fake_dir/start.sh" <<EOF
+#!$TMP/no-such-interpreter
+printf '%s\n' "\$*" > "$spawn_marker"
+EOF
+chmod +x "$fake_dir/start.sh"
+spawn_log="$TMP/spawn.log"; : > "$spawn_log"
+# SCRIPT_DIR is overridden inside a subshell so the seam's own value, which the
+# assertions above still rely on, is left intact. `wait` reaps the backgrounded
+# spawn before the marker is read.
+# shellcheck disable=SC2034  # read by the sourced spawn helper, not this file
+( SCRIPT_DIR="$fake_dir"
+  spawn_start_sh_detached "$spawn_log" --path "$proj" --_daemon_supervisor
+  wait ) >/dev/null 2>&1
+ok "detached spawn runs a target whose shebang does not resolve" \
+  '[ -f "$spawn_marker" ]'
+ok "detached spawn forwards its arguments" \
+  'grep -q -- "--_daemon_supervisor" "$spawn_marker" 2>/dev/null'
+ok "detached spawn leaves no interpreter error in the log" \
+  '! grep -qi "no such file\|bad interpreter" "$spawn_log"'
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
