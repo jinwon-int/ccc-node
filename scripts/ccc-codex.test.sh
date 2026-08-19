@@ -79,5 +79,35 @@ set -e
 ok "launcher rejects recursive real-cli configuration" '[ "$rc" = 127 ]'
 ok "launcher uses final exec rather than a child Codex process" 'grep -Fq '"'"'exec "$real_cli" "$@"'"'"' "$LAUNCHER"'
 
+# --- shebang-unresolvable materializer (Termux exit-78 class) ---
+# Android has no /usr/bin/env, so without libtermux-exec's LD_PRELOAD hook
+# the kernel cannot exec a `#!/usr/bin/env python3` script; a broken absolute
+# interpreter reproduces the same ENOENT class hermetically. The launcher must
+# retry through an explicit interpreter from PATH (python3 ignores shebangs).
+mat_py="$TMP/materializer-py"
+cat > "$mat_py" <<'PY'
+#!/nonexistent/ccc-test-interp
+import os, sys
+sub = sys.argv[1] if len(sys.argv) > 1 else ""
+with open(os.environ["ORDER_FILE"], "a", encoding="utf-8") as fh:
+    fh.write(sub + "\n")
+sys.exit(int(os.environ.get("MAT_RC", "0")))
+PY
+chmod 0700 "$mat_py"
+: > "$order"; : > "$err"; rm -f "$argv"
+set +e
+out="$(printf 'stdin data' | ORDER_FILE="$order" ARGV_FILE="$argv" CWD_FILE="$cwd_file" MAT_RC=0 REAL_RC=23 CCC_CODEX_MEMORY_MATERIALIZER_PATH="$mat_py" CCC_CODEX_REAL_CLI_PATH="$real" "$LAUNCHER" --alpha 2>"$err")"
+rc=$?
+set -e
+ok "launcher falls back to an explicit interpreter when the materializer shebang cannot exec" \
+  '[ "$rc" = 23 ] && grep -qx materialize "$order" && grep -qx real "$order" && ! grep -q "memory bootstrap unavailable" "$err"'
+
+: > "$order"; : > "$err"
+set +e
+out="$(printf '' | ORDER_FILE="$order" ARGV_FILE="$argv" CWD_FILE="$cwd_file" MAT_RC=5 CCC_CODEX_MEMORY_MATERIALIZER_PATH="$mat_py" CCC_CODEX_REAL_CLI_PATH="$real" "$LAUNCHER" 2>"$err")"
+rc=$?
+set -e
+ok "shebang-fallback materializer still fails closed on real script failures" '[ "$rc" = 78 ]'
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

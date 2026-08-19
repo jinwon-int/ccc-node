@@ -28,16 +28,35 @@ if [ "$skip" != "1" ]; then
     printf "%s\n" "ccc-piri: memory bootstrap unavailable" >&2
     exit 78
   fi
-  # Piri nodes inject the nunchi-primary snapshot through this path only, and
-  # the canonical loader output alone exceeds the 8192 default on fleet nodes,
-  # which silently truncated the nunchi block. Default to 16KiB (hard max
-  # 24576); an explicit CCC_CODEX_MEMORY_MAX_BYTES always wins.
-  if ! env CODEX_HOME="$memory_home" CCC_MEMORY_MATERIALIZER_PROVIDER="${CCC_MEMORY_MATERIALIZER_PROVIDER:-piri}" \
-      CCC_CODEX_MEMORY_MAX_BYTES="${CCC_CODEX_MEMORY_MAX_BYTES:-16384}" \
-      "$materializer" materialize --json >/dev/null 2>&1; then
+  # Same shebang fallback as ccc-codex: Android has no /usr/bin/env, so
+  # without libtermux-exec's LD_PRELOAD hook the kernel cannot exec the
+  # `#!/usr/bin/env python3` materializer and the bootstrap would exit 78.
+  # Retry through an explicit interpreter from PATH (python3 ignores shebangs).
+  # materialize carries the full env prefix — Piri nodes inject the nunchi-primary
+  # snapshot through this path only, and the canonical loader output alone exceeds
+  # the 8192 default, so CCC_CODEX_MEMORY_MAX_BYTES defaults to 16KiB (hard max
+  # 24576); an explicit value always wins. status only needs CODEX_HOME,
+  # preserving the original asymmetry.
+  run_materializer() {
+    local sub="$1"
+    local -a pre
+    if [ "$sub" = "materialize" ]; then
+      pre=(env CODEX_HOME="$memory_home" CCC_MEMORY_MATERIALIZER_PROVIDER="${CCC_MEMORY_MATERIALIZER_PROVIDER:-piri}" CCC_CODEX_MEMORY_MAX_BYTES="${CCC_CODEX_MEMORY_MAX_BYTES:-16384}")
+    else
+      pre=(env CODEX_HOME="$memory_home")
+    fi
+    if "${pre[@]}" "$materializer" "$sub" --json >/dev/null 2>&1; then
+      return 0
+    fi
+    local interpreter
+    interpreter="$(command -v python3 2>/dev/null || command -v python 2>/dev/null || true)"
+    [ -n "$interpreter" ] || return 1
+    "${pre[@]}" "$interpreter" "$materializer" "$sub" --json >/dev/null 2>&1
+  }
+  if ! run_materializer materialize; then
     # A refresh failure may proceed only when a previously materialized block
     # is still structurally valid and private. status is read-only/body-free.
-    if ! env CODEX_HOME="$memory_home" "$materializer" status --json >/dev/null 2>&1; then
+    if ! run_materializer status; then
       printf "%s\n" "ccc-piri: memory bootstrap unavailable" >&2
       exit 78
     fi

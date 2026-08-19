@@ -18,6 +18,16 @@ SEEN="$NUNCHI_HOME/codex-seen"
 LOCK="$NUNCHI_HOME/.codex-feed.lock"
 SESSIONS_DIR="${CODEX_SESSIONS_DIR:-$HOME/.codex/sessions}"
 MAX_FILES_PER_RUN="${NUNCHI_FEED_MAX_FILES:-3}"
+# Bounded kill: TERM then SIGKILL escalation, stdin detached. An orphaned
+# codex exec (Android suspension or an LMK-reaped parent) otherwise sleeps
+# forever — fleet incident: 7 orphaned codex.bin processes aged 8/4..8/16
+# found on daegyo 2026-08-19.
+CODEX_TIMEOUT="${NUNCHI_FEED_CODEX_TIMEOUT_SEC:-300}"
+CODEX_KILL_GRACE="${NUNCHI_FEED_CODEX_KILL_GRACE_SEC:-15}"
+# Lane tag rides the prompt argv so the stale-lane sweep below can tell this
+# lane's codex processes apart from other honcho-shaped codex calls (the
+# bridge's honcho extraction uses near-identical prompt text).
+LANE_TAG="nunchi-codex-feed-816"
 mkdir -p "$NUNCHI_HOME"
 touch "$SEEN"
 
@@ -31,6 +41,13 @@ JSON 객체 하나만 출력. 설명/마크다운 금지.
 
 (
   flock -n 9 || exit 0
+  # Stale-lane sweep: under this lock, any codex exec still carrying the lane
+  # tag belongs to an earlier tick (this run has spawned none yet). Kill it so
+  # a suspended tick cannot accumulate orphans across cron ticks.
+  for pid in $(pgrep -f "codex exec.*${LANE_TAG}" 2>/dev/null || true); do
+    [ "$pid" = "$$" ] && continue
+    kill -9 "$pid" 2>/dev/null || true
+  done
   n=0
   # oldest-first so backfill is chronological
   for f in $(find "$SESSIONS_DIR" -name "*.jsonl" -printf '%T@ %p\n' 2>/dev/null | sort -n | cut -d' ' -f2-); do
@@ -54,7 +71,9 @@ print(text[:40000])                   # byte cap
 PYEOF
 )
     [ ${#convo} -gt 200 ] || { echo "$f" >> "$SEEN"; continue; }
-    resp_full=$(timeout 300 codex exec --skip-git-repo-check "${PROMPT_PREFIX}${convo}" 2>/dev/null)
+    resp_full=$(timeout -k "$CODEX_KILL_GRACE" "$CODEX_TIMEOUT" codex exec --skip-git-repo-check "${PROMPT_PREFIX}${convo}
+
+[${LANE_TAG}]" </dev/null 2>/dev/null)
     # codex exec layout: session log ... "tokens used\n<count>\n<final message (multi-line)>"
     resp=$(python3 -c '
 import sys
