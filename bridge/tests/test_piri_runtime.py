@@ -790,8 +790,107 @@ class PiriRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(result), 1)
         self.assertIsInstance(result[0], ErrorEvent)
         self.assertEqual(result[0].code, "piri_turn_failed")
-        self.assertEqual(result[0].message, "Piri provider turn failed")
+        # The upstream detail survives the bridge boundary (#1148).
+        self.assertEqual(result[0].message, "Piri provider turn failed: provider failed")
+        self.assertFalse(result[0].retryable)
         self.assertFalse(any(isinstance(event, ResultEvent) for event in result))
+
+    async def test_failed_turn_preserves_bounded_upstream_detail(self) -> None:
+        session = await self.runtime.start_or_resume(
+            SessionRequest(working_directory="/workspace")
+        )
+        client = self.factory.clients[0]
+        quota_body = (
+            '403 {"error":{"type":"permission_error","message":"You\'ve reached '
+            'your usage limit for this billing cycle."}}'
+        )
+        await client.events.put(
+            {
+                "type": "message_end",
+                "message": {
+                    "role": "assistant",
+                    "stopReason": "error",
+                    "errorMessage": quota_body,
+                },
+            }
+        )
+        await client.events.put({"type": "agent_settled"})
+
+        result = await collect(session.send_turn("work"))
+
+        self.assertEqual(len(result), 1)
+        error = result[0]
+        self.assertEqual(error.code, "piri_turn_failed")
+        self.assertIn("usage limit", error.message)
+        self.assertIn("403", error.message)
+        # Quota/billing 403 is neither immediately retryable nor permanent.
+        self.assertFalse(error.retryable)
+        self.assertFalse(any(isinstance(event, ResultEvent) for event in result))
+
+    async def test_failed_turn_marks_transient_upstream_status_retryable(self) -> None:
+        session = await self.runtime.start_or_resume(
+            SessionRequest(working_directory="/workspace")
+        )
+        client = self.factory.clients[0]
+        await client.events.put(
+            {
+                "type": "message_end",
+                "message": {
+                    "role": "assistant",
+                    "stopReason": "error",
+                    "errorMessage": "429 too many requests: slow down",
+                },
+            }
+        )
+        await client.events.put({"type": "agent_settled"})
+
+        result = await collect(session.send_turn("work"))
+
+        self.assertEqual(result[0].code, "piri_turn_failed")
+        self.assertTrue(result[0].retryable)
+        self.assertIn("429", result[0].message)
+
+    async def test_failed_turn_truncates_and_normalizes_long_detail(self) -> None:
+        session = await self.runtime.start_or_resume(
+            SessionRequest(working_directory="/workspace")
+        )
+        client = self.factory.clients[0]
+        await client.events.put(
+            {
+                "type": "message_end",
+                "message": {
+                    "role": "assistant",
+                    "stopReason": "error",
+                    "errorMessage": "line1\n\nline2\t" + ("x" * 600),
+                },
+            }
+        )
+        await client.events.put({"type": "agent_settled"})
+
+        result = await collect(session.send_turn("work"))
+
+        message = result[0].message
+        self.assertTrue(message.startswith("Piri provider turn failed: line1 line2 "))
+        self.assertLessEqual(len(message), len("Piri provider turn failed: ") + 500)
+        self.assertTrue(message.endswith("…"))
+
+    async def test_failed_turn_without_detail_keeps_plain_message(self) -> None:
+        session = await self.runtime.start_or_resume(
+            SessionRequest(working_directory="/workspace")
+        )
+        client = self.factory.clients[0]
+        await client.events.put(
+            {
+                "type": "message_end",
+                "message": {"role": "assistant", "stopReason": "error", "errorMessage": 403},
+            }
+        )
+        await client.events.put({"type": "agent_settled"})
+
+        result = await collect(session.send_turn("work"))
+
+        self.assertEqual(result[0].message, "Piri provider turn failed")
+        self.assertFalse(result[0].retryable)
 
     async def test_successful_auto_retry_clears_an_earlier_provider_error(self) -> None:
         session = await self.runtime.start_or_resume(
