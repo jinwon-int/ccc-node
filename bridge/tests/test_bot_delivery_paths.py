@@ -293,6 +293,7 @@ class ResolvePathsExtensionTests(unittest.TestCase):
             "report.pdf", "data.csv", "summary.md", "notes.txt", "sheet.xlsx",
             "paper.docx", "config.json", "events.jsonl", "run.log", "logo.svg",
             "clip.mov", "voice.wav", "book.epub", "slides.pptx",
+            "form.hwpx", "legacy.hwp",
         ]
         for n in names:
             (tmpdir / n).write_text("x", encoding="utf-8")
