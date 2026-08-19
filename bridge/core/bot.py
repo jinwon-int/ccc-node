@@ -2104,6 +2104,8 @@ class TelegramBot(
     _SENDABLE_FILE_EXTENSIONS = (
         # documents
         "pdf", "txt", "md", "markdown", "rtf", "doc", "docx", "odt", "tex", "epub",
+        # Korean word processor (Hangul) documents
+        "hwp", "hwpx",
         # data / markup
         "csv", "tsv", "json", "jsonl", "ndjson", "xml", "yaml", "yml", "ics", "log",
         # spreadsheets / presentations
