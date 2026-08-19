@@ -481,5 +481,34 @@ HOME="$home" PATH="/usr/bin:/bin" CCC_STATE_DIR="$state" NUNCHI_HOME="$nunchi_ho
 ok "refresh wrapper umask 077 keeps lock and status owner-only" \
   '[ "$rc" = 0 ] && [ "$(stat -c %a "$nunchi_home/mempalace-refresh.lock")" = 600 ] && [ "$(stat -c %a "$n865_status")" = 600 ]'
 
+# --- ghost marker detection (#1079): a managed line whose paths no longer
+# exist fails on every tick forever (gongmyoung root ran 3 for weeks).
+# --apply strips our own ghosts (strip_cron) but must WARN first; status
+# reports the count; a clean crontab stays quiet.
+: > "$cron_store"
+printf '%s\n' \
+  '*/10 * * * * bash /nonexistent-ghost-home/.claude/hooks/nunchi/ingest-cron.sh >> /nonexistent-ghost-home/.nunchi/cron.log 2>&1 # nunchi:#816' \
+  > "$cron_store"
+out="$(run_install --apply --codex 2>&1)"; rc=$?
+ok "apply warns about ghost cron lines whose paths are missing (#1079)" \
+  '[ "$rc" = 0 ] && grep -q "WARNING (apply): managed nunchi cron line(s) point at missing paths" <<<"$out" && grep -q "nonexistent-ghost-home" <<<"$out"'
+ok "apply still strips the ghost line from our own crontab" \
+  '! grep -q "nonexistent-ghost-home" "$cron_store" && [ "$(grep -c "nunchi:#816" "$cron_store")" = 3 ]'
+
+out="$(run_install 2>&1)"; rc=$?
+ok "status reports ghost_cron=0 after a clean apply" \
+  '[ "$rc" = 0 ] && grep -q "^ghost_cron: 0 line(s)" <<<"$out"'
+
+printf '%s\n' \
+  '7 8 * * 1 bash /gone/.claude/hooks/nunchi/bench.sh >> /gone/.nunchi/bench.cron.log 2>&1 # nunchi:#816' \
+  >> "$cron_store"
+out="$(run_install 2>&1)"; rc=$?
+ok "status counts ghost lines pointing at missing paths" \
+  '[ "$rc" = 0 ] && grep -q "^ghost_cron: 1 line(s)" <<<"$out"'
+
+out="$(run_install --remove 2>&1)"; rc=$?
+ok "remove cleans our ghosts silently (no cross-account residue in tests)" \
+  '[ "$rc" = 0 ] && ! grep -q "ghost entries" <<<"$out" && [ "$(grep -c "nunchi:#816" "$cron_store" || true)" = 0 ]'
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
