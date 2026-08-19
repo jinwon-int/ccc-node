@@ -174,69 +174,116 @@ def _heredoc_body_lines(lines: list[str]) -> set[int]:
     return data
 
 
-def _logical_spans(coded: list[tuple[int, str | None]]):
-    """Join physical lines into logical command texts.
+class _SpanBuilder:
+    """Join physical code lines into logical command texts.
 
-    `coded` is (lineno, code-or-None-for-heredoc-data). Lines are joined on
-    trailing-backslash continuations and on unterminated quotes (a newline
-    inside quotes is kept). Yields (text, marks) where marks is a sorted list
-    of (offset, lineno) for offset->line mapping.
+    Lines join on trailing-backslash continuations and on unterminated quotes
+    (a newline inside quotes is kept). `feed` receives (lineno, code-or-None);
+    a None line is heredoc data and ends any open span defensively.
     """
-    spans: list[tuple[str, list[tuple[int, int]]]] = []
-    buf: list[str] = []
-    marks: list[tuple[int, int]] = []
-    sq = dq = False
 
-    def emit() -> None:
-        nonlocal buf, marks
-        if buf or marks:
-            text = "".join(buf)
+    def __init__(self) -> None:
+        self.spans: list[tuple[str, list[tuple[int, int]]]] = []
+        self._buf: list[str] = []
+        self._marks: list[tuple[int, int]] = []
+        self._sq = False
+        self._dq = False
+
+    def _emit(self) -> None:
+        if self._buf or self._marks:
+            text = "".join(self._buf)
             if text.strip():
-                spans.append((text, marks))
-        buf, marks = [], []
+                self.spans.append((text, self._marks))
+        self._buf, self._marks = [], []
 
-    for lineno, code in coded:
-        if code is None:
-            emit()  # heredoc data cannot be mid-quote in sane code; be safe
-            continue
-        if not buf:
-            marks = [(0, lineno)]
-        else:
-            marks.append((len("".join(buf)), lineno))
+    def _feed_chars(self, code: str) -> bool:
+        """Consume one line; returns True when a trailing backslash continues."""
         i, n = 0, len(code)
         esc = False
         while i < n:
             ch = code[i]
             if esc:
                 # backslash-newline (line continuation) drops both characters
-                if ch == "\n":
-                    pass
-                else:
-                    buf.append("\\" + ch)
+                if ch != "\n":
+                    self._buf.append("\\" + ch)
                 esc = False
                 i += 1
                 continue
-            if ch == "\\" and not sq:
+            if ch == "\\" and not self._sq:
                 if i == n - 1:
                     esc = True  # trailing backslash: continuation marker
                 else:
-                    buf.append("\\" + code[i + 1])
+                    self._buf.append("\\" + code[i + 1])
                     i += 1
                 i += 1
                 continue
-            if ch == "'" and not dq:
-                sq = not sq
-            elif ch == '"' and not sq:
-                dq = not dq
-            buf.append(ch)
+            if ch == "'" and not self._dq:
+                self._sq = not self._sq
+            elif ch == '"' and not self._sq:
+                self._dq = not self._dq
+            self._buf.append(ch)
             i += 1
-        if esc or sq or dq:
-            if sq or dq:
-                buf.append("\n")
-            continue  # logical line continues on the next physical line
-        emit()
-    emit()
-    return spans
+        return esc
+
+    def feed(self, lineno: int, code: str | None) -> None:
+        if code is None:
+            self._emit()
+            return
+        if not self._buf:
+            self._marks = [(0, lineno)]
+        else:
+            self._marks.append((len("".join(self._buf)), lineno))
+        esc = self._feed_chars(code)
+        if esc or self._sq or self._dq:
+            if self._sq or self._dq:
+                self._buf.append("\n")
+            return  # logical line continues on the next physical line
+        self._emit()
+
+    def finish(self) -> list[tuple[str, list[tuple[int, int]]]]:
+        self._emit()
+        return self.spans
+
+
+def _logical_spans(coded: list[tuple[int, str | None]]):
+    """Join (lineno, code-or-None) pairs into (text, marks) logical spans.
+
+    marks is a sorted list of (offset, lineno) for offset->line mapping.
+    """
+    builder = _SpanBuilder()
+    for lineno, code in coded:
+        builder.feed(lineno, code)
+    return builder.finish()
+
+
+def _match_backtick(text: str, i: int) -> int:
+    """Index of the closing backtick for the one at text[i] (or len(text))."""
+    j = i + 1
+    while j < len(text) and text[j] != "`":
+        j += 2 if text[j] == "\\" else 1
+    return min(j, len(text))
+
+
+def _match_paren_sub(text: str, i: int) -> int:
+    """Index just past the matching ')' for a '$(' at text[i]."""
+    depth, j, n = 1, i + 2, len(text)
+    isq = idq = False
+    while j < n and depth:
+        c2 = text[j]
+        if c2 == "\\" and not isq:
+            j += 2
+            continue
+        if c2 == "'" and not idq:
+            isq = not isq
+        elif c2 == '"' and not isq:
+            idq = not idq
+        elif not isq and not idq:
+            if c2 == "(":
+                depth += 1
+            elif c2 == ")":
+                depth -= 1
+        j += 1
+    return j
 
 
 def _extract_cmdsubs(text: str) -> tuple[str, list[tuple[int, str]]]:
@@ -257,50 +304,20 @@ def _extract_cmdsubs(text: str) -> tuple[str, list[tuple[int, str]]]:
             continue
         if ch == "'" and not dq:
             sq = not sq
-            i += 1
-            continue
-        if ch == '"' and not sq:
+        elif ch == '"' and not sq:
             dq = not dq
-            i += 1
-            continue
-        if sq:
-            i += 1
-            continue
-        if ch == "`":
-            j = i + 1
-            while j < n and text[j] != "`":
-                if text[j] == "\\":
-                    j += 1
-                j += 1
-            inner = text[i + 1:j]
+        elif not sq and ch == "`":
+            j = _match_backtick(text, i)
+            spans.append((i + 1, text[i + 1:j]))
             for k in range(i, min(j + 1, n)):
                 chars[k] = " "
-            spans.append((i + 1, inner))
             i = j + 1
             continue
-        if ch == "$" and i + 1 < n and text[i + 1] == "(":
-            depth = 1
-            j = i + 2
-            isq = idq = False
-            while j < n and depth:
-                c2 = text[j]
-                if c2 == "\\" and not isq:
-                    j += 2
-                    continue
-                if c2 == "'" and not idq:
-                    isq = not isq
-                elif c2 == '"' and not isq:
-                    idq = not idq
-                elif not isq and not idq:
-                    if c2 == "(":
-                        depth += 1
-                    elif c2 == ")":
-                        depth -= 1
-                j += 1
-            inner = text[i + 2:j - 1]
+        elif not sq and ch == "$" and i + 1 < n and text[i + 1] == "(":
+            j = _match_paren_sub(text, i)
+            spans.append((i + 2, text[i + 2:j - 1]))
             for k in range(i, j):
                 chars[k] = " "
-            spans.append((i + 2, inner))
             i = j
             continue
         i += 1
@@ -336,6 +353,100 @@ def _is_seam_token(word: str) -> bool:
     return False
 
 
+def _match_dquote(text: str, i: int) -> int:
+    """Index of the closing double quote for the one at text[i]."""
+    j, n = i + 1, len(text)
+    while j < n:
+        if text[j] == "\\":
+            j += 2
+            continue
+        if text[j] == '"':
+            break
+        j += 1
+    return min(j, n - 1)
+
+
+def _consume_word(text: str, i: int) -> tuple[str, int, int]:
+    """Consume one word (quotes kept); returns (word, start, next_i)."""
+    start = i
+    buf: list[str] = []
+    n = len(text)
+    while i < n:
+        c = text[i]
+        if c in " \t\n;|)":
+            break
+        if c == "(":
+            # `arr2=(` keeps the paren in the word (array literal); any other
+            # `(` is a subshell separator. The word ENDS at the paren so the
+            # array consumer below takes over the elements.
+            if ASSIGN_RE.match("".join(buf)):
+                buf.append(c)
+                i += 1
+            break
+        if c == "&" and not (buf and buf[-1].endswith(">")) \
+                and not (i + 1 < n and text[i + 1] == ">"):
+            break  # plain `&` separator; `>&`/`&>` stay part of redirect words
+        if c == "\\" and i + 1 < n:
+            buf.append(text[i:i + 2])
+            i += 2
+            continue
+        if c == "'":
+            j = text.find("'", i + 1)
+            j = n - 1 if j == -1 else j
+            buf.append(text[i:j + 1])
+            i = j + 1
+            continue
+        if c == '"':
+            j = _match_dquote(text, i)
+            buf.append(text[i:j + 1])
+            i = min(j + 1, n)
+            continue
+        buf.append(c)
+        i += 1
+    return "".join(buf), start, i
+
+
+def _separator_width(text: str, i: int) -> int:
+    """Width of the command separator at text[i], or 0 when there is none."""
+    if text.startswith("&&", i) or text.startswith("||", i):
+        return 2
+    ch = text[i]
+    if ch in ";|()":
+        return 1
+    if ch == "&":
+        # `&>` / `&>>` and the `&` of `2>&1` are redirection syntax, not
+        # command separators (the word consumer keeps them in their word).
+        if i + 1 < len(text) and text[i + 1] == ">":
+            return 0
+        if i > 0 and text[i - 1] == ">":
+            return 0
+        return 1
+    return 0
+
+
+def _consume_array(text: str, i: int) -> int:
+    """Skip array-literal elements after `arr=(` until the matching ')'."""
+    depth, n = 1, len(text)
+    while i < n and depth:
+        if text[i] == "(":
+            depth += 1
+        elif text[i] == ")":
+            depth -= 1
+        i += 1
+    return i
+
+
+def _classify_head(word: str) -> str:
+    """Head-word role: 'skip' (stay at head), 'decl', or 'command'."""
+    if REDIR_RE.match(word) or ASSIGN_RE.match(word):
+        return "skip"
+    if word in DECL_WORDS:
+        return "decl"
+    if word in LAUNCHERS or word in CONTROL_WORDS:
+        return "skip"
+    return "command"
+
+
 def _scan_shell_level(text: str, marks: list[tuple[int, int]], base: int,
                       rel: str, waived: set[int], findings: list[Finding]) -> None:
     """Tokenize one command level; flag interpreter-less .sh command words."""
@@ -349,113 +460,42 @@ def _scan_shell_level(text: str, marks: list[tuple[int, int]], base: int,
     head = True          # next word is a command-head candidate
     decl = False         # inside local/export/... (rest are assignments/args)
     while i < n:
-        ch = blanked[i]
-        if ch in " \t\n":
+        if blanked[i] in " \t\n":
             i += 1
             continue
-        # separators — a new command context starts after them
-        if blanked.startswith("&&", i) or blanked.startswith("||", i):
+        width = _separator_width(blanked, i)
+        if width:
             head, decl = True, False
-            i += 2
+            i += width
             continue
-        if ch in ";|":
-            head, decl = True, False
-            i += 1
-            continue
-        if ch == "&":
-            if i + 1 < n and blanked[i + 1] == ">":
-                pass  # &> / &>> redirection: fall into word consumption
-            elif i > 0 and blanked[i - 1] == ">":
-                i += 1  # 2>&1-style: part of the redirection word
-                continue
-            else:
-                head, decl = True, False
-                i += 1
-                continue
-        if ch in "()":
-            head, decl = True, False
-            i += 1
-            continue
-        # consume one word (quotes already blanked-safe; keep quotes in text)
-        start = i
-        buf: list[str] = []
-        while i < n:
-            c = blanked[i]
-            if c in " \t\n;|)":
-                break
-            if c == "(":
-                # `arr2=(` keeps the paren in the word (array literal); any
-                # other `(` is a subshell separator. The word ENDS at the
-                # paren so the array consumer below takes over the elements.
-                if ASSIGN_RE.match("".join(buf)):
-                    buf.append(c)
-                    i += 1
-                break
-            if c == "&" and not (buf and buf[-1].endswith(">")) \
-               and not (i + 1 < n and blanked[i + 1] == ">"):
-                break
-            if c == "\\" and i + 1 < n:
-                buf.append(blanked[i:i + 2])
-                i += 2
-                continue
-            if c == "'":
-                j = blanked.find("'", i + 1)
-                j = n - 1 if j == -1 else j
-                buf.append(blanked[i:j + 1])
-                i = j + 1
-                continue
-            if c == '"':
-                j = i + 1
-                while j < n:
-                    if blanked[j] == "\\":
-                        j += 2
-                        continue
-                    if blanked[j] == '"':
-                        break
-                    j += 1
-                buf.append(blanked[i:j + 1])
-                i = min(j + 1, n)
-                continue
-            buf.append(c)
-            i += 1
-        word = "".join(buf)
+        word, start, i = _consume_word(blanked, i)
         if not word:
-            i += 1
+            i += 1  # defensive: never spin on a zero-width word
             continue
-
         if ARRAY_ASSIGN_RE.match(word):
             # arr=( ... — consume elements as data until the matching `)`.
-            depth = 1
-            while i < n and depth:
-                c = blanked[i]
-                if c == "(":
-                    depth += 1
-                elif c == ")":
-                    depth -= 1
-                i += 1
+            i = _consume_array(blanked, i)
             head = False
             continue
-        if head and not decl:
-            if REDIR_RE.match(word):
-                continue
-            if ASSIGN_RE.match(word):
-                continue
-            if word in DECL_WORDS:
-                decl = True
-                continue
-            if word in LAUNCHERS or word in CONTROL_WORDS:
-                continue
-            # This word is the effective command.
-            head = False
-            if _is_sh_candidate(word) and not _is_seam_token(word):
-                lineno = _lineno_at(marks, base + start)
-                if lineno not in waived:
-                    findings.append(Finding(
-                        rel, lineno, "shell",
-                        f"repo script in command position without an interpreter: "
-                        f"{word} (name one — e.g. bash {word} — or waive with a "
-                        f"reason: # {WAIVER_MARK}: <why this exec is intentional>)",
-                    ))
+        if not head or decl:
+            continue
+        role = _classify_head(word)
+        if role == "decl":
+            decl = True
+            continue
+        if role == "skip":
+            continue
+        # This word is the effective command.
+        head = False
+        if _is_sh_candidate(word) and not _is_seam_token(word):
+            lineno = _lineno_at(marks, base + start)
+            if lineno not in waived:
+                findings.append(Finding(
+                    rel, lineno, "shell",
+                    f"repo script in command position without an interpreter: "
+                    f"{word} (name one — e.g. bash {word} — or waive with a "
+                    f"reason: # {WAIVER_MARK}: <why this exec is intentional>)",
+                ))
 
 
 def _remark(inner: str, parent_marks: list[tuple[int, int]], off: int):
@@ -550,6 +590,66 @@ def _collect_names(body: list[ast.stmt], names: dict[str, ast.AST]) -> None:
                 names.setdefault(stmt.target.id, stmt.value)
 
 
+def _subprocess_imports(tree: ast.AST) -> tuple[bool, set[str]]:
+    """(has `import subprocess`, names imported `from subprocess`)."""
+    imported_names: set[str] = set()
+    has_subprocess_module = False
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name == "subprocess":
+                    has_subprocess_module = True
+        elif isinstance(node, ast.ImportFrom) and node.module == "subprocess":
+            for alias in node.names:
+                if alias.name in SUBPROCESS_FUNCS:
+                    imported_names.add(alias.asname or alias.name)
+    return has_subprocess_module, imported_names
+
+
+def _is_subprocess_call(node: ast.AST, has_mod: bool, imported: set[str]) -> bool:
+    if not isinstance(node, ast.Call) or not node.args:
+        return False
+    func = node.func
+    if isinstance(func, ast.Attribute) and func.attr in SUBPROCESS_FUNCS:
+        return isinstance(func.value, ast.Name) and func.value.id == "subprocess" and has_mod
+    return isinstance(func, ast.Name) and func.id in imported
+
+
+def _function_scopes(tree: ast.AST) -> list[tuple[int, int, dict[str, ast.AST]]]:
+    scopes: list[tuple[int, int, dict[str, ast.AST]]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            scope: dict[str, ast.AST] = {}
+            _collect_names(node.body, scope)
+            scopes.append((node.lineno, node.end_lineno or node.lineno, scope))
+    return scopes
+
+
+def _python_finding(node: ast.Call, names: dict[str, ast.AST],
+                    lines: list[str], rel: str) -> Finding | None:
+    """Finding when a subprocess call's argv head resolves to a repo .sh."""
+    argv = node.args[0]
+    if not isinstance(argv, (ast.List, ast.Tuple)) or not argv.elts:
+        return None
+    head = argv.elts[0]
+    if isinstance(head, ast.Constant) and isinstance(head.value, str):
+        if head.value in INTERPRETERS or not head.value.endswith(".sh"):
+            return None
+    if not _sh_literal(head, names):
+        return None
+    lineno = node.lineno
+    line_text = lines[lineno - 1] if 0 < lineno <= len(lines) else ""
+    _, comment = _strip_comment(line_text)
+    if WAIVER_RE.search(comment):
+        return None
+    return Finding(
+        rel, lineno, "python",
+        "subprocess argv head resolves to a repo .sh without an interpreter "
+        "(use [\"bash\", <script>, ...]; or waive with a reason: "
+        f"# {WAIVER_MARK}: <why this exec is intentional>)",
+    )
+
+
 def check_python_file(path: Path, rel: str) -> list[Finding]:
     findings: list[Finding] = []
     try:
@@ -562,65 +662,21 @@ def check_python_file(path: Path, rel: str) -> list[Finding]:
         return findings  # not our gate; py_compile sections own syntax
     lines = src.splitlines()
 
-    imported_names: set[str] = set()
-    has_subprocess_module = False
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            for alias in node.names:
-                if alias.name == "subprocess":
-                    has_subprocess_module = True
-        elif isinstance(node, ast.ImportFrom) and node.module == "subprocess":
-            for alias in node.names:
-                if alias.name in SUBPROCESS_FUNCS:
-                    imported_names.add(alias.asname or alias.name)
-
+    has_mod, imported = _subprocess_imports(tree)
     module_names: dict[str, ast.AST] = {}
     _collect_names(tree.body, module_names)
-
-    # Pre-map each call to its innermost function scope for name resolution.
-    func_scopes: list[tuple[int, int, dict[str, ast.AST]]] = []
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            scope: dict[str, ast.AST] = {}
-            _collect_names(node.body, scope)
-            func_scopes.append((node.lineno, node.end_lineno or node.lineno, scope))
+    scopes = _function_scopes(tree)
 
     for node in ast.walk(tree):
-        if not isinstance(node, ast.Call):
+        if not _is_subprocess_call(node, has_mod, imported):
             continue
-        func = node.func
-        is_subprocess_call = False
-        if isinstance(func, ast.Attribute) and func.attr in SUBPROCESS_FUNCS:
-            if isinstance(func.value, ast.Name) and func.value.id == "subprocess" and has_subprocess_module:
-                is_subprocess_call = True
-        elif isinstance(func, ast.Name) and func.id in imported_names:
-            is_subprocess_call = True
-        if not is_subprocess_call or not node.args:
-            continue
-        argv = node.args[0]
-        if not isinstance(argv, (ast.List, ast.Tuple)) or not argv.elts:
-            continue
-        head = argv.elts[0]
-        if isinstance(head, ast.Constant) and isinstance(head.value, str):
-            if head.value in INTERPRETERS or not head.value.endswith(".sh"):
-                continue
         names = dict(module_names)
-        for lo, hi, scope in func_scopes:
+        for lo, hi, scope in scopes:
             if lo <= node.lineno <= hi:
                 names.update(scope)
-        if not _sh_literal(head, names):
-            continue
-        lineno = node.lineno
-        line_text = lines[lineno - 1] if 0 < lineno <= len(lines) else ""
-        _, comment = _strip_comment(line_text)
-        if WAIVER_RE.search(comment):
-            continue
-        findings.append(Finding(
-            rel, lineno, "python",
-            "subprocess argv head resolves to a repo .sh without an interpreter "
-            "(use [\"bash\", <script>, ...]; or waive with a reason: "
-            f"# {WAIVER_MARK}: <why this exec is intentional>)",
-        ))
+        finding = _python_finding(node, names, lines, rel)
+        if finding is not None:
+            findings.append(finding)
     return findings
 
 
