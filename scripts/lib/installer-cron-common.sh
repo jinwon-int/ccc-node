@@ -60,13 +60,13 @@ ccc_cron_strip_managed() {
 }
 
 # ccc_cron_root_scope_warning <label> [euid] [root-home] [home-parent] —
-# warn when a crontab installer runs as root on a node whose harness lives
-# under a service account. #1079: install-nunchi.sh ran once as root on
-# gongmyoung, and the resulting root-crontab entries failed on every tick for
-# WEEKS — the real harness had moved to the gongmyoung account and nothing
-# could see root's crontab. The three installers sharing this lib resolve
-# every path from $HOME, so a root invocation writes a full second (dead)
-# install. Legit root nodes (a real /root/.claude harness) stay silent.
+# warn when an installer runs as root on a node whose harness lives under a
+# service account. #1079: install-nunchi.sh ran once as root on gongmyoung,
+# and the resulting root-crontab entries failed on every tick for WEEKS —
+# the real harness had moved to the gongmyoung account and nothing could see
+# root's crontab. Every installer that resolves paths from $HOME writes a
+# full second (dead) install on a root invocation. Legit root nodes (a real
+# /root/.claude harness) stay silent.
 # Warning-only, like the #1186 nunchi ghost warning — removal/scope choice
 # stays an operator decision. The euid/home args are test seams.
 ccc_cron_root_scope_warning() {
@@ -80,7 +80,7 @@ ccc_cron_root_scope_warning() {
   done
   [ -n "$found" ] || return 0
   echo "WARNING ($label): running as root but no $root_home/.claude — harness lives under:$found" >&2
-  echo "  entries would land in ROOT's crontab with /root paths (the #1079 ghost class);" >&2
+  echo "  this would install for ROOT (HOME=/root), not the service account (the #1079 ghost class);" >&2
   echo "  re-run as the service account, e.g.: runuser -u <user> -- $0 $*" >&2
 }
 
