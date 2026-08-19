@@ -673,6 +673,17 @@ class Config(
             "push notifier (CCC_PUSH_ENABLED). Default off."
         ),
     )
+    state_contract_allow_enabled: bool = Field(
+        default=True,
+        alias="CCC_STATE_CONTRACT_ALLOW",
+        description=(
+            "Kill-switch (#1045 proposal 1): let a structured Write/Edit/MultiEdit "
+            "whose realpath is exactly the session's working-state.md checkpoint "
+            "contract file proceed without an approval route (headless/external_event "
+            "turns have none). Default on; set 0 to restore the unconditional "
+            "fail-closed deny. Never widens beyond that single file."
+        ),
+    )
 
     @field_validator("push_enabled", mode="before")
     @classmethod

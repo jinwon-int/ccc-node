@@ -5,6 +5,19 @@ All notable changes to the Claude Code node harness. Dates are KST.
 ## [Unreleased]
 
 ### Added
+- Working-state checkpoint contract allow (#1045 proposal 1). The Claude
+  runtime's `can_use_tool` bridge now lets a structured Write/Edit/MultiEdit
+  whose realpath is exactly the session's `working-state.md` (default state
+  dir, or the audience-scoped state dir recorded at session start) proceed
+  without an approval route, in both fail-closed branches (`turn=none`
+  no-route and the active-turn handler that has no callback in
+  headless/external_event continuations). Trace:
+  `Approval request allowed … reason=state-contract-allow` (body-free).
+  Bash, siblings, relative paths, and a symlinked contract file never match;
+  everything else keeps the unchanged fail-closed deny with its #1047 reason
+  codes. Kill-switch `CCC_STATE_CONTRACT_ALLOW=0` (Settings
+  `state_contract_allow_enabled`, default on). Regression suite
+  `bridge/tests/test_state_contract_allow.py`.
 - Working-state checkpoint parity for Piri/Codex nodes (#1176). The
   materialized memory block now carries a static working-state policy
   (`working-state-policy: working-state-checkpoint-v1`) telling the session to
