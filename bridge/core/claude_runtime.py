@@ -89,6 +89,12 @@ from .curated_memory import build_curated_memory_settings
 from .memory_audience import audience_from_claude_environment
 from .project_chat_history import _first_text_block, iter_transcript_messages
 from .sdk_text import _extract_stream_text_delta
+from .state_contract import (
+    ALLOW_REASON as _STATE_CONTRACT_ALLOW_REASON,
+    contract_files as _state_contract_files,
+    state_contract_allows as _state_contract_allows,
+    state_contract_enabled as _state_contract_enabled,
+)
 from .tool_policy import (
     BASH_DISABLED,
     EXECUTION_OWNER_OPERATOR,
@@ -330,6 +336,12 @@ class ClaudeSession:
         self._turn_generation = 0
         self._approval_counter = 0
         self._closed = False
+        # #1045 proposal 1: extra state dirs (audience-scoped route) whose
+        # working-state.md is this session's checkpoint contract file.
+        self._contract_state_dirs: tuple[str, ...] = ()
+        # A shared-audience session may write only its scoped contract file;
+        # the node's unscoped checkpoint stays private input (#1155 parity).
+        self._contract_include_default = True
         # Between-turns ("unsolicited") frame state (inherited from the
         # retired direct path's stream-state machinery):
         #   * handler — optional delivery route; absent = frames are dropped
@@ -1132,6 +1144,22 @@ class ClaudeSession:
 
     # -- approvals ----------------------------------------------------------
 
+    def _state_contract_allows(self, tool_name: str, tool_input: object) -> bool:
+        settings = getattr(self._runtime, "_settings", None)
+        if not _state_contract_enabled(settings):
+            return False
+        candidates = _state_contract_files(
+            settings,
+            extra_state_dirs=self._contract_state_dirs,
+            include_default=self._contract_include_default,
+        )
+        return _state_contract_allows(
+            tool_name,
+            tool_input if isinstance(tool_input, Mapping) else None,
+            candidates=candidates,
+            enabled=True,
+        )
+
     async def _handle_permission_request(
         self,
         tool_name: str,
@@ -1143,6 +1171,27 @@ class ClaudeSession:
         Fail-closed: without an in-flight turn, or when the turn's handler
         raises, the provider receives a deny decision.
         """
+
+        # #1045 proposal 1: the working-state checkpoint contract file is the
+        # one path a turn may write without an approval route. Evaluated
+        # before BOTH fail-closed branches below (turn=none no-route and the
+        # active-turn handler that has no callback in headless continuations),
+        # so the harness contract "keep working-state.md current" holds in
+        # exactly the turns that need it. Narrow by construction: structured
+        # write actions, absolute file_path, realpath-equal to a known
+        # non-symlinked contract file, kill-switch CCC_STATE_CONTRACT_ALLOW.
+        # Anything else continues into the unchanged fail-closed flow.
+        if self._state_contract_allows(tool_name, tool_input):
+            active_for_log = self._active_turn
+            logger.info(
+                "Approval request allowed provider=claude tool=%s target_kind=path "
+                "request_id=%s turn=%s outcome=allowed reason=%s",
+                tool_name,
+                getattr(context, "tool_use_id", None),
+                "none" if active_for_log is None or active_for_log.finished else "active",
+                _STATE_CONTRACT_ALLOW_REASON,
+            )
+            return PermissionResultAllow()
 
         active = self._active_turn
         if active is None or active.finished:
@@ -1284,6 +1333,12 @@ class ClaudeRuntime:
         # waiting for a frame that cannot arrive yet.
         session_id = request.session_id or str(uuid.uuid4())
         session = ClaudeSession(self, session_id)
+        if request.memory_environment is not None:
+            scoped_state_dir = request.memory_environment.get("CCC_STATE_DIR")
+            if isinstance(scoped_state_dir, str) and scoped_state_dir.strip():
+                session._contract_state_dirs = (scoped_state_dir.strip(),)
+            if request.memory_environment.get("CCC_MEMORY_AUDIENCE") == "shared":
+                session._contract_include_default = False
         options = self._build_options(
             request,
             session._handle_permission_request,
