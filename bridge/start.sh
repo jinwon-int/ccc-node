@@ -42,7 +42,7 @@ get_checkout_version() {
     if [ ! -x "$version_cmd" ]; then
         return 1
     fi
-    CCC_VERSION_REPO_DIR="$REPO_ROOT" "$version_cmd"
+    CCC_VERSION_REPO_DIR="$REPO_ROOT" bash "$version_cmd"
 }
 
 validate_canonical_origin() {
@@ -860,7 +860,7 @@ do_upgrade() {
     echo "🔄 Running canonical ccc-node updater..."
     if CCC_SELF_UPDATE_REPO="$REPO_ROOT" \
         CCC_SELF_UPDATE_BRANCH="main" \
-        "$updater" run; then
+        bash "$updater" run; then
         if ! current="$(get_checkout_version)"; then
             echo "❌ Update completed but installed checkout identity is unavailable" >&2
             exit 1

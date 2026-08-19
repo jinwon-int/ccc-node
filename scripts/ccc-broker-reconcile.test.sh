@@ -21,10 +21,12 @@ printf '%s\n' '# operator-fixed broker project dir' "$BROKER_DIR" > "$DIRF"; chm
 printf '%s\n' '# exact compose service names only' 'a2a-broker' 't2-broker' > "$ALLOW"; chmod 600 "$ALLOW"
 
 run_wrapper() {
+  # `bash -p` (not a bare `bash`) keeps the shebang's privileged mode when
+  # naming the interpreter: plain bash would source the caller's BASH_ENV.
   CCC_BROKER_RECONCILE_DIR_FILE="$DIRF" \
   CCC_BROKER_RECONCILE_ALLOWLIST="$ALLOW" \
   CCC_BROKER_RECONCILE_DRY_RUN=1 \
-    "$WRAPPER" "$@"
+    bash -p "$WRAPPER" "$@"
 }
 
 # --- happy path -------------------------------------------------------------

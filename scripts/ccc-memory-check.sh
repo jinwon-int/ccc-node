@@ -263,7 +263,7 @@ BOT_DATA_DIR="${BOT_DATA_DIR:-${PROJECT_ROOT:-$PWD}/.telegram_bot}"
 DISTILL_JOURNAL_DIR="${CCC_DISTILL_JOURNAL_DIR:-$BOT_DATA_DIR/distill-journal}"
 codex_json='{"status":"unavailable","active_kind":null,"snapshot_sha256":null,"snapshot_bytes":0,"file_bytes":0,"metadata_status":"missing"}'
 if [ -x "$CODEX_MATERIALIZER" ] && [ -f "$CODEX_MATERIALIZER" ]; then
-  candidate="$("$CODEX_MATERIALIZER" status --json 2>/dev/null || true)"
+  candidate="$(python3 "$CODEX_MATERIALIZER" status --json 2>/dev/null || true)"
   if jq -e 'type == "object" and (.status | type == "string")' >/dev/null 2>&1 <<<"$candidate"; then
     codex_json="$candidate"
   fi

@@ -10,13 +10,19 @@ keeps the NEXT call site from re-entering the same form.
 
 What is flagged
 ---------------
-Shell (tracked ``*.sh``) — a ``*.sh`` path as the effective command word with
-no interpreter in front of it::
+Shell (tracked ``*.sh``) — a repo script (``*.sh``/``*.py``) as the effective
+command word with no interpreter in front of it::
 
     "$HOOKDIR/scan-injection.sh" "$label"          # command position
     nohup "$SCRIPT_DIR/start.sh" &                  # launcher prefix (#1151)
     exec "$DIR/foo.sh"                              # exec prefix
     out="$(printf x | "$DIR/foo.sh")"               # after a pipe (#1157 form)
+    env X=1 "$materializer" materialize             # env prefixes (#1183 form)
+
+including a bare variable (``"$materializer"``) whose latest earlier simple
+assignment in the same file resolves to a ``*.sh``/``*.py`` path (the
+pre-#1183 ccc-codex/ccc-piri shape); seam-valued and non-script assignments
+resolve clean.
 
 Launcher prefixes stripped before the decision: nohup, exec, setsid, command,
 builtin, time, sudo, env — plus leading VAR=value assignments and control
@@ -43,10 +49,10 @@ What is intentionally NOT flagged (false-positive guards)
   exec exactly as named — forcing an interpreter onto it would break the seam
   (#1152/#1158 keep this distinction)
 - comment lines, here-doc bodies (data, not code), array-literal elements
-- a command word that does not statically resolve to a ``*.sh`` path
-  (``"$scan_bin"``, ``"${launcher[@]}"``): the check cannot prove the target
-  is a repo script, so it stays silent — the seam/waiver conventions are how
-  those call sites document intent
+- a command word that does not statically resolve to a repo script path
+  (``"${launcher[@]}"`` array heads, for-loop variables): the check cannot
+  prove the target is a repo script, so it stays silent — the seam/waiver
+  conventions are how those call sites document intent
 - python argv heads that are system tools (``tar``, ``git``) or names that do
   not statically resolve to a ``*.sh`` path
 
@@ -78,9 +84,13 @@ WAIVER_MARK = "ccc:interpreter-ok"
 
 # Override seams: the operator/test named the executable; it may not be a bash
 # script at all, so it must exec exactly as given (#1152, #1158).
+# A2A_PYTHON_HARNESS: unit tests substitute a bash mock whose own shebang
+# picks the interpreter; a2a-termux-native-worker.sh branches on it and execs
+# the override directly by design.
 SEAM_VARS = frozenset({
     "CCC_SCAN_INJECTION_BIN",
     "CCC_BRIDGE_RESTART_SPAWN",
+    "A2A_PYTHON_HARNESS",
 })
 SEAM_SUFFIXES = ("_BIN", "_SPAWN", "_CMD", "_COMMAND", "_TOOL", "_OVERRIDE")
 
@@ -340,9 +350,59 @@ def _is_sh_candidate(word: str) -> bool:
     core = _word_core(word)
     if "$(" in core or "`" in core or "*" in core:
         return False
-    if not re.search(r"\.sh\}?$", core):
+    if not re.search(r"\.(?:sh|py)\}?$", core):
         return False
     return bool(re.match(r"^(\$|\.{1,2}/|/|~)", core))
+
+
+def _suggest_interpreter(text: str) -> str:
+    return "python3" if re.search(r"\.py\}?[\"']?$", text) else "bash"
+
+
+ASSIGN_FULL_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)(?:\[[^\]]*\])?\+?=(.*)$", re.S)
+VAR_USE_RE = re.compile(r"^\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?$")
+
+
+def _classify_assign_value(raw: str) -> str:
+    """'seam' | 'script' | 'other' for a simple assignment's value text."""
+    core = _word_core(raw)
+    m = VAR_USE_RE.match(core)
+    if m and (m.group(1) in SEAM_VARS or m.group(1).endswith(SEAM_SUFFIXES)):
+        return "seam"
+    if _is_seam_token(core):
+        return "seam"
+    if re.search(r"\.(?:sh|py)\}?$", core):
+        return "script"
+    return "other"
+
+
+class _AssignTable:
+    """File-order map of simple scalar assignments: name -> [(seq, kind, value)].
+
+    Uses are resolved against the latest assignment BEFORE them in file order,
+    so a seam-valued override assigned inside one branch does not poison the
+    .sh-valued default assigned in another (checkpoint.sh shape).
+    """
+
+    def __init__(self) -> None:
+        self.seq = 0
+        self.kinds: dict[str, list[tuple[int, str, str]]] = {}
+
+    def record(self, name: str, kind: str, value: str) -> None:
+        self.seq += 1
+        self.kinds.setdefault(name, []).append((self.seq, kind, value[:120]))
+
+    def tick(self) -> int:
+        self.seq += 1
+        return self.seq
+
+    def kind_at(self, name: str, seq: int) -> tuple[str, str] | None:
+        best: tuple[str, str] | None = None
+        for s, k, v in self.kinds.get(name, []):
+            if s >= seq:
+                break
+            best = (k, v)
+        return best
 
 
 def _is_seam_token(word: str) -> bool:
@@ -447,14 +507,44 @@ def _classify_head(word: str) -> str:
     return "command"
 
 
+def _check_command_word(word: str, lineno: int, table: "_AssignTable",
+                        rel: str, findings: list[Finding]) -> None:
+    """Flag the effective command word when it provably execs a repo script."""
+    core = _word_core(word)
+    var_use = VAR_USE_RE.match(core)
+    if var_use:
+        resolved = table.kind_at(var_use.group(1), table.tick())
+        if resolved and resolved[0] == "script":
+            interp = _suggest_interpreter(resolved[1])
+            findings.append(Finding(
+                rel, lineno, "shell",
+                f"command word {word} resolves to a repo script via "
+                f"{var_use.group(1)}={resolved[1]} — name an interpreter "
+                f"(e.g. {interp} {word}) or waive with a reason: "
+                f"# {WAIVER_MARK}: <why this exec is intentional>",
+            ))
+        # seam / other / unknown: the seam contract passes as-is, and an
+        # unresolvable word is the documented conservative gap.
+        return
+    if _is_sh_candidate(word) and not _is_seam_token(word):
+        interp = _suggest_interpreter(word)
+        findings.append(Finding(
+            rel, lineno, "shell",
+            f"repo script in command position without an interpreter: "
+            f"{word} (name one — e.g. {interp} {word} — or waive with a "
+            f"reason: # {WAIVER_MARK}: <why this exec is intentional>)",
+        ))
+
+
 def _scan_shell_level(text: str, marks: list[tuple[int, int]], base: int,
-                      rel: str, waived: set[int], findings: list[Finding]) -> None:
-    """Tokenize one command level; flag interpreter-less .sh command words."""
+                      rel: str, waived: set[int], findings: list[Finding],
+                      table: _AssignTable) -> None:
+    """Tokenize one command level; flag interpreter-less script command words."""
     blanked, subs = _extract_cmdsubs(text)
     for off, inner in subs:
         # Recursion re-uses the parent's mark table shifted by the span offset.
         inner_marks = [(mo + off, ln) for mo, ln in _remark(inner, marks, off)]
-        _scan_shell_level(inner, inner_marks, 0, rel, waived, findings)
+        _scan_shell_level(inner, inner_marks, 0, rel, waived, findings, table)
 
     i, n = 0, len(blanked)
     head = True          # next word is a command-head candidate
@@ -477,7 +567,18 @@ def _scan_shell_level(text: str, marks: list[tuple[int, int]], base: int,
             i = _consume_array(blanked, i)
             head = False
             continue
-        if not head or decl:
+        assign = ASSIGN_FULL_RE.match(word)
+        if decl:
+            # local/export x="$D/f.sh" — record so later bare-$x uses resolve.
+            if assign:
+                table.record(assign.group(1), _classify_assign_value(assign.group(2)), assign.group(2))
+            continue
+        if not head:
+            continue
+        if assign:
+            # Prefix assignment at command position: record the binding; the
+            # command word (if any) is still ahead.
+            table.record(assign.group(1), _classify_assign_value(assign.group(2)), assign.group(2))
             continue
         role = _classify_head(word)
         if role == "decl":
@@ -487,15 +588,9 @@ def _scan_shell_level(text: str, marks: list[tuple[int, int]], base: int,
             continue
         # This word is the effective command.
         head = False
-        if _is_sh_candidate(word) and not _is_seam_token(word):
-            lineno = _lineno_at(marks, base + start)
-            if lineno not in waived:
-                findings.append(Finding(
-                    rel, lineno, "shell",
-                    f"repo script in command position without an interpreter: "
-                    f"{word} (name one — e.g. bash {word} — or waive with a "
-                    f"reason: # {WAIVER_MARK}: <why this exec is intentional>)",
-                ))
+        lineno = _lineno_at(marks, base + start)
+        if lineno not in waived:
+            _check_command_word(word, lineno, table, rel, findings)
 
 
 def _remark(inner: str, parent_marks: list[tuple[int, int]], off: int):
@@ -527,6 +622,7 @@ def check_shell_file(path: Path, rel: str) -> list[Finding]:
         coded.append((lineno, code))
 
     in_array = False
+    table = _AssignTable()
     for text, marks in _logical_spans(coded):
         first = text.strip()
         if in_array:
@@ -536,7 +632,7 @@ def check_shell_file(path: Path, rel: str) -> list[Finding]:
         if re.search(r"=\(\s*$", text) and ")" not in text:
             in_array = True
             continue
-        _scan_shell_level(text, marks, 0, rel, waived, findings)
+        _scan_shell_level(text, marks, 0, rel, waived, findings, table)
     return findings
 
 
@@ -682,22 +778,48 @@ def check_python_file(path: Path, rel: str) -> list[Finding]:
 
 # ---------------------------------------------------------------------------
 
+SHELL_SHEBANG_RE = re.compile(r"^#!.*\b(?:bash|sh|dash|zsh|ksh|ash)\b")
+PYTHON_SHEBANG_RE = re.compile(r"^#!.*\bpython[0-9.]*\b")
+
+
+def _classify_file(repo_root: Path, rel: str) -> str | None:
+    """'shell' | 'python' | None — by extension, else by shebang.
+
+    Extensionless launchers (scripts/ccc-codex, scripts/ccc-piri) carry the
+    same defect class — the pre-#1183 materializer exec lived in one — so a
+    missing .sh suffix must not exempt a script from the shell scan.
+    """
+    if rel.endswith(".sh"):
+        return "shell"
+    if rel.endswith(".py"):
+        return "python"
+    try:
+        with open(repo_root / rel, "rb") as fh:
+            first = fh.readline(200).decode("utf-8", errors="replace")
+    except OSError:
+        return None
+    if SHELL_SHEBANG_RE.match(first):
+        return "shell"
+    if PYTHON_SHEBANG_RE.match(first):
+        return "python"
+    return None
+
+
 def list_tracked_files(repo_root: Path) -> tuple[list[str], str | None]:
-    """Tracked *.sh/*.py relative paths; falls back to a filesystem walk."""
+    """All tracked relative paths; falls back to a filesystem walk."""
     try:
         out = subprocess.run(
-            ["git", "-C", str(repo_root), "ls-files", "*.sh", "*.py"],
+            ["git", "-C", str(repo_root), "ls-files"],
             check=True, capture_output=True, text=True,
         )
         files = [ln for ln in out.stdout.splitlines() if ln.strip()]
         return files, None
     except (OSError, subprocess.CalledProcessError) as exc:
         fallback: list[str] = []
-        for pat in ("*.sh", "*.py"):
-            for p in sorted(repo_root.rglob(pat)):
-                if ".git" in p.parts:
-                    continue
-                fallback.append(str(p.relative_to(repo_root)))
+        for p in sorted(repo_root.rglob("*")):
+            if not p.is_file() or ".git" in p.parts:
+                continue
+            fallback.append(str(p.relative_to(repo_root)))
         return fallback, f"git ls-files unavailable ({exc}); filesystem walk used"
 
 
@@ -709,10 +831,13 @@ def run_check(repo_root: Path) -> tuple[list[Finding], int, str | None]:
         p = repo_root / rel
         if not p.is_file():
             continue
+        kind = _classify_file(repo_root, rel)
+        if kind is None:
+            continue
         scanned += 1
-        if rel.endswith(".sh"):
+        if kind == "shell":
             findings.extend(check_shell_file(p, rel))
-        elif rel.endswith(".py"):
+        else:
             findings.extend(check_python_file(p, rel))
     findings.sort(key=lambda f: (f.path, f.line))
     return findings, scanned, note

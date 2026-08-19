@@ -19,7 +19,7 @@ fi
 # 2026-07-29..08-19). Retry through an explicit interpreter from PATH —
 # python3 ignores shebangs, so the same script runs unchanged.
 run_materializer() {
-  if "$materializer" "$@" >/dev/null 2>&1; then
+  if "$materializer" "$@" >/dev/null 2>&1; then  # ccc:interpreter-ok: deliberate try-direct-first half of the #1183 try-then-interpreter-fallback; the ENOENT path below is the design, not silence
     return 0
   fi
   local interpreter

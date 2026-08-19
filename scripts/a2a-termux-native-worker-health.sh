@@ -362,7 +362,7 @@ main() {
     valid_bounded_uint --tunnel-restart-cooldown "$TUNNEL_RESTART_COOLDOWN" 604800 || return 2
 
     # Validate the env via the canonical harness before doing anything else.
-    if ! "$HARNESS" check --env-file "$env_file" >/dev/null 2>&1; then
+    if ! bash "$HARNESS" check --env-file "$env_file" >/dev/null 2>&1; then
         log "env validation failed for $env_file"
         echo "env validation failed for $env_file" >&2
         return 2
@@ -412,7 +412,7 @@ main() {
                     log "tunnel-down recovery: sup=$sup_pid streak=$streak reachable — controlled restart"
                     record_restart_ts
                     reset_tunnel_down_streak
-                    "$HARNESS" stop >/dev/null 2>&1 || true
+                    bash "$HARNESS" stop >/dev/null 2>&1 || true
                     if spawn_supervisor_and_verify "$env_file" "$sup_record"; then
                         local msg="tunnel-down recovery: restarted supervisor (was pid=$sup_pid after $streak down cycles)"
                         log "$msg"
