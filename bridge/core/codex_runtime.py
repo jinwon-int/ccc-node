@@ -10,6 +10,7 @@ import hashlib
 import logging
 import math
 import os
+from pathlib import Path
 import re
 import signal
 import time
@@ -58,12 +59,17 @@ from .working_state_archive import (
     archive_working_state,
     select_working_state_environment,
 )
+from telegram_bot.memory.codex_rollout import (
+    read_codex_rollout_candidates,
+    validate_rollout_root,
+)
 from telegram_bot.memory.distill_types import (
     CodexTranscriptSnapshot,
     SnapshotUnavailableError,
     TranscriptBounds,
     TranscriptMessage,
 )
+from .turn_stall import find_rollout
 
 
 logger = logging.getLogger(__name__)
@@ -795,11 +801,19 @@ class CodexRuntime:
         thread = await self._client.thread_read(session_id, include_turns=True)
         thread_hash = hashlib.sha256(session_id.encode("utf-8")).hexdigest()
         if thread is None:
-            # Fail closed. Returning an empty snapshot here made the whole
-            # distill pipeline report success while discarding the session:
-            # snapshot_done -> extractor sees no transcript -> honcho: [] ->
-            # journal records a completed job with zero facts. The message
-            # carries only the hash, never the session id.
+            # The app-server is authoritative only while it still holds the
+            # thread. Distill snapshots are taken by a worker that runs after
+            # the interactive path enqueued the job (#475's trigger contract
+            # never awaits a provider call), so by then the read returns
+            # nothing. Fall back to the rollout file, which outlives the
+            # process. Fail closed if that is unavailable too: returning an
+            # empty snapshot made the pipeline report success while discarding
+            # the session (snapshot_done -> no transcript -> honcho: []).
+            disk = await asyncio.to_thread(
+                self._rollout_snapshot, session_id, limits, captured, thread_hash
+            )
+            if disk is not None:
+                return disk
             raise SnapshotUnavailableError(
                 f"Codex thread is not readable for snapshot: {thread_hash}"
             )
@@ -816,6 +830,73 @@ class CodexRuntime:
             messages=messages,
             byte_count=byte_count,
             truncated=structural_truncation or byte_truncation,
+            captured_at=self._format_snapshot_time(captured),
+        )
+
+    def _rollout_snapshot(
+        self,
+        session_id: str,
+        limits: TranscriptBounds,
+        captured: datetime,
+        thread_hash: str,
+    ) -> CodexTranscriptSnapshot | None:
+        """Rebuild the snapshot from this runtime's rollout files, or None.
+
+        The search is confined to the CODEX_HOME this runtime was constructed
+        with. CodexRuntimePool gives every audience its own process and its own
+        CODEX_HOME (memory_audience.codex_environment), so staying inside it is
+        what keeps the fallback from reading across audience partitions — the
+        isolation the pool's own thread-ownership check provides on the RPC
+        path. Never widen this to a default or global sessions root.
+        """
+
+        environment: Mapping[str, str] = self._process_environment or os.environ
+        configured = (environment.get("CODEX_HOME") or "").strip()
+        codex_home = Path(configured) if configured else Path.home() / ".codex"
+        try:
+            validate_rollout_root(codex_home / "sessions")
+        except (OSError, ValueError) as error:
+            logger.warning(
+                "codex rollout fallback root unusable thread=%s reason=%s",
+                thread_hash,
+                type(error).__name__,
+            )
+            return None
+        path = find_rollout([codex_home], session_id)
+        if path is None:
+            return None
+        try:
+            newest_messages, last_turn_id, truncated = read_codex_rollout_candidates(
+                path, session_id, limits=limits, captured=captured
+            )
+        except (OSError, ValueError) as error:
+            # A rollout that fails its identity or safety contract is not a
+            # substitute for the thread. Returning None keeps the caller on the
+            # fail-closed path instead of attributing another session's text.
+            logger.warning(
+                "codex rollout fallback rejected thread=%s reason=%s",
+                thread_hash,
+                type(error).__name__,
+            )
+            return None
+        if not newest_messages:
+            return None
+        messages, byte_count, byte_truncation = self._bound_snapshot_messages(
+            newest_messages, limits
+        )
+        if not messages:
+            return None
+        logger.info(
+            "codex snapshot served from rollout file thread=%s messages=%d",
+            thread_hash,
+            len(messages),
+        )
+        return CodexTranscriptSnapshot(
+            thread_hash=thread_hash,
+            last_turn_id=last_turn_id,
+            messages=messages,
+            byte_count=byte_count,
+            truncated=truncated or byte_truncation,
             captured_at=self._format_snapshot_time(captured),
         )
 
