@@ -46,6 +46,17 @@ LEGACY_MEMDIR="${CCC_MEMORY_LEGACY_DIR:-${HOME:-/root}/.claude/memories}"
 LEGACY_HERMES_MEMDIR="${CCC_MEMORY_LEGACY_HERMES_DIR:-${HOME:-/root}/.hermes/memories}"
 LEGACY_RESUME_FILE="${CCC_MEMORY_LEGACY_RESUME_FILE:-$LEGACY_STATE_DIR/resume.md}"
 RESUME_FILE="${CCC_RESUME_FILE:-$STATE_DIR/resume.md}"
+# Working-state checkpoint block (#1176). On Claude nodes checkpoint.sh owns
+# this file across PreCompact/PostCompact, so the default here is OFF and the
+# Claude output stays byte-identical. The Codex/Piri materializer (whose only
+# snapshot source is this loader) turns it on, which gives those providers the
+# same "continue from here" context at session start and on every
+# compaction_end refresh. PostCompact is always skipped so a Claude node that
+# opts in for SessionStart never double-injects next to checkpoint.sh.
+WS_INJECT="${CCC_MEMORY_INJECT_WORKING_STATE:-0}"
+MAX_WS="${CCC_WORKING_STATE_MAX_BYTES:-2048}"
+WS_FILE="${CCC_WORKING_STATE:-$STATE_DIR/working-state.md}"
+LEGACY_WS_FILE="${CCC_MEMORY_LEGACY_WORKING_STATE:-$LEGACY_STATE_DIR/working-state.md}"
 
 LOAD_MEMORY_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)" || LOAD_MEMORY_LIB_DIR="$HOOKDIR"
 # shellcheck source=claude/hooks/lib/hook-common.sh
@@ -273,6 +284,20 @@ if ! is_disabled "$AUDIENCE_SCOPED" && [ "$MEMORY_AUDIENCE" = "private" ]; then
   legacy_resume="$(cat "$LEGACY_RESUME_FILE" 2>/dev/null)"
   resume="$(printf '%s\n%s' "$legacy_resume" "$resume")"
 fi
+# Working-state: same resolution as checkpoint.sh (#1155) — the scoped file
+# first; an empty scoped file falls back to the node's pre-scope legacy file
+# only for the private audience, never for a shared one.
+ws=""; ws_file=""
+if ! is_disabled "$WS_INJECT" && [ "$EVENT" != "PostCompact" ]; then
+  ws_file="$WS_FILE"
+  if [ ! -s "$ws_file" ] \
+    && ! is_disabled "$AUDIENCE_SCOPED" && [ "$MEMORY_AUDIENCE" = "private" ] \
+    && [ -n "$LEGACY_WS_FILE" ] && [ "$LEGACY_WS_FILE" != "$WS_FILE" ] \
+    && [ -s "$LEGACY_WS_FILE" ]; then
+    ws_file="$LEGACY_WS_FILE"
+  fi
+  ws="$(cat "$ws_file" 2>/dev/null)"
+fi
 
 # Limit the canonical blocks first (static caps) so we can measure their slack
 _mark sources
@@ -331,6 +356,9 @@ fi
 if [ -n "$scan_dir" ]; then
   scan_lane mem built-in-memory "$MAX_MEM" "$mem" &
   scan_lane resume resume-pointer "$MAX_RESUME" "$resume" &
+  if [ -n "$ws" ]; then
+    scan_lane ws working-state-checkpoint "$MAX_WS" "$ws" &
+  fi
   if ! is_disabled "$WIKI_ENABLED"; then
     scan_lane wiki family-wiki-cache "$MAX_WIKI" "$wiki" &
   fi
@@ -340,6 +368,11 @@ if [ -n "$scan_dir" ]; then
 fi
 mem="$(scanned_block mem built-in-memory "$MAX_MEM" "$mem")"
 resume="$(scanned_block resume resume-pointer "$MAX_RESUME" "$resume")"
+# Agent-written and re-entering model context: scanned like every other block
+# (same label checkpoint.sh uses for its PostCompact re-injection, #1045).
+if [ -n "$ws" ]; then
+  ws="$(scanned_block ws working-state-checkpoint "$MAX_WS" "$ws")"
+fi
 if ! is_disabled "$WIKI_ENABLED"; then
   wiki="$(scanned_block wiki family-wiki-cache "$MAX_WIKI" "$wiki")"
 fi
@@ -361,7 +394,9 @@ if ! is_disabled "${CCC_MEMORY_DYNAMIC_BUDGET:-1}"; then
   msize="$(printf '%s' "$mem" | wc -c)"
   wsize="$(printf '%s' "$wiki" | wc -c)"
   hsize="$(printf '%s' "$honcho" | wc -c)"
-  rsize="$(printf '%s' "$resume" | wc -c)"
+  # The working-state block is a second pointer-class block next to resume;
+  # count it there so the local hot block cannot reclaim bytes it occupies.
+  rsize="$(( $(printf '%s' "$resume" | wc -c) + $(printf '%s' "$ws" | wc -c) ))"
   # alloc = byte budget for local (>= MAX_LOCAL, reclaiming slack up to the total
   # minus a ~1000B scaffold reserve); dyn_limit = results to fetch to fill it
   # (~180B/result, clamped to [5,25]). The final limit_bytes is the hard bound.
@@ -512,6 +547,28 @@ ${resume}
 "
 fi
 
+# Working-state block (#1176). Placed right after MEMORY+USER so the byte caps
+# downstream (the materializer truncates from the tail) cut Honcho/Wiki before
+# the live task pointer. Stale guard mirrors checkpoint.sh: CCC_CKPT_STALE_DAYS
+# (default 14, 0 disables) — a weeks-old objective must not read as current.
+ws_block=""
+if ! is_disabled "$WS_INJECT" && [ "$EVENT" != "PostCompact" ]; then
+  ws_stale=""
+  ws_stale_days="${CCC_CKPT_STALE_DAYS:-14}"
+  case "$ws_stale_days" in ''|*[!0-9]*) ws_stale_days=14 ;; esac
+  if [ -n "$ws" ] && [ "$ws_stale_days" -gt 0 ]; then
+    ws_age="$(age_seconds "$ws_file")"
+    if [ "$ws_age" -ge $(( ws_stale_days * 86400 )) ]; then
+      ws_stale="⚠ STALE: working-state.md was last modified $(( ws_age / 86400 )) days ago — it may describe an already-finished task. Verify against live state before acting on it, and clear it to an idle note when its task closes.
+"
+    fi
+  fi
+  ws_block="
+## Working-state checkpoint (agent-written — objective / progress / next step; re-injected at session start and after compaction)
+${ws_stale}${ws:-(working-state.md empty — if a task is in progress, keep ${WS_FILE} updated as objective / progress / next step)}
+"
+fi
+
 operational_note="Operational facts are mutable — live-check the node before asserting or changing anything."
 audience_note=""
 if ! is_disabled "$AUDIENCE_SCOPED"; then
@@ -571,7 +628,7 @@ Memory profile: ${PROFILE}; last refresh: ${stamp:-never}; ${wiki_note}; ${honch
 
 ## Built-in MEMORY + USER
 ${mem:-(memory files unavailable)}
-
+${ws_block}
 ## Local hot memory (task-conditioned cache search)
 ${local_hot:-(local hot memory disabled or no hits)}
 ${skills_block}${wiki_block}

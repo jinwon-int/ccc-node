@@ -29,13 +29,15 @@ The materializer is local/no-provider and preserves user bytes outside `<!-- ccc
 Configuration:
 
 - `CCC_CODEX_MEMORY_MAX_BYTES` — snapshot body cap (default 8192; hard max 24576).
-- `CCC_CODEX_AGENTS_BUDGET_BYTES` — whole active global file budget after preserving user content (default 24576; hard max 32768).
+- `CCC_CODEX_AGENTS_BUDGET_BYTES` — whole active global file budget after preserving user content (default 24576; floor 2048 so the static header always fits; hard max 32768).
 - `CCC_CODEX_LOCK_TIMEOUT_SEC` — local materializer lock deadline (default 3 seconds; hard max 10).
 - `CCC_CODEX_LOADER_TIMEOUT_SEC` — `load-memory.sh` deadline (default/hard max 14 seconds).
 - `CCC_CODEX_MEMORY_LOADER` — explicit trusted loader path. This always wins over automatic nunchi selection.
 - `CCC_CODEX_NUNCHI_MAX_BYTES` — nunchi-only contribution cap (default 3072; hard max 8192).
 - `CCC_CODEX_NUNCHI_REGEN_TIMEOUT_SEC` — stale nunchi snapshot regeneration deadline (default 2 seconds; hard max 3).
 - `CCC_CODEX_NUNCHI_SNAPSHOT_MAX_AGE_SEC` — maximum accepted nunchi snapshot age before bounded regeneration (default 900 seconds; hard max 86400).
+
+The managed block carries two static policy blocks ahead of the untrusted snapshot: the GitHub CLI-first policy and, since #1176, the working-state checkpoint policy (`- working-state-policy: \`working-state-checkpoint-v1\``) that tells Codex/Piri sessions to keep `$CCC_STATE_DIR/working-state.md` (default `~/.claude/state/working-state.md`) updated as objective / progress / next step. The materializer also sets `CCC_MEMORY_INJECT_WORKING_STATE=1` for its `load-memory.sh` run (an explicit operator value wins), so the file's current content lands in the snapshot as `## Working-state checkpoint` right after MEMORY+USER — bounded by `CCC_WORKING_STATE_MAX_BYTES` (default 2048), scanned like every other block, flagged `STALE` past `CCC_CKPT_STALE_DAYS` (default 14), with the #1155 private-audience legacy fallback. Piri re-materializes on `compaction_end`, so this gives Piri/Codex the same post-compaction continuity Claude nodes get from `checkpoint.sh`. On Claude nodes the loader flag defaults to `0` (output byte-identical) and `PostCompact` never emits the block even when opted in, because `checkpoint.sh` owns that re-injection.
 
 `materialize --json` and `status --json` emit only status, hashes, byte counts, active kind, and durability/metadata state; they never emit memory bodies. `setup.sh` installs the materializer and `scripts/ccc-codex` beside `load-memory.sh` under `${CCC_CLAUDE_DIR:-$HOME/.claude}/hooks`.
 
