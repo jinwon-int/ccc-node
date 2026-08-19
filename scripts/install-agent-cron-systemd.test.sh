@@ -109,5 +109,20 @@ okc "$RC" 2 "non-numeric --timeout-start exits 2"
 run env CCC_SYSTEMD_DIR="$TMP/sd10" CCC_AGENT_CRON_TIMEOUT_START=900 CCC_SYSTEMCTL="$STUB" bash "$SC"
 ok "env CCC_AGENT_CRON_TIMEOUT_START honored" 'grep -q "^TimeoutStartSec=900$" "$OUT"'
 
+# --- root-scope warning (#1079 phase 3 follow-up): root on a service-account
+# node would pin HOME=/root into the unit — same ghost class as the crontab
+# installers. CCC_ROOT_SCOPE_* seams keep the test hermetic.
+mkdir -p "$TMP/home/gongmyoung/.claude" "$TMP/noroothome"
+run env CCC_SYSTEMD_DIR="$TMP/sd11" CCC_SYSTEMCTL="$STUB" \
+    CCC_ROOT_SCOPE_CHECK_EUID=0 CCC_ROOT_SCOPE_ROOT_HOME="$TMP/noroothome" \
+    CCC_ROOT_SCOPE_HOME_PARENT="$TMP/home" bash "$SC"
+ok "root on a service-account node warns and names the account" \
+  'grep -q "WARNING (ccc-agent-cron): running as root" "$OUT" && grep -q "gongmyoung" "$OUT"'
+
+run env CCC_SYSTEMD_DIR="$TMP/sd12" CCC_SYSTEMCTL="$STUB" \
+    CCC_ROOT_SCOPE_CHECK_EUID=1000 CCC_ROOT_SCOPE_ROOT_HOME="$TMP/noroothome" \
+    CCC_ROOT_SCOPE_HOME_PARENT="$TMP/home" bash "$SC"
+ok "non-root stays silent" '! grep -q "running as root" "$OUT"'
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

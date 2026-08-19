@@ -90,6 +90,18 @@ if [ -z "$SYSTEMD_DIR" ]; then
   fi
 fi
 
+# #1079 phase 3 follow-up: same root-scope hazard as the crontab installers —
+# Environment=HOME=$HOME and the --user unit dir both resolve from the
+# invoking account, so a root run on a service-account node installs a dead
+# second scheduler for /root. Reuses the shared detector; warning-only.
+# The CCC_ROOT_SCOPE_* overrides are test seams (production defaults shown).
+# shellcheck source=/dev/null
+. "$ROOT/scripts/lib/installer-cron-common.sh"
+ccc_cron_root_scope_warning "$SERVICE_NAME" \
+  "${CCC_ROOT_SCOPE_CHECK_EUID:-$(id -u)}" \
+  "${CCC_ROOT_SCOPE_ROOT_HOME:-/root}" \
+  "${CCC_ROOT_SCOPE_HOME_PARENT:-/home}"
+
 SERVICE_FILE="$SYSTEMD_DIR/$SERVICE_NAME.service"
 TIMER_FILE="$SYSTEMD_DIR/$SERVICE_NAME.timer"
 SYSTEMCTL_ARGS=()
