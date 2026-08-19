@@ -57,11 +57,13 @@ ok "scanned PostCompact neutralizes injection phrases" \
 out="$(CCC_STATE_DIR="$scan_state" CCC_SCAN_INJECTION_BIN="$TMP/does-not-exist" bash "$CHECKPOINT" PostCompact 2>&1)"; rc=$?
 ok "missing scanner fails open with raw text" \
   '[ "$rc" = 0 ] && jq -e ".hookSpecificOutput.additionalContext | contains(\"progress note\")" <<<"$out" >/dev/null'
+ok "missing scanner stays quiet (expected branch, no alarm)" '! grep -qi "UNSCANNED" <<<"$out"'
 printf '#!/usr/bin/env bash\nexit 1\n' > "$TMP/failing-scanner"
 chmod +x "$TMP/failing-scanner"
-out="$(CCC_STATE_DIR="$scan_state" CCC_SCAN_INJECTION_BIN="$TMP/failing-scanner" bash "$CHECKPOINT" PostCompact 2>&1)"; rc=$?
+out="$(CCC_STATE_DIR="$scan_state" CCC_SCAN_INJECTION_BIN="$TMP/failing-scanner" bash "$CHECKPOINT" PostCompact 2>"$TMP/fail-scan.err")"; rc=$?
 ok "failing scanner fails open with raw text" \
   '[ "$rc" = 0 ] && jq -e ".hookSpecificOutput.additionalContext | contains(\"progress note\")" <<<"$out" >/dev/null'
+ok "failing scanner is noted on stderr, not silent (#1160)" 'grep -qi "UNSCANNED" "$TMP/fail-scan.err"'
 
 # --- #1155: an audience-scoped session still sees pre-scope working-state ----
 # A scoped session points CCC_STATE_DIR at a per-audience tree that starts
