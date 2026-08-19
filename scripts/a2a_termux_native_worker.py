@@ -48,18 +48,26 @@ EXEC_KEYS = ("A2A_NATIVE_NODE_BIN",)
 ANALYSIS_BRIDGE = "claude-a2a-analysis-bridge.mjs"
 PATCH_BRIDGE = "claude-a2a-patch-bridge.mjs"
 CODEX_BRIDGE = "codex-a2a-analysis-bridge.mjs"
-ALLOWED_BRIDGES = (ANALYSIS_BRIDGE, PATCH_BRIDGE, CODEX_BRIDGE)
+# Fleet-owned piri harness lane (a2a-nexus #1745/#1899): the in-repo bridge
+# shares the same OpenClaw-shaped argv/stdout contract and spawns the piri CLI
+# itself (docker lane, or A2A_PIRI_EXEC=native on Docker-less hosts), so the
+# launcher only validates the piri CLI entry point and stays out of provider
+# credentials — the bridge preflights them fail-closed.
+PIRI_BRIDGE = "piri-a2a-analysis-bridge.mjs"
+ALLOWED_BRIDGES = (ANALYSIS_BRIDGE, PATCH_BRIDGE, CODEX_BRIDGE, PIRI_BRIDGE)
 # The adapter id the worker must register, keyed by the wired bridge file, so
 # WORKER_METADATA_JSON stays honest about which bridge is actually spawned.
 BRIDGE_ADAPTER = {
     ANALYSIS_BRIDGE: "claude-a2a-analysis-bridge",
     PATCH_BRIDGE: "claude-a2a-patch-bridge",
     CODEX_BRIDGE: "codex-a2a-analysis-bridge",
+    PIRI_BRIDGE: "piri-a2a-analysis-bridge",
 }
 BRIDGE_METADATA = {
     ANALYSIS_BRIDGE: {"runtime": "claude-code", "harness": "claude"},
     PATCH_BRIDGE: {"runtime": "claude-code", "harness": "claude"},
     CODEX_BRIDGE: {"runtime": "codex", "harness": "codex"},
+    PIRI_BRIDGE: {"runtime": "piri", "harness": "piri"},
 }
 # The versioned external handler worker.js spawns per task; its documented
 # contract is "stdin A2A task JSON -> stdout WorkerHandlerOutcome JSON". Newer
@@ -265,6 +273,10 @@ def validate_env(env: dict[str, str]) -> tuple[Path, list[str], dict[str, object
         )
         check_forbidden_context(config_dir, "A2A_CODEX_ANALYSIS_CONFIG_DIR")
         existing_file("Codex auth.json", str(config_dir / "auth.json"))
+    elif openclaw.name == PIRI_BRIDGE:
+        require_keys(env, ("A2A_PIRI_CLI",))
+        check_forbidden_context(Path(env["A2A_PIRI_CLI"]).expanduser(), "A2A_PIRI_CLI")
+        executable_file("A2A_PIRI_CLI", env["A2A_PIRI_CLI"])
     else:
         require_keys(env, ("A2A_CLAUDE_CODE_BIN",))
         check_forbidden_context(
