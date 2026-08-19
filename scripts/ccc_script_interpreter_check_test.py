@@ -155,6 +155,56 @@ class ShellCase(unittest.TestCase):
         # default branch names bash, the override branch execs the seam as-is
         self.assert_clean('if [ -n "${CCC_SCAN_INJECTION_BIN:-}" ]; then\n  ckpt_run() { "$scan_bin" "$1"; }\nelse\n  ckpt_run() { bash "$scan_bin" "$1"; }\nfi\n')
 
+    # --- extension A: .py literal heads (#1183 class) ---
+    def test_py_literal_command_position(self):
+        self.assert_flags('"$D/tool.py" --json\n')
+
+    def test_py_exec_prefix(self):
+        self.assert_flags('exec "$D/tool.py"\n')
+
+    def test_py_named_interpreter_passes(self):
+        self.assert_clean('python3 "$D/tool.py" --json\n')
+
+    # --- extension B: simple assignment resolution (materializer shape) ---
+    def test_var_resolved_sh_flags(self):
+        self.assert_flags('M="$D/x.sh"\n"$M" --json\n')
+
+    def test_var_resolved_py_via_env_prefix_flags(self):
+        # pre-#1183 ccc-piri: env-assignments stripped, bare var head resolves
+        # to the repo .py default — the daegyo exit-78 class
+        self.assert_flags('materializer="${CCC_PIRI_MEMORY_MATERIALIZER_PATH:-$SCRIPT_DIR/ccc_codex_memory.py}"\nenv CODEX_HOME="$h" MAX="${CCC_MAX:-16384}" \\\n    "$materializer" materialize --json\n')
+
+    def test_var_with_bash_passes(self):
+        self.assert_clean('M="$D/x.sh"\nbash "$M" --json\n')
+
+    def test_var_seam_reference_passes(self):
+        self.assert_clean('S="$CCC_SCAN_INJECTION_BIN"\n"$S" "$1"\n')
+
+    def test_var_seam_default_passes(self):
+        self.assert_clean('S="${CCC_BRIDGE_RESTART_SPAWN:-$D/start.sh}"\n"$S" --daemon\n')
+
+    def test_var_resolution_order_seam_branch(self):
+        # checkpoint.sh: the seam assignment precedes the seam-branch use;
+        # the .sh default assignment only reaches the bash-named branch
+        self.assert_clean('if [ -n "${CCC_SCAN_INJECTION_BIN:-}" ]; then\n  S="$CCC_SCAN_INJECTION_BIN"\n  run() { "$S" "$1"; }\nelse\n  S="$D/scan.sh"\n  run() { bash "$S" "$1"; }\nfi\n')
+
+    def test_var_reassigned_to_non_script_passes(self):
+        self.assert_clean('M="$D/x.sh"\nM="plain-value"\n"$M" arg\n')
+
+    def test_var_unknown_passes(self):
+        self.assert_clean('"$UNTRACKED" arg\n')
+
+    def test_var_use_waiver_passes(self):
+        self.assert_clean('M="$D/x.py"\n"$M" arg  # ccc:interpreter-ok: try-then-fallback to an explicit python3 (#1183)\n')
+
+    def test_local_assignment_resolved_flags(self):
+        self.assert_flags('f() {\n  local m="$D/x.sh"\n  "$m" arg\n}\n')
+
+    def test_array_launcher_head_passes(self):
+        # residual gap, documented: array launcher heads (pre=(env ...)) are
+        # not resolved — spawn_launcher/pre may be conditionally built
+        self.assert_clean('pre=(env CODEX_HOME="$h")\n"${pre[@]}" "$materializer" --json\n')
+
 
 class PythonCase(unittest.TestCase):
     def setUp(self):

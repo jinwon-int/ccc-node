@@ -60,7 +60,7 @@ export PATH="$TMP/bin:$PATH"
 export FAKE_MERGE_MARKER="$TMP/merged"
 HEAD_SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 
-if "$SCRIPT" --repo jinwon-int/ccc-node --pr 1 --expected-head "$HEAD_SHA" \
+if bash "$SCRIPT" --repo jinwon-int/ccc-node --pr 1 --expected-head "$HEAD_SHA" \
   >"$TMP/out" 2>"$TMP/err"; then
   fail "merge succeeded without explicit approval"
 elif grep -q -- '--operator-approved is required' "$TMP/err"; then
@@ -69,7 +69,7 @@ else
   fail "missing approval failure was not explicit"
 fi
 
-if "$SCRIPT" --repo jinwon-int/ccc-node --pr 1 \
+if bash "$SCRIPT" --repo jinwon-int/ccc-node --pr 1 \
   --expected-head cccccccccccccccccccccccccccccccccccccccc \
   --operator-approved --dry-run >"$TMP/out" 2>"$TMP/err"; then
   fail "changed head was accepted"
@@ -80,7 +80,7 @@ else
 fi
 
 FAKE_CHECKS='[{"status":"COMPLETED","conclusion":"FAILURE"}]' \
-  "$SCRIPT" --repo jinwon-int/ccc-node --pr 1 --expected-head "$HEAD_SHA" \
+  bash "$SCRIPT" --repo jinwon-int/ccc-node --pr 1 --expected-head "$HEAD_SHA" \
   --operator-approved --dry-run >"$TMP/out" 2>"$TMP/err" && rc=0 || rc=$?
 if [ "$rc" -ne 0 ] && grep -q 'unsuccessful checks' "$TMP/err"; then
   pass
@@ -89,7 +89,7 @@ else
 fi
 
 FAKE_CHECKS='[{"state":"SUCCESS","context":"legacy-status"}]' \
-  "$SCRIPT" --repo jinwon-int/ccc-node --pr 1 --expected-head "$HEAD_SHA" \
+  bash "$SCRIPT" --repo jinwon-int/ccc-node --pr 1 --expected-head "$HEAD_SHA" \
   --operator-approved --dry-run >"$TMP/out" 2>"$TMP/err" && rc=0 || rc=$?
 if [ "$rc" -eq 0 ] && jq -e '.check_count == 1' "$TMP/out" >/dev/null; then
   pass
@@ -98,7 +98,7 @@ else
 fi
 
 rm -f "$FAKE_MERGE_MARKER"
-if "$SCRIPT" --repo jinwon-int/ccc-node --pr 1 --expected-head "$HEAD_SHA" \
+if bash "$SCRIPT" --repo jinwon-int/ccc-node --pr 1 --expected-head "$HEAD_SHA" \
   --operator-approved --dry-run >"$TMP/out"; then
   jq -e '.ok == true and .dry_run == true and .actor == "jinon86" and .check_count == 0' \
     "$TMP/out" >/dev/null && [ ! -e "$FAKE_MERGE_MARKER" ] && pass \
@@ -108,7 +108,7 @@ else
 fi
 
 rm -f "$FAKE_MERGE_MARKER"
-if "$SCRIPT" --repo jinwon-int/ccc-node --pr 1 --expected-head "$HEAD_SHA" \
+if bash "$SCRIPT" --repo jinwon-int/ccc-node --pr 1 --expected-head "$HEAD_SHA" \
   --operator-approved >"$TMP/out"; then
   jq -e '.ok == true and .merged == true and .merge_sha == "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"' \
     "$TMP/out" >/dev/null && [ -e "$FAKE_MERGE_MARKER" ] && pass \
@@ -120,7 +120,7 @@ fi
 # Base guard is the repository's own default branch, not the literal "main".
 rm -f "$FAKE_MERGE_MARKER"
 if FAKE_DEFAULT_BRANCH=master FAKE_BASE=master \
-  "$SCRIPT" --repo jinwon-int/seoyoon-family-wiki --pr 3304 --expected-head "$HEAD_SHA" \
+  bash "$SCRIPT" --repo jinwon-int/seoyoon-family-wiki --pr 3304 --expected-head "$HEAD_SHA" \
   --operator-approved --dry-run >"$TMP/out" 2>"$TMP/err"; then
   pass
 else
@@ -128,7 +128,7 @@ else
 fi
 
 FAKE_DEFAULT_BRANCH=main FAKE_BASE=release/2026-08 \
-  "$SCRIPT" --repo jinwon-int/ccc-node --pr 1 --expected-head "$HEAD_SHA" \
+  bash "$SCRIPT" --repo jinwon-int/ccc-node --pr 1 --expected-head "$HEAD_SHA" \
   --operator-approved --dry-run >"$TMP/out" 2>"$TMP/err" && rc=0 || rc=$?
 if [ "$rc" -ne 0 ] && grep -q 'base branch is not the repository default branch' "$TMP/err"; then
   pass

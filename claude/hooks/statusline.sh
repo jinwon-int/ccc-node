@@ -32,7 +32,7 @@ PCT="${PCT%%.*}"
 # The collector emits nothing and status-line rendering must never depend on it.
 USAGE_COLLECTOR="${CCC_STATUSLINE_USAGE_COLLECTOR:-$HOME/.claude/hooks/statusline-usage.py}"
 if [ -x "$USAGE_COLLECTOR" ]; then
-  printf '%s' "$input" | "$USAGE_COLLECTOR" >/dev/null 2>&1 || true
+  printf '%s' "$input" | python3 "$USAGE_COLLECTOR" >/dev/null 2>&1 || true
 fi
 
 # Node label: explicit env override -> state file -> short hostname.
