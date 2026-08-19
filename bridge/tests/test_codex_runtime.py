@@ -874,6 +874,33 @@ class CodexRuntimeTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(client.thread_start_calls, [])
         self.assertEqual(client.thread_resume_calls, [])
+
+    async def test_distill_snapshot_fails_closed_when_the_thread_is_unreadable(self) -> None:
+        """An unreadable thread must raise, not return an empty snapshot.
+
+        Returning a zero-byte snapshot made the snapshot worker mark the job
+        SNAPSHOT_DONE; the extractor then had no transcript to read and emitted
+        `honcho: []`, so the journal recorded a successful distill that stored
+        nothing. Every Codex extraction on seoseo and sogyo went that way for a
+        month (35/35 and 29/29 zero-byte) and no layer reported an error.
+        """
+
+        from telegram_bot.memory.distill_types import (
+            SnapshotUnavailableError,
+            TranscriptBounds,
+        )
+
+        client = self.clients[0]
+        # thread_reads has no entry for this id, so thread_read returns None.
+        with self.assertRaises(SnapshotUnavailableError):
+            await self.runtime.read_session_snapshot(
+                "thread-absent",
+                bounds=TranscriptBounds(),
+            )
+        self.assertEqual(
+            [call["thread_id"] for call in client.thread_read_calls],
+            ["thread-absent"],
+        )
         self.assertEqual(client.turn_start_calls, [])
 
     async def test_turn_maps_streamed_events_including_notifications_before_response(self) -> None:

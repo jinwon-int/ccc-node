@@ -16,6 +16,26 @@ _DISTILL_MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,127}$")
 DISTILL_PROVIDERS = frozenset({"claude", "codex", "piri"})
 
 
+class SnapshotUnavailableError(RuntimeError):
+    """The transcript a distill job names could not be located.
+
+    Snapshot readers must raise this instead of returning an empty snapshot.
+    A zero-byte transcript is indistinguishable from an empty conversation, so
+    returning one makes the snapshotter mark the job ``snapshot_done``, the
+    extractor emit no facts, and every layer report success while the session's
+    memory is discarded. That fail-open silently dropped 133 Codex sessions
+    across five nodes between 2026-07-18 and 2026-08-19 before anything
+    surfaced it.
+
+    Deliberately a ``RuntimeError`` and not a ``ValueError``: the snapshot
+    worker maps ``ValueError`` to a terminal ``invalid_snapshot_request`` and
+    everything else to a retryable failure. A transcript that is missing right
+    now is usually a restarted app-server or a session whose file has not been
+    flushed yet, so it deserves the retry; one that is genuinely gone still
+    terminalizes as ``max_attempts_exceeded`` and stays visible in the journal.
+    """
+
+
 class DistillTrigger(str, Enum):
     NEW_COMMAND = "new_command"
     PROVIDER_SWITCH = "provider_switch"

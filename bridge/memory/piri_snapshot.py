@@ -13,6 +13,7 @@ from typing import Any, Literal, Mapping
 
 from .distill_types import (
     CodexTranscriptSnapshot,
+    SnapshotUnavailableError,
     TranscriptBounds,
     TranscriptMessage,
 )
@@ -256,13 +257,12 @@ def read_piri_snapshot(
     thread_hash = hashlib.sha256(session_id.encode("utf-8")).hexdigest()
     path = _session_path(Path(session_dir), session_id)
     if path is None:
-        return CodexTranscriptSnapshot(
-            thread_hash=thread_hash,
-            last_turn_id=None,
-            messages=(),
-            byte_count=0,
-            truncated=False,
-            captured_at=captured.isoformat().replace("+00:00", "Z"),
+        # Same fail-open as the Codex reader had: an absent transcript must not
+        # be reported as an empty one, or the job completes having stored
+        # nothing. Not yet observed on a live Piri node (0/69 zero-byte
+        # snapshots as of 2026-08-19), but the defect is identical in kind.
+        raise SnapshotUnavailableError(
+            f"Piri session transcript is not readable for snapshot: {thread_hash}"
         )
 
     payload, metadata = _read_payload(path, session_id, bounds)

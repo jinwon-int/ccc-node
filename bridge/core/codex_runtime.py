@@ -60,6 +60,7 @@ from .working_state_archive import (
 )
 from telegram_bot.memory.distill_types import (
     CodexTranscriptSnapshot,
+    SnapshotUnavailableError,
     TranscriptBounds,
     TranscriptMessage,
 )
@@ -794,13 +795,13 @@ class CodexRuntime:
         thread = await self._client.thread_read(session_id, include_turns=True)
         thread_hash = hashlib.sha256(session_id.encode("utf-8")).hexdigest()
         if thread is None:
-            return CodexTranscriptSnapshot(
-                thread_hash=thread_hash,
-                last_turn_id=None,
-                messages=(),
-                byte_count=0,
-                truncated=False,
-                captured_at=self._format_snapshot_time(captured),
+            # Fail closed. Returning an empty snapshot here made the whole
+            # distill pipeline report success while discarding the session:
+            # snapshot_done -> extractor sees no transcript -> honcho: [] ->
+            # journal records a completed job with zero facts. The message
+            # carries only the hash, never the session id.
+            raise SnapshotUnavailableError(
+                f"Codex thread is not readable for snapshot: {thread_hash}"
             )
 
         newest_messages, last_turn_id, structural_truncation = (
