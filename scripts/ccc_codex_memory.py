@@ -44,6 +44,24 @@ GITHUB_POLICY_BLOCK = """## GitHub execution policy
 - Check `gh auth status` before an authenticated GitHub workflow when the
   current session has not already verified it.
 """
+# Working-state checkpoint policy (#1176). Claude nodes receive this directive
+# from the SessionStart tools cheatsheet and get the file re-injected by
+# checkpoint.sh; Codex/Piri sessions see only this materialized block, so the
+# directive lives here (outside the untrusted reference context, never
+# truncated) and the loader is asked for the file's current content below.
+WORKING_STATE_POLICY_VERSION = "working-state-checkpoint-v1"
+WORKING_STATE_POLICY_BLOCK = """## Working-state checkpoint policy
+
+- During multi-step or long-running work keep a checkpoint file updated with
+  three headings — objective / progress / next step — so a compacted or
+  resumed session can continue from it.
+- Path: `$CCC_STATE_DIR/working-state.md` when `CCC_STATE_DIR` is set in your
+  environment, otherwise `~/.claude/state/working-state.md`. Plain Markdown,
+  no secrets, no raw tool output; keep it under ~2 KiB.
+- Its current content is re-injected below under "Working-state checkpoint"
+  at session start and after every compaction; clear it to an idle note when
+  the task closes so a stale objective cannot steer a later session.
+"""
 SCHEMA_VERSION = "ccc.codex.memory.v1"
 METADATA_SCHEMA_VERSION = 1
 LOCK_NAME = ".ccc-codex-memory.lock"
@@ -54,6 +72,9 @@ MAX_EXISTING_BYTES = 1024 * 1024
 _HASH_RE = re.compile(r"^- snapshot-sha256: `([0-9a-f]{64})`$", re.MULTILINE)
 _TIME_RE = re.compile(r"^- materialized-at: `([^`]+)`$", re.MULTILINE)
 _GITHUB_POLICY_RE = re.compile(r"^- github-policy: `([^`]+)`$", re.MULTILINE)
+_WORKING_STATE_POLICY_RE = re.compile(
+    r"^- working-state-policy: `([^`]+)`$", re.MULTILINE
+)
 _EXIT_CODES = {
     "codex_audience_scoped_blocked": 70,
     "codex_lock_timeout": 20,
@@ -104,10 +125,13 @@ class MaterializeOptions:
             memory_max_bytes=_bounded_int(
                 env.get("CCC_CODEX_MEMORY_MAX_BYTES"), 8192, minimum=128, maximum=24576
             ),
+            # Floor covers the static header (markers, metadata, policy
+            # blocks — ~1.6 KiB after #1176) so a minimum budget is still
+            # satisfiable by a non-empty snapshot.
             agents_budget_bytes=_bounded_int(
                 env.get("CCC_CODEX_AGENTS_BUDGET_BYTES"),
                 24576,
-                minimum=1024,
+                minimum=2048,
                 maximum=32768,
             ),
             lock_timeout_seconds=_bounded_float(
@@ -188,6 +212,7 @@ class _ParsedBlock:
     snapshot_sha256: str | None
     materialized_at: str | None
     github_policy: str | None
+    working_state_policy: str | None
     snapshot: str | None
 
 
@@ -373,6 +398,7 @@ def parse_managed_block(text: str) -> _ParsedBlock | None:
     hash_match = _HASH_RE.search(block)
     time_match = _TIME_RE.search(block)
     github_policy_match = _GITHUB_POLICY_RE.search(block)
+    working_state_policy_match = _WORKING_STATE_POLICY_RE.search(block)
     snapshot: str | None = None
     delimiter_at = block.find(SNAPSHOT_DELIMITER)
     if delimiter_at >= 0:
@@ -384,6 +410,9 @@ def parse_managed_block(text: str) -> _ParsedBlock | None:
         snapshot_sha256=hash_match.group(1) if hash_match else None,
         materialized_at=time_match.group(1) if time_match else None,
         github_policy=github_policy_match.group(1) if github_policy_match else None,
+        working_state_policy=(
+            working_state_policy_match.group(1) if working_state_policy_match else None
+        ),
         snapshot=snapshot,
     )
 
@@ -407,8 +436,10 @@ def _render_block(snapshot: str, *, materialized_at: str) -> tuple[str, str]:
         f"- schema: `{SCHEMA_VERSION}`\n"
         f"- snapshot-sha256: `{digest}`\n"
         f"- materialized-at: `{materialized_at}`\n\n"
-        f"- github-policy: `{GITHUB_POLICY_VERSION}`\n\n"
+        f"- github-policy: `{GITHUB_POLICY_VERSION}`\n"
+        f"- working-state-policy: `{WORKING_STATE_POLICY_VERSION}`\n\n"
         f"{GITHUB_POLICY_BLOCK}\n"
+        f"{WORKING_STATE_POLICY_BLOCK}\n"
         f"{SNAPSHOT_DELIMITER}{snapshot}\n"
         f"{END_MARKER}"
     )
@@ -558,6 +589,7 @@ def materialize_snapshot(snapshot: str, options: MaterializeOptions) -> Material
             and parsed.snapshot is not None
             and parsed.snapshot_sha256 == digest
             and parsed.github_policy == GITHUB_POLICY_VERSION
+            and parsed.working_state_policy == WORKING_STATE_POLICY_VERSION
             and _snapshot_hash(parsed.snapshot) == digest
         )
         if existing_snapshot_matches:
@@ -658,6 +690,7 @@ def snapshot_status(options: MaterializeOptions) -> SnapshotStatus:
             or parsed.snapshot is None
             or parsed.snapshot_sha256 is None
             or parsed.github_policy != GITHUB_POLICY_VERSION
+            or parsed.working_state_policy != WORKING_STATE_POLICY_VERSION
         ):
             return SnapshotStatus(
                 status="missing",
@@ -946,9 +979,14 @@ def load_snapshot(options: MaterializeOptions) -> str:
         if loader.suffix == ".py"
         else ["bash", str(loader), "SessionStart"]
     )
+    # The loader's working-state block defaults OFF (Claude nodes get it from
+    # checkpoint.sh). This materializer is the only snapshot source for
+    # Codex/Piri, so ask for it here; an explicit operator value still wins.
+    loader_environ = dict(options.environ)
+    loader_environ.setdefault("CCC_MEMORY_INJECT_WORKING_STATE", "1")
     returncode, stdout = _run_loader_bounded(
         command,
-        environ=options.environ,
+        environ=loader_environ,
         timeout_seconds=options.loader_timeout_seconds,
     )
     if returncode != 0:

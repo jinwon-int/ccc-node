@@ -63,6 +63,15 @@ user that runs ccc-node.
   the interactive Piri turn still runs on its configured Kimi or GLM model.
 - Piri RPC 0.83 has no post-compaction hook. Read bootstrap and session-end
   writeback are supported, while post-compaction refresh remains degraded.
+  Capable builds (`set_append_system_prompt`, `compaction_end` events)
+  re-materialize and re-inject the snapshot after each compaction.
+- Working-state checkpoint (#1176): the materialized context carries the
+  working-state policy block, and the snapshot includes the current
+  `$CCC_STATE_DIR/working-state.md` under `## Working-state checkpoint`, so a
+  Piri session is told to keep the file and gets it back at session start and
+  on every `compaction_end` refresh — the Piri counterpart of Claude's
+  `checkpoint.sh` PreCompact/PostCompact pair. There is still no
+  pre-compaction snapshot copy or session-end archive on Piri.
 
 ## Telegram surface
 
