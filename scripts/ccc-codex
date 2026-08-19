@@ -11,10 +11,27 @@ if [ ! -f "$materializer" ] || [ ! -x "$materializer" ] || [ -L "$materializer" 
   exit 78
 fi
 
-if ! "$materializer" materialize --json >/dev/null 2>&1; then
+# Direct exec relies on the kernel resolving the materializer's
+# `#!/usr/bin/env python3` shebang. Android has no /usr/bin/env, so in a
+# context without libtermux-exec's LD_PRELOAD hook (the bridge's isolated
+# distill environment intentionally drops it) the exec fails with ENOENT and
+# every bootstrap exits 78 (fleet incident: daegyo codex distill, 165x exit 78
+# 2026-07-29..08-19). Retry through an explicit interpreter from PATH —
+# python3 ignores shebangs, so the same script runs unchanged.
+run_materializer() {
+  if "$materializer" "$@" >/dev/null 2>&1; then  # ccc:interpreter-ok: deliberate try-direct-first half of the #1183 try-then-interpreter-fallback; the ENOENT path below is the design, not silence
+    return 0
+  fi
+  local interpreter
+  interpreter="$(command -v python3 2>/dev/null || command -v python 2>/dev/null || true)"
+  [ -n "$interpreter" ] || return 1
+  "$interpreter" "$materializer" "$@" >/dev/null 2>&1
+}
+
+if ! run_materializer materialize --json; then
   # A refresh failure may proceed only when a previously materialized block is
   # still structurally valid and private. status is read-only and body-free.
-  if ! "$materializer" status --json >/dev/null 2>&1; then
+  if ! run_materializer status --json; then
     printf '%s\n' 'ccc-codex: memory bootstrap unavailable' >&2
     exit 78
   fi

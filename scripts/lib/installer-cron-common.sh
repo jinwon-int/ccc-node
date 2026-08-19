@@ -59,6 +59,31 @@ ccc_cron_strip_managed() {
   '
 }
 
+# ccc_cron_root_scope_warning <label> [euid] [root-home] [home-parent] —
+# warn when a crontab installer runs as root on a node whose harness lives
+# under a service account. #1079: install-nunchi.sh ran once as root on
+# gongmyoung, and the resulting root-crontab entries failed on every tick for
+# WEEKS — the real harness had moved to the gongmyoung account and nothing
+# could see root's crontab. The three installers sharing this lib resolve
+# every path from $HOME, so a root invocation writes a full second (dead)
+# install. Legit root nodes (a real /root/.claude harness) stay silent.
+# Warning-only, like the #1186 nunchi ghost warning — removal/scope choice
+# stays an operator decision. The euid/home args are test seams.
+ccc_cron_root_scope_warning() {
+  local label="$1" euid="${2:-$(id -u)}" root_home="${3:-/root}" home_parent="${4:-/home}"
+  [ "$euid" = 0 ] || return 0
+  [ -d "$root_home/.claude" ] && return 0
+  local d found=""
+  for d in "$home_parent"/*/.claude; do
+    [ -d "$d" ] || continue
+    found="$found ${d%/.claude}"
+  done
+  [ -n "$found" ] || return 0
+  echo "WARNING ($label): running as root but no $root_home/.claude — harness lives under:$found" >&2
+  echo "  entries would land in ROOT's crontab with /root paths (the #1079 ghost class);" >&2
+  echo "  re-run as the service account, e.g.: runuser -u <user> -- $0 $*" >&2
+}
+
 # ccc_cron_installer_finish — one driver for the shared install/remove flow.
 #
 #   --label TEXT         short lane name for messages ("memory-refresh")
@@ -116,6 +141,7 @@ ccc_cron_installer_finish() {
   fi
 
   ccc_cron_check_crontab "$crontab"
+  ccc_cron_root_scope_warning "$label"
 
   local current without_marker desired action
   current="$("$crontab" -l 2>/dev/null || true)"

@@ -58,7 +58,7 @@ export MOCK_SSH_MARKER="$TMP/ssh.called"
 export MOCK_REVIEW_MARKER="$TMP/review.called"
 export MOCK_GH_LOG="$TMP/gh.calls"
 
-if "$HELPER" jinwon-int/ccc-node 535 >"$TMP/no-approval.out" 2>&1; then
+if bash "$HELPER" jinwon-int/ccc-node 535 >"$TMP/no-approval.out" 2>&1; then
   bad "helper accepted a call without fresh explicit approval"
 elif [ -e "$MOCK_SSH_MARKER" ]; then
   bad "helper contacted Seoseo before checking approval"
@@ -66,7 +66,7 @@ else
   ok
 fi
 
-if CCC_EXPLICIT_USER_APPROVAL=1 "$HELPER" other-owner/repo 535 >"$TMP/bad-repo.out" 2>&1; then
+if CCC_EXPLICIT_USER_APPROVAL=1 bash "$HELPER" other-owner/repo 535 >"$TMP/bad-repo.out" 2>&1; then
   bad "helper accepted a repository outside jinwon-int"
 elif [ -e "$MOCK_SSH_MARKER" ]; then
   bad "helper contacted Seoseo before validating repository scope"
@@ -74,7 +74,7 @@ else
   ok
 fi
 
-if CCC_EXPLICIT_USER_APPROVAL=1 "$HELPER" jinwon-int/ccc-node 535 >"$TMP/success.out" 2>&1 \
+if CCC_EXPLICIT_USER_APPROVAL=1 bash "$HELPER" jinwon-int/ccc-node 535 >"$TMP/success.out" 2>&1 \
    && [ -e "$MOCK_SSH_MARKER" ] && [ -e "$MOCK_REVIEW_MARKER" ]; then
   ok
 else
@@ -88,7 +88,7 @@ fi
 
 rm -f "$MOCK_REVIEW_MARKER"
 if MOCK_ACTOR=seoseo-ai CCC_EXPLICIT_USER_APPROVAL=1 \
-   "$HELPER" jinwon-int/ccc-node 535 >"$TMP/wrong-actor.out" 2>&1; then
+   bash "$HELPER" jinwon-int/ccc-node 535 >"$TMP/wrong-actor.out" 2>&1; then
   bad "helper accepted a remote actor other than jinon86"
 elif [ -e "$MOCK_REVIEW_MARKER" ]; then
   bad "helper submitted a review before refusing the wrong actor"
@@ -98,7 +98,7 @@ fi
 
 rm -f "$MOCK_REVIEW_MARKER"
 if MOCK_AUTHOR=jinon86 CCC_EXPLICIT_USER_APPROVAL=1 \
-   "$HELPER" jinwon-int/ccc-node 535 >"$TMP/self-review.out" 2>&1; then
+   bash "$HELPER" jinwon-int/ccc-node 535 >"$TMP/self-review.out" 2>&1; then
   bad "helper allowed a self-review"
 elif [ -e "$MOCK_REVIEW_MARKER" ]; then
   bad "helper submitted a self-review before refusing"
@@ -108,7 +108,7 @@ fi
 
 rm -f "$MOCK_REVIEW_MARKER"
 if MOCK_REQUESTED=false CCC_EXPLICIT_USER_APPROVAL=1 \
-   "$HELPER" jinwon-int/ccc-node 535 >"$TMP/not-requested.out" 2>&1; then
+   bash "$HELPER" jinwon-int/ccc-node 535 >"$TMP/not-requested.out" 2>&1; then
   bad "helper approved without a jinon86 review request"
 elif [ -e "$MOCK_REVIEW_MARKER" ]; then
   bad "helper submitted an unrequested review before refusing"
@@ -122,7 +122,7 @@ fi
 # These two cases are what the earlier suite was missing.
 rm -f "$MOCK_REVIEW_MARKER"
 if MOCK_DEFAULT_BRANCH=master MOCK_BASE=master CCC_EXPLICIT_USER_APPROVAL=1 \
-   "$HELPER" jinwon-int/seoyoon-family-wiki 3304 >"$TMP/master-repo.out" 2>&1 \
+   bash "$HELPER" jinwon-int/seoyoon-family-wiki 3304 >"$TMP/master-repo.out" 2>&1 \
    && [ -e "$MOCK_REVIEW_MARKER" ]; then
   ok
 else
@@ -131,7 +131,7 @@ fi
 
 rm -f "$MOCK_REVIEW_MARKER"
 if MOCK_DEFAULT_BRANCH=main MOCK_BASE=release/2026-08 CCC_EXPLICIT_USER_APPROVAL=1 \
-   "$HELPER" jinwon-int/ccc-node 535 >"$TMP/wrong-base.out" 2>&1; then
+   bash "$HELPER" jinwon-int/ccc-node 535 >"$TMP/wrong-base.out" 2>&1; then
   bad "helper approved a PR whose base is not the default branch"
 elif [ -e "$MOCK_REVIEW_MARKER" ]; then
   bad "helper submitted a review before refusing a non-default base"

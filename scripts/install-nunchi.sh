@@ -315,6 +315,7 @@ status() {
   echo "hooks: $([ -f "$HOOKS/nunchi.py" ] && echo present || echo MISSING) ($HOOKS)"
   echo "codex_loader: $(if validate_codex_loader; then echo present; else echo MISSING/UNSAFE; fi)"
   echo "cron: $(grep -cF "$MARK" <<<"$cron" || true) line(s)"
+  echo "ghost_cron: $(_ghost_lines "$cron" | grep -c . || true) line(s) pointing at missing paths (#1079)"
   echo "db: $(ls -la "$NUNCHI_DIR/facts.db" 2>/dev/null | awk '{print $5" bytes"}' || echo none)"
 }
 
@@ -336,6 +337,73 @@ strip_cron() {  # remove managed and legacy hand-deploy nunchi lines
     > "$tmp" || true
   "$CRONTAB" "$tmp"
   rm -f "$tmp"
+}
+
+# Ghost marker detection (#1079): a managed cron line whose script/binary/dir
+# path no longer exists fails on every tick forever — the gongmyoung root
+# crontab ran 3 such ghosts for weeks after the harness moved to a service
+# account, because strip_cron only ever reaches the CALLER's crontab.
+# Detection is warning-only; removal stays an operator decision.
+_ghost_lines() {  # <cron-text> -> "lineno<TAB>missing-path" per missing path
+  python3 - "$1" <<'PY'
+import os
+import re
+import shlex
+import sys
+
+cron, mark = sys.argv[1], "# nunchi:#816"
+assign = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+for lineno, line in enumerate(cron.splitlines(), 1):
+    if mark not in line:
+        continue
+    fields = line.split(maxsplit=5)
+    if len(fields) != 6:
+        continue
+    cmd = fields[5].split(mark, 1)[0]
+    cmd = cmd.split(">>", 1)[0].split("2>&1", 1)[0]
+    try:
+        tokens = shlex.split(cmd.replace(r"\%", "%"))
+    except ValueError:
+        continue
+    for tok in tokens:
+        if assign.match(tok):
+            continue  # env prefix values (NUNCHI_DB=...) may not exist yet
+        if tok.startswith("/") or tok.endswith(".sh"):
+            if not os.path.exists(tok):
+                print(f"{lineno}\t{tok}")
+PY
+}
+
+warn_ghost_markers() {  # <context-label> — best-effort, never fails the action
+  local label="$1" cron ghosts
+  cron="$("$CRONTAB" -l 2>/dev/null || true)"
+  ghosts="$(_ghost_lines "$cron")"
+  if [ -n "$ghosts" ]; then
+    echo "WARNING ($label): managed nunchi cron line(s) point at missing paths (ghost entries — #1079):" >&2
+    echo "$ghosts" >&2
+    echo "  own-crontab ghosts are removed by --apply/--remove; otherwise: crontab -l | grep -vF '$MARK' | crontab -" >&2
+  fi
+  # Cross-account sweep (root only): other users' crontabs may hold ghosts
+  # this account cannot see — #1079 was root-vs-service-user on gongmyoung.
+  # Skipped under --target-user re-exec so the sweep runs once, at the top.
+  if [ "$(id -u)" = 0 ] && [ -z "${CCC_NUNCHI_TARGET_USER:-}" ] \
+     && command -v runuser >/dev/null 2>&1 && command -v getent >/dev/null 2>&1; then
+    local dir user ucrontab ughosts swept=0
+    for dir in /home/*; do
+      [ -d "$dir" ] || continue
+      user="${dir#/home/*}"
+      getent passwd "$user" >/dev/null 2>&1 || continue
+      swept=$((swept + 1)); [ "$swept" -gt 16 ] && break
+      ucrontab="$(runuser -u "$user" -- crontab -l 2>/dev/null || true)"
+      [ -n "$ucrontab" ] || continue
+      ughosts="$(_ghost_lines "$ucrontab")"
+      if [ -n "$ughosts" ]; then
+        echo "WARNING ($label): user '$user' has ghost nunchi cron line(s) (#1079):" >&2
+        echo "$ughosts" >&2
+        echo "  remove with: runuser -u $user -- sh -c 'crontab -l | grep -vF \"$MARK\" | crontab -'" >&2
+      fi
+    done
+  fi
 }
 
 cron_quote() {  # shell quote one argv value, then protect cron's special '%'
@@ -504,6 +572,7 @@ case "$ACTION" in
       refresh_ready=1
     fi
     retire_legacy
+    warn_ghost_markers apply  # ghosts in OUR crontab are removed by strip_cron below
     strip_cron
     write_mode on
     scoped_env=""
@@ -540,6 +609,7 @@ case "$ACTION" in
   remove)
     write_mode off
     strip_cron
+    warn_ghost_markers remove  # reports only cross-account residue at this point
     set_sessionstart_hook remove
     ccc_installer_record_remove "$STATE" "$NUNCHI_SELF_DIR/install-nunchi.sh" || true
     echo "nunchi disabled (code and ~/.nunchi DB kept)"

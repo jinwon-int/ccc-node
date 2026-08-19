@@ -126,7 +126,7 @@ printf 'via-explicit-interpreter'
 SH
 chmod +x "$TMP/badshebang-tool.sh"
 # the fixture really is unexec'able through its shebang on this host:
-"$TMP/badshebang-tool.sh" >/dev/null 2>&1; badshebang_rc=$?
+"$TMP/badshebang-tool.sh" >/dev/null 2>&1; badshebang_rc=$?  # ccc:interpreter-ok: deliberate bad-shebang exec to pin the unspawnable-tool path (#1159)
 out="$(python3 "$MOD" run-memory-search-bounded "$TMP/badshebang-tool.sh" q 5 3 "")"; rc=$?
 ok "bounded runner runs a tool whose shebang does not resolve (#1159)" \
   '[ "$badshebang_rc" != 0 ] && [ "$rc" = 0 ] && [ "$out" = "via-explicit-interpreter" ]'
