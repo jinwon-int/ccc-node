@@ -222,6 +222,27 @@ if command -v python3 >/dev/null 2>&1; then
   if python3 -m py_compile scripts/ccc-fleet-skills-sync.py 2>/dev/null; then say "  ok scripts/ccc-fleet-skills-sync.py compiles"; else err "py_compile: scripts/ccc-fleet-skills-sync.py"; fi
   if python3 -m py_compile scripts/ccc_memory_probe.py 2>/dev/null; then say "  ok scripts/ccc_memory_probe.py compiles"; else err "py_compile: scripts/ccc_memory_probe.py"; fi
   if python3 -m py_compile bridge/runtime_config_check.py 2>/dev/null; then say "  ok bridge/runtime_config_check.py compiles"; else err "py_compile: bridge/runtime_config_check.py"; fi
+  if python3 -m py_compile scripts/ccc_script_interpreter_check.py 2>/dev/null; then say "  ok scripts/ccc_script_interpreter_check.py compiles"; else err "py_compile: scripts/ccc_script_interpreter_check.py"; fi
+  if python3 -m py_compile scripts/ccc_script_interpreter_check_test.py 2>/dev/null; then say "  ok scripts/ccc_script_interpreter_check_test.py compiles"; else err "py_compile: scripts/ccc_script_interpreter_check_test.py"; fi
+else
+  say "  (python3 absent — skipped)"
+fi
+
+# 3c) interpreter-named invocation of repo scripts (#1160). Exec'ing a repo
+# .sh through its shebang silently dies on Termux (no /bin/bash, no /usr) and
+# five defects of that shape shipped silently (#472/#663/#1151/#1157/#1159),
+# each fixed individually. This static check fails CI on any NEW call site
+# that execs a repo script without naming an interpreter; override seams
+# (CCC_SCAN_INJECTION_BIN, CCC_BRIDGE_RESTART_SPAWN) and deliberate exceptions
+# (`# ccc:interpreter-ok: <reason>`) are honored. The repo baseline is clean.
+say "== interpreter-named script invocation =="
+if command -v python3 >/dev/null 2>&1; then
+  if python3 scripts/ccc_script_interpreter_check.py --repo-root . >"$TMP/interp-check.out" 2>&1; then
+    say "  ok repo script call sites name an interpreter or a declared seam"
+  else
+    err "interpreter-less repo script invocation(s) detected"
+    tail -10 "$TMP/interp-check.out"
+  fi
 else
   say "  (python3 absent — skipped)"
 fi
@@ -292,6 +313,7 @@ HARNESS_SUITES=(claude/hooks/observability.test.sh claude/hooks/security-scan.te
          claude/hooks/nunchi/nunchi.test.sh claude/hooks/nunchi/bench.test.sh \
          claude/hooks/nunchi/bridge-journal.test.sh claude/hooks/nunchi/codex-feed.test.sh \
          scripts/ccc-doctor.test.sh scripts/ccc-memory.test.sh scripts/ccc-codex-memory.test.sh scripts/ccc-codex.test.sh scripts/ccc-piri.test.sh piri/skills/web/web_tools.test.sh scripts/ccc-codex-github-policy.test.sh scripts/ccc-distill-check.test.sh scripts/ccc-distill-fleet-matrix.test.sh scripts/ccc-security-audit.test.sh \
+         scripts/ccc-script-interpreter-check.test.sh \
          scripts/ccc-fleet-matrix.test.sh scripts/ccc-wiki-triage.test.sh scripts/setup.test.sh \
          scripts/harness-paths.test.sh scripts/canonical-paths.test.sh \
          scripts/installer-gen-stamp.test.sh \
