@@ -28,11 +28,31 @@ jobs:
         # rather than erroring, so Retries alone never fires. Give each fetch a
         # 30 s timeout so a hang turns into a retry, and let the job timeout
         # above be the last line of defence.
+        #
+        # #1190: even with those fetch timeouts the step still hung twice more
+        # the same day (runs 32268948479 / 32272588603, both canceled at the
+        # 20-min job timeout with zero apt output) — the stall sits outside
+        # Acquire's coverage (dpkg/apt lock wait, pre-download resolver), so
+        # bound the INVOCATION itself: `timeout` turns the hang into a
+        # retryable failure, and the step cap keeps a fully wedged apt from
+        # eating the job budget.
+        timeout-minutes: 5
         env:
           APT_OPTS: -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30
         run: |
-          sudo apt-get $APT_OPTS update -qq
-          sudo apt-get $APT_OPTS install -y -qq jq shellcheck
+          rc=1
+          for attempt in 1 2 3; do
+            if timeout 90 sudo apt-get $APT_OPTS update -qq \
+              && timeout 90 sudo apt-get $APT_OPTS install -y -qq jq shellcheck; then
+              rc=0
+              break
+            fi
+            echo "apt attempt $attempt failed or timed out — retrying"
+            sleep 5
+          done
+          [ "$rc" = 0 ] || { echo "apt install failed after 3 attempts"; exit 1; }
+          jq --version
+          shellcheck --version | head -2
       - name: Validate harness (JSON, shell syntax, shellcheck, hook tests, frontmatter)
         env:
           TMPDIR: ${{ runner.temp }}/ccc-tmp
