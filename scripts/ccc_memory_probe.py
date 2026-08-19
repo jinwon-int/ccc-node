@@ -378,7 +378,14 @@ def mempalace_refresh_probe(path: Path, now: int) -> dict[str, object]:
     }
 
 
-_MANAGED_MARKER = re.compile(r"\s+# nunchi:#816\s*$")
+# Installer-rendered managed entries end with the `# nunchi:#816` marker plus,
+# since #1081/#1140, a content-stamped ` gen=h_<sha256:12>` suffix
+# (scripts/lib/installer-gen-stamp.sh). The probe only recognizes and strips
+# the trailer here; validating the stamp against the checkout is the
+# doctor/self-update gen-drift lane's job, so the suffix is accepted, not
+# compared. (#1174: the end-anchored pre-stamp form read every stamped entry
+# as unmanaged and falsely reported feed/refresh/bench-count degraded.)
+_MANAGED_MARKER = re.compile(r"\s+# nunchi:#816(?:\s+gen=h_[0-9a-f]{12})?\s*$")
 
 
 def cron_commands(cron: str, *, managed_only: bool) -> list[list[str]]:

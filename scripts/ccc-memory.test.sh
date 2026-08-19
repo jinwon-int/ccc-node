@@ -77,6 +77,22 @@ ok "memory check reports healthy nunchi and MemPalace scalars" '[ "$rc" = 0 ] &&
 '\'' >/dev/null <<<"$out"'
 ok "memory readiness JSON never exposes snapshot, fact or refresh bodies" '! grep -q "PROBE_SECRET_BODY\|PROBE_SECRET_FACT\|PROBE_SECRET_REFRESH" <<<"$out"'
 
+# #1174: since #1081/#1140 the installers render managed entries with a
+# ` gen=h_<hex12>` stamp suffix; the probe must still recognize and count
+# them (its marker regex used to be end-anchored at `# nunchi:#816`, which
+# read every stamped entry as unmanaged and falsely reported feed/refresh/
+# bench-count degraded on every bootstrapped node).
+stamped_probe_cron=$'*/10 * * * * bash /tmp/codex-feed.sh # nunchi:#816 gen=h_0123456789ab\n17 * * * * bash /tmp/mempalace-refresh.sh codex /tmp/sessions # nunchi:#816 gen=h_0123456789ab\n7 8 * * 1 bash /tmp/bench.sh # nunchi:#816 gen=h_0123456789ab'
+out="$(HOME="$probe_home" CCC_CLAUDE_DIR="$probe_claude" CCC_STATE_DIR="$probe_state" \
+  CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" \
+  CCC_MEMORY_CHECK_NOW_EPOCH=200 CCC_NUNCHI_MEMPALACE_REPAIR_STATUS_TEXT="$repair_ok" \
+  CCC_NUNCHI_CRONTAB_TEXT="$stamped_probe_cron" bash "$ROOT/scripts/ccc-memory-check.sh" --json 2>&1)"; rc=$?
+ok "memory check counts gen-stamped managed cron entries (#1174)" '[ "$rc" = 0 ] && jq -e '\''
+  .nunchi.status == "ok" and .nunchi.cron.feed == "codex"
+  and .nunchi.cron.feed_count == 1 and .nunchi.cron.managed_refresh_count == 1
+  and .nunchi.cron.bench_count == 1 and .nunchi.cron.legacy_sweep_count == 0
+'\'' >/dev/null <<<"$out"'
+
 audience_probe_root="$TMP/audience-probe"
 audience_private="$audience_probe_root/private-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 audience_shared="$audience_probe_root/shared"
@@ -128,6 +144,22 @@ out="$(HOME="$probe_home" CCC_CLAUDE_DIR="$probe_claude" CCC_STATE_DIR="$probe_s
   CCC_MEMORY_CHECK_NOW_EPOCH=200 CCC_NUNCHI_MEMPALACE_REPAIR_STATUS_TEXT="$repair_ok" \
   CCC_NUNCHI_CRONTAB_TEXT="$custom_path_cron" bash "$ROOT/scripts/ccc-memory-check.sh" --json 2>&1)"; rc=$?
 ok "memory check recovers custom DB and snapshot paths from managed cron" '[ "$rc" = 0 ] && jq -e '\''
+  .nunchi.status == "ok" and .nunchi.db.integrity == "ok" and .nunchi.db.facts == 1
+  and .nunchi.snapshot.primary_header == true
+'\'' >/dev/null <<<"$out"'
+mv "$probe_nunchi/facts.db.default" "$probe_nunchi/facts.db"
+mv "$probe_nunchi/snapshot.md.default" "$probe_nunchi/snapshot.md"
+
+stamped_custom_path_cron="*/10 * * * * NUNCHI_DB=$custom_nunchi_store/facts.db NUNCHI_SNAPSHOT=$custom_nunchi_store/snapshot.md bash /tmp/codex-feed.sh # nunchi:#816 gen=h_0123456789ab"
+stamped_custom_path_cron+=$'\n17 * * * * bash /tmp/mempalace-refresh.sh codex /tmp/sessions # nunchi:#816 gen=h_0123456789ab'
+stamped_custom_path_cron+=$'\n'"7 8 * * 1 NUNCHI_DB=$custom_nunchi_store/facts.db NUNCHI_SNAPSHOT=$custom_nunchi_store/snapshot.md bash /tmp/bench.sh # nunchi:#816 gen=h_0123456789ab"
+mv "$probe_nunchi/facts.db" "$probe_nunchi/facts.db.default"
+mv "$probe_nunchi/snapshot.md" "$probe_nunchi/snapshot.md.default"
+out="$(HOME="$probe_home" CCC_CLAUDE_DIR="$probe_claude" CCC_STATE_DIR="$probe_state" \
+  CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" \
+  CCC_MEMORY_CHECK_NOW_EPOCH=200 CCC_NUNCHI_MEMPALACE_REPAIR_STATUS_TEXT="$repair_ok" \
+  CCC_NUNCHI_CRONTAB_TEXT="$stamped_custom_path_cron" bash "$ROOT/scripts/ccc-memory-check.sh" --json 2>&1)"; rc=$?
+ok "memory check recovers custom paths from gen-stamped managed cron (#1174)" '[ "$rc" = 0 ] && jq -e '\''
   .nunchi.status == "ok" and .nunchi.db.integrity == "ok" and .nunchi.db.facts == 1
   and .nunchi.snapshot.primary_header == true
 '\'' >/dev/null <<<"$out"'
