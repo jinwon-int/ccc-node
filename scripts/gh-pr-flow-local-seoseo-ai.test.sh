@@ -50,10 +50,10 @@ export PATH="$TMP/bin:$PATH"
 export MOCK_REVIEW_MARKER="$TMP/review.called"
 export MOCK_GH_LOG="$TMP/gh.calls"
 
-run() { CCC_EXPLICIT_USER_APPROVAL=1 "$HELPER" "$@"; }
+run() { CCC_EXPLICIT_USER_APPROVAL=1 bash "$HELPER" "$@"; }
 
 # --- approval gate -----------------------------------------------------------
-if "$HELPER" jinwon-int/ccc-node 535 >"$TMP/no-approval.out" 2>&1; then
+if bash "$HELPER" jinwon-int/ccc-node 535 >"$TMP/no-approval.out" 2>&1; then
   bad "helper accepted a call without fresh explicit approval"
 elif [ -e "$MOCK_REVIEW_MARKER" ]; then
   bad "helper reviewed before checking approval"
