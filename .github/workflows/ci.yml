@@ -9,6 +9,8 @@ permissions:
   contents: read
 
 # Cancel superseded runs on the same ref (PR pushes); never cancel main builds.
+# Every job carries timeout-minutes: without it a runner stalled on a package
+# mirror blocks the PR for the 6h default (2026-08-19, run 32233059105).
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
@@ -17,10 +19,13 @@ jobs:
   validate-harness:
     name: validate-harness
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Install jq + shellcheck
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq jq shellcheck
+        # Acquire::Retries: a stalled Ubuntu mirror once held this step for 33 min
+        # (run 32233059105); the job timeout above bounds it, retries usually avoid it.
+        run: sudo apt-get -o Acquire::Retries=3 update -qq && sudo apt-get -o Acquire::Retries=3 install -y -qq jq shellcheck
       - name: Validate harness (JSON, shell syntax, shellcheck, hook tests, frontmatter)
         env:
           TMPDIR: ${{ runner.temp }}/ccc-tmp
@@ -31,6 +36,7 @@ jobs:
   python-lint:
     name: python-lint
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
@@ -61,6 +67,7 @@ jobs:
   secret-scan:
     name: secret-scan
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -79,6 +86,7 @@ jobs:
   bridge-tests:
     name: bridge-tests (${{ matrix.python-version }})
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -132,6 +140,7 @@ jobs:
   wheel-smoke:
     name: wheel-smoke
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
