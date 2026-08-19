@@ -134,6 +134,18 @@ class CodexMemoryMaterializerTest(unittest.TestCase):
             text.index(self.module.GITHUB_POLICY_BLOCK.strip()),
             text.index(self.module.SNAPSHOT_DELIMITER),
         )
+        # #1176: the working-state directive is a static header block like the
+        # GitHub policy — outside the untrusted reference context, never
+        # subject to snapshot truncation — and carries its own version marker.
+        self.assertIn(
+            f"- working-state-policy: `{self.module.WORKING_STATE_POLICY_VERSION}`",
+            text,
+        )
+        self.assertIn(self.module.WORKING_STATE_POLICY_BLOCK.strip(), text)
+        self.assertLess(
+            text.index(self.module.WORKING_STATE_POLICY_BLOCK.strip()),
+            text.index(self.module.SNAPSHOT_DELIMITER),
+        )
         self.assertIn("NODE_SECRET_SENTINEL", text)
         self.assertNotIn("NODE_SECRET_SENTINEL", meta_text)
         self.assertEqual(meta["snapshot_sha256"], result.snapshot_sha256)
@@ -220,7 +232,7 @@ class CodexMemoryMaterializerTest(unittest.TestCase):
         target = self.codex_home / "AGENTS.md"
         legacy = target.read_text(encoding="utf-8")
         legacy = legacy.replace(
-            f"- github-policy: `{self.module.GITHUB_POLICY_VERSION}`\n\n", ""
+            f"- github-policy: `{self.module.GITHUB_POLICY_VERSION}`\n", ""
         ).replace(f"{self.module.GITHUB_POLICY_BLOCK}\n", "")
         target.write_text(legacy, encoding="utf-8")
         target.chmod(0o600)
@@ -232,6 +244,35 @@ class CodexMemoryMaterializerTest(unittest.TestCase):
 
         self.assertEqual(result.status, "updated")
         self.assertIn(self.module.GITHUB_POLICY_BLOCK.strip(), refreshed)
+        self.assertEqual(refreshed.count(self.module.BEGIN_MARKER), 1)
+
+    def test_legacy_block_without_working_state_policy_is_not_reused(self) -> None:
+        # A block materialized before #1176 has the same snapshot hash but no
+        # working-state policy; the unchanged-snapshot fast path must not keep
+        # it, or fleet Piri/Codex nodes would never receive the directive.
+        options = self.options()
+        self.module.materialize_snapshot("same-snapshot", options)
+        target = self.codex_home / "AGENTS.md"
+        legacy = target.read_text(encoding="utf-8")
+        legacy = legacy.replace(
+            f"- working-state-policy: `{self.module.WORKING_STATE_POLICY_VERSION}`\n",
+            "",
+        ).replace(f"{self.module.WORKING_STATE_POLICY_BLOCK}\n", "")
+        self.assertNotIn(self.module.WORKING_STATE_POLICY_BLOCK.strip(), legacy)
+        target.write_text(legacy, encoding="utf-8")
+        target.chmod(0o600)
+
+        status = self.module.snapshot_status(options)
+        self.assertEqual(status.status, "missing")
+        result = self.module.materialize_snapshot("same-snapshot", options)
+        refreshed = target.read_text(encoding="utf-8")
+
+        self.assertEqual(result.status, "updated")
+        self.assertIn(self.module.WORKING_STATE_POLICY_BLOCK.strip(), refreshed)
+        self.assertIn(
+            f"- working-state-policy: `{self.module.WORKING_STATE_POLICY_VERSION}`",
+            refreshed,
+        )
         self.assertEqual(refreshed.count(self.module.BEGIN_MARKER), 1)
 
     def test_nonempty_override_is_active_and_empty_override_falls_back(self) -> None:
@@ -351,13 +392,13 @@ class CodexMemoryMaterializerTest(unittest.TestCase):
             "한글🙂" * 200,
             self.options(
                 CCC_CODEX_MEMORY_MAX_BYTES="129",
-                CCC_CODEX_AGENTS_BUDGET_BYTES="1024",
+                CCC_CODEX_AGENTS_BUDGET_BYTES="2048",
             ),
         )
         text = (self.codex_home / "AGENTS.md").read_text(encoding="utf-8")
         self.assertTrue(result.truncated)
         self.assertNotIn("�", text)
-        self.assertLessEqual(len(text.encode("utf-8")), 1024)
+        self.assertLessEqual(len(text.encode("utf-8")), 2048)
 
         target = self.codex_home / "AGENTS.md"
         target.write_text("u" * 1000, encoding="utf-8")
@@ -365,7 +406,7 @@ class CodexMemoryMaterializerTest(unittest.TestCase):
         before = target.read_bytes()
         with self.assertRaises(self.module.MaterializeError) as caught:
             self.module.materialize_snapshot(
-                "new", self.options(CCC_CODEX_AGENTS_BUDGET_BYTES="1024")
+                "new", self.options(CCC_CODEX_AGENTS_BUDGET_BYTES="2048")
             )
         self.assertEqual(caught.exception.code, "codex_budget_exhausted")
         self.assertEqual(target.read_bytes(), before)
@@ -499,6 +540,46 @@ class CodexMemoryMaterializerTest(unittest.TestCase):
         self.assertNotIn(sentinel, completed.stdout)
         self.assertNotIn(sentinel, completed.stderr)
         self.assertIn(sentinel, (self.codex_home / "AGENTS.md").read_text())
+
+    def test_loader_is_asked_for_working_state_unless_operator_overrides(self) -> None:
+        # #1176: the materializer is the only snapshot source for Codex/Piri,
+        # so it turns the loader's working-state block on; an explicit operator
+        # value in the environment must pass through untouched.
+        hooks = self.root / "hooks"
+        hooks.mkdir()
+        loader = hooks / "load-memory.sh"
+        loader.write_text(
+            "#!/usr/bin/env bash\n"
+            "printf '{\"hookSpecificOutput\":{\"additionalContext\":\"WS_FLAG=%s\"}}\n' "
+            "\"${CCC_MEMORY_INJECT_WORKING_STATE:-unset}\"\n",
+            encoding="utf-8",
+        )
+        loader.chmod(0o700)
+        for override, expected in ((None, "WS_FLAG=1"), ("0", "WS_FLAG=0")):
+            with self.subTest(override=override):
+                env = os.environ.copy()
+                env.pop("CCC_MEMORY_INJECT_WORKING_STATE", None)
+                env.update(
+                    {
+                        "HOME": str(self.home),
+                        "CODEX_HOME": str(self.codex_home),
+                        "CCC_CODEX_MEMORY_LOADER": str(loader),
+                        "CCC_MEMORY_NO_REFRESH": "1",
+                    }
+                )
+                if override is not None:
+                    env["CCC_MEMORY_INJECT_WORKING_STATE"] = override
+                completed = subprocess.run(
+                    [sys.executable, str(MODULE_PATH), "materialize", "--json"],
+                    env=env,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    timeout=10,
+                    check=False,
+                )
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                self.assertIn(expected, (self.codex_home / "AGENTS.md").read_text())
 
     def test_audience_scoped_env_requires_exact_keyring_backed_home(self) -> None:
         env = os.environ.copy()

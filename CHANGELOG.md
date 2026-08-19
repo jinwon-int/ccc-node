@@ -5,6 +5,19 @@ All notable changes to the Claude Code node harness. Dates are KST.
 ## [Unreleased]
 
 ### Added
+- Working-state checkpoint parity for Piri/Codex nodes (#1176). The
+  materialized memory block now carries a static working-state policy
+  (`working-state-policy: working-state-checkpoint-v1`) telling the session to
+  keep `$CCC_STATE_DIR/working-state.md` as objective / progress / next step,
+  and the materializer asks `load-memory.sh` (`CCC_MEMORY_INJECT_WORKING_STATE=1`)
+  to include the file's current content as `## Working-state checkpoint` right
+  after MEMORY+USER — bounded (`CCC_WORKING_STATE_MAX_BYTES`, default 2048),
+  scanned, stale-flagged (`CCC_CKPT_STALE_DAYS`), with the #1155
+  private-audience legacy fallback. Piri's `compaction_end` refresh therefore
+  re-injects the live task pointer the way `checkpoint.sh` does for Claude.
+  Claude SessionStart/PostCompact output is byte-identical (loader flag
+  defaults to 0; PostCompact never emits the block). The agents-file budget
+  floor rises 1024→2048 so the larger static header always fits.
 - Opt-in fleet skill intake now connects node-local autosave output to the
   private `jinwon-int/fleet-skills` review boundary without giving every node a
   GitHub write credential. Each daily node sweep reclassifies and rescans
