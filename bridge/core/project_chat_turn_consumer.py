@@ -148,6 +148,23 @@ async def _read_bounded_event(
     abort_stalled_turn: AsyncAction | None,
     interrupt_timeout_seconds: float,
 ) -> _BoundedRead:
+    if timeout_seconds <= 0:
+        # The bound already elapsed before this read was scheduled —
+        # _select_timeout clamps an overrun grace to max(0.0, ...) and on a
+        # busy loop that is exactly 0.0. EventStream.read rejects non-positive
+        # timeouts with a ValueError, which surfaced the expired bound as an
+        # unrelated "timeout_seconds must be positive" turn error instead of
+        # the stall path (observed as the 3.12-only CI flake in
+        # test_codex_approval_pending_uses_distinct_stall_bound, approval
+        # grace 0.05s on a loaded runner). An expired bound IS the timeout:
+        # take the same interrupt/abort path without scheduling a read.
+        await interrupt(timeout_outcome)
+        await reader.cancel_pending()
+        await _abort_stalled_owner(
+            abort_stalled_turn,
+            timeout_seconds=interrupt_timeout_seconds,
+        )
+        return _BoundedRead(event=None, timed_out=True)
     try:
         event = await reader.read(timeout_seconds)
     except EventWaitTimeout:
