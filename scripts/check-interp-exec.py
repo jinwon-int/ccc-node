@@ -71,6 +71,84 @@ _ESAC_RE = re.compile(r"esac\b")  # used with .match(line, p) after skip_ws
 _ARRAY_OPEN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(\[[^]]*\])?\+?=\(")
 
 
+class _Lexer:
+    """State machine for lex_segments — split out so each operator handler
+    stays small enough for the repo's C901 gate (#348)."""
+
+    def __init__(self, line: str):
+        self.line = line
+        self.n = len(line)
+        self.i = 0
+        self.segs: list[tuple[str, bool]] = []
+        self.cur: list[str] = []
+        self.quote = ""
+        self.depth = 0      # $( nesting
+        self.btick = False  # inside `...`
+        self.cmd_next = True
+
+    def flush(self, is_cmd: bool) -> None:
+        self.segs.append(("".join(self.cur), is_cmd))
+        self.cur = []
+
+    def lex_quoted(self) -> None:
+        c = self.line[self.i]
+        if c == "\\" and self.quote == '"' and self.i + 1 < self.n:
+            self.cur.append(self.line[self.i : self.i + 2])
+            self.i += 2
+            return
+        # $( and ` are live command substitutions even inside "..."
+        if self.quote == '"' and c == "$" and self.i + 1 < self.n and self.line[self.i + 1] == "(":
+            self.flush(self.cmd_next)
+            self.depth += 1
+            self.cmd_next = True
+            self.i += 2
+            return
+        if self.quote == '"' and c == "`":
+            self.flush(self.cmd_next)
+            self.btick = True
+            self.cmd_next = True
+            self.i += 1
+            return
+        self.cur.append(c)
+        if c == self.quote:
+            self.quote = ""
+        self.i += 1
+
+    def lex_backtick(self) -> None:
+        if self.btick:
+            self.flush(True)        # backtick contents were command position
+            self.btick = False
+            self.cmd_next = False   # resumes the surrounding token
+        else:
+            self.flush(self.cmd_next)
+            self.btick = True
+            self.cmd_next = True
+        self.i += 1
+
+    def lex_open_paren(self) -> None:
+        if self.cur and "".join(self.cur).rstrip().endswith("="):
+            self.cur.append("(")    # array assignment: =( ... )
+            self.i += 1
+            return
+        self.flush(self.cmd_next)
+        self.cmd_next = True        # subshell contents
+        self.i += 1
+
+    def lex_close_paren(self) -> None:
+        self.flush(self.cmd_next if self.depth == 0 else True)
+        if self.depth > 0:
+            self.depth -= 1
+            self.cmd_next = self.btick  # resumes outer token unless inside ``
+        else:
+            self.cmd_next = True        # case-body / post-subshell
+        self.i += 1
+
+    def lex_terminator(self, width: int) -> None:
+        self.flush(self.cmd_next)
+        self.cmd_next = True
+        self.i += width
+
+
 def lex_segments(line: str) -> list[tuple[str, bool]]:
     """Split a shell line into (text, is_command_start) segments.
 
@@ -81,107 +159,45 @@ def lex_segments(line: str) -> list[tuple[str, bool]]:
     kept literal (array assignment). Backslash-newline continuations are
     joined by the caller before this runs.
     """
-    segs: list[tuple[str, bool]] = []
-    cur: list[str] = []
-    i, n = 0, len(line)
-    quote = ""
-    depth = 0      # $( nesting
-    btick = False  # inside `...`
-    cmd_next = True
-
-    def flush(is_cmd: bool) -> None:
-        nonlocal cur
-        segs.append(("".join(cur), is_cmd))
-        cur = []
-
-    while i < n:
-        c = line[i]
-        if quote:
-            if c == "\\" and quote == '"' and i + 1 < n:
-                cur.append(line[i + 1])
-                i += 2
-                continue
-            # $( and ` are live command substitutions even inside "..."
-            if quote == '"' and c == "$" and i + 1 < n and line[i + 1] == "(":
-                flush(cmd_next)
-                depth += 1
-                cmd_next = True
-                i += 2
-                continue
-            if quote == '"' and c == "`":
-                flush(cmd_next)
-                btick = True
-                cmd_next = True
-                i += 1
-                continue
-            cur.append(c)
-            if c == quote:
-                quote = ""
-            i += 1
+    st = _Lexer(line)
+    while st.i < st.n:
+        c = st.line[st.i]
+        if st.quote:
+            st.lex_quoted()
             continue
         if c in "\"'":
-            quote = c
-            cur.append(c)
-            i += 1
+            st.quote = c
+            st.cur.append(c)
+            st.i += 1
             continue
-        if c == "\\" and i + 1 < n:
-            cur.append(line[i : i + 2])
-            i += 2
+        if c == "\\" and st.i + 1 < st.n:
+            st.cur.append(st.line[st.i : st.i + 2])
+            st.i += 2
             continue
         if c == "`":
-            if btick:
-                flush(True)       # backtick contents were command position
-                btick = False
-                cmd_next = False  # resumes the surrounding token
-            else:
-                flush(cmd_next)
-                btick = True
-                cmd_next = True
-            i += 1
+            st.lex_backtick()
             continue
-        if c == "$" and i + 1 < n and line[i + 1] == "(":
-            flush(cmd_next)
-            depth += 1
-            cmd_next = True
-            i += 2
+        if c == "$" and st.i + 1 < st.n and st.line[st.i + 1] == "(":
+            st.flush(st.cmd_next)
+            st.depth += 1
+            st.cmd_next = True
+            st.i += 2
             continue
         if c == "(":
-            if cur and "".join(cur).rstrip().endswith("="):
-                cur.append(c)     # array assignment: =( ... )
-                i += 1
-                continue
-            flush(cmd_next)
-            cmd_next = True       # subshell contents
-            i += 1
+            st.lex_open_paren()
             continue
         if c == ")":
-            flush(cmd_next if depth == 0 else True)
-            if depth > 0:
-                depth -= 1
-                cmd_next = btick   # resumes outer token unless inside ``
-            else:
-                cmd_next = True   # case-body / post-subshell
-            i += 1
+            st.lex_close_paren()
             continue
-        if c == ";":
-            flush(cmd_next)
-            cmd_next = True
-            i += 1
+        if c in ";&|":
+            nxt = st.line[st.i + 1] if st.i + 1 < st.n else ""
+            st.lex_terminator(2 if c != ";" and nxt in "&|" else 1)
             continue
-        if c == "&":
-            flush(cmd_next)
-            cmd_next = True
-            i += 2 if i + 1 < n and line[i + 1] == "&" else 1
-            continue
-        if c == "|":
-            flush(cmd_next)
-            cmd_next = True
-            i += 2 if i + 1 < n and line[i + 1] in "|&" else 1
-            continue
-        cur.append(c)
-        i += 1
-    flush(cmd_next)
-    return segs
+        st.cur.append(c)
+        st.i += 1
+    st.flush(st.cmd_next)
+    return st.segs
+
 
 
 def tokenize(seg: str) -> list[str]:
@@ -297,6 +313,47 @@ def scan_shell_line(line: str) -> bool:
     return False
 
 
+_IN_RE = re.compile(r"\bin\b")
+
+
+def _scan_pattern_end(line: str, pos: int) -> int:
+    """Index of the case-pattern-terminating ')' outside quotes, or -1."""
+    q = ""
+    for j in range(pos, len(line)):
+        c = line[j]
+        if q:
+            if c == q:
+                q = ""
+        elif c in "\"'":
+            q = c
+        elif c == ")":
+            return j
+    return -1
+
+
+def _scan_dsemi(line: str, pos: int) -> int:
+    """Index of the body-terminating ';;' / ';&' / ';;&' outside quotes, or -1.
+
+    A lone ';' is ordinary body syntax (`... ]; then`) and must NOT end the
+    body — treating it as a terminator cascades the whole case block into
+    mis-blanked "patterns".
+    """
+    q = ""
+    n = len(line)
+    j = pos
+    while j < n:
+        c = line[j]
+        if q:
+            if c == q:
+                q = ""
+        elif c in "\"'":
+            q = c
+        elif c == ";" and j + 1 < n and line[j + 1] in ";&":
+            return j
+        j += 1
+    return -1
+
+
 def _blank_case_regions(line: str, case_stack: list[str]) -> str:
     """Blank out case-pattern regions so their tokens are never judged.
 
@@ -321,63 +378,35 @@ def _blank_case_regions(line: str, case_stack: list[str]) -> str:
         guard += 1
         if not case_stack:
             m = _CASE_START_RE.search(line, pos)
-            if m:
-                case_stack.append("pre")
-                pos = m.end()
-                continue
-            return "".join(chars)
+            if not m:
+                return "".join(chars)
+            case_stack.append("pre")
+            pos = m.end()
+            continue
         top = case_stack[-1]
         if top == "pre":
-            m = re.compile(r"\bin\b").search(line, pos)
-            if m:
-                case_stack[-1] = "pattern"
-                pos = m.end()
-                continue
-            return "".join(chars)  # `in` on a later line; judge header normally
+            m = _IN_RE.search(line, pos)
+            if not m:
+                return "".join(chars)  # `in` on a later line; judge header normally
+            case_stack[-1] = "pattern"
+            pos = m.end()
+            continue
         if top == "pattern":
             p = skip_ws(pos)
             if _ESAC_RE.match(line, p):
                 case_stack.pop()
                 pos = p + 4
                 continue
-            # find the pattern-terminating ')' outside quotes
-            q = ""
-            j = pos
-            while j < n:
-                c = line[j]
-                if q:
-                    if c == q:
-                        q = ""
-                elif c in "\"'":
-                    q = c
-                elif c == ")":
-                    break
-                j += 1
-            blank(pos, j + 1 if j < n else n)
-            if j >= n:
+            j = _scan_pattern_end(line, pos)
+            blank(pos, j + 1 if j >= 0 else n)
+            if j < 0:
                 return "".join(chars)  # pattern continues on the next line
             case_stack[-1] = "body"
             pos = j + 1
             continue
-        # body zone: a ';;' / ';&' / ';;&' returns us to the pattern zone,
-        # while a nested `case` opens a new block. A lone ';' is ordinary
-        # body syntax (`... ]; then`) and must NOT switch zones — treating
-        # it as a terminator cascades the whole case block into mis-blanked
-        # "patterns". Whichever marker comes first wins.
-        q = ""
-        j = pos
-        dsemi = -1
-        while j < n:
-            c = line[j]
-            if q:
-                if c == q:
-                    q = ""
-            elif c in "\"'":
-                q = c
-            elif c == ";" and j + 1 < n and line[j + 1] in ";&":
-                dsemi = j
-                break
-            j += 1
+        # body zone: ';;' / ';&' returns to the pattern zone, a nested `case`
+        # opens a new block — whichever marker comes first wins.
+        dsemi = _scan_dsemi(line, pos)
         m = _CASE_START_RE.search(line, pos)
         if m and (dsemi < 0 or m.start() < dsemi):
             case_stack.append("pre")
