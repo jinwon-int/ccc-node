@@ -222,6 +222,25 @@ if command -v python3 >/dev/null 2>&1; then
   if python3 -m py_compile scripts/ccc-fleet-skills-sync.py 2>/dev/null; then say "  ok scripts/ccc-fleet-skills-sync.py compiles"; else err "py_compile: scripts/ccc-fleet-skills-sync.py"; fi
   if python3 -m py_compile scripts/ccc_memory_probe.py 2>/dev/null; then say "  ok scripts/ccc_memory_probe.py compiles"; else err "py_compile: scripts/ccc_memory_probe.py"; fi
   if python3 -m py_compile bridge/runtime_config_check.py 2>/dev/null; then say "  ok bridge/runtime_config_check.py compiles"; else err "py_compile: bridge/runtime_config_check.py"; fi
+  if python3 -m py_compile scripts/check-interp-exec.py 2>/dev/null; then say "  ok scripts/check-interp-exec.py compiles"; else err "py_compile: scripts/check-interp-exec.py"; fi
+else
+  say "  (python3 absent — skipped)"
+fi
+
+# 3c) interpreter-less .sh execution lint (#1160) — the shared root of
+# #472/#663/#1151/#1157/#1159: a repo .sh invoked without a named interpreter
+# dies silently on Termux (no /bin/bash, no /usr/bin/env) behind fail-open
+# branches. Every fix so far was individual; this gate fails CI on the NEXT
+# call site written the same way. Deliberate seams carry an inline
+# `interp-exec-ok: <reason>` waiver.
+say "== interp-exec lint =="
+if command -v python3 >/dev/null 2>&1; then
+  if python3 scripts/check-interp-exec.py >"$TMP/interp-exec.out" 2>&1; then
+    say "  ok no repo .sh executed without a named interpreter"
+  else
+    err "interpreter-less .sh execution sites found (#1160)"
+    tail -20 "$TMP/interp-exec.out"
+  fi
 else
   say "  (python3 absent — skipped)"
 fi
@@ -298,6 +317,7 @@ HARNESS_SUITES=(claude/hooks/observability.test.sh claude/hooks/security-scan.te
          scripts/agent-cron.test.sh scripts/agent-cron-lib.test.sh scripts/a2a-termux-native-worker.test.sh \
          scripts/a2a-termux-native-worker-health.test.sh \
          scripts/resource-pressure-guard.test.sh \
+         scripts/check-interp-exec.test.sh \
          scripts/install-memory-refresh-cron.test.sh scripts/install-nunchi.test.sh scripts/install-termux-mempalace.test.sh scripts/ccc-skill-autosave.test.sh \
          scripts/ccc-skill-promotion.test.sh \
          scripts/ccc-fleet-skills-sync.test.sh \

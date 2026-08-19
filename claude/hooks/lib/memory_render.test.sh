@@ -126,6 +126,7 @@ printf 'via-explicit-interpreter'
 SH
 chmod +x "$TMP/badshebang-tool.sh"
 # the fixture really is unexec'able through its shebang on this host:
+# interp-exec-ok: deliberate direct exec — asserts the shebang fails (rc!=0) before the bounded runner retries with a named interpreter (#1159)
 "$TMP/badshebang-tool.sh" >/dev/null 2>&1; badshebang_rc=$?
 out="$(python3 "$MOD" run-memory-search-bounded "$TMP/badshebang-tool.sh" q 5 3 "")"; rc=$?
 ok "bounded runner runs a tool whose shebang does not resolve (#1159)" \

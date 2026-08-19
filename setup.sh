@@ -505,11 +505,11 @@ run chmod +x "${installed_hook_scripts[@]}" "${hook_tree_targets[@]}"
 if [ "${CCC_SELF_UPDATE_REGISTER_CRON:-true}" != "false" ] && [ "$DRY" != 1 ] && [ -x "$SRC/scripts/agent-cron.sh" ]; then
   agent_cron_store="$CLAUDE_DIR/state/agent-cron/tasks.json"
   if CCC_AGENT_CRON_STORE="$agent_cron_store" \
-       "$SRC/scripts/agent-cron.sh" list --json 2>/dev/null \
+       bash "$SRC/scripts/agent-cron.sh" list --json 2>/dev/null \
        | jq -e 'any(.tasks[]?; .id == "self-update")' >/dev/null; then
     note "self-update agent-cron task already registered (id=self-update)"
   elif CCC_AGENT_CRON_STORE="$agent_cron_store" \
-       "$SRC/scripts/agent-cron.sh" add self-update \
+       bash "$SRC/scripts/agent-cron.sh" add self-update \
          --schedule "${CCC_SELF_UPDATE_CRON:-17 4,10,16,22 * * *}" \
          --prompt "Update the local ccc-node harness and restart only operator-allowlisted services." \
          --notify telegram-owner-on-failure \
