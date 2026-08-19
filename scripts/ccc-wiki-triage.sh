@@ -29,11 +29,36 @@ candidates_file = Path(candidates_path)
 decisions_file = Path(decisions_path)
 text = candidates_file.read_text(encoding="utf-8", errors="replace") if candidates_file.exists() else ""
 SECRET_LINE = re.compile(r"(?i)(token|secret|password|api[_-]?key|authorization|private[_-]?key|cookie|session)\s*[:=]|bearer\s+[A-Za-z0-9._-]+")
+# Labelled `keyword:`/`keyword=` shapes are only half the problem: a bare token
+# pasted without a label matched nothing and was printed verbatim by `show`.
+# These mirror the FW-03 redact pass in claude/hooks/distill/extract.sh so the
+# two stay consistent; keep them high-precision so ordinary wiki prose survives.
+SECRET_TOKEN = re.compile(
+    r"(ghp|gho|ghs|ghr|github_pat)_[A-Za-z0-9_]{20,}"
+    r"|sk-[A-Za-z0-9_-]{20,}"
+    r"|AKIA[A-Z0-9]{16}"
+    r"|xox[abprs]-[A-Za-z0-9-]{10,}"
+    r"|AIza[A-Za-z0-9_-]{35}"
+    r"|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]+"
+)
+# A PEM block leaks through line-at-a-time matching: only the BEGIN line looks
+# like a secret, while the base64 body carries the actual key material.
+PEM_BEGIN = re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----")
+PEM_END = re.compile(r"-----END [A-Z0-9 ]*PRIVATE KEY-----")
 
 def clean(body: str) -> str:
     lines=[]
+    in_pem=False
     for line in body.splitlines():
-        if SECRET_LINE.search(line):
+        if in_pem:
+            lines.append("[REDACTED_SENSITIVE_LINE]")
+            if PEM_END.search(line):
+                in_pem=False
+            continue
+        if PEM_BEGIN.search(line):
+            in_pem=not PEM_END.search(line)
+            lines.append("[REDACTED_SENSITIVE_LINE]")
+        elif SECRET_LINE.search(line) or SECRET_TOKEN.search(line):
             lines.append("[REDACTED_SENSITIVE_LINE]")
         else:
             lines.append(line)

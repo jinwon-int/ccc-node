@@ -497,5 +497,44 @@ ok "scan: fail-open output does not depend on the path" '[ "$fo_serial" = "$fo_p
 ok "scan: parallel lanes leave no scratch directory behind" \
   '[ "$(find "${TMPDIR:-/tmp}" -maxdepth 1 -name "ccc-mem-scan.*" 2>/dev/null | wc -l)" = 0 ]'
 
+# --- Skill index injection (#1145) ---
+skills="$TMP/skills"; mkdir -p "$skills/gh-pr-flow" "$skills/no-frontmatter"
+printf -- '---\nname: gh-pr-flow\ndescription: Ship code through the PR-first flow including REVIEW_REQUIRED cross-account review\n---\nbody\n' > "$skills/gh-pr-flow/SKILL.md"
+printf 'no frontmatter here\n' > "$skills/no-frontmatter/SKILL.md"
+out="$(HOME="$TMP/home" CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CCC_HOOK_DIR="$ROOT/claude/hooks" CCC_MEMORY_TOOLS_DIR="$tools" CCC_SKILLS_DIR="$skills" CCC_HONCHO_MEMORY_ENABLED=0 CCC_MEMORY_NO_REFRESH=1 bash "$ROOT/claude/hooks/load-memory.sh" SessionStart 2>&1)"; rc=$?
+ok "skill index injects name and description from frontmatter" \
+  '[ "$rc" = 0 ] && grep -q "Node skills index" <<<"$out" && grep -q "gh-pr-flow — Ship code through the PR-first flow" <<<"$out"'
+ok "skill without frontmatter is skipped, not misparsed" '! grep -q "no-frontmatter" <<<"$out"'
+big="$skills/zz-big"; mkdir -p "$big"
+printf -- '---\nname: zz-big\ndescription: %s\n---\n' "$(printf 'x%.0s' $(seq 1 3000))" > "$big/SKILL.md"
+out="$(HOME="$TMP/home" CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CCC_HOOK_DIR="$ROOT/claude/hooks" CCC_MEMORY_TOOLS_DIR="$tools" CCC_SKILLS_DIR="$skills" CCC_SKILL_INDEX_MAX_BYTES=200 CCC_HONCHO_MEMORY_ENABLED=0 CCC_MEMORY_NO_REFRESH=1 bash "$ROOT/claude/hooks/load-memory.sh" SessionStart 2>&1)"; rc=$?
+ok "over-budget index degrades to a complete names-only list, no silent tail-drop" \
+  '[ "$rc" = 0 ] && grep -q "names only" <<<"$out" && grep -q -- "- zz-big" <<<"$out" && grep -q -- "- gh-pr-flow" <<<"$out" && ! grep -q "$(printf "x%.0s" $(seq 1 500))" <<<"$out"'
+out="$(HOME="$TMP/home" CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CCC_HOOK_DIR="$ROOT/claude/hooks" CCC_MEMORY_TOOLS_DIR="$tools" CCC_SKILLS_DIR="$skills" CCC_SKILL_INDEX_ENABLED=0 CCC_HONCHO_MEMORY_ENABLED=0 CCC_MEMORY_NO_REFRESH=1 bash "$ROOT/claude/hooks/load-memory.sh" SessionStart 2>&1)"; rc=$?
+ok "skill index can be disabled" '[ "$rc" = 0 ] && ! grep -q "Node skills index" <<<"$out"'
+
+# --- #1157: load-memory runs the scanner through bash, not its shebang -------
+# CCC_HOOK_DIR resolves only scan-injection.sh, so a fake scanner whose shebang
+# cannot resolve stands in for Termux, where /usr/bin/env does not exist.
+# Exec'ing it dies with 126, the command substitution fails, and the fail-open
+# branch injects the block UNSCANNED — every session, with nothing logged. The
+# scanner's own suite could not catch this: it invokes `bash "$SCAN"`, which is
+# exactly the form the callers lacked.
+fake_hookdir="$TMP/fake-hookdir"; mkdir -p "$fake_hookdir"
+cat > "$fake_hookdir/scan-injection.sh" <<EOF
+#!$TMP/no-such-interpreter
+sed 's/SENTINELSECRET/[REDACTED:credential]/'
+EOF
+chmod +x "$fake_hookdir/scan-injection.sh"
+scan_mem="$TMP/scan-mem"; mkdir -p "$scan_mem"
+printf 'Node memory: SENTINELSECRET\n' > "$scan_mem/MEMORY.md"
+printf 'User memory: Korean concise\n' > "$scan_mem/USER.md"
+out="$(HOME="$TMP/home" CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" \
+  CCC_MEMORY_DIR="$scan_mem" CCC_HOOK_DIR="$fake_hookdir" CCC_MEMORY_TOOLS_DIR="$tools" \
+  CCC_HONCHO_MEMORY_ENABLED=0 CCC_MEMORY_NO_REFRESH=1 \
+  bash "$ROOT/claude/hooks/load-memory.sh" SessionStart 2>&1)"
+ok "load-memory scans blocks when the scanner shebang does not resolve" \
+  'grep -q "REDACTED:credential" <<<"$out" && ! grep -q "SENTINELSECRET" <<<"$out"'
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

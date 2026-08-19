@@ -112,7 +112,6 @@ class ContinuationQueue:
         return data
 
     def _write(self, data: Dict[str, Any]) -> None:
-        self._path.parent.mkdir(parents=True, exist_ok=True)
         payload = json.dumps(data, ensure_ascii=False, indent=1).encode("utf-8")
         try:
             previous = self._path.read_bytes() if self._path.exists() else None

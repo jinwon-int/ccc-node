@@ -32,7 +32,7 @@ fi
 [ -f "$FACTS_FILE" ] || { echo '{"ok":true,"skipped":"no-facts-file"}'; exit 0; }
 
 FACTS_FILE="$FACTS_FILE" SIM="$SIM" python3 - <<'PY' || { echo '{"ok":false,"error":"consolidate-failed"}'; exit 0; }
-import json, os, re, sys, tempfile
+import fcntl, json, os, re, sys, tempfile, time
 
 facts_file = os.environ["FACTS_FILE"]
 try:
@@ -62,6 +62,37 @@ def jaccard(a, b):
     if inter == 0:
         return 0.0
     return inter / len(a | b)
+
+# Serialize against the appenders before reading.  This pass is a read ->
+# cluster -> os.replace of the WHOLE file, so a distiller append landing inside
+# that window was overwritten and lost.  CodexLocalMemorySink holds this exact
+# lock across its own read-modify-write (bridge/memory/distill_local_sink.py),
+# and CodexMemoryPromoter coordinates on it too, so it is the file's canonical
+# mutex -- taking anything else would not actually exclude them.  Mode 0600 and
+# O_NOFOLLOW match the sink's lock validation; a differently-moded lock file
+# would make the sink fail closed.
+lock_path = os.path.join(os.path.dirname(facts_file) or ".", ".local-memory-sink.lock")
+lock_fd = None
+try:
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    lock_fd = os.open(lock_path, flags, 0o600)
+    os.fchmod(lock_fd, 0o600)
+    for attempt in range(5):
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except OSError:
+            if attempt == 4:
+                # Fail open, the file's whole contract: a writer is active, so
+                # skip this pass rather than block the background refresh.
+                print(json.dumps({"ok": True, "skipped": "locked"})); sys.exit(0)
+            time.sleep(0.2)
+except SystemExit:
+    raise
+except Exception:
+    print(json.dumps({"ok": False, "error": "lock-failed"})); sys.exit(0)
+# The fd is intentionally left open: the flock is released when this
+# short-lived process exits, which is exactly the window we must cover.
 
 lines = []
 try:

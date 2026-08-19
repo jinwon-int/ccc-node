@@ -269,7 +269,7 @@ class CapabilityRuntimeDriftTests(unittest.TestCase):
                 )
         self.assertIs(
             capability_status("piri", "memory_postcompact_reinject").state,
-            CapabilityState.DEGRADED,
+            CapabilityState.SUPPORTED,
         )
         self.assertTrue(hasattr(PiriRuntime, "read_session_snapshot"))
         self.assertTrue(

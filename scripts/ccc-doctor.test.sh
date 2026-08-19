@@ -178,6 +178,19 @@ ok "clean output reports 정상" 'grep -q "정상" <<<"$out"'
 ok "clean output reports standalone mode" 'grep -q "mode.*standalone" <<<"$out"'
 ok "clean output reports harness version" 'grep -q "harness version" <<<"$out"'
 
+# --- continuation state and opt-in visibility (#1113 follow-up) ---------------
+ct="$(make_fixture continuation-state standalone)"
+mkdir -p "$ct/home/.telegram_bot/continuation"
+chmod 775 "$ct/home/.telegram_bot/continuation"
+out="$(CCC_CONTINUATION_ENABLED=true run_doctor "$ct")"; rc=$?
+ok "continuation rejects a group-writable state directory under umask 0002" \
+  '[ "$rc" != 0 ] && grep -q "수동필요.*continuation state.*configured=enabled.*unsafe-mode-0775" <<<"$out"'
+
+chmod 700 "$ct/home/.telegram_bot/continuation"
+out="$(CCC_CONTINUATION_ENABLED=true run_doctor "$ct")"; rc=$?
+ok "continuation reports an enabled owner-only state directory" \
+  '[ "$rc" = 0 ] && grep -q "정상.*continuation state.*configured=enabled.*private-0700" <<<"$out"'
+
 # 2026-08-03 dungae regression: a legacy one-hour process timeout combined
 # with the new two-hour delegated-task default crash-looped the bridge, while
 # doctor called the status merely "readable" and offered no repair boundary.
@@ -767,6 +780,106 @@ ok "provider drift (configured codex, runtime claude) is a non-fatal 경고" \
 nc="$(run_nc codex "$codex_cron" "$deg_json" "" "/usr/bin:/bin")"
 ok "missing MemPalace CLI is a 경고 (peer-facts-only degrade), body-free" \
   'jq -e ".klass == \"경고\" and (.status | contains(\"mempalace=missing\"))" <<<"$nc" >/dev/null'
+
+# #1081: doctor surfaces installer-managed cron entries frozen at older code.
+# One row per known marker (absent = opt-in 정상; gen match = 정상; unstamped
+# or mismatched gen = non-fatal 경고) plus unmanaged-marker classification.
+# Driven through a Python helper (same pattern as nunchi-collection above)
+# against a minimal fixture repo carrying the real installers + gen-stamp lib.
+cdrepo="$TMP/cron-drift-repo"
+mkdir -p "$cdrepo/scripts/lib" "$cdrepo/.claude"
+cp "$ROOT/scripts/lib/installer-gen-stamp.sh" "$cdrepo/scripts/lib/"
+cp "$ROOT/scripts/lib/installer-cron-common.sh" "$cdrepo/scripts/lib/"
+for s in install-memory-refresh-cron install-pr-status-poll-cron install-skill-autosave-cron install-nunchi; do
+  cp "$ROOT/scripts/$s.sh" "$cdrepo/scripts/"
+done
+# shellcheck source=/dev/null
+. "$ROOT/scripts/lib/installer-gen-stamp.sh"
+gen_mr="$(ccc_installer_gen_stamp_auto "$cdrepo/scripts/install-memory-refresh-cron.sh")"
+gen_pp="$(ccc_installer_gen_stamp_auto "$cdrepo/scripts/install-pr-status-poll-cron.sh")"
+gen_sa="$(ccc_installer_gen_stamp_auto "$cdrepo/scripts/install-skill-autosave-cron.sh")"
+gen_nu="$(ccc_installer_gen_stamp_auto "$cdrepo/scripts/install-nunchi.sh")"
+cat > "$TMP/cron-drift.py" <<'PY_EOF'
+import json, os, sys
+from pathlib import Path
+sys.path.insert(0, str(Path(os.environ["DOCTOR_PY"]).resolve().parent))
+import ccc_doctor as mod
+repo = Path(os.environ["CD_REPO"])
+os.environ["CCC_CRONTAB_CMD"] = os.environ["CD_CRONTAB"]
+os.environ["CCC_TEST_CRONTAB_STORE"] = os.environ["CD_CRON_STORE"]
+store = Path(os.environ["CD_CRON_STORE"]); store.parent.mkdir(parents=True, exist_ok=True)
+store.write_text(os.environ.get("CD_CRON", ""))
+d = mod.Doctor(repo, repo / ".claude", "settings")
+d.check_cron_drift()
+print(json.dumps({
+    "exit": d.report_exit_code(),
+    "rows": [{"item": r.item, "klass": r.klass, "status": r.status, "action": r.action} for r in d.rows],
+}, ensure_ascii=False))
+PY_EOF
+run_cd() {  # <cron-text> [repo-dir]
+  CD_CRON="$1" CD_REPO="${2:-$cdrepo}" \
+  CD_CRONTAB="$nbin/crontab" CD_CRON_STORE="$TMP/cd-cron" \
+  DOCTOR_PY="$ROOT/scripts/ccc_doctor.py" \
+  python3 "$TMP/cron-drift.py" 2>/dev/null
+}
+
+cd_out="$(run_cd "")"
+ok "empty crontab: four opt-in rows, all 정상" \
+  'jq -e "[.rows[] | select(.klass != \"정상\")] | length == 0" <<<"$cd_out" >/dev/null && [ "$(jq ".rows | length" <<<"$cd_out")" = 4 ]'
+ok "empty crontab: rows are the four known markers" \
+  'jq -e "[.rows[].item] == [\"cron gen memory-refresh\", \"cron gen pr-status-poll\", \"cron gen skill-autosave\", \"cron gen nunchi\"]" <<<"$cd_out" >/dev/null'
+
+full_cron="# ccc-node:memory-refresh:begin
+*/30 * * * * bash -lc 'x' >> /l 2>&1  # ccc-node:memory-refresh gen=$gen_mr
+# ccc-node:memory-refresh:end
+# ccc-node:pr-status-poll:begin
+*/17 * * * * bash -lc 'x' >> /l 2>&1  # ccc-node:pr-status-poll gen=$gen_pp
+# ccc-node:pr-status-poll:end
+# ccc-node:autosave-schedule:begin
+CRON_TZ=Etc/UTC
+45 20 * * * bash -lc 'x' >> /l 2>&1  # ccc-node:skill-autosave gen=$gen_sa
+# ccc-node:autosave-schedule:end
+*/10 * * * * bash /h/ingest-cron.sh >> /l 2>&1 # nunchi:#816 gen=$gen_nu
+17 * * * * bash /h/mempalace-refresh.sh codex /s >> /l 2>&1 # nunchi:#816 gen=$gen_nu
+7 8 * * 1 bash /h/bench.sh >> /l 2>&1 # nunchi:#816 gen=$gen_nu"
+cd_out="$(run_cd "$full_cron")"
+ok "all-stamped current entries: four 정상 rows" \
+  'jq -e "[.rows[] | select(.klass != \"정상\")] | length == 0" <<<"$cd_out" >/dev/null'
+ok "nunchi row reports all three lines current" \
+  'jq -e ".rows[] | select(.item == \"cron gen nunchi\") | .status | contains(\"lines=3\")" <<<"$cd_out" >/dev/null'
+ok "block-wrapped lanes count entries only, not BEGIN/END markers" \
+  'jq -e ".rows[] | select(.item == \"cron gen memory-refresh\") | .status | contains(\"lines=1\")" <<<"$cd_out" >/dev/null'
+ok "BEGIN/END block markers are not misread as unmanaged" \
+  '! jq -e ".rows[] | select(.item == \"cron unmanaged markers\")" <<<"$cd_out" >/dev/null'
+
+cd_out="$(run_cd "*/30 * * * * bash -lc 'x' >> /l 2>&1  # ccc-node:memory-refresh gen=h_000000000000")"
+ok "stale gen stamp is a non-fatal 경고 naming both stamps" \
+  'jq -e ".rows[] | select(.item == \"cron gen memory-refresh\" and .klass == \"경고\") | .status | contains(\"gen=h_000000000000 != current gen=$gen_mr\")" <<<"$cd_out" >/dev/null'
+ok "stale gen action points at the rendering installer" \
+  'jq -e ".rows[] | select(.item == \"cron gen memory-refresh\") | .action | contains(\"install-memory-refresh-cron.sh --apply\")" <<<"$cd_out" >/dev/null'
+ok "drift 경고 never flips the doctor exit code" \
+  'jq -e ".exit == 0" <<<"$cd_out" >/dev/null'
+
+cd_out="$(run_cd "*/10 * * * * bash /h/piri-feed.sh >> /l 2>&1 # nunchi:#816
+17 * * * * bash /h/mempalace-refresh.sh piri /s >> /l 2>&1 # nunchi:#816 gen=$gen_nu")"
+ok "mixed stamped+unstamped nunchi lines are 경고 unstamped" \
+  'jq -e ".rows[] | select(.item == \"cron gen nunchi\" and .klass == \"경고\") | .status | contains(\"unstamped pre-#1081\")" <<<"$cd_out" >/dev/null'
+
+cd_out="$(run_cd "45 4,5 * * * bash -lc 'x' >> /l 2>&1  # ccc-node:self-update
+30 4 * * * /x/ccc-live-backups-rotate.sh >/dev/null 2>&1  # ccc-node:live-backups-rotate")"
+ok "documented hand-installed markers are 정상 with labels" \
+  'jq -e ".rows[] | select(.item == \"cron unmanaged markers\" and .klass == \"정상\") | .status | contains(\"ccc-node:self-update\") and contains(\"live-backups-rotate\")" <<<"$cd_out" >/dev/null'
+cd_out="$(run_cd "*/5 * * * * bash /x/ghost.sh  # ccc-node:ghost-lane")"
+ok "unknown unmanaged marker is a 경고 with the label" \
+  'jq -e ".rows[] | select(.item == \"cron unmanaged markers\" and .klass == \"경고\") | .status | contains(\"ccc-node:ghost-lane\")" <<<"$cd_out" >/dev/null'
+
+nolbrepo="$TMP/cron-drift-nolib"
+mkdir -p "$nolbrepo/scripts" "$nolbrepo/.claude"
+cp "$ROOT/scripts/install-memory-refresh-cron.sh" "$nolbrepo/scripts/"
+cd_out="$(run_cd "*/30 * * * * bash -lc 'x' >> /l 2>&1  # ccc-node:memory-refresh gen=$gen_mr" "$nolbrepo")"
+ok "incomplete checkout (lib missing) is a 경고, not a silent pass" \
+  'jq -e ".rows[] | select(.item == \"cron gen memory-refresh\" and .klass == \"경고\") | .status | contains(\"cannot recompute current stamp\")" <<<"$cd_out" >/dev/null'
+
 
 # Static backstop: a new probe added later must not reintroduce bare-exec.
 ok "no repo script is subprocess-exec'd without an explicit interpreter" \

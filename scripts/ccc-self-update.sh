@@ -20,16 +20,24 @@
 #      0 = healthy. With both files present, an up-to-date tick that finds the
 #      runtime DOWN attempts one recovery restart — so the second daily slot
 #      can recover an updated-but-down node (#971).)
+#   ~/.claude/self-update.no-reapply (optional: operator kill-switch; when this
+#      file exists, installer-managed cron is never rewritten. Env override:
+#      CCC_SELF_UPDATE_REAPPLY=0. Agent must not write the file.)
 #
 # Procedure (run):
 #   1. take a lock; resolve the repo (env > repo file > script location > ~/ccc-node)
 #   2. preconditions: .git present, clean working tree, on the expected branch
 #   3. git fetch + merge --ff-only (never rewrites local history)
-#   4. if HEAD changed (or --force): snapshot Claude + Hermes managed artifacts,
-#      run ./setup.sh, validate bridge runtime config when its service is
-#      allowlisted, then verify repo SHA and artifact rollback on failure
-#   5. restart each allowlisted service and verify it is active again
-#   6. append a JSONL audit record and queue an owner Telegram notification
+#   4. if HEAD changed (or --force): snapshot Claude + Hermes managed artifacts
+#      and the Codex GitHub policy config, run ./setup.sh, validate bridge
+#      runtime config when its service is allowlisted, then verify repo SHA
+#      and artifact rollback on failure
+#   5. if any install record's gen stamp drifted: snapshot crontab, replay
+#      the recorded argv, verify the new gen; on failure restore crontab and
+#      abort (exit 12). Kill-switch: self-update.no-reapply or
+#      CCC_SELF_UPDATE_REAPPLY=0. Only runs when HEAD changed (or --force).
+#   6. restart each allowlisted service and verify it is active again
+#   7. append a JSONL audit record and queue an owner Telegram notification
 #      (spool only — this script never touches the bot token)
 #
 # Modes: run [--force] | status
@@ -47,11 +55,13 @@
 # Exit: 0 = up-to-date or updated cleanly; 7 = a restart (allowlisted service
 #      or external restart-cmd) or a recovery attempt failed; 8 = deferred
 #      (bridge busy); 11 = degraded (code updated but nothing restarted and no
-#      restart-cmd configured); other non-zero = aborted (reason logged).
+#      restart-cmd configured); 12 = installer re-apply failed (crontab was
+#      restored); other non-zero = aborted (reason logged).
 set -uo pipefail
 
 CLAUDE_DIR="${CCC_CLAUDE_DIR:-${HOME:-/root}/.claude}"
 HERMES_ROOT="${CCC_HERMES_DIR:-${HOME:-/root}/.hermes}"
+CODEX_DIR="${CODEX_HOME:-${HOME:-/root}/.codex}"
 STATE_DIR="${CCC_STATE_DIR:-$CLAUDE_DIR/state}"
 LOG="$STATE_DIR/self-update.log"
 LOCK="$STATE_DIR/self-update.lock"
@@ -78,6 +88,7 @@ mkdir -p "$STATE_DIR" 2>/dev/null
 INSTALL_SNAPSHOT_DIR=""
 CLAUDE_SNAPSHOT=""
 HERMES_SNAPSHOT=""
+CODEX_SNAPSHOT=""
 KEEP_INSTALL_SNAPSHOT=0
 
 ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
@@ -169,6 +180,7 @@ snapshot_installed_artifacts() {
   chmod 700 "$INSTALL_SNAPSHOT_DIR" || return 1
   CLAUDE_SNAPSHOT="$INSTALL_SNAPSHOT_DIR/claude.tar.gz"
   HERMES_SNAPSHOT="$INSTALL_SNAPSHOT_DIR/hermes.tar.gz"
+  CODEX_SNAPSHOT="$INSTALL_SNAPSHOT_DIR/codex.tar.gz"
   for item in "${CCC_MANAGED_PATHS[@]}"; do
     { [ -e "$CLAUDE_DIR/$item" ] || [ -L "$CLAUDE_DIR/$item" ]; } && existing+=("$item")
   done
@@ -185,15 +197,21 @@ snapshot_installed_artifacts() {
   chmod 600 "$CLAUDE_SNAPSHOT" "$HERMES_SNAPSHOT" || return 1
   tar -tzf "$CLAUDE_SNAPSHOT" >/dev/null || return 1
   tar -tzf "$HERMES_SNAPSHOT" >/dev/null || return 1
-  python3 - "$CLAUDE_SNAPSHOT" "$HERMES_SNAPSHOT" "${CCC_MANAGED_PATHS[*]}" <<'PY' || return 1
+  # The Codex GitHub policy state lives outside $CLAUDE_DIR and setup.sh
+  # replaces config.toml with no backup of its own (#1131); capture it so a
+  # rollback does not strand the new policy while claiming a full restore.
+  ccc_snapshot_codex_policy_state "$CODEX_DIR" "$INSTALL_SNAPSHOT_DIR" || return 1
+  chmod 600 "$CODEX_SNAPSHOT" || return 1
+  python3 - "$CLAUDE_SNAPSHOT" "$HERMES_SNAPSHOT" "$CODEX_SNAPSHOT" "${CCC_MANAGED_PATHS[*]}" <<'PY' || return 1
 import pathlib
 import sys
 import tarfile
 
-claude_archive, hermes_archive, allowed_text = sys.argv[1:]
+claude_archive, hermes_archive, codex_archive, allowed_text = sys.argv[1:]
 for archive, allowed in (
     (claude_archive, set(allowed_text.split())),
     (hermes_archive, {"honcho.json"}),
+    (codex_archive, {"config.toml"}),
 ):
     with tarfile.open(archive, "r:gz") as tf:
         for member in tf.getmembers():
@@ -214,6 +232,7 @@ restore_installed_artifacts() {
   tar -xzf "$CLAUDE_SNAPSHOT" -C "$CLAUDE_DIR" || failed=1
   rm -f -- "$HERMES_ROOT/honcho.json" || failed=1
   tar -xzf "$HERMES_SNAPSHOT" -C "$HERMES_ROOT" || failed=1
+  ccc_restore_codex_policy_state "$CODEX_DIR" "$INSTALL_SNAPSHOT_DIR" || failed=1
   [ "$failed" = 0 ]
 }
 
@@ -474,8 +493,8 @@ if ! (cd "$REPO" && bash setup.sh >>"$LOG" 2>&1); then
   restore_installed_artifacts || ARTIFACT_ROLLBACK_OK=false
   if [ "$REPO_ROLLBACK_OK" = true ] && [ "$ARTIFACT_ROLLBACK_OK" = true ]; then
     audit "setup-failed-rolled-back" "$OLD_SHA" "$NEW_SHA" "$CHANGED" false '[]'
-    notify "self-update 실패: setup.sh 오류 — repo와 설치본을 ${OLD_SHA:0:7} 상태로 롤백했습니다. 로그: ~/.claude/state/self-update.log" "fail-$NEW_SHA"
-    say "self-update: setup.sh failed; rolled back repo and installed artifacts to ${OLD_SHA:0:7}" >&2
+    notify "self-update 실패: setup.sh 오류 — repo와 설치본(Claude 하네스·honcho.json·Codex GitHub 정책 설정)을 ${OLD_SHA:0:7} 상태로 롤백했습니다. 로그: ~/.claude/state/self-update.log" "fail-$NEW_SHA"
+    say "self-update: setup.sh failed; rolled back repo and installed artifacts (Claude harness, honcho.json, Codex GitHub policy config) to ${OLD_SHA:0:7}" >&2
     exit 6
   fi
   audit "setup-failed-rollback-degraded" "$OLD_SHA" "$NEW_SHA" "$CHANGED" false '[]'
@@ -493,7 +512,7 @@ if bridge_service_allowlisted && ! bridge_runtime_config_preflight; then
   restore_installed_artifacts || ARTIFACT_ROLLBACK_OK=false
   if [ "$REPO_ROLLBACK_OK" = true ] && [ "$ARTIFACT_ROLLBACK_OK" = true ]; then
     audit "bridge-config-preflight-failed-rolled-back" "$OLD_SHA" "$NEW_SHA" "$CHANGED" false '[]'
-    notify "self-update 실패: bridge runtime config preflight 오류 — repo와 설치본을 ${OLD_SHA:0:7} 상태로 롤백했습니다. 로그: ~/.claude/state/self-update.log" "bridge-config-fail-$NEW_SHA"
+    notify "self-update 실패: bridge runtime config preflight 오류 — repo와 설치본(Claude 하네스·honcho.json·Codex GitHub 정책 설정)을 ${OLD_SHA:0:7} 상태로 롤백했습니다. 로그: ~/.claude/state/self-update.log" "bridge-config-fail-$NEW_SHA"
     say "self-update: bridge runtime config preflight failed; rolled back before service restart" >&2
     exit 6
   fi
@@ -509,6 +528,74 @@ fi
 # material is needed, and deleting it here left that path with nothing to
 # restore from. It is removed once the restarts have succeeded (below), so the
 # success path keeps its no-residue behavior.
+
+# --- installer re-apply (cron drift repair, #1081 phase 2) --------------------
+# Runs only on a changed (or --force) tick: an up-to-date node has the same
+# installer bytes it last applied, so gen cannot drift. Doctor still surfaces
+# unstamped/legacy entries on every run; the next code change repairs them.
+REAPPLY_COUNT=0
+REAPPLY_NOTE=""
+CRONTAB_CMD="${CCC_SELF_UPDATE_CRONTAB_CMD:-crontab}"
+NO_REAPPLY_FILE="$CLAUDE_DIR/self-update.no-reapply"
+CRONTAB_SNAP=""
+reapply_skip() { log "reapply skipped reason=$1"; }
+if [ "${CCC_SELF_UPDATE_REAPPLY:-1}" = "0" ]; then
+  reapply_skip env-disabled
+elif [ -f "$NO_REAPPLY_FILE" ]; then
+  reapply_skip operator-file
+elif ! command -v "${CRONTAB_CMD%% *}" >/dev/null 2>&1; then
+  reapply_skip no-crontab
+elif [ ! -r "$REPO/scripts/lib/installer-gen-stamp.sh" ]; then
+  reapply_skip lib-missing
+else
+  # shellcheck source=/dev/null
+  . "$REPO/scripts/lib/installer-gen-stamp.sh"
+  for rec in "$STATE_DIR"/install-*.json; do
+    [ -f "$rec" ] || continue
+    installer="$(jq -r '.installer // empty' "$rec" 2>/dev/null)" || installer=""
+    marker="$(jq -r '.marker // empty' "$rec" 2>/dev/null)" || marker=""
+    old_gen="$(jq -r '.gen // empty' "$rec" 2>/dev/null)" || old_gen=""
+    schema="$(jq -r '.schema // empty' "$rec" 2>/dev/null)" || schema=""
+    case "$schema" in ccc.install-record.v1) ;; *) log "reapply skip reason=bad-schema path=$rec"; continue ;; esac
+    case "$installer" in
+      scripts/install-[A-Za-z0-9._-]*\.sh) ;;
+      *) log "reapply skip reason=bad-installer installer=$installer"; continue ;;
+    esac
+    [ -n "$marker" ] && [ -n "$old_gen" ] && [ -f "$REPO/$installer" ] || {
+      log "reapply skip reason=incomplete-record path=$rec"
+      continue
+    }
+    current="$(ccc_installer_gen_stamp_auto "$REPO/$installer" 2>/dev/null)" || current=""
+    [ -n "$current" ] || { log "reapply skip reason=stamp-failed installer=$installer"; continue; }
+    if [ "$current" = "$old_gen" ]; then
+      log "reapply skip reason=current installer=$installer gen=$current"
+      continue
+    fi
+    if [ -z "$CRONTAB_SNAP" ]; then
+      CRONTAB_SNAP="$INSTALL_SNAPSHOT_DIR/crontab.before-reapply"
+      "$CRONTAB_CMD" -l >"$CRONTAB_SNAP" 2>/dev/null || : >"$CRONTAB_SNAP"
+    fi
+    mapfile -t rec_argv < <(jq -r '.argv[]' "$rec" 2>/dev/null) || rec_argv=()
+    log "reapply begin installer=$installer old=$old_gen new=$current"
+    if ! CCC_CRONTAB_CMD="$CRONTAB_CMD" bash "$REPO/$installer" "${rec_argv[@]}" >>"$LOG" 2>&1; then
+      "$CRONTAB_CMD" "$CRONTAB_SNAP" >>"$LOG" 2>&1 || true
+      audit "reapply-failed" "$OLD_SHA" "$NEW_SHA" "$CHANGED" "$SETUP_OK" '[]'
+      notify "self-update $(git -C "$REPO" rev-parse --short HEAD): cron 재적용 실패 ($installer) — crontab 복원됨. ~/.claude/state/self-update.log" "reapply-fail-$NEW_SHA"
+      say "self-update: installer re-apply failed ($installer); crontab restored" >&2
+      exit 12
+    fi
+    if ! "$CRONTAB_CMD" -l 2>/dev/null | grep -F "$marker" | grep -qF "gen=$current"; then
+      "$CRONTAB_CMD" "$CRONTAB_SNAP" >>"$LOG" 2>&1 || true
+      audit "reapply-verify-failed" "$OLD_SHA" "$NEW_SHA" "$CHANGED" "$SETUP_OK" '[]'
+      notify "self-update $(git -C "$REPO" rev-parse --short HEAD): cron 재적용 검증 실패 ($installer) — crontab 복원됨. ~/.claude/state/self-update.log" "reapply-verify-$NEW_SHA"
+      say "self-update: installer re-apply did not stamp $marker with $current; crontab restored" >&2
+      exit 12
+    fi
+    REAPPLY_COUNT=$((REAPPLY_COUNT + 1))
+    log "reapply ok installer=$installer old=$old_gen new=$current"
+  done
+  [ "$REAPPLY_COUNT" -gt 0 ] && REAPPLY_NOTE=", cron 재적용 ${REAPPLY_COUNT}건"
+fi
 
 # --- restart allowlisted services ----------------------------------------------
 SERVICES_JSON='[]'
@@ -612,7 +699,7 @@ INSTALL_SNAPSHOT_DIR=""
 
 audit "ok" "$OLD_SHA" "$NEW_SHA" "$CHANGED" "$SETUP_OK" "$SERVICES_JSON"
 if [ "$CHANGED" = "true" ]; then
-  notify "self-update 완료: ${OLD_SHA:0:7} → ${SHORT_NEW}, 서비스 ${RESTARTED}개 재시작." "ok-$NEW_SHA"
+  notify "self-update 완료: ${OLD_SHA:0:7} → ${SHORT_NEW}, 서비스 ${RESTARTED}개 재시작${REAPPLY_NOTE}." "ok-$NEW_SHA"
 fi
-say "self-update: ok (${OLD_SHA:0:7} → ${SHORT_NEW}, services restarted: $RESTARTED)"
+say "self-update: ok (${OLD_SHA:0:7} → ${SHORT_NEW}, services restarted: $RESTARTED${REAPPLY_NOTE})"
 exit 0

@@ -52,6 +52,11 @@
       "reason": "Claude Agent tool and TaskStop runtime"
     },
     {
+      "pattern": "skills/shared/bridge-yield-continue/**",
+      "compatibility": "adapted",
+      "codex_skill": "bridge-yield-continue"
+    },
+    {
       "pattern": "claude/skills/distill/**",
       "compatibility": "claude-only",
       "reason": "Claude hook and transcript pipeline"
@@ -100,9 +105,43 @@
       "pattern": "claude/hooks/**",
       "compatibility": "claude-only",
       "reason": "Claude native lifecycle hooks and hook tests"
+    },
+    {
+      "pattern": "claude/skills/nclex-multi-pr-pre-flight-gate-validation/**",
+      "compatibility": "claude-only",
+      "reason": "Claude-side pre-flight triage for jinwon-int/nclex PRs; feeds the Claude-only nclex-a2a-content-pipeline lane and relies on Claude skill auto-matching"
+    },
+    {
+      "pattern": "claude/skills/bilingual-terminology-review-gate/**",
+      "compatibility": "claude-only",
+      "reason": "Claude A2A worker review lane procedure (metadata type claude); codex bridge runs its own lane prompts"
+    },
+    {
+      "pattern": "claude/skills/ghost-process-cleanup-and-verification/**",
+      "compatibility": "claude-only",
+      "reason": "generic shell procedure authored for Claude skill matching; codex mirror candidate, none exists yet"
+    },
+    {
+      "pattern": "claude/skills/nclex-a2a-content-pipeline/**",
+      "compatibility": "claude-only",
+      "reason": "Claude session A2A dispatch orchestration (a2a-dispatch-round manifests, receipt projection); no codex mirror yet"
+    },
+    {
+      "pattern": "claude/skills/github-incident-recovery-merge-retry/**",
+      "compatibility": "claude-only",
+      "reason": "generic gh/systemd shell procedure authored for Claude skill matching; codex mirror candidate, none exists yet"
+    },
+    {
+      "pattern": "claude/skills/github-merge-state-conflict-diagnosis/**",
+      "compatibility": "claude-only",
+      "reason": "generic gh diagnostic procedure authored for Claude skill matching; codex mirror candidate, none exists yet"
     }
   ],
   "managed_skills": [
+    {
+      "name": "bridge-yield-continue",
+      "source": "skills/shared/bridge-yield-continue"
+    },
     {
       "name": "ccc-agent-cron",
       "source": "codex/skills/ccc-agent-cron"

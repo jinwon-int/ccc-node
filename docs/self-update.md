@@ -24,9 +24,16 @@ rather than composing the steps ad hoc.
    plus Hermes `honcho.json`, then let `./setup.sh` redeploy the harness; a
    setup failure verifies rollback of both the repository SHA and installed
    artifacts before reporting success
-5. restarts each service listed in the operator allowlist and verifies it is
+5. if any `~/.claude/state/install-*.json` record's generation stamp drifted
+   against the current checkout: snapshot crontab, replay the recorded argv
+   (the resolved `--apply --schedule …` the installer materialized), verify
+   the new stamp. On failure the crontab is restored and the run exits 12.
+   Kill-switch: operator-owned `~/.claude/self-update.no-reapply`, or
+   `CCC_SELF_UPDATE_REAPPLY=0`. Re-apply runs only when HEAD changed (or
+   `--force`) — an up-to-date tick cannot have installer-content drift.
+6. restarts each service listed in the operator allowlist and verifies it is
    active again
-6. appends a JSONL audit record (`~/.claude/state/self-update.log`) and queues
+7. appends a JSONL audit record (`~/.claude/state/self-update.log`) and queues
    an owner Telegram notification via the push spool (token never touched;
    delivery needs the bridge `CCC_PUSH_ENABLED=true` opt-in)
 
@@ -143,6 +150,8 @@ plain `ccc-self-update.sh run` with no shell chaining.
 | `CCC_SELF_UPDATE_HEALTH_FRESH_SECONDS` | `90` | max age of `health.json` for its workload to count |
 | `CCC_SELF_UPDATE_BUSY_MAX_SECONDS` | `1800` | never defer for a task older than this |
 | `CCC_SELF_UPDATE_MAX_DEFER_SECONDS` | `3600` | cap total deferral so continuous load can't starve updates |
+| `CCC_SELF_UPDATE_REAPPLY` | `1` | set to `0` to skip installer cron re-apply; equivalent operator file: `~/.claude/self-update.no-reapply` |
+| `CCC_SELF_UPDATE_CRONTAB_CMD` | `crontab` | crontab binary (tests inject a stub) |
 
 Exit codes: 0 ok/up-to-date · 3 lock held · 4 precondition failed · 5 fetch/ff
 failed · 6 setup/snapshot failed (repo and managed artifacts were verified
@@ -153,6 +162,8 @@ was degraded · 10 successful-update recovery snapshot cleanup failed ·
 11 degraded — code updated but no allowlisted service restarted (services
 file missing/empty); running processes may still hold the old code, so this
 is reported as non-ok to surface silent drift rather than `result:"ok"`.
+12 installer re-apply failed — crontab was restored from the pre-reapply
+snapshot; the repo/harness stay at the new SHA (setup already succeeded).
 On exit 9, the validated private recovery snapshot is retained under
 `~/.claude/state/self-update-install-rollback.*/` (`0700` directory containing
 `0600` Claude and Hermes archives) for local operator

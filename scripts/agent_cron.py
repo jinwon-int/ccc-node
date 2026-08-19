@@ -391,7 +391,19 @@ def lock_command_guarded(task_id, action, run_id, scheduled_at, at, as_json, tas
         return result, as_json, 1
     if status['lockState'] == 'stale':
         stale_path = path.with_name(f'{path.name}.stale.{int(at.timestamp())}.{os.getpid()}')
-        path.rename(stale_path)
+        try:
+            path.rename(stale_path)
+        except FileNotFoundError:
+            # Another reclaimer won the same stale lock between lock_status()
+            # above and this rename.  acquire_for_run_guarded() has always
+            # handled that race; the operator CLI did not, so it fell through
+            # to the top-level `except Exception` and reported a bare error
+            # with no taskId/lockState for the operator to act on.
+            after = lock_status(task_id, task, at)
+            return {'ok': False, 'taskId': task_id, 'action': action, **after, 'runId': run_id}, as_json, 1
+        except OSError as e:
+            return {'ok': False, 'taskId': task_id, 'action': action, 'lockState': 'error',
+                    'error': str(e), 'runId': run_id}, as_json, 1
         reclaimed = True
     payload = {
         'taskId': task_id,

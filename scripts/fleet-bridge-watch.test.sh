@@ -58,6 +58,24 @@ okc "$RC" 1 "a down bridge exits nonzero"
 ok "down node reported" 'grep -q "^DOWN beta" "$OUT"'
 ok "healthy node still OK" 'grep -q "^OK alpha" "$OUT"'
 
+# ---- degraded: alive and serving, but not restartable ----------------------
+# The gongyung 2026-08-11 shape: the bot answered Telegram normally while
+# start.sh reported "degraded" (running with no pid file). Reported as DOWN,
+# that reads as an outage and trains the operator to discount the alert.
+reply beta /root/ccc-node degraded /root/ccc-node
+run "alpha beta"
+okc "$RC" 1 "a degraded bridge still exits nonzero"
+ok "degraded reported under its own name" 'grep -q "^DEGRADED beta runtime=/root/ccc-node" "$OUT"'
+ok "degraded is not reported as DOWN"     '! grep -q "^DOWN beta" "$OUT"'
+ok "degraded is not reported as OK"       '! grep -q "^OK beta" "$OUT"'
+ok "healthy node unaffected by degraded peer" 'grep -q "^OK alpha" "$OUT"'
+
+# A truly absent bridge must still be DOWN — the split must not soften it.
+reply beta /root/ccc-node no /root/ccc-node
+run "beta"
+okc "$RC" 1 "absent bridge still exits nonzero"
+ok "absent bridge is DOWN, not DEGRADED" 'grep -q "^DOWN beta" "$OUT" && ! grep -q "^DEGRADED beta" "$OUT"'
+
 # ---- boot-path mismatch: available, but the unit points elsewhere ----------
 # The yukson 2026-07-27 shape. Availability alone would call this healthy.
 reply beta /root/ccc-node yes /opt/ccc-node
@@ -216,6 +234,16 @@ ok "overridden root reports OK" 'grep -q "^OK beta (/srv/ccc-node)" "$OUT"'
 # The whole point: paths come from the running process, never a baked table.
 ok "no hardcoded node->path table" \
   '! grep -nE "^(check|[a-z]+) +(seoseo|yukson|sogyo|nosuk|dungae) +.*(/opt/ccc-node|/root/ccc-node)" "$SC"'
+
+# ---- the doctor is run without the bridge's CLI-path environment -----------
+# Not an oversight: carrying CCC_CODEX_CLI_PATH across points the doctor's
+# Codex --version probe at the ccc-codex memory wrapper, which times out and
+# turns every healthy codex node into a false DRIFT (daegyo, 2026-08-11). The
+# piri false positive this would have fixed is tracked separately, doctor-side.
+ok "doctor call does not inject bridge CLI paths" \
+  '! grep -q "env \$cli_env" "$SC"'
+ok "probe does not read the serving process environ" \
+  '! grep -q "environ" "$SC"'
 
 # ---- transport retry (#972) ------------------------------------------------
 # Flaky stub: fails while $TMP/flaky/<node> holds a positive counter, then

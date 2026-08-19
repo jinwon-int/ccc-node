@@ -453,6 +453,43 @@ ok "setup honors CODEX_HOME while preserving unrelated Codex config" \
 ok "setup honors CODEX_HOME for managed skills" \
   '[ -f "$policy_codex/skills/ccc-doctor/SKILL.md" ] && [ "$(stat -c %a "$policy_codex/skills/ccc-doctor/SKILL.md")" = 600 ]'
 
+# --- rollback covers Codex GitHub policy state (#1131) ----------------------
+# Fail AFTER the transport policy step has applied (the managed-skills step is
+# the next python3 invocation) and assert the install transaction puts
+# $CODEX_DIR back exactly: a pre-existing config.toml returns byte-for-byte,
+# and a $CODEX_DIR the failed run created disappears again.
+mkdir -p "$TMP/fail-skills-bin"
+cat > "$TMP/fail-skills-bin/python3" <<EOF
+#!/usr/bin/env bash
+for a in "\$@"; do
+  case "\$a" in *ccc_codex_skills.py) exit 93 ;; esac
+done
+exec "$(command -v python3)" "\$@"
+EOF
+chmod +x "$TMP/fail-skills-bin/python3"
+
+codex_txn_codex="$TMP/codex-txn-codex"
+mkdir -p "$codex_txn_codex"
+chmod 700 "$codex_txn_codex"
+printf '%s\n' 'sentinel = "RESTORE-ME"' '' '[plugins."github@openai-curated-remote"]' 'enabled = true' > "$codex_txn_codex/config.toml"
+chmod 600 "$codex_txn_codex/config.toml"
+codex_txn_cfg_before="$(sha256sum "$codex_txn_codex/config.toml")"
+out="$(HOME="$TMP/codex-txn-home" PATH="$TMP/fail-skills-bin:$PATH" \
+  CCC_CLAUDE_DIR="$TMP/codex-txn-claude" CCC_HERMES_DIR="$TMP/codex-txn-hermes" CODEX_HOME="$codex_txn_codex" \
+  bash "$SETUP" --no-backup 2>&1)"; rc=$?
+ok "setup failure after the Codex policy step exits non-zero" '[ "$rc" != 0 ]'
+ok "rollback restores a pre-existing Codex config.toml byte-for-byte (#1131)" \
+  '[ "$(sha256sum "$codex_txn_codex/config.toml")" = "$codex_txn_cfg_before" ]'
+ok "rollback report names the Codex policy config in the restored scope (#1131)" \
+  'grep -Fq "restored previous installed artifacts (Claude harness, honcho.json, Codex GitHub policy config)" <<<"$out"'
+
+codex_new_codex="$TMP/codex-new-codex"
+out="$(HOME="$TMP/codex-new-home" PATH="$TMP/fail-skills-bin:$PATH" \
+  CCC_CLAUDE_DIR="$TMP/codex-new-claude" CCC_HERMES_DIR="$TMP/codex-new-hermes" CODEX_HOME="$codex_new_codex" \
+  bash "$SETUP" --no-backup 2>&1)"; rc=$?
+ok "setup failure after the policy step on a codex-less node exits non-zero" '[ "$rc" != 0 ]'
+ok "rollback removes a Codex dir the failed run created (#1131)" '[ ! -e "$codex_new_codex" ]'
+
 # Root-run Claude would reject --dangerously-skip-permissions, so setup must
 # neutralize the bypassPermissions default when the run user is root. Simulate
 # root deterministically with the setup test seam, which is accepted only when

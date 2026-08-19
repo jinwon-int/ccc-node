@@ -7,6 +7,7 @@ import os
 import time
 import asyncio
 import logging
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Tuple
 
@@ -218,6 +219,12 @@ class ProjectChatHandler(
         )
         self._typing_interval_seconds = TYPING_INTERVAL
         self._conversation_locks: Dict[Tuple[int, int], asyncio.Lock] = {}
+        # Requests admitted to a conversation but not yet finished, including
+        # the one holding the lock. A value above 1 means later messages are
+        # already waiting behind the current turn, which is the only in-process
+        # signal that a turn's empty output was coalesced rather than lost
+        # (#1128). Kept here beside the lock it mirrors so both share a key.
+        self._conversation_pending: Dict[Tuple[int, int], int] = {}
         self._claude_usage: Dict[Tuple[int, int, str], UsageSnapshot] = {}
         # Rate-limit windows are a property of the single underlying Claude
         # subscription/OAuth credential this node authenticates with, not of
@@ -554,6 +561,50 @@ class ProjectChatHandler(
             lock = asyncio.Lock()
             self._conversation_locks[key] = lock
         return lock
+
+    def _enter_conversation_queue(self, key: Tuple[int, int]) -> None:
+        """Count this request against ``key`` before it contends for the lock.
+
+        Called before acquisition, not after, so a request still waiting is
+        visible to the turn currently holding the lock. That ordering is the
+        whole point: the holder needs to know someone is behind it *while* it
+        is finishing, not afterwards.
+        """
+        self._conversation_pending[key] = self._conversation_pending.get(key, 0) + 1
+
+    def _leave_conversation_queue(self, key: Tuple[int, int]) -> None:
+        """Drop this request's claim on ``key``, forgetting empty keys."""
+        remaining = self._conversation_pending.get(key, 0) - 1
+        if remaining > 0:
+            self._conversation_pending[key] = remaining
+        else:
+            self._conversation_pending.pop(key, None)
+
+    def _conversation_followers(self, key: Tuple[int, int]) -> int:
+        """Requests queued behind the current holder of ``key`` (never < 0).
+
+        The holder counts itself, so subtract it. A caller that never
+        registered (older tests, direct invocations) reads 0 rather than -1.
+        """
+        return max(0, self._conversation_pending.get(key, 0) - 1)
+
+    @asynccontextmanager
+    async def _conversation_turn(self, user_id: int, chat_id: int):
+        """Hold the conversation lock while staying countable.
+
+        Wraps ``_get_conversation_lock`` rather than replacing it so the
+        existing callers that only need mutual exclusion (dead-session
+        recovery, wakeup) are untouched. Registration happens before the
+        acquire and is released in ``finally``, so a request that is cancelled
+        while waiting does not leak a phantom follower.
+        """
+        key = self._stream_key(user_id, chat_id)
+        self._enter_conversation_queue(key)
+        try:
+            async with self._get_conversation_lock(user_id, chat_id):
+                yield
+        finally:
+            self._leave_conversation_queue(key)
 
     def workload_snapshot(self, now: float) -> tuple[int, float]:
         """Return ``(in_flight_count, oldest_request_age_seconds)``.

@@ -162,10 +162,29 @@ def _stall_ages(loop: Any, request: _PendingRequest) -> dict[str, str]:
 # rejected key changes nothing and retrying a throttle makes it worse.
 _RETRYABLE_ADMISSION_CLASSES = frozenset({"silent", "network", "timeout"})
 
+# A provider turn that runs to a normal completion yet produces no
+# user-visible text anywhere (#775). Measured on gwakga 2026-08-18 14:44: a
+# follow-up "did the background job finish?" turn ended after ~7s with
+# ResultEvent+CompletionEvent and zero text, and the bridge handed the
+# user "Please retry your request" instead of retrying itself. The turn
+# completed, so this is not an admission stall — but it is the same
+# short-window transient class, and the bounded retry budget below is the
+# right remedy for both.
+_EMPTY_COMPLETION_MARKER = "empty-completion"
+
 
 def _admission_retry_class(response: ChatResponse) -> str | None:
-    """The stderr class of a retryable admission failure, else ``None``."""
+    """The retryable failure class of a turn, else ``None``.
+
+    Two marker shapes are retryable: ``admission-timeout/<stderr class>``
+    where the class looks transient, and a bare ``empty-completion`` turn
+    the provider finished without ever speaking. The ``coalesced-turn``
+    marker is deliberately excluded — the answer is already on its way
+    under the follower turn, so resending only queues a duplicate.
+    """
     marker = getattr(response, "failure_class", None) or ""
+    if marker == _EMPTY_COMPLETION_MARKER:
+        return marker
     prefix, _, cls = marker.partition("/")
     if prefix != "admission-timeout":
         return None
@@ -362,6 +381,10 @@ class ProjectChatProcessMixin:
         # uplink drops for ~60s at a time — but the retry runs on its own small
         # budget, never the full grace again: 300s + 300s is the 600s dead wait
         # that made raising the deadline the wrong fix in the first place.
+        # The same budget covers `empty-completion` turns (#775): the provider
+        # finished without any visible text, which is the same short-window
+        # transient class seen on gwakga 2026-08-18 14:44 — the user was told
+        # to retry by hand for something the bridge could retry itself.
         #
         # This does not hide the cause. The #846 warning is emitted for each
         # admission timeout, so a retried failure still leaves the first
@@ -379,7 +402,7 @@ class ProjectChatProcessMixin:
             return response
 
         logger.warning(
-            "Retrying a turn the provider never admitted for user %s chat %s "
+            "Retrying a turn with no user-visible answer for user %s chat %s "
             "(class=%s retry_grace=%gs)",
             user_id,
             chat_id,
@@ -408,7 +431,8 @@ class ProjectChatProcessMixin:
         )
         if retried.success:
             logger.info(
-                "Retry admitted the turn for user %s chat %s after a %s stall",
+                "Retry recovered the turn for user %s chat %s after a %s "
+                "failure",
                 user_id,
                 chat_id,
                 retry_class,
@@ -644,7 +668,7 @@ class ProjectChatProcessMixin:
                 bot, chat_id, user_id, settings=self._config
             )
 
-        async with self._get_conversation_lock(user_id, chat_id):
+        async with self._conversation_turn(user_id, chat_id):
             loop = asyncio.get_running_loop()
             progress_coordinator = RequestProgressCoordinator(
                 ledger_create=self._ledger_create,
@@ -1237,29 +1261,65 @@ class ProjectChatProcessMixin:
                             pass
                         content = recovered
                     else:
+                        # #1128: two messages sent within about a second reach
+                        # the provider as a single turn, so exactly one request
+                        # carries the answer and the rest end with no visible
+                        # text. A follower queued behind this turn is the only
+                        # in-process evidence of that; the queue lives inside
+                        # the CLI, so the alternative would be parsing its
+                        # transcript and coupling the bridge to that format.
+                        followers = self._conversation_followers(key)
+                        coalesced = followers > 0
+                        cause = "coalesced-turn" if coalesced else "empty-completion"
                         _claim_request_terminal(
                             progress_request,
                             RequestPhase.FAILED,
-                            cause="empty-completion",
+                            cause=cause,
                         )
                         logger.warning(
                             "Empty normal completion for user %s chat %s: "
                             "provider=%s finished successfully without "
-                            "user-visible text (session kept)",
+                            "user-visible text (session kept) cause=%s "
+                            "followers=%s",
                             user_id,
                             chat_id,
                             provider_label,
+                            cause,
+                            followers,
                         )
                         try:
-                            health_reporter.record_empty_completion(recovered=False)
+                            health_reporter.record_empty_completion(
+                                recovered=False, coalesced=coalesced
+                            )
                         except Exception:
                             pass
+                        if coalesced:
+                            # Not a failure: the turn ran, and its answer is
+                            # already on its way under the follower. Telling
+                            # the user to retry would queue yet another
+                            # message and reproduce the same split.
+                            message = "Handled together with your other message"
+                            return ChatResponse(
+                                content=f"⏳ {message}; the answer arrives with that one.",
+                                success=False,
+                                error="coalesced_turn",
+                                session_id=session.session_id,
+                                # Typed for diagnostics; deliberately NOT in
+                                # the retry set — the follower carries the
+                                # answer and a resend would duplicate the
+                                # question (#1128).
+                                failure_class="coalesced-turn",
+                            )
                         message = "Agent finished without a visible answer"
                         return ChatResponse(
                             content=f"❌ {message}. Please retry your request.",
                             success=False,
                             error=message,
                             session_id=session.session_id,
+                            # Lets process_message's bounded retry take one
+                            # more shot instead of pushing the retry onto
+                            # the user (gwakga 2026-08-18 14:44).
+                            failure_class=_EMPTY_COMPLETION_MARKER,
                         )
                 _claim_request_terminal(
                     progress_request,

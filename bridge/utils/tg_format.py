@@ -57,9 +57,14 @@ def _render_table_block_for_telegram(table_block: list) -> str:
             # First cell is the row-label (heading); remaining cells align with headers.
             heading = cells[0] if cells and cells[0] else f"Row {index}"
             data_cells = cells[1:]
+            # The heading is its own cell here, so no data cell is ever suppressed.
+            heading_column = None
         else:
-            # No row-label column: use first non-empty cell as heading.
-            heading = next((cell for cell in cells if cell), f"Row {index}")
+            # No row-label column: use first non-empty cell as heading.  Keep
+            # its column index -- the bullet loop below must suppress *that
+            # cell*, not every cell that happens to share its text.
+            heading_column = next((i for i, cell in enumerate(cells) if cell), None)
+            heading = cells[heading_column] if heading_column is not None else f"Row {index}"
             data_cells = cells
 
         # Pad or trim data_cells to match headers length.
@@ -68,13 +73,16 @@ def _render_table_block_for_telegram(table_block: list) -> str:
         elif len(data_cells) > len(headers):
             data_cells = data_cells[: len(headers)]
 
-        # Build the bulleted lines for this row.  Skip any bullet whose value
-        # duplicates the heading text -- when has_row_label_col is False the
-        # heading IS the first data cell, and emitting it twice (once as the
-        # bold heading, once as the first bullet) is visual noise.
+        # Build the bulleted lines for this row.  When has_row_label_col is
+        # False the heading IS one of the data cells, so emitting it twice
+        # (once as the bold heading, once as its own bullet) is visual noise.
+        # Suppress it BY COLUMN: matching on value instead dropped every other
+        # column that repeated the heading text, silently losing that datum
+        # (e.g. "| Owner | Reviewer |" / "| alice | alice |" rendered as just
+        # "**alice**" with the Reviewer bullet gone).
         bullets = []
-        for header, value in zip(headers, data_cells):
-            if not has_row_label_col and value == heading:
+        for column, (header, value) in enumerate(zip(headers, data_cells)):
+            if column == heading_column:
                 continue
             bullets.append(f"• {header}: {value}")
 

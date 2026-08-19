@@ -485,7 +485,7 @@ render_turn_occupancy_from_health() {
 # so --status agrees with --restart on what "managed" means.
 service_managed_main_pid() {
     local main_pid
-    main_pid="$("$SCRIPT_DIR/service-systemd.sh" main-pid 2>/dev/null)" || return 1
+    main_pid="$(bash "$SCRIPT_DIR/service-systemd.sh" main-pid 2>/dev/null)" || return 1
     [ -n "$main_pid" ] && [ "$main_pid" != "0" ] || return 1
     printf '%s\n' "$main_pid"
 }
@@ -796,7 +796,7 @@ do_install() {
         echo "⚠️  Another instance is already using the same Bot Token (PID: $(cat "$TOKEN_LOCK_FILE")). Stop it first."
         exit 1
     fi
-    exec "$SCRIPT_DIR/service-launchd.sh" install \
+    exec bash "$SCRIPT_DIR/service-launchd.sh" install \
         --project-root "$PROJECT_ROOT" \
         --proxy-url "$(read_env_with_fallback "PROXY_URL")" \
         --caller "$0"
@@ -805,7 +805,7 @@ do_install() {
 do_uninstall() {
     init_token_lock
     export CCC_BRIDGE_TOKEN_LOCK_FILE="$TOKEN_LOCK_FILE"
-    exec "$SCRIPT_DIR/service-launchd.sh" uninstall \
+    exec bash "$SCRIPT_DIR/service-launchd.sh" uninstall \
         --project-root "$PROJECT_ROOT" \
         --caller "$0"
 }
@@ -824,14 +824,14 @@ do_install_systemd() {
         exit 1
     fi
     check_env
-    exec "$SCRIPT_DIR/service-systemd.sh" install \
+    exec bash "$SCRIPT_DIR/service-systemd.sh" install \
         --project-root "$PROJECT_ROOT" \
         --proxy-url "$(read_env_with_fallback "PROXY_URL")" \
         --caller "$0"
 }
 
 do_uninstall_systemd() {
-    exec "$SCRIPT_DIR/service-systemd.sh" uninstall --caller "$0"
+    exec bash "$SCRIPT_DIR/service-systemd.sh" uninstall --caller "$0"
 }
 
 do_version() {
@@ -1028,7 +1028,7 @@ do_restart() {
         echo "💡 Restart via the service manager: launchctl kickstart -k gui/$(id -u)/$PLIST_LABEL"
         exit 3
     fi
-    if "$SCRIPT_DIR/service-systemd.sh" is-managed >/dev/null 2>&1; then
+    if bash "$SCRIPT_DIR/service-systemd.sh" is-managed >/dev/null 2>&1; then
         unit="${BRIDGE_SERVICE_NAME:-ccc-telegram-bridge}.service"
         scope_flag=""
         [ "$(id -u)" = "0" ] || scope_flag=" --user"
@@ -1123,6 +1123,28 @@ do_restart() {
     echo "── health ──"
     restart_status_snapshot
     exit 0
+}
+
+# Spawn this checkout's start.sh detached, naming the interpreter explicitly.
+#
+# Same call-site constraint do_restart documents above, on the other spawn
+# path: executing start.sh directly makes the spawn depend on its `#!/bin/bash`
+# shebang resolving, and Termux has neither /bin/bash nor /usr/bin/env. Under
+# `nohup ... &` that failure is close to invisible — it leaves only
+#   nohup: failed to run command '.../start.sh': No such file or directory
+# in the daemon log while the caller prints a PID and exits 0 (#1151, observed
+# on gongyung 2026-08-18). It reproduces only from spawning contexts without
+# termux-exec's LD_PRELOAD, which is what rewrites the shebang when present, so
+# it reads as intermittent. Changing the shebang does not fix it: /usr/bin/env
+# is missing there too, and the declared interpreter has to keep working for
+# the other nodes. The call site is the only place that can name it.
+#
+# Sets SPAWNED_PID. nohup execs, so that is the spawned process itself and
+# stays a valid liveness handle for the caller.
+spawn_start_sh_detached() { # <log> <args...>
+    local log="$1"; shift
+    nohup bash "$SCRIPT_DIR/start.sh" "$@" >> "$log" 2>&1 &
+    SPAWNED_PID=$!
 }
 
 # ── Unit-test seam (#584 P3-2) ──
@@ -1444,8 +1466,20 @@ if [ "$DAEMON_MODE" -eq 1 ] && [ "$RUN_AS_DAEMON_SUPERVISOR" -eq 0 ]; then
     DAEMON_LOG="$LOGS_DIR/supervisor.log"
     SUPERVISOR_ARGS=("--path" "$PROJECT_ROOT" "--_daemon_supervisor")
     [ -n "$BOT_DEBUG" ] && SUPERVISOR_ARGS+=("--debug")
-    nohup "$SCRIPT_DIR/start.sh" "${SUPERVISOR_ARGS[@]}" >> "$DAEMON_LOG" 2>&1 &
-    SUPERVISOR_PID=$!
+    spawn_start_sh_detached "$DAEMON_LOG" "${SUPERVISOR_ARGS[@]}"
+    SUPERVISOR_PID="$SPAWNED_PID"
+    # A spawn that cannot exec dies immediately, so confirm the supervisor is
+    # still there before announcing it. Reporting a PID for a process that
+    # never ran sent a caller looking for a stale-code or Telegram fault while
+    # the bridge had simply not started (#1151). Same belt-and-braces as the
+    # restart path's readiness poll: a pid-file check backs up the signal probe
+    # in case the spawn has already handed off.
+    sleep 1
+    if ! kill -0 "$SUPERVISOR_PID" 2>/dev/null && ! is_supervisor_running; then
+        echo "❌ Daemon start failed: the spawned supervisor exited immediately"
+        echo "📄 Log: $DAEMON_LOG"
+        exit 1
+    fi
     echo "✅ Bot started in background (PID: $SUPERVISOR_PID)"
     echo "📄 Log: $DAEMON_LOG"
     echo "💡 Use $0 --path \"$PROJECT_ROOT\" --status to check status"

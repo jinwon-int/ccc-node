@@ -24,11 +24,16 @@ export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER
 # node's real ~/.telegram_bot/health.json, and on a node whose bridge is
 # actively serving a session every fixture update defers (rc=8) and the suite
 # mass-fails. Point it at a nonexistent fixture path instead (fail-open).
+# CODEX_HOME must likewise never resolve to the operator's real ~/.codex: the
+# artifact snapshot/rollback covers the Codex policy config (#1131), so an
+# unset CODEX_HOME would let a FAILED-fixture restore delete the live file.
 unset CCC_SELF_UPDATE_BRANCH CCC_SELF_UPDATE_SERVICES
 unset CCC_SELF_UPDATE_RESTART_CMD CCC_SELF_UPDATE_HEALTH_CMD
 unset CCC_SELF_UPDATE_RESTART_CMD_FILE CCC_SELF_UPDATE_HEALTH_CMD_FILE
 unset CCC_SELF_UPDATE_HEALTH_FRESH_SECONDS
 unset CCC_SELF_UPDATE_BUSY_MAX_SECONDS CCC_SELF_UPDATE_MAX_DEFER_SECONDS
+unset CCC_SELF_UPDATE_REAPPLY CCC_SELF_UPDATE_CRONTAB_CMD
+unset CODEX_HOME
 export CCC_SELF_UPDATE_HEALTH_FILE="$TMP/no-such-health.json"
 
 # Fixture: origin repo with a stub setup.sh, plus a node-side clone.
@@ -65,17 +70,32 @@ exit 0
 SH
 chmod +x "$FAKEBIN/fakesystemctl"
 
+export FAKE_CRON="$TMP/crontab.txt"
+: > "$FAKE_CRON"
+cat > "$FAKEBIN/crontab" <<'STUB'
+#!/usr/bin/env bash
+f="${FAKE_CRON:?}"
+case "${1:-}" in
+  -l) [ -s "$f" ] && cat "$f" || exit 1 ;;
+  -)  cat > "$f" ;;
+  *)  [ -n "${1:-}" ] && [ -f "$1" ] && cat "$1" > "$f" ;;
+esac
+STUB
+chmod +x "$FAKEBIN/crontab"
+
 CLAUDE="$TMP/claude"
 STATE="$CLAUDE/state"
 HERMES="$TMP/hermes"
-mkdir -p "$STATE" "$CLAUDE" "$HERMES"
+mkdir -p "$STATE" "$CLAUDE" "$HERMES" "$TMP/codex"
 export SETUP_MARKER="$TMP/setup.marker"
 
 run_selfup() {
   CCC_CLAUDE_DIR="$CLAUDE" CCC_STATE_DIR="$STATE" CCC_PUSH_SPOOL="$TMP/spool" \
-  CCC_HERMES_DIR="$HERMES" \
+  CCC_HERMES_DIR="$HERMES" CODEX_HOME="${CODEX_HOME:-$TMP/codex}" \
   CCC_SELF_UPDATE_BRIDGE_PROJECT_ROOT="$TMP/project" \
   CCC_SELF_UPDATE_REPO="${REPO_OVERRIDE:-$REPO}" CCC_SELF_UPDATE_SYSTEMCTL="$FAKEBIN/fakesystemctl" \
+  CCC_SELF_UPDATE_CRONTAB_CMD="$FAKEBIN/crontab" CCC_CRONTAB_CMD="$FAKEBIN/crontab" \
+  FAKE_CRON="$FAKE_CRON" PATH="$FAKEBIN:$PATH" \
   CCC_SELF_UPDATE_RESTART_WAIT_SECONDS=3 \
   CCC_NODE=testnode bash "$SELFUP" "$@"
 }
@@ -285,6 +305,11 @@ mkdir -p "$CLAUDE/hooks"
 printf '%s\n' 'old-installed-hook' > "$CLAUDE/hooks/installed-hook.sh"
 printf '%s\n' '{"oldHoncho":true}' > "$HERMES/honcho.json"
 printf '%s\n' '{"oldLocal":true}' > "$CLAUDE/settings.local.json"
+# The broken setup also rewrites the Codex GitHub policy config the way
+# ccc_codex_github_policy.py does (in place, no backup); rollback must put it
+# back byte-for-byte (#1131).
+printf '%s\n' 'sentinel = "KEEP-ME"' '' '[plugins."github@openai-curated-remote"]' 'enabled = true' > "$TMP/codex/config.toml"
+CODEX_CFG_BEFORE="$(sha256sum "$TMP/codex/config.toml")"
 rm -f "$CLAUDE/headless.sh"
 INSTALLED_BEFORE="$(sha256sum "$CLAUDE/hooks/installed-hook.sh")"
 cat > "$TMP/seed/setup.sh" <<'SH'
@@ -292,6 +317,8 @@ cat > "$TMP/seed/setup.sh" <<'SH'
 printf '%s\n' 'partially-updated-hook' > "${CCC_CLAUDE_DIR:?}/hooks/installed-hook.sh"
 printf '%s\n' 'partially-created-headless' > "${CCC_CLAUDE_DIR:?}/headless.sh"
 printf '%s\n' '{"newHoncho":true}' > "${CCC_HERMES_DIR:?}/honcho.json"
+mkdir -p "${CODEX_HOME:?}"
+printf '%s\n' 'enabled = false # rewritten by policy' >> "${CODEX_HOME:?}/config.toml"
 exit 1
 SH
 git -C "$TMP/seed" add -A && git -C "$TMP/seed" commit -qm broken-setup && git -C "$TMP/seed" push -q origin main
@@ -299,6 +326,10 @@ out="$(run_selfup run 2>&1)"; rc=$?
 ok "setup failure exits non-zero and rolls back" '[ "$rc" = 6 ] && [ "$(git -C "$REPO" rev-parse HEAD)" = "$OLD_HEAD" ]'
 ok "setup failure restores installed artifacts" '[ "$(sha256sum "$CLAUDE/hooks/installed-hook.sh")" = "$INSTALLED_BEFORE" ]'
 ok "setup failure restores Hermes honcho artifact" 'grep -q "oldHoncho" "$HERMES/honcho.json"'
+ok "setup failure restores Codex GitHub policy config byte-for-byte (#1131)" \
+  '[ "$(sha256sum "$TMP/codex/config.toml")" = "$CODEX_CFG_BEFORE" ]'
+ok "rollback notification names the restored scope honestly (#1131)" \
+  'jq -r .text "$TMP/spool"/*SelfUpdate*.json | grep -q "Codex GitHub 정책 설정"'
 ok "setup failure keeps managed absent artifact absent" '[ ! -e "$CLAUDE/headless.sh" ]'
 # settings.local.json is node-local (unmanaged): self-update's snapshot/deploy/
 # rollback lifecycle never touches it, so a node's approvals survive intact (#454).
@@ -307,6 +338,14 @@ ok "self-update leaves node-local settings.local.json untouched" \
 ok "rollback audit recorded" 'grep -q "setup-failed-rolled-back" "$STATE/self-update.log"'
 ok "successful artifact rollback removes private recovery snapshot" \
   '! compgen -G "$STATE/self-update-install-rollback.*" >/dev/null'
+
+# Same broken run on a node with NO $CODEX_DIR: the failed run creates the
+# directory through the policy step, and the rollback must remove it whole
+# rather than strand the new policy state (#1131).
+rm -rf "$TMP/codex-fresh"
+out="$(CODEX_HOME="$TMP/codex-fresh" run_selfup run 2>&1)"; rc=$?
+ok "rollback removes a Codex dir the failed run created (#1131)" \
+  '[ "$rc" = 6 ] && [ ! -e "$TMP/codex-fresh" ]'
 
 # A failed repository reset must never be reported as a complete rollback.
 cat > "$FAKEBIN/git" <<'SH'
@@ -449,6 +488,101 @@ out="$(run_selfup run 2>&1)"; rc=$?
 ok "busy deferral still exits 8" '[ "$rc" = 8 ]'
 ok "busy deferral does not notify" '[ -z "$(spool_text)" ]'
 rm -f "$HFILE"; export CCC_SELF_UPDATE_HEALTH_FILE="$TMP/no-such-health.json"
+
+# Restore the succeeding stub setup.sh (section 4 replaced it with `exit 1`).
+cat > "$TMP/seed/setup.sh" <<'SH'
+#!/usr/bin/env bash
+echo "setup ran at $(git rev-parse --short HEAD)" >> "${SETUP_MARKER:?}"
+SH
+
+# --- #1081 phase 2: installer re-apply on gen drift --------------------------
+# Plant the real gen-stamp lib + a stub installer in the fixture repo so
+# self-update can recompute stamps and invoke a hermetic --apply.
+mkdir -p "$TMP/seed/scripts/lib"
+cp "$HERE/lib/installer-gen-stamp.sh" "$TMP/seed/scripts/lib/"
+cat > "$TMP/seed/scripts/install-fake-cron.sh" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# shellcheck source=/dev/null
+. "$ROOT/scripts/lib/installer-gen-stamp.sh"
+GEN="$(ccc_installer_gen_stamp "$ROOT/scripts/install-fake-cron.sh")"
+MARKER="# ccc-node:fake"
+CRONTAB="${CCC_CRONTAB_CMD:-crontab}"
+APPLY=0; REMOVE=0
+for a in "$@"; do
+  case "$a" in --apply) APPLY=1 ;; --remove) REMOVE=1 ;; esac
+done
+[ "$APPLY" = 1 ] || exit 0
+: >> "${CCC_TEST_REAPPLY_MARKER:?}"
+[ -z "${CCC_TEST_REAPPLY_FAIL:-}" ] || exit 1
+current="$("$CRONTAB" -l 2>/dev/null || true)"
+without="$(printf '%s\n' "$current" | grep -vF "$MARKER" || true)"
+if [ "$REMOVE" = 1 ]; then
+  printf '%s\n' "$without" | "$CRONTAB" -
+else
+  printf '%s\n%s\n' "$without" "* * * * * echo fake $MARKER gen=$GEN" | "$CRONTAB" -
+fi
+SH
+chmod +x "$TMP/seed/scripts/install-fake-cron.sh"
+git -C "$TMP/seed" add -A && git -C "$TMP/seed" commit -qm reapply-plant && git -C "$TMP/seed" push -q origin main
+# shellcheck source=/dev/null
+. "$HERE/lib/installer-gen-stamp.sh"
+fake_gen="$(ccc_installer_gen_stamp "$TMP/seed/scripts/install-fake-cron.sh")"
+
+# matching gen: no replay
+printf '%s\n' 'hermes-broker' > "$CLAUDE/self-update.services"
+export CCC_TEST_REAPPLY_MARKER="$TMP/reapplied.marker"
+rm -f "$CCC_TEST_REAPPLY_MARKER" "$TMP/spool"/*.json
+printf '%s\n' '0 4 * * * echo keepme' > "$FAKE_CRON"
+jq -nc --arg gen "$fake_gen" \
+  '{schema:"ccc.install-record.v1",installer:"scripts/install-fake-cron.sh",marker:"# ccc-node:fake",gen:$gen,argv:["--apply"],applied_at:"2026-01-01T00:00:00Z"}' \
+  > "$STATE/install-fake-cron.json"
+out="$(run_selfup run)"; rc=$?
+ok "matching gen does not re-apply" '[ "$rc" = 0 ] && [ ! -f "$CCC_TEST_REAPPLY_MARKER" ]'
+ok "matching-gen tick leaves unrelated crontab lines alone" 'grep -qF "echo keepme" "$FAKE_CRON"'
+
+# drifted gen: replay + stamp + notify
+echo drift-reapply > "$TMP/seed/file.txt"
+git -C "$TMP/seed" add -A && git -C "$TMP/seed" commit -qm reapply-drift && git -C "$TMP/seed" push -q origin main
+rm -f "$CCC_TEST_REAPPLY_MARKER" "$TMP/spool"/*.json
+jq -nc '{schema:"ccc.install-record.v1",installer:"scripts/install-fake-cron.sh",marker:"# ccc-node:fake",gen:"h_000000000000",argv:["--apply"],applied_at:"2026-01-01T00:00:00Z"}' \
+  > "$STATE/install-fake-cron.json"
+out="$(run_selfup run)"; rc=$?
+ok "drifted gen re-applies and exits 0" '[ "$rc" = 0 ] && [ -f "$CCC_TEST_REAPPLY_MARKER" ]'
+ok "re-apply stamps the current gen onto the managed line" 'grep -qF "# ccc-node:fake gen=$fake_gen" "$FAKE_CRON"'
+ok "re-apply preserves unrelated crontab lines" 'grep -qF "echo keepme" "$FAKE_CRON"'
+ok "re-apply is mentioned in the success notify" 'grep -rh "cron 재적용" "$TMP/spool" >/dev/null 2>&1'
+
+# kill-switch file
+echo noswitch > "$TMP/seed/file.txt"
+git -C "$TMP/seed" add -A && git -C "$TMP/seed" commit -qm reapply-killfile && git -C "$TMP/seed" push -q origin main
+: > "$CLAUDE/self-update.no-reapply"
+rm -f "$CCC_TEST_REAPPLY_MARKER" "$TMP/spool"/*.json
+jq -nc '{schema:"ccc.install-record.v1",installer:"scripts/install-fake-cron.sh",marker:"# ccc-node:fake",gen:"h_000000000000",argv:["--apply"],applied_at:"2026-01-01T00:00:00Z"}' \
+  > "$STATE/install-fake-cron.json"
+out="$(run_selfup run)"; rc=$?
+ok "operator no-reapply file skips replay" '[ "$rc" = 0 ] && [ ! -f "$CCC_TEST_REAPPLY_MARKER" ]'
+rm -f "$CLAUDE/self-update.no-reapply"
+
+# env kill-switch
+echo noenv > "$TMP/seed/file.txt"
+git -C "$TMP/seed" add -A && git -C "$TMP/seed" commit -qm reapply-killenv && git -C "$TMP/seed" push -q origin main
+rm -f "$CCC_TEST_REAPPLY_MARKER"
+out="$(CCC_SELF_UPDATE_REAPPLY=0 run_selfup run)"; rc=$?
+ok "CCC_SELF_UPDATE_REAPPLY=0 skips replay" '[ "$rc" = 0 ] && [ ! -f "$CCC_TEST_REAPPLY_MARKER" ]'
+
+# replay failure restores crontab
+echo failre > "$TMP/seed/file.txt"
+git -C "$TMP/seed" add -A && git -C "$TMP/seed" commit -qm reapply-fail && git -C "$TMP/seed" push -q origin main
+printf '%s\n' '0 4 * * * echo keepme' > "$FAKE_CRON"
+rm -f "$CCC_TEST_REAPPLY_MARKER" "$TMP/spool"/*.json
+jq -nc '{schema:"ccc.install-record.v1",installer:"scripts/install-fake-cron.sh",marker:"# ccc-node:fake",gen:"h_000000000000",argv:["--apply"],applied_at:"2026-01-01T00:00:00Z"}' \
+  > "$STATE/install-fake-cron.json"
+out="$(CCC_TEST_REAPPLY_FAIL=1 run_selfup run 2>&1)"; rc=$?
+ok "failed re-apply exits 12" '[ "$rc" = 12 ]'
+ok "failed re-apply restores the pre-reapply crontab" 'grep -qF "echo keepme" "$FAKE_CRON" && ! grep -qF "ccc-node:fake" "$FAKE_CRON"'
+ok "failed re-apply notifies" 'grep -rh "cron 재적용 실패" "$TMP/spool" >/dev/null 2>&1'
 
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

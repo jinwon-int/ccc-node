@@ -96,5 +96,5 @@ out="$(CCC_CRUSH_BIN="$FAKE" CCC_CRUSH_MODEL=kimi/k3 CCC_CRUSH_WORKDIR="$TMP" CC
 after_env="$(cat "$FAKE_CRUSH_ENV")"
 ok "failed validation never invokes provider" '[ "$before_env" = "$after_env" ]'
 
-echo "pass=$pass fail=$fail"
+echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

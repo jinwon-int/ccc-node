@@ -79,12 +79,29 @@ ok "installed line runs the autosave cmd" 'grep -q "ccc-skill-autosave.sh" "$CRO
 ok "managed timezone block installed" \
   '[ "$(grep -cF "# ccc-node:autosave-schedule:begin" "$CRON_STORE")" = 1 ] && grep -qF "CRON_TZ=Etc/UTC" "$CRON_STORE"'
 
+# ---- generation stamp (#1081): content hash of installer + shared libs ------
+# Inputs are owned by ccc_installer_gen_inputs (#1077): installer + cron-common.
+# shellcheck source=/dev/null
+. "$HERE/lib/installer-gen-stamp.sh"
+want_gen="$(ccc_installer_gen_stamp_auto "$SC")"
+ok "installed line carries gen stamp" 'grep -qE "# ccc-node:skill-autosave gen=h_[0-9a-f]{12}$" "$CRON_STORE"'
+ok "gen stamp matches installer content" 'grep -qF "gen=$want_gen" "$CRON_STORE"'
+ok "BEGIN/END block markers stay unstamped (exact-match parsed)" '! grep -qE "autosave-schedule:(begin|end) gen=" "$CRON_STORE"'
+
+# ---- install record (#1081 phase 2): replay material for self-update --------
+REC="$CCC_STATE_DIR/install-skill-autosave-cron.json"
+ok "apply writes an install record" '[ -f "$REC" ]'
+ok "record carries schema/marker/gen" 'jq -e ".schema==\"ccc.install-record.v1\" and .marker==\"# ccc-node:skill-autosave\" and .gen==\"$want_gen\"" "$REC" >/dev/null'
+ok "record argv materializes resolved schedule and fleet identity" \
+  'jq -e ".argv == [\"--apply\",\"--schedule\",\"45 20 * * *\",\"--node\",\"fixture-node\"]" "$REC" >/dev/null'
+
 # ---- idempotency: re-apply keeps a single marker line ----------------------
 run bash "$SC" --apply
 okc "$RC" 0 "re-apply exits 0"
 ok "re-apply still exactly one marker line" '[ "$(grep -cF "$MARKER" "$CRON_STORE")" = 1 ]'
 ok "re-apply still exactly one timezone block" \
   '[ "$(grep -cF "# ccc-node:autosave-schedule:begin" "$CRON_STORE")" = 1 ]'
+ok "re-apply keeps the same gen stamp" 'grep -qF "gen=$want_gen" "$CRON_STORE"'
 
 # ---- unrelated pre-existing lines are preserved ----------------------------
 printf '%s\n' "CRON_TZ=Asia/Seoul" "0 3 * * * /usr/bin/other-job" > "$CRON_STORE"
@@ -100,6 +117,7 @@ ok "marker line removed" '[ "$(grep -cF "$MARKER" "$CRON_STORE")" = 0 ]'
 ok "unrelated line survives removal" 'grep -qF "other-job" "$CRON_STORE"'
 ok "managed timezone block removed" '! grep -qF "# ccc-node:autosave-schedule:begin" "$CRON_STORE" && ! grep -qF "CRON_TZ=Etc/UTC" "$CRON_STORE"'
 ok "unrelated timezone survives removal" 'grep -qF "CRON_TZ=Asia/Seoul" "$CRON_STORE"'
+ok "remove drops the install record (no resurrection via re-apply)" '[ ! -f "$REC" ]'
 
 # ---- malformed managed block fails closed ---------------------------------
 printf '%s\n' '# ccc-node:autosave-schedule:begin' 'CRON_TZ=Etc/UTC' > "$CRON_STORE"
