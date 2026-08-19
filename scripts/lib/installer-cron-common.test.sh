@@ -96,6 +96,25 @@ NOCRON=(--label demo --marker "$M" --begin "$B" --end "$E"
 (ccc_cron_installer_finish "${NOCRON[@]}" --apply 1 --remove 0 --schedule-desc x --body x) >/dev/null 2>&1; rc=$?
 ok "driver exits 3 when the crontab command is absent" '[ "$rc" = 3 ]'
 
+# ---- ccc_cron_root_scope_warning (#1079 generalization) ---------------------
+# Root on a service-account node writes a second, dead install into root's
+# crontab (the gongmyoung ghost class). Warning-only; euid/home args are seams.
+mkdir -p "$TMP/home/gongmyoung/.claude" "$TMP/noroothome"
+out="$(ccc_cron_root_scope_warning demo 0 "$TMP/noroothome" "$TMP/home" 2>&1)"
+ok "root + no root harness + service-account harness warns and names the account" \
+  'grep -q "WARNING (demo): running as root" <<<"$out" && grep -q "gongmyoung" <<<"$out"'
+
+mkdir -p "$TMP/roothome/.claude"
+out="$(ccc_cron_root_scope_warning demo 0 "$TMP/roothome" "$TMP/home" 2>&1)"
+ok "root with a real root harness stays silent" '[ -z "$out" ]'
+
+out="$(ccc_cron_root_scope_warning demo 1000 "$TMP/noroothome" "$TMP/home" 2>&1)"
+ok "non-root never warns" '[ -z "$out" ]'
+
+mkdir -p "$TMP/emptyhome"
+out="$(ccc_cron_root_scope_warning demo 0 "$TMP/noroothome" "$TMP/emptyhome" 2>&1)"
+ok "root with no service-account harness anywhere stays silent" '[ -z "$out" ]'
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
 
