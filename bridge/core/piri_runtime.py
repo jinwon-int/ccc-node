@@ -767,6 +767,42 @@ def _message_update_events(
     return (), False
 
 
+# Mirrors claude_runtime's retry policy for upstream HTTP statuses (immediate
+# retry is pointless for quota/billing 402/403, while 429/5xx deserve one).
+# Kept per-runtime until provider error mapping is centralized (#1148 scope
+# deliberately stops at preserving the detail, not the shared-mapper refactor).
+_RETRYABLE_UPSTREAM_STATUSES = frozenset({408, 429, 500, 502, 503, 504, 529})
+_UPSTREAM_STATUS_RE = re.compile(r"\b([45]\d\d)\b")
+_UPSTREAM_DETAIL_MAX = 500
+
+
+def _upstream_error_detail(
+    provider_message: Mapping[str, Any],
+) -> tuple[str | None, int | None]:
+    """Preserve the upstream failure reason the agent put on the message.
+
+    stopReason=error events carry the actionable diagnosis in `errorMessage`
+    (e.g. Kimi's "403 {…usage limit…} — quota refreshes next cycle"). The old
+    code dropped it at this boundary, so a self-healing quota condition
+    surfaced as a body-free "piri_turn_failed" and cost a 4-node SSH
+    investigation (#1148). Returns (bounded detail, first HTTP status found).
+    The detail is an agent-rendered error string — never headers or
+    credentials — whitespace-collapsed and length-capped for the logs and the
+    user-facing failure card, both of which render ErrorEvent.message.
+    """
+    raw = provider_message.get("errorMessage")
+    if not isinstance(raw, str):
+        return None, None
+    detail = re.sub(r"\s+", " ", raw).strip()
+    if not detail:
+        return None, None
+    if len(detail) > _UPSTREAM_DETAIL_MAX:
+        detail = detail[: _UPSTREAM_DETAIL_MAX - 1].rstrip() + "…"
+    status_match = _UPSTREAM_STATUS_RE.search(detail)
+    status = int(status_match.group(1)) if status_match else None
+    return detail, status
+
+
 def _message_end_result(
     event: Mapping[str, Any],
     *,
@@ -787,9 +823,14 @@ def _message_end_result(
             message="Piri turn was interrupted",
         )
     elif stop_reason == "error":
+        detail, upstream_status = _upstream_error_detail(provider_message)
+        message = "Piri provider turn failed"
+        if detail:
+            message = f"{message}: {detail}"
         terminal_error = ErrorEvent(
             code="piri_turn_failed",
-            message="Piri provider turn failed",
+            message=message,
+            retryable=upstream_status in _RETRYABLE_UPSTREAM_STATUSES,
         )
     else:
         # A later successful assistant message means Piri's automatic retry recovered.
