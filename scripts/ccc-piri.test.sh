@@ -119,5 +119,44 @@ rc=$?
 set -e
 ok "CCC_PIRI_MEMORY_SKIP=1 bypasses the memory bootstrap" '[ "$rc" = 0 ] && [ "$out" = "REAL:" ] && [ "$(cat "$order")" = "real" ]'
 
+# --- shebang-unresolvable materializer (Termux exit-78 class) ---
+# Same incident class as ccc-codex: without libtermux-exec's LD_PRELOAD hook
+# the kernel cannot exec `#!/usr/bin/env python3` on Android; a broken
+# absolute interpreter reproduces the ENOENT class hermetically. The launcher
+# must retry via an interpreter from PATH, preserving the env prefix.
+mat_py="$TMP/materializer-py"
+cat > "$mat_py" <<'PY'
+#!/nonexistent/ccc-test-interp
+import os, sys
+sub = sys.argv[1] if len(sys.argv) > 1 else ""
+order = os.environ["ORDER_FILE"]
+with open(order, "a", encoding="utf-8") as fh:
+    fh.write(sub + "\n")
+if sub == "materialize":
+    with open(os.environ["ENV_FILE"], "a", encoding="utf-8") as fh:
+        fh.write("CODEX_HOME=%s\nPROVIDER=%s\nMAX_BYTES=%s\n" % (
+            os.environ.get("CODEX_HOME", ""),
+            os.environ.get("CCC_MEMORY_MATERIALIZER_PROVIDER", ""),
+            os.environ.get("CCC_CODEX_MEMORY_MAX_BYTES", "")))
+sys.exit(int(os.environ.get("MAT_RC", "0")))
+PY
+chmod 0700 "$mat_py"
+: > "$order"; : > "$env_file"; rm -f "$argv"
+set +e
+out="$(printf 'stdin data' | ORDER_FILE="$order" ARGV_FILE="$argv" CWD_FILE="$cwd_file" ENV_FILE="$env_file" MAT_RC=0 REAL_RC=23 CCC_PIRI_MEMORY_HOME="$piri_home" CCC_PIRI_MEMORY_MATERIALIZER_PATH="$mat_py" CCC_PIRI_REAL_CLI_PATH="$real" "$LAUNCHER" --mode rpc 2>"$err")"
+rc=$?
+set -e
+ok "launcher falls back to an explicit interpreter when the materializer shebang cannot exec" \
+  '[ "$rc" = 23 ] && grep -qx materialize "$order" && grep -qx real "$order" && ! grep -q "memory bootstrap unavailable" "$err"'
+ok "shebang fallback preserves the materialize env prefix" \
+  'grep -Fx "CODEX_HOME=$piri_home" "$env_file" >/dev/null && grep -Fx "PROVIDER=piri" "$env_file" >/dev/null && grep -Fx "MAX_BYTES=16384" "$env_file" >/dev/null'
+
+: > "$order"; : > "$err"
+set +e
+out="$(printf '' | ORDER_FILE="$order" ARGV_FILE="$argv" CWD_FILE="$cwd_file" ENV_FILE="$env_file" MAT_RC=5 CCC_PIRI_MEMORY_HOME="$piri_home" CCC_PIRI_MEMORY_MATERIALIZER_PATH="$mat_py" CCC_PIRI_REAL_CLI_PATH="$real" "$LAUNCHER" 2>"$err")"
+rc=$?
+set -e
+ok "shebang-fallback materializer still fails closed on real script failures" '[ "$rc" = 78 ]'
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
