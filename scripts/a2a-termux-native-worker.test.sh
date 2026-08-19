@@ -22,8 +22,11 @@ printf 'console.log("worker fixture");\n' > "$TMP/worker/dist/worker.js"
 printf 'console.log("bridge fixture");\n' > "$TMP/worker/scripts/claude-a2a-analysis-bridge.mjs"
 printf 'console.log("patch bridge fixture");\n' > "$TMP/worker/scripts/claude-a2a-patch-bridge.mjs"
 printf 'console.log("codex bridge fixture");\n' > "$TMP/worker/scripts/codex-a2a-analysis-bridge.mjs"
+printf 'console.log("piri bridge fixture");\n' > "$TMP/worker/scripts/piri-a2a-analysis-bridge.mjs"
 printf 'console.log("task handler fixture");\n' > "$TMP/worker/scripts/a2a-task-handler.mjs"
 chmod +x "$TMP/bin/node-native" "$TMP/bin/claude-native" "$TMP/bin/codex-native"
+printf '#!/usr/bin/env bash\necho piri "$@"\n' > "$TMP/bin/piri-cli"
+chmod +x "$TMP/bin/piri-cli"
 
 write_env() {
   cat > "$1" <<EOF
@@ -159,10 +162,41 @@ write_patch_env "$patch_good"
 out="$(bash "$TOOL" check --env-file "$patch_good" 2>&1)"; rc=$?
 ok "patch bridge + single-shot passes" '[ "$rc" = 0 ] && grep -q "safe to launch" <<<"$out" && grep -q "adapter=claude-a2a-patch-bridge" <<<"$out"'
 
+write_piri_env() {
+  cat > "$1" <<EOF
+A2A_TERMUX_NATIVE=1
+A2A_NATIVE_NODE_BIN=$TMP/bin/node-native
+A2A_WORKER_ROOT=$TMP/worker
+OPENCLAW_BIN=$TMP/worker/scripts/piri-a2a-analysis-bridge.mjs
+A2A_OPENCLAW_ANALYSIS_BIN=$TMP/worker/scripts/piri-a2a-analysis-bridge.mjs
+A2A_PIRI_CLI=$TMP/bin/piri-cli
+A2A_PIRI_EXEC=native
+A2A_PIRI_MODEL=zai/glm-5.3
+A2A_PIRI_THINKING=high
+BROKER_URL=http://127.0.0.1:18790
+WORKER_MODE=persistent
+WORKER_METADATA_JSON={"runtime":"piri","harness":"piri","adapter":"piri-a2a-analysis-bridge","nodeId":"mobile-native"}
+CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+DISABLE_GROWTHBOOK=1
+USE_BUILTIN_RIPGREP=0
+EOF
+}
+
 codex_good="$TMP/codex-good.env"
 write_codex_env "$codex_good"
 out="$(bash "$TOOL" check --env-file "$codex_good" 2>&1)"; rc=$?
 ok "Codex analysis bridge passes with Codex runtime metadata" '[ "$rc" = 0 ] && grep -q "safe to launch" <<<"$out" && grep -q "runtime=codex,harness=codex,adapter=codex-a2a-analysis-bridge" <<<"$out"'
+
+piri_good="$TMP/piri-good.env"
+write_piri_env "$piri_good"
+out="$(bash "$TOOL" check --env-file "$piri_good" 2>&1)"; rc=$?
+ok "Piri analysis bridge passes with Piri runtime metadata" '[ "$rc" = 0 ] && grep -q "safe to launch" <<<"$out" && grep -q "runtime=piri,harness=piri,adapter=piri-a2a-analysis-bridge" <<<"$out"'
+
+piri_missing_cli="$TMP/piri-missing-cli.env"
+write_piri_env "$piri_missing_cli"
+sed -i '/^A2A_PIRI_CLI=/d' "$piri_missing_cli"
+out="$(bash "$TOOL" check --env-file "$piri_missing_cli" 2>&1)"; rc=$?
+ok "Piri bridge without A2A_PIRI_CLI fails closed" '[ "$rc" = 2 ] && grep -q "A2A_PIRI_CLI" <<<"$out"'
 
 codex_missing_bin="$TMP/codex-missing-bin.env"
 write_codex_env "$codex_missing_bin"
