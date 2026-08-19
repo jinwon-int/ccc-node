@@ -206,6 +206,38 @@ async def test_admission_timeout_preserves_interrupt_drain_abort_close_order() -
     assert outcome is TurnStreamOutcome.ADMISSION_TIMEOUT
     assert order == ["interrupt", "pending-cancel", "abort", "aclose"]
 
+@pytest.mark.anyio
+async def test_expired_approval_bound_takes_the_stall_path_without_a_read() -> None:
+    # A grace that already elapsed before the read is scheduled clamps to
+    # exactly 0.0 in _select_timeout; the expired bound must take the stall
+    # path, not crash into EventStream.read's positivity guard (the py3.12
+    # CI flake: approval grace 0.05s on a loaded runner surfaced as
+    # "timeout_seconds must be positive" instead of the stall outcome).
+    order: list[str] = []
+    stream = ScriptedStream([], order=order)
+    state = TurnEventState()
+    state.mark_admitted()
+    state.approval_pending = True
+    state.approval_pending_since = 0.0  # far in the past vs the loop clock
+
+    outcome = await consume_turn_stream(
+        stream,
+        state=state,
+        has_text=lambda: False,
+        on_event=_observer(state),
+        interrupt=_record_action(order, "interrupt"),
+        abort_stalled_turn=_record_action(order, "abort"),
+        admission_timeout_seconds=0.001,
+        approval_stall_seconds=0.001,
+        terminal_stall_seconds=0.0,
+        interrupt_timeout_seconds=1.0,
+    )
+
+    assert outcome is TurnStreamOutcome.APPROVAL_STALL
+    assert order == ["interrupt", "abort", "aclose"]
+    assert stream.reads == 0
+
+
 
 @pytest.mark.anyio
 async def test_terminal_stall_uses_the_same_order_after_admission() -> None:
