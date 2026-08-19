@@ -16,15 +16,23 @@ okc() { if [ "$1" = "$2" ]; then pass=$((pass+1)); else fail=$((fail+1)); echo "
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
+# Fixture stubs name the build host's resolved bash, not `#!/usr/bin/env bash`
+# which cannot resolve on Termux (#1153; same root as #472/#663).
+. "$(cd "$(dirname "$0")/.." && pwd)/claude/hooks/lib/test-stub.sh"
+
 # Stub systemctl / launchctl: record every invocation, always succeed.
 SC_CALLS="$TMP/systemctl.calls"
 SC_STUB="$TMP/systemctl"
-printf '#!/usr/bin/env bash\necho "$*" >> "%s"\nexit 0\n' "$SC_CALLS" > "$SC_STUB"
-chmod +x "$SC_STUB"
+write_exec_stub "$SC_STUB" <<EOF
+echo "\$*" >> "$SC_CALLS"
+exit 0
+EOF
 LC_CALLS="$TMP/launchctl.calls"
 LC_STUB="$TMP/launchctl"
-printf '#!/usr/bin/env bash\necho "$*" >> "%s"\nexit 0\n' "$LC_CALLS" > "$LC_STUB"
-chmod +x "$LC_STUB"
+write_exec_stub "$LC_STUB" <<EOF
+echo "\$*" >> "$LC_CALLS"
+exit 0
+EOF
 
 PROJECT="$TMP/myproj"
 mkdir -p "$PROJECT"
@@ -128,8 +136,7 @@ ok "dry-run is mutation-free" \
 ROLLBACK_CALLS="$TMP/systemctl-rollback.calls"
 ROLLBACK_COUNT="$TMP/systemctl-rollback.count"
 ROLLBACK_STUB="$TMP/systemctl-rollback"
-cat > "$ROLLBACK_STUB" <<SH
-#!/usr/bin/env bash
+write_exec_stub "$ROLLBACK_STUB" <<SH
 echo "\$*" >> "$ROLLBACK_CALLS"
 count="\$(cat "$ROLLBACK_COUNT" 2>/dev/null || echo 0)"
 count=\$((count + 1))
@@ -137,7 +144,6 @@ printf '%s' "\$count" > "$ROLLBACK_COUNT"
 [ "\$count" = 1 ] && exit 1
 exit 0
 SH
-chmod +x "$ROLLBACK_STUB"
 unit_before="$(sha256sum "$UNIT")"
 run env HOME="$FH" CCC_SYSTEMD_DIR="$SD" CCC_SYSTEMCTL="$ROLLBACK_STUB" \
     bash "$SSD" reconcile
@@ -154,12 +160,10 @@ ok "successful rollback leaves no staging artifacts" \
 # gets a non-zero result for operator follow-up.
 ALWAYS_FAIL_CALLS="$TMP/systemctl-always-fail.calls"
 ALWAYS_FAIL_STUB="$TMP/systemctl-always-fail"
-cat > "$ALWAYS_FAIL_STUB" <<SH
-#!/usr/bin/env bash
+write_exec_stub "$ALWAYS_FAIL_STUB" <<SH
 echo "\$*" >> "$ALWAYS_FAIL_CALLS"
 exit 1
 SH
-chmod +x "$ALWAYS_FAIL_STUB"
 unit_before="$(sha256sum "$UNIT")"
 run env HOME="$FH" CCC_SYSTEMD_DIR="$SD" CCC_SYSTEMCTL="$ALWAYS_FAIL_STUB" \
     bash "$SSD" reconcile
@@ -207,9 +211,16 @@ ok "symlink skip does not contact systemctl" '[ ! -s "$SC_CALLS" ]'
 
 # A multiply hard-linked main unit likewise keeps all names, bytes, and link
 # metadata intact instead of severing the topology with an atomic replacement.
+# The fixture itself needs filesystem hard-link support: Android/Termux's
+# f2fs refuses `ln` with EPERM even for the owner (실측 gongyung), and on such
+# a filesystem a multiply-linked unit can never exist, so the reconcile path
+# this block exercises is unreachable there — probe once and skip visibly.
 HARDLINK_SD="$TMP/hardlink-sd"
 HARDLINK_PEER="$TMP/hardlink-peer.service"
 mkdir -p "$HARDLINK_SD"
+hl_probe="$TMP/hardlink-probe"; printf 'x' > "$hl_probe"
+if ln "$hl_probe" "$hl_probe.link" 2>/dev/null; then
+rm -f "$hl_probe" "$hl_probe.link"
 cp "$UNIT" "$HARDLINK_PEER"
 sed -i 's/^Restart=always$/Restart=on-failure/' "$HARDLINK_PEER"
 HARDLINK_UNIT="$HARDLINK_SD/ccc-telegram-bridge.service"
@@ -226,6 +237,10 @@ ok "hard-link reconcile preserves bytes, identity, and link count" \
 ok "hard-link skip directs explicit normalization and drop-ins" \
    'grep -q "Normalize the main-unit path explicitly" "$OUT" && grep -q "drop-ins" "$OUT"'
 ok "hard-link skip does not contact systemctl" '[ ! -s "$SC_CALLS" ]'
+else
+rm -f "$hl_probe"
+echo "SKIP: hard-link reconcile cases (filesystem denies hard links on this host)"
+fi
 
 # User scope uses the user target and --user daemon-reload, while retaining the
 # same state-preserving reconciliation behavior. The scope override is accepted
