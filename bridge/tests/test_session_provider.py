@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -2172,3 +2173,43 @@ async def test_codex_effort_aligns_stale_provider_before_selection(tmp_path: Pat
     assert session["session_id"] is None
     assert "model" not in session
     assert session["effort"] == "high"
+
+
+@pytest.mark.anyio
+async def test_routeless_distill_job_warns_once_about_unroutable_local_sink(
+    tmp_path: Path,
+    caplog,
+) -> None:
+    """A node whose memory mode yields no audience loses the local sink lane.
+
+    ``mark_extraction_done`` sets ``local_sink_status=UNROUTABLE`` with no
+    ``error_code`` and no log line, so ``resume.md`` and local memory facts stop
+    being written while the wiki/honcho sinks keep succeeding — the failure is
+    invisible in logs and in ``--status``. Warn once per process instead.
+    """
+
+    from telegram_bot.memory.distill_types import DistillTrigger
+
+    manager = make_manager(tmp_path, "claude")
+    bot = bare_bot(manager, provider="claude")
+    bot._config.bridge_memory_mode = "curated"
+    journal = RecordingDistillJournal()
+    bot._distill_journal = journal
+
+    with caplog.at_level(logging.WARNING, logger="telegram_bot.core.bot"):
+        for _ in range(3):
+            await bot._enqueue_previous_codex_session(
+                {"provider": "claude", "session_id": "claude-1"},
+                DistillTrigger.NEW_COMMAND,
+            )
+
+    warnings = [
+        record
+        for record in caplog.records
+        if "local sink unroutable" in record.getMessage()
+    ]
+    assert len(warnings) == 1
+    assert "curated" in warnings[0].getMessage()
+    # The job is still enqueued: wiki/honcho sinks remain unaffected.
+    assert len(journal.calls) == 3
+    assert journal.calls[0]["memory_audience"] is None

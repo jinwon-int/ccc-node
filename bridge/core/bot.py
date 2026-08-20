@@ -119,6 +119,7 @@ class TelegramBot(
         self._session_manager = session_manager
         self._project_chat = project_chat
         self._distill_journal = distill_journal
+        self._local_sink_unroutable_warned = False
         self._distill_snapshot_worker = distill_snapshot_worker
         # Budget-gated distill extraction worker composed by build_context;
         # retained by the running application so #465's scheduling phase
@@ -1222,6 +1223,20 @@ class TelegramBot(
             if isinstance(stored_audience, str) and isinstance(stored_scope, str):
                 memory_audience = stored_audience
                 memory_scope = stored_scope
+        if memory_audience is None and not getattr(
+            self, "_local_sink_unroutable_warned", False
+        ):
+            # The journal marks a routeless job UNROUTABLE with no error_code and
+            # no log line, so a node whose memory mode yields no audience loses the
+            # local lane (resume.md, memory facts) silently. Wiki/Honcho sinks are
+            # unaffected. Warn once per process so the gap is observable.
+            self._local_sink_unroutable_warned = True
+            logger.warning(
+                "distill local sink unroutable: bridge_memory_mode=%r resolves no memory "
+                "audience, so resume.md and local memory facts will not be written "
+                "(wiki/honcho sinks unaffected)",
+                getattr(self._config, "bridge_memory_mode", None),
+            )
         enqueue_kwargs = {
             "provider": provider,
             "thread_id": thread_id,
