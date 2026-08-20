@@ -44,6 +44,26 @@ packages = [
 # staged plan (72 → 75 → 80) is documented in docs/quality-baseline.md. CI
 # runs pytest with --cov from bridge/, so this config applies to every gated
 # coverage run.
+# The tests import `telegram_bot`, which is this directory installed under its
+# package name (see [tool.setuptools] package-dir above). Nothing inside the
+# checkout is importable as `telegram_bot`, so a bare `pytest` has to find that
+# name somewhere else on sys.path — and on any node that actually runs the
+# bridge, it finds the DEPLOYED copy at /opt/ccc-node instead of the code under
+# test. The failure is silent and cuts both ways: an older deployment reports
+# failures the checkout does not have (observed: three test_distill_local_sink
+# cases red on a clean main), and a deployment that is merely different reports
+# green for code that never executed. A clean clone does not help, because the
+# clone has no `telegram_bot` either.
+#
+# CI already resolves this with a checked-in shim — .github/pythonpath holds a
+# `telegram_bot` symlink back to this directory — but it only worked there
+# because the workflow exports PYTHONPATH by hand, which no local invocation
+# does. Declaring it here makes the same shim the default for every run, so
+# local and CI resolve the same package by construction rather than by
+# remembering an env var. Relative to this file's directory, i.e. rootdir.
+[tool.pytest.ini_options]
+pythonpath = ["../.github/pythonpath"]
+
 [tool.coverage.run]
 branch = true
 
