@@ -274,6 +274,12 @@ else
   err "doctor hook-tree walk tests failed"
   tail -10 "$TMP/doctor-hookfiles-test.out" 2>/dev/null
 fi
+if python3 scripts/a2a_piri_memory_snapshot_test.py >"$TMP/a2a-piri-memory-test.out" 2>&1; then
+  say "  ok A2A Piri shared memory snapshot producer tests"
+else
+  err "A2A Piri shared memory snapshot producer tests failed"
+  tail -10 "$TMP/a2a-piri-memory-test.out" 2>/dev/null
+fi
 # A suite must not inherit the harness environment of the node it runs on
 # (#1064). The per-suite guard `ccc_test_reset_hook_env` (#1023) only reaches
 # suites that source test-stub.sh, so Python-driven suites fell outside it and
