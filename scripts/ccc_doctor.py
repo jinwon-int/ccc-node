@@ -1392,6 +1392,25 @@ class Doctor:
                 "CCC_NUNCHI_MEMPALACE_STATUS", nunchi_home / "mempalace-refresh.status.json"
             )
         )
+        # Audience-scoped lanes (#1202): the scoped dispatcher re-execs per
+        # scope with CCC_NUNCHI_MEMPALACE_STATUS under
+        # <audience-root>/<scope>/nunchi/, so the top-level status file stops
+        # updating the day scoping is enabled — reading it reports a healthy
+        # lane as frozen forever (실측: 4 nodes, legacy file ~14 days old,
+        # scoped files 5 minutes old). Prefer the NEWEST scoped status file.
+        scope_count = 0
+        if re.search(r"\bCCC_NUNCHI_AUDIENCE_SCOPED=1\b", cron):
+            m_root = re.search(r"\bCCC_NUNCHI_AUDIENCE_ROOT=(\S+)", cron)
+            if m_root:
+                scoped = sorted(
+                    Path(m_root.group(1)).glob("*/nunchi/mempalace-refresh.status.json"),
+                    key=lambda p: p.stat().st_mtime if p.exists() else 0,
+                    reverse=True,
+                )
+                scope_count = len(scoped)
+                if scoped:
+                    status_file = scoped[0]
+
         collection = "none"
         coll_state = ""
         sweep_finished: int | None = None
@@ -1409,8 +1428,14 @@ class Doctor:
             collection = "none"
 
         ticks, stale = self._nunchi_tick_freshness(
-            configured, nunchi_home, sweep_finished, sweep_cron_present=m is not None
+            configured,
+            nunchi_home,
+            sweep_finished,
+            sweep_cron_present=m is not None,
+            scoped=scope_count > 0,
         )
+        if scope_count:
+            ticks = f"scopes={scope_count} {ticks}"
 
         status = (
             "configured={}; runtime={}; match={}; source={} {}; "
@@ -1441,6 +1466,7 @@ class Doctor:
         sweep_finished: int | None,
         *,
         sweep_cron_present: bool,
+        scoped: bool = False,
     ) -> tuple[str, list[str]]:
         """Age the newest ingest/sweep ticks for check_nunchi_collection (#1200).
 
@@ -1487,7 +1513,9 @@ class Doctor:
             ingest_tick = f"age={ingest_age}min"
             if ingest_stale_min and ingest_age > ingest_stale_min:
                 stale.append(f"ingest-tick-stale({ingest_age}min>{ingest_stale_min}min)")
-        elif configured == "claude":
+        elif configured == "claude" and not scoped:
+            # Scoped lanes keep their feed artefacts under the audience root
+            # (#1202) — the top-level file is legitimately absent there.
             stale.append("ingest-status-missing")
 
         ticks = f"ingest:{ingest_tick} sweep:{sweep_tick}"

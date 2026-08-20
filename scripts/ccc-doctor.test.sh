@@ -811,6 +811,21 @@ nc="$(CCC_NUNCHI_SWEEP_STALE_MIN=0 run_nc codex "$codex_cron" "$stale_json" "$nb
 ok "CCC_NUNCHI_SWEEP_STALE_MIN=0 disables the sweep age gate (정상)" \
   'jq -e ".klass == \"정상\" and (.status | contains(\"STALE\") | not)" <<<"$nc" >/dev/null'
 
+# #1202: audience-scoped lanes write status under <root>/<scope>/nunchi/, so
+# the top-level file is a legacy leftover — the doctor must prefer the newest
+# scoped status (실측: legacy ~14 days old, scoped 5 minutes, lane healthy).
+nc_aud="$TMP/nc-aud"; mkdir -p "$nc_aud/private-x/nunchi"
+scoped_cron="*/10 * * * * CCC_NUNCHI_AUDIENCE_SCOPED=1 CCC_NUNCHI_AUDIENCE_ROOT=$nc_aud bash /h/.claude/hooks/nunchi/piri-feed.sh >> /log 2>&1 # nunchi:#816
+17 * * * * CCC_NUNCHI_AUDIENCE_SCOPED=1 CCC_NUNCHI_AUDIENCE_ROOT=$nc_aud bash /h/.claude/hooks/nunchi/mempalace-refresh.sh piri /h/.piri/agent/sessions >> /log 2>&1 # nunchi:#816"
+printf '%s' "$ok_json" > "$nc_aud/private-x/nunchi/mempalace-refresh.status.json"
+nc="$(run_nc piri "$scoped_cron" "$stale_json" "$nbin/mempalace")"
+ok "audience-scoped lane prefers the newest scoped status — legacy stale top-level ignored (정상)" \
+  'jq -e ".klass == \"정상\" and (.status | contains(\"scopes=1\") and (contains(\"STALE\") | not))" <<<"$nc" >/dev/null'
+printf '%s' "$stale_json" > "$nc_aud/private-x/nunchi/mempalace-refresh.status.json"
+nc="$(run_nc piri "$scoped_cron" "" "$nbin/mempalace")"
+ok "audience-scoped lane with a genuinely stale scoped tick is a 경고 (sweep-tick-stale)" \
+  'jq -e ".klass == \"경고\" and (.status | contains(\"scopes=1\") and contains(\"sweep-tick-stale\"))" <<<"$nc" >/dev/null'
+
 # #1081: doctor surfaces installer-managed cron entries frozen at older code.
 # One row per known marker (absent = opt-in 정상; gen match = 정상; unstamped
 # or mismatched gen = non-fatal 경고) plus unmanaged-marker classification.
