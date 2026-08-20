@@ -11,6 +11,28 @@ ccc-node memory starts from a no-network SessionStart snapshot and refreshes cac
 - Optional local nunchi snapshot on nodes that explicitly enable nunchi mode.
 - Distilled local facts from the Session Distiller pipeline.
 
+## Valid-time semantics (#871)
+
+Structured facts may carry `valid_from` / `valid_until` — a different axis
+from `observed_at` (when the system learned the fact). Boundary rule:
+`valid_from` is inclusive, `valid_until` is exclusive.
+
+- `ccc-memory-search` defaults to `current` mode: facts whose `valid_from`
+  lies in the future are excluded, and expired facts (`valid_until` <= now)
+  are partitioned below still-valid ones — demoted, never deleted, so history
+  stays retrievable.
+- Explicit point-in-time lookup: `ccc-memory-search <query> --as-of <ISO ts>`
+  (or `CCC_MEMORY_AS_OF=<ISO ts>`) returns only facts valid at that instant.
+- Undated or malformed-window facts are always kept (conservative keep) with
+  a body-free `temporal.reason` marker; an unparseable as_of value falls back
+  to `current` mode with a summary signal. Parse failure never hides a fact.
+- Every result carries a body-safe `temporal` block and the search JSON has a
+  top-level `temporal` summary (`mode` / `excluded` / `demoted` / `degraded`).
+- Distill write-back derives `durability` from the fact kind
+  (`task-progress` → `volatile`, everything else `durable`) instead of
+  stamping every fact durable, and the extraction contract's `kind` covers
+  `preference|decision|observation|context|task-progress|procedure|constraint`.
+
 ## Source isolation
 
 - `CCC_NODE_ISOLATION_PROFILE=external` is the higher-priority external-node placement policy. The bridge validates and exports it to Claude hooks; it forces Family Wiki off (injection, refresh, local indexing, and distill queue writes). It is a **memory-source gate, not an execution boundary**: the node has no PreToolUse policy hook (removed, TM-1306), so path/URL/command/MCP execution is governed by behavioral policy plus the OS-level wrappers documented in [`docs/service-control.md`](service-control.md).
