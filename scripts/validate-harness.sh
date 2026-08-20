@@ -327,6 +327,7 @@ HARNESS_SUITES=(claude/hooks/observability.test.sh claude/hooks/security-scan.te
          scripts/a2a-termux-native-worker-health.test.sh \
          scripts/resource-pressure-guard.test.sh \
          scripts/install-memory-refresh-cron.test.sh scripts/install-nunchi.test.sh scripts/install-termux-mempalace.test.sh scripts/ccc-skill-autosave.test.sh \
+         scripts/cost-ledger.test.sh \
          scripts/ccc-skill-promotion.test.sh \
          scripts/ccc-fleet-skills-sync.test.sh \
          scripts/gh-pr-flow-seoseo-merge.test.sh \
