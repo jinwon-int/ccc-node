@@ -536,6 +536,20 @@ out="$(HOME="$TMP/home" CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" \
 ok "load-memory scans blocks when the scanner shebang does not resolve" \
   'grep -q "REDACTED:credential" <<<"$out" && ! grep -q "SENTINELSECRET" <<<"$out"'
 
+# --- #1160: a scanner that exists but FAILS must not fail open silently ------
+cat > "$fake_hookdir/scan-injection.sh" <<'EOF'
+#!/usr/bin/env bash
+exit 1
+EOF
+out="$(HOME="$TMP/home" CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" \
+  CCC_MEMORY_DIR="$scan_mem" CCC_HOOK_DIR="$fake_hookdir" CCC_MEMORY_TOOLS_DIR="$tools" \
+  CCC_HONCHO_MEMORY_ENABLED=0 CCC_MEMORY_NO_REFRESH=1 \
+  bash "$ROOT/claude/hooks/load-memory.sh" SessionStart 2>&1)"
+ok "failing scanner fails open with the raw block (contract unchanged)" \
+  'grep -q "SENTINELSECRET" <<<"$out"'
+ok "failing scanner is noted on stderr, not silent (#1160)" \
+  'grep -qi "UNSCANNED" <<<"$out"'
+
 # Working-state checkpoint block (#1176). Default OFF keeps Claude output
 # byte-identical (checkpoint.sh owns PreCompact/PostCompact there); the
 # Codex/Piri materializer turns it on so those providers get the same

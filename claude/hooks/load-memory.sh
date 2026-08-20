@@ -151,10 +151,20 @@ scan_injection_block() { # <label> <text>
   # scanner; it must not silently become the default on a whole platform.
   # scan-injection.sh's own suite never caught this because it invokes the
   # scanner as `bash "$SCAN"`, which is the form the callers lacked.
-  if [ -x "$HOOKDIR/scan-injection.sh" ] \
-    && scanned="$(printf '%s' "$text" | bash "$HOOKDIR/scan-injection.sh" "$label" 2>/dev/null)"; then
+  if [ ! -x "$HOOKDIR/scan-injection.sh" ]; then
+    printf '%s' "$text"
+    return
+  fi
+  if scanned="$(printf '%s' "$text" | bash "$HOOKDIR/scan-injection.sh" "$label" 2>/dev/null)"; then
     printf '%s' "$scanned"
   else
+    # #1160: the scanner EXISTS but its invocation failed — the block is about
+    # to be injected UNSCANNED on a node that believes itself protected. Note
+    # it on stderr (hook stderr lands in session/hook logs) instead of letting
+    # a whole platform run unprotected silently for months (#1157 shipped
+    # exactly this; memory_render.py got the same note in #1169). The label
+    # only — never the block body. Fail-open itself is unchanged.
+    printf 'load-memory: scan-injection failed (label=%s); injecting UNSCANNED block\n' "$label" >&2
     printf '%s' "$text"
   fi
 }
