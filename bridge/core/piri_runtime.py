@@ -6,6 +6,7 @@ import asyncio
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
+import logging
 import os
 from pathlib import Path
 import re
@@ -30,6 +31,11 @@ from .agent_runtime import (
 )
 from .piri_rpc import PiriRpcProcessClient
 from .codex_runtime import _run_codex_memory_bootstrap
+from .working_state_archive import (
+    ArchiveEvent,
+    archive_working_state,
+    select_working_state_environment,
+)
 from telegram_bot.memory.distill_types import (
     CodexTranscriptSnapshot,
     TranscriptBounds,
@@ -48,6 +54,7 @@ _SESSION_ID_PATTERN = re.compile(
     r"^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,126}[A-Za-z0-9])?$"
 )
 _MODEL_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,255}$")
+logger = logging.getLogger(__name__)
 
 
 class PiriClient(Protocol):
@@ -109,6 +116,7 @@ class PiriSession:
         *,
         on_close: Callable[[PiriSession], None] | None = None,
         memory_refresher: PiriMemoryRefresher | None = None,
+        working_state_environment: Mapping[str, str] | None = None,
     ) -> None:
         if not session_id:
             raise ValueError("Piri session id must not be empty")
@@ -120,6 +128,14 @@ class PiriSession:
         self._on_close = on_close
         self._closed = False
         self._memory_refresher = memory_refresher
+        selected_environment = select_working_state_environment(
+            working_state_environment
+        )
+        self._working_state_environment = (
+            MappingProxyType(selected_environment)
+            if selected_environment is not None
+            else None
+        )
         # Bounded idempotency ledger for post-compaction memory refreshes.
         self._applied_compaction_ids: list[str] = []
 
@@ -140,6 +156,7 @@ class PiriSession:
         try:
             await self._client.close()
         finally:
+            await self._archive_working_state("session_end")
             if self._on_close is not None:
                 self._on_close(self)
 
@@ -165,6 +182,11 @@ class PiriSession:
                 cleanup_required = True
                 while True:
                     event = await self._client.next_event()
+                    if event.get("type") == "compaction_start":
+                        # Piri exposes the one provider lifecycle seam that is
+                        # early enough to preserve the pre-compaction state.
+                        await self._maybe_checkpoint_working_state(event)
+                        continue
                     if event.get("type") == "compaction_end":
                         # piri#2 lifecycle hook: refresh the injected memory snapshot.
                         # Never surfaced to consumers and never allowed to fail a turn.
@@ -207,6 +229,29 @@ class PiriSession:
                 finally:
                     self._active = False
                     self._interrupt_requested = False
+
+    async def _archive_working_state(self, event: ArchiveEvent) -> None:
+        environment = self._working_state_environment
+        if environment is None:
+            return
+        try:
+            await asyncio.to_thread(
+                archive_working_state,
+                event,
+                environment=environment,
+                session_id=self._session_id,
+            )
+        except Exception:
+            # Body-free, fail-open observability: lifecycle preservation must
+            # never replace a provider result or block session cleanup.
+            logger.warning("Piri working-state archive failed event=%s", event)
+
+    async def _maybe_checkpoint_working_state(self, event: Mapping[str, Any]) -> None:
+        if event.get("sessionId") != self._session_id:
+            return
+        if event.get("aborted"):
+            return
+        await self._archive_working_state("pre_compact")
 
     async def _maybe_refresh_memory(self, event: Mapping[str, Any]) -> None:
         """Best-effort post-compaction memory refresh (piri#2 consumer).
@@ -391,6 +436,7 @@ class PiriRuntime:
             client,
             on_close=self._sessions.discard,
             memory_refresher=memory_refresher,
+            working_state_environment=environment,
         )
         self._sessions.add(session)
         return session

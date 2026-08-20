@@ -439,6 +439,54 @@ class PiriRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 ["scoped memory v1", "scoped memory v2", "scoped memory v3"],
             )
 
+    async def test_compaction_start_checkpoints_and_close_archives_working_state(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state_dir = Path(directory) / "state"
+            state_dir.mkdir(mode=0o700)
+            working_state = state_dir / "working-state.md"
+            working_state.write_text("objective: piri lifecycle\n", encoding="utf-8")
+            working_state.chmod(0o600)
+            session = await self.runtime.start_or_resume(
+                SessionRequest(
+                    working_directory="/workspace/project",
+                    memory_environment={"CCC_STATE_DIR": str(state_dir)},
+                )
+            )
+            client = self.factory.clients[0]
+            await client.events.put(
+                {
+                    "type": "compaction_start",
+                    "reason": "threshold",
+                    "sessionId": session.session_id,
+                }
+            )
+            await client.events.put(self._assistant_end())
+            await client.events.put({"type": "agent_settled"})
+
+            await collect(session.send_turn("work"))
+
+            checkpoints = tuple(
+                (state_dir / "checkpoints").glob("working-state-*.md")
+            )
+            self.assertEqual(len(checkpoints), 1)
+            self.assertEqual(
+                checkpoints[0].read_text(encoding="utf-8"),
+                "objective: piri lifecycle\n",
+            )
+            await session.close()
+            await session.close()
+            archives = tuple(
+                (state_dir / "session-archive").glob("working-state-*.md")
+            )
+            self.assertEqual(len(archives), 1)
+            self.assertEqual(
+                archives[0].read_text(encoding="utf-8"),
+                "objective: piri lifecycle\n",
+            )
+            self.assertEqual(client.close_calls, 1)
+
     async def test_compaction_end_aborted_or_foreign_session_skips_refresh(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             _runtime, factory, session = await self._start_capable_memory_session(

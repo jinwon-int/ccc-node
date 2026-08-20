@@ -5,6 +5,15 @@ All notable changes to the Claude Code node harness. Dates are KST.
 ## [Unreleased]
 
 ### Added
+- Provider lifecycle archives complete the working-state parity follow-up
+  (#1196). Piri now snapshots the current contract on its matching
+  `compaction_start` event into the Claude-compatible `checkpoints/` name and
+  30-file retention policy; conversation-local Piri and Codex closes archive
+  it under `session-archive/` without closing Codex's shared app-server.
+  Copies are owner-private, atomic, source-bounded, body-free in diagnostics,
+  and audience-routed: the #1155 legacy fallback remains private-only and can
+  never cross into a shared audience. `CCC_WORKING_STATE_ARCHIVE=0` disables
+  the feature and `CCC_WORKING_STATE_ARCHIVE_MAX_BYTES` bounds source size.
 - Working-state checkpoint contract allow (#1045 proposal 1). The Claude
   runtime's `can_use_tool` bridge now lets a structured Write/Edit/MultiEdit
   whose realpath is exactly the session's `working-state.md` (default state

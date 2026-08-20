@@ -54,6 +54,10 @@ from .usage import (
     parse_codex_rate_limits,
     parse_codex_thread_usage,
 )
+from .working_state_archive import (
+    archive_working_state,
+    select_working_state_environment,
+)
 from telegram_bot.memory.distill_types import (
     CodexTranscriptSnapshot,
     TranscriptBounds,
@@ -261,6 +265,7 @@ class CodexSession:
         approvals_reviewer: str | None,
         sandbox_policy: Mapping[str, AgentJsonValue] | None,
         turn_lock: asyncio.Lock,
+        working_state_environment: Mapping[str, str] | None = None,
     ) -> None:
         self._runtime = runtime
         self._thread_id = thread_id
@@ -270,6 +275,10 @@ class CodexSession:
         self._approvals_reviewer = approvals_reviewer
         self._sandbox_policy = cast(Mapping[str, JsonValue] | None, sandbox_policy)
         self._turn_lock = turn_lock
+        self._working_state_environment = select_working_state_environment(
+            working_state_environment
+        )
+        self._closed = False
 
     @property
     def session_id(self) -> str:
@@ -333,6 +342,27 @@ class CodexSession:
             return
         await self._runtime._client.turn_interrupt(self._thread_id, active.turn_id)
 
+    async def close(self) -> None:
+        """Archive conversation state without closing the shared app-server."""
+
+        if self._closed:
+            return
+        self._closed = True
+        environment = self._working_state_environment
+        if environment is None:
+            return
+        try:
+            await asyncio.to_thread(
+                archive_working_state,
+                "session_end",
+                environment=environment,
+                session_id=self._thread_id,
+            )
+        except Exception:
+            # Provider/working-state bodies must never enter diagnostics, and
+            # best-effort preservation must not block conversation cleanup.
+            logger.warning("Codex working-state archive failed event=session_end")
+
 
 class CodexRuntime:
     """Own a shared Codex app-server client and its notification dispatcher."""
@@ -343,6 +373,7 @@ class CodexRuntime:
         cli_path: str = "codex",
         client_factory: ClientFactory | None = None,
         process_environment: Mapping[str, str] | None = None,
+        working_state_environment: Mapping[str, str] | None = None,
         memory_materializer_path: str | None = None,
         memory_bootstrap_timeout_seconds: float = 14.0,
         memory_bootstrap: MemoryBootstrap | None = None,
@@ -405,6 +436,11 @@ class CodexRuntime:
             self._client_factory = environment_client_factory
         self._client = self._client_factory(self._handle_server_request)
         self._process_environment = bound_environment
+        self._working_state_environment = select_working_state_environment(
+            working_state_environment
+            if working_state_environment is not None
+            else bound_environment
+        )
         self._memory_bootstrap = memory_bootstrap
         self._memory_bootstrap_lock = asyncio.Lock()
         self._start_lock = asyncio.Lock()
@@ -566,6 +602,7 @@ class CodexRuntime:
             request.approvals_reviewer,
             request.sandbox_policy,
             turn_lock,
+            request.memory_environment or self._working_state_environment,
         )
 
     async def list_models(self) -> Sequence[ModelInfo]:

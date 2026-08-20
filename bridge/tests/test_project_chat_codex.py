@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import importlib
 import json
+import os
 import stat
 import sys
 from collections.abc import AsyncIterator
@@ -1333,11 +1334,13 @@ def test_codex_composition_wires_memory_bootstrap_settings(
             self,
             *,
             cli_path,
+            working_state_environment,
             memory_materializer_path,
             memory_bootstrap_timeout_seconds,
         ) -> None:
             captured.update(
                 cli_path=cli_path,
+                working_state_environment=working_state_environment,
                 memory_materializer_path=memory_materializer_path,
                 memory_bootstrap_timeout_seconds=memory_bootstrap_timeout_seconds,
             )
@@ -1352,6 +1355,7 @@ def test_codex_composition_wires_memory_bootstrap_settings(
     assert context.agent_runtime is not None
     assert captured == {
         "cli_path": str(tmp_path / ".claude" / "hooks" / "ccc-codex"),
+        "working_state_environment": os.environ,
         "memory_materializer_path": str(tmp_path / ".claude" / "hooks" / "ccc_codex_memory.py"),
         "memory_bootstrap_timeout_seconds": 14.0,
     }

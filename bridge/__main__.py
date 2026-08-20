@@ -167,6 +167,7 @@ def build_context(
             if process_environment is None:
                 return CodexRuntime(
                     cli_path=settings.codex_cli_path,
+                    working_state_environment=os.environ,
                     memory_materializer_path=settings.codex_memory_materializer_path,
                     memory_bootstrap_timeout_seconds=(
                         settings.codex_memory_bootstrap_timeout_seconds
