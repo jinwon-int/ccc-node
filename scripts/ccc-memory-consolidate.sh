@@ -8,10 +8,45 @@
 # injected several times, crowding the budget and reading as contradictory.
 #
 # This pass clusters near-duplicate facts (character-4-gram Jaccard ≥ threshold,
-# within the SAME kind) and keeps the most recent of each cluster, marking the
-# older MACHINE-GENERATED copies review:"superseded" — kept in the file as an
+# within the same LOGICAL KEY) and keeps the winner of each cluster, marking the
+# losing MACHINE-GENERATED copies review:"superseded" — kept in the file as an
 # audit trail, skipped by the index. Human-reviewed facts (review approved /
 # needs-human) are never auto-superseded.
+#
+# #871 §4 supersede/conflict semantics. The contract is nunchi's, not a new one:
+# nunchi.py's write gate already settled these questions for the peer-facts lane
+# and both lanes must mean the same thing, or an audit that reads one and
+# reasons about the other is wrong.
+#
+#   Logical key (kind, subject)  Lexical similarity alone is not identity. Two
+#       facts about DIFFERENT subjects that happen to share phrasing must never
+#       collapse into one, so clustering is partitioned by (kind, subject) and
+#       similarity only decides membership inside a partition. subject comes
+#       from entities[0]; a fact without one clusters only with other
+#       subject-less facts of its kind.
+#
+#   G2 source precedence  A lower-rank fact never closes a higher-rank one — an
+#       agent inference must not bury a user statement. Rank (3 user-stated /
+#       2 measured / 1 inferred) is read from source_rank and is a SEPARATE axis
+#       from confidence; the winner is the highest rank, newest only as the
+#       tiebreak. Unset/unparseable rank is 1, matching G2's demote-don't-trust
+#       rule for an unverifiable claim.
+#
+#   G3 ambiguity is never auto-resolved  If the NEWEST fact in a cluster ranks
+#       below the winner, the cluster is a real contradiction — newer-but-weaker
+#       against older-but-stronger — and neither direction is safely decidable:
+#       superseding the old one buries a user statement, superseding the new one
+#       discards current information. So nothing in that cluster is superseded,
+#       the newcomer is flagged review:"needs-human", and both stay open and
+#       visible. This is the only path that MINTS needs-human; before it the
+#       script merely respected one already set by a human.
+#
+#   valid_until on the loser  Marking review:"superseded" alone left the slice-1
+#       temporal search (current/as_of, #1197) unable to act on the decision:
+#       it reads valid_from/valid_until, not review. A superseded fact now also
+#       gets valid_until = the winner's observed_at and superseded_by = the
+#       winner's id, which is what actually connects the two slices — the fact
+#       stops being "current" and stays retrievable as of a past instant.
 #
 # Local-only, atomic, bounded, fail-open. Best run from the background memory
 # refresh (network-allowed, off the hot path); it never blocks startup.
@@ -104,22 +139,47 @@ try:
 except Exception:
     print(json.dumps({"ok": False, "error": "read-failed"})); sys.exit(0)
 
-records = []  # (idx, obj, text, review, kind, grams, sort_key)
+def source_rank(obj):
+    """G2 rank, defaulting to 1 (inferred).
+
+    Anything we cannot read as 1/2/3 is treated as the weakest rank rather
+    than trusted: G2 demotes an unverifiable claim instead of honouring it,
+    and a malformed value is exactly that.
+    """
+    try:
+        r = int(obj.get("source_rank"))
+    except (TypeError, ValueError):
+        return 1
+    return r if 1 <= r <= 3 else 1
+
+
+def subject_of(obj):
+    """Logical-key subject — entities[0], normalized. '' when absent."""
+    ents = obj.get("entities")
+    if isinstance(ents, list) and ents:
+        return norm(str(ents[0]))
+    return ""
+
+
+records = []  # (idx, obj, text, review, key, grams, sort_key, rank)
 for idx, raw in enumerate(lines):
     try:
         obj = json.loads(raw)
     except Exception:
         obj = None
     if not isinstance(obj, dict):
-        records.append((idx, None, None, None, None, None, None))
+        records.append((idx, None, None, None, None, None, None, None))
         continue
     review = str(obj.get("review") or "auto-local").lower()
     text = str(obj.get("text") or obj.get("summary") or "")
     kind = str(obj.get("kind") or "fact").lower()
+    # Logical key, not kind alone: same-kind facts about different subjects are
+    # different facts however similar their wording.
+    key = (kind, subject_of(obj))
     grams = ngrams(text)
-    # Most-recent wins: prefer observed_at, then file order (later = newer).
+    # Recency: prefer observed_at, then file order (later = newer).
     sort_key = (str(obj.get("observed_at") or ""), idx)
-    records.append((idx, obj, text, review, kind, grams, sort_key))
+    records.append((idx, obj, text, review, key, grams, sort_key, source_rank(obj)))
 
 # Candidates eligible to participate in clustering (already-inert facts excluded).
 elig = [r for r in records
@@ -151,30 +211,57 @@ for r in elig:
     clusters.setdefault(find(r[0]), []).append(r)
 
 by_idx = {r[0]: r for r in records}
-superseded_idx = set()
+superseded_idx = {}   # idx -> winner record
+conflict_idx = set()
 cluster_count = 0
 for members in clusters.values():
     if len(members) < 2:
         continue
     cluster_count += 1
-    keeper = max(members, key=lambda r: r[6])  # newest by (observed_at, idx)
+    # G2: highest rank wins; recency is only the tiebreak. This is what stops
+    # an inference from closing a user statement.
+    keeper = max(members, key=lambda r: (r[7], r[6]))
+    newest = max(members, key=lambda r: r[6])
+    if newest[7] < keeper[7]:
+        # G3: newer-but-weaker vs older-but-stronger. Not auto-resolvable in
+        # either direction, so resolve nothing — flag and leave both open.
+        # Only an untouched machine fact is flagged, which also makes the pass
+        # idempotent: once it reads needs-human it is no longer SUPERSEDABLE.
+        if newest[3] in SUPERSEDABLE:
+            conflict_idx.add(newest[0])
+        continue
     for r in members:
         if r[0] == keeper[0]:
             continue
         if r[3] in SUPERSEDABLE:  # only auto-generated copies are demoted
-            superseded_idx.add(r[0])
+            superseded_idx[r[0]] = keeper
 
-if not superseded_idx:
+if not superseded_idx and not conflict_idx:
     print(json.dumps({"ok": True, "total": len(lines), "clusters": cluster_count,
-                      "superseded": 0, "changed": False}))
+                      "superseded": 0, "conflicts": 0, "changed": False}))
     sys.exit(0)
 
 out_lines = []
 for idx, raw in enumerate(lines):
     if idx in superseded_idx:
-        obj = by_idx[idx][1]
-        obj = dict(obj)
+        obj = dict(by_idx[idx][1])
         obj["review"] = "superseded"
+        winner = superseded_idx[idx]
+        # Connect the decision to the slice-1 temporal search, which reads
+        # valid_until rather than review. Never widen an existing bound: a
+        # valid_until already on the fact was set deliberately.
+        if not obj.get("valid_until"):
+            winner_at = str((winner[1] or {}).get("observed_at") or "")
+            if winner_at:
+                obj["valid_until"] = winner_at
+        winner_id = str((winner[1] or {}).get("id") or "")
+        if winner_id:
+            obj["superseded_by"] = winner_id
+        out_lines.append(json.dumps(obj, ensure_ascii=False))
+    elif idx in conflict_idx:
+        obj = dict(by_idx[idx][1])
+        obj["review"] = "needs-human"
+        obj["conflict"] = "source-rank"
         out_lines.append(json.dumps(obj, ensure_ascii=False))
     else:
         out_lines.append(raw)
@@ -191,5 +278,6 @@ except Exception:
     print(json.dumps({"ok": False, "error": "write-failed"})); sys.exit(0)
 
 print(json.dumps({"ok": True, "total": len(lines), "clusters": cluster_count,
-                  "superseded": len(superseded_idx), "changed": True}))
+                  "superseded": len(superseded_idx),
+                  "conflicts": len(conflict_idx), "changed": True}))
 PY

@@ -998,6 +998,75 @@ out="$(CCC_STATE_DIR="$co_state" CCC_MEMORY_FACTS_FILE="$co_facts" bash "$ROOT/s
 ok "consolidate is idempotent (second run changes nothing)" '[ "$rc" = 0 ] && jq -e ".superseded == 0 and .changed == false" >/dev/null <<<"$out"'
 out="$(CCC_STATE_DIR="$co_state" CCC_MEMORY_FACTS_FILE="$co_facts" CCC_MEMORY_CONSOLIDATE=0 bash "$ROOT/scripts/ccc-memory-consolidate.sh" 2>&1)"; rc=$?
 ok "CCC_MEMORY_CONSOLIDATE=0 skips" '[ "$rc" = 0 ] && jq -e ".skipped == \"disabled\"" >/dev/null <<<"$out"'
+
+# ---- #871 §4 supersede/conflict semantics, aligned to nunchi G1/G2/G3 -------
+# The peer-facts lane already settled these questions; both lanes must mean the
+# same thing. Fixtures carry no lexical tell — the decision comes from the
+# logical key and source_rank, not from wording.
+
+# The superseded loser must carry valid_until, not just review. Slice 1's
+# temporal search (#1197) reads valid_from/valid_until and never review, so
+# without this the supersede decision was invisible to current/as_of.
+ok "a superseded fact records valid_until and the winner's id" \
+  'jq -e ".review == \"superseded\" and .valid_until == \"2026-06-20T00:00:00Z\" and .superseded_by == \"c-new\"" >/dev/null <<<"$(grep c-old "$co_facts")"'
+
+# G2: the winner is the highest source_rank, recency only breaks the tie.
+g2_state="$TMP/consolidate-g2"; rm -rf "$g2_state"; mkdir -p "$g2_state"
+g2_facts="$g2_state/memory-facts.jsonl"
+printf '%s\n' \
+  '{"id":"g2-old","kind":"preference","text":"Operator prefers concise Korean reports always","observed_at":"2026-06-01T00:00:00Z","review":"auto-local","source_rank":1,"entities":["operator"]}' \
+  '{"id":"g2-new","kind":"preference","text":"Operator prefers concise Korean reports always now","observed_at":"2026-07-01T00:00:00Z","review":"auto-local","source_rank":3,"entities":["operator"]}' \
+  > "$g2_facts"
+out="$(CCC_STATE_DIR="$g2_state" CCC_MEMORY_FACTS_FILE="$g2_facts" bash "$ROOT/scripts/ccc-memory-consolidate.sh" 2>&1)"; rc=$?
+ok "G2 higher-rank newcomer supersedes the weaker older fact" \
+  '[ "$rc" = 0 ] && jq -e ".superseded == 1 and .conflicts == 0" >/dev/null <<<"$out" \
+   && jq -e ".review == \"superseded\" and .superseded_by == \"g2-new\"" >/dev/null <<<"$(grep g2-old "$g2_facts")"'
+
+# G3: newer-but-weaker against older-but-stronger is a real contradiction.
+# Neither direction is safe, so nothing is superseded — an agent inference must
+# not bury a user statement, and the newer fact must not be silently dropped.
+g3_state="$TMP/consolidate-g3"; rm -rf "$g3_state"; mkdir -p "$g3_state"
+g3_facts="$g3_state/memory-facts.jsonl"
+printf '%s\n' \
+  '{"id":"g3-user","kind":"preference","text":"Operator prefers concise Korean reports always","observed_at":"2026-06-01T00:00:00Z","review":"auto-local","source_rank":3,"entities":["operator"]}' \
+  '{"id":"g3-agent","kind":"preference","text":"Operator prefers concise Korean reports always now","observed_at":"2026-07-01T00:00:00Z","review":"auto-local","source_rank":1,"entities":["operator"]}' \
+  > "$g3_facts"
+out="$(CCC_STATE_DIR="$g3_state" CCC_MEMORY_FACTS_FILE="$g3_facts" bash "$ROOT/scripts/ccc-memory-consolidate.sh" 2>&1)"; rc=$?
+ok "G3 ambiguous rank conflict supersedes nothing and flags the newcomer" \
+  '[ "$rc" = 0 ] && jq -e ".superseded == 0 and .conflicts == 1" >/dev/null <<<"$out"'
+ok "G3 leaves the user-stated fact open — an inference never buries it" \
+  'jq -e ".review == \"auto-local\" and (has(\"valid_until\") | not)" >/dev/null <<<"$(grep g3-user "$g3_facts")"'
+ok "G3 flags the newcomer needs-human with an auditable conflict reason" \
+  'jq -e ".review == \"needs-human\" and .conflict == \"source-rank\"" >/dev/null <<<"$(grep g3-agent "$g3_facts")"'
+out="$(CCC_STATE_DIR="$g3_state" CCC_MEMORY_FACTS_FILE="$g3_facts" bash "$ROOT/scripts/ccc-memory-consolidate.sh" 2>&1)"; rc=$?
+ok "G3 flagging is idempotent — a flagged fact is not re-flagged" \
+  '[ "$rc" = 0 ] && jq -e ".conflicts == 0 and .changed == false" >/dev/null <<<"$out"'
+
+# Logical key: identical wording about DIFFERENT subjects is not one fact.
+# Lexical similarity alone would have collapsed these.
+lkey_state="$TMP/consolidate-lkey"; rm -rf "$lkey_state"; mkdir -p "$lkey_state"
+lkey_facts="$lkey_state/memory-facts.jsonl"
+printf '%s\n' \
+  '{"id":"lk-a","kind":"preference","text":"Node prefers concise Korean reports always","observed_at":"2026-06-01T00:00:00Z","review":"auto-local","entities":["nosuk"]}' \
+  '{"id":"lk-b","kind":"preference","text":"Node prefers concise Korean reports always","observed_at":"2026-07-01T00:00:00Z","review":"auto-local","entities":["daegyo"]}' \
+  > "$lkey_facts"
+out="$(CCC_STATE_DIR="$lkey_state" CCC_MEMORY_FACTS_FILE="$lkey_facts" bash "$ROOT/scripts/ccc-memory-consolidate.sh" 2>&1)"; rc=$?
+ok "same wording about different subjects never collapses (logical key)" \
+  '[ "$rc" = 0 ] && jq -e ".clusters == 0 and .superseded == 0" >/dev/null <<<"$out" \
+   && jq -e ".review == \"auto-local\"" >/dev/null <<<"$(grep lk-a "$lkey_facts")"'
+
+# An unparseable source_rank is demoted to 1 rather than trusted (G2), so a
+# malformed value can never let a fact outrank a real user statement.
+bad_state="$TMP/consolidate-badrank"; rm -rf "$bad_state"; mkdir -p "$bad_state"
+bad_facts="$bad_state/memory-facts.jsonl"
+printf '%s\n' \
+  '{"id":"br-user","kind":"preference","text":"Operator prefers concise Korean reports always","observed_at":"2026-06-01T00:00:00Z","review":"auto-local","source_rank":3,"entities":["operator"]}' \
+  '{"id":"br-bad","kind":"preference","text":"Operator prefers concise Korean reports always now","observed_at":"2026-07-01T00:00:00Z","review":"auto-local","source_rank":"99","entities":["operator"]}' \
+  > "$bad_facts"
+out="$(CCC_STATE_DIR="$bad_state" CCC_MEMORY_FACTS_FILE="$bad_facts" bash "$ROOT/scripts/ccc-memory-consolidate.sh" 2>&1)"; rc=$?
+ok "a malformed source_rank is demoted, not trusted" \
+  '[ "$rc" = 0 ] && jq -e ".superseded == 0 and .conflicts == 1" >/dev/null <<<"$out"'
+
 # Regression (#869 sweep / #1076): this pass rewrites the WHOLE facts file, so
 # it must hold the same lock the appenders take (.local-memory-sink.lock) or a
 # concurrent append lands inside the read->os.replace window and is lost.
