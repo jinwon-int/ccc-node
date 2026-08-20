@@ -21,6 +21,86 @@ STATE="${CCC_STATE_DIR:-$HOME/.claude/state}"
 MODE="${CCC_NUNCHI_MODE:-$(cat "$STATE/nunchi.mode" 2>/dev/null || echo off)}"
 [ "$MODE" = "on" ] || exit 0
 
+# In audience-scoped mode the cron entry is a body-free dispatcher. It visits
+# only canonical direct children of the configured opaque audience root and
+# reinvokes this script against that scope's own DB and snapshot, writing a
+# scope-local bench file. The scope enumerator below is kept byte-identical to
+# the copies in piri-feed.sh and mempalace-refresh.sh; bench.test.sh asserts
+# the three stay in sync.
+#
+# Without this the run always scored $HOME/.nunchi. On a scoped node ingest
+# writes only to <audience-root>/<scope>/nunchi/facts.db, so the unscoped DB
+# stops receiving facts the moment scoping is enabled and the Phase 2 parity
+# gate (#827) measured a frozen store instead of live memory — observed on
+# soonwook (bench read 52 facts @2026-07-30 while ingest held 58 @2026-08-19),
+# jingun, bangtong and dungae.
+if [ "${CCC_NUNCHI_AUDIENCE_SCOPED:-0}" = 1 ] \
+    && [ "${CCC_NUNCHI_SCOPED_CHILD:-0}" != 1 ]; then
+  audience_root="${CCC_NUNCHI_AUDIENCE_ROOT:-}"
+  max_scopes="${CCC_NUNCHI_MAX_SCOPES_PER_RUN:-64}"
+  case "$max_scopes" in
+    ''|*[!0-9]*) max_scopes=64 ;;
+    *) [ "$max_scopes" -ge 1 ] && [ "$max_scopes" -le 64 ] || max_scopes=64 ;;
+  esac
+  rc=0
+  while IFS= read -r scope_root; do
+    # Bench a scope only once it has a fact store. A scope that has never
+    # ingested would otherwise emit a full sheet of "기록 없음" and be counted
+    # as retrieval failure against the gate rather than as absent sample.
+    [ -f "$scope_root/nunchi/facts.db" ] || continue
+    scope="${scope_root##*/}"
+    kind=private
+    [ "$scope" = shared ] && kind=shared
+    CCC_NUNCHI_SCOPED_CHILD=1 \
+      CCC_NUNCHI_AUDIENCE_SCOPE="$scope" \
+      CCC_NUNCHI_AUDIENCE_KIND="$kind" \
+      NUNCHI_HOME="$scope_root/nunchi" \
+      NUNCHI_DB="$scope_root/nunchi/facts.db" \
+      NUNCHI_SNAPSHOT="$scope_root/nunchi/snapshot.md" \
+      bash "$0" || rc=1
+  done < <(python3 - "$audience_root" "$max_scopes" <<'PY'
+import os
+from pathlib import Path
+import re
+import stat
+import sys
+
+root = Path(sys.argv[1])
+limit = int(sys.argv[2])
+try:
+    meta = root.lstat()
+except OSError:
+    raise SystemExit(0)
+if not (
+    root.is_absolute()
+    and stat.S_ISDIR(meta.st_mode)
+    and meta.st_uid == os.geteuid()
+    and not stat.S_IMODE(meta.st_mode) & 0o077
+):
+    raise SystemExit(0)
+count = 0
+for child in sorted(root.iterdir(), key=lambda item: item.name):
+    if count >= limit:
+        break
+    if child.name != "shared" and not re.fullmatch(r"private-[0-9a-f]{32}", child.name):
+        continue
+    try:
+        item = child.lstat()
+    except OSError:
+        continue
+    if not (
+        stat.S_ISDIR(item.st_mode)
+        and item.st_uid == os.geteuid()
+        and not stat.S_IMODE(item.st_mode) & 0o077
+    ):
+        continue
+    print(child)
+    count += 1
+PY
+  )
+  exit "$rc"
+fi
+
 HERE="$(cd "$(dirname "$0")" && pwd)"
 QSET="${NUNCHI_BENCH_QSET:-$HERE/bench-qset.tsv}"
 NUNCHI_HOME="${NUNCHI_HOME:-$HOME/.nunchi}"
@@ -44,7 +124,13 @@ WIKI_TIMEOUT="${NUNCHI_BENCH_WIKI_TIMEOUT_SEC:-40}"
 
 mkdir -p "$NUNCHI_HOME"
 {
-  echo "# nunchi bench $(date -Is) node=${CCC_NODE:-$(hostname -s)}"
+  # scope= is body-free: it names the opaque audience partition, never its
+  # contents. Without it the per-scope sheets are indistinguishable and the
+  # fleet roll-up cannot tell one node's two scopes from two nodes.
+  scope_label=""
+  [ -n "${CCC_NUNCHI_AUDIENCE_SCOPE:-}" ] \
+    && scope_label=" scope=${CCC_NUNCHI_AUDIENCE_SCOPE} kind=${CCC_NUNCHI_AUDIENCE_KIND:-private}"
+  echo "# nunchi bench $(date -Is) node=${CCC_NODE:-$(hostname -s)}${scope_label}"
   echo
 } >> "$OUT"
 

@@ -586,7 +586,12 @@ case "$ACTION" in
     else
       echo "mempalace CLI, refresh hook or transcript dir missing — verbatim refresh cron skipped"
     fi
-    append_cron_line "7 8 * * 1 CCC_STATE_DIR=$(cron_quote "$STATE") NUNCHI_HOME=$(cron_quote "$NUNCHI_DIR") NUNCHI_DB=$(cron_quote "$NUNCHI_DB_PATH") NUNCHI_SNAPSHOT=$(cron_quote "$NUNCHI_SNAPSHOT_PATH") $(cron_quote "$bash_bin") $(cron_quote "$HOOKS/bench.sh") >> $(cron_quote "$NUNCHI_DIR/bench.cron.log") 2>&1 $MARK gen=$GEN"
+    # ${scoped_env} must be present here for the same reason as the feed and
+    # refresh lines above: without it bench.sh scores the unscoped
+    # $NUNCHI_DIR, which on a scoped node stops receiving facts as soon as
+    # ingest becomes scoped. That made the Phase 2 parity gate (#827) measure
+    # a store frozen weeks earlier on every audience-scoped node.
+    append_cron_line "7 8 * * 1 CCC_STATE_DIR=$(cron_quote "$STATE") ${scoped_env}NUNCHI_HOME=$(cron_quote "$NUNCHI_DIR") NUNCHI_DB=$(cron_quote "$NUNCHI_DB_PATH") NUNCHI_SNAPSHOT=$(cron_quote "$NUNCHI_SNAPSHOT_PATH") $(cron_quote "$bash_bin") $(cron_quote "$HOOKS/bench.sh") >> $(cron_quote "$NUNCHI_DIR/bench.cron.log") 2>&1 $MARK gen=$GEN"
     echo "weekly bench cron added (Mon 08:07)"
     if [ "$resolved_provider" = "claude" ]; then
       set_sessionstart_hook add
