@@ -1,0 +1,21 @@
+{
+  "schema": "ccc.memory-retention.v1",
+  "comment": "Typed retention policy (#871 slice 2). Inspectable table — not hardcoded numbers. ttl_days 0 = never age-expire. age_expiry_forbidden kinds are NEVER dropped by TTL regardless of their durability field (a mislabeled volatile constraint must not silently vanish); such conflicts are kept and counted in the index summary diagnostics. Unknown kinds are kept conservatively and counted. Periods are operational estimates — tune from fleet measurement, do not copy external reference numbers.",
+  "durabilities": {
+    "volatile": { "ttl_days": 14 },
+    "session-only": { "ttl_days": 2 },
+    "week-scale": { "ttl_days": 45 },
+    "durable": { "ttl_days": 0 }
+  },
+  "kinds": {
+    "task-progress": { "default_durability": "volatile" },
+    "observation": { "default_durability": "durable" },
+    "preference": { "default_durability": "durable" },
+    "context": { "default_durability": "durable" },
+    "fact": { "default_durability": "durable" },
+    "decision": { "default_durability": "durable", "age_expiry_forbidden": true },
+    "procedure": { "default_durability": "durable", "age_expiry_forbidden": true },
+    "constraint": { "default_durability": "durable", "age_expiry_forbidden": true }
+  },
+  "unknown_kind": { "action": "keep" }
+}

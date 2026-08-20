@@ -806,6 +806,40 @@ ok "decay keeps undated volatile fact (fail-safe)" 'dq_has "zdelta"'
 CCC_STATE_DIR="$decay_state" CCC_MEMORY_CACHE_DIR="$decay_cache" CCC_MEMORY_DIR="$decay_mem" CCC_MEMORY_FACTS_FILE="$decay_facts" CCC_MEMORY_VOLATILE_TTL_DAYS=0 bash "$ROOT/scripts/ccc-memory-index.sh" rebuild >/dev/null 2>&1
 ok "TTL=0 disables decay (stale volatile returns)" 'dq_has "zalpha"'
 
+# #871 slice 2 — typed retention: durability-class TTLs come from an
+# inspectable policy table; guard kinds (constraint/procedure/decision) are
+# NEVER age-expired even when mislabeled volatile (kept + counted); unknown
+# kinds are kept conservatively + counted; a malformed policy file fails OPEN
+# to defaults that reproduce legacy behavior. Diagnostics are body-free counts.
+ret_state="$TMP/retention-state"
+ret_cache="$ret_state/cache"
+ret_mem="$ret_state/memories"
+mkdir -p "$ret_cache" "$ret_mem"
+printf 'retention fixture memory\n' > "$ret_mem/MEMORY.md"
+printf 'retention fixture user\n' > "$ret_mem/USER.md"
+ret_facts="$ret_state/retention-facts.jsonl"
+printf '%s\n' \
+  "{\"id\":\"ret-guard\",\"kind\":\"constraint\",\"text\":\"guarded safety rule qalpha marker\",\"durability\":\"volatile\",\"observed_at\":\"$OLD_TS\",\"review\":\"auto-local\"}" \
+  "{\"id\":\"ret-session\",\"kind\":\"task-progress\",\"text\":\"session scratch qbeta marker\",\"durability\":\"session-only\",\"observed_at\":\"$OLD_TS\",\"review\":\"auto-local\"}" \
+  "{\"id\":\"ret-week\",\"kind\":\"observation\",\"text\":\"week scale note qgamma marker\",\"durability\":\"week-scale\",\"observed_at\":\"$OLD_TS\",\"review\":\"auto-local\"}" \
+  "{\"id\":\"ret-unknown\",\"kind\":\"mystery-kind\",\"text\":\"unknown kind note qdelta marker\",\"durability\":\"volatile\",\"observed_at\":\"$OLD_TS\",\"review\":\"auto-local\"}" \
+  > "$ret_facts"
+ret_out="$(CCC_STATE_DIR="$ret_state" CCC_MEMORY_CACHE_DIR="$ret_cache" CCC_MEMORY_DIR="$ret_mem" CCC_MEMORY_FACTS_FILE="$ret_facts" bash "$ROOT/scripts/ccc-memory-index.sh" rebuild 2>/dev/null)"
+rq_has() {
+  local out
+  out="$(CCC_STATE_DIR="$ret_state" CCC_MEMORY_INDEX_DB="$ret_state/memory-index.sqlite" \
+    bash "$ROOT/scripts/ccc-memory-search.sh" "$1" 2>/dev/null)" || return 1
+  jq -e --arg marker "$1" '.results | any(.[]; (((.path // "") + " " + (.snippet // "")) | contains($marker)))' >/dev/null <<<"$out"
+}
+ok "guard kind (constraint) mislabeled volatile is never age-expired" 'rq_has "qalpha"'
+ok "session-only durability expires past its table TTL" '! rq_has "qbeta"'
+ok "week-scale durability survives past the volatile TTL" 'rq_has "qgamma"'
+ok "unknown kind is kept conservatively (old + volatile)" 'rq_has "qdelta"'
+ok "index summary reports body-free retention diagnostics" 'jq -e ".retention.guarded >= 1 and .retention.dropped >= 1 and .retention.unknown_kinds >= 1" >/dev/null <<<"$ret_out"'
+CCC_STATE_DIR="$ret_state" CCC_MEMORY_CACHE_DIR="$ret_cache" CCC_MEMORY_DIR="$ret_mem" CCC_MEMORY_FACTS_FILE="$ret_facts" \
+  CCC_MEMORY_RETENTION_POLICY="$TMP/does-not-exist.json" bash "$ROOT/scripts/ccc-memory-index.sh" rebuild >/dev/null 2>&1
+ok "missing policy file fails open (guard kind still kept via defaults)" 'rq_has "qalpha"'
+
 # #871 valid-time semantics: observed_at and valid_from/valid_until are
 # different axes. Boundary rule: valid_from inclusive, valid_until exclusive.
 # current mode partitions expired facts below still-valid ones and excludes
