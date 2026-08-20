@@ -95,9 +95,17 @@ else
   # interpreter onto it would defeat the seam.
   ckpt_run_scanner() { bash "$scan_bin" "$1"; }
 fi
-if [ -x "$scan_bin" ] \
-  && scanned="$(printf '%s' "$state" | ckpt_run_scanner working-state-checkpoint 2>/dev/null)"; then
-  state="$scanned"
+if [ -x "$scan_bin" ]; then
+  if scanned="$(printf '%s' "$state" | ckpt_run_scanner working-state-checkpoint 2>/dev/null)"; then
+    state="$scanned"
+  else
+    # #1160: the scanner is present but its invocation failed — the working
+    # state is about to re-enter context UNSCANNED while the node believes
+    # itself protected. Record it on stderr (hook stderr lands in session/
+    # hook logs) instead of repeating #1157's months-long silent window.
+    # Fail-open itself is unchanged.
+    printf 'checkpoint: scanner invocation failed; working state re-injected UNSCANNED\n' >&2
+  fi
 fi
 # Stale guard: a working-state last written weeks ago re-enters context here
 # looking current, and a dead objective (e.g. a task that finished a month
