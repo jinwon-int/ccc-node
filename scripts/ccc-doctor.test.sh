@@ -734,6 +734,12 @@ if sj:
     sfile.write_text(sj)
 elif sfile.exists():
     sfile.unlink()
+ifile = sfile.parent / "ingest.status.json"
+ij = os.environ.get("ND_INGEST_JSON", "")
+if ij:
+    ifile.write_text(ij)
+elif ifile.exists():
+    ifile.unlink()
 os.environ["CCC_NUNCHI_MEMPALACE_STATUS"] = str(sfile)
 os.environ["NUNCHI_HOME"] = str(sfile.parent)
 mp = os.environ.get("ND_MP", "")
@@ -746,9 +752,10 @@ d.check_nunchi_collection()
 r = d.rows[0] if d.rows else None
 print(json.dumps({"klass": r.klass, "status": r.status} if r else {"klass": "none", "status": "none"}, ensure_ascii=False))
 PY_EOF
-run_nc() {  # <provider> <cron-text> <status-json> <mp-path|empty> [path]
+run_nc() {  # <provider> <cron-text> <status-json> <mp-path|empty> [path] [ingest-json]
   ND_PROVIDER="$1" ND_CRON="$2" ND_STATUS_JSON="$3" ND_MP="$4" \
   ND_HOME="$TMP/nc-home" ND_PATH="${5:-$nbin:/usr/bin:/bin}" \
+  ND_INGEST_JSON="${6:-}" \
   ND_CRONTAB="$nbin/crontab" ND_CRON_STORE="$TMP/nc-cron" ND_STATUS="$TMP/nc-status.json" \
   NUNCHI_COLL_REPO="$nrepo" DOCTOR_PY="$ROOT/scripts/ccc_doctor.py" \
   python3 "$TMP/nunchi-collection.py" 2>/dev/null
@@ -759,8 +766,12 @@ claude_cron='*/10 * * * * bash /h/.claude/hooks/nunchi/ingest-cron.sh >> /log 2>
 17 * * * * bash /h/.claude/hooks/nunchi/mempalace-refresh.sh claude /h/.claude/projects >> /log 2>&1 # nunchi:#816'
 piri_cron='*/10 * * * * bash /h/.claude/hooks/nunchi/piri-feed.sh >> /log 2>&1 # nunchi:#816
 17 * * * * bash /h/.claude/hooks/nunchi/mempalace-refresh.sh piri /h/.piri/agent/sessions >> /log 2>&1 # nunchi:#816'
-ok_json='{"schema":"ccc.nunchi.mempalace-refresh.v1","provider":"codex","state":"ok","exit_code":0,"started_at":1,"finished_at":2}'
-deg_json='{"schema":"ccc.nunchi.mempalace-refresh.v1","provider":"codex","state":"degraded","exit_code":0,"started_at":1,"finished_at":2}'
+nc_now="$(date +%s)"
+ok_json='{"schema":"ccc.nunchi.mempalace-refresh.v1","provider":"codex","state":"ok","exit_code":0,"started_at":'"$nc_now"',"finished_at":'"$nc_now"'}'
+deg_json='{"schema":"ccc.nunchi.mempalace-refresh.v1","provider":"codex","state":"degraded","exit_code":0,"started_at":'"$nc_now"',"finished_at":'"$nc_now"'}'
+stale_json='{"schema":"ccc.nunchi.mempalace-refresh.v1","provider":"codex","state":"ok","exit_code":0,"started_at":1,"finished_at":'"$((nc_now - 1200000))"'}'
+fresh_ingest='{"schema":"ccc.nunchi.ingest.v1","finished_at":'"$nc_now"',"sources":1,"ingested":0,"retired":0,"deferred":0}'
+stale_ingest='{"schema":"ccc.nunchi.ingest.v1","finished_at":'"$((nc_now - 90000))"',"sources":1,"ingested":0,"retired":0,"deferred":0}'
 
 nc="$(run_nc claude "" "" "")"
 ok "no managed cron reports nunchi collection not enabled (정상, body-free)" \
@@ -768,9 +779,9 @@ ok "no managed cron reports nunchi collection not enabled (정상, body-free)" \
 nc="$(run_nc codex "$codex_cron" "$ok_json" "$nbin/mempalace")"
 ok "codex lane with matching provider and present MemPalace is 정상" \
   'jq -e ".klass == \"정상\" and (.status | contains(\"configured=codex\") and contains(\"runtime=codex\") and contains(\"match=ok\") and contains(\"source=mine\") and contains(\"/h/.codex/sessions\") and contains(\"version=MemPalace 9.9-test\"))" <<<"$nc" >/dev/null'
-nc="$(run_nc claude "$claude_cron" "$ok_json" "$nbin/mempalace")"
-ok "claude lane uses sweep source and stays 정상" \
-  'jq -e ".klass == \"정상\" and (.status | contains(\"match=ok\") and contains(\"source=sweep\") and contains(\"/h/.claude/projects\"))" <<<"$nc" >/dev/null'
+nc="$(run_nc claude "$claude_cron" "$ok_json" "$nbin/mempalace" "" "$fresh_ingest")"
+ok "claude lane uses sweep source and stays 정상 (fresh ingest+sweep ticks)" \
+  'jq -e ".klass == \"정상\" and (.status | contains(\"match=ok\") and contains(\"source=sweep\") and contains(\"/h/.claude/projects\") and (contains(\"STALE\") | not))" <<<"$nc" >/dev/null'
 nc="$(run_nc piri "$piri_cron" "$ok_json" "$nbin/mempalace")"
 ok "piri lane uses the conversation miner (mine) source and stays 정상" \
   'jq -e ".klass == \"정상\" and (.status | contains(\"configured=piri\") and contains(\"runtime=piri\") and contains(\"match=ok\") and contains(\"source=mine\") and contains(\"/h/.piri/agent/sessions\"))" <<<"$nc" >/dev/null'
@@ -780,6 +791,25 @@ ok "provider drift (configured codex, runtime claude) is a non-fatal 경고" \
 nc="$(run_nc codex "$codex_cron" "$deg_json" "" "/usr/bin:/bin")"
 ok "missing MemPalace CLI is a 경고 (peer-facts-only degrade), body-free" \
   'jq -e ".klass == \"경고\" and (.status | contains(\"mempalace=missing\"))" <<<"$nc" >/dev/null'
+
+# #1200: last-success-tick freshness — a frozen pipe keeps its final
+# state=ok forever, so the doctor must gate on tick AGE too (실측: 4 nodes
+# frozen ~14 days, all 정상 before this check). Non-fatal 경고, body-free.
+nc="$(run_nc codex "$codex_cron" "$stale_json" "$nbin/mempalace")"
+ok "stale sweep tick (state=ok, ~14 days old) is a 경고 with sweep-tick-stale" \
+  'jq -e ".klass == \"경고\" and (.status | contains(\"sweep-tick-stale\"))" <<<"$nc" >/dev/null'
+nc="$(run_nc codex "$codex_cron" "" "$nbin/mempalace")"
+ok "managed refresh cron with no status file ever written is a 경고 (sweep-status-missing)" \
+  'jq -e ".klass == \"경고\" and (.status | contains(\"sweep-status-missing\"))" <<<"$nc" >/dev/null'
+nc="$(run_nc claude "$claude_cron" "$ok_json" "$nbin/mempalace")"
+ok "claude lane without ingest.status.json is a 경고 (ingest-status-missing)" \
+  'jq -e ".klass == \"경고\" and (.status | contains(\"ingest-status-missing\"))" <<<"$nc" >/dev/null'
+nc="$(run_nc claude "$claude_cron" "$ok_json" "$nbin/mempalace" "" "$stale_ingest")"
+ok "stale ingest tick on the claude lane is a 경고 (ingest-tick-stale)" \
+  'jq -e ".klass == \"경고\" and (.status | contains(\"ingest-tick-stale\"))" <<<"$nc" >/dev/null'
+nc="$(CCC_NUNCHI_SWEEP_STALE_MIN=0 run_nc codex "$codex_cron" "$stale_json" "$nbin/mempalace")"
+ok "CCC_NUNCHI_SWEEP_STALE_MIN=0 disables the sweep age gate (정상)" \
+  'jq -e ".klass == \"정상\" and (.status | contains(\"STALE\") | not)" <<<"$nc" >/dev/null'
 
 # #1081: doctor surfaces installer-managed cron entries frozen at older code.
 # One row per known marker (absent = opt-in 정상; gen match = 정상; unstamped

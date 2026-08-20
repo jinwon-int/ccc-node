@@ -23,6 +23,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -1329,7 +1330,9 @@ class Doctor:
         excerpts, session ids or credentials): the configured collection lane
         (from the managed cron) vs the runtime ``CCC_AGENT_PROVIDER`` (DRIFT),
         the source kind/path, the MemPalace binary/version (or peer-facts-only
-        degrade), and the last collection state/exit/timestamp. The parsing
+        degrade), the last collection state/exit/timestamp, and the AGE of the
+        newest ingest/sweep tick (#1200 — a frozen pipe keeps its last
+        state=ok forever, so freshness needs its own gate). The parsing
         mirrors ``install-nunchi.sh`` ``status`` (``_status_source`` /
         ``_status_collection`` / ``_status_provider_match``) so the doctor and
         the installer cannot diverge in semantics (#920). Severity is 정상 when
@@ -1391,6 +1394,7 @@ class Doctor:
         )
         collection = "none"
         coll_state = ""
+        sweep_finished: int | None = None
         try:
             data = json.loads(status_file.read_text())
             coll_state = str(data.get("state", ""))
@@ -1399,15 +1403,26 @@ class Doctor:
                 data.get("exit_code", "?"),
                 data.get("finished_at", data.get("started_at", "?")),
             )
+            with contextlib.suppress(TypeError, ValueError):
+                sweep_finished = int(data.get("finished_at", data.get("started_at")))
         except Exception:
             collection = "none"
 
+        ticks, stale = self._nunchi_tick_freshness(
+            configured, nunchi_home, sweep_finished, sweep_cron_present=m is not None
+        )
+
         status = (
             "configured={}; runtime={}; match={}; source={} {}; "
-            "mempalace={} version={}; collection={}"
-        ).format(configured, self.provider, match, kind, path, mp or "missing", version, collection)
+            "mempalace={} version={}; collection={}; ticks={}"
+        ).format(
+            configured, self.provider, match, kind, path, mp or "missing", version,
+            collection, ticks,
+        )
 
-        healthy = match == "ok" and mp_ok and coll_state in {"ok", "running", ""}
+        healthy = (
+            match == "ok" and mp_ok and coll_state in {"ok", "running", ""} and not stale
+        )
         self.add(
             "정상" if healthy else "경고",
             "nunchi collection",
@@ -1415,8 +1430,70 @@ class Doctor:
             "none"
             if healthy
             else "run scripts/install-nunchi.sh and align provider/source; "
-            "install MemPalace for verbatim collection",
+            "install MemPalace for verbatim collection; on stale ticks check "
+            "~/.nunchi/*.cron.log and the cron PATH (#996/#1200 class)",
         )
+
+    def _nunchi_tick_freshness(
+        self,
+        configured: str,
+        nunchi_home: Path,
+        sweep_finished: int | None,
+        *,
+        sweep_cron_present: bool,
+    ) -> tuple[str, list[str]]:
+        """Age the newest ingest/sweep ticks for check_nunchi_collection (#1200).
+
+        A pipe that stops firing leaves its last status frozen at state=ok, so
+        state alone reports a healthy lane forever (실측: 4 nodes frozen ~14
+        days, all 정상). Returns a body-free ``ticks`` summary plus the stale
+        findings. Thresholds are env-tunable minutes
+        (CCC_NUNCHI_SWEEP_STALE_MIN default 1560, CCC_NUNCHI_INGEST_STALE_MIN
+        default 360); 0 disables that lane's age gate. The ingest status file
+        is only demanded on the claude lane — its managed ingest-cron writes
+        it; piri/codex feeders report through their own lanes (표기만).
+        """
+
+        def _stale_min(env: str, default: int) -> int:
+            with contextlib.suppress(TypeError, ValueError):
+                return int(os.environ.get(env, "") or default)
+            return default
+
+        now = int(time.time())
+        stale: list[str] = []
+        sweep_stale_min = _stale_min("CCC_NUNCHI_SWEEP_STALE_MIN", 1560)
+        ingest_stale_min = _stale_min("CCC_NUNCHI_INGEST_STALE_MIN", 360)
+
+        sweep_tick = "none"
+        if sweep_finished is not None:
+            sweep_age = max(0, (now - sweep_finished) // 60)
+            sweep_tick = f"age={sweep_age}min"
+            if sweep_stale_min and sweep_age > sweep_stale_min:
+                stale.append(f"sweep-tick-stale({sweep_age}min>{sweep_stale_min}min)")
+        elif sweep_cron_present:
+            # The managed refresh cron exists but no tick ever landed (or the
+            # status file vanished) — the lane never ran where it should.
+            stale.append("sweep-status-missing")
+
+        ingest_file = Path(
+            os.environ.get("CCC_NUNCHI_INGEST_STATUS", nunchi_home / "ingest.status.json")
+        )
+        ingest_tick = "none"
+        ingest_finished: int | None = None
+        with contextlib.suppress(Exception):
+            ingest_finished = int(json.loads(ingest_file.read_text()).get("finished_at"))
+        if ingest_finished is not None:
+            ingest_age = max(0, (now - ingest_finished) // 60)
+            ingest_tick = f"age={ingest_age}min"
+            if ingest_stale_min and ingest_age > ingest_stale_min:
+                stale.append(f"ingest-tick-stale({ingest_age}min>{ingest_stale_min}min)")
+        elif configured == "claude":
+            stale.append("ingest-status-missing")
+
+        ticks = f"ingest:{ingest_tick} sweep:{sweep_tick}"
+        if stale:
+            ticks += " STALE[{}]".format(",".join(stale))
+        return ticks, stale
 
     def current_cron_gen_stamp(self, script_rel: str) -> str | None:
         """Recompute an installer's generation stamp from the current checkout.
