@@ -33,6 +33,9 @@ sys.stdin.read()
 print("BENCH_STDIN_ISOLATED")
 PY
 
+# Deliberately a pre-#1207 4-column Q-set: the shipped Q-set grew to six
+# columns, and bench.sh must keep grading an old one exactly as it used to.
+# The six-column path is exercised separately below.
 cat > "$hooks/bench-qset.tsv" <<'EOF'
 id	category	query	expect_hint
 q1	relational	query one	expect one
@@ -130,6 +133,149 @@ HOME="$home2" CCC_STATE_DIR="$state2" NUNCHI_HOME="$nunchi_home2" \
 out4="$(find "$nunchi_home2" -maxdepth 1 -name 'bench-*.md' -type f -print -quit)"
 ok "a non-zero backend exit is marked INVALID with the exit code as reason" \
   '[ -n "$out4" ] && [ "$(grep -c "rc=3 status=INVALID reason=exit-3 source=none$" "$out4")" = 5 ]'
+
+# ---- TM-2370 P1-A: six-column Q-set, negative-control reverse grading -------
+# #1207 grew the Q-set to six columns (id/category/query/expect_hint/source/
+# evidence) and no test covered what bench.sh does with such a row. `source`
+# states which layer SHOULD answer; `none` marks a negative control (q44-q48,
+# category 부정형) whose correct answer is "기록 없음". Grading those as positive
+# rows inverts the verdict twice: a correct refusal counts as retrieval failure
+# and a fabricated answer counts as coverage.
+p1a_home="$TMP/home-p1a"
+p1a_hooks="$p1a_home/.claude/hooks/nunchi"
+p1a_state="$p1a_home/.claude/state"
+p1a_nh="$p1a_home/.nunchi"
+mkdir -p "$p1a_hooks" "$p1a_state" "$p1a_nh"
+cp "$ROOT/claude/hooks/nunchi/bench.sh" "$p1a_hooks/bench.sh"
+chmod 700 "$p1a_hooks/bench.sh"
+printf 'on' > "$p1a_state/nunchi.mode"
+
+printf 'id\tcategory\tquery\texpect_hint\tsource\tevidence\n' > "$p1a_hooks/bench-qset.tsv"
+printf 'p1\t관계선호\tpositive one\thint one\tnunchi\tev one\n' >> "$p1a_hooks/bench-qset.tsv"
+printf 'p2\t관계선호\tpositive two\thint two\twiki\tev two\n' >> "$p1a_hooks/bench-qset.tsv"
+printf 'p3\t시점\tpositive three\thint three\teither\tev three\n' >> "$p1a_hooks/bench-qset.tsv"
+printf 'n1\t부정형\tnegative one\thint four\tnone\tev four\n' >> "$p1a_hooks/bench-qset.tsv"
+printf 'n2\t부정형\tnegative two\thint five\tnone\tev five\n' >> "$p1a_hooks/bench-qset.tsv"
+
+# Backend answers every query substantively — including the two negative
+# controls, which is the fabrication the gate must hard-fail on.
+cat > "$p1a_hooks/nunchi.py" <<'PY'
+#!/usr/bin/env python3
+import sys
+cmd = sys.argv[1]
+sys.stdin.read()
+print("stub metrics" if cmd == "metrics" else "확정적인 답변입니다")
+PY
+rm -f "$p1a_nh"/bench-*.md
+HOME="$p1a_home" CCC_STATE_DIR="$p1a_state" NUNCHI_HOME="$p1a_nh" \
+  NUNCHI_BENCH_QSET="$p1a_hooks/bench-qset.tsv" CCC_NODE=test-node \
+  NUNCHI_BENCH_WIKI_CLI=/nonexistent \
+  bash "$p1a_hooks/bench.sh" > "$TMP/p1a-fab" 2>&1
+fab_rc=$?
+fab="$(find "$p1a_nh" -maxdepth 1 -name 'bench-*.md' -type f -print -quit)"
+
+ok "a six-column Q-set does not fold source/evidence into expect" \
+  '[ -n "$fab" ] && grep -q "^- expect: hint one$" "$fab" && ! grep -q "^- expect: hint one	" "$fab"'
+ok "the evidence column is surfaced for the correctness grader" \
+  'grep -q "^- evidence: ev one$" "$fab"'
+ok "answering a negative control is graded FABRICATED, not as coverage" \
+  '[ "$(grep -c "^## n[12] (부정형) .*grade=FABRICATED$" "$fab")" = 2 ]'
+ok "positive rows keep the pre-existing source= line format (no grade= noise)" \
+  '[ "$(grep -c "^## p[123] .*status=OK source=nunchi$" "$fab")" = 3 ]'
+ok "fabrications are excluded from the per-layer coverage counters" \
+  'grep -q "^- answered by nunchi: 3$" "$fab" && grep -q "^- fabrications (부정형 조작): 2$" "$fab"'
+ok "negative controls leave the positive denominator" \
+  'grep -q "^- positive rows (valid): 3$" "$fab" && grep -q "^- negative-control rows (valid): 2$" "$fab"'
+ok "a fabrication hard-fails the gate verdict" \
+  'grep -q "^- gate verdict: FAIL — 2 fabrication(s) on negative controls (hard fail)$" "$fab"'
+ok "a failing gate still exits 0 — the bench is not the failing unit (#1078)" \
+  '[ "$fab_rc" = 0 ]'
+
+# The same Q-set with a backend that correctly refuses the negative controls.
+cat > "$p1a_hooks/nunchi.py" <<'PY'
+#!/usr/bin/env python3
+import sys
+cmd = sys.argv[1]
+sys.stdin.read()
+if cmd == "metrics":
+    print("stub metrics")
+elif "negative" in sys.argv[2]:
+    print("해당 내용은 기록 없음")
+else:
+    print("확정적인 답변입니다")
+PY
+rm -f "$p1a_nh"/bench-*.md
+HOME="$p1a_home" CCC_STATE_DIR="$p1a_state" NUNCHI_HOME="$p1a_nh" \
+  NUNCHI_BENCH_QSET="$p1a_hooks/bench-qset.tsv" CCC_NODE=test-node \
+  NUNCHI_BENCH_WIKI_CLI=/nonexistent \
+  bash "$p1a_hooks/bench.sh" > "$TMP/p1a-ok" 2>&1
+good="$(find "$p1a_nh" -maxdepth 1 -name 'bench-*.md' -type f -print -quit)"
+
+ok "refusing a negative control is graded CORRECT-REJECT, not retrieval failure" \
+  '[ "$(grep -c "^## n[12] (부정형) .*grade=CORRECT-REJECT$" "$good")" = 2 ]'
+ok "correct rejections do not inflate the unanswered gate candidates" \
+  'grep -q "^- correct rejections: 2$" "$good" && grep -q "^- unanswered (gate candidates): 0$" "$good"'
+ok "a clean run passes the gate and reports the rate against positives only" \
+  'grep -q "^- unanswered rate: 0% of 3 positive (threshold ≤10%)$" "$good" \
+   && grep -q "^- gate verdict: PASS$" "$good"'
+ok "the gate verdict reaches the cron log on stdout" \
+  'grep -q "gate=PASS" "$TMP/p1a-ok"'
+
+# A backend that finds nothing at all: every positive row is unanswered, while
+# the negative controls are (correctly) refused. Fabrications are zero, so the
+# unanswered threshold — not the hard fail — decides the verdict.
+cat > "$p1a_hooks/nunchi.py" <<'PY'
+#!/usr/bin/env python3
+import sys
+cmd = sys.argv[1]
+sys.stdin.read()
+print("stub metrics" if cmd == "metrics" else "해당 내용은 기록 없음")
+PY
+rm -f "$p1a_nh"/bench-*.md
+HOME="$p1a_home" CCC_STATE_DIR="$p1a_state" NUNCHI_HOME="$p1a_nh" \
+  NUNCHI_BENCH_QSET="$p1a_hooks/bench-qset.tsv" CCC_NODE=test-node \
+  NUNCHI_BENCH_WIKI_CLI=/nonexistent \
+  bash "$p1a_hooks/bench.sh" > "$TMP/p1a-thr" 2>&1
+thr="$(find "$p1a_nh" -maxdepth 1 -name 'bench-*.md' -type f -print -quit)"
+ok "an all-unanswered positive set fails the default 10% threshold" \
+  '[ "$(grep -c "^- fabrications (부정형 조작): 0$" "$thr")" = 1 ] \
+   && grep -q "^- unanswered rate: 100% of 3 positive (threshold ≤10%)$" "$thr" \
+   && grep -q "^- gate verdict: FAIL — unanswered 100% > 10%$" "$thr"'
+
+# The threshold is overridable so the first month of 48-question runs can be
+# calibrated without a code change.
+rm -f "$p1a_nh"/bench-*.md
+HOME="$p1a_home" CCC_STATE_DIR="$p1a_state" NUNCHI_HOME="$p1a_nh" \
+  NUNCHI_BENCH_QSET="$p1a_hooks/bench-qset.tsv" CCC_NODE=test-node \
+  NUNCHI_BENCH_WIKI_CLI=/nonexistent NUNCHI_BENCH_UNANSWERED_MAX_PCT=100 \
+  bash "$p1a_hooks/bench.sh" > "$TMP/p1a-cal" 2>&1
+cal="$(find "$p1a_nh" -maxdepth 1 -name 'bench-*.md' -type f -print -quit)"
+ok "a calibrated threshold changes the verdict without a code change" \
+  'grep -q "^- unanswered rate: 100% of 3 positive (threshold ≤100%)$" "$cal" \
+   && grep -q "^- gate verdict: PASS$" "$cal"'
+
+# Fabrication outranks the unanswered threshold: a node that invents answers
+# must not be able to buy a PASS by loosening calibration.
+cat > "$p1a_hooks/nunchi.py" <<'PY'
+#!/usr/bin/env python3
+import sys
+cmd = sys.argv[1]
+sys.stdin.read()
+print("stub metrics" if cmd == "metrics" else "확정적인 답변입니다")
+PY
+rm -f "$p1a_nh"/bench-*.md
+HOME="$p1a_home" CCC_STATE_DIR="$p1a_state" NUNCHI_HOME="$p1a_nh" \
+  NUNCHI_BENCH_QSET="$p1a_hooks/bench-qset.tsv" CCC_NODE=test-node \
+  NUNCHI_BENCH_WIKI_CLI=/nonexistent NUNCHI_BENCH_UNANSWERED_MAX_PCT=100 \
+  bash "$p1a_hooks/bench.sh" > "$TMP/p1a-hard" 2>&1
+hard="$(find "$p1a_nh" -maxdepth 1 -name 'bench-*.md' -type f -print -quit)"
+ok "a loosened threshold cannot buy a PASS past a fabrication" \
+  'grep -q "^- gate verdict: FAIL — 2 fabrication(s) on negative controls (hard fail)$" "$hard"'
+
+# A contaminated sample must not be reported as a gate FAIL: an INVALID row
+# produces no answer at all, so it says nothing about retrieval either way.
+ok "a contaminated run is INDETERMINATE, never a gate FAIL" \
+  'grep -q "^- gate verdict: INDETERMINATE — sample contaminated (5 invalid)$" "$out2"'
 
 # ---- #827 / TM-2339: the gate is "nunchi + Wiki", not "nunchi alone" --------
 # TM-2029 assigned durable cross-node knowledge to the Family Wiki. A per-node
