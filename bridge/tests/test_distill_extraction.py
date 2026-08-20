@@ -566,3 +566,19 @@ def test_distill_backend_protocol_is_provider_neutral_and_runtime_checkable() ->
             return parse_extraction_output(json.dumps(valid_output()), wiki_enabled=True)
 
     assert isinstance(Backend(), DistillBackend)
+
+
+@pytest.mark.parametrize(
+    "kind",
+    ["preference", "decision", "observation", "context", "task-progress", "procedure", "constraint"],
+)
+def test_honcho_fact_kind_covers_retention_classes_and_schema_stays_in_sync(kind: str) -> None:
+    # #871: the extraction contract must express the retention-relevant kinds
+    # (task-progress ages fast; procedure/constraint must not), and the
+    # checked-in JSON schema must accept exactly the same set as the parser.
+    payload = valid_output()
+    payload["honcho"][0]["kind"] = kind
+    parsed = parse_extraction_output(json.dumps(payload), wiki_enabled=True)
+    assert parsed.honcho[0].kind == kind
+    schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
+    assert Draft202012Validator(schema).is_valid(payload)

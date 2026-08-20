@@ -806,6 +806,40 @@ ok "decay keeps undated volatile fact (fail-safe)" 'dq_has "zdelta"'
 CCC_STATE_DIR="$decay_state" CCC_MEMORY_CACHE_DIR="$decay_cache" CCC_MEMORY_DIR="$decay_mem" CCC_MEMORY_FACTS_FILE="$decay_facts" CCC_MEMORY_VOLATILE_TTL_DAYS=0 bash "$ROOT/scripts/ccc-memory-index.sh" rebuild >/dev/null 2>&1
 ok "TTL=0 disables decay (stale volatile returns)" 'dq_has "zalpha"'
 
+# #871 valid-time semantics: observed_at and valid_from/valid_until are
+# different axes. Boundary rule: valid_from inclusive, valid_until exclusive.
+# current mode partitions expired facts below still-valid ones and excludes
+# future-valid facts (demote/exclude, never delete); explicit as_of retrieves
+# the point-in-time fact; malformed windows degrade to conservative keep.
+temp_state="$TMP/temporal-state"
+temp_cache="$temp_state/cache"
+temp_mem="$temp_state/memories"
+mkdir -p "$temp_cache" "$temp_mem"
+printf 'temporal fixture memory\n' > "$temp_mem/MEMORY.md"
+printf 'temporal fixture user\n' > "$temp_mem/USER.md"
+temp_facts="$temp_state/temporal-facts.jsonl"
+printf '%s\n' \
+  '{"id":"t-old","kind":"decision","text":"release train departs at 10:00 zeta marker","durability":"durable","observed_at":"2025-06-01T00:00:00Z","valid_from":"2025-06-01T00:00:00Z","valid_until":"2026-06-01T00:00:00Z","review":"auto-local"}' \
+  '{"id":"t-new","kind":"decision","text":"release train departs at 14:00 zeta marker","durability":"durable","observed_at":"2026-06-01T00:00:00Z","valid_from":"2026-06-01T00:00:00Z","review":"auto-local"}' \
+  '{"id":"t-future","kind":"constraint","text":"embargo window zeta-future marker","durability":"durable","observed_at":"2026-06-02T00:00:00Z","valid_from":"2999-01-01T00:00:00Z","review":"auto-local"}' \
+  '{"id":"t-broken","kind":"preference","text":"broken window zeta-broken marker","durability":"durable","observed_at":"2026-06-02T00:00:00Z","valid_from":"not-a-timestamp","review":"auto-local"}' \
+  > "$temp_facts"
+CCC_STATE_DIR="$temp_state" CCC_MEMORY_CACHE_DIR="$temp_cache" CCC_MEMORY_DIR="$temp_mem" CCC_MEMORY_FACTS_FILE="$temp_facts" bash "$ROOT/scripts/ccc-memory-index.sh" rebuild >/dev/null 2>&1
+tsearch() {
+  env CCC_STATE_DIR="$temp_state" CCC_MEMORY_INDEX_DB="$temp_state/memory-index.sqlite" "$@" bash "$ROOT/scripts/ccc-memory-search.sh" "release train departs zeta" 2>/dev/null
+}
+out="$(tsearch)"; rc=$?
+ok "current mode partitions expired below still-valid" '[ "$rc" = 0 ] && jq -e '\''(.temporal.mode == "current") and (([.results[].path | contains(":t-new")] | index(true)) < ([.results[].path | contains(":t-old")] | index(true)))'\'' >/dev/null <<<"$out"'
+ok "current mode excludes future valid_from" '[ "$rc" = 0 ] && jq -e '\''(.results | all(.path | contains(":t-future") | not)) and (.temporal.excluded >= 1)'\'' >/dev/null <<<"$out"'
+ok "current mode keeps expired facts retrievable (demoted, not deleted)" '[ "$rc" = 0 ] && jq -e '\''.results | any(.path | contains(":t-old"))'\'' >/dev/null <<<"$out"'
+ok "malformed window degrades to conservative keep with reason" '[ "$rc" = 0 ] && jq -e '\''.results | any((.path | contains(":t-broken")) and .temporal.status == "undated" and .temporal.reason == "malformed-window-kept")'\'' >/dev/null <<<"$out"'
+out="$(tsearch CCC_MEMORY_AS_OF=2026-01-15T00:00:00Z)"; rc=$?
+ok "as_of retrieves the point-in-time fact and excludes later ones" '[ "$rc" = 0 ] && jq -e '\''(.temporal.mode == "as_of") and (.results[0].path | contains(":t-old")) and (.results | all(.path | contains(":t-new") | not))'\'' >/dev/null <<<"$out"'
+out="$(CCC_STATE_DIR="$temp_state" CCC_MEMORY_INDEX_DB="$temp_state/memory-index.sqlite" bash "$ROOT/scripts/ccc-memory-search.sh" "release train departs zeta" --as-of 2026-01-15T00:00:00Z 2>/dev/null)"; rc=$?
+ok "as_of works as a CLI flag too" '[ "$rc" = 0 ] && jq -e '\''(.temporal.mode == "as_of") and (.results[0].path | contains(":t-old"))'\'' >/dev/null <<<"$out"'
+out="$(tsearch CCC_MEMORY_AS_OF=garbage)"; rc=$?
+ok "unparseable as_of degrades to current mode with body-free signal" '[ "$rc" = 0 ] && jq -e '\''(.temporal.mode == "current") and (.temporal.reason == "as-of-parse-failed-using-current")'\'' >/dev/null <<<"$out"'
+
 # restore the structured-fact index for the secret-redaction test below
 CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CCC_MEMORY_FACTS_FILE="$facts" bash "$ROOT/scripts/ccc-memory-index.sh" rebuild >/dev/null 2>&1
 ok "structured fact indexing redacts secrets" '! python3 - <<PY | grep -q VALUE_SHOULD_NOT_INDEX_FACT

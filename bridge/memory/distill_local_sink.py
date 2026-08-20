@@ -174,7 +174,9 @@ class CodexLocalMemorySink:
                 "review": "auto-local",
                 "privacy": self.audience,
                 "audience": self.audience,
-                "durability": "durable",
+                # #871: durability follows the fact kind instead of a blanket
+                # "durable" — task-progress ages like the index default expects.
+                "durability": "volatile" if item.kind == "task-progress" else "durable",
                 "confidence": 0.7,
                 "observed_at": provenance.distilled_at,
                 "entities": [item.subject],

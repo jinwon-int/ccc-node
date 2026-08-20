@@ -55,7 +55,10 @@
             "preference",
             "decision",
             "observation",
-            "context"
+            "context",
+            "task-progress",
+            "procedure",
+            "constraint"
           ],
           "title": "Kind",
           "type": "string"

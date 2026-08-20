@@ -11,6 +11,14 @@ DB = os.environ.get("CCC_MEMORY_INDEX_DB") or f"{STATE_DIR}/memory-index.sqlite"
 QUERY = sys.argv[1] if len(sys.argv) > 1 else ""
 LIMIT = os.environ.get("CCC_MEMORY_SEARCH_LIMIT") or "5"
 RETRIEVAL = os.environ.get("CCC_MEMORY_RETRIEVAL") or "fts"
+# #871: explicit historical lookup. `ccc-memory-search <q> --as-of <ISO ts>`
+# or CCC_MEMORY_AS_OF=<ISO ts>. An unparseable value degrades to the default
+# current mode with a body-free signal (never an error, never a deletion).
+AS_OF = os.environ.get("CCC_MEMORY_AS_OF", "").strip()
+if "--as-of" in sys.argv[2:]:
+    _i = sys.argv[2:].index("--as-of") + 2
+    if _i + 1 < len(sys.argv):
+        AS_OF = sys.argv[_i + 1].strip() or AS_OF
 
 if not QUERY:
     print(f"usage: {Path(sys.argv[0]).name} <query>", file=sys.stderr)
@@ -265,7 +273,7 @@ def rerank(cands):
             signals["fts_bm25"]=c["bm25"]
         score=(token_hits*4.0)+(phrase_hit*3.0)+signals["source_boost"]+signals["recency_boost"]+signals["durability_penalty"]+(tie*0.5)+signals["usage_boost"]
         out.append({"path":c["path"],"source":c["source"],"snippet":c["snippet"],
-                    "score":round(score,4),"signals":signals,"_chash":_chash(content)})
+                    "score":round(score,4),"signals":signals,"temporal":_temporal_tag(content, time.time()),"_chash":_chash(content)})
     out.sort(key=lambda x: x["score"], reverse=True)
     return out
 
@@ -314,7 +322,7 @@ def fuzzy_rerank(cands):
         }
         score=(c["fuzzy_sim"]*8.0)+signals["source_boost"]+signals["recency_boost"]+signals["durability_penalty"]+signals["usage_boost"]
         out.append({"path":c["path"],"source":c["source"],"snippet":c["snippet"],
-                    "score":round(score,4),"signals":signals,"_chash":_chash(content)})
+                    "score":round(score,4),"signals":signals,"temporal":_temporal_tag(content, time.time()),"_chash":_chash(content)})
     out.sort(key=lambda x: x["score"], reverse=True)
     return out
 
@@ -406,7 +414,7 @@ def embedding_rerank(cands):
         }
         score=(c["cos"]*8.0)+signals["source_boost"]+signals["recency_boost"]+signals["durability_penalty"]+signals["usage_boost"]
         out.append({"path":c["path"],"source":c["source"],"snippet":c["snippet"],
-                    "score":round(score,4),"signals":signals,"_chash":_chash(content)})
+                    "score":round(score,4),"signals":signals,"temporal":_temporal_tag(content, time.time()),"_chash":_chash(content)})
     out.sort(key=lambda x: x["score"], reverse=True)
     return out
 
@@ -435,6 +443,85 @@ def recency_boost(updated_at: str):
     except Exception:
         return 0.0
 
+# ---- valid-time semantics (#871 slice 1) ----------------------------------
+# observed_at (when recorded) and valid_from/valid_until (when the fact is
+# true) are different axes. Boundary rule, fixed here and in the tests:
+# valid_from is INCLUSIVE, valid_until is EXCLUSIVE. Modes:
+#   current (default): future facts (valid_from > now) are excluded; expired
+#     facts (valid_until <= now) are partitioned BELOW still-valid ones —
+#     demoted, never deleted, so history stays retrievable.
+#   as_of: only facts valid at that instant are eligible.
+# Undated or malformed-window facts are always kept (conservative) with a
+# body-free degraded signal; a parse failure never hides a raw fact.
+def _parse_ts(value):
+    v = (value or "").strip()
+    if not v or v.lower() == "null":
+        return None
+    try:
+        dt = datetime.fromisoformat(v.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.timestamp()
+    except Exception:
+        return None
+
+def _temporal_tag(content, now):
+    vf_raw = vu_raw = ""
+    for line in (content or "").splitlines():
+        if line.startswith("valid_from: "):
+            vf_raw = line[12:].strip()
+        elif line.startswith("valid_until: "):
+            vu_raw = line[13:].strip()
+    tag = {"status": "undated", "valid_from": vf_raw or None, "valid_until": vu_raw or None}
+    if not vf_raw and not vu_raw:
+        return tag
+    vf = _parse_ts(vf_raw)
+    vu = _parse_ts(vu_raw)
+    if (vf_raw and vf is None) or (vu_raw and vu is None):
+        tag["reason"] = "malformed-window-kept"
+        return tag
+    if vf is not None and vf > now:
+        tag["status"] = "future"
+    elif vu is not None and vu <= now:
+        tag["status"] = "expired"
+    else:
+        tag["status"] = "current"
+    return tag
+
+def _temporal_finalize(rows):
+    as_of_ts = _parse_ts(AS_OF)
+    summary = {"mode": "current", "as_of": None, "excluded": 0, "demoted": 0, "degraded": 0}
+    if AS_OF:
+        if as_of_ts is None:
+            summary["degraded"] += 1
+            summary["reason"] = "as-of-parse-failed-using-current"
+        else:
+            summary["mode"] = "as_of"
+            summary["as_of"] = AS_OF
+    current_part, expired_part = [], []
+    for r in rows:
+        tag = r.get("temporal") or {"status": "undated"}
+        tag["mode"] = summary["mode"]
+        if summary["mode"] == "as_of":
+            tag["as_of"] = AS_OF
+            if tag["status"] != "undated":
+                vf = _parse_ts(tag.get("valid_from"))
+                vu = _parse_ts(tag.get("valid_until"))
+                if (vf is not None and vf > as_of_ts) or (vu is not None and vu <= as_of_ts):
+                    summary["excluded"] += 1
+                    continue
+            current_part.append(r)
+            continue
+        if tag["status"] == "future":
+            summary["excluded"] += 1
+            continue
+        if tag["status"] == "expired":
+            summary["demoted"] += 1
+            expired_part.append(r)
+        else:
+            current_part.append(r)
+    return current_part + expired_part, summary
+
 def hybrid(toks):
     rows=con.execute("SELECT path, source, content, updated_at FROM memory_docs").fetchall()
     q=query.lower()
@@ -458,7 +545,7 @@ def hybrid(toks):
         # optional vector lanes can be added later without changing startup safety.
         score=(token_hits*4.0)+(phrase_hit*3.0)+signals["source_boost"]+signals["recency_boost"]+signals["durability_penalty"]+signals["usage_boost"]
         sn=display_snippet(r["source"], content)
-        out.append({"path":r["path"],"source":r["source"],"snippet":sn,"score":round(score,4),"signals":signals,"_chash":_chash(content)})
+        out.append({"path":r["path"],"source":r["source"],"snippet":sn,"score":round(score,4),"signals":signals,"temporal":_temporal_tag(content, time.time()),"_chash":_chash(content)})
     out.sort(key=lambda x: x["score"], reverse=True)
     return out[:limit]
 
@@ -513,9 +600,12 @@ else:
 if not wiki_enabled:
     rows = [row for row in rows if not hidden_by_wiki_boundary(row)]
 
+# #871: valid-time semantics, applied uniformly after every lane has fused.
+rows, temporal_summary = _temporal_finalize(rows)
+
 # Feedback: record the surfaced docs (only when the caller opted in), then drop
 # the internal content-hash before emitting results.
 record_usage(rows)
 for r in rows:
     r.pop("_chash", None)
-print(json.dumps({"query":query,"tokens":toks,"retrievalMode":mode,"lanes":used,"results":rows}, ensure_ascii=False, indent=2))
+print(json.dumps({"query":query,"tokens":toks,"retrievalMode":mode,"lanes":used,"temporal":temporal_summary,"results":rows}, ensure_ascii=False, indent=2))

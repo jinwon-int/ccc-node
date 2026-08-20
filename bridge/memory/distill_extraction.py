@@ -200,7 +200,10 @@ class DistillProvenance(_StrictModel):
 
 
 class HonchoFact(_StrictModel):
-    kind: Literal["preference", "decision", "observation", "context"]
+    # #871: task-progress/procedure/constraint join the original four kinds so
+    # distilled facts can carry the retention class the fact actually has
+    # (task-progress ages fast; procedure/constraint must not).
+    kind: Literal["preference", "decision", "observation", "context", "task-progress", "procedure", "constraint"]
     text: str = Field(min_length=1, max_length=4096)
     subject: Literal["user", "session", "node"]
 

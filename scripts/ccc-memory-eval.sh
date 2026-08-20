@@ -40,9 +40,16 @@ if [ "${1:-}" = "--scenario" ] || [ "${CCC_MEMORY_EVAL_MODE:-}" = "scenario" ]; 
 {"id":"old-editor","kind":"preference","text":"Historical editor preference for ccc-node memory fixtures was Vim before Helix.","entities":["ccc-node","Vim"],"tags":["historical","preference"],"observed_at":"2026-01-01T00:00:00Z","valid_from":"2026-01-01T00:00:00Z","valid_until":"2026-06-27T00:00:00Z","confidence":0.8,"durability":"durable","privacy":"private","review":"auto-local","source":{"type":"scenario-fixture","path":"memory-facts.jsonl"}}
 {"id":"volatile-pr","kind":"task-progress","text":"Volatile task progress says a no-network startup PR draft is pending and should not outrank durable policy.","entities":["ccc-node"],"tags":["volatile"],"observed_at":"2026-06-27T00:01:00Z","confidence":0.6,"durability":"volatile","privacy":"private","review":"auto-local","source":{"type":"scenario-fixture","path":"memory-facts.jsonl"}}
 {"id":"benchmark-adapter","kind":"procedure","text":"Benchmark adapter experiments must be disabled by default and export only synthetic scenario fixtures unless an operator explicitly points at real memory.","entities":["benchmark adapter","ccc-node"],"tags":["benchmark","safety"],"observed_at":"2026-06-27T00:02:00Z","confidence":0.9,"durability":"durable","privacy":"private","review":"auto-local","source":{"type":"scenario-fixture","path":"memory-facts.jsonl"}}
+{"id":"standup-old","kind":"decision","text":"Team standup time is 09:00 KST. Team standup time team standup time.","entities":["team"],"tags":["schedule"],"observed_at":"2025-06-01T00:00:00Z","valid_from":"2025-06-01T00:00:00Z","valid_until":"2026-06-01T00:00:00Z","confidence":0.9,"durability":"durable","privacy":"private","review":"auto-local","source":{"type":"scenario-fixture","path":"memory-facts.jsonl"}}
+{"id":"standup-new","kind":"decision","text":"Team standup time is 09:30 KST.","entities":["team"],"tags":["schedule"],"observed_at":"2026-06-01T00:00:00Z","valid_from":"2026-06-01T00:00:00Z","valid_until":null,"confidence":0.9,"durability":"durable","privacy":"private","review":"auto-local","source":{"type":"scenario-fixture","path":"memory-facts.jsonl"}}
+{"id":"freeze-future","kind":"constraint","text":"Deploy freeze window forbids Friday production deploys.","entities":["deploy"],"tags":["freeze"],"observed_at":"2026-06-27T00:03:00Z","valid_from":"2999-01-01T00:00:00Z","valid_until":null,"confidence":0.9,"durability":"durable","privacy":"private","review":"auto-local","source":{"type":"scenario-fixture","path":"memory-facts.jsonl"}}
+{"id":"secrets-constraint","kind":"constraint","text":"Never store raw secrets in memory artifacts.","entities":["memory"],"tags":["safety"],"observed_at":"2025-01-01T00:00:00Z","confidence":0.99,"durability":"durable","privacy":"private","review":"auto-local","source":{"type":"scenario-fixture","path":"memory-facts.jsonl"}}
 JSONL
   printf 'scenario-node\n' > "$STATE_DIR/node.txt"
-  CCC_STATE_DIR="$STATE_DIR" CCC_MEMORY_CACHE_DIR="$CACHE" CCC_MEMORY_DIR="$MEMORY_DIR" CCC_MEMORY_FACTS_FILE="$FACTS" "$INDEX_TOOL" rebuild >/dev/null
+  # Pin CCC_MEMORY_INDEX_DB explicitly: on audience-scoped bridge nodes the
+  # caller's exported CCC_MEMORY_INDEX_DB would otherwise hijack the rebuild
+  # target and overwrite the LIVE index with fixture docs.
+  CCC_STATE_DIR="$STATE_DIR" CCC_MEMORY_CACHE_DIR="$CACHE" CCC_MEMORY_DIR="$MEMORY_DIR" CCC_MEMORY_FACTS_FILE="$FACTS" CCC_MEMORY_INDEX_DB="$STATE_DIR/memory-index.sqlite" "$INDEX_TOOL" rebuild >/dev/null
   python3 - "$SEARCH_TOOL" "$STATE_DIR" <<'PY'
 import json, os, subprocess, sys, time
 search_tool, state_dir = sys.argv[1], sys.argv[2]
@@ -50,13 +57,24 @@ cases = [
   {"id":"accurate-retrieval", "query":"Korean practical evidence reports", "expected":["USER.md"], "competency":"accurate_retrieval"},
   {"id":"incremental-structured", "query":"benchmark adapter experiments synthetic scenario fixtures", "expected":["benchmark-adapter"], "competency":"test_time_learning"},
   {"id":"temporal-current", "query":"current editor preference Helix", "expected":["new-editor"], "competency":"temporal_current"},
-  {"id":"temporal-history", "query":"historical editor Vim before Helix", "expected":["old-editor"], "competency":"temporal_history"},
+  # Historical lookup now exercises the real as_of path: the expired fact is
+  # partitioned below current ones in default mode, so only an explicit
+  # point-in-time query may return it at rank 1.
+  {"id":"temporal-history", "query":"historical editor Vim before Helix", "expected":["old-editor"], "as_of":"2026-02-01T00:00:00Z", "competency":"temporal_history"},
   {"id":"volatile-demotion", "query":"durable operating policy no-network startup", "expected":["MEMORY.md"], "not_top":["volatile-pr"], "competency":"selective_forgetting"},
+  # #871 semantic temporal cases: no temporal cue words in the query, so only
+  # valid-time semantics (not lexical match) can pick the right fact.
+  {"id":"temporal-current-semantic", "query":"team standup time", "expected":["standup-new"], "competency":"temporal_current"},
+  {"id":"temporal-as-of", "query":"team standup time", "expected":["standup-old"], "absent":["standup-new"], "as_of":"2026-01-15T00:00:00Z", "competency":"temporal_history"},
+  {"id":"temporal-future-excluded", "query":"deploy freeze window Friday production deploys", "expected":[], "absent":["freeze-future"], "competency":"temporal_current"},
+  {"id":"constraint-no-age-expiry", "query":"raw secrets memory artifacts", "expected":["secrets-constraint"], "competency":"selective_forgetting"},
 ]
 per=[]; latencies=[]
 for c in cases:
     start=time.time()
     env={**os.environ,"CCC_STATE_DIR":state_dir,"CCC_MEMORY_INDEX_DB":f"{state_dir}/memory-index.sqlite","CCC_MEMORY_RETRIEVAL":"hybrid-local","CCC_MEMORY_SEARCH_LIMIT":"5"}
+    if c.get("as_of"):
+        env["CCC_MEMORY_AS_OF"]=c["as_of"]
     cp=subprocess.run([search_tool, c["query"]], env=env, text=True, capture_output=True, timeout=10)
     latencies.append(int((time.time()-start)*1000))
     results=json.loads(cp.stdout).get("results", []) if cp.returncode == 0 else []
@@ -68,12 +86,17 @@ for c in cases:
     forbidden_top=False
     if c.get("not_top") and paths:
         forbidden_top=any(x in paths[0] for x in c["not_top"])
-    per.append({**c,"paths":paths,"ranks":ranks,"forbidden_top":forbidden_top})
+    absent_hit=False
+    if c.get("absent"):
+        absent_hit=any(any(x in p for p in paths) for x in c["absent"])
+    per.append({**c,"paths":paths,"ranks":ranks,"forbidden_top":forbidden_top,"absent_hit":absent_hit})
 ks=[1,3,5]
 metrics={}
 for k in ks:
     precisions=[]; recalls=[]
     for row in per:
+        if not row["expected"]:
+            continue  # absence-assertion cases carry no retrieval target
         top=row["paths"][:k]
         hits=sum(1 for exp in row["expected"] if any(exp in p for p in top))
         precisions.append(hits / max(1, min(k, len(top) or k)))
@@ -88,13 +111,23 @@ metrics["mrr"]=sum(rr)/len(rr)
 metrics["temporal_current_accuracy"]=1.0 if next(r for r in per if r["id"]=="temporal-current")["ranks"][0] == 1 else 0.0
 metrics["conflict_resolution_accuracy"]=(metrics["temporal_current_accuracy"] + (1.0 if next(r for r in per if r["id"]=="temporal-history")["ranks"][0] == 1 else 0.0))/2
 metrics["volatile_exclusion_accuracy"]=1.0 if not next(r for r in per if r["id"]=="volatile-demotion")["forbidden_top"] else 0.0
+# #871: semantic temporal cases (no lexical cue in the query) must all hold:
+# current picks the still-valid fact, as_of picks the then-valid fact, future
+# valid_from stays out of current results, and constraints never age out.
+_sem_ids={"temporal-current-semantic","temporal-as-of","temporal-future-excluded","constraint-no-age-expiry"}
+_sem=[r for r in per if r["id"] in _sem_ids]
+metrics["temporal_semantic_accuracy"]=1.0 if _sem and all(
+    ((all(rk is not None and rk == 1 for rk in r["ranks"])) if r["expected"] else True)
+    and not r["absent_hit"]
+    for r in _sem
+) else 0.0
 latencies_sorted=sorted(latencies)
 def pct(values,q):
     if not values: return 0
     return values[min(len(values)-1, max(0, int(round((len(values)-1)*q))))]
 metrics["latency_p50_ms"]=pct(latencies_sorted,0.50)
 metrics["latency_p95_ms"]=pct(latencies_sorted,0.95)
-ok=metrics["recall_at_5"] >= 0.8 and metrics["precision_at_1"] >= 0.6 and metrics["temporal_current_accuracy"] == 1.0 and metrics["volatile_exclusion_accuracy"] == 1.0
+ok=metrics["recall_at_5"] >= 0.8 and metrics["precision_at_1"] >= 0.6 and metrics["temporal_current_accuracy"] == 1.0 and metrics["volatile_exclusion_accuracy"] == 1.0 and metrics["temporal_semantic_accuracy"] == 1.0
 print(json.dumps({"ok":ok,"mode":"scenario","cases":per,"metrics":metrics,"state_dir":state_dir}, ensure_ascii=False, indent=2))
 PY
   exit $?
@@ -124,7 +157,7 @@ ccc-node SessionStart must stay no-network and fail-open.
 ' > "$CACHE/honcho.txt"
   printf 'golden-node
 ' > "$STATE_DIR/node.txt"
-  CCC_STATE_DIR="$STATE_DIR" CCC_MEMORY_CACHE_DIR="$CACHE" CCC_MEMORY_DIR="$MEMORY_DIR" "$INDEX_TOOL" rebuild >/dev/null
+  CCC_STATE_DIR="$STATE_DIR" CCC_MEMORY_CACHE_DIR="$CACHE" CCC_MEMORY_DIR="$MEMORY_DIR" CCC_MEMORY_INDEX_DB="$STATE_DIR/memory-index.sqlite" "$INDEX_TOOL" rebuild >/dev/null
   python3 - "$SEARCH_TOOL" "$STATE_DIR" <<'PY'
 import json, os, subprocess, sys, time
 search_tool, state_dir = sys.argv[1], sys.argv[2]
@@ -222,7 +255,7 @@ printf 'Honcho summary: user prefers Korean practical reports and PR-first workf
 printf 'eval-node\n' > "$STATE_DIR/node.txt"
 printf '%s\n' "$QUERY" > "$STATE_DIR/current-task.txt"
 
-CCC_STATE_DIR="$STATE_DIR" CCC_MEMORY_CACHE_DIR="$CACHE" CCC_MEMORY_DIR="$MEMORY_DIR" \
+CCC_STATE_DIR="$STATE_DIR" CCC_MEMORY_CACHE_DIR="$CACHE" CCC_MEMORY_DIR="$MEMORY_DIR" CCC_MEMORY_INDEX_DB="$STATE_DIR/memory-index.sqlite" \
   "$INDEX_TOOL" rebuild >"$INDEX_OUT" 2>"$INDEX_ERR"
 index_rc=$?
 search_json="$(CCC_STATE_DIR="$STATE_DIR" CCC_MEMORY_INDEX_DB="$STATE_DIR/memory-index.sqlite" "$SEARCH_TOOL" "$QUERY" 2>"$SEARCH_ERR")"

@@ -242,3 +242,33 @@ def test_rejects_hardlinked_or_non_private_existing_state(tmp_path: Path) -> Non
 def test_rejects_unscoped_or_invalid_audiences(tmp_path: Path, audience: str) -> None:
     with pytest.raises(ValueError, match="audience"):
         CodexLocalMemorySink(tmp_path / "state", audience=audience)
+
+
+@pytest.mark.parametrize(
+    ("kind", "expected_durability"),
+    [
+        ("preference", "durable"),
+        ("decision", "durable"),
+        ("observation", "durable"),
+        ("context", "durable"),
+        ("procedure", "durable"),
+        ("constraint", "durable"),
+        ("task-progress", "volatile"),
+    ],
+)
+def test_fact_durability_follows_kind(
+    tmp_path: Path, kind: str, expected_durability: str
+) -> None:
+    # #871: the sink must not stamp every fact "durable" — task-progress ages
+    # like the index default, retention-relevant kinds stay durable.
+    sink = CodexLocalMemorySink(tmp_path / "state", audience="private")
+    output = extraction_output()
+    mutated = output.model_dump()
+    mutated["honcho"][0]["kind"] = kind
+    output = DistillExtractionOutput.model_validate(mutated)
+
+    sink.write(output, job_id=JOB_ID)
+
+    facts = read_facts(tmp_path / "state" / "memory-facts.jsonl")
+    assert facts[0]["kind"] == kind
+    assert facts[0]["durability"] == expected_durability
