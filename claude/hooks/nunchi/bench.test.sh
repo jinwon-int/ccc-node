@@ -246,5 +246,100 @@ run_wiki_bench
 ok "an INVALID row is never attributed to the Wiki layer" \
   '[ "$(grep -c "status=INVALID reason=provider-failure source=none$" "$wout")" = 5 ] && ! grep -q "WIKI-ANSWER" "$wout"'
 
+# ---------------------------------------------------------------------------
+# #827 — audience-scoped dispatch.
+#
+# On a scoped node ingest writes only to <audience-root>/<scope>/nunchi/facts.db.
+# bench.sh had no scope awareness and always scored $HOME/.nunchi, so from the
+# moment scoping was enabled it graded a frozen store: soonwook's bench read 52
+# facts last written 2026-07-30 while ingest held 58 written 2026-08-19. Four of
+# twelve fleet nodes were affected, which invalidates cross-node comparison of
+# the Phase 2 parity gate.
+
+# The enumerator is duplicated across three scripts by repo convention. Nothing
+# guarded that, and a security-relevant path validator silently drifting apart
+# is worse than the duplication itself.
+extract_scope_enum() {  # <script path>
+  awk '/"\$audience_root" "\$max_scopes" <<.PY.$/{f=1;next} f&&/^PY$/{exit} f' "$1"
+}
+extract_scope_enum "$ROOT/claude/hooks/nunchi/bench.sh"             > "$TMP/enum-bench"
+extract_scope_enum "$ROOT/claude/hooks/nunchi/piri-feed.sh"         > "$TMP/enum-feed"
+extract_scope_enum "$ROOT/claude/hooks/nunchi/mempalace-refresh.sh" > "$TMP/enum-refresh"
+ok "the scope enumerator is non-empty in all three scripts" \
+  '[ -s "$TMP/enum-bench" ] && [ -s "$TMP/enum-feed" ] && [ -s "$TMP/enum-refresh" ]'
+ok "bench.sh's scope enumerator stays byte-identical to piri-feed.sh's" \
+  'cmp -s "$TMP/enum-bench" "$TMP/enum-feed"'
+ok "bench.sh's scope enumerator stays byte-identical to mempalace-refresh.sh's" \
+  'cmp -s "$TMP/enum-bench" "$TMP/enum-refresh"'
+
+s_home="$TMP/scoped"
+s_hooks="$s_home/.claude/hooks/nunchi"
+s_state="$s_home/.claude/state"
+s_unscoped="$s_home/.nunchi"
+s_root="$s_home/audiences"
+s_priv="$s_root/private-$(printf '0%.0s' $(seq 32) | tr '0' 'a')"
+s_shared="$s_root/shared"
+mkdir -p "$s_hooks" "$s_state" "$s_unscoped" "$s_priv/nunchi" "$s_shared/nunchi"
+chmod 700 "$s_root" "$s_priv" "$s_shared"
+cp "$ROOT/claude/hooks/nunchi/bench.sh" "$s_hooks/bench.sh"
+chmod 700 "$s_hooks/bench.sh"
+printf 'on' > "$s_state/nunchi.mode"
+cp "$hooks/bench-qset.tsv" "$s_hooks/bench-qset.tsv"
+# Both scopes have ingested; only these two may be benched.
+: > "$s_priv/nunchi/facts.db"
+: > "$s_shared/nunchi/facts.db"
+# A scope that has never ingested must be skipped rather than graded as a
+# sheet of retrieval failures.
+mkdir -p "$s_root/private-$(printf 'b%.0s' $(seq 32))/nunchi"
+chmod 700 "$s_root/private-$(printf 'b%.0s' $(seq 32))"
+
+# Echo the DB the child was pointed at so the assertion can prove the dispatch
+# rebound it, not merely that some bench file appeared.
+cat > "$s_hooks/nunchi.py" <<'PY'
+#!/usr/bin/env python3
+import os, sys
+cmd = sys.argv[1]
+sys.stdin.read()
+if cmd == "metrics":
+    print("stub metrics")
+else:
+    print("DBSEEN=" + os.environ.get("NUNCHI_DB", "unset"))
+PY
+
+HOME="$s_home" CCC_STATE_DIR="$s_state" NUNCHI_HOME="$s_unscoped" \
+  NUNCHI_BENCH_QSET="$s_hooks/bench-qset.tsv" CCC_NODE=scoped-node \
+  CCC_NUNCHI_AUDIENCE_SCOPED=1 CCC_NUNCHI_AUDIENCE_ROOT="$s_root" \
+  NUNCHI_BENCH_WIKI_CLI=/nonexistent \
+  bash "$s_hooks/bench.sh" > "$TMP/s-stdout" 2> "$TMP/s-stderr"
+s_rc=$?
+s_priv_out="$(find "$s_priv/nunchi" -maxdepth 1 -name 'bench-*.md' -type f -print -quit)"
+s_shared_out="$(find "$s_shared/nunchi" -maxdepth 1 -name 'bench-*.md' -type f -print -quit)"
+s_unscoped_out="$(find "$s_unscoped" -maxdepth 1 -name 'bench-*.md' -type f -print -quit)"
+
+ok "scoped dispatch exits cleanly" '[ "$s_rc" = 0 ]'
+ok "each ingested scope gets its own bench sheet" \
+  '[ -n "$s_priv_out" ] && [ -n "$s_shared_out" ]'
+ok "the frozen unscoped store is no longer benched on a scoped node" \
+  '[ -z "$s_unscoped_out" ]'
+ok "the private scope is graded against its own DB, not \$HOME/.nunchi" \
+  'grep -q "DBSEEN=$s_priv/nunchi/facts.db" "$s_priv_out"'
+ok "the shared scope is graded against its own DB" \
+  'grep -q "DBSEEN=$s_shared/nunchi/facts.db" "$s_shared_out"'
+ok "a scope that has never ingested is skipped, not scored as failure" \
+  '[ -z "$(find "$s_root/private-$(printf "b%.0s" $(seq 32))/nunchi" -name "bench-*.md" -print -quit)" ]'
+ok "each sheet records its opaque scope and kind, and no fact bodies" \
+  'grep -q "node=scoped-node scope=${s_priv##*/} kind=private" "$s_priv_out" \
+   && grep -q "node=scoped-node scope=shared kind=shared" "$s_shared_out"'
+
+# The unscoped path must keep working unchanged for the 8 non-scoped nodes.
+HOME="$s_home" CCC_STATE_DIR="$s_state" NUNCHI_HOME="$s_unscoped" \
+  NUNCHI_BENCH_QSET="$s_hooks/bench-qset.tsv" CCC_NODE=plain-node \
+  NUNCHI_BENCH_WIKI_CLI=/nonexistent \
+  bash "$s_hooks/bench.sh" > "$TMP/p-stdout" 2>&1
+p_rc=$?
+p_out="$(find "$s_unscoped" -maxdepth 1 -name 'bench-*.md' -type f -print -quit)"
+ok "an unscoped node still benches \$NUNCHI_HOME and emits no scope label" \
+  '[ "$p_rc" = 0 ] && [ -n "$p_out" ] && grep -q "node=plain-node$" "$p_out"'
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

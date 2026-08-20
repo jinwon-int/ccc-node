@@ -182,8 +182,14 @@ printf '%s\n' "{\"type\":\"message\",\"message\":{\"role\":\"user\",\"content\":
 chmod 600 "$first_scope/piri/sessions/1_test.jsonl"
 out="$(env "${common_env[@]}" bash "$ROOT/scripts/install-nunchi.sh" \
   --apply --piri --audience-scoped "$audience_root" 2>&1)"; rc=$?
+# All three managed lines must carry the scope, not just feed and refresh.
+# This assertion previously expected 2 and so encoded the #827 defect: the
+# bench cron ran unscoped, which made bench.sh grade $HOME/.nunchi — a store
+# that stops receiving facts the moment ingest becomes scoped.
 ok "scoped Piri install persists the exact audience dispatcher root in managed cron" \
-  '[ "$rc" = 0 ] && [ "$(grep -c "CCC_NUNCHI_AUDIENCE_SCOPED=1" "$cron_store")" = 2 ] && [ "$(grep -c "CCC_NUNCHI_AUDIENCE_ROOT=$audience_root" "$cron_store")" = 2 ] && grep -q "audience_scoped: enabled=1 root=$audience_root" <<<"$out"'
+  '[ "$rc" = 0 ] && [ "$(grep -c "CCC_NUNCHI_AUDIENCE_SCOPED=1" "$cron_store")" = 3 ] && [ "$(grep -c "CCC_NUNCHI_AUDIENCE_ROOT=$audience_root" "$cron_store")" = 3 ] && grep -q "audience_scoped: enabled=1 root=$audience_root" <<<"$out"'
+ok "the weekly bench cron is scoped alongside the feed and refresh lines" \
+  'grep "bench.sh" "$cron_store" | grep -q "CCC_NUNCHI_AUDIENCE_SCOPED=1 CCC_NUNCHI_AUDIENCE_ROOT=$audience_root"'
 ok "scoped apply materializes provider and audience flags into the install record" \
   'jq -e --arg root "$audience_root" ".argv==[\"--apply\",\"--piri\",\"--audience-scoped\",\$root]" "$nrec" >/dev/null'
 out="$(run_install 2>&1)"; rc=$?
