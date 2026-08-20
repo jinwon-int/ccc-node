@@ -158,5 +158,45 @@ rc=$?
 set -e
 ok "shebang-fallback materializer still fails closed on real script failures" '[ "$rc" = 78 ]'
 
+# #1184: the final real-CLI exec is shebang-aware. A `#!/usr/bin/env X` real
+# CLI runs through the interpreter resolved from PATH (the kernel cannot
+# resolve /usr/bin/env on Android without libtermux-exec's hook); an
+# absolute-shebang script still execs directly. The piri chain's later hops
+# (pi-test.sh -> tsx) live in the piri repo and are out of scope here. The
+# stub interpreter gets a unique name so the launcher/materializer's own
+# `env bash` resolutions can never be mistaken for the real-CLI route.
+stubdir="$TMP/stub-bin"; mkdir -p "$stubdir"
+real_bash="$(command -v bash)"
+stub_log="$TMP/stub-interp.log"
+stub_name="bashstub-ccc1184"
+cat > "$stubdir/$stub_name" <<SH
+#!$real_bash
+printf 'STUB:%s\n' "\$*" >> "$stub_log"
+exec "$real_bash" "\$@"
+SH
+chmod 0700 "$stubdir/$stub_name"
+
+real_env="$TMP/real-env-stub"
+{ printf '#!/usr/bin/env %s\n' "$stub_name"; tail -n +2 "$real"; } > "$real_env"
+chmod 0700 "$real_env"
+: > "$order"; : > "$stub_log"
+set +e
+out="$(printf 'stdin data' | PATH="$stubdir:$PATH" ORDER_FILE="$order" ARGV_FILE="$argv" CWD_FILE="$cwd_file" ENV_FILE="$env_file" MAT_RC=0 STATUS_RC=1 REAL_RC=23 CCC_PIRI_MEMORY_HOME="$piri_home" CCC_PIRI_MEMORY_MATERIALIZER_PATH="$mat" CCC_PIRI_REAL_CLI_PATH="$real_env" "$LAUNCHER" --mode rpc 2>"$err")"
+rc=$?
+set -e
+ok "env-shebang real CLI execs through the PATH-resolved interpreter" \
+  '[ "$rc" = 23 ] && [ "$out" = "REAL:stdin data" ] && grep -Fx "STUB:'"$real_env"' --mode rpc" "$stub_log" >/dev/null'
+
+real_abs="$TMP/real-abs"
+{ printf '#!%s\n' "$real_bash"; tail -n +2 "$real"; } > "$real_abs"
+chmod 0700 "$real_abs"
+: > "$order"; : > "$stub_log"
+set +e
+out="$(printf 'stdin data' | PATH="$stubdir:$PATH" ORDER_FILE="$order" ARGV_FILE="$argv" CWD_FILE="$cwd_file" ENV_FILE="$env_file" MAT_RC=0 STATUS_RC=1 REAL_RC=23 CCC_PIRI_MEMORY_HOME="$piri_home" CCC_PIRI_MEMORY_MATERIALIZER_PATH="$mat" CCC_PIRI_REAL_CLI_PATH="$real_abs" "$LAUNCHER" --mode rpc 2>"$err")"
+rc=$?
+set -e
+ok "absolute-shebang real CLI still execs directly" \
+  '[ "$rc" = 23 ] && [ "$out" = "REAL:stdin data" ] && [ ! -s "$stub_log" ]'
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

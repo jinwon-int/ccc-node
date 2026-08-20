@@ -109,5 +109,55 @@ rc=$?
 set -e
 ok "shebang-fallback materializer still fails closed on real script failures" '[ "$rc" = 78 ]'
 
+# #1184: the final real-CLI exec is shebang-aware. A `#!/usr/bin/env X` real
+# CLI runs through the interpreter resolved from PATH (the kernel cannot
+# resolve /usr/bin/env on Android without libtermux-exec's hook); an
+# absolute-shebang script still execs directly. The stub interpreter gets a
+# unique name so the launcher/materializer's own `env bash` resolutions can
+# never be mistaken for the real-CLI route.
+stubdir="$TMP/stub-bin"; mkdir -p "$stubdir"
+real_bash="$(command -v bash)"
+stub_log="$TMP/stub-interp.log"
+stub_name="bashstub-ccc1184"
+cat > "$stubdir/$stub_name" <<SH
+#!$real_bash
+printf 'STUB:%s\n' "\$*" >> "$stub_log"
+exec "$real_bash" "\$@"
+SH
+chmod 0700 "$stubdir/$stub_name"
+
+real_env="$TMP/real-env-stub"
+{ printf '#!/usr/bin/env %s\n' "$stub_name"; tail -n +2 "$real"; } > "$real_env"
+chmod 0700 "$real_env"
+: > "$order"; : > "$stub_log"
+set +e
+out="$(printf 'stdin data' | PATH="$stubdir:$PATH" ORDER_FILE="$order" ARGV_FILE="$argv" CWD_FILE="$cwd_file" MAT_RC=0 STATUS_RC=1 REAL_RC=23 CCC_CODEX_MEMORY_MATERIALIZER_PATH="$mat" CCC_CODEX_REAL_CLI_PATH="$real_env" "$LAUNCHER" --alpha 2>"$err")"
+rc=$?
+set -e
+ok "env-shebang real CLI execs through the PATH-resolved interpreter" \
+  '[ "$rc" = 23 ] && [ "$out" = "REAL:stdin data" ] && grep -Fx "STUB:'"$real_env"' --alpha" "$stub_log" >/dev/null'
+
+real_abs="$TMP/real-abs"
+{ printf '#!%s\n' "$real_bash"; tail -n +2 "$real"; } > "$real_abs"
+chmod 0700 "$real_abs"
+: > "$order"; : > "$stub_log"
+set +e
+out="$(printf 'stdin data' | PATH="$stubdir:$PATH" ORDER_FILE="$order" ARGV_FILE="$argv" CWD_FILE="$cwd_file" MAT_RC=0 STATUS_RC=1 REAL_RC=23 CCC_CODEX_MEMORY_MATERIALIZER_PATH="$mat" CCC_CODEX_REAL_CLI_PATH="$real_abs" "$LAUNCHER" --alpha 2>"$err")"
+rc=$?
+set -e
+ok "absolute-shebang real CLI still execs directly" \
+  '[ "$rc" = 23 ] && [ "$out" = "REAL:stdin data" ] && [ ! -s "$stub_log" ]'
+
+real_envs="$TMP/real-env-s"
+{ printf '#!/usr/bin/env -S %s --norc\n' "$stub_name"; tail -n +2 "$real"; } > "$real_envs"
+chmod 0700 "$real_envs"
+: > "$order"; : > "$stub_log"
+set +e
+out="$(printf 'stdin data' | PATH="$stubdir:$PATH" ORDER_FILE="$order" ARGV_FILE="$argv" CWD_FILE="$cwd_file" MAT_RC=0 STATUS_RC=1 REAL_RC=23 CCC_CODEX_MEMORY_MATERIALIZER_PATH="$mat" CCC_CODEX_REAL_CLI_PATH="$real_envs" "$LAUNCHER" --alpha 2>"$err")"
+rc=$?
+set -e
+ok "env -S fixed args are honored ahead of the script path" \
+  '[ "$rc" = 23 ] && [ "$out" = "REAL:stdin data" ] && grep -Fx "STUB:--norc '"$real_envs"' --alpha" "$stub_log" >/dev/null'
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
