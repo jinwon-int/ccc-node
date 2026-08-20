@@ -923,6 +923,11 @@ class CodexRuntimeTests(unittest.IsolatedAsyncioTestCase):
             codex_home = Path(raw_home)
             day = codex_home / "sessions" / "2026" / "08" / "19"
             day.mkdir(mode=0o755, parents=True)
+            # parents=True creates intermediate directories with the process
+            # umask.  Pin the Codex-owned root to its real 0755 mode so this
+            # success-path test remains valid under a collaborative 0002
+            # checkout while validate_rollout_root keeps rejecting 0775.
+            (codex_home / "sessions").chmod(0o755)
             captured = datetime(2026, 8, 19, 12, 0, tzinfo=timezone.utc)
             rollout = day / "rollout-2026-08-19T00-00-00-thread-dead.jsonl"
             rollout.write_text(
