@@ -147,7 +147,16 @@ mkdir -p "$NUNCHI_HOME"
 LEDGER="$(mktemp "${TMPDIR:-/tmp}/nunchi-bench-XXXXXX")" || exit 2
 trap 'rm -f "$LEDGER"' EXIT
 
-tail -n +2 "$QSET" | while IFS=$'\t' read -r qid category query expect; do
+# TM-2370 P1-A — the Q-set gained `source` and `evidence` columns in #1207.
+# `read` folds every unread column into the last variable, so a 4-variable read
+# silently glued source+evidence onto $expect. The 5th variable is deliberately
+# NOT named `source`: this loop already owns a `source` variable meaning "which
+# layer actually answered", and the two share a value space (none/nunchi/wiki),
+# so reusing the name would corrupt layer attribution with no syntax error and
+# no implausible value. `want_source` is the Q-set's claim, `source` the measurement.
+# A pre-#1207 4-column Q-set leaves both new variables empty, which the polarity
+# rule below reads as "positive" — an old Q-set keeps exactly its old meaning.
+tail -n +2 "$QSET" | while IFS=$'\t' read -r qid category query expect want_source evidence; do
   [ -n "$qid" ] || continue
   start="$(date +%s)"
   # The loop itself reads the Q-set from stdin. Provider CLIs launched by
@@ -192,15 +201,42 @@ tail -n +2 "$QSET" | while IFS=$'\t' read -r qid category query expect; do
       source=nunchi
     fi
   fi
-  printf '%s\t%s\t%s\n' "$qid" "$status" "$source" >> "$LEDGER"
-  {
-    if [ -n "$reason" ]; then
-      echo "## $qid ($category) — ${dur}s rc=$rc status=$status reason=$reason source=$source"
+  # TM-2370 P1-A — `source=none` in the Q-set marks a negative-control row: a
+  # question with no true answer (q44-q48, category 부정형), where "기록 없음" IS
+  # the correct answer. Grading those like positive rows inverts the verdict
+  # twice — a correct refusal scores as retrieval failure, and a fabricated
+  # answer scores as a success. They must leave the positive denominator and be
+  # graded in reverse.
+  case "$want_source" in
+    none) polarity=negative ;;
+    *)    polarity=positive ;;
+  esac
+  # Spelled out rather than `test && x || y`: this is the grading decision, and
+  # in that idiom a future change to the middle branch silently falls through to
+  # the wrong grade.
+  grade=-
+  if [ "$status" = OK ]; then
+    if [ "$polarity" = negative ]; then
+      if [ "$source" = none ]; then grade=CORRECT-REJECT; else grade=FABRICATED; fi
     else
-      echo "## $qid ($category) — ${dur}s rc=$rc status=$status source=$source"
+      if [ "$source" = none ]; then grade=UNANSWERED; else grade=ANSWERED; fi
+    fi
+  fi
+  printf '%s\t%s\t%s\t%s\t%s\n' "$qid" "$status" "$source" "$polarity" "$grade" >> "$LEDGER"
+  {
+    # grade= is emitted only for negative-control rows. On a positive row it is
+    # a pure restatement of source= (ANSWERED iff source!=none), so adding it
+    # everywhere would be noise; on a negative row source= alone reads backwards.
+    suffix=
+    [ "$polarity" = negative ] && suffix=" grade=$grade"
+    if [ -n "$reason" ]; then
+      echo "## $qid ($category) — ${dur}s rc=$rc status=$status reason=$reason source=$source$suffix"
+    else
+      echo "## $qid ($category) — ${dur}s rc=$rc status=$status source=$source$suffix"
     fi
     echo "- Q: $query"
     echo "- expect: $expect"
+    [ -n "${evidence:-}" ] && echo "- evidence: $evidence"
     printf '%s\n\n' "$ans" | sed 's/^/  > /'
     if [ "$source" = wiki ]; then
       echo "- Wiki 계층 답변:"
@@ -212,9 +248,28 @@ done
 total="$(wc -l < "$LEDGER" | tr -d ' ')"
 invalid="$(grep -c $'\tINVALID\t' "$LEDGER" || true)"
 valid=$(( total - invalid ))
-by_nunchi="$(grep -c $'\tnunchi$' "$LEDGER" || true)"
-by_wiki="$(grep -c $'\twiki$' "$LEDGER" || true)"
-unanswered=$(( valid - by_nunchi - by_wiki ))
+# The layer counters used to be anchored with $ because source was the last
+# ledger field. Adding polarity/grade would have silently zeroed them, so they
+# are matched by position instead — and scoped to positive rows, because a
+# negative-control row attributed to a layer is a fabrication, not coverage.
+read -r by_nunchi by_wiki answered unanswered correct_reject fabricated <<<"$(
+  awk -F'\t' '
+    $4=="positive" && $3=="nunchi"         {n++}
+    $4=="positive" && $3=="wiki"           {w++}
+    $5=="ANSWERED"                         {a++}
+    $5=="UNANSWERED"                       {u++}
+    $5=="CORRECT-REJECT"                   {r++}
+    $5=="FABRICATED"                       {f++}
+    END { printf "%d %d %d %d %d %d", n+0, w+0, a+0, u+0, r+0, f+0 }
+  ' "$LEDGER"
+)"
+pos_valid=$(( answered + unanswered ))
+neg_valid=$(( correct_reject + fabricated ))
+# TM-2370 P1-A gate thresholds. Overridable so a node can be calibrated without
+# a code change during the first month of 48-question runs.
+UNANSWERED_MAX_PCT="${NUNCHI_BENCH_UNANSWERED_MAX_PCT:-10}"
+unanswered_pct=0
+[ "$pos_valid" -gt 0 ] && unanswered_pct=$(( unanswered * 100 / pos_valid ))
 {
   echo "## bench-summary ($(date -Is))"
   echo "- queries: $total"
@@ -226,6 +281,32 @@ unanswered=$(( valid - by_nunchi - by_wiki ))
   echo "- answered by nunchi: $by_nunchi"
   echo "- answered by wiki: $by_wiki"
   echo "- unanswered (gate candidates): $unanswered"
+  # TM-2370 P1-A — positive and negative-control rows are scored separately.
+  # A negative-control row answered by any layer is a fabrication: the question
+  # has no true answer, so producing one is the failure mode the gate exists to
+  # catch, not a coverage win.
+  if [ "$neg_valid" -gt 0 ]; then
+    echo "- positive rows (valid): $pos_valid"
+    echo "- negative-control rows (valid): $neg_valid"
+    echo "- correct rejections: $correct_reject"
+    echo "- fabrications (부정형 조작): $fabricated"
+  fi
+  echo "- unanswered rate: ${unanswered_pct}% of $pos_valid positive (threshold ≤${UNANSWERED_MAX_PCT}%)"
+  # The verdict is advisory and never changes the exit code. bench.sh is a cron
+  # job on every node and #1078 already settled that the bench is not the
+  # failing unit — a failing gate must not turn into fleet-wide cron noise.
+  if [ "$invalid" -gt 0 ]; then
+    verdict="INDETERMINATE — sample contaminated ($invalid invalid)"
+  elif [ "$fabricated" -gt 0 ]; then
+    verdict="FAIL — $fabricated fabrication(s) on negative controls (hard fail)"
+  elif [ "$pos_valid" -eq 0 ]; then
+    verdict="INDETERMINATE — no positive rows"
+  elif [ "$unanswered_pct" -gt "$UNANSWERED_MAX_PCT" ]; then
+    verdict="FAIL — unanswered ${unanswered_pct}% > ${UNANSWERED_MAX_PCT}%"
+  else
+    verdict="PASS"
+  fi
+  echo "- gate verdict: $verdict"
   if [ "$invalid" -gt 0 ]; then
     # The parity gate counts "기록 없음" answers. An INVALID row has none, so
     # leaving it in the sample makes a dead backend look like a perfect score.
@@ -236,4 +317,4 @@ unanswered=$(( valid - by_nunchi - by_wiki ))
   echo
 } >> "$OUT"
 
-echo "bench written: $OUT (valid=$valid invalid=$invalid)"
+echo "bench written: $OUT (valid=$valid invalid=$invalid) gate=$verdict"
