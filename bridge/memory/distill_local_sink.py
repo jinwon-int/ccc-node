@@ -178,6 +178,18 @@ class CodexLocalMemorySink:
                 # "durable" — task-progress ages like the index default expects.
                 "durability": "volatile" if item.kind == "task-progress" else "durable",
                 "confidence": 0.7,
+                # #871 §4 / nunchi G2 — source precedence is a separate axis
+                # from confidence, so a contradiction is never resolved by the
+                # confidence number alone. Ranks mirror nunchi's peer_facts:
+                # 3 user-stated, 2 measured, 1 inferred.
+                #
+                # Everything this sink writes is an agent's reading of a
+                # transcript, and nothing here verifies a claim against a
+                # literal quote. G2's rule for exactly that case is to demote
+                # to 1 rather than trust a self-reported rank, so a distilled
+                # fact can never close a user-stated or measured one. A writer
+                # that CAN cite a quote sets a higher rank on its own facts.
+                "source_rank": 1,
                 "observed_at": provenance.distilled_at,
                 "entities": [item.subject],
                 "tags": ["distilled", provenance.trigger.value],
