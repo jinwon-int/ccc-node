@@ -215,9 +215,14 @@ ok "snapshot header marks nunchi primary" 'grep -q "nunchi working memory (prima
 printf 'off' > "$CCC_STATE_DIR/nunchi.mode"
 out="$(bash "$HERE/bench.sh" 2>&1)"; rc=$?
 ok "bench no-op when mode=off" '[ "$rc" = 0 ] && [ -z "$out" ]'
+# TM-2370 P1: the Q-set grew 7 -> 48 (six columns — source/evidence fold into
+# expect for the 4-column reader, so bench.sh needs no change). Contract: every
+# row has exactly 6 columns, ids are unique, and the original q1-q7 queries are
+# preserved verbatim for series continuity.
 rows="$(tail -n +2 "$HERE/bench-qset.tsv" | grep -c .)"
-badcols="$(awk -F'\t' 'NF!=4' "$HERE/bench-qset.tsv" | grep -c . || true)"
-ok "bench qset has 7 rows of 4 tab-separated columns" '[ "$rows" = 7 ] && [ "$badcols" = 0 ]'
+badcols="$(awk -F'\t' 'NF!=6' "$HERE/bench-qset.tsv" | grep -c . || true)"
+dupids="$(tail -n +2 "$HERE/bench-qset.tsv" | cut -f1 | sort | uniq -d | grep -c . || true)"
+ok "bench qset has 48 rows of 6 tab-separated columns, unique ids" '[ "$rows" = 48 ] && [ "$badcols" = 0 ] && [ "$dupids" = 0 ]'
 printf 'on' > "$CCC_STATE_DIR/nunchi.mode"
 
 # ---- 13. #890 write gate ----------------------------------------------------
