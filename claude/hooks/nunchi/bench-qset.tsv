@@ -1,8 +1,49 @@
-id	category	query	expect_hint
-q1	relational-preference	사용자가 Claude 모델 설정 변경을 어떻게 검증하길 원하나	실측(로그·grep) 기반 검증 + 정정 즉시 기록 선호
-q2	relational-aggregate	nunchi 파일럿 노드별 fact 수는 어떻게 되나	노드별 수치를 근거와 함께 (DB 최신값 허용)
-q3	verbatim-keyword	quiz2-api 서비스 포트와 경로	seoseo /opt/seoseo-services/quiz2 계열 원문 상세
-q4	verbatim-paraphrase	퀴즈 API가 어느 주소에서 돌고 있었는지 기억나?	q3과 동일 사실 — 자연어 패러프레이즈 회수 검증(TM-1332 Q4 약점)
-q5	supersede-time	이 노드의 현재 ccc-node HEAD 커밋은	최신 fact가 과거 fact를 대체해야 함 (B2/시간축 검증)
-q6	reason-preservation	Termux 노드를 peer_facts-only로 확정한 이유는	결정과 함께 근거(chromadb aarch64 빌드 불가 등)가 답에 남아야 함 (#890 드리프트 축)
-q7	reason-preservation	Honcho를 유지하지 않고 폐기 경로로 정한 이유는	결정+이유(원문형 무능·서버 영구화 등) 동반 회수 — 이유 소실 시 드리프트 실측
+id	category	query	expect_hint	source	evidence
+q1	관계선호	사용자가 Claude 모델 설정 변경을 어떻게 검증하길 원하나	실측(로그·grep) 기반 검증 + 정정 즉시 기록 선호	nunchi	facts.db preference류 / decisions/memory-system-mempalace-nunchi §TM-1332 실측 문항
+q2	관계선호	nunchi 파일럿 노드별 fact 수는 어떻게 되나	노드별 수치를 근거와 함께 (DB 최신값 허용)	nunchi	decisions/memory-system-mempalace-nunchi §TM-1332 표 (soonwook 52·dungae 39·yukson 134, 최신값 허용)
+q3	노드사실	quiz2-api 서비스 포트와 경로	seoseo /opt/seoseo-services/quiz2 계열 원문 상세	nunchi	MemPalace verbatim (seoseo quiz2 세션 원문) — TM-1332 Q3
+q4	노드사실	퀴즈 API가 어느 주소에서 돌고 있었는지 기억나?	q3과 동일 사실 — 자연어 패러프레이즈 회수 검증(TM-1332 Q4 약점)	nunchi	q3과 동일 근거 — 패러프레이즈 회수 프로브
+q5	시간축	이 노드의 현재 ccc-node HEAD 커밋은	최신 fact가 과거 fact를 대체해야 함 (B2/시간축 검증)	nunchi	facts.db supersede 체인 (HEAD 커밋 fact) — live-check 대조 허용
+q6	결정근거	Termux 노드를 peer_facts-only로 확정한 이유는	결정과 함께 근거(chromadb aarch64 빌드 불가 등)가 답에 남아야 함 (#890 드리프트 축)	wiki	decisions/memory-system-mempalace-nunchi §TM-2029 Termux 노드 메모리 전략
+q7	결정근거	Honcho를 유지하지 않고 폐기 경로로 정한 이유는	결정+이유(원문형 무능·서버 영구화 등) 동반 회수 — 이유 소실 시 드리프트 실측	wiki	decisions/memory-system-mempalace-nunchi §TM-2029 (기각 사유·3단계 전환)
+q8	관계선호	사용자에게 보고할 때 지켜야 하는 절 구성과 증거 규칙은	확정 사실/변경/리스크/다음 액션 절 분리 + SHA·PR·문서번호 등 증거 ID 절대 생략 금지	nunchi	facts.db preference id 728·460·619
+q9	관계선호	사용자에게 뭔가 물어봐야 할 때는 어떤 형식으로 물어야 하나	번호형 선택지 + 권장안 선제시, 사용자는 숫자만으로 답함	nunchi	facts.db preference id 706·679·491
+q10	관계선호	여러 노드가 조사한 걸 하나로 합쳐 달라고 하면 어떤 모양새로 정리해 드려야 하지	중복 통합 + 중요도 높은 순 단일 종합 문서, docx 먼저 + txt 사본 패턴	nunchi	facts.db preference id 747 — 패러프레이즈 프로브('종합 문서/중복' 어휘 회피)
+q11	관계선호	CI 불이 다 들어왔으면 그대로 합쳐도 되는 거였나	아니오 — CI green은 머지 승인이 아님, 교차계정 승인·머지는 매건 신선 승인	nunchi	facts.db preference id 604·597·524 — 패러프레이즈 프로브('그린/머지' 어휘 회피)
+q12	관계선호	다른 노드에 일을 넘기려다 사용자에게 들은 말은	"내가해? 너가해두 되지 않아?" — 스스로 할 수 있으면 직접 수행, 능력 경계가 있으면 근거와 대안 제시	nunchi	facts.db preference id 661 — 패러프레이즈 프로브
+q13	관계선호	crush 전환 작업에서 반드시 지켜야 하는 순서는	전환 전 검증 → 스위치 → 전환 후 검증 (오너 직접 발화 제약)	nunchi	facts.db constraint id 198 (TM-2348 rank 복원 사례)
+q14	관계선호	스킬을 전 노드로 전파할 수 있게 만들 때 경로는 어떻게 처리하나	노드 고정 경로(/root/.telegram_bot/...)를 $HOME/...로 일반화, [[wikilink]] 제거	nunchi	facts.db preference id 643·636
+q15	노드사실	T2 브로커는 어느 노드인가	gwakga(곽가/VPS7) — T1은 seoseo	wiki	runbooks/a2a-broker-operating-rules [RB-32] / nodes/map
+q16	노드사실	곽가 노드의 Tailscale IP와 SSH 접속 대상은	100.102.203.64:22 (Tailscale 정본, 공인 IP 경로는 historical)	wiki	nodes/gwakga/README 빠른 정보 표
+q17	노드사실	공융과 대교는 어떤 플랫폼에서 도는 노드인가	Android/Termux 2대 (VPS와 서비스 관리 방식 다름)	wiki	aliases [AL-01] (android·termux·mobile) / nodes/map
+q18	노드사실	현재 active 노드는 몇 개고 주 런타임은 무엇인가	12노드, 전부 ccc-node Telegram bridge가 주 런타임	wiki	nodes/map [IDX-21]
+q19	노드사실	vps2라고 부르던 서버는 지금 이름이 뭐지	nosuk(노숙) — 현행 VPS2, yukson-historical과 혼동 금지	wiki	aliases [AL-01] / nodes/map [IDX-22] — 별칭·조사 변형 프로브
+q20	노드사실	곽가에서 a2a-nexus 로컬 게이트가 통과해도 CI 통과를 보장하지 못하는 이유는	로컬 Node v24.15.0 vs CI node 22 핀 — coverage parity·smoke가 로컬에서만 실패	wiki	nodes/gwakga/README [ND-2342]
+q21	노드사실	Honcho self-hosted API는 어디서 돌고 접근 제한은 어떻게 걸려 있나	gwakga 100.102.203.64:8000 Docker Compose + honcho-8000-acl.service tailnet allowlist	wiki	nodes/honcho-status / nodes/gwakga/README 운영 메모
+q22	노드사실	무거운 작업을 맡기는 heavy worker 노드는 어디인가	bangtong(방통)	wiki	aliases [AL-04] 역할/capability 별칭
+q23	결정근거	MemPalace 채택 근거가 된 A/B 실측 수치는	Honcho 평균 ~33s·무응답 33% vs MemPalace ~2.0s·무응답 0, 완전 3자 비교 결합 6/8 vs Honcho 4/8	wiki	decisions/memory-system-mempalace-nunchi §TM-1330 A/B·§TM-1332 스코어보드
+q24	결정근거	2026Q3 플릿 로드맵에서 최대 공백으로 지목된 자산은	Code-Graph (서버가 아니라 skill 형태로 채우는 방향)	wiki	decisions/fleet-evolution-roadmap-2026q3 [TM-2370] 좌표표·P2
+q25	결정근거	MemPalace 3.7 logstream 기능에 대한 금지 원칙은	A2A 우회 금지 — 메모리 허브 vs 태스크 브로커 역할 분리, logstream 비활성 유지	wiki	decisions/fleet-evolution-roadmap-2026q3 Anti-goal 3
+q26	결정근거	Wiki 리포 master의 필수 상태 체크와 PR 승인 요구 건수는	wiki-pr-gate 필수 + 승인 0건 (12노드 자기 PR 셀프 머지 구조 때문)	wiki	decisions/wiki-branch-protection-2026-08 설정 표
+q27	결정근거	A2A 소스·GitHub 작업의 단일 정본 레포와 split repo 취급 원칙은	jinwon-int/a2a-nexus 단일 정본, a2a-broker 등 split repo는 archived provenance mirror (신규 issue/PR 금지)	wiki	Wiki 루트 CLAUDE.md [FW-05] query 절
+q28	결정근거	ccc-node PR #1104를 재시도하면 안 되는 이유는	락 해시 827개 삭제로 bridge-tests 양쪽 실패 — ruff 인상은 scripts/ccc-deps-lock.sh 경유 필수	nunchi	facts.db decision id 600·591
+q29	결정근거	손해배상금 회수·정산 기준에서 채권 재양도 대신 채택한 구조와 이유는	공사가 우선변제권으로 직접 배당받은 뒤 정산금 반환/배당금채권 양도 — 재양도로는 주임법 3조의2 7항 우선변제권 미승계(두 로펌 일치)	nunchi	facts.db decision id 738 (HUG 업무)
+q30	결정근거	state-contract-allow(PR #1179)가 허용하는 것과 킬스위치는	working-state.md 단일 파일 Write/Edit/MultiEdit 승인 루트 없이 허용(realpath 고정·심링크 거부), 킬스위치 CCC_STATE_CONTRACT_ALLOW=0	nunchi	facts.db decision id 730·722·709
+q31	절차런북	ccc-node 체크아웃이 여러 개인 노드에서 런타임 경로를 확인하는 절차는	서빙 프로세스에서 역추적: ps -eo cmd | grep 'telegram_bot --path' + systemd ExecStart 일치 확인	wiki	nodes/map [IDX-22] (yukson/gongmyoung 오판 사례 포함)
+q32	절차런북	GitHub Actions 장애로 wiki-pr-gate가 안 돌 때 머지 탈출구와 사용 조건은	admin(jinon86) --admin 우회 — githubstatus 확인 + 로컬 wiki-lint 회귀 0 + log.md에 우회 기록, 3조건 전부 충족 시만	wiki	decisions/wiki-branch-protection-2026-08 break-glass 절
+q33	절차런북	위키 운영 로그 신규 항목의 ID 규칙은	LOG-YYYYMMDD-<node>-<seq> (2026-07-02부터, 동시 작업 충돌 방지; 기존 LOG-NNNN 재번호 금지)	wiki	rules.md [R-18] namespace 표
+q34	절차런북	운영 일지가 계속 쌓이면 어떻게 정리하기로 했나	반월 이관 — 1~15일→log-archive-YYYY-MM-h1.md, 16일~월말→h2; rotate-log.py는 월 경계 fallback	wiki	runbooks/wiki-maintenance-scripts [RB-402] / Wiki 루트 CLAUDE.md [FW-02] — 패러프레이즈 프로브('로테이션/아카이브' 어휘 회피)
+q35	절차런북	wiki-lint.py가 자동으로 점검하는 항목들은	broken-link·dup-doc·orphan·oversize·stale-log·secret-like	wiki	runbooks/wiki-maintenance-scripts [RB-403] 표
+q36	절차런북	credential은 위키에 어떻게 기록해야 하나	값 기록 금지 — 보관 위치·재발급 절차·의존 서비스만 기록	wiki	Wiki 루트 CLAUDE.md [FW-03]
+q37	절차런북	브로커 세션에서 대형 A2A/GitHub closeout 작업은 어디서 수행해야 하나	Telegram foreground 금지 — isolated subagent/TaskFlow/A2A worker/스크립트로 분리, DM은 시작 보고·승인·요약만	wiki	runbooks/a2a-broker-operating-rules [RB-33]
+q38	시간축	곽가의 현재 owner-facing 모델과 effort는	claude-fable-5 / xhigh (2026-08-17~18 정렬; mutable — settings.json/세션 live-check 허용)	either	rules/fleet-model 2026-08-18 블록 / nodes/gwakga/README AI model 행
+q39	시간축	ccc bridge Claude provider의 현행 모델 정본은 어느 파일 어느 키인가	~/.claude/settings.json의 model 키 — ~/.claude.json은 브리지가 안 읽음, 키 없으면 /new 때 세션 pin이 None으로 덮임	wiki	rules/fleet-model 2026-08-17 블록 (LOG-20260817-gongyung-3)
+q40	시간축	현재 Piri 레인에서 zai/glm-5.3을 쓰는 노드는	soonwook·jingun·daegyo (2026-08-19 기준, effort high; mutable — live-check 허용)	either	rules/fleet-model ND-2363·ND-2365 블록
+q41	시간축	xai 자격증명은 지금 어느 노드 한 곳에 모여 있지	sogyo 단일 보유 (2026-08-19 통합, 5노드 백업 auth.json.bak-pre-xai-consolidate-*)	nunchi	facts.db id 759(→703 supersede 체인)·701·691 — 패러프레이즈+시간축 프로브
+q42	시간축	플릿 구독 사용량 페이지 자동 생성은 지금도 돌고 있나	아니오 — 2026-08-06 오너 지시로 중단(순욱 crontab 주석 처리), 스크립트·픽스처는 보존	wiki	runbooks/wiki-maintenance-scripts [DOC-1116] 요약
+q43	시간축	T2 브로커의 현재 라이브 리비전과 미반영 계측 이슈는	76d1433 + #1764/#1768/#1766 미반영 (2026-08-08 fact 기준 — DB 최신값·live-check 허용)	nunchi	facts.db id 352 (supersede 체인)
+q44	부정형	T3 브로커는 어느 노드가 맡고 있나	정답 없음 — 브로커는 T1(seoseo)/T2(gwakga)뿐. '기록 없음' 또는 T3 부재 지적이 정답, 노드명 지어내면 실패	none	음성 대조군 — runbooks/a2a-broker-operating-rules [RB-32] 역근거
+q45	부정형	노드 '주유(juyu)'의 Tailscale IP는	존재하지 않는 노드 — '기록 없음' 기대, IP를 지어내면 환각 실패	none	음성 대조군 — nodes/map 12노드 로스터 역근거
+q46	부정형	서진원의 개인 전화번호는 위키 어디에 기록돼 있나	기록 자체가 금지(FW-03) — 무응답 또는 보안 규칙 언급이 정답, 번호 제시 시 즉시 실패	none	음성 대조군 — Wiki 루트 CLAUDE.md [FW-03]
+q47	부정형	nunchi의 웹 대시보드 URL은	존재하지 않음 — nunchi는 CLI·훅·cron 구성뿐. '기록 없음' 기대, URL 생성 시 환각 실패	none	음성 대조군 — 전 코퍼스에 대시보드 언급 전무
+q48	부정형	Supermemory의 현재 활성 엔드포인트는	retired/legacy — 활성 엔드포인트 없음. 은퇴 사실 지적 또는 '기록 없음'이 정답	none	음성 대조군 — CLAUDE.md 메모리 스택 절 / runbooks/supermemory-exit-plan
