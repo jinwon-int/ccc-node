@@ -288,6 +288,34 @@ class CodexRuntimeTests(unittest.IsolatedAsyncioTestCase):
             ),
         )
 
+    async def test_session_close_archives_scoped_working_state_without_closing_runtime(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state_dir = Path(directory) / "state"
+            state_dir.mkdir(mode=0o700)
+            working_state = state_dir / "working-state.md"
+            working_state.write_text("objective: codex close\n", encoding="utf-8")
+            working_state.chmod(0o600)
+            session = await self.runtime.start_or_resume(
+                SessionRequest(
+                    working_directory="/workspace/new",
+                    memory_environment={"CCC_STATE_DIR": str(state_dir)},
+                )
+            )
+
+            await session.close()
+            await session.close()
+
+            archives = tuple((state_dir / "session-archive").glob("working-state-*.md"))
+            self.assertEqual(len(archives), 1)
+            self.assertEqual(
+                archives[0].read_text(encoding="utf-8"),
+                "objective: codex close\n",
+            )
+            self.assertEqual(archives[0].stat().st_mode & 0o777, 0o600)
+            self.assertEqual(self.clients[0].close_calls, 0)
+
     async def test_idle_recycle_replaces_app_server_and_resumes_durable_thread(
         self,
     ) -> None:
