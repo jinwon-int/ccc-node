@@ -9,7 +9,10 @@ from pathlib import Path
 
 import pytest
 
-from telegram_bot.memory.distill_types import TranscriptBounds
+from telegram_bot.memory.distill_types import (
+    SnapshotUnavailableError,
+    TranscriptBounds,
+)
 from telegram_bot.memory.piri_snapshot import (
     find_piri_session_directory,
     read_piri_snapshot,
@@ -60,6 +63,25 @@ def test_finder_returns_none_when_missing(tmp_path: Path) -> None:
 
     assert find_piri_session_directory(root, "absent-session") is None
     assert find_piri_session_directory(tmp_path / "no-such-root", "x") is None
+
+
+def test_snapshot_fails_closed_when_the_session_file_is_absent(tmp_path: Path) -> None:
+    """A missing transcript must raise rather than read as an empty one.
+
+    Same fail-open the Codex reader had: an empty snapshot completes the job
+    and the session's memory is dropped with every layer reporting success.
+    Not yet observed on a live Piri node, but identical in kind.
+    """
+
+    session_dir = tmp_path / "sessions"
+    _write_session(session_dir, "present", [])
+
+    with pytest.raises(SnapshotUnavailableError):
+        read_piri_snapshot(
+            session_dir,
+            "absent",
+            bounds=TranscriptBounds(),
+        )
 
 
 def test_finder_rejects_ambiguity_across_subdirs(tmp_path: Path) -> None:

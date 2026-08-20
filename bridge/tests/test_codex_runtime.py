@@ -219,6 +219,7 @@ class CodexRuntimeTests(unittest.IsolatedAsyncioTestCase):
             self.clients.append(client)
             return client
 
+        self.factory = factory
         self.runtime = CodexRuntime(client_factory=factory)
 
     async def asyncTearDown(self) -> None:
@@ -875,6 +876,165 @@ class CodexRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client.thread_start_calls, [])
         self.assertEqual(client.thread_resume_calls, [])
         self.assertEqual(client.turn_start_calls, [])
+
+    async def test_distill_snapshot_fails_closed_when_the_thread_is_unreadable(self) -> None:
+        """An unreadable thread must raise, not return an empty snapshot.
+
+        Returning a zero-byte snapshot made the snapshot worker mark the job
+        SNAPSHOT_DONE; the extractor then had no transcript to read and emitted
+        `honcho: []`, so the journal recorded a successful distill that stored
+        nothing. Every Codex extraction on seoseo and sogyo went that way for a
+        month (35/35 and 29/29 zero-byte) and no layer reported an error.
+        """
+
+        from telegram_bot.memory.distill_types import (
+            SnapshotUnavailableError,
+            TranscriptBounds,
+        )
+
+        client = self.clients[0]
+        # thread_reads has no entry for this id, so thread_read returns None.
+        with self.assertRaises(SnapshotUnavailableError):
+            await self.runtime.read_session_snapshot(
+                "thread-absent",
+                bounds=TranscriptBounds(),
+            )
+        self.assertEqual(
+            [call["thread_id"] for call in client.thread_read_calls],
+            ["thread-absent"],
+        )
+
+    async def test_snapshot_falls_back_to_the_rollout_file_when_the_thread_is_gone(
+        self,
+    ) -> None:
+        """A dead thread still has its transcript on disk; use it.
+
+        thread/read is authoritative only while the app-server holds the
+        thread, and a distill snapshot is taken after the session ended, so the
+        live read is normally already gone by then.
+        """
+
+        import json
+        import tempfile
+        from datetime import datetime, timezone
+        from telegram_bot.memory.distill_types import TranscriptBounds
+
+        with tempfile.TemporaryDirectory() as raw_home:
+            codex_home = Path(raw_home)
+            day = codex_home / "sessions" / "2026" / "08" / "19"
+            day.mkdir(mode=0o755, parents=True)
+            # parents=True creates intermediate directories with the process
+            # umask.  Pin the Codex-owned root to its real 0755 mode so this
+            # success-path test remains valid under a collaborative 0002
+            # checkout while validate_rollout_root keeps rejecting 0775.
+            (codex_home / "sessions").chmod(0o755)
+            captured = datetime(2026, 8, 19, 12, 0, tzinfo=timezone.utc)
+            rollout = day / "rollout-2026-08-19T00-00-00-thread-dead.jsonl"
+            rollout.write_text(
+                "\n".join(
+                    json.dumps(record, ensure_ascii=False)
+                    for record in (
+                        {
+                            "type": "session_meta",
+                            "timestamp": "2026-08-19T11:00:00Z",
+                            "payload": {"id": "thread-dead", "session_id": "thread-dead"},
+                        },
+                        {
+                            "type": "event_msg",
+                            "timestamp": "2026-08-19T11:30:00Z",
+                            "payload": {"type": "user_message", "message": "살아남은 질문"},
+                        },
+                        {
+                            "type": "event_msg",
+                            "timestamp": "2026-08-19T11:31:00Z",
+                            "payload": {"type": "agent_message", "message": "살아남은 답변"},
+                        },
+                    )
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            rollout.chmod(0o644)
+
+            runtime = CodexRuntime(
+                client_factory=self.factory,
+                process_environment={"CODEX_HOME": str(codex_home)},
+            )
+            try:
+                result = await runtime.read_session_snapshot(
+                    "thread-dead",
+                    bounds=TranscriptBounds(),
+                    now=captured,
+                )
+            finally:
+                await runtime.close()
+
+        self.assertEqual(
+            [(message.role, message.text) for message in result.messages],
+            [("user", "살아남은 질문"), ("assistant", "살아남은 답변")],
+        )
+        self.assertGreater(result.byte_count, 0)
+
+    async def test_rollout_fallback_never_reads_another_audience_codex_home(self) -> None:
+        """The fallback must stay inside the runtime's own CODEX_HOME.
+
+        CodexRuntimePool gives each audience its own process and CODEX_HOME, and
+        on the RPC path the pool refuses a thread owned by another audience. A
+        fallback that searched a shared or default sessions root would read
+        across that partition, so it is confined to the configured home and
+        fails closed when the transcript only exists elsewhere.
+        """
+
+        import json
+        import tempfile
+        from datetime import datetime, timezone
+        from telegram_bot.memory.distill_types import (
+            SnapshotUnavailableError,
+            TranscriptBounds,
+        )
+
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            other_home = root / "audience-other"
+            own_home = root / "audience-own"
+            day = other_home / "sessions" / "2026" / "08" / "19"
+            day.mkdir(mode=0o755, parents=True)
+            (own_home / "sessions").mkdir(mode=0o755, parents=True)
+            leaked = day / "rollout-2026-08-19T00-00-00-thread-other.jsonl"
+            leaked.write_text(
+                "\n".join(
+                    json.dumps(record, ensure_ascii=False)
+                    for record in (
+                        {
+                            "type": "session_meta",
+                            "timestamp": "2026-08-19T11:00:00Z",
+                            "payload": {"id": "thread-other", "session_id": "thread-other"},
+                        },
+                        {
+                            "type": "event_msg",
+                            "timestamp": "2026-08-19T11:30:00Z",
+                            "payload": {"type": "user_message", "message": "다른 오디언스의 비밀"},
+                        },
+                    )
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            leaked.chmod(0o644)
+
+            runtime = CodexRuntime(
+                client_factory=self.factory,
+                process_environment={"CODEX_HOME": str(own_home)},
+            )
+            try:
+                with self.assertRaises(SnapshotUnavailableError):
+                    await runtime.read_session_snapshot(
+                        "thread-other",
+                        bounds=TranscriptBounds(),
+                        now=datetime(2026, 8, 19, 12, 0, tzinfo=timezone.utc),
+                    )
+            finally:
+                await runtime.close()
 
     async def test_turn_maps_streamed_events_including_notifications_before_response(self) -> None:
         session = await self.runtime.start_or_resume(
