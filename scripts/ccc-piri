@@ -81,4 +81,39 @@ if [ "$real_cli" -ef "$0" ]; then
   exit 127
 fi
 
-exec "$real_cli" "$@"
+# #1184: the final exec must be shebang-aware for the same reason the
+# materializer exec is (#1183). Android has no /usr/bin/env, so without
+# libtermux-exec's LD_PRELOAD hook (dropped deliberately by the bridge's
+# isolated distill env) the kernel cannot exec a `#!/usr/bin/env X` real
+# CLI — and a failed execve cannot be caught in-process (a non-interactive
+# shell exits on exec failure), so the routing decision happens up front:
+# env-shebang scripts exec through the interpreter resolved from PATH;
+# ELF binaries and absolute-shebang scripts exec directly — the kernel
+# handles both without the hook. An unresolvable interpreter keeps the old
+# behavior (direct exec), so hooked environments are unaffected. argv[0]
+# becomes the resolved interpreter; `env -S` fixed args are honored. The
+# piri chain's later hops (pi-test.sh -> tsx, an `#!/usr/bin/env node`
+# script) belong to the piri repo and still need their own resolution for
+# fully stripped-env use — this boundary covers the first hop only.
+case "$(head -c 15 "$real_cli" 2>/dev/null)" in
+  '#!/usr/bin/env ')
+    env_shebang="$(head -n 1 "$real_cli")"
+    env_shebang="${env_shebang#'#!/usr/bin/env '}"
+    case "$env_shebang" in -S\ *) env_shebang="${env_shebang#-S }" ;; esac
+    shebang_interp="${env_shebang%% *}"
+    case "$shebang_interp" in
+      ''|*/*) ;;  # empty or unexpected path form: fall through to direct exec
+      *)
+        shebang_resolved="$(command -v "$shebang_interp" 2>/dev/null || true)"
+        if [ -n "$shebang_resolved" ]; then
+          shebang_args="${env_shebang#"$shebang_interp"}"
+          shebang_args="${shebang_args# }"
+          # shellcheck disable=SC2086 # fixed args from the shebang line, intentional splitting
+          exec "$shebang_resolved" $shebang_args "$real_cli" "$@"
+        fi
+        ;;
+    esac
+    ;;
+esac
+
+exec "$real_cli" "$@"  # ccc:interpreter-ok: #1184 — env-shebang scripts are routed through a PATH-resolved interpreter above; only ELF / absolute-shebang / hooked-env targets reach this direct exec
