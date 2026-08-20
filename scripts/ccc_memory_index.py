@@ -74,6 +74,77 @@ try:
 except ValueError:
     VOLATILE_TTL_DAYS = 14.0
 
+# Typed retention policy (#871 slice 2). An inspectable JSON table maps
+# durabilities to TTLs and marks kinds whose facts must never age-expire
+# (constraint/procedure/decision — a safety rule does not stop being true
+# because nobody touched it for a month). Loading fails OPEN to built-in
+# defaults that reproduce the legacy volatile-only behavior; a malformed
+# policy file never blocks indexing. CCC_MEMORY_VOLATILE_TTL_DAYS keeps
+# overriding the volatile TTL for backward compatibility.
+_RETENTION_DEFAULTS = {
+    "durabilities": {
+        "volatile": {"ttl_days": 14},
+        "session-only": {"ttl_days": 2},
+        "week-scale": {"ttl_days": 45},
+        "durable": {"ttl_days": 0},
+    },
+    "kinds": {
+        "decision": {"age_expiry_forbidden": True},
+        "procedure": {"age_expiry_forbidden": True},
+        "constraint": {"age_expiry_forbidden": True},
+    },
+}
+
+
+def _load_retention_policy():
+    path = os.environ.get("CCC_MEMORY_RETENTION_POLICY") or str(
+        Path(__file__).resolve().parent / "memory-retention-policy.json"
+    )
+    try:
+        data = json.loads(Path(path).read_text())
+        if not isinstance(data, dict) or not isinstance(data.get("durabilities"), dict):
+            raise ValueError("bad shape")
+        return data
+    except Exception:
+        return _RETENTION_DEFAULTS
+
+
+RETENTION = _load_retention_policy()
+RETENTION_STATS = {"dropped": 0, "guarded": 0, "unknown_kinds": 0}
+_KNOWN_KINDS = set(_RETENTION_DEFAULTS["kinds"]) | {
+    "task-progress", "observation", "preference", "context", "fact", "unstructured",
+} | set((RETENTION.get("kinds") or {}).keys())
+
+
+def retention_ttl_days(durability):
+    """TTL in days for a durability class (0 = never age-expire)."""
+    if durability == "volatile":
+        return VOLATILE_TTL_DAYS  # legacy env override wins
+    entry = (RETENTION.get("durabilities") or {}).get(durability) or {}
+    try:
+        return float(entry.get("ttl_days", 0) or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def retention_keeps(kind, durability, observed_at):
+    """True when the fact survives typed retention; updates RETENTION_STATS."""
+    if kind not in _KNOWN_KINDS:
+        RETENTION_STATS["unknown_kinds"] += 1
+        return True  # conservative keep + diagnostics
+    ttl = retention_ttl_days(durability)
+    if ttl <= 0:
+        return True
+    age = fact_age_days(observed_at)
+    if age is None or age <= ttl:
+        return True
+    kind_entry = (RETENTION.get("kinds") or {}).get(kind) or _RETENTION_DEFAULTS["kinds"].get(kind) or {}
+    if kind_entry.get("age_expiry_forbidden"):
+        RETENTION_STATS["guarded"] += 1  # mislabeled volatile guard-kind: keep, surface
+        return True
+    RETENTION_STATS["dropped"] += 1
+    return False
+
 
 def fact_age_days(observed_at):
     """Age of a fact in days from its observed_at, or None if unparseable.
@@ -255,12 +326,11 @@ def structured_fact_docs(path: Path):
         kind = str(obj.get("kind") or "fact")
         durability = str(obj.get("durability") or ("volatile" if kind == "task-progress" else "durable")).lower()
         observed_at = str(obj.get("observed_at") or "")
-        # Decay: drop volatile facts past the TTL before they consume a dedup
-        # slot or get indexed. Durable facts and undated facts are kept.
-        if durability == "volatile" and VOLATILE_TTL_DAYS > 0:
-            age = fact_age_days(observed_at)
-            if age is not None and age > VOLATILE_TTL_DAYS:
-                continue
+        # Typed retention (#871 slice 2): durability-class TTLs from the
+        # policy table, guard kinds never age-expire, unknown kinds are kept
+        # conservatively — all counted body-free in the summary diagnostics.
+        if not retention_keeps(kind, durability, observed_at):
+            continue
         text = redact_text(str(obj.get("text") or obj.get("summary") or ""))
         if not text:
             continue
@@ -408,4 +478,4 @@ finally:
     con.close()
     secure_db_files(db)
 
-print(json.dumps({"ok": True, "db": str(db), "documents": count, "distill_indexed": index_distill_enabled, "fts5_enabled": fts5_enabled, "wiki_enabled": wiki_enabled}, ensure_ascii=False))
+print(json.dumps({"ok": True, "db": str(db), "documents": count, "distill_indexed": index_distill_enabled, "fts5_enabled": fts5_enabled, "wiki_enabled": wiki_enabled, "retention": RETENTION_STATS}, ensure_ascii=False))
