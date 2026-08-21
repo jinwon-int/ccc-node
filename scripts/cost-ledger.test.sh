@@ -185,8 +185,8 @@ ok "codex: cache_write lands in the untyped bucket (no TTL split exists)" \
   '[ "$(jq -r ".models[\"codex:gpt-5.6-sol\"].cache_write_untyped_tokens" <<<"$json")" = 250 ]'
 ok "codex: reasoning counts as thinking tokens" \
   '[ "$(jq -r ".models[\"codex:gpt-5.6-sol\"].thinking_tokens" <<<"$json")" = 71 ]'
-ok "codex: model prices null (not in PRICING, no guessing)" \
-  '[ "$(jq -r ".models[\"codex:gpt-5.6-sol\"].est_cost_usd" <<<"$json")" = null ]'
+ok "codex: model prices at the official OpenAI short-context rate (read 2026-08-21)" \
+  '[ "$(jq -r ".models[\"codex:gpt-5.6-sol\"].est_cost_usd" <<<"$json")" = 0.167854 ]'
 ok "codex: row is provider-tagged" \
   '[ "$(jq -r ".models[\"codex:gpt-5.6-sol\"].provider" <<<"$json")" = codex ]'
 
@@ -203,8 +203,8 @@ ok "piri: sums per-message deltas with dedup by (file,id)" \
   '[ "$(jq -r ".models[\"piri:k3\"].input_tokens" <<<"$json")" = 1503 ] && [ "$(jq -r ".models[\"piri:k3\"].turns" <<<"$json")" = 2 ]'
 ok "piri: cacheRead folds into cache_read" \
   '[ "$(jq -r ".models[\"piri:k3\"].cache_read_input_tokens" <<<"$json")" = 275176 ]'
-ok "piri: cacheWrite lands in untyped bucket, cost null" \
-  '[ "$(jq -r ".models[\"piri:k3\"].cache_write_untyped_tokens" <<<"$json")" = 40 ] && [ "$(jq -r ".models[\"piri:k3\"].est_cost_usd" <<<"$json")" = null ]'
+ok "piri: cacheWrite lands in untyped bucket, priced at the official Kimi K3 rate" \
+  '[ "$(jq -r ".models[\"piri:k3\"].cache_write_untyped_tokens" <<<"$json")" = 40 ] && [ "$(jq -r ".models[\"piri:k3\"].est_cost_usd" <<<"$json")" = 0.090107 ]'
 ok "piri: row is provider-tagged" \
   '[ "$(jq -r ".models[\"piri:k3\"].provider" <<<"$json")" = piri ]'
 ok "record source flips to multi-provider-transcripts with several collectors" \

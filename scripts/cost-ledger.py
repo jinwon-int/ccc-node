@@ -109,6 +109,31 @@ PRICING: dict[str, dict[str, float | None]] = {
     #   claude-mythos-preview — no published price anywhere (Glasswing).
     #   non-Anthropic ids (e.g. the piri nodes' kimi-coding/*) — not ours to
     #     price from this page at all.
+    # --- stage 2 providers (read 2026-08-21, each from its official page) ---
+    # OpenAI Standard tier, short context. The page also publishes a ~2x
+    # long-context class ($10/$1/$12.50/$45), but the boundary at which a
+    # request becomes "long context" was not stated in the fetched text, and
+    # codex's token_count record does not say which class it was billed at —
+    # so rows are priced at the short-context rate, a documented possible
+    # UNDERSTATEMENT for long-context turns (same least-wrong pattern as the
+    # untyped-cache-write 5m assumption below). One cache-write rate exists
+    # ($6.25) — codex has no TTL split, so both buckets carry it.
+    #   https://developers.openai.com/api/docs/pricing (Standard, 2026-08-21)
+    "gpt-5.6-sol": {"input": 5.0, "output": 30.0, "cache_read": 0.50,
+                    "cache_write_5m": 6.25, "cache_write_1h": 6.25},
+    # Kimi K3: input $3.00, cache-hit read $0.30, output $15.00, 1M context.
+    # The official table lists no cache-write rate at all — Kimi's automatic
+    # context caching bills cache-hit reads only, so writes are encoded 0.0
+    # (unbilled), not guessed.
+    #   https://platform.kimi.ai/docs/pricing/chat-k3 (2026-08-21)
+    "k3": {"input": 3.0, "output": 15.0, "cache_read": 0.30,
+           "cache_write_5m": 0.0, "cache_write_1h": 0.0},
+    # GLM-5.3: input $1.4, cached input $0.26, output $4.4. "Cached Input
+    # Storage" is marked Limited-time Free — encoded 0.0 with the promo note;
+    # re-read the page when the promotion ends.
+    #   https://docs.z.ai/guides/overview/pricing (2026-08-21)
+    "glm-5.3": {"input": 1.4, "output": 4.4, "cache_read": 0.26,
+                "cache_write_5m": 0.0, "cache_write_1h": 0.0},
 }
 
 # Usage-level modifiers the pricing page defines but this stage does not price.
@@ -126,11 +151,14 @@ _STANDARD_TIER = {"standard", "", None}
 
 
 def _pricing_for(model: str) -> dict[str, float | None] | None:
-    if model in PRICING:
-        return PRICING[model]
+    # Collector namespaces (stage 2): "codex:gpt-5.6-sol" prices as
+    # "gpt-5.6-sol" — the prefix is provenance, not a different model.
+    bare = model.split(":", 1)[1] if model.split(":", 1)[0] in {"codex", "piri"} else model
+    if bare in PRICING:
+        return PRICING[bare]
     best = None
     for key, val in PRICING.items():
-        if model.startswith(key) and (best is None or len(key) > len(best[0])):
+        if bare.startswith(key) and (best is None or len(key) > len(best[0])):
             best = (key, val)
     return best[1] if best else None
 
