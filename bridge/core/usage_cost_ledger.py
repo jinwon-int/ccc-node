@@ -64,12 +64,14 @@ class CostLedger:
     def path(self) -> Path:
         return self._path
 
-    def record_snapshot(self, snapshot: Any, *, provider: str = "claude") -> None:
+    def record_snapshot(self, snapshot: Any, *, provider: str = "claude", session_id: str | None = None) -> None:
         """Append one turn's per-model cost from a parsed ``UsageSnapshot``.
 
         Reads ``snapshot.models`` (an iterable of objects with ``model``,
         ``cost_usd``, ``input_tokens``, ``output_tokens``) and
         ``snapshot.total_cost_usd``. A turn with no cost is skipped (no row).
+        ``session_id`` is recorded (bounded) so rows stay attributable to
+        their conversation for later audit/rollup (#1205 D-3).
         """
 
         if not self._enabled:
@@ -99,6 +101,8 @@ class CostLedger:
                 ),
                 "models": rows,
             }
+            if session_id:
+                line["sid"] = str(session_id)[:80]
             self._path.parent.mkdir(parents=True, exist_ok=True)
             with self._path.open("a", encoding="utf-8") as handle:
                 handle.write(
