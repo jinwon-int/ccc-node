@@ -44,7 +44,11 @@ emit "$T" "$IN_DAY" m1 r1 claude-opus-5 \
 emit "$T" "$BEFORE" m0 r0 claude-opus-5 \
   '{"input_tokens":9000000,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}'
 
-run() { CCC_NODE=testnode python3 "$LEDGER" --projects "$TMP/projects" --date 2026-08-20 "$@"; }
+# Stage 2 (#1205): the codex/piri collectors default to real home dirs, so the
+# harness pins them to hermetic empties — assertions stay about fixtures.
+codex_root="$TMP/codex-sessions"; piri_root="$TMP/piri-sessions"
+mkdir -p "$codex_root" "$piri_root"
+run() { CCC_NODE=testnode python3 "$LEDGER" --projects "$TMP/projects" --codex-sessions "$codex_root" --piri-sessions "$piri_root" --date 2026-08-20 "$@"; }
 
 out="$(run --dry-run 2>&1)"; rc=$?
 ok "dry-run exits 0" '[ "$rc" = 0 ]'
@@ -88,7 +92,7 @@ ok "the refusal names the modifier" \
   'jq -e ".models[\"claude-opus-5\"].usage_modifiers | index(\"inference_geo=us\")" <<<"$json3" >/dev/null'
 
 # --- a node with no transcripts is a normal state, not a failure ----------
-out4="$(CCC_NODE=testnode python3 "$LEDGER" --projects "$TMP/does-not-exist" --date 2026-08-20 2>&1)"; rc4=$?
+out4="$(CCC_NODE=testnode python3 "$LEDGER" --projects "$TMP/does-not-exist" --codex-sessions "$TMP/also-missing" --piri-sessions "$TMP/also-missing" --date 2026-08-20 2>&1)"; rc4=$?
 ok "a node without transcripts exits 0 (daegyo/gongmyoung are legitimate)" '[ "$rc4" = 0 ]'
 ok "and says it skipped rather than writing a zero row" \
   'jq -e ".ok == true and .skipped == \"no-transcripts\"" <<<"$out4" >/dev/null'
@@ -151,6 +155,66 @@ bash "$INSTALLER" --apply >/dev/null 2>&1
 ok "re-apply is idempotent" '[ "$(marker_count)" = 1 ]'
 bash "$INSTALLER" --apply --remove >/dev/null 2>&1
 ok "remove takes the entry back out" '[ "$(marker_count)" = 0 ]'
+
+# --- weekly rollup entry (D-4): opt-in --weekly adds a second managed line --
+bash "$INSTALLER" --apply --weekly >/dev/null 2>&1
+ok "--weekly adds the Monday rollup line inside the same managed block" \
+  '[ "$(marker_count)" = 2 ] && grep -qF "cost-ledger-weekly.py" "$FAKE_CRON" && grep -qF "17 5 * * 1" "$FAKE_CRON"'
+ok "weekly line carries CCC_STATE_DIR and the gen stamp" \
+  'grep "cost-ledger-weekly.py" "$FAKE_CRON" | grep -qF "CCC_STATE_DIR=" && grep "cost-ledger-weekly.py" "$FAKE_CRON" | grep -qE "gen=h_[0-9a-f]{12}$"'
+bash "$INSTALLER" --apply >/dev/null 2>&1
+ok "re-apply without --weekly strips the rollup line (opt-in is not sticky)" \
+  '[ "$(marker_count)" = 1 ] && ! grep -qF "cost-ledger-weekly.py" "$FAKE_CRON"'
+bash "$INSTALLER" --apply --remove >/dev/null 2>&1
+
+# --- stage 2: codex collector (#1205 D-1) -----------------------------------
+# turn_context carries the model; token_count events carry total (cumulative)
+# AND last (per-turn delta) — the ledger must use `last`.
+cx="$codex_root/2026/08/20"; mkdir -p "$cx"
+cat > "$cx/rollout-2026-08-20T01-00-00-test.jsonl" <<'EOF'
+{"timestamp":"2026-08-20T00:55:00.000Z","type":"turn_context","payload":{"turn_id":"t1","model":"gpt-5.6-sol"}}
+{"timestamp":"2026-08-20T01:00:00.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":17598,"cached_input_tokens":4864,"cache_write_input_tokens":100,"output_tokens":162,"reasoning_output_tokens":71,"total_tokens":17760},"last_token_usage":{"input_tokens":17598,"cached_input_tokens":4864,"cache_write_input_tokens":100,"output_tokens":162,"reasoning_output_tokens":71,"total_tokens":17760},"model_context_window":258400}}}
+{"timestamp":"2026-08-20T02:00:00.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":30000,"cached_input_tokens":4864,"cache_write_input_tokens":250,"output_tokens":462,"reasoning_output_tokens":71,"total_tokens":30462},"last_token_usage":{"input_tokens":12402,"cached_input_tokens":0,"cache_write_input_tokens":150,"output_tokens":300,"reasoning_output_tokens":0,"total_tokens":12702},"model_context_window":258400}}}
+{"timestamp":"2026-08-19T14:00:00.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{},"last_token_usage":{"input_tokens":999999,"output_tokens":0},"model_context_window":258400}}}
+EOF
+out="$(run --dry-run 2>&1)"; rc=$?
+json="$(printf '%s' "$out" | sed -n '/^{/,$p')"
+ok "codex: uses last_token_usage deltas, not the cumulative total" \
+  '[ "$rc" = 0 ] && [ "$(jq -r ".models[\"codex:gpt-5.6-sol\"].input_tokens" <<<"$json")" = 30000 ]'
+ok "codex: cache_write lands in the untyped bucket (no TTL split exists)" \
+  '[ "$(jq -r ".models[\"codex:gpt-5.6-sol\"].cache_write_untyped_tokens" <<<"$json")" = 250 ]'
+ok "codex: reasoning counts as thinking tokens" \
+  '[ "$(jq -r ".models[\"codex:gpt-5.6-sol\"].thinking_tokens" <<<"$json")" = 71 ]'
+ok "codex: model prices at the official OpenAI short-context rate (read 2026-08-21)" \
+  '[ "$(jq -r ".models[\"codex:gpt-5.6-sol\"].est_cost_usd" <<<"$json")" = 0.167854 ]'
+ok "codex: row is provider-tagged" \
+  '[ "$(jq -r ".models[\"codex:gpt-5.6-sol\"].provider" <<<"$json")" = codex ]'
+
+# --- stage 2: piri collector (#1205 D-2) ------------------------------------
+cat > "$piri_root/2026-08-20T01-00-00-000Z_sess1.jsonl" <<'EOF'
+{"type":"message","id":"m1","parentId":"m0","timestamp":"2026-08-20T01:05:00.000Z","message":{"role":"assistant","model":"k3","usage":{"input":703,"output":153,"cacheRead":274176,"cacheWrite":0,"totalTokens":275032}}}
+{"type":"message","id":"m2","parentId":"m1","timestamp":"2026-08-20T01:06:00.000Z","message":{"role":"assistant","model":"k3","usage":{"input":800,"output":50,"cacheRead":1000,"cacheWrite":40,"totalTokens":1890}}}
+{"type":"message","id":"m2","parentId":"m1","timestamp":"2026-08-20T01:06:00.000Z","message":{"role":"assistant","model":"k3","usage":{"input":800,"output":50,"cacheRead":1000,"cacheWrite":40,"totalTokens":1890}}}
+{"type":"message","id":"u1","timestamp":"2026-08-20T01:04:00.000Z","message":{"role":"user","content":[{"type":"text","text":"hi"}]}}
+EOF
+out="$(run --dry-run 2>&1)"; rc=$?
+json="$(printf '%s' "$out" | sed -n '/^{/,$p')"
+ok "piri: sums per-message deltas with dedup by (file,id)" \
+  '[ "$(jq -r ".models[\"piri:k3\"].input_tokens" <<<"$json")" = 1503 ] && [ "$(jq -r ".models[\"piri:k3\"].turns" <<<"$json")" = 2 ]'
+ok "piri: cacheRead folds into cache_read" \
+  '[ "$(jq -r ".models[\"piri:k3\"].cache_read_input_tokens" <<<"$json")" = 275176 ]'
+ok "piri: cacheWrite lands in untyped bucket, priced at the official Kimi K3 rate" \
+  '[ "$(jq -r ".models[\"piri:k3\"].cache_write_untyped_tokens" <<<"$json")" = 40 ] && [ "$(jq -r ".models[\"piri:k3\"].est_cost_usd" <<<"$json")" = 0.090107 ]'
+ok "piri: row is provider-tagged" \
+  '[ "$(jq -r ".models[\"piri:k3\"].provider" <<<"$json")" = piri ]'
+ok "record source flips to multi-provider-transcripts with several collectors" \
+  '[ "$(jq -r ".source" <<<"$json")" = "multi-provider-transcripts" ]'
+
+# --- stage 2: --providers restricts collectors -------------------------------
+out="$(run --providers claude --dry-run 2>&1)"; rc=$?
+json="$(printf '%s' "$out" | sed -n '/^{/,$p')"
+ok "--providers claude excludes codex/piri collectors" \
+  '[ "$(jq -r ".models | keys | length" <<<"$json")" = 1 ] && [ "$(jq -r ".source" <<<"$json")" = "claude-projects-transcripts" ]'
 
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

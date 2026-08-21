@@ -36,6 +36,7 @@ from telegram_bot.utils.duration_log import (
 from telegram_bot.core.usage import (
     SNAPSHOT_TTL_SECONDS,
     UsageSnapshot,
+    delta_from_snapshots,
     load_claude_status_snapshot,
     local_claude_environment_snapshot,
     local_piri_environment_snapshot,
@@ -454,7 +455,18 @@ class ProjectChatHandler(
         snapshot = parse_claude_result(msg, observed_at=self._clock.time())
         cost_ledger = getattr(self, "_cost_ledger", None)
         if cost_ledger is not None:
-            cost_ledger.record_snapshot(snapshot, provider="claude")
+            # The SDK's ResultMessage totals are session-cumulative running
+            # totals, zeroed on ConversationResetMessage — appending them raw
+            # re-counted every earlier turn in the window (#1205 D-3). Write
+            # the per-turn delta against the previous cached snapshot for this
+            # session key instead; a reset surfaces as a new key (no previous)
+            # or a backwards total, both handled inside delta_from_snapshots.
+            previous = self._claude_usage.get(key)
+            cost_ledger.record_snapshot(
+                delta_from_snapshots(previous, snapshot),
+                provider="claude",
+                session_id=session_id,
+            )
         self._claude_usage[key] = snapshot
         self._claude_usage = dict(tuple(self._claude_usage.items())[-128:])
 
