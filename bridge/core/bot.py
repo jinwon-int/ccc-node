@@ -37,6 +37,12 @@ from telegram_bot.core.project_chat_state import (
     QueuedFollowup,
 )
 from telegram_bot.core.heartbeat import format_duration
+from telegram_bot.core.turn_notices import (
+    busy_notice_text,
+    compose_history_injection,
+    session_start_notice_text,
+    session_start_reason,
+)
 from telegram_bot.core.session_scope import legacy_storage_keys, storage_key
 from telegram_bot.memory.distill_types import DistillJob, DistillTrigger
 from telegram_bot.utils.audio_processor import AudioProcessor
@@ -1680,56 +1686,10 @@ class TelegramBot(
         """Return the SDK history directory owned by the injected handler."""
         return self._project_chat.conversations_dir
 
-    @staticmethod
-    def _session_start_notice_text(
-        *,
-        reason: str,
-        model: Optional[str],
-        provider: str = "claude",
-        previous_session_id: Optional[str] = None,
-    ) -> str:
-        provider_label = {
-            "claude": "Claude Code",
-            "codex": "Codex",
-            "crush": "Crush",
-            "piri": "Piri",
-        }.get(provider, provider.title())
-        # Banner model label: explicit /model choice first, then the operator
-        # display label, then the env-routed model (Claude path only), so the
-        # notice reflects the real backend instead of a bare "default".
-        display_model = model or os.environ.get("CCC_MODEL_LABEL", "").strip()
-        if not display_model and provider == "claude":
-            display_model = os.environ.get("ANTHROPIC_MODEL", "").strip()
-        if not display_model and provider == "crush":
-            display_model = os.environ.get("CCC_CRUSH_MODEL", "").strip()
-        if not display_model:
-            display_model = "default"
-        lines = [
-            f"◐ CCC session started ({reason}). Conversation history is on a fresh {provider_label} stream.",
-            "Use /resume to browse and restore a previous session.",
-            "",
-            f"◆ Model: {display_model}",
-            f"◆ Provider: {provider_label}",
-            "◆ Context: new stream",
-        ]
-        if previous_session_id:
-            lines.append(f"◆ Previous session: {previous_session_id[:8]}… (not resumed)")
-        return "\n".join(lines)
-
-    @staticmethod
-    def _session_start_reason(
-        *,
-        new_session: bool,
-        auto_new_session: bool,
-        stale_session_id: Optional[str],
-    ) -> str:
-        if auto_new_session:
-            return "automatic reset"
-        if new_session:
-            return "/new requested"
-        if stale_session_id:
-            return "previous session was not resumable"
-        return "no active session"
+    # Thin delegators — composition lives in core/turn_notices.py (#896 slice;
+    # kept as methods so call sites and existing tests are unchanged).
+    _session_start_notice_text = staticmethod(session_start_notice_text)
+    _session_start_reason = staticmethod(session_start_reason)
 
     @staticmethod
     def _message_timestamp_utc(message: Message) -> datetime:
@@ -1906,11 +1866,7 @@ class TelegramBot(
                 getattr(self._config, "busy_notice_min_elapsed_seconds", 10.0)
             )
             if busy_seconds is not None and busy_seconds >= threshold:
-                reply = (
-                    "⏳ Still working on the previous message "
-                    f"({format_duration(busy_seconds)} elapsed). "
-                    "I will handle this message after it finishes."
-                )
+                reply = busy_notice_text(busy_seconds)
                 try:
                     await message.reply_text(reply)
                 except Exception:
@@ -2005,17 +1961,7 @@ class TelegramBot(
                 try:
                     recent = self._project_chat.get_recent_messages(stale_session_id, limit=6)
                     if recent:
-                        lines = []
-                        for m in recent:
-                            label = "사용자" if m["role"] == "user" else "어시스턴트"
-                            snippet = m["content"][:400].replace("\n", " ")
-                            lines.append(f"{label}: {snippet}")
-                        history_block = "\n".join(lines)
-                        send_text = (
-                            f"[이전 대화 맥락 — 세션 전환으로 자동 주입됨]\n"
-                            f"{history_block}\n\n"
-                            f"[현재 메시지]\n{text}"
-                        )
+                        send_text = compose_history_injection(recent, text)
                         if sensitive_log_event:
                             logger.info(
                                 "History injection applied for sensitive input event=%s",
