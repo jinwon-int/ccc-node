@@ -1,5 +1,13 @@
 # Changelog
 
+- **Durable follow-up queue orchestration extracted from bot.py (#896
+  slice).** Queue state initialization, admission, Telegram update replay,
+  retry/notification workers, `/stop` clearing, and startup/shutdown hooks
+  moved unchanged into the new `core/bot_followup_queue.py` mixin. The mixin
+  precedes `BotLifecycleMixin` so cooperative lifecycle ordering is preserved,
+  while `core/bot.py` retains its existing handler registrations and internal
+  envelope import compatibility (`bot.py` 2092 → 1143 lines).
+
 - **Turn notice composition extracted from bot.py (#896 slice, #348
   hotspot).** The busy notice, session-start reason/banner, and
   history-injection prompt composition moved from `core/bot.py` into the new
