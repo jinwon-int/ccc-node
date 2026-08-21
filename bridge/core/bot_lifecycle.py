@@ -48,6 +48,7 @@ from telegram_bot.core.external_wait import (
 from telegram_bot.core.continuation import ContinuationQueue, default_queue_path
 from telegram_bot.core.continuation_monitor import ContinuationMonitor
 from telegram_bot.core.external_wait_monitor import ExternalWaitMonitor, GhCliTransport
+from telegram_bot.core.webhook_nudge import build_from_env as build_webhook_nudge_server
 from telegram_bot.core.turn_watchdog import TurnAgeWatchdog
 from telegram_bot.core.codex_app_server import live_app_server_clients
 from telegram_bot.core.turn_stall import StallProbeMonitor
@@ -789,6 +790,7 @@ class BotLifecycleMixin:
             dead_session_recovery_task = None
             external_wait_task = None
             continuation_task = None
+            webhook_nudge_server = None
             distill_snapshot_task = None
             distill_extraction_task = None
             distill_local_sink_task = None
@@ -871,6 +873,10 @@ class BotLifecycleMixin:
                     if continuation_monitor is not None
                     else None
                 )
+                webhook_nudge_server = self._build_webhook_nudge_server()
+                if webhook_nudge_server is not None:
+                    # Bind failures log and degrade to polling; never fatal.
+                    await webhook_nudge_server.start()
                 health_alerts_task = asyncio.create_task(
                     self._health_alerts_probe(stop_event), name="health-alerts"
                 )
@@ -1038,6 +1044,8 @@ class BotLifecycleMixin:
                             await _task
                         except (asyncio.CancelledError, _PollingRestart):
                             pass
+                if webhook_nudge_server is not None:
+                    await webhook_nudge_server.close()
                 await self._graceful_shutdown()
                 if stop_event.is_set():
                     await self._enqueue_shutdown_distills()
@@ -1271,6 +1279,23 @@ class BotLifecycleMixin:
             on_stats=self._record_recovery_stats,
             wakeup_tick=self._build_dead_session_wakeup_tick(),
             wakeup_defer=self._build_dead_session_wakeup_defer(),
+        )
+
+    def _build_webhook_nudge_server(self):
+        """GitHub webhook nudge listener for external waits (#1222); None when off.
+
+        A verified delivery only pulls matching waits' next poll forward; the
+        monitor still reads GitHub through its authenticated transport, so a
+        forged or lost delivery can neither invent nor suppress a terminal
+        state. Off by default; enabling without an HMAC secret refuses to
+        start the listener (fail-closed) while the bridge boots normally.
+        """
+        data_dir = getattr(self._config, "bot_data_dir", None) or (
+            FilePath(self._config.project_root) / ".telegram_bot"
+        )
+        home = FilePath(data_dir) / "external-wait"
+        return build_webhook_nudge_server(
+            lambda: ExternalWaitRegistry(external_wait_registry_path(home))
         )
 
     def _build_external_wait_monitor(self):

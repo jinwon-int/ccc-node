@@ -708,6 +708,32 @@ async def test_corrupt_queue_degrades_without_stopping_bridge(
 
 
 @pytest.mark.anyio
+async def test_graceful_stop_drains_followups_before_lifecycle_shutdown(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bot = _bot_harness(tmp_path / "queue.json")
+    calls: list[str] = []
+
+    async def stop_followups() -> None:
+        calls.append("followups")
+
+    async def stop_lifecycle(_self) -> None:
+        calls.append("lifecycle")
+
+    bot._stop_followup_workers = stop_followups
+    monkeypatch.setattr(
+        BotLifecycleMixin,
+        "_do_graceful_stop",
+        stop_lifecycle,
+    )
+
+    await bot._do_graceful_stop()
+
+    assert calls == ["followups", "lifecycle"]
+
+
+@pytest.mark.anyio
 async def test_replay_rechecks_live_access_before_any_processing(
     tmp_path: Path,
 ) -> None:
