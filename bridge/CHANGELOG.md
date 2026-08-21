@@ -1,5 +1,17 @@
 # Changelog
 
+- **GitHub webhook nudge for external waits (#1222).** New opt-in
+  loopback-bound listener (`CCC_WEBHOOK_NUDGE_ENABLED`, default off) accepts
+  HMAC-authenticated GitHub webhook deliveries (`workflow_run`,
+  `check_suite`, `pull_request`) and pulls matching monitoring waits'
+  `next_poll_epoch` forward, cutting CI terminal-detection latency from the
+  300s backoff cap to roughly one monitor tick. Deliveries are untrusted
+  hints only — terminal classification, exact-head validation, wake
+  journaling, and resume budgets stay in the polling monitor, lost
+  deliveries degrade to plain polling, and enabling without
+  `CCC_WEBHOOK_NUDGE_SECRET` refuses to start the listener (fail-closed)
+  while the bridge boots normally. Payload bodies are never persisted.
+
 - **Explicit Claude SDK stdout buffer bound.** The adapter now always passes
   `ClaudeAgentOptions.max_buffer_size` (new `CCC_CLAUDE_MAX_BUFFER_SIZE`,
   default 16 MiB, accepted range 1 MiB–256 MiB), including on the bare
