@@ -1,5 +1,12 @@
 # Changelog
 
+- **Claude runtime option composition extracted (#896 slice).** Request-level
+  SDK options, execution-profile tool policy, curated web/MCP wiring, sandbox
+  settings, and audience-scoped memory settings moved unchanged from
+  `core/claude_runtime.py` into the new `core/claude_runtime_options.py`
+  mixin. Runtime initialization still resolves the host profile and retains
+  the existing public API (`claude_runtime.py` 1495 → 1335 lines).
+
 - **Claude transcript browsing extracted from claude_runtime.py (#896
   slice).** The provider-neutral SessionBrowser implementation for listing
   transcripts, reading bounded history, and producing distill snapshots moved
