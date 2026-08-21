@@ -156,6 +156,17 @@ ok "re-apply is idempotent" '[ "$(marker_count)" = 1 ]'
 bash "$INSTALLER" --apply --remove >/dev/null 2>&1
 ok "remove takes the entry back out" '[ "$(marker_count)" = 0 ]'
 
+# --- weekly rollup entry (D-4): opt-in --weekly adds a second managed line --
+bash "$INSTALLER" --apply --weekly >/dev/null 2>&1
+ok "--weekly adds the Monday rollup line inside the same managed block" \
+  '[ "$(marker_count)" = 2 ] && grep -qF "cost-ledger-weekly.py" "$FAKE_CRON" && grep -qF "17 5 * * 1" "$FAKE_CRON"'
+ok "weekly line carries CCC_STATE_DIR and the gen stamp" \
+  'grep "cost-ledger-weekly.py" "$FAKE_CRON" | grep -qF "CCC_STATE_DIR=" && grep "cost-ledger-weekly.py" "$FAKE_CRON" | grep -qE "gen=h_[0-9a-f]{12}$"'
+bash "$INSTALLER" --apply >/dev/null 2>&1
+ok "re-apply without --weekly strips the rollup line (opt-in is not sticky)" \
+  '[ "$(marker_count)" = 1 ] && ! grep -qF "cost-ledger-weekly.py" "$FAKE_CRON"'
+bash "$INSTALLER" --apply --remove >/dev/null 2>&1
+
 # --- stage 2: codex collector (#1205 D-1) -----------------------------------
 # turn_context carries the model; token_count events carry total (cumulative)
 # AND last (per-turn delta) — the ledger must use `last`.
