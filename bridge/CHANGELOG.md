@@ -1,5 +1,14 @@
 # Changelog
 
+- **Turn notice composition extracted from bot.py (#896 slice, #348
+  hotspot).** The busy notice, session-start reason/banner, and
+  history-injection prompt composition moved from `core/bot.py` into the new
+  directly unit-tested `core/turn_notices.py`, following the established
+  pure-helper pattern (`ui.py`, `media.py`, `sdk_text.py`). `bot.py` keeps
+  thin delegators so call sites, behavior, and existing tests are unchanged
+  (`bot.py` 2147 → 2093 lines; the `_process_user_message_text` C901
+  baseline hotspot loses two inline composition blocks).
+
 - **GitHub webhook nudge for external waits (#1222).** New opt-in
   loopback-bound listener (`CCC_WEBHOOK_NUDGE_ENABLED`, default off) accepts
   HMAC-authenticated GitHub webhook deliveries (`workflow_run`,
