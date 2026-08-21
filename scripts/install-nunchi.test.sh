@@ -28,7 +28,7 @@ cron_store="$TMP/crontab"
 piri_sessions="$home/.piri/agent/sessions"
 mkdir -p "$hooks/nunchi" "$state" "$codex_home/sessions" "$piri_sessions" \
   "$home/.claude/projects" "$home/.local/bin" "$nunchi_home" "$fake_bin"
-cp "$ROOT"/claude/hooks/nunchi/{codex-loader.py,nunchi.py,codex-feed.sh,piri-feed.sh,ingest-cron.sh,bench.sh,bench-qset.tsv,sessionstart.sh,mempalace-refresh.sh} "$hooks/nunchi/"
+cp "$ROOT"/claude/hooks/nunchi/{codex-loader.py,nunchi.py,judge-batch.py,codex-feed.sh,piri-feed.sh,ingest-cron.sh,bench.sh,bench-qset.tsv,sessionstart.sh,mempalace-refresh.sh} "$hooks/nunchi/"
 cp "$ROOT/claude/hooks/scan-injection.sh" "$hooks/scan-injection.sh"
 chmod 700 "$hooks/nunchi/codex-loader.py" "$hooks/nunchi/nunchi.py" "$hooks/scan-injection.sh"
 chmod 755 "$hooks/nunchi"/*.sh
@@ -113,6 +113,17 @@ CCC_TEST_MEMPALACE_CAPTURE="$refresh_capture" HOME="$home" \
   bash "$hooks/nunchi/mempalace-refresh.sh" codex "$codex_home/sessions" >/dev/null 2>&1; rc=$?
 ok "Codex refresh uses the native incremental conversation miner with --wing codex" \
   '[ "$rc" = 0 ] && grep -qx "mine $codex_home/sessions --mode convos --wing codex" "$refresh_capture" && jq -e '\'' .provider == "codex" and .state == "ok" and .exit_code == 0 '\'' "$nunchi_home/mempalace-refresh.status.json" >/dev/null'
+
+# --- Judge batch cron (#1204): opt-in via --judge, a 4th managed line that is
+# dry-run by design (no NUNCHI_JUDGE_APPLY — flipping to apply is a fresh,
+# per-node approval, never an installer default).
+out="$(run_install --apply --codex --judge 2>&1)"; rc=$?
+ok "--judge adds a managed daily judge-batch cron alongside feed/refresh/bench" \
+  '[ "$rc" = 0 ] && [ "$(grep -c "nunchi:#816" "$cron_store")" = 4 ] && grep -q "judge-batch.py" "$cron_store"'
+ok "judge cron is dry-run only (no APPLY env) and keeps the gen stamp" \
+  '! grep "judge-batch.py" "$cron_store" | grep -q "NUNCHI_JUDGE_APPLY" && grep "judge-batch.py" "$cron_store" | grep -qE "gen=h_[0-9a-f]{12}$"'
+ok "judge cron line survives a plain re-apply unchanged (strip+rewrite idempotence)" \
+  'run_install --apply --codex >/dev/null 2>&1 && [ "$(grep -c "judge-batch.py" "$cron_store")" = 0 ]'
 
 # --- Piri lane: Piri has no distill feed, so its lane runs a per-session
 # extractor (piri-feed.sh) and mines transcripts with the conversation miner

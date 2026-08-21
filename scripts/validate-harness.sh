@@ -317,6 +317,7 @@ HARNESS_SUITES=(claude/hooks/observability.test.sh claude/hooks/security-scan.te
          claude/hooks/distill/local-facts.test.sh claude/hooks/memory-hooks.test.sh \
          claude/hooks/refresh-memory-freshness.test.sh \
          claude/hooks/nunchi/nunchi.test.sh claude/hooks/nunchi/bench.test.sh \
+         claude/hooks/nunchi/judge-batch.test.sh \
          claude/hooks/nunchi/bridge-journal.test.sh claude/hooks/nunchi/codex-feed.test.sh \
          scripts/ccc-doctor.test.sh scripts/ccc-memory.test.sh scripts/ccc-codex-memory.test.sh scripts/ccc-codex.test.sh scripts/ccc-piri.test.sh piri/skills/web/web_tools.test.sh scripts/ccc-codex-github-policy.test.sh scripts/ccc-distill-check.test.sh scripts/ccc-distill-fleet-matrix.test.sh scripts/ccc-security-audit.test.sh \
          scripts/ccc-script-interpreter-check.test.sh \
