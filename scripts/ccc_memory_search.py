@@ -32,6 +32,25 @@ sys.argv = [sys.argv[0], DB, QUERY, LIMIT, RETRIEVAL]
 import hashlib, json, math, os, re, sqlite3, subprocess, sys, tempfile, time
 from datetime import datetime, timezone
 path, query, retrieval = sys.argv[1], sys.argv[2], sys.argv[4]
+
+# #871 remaining slice: NL time-reference auto-expansion. When the caller gave
+# no explicit --as-of/CCC_MEMORY_AS_OF, estimate an as_of instant from the
+# query itself (ccc_memory_timeparse — explicit absolute dates or strong
+# relative markers only, period mentions resolve to the period END). Explicit
+# as_of always wins; CCC_MEMORY_NL_AS_OF=0 disables. Expansion is reported in
+# the temporal summary block so a wrong guess is visible, never silent.
+NL_AS_OF = None
+if not AS_OF and os.environ.get("CCC_MEMORY_NL_AS_OF", "1").strip().lower() not in {"0", "false", "off", "no"}:
+    try:
+        from ccc_memory_timeparse import estimate_as_of
+        _est = estimate_as_of(query)
+    except Exception:
+        _est = {"ts": None, "reason": "nl-timeparse-error"}
+    if _est.get("ts") is not None:
+        AS_OF = str(_est["iso"])
+        NL_AS_OF = {"rule": _est.get("rule"), "iso": _est["iso"]}
+    elif _est.get("reason") not in (None, "no-time-reference", "empty-query"):
+        NL_AS_OF = {"degraded": _est.get("reason")}
 # Guard the limit parse like every other numeric env var here: a malformed
 # CCC_MEMORY_SEARCH_LIMIT (e.g. "abc") must fall back, not crash with a
 # traceback, and a non-positive value (0/-1 → empty results) falls back too.
@@ -602,6 +621,8 @@ if not wiki_enabled:
 
 # #871: valid-time semantics, applied uniformly after every lane has fused.
 rows, temporal_summary = _temporal_finalize(rows)
+if NL_AS_OF:
+    temporal_summary["nl_as_of"] = NL_AS_OF
 
 # Feedback: record the surfaced docs (only when the caller opted in), then drop
 # the internal content-hash before emitting results.

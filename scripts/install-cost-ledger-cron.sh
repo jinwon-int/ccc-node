@@ -37,6 +37,10 @@ LEDGER_OUT="${CCC_COST_LEDGER_FILE:-$STATE_DIR/cost-ledger.jsonl}"
 # every other scheduled job lands on. Early enough that the row exists before
 # the 04:45 self-update window touches anything.
 SCHEDULE="${CCC_COST_LEDGER_CRON:-29 3 * * *}"
+# Weekly rollup (D-4): Monday 05:17 KST, after the daily run has closed
+# Sunday, so the previous ISO week is complete when it is queued.
+WEEKLY_SCHEDULE="${CCC_COST_LEDGER_WEEKLY_CRON:-17 5 * * 1}"
+WEEKLY_CMD="${CCC_COST_LEDGER_WEEKLY_CMD:-$SELF_DIR/cost-ledger-weekly.py}"
 LOG="${CCC_COST_LEDGER_CRON_LOG:-$STATE_DIR/cost-ledger.cron.log}"
 CRONTAB="${CCC_CRONTAB_CMD:-crontab}"
 MARKER="# ccc-node:cost-ledger"
@@ -44,6 +48,7 @@ BLOCK_BEGIN="# ccc-node:cost-ledger:begin"
 BLOCK_END="# ccc-node:cost-ledger:end"
 APPLY=0
 REMOVE=0
+WEEKLY=0
 
 # Shared installer libs (#1081, #1077): gen stamps + records, and the common
 # crontab install/remove driver.
@@ -81,6 +86,10 @@ Options:
   --apply          Write the crontab change.
   --remove         Remove the managed entry (with --apply) instead of adding it.
   --schedule SPEC  Cron schedule (5 fields). Default: "$SCHEDULE".
+  --weekly         Also install the Monday weekly rollup entry (D-4):
+                   cost-ledger-weekly.py queues the previous ISO week's
+                   per-model totals into the wiki-candidates queue (human
+                   gate; never auto-PR). Default: "$WEEKLY_SCHEDULE".
 
 Env overrides: CCC_CLAUDE_DIR, CCC_STATE_DIR, CCC_COST_LEDGER_CMD,
 CCC_COST_LEDGER_FILE, CCC_COST_LEDGER_CRON, CCC_COST_LEDGER_CRON_LOG,
@@ -94,6 +103,7 @@ while [ $# -gt 0 ]; do
     --apply) APPLY=1 ;;
     --remove) REMOVE=1 ;;
     --schedule) ccc_cron_need_val "$1" "${2:-}"; SCHEDULE="$2"; shift ;;
+    --weekly) WEEKLY=1 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown arg: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -106,6 +116,11 @@ done
 # node whose identity lives only in state/node.txt would be recorded under its
 # hostname, which disagrees with the fleet name on at least one node.
 CRON_LINE="$SCHEDULE bash -lc 'CCC_STATE_DIR=\"$STATE_DIR\" python3 \"$LEDGER_CMD\" --out \"$LEDGER_OUT\"' >> \"$LOG\" 2>&1  $MARKER gen=$GEN"
+if [ "$WEEKLY" = 1 ]; then
+  # The weekly line shares the managed block + gen stamp; queueing is
+  # dry-run-free by design (the wiki-candidates queue is the human gate).
+  CRON_LINE="$CRON_LINE"$'\n'"$WEEKLY_SCHEDULE bash -lc 'CCC_STATE_DIR=\"$STATE_DIR\" python3 \"$WEEKLY_CMD\" --ledger \"$LEDGER_OUT\"' >> \"$LOG\" 2>&1  $MARKER gen=$GEN"
+fi
 
 if [ "$APPLY" = 1 ] && [ "$REMOVE" != 1 ]; then
   # The entry appends to "$LOG" under STATE_DIR; create the directory now

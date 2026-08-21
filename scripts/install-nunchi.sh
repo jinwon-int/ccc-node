@@ -8,6 +8,7 @@
 #   install-nunchi.sh --apply --claude     # explicit Claude override
 #   install-nunchi.sh --apply --piri       # explicit Piri override
 #   install-nunchi.sh --apply --piri --audience-scoped /absolute/audience/root
+#   install-nunchi.sh --apply --judge    # + daily review-queue judge batch (#1204)
 #   install-nunchi.sh --apply --target-user gongmyoung
 #   install-nunchi.sh --remove             # mode off + managed cron/hook removal
 #   install-nunchi.sh                      # status
@@ -25,6 +26,7 @@ set -euo pipefail
 ACTION="status"
 PROVIDER="${CCC_NUNCHI_PROVIDER:-auto}"
 TARGET_USER="${CCC_NUNCHI_TARGET_USER:-}"
+JUDGE="${CCC_NUNCHI_JUDGE:-0}"
 AUDIENCE_SCOPED="${CCC_NUNCHI_AUDIENCE_SCOPED:-0}"
 AUDIENCE_ROOT="${CCC_NUNCHI_AUDIENCE_ROOT:-}"
 ORIGINAL_ARGS=("$@")
@@ -41,6 +43,7 @@ while [ $# -gt 0 ]; do
     --target-user)
       [ $# -ge 2 ] || { echo "--target-user requires a user" >&2; exit 2; }
       TARGET_USER="$2"; shift ;;
+    --judge) JUDGE=1 ;;
     --help|-h)
       sed -n '2,14p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
@@ -551,6 +554,7 @@ case "$ACTION" in
       fi
     fi
     bash_bin="$(command -v bash)"
+    python3_bin="$(command -v python3)"
     mp="${CCC_NUNCHI_MEMPALACE_CLI:-}"
     [ -n "$mp" ] || mp="$(command -v mempalace || true)"
     [ -z "$mp" ] && [ -x "$HOME/.local/bin/mempalace" ] && mp="$HOME/.local/bin/mempalace"
@@ -593,6 +597,13 @@ case "$ACTION" in
     # a store frozen weeks earlier on every audience-scoped node.
     append_cron_line "7 8 * * 1 CCC_STATE_DIR=$(cron_quote "$STATE") ${scoped_env}NUNCHI_HOME=$(cron_quote "$NUNCHI_DIR") NUNCHI_DB=$(cron_quote "$NUNCHI_DB_PATH") NUNCHI_SNAPSHOT=$(cron_quote "$NUNCHI_SNAPSHOT_PATH") $(cron_quote "$bash_bin") $(cron_quote "$HOOKS/bench.sh") >> $(cron_quote "$NUNCHI_DIR/bench.cron.log") 2>&1 $MARK gen=$GEN"
     echo "weekly bench cron added (Mon 08:07)"
+    if [ "$JUDGE" = 1 ]; then
+      # #1204 daily review-queue triage. Dry-run by default — the cron line
+      # deliberately carries no NUNCHI_JUDGE_APPLY: flipping to apply is a
+      # fresh-approval, per-node action, not an installer decision.
+      append_cron_line "41 4 * * * CCC_STATE_DIR=$(cron_quote "$STATE") ${scoped_env}NUNCHI_HOME=$(cron_quote "$NUNCHI_DIR") NUNCHI_DB=$(cron_quote "$NUNCHI_DB_PATH") NUNCHI_SNAPSHOT=$(cron_quote "$NUNCHI_SNAPSHOT_PATH") $(cron_quote "$python3_bin") $(cron_quote "$HOOKS/judge-batch.py") >> $(cron_quote "$NUNCHI_DIR/judge.cron.log") 2>&1 $MARK gen=$GEN"
+      echo "daily judge-batch cron added (04:41, dry-run)"
+    fi
     if [ "$resolved_provider" = "claude" ]; then
       set_sessionstart_hook add
     else
