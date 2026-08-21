@@ -5,6 +5,11 @@ All notable changes to the Claude Code node harness. Dates are KST.
 ## [Unreleased]
 
 ### Added
+- Claude session background-task workload tracking now lives in a focused
+  mixin (#896 follow-up). The SDK typed-frame, compatibility SystemMessage,
+  transcript-notification, and authoritative roster paths retain their
+  existing body-free task-id and monotonic-age behavior while reducing the
+  remaining Claude runtime composition surface.
 - Provider lifecycle archives complete the working-state parity follow-up
   (#1196). Piri now snapshots the current contract on its matching
   `compaction_start` event into the Claude-compatible `checkpoints/` name and
