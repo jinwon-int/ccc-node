@@ -129,6 +129,10 @@ utils/chat_logger.py Per-session debug chat logging
 | `CLAUDE_PROCESS_TIMEOUT` | No | Whole-turn SDK timeout in seconds (default: 21600 / 6 hours; read at process start) |
 | `CCC_CLAUDE_MAX_BUFFER_SIZE` | No | Max bytes for one Claude Agent SDK stdout NDJSON line (default: 16777216 / 16 MiB, range 1 MiB–256 MiB). Always sent explicitly: the SDK's own 1 MiB fallback kills the whole turn with `SDKJSONDecodeError` when a tool result carries a large image |
 | `CCC_APPROVAL_STALL_SECONDS` | No | Wall-clock deadline for a pending provider approval (default: 120; 0 disables) |
+| `CCC_WEBHOOK_NUDGE_ENABLED` | No | Opt-in GitHub webhook nudge listener for external waits (#1222, default **false**). A verified delivery only pulls matching waits' next poll forward; state is still read via the authenticated `gh` polling path |
+| `CCC_WEBHOOK_NUDGE_SECRET` | Nudge only | HMAC secret for `X-Hub-Signature-256` verification. Required when enabled — missing secret refuses to start the listener (fail-closed) |
+| `CCC_WEBHOOK_NUDGE_HOST` / `CCC_WEBHOOK_NUDGE_PORT` | No | Bind address for the nudge listener (default: `127.0.0.1:8791`; public ingress is a separate per-node decision) |
+| `CCC_WEBHOOK_NUDGE_MAX_BODY_BYTES` | No | Delivery body cap in bytes (default: 1048576, clamped to [4096, 16777216]) |
 | `PROXY_URL` | No | HTTP proxy; start.sh auto-configures env vars |
 | `PROJECT_ROOT` | Set by start.sh | Base path for all file access validation |
 | `DRAFT_UPDATE_MIN_CHARS` | No | Min characters before draft update (default: 150) |

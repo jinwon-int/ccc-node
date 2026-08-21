@@ -8,7 +8,7 @@ import os
 import re
 import stat
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from hashlib import sha256
 from pathlib import Path
@@ -622,6 +622,71 @@ def _model_usage_entries(model_usage: Mapping[str, Any]) -> tuple[ModelUsage, ..
             )
         )
     return tuple(entries)
+
+
+def delta_from_snapshots(previous: UsageSnapshot | None, current: UsageSnapshot) -> UsageSnapshot:
+    """Per-turn delta between two session-cumulative usage snapshots.
+
+    The SDK's ``ResultMessage`` usage/cost totals are *running totals* for the
+    conversation, zeroed when a ``ConversationResetMessage`` arrives (the
+    SDK's own docstring: "If you accumulate those totals across a long-lived
+    session, snapshot them when this message arrives"). Appending those
+    cumulative snapshots directly re-counts every earlier turn in the window
+    (measured on dungae 2026-08-21: a 24-row ledger read ~17x the true spend).
+
+    Subtracting the previous cached snapshot converts the stream into true
+    per-turn deltas. A reset surfaces either as a *new session key* (no
+    previous — the fresh conversation's full first total IS the delta) or as
+    ``current < previous`` (totals zeroed under a kept session id) — both
+    resolve to "take current as-is". Per-model fields subtract the matching
+    model only; a model seen for the first time contributes its full totals.
+    """
+    if previous is None:
+        return current
+    cur_total = current.total_cost_usd
+    prev_total = previous.total_cost_usd
+    if cur_total is None or prev_total is None or cur_total < prev_total:
+        return current
+    prev_models = {entry.model: entry for entry in previous.models}
+    delta_models = []
+    for entry in current.models:
+        prior = prev_models.get(entry.model)
+        if prior is None:
+            delta_models.append(entry)
+            continue
+        cost: float | None
+        if entry.cost_usd is None or prior.cost_usd is None:
+            cost = entry.cost_usd
+        else:
+            cost = max(0.0, entry.cost_usd - prior.cost_usd)
+        delta_models.append(
+            ModelUsage(
+                model=entry.model,
+                input_tokens=max(0, entry.input_tokens - prior.input_tokens),
+                cache_creation_input_tokens=max(
+                    0, entry.cache_creation_input_tokens - prior.cache_creation_input_tokens
+                ),
+                cache_read_input_tokens=max(
+                    0, entry.cache_read_input_tokens - prior.cache_read_input_tokens
+                ),
+                output_tokens=max(0, entry.output_tokens - prior.output_tokens),
+                cost_usd=cost,
+            )
+        )
+
+    def _delta_field(cur: int | None, prev: int | None) -> int | None:
+        if cur is None or prev is None:
+            return cur
+        return max(0, cur - prev)
+
+    return replace(
+        current,
+        input_tokens=_delta_field(current.input_tokens, previous.input_tokens),
+        output_tokens=_delta_field(current.output_tokens, previous.output_tokens),
+        total_tokens=_delta_field(current.total_tokens, previous.total_tokens),
+        total_cost_usd=round(cur_total - prev_total, 6),
+        models=tuple(delta_models),
+    )
 
 
 def parse_claude_result(message: object, *, observed_at: float | None = None) -> UsageSnapshot:
