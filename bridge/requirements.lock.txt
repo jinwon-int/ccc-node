@@ -17,6 +17,7 @@ anyio==4.14.2 \
     #   -c .github/requirements/bridge-ci.txt
     #   claude-agent-sdk
     #   httpx
+    #   httpx2
     #   mcp
     #   openai
     #   sse-starlette
@@ -217,6 +218,7 @@ h11==0.16.0 \
     # via
     #   -c .github/requirements/bridge-ci.txt
     #   httpcore
+    #   httpcore2
     #   uvicorn
 httpcore==1.0.9 \
     --hash=sha256:2d400746a40668fc9dec9810239072b40b4484b640a8c38fd654a024c7a1bf55 \
@@ -224,13 +226,18 @@ httpcore==1.0.9 \
     # via
     #   -c .github/requirements/bridge-ci.txt
     #   httpx
+httpcore2==2.12.0 \
+    --hash=sha256:7e04258ce01013d7d615e5b910a3b27fac937d7a95038227e79652b4ba3b4ceb \
+    --hash=sha256:9293522bba0aa7c4c8e9e3f040c16575bd8868e155a77fa30c7a9085a5eae648
+    # via
+    #   -c .github/requirements/bridge-ci.txt
+    #   httpx2
 httpx==0.28.1 \
     --hash=sha256:75e98c5f16b0f35b567856f597f06ff2270a374470a5c2392242528e3e3e42fc \
     --hash=sha256:d909fcccc110f8c7faf814ca82a9a4d816bc5a6dbfea25d6591d6985b8ba59ad
     # via
     #   -c .github/requirements/bridge-ci.txt
     #   mcp
-    #   openai
     #   python-telegram-bot
 httpx-sse==0.4.3 \
     --hash=sha256:0ac1c9fe3c0afad2e0ebb25a934a59f4c7823b60792691f779fad2c5568830fc \
@@ -238,6 +245,12 @@ httpx-sse==0.4.3 \
     # via
     #   -c .github/requirements/bridge-ci.txt
     #   mcp
+httpx2==2.12.0 \
+    --hash=sha256:7631fe9887a8a2275f4a2540e053aa670fcc50742864a9ae7c66e609fdcf12cf \
+    --hash=sha256:cc8b6eecb8661c146b8f89a60e97456ee086e91a784ed31ac450c3a9e613dd36
+    # via
+    #   -c .github/requirements/bridge-ci.txt
+    #   openai
 idna==3.18 \
     --hash=sha256:7f952cbe720b688055e3f87de14f5c3e5fdaa8bc3928985c4077ca689de849a2 \
     --hash=sha256:ffb385a7e039654cef1ab9ef32c6fafe283c0c0467bba1d9029738ce4a14a848
@@ -245,6 +258,7 @@ idna==3.18 \
     #   -c .github/requirements/bridge-ci.txt
     #   anyio
     #   httpx
+    #   httpx2
 jiter==0.16.0 \
     --hash=sha256:0542a7189c26920778658fc8fcf2af8bae05bae9924577f71804acef37996536 \
     --hash=sha256:0758ab7747a984797cf048e8eedea1d8ef39d7994b25611daf5b48fc903e8873 \
@@ -372,9 +386,9 @@ mcp==1.29.0 \
     # via
     #   -c .github/requirements/bridge-ci.txt
     #   claude-agent-sdk
-openai==2.53.0 \
-    --hash=sha256:baf5802ad08980e1d9d561e1b996e800c8bcd14af5847c6d0e7a5cc59e4d4116 \
-    --hash=sha256:c694ffc747a3c4d1663ef2b07b811315a476164ee5efa3a993967349ebca7618
+openai==3.2.0 \
+    --hash=sha256:1d26bd6f49738f6848bcce370794ee03acc0561d468070df010b44178da8e797 \
+    --hash=sha256:e97a64a2df665460fbb1f23adbe3e4b717f6ac04b5740552889ad1d8dd9025c2
     # via
     #   -c .github/requirements/bridge-ci.txt
     #   ccc-telegram-bridge (bridge/pyproject.toml)
@@ -906,12 +920,20 @@ tqdm==4.70.0 \
     # via
     #   -c .github/requirements/bridge-ci.txt
     #   openai
+truststore==0.10.4 \
+    --hash=sha256:9d91bd436463ad5e4ee4aba766628dd6cd7010cf3e2461756b3303710eebc301 \
+    --hash=sha256:adaeaecf1cbb5f4de3b1959b42d41f6fab57b2b1666adb59e89cb0b53361d981
+    # via
+    #   -c .github/requirements/bridge-ci.txt
+    #   httpcore2
+    #   httpx2
 typing-extensions==4.16.0 \
     --hash=sha256:481caa481374e813c1b176ada14e97f1f67a4539ce9cfeb3f350d78d6370c2e8 \
     --hash=sha256:dc983d19a509c94dba722ee6abd33940f7c05a89e243c47e907eb4db6f1a43e5
     # via
     #   -c .github/requirements/bridge-ci.txt
     #   anyio
+    #   httpx2
     #   mcp
     #   openai
     #   opentelemetry-api
