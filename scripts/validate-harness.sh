@@ -221,6 +221,9 @@ if command -v python3 >/dev/null 2>&1; then
   if python3 -m py_compile scripts/ccc-skill-promotion.py 2>/dev/null; then say "  ok scripts/ccc-skill-promotion.py compiles"; else err "py_compile: scripts/ccc-skill-promotion.py"; fi
   if python3 -m py_compile scripts/ccc-fleet-skills-sync.py 2>/dev/null; then say "  ok scripts/ccc-fleet-skills-sync.py compiles"; else err "py_compile: scripts/ccc-fleet-skills-sync.py"; fi
   if python3 -m py_compile scripts/ccc_memory_probe.py 2>/dev/null; then say "  ok scripts/ccc_memory_probe.py compiles"; else err "py_compile: scripts/ccc_memory_probe.py"; fi
+  if python3 -m py_compile scripts/cost-ledger-weekly.py 2>/dev/null; then say "  ok scripts/cost-ledger-weekly.py compiles"; else err "py_compile: scripts/cost-ledger-weekly.py"; fi
+  if python3 -m py_compile scripts/ccc_memory_timeparse.py 2>/dev/null; then say "  ok scripts/ccc_memory_timeparse.py compiles"; else err "py_compile: scripts/ccc_memory_timeparse.py"; fi
+  if python3 -m py_compile scripts/ccc_memory_timeparse_test.py 2>/dev/null; then say "  ok scripts/ccc_memory_timeparse_test.py compiles"; else err "py_compile: scripts/ccc_memory_timeparse_test.py"; fi
   if python3 -m py_compile bridge/runtime_config_check.py 2>/dev/null; then say "  ok bridge/runtime_config_check.py compiles"; else err "py_compile: bridge/runtime_config_check.py"; fi
   if python3 -m py_compile scripts/ccc_script_interpreter_check.py 2>/dev/null; then say "  ok scripts/ccc_script_interpreter_check.py compiles"; else err "py_compile: scripts/ccc_script_interpreter_check.py"; fi
   if python3 -m py_compile scripts/ccc_script_interpreter_check_test.py 2>/dev/null; then say "  ok scripts/ccc_script_interpreter_check_test.py compiles"; else err "py_compile: scripts/ccc_script_interpreter_check_test.py"; fi
@@ -255,6 +258,12 @@ if python3 scripts/ccc_codex_skills.py validate --repo-root . >"$TMP/codex-skill
 else
   err "Codex managed-skill validation/tests failed"
   tail -10 "$TMP/codex-skills-validate.out" "$TMP/codex-skills-test.out" 2>/dev/null
+fi
+if python3 scripts/ccc_memory_timeparse_test.py >"$TMP/timeparse-test.out" 2>&1; then
+  say "  ok NL as_of time-reference estimation tests (#871)"
+else
+  err "NL as_of timeparse tests failed"
+  tail -10 "$TMP/timeparse-test.out" 2>/dev/null
 fi
 if python3 scripts/ccc_doctor_bootpath_test.py >"$TMP/doctor-bootpath-test.out" 2>&1; then
   say "  ok doctor bridge boot-path guard tests"
@@ -317,6 +326,7 @@ HARNESS_SUITES=(claude/hooks/observability.test.sh claude/hooks/security-scan.te
          claude/hooks/distill/local-facts.test.sh claude/hooks/memory-hooks.test.sh \
          claude/hooks/refresh-memory-freshness.test.sh \
          claude/hooks/nunchi/nunchi.test.sh claude/hooks/nunchi/bench.test.sh \
+         claude/hooks/nunchi/judge-batch.test.sh \
          claude/hooks/nunchi/bridge-journal.test.sh claude/hooks/nunchi/codex-feed.test.sh \
          scripts/ccc-doctor.test.sh scripts/ccc-memory.test.sh scripts/ccc-codex-memory.test.sh scripts/ccc-codex.test.sh scripts/ccc-piri.test.sh piri/skills/web/web_tools.test.sh scripts/ccc-codex-github-policy.test.sh scripts/ccc-distill-check.test.sh scripts/ccc-distill-fleet-matrix.test.sh scripts/ccc-security-audit.test.sh \
          scripts/ccc-script-interpreter-check.test.sh \
@@ -328,6 +338,7 @@ HARNESS_SUITES=(claude/hooks/observability.test.sh claude/hooks/security-scan.te
          scripts/resource-pressure-guard.test.sh \
          scripts/install-memory-refresh-cron.test.sh scripts/install-nunchi.test.sh scripts/install-termux-mempalace.test.sh scripts/ccc-skill-autosave.test.sh \
          scripts/cost-ledger.test.sh \
+         scripts/cost-ledger-weekly.test.sh \
          scripts/ccc-skill-promotion.test.sh \
          scripts/ccc-fleet-skills-sync.test.sh \
          scripts/gh-pr-flow-seoseo-merge.test.sh \

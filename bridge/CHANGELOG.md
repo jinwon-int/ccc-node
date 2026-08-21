@@ -1,5 +1,41 @@
 # Changelog
 
+- **Claude transcript browsing extracted from claude_runtime.py (#896
+  slice).** The provider-neutral SessionBrowser implementation for listing
+  transcripts, reading bounded history, and producing distill snapshots moved
+  unchanged into `core/claude_session_browser.py`. `ClaudeRuntime` composes the
+  mixin while retaining its public API and transcript directory ownership
+  (`claude_runtime.py` 1592 → 1495 lines).
+
+- **Durable follow-up queue orchestration extracted from bot.py (#896
+  slice).** Queue state initialization, admission, Telegram update replay,
+  retry/notification workers, `/stop` clearing, and startup/shutdown hooks
+  moved unchanged into the new `core/bot_followup_queue.py` mixin. The mixin
+  precedes `BotLifecycleMixin` so cooperative lifecycle ordering is preserved,
+  while `core/bot.py` retains its existing handler registrations and internal
+  envelope import compatibility (`bot.py` 2092 → 1143 lines).
+
+- **Turn notice composition extracted from bot.py (#896 slice, #348
+  hotspot).** The busy notice, session-start reason/banner, and
+  history-injection prompt composition moved from `core/bot.py` into the new
+  directly unit-tested `core/turn_notices.py`, following the established
+  pure-helper pattern (`ui.py`, `media.py`, `sdk_text.py`). `bot.py` keeps
+  thin delegators so call sites, behavior, and existing tests are unchanged
+  (`bot.py` 2147 → 2093 lines; the `_process_user_message_text` C901
+  baseline hotspot loses two inline composition blocks).
+
+- **GitHub webhook nudge for external waits (#1222).** New opt-in
+  loopback-bound listener (`CCC_WEBHOOK_NUDGE_ENABLED`, default off) accepts
+  HMAC-authenticated GitHub webhook deliveries (`workflow_run`,
+  `check_suite`, `pull_request`) and pulls matching monitoring waits'
+  `next_poll_epoch` forward, cutting CI terminal-detection latency from the
+  300s backoff cap to roughly one monitor tick. Deliveries are untrusted
+  hints only — terminal classification, exact-head validation, wake
+  journaling, and resume budgets stay in the polling monitor, lost
+  deliveries degrade to plain polling, and enabling without
+  `CCC_WEBHOOK_NUDGE_SECRET` refuses to start the listener (fail-closed)
+  while the bridge boots normally. Payload bodies are never persisted.
+
 - **Explicit Claude SDK stdout buffer bound.** The adapter now always passes
   `ClaudeAgentOptions.max_buffer_size` (new `CCC_CLAUDE_MAX_BUFFER_SIZE`,
   default 16 MiB, accepted range 1 MiB–256 MiB), including on the bare

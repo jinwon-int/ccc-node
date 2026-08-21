@@ -874,6 +874,26 @@ ok "as_of works as a CLI flag too" '[ "$rc" = 0 ] && jq -e '\''(.temporal.mode =
 out="$(tsearch CCC_MEMORY_AS_OF=garbage)"; rc=$?
 ok "unparseable as_of degrades to current mode with body-free signal" '[ "$rc" = 0 ] && jq -e '\''(.temporal.mode == "current") and (.temporal.reason == "as-of-parse-failed-using-current")'\'' >/dev/null <<<"$out"'
 
+# #871 remaining slice: NL time-reference auto-expansion. The same fixture
+# drives it — an absolute date in the query itself must land on the same
+# instant as the explicit --as-of above, explicit flags always win, the
+# kill-switch restores plain current mode, and ambiguous dates degrade with a
+# body-free signal instead of guessing.
+tsearchq() { # <query> [extra env...]
+  local q="$1"; shift
+  env CCC_STATE_DIR="$temp_state" CCC_MEMORY_INDEX_DB="$temp_state/memory-index.sqlite" "$@" bash "$ROOT/scripts/ccc-memory-search.sh" "$q" 2>/dev/null
+}
+out="$(tsearchq "2026-01-15에 release train departs zeta")"; rc=$?
+ok "NL absolute date auto-expands to as_of and retrieves the point-in-time fact" '[ "$rc" = 0 ] && jq -e '\''(.temporal.mode == "as_of") and (.temporal.nl_as_of.rule == "abs:iso-date") and (.results[0].path | contains(":t-old")) and (.results | all(.path | contains(":t-new") | not))'\'' >/dev/null <<<"$out"'
+out="$(tsearchq "2026-01-15에 release train departs zeta" CCC_MEMORY_AS_OF=2026-01-15T00:00:00Z)"; rc=$?
+ok "explicit as_of wins over NL expansion (no nl_as_of marker)" '[ "$rc" = 0 ] && jq -e '\''(.temporal.mode == "as_of") and (.temporal | has("nl_as_of") | not)'\'' >/dev/null <<<"$out"'
+out="$(tsearchq "2026-01-15에 release train departs zeta" CCC_MEMORY_NL_AS_OF=0)"; rc=$?
+ok "CCC_MEMORY_NL_AS_OF=0 disables the expansion" '[ "$rc" = 0 ] && jq -e '\''(.temporal.mode == "current") and (.temporal | has("nl_as_of") | not)'\'' >/dev/null <<<"$out"'
+out="$(tsearchq "2026-01-15와 2026-03-01에 release train departs zeta")"; rc=$?
+ok "ambiguous absolute dates degrade to current with body-free signal" '[ "$rc" = 0 ] && jq -e '\''(.temporal.mode == "current") and (.temporal.nl_as_of.degraded == "ambiguous-absolute-dates")'\'' >/dev/null <<<"$out"'
+out="$(tsearchq "release train departs zeta")"; rc=$?
+ok "time-less query carries no nl_as_of marker" '[ "$rc" = 0 ] && jq -e '\''.temporal | has("nl_as_of") | not'\'' >/dev/null <<<"$out"'
+
 # restore the structured-fact index for the secret-redaction test below
 CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CCC_MEMORY_FACTS_FILE="$facts" bash "$ROOT/scripts/ccc-memory-index.sh" rebuild >/dev/null 2>&1
 ok "structured fact indexing redacts secrets" '! python3 - <<PY | grep -q VALUE_SHOULD_NOT_INDEX_FACT
