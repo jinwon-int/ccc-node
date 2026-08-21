@@ -1,5 +1,12 @@
 # Changelog
 
+- **Claude transcript browsing extracted from claude_runtime.py (#896
+  slice).** The provider-neutral SessionBrowser implementation for listing
+  transcripts, reading bounded history, and producing distill snapshots moved
+  unchanged into `core/claude_session_browser.py`. `ClaudeRuntime` composes the
+  mixin while retaining its public API and transcript directory ownership
+  (`claude_runtime.py` 1592 → 1495 lines).
+
 - **Durable follow-up queue orchestration extracted from bot.py (#896
   slice).** Queue state initialization, admission, Telegram update replay,
   retry/notification workers, `/stop` clearing, and startup/shutdown hooks
