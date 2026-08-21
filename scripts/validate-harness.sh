@@ -221,6 +221,8 @@ if command -v python3 >/dev/null 2>&1; then
   if python3 -m py_compile scripts/ccc-skill-promotion.py 2>/dev/null; then say "  ok scripts/ccc-skill-promotion.py compiles"; else err "py_compile: scripts/ccc-skill-promotion.py"; fi
   if python3 -m py_compile scripts/ccc-fleet-skills-sync.py 2>/dev/null; then say "  ok scripts/ccc-fleet-skills-sync.py compiles"; else err "py_compile: scripts/ccc-fleet-skills-sync.py"; fi
   if python3 -m py_compile scripts/ccc_memory_probe.py 2>/dev/null; then say "  ok scripts/ccc_memory_probe.py compiles"; else err "py_compile: scripts/ccc_memory_probe.py"; fi
+  if python3 -m py_compile scripts/ccc_memory_timeparse.py 2>/dev/null; then say "  ok scripts/ccc_memory_timeparse.py compiles"; else err "py_compile: scripts/ccc_memory_timeparse.py"; fi
+  if python3 -m py_compile scripts/ccc_memory_timeparse_test.py 2>/dev/null; then say "  ok scripts/ccc_memory_timeparse_test.py compiles"; else err "py_compile: scripts/ccc_memory_timeparse_test.py"; fi
   if python3 -m py_compile bridge/runtime_config_check.py 2>/dev/null; then say "  ok bridge/runtime_config_check.py compiles"; else err "py_compile: bridge/runtime_config_check.py"; fi
   if python3 -m py_compile scripts/ccc_script_interpreter_check.py 2>/dev/null; then say "  ok scripts/ccc_script_interpreter_check.py compiles"; else err "py_compile: scripts/ccc_script_interpreter_check.py"; fi
   if python3 -m py_compile scripts/ccc_script_interpreter_check_test.py 2>/dev/null; then say "  ok scripts/ccc_script_interpreter_check_test.py compiles"; else err "py_compile: scripts/ccc_script_interpreter_check_test.py"; fi
@@ -255,6 +257,12 @@ if python3 scripts/ccc_codex_skills.py validate --repo-root . >"$TMP/codex-skill
 else
   err "Codex managed-skill validation/tests failed"
   tail -10 "$TMP/codex-skills-validate.out" "$TMP/codex-skills-test.out" 2>/dev/null
+fi
+if python3 scripts/ccc_memory_timeparse_test.py >"$TMP/timeparse-test.out" 2>&1; then
+  say "  ok NL as_of time-reference estimation tests (#871)"
+else
+  err "NL as_of timeparse tests failed"
+  tail -10 "$TMP/timeparse-test.out" 2>/dev/null
 fi
 if python3 scripts/ccc_doctor_bootpath_test.py >"$TMP/doctor-bootpath-test.out" 2>&1; then
   say "  ok doctor bridge boot-path guard tests"
