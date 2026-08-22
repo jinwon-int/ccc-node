@@ -413,6 +413,7 @@ fi
 
 OLD_SHA="$(git -C "$REPO" rev-parse HEAD 2>/dev/null)"
 
+# ccc-side-effect: self_update.apply
 # --- fetch + ff-only merge ----------------------------------------------------
 # fetch failure is the one precondition that DOES self-heal (transient network),
 # so it alerts only once it has burned consecutive scheduled ticks.

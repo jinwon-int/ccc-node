@@ -27,5 +27,6 @@ python3 scripts/ccc_architecture_contract.py --repo-root .
 - 이 파일은 import 경계의 설명서다. runtime authorization이나 permission gate를
   대체하지 않는다.
 
-외부 부수효과 inventory, recovery drill, 생성된 운영 표는 #872의 후속 slice에서
-같은 source-of-truth 원칙으로 추가한다.
+외부 부수효과 inventory, recovery drill, 생성된 운영 표는
+`side-effect-contract.md`와 별도의 versioned contract가 같은 source-of-truth
+원칙으로 관리한다.
