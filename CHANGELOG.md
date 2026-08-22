@@ -81,6 +81,18 @@ All notable changes to the Claude Code node harness. Dates are KST.
   correct under `CCC_CLAUDE_DIR` overrides and stale installs.
 
 ### Fixed
+- `setup.sh` no longer erases a node's `model` pin from `~/.claude/settings.json`
+  (#1235). `settings.json` is a managed artifact recomposed from repo templates
+  on every run, and self-update runs setup on every changed tick, so a pin set
+  on a node survived only until the next code change. The bridge reads that key
+  as the canonical model source and `/new` syncs the session pin *from* it, so
+  an absent key silently overwrote the live session pin with null and served the
+  account default instead. Measured 2026-08-22: 7/7 nodes checked had lost the
+  key. The key is now carried across the rebuild — the same
+  node-local-survives-setup contract `settings.local.json` already had (#454) —
+  on both the merge and `--with-plugin` paths. A template that ships its own
+  `model` still wins, and setup never invents a pin where the node had none.
+  Recovering pins already lost is a separate operator decision.
 - Memory distill: `CCC_MEMORY_ASSISTANT_LABEL`'s built-in default was
   hardcoded to `"dungae, a Hermes Team2 worker"` in three places
   (`bridge/utils/settings_memory.py`, `claude/hooks/distill/extract.sh`,

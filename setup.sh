@@ -292,6 +292,52 @@ neutralize_bypass_if_root() {
   fi
 }
 
+# `model` is the node's model pin and the bridge reads it from settings.json as
+# the canonical source (bridge/core/bot_commands.py `_get_real_model`: session
+# model -> settings.json `model` -> literal fallback). But settings.json is a
+# managed artifact recomposed from repo templates on every setup run, and
+# self-update runs setup on every changed tick — so a pin set on a node survived
+# only until the next code change, then vanished with no warning. Worse than a
+# plain reset: `/new` syncs the session model FROM settings.json, so an absent
+# key overwrites the live session pin with null and the account default gets
+# served (#1235; measured 2026-08-22, 7/7 nodes had lost the key).
+#
+# So carve out this one key, the same node-local-survives-setup contract
+# settings.local.json already has (#454). Everything else in the file stays
+# repo-owned.
+read_node_local_model() { # <settings-path> -> pin on stdout (empty if none)
+  local src="$1"
+  [ -f "$src" ] || return 0
+  jq -r 'if has("model") and (.model | type) == "string" then .model else empty end' \
+    "$src" 2>/dev/null || true
+}
+
+restore_node_local_model() { # <settings-path> <pin>
+  local dest="$1" model="$2"
+  [ -n "$model" ] || return 0
+  if [ "$DRY" = 1 ]; then
+    echo "[dry-run] preserve node-local model pin '$model' in $dest"
+    return 0
+  fi
+  [ -f "$dest" ] || return 0
+  # A template that ships its own pin wins: the repo still owns anything it
+  # actually declares, and this is only meant to stop silent erasure.
+  if jq -e 'has("model")' "$dest" >/dev/null 2>&1; then
+    note "settings.json ships a model pin — node-local '$model' not reapplied"
+    return 0
+  fi
+  local tmp; tmp="$(mktemp "${dest}.XXXXXX")" || { echo "ERROR: mktemp failed for $dest" >&2; return 1; }
+  if jq --arg m "$model" '.model = $m' "$dest" > "$tmp" 2>/dev/null \
+     && jq -e . "$tmp" >/dev/null 2>&1; then
+    mv "$tmp" "$dest"
+    note "preserved node-local model pin: $model"
+  else
+    rm -f "$tmp"
+    echo "ERROR: failed to preserve node-local model pin at '$dest' (existing file left untouched)" >&2
+    return 1
+  fi
+}
+
 # Snapshot the existing ~/.claude config BEFORE we overwrite anything. setup.sh unconditionally
 # overwrites settings.json and the hook/output-style/agent/command/skill dirs — on a node that
 # already has a configured identity that is destructive, so we tar a restore point first.
@@ -332,12 +378,17 @@ run mkdir -p "$CLAUDE_DIR/hooks" "$CLAUDE_DIR/hooks/lib"
 #   - claude/hooks/enforcement-overlay.json : portable hooks audit/redact/notify
 # Standalone (default): base + overlay merged → settings.json owns everything.
 # --with-plugin: base only → the ccc-node plugin's hooks/hooks.json owns the portable hooks.
+# Read the node-local model pin BEFORE either path replaces the file — both
+# render from repo templates and mv over the destination, so nothing survives
+# unless it was captured first (#1235).
+NODE_LOCAL_MODEL="$(read_node_local_model "$CLAUDE_DIR/settings.json")"
 if [ "$WITH_PLUGIN" = 1 ]; then
   note "plugin mode: lean settings (portable hooks come from the ccc-node plugin)"
   run atomic_install "$SRC/claude/settings.base.json" "$CLAUDE_DIR/settings.json"
 else
   merge_settings_json "$SRC/claude/settings.base.json" "$SRC/claude/hooks/enforcement-overlay.json" "$CLAUDE_DIR/settings.json"
 fi
+restore_node_local_model "$CLAUDE_DIR/settings.json" "$NODE_LOCAL_MODEL"
 neutralize_bypass_if_root "$CLAUDE_DIR/settings.json"
 # settings.local.json is the NODE-LOCAL approvals file — seed it from the
 # template ONLY when absent so a node's accumulated/hand-added approvals are

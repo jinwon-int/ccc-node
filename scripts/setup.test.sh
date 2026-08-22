@@ -599,5 +599,51 @@ out="$(HOME="$tm_home" CCC_CLAUDE_DIR="$tm_claude" CCC_HERMES_DIR="$tm_hermes" \
 ok "Termux dry-run prints but does not run pkg install" \
   'grep -q "dry-run. pkg install -y rust rust-std-aarch64-linux-android" <<<"$out" && [ ! -s "$TMP/tm-pkg.calls" ]'
 
+# #1235: settings.json is recomposed from repo templates on every run, so the
+# node-local `model` pin has to be carried across explicitly or self-update
+# erases it on the next changed tick.
+mp_home="$TMP/mp-home-1235"; mp_claude="$TMP/mp-claude-1235"; mp_hermes="$TMP/mp-hermes-1235"
+mkdir -p "$mp_claude"
+printf '{"model":"claude-fable-5"}\n' > "$mp_claude/settings.json"
+out="$(HOME="$mp_home" CCC_CLAUDE_DIR="$mp_claude" CCC_HERMES_DIR="$mp_hermes" \
+  bash "$SETUP" --no-backup 2>&1)"; rc=$?
+ok "setup preserves the node-local model pin across a rebuild" \
+  '[ "$rc" = 0 ] && [ "$(jq -r .model "$mp_claude/settings.json")" = "claude-fable-5" ]'
+ok "the rebuilt settings still carry the repo-owned keys" \
+  '[ "$(jq -r "has(\"hooks\") and has(\"permissions\")" "$mp_claude/settings.json")" = true ]'
+
+# A second run is the self-update case: the pin must survive repeatedly, not
+# just the first rebuild after it was set.
+HOME="$mp_home" CCC_CLAUDE_DIR="$mp_claude" CCC_HERMES_DIR="$mp_hermes" \
+  bash "$SETUP" --no-backup >/dev/null 2>&1
+ok "the model pin survives a repeat (self-update) run" \
+  '[ "$(jq -r .model "$mp_claude/settings.json")" = "claude-fable-5" ]'
+
+# No pin present: setup must not invent one.
+np_claude="$TMP/np-claude-1235"
+HOME="$TMP/np-home-1235" CCC_CLAUDE_DIR="$np_claude" CCC_HERMES_DIR="$TMP/np-hermes-1235" \
+  bash "$SETUP" --no-backup >/dev/null 2>&1
+ok "setup does not add a model key when the node had none" \
+  '[ "$(jq -r "has(\"model\")" "$np_claude/settings.json")" = false ]'
+
+# --with-plugin takes the other install path; it drops the pin too without the fix.
+pg_claude="$TMP/pg-claude-1235"
+mkdir -p "$pg_claude"
+printf '{"model":"claude-opus-5"}\n' > "$pg_claude/settings.json"
+HOME="$TMP/pg-home-1235" CCC_CLAUDE_DIR="$pg_claude" CCC_HERMES_DIR="$TMP/pg-hermes-1235" \
+  bash "$SETUP" --no-backup --with-plugin >/dev/null 2>&1
+ok "plugin-mode install preserves the model pin too" \
+  '[ "$(jq -r .model "$pg_claude/settings.json")" = "claude-opus-5" ]'
+
+# Dry-run must not touch the file.
+dm_claude="$TMP/dm-claude-1235"
+mkdir -p "$dm_claude"
+printf '{"model":"claude-opus-5"}\n' > "$dm_claude/settings.json"
+dm_before="$(cat "$dm_claude/settings.json")"
+out="$(HOME="$TMP/dm-home-1235" CCC_CLAUDE_DIR="$dm_claude" CCC_HERMES_DIR="$TMP/dm-hermes-1235" \
+  bash "$SETUP" --dry-run 2>&1)"
+ok "dry-run reports the preserved pin without writing" \
+  '[ "$dm_before" = "$(cat "$dm_claude/settings.json")" ] && grep -q "preserve node-local model pin" <<<"$out"'
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
