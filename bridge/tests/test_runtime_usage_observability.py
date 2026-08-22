@@ -52,6 +52,7 @@ for _name in [
     "telegram_bot.core.bot_followup_queue",
     "telegram_bot.core.claude_session_approvals",
     "telegram_bot.core.claude_session_browser",
+    "telegram_bot.core.claude_session_frame_routing",
     "telegram_bot.core.claude_session_task_tracking",
     "telegram_bot.core.claude_session_turn_events",
     "telegram_bot.core.claude_runtime_options",

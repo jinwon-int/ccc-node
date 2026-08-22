@@ -1,5 +1,12 @@
 # Changelog
 
+- **Claude session frame routing extracted (#896 slice).** The SDK reader,
+  active-versus-unsolicited frame dispatch, stable session-id observation, and
+  between-turn delivery moved unchanged from `core/claude_runtime.py` into the
+  new `core/claude_session_frame_routing.py` mixin. The existing runtime log
+  channel and composed turn/task hooks remain stable while the runtime surface
+  drops from 902 to 766 lines.
+
 - **Claude active-turn event routing extracted (#896 slice).** Stream deltas,
   assistant message boundaries, tool lifecycle pairing, terminal result/error
   normalization, and active-turn failure delivery moved unchanged from
