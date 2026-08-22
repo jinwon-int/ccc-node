@@ -1,5 +1,14 @@
 # Changelog
 
+- **Claude active-turn event routing extracted (#896 slice).** Stream deltas,
+  assistant message boundaries, tool lifecycle pairing, terminal result/error
+  normalization, and active-turn failure delivery moved unchanged from
+  `core/claude_runtime.py` into the new
+  `core/claude_session_turn_events.py` mixin. Reader-loop ownership,
+  unsolicited delivery, and background-task observation remain composed
+  through `ClaudeSession` while the runtime surface drops from 1055 to 902
+  lines.
+
 - **Claude session approval routing extracted (#896 slice).** State-contract
   checkpoint allowances, fail-closed no-route handling, active-turn approval
   dispatch, supersession checks, and body-free decision traces moved unchanged
