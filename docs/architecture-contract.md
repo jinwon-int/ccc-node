@@ -4,6 +4,9 @@
 경계를 선언하는 versioned source of truth다. `scripts/ccc_architecture_contract.py`가
 stdlib AST로 실제 import를 읽고, 선언된 금지 방향과 다른 edge를 rule 이름·source
 path·import target과 함께 실패시킨다. 소스 본문이나 런타임 payload는 출력하지 않는다.
+검사 대상은 선언된 Python root 아래의 Git-tracked regular `.py` 파일뿐이다. 따라서
+설치 트리에 남은 untracked virtualenv·cache는 결과를 바꾸지 않으며, tracked symlink나
+root 밖으로 해석되는 경로는 안전하게 fail closed한다. 검사는 Git worktree에서 실행한다.
 
 첫 계약은 #896의 단계적 분해가 provider adapter 안으로 Telegram UI 구현을 다시
 끌어들이지 못하게 한다. provider adapter는 typed runtime event를 노출하고,

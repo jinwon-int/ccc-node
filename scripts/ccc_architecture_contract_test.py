@@ -8,6 +8,7 @@ import importlib.util
 import io
 import json
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -51,6 +52,18 @@ class ArchitectureContractTest(unittest.TestCase):
         (self.pkg / "ui.py").write_text("def render(): pass\n", encoding="utf-8")
         (self.pkg / "store.py").write_text("def read(): pass\n", encoding="utf-8")
         self.contract_path = self.root / "contract.json"
+        subprocess.run(
+            ["git", "init", "-q"],
+            cwd=self.root,
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        self.track(
+            self.pkg / "__init__.py",
+            self.pkg / "ui.py",
+            self.pkg / "store.py",
+        )
 
     def tearDown(self) -> None:
         self.temp.cleanup()
@@ -58,15 +71,31 @@ class ArchitectureContractTest(unittest.TestCase):
     def write_contract(self, contract: dict[str, object] | None = None) -> None:
         self.contract_path.write_text(json.dumps(contract or _contract()), encoding="utf-8")
 
+    def track(self, *paths: Path) -> None:
+        relative_paths = [path.relative_to(self.root).as_posix() for path in paths]
+        subprocess.run(
+            ["git", "add", "--", *relative_paths],
+            cwd=self.root,
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+    def write_provider(self, content: str) -> Path:
+        path = self.pkg / "provider.py"
+        path.write_text(content, encoding="utf-8")
+        self.track(path)
+        return path
+
     def test_valid_declared_dependency_passes(self) -> None:
-        (self.pkg / "provider.py").write_text("from .store import read\n", encoding="utf-8")
+        self.write_provider("from .store import read\n")
         self.write_contract()
         result = ARCH.validate(self.root, self.contract_path)
         self.assertEqual(result.violations, ())
         self.assertEqual(result.classified_count, 3)
 
     def test_relative_import_violation_names_rule_path_and_target(self) -> None:
-        (self.pkg / "provider.py").write_text("from . import ui\n", encoding="utf-8")
+        self.write_provider("from . import ui\n")
         self.write_contract()
         result = ARCH.validate(self.root, self.contract_path)
         self.assertEqual(len(result.violations), 1)
@@ -77,7 +106,7 @@ class ArchitectureContractTest(unittest.TestCase):
         )
 
     def test_absolute_from_import_violation_resolves_child_module(self) -> None:
-        (self.pkg / "provider.py").write_text("from pkg import ui\n", encoding="utf-8")
+        self.write_provider("from pkg import ui\n")
         self.write_contract()
         result = ARCH.validate(self.root, self.contract_path)
         self.assertEqual([item.target_module for item in result.violations], ["pkg.ui"])
@@ -87,6 +116,7 @@ class ArchitectureContractTest(unittest.TestCase):
         sub.mkdir()
         (sub / "__init__.py").write_text("from . import ui\n", encoding="utf-8")
         (sub / "ui.py").write_text("def render(): pass\n", encoding="utf-8")
+        self.track(sub / "__init__.py", sub / "ui.py")
         contract = _contract()
         layers = contract["layers"]
         assert isinstance(layers, list)
@@ -98,9 +128,7 @@ class ArchitectureContractTest(unittest.TestCase):
 
     def test_cli_fails_without_printing_source_body(self) -> None:
         marker = "PRIVATE_BODY_MUST_NOT_APPEAR"
-        (self.pkg / "provider.py").write_text(
-            f"# {marker}\nfrom . import ui\n", encoding="utf-8"
-        )
+        self.write_provider(f"# {marker}\nfrom . import ui\n")
         self.write_contract()
         stderr = io.StringIO()
         with contextlib.redirect_stderr(stderr):
@@ -112,7 +140,7 @@ class ArchitectureContractTest(unittest.TestCase):
         self.assertNotIn(marker, stderr.getvalue())
 
     def test_overlapping_layer_patterns_fail_closed(self) -> None:
-        (self.pkg / "provider.py").write_text("", encoding="utf-8")
+        self.write_provider("")
         contract = _contract()
         layers = contract["layers"]
         assert isinstance(layers, list)
@@ -138,6 +166,31 @@ class ArchitectureContractTest(unittest.TestCase):
         self.write_contract(contract)
         with self.assertRaisesRegex(ARCH.ContractError, "repository-relative"):
             ARCH.load_contract(self.contract_path)
+
+    def test_untracked_venv_does_not_change_repository_counts(self) -> None:
+        self.write_provider("from .store import read\n")
+        self.write_contract()
+        baseline = ARCH.validate(self.root, self.contract_path)
+
+        site_packages = self.pkg / "venv" / "lib" / "python3.12" / "site-packages"
+        site_packages.mkdir(parents=True)
+        (site_packages / "rogue.py").write_text("from pkg import ui\n", encoding="utf-8")
+
+        installed_tree = ARCH.validate(self.root, self.contract_path)
+        self.assertEqual(installed_tree, baseline)
+        self.assertEqual(installed_tree.module_count, 4)
+        self.assertEqual(installed_tree.import_count, 1)
+
+    def test_tracked_symlink_to_outside_python_root_fails_closed(self) -> None:
+        outside = self.root / "outside.py"
+        outside.write_text("from pkg import ui\n", encoding="utf-8")
+        provider = self.pkg / "provider.py"
+        provider.symlink_to(outside)
+        self.track(provider)
+        self.write_contract()
+
+        with self.assertRaisesRegex(ARCH.ContractError, "tracked source is a symlink"):
+            ARCH.validate(self.root, self.contract_path)
 
 
 if __name__ == "__main__":
