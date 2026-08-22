@@ -1,5 +1,13 @@
 # Changelog
 
+- **Claude session approval routing extracted (#896 slice).** State-contract
+  checkpoint allowances, fail-closed no-route handling, active-turn approval
+  dispatch, supersession checks, and body-free decision traces moved unchanged
+  from `core/claude_runtime.py` into the new
+  `core/claude_session_approvals.py` mixin. `ClaudeSession` retains its method
+  and private-symbol compatibility while the runtime composition surface drops
+  from 1201 to 1055 lines.
+
 - **Claude runtime option composition extracted (#896 slice).** Request-level
   SDK options, execution-profile tool policy, curated web/MCP wiring, sandbox
   settings, and audience-scoped memory settings moved unchanged from

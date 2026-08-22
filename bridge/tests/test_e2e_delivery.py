@@ -47,6 +47,7 @@ for name in (
     "telegram_bot.core.project_chat_history",
     "telegram_bot.core.project_chat_process",
     "telegram_bot.core.project_chat_state",
+    "telegram_bot.core.claude_session_approvals",
     "telegram_bot.core.claude_session_browser",
     "telegram_bot.core.claude_session_task_tracking",
     "telegram_bot.core.claude_runtime_options",
