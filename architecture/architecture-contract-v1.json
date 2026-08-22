@@ -1,0 +1,91 @@
+{
+  "schema_version": 1,
+  "python_roots": [
+    {
+      "path": "bridge",
+      "package": "telegram_bot"
+    }
+  ],
+  "layers": [
+    {
+      "name": "presentation",
+      "module_patterns": [
+        "telegram_bot.core.bot",
+        "telegram_bot.core.bot_*",
+        "telegram_bot.core.media",
+        "telegram_bot.core.turn_notices",
+        "telegram_bot.core.ui"
+      ]
+    },
+    {
+      "name": "orchestration",
+      "module_patterns": [
+        "telegram_bot.core.continuation*",
+        "telegram_bot.core.dead_session_*",
+        "telegram_bot.core.external_wait*",
+        "telegram_bot.core.project_chat*",
+        "telegram_bot.core.request_lifecycle",
+        "telegram_bot.core.task_queue",
+        "telegram_bot.core.turn_stall",
+        "telegram_bot.core.turn_watchdog"
+      ]
+    },
+    {
+      "name": "provider_adapters",
+      "module_patterns": [
+        "telegram_bot.core.agent_runtime",
+        "telegram_bot.core.claude_runtime",
+        "telegram_bot.core.claude_runtime_options",
+        "telegram_bot.core.claude_session_*",
+        "telegram_bot.core.codex_app_server",
+        "telegram_bot.core.codex_runtime*",
+        "telegram_bot.core.crush_runtime",
+        "telegram_bot.core.piri_rpc",
+        "telegram_bot.core.piri_runtime",
+        "telegram_bot.core.provider_capabilities"
+      ]
+    },
+    {
+      "name": "domain_services",
+      "module_patterns": [
+        "telegram_bot.core.approval_*",
+        "telegram_bot.core.async_completion_event",
+        "telegram_bot.core.crash_policy",
+        "telegram_bot.core.curated_memory",
+        "telegram_bot.core.lifecycle_*",
+        "telegram_bot.core.memory_audience",
+        "telegram_bot.core.session_isolation",
+        "telegram_bot.core.session_resume",
+        "telegram_bot.core.session_scope",
+        "telegram_bot.core.state_contract",
+        "telegram_bot.core.tool_policy"
+      ]
+    },
+    {
+      "name": "gateways_sinks",
+      "module_patterns": [
+        "telegram_bot.core.agent_session_registry",
+        "telegram_bot.core.conversation_paths",
+        "telegram_bot.core.paths",
+        "telegram_bot.core.push_notifier",
+        "telegram_bot.core.restart_handoff",
+        "telegram_bot.core.task_ledger",
+        "telegram_bot.core.usage*",
+        "telegram_bot.core.webhook_nudge",
+        "telegram_bot.core.working_state_archive"
+      ]
+    }
+  ],
+  "rules": [
+    {
+      "name": "provider-adapters-do-not-import-presentation",
+      "from_layers": [
+        "provider_adapters"
+      ],
+      "forbid_layers": [
+        "presentation"
+      ],
+      "reason": "Provider adapters expose typed runtime events; Telegram UI and rendering stay in the presentation layer."
+    }
+  ]
+}

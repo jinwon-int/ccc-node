@@ -52,4 +52,5 @@ files = [
   "scripts/agent_cron_schema.py",
   "scripts/agent_cron_model.py",
   "scripts/agent_cron_repository.py",
+  "scripts/ccc_architecture_contract.py",
 ]
