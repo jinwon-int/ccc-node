@@ -350,6 +350,7 @@ class CodexDistillHonchoSinkWorker:
             lease_epoch=claimed.honcho_sink_lease_epoch, error_code=code,
         )
 
+    # ccc-side-effect: honcho.deliver_distill
     async def write_once(self, *, job_id: str) -> DistillJob:
         claimed = await asyncio.to_thread(
             self._journal.claim_honcho_sink, job_id,

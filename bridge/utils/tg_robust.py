@@ -87,6 +87,7 @@ def looks_like_pool_timeout(error: BaseException) -> bool:
     return False
 
 
+# ccc-side-effect: telegram.send_text
 async def send_with_retry(
     op_factory: Callable[[], Awaitable[Any]],
     *,

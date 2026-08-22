@@ -1,0 +1,84 @@
+{
+  "schema_version": 1,
+  "registration_roots": [
+    "bridge",
+    "scripts"
+  ],
+  "operations": [
+    {
+      "operation": "telegram.send_text",
+      "owner": "bridge delivery",
+      "registration": {
+        "kind": "python-symbol",
+        "path": "bridge/utils/tg_robust.py",
+        "symbol": "send_with_retry"
+      },
+      "external": true,
+      "idempotency": "none",
+      "idempotency_key": "none",
+      "retry_class": "conditional",
+      "ambiguous_window": "request accepted before response or process exit before caller ACK",
+      "reconcile": "manual",
+      "compensation": "delete",
+      "audit_surface": "body-free bridge diagnostics and Telegram receipt when returned",
+      "approval_boundary": "authorized bridge delivery path",
+      "recovery": {
+        "before_intent": "safe-replay",
+        "after_intent_before_call": "safe-replay",
+        "after_external_success_before_ack": "manual-review",
+        "after_ack_before_terminal": "safe-replay",
+        "duplicate_restart_replay": "manual-review"
+      }
+    },
+    {
+      "operation": "honcho.deliver_distill",
+      "owner": "memory Honcho sink worker",
+      "registration": {
+        "kind": "python-symbol",
+        "path": "bridge/memory/distill_honcho_worker.py",
+        "symbol": "CodexDistillHonchoSinkWorker.write_once"
+      },
+      "external": true,
+      "idempotency": "native",
+      "idempotency_key": "ccc-distill-<job-id> and ccc-distill-<job-id>-session",
+      "retry_class": "safe",
+      "ambiguous_window": "HTTP success before durable outbox ACK and journal completion",
+      "reconcile": "none",
+      "compensation": "none",
+      "audit_surface": "owner-only outbox plus leased distill journal status",
+      "approval_boundary": "configured memory route and Honcho enable gate",
+      "recovery": {
+        "before_intent": "safe-replay",
+        "after_intent_before_call": "safe-replay",
+        "after_external_success_before_ack": "safe-replay",
+        "after_ack_before_terminal": "safe-replay",
+        "duplicate_restart_replay": "safe-replay"
+      }
+    },
+    {
+      "operation": "self_update.apply",
+      "owner": "pre-approved node maintenance",
+      "registration": {
+        "kind": "shell-main",
+        "path": "scripts/ccc-self-update.sh",
+        "symbol": "<top-level>"
+      },
+      "external": true,
+      "idempotency": "local-ledger",
+      "idempotency_key": "old and new commit SHA plus installer generation stamps",
+      "retry_class": "conditional",
+      "ambiguous_window": "repository or installed artifacts changed before terminal audit",
+      "reconcile": "query",
+      "compensation": "restore-snapshot",
+      "audit_surface": "body-free self-update audit record and notification result",
+      "approval_boundary": "reviewed procedure plus operator-owned service allowlist",
+      "recovery": {
+        "before_intent": "safe-replay",
+        "after_intent_before_call": "safe-replay",
+        "after_external_success_before_ack": "reconcile",
+        "after_ack_before_terminal": "safe-replay",
+        "duplicate_restart_replay": "reconcile"
+      }
+    }
+  ]
+}

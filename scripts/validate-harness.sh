@@ -45,7 +45,8 @@ for f in claude/settings.base.json claude/settings.local.template.json \
          .claude-plugin/marketplace.json \
          claude/.claude-plugin/plugin.json claude/hooks/hooks.json \
          schemas/agent-cron-task-store.schema.json \
-         architecture/architecture-contract-v1.json; do
+         architecture/architecture-contract-v1.json \
+         architecture/side-effect-contract-v1.json; do
   [ -f "$f" ] || { say "  (skip $f — absent)"; continue; }
   if jq -e . "$f" >/dev/null 2>&1; then say "  ok $f"; else err "invalid JSON: $f"; fi
 done
@@ -230,6 +231,8 @@ if command -v python3 >/dev/null 2>&1; then
   if python3 -m py_compile scripts/ccc_script_interpreter_check_test.py 2>/dev/null; then say "  ok scripts/ccc_script_interpreter_check_test.py compiles"; else err "py_compile: scripts/ccc_script_interpreter_check_test.py"; fi
   if python3 -m py_compile scripts/ccc_architecture_contract.py 2>/dev/null; then say "  ok scripts/ccc_architecture_contract.py compiles"; else err "py_compile: scripts/ccc_architecture_contract.py"; fi
   if python3 -m py_compile scripts/ccc_architecture_contract_test.py 2>/dev/null; then say "  ok scripts/ccc_architecture_contract_test.py compiles"; else err "py_compile: scripts/ccc_architecture_contract_test.py"; fi
+  if python3 -m py_compile scripts/ccc_side_effect_contract.py 2>/dev/null; then say "  ok scripts/ccc_side_effect_contract.py compiles"; else err "py_compile: scripts/ccc_side_effect_contract.py"; fi
+  if python3 -m py_compile scripts/ccc_side_effect_contract_test.py 2>/dev/null; then say "  ok scripts/ccc_side_effect_contract_test.py compiles"; else err "py_compile: scripts/ccc_side_effect_contract_test.py"; fi
 else
   say "  (python3 absent — skipped)"
 fi
@@ -274,6 +277,13 @@ if python3 scripts/ccc_architecture_contract.py --repo-root . >"$TMP/architectur
 else
   err "architecture contract validation/tests failed"
   tail -10 "$TMP/architecture-contract.out" "$TMP/architecture-contract-test.out" 2>/dev/null
+fi
+if python3 scripts/ccc_side_effect_contract.py --repo-root . >"$TMP/side-effect-contract.out" 2>&1 \
+   && python3 scripts/ccc_side_effect_contract_test.py >"$TMP/side-effect-contract-test.out" 2>&1; then
+  say "  ok typed side-effect inventory and recovery drills (#872)"
+else
+  err "side-effect contract validation/tests failed"
+  tail -10 "$TMP/side-effect-contract.out" "$TMP/side-effect-contract-test.out" 2>/dev/null
 fi
 if python3 scripts/ccc_doctor_bootpath_test.py >"$TMP/doctor-bootpath-test.out" 2>&1; then
   say "  ok doctor bridge boot-path guard tests"
