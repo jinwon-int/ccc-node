@@ -16,6 +16,8 @@ from fnmatch import fnmatchcase
 import importlib.util
 import json
 from pathlib import Path, PurePosixPath
+import stat
+import subprocess
 import sys
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -196,23 +198,100 @@ def _module_name(root: PythonRoot, relative: Path) -> str:
     return root.package if not suffix else f"{root.package}.{suffix}"
 
 
+def _tracked_paths(
+    repo_root: Path, roots: Sequence[PythonRoot]
+) -> tuple[PurePosixPath, ...]:
+    command = [
+        "git",
+        "-C",
+        str(repo_root),
+        "ls-files",
+        "-z",
+        "--stage",
+        "--",
+        *(f":(top,literal){root.path}" for root in roots),
+    ]
+    try:
+        completed = subprocess.run(
+            command,
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError as exc:
+        raise ContractError("cannot enumerate tracked sources with git") from exc
+    if completed.returncode != 0:
+        raise ContractError(
+            f"cannot enumerate tracked sources (git exit {completed.returncode})"
+        )
+
+    tracked: list[PurePosixPath] = []
+    for record in completed.stdout.split(b"\0"):
+        if not record:
+            continue
+        metadata, separator, raw_path = record.partition(b"\t")
+        fields = metadata.split()
+        if not separator or len(fields) != 3:
+            raise ContractError("git returned malformed tracked source metadata")
+        try:
+            decoded = raw_path.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ContractError("tracked source path is not valid UTF-8") from exc
+        path = PurePosixPath(decoded)
+        if path.is_absolute() or ".." in path.parts:
+            raise ContractError("git returned an unsafe tracked source path")
+        if path.suffix == ".py":
+            mode = fields[0]
+            if mode == b"120000":
+                raise ContractError(f"tracked source is a symlink: {path}")
+            if mode not in {b"100644", b"100755"}:
+                raise ContractError(f"tracked source is not a regular file: {path}")
+            tracked.append(path)
+    _require_unique((path.as_posix() for path in tracked), "tracked source path")
+    return tuple(sorted(tracked, key=PurePosixPath.as_posix))
+
+
+def _tracked_regular_file(repo_root: Path, relative: PurePosixPath) -> Path:
+    candidate = repo_root
+    for part in relative.parts:
+        candidate /= part
+        try:
+            mode = candidate.lstat().st_mode
+        except OSError as exc:
+            raise ContractError(f"tracked source is unavailable: {relative}") from exc
+        if stat.S_ISLNK(mode):
+            raise ContractError(f"tracked source is a symlink: {relative}")
+    if not stat.S_ISREG(mode):
+        raise ContractError(f"tracked source is not a regular file: {relative}")
+    return candidate
+
+
 def discover_modules(repo_root: Path, contract: ArchitectureContract) -> tuple[ModuleSource, ...]:
     modules: list[ModuleSource] = []
     resolved_repo = repo_root.resolve()
+    tracked_paths = _tracked_paths(resolved_repo, contract.python_roots)
     for root in contract.python_roots:
-        source_root = (repo_root / root.path).resolve()
+        source_root = (resolved_repo / root.path).resolve()
         if not source_root.is_relative_to(resolved_repo):
             raise ContractError(f"python root escapes repository: {root.path}")
         if not source_root.is_dir():
             raise ContractError(f"python root does not exist: {root.path}")
-        for path in sorted(source_root.rglob("*.py")):
-            relative = path.relative_to(source_root)
-            repo_relative = path.relative_to(repo_root).as_posix()
+        pure_root = PurePosixPath(root.path)
+        for tracked_path in tracked_paths:
+            try:
+                pure_relative = tracked_path.relative_to(pure_root)
+            except ValueError:
+                continue
+            path = _tracked_regular_file(resolved_repo, tracked_path)
+            resolved_path = path.resolve()
+            if not resolved_path.is_relative_to(source_root):
+                raise ContractError(f"tracked source escapes python root: {tracked_path}")
+            relative = Path(*pure_relative.parts)
             modules.append(
                 ModuleSource(
                     _module_name(root, relative),
-                    repo_relative,
-                    path,
+                    tracked_path.as_posix(),
+                    resolved_path,
                     relative.name == "__init__.py",
                 )
             )
