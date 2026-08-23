@@ -1379,6 +1379,7 @@ OWNER_NOTIFY = ('telegram-owner', 'telegram-owner-on-failure')
 CHAT_NOTIFY = ('telegram-chat', 'telegram-chat-on-failure')
 
 
+# ccc-side-effect: agent_cron.spool_notify
 def write_owner_spool(task, task_id, run_id, scheduled_at, status, headless, at):
     base = notification_base(task)
     notify = task.get('notify', 'none')
