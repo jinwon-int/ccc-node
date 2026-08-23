@@ -174,6 +174,22 @@ ok "autonomy=kill drain logs skip reason" 'grep -q "\[pending-drain\] skip reaso
 ok "autonomy=kill drain retains pending jobs" \
   '[ "$(find "$STATE/distill-pending" -maxdepth 1 -type f -name "*.json" | wc -l | tr -d " ")" = "$before_jobs" ]'
 
+# Recursion guard: a child extract session exports CLAUDE_DISTILL_INFLIGHT=1.
+# Drain must honor it (not unset-and-continue) or SessionStart re-enters.
+: > "$STATE/distill.log"
+HOME="$TMP/home" CCC_STATE_DIR="$STATE" CLAUDE_DISTILL_INFLIGHT=1 bash "$DRAIN" >/dev/null 2>&1
+ok "INFLIGHT drain spawns nothing" '! grep -q "\[pending-drain\] spawned job=" "$STATE/distill.log"'
+ok "INFLIGHT drain logs skip reason" 'grep -q "\[pending-drain\] skip reason=distill-inflight" "$STATE/distill.log"'
+ok "INFLIGHT drain retains pending jobs" \
+  '[ "$(find "$STATE/distill-pending" -maxdepth 1 -type f -name "*.json" | wc -l | tr -d " ")" = "$before_jobs" ]'
+
+: > "$STATE/distill.log"
+HOME="$TMP/home" CCC_STATE_DIR="$STATE" CCC_DISTILL_PENDING_INFLIGHT_MAX=0 bash "$DRAIN" >/dev/null 2>&1
+ok "inflight-cap 0 drain spawns nothing" '! grep -q "\[pending-drain\] spawned job=" "$STATE/distill.log"'
+ok "inflight-cap 0 drain logs skip reason" 'grep -q "\[pending-drain\] skip reason=inflight-cap" "$STATE/distill.log"'
+ok "inflight-cap 0 drain retains pending jobs" \
+  '[ "$(find "$STATE/distill-pending" -maxdepth 1 -type f -name "*.json" | wc -l | tr -d " ")" = "$before_jobs" ]'
+
 : > "$STATE/distill.log"
 printf '%s\n' success > "$CLAUDE_STUB_MODE_FILE"
 HOME="$TMP/home" CCC_STATE_DIR="$STATE" CCC_AUTONOMY=dry-run bash "$DRAIN" >/dev/null 2>&1
