@@ -181,3 +181,91 @@ def test_corrupt_record_is_retained_and_diagnostic_is_body_free(
     assert rc == pending.INVALID_EXIT
     assert journal.record_path(job_id).is_file()
     assert secret not in capsys.readouterr().err
+
+
+def _write_script(path: Path, body: str) -> Path:
+    path.write_text(f"#!/usr/bin/env bash\n{body}\n", encoding="utf-8")
+    path.chmod(0o700)
+    return path
+
+
+def _fresh_created_at() -> str:
+    from datetime import datetime, timezone
+
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def test_attempts_cap_dead_letters_instead_of_backing_off(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#1250: backoff spaces retries; the cap ends them (sogyo 0->134 pile)."""
+    transcript = tmp_path / "transcript.jsonl"
+    transcript.write_text("body", encoding="utf-8")
+    journal = pending.PendingV1Journal(tmp_path / "queue")
+    journal.initialize()
+    value = dict(record(transcript), created_at=_fresh_created_at())
+    job_id, _ = journal.enqueue(value)
+    script = _write_script(tmp_path / "worker.sh", "exit 1")
+    monkeypatch.setenv("CCC_DISTILL_PENDING_MAX_ATTEMPTS", "2")
+    monkeypatch.setenv("CCC_DISTILL_PENDING_MAX_AGE_HOURS", "48")
+
+    first = pending.main(
+        ["run", str(journal.root), str(journal.record_path(job_id)), str(script)]
+    )
+
+    assert first == 1
+    assert journal.read(job_id)["fail_count"] == 1
+
+    second = pending.main(
+        ["run", str(journal.root), str(journal.record_path(job_id)), str(script)]
+    )
+
+    assert second == pending.DEAD_EXIT
+    assert not journal.record_path(job_id).is_file()
+    dead = journal.root / "dead" / f"{job_id}.json"
+    assert dead.is_file()
+    assert stat.S_IMODE(dead.stat().st_mode) == 0o600
+    assert stat.S_IMODE((journal.root / "dead").stat().st_mode) == 0o700
+    assert journal.discover_claimable(5) == ()
+
+
+def test_expired_record_dead_letters_without_running_script(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    transcript = tmp_path / "transcript.jsonl"
+    transcript.write_text("body", encoding="utf-8")
+    journal = pending.PendingV1Journal(tmp_path / "queue")
+    journal.initialize()
+    # The shared fixture timestamp (2026-08-01) is far beyond the default TTL.
+    job_id, _ = journal.enqueue(record(transcript))
+    marker = tmp_path / "script-ran"
+    script = _write_script(tmp_path / "worker.sh", f"touch {marker}")
+    monkeypatch.setenv("CCC_DISTILL_PENDING_MAX_ATTEMPTS", "5")
+    monkeypatch.setenv("CCC_DISTILL_PENDING_MAX_AGE_HOURS", "48")
+
+    rc = pending.main(["run", str(journal.root), str(journal.record_path(job_id)), str(script)])
+
+    assert rc == pending.DEAD_EXIT
+    assert not marker.exists()
+    assert not journal.record_path(job_id).is_file()
+    assert (journal.root / "dead" / f"{job_id}.json").is_file()
+
+
+def test_successful_run_still_completes_and_leaves_no_dead_letter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    transcript = tmp_path / "transcript.jsonl"
+    transcript.write_text("body", encoding="utf-8")
+    journal = pending.PendingV1Journal(tmp_path / "queue")
+    journal.initialize()
+    value = dict(record(transcript), created_at=_fresh_created_at())
+    job_id, _ = journal.enqueue(value)
+    script = _write_script(tmp_path / "worker.sh", f"exit {pending.SUCCESS_TOKEN}")
+    monkeypatch.setenv("CCC_DISTILL_PENDING_MAX_ATTEMPTS", "5")
+    monkeypatch.setenv("CCC_DISTILL_PENDING_MAX_AGE_HOURS", "48")
+
+    rc = pending.main(["run", str(journal.root), str(journal.record_path(job_id)), str(script)])
+
+    assert rc == 0
+    assert not journal.record_path(job_id).is_file()
+    assert not (journal.root / "dead").exists()
