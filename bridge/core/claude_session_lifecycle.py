@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Callable, Sequence
 import logging
 from typing import TYPE_CHECKING, cast
 
@@ -72,7 +72,9 @@ class ClaudeSessionLifecycleMixin:
     _stderr_tail: deque[str]
     _turn_lock: asyncio.Lock | None
     _fail_active_turn: Callable[[str, str], None]
-    _read_frames: Callable[["SdkClient"], Awaitable[None]]
+
+    if TYPE_CHECKING:
+        async def _read_frames(self, client: SdkClient) -> None: ...
 
     async def _start(self, client: SdkClient, *, timeout_seconds: float) -> None:
         self._client = client
