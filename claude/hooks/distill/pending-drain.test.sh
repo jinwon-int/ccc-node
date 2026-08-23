@@ -46,6 +46,9 @@ STATE="$TMP/state"
 PROJECT="$TMP/projects/-root-workspace"
 mkdir -p "$STATE" "$PROJECT" "$TMP/bin"
 touch "$STATE/distill.dryrun"
+# Existing cases assert immediate redrain after a generic extract fail.
+# Auth/quota coverage uses distill.cooldown instead of job backoff.
+export CCC_DISTILL_FAIL_BACKOFF_SEC=0
 
 make_transcript() {
   local path="$1" marker="$2"
@@ -74,6 +77,10 @@ case "$mode" in
     sleep 30
     ;;
   fail) exit 9 ;;
+  nologin)
+    printf '%s\n' 'Not logged in · Please run /login'
+    exit 1
+    ;;
   *)
     printf '%s' '{"honcho":[],"wiki_candidates":[],"resume":{"last_activity":"ok","pending_action":"","awaiting_user":false,"open_question":"","next_step":"","evidence":[]}}'
     ;;
@@ -192,12 +199,34 @@ ok "inflight-cap 0 drain retains pending jobs" \
 
 : > "$STATE/distill.log"
 printf '%s\n' success > "$CLAUDE_STUB_MODE_FILE"
-HOME="$TMP/home" CCC_STATE_DIR="$STATE" CCC_AUTONOMY=dry-run bash "$DRAIN" >/dev/null 2>&1
+HOME="$TMP/home" CCC_STATE_DIR="$STATE" CCC_DISTILL_FAIL_BACKOFF_SEC=0 \
+  CCC_AUTONOMY=dry-run bash "$DRAIN" >/dev/null 2>&1
 ok "autonomy=dry-run drain is not halted (reaches spawn)" \
   'wait_for '\''grep -q "\[pending-drain\] spawned job=" "$STATE/distill.log"'\'' && ! grep -q "skip reason=autonomy-kill" "$STATE/distill.log"'
 wait_for '[ ! -f "$failed_job" ] && grep -q "pending completed job=$failed_id" "$STATE/distill.log"'
 ok "autonomy=dry-run worker completes before fixture cleanup" \
   '[ ! -f "$failed_job" ] && grep -q "pending completed job=$failed_id" "$STATE/distill.log"'
+
+# Auth/quota failures must not be re-spawned on the next SessionStart.
+TRANSCRIPT_AUTH="$PROJECT/sess-nologin.jsonl"
+make_transcript "$TRANSCRIPT_AUTH" nologin
+printf '%s\n' nologin > "$CLAUDE_STUB_MODE_FILE"
+rm -f "$STATE/distill.cooldown" "$STATE/distill-last-error.json"
+: > "$STATE/distill.log"
+payload sess-nologin "$TRANSCRIPT_AUTH" | \
+  HOME="$TMP/home" CCC_STATE_DIR="$STATE" CCC_DISTILL_SCOPE_CWDS="/root/workspace" \
+  bash "$DISTILL" sessionend >/dev/null 2>&1
+wait_for 'grep -q "pending retained reason=pipeline-failed" "$STATE/distill.log" && [ -f "$STATE/distill.cooldown" ]'
+ok "nologin extract writes node cooldown" \
+  'jq -e ".class == \"not_logged_in\"" "$STATE/distill.cooldown" >/dev/null'
+auth_jobs="$(find "$STATE/distill-pending" -maxdepth 1 -type f -name '*.json' | wc -l | tr -d '[:space:]')"
+ok "nologin keeps the pending job" '[ "$auth_jobs" -ge 1 ]'
+: > "$STATE/distill.log"
+HOME="$TMP/home" CCC_STATE_DIR="$STATE" bash "$DRAIN" >/dev/null 2>&1
+ok "cooldown drain spawns nothing" '! grep -q "\[pending-drain\] spawned job=" "$STATE/distill.log"'
+ok "cooldown drain logs skip reason" 'grep -q "\[pending-drain\] skip reason=provider-cooldown" "$STATE/distill.log"'
+ok "cooldown drain retains pending jobs" \
+  '[ "$(find "$STATE/distill-pending" -maxdepth 1 -type f -name "*.json" | wc -l | tr -d " ")" = "$auth_jobs" ]'
 
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

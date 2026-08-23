@@ -28,6 +28,23 @@ ASSISTANT_LABEL="$(printf '%s' "${CCC_MEMORY_ASSISTANT_LABEL:-ccc-node assistant
 EXTRACT_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)" || EXTRACT_LIB_DIR="${HOME:-/root}/.claude/hooks/distill"
 # shellcheck source=claude/hooks/lib/hook-common.sh
 . "$EXTRACT_LIB_DIR/../lib/hook-common.sh" || exit 0
+# shellcheck source=claude/hooks/distill/provider-guard.sh
+. "$EXTRACT_LIB_DIR/provider-guard.sh" 2>/dev/null || true
+STATE_DIR="${CCC_STATE_DIR:-${HOME:-/root}/.claude/state}"
+
+fail_extract() {
+  local ec="${1:-1}"
+  local cls="extract_failed"
+  if declare -f ccc_distill_classify_text >/dev/null 2>&1; then
+    cls="$(ccc_distill_classify_text "${RESULT:-}")"
+  fi
+  echo "extract_error_class=$cls" >&2
+  if declare -f ccc_distill_write_last_error >/dev/null 2>&1; then
+    ccc_distill_write_last_error "$cls" "$ec"
+    ccc_distill_set_cooldown "$cls"
+  fi
+  exit 1
+}
 WIKI_ENABLED_JSON=true
 is_disabled "$WIKI_ENABLED" && WIKI_ENABLED_JSON=false
 
@@ -240,12 +257,12 @@ if [ $ec -eq 124 ]; then
   fi
   if [ $ec -ne 0 ] || [ -z "$RESULT" ]; then
     echo "claude -p timeout-retry also failed (ec=$ec) or empty" >&2
-    exit 1
+    fail_extract "$ec"
   fi
   echo "recovered on timeout retry" >&2
 elif [ $ec -ne 0 ] || [ -z "$RESULT" ]; then
   echo "claude -p attempt 1 failed (ec=$ec) or empty result" >&2
-  exit 1
+  fail_extract "$ec"
 fi
 
 CLEAN="$(try_parse "$RESULT")"
@@ -259,14 +276,16 @@ if ! printf '%s' "$CLEAN" | jq -e '.honcho and .wiki_candidates and (.resume | t
     echo "JSON-drift retry failed (ec=$ec2) or empty" >&2
     echo "--- previous attempt raw (head 1KB) ---" >&2
     printf '%s\n' "$RESULT" | head -c 1024 >&2
-    exit 1
+    RESULT="${RESULT2:-$RESULT}"
+    fail_extract "$ec2"
   fi
   CLEAN="$(try_parse "$RESULT2")"
   if ! printf '%s' "$CLEAN" | jq -e '.honcho and .wiki_candidates and (.resume | type == "object")' >/dev/null 2>&1; then
     echo "JSON-drift retry also produced non-JSON; giving up" >&2
     echo "--- retry raw (head 1KB) ---" >&2
     printf '%s\n' "$RESULT2" | head -c 1024 >&2
-    exit 1
+    RESULT="$RESULT2"
+    fail_extract 1
   fi
   echo "recovered on JSON-drift retry" >&2
 fi

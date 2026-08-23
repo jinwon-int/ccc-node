@@ -47,6 +47,16 @@ SPAWN_HELPER="$HOOKDIR/lib/spawn-detached.sh"
   && [ -r "$PENDING_ADAPTER" ] && [ -r "$SPAWN_HELPER" ] \
   || { log "skip reason=missing-runtime"; exit 0; }
 
+# shellcheck source=claude/hooks/distill/provider-guard.sh
+[ -r "$HOOKDIR/distill/provider-guard.sh" ] && . "$HOOKDIR/distill/provider-guard.sh" 2>/dev/null || true
+if declare -f ccc_distill_cooldown_class >/dev/null 2>&1; then
+  _cd_cls="$(ccc_distill_cooldown_class || true)"
+  if [ -n "${_cd_cls:-}" ]; then
+    log "skip reason=provider-cooldown class=$_cd_cls"
+    exit 0
+  fi
+fi
+
 # shellcheck source=claude/hooks/lib/spawn-detached.sh
 . "$SPAWN_HELPER"
 

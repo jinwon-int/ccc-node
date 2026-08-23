@@ -4,6 +4,16 @@ All notable changes to the Claude Code node harness. Dates are KST.
 
 ## [Unreleased]
 
+### Fixed
+- Distill no longer re-spawns extract on every SessionStart after a
+  provider login/expiry/weekly-limit failure. `extract.sh` classifies the
+  `claude -p` stdout, writes `distill-last-error.json`, and sets a node
+  `distill.cooldown`. `pending-drain.sh` and SessionEnd skip extract while
+  the cooldown is active. Failed jobs stay on disk with `retry_after` so
+  generic failures also back off instead of remaining immediately claimable.
+  #1248 stopped the SessionStart re-entry fork bomb; this stops the remaining
+  auth/quota retry storm (sogyo/gwakga/yukson 2026-08-23).
+
 ### Added
 - Claude session background-task workload tracking now lives in a focused
   mixin (#896 follow-up). The SDK typed-frame, compatibility SystemMessage,

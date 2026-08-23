@@ -49,6 +49,13 @@ HELD_EXIT = 75
 INVALID_EXIT = 74
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _PRIVATE_SCOPE_RE = re.compile(r"^private-[0-9a-f]{32}$")
+_ERROR_CLASS_RE = re.compile(r"^[a-z0-9_]{1,32}$")
+_HARD_CLASSES = {
+    "not_logged_in",
+    "oauth_expired",
+    "weekly_limit",
+    "rate_limited",
+}
 _DISABLED = {"0", "false", "FALSE", "off", "OFF", "no", "NO"}
 _MAX_TEXT = 4096
 _ENV_FIELDS = (
@@ -105,6 +112,77 @@ def _route(record: Mapping[str, Any]) -> tuple[bool, str, str]:
     return scoped, audience, scope
 
 
+def _parse_iso(value: str) -> datetime | None:
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _in_backoff(record: Mapping[str, Any], now: datetime) -> bool:
+    raw = record.get("retry_after")
+    if raw in (None, ""):
+        return False
+    if not isinstance(raw, str):
+        return True
+    parsed = _parse_iso(raw)
+    if parsed is None:
+        return True
+    return parsed > now
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name, "")
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def _retry_after_iso(error_class: str, fail_count: int) -> str:
+    from datetime import timedelta
+
+    now = datetime.now(timezone.utc)
+    if error_class == "weekly_limit":
+        delay_until = datetime(
+            now.year, now.month, now.day, 1, 0, 0, tzinfo=timezone.utc
+        )
+        if delay_until <= now:
+            delay_until = delay_until + timedelta(days=1)
+    elif error_class == "rate_limited":
+        delay_until = now + timedelta(
+            seconds=max(_env_int("CCC_DISTILL_RATE_COOLDOWN_SEC", 1800), 1)
+        )
+    elif error_class in _HARD_CLASSES:
+        delay_until = now + timedelta(
+            seconds=max(_env_int("CCC_DISTILL_AUTH_COOLDOWN_SEC", 21600), 1)
+        )
+    else:
+        base = max(_env_int("CCC_DISTILL_FAIL_BACKOFF_SEC", 900), 0)
+        cap = max(_env_int("CCC_DISTILL_FAIL_BACKOFF_CAP_SEC", 14400), 0)
+        shift = max(fail_count, 1) - 1
+        delay_until = now + timedelta(seconds=min(base * (2**shift), cap))
+    return delay_until.isoformat().replace("+00:00", "Z")
+
+
+def _error_class_from_state(pending_root: Path) -> str:
+    path = pending_root.parent / "distill-last-error.json"
+    env_dir = os.environ.get("CCC_STATE_DIR")
+    if env_dir:
+        path = Path(env_dir) / "distill-last-error.json"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return "extract_failed"
+    klass = payload.get("class") if isinstance(payload, dict) else None
+    if isinstance(klass, str) and _ERROR_CLASS_RE.fullmatch(klass):
+        return klass
+    return "extract_failed"
+
+
 def _job_id(session_id: str, transcript_hash: str) -> str:
     material = b"\0".join(
         (session_id.encode("utf-8"), transcript_hash.encode("ascii"), b"v1")
@@ -158,6 +236,18 @@ class PendingV1Journal(JsonJournalCore):
             )
         if type(record.get("dryrun")) is not int or record["dryrun"] not in {0, 1}:
             raise ValueError("invalid_dryrun")
+        if "retry_after" in record:
+            _text(record.get("retry_after"), "retry_after")
+        if "last_failed_at" in record:
+            _text(record.get("last_failed_at"), "last_failed_at")
+        if "last_error_class" in record:
+            klass = record.get("last_error_class")
+            if not isinstance(klass, str) or not _ERROR_CLASS_RE.fullmatch(klass):
+                raise ValueError("invalid_last_error_class")
+        if "fail_count" in record:
+            count = record.get("fail_count")
+            if type(count) is not int or count < 0 or count > 100000:
+                raise ValueError("invalid_fail_count")
         _route(record)
         return record
 
@@ -183,14 +273,36 @@ class PendingV1Journal(JsonJournalCore):
     def discover_claimable(self, limit: int) -> tuple[str, ...]:
         if limit <= 0:
             return ()
+        now = datetime.now(timezone.utc)
         result: list[str] = []
         # Scan beyond held jobs, but do not parse or echo corrupt record bodies.
         for record_id in self.list_record_ids():
-            if self.is_claimable(record_id):
-                result.append(record_id)
-                if len(result) == limit:
-                    break
+            if not self.is_claimable(record_id):
+                continue
+            try:
+                record = self.read(record_id)
+            except (OSError, ValueError, json.JSONDecodeError):
+                continue
+            if _in_backoff(record, now):
+                continue
+            result.append(record_id)
+            if len(result) == limit:
+                break
         return tuple(result)
+
+    def mark_retry(self, record_id: str, error_class: str) -> None:
+        record = self.read(record_id)
+        fail_count = int(record.get("fail_count") or 0) + 1
+        record["fail_count"] = fail_count
+        record["last_error_class"] = error_class
+        record["last_failed_at"] = datetime.now(timezone.utc).isoformat().replace(
+            "+00:00", "Z"
+        )
+        record["retry_after"] = _retry_after_iso(error_class, fail_count)
+        with self._exclusive():
+            self._write_json_unlocked(
+                record_id, self.validate_record(record_id, record)
+            )
 
 
 def _record_from_environment() -> dict[str, Any]:
@@ -314,6 +426,7 @@ def _run(args: argparse.Namespace) -> int:
             check=False,
         )
         if result.returncode != SUCCESS_TOKEN:
+            journal.mark_retry(record_id, _error_class_from_state(journal.root))
             return 1
         journal.complete_claimed(record_id)
         return 0

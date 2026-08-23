@@ -93,6 +93,10 @@ case "$mode" in
   timeout)
     if [ "$count" = 1 ]; then sleep 5; else printf '{"honcho":[],"wiki_candidates":[],"resume":{"last_activity":"","pending_action":"","awaiting_user":false,"open_question":"","next_step":"","evidence":[]}}'; fi
     ;;
+  nologin)
+    printf 'Not logged in · Please run /login\n'
+    exit 1
+    ;;
   wiki)
     printf '{"honcho":[{"kind":"context","text":"external owner fact","subject":"user"}],"wiki_candidates":[{"title":"must disappear","suggested_path":"pages/log.md","summary":"x","evidence_excerpt":"x"}],"resume":{"last_activity":"ok","pending_action":"","awaiting_user":false,"open_question":"","next_step":"","evidence":[]}}'
     ;;
@@ -118,6 +122,8 @@ SH
 run_extract() {
   local transcript="$1" mode="$2" timeout_s="${3:-4}"
   install_stub "$mode"
+  mkdir -p "$TMP/state"
+  export CCC_STATE_DIR="$TMP/state"
   export CLAUDE_DISTILL_TRANSCRIPT="$transcript"
   export CLAUDE_DISTILL_SESSION="sess-test"
   export CLAUDE_DISTILL_TRIGGER="manual"
@@ -171,6 +177,12 @@ ok "timeout retry logs recovery" 'grep -q "recovered on timeout retry" "$TMP/std
 ok "timeout retry invokes claude twice" '[ "$(cat "$TMP/count-timeout")" = 2 ]'
 ok "timeout retry preserves deny-all tool policy" \
   'argv_is_deny_all "$TMP/args-timeout.txt" 2 && tool_env_is_unset "$TMP/tool-env-timeout.txt" 2'
+
+run_extract "$TRANSCRIPT" nologin
+ok "nologin extract exits 1" '[ "$rc" = 1 ]'
+ok "nologin extract classifies not_logged_in" 'grep -q "extract_error_class=not_logged_in" "$TMP/stderr-nologin"'
+ok "nologin extract writes last-error" 'jq -e ".class == \"not_logged_in\"" "$TMP/state/distill-last-error.json" >/dev/null'
+ok "nologin extract sets node cooldown" 'jq -e ".class == \"not_logged_in\" and .until" "$TMP/state/distill.cooldown" >/dev/null'
 
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
