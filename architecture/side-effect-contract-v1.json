@@ -79,6 +79,31 @@
         "after_ack_before_terminal": "safe-replay",
         "duplicate_restart_replay": "reconcile"
       }
+    },
+    {
+      "operation": "agent_cron.spool_notify",
+      "owner": "agent-cron owner notification",
+      "registration": {
+        "kind": "python-symbol",
+        "path": "scripts/agent_cron.py",
+        "symbol": "write_owner_spool"
+      },
+      "external": true,
+      "idempotency": "local-ledger",
+      "idempotency_key": "agent-cron:<task-id>:<run-id>:<status>",
+      "retry_class": "conditional",
+      "ambiguous_window": "spool file created before lastRunAt/runHistory ACK",
+      "reconcile": "receipt",
+      "compensation": "delete",
+      "audit_surface": "body-free spool path and redacted owner text envelope",
+      "approval_boundary": "notify=telegram-owner or allowlisted telegram-chat",
+      "recovery": {
+        "before_intent": "safe-replay",
+        "after_intent_before_call": "safe-replay",
+        "after_external_success_before_ack": "reconcile",
+        "after_ack_before_terminal": "safe-replay",
+        "duplicate_restart_replay": "reconcile"
+      }
     }
   ]
 }

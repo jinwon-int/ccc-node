@@ -109,6 +109,64 @@ class SideEffectContractTest(unittest.TestCase):
     def validate(self):  # type: ignore[no-untyped-def]
         return CONTRACT.validate(self.root, self.contract_path, self.document_path)
 
+    def test_checked_in_production_matrix_has_twenty_deterministic_drills(self) -> None:
+        repo = Path(__file__).resolve().parents[1]
+        contract = CONTRACT.load_contract(repo / "architecture/side-effect-contract-v1.json")
+        observations = CONTRACT.run_recovery_drills(contract)
+        self.assertEqual(
+            [item.operation for item in contract.operations],
+            [
+                "telegram.send_text",
+                "honcho.deliver_distill",
+                "self_update.apply",
+                "agent_cron.spool_notify",
+            ],
+        )
+        self.assertEqual(len(observations), 20)
+        by_op = {
+            operation.operation: {
+                item.boundary: item for item in observations if item.operation == operation.operation
+            }
+            for operation in contract.operations
+        }
+        telegram_ambiguous = by_op["telegram.send_text"][
+            CONTRACT.RecoveryBoundary.AFTER_EXTERNAL_SUCCESS_BEFORE_ACK
+        ]
+        self.assertEqual(telegram_ambiguous.action.value, "manual-review")
+        self.assertEqual(telegram_ambiguous.attempts, 1)
+        self.assertFalse(telegram_ambiguous.ack_recorded)
+        honcho_dup = by_op["honcho.deliver_distill"][
+            CONTRACT.RecoveryBoundary.DUPLICATE_RESTART_REPLAY
+        ]
+        self.assertEqual(honcho_dup.action.value, "safe-replay")
+        self.assertEqual(honcho_dup.attempts, 2)
+        self.assertEqual(honcho_dup.unique_effects, 1)
+        cron_ambiguous = by_op["agent_cron.spool_notify"][
+            CONTRACT.RecoveryBoundary.AFTER_EXTERNAL_SUCCESS_BEFORE_ACK
+        ]
+        self.assertEqual(cron_ambiguous.action.value, "reconcile")
+        self.assertEqual(cron_ambiguous.attempts, 1)
+        self.assertTrue(cron_ambiguous.ack_recorded)
+
+    def test_compensate_fixture_undoes_the_unacked_effect(self) -> None:
+        operation = _operation()
+        operation["idempotency"] = "none"
+        operation["idempotency_key"] = "none"
+        operation["retry_class"] = "conditional"
+        operation["reconcile"] = "none"
+        operation["compensation"] = "delete"
+        recovery = operation["recovery"]
+        assert isinstance(recovery, dict)
+        recovery["after_external_success_before_ack"] = "compensate"
+        recovery["duplicate_restart_replay"] = "compensate"
+        self.contract_path.write_text(json.dumps(_contract(operation)), encoding="utf-8")
+        contract = CONTRACT.load_contract(self.contract_path)
+        ambiguous = CONTRACT.run_recovery_drills(contract)[2]
+        self.assertEqual(ambiguous.action.value, "compensate")
+        self.assertEqual(ambiguous.attempts, 1)
+        self.assertEqual(ambiguous.unique_effects, 0)
+        self.assertTrue(ambiguous.ack_recorded)
+
     def test_valid_contract_runs_five_deterministic_fake_sink_drills(self) -> None:
         self.write_contract()
         result = self.validate()

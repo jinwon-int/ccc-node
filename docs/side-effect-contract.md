@@ -31,6 +31,7 @@ exactly-once를 주장하지 않으며 실제 Telegram, Honcho, self-update를 �
 | `telegram.send_text` | bridge delivery | none: `none` | conditional | request accepted before response or process exit before caller ACK | manual | delete | body-free bridge diagnostics and Telegram receipt when returned | authorized bridge delivery path | `bridge/utils/tg_robust.py::send_with_retry` |
 | `honcho.deliver_distill` | memory Honcho sink worker | native: `ccc-distill-<job-id> and ccc-distill-<job-id>-session` | safe | HTTP success before durable outbox ACK and journal completion | none | none | owner-only outbox plus leased distill journal status | configured memory route and Honcho enable gate | `bridge/memory/distill_honcho_worker.py::CodexDistillHonchoSinkWorker.write_once` |
 | `self_update.apply` | pre-approved node maintenance | local-ledger: `old and new commit SHA plus installer generation stamps` | conditional | repository or installed artifacts changed before terminal audit | query | restore-snapshot | body-free self-update audit record and notification result | reviewed procedure plus operator-owned service allowlist | `scripts/ccc-self-update.sh::<top-level>` |
+| `agent_cron.spool_notify` | agent-cron owner notification | local-ledger: `agent-cron:<task-id>:<run-id>:<status>` | conditional | spool file created before lastRunAt/runHistory ACK | receipt | delete | body-free spool path and redacted owner text envelope | notify=telegram-owner or allowlisted telegram-chat | `scripts/agent_cron.py::write_owner_spool` |
 
 ### Deterministic recovery matrix
 
@@ -39,9 +40,11 @@ exactly-once를 주장하지 않으며 실제 Telegram, Honcho, self-update를 �
 | `telegram.send_text` | safe-replay | safe-replay | manual-review | safe-replay | manual-review |
 | `honcho.deliver_distill` | safe-replay | safe-replay | safe-replay | safe-replay | safe-replay |
 | `self_update.apply` | safe-replay | safe-replay | reconcile | safe-replay | reconcile |
+| `agent_cron.spool_notify` | safe-replay | safe-replay | reconcile | safe-replay | reconcile |
 <!-- ccc-side-effect-contract:end -->
 
 초기 범위는 이슈 #872의 제안 순서에 따라 Telegram text delivery, Honcho distill
-delivery, self-update apply 세 효과다. edit/delete, Wiki handoff, external-wait,
-agent-cron, autosave, service lifecycle, GitHub write는 후속 inventory 확장 때 같은
-marker와 policy gate로 추가한다.
+delivery, self-update apply였고, 이번 슬라이스가 agent-cron owner spool을 같은
+marker와 policy gate로 추가한다. 실제 Telegram 전송은 계속 `telegram.send_text`다.
+Wiki handoff, external-wait, autosave, service lifecycle, GitHub write는 후속
+inventory 확장 때 같은 방식으로 추가한다.
