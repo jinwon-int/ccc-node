@@ -5,21 +5,34 @@
 # workers, never waits for provider I/O, and leaves every job on disk until its
 # worker completes successfully. Per-job locking in distill.sh prevents a live
 # SessionEnd worker and a recovery worker from processing the same job at once.
+#
+# Recursion guard: extract/recovery children export CLAUDE_DISTILL_INFLIGHT=1.
+# Honor that flag and exit before unsetting it. Unsetting first made every
+# child SessionStart re-enter this launcher (sogyo 2026-08-23 storm).
 set -uo pipefail
 
-unset CLAUDE_DISTILL_INFLIGHT
 umask 077
 
 STATE_DIR="${CCC_STATE_DIR:-${HOME:-/root}/.claude/state}"
 LOG="$STATE_DIR/distill.log"
 PENDING_DIR="$STATE_DIR/distill-pending"
 MAX_BATCH="${CCC_DISTILL_PENDING_DRAIN_BATCH:-3}"
+MAX_INFLIGHT="${CCC_DISTILL_PENDING_INFLIGHT_MAX:-3}"
 
 case "$MAX_BATCH" in ''|*[!0-9]*) MAX_BATCH=3 ;; esac
+case "$MAX_INFLIGHT" in ''|*[!0-9]*) MAX_INFLIGHT=3 ;; esac
 [ "$MAX_BATCH" -gt 0 ] || exit 0
 mkdir -p "$STATE_DIR" 2>/dev/null || exit 0
 
 log() { printf '%s [pending-drain] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" 2>/dev/null >> "$LOG" || :; }
+
+if [ -n "${CLAUDE_DISTILL_INFLIGHT:-}" ]; then
+  log "skip reason=distill-inflight"
+  exit 0
+fi
+
+# Workers must not inherit a stray inflight flag (distill.sh short-circuits).
+unset CLAUDE_DISTILL_INFLIGHT
 
 [ -d "$PENDING_DIR" ] || exit 0
 [ ! -L "$PENDING_DIR" ] || { log "skip reason=pending-dir-symlink"; exit 0; }
@@ -58,6 +71,24 @@ fi
 run_pending_job() {
   bash "$PENDING_WORKER" "${1:?}" "${2:?}" "${3:?}"
 }
+
+# Global cap across concurrent SessionStarts. Held claim locks == live workers
+# in this STATE_DIR (flock releases on death, so stale files do not count).
+held=0
+shopt -s nullglob
+for lock in "$PENDING_DIR"/*.json.lock; do
+  [ -e "$lock" ] || continue
+  if ! flock -n "$lock" true 2>/dev/null; then
+    held=$((held + 1))
+  fi
+done
+shopt -u nullglob
+slots=$((MAX_INFLIGHT - held))
+if [ "$slots" -le 0 ]; then
+  log "skip reason=inflight-cap held=$held max=$MAX_INFLIGHT"
+  exit 0
+fi
+[ "$MAX_BATCH" -le "$slots" ] || MAX_BATCH="$slots"
 
 started=0
 while IFS= read -r job; do
