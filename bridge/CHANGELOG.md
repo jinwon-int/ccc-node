@@ -1,5 +1,13 @@
 # Changelog
 
+- **Claude session lifecycle extracted (#896 slice).** Session `_start`,
+  single-flight `close` / `_begin_close` / `_finish_close`, stderr sink, and
+  body-free `transport_diagnostics` moved unchanged from
+  `core/claude_runtime.py` into the new `core/claude_session_lifecycle.py`
+  mixin. `_classify_cli_stderr` moves with the diagnostics and stays
+  importable from `claude_runtime` for existing tests. `ClaudeSession`
+  composes the mixin (`claude_runtime.py` 560 → 404 lines).
+
 - **Claude delegated-task ledger extracted (#896 slice).** Result-deferring
   task normalization (`_delegated_task_change`), lifecycle events, and the
   `_observe_result_deferring_task` ledger moved unchanged from
