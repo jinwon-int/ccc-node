@@ -1,5 +1,13 @@
 # Changelog
 
+- **Claude session turn admission extracted (#896 slice).** `send_turn`,
+  `interrupt`, and `abort_stalled_turn` moved unchanged from
+  `core/claude_runtime.py` into the new `core/claude_session_turn_admission.py`
+  mixin. `_ActiveTurn` stays on the runtime module (tests import it there);
+  the mixin late-imports that type to avoid a load-time cycle. Session close,
+  frame routing, and delegated-task observation remain composed through
+  `ClaudeSession` (`claude_runtime.py` 766 → 660 lines).
+
 - **Claude session frame routing extracted (#896 slice).** The SDK reader,
   active-versus-unsolicited frame dispatch, stable session-id observation, and
   between-turn delivery moved unchanged from `core/claude_runtime.py` into the
