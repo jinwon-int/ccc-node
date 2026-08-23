@@ -8,6 +8,7 @@ from pydantic import SecretStr
 
 from telegram_bot.core import web_mcp
 from telegram_bot.core.web_mcp import (
+    FIRECRAWL_DEVELOPER_SEARCH_TOOL,
     FIRECRAWL_SCRAPE_TOOL,
     FIRECRAWL_SEARCH_TOOL,
     SEARXNG_FETCH_TOOL,
@@ -41,10 +42,14 @@ def test_curated_web_mcp_is_off_by_default(tmp_path: Path) -> None:
     assert build_curated_web_mcp(_settings(tmp_path, "off")) is None
 
 
-def test_curated_web_mcp_builds_only_search_and_scrape(tmp_path: Path) -> None:
+def test_curated_web_mcp_builds_search_scrape_and_developer_index(tmp_path: Path) -> None:
     options = build_curated_web_mcp(_settings(tmp_path))
     assert options is not None
-    assert options["allowed_tools"] == [SEARXNG_SEARCH_TOOL, FIRECRAWL_SCRAPE_TOOL]
+    assert options["allowed_tools"] == [
+        SEARXNG_SEARCH_TOOL,
+        FIRECRAWL_SCRAPE_TOOL,
+        FIRECRAWL_DEVELOPER_SEARCH_TOOL,
+    ]
     assert options["disallowed_tools"] == [
         "WebSearch",
         "WebFetch",
@@ -58,10 +63,16 @@ def test_curated_web_mcp_builds_only_search_and_scrape(tmp_path: Path) -> None:
     assert options["process_env"] == {"FIRECRAWL_API_KEY": "fc-test-secret"}
 
 
-def test_firecrawl_mode_builds_search_and_scrape_without_searxng(tmp_path: Path) -> None:
+def test_firecrawl_mode_builds_search_scrape_and_developer_without_searxng(
+    tmp_path: Path,
+) -> None:
     options = build_curated_web_mcp(_settings(tmp_path, "firecrawl"))
     assert options is not None
-    assert options["allowed_tools"] == [FIRECRAWL_SEARCH_TOOL, FIRECRAWL_SCRAPE_TOOL]
+    assert options["allowed_tools"] == [
+        FIRECRAWL_SEARCH_TOOL,
+        FIRECRAWL_SCRAPE_TOOL,
+        FIRECRAWL_DEVELOPER_SEARCH_TOOL,
+    ]
     assert options["disallowed_tools"] == [
         "WebSearch",
         "WebFetch",

@@ -32,6 +32,7 @@ The managed set is:
 | `gh-ci-wait` | Durable GitHub CI wait registration (sourced from `skills/shared/`) |
 | `fleet-disk-constraint-triage` | Fleet disk audit and node-local cleanup delegation (sourced from `skills/shared/`) |
 | `gh-pr-flow` | Exact-head protected PR review and normal squash merge |
+| `web-routing` | SearXNG search, Firecrawl URL scrape, and Developer Index routing |
 
 Managed skills are sourced from `codex/skills/` (Codex-adapted ports) or, when
 the shared text is already runtime-clean, directly from `skills/shared/` — the

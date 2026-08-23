@@ -72,6 +72,11 @@
       "codex_skill": "gh-ci-wait"
     },
     {
+      "pattern": "skills/shared/web-routing/**",
+      "compatibility": "adapted",
+      "codex_skill": "web-routing"
+    },
+    {
       "pattern": "claude/skills/gh-pr-flow/**",
       "compatibility": "adapted",
       "codex_skill": "gh-pr-flow"
@@ -177,6 +182,10 @@
     {
       "name": "gh-pr-flow",
       "source": "codex/skills/gh-pr-flow"
+    },
+    {
+      "name": "web-routing",
+      "source": "skills/shared/web-routing"
     }
   ]
 }

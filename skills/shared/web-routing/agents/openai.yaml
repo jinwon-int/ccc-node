@@ -1,0 +1,4 @@
+interface:
+  display_name: "Fleet Web Routing"
+  short_description: "SearXNG search and Firecrawl fetch/developer routing"
+  default_prompt: "Use $web-routing to route general search to SearXNG, known-URL reads to Firecrawl scrape, and developer artifact questions to Firecrawl Developer Index."

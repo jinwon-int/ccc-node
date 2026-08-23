@@ -256,7 +256,7 @@ ok "reinstall replaces hook-tree inodes and keeps them executable" \
 ok "atomic staging leaves no hidden temp files behind" \
   '[ -z "$(find "$rewrite_claude" -name ".*.??????" 2>/dev/null)" ]'
 ok "setup installs the Piri web skill when a Piri agent dir exists" \
-  '[ -f "$TMP/rewrite-home/.piri/agent/skills/web/SKILL.md" ] && [ -x "$TMP/rewrite-home/.piri/agent/skills/web/web_search.py" ] && [ -x "$TMP/rewrite-home/.piri/agent/skills/web/web_fetch.py" ] && cmp -s "$ROOT/piri/skills/web/web_search.py" "$TMP/rewrite-home/.piri/agent/skills/web/web_search.py"'
+  '[ -f "$TMP/rewrite-home/.piri/agent/skills/web/SKILL.md" ] && [ -x "$TMP/rewrite-home/.piri/agent/skills/web/web_search.py" ] && [ -x "$TMP/rewrite-home/.piri/agent/skills/web/web_fetch.py" ] && [ -x "$TMP/rewrite-home/.piri/agent/skills/web/web_developer.py" ] && cmp -s "$ROOT/piri/skills/web/web_search.py" "$TMP/rewrite-home/.piri/agent/skills/web/web_search.py"'
 # Repo skills install as refreshed copies from the claude + shared trees, with
 # a manifest-driven prune for skills the repo no longer ships. Real dirs only
 # — the managed-artifact guard refuses symlinks by design (harness_paths.py).

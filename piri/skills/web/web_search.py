@@ -5,9 +5,7 @@ Usage: web-search.py <query> [--limit N]
 
 Environment:
   SEARXNG_URL        comma-separated SearXNG base URLs, tried in order
-                     (default http://127.0.0.1:8888). Fleet piri nodes whose
-                     IP is engine-blocked fall back to bangtong's instance
-                     over Tailscale (http://100.80.237.12:8889).
+                     (default: Seoseo's canonical Tailnet endpoint).
   WEB_SEARCH_LIMIT   default result count (default 5, hard max 10)
 
 Output is plain text: one numbered block per result (title / url / snippet).
@@ -24,7 +22,7 @@ import sys
 import urllib.parse
 import urllib.request
 
-DEFAULT_URL = "http://127.0.0.1:8888"
+DEFAULT_URL = "https://vps4.tail1546e7.ts.net:18443"
 MAX_LIMIT = 10
 MAX_SNIPPET = 280
 TIMEOUT = 15
