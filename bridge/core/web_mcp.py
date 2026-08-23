@@ -1,4 +1,4 @@
-"""Curated SearXNG search + Firecrawl fetch routing for the Claude bridge."""
+"""Curated SearXNG search + Firecrawl fetch/developer routing for Claude."""
 
 from __future__ import annotations
 
@@ -15,6 +15,7 @@ SEARXNG_SEARCH_TOOL = "mcp__searxng__searxng_web_search"
 SEARXNG_FETCH_TOOL = "mcp__searxng__web_url_read"
 FIRECRAWL_SCRAPE_TOOL = "mcp__firecrawl__firecrawl_scrape"
 FIRECRAWL_SEARCH_TOOL = "mcp__firecrawl__firecrawl_search"
+FIRECRAWL_DEVELOPER_SEARCH_TOOL = "mcp__firecrawl__firecrawl_developer_search"
 NATIVE_WEB_TOOLS = ("WebSearch", "WebFetch")
 
 WEB_ROUTING_PROMPT = """
@@ -24,8 +25,11 @@ WEB_ROUTING_PROMPT = """
 - For every web search, use `mcp__searxng__searxng_web_search`.
 - For every known-URL fetch, read, scrape, or extraction, use
   `mcp__firecrawl__firecrawl_scrape`.
-- Claude's built-in WebSearch/WebFetch, Firecrawl search, and SearXNG URL fetch
-  are unavailable in this mode. Do not claim that you used them.
+- For public developer artifacts (documentation, repository READMEs, issues,
+  and merged pull requests), use
+  `mcp__firecrawl__firecrawl_developer_search`.
+- Claude's built-in WebSearch/WebFetch, Firecrawl general search, and SearXNG
+  URL fetch are unavailable in this mode. Do not claim that you used them.
 """
 
 FIRECRAWL_ROUTING_PROMPT = """
@@ -35,6 +39,9 @@ FIRECRAWL_ROUTING_PROMPT = """
 - For every web search, use `mcp__firecrawl__firecrawl_search`.
 - For every known-URL fetch, read, scrape, or extraction, use
   `mcp__firecrawl__firecrawl_scrape`.
+- For public developer artifacts (documentation, repository READMEs, issues,
+  and merged pull requests), use
+  `mcp__firecrawl__firecrawl_developer_search`.
 - Claude's built-in WebSearch/WebFetch and SearXNG are unavailable in this
   mode. Do not claim that you used them.
 """
@@ -107,7 +114,11 @@ def build_curated_web_mcp(settings: Any) -> dict[str, Any] | None:
         return {
             "mcp_servers": {"firecrawl": _stdio_server("firecrawl-mcp")},
             "process_env": {"FIRECRAWL_API_KEY": firecrawl_key},
-            "allowed_tools": [FIRECRAWL_SEARCH_TOOL, FIRECRAWL_SCRAPE_TOOL],
+            "allowed_tools": [
+                FIRECRAWL_SEARCH_TOOL,
+                FIRECRAWL_SCRAPE_TOOL,
+                FIRECRAWL_DEVELOPER_SEARCH_TOOL,
+            ],
             "disallowed_tools": [
                 *NATIVE_WEB_TOOLS,
                 SEARXNG_SEARCH_TOOL,
@@ -127,7 +138,11 @@ def build_curated_web_mcp(settings: Any) -> dict[str, Any] | None:
             "firecrawl": _stdio_server("firecrawl-mcp"),
         },
         "process_env": {"FIRECRAWL_API_KEY": firecrawl_key},
-        "allowed_tools": [SEARXNG_SEARCH_TOOL, FIRECRAWL_SCRAPE_TOOL],
+        "allowed_tools": [
+            SEARXNG_SEARCH_TOOL,
+            FIRECRAWL_SCRAPE_TOOL,
+            FIRECRAWL_DEVELOPER_SEARCH_TOOL,
+        ],
         "disallowed_tools": [
             *NATIVE_WEB_TOOLS,
             SEARXNG_FETCH_TOOL,
