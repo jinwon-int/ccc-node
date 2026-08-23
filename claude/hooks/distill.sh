@@ -51,6 +51,8 @@ if [ -f "$STATE_DIR/distill.disabled" ]; then
     "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${1:-unknown}" 2>/dev/null >> "$LOG" || :
   exit 0
 fi
+# shellcheck source=claude/hooks/distill/provider-guard.sh
+[ -r "$DISTILL_LIB_DIR/distill/provider-guard.sh" ] && . "$DISTILL_LIB_DIR/distill/provider-guard.sh" 2>/dev/null || true
 
 # ---- fleet autonomy guard (#386) -------------------------------------------
 # Resolved once, above this layer's own toggles, and honored on every entry path
@@ -117,7 +119,14 @@ run_bg_pipeline() {
   PIPE_PID="${BASHPID:-$$}"
   elapsed_s() { now="$(date -u +%s)"; printf '%s' "$((now - PIPE_START_EPOCH))"; }
 
-  local EXTRACT_OUT ec
+  local EXTRACT_OUT ec cooldown_cls
+  if declare -f ccc_distill_cooldown_class >/dev/null 2>&1; then
+    cooldown_cls="$(ccc_distill_cooldown_class || true)"
+    if [ -n "${cooldown_cls:-}" ]; then
+      log "extract skipped reason=provider-cooldown class=$cooldown_cls trigger=$TRIGGER pid=$PIPE_PID"
+      return 1
+    fi
+  fi
   EXTRACT_OUT="$(bash "$HOOKDIR/distill/extract.sh" 2>>"$LOG")"
   ec=$?
   if [ $ec -ne 0 ] || [ -z "$EXTRACT_OUT" ]; then
@@ -300,6 +309,14 @@ else
   log "enqueue dedup job=$JOB_ID trigger=$TRIGGER"
 fi
 export CLAUDE_DISTILL_JOB="$PENDING_JOB"
+
+if declare -f ccc_distill_cooldown_class >/dev/null 2>&1; then
+  _cd_cls="$(ccc_distill_cooldown_class || true)"
+  if [ -n "${_cd_cls:-}" ]; then
+    log "skip spawn reason=provider-cooldown class=$_cd_cls job=$JOB_ID"
+    exit 0
+  fi
+fi
 
 # Prefer `setsid`: a plain disowned subshell stays in the hook's process
 # group/session, so when the parent session is torn down as a group (ssh-driven
