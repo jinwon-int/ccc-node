@@ -47,6 +47,7 @@ SCHEMA = "ccc.distill.pending.v1"
 SUCCESS_TOKEN = 76
 HELD_EXIT = 75
 INVALID_EXIT = 74
+DEAD_EXIT = 73
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _PRIVATE_SCOPE_RE = re.compile(r"^private-[0-9a-f]{32}$")
 _ERROR_CLASS_RE = re.compile(r"^[a-z0-9_]{1,32}$")
@@ -140,6 +141,46 @@ def _env_int(name: str, default: int) -> int:
         return int(raw)
     except ValueError:
         return default
+
+
+def _max_attempts() -> int:
+    # sogyo 2026-08-23: without a cap, jobs failing on a persistent provider
+    # outage retried forever and the journal piled 0 -> 134 in 19h. Backoff
+    # (#1253) spaces retries out; this cap ends them.
+    value = _env_int("CCC_DISTILL_PENDING_MAX_ATTEMPTS", 5)
+    return value if value > 0 else 5
+
+
+def _max_age_hours() -> float:
+    raw = os.environ.get("CCC_DISTILL_PENDING_MAX_AGE_HOURS", "")
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return 48.0
+    return value if value > 0 else 48.0
+
+
+def _record_age_hours(record: Mapping[str, Any]) -> float | None:
+    """Age in hours, or None when created_at is missing/unparseable.
+
+    Fail-open on purpose: a malformed timestamp must not dead-letter a
+    processable job.
+    """
+    created = record.get("created_at")
+    if not isinstance(created, str) or not created:
+        return None
+    stamp = _parse_iso(created)
+    if stamp is None:
+        return None
+    return (datetime.now(timezone.utc) - stamp).total_seconds() / 3600.0
+
+
+def _fsync_dir(path: Path) -> None:
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0))
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
 
 def _retry_after_iso(error_class: str, fail_count: int) -> str:
@@ -304,6 +345,35 @@ class PendingV1Journal(JsonJournalCore):
                 record_id, self.validate_record(record_id, record)
             )
 
+    def dead_letter_claimed(self, record_id: str) -> Path:
+        """Move a claimed record out of the claimable set into ``dead/``.
+
+        Dead-lettering is deliberate and loud (caller logs + exit code); the
+        record body is preserved for postmortem instead of being silently
+        dropped, mirroring the canary's no-silent-discard rule.
+        """
+        with self._exclusive():
+            dead_dir = self.root / "dead"
+            if dead_dir.is_symlink():
+                raise ValueError("dead_letter_symlink")
+            if not dead_dir.exists():
+                dead_dir.mkdir(mode=0o700)
+                os.chmod(dead_dir, 0o700)
+            source = self.record_path(record_id)
+            self._validate_regular_file(source)
+            target = dead_dir / source.name
+            if target.exists() or target.is_symlink():
+                raise ValueError("dead_letter_collision")
+            os.replace(source, target)
+            os.chmod(target, 0o600)
+            try:
+                self.claim_path(record_id).unlink()
+            except FileNotFoundError:
+                pass
+            _fsync_dir(dead_dir)
+            _fsync_dir(self.root)
+            return target
+
 
 def _record_from_environment() -> dict[str, Any]:
     transcript_path = os.environ.get("CLAUDE_DISTILL_TRANSCRIPT", "")
@@ -412,6 +482,11 @@ def _run(args: argparse.Namespace) -> int:
         if not claimed:
             return HELD_EXIT
         record = journal.read(record_id)
+        age = _record_age_hours(record)
+        if age is not None and age > _max_age_hours():
+            journal.dead_letter_claimed(record_id)
+            print("pending-journal: dead_lettered reason=ttl", file=sys.stderr)
+            return DEAD_EXIT
         if _transcript_hash(str(record["transcript_path"])) != record["transcript_sha256"]:
             raise ValueError("transcript_changed")
         script = Path(args.script)
@@ -426,6 +501,15 @@ def _run(args: argparse.Namespace) -> int:
             check=False,
         )
         if result.returncode != SUCCESS_TOKEN:
+            # fail_count+1 is what mark_retry would write; at the cap the job
+            # dead-letters instead of earning yet another backoff cycle.
+            if int(record.get("fail_count") or 0) + 1 >= _max_attempts():
+                journal.dead_letter_claimed(record_id)
+                print(
+                    "pending-journal: dead_lettered reason=max_attempts",
+                    file=sys.stderr,
+                )
+                return DEAD_EXIT
             journal.mark_retry(record_id, _error_class_from_state(journal.root))
             return 1
         journal.complete_claimed(record_id)

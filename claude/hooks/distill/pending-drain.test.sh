@@ -137,10 +137,19 @@ recovered_job_complete() {
     grep -q "pending completed job=" "$STATE/distill.log"
 }
 
+# Healthy-node fixtures for the #1250 load gate: drains that must reach spawn
+# point at these instead of the host's real /proc, so a loaded operator
+# machine cannot flip spawn-expecting assertions (#1023-class flake).
+printf '0.10 0.20 0.30 1/100 1234\n' > "$TMP/loadavg.cool"
+printf 'MemTotal: 3888888 kB\nMemAvailable: 3000000 kB\nSwapTotal: 2097152 kB\nSwapFree: 2000000 kB\n' > "$TMP/meminfo.ok"
+
 printf '%s\n' success > "$CLAUDE_STUB_MODE_FILE"
 HOME="$TMP/home" CCC_STATE_DIR="$STATE" \
   CCC_MEMORY_AUDIENCE_SCOPED=1 CCC_MEMORY_AUDIENCE=private \
   CCC_MEMORY_SCOPE="private-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" \
+  CCC_DISTILL_PENDING_NPROC=3 \
+  CCC_DISTILL_PENDING_LOADAVG_PATH="$TMP/loadavg.cool" \
+  CCC_DISTILL_PENDING_MEMINFO_PATH="$TMP/meminfo.ok" \
   bash "$DRAIN" >/dev/null 2>&1
 wait_for 'recovered_job_complete' || tail -20 "$STATE/distill.log" 2>/dev/null
 ok "SessionStart drain completes and removes a recovered job" \
@@ -191,7 +200,11 @@ ok "INFLIGHT drain retains pending jobs" \
   '[ "$(find "$STATE/distill-pending" -maxdepth 1 -type f -name "*.json" | wc -l | tr -d " ")" = "$before_jobs" ]'
 
 : > "$STATE/distill.log"
-HOME="$TMP/home" CCC_STATE_DIR="$STATE" CCC_DISTILL_PENDING_INFLIGHT_MAX=0 bash "$DRAIN" >/dev/null 2>&1
+HOME="$TMP/home" CCC_STATE_DIR="$STATE" CCC_DISTILL_PENDING_INFLIGHT_MAX=0 \
+  CCC_DISTILL_PENDING_NPROC=3 \
+  CCC_DISTILL_PENDING_LOADAVG_PATH="$TMP/loadavg.cool" \
+  CCC_DISTILL_PENDING_MEMINFO_PATH="$TMP/meminfo.ok" \
+  bash "$DRAIN" >/dev/null 2>&1
 ok "inflight-cap 0 drain spawns nothing" '! grep -q "\[pending-drain\] spawned job=" "$STATE/distill.log"'
 ok "inflight-cap 0 drain logs skip reason" 'grep -q "\[pending-drain\] skip reason=inflight-cap" "$STATE/distill.log"'
 ok "inflight-cap 0 drain retains pending jobs" \
@@ -200,6 +213,9 @@ ok "inflight-cap 0 drain retains pending jobs" \
 : > "$STATE/distill.log"
 printf '%s\n' success > "$CLAUDE_STUB_MODE_FILE"
 HOME="$TMP/home" CCC_STATE_DIR="$STATE" CCC_DISTILL_FAIL_BACKOFF_SEC=0 \
+  CCC_DISTILL_PENDING_NPROC=3 \
+  CCC_DISTILL_PENDING_LOADAVG_PATH="$TMP/loadavg.cool" \
+  CCC_DISTILL_PENDING_MEMINFO_PATH="$TMP/meminfo.ok" \
   CCC_AUTONOMY=dry-run bash "$DRAIN" >/dev/null 2>&1
 ok "autonomy=dry-run drain is not halted (reaches spawn)" \
   'wait_for '\''grep -q "\[pending-drain\] spawned job=" "$STATE/distill.log"'\'' && ! grep -q "skip reason=autonomy-kill" "$STATE/distill.log"'
@@ -227,6 +243,68 @@ ok "cooldown drain spawns nothing" '! grep -q "\[pending-drain\] spawned job=" "
 ok "cooldown drain logs skip reason" 'grep -q "\[pending-drain\] skip reason=provider-cooldown" "$STATE/distill.log"'
 ok "cooldown drain retains pending jobs" \
   '[ "$(find "$STATE/distill-pending" -maxdepth 1 -type f -name "*.json" | wc -l | tr -d " ")" = "$auth_jobs" ]'
+
+# --- load gate (#1250): a saturated node drains nothing ----------------------
+# sogyo 2026-08-23 escalated because drains kept spawning at load 98 / swap 0.
+rm -f "$STATE/distill.cooldown" "$STATE/distill-last-error.json"
+printf '99.00 90.00 80.00 2/100 1234\n' > "$TMP/loadavg.hot"
+printf 'MemTotal: 3888888 kB\nMemAvailable: 102400 kB\nSwapTotal: 2097152 kB\nSwapFree: 2000000 kB\n' > "$TMP/meminfo.lowmem"
+printf 'MemTotal: 3888888 kB\nMemAvailable: 3000000 kB\nSwapTotal: 2097152 kB\nSwapFree: 100 kB\n' > "$TMP/meminfo.swapfull"
+gate_jobs="$(find "$STATE/distill-pending" -maxdepth 1 -type f -name '*.json' | wc -l | tr -d '[:space:]')"
+
+: > "$STATE/distill.log"
+HOME="$TMP/home" CCC_STATE_DIR="$STATE" CCC_DISTILL_PENDING_NPROC=3 \
+  CCC_DISTILL_PENDING_LOADAVG_PATH="$TMP/loadavg.hot" \
+  CCC_DISTILL_PENDING_MEMINFO_PATH="$TMP/meminfo.ok" \
+  bash "$DRAIN" >/dev/null 2>&1
+ok "load-gate: high load spawns nothing" '! grep -q "\[pending-drain\] spawned job=" "$STATE/distill.log"'
+ok "load-gate: high load logs skip reason" 'grep -q "\[pending-drain\] skip reason=load-gate" "$STATE/distill.log"'
+ok "load-gate: high load retains pending jobs" \
+  '[ "$(find "$STATE/distill-pending" -maxdepth 1 -type f -name "*.json" | wc -l | tr -d " ")" = "$gate_jobs" ]'
+
+: > "$STATE/distill.log"
+HOME="$TMP/home" CCC_STATE_DIR="$STATE" CCC_DISTILL_PENDING_NPROC=3 \
+  CCC_DISTILL_PENDING_LOADAVG_PATH="$TMP/loadavg.cool" \
+  CCC_DISTILL_PENDING_MEMINFO_PATH="$TMP/meminfo.lowmem" \
+  bash "$DRAIN" >/dev/null 2>&1
+ok "load-gate: low MemAvailable spawns nothing" '! grep -q "\[pending-drain\] spawned job=" "$STATE/distill.log"'
+ok "load-gate: low MemAvailable logs skip reason" 'grep -q "\[pending-drain\] skip reason=load-gate" "$STATE/distill.log"'
+
+: > "$STATE/distill.log"
+HOME="$TMP/home" CCC_STATE_DIR="$STATE" CCC_DISTILL_PENDING_NPROC=3 \
+  CCC_DISTILL_PENDING_LOADAVG_PATH="$TMP/loadavg.cool" \
+  CCC_DISTILL_PENDING_MEMINFO_PATH="$TMP/meminfo.swapfull" \
+  bash "$DRAIN" >/dev/null 2>&1
+ok "load-gate: exhausted swap spawns nothing" '! grep -q "\[pending-drain\] spawned job=" "$STATE/distill.log"'
+ok "load-gate: exhausted swap logs skip reason" 'grep -q "\[pending-drain\] skip reason=load-gate" "$STATE/distill.log"'
+
+: > "$STATE/distill.log"
+# Fresh job with already-expired backoff: the nologin job above carries a 6h
+# auth retry_after that no drain env can retroactively shorten.
+TRANSCRIPT_GATE="$PROJECT/sess-gate.jsonl"
+make_transcript "$TRANSCRIPT_GATE" gate
+printf '%s\n' fail > "$CLAUDE_STUB_MODE_FILE"
+payload sess-gate "$TRANSCRIPT_GATE" | \
+  HOME="$TMP/home" CCC_STATE_DIR="$STATE" CCC_DISTILL_SCOPE_CWDS="/root/workspace" \
+  CCC_DISTILL_FAIL_BACKOFF_SEC=0 \
+  bash "$DISTILL" sessionend >/dev/null 2>&1
+wait_for '[ "$(find "$STATE/distill-pending" -maxdepth 1 -type f -name "*.json" | wc -l | tr -d " ")" -gt "$gate_jobs" ]'
+gate_job="$(grep -l '"session_id":"sess-gate"' "$STATE"/distill-pending/*.json 2>/dev/null | head -1)"
+# The inline SessionEnd worker still holds the claim while it extracts; a
+# drain that fires during that window sees job-lock-held, not a healthy gate.
+wait_for '[ -n "$gate_job" ] && [ -e "$gate_job.lock" ] && flock -n "$gate_job.lock" true 2>/dev/null'
+wait_for 'grep -q "pending retained reason=pipeline-failed" "$STATE/distill.log" || grep -q "pending completed" "$STATE/distill.log"'
+: > "$STATE/distill.log"
+HOME="$TMP/home" CCC_STATE_DIR="$STATE" CCC_DISTILL_PENDING_NPROC=3 \
+  CCC_DISTILL_FAIL_BACKOFF_SEC=0 \
+  CCC_DISTILL_PENDING_LOADAVG_PATH="$TMP/loadavg.cool" \
+  CCC_DISTILL_PENDING_MEMINFO_PATH="$TMP/meminfo.ok" \
+  bash "$DRAIN" >/dev/null 2>&1
+ok "load-gate: healthy node drains normally" \
+  'wait_for '\''grep -q "\[pending-drain\] spawned job=" "$STATE/distill.log"'\'''
+wait_for 'grep -q "pending retained reason=pipeline-failed" "$STATE/distill.log" || grep -q "pending dead-lettered" "$STATE/distill.log"'
+ok "load-gate: healthy drain retains the failing job" \
+  '[ "$(find "$STATE/distill-pending" -maxdepth 1 -type f -name "*.json" | wc -l | tr -d " ")" -ge 1 ]'
 
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

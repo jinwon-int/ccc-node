@@ -82,6 +82,41 @@ run_pending_job() {
   bash "$PENDING_WORKER" "${1:?}" "${2:?}" "${3:?}"
 }
 
+# Load gate (#1250): never add extraction workers to a saturated node. sogyo
+# 2026-08-23 kept draining at load 98 / swap 0 until sshd could no longer fork.
+# Fail-open when /proc is unreadable: pseudo-fs reads do not degrade under the
+# saturation this gate guards against, and an unreadable source must not halt
+# recovery on healthy nodes.
+LOADAVG_PATH="${CCC_DISTILL_PENDING_LOADAVG_PATH:-/proc/loadavg}"
+MEMINFO_PATH="${CCC_DISTILL_PENDING_MEMINFO_PATH:-/proc/meminfo}"
+LOAD_FACTOR="${CCC_DISTILL_PENDING_LOAD_FACTOR:-2}"
+MIN_MEM_KB="${CCC_DISTILL_PENDING_MIN_MEM_KB:-262144}"
+MIN_SWAP_FREE_PCT="${CCC_DISTILL_PENDING_MIN_SWAP_FREE_PCT:-10}"
+case "$LOAD_FACTOR" in ''|*[!0-9.]*) LOAD_FACTOR=2 ;; esac
+case "$MIN_MEM_KB" in ''|*[!0-9]*) MIN_MEM_KB=262144 ;; esac
+case "$MIN_SWAP_FREE_PCT" in ''|*[!0-9]*) MIN_SWAP_FREE_PCT=10 ;; esac
+if [ -r "$LOADAVG_PATH" ] && [ -r "$MEMINFO_PATH" ]; then
+  load1="$(awk '{print $1}' "$LOADAVG_PATH" 2>/dev/null)"
+  nproc_now="${CCC_DISTILL_PENDING_NPROC:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || printf '1')}"
+  case "$nproc_now" in ''|*[!0-9]*) nproc_now=1 ;; esac
+  mem_avail_kb="$(awk '/^MemAvailable:/ {print $2; exit}' "$MEMINFO_PATH" 2>/dev/null)"
+  swap_total_kb="$(awk '/^SwapTotal:/ {print $2; exit}' "$MEMINFO_PATH" 2>/dev/null)"
+  swap_free_kb="$(awk '/^SwapFree:/ {print $2; exit}' "$MEMINFO_PATH" 2>/dev/null)"
+  gate_reason=""
+  if awk -v l="${load1:-0}" -v n="$nproc_now" -v f="$LOAD_FACTOR" 'BEGIN{exit !(l+0 >= n*f)}'; then
+    gate_reason="load1=${load1:-?} nproc=$nproc_now factor=$LOAD_FACTOR"
+  elif [ -n "$mem_avail_kb" ] && [ "$mem_avail_kb" -lt "$MIN_MEM_KB" ]; then
+    gate_reason="mem_available_kb=$mem_avail_kb min=$MIN_MEM_KB"
+  elif [ -n "$swap_total_kb" ] && [ "$swap_total_kb" -gt 0 ] && [ -n "$swap_free_kb" ] \
+    && [ $((swap_free_kb * 100)) -lt $((swap_total_kb * MIN_SWAP_FREE_PCT)) ]; then
+    gate_reason="swap_free_kb=$swap_free_kb min_pct=$MIN_SWAP_FREE_PCT"
+  fi
+  if [ -n "$gate_reason" ]; then
+    log "skip reason=load-gate $gate_reason"
+    exit 0
+  fi
+fi
+
 # Global cap across concurrent SessionStarts. Held claim locks == live workers
 # in this STATE_DIR (flock releases on death, so stale files do not count).
 held=0
