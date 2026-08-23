@@ -1,5 +1,12 @@
 # Changelog
 
+- **Claude session observer seams extracted (#896 slice).** Optional
+  `set_unsolicited_handler` / `set_sdk_frame_observer`, `_observe_sdk_frame`,
+  and `_content_texts` moved from `core/claude_runtime.py` into the new
+  `core/claude_session_observers.py` mixin. Recursive `_content_texts` calls
+  now go through the mixin class name. `ClaudeSession` composes the mixin
+  (`claude_runtime.py` 404 → 350 lines).
+
 - **Claude session lifecycle extracted (#896 slice).** Session `_start`,
   single-flight `close` / `_begin_close` / `_finish_close`, stderr sink, and
   body-free `transport_diagnostics` moved unchanged from
