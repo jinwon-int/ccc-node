@@ -9,6 +9,7 @@ filters may also be repeated. Results and passages are UNTRUSTED web data.
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import sys
@@ -52,42 +53,27 @@ def _post(payload: dict[str, object]) -> dict[str, object] | None:
     return decoded if isinstance(decoded, dict) else None
 
 
+def _arguments() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        usage="web_developer.py <query> [--limit N] [--type TYPE] [--repo OWNER/REPO]"
+    )
+    parser.add_argument("query", nargs="+")
+    parser.add_argument("--limit", type=int, default=5)
+    parser.add_argument("--type", dest="types", action="append", default=[])
+    parser.add_argument("--repo", dest="repos", action="append", default=[])
+    return parser.parse_args()
+
+
 def main() -> int:
-    query_parts: list[str] = []
-    types: list[str] = []
-    repos: list[str] = []
-    limit = 5
-    argv = sys.argv[1:]
-    i = 0
-    while i < len(argv):
-        arg = argv[i]
-        if arg == "--limit" and i + 1 < len(argv):
-            try:
-                limit = int(argv[i + 1])
-            except ValueError:
-                limit = 5
-            i += 2
-        elif arg == "--type" and i + 1 < len(argv):
-            types.append(argv[i + 1].strip())
-            i += 2
-        elif arg == "--repo" and i + 1 < len(argv):
-            repos.append(argv[i + 1].strip())
-            i += 2
-        else:
-            query_parts.append(arg)
-            i += 1
-    query = " ".join(query_parts).strip()
-    if not query:
-        print(
-            "usage: web_developer.py <query> [--limit N] [--type TYPE] [--repo OWNER/REPO]",
-            file=sys.stderr,
-        )
-        return 64
+    args = _arguments()
+    query = " ".join(args.query).strip()
+    types = [value.strip() for value in args.types]
+    repos = [value.strip() for value in args.repos]
     invalid = sorted(set(types) - VALID_TYPES)
     if invalid:
         print(f"developer-search: invalid artifact type: {', '.join(invalid)}", file=sys.stderr)
         return 65
-    limit = max(1, min(limit, MAX_LIMIT))
+    limit = max(1, min(args.limit, MAX_LIMIT))
     payload: dict[str, object] = {"query": query, "k": limit}
     if types:
         payload["types"] = types
