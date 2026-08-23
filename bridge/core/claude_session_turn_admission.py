@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator, Callable
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from .agent_runtime import (
     AgentEvent,
@@ -15,7 +15,7 @@ from .agent_runtime import (
 )
 
 if TYPE_CHECKING:
-    from .claude_runtime import ClaudeRuntime, SdkClient, _ActiveTurn
+    from .claude_runtime import ClaudeRuntime, ClaudeSession, SdkClient, _ActiveTurn
 
 
 class ClaudeSessionTurnAdmissionMixin:
@@ -28,8 +28,11 @@ class ClaudeSessionTurnAdmissionMixin:
     _turn_generation: int
     _turn_lock: asyncio.Lock | None
     _unsolicited_discard: bool
-    session_id: str
     _begin_close: Callable[[], asyncio.Task[None] | None]
+
+    if TYPE_CHECKING:
+        @property
+        def session_id(self) -> str: ...
 
     def send_turn(
         self,
@@ -52,7 +55,9 @@ class ClaudeSessionTurnAdmissionMixin:
                 # seal it synchronously before the old owner releases (#625).
                 if self._closed:
                     raise RuntimeError("Claude session is closed")
-                self._runtime._turn_owners[self.session_id] = self
+                self._runtime._turn_owners[self.session_id] = cast(
+                    "ClaudeSession", self
+                )
                 self._turn_generation += 1
                 active = _ActiveTurn(
                     asyncio.Queue(),
