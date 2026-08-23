@@ -1,5 +1,13 @@
 # Changelog
 
+- **Claude delegated-task ledger extracted (#896 slice).** Result-deferring
+  task normalization (`_delegated_task_change`), lifecycle events, and the
+  `_observe_result_deferring_task` ledger moved unchanged from
+  `core/claude_runtime.py` into the new `core/claude_session_delegated_tasks.py`
+  mixin. Background-shell tracking stays in `claude_session_task_tracking.py`;
+  the new mixin reuses its `_normalize_task_id` / `_task_update_status` helpers.
+  `ClaudeSession` composes the mixin (`claude_runtime.py` 657 → 566 lines).
+
 - **Claude session turn admission extracted (#896 slice).** `send_turn`,
   `interrupt`, and `abort_stalled_turn` moved unchanged from
   `core/claude_runtime.py` into the new `core/claude_session_turn_admission.py`
