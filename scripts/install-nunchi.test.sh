@@ -122,8 +122,22 @@ ok "--judge adds a managed daily judge-batch cron alongside feed/refresh/bench" 
   '[ "$rc" = 0 ] && [ "$(grep -c "nunchi:#816" "$cron_store")" = 4 ] && grep -q "judge-batch.py" "$cron_store"'
 ok "judge cron is dry-run only (no APPLY env) and keeps the gen stamp" \
   '! grep "judge-batch.py" "$cron_store" | grep -q "NUNCHI_JUDGE_APPLY" && grep "judge-batch.py" "$cron_store" | grep -qE "gen=h_[0-9a-f]{12}$"'
-ok "judge cron line survives a plain re-apply unchanged (strip+rewrite idempotence)" \
+# The install record is what self-update replays. If --judge is not
+# materialized there, the replay runs a plain --apply, strip_cron drops every
+# managed line, and only the recorded flags re-add them — so the judge cron
+# disappears with no error. Measured 2026-08-25 (#1264): live on 1 of 11 fleet
+# nodes although every node had the script and a non-empty review queue.
+ok "install record materializes --judge so a self-update replay keeps the cron" \
+  'jq -e ".argv==[\"--apply\",\"--codex\",\"--judge\"]" "$nrec" >/dev/null'
+ok "replaying the recorded argv preserves the judge cron line" \
+  'run_install --apply --codex --judge >/dev/null 2>&1 && [ "$(grep -c "judge-batch.py" "$cron_store")" = 1 ]'
+# A re-apply that genuinely drops --judge is opt-OUT, not replay: the line is
+# removed on purpose. This asserts the removal path, which the previous
+# revision of this case claimed to be survival while asserting a count of 0.
+ok "a deliberate re-apply without --judge removes the judge cron" \
   'run_install --apply --codex >/dev/null 2>&1 && [ "$(grep -c "judge-batch.py" "$cron_store")" = 0 ]'
+ok "opting out also drops --judge from the install record" \
+  'jq -e ".argv==[\"--apply\",\"--codex\"]" "$nrec" >/dev/null'
 
 # --- Piri lane: Piri has no distill feed, so its lane runs a per-session
 # extractor (piri-feed.sh) and mines transcripts with the conversation miner
