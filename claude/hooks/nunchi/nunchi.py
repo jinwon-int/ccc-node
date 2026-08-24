@@ -28,6 +28,8 @@ Write gate (#890 — graph-engineering review):
       a user statement).
   G3  ambiguous high-overlap conflicts are NEVER auto-resolved — both stay
       open, the newcomer is flagged review=1 and surfaced in the snapshot.
+      Cross-session for session:* peers, same as G1 (#1255) — a same-kind
+      near-duplicate landed under a different session id is still compared.
   G4  kind=constraint (금지/필수 rules) is stored near-verbatim and always
       injected by `snapshot` regardless of the recency limit.
 
@@ -338,19 +340,36 @@ def _update_supersede(c, observed, text, new_rank):
     return None
 
 
-def _conflict_review(c, observed, text):
+def _conflict_review(c, observed, text, kind=None):
     """G3 — flag (never resolve) a suspicious high-overlap open sibling.
 
     A newcomer overlapping an open same-peer fact >= 0.6 without matching the
     G1 update pattern is a potential contradiction or drifted duplicate: both
     stay open and the newcomer is flagged review=1 for the owner queue.
+
+    #1255: session:* peers are one distiller's log split across many session
+    ids (same pattern as G1's `_g1_pool`) — a plain `observed=?` match can
+    never see a near-duplicate landed under a *different* session id, so the
+    same conclusion re-extracted by several sessions on the same day was
+    silently stored N times with no conflict ever flagged. Cross-match all
+    session peers for the same `kind`, exactly like `_g1_pool`; user/node
+    peers stay strictly scoped (a single observed value already, no fan-out
+    to widen). Restricting to same-kind avoids matching a `context` note
+    against an unrelated `decision` sentence that happens to share tokens.
     """
     new = _tokens(text)
     if not new:
         return 0
+    if str(observed).startswith("session:"):
+        where, params = "(observed=? OR observed LIKE 'session:%')", (observed,)
+    else:
+        where, params = "observed=?", (observed,)
+    if kind is not None:
+        where += " AND kind=?"
+        params = params + (kind,)
     for _fid, fact, _r in c.execute(
-            "SELECT id, fact, source_rank FROM peer_facts"
-            " WHERE observed=? AND valid_to IS NULL", (observed,)).fetchall():
+            f"SELECT id, fact, source_rank FROM peer_facts"
+            f" WHERE {where} AND valid_to IS NULL", params).fetchall():
         old = _tokens(fact)
         if old and len(new & old) / min(len(new), len(old)) >= 0.6:
             return 1
@@ -453,7 +472,7 @@ def ingest(path):
             else:
                 superseded = _update_supersede(c, observed, text, rank)
         if superseded is None and kind not in ("correction", "constraint", "observation"):
-            review = review or _conflict_review(c, observed, text)
+            review = review or _conflict_review(c, observed, text, kind)
         dedup = hashlib.sha1(f"{OBSERVER}|{it.get('subject')}|{text}".encode()).hexdigest()
         evidence = (f"auto:correction:{sid}" if kind == "correction" and superseded is not None
                     else f"auto:update:{sid}" if superseded is not None

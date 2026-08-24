@@ -331,6 +331,24 @@ gpayload s93 context node "기본 모델 값은 opus 이다" | NUNCHI_DB="$GDB" 
 ok "G3 conflicting sibling stays open and is flagged" \
   'gq "SELECT valid_to, review FROM peer_facts WHERE fact LIKE \"%opus 이다%\"" | grep -q "(None, 1)"'
 
+# G3 cross-session (#1255): the same conclusion re-extracted under a *different*
+# session id must still be compared — a plain observed=? match would silently
+# stack N near-identical facts (measured 2026-08-22: 40 clusters, 82 facts).
+gpayload s97a decision session "게이트 정밀도 50% 손실률 80% 근거로 V2 자동 승격을 차단하기로 결정" \
+  | NUNCHI_DB="$GDB" python3 "$NP" ingest - >/dev/null
+gpayload s97b decision session "게이트 정밀도 50% 손실률 80% 근거로 V2 자동 승격을 차단하기로 함" \
+  | NUNCHI_DB="$GDB" python3 "$NP" ingest - >/dev/null
+ok "G3 flags a same-kind near-duplicate landed under a different session id" \
+  'gq "SELECT valid_to, review FROM peer_facts WHERE fact LIKE \"%차단하기로 함%\"" | grep -q "(None, 1)"'
+
+# G3 cross-session stays kind-scoped: a different (non-excluded) kind sharing
+# tokens must not be flagged just because it lands in the same cross-session
+# pool — same words, different kind of statement.
+gpayload s97c context session "게이트 정밀도 50% 손실률 80% 근거로 V2 자동 승격을 차단하기로 기록" \
+  | NUNCHI_DB="$GDB" python3 "$NP" ingest - >/dev/null
+ok "G3 cross-session match stays scoped to the same kind" \
+  'gq "SELECT review FROM peer_facts WHERE fact LIKE \"%차단하기로 기록%\"" | grep -q "(0,)"'
+
 # G4: constraints always injected into the snapshot, ahead of the limit
 gpayload s94 constraint user "절대 main 브랜치에 직접 푸시 금지" | NUNCHI_DB="$GDB" python3 "$NP" ingest - >/dev/null
 snap="$(NUNCHI_DB="$GDB" NUNCHI_SNAPSHOT="$TMP/gate-snap.md" python3 "$NP" snapshot --limit 1)"
