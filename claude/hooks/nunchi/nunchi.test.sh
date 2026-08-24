@@ -109,6 +109,37 @@ ok "review queue at threshold escalates wording" 'grep -q "임계치" <<<"$out"'
 out="$(NUNCHI_REVIEW_QUEUE_ALERT=99 python3 "$NP" snapshot --limit 25 2>&1)"
 ok "below threshold keeps plain warning" 'grep -q "⚠ 검토대기" <<<"$out" && ! grep -q "⚠⚠" <<<"$out"'
 
+# --- G5 split (#1264): a reasonless decision cannot be cleared by judge-batch
+# (#1270) and its reason is usually unrecoverable, so it must not drive the
+# alert threshold — otherwise ⚠⚠ latches on permanently and stops meaning
+# "act now". It gets its own always-visible line instead of being hidden.
+python3 - "$NUNCHI_DB" <<'PY'
+import sqlite3, sys
+c = sqlite3.connect(sys.argv[1])
+for n in range(4):
+    c.execute("INSERT INTO peer_facts(observer,observed,kind,fact,valid_from,dedup,created_at,source_rank,review)"
+              " VALUES('family-assistant','yukson','decision',?,'2026-08-07',?,'2026-08-07T00:00:00+00:00',1,1)",
+              (f"G5-NO-REASON-{n}", f"g5-{n}"))
+c.commit()
+PY
+out="$(NUNCHI_REVIEW_QUEUE_ALERT=3 python3 "$NP" snapshot --limit 25 2>&1)"
+ok "G5 reasonless decisions are excluded from the alert threshold" \
+  'grep -q "⚠ 검토대기 1건" <<<"$out" && ! grep -q "⚠⚠" <<<"$out"'
+ok "G5 reasonless decisions get their own visible line" \
+  'grep -q "근거 결측 결정 4건" <<<"$out" && grep -q "annotate" <<<"$out"'
+# An inline reason marker satisfies G5, so such a decision stays actionable and
+# must still count toward the threshold.
+python3 - "$NUNCHI_DB" <<'PY'
+import sqlite3, sys
+c = sqlite3.connect(sys.argv[1])
+c.execute("INSERT INTO peer_facts(observer,observed,kind,fact,valid_from,dedup,created_at,source_rank,review)"
+          " VALUES('family-assistant','yukson','decision','B안을 채택한다 — A안이 기존 DB에 도달하지 못하기 때문','2026-08-07','g5-inline','2026-08-07T00:00:00+00:00',1,1)")
+c.commit()
+PY
+out="$(NUNCHI_REVIEW_QUEUE_ALERT=3 python3 "$NP" snapshot --limit 25 2>&1)"
+ok "a decision carrying an inline reason still counts as actionable" \
+  'grep -q "⚠ 검토대기 2건" <<<"$out" && grep -q "근거 결측 결정 4건" <<<"$out"'
+
 # ---- 4. recall: observed match + Korean alias query expansion (B3) ---------
 out="$(python3 "$NP" recall "yukson" 2>&1)"
 ok "recall by node slug hits node fact" 'grep -q "코덱스 러너" <<<"$out"'

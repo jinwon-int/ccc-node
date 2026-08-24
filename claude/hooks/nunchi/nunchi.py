@@ -913,9 +913,21 @@ def snapshot(limit):
     cons = c.execute(
         "SELECT observed,fact FROM peer_facts WHERE valid_to IS NULL"
         " AND kind = 'constraint' ORDER BY id DESC").fetchall()
-    pending = c.execute(
-        "SELECT COUNT(*) FROM peer_facts WHERE valid_to IS NULL AND review=1"
-    ).fetchone()[0]
+    queued = c.execute(
+        "SELECT kind,fact,because FROM peer_facts"
+        " WHERE valid_to IS NULL AND review=1").fetchall()
+    # #1264 — a G5-flagged decision is owner-actionable ONLY while its reason
+    # is still recoverable, and usually it is not: measured 2026-08-25 on this
+    # node, 139 of 144 had their source transcript already deleted and
+    # `evidence` holds a distill pointer, not the reason. judge-batch can never
+    # clear them (#1270), so counting them in the alert pins ⚠⚠ on forever and
+    # the escalation stops carrying information — the exact silent-backlog
+    # failure #1010 proposal 3 introduced it to prevent. They are split out and
+    # given their own line rather than hidden: the gap stays visible, but the
+    # threshold now tracks the queue an owner can actually drain.
+    g5_blocked = sum(1 for k, f, b in queued
+                     if _g5_reasonless_decision(k, f, b))
+    pending = len(queued) - g5_blocked
     # #1010 proposal 3 — escalate the wording once the queue crosses the
     # alert threshold (default 10; NUNCHI_REVIEW_QUEUE_ALERT) so a silently
     # growing review backlog becomes visible in the SessionStart snapshot.
@@ -941,6 +953,10 @@ def snapshot(limit):
         else:
             lines.append(
                 f"- ⚠ 검토대기 {pending}건 (충돌/미검증 출처) — `nunchi.py review`로 확인")
+    if g5_blocked:
+        lines.append(
+            f"- ⚠ 근거 결측 결정 {g5_blocked}건 — 자동 판정 불가(G5, #1264)."
+            " `nunchi.py annotate <id> --because <이유>`로만 해소")
     for o, f in cons:
         lines.append(f"- [제약/{o}] {f}")
     lines += [f"- ({o}/{k}) {f}" for o, k, f in rows]
