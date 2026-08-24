@@ -276,6 +276,24 @@ _SOURCE_RANK = {"user-stated": 3, "measured": 2, "inferred": 1}
 _REASON_INLINE = re.compile(r"때문|근거|이유|덕분|위해|목적")
 
 
+def _g5_reasonless_decision(kind, text, because=None):
+    """G5 (#1264) — a decision carrying its reason through neither channel.
+
+    Shared with judge-batch.py: a fact flagged only for this gap must NEVER
+    be deterministically cleared there — the gap is owner-actionable
+    (`annotate <id> --because`), and clearing would silently hide it.
+    """
+    return (kind == "decision" and not (because or "").strip()
+            and not _REASON_INLINE.search(text or ""))
+
+
+def _read_stdin_text():
+    """Decode stdin bytes tolerantly. A byte-capped producer (head -c) can
+    truncate mid-multibyte, and a raw UnicodeDecodeError traceback leaked
+    into the weekly bench (measured 2026-08-24, q9 wiki lane)."""
+    return sys.stdin.buffer.read().decode("utf-8", "replace")
+
+
 def _quote_key(text):
     """Skeleton for quote matching: drop whitespace, backslashes and markdown
     emphasis so a verbatim quote matches regardless of formatting.
@@ -457,7 +475,11 @@ def _transcript_text(payload):
 
 
 def ingest(path):
-    payload = json.load(sys.stdin if path == "-" else open(path))
+    try:
+        payload = (json.loads(_read_stdin_text()) if path == "-"
+                   else json.load(open(path, encoding="utf-8", errors="replace")))
+    except ValueError as exc:
+        sys.exit(f"ingest: invalid payload JSON ({exc})")
     sid = payload.get("session_id", "unknown")
     items = payload.get("honcho", [])
     auto_supersede = os.environ.get("NUNCHI_NO_AUTO_SUPERSEDE") != "1"
@@ -485,7 +507,7 @@ def ingest(path):
         # because nor an inline marker — is stored but flagged for the owner
         # queue. Reasonless decisions get blindly re-litigated or blindly
         # obeyed later; both are measured failure modes (bench q7).
-        if kind == "decision" and not because and not _REASON_INLINE.search(text):
+        if _g5_reasonless_decision(kind, text, because):
             review = 1
         superseded = None
         if auto_supersede:
@@ -821,7 +843,7 @@ def synthesize_stdin(query):
     so live recall behaviour does not move. Synthesis reuses llm_synthesize so
     the backend-selection fix (#1082) is not duplicated here.
     """
-    evidence = sys.stdin.read().strip()
+    evidence = _read_stdin_text().strip()
     if not evidence:
         print("기록 없음")
         return

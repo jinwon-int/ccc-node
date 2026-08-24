@@ -644,5 +644,27 @@ out="$(DIALECTIC_PROMPT_CAPTURE="$TMP/dcap" PATH="$syn_bin:/usr/bin:/bin" HOME="
 ok "dialectic evidence carries the structured because" \
   'grep -q "근거: 디스크 상한 80% 정책 때문" "$TMP/dcap" && grep -q "STUB-OK" <<<"$out"'
 
+# ---- 5. stdin decode hardening (#1264 follow-up) ----------------------------
+# A byte-capped producer (head -c) can truncate stdin mid-multibyte. The bench
+# measured a raw UnicodeDecodeError traceback leaking into the q9 wiki-lane
+# report on 2026-08-24; stdin reads must decode tolerantly instead.
+cat > "$syn_bin/claude" <<'EOF'
+#!/usr/bin/env bash
+echo "SYN-OK"
+EOF
+chmod +x "$syn_bin/claude"
+out="$(python3 -c "
+import sys
+sys.stdout.buffer.write('질문 근거 텍스트 — 페이지 경로'.encode('utf-8')[:16])" \
+  | PATH="$syn_bin:/usr/bin:/bin" HOME="$TMP/home" python3 "$NP" synthesize "질문" 2>&1)"
+ok "synthesize survives truncated multibyte stdin (no traceback)" \
+  '! grep -q "Traceback\|UnicodeDecodeError" <<<"$out"'
+out="$(python3 -c "
+import sys
+sys.stdout.buffer.write('{\"session_id\":\"strunc\",\"honcho\":[{\"kind\":\"fact\",\"subject\":\"node\",\"text\":\"짤린 텍스트'.encode('utf-8'))" \
+  | CCC_NODE=nosuk python3 "$NP" ingest - 2>&1)"; rc=$?
+ok "ingest rejects truncated stdin cleanly (no traceback, nonzero exit)" \
+  '[ "$rc" != 0 ] && ! grep -q "Traceback\|UnicodeDecodeError" <<<"$out"'
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
