@@ -65,6 +65,15 @@ MAX_WS="${CCC_WORKING_STATE_MAX_BYTES:-2048}"
 PROMISES_INJECT="${CCC_MEMORY_INJECT_PENDING_PROMISES:-1}"
 MAX_PROMISES="${CCC_PENDING_PROMISES_MAX_BYTES:-1024}"
 EXTERNAL_WAIT_HOME="${CCC_EXTERNAL_WAIT_HOME:-${HOME:-/root}/.telegram_bot/external-wait}"
+# Detached-job completion evidence (#1258, second half). Same default-ON,
+# silent-when-nothing-outstanding contract as the promises block above, and for
+# the same reason it cannot be a live watcher: `bridge-safe-detached-run`
+# detaches the work but its Step 2 poll loop is still a session child, so a
+# restart kills the watcher while the job keeps running. Re-reading the log's
+# EXIT marker at SessionStart needs no surviving process at all.
+DETACHED_JOBS_INJECT="${CCC_MEMORY_INJECT_DETACHED_JOBS:-1}"
+MAX_DETACHED_JOBS="${CCC_DETACHED_JOBS_MAX_BYTES:-1024}"
+DETACHED_JOBS_REGISTRY="${CCC_DETACHED_JOBS_REGISTRY:-$STATE_DIR/detached-jobs.jsonl}"
 WS_FILE="${CCC_WORKING_STATE:-$STATE_DIR/working-state.md}"
 LEGACY_WS_FILE="${CCC_MEMORY_LEGACY_WORKING_STATE:-$LEGACY_STATE_DIR/working-state.md}"
 
@@ -80,6 +89,8 @@ MEMORY_RENDER_PY="$LOAD_MEMORY_LIB_DIR/lib/memory_render.py"
 # Still-owed external-wait promises renderer (#1258); same stdlib-only, fail-open
 # contract as memory_render.py above.
 PENDING_PROMISES_PY="$LOAD_MEMORY_LIB_DIR/lib/pending_promises.py"
+# Detached-job completion sweep (#1258); same stdlib-only, fail-open contract.
+DETACHED_JOBS_PY="$LOAD_MEMORY_LIB_DIR/lib/detached_jobs.py"
 
 # Stage timing instrumentation (#897 step 1): EPOCHREALTIME marks around the
 # expensive stages, appended as ONE body-free JSON line per run to
@@ -611,6 +622,27 @@ ${promises}
   fi
 fi
 
+# Detached-job completion block (#1258). Sits with the promises block for the
+# same tail-truncation reason. This is the half the earlier slice left open: a
+# systemd-run job outlives the session, but the watcher that was supposed to
+# notice it finishing does not, so the only durable evidence is the log's EXIT
+# marker and nothing was re-reading it. Fail-open — a missing/broken helper
+# yields an empty block, never a failed hook.
+detached_block=""
+if ! is_disabled "$DETACHED_JOBS_INJECT"; then
+  detached=""
+  if [ -r "$DETACHED_JOBS_PY" ]; then
+    detached="$(python3 "$DETACHED_JOBS_PY" sweep \
+      "$DETACHED_JOBS_REGISTRY" --max-bytes "$MAX_DETACHED_JOBS" 2>/dev/null)" || detached=""
+  fi
+  if [ -n "$detached" ]; then
+    detached_block="
+## 🧱 detached 작업 상태 (로그 EXIT 마커 기준 — 감시자 생존과 무관)
+${detached}
+"
+  fi
+fi
+
 operational_note="Operational facts are mutable — live-check the node before asserting or changing anything."
 audience_note=""
 if ! is_disabled "$AUDIENCE_SCOPED"; then
@@ -670,7 +702,7 @@ Memory profile: ${PROFILE}; last refresh: ${stamp:-never}; ${wiki_note}; ${honch
 
 ## Built-in MEMORY + USER
 ${mem:-(memory files unavailable)}
-${ws_block}${promises_block}
+${ws_block}${promises_block}${detached_block}
 ## Local hot memory (task-conditioned cache search)
 ${local_hot:-(local hot memory disabled or no hits)}
 ${skills_block}${wiki_block}

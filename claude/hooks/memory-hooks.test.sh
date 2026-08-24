@@ -670,5 +670,42 @@ out="$(run_promises 'not json{{{')"
 ok "pending-promises: a corrupt registry degrades to no block, not a failed hook" \
   '! grep -q "미완 약속" <<<"$out" && grep -q "additionalContext" <<<"$out"'
 
+# ---- detached-job completion evidence (#1258, second half) -------------------
+# Same reasoning as the promises block above: the unit contract lives in
+# lib/detached_jobs.test.sh, and what is pinned here is the *wiring*, which
+# fails silently. The block is invoked behind `[ -r ... ]` with a fail-open
+# `||`, so a wrong path yields no error — only a block that never appears.
+djreg="$TMP/detached-jobs.jsonl"
+run_detached() { # <registry body>
+  printf '%s' "$1" > "$djreg"
+  HOME="$TMP/home" CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" \
+    CCC_MEMORY_DIR="$mem" CCC_HOOK_DIR="$ROOT/claude/hooks" \
+    CCC_MEMORY_TOOLS_DIR="$tools" CCC_HONCHO_MEMORY_ENABLED=0 \
+    CCC_MEMORY_NO_REFRESH=1 CCC_DETACHED_JOBS_REGISTRY="$djreg" \
+    bash "$ROOT/claude/hooks/load-memory.sh" SessionStart 2>&1
+}
+
+out="$(run_detached '')"
+ok "detached-jobs: an empty registry injects no block (block defaults ON, so silence is the contract)" \
+  '! grep -q "detached 작업 상태" <<<"$out"'
+
+djlog="$TMP/dj-done.log"; printf 'work\nEXIT=0\n' > "$djlog"
+out="$(run_detached "$(printf '{"unit":"dj1","log":"%s","started_at":%s,"summary":"recheck addr"}' "$djlog" "$(date +%s)")")"
+ok "detached-jobs: a finished job reaches additionalContext with its exit code" \
+  'grep -q "detached 작업 상태" <<<"$out" && grep -q "dj1" <<<"$out" && grep -q "EXIT=0" <<<"$out"'
+
+out="$(run_detached "$(printf '{"unit":"dj2","log":"%s","started_at":%s,"acked":true}' "$djlog" "$(date +%s)")")"
+ok "detached-jobs: an acked job stays out of the payload" \
+  '! grep -q "detached 작업 상태" <<<"$out"'
+
+out="$(CCC_MEMORY_INJECT_DETACHED_JOBS=0 run_detached "$(printf '{"unit":"dj3","log":"%s","started_at":%s}' "$djlog" "$(date +%s)")")"
+ok "detached-jobs: CCC_MEMORY_INJECT_DETACHED_JOBS=0 disables the block" \
+  '! grep -q "detached 작업 상태" <<<"$out"'
+
+out="$(run_detached 'not json{{{')"
+ok "detached-jobs: a corrupt registry degrades to no block, not a failed hook" \
+  '! grep -q "detached 작업 상태" <<<"$out" && grep -q "additionalContext" <<<"$out"'
+
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

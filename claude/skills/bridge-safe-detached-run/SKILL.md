@@ -1,6 +1,6 @@
 ---
 name: bridge-safe-detached-run
-description: Run a long-running command as a detached systemd transient unit so it survives Telegram-bridge/session restarts — with persistent log file, EXIT marker, HOME/PATH env injection, and a polling watcher. Use when a task may outlive the current session (installs, mining/indexing, builds, migrations, long tests), when a previous background task was killed by a bridge restart (ccc-node #822), or when systemd-run output mysteriously fails due to missing HOME.
+description: Run a long-running command as a detached systemd transient unit so it survives Telegram-bridge/session restarts — with persistent log file, EXIT marker, HOME/PATH env injection, and a durable job registry that lets any later session read the completion evidence. Use when a task may outlive the current session (installs, mining/indexing, builds, migrations, long tests), when a previous background task was killed by a bridge restart (ccc-node #822), when a watcher died and a finished job looks failed (ccc-node #1258), or when systemd-run output mysteriously fails due to missing HOME.
 ---
 
 # bridge-safe-detached-run
@@ -8,7 +8,9 @@ description: Run a long-running command as a detached systemd transient unit so 
 Session/bridge restarts kill ordinary background children (`&`, harness bg
 tasks — ccc-node #822). For any command that may outlive the session, run it as
 a **systemd transient unit** owned by PID 1, with a persistent log and an EXIT
-marker, then poll the log. Formalizes the #822 workaround.
+marker, then **register it** so the evidence outlives your watcher too. Step 1
+formalizes the #822 workaround; Step 2 closes #1258, where the work survived but
+the process watching it did not.
 
 ## When to Use
 
@@ -39,9 +41,36 @@ Rules:
   reliable completion signal after `--collect` removes the unit.
 - Log to a persistent file (`>> log 2>&1`) — journald alone disappears with `--collect`.
 
-## Step 2 — Watch for completion
+## Step 2 — Register the job so the *next* session can find it
 
-Poll the log (survives your own session restarts too):
+**Detaching the work is not enough — the watcher must not be the only record**
+(ccc-node #1258). A `Monitor` until-loop or a bounded `for` poll runs as a child
+of the session process. When the session restarts, the watcher dies while the
+job keeps going, and all you get is `<task-notification status=stopped>`, which
+cannot distinguish "the work failed" from "my watcher was lost". On 2026-08-24
+that nearly caused a completed 12/12 job to be re-run.
+
+Register the log path immediately after launching, in the same turn:
+
+```bash
+python3 ~/.claude/hooks/lib/detached_jobs.py register \
+  --unit <job> --log "$LOG" --summary "<one line, body-free>"
+```
+
+Now the completion evidence is durable and **stateless to read**: every
+SessionStart sweeps the registry and reports each job as `done` (with its real
+`EXIT=` code), `running`, or `lost` — no surviving process required. Acknowledge
+a job you have acted on so it stops being reported:
+
+```bash
+python3 ~/.claude/hooks/lib/detached_jobs.py ack --unit <job>
+python3 ~/.claude/hooks/lib/detached_jobs.py list     # all outstanding jobs
+```
+
+## Step 2b — Watching inside the current turn (optional)
+
+Polling is still fine when you genuinely expect to stay alive, but it is now an
+optimization, not the record:
 
 ```bash
 # quick check
@@ -52,6 +81,9 @@ grep '^EXIT=' "$LOG"   # EXIT=0 → success; nonzero → inspect log
 ```
 
 While the unit is live: `systemctl status <job>.service` / `journalctl -u <job> -n 20`.
+Remember `--collect` removes the unit on exit, so once the job succeeds
+`systemctl status` says "could not be found" — that is normal and is **not**
+evidence of failure. The log's `EXIT=` marker is the only durable proof.
 
 ## Step 3 — Short synchronous variant
 
@@ -87,3 +119,5 @@ systemctl stop <job>.service                               # abort a running job
 - Launch returns `Running as unit: <job>.service`
 - Log file grows; `EXIT=0` appears at completion
 - The job keeps running across a bridge/session restart (that's the point)
+- `detached_jobs.py list` shows the job, and a later SessionStart reports it as
+  `done`/`running`/`lost` even if this session is gone
