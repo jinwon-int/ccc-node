@@ -55,6 +55,21 @@ print(cur.lastrowid)
 PY
 }
 
+seed_kind() { # seed_kind <observed> <kind> <fact> <created_at> <rank> <review> <dedup> <because|"">
+  python3 - "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" <<'PY'
+import os, sqlite3, sys
+observed, kind, fact, created, rank, review, dedup, because = sys.argv[1:9]
+c = sqlite3.connect(os.environ["NUNCHI_DB"])
+cur = c.execute(
+    "INSERT INTO peer_facts(observer,observed,kind,fact,evidence,valid_from,valid_to,"
+    "supersedes,dedup,created_at,source_rank,review,because) VALUES(?,?,?,?,?,?,NULL,NULL,?,?,?,?,?)",
+    ("family-assistant", observed, kind, fact, "distill:test", created, dedup, created,
+     int(rank), int(review), because or None))
+c.commit()
+print(cur.lastrowid)
+PY
+}
+
 run_batch() { # run_batch [extra-env...] — always with the stubbed judge on PATH
   env PATH="$TMP/bin:$PATH" "$@" python3 "$JB"
 }
@@ -172,6 +187,21 @@ ok "scoped fan-out exits 0" '[ "$?" = 0 ]'
 ok "shared scope triaged (audit written)" '[ -f "$SCOPE_ROOT/shared/nunchi/judge-audit.jsonl" ] || [ ! -f "$SCOPE_ROOT/not-a-scope/nunchi/judge-audit.jsonl" ]'
 ok "non-canonical scope dir never touched" '[ ! -f "$SCOPE_ROOT/not-a-scope/nunchi/judge-audit.jsonl" ]'
 ok "DB-less canonical scope skipped without error" '[ ! -f "$SCOPE_ROOT/private-ffffffffffffffffffffffffffffffff/nunchi/judge-audit.jsonl" ]'
+
+# ---- 8. G5: a reasonless decision is never deterministic-cleared (#1264) ---
+# The deterministic pass clears anything without a live >=0.6 sibling — that
+# rule predates G5, and a reasonless decision has no such sibling, so without
+# this guard the batch would silently hide the missing reason from the owner.
+reset_db
+idg1="$(seed_kind dungae decision "Honcho 유지안 기각으로 폐기 경로 확정" "$OLD" 1 1 dg1 "")"
+idg2="$(seed_kind dungae decision "측정 비용 때문에 백업 자동화를 보류했다" "$OLD" 1 1 dg2 "")"
+idg3="$(seed_kind dungae decision "로그 보관을 30일로 결정" "$OLD" 1 1 dg3 "디스크 상한 정책 때문")"
+NUNCHI_JUDGE_APPLY=1 run_batch
+ok "G5 reasonless decision stays flagged (never deterministic-clear)" '[ "$(review_of "$idg1")" = 1 ]'
+ok "G5 item classified g5-reasonless-decision in audit" 'grep -q "\"class\": \"g5-reasonless-decision\"" "$NUNCHI_HOME/judge-audit.jsonl"'
+ok "G5 audit points the owner at annotate" 'grep -q "annotate" "$NUNCHI_HOME/judge-audit.jsonl"'
+ok "inline-reason decision takes the normal deterministic path" '[ "$(review_of "$idg2")" = 0 ]'
+ok "structured-because decision takes the normal deterministic path" '[ "$(review_of "$idg3")" = 0 ]'
 
 printf 'PASS=%d FAIL=%d\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

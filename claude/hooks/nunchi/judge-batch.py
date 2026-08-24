@@ -18,6 +18,10 @@ Guard rails (issue #1204 contract):
 - items younger than MIN_AGE_HOURS (default 24) are inviolable
 - the only automatic mutation is `review=0` (the `review <id> --clear`
   equivalent); supersede appears in the report as proposal text only
+- G5 (#1264): a reasonless decision is never deterministic-cleared — it has
+  no live sibling by construction, so the deterministic pass would hide the
+  missing reason. Class g5-reasonless-decision, always verdict=human, and
+  the audit points the owner at `annotate <id> --because`.
 - judge failure / unparseable verdict is fail-closed (human-approval)
 - NUNCHI_JUDGE_APPLY=1 to mutate; default is dry-run
 - before an apply run mutates: DB backup to ~/.nunchi/backup/; per-item
@@ -152,7 +156,7 @@ def fetch_queue(conn):
     """Oldest-first flagged facts older than the freshness moat."""
     cutoff = (datetime.now(timezone.utc) - timedelta(hours=MIN_AGE_HOURS)).isoformat(timespec="seconds")
     return conn.execute(
-        "SELECT id, observed, kind, fact, source_rank, created_at FROM peer_facts"
+        "SELECT id, observed, kind, fact, source_rank, created_at, because FROM peer_facts"
         " WHERE valid_to IS NULL AND review=1 AND created_at <= ?"
         " ORDER BY id LIMIT ?",
         (cutoff, CAP),
@@ -194,7 +198,7 @@ JUDGE_SYSTEM = (
 
 
 def build_judge_prompt(item, siblings):
-    fid, observed, kind, text, rank, _created = item
+    fid, observed, kind, text, rank, _created, _because = item
     sib_lines = "\n".join(f"- #{sid}: {sfact}" for sid, sfact in siblings[:5])
     return f"""Flagged fact #{fid} (kind={kind}, observed={observed}, source_rank={rank}):
 {text}
@@ -298,10 +302,25 @@ def write_report(payload, human_items):
 
 
 def triage_queue(conn, queue):
-    """Deterministic pass first; only live-conflict items spend a judge call."""
+    """Deterministic pass first; only live-conflict items spend a judge call.
+
+    G5 (#1264) precedes both: a reasonless decision has no live sibling by
+    construction, so the deterministic rule would clear it and silently hide
+    the missing reason. That gap is owner-actionable (annotate), never
+    batch-clearable.
+    """
     decisions = []
     for item in queue:
-        fid, observed, kind, text, rank, created = item
+        fid, observed, kind, text, rank, created, because = item
+        if nunchi._g5_reasonless_decision(kind, text, because):
+            decisions.append({
+                "id": fid, "class": "g5-reasonless-decision",
+                "rationale": ("decision without its reason (G5, #1264) — owner backfill: "
+                              f"nunchi.py annotate {fid} --because <reason>; "
+                              "clearing would hide the gap"),
+                "verdict": "human", "supersede_proposal": None,
+            })
+            continue
         siblings = live_conflict(conn, fid, observed, text)
         if not siblings:
             decisions.append({
