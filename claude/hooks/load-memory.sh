@@ -55,6 +55,16 @@ RESUME_FILE="${CCC_RESUME_FILE:-$STATE_DIR/resume.md}"
 # opts in for SessionStart never double-injects next to checkpoint.sh.
 WS_INJECT="${CCC_MEMORY_INJECT_WORKING_STATE:-0}"
 MAX_WS="${CCC_WORKING_STATE_MAX_BYTES:-2048}"
+# Still-owed external-wait promises (#1258). Unlike the working-state block this
+# defaults ON, because it is silent unless the durable registry actually holds
+# an outstanding promise: with nothing owed the renderer prints nothing and this
+# loader's output stays byte-identical. The registry survives restarts already
+# (#740) — what was missing is any path that tells the *next* session about it,
+# which is exactly what the 4h auto-new-session rotation and self-update
+# restarts were eating.
+PROMISES_INJECT="${CCC_MEMORY_INJECT_PENDING_PROMISES:-1}"
+MAX_PROMISES="${CCC_PENDING_PROMISES_MAX_BYTES:-1024}"
+EXTERNAL_WAIT_HOME="${CCC_EXTERNAL_WAIT_HOME:-${HOME:-/root}/.telegram_bot/external-wait}"
 WS_FILE="${CCC_WORKING_STATE:-$STATE_DIR/working-state.md}"
 LEGACY_WS_FILE="${CCC_MEMORY_LEGACY_WORKING_STATE:-$LEGACY_STATE_DIR/working-state.md}"
 
@@ -67,6 +77,9 @@ LOAD_MEMORY_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pw
 # heredocs live in this stdlib-only module. Every caller keeps its fail-open
 # `||` fallback, so a missing module degrades exactly like a heredoc failure.
 MEMORY_RENDER_PY="$LOAD_MEMORY_LIB_DIR/lib/memory_render.py"
+# Still-owed external-wait promises renderer (#1258); same stdlib-only, fail-open
+# contract as memory_render.py above.
+PENDING_PROMISES_PY="$LOAD_MEMORY_LIB_DIR/lib/pending_promises.py"
 
 # Stage timing instrumentation (#897 step 1): EPOCHREALTIME marks around the
 # expensive stages, appended as ONE body-free JSON line per run to
@@ -579,6 +592,25 @@ ${ws_stale}${ws:-(working-state.md empty — if a task is in progress, keep ${WS
 "
 fi
 
+# Still-owed promises block (#1258). Sits next to the working-state pointer for
+# the same reason: downstream byte caps truncate from the tail, and an
+# outstanding promise is live-task context, not background reading. Fail-open —
+# a missing/broken helper yields an empty block, never a failed hook.
+promises_block=""
+if ! is_disabled "$PROMISES_INJECT"; then
+  promises=""
+  if [ -r "$PENDING_PROMISES_PY" ]; then
+    promises="$(python3 "$PENDING_PROMISES_PY" \
+      "$EXTERNAL_WAIT_HOME/waits.json" --max-bytes "$MAX_PROMISES" 2>/dev/null)" || promises=""
+  fi
+  if [ -n "$promises" ]; then
+    promises_block="
+## ⚠ 미완 약속 (durable external-wait 레지스트리 — 세션이 바뀌어도 살아 있음)
+${promises}
+"
+  fi
+fi
+
 operational_note="Operational facts are mutable — live-check the node before asserting or changing anything."
 audience_note=""
 if ! is_disabled "$AUDIENCE_SCOPED"; then
@@ -638,7 +670,7 @@ Memory profile: ${PROFILE}; last refresh: ${stamp:-never}; ${wiki_note}; ${honch
 
 ## Built-in MEMORY + USER
 ${mem:-(memory files unavailable)}
-${ws_block}
+${ws_block}${promises_block}
 ## Local hot memory (task-conditioned cache search)
 ${local_hot:-(local hot memory disabled or no hits)}
 ${skills_block}${wiki_block}

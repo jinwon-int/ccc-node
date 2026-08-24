@@ -339,6 +339,7 @@ HARNESS_SUITES=(claude/hooks/observability.test.sh claude/hooks/security-scan.te
          claude/hooks/skill-review/codex-autoinstall.test.sh \
          claude/hooks/lib/mtime-prune.test.sh \
          claude/hooks/lib/memory_render.test.sh \
+         claude/hooks/lib/pending_promises.test.sh \
          claude/hooks/lib/test-stub.test.sh \
          claude/hooks/lib/hook-common.test.sh \
          claude/hooks/distill/extract.test.sh claude/hooks/distill/honcho-push.test.sh \
