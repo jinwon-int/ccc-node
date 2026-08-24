@@ -145,6 +145,29 @@ raise SystemExit(0 if safe else 1)
 PY
 }
 
+# #1263 — a node that ships claude/codex binaries was never checked for
+# whether either is actually *authenticated*. `--apply` used to succeed
+# silently on a node where both are logged out (gongmyoung: codex 401 +
+# claude not installed): ingest still worked, but dialectic/bench synthesis
+# was dead from minute one with no signal anywhere that it needed attention.
+# This is a diagnostic-only probe — it never blocks --apply, since ingest is
+# a real, independent value even with zero working synthesis backend.
+any_backend_authenticated() {
+  if command -v claude >/dev/null 2>&1; then
+    if claude auth status 2>/dev/null | grep -q '"loggedIn": *true'; then
+      return 0
+    fi
+  fi
+  if command -v codex >/dev/null 2>&1; then
+    # Anchored: "Not logged in" contains the unanchored substring "logged in"
+    # too, so a bare `grep -qi 'logged in'` reports a dead codex as healthy.
+    if codex login status 2>/dev/null | grep -qi '^logged in'; then
+      return 0
+    fi
+  fi
+  return 1
+}
+
 # Body-free status renderers for the enriched nunchi status (#865). These
 # report provider wiring, source, binary, and the last collection result
 # without ever printing transcript body, excerpts, session ids or credentials.
@@ -317,6 +340,7 @@ status() {
   echo "mode: $(cat "$MODE_FILE" 2>/dev/null || echo off)"
   echo "hooks: $([ -f "$HOOKS/nunchi.py" ] && echo present || echo MISSING) ($HOOKS)"
   echo "codex_loader: $(if validate_codex_loader; then echo present; else echo MISSING/UNSAFE; fi)"
+  echo "backend_auth: $(if any_backend_authenticated; then echo ok; else echo "NONE (claude/codex both unauthenticated)"; fi)"
   echo "cron: $(grep -cF "$MARK" <<<"$cron" || true) line(s)"
   echo "ghost_cron: $(_ghost_lines "$cron" | grep -c . || true) line(s) pointing at missing paths (#1079)"
   echo "db: $(ls -la "$NUNCHI_DIR/facts.db" 2>/dev/null | awk '{print $5" bytes"}' || echo none)"
@@ -620,6 +644,11 @@ case "$ACTION" in
       "${record_argv[@]}" \
       || echo "WARNING: install record write failed — self-update re-apply will not track these entries" >&2
     echo "nunchi enabled (mode=on, provider=$resolved_provider, feed=$(basename "$feed"))"
+    if ! any_backend_authenticated; then
+      echo "⚠ no authenticated LLM backend found (claude/codex) — ingest will still" >&2
+      echo "  collect facts, but dialectic/bench synthesis has nothing to answer with" >&2
+      echo "  until one is: run 'claude auth login' or 'codex login --device-auth'." >&2
+    fi
     status
     ;;
   remove)

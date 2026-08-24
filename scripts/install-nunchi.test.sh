@@ -527,5 +527,42 @@ out="$(run_install --remove 2>&1)"; rc=$?
 ok "remove cleans our ghosts silently (no cross-account residue in tests)" \
   '[ "$rc" = 0 ] && ! grep -q "ghost entries" <<<"$out" && [ "$(grep -c "nunchi:#816" "$cron_store" || true)" = 0 ]'
 
+# ---- #1263: --apply must diagnose "no authenticated LLM backend" instead of
+# silently succeeding with a dialectic/bench synthesis that can never answer.
+# `run_install` inherits the caller's real PATH (no override in common_env),
+# so a real claude/codex on the host running this suite would otherwise leak
+# into the check — auth_bin is prepended ahead of it so the stub always wins,
+# keeping this hermetic regardless of the host's actual login state.
+auth_bin="$TMP/bin-auth"; mkdir -p "$auth_bin"
+cat > "$auth_bin/claude" <<'EOF'
+#!/usr/bin/env bash
+[ "$1" = auth ] && [ "$2" = status ] && echo '{"loggedIn": false}'
+EOF
+cat > "$auth_bin/codex" <<'EOF'
+#!/usr/bin/env bash
+[ "$1" = login ] && [ "$2" = status ] && echo "Not logged in"
+EOF
+chmod +x "$auth_bin/claude" "$auth_bin/codex"
+out="$(PATH="$auth_bin:$PATH" run_install --apply --codex 2>&1)"; rc=$?
+ok "apply warns when neither claude nor codex is authenticated" \
+  '[ "$rc" = 0 ] && grep -q "no authenticated LLM backend" <<<"$out"'
+out="$(PATH="$auth_bin:$PATH" run_install 2>&1)"; rc=$?
+ok "status reports backend_auth=NONE when neither backend is authenticated" \
+  '[ "$rc" = 0 ] && grep -q "^backend_auth: NONE" <<<"$out"'
+
+cat > "$auth_bin/claude" <<'EOF'
+#!/usr/bin/env bash
+[ "$1" = auth ] && [ "$2" = status ] && echo '{"loggedIn": true}'
+EOF
+chmod +x "$auth_bin/claude"
+out="$(PATH="$auth_bin:$PATH" run_install --apply --codex 2>&1)"; rc=$?
+ok "apply stays quiet once claude is authenticated" \
+  '[ "$rc" = 0 ] && ! grep -q "no authenticated LLM backend" <<<"$out"'
+out="$(PATH="$auth_bin:$PATH" run_install 2>&1)"; rc=$?
+ok "status reports backend_auth=ok once a backend is authenticated" \
+  '[ "$rc" = 0 ] && grep -q "^backend_auth: ok" <<<"$out"'
+
+run_install --remove >/dev/null 2>&1
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

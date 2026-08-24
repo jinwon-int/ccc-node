@@ -43,6 +43,7 @@ Usage:
   nunchi.py snapshot [--limit N]             # SessionStart-ready summary
   nunchi.py review-stale [--close]           # G1 retro pass over old facts
   nunchi.py metrics                          # body-free counters for bench
+  nunchi.py backend-status                   # synthesis backend health (#1263)
   nunchi.py stats
 """
 import glob
@@ -581,24 +582,112 @@ def _run_synth_backend(name, argv, env):
     return text, None
 
 
+BACKEND_HEALTH = os.environ.get(
+    "NUNCHI_BACKEND_HEALTH", os.path.join(os.path.dirname(DB), "backend-health.json"))
+_BACKEND_HEALTH_WINDOW = 20
+_BACKEND_DEGRADED_WINDOW = 5
+_BACKEND_DEGRADED_MIN = 3  # of the last _BACKEND_DEGRADED_WINDOW calls
+
+
+def _load_backend_health():
+    try:
+        with open(BACKEND_HEALTH, encoding="utf-8") as fh:
+            data = json.load(fh)
+        if isinstance(data, dict) and isinstance(data.get("history"), list):
+            return data
+    except (OSError, ValueError):
+        pass
+    return {"history": []}
+
+
+def _record_backend_outcome(primary, winner, attempts):
+    """Fleet #1263-class fix: a fallback that quietly succeeds hides an outage.
+
+    Every llm_synthesize() call appends one entry (primary candidate name,
+    which backend actually answered — None if all failed, and the failure
+    reasons) to a small rolling-window status file. `backend_status()` and
+    `snapshot()` read it to surface a degraded/outage warning instead of the
+    silent "it still answered" state #1263 found on nosuk/jingun/bangtong.
+    """
+    data = _load_backend_health()
+    data["history"].append({
+        "ts": now(),
+        "primary": primary,
+        "winner": winner,
+        "attempts": attempts,
+    })
+    data["history"] = data["history"][-_BACKEND_HEALTH_WINDOW:]
+    try:
+        os.makedirs(os.path.dirname(BACKEND_HEALTH) or ".", exist_ok=True)
+        with open(BACKEND_HEALTH, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, ensure_ascii=False)
+    except OSError:
+        pass  # status tracking is best-effort; never block synthesis on it
+
+
+def backend_health_state():
+    """Derive (state, detail) from recent history: ok | degraded | outage.
+
+    outage   — the most recent call got no answer from any backend.
+    degraded — the primary candidate lost >= _BACKEND_DEGRADED_MIN of the
+               last _BACKEND_DEGRADED_WINDOW calls to a fallback (still
+               answering, just not on the intended backend — #1263's
+               nosuk/jingun/bangtong pattern).
+    ok       — primary is answering, or no history yet.
+    """
+    hist = _load_backend_health()["history"]
+    if not hist:
+        return "ok", ""
+    last = hist[-1]
+    if last["winner"] is None:
+        return "outage", last["attempts"]
+    recent = hist[-_BACKEND_DEGRADED_WINDOW:]
+    degraded_n = sum(1 for h in recent if h["winner"] and h["winner"] != h["primary"])
+    if degraded_n >= _BACKEND_DEGRADED_MIN:
+        return "degraded", f"{last['primary']}→{last['winner']}"
+    return "ok", ""
+
+
+def backend_status():
+    """Human-readable backend health for `nunchi.py backend-status` (#1263)."""
+    hist = _load_backend_health()["history"]
+    if not hist:
+        print("no synthesis calls recorded yet")
+        return
+    state, detail = backend_health_state()
+    last = hist[-1]
+    print(f"state: {state}" + (f" ({detail})" if detail else ""))
+    print(f"last: primary={last['primary']} winner={last['winner']} "
+          f"attempts={last['attempts']} ts={last['ts']}")
+    print(f"window: {len(hist)}/{_BACKEND_HEALTH_WINDOW}")
+    for h in hist[-_BACKEND_DEGRADED_WINDOW:]:
+        print(f"  {h['ts']} primary={h['primary']} winner={h['winner']} {h['attempts']}")
+
+
 def llm_synthesize(prompt):
     """Query-time synthesis backend: first candidate that can actually answer.
 
     Falls back when a backend is present but unusable (logged out, quota, empty),
     so one unauthenticated CLI cannot mask a working one on the same node.
+
+    #1263: recording is separate from the try loop below so a health-file
+    write failure can never affect which text gets returned.
     """
     import shutil
     env = {**os.environ, "CLAUDE_DISTILL_INFLIGHT": "1"}
     attempts, last_text = [], ""
+    primary = next((n for n, _ in _synth_candidates() if shutil.which(n)), None)
     for name, template in _synth_candidates():
         if not shutil.which(name):
             continue
         argv = [prompt if part == "{prompt}" else part for part in template]
         text, reason = _run_synth_backend(name, argv, env)
         if reason is None:
+            _record_backend_outcome(primary, name, ", ".join(attempts) or None)
             return text
         attempts.append(f"{name}:{reason}")
         last_text = text or last_text
+    _record_backend_outcome(primary, None, ", ".join(attempts) or "no candidates present")
     if not attempts:
         return "(합성 백엔드 없음: claude/codex CLI 부재)"
     # Every present backend failed. Name them so the failure is diagnosable
@@ -767,6 +856,18 @@ def snapshot(limit):
     # growing review backlog becomes visible in the SessionStart snapshot.
     alert_at = int(os.environ.get("NUNCHI_REVIEW_QUEUE_ALERT", "10"))
     lines = ["## nunchi working memory (primary — gate-3 transition, #824)"]
+    # #1263 — a working fallback looks identical to a healthy primary unless
+    # something surfaces the substitution. Same escalation pattern as the
+    # review queue: silent while healthy, visible the moment it isn't.
+    backend_state, backend_detail = backend_health_state()
+    if backend_state == "outage":
+        lines.append(
+            f"- ⚠⚠ nunchi 합성 백엔드 전멸(claude·codex 모두 실패: {backend_detail}) —"
+            " `nunchi.py backend-status`로 확인")
+    elif backend_state == "degraded":
+        lines.append(
+            f"- ⚠ nunchi 합성 백엔드가 fallback으로 강등됨({backend_detail}) —"
+            " 1순위 인증 재확인 필요, `nunchi.py backend-status`로 확인")
     if pending:
         if pending >= alert_at:
             lines.append(
@@ -915,6 +1016,8 @@ if __name__ == "__main__":
         review_stale("--close" in args)
     elif cmd == "metrics":
         metrics()
+    elif cmd == "backend-status":
+        backend_status()
     elif cmd == "stats":
         stats()
     else:

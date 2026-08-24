@@ -497,6 +497,83 @@ out="$(PATH="$syn_bin:/usr/bin:/bin" HOME="$TMP/home" python3 "$NP" dialectic "�
 ok "dialectic still synthesizes from peer facts, unchanged" \
   'grep -q "DIALECTIC-STUB" <<<"$out"'
 
+# ---- #1263: silent fallback degradation must surface, not hide ------------
+# nosuk/jingun/bangtong ran on codex for an unknown time because a working
+# fallback looks identical to a healthy primary from the outside. Each
+# llm_synthesize() call now appends to a small rolling status file; snapshot()
+# and `backend-status` must turn "primary keeps losing to the fallback" into
+# a visible warning instead of quiet, indefinite substitution.
+#
+# NUNCHI_DB is `export`-ed near the top of this file (line ~20) for the rest
+# of the suite, so every call below pins its own NUNCHI_DB/NUNCHI_SNAPSHOT
+# explicitly — relying on HOME-derived defaults here would silently read and
+# write the shared suite-wide DB instead of this section's isolated one.
+health_home="$TMP/home-backend-health"; mkdir -p "$health_home"
+health_bin="$TMP/bin-health"; mkdir -p "$health_bin"
+HDB="$health_home/.nunchi/facts.db"
+HSNAP="$health_home/.nunchi/snapshot.md"
+hdialectic() { NUNCHI_DB="$HDB" NUNCHI_SNAPSHOT="$HSNAP" PATH="$health_bin:/usr/bin:/bin" HOME="$health_home" python3 "$NP" dialectic "모델" >/dev/null 2>&1; }
+hstatus()    { NUNCHI_DB="$HDB" NUNCHI_SNAPSHOT="$HSNAP" PATH="$health_bin:/usr/bin:/bin" HOME="$health_home" python3 "$NP" backend-status 2>&1; }
+hsnapshot()  { NUNCHI_DB="$HDB" NUNCHI_SNAPSHOT="$HSNAP" python3 "$NP" snapshot --limit 1; }
+
+cat > "$health_bin/claude" <<'EOF'
+#!/usr/bin/env bash
+echo "CLAUDE-ANSWER"
+EOF
+cat > "$health_bin/codex" <<'EOF'
+#!/usr/bin/env bash
+echo "session log line"
+echo "CODEX-ANSWER"
+EOF
+chmod +x "$health_bin/claude" "$health_bin/codex"
+
+# One healthy call: primary (claude) wins, state stays ok, no warning line.
+hdialectic
+snap="$(hsnapshot)"
+ok "snapshot stays clean while the primary backend is answering" \
+  '! grep -q "합성 백엔드" <<<"$snap"'
+
+# Take claude down: three straight calls fall to codex — #1263's exact pattern.
+cat > "$health_bin/claude" <<'EOF'
+#!/usr/bin/env bash
+echo "Not logged in · Please run /login"
+EOF
+chmod +x "$health_bin/claude"
+for _ in 1 2 3; do hdialectic; done
+out="$(hstatus)"
+ok "backend-status reports degraded once the fallback carries most calls" \
+  'grep -q "^state: degraded" <<<"$out"'
+snap="$(hsnapshot)"
+ok "snapshot surfaces the degraded-backend warning" \
+  'grep -q "강등됨" <<<"$snap"'
+
+# Both backends dead: state escalates to outage, distinct from degraded.
+cat > "$health_bin/codex" <<'EOF'
+#!/usr/bin/env bash
+echo "Not logged in · Please run /login"
+EOF
+chmod +x "$health_bin/codex"
+hdialectic
+out="$(hstatus)"
+ok "backend-status escalates to outage when every backend fails" \
+  'grep -q "^state: outage" <<<"$out"'
+snap="$(hsnapshot)"
+ok "snapshot escalates its wording for a full backend outage" \
+  'grep -q "전멸" <<<"$snap"'
+
+# Recovery: enough healthy primary calls to flush the bad entries out of the
+# rolling window (_BACKEND_DEGRADED_WINDOW=5) must clear the state — a single
+# good call should not still read "degraded" off stale window entries.
+cat > "$health_bin/claude" <<'EOF'
+#!/usr/bin/env bash
+echo "CLAUDE-ANSWER"
+EOF
+chmod +x "$health_bin/claude"
+for _ in 1 2 3 4 5; do hdialectic; done
+out="$(hstatus)"
+ok "backend-status clears back to ok once the primary is healthy again" \
+  'grep -q "^state: ok" <<<"$out"'
+
 # Cross-file constant check, same precedent as SYNTH_UNAVAILABLE_RE (#1072):
 # a no-record phrasing known to one file and not the other silently rescores
 # retrieval quality — that is exactly how gwakga's q6 paraphrase was counted
