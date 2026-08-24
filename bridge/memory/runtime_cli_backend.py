@@ -22,6 +22,10 @@ from .distill_extraction import (
     canonical_extraction_input_bytes,
     parse_extraction_output,
 )
+from .distill_guard import (
+    classify_provider_failure,
+    communicate_with_bounded_stderr,
+)
 
 _DEFAULT_PATH = "/usr/local/bin:/usr/bin:/bin"
 _MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,127}$")
@@ -375,15 +379,16 @@ class RuntimeCliDistillBackend:
                 cwd = private_root / "cwd"
                 cwd.mkdir(mode=0o700)
                 output = private_root / "output.json"
-                descriptor = os.open(
-                    output, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
-                )
+                output_descriptor = -1
                 try:
+                    output_descriptor = os.open(
+                        output, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
+                    )
                     process = await asyncio.create_subprocess_exec(
                         *_command(self.provider, executable, self._model, schema_text),
                         stdin=asyncio.subprocess.PIPE,
-                        stdout=descriptor,
-                        stderr=asyncio.subprocess.DEVNULL,
+                        stdout=output_descriptor,
+                        stderr=asyncio.subprocess.PIPE,
                         cwd=str(cwd),
                         env=_minimal_environment(
                             self._environment,
@@ -396,10 +401,14 @@ class RuntimeCliDistillBackend:
                 except OSError:
                     raise RuntimeDistillBackendError("distill_spawn_failed") from None
                 finally:
-                    os.close(descriptor)
+                    if output_descriptor >= 0:
+                        os.close(output_descriptor)
                 try:
-                    await asyncio.wait_for(
-                        process.communicate(input=stdin_bytes),
+                    diagnostic = await asyncio.wait_for(
+                        communicate_with_bounded_stderr(
+                            process,
+                            input_bytes=stdin_bytes,
+                        ),
                         timeout=self._timeout_seconds,
                     )
                 except asyncio.CancelledError:
@@ -412,8 +421,20 @@ class RuntimeCliDistillBackend:
                     await _stop_process(process)
                     raise RuntimeDistillBackendError("distill_io_failed") from None
                 if process.returncode != 0:
+                    try:
+                        stdout_diagnostic = _read_output(
+                            output,
+                            min(self._max_output_bytes, 64 * 1024),
+                        )
+                    except RuntimeDistillBackendError:
+                        stdout_diagnostic = b""
+                    classified = classify_provider_failure(
+                        self.provider,
+                        diagnostic + b"\n" + stdout_diagnostic,
+                    )
                     raise RuntimeDistillBackendError(
-                        "distill_nonzero_exit", exit_status=process.returncode
+                        classified or "distill_nonzero_exit",
+                        exit_status=process.returncode,
                     )
                 payload = _strip_markdown_fence(
                     _read_output(output, self._max_output_bytes)

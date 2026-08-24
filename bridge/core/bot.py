@@ -106,6 +106,7 @@ class TelegramBot(
         self._project_chat = project_chat
         self._distill_journal = distill_journal
         self._local_sink_unroutable_warned = False
+        self._distill_global_disabled_warned = False
         self._distill_snapshot_worker = distill_snapshot_worker
         # Budget-gated distill extraction worker composed by build_context;
         # retained by the running application so #465's scheduling phase
@@ -252,6 +253,15 @@ class TelegramBot(
         discriminator: str | None = None,
     ) -> DistillJob | None:
         if getattr(self._config, "memory_distill_provider", "auto") == "off":
+            return None
+        from telegram_bot.memory.distill_guard import global_distill_disabled
+
+        if global_distill_disabled():
+            if not getattr(self, "_distill_global_disabled_warned", False):
+                self._distill_global_disabled_warned = True
+                logger.warning(
+                    "Distill enqueue skipped: global disable marker is present"
+                )
             return None
         provider = str(session.get("provider", "claude")).strip().lower()
         thread_id = session.get("session_id")

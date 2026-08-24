@@ -5,6 +5,13 @@ All notable changes to the Claude Code node harness. Dates are KST.
 ## [Unreleased]
 
 ### Fixed
+- Provider-neutral distill now applies the same bounded failure controls to
+  Claude, Codex, and Piri (#1254): one shared `distill.disabled` off-switch,
+  body-free auth/quota/rate-limit/model classification, owner-only
+  provider+model cooldown state, durable exponential retry-after, per-job and
+  per-sweep attempt caps, and a fail-closed finite autonomous budget gate.
+  Bounded stderr is drained without retaining provider bodies, while doctor
+  and `ccc-distill-check` expose only safe circuit and queue state.
 - Distill no longer re-spawns extract on every SessionStart after a
   provider login/expiry/weekly-limit failure. `extract.sh` classifies the
   `claude -p` stdout, writes `distill-last-error.json`, and sets a node

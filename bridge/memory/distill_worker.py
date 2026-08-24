@@ -18,6 +18,7 @@ from .distill_extraction import (
 )
 from .codex_exec_backend import MAX_EXTRACTION_JSON_BYTES
 from .distill_journal import DistillJournal
+from .distill_guard import DistillGuard, PROVIDER_CIRCUIT_CODES
 from .distill_types import DistillExtractionAccounting, DistillJob
 
 logger = logging.getLogger(__name__)
@@ -81,6 +82,7 @@ _RETRYABLE_BACKEND_CODES = frozenset(
         "codex_distill_nonzero_exit",
         "codex_distill_output_invalid",
     }
+    | PROVIDER_CIRCUIT_CODES
 )
 _TERMINAL_BACKEND_CODES = frozenset(
     {
@@ -130,6 +132,10 @@ class CodexDistillExtractionWorker:
         extractor_provider: Literal["claude", "codex", "piri"] = "codex",
         model: str = "provider-default",
         clock: Callable[[], float] = time.monotonic,
+        guard: DistillGuard | None = None,
+        provider_cooldown_seconds: int = 3600,
+        retry_backoff_base_seconds: int = 300,
+        retry_backoff_max_seconds: int = 6 * 3600,
     ) -> None:
         if (
             lease_seconds <= 0
@@ -137,6 +143,12 @@ class CodexDistillExtractionWorker:
             or type(wiki_enabled) is not bool
             or type(honcho_enabled) is not bool
             or extractor_provider not in {"claude", "codex", "piri"}
+            or type(provider_cooldown_seconds) is not int
+            or provider_cooldown_seconds <= 0
+            or type(retry_backoff_base_seconds) is not int
+            or retry_backoff_base_seconds <= 0
+            or type(retry_backoff_max_seconds) is not int
+            or retry_backoff_max_seconds < retry_backoff_base_seconds
         ):
             raise ValueError("invalid distill extraction worker configuration")
         self._journal = journal
@@ -148,6 +160,10 @@ class CodexDistillExtractionWorker:
         self._honcho_enabled = honcho_enabled
         self._extractor_provider = extractor_provider
         self._usage_meter = usage_meter
+        self._guard = guard
+        self._provider_cooldown_seconds = provider_cooldown_seconds
+        self._retry_backoff_base_seconds = retry_backoff_base_seconds
+        self._retry_backoff_max_seconds = retry_backoff_max_seconds
         try:
             DistillExtractionAccounting(model, 0, 0, 0)
         except ValueError:
@@ -182,20 +198,68 @@ class CodexDistillExtractionWorker:
         error_code: str,
         terminal: bool,
         accounting: DistillExtractionAccounting | None = None,
+        retry_after_seconds: int = 0,
     ) -> DistillJob:
-        method = (
-            self._journal.mark_extraction_terminal_failed
-            if terminal
-            else self._journal.mark_extraction_retryable_failed
-        )
+        if terminal:
+            return await asyncio.to_thread(
+                self._journal.mark_extraction_terminal_failed,
+                claimed.job_id,
+                owner_token=self._owner_token,
+                lease_epoch=claimed.extraction_lease_epoch,
+                error_code=error_code,
+                accounting=accounting,
+            )
         return await asyncio.to_thread(
-            method,
+            self._journal.mark_extraction_retryable_failed,
             claimed.job_id,
             owner_token=self._owner_token,
             lease_epoch=claimed.extraction_lease_epoch,
             error_code=error_code,
             accounting=accounting,
+            retry_after_seconds=retry_after_seconds,
         )
+
+    def _retry_delay(self, extraction_attempt: int) -> int:
+        exponent = max(0, min(30, extraction_attempt - 1))
+        return min(
+            self._retry_backoff_max_seconds,
+            self._retry_backoff_base_seconds * (2**exponent),
+        )
+
+    def _guard_decision(self):
+        if self._guard is None:
+            return None
+        return self._guard.decision(self._extractor_provider, self._model)
+
+    def _retry_delay_after_error(
+        self,
+        *,
+        error_code: str,
+        terminal: bool,
+        extraction_attempt: int,
+    ) -> int:
+        if terminal:
+            return 0
+        retry_after_seconds = self._retry_delay(extraction_attempt)
+        if error_code not in PROVIDER_CIRCUIT_CODES or self._guard is None:
+            return retry_after_seconds
+        try:
+            circuit = self._guard.trip(
+                self._extractor_provider,
+                self._model,
+                error_code=error_code,
+                cooldown_seconds=self._provider_cooldown_seconds,
+            )
+            return max(
+                retry_after_seconds,
+                circuit.remaining_seconds(time.time()),
+            )
+        except Exception:
+            logger.warning(
+                "Distill circuit breaker state write failed: provider=%s",
+                self._extractor_provider,
+            )
+            return retry_after_seconds
 
     def _refund_unused_reservation(self, reservation: _ReservationLike | None) -> None:
         """Return budget reserved for an attempt the provider never ran.
@@ -218,6 +282,13 @@ class CodexDistillExtractionWorker:
     async def extract_once(self, *, job_id: str) -> DistillJob:
         reservation: _ReservationLike | None = None
         preview = await asyncio.to_thread(self._journal.get, job_id)
+        guard_decision = self._guard_decision()
+        if guard_decision is not None and not guard_decision.allowed:
+            logger.warning(
+                "Distill extraction deferred by circuit breaker: code=%s",
+                guard_decision.code,
+            )
+            return preview
         preview_snapshot = getattr(preview, "snapshot", None)
         snapshot_bytes = (
             preview_snapshot.byte_count if preview_snapshot is not None else 0
@@ -291,6 +362,18 @@ class CodexDistillExtractionWorker:
                 error_code="distill_input_invalid",
                 terminal=True,
             )
+        guard_decision = self._guard_decision()
+        if guard_decision is not None and not guard_decision.allowed:
+            self._refund_unused_reservation(reservation)
+            return await self._fail(
+                claimed,
+                error_code=guard_decision.code or "distill_provider_cooldown",
+                terminal=False,
+                retry_after_seconds=max(
+                    self._retry_delay(claimed.extraction_attempts),
+                    guard_decision.remaining_seconds(time.time()),
+                ),
+            )
         try:
             started_at = self._clock()
             output = await self._backend.extract(extraction_input)
@@ -299,6 +382,9 @@ class CodexDistillExtractionWorker:
                 claimed,
                 error_code="distill_cancelled",
                 terminal=False,
+                retry_after_seconds=self._retry_delay(
+                    claimed.extraction_attempts
+                ),
                 accounting=self._accounting(
                     snapshot_bytes=snapshot.byte_count,
                     started_at=started_at,
@@ -308,6 +394,11 @@ class CodexDistillExtractionWorker:
             raise
         except Exception as error:
             error_code, terminal = _body_free_error_code(error)
+            retry_after_seconds = self._retry_delay_after_error(
+                error_code=error_code,
+                terminal=terminal,
+                extraction_attempt=claimed.extraction_attempts,
+            )
             # Status only — never provider output. A nonzero exit otherwise
             # reaches the journal as one opaque code whatever the cause was
             # (#760 was a schema rejection and had to be reproduced by hand).
@@ -324,6 +415,7 @@ class CodexDistillExtractionWorker:
                 claimed,
                 error_code=error_code,
                 terminal=terminal,
+                retry_after_seconds=retry_after_seconds,
                 accounting=self._accounting(
                     snapshot_bytes=snapshot.byte_count,
                     started_at=started_at,

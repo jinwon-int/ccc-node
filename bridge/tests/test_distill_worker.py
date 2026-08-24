@@ -19,6 +19,7 @@ from telegram_bot.memory.distill_extraction import (
     DistillExtractionOutput,
 )
 from telegram_bot.memory.distill_journal import DistillJournal
+from telegram_bot.memory.distill_guard import DistillGuard
 from telegram_bot.memory.distill_types import (
     CodexTranscriptSnapshot,
     DistillJob,
@@ -122,6 +123,107 @@ class SuccessfulBackend:
         self.calls.append(extraction_input)
         await asyncio.sleep(0.01)
         return output_for(extraction_input)
+
+
+@pytest.mark.anyio
+async def test_global_disable_marker_defers_before_claim_or_provider(
+    tmp_path: Path,
+) -> None:
+    journal = DistillJournal(tmp_path / "journal")
+    journal.initialize()
+    job = snapshot_done_job(journal)
+    backend = SuccessfulBackend()
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "distill.disabled").touch()
+
+    result = await CodexDistillExtractionWorker(
+        journal,
+        backend,
+        owner_token="guarded-worker",
+        usage_meter=None,
+        guard=DistillGuard(state_dir=state),
+    ).extract_once(job_id=job.job_id)
+
+    assert backend.calls == []
+    assert result.status is DistillJobStatus.SNAPSHOT_DONE
+    assert result.extraction_attempts == 0
+
+
+@pytest.mark.anyio
+async def test_provider_failure_trips_shared_cooldown_for_other_jobs(
+    tmp_path: Path,
+) -> None:
+    journal = DistillJournal(tmp_path / "journal")
+    journal.initialize()
+    first_job = snapshot_done_job(journal, thread_id="thread-auth-1")
+    second_job = snapshot_done_job(journal, thread_id="thread-auth-2")
+
+    class AuthFailureBackend:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def extract(self, extraction_input: DistillExtractionInput) -> Any:
+            del extraction_input
+            self.calls += 1
+            raise CodexDistillBackendError("distill_auth_unavailable")
+
+    backend = AuthFailureBackend()
+    guard = DistillGuard(state_dir=tmp_path / "state")
+    worker = CodexDistillExtractionWorker(
+        journal,
+        backend,
+        owner_token="circuit-worker",
+        usage_meter=None,
+        guard=guard,
+        provider_cooldown_seconds=3600,
+    )
+
+    failed = await worker.extract_once(job_id=first_job.job_id)
+    deferred = await worker.extract_once(job_id=second_job.job_id)
+
+    assert backend.calls == 1
+    assert failed.status is DistillJobStatus.EXTRACTION_RETRYABLE_FAILED
+    assert failed.error_code == "distill_auth_unavailable"
+    assert failed.extraction_retry_after is not None
+    assert deferred.status is DistillJobStatus.SNAPSHOT_DONE
+    assert deferred.extraction_attempts == 0
+
+
+@pytest.mark.anyio
+async def test_retry_after_prevents_each_sweep_from_recalling_provider(
+    tmp_path: Path,
+) -> None:
+    journal = DistillJournal(tmp_path / "journal")
+    journal.initialize()
+    job = snapshot_done_job(journal, thread_id="thread-backoff")
+
+    class TimeoutBackend:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def extract(self, extraction_input: DistillExtractionInput) -> Any:
+            del extraction_input
+            self.calls += 1
+            raise CodexDistillBackendError("codex_distill_timeout")
+
+    backend = TimeoutBackend()
+    worker = CodexDistillExtractionWorker(
+        journal,
+        backend,
+        owner_token="backoff-worker",
+        usage_meter=None,
+        retry_backoff_base_seconds=300,
+    )
+
+    first = await worker.extract_once(job_id=job.job_id)
+    second = await worker.extract_once(job_id=job.job_id)
+
+    assert backend.calls == 1
+    assert first.extraction_attempts == 1
+    assert first.extraction_retry_after is not None
+    assert second.status is DistillJobStatus.EXTRACTION_RETRYABLE_FAILED
+    assert second.extraction_attempts == 1
 
 
 @pytest.mark.anyio

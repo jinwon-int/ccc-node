@@ -15,6 +15,8 @@ LAST="$STATE_DIR/distill-last.json"
 CKPT_DIR="$STATE_DIR/checkpoints"
 DISABLED="$STATE_DIR/distill.disabled"
 DRYRUN="$STATE_DIR/distill.dryrun"
+COMMON_JOURNAL="${CCC_DISTILL_JOURNAL_DIR:-${PROJECT_ROOT:-$PWD}/.telegram_bot/distill-journal}"
+COOLDOWN_DIR="$STATE_DIR/distill-provider-cooldowns"
 OUTPUT="${1:-text}"
 
 # Portable mtime select helper (busybox find has no -printf; see #449).
@@ -41,6 +43,27 @@ case "$queue_lines" in ''|*[!0-9]*) queue_lines=0 ;; esac
 dead_lines=0
 [ -f "$DEAD" ] && [ -s "$DEAD" ] && dead_lines="$(wc -l < "$DEAD" | tr -d '[:space:]')"
 case "$dead_lines" in ''|*[!0-9]*) dead_lines=0 ;; esac
+
+# ---- provider-neutral journal/circuit counts (body-free) -------------------
+common_total=0; common_ready=0; common_retryable=0; common_done=0; common_terminal=0
+if [ -d "$COMMON_JOURNAL" ]; then
+  for common_job in "$COMMON_JOURNAL"/*.json; do
+    [ -f "$common_job" ] || continue
+    common_total=$((common_total + 1))
+    common_status="$(jq -r '.status // "unknown"' "$common_job" 2>/dev/null || printf 'invalid')"
+    case "$common_status" in
+      snapshot_done) common_ready=$((common_ready + 1)) ;;
+      extraction_retryable_failed) common_retryable=$((common_retryable + 1)) ;;
+      extraction_done) common_done=$((common_done + 1)) ;;
+      extraction_terminal_failed) common_terminal=$((common_terminal + 1)) ;;
+    esac
+  done
+fi
+cooldown_files=0
+if [ -d "$COOLDOWN_DIR" ]; then
+  cooldown_files="$(find "$COOLDOWN_DIR" -maxdepth 1 -type f -name '*.json' 2>/dev/null | wc -l | tr -d '[:space:]')"
+  case "$cooldown_files" in ''|*[!0-9]*) cooldown_files=0 ;; esac
+fi
 
 # ---- last distill result ----------------------------------------------------
 last_summary="none"
@@ -107,18 +130,29 @@ if [ "$OUTPUT" = "--json" ]; then
     --argjson drain_ok "$drain_ok" \
     --argjson drain_failed "$drain_failed" \
     --argjson drain_drop "$drain_drop" \
+    --arg common_journal "$COMMON_JOURNAL" \
+    --argjson common_total "$common_total" \
+    --argjson common_ready "$common_ready" \
+    --argjson common_retryable "$common_retryable" \
+    --argjson common_done "$common_done" \
+    --argjson common_terminal "$common_terminal" \
+    --argjson cooldown_files "$cooldown_files" \
     '{mode:$mode, last:$last, state_dir:$state_dir, state_dir_ok:$state_dir_ok,
       honcho_base:$honcho_base,
       queue:{lines:$queue_lines, dead:$dead_lines},
       checkpoint:{dir:$ckpt_dir, snapshots:$ckpt_snapshots, last:$ckpt_last},
       triggers:{manual:$manual, sessionend:$sessionend, precompact:$precompact},
-      drain:{ok:$drain_ok, failed:$drain_failed, dropped:$drain_drop}}'
+      drain:{ok:$drain_ok, failed:$drain_failed, dropped:$drain_drop},
+      provider_neutral:{journal:$common_journal, total:$common_total,
+        ready:$common_ready, retryable:$common_retryable, done:$common_done,
+        terminal:$common_terminal, cooldown_files:$cooldown_files}}'
 else
   printf '# ccc distill check\n\n'
   printf -- '- state dir:  `%s` (%s)\n' "$STATE_DIR" "$state_dir_ok"
   printf -- '- mode:       `%s`\n' "$MODE"
   printf -- '- last:       %s\n' "$last_summary"
   printf -- '- queue:      %s lines (dead: %s)\n' "$queue_lines" "$dead_lines"
+  printf -- '- common:     %s jobs (ready: %s, retryable: %s, done: %s, terminal: %s, cooldown files: %s)\n' "$common_total" "$common_ready" "$common_retryable" "$common_done" "$common_terminal" "$cooldown_files"
   printf -- '- checkpoint: %s snapshots (last: %s)\n' "$checkpoint_snapshots" "$checkpoint_last"
   printf -- '- honcho:     %s\n' "$honcho_base"
   printf '\n## triggers (14d)\n\n'

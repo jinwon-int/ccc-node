@@ -308,6 +308,12 @@ a provider turn or reads transcript/credential files.
 | `CCC_MEMORY_DISTILL_PROVIDER` | Claude/Codex/Piri | `auto` | Extractor backend: `auto` follows `CCC_AGENT_PROVIDER`; explicit `claude`/`codex`/`piri` overrides; `off` disables shared distill workers |
 | `CCC_MEMORY_DISTILL_MODEL` | Claude/Codex/Piri | `provider-default` | Isolated extractor model; provider-default follows the selected runtime configuration and accepts provider-qualified Piri model IDs |
 | `CCC_MEMORY_DISTILL_TIMEOUT_SEC` | Claude/Codex/Piri | `120` | Per-attempt provider-neutral extraction timeout, bounded to 1–600 seconds |
+| `CCC_MEMORY_DISTILL_ALLOW_UNBOUNDED` | Claude/Codex/Piri | `false` | Explicit escape hatch for extraction without a finite autonomous provider budget; default fails closed |
+| `CCC_MEMORY_DISTILL_MAX_ATTEMPTS` | Claude/Codex/Piri | `5` | Maximum extraction attempts retained per journal job |
+| `CCC_MEMORY_DISTILL_RETRY_BACKOFF_BASE_SEC` | Claude/Codex/Piri | `300` | Initial durable retry-after; subsequent retry delays double |
+| `CCC_MEMORY_DISTILL_RETRY_BACKOFF_MAX_SEC` | Claude/Codex/Piri | `21600` | Maximum durable extraction retry delay |
+| `CCC_MEMORY_DISTILL_PROVIDER_COOLDOWN_SEC` | Claude/Codex/Piri | `3600` | Provider+model cooldown after auth, quota, rate-limit, or model availability failure |
+| `CCC_MEMORY_DISTILL_MAX_JOBS_PER_SWEEP` | Claude/Codex/Piri | `1` | Maximum extraction jobs attempted during one scheduler sweep |
 | `CCC_MEMORY_DISTILL_CHECKPOINT_TURNS` | Claude/Codex/Piri | `0` | Completed-turn checkpoint gate for the shared journal; 0 disables |
 | `CCC_MEMORY_DISTILL_CHECKPOINT_BYTES` | Claude/Codex/Piri | `0` | UTF-8 checkpoint byte gate for the shared journal; 0 disables |
 | `CCC_MEMORY_DISTILL_CHECKPOINT_AGE_SECONDS` | Claude/Codex/Piri | `0` | Runtime-age checkpoint gate for the shared journal; 0 disables |

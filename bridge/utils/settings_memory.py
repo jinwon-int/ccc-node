@@ -194,6 +194,53 @@ class MemorySettingsMixin:
         alias="CCC_MEMORY_DISTILL_TIMEOUT_SEC",
         description="Bounded timeout for one isolated provider-neutral distill call.",
     )
+    memory_distill_allow_unbounded: bool = Field(
+        default=False,
+        alias="CCC_MEMORY_DISTILL_ALLOW_UNBOUNDED",
+        description=(
+            "Explicit escape hatch for provider-neutral autonomous extraction "
+            "without a finite provider budget. False fails closed when the "
+            "effective provider budget is zero or usage metering is disabled."
+        ),
+    )
+    memory_distill_max_attempts: int = Field(
+        default=5,
+        ge=1,
+        le=20,
+        alias="CCC_MEMORY_DISTILL_MAX_ATTEMPTS",
+        description="Maximum provider extraction attempts retained per journal job.",
+    )
+    memory_distill_retry_backoff_base_seconds: int = Field(
+        default=300,
+        ge=1,
+        le=24 * 60 * 60,
+        alias="CCC_MEMORY_DISTILL_RETRY_BACKOFF_BASE_SEC",
+        description="Initial durable extraction retry delay; subsequent retries double.",
+    )
+    memory_distill_retry_backoff_max_seconds: int = Field(
+        default=6 * 60 * 60,
+        ge=1,
+        le=7 * 24 * 60 * 60,
+        alias="CCC_MEMORY_DISTILL_RETRY_BACKOFF_MAX_SEC",
+        description="Maximum durable extraction retry delay.",
+    )
+    memory_distill_provider_cooldown_seconds: int = Field(
+        default=60 * 60,
+        ge=60,
+        le=7 * 24 * 60 * 60,
+        alias="CCC_MEMORY_DISTILL_PROVIDER_COOLDOWN_SEC",
+        description=(
+            "Provider+model circuit-breaker cooldown after auth, quota, "
+            "rate-limit, or model-availability failures."
+        ),
+    )
+    memory_distill_max_jobs_per_sweep: int = Field(
+        default=1,
+        ge=1,
+        le=100,
+        alias="CCC_MEMORY_DISTILL_MAX_JOBS_PER_SWEEP",
+        description="Maximum provider extraction attempts in one scheduler sweep.",
+    )
     memory_distill_checkpoint_turns: int = Field(
         default=0,
         ge=0,
@@ -282,6 +329,14 @@ class MemorySettingsMixin:
 
     @model_validator(mode="after")
     def validate_bridge_memory_scope(self):
+        if (
+            self.memory_distill_retry_backoff_max_seconds
+            < self.memory_distill_retry_backoff_base_seconds
+        ):
+            raise ValueError(
+                "CCC_MEMORY_DISTILL_RETRY_BACKOFF_MAX_SEC must be greater than "
+                "or equal to CCC_MEMORY_DISTILL_RETRY_BACKOFF_BASE_SEC"
+            )
         assert_memory_scope_safe(
             self.bridge_memory_mode,
             self.telegram_session_scope,

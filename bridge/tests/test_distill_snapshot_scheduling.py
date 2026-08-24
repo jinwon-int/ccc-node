@@ -190,3 +190,94 @@ async def test_lifecycle_loop_recovers_expired_snapshot_lease(tmp_path: Path) ->
     recovered = journal.get(job.job_id)
     assert recovered.status is DistillJobStatus.SNAPSHOT_DONE
     assert recovered.attempts == 2
+
+
+@pytest.mark.anyio
+async def test_extraction_loop_attempts_only_configured_jobs_per_sweep() -> None:
+    class Journal:
+        def recover_stale_running(self) -> int:
+            return 0
+
+        def list_jobs(self):
+            return tuple(
+                SimpleNamespace(
+                    job_id=f"job-{index}",
+                    status=DistillJobStatus.SNAPSHOT_DONE,
+                )
+                for index in range(3)
+            )
+
+    class Worker:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        async def extract_once(self, *, job_id: str):
+            self.calls.append(job_id)
+
+    worker = Worker()
+    bot = TelegramBot.__new__(TelegramBot)
+    bot._distill_journal = Journal()
+    bot._distill_extraction_worker = worker
+    bot._config = SimpleNamespace(
+        distill_extraction_poll_interval=60,
+        memory_distill_max_jobs_per_sweep=1,
+    )
+    stop = asyncio.Event()
+    task = asyncio.create_task(bot._distill_extraction_loop(stop))
+    try:
+        deadline = asyncio.get_running_loop().time() + 1
+        while not worker.calls and asyncio.get_running_loop().time() < deadline:
+            await asyncio.sleep(0.01)
+        assert worker.calls == ["job-0"]
+    finally:
+        stop.set()
+        await asyncio.wait_for(task, timeout=2)
+
+
+@pytest.mark.anyio
+async def test_extraction_loop_skips_retry_after_without_starving_fresh_job() -> None:
+    future = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+
+    class Journal:
+        def recover_stale_running(self) -> int:
+            return 0
+
+        def list_jobs(self):
+            return (
+                SimpleNamespace(
+                    job_id="delayed",
+                    status=DistillJobStatus.EXTRACTION_RETRYABLE_FAILED,
+                    extraction_retry_after=future,
+                ),
+                SimpleNamespace(
+                    job_id="fresh",
+                    status=DistillJobStatus.SNAPSHOT_DONE,
+                    extraction_retry_after=None,
+                ),
+            )
+
+    class Worker:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        async def extract_once(self, *, job_id: str):
+            self.calls.append(job_id)
+
+    worker = Worker()
+    bot = TelegramBot.__new__(TelegramBot)
+    bot._distill_journal = Journal()
+    bot._distill_extraction_worker = worker
+    bot._config = SimpleNamespace(
+        distill_extraction_poll_interval=60,
+        memory_distill_max_jobs_per_sweep=1,
+    )
+    stop = asyncio.Event()
+    task = asyncio.create_task(bot._distill_extraction_loop(stop))
+    try:
+        deadline = asyncio.get_running_loop().time() + 1
+        while not worker.calls and asyncio.get_running_loop().time() < deadline:
+            await asyncio.sleep(0.01)
+        assert worker.calls == ["fresh"]
+    finally:
+        stop.set()
+        await asyncio.wait_for(task, timeout=2)
