@@ -124,5 +124,8 @@ w leak '{"w1":{"wait_id":"w1","state":"monitoring","repo":"o/r","pr_number":1,
 out="$(python3 "$MOD" "$TMP/leak.json")"
 ok "unknown free-text fields are not rendered" '! grep -q "SECRET" <<<"$out"'
 
-echo "pending_promises: pass=$pass fail=$fail"
+# The summary line format is load-bearing: validate-harness.sh's
+# suite_summary() greps for exactly ^PASS=<n> FAIL=<n>$, so a lowercase variant
+# reads as a suite that asserted nothing.
+echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
