@@ -44,6 +44,7 @@ for f in claude/settings.base.json claude/settings.local.template.json \
          claude/hooks/enforcement-overlay.json \
          .claude-plugin/marketplace.json \
          claude/.claude-plugin/plugin.json claude/hooks/hooks.json \
+         schemas/auto-distill-evaluation-receipt-v1.schema.json \
          schemas/agent-cron-task-store.schema.json \
          architecture/architecture-contract-v1.json \
          architecture/side-effect-contract-v1.json; do

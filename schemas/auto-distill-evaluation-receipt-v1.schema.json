@@ -1,0 +1,126 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://jinwon-int.github.io/ccc-node/schemas/auto-distill-evaluation-receipt-v1.schema.json",
+  "title": "ccc-node auto-distill exact-source evaluation receipt",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "pipeline", "subject", "evaluation", "issued_at"],
+  "properties": {
+    "schema": {"const": "ccc.auto-distill.evaluation-receipt.v1"},
+    "pipeline": {"type": "integer", "minimum": 1},
+    "subject": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256", "surface_schema", "surface_sha256", "surface_members"],
+      "properties": {
+        "path": {"const": "scripts/auto-distill/auto-distill.py"},
+        "sha256": {"$ref": "#/$defs/sha256"},
+        "surface_schema": {"const": "ccc.auto-distill.canon-surface.v1"},
+        "surface_sha256": {"$ref": "#/$defs/sha256"},
+        "surface_members": {
+          "const": [
+            "assign:PIPELINE",
+            "assign:CANON_PROMPT",
+            "assign:CANON_EXCLUDE",
+            "assign:_FOCUS_WORD_RE",
+            "assign:TOKEN_RES",
+            "assign:SELF_ADDR_RE",
+            "function:unwrap_claude_envelope",
+            "function:extract_json",
+            "function:_focus_needles",
+            "function:_needle_score",
+            "function:_window_body",
+            "function:section_body",
+            "function:literal_hits",
+            "function:self_canon_addrs",
+            "function:format_self_canon",
+            "function:self_canon_sections",
+            "function:canon_snippets",
+            "function:canon_dedup"
+          ]
+        }
+      }
+    },
+    "evaluation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id", "evaluated_source_sha256", "completed_at", "provider", "model",
+        "corpus", "harness", "artifacts", "recheck", "confusion",
+        "collateral_damage", "passed"
+      ],
+      "properties": {
+        "id": {"type": "string", "pattern": "^TM-[0-9][0-9A-Za-z-]*$"},
+        "evaluated_source_sha256": {"$ref": "#/$defs/sha256"},
+        "completed_at": {"type": "string", "format": "date-time"},
+        "provider": {"type": "string", "minLength": 1, "maxLength": 80},
+        "model": {"type": "string", "minLength": 1, "maxLength": 80},
+        "corpus": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "sample", "sample_md5", "sample_sha256", "verdicts",
+            "verdicts_md5", "verdicts_sha256", "cases"
+          ],
+          "properties": {
+            "sample": {"type": "string", "minLength": 1, "maxLength": 128},
+            "sample_md5": {"$ref": "#/$defs/md5"},
+            "sample_sha256": {"$ref": "#/$defs/sha256"},
+            "verdicts": {"type": "string", "minLength": 1, "maxLength": 128},
+            "verdicts_md5": {"$ref": "#/$defs/md5"},
+            "verdicts_sha256": {"$ref": "#/$defs/sha256"},
+            "cases": {"type": "integer", "minimum": 1}
+          }
+        },
+        "harness": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["eval_canon_sha256", "recheck_addr_sha256"],
+          "properties": {
+            "eval_canon_sha256": {"$ref": "#/$defs/sha256"},
+            "recheck_addr_sha256": {"$ref": "#/$defs/sha256"}
+          }
+        },
+        "artifacts": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["eval_log_sha256", "eval_result_sha256", "recheck_log_sha256"],
+          "properties": {
+            "eval_log_sha256": {"$ref": "#/$defs/sha256"},
+            "eval_result_sha256": {"$ref": "#/$defs/sha256"},
+            "recheck_log_sha256": {"$ref": "#/$defs/sha256"}
+          }
+        },
+        "recheck": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["baseline_duplicates", "duplicates", "cases", "suspect"],
+          "properties": {
+            "baseline_duplicates": {"type": "integer", "minimum": 0},
+            "duplicates": {"type": "integer", "minimum": 0},
+            "cases": {"type": "integer", "minimum": 1},
+            "suspect": {"type": "integer", "minimum": 0}
+          }
+        },
+        "confusion": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["tp", "fp", "fn", "tn"],
+          "properties": {
+            "tp": {"type": "integer", "minimum": 1},
+            "fp": {"type": "integer", "minimum": 0},
+            "fn": {"type": "integer", "minimum": 0},
+            "tn": {"type": "integer", "minimum": 0}
+          }
+        },
+        "collateral_damage": {"const": 0},
+        "passed": {"const": true}
+      }
+    },
+    "issued_at": {"type": "string", "format": "date-time"}
+  },
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "md5": {"type": "string", "pattern": "^[0-9a-f]{32}$"}
+  }
+}

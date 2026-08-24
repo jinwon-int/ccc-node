@@ -3,8 +3,11 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -13,7 +16,13 @@ import unittest
 ROOT = Path(__file__).resolve().parents[2]
 INSTALLER = ROOT / "scripts/install-auto-distill.sh"
 SOURCE = ROOT / "scripts/auto-distill"
-FILES = ("auto-distill.py", "metrics.py", "model_command.py")
+FILES = ("auto-distill.py", "metrics.py", "model_command.py", "evaluation-receipt.json")
+MODES = {
+    "auto-distill.py": 0o700,
+    "metrics.py": 0o700,
+    "model_command.py": 0o700,
+    "evaluation-receipt.json": 0o600,
+}
 
 
 class AutoDistillInstallerTest(unittest.TestCase):
@@ -30,12 +39,13 @@ class AutoDistillInstallerTest(unittest.TestCase):
         action: str,
         *,
         environment_updates: dict[str, str] | None = None,
+        installer: Path = INSTALLER,
     ) -> subprocess.CompletedProcess[str]:
         environment = os.environ.copy()
         environment["CCC_AUTO_DISTILL_TARGET_HOME"] = str(self.home)
         environment.update(environment_updates or {})
         return subprocess.run(
-            ["bash", str(INSTALLER), action],
+            ["bash", str(installer), action],
             capture_output=True,
             text=True,
             timeout=20,
@@ -46,6 +56,17 @@ class AutoDistillInstallerTest(unittest.TestCase):
     @property
     def destination(self) -> Path:
         return self.home / ".hermes/auto-distill"
+
+    def copy_installer_tree(self) -> tuple[Path, Path]:
+        scripts = Path(self.temp.name) / "fixture-scripts"
+        scripts.mkdir()
+        fixture_installer = scripts / INSTALLER.name
+        fixture_verifier = scripts / "verify-auto-distill-receipt.py"
+        shutil.copy2(INSTALLER, fixture_installer)
+        shutil.copy2(ROOT / "scripts/verify-auto-distill-receipt.py", fixture_verifier)
+        fixture_source = scripts / "auto-distill"
+        shutil.copytree(SOURCE, fixture_source)
+        return fixture_installer, fixture_source
 
     def test_preview_is_non_mutating(self) -> None:
         result = self.run_installer("--preview")
@@ -59,8 +80,9 @@ class AutoDistillInstallerTest(unittest.TestCase):
         for name in FILES:
             installed = self.destination / name
             self.assertEqual(installed.read_bytes(), (SOURCE / name).read_bytes())
-            self.assertEqual(installed.stat().st_mode & 0o777, 0o700)
+            self.assertEqual(installed.stat().st_mode & 0o777, MODES[name])
         self.assertIn("cron/services: unchanged", result.stdout)
+        self.assertIn("evaluation receipt ok", result.stdout)
 
     def test_reapply_is_idempotent_without_backup(self) -> None:
         self.assertEqual(self.run_installer("--apply").returncode, 0)
@@ -128,6 +150,83 @@ exec /bin/mv "$@"
         drifted = self.run_installer("--check")
         self.assertEqual(drifted.returncode, 1)
         self.assertIn("drift metrics.py", drifted.stdout)
+
+    def test_missing_receipt_fails_closed_before_preview_mutation(self) -> None:
+        installer, source = self.copy_installer_tree()
+        (source / "evaluation-receipt.json").unlink()
+        result = self.run_installer("--preview", installer=installer)
+        self.assertEqual(result.returncode, 3)
+        self.assertIn("evaluation receipt invalid", result.stderr)
+        self.assertFalse(self.destination.exists())
+
+    def test_stale_full_source_hash_fails_closed(self) -> None:
+        installer, source = self.copy_installer_tree()
+        with (source / "auto-distill.py").open("a", encoding="utf-8") as handle:
+            handle.write("\n# unreceipted source drift\n")
+        result = self.run_installer("--apply", installer=installer)
+        self.assertEqual(result.returncode, 3)
+        self.assertIn("subject SHA-256", result.stderr)
+        self.assertFalse(self.destination.exists())
+
+    def test_surface_drift_fails_even_when_full_hash_field_is_rewritten(self) -> None:
+        installer, source = self.copy_installer_tree()
+        target = source / "auto-distill.py"
+        text = target.read_text(encoding="utf-8")
+        target.write_text(
+            text.replace("def _needle_score(text, needles):", "def _needle_score(text, needles):\n    # untested semantic surface"),
+            encoding="utf-8",
+        )
+        receipt_path = source / "evaluation-receipt.json"
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        changed_sha = hashlib.sha256(target.read_bytes()).hexdigest()
+        receipt["subject"]["sha256"] = changed_sha
+        receipt["evaluation"]["evaluated_source_sha256"] = changed_sha
+        receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+        result = self.run_installer("--apply", installer=installer)
+        self.assertEqual(result.returncode, 3)
+        self.assertIn("surface SHA-256", result.stderr)
+        self.assertFalse(self.destination.exists())
+
+    def test_failed_gate_receipt_is_rejected(self) -> None:
+        installer, source = self.copy_installer_tree()
+        receipt_path = source / "evaluation-receipt.json"
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        receipt["evaluation"]["passed"] = False
+        receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+        result = self.run_installer("--apply", installer=installer)
+        self.assertEqual(result.returncode, 3)
+        self.assertIn("not signed as passed", result.stderr)
+        self.assertFalse(self.destination.exists())
+
+    def test_invalid_receipt_does_not_touch_existing_target(self) -> None:
+        installer, source = self.copy_installer_tree()
+        self.destination.mkdir(parents=True, mode=0o700)
+        existing = self.destination / "auto-distill.py"
+        existing.write_text("preserve-existing-target\n", encoding="utf-8")
+        receipt_path = source / "evaluation-receipt.json"
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        receipt["evaluation"]["collateral_damage"] = 1
+        receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+
+        result = self.run_installer("--apply", installer=installer)
+
+        self.assertEqual(result.returncode, 3)
+        self.assertIn("collateral damage", result.stderr)
+        self.assertEqual(existing.read_text(encoding="utf-8"), "preserve-existing-target\n")
+        self.assertFalse((self.home / ".hermes/backups/auto-distill").exists())
+
+    def test_symlinked_managed_receipt_is_rejected(self) -> None:
+        installer, source = self.copy_installer_tree()
+        receipt_path = source / "evaluation-receipt.json"
+        referent = Path(self.temp.name) / "outside-receipt.json"
+        receipt_path.replace(referent)
+        receipt_path.symlink_to(referent)
+
+        result = self.run_installer("--apply", installer=installer)
+
+        self.assertEqual(result.returncode, 3)
+        self.assertIn("missing or unsafe", result.stderr)
+        self.assertFalse(self.destination.exists())
 
     def test_symlink_target_is_rejected_without_touching_referent(self) -> None:
         self.destination.mkdir(parents=True, mode=0o700)

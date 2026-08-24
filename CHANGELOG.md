@@ -5,6 +5,15 @@ All notable changes to the Claude Code node harness. Dates are KST.
 ## [Unreleased]
 
 ### Fixed
+- Auto-distill deployment now fails closed without a repository-reviewed
+  exact-source evaluation receipt (#1262). Preview/check/apply bind the target
+  Pipeline, full source SHA-256, canonical-dedup evaluation surface, corpus
+  metadata, time ordering, confusion matrix, improved address recheck, zero
+  collateral damage, and non-all-keep result. Missing, malformed, stale, or
+  failed receipts cannot mutate the target; the owner-only installed receipt
+  joins the existing transactional backup/rollback boundary. Any source-byte
+  change requires a fresh evaluation and receipt instead of trusting the
+  Pipeline number alone.
 - TM-2380 auto-distill is now repository-managed instead of a five-node
   hand-deployed script (#1257). Its model resolver recovers Piri configuration
   from the cron environment, the bridge systemd unit, `/opt/piri`, the Termux
