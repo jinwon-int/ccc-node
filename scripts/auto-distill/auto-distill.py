@@ -714,7 +714,10 @@ TOKEN_RES = [
     # 문서를 잔뜩 물어오므로, 코드 식별자의 표식(중간 대문자·밑줄·숫자)을 요구한다.
     # 길이는 정규식 lookbehind 로 재면 **토큰 길이가 아니라 앞 문자 수**를 재게 되어
     # 뒤쪽의 짧은 토큰이 통과한다(실측: `PR` 이 잡혔다). 길이는 코드에서 건다.
-    re.compile(r"\b([a-zA-Z][a-zA-Z0-9_]*(?:[A-Z_0-9][a-zA-Z0-9_]*)+(?:\.[a-z]{2,4})?)\b"),
+    # Consume the first required marker with disjoint character classes. The
+    # previous overlapping ``*``/``+`` groups could backtrack exponentially
+    # on long digit runs (CodeQL py/redos, #1257).
+    re.compile(r"\b([A-Za-z][a-z]*[A-Z0-9_][A-Za-z0-9_]*(?:\.[a-z]{2,4})?)\b"),
     re.compile(r"(?:PR\s*)?(#\d{3,6})\b"),                    # PR/이슈 번호
 ]
 

@@ -261,6 +261,27 @@ class ModelCommandTest(unittest.TestCase):
         self.assertEqual(raw, "")
         self.assertNotIn("/private/path", error)
 
+    def test_identifier_regex_is_linear_and_keeps_marker_contract(self) -> None:
+        identifier = AUTO_DISTILL.TOKEN_RES[3]
+        accepted = [
+            "providerGuard",
+            "provider_guard",
+            "provider2",
+            "A2A",
+            "guardFile.sh",
+        ]
+        rejected = ["observation", "primitives", "abcdef"]
+        self.assertEqual(
+            [identifier.fullmatch(value) is not None for value in accepted],
+            [True] * len(accepted),
+        )
+        self.assertEqual(
+            [identifier.fullmatch(value) is not None for value in rejected],
+            [False] * len(rejected),
+        )
+        long_digit_run = "a" + ("0" * 100_000)
+        self.assertIsNotNone(identifier.fullmatch(long_digit_run))
+
     def test_main_reports_custom_engine_and_writes_body_free_audit(self) -> None:
         custom = self.executable("custom")
         session_dir = self.home / ".piri/agent/sessions"
