@@ -32,6 +32,11 @@ Write gate (#890 — graph-engineering review):
       near-duplicate landed under a different session id is still compared.
   G4  kind=constraint (금지/필수 rules) is stored near-verbatim and always
       injected by `snapshot` regardless of the recency limit.
+  G5  kind=decision must carry its reason (#1264 — bench q7 measured a
+      reasonless decision only the Wiki layer could answer). The reason rides
+      a structured `because` field or an inline marker (때문/근거/이유) in the
+      sentence itself; a decision with neither is stored but flagged review=1.
+      Never rejects — the fact is kept, the gap is surfaced.
 
 Usage:
   nunchi.py init
@@ -40,6 +45,7 @@ Usage:
   nunchi.py dialectic <query> [--target T]   # facts + MemPalace + Haiku
   nunchi.py synthesize <query>               # answer from stdin evidence (bench Wiki layer)
   nunchi.py supersede <fact_id> <new text>   # close old, insert new
+  nunchi.py annotate <fact_id> --because <reason>  # backfill a decision's reason
   nunchi.py snapshot [--limit N]             # SessionStart-ready summary
   nunchi.py review-stale [--close]           # G1 retro pass over old facts
   nunchi.py metrics                          # body-free counters for bench
@@ -95,7 +101,8 @@ CREATE TABLE IF NOT EXISTS peer_facts (
   dedup TEXT UNIQUE,
   created_at TEXT NOT NULL,
   source_rank INTEGER DEFAULT 1,
-  review INTEGER DEFAULT 0
+  review INTEGER DEFAULT 0,
+  because TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_peer ON peer_facts(observer, observed, valid_to);
 CREATE VIRTUAL TABLE IF NOT EXISTS facts_fts USING fts5(
@@ -130,10 +137,12 @@ def _migrate_fts(c):
 
 
 def _migrate_gate_cols(c):
-    """#890 — add write-gate columns to a pre-gate DB, lossless in place."""
+    """#890 — add write-gate columns to a pre-gate DB, lossless in place.
+    #1264 adds `because` (G5) through the same path."""
     cols = [r[1] for r in c.execute("PRAGMA table_info(peer_facts)")]
     for name, ddl in (("source_rank", "source_rank INTEGER DEFAULT 1"),
-                      ("review", "review INTEGER DEFAULT 0")):
+                      ("review", "review INTEGER DEFAULT 0"),
+                      ("because", "because TEXT")):
         if name not in cols:
             try:
                 c.execute(f"ALTER TABLE peer_facts ADD COLUMN {ddl}")
@@ -260,6 +269,11 @@ _DONE = re.compile(
     r"완료|완결|종결|머지|MERGED|병합|해소|확정|성공|폐기|설치됨|닫힘|CLOSED|배포됨", re.IGNORECASE)
 
 _SOURCE_RANK = {"user-stated": 3, "measured": 2, "inferred": 1}
+
+# G5 (#1264) — an inline reason marker makes a decision self-contained even
+# without the structured `because` field (the Claude lane historically embeds
+# the reason in the sentence; both forms satisfy the gate).
+_REASON_INLINE = re.compile(r"때문|근거|이유|덕분|위해|목적")
 
 
 def _quote_key(text):
@@ -466,6 +480,13 @@ def ingest(path):
             skipped_mutable += 1
             continue
         rank, review = _verify_rank(it, transcript)
+        because = (it.get("because") or "").strip() or None
+        # G5 (#1264): a decision without its reason — neither a structured
+        # because nor an inline marker — is stored but flagged for the owner
+        # queue. Reasonless decisions get blindly re-litigated or blindly
+        # obeyed later; both are measured failure modes (bench q7).
+        if kind == "decision" and not because and not _REASON_INLINE.search(text):
+            review = 1
         superseded = None
         if auto_supersede:
             if kind == "correction":
@@ -481,11 +502,11 @@ def ingest(path):
         try:
             c.execute(
                 "INSERT INTO peer_facts(observer,observed,kind,fact,evidence,valid_from,"
-                "supersedes,dedup,created_at,source_rank,review)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                "supersedes,dedup,created_at,source_rank,review,because)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                 (OBSERVER, observed, kind, text, evidence,
                  payload.get("distilled_at") or now(), superseded, dedup, now(),
-                 rank, review))
+                 rank, review, because))
             n += 1
         except sqlite3.IntegrityError:
             pass  # duplicate fact already stored
@@ -514,23 +535,28 @@ def search(c, query, target=None, limit=10, include_history=False):
     q = " OR ".join(f'"{w}"' for w in words) or f'"{query}"'
     try:
         rows = c.execute(
-            f"SELECT f.id,f.observed,f.kind,f.fact,f.valid_from,f.valid_to,bm25(facts_fts) r"
+            f"SELECT f.id,f.observed,f.kind,f.fact,f.valid_from,f.valid_to,f.because,bm25(facts_fts) r"
             f" FROM facts_fts x JOIN peer_facts f ON f.id=x.rowid"
             f" WHERE facts_fts MATCH ? AND {where}"
             f" ORDER BY r LIMIT ?", [q] + args + [limit]).fetchall()
     except sqlite3.OperationalError:
         like = f"%{query}%"
         rows = c.execute(
-            f"SELECT id,observed,kind,fact,valid_from,valid_to,0 FROM peer_facts f"
+            f"SELECT id,observed,kind,fact,valid_from,valid_to,because,0 FROM peer_facts f"
             f" WHERE (fact LIKE ? OR observed LIKE ?) AND {where} ORDER BY id DESC LIMIT ?",
             [like, like] + args + [limit]).fetchall()
     return rows
 
 
+def _because_suffix(because):
+    """G5 surfacing — attach the stored reason wherever a fact is shown."""
+    return f" (근거: {because})" if because else ""
+
+
 def recall(query, target, limit):
     for r in search(db(), query, target, limit, include_history=True):
         closed = f" ~{r[5]}]" if r[5] else ""
-        print(f"[#{r[0]} {r[1]} ({r[2]}) {r[4][:10]}{closed} {r[3]}")
+        print(f"[#{r[0]} {r[1]} ({r[2]}) {r[4][:10]}{closed} {r[3]}{_because_suffix(r[6])}")
 
 
 # Provider notices that mean "this backend produced no answer". Kept byte-identical
@@ -809,8 +835,8 @@ def synthesize_stdin(query):
 def dialectic(query, target):
     c = db()
     facts = search(c, query, target, limit=12, include_history=True)
-    current = [f"- {r[3]}" for r in facts if not r[5]]
-    history = [f"- ({r[4][:10]}~{r[5][:10]}) {r[3]}" for r in facts if r[5]]
+    current = [f"- {r[3]}{_because_suffix(r[6])}" for r in facts if not r[5]]
+    history = [f"- ({r[4][:10]}~{r[5][:10]}) {r[3]}{_because_suffix(r[6])}" for r in facts if r[5]]
     verbatim = mempalace_verbatim(query, 3)   # §3: verbatim layer, optional
     prompt = (
         "아래는 peer 메모리(요약 사실)와 MemPalace(원문 발췌)에서 검색한 근거다. 질문에 한국어로 간결·정확히 답하라.\n"
@@ -819,6 +845,23 @@ def dialectic(query, target):
         "\n\n[peer 사실 — 과거 이력]\n" + ("\n".join(history) or "(없음)") +
         "\n\n[MemPalace 원문 발췌]\n" + (verbatim or "(없음)"))
     print(llm_synthesize(prompt))
+
+
+def annotate(fid, because):
+    """G5 backfill — attach a reason to an existing (pre-G5) decision fact.
+
+    The review flag is NOT cleared: it may also owe to G2/G3, and clearing
+    stays explicit and per-fact (`review <id> --clear`).
+    """
+    if not (because or "").strip():
+        sys.exit("annotate: empty --because")
+    c = db()
+    cur = c.execute("UPDATE peer_facts SET because=? WHERE id=?",
+                    (because.strip(), fid))
+    if cur.rowcount == 0:
+        sys.exit(f"no fact #{fid}")
+    c.commit()
+    print(f"#{fid} because set (review flag unchanged — clear: nunchi.py review {fid} --clear)")
 
 
 def supersede(fid, new_text):
@@ -1005,6 +1048,8 @@ if __name__ == "__main__":
         dialectic(args[0], flag("--target"))
     elif cmd == "synthesize":
         synthesize_stdin(args[0])
+    elif cmd == "annotate":
+        annotate(int(args[0]), flag("--because", ""))
     elif cmd == "supersede":
         supersede(int(args[0]), args[1])
     elif cmd == "snapshot":

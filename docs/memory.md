@@ -349,6 +349,13 @@ bounded by `CCC_MEMORY_DISTILL_MAX_JOBS_PER_SWEEP` (1).
   schema. Every object rejects additional properties. Honcho facts are capped at 12,
   Wiki candidates at 3, Wiki paths are limited to relative `pages/team/...`,
   `pages/nodes/...`, or `pages/log.md` targets, and resume/evidence fields are bounded.
+  Each Honcho fact carries a required-but-nullable `because` (#1264): extractors set
+  it to the one-sentence reason for every `kind=decision` fact — a decision without
+  its why gets blindly re-litigated or blindly obeyed (weekly bench q7 measured a
+  decision whose reason survived only in the Wiki). The parser accepts pre-#1264
+  payloads with the key absent; the nunchi G5 write gate, not schema rejection,
+  flags reasonless decisions for owner review so one lazy extraction never loses
+  a whole fact batch.
 - `CCC_WIKI_MEMORY_ENABLED=0` must be represented to the parser as Wiki-disabled; any
   non-empty `wiki_candidates` result then fails closed.
 - Transcript text remains untrusted data. Credential-like content is redacted before

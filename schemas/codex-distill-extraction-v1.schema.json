@@ -50,6 +50,18 @@
     "HonchoFact": {
       "additionalProperties": false,
       "properties": {
+        "because": {
+          "anyOf": [
+            {
+              "maxLength": 1024,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Because"
+        },
         "kind": {
           "enum": [
             "preference",
@@ -82,7 +94,8 @@
       "required": [
         "kind",
         "text",
-        "subject"
+        "subject",
+        "because"
       ],
       "title": "HonchoFact",
       "type": "object"

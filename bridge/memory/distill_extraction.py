@@ -14,7 +14,7 @@ from pathlib import PurePosixPath
 import re
 from typing import Annotated, Any, Literal, Protocol, runtime_checkable
 
-from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, field_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, field_validator, model_validator
 
 from .distill_types import CodexTranscriptSnapshot, DistillTrigger
 
@@ -206,6 +206,42 @@ class HonchoFact(_StrictModel):
     kind: Literal["preference", "decision", "observation", "context", "task-progress", "procedure", "constraint"]
     text: str = Field(min_length=1, max_length=4096)
     subject: Literal["user", "session", "node"]
+    # #1264: a decision's reason. Required-but-nullable in the generated
+    # schema (the output-schema policy demands every property in `required`);
+    # the model before-validator keeps pre-#1264 payloads parseable, and the
+    # nunchi G5 write gate flags reasonless decisions downstream.
+    because: str | None = Field(max_length=1024)
+
+    @model_validator(mode="before")
+    @classmethod
+    def default_because(cls, data: object) -> object:
+        # Backward compatibility: pre-#1264 extractors never emitted the key.
+        # The strict schema requires it (structured-output policy), but the
+        # parser must still accept legacy payloads — a missing key is null.
+        if isinstance(data, dict) and "because" not in data:
+            return {**data, "because": None}
+        return data
+
+    @field_validator("because", mode="before")
+    @classmethod
+    def normalize_because(cls, value: object) -> object:
+        if value is None:
+            return None
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
+
+    @field_validator("because")
+    @classmethod
+    def validate_because(cls, value: str | None) -> str | None:
+        if value is None:
+            return value
+        return _validate_text(
+            value,
+            field="honcho.because",
+            max_chars=1024,
+            reject_directive=True,
+        )
 
     @field_validator("text")
     @classmethod

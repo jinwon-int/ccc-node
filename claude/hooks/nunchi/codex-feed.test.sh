@@ -69,5 +69,16 @@ ok "processed rollout is marked seen despite the non-JSON response" 'grep -qxF "
 ok "stdin was detached (fake codex did not inherit the test stdin)" '[ "$(wc -l < "$pid_file")" -ge 1 ]'
 
 kill "$spawner" 2>/dev/null || true
+
+# #1264: both feed lanes must prompt for decision facts with a because reason,
+# and the two prompt blocks must not drift apart (the legacy 4-kind prompt is
+# how decision rationale never reached piri/codex nodes — bench q7).
+PIRI_FEED="$ROOT/claude/hooks/nunchi/piri-feed.sh"
+ok "codex lane prompt requires decision+because" 'grep -q "decision" "$FEED" && grep -q "because" "$FEED"'
+ok "piri lane prompt requires decision+because" 'grep -q "decision" "$PIRI_FEED" && grep -q "because" "$PIRI_FEED"'
+prompt_of() { awk "/^PROMPT_PREFIX='/{f=1;next} f \u0026\u0026 /^'/{exit} f{print}" "$1"; }
+ok "feed prompt blocks stay byte-identical across lanes" \
+  '[ "$(prompt_of "$FEED")" = "$(prompt_of "$PIRI_FEED")" ]'
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

@@ -116,8 +116,9 @@ mkdir -p "$NUNCHI_HOME" "$EXTRACTOR_SESSION_DIR"
 touch "$SEEN"
 
 PROMPT_PREFIX='다음은 AI 에이전트 작업 세션의 대화 발췌이다. 다음 세션에서도 알아야 할 사실만 추출해 strict JSON으로 답하라.
-형식: {"honcho":[{"kind":"preference|fact|context|correction","text":"<한 문장 한국어 사실>","subject":"user|session|node"}]}
+형식: {"honcho":[{"kind":"preference|decision|fact|context|correction","text":"<한 문장 한국어 사실>","subject":"user|session|node","because":"<kind=decision이면 결정 이유 한 문장 — 필수, 아니면 생략>"}]}
 기준: user=사용자 선호/지시 방식, session=진행 중 작업 맥락/다음 액션, node=이 노드 사실. 잡담/디버깅만 있으면 {"honcho":[]}.
+decision: 확정된 결정. 이유 없는 결정은 나중에 무작정 재논의되거나 무작정 따르게 되므로 반드시 because에 이유를 적어라.
 JSON 객체 하나만 출력. 설명/마크다운 금지.
 
 대화:

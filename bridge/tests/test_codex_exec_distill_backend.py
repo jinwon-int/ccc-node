@@ -243,6 +243,8 @@ async def test_backend_uses_exact_isolated_argv_private_cwd_and_canonical_stdin(
         'cli_auth_credentials_store="keyring"',
     )
     assert args[-1] == DISTILL_EXTRACTION_PROMPT
+    # #1264: the shared prompt must instruct decision facts to carry because
+    assert "because" in DISTILL_EXTRACTION_PROMPT
     assert "--ephemeral" in args
     assert "--ignore-user-config" in args
     assert "--ignore-rules" in args
