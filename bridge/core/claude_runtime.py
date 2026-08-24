@@ -13,9 +13,8 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
-import logging
 from pathlib import Path
 from typing import Any, Protocol
 import uuid
@@ -51,6 +50,7 @@ from .claude_session_lifecycle import (
     _STDERR_TAIL_LINES,
     _classify_cli_stderr as _lifecycle_classify_cli_stderr,
 )
+from .claude_session_observers import ClaudeSessionObserversMixin
 from .claude_session_task_tracking import ClaudeSessionTaskTrackingMixin
 from .claude_session_turn_admission import ClaudeSessionTurnAdmissionMixin
 from .claude_session_turn_events import (
@@ -65,8 +65,6 @@ from .tool_policy import (
     resolve_execution_profile,
     running_as_root,
 )
-
-logger = logging.getLogger(__name__)
 
 INTERRUPTED_ERROR_CODE = _TURN_INTERRUPTED_ERROR_CODE
 
@@ -176,6 +174,7 @@ class _ActiveTurn:
 
 class ClaudeSession(
     ClaudeSessionLifecycleMixin,
+    ClaudeSessionObserversMixin,
     ClaudeSessionTurnAdmissionMixin,
     ClaudeSessionApprovalMixin,
     ClaudeSessionDelegatedTasksMixin,
@@ -247,59 +246,6 @@ class ClaudeSession(
             raise RuntimeError("Claude session is not started")
         return self._session_id
 
-    def set_unsolicited_handler(self, handler: UnsolicitedHandler) -> None:
-        """Register the between-turns delivery route (optional seam).
-
-        Mirrors the style of the optional runtime seams project_chat probes
-        via ``getattr`` (``set_usage_recorder`` / ``set_turn_attempt_recorder``
-        on CodexRuntime): runtimes/sessions without the method keep their
-        current behavior. The handler is fail-open — exceptions are logged and
-        never break the reader task. Re-registration replaces the route.
-        """
-
-        self._unsolicited_handler = handler
-
-    def set_sdk_frame_observer(self, observer: SdkFrameObserver) -> None:
-        """Register the raw-SDK-frame observation route (optional seam).
-
-        Same optional-seam style as ``set_unsolicited_handler``: callers
-        probe it via ``getattr`` and sessions without it keep their current
-        behavior. The observer runs synchronously for every frame the reader
-        routes — turn and between-turns flows alike, including frames the
-        discard machinery swallows — strictly for observation (the /usage
-        usage-snapshot and rate-limit recorders). It is fail-open: exceptions
-        are logged and never reach turn processing. Re-registration replaces
-        the route.
-        """
-
-        self._sdk_frame_observer = observer
-
-    @staticmethod
-    def _content_texts(value: Any) -> list[str]:
-        if isinstance(value, str):
-            return [value]
-        if isinstance(value, Mapping):
-            texts: list[str] = []
-            for item in value.values():
-                texts.extend(ClaudeSession._content_texts(item))
-            return texts
-        if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
-            texts = []
-            for item in value:
-                texts.extend(ClaudeSession._content_texts(item))
-            return texts
-        return []
-
-    def _observe_sdk_frame(self, message: Message) -> None:
-        observer = self._sdk_frame_observer
-        if observer is None:
-            return
-        try:
-            observer(message)
-        except Exception:
-            # Observation-only seam: a broken observer must never affect the
-            # frame routing that serves turns and unsolicited delivery.
-            logger.exception("Claude SDK frame observer failed; frame routing continues")
 
 class ClaudeRuntime(ClaudeSessionBrowserMixin, ClaudeRuntimeOptionsMixin):
     """AgentRuntime over per-session ``ClaudeSDKClient`` connections."""

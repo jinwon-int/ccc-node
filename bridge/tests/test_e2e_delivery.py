@@ -51,6 +51,7 @@ for name in (
     "telegram_bot.core.claude_session_browser",
     "telegram_bot.core.claude_session_frame_routing",
     "telegram_bot.core.claude_session_lifecycle",
+    "telegram_bot.core.claude_session_observers",
     "telegram_bot.core.claude_session_delegated_tasks",
     "telegram_bot.core.claude_session_task_tracking",
     "telegram_bot.core.claude_session_turn_admission",
