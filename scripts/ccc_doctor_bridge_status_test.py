@@ -62,7 +62,7 @@ class BridgeStatusVerdictTest(unittest.TestCase):
         doctor = Doctor(Path.cwd(), Path.cwd() / ".claude", "settings")
         doctor.provider = "piri"
         doctor._bridge_provider_state = ("piri", "healthy")
-        with patch.dict("os.environ", {"CCC_MEMORY_DISTILL_PROVIDER": "auto"}), patch(
+        with patch.dict("os.environ", {"CCC_MEMORY_DISTILL_PROVIDER": "auto", "CCC_MEMORY_DISTILL_ALLOW_UNBOUNDED": "1"}), patch(
             "ccc_doctor.shutil.which", return_value="/bin/true"
         ):
             doctor.check_distill_readiness()
@@ -95,7 +95,7 @@ class BridgeStatusVerdictTest(unittest.TestCase):
             doctor.provider = "piri"
             doctor._bridge_provider_state = ("piri", "healthy")
             with patch.dict(
-                "os.environ", {"CCC_MEMORY_DISTILL_PROVIDER": "auto"}, clear=True
+                "os.environ", {"CCC_MEMORY_DISTILL_PROVIDER": "auto", "CCC_MEMORY_DISTILL_ALLOW_UNBOUNDED": "1"}, clear=True
             ), patch.object(
                 doctor, "bridge_systemd_units", return_value=[stale_unit, unit]
             ), patch.object(
@@ -112,7 +112,7 @@ class BridgeStatusVerdictTest(unittest.TestCase):
         doctor.provider = "codex"
         doctor._bridge_provider_state = ("codex", "healthy")
         with patch.dict(
-            "os.environ", {"CCC_MEMORY_DISTILL_PROVIDER": "auto"}, clear=True
+            "os.environ", {"CCC_MEMORY_DISTILL_PROVIDER": "auto", "CCC_MEMORY_DISTILL_ALLOW_UNBOUNDED": "1"}, clear=True
         ), patch(
             "ccc_doctor.shutil.which", return_value=None
         ), patch.object(
@@ -130,12 +130,40 @@ class BridgeStatusVerdictTest(unittest.TestCase):
         doctor.provider = "claude"
         doctor._bridge_provider_state = ("claude", "healthy")
         with patch.dict(
-            "os.environ", {"CCC_MEMORY_DISTILL_PROVIDER": "piri"}
+            "os.environ", {"CCC_MEMORY_DISTILL_PROVIDER": "piri", "CCC_MEMORY_DISTILL_ALLOW_UNBOUNDED": "1"}
         ), patch("ccc_doctor.shutil.which", return_value="/bin/true"):
             doctor.check_distill_readiness()
 
         self.assertEqual(doctor.distill_readiness, "static-ready")
         self.assertIn("live auth unproven", doctor.rows[-1].status)
+
+    def test_distill_without_finite_budget_is_safely_blocked(self) -> None:
+        doctor = Doctor(Path.cwd(), Path.cwd() / ".claude", "settings")
+        doctor.provider = "codex"
+        doctor._bridge_provider_state = ("codex", "healthy")
+        with patch.dict(
+            "os.environ",
+            {"CCC_MEMORY_DISTILL_PROVIDER": "auto"},
+            clear=True,
+        ):
+            doctor.check_distill_readiness()
+
+        self.assertEqual(doctor.distill_readiness, "blocked")
+        self.assertIn("fail-closed", doctor.rows[-1].status)
+
+    def test_global_distill_marker_wins_before_provider_probe(self) -> None:
+        with TemporaryDirectory() as temp:
+            claude_dir = Path(temp) / ".claude"
+            state = claude_dir / "state"
+            state.mkdir(parents=True)
+            (state / "distill.disabled").touch()
+            doctor = Doctor(Path.cwd(), claude_dir, "settings")
+            doctor.provider = "piri"
+            with patch.dict("os.environ", {}, clear=True):
+                doctor.check_distill_readiness()
+
+        self.assertEqual(doctor.distill_readiness, "disabled")
+        self.assertIn("global off-switch active", doctor.rows[-1].status)
 
 
 if __name__ == "__main__":

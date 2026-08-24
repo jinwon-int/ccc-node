@@ -106,6 +106,13 @@ class DistillJournal(JsonJournalCore):
         }
         if job.status in extraction_statuses and job.snapshot is None:
             raise ValueError("distill extraction job is missing its snapshot")
+        if job.extraction_retry_after is not None:
+            try:
+                _parse_timestamp(job.extraction_retry_after)
+            except ValueError as error:
+                raise ValueError(
+                    "invalid distill extraction retry timestamp"
+                ) from error
         if (job.status is DistillJobStatus.EXTRACTION_DONE) != (
             job.extraction_output is not None
         ):
@@ -320,10 +327,20 @@ class DistillJournal(JsonJournalCore):
                     updated_at=_timestamp(current_time),
                     owner_token=None,
                     lease_expires_at=None,
+                    extraction_retry_after=None,
                     error_code="extraction_max_attempts_exceeded",
                 )
                 self._write_unlocked(terminal)
                 return None
+            if job.extraction_retry_after is not None:
+                try:
+                    retry_after = _parse_timestamp(job.extraction_retry_after)
+                except ValueError as error:
+                    raise ValueError(
+                        "invalid distill extraction retry timestamp"
+                    ) from error
+                if retry_after > current_time:
+                    return None
             running = replace(
                 job,
                 status=DistillJobStatus.RUNNING_EXTRACTION,
@@ -334,6 +351,7 @@ class DistillJournal(JsonJournalCore):
                 lease_expires_at=_timestamp(
                     current_time + timedelta(seconds=lease_seconds)
                 ),
+                extraction_retry_after=None,
                 error_code=None,
             )
             self._write_unlocked(running)
@@ -408,6 +426,7 @@ class DistillJournal(JsonJournalCore):
                     if accounting is not None
                     else job.extraction_accounting
                 ),
+                extraction_retry_after=None,
                 local_sink_status=(
                     DistillLocalSinkStatus.PENDING
                     if job.memory_audience is not None
@@ -436,8 +455,11 @@ class DistillJournal(JsonJournalCore):
         lease_epoch: int,
         error_code: str,
         accounting: DistillExtractionAccounting | None = None,
+        retry_after_seconds: int = 0,
         now: datetime | None = None,
     ) -> DistillJob:
+        if type(retry_after_seconds) is not int or retry_after_seconds < 0:
+            raise ValueError("retry_after_seconds must be a non-negative integer")
         return self._mark_extraction_failed(
             job_id,
             owner_token=owner_token,
@@ -445,6 +467,7 @@ class DistillJournal(JsonJournalCore):
             error_code=error_code,
             accounting=accounting,
             status=DistillJobStatus.EXTRACTION_RETRYABLE_FAILED,
+            retry_after_seconds=retry_after_seconds,
             now=now,
         )
 
@@ -465,6 +488,7 @@ class DistillJournal(JsonJournalCore):
             error_code=error_code,
             accounting=accounting,
             status=DistillJobStatus.EXTRACTION_TERMINAL_FAILED,
+            retry_after_seconds=0,
             now=now,
         )
 
@@ -478,17 +502,25 @@ class DistillJournal(JsonJournalCore):
         status: DistillJobStatus,
         accounting: DistillExtractionAccounting | None,
         now: datetime | None,
+        retry_after_seconds: int,
     ) -> DistillJob:
         self._validate_error_code(error_code)
+        current_time = _normalize_time(now or _utc_now())
         with self._exclusive():
             job = self._read_unlocked(job_id)
             self._require_running_extraction(job, owner_token, lease_epoch)
             failed = replace(
                 job,
                 status=status,
-                updated_at=_timestamp(now or _utc_now()),
+                updated_at=_timestamp(current_time),
                 owner_token=None,
                 lease_expires_at=None,
+                extraction_retry_after=(
+                    _timestamp(current_time + timedelta(seconds=retry_after_seconds))
+                    if status is DistillJobStatus.EXTRACTION_RETRYABLE_FAILED
+                    and retry_after_seconds > 0
+                    else None
+                ),
                 extraction_output=None,
                 extraction_output_hash=None,
                 extraction_accounting=(
@@ -1019,6 +1051,7 @@ class DistillJournal(JsonJournalCore):
                             updated_at=_timestamp(current_time),
                             owner_token=None,
                             lease_expires_at=None,
+                            extraction_retry_after=None,
                             error_code=error_code,
                         )
                         changed += 1

@@ -771,7 +771,11 @@ class RetryableFailureLoopTests(unittest.IsolatedAsyncioTestCase):
         )
         backend = FlakyBackend()
         worker = handler.build_distill_extraction_worker(
-            journal, backend, owner_token="retry-loop-test"
+            journal,
+            backend,
+            owner_token="retry-loop-test",
+            retry_backoff_base_seconds=1,
+            retry_backoff_max_seconds=1,
         )
         bot = TelegramBot(
             settings=settings,

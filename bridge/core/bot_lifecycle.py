@@ -6,7 +6,7 @@ import os
 import signal
 import shutil
 import subprocess
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path as FilePath
 from typing import Any, Callable, Optional, Protocol, cast
 
@@ -1719,10 +1719,22 @@ class BotLifecycleMixin:
         interval = float(
             getattr(self._config, "distill_extraction_poll_interval", 300.0) or 300.0
         )
+        max_jobs_per_sweep = max(
+            1,
+            int(
+                getattr(
+                    self._config,
+                    "memory_distill_max_jobs_per_sweep",
+                    1,
+                )
+                or 1
+            ),
+        )
         while not stop_event.is_set():
             try:
                 await asyncio.to_thread(journal.recover_stale_running)
                 jobs = await asyncio.to_thread(journal.list_jobs)
+                attempted = 0
                 for job in jobs:
                     if stop_event.is_set():
                         break
@@ -1734,7 +1746,17 @@ class BotLifecycleMixin:
                         DistillJobStatus.EXTRACTION_RETRYABLE_FAILED,
                     ):
                         continue
+                    retry_after_raw = getattr(job, "extraction_retry_after", None)
+                    if retry_after_raw is not None:
+                        retry_after = datetime.fromisoformat(
+                            retry_after_raw.replace("Z", "+00:00")
+                        )
+                        if retry_after > datetime.now(timezone.utc):
+                            continue
                     await worker.extract_once(job_id=job.job_id)
+                    attempted += 1
+                    if attempted >= max_jobs_per_sweep:
+                        break
             except asyncio.CancelledError:
                 raise
             except Exception:

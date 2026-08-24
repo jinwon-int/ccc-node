@@ -30,6 +30,12 @@ MEMORY_FIELDS = {
     "memory_distill_provider": "CCC_MEMORY_DISTILL_PROVIDER",
     "memory_distill_model": "CCC_MEMORY_DISTILL_MODEL",
     "memory_distill_timeout_seconds": "CCC_MEMORY_DISTILL_TIMEOUT_SEC",
+    "memory_distill_allow_unbounded": "CCC_MEMORY_DISTILL_ALLOW_UNBOUNDED",
+    "memory_distill_max_attempts": "CCC_MEMORY_DISTILL_MAX_ATTEMPTS",
+    "memory_distill_retry_backoff_base_seconds": "CCC_MEMORY_DISTILL_RETRY_BACKOFF_BASE_SEC",
+    "memory_distill_retry_backoff_max_seconds": "CCC_MEMORY_DISTILL_RETRY_BACKOFF_MAX_SEC",
+    "memory_distill_provider_cooldown_seconds": "CCC_MEMORY_DISTILL_PROVIDER_COOLDOWN_SEC",
+    "memory_distill_max_jobs_per_sweep": "CCC_MEMORY_DISTILL_MAX_JOBS_PER_SWEEP",
     "memory_distill_checkpoint_turns": "CCC_MEMORY_DISTILL_CHECKPOINT_TURNS",
     "memory_distill_checkpoint_bytes": "CCC_MEMORY_DISTILL_CHECKPOINT_BYTES",
     "memory_distill_checkpoint_age_seconds": "CCC_MEMORY_DISTILL_CHECKPOINT_AGE_SECONDS",
@@ -99,6 +105,12 @@ def test_provider_neutral_distill_defaults_follow_main_runtime_and_are_bounded()
     assert Config.model_fields["memory_distill_provider"].default == "auto"
     assert Config.model_fields["memory_distill_model"].default == "provider-default"
     assert Config.model_fields["memory_distill_timeout_seconds"].default == 120.0
+    assert Config.model_fields["memory_distill_allow_unbounded"].default is False
+    assert Config.model_fields["memory_distill_max_attempts"].default == 5
+    assert Config.model_fields["memory_distill_retry_backoff_base_seconds"].default == 300
+    assert Config.model_fields["memory_distill_retry_backoff_max_seconds"].default == 21600
+    assert Config.model_fields["memory_distill_provider_cooldown_seconds"].default == 3600
+    assert Config.model_fields["memory_distill_max_jobs_per_sweep"].default == 1
     assert Config.model_fields["memory_distill_checkpoint_turns"].default == 0
     assert Config.model_fields["memory_distill_checkpoint_bytes"].default == 0
     assert Config.model_fields["memory_distill_checkpoint_age_seconds"].default == 0
@@ -110,11 +122,21 @@ def test_provider_neutral_distill_defaults_follow_main_runtime_and_are_bounded()
         CCC_MEMORY_DISTILL_MODEL="kimi-coding/k3",
         CCC_MEMORY_DISTILL_TIMEOUT_SEC=75,
         CCC_MEMORY_DISTILL_CHECKPOINT_TURNS=10,
+        CCC_MEMORY_DISTILL_MAX_ATTEMPTS=4,
+        CCC_MEMORY_DISTILL_RETRY_BACKOFF_BASE_SEC=60,
+        CCC_MEMORY_DISTILL_RETRY_BACKOFF_MAX_SEC=600,
+        CCC_MEMORY_DISTILL_PROVIDER_COOLDOWN_SEC=1800,
+        CCC_MEMORY_DISTILL_MAX_JOBS_PER_SWEEP=2,
     )
     assert configured.memory_distill_provider == "piri"
     assert configured.memory_distill_model == "kimi-coding/k3"
     assert configured.memory_distill_timeout_seconds == 75.0
     assert configured.memory_distill_checkpoint_turns == 10
+    assert configured.memory_distill_max_attempts == 4
+    assert configured.memory_distill_retry_backoff_base_seconds == 60
+    assert configured.memory_distill_retry_backoff_max_seconds == 600
+    assert configured.memory_distill_provider_cooldown_seconds == 1800
+    assert configured.memory_distill_max_jobs_per_sweep == 2
 
     with pytest.raises(ValidationError, match="CCC_MEMORY_DISTILL_PROVIDER"):
         Config(
@@ -136,6 +158,13 @@ def test_provider_neutral_distill_defaults_follow_main_runtime_and_are_bounded()
                 _env_file=None,
                 CCC_MEMORY_DISTILL_TIMEOUT_SEC=timeout,
             )
+    with pytest.raises(ValidationError, match="RETRY_BACKOFF_MAX_SEC"):
+        Config(
+            telegram_bot_token="123456:abc",
+            _env_file=None,
+            CCC_MEMORY_DISTILL_RETRY_BACKOFF_BASE_SEC=600,
+            CCC_MEMORY_DISTILL_RETRY_BACKOFF_MAX_SEC=60,
+        )
 
 
 @pytest.mark.parametrize(

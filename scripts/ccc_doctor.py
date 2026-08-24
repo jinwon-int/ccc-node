@@ -13,8 +13,10 @@ from __future__ import annotations
 
 import contextlib
 import filecmp
+import hashlib
 import importlib.util
 import json
+import math
 import os
 import re
 import shlex
@@ -108,6 +110,47 @@ CRON_GEN_FULL_RE = re.compile(r"h_[0-9a-f]{12}")
 # Managed-unit bookkeeping lines (#1077): `# ccc-node:<lane>:begin` / `:end`.
 # They carry the lane marker as a substring but are not entries.
 CRON_BLOCK_MARKER_RE = re.compile(r"# ccc-node:[A-Za-z0-9-]+:(?:begin|end)\s*$")
+
+
+def load_owner_only_json(path: Path, *, max_bytes: int) -> dict[str, Any]:
+    """Read one small owner-only JSON file without following link races."""
+
+    metadata = path.lstat()
+    if (
+        path.is_symlink()
+        or not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_nlink != 1
+        or metadata.st_uid != os.getuid()
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+        or metadata.st_size <= 0
+        or metadata.st_size > max_bytes
+    ):
+        raise ValueError("unsafe owner-only JSON state")
+    descriptor = -1
+    try:
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        opened = os.fstat(descriptor)
+        if (
+            opened.st_dev != metadata.st_dev
+            or opened.st_ino != metadata.st_ino
+            or not stat.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+            or opened.st_uid != os.getuid()
+            or stat.S_IMODE(opened.st_mode) != 0o600
+            or opened.st_size <= 0
+            or opened.st_size > max_bytes
+        ):
+            raise ValueError("unsafe owner-only JSON state")
+        with os.fdopen(descriptor, "rb", closefd=True) as stream:
+            descriptor = -1
+            raw = stream.read(max_bytes + 1)
+        value = json.loads(raw.decode("utf-8"))
+        if not isinstance(value, dict):
+            raise ValueError("owner-only JSON state is not an object")
+        return value
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
 CODEX_PROBE_TIMEOUT_SECONDS = 5.0
 CODEX_PROBE_TIMEOUT_MAX_SECONDS = 10.0
 
@@ -708,6 +751,19 @@ class Doctor:
             self.distill_readiness = "disabled"
             self.add("정상", "distill extractor", "disabled", "none")
             return
+        state_dir = Path(
+            os.environ.get("CCC_STATE_DIR") or (self.claude_dir / "state")
+        ).expanduser()
+        disabled_marker = state_dir / "distill.disabled"
+        if disabled_marker.exists() or disabled_marker.is_symlink():
+            self.distill_readiness = "disabled"
+            self.add(
+                "정상",
+                "distill extractor",
+                "global off-switch active; no provider call allowed",
+                "remove distill.disabled only through an explicitly approved activation",
+            )
+            return
         effective = self.provider if configured == "auto" else configured
         if effective not in {"claude", "codex", "piri"}:
             self.distill_readiness = "disabled" if configured == "auto" else "failed"
@@ -720,6 +776,64 @@ class Doctor:
                     if configured == "auto"
                     else "set CCC_MEMORY_DISTILL_PROVIDER to auto, off, claude, codex, or piri"
                 ),
+            )
+            return
+        model = os.environ.get("CCC_MEMORY_DISTILL_MODEL", "provider-default").strip()
+        if effective == "codex" and model == "provider-default":
+            model = os.environ.get("CCC_CODEX_DISTILL_MODEL", model).strip()
+        cooldown_key = hashlib.sha256(f"{effective}\0{model}".encode()).hexdigest()
+        cooldown_path = state_dir / "distill-provider-cooldowns" / f"{cooldown_key}.json"
+        if cooldown_path.exists() or cooldown_path.is_symlink():
+            try:
+                value = load_owner_only_json(cooldown_path, max_bytes=4096)
+                retry_after = value.get("retry_after_epoch")
+                if (
+                    value.get("provider") != effective
+                    or value.get("model") != model
+                    or isinstance(retry_after, bool)
+                    or not isinstance(retry_after, (int, float))
+                    or not math.isfinite(float(retry_after))
+                ):
+                    raise ValueError("unsafe cooldown state")
+                if float(retry_after) > time.time():
+                    self.distill_readiness = "cooldown"
+                    self.add(
+                        "경고",
+                        "distill extractor",
+                        f"configured={configured}; effective={effective}; provider/model cooldown active",
+                        "wait for the cooldown or repair provider authentication/quota before an approved retry",
+                    )
+                    return
+            except (OSError, ValueError, TypeError):
+                self.distill_readiness = "failed"
+                self.add(
+                    "수동필요",
+                    "distill extractor",
+                    f"configured={configured}; effective={effective}; cooldown state unsafe",
+                    "inspect owner-only distill-provider-cooldowns state; do not bypass it",
+                )
+                return
+        allow_unbounded = os.environ.get(
+            "CCC_MEMORY_DISTILL_ALLOW_UNBOUNDED", ""
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        meter_enabled = os.environ.get("CCC_USAGE_METER_ENABLED", "true").strip().lower() not in {
+            "0",
+            "false",
+            "no",
+            "off",
+        }
+        budget_name = f"CCC_USAGE_BUDGET_TOKENS_{effective.upper()}"
+        try:
+            budget = int(os.environ.get(budget_name, "0") or 0)
+        except ValueError:
+            budget = 0
+        if not allow_unbounded and (not meter_enabled or budget <= 0):
+            self.distill_readiness = "blocked"
+            self.add(
+                "경고",
+                "distill extractor",
+                f"configured={configured}; effective={effective}; autonomous spend fail-closed",
+                f"enable usage metering and set a finite {budget_name}; explicit unbounded opt-in is not recommended",
             )
             return
         piri_path = os.environ.get("CCC_PIRI_CLI_PATH", "").strip()

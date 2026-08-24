@@ -322,10 +322,25 @@ extractor model; for Piri this preserves the node's configured Kimi/GLM default.
 effective extractor is Codex. Each completed provider attempt appends body-free accounting to its
 journal record: model, bounded snapshot bytes, duration in milliseconds, and
 the conservative maximum-token estimate reserved by the shared #388 usage
-meter. This estimate is not actual provider token usage. The existing
-`CCC_USAGE_BUDGET_TOKENS_CODEX` and `CCC_USAGE_BUDGET_WARN_PERCENT` settings
-provide configurable warn/enforce gates; enforce defers autonomous extraction
-before claim/provider execution without blocking interactive turns.
+meter. This estimate is not actual provider token usage. The provider-specific
+`CCC_USAGE_BUDGET_TOKENS_CLAUDE`, `CCC_USAGE_BUDGET_TOKENS_CODEX`, or
+`CCC_USAGE_BUDGET_TOKENS_PIRI` value must be finite and greater than zero for
+the effective extractor. A zero budget now fails closed for provider-neutral
+distill; `CCC_MEMORY_DISTILL_ALLOW_UNBOUNDED=1` is an explicit, discouraged
+escape hatch. Enforce defers autonomous extraction before claim/provider
+execution without blocking interactive turns.
+
+The legacy and bridge paths share
+`${CCC_STATE_DIR:-~/.claude/state}/distill.disabled` as a global off-switch.
+Provider stderr is captured only in a bounded owner-only tempfile, classified
+as authentication, quota, rate-limit, or model availability, and then deleted;
+its body never reaches logs or journals. Those classes trip an owner-only
+provider+model cooldown (`CCC_MEMORY_DISTILL_PROVIDER_COOLDOWN_SEC`, default
+3600 seconds). Other retryable failures use durable exponential retry-after
+from `CCC_MEMORY_DISTILL_RETRY_BACKOFF_BASE_SEC` (300 seconds) up to
+`CCC_MEMORY_DISTILL_RETRY_BACKOFF_MAX_SEC` (21600 seconds). Each journal job is
+bounded by `CCC_MEMORY_DISTILL_MAX_ATTEMPTS` (5), and each scheduler sweep is
+bounded by `CCC_MEMORY_DISTILL_MAX_JOBS_PER_SWEEP` (1).
 
 - `bridge/memory/distill_extraction.py` contains the input/output models,
   `DistillBackend` protocol, privacy gates, canonical input serializer, strict JSON

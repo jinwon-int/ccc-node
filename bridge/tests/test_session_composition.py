@@ -877,6 +877,7 @@ os.environ["ALLOWED_USER_IDS"] = "1"
 os.environ["CCC_AGENT_PROVIDER"] = "codex"
 os.environ["CCC_CODEX_DISTILL_MODEL"] = "gpt-5-mini"
 os.environ["CCC_CODEX_DISTILL_TIMEOUT_SEC"] = "45"
+os.environ["CCC_USAGE_BUDGET_TOKENS_CODEX"] = "200000"
 
 from telegram_bot.__main__ import build_context, load_runtime_settings
 from telegram_bot.memory.distill_worker import CodexDistillExtractionWorker
@@ -911,6 +912,32 @@ print("COMPOSED-GATED-WORKER-OK")
     )
     assert result.returncode == 0, result.stderr
     assert "COMPOSED-GATED-WORKER-OK" in result.stdout
+
+
+def test_build_context_fails_closed_without_finite_distill_budget(tmp_path):
+    result = _run_probe(
+        """
+import os
+from pathlib import Path
+
+root = Path(os.environ["PROBE_ROOT"])
+(root / "project").mkdir(parents=True, exist_ok=True)
+os.environ["PROJECT_ROOT"] = str(root / "project")
+os.environ["TELEGRAM_BOT_TOKEN"] = "123456:test"
+os.environ["ALLOWED_USER_IDS"] = "1"
+os.environ["CCC_AGENT_PROVIDER"] = "codex"
+
+from telegram_bot.__main__ import build_context, load_runtime_settings
+
+context = build_context(load_runtime_settings())
+assert context.distill_extraction_worker is None
+assert context.distill_snapshot_worker is not None
+print("DISTILL-UNBOUNDED-FAIL-CLOSED-OK")
+""",
+        probe_root=tmp_path,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "DISTILL-UNBOUNDED-FAIL-CLOSED-OK" in result.stdout
 
 
 def test_build_context_defaults_codex_skill_collector_on_with_opt_out(tmp_path):
@@ -1078,6 +1105,7 @@ os.environ.update({
     "CCC_BRIDGE_MEMORY_MODE": "audience-scoped",
     "CCC_BRIDGE_MEMORY_AUDIENCE_ROOT": str(root / "audiences"),
     "CCC_CODEX_AUDIENCE_AUTH_MODE": "keyring",
+    "CCC_USAGE_BUDGET_TOKENS_CODEX": "200000",
     "CCC_WIKI_MEMORY_ENABLED": "1",
     "CCC_HONCHO_MEMORY_ENABLED": "1",
     "CCC_HONCHO_CFG": str(root / "honcho.json"),
@@ -1159,6 +1187,7 @@ os.environ.update({
     "CCC_BRIDGE_MEMORY_AUDIENCE_ROOT": str(root / "audiences"),
     "CCC_HONCHO_MEMORY_ENABLED": "1",
     "CCC_HONCHO_CFG": str(root / "honcho.json"),
+    "CCC_USAGE_BUDGET_TOKENS_PIRI": "200000",
 })
 
 from telegram_bot.__main__ import build_context, load_runtime_settings

@@ -211,3 +211,58 @@ async def test_runtime_backend_failures_are_body_free(tmp_path: Path) -> None:
     )
     with pytest.raises(RuntimeDistillBackendError, match="^distill_output_invalid$"):
         await invalid.extract(extraction_input)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("provider", ["claude", "piri"])
+async def test_runtime_backend_classifies_auth_failure_without_retaining_stderr(
+    tmp_path: Path,
+    provider: str,
+) -> None:
+    extraction_input = build_extraction_input(
+        _snapshot(), trigger=DistillTrigger.EXPLICIT, provider="claude"
+    )
+    executable = _script(
+        tmp_path,
+        f"{provider}-auth-failure",
+        'import sys\nsys.stderr.write("Authentication failed PRIVATE_TOKEN")\nraise SystemExit(1)',
+    )
+    backend = RuntimeCliDistillBackend(
+        provider,  # type: ignore[arg-type]
+        executable=str(executable),
+        environment={"PATH": str(Path(sys.executable).parent)},
+        temp_root=tmp_path,
+    )
+
+    with pytest.raises(RuntimeDistillBackendError) as caught:
+        await backend.extract(extraction_input)
+
+    assert caught.value.code == "distill_auth_unavailable"
+    assert "PRIVATE_TOKEN" not in repr(caught.value)
+
+
+@pytest.mark.anyio
+async def test_runtime_backend_also_classifies_provider_failure_written_to_stdout(
+    tmp_path: Path,
+) -> None:
+    extraction_input = build_extraction_input(
+        _snapshot(), trigger=DistillTrigger.EXPLICIT, provider="piri"
+    )
+    backend = RuntimeCliDistillBackend(
+        "piri",
+        executable=str(
+            _script(
+                tmp_path,
+                "piri-quota-stdout",
+                'print("usage limit reached PRIVATE_BODY")\nraise SystemExit(1)',
+            )
+        ),
+        environment={"PATH": str(Path(sys.executable).parent)},
+        temp_root=tmp_path,
+    )
+
+    with pytest.raises(RuntimeDistillBackendError) as caught:
+        await backend.extract(extraction_input)
+
+    assert caught.value.code == "distill_quota_exhausted"
+    assert "PRIVATE_BODY" not in repr(caught.value)

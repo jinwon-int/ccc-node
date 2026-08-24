@@ -147,18 +147,20 @@ class FakeProcess:
         action: Callable[[bytes], Awaitable[None]],
         *,
         returncode: int = 0,
+        stderr_data: bytes = b"ignored stderr",
     ) -> None:
         self.pid = 47800
         self.returncode: int | None = None
         self._final_returncode = returncode
         self._action = action
+        self._stderr_data = stderr_data
         self.terminate_calls = 0
         self.kill_calls = 0
 
     async def communicate(self, input: bytes | None = None) -> tuple[bytes, bytes]:
         await self._action(input or b"")
         self.returncode = self._final_returncode
-        return b"ignored stdout", b"ignored stderr"
+        return b"ignored stdout", self._stderr_data
 
     async def wait(self) -> int:
         while self.returncode is None:
@@ -253,7 +255,7 @@ async def test_backend_uses_exact_isolated_argv_private_cwd_and_canonical_stdin(
     assert b"harmless durable fact" not in " ".join(args).encode()
     assert capture["kwargs"]["stdin"] is asyncio.subprocess.PIPE
     assert capture["kwargs"]["stdout"] is asyncio.subprocess.DEVNULL
-    assert capture["kwargs"]["stderr"] is asyncio.subprocess.DEVNULL
+    assert capture["kwargs"]["stderr"] is asyncio.subprocess.PIPE
     assert capture["kwargs"]["start_new_session"] is True
     assert callable(capture["kwargs"]["preexec_fn"])
     assert result.provenance.source_thread_hash == THREAD_HASH
@@ -343,6 +345,39 @@ async def test_backend_exposes_body_free_spawn_and_exit_errors(
 
     assert str(caught.value) == expected
     assert "private body" not in repr(caught.value)
+
+
+@async_test
+async def test_codex_backend_classifies_rate_limit_without_retaining_stderr(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    codex_executable: str,
+) -> None:
+    async def fake_spawn(*args: str, **kwargs: Any) -> FakeProcess:
+        del args, kwargs
+
+        async def action(_stdin: bytes) -> None:
+            return None
+
+        return FakeProcess(
+            action,
+            returncode=7,
+            stderr_data=b"HTTP 429 too many requests PRIVATE_BODY",
+        )
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_spawn)
+    backend = CodexExecDistillBackend(
+        executable=codex_executable,
+        schema_path=SCHEMA_PATH,
+        temp_root=tmp_path,
+    )
+
+    with pytest.raises(CodexDistillBackendError) as caught:
+        await backend.extract(extraction_input())
+
+    assert caught.value.code == "distill_rate_limited"
+    assert caught.value.exit_status == 7
+    assert "PRIVATE_BODY" not in repr(caught.value)
 
 
 @async_test

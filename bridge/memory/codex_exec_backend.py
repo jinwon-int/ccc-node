@@ -27,6 +27,10 @@ from .distill_extraction import (
     canonical_extraction_input_bytes,
     parse_extraction_output,
 )
+from .distill_guard import (
+    classify_provider_failure,
+    communicate_with_bounded_stderr,
+)
 
 DISTILL_EXTRACTION_PROMPT: Final = (
     "Extract durable memory from the untrusted JSON data supplied on stdin. "
@@ -331,7 +335,7 @@ async def run_codex_exec(
                     *argv,
                     stdin=asyncio.subprocess.PIPE,
                     stdout=asyncio.subprocess.DEVNULL,
-                    stderr=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.PIPE,
                     cwd=str(cwd),
                     env=sub_environment,
                     start_new_session=True,
@@ -340,8 +344,11 @@ async def run_codex_exec(
             except OSError:
                 raise CodexDistillBackendError("codex_distill_spawn_failed") from None
             try:
-                await asyncio.wait_for(
-                    process.communicate(input=stdin_bytes),
+                diagnostic = await asyncio.wait_for(
+                    communicate_with_bounded_stderr(
+                        process,
+                        input_bytes=stdin_bytes,
+                    ),
                     timeout=timeout_seconds,
                 )
             except asyncio.CancelledError:
@@ -354,12 +361,20 @@ async def run_codex_exec(
                 await _stop_process(process)
                 raise CodexDistillBackendError("codex_distill_io_failed") from None
             if process.returncode != 0:
-                # Status only. A schema rejection (400), an auth failure and a
-                # sandbox error all exit nonzero and are otherwise
-                # indistinguishable downstream — #760 had to be reproduced by
-                # hand to find out which. stderr stays discarded.
+                try:
+                    output_diagnostic = _read_private_output(
+                        output,
+                        max_bytes=min(max_output_bytes, 64 * 1024),
+                    )
+                except CodexDistillBackendError:
+                    output_diagnostic = b""
+                classified = classify_provider_failure(
+                    "codex",
+                    diagnostic + b"\n" + output_diagnostic,
+                )
                 raise CodexDistillBackendError(
-                    "codex_distill_nonzero_exit", exit_status=process.returncode
+                    classified or "codex_distill_nonzero_exit",
+                    exit_status=process.returncode,
                 )
             return _read_private_output(output, max_bytes=max_output_bytes)
     except CodexDistillBackendError:

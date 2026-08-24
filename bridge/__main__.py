@@ -120,6 +120,34 @@ def _build_distill_environment(
     return environment
 
 
+def _distill_extraction_authorized(
+    settings: Settings,
+    project_chat: Any,
+    provider: str | None,
+) -> bool:
+    """Fail closed unless autonomous extraction has a real finite spend gate."""
+
+    if provider is None:
+        return False
+    provider_budget = int(
+        getattr(settings, f"usage_budget_tokens_{provider}", 0) or 0
+    )
+    finite_spend_gate = (
+        bool(getattr(settings, "usage_meter_enabled", True))
+        and provider_budget > 0
+        and project_chat.usage_meter is not None
+    )
+    if finite_spend_gate or bool(settings.memory_distill_allow_unbounded):
+        return True
+    logger.warning(
+        "Provider-neutral distill extraction disabled: provider=%s requires "
+        "usage metering and a finite autonomous budget (or explicit "
+        "CCC_MEMORY_DISTILL_ALLOW_UNBOUNDED=1)",
+        provider,
+    )
+    return False
+
+
 def build_context(
     settings: Settings,
     *,
@@ -265,9 +293,16 @@ def build_context(
         settings.agent_provider,
         settings.memory_distill_provider,
     )
+    distill_environment = (
+        _build_distill_environment(settings, distill_provider)
+        if distill_provider is not None
+        else None
+    )
     distill_extraction_worker = None
-    if distill_provider is not None:
-        distill_environment = _build_distill_environment(settings, distill_provider)
+    if _distill_extraction_authorized(settings, project_chat, distill_provider):
+        from telegram_bot.memory.distill_guard import DistillGuard
+
+        assert distill_provider is not None
         distill_model, _distill_timeout = resolve_distill_model_timeout(
             settings, distill_provider
         )
@@ -283,6 +318,17 @@ def build_context(
             honcho_enabled=honcho_enabled,
             extractor_provider=distill_provider,
             model=distill_model,
+            guard=DistillGuard(),
+            max_attempts=settings.memory_distill_max_attempts,
+            provider_cooldown_seconds=(
+                settings.memory_distill_provider_cooldown_seconds
+            ),
+            retry_backoff_base_seconds=(
+                settings.memory_distill_retry_backoff_base_seconds
+            ),
+            retry_backoff_max_seconds=(
+                settings.memory_distill_retry_backoff_max_seconds
+            ),
         )
     distill_snapshot_worker = None
     if (

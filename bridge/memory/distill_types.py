@@ -244,6 +244,11 @@ def validate_memory_route(audience: str | None, scope: str | None) -> None:
         raise ValueError("invalid distill memory audience route")
 
 
+def _validate_extraction_retry_after(value: str | None) -> None:
+    if value is not None and (not isinstance(value, str) or not value):
+        raise ValueError("invalid distill job extraction_retry_after")
+
+
 @dataclass(frozen=True, slots=True)
 class TranscriptBounds:
     max_turns: int = 20
@@ -389,6 +394,7 @@ class DistillJob:
     error_code: str | None = None
     extraction_attempts: int = 0
     extraction_lease_epoch: int = 0
+    extraction_retry_after: str | None = None
     extraction_output: str | None = None
     extraction_output_hash: str | None = None
     extraction_accounting: tuple[DistillExtractionAccounting, ...] = ()
@@ -459,6 +465,7 @@ class DistillJob:
             self.error_code
         ):
             raise ValueError("invalid distill job error_code")
+        _validate_extraction_retry_after(self.extraction_retry_after)
         if (self.extraction_output is None) != (self.extraction_output_hash is None):
             raise ValueError("distill extraction output and hash must be stored together")
         if self.extraction_output is not None:
@@ -499,6 +506,7 @@ class DistillJob:
             "error_code": self.error_code,
             "extraction_attempts": self.extraction_attempts,
             "extraction_lease_epoch": self.extraction_lease_epoch,
+            "extraction_retry_after": self.extraction_retry_after,
             "extraction_output": self.extraction_output,
             "extraction_output_hash": self.extraction_output_hash,
             "extraction_accounting": [
@@ -574,6 +582,7 @@ class DistillJob:
         owner_token = value.get("owner_token")
         lease_expires_at = value.get("lease_expires_at")
         error_code = value.get("error_code")
+        extraction_retry_after = value.get("extraction_retry_after")
         extraction_output = value.get("extraction_output")
         extraction_output_hash = value.get("extraction_output_hash")
         raw_extraction_accounting = value.get("extraction_accounting", [])
@@ -583,6 +592,7 @@ class DistillJob:
             ("owner_token", owner_token),
             ("lease_expires_at", lease_expires_at),
             ("error_code", error_code),
+            ("extraction_retry_after", extraction_retry_after),
             ("extraction_output", extraction_output),
             ("extraction_output_hash", extraction_output_hash),
             ("memory_audience", memory_audience),
@@ -641,6 +651,7 @@ class DistillJob:
             error_code=error_code,
             extraction_attempts=extraction_attempts,
             extraction_lease_epoch=extraction_lease_epoch,
+            extraction_retry_after=extraction_retry_after,
             extraction_output=extraction_output,
             extraction_output_hash=extraction_output_hash,
             extraction_accounting=extraction_accounting,
