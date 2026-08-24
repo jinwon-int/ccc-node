@@ -629,5 +629,46 @@ ok "working-state: private scoped session falls back to the legacy file when the
 ok "working-state: shared scoped session is valid and never reads the legacy file" \
   'grep -q "scoped memory" <<<"$out_shared" && ! grep -q "Audience-scoped memory unavailable" <<<"$out_shared" && ! grep -q "LEGACY_WS_SENTINEL" <<<"$out_shared"'
 
+# ---- still-owed external-wait promises (#1258) -------------------------------
+# The unit contract lives in lib/pending_promises.test.sh; what is pinned here
+# is the *wiring*, because the failure mode is silent. The helper is invoked
+# behind a `[ -r ... ]` guard with a fail-open `||`, so a wrong path (this block
+# shipped once looking for the module beside load-memory.sh instead of in lib/)
+# produces no error at all — just a block that never appears. Only an
+# end-to-end assertion catches that.
+ew="$TMP/external-wait"; mkdir -p "$ew"
+run_promises() { # <waits.json body>
+  printf '%s' "$1" > "$ew/waits.json"
+  HOME="$TMP/home" CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" \
+    CCC_MEMORY_DIR="$mem" CCC_HOOK_DIR="$ROOT/claude/hooks" \
+    CCC_MEMORY_TOOLS_DIR="$tools" CCC_HONCHO_MEMORY_ENABLED=0 \
+    CCC_MEMORY_NO_REFRESH=1 CCC_EXTERNAL_WAIT_HOME="$ew" \
+    bash "$ROOT/claude/hooks/load-memory.sh" SessionStart 2>&1
+}
+
+out="$(run_promises '{}')"
+ok "pending-promises: an empty registry injects no block (block defaults ON, so silence is the contract)" \
+  '! grep -q "미완 약속" <<<"$out"'
+
+out="$(run_promises '{"w1":{"wait_id":"w1","state":"monitoring","repo":"o/r","pr_number":7,"summary":"CI running"}}')"
+ok "pending-promises: a monitoring wait reaches additionalContext" \
+  'grep -q "미완 약속" <<<"$out" && grep -q "o/r#7" <<<"$out"'
+
+out="$(run_promises '{"w1":{"wait_id":"w1","state":"completed","repo":"o/r","pr_number":8,"summary":"green","wake":{"state":"done","resumed":false,"skip_reason":"session_moved"}}}')"
+ok "pending-promises: a dropped promise reaches additionalContext with its skip reason" \
+  'grep -q "o/r#8" <<<"$out" && grep -q "session_moved" <<<"$out"'
+
+out="$(run_promises '{"w1":{"wait_id":"w1","state":"completed","repo":"o/r","pr_number":9,"wake":{"state":"done","resumed":true}}}')"
+ok "pending-promises: a fulfilled promise stays out of the payload" \
+  '! grep -q "미완 약속" <<<"$out"'
+
+out="$(CCC_MEMORY_INJECT_PENDING_PROMISES=0 run_promises '{"w1":{"wait_id":"w1","state":"monitoring","repo":"o/r","pr_number":7}}')"
+ok "pending-promises: CCC_MEMORY_INJECT_PENDING_PROMISES=0 disables the block" \
+  '! grep -q "미완 약속" <<<"$out"'
+
+out="$(run_promises 'not json{{{')"
+ok "pending-promises: a corrupt registry degrades to no block, not a failed hook" \
+  '! grep -q "미완 약속" <<<"$out" && grep -q "additionalContext" <<<"$out"'
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
