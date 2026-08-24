@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Managed auto-distill provider/installer regressions (#1257).
+# Managed auto-distill provider/installer/receipt regressions (#1257, #1262).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"

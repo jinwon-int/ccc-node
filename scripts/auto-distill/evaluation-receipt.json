@@ -1,0 +1,70 @@
+{
+  "schema": "ccc.auto-distill.evaluation-receipt.v1",
+  "pipeline": 6,
+  "subject": {
+    "path": "scripts/auto-distill/auto-distill.py",
+    "sha256": "0055171eb9791866f44dcc87a4698369fc8df2542af2e9e2f584daf18a62cfd6",
+    "surface_schema": "ccc.auto-distill.canon-surface.v1",
+    "surface_sha256": "5927f8180bf77fef76e76d02c8d7f74594d753f0c78a2e5ab64717e395087e4a",
+    "surface_members": [
+      "assign:PIPELINE",
+      "assign:CANON_PROMPT",
+      "assign:CANON_EXCLUDE",
+      "assign:_FOCUS_WORD_RE",
+      "assign:TOKEN_RES",
+      "assign:SELF_ADDR_RE",
+      "function:unwrap_claude_envelope",
+      "function:extract_json",
+      "function:_focus_needles",
+      "function:_needle_score",
+      "function:_window_body",
+      "function:section_body",
+      "function:literal_hits",
+      "function:self_canon_addrs",
+      "function:format_self_canon",
+      "function:self_canon_sections",
+      "function:canon_snippets",
+      "function:canon_dedup"
+    ]
+  },
+  "evaluation": {
+    "id": "TM-2398",
+    "evaluated_source_sha256": "0055171eb9791866f44dcc87a4698369fc8df2542af2e9e2f584daf18a62cfd6",
+    "completed_at": "2026-08-24T23:23:58+09:00",
+    "provider": "claude-code-oauth",
+    "model": "haiku",
+    "corpus": {
+      "sample": "sample-v4.json",
+      "sample_md5": "d10ab0338da57f0f83e4f7123fece1cd",
+      "sample_sha256": "56e349d2ba79f5e9395957eb53af14f8d3c0ab862a0100c72229e63bd2388c16",
+      "verdicts": "verdicts.json",
+      "verdicts_md5": "886a4840289163898a9d7ff1e6d7b5d2",
+      "verdicts_sha256": "f496bb33a8507e62f6f1099397478f99dae68d52b27aa773f11f53bd4b73da1e",
+      "cases": 47
+    },
+    "harness": {
+      "eval_canon_sha256": "33be3b396015e7dd46e134c5d5294a115df69f325a95fa5e194f688954fe8a85",
+      "recheck_addr_sha256": "01ad650774f1e90c31052d21775ec2a0d45c9518962970458f9195b8204e3e70"
+    },
+    "artifacts": {
+      "eval_log_sha256": "eb5dd1f7182038c82495ea4e8b7b7ff6642a2c5aeee2d6c01ea5c8efec0ea8ad",
+      "eval_result_sha256": "81dc8432bf1e42072f91b96a6444efc73edbedb006e61d4dd61fb9db9b322e60",
+      "recheck_log_sha256": "c9b323037ea051beb2651ffdf0197223534767d2d943cf38b514e1c2de06fa4a"
+    },
+    "recheck": {
+      "baseline_duplicates": 1,
+      "duplicates": 8,
+      "cases": 12,
+      "suspect": 0
+    },
+    "confusion": {
+      "tp": 13,
+      "fp": 1,
+      "fn": 10,
+      "tn": 23
+    },
+    "collateral_damage": 0,
+    "passed": true
+  },
+  "issued_at": "2026-08-24T23:24:36+09:00"
+}

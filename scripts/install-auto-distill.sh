@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Install the repo-managed TM-2380 auto-distill source transactionally (#1257).
+# Install the repo-managed TM-2380 auto-distill source transactionally (#1257, #1262).
 #
 # This deliberately does not create/modify cron entries or start services.
 # Fleet rollout remains a separately approved operation.
@@ -7,9 +7,11 @@ set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SOURCE_DIR="$SCRIPT_DIR/auto-distill"
+RECEIPT_VERIFIER="$SCRIPT_DIR/verify-auto-distill-receipt.py"
+RECEIPT_NAME=evaluation-receipt.json
 ACTION=preview
 TARGET_HOME="${CCC_AUTO_DISTILL_TARGET_HOME:-${HOME:?HOME must be set}}"
-FILES=(auto-distill.py metrics.py model_command.py)
+FILES=(auto-distill.py metrics.py model_command.py "$RECEIPT_NAME")
 
 usage() {
   printf '%s\n' \
@@ -44,9 +46,27 @@ esac
   || { echo "target home owner is unsafe" >&2; exit 2; }
 
 for name in "${FILES[@]}"; do
-  [ -f "$SOURCE_DIR/$name" ] && [ ! -L "$SOURCE_DIR/$name" ] \
-    || { echo "managed source missing or unsafe: $name" >&2; exit 2; }
+  if [ ! -f "$SOURCE_DIR/$name" ] || [ -L "$SOURCE_DIR/$name" ]; then
+    if [ "$name" = "$RECEIPT_NAME" ]; then
+      echo "evaluation receipt invalid: missing or unsafe" >&2
+      exit 3
+    fi
+    echo "managed source missing or unsafe: $name" >&2
+    exit 2
+  fi
 done
+if [ ! -f "$RECEIPT_VERIFIER" ] || [ -L "$RECEIPT_VERIFIER" ]; then
+  echo "receipt verifier missing or unsafe" >&2
+  exit 2
+fi
+
+if ! receipt_summary="$(python3 "$RECEIPT_VERIFIER" \
+    --source "$SOURCE_DIR/auto-distill.py" \
+    --receipt "$SOURCE_DIR/$RECEIPT_NAME" 2>&1)"; then
+  printf '%s\n' "$receipt_summary" >&2
+  exit 3
+fi
+printf '%s\n' "$receipt_summary"
 
 DEST_DIR="$TARGET_HOME/.hermes/auto-distill"
 BACKUP_ROOT="$TARGET_HOME/.hermes/backups/auto-distill"
@@ -69,6 +89,13 @@ safe_target_file() {
     [ "$(stat -c %u -- "$path")" = "$(id -u)" ] \
       || { echo "unsafe target owner: $path" >&2; return 1; }
   fi
+}
+
+file_mode() {
+  case "$1" in
+    "$RECEIPT_NAME") printf '600\n' ;;
+    *) printf '700\n' ;;
+  esac
 }
 
 safe_existing_dir "$TARGET_HOME/.hermes" || exit 2
@@ -126,7 +153,7 @@ rollback() {
   trap - ERR
   for name in "${installed[@]}"; do
     if [ -n "$backup_dir" ] && [ -f "$backup_dir/$name" ]; then
-      install -m 700 -- "$backup_dir/$name" "$DEST_DIR/$name"
+      install -m "$(file_mode "$name")" -- "$backup_dir/$name" "$DEST_DIR/$name"
     else
       rm -f -- "$DEST_DIR/$name"
     fi
@@ -140,7 +167,7 @@ trap cleanup EXIT
 trap 'rollback $?' ERR
 
 for name in "${FILES[@]}"; do
-  install -m 700 -- "$SOURCE_DIR/$name" "$stage_dir/$name"
+  install -m "$(file_mode "$name")" -- "$SOURCE_DIR/$name" "$stage_dir/$name"
   if [ ! -f "$DEST_DIR/$name" ] || ! cmp -s "$stage_dir/$name" "$DEST_DIR/$name"; then
     changed+=("$name")
   fi
