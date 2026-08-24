@@ -5,6 +5,16 @@ All notable changes to the Claude Code node harness. Dates are KST.
 ## [Unreleased]
 
 ### Fixed
+- TM-2380 auto-distill is now repository-managed instead of a five-node
+  hand-deployed script (#1257). Its model resolver recovers Piri configuration
+  from the cron environment, the bridge systemd unit, `/opt/piri`, the Termux
+  home path, or `PATH`; an identified Piri node fails closed instead of
+  silently falling through to an unauthenticated Claude CLI. Auto-to-Claude
+  selection is explicit in body-free console/audit evidence, quoted custom
+  commands are parsed safely, and every extractor child carries the lifecycle
+  INFLIGHT guards. A preview-first transactional installer backs up and rolls
+  back changed source without modifying cron or services; hermetic provider,
+  integration, and installer regressions pin the contract.
 - Provider-neutral distill now applies the same bounded failure controls to
   Claude, Codex, and Piri (#1254): one shared `distill.disabled` off-switch,
   body-free auth/quota/rate-limit/model classification, owner-only

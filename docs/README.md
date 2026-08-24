@@ -5,6 +5,7 @@ Living operator docs stay at the top level of `docs/`; historical closeouts and 
 | Doc | Scope |
 |---|---|
 | [`memory.md`](memory.md) | SessionStart/PostCompact memory injection, cache refresh, local hot-memory index, eval/benchmark flows. |
+| [`auto-distill.md`](auto-distill.md) | TM-2380 session-to-Wiki canary, provider resolution, managed installation, and rollout boundary. |
 | [`harness.md`](harness.md) | Settings, hooks, status line, output style, plugin/standalone mode, path overrides. |
 | [`doctor.md`](doctor.md) | Doctor diagnostics, guarded repair, rollback, fleet matrix. |
 | [`security-audit.md`](security-audit.md) | Read-only security audit and fleet matrix reporting. |
