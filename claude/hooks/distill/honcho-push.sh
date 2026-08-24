@@ -100,7 +100,8 @@ fi
 # Honcho's dialectic engine will reason over it on recall.
 CONTENT="$(printf '%s' "$HONCHO_FACTS" | jq -r --arg sid "$SID" --arg trg "$TRG" '
   "[distill trigger=\($trg) session=\($sid)]\n" +
-  (map("- (\(.kind // "fact")) \(.text // "")") | join("\n"))
+  (map("- (\(.kind // "fact")) \(.text // "")" +
+    (if (.because // "") != "" then " (근거: \(.because))" else "" end)) | join("\n"))
 ' 2>/dev/null)"
 
 # Cap content (Honcho MessageCreate.content maxLength = 25000).

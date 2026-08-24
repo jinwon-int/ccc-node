@@ -149,6 +149,8 @@ ok "valid JSON carries source cwd metadata" 'jq -e ".source_cwd == \"/root/proje
 ok "valid JSON carries transcript_path for the G2 quote gate" \
   'jq -e --arg t "$TRANSCRIPT" ".transcript_path == \$t" <<<"$out" >/dev/null'
 ok "transcript input is redacted before claude" '! grep -q "$fake_github_token\|Bearer abcdefghijklmnopqrstuvwxyz123456" "$TMP/input-valid.txt" && grep -q "REDACTED" "$TMP/input-valid.txt"'
+# #1264: the Claude-lane extraction prompt must require `because` on decisions
+ok "extract prompt requires because on decisions (G5 contract)" 'grep -q "because" "$TMP/input-valid.txt"'
 ok "hostile inherited allowlist cannot enable tools" \
   'argv_is_deny_all "$TMP/args-valid.txt" 1 && tool_env_is_unset "$TMP/tool-env-valid.txt" 1 && ! grep -q "<Bash>\\|<Edit>\\|<Write>" "$TMP/args-valid.txt"'
 

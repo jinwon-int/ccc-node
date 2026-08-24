@@ -53,6 +53,9 @@ PY
 out="$(NUNCHI_DB="$OLD" python3 "$NP" init 2>&1)"
 mig="$(NUNCHI_DB="$OLD" python3 -c "import sqlite3;print([r[1] for r in sqlite3.connect('$OLD').execute('PRAGMA table_info(facts_fts)')])")"
 ok "old DB migrated to 2-col FTS" 'grep -q "observed" <<<"$mig"'
+migc="$(NUNCHI_DB="$OLD" python3 -c "import sqlite3;print([r[1] for r in sqlite3.connect('$OLD').execute('PRAGMA table_info(peer_facts)')])")"
+ok "old DB migrated with gate columns incl. because (G5)" \
+  'grep -q "source_rank" <<<"$migc" && grep -q "review" <<<"$migc" && grep -q "because" <<<"$migc"'
 out="$(NUNCHI_DB="$OLD" python3 "$NP" recall "yukson" 2>&1)"
 ok "migrated DB answers node-name query (B1)" 'grep -q "노드 상태 정상" <<<"$out"'
 
@@ -591,6 +594,55 @@ import sys; sys.path.insert(0, \"$HERE\")
 from nunchi import NO_RECORD_RE
 import sys as s
 s.exit(0 if NO_RECORD_RE.search(\"질문한 내용에 대한 근거 기록이 없습니다.\") else 1)"'
+
+# ---- 4. G5: decision must carry a reason (#1264) --------------------------
+# A decision without its why gets blindly re-litigated or blindly obeyed.
+# G5 flags (never rejects) reasonless decisions; the reason rides a structured
+# `because` field or an inline marker in the sentence itself.
+payloadb() {  # payloadb <sid> <kind> <subject> <text> [because]
+  if [ -n "${5:-}" ]; then
+    printf '{"session_id":"%s","distilled_at":"2026-08-24T00:00:00+00:00","honcho":[{"kind":"%s","subject":"%s","text":"%s","because":"%s"}]}' "$1" "$2" "$3" "$4" "$5"
+  else
+    printf '{"session_id":"%s","distilled_at":"2026-08-24T00:00:00+00:00","honcho":[{"kind":"%s","subject":"%s","text":"%s"}]}' "$1" "$2" "$3" "$4"
+  fi
+}
+# isolated observed peer so G3/G1 cannot interfere with the G5 assertions
+out="$(CCC_NODE=nosuk payloadb sg5a decision node "노드 백업 정책을 주간 수동으로 확정" | CCC_NODE=nosuk python3 "$NP" ingest - 2>&1)"
+ok "G5: reasonless decision still ingested (flag, never reject)" 'grep -q "ingested 1/1" <<<"$out"'
+row="$(python3 -c "import sqlite3;print(sqlite3.connect('$NUNCHI_DB').execute(\"SELECT review FROM peer_facts WHERE fact LIKE '%백업 정책%'\").fetchone()[0])")"
+ok "G5: reasonless decision flagged review=1" '[ "$row" = "1" ]'
+
+CCC_NODE=nosuk payloadb sg5b decision node "측정 비용 때문에 백업 자동화를 보류했다" | CCC_NODE=nosuk python3 "$NP" ingest - >/dev/null
+row="$(python3 -c "import sqlite3;print(sqlite3.connect('$NUNCHI_DB').execute(\"SELECT review FROM peer_facts WHERE fact LIKE '%백업 자동화%'\").fetchone()[0])")"
+ok "G5: inline-reason decision not flagged" '[ "$row" = "0" ]'
+
+CCC_NODE=nosuk payloadb sg5c decision node "로그 보관을 30일로 결정" "디스크 상한 80% 정책 때문" | CCC_NODE=nosuk python3 "$NP" ingest - >/dev/null
+row="$(python3 -c "import sqlite3;print(*sqlite3.connect('$NUNCHI_DB').execute(\"SELECT review, because FROM peer_facts WHERE fact LIKE '%로그 보관%'\").fetchone())")"
+ok "G5: structured because stored, not flagged" '[ "$row" = "0 디스크 상한 80% 정책 때문" ]'
+
+out="$(python3 "$NP" recall "로그 보관" 2>&1)"
+ok "recall prints the because rationale" 'grep -q "근거: 디스크 상한 80%" <<<"$out"'
+
+# annotate — owner backfill for pre-G5 decisions; review stays owner-cleared
+out="$(python3 "$NP" annotate 99999 --because "없는 id" 2>&1)"; rc=$?
+ok "annotate rejects unknown fact id" '[ "$rc" != 0 ]'
+fid="$(python3 -c "import sqlite3;print(sqlite3.connect('$NUNCHI_DB').execute(\"SELECT id FROM peer_facts WHERE fact LIKE '%백업 정책%'\").fetchone()[0])")"
+python3 "$NP" annotate "$fid" --because "자동화 실패 이력(2026-06) 때문" >/dev/null
+row="$(python3 -c "import sqlite3;print(*sqlite3.connect('$NUNCHI_DB').execute(\"SELECT because, review FROM peer_facts WHERE id=$fid\").fetchone())")"
+ok "annotate backfills because; review flag stays explicit-clear-only" \
+  '[ "$row" = "자동화 실패 이력(2026-06) 때문 1" ]'
+
+# dialectic evidence must carry the structured because so q7-class reason
+# questions can be answered from peer facts instead of failing to wiki-only.
+cat > "$syn_bin/claude" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" > "${DIALECTIC_PROMPT_CAPTURE:?}"
+echo "STUB-OK"
+EOF
+chmod +x "$syn_bin/claude"
+out="$(DIALECTIC_PROMPT_CAPTURE="$TMP/dcap" PATH="$syn_bin:/usr/bin:/bin" HOME="$TMP/home" python3 "$NP" dialectic "로그 보관" 2>&1)"
+ok "dialectic evidence carries the structured because" \
+  'grep -q "근거: 디스크 상한 80% 정책 때문" "$TMP/dcap" && grep -q "STUB-OK" <<<"$out"'
 
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

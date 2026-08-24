@@ -112,7 +112,8 @@ Schema:
       "text": "<one-sentence Korean fact about the user, relationship, or in-flight work>",
       "subject": "user" | "session" | "node",
       "source": "user-stated" | "measured" | "inferred",
-      "quote": "<<= 120 chars verbatim quote from the transcript grounding this fact, or empty string>"
+      "quote": "<<= 120 chars verbatim quote from the transcript grounding this fact, or empty string>",
+      "because": "<one-sentence reason — REQUIRED when kind=decision, omit otherwise>"
     }
   ],
   "wiki_candidates": [
@@ -140,9 +141,10 @@ honcho criteria (working/relational memory; volatile OK):
   - PRESERVE VERBATIM inside `text`: numbers, issue/PR ids (#NNN), commit SHAs,
     file paths, and model/version strings — copy them exactly, never round or
     paraphrase (summary drift kills specifics first).
-  - kind=decision MUST carry its reason in the same sentence ("...때문에 X로
-    결정" / "근거: ..."). A decision without its why gets blindly re-litigated
-    or blindly obeyed later — both are failure modes.
+  - kind=decision MUST set `because` to its one-sentence reason. A decision
+    without its why gets blindly re-litigated or blindly obeyed later — both
+    are failure modes (weekly bench q7 measured a decision whose reason only
+    survived in the Wiki). Keep `text` self-contained even without it.
   - kind=constraint is for standing prohibitions/musts the user stated
     ("절대 X 금지", "반드시 Y 먼저"). Keep near-verbatim; never summarize,
     merge, or soften. Constraints outlive ordinary context.
