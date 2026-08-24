@@ -640,6 +640,13 @@ case "$ACTION" in
     # audience-scoped install (the #996 emergency configuration).
     record_argv=(--apply "--$resolved_provider")
     if [ "$AUDIENCE_SCOPED" = 1 ]; then record_argv+=(--audience-scoped "$AUDIENCE_ROOT"); fi
+    # --judge must be materialized for the same reason as the audience flags:
+    # the judge line is opt-in, so a replay that omits it silently DELETES the
+    # cron (strip_cron drops all managed lines, then only the recorded flags
+    # re-add them). Measured 2026-08-25: judge-batch cron was live on 1 of 11
+    # fleet nodes while every node carried the script and a non-empty review
+    # queue (#1264) — this omission is the mechanism that loses it.
+    if [ "$JUDGE" = 1 ]; then record_argv+=(--judge); fi
     ccc_installer_record_write "$STATE" "$NUNCHI_SELF_DIR/install-nunchi.sh" "$MARK" "$GEN" -- \
       "${record_argv[@]}" \
       || echo "WARNING: install record write failed — self-update re-apply will not track these entries" >&2
