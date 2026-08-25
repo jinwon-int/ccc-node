@@ -203,5 +203,26 @@ ok "G5 audit points the owner at annotate" 'grep -q "annotate" "$NUNCHI_HOME/jud
 ok "inline-reason decision takes the normal deterministic path" '[ "$(review_of "$idg2")" = 0 ]'
 ok "structured-because decision takes the normal deterministic path" '[ "$(review_of "$idg3")" = 0 ]'
 
+# ---- 9. G3 batch pool mirrors ingest: cross-session siblings (#1255) -------
+# _conflict_review widened G3 to all same-kind session:* peers; the batch
+# recheck used a bare observed=? match, saw "no live sibling" for a
+# cross-session near-duplicate, and deterministically cleared the very flag
+# the write gate had raised for it.
+reset_db
+cat >"$TMP/bin/claude" <<'STUB'
+#!/usr/bin/env bash
+cat >/dev/null
+exit 1
+STUB
+chmod +x "$TMP/bin/claude"
+idx1="$(seed session:aaa "동일 결론이 여러 세션에서 재추출되었다" "$OLD" 1 1 dx1)"
+idx2="$(seed session:bbb "동일 결론이 여러 세션에서 재추출되었다" "$OLD" 1 0 dx2)"
+idx3="$(seed session:ccc "완전히 무관한 주제의 외로운 항목" "$OLD" 1 1 dx3)"
+NUNCHI_JUDGE_APPLY=1 run_batch
+ok "cross-session sibling keeps the flag (fail-closed to human)" '[ "$(review_of "$idx1")" = 1 ]'
+ok "only the lonely item deterministic-cleared (sibling went to the judge lane)" 'grep -c "\"class\": \"deterministic-clear\"" "$NUNCHI_HOME/judge-audit.jsonl" | grep -qx 1'
+ok "unflagged cross-session sibling untouched" '[ "$(review_of "$idx2")" = 0 ]'
+ok "lonely session item still clears deterministically" '[ "$(review_of "$idx3")" = 0 ]'
+
 printf 'PASS=%d FAIL=%d\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

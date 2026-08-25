@@ -36,7 +36,7 @@ AUDIT = os.path.join(HOME, ".hermes/logs/auto-distill-audit.jsonl")
 WIKI_CACHE = os.path.join(HOME, ".wiki-agent/wiki-cache/pages/nodes")
 NODES = ["gwakga", "nosuk", "yukson", "sogyo", "daegyo"]
 
-def _current_pipeline(default=5):
+def _current_pipeline(default=6):
     """현행 파이프라인 버전을 **추출기에서 직접 읽는다.**
 
     두 파일에 숫자를 따로 적어두면 반드시 어긋난다 — 실측 2026-08-22: 추출기를
@@ -259,7 +259,10 @@ def main():  # noqa: C901 - report assembly mirrors the deployed collector
     if cov:
         print("  ⚠ 판정 커버리지가 낮다 (%s). 검토자가 일부만 판정하면" % ", ".join(cov))
         print("    선택 편향으로 위 비율이 실제와 크게 달라진다 — 전건 판정 후 볼 것.")
-        if loss > 0.5:
+        # loss 는 격리분 판정이 0건이면 None 이다 — "통과분 일부 판정, 격리분
+        # 미판정"이 저커버리지 경고의 가장 흔한 진입 상태라 None 비교로 죽으면
+        # 보고서 전체가 안 나온다.
+        if loss is not None and loss > 0.5:
             print("  ⚠ 게이트가 가치 있는 항목을 절반 넘게 막고 있다 —")
             print("    승격 판정에 가치 축을 넣기 전에는 V2 자동 승격을 켜면 안 된다.")
     promoted = sum(1 for v in judged if v["status"] == "promoted")

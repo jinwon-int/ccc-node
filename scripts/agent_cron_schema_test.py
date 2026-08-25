@@ -43,6 +43,23 @@ class SchemaContractTests(unittest.TestCase):
             "schemas/agent-cron-task-store.schema.json"
         ))
 
+    def test_task_without_notify_is_legal_and_needs_no_chat_id(self) -> None:
+        # Regression: the notifyChatId conditional's `if` lacked
+        # `required: ["notify"]`, so a task that simply omitted notify
+        # (schema default "none") satisfied the guard and the whole store
+        # failed closed with "notifyChatId is required" — bricking every
+        # CLI command over a hand-edited or externally generated store.
+        store = valid_store()
+        del store["tasks"][0]["notify"]  # type: ignore[union-attr,index]
+        self.assertEqual(validate_store(store), [])
+
+    def test_chat_notify_still_requires_chat_id(self) -> None:
+        store = valid_store()
+        store["tasks"][0]["notify"] = "telegram-chat"  # type: ignore[index]
+        self.assertTrue(
+            any("notifyChatId is required" in error for error in validate_store(store))
+        )
+
     def test_unknown_fields_fail_closed_at_every_object_boundary(self) -> None:
         cases = []
         root = valid_store()

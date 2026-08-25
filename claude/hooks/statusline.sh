@@ -67,10 +67,16 @@ if [ -n "$CWD" ]; then
     BR="${CURRENT_BRANCH}${DIRTY_MARKER}"
 
     # Write cache (ignore failures — statusline must never block).
+    # dirty must be a JSON literal: `${DIRTY_MARKER:+true}` expanded to an
+    # empty string on clean repos, jq rejected it, and the already-applied
+    # redirection truncated the cache to an empty file — so the TTL cache
+    # never worked for clean repos and every render re-ran git status.
+    DIRTY_JSON=false
+    [ -n "$DIRTY_MARKER" ] && DIRTY_JSON=true
     mkdir -p "$CACHE_DIR" 2>/dev/null
     jq -n \
       --arg branch "$CURRENT_BRANCH" \
-      --argjson dirty "${DIRTY_MARKER:+true}" \
+      --argjson dirty "$DIRTY_JSON" \
       --argjson ts "$NOW" \
       '{branch: $branch, dirty: $dirty, timestamp: $ts}' >"$CACHE_FILE" 2>/dev/null || true
   fi

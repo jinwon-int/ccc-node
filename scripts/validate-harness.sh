@@ -568,6 +568,19 @@ if [ -f claude/hooks/statusline.sh ]; then
   # empty input must not crash (fail-open to a usable bar)
   printf '%s' '' | CCC_NODE=ci bash claude/hooks/statusline.sh >/dev/null 2>&1 \
     && say "  ok statusline.sh survives empty input" || err "statusline.sh crashed on empty input"
+  # git TTL cache must be valid JSON for a CLEAN repo (regression: the empty
+  # ${DIRTY_MARKER:+true} --argjson made jq abort after the redirect had
+  # truncated the cache, so clean repos re-ran git status on every render)
+  clean_repo="$TMP/status-clean-repo"
+  if git init -q "$clean_repo" 2>/dev/null \
+     && git -C "$clean_repo" -c user.email=ci@local -c user.name=ci commit -q --allow-empty -m init 2>/dev/null; then
+    printf '{"workspace":{"current_dir":"%s"}}' "$clean_repo" \
+      | CCC_NODE=ci HOME="$TMP/status-home" bash claude/hooks/statusline.sh >/dev/null 2>&1 || true
+    cache_json="$(find "$TMP/status-home/.claude/cache/git-status" -name '*.json' 2>/dev/null | head -1)"
+    if [ -n "$cache_json" ] && jq -e '.branch and (.dirty == false)' "$cache_json" >/dev/null 2>&1; then
+      say "  ok statusline git cache is valid JSON for a clean repo"
+    else err "statusline git cache invalid/empty for a clean repo (--argjson regression)"; fi
+  fi
 fi
 # settings statusLine command must point at an installed script that exists in-repo
 SL_CMD="$(jq -r '.statusLine.command // empty' claude/settings.base.json 2>/dev/null)"

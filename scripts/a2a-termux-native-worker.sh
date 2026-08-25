@@ -486,9 +486,15 @@ main() {
     local env_file=""
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --env-file) env_file="${2:-}"; shift 2 ;;
+            --env-file)
+                # `shift 2` with one arg left is a no-op under bash (status 1,
+                # params untouched), and the unknown-arg branch without a
+                # return re-dispatches the same token forever — both spun this
+                # loop unbounded, flooding the supervisor log.
+                [[ $# -ge 2 ]] || { echo "--env-file requires a value" >&2; usage; return 2; }
+                env_file="$2"; shift 2 ;;
             -h|--help)  usage; return 2 ;;
-            *)          echo "unknown arg: $1" >&2; usage ;;
+            *)          echo "unknown arg: $1" >&2; usage; return 2 ;;
         esac
     done
     case "$cmd" in

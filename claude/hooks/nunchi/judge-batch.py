@@ -163,22 +163,32 @@ def fetch_queue(conn):
     ).fetchall()
 
 
-def live_conflict(conn, fact_id, observed, text):
+def live_conflict(conn, fact_id, observed, text, kind=None):
     """The write gate's G3 rule re-run at batch time, excluding the item itself.
 
     At ingest _conflict_review runs before the newcomer is inserted, so it
     never self-matches; the batch recheck must exclude the queued item's own
-    row explicitly. Tokenization and the 0.6 threshold come from nunchi.py
-    verbatim (imported, not copied).
+    row explicitly. Tokenization, the 0.6 threshold, AND the candidate pool
+    mirror nunchi.py: #1255 widened G3 to all same-kind session:* peers, and
+    a batch recheck scoped to one session id saw "no live sibling" for
+    exactly the cross-session near-duplicates the flag exists for — and
+    deterministically cleared them.
     """
     new = nunchi._tokens(text)
     if not new:
         return []
+    if str(observed).startswith("session:"):
+        where, params = "(observed=? OR observed LIKE 'session:%')", (observed,)
+    else:
+        where, params = "observed=?", (observed,)
+    if kind is not None:
+        where += " AND kind=?"
+        params = params + (kind,)
     hits = []
     for fid, fact in conn.execute(
-            "SELECT id, fact FROM peer_facts"
-            " WHERE observed=? AND valid_to IS NULL AND id != ?",
-            (observed, fact_id)).fetchall():
+            f"SELECT id, fact FROM peer_facts"
+            f" WHERE {where} AND valid_to IS NULL AND id != ?",
+            params + (fact_id,)).fetchall():
         old = nunchi._tokens(fact)
         if old and len(new & old) / min(len(new), len(old)) >= 0.6:
             hits.append((fid, fact))
@@ -321,7 +331,7 @@ def triage_queue(conn, queue):
                 "verdict": "human", "supersede_proposal": None,
             })
             continue
-        siblings = live_conflict(conn, fid, observed, text)
+        siblings = live_conflict(conn, fid, observed, text, kind)
         if not siblings:
             decisions.append({
                 "id": fid, "class": "deterministic-clear",

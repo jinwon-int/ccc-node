@@ -15,7 +15,10 @@
         "required": ["id", "schedule", "prompt", "enabled"],
         "allOf": [
           {
-            "if": { "properties": { "notify": { "enum": ["telegram-chat", "telegram-chat-on-failure"] } } },
+            "if": {
+              "properties": { "notify": { "enum": ["telegram-chat", "telegram-chat-on-failure"] } },
+              "required": ["notify"]
+            },
             "then": { "required": ["notifyChatId"] }
           }
         ],
