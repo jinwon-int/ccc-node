@@ -1,5 +1,24 @@
 # Changelog
 
+- **Idle-session RSS watermark now scales to the host's real memory
+  (#1277).** The session resource guard closes an idle agent session (and
+  kills any background children riding along in its process tree — e.g. an
+  ad-hoc `Bash(run_in_background)` job) once the process tree's RSS crosses
+  `CCC_BRIDGE_SESSION_TREE_RSS_LIMIT_MB`. The old fixed default (1024 MiB)
+  did not fit a fleet spanning VPS and phone nodes: observed on a 22 GiB VPS
+  with 20 GiB free, a single idle session with two MCP servers attached
+  (searxng, firecrawl) routinely sat at 1.0-1.2 GiB RSS — right at the
+  watermark — so the guard fired on almost every idle tick (48 evictions/day
+  observed) despite there being no real memory pressure at all, silently
+  killing unrelated background work. `utils/session_resource_guard.py` adds
+  `system_total_memory_mb()` (reads `/proc/meminfo`, fails open to 0 on
+  hardened/non-Linux hosts) and `default_session_tree_rss_limit_mb()`
+  (a quarter of total memory, floored at the historical 1024 MiB and capped
+  at 8192 MiB); `utils/config.py` wires it in as the field's
+  `default_factory` so an explicit `CCC_BRIDGE_SESSION_TREE_RSS_LIMIT_MB`
+  still overrides it unchanged. Seven new regression tests cover the scaling
+  math and its floor/cap/fallback edges.
+
 - **Webhook nudge listener self-heals a dead accept() socket instead of
   spinning (#1274).** A listening socket can outlive the network interface
   it was bound to — most commonly on a mobile/Termux node whose IP changes
