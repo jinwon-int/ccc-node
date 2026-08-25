@@ -12,9 +12,11 @@ import time
 from typing import Literal, Protocol, cast
 
 from .distill_extraction import (
+    DecisionReasonMissingError,
     DistillBackend,
     DistillExtractionOutput,
     build_extraction_input,
+    validate_live_decision_reasons,
 )
 from .codex_exec_backend import MAX_EXTRACTION_JSON_BYTES
 from .distill_journal import DistillJournal
@@ -76,11 +78,13 @@ _RETRYABLE_BACKEND_CODES = frozenset(
         "distill_io_failed",
         "distill_nonzero_exit",
         "distill_output_invalid",
+        "distill_decision_reason_missing",
         "codex_distill_spawn_failed",
         "codex_distill_timeout",
         "codex_distill_io_failed",
         "codex_distill_nonzero_exit",
         "codex_distill_output_invalid",
+        "codex_distill_decision_reason_missing",
     }
     | PROVIDER_CIRCUIT_CODES
 )
@@ -432,6 +436,23 @@ class CodexDistillExtractionWorker:
                 claimed,
                 error_code="distill_output_invalid",
                 terminal=True,
+                accounting=accounting,
+            )
+        # Provider-neutral defense in depth: concrete Claude/Codex/Piri
+        # adapters enforce this contract, but the worker is the final common
+        # boundary before every sink. A future DistillBackend must not be able
+        # to reintroduce reasonless live decisions by omitting adapter-local
+        # validation.
+        try:
+            output = validate_live_decision_reasons(output)
+        except DecisionReasonMissingError:
+            return await self._fail(
+                claimed,
+                error_code="distill_decision_reason_missing",
+                terminal=False,
+                retry_after_seconds=self._retry_delay(
+                    claimed.extraction_attempts
+                ),
                 accounting=accounting,
             )
         provenance = output.provenance

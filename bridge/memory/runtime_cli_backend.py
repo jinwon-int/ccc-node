@@ -17,10 +17,12 @@ from typing import Final, Literal
 from .codex_exec_backend import _DEFAULT_SCHEMA, DISTILL_EXTRACTION_PROMPT
 from .distill_extraction import (
     MAX_EXTRACTION_JSON_BYTES,
+    DecisionReasonMissingError,
     DistillExtractionInput,
     DistillExtractionOutput,
     canonical_extraction_input_bytes,
     parse_extraction_output,
+    validate_live_decision_reasons,
 )
 from .distill_guard import (
     classify_provider_failure,
@@ -447,6 +449,10 @@ class RuntimeCliDistillBackend:
             result = parse_extraction_output(payload, wiki_enabled=self._wiki_enabled)
         except (TypeError, ValueError):
             raise RuntimeDistillBackendError("distill_output_invalid") from None
+        try:
+            result = validate_live_decision_reasons(result)
+        except DecisionReasonMissingError:
+            raise RuntimeDistillBackendError("distill_decision_reason_missing") from None
         provenance = result.provenance
         if (
             provenance.provider != extraction_input.provider

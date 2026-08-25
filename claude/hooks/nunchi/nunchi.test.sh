@@ -628,8 +628,9 @@ s.exit(0 if NO_RECORD_RE.search(\"질문한 내용에 대한 근거 기록이 �
 
 # ---- 4. G5: decision must carry a reason (#1264) --------------------------
 # A decision without its why gets blindly re-litigated or blindly obeyed.
-# G5 flags (never rejects) reasonless decisions; the reason rides a structured
-# `because` field or an inline marker in the sentence itself.
+# G5 flags (never rejects) reasonless legacy decisions. New extractor payloads
+# declare required-v1 and reject a decision before storage unless structured
+# `because` is present; inline markers remain a compatibility path only.
 payloadb() {  # payloadb <sid> <kind> <subject> <text> [because]
   if [ -n "${5:-}" ]; then
     printf '{"session_id":"%s","distilled_at":"2026-08-24T00:00:00+00:00","honcho":[{"kind":"%s","subject":"%s","text":"%s","because":"%s"}]}' "$1" "$2" "$3" "$4" "$5"
@@ -650,6 +651,14 @@ ok "G5: inline-reason decision not flagged" '[ "$row" = "0" ]'
 CCC_NODE=nosuk payloadb sg5c decision node "로그 보관을 30일로 결정" "디스크 상한 80% 정책 때문" | CCC_NODE=nosuk python3 "$NP" ingest - >/dev/null
 row="$(python3 -c "import sqlite3;print(*sqlite3.connect('$NUNCHI_DB').execute(\"SELECT review, because FROM peer_facts WHERE fact LIKE '%로그 보관%'\").fetchone())")"
 ok "G5: structured because stored, not flagged" '[ "$row" = "0 디스크 상한 80% 정책 때문" ]'
+
+out="$(printf '%s' '{"session_id":"sg5-live","distilled_at":"2026-08-25T00:00:00+00:00","decision_reason_contract":"required-v1","honcho":[{"kind":"decision","subject":"node","text":"위험 때문에 라이브 전환을 보류했다"},{"kind":"decision","subject":"node","text":"파일럿을 이틀 유지하기로 결정","because":"유입률 표본이 아직 둘뿐이기 때문"}]}' | CCC_NODE=nosuk python3 "$NP" ingest - 2>&1)"
+stored_inline="$(python3 -c "import sqlite3;print(sqlite3.connect('$NUNCHI_DB').execute(\"SELECT count(*) FROM peer_facts WHERE fact LIKE '%라이브 전환%'\").fetchone()[0])")"
+ok "live reason contract rejects inline-only decision before storage" \
+  'grep -q "ingested 1/2" <<<"$out" && grep -q "skipped_reasonless_decisions=1" <<<"$out" && [ "$stored_inline" = 0 ]'
+row="$(python3 -c "import sqlite3;print(*sqlite3.connect('$NUNCHI_DB').execute(\"SELECT review, because FROM peer_facts WHERE fact LIKE '%파일럿을 이틀%'\").fetchone())")"
+ok "live reason contract stores a structured reason without G5 review" \
+  '[ "$row" = "0 유입률 표본이 아직 둘뿐이기 때문" ]'
 
 out="$(python3 "$NP" recall "로그 보관" 2>&1)"
 ok "recall prints the because rationale" 'grep -q "근거: 디스크 상한 80%" <<<"$out"'

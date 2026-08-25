@@ -118,7 +118,7 @@ touch "$SEEN"
 PROMPT_PREFIX='다음은 AI 에이전트 작업 세션의 대화 발췌이다. 다음 세션에서도 알아야 할 사실만 추출해 strict JSON으로 답하라.
 형식: {"honcho":[{"kind":"preference|decision|fact|context|correction","text":"<한 문장 한국어 사실>","subject":"user|session|node","because":"<kind=decision이면 결정 이유 한 문장 — 필수, 아니면 생략>"}]}
 기준: user=사용자 선호/지시 방식, session=진행 중 작업 맥락/다음 액션, node=이 노드 사실. 잡담/디버깅만 있으면 {"honcho":[]}.
-decision: 확정된 결정. 이유 없는 결정은 나중에 무작정 재논의되거나 무작정 따르게 되므로 반드시 because에 이유를 적어라.
+decision: 확정된 결정. 반드시 대화에 실제로 나온 이유를 because에 적어라. 대화에 이유가 없으면 decision으로 출력하지 말고 생략하며, 이유를 추측하거나 지어내지 마라.
 JSON 객체 하나만 출력. 설명/마크다운 금지.
 
 대화:
@@ -226,6 +226,7 @@ payload = {"session_id": f"piri:{sid}",
            "memory_audience": os.environ.get("CCC_NUNCHI_AUDIENCE_KIND"),
            "memory_scope": os.environ.get("CCC_NUNCHI_AUDIENCE_SCOPE"),
            "distilled_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+           "decision_reason_contract": "required-v1",
            "honcho": items}
 r = subprocess.run(["python3", os.environ["NUNCHI_PY"], "ingest", "-"],
                    input=json.dumps(payload), capture_output=True, text=True)
