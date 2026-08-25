@@ -162,6 +162,14 @@ review path; v2 proposals are rendered and applied through `autoinstall.sh`
 as shown above. In the default approve mode nothing is installed or mutated
 without approval.
 
+An owner-operated Claude bridge using audience-scoped memory keeps SDK
+`setting_sources=[]` so host hooks and unscoped memory settings stay isolated.
+For an explicit `/skillsuggest`, `/skill skillsuggest`, or equivalent
+`/command`, the bridge instead resolves only the matching owner-owned,
+not-group/world-writable, non-symlinked `SKILL.md` under its trusted skill
+roots and asks Claude to read that exact file. Other filesystem settings and
+unknown slash commands remain disabled/native respectively.
+
 ## Auto mode — unattended install with post-hoc review (#355)
 
 Opt in per node (default stays `approve`; existing nodes are unchanged):

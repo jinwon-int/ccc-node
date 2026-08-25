@@ -58,6 +58,10 @@ from telegram_bot.core.project_chat_types import (
 )
 from telegram_bot.core.task_queue import UserTaskQueue
 from telegram_bot.core.usage import UsageSnapshot, render_usage
+from telegram_bot.core.skill_command import (
+    SkillCommandResolutionError,
+    expand_audience_scoped_skill_command,
+)
 from telegram_bot.memory.distill_types import DistillJob, DistillTrigger
 from telegram_bot.memory.promotion import MemoryPromotionResult
 from .conversation_paths import resolve_conversation_file
@@ -1831,6 +1835,26 @@ class BotCommandMixin:
     ) -> bool:
         return await self._tasks.enqueue(user_id, run_task, on_overflow)
 
+    async def _skill_aware_slash_message(
+        self, message: Message, slash_cmd: str
+    ) -> str | None:
+        """Selectively expand owner-invoked skills hidden by audience isolation."""
+
+        try:
+            return expand_audience_scoped_skill_command(self._config, slash_cmd)
+        except SkillCommandResolutionError as exc:
+            command_name = slash_cmd.partition(" ")[0][:80]
+            logger.warning(
+                "Rejected unsafe local skill invocation %s: %s",
+                command_name,
+                exc,
+            )
+            await message.reply_text(
+                "❌ Skill invocation refused: the local skill installation failed "
+                "bridge safety validation."
+            )
+            return None
+
     async def _cmd_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /command xxx - forward as Claude Code slash command"""
         if not await self._check_access(update):
@@ -1850,6 +1874,9 @@ class BotCommandMixin:
 
         conversation_key = self._conversation_key(user_id, chat.id)
         slash_cmd = "/" + parts[1]
+        user_message = await self._skill_aware_slash_message(message, slash_cmd)
+        if user_message is None:
+            return
 
         async def run_task():
             session, _ = await self._switch_provider_if_needed(
@@ -1860,7 +1887,7 @@ class BotCommandMixin:
             except Exception:
                 pass
             response = await self._project_chat.process_message(
-                user_message=slash_cmd,
+                user_message=user_message,
                 user_id=user_id,
                 chat_id=chat.id,
                 session_id=self._effective_session_id(conversation_key, session),
@@ -1907,6 +1934,9 @@ class BotCommandMixin:
         chat = self._require_chat(update)
         app = self._require_application()
         conversation_key = self._conversation_key(user_id, chat.id)
+        user_message = await self._skill_aware_slash_message(message, slash_cmd)
+        if user_message is None:
+            return
 
         async def run_task():
             session, _ = await self._switch_provider_if_needed(
@@ -1915,7 +1945,7 @@ class BotCommandMixin:
             await message.chat.send_action(action="typing")
             try:
                 response = await self._project_chat.process_message(
-                    user_message=slash_cmd,
+                    user_message=user_message,
                     user_id=user_id,
                     chat_id=chat.id,
                     session_id=self._effective_session_id(conversation_key, session),

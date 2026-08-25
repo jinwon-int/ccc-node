@@ -1,5 +1,16 @@
 # Changelog
 
+- **Audience-scoped Claude bridges can invoke installed skills without
+  reopening host settings.** Audience memory isolation intentionally gives the
+  Agent SDK `setting_sources=[]`, but that also made Telegram `/skillsuggest`
+  reach Claude Code as an unregistered slash command and return `Unknown
+  command` even though the skill was installed. Owner-operated bridges now
+  resolve explicit direct, `/skill`, and `/command` invocations against an
+  owner-owned, not-group/world-writable, non-symlinked `SKILL.md` with matching
+  frontmatter, then ask Claude to read that exact file. Unknown commands and
+  other providers/profiles retain native behavior; host hooks and unscoped
+  memory settings remain disabled.
+
 - **Idle-session RSS watermark now scales to the host's real memory
   (#1277).** The session resource guard closes an idle agent session (and
   kills any background children riding along in its process tree — e.g. an
