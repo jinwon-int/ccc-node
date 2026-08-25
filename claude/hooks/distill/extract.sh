@@ -34,8 +34,8 @@ STATE_DIR="${CCC_STATE_DIR:-${HOME:-/root}/.claude/state}"
 
 fail_extract() {
   local ec="${1:-1}"
-  local cls="extract_failed"
-  if declare -f ccc_distill_classify_text >/dev/null 2>&1; then
+  local cls="${2:-extract_failed}"
+  if [ "$cls" = "extract_failed" ] && declare -f ccc_distill_classify_text >/dev/null 2>&1; then
     cls="$(ccc_distill_classify_text "${RESULT:-}")"
   fi
   echo "extract_error_class=$cls" >&2
@@ -113,7 +113,7 @@ Schema:
       "subject": "user" | "session" | "node",
       "source": "user-stated" | "measured" | "inferred",
       "quote": "<<= 120 chars verbatim quote from the transcript grounding this fact, or empty string>",
-      "because": "<one-sentence reason — REQUIRED when kind=decision, omit otherwise>"
+      "because": "<one-sentence transcript-supported reason — REQUIRED when kind=decision, omit otherwise>"
     }
   ],
   "wiki_candidates": [
@@ -144,7 +144,9 @@ honcho criteria (working/relational memory; volatile OK):
   - kind=decision MUST set `because` to its one-sentence reason. A decision
     without its why gets blindly re-litigated or blindly obeyed later — both
     are failure modes (weekly bench q7 measured a decision whose reason only
-    survived in the Wiki). Keep `text` self-contained even without it.
+    survived in the Wiki). Keep `text` self-contained even without it. If the
+    transcript does not contain the reason, OMIT that decision; never invent,
+    infer, or leave `because` empty.
   - kind=constraint is for standing prohibitions/musts the user stated
     ("절대 X 금지", "반드시 Y 먼저"). Keep near-verbatim; never summarize,
     merge, or soften. Constraints outlive ordinary context.
@@ -192,13 +194,13 @@ Family Wiki memory is disabled for this node. You MUST return wiki_candidates as
 fi
 
 # System-prompt-level constraint (belt + suspenders with the user-prompt instruction).
-SYSTEM_CONSTRAINT='Output strict JSON only. The entire response is a single JSON object starting with { and ending with }. Include honcho, wiki_candidates, and resume keys. No prose, no preamble, no analysis, no markdown fences. If nothing qualifies, return {"honcho":[],"wiki_candidates":[],"resume":{"last_activity":"","pending_action":"","awaiting_user":false,"open_question":"","next_step":"","evidence":[]}}.'
+SYSTEM_CONSTRAINT='Output strict JSON only. The entire response is a single JSON object starting with { and ending with }. Include honcho, wiki_candidates, and resume keys. No prose, no preamble, no analysis, no markdown fences. Every kind=decision item MUST carry a non-empty, transcript-supported because; omit the decision if its reason is absent and never invent one. If nothing qualifies, return {"honcho":[],"wiki_candidates":[],"resume":{"last_activity":"","pending_action":"","awaiting_user":false,"open_question":"","next_step":"","evidence":[]}}.'
 if is_disabled "$WIKI_ENABLED"; then
   SYSTEM_CONSTRAINT="${SYSTEM_CONSTRAINT} Family Wiki memory is disabled: wiki_candidates MUST be []."
 fi
 
 # Even more emphatic prompt used on retries (timeout or JSON-drift).
-STRICT='CRITICAL OUTPUT CONTRACT. Your entire response MUST be exactly one JSON object and nothing else. The very first character is { and the very last character is }. Include honcho, wiki_candidates, and resume keys. No prose. No code fences. No "Here is the JSON". If you have nothing to extract, output exactly: {"honcho":[],"wiki_candidates":[],"resume":{"last_activity":"","pending_action":"","awaiting_user":false,"open_question":"","next_step":"","evidence":[]}}'
+STRICT='CRITICAL OUTPUT CONTRACT. Your entire response MUST be exactly one JSON object and nothing else. The very first character is { and the very last character is }. Include honcho, wiki_candidates, and resume keys. No prose. No code fences. No "Here is the JSON". Every kind=decision MUST carry a non-empty because grounded in the transcript; if no reason is present, omit that decision and never invent one. If you have nothing to extract, output exactly: {"honcho":[],"wiki_candidates":[],"resume":{"last_activity":"","pending_action":"","awaiting_user":false,"open_question":"","next_step":"","evidence":[]}}'
 if is_disabled "$WIKI_ENABLED"; then
   STRICT="${STRICT} Family Wiki memory is disabled: wiki_candidates MUST be []."
 fi
@@ -236,6 +238,30 @@ try_parse() {
   printf '%s' "$1" | sed -E '/^[[:space:]]*```/d'
 }
 
+valid_extract_structure() {
+  printf '%s' "$1" | jq -e '
+    (.honcho | type == "array")
+    and (.wiki_candidates | type == "array")
+    and (.resume | type == "object")
+  ' >/dev/null 2>&1
+}
+
+valid_decision_reasons() {
+  # New live extractions are stricter than the legacy payload parser: a
+  # structured reason is mandatory for decisions. This is body-free and does
+  # not try to infer a missing reason from the decision sentence.
+  printf '%s' "$1" | jq -e '
+    all(.honcho[];
+      (.kind != "decision")
+      or ((.because | type) == "string"
+          and ((.because | gsub("[[:space:]]"; "")) | length) > 0))
+  ' >/dev/null 2>&1
+}
+
+valid_extract() {
+  valid_extract_structure "$1" && valid_decision_reasons "$1"
+}
+
 build_input() {
   # $1 = REDACTED slice (already byte-capped)
   printf '%s\n\n--- transcript (session=%s trigger=%s) ---\n%s\n' \
@@ -269,27 +295,26 @@ fi
 
 CLEAN="$(try_parse "$RESULT")"
 
-# JSON-drift retry (#70): same input window, STRICT prompt.
-if ! printf '%s' "$CLEAN" | jq -e '.honcho and .wiki_candidates and (.resume | type == "object")' >/dev/null 2>&1; then
-  echo "attempt produced non-JSON; retrying with STRICT system prompt" >&2
+# Structural/decision-reason retry (#70, #1264): same input window, STRICT.
+if ! valid_extract "$CLEAN"; then
+  echo "attempt violated JSON or decision-reason contract; retrying with STRICT system prompt" >&2
   RESULT2="$(call_claude "$STRICT" "$INPUT")"
   ec2=$?
   if [ $ec2 -ne 0 ] || [ -z "$RESULT2" ]; then
     echo "JSON-drift retry failed (ec=$ec2) or empty" >&2
-    echo "--- previous attempt raw (head 1KB) ---" >&2
-    printf '%s\n' "$RESULT" | head -c 1024 >&2
     RESULT="${RESULT2:-$RESULT}"
     fail_extract "$ec2"
   fi
   CLEAN="$(try_parse "$RESULT2")"
-  if ! printf '%s' "$CLEAN" | jq -e '.honcho and .wiki_candidates and (.resume | type == "object")' >/dev/null 2>&1; then
-    echo "JSON-drift retry also produced non-JSON; giving up" >&2
-    echo "--- retry raw (head 1KB) ---" >&2
-    printf '%s\n' "$RESULT2" | head -c 1024 >&2
+  if ! valid_extract "$CLEAN"; then
+    echo "STRICT retry also violated JSON or decision-reason contract; giving up" >&2
     RESULT="$RESULT2"
+    if valid_extract_structure "$CLEAN" && ! valid_decision_reasons "$CLEAN"; then
+      fail_extract 1 decision_reason_missing
+    fi
     fail_extract 1
   fi
-  echo "recovered on JSON-drift retry" >&2
+  echo "recovered on strict contract retry" >&2
 fi
 
 # Tag with metadata for downstream consumers.
@@ -306,4 +331,4 @@ printf '%s' "$CLEAN" | jq -c \
   --arg transcript_path "$TRANSCRIPT" \
   --argjson wiki_enabled "$WIKI_ENABLED_JSON" \
   '(if $wiki_enabled then . else .wiki_candidates = [] end)
-   | . + {session_id:$sid, trigger:$trg, distilled_at:$ts, source_cwd:$source_cwd, source_project:$source_project, transcript_path:$transcript_path}'
+   | . + {session_id:$sid, trigger:$trg, distilled_at:$ts, source_cwd:$source_cwd, source_project:$source_project, transcript_path:$transcript_path, decision_reason_contract:"required-v1"}'

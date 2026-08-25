@@ -69,6 +69,10 @@ class _StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
 
+class DecisionReasonMissingError(ValueError):
+    """A live decision omitted its separately auditable reason."""
+
+
 def _validate_timestamp(value: str, *, field: str) -> str:
     if not isinstance(value, str) or not value:
         raise ValueError(f"{field} must be a non-empty timestamp")
@@ -208,8 +212,10 @@ class HonchoFact(_StrictModel):
     subject: Literal["user", "session", "node"]
     # #1264: a decision's reason. Required-but-nullable in the generated
     # schema (the output-schema policy demands every property in `required`);
-    # the model before-validator keeps pre-#1264 payloads parseable, and the
-    # nunchi G5 write gate flags reasonless decisions downstream.
+    # the model before-validator keeps pre-#1264 stored payloads parseable.
+    # Live provider backends call validate_live_decision_reasons() before any
+    # sink accepts a new extraction, so this compatibility path cannot create
+    # new reasonless decision facts (#1264 follow-up).
     because: str | None = Field(max_length=1024)
 
     @model_validator(mode="before")
@@ -376,6 +382,28 @@ class DistillExtractionOutput(_StrictModel):
         if type(value) is not int or value != DISTILL_EXTRACTION_SCHEMA_VERSION:
             raise ValueError("schema_version must be integer 1")
         return value
+
+
+def validate_live_decision_reasons(
+    output: DistillExtractionOutput,
+) -> DistillExtractionOutput:
+    """Reject a new extraction that omits a structured decision reason.
+
+    Parsing remains backward compatible for persisted pre-#1264 payloads, but
+    live extraction is a stricter boundary: an inline claim is not a substitute
+    for the separately auditable `because` field, and the provider must omit a
+    decision when the transcript does not contain its reason. Rejecting the
+    whole provider output lets the journal retry without allowing a partial,
+    reasonless decision to reach any sink.
+    """
+    if not isinstance(output, DistillExtractionOutput):
+        raise ValueError("output must be a DistillExtractionOutput")
+    if any(
+        fact.kind == "decision" and fact.because is None
+        for fact in output.honcho
+    ):
+        raise DecisionReasonMissingError("live decision fact is missing because")
+    return output
 
 
 @runtime_checkable

@@ -90,6 +90,16 @@ case "$mode" in
   drift)
     if [ "$count" = 1 ]; then printf 'Here is the JSON: nope\n'; else printf '{"honcho":[],"wiki_candidates":[],"resume":{"last_activity":"","pending_action":"","awaiting_user":false,"open_question":"","next_step":"","evidence":[]}}'; fi
     ;;
+  reasonfix)
+    if [ "$count" = 1 ]; then
+      printf '{"honcho":[{"kind":"decision","text":"source-only로 유지","subject":"session"}],"wiki_candidates":[],"resume":{"last_activity":"","pending_action":"","awaiting_user":false,"open_question":"","next_step":"","evidence":[]}}'
+    else
+      printf '{"honcho":[{"kind":"decision","text":"source-only로 유지","subject":"session","because":"배포 위험이 아직 측정되지 않았기 때문"}],"wiki_candidates":[],"resume":{"last_activity":"","pending_action":"","awaiting_user":false,"open_question":"","next_step":"","evidence":[]}}'
+    fi
+    ;;
+  reasonbad)
+    printf '{"honcho":[{"kind":"decision","text":"REASONLESS_BODY_CANARY","subject":"session"}],"wiki_candidates":[],"resume":{"last_activity":"","pending_action":"","awaiting_user":false,"open_question":"","next_step":"","evidence":[]}}'
+    ;;
   timeout)
     if [ "$count" = 1 ]; then sleep 5; else printf '{"honcho":[],"wiki_candidates":[],"resume":{"last_activity":"","pending_action":"","awaiting_user":false,"open_question":"","next_step":"","evidence":[]}}'; fi
     ;;
@@ -143,6 +153,8 @@ run_extract "$TRANSCRIPT" valid
 ok "valid JSON exits 0" '[ "$rc" = 0 ]'
 ok "valid JSON is tagged with session metadata" 'jq -e ".session_id == \"sess-test\" and .trigger == \"manual\" and (.honcho|length)==1" <<<"$out" >/dev/null'
 ok "valid JSON carries source cwd metadata" 'jq -e ".source_cwd == \"/root/project-a\" and .source_project == \"-root-project-a\"" <<<"$out" >/dev/null'
+ok "valid JSON declares the live decision-reason contract" \
+  'jq -e ".decision_reason_contract == \"required-v1\"" <<<"$out" >/dev/null'
 # #1099: nunchi's G2 gate verifies quotes against the transcript. Dropping the
 # path forced it to guess from source_cwd (the distill-time cwd) and demote
 # verifiable user-stated facts to inferred. The path is validated here already.
@@ -168,10 +180,22 @@ ok "fenced JSON is stripped" '[ "$rc" = 0 ] && jq -e ".honcho == [] and .wiki_ca
 
 run_extract "$TRANSCRIPT" drift
 ok "JSON-drift retry exits 0" '[ "$rc" = 0 ] && jq -e ".honcho == [] and .wiki_candidates == []" <<<"$out" >/dev/null'
-ok "JSON-drift retry logs recovery" 'grep -q "recovered on JSON-drift retry" "$TMP/stderr-drift"'
+ok "JSON-drift retry logs recovery" 'grep -q "recovered on strict contract retry" "$TMP/stderr-drift"'
 ok "JSON-drift invokes claude twice" '[ "$(cat "$TMP/count-drift")" = 2 ]'
 ok "JSON-drift retry preserves deny-all tool policy" \
   'argv_is_deny_all "$TMP/args-drift.txt" 2 && tool_env_is_unset "$TMP/tool-env-drift.txt" 2'
+
+run_extract "$TRANSCRIPT" reasonfix
+ok "reasonless decision receives one strict retry and then succeeds with because" \
+  '[ "$rc" = 0 ] && [ "$(cat "$TMP/count-reasonfix")" = 2 ] && jq -e '\'' .honcho[0].because == "배포 위험이 아직 측정되지 않았기 때문" '\'' <<<"$out" >/dev/null'
+ok "decision-reason retry remains tool-free" \
+  'argv_is_deny_all "$TMP/args-reasonfix.txt" 2 && tool_env_is_unset "$TMP/tool-env-reasonfix.txt" 2'
+
+run_extract "$TRANSCRIPT" reasonbad
+ok "persistently reasonless decision fails before downstream dispatch" \
+  '[ "$rc" = 1 ] && [ "$(cat "$TMP/count-reasonbad")" = 2 ] && grep -q "extract_error_class=decision_reason_missing" "$TMP/stderr-reasonbad"'
+ok "reasonless provider body is not copied into diagnostics" \
+  '! grep -q "REASONLESS_BODY_CANARY" "$TMP/stderr-reasonbad"'
 
 run_extract "$TRANSCRIPT" timeout 1
 ok "timeout retry exits 0" '[ "$rc" = 0 ] && jq -e ".honcho == [] and .wiki_candidates == []" <<<"$out" >/dev/null'

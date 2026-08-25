@@ -348,6 +348,7 @@ async def test_extraction_records_body_free_model_bytes_duration_and_cost_estima
         ("distill_spawn_failed", DistillJobStatus.EXTRACTION_RETRYABLE_FAILED),
         ("distill_timeout", DistillJobStatus.EXTRACTION_RETRYABLE_FAILED),
         ("distill_output_invalid", DistillJobStatus.EXTRACTION_RETRYABLE_FAILED),
+        ("distill_decision_reason_missing", DistillJobStatus.EXTRACTION_RETRYABLE_FAILED),
         ("codex_distill_spawn_failed", DistillJobStatus.EXTRACTION_RETRYABLE_FAILED),
         ("codex_distill_timeout", DistillJobStatus.EXTRACTION_RETRYABLE_FAILED),
         ("codex_distill_io_failed", DistillJobStatus.EXTRACTION_RETRYABLE_FAILED),
@@ -355,6 +356,7 @@ async def test_extraction_records_body_free_model_bytes_duration_and_cost_estima
         ("codex_distill_schema_unsafe", DistillJobStatus.EXTRACTION_TERMINAL_FAILED),
         ("codex_distill_executable_unsafe", DistillJobStatus.EXTRACTION_TERMINAL_FAILED),
         ("codex_distill_output_invalid", DistillJobStatus.EXTRACTION_RETRYABLE_FAILED),
+        ("codex_distill_decision_reason_missing", DistillJobStatus.EXTRACTION_RETRYABLE_FAILED),
     ],
 )
 @pytest.mark.anyio
@@ -387,6 +389,45 @@ async def test_backend_failure_is_classified_with_body_free_code(
     assert result.extraction_accounting[0].model == "provider-default"
     assert result.extraction_accounting[0].snapshot_bytes == snapshot().byte_count
     assert result.extraction_accounting[0].estimated_max_tokens == 73854
+
+
+@pytest.mark.anyio
+async def test_worker_rejects_reasonless_decision_from_any_backend_before_sinks(
+    tmp_path: Path,
+) -> None:
+    journal = DistillJournal(tmp_path / "journal")
+    journal.initialize()
+    job = snapshot_done_job(journal, thread_id="thread-provider-neutral-reason")
+
+    class FutureBackend:
+        async def extract(
+            self, extraction_input: DistillExtractionInput
+        ) -> DistillExtractionOutput:
+            value = output_for(extraction_input).model_dump(mode="json")
+            value["honcho"] = [
+                {
+                    "kind": "decision",
+                    "text": "Keep the provider-neutral boundary.",
+                    "subject": "session",
+                    "because": None,
+                }
+            ]
+            return DistillExtractionOutput.model_validate(value)
+
+    result = await CodexDistillExtractionWorker(
+        journal,
+        FutureBackend(),
+        owner_token="provider-neutral-worker",
+        usage_meter=None,
+    ).extract_once(job_id=job.job_id)
+
+    assert result.status is DistillJobStatus.EXTRACTION_RETRYABLE_FAILED
+    assert result.error_code == "distill_decision_reason_missing"
+    assert result.extraction_output is None
+    assert result.extraction_retry_after is not None
+    assert "Keep the provider-neutral boundary" not in repr(
+        journal.diagnostics(job.job_id)
+    )
 
 
 @pytest.mark.anyio

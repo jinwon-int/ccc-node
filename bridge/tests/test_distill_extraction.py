@@ -25,6 +25,7 @@ from telegram_bot.memory.distill_extraction import (
     canonical_extraction_input_bytes,
     extraction_output_json_schema,
     parse_extraction_output,
+    validate_live_decision_reasons,
 )
 from telegram_bot.memory.distill_types import (
     CodexTranscriptSnapshot,
@@ -599,14 +600,35 @@ def test_honcho_fact_decision_because_round_trips_and_schema_stays_in_sync() -> 
 
 def test_honcho_fact_because_absent_or_blank_normalizes_to_none() -> None:
     # Optional for backward compatibility: pre-#1264 payloads and extractors
-    # that never emit the field must stay valid, and a blank emission is the
-    # same as omitting it (the nunchi G5 gate flags the fact downstream).
+    # that never emitted the field must stay parseable, and a blank emission is
+    # the same as omitting it. Live adapters plus the common worker reject this
+    # representation; nunchi G5 remains the legacy unmarked-payload safety net.
     payload = valid_output()
     parsed = parse_extraction_output(json.dumps(payload), wiki_enabled=True)
     assert parsed.honcho[0].because is None
     payload["honcho"][0]["because"] = "   "
     parsed = parse_extraction_output(json.dumps(payload), wiki_enabled=True)
     assert parsed.honcho[0].because is None
+
+
+def test_live_extraction_rejects_reasonless_decisions_but_legacy_parse_survives() -> None:
+    # Stored pre-#1264 v1 output must remain readable, while no new provider
+    # result may use that compatibility path to feed G5 indefinitely.
+    payload = valid_output()
+    parsed = parse_extraction_output(json.dumps(payload), wiki_enabled=True)
+    with pytest.raises(ValueError, match="missing because"):
+        validate_live_decision_reasons(parsed)
+
+    # An inline reason is useful for old nunchi facts but does not replace the
+    # structured, independently surfaced reason required of new extraction.
+    payload["honcho"][0]["text"] = "Keep source-only because rollout risk is high."
+    parsed = parse_extraction_output(json.dumps(payload), wiki_enabled=True)
+    with pytest.raises(ValueError, match="missing because"):
+        validate_live_decision_reasons(parsed)
+
+    payload["honcho"][0]["because"] = "The rollout risk is not yet bounded."
+    parsed = parse_extraction_output(json.dumps(payload), wiki_enabled=True)
+    assert validate_live_decision_reasons(parsed) is parsed
 
 
 def test_honcho_fact_because_is_bounded() -> None:

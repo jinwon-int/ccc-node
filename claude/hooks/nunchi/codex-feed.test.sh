@@ -76,7 +76,11 @@ kill "$spawner" 2>/dev/null || true
 PIRI_FEED="$ROOT/claude/hooks/nunchi/piri-feed.sh"
 ok "codex lane prompt requires decision+because" 'grep -q "decision" "$FEED" && grep -q "because" "$FEED"'
 ok "piri lane prompt requires decision+because" 'grep -q "decision" "$PIRI_FEED" && grep -q "because" "$PIRI_FEED"'
-prompt_of() { awk "/^PROMPT_PREFIX='/{f=1;next} f \u0026\u0026 /^'/{exit} f{print}" "$1"; }
+ok "both feed lanes forbid inventing a missing decision reason" \
+  'grep -q "추측하거나 지어내지 마라" "$FEED" && grep -q "추측하거나 지어내지 마라" "$PIRI_FEED"'
+ok "both feed payloads declare the required-v1 reason contract" \
+  'grep -q '\''"decision_reason_contract": "required-v1"'\'' "$FEED" && grep -q '\''"decision_reason_contract": "required-v1"'\'' "$PIRI_FEED"'
+prompt_of() { awk "/^PROMPT_PREFIX='/{f=1;next} f && /^'/{exit} f{print}" "$1"; }
 ok "feed prompt blocks stay byte-identical across lanes" \
   '[ "$(prompt_of "$FEED")" = "$(prompt_of "$PIRI_FEED")" ]'
 

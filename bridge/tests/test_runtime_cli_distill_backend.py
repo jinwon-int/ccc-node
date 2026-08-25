@@ -62,6 +62,44 @@ json.dump({{
     return executable
 
 
+def _reasonless_decision_stub(tmp_path: Path) -> Path:
+    executable = tmp_path / "reasonless-extractor-stub"
+    executable.write_text(
+        f"""#!{sys.executable}
+import json
+import sys
+value = json.load(sys.stdin)
+json.dump({{
+    "schema_version": 1,
+    "provenance": {{
+        "provider": value["provider"],
+        "source_thread_hash": value["source_thread_hash"],
+        "trigger": value["trigger"],
+        "distilled_at": "2026-08-05T00:00:01Z"
+    }},
+    "honcho": [{{
+        "kind": "decision",
+        "text": "Keep the source-only phase.",
+        "subject": "session",
+        "because": None
+    }}],
+    "wiki_candidates": [],
+    "resume": {{
+        "last_activity": "",
+        "pending_action": "",
+        "awaiting_user": False,
+        "open_question": "",
+        "next_step": "",
+        "evidence": []
+    }}
+}}, sys.stdout)
+""",
+        encoding="utf-8",
+    )
+    executable.chmod(0o700)
+    return executable
+
+
 def _script(tmp_path: Path, name: str, body: str) -> Path:
     executable = tmp_path / name
     executable.write_text(f"#!{sys.executable}\n{body}\n", encoding="utf-8")
@@ -91,6 +129,31 @@ async def test_runtime_backends_return_the_same_validated_contract(
 
     assert result.provenance.provider == "piri"
     assert result.provenance.source_thread_hash == "a" * 64
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("provider", ["claude", "piri"])
+async def test_runtime_backends_reject_new_reasonless_decisions(
+    tmp_path: Path,
+    provider: str,
+) -> None:
+    backend = RuntimeCliDistillBackend(
+        provider,  # type: ignore[arg-type]
+        executable=str(_reasonless_decision_stub(tmp_path)),
+        environment={"PATH": str(Path(sys.executable).parent)},
+        temp_root=tmp_path,
+    )
+    extraction_input = build_extraction_input(
+        _snapshot(),
+        trigger=DistillTrigger.EXPLICIT,
+        provider="piri",
+    )
+
+    with pytest.raises(
+        RuntimeDistillBackendError,
+        match="^distill_decision_reason_missing$",
+    ):
+        await backend.extract(extraction_input)
 
 
 def test_commands_disable_session_tools_and_context() -> None:
