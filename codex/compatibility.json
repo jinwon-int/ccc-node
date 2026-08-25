@@ -155,6 +155,16 @@
       "pattern": "claude/skills/install-record-flag-materialization/**",
       "compatibility": "claude-only",
       "reason": "ccc.install-record.v1 / self-update replay contract driven from Claude sessions; codex mirror candidate, none exists yet"
+    },
+    {
+      "pattern": "claude/skills/bridge-timeout-performance-tuning-and-verification/**",
+      "compatibility": "claude-only",
+      "reason": "Claude bridge/session config-tuning procedure (backup, restart, /proc/<pid>/environ verification) driven from Claude sessions"
+    },
+    {
+      "pattern": "claude/skills/bridge-detached-self-restart/**",
+      "compatibility": "claude-only",
+      "reason": "Claude bridge self-restart-detach technique built on the Claude-only systemd-run job registry (bridge-safe-detached-run, detached_jobs.py)"
     }
   ],
   "managed_skills": [
