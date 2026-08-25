@@ -535,9 +535,17 @@ def test_staged_draft_installs_into_codex_skills(tmp_path: Path) -> None:
     # Autonomous ownership state is deliberately restricted to the owner.
     state.chmod(0o700)
 
+    # autoinstall.sh anchors its queue to CCC_SKILL_REVIEW_STATE_DIR, never to
+    # CCC_STATE_DIR (the bridge scopes that one per memory audience). HOME and
+    # CCC_CLAUDE_DIR are sandboxed too so a missed anchor falls through to
+    # tmp_path instead of the operator's real ~/.claude/state queue.
+    home = tmp_path / "home"
+    (home / ".claude").mkdir(parents=True, exist_ok=True)
     env = {
         **os.environ,
-        "CCC_STATE_DIR": str(state),
+        "HOME": str(home),
+        "CCC_CLAUDE_DIR": str(home / ".claude"),
+        "CCC_SKILL_REVIEW_STATE_DIR": str(state),
         "CCC_SKILL_PROVIDER": "codex",
         "CODEX_SKILLS_DIR": str(codex_skills),
         "CCC_SKILL_AUTOSAVE_MODE": "auto",
