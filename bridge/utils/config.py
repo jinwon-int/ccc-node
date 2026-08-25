@@ -22,6 +22,9 @@ from telegram_bot.runtime_config_check import (
     MIN_CLAUDE_MAX_BUFFER_SIZE,
     validate_timeout_invariant,
 )
+from telegram_bot.utils.session_resource_guard import (
+    default_session_tree_rss_limit_mb,
+)
 from telegram_bot.utils.settings_heartbeat import HeartbeatSettingsMixin
 from telegram_bot.utils.settings_memory import MemorySettingsMixin
 from telegram_bot.utils.settings_voice import VoiceSettingsMixin
@@ -489,13 +492,17 @@ class Config(
         ),
     )
     session_tree_rss_limit_mb: int = Field(
-        default=1024,
+        default_factory=default_session_tree_rss_limit_mb,
         ge=0,
         le=1024 * 1024,
         alias="CCC_BRIDGE_SESSION_TREE_RSS_LIMIT_MB",
         description=(
-            "Idle bridge process-tree RSS high-water mark in MiB. Zero disables "
-            "the memory watermark."
+            "Idle bridge process-tree RSS high-water mark in MiB. Unset "
+            "scales to a quarter of total system memory (floor 1024, cap "
+            "8192 MiB — #1277) instead of a fixed value, since a single "
+            "watermark does not fit a fleet spanning VPS and phone nodes. "
+            "Zero disables the memory watermark; set explicitly to override "
+            "the automatic scaling."
         ),
     )
     codex_max_session_attachments: int = Field(

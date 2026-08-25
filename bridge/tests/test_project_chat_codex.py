@@ -45,6 +45,9 @@ from telegram_bot.core.agent_runtime import (
 from telegram_bot.core.project_chat import ProjectChatHandler
 from telegram_bot.core.project_chat_types import AgentSessionEntry
 from telegram_bot.core.task_ledger import TaskLedger
+from telegram_bot.utils.session_resource_guard import (
+    default_session_tree_rss_limit_mb,
+)
 
 
 @pytest.fixture
@@ -359,7 +362,8 @@ def test_agent_provider_settings_default_and_reject_unknown(tmp_path: Path) -> N
     assert settings.session_guard_interval_seconds == 60.0
     assert settings.session_idle_ttl_seconds == 4 * 60 * 60
     assert settings.max_resident_sessions == 2
-    assert settings.session_tree_rss_limit_mb == 1024
+    # Unset: scales to this host's real memory rather than a fixed 1024 (#1277).
+    assert settings.session_tree_rss_limit_mb == default_session_tree_rss_limit_mb()
     assert settings.codex_max_session_attachments == 2
     codex_settings = settings_class.load(
         project_root=tmp_path / "project",
