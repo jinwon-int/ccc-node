@@ -1,5 +1,25 @@
 # Changelog
 
+- **Webhook nudge listener self-heals a dead accept() socket instead of
+  spinning (#1274).** A listening socket can outlive the network interface
+  it was bound to — most commonly on a mobile/Termux node whose IP changes
+  under the process (wifi/mobile data switch). Every `accept()` then fails
+  with the same `OSError` forever, and asyncio's built-in accept callback
+  has no backoff for that case: it re-logs and re-arms in a tight loop,
+  pinning a CPU core and filling the disk with repeated tracebacks within
+  hours (observed: ~44GB of logs in a day on gongyung, which starved disk
+  space and tripped the durable follow-up queue's fail-safe pause).
+  `WebhookNudgeServer` now runs its own accept loop (`loop.sock_accept`)
+  that counts consecutive failures, backs off between retries (50ms,
+  doubling, capped at 2s), and — once a run of failures crosses a
+  threshold (default 20) — closes and rebinds a fresh socket on the same
+  host/port, retrying the rebind itself with a paced backoff before giving
+  up and stopping the listener (fail-soft; polling remains the fallback,
+  unchanged from a failed initial bind). Three new regression tests drive
+  the failure pattern directly: recovery below threshold without a rebind,
+  a triggered rebind that keeps serving, and a clean give-up when rebinding
+  itself never recovers.
+
 - **Claude session observer seams extracted (#896 slice).** Optional
   `set_unsolicited_handler` / `set_sdk_frame_observer`, `_observe_sdk_frame`,
   and `_content_texts` moved from `core/claude_runtime.py` into the new
