@@ -140,6 +140,21 @@
       "pattern": "claude/skills/github-merge-state-conflict-diagnosis/**",
       "compatibility": "claude-only",
       "reason": "generic gh diagnostic procedure authored for Claude skill matching; codex mirror candidate, none exists yet"
+    },
+    {
+      "pattern": "skills/shared/metric-counting-method-verification/**",
+      "compatibility": "claude-only",
+      "reason": "generic measurement-verification procedure authored for Claude skill matching; codex mirror candidate, none exists yet"
+    },
+    {
+      "pattern": "skills/shared/fleet-task-handoff-with-constraints/**",
+      "compatibility": "claude-only",
+      "reason": "generic multi-node handoff procedure authored for Claude skill matching; codex mirror candidate, none exists yet"
+    },
+    {
+      "pattern": "claude/skills/install-record-flag-materialization/**",
+      "compatibility": "claude-only",
+      "reason": "ccc.install-record.v1 / self-update replay contract driven from Claude sessions; codex mirror candidate, none exists yet"
     }
   ],
   "managed_skills": [
