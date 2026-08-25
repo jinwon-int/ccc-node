@@ -99,6 +99,53 @@ class RevertCancelScopeTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(task.cancelled() or task.done())
 
 
+class RevertSessionScopeTests(unittest.IsolatedAsyncioTestCase):
+    """/revert must browse/truncate the SAME conversation's session.
+
+    Bug (same class as the cancel-scope one above, other half): _cmd_revert and
+    _handle_revert_callback looked the session up by the bare ``user_id``, so in
+    a group chat they resolved the user's DM session — the keyboard listed the
+    DM transcript and reverting truncated the DM JSONL while the group session
+    stayed untouched. Fixed by using the conversation key like every other
+    command.
+    """
+
+    def _bare_bot(self):
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock
+
+        bot = TelegramBot.__new__(TelegramBot)
+        bot._check_access = AsyncMock(return_value=True)
+        bot._active_provider = lambda: "claude"
+        bot._claude_scoped_transcript_controls_disabled = lambda: False
+        # Empty session -> both paths return right after the lookup we assert on.
+        bot._session_manager = SimpleNamespace(get_session=AsyncMock(return_value={}))
+        bot._project_chat = MagicMock()
+        return bot
+
+    def _group_update(self):
+        from unittest.mock import MagicMock
+
+        update = MagicMock()
+        update.effective_user.id = 7
+        update.effective_chat.id = 999
+        update.message.reply_text = AsyncMock()
+        update.callback_query.edit_message_text = AsyncMock()
+        return update
+
+    async def test_cmd_revert_uses_conversation_key_in_groups(self):
+        bot = self._bare_bot()
+        await bot._cmd_revert(self._group_update(), context=None)
+        bot._session_manager.get_session.assert_awaited_once_with("7:999")
+
+    async def test_revert_callback_uses_conversation_key_in_groups(self):
+        bot = self._bare_bot()
+        await bot._handle_revert_callback(
+            self._group_update(), context=None, data="revert:select:1"
+        )
+        bot._session_manager.get_session.assert_awaited_once_with("7:999")
+
+
 class VoiceCancelScopeTests(unittest.IsolatedAsyncioTestCase):
     """/stop and /new cancel voice transcription per conversation, not globally.
 

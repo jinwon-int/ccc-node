@@ -630,5 +630,16 @@ ok "status reports tunnel UP when curl returns 0" 'grep -q "tunnel: UP" <<<"$out
 ok "sanitize_termux_env clears poisoned LD_LIBRARY_PATH, keeps Termux preload" 'grep -q "^OK$" "$SUP_TMP/sanitize.termux.marker" 2>/dev/null'
 ok "sanitize_termux_env is a no-op off Termux" 'grep -q "^OK$" "$SUP_TMP/sanitize.nontermux.marker" 2>/dev/null'
 
+# -- argument parsing terminates (regression: unknown arg / valueless --env-file
+# spun the dispatch loop forever, flooding the redirected log) ---------------
+timeout 5 "$TOOL" status bogus-arg > "$TMP/args.unknown.out" 2>&1
+rc_unknown=$?
+ok "unknown argument exits 2 instead of looping" '[ "$rc_unknown" = 2 ]'
+ok "unknown argument names the offender" 'grep -q "unknown arg: bogus-arg" "$TMP/args.unknown.out"'
+timeout 5 "$TOOL" check --env-file > "$TMP/args.novalue.out" 2>&1
+rc_novalue=$?
+ok "valueless --env-file exits 2 instead of looping" '[ "$rc_novalue" = 2 ]'
+ok "valueless --env-file says a value is required" 'grep -q -- "--env-file requires a value" "$TMP/args.novalue.out"'
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

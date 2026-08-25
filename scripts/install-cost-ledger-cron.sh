@@ -128,10 +128,17 @@ if [ "$APPLY" = 1 ] && [ "$REMOVE" != 1 ]; then
   mkdir -p "$(dirname "$LOG")" 2>/dev/null || true
 fi
 
+# --weekly must be materialized in the record argv (#1264 defect class): the
+# weekly line is opt-in, so a self-update replay that omits the flag rebuilds
+# the managed block with only the daily line — the Monday rollup vanishes
+# while verification still passes on the daily line's fresh gen stamp.
+record_argv=(--apply --schedule "$SCHEDULE")
+if [ "$WEEKLY" = 1 ]; then record_argv+=(--weekly); fi
+
 ccc_cron_installer_finish \
   --label "cost-ledger" \
   --marker "$MARKER" --begin "$BLOCK_BEGIN" --end "$BLOCK_END" \
   --crontab "$CRONTAB" --state-dir "$STATE_DIR" --self "$SELF" --gen "$GEN" \
   --apply "$APPLY" --remove "$REMOVE" --schedule-desc "$SCHEDULE" \
   --body "$CRON_LINE" -- \
-  --apply --schedule "$SCHEDULE"
+  "${record_argv[@]}"

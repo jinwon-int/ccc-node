@@ -4,7 +4,61 @@ All notable changes to the Claude Code node harness. Dates are KST.
 
 ## [Unreleased]
 
+### Removed
+- Dead files from the pre-fork/legacy era: `bridge/pre-kill.sh` (unreferenced;
+  its `pkill` pattern ignored `--path` and would kill every bridge on a
+  multi-bridge host if revived), `bridge/hooks/permission_gate.sh` (the last
+  remnant of the removed temp-file-polling PreToolUse approval seam), and
+  `schemas/codex-skill-candidate-v1.schema.json` (the v1→v2 upgrade adapter
+  reads no schema file; nothing referenced it). The plugin manifest and
+  marketplace descriptions no longer advertise the removed (TM-1306)
+  fail-closed enforcement guard, and other doc drift is aligned: the
+  `bridge/README.md` revert example's orphaned fragment (which unbalanced
+  every fence after it), the fossil upstream "Chinese" bullets in
+  `bridge/CLAUDE.md`, the dead `CCC_ALERT_MAX_DEAD_STREAMS` example entry,
+  `docs/harness.md`'s `settings.local.template.json` filename, the 13 living
+  docs missing from `docs/README.md`, the six directories missing from the
+  root layout block, and a translation-lag banner on `bridge/README-zh.md`
+  per the i18n policy.
+
 ### Fixed
+- Full-repo code-review sweep: group-chat `/revert` now resolves the
+  conversation-scoped session instead of the sender's DM (it browsed and
+  truncated the wrong transcript in groups); the stale-message drop no longer
+  ages out inline-keyboard taps (a callback's `message.date` is the keyboard's
+  post time, so every keyboard silently died after 20 minutes without
+  `answer()`); `/memory_promote` accepts facts from every distill provider
+  instead of hardcoding `codex` (claude/piri nodes could never promote); and
+  crush is wired into the `/model`, `/resume`, and `/history` menus its
+  declared `model_discovery`/`session_browsing` capabilities promise (every
+  menu tap previously failed with a provider mismatch).
+- Judge-batch's G3 recheck now mirrors the ingest rule's #1255 cross-session
+  pool (same-kind `session:*` peers): a near-duplicate stored under a
+  different session id no longer reads as "no live sibling", which was
+  deterministically clearing exactly the review flags the write gate had
+  raised for it.
+- The agent-cron store schema's `notifyChatId` conditional now requires
+  `notify` to be present before it applies: a task that simply omitted
+  `notify` (schema default `none`) failed the whole store closed with
+  "notifyChatId is required", disabling every CLI command over it.
+- `install-cost-ledger-cron.sh` materializes `--weekly` in its install record
+  (#1264 defect class): a gen-drift self-update replay used to rebuild the
+  managed block with only the daily line, silently deleting the Monday
+  rollup while verification passed on the daily line's fresh stamp.
+- The statusline git TTL cache works on clean repos: the empty
+  `${DIRTY_MARKER:+true}` `--argjson` made jq abort after the redirect had
+  truncated the cache file, so every render re-ran `git status`. A
+  validate-harness check now pins the clean-repo cache shape.
+- `a2a-termux-native-worker.sh` argument parsing terminates: an unknown
+  argument (or `--env-file` without a value) spun the dispatch loop forever,
+  flooding the supervisor log; both now exit 2 with usage.
+- auto-distill `metrics.py` no longer crashes with a TypeError when quarantine
+  items exist but none are judged yet (the low-coverage warning compared a
+  None loss rate), and its offline pipeline fallback tracks the deployed
+  `PIPELINE = 6`.
+- `tests/test_autoresearch_streaming.py` — the only test anchoring the
+  `research/` evaluator contract — is now run by CI (it was wired into no job
+  or script since it landed).
 - Auto-distill deployment now fails closed without a repository-reviewed
   exact-source evaluation receipt (#1262). Preview/check/apply bind the target
   Pipeline, full source SHA-256, canonical-dedup evaluation surface, corpus

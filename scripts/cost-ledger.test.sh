@@ -162,9 +162,17 @@ ok "--weekly adds the Monday rollup line inside the same managed block" \
   '[ "$(marker_count)" = 2 ] && grep -qF "cost-ledger-weekly.py" "$FAKE_CRON" && grep -qF "17 5 * * 1" "$FAKE_CRON"'
 ok "weekly line carries CCC_STATE_DIR and the gen stamp" \
   'grep "cost-ledger-weekly.py" "$FAKE_CRON" | grep -qF "CCC_STATE_DIR=" && grep "cost-ledger-weekly.py" "$FAKE_CRON" | grep -qE "gen=h_[0-9a-f]{12}$"'
+# Regression (#1264 defect class): the record argv must materialize --weekly,
+# or the first gen-drift self-update replay rebuilds the block with only the
+# daily line and the Monday rollup silently vanishes.
+REC="$CCC_STATE_DIR/install-cost-ledger-cron.json"
+ok "--weekly is materialized in the install record" \
+  'jq -e ".argv | index(\"--weekly\")" "$REC" >/dev/null 2>&1'
 bash "$INSTALLER" --apply >/dev/null 2>&1
 ok "re-apply without --weekly strips the rollup line (opt-in is not sticky)" \
   '[ "$(marker_count)" = 1 ] && ! grep -qF "cost-ledger-weekly.py" "$FAKE_CRON"'
+ok "record argv drops --weekly when reinstalled without it" \
+  '! jq -e ".argv | index(\"--weekly\")" "$REC" >/dev/null 2>&1'
 bash "$INSTALLER" --apply --remove >/dev/null 2>&1
 
 # --- stage 2: codex collector (#1205 D-1) -----------------------------------

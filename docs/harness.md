@@ -7,7 +7,7 @@ This document covers the Claude Code harness pieces installed by `setup.sh`: set
 | Path | Purpose |
 |---|---|
 | `claude/settings.base.json` | Node-local hooks, `statusLine`, and `outputStyle` baseline. |
-| `claude/settings.local.json` | Local permission allowlist template. |
+| `claude/settings.local.template.json` | Local permission allowlist template. |
 | `claude/hooks/enforcement-overlay.json` | Portable enforcement/observability hook overlay for standalone installs. |
 | `claude/CLAUDE.md.template` | Operating-policy skeleton with placeholders for node/user identity. |
 | `claude/hooks/` | Memory loading, tool loading, guard/audit/redact/notify, distill, skill-review, statusline, evidence gate. |

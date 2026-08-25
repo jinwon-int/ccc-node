@@ -21,7 +21,7 @@ from telegram_bot.utils.secure_fs import (
 )
 
 from .distill_extraction import HonchoFact
-from .distill_types import DistillTrigger, validate_memory_route
+from .distill_types import DISTILL_PROVIDERS, DistillTrigger, validate_memory_route
 
 
 _FACT_ID_RE = re.compile(r"^distill-[0-9a-f]{12}$")
@@ -219,7 +219,10 @@ class CodexMemoryPromoter:
             raise ValueError("private local fact trigger is invalid") from error
         if (
             source.get("type") != "distill"
-            or source.get("provider") != "codex"
+            # The local sink records provenance.provider verbatim, and the
+            # promoter is wired for every audience-scoped provider — a literal
+            # "codex" here made /memory_promote reject every claude/piri fact.
+            or source.get("provider") not in DISTILL_PROVIDERS
             or source.get("schema_version") != 1
             or not isinstance(source.get("job_id"), str)
             or _SHA256_RE.fullmatch(str(source["job_id"])) is None

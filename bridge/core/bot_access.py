@@ -72,8 +72,14 @@ class BotAccessMixin:
         Returns:
             bool: True if user has permission, False otherwise
         """
-        # Drop stale messages (> 20 min old)
-        msg = update.message or update.callback_query and update.callback_query.message
+        # Drop stale messages (> 20 min old). Messages only: Telegram
+        # redelivers a backlog of missed messages on reconnect and those carry
+        # their original send time, which is what this guard exists for. A
+        # callback tap is a live action whose message.date is the KEYBOARD's
+        # post time — aging it out turned every inline keyboard into a silent
+        # 20-minute TTL (dropped before query.answer(), so the client showed
+        # only a hanging spinner).
+        msg = update.message
         if msg and msg.date:
             age = (datetime.now(timezone.utc) - msg.date).total_seconds()
             if age > STALE_MESSAGE_SECONDS:

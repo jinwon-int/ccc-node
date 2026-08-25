@@ -201,14 +201,6 @@ You:   [Tap "Restore code and conversation"]
 Bot:   ✅ Reverted to message #42. Conversation and code state restored.
 ```
 
-You:   1
-Bot:   Switched to session: Refactoring auth module
-
-You:   where did we leave off?
-Claude: We finished extracting the JWT logic into a separate service.
-        Still remaining: updating the middleware to use the new service...
-```
-
 ### Switch models mid-conversation
 
 ```

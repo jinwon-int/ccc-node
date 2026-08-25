@@ -49,13 +49,19 @@ After setup:
 
 ```text
 claude/                    Claude Code harness templates, hooks, agents, skills, commands
-codex/                     Ephemeral Codex headless runner for agent-cron
+codex/                     Ephemeral Codex headless runner for agent-cron + managed skills
+crush/                     Crush harness for Kimi-K3/GLM nodes (headless runner, bridge rc)
+piri/                      Piri-side skills installed into ~/.piri/agent/skills
 bridge/                    Telegram bridge Python package and startup/setup scripts
+skills/                    Shared skill tree installed across providers by setup.sh
+architecture/              Machine-readable architecture/side-effect contract data
 docs/                      Living operator docs
 docs/archive/              Historical closeout/roadmap records
 hermes/                    Hermes-side templates; no real memory/secrets
+research/                  Isolated research evaluators (pinned by tests/, never imported)
 scripts/                   Validation, diagnostics, memory, A2A, doctor, version helpers
 schemas/                   JSON schemas for local task/state files
+tests/                     Repo-level CI hardening and research-contract tests
 setup.sh                   Idempotent bootstrap; refuses to overwrite real node state
 ```
 

@@ -11,8 +11,6 @@ Telegram bot that integrates with Claude Code SDK to run Claude Code sessions an
 - All code, comments, variable names, shell messages, and log strings must be in **English**
 - Bot preset strings (command responses, status messages, error prompts) should be kept **minimal and in English**
 - The LLM (Claude) handles language adaptation naturally based on the user's conversation language — no hardcoded i18n needed
-- Openspec's documentation is in **Chinese**
-- Communication in Claude Code is in **Chinese** as much as possible
 
 ```bash
 # Setup

@@ -2,6 +2,11 @@
 
 [English](README.md)
 
+> **翻译滞后提示 / Translation needs follow-up** — 本文档落后于英文版
+> [README.md](README.md)（缺少 Linux systemd 安装、`/effort`·`/restart` 命令、
+> Codex/Piri/Crush 前置条件以及约 30 个环境变量条目）。以英文版为准；
+> 参见 `docs/bridge-upstream-i18n-policy.md`。
+
 把你的 Telegram 变成远程 Claude Code 终端。随时随地与 Claude 对话、运行技能、编辑代码、搜索文件。
 
 ## 解决什么问题？

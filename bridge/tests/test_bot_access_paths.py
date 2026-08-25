@@ -136,6 +136,24 @@ class CheckAccessTests(unittest.TestCase):
         self.assertTrue(asyncio.run(bot._check_access(update)))
         self.assertEqual(reply.calls, [])
 
+    def test_old_inline_keyboard_tap_is_not_dropped(self):
+        # A callback's message.date is the keyboard's POST time, not the tap
+        # time. The stale-backlog drop used to age these out too, so every
+        # inline keyboard older than 20 minutes died before query.answer()
+        # with only a hanging client spinner.
+        bot = self._harness(allowed=(1,))
+        keyboard_message = SimpleNamespace(
+            date=datetime.now(timezone.utc) - timedelta(seconds=21 * 60),
+            voice=None,
+            reply_text=_Recorder(),
+        )
+        update = SimpleNamespace(
+            message=None,
+            callback_query=SimpleNamespace(message=keyboard_message, answer=_Recorder()),
+            effective_user=SimpleNamespace(id=1),
+        )
+        self.assertTrue(asyncio.run(bot._check_access(update)))
+
 
 class PermissionCallbackTests(unittest.TestCase):
     def _harness(self, **kwargs) -> AccessHarness:
