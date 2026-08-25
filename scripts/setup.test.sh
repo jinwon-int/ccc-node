@@ -380,6 +380,8 @@ ok "setup installs the Piri launcher as an executable managed hook" \
   '[ -x "$rewrite_claude/hooks/ccc-piri" ] && cmp -s "$ROOT/scripts/ccc-piri" "$rewrite_claude/hooks/ccc-piri"'
 ok "setup installs the managed nunchi Codex loader" \
   '[ -x "$rewrite_claude/hooks/nunchi/codex-loader.py" ] && cmp -s "$ROOT/claude/hooks/nunchi/codex-loader.py" "$rewrite_claude/hooks/nunchi/codex-loader.py"'
+ok "setup installs the nunchi judge verdict schema as a managed hook-tree asset" \
+  '[ -x "$rewrite_claude/hooks/nunchi/judge-verdict.schema.json" ] && cmp -s "$ROOT/claude/hooks/nunchi/judge-verdict.schema.json" "$rewrite_claude/hooks/nunchi/judge-verdict.schema.json"'
 ok "setup installs the body-free memory readiness probe beside memory-check" \
   '[ -f "$rewrite_claude/hooks/ccc_memory_probe.py" ] && [ ! -x "$rewrite_claude/hooks/ccc_memory_probe.py" ] && cmp -s "$ROOT/scripts/ccc_memory_probe.py" "$rewrite_claude/hooks/ccc_memory_probe.py"'
 ok "setup installs the canonical secure-fs helper beside the Codex materializer" \

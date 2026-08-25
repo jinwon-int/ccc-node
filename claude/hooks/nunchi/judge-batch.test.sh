@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # Tests for claude/hooks/nunchi/judge-batch.py (#1204, TM-2370 P0-c).
 # Isolated via NUNCHI_DB/NUNCHI_HOME/CCC_STATE_DIR overrides; the judge CLI is
-# ALWAYS a PATH stub (default: exits 1 = unavailable) so no test can ever hit
-# a real claude — no network, no cost. Matrix mirrors the issue contract:
-# deterministic-first clear, judge path, fail-closed human, freshness moat,
-# CAP, flock, dry-run vs APPLY, backup + append-only audit, scoped fan-out.
+# ALWAYS a PATH stub (default: exits unavailable) so no test can ever hit a
+# real Claude or Codex provider — no network, no cost. Matrix mirrors the contract:
+# deterministic-first clear, Claude-first/Codex-fallback judge paths,
+# fail-closed human, freshness moat, CAP, flock, dry-run vs APPLY, backup +
+# append-only body-free audit, scoped fan-out.
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 JB="$HERE/judge-batch.py"
@@ -27,13 +28,19 @@ export NUNCHI_HOME="$TMP/nunchi-home"
 export CCC_STATE_DIR="$TMP/state"
 unset CCC_NUNCHI_AUDIENCE_SCOPED CCC_NUNCHI_AUDIENCE_ROOT CCC_NUNCHI_SCOPED_CHILD
 
-# Default judge stub: unavailable (exit 1). Tests 2/3 overwrite it.
+# Default judge stubs: unavailable. Both names are always shadowed so auto
+# fallback can never escape to a real host CLI/provider during the suite.
 cat >"$TMP/bin/claude" <<'STUB'
 #!/usr/bin/env bash
 cat >/dev/null
 exit 1
 STUB
-chmod +x "$TMP/bin/claude"
+cat >"$TMP/bin/codex" <<'STUB'
+#!/usr/bin/env bash
+cat >/dev/null
+exit 127
+STUB
+chmod +x "$TMP/bin/claude" "$TMP/bin/codex"
 
 python3 "$NP" init >/dev/null
 
@@ -170,6 +177,21 @@ ok "deterministic clear still applies without a judge CLI" '[ "$(review_of "$id9
 ok "conflict with unavailable judge stays flagged" '[ "$(review_of "$id10")" = 1 ]'
 ok "judge-unavailable class recorded" 'grep -q "judge-unavailable" "$NUNCHI_HOME/judge-audit.jsonl"'
 
+# The historical command override may be a wrapper whose basename does not
+# reveal the provider. Auto mode must retain its pre-#1278 Claude argv shape.
+cat >"$TMP/bin/judge-wrapper" <<'STUB'
+#!/usr/bin/env bash
+cat >/dev/null
+printf '%s\n' '{"verdict":"clear","rationale":"wrapper result","supersede_proposal":null}'
+STUB
+chmod +x "$TMP/bin/judge-wrapper"
+reset_db
+id12="$(seed dungae "래퍼 형제 갈등" "$OLD" 1 1 d12)"
+id13="$(seed dungae "래퍼 형제 갈등" "$OLD" 1 0 d13)"
+out="$(run_batch NUNCHI_JUDGE_APPLY=1 NUNCHI_JUDGE_CMD=judge-wrapper)"
+ok "custom command override retains Claude adapter semantics" \
+  '[ "$(review_of "$id12")" = 0 ] && grep -q '\''"backend": "claude"'\'' "$NUNCHI_HOME/judge-audit.jsonl"'
+
 # ---- 9. scoped fan-out: canonical scopes only, DB-less/non-canonical skip --
 SCOPE_ROOT="$TMP/audiences"
 GOOD_PRIV="private-0123456789abcdef0123456789abcdef"
@@ -203,26 +225,103 @@ ok "G5 audit points the owner at annotate" 'grep -q "annotate" "$NUNCHI_HOME/jud
 ok "inline-reason decision takes the normal deterministic path" '[ "$(review_of "$idg2")" = 0 ]'
 ok "structured-because decision takes the normal deterministic path" '[ "$(review_of "$idg3")" = 0 ]'
 
-# ---- 9. G3 batch pool mirrors ingest: cross-session siblings (#1255) -------
-# _conflict_review widened G3 to all same-kind session:* peers; the batch
-# recheck used a bare observed=? match, saw "no live sibling" for a
-# cross-session near-duplicate, and deterministically cleared the very flag
-# the write gate had raised for it.
+# ---- 10. G3 batch pool mirrors ingest: cross-session siblings (#1255) ------
+reset_db
+idx1="$(seed_kind session:aaa context "동일 결론이 여러 세션에서 재추출되었다" "$OLD" 1 1 dx1 "")"
+idx2="$(seed_kind session:bbb context "동일 결론이 여러 세션에서 재추출되었다" "$OLD" 1 0 dx2 "")"
+idx3="$(seed_kind session:ccc decision "동일 결론이 여러 세션에서 재추출되었다" "$OLD" 1 0 dx3 "다른 kind 대조")"
+idx4="$(seed_kind session:ddd context "완전히 무관한 주제의 외로운 항목" "$OLD" 1 1 dx4 "")"
+out="$(run_batch NUNCHI_JUDGE_APPLY=1)"
+ok "cross-session same-kind sibling keeps the flag fail-closed" \
+  '[ "$(review_of "$idx1")" = 1 ]'
+ok "unflagged cross-session sibling remains untouched" '[ "$(review_of "$idx2")" = 0 ]'
+ok "same-text different-kind item is not a conflict candidate" '[ "$(review_of "$idx3")" = 0 ]'
+ok "lonely cross-session item still clears deterministically" '[ "$(review_of "$idx4")" = 0 ]'
+ok "cross-session conflict entered judge while only the lonely item auto-cleared" \
+  '[ "$(grep -c '\''"class": "judge"'\'' "$NUNCHI_HOME/judge-audit.jsonl")" = 1 ] && [ "$(grep -c '\''"class": "deterministic-clear"'\'' "$NUNCHI_HOME/judge-audit.jsonl")" = 1 ]'
+
+# ---- 11. Codex adapter: isolated strict-output fallback (#1278) ------------
 reset_db
 cat >"$TMP/bin/claude" <<'STUB'
 #!/usr/bin/env bash
 cat >/dev/null
 exit 1
 STUB
-chmod +x "$TMP/bin/claude"
-idx1="$(seed session:aaa "동일 결론이 여러 세션에서 재추출되었다" "$OLD" 1 1 dx1)"
-idx2="$(seed session:bbb "동일 결론이 여러 세션에서 재추출되었다" "$OLD" 1 0 dx2)"
-idx3="$(seed session:ccc "완전히 무관한 주제의 외로운 항목" "$OLD" 1 1 dx3)"
-NUNCHI_JUDGE_APPLY=1 run_batch
-ok "cross-session sibling keeps the flag (fail-closed to human)" '[ "$(review_of "$idx1")" = 1 ]'
-ok "only the lonely item deterministic-cleared (sibling went to the judge lane)" 'grep -c "\"class\": \"deterministic-clear\"" "$NUNCHI_HOME/judge-audit.jsonl" | grep -qx 1'
-ok "unflagged cross-session sibling untouched" '[ "$(review_of "$idx2")" = 0 ]'
-ok "lonely session item still clears deterministically" '[ "$(review_of "$idx3")" = 0 ]'
+cat >"$TMP/bin/codex" <<'STUB'
+#!/usr/bin/env bash
+set -u
+stub_root="$(cd "$(dirname "$0")/.." && pwd)"
+args_file="$stub_root/codex-args"
+cwd_file="$stub_root/codex-cwd"
+env_file="$stub_root/codex-env"
+: >"$args_file"
+output=""
+while [ "$#" -gt 0 ]; do
+  printf '%s\n' "$1" >>"$args_file"
+  if [ "$1" = "--output-last-message" ] && [ "$#" -ge 2 ]; then
+    output="$2"
+    shift
+    printf '%s\n' "$1" >>"$args_file"
+  fi
+  shift
+done
+cat >/dev/null
+[ -n "$output" ] || exit 2
+case "$(cat "$stub_root/codex-mode" 2>/dev/null || printf valid)" in
+  bad) printf '%s\n' 'not-json' >"$output" ;;
+  extra) printf '%s\n' '{"verdict":"clear","rationale":"same fact","supersede_proposal":null,"unexpected":true}' >"$output" ;;
+  long) printf '{"verdict":"clear","rationale":"%s","supersede_proposal":null}\n' "$(printf '%201s' '' | tr ' ' x)" >"$output" ;;
+  *) printf '%s\n' '{"verdict":"clear","rationale":"same fact","supersede_proposal":null}' >"$output" ;;
+esac
+printf '%s\n' "$PWD" >"$cwd_file"
+env | sort >"$env_file"
+STUB
+chmod +x "$TMP/bin/claude" "$TMP/bin/codex"
+export TELEGRAM_BOT_TOKEN="synthetic-must-not-cross"
+idc1="$(seed dungae "Codex 폴백 형제 갈등" "$OLD" 1 1 dc1)"
+idc2="$(seed dungae "Codex 폴백 형제 갈등" "$OLD" 1 0 dc2)"
+out="$(run_batch NUNCHI_JUDGE_APPLY=1)"
+ok "auto mode falls back from failed Claude to Codex" '[ "$(review_of "$idc1")" = 0 ]'
+ok "Codex is the body-free audit winner" \
+  'grep -q '\''"backend": "codex"'\'' "$NUNCHI_HOME/judge-audit.jsonl" && grep -q '\''"claude:exit-1"'\'' "$NUNCHI_HOME/judge-audit.jsonl"'
+ok "Codex adapter uses the isolated strict-output contract" \
+  'grep -qx -- "--ephemeral" "$TMP/codex-args" && grep -qx -- "--ignore-user-config" "$TMP/codex-args" && grep -qx -- "--ignore-rules" "$TMP/codex-args" && grep -qx -- "read-only" "$TMP/codex-args" && grep -qx -- "--output-schema" "$TMP/codex-args" && grep -qx -- "--output-last-message" "$TMP/codex-args" && grep -q "/nunchi-judge-" "$TMP/codex-cwd"'
+ok "Codex adapter never receives Claude-only flags" \
+  '! grep -qx -- "--tools" "$TMP/codex-args" && ! grep -qx -- "--permission-mode" "$TMP/codex-args" && ! grep -qx -- "--append-system-prompt" "$TMP/codex-args"'
+ok "Codex adapter strips unrelated fleet secrets from the child environment" \
+  '! grep -q "TELEGRAM_BOT_TOKEN\|synthetic-must-not-cross" "$TMP/codex-env"'
+ok "winning Codex backend appears in the local report" \
+  'grep -q "judge backends: claude=0, codex=1" "$CCC_STATE_DIR/nunchi-review-report.md"'
+
+# A structurally invalid Codex response must not clear a flag, even in APPLY.
+reset_db
+idc3="$(seed dungae "Codex 오류 형제 갈등" "$OLD" 1 1 dc3)"
+idc4="$(seed dungae "Codex 오류 형제 갈등" "$OLD" 1 0 dc4)"
+printf '%s\n' bad >"$TMP/codex-mode"
+out="$(run_batch NUNCHI_JUDGE_APPLY=1 NUNCHI_JUDGE_PROVIDER=codex)"
+ok "invalid Codex output fails closed to human" '[ "$(review_of "$idc3")" = 1 ]'
+ok "invalid Codex failure class is sanitized in audit" \
+  'grep -q '\''"codex:no-json"'\'' "$NUNCHI_HOME/judge-audit.jsonl" && ! grep -q "not-json" "$NUNCHI_HOME/judge-audit.jsonl"'
+
+# Defense in depth: the local parser independently enforces the checked-in
+# schema instead of trusting an external CLI to reject extra fields.
+reset_db
+idc5="$(seed dungae "Codex 스키마 형제 갈등" "$OLD" 1 1 dc5)"
+idc6="$(seed dungae "Codex 스키마 형제 갈등" "$OLD" 1 0 dc6)"
+printf '%s\n' extra >"$TMP/codex-mode"
+out="$(run_batch NUNCHI_JUDGE_APPLY=1 NUNCHI_JUDGE_PROVIDER=codex)"
+ok "local parser rejects schema-extra Codex output fail-closed" '[ "$(review_of "$idc5")" = 1 ]'
+ok "schema failure is body-free in audit" \
+  'grep -q '\''"codex:schema-invalid"'\'' "$NUNCHI_HOME/judge-audit.jsonl" && ! grep -q "unexpected" "$NUNCHI_HOME/judge-audit.jsonl"'
+
+reset_db
+idc7="$(seed dungae "Codex 길이 형제 갈등" "$OLD" 1 1 dc7)"
+idc8="$(seed dungae "Codex 길이 형제 갈등" "$OLD" 1 0 dc8)"
+printf '%s\n' long >"$TMP/codex-mode"
+out="$(run_batch NUNCHI_JUDGE_APPLY=1 NUNCHI_JUDGE_PROVIDER=codex)"
+ok "local parser rejects overlong Codex rationale fail-closed" '[ "$(review_of "$idc7")" = 1 ]'
+ok "overlong output body is absent from audit" \
+  'grep -q '\''"codex:schema-invalid"'\'' "$NUNCHI_HOME/judge-audit.jsonl" && ! grep -q "xxxxxxxxxxxxxxxx" "$NUNCHI_HOME/judge-audit.jsonl"'
 
 printf 'PASS=%d FAIL=%d\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
