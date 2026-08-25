@@ -267,7 +267,10 @@ it as supported; otherwise the override is removed and the bot reports the reset
 | `/skill <name> [args]` | Execute a skill command |
 | `/command <cmd> [args]` | Execute a Claude Code slash command |
 
-Any unrecognized `/command` is also forwarded as a skill invocation.
+Any unrecognized direct slash command is also forwarded as a skill invocation.
+On an owner-operated, audience-scoped Claude bridge, host setting sources stay
+disabled; the bridge selectively resolves an explicitly invoked, safety-checked
+local `SKILL.md` instead of exposing host hooks or unscoped memory settings.
 
 `/usage` uses Codex app-server read methods and already-observed token updates.
 For Claude it uses only existing Agent SDK result metadata plus an optional,
