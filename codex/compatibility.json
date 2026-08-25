@@ -165,6 +165,11 @@
       "pattern": "claude/skills/bridge-detached-self-restart/**",
       "compatibility": "claude-only",
       "reason": "Claude bridge self-restart-detach technique built on the Claude-only systemd-run job registry (bridge-safe-detached-run, detached_jobs.py)"
+    },
+    {
+      "pattern": "claude/skills/github-metered-billing-leak-diagnosis/**",
+      "compatibility": "claude-only",
+      "reason": "generic gh billing-API diagnostic procedure authored for Claude skill matching; codex mirror candidate, none exists yet"
     }
   ],
   "managed_skills": [
