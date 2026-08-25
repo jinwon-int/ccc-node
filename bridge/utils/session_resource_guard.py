@@ -65,3 +65,65 @@ def process_tree_rss_mb(
         total_kib += process[1]
         pending.extend(children.get(pid, ()))
     return round(total_kib / 1024.0, 1)
+
+
+# -- idle-session RSS watermark scaling (#1277) --------------------------------
+#
+# The session resource guard closes an idle agent session (and kills any
+# background children riding along in its process tree, e.g. an ad-hoc
+# ``Bash(run_in_background)`` job) once the process tree's RSS crosses a
+# configured watermark. A single fixed watermark does not fit a heterogeneous
+# fleet: observed on a 22 GiB VPS with 20 GiB free, a single idle session with
+# two MCP servers attached (searxng, firecrawl) routinely sat at 1.0-1.2 GiB
+# RSS — right at the old fixed 1024 MiB default — so the guard fired on
+# almost every idle tick (48 evictions/day observed) even though the host had
+# no real memory pressure at all.
+
+DEFAULT_SESSION_TREE_RSS_LIMIT_MB = 1024
+MIN_SESSION_TREE_RSS_LIMIT_MB = 1024
+MAX_SESSION_TREE_RSS_LIMIT_MB = 8192
+SESSION_TREE_RSS_LIMIT_FRACTION = 0.25
+
+
+def system_total_memory_mb(*, proc_root: Path = Path("/proc")) -> float:
+    """Return total system memory in MiB, or 0.0 if it cannot be determined.
+
+    Reads ``MemTotal:`` (kB) from ``<proc_root>/meminfo``. Missing, unreadable,
+    or malformed input fails open (returns 0.0) rather than raising, so
+    callers can fall back to a fixed default on hardened or non-Linux hosts.
+    """
+    try:
+        text = (proc_root / "meminfo").read_text(encoding="utf-8")
+    except OSError:
+        return 0.0
+    for line in text.splitlines():
+        if not line.startswith("MemTotal:"):
+            continue
+        parts = line.split()
+        if len(parts) < 2:
+            return 0.0
+        try:
+            return round(int(parts[1]) / 1024.0, 1)
+        except ValueError:
+            return 0.0
+    return 0.0
+
+
+def default_session_tree_rss_limit_mb(*, proc_root: Path = Path("/proc")) -> int:
+    """Scale the idle-session RSS watermark default to the host's real memory.
+
+    A quarter of total system memory, floored at the historical 1024 MiB
+    default and capped at 8192 MiB, keeps the watermark meaningful on
+    genuinely small hosts (e.g. a resource-constrained Termux phone) while
+    giving generously-provisioned nodes (VPS-class, 16+ GiB) enough room that
+    a normal idle baseline is not mistaken for memory pressure. Detection
+    failure falls back to the fixed default. An explicit
+    ``CCC_BRIDGE_SESSION_TREE_RSS_LIMIT_MB`` always overrides this.
+    """
+    total = system_total_memory_mb(proc_root=proc_root)
+    if total <= 0:
+        return DEFAULT_SESSION_TREE_RSS_LIMIT_MB
+    scaled = round(total * SESSION_TREE_RSS_LIMIT_FRACTION)
+    return max(
+        MIN_SESSION_TREE_RSS_LIMIT_MB, min(MAX_SESSION_TREE_RSS_LIMIT_MB, scaled)
+    )
