@@ -469,6 +469,130 @@ async def test_bind_failure_degrades_without_raising(tmp_path: Path) -> None:
         await server.close()
 
 
+# -- accept-loop resilience (#1274) --------------------------------------------------
+#
+# A dead-interface socket makes every accept() fail with the same OSError
+# forever. These tests drive that failure pattern directly (by monkeypatching
+# the running loop's ``sock_accept``) rather than actually downing a network
+# interface, and assert the listener backs off, self-heals below its failure
+# threshold, rebinds once the threshold is crossed, and gives up cleanly
+# (without crashing or leaking tasks) if rebinding itself never recovers.
+
+
+@pytest.mark.anyio
+async def test_accept_failures_below_threshold_recover_without_rebind(
+    tmp_path: Path, monkeypatch
+) -> None:
+    clock = Clock()
+    server, registry, wait_id = await start_server(tmp_path, clock)
+    loop = asyncio.get_running_loop()
+    real_accept = loop.sock_accept
+    calls = {"n": 0}
+
+    async def flaky(sock):
+        calls["n"] += 1
+        if calls["n"] <= 4:
+            raise OSError(22, "Invalid argument")
+        return await real_accept(sock)
+
+    rebind_calls = {"n": 0}
+    original_bind = server._bind_socket
+
+    def counting_bind():
+        rebind_calls["n"] += 1
+        return original_bind()
+
+    monkeypatch.setattr(loop, "sock_accept", flaky)
+    monkeypatch.setattr(server, "_bind_socket", counting_bind)
+    try:
+        body = json.dumps(workflow_run_payload()).encode()
+        response = await send_request(server.port, body, signature=sign(body))
+        assert status_of(response) == 204
+        assert calls["n"] >= 5
+        # Four failures never reach the (default 20) threshold: the loop
+        # backs off and keeps retrying the *same* socket, no rebind needed.
+        assert rebind_calls["n"] == 0
+    finally:
+        await server.close()
+
+
+@pytest.mark.anyio
+async def test_accept_failures_at_threshold_trigger_rebind(
+    tmp_path: Path, monkeypatch
+) -> None:
+    clock = Clock()
+    server, registry, wait_id = await start_server(
+        tmp_path, clock, max_consecutive_accept_failures=3
+    )
+    loop = asyncio.get_running_loop()
+
+    async def always_fail(sock):
+        raise OSError(22, "Invalid argument")
+
+    rebind_calls = {"n": 0}
+    original_bind = server._bind_socket
+
+    def counting_bind():
+        rebind_calls["n"] += 1
+        return original_bind()
+
+    monkeypatch.setattr(loop, "sock_accept", always_fail)
+    monkeypatch.setattr(server, "_bind_socket", counting_bind)
+    try:
+        for _ in range(50):
+            if rebind_calls["n"] >= 1:
+                break
+            await asyncio.sleep(0.05)
+        assert rebind_calls["n"] >= 1
+
+        # Restore the real accept/bind path and confirm the *rebound*
+        # socket actually serves a fresh request (proves the old dead
+        # socket was replaced, not just closed).
+        monkeypatch.undo()
+        body = json.dumps(workflow_run_payload()).encode()
+        response = await send_request(server.port, body, signature=sign(body))
+        assert status_of(response) == 204
+    finally:
+        await server.close()
+
+
+@pytest.mark.anyio
+async def test_rebind_gives_up_after_max_attempts_and_stays_closable(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import telegram_bot.core.webhook_nudge as webhook_nudge_module
+
+    # Speed the retry cadence up for the test; production keeps the real
+    # 30s pacing between rebind attempts.
+    monkeypatch.setattr(webhook_nudge_module, "REBIND_RETRY_INTERVAL_SECONDS", 0.01)
+    clock = Clock()
+    server, registry, wait_id = await start_server(
+        tmp_path, clock, max_consecutive_accept_failures=2
+    )
+    loop = asyncio.get_running_loop()
+
+    async def always_fail_accept(sock):
+        raise OSError(22, "Invalid argument")
+
+    def always_fail_bind():
+        raise OSError(99, "simulated: interface gone")
+
+    monkeypatch.setattr(loop, "sock_accept", always_fail_accept)
+    monkeypatch.setattr(server, "_bind_socket", always_fail_bind)
+
+    for _ in range(200):
+        if server._sock is None and (
+            server._accept_task is None or server._accept_task.done()
+        ):
+            break
+        await asyncio.sleep(0.02)
+    # Fail-soft: no live socket, no crash — matches an initial bind failure.
+    assert server._sock is None
+
+    # Must still be safely closable even with nothing live to tear down.
+    await server.close()
+
+
 # -- env-gated construction ---------------------------------------------------------
 
 

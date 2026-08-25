@@ -35,6 +35,7 @@ import hmac
 import json
 import logging
 import os
+import socket
 import time
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -56,6 +57,24 @@ MAX_HEADER_BYTES = 16_384
 MAX_HEADER_COUNT = 64
 REQUEST_TIMEOUT_SECONDS = 10.0
 DEFAULT_RATE_LIMIT_PER_MINUTE = 120
+
+# #1274: a listening socket can outlive the network interface it was bound
+# to (most commonly on a mobile/Termux node whose IP changes under the
+# process, e.g. wifi <-> mobile data). When that happens, every accept()
+# fails with the same OSError forever, and asyncio's built-in
+# ``_accept_connection`` callback has no backoff for the general case — it
+# just re-logs and re-arms, becoming a tight loop that pins a CPU core and
+# can fill the disk with repeated tracebacks within hours. We run our own
+# accept loop (via ``loop.sock_accept``) instead of ``asyncio.start_server``
+# so we can count consecutive failures, back off between retries, and
+# rebind a fresh socket once the failure run is long enough to mean "this
+# socket is dead", rather than trusting a single accept() error to be
+# transient.
+DEFAULT_MAX_CONSECUTIVE_ACCEPT_FAILURES = 20
+ACCEPT_FAILURE_BACKOFF_BASE_SECONDS = 0.05
+ACCEPT_FAILURE_BACKOFF_CAP_SECONDS = 2.0
+REBIND_RETRY_INTERVAL_SECONDS = 30.0
+REBIND_MAX_ATTEMPTS = 5
 
 # Nudged waits restart from the registry's freshest cadence so a mid-run
 # event (one workflow done, the rollup still pending) keeps polling briskly
@@ -235,6 +254,7 @@ class WebhookNudgeServer:
         max_body_bytes: int = DEFAULT_MAX_BODY_BYTES,
         rate_limit_per_minute: int = DEFAULT_RATE_LIMIT_PER_MINUTE,
         clock: Callable[[], float] = time.time,
+        max_consecutive_accept_failures: int = DEFAULT_MAX_CONSECUTIVE_ACCEPT_FAILURES,
     ) -> None:
         if not secret:
             raise ValueError("webhook nudge requires a non-empty secret")
@@ -247,23 +267,38 @@ class WebhookNudgeServer:
         )
         self._rate_limit = max(1, int(rate_limit_per_minute))
         self._clock = clock
-        self._server: Optional[asyncio.Server] = None
+        self._max_consecutive_accept_failures = max(
+            1, int(max_consecutive_accept_failures)
+        )
+        self._sock: Optional[socket.socket] = None
+        self._accept_task: Optional[asyncio.Task] = None
+        self._closing = False
         self._window_start = 0.0
         self._window_count = 0
 
     @property
     def port(self) -> int:
         """The actual bound port (useful when constructed with port 0)."""
-        if self._server and self._server.sockets:
-            return int(self._server.sockets[0].getsockname()[1])
+        if self._sock is not None:
+            return int(self._sock.getsockname()[1])
         return self._port
+
+    def _bind_socket(self) -> socket.socket:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.bind((self._host, self._port))
+            sock.listen(128)
+            sock.setblocking(False)
+        except OSError:
+            sock.close()
+            raise
+        return sock
 
     async def start(self) -> bool:
         """Bind and serve; False (with a log) instead of raising on bind errors."""
         try:
-            self._server = await asyncio.start_server(
-                self._handle_connection, self._host, self._port
-            )
+            self._sock = self._bind_socket()
         except OSError as exc:
             logger.error(
                 "Webhook nudge listener failed to bind %s:%d (%s) — "
@@ -272,25 +307,157 @@ class WebhookNudgeServer:
                 self._port,
                 exc.strerror or exc,
             )
-            self._server = None
+            self._sock = None
             return False
+        # Pin the resolved ephemeral port (matters when constructed with
+        # port=0) so a later rebind reuses the same concrete port rather
+        # than drifting to a new one.
+        self._port = int(self._sock.getsockname()[1])
         logger.info(
             "Webhook nudge listener on %s:%d (path %s, body cap %d bytes)",
             self._host,
-            self.port,
+            self._port,
             NUDGE_PATH,
             self._max_body_bytes,
+        )
+        self._closing = False
+        self._accept_task = asyncio.create_task(
+            self._accept_loop(), name="webhook-nudge-accept-loop"
         )
         return True
 
     async def close(self) -> None:
-        if self._server is None:
-            return
-        self._server.close()
+        self._closing = True
+        task, self._accept_task = self._accept_task, None
+        if task is not None:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.exception("Webhook nudge accept loop raised on shutdown")
+        if self._sock is not None:
+            try:
+                self._sock.close()
+            finally:
+                self._sock = None
+
+    # -- accept loop (#1274: bounded failures, backoff, self-healing rebind) -------
+
+    async def _accept_loop(self) -> None:
+        """Accept connections until closed, surviving a dead listening socket.
+
+        Unlike ``asyncio.start_server``'s built-in accept callback, this loop
+        treats a run of consecutive ``accept()`` failures as "the socket is
+        dead" (e.g. the bound IP disappeared) rather than retrying forever
+        at full speed: it backs off between attempts and, once the run is
+        long enough, closes and rebinds a fresh socket. A failed rebind
+        backs off further and tries again a bounded number of times before
+        giving up and stopping the listener (fail-soft — polling remains
+        the fallback path, same as a failed initial bind).
+        """
+        loop = asyncio.get_running_loop()
+        consecutive_failures = 0
+        backoff = ACCEPT_FAILURE_BACKOFF_BASE_SECONDS
+        while not self._closing:
+            if self._sock is None:
+                return
+            try:
+                conn, _addr = await loop.sock_accept(self._sock)
+            except asyncio.CancelledError:
+                raise
+            except OSError as exc:
+                consecutive_failures += 1
+                if consecutive_failures == 1:
+                    logger.warning(
+                        "Webhook nudge accept() failed (%s); backing off "
+                        "(self-heals on transient bind loss, e.g. a mobile "
+                        "node's IP changing)",
+                        exc.strerror or exc,
+                    )
+                if consecutive_failures >= self._max_consecutive_accept_failures:
+                    logger.error(
+                        "Webhook nudge listener accept() failed %d times "
+                        "consecutively on %s:%d — rebinding",
+                        consecutive_failures,
+                        self._host,
+                        self._port,
+                    )
+                    if not await self._rebind():
+                        logger.error(
+                            "Webhook nudge listener could not rebind after "
+                            "repeated accept() failures — stopping; polling "
+                            "remains the fallback"
+                        )
+                        self._sock = None
+                        return
+                    consecutive_failures = 0
+                    backoff = ACCEPT_FAILURE_BACKOFF_BASE_SECONDS
+                    continue
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, ACCEPT_FAILURE_BACKOFF_CAP_SECONDS)
+                continue
+            consecutive_failures = 0
+            backoff = ACCEPT_FAILURE_BACKOFF_BASE_SECONDS
+            try:
+                conn.setblocking(False)
+            except OSError:
+                conn.close()
+                continue
+            asyncio.create_task(self._serve_accepted(conn))
+
+    async def _serve_accepted(self, conn: socket.socket) -> None:
+        loop = asyncio.get_running_loop()
         try:
-            await self._server.wait_closed()
-        finally:
-            self._server = None
+            await loop.connect_accepted_socket(
+                lambda: asyncio.StreamReaderProtocol(
+                    asyncio.StreamReader(), self._handle_connection
+                ),
+                conn,
+            )
+        except OSError:
+            logger.debug(
+                "Webhook nudge failed to wrap an accepted connection",
+                exc_info=True,
+            )
+            try:
+                conn.close()
+            except OSError:
+                pass
+
+    async def _rebind(self) -> bool:
+        """Close the dead socket and retry binding a fresh one in place."""
+        if self._sock is not None:
+            try:
+                self._sock.close()
+            except OSError:
+                pass
+            self._sock = None
+        for attempt in range(1, REBIND_MAX_ATTEMPTS + 1):
+            if self._closing:
+                return False
+            try:
+                self._sock = self._bind_socket()
+            except OSError as exc:
+                logger.warning(
+                    "Webhook nudge rebind attempt %d/%d on %s:%d failed (%s)",
+                    attempt,
+                    REBIND_MAX_ATTEMPTS,
+                    self._host,
+                    self._port,
+                    exc.strerror or exc,
+                )
+                await asyncio.sleep(REBIND_RETRY_INTERVAL_SECONDS)
+                continue
+            logger.info(
+                "Webhook nudge listener rebound on %s:%d after accept "
+                "failures",
+                self._host,
+                self._port,
+            )
+            return True
+        return False
 
     # -- request handling ---------------------------------------------------------
 
