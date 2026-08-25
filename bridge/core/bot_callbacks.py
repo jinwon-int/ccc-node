@@ -253,7 +253,7 @@ class BotCallbackMixin:
                 )
                 updates.update(session_id=None, new_session=True)
                 remove_fields.add("effort")
-            elif active_provider in {"codex", "piri"}:
+            elif active_provider in {"codex", "piri", "crush"}:
                 reset_note = await self._runtime_model_effort_reset_note(
                     session, model_name
                 )

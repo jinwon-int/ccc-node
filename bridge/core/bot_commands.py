@@ -808,7 +808,7 @@ class BotCommandMixin:
                 )
                 updates.update(session_id=None, new_session=True)
                 remove_fields.add("effort")
-            elif active_provider in {"codex", "piri"}:
+            elif active_provider in {"codex", "piri", "crush"}:
                 reset_note = await self._runtime_model_effort_reset_note(session, name)
                 if reset_note:
                     remove_fields.add("effort")
@@ -826,8 +826,11 @@ class BotCommandMixin:
             log_debug(user_id, "bot", reply)
             return
 
-        if active_provider in {"codex", "piri"}:
-            provider_label = "Codex" if active_provider == "codex" else "Piri"
+        if active_provider in {"codex", "piri", "crush"}:
+            # crush declares model_discovery=supported (provider_capabilities);
+            # leaving it out of this branch dropped crush nodes into the Claude
+            # picker whose callbacks then always failed the provider check.
+            provider_label = active_provider.title()
             model_hint = "<codex-model>" if active_provider == "codex" else "<provider/model>"
             try:
                 models = await self._project_chat.list_runtime_models()
@@ -1069,42 +1072,44 @@ class BotCommandMixin:
             return True
         return False
 
-    async def _show_codex_resume_sessions(
+    async def _show_runtime_resume_sessions(
         self,
         *,
         conversation_key,
         user_id: int,
         message,
     ) -> None:
-        """Render the provider-scoped Codex thread browser."""
+        """Render the provider-scoped runtime thread browser (Codex/Crush)."""
 
+        provider = self._active_provider()
+        provider_label = provider.title()
         try:
-            codex_sessions = await self._project_chat.list_runtime_sessions(limit=10)
+            runtime_sessions = await self._project_chat.list_runtime_sessions(limit=10)
         except Exception:
-            logger.warning("Codex session browsing failed")
-            reply = "⚠️ Codex session history is unavailable."
+            logger.warning("%s session browsing failed", provider_label)
+            reply = f"⚠️ {provider_label} session history is unavailable."
             await message.reply_text(reply)
             log_debug(user_id, "bot", reply)
             return
-        if not codex_sessions:
-            reply = "📭 No Codex session history found."
+        if not runtime_sessions:
+            reply = f"📭 No {provider_label} session history found."
             await message.reply_text(reply)
             log_debug(user_id, "bot", reply)
             return
 
         resume_list = []
         lines = ["📋 Session History\n"]
-        for index, item in enumerate(codex_sessions, 1):
+        for index, item in enumerate(runtime_sessions, 1):
             label = item.title or item.preview or item.id
             label = re.sub(r"https?://\S+", "", label)
             label = " ".join(label.split())[:120] or item.id
-            resume_list.append([item.id, label, "codex"])
+            resume_list.append([item.id, label, provider])
             details = " · ".join(
                 " ".join(value.split())[:80]
                 for value in (item.model, item.cwd)
                 if value
             )
-            provider_tag = f"codex · {details}" if details else "codex"
+            provider_tag = f"{provider} · {details}" if details else provider
             lines.append(f"{index}. {label} [{provider_tag}]")
         lines.append("\nReply with a number to switch to that session:")
         await self._session_manager.patch_session(
@@ -1196,8 +1201,8 @@ class BotCommandMixin:
             await message.reply_text(reply)
             log_debug(user_id, "bot", reply)
             return
-        if active_provider == "codex":
-            await self._show_codex_resume_sessions(
+        if active_provider in {"codex", "crush"}:
+            await self._show_runtime_resume_sessions(
                 conversation_key=conversation_key,
                 user_id=user_id,
                 message=message,
@@ -1385,12 +1390,13 @@ class BotCommandMixin:
             log_debug(user_id, "bot", reply)
             return
 
-        if session["provider"] == "codex":
+        if session["provider"] in {"codex", "crush"}:
+            provider_label = str(session["provider"]).title()
             try:
                 history = await self._project_chat.read_runtime_session(session_id, limit=5)
             except Exception:
-                logger.warning("Codex history browsing failed")
-                reply = "⚠️ Codex history is unavailable for this session."
+                logger.warning("%s history browsing failed", provider_label)
+                reply = f"⚠️ {provider_label} history is unavailable for this session."
                 await message.reply_text(reply)
                 log_debug(user_id, "bot", reply)
                 return
@@ -1456,6 +1462,7 @@ class BotCommandMixin:
             return
         user_id = self._require_user(update).id
         message = self._require_message(update)
+        chat = self._require_chat(update)
         log_debug(user_id, "command", "/revert")
 
         if self._active_provider() == "piri":
@@ -1473,7 +1480,13 @@ class BotCommandMixin:
             log_debug(user_id, "bot", reply)
             return
 
-        session = await self._session_manager.get_session(user_id)
+        # Conversation-scoped lookup: in a group chat the bare user_id would
+        # resolve the user's DM session and revert would truncate that
+        # transcript instead of the group's (same scope rule as /new and the
+        # queue keys in test_revert_cancel_scope).
+        session = await self._session_manager.get_session(
+            self._conversation_key(user_id, chat.id)
+        )
         session_id = session.get("session_id")
 
         if not session_id:
@@ -1529,7 +1542,9 @@ class BotCommandMixin:
 
         action = parts[1]  # "select", "page", or "mode"
 
-        session = await self._session_manager.get_session(user_id)
+        session = await self._session_manager.get_session(
+            self._conversation_key(user_id, chat_id)
+        )
         session_id = session.get("session_id")
 
         if not session_id:

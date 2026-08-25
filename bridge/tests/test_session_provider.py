@@ -493,6 +493,34 @@ async def test_codex_resume_uses_runtime_and_persists_canonical_provider_entries
 
 
 @pytest.mark.anyio
+async def test_crush_resume_uses_runtime_and_persists_crush_provider_entries(
+    tmp_path: Path,
+) -> None:
+    # Regression: crush declares session_browsing=supported but /resume only
+    # routed codex to the runtime browser, dropping crush into the Claude
+    # transcript listing whose selections then failed the provider check.
+    manager = make_manager(tmp_path, "crush")
+    project_chat = SimpleNamespace(
+        list_runtime_sessions=AsyncMock(return_value=(
+            SessionSummary(
+                "crush-1", title="Crush thread", preview="hello", updated_at=900.0,
+                cwd="/workspace", model="kimi-coding/k3",
+            ),
+        )),
+        list_sessions=Mock(side_effect=AssertionError("must not read Claude transcripts")),
+    )
+    bot = bare_bot(manager, provider="crush", project_chat=project_chat)
+    update = make_update()
+
+    await bot._cmd_resume(update, SimpleNamespace(args=[]))
+
+    project_chat.list_runtime_sessions.assert_awaited_once_with(limit=10)
+    session = await manager.get_session("7:9")
+    assert session["resume_list"] == [["crush-1", "Crush thread", "crush"]]
+    assert "[crush" in update.message.replies[0][0].lower()
+
+
+@pytest.mark.anyio
 async def test_codex_history_never_reads_claude_transcript_store(tmp_path: Path) -> None:
     manager = make_manager(tmp_path, "codex")
     await manager.store.set(
@@ -1144,6 +1172,29 @@ async def test_codex_model_command_does_not_read_claude_settings_and_persists_ra
     assert session["session_id"] is None
     assert session["new_session"] is True
     assert explicit.message.replies[0][0] == "✅ Switched to o3/custom:raw"
+
+
+@pytest.mark.anyio
+async def test_crush_model_menu_uses_runtime_catalog_with_provider_scoped_callbacks(
+    tmp_path: Path,
+) -> None:
+    # Regression: crush declares model_discovery=supported but the /model menu
+    # branch only covered codex/piri — crush fell into the Claude picker whose
+    # "model:<name>" callbacks always failed the provider-mismatch check.
+    manager = make_manager(tmp_path, "crush")
+    project_chat = SimpleNamespace(
+        list_runtime_models=AsyncMock(return_value=(
+            ModelInfo("kimi-coding/k3", "Kimi K3"),
+        ))
+    )
+    bot = bare_bot(manager, provider="crush", project_chat=project_chat)
+    update = make_update()
+
+    await bot._cmd_model(update, SimpleNamespace(args=[]))
+    assert update.message.replies[0][0] == "🤖 Select Crush model:"
+    button = update.message.replies[0][1]["reply_markup"].inline_keyboard[0][0]
+    assert button.text == "Kimi K3"
+    assert button.callback_data == "model:crush:kimi-coding/k3"
 
 
 @pytest.mark.anyio
