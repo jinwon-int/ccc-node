@@ -161,7 +161,12 @@ any_backend_authenticated() {
   if command -v codex >/dev/null 2>&1; then
     # Anchored: "Not logged in" contains the unanchored substring "logged in"
     # too, so a bare `grep -qi 'logged in'` reports a dead codex as healthy.
-    if codex login status 2>/dev/null | grep -qi '^logged in'; then
+    # 2>&1, not 2>/dev/null: `codex login status` prints its verdict on STDERR
+    # (measured 2026-08-25 on gwakga — stdout is empty, stderr carries
+    # "Logged in using ChatGPT"), so discarding stderr made an authenticated
+    # codex read as unauthenticated on every node. The anchor is what keeps
+    # the merge safe: an error message on stderr cannot start with "logged in".
+    if codex login status 2>&1 | grep -qi '^logged in'; then
       return 0
     fi
   fi

@@ -554,7 +554,11 @@ cat > "$auth_bin/claude" <<'EOF'
 EOF
 cat > "$auth_bin/codex" <<'EOF'
 #!/usr/bin/env bash
-[ "$1" = login ] && [ "$2" = status ] && echo "Not logged in"
+# Real `codex login status` writes its verdict to STDERR, not stdout (measured
+# 2026-08-25). The stub must do the same or the probe is tested against
+# behaviour the CLI does not have — which is exactly how the 2>/dev/null bug
+# survived: an authenticated codex read as unauthenticated fleet-wide.
+[ "$1" = login ] && [ "$2" = status ] && echo "Not logged in" >&2
 EOF
 chmod +x "$auth_bin/claude" "$auth_bin/codex"
 out="$(PATH="$auth_bin:$PATH" run_install --apply --codex 2>&1)"; rc=$?
@@ -562,6 +566,27 @@ ok "apply warns when neither claude nor codex is authenticated" \
   '[ "$rc" = 0 ] && grep -q "no authenticated LLM backend" <<<"$out"'
 out="$(PATH="$auth_bin:$PATH" run_install 2>&1)"; rc=$?
 ok "status reports backend_auth=NONE when neither backend is authenticated" \
+  '[ "$rc" = 0 ] && grep -q "^backend_auth: NONE" <<<"$out"'
+
+# codex alone authenticated (claude still logged out): the verdict arrives on
+# stderr, so this is the case the old `2>/dev/null` probe silently failed.
+cat > "$auth_bin/codex" <<'EOF'
+#!/usr/bin/env bash
+[ "$1" = login ] && [ "$2" = status ] && echo "Logged in using ChatGPT" >&2
+EOF
+chmod +x "$auth_bin/codex"
+out="$(PATH="$auth_bin:$PATH" run_install 2>&1)"; rc=$?
+ok "backend_auth=ok when only codex is authenticated (verdict on stderr)" \
+  '[ "$rc" = 0 ] && grep -q "^backend_auth: ok" <<<"$out"'
+# The anchor must still reject a logged-out codex whose message merely
+# contains "logged in".
+cat > "$auth_bin/codex" <<'EOF'
+#!/usr/bin/env bash
+[ "$1" = login ] && [ "$2" = status ] && echo "Not logged in" >&2
+EOF
+chmod +x "$auth_bin/codex"
+out="$(PATH="$auth_bin:$PATH" run_install 2>&1)"; rc=$?
+ok "a logged-out codex is not rescued by merging stderr" \
   '[ "$rc" = 0 ] && grep -q "^backend_auth: NONE" <<<"$out"'
 
 cat > "$auth_bin/claude" <<'EOF'
