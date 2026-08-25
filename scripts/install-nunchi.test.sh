@@ -139,6 +139,28 @@ ok "a deliberate re-apply without --judge removes the judge cron" \
 ok "opting out also drops --judge from the install record" \
   'jq -e ".argv==[\"--apply\",\"--codex\"]" "$nrec" >/dev/null'
 
+# --- APPLY mode (#1264): dry-run is the default and apply is opt-in per node.
+# The flag exists so an approved apply pilot SURVIVES a re-apply — before it,
+# the only way to enable apply was hand-editing the managed cron line, which
+# strip_cron rewrites, silently switching the pilot back off.
+out="$(run_install --apply --codex --judge-apply 2>&1)"; rc=$?
+ok "--judge-apply puts NUNCHI_JUDGE_APPLY=1 on the judge cron line" \
+  '[ "$rc" = 0 ] && grep "judge-batch.py" "$cron_store" | grep -q "NUNCHI_JUDGE_APPLY=1"'
+ok "--judge-apply implies --judge (one judge line, not zero or two)" \
+  '[ "$(grep -c "judge-batch.py" "$cron_store")" = 1 ]'
+ok "--judge-apply announces that it mutates the store" 'grep -q "APPLY — mutates the fact store" <<<"$out"'
+ok "install record materializes --judge-apply, not the weaker --judge" \
+  'jq -e ".argv==[\"--apply\",\"--codex\",\"--judge-apply\"]" "$nrec" >/dev/null'
+ok "replaying the recorded argv keeps APPLY (no silent downgrade to dry-run)" \
+  'run_install --apply --codex --judge-apply >/dev/null 2>&1 && grep "judge-batch.py" "$cron_store" | grep -q "NUNCHI_JUDGE_APPLY=1"'
+# Stepping back down to plain --judge must actually disarm the cron.
+out="$(run_install --apply --codex --judge 2>&1)"; rc=$?
+ok "re-applying with plain --judge disarms APPLY on the cron line" \
+  '[ "$rc" = 0 ] && grep -q "judge-batch.py" "$cron_store" && ! grep "judge-batch.py" "$cron_store" | grep -q "NUNCHI_JUDGE_APPLY"'
+ok "stepping down also rewrites the install record to --judge" \
+  'jq -e ".argv==[\"--apply\",\"--codex\",\"--judge\"]" "$nrec" >/dev/null'
+run_install --apply --codex >/dev/null 2>&1
+
 # --- Piri lane: Piri has no distill feed, so its lane runs a per-session
 # extractor (piri-feed.sh) and mines transcripts with the conversation miner
 # attributed to the piri wing (--wing piri), mirroring the Codex lane.

@@ -9,6 +9,9 @@
 #   install-nunchi.sh --apply --piri       # explicit Piri override
 #   install-nunchi.sh --apply --piri --audience-scoped /absolute/audience/root
 #   install-nunchi.sh --apply --judge    # + daily review-queue judge batch (#1204)
+#   install-nunchi.sh --apply --judge-apply  # judge batch in APPLY mode — MUTATES
+#                                            # the fact store; implies --judge and
+#                                            # needs fresh per-node approval (#1264)
 #   install-nunchi.sh --apply --target-user gongmyoung
 #   install-nunchi.sh --remove             # mode off + managed cron/hook removal
 #   install-nunchi.sh                      # status
@@ -27,6 +30,7 @@ ACTION="status"
 PROVIDER="${CCC_NUNCHI_PROVIDER:-auto}"
 TARGET_USER="${CCC_NUNCHI_TARGET_USER:-}"
 JUDGE="${CCC_NUNCHI_JUDGE:-0}"
+JUDGE_APPLY="${CCC_NUNCHI_JUDGE_APPLY:-0}"
 AUDIENCE_SCOPED="${CCC_NUNCHI_AUDIENCE_SCOPED:-0}"
 AUDIENCE_ROOT="${CCC_NUNCHI_AUDIENCE_ROOT:-}"
 ORIGINAL_ARGS=("$@")
@@ -44,6 +48,9 @@ while [ $# -gt 0 ]; do
       [ $# -ge 2 ] || { echo "--target-user requires a user" >&2; exit 2; }
       TARGET_USER="$2"; shift ;;
     --judge) JUDGE=1 ;;
+    # Implies --judge: an apply-mode cron with no judge cron is not a state
+    # the installer can express, so asking for one is asking for both.
+    --judge-apply) JUDGE=1; JUDGE_APPLY=1 ;;
     --help|-h)
       sed -n '2,14p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
@@ -627,11 +634,21 @@ case "$ACTION" in
     append_cron_line "7 8 * * 1 CCC_STATE_DIR=$(cron_quote "$STATE") ${scoped_env}NUNCHI_HOME=$(cron_quote "$NUNCHI_DIR") NUNCHI_DB=$(cron_quote "$NUNCHI_DB_PATH") NUNCHI_SNAPSHOT=$(cron_quote "$NUNCHI_SNAPSHOT_PATH") $(cron_quote "$bash_bin") $(cron_quote "$HOOKS/bench.sh") >> $(cron_quote "$NUNCHI_DIR/bench.cron.log") 2>&1 $MARK gen=$GEN"
     echo "weekly bench cron added (Mon 08:07)"
     if [ "$JUDGE" = 1 ]; then
-      # #1204 daily review-queue triage. Dry-run by default — the cron line
-      # deliberately carries no NUNCHI_JUDGE_APPLY: flipping to apply is a
-      # fresh-approval, per-node action, not an installer decision.
-      append_cron_line "41 4 * * * CCC_STATE_DIR=$(cron_quote "$STATE") ${scoped_env}NUNCHI_HOME=$(cron_quote "$NUNCHI_DIR") NUNCHI_DB=$(cron_quote "$NUNCHI_DB_PATH") NUNCHI_SNAPSHOT=$(cron_quote "$NUNCHI_SNAPSHOT_PATH") $(cron_quote "$python3_bin") $(cron_quote "$HOOKS/judge-batch.py") >> $(cron_quote "$NUNCHI_DIR/judge.cron.log") 2>&1 $MARK gen=$GEN"
-      echo "daily judge-batch cron added (04:41, dry-run)"
+      # #1204 daily review-queue triage. Dry-run unless --judge-apply is passed:
+      # flipping to apply is a fresh-approval, per-node action, never a default.
+      # #1264 — the flag exists so that approval can SURVIVE. Before it, the
+      # only way to enable apply was hand-editing the managed cron line, which
+      # strip_cron rewrites on the next re-apply: the approved pilot switched
+      # itself back off with no error, the same silent-revert class as the
+      # missing --judge install-record entry.
+      judge_apply_env=""
+      if [ "$JUDGE_APPLY" = 1 ]; then judge_apply_env="NUNCHI_JUDGE_APPLY=1 "; fi
+      append_cron_line "41 4 * * * CCC_STATE_DIR=$(cron_quote "$STATE") ${judge_apply_env}${scoped_env}NUNCHI_HOME=$(cron_quote "$NUNCHI_DIR") NUNCHI_DB=$(cron_quote "$NUNCHI_DB_PATH") NUNCHI_SNAPSHOT=$(cron_quote "$NUNCHI_SNAPSHOT_PATH") $(cron_quote "$python3_bin") $(cron_quote "$HOOKS/judge-batch.py") >> $(cron_quote "$NUNCHI_DIR/judge.cron.log") 2>&1 $MARK gen=$GEN"
+      if [ "$JUDGE_APPLY" = 1 ]; then
+        echo "daily judge-batch cron added (04:41, APPLY — mutates the fact store)"
+      else
+        echo "daily judge-batch cron added (04:41, dry-run)"
+      fi
     fi
     if [ "$resolved_provider" = "claude" ]; then
       set_sessionstart_hook add
@@ -651,7 +668,10 @@ case "$ACTION" in
     # re-add them). Measured 2026-08-25: judge-batch cron was live on 1 of 11
     # fleet nodes while every node carried the script and a non-empty review
     # queue (#1264) — this omission is the mechanism that loses it.
-    if [ "$JUDGE" = 1 ]; then record_argv+=(--judge); fi
+    # --judge-apply supersedes --judge in the record (it implies it), so the
+    # replay reproduces apply mode instead of silently downgrading to dry-run.
+    if [ "$JUDGE_APPLY" = 1 ]; then record_argv+=(--judge-apply)
+    elif [ "$JUDGE" = 1 ]; then record_argv+=(--judge); fi
     ccc_installer_record_write "$STATE" "$NUNCHI_SELF_DIR/install-nunchi.sh" "$MARK" "$GEN" -- \
       "${record_argv[@]}" \
       || echo "WARNING: install record write failed — self-update re-apply will not track these entries" >&2
