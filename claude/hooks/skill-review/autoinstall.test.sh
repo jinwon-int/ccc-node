@@ -8,6 +8,16 @@ pass=0; fail=0
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
+# Sandbox every fallback path. These scripts resolve their state dir from
+# CCC_SKILL_REVIEW_STATE_DIR/CCC_CLAUDE_DIR/HOME; if a fixture forgets one, the
+# fallback must land in TMP and never in the real node queue. A run of this
+# suite once archived live drafts out of ~/.claude/state/pending-skills because
+# an unset anchor fell through to the operator's home.
+export HOME="$TMP/home"
+export CCC_CLAUDE_DIR="$TMP/home/.claude"
+mkdir -p "$CCC_CLAUDE_DIR/state" "$CCC_CLAUDE_DIR/skills"
+chmod 700 "$CCC_CLAUDE_DIR/state" "$CCC_CLAUDE_DIR/skills"
+
 ok() { if eval "$2"; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $1"; fi; }
 
 STATE="$TMP/state"
@@ -21,7 +31,7 @@ chmod 700 "$STATE"
 chmod 700 "$SKILLS"
 
 run_auto() { # [extra env assignments...] verb [args...]
-  CCC_STATE_DIR="$STATE" CLAUDE_SKILLS_DIR="$SKILLS" CCC_PUSH_SPOOL="$SPOOL" \
+  CCC_SKILL_REVIEW_STATE_DIR="$STATE" CLAUDE_SKILLS_DIR="$SKILLS" CCC_PUSH_SPOOL="$SPOOL" \
   CCC_NODE=testnode "$@"
 }
 
@@ -221,11 +231,11 @@ PENDING_SAVE="$PENDING"; STATE_SAVE="$STATE"; SKILLS_SAVE="$SKILLS"
 STATE="$CAP_STATE"; SKILLS="$CAP_SKILLS"; PENDING="$CAP_STATE/pending-skills"
 make_draft 20260101-000011-l-cap1 cap-one "Capture the first recurring maintenance procedure for the fleet nodes."
 make_draft 20260101-000012-m-cap2 cap-two "Capture the second recurring maintenance procedure for backup checks."
-out="$(CCC_STATE_DIR="$CAP_STATE" CLAUDE_SKILLS_DIR="$CAP_SKILLS" CCC_PUSH_SPOOL="$CAP_SPOOL" \
+out="$(CCC_SKILL_REVIEW_STATE_DIR="$CAP_STATE" CLAUDE_SKILLS_DIR="$CAP_SKILLS" CCC_PUSH_SPOOL="$CAP_SPOOL" \
   CCC_SKILL_AUTOSAVE_MODE=auto CCC_SKILL_AUTOSAVE_DAILY_CAP=1 bash "$AUTO" run)"
 ok "cap installs only one" '[ "$(find "$CAP_SKILLS" -name SKILL.md | wc -l | tr -d "[:space:]")" = 1 ]'
 ok "over-cap draft deferred, not blocked" 'jq -e ".deferred == 1" >/dev/null <<<"$out" && ! ls "$CAP_STATE/pending-skills"/*/autosave-block.json >/dev/null 2>&1'
-ok "cap counts prior installs from ledger" '[ "$(CCC_STATE_DIR="$CAP_STATE" CLAUDE_SKILLS_DIR="$CAP_SKILLS" CCC_PUSH_SPOOL="$CAP_SPOOL" CCC_SKILL_AUTOSAVE_MODE=auto CCC_SKILL_AUTOSAVE_DAILY_CAP=1 bash "$AUTO" run | jq -r ".installed | length")" = 0 ]'
+ok "cap counts prior installs from ledger" '[ "$(CCC_SKILL_REVIEW_STATE_DIR="$CAP_STATE" CLAUDE_SKILLS_DIR="$CAP_SKILLS" CCC_PUSH_SPOOL="$CAP_SPOOL" CCC_SKILL_AUTOSAVE_MODE=auto CCC_SKILL_AUTOSAVE_DAILY_CAP=1 bash "$AUTO" run | jq -r ".installed | length")" = 0 ]'
 STATE="$STATE_SAVE"; SKILLS="$SKILLS_SAVE"; PENDING="$PENDING_SAVE"
 
 # --- 8) off-switch wins over auto mode ----------------------------------------------
@@ -283,21 +293,21 @@ make_draft_at() { # <store> <skills> <id> <name> <desc>
 
 # CCC_AUTONOMY=kill halts autonomous install regardless of auto mode.
 make_draft_at "$A_STATE" "$A_SKILLS" a-kill kill-me "Capture the recurring autonomy kill-switch verification procedure now."
-out="$(CCC_STATE_DIR="$A_STATE" CLAUDE_SKILLS_DIR="$A_SKILLS" CCC_PUSH_SPOOL="$TMP/aspool" CCC_AUTONOMY=kill CCC_SKILL_AUTOSAVE_MODE=auto bash "$AUTO" run)"
+out="$(CCC_SKILL_REVIEW_STATE_DIR="$A_STATE" CLAUDE_SKILLS_DIR="$A_SKILLS" CCC_PUSH_SPOOL="$TMP/aspool" CCC_AUTONOMY=kill CCC_SKILL_AUTOSAVE_MODE=auto bash "$AUTO" run)"
 ok "CCC_AUTONOMY=kill installs nothing" 'jq -e ".skipped == \"autonomy-kill\"" >/dev/null <<<"$out" && [ ! -e "$A_SKILLS/kill-me" ]'
 
 # CCC_AUTONOMY=dry-run gates + reports would_install but writes nothing.
-out="$(CCC_STATE_DIR="$A_STATE" CLAUDE_SKILLS_DIR="$A_SKILLS" CCC_PUSH_SPOOL="$TMP/aspool" CCC_AUTONOMY=dry-run CCC_SKILL_AUTOSAVE_MODE=auto bash "$AUTO" run)"
+out="$(CCC_SKILL_REVIEW_STATE_DIR="$A_STATE" CLAUDE_SKILLS_DIR="$A_SKILLS" CCC_PUSH_SPOOL="$TMP/aspool" CCC_AUTONOMY=dry-run CCC_SKILL_AUTOSAVE_MODE=auto bash "$AUTO" run)"
 ok "CCC_AUTONOMY=dry-run reports would_install, writes nothing" 'jq -e ".dry_run == true and (.would_install | index(\"kill-me\") != null) and (.installed | length == 0)" >/dev/null <<<"$out" && [ ! -e "$A_SKILLS/kill-me" ] && [ ! -s "$A_STATE/skill-autosave-install.jsonl" ]'
 
 # File switch: autonomy.dry-run in the state dir.
 touch "$A_STATE/autonomy.dry-run"
-out="$(CCC_STATE_DIR="$A_STATE" CLAUDE_SKILLS_DIR="$A_SKILLS" CCC_PUSH_SPOOL="$TMP/aspool" CCC_SKILL_AUTOSAVE_MODE=auto bash "$AUTO" run)"
+out="$(CCC_SKILL_REVIEW_STATE_DIR="$A_STATE" CLAUDE_SKILLS_DIR="$A_SKILLS" CCC_PUSH_SPOOL="$TMP/aspool" CCC_SKILL_AUTOSAVE_MODE=auto bash "$AUTO" run)"
 ok "autonomy.dry-run file mutes install" 'jq -e ".dry_run == true and (.installed | length == 0)" >/dev/null <<<"$out" && [ ! -e "$A_SKILLS/kill-me" ]'
 rm -f "$A_STATE/autonomy.dry-run"
 
 # active (default) still installs.
-out="$(CCC_STATE_DIR="$A_STATE" CLAUDE_SKILLS_DIR="$A_SKILLS" CCC_PUSH_SPOOL="$TMP/aspool" CCC_SKILL_AUTOSAVE_MODE=auto bash "$AUTO" run)"
+out="$(CCC_SKILL_REVIEW_STATE_DIR="$A_STATE" CLAUDE_SKILLS_DIR="$A_SKILLS" CCC_PUSH_SPOOL="$TMP/aspool" CCC_SKILL_AUTOSAVE_MODE=auto bash "$AUTO" run)"
 ok "default autonomy=active installs" '[ -f "$A_SKILLS/kill-me/SKILL.md" ]'
 
 # --- failed counter (#770): a non-compliant skills root fail-closes the
@@ -307,9 +317,23 @@ mkdir -p "$F_STATE/pending-skills" "$F_SKILLS"
 chmod 700 "$F_STATE"
 chmod 777 "$F_SKILLS"  # deliberately non-compliant: contract must fail closed
 make_draft_at "$F_STATE" "$F_SKILLS" f-fail fail-one "Capture the recurring failed-counter verification procedure here."
-out="$(CCC_STATE_DIR="$F_STATE" CLAUDE_SKILLS_DIR="$F_SKILLS" CCC_PUSH_SPOOL="$TMP/fspool" CCC_SKILL_AUTOSAVE_MODE=auto bash "$AUTO" run)"
+out="$(CCC_SKILL_REVIEW_STATE_DIR="$F_STATE" CLAUDE_SKILLS_DIR="$F_SKILLS" CCC_PUSH_SPOOL="$TMP/fspool" CCC_SKILL_AUTOSAVE_MODE=auto bash "$AUTO" run)"
 ok "non-compliant root reports failed=1, installs nothing" 'jq -e ".failed == 1 and (.installed | length == 0)" >/dev/null <<<"$out" && [ ! -e "$F_SKILLS/fail-one" ]'
 ok "failed install leaves draft pending" '[ -d "$F_STATE/pending-skills/f-fail" ]'
+
+# --- queue anchor: CCC_STATE_DIR must NOT relocate the queue -----------------
+# The bridge exports CCC_STATE_DIR per memory audience while the collector
+# stages drafts into the node-global ~/.claude/state/pending-skills. Honouring
+# it here made `status` report an empty queue while real drafts sat unread.
+Q_STATE="$TMP/qstate"; Q_SKILLS="$TMP/qskills"; Q_DECOY="$TMP/qdecoy"
+mkdir -p "$Q_STATE/pending-skills" "$Q_SKILLS" "$Q_DECOY/pending-skills"
+chmod 700 "$Q_STATE" "$Q_SKILLS" "$Q_DECOY"
+make_draft_at "$Q_STATE" "$Q_SKILLS" q-anchor queue-anchor "Capture the recurring queue anchor verification procedure here."
+out="$(CCC_SKILL_REVIEW_STATE_DIR="$Q_STATE" CCC_STATE_DIR="$Q_DECOY" CLAUDE_SKILLS_DIR="$Q_SKILLS" CCC_PUSH_SPOOL="$TMP/qspool" CCC_SKILL_AUTOSAVE_MODE=auto bash "$AUTO" status)"
+ok "CCC_STATE_DIR does not hide the real queue" 'grep -q "pending drafts: 1" <<<"$out"'
+out="$(CCC_SKILL_REVIEW_STATE_DIR="$Q_STATE" CCC_STATE_DIR="$Q_DECOY" CLAUDE_SKILLS_DIR="$Q_SKILLS" CCC_PUSH_SPOOL="$TMP/qspool" CCC_SKILL_AUTOSAVE_MODE=auto bash "$AUTO" run)"
+ok "CCC_STATE_DIR does not relocate installs" 'jq -e "(.installed | index(\"queue-anchor\")) != null" >/dev/null <<<"$out" && [ -f "$Q_SKILLS/queue-anchor/SKILL.md" ]'
+ok "CCC_STATE_DIR decoy queue stays untouched" '[ -z "$(ls -A "$Q_DECOY/pending-skills")" ] && [ ! -e "$Q_DECOY/skill-autosave-install.jsonl" ]'
 
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

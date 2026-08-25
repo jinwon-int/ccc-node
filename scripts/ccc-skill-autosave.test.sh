@@ -16,6 +16,16 @@ pass=0; fail=0
 TMP="$(ccc_test_tmpdir)" || exit 1
 trap 'rm -rf "$TMP"' EXIT
 
+# Sandbox every fallback path. These scripts resolve their state dir from
+# CCC_SKILL_REVIEW_STATE_DIR/CCC_CLAUDE_DIR/HOME; if a fixture forgets one, the
+# fallback must land in TMP and never in the real node queue. A run of this
+# suite once archived live drafts out of ~/.claude/state/pending-skills because
+# an unset anchor fell through to the operator's home.
+export HOME="$TMP/home"
+export CCC_CLAUDE_DIR="$TMP/home/.claude"
+mkdir -p "$CCC_CLAUDE_DIR/state" "$CCC_CLAUDE_DIR/skills"
+chmod 700 "$CCC_CLAUDE_DIR/state" "$CCC_CLAUDE_DIR/skills"
+
 ok() { if eval "$2"; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $1"; fi; }
 
 make_transcript() {

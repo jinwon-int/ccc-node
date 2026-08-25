@@ -215,7 +215,11 @@ def _build_context(args: argparse.Namespace) -> Context:
         skills_dir = Path(os.environ.get("CODEX_SKILLS_DIR", codex_home / "skills"))
     else:
         skills_dir = Path(os.environ.get("CLAUDE_SKILLS_DIR", claude_dir / "skills"))
-    state_dir = args.state_dir or Path(os.environ.get("CCC_STATE_DIR", claude_dir / "state"))
+    # Node-global anchor, not CCC_STATE_DIR: the bridge scopes that per memory
+    # audience, and skill ownership records live beside the node-wide queue.
+    state_dir = args.state_dir or Path(
+        os.environ.get("CCC_SKILL_REVIEW_STATE_DIR", claude_dir / "state")
+    )
     return Context(
         provider=provider,
         skills_dir=Path(os.path.abspath(skills_dir)),

@@ -12,6 +12,16 @@ pass=0; fail=0
 TMP="$(ccc_test_tmpdir)" || exit 1
 trap 'rm -rf "$TMP"' EXIT
 
+# Sandbox every fallback path. These scripts resolve their state dir from
+# CCC_SKILL_REVIEW_STATE_DIR/CCC_CLAUDE_DIR/HOME; if a fixture forgets one, the
+# fallback must land in TMP and never in the real node queue. A run of this
+# suite once archived live drafts out of ~/.claude/state/pending-skills because
+# an unset anchor fell through to the operator's home.
+export HOME="$TMP/home"
+export CCC_CLAUDE_DIR="$TMP/home/.claude"
+mkdir -p "$CCC_CLAUDE_DIR/state" "$CCC_CLAUDE_DIR/skills"
+chmod 700 "$CCC_CLAUDE_DIR/state" "$CCC_CLAUDE_DIR/skills"
+
 ok() { if eval "$2"; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $1"; fi; }
 
 argv_is_deny_all() {
@@ -78,7 +88,7 @@ exec "$@"
 SH
 PATH="$TMP/bin:$PATH"
 
-out="$(payload sess-1 "$TRANS" "/root/work" | CCC_STATE_DIR="$STATE" CLAUDE_SKILLS_DIR="$SKILLS" CCC_SKILL_REVIEW_COOLDOWN_SECONDS=0 bash "$REVIEW" sessionend 2>&1)"; rc=$?
+out="$(payload sess-1 "$TRANS" "/root/work" | CCC_SKILL_REVIEW_STATE_DIR="$STATE" CLAUDE_SKILLS_DIR="$SKILLS" CCC_SKILL_REVIEW_COOLDOWN_SECONDS=0 bash "$REVIEW" sessionend 2>&1)"; rc=$?
 ok "skill-review hook exits 0" '[ "$rc" = 0 ]'
 ok "skill-review uses the shared setsid spawn mode" 'grep -q "spawned bg pid=.* mode=setsid" "$STATE/skill-review.log"'
 for _ in $(seq 1 30); do
@@ -104,7 +114,7 @@ SPOOL_AUTO="$TMP/spool-auto"
 mkdir -p "$STATE_AUTO" "$SKILLS_AUTO"
 chmod 700 "$STATE_AUTO"
 chmod 700 "$SKILLS_AUTO"  # contract-compliant root under any umask (#770)
-out="$(payload sess-auto "$TRANS" "/root/work" | CCC_STATE_DIR="$STATE_AUTO" CLAUDE_SKILLS_DIR="$SKILLS_AUTO" \
+out="$(payload sess-auto "$TRANS" "/root/work" | CCC_SKILL_REVIEW_STATE_DIR="$STATE_AUTO" CLAUDE_SKILLS_DIR="$SKILLS_AUTO" \
   CCC_PUSH_SPOOL="$SPOOL_AUTO" CCC_SKILL_AUTOSAVE_MODE=auto CCC_SKILL_REVIEW_COOLDOWN_SECONDS=0 \
   bash "$REVIEW" sessionend 2>&1)"; rc=$?
 ok "auto-mode hook exits 0" '[ "$rc" = 0 ]'
@@ -124,13 +134,13 @@ ok "auto mode writes no approval marker when nothing stays pending" '! grep -q "
 
 # Cooldown should skip a second hook-triggered run when enabled.
 : > "$STATE/skill-review.log"
-out="$(payload sess-1 "$TRANS" "/root/work" | CCC_STATE_DIR="$STATE" CLAUDE_SKILLS_DIR="$SKILLS" CCC_SKILL_REVIEW_COOLDOWN_SECONDS=9999 bash "$REVIEW" sessionend 2>&1)"; rc=$?
+out="$(payload sess-1 "$TRANS" "/root/work" | CCC_SKILL_REVIEW_STATE_DIR="$STATE" CLAUDE_SKILLS_DIR="$SKILLS" CCC_SKILL_REVIEW_COOLDOWN_SECONDS=9999 bash "$REVIEW" sessionend 2>&1)"; rc=$?
 ok "cooldown run exits 0" '[ "$rc" = 0 ]'
 ok "cooldown skip logged" 'grep -q "skip reason=cooldown" "$STATE/skill-review.log"'
 
 # Recursion guard short-circuits before touching state.
 : > "$STATE/skill-review.log"
-out="$(CLAUDE_SKILL_REVIEW_INFLIGHT=1 CCC_STATE_DIR="$STATE" bash "$REVIEW" sessionend <<<"$(payload sess-guard "$TRANS" "/root/work")" 2>&1)"; rc=$?
+out="$(CLAUDE_SKILL_REVIEW_INFLIGHT=1 CCC_SKILL_REVIEW_STATE_DIR="$STATE" bash "$REVIEW" sessionend <<<"$(payload sess-guard "$TRANS" "/root/work")" 2>&1)"; rc=$?
 ok "recursion guard exits 0" '[ "$rc" = 0 ]'
 ok "recursion guard logs nothing" '[ ! -s "$STATE/skill-review.log" ]'
 
@@ -141,7 +151,7 @@ mkdir -p "$STATE_DISABLED"
 : > "$STATE_DISABLED/skill-review.disabled"
 out="$(CLAUDE_SKILL_REVIEW_BG=1 CLAUDE_SKILL_REVIEW_INFLIGHT=1 \
   CLAUDE_SKILL_REVIEW_TRANSCRIPT="$TRANS" CLAUDE_SKILL_REVIEW_SESSION=sess-disabled \
-  CLAUDE_ENV_SNAPSHOT="$SNAPSHOT_DISABLED" CCC_STATE_DIR="$STATE_DISABLED" \
+  CLAUDE_ENV_SNAPSHOT="$SNAPSHOT_DISABLED" CCC_SKILL_REVIEW_STATE_DIR="$STATE_DISABLED" \
   bash "$REVIEW" sessionend 2>&1)"; rc=$?
 ok "disabled background re-entry exits 0" '[ "$rc" = 0 ]'
 ok "disabled background re-entry never calls provider" '[ ! -e "$SNAPSHOT_DISABLED" ]'

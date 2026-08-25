@@ -39,7 +39,13 @@ set -uo pipefail
 export LC_ALL=C
 
 CLAUDE_DIR="${CCC_CLAUDE_DIR:-${HOME:-/root}/.claude}"
-STATE_DIR="${CCC_STATE_DIR:-$CLAUDE_DIR/state}"
+# Anchored to the node-global Claude dir on purpose — NOT to CCC_STATE_DIR.
+# The bridge exports CCC_STATE_DIR per memory audience (memory_audience.py,
+# hook_environment), so honouring it here pointed the queue at a per-audience
+# memory scope while the collector kept staging drafts into the node-global
+# ~/.claude/state/pending-skills (settings_memory.py codex_skill_pending_dir).
+# Skills install to one node-wide skills dir, so the queue is node-global too.
+STATE_DIR="${CCC_SKILL_REVIEW_STATE_DIR:-$CLAUDE_DIR/state}"
 SKILLS_DIR="${CLAUDE_SKILLS_DIR:-$CLAUDE_DIR/skills}"
 PENDING_DIR="${CCC_SKILL_REVIEW_PENDING_DIR:-$STATE_DIR/pending-skills}"
 SPOOL="${CCC_PUSH_SPOOL:-$STATE_DIR/telegram-spool}"
@@ -304,21 +310,25 @@ do_run() {
   # Fleet-wide autonomy guard (#386): a single kill-switch/dry-run above this
   # layer's own mode. kill => install nothing; dry-run => gate + report what
   # would install, write nothing.
+  # autonomy-guard.sh resolves its own dir from CCC_STATE_DIR, so pin it to the
+  # queue's anchor (the distill.sh idiom). Without this the operator kill-switch
+  # at ~/.claude/state/autonomy.kill would be invisible whenever the bridge has
+  # scoped CCC_STATE_DIR to a memory audience — the guard must not fail open.
   local AUTONOMY_STATE="active" AUTONOMY_DRY=0
   if declare -f ccc_autonomy_state >/dev/null 2>&1; then
-    AUTONOMY_STATE="$(ccc_autonomy_state 2>/dev/null || echo active)"
+    AUTONOMY_STATE="$(CCC_STATE_DIR="$STATE_DIR" ccc_autonomy_state 2>/dev/null || echo active)"
   fi
   if [ "$AUTONOMY_STATE" = "kill" ]; then
     log "skip reason=autonomy-kill trigger=$TRIGGER"
     declare -f ccc_autonomy_record >/dev/null 2>&1 \
-      && ccc_autonomy_record autoinstall kill "$TRIGGER"
+      && CCC_STATE_DIR="$STATE_DIR" ccc_autonomy_record autoinstall kill "$TRIGGER"
     printf '{"mode":"auto","skipped":"autonomy-kill"}\n'
     return 0
   fi
   if [ "$AUTONOMY_STATE" = "dry-run" ]; then
     AUTONOMY_DRY=1
     declare -f ccc_autonomy_record >/dev/null 2>&1 \
-      && ccc_autonomy_record autoinstall dry-run "$TRIGGER"
+      && CCC_STATE_DIR="$STATE_DIR" ccc_autonomy_record autoinstall dry-run "$TRIGGER"
   fi
 
   # Fail closed if the install target is unsafe (symlinked leaf / non-dir).
