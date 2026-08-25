@@ -20,9 +20,16 @@ class Healthy(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path.startswith("/search"):
             q = parse_qs(urlparse(self.path).query).get("q", [""])[0]
-            body = json.dumps({"results": [
-                {"title": f"Result for {q}", "url": "https://example.org/a", "content": "snippet text", "engine": "stub"}
-            ], "unresponsive_engines": []}).encode()
+            if "array-mode" in q:
+                # A proxy error page / misconfigured instance: valid JSON,
+                # but not the object shape SearXNG promises.
+                body = json.dumps(["not", "an", "object"]).encode()
+            else:
+                body = json.dumps({"results": [
+                    {"title": f"Result for {q}", "url": "https://example.org/a", "content": "snippet text", "engine": "stub"},
+                    {"title": f"Second result for {q}", "url": "https://example.org/b", "content": "snippet two", "engine": "stub"},
+                    {"title": f"Third result for {q}", "url": "https://example.org/c", "content": "snippet three", "engine": "stub"},
+                ], "unresponsive_engines": []}).encode()
         else:
             body = b"{}"
         self.send_response(200); self.send_header("Content-Type", "application/json")
@@ -85,6 +92,20 @@ ok "search marks results as untrusted data" 'grep -qi "untrusted data" <<<"$out"
 
 out="$(SEARXNG_URL="http://127.0.0.1:$blocked_port,http://127.0.0.1:$healthy_port" python3 "$SEARCH" "fallback" 2>/dev/null)"
 ok "search falls through an engine-blocked SearXNG instance" 'grep -q "Result for fallback" <<<"$out"'
+
+# Regression: the env var is the documented DEFAULT — an explicit flag must
+# win (it used to be silently overridden on any node with the env set).
+out="$(SEARXNG_URL="http://127.0.0.1:$healthy_port" WEB_SEARCH_LIMIT=1 python3 "$SEARCH" "precedence" --limit 3 2>/dev/null)"
+ok "explicit --limit beats the WEB_SEARCH_LIMIT env default" 'grep -q "example.org/c" <<<"$out"'
+out="$(SEARXNG_URL="http://127.0.0.1:$healthy_port" WEB_SEARCH_LIMIT=1 python3 "$SEARCH" "envdefault" 2>/dev/null)"
+ok "WEB_SEARCH_LIMIT still applies as the default without a flag" 'grep -q "example.org/a" <<<"$out" && ! grep -q "example.org/b" <<<"$out"'
+
+# Regression: a 200 response whose JSON is an array crashed with an
+# AttributeError instead of degrading like every other instance failure.
+set +e
+SEARXNG_URL="http://127.0.0.1:$healthy_port" python3 "$SEARCH" "array-mode" >/dev/null 2>"$TMP/err"; rc=$?
+set -e
+ok "non-object SearXNG JSON degrades instead of crashing" '[ "$rc" = 69 ] && grep -q "non-object-response" "$TMP/err"'
 
 set +e
 SEARXNG_URL="http://127.0.0.1:$blocked_port" python3 "$SEARCH" "empty" >/dev/null 2>"$TMP/err"; rc=$?

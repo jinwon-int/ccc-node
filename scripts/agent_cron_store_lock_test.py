@@ -235,5 +235,57 @@ class CliAddUnderConcurrencyTest(unittest.TestCase):
         self.assertIn("existing", ids_in(store))
 
 
+class SameBootDeadHolderTest(unittest.TestCase):
+    """A dead same-boot holder is SURFACED, never auto-stolen.
+
+    The tested lock contract makes bootId change and the opt-in
+    lockTimeoutSec the only staleness sources — a wrong liveness guess must
+    not double-run a task. But a run killed mid-flight (SIGKILL/OOM) holds
+    its O_EXCL lock until reboot under the default lockTimeoutSec=0 with
+    nothing pointing at the cause; lock_status now reports holderAlive so an
+    operator/doctor can release deliberately.
+    """
+
+    def setUp(self) -> None:
+        self.dir = Path(tempfile.mkdtemp())
+        self.store = self.dir / "tasks.json"
+        seed(self.store, ["job"])
+        agent_cron.store = self.store
+
+    def _write_lock(self, pid: int) -> None:
+        path = agent_cron.lock_path("job")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(
+                {
+                    "bootId": agent_cron.boot_id(),
+                    "pid": pid,
+                    "acquiredAt": "2026-08-25T00:00:00+00:00",
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+    def _status(self) -> dict:
+        return agent_cron.lock_status(
+            "job", {"lockTimeoutSec": 0}, agent_cron.parse_dt("2026-08-25T00:05:00+00:00", "at")
+        )
+
+    def test_dead_holder_in_same_boot_stays_held_but_is_flagged(self) -> None:
+        child = subprocess.Popen(["true"])
+        child.wait()  # reaped by us -> the pid provably no longer exists
+        self._write_lock(child.pid)
+        status = self._status()
+        self.assertEqual(status["lockState"], "held")
+        self.assertIs(status["holderAlive"], False)
+
+    def test_live_holder_in_same_boot_reads_alive(self) -> None:
+        self._write_lock(os.getpid())
+        status = self._status()
+        self.assertEqual(status["lockState"], "held")
+        self.assertIs(status["holderAlive"], True)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

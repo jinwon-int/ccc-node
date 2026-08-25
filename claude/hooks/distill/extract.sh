@@ -85,9 +85,14 @@ build_redacted() {
     -e 's/Bearer [A-Za-z0-9._-]{20,}/Bearer [REDACTED]/g' \
   )"
 
-  # byte cap — keep the tail so most-recent context wins
-  if [ "${#redacted}" -gt "$max_bytes" ]; then
-    redacted="...[truncated $((${#redacted} - max_bytes)) bytes]...
+  # byte cap — keep the tail so most-recent context wins. Measure BYTES:
+  # ${#var} counts characters, and the fleet's Korean-heavy transcripts are
+  # ~3 bytes/char, so the character comparison let prompts grow ~3x past the
+  # byte budget before triggering (tail -c already cuts bytes).
+  local byte_len
+  byte_len="$(printf '%s' "$redacted" | wc -c | tr -d '[:space:]')"
+  if [ "$byte_len" -gt "$max_bytes" ]; then
+    redacted="...[truncated $((byte_len - max_bytes)) bytes]...
 $(printf '%s' "$redacted" | tail -c "$max_bytes")"
   fi
 

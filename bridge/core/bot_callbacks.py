@@ -282,8 +282,3 @@ class BotCallbackMixin:
             log_debug(user_id, "bot", reply)
             return
 
-        # Check if there's a pending question
-        pending = await self._session_manager.get_pending_question(user_id)
-        if pending:
-            await self._session_manager.clear_pending_question(user_id)
-            await query.edit_message_text(f"✅ Selected: {data}\n\nContinuing...")

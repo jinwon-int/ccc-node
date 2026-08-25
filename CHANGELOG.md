@@ -22,6 +22,43 @@ All notable changes to the Claude Code node harness. Dates are KST.
   per the i18n policy.
 
 ### Fixed
+- Review-sweep follow-up (LOW batch): bridge robustness — clean-repo
+  statusline parity in the health renderer (crush label + timezone-naive
+  `updated_at` no longer a TypeError), non-UTF-8 `.env` bytes and unknown
+  `LOG_LEVEL` no longer kill startup, the Honcho sink worker gains the
+  catch-all its local/wiki twins had, the push-notifier dedup map and the
+  app-server request mirror are bounded, the process-timeout handler
+  interrupts before closing, and redaction growth on a budget-full snapshot
+  is clamped instead of terminally failing extraction. Dead code removed:
+  the never-produced pending-question flow, `_maybe_resume`,
+  `force_cleanup_stale_turns` (with the deactivate diagnostic's
+  wall-vs-monotonic age fixed), `_is_priority_command`, the legacy
+  `SkillCandidate` model, three never-read polling config fields, and the
+  retired `Agent` tool-name display case.
+- Review-sweep follow-up (scripts/hooks): past-year Korean dates parse
+  instead of dying ambiguous (with impossible dates skipped), the memory
+  probe accepts the writer's documented `degraded` state, distill's
+  turn-window guard runs before use, transcript byte caps measure bytes
+  (not characters), an agent-cron lock whose same-boot holder pid no longer
+  exists is surfaced as `holderAlive: false` (the never-steal contract
+  stands; the condition is now visible instead of silent),
+  scoped Honcho refresh classifies rc=3 as no-content so the
+  #781 TTL cache engages, curator backups load usage inside the mutation
+  lock, valueless option values exit 2 instead of spinning nine scripts'
+  parse loops, `start.sh`'s env parser keeps quoted values with inline
+  comments intact, launchd `--install` fails loudly when both load APIs
+  fail, the fleet bridge probe names its interpreter (#1160 class) and
+  resolves the `~` fallback, the watchdog no longer leaks its lock fd into
+  the daemon, skill-manifest hashing pins `LC_ALL=C`, the placeholder
+  banner skips documentation examples, `web_search`/`web_fetch` flags beat
+  their env defaults and a non-object SearXNG reply degrades gracefully,
+  and the six documented `CCC_MEMORY_DISTILL_*` bounded-failure knobs are
+  listed in `.env.example`.
+- Test hermeticity: the zero-width scan case builds its fixture via python3
+  (locale-independent), killpg assertions accept an unreaped zombie
+  (containers without a PID-1 reaper), and the doctor boot-path suite stubs
+  `has_systemd` — the four suites that false-failed on systemd-less or
+  LANG-less machines now pass there while pinning the same contracts.
 - Full-repo code-review sweep: group-chat `/revert` now resolves the
   conversation-scoped session instead of the sender's DM (it browsed and
   truncated the wrong transcript in groups); the stale-message drop no longer

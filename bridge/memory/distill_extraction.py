@@ -426,10 +426,24 @@ def build_extraction_input(
         raise ValueError("snapshot must be a CodexTranscriptSnapshot")
     if not isinstance(trigger, DistillTrigger):
         raise ValueError("trigger must be a supported DistillTrigger")
-    messages = tuple(
-        ExtractionMessage(role=message.role, text=_redact_credentials(message.text))
-        for message in snapshot.messages
-    )
+    normalized = []
+    for message in snapshot.messages:
+        redacted = _redact_credentials(message.text)
+        original_budget = len(message.text.encode("utf-8"))
+        if len(redacted.encode("utf-8")) > original_budget:
+            # Redaction can grow the text (the 21-byte marker over a shorter
+            # credential span, e.g. AKIA+16 = 20 bytes). The snapshotters fill
+            # the per-message and total byte budgets exactly, so any net
+            # growth used to trip the model's byte caps and turn a valid
+            # snapshot into a terminal validation failure — exactly the
+            # success-shaped memory loss this pipeline exists to prevent.
+            # Trim back to the original byte budget; a marker cut mid-way is
+            # cosmetic and the credential is still gone.
+            redacted = redacted.encode("utf-8")[:original_budget].decode(
+                "utf-8", "ignore"
+            )
+        normalized.append(ExtractionMessage(role=message.role, text=redacted))
+    messages = tuple(normalized)
     return DistillExtractionInput(
         schema_version=DISTILL_EXTRACTION_SCHEMA_VERSION,
         provider=provider,

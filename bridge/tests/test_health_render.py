@@ -80,6 +80,23 @@ class HealthRenderTests(unittest.TestCase):
         lines = self._render(self.dir / "nope.json", provider="piri")
         self.assertIn("   Piri: degraded (health missing)", lines)
 
+    def test_crush_provider_uses_crush_label(self):
+        # Regression: the renderer's map predated the crush provider, so a
+        # crush node's --status labeled the agent line "Claude" while
+        # health.json reasons said "Crush:".
+        lines = self._render(self.dir / "nope.json", provider="crush")
+        self.assertIn("   Crush: degraded (health missing)", lines)
+
+    def test_timezone_naive_updated_at_degrades_instead_of_raising(self):
+        # Regression: a hand-edited health file without a UTC offset made
+        # aware-minus-naive datetime arithmetic raise TypeError, turning
+        # --status into a traceback instead of a status report.
+        data = self._fresh()
+        data["updated_at"] = "2026-07-15T11:59:55"  # no offset
+        lines = self._render(self._write(data))
+        self.assertTrue(lines, "renderer must produce status lines")
+        self.assertEqual(lines[0], "🟢 Bot status: available")
+
     def test_unreadable_file_reports_invalid(self):
         p = self.dir / "health.json"
         p.write_text("not json{{{", encoding="utf-8")

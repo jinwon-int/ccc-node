@@ -30,9 +30,6 @@ setattr(
     "config",
     types.SimpleNamespace(
         telegram_bot_token="test_token",
-        network_retry_attempts=3,
-        network_retry_delay=5,
-        polling_timeout=30,
         bot_data_dir=_Path("/tmp/test_bot"),
         logs_dir=_Path("/tmp/test_bot/logs"),
         session_store_path=_Path("/tmp/test_bot/sessions.json"),

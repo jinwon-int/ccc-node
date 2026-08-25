@@ -74,7 +74,9 @@ end_ns="$(python3 -c 'import time; print(time.monotonic_ns())')"
 elapsed_ms=$(( (end_ns - start_ns) / 1000000 ))
 stall_pid="$(cat "$stall_pid_file" 2>/dev/null || true)"
 ok "stalled local search is bounded while canonical memory still injects" '[ "$rc" = 0 ] && [ "$elapsed_ms" -lt 1500 ] && grep -q "Node memory: safe fact" <<<"$out" && jq -e ".hookSpecificOutput.additionalContext" >/dev/null <<<"$out"'
-ok "stalled local search process group is terminated and reaped" '[ -n "$stall_pid" ] && ! kill -0 "$stall_pid" 2>/dev/null'
+# Gone OR an unreaped zombie: in containers without a PID-1 reaper the killed
+# child stays Z (kill -0 still succeeds) even though the group kill did its job.
+ok "stalled local search process group is terminated and reaped" '[ -n "$stall_pid" ] && { ! kill -0 "$stall_pid" 2>/dev/null || [ "$(ps -o state= -p "$stall_pid" 2>/dev/null | tr -d "[:space:]")" = "Z" ]; }'
 
 usage_marker="$TMP/sessionstart-usage-recorded"
 rm -f "$usage_marker"

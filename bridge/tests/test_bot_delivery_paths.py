@@ -211,21 +211,6 @@ class HandleTextMessageTests(unittest.TestCase):
         self.assertNotIn("resume_list", session)
         self.assertEqual(bot.processed_texts, ["let's keep working"])
 
-    def test_pending_question_answer_is_consumed_without_enqueueing(self):
-        bot = self._harness()
-        asyncio.run(
-            bot._session_manager.set_pending_question(
-                "1:10", "q1", {"question": "pick one"}
-            )
-        )
-        update, reply = _update("option A")
-
-        asyncio.run(bot._handle_text_message(update, None))
-
-        self.assertTrue(reply.texts and reply.texts[0].startswith("✅ Answer received"))
-        self.assertEqual(bot.enqueued, 0)
-        self.assertIsNone(asyncio.run(bot._session_manager.get_pending_question("1:10")))
-
     def test_queue_overflow_replies_instead_of_processing(self):
         bot = self._harness(overflow=True)
         update, reply = _update("do more work")

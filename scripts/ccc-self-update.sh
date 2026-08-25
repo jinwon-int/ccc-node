@@ -292,7 +292,7 @@ if [ "$MODE" = "status" ]; then
   say "repo: $REPO (branch $BRANCH)"
   say "head: $(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo '?')"
   say "lock: $([ -d "$LOCK" ] && echo HELD || echo free)"
-  say "services file: $SERVICES_FILE $([ -f "$SERVICES_FILE" ] && echo "($(grep -cv '^[[:space:]]*\(#\|$\)' "$SERVICES_FILE" 2>/dev/null || echo 0) services)" || echo '(missing)')"
+  say "services file: $SERVICES_FILE $([ -f "$SERVICES_FILE" ] && echo "($(grep -cv '^[[:space:]]*\(#\|$\)' "$SERVICES_FILE" 2>/dev/null || true) services)" || echo '(missing)')"
   say "-- log (last 5) --"
   tail -5 "$LOG" 2>/dev/null
   exit 0

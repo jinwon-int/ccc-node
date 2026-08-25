@@ -73,49 +73,11 @@ class _StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
 
-class SkillCandidate(_StrictModel):
-    """Legacy schema-v1 create-only candidate.
-
-    Kept as an input adapter so already-produced v1 output remains readable.
-    New extraction uses the action-discriminated proposal classes below.
-    """
-
-    name: str = Field(min_length=1, max_length=64)
-    summary: str = Field(min_length=1, max_length=600)
-    reason: str = Field(min_length=1, max_length=600)
-    evidence_excerpt: str = Field(default="", max_length=200)
-    skill_md: str = Field(min_length=1, max_length=_MAX_SKILL_MD_BYTES)
-
-    @field_validator("name")
-    @classmethod
-    def _validate_name(cls, value: str) -> str:
-        if not _KEBAB_RE.fullmatch(value):
-            raise ValueError("name must be lowercase kebab-case")
-        return value
-
-    @field_validator("skill_md")
-    @classmethod
-    def _validate_skill_md(cls, value: str) -> str:
-        # Frontmatter is required so the draft can install (autoinstall lints it too).
-        if not value.startswith("---"):
-            raise ValueError("skill_md must start with YAML frontmatter")
-        for text in (value,):
-            if _DIRECTIVE_RE.search(text):
-                raise ValueError("skill_md contains an injected directive")
-            for pattern in _CREDENTIAL_PATTERNS:
-                if pattern.search(text):
-                    raise ValueError("skill_md contains a credential-like value")
-        return value
-
-    @field_validator("summary", "reason", "evidence_excerpt")
-    @classmethod
-    def _validate_free_text(cls, value: str) -> str:
-        if _DIRECTIVE_RE.search(value):
-            raise ValueError("field contains an injected directive")
-        for pattern in _CREDENTIAL_PATTERNS:
-            if pattern.search(value):
-                raise ValueError("field contains a credential-like value")
-        return value
+# The legacy schema-v1 SkillCandidate model used to live here "as an input
+# adapter", but v1 payloads are upgraded as raw dicts by
+# SkillCandidateOutput._upgrade_schema_v1 and validated by the proposal
+# classes below — the model was never instantiated, and its duplicated
+# validators could silently drift from SkillCreateProposal's.
 
 
 def _validate_public_text(value: str) -> str:
@@ -962,7 +924,6 @@ class SkillCandidateCollector:
 
 
 __all__ = [
-    "SkillCandidate",
     "SkillCreateProposal",
     "SkillPatchProposal",
     "SkillWriteFileProposal",

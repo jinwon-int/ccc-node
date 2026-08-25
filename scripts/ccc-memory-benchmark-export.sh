@@ -9,7 +9,7 @@ OUTPUT="jsonl"
 while [ $# -gt 0 ]; do
   case "$1" in
     --synthetic) MODE="synthetic"; shift ;;
-    --from-state) MODE="from-state"; STATE_DIR="${2:-}"; shift 2 ;;
+    --from-state) [ "$#" -ge 2 ] || { echo "--from-state requires a value" >&2; exit 2; }; MODE="from-state"; STATE_DIR="${2:-}"; shift 2 ;;
     --json) OUTPUT="json"; shift ;;
     --help|-h)
       echo "usage: $0 [--synthetic] [--from-state <state-dir>] [--json]"; exit 0 ;;

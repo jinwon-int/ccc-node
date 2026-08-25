@@ -122,7 +122,10 @@ def check_sensitive_perms(label, path, expected_max=0o600):
         add('수동필요', f'permissions:{label}', 'stat failed', 'inspect file permissions manually')
         return
     if mode & 0o077:
-        add('교정가능' if '교정가능' in counts else '위험', f'permissions:{label}', f'mode {mode:04o} allows group/other access', 'future --fix should chmod 0600 after backup')
+        # ('교정가능' if '교정가능' in counts else …) could never be true —
+        # counts only gains a key via add() itself — and the class would be
+        # invisible in the fixed-key summary anyway; say 위험 plainly.
+        add('위험', f'permissions:{label}', f'mode {mode:04o} allows group/other access', 'future --fix should chmod 0600 after backup')
     elif mode <= expected_max:
         add('정상', f'permissions:{label}', f'mode {mode:04o}', 'none')
     else:

@@ -87,12 +87,21 @@ bpath=$(printf '%s' "$cmd" | awk '{for(i=1;i<NF;i++) if($i=="--path") {print $(i
 [ -n "$root" ] || { echo "RUNTIME=-"; echo "AVAIL=no"; echo "UNIT=-"; exit 0; }
 echo "RUNTIME=$root"
 
-# availability — run start.sh as the account that owns the process
+# availability — run start.sh as the account that owns the process.
+# Name the interpreter (the #1160 defect class): shebang-exec'ing start.sh
+# fails on Termux where /bin/bash does not exist outside termux-exec
+# contexts, and the empty $st then paged a false "DOWN <node>". The su
+# fallback also used '~' inside single quotes, which never expands — use
+# $HOME resolved by the target account's login shell.
 st=""
 if [ "$(id -u)" = "$runuid" ]; then
-  st=$("$root/bridge/start.sh" --path "${bpath:-$HOME}" --status 2>/dev/null)
+  st=$(bash "$root/bridge/start.sh" --path "${bpath:-$HOME}" --status 2>/dev/null)
 else
-  st=$(su - "$runuser" -c "'$root/bridge/start.sh' --path '${bpath:-~}' --status" 2>/dev/null)
+  if [ -n "$bpath" ]; then
+    st=$(su - "$runuser" -c "bash '$root/bridge/start.sh' --path '$bpath' --status" 2>/dev/null)
+  else
+    st=$(su - "$runuser" -c "bash '$root/bridge/start.sh' --path \"\$HOME\" --status" 2>/dev/null)
+  fi
 fi
 # Three states, not two. `degraded` means the process is alive and serving but
 # start.sh has lost its bookkeeping (typically a missing pid file), so --stop

@@ -158,20 +158,6 @@ class SessionManager:
     async def clear_session(self, user_id: int) -> None:
         await self.store.delete(user_id)
 
-    async def set_pending_question(
-        self, user_id: int, question_id: str, question_data: Dict[str, Any]
-    ) -> None:
-        await self.update_session(
-            user_id, {"pending_question": {"id": question_id, **question_data}}
-        )
-
-    async def get_pending_question(self, user_id: int) -> Optional[Dict[str, Any]]:
-        session = await self.get_session(user_id)
-        return session.get("pending_question")
-
-    async def clear_pending_question(self, user_id: int) -> None:
-        await self.patch_session(user_id, remove_fields={"pending_question"})
-
     @staticmethod
     def _normalize_timestamp(value: datetime) -> datetime:
         if value.tzinfo is None:

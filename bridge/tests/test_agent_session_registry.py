@@ -222,47 +222,41 @@ def test_deactivate_token_mismatch_logs_warning(caplog: Any) -> None:
     assert "user=7" in log_message
 
 
-def test_force_cleanup_stale_turns_removes_zombies() -> None:
-    """Per #860: emergency cleanup removes turns older than threshold."""
+def test_deactivate_mismatch_warning_carries_finite_age() -> None:
+    """The mismatch diagnostic's age must come from the started_at clock.
 
-    registry = AgentSessionRegistry()
-    key = (7, 70)
-    session = object()
+    started_at is recorded with loop.time() (monotonic); the old wall-clock
+    subtraction printed ~1.7e9-second garbage ages, and the dead wall-clock
+    force_cleanup_stale_turns helper built on the same mixing was removed.
+    """
+    import asyncio
+    import logging as _logging
 
-    # Register a turn and abandon it (simulate zombie)
-    registry.register_active(key, session, started_at=1.0)
+    from telegram_bot.core.agent_session_registry import ActiveToken
 
-    # Verify it's counted as active
-    metrics = registry.metrics()
-    assert metrics.active_sessions == 1
+    async def scenario() -> str:
+        registry = AgentSessionRegistry()
+        key = (7, 70)
+        loop = asyncio.get_running_loop()
+        registry.register_active(key, object(), started_at=loop.time() - 5.0)
+        stale = ActiveToken(key=key, generation=999)
+        records: list[_logging.LogRecord] = []
 
-    # Force cleanup turns older than 0 seconds (removes everything)
-    cleaned = registry.force_cleanup_stale_turns(max_age_seconds=0.0)
+        handler = _logging.Handler()
+        handler.emit = records.append  # type: ignore[method-assign]
+        logger = _logging.getLogger("telegram_bot.core.agent_session_registry")
+        logger.addHandler(handler)
+        try:
+            assert registry.deactivate_if_same(stale) is False
+        finally:
+            logger.removeHandler(handler)
+        return next(
+            r.getMessage() for r in records if "token mismatch" in r.getMessage()
+        )
 
-    # Verify zombie was removed
-    assert cleaned == 1
-    metrics_after = registry.metrics()
-    assert metrics_after.active_sessions == 0
-
-
-def test_force_cleanup_respects_age_threshold() -> None:
-    """Per #860: cleanup only removes turns exceeding threshold."""
-    import time
-
-    registry = AgentSessionRegistry()
-    key = (7, 70)
-    session = object()
-
-    # Register a fresh turn
-    registry.register_active(key, session, started_at=time.time())
-
-    # Force cleanup with generous threshold
-    cleaned = registry.force_cleanup_stale_turns(max_age_seconds=3600.0)
-
-    # Verify fresh turn was preserved
-    assert cleaned == 0
-    metrics = registry.metrics()
-    assert metrics.active_sessions == 1
+    message = asyncio.run(scenario())
+    age = float(message.split("active_age=")[1].split("s")[0])
+    assert 0.0 <= age < 3600.0, message
 
 
 if __name__ == "__main__":

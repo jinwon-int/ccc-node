@@ -77,6 +77,20 @@ class DependencyPolicyTests(unittest.TestCase):
                 InstallMode.UNLOCKED,
             )
 
+    def test_non_utf8_env_defaults_to_locked_instead_of_crashing(self):
+        # Regression: a Windows-1252 curly quote pasted into .env made
+        # read_text raise UnicodeDecodeError (only OSError was caught) and
+        # the whole dependency bootstrap died with a traceback.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            project_env = root / "project.env"
+            project_env.write_bytes(b"CCC_DEPS_UNLOCKED=1 # \x93smart\x94 quote\n")
+
+            self.assertEqual(
+                resolve_install_mode(None, project_env, root / "missing"),
+                InstallMode.LOCKED,
+            )
+
     def test_fingerprint_matches_legacy_byte_contract_and_covers_mode(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)

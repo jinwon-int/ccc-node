@@ -118,32 +118,62 @@ def _resolve_relative(kind, n, rule, now):
 
 
 def _absolute_candidates(query, now):
-    """(dt, rule) for every absolute date mention; month-only → month END."""
+    """(dt, rule) for every absolute date mention; month-only → month END.
+
+    Year-less patterns are suppressed inside a year-qualified match's span:
+    "2024년 3월 15일" used to yield BOTH (2024,3,15) and — via _KO_MD's
+    one-character lookbehind seeing only the space — (now.year,3,15), so every
+    past-year query died as "ambiguous-absolute-dates" (the primary as_of use
+    case). An impossible calendar date is skipped instead of raising.
+    """
     out = []
+    year_spans = []
+
+    def _add(rule, span, factory):
+        try:
+            out.append((factory(), rule))
+        except ValueError:
+            return
+        if span is not None:
+            year_spans.append(span)
+
+    def _covered(span):
+        return any(span[0] >= s and span[1] <= e for s, e in year_spans)
+
     for m in _ISO_DATE.finditer(query):
         y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
-        out.append((_end_of_day(datetime(y, mo, d)), "abs:iso-date"))
+        _add("abs:iso-date", m.span(), lambda: _end_of_day(datetime(y, mo, d)))
     for m in _KO_YMD.finditer(query):
         y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
-        out.append((_end_of_day(datetime(y, mo, d)), "abs:ko-ymd"))
+        _add("abs:ko-ymd", m.span(), lambda: _end_of_day(datetime(y, mo, d)))
     for m in _KO_YM.finditer(query):
         y, mo = int(m.group(1)), int(m.group(2))
-        end = (_add_months(datetime(y, mo, 1), 1) - timedelta(seconds=1)).astimezone()
-        out.append((end, "abs:ko-ym"))
+        _add(
+            "abs:ko-ym",
+            m.span(),
+            lambda: (_add_months(datetime(y, mo, 1), 1) - timedelta(seconds=1)).astimezone(),
+        )
     for m in _KO_MD.finditer(query):
+        if _covered(m.span()):
+            continue
         mo, d = int(m.group(1)), int(m.group(2))
-        out.append((_end_of_day(datetime(now.year, mo, d)), "abs:ko-md"))
+        _add("abs:ko-md", None, lambda: _end_of_day(datetime(now.year, mo, d)))
     for m in _NUM_MD.finditer(query):
+        if _covered(m.span()):
+            continue
         mo, d = int(m.group(1)), int(m.group(2))
         if 1 <= mo <= 12 and 1 <= d <= 31:
-            out.append((_end_of_day(datetime(now.year, mo, d)), "abs:num-md"))
+            _add("abs:num-md", None, lambda: _end_of_day(datetime(now.year, mo, d)))
     for m in _EN_MONTH_YEAR.finditer(query):
         mo, y = _MONTH_EN[m.group(1).lower()], int(m.group(2))
-        end = (_add_months(datetime(y, mo, 1), 1) - timedelta(seconds=1)).astimezone()
-        out.append((end, "abs:en-month-year"))
+        _add(
+            "abs:en-month-year",
+            m.span(),
+            lambda: (_add_months(datetime(y, mo, 1), 1) - timedelta(seconds=1)).astimezone(),
+        )
     for m in _EN_YEAR.finditer(query):
         y = int(m.group(1))
-        out.append((_end_of_day(datetime(y, 12, 31)), "abs:en-year"))
+        _add("abs:en-year", m.span(), lambda: _end_of_day(datetime(y, 12, 31)))
     return out
 
 

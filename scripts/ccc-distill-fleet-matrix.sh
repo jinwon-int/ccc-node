@@ -46,10 +46,10 @@ PROBE_FILE=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --status)        STATUS_FILE="${2:-}"; shift 2 ;;
-    --path-probe)    PROBE_FILE="${2:-}"; shift 2 ;;
-    --target-commit) TARGET_COMMIT="${2:-}"; shift 2 ;;
-    --node-list)     KNOWN_NODES="${2:-}"; shift 2 ;;
+    --status) [ "$#" -ge 2 ] || { echo "--status requires a value" >&2; exit 2; }; STATUS_FILE="${2:-}"; shift 2 ;;
+    --path-probe) [ "$#" -ge 2 ] || { echo "--path-probe requires a value" >&2; exit 2; }; PROBE_FILE="${2:-}"; shift 2 ;;
+    --target-commit) [ "$#" -ge 2 ] || { echo "--target-commit requires a value" >&2; exit 2; }; TARGET_COMMIT="${2:-}"; shift 2 ;;
+    --node-list) [ "$#" -ge 2 ] || { echo "--node-list requires a value" >&2; exit 2; }; KNOWN_NODES="${2:-}"; shift 2 ;;
     -h|--help)       usage 0 ;;
     *)               printf 'unknown arg: %s\n' "$1" >&2; usage 2 ;;
   esac
@@ -93,7 +93,7 @@ split_file() {
           if (name != "") flush(name, host, n)
           delete lines
           n = 0
-          n2 = split(raw, parts, " ")
+          split(raw, parts, " ")
           name = parts[2]
           host = ""
           continue
@@ -116,11 +116,9 @@ split_file() {
   ' "$1"
 }
 
-# tmp file to merge records
+# tmp dir for per-node records
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
-MERGED="$TMP_DIR/merged.tsv"
-: > "$MERGED"
 
 declare -A HOST    # node -> host
 declare -A CAND    # node -> candidate path

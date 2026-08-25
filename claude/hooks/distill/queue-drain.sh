@@ -108,6 +108,9 @@ fi
 
 # ---- drain loop -----------------------------------------------------------
 TMP="$(mktemp "$STATE_DIR/.honcho-queue.XXXXXX.tmp")"
+# A crash mid-drain replays the worklist by design, but each replay minted a
+# fresh temp file and the orphans accumulated in the state dir forever.
+trap 'rm -f "$TMP"' EXIT
 DRAINED=0; FAILED=0; DROPPED=0; PROCESSED=0
 
 # Process up to MAX_BATCH lines; keep the rest in $TMP.

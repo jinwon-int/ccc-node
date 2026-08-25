@@ -95,6 +95,9 @@ fi
 while [ $# -gt 0 ]; do
     case "$1" in
         --path)
+            # `shift 2` with no value is a no-op (params untouched, status 1),
+            # so a bare `--path` used to spin this loop forever with no output.
+            [ "$#" -ge 2 ] || { echo "--path requires a value" >&2; exit 2; }
             export PROJECT_ROOT="$2"
             shift 2
             ;;
@@ -628,13 +631,30 @@ read_env_value() {
     [ -n "$line" ] || return 0
     local value="${line#*=}"
     value="$(printf '%s' "$value" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
-    value="${value%\"}"
-    value="${value#\"}"
-    value="${value%\'}"
-    value="${value#\'}"
-    # Strip trailing inline comment (common pattern: KEY=value # comment)
-    value="${value%% \#*}"
-    value="$(printf '%s' "$value" | sed -E 's/[[:space:]]+$//')"
+    case "$value" in
+        \"*\"*)
+            # Quoted value, possibly followed by an inline comment: keep the
+            # quoted span only. Quotes used to be stripped BEFORE the comment,
+            # so `KEY="v" # c` yielded `v"` — a trailing quote that poisoned
+            # every key read through this parser (proxy URL included, which
+            # then gets baked into systemd units).
+            value="${value#\"}"
+            value="${value%%\"*}"
+            ;;
+        \'*\'*)
+            value="${value#\'}"
+            value="${value%%\'*}"
+            ;;
+        *)
+            # Unquoted: strip the inline comment, then legacy edge trims.
+            value="${value%% \#*}"
+            value="$(printf '%s' "$value" | sed -E 's/[[:space:]]+$//')"
+            value="${value%\"}"
+            value="${value#\"}"
+            value="${value%\'}"
+            value="${value#\'}"
+            ;;
+    esac
     echo "$value"
 }
 

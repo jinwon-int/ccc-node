@@ -629,7 +629,11 @@ run cp "$SRC/claude/commands/"*.md "$CLAUDE_DIR/commands/"
 # unmodified, kept with a warning when the node edited it; skills whose names
 # are not in the repo set (node-local/autosave) are never touched.
 skill_tree_hash() { # <dir> — deterministic content hash over file contents
-  (cd "$1" && find . -type f -exec sha256sum {} + | sort -k2 | sha256sum | awk '{print $1}')
+  # LC_ALL=C: collation must not depend on the caller's locale, or the same
+  # pristine tree hashes differently between an operator shell (UTF-8) and
+  # cron/systemd (C) — flipping the manifest's prune/kept-modified verdicts
+  # (the hook-tree dedup above pins its sort the same way).
+  (cd "$1" && find . -type f -exec sha256sum {} + | LC_ALL=C sort -k2 | sha256sum | awk '{print $1}')
 }
 install_repo_skills_into() { # install_repo_skills_into <dest-root> <manifest> <source-root>...
   local dest_root="$1" manifest="$2"; shift 2
@@ -857,6 +861,12 @@ warn_placeholder_residue() {
   # placeholder left from a previous run is just as fatal to the memory pipeline.
   for f in "$HERMES_ROOT/honcho.json" ${SEEDED[@]+"${SEEDED[@]}"}; do
     [ -f "$f" ] || continue
+    case "$(basename "$f")" in
+      # Documentation ships literal <NODE>/<USER_PEER>/<PLACEHOLDER> as
+      # examples; flagging it on every fresh install buried the honcho.json
+      # warning this banner exists for.
+      tools-cheatsheet.md) continue ;;
+    esac
     if [ "$f" = "$HERMES_ROOT/honcho.json" ]; then          # dedupe when freshly seeded
       [ "$honcho_checked" = 1 ] && continue
       honcho_checked=1

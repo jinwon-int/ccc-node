@@ -1685,8 +1685,12 @@ def _command_backup(context, reason: str, dry_run: bool) -> dict[str, Any]:
             "eligible_skills": eligible,
             "keep": config["backup_keep"],
         }
-    usage = _load_usage(context, strict=True)
     with ownership._MutationLock(context):
+        # Load INSIDE the lock (the _command_run rule): a bump landing between
+        # an unlocked load and the locked snapshot made the backup embed a
+        # stale usage.json — and a later rollback to it restored pre-bump
+        # telemetry.
+        usage = _load_usage(context, strict=True)
         result = _snapshot(
             context, usage, reason=reason, now=now, keep=config["backup_keep"]
         )

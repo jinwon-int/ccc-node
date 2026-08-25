@@ -69,7 +69,10 @@ def _read_env_value(path: Path, key: str) -> str:
     value = ""
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
-    except OSError:
+    except (OSError, UnicodeError):
+        # A non-UTF-8 byte in a hand-edited .env must default to the locked
+        # flow, not abort the whole bootstrap with a traceback (the twin
+        # parser in runtime_config_check.py already catches UnicodeError).
         return ""
     for line in lines:
         match = assignment.match(line)

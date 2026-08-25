@@ -242,34 +242,53 @@ refresh_honcho() {
         private_tmp="$tmp.private"
         shared_tmp="$tmp.shared"
         legacy_tmp="$tmp.legacy"
+        # rc=3 is "server reached and answered with nothing" — classify it
+        # no-content exactly like the unscoped path below, or the #781 TTL
+        # freshness cache (which accepts ok|empty|no-content only) never
+        # engages for scoped nodes and every background refresh re-pays the
+        # full multi-call dialectic.
         if [ "$MEMORY_AUDIENCE" = "shared" ]; then
-          if honcho_chat "$honcho" "$ws--ccc-$HONCHO_SHARED_WORKSPACE_SCOPE" \
-            "$peer" "$target" "$token" "$rl" "$query" "$shared_tmp" "$tmp.err"; then
+          chat_rc=0
+          honcho_chat "$honcho" "$ws--ccc-$HONCHO_SHARED_WORKSPACE_SCOPE" \
+            "$peer" "$target" "$token" "$rl" "$query" "$shared_tmp" "$tmp.err" || chat_rc=$?
+          if [ "$chat_rc" = 0 ]; then
             {
               printf '### Honcho shared audience\n'
               cat "$shared_tmp"
             } > "$tmp"
             mv "$tmp" "$CACHE/honcho.txt"
+          elif [ "$chat_rc" = 3 ]; then
+            status="no-content"; err="$(tr '\n' ' ' < "$tmp.err" | cut -c1-240)"
           else
             status="error"; err="$(tr '\n' ' ' < "$tmp.err" | cut -c1-240)"
           fi
-        elif honcho_chat "$honcho" "$ws--ccc-$HONCHO_WORKSPACE_SCOPE" \
-          "$peer" "$target" "$token" "$rl" "$query" "$private_tmp" "$tmp.err" \
-          && honcho_chat "$honcho" "$ws--ccc-$HONCHO_SHARED_WORKSPACE_SCOPE" \
-          "$peer" "$target" "$token" "$rl" "$query" "$shared_tmp" "$tmp.err" \
-          && honcho_chat "$honcho" "$ws" "$peer" "$target" "$token" "$rl" \
-          "$query" "$legacy_tmp" "$tmp.err"; then
-          {
-            printf '### Honcho private audience\n'
-            cat "$private_tmp"
-            printf '\n\n### Honcho shared audience\n'
-            cat "$shared_tmp"
-            printf '\n\n### Honcho private-only legacy\n'
-            cat "$legacy_tmp"
-          } > "$tmp"
-          mv "$tmp" "$CACHE/honcho.txt"
         else
-          status="error"; err="$(tr '\n' ' ' < "$tmp.err" | cut -c1-240)"
+          chat_rc=0
+          honcho_chat "$honcho" "$ws--ccc-$HONCHO_WORKSPACE_SCOPE" \
+            "$peer" "$target" "$token" "$rl" "$query" "$private_tmp" "$tmp.err" || chat_rc=$?
+          if [ "$chat_rc" = 0 ]; then
+            honcho_chat "$honcho" "$ws--ccc-$HONCHO_SHARED_WORKSPACE_SCOPE" \
+              "$peer" "$target" "$token" "$rl" "$query" "$shared_tmp" "$tmp.err" || chat_rc=$?
+          fi
+          if [ "$chat_rc" = 0 ]; then
+            honcho_chat "$honcho" "$ws" "$peer" "$target" "$token" "$rl" \
+              "$query" "$legacy_tmp" "$tmp.err" || chat_rc=$?
+          fi
+          if [ "$chat_rc" = 0 ]; then
+            {
+              printf '### Honcho private audience\n'
+              cat "$private_tmp"
+              printf '\n\n### Honcho shared audience\n'
+              cat "$shared_tmp"
+              printf '\n\n### Honcho private-only legacy\n'
+              cat "$legacy_tmp"
+            } > "$tmp"
+            mv "$tmp" "$CACHE/honcho.txt"
+          elif [ "$chat_rc" = 3 ]; then
+            status="no-content"; err="$(tr '\n' ' ' < "$tmp.err" | cut -c1-240)"
+          else
+            status="error"; err="$(tr '\n' ' ' < "$tmp.err" | cut -c1-240)"
+          fi
         fi
       else
         honcho_chat "$honcho" "$ws" "$peer" "$target" "$token" "$rl" \

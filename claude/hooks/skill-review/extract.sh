@@ -46,8 +46,12 @@ build_redacted() {
     -e 's/-----BEGIN [A-Z ]*PRIVATE KEY-----/[REDACTED:pem-begin]/g' \
     -e 's/Bearer [A-Za-z0-9._-]{20,}/Bearer [REDACTED]/g' \
     -e 's/((password|passwd|secret|token|api[_-]?key|authorization)[=:[:space:]"'"'"']+)[^[:space:]"'"'"'&|;]+/\1[REDACTED]/gI')"
-  if [ "${#redacted}" -gt "$max_bytes" ]; then
-    redacted="...[truncated $((${#redacted} - max_bytes)) bytes]...
+  # Measure BYTES, not characters (same fix as distill/extract.sh): the
+  # character comparison let Korean-heavy content grow ~3x past the budget.
+  local byte_len
+  byte_len="$(printf '%s' "$redacted" | wc -c | tr -d '[:space:]')"
+  if [ "$byte_len" -gt "$max_bytes" ]; then
+    redacted="...[truncated $((byte_len - max_bytes)) bytes]...
 $(printf '%s' "$redacted" | tail -c "$max_bytes")"
   fi
   printf '%s' "$redacted"

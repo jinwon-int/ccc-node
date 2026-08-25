@@ -155,6 +155,14 @@ class PushNotifier:
                 continue
 
             self._sent_times = [t for t in self._sent_times if now - t < 60]
+            # Prune the dedup map with the same discipline: entries were only
+            # ever compared against the window, never removed, so a long-lived
+            # bridge accumulated one entry per distinct notification forever.
+            self._recent = {
+                k: t
+                for k, t in self._recent.items()
+                if now - t < _DEDUP_WINDOW_SECONDS
+            }
             if len(self._sent_times) >= self.max_per_minute:
                 logger.warning("Push rate limit reached (%d/min); deferring", self.max_per_minute)
                 return

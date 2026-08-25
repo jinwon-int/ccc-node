@@ -60,6 +60,14 @@ class SetupLoggingLevelTest(unittest.TestCase):
             and not isinstance(h, logging.FileHandler)
         ]
 
+    def test_unknown_log_level_falls_back_to_info_instead_of_crashing(self):
+        # Regression: LOG_LEVEL is a documented .env knob and setup_logging is
+        # called before __main__'s try/except — `getattr(logging, "TRACE")`
+        # used to kill startup with a bare AttributeError.
+        self._settings.log_level = "trace"
+        setup_logging(self._settings)
+        self.assertLessEqual(self._root.level, logging.INFO)
+
     def test_root_passes_info_and_console_stays_warning(self):
         setup_logging(self._settings)
         # Root must pass INFO+ so the INFO file handler actually receives records.

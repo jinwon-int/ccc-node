@@ -220,7 +220,16 @@ def _is_mutable_ops_fact(text):
 # #1010 proposal 2 — volatile `observation` class: searchable via recall but
 # never injected into the snapshot, never G3-flagged, and auto-closed once
 # older than NUNCHI_OBSERVATION_TTL_DAYS (default 7; <=0 disables the sweep).
-_OBSERVATION_TTL_DAYS = float(os.environ.get("NUNCHI_OBSERVATION_TTL_DAYS", "7"))
+def _float_env(name, default):
+    """Malformed env must not turn every nunchi command into an import-time
+    traceback (this runs before argument parsing, so even `snapshot` died)."""
+    try:
+        return float(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return float(default)
+
+
+_OBSERVATION_TTL_DAYS = _float_env("NUNCHI_OBSERVATION_TTL_DAYS", "7")
 
 
 def _close_expired_observations(c):
@@ -993,6 +1002,10 @@ def review(fact_id=None, clear=False):
             c.execute("UPDATE peer_facts SET review=0 WHERE id=?", (fact_id,))
             c.commit()
             print(f"#{fact_id} review flag cleared")
+        else:
+            # The id-only form used to exit silently, contradicting the
+            # printed hint; say what the caller probably meant.
+            print(f"no action for #{fact_id} — to clear: nunchi.py review {fact_id} --clear")
         return
     rows = c.execute(
         "SELECT id,observed,kind,fact,source_rank FROM peer_facts"
