@@ -28,7 +28,7 @@ cron_store="$TMP/crontab"
 piri_sessions="$home/.piri/agent/sessions"
 mkdir -p "$hooks/nunchi" "$state" "$codex_home/sessions" "$piri_sessions" \
   "$home/.claude/projects" "$home/.local/bin" "$nunchi_home" "$fake_bin"
-cp "$ROOT"/claude/hooks/nunchi/{codex-loader.py,nunchi.py,judge-batch.py,codex-feed.sh,piri-feed.sh,ingest-cron.sh,bench.sh,bench-qset.tsv,sessionstart.sh,mempalace-refresh.sh} "$hooks/nunchi/"
+cp "$ROOT"/claude/hooks/nunchi/{codex-loader.py,nunchi.py,judge-batch.py,judge-verdict.schema.json,codex-feed.sh,piri-feed.sh,ingest-cron.sh,bench.sh,bench-qset.tsv,sessionstart.sh,mempalace-refresh.sh} "$hooks/nunchi/"
 cp "$ROOT/claude/hooks/scan-injection.sh" "$hooks/scan-injection.sh"
 chmod 700 "$hooks/nunchi/codex-loader.py" "$hooks/nunchi/nunchi.py" "$hooks/scan-injection.sh"
 chmod 755 "$hooks/nunchi"/*.sh
