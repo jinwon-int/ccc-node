@@ -19,8 +19,8 @@ EVIDENCE=""
 NODE_LIST="dungae,nosuk,soonwook,gongyung,daegyo"
 while [ $# -gt 0 ]; do
   case "$1" in
-    --evidence|--status) EVIDENCE="${2:-}"; shift 2 ;;
-    --node-list) NODE_LIST="${2:-}"; shift 2 ;;
+    --evidence|--status) [ "$#" -ge 2 ] || { echo "--evidence/--status requires a value" >&2; exit 2; }; EVIDENCE="${2:-}"; shift 2 ;;
+    --node-list) [ "$#" -ge 2 ] || { echo "--node-list requires a value" >&2; exit 2; }; NODE_LIST="${2:-}"; shift 2 ;;
     --json) shift ;;
     -h|--help) usage 0 ;;
     *) printf 'unknown arg: %s\n' "$1" >&2; usage 2 ;;

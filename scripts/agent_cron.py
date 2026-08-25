@@ -267,6 +267,26 @@ def lock_age(lock, at):
     return max(0, int((at - acquired).total_seconds()))
 
 
+def _holder_process_gone(pid):
+    """True only when the recorded holder pid provably no longer exists.
+
+    Observability only: the tested lock contract makes bootId change and the
+    opt-in lockTimeoutSec the ONLY staleness sources (a same-boot lock is
+    never stolen, even from a SIGKILL'd holder — a wrong liveness guess must
+    not double-run a task). This surfaces the dead-holder condition in
+    lock_status output so an operator/doctor can release deliberately.
+    """
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except OSError:
+        return False
+    return False
+
+
 def lock_status(task_id, task, at):
     path, lock = read_lock(task_id)
     base = {'lockPath': str(lock_path(task_id)), 'lockState': 'free'}
@@ -281,8 +301,16 @@ def lock_status(task_id, task, at):
         stale = True
     if not stale and not quarantined and timeout and age is not None and age > timeout:
         stale = True
+    holder_alive = None
+    if lock.get('bootId') and current_boot and lock.get('bootId') == current_boot:
+        holder_alive = not _holder_process_gone(lock.get('pid'))
     state = 'stale' if stale else ('persist-failed' if quarantined else 'held')
     base.update({'lockState': state, 'holder': lock, 'lockAgeSec': age, 'lockTimeoutSec': timeout})
+    if holder_alive is not None:
+        # A held lock whose same-boot holder pid no longer exists will never
+        # be released by that holder; surface it so `lock --action release`
+        # or a lockTimeoutSec can be applied deliberately.
+        base['holderAlive'] = holder_alive
     return base
 
 

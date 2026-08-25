@@ -7,7 +7,7 @@ MODE="local"
 OUTPUT="text"
 while [ $# -gt 0 ]; do
   case "$1" in
-    --mode) MODE="${2:-local}"; shift 2 ;;
+    --mode) [ "$#" -ge 2 ] || { echo "--mode requires a value" >&2; exit 2; }; MODE="${2:-local}"; shift 2 ;;
     --local) MODE="local"; shift ;;
     --remote) MODE="remote"; shift ;;
     --json) OUTPUT="json"; shift ;;

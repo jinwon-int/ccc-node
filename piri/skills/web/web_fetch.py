@@ -87,7 +87,13 @@ def _request(payload: dict[str, object]) -> dict[str, object] | None:
 
 def main() -> int:
     args: list[str] = []
-    max_chars = 6000
+    # Env is the DEFAULT (per the docstring); an explicit --max-chars flag
+    # wins. The env used to be applied after flag parsing, silently
+    # overriding the flag on any node with WEB_FETCH_MAX_CHARS set.
+    try:
+        max_chars = int(os.environ.get("WEB_FETCH_MAX_CHARS", 6000))
+    except ValueError:
+        max_chars = 6000
     argv = sys.argv[1:]
     i = 0
     while i < len(argv):
@@ -100,10 +106,7 @@ def main() -> int:
         else:
             args.append(argv[i])
             i += 1
-    try:
-        max_chars = max(200, min(int(os.environ.get("WEB_FETCH_MAX_CHARS", max_chars)), 20000))
-    except ValueError:
-        max_chars = 6000
+    max_chars = max(200, min(max_chars, 20000))
     if not args:
         print("usage: web_fetch.py <url> [--max-chars N]", file=sys.stderr)
         return 64

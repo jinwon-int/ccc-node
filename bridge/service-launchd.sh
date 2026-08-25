@@ -56,14 +56,17 @@ while [ $# -gt 0 ]; do
             shift
             ;;
         --project-root)
+            [ "$#" -ge 2 ] || { echo "--project-root requires a value" >&2; exit 2; }
             PROJECT_ROOT_ARG="$2"
             shift 2
             ;;
         --proxy-url)
+            [ "$#" -ge 2 ] || { echo "--proxy-url requires a value" >&2; exit 2; }
             PROXY_URL_ARG="$2"
             shift 2
             ;;
         --caller)
+            [ "$#" -ge 2 ] || { echo "--caller requires a value" >&2; exit 2; }
             CALLER="$2"
             shift 2
             ;;
@@ -229,7 +232,13 @@ PLIST
         echo "🚀 Bot started via launchd"
     else
         echo "⚠️  launchctl bootstrap failed, trying legacy API..."
-        "$LAUNCHCTL" load -w "$PLIST_FILE"
+        if ! "$LAUNCHCTL" load -w "$PLIST_FILE"; then
+            # Both APIs failed: exit nonzero like the systemd twin does on
+            # `enable --now` failure — this used to fall through to the wait
+            # loop and report success with no service loaded.
+            echo "❌ launchctl load failed too — service is NOT installed" >&2
+            exit 1
+        fi
     fi
     # Wait for process to start (up to 5 seconds)
     echo "⏳ Waiting for bot to initialize..."

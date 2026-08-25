@@ -55,6 +55,11 @@ CASES_HIT = [
     ("last year baseline", iso(2025, 12, 31), "en:lastyear"),
     # absolute beats relative when both appear
     ("지난주에 2026-03-15 문서를 봤다", iso(2026, 3, 15), "abs:iso-date"),
+    # Regression: a PAST-year full date used to double-match (_KO_MD also hit
+    # the "3월 15일" substring with now.year) and die as ambiguous — asking
+    # about a previous year is the primary as_of use case.
+    ("2024년 3월 15일에 뭐라 했지", iso(2024, 3, 15), "abs:ko-ymd"),
+    ("2024-11-02 회고", iso(2024, 11, 2), "abs:iso-date"),
 ]
 
 CASES_MISS = [
@@ -67,6 +72,9 @@ CASES_MISS = [
     ("머지는 항상 스쿼시", "no-time-reference"),
     ("2026-03-15와 2026-04-01 둘 다", "ambiguous-absolute-dates"),
     ("99999일 전", "relative-out-of-range"),
+    # An impossible calendar date is skipped, not a crash; with no other
+    # time reference the query falls through to no-time-reference.
+    ("2월 30일 메모", "no-time-reference"),
 ]
 
 

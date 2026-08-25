@@ -347,7 +347,7 @@ def mempalace_refresh_probe(path: Path, now: int) -> dict[str, object]:
     finished = doc.get("finished_at")
     # bool is a subclass of int in Python; readiness accepts exact integers only.
     if (
-        state not in {"running", "ok", "error"}
+        state not in {"running", "ok", "degraded", "error"}
         or provider not in {"claude", "codex", "piri"}
         or type(exit_code) is not int
         or type(started) is not int
@@ -357,6 +357,10 @@ def mempalace_refresh_probe(path: Path, now: int) -> dict[str, object]:
     valid_state = (
         (state == "running" and started > 0 and finished == 0 and exit_code == -1)
         or (state == "ok" and 0 < started <= finished and exit_code == 0)
+        # mempalace-refresh.sh writes `degraded 0` on the documented #865
+        # MemPalace-absent, peer-facts-only path; the scoped validator
+        # already accepts it and this probe used to call it "invalid".
+        or (state == "degraded" and 0 < started <= finished and exit_code == 0)
         or (
             state == "error"
             and 0 < started <= finished

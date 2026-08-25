@@ -77,6 +77,18 @@ ok "memory check reports healthy nunchi and MemPalace scalars" '[ "$rc" = 0 ] &&
 '\'' >/dev/null <<<"$out"'
 ok "memory readiness JSON never exposes snapshot, fact or refresh bodies" '! grep -q "PROBE_SECRET_BODY\|PROBE_SECRET_FACT\|PROBE_SECRET_REFRESH" <<<"$out"'
 
+# Regression: mempalace-refresh.sh writes `state=degraded, exit_code=0` on the
+# documented #865 MemPalace-absent path; the unscoped probe used to reject the
+# record as refresh-invalid (file corrupt) instead of reporting the state.
+printf '%s\n' '{"schema":"ccc.nunchi.mempalace-refresh.v1","provider":"codex","state":"degraded","exit_code":0,"started_at":180,"finished_at":190}' > "$probe_nunchi/mempalace-refresh.status.json"
+out="$(HOME="$probe_home" CCC_CLAUDE_DIR="$probe_claude" CCC_STATE_DIR="$probe_state" \
+  CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" \
+  CCC_MEMORY_CHECK_NOW_EPOCH=200 CCC_NUNCHI_MEMPALACE_REPAIR_STATUS_TEXT="$repair_ok" \
+  CCC_NUNCHI_CRONTAB_TEXT="$probe_cron" bash "$ROOT/scripts/ccc-memory-check.sh" --json 2>&1)"
+ok "degraded-by-design refresh state is reported, not called invalid" \
+  'jq -e ".mempalace.refresh.status == \"degraded\"" >/dev/null <<<"$out"'
+printf '%s\n' '{"schema":"ccc.nunchi.mempalace-refresh.v1","provider":"codex","state":"ok","exit_code":0,"started_at":180,"finished_at":190,"ignored":"PROBE_SECRET_REFRESH"}' > "$probe_nunchi/mempalace-refresh.status.json"
+
 # #1174: since #1081/#1140 the installers render managed entries with a
 # ` gen=h_<hex12>` stamp suffix; the probe must still recognize and count
 # them (its marker regex used to be end-anchored at `# nunchi:#816`, which

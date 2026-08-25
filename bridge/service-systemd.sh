@@ -84,14 +84,17 @@ while [ $# -gt 0 ]; do
             shift
             ;;
         --project-root)
+            [ "$#" -ge 2 ] || { echo "--project-root requires a value" >&2; exit 2; }
             PROJECT_ROOT_ARG="$2"
             shift 2
             ;;
         --proxy-url)
+            [ "$#" -ge 2 ] || { echo "--proxy-url requires a value" >&2; exit 2; }
             PROXY_URL_ARG="$2"
             shift 2
             ;;
         --caller)
+            [ "$#" -ge 2 ] || { echo "--caller requires a value" >&2; exit 2; }
             CALLER="$2"
             shift 2
             ;;

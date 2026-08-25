@@ -113,7 +113,7 @@ fi
 check_python_version() {
     if [ $SILENT_MODE -eq 0 ]; then
         echo -e "${CYAN}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-        echo -e "${CYAN}${BOLD}Step 1 of 3: System Requirements Check${NC}"
+        echo -e "${CYAN}${BOLD}Step 1 of 4: System Requirements Check${NC}"
         echo -e "${CYAN}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
         echo ""
     fi
@@ -262,10 +262,9 @@ write_env_file() {
         fi
     fi
 
-    # Copy from .env.example if it doesn't exist
-    if [ ! -f "$ENV_FILE" ] && [ -f "$ENV_EXAMPLE" ]; then
-        cp "$ENV_EXAMPLE" "$ENV_FILE"
-    fi
+    # (No .env.example seed here: the block below truncates and fully
+    # rewrites $ENV_FILE, so a copied example never survived to the result —
+    # the wizard's answers are the whole generated file.)
 
     # Write configuration
     {
@@ -314,7 +313,7 @@ write_env_file() {
 
 interactive_config() {
     echo -e "${CYAN}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo -e "${CYAN}${BOLD}Step 2 of 3: Bot Configuration${NC}"
+    echo -e "${CYAN}${BOLD}Step 2 of 4: Bot Configuration${NC}"
     echo -e "${CYAN}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     echo ""
 

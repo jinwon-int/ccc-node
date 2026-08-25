@@ -14,7 +14,7 @@ QUERY=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --json) OUTPUT="json"; shift ;;
-    --query) QUERY="${2:-}"; shift 2 ;;
+    --query) [ "$#" -ge 2 ] || { echo "--query requires a value" >&2; exit 2; }; QUERY="${2:-}"; shift 2 ;;
     --help|-h)
       echo "usage: $0 [--json] [--query <query>]"; exit 0 ;;
     *) QUERY="${QUERY:+$QUERY }$1"; shift ;;
@@ -40,6 +40,13 @@ check_json="{}"
 if [ -n "$CHECK_TOOL" ]; then
   check_json="$(CCC_STATE_DIR="$STATE_DIR" CCC_MEMORY_CACHE_DIR="$CACHE" CCC_MEMORY_DIR="$MEMORY_DIR" "$CHECK_TOOL" --json 2>/dev/null || printf '{}')"
 fi
+# Unpredictable private temp path + cleanup on any exit: the old fixed
+# ${TMPDIR}/ccc-memory-explain.$$.json name was symlink-followable on a
+# shared /tmp and leaked on interrupt (validate-harness.sh documents the
+# hostile-shared-/tmp incident class).
+EXPLAIN_OUT="$(mktemp "${TMPDIR:-/tmp}/ccc-memory-explain.XXXXXX.json")"
+trap 'rm -f "$EXPLAIN_OUT"' EXIT
+
 jq -n \
   --arg query "$QUERY" \
   --arg retrieval "${CCC_MEMORY_RETRIEVAL:-fts-rerank}" \
@@ -54,10 +61,10 @@ jq -n \
   --argjson max_honcho "${CCC_HONCHO_MAX_BYTES:-4000}" \
   --argjson max_local "${CCC_LOCAL_MEMORY_MAX_BYTES:-3000}" \
   '{ok:true, query:$query, retrievalMode:$retrieval, paths:{state_dir:$state_dir,cache_dir:$cache_dir,memory_dir:$memory_dir}, budgets:{total:$max_total,built_in:$max_mem,wiki:$max_wiki,honcho:$max_honcho,local_hot:$max_local}, cache:$check, search:$search, safety:{read_only:true, no_network:true, raw_secret_output:false, retrieved_context_is_untrusted:true}}' \
-  > "${TMPDIR:-/tmp}/ccc-memory-explain.$$.json"
+  > "$EXPLAIN_OUT"
 if [ "$OUTPUT" = "json" ]; then
-  cat "${TMPDIR:-/tmp}/ccc-memory-explain.$$.json"
+  cat "$EXPLAIN_OUT"
 else
-  jq -r '"# ccc memory explain\n\n- query: \(.query)\n- retrievalMode: \(.retrievalMode)\n- state: \(.paths.state_dir)\n- cache: \(.paths.cache_dir)\n- total budget: \(.budgets.total) bytes\n- wiki status: \(.cache.wiki.status // "unknown")\n- honcho status: \(.cache.honcho.status // "unknown")\n\n## Top results\n" + ((.search.results // []) | to_entries | map("\(.key+1). [\(.value.source)] \(.value.path) score=\(.value.score // "n/a")") | join("\n"))' "${TMPDIR:-/tmp}/ccc-memory-explain.$$.json"
+  jq -r '"# ccc memory explain\n\n- query: \(.query)\n- retrievalMode: \(.retrievalMode)\n- state: \(.paths.state_dir)\n- cache: \(.paths.cache_dir)\n- total budget: \(.budgets.total) bytes\n- wiki status: \(.cache.wiki.status // "unknown")\n- honcho status: \(.cache.honcho.status // "unknown")\n\n## Top results\n" + ((.search.results // []) | to_entries | map("\(.key+1). [\(.value.source)] \(.value.path) score=\(.value.score // "n/a")") | join("\n"))' "$EXPLAIN_OUT"
 fi
-rm -f "${TMPDIR:-/tmp}/ccc-memory-explain.$$.json"
+rm -f "$EXPLAIN_OUT"

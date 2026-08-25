@@ -88,7 +88,11 @@ if command -v termux-wake-lock >/dev/null 2>&1; then
 fi
 
 if [ -x "$START" ]; then
-  bash "$START" --path "$HOME" --daemon >> "$LOG" 2>&1
+  # Close the flock fd for the child: the daemonized supervisor/bot inherited
+  # fd 9 and held the "start lock" for its whole life, so a healthy running
+  # bridge logged "another start is in flight" whenever pgrep missed it
+  # (a2a-termux-native-worker.sh closes its lock fd the same way).
+  bash "$START" --path "$HOME" --daemon >> "$LOG" 2>&1 9>&-
   echo "[$(ts)] bridge watchdog: start.sh exit=$?" >> "$LOG"
 else
   echo "[$(ts)] bridge watchdog: $START not found/executable" >> "$LOG"

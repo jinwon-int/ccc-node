@@ -331,7 +331,9 @@ def shell_join(args: list[str]) -> str:
     return " ".join(shlex.quote(arg) for arg in args)
 
 
-def load_and_validate(env_file: str) -> tuple[dict[str, str], Path, list[str], dict[str, object]]:
+def load_and_validate(
+    env_file: str,
+) -> tuple[dict[str, str], Path, list[str], dict[str, object], dict[str, str]]:
     path = Path(env_file)
     if not path.is_file():
         raise ConfigError(f"env file not found: {env_file}")

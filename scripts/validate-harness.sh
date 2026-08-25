@@ -449,11 +449,14 @@ done
 
 # 5) skill + agent frontmatter (must start with --- and carry name: + description:)
 say "== frontmatter =="
-fm_check() { # <file>
-  local f="$1"
-  head -1 "$f" | grep -q '^---' || { err "no frontmatter: $f"; return; }
-  awk 'NR>1 && /^---/{exit} {print}' "$f" | grep -q '^name:'        || err "no name: in $f"
-  awk 'NR>1 && /^---/{exit} {print}' "$f" | grep -q '^description:' || err "no description: in $f"
+fm_check() { # <file> — nonzero on any finding so the caller's `&& say ok`
+  # line stays truthful (err only sets fail=1 and returns 0, so a bare
+  # `return` after it used to print a contradictory "ok" after the FAIL).
+  local f="$1" bad=0
+  head -1 "$f" | grep -q '^---' || { err "no frontmatter: $f"; return 1; }
+  awk 'NR>1 && /^---/{exit} {print}' "$f" | grep -q '^name:'        || { err "no name: in $f"; bad=1; }
+  awk 'NR>1 && /^---/{exit} {print}' "$f" | grep -q '^description:' || { err "no description: in $f"; bad=1; }
+  return "$bad"
 }
 for f in claude/skills/*/SKILL.md skills/shared/*/SKILL.md; do [ -f "$f" ] && fm_check "$f" && say "  ok $f"; done
 for f in codex/skills/*/SKILL.md; do [ -f "$f" ] && fm_check "$f" && say "  ok $f"; done

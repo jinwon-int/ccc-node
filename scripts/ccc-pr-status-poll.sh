@@ -89,7 +89,9 @@ CHECK_STATUS_JQ='
 
 cmd_status() {
   local n_repos
-  n_repos="$(grep -cv '^[[:space:]]*\(#\|$\)' "$REPOS_FILE" 2>/dev/null || echo 0)"
+  # `grep -c` prints its 0 AND exits 1 on no matches, so `|| echo 0` used to
+  # produce the two-line string "0\n0" and break the -eq test on every tick.
+  n_repos="$(grep -cv '^[[:space:]]*\(#\|$\)' "$REPOS_FILE" 2>/dev/null)" || n_repos=0
   say "repos file: $REPOS_FILE ($( [ -f "$REPOS_FILE" ] && echo "$n_repos configured" || echo missing ))"
   say "state file: $STATE_FILE ($( [ -f "$STATE_FILE" ] && echo present || echo none ))"
   say "last run:"
@@ -105,7 +107,7 @@ cmd_run() {
   fi
 
   local n_repos
-  n_repos="$(grep -cv '^[[:space:]]*\(#\|$\)' "$REPOS_FILE" 2>/dev/null || echo 0)"
+  n_repos="$(grep -cv '^[[:space:]]*\(#\|$\)' "$REPOS_FILE" 2>/dev/null)" || n_repos=0
   if [ ! -f "$REPOS_FILE" ] || [ "$n_repos" -eq 0 ]; then
     log "skip reason=no-repos-file path=$REPOS_FILE"
     say "pr-status-poll: no repos configured ($REPOS_FILE missing/empty); nothing to track" >&2

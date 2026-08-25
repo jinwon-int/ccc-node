@@ -30,7 +30,13 @@ TIMEOUT = 15
 
 def main() -> int:
     args: list[str] = []
-    limit = 5
+    # Env is the DEFAULT (per the docstring); an explicit --limit flag wins.
+    # The env used to be applied after flag parsing, silently overriding the
+    # flag on any node with WEB_SEARCH_LIMIT set.
+    try:
+        limit = int(os.environ.get("WEB_SEARCH_LIMIT", 5))
+    except ValueError:
+        limit = 5
     argv = sys.argv[1:]
     i = 0
     while i < len(argv):
@@ -43,10 +49,7 @@ def main() -> int:
         else:
             args.append(argv[i])
             i += 1
-    try:
-        limit = max(1, min(int(os.environ.get("WEB_SEARCH_LIMIT", limit)), MAX_LIMIT))
-    except ValueError:
-        limit = 5
+    limit = max(1, min(limit, MAX_LIMIT))
     query = " ".join(args).strip()
     if not query:
         print("usage: web-search.py <query> [--limit N]", file=sys.stderr)
@@ -63,6 +66,12 @@ def main() -> int:
                 candidate = json.loads(resp.read(2 * 1024 * 1024).decode("utf-8", "replace"))
         except Exception as exc:  # noqa: BLE001 — try the next instance
             last_error = (base, type(exc).__name__)
+            continue
+        if not isinstance(candidate, dict):
+            # A proxy error page or misconfigured instance can 200 with a
+            # JSON array/string; .get() on it crashed the whole command and
+            # skipped the remaining fallback instances.
+            last_error = (base, "non-object-response")
             continue
         # An engine-blocked node answers 200 with zero results and a non-empty
         # unresponsive_engines list; treat that as degraded and fall through.
