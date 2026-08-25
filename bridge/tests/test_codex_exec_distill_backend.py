@@ -312,6 +312,40 @@ async def test_backend_rejects_output_provenance_not_bound_to_input(
 
 
 @async_test
+async def test_backend_rejects_new_reasonless_decision_before_any_sink(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, codex_executable: str
+) -> None:
+    payload = valid_output()
+    payload["honcho"] = [
+        {
+            "kind": "decision",
+            "text": "Keep the source-only phase because rollout is not bounded.",
+            "subject": "session",
+            "because": None,
+        }
+    ]
+
+    async def fake_spawn(*args: str, **kwargs: Any) -> FakeProcess:
+        del kwargs
+
+        async def action(_stdin: bytes) -> None:
+            output_path_from_args(args).write_text(json.dumps(payload), encoding="utf-8")
+
+        return FakeProcess(action)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_spawn)
+    backend = CodexExecDistillBackend(
+        executable=codex_executable, schema_path=SCHEMA_PATH, temp_root=tmp_path
+    )
+
+    with pytest.raises(
+        CodexDistillBackendError,
+        match="^codex_distill_decision_reason_missing$",
+    ):
+        await backend.extract(extraction_input())
+
+
+@async_test
 @pytest.mark.parametrize(
     ("returncode", "spawn_error", "expected"),
     [

@@ -33,10 +33,12 @@ Write gate (#890 — graph-engineering review):
   G4  kind=constraint (금지/필수 rules) is stored near-verbatim and always
       injected by `snapshot` regardless of the recency limit.
   G5  kind=decision must carry its reason (#1264 — bench q7 measured a
-      reasonless decision only the Wiki layer could answer). The reason rides
-      a structured `because` field or an inline marker (때문/근거/이유) in the
-      sentence itself; a decision with neither is stored but flagged review=1.
-      Never rejects — the fact is kept, the gap is surfaced.
+      reasonless decision only the Wiki layer could answer). Legacy payloads
+      with neither structured `because` nor an inline marker remain stored and
+      flagged for compatibility. New extractors declare
+      `decision_reason_contract=required-v1`; their reasonless decisions are
+      rejected before storage so the review queue is not an ingestion sink for
+      a known-invalid extraction.
 
 Usage:
   nunchi.py init
@@ -274,6 +276,7 @@ _SOURCE_RANK = {"user-stated": 3, "measured": 2, "inferred": 1}
 # without the structured `because` field (the Claude lane historically embeds
 # the reason in the sentence; both forms satisfy the gate).
 _REASON_INLINE = re.compile(r"때문|근거|이유|덕분|위해|목적")
+_DECISION_REASON_CONTRACT = "required-v1"
 
 
 def _g5_reasonless_decision(kind, text, because=None):
@@ -482,11 +485,15 @@ def ingest(path):
         sys.exit(f"ingest: invalid payload JSON ({exc})")
     sid = payload.get("session_id", "unknown")
     items = payload.get("honcho", [])
+    strict_decision_reasons = (
+        payload.get("decision_reason_contract") == _DECISION_REASON_CONTRACT
+    )
     auto_supersede = os.environ.get("NUNCHI_NO_AUTO_SUPERSEDE") != "1"
     transcript = _transcript_text(payload)
     c = db()
     n = 0
     skipped_mutable = 0
+    skipped_reasonless_decisions = 0
     for it in items:
         # Gate order matters (#890): normalize → rank-verify → update/close →
         # conflict-review → dedup. Normalizing first is what lets the same
@@ -503,10 +510,14 @@ def ingest(path):
             continue
         rank, review = _verify_rank(it, transcript)
         because = (it.get("because") or "").strip() or None
-        # G5 (#1264): a decision without its reason — neither a structured
-        # because nor an inline marker — is stored but flagged for the owner
-        # queue. Reasonless decisions get blindly re-litigated or blindly
-        # obeyed later; both are measured failure modes (bench q7).
+        # G5 (#1264): legacy payloads remain flag-not-reject. Producers that
+        # declare the live required-v1 contract have already promised a
+        # structured reason, so violating it is rejected before DB insertion;
+        # a body-free skipped counter keeps the failure visible without
+        # turning the owner's review queue into extractor backpressure.
+        if strict_decision_reasons and kind == "decision" and not because:
+            skipped_reasonless_decisions += 1
+            continue
         if _g5_reasonless_decision(kind, text, because):
             review = 1
         superseded = None
@@ -533,7 +544,11 @@ def ingest(path):
         except sqlite3.IntegrityError:
             pass  # duplicate fact already stored
     c.commit()
-    print(f"ingested {n}/{len(items)} facts (session={sid}, skipped_mutable_ops={skipped_mutable})")
+    print(
+        f"ingested {n}/{len(items)} facts (session={sid},"
+        f" skipped_mutable_ops={skipped_mutable},"
+        f" skipped_reasonless_decisions={skipped_reasonless_decisions})"
+    )
 
 
 def _expand_query(query):
