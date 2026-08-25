@@ -395,6 +395,13 @@ class CodexDistillHonchoSinkWorker:
             return await self._fail(
                 claimed, code="honcho_sink_io_failed", terminal=False
             )
+        except Exception:
+            # Catch-all parity with the local/wiki sink twins: without it an
+            # unexpected error left the job RUNNING and invisible until the
+            # 300 s lease expired, instead of being recorded immediately.
+            return await self._fail(
+                claimed, code="honcho_sink_failed", terminal=False
+            )
         return await asyncio.to_thread(
             self._journal.mark_honcho_sink_done, claimed.job_id,
             owner_token=self._owner_token,

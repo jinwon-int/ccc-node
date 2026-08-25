@@ -313,15 +313,11 @@ class Config(
         ),
     )
 
-    # Telegram Bot
+    # Telegram Bot. Polling retry/timeout knobs deliberately do not exist
+    # here: PTB's own network_retry_loop handles polling retries
+    # (bot_lifecycle), and the three legacy fields that used to sit next to
+    # the token were read by nothing.
     telegram_bot_token: str = Field(..., description="Telegram Bot API Token")
-    network_retry_attempts: int = Field(
-        default=3, description="Number of retry attempts for network errors"
-    )
-    network_retry_delay: int = Field(
-        default=5, description="Delay in seconds between retry attempts"
-    )
-    polling_timeout: int = Field(default=30, description="Telegram polling timeout in seconds")
 
     @field_validator("telegram_bot_token", mode="before")
     @classmethod

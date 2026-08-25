@@ -32,9 +32,13 @@ _ICONS = {
 
 
 def _agent_label(provider: str) -> str:
+    # Keep in step with utils/health.py's writer-side provider mapping: the
+    # renderer's old two-way map labeled crush nodes "Claude" while health.json
+    # reasons said "Crush:" (the same drift health.py:83 documents fixing).
     return {
         "codex": "Codex",
         "piri": "Piri",
+        "crush": "Crush",
     }.get(str(provider).strip().lower(), "Claude")
 
 
@@ -42,9 +46,15 @@ def _parse_iso(value: Optional[str]) -> Optional[datetime]:
     if not value:
         return None
     try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     except (AttributeError, TypeError, ValueError):
         return None
+    if parsed.tzinfo is None:
+        # The bridge writer always emits "Z", but a hand-edited or
+        # third-party health file may omit the offset; aware-minus-naive
+        # arithmetic would turn --status into a TypeError traceback.
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
 
 
 def _format_age(seconds: int) -> str:

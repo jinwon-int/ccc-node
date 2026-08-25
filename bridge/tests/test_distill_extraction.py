@@ -118,6 +118,29 @@ def valid_output() -> dict[str, Any]:
     }
 
 
+def test_redaction_growth_never_pushes_an_at_cap_snapshot_over_the_byte_caps() -> None:
+    # Regression: the 21-byte [REDACTED_CREDENTIAL] marker over a shorter
+    # credential span (AKIA+16 = 20 bytes) is net-growing, and the
+    # snapshotters truncate to the byte budgets EXACTLY — so a budget-full
+    # snapshot with a short-form credential failed validation terminally and
+    # the session's memory was silently discarded.
+    from telegram_bot.memory.distill_extraction import (
+        MAX_INPUT_MESSAGE_BYTES,
+    )
+
+    key = "AKIA" + "A" * 16  # 20 bytes -> redacts to 21
+    filler = "x" * (MAX_INPUT_MESSAGE_BYTES - len(key) - 1)
+    text = filler + " " + key  # \b needs the non-word char before AKIA
+    assert len(text.encode("utf-8")) == MAX_INPUT_MESSAGE_BYTES
+    source = snapshot(TranscriptMessage("user", text, None))
+
+    value = build_extraction_input(source, trigger=DistillTrigger.NEW_COMMAND)
+
+    assert key.encode() not in canonical_extraction_input_bytes(value)
+    assert value.byte_count <= MAX_INPUT_MESSAGE_BYTES
+    assert len(value.messages[0].text.encode("utf-8")) <= MAX_INPUT_MESSAGE_BYTES
+
+
 def test_same_snapshot_and_trigger_produce_byte_identical_redacted_input() -> None:
     raw = synthetic_bearer()
     source = snapshot(TranscriptMessage("user", f"header Authorization: {raw}", None))

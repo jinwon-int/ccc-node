@@ -348,7 +348,7 @@ class BotLifecycleMixin:
             logger.info(
                 "Dead-session recovery: scanned=%d delivered=%d duplicate=%d failed=%d "
                 "rejected=%d quarantined=%d quarantine_skipped=%d deferred_wakeup=%d "
-                "active=%d locked=%d",
+                "locked=%d",
                 stats.scanned,
                 stats.delivered,
                 stats.duplicate,
@@ -357,7 +357,6 @@ class BotLifecycleMixin:
                 stats.quarantined,
                 stats.quarantine_skipped,
                 stats.deferred_wakeup,
-                stats.skipped_active,
                 stats.skipped_locked,
             )
 

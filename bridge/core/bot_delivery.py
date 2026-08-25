@@ -287,16 +287,6 @@ class BotDeliveryMixin:
         # Capture explicit outside-path approval/denial from user replies.
         await self._maybe_capture_outside_approval(user_id, text, chat.id)
 
-        # Check if there's a pending question
-        pending = await self._session_manager.get_pending_question(conversation_key)
-        if pending:
-            log_debug(user_id, "user", f"[answer] {text}")
-            await self._session_manager.clear_pending_question(conversation_key)
-            reply = f"✅ Answer received: {text}\n\nContinuing..."
-            await message.reply_text(reply)
-            log_debug(user_id, "bot", reply)
-            return
-
         # Inject replied-to (quoted) original as context so the agent knows
         # which prior message the user is referencing. The special branches
         # above (resume selection, pending-question answer) return early and

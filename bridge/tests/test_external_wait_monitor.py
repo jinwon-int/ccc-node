@@ -546,9 +546,11 @@ async def test_resume_turn_binds_the_canonical_conversation_session(tmp_path: Pa
         "terminal_status": TERMINAL_SUCCESS,
         "summary": "squash-merge when green",
     }
-    resumed, skip_reason = await monitor._maybe_resume(record)
-
-    assert resumed is True and skip_reason is None
+    # Drive the live resume components directly (_deliver_wake's order); the
+    # old _maybe_resume wrapper encoded the retired resume-before-notify order
+    # and was removed as drifted dead code.
+    assert await monitor._resume_skip_reason(record) is None
+    assert await monitor._run_resume(record) is True
     assert len(calls) == 1
     # The whole point: the continuation is bound to the conversation, so a wait
     # registered inside it records an id the guard will still recognize.

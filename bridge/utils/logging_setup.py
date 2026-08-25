@@ -12,6 +12,7 @@ import errno
 import logging
 import os
 import stat
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -135,7 +136,16 @@ def setup_logging(settings: Any = None) -> None:
     error_name = f"error_{datetime.now().strftime('%Y-%m-%d')}.log"
     fh, efh = _private_log_handlers(logs_dir, ("bot.log", error_name))
 
-    log_level = getattr(logging, runtime_config.log_level.upper())
+    # An unknown LOG_LEVEL (e.g. "trace", or a typo) must not kill startup
+    # with an AttributeError before any logging exists — fall back to INFO
+    # and say which value was ignored.
+    log_level = getattr(logging, str(runtime_config.log_level).upper(), None)
+    if not isinstance(log_level, int):
+        print(
+            f"WARNING: unknown LOG_LEVEL {runtime_config.log_level!r}; using INFO",
+            file=sys.stderr,
+        )
+        log_level = logging.INFO
     formatter = logging.Formatter(runtime_config.log_format)
     is_debug = os.environ.get("BOT_DEBUG")
     console_level = log_level if is_debug else logging.WARNING

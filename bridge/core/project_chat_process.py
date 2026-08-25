@@ -1339,9 +1339,11 @@ class ProjectChatProcessMixin:
                     cause="process-timeout",
                 )
                 if terminal_won and session is not None:
-                    await self._drop_agent_session(key, session)
-                if terminal_won and session is not None:
+                    # Interrupt BEFORE dropping: _drop_agent_session closes the
+                    # session, and a closed Claude session ignores interrupt —
+                    # the stall paths below already use this order.
                     await self._interrupt_agent_session(session)
+                    await self._drop_agent_session(key, session)
                 if terminal_won:
                     await self._cancel_agent_streaming(
                         streaming_handler, context="handling an agent timeout"

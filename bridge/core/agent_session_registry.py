@@ -7,8 +7,8 @@ remain the responsibility of ``ProjectChatHandler``.
 
 from __future__ import annotations
 
+import asyncio
 import logging
-import time
 from dataclasses import dataclass
 from typing import Any, TypeAlias
 
@@ -319,7 +319,16 @@ class AgentSessionRegistry:
             user_id = token.key[0]
             chat_id = token.key[1] if len(token.key) > 1 else None
             actual_token = active.token if active else None
-            age = (time.time() - active.started_at) if active else 0
+            # started_at is loop.time() (monotonic); subtracting it from
+            # wall-clock time.time() printed ~1.7e9-second garbage ages.
+            try:
+                age = (
+                    (asyncio.get_running_loop().time() - active.started_at)
+                    if active
+                    else 0.0
+                )
+            except RuntimeError:
+                age = -1.0  # no running loop: age unknowable in this clock domain
             logger.warning(
                 "Deactivate failed: token mismatch indicates abandoned turn "
                 "(user=%s, chat=%s, expected_token=%s, actual_token=%s, "
@@ -408,46 +417,6 @@ class AgentSessionRegistry:
             record is not None
             and (record.cached is not None or record.active is not None)
         )
-
-    def force_cleanup_stale_turns(self, *, max_age_seconds: float) -> int:
-        """Emergency cleanup of zombie turns older than threshold.
-
-        Per #860: called from health monitor when active_requests grows
-        unexpectedly. This is a last-resort cleanup mechanism when normal
-        request lifecycle fails due to race conditions or abandons.
-
-        Returns the count of cleaned-up zombie turns.
-
-        Args:
-            max_age_seconds: Age threshold in seconds; turns older than this
-                are considered abandoned and will be force-removed.
-
-        Returns:
-            Number of zombie turns cleaned up.
-        """
-        cleaned = 0
-        now = time.time()
-        for key, record in tuple(self._records.items()):
-            active = record.active
-            if active is None:
-                continue
-            age = now - active.started_at
-            if age > max_age_seconds:
-                user_id = key[0]
-                chat_id = key[1] if len(key) > 1 else None
-                logger.error(
-                    "FORCE CLEANUP: removing zombie turn older than threshold "
-                    "(user=%s, chat=%s, age=%.2fs, token=%s, waiting=%s)",
-                    user_id,
-                    chat_id,
-                    age,
-                    active.token,
-                    active.waiting_for_turn,
-                )
-                record.active = None
-                self._prune(key)
-                cleaned += 1
-        return cleaned
 
     def metrics(self) -> AgentSessionMetrics:
         resident = 0

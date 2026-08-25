@@ -113,15 +113,6 @@ class BotAccessMixin:
             return False
         return True
 
-    @staticmethod
-    def _is_priority_command(text: str) -> bool:
-        """Check if a command should be processed with priority (bypass queue).
-
-        Priority commands are processed immediately without queue limit checks.
-        Currently /stop and /revert are priority commands.
-        """
-        return text.strip() in ("/stop", "/revert")
-
     def _project_root(self) -> FilePath:
         return FilePath(self._config.project_root).resolve()
 

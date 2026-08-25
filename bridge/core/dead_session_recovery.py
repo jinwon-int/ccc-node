@@ -95,7 +95,9 @@ class RecoveryStats:
     duplicate: int = 0
     failed: int = 0
     rejected: int = 0
-    skipped_active: int = 0
+    # "Busy conversation" is expressed via the per-conversation lock timeout
+    # (skipped_locked); there is no separate is-active probe, so the old
+    # always-zero skipped_active field was removed rather than logged forever.
     skipped_locked: int = 0
     quarantined: int = 0
     #: Give-up transitions: a conversation reaching the consecutive-reject bound

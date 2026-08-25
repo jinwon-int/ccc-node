@@ -85,8 +85,6 @@ class StreamingMessageHandler:
             summary = input["url"]
         elif name == "WebSearch" and "query" in input:
             summary = input["query"]
-        elif name == "Agent" and "subagent_type" in input:
-            summary = input["subagent_type"]
         elif name == "Task" and "description" in input:
             summary = input["description"]
         elif name == "AskUserQuestion":

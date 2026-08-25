@@ -185,7 +185,12 @@ class CodexAppServerClient:
         self._next_id = 1
         self._pending: dict[int, asyncio.Future[JsonValue]] = {}
         self._notifications: asyncio.Queue[CodexNotification] = asyncio.Queue()
-        self._server_requests: asyncio.Queue[CodexServerRequest] = asyncio.Queue()
+        # Bounded observation mirror: production never drains it (only tests
+        # call next_server_request), so an unbounded queue retained every
+        # approval request's params for the life of the connection.
+        self._server_requests: asyncio.Queue[CodexServerRequest] = asyncio.Queue(
+            maxsize=64
+        )
         self._start_lock = asyncio.Lock()
         self._write_lock = asyncio.Lock()
         self._reader_task: asyncio.Task[None] | None = None
@@ -683,7 +688,14 @@ class CodexAppServerClient:
                         await self._notifications.put(CodexNotification(method, params))
                     elif self._is_rpc_id(request_id):
                         request = CodexServerRequest(request_id, method, params)
-                        await self._server_requests.put(request)
+                        if self._server_requests.full():
+                            # Drop the oldest observation rather than blocking
+                            # the reader loop on a mirror nothing drains.
+                            try:
+                                self._server_requests.get_nowait()
+                            except asyncio.QueueEmpty:
+                                pass
+                        self._server_requests.put_nowait(request)
                         task = asyncio.create_task(self._dispatch_server_request(request))
                         self._server_request_tasks.add(task)
                         task.add_done_callback(self._server_request_tasks.discard)

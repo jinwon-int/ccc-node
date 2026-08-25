@@ -395,20 +395,6 @@ class ExternalWaitMonitor:
             logger.warning("External-wait notifier raised: wait=%s", record["wait_id"])
             return False
 
-    async def _maybe_resume(self, record: Dict[str, Any]) -> tuple[bool, Optional[str]]:
-        """(resumed, skip_reason). The reason is what the owner has to act on.
-
-        Every non-resuming path names itself: a silently-False return made a
-        dropped promise look the same as a fulfilled one in both the ledger and
-        the notification (#740 follow-up, 2026-07-30).
-        """
-        skip_reason = await self._resume_skip_reason(record)
-        if skip_reason is not None:
-            return False, skip_reason
-        if await self._run_resume(record):
-            return True, None
-        return False, "resume_failed"
-
     async def _resume_skip_reason(self, record: Dict[str, Any]) -> Optional[str]:
         """Return why auto-resume must not run, or ``None`` when eligible."""
         if not self._resume_enabled or self._resumer is None:
