@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "verdict": {
+      "type": "string",
+      "enum": ["clear", "conflict", "human"]
+    },
+    "rationale": {
+      "type": "string",
+      "maxLength": 200
+    },
+    "supersede_proposal": {
+      "anyOf": [
+        {"type": "string", "maxLength": 200},
+        {"type": "null"}
+      ]
+    }
+  },
+  "required": ["verdict", "rationale", "supersede_proposal"]
+}
