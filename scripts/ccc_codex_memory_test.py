@@ -1022,11 +1022,25 @@ class CodexMemoryMaterializerTest(unittest.TestCase):
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertEqual(json.loads(completed.stdout), base_document)
         child_pid = marker.read_text(encoding="ascii")
+
+        def _dead(pid: str) -> bool:
+            # Gone, or an unreaped zombie: containers without a PID-1 reaper
+            # keep the killed child in /proc as Z (defunct) even though the
+            # loader's killpg did its job — the /proc-gone form false-failed
+            # there while the sleep sat as `Z <defunct>`.
+            stat = Path("/proc", pid, "stat")
+            if not stat.exists():
+                return True
+            try:
+                return stat.read_text().rsplit(")", 1)[1].split()[0] == "Z"
+            except (OSError, IndexError):
+                return True
+
         for _ in range(20):
-            if not Path("/proc", child_pid).exists():
+            if _dead(child_pid):
                 break
             time.sleep(0.01)
-        self.assertFalse(Path("/proc", child_pid).exists())
+        self.assertTrue(_dead(child_pid))
 
     def test_audience_scoped_materialization_never_uses_global_nunchi(self) -> None:
         loader, env, _base_document = self._prepare_nunchi_loader(

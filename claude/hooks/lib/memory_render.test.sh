@@ -112,7 +112,9 @@ elapsed=$(( $(date +%s) - start ))
 ok "bounded runner enforces the deadline (exit 0, no output)" '[ "$rc" = 0 ] && [ -z "$out" ] && [ "$elapsed" -le 5 ]'
 sleep 0.2
 stall_pid="$(cat "$TMP/stall.pid" 2>/dev/null || true)"
-ok "bounded runner killpg reaps the whole tool process group" '[ -n "$stall_pid" ] && ! kill -0 "$stall_pid" 2>/dev/null'
+# Gone OR an unreaped zombie: in containers without a PID-1 reaper the killed
+# child stays Z (kill -0 still succeeds) even though killpg did its job.
+ok "bounded runner killpg reaps the whole tool process group" '[ -n "$stall_pid" ] && { ! kill -0 "$stall_pid" 2>/dev/null || [ "$(ps -o state= -p "$stall_pid" 2>/dev/null | tr -d "[:space:]")" = "Z" ]; }'
 
 out="$(python3 "$MOD" run-memory-search-bounded "$TMP/does-not-exist" q 5 3 "")"; rc=$?
 ok "bounded runner exits 0 quietly when the tool is missing" '[ "$rc" = 0 ] && [ -z "$out" ]'

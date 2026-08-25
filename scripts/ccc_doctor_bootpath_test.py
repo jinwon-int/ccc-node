@@ -81,6 +81,11 @@ class BootPathVerdictTest(unittest.TestCase):
         doctor = make_doctor()
         doctor.running_bridge_root = lambda: running  # type: ignore[method-assign]
         doctor.unit_bridge_root = lambda _unit: unit_root  # type: ignore[method-assign]
+        # Hermeticity: check_bridge_boot_path branches on the HOST's systemd
+        # before touching the stubbed lookups — without this stub the suite
+        # leaked into the Termux branch and false-failed on any systemd-less
+        # machine (containers, WSL).
+        doctor.has_systemd = lambda: True  # type: ignore[method-assign]
         doctor.check_bridge_boot_path()
         return doctor
 

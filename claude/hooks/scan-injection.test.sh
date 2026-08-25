@@ -59,8 +59,11 @@ ok "password assignment is redacted" \
   '! grep -Fq "supersecretvalue99" <<<"$out" && grep -Fq "[REDACTED:credential]" <<<"$out"'
 
 # 4) Invisible unicode is neutralized (zero-width space assembled via escape so
-# no invisible literal lives in this file)
-zw="$(printf 'clean\u200Bhidden')"
+# no invisible literal lives in this file). Built with python3, not printf:
+# bash's \u escape emits through the current locale, so under LANG-less C
+# environments (containers) it produced no zero-width byte and both
+# assertions false-failed; python coerces C to UTF-8 (PEP 538).
+zw="$(python3 -c 'print("clean\u200Bhidden", end="")')"
 scan unit-zw "$zw"
 ok "zero-width character is made visible as a redaction marker" \
   'grep -Fq "[REDACTED:unicode]" <<<"$out"'
