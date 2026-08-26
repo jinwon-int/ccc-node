@@ -77,6 +77,24 @@ ccc_lifecycle_prepare_private_dir() { # <dir>
   fi
 }
 
+ccc_lifecycle_rotate_if_large() { # <file> — keep the newest half when over budget
+  # These logs are append-only and were previously unbounded, so every
+  # tail/grep over them slowed down with node age. Byte-tail rotation may cut
+  # the oldest surviving line mid-record; readers already tolerate that
+  # (same idiom as load-memory.sh memory-timing rotation).
+  local path="${1:-}" max_bytes="${CCC_LIFECYCLE_LOG_MAX_BYTES:-1048576}" size
+  case "$max_bytes" in ''|*[!0-9]*) return 0 ;; esac
+  [ "$max_bytes" -gt 0 ] || return 0
+  size="$(wc -c < "$path" 2>/dev/null || printf '0')"
+  case "$size" in ''|*[!0-9]*) return 0 ;; esac
+  if [ "$size" -gt "$max_bytes" ]; then
+    tail -c "$((max_bytes / 2))" "$path" > "$path.tmp" 2>/dev/null \
+      && mv -f "$path.tmp" "$path" 2>/dev/null || rm -f "$path.tmp"
+    chmod 600 "$path" 2>/dev/null || true
+  fi
+  return 0
+}
+
 ccc_lifecycle_append_line() { # <file> <already-body-free-line>
   local path="${1:-}" line="${2:-}" directory
   [ -n "$path" ] || return 1
@@ -89,11 +107,12 @@ ccc_lifecycle_append_line() { # <file> <already-body-free-line>
     [ -f "$path" ] && [ ! -L "$path" ] && [ -O "$path" ] || return 1
   fi
   chmod 600 "$path" 2>/dev/null || return 1
-  printf '%s\n' "$line" 2>/dev/null >> "$path"
+  printf '%s\n' "$line" 2>/dev/null >> "$path" || return 1
+  ccc_lifecycle_rotate_if_large "$path"
 }
 
 ccc_lifecycle_append_unique_line() { # <file> <body-free-line> <opaque-dedup>
-  local path="${1:-}" line="${2:-}" dedup="${3:-}" directory
+  local path="${1:-}" line="${2:-}" dedup="${3:-}" directory recent
   [ -n "$path" ] && [ -n "$dedup" ] || return 1
   directory="$(dirname "$path")" || return 1
   ccc_lifecycle_prepare_private_dir "$directory" || return 1
@@ -104,6 +123,12 @@ ccc_lifecycle_append_unique_line() { # <file> <body-free-line> <opaque-dedup>
     [ -f "$path" ] && [ ! -L "$path" ] && [ -O "$path" ] || return 1
   fi
   chmod 600 "$path" 2>/dev/null || return 1
-  grep -Fq -- "$dedup" "$path" 2>/dev/null && return 0
-  printf '%s\n' "$line" 2>/dev/null >> "$path"
+  # Dedup exists to absorb near-simultaneous duplicate events; bound the scan
+  # to the recent tail so one append never re-reads months of history. Plain
+  # substring match (grep -F equivalent) avoids a pipefail/SIGPIPE-sensitive
+  # tail|grep -q pipeline in sourcing hooks.
+  recent="$(tail -n 2000 "$path" 2>/dev/null || true)"
+  case "$recent" in *"$dedup"*) return 0 ;; esac
+  printf '%s\n' "$line" 2>/dev/null >> "$path" || return 1
+  ccc_lifecycle_rotate_if_large "$path"
 }

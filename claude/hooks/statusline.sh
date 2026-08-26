@@ -29,10 +29,11 @@ PCT="${PCT%%.*}"
 [[ "$PCT" =~ ^[0-9]+$ ]] || PCT=0
 
 # Best-effort, allowlisted usage snapshot for the local Telegram /usage command.
-# The collector emits nothing and status-line rendering must never depend on it.
+# The collector emits nothing and status-line rendering must never depend on it,
+# so it runs detached: its ~40ms interpreter start must not tax every render.
 USAGE_COLLECTOR="${CCC_STATUSLINE_USAGE_COLLECTOR:-$HOME/.claude/hooks/statusline-usage.py}"
 if [ -x "$USAGE_COLLECTOR" ]; then
-  printf '%s' "$input" | python3 "$USAGE_COLLECTOR" >/dev/null 2>&1 || true
+  ( printf '%s' "$input" | python3 "$USAGE_COLLECTOR" >/dev/null 2>&1 & ) 2>/dev/null
 fi
 
 # Node label: explicit env override -> state file -> short hostname.
@@ -43,42 +44,50 @@ NODE="${CCC_NODE:-}"
 # Git branch + dirty marker with TTL cache (5s). Best-effort, scoped to session cwd.
 BR=""
 if [ -n "$CWD" ]; then
-  # Use md5 of CWD as cache key (safe, deterministic, short).
-  CWD_KEY="$(printf '%s' "$CWD" | md5sum | cut -d' ' -f1)"
+  # Bash-only cache key (no md5sum fork): non-alnum -> _, keep the distinguishing
+  # tail. A key collision only mislabels the bar's branch for one TTL window.
+  CWD_KEY="${CWD//[!a-zA-Z0-9]/_}"
+  [ "${#CWD_KEY}" -gt 200 ] && CWD_KEY="${CWD_KEY:${#CWD_KEY}-200}"
   CACHE_DIR="$HOME/.claude/cache/git-status"
-  CACHE_FILE="$CACHE_DIR/$CWD_KEY.json"
+  CACHE_FILE="$CACHE_DIR/$CWD_KEY.tsv"
   CACHE_TTL=5
 
-  # Read from cache if fresh (exists and <TTL seconds old).
-  NOW="$(date +%s)"
+  # One tab-separated line: ts<TAB>branch<TAB>dirty(0|1), read with the bash
+  # builtin — the JSON cache cost three jq forks per render on every HIT.
+  # A successful fresh read IS the hit: branch may legitimately be empty
+  # (detached HEAD, non-repo cwd), which the old `-z "$BR"` miss inference
+  # treated as a miss and re-ran git on every render, forever.
+  NOW="${EPOCHSECONDS:-$(date +%s)}"
+  GIT_HIT=0
   if [ -r "$CACHE_FILE" ]; then
-    CACHED_TS="$(jq -r '.timestamp // 0' "$CACHE_FILE" 2>/dev/null || echo 0)"
-    if [ "$((NOW - CACHED_TS))" -lt "$CACHE_TTL" ]; then
-      BR="$(jq -r '.branch // empty' "$CACHE_FILE" 2>/dev/null)"
-      [ "$(jq -r '.dirty // false' "$CACHE_FILE" 2>/dev/null)" = "true" ] && BR="${BR}*"
-    fi
+    CACHED_TS=""; CACHED_BR=""; CACHED_DIRTY=""
+    IFS=$'\t' read -r CACHED_TS CACHED_BR CACHED_DIRTY < "$CACHE_FILE" 2>/dev/null || true
+    case "$CACHED_TS" in
+      ''|*[!0-9]*) ;;
+      *)
+        if [ "$((NOW - CACHED_TS))" -lt "$CACHE_TTL" ]; then
+          GIT_HIT=1
+          BR="$CACHED_BR"
+          [ "$CACHED_DIRTY" = "1" ] && BR="${BR}*"
+        fi
+        ;;
+    esac
   fi
 
-  # Cache miss or stale: recompute and store.
-  if [ -z "$BR" ] && git -C "$CWD" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-    CURRENT_BRANCH="$(git -C "$CWD" branch --show-current 2>/dev/null)"
-    DIRTY_MARKER=""
-    [ -n "$(git -C "$CWD" status --porcelain 2>/dev/null)" ] && DIRTY_MARKER="*"
-    BR="${CURRENT_BRANCH}${DIRTY_MARKER}"
-
+  # Cache miss or stale: recompute and store. Non-repo cwds are cached too
+  # (empty branch), so they stop paying a git fork on every render.
+  if [ "$GIT_HIT" != "1" ]; then
+    CURRENT_BRANCH=""
+    DIRTY=0
+    if git -C "$CWD" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+      CURRENT_BRANCH="$(git -C "$CWD" branch --show-current 2>/dev/null)"
+      [ -n "$(git -C "$CWD" status --porcelain 2>/dev/null)" ] && DIRTY=1
+    fi
+    BR="$CURRENT_BRANCH"
+    [ "$DIRTY" = "1" ] && BR="${BR}*"
     # Write cache (ignore failures — statusline must never block).
-    # dirty must be a JSON literal: `${DIRTY_MARKER:+true}` expanded to an
-    # empty string on clean repos, jq rejected it, and the already-applied
-    # redirection truncated the cache to an empty file — so the TTL cache
-    # never worked for clean repos and every render re-ran git status.
-    DIRTY_JSON=false
-    [ -n "$DIRTY_MARKER" ] && DIRTY_JSON=true
     mkdir -p "$CACHE_DIR" 2>/dev/null
-    jq -n \
-      --arg branch "$CURRENT_BRANCH" \
-      --argjson dirty "$DIRTY_JSON" \
-      --argjson ts "$NOW" \
-      '{branch: $branch, dirty: $dirty, timestamp: $ts}' >"$CACHE_FILE" 2>/dev/null || true
+    printf '%s\t%s\t%s\n' "$NOW" "$CURRENT_BRANCH" "$DIRTY" > "$CACHE_FILE" 2>/dev/null || true
   fi
 fi
 

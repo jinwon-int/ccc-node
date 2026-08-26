@@ -198,6 +198,33 @@ limit_bytes() { # <max> <text>
   python3 "$MEMORY_RENDER_PY" limit-bytes "$max"
 }
 
+byte_len() { # <text> -> byte count, no fork (length is locale-dependent, so pin C)
+  local LC_ALL=C
+  printf '%s' "${#1}"
+}
+
+# Combined scan + byte-cap: one scanner process applies the cap in-process
+# (scan-injection.sh's optional second arg) instead of piping through a second
+# limit_bytes interpreter per block. Both fail-open paths still cap the bytes.
+# Empty blocks (fresh node, disabled lanes) skip both processes outright —
+# the old pipeline paid two interpreter starts to transform "" into "".
+scan_capped_block() { # <label> <max> <text>
+  local label="$1" max="$2" text="$3" scanned
+  [ -n "$text" ] || return 0
+  if [ ! -x "$HOOKDIR/scan-injection.sh" ]; then
+    printf '%s' "$text" | limit_bytes "$max"
+    return
+  fi
+  if scanned="$(printf '%s' "$text" | bash "$HOOKDIR/scan-injection.sh" "$label" "$max" 2>/dev/null)"; then
+    printf '%s' "$scanned"
+  else
+    # Same UNSCANNED contract as scan_injection_block (#1160): note it, keep
+    # fail-open, still enforce the byte cap on the unscanned text.
+    printf 'load-memory: scan-injection failed (label=%s); injecting UNSCANNED block\n' "$label" >&2
+    printf '%s' "$text" | limit_bytes "$max"
+  fi
+}
+
 # Cross-source injection dedup. The local hot-memory search re-surfaces hits from
 # MEMORY.md/USER.md (source=memory) and the wiki/honcho caches (source=cache) that
 # are ALSO injected verbatim as their own blocks above — double-spending the
@@ -366,14 +393,14 @@ scan_parallel_worthwhile() {
 }
 scan_dir=""
 scan_lane() { # <name> <label> <max> <text>
-  { scan_injection_block "$2" "$4" | limit_bytes "$3"; } > "$scan_dir/$1" 2>/dev/null \
+  scan_capped_block "$2" "$3" "$4" > "$scan_dir/$1" 2>/dev/null \
     && : > "$scan_dir/$1.done"
 }
 scanned_block() { # <name> <label> <max> <text>
   if [ -n "$scan_dir" ] && [ -f "$scan_dir/$1.done" ]; then
     cat "$scan_dir/$1" 2>/dev/null
   else
-    scan_injection_block "$2" "$4" | limit_bytes "$3"
+    scan_capped_block "$2" "$3" "$4"
   fi
 }
 scan_parallel_pref="${CCC_MEMORY_SCAN_PARALLEL:-auto}"
@@ -425,12 +452,12 @@ if [ -n "$scan_dir" ]; then rm -rf "$scan_dir"; fi
 alloc_local="$MAX_LOCAL"
 search_limit="${CCC_MEMORY_SEARCH_LIMIT:-}"
 if ! is_disabled "${CCC_MEMORY_DYNAMIC_BUDGET:-1}"; then
-  msize="$(printf '%s' "$mem" | wc -c)"
-  wsize="$(printf '%s' "$wiki" | wc -c)"
-  hsize="$(printf '%s' "$honcho" | wc -c)"
+  msize="$(byte_len "$mem")"
+  wsize="$(byte_len "$wiki")"
+  hsize="$(byte_len "$honcho")"
   # The working-state block is a second pointer-class block next to resume;
   # count it there so the local hot block cannot reclaim bytes it occupies.
-  rsize="$(( $(printf '%s' "$resume" | wc -c) + $(printf '%s' "$ws" | wc -c) ))"
+  rsize="$(( $(byte_len "$resume") + $(byte_len "$ws") ))"
   # alloc = byte budget for local (>= MAX_LOCAL, reclaiming slack up to the total
   # minus a ~1000B scaffold reserve); dyn_limit = results to fetch to fill it
   # (~180B/result, clamped to [5,25]). The final limit_bytes is the hard bound.
@@ -537,21 +564,26 @@ if [ "$PROFILE" = "hybrid" ] || [ "$PROFILE" = "max-perf" ] || ! is_disabled "$L
   fi
 fi
 
-local_hot="$(filter_disabled_wiki_hits "$local_hot")"
-_mark filter_wiki
+# The whole post-processing chain transforms "" into "" through four Python
+# starts; skip it when no search lane produced anything (tool missing, search
+# disabled, or every lane timed out).
+if [ -n "$local_hot" ]; then
+  local_hot="$(filter_disabled_wiki_hits "$local_hot")"
+  _mark filter_wiki
 
-# Dedup the local hot block against what we ACTUALLY inject above (post-redaction,
-# post-truncation) before rendering it — so it surfaces index-only content
-# (distilled facts) instead of echoing the canonical blocks.
-local_hot="$(dedup_local_hot "$mem
+  # Dedup the local hot block against what we ACTUALLY inject above (post-redaction,
+  # post-truncation) before rendering it — so it surfaces index-only content
+  # (distilled facts) instead of echoing the canonical blocks.
+  local_hot="$(dedup_local_hot "$mem
 $wiki
 $honcho" "$local_hot")"
-_mark dedup
-# Render the search JSON to compact readable lines, then apply the (possibly
-# enlarged) local byte budget.
-local_hot="$(render_local_hot "$local_hot")"
-local_hot="$(scan_injection_block local-hot-memory "$local_hot" | limit_bytes "$alloc_local")"
-_mark render
+  _mark dedup
+  # Render the search JSON to compact readable lines, then apply the (possibly
+  # enlarged) local byte budget (scan + cap in one process).
+  local_hot="$(render_local_hot "$local_hot")"
+  local_hot="$(scan_capped_block local-hot-memory "$alloc_local" "$local_hot")"
+  _mark render
+fi
 
 node_label="${CCC_NODE:-$(cat "$STATE_DIR/node.txt" 2>/dev/null || hostname -s 2>/dev/null || printf 'ccc-node')}"
 stamp="$(cat "$CACHE/.last-refresh" 2>/dev/null)"
@@ -654,34 +686,51 @@ if ! is_disabled "$AUDIENCE_SCOPED"; then
 fi
 skills_block=""
 if ! is_disabled "$SKILLS_ENABLED" && [ -d "$SKILLS_DIR" ]; then
-  skills_index="$(
-    for skill_md in "$SKILLS_DIR"/*/SKILL.md; do
-      [ -r "$skill_md" ] || continue
-      awk 'NR==1 && $0!="---" {exit}
-        /^---$/ {fm++; next}
-        fm==1 && /^name:[ ]*/ {sub(/^name:[ ]*/,""); name=$0}
-        fm==1 && /^description:[ ]*/ {sub(/^description:[ ]*/,""); desc=substr($0,1,160)}
-        END {if (name!="") printf "- %s — %s\n", name, desc}' "$skill_md"
-    done | sort
-  )"
+  # One awk pass over every readable SKILL.md emits name<TAB>desc pairs; both
+  # renderings (full and the #1081 names-only degrade) derive from that single
+  # pass in shell. The old shape forked awk per file and, whenever descriptions
+  # overflowed the budget (the common case on a well-stocked node), discarded
+  # the whole first pass and forked the per-file loop a second time.
+  skill_files=()
+  for skill_md in "$SKILLS_DIR"/*/SKILL.md; do
+    [ -r "$skill_md" ] && skill_files+=("$skill_md")
+  done
+  skills_pairs=""
+  if [ "${#skill_files[@]}" -gt 0 ]; then
+    skills_pairs="$(awk '
+      function flush() { if (name != "") printf "%s\t%s\n", name, desc; name=""; desc=""; fm=0; skip=0 }
+      FNR==1 { flush(); if ($0 != "---") { skip=1 } else { fm=1 }; next }
+      skip { next }
+      /^---$/ { fm++; next }
+      fm==1 && /^name:[ ]*/ { sub(/^name:[ ]*/,""); name=$0; next }
+      fm==1 && /^description:[ ]*/ { sub(/^description:[ ]*/,""); desc=substr($0,1,160); next }
+      END { flush() }' "${skill_files[@]}" 2>/dev/null | sort)"
+  fi
+  skills_index=""
+  skills_names=""
+  while IFS=$'\t' read -r s_name s_desc; do
+    [ -n "$s_name" ] || continue
+    skills_index+="- ${s_name} — ${s_desc}"$'\n'
+    skills_names+="- ${s_name}"$'\n'
+  done <<<"$skills_pairs"
+  skills_index="${skills_index%$'\n'}"
+  skills_names="${skills_names%$'\n'}"
   skills_note="read the SKILL.md before use; search these descriptions, not filenames"
-  if [ -n "$skills_index" ] && [ "$(printf '%s' "$skills_index" | wc -c)" -gt "$MAX_SKILLS" ]; then
+  if [ -n "$skills_index" ] && [ "$(byte_len "$skills_index")" -gt "$MAX_SKILLS" ]; then
     # No silent tail-drop (#1081 lesson): degrade the WHOLE index to names
     # rather than truncating away the skills that sort last.
     skills_note="names only — descriptions exceed the byte budget; read each SKILL.md"
-    skills_index="$(
-      for skill_md in "$SKILLS_DIR"/*/SKILL.md; do
-        [ -r "$skill_md" ] || continue
-        awk 'NR==1 && $0!="---" {exit}
-          /^---$/ {fm++; next}
-          fm==1 && /^name:[ ]*/ {sub(/^name:[ ]*/,""); print "- " $0; exit}' "$skill_md"
-      done | sort
-    )"
+    skills_index="$skills_names"
   fi
   if [ -n "$skills_index" ]; then
+    # The chosen rendering usually fits; only cap (one interpreter) when even
+    # the names-only degrade overflows the budget.
+    if [ "$(byte_len "$skills_index")" -gt "$MAX_SKILLS" ]; then
+      skills_index="$(printf '%s' "$skills_index" | limit_bytes "$MAX_SKILLS")"
+    fi
     skills_block="
 ## Node skills index (${skills_note})
-$(printf '%s' "$skills_index" | limit_bytes "$MAX_SKILLS")
+${skills_index}
 "
   fi
 fi

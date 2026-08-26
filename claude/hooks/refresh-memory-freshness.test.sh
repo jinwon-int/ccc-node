@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Hermetic Honcho freshness tests. No provider or Wiki network calls.
+# Hermetic Honcho + Wiki freshness tests. No provider or Wiki network calls.
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -105,10 +105,12 @@ first_refreshed_at="$(jq -r '.refreshed_at' "$cache/.honcho.status.json")"
 
 printf 'prompt two should not churn the stable task key\n' > "$state/current-prompt.txt"
 out="$(run_refresh)"; rc=$?
-ok "fresh same-task refresh skips Honcho but still refreshes Wiki" \
-  '[ "$rc" = 0 ] && grep -q "honcho refresh skipped reason=fresh" <<<"$out" && [ "$(wc -l < "$HONCHO_CALL_LOG")" = 1 ] && [ "$(wc -l < "$WIKI_CALL_LOG")" = 2 ]'
+ok "fresh same-task refresh skips Honcho and Wiki alike" \
+  '[ "$rc" = 0 ] && grep -q "honcho refresh skipped reason=fresh" <<<"$out" && grep -q "wiki refresh skipped reason=fresh" <<<"$out" && [ "$(wc -l < "$HONCHO_CALL_LOG")" = 1 ] && [ "$(wc -l < "$WIKI_CALL_LOG")" = 1 ]'
 ok "fresh skip does not advance refreshed_at" \
   '[ "$(jq -r ".refreshed_at" "$cache/.honcho.status.json")" = "$first_refreshed_at" ]'
+ok "wiki freshness key stores only hashes, never the query" \
+  'jq -e ".status == \"ok\" and (.query_hash | length) == 64 and has(\"query\") == false" "$cache/.wiki.status.json" >/dev/null'
 
 out="$(CCC_HONCHO_FORCE_REFRESH=1 run_refresh)"; rc=$?
 ok "explicit force refresh bypasses freshness" \
@@ -118,6 +120,8 @@ printf 'task beta\n' > "$state/current-task.txt"
 out="$(run_refresh)"; rc=$?
 ok "material task change refreshes Honcho" \
   '[ "$rc" = 0 ] && [ "$(wc -l < "$HONCHO_CALL_LOG")" = 3 ]'
+ok "material task change refreshes Wiki too" \
+  '[ "$(wc -l < "$WIKI_CALL_LOG")" = 2 ]'
 
 jq '.reasoningLevel = "medium"' "$cfg" > "$cfg.tmp" && mv "$cfg.tmp" "$cfg"
 chmod 600 "$cfg"
@@ -159,8 +163,27 @@ out="$(HONCHO_STUB_MODE=empty run_refresh)"; rc=$?
 ok "credential rotation alone does not expose or churn the non-secret fingerprint" \
   '[ "$rc" = 0 ] && [ "$(wc -l < "$HONCHO_CALL_LOG")" = 9 ] && ! grep -q "rotated-token-not-in-fingerprint" "$cache/.honcho.status.json"'
 
-ok "Wiki remains independent across every warmer invocation" \
-  '[ "$(wc -l < "$WIKI_CALL_LOG")" = 12 ]'
+# Wiki freshness gates independently: none of the honcho-side churn above
+# (force refresh, config change, invalidation, error retries) re-ran the
+# prefetch while the wiki's own key stayed fresh.
+ok "wiki refresh stays gated across honcho-side churn" \
+  '[ "$(wc -l < "$WIKI_CALL_LOG")" = 2 ]'
+
+out="$(CCC_WIKI_FORCE_REFRESH=1 run_refresh)"; rc=$?
+ok "explicit wiki force refresh bypasses freshness" \
+  '[ "$rc" = 0 ] && [ "$(wc -l < "$WIKI_CALL_LOG")" = 3 ]'
+
+jq '.refreshed_at = "2000-01-01T00:00:00Z"' "$cache/.wiki.status.json" \
+  > "$cache/.wiki.status.json.tmp" \
+  && mv "$cache/.wiki.status.json.tmp" "$cache/.wiki.status.json"
+out="$(run_refresh)"; rc=$?
+ok "expired wiki status refreshes the prefetch" \
+  '[ "$rc" = 0 ] && [ "$(wc -l < "$WIKI_CALL_LOG")" = 4 ]'
+
+rm -f "$cache/wiki.txt"
+out="$(run_refresh)"; rc=$?
+ok "cleared wiki cache file repopulates despite a fresh ok status" \
+  '[ "$rc" = 0 ] && [ "$(wc -l < "$WIKI_CALL_LOG")" = 5 ] && [ -s "$cache/wiki.txt" ]'
 
 echo "----"
 echo "PASS=$pass FAIL=$fail"
