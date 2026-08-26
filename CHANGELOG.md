@@ -62,10 +62,22 @@ All notable changes to the Claude Code node harness. Dates are KST.
     load control.json once per run instead of per skill; classifications
     computed by a run are reused by its backup snapshot. The SKILL.md
     TOCTOU double-read is deliberately kept (contract-pinned).
-  - Deferred: the equivalent incremental-scan work for
-    `scripts/auto-distill/` was implemented but reverted — it requires a
-    fresh exact-source evaluation receipt (TM-2380 governance), which
-    cannot be minted locally.
+  - The previously deferred incremental-scan work for
+    `scripts/auto-distill/` now lands **with a fresh exact-source
+    evaluation receipt** (TM-2406): `iter_messages(since_line=)` skips
+    already-watermarked lines before `json.loads`, the cheap
+    watermark/mtime gate runs before `is_self_call` so unchanged
+    sessions are never opened, per-run file stats replace repeated
+    `getmtime` calls (and files vanishing mid-sort no longer kill the
+    run), `section_body` reads each wiki file once per run (bounded
+    FIFO cache), and the literal channel is one `grep -rInF -f` pass
+    over a pattern file instead of tens-to-hundreds of per-token
+    greps — per-item token selection, first-match-per-file, staging
+    exclusion and excerpt formatting are unchanged (pinned by new
+    tests). The receipt was minted from a genuine re-evaluation on the
+    gwakga isolated harness (TM-2406: recheck 7/12 · suspect 0, TP 16 ·
+    FP 1 · FN 7 · TN 23, collateral damage 0) and `test_receipt.py`'s
+    pinned evaluation id moves TM-2398 → TM-2406 with it.
 
 ### Removed
 - Dead files from the pre-fork/legacy era: `bridge/pre-kill.sh` (unreferenced;

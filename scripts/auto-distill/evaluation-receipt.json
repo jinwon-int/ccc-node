@@ -3,9 +3,9 @@
   "pipeline": 6,
   "subject": {
     "path": "scripts/auto-distill/auto-distill.py",
-    "sha256": "0055171eb9791866f44dcc87a4698369fc8df2542af2e9e2f584daf18a62cfd6",
+    "sha256": "eb3ddcea465bd5b520cc80944a28fbb99f2773aa66ef8a92199be7bd5225f0b7",
     "surface_schema": "ccc.auto-distill.canon-surface.v1",
-    "surface_sha256": "5927f8180bf77fef76e76d02c8d7f74594d753f0c78a2e5ab64717e395087e4a",
+    "surface_sha256": "7967da08c25cb6c2eb1d2b9477b3b4ff0aec43bf79e93f7a4123828db2234d7e",
     "surface_members": [
       "assign:PIPELINE",
       "assign:CANON_PROMPT",
@@ -28,9 +28,9 @@
     ]
   },
   "evaluation": {
-    "id": "TM-2398",
-    "evaluated_source_sha256": "0055171eb9791866f44dcc87a4698369fc8df2542af2e9e2f584daf18a62cfd6",
-    "completed_at": "2026-08-24T23:23:58+09:00",
+    "id": "TM-2406",
+    "evaluated_source_sha256": "eb3ddcea465bd5b520cc80944a28fbb99f2773aa66ef8a92199be7bd5225f0b7",
+    "completed_at": "2026-08-26T14:23:27+09:00",
     "provider": "claude-code-oauth",
     "model": "haiku",
     "corpus": {
@@ -43,28 +43,28 @@
       "cases": 47
     },
     "harness": {
-      "eval_canon_sha256": "33be3b396015e7dd46e134c5d5294a115df69f325a95fa5e194f688954fe8a85",
+      "eval_canon_sha256": "a0aae5241dc4d3768cc0b69dbc859a9d7e14553a687d98d9e4276016814b1aa5",
       "recheck_addr_sha256": "01ad650774f1e90c31052d21775ec2a0d45c9518962970458f9195b8204e3e70"
     },
     "artifacts": {
-      "eval_log_sha256": "eb5dd1f7182038c82495ea4e8b7b7ff6642a2c5aeee2d6c01ea5c8efec0ea8ad",
-      "eval_result_sha256": "81dc8432bf1e42072f91b96a6444efc73edbedb006e61d4dd61fb9db9b322e60",
-      "recheck_log_sha256": "c9b323037ea051beb2651ffdf0197223534767d2d943cf38b514e1c2de06fa4a"
+      "eval_log_sha256": "9015d3b9f40726feca72efa39cbf3510235ff6b25c484279fb07e726969f51c1",
+      "eval_result_sha256": "6d5ef5d25f49329fab0a05613d5447fa9edb01a75a73a1673b1924912ffb2885",
+      "recheck_log_sha256": "2eef88de94f90c77bde0bff011f3c6f8b56ddbe12844d398e53fd25d99bb5216"
     },
     "recheck": {
       "baseline_duplicates": 1,
-      "duplicates": 8,
+      "duplicates": 7,
       "cases": 12,
       "suspect": 0
     },
     "confusion": {
-      "tp": 13,
+      "tp": 16,
       "fp": 1,
-      "fn": 10,
+      "fn": 7,
       "tn": 23
     },
     "collateral_damage": 0,
     "passed": true
   },
-  "issued_at": "2026-08-24T23:24:36+09:00"
+  "issued_at": "2026-08-26T14:25:27+09:00"
 }
