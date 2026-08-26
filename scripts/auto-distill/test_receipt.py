@@ -51,7 +51,7 @@ class AutoDistillReceiptTest(unittest.TestCase):
         result = self.run_verifier()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("evaluation receipt ok: pipeline=6", result.stdout)
-        self.assertIn("evaluation=TM-2407", result.stdout)
+        self.assertIn("evaluation=TM-2408", result.stdout)
 
     def test_schema_pins_canonical_receipt_identity_and_surface(self) -> None:
         schema = json.loads(SCHEMA.read_text(encoding="utf-8"))

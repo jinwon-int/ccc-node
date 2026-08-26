@@ -113,6 +113,7 @@ def resolve_node():
     return NODE_ALIASES.get(h, h)
 
 CAP_PER_RUN = 5         # 회당 세션 상한
+EXTRACT_FAIL_BUDGET = 3  # 같은 파일 스냅샷의 연속 추출 실패 상한 (#1297)
 
 
 def log_audit(rec):
@@ -369,6 +370,61 @@ def save_watermark(wm):
     with open(tmp, "w") as fh:
         json.dump(wm, fh, ensure_ascii=False, indent=1)
     os.replace(tmp, STATE)
+
+
+def extract_failure_reason(error):
+    """Return one body-free failure class for state, summaries, and audit."""
+    reason = str(error or "").split(":", 1)[0].strip()
+    reason = re.sub(r"[^0-9A-Za-z_.-]+", "_", reason).strip("_")
+    return reason[:80] or "extract_fail"
+
+
+def extract_failure_state(entry):
+    """Read the optional retry state without trusting malformed watermark data."""
+    if not isinstance(entry, dict):
+        return {}
+    failure = entry.get("extract_failure")
+    return failure if isinstance(failure, dict) else {}
+
+
+def dead_letter_holds(entry, snapshot_size):
+    """A dead letter stays parked until its append-only source grows."""
+    failure = extract_failure_state(entry)
+    failed_size = failure.get("snapshot_size")
+    return (
+        failure.get("dead_lettered") is True
+        and type(failed_size) is int
+        and failed_size >= 0
+        and snapshot_size <= failed_size
+    )
+
+
+def record_extract_failure(
+        entry, *, path, snapshot_size, snapshot_mtime, error,
+        budget=EXTRACT_FAIL_BUDGET):
+    """Return updated retry state while preserving the last success cursor."""
+    current = dict(entry) if isinstance(entry, dict) else {}
+    previous = extract_failure_state(current)
+    previous_size = previous.get("snapshot_size")
+    previous_attempts = previous.get("attempts")
+    same_snapshot = type(previous_size) is int and previous_size == snapshot_size
+    if type(previous_attempts) is not int or previous_attempts < 0:
+        previous_attempts = 0
+    attempts = previous_attempts + 1 if same_snapshot else 1
+    limit = max(1, int(budget))
+    failure = {
+        "attempts": attempts,
+        "budget": limit,
+        "reason": extract_failure_reason(error),
+        "snapshot_size": int(snapshot_size),
+        "snapshot_mtime": float(snapshot_mtime),
+        "dead_lettered": attempts >= limit,
+    }
+    # `mtime` and `lines` remain the last *successful* cursor. Advancing either
+    # on failure would silently discard the unextracted increment.
+    current["path"] = path
+    current["extract_failure"] = failure
+    return current, failure
 
 
 def digest_session(path, since_line=0):
@@ -1301,23 +1357,26 @@ def main():  # noqa: C901 - orchestration kept aligned with deployed v6
     # stat 은 파일당 한 번만 한다 — 정렬키·지평·워터마크(·워터마크 저장)가 같은
     # 값을 재사용한다. 나열과 stat 사이에 사라진 파일은 조용히 제외한다
     # (예전에는 정렬 도중 getmtime 이 예외를 던져 회차 전체가 죽었다).
-    mtimes = {}
+    snapshots = {}
     for f in set(files):
         try:
-            mtimes[f] = os.path.getmtime(f)
+            snapshots[f] = os.stat(f)
         except OSError:
             continue
-    files = sorted(mtimes, key=mtimes.__getitem__, reverse=True)
+    files = sorted(snapshots, key=lambda path: snapshots[path].st_mtime,
+                   reverse=True)
 
     # 콜드스타트 지평. 워터마크가 없는 첫 회차에는 모든 과거 세션이 "신규"로 보인다
     # (실측 2026-08-22: 소교 697 · 노숙 193 · 곽가 90 · 육손 78). 지평이 없으면
     # 수개월 전 세션에서 이미 낡았거나 이미 기록된 사실을 다시 뽑느라 예산을 태운다.
     todo = []
+    dead_letters = []
     self_calls = 0
     too_old = 0
     horizon = time.time() - args.max_age_days * 86400 if args.max_age_days > 0 else 0
     for f in files:
-        mtime = mtimes[f]
+        snapshot = snapshots[f]
+        mtime = snapshot.st_mtime
         if horizon and mtime < horizon:
             too_old += 1
             continue
@@ -1327,14 +1386,33 @@ def main():  # noqa: C901 - orchestration kept aligned with deployed v6
         # 감사 이벤트를 매 회차 남기지 않는다 — 의도된 로그 소음 제거.
         key = hashlib.sha256(f.encode()).hexdigest()[:16]
         prev = wm.get(key, {})
-        if not (prev.get("lines", 0) == 0 or mtime > prev.get("mtime", 0)):
+        failure = extract_failure_state(prev)
+        held = dead_letter_holds(prev, snapshot.st_size)
+        if held:
+            if not args.only or args.only in os.path.basename(f):
+                dead_letters.append({
+                    "session": os.path.basename(f)[:24],
+                    "reason": failure.get("reason", "extract_fail"),
+                    "attempts": failure.get("attempts", EXTRACT_FAIL_BUDGET),
+                    "state": "held",
+                })
+            continue
+        failed_size = failure.get("snapshot_size")
+        reactivated = (
+            failure.get("dead_lettered") is True
+            and type(failed_size) is int
+            and snapshot.st_size > failed_size
+        )
+        if not reactivated \
+                and not (prev.get("lines", 0) == 0
+                         or mtime > prev.get("mtime", 0)):
             continue
         if is_self_call(f):
             self_calls += 1
             log_audit({"event": "skip", "session": os.path.basename(f)[:24],
                        "reason": "self_call"})
             continue
-        todo.append((f, key, prev.get("lines", 0)))
+        todo.append((f, key, prev.get("lines", 0), reactivated))
     if args.only:
         todo = [t for t in todo if args.only in os.path.basename(t[0])]
     skipped = max(0, len(todo) - args.cap)
@@ -1350,10 +1428,20 @@ def main():  # noqa: C901 - orchestration kept aligned with deployed v6
     render_path = args.render_out or os.path.join(HOME, ".hermes/logs/auto-%s.md" % args.node)
     rendered_add = rendered_dup = 0
     results = []
-    for f, key, since in todo:
+    for f, key, since, reactivated in todo:
         t0 = time.time()
         digest, ids, total = digest_session(f, since)
         name = os.path.basename(f)[:24]
+        if reactivated and not args.dry_run:
+            failure = extract_failure_state(wm.get(key, {}))
+            failed_size = failure.get("snapshot_size")
+            log_audit({
+                "event": "dead_letter_reactivated",
+                "session": name,
+                "reason": failure.get("reason", "extract_fail"),
+                "attempts": failure.get("attempts", EXTRACT_FAIL_BUDGET),
+                "growth_bytes": snapshots[f].st_size - failed_size,
+            })
         if len(digest) < MIN_TEXT:
             # INV-2: '스키마를 한 줄도 인식 못 함'과 '내용이 적음'은 다른 사건이다.
             # 전자를 too_small 로 뭉뚱그리면 어댑터 결함이 감사로그에서 정상으로 보인다.
@@ -1364,15 +1452,44 @@ def main():  # noqa: C901 - orchestration kept aligned with deployed v6
             if not args.dry_run:
                 # 스캔 시점 mtime 을 기록한다: 다이제스트 이후 붙은 내용이 있으면
                 # 파일 mtime 이 이보다 새로워져 다음 회차가 반드시 다시 본다.
-                wm[key] = {"lines": total, "mtime": mtimes[f], "path": f}
+                wm[key] = {"lines": total, "mtime": snapshots[f].st_mtime,
+                           "path": f}
             continue
         print("  추출  %s  증가분 %dB / %d줄 ... " % (name, len(digest), total - since), end="", flush=True)
         data, (err, usage, raw) = extract(digest, model_cmd, args.timeout)
         dt = time.time() - t0
         if err:
-            print("실패 (%s, %.1fs)" % (err, dt))
-            log_audit({"event": "extract_fail", "session": name, "error": err,
-                       "sec": round(dt, 1), "usage": usage})
+            failure_entry, failure = record_extract_failure(
+                wm.get(key, {}),
+                path=f,
+                snapshot_size=snapshots[f].st_size,
+                snapshot_mtime=snapshots[f].st_mtime,
+                error=err,
+            )
+            print("실패 (%s, %.1fs)" % (failure["reason"], dt))
+            log_audit({"event": "extract_fail", "session": name,
+                       "reason": failure["reason"],
+                       "attempt": failure["attempts"],
+                       "budget": failure["budget"],
+                       "sec": round(dt, 1), "usage": usage,
+                       "dry_run": args.dry_run})
+            if not args.dry_run:
+                wm[key] = failure_entry
+                if failure["dead_lettered"]:
+                    dead_letters.append({
+                        "session": name,
+                        "reason": failure["reason"],
+                        "attempts": failure["attempts"],
+                        "state": "new",
+                    })
+                    log_audit({
+                        "event": "dead_letter",
+                        "session": name,
+                        "reason": failure["reason"],
+                        "attempts": failure["attempts"],
+                        "budget": failure["budget"],
+                        "snapshot_size": failure["snapshot_size"],
+                    })
             continue
         items = data.get("items", []) if isinstance(data, dict) else []
         kept, dropped = verify(items, ids)
@@ -1497,7 +1614,8 @@ def main():  # noqa: C901 - orchestration kept aligned with deployed v6
                 rendered_dup += skipped_dup
 
         if not args.dry_run:
-            wm[key] = {"lines": total, "mtime": mtimes[f], "path": f}
+            wm[key] = {"lines": total, "mtime": snapshots[f].st_mtime,
+                       "path": f}
 
     print()
     print("=" * 60)
@@ -1506,6 +1624,11 @@ def main():  # noqa: C901 - orchestration kept aligned with deployed v6
     tot_quar = sum(r.get("quarantined", 0) for r in results)
     print("세션 %d개 처리 · 승격후보 %d건 · 검토격리 %d건 · 증거미달 폐기 %d건"
           % (len(results), tot_kept, tot_quar, tot_drop))
+    if dead_letters:
+        print("추출 실패 dead-letter %d개 (파일 증가 시 자동 재시도)" % len(dead_letters))
+        for dead in dead_letters:
+            print("  - %s reason=%s attempts=%s state=%s" % (
+                dead["session"], dead["reason"], dead["attempts"], dead["state"]))
     if tot_quar:
         print("격리 레인: %s (검토 대기 — 폐기 아님)" % args.quarantine)
     if results:
