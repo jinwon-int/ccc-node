@@ -163,7 +163,7 @@ else
     # "manual" trigger bypasses its hook cooldown (this sweep budgets itself).
     if jq -nc --arg sid "$sid" --arg tp "$transcript" \
         '{session_id:$sid, transcript_path:$tp}' 2>/dev/null \
-        | bash "$REVIEW" manual >>"$LOG" 2>&1; then
+        | CCC_SKILL_REVIEW_STATE_DIR="$STATE_DIR" bash "$REVIEW" manual >>"$LOG" 2>&1; then
       drafted=$((drafted + 1))
       tmp="$LEDGER.tmp.$$"
       { awk -F'\t' -v s="$sid" '$1!=s' "$LEDGER" 2>/dev/null;
@@ -200,7 +200,10 @@ fi
 EFFECTIVE_MODE="$(resolve_mode)"
 if [ "$EFFECTIVE_MODE" = "auto" ]; then
   if [ -f "$AUTOINSTALL" ]; then
-    summary="$(CCC_SKILL_AUTOSAVE_TRIGGER=sweep bash "$AUTOINSTALL" run 2>>"$LOG")" \
+    # autoinstall.sh anchors its queue to CCC_SKILL_REVIEW_STATE_DIR, never to
+    # CCC_STATE_DIR (which the bridge scopes per memory audience). Hand it the
+    # sweep's resolved state dir so both layers read the same queue.
+    summary="$(CCC_SKILL_REVIEW_STATE_DIR="$STATE_DIR" CCC_SKILL_AUTOSAVE_TRIGGER=sweep bash "$AUTOINSTALL" run 2>>"$LOG")" \
       && log "autoinstall $(printf '%s' "$summary" | head -c 500)" \
       || log "autoinstall failed (non-fatal)"
   else

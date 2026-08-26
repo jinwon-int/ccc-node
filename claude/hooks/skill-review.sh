@@ -15,7 +15,13 @@
 #   - Cooldown: CCC_SKILL_REVIEW_COOLDOWN_SECONDS (default 3600) for hook triggers.
 set -uo pipefail
 
-STATE_DIR="${CCC_STATE_DIR:-${HOME:-/root}/.claude/state}"
+# Node-global anchor, NOT CCC_STATE_DIR. This hook fires from SessionEnd, so
+# under an audience-scoped bridge session CCC_STATE_DIR points at a per-audience
+# memory tree — staging drafts there would hide them from the collector and the
+# installer, both of which use the node-global queue, and would silently move
+# the documented off-switch at ~/.claude/state/skill-review.disabled. Skills
+# install to one node-wide skills dir, so the whole queue is node-global.
+STATE_DIR="${CCC_SKILL_REVIEW_STATE_DIR:-${HOME:-/root}/.claude/state}"
 LOG="$STATE_DIR/skill-review.log"
 PENDING_DIR="$STATE_DIR/pending-skills"
 mkdir -p "$STATE_DIR" "$PENDING_DIR" 2>/dev/null

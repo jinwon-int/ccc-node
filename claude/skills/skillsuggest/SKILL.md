@@ -18,13 +18,16 @@ Two autosave modes change what "review" means here (`docs/skill-autosave.md`):
 ## Procedure
 
 1. **Check pending Skill Review drafts first** (LLM-drafted, still human-gated):
+   The queue is node-global. Resolve it with `CCC_SKILL_REVIEW_STATE_DIR`, never
+   with `CCC_STATE_DIR` — the bridge scopes that one per memory audience, and
+   reading it here reports an empty queue while real drafts sit unread.
    ```bash
-   STATE="${CCC_STATE_DIR:-$HOME/.claude/state}"
+   STATE="${CCC_SKILL_REVIEW_STATE_DIR:-$HOME/.claude/state}"
    find "$STATE/pending-skills" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort
    ```
    For a chosen `<id>`:
    ```bash
-   STATE="${CCC_STATE_DIR:-$HOME/.claude/state}"
+   STATE="${CCC_SKILL_REVIEW_STATE_DIR:-$HOME/.claude/state}"
    jq . "$STATE/pending-skills/<id>/meta.json"
    AUTO="${CCC_CLAUDE_DIR:-$HOME/.claude}/hooks/skill-review/autoinstall.sh"
    if [ -f "$STATE/pending-skills/<id>/proposal.json" ]; then
@@ -41,7 +44,7 @@ Two autosave modes change what "review" means here (`docs/skill-autosave.md`):
    For a legacy `SKILL.md` draft, approve only after reading the full draft and
    checking for node-specific facts or secrets:
    ```bash
-   STATE="${CCC_STATE_DIR:-$HOME/.claude/state}"
+   STATE="${CCC_SKILL_REVIEW_STATE_DIR:-$HOME/.claude/state}"
    id="<id>"
    name="$(jq -r '.name // empty' "$STATE/pending-skills/$id/meta.json")"
    [ -n "$name" ] || name="$(awk 'NR>1 && /^---/{exit} /^name:/ {sub(/^name:[[:space:]]*/,""); print; exit}' "$STATE/pending-skills/$id/SKILL.md")"
@@ -52,7 +55,7 @@ Two autosave modes change what "review" means here (`docs/skill-autosave.md`):
    ```
    Reject by archiving rather than deleting:
    ```bash
-   STATE="${CCC_STATE_DIR:-$HOME/.claude/state}"
+   STATE="${CCC_SKILL_REVIEW_STATE_DIR:-$HOME/.claude/state}"
    mv "$STATE/pending-skills/<id>" "$STATE/pending-skills/<id>.rejected-$(date -u +%Y%m%d%H%M%S)"
    ```
    A pending draft with an `autosave-block.json` file was machine-rejected by

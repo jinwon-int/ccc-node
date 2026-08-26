@@ -15,6 +15,16 @@ pass=0; fail=0
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
+# Sandbox every fallback path. These scripts resolve their state dir from
+# CCC_SKILL_REVIEW_STATE_DIR/CCC_CLAUDE_DIR/HOME; if a fixture forgets one, the
+# fallback must land in TMP and never in the real node queue. A run of this
+# suite once archived live drafts out of ~/.claude/state/pending-skills because
+# an unset anchor fell through to the operator's home.
+export HOME="$TMP/home"
+export CCC_CLAUDE_DIR="$TMP/home/.claude"
+mkdir -p "$CCC_CLAUDE_DIR/state" "$CCC_CLAUDE_DIR/skills"
+chmod 700 "$CCC_CLAUDE_DIR/state" "$CCC_CLAUDE_DIR/skills"
+
 ok() { if eval "$2"; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $1"; fi; }
 
 STATE="$TMP/state"
@@ -30,7 +40,7 @@ chmod 700 "$STATE"
 # CLAUDE_SKILLS_DIR is also set (to a separate empty dir) to prove the provider
 # selects the Codex surface and never the Claude one.
 run_codex() { # [extra env...] verb [args...]
-  CCC_STATE_DIR="$STATE" CCC_SKILL_PROVIDER=codex \
+  CCC_SKILL_REVIEW_STATE_DIR="$STATE" CCC_SKILL_PROVIDER=codex \
   CODEX_SKILLS_DIR="$CODEX_SKILLS" CLAUDE_SKILLS_DIR="$CLAUDE_SKILLS" \
   CCC_PUSH_SPOOL="$SPOOL" CCC_NODE=testnode "$@"
 }
@@ -200,7 +210,7 @@ cc_make() {
 }
 cc_make
 for _ in $(seq 1 10); do
-  CCC_STATE_DIR="$CC_STATE" CCC_SKILL_PROVIDER=codex CODEX_SKILLS_DIR="$CC_CODEX" \
+  CCC_SKILL_REVIEW_STATE_DIR="$CC_STATE" CCC_SKILL_PROVIDER=codex CODEX_SKILLS_DIR="$CC_CODEX" \
   CCC_PUSH_SPOOL="$CC_SPOOL" CCC_NODE=testnode CCC_SKILL_AUTOSAVE_MODE=auto \
   bash "$AUTO" run >/dev/null 2>&1 &
 done
@@ -218,7 +228,7 @@ printf -- '---\nname: codex-cap-a\ndescription: Capture the first recurring Code
 printf -- '---\nname: codex-cap-b\ndescription: Capture the second recurring Codex maintenance procedure for backup checks.\n---\n\n# B\n\n## Procedure\n1. Step.\n2. Verify.\n3. Record.\n4. Confirm.\n5. Done.\n' > "$CAP_STATE/pending-skills/cap-b/SKILL.md"
 jq -nc '{id:"cap-a",name:"codex-cap-a",status:"pending"}' > "$CAP_STATE/pending-skills/cap-a/meta.json"
 jq -nc '{id:"cap-b",name:"codex-cap-b",status:"pending"}' > "$CAP_STATE/pending-skills/cap-b/meta.json"
-out="$(CCC_STATE_DIR="$CAP_STATE" CCC_SKILL_PROVIDER=codex CODEX_SKILLS_DIR="$CAP_CODEX" \
+out="$(CCC_SKILL_REVIEW_STATE_DIR="$CAP_STATE" CCC_SKILL_PROVIDER=codex CODEX_SKILLS_DIR="$CAP_CODEX" \
   CCC_PUSH_SPOOL="$CAP_SPOOL" CCC_SKILL_AUTOSAVE_MODE=auto CCC_SKILL_AUTOSAVE_DAILY_CAP=1 bash "$AUTO" run)"
 ok "codex cap installs only one" '[ "$(find "$CAP_CODEX" -name SKILL.md | wc -l | tr -d "[:space:]")" = 1 ]'
 ok "codex over-cap draft deferred, not blocked" 'jq -e ".deferred == 1" >/dev/null <<<"$out"'
@@ -231,7 +241,7 @@ ln -s "$SL_REAL" "$SL_LINK"
 mkdir -p "$SL_STATE/pending-skills/sl-1"
 printf -- '---\nname: codex-symlink-target\ndescription: Capture the recurring Codex secure install directory verification procedure.\n---\n\n# S\n\n## Procedure\n1. Step.\n2. Verify.\n3. Record.\n4. Confirm.\n5. Done.\n' > "$SL_STATE/pending-skills/sl-1/SKILL.md"
 jq -nc '{id:"sl-1",name:"codex-symlink-target",status:"pending"}' > "$SL_STATE/pending-skills/sl-1/meta.json"
-out="$(CCC_STATE_DIR="$SL_STATE" CCC_SKILL_PROVIDER=codex CODEX_SKILLS_DIR="$SL_LINK" \
+out="$(CCC_SKILL_REVIEW_STATE_DIR="$SL_STATE" CCC_SKILL_PROVIDER=codex CODEX_SKILLS_DIR="$SL_LINK" \
   CCC_PUSH_SPOOL="$TMP/sl-spool" CCC_SKILL_AUTOSAVE_MODE=auto bash "$AUTO" run)"
 ok "codex symlinked skills dir fails closed" 'jq -e ".skipped == \"unsafe-skills-dir\"" >/dev/null <<<"$out"'
 ok "codex symlinked skills dir installs nothing" '[ -z "$(ls -A "$SL_REAL" 2>/dev/null)" ]'

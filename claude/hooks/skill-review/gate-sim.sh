@@ -25,7 +25,7 @@ export LC_ALL=C
 HERE="$(cd "$(dirname "$0")" && pwd)"
 AUTO="$HERE/autoinstall.sh"
 CLAUDE_DIR="${CCC_CLAUDE_DIR:-${HOME:-/root}/.claude}"
-STATE_DIR="${CCC_STATE_DIR:-$CLAUDE_DIR/state}"
+STATE_DIR="${CCC_SKILL_REVIEW_STATE_DIR:-$CLAUDE_DIR/state}"
 PENDING_DIR="${CCC_SKILL_REVIEW_PENDING_DIR:-$STATE_DIR/pending-skills}"
 
 [ -r "$AUTO" ] || { echo "gate-sim: cannot read $AUTO" >&2; exit 2; }
