@@ -21,7 +21,7 @@ FACTS="$CCC_STATE_DIR/memory-facts.jsonl"
 
 PAYLOAD='{"session_id":"sess-lf","trigger":"sessionend","distilled_at":"2026-06-28T00:00:00Z","honcho":[
   {"kind":"preference","text":"Operator prefers Helix as the current editor","subject":"operator"},
-  {"kind":"decision","text":"Honcho auth is enforced via OAuth subprocess","subject":"honcho"}
+  {"kind":"decision","text":"Honcho auth is enforced via OAuth subprocess","subject":"honcho","because":"The API requires an OAuth-backed identity"}
 ],"wiki_candidates":[]}'
 
 # ---- first append ----------------------------------------------------------
@@ -33,6 +33,8 @@ ok "facts file is chmod 600" '[ "$(stat -c %a "$FACTS")" = 600 ]'
 ok "each line is valid json with index schema" 'jq -e "select(.id and .kind and .text and .review == \"auto-local\" and .privacy == \"private\" and .source.type == \"distill\")" "$FACTS" >/dev/null'
 ok "id is distill-prefixed" 'jq -re ".id" "$FACTS" | grep -q "^distill-"'
 ok "tags carry distilled + trigger" 'jq -e "select((.tags | index(\"distilled\")) and (.tags | index(\"sessionend\")))" "$FACTS" >/dev/null'
+ok "decision preserves its extracted reason" 'jq -e '\''select(.kind == "decision" and .because == "The API requires an OAuth-backed identity")'\'' "$FACTS" >/dev/null'
+ok "facts without a reason omit the because key" '[ "$(jq -r '\''select(.kind == "preference") | has("because")'\'' "$FACTS")" = "false" ]'
 ok "durability is omitted (index derives it)" '[ "$(jq -r "has(\"durability\")" "$FACTS" | sort -u)" = "false" ]'
 
 # ---- dedup -----------------------------------------------------------------

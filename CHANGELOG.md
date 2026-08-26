@@ -5,6 +5,45 @@ All notable changes to the Claude Code node harness. Dates are KST.
 ## [Unreleased]
 
 ### Changed
+- **Legacy AUTO.md boundary in the batch publisher (#1301).** Existing Wiki
+  blocks from before status/pipeline metadata are preserved by stable key
+  instead of blocking later appends. Cumulative node sources remain strict by
+  default; the explicit `--skip-legacy-metadata` mode excludes and body-free
+  counts only those pre-pipeline blocks, while malformed keys, duplicates,
+  attribution errors, conflict markers, and secret-shaped content still fail.
+- **Single-batch 11-node auto-distill Wiki publication (#1298).** A designated
+  collector can now account for the exact TM-2380 roster with explicit
+  local/SSH/zero-candidate declarations, preview body-free counts, and merge
+  unseen stable keys into one Wiki worktree before optionally invoking one
+  `wiki-agent pr`. It fails closed on missing roster members, output/read
+  failures, wrong node attribution, duplicate keys, conflict markers, and
+  secret-shaped content; existing Wiki blocks win by key so human verdicts are
+  preserved and reruns are idempotent. Apply/submit are explicit opt-ins and
+  the existing AUTO.md red gate still requires a human merge. The collector is
+  source-only tooling and does not change or install the receipt-bound
+  extractor.
+- **auto-distill codex-lane support (#1295).** Codex-primary nodes can now
+  join the TM-2380 canary: `iter_messages` recognizes the Codex CLI rollout
+  schema (`response_item`/`message` payloads, `input_text`/`output_text`),
+  filtering the `[`/`#`/`<`-prefixed system/tool-context user turns that
+  dominate real rollouts (live sample: 166 user turns -> 86, digest 625KB ->
+  261KB while preserving every owner utterance). Digests gained a
+  `MAX_DIGEST_BYTES` (400KB) head-trim so an oversized session can no longer
+  blow up the prompt. `model_command` adds an engine=codex resolver
+  (`CCC_AUTO_DISTILL_PROVIDER=codex`, fail-closed — never falls back to
+  Piri/Claude) that isolates extraction calls by redirecting `CODEX_HOME` to
+  a scratch home with symlinked auth/config: the extractor's own rollouts
+  never touch `~/.codex/sessions` (live-proven on seoseo: 140 -> 140 real
+  sessions across a successful run, extractor sessions only under the
+  scratch tree; an earlier argv-only wiring that dropped the override and
+  leaked 20 sessions was caught by exactly this measurement and is
+  quarantined). Reading the operator's codex sessions stays opt-in via
+  `CCC_AUTO_DISTILL_CODEX=1` **and** is only allowed when the resolved
+  engine is codex — the blanket FORBIDDEN check remains for every other
+  node. Receipt re-minted from a genuine re-evaluation (TM-2407: recheck
+  7/12 suspect 0; TP 13 FP 1 FN 10 TN 23; collateral 0); test_receipt id
+  pin TM-2406 -> TM-2407. Known follow-up: the codex engine reports no
+  usage telemetry yet (cost metering shows 0).
 - **Fleet-wide performance pass — hooks, bridge idle/turn paths, distill
   queue, agent-cron, periodic scripts.** One optimization train from a
   full-repo efficiency review:
@@ -97,6 +136,14 @@ All notable changes to the Claude Code node harness. Dates are KST.
   per the i18n policy.
 
 ### Fixed
+- **Bounded auto-distill extraction retries (#1297).** Three consecutive
+  failures on the same session snapshot now dead-letter it before the per-run
+  CAP is applied, preventing a permanently failing newest session from
+  starving healthy work. The last successful cursor is preserved; file growth
+  grants a fresh retry budget, dry runs do not consume it, and body-free
+  reasons plus held/new state are exposed in audit and run summaries. The
+  exact source passed a genuine isolated evaluation (TM-2408: recheck 8/12,
+  suspect 0; TP 13, FP 1, FN 10, TN 23; collateral damage 0).
 - Review-sweep follow-up (LOW batch): bridge robustness — clean-repo
   statusline parity in the health renderer (crush label + timezone-naive
   `updated_at` no longer a TypeError), non-UTF-8 `.env` bytes and unknown

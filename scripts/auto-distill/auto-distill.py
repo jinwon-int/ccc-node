@@ -82,6 +82,8 @@ STATE = os.path.join(HOME, ".hermes/state/auto-distill.watermark.json")
 AUDIT = os.path.join(HOME, ".hermes/logs/auto-distill-audit.jsonl")
 
 MIN_TEXT = 400          # 이보다 짧은 다이제스트는 건질 게 없다
+# 다이제스트 상한(#1295): 초과 시 오래된 앞부분부터 자른다(digest_session 참조).
+MAX_DIGEST_BYTES = 400_000
 # 현행 파이프라인 버전. 감사로그와 **렌더된 항목 양쪽**에 각인한다.
 #   1 = 구조검증만  2 = +함의검증  3 = +격리레인/비용계측
 #   4 = +가치판정/인용보수  5 = +정본 중복 대조
@@ -111,6 +113,7 @@ def resolve_node():
     return NODE_ALIASES.get(h, h)
 
 CAP_PER_RUN = 5         # 회당 세션 상한
+EXTRACT_FAIL_BUDGET = 3  # 같은 파일 스냅샷의 연속 추출 실패 상한 (#1297)
 
 
 def log_audit(rec):
@@ -297,19 +300,37 @@ def iter_messages(path, since_line=0):
             if ty == "message":                       # piri
                 m = o.get("message", {}) or {}
                 role, mid = m.get("role"), (o.get("id") or "")[:8]
+                c = m.get("content")
             elif ty in ("user", "assistant"):          # Claude Code
                 m = o.get("message", {}) or {}
                 role, mid = (m.get("role") or ty), (o.get("uuid") or "")[:8]
+                c = m.get("content")
+            elif ty == "response_item":                # Codex CLI rollout (#1295)
+                p = o.get("payload") or {}
+                if p.get("type") != "message":
+                    continue
+                role, mid = p.get("role"), (p.get("id") or "")[:8]
+                c = p.get("content")
+                # codex user 턴에는 도구 맥락/시스템 프리앰블이 섞여 든다
+                # (실측: 166 user 중 ~80건이 [/#/< 시작 블록, 오너 발화는 아님).
+                # 이 노드의 오너 발화는 한국어 대화체라 세 패턴과 충돌하지
+                # 않는다. assistant 응답은 그대로 유지한다.
+                if role == "user":
+                    _c0 = c[0].get("text", "").lstrip()[:1] \
+                        if isinstance(c, list) and c and isinstance(c[0], dict) \
+                        else str(c or "").lstrip()[:1]
+                    if _c0 in ("[", "#", "<"):
+                        continue
             else:
                 continue
             if role not in ("user", "assistant"):
                 continue
             seen_schema = True
-            c = m.get("content")
             if isinstance(c, list):
                 # thinking / tool_use / tool_result 는 버린다
+                # (codex rollout 은 input_text/output_text 만 본문으로 취급)
                 txt = "".join(p.get("text", "") for p in c
-                              if isinstance(p, dict) and p.get("type") == "text")
+                              if isinstance(p, dict) and p.get("type") in ("text", "input_text", "output_text"))
             else:
                 txt = str(c or "")
             txt = txt.strip()
@@ -351,6 +372,61 @@ def save_watermark(wm):
     os.replace(tmp, STATE)
 
 
+def extract_failure_reason(error):
+    """Return one body-free failure class for state, summaries, and audit."""
+    reason = str(error or "").split(":", 1)[0].strip()
+    reason = re.sub(r"[^0-9A-Za-z_.-]+", "_", reason).strip("_")
+    return reason[:80] or "extract_fail"
+
+
+def extract_failure_state(entry):
+    """Read the optional retry state without trusting malformed watermark data."""
+    if not isinstance(entry, dict):
+        return {}
+    failure = entry.get("extract_failure")
+    return failure if isinstance(failure, dict) else {}
+
+
+def dead_letter_holds(entry, snapshot_size):
+    """A dead letter stays parked until its append-only source grows."""
+    failure = extract_failure_state(entry)
+    failed_size = failure.get("snapshot_size")
+    return (
+        failure.get("dead_lettered") is True
+        and type(failed_size) is int
+        and failed_size >= 0
+        and snapshot_size <= failed_size
+    )
+
+
+def record_extract_failure(
+        entry, *, path, snapshot_size, snapshot_mtime, error,
+        budget=EXTRACT_FAIL_BUDGET):
+    """Return updated retry state while preserving the last success cursor."""
+    current = dict(entry) if isinstance(entry, dict) else {}
+    previous = extract_failure_state(current)
+    previous_size = previous.get("snapshot_size")
+    previous_attempts = previous.get("attempts")
+    same_snapshot = type(previous_size) is int and previous_size == snapshot_size
+    if type(previous_attempts) is not int or previous_attempts < 0:
+        previous_attempts = 0
+    attempts = previous_attempts + 1 if same_snapshot else 1
+    limit = max(1, int(budget))
+    failure = {
+        "attempts": attempts,
+        "budget": limit,
+        "reason": extract_failure_reason(error),
+        "snapshot_size": int(snapshot_size),
+        "snapshot_mtime": float(snapshot_mtime),
+        "dead_lettered": attempts >= limit,
+    }
+    # `mtime` and `lines` remain the last *successful* cursor. Advancing either
+    # on failure would silently discard the unextracted increment.
+    current["path"] = path
+    current["extract_failure"] = failure
+    return current, failure
+
+
 def digest_session(path, since_line=0):
     """세션 파일에서 user/assistant 텍스트만 뽑는다.
 
@@ -372,6 +448,20 @@ def digest_session(path, since_line=0):
         # 판단하게 되므로 넉넉히 보관하고, 사람이 보는 출력에서만 자른다.
         ids[mid] = "%s: %s" % (role, txt[:1200].replace("\n", " "))
         kept.append("[%s] %s: %s" % (mid, role, txt))
+    # Codex 롤아웃은 시스템 프리앰블/도구 맥락이 user 턴으로 섞여 들어와
+    # 다이제스트가 600KB+ 로 커질 수 있다(#1295 실측 625KB). piri/claude 실측은
+    # ~126KB. 상한을 넘으면 **오래된 앞부분부터** 자른다 — 대화 끝이 최신 사실
+    # 이고, 증거 앤커(ids)도 남은 줄만 유지해 끊긴 인용을 막는다.
+    if len("\n".join(kept)) > MAX_DIGEST_BYTES:
+        kept_bytes, cut = 0, len(kept)
+        for i, chunk in enumerate(kept):
+            kept_bytes += len(chunk) + 1
+            if kept_bytes > MAX_DIGEST_BYTES:
+                cut = i
+                break
+        kept = kept[cut:]
+        kept_ids = {m.group(1) for c in kept for m in [re.match(r"\[([^\]]+)\]", c)] if m}
+        ids = {k: v for k, v in ids.items() if k in kept_ids}
     digest_session.last_anon = anon
     return "\n".join(kept), ids, n
 
@@ -435,9 +525,20 @@ def unwrap_claude_envelope(out):
     return usage, str(env.get("result") or "")
 
 
+# 리졸브된 엔진 전용 환경(#1295): main 에서 resolve_model_command() 결과로
+# 채우고 extract_json 이 자식 환경에 merge 한다. codex 엔진의 CODEX_HOME
+# 격리가 여기를 거치지 않으면(초기화 누락) 추출 세션이 원본 ~/.codex/sessions
+# 에 쌓여 자기호출 되먹임이 재발한다 — seoseo 실측으로 잡은 결함이다.
+ENGINE_ENV = {}
+
+
 def extract_json(prompt, model_cmd, timeout):
     """모델을 호출해 strict JSON 하나를 받아온다. 추출·함의검증 공용."""
     child_env = os.environ.copy()
+    # Engine-specific overrides (codex: CODEX_HOME isolation — see
+    # model_command.codex_scratch_home).
+    if ENGINE_ENV:
+        child_env.update(ENGINE_ENV)
     # Every extractor backend receives the legacy Claude-hook recursion guard.
     # Piri normally creates no Claude session, but carrying the guard keeps a
     # wrapper or future backend from re-entering SessionStart/End distill.
@@ -1177,6 +1278,7 @@ def main():  # noqa: C901 - orchestration kept aligned with deployed v6
         log_audit({"event": "engine_unavailable", "reason": message})
         return 2
     model_cmd = list(selected_model.argv)
+    ENGINE_ENV.update(dict(getattr(selected_model, "env_overrides", ())))
     reason = " reason=%s" % selected_model.reason if selected_model.reason else ""
     print("모델 엔진: engine=%s source=%s%s"
           % (selected_model.engine, selected_model.source, reason))
@@ -1199,11 +1301,28 @@ def main():  # noqa: C901 - orchestration kept aligned with deployed v6
         except Exception as e:
             print("      ⚠ Wiki 캐시 동기화 실패 (리터럴 대조가 낡을 수 있음): %s" % e)
 
-    picked = [(k, v) for k, v in SOURCES.items()
+    # INV-2: codex 로그는 어떤 경로로도 입력이 될 수 없다.
+    # 예외 (#1295): CCC_AUTO_DISTILL_CODEX=1 인 노드(codex 레인)는 추출 엔진도
+    # codex 로 리졸브됐을 때만 원본 codex 롤아웃을 소스로 허용한다. 추출 호출은
+    # CODEX_HOME 스크래치 리다이렉트로 격리되므로(model_command 참조) 추출기의
+    # 세션이 원본 트리에 떨어지는 일이 구조적으로 없다 — INV-2 ④ 실측이 이를
+    # 입증한다. 다른 엔진이면 격리가 없으므로 fail-closed.
+    codex_opt_in = os.environ.get("CCC_AUTO_DISTILL_CODEX", "").strip() == "1"
+    sources = dict(SOURCES)
+    if codex_opt_in:
+        sources["codex"] = FORBIDDEN
+    picked = [(k, v) for k, v in sources.items()
               if (args.source in ("auto", k)) and os.path.isdir(v)]
+    if codex_opt_in and picked and any(k == "codex" for k, _ in picked) \
+            and getattr(selected_model, "engine", None) != "codex":
+        print("FATAL: codex 소스는 codex 엔진(CODEX_HOME 격리)에서만 읽을 수 있다",
+              file=sys.stderr)
+        return 2
     for name, d in picked:
         rd = os.path.realpath(d)
         if rd == fb or rd.startswith(fb + os.sep):
+            if codex_opt_in and name == "codex":
+                continue  # 위 가드가 통과된 경우만 여기 온다
             print("FATAL: 소스 %s 가 codex 로그를 가리킨다" % name, file=sys.stderr)
             return 2
     if not picked:
@@ -1230,29 +1349,34 @@ def main():  # noqa: C901 - orchestration kept aligned with deployed v6
     import glob
     files = []
     for name, d in picked:
-        got = glob.glob(d + "/*/*.jsonl") + glob.glob(d + "/*.jsonl")
+        # codex 롤아웃은 세대/월/일 3단 아래에 있다 (sessions/YYYY/MM/DD/*.jsonl).
+        got = (glob.glob(d + "/*/*.jsonl") + glob.glob(d + "/*.jsonl")
+               + glob.glob(d + "/*/*/*/*.jsonl"))
         print("소스 %s: %d개" % (name, len(got)))
         files += got
     # stat 은 파일당 한 번만 한다 — 정렬키·지평·워터마크(·워터마크 저장)가 같은
     # 값을 재사용한다. 나열과 stat 사이에 사라진 파일은 조용히 제외한다
     # (예전에는 정렬 도중 getmtime 이 예외를 던져 회차 전체가 죽었다).
-    mtimes = {}
+    snapshots = {}
     for f in set(files):
         try:
-            mtimes[f] = os.path.getmtime(f)
+            snapshots[f] = os.stat(f)
         except OSError:
             continue
-    files = sorted(mtimes, key=mtimes.__getitem__, reverse=True)
+    files = sorted(snapshots, key=lambda path: snapshots[path].st_mtime,
+                   reverse=True)
 
     # 콜드스타트 지평. 워터마크가 없는 첫 회차에는 모든 과거 세션이 "신규"로 보인다
     # (실측 2026-08-22: 소교 697 · 노숙 193 · 곽가 90 · 육손 78). 지평이 없으면
     # 수개월 전 세션에서 이미 낡았거나 이미 기록된 사실을 다시 뽑느라 예산을 태운다.
     todo = []
+    dead_letters = []
     self_calls = 0
     too_old = 0
     horizon = time.time() - args.max_age_days * 86400 if args.max_age_days > 0 else 0
     for f in files:
-        mtime = mtimes[f]
+        snapshot = snapshots[f]
+        mtime = snapshot.st_mtime
         if horizon and mtime < horizon:
             too_old += 1
             continue
@@ -1262,14 +1386,33 @@ def main():  # noqa: C901 - orchestration kept aligned with deployed v6
         # 감사 이벤트를 매 회차 남기지 않는다 — 의도된 로그 소음 제거.
         key = hashlib.sha256(f.encode()).hexdigest()[:16]
         prev = wm.get(key, {})
-        if not (prev.get("lines", 0) == 0 or mtime > prev.get("mtime", 0)):
+        failure = extract_failure_state(prev)
+        held = dead_letter_holds(prev, snapshot.st_size)
+        if held:
+            if not args.only or args.only in os.path.basename(f):
+                dead_letters.append({
+                    "session": os.path.basename(f)[:24],
+                    "reason": failure.get("reason", "extract_fail"),
+                    "attempts": failure.get("attempts", EXTRACT_FAIL_BUDGET),
+                    "state": "held",
+                })
+            continue
+        failed_size = failure.get("snapshot_size")
+        reactivated = (
+            failure.get("dead_lettered") is True
+            and type(failed_size) is int
+            and snapshot.st_size > failed_size
+        )
+        if not reactivated \
+                and not (prev.get("lines", 0) == 0
+                         or mtime > prev.get("mtime", 0)):
             continue
         if is_self_call(f):
             self_calls += 1
             log_audit({"event": "skip", "session": os.path.basename(f)[:24],
                        "reason": "self_call"})
             continue
-        todo.append((f, key, prev.get("lines", 0)))
+        todo.append((f, key, prev.get("lines", 0), reactivated))
     if args.only:
         todo = [t for t in todo if args.only in os.path.basename(t[0])]
     skipped = max(0, len(todo) - args.cap)
@@ -1285,10 +1428,20 @@ def main():  # noqa: C901 - orchestration kept aligned with deployed v6
     render_path = args.render_out or os.path.join(HOME, ".hermes/logs/auto-%s.md" % args.node)
     rendered_add = rendered_dup = 0
     results = []
-    for f, key, since in todo:
+    for f, key, since, reactivated in todo:
         t0 = time.time()
         digest, ids, total = digest_session(f, since)
         name = os.path.basename(f)[:24]
+        if reactivated and not args.dry_run:
+            failure = extract_failure_state(wm.get(key, {}))
+            failed_size = failure.get("snapshot_size")
+            log_audit({
+                "event": "dead_letter_reactivated",
+                "session": name,
+                "reason": failure.get("reason", "extract_fail"),
+                "attempts": failure.get("attempts", EXTRACT_FAIL_BUDGET),
+                "growth_bytes": snapshots[f].st_size - failed_size,
+            })
         if len(digest) < MIN_TEXT:
             # INV-2: '스키마를 한 줄도 인식 못 함'과 '내용이 적음'은 다른 사건이다.
             # 전자를 too_small 로 뭉뚱그리면 어댑터 결함이 감사로그에서 정상으로 보인다.
@@ -1299,15 +1452,44 @@ def main():  # noqa: C901 - orchestration kept aligned with deployed v6
             if not args.dry_run:
                 # 스캔 시점 mtime 을 기록한다: 다이제스트 이후 붙은 내용이 있으면
                 # 파일 mtime 이 이보다 새로워져 다음 회차가 반드시 다시 본다.
-                wm[key] = {"lines": total, "mtime": mtimes[f], "path": f}
+                wm[key] = {"lines": total, "mtime": snapshots[f].st_mtime,
+                           "path": f}
             continue
         print("  추출  %s  증가분 %dB / %d줄 ... " % (name, len(digest), total - since), end="", flush=True)
         data, (err, usage, raw) = extract(digest, model_cmd, args.timeout)
         dt = time.time() - t0
         if err:
-            print("실패 (%s, %.1fs)" % (err, dt))
-            log_audit({"event": "extract_fail", "session": name, "error": err,
-                       "sec": round(dt, 1), "usage": usage})
+            failure_entry, failure = record_extract_failure(
+                wm.get(key, {}),
+                path=f,
+                snapshot_size=snapshots[f].st_size,
+                snapshot_mtime=snapshots[f].st_mtime,
+                error=err,
+            )
+            print("실패 (%s, %.1fs)" % (failure["reason"], dt))
+            log_audit({"event": "extract_fail", "session": name,
+                       "reason": failure["reason"],
+                       "attempt": failure["attempts"],
+                       "budget": failure["budget"],
+                       "sec": round(dt, 1), "usage": usage,
+                       "dry_run": args.dry_run})
+            if not args.dry_run:
+                wm[key] = failure_entry
+                if failure["dead_lettered"]:
+                    dead_letters.append({
+                        "session": name,
+                        "reason": failure["reason"],
+                        "attempts": failure["attempts"],
+                        "state": "new",
+                    })
+                    log_audit({
+                        "event": "dead_letter",
+                        "session": name,
+                        "reason": failure["reason"],
+                        "attempts": failure["attempts"],
+                        "budget": failure["budget"],
+                        "snapshot_size": failure["snapshot_size"],
+                    })
             continue
         items = data.get("items", []) if isinstance(data, dict) else []
         kept, dropped = verify(items, ids)
@@ -1432,7 +1614,8 @@ def main():  # noqa: C901 - orchestration kept aligned with deployed v6
                 rendered_dup += skipped_dup
 
         if not args.dry_run:
-            wm[key] = {"lines": total, "mtime": mtimes[f], "path": f}
+            wm[key] = {"lines": total, "mtime": snapshots[f].st_mtime,
+                       "path": f}
 
     print()
     print("=" * 60)
@@ -1441,6 +1624,11 @@ def main():  # noqa: C901 - orchestration kept aligned with deployed v6
     tot_quar = sum(r.get("quarantined", 0) for r in results)
     print("세션 %d개 처리 · 승격후보 %d건 · 검토격리 %d건 · 증거미달 폐기 %d건"
           % (len(results), tot_kept, tot_quar, tot_drop))
+    if dead_letters:
+        print("추출 실패 dead-letter %d개 (파일 증가 시 자동 재시도)" % len(dead_letters))
+        for dead in dead_letters:
+            print("  - %s reason=%s attempts=%s state=%s" % (
+                dead["session"], dead["reason"], dead["attempts"], dead["state"]))
     if tot_quar:
         print("격리 레인: %s (검토 대기 — 폐기 아님)" % args.quarantine)
     if results:

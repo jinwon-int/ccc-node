@@ -3,9 +3,9 @@
   "pipeline": 6,
   "subject": {
     "path": "scripts/auto-distill/auto-distill.py",
-    "sha256": "eb3ddcea465bd5b520cc80944a28fbb99f2773aa66ef8a92199be7bd5225f0b7",
+    "sha256": "595f653c93f9082a35dc7633cc62f893828e04570d16d5e83a69633335035be7",
     "surface_schema": "ccc.auto-distill.canon-surface.v1",
-    "surface_sha256": "7967da08c25cb6c2eb1d2b9477b3b4ff0aec43bf79e93f7a4123828db2234d7e",
+    "surface_sha256": "fa1e3a99cccae1e6e054c4cf44e4147664f8deb6a1a7e47eade12768558c9f52",
     "surface_members": [
       "assign:PIPELINE",
       "assign:CANON_PROMPT",
@@ -28,9 +28,9 @@
     ]
   },
   "evaluation": {
-    "id": "TM-2406",
-    "evaluated_source_sha256": "eb3ddcea465bd5b520cc80944a28fbb99f2773aa66ef8a92199be7bd5225f0b7",
-    "completed_at": "2026-08-26T14:23:27+09:00",
+    "id": "TM-2408",
+    "evaluated_source_sha256": "595f653c93f9082a35dc7633cc62f893828e04570d16d5e83a69633335035be7",
+    "completed_at": "2026-08-26T14:00:12.187811Z",
     "provider": "claude-code-oauth",
     "model": "haiku",
     "corpus": {
@@ -47,24 +47,24 @@
       "recheck_addr_sha256": "01ad650774f1e90c31052d21775ec2a0d45c9518962970458f9195b8204e3e70"
     },
     "artifacts": {
-      "eval_log_sha256": "9015d3b9f40726feca72efa39cbf3510235ff6b25c484279fb07e726969f51c1",
-      "eval_result_sha256": "6d5ef5d25f49329fab0a05613d5447fa9edb01a75a73a1673b1924912ffb2885",
-      "recheck_log_sha256": "2eef88de94f90c77bde0bff011f3c6f8b56ddbe12844d398e53fd25d99bb5216"
+      "eval_log_sha256": "6abe3e06be8f45026bc43093df2d17595badb47a5e7816a5d8d39b3ec5ebe2b1",
+      "eval_result_sha256": "b1b9e5314e900646177195ae5ea088843ed87bdadcfbaf72a7cbfdad7de6383b",
+      "recheck_log_sha256": "e7c7ab43576b850f1dfce019411b0c3990d40b0b9ae51fcbc3b3c17c1784f06e"
     },
     "recheck": {
       "baseline_duplicates": 1,
-      "duplicates": 7,
+      "duplicates": 8,
       "cases": 12,
       "suspect": 0
     },
     "confusion": {
-      "tp": 16,
+      "tp": 13,
       "fp": 1,
-      "fn": 7,
+      "fn": 10,
       "tn": 23
     },
     "collateral_damage": 0,
     "passed": true
   },
-  "issued_at": "2026-08-26T14:25:27+09:00"
+  "issued_at": "2026-08-26T23:01:02+09:00"
 }

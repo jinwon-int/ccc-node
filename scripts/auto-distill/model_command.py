@@ -31,6 +31,17 @@ PIRI_ARGS = (
     "--exclude-tools",
     "bash,edit,write,read,grep,find,ls,ask_question",
 )
+# Codex exec reads the prompt from stdin (trailing "-") and persists rollout
+# sessions under $CODEX_HOME. Persistence cannot be disabled on the CLI, so the
+# engine instead redirects CODEX_HOME to an isolated scratch home (see
+# codex_scratch_home) — the extractor's own rollouts then never land in the
+# operator's ~/.codex/sessions, making the self-call remix structurally
+# impossible (#1295, live-proven on seoseo 2026-08-26).
+CODEX_ARGS = (
+    "exec",
+    "--skip-git-repo-check",
+    "-",
+)
 CLAUDE_ARGS = (
     "-p",
     "--no-session-persistence",
@@ -63,6 +74,39 @@ class ModelCommand:
     engine: str
     source: str
     reason: str | None = None
+    # Engine-specific environment overrides merged into the child environment
+    # by the caller (extract_json). Codex uses this for CODEX_HOME isolation.
+    env_overrides: tuple[tuple[str, str], ...] = ()
+
+
+def codex_scratch_home(home: Path | None = None) -> Path:
+    """Prepare an isolated CODEX_HOME and return it (idempotent, per-node).
+
+    Auth/config are *symlinked* from the real ~/.codex (no copies, no secret
+    material is duplicated); only rollout sessions are written under the
+    scratch home. Live-proven on seoseo: with this redirect the extractor's
+    session lands in the scratch tree and ~/.codex/sessions stays untouched
+    (119 → 119 files across a successful "OK" completion). Raises
+    ModelCommandError when the real auth is missing so a codex-lane node fails
+    closed instead of silently issuing unauthenticated calls.
+    """
+
+    real_home = (Path.home() if home is None else home) / ".codex"
+    auth = real_home / "auth.json"
+    if not auth.is_file():
+        raise ModelCommandError(
+            "codex engine selected but ~/.codex/auth.json is missing"
+        )
+    scratch = real_home.parent / ".codex-auto-distill-scratch"
+    scratch.mkdir(parents=True, exist_ok=True)
+    for name in ("auth.json", "config.toml"):
+        target = real_home / name
+        link = scratch / name
+        if link.is_symlink() or link.exists():
+            link.unlink()
+        if target.is_file():
+            link.symlink_to(target)
+    return scratch
 
 
 def parse_systemd_environment(raw: str, *, allowed: Sequence[str] = UNIT_ENV_KEYS) -> dict[str, str]:
@@ -156,9 +200,9 @@ def _provider_hint(process_env: Mapping[str, str], unit_env: Mapping[str, str]) 
         or ""
     ).strip().lower()
     if dedicated:
-        if dedicated not in {"auto", "piri", "claude"}:
+        if dedicated not in {"auto", "piri", "claude", "codex"}:
             raise ModelCommandError(
-                "CCC_AUTO_DISTILL_PROVIDER must be auto, piri, or claude"
+                "CCC_AUTO_DISTILL_PROVIDER must be auto, piri, claude, or codex"
             )
         return dedicated
     runtime = (
@@ -215,6 +259,9 @@ def resolve_model_command(
         ("PATH:claude", "claude"),
     )
     claude_executable, claude_source = _first_runnable(claude_candidates, which=which)
+    codex_executable, codex_source = _first_runnable(
+        (("PATH:codex", "codex"),), which=which
+    )
     provider = _provider_hint(process_env, unit_env)
 
     if provider == "piri":
@@ -230,6 +277,21 @@ def resolve_model_command(
             raise ModelCommandError("provider=claude but no runnable Claude CLI was found")
         return ModelCommand(
             (claude_executable, *CLAUDE_ARGS), "claude", str(claude_source)
+        )
+    if provider == "codex":
+        # A node explicitly identified as codex never falls back to Piri or
+        # Claude when the codex CLI is missing (fail-closed, #1295).
+        if not codex_executable:
+            raise ModelCommandError(
+                "provider=codex but no runnable codex CLI was found; "
+                "refusing Piri/Claude fallback"
+            )
+        scratch = codex_scratch_home()
+        return ModelCommand(
+            (codex_executable, *CODEX_ARGS),
+            "codex",
+            str(codex_source),
+            env_overrides=(("CODEX_HOME", str(scratch)),),
         )
     if piri_executable:
         return ModelCommand((piri_executable, *PIRI_ARGS), "piri", str(piri_source))
