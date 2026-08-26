@@ -147,6 +147,9 @@ def _render_facts(
             "tags": ["distilled"] + ([trigger] if trigger else []),
             "source": {"type": "distill", "session": session, "trigger": trigger},
         }
+        because = str(item.get("because") or "").strip()
+        if because:
+            fact["because"] = because
         if _enabled(os.environ.get("CCC_MEMORY_AUDIENCE_SCOPED", "0")):
             fact["audience"] = audience
         added.append(json.dumps(fact, ensure_ascii=False))
