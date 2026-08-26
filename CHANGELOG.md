@@ -5,6 +5,12 @@ All notable changes to the Claude Code node harness. Dates are KST.
 ## [Unreleased]
 
 ### Changed
+- **Legacy AUTO.md boundary in the batch publisher (#1301).** Existing Wiki
+  blocks from before status/pipeline metadata are preserved by stable key
+  instead of blocking later appends. Cumulative node sources remain strict by
+  default; the explicit `--skip-legacy-metadata` mode excludes and body-free
+  counts only those pre-pipeline blocks, while malformed keys, duplicates,
+  attribution errors, conflict markers, and secret-shaped content still fail.
 - **Single-batch 11-node auto-distill Wiki publication (#1298).** A designated
   collector can now account for the exact TM-2380 roster with explicit
   local/SSH/zero-candidate declarations, preview body-free counts, and merge

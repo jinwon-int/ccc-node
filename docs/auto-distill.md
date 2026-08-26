@@ -135,8 +135,14 @@ The collector requires all 11 nodes to be accounted for explicitly. It rejects
 ambiguous globs, wrong AUTO.md headers, duplicate candidate keys, merge markers,
 and secret-shaped content before the first Wiki write. Existing Wiki blocks win
 by stable key, so a local `unverified` copy cannot overwrite a human
-`promoted`/`discarded`/`fix-citation` verdict. This also makes a repeated batch
-idempotent. A prior attribution bug may leave an old `auto-<wrong-node>.md` on a
+`promoted`/`discarded`/`fix-citation` verdict. Historical target blocks that
+predate the current status/pipeline markers are preserved unchanged. Cumulative
+source files can carry the same pre-pipeline shape; they fail closed by default.
+After separately accounting for those legacy blocks, pass
+`--skip-legacy-metadata` to exclude them while reporting a body-free
+`rejected_legacy` count. Every other malformed block still fails. This makes a
+repeated batch idempotent without silently upgrading old evidence to the current
+pipeline. A prior attribution bug may leave an old `auto-<wrong-node>.md` on a
 host; map only the corrected node-specific path and never upload the stale file.
 
 `publish_wiki.py` is source-only collector tooling and is not installed by
