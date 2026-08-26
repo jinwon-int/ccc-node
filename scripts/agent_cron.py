@@ -237,11 +237,19 @@ def task_lock_guard(task_id):
             os.close(fd)
 
 
+_boot_id_cache = None
+
+
 def boot_id():
-    try:
-        return Path('/proc/sys/kernel/random/boot_id').read_text(encoding='utf-8').strip()
-    except OSError:
-        return ''
+    # Process-invariant, so read /proc once: lock_status() consults it for
+    # every task on every plan, which used to re-read the file each time.
+    global _boot_id_cache
+    if _boot_id_cache is None:
+        try:
+            _boot_id_cache = Path('/proc/sys/kernel/random/boot_id').read_text(encoding='utf-8').strip()
+        except OSError:
+            _boot_id_cache = ''
+    return _boot_id_cache
 
 
 def read_lock(task_id):
@@ -632,8 +640,36 @@ def parse_scheduler_args():
     return dry_run, execute, at_value, local_json, max_runs
 
 
+def _status_health(status, row, last_status):
+    if status == 'disabled':
+        return 'disabled'
+    if status == 'run-limit-reached':
+        return 'completed'
+    if status in {'locked', 'stale-lock'}:
+        return 'locked'
+    if status == 'persist-failed':
+        return 'failed'
+    if status == 'retry-exhausted':
+        return 'retry-exhausted'
+    if status == 'retry-wait':
+        return 'retry-wait'
+    if status in {'due', 'retry-due'}:
+        return 'due'
+    if status == 'invalid-schedule' or row.get('error'):
+        return 'invalid'
+    if last_status in {'failed', 'error'}:
+        return 'failed'
+    return 'healthy'
+
+
 def agent_cron_status(data):
     plan = due_plan(data)
+    # One pass instead of a task_by_id() linear scan per plan row; first task
+    # wins on a duplicate id, mirroring task_by_id().
+    tasks_by_id = {}
+    for candidate in data.get('tasks', []):
+        if isinstance(candidate, dict):
+            tasks_by_id.setdefault(candidate.get('id'), candidate)
     tasks = []
     counts = {
         'total': 0,
@@ -650,32 +686,14 @@ def agent_cron_status(data):
     for row in plan.get('tasks', []):
         status = row.get('status') or 'unknown'
         task_id = row.get('id')
-        task = task_by_id(data, task_id) if task_id else None
+        task = tasks_by_id.get(task_id) if task_id else None
         last_status = task.get('lastStatus') if isinstance(task, dict) else None
         last_exit = None
         if isinstance(task, dict):
             history = task.get('runHistory')
             if isinstance(history, list) and history and isinstance(history[-1], dict):
                 last_exit = history[-1].get('exitCode')
-        health = 'healthy'
-        if status == 'disabled':
-            health = 'disabled'
-        elif status == 'run-limit-reached':
-            health = 'completed'
-        elif status in {'locked', 'stale-lock'}:
-            health = 'locked'
-        elif status == 'persist-failed':
-            health = 'failed'
-        elif status == 'retry-exhausted':
-            health = 'retry-exhausted'
-        elif status == 'retry-wait':
-            health = 'retry-wait'
-        elif status in {'due', 'retry-due'}:
-            health = 'due'
-        elif status == 'invalid-schedule' or row.get('error'):
-            health = 'invalid'
-        elif last_status in {'failed', 'error'}:
-            health = 'failed'
+        health = _status_health(status, row, last_status)
         counts['total'] += 1
         if health == 'retry-wait':
             counts['retry_wait'] += 1
@@ -811,6 +829,11 @@ def scheduler_plan(data):
 def scheduler_execute(data, plan, actions, at_value, as_json, max_runs):
     runnable = [a for a in actions if a.get('action') == 'would-run' and a.get('taskId')]
     selected = runnable[:max_runs]
+    # Hand each run its already-computed plan row so run_execute does not
+    # replan every task per execution; first row wins, mirroring run_plan_for.
+    rows_by_id = {}
+    for row in plan.get('tasks', []):
+        rows_by_id.setdefault(row.get('id'), row)
     results = []
     any_headless = False
     any_spool = False
@@ -818,7 +841,10 @@ def scheduler_execute(data, plan, actions, at_value, as_json, max_runs):
     any_lock = False
     any_task_write = False
     for action in selected:
-        result, _json, _rc = run_execute(data, action['taskId'], at_value or plan.get('at'), True)
+        result, _json, _rc = run_execute(
+            data, action['taskId'], at_value or plan.get('at'), True,
+            plan_row=rows_by_id.get(action['taskId']), plan_at=plan.get('at'),
+        )
         results.append(result)
         m = result.get('mutations') or {}
         any_headless = any_headless or bool(m.get('headlessExecute'))
@@ -1470,17 +1496,23 @@ def write_owner_spool(task, task_id, run_id, scheduled_at, status, headless, at)
         return {**base, 'delivery': 'spool-error', 'redacted': True, 'error': short_text(str(e), 600)}
 
 
-def run_execute(data, task_id, at_value, as_json):  # noqa: C901 -- #348 baseline hotspot
+def run_execute(data, task_id, at_value, as_json, plan_row=None, plan_at=None):  # noqa: C901 -- #348 baseline hotspot
     task = task_by_id(data, task_id)
     if not task:
         return {'ok': False, 'mode': 'run-execute', 'taskId': task_id, 'error': 'task id not found'}, as_json, 1
-    plan, row = run_plan_for(data, task_id, at_value)
-    if row is None:
-        return {'ok': False, 'mode': 'run-execute', 'taskId': task_id, 'error': 'task id not found in due plan'}, as_json, 1
+    # scheduler_execute already holds the due plan; when it hands this task's
+    # row (and the plan's at) over, skip the per-task all-tasks replan. The
+    # manual `run` path keeps the defaults and plans for itself.
+    if plan_row is None or plan_at is None:
+        plan, plan_row = run_plan_for(data, task_id, at_value)
+        if plan_row is None:
+            return {'ok': False, 'mode': 'run-execute', 'taskId': task_id, 'error': 'task id not found in due plan'}, as_json, 1
+        plan_at = plan.get('at')
+    row = plan_row
     base = {
         'mode': 'run-execute',
         'store': str(store),
-        'at': plan.get('at'),
+        'at': plan_at,
         'taskId': task_id,
         'scheduledAt': row.get('scheduledAt'),
         'due': bool(row.get('due')),
@@ -1493,7 +1525,7 @@ def run_execute(data, task_id, at_value, as_json):  # noqa: C901 -- #348 baselin
         return {**base, 'ok': True, 'status': 'disabled', 'mutations': mutation_flags(False, False, False)}, as_json, 0
     if not row.get('due'):
         return {**base, 'ok': True, 'status': 'not-due', 'mutations': mutation_flags(False, False, False)}, as_json, 0
-    at = parse_dt(plan.get('at'), '--at')
+    at = parse_dt(plan_at, '--at')
     scheduled_at = row.get('scheduledAt') or fmt_dt(at)
     run_id = f'{task_id}-{int(at.timestamp())}-{os.getpid()}'
     acquired, lock = acquire_for_run(task_id, task, run_id, scheduled_at, at)
