@@ -170,6 +170,11 @@
       "pattern": "claude/skills/github-metered-billing-leak-diagnosis/**",
       "compatibility": "claude-only",
       "reason": "generic gh billing-API diagnostic procedure authored for Claude skill matching; codex mirror candidate, none exists yet"
+    },
+    {
+      "pattern": "claude/skills/hwp-forge-donor-template-restore-build/**",
+      "compatibility": "claude-only",
+      "reason": "generic HWP/HWPX form-inheritance and donor-restore document procedure authored for Claude skill matching; codex mirror candidate, none exists yet"
     }
   ],
   "managed_skills": [
