@@ -175,6 +175,21 @@
       "pattern": "claude/skills/hwp-forge-donor-template-restore-build/**",
       "compatibility": "claude-only",
       "reason": "generic HWP/HWPX form-inheritance and donor-restore document procedure authored for Claude skill matching; codex mirror candidate, none exists yet"
+    },
+    {
+      "pattern": "skills/shared/scheduled-verification-with-session-fallback/**",
+      "compatibility": "claude-only",
+      "reason": "durable-scheduler capability probe and tiered scheduling procedure; references the Claude-only CronCreate tier; codex mirror candidate, none exists yet"
+    },
+    {
+      "pattern": "skills/shared/cli-diagnostic-stderr-sink-detection/**",
+      "compatibility": "claude-only",
+      "reason": "generic shell stream/exit-code diagnosis procedure authored for Claude skill matching; codex mirror candidate, none exists yet"
+    },
+    {
+      "pattern": "skills/shared/schema-change-mixed-data-validation/**",
+      "compatibility": "claude-only",
+      "reason": "generic schema-changeover data-validation procedure authored for Claude skill matching; codex mirror candidate, none exists yet"
     }
   ],
   "managed_skills": [
