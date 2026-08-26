@@ -39,7 +39,7 @@ from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Mapping, Optional
+from typing import Any, Dict, Mapping, Optional
 from xml.etree import ElementTree
 
 logger = logging.getLogger(__name__)
@@ -110,6 +110,11 @@ class RecoveryStats:
     #: The notifications stay pending in the transcript FIFO, so a wakeup
     #: that never consumes them falls back to raw delivery on a later scan.
     deferred_wakeup: int = 0
+    #: Conversations skipped because a prior scan fully handled an identical
+    #: transcript (same dev/ino/size/mtime identity): an unchanged append-only
+    #: file cannot yield new notifications, so the per-tick full JSONL parse
+    #: is skipped until the file changes.
+    skipped_unchanged: int = 0
 
 
 def recovery_enabled(environ: Optional[Mapping[str, str]] = None) -> bool:
@@ -724,6 +729,7 @@ async def recover_dead_session_notifications(  # noqa: C901 -- #348 baseline hot
     root_retry_attempts: int = DEFAULT_ROOT_RETRY_ATTEMPTS,
     root_retry_backoff_seconds: float = DEFAULT_ROOT_RETRY_BACKOFF_SECONDS,
     wakeup_defer: Optional[Any] = None,
+    scan_cache: Optional[Dict[str, Any]] = None,
 ) -> RecoveryStats:
     """Scan persisted dead sessions once and deliver bounded terminal notices.
 
@@ -736,6 +742,16 @@ async def recover_dead_session_notifications(  # noqa: C901 -- #348 baseline hot
     before. Deferral never consumes anything — the notifications stay in the
     transcript FIFO, so unless a wakeup turn dequeues them a later scan
     delivers them raw; a predicate error also falls back to raw delivery.
+
+    ``scan_cache`` (optional mutable mapping owned by the periodic caller)
+    remembers, per conversation, the transcript file identity a fully handled
+    scan last saw. An unchanged append-only transcript cannot produce new
+    notifications, so matching identities skip the full JSONL parse — this
+    scan runs every interval over up to ``max_sessions`` transcripts forever,
+    and re-parsing megabytes of unchanged history dominated its cost. Entries
+    are only written after a pass that left nothing behind (no failed
+    delivery, no per-scan budget cut, no quarantine, no wakeup deferral), so
+    any incomplete pass keeps rescanning until it completes.
     """
     stats = RecoveryStats()
     if not recovery_enabled() or not conversations_dir:
@@ -828,6 +844,15 @@ async def recover_dead_session_notifications(  # noqa: C901 -- #348 baseline hot
                             )
                         else:
                             stats.failed += 1
+                    continue
+                identity = _transcript_file_identity(path)
+                if (
+                    scan_cache is not None
+                    and quarantine is None
+                    and identity is not None
+                    and scan_cache.get(storage_key) == (session_id, identity)
+                ):
+                    stats.skipped_unchanged += 1
                     continue
                 if wakeup_defer is None:
                     replay = None
@@ -937,6 +962,16 @@ async def recover_dead_session_notifications(  # noqa: C901 -- #348 baseline hot
                     break
                 stats.delivered += 1
                 sent_here += 1
+            else:
+                # The pass handled everything this transcript holds (every
+                # break path above skips this else): until the file identity
+                # changes, a rescan can only rediscover markered duplicates.
+                if (
+                    scan_cache is not None
+                    and quarantine is None
+                    and identity is not None
+                ):
+                    scan_cache[storage_key] = (session_id, identity)
         finally:
             lock.release()
     return stats
@@ -970,6 +1005,10 @@ async def run_periodic_dead_session_recovery(
     same tick.
     """
     interval = recovery_interval()
+    # Per-conversation transcript identity of the last fully handled scan;
+    # lives for the loop's lifetime so unchanged transcripts stop being
+    # re-parsed every tick (see recover_dead_session_notifications).
+    scan_cache: Dict[str, Any] = {}
     while not stop_event.is_set():
         try:
             await asyncio.wait_for(stop_event.wait(), timeout=interval)
@@ -983,6 +1022,7 @@ async def run_periodic_dead_session_recovery(
                 project_handler,
                 conversations_dir,
                 wakeup_defer=wakeup_defer,
+                scan_cache=scan_cache,
             )
             if on_stats is not None:
                 on_stats(stats)

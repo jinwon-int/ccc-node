@@ -210,6 +210,79 @@ class DistillJournal(JsonJournalCore):
                 self._validate_job_name(path)
             return tuple(self._read_unlocked(path.stem) for path in paths)
 
+    @staticmethod
+    def _job_fully_terminal(job: DistillJob) -> bool:
+        """True when no pipeline stage will ever act on this job again."""
+        if job.status in (
+            DistillJobStatus.TERMINAL_FAILED,
+            DistillJobStatus.EXTRACTION_TERMINAL_FAILED,
+        ):
+            # Extraction never completed, so the sink stages can never leave
+            # PENDING: the job is finished for every consumer.
+            return True
+        if job.status is not DistillJobStatus.EXTRACTION_DONE:
+            return False
+        return (
+            job.local_sink_status
+            in (
+                DistillLocalSinkStatus.DONE,
+                DistillLocalSinkStatus.TERMINAL_FAILED,
+                DistillLocalSinkStatus.UNROUTABLE,
+            )
+            and job.wiki_sink_status
+            in (
+                DistillWikiSinkStatus.DONE,
+                DistillWikiSinkStatus.TERMINAL_FAILED,
+                DistillWikiSinkStatus.DISABLED,
+            )
+            and job.honcho_sink_status
+            in (
+                DistillHonchoSinkStatus.DONE,
+                DistillHonchoSinkStatus.TERMINAL_FAILED,
+                DistillHonchoSinkStatus.DISABLED,
+            )
+        )
+
+    def prune_terminal_jobs(
+        self,
+        *,
+        older_than_seconds: float,
+        now: datetime | None = None,
+    ) -> tuple[str, ...]:
+        """Remove fully-terminal jobs whose last update is older than the cutoff.
+
+        Nothing ever deleted finished jobs before, so the journal grew without
+        bound and every sweep in every pipeline loop re-read and re-validated
+        records (snapshot payloads included) that no stage could act on again.
+        Only jobs that pass full validation AND are terminal for every stage
+        are removed; malformed or in-flight records are always kept, and each
+        removal is reported to the caller for logging (no silent disposal).
+        """
+        if older_than_seconds <= 0:
+            return ()
+        current_time = _normalize_time(now or _utc_now())
+        removed: list[str] = []
+        with self._exclusive():
+            for path in sorted(self.root.glob("*.json")):
+                try:
+                    self._validate_job_name(path)
+                    job = self._read_unlocked(path.stem)
+                    updated_at = _parse_timestamp(job.updated_at)
+                except (KeyError, ValueError, PermissionError, OSError):
+                    continue
+                if not self._job_fully_terminal(job):
+                    continue
+                if (current_time - updated_at).total_seconds() < older_than_seconds:
+                    continue
+                try:
+                    path.unlink()
+                except FileNotFoundError:
+                    continue
+                except OSError:
+                    continue
+                removed.append(job.job_id)
+        return tuple(removed)
+
     def claim(
         self,
         job_id: str,

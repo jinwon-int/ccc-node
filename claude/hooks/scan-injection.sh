@@ -8,10 +8,16 @@
 set -uo pipefail
 
 label="${1:-memory-injection}"
+# Optional byte cap applied to the sanitized output inside the same Python
+# process (same truncation contract as memory_render.py limit-bytes), so
+# callers that need scan+cap pay one interpreter start instead of two.
+# Empty/non-numeric means "no cap" — existing scan-only callers are unchanged.
+max_bytes="${2:-}"
+case "$max_bytes" in *[!0-9]*) max_bytes="" ;; esac
 input_tmp="$(mktemp)"
 trap 'rm -f "$input_tmp"' EXIT
 cat > "$input_tmp"
-python3 - "$label" "$input_tmp" <<'PY'
+python3 - "$label" "$input_tmp" "$max_bytes" <<'PY'
 import json
 import os
 import re
@@ -81,7 +87,17 @@ for rx in injection_patterns:
     text = text2
 
 # Emit sanitized text first; audit metadata never includes raw/redacted body.
-sys.stdout.write(text)
+# The optional cap mirrors memory_render.py cmd_limit_bytes byte-for-byte
+# (marker reserved inside the limit, truncation on a decodable boundary).
+# Audit sizes below stay pre-cap, exactly as when the cap ran downstream.
+max_bytes = sys.argv[3] if len(sys.argv) > 3 else ""
+out = text.encode('utf-8', 'replace')
+if max_bytes.isdigit() and int(max_bytes) > 0 and len(out) > int(max_bytes):
+    limit = int(max_bytes)
+    suffix = "\n… [truncated by CCC memory budget]\n".encode("utf-8")
+    keep = max(0, limit - len(suffix))
+    out = out[:keep].decode("utf-8", errors="ignore").encode("utf-8") + suffix
+sys.stdout.buffer.write(out)
 
 if categories:
     log = os.environ.get('CCC_AUDIT_LOG', os.path.expanduser('~/.claude/state/audit.jsonl'))

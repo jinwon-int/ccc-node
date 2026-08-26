@@ -16,6 +16,7 @@ HONCHO_TIMEOUT="${CCC_HONCHO_TIMEOUT_SEC:-60}"
 HONCHO_ENABLED="${CCC_HONCHO_MEMORY_ENABLED:-1}"
 HONCHO_FORCE_REFRESH="${CCC_HONCHO_FORCE_REFRESH:-0}"
 WIKI_ENABLED="${CCC_WIKI_MEMORY_ENABLED:-1}"
+WIKI_FORCE_REFRESH="${CCC_WIKI_FORCE_REFRESH:-0}"
 ISOLATION_PROFILE="${CCC_NODE_ISOLATION_PROFILE:-fleet}"
 [ "$ISOLATION_PROFILE" = "external" ] && WIKI_ENABLED=0
 PROFILE="${CCC_MEMORY_PROFILE:-honcho}"
@@ -110,6 +111,32 @@ honcho_cache_is_fresh() { # <query_hash> <config_hash>
     ' "$status_file" >/dev/null 2>&1
 }
 
+wiki_cache_is_fresh() { # <query_hash>
+  local query_hash="$1"
+  local status_file="$CACHE/.wiki.status.json"
+  local max_age="${CCC_WIKI_CACHE_MAX_AGE_SEC:-${CCC_MEMORY_CACHE_TTL_SEC:-21600}}"
+  local has_cache=0
+  is_disabled "$WIKI_FORCE_REFRESH" || return 1
+  case "$max_age" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$max_age" -gt 0 ] || return 1
+  [ -f "$status_file" ] || return 1
+  [ -s "$CACHE/wiki.txt" ] && has_cache=1
+  jq -e --arg query_hash "$query_hash" --arg has_cache "$has_cache" \
+    --argjson now "$(date -u +%s)" --argjson max_age "$max_age" '
+      # ok|empty both mean the wiki agent WAS reached and answered (#781): the
+      # declared TTL was recorded but never enforced, so every SessionStart
+      # paid a full prefetch to rebuild a cache it considered fresh for 6h.
+      # ok additionally requires the cache file to still exist so an
+      # externally cleared cache repopulates immediately.
+      (((.status == "ok") and ($has_cache == "1")) or (.status == "empty"))
+      and (.query_hash == $query_hash)
+      and ((try (.refreshed_at | fromdateiso8601) catch 0) as $refreshed
+        | $refreshed > 0
+        and $now >= $refreshed
+        and (($now - $refreshed) < $max_age))
+    ' "$status_file" >/dev/null 2>&1
+}
+
 clear_honcho_invalidation() { # <token-observed-before-refresh>
   local observed="$1" current
   [ -n "$observed" ] || return 0
@@ -121,14 +148,24 @@ clear_honcho_invalidation() { # <token-observed-before-refresh>
 }
 
 refresh_wiki() {
-  local start end duration q tmp status err bytes
+  local start end duration q q_stable query_hash tmp status err bytes
   start="$(now_ms)"
-  q=""
+  q=""; q_stable=""
   tmp="$CACHE/wiki.txt.tmp.$$"
   status="ok"; err=""; bytes=0
   if is_disabled "$WIKI_ENABLED"; then
     status="disabled"; err="Family Wiki read path disabled"
   else
+    # Freshness key excludes the per-session prompt (the #781 honcho decision):
+    # wiki.txt is consumed as a shared cache across sessions, so a changing
+    # prompt must not defeat the TTL and re-pay a prefetch every SessionStart.
+    q_stable="$(query_from_state 0)"
+    query_hash="$(printf '%s' "$q_stable" | sha256sum 2>/dev/null | cut -d' ' -f1)"
+    if wiki_cache_is_fresh "$query_hash"; then
+      printf 'wiki refresh skipped reason=fresh max_age_sec=%s\n' \
+        "${CCC_WIKI_CACHE_MAX_AGE_SEC:-${CCC_MEMORY_CACHE_TTL_SEC:-21600}}" >&2
+      return 0
+    fi
     q="$(query_from_state)"
     if [ ! -x "$WIKI" ]; then
       status="missing"; err="wiki-agent not executable"
@@ -143,7 +180,9 @@ refresh_wiki() {
   fi
   rm -f "$tmp" "$tmp.err"
   end="$(now_ms)"; duration="$((end - start))"
-  record_status wiki "$status" "$duration" "$bytes" "$err" "$q"
+  # The stored query_hash is the freshness key, so it records the stable query
+  # (prompt excluded) that wiki_cache_is_fresh compares against.
+  record_status wiki "$status" "$duration" "$bytes" "$err" "$q_stable"
 }
 
 honcho_chat() { # <base> <workspace> <peer> <target> <token> <reasoning> <query> <output> <error>

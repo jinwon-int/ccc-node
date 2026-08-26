@@ -186,10 +186,21 @@ SC_SCOPE=(claude/hooks/audit.sh claude/hooks/redact.sh claude/hooks/lifecycle-fe
           scripts/bridge-watchdog.sh scripts/bridge-watchdog.test.sh \
           scripts/resource-pressure-guard.sh scripts/resource-pressure-guard.test.sh)
 if command -v shellcheck >/dev/null 2>&1; then
+  SC_PRESENT=()
   for f in "${SC_SCOPE[@]}"; do
-    [ -f "$f" ] || continue
-    if shellcheck --severity=warning -e SC2155,SC1090,SC1091 "$f"; then say "  ok $f"; else err "shellcheck: $f"; fi
+    [ -f "$f" ] && SC_PRESENT+=("$f")
   done
+  # Batch the whole scope into one shellcheck spawn first; only when that
+  # fails re-run per file so the failing script is named next to its findings.
+  # Both paths emit the same per-file ok/FAIL lines and tally into $fail.
+  if [ "${#SC_PRESENT[@]}" -gt 0 ] \
+     && shellcheck --severity=warning -e SC2155,SC1090,SC1091 "${SC_PRESENT[@]}" >/dev/null 2>&1; then
+    for f in "${SC_PRESENT[@]}"; do say "  ok $f"; done
+  else
+    for f in "${SC_PRESENT[@]}"; do
+      if shellcheck --severity=warning -e SC2155,SC1090,SC1091 "$f"; then say "  ok $f"; else err "shellcheck: $f"; fi
+    done
+  fi
   # 3a) Repo-wide error-severity sweep — every tracked script gets at least
   # error-level lint, so a new script cannot escape shellcheck entirely
   # (previously anything outside SC_SCOPE only got bash -n). SC_SCOPE keeps
@@ -214,26 +225,36 @@ fi
 # 3b) python hook helpers — a syntax error would break the statusline helper, so
 # compile the shipped python here.
 say "== python hook helpers =="
+PY_COMPILE_FILES=(claude/hooks/statusline-usage.py \
+                  claude/hooks/lib/memory_render.py \
+                  claude/hooks/distill/pending_journal.py \
+                  claude/hooks/skill-review/ownership.py \
+                  claude/hooks/skill-review/curator.py \
+                  scripts/ccc_codex_github_policy.py \
+                  scripts/ccc-skill-promotion.py \
+                  scripts/ccc-fleet-skills-sync.py \
+                  scripts/ccc_memory_probe.py \
+                  scripts/cost-ledger-weekly.py \
+                  scripts/ccc_memory_timeparse.py \
+                  scripts/ccc_memory_timeparse_test.py \
+                  bridge/runtime_config_check.py \
+                  scripts/ccc_script_interpreter_check.py \
+                  scripts/ccc_script_interpreter_check_test.py \
+                  scripts/ccc_architecture_contract.py \
+                  scripts/ccc_architecture_contract_test.py \
+                  scripts/ccc_side_effect_contract.py \
+                  scripts/ccc_side_effect_contract_test.py)
 if command -v python3 >/dev/null 2>&1; then
-  if python3 -m py_compile claude/hooks/statusline-usage.py 2>/dev/null; then say "  ok claude/hooks/statusline-usage.py compiles"; else err "py_compile: claude/hooks/statusline-usage.py"; fi
-  if python3 -m py_compile claude/hooks/lib/memory_render.py 2>/dev/null; then say "  ok claude/hooks/lib/memory_render.py compiles"; else err "py_compile: claude/hooks/lib/memory_render.py"; fi
-  if python3 -m py_compile claude/hooks/distill/pending_journal.py 2>/dev/null; then say "  ok claude/hooks/distill/pending_journal.py compiles"; else err "py_compile: claude/hooks/distill/pending_journal.py"; fi
-  if python3 -m py_compile claude/hooks/skill-review/ownership.py 2>/dev/null; then say "  ok claude/hooks/skill-review/ownership.py compiles"; else err "py_compile: claude/hooks/skill-review/ownership.py"; fi
-  if python3 -m py_compile claude/hooks/skill-review/curator.py 2>/dev/null; then say "  ok claude/hooks/skill-review/curator.py compiles"; else err "py_compile: claude/hooks/skill-review/curator.py"; fi
-  if python3 -m py_compile scripts/ccc_codex_github_policy.py 2>/dev/null; then say "  ok scripts/ccc_codex_github_policy.py compiles"; else err "py_compile: scripts/ccc_codex_github_policy.py"; fi
-  if python3 -m py_compile scripts/ccc-skill-promotion.py 2>/dev/null; then say "  ok scripts/ccc-skill-promotion.py compiles"; else err "py_compile: scripts/ccc-skill-promotion.py"; fi
-  if python3 -m py_compile scripts/ccc-fleet-skills-sync.py 2>/dev/null; then say "  ok scripts/ccc-fleet-skills-sync.py compiles"; else err "py_compile: scripts/ccc-fleet-skills-sync.py"; fi
-  if python3 -m py_compile scripts/ccc_memory_probe.py 2>/dev/null; then say "  ok scripts/ccc_memory_probe.py compiles"; else err "py_compile: scripts/ccc_memory_probe.py"; fi
-  if python3 -m py_compile scripts/cost-ledger-weekly.py 2>/dev/null; then say "  ok scripts/cost-ledger-weekly.py compiles"; else err "py_compile: scripts/cost-ledger-weekly.py"; fi
-  if python3 -m py_compile scripts/ccc_memory_timeparse.py 2>/dev/null; then say "  ok scripts/ccc_memory_timeparse.py compiles"; else err "py_compile: scripts/ccc_memory_timeparse.py"; fi
-  if python3 -m py_compile scripts/ccc_memory_timeparse_test.py 2>/dev/null; then say "  ok scripts/ccc_memory_timeparse_test.py compiles"; else err "py_compile: scripts/ccc_memory_timeparse_test.py"; fi
-  if python3 -m py_compile bridge/runtime_config_check.py 2>/dev/null; then say "  ok bridge/runtime_config_check.py compiles"; else err "py_compile: bridge/runtime_config_check.py"; fi
-  if python3 -m py_compile scripts/ccc_script_interpreter_check.py 2>/dev/null; then say "  ok scripts/ccc_script_interpreter_check.py compiles"; else err "py_compile: scripts/ccc_script_interpreter_check.py"; fi
-  if python3 -m py_compile scripts/ccc_script_interpreter_check_test.py 2>/dev/null; then say "  ok scripts/ccc_script_interpreter_check_test.py compiles"; else err "py_compile: scripts/ccc_script_interpreter_check_test.py"; fi
-  if python3 -m py_compile scripts/ccc_architecture_contract.py 2>/dev/null; then say "  ok scripts/ccc_architecture_contract.py compiles"; else err "py_compile: scripts/ccc_architecture_contract.py"; fi
-  if python3 -m py_compile scripts/ccc_architecture_contract_test.py 2>/dev/null; then say "  ok scripts/ccc_architecture_contract_test.py compiles"; else err "py_compile: scripts/ccc_architecture_contract_test.py"; fi
-  if python3 -m py_compile scripts/ccc_side_effect_contract.py 2>/dev/null; then say "  ok scripts/ccc_side_effect_contract.py compiles"; else err "py_compile: scripts/ccc_side_effect_contract.py"; fi
-  if python3 -m py_compile scripts/ccc_side_effect_contract_test.py 2>/dev/null; then say "  ok scripts/ccc_side_effect_contract_test.py compiles"; else err "py_compile: scripts/ccc_side_effect_contract_test.py"; fi
+  # One interpreter compiles the whole list (was one python3 spawn per file);
+  # only when the batch fails re-run per file so the broken/missing file is
+  # attributed. The per-file "ok ... compiles" lines are printed either way.
+  if python3 -m py_compile "${PY_COMPILE_FILES[@]}" 2>/dev/null; then
+    for f in "${PY_COMPILE_FILES[@]}"; do say "  ok $f compiles"; done
+  else
+    for f in "${PY_COMPILE_FILES[@]}"; do
+      if python3 -m py_compile "$f" 2>/dev/null; then say "  ok $f compiles"; else err "py_compile: $f"; fi
+    done
+  fi
 else
   say "  (python3 absent — skipped)"
 fi
@@ -344,6 +365,7 @@ HARNESS_SUITES=(claude/hooks/observability.test.sh claude/hooks/security-scan.te
          claude/hooks/lib/detached_jobs.test.sh \
          claude/hooks/lib/test-stub.test.sh \
          claude/hooks/lib/hook-common.test.sh \
+         claude/hooks/statusline.test.sh \
          claude/hooks/distill/extract.test.sh claude/hooks/distill/honcho-push.test.sh \
          claude/hooks/distill/queue-drain.test.sh claude/hooks/distill/pending-drain.test.sh claude/hooks/distill/wiki-queue.test.sh \
          claude/hooks/distill/local-facts.test.sh claude/hooks/memory-hooks.test.sh \
@@ -565,24 +587,40 @@ if [ -f claude/hooks/statusline.sh ]; then
   if out="$(printf '%s' "$SAMPLE" | CCC_NODE=ci CCC_STATE_DIR="$TMP/status-state" CCC_STATUSLINE_USAGE_COLLECTOR="$ROOT/claude/hooks/statusline-usage.py" bash claude/hooks/statusline.sh 2>/dev/null)" && [ -n "$out" ]; then
     say "  ok statusline.sh emits output"
   else err "statusline.sh produced no output / non-zero"; fi
-  if find "$TMP/status-state/usage" -type f -name '*.json' -perm 0600 2>/dev/null | grep -q .; then
+  # The collector runs detached from the render path (its interpreter start
+  # must not tax every status-line render), so give its snapshot a bounded
+  # moment to land before asserting on it.
+  collector_ok=0
+  for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    if find "$TMP/status-state/usage" -type f -name '*.json' -perm 0600 2>/dev/null | grep -q .; then
+      collector_ok=1
+      break
+    fi
+    sleep 0.25
+  done
+  if [ "$collector_ok" = 1 ]; then
     say "  ok statusline usage collector writes owner-only snapshot"
   else err "statusline usage collector did not write owner-only snapshot"; fi
   # empty input must not crash (fail-open to a usable bar)
   printf '%s' '' | CCC_NODE=ci bash claude/hooks/statusline.sh >/dev/null 2>&1 \
     && say "  ok statusline.sh survives empty input" || err "statusline.sh crashed on empty input"
-  # git TTL cache must be valid JSON for a CLEAN repo (regression: the empty
-  # ${DIRTY_MARKER:+true} --argjson made jq abort after the redirect had
-  # truncated the cache, so clean repos re-ran git status on every render)
+  # git TTL cache must be a valid, non-empty record for a CLEAN repo. The
+  # historical regression class: a malformed write truncated the cache so
+  # clean repos re-ran git status on every render. The cache is a one-line
+  # TSV (ts<TAB>branch<TAB>dirty) read by the bash builtin — statusline.test.sh
+  # covers hit/miss behavior; this smoke check pins the persisted shape.
   clean_repo="$TMP/status-clean-repo"
   if git init -q "$clean_repo" 2>/dev/null \
      && git -C "$clean_repo" -c user.email=ci@local -c user.name=ci commit -q --allow-empty -m init 2>/dev/null; then
     printf '{"workspace":{"current_dir":"%s"}}' "$clean_repo" \
       | CCC_NODE=ci HOME="$TMP/status-home" bash claude/hooks/statusline.sh >/dev/null 2>&1 || true
-    cache_json="$(find "$TMP/status-home/.claude/cache/git-status" -name '*.json' 2>/dev/null | head -1)"
-    if [ -n "$cache_json" ] && jq -e '.branch and (.dirty == false)' "$cache_json" >/dev/null 2>&1; then
-      say "  ok statusline git cache is valid JSON for a clean repo"
-    else err "statusline git cache invalid/empty for a clean repo (--argjson regression)"; fi
+    cache_tsv="$(find "$TMP/status-home/.claude/cache/git-status" -name '*.tsv' 2>/dev/null | head -1)"
+    cache_line=""
+    [ -n "$cache_tsv" ] && IFS= read -r cache_line < "$cache_tsv" 2>/dev/null
+    if [ -n "$cache_line" ] \
+       && printf '%s' "$cache_line" | grep -Eq $'^[0-9]+\t[^\t]+\t0$'; then
+      say "  ok statusline git cache records a clean repo"
+    else err "statusline git cache invalid/empty for a clean repo"; fi
   fi
 fi
 # settings statusLine command must point at an installed script that exists in-repo

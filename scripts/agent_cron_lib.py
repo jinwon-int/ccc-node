@@ -253,7 +253,7 @@ def apply_retry_transition(task, scheduled_at, attempt, run_id, status, at):
     return {'cleared': False, 'attempt': attempt, 'retryEligibleAt': fmt_dt(eligible), 'exhausted': False, 'policy': policy}
 
 
-def cron_matches(dt, spec):
+def _day_matches(dt, spec):
     dow = (dt.weekday() + 1) % 7  # Python Mon=0; cron Sun=0
     dows = spec['dow']
     dom_match = dt.day in spec['dom']
@@ -262,13 +262,15 @@ def cron_matches(dt, spec):
     # restricted, either field may match. If one is '*', the restricted field
     # controls the day match.
     if not spec.get('dom_any') and not spec.get('dow_any'):
-        day_match = dom_match or dow_match
-    else:
-        day_match = dom_match and dow_match
+        return dom_match or dow_match
+    return dom_match and dow_match
+
+
+def cron_matches(dt, spec):
     return (
         dt.minute in spec['minute'] and
         dt.hour in spec['hour'] and
-        day_match and
+        _day_matches(dt, spec) and
         dt.month in spec['month']
     )
 
@@ -278,28 +280,139 @@ def _local(dt, spec):
     return dt if tz is timezone.utc else dt.astimezone(tz)
 
 
+_ONE_MINUTE = timedelta(minutes=1)
+
+
+def _next_local_midnight(naive):
+    return datetime(naive.year, naive.month, naive.day) + timedelta(days=1)
+
+
+def _next_candidate_local(spec, naive, month_jump):
+    """Earliest naive wall-clock minute after ``naive`` that could match ``spec``.
+
+    Field-aware jump target on the local calendar: by construction, every
+    wall-clock minute strictly between ``naive`` and the returned value fails
+    ``cron_matches``, so a scan may skip straight to it. ``month_jump=False``
+    caps a month mismatch at the next local midnight so zone-aware callers can
+    verify each hop against a constant UTC offset (see ``_first_match_zone``).
+    """
+    if naive.month not in spec['month']:
+        if not month_jump:
+            return _next_local_midnight(naive)
+        month = min((m for m in spec['month'] if m > naive.month), default=None)
+        if month is None:
+            return datetime(naive.year + 1, min(spec['month']), 1)
+        return datetime(naive.year, month, 1)
+    if not _day_matches(naive, spec):
+        return _next_local_midnight(naive)
+    if naive.hour not in spec['hour']:
+        hour = min((h for h in spec['hour'] if h > naive.hour), default=None)
+        if hour is None:
+            return _next_local_midnight(naive)
+        return naive.replace(hour=hour, minute=0)
+    minute = min((m for m in spec['minute'] if m > naive.minute), default=None)
+    if minute is None:
+        return naive.replace(minute=0) + timedelta(hours=1)
+    return naive.replace(minute=minute)
+
+
+def _first_match_fixed(spec, cur, end):
+    """Scan when ``_local`` is the identity (spec tz is UTC).
+
+    The matched fields are ``cur``'s own calendar fields, offsets never change,
+    and timedelta arithmetic is exact, so jumps need no verification.
+    """
+    tzinfo = cur.tzinfo
+    while cur <= end:
+        if cron_matches(cur, spec):
+            return cur
+        target = _next_candidate_local(spec, cur.replace(tzinfo=None), True)
+        cur = target.replace(tzinfo=tzinfo)
+    return None
+
+
+def _first_match_walk(spec, cur, end):
+    """Legacy minute walk, kept for naive iteration against a zone-aware spec
+    (``astimezone`` would anchor naive datetimes to the system timezone, so
+    wall-clock jump targets cannot be converted back faithfully)."""
+    while cur <= end:
+        if cron_matches(_local(cur, spec), spec):
+            return cur
+        cur += _ONE_MINUTE
+    return None
+
+
+def _first_match_zone(spec, cur, end, tz):
+    """Zone-aware scan: jump on the local calendar, verify each hop in UTC.
+
+    A hop is trusted only when the UTC offset is unchanged across it, the
+    elapsed time equals the wall-clock delta, and the landing instant shows
+    exactly the targeted wall time; otherwise (a DST or other offset change
+    inside the hop, an ambiguous or nonexistent target) fall back to minute
+    stepping so no matching minute can be skipped. Hops are capped at one
+    local day (``month_jump=False``), and tzdata has no two offset changes
+    within one such window, so the endpoint checks see every transition.
+    fold=0 resolves an ambiguous jump target to its earliest UTC instant, so a
+    repeated local hour is entered on its first pass and re-scanned minute by
+    minute on its second.
+    """
+    frame = cur.tzinfo
+    while cur <= end:
+        loc = cur.astimezone(tz)
+        if cron_matches(loc, spec):
+            return cur
+        naive = loc.replace(tzinfo=None)
+        target = _next_candidate_local(spec, naive, False)
+        cand = target.replace(tzinfo=tz).astimezone(frame).replace(second=0, microsecond=0)
+        cand_loc = cand.astimezone(tz)
+        if (cand <= cur
+                or cand - cur != target - naive
+                or cand_loc.replace(tzinfo=None) != target
+                or cand_loc.utcoffset() != loc.utcoffset()):
+            cur += _ONE_MINUTE
+            continue
+        cur = cand
+    return None
+
+
+def _first_match(spec, cur, end):
+    """First minute in [``cur``, ``end``] whose local view matches ``spec``.
+
+    Equivalent to walking minute by minute and returning the first hit, but
+    skips over stretches whose month/day/hour fields cannot match.
+    """
+    if cur > end:
+        return None
+    tz = spec.get('tz') or timezone.utc
+    if tz is timezone.utc:
+        return _first_match_fixed(spec, cur, end)
+    if cur.tzinfo is None:
+        return _first_match_walk(spec, cur, end)
+    return _first_match_zone(spec, cur, end, tz)
+
+
 def iter_occurrences(spec, start_exclusive, end_inclusive, cap=OCCURRENCE_SCAN_LIMIT):
     cur = (start_exclusive + timedelta(minutes=1)).replace(second=0, microsecond=0)
     end = end_inclusive.replace(second=0, microsecond=0)
     out = []
     truncated = False
-    while cur <= end:
-        if cron_matches(_local(cur, spec), spec):
-            if len(out) >= cap:
-                truncated = True
-                break
-            out.append(cur)
-        cur += timedelta(minutes=1)
+    while True:
+        hit = _first_match(spec, cur, end)
+        if hit is None:
+            break
+        if len(out) >= cap:
+            truncated = True
+            break
+        out.append(hit)
+        cur = hit + _ONE_MINUTE
     return out, truncated
 
 
 def next_occurrence(spec, after, max_minutes=366 * 24 * 60):
     cur = (after + timedelta(minutes=1)).replace(second=0, microsecond=0)
-    for _ in range(max_minutes):
-        if cron_matches(_local(cur, spec), spec):
-            return cur
-        cur += timedelta(minutes=1)
-    return None
+    # Same horizon as checking max_minutes candidates one minute apart; the
+    # jumps merely skip candidates that provably cannot match.
+    return _first_match(spec, cur, cur + timedelta(minutes=max_minutes - 1))
 
 
 def _interval_next_after(spec, floor, anchor):

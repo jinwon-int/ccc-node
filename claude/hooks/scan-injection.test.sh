@@ -84,6 +84,21 @@ scan unit-clean "$clean_text"
 ok "clean text is unchanged" '[ "$rc" = 0 ] && [ "$out" = "$clean_text" ]'
 ok "clean text is not audited" '[ ! -s "$CCC_AUDIT_LOG" ]'
 
+# 7) Optional byte cap (arg 2): applied in-process with the limit_bytes
+# contract — marker reserved inside the limit, total output within the cap.
+long_text="$(printf 'A%.0s' $(seq 1 200))"
+out="$(printf '%s' "$long_text" | bash "$HOOK" unit-cap 80 2>/dev/null)"; rc=$?
+ok "capped output stays within the byte limit" \
+  '[ "$rc" = 0 ] && [ "$(printf "%s" "$out" | wc -c)" -le 80 ]'
+ok "capped output carries the truncation marker" \
+  'grep -Fq "[truncated by CCC memory budget]" <<<"$out"'
+out="$(printf '%s' "$long_text" | bash "$HOOK" unit-cap 4096 2>/dev/null)"; rc=$?
+ok "under-limit input is not truncated by the cap" \
+  '[ "$rc" = 0 ] && [ "$out" = "$long_text" ]'
+out="$(printf '%s' "$long_text" | bash "$HOOK" unit-cap not-a-number 2>/dev/null)"; rc=$?
+ok "non-numeric cap argument means no cap" \
+  '[ "$rc" = 0 ] && [ "$out" = "$long_text" ]'
+
 echo "----"
 echo "PASS=$pass FAIL=$fail"
 [ "$fail" = "0" ]

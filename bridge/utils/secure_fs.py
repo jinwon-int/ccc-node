@@ -8,6 +8,7 @@ import os
 import secrets
 import stat
 import tempfile
+import time
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -259,9 +260,50 @@ def _validate_storage_directory(path: Path) -> None:
         )
 
 
+# Directories that already passed a full ancestor walk, keyed by absolute
+# path, valued with the leaf's (st_dev, st_ino, st_mode, st_uid) fingerprint
+# at validation time plus that time (monotonic). Atomic writes re-validated
+# every component (~3 lstats per component) on every single write; with the
+# fingerprint an unchanged leaf needs one lstat. Semantics: a matching
+# fingerprint means traversing the path now reaches the same physical
+# directory that passed the full walk (an ancestor swapped to redirect the
+# path would resolve the leaf to a different dev/ino and miss the cache),
+# and the leaf's owner/mode checks below stay dynamic. The TTL bounds how
+# long a later ancestor mode/owner drift can go unnoticed: the full walk
+# still re-runs at least once per minute per directory.
+_VALIDATED_DIRECTORY_FINGERPRINTS: dict[
+    str, tuple[tuple[int, int, int, int], float]
+] = {}
+_VALIDATED_DIRECTORY_FINGERPRINTS_MAX = 128
+_VALIDATED_DIRECTORY_TTL_SECONDS = 60.0
+
+
+def _directory_fingerprint(metadata: os.stat_result) -> tuple[int, int, int, int]:
+    return (metadata.st_dev, metadata.st_ino, metadata.st_mode, metadata.st_uid)
+
+
 def _ensure_storage_directory(path: Path) -> None:
     """Create a private state directory or validate an existing safe directory."""
     path = _absolute_path(path)
+    cache_key = str(path)
+    cached = _VALIDATED_DIRECTORY_FINGERPRINTS.get(cache_key)
+    if cached is not None:
+        fingerprint, validated_monotonic = cached
+        try:
+            metadata = path.lstat()
+        except OSError:
+            metadata = None
+        if (
+            metadata is not None
+            and time.monotonic() - validated_monotonic
+            < _VALIDATED_DIRECTORY_TTL_SECONDS
+            and stat.S_ISDIR(metadata.st_mode)
+            and _directory_fingerprint(metadata) == fingerprint
+            and not stat.S_IMODE(metadata.st_mode) & 0o022
+            and (not hasattr(os, "getuid") or metadata.st_uid == os.getuid())
+        ):
+            return
+        _VALIDATED_DIRECTORY_FINGERPRINTS.pop(cache_key, None)
     _validate_existing_directory_components(path)
     try:
         path.lstat()
@@ -285,6 +327,12 @@ def _ensure_storage_directory(path: Path) -> None:
         raise PermissionError(
             f"session store parent is writable by group or others: {path} ({mode:04o})"
         )
+    if len(_VALIDATED_DIRECTORY_FINGERPRINTS) >= _VALIDATED_DIRECTORY_FINGERPRINTS_MAX:
+        _VALIDATED_DIRECTORY_FINGERPRINTS.clear()
+    _VALIDATED_DIRECTORY_FINGERPRINTS[cache_key] = (
+        _directory_fingerprint(metadata),
+        time.monotonic(),
+    )
 
 
 def ensure_private_directory(path: Path) -> None:

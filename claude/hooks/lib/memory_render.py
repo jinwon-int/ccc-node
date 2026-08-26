@@ -13,14 +13,13 @@ with no access to the repo's Python packages.
 Usage: python3 memory_render.py <subcommand> [args...]
 """
 
-import json
-import math
 import os
-import pathlib
-import re
-import signal
-import subprocess
 import sys
+
+# json/math/pathlib/re/signal/subprocess are imported inside the subcommands
+# that use them: this process is forked several times per SessionStart, and the
+# hot subcommand (limit-bytes) needs none of them — eager imports taxed every
+# call ~18ms of pure module-load time.
 
 
 def cmd_limit_bytes(argv):
@@ -49,6 +48,9 @@ def cmd_dedup_local_hot(argv):
     kept (lossless). Structured (distilled-fact) and distill-state hits have no
     other injection path and are always kept.
     """
+    import json
+    import re
+
     raw = os.environ.get("SEARCH_JSON", "")
     try:
         doc = json.loads(raw)
@@ -88,6 +90,9 @@ def cmd_filter_disabled_wiki_hits(argv):
     Fail closed immediately when Wiki memory is disabled, even before the next
     background index update removes a stale wiki.txt row from SQLite.
     """
+    import json
+    import pathlib
+
     raw = os.environ.get("SEARCH_JSON", "")
     try:
         doc = json.loads(raw)
@@ -122,6 +127,9 @@ def cmd_render_local_hot(argv):
     the bounded injection budget — the agent only needs the snippet and which
     source it came from.
     """
+    import json
+    import re
+
     raw = os.environ.get("SEARCH_JSON", "")
     try:
         doc = json.loads(raw)
@@ -170,6 +178,10 @@ def cmd_run_memory_search_bounded(argv):
     spawned, which is genuinely exceptional — so it is noted on stderr (the
     hook's stderr lands in the session/hook logs) instead of vanishing.
     """
+    import math
+    import signal
+    import subprocess
+
     tool, query, limit, raw_timeout, state_override = argv
     try:
         timeout = float(raw_timeout)
@@ -227,6 +239,8 @@ def cmd_merge_local_hot(argv):
     document path (falling back to snippet when pathless), with the recent lane
     taking precedence, then re-sorted by score descending.
     """
+    import json
+
     def rows(name):
         try:
             doc = json.loads(os.environ.get(name, ""))

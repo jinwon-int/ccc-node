@@ -46,13 +46,35 @@ def _sample_record(
     }
 
 
+# Per-path byte size below which the next trim scan is skipped. Reading and
+# splitting the whole file to learn it is still under the cap cost O(file) on
+# every appended sample; with the ~10%-growth hysteresis below, the full scan
+# runs once per growth step instead. The 64-byte floor keeps small files (and
+# the tests that append a handful of records) trimming exactly per append,
+# since every real sample record is larger than that.
+_NEXT_TRIM_SCAN_SIZE: dict[str, int] = {}
+
+
 def _trim_jsonl(path: Path, max_lines: int) -> None:
     if max_lines <= 0 or not path.exists():
         return
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return
+    key = str(path)
+    if size < _NEXT_TRIM_SCAN_SIZE.get(key, 0):
+        return
     lines = path.read_text(encoding="utf-8").splitlines()
     if len(lines) <= max_lines:
+        _NEXT_TRIM_SCAN_SIZE[key] = size + max(64, size // 10)
         return
     path.write_text("\n".join(lines[-max_lines:]) + "\n", encoding="utf-8")
+    try:
+        trimmed_size = path.stat().st_size
+    except OSError:
+        trimmed_size = 0
+    _NEXT_TRIM_SCAN_SIZE[key] = trimmed_size + max(64, trimmed_size // 10)
 
 
 def append_duration_sample(

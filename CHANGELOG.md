@@ -4,6 +4,69 @@ All notable changes to the Claude Code node harness. Dates are KST.
 
 ## [Unreleased]
 
+### Changed
+- **Fleet-wide performance pass — hooks, bridge idle/turn paths, distill
+  queue, agent-cron, periodic scripts.** One optimization train from a
+  full-repo efficiency review:
+  - *Hooks*: statusline renders drop from ~74ms to <15ms warm (usage
+    collector detached; the git TTL cache is a one-line TSV read by the bash
+    builtin with an explicit hit flag, so detached-HEAD/non-repo results
+    cache too; covered by the new `statusline.test.sh`). SessionStart sheds
+    ~0.5s of interpreter starts: scan-injection gained an in-process byte
+    cap so every scan+limit pipeline is one Python process, empty blocks
+    skip both, the skills index is one awk pass (the old per-file loop ran
+    twice whenever descriptions overflowed), and `memory_render.py` imports
+    lazily. The wiki prefetch finally honors its declared TTL via a
+    #781-style freshness gate on a stable prompt-free key
+    (`CCC_WIKI_FORCE_REFRESH` bypasses). audit/notify derive their fields in
+    one jq pass; the lifecycle logs rotate at `CCC_LIFECYCLE_LOG_MAX_BYTES`
+    (default 1MiB) and the dedup scan is tail-bounded instead of grepping
+    unbounded history on every Stop.
+  - *Bridge idle load*: the six distill pipeline loops share one journal
+    sweep per poll cluster (was eleven full journal reads per 300s tick)
+    and fully-terminal jobs are finally pruned
+    (`distill_job_retention_seconds`, default 14 days) instead of growing
+    the journal forever. The external-wait monitor's idle tick is one
+    `os.stat` instead of two full read+parse passes every 5s. `health.json`
+    stops rewriting every tick when idle (30s steady-state throttle, well
+    under every consumer's ≥90s staleness window). Dead-session recovery
+    skips re-parsing transcripts whose file identity is unchanged since a
+    fully handled scan.
+  - *Bridge turn path*: SessionStore commits validate only the touched
+    entry, reuse the last written payload as the previous-good backup
+    (no per-commit re-read+re-parse), roll back one key instead of
+    deep-copying every session, and run the fsync'd writes off the event
+    loop; TaskLedger and the external-wait registry reuse last-payload
+    backups too; secure_fs caches a leaf fingerprint (60s TTL) so repeat
+    atomic writes cost one lstat instead of a full ancestor walk; Codex
+    per-token-event usage recording coalesces to the turn boundary
+    (identical telescoped delta, one durable meter write per turn).
+  - *Distill pending queue*: a newer enqueue supersedes stale same-session
+    jobs (ends the PreCompact+SessionEnd double extraction), and a job
+    whose transcript changed dead-letters loudly at run time instead of
+    being retained claimable forever at the head of the drain order; the
+    recorded transcript byte count settles the grown-transcript case with
+    one stat instead of re-hashing.
+  - *agent-cron*: `next_occurrence`/`iter_occurrences` field-jump instead
+    of minute-walking — sparse `0 0 1 1 *` drops from ~460ms to ~5µs (UTC)
+    / ~3ms (zone-aware), with every DST hop verified and falling back to
+    minute stepping; the scheduler reuses the already-computed plan row per
+    executed task instead of replanning all tasks; `boot_id()` is cached.
+  - *Periodic scripts*: memory-consolidate buckets similarity pairs by
+    logical key (O(n²) → O(Σn_k²) inside the sink lock); ccc-memory-check
+    runs one jq per JSON blob and one pass over the writeback queue (was
+    ~120 spawns); validate-harness batches shellcheck/py_compile with a
+    per-file fallback for attribution, and its statusline checks track the
+    new cache format with a bounded wait for the detached collector.
+  - *skill-review*: curator/ownership read the ledger once per command and
+    load control.json once per run instead of per skill; classifications
+    computed by a run are reused by its backup snapshot. The SKILL.md
+    TOCTOU double-read is deliberately kept (contract-pinned).
+  - Deferred: the equivalent incremental-scan work for
+    `scripts/auto-distill/` was implemented but reverted — it requires a
+    fresh exact-source evaluation receipt (TM-2380 governance), which
+    cannot be minted locally.
+
 ### Removed
 - Dead files from the pre-fork/legacy era: `bridge/pre-kill.sh` (unreferenced;
   its `pkill` pattern ignored `--path` and would kill every bridge on a

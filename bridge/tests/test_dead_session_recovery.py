@@ -184,6 +184,54 @@ class DeadSessionScannerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.bot.send_message.await_args.kwargs["chat_id"], 70)
         self.assertEqual(len(self.sessions.sessions["7:70"][MARKER_KEY]), 1)
 
+    async def test_scan_cache_skips_unchanged_transcripts(self):
+        from unittest.mock import patch
+
+        cache: dict = {}
+        first = await recover_dead_session_notifications(
+            self.bot, self.sessions, self.handler, self.root, scan_cache=cache
+        )
+        self.assertEqual(first.delivered, 1)
+        self.assertEqual(len(cache), 1)
+
+        with patch(
+            "telegram_bot.core.dead_session_recovery.scan_transcript"
+        ) as scanner:
+            second = await recover_dead_session_notifications(
+                self.bot, self.sessions, self.handler, self.root, scan_cache=cache
+            )
+            scanner.assert_not_called()
+        self.assertEqual(second.skipped_unchanged, 1)
+        self.assertEqual(second.scanned, 0)
+
+        # Appending to the transcript changes its identity; the next scan
+        # parses again and delivers only the new notification.
+        path = self.root / f"{self.session_id}.jsonl"
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(_queue("enqueue", content=_task("task-2")))
+        third = await recover_dead_session_notifications(
+            self.bot, self.sessions, self.handler, self.root, scan_cache=cache
+        )
+        self.assertEqual(third.skipped_unchanged, 0)
+        self.assertEqual(third.delivered, 1)
+        self.assertEqual(third.duplicate, 1)
+
+    async def test_send_failure_is_not_cached_and_rescans(self):
+        cache: dict = {}
+        self.bot.send_message.side_effect = RuntimeError("network")
+        first = await recover_dead_session_notifications(
+            self.bot, self.sessions, self.handler, self.root, scan_cache=cache
+        )
+        self.assertEqual(first.failed, 1)
+        self.assertEqual(cache, {})
+
+        self.bot.send_message.side_effect = None
+        second = await recover_dead_session_notifications(
+            self.bot, self.sessions, self.handler, self.root, scan_cache=cache
+        )
+        self.assertEqual(second.delivered, 1)
+        self.assertEqual(len(cache), 1)
+
     async def test_locked_conversation_is_skipped(self):
         lock = asyncio.Lock()
         await lock.acquire()

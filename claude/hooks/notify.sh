@@ -20,19 +20,26 @@ esac
 # a false approval marker or a synthetic notification.
 canonical_input="$(printf '%s' "$input" | jq -cS 'select(type == "object")' 2>/dev/null)"
 [ -n "$canonical_input" ] || exit 0
-message_present="$(printf '%s' "$canonical_input" \
-  | jq -r '[.message?, .notification?]
-           | any(.[]; (type == "string") and test("\\S"))' 2>/dev/null)"
+# One jq pass for both derived fields (this hook fires on every Stop).
+message_present=""; sid=""
+{ read -r message_present && read -r sid; } < <(printf '%s' "$canonical_input" \
+  | jq -r '([.message?, .notification?]
+            | any(.[]; (type == "string") and test("\\S"))),
+           (.session_id // "")' 2>/dev/null) || true
 # Empty/unknown Notification objects are not operator attention. Stop and
 # SessionEnd legitimately carry no message, so this gate is event-specific.
 [ "$EVENT" != "Notification" ] || [ "$message_present" = "true" ] || exit 0
-printf '%s' "$input" | bash "$HERE/lifecycle-feed.sh" "$EVENT" >/dev/null 2>&1 || true
+# The feed CLI is default-off; mirror its gate so the default path skips the fork.
+case "${CCC_LIFECYCLE_AUDIT:-}" in
+  1|true|TRUE|yes|YES|on|ON)
+    printf '%s' "$input" | bash "$HERE/lifecycle-feed.sh" "$EVENT" >/dev/null 2>&1 || true
+    ;;
+esac
 state_dir="$(ccc_lifecycle_state_dir 2>/dev/null || true)"
 LOG="${CCC_AUDIT_LOG:-${state_dir:+$state_dir/audit.jsonl}}"
 APPROVAL="${CCC_APPROVAL_LOG:-${state_dir:+$state_dir/approval-needed.log}}"
 
 ts="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)"
-sid="$(printf '%s' "$canonical_input" | jq -r '.session_id // empty' 2>/dev/null)"
 session_ref=""
 if command -v ccc_lifecycle_ref >/dev/null 2>&1; then
   session_ref="$(ccc_lifecycle_ref "$sid" 2>/dev/null || true)"

@@ -233,6 +233,7 @@ class ExternalWaitMonitor:
         self._transport_errors: Dict[str, int] = {}
         self._resume_count = 0
         self._resume_day = ""
+        self._idle_identity: Optional[tuple] = None
 
     # -- configuration helpers ---------------------------------------------------
     @staticmethod
@@ -271,10 +272,21 @@ class ExternalWaitMonitor:
                 pass
 
     async def _tick(self) -> None:
+        # Idle fast path: a previous tick proved the registry holds no
+        # monitoring record and no pending wake. Time alone cannot create
+        # work in that state, so until the file identity changes (any
+        # register/mutate rewrites it atomically), the tick is one os.stat
+        # instead of two full read+parse passes — this loop runs every 5s
+        # forever, and the registry is empty most of a node's life.
+        idle = getattr(self._registry, "idle_snapshot_identity", None)
+        if idle is not None and self._idle_identity is not None:
+            if self._idle_identity == self._registry.state_file_identity():
+                return
         for record in self._registry.due(now=self._clock()):
             await self._poll_one(record)
         for record in self._registry.pending_wakes():
             await self._deliver_wake(record)
+        self._idle_identity = idle() if idle is not None else None
 
     # -- polling ------------------------------------------------------------------
     async def _poll_one(self, record: Dict[str, Any]) -> None:

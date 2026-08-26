@@ -9,14 +9,16 @@ import os
 import stat
 import sys
 import time
+from collections.abc import Mapping
 from hashlib import sha256
 from pathlib import Path
-from secrets import token_hex
-from typing import Any, Mapping
+from typing import Any
 
 MAX_INPUT_BYTES = 256 * 1024
 MAX_SNAPSHOTS = 64
 PRUNE_AFTER_SECONDS = 24 * 60 * 60
+PRUNE_INTERVAL_SECONDS = 10 * 60
+PRUNE_MARKER = ".last-prune"
 
 
 def number(value: object, maximum: float) -> int | float | None:
@@ -136,7 +138,7 @@ def write_snapshot(directory_fd: int, session_id: str, snapshot: Mapping[str, ob
     ):
         return
     payload = json.dumps(snapshot, separators=(",", ":"), sort_keys=True).encode("utf-8")
-    temporary = f".{name}.{os.getpid()}.{token_hex(6)}.tmp"
+    temporary = f".{name}.{os.getpid()}.{os.urandom(6).hex()}.tmp"
     try:
         fd = os.open(
             temporary,
@@ -161,6 +163,31 @@ def write_snapshot(directory_fd: int, session_id: str, snapshot: Mapping[str, ob
             os.unlink(temporary, dir_fd=directory_fd)
         except FileNotFoundError:
             pass
+
+
+def prune_due(directory_fd: int, now: float) -> bool:
+    """Bound the walk+stat prune sweep to once per interval, not per render."""
+
+    try:
+        info = os.stat(PRUNE_MARKER, dir_fd=directory_fd, follow_symlinks=False)
+    except (FileNotFoundError, OSError):
+        return True
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+        return True
+    return now - info.st_mtime >= PRUNE_INTERVAL_SECONDS
+
+
+def mark_pruned(directory_fd: int) -> None:
+    fd = os.open(
+        PRUNE_MARKER,
+        os.O_WRONLY | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW,
+        0o600,
+        dir_fd=directory_fd,
+    )
+    try:
+        os.utime(fd)
+    finally:
+        os.close(fd)
 
 
 def prune(directory_fd: int, now: float) -> None:
@@ -201,7 +228,9 @@ def main() -> int:
         directory_fd = open_snapshot_directory()
         try:
             write_snapshot(directory_fd, *sanitized)
-            prune(directory_fd, now)
+            if prune_due(directory_fd, now):
+                prune(directory_fd, now)
+                mark_pruned(directory_fd)
         finally:
             os.close(directory_fd)
     except OSError:

@@ -231,18 +231,25 @@ def _job_id(session_id: str, transcript_hash: str) -> str:
     return hashlib.sha256(material).hexdigest()
 
 
-def _transcript_hash(path_value: str) -> str:
+def _transcript_digest(path_value: str) -> tuple[str, int]:
+    """One pass over the transcript: (sha256 hex, byte count)."""
     path = Path(path_value)
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
     flags |= getattr(os, "O_NOFOLLOW", 0)
     fd = os.open(path, flags)
     digest = hashlib.sha256()
+    total = 0
     try:
         while chunk := os.read(fd, 65536):
             digest.update(chunk)
+            total += len(chunk)
     finally:
         os.close(fd)
-    return digest.hexdigest()
+    return digest.hexdigest(), total
+
+
+def _transcript_hash(path_value: str) -> str:
+    return _transcript_digest(path_value)[0]
 
 
 class PendingV1Journal(JsonJournalCore):
@@ -289,6 +296,10 @@ class PendingV1Journal(JsonJournalCore):
             count = record.get("fail_count")
             if type(count) is not int or count < 0 or count > 100000:
                 raise ValueError("invalid_fail_count")
+        if "transcript_bytes" in record:
+            size = record.get("transcript_bytes")
+            if type(size) is not int or size < 0:
+                raise ValueError("invalid_transcript_bytes")
         _route(record)
         return record
 
@@ -345,6 +356,50 @@ class PendingV1Journal(JsonJournalCore):
                 record_id, self.validate_record(record_id, record)
             )
 
+    def supersede_stale_session_records(
+        self, session_id: str, keep_record_id: str
+    ) -> tuple[str, ...]:
+        """Remove unclaimed pending records for *session_id* other than *keep*.
+
+        Transcripts are append-only and per-session, so an older pending
+        record for the same session pins a hash the transcript no longer
+        has: it can never extract successfully, yet its stable scan position
+        let it burn a drain slot on every SessionStart, and while it still
+        matched (PreCompact followed by SessionEnd on an unchanged tail) it
+        paid a second provider extraction over the same conversation. The
+        newest enqueue is the authoritative snapshot; stale siblings are
+        removed under their claim lock so a running worker is never
+        disturbed, and every removal is reported to the caller (no silent
+        disposal).
+        """
+        removed: list[str] = []
+        for record_id in self.list_record_ids():
+            if record_id == keep_record_id:
+                continue
+            try:
+                record = self.read(record_id)
+            except (OSError, ValueError, json.JSONDecodeError):
+                continue
+            if record.get("session_id") != session_id:
+                continue
+            with self.claim_record(record_id) as claimed:
+                if not claimed:
+                    continue
+                with self._exclusive():
+                    path = self.record_path(record_id)
+                    try:
+                        self._validate_regular_file(path)
+                        path.unlink()
+                    except (OSError, PermissionError):
+                        continue
+                    try:
+                        self.claim_path(record_id).unlink()
+                    except FileNotFoundError:
+                        pass
+                    _fsync_dir(self.root)
+                removed.append(record_id)
+        return tuple(removed)
+
     def dead_letter_claimed(self, record_id: str) -> Path:
         """Move a claimed record out of the claimable set into ``dead/``.
 
@@ -378,12 +433,13 @@ class PendingV1Journal(JsonJournalCore):
 def _record_from_environment() -> dict[str, Any]:
     transcript_path = os.environ.get("CLAUDE_DISTILL_TRANSCRIPT", "")
     session_id = os.environ.get("CLAUDE_DISTILL_SESSION", "")
-    transcript_hash = _transcript_hash(transcript_path)
+    transcript_hash, transcript_bytes = _transcript_digest(transcript_path)
     record_id = _job_id(session_id, transcript_hash)
     return {
         "schema": SCHEMA,
         "job_id": record_id,
         "transcript_sha256": transcript_hash,
+        "transcript_bytes": transcript_bytes,
         "session_id": session_id,
         "transcript_path": transcript_path,
         "source_cwd": os.environ.get("CLAUDE_DISTILL_SOURCE_CWD", ""),
@@ -460,8 +516,21 @@ def _journal(root: str) -> PendingV1Journal:
 
 def _enqueue(args: argparse.Namespace) -> int:
     record = _record_from_environment()
-    record_id, created = _journal(args.root).enqueue(record)
-    print(json.dumps({"job_id": record_id, "created": created}, separators=(",", ":")))
+    journal = _journal(args.root)
+    record_id, created = journal.enqueue(record)
+    superseded: tuple[str, ...] = ()
+    if created:
+        superseded = journal.supersede_stale_session_records(
+            record["session_id"], record_id
+        )
+        for stale_id in superseded:
+            print(f"pending-journal: superseded stale={stale_id}", file=sys.stderr)
+    print(
+        json.dumps(
+            {"job_id": record_id, "created": created, "superseded": list(superseded)},
+            separators=(",", ":"),
+        )
+    )
     return 0
 
 
@@ -487,8 +556,34 @@ def _run(args: argparse.Namespace) -> int:
             journal.dead_letter_claimed(record_id)
             print("pending-journal: dead_lettered reason=ttl", file=sys.stderr)
             return DEAD_EXIT
-        if _transcript_hash(str(record["transcript_path"])) != record["transcript_sha256"]:
-            raise ValueError("transcript_changed")
+        # Identity check. Raising here used to return INVALID_EXIT with the
+        # record retained untouched: no fail_count, no backoff, permanently
+        # claimable — and the deterministic scan order let a few such jobs
+        # occupy every drain's slots forever while valid jobs starved. The
+        # mismatch is permanent (append-only transcript, hash pinned at
+        # enqueue), so the job is dead-lettered loudly instead. The recorded
+        # byte count (when present) settles the common grown-transcript case
+        # with one stat instead of re-hashing the whole file.
+        transcript_path = str(record["transcript_path"])
+        recorded_bytes = record.get("transcript_bytes")
+        try:
+            if type(recorded_bytes) is int and (
+                os.stat(transcript_path).st_size != recorded_bytes
+            ):
+                transcript_intact = False
+            else:
+                transcript_intact = (
+                    _transcript_hash(transcript_path) == record["transcript_sha256"]
+                )
+        except OSError:
+            transcript_intact = False
+        if not transcript_intact:
+            journal.dead_letter_claimed(record_id)
+            print(
+                "pending-journal: dead_lettered reason=transcript_changed",
+                file=sys.stderr,
+            )
+            return DEAD_EXIT
         script = Path(args.script)
         if not script.is_absolute() or not script.is_file():
             raise ValueError("invalid_reentry_script")

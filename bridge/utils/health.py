@@ -1,12 +1,18 @@
 import json
 import os
 import threading
+import time
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
 
 from telegram_bot.utils.config import config
+
+# Steady-state disk-write throttle. Must stay well under every consumer's
+# staleness threshold: start.sh --status uses WATCHDOG_INTERVAL*2+30 (>=90s)
+# and ccc-self-update.sh uses CCC_SELF_UPDATE_HEALTH_FRESH_SECONDS (90s).
+_STEADY_STATE_REWRITE_SECONDS = 30.0
 
 # Agent providers this node can run. Keep in step with
 # Settings.agent_provider (utils/config.py) — health.json is how an operator
@@ -74,6 +80,13 @@ class RuntimeHealthReporter:
         self._process_mode = "foreground"
         self._token_lock_file = ""
         self._owns_token_lock = False
+        # Write throttles for the two per-tick writers (workload reporter,
+        # watchdog OK). Idle steady-state used to rewrite health.json every
+        # tick with only timestamps changing; a bounded skip keeps all stamps
+        # far fresher than any consumer's staleness threshold (>=90s) while
+        # dropping the constant serialize+fsync churn.
+        self._idle_workload_written_monotonic: float | None = None
+        self._telegram_ok_written_monotonic: float | None = None
         # Ephemeral request refs never leave this process. They let concurrent
         # turns contribute to one body-free delegated-task gauge without
         # exposing chat/session/task identifiers in health.json.
@@ -257,11 +270,24 @@ class RuntimeHealthReporter:
 
     def record_telegram_ok(self) -> None:
         with self._lock:
+            already_healthy = (
+                self._state["telegram"].get("state") == "healthy"
+                and self._state["telegram"].get("consecutive_failures") == 0
+            )
+            now_monotonic = time.monotonic()
+            if (
+                already_healthy
+                and self._telegram_ok_written_monotonic is not None
+                and now_monotonic - self._telegram_ok_written_monotonic
+                < _STEADY_STATE_REWRITE_SECONDS
+            ):
+                return
             self._state["telegram"]["state"] = "healthy"
             self._state["telegram"]["last_ok_at"] = _utc_now_iso()
             self._state["telegram"]["consecutive_failures"] = 0
             self._recompute_service_locked()
             self._write_health_locked()
+            self._telegram_ok_written_monotonic = now_monotonic
 
     def record_telegram_error(
         self, error: str, consecutive_failures: Optional[int] = None
@@ -519,6 +545,20 @@ class RuntimeHealthReporter:
             wall_now = wall_now.astimezone(timezone.utc)
             observation_time = wall_now.isoformat().replace("+00:00", "Z")
             if active_count == 0:
+                now_monotonic = time.monotonic()
+                previous = self._state.get("workload") or {}
+                previous_occupancy = previous.get("turn_occupancy") or {}
+                if (
+                    previous_occupancy.get("state") == "idle"
+                    and self._idle_workload_written_monotonic is not None
+                    and now_monotonic - self._idle_workload_written_monotonic
+                    < _STEADY_STATE_REWRITE_SECONDS
+                ):
+                    # Idle -> idle inside the throttle window: only observed_at
+                    # would change. The reporter ticks every 10s, so without
+                    # this the file was rewritten 8,640 times/day on a fully
+                    # idle bridge.
+                    return
                 self._state["workload"] = {
                     "active_requests": 0,
                     "oldest_request_age_seconds": 0,
@@ -529,6 +569,7 @@ class RuntimeHealthReporter:
                     },
                 }
                 self._write_health_locked()
+                self._idle_workload_written_monotonic = now_monotonic
                 return
 
             elapsed = max(0.0, float(oldest_request_age_seconds))

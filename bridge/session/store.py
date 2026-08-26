@@ -73,46 +73,51 @@ def _validate_json_value(
         active_containers.remove(marker)
 
 
+def _validate_session_entry(key: Any, value: Any) -> None:
+    """Validate one session-store entry: key shape and entry contents."""
+    if not isinstance(key, str):
+        raise SessionStoreValidationError(
+            f"session store key must be a string, got {type(key).__name__}"
+        )
+    prefix, separator, user_id = key.partition(":")
+    if prefix != "telegram_session" or separator != ":" or not user_id:
+        raise SessionStoreValidationError(f"invalid session store key: {key!r}")
+    try:
+        for component in user_id.split(":"):
+            if not component:
+                raise ValueError("empty conversation key component")
+            int(component)
+    except ValueError as error:
+        raise SessionStoreValidationError(
+            f"invalid session conversation key: {key!r}"
+        ) from error
+    if not isinstance(value, dict):
+        raise SessionStoreValidationError(
+            f"session entry {key!r} must be an object, got {type(value).__name__}"
+        )
+    provider = value.get("provider")
+    if provider is not None and (
+        not isinstance(provider, str)
+        or provider not in {"claude", "codex", "crush", "piri"}
+    ):
+        raise SessionStoreValidationError(
+            f"session entry {key!r} has invalid provider: {provider!r}"
+        )
+    effort = value.get("effort")
+    if effort is not None and (not isinstance(effort, str) or not effort):
+        raise SessionStoreValidationError(
+            f"session entry {key!r} has invalid effort: {effort!r}"
+        )
+    _validate_json_value(value, key, set())
+
+
 def _validate_session_data(data: Any) -> Dict[str, Any]:
     if not isinstance(data, dict):
         raise SessionStoreValidationError(
             f"session store root must be an object, got {type(data).__name__}"
         )
     for key, value in data.items():
-        if not isinstance(key, str):
-            raise SessionStoreValidationError(
-                f"session store key must be a string, got {type(key).__name__}"
-            )
-        prefix, separator, user_id = key.partition(":")
-        if prefix != "telegram_session" or separator != ":" or not user_id:
-            raise SessionStoreValidationError(f"invalid session store key: {key!r}")
-        try:
-            for component in user_id.split(":"):
-                if not component:
-                    raise ValueError("empty conversation key component")
-                int(component)
-        except ValueError as error:
-            raise SessionStoreValidationError(
-                f"invalid session conversation key: {key!r}"
-            ) from error
-        if not isinstance(value, dict):
-            raise SessionStoreValidationError(
-                f"session entry {key!r} must be an object, got {type(value).__name__}"
-            )
-        provider = value.get("provider")
-        if provider is not None and (
-            not isinstance(provider, str)
-            or provider not in {"claude", "codex", "crush", "piri"}
-        ):
-            raise SessionStoreValidationError(
-                f"session entry {key!r} has invalid provider: {provider!r}"
-            )
-        effort = value.get("effort")
-        if effort is not None and (not isinstance(effort, str) or not effort):
-            raise SessionStoreValidationError(
-                f"session entry {key!r} has invalid effort: {effort!r}"
-            )
-        _validate_json_value(value, key, set())
+        _validate_session_entry(key, value)
     return data
 
 
@@ -159,6 +164,11 @@ class SessionStore:
         self._lock = asyncio.Lock()
         self._storage_path = secure_fs._absolute_path(Path(storage_path))
         self._initialized = False
+        # Exact bytes of the last validated payload this process loaded or
+        # wrote. The previous-good backup reuses them instead of re-reading
+        # and re-parsing the whole file on every commit (this store persists
+        # several times per turn).
+        self._last_payload: Optional[bytes] = None
 
     def validate_path(self) -> None:
         """Validate the configured storage path without creating runtime state."""
@@ -224,14 +234,24 @@ class SessionStore:
         ).encode("utf-8")
         secure_fs._atomic_write_bytes(self._storage_path, payload)
         self._local_data = recovered
+        self._last_payload = payload
         logger.warning(
             "Recovered local session data from previous-good backup %s",
             self._backup_path,
         )
 
-    def _save_local_data(self):
+    def _save_local_data(self, changed_key: Optional[str] = None):
         try:
-            _validate_session_data(self._local_data)
+            if changed_key is None:
+                _validate_session_data(self._local_data)
+            elif changed_key in self._local_data:
+                # Single-key commits validate only the touched entry: every
+                # other entry was validated when it was loaded or last
+                # written, and json.dumps(allow_nan=False) below still
+                # backstops serializability of the whole document.
+                _validate_session_entry(
+                    changed_key, self._local_data[changed_key]
+                )
             payload = (
                 json.dumps(
                     self._local_data,
@@ -241,33 +261,63 @@ class SessionStore:
                 ) + "\n"
             ).encode("utf-8")
             if self._storage_path.exists():
-                previous_payload = self._storage_path.read_bytes()
-                # Parse the exact bytes destined for backup to avoid a TOCTOU
-                # gap between validation and previous-good preservation.
-                _decode_json_object(previous_payload, self._storage_path)
+                previous_payload = self._last_payload
+                if previous_payload is None:
+                    previous_payload = self._storage_path.read_bytes()
+                    # Parse the exact bytes destined for backup to avoid a
+                    # TOCTOU gap between validation and previous-good
+                    # preservation. After the first commit the last payload
+                    # this process wrote (already validated when produced)
+                    # serves as the previous-good bytes, so the per-commit
+                    # read+reparse of the whole file disappears.
+                    _decode_json_object(previous_payload, self._storage_path)
                 secure_fs._atomic_write_bytes(self._backup_path, previous_payload)
-            secure_fs._atomic_write_bytes(self._storage_path, payload)
+            try:
+                secure_fs._atomic_write_bytes(self._storage_path, payload)
+            except SessionStoreDurabilityError:
+                # The primary rename committed before the durability fault;
+                # disk holds the new bytes, so they are the previous-good
+                # payload for the next commit.
+                self._last_payload = payload
+                raise
+            self._last_payload = payload
         except Exception as e:
             logger.error(f"Failed to save local session data: {e}")
             raise
 
-    def _commit(self, mutation) -> None:
-        """Apply one in-memory mutation and roll it back if persistence fails."""
-        previous = copy.deepcopy(self._local_data)
+    def _commit(self, key: str, mutation) -> None:
+        """Apply one single-key mutation and roll it back if persistence fails.
+
+        Every store mutation replaces or removes exactly one entry (and never
+        mutates the previous value in place), so rollback only needs that
+        entry's prior reference — not a deep copy of every session, which
+        this method used to take on each of the several commits a normal
+        turn performs.
+        """
+        had_key = key in self._local_data
+        previous_value = self._local_data.get(key)
         try:
             mutation()
-            self._save_local_data()
+            self._save_local_data(changed_key=key)
         except SessionStoreDurabilityError as error:
             # If the primary rename committed, disk already contains the new
             # state. Preserve the matching memory state while surfacing that
             # crash-durability could not be confirmed. Backup-only failures
             # happen before the primary replace and still require rollback.
             if error.destination != self._storage_path:
-                self._local_data = previous
+                self._restore_entry(key, had_key, previous_value)
             raise
         except Exception:
-            self._local_data = previous
+            self._restore_entry(key, had_key, previous_value)
             raise
+
+    def _restore_entry(
+        self, key: str, had_key: bool, previous_value: Any
+    ) -> None:
+        if had_key:
+            self._local_data[key] = previous_value
+        else:
+            self._local_data.pop(key, None)
 
     def _key(self, user_id: int) -> str:
         return f"telegram_session:{user_id}"
@@ -303,14 +353,22 @@ class SessionStore:
         key = self._key(user_id)
         value = copy.deepcopy(data)
         async with self._lock:
-            self._commit(lambda: self._local_data.__setitem__(key, value))
+            # The disk write (backup + primary, fsync'd) runs off the event
+            # loop; the store lock still serializes commits, and readers
+            # cannot observe the in-flight mutation because they also take
+            # the lock.
+            await asyncio.to_thread(
+                self._commit, key, lambda: self._local_data.__setitem__(key, value)
+            )
 
     async def delete(self, user_id: int) -> None:
         self._require_initialized()
         key = self._key(user_id)
         async with self._lock:
             if key in self._local_data:
-                self._commit(lambda: self._local_data.pop(key))
+                await asyncio.to_thread(
+                    self._commit, key, lambda: self._local_data.pop(key)
+                )
 
     async def update(self, user_id: int, updates: Dict[str, Any]) -> None:
         # Build the new state from a private copy of the stored dict so an
@@ -320,7 +378,9 @@ class SessionStore:
         async with self._lock:
             data = copy.deepcopy(self._local_data.get(key, {}))
             data.update(copy.deepcopy(updates))
-            self._commit(lambda: self._local_data.__setitem__(key, data))
+            await asyncio.to_thread(
+                self._commit, key, lambda: self._local_data.__setitem__(key, data)
+            )
 
     async def patch(
         self,
@@ -346,7 +406,11 @@ class SessionStore:
                     data[field] = value
                     changed = True
             if changed:
-                self._commit(lambda: self._local_data.__setitem__(key, data))
+                await asyncio.to_thread(
+                    self._commit,
+                    key,
+                    lambda: self._local_data.__setitem__(key, data),
+                )
 
     async def patch_if(
         self,
@@ -372,5 +436,7 @@ class SessionStore:
             for field in removals:
                 data.pop(field, None)
             data.update(update_copy)
-            self._commit(lambda: self._local_data.__setitem__(key, data))
+            await asyncio.to_thread(
+                self._commit, key, lambda: self._local_data.__setitem__(key, data)
+            )
             return True

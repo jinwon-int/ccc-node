@@ -540,6 +540,27 @@ cp "$journal/$done_id.json" "$settled_journal/$done_id.json"
 out="$(CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CCC_DISTILL_JOURNAL_DIR="$settled_journal" CCC_MEMORY_CHECK_NOW_EPOCH=200 bash "$ROOT/scripts/ccc-memory-check.sh" --json 2>&1)"; rc=$?
 ok "memory check reports a completed write-back queue as settled" '[ "$rc" = 0 ] && jq -e '\''.writeback_queue.status == "settled" and .writeback_queue.jobs == 1 and .writeback_queue.pending_jobs == 0'\'' >/dev/null <<<"$out"'
 
+# All-valid multi-file journal: the single batched jq pass (no malformed file
+# forcing the per-file fallback) must aggregate the same per-file projections.
+valid_journal="$TMP/valid-batch-distill-journal"
+mkdir -m 700 "$valid_journal"
+cp "$journal/$queued_id.json" "$valid_journal/$queued_id.json"
+cp "$journal/$done_id.json" "$valid_journal/$done_id.json"
+cp "$journal/$retry_id.json" "$valid_journal/$retry_id.json"
+out="$(CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CCC_DISTILL_JOURNAL_DIR="$valid_journal" CCC_MEMORY_CHECK_NOW_EPOCH=200 bash "$ROOT/scripts/ccc-memory-check.sh" --json 2>&1)"; rc=$?
+ok "memory check batched pass aggregates an all-valid multi-file queue" '[ "$rc" = 0 ] && jq -e '\''
+  .writeback_queue.status == "degraded"
+  and .writeback_queue.jobs == 3
+  and .writeback_queue.pending_jobs == 2
+  and .writeback_queue.invalid_records == 0
+  and .writeback_queue.snapshot_bytes == 620
+  and .writeback_queue.oldest_age_seconds == 120
+  and .writeback_queue.retries == {snapshot:4, extraction:4, local:5, wiki:0, honcho:0, total:13}
+  and .writeback_queue.accounting.accounted_attempts == 3
+  and .writeback_queue.status_counts == {queued:1, extraction_done:2}
+  and .writeback_queue.local_status_counts == {done:1, retryable_failed:1}
+'\'' >/dev/null <<<"$out"'
+
 codex_home="$TMP/codex-home"
 CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CCC_MEMORY_TOOLS_DIR="$ROOT/scripts" CODEX_HOME="$codex_home" python3 "$ROOT/scripts/ccc_codex_memory.py" materialize --json >/dev/null 2>&1
 out="$(CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CCC_MEMORY_TOOLS_DIR="$ROOT/scripts" CODEX_HOME="$codex_home" bash "$ROOT/scripts/ccc-memory-check.sh" --json 2>&1)"; rc=$?

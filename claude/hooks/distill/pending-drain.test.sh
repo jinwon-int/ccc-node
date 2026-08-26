@@ -306,5 +306,37 @@ wait_for 'grep -q "pending retained reason=pipeline-failed" "$STATE/distill.log"
 ok "load-gate: healthy drain retains the failing job" \
   '[ "$(find "$STATE/distill-pending" -maxdepth 1 -type f -name "*.json" | wc -l | tr -d " ")" -ge 1 ]'
 
+# A newer enqueue for the SAME session supersedes stale pending siblings.
+# Transcripts are append-only, so the older job's pinned hash can never match
+# again: retained, it burned a drain slot every SessionStart and (while its
+# snapshot still matched) paid a duplicate extraction over one conversation.
+stale_gate_id="$(basename "$gate_job" .json)"
+printf '{"type":"user","message":{"content":"gate turn 4"}}\n' >> "$TRANSCRIPT_GATE"
+: > "$STATE/distill.log"
+payload sess-gate "$TRANSCRIPT_GATE" | \
+  HOME="$TMP/home" CCC_STATE_DIR="$STATE" CCC_DISTILL_SCOPE_CWDS="/root/workspace" \
+  CCC_DISTILL_FAIL_BACKOFF_SEC=0 \
+  bash "$DISTILL" sessionend >/dev/null 2>&1
+wait_for '[ ! -f "$gate_job" ]'
+ok "newer same-session enqueue supersedes the stale pending job" \
+  '[ ! -f "$gate_job" ] && grep -q "superseded stale=$stale_gate_id" "$STATE/distill.log"'
+fresh_gate_job="$(grep -l '"session_id":"sess-gate"' "$STATE"/distill-pending/*.json 2>/dev/null | head -1)"
+ok "superseding enqueue leaves exactly one fresh job for the session" \
+  '[ -n "$fresh_gate_job" ] && [ "$fresh_gate_job" != "$gate_job" ]'
+
+# A stale job whose transcript changed after enqueue dead-letters loudly at
+# run time. Raising invalid_job used to retain it untouched — permanently
+# claimable at a stable scan position, starving valid jobs of drain slots.
+# Driven through the adapter directly so drain slot ordering cannot flake it.
+wait_for '[ -n "$fresh_gate_job" ] && [ -e "$fresh_gate_job.lock" ] && flock -n "$fresh_gate_job.lock" true 2>/dev/null'
+fresh_gate_id="$(basename "$fresh_gate_job" .json)"
+printf '{"type":"user","message":{"content":"gate turn 5"}}\n' >> "$TRANSCRIPT_GATE"
+dead_rc=0
+dead_err="$(HOME="$TMP/home" CCC_STATE_DIR="$STATE" \
+  python3 "$HERE/pending_journal.py" run "$STATE/distill-pending" \
+    "$fresh_gate_job" "$DISTILL" 2>&1 >/dev/null)" || dead_rc=$?
+ok "changed transcript dead-letters the stale job instead of retaining it" \
+  '[ "$dead_rc" = 73 ] && [ -f "$STATE/distill-pending/dead/$fresh_gate_id.json" ] && [ ! -f "$fresh_gate_job" ] && grep -q "reason=transcript_changed" <<<"$dead_err"'
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

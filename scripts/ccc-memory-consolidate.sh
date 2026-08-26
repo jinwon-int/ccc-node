@@ -198,13 +198,20 @@ def union(a, b):
     if ra != rb:
         parent[rb] = ra
 
-for i in range(len(elig)):
-    for j in range(i + 1, len(elig)):
-        a, b = elig[i], elig[j]
-        if a[4] != b[4]:
-            continue
-        if jaccard(a[5], b[5]) >= sim_threshold:
-            union(a[0], b[0])
+# Pair only within a logical-key bucket. The old loop visited every pair of
+# eligible rows and rejected cross-key pairs inside the inner loop -- O(n^2)
+# over the whole file while holding the sink lock. Bucketing first yields the
+# exact same candidate pairs (a[4] == b[4]), in the same relative order, so
+# the union-find components -- and everything downstream -- are unchanged.
+buckets = {}
+for r in elig:
+    buckets.setdefault(r[4], []).append(r)
+for members in buckets.values():
+    for i in range(len(members)):
+        for j in range(i + 1, len(members)):
+            a, b = members[i], members[j]
+            if jaccard(a[5], b[5]) >= sim_threshold:
+                union(a[0], b[0])
 
 clusters = {}
 for r in elig:

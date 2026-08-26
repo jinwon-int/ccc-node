@@ -59,48 +59,13 @@ empty_writeback_json() {
   }'
 }
 
-writeback_queue_json() {
-  local root="$1" now invalid=0 record_bytes=0 path name size safe
-  local -a records=() paths=()
-
-  # Diagnostics are strictly read-only. In particular, a missing queue is not
-  # initialized here, and an unsafe root is never traversed.
-  if [ -L "$root" ] || { [ -e "$root" ] && [ ! -d "$root" ]; }; then
-    empty_writeback_json degraded 1
-    return 0
-  fi
-  if [ ! -e "$root" ]; then
-    empty_writeback_json missing 0
-    return 0
-  fi
-
-  shopt -s nullglob
-  paths=("$root"/*.json)
-  shopt -u nullglob
-  now="$(now_epoch)"
-
-  for path in "${paths[@]}"; do
-    if [ -L "$path" ] || [ ! -f "$path" ]; then
-      invalid=$((invalid + 1))
-      continue
-    fi
-    size="$(wc -c < "$path" 2>/dev/null | tr -d '[:space:]')"
-    case "$size" in ''|*[!0-9]*) size=0;; esac
-    record_bytes=$((record_bytes + size))
-    if [ "$size" -gt 1048576 ]; then
-      invalid=$((invalid + 1))
-      continue
-    fi
-    name="${path##*/}"
-    if [[ ! "$name" =~ ^[0-9a-f]{64}\.json$ ]]; then
-      invalid=$((invalid + 1))
-      continue
-    fi
-
-    # Project only scalar counters and timestamps out of each record. Raw
-    # thread ids, messages, extraction output, route values, and error text
-    # never enter the projected records or command output.
-    safe="$(jq -ce --arg expected_id "${name%.json}" '
+# Per-record validation/projection shared by the batched and per-file passes
+# below. $expected_id must be bound by the caller: the batched pass derives it
+# from input_filename, the per-file fallback binds it with --arg. Projects only
+# scalar counters and timestamps out of each record. Raw thread ids, messages,
+# extraction output, route values, and error text never enter the projected
+# records or command output.
+WB_VALIDATE_JQ='
       def nnint: type == "number" and floor == . and . >= 0;
       def oneof($values): . as $value | ($values | index($value)) != null;
       def journal_epoch:
@@ -175,13 +140,110 @@ writeback_queue_json() {
             or ($honcho | oneof(["retryable_failed","terminal_failed"]))
           )
         }
-    ' "$path" 2>/dev/null)"
-    if [ -z "$safe" ]; then
+    '
+
+writeback_queue_json() {
+  local root="$1" now invalid=0 record_bytes=0 path name size safe
+  local expected total_lines batch src_count i
+  local -a records=() paths=() statable=() size_lines=() jq_files=() batch_lines=()
+
+  # Diagnostics are strictly read-only. In particular, a missing queue is not
+  # initialized here, and an unsafe root is never traversed.
+  if [ -L "$root" ] || { [ -e "$root" ] && [ ! -d "$root" ]; }; then
+    empty_writeback_json degraded 1
+    return 0
+  fi
+  if [ ! -e "$root" ]; then
+    empty_writeback_json missing 0
+    return 0
+  fi
+
+  shopt -s nullglob
+  paths=("$root"/*.json)
+  shopt -u nullglob
+  now="$(now_epoch)"
+
+  for path in "${paths[@]}"; do
+    if [ -L "$path" ] || [ ! -f "$path" ]; then
       invalid=$((invalid + 1))
       continue
     fi
-    records+=("$safe")
+    statable+=("$path")
   done
+
+  # One size pass for every remaining file (was one `wc -c` spawn per file).
+  # wc prints one line per operand in argument order, plus a trailing total
+  # line for two or more operands. On any line-count mismatch (e.g. a file
+  # vanished between the glob and the batch) fall back to the per-file probe,
+  # which keeps the old ''/garbage -> 0 normalization per file.
+  if [ "${#statable[@]}" -gt 0 ]; then
+    mapfile -t size_lines < <(wc -c "${statable[@]}" 2>/dev/null | awk '{print $1}')
+    expected="${#statable[@]}"
+    total_lines=$((expected > 1 ? expected + 1 : expected))
+    if [ "${#size_lines[@]}" -eq "$total_lines" ]; then
+      size_lines=("${size_lines[@]:0:expected}")
+    else
+      size_lines=()
+      for path in "${statable[@]}"; do
+        size_lines+=("$(wc -c < "$path" 2>/dev/null | tr -d '[:space:]')")
+      done
+    fi
+  fi
+
+  for i in "${!statable[@]}"; do
+    path="${statable[$i]}"
+    size="${size_lines[$i]:-}"
+    case "$size" in ''|*[!0-9]*) size=0;; esac
+    record_bytes=$((record_bytes + size))
+    if [ "$size" -gt 1048576 ]; then
+      invalid=$((invalid + 1))
+      continue
+    fi
+    name="${path##*/}"
+    if [[ ! "$name" =~ ^[0-9a-f]{64}\.json$ ]]; then
+      invalid=$((invalid + 1))
+      continue
+    fi
+    jq_files+=("$path")
+  done
+
+  # One jq reads every surviving queue file (was one large jq spawn per file):
+  # input_filename recovers per-file identity, so the expected job id is the
+  # file's own basename, exactly as --arg expected_id passed it before. The
+  # first output line counts the distinct files that produced a projected
+  # record; a file yielding none is invalid, matching the old per-file
+  # empty-output verdict. jq aborts the whole batch when any file is malformed
+  # JSON, so that path falls back to the original per-file loop, which
+  # reproduces the per-file verdicts one by one.
+  if [ "${#jq_files[@]}" -gt 0 ]; then
+    if batch="$(jq -cn '
+        [ inputs
+          | input_filename as $wb_src
+          | ($wb_src | split("/") | last | rtrimstr(".json")) as $expected_id
+          | ('"$WB_VALIDATE_JQ"') + {_wb_src: $wb_src}
+        ] as $tagged
+        | ($tagged | map(._wb_src) | unique | length),
+          ($tagged[] | del(._wb_src))
+      ' "${jq_files[@]}" </dev/null 2>/dev/null)"; then
+      mapfile -t batch_lines <<<"$batch"
+      src_count="${batch_lines[0]:-0}"
+      case "$src_count" in ''|*[!0-9]*) src_count=0;; esac
+      invalid=$((invalid + ${#jq_files[@]} - src_count))
+      if [ "${#batch_lines[@]}" -gt 1 ]; then
+        records=("${batch_lines[@]:1}")
+      fi
+    else
+      for path in "${jq_files[@]}"; do
+        name="${path##*/}"
+        safe="$(jq -ce --arg expected_id "${name%.json}" "$WB_VALIDATE_JQ" "$path" 2>/dev/null)"
+        if [ -z "$safe" ]; then
+          invalid=$((invalid + 1))
+          continue
+        fi
+        records+=("$safe")
+      done
+    fi
+  fi
 
   if [ "${#records[@]}" -eq 0 ]; then
     if [ "$invalid" -gt 0 ]; then
@@ -340,43 +402,61 @@ printf -- '- cache:   %s\n' "$CACHE"
 printf -- '- wiki:    %s age=%ss bytes=%s\n' "$wiki_status" "$(age_for "$wiki_file")" "$(bytes_for "$wiki_file")"
 printf -- '- honcho:  %s age=%ss bytes=%s base=%s\n' "$honcho_status" "$(age_for "$honcho_file")" "$(bytes_for "$honcho_file")" "$honcho_base"
 printf -- '- index:   %s\n' "$index_db"
+# One jq per source blob renders all of that blob's report fields, one output
+# line per printf argument (was one jq spawn per field, 35 spawns for these
+# five lines). Every field is try-wrapped so a bad path degrades to the same
+# empty string a failed per-field spawn used to yield, without aborting the
+# fields after it; the :- fallbacks keep set -u safe if jq dies outright.
+mapfile -t codex_f < <(jq -r '
+  (try (.status) catch ""),
+  (try (.active_kind // "none") catch ""),
+  (try (.snapshot_sha256 // "none") catch ""),
+  (try (.metadata_status // "missing") catch "")' <<<"$codex_json")
 printf -- '- codex:   %s kind=%s hash=%s metadata=%s\n' \
-  "$(jq -r '.status' <<<"$codex_json")" \
-  "$(jq -r '.active_kind // "none"' <<<"$codex_json")" \
-  "$(jq -r '.snapshot_sha256 // "none"' <<<"$codex_json")" \
-  "$(jq -r '.metadata_status // "missing"' <<<"$codex_json")"
+  "${codex_f[0]:-}" "${codex_f[1]:-}" "${codex_f[2]:-}" "${codex_f[3]:-}"
+mapfile -t probe_f < <(jq -r '
+  (try (.nunchi.status) catch ""),
+  (try (.nunchi.mode) catch ""),
+  (try (.nunchi.db.facts // 0) catch ""),
+  (try (.nunchi.snapshot.bytes // 0) catch ""),
+  (try (.nunchi.cron.feed // "missing") catch ""),
+  (try (.nunchi.reasons | join(",")) catch ""),
+  (try (.nunchi.audience_scoped.enabled // false) catch ""),
+  (try (.nunchi.audience_scoped.root_status // "disabled") catch ""),
+  (try (.nunchi.audience_scoped.scope_count // 0) catch ""),
+  (try (.nunchi.audience_scoped.private_count // 0) catch ""),
+  (try (.nunchi.audience_scoped.shared_count // 0) catch ""),
+  (try (.nunchi.audience_scoped.session_roots // 0) catch ""),
+  (try (.nunchi.audience_scoped.nunchi_db_partitions // 0) catch ""),
+  (try (.nunchi.audience_scoped.snapshot_partitions // 0) catch ""),
+  (try (.nunchi.audience_scoped.mempalace_index_partitions // 0) catch ""),
+  (try (.nunchi.audience_scoped.invalid_entries // 0) catch ""),
+  (try (.mempalace.status) catch ""),
+  (try (.mempalace.required) catch ""),
+  (try (.mempalace.embeddings // 0) catch ""),
+  (try (.mempalace.reasons | join(",")) catch "")' <<<"$memory_probe_json")
 printf -- '- nunchi: %s mode=%s facts=%s snapshot_bytes=%s feed=%s reasons=%s\n' \
-  "$(jq -r '.nunchi.status' <<<"$memory_probe_json")" \
-  "$(jq -r '.nunchi.mode' <<<"$memory_probe_json")" \
-  "$(jq -r '.nunchi.db.facts // 0' <<<"$memory_probe_json")" \
-  "$(jq -r '.nunchi.snapshot.bytes // 0' <<<"$memory_probe_json")" \
-  "$(jq -r '.nunchi.cron.feed // "missing"' <<<"$memory_probe_json")" \
-  "$(jq -r '.nunchi.reasons | join(",")' <<<"$memory_probe_json")"
+  "${probe_f[0]:-}" "${probe_f[1]:-}" "${probe_f[2]:-}" \
+  "${probe_f[3]:-}" "${probe_f[4]:-}" "${probe_f[5]:-}"
 printf -- '- nunchi_audiences: enabled=%s root=%s scopes=%s private=%s shared=%s sessions=%s dbs=%s snapshots=%s mempalace_indexes=%s invalid=%s\n' \
-  "$(jq -r '.nunchi.audience_scoped.enabled // false' <<<"$memory_probe_json")" \
-  "$(jq -r '.nunchi.audience_scoped.root_status // "disabled"' <<<"$memory_probe_json")" \
-  "$(jq -r '.nunchi.audience_scoped.scope_count // 0' <<<"$memory_probe_json")" \
-  "$(jq -r '.nunchi.audience_scoped.private_count // 0' <<<"$memory_probe_json")" \
-  "$(jq -r '.nunchi.audience_scoped.shared_count // 0' <<<"$memory_probe_json")" \
-  "$(jq -r '.nunchi.audience_scoped.session_roots // 0' <<<"$memory_probe_json")" \
-  "$(jq -r '.nunchi.audience_scoped.nunchi_db_partitions // 0' <<<"$memory_probe_json")" \
-  "$(jq -r '.nunchi.audience_scoped.snapshot_partitions // 0' <<<"$memory_probe_json")" \
-  "$(jq -r '.nunchi.audience_scoped.mempalace_index_partitions // 0' <<<"$memory_probe_json")" \
-  "$(jq -r '.nunchi.audience_scoped.invalid_entries // 0' <<<"$memory_probe_json")"
+  "${probe_f[6]:-}" "${probe_f[7]:-}" "${probe_f[8]:-}" "${probe_f[9]:-}" \
+  "${probe_f[10]:-}" "${probe_f[11]:-}" "${probe_f[12]:-}" "${probe_f[13]:-}" \
+  "${probe_f[14]:-}" "${probe_f[15]:-}"
 printf -- '- mempalace: %s required=%s embeddings=%s reasons=%s\n' \
-  "$(jq -r '.mempalace.status' <<<"$memory_probe_json")" \
-  "$(jq -r '.mempalace.required' <<<"$memory_probe_json")" \
-  "$(jq -r '.mempalace.embeddings // 0' <<<"$memory_probe_json")" \
-  "$(jq -r '.mempalace.reasons | join(",")' <<<"$memory_probe_json")"
+  "${probe_f[16]:-}" "${probe_f[17]:-}" "${probe_f[18]:-}" "${probe_f[19]:-}"
+mapfile -t wb_f < <(jq -r '
+  (try (.status) catch ""),
+  (try (.jobs) catch ""),
+  (try (.pending_jobs) catch ""),
+  (try (.invalid_records) catch ""),
+  (try (.record_bytes) catch ""),
+  (try (.snapshot_bytes) catch ""),
+  (try (.oldest_age_seconds) catch ""),
+  (try (.retries.total) catch ""),
+  (try (.accounting.accounted_attempts) catch ""),
+  (try (.accounting.estimated_max_tokens) catch ""),
+  (try (.accounting.duration_ms) catch "")' <<<"$writeback_json")
 printf -- '- writeback: status=%s jobs=%s pending=%s invalid=%s bytes=%s snapshot_bytes=%s oldest=%ss retries=%s accounted=%s estimated_max_tokens=%s duration_ms=%s\n' \
-  "$(jq -r '.status' <<<"$writeback_json")" \
-  "$(jq -r '.jobs' <<<"$writeback_json")" \
-  "$(jq -r '.pending_jobs' <<<"$writeback_json")" \
-  "$(jq -r '.invalid_records' <<<"$writeback_json")" \
-  "$(jq -r '.record_bytes' <<<"$writeback_json")" \
-  "$(jq -r '.snapshot_bytes' <<<"$writeback_json")" \
-  "$(jq -r '.oldest_age_seconds' <<<"$writeback_json")" \
-  "$(jq -r '.retries.total' <<<"$writeback_json")" \
-  "$(jq -r '.accounting.accounted_attempts' <<<"$writeback_json")" \
-  "$(jq -r '.accounting.estimated_max_tokens' <<<"$writeback_json")" \
-  "$(jq -r '.accounting.duration_ms' <<<"$writeback_json")"
+  "${wb_f[0]:-}" "${wb_f[1]:-}" "${wb_f[2]:-}" "${wb_f[3]:-}" "${wb_f[4]:-}" \
+  "${wb_f[5]:-}" "${wb_f[6]:-}" "${wb_f[7]:-}" "${wb_f[8]:-}" "${wb_f[9]:-}" \
+  "${wb_f[10]:-}"

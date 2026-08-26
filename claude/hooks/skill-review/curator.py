@@ -240,8 +240,39 @@ def _last_activity(record: dict[str, Any]) -> datetime | None:
     return max(stamps) if stamps else None
 
 
-def _seed_record(context, usage: dict[str, Any], name: str, now: datetime) -> dict[str, Any]:
-    """First-sight seeding: created_at prefers durable provenance, else now."""
+def _ledger_created_index(context, rows: list[dict[str, Any]]) -> dict[str, datetime]:
+    """Latest parseable create/adopt timestamp per skill name for this provider.
+
+    Mirrors the row filter _seed_record used when it scanned the ledger per
+    skill: later rows win, rows with an unparseable ``ts`` never override.
+    """
+    index: dict[str, datetime] = {}
+    for row in rows:
+        if (
+            row.get("event") in {"create", "adopt"}
+            and row.get("outcome") == "changed"
+            and row.get("provider") == context.provider
+            and isinstance(row.get("name"), str)
+        ):
+            stamp = _parse_ts(row.get("ts"))
+            if stamp is not None:
+                index[row["name"]] = stamp
+    return index
+
+
+def _seed_record(
+    context,
+    usage: dict[str, Any],
+    name: str,
+    now: datetime,
+    *,
+    created_index: dict[str, datetime] | None = None,
+) -> dict[str, Any]:
+    """First-sight seeding: created_at prefers durable provenance, else now.
+
+    ``created_index`` shares one prebuilt _ledger_created_index across a
+    per-skill loop; when omitted the ledger is read here as before.
+    """
     created = None
     marker_path = context.skills_dir / name / ownership._AUTOSAVE_MARKER
     try:
@@ -251,14 +282,11 @@ def _seed_record(context, usage: dict[str, Any], name: str, now: datetime) -> di
     except (ContractError, FileNotFoundError):
         created = None
     if created is None:
-        for row in ownership._read_ledger(context):
-            if (
-                row.get("event") in {"create", "adopt"}
-                and row.get("outcome") == "changed"
-                and row.get("provider") == context.provider
-                and row.get("name") == name
-            ):
-                created = _parse_ts(row.get("ts")) or created
+        if created_index is None:
+            created_index = _ledger_created_index(
+                context, ownership._read_ledger(context)
+            )
+        created = created_index.get(name)
     record = _empty_record(
         ownership._target_id(context, name), _ts(created or now)
     )
@@ -266,13 +294,21 @@ def _seed_record(context, usage: dict[str, Any], name: str, now: datetime) -> di
     return record
 
 
-def _sync_patches_from_ledger(context, usage: dict[str, Any]) -> None:
+def _sync_patches_from_ledger(
+    context,
+    usage: dict[str, Any],
+    *,
+    ledger_rows: list[dict[str, Any]] | None = None,
+) -> None:
     """Recompute patch_count/last_patched_at from the ownership ledger.
 
     Idempotent: counts are recomputed from source-of-truth rows each time.
+    ``ledger_rows`` reuses rows the calling command already read.
     """
     applied: dict[str, dict[str, Any]] = {}
-    for row in ownership._read_ledger(context):
+    if ledger_rows is None:
+        ledger_rows = ownership._read_ledger(context)
+    for row in ledger_rows:
         if (
             row.get("event") == "skill-proposal-apply"
             and row.get("outcome") == "applied"
@@ -478,15 +514,23 @@ def _recover_one_transaction(
     return {"transaction_id": tx, "event": event, "name": name, "outcome": outcome}
 
 
-def _recover_curator_transactions(context, usage: dict[str, Any]) -> list[dict[str, Any]]:
+def _recover_curator_transactions(
+    context,
+    usage: dict[str, Any],
+    *,
+    ledger_rows: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
     """Reconcile prepared curator rows without a terminal row.
 
     Idempotent: a terminal row is appended for every dangling prepared row,
     so a later crash simply re-derives the same terminal state.
+    ``ledger_rows`` reuses rows the calling command already read.
     """
     prepared: dict[str, dict[str, Any]] = {}
     terminated: set[str] = set()
-    for row in ownership._read_ledger(context):
+    if ledger_rows is None:
+        ledger_rows = ownership._read_ledger(context)
+    for row in ledger_rows:
         if row.get("event") not in _CURATOR_TX_EVENTS:
             continue
         tx = row.get("transaction_id")
@@ -827,6 +871,7 @@ def _snapshot(
     now: datetime,
     keep: int,
     protect_ids: set[str] | None = None,
+    classifications: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Owner-only backup of autosave-managed skills + curator metadata.
 
@@ -834,6 +879,8 @@ def _snapshot(
     caller. A single unsafe/oversized skill is quarantined instead — excluded
     from the snapshot and reported in ``skipped_unsafe`` so the caller can
     refuse to transition exactly that skill while the rest proceed.
+    ``classifications`` reuses per-skill records an earlier pass under the
+    same mutation lock already computed; names it lacks are classified here.
     """
     ownership._ensure_private_dir(context.state_dir / _BACKUP_DIR, context)
     _check_same_filesystem(context)
@@ -848,6 +895,10 @@ def _snapshot(
         candidate = f"{backup_id}-{suffix:02d}"
     backup_id = candidate
     dest = root / backup_id
+    # One control read serves the classification loop and the control.json
+    # copy below; a corrupt control file still aborts the whole snapshot with
+    # the same error it raised when read at copy time.
+    controls = ownership._load_controls(context)
     skills_meta: list[dict[str, Any]] = []
     skipped_unsafe: list[str] = []
     try:
@@ -856,10 +907,16 @@ def _snapshot(
         os.mkdir(dest / "skills", mode=0o700)
         total_bytes = 0
         for name in ownership._skill_names(context):
-            try:
-                classification = ownership._classification(context, name)
-            except ContractError:
-                continue
+            classification = (
+                classifications.get(name) if classifications is not None else None
+            )
+            if classification is None:
+                try:
+                    classification = ownership._classification(
+                        context, name, controls=controls
+                    )
+                except ContractError:
+                    continue
             if classification["base_classification"] != "autosave-managed":
                 continue
             try:
@@ -882,7 +939,6 @@ def _snapshot(
             payload = ownership._canonical_json(usage)
             usage_sha = ownership._sha256(payload)
             ownership._write_private_atomic(dest / "usage.json", usage, context)
-        controls = ownership._load_controls(context)
         control_sha = ownership._sha256(ownership._canonical_json(controls))
         ownership._write_private_atomic(dest / "control.json", controls, context)
         manifest = {
@@ -1292,11 +1348,28 @@ def _run_report_skeleton(auto: bool, dry_run: bool, now: datetime, config) -> di
 
 
 def _classify_run_decision(
-    context, usage, name: str, now: datetime, config, report, dry_run: bool
+    context,
+    usage,
+    name: str,
+    now: datetime,
+    config,
+    report,
+    dry_run: bool,
+    *,
+    controls: dict[str, Any] | None = None,
+    created_index: dict[str, datetime] | None = None,
+    classifications: dict[str, dict[str, Any]] | None = None,
 ) -> None:
-    """Append one skill's transition decision to the run report (no mutation)."""
+    """Append one skill's transition decision to the run report (no mutation).
+
+    ``controls``/``created_index`` share reads the run performed once up
+    front; ``classifications`` collects this skill's record so the backup
+    pass can reuse it instead of classifying everything a second time.
+    """
     report["counts"]["checked"] += 1
-    classification = ownership._classification(context, name)
+    classification = ownership._classification(context, name, controls=controls)
+    if classifications is not None:
+        classifications[name] = classification
     if classification["base_classification"] != "autosave-managed":
         report["counts"]["protected"] += 1
         report["decisions"].append(
@@ -1314,7 +1387,7 @@ def _classify_run_decision(
     record = usage["records"].get(_record_key(context, name))
     if record is None:
         if not dry_run:
-            _seed_record(context, usage, name, now)
+            _seed_record(context, usage, name, now, created_index=created_index)
         report["counts"]["seeded"] += 1
         report["decisions"].append({"name": name, "action": "seed", "reason": "first-sight"})
         return
@@ -1329,10 +1402,23 @@ def _classify_run_decision(
     report["counts"][count_keys[action]] += 1
 
 
-def _apply_run_decisions(context, usage, report, now: datetime, config) -> None:
+def _apply_run_decisions(
+    context,
+    usage,
+    report,
+    now: datetime,
+    config,
+    *,
+    classifications: dict[str, dict[str, Any]] | None = None,
+) -> None:
     """Backup first, then apply every planned transition (lock already held)."""
     backup = _snapshot(
-        context, usage, reason="pre-curator-run", now=now, keep=config["backup_keep"]
+        context,
+        usage,
+        reason="pre-curator-run",
+        now=now,
+        keep=config["backup_keep"],
+        classifications=classifications,
     )
     report["backup"] = backup
     quarantined = set(backup.get("skipped_unsafe", ()))
@@ -1379,22 +1465,44 @@ def _command_run(context, *, dry_run: bool, auto: bool) -> dict[str, Any]:
                 return skip
         usage = _load_usage(context, strict=True)
         report = _run_report_skeleton(auto, dry_run, now, config)
-        recoveries = _recover_curator_transactions(context, usage)
+        # One ledger read serves recovery, patch sync and first-sight seeding;
+        # the terminal rows recovery appends can never match the create/adopt
+        # or proposal-apply filters the later consumers select on.
+        ledger_rows = ownership._read_ledger(context)
+        recoveries = _recover_curator_transactions(
+            context, usage, ledger_rows=ledger_rows
+        )
         if recoveries:
             report["recoveries"] = recoveries
-        _sync_patches_from_ledger(context, usage)
+        _sync_patches_from_ledger(context, usage, ledger_rows=ledger_rows)
         if auto and _node_recently_active(usage, now, config["min_idle_hours"]):
             _save_usage(context, usage)
             report["skipped"] = "node-active-within-min-idle"
             return report
+        controls = ownership._preload_controls(context)
+        created_index = _ledger_created_index(context, ledger_rows)
+        classifications: dict[str, dict[str, Any]] = {}
         for name in ownership._skill_names(context):
-            _classify_run_decision(context, usage, name, now, config, report, dry_run)
+            _classify_run_decision(
+                context,
+                usage,
+                name,
+                now,
+                config,
+                report,
+                dry_run,
+                controls=controls,
+                created_index=created_index,
+                classifications=classifications,
+            )
         planned = any(
             decision["action"] in {"mark-stale", "reactivate", "archive"}
             for decision in report["decisions"]
         )
         if not dry_run and planned:
-            _apply_run_decisions(context, usage, report, now, config)
+            _apply_run_decisions(
+                context, usage, report, now, config, classifications=classifications
+            )
         elif not dry_run:
             _save_usage(context, usage)
         if not dry_run:
@@ -1452,9 +1560,10 @@ def _command_status(context, name: str | None) -> dict[str, Any]:
     now = _now()
     usage = _load_usage(context, strict=False)
     names = [name] if name else ownership._skill_names(context)
+    controls = ownership._preload_controls(context)
     skills = []
     for item in names:
-        classification = ownership._classification(context, item)
+        classification = ownership._classification(context, item, controls=controls)
         skills.append(_skill_report(context, item, classification, usage, now))
     archived = _list_archive_entries(context)
     return {
@@ -1471,9 +1580,10 @@ def _command_report(context) -> dict[str, Any]:
     usage = _load_usage(context, strict=False)
     by_state: dict[str, int] = {"active": 0, "stale": 0, "archived": 0, "untracked": 0}
     by_class: dict[str, int] = {}
+    controls = ownership._preload_controls(context)
     skills = []
     for name in ownership._skill_names(context):
-        classification = ownership._classification(context, name)
+        classification = ownership._classification(context, name, controls=controls)
         by_class[classification["base_classification"]] = (
             by_class.get(classification["base_classification"], 0) + 1
         )
@@ -1636,10 +1746,17 @@ def _command_archive(context, name: str, dry_run: bool) -> dict[str, Any]:
         }
     with ownership._MutationLock(context):
         usage = _load_usage(context, strict=True)
-        _recover_curator_transactions(context, usage)
-        _sync_patches_from_ledger(context, usage)
+        ledger_rows = ownership._read_ledger(context)
+        _recover_curator_transactions(context, usage, ledger_rows=ledger_rows)
+        _sync_patches_from_ledger(context, usage, ledger_rows=ledger_rows)
         if usage["records"].get(_record_key(context, name)) is None:
-            _seed_record(context, usage, name, now)
+            _seed_record(
+                context,
+                usage,
+                name,
+                now,
+                created_index=_ledger_created_index(context, ledger_rows),
+            )
         result = _archive_skill(context, usage, name, now, manual=True)
     return {"ok": True, "command": "archive", "dry_run": False, **result}
 
@@ -1670,9 +1787,12 @@ def _command_backup(context, reason: str, dry_run: bool) -> dict[str, Any]:
     now = _now()
     if dry_run:
         eligible = 0
+        controls = ownership._preload_controls(context)
         for name in ownership._skill_names(context):
             try:
-                classification = ownership._classification(context, name)
+                classification = ownership._classification(
+                    context, name, controls=controls
+                )
             except ContractError:
                 continue
             if classification["base_classification"] == "autosave-managed":
